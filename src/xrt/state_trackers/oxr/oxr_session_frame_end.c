@@ -16,6 +16,7 @@
 #include "os/os_time.h"
 
 #include "util/u_debug.h"
+#include "util/u_logging.h"
 #include "util/u_misc.h"
 #include "util/u_time.h"
 #include "util/u_verify.h"
@@ -2041,6 +2042,29 @@ submit_zone_3d_layer(struct oxr_session *sess,
 }
 #endif // OXR_HAVE_DXR_display_zones
 
+/*!
+ * #1544: one-shot note that the active compositor does not implement an
+ * optional composition-layer type.
+ *
+ * The KHR layer extensions are advertised instance-wide, but a backend may not
+ * wire every xrt_compositor layer slot (the GL lane did not). xrt_comp_layer_*
+ * now returns XRT_ERROR_NOT_IMPLEMENTED for a NULL slot instead of calling
+ * through it — a NULL slot must fail the layer, not the process. Say so once,
+ * never per frame, then fall through to OXR_CHECK_XRET (XR_ERROR_RUNTIME_FAILURE).
+ *
+ * A macro rather than a helper so each of the five call sites gets its own latch
+ * while staying one line.
+ */
+#define OXR_NOTE_LAYER_NOT_IMPLEMENTED(XRET, TYPE)                                                                     \
+	do {                                                                                                           \
+		static bool oxr_layer_not_impl_warned = false;                                                         \
+		if ((XRET) == XRT_ERROR_NOT_IMPLEMENTED && !oxr_layer_not_impl_warned) {                               \
+			oxr_layer_not_impl_warned = true;                                                              \
+			U_LOG_E("xrEndFrame: the active compositor has no " TYPE                                       \
+			        " layer implementation — failing the layer, not the process (#1544)");                 \
+		}                                                                                                      \
+	} while (false)
+
 static XrResult
 submit_cube_layer(struct oxr_session *sess,
                   struct xrt_compositor *xc,
@@ -2091,6 +2115,7 @@ submit_cube_layer(struct oxr_session *sess,
 	}
 
 	xrt_result_t xret = xrt_comp_layer_cube(xc, head, sc->swapchain, &data);
+	OXR_NOTE_LAYER_NOT_IMPLEMENTED(xret, "cube");
 	OXR_CHECK_XRET(log, sess, xret, xrt_comp_layer_cube);
 
 	return XR_SUCCESS;
@@ -2143,6 +2168,7 @@ submit_cylinder_layer(struct oxr_session *sess,
 	fill_in_depth_test(sess, (XrCompositionLayerBaseHeader *)cylinder, &data);
 
 	xrt_result_t xret = xrt_comp_layer_cylinder(xc, head, sc->swapchain, &data);
+	OXR_NOTE_LAYER_NOT_IMPLEMENTED(xret, "cylinder");
 	OXR_CHECK_XRET(log, sess, xret, xrt_comp_layer_cylinder);
 
 	return XR_SUCCESS;
@@ -2197,6 +2223,7 @@ submit_equirect1_layer(struct oxr_session *sess,
 	data.equirect1.bias = *bias;
 
 	xrt_result_t xret = xrt_comp_layer_equirect1(xc, head, sc->swapchain, &data);
+	OXR_NOTE_LAYER_NOT_IMPLEMENTED(xret, "equirect1");
 	OXR_CHECK_XRET(log, sess, xret, xrt_comp_layer_equirect1);
 
 	return XR_SUCCESS;
@@ -2268,6 +2295,7 @@ submit_equirect2_layer(struct oxr_session *sess,
 	fill_in_depth_test(sess, (XrCompositionLayerBaseHeader *)equirect, &data);
 
 	xrt_result_t xret = xrt_comp_layer_equirect2(xc, head, sc->swapchain, &data);
+	OXR_NOTE_LAYER_NOT_IMPLEMENTED(xret, "equirect2");
 	OXR_CHECK_XRET(log, sess, xret, xrt_comp_layer_equirect2);
 
 	return XR_SUCCESS;
@@ -2368,6 +2396,7 @@ submit_passthrough_layer(struct oxr_session *sess,
 	fill_in_blend_factors(sess, (XrCompositionLayerBaseHeader *)passthrough, &data);
 
 	xrt_result_t xret = xrt_comp_layer_passthrough(xc, head, &data);
+	OXR_NOTE_LAYER_NOT_IMPLEMENTED(xret, "passthrough");
 	OXR_CHECK_XRET(log, sess, xret, xrt_comp_layer_passthrough);
 
 	return XR_SUCCESS;
