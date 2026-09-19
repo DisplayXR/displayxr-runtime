@@ -37,10 +37,17 @@
 #   # optional (enables the legacy udev VR prober — NOT needed for selftest):
 #   sudo apt-get install -y libudev-dev
 #
+#   NOTE: install the dependencies BEFORE the first configure. CMake caches a
+#   failed feature probe permanently, so a package installed afterwards is not
+#   picked up — and the mismatch can wedge the tree outright (see --clean).
+#
 # Usage:
 #   ./scripts/build_linux.sh             # in-process headless build + selftest
 #   ./scripts/build_linux.sh --service   # also build displayxr-service (IPC)
 #   ./scripts/build_linux.sh --no-test   # build only, skip the selftest run
+#   ./scripts/build_linux.sh --clean     # drop the CMake cache first — REQUIRED
+#                                        # after installing a dependency into a
+#                                        # tree that was already configured
 #   ./scripts/build_linux.sh --apps      # also build the OpenXR loader + the
 #                                        # test apps: cube_hosted_legacy_vk_linux
 #                                        # (hosted, Phase 1b) and cube_handle_vk_linux
@@ -59,14 +66,36 @@ BUILD_DIR="${BUILD_DIR:-$ROOT/build}"
 SERVICE_MODE=OFF
 RUN_TEST=ON
 BUILD_APPS=OFF
+CLEAN=OFF
 for arg in "$@"; do
   case "$arg" in
     --service) SERVICE_MODE=ON ;;
     --no-test) RUN_TEST=OFF ;;
     --apps) BUILD_APPS=ON ;;
+    --clean) CLEAN=ON ;;
     *) echo "Unknown arg: $arg" >&2; exit 2 ;;
   esac
 done
+
+# --clean: drop the CMake cache so feature detection re-runs from scratch.
+#
+# This exists because a stale cache does not merely miss a new dependency, it
+# can WEDGE the tree. Feature probes made with check_*_source_compiles cache
+# their result permanently — a probe that failed because its -dev package was
+# absent stays failed after you install it, since CMake never retries. Install
+# libgles-dev into a tree first configured without libegl-dev and you get a
+# hard configure error (`XRT_HAVE_OPENGLES requires XRT_HAVE_EGL`) describing a
+# situation that is no longer true: EGL is present, only the cached probe says
+# otherwise. The build is then unfixable by installing anything.
+#
+# Deleting CMakeCache.txt + CMakeFiles/ (rather than the whole build dir) keeps
+# the expensive artifacts — the provisioned OpenXR loader under
+# _openxr-$OPENXR_VERSION and the _plugins staging dir — so a clean reconfigure
+# costs a rebuild, not a re-download. Mirrors build_windows.bat's --clean.
+if [ "$CLEAN" = "ON" ]; then
+  echo "=== --clean: removing CMake cache in $BUILD_DIR (keeping _openxr-* and _plugins) ==="
+  rm -rf "$BUILD_DIR/CMakeCache.txt" "$BUILD_DIR/CMakeFiles"
+fi
 
 OPENXR_VERSION="1.1.63"
 # Versioned cache (#1487): the existence gate below is inherently
