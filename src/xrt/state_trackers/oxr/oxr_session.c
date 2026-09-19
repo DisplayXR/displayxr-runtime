@@ -4340,7 +4340,23 @@ oxr_session_create_impl(struct oxr_logger *log,
 			struct comp_vk_native_xlib_handle xlib_handle = {0};
 			const XrXlibWindowBindingCreateInfoDXR *xlib_binding = OXR_GET_INPUT_FROM_CHAIN(
 			    createInfo, XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_DXR, XrXlibWindowBindingCreateInfoDXR);
-			if (xlib_binding != NULL && xlib_binding->xDisplay != NULL && xlib_binding->window != 0) {
+			if (xlib_binding != NULL) {
+				// A chained-but-empty binding used to be dropped SILENTLY: the
+				// session fell through to the hosted path and the first sign of
+				// trouble was an XCB error from a window the app never asked the
+				// runtime to create. Name the field instead.
+				if (xlib_binding->xDisplay == NULL) {
+					return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+					                 "(" XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME
+					                 ") XrXlibWindowBindingCreateInfoDXR::xDisplay must not be "
+					                 "NULL");
+				}
+				if (xlib_binding->window == 0) {
+					return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+					                 "(" XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME
+					                 ") XrXlibWindowBindingCreateInfoDXR::window must not be None "
+					                 "(0)");
+				}
 				xlib_handle.display = (void *)xlib_binding->xDisplay;
 				xlib_handle.window = (unsigned long)xlib_binding->window;
 				window_handle = &xlib_handle;
@@ -4354,8 +4370,22 @@ oxr_session_create_impl(struct oxr_logger *log,
 			struct comp_vk_native_wayland_handle wayland_handle = {0};
 			const XrWaylandSurfaceBindingCreateInfoDXR *wayland_binding = OXR_GET_INPUT_FROM_CHAIN(
 			    createInfo, XR_TYPE_WAYLAND_SURFACE_BINDING_CREATE_INFO_DXR, XrWaylandSurfaceBindingCreateInfoDXR);
-			if (wayland_binding != NULL && wayland_binding->wlDisplay != NULL &&
-			    wayland_binding->wlSurface != NULL) {
+			if (wayland_binding != NULL) {
+				// Same silent-drop as the xlib sibling above, and worse here:
+				// falling through would try comp_vk_native_window_xcb_create and
+				// fail with an XCB diagnostic that never mentions Wayland.
+				if (wayland_binding->wlDisplay == NULL) {
+					return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+					                 "(" XR_DXR_WAYLAND_SURFACE_BINDING_EXTENSION_NAME
+					                 ") XrWaylandSurfaceBindingCreateInfoDXR::wlDisplay must not "
+					                 "be NULL");
+				}
+				if (wayland_binding->wlSurface == NULL) {
+					return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+					                 "(" XR_DXR_WAYLAND_SURFACE_BINDING_EXTENSION_NAME
+					                 ") XrWaylandSurfaceBindingCreateInfoDXR::wlSurface must not "
+					                 "be NULL");
+				}
 				wayland_handle.display = (void *)wayland_binding->wlDisplay;
 				wayland_handle.surface = (void *)wayland_binding->wlSurface;
 				window_handle = &wayland_handle;

@@ -33,11 +33,25 @@ const char *xrt_gfx_vk_instance_extensions = VK_KHR_EXTERNAL_FENCE_CAPABILITIES_
     // VK native compositor on Android needs VkSurfaceKHR via VK_KHR_android_surface
     " " VK_KHR_SURFACE_EXTENSION_NAME
     " " VK_KHR_ANDROID_SURFACE_EXTENSION_NAME
-#elif defined(VK_KHR_xcb_surface) && defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
-    // VK native compositor on desktop Linux needs VkSurfaceKHR via VK_KHR_xcb_surface
-    // (xcb_connection_t + xcb_window_t -> VkSurfaceKHR in comp_vk_native_target).
+#elif defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
+    // VK native compositor on desktop Linux needs VkSurfaceKHR plus whichever
+    // window-system surface extension the app's binding will end up using
+    // (xcb_connection_t + xcb_window_t, or wl_display* + wl_surface* ->
+    // VkSurfaceKHR in comp_vk_native_target).
+    //
+    // ADDITIVE, not either/or, and for a sharper reason than the enable2 list
+    // in oxr_vulkan.c: an enable1 app enables EXACTLY this string, so naming
+    // only VK_KHR_xcb_surface here makes vkCreateWaylandSurfaceKHR permanently
+    // unresolvable and the Wayland present path impossible on this path too.
+    // Both compiled-in platforms go in unconditionally; an unused surface
+    // extension costs nothing on any Linux ICD.
     " " VK_KHR_SURFACE_EXTENSION_NAME
+#ifdef VK_KHR_xcb_surface
     " " VK_KHR_XCB_SURFACE_EXTENSION_NAME
+#endif
+#ifdef VK_KHR_wayland_surface
+    " " VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME
+#endif
 #endif
     ;
 
@@ -52,17 +66,19 @@ const char *xrt_gfx_vk_device_extensions = VK_KHR_DEDICATED_ALLOCATION_EXTENSION
 // Platform version of "external_memory"
 #if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_FD)
     " " VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME
-#if defined(VK_KHR_xcb_surface) && defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
+#if (defined(VK_KHR_xcb_surface) || defined(VK_KHR_wayland_surface)) && defined(XRT_OS_LINUX) &&                       \
+    !defined(XRT_OS_ANDROID)
     // VK native compositor on desktop Linux presents on the app's VkDevice via a
-    // swapchain over the XCB surface (comp_vk_native_target)
+    // swapchain over the XCB *or* Wayland surface (comp_vk_native_target) — the
+    // gate has to name both, or an XRT_HAVE_XCB=OFF / XRT_HAVE_WAYLAND=ON build
+    // hands the enable1 app a surface it can never present on.
     " " VK_KHR_SWAPCHAIN_EXTENSION_NAME
     // Desktop-background capture (runtime#757): the display processor imports
     // PipeWire dma-bufs on the app's VkDevice (the same vk_bundle the DP
     // weaves with), so the device needs the dma-buf import set. Universally
     // supported by Mesa and the NVIDIA driver on the desktop-Linux targets we
     // ship (Preview).
-    " " VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME
-    " " VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME
+    " " VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME " " VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME
 #endif
 
 #elif defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_AHARDWAREBUFFER)
