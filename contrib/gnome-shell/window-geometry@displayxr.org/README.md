@@ -71,7 +71,13 @@ the same geometry to serve its own non-DisplayXR apps). The full contract is in
 
 ## Constraints
 
-- Coordinates are logical pixels; windowed weaving requires monitor scale 1.0
-  (the provider reports the scale so the runtime can warn otherwise).
+- Coordinates are logical pixels; windowed weaving requires monitor scale 1.0.
+  The provider reports the scale, and at anything other than 1.0 the runtime
+  **refuses** the rect and stays display-scoped rather than weave at a phase it
+  knows is wrong (runtime#1557) — the compositor also resamples the surface at
+  non-unit scale, which destroys an interlace regardless of phase.
+- GNOME Shell versions 45–50 (`shell-version` in `metadata.json`). Validated
+  live on GNOME 50.1 / Ubuntu 26.04 (runtime#817). A newly installed extension
+  is only picked up at the next login — Wayland cannot restart the shell.
 - Runtime matches windows by PID → works for in-process apps; IPC/service
   mode needs the client PID plumbed (tracked in runtime#817).
