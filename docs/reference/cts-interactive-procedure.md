@@ -707,24 +707,40 @@ skips.
 
 ## 9. Where the XML lands, and how to package it
 
-`run_cts.ps1` writes both files to `%TEMP%` and prints the paths as its last two
-lines:
+`run_cts.ps1` writes **three** files to `%TEMP%`, all on the same stem, and
+prints their paths as its last three lines:
 
 ```
 XML:     C:\Users\<you>\AppData\Local\Temp\interactive_composition_d3d11.xml
 CONSOLE: C:\Users\<you>\AppData\Local\Temp\interactive_composition_d3d11_console.log
+STDOUT:  C:\Users\<you>\AppData\Local\Temp\interactive_composition_d3d11_stdout.log
 ```
+
+The two logs are **not** duplicates. `_console.log` is the Catch2 console
+reporter's output — the per-test results. `_stdout.log` is `conformance_cli`'s
+own standard output, which is where it prints its frame-timing block (average
+`xrWaitFrame` wait, overhead score) that never goes through the reporter at all.
+Keep both.
+
+> **An interactive run shows no live terminal output.** `-RedirectStandardOutput`
+> can only target a file, so `conformance_cli`'s stdout is buffered to
+> `_stdout.log` and replayed to the terminal in one write **after the process
+> exits**. On an hour-long hand-paced run that means a silent console
+> throughout. It is not a hang. The prompts you act on are rendered composition
+> layers, not stdout — and when a test needs a log to answer it (§8.6, haptic
+> confirmation), the log to tail is the **runtime's**, in
+> `%LOCALAPPDATA%\DisplayXR\`, not this one.
 
 The `-Interactive` names are chosen so a submission package can be assembled
 from them unmodified:
 
-| Category | XML | Console log |
-|---|---|---|
-| composition | `interactive_composition_<graphics>.xml` | `interactive_composition_<graphics>_console.log` |
-| scenario | `interactive_scenario_<graphics>.xml` | `interactive_scenario_<graphics>_console.log` |
-| actions | `interactive_actions_<graphics>_<profile-slug>.xml` | `…_console.log` |
+| Category | XML | Reporter log | Stdout log |
+|---|---|---|---|
+| composition | `interactive_composition_<graphics>.xml` | `…_console.log` | `…_stdout.log` |
+| scenario | `interactive_scenario_<graphics>.xml` | `…_console.log` | `…_stdout.log` |
+| actions | `interactive_actions_<graphics>_<profile-slug>.xml` | `…_console.log` | `…_stdout.log` |
 
-(Automated runs keep the historical `cts_<tag>.xml` stem, so the two never
+(Automated runs keep the historical `cts_<tag>` stem, so the two families never
 collide in one directory.)
 
 **Rename on packaging.** The CTS usage guide's own example filenames are
@@ -740,7 +756,7 @@ differ when assembling the package:
 | `interactive_actions_<graphics>_<profile-slug>.xml` | `interactive_action_<profile>.xml` |
 | (automated) `cts_<graphics>_<api>.xml` | `automated_<api>.xml` |
 
-**Copy both out of `%TEMP%` immediately.** `%TEMP%` is swept, and the screenshot
+**Copy all three out of `%TEMP%` immediately.** `%TEMP%` is swept, and the screenshot
 tooling in CLAUDE.md § *Autonomous capture* writes there too.
 
 For each run, record alongside the XML:
