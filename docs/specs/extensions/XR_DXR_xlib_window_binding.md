@@ -6,7 +6,7 @@
 | Spec Version | 1 |
 | Type Values | `XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_DXR` (1004999200) |
 | Author | The DisplayXR Project |
-| Platform | Desktop Linux (X11/Xlib). Wayland out of scope (see §6). |
+| Platform | Desktop Linux (X11/Xlib). Wayland has its own sibling: [`XR_DXR_wayland_surface_binding`](XR_DXR_wayland_surface_binding.md). |
 
 ---
 
