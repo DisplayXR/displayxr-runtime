@@ -106,7 +106,7 @@ jobs:
             libeigen3-dev libcjson-dev libudev-dev \
             libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev libwayland-dev \
             libdbus-1-dev \
-            libgl1-mesa-dev libegl1-mesa-dev libxrandr-dev libxxf86vm-dev libxcb-glx0-dev
+            libgl-dev libglvnd-dev libegl1-mesa-dev libxrandr-dev libxxf86vm-dev libxcb-glx0-dev
 
       - name: Build + headless selftest + test app
         # --apps also builds the OpenXR loader (from source) + the test apps:
@@ -142,7 +142,7 @@ jobs:
             libeigen3-dev libcjson-dev libudev-dev \
             libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev libwayland-dev \
             libdbus-1-dev \
-            libgl1-mesa-dev libegl1-mesa-dev libxrandr-dev libxxf86vm-dev libxcb-glx0-dev
+            libgl-dev libglvnd-dev libegl1-mesa-dev libxrandr-dev libxxf86vm-dev libxcb-glx0-dev
 
       - uses: actions/checkout@v5
         if: needs.DetectChanges.outputs.docs_only != 'true'
@@ -206,7 +206,7 @@ jobs:
             libeigen3-dev libcjson-dev libudev-dev \
             libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev libwayland-dev \
             libdbus-1-dev \
-            libgl1-mesa-dev libegl1-mesa-dev libxrandr-dev libxxf86vm-dev libxcb-glx0-dev
+            libgl-dev libglvnd-dev libegl1-mesa-dev libxrandr-dev libxxf86vm-dev libxcb-glx0-dev
 
       - name: Build service + IPC-client runtime (headless selftest)
         # XRT_FEATURE_SERVICE=ON: displayxr-service + the IPC-client runtime
@@ -219,11 +219,16 @@ jobs:
   # Build the runtime .deb and, on a v* tag, attach it to the GitHub Release —
   # the CI-published asset the Linux meta-bundle fetches (#781 Phase 3). Runs on
   # every PR too (build-only) so a broken package_deb_linux.sh is caught before
-  # release. NB: deliberately does NOT install the GL/EGL dev libs — the .deb is
-  # the in-process, Vulkan-only runtime, and finding GL would flip XRT_HAVE_OPENGL
-  # on and trip the comp_gl-has-no-Linux-branch gate (#709). The vendor Leia
-  # plug-in .deb is NOT built here: Track B needs the commercial SR SDK, so it is
-  # produced on an SR-equipped box, not public CI.
+  # release. NB: deliberately does NOT install the GL/EGL dev libs — NOT because
+  # they would break the build (comp_gl is gated `(WIN32 OR APPLE) AND
+  # XRT_HAVE_OPENGL` in src/xrt/compositor/CMakeLists.txt, so on Linux GL only
+  # reaches the sim_display GL DP + aux_ogl, and a 26.04 build with GL/EGL ON is
+  # green), but because Linux has no GL compositor at all: flipping
+  # XRT_HAVE_OPENGL/XRT_HAVE_EGL on would only add unusable code and extra
+  # runtime Depends to the shipped .deb. (The Selftest/Service jobs install them
+  # on purpose — they exist to keep the platform gate itself honest, #709.) The
+  # vendor Leia plug-in .deb is NOT built here: Track B needs the commercial SR
+  # SDK, so it is produced on an SR-equipped box, not public CI.
   Deb:
     needs: DetectChanges
     runs-on: ubuntu-latest
@@ -249,6 +254,10 @@ jobs:
         # nothing references a wl_* symbol (the app's wl_display*/wl_surface* go
         # straight into VkWaylandSurfaceCreateInfoKHR), so --as-needed drops
         # -lwayland-client and libwayland-client0 never enters Depends.
+        # libxrandr-dev is REQUIRED too: with x11+xrandr absent, pkg_check_modules
+        # leaves XRT_HAVE_XLIB_XRANDR OFF and the released .deb ships with no
+        # DXR_LINUX_DIRECT_SCANOUT present path (adds libxrandr2 + libx11-6 to the
+        # derived Depends). Keep in lockstep with scripts/test_deb_linux.sh.
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           sudo apt-get update
@@ -258,6 +267,7 @@ jobs:
             libeigen3-dev libcjson-dev libudev-dev \
             libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev libwayland-dev \
             libdbus-1-dev \
+            libxrandr-dev \
             dpkg-dev fakeroot
 
       - name: Build runtime .deb (clean Release build)
