@@ -5140,6 +5140,59 @@ xrt_to_xr_pose(struct xrt_pose *xrt_pose, XrPosef *xr_pose)
 	xr_pose->position.z = xrt_pose->position.z;
 }
 
+/*!
+ * Report "no hand" the way the spec demands: `isActive` false *and* every
+ * joint location — plus every joint velocity, when one is chained — with its
+ * flags cleared.
+ *
+ * Locate Hand Joints: "If the returned isActive is false, it indicates the
+ * hand tracker did not detect the hand input or the application lost input
+ * focus. In this case, the runtime must return all jointLocations with
+ * neither XR_SPACE_LOCATION_POSITION_VALID_BIT nor
+ * XR_SPACE_LOCATION_ORIENTATION_VALID_BIT set."
+ *
+ * The runtime owns that contract, so it is enforced here rather than trusted
+ * to the device: a `xrt_device::get_hand_tracking` may report
+ * `is_active == false` while still handing back its last joint set with the
+ * valid bits still set in `relation_flags`. An app is also entitled to pass
+ * an uninitialised `jointLocations` array and read it back after a successful
+ * call — which is exactly what the CTS `XR_EXT_hand_tracking-simple-queries`
+ * "Query joint locations" case does, and how #1543 surfaced.
+ *
+ * @p ds is the chained `XrHandTrackingDataSourceStateEXT`, or NULL when the
+ * app did not chain one (or `XR_EXT_hand_tracking_data_source` is not built
+ * in). Its `isActive` must mirror @ref XrHandJointLocationsEXT::isActive —
+ * the two cannot disagree about whether a hand was located — so an inactive
+ * locate clears it here too. `dataSource` is left alone: it is only
+ * meaningful once a source device is known, and the later exits have already
+ * written it by the time they get here. (Quoting the extension by name: the
+ * local `openxr.h` carries only the struct declaration, no prose, and no
+ * OpenXR-CTS case for the extension is checked out on this box.)
+ */
+static void
+oxr_hand_joints_report_inactive(XrHandJointLocationsEXT *locations,
+                                XrHandJointVelocitiesEXT *vel,
+                                XrHandTrackingDataSourceStateEXT *ds)
+{
+	locations->isActive = XR_FALSE;
+
+	if (ds != NULL) {
+		ds->isActive = XR_FALSE;
+	}
+
+	for (uint32_t i = 0; i < locations->jointCount; i++) {
+		locations->jointLocations[i].locationFlags = 0;
+	}
+
+	if (vel == NULL) {
+		return;
+	}
+
+	for (uint32_t i = 0; i < vel->jointCount; i++) {
+		vel->jointVelocities[i].velocityFlags = 0;
+	}
+}
+
 XrResult
 oxr_session_hand_joints(struct oxr_logger *log,
                         struct oxr_hand_tracker *hand_tracker,
@@ -5153,6 +5206,16 @@ oxr_session_hand_joints(struct oxr_logger *log,
 
 	XrHandJointVelocitiesEXT *vel =
 	    OXR_GET_OUTPUT_FROM_CHAIN(locations, XR_TYPE_HAND_JOINT_VELOCITIES_EXT, XrHandJointVelocitiesEXT);
+
+	// Resolved up here, not next to the `dataSource` assignment below, so
+	// that EVERY exit — including the no-device one — can answer it. #1543.
+	XrHandTrackingDataSourceStateEXT *data_source_state = NULL;
+#ifdef OXR_HAVE_EXT_hand_tracking_data_source
+	if (inst->extensions.EXT_hand_tracking_data_source) {
+		data_source_state = OXR_GET_OUTPUT_FROM_CHAIN(locations, XR_TYPE_HAND_TRACKING_DATA_SOURCE_STATE_EXT,
+		                                              XrHandTrackingDataSourceStateEXT);
+	}
+#endif
 
 	const XrTime at_time = locateInfo->time;
 
@@ -5192,19 +5255,19 @@ oxr_session_hand_joints(struct oxr_logger *log,
 	}
 
 	if (data_source == NULL || data_source->xdev == NULL) {
-		locations->isActive = false;
+		// No device holds the hand-tracking role — e.g. the input
+		// provider reported its hardware ABSENT, so the arbiter left
+		// the slot at -1. Still an inactive *locate*, not an error,
+		// so the joint flags owe the app a clear. #1543.
+		oxr_hand_joints_report_inactive(locations, vel, data_source_state);
 		return XR_SUCCESS;
 	}
 
 #ifdef OXR_HAVE_EXT_hand_tracking_data_source
-	XrHandTrackingDataSourceStateEXT *data_source_state = NULL;
-	if (hand_tracker->sess->sys->inst->extensions.EXT_hand_tracking_data_source) {
-		data_source_state = OXR_GET_OUTPUT_FROM_CHAIN(locations, XR_TYPE_HAND_TRACKING_DATA_SOURCE_STATE_EXT,
-		                                              XrHandTrackingDataSourceStateEXT);
-	}
-
+	// The source device is known, so `dataSource` can be answered — but
+	// `isActive` cannot yet: two exits below still report "no hand". It is
+	// set at the success path, where it mirrors `locations->isActive`.
 	if (data_source_state != NULL) {
-		data_source_state->isActive = XR_TRUE;
 		data_source_state->dataSource = xrt_hand_tracking_data_source_to_xr(data_source->input_name);
 	}
 #endif
@@ -5221,7 +5284,7 @@ oxr_session_hand_joints(struct oxr_logger *log,
 		return ret;
 	}
 	if (T_base_xdev.relation_flags == 0) {
-		locations->isActive = false;
+		oxr_hand_joints_report_inactive(locations, vel, data_source_state);
 		return XR_SUCCESS;
 	}
 
@@ -5234,22 +5297,15 @@ oxr_session_hand_joints(struct oxr_logger *log,
 
 	// Can we not relate to this space or did we not get values?
 	if (T_base_hand.relation_flags == 0 || !value.is_active) {
-		locations->isActive = false;
-
-		// Loop over all joints and zero flags.
-		for (uint32_t i = 0; i < locations->jointCount; i++) {
-			locations->jointLocations[i].locationFlags = XRT_SPACE_RELATION_BITMASK_NONE;
-			if (vel) {
-				XrHandJointVelocityEXT *v = &vel->jointVelocities[i];
-				v->velocityFlags = XRT_SPACE_RELATION_BITMASK_NONE;
-			}
-		}
-
+		oxr_hand_joints_report_inactive(locations, vel, data_source_state);
 		return XR_SUCCESS;
 	}
 
 	// We know we are active.
 	locations->isActive = true;
+	if (data_source_state != NULL) {
+		data_source_state->isActive = XR_TRUE;
+	}
 
 	for (uint32_t i = 0; i < locations->jointCount; i++) {
 		locations->jointLocations[i].locationFlags =
