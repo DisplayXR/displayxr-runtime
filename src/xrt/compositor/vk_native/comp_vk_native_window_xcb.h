@@ -66,11 +66,23 @@ struct comp_vk_native_xlib_handle
  *
  * `display` is a `struct wl_display *` and `surface` a `struct wl_surface *`;
  * kept as void pointers so includers don't need the Wayland headers.
+ *
+ * The size fields carry XrWaylandSurfaceGeometryDXR (extension spec v2). They
+ * are not a convenience: a wl_surface has NO intrinsic size — the WSI answers
+ * `currentExtent == UINT32_MAX` and the buffer the runtime attaches is what
+ * DEFINES the surface — so without them the compositor falls back to the panel
+ * and thereby RESIZES the app's window to the panel. Only the app knows the
+ * size (it acked the xdg_toplevel.configure), and the compositor-side geometry
+ * service cannot bootstrap it because Mutter only lists a window once it has a
+ * mapped buffer. 0 = not declared, keep the pre-v2 panel-sized behaviour.
  */
 struct comp_vk_native_wayland_handle
 {
 	void *display;
 	void *surface;
+	uint32_t width;       //!< Declared surface width in pixels, 0 = unknown.
+	uint32_t height;      //!< Declared surface height in pixels, 0 = unknown.
+	uint32_t refresh_mhz; //!< wl_output.mode refresh in milli-hertz, 0 = unknown.
 };
 
 struct comp_vk_native_window_xcb;

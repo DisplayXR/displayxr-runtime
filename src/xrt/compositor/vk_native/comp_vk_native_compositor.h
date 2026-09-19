@@ -246,6 +246,36 @@ void
 comp_vk_native_compositor_set_legacy_app_tile_scaling(struct xrt_compositor *xc, bool legacy);
 
 /*!
+ * Publish the app's Wayland surface geometry (XR_DXR_wayland_surface_binding
+ * spec v2, `xrSetWaylandSurfaceGeometryDXR`).
+ *
+ * The Wayland analogue of the XCB `query_geometry` poll, pushed instead of
+ * pulled because there is nothing to poll: a wl_surface has no intrinsic size,
+ * the WSI reports `currentExtent == UINT32_MAX`, and the buffer the compositor
+ * attaches is what DEFINES the surface. Only the app has seen the
+ * `xdg_toplevel.configure`. Position is NOT part of this call — that still
+ * comes from the compositor-side geometry service (ADR-033).
+ *
+ * De-duplicated: the next `begin_frame` compares against the live swapchain
+ * size and only then re-creates it. Safe to call every frame, and safe to call
+ * from a different thread than the render thread (guarded by the compositor
+ * mutex).
+ *
+ * @param xc          A vk_native compositor.
+ * @param width       Surface width in pixels, must be non-zero.
+ * @param height      Surface height in pixels, must be non-zero.
+ * @param refresh_mhz `wl_output.mode` refresh in milli-hertz, 0 = leave alone.
+ *
+ * @return false when this session has no app-provided Wayland surface (or the
+ *         build has no Wayland support), in which case nothing was recorded.
+ */
+bool
+comp_vk_native_compositor_set_wayland_surface_geometry(struct xrt_compositor *xc,
+                                                       uint32_t width,
+                                                       uint32_t height,
+                                                       uint32_t refresh_mhz);
+
+/*!
  * Get the vk_bundle from a VK native compositor (for sub-modules).
  *
  * @ingroup comp_vk_native

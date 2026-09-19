@@ -427,6 +427,25 @@ struct comp_vk_native_compositor
 	bool use_wayland;
 	//! wl_display* + wl_surface* handed to the target as the type-erased hwnd.
 	struct comp_vk_native_wayland_handle wayland_handle;
+	/*!
+	 * Live app-declared surface size (XR_DXR_wayland_surface_binding spec v2,
+	 * XrWaylandSurfaceGeometryDXR + xrSetWaylandSurfaceGeometryDXR).
+	 *
+	 * This is the Wayland substitute for the XCB `query_geometry` poll, and it
+	 * has to come from the app: a wl_surface has no intrinsic size, the WSI
+	 * answers `currentExtent == UINT32_MAX`, and the buffer this compositor
+	 * attaches is what DEFINES the surface — so a guess does not mis-size the
+	 * window, it RESIZES it. Only the app has seen the xdg_toplevel.configure,
+	 * and the compositor-side geometry service cannot bootstrap the value
+	 * because Mutter lists a window only once it has a mapped buffer.
+	 *
+	 * Written by the app thread inside
+	 * comp_vk_native_compositor_set_wayland_surface_geometry, read by the
+	 * compositor thread in begin_frame; both take @p mutex. 0 = never declared,
+	 * which keeps the pre-v2 panel-sized behaviour.
+	 */
+	uint32_t wl_declared_width;
+	uint32_t wl_declared_height;
 #endif
 #ifdef DXR_HAVE_WL_GEOM
 	//! Compositor-side window-geometry provider (#817). NULL when the session
@@ -2030,6 +2049,19 @@ vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 			// geometry — no helper tracking ConfigureNotify for this window.
 			comp_vk_native_window_xcb_query_geometry(&c->xcb_handle, &new_width, &new_height);
 		}
+#ifdef XRT_HAVE_WAYLAND
+		else if (c->use_wayland) {
+			// Wayland: nothing to poll. The app republishes its acked
+			// xdg_toplevel.configure size through
+			// xrSetWaylandSurfaceGeometryDXR; read the latest under the same
+			// lock the setter writes it with, then fall into the shared
+			// compare-and-follow below.
+			os_mutex_lock(&c->mutex);
+			new_width = c->wl_declared_width;
+			new_height = c->wl_declared_height;
+			os_mutex_unlock(&c->mutex);
+		}
+#endif
 
 		if (new_width > 0 && new_height > 0 &&
 		    (new_width != c->settings.preferred.width ||
@@ -8363,7 +8395,21 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		c->use_wayland = true;
 		c->xcb_window = NULL;
 		c->owns_window = false;
+		// Spec v2: the app may have declared its surface size + output refresh
+		// (XrWaylandSurfaceGeometryDXR). Seed the live value from it so the very
+		// first swapchain is already the app's size.
+		c->wl_declared_width = wl->width;
+		c->wl_declared_height = wl->height;
 		U_LOG_I("Using app-provided Wayland surface (XR_DXR_wayland_surface_binding)");
+		if (wl->width > 0 && wl->height > 0) {
+			U_LOG_W("Wayland surface geometry declared by the app: %ux%u @ %u mHz", wl->width, wl->height,
+			        wl->refresh_mhz);
+		} else {
+			U_LOG_W(
+			    "Wayland surface geometry NOT declared (no XrWaylandSurfaceGeometryDXR) — "
+			    "sizing the swapchain to the panel, which on Wayland RESIZES the surface to "
+			    "the panel. Chain the struct to run windowed.");
+		}
 #ifdef DXR_HAVE_WL_GEOM
 		// Windowed weaving (#817): absolute window position via the
 		// compositor's geometry service. NULL / no-data → display-scoped.
@@ -8582,6 +8628,16 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 			c->settings.preferred.height = xh;
 		}
 	}
+#ifdef XRT_HAVE_WAYLAND
+	// App-provided Wayland surface: there is nothing to query. The WSI reports
+	// currentExtent == UINT32_MAX and the buffer we attach DEFINES the surface,
+	// so falling through to the panel size does not mis-size the window — it
+	// resizes it. The app's declared geometry (spec v2) is the only source.
+	if (c->use_wayland && c->wl_declared_width > 0 && c->wl_declared_height > 0) {
+		c->settings.preferred.width = c->wl_declared_width;
+		c->settings.preferred.height = c->wl_declared_height;
+	}
+#endif
 #endif
 
 	// Default refresh rate, replaced with the monitor's CURRENT mode where we
@@ -8612,6 +8668,23 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		if (refresh_handle.connection == NULL && c->xcb_window != NULL) {
 			comp_vk_native_window_xcb_get_handle(c->xcb_window, &refresh_handle);
 		}
+#ifdef XRT_HAVE_WAYLAND
+		// Wayland has no XCB connection, so the RandR query above cannot run and
+		// the rate stayed at the hardcoded 60 with no diagnostic. The app reads
+		// wl_output.mode and hands it over with its surface geometry (spec v2).
+		if (c->use_wayland && c->wayland_handle.refresh_mhz > 0) {
+			c->display_refresh_rate = (float)c->wayland_handle.refresh_mhz / 1000.0f;
+			U_LOG_W(
+			    "Display refresh rate: %.2f Hz (frame period %.2f ms) — from the app's "
+			    "XrWaylandSurfaceGeometryDXR",
+			    c->display_refresh_rate, 1000.0 / c->display_refresh_rate);
+		} else if (c->use_wayland) {
+			U_LOG_W(
+			    "Display refresh rate: %.2f Hz (frame period %.2f ms) — DEFAULT; the app declared "
+			    "no wl_output refresh and Wayland has no XCB connection for the RandR query",
+			    c->display_refresh_rate, 1000.0 / c->display_refresh_rate);
+		}
+#endif
 		if (refresh_handle.connection != NULL) {
 			float hz = 0.0f;
 			if (comp_vk_native_window_xcb_query_refresh_hz(&refresh_handle, &hz) && hz > 0.0f) {
@@ -9938,6 +10011,50 @@ comp_vk_native_compositor_set_legacy_app_tile_scaling(struct xrt_compositor *xc,
 	if (xc == NULL) return;
 	struct comp_vk_native_compositor *c = vk_comp(xc);
 	c->legacy_app_tile_scaling = legacy;
+}
+
+bool
+comp_vk_native_compositor_set_wayland_surface_geometry(struct xrt_compositor *xc,
+                                                       uint32_t width,
+                                                       uint32_t height,
+                                                       uint32_t refresh_mhz)
+{
+#if defined(XRT_OS_LINUX_DESKTOP) && defined(XRT_HAVE_WAYLAND)
+	if (xc == NULL || width == 0 || height == 0) {
+		return false;
+	}
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	if (!c->use_wayland) {
+		return false;
+	}
+
+	// Same lock the begin_frame reader takes. The app may call this from a
+	// different thread than the render thread, and the two u32s are a PAIR —
+	// a torn read would size the swapchain from one configure's width and
+	// another's height.
+	os_mutex_lock(&c->mutex);
+	const bool changed = c->wl_declared_width != width || c->wl_declared_height != height;
+	c->wl_declared_width = width;
+	c->wl_declared_height = height;
+	if (refresh_mhz > 0) {
+		c->wayland_handle.refresh_mhz = refresh_mhz;
+	}
+	os_mutex_unlock(&c->mutex);
+
+	// Lifecycle event (the app's toplevel was resized), never per frame — the
+	// app is expected to call this once per configure, and re-calls with an
+	// unchanged size are de-duplicated to silence right here.
+	if (changed) {
+		U_LOG_W("Wayland surface geometry republished by the app: %ux%u @ %u mHz", width, height, refresh_mhz);
+	}
+	return true;
+#else
+	(void)xc;
+	(void)width;
+	(void)height;
+	(void)refresh_mhz;
+	return false;
+#endif
 }
 
 struct vk_bundle *

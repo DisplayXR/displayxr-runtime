@@ -4413,6 +4413,23 @@ oxr_session_create_impl(struct oxr_logger *log,
 				wayland_handle.surface = (void *)wayland_binding->wlSurface;
 				window_handle = &wayland_handle;
 				window_is_wayland = true;
+
+				// Spec v2: the SIZE half of the binding. A wl_surface has no
+				// intrinsic size — the WSI answers currentExtent == UINT32_MAX
+				// and the buffer the runtime attaches DEFINES the surface — so
+				// without this the compositor sizes to the panel and thereby
+				// RESIZES the app's window. Only the app knows: it acked the
+				// xdg_toplevel.configure, and the compositor-side geometry
+				// service cannot bootstrap the value because Mutter lists a
+				// window only once it has a mapped buffer. Optional: absent (or
+				// zeroed) keeps the pre-v2 panel-sized behaviour.
+				const XrWaylandSurfaceGeometryDXR *wayland_geom = OXR_GET_INPUT_FROM_CHAIN(
+				    createInfo, XR_TYPE_WAYLAND_SURFACE_GEOMETRY_DXR, XrWaylandSurfaceGeometryDXR);
+				if (wayland_geom != NULL) {
+					wayland_handle.width = wayland_geom->width;
+					wayland_handle.height = wayland_geom->height;
+					wayland_handle.refresh_mhz = wayland_geom->refreshMilliHertz;
+				}
 			}
 #endif
 
