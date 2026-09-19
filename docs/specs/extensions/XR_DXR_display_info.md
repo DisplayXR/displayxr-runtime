@@ -1263,11 +1263,17 @@ renderHeight = (uint32_t)(windowHeight * recommendedViewScaleY)
 ```
 
 **Semantics:**
-- The scale factors are **static display properties**: they encode the ratio of the
-  display's optimal internal render resolution to its native pixel resolution (e.g.,
-  `sr_recommended_width / display_pixel_width`).
-- They do **not** change with window resize. The formula above naturally produces the
-  correct render resolution for any window size.
+- The pair reports **the ACTIVE rendering mode's per-view scale, as of the moment you
+  query it** — `xrEnumerateDisplayRenderingModesDXR`'s `viewScaleX/Y` for whichever mode
+  is currently active. Re-query `xrGetSystemProperties` after a mode change (or just read
+  the mode table, which is the same number) if you cache it.
+- Within one mode it is a **static display property**: the ratio of that mode's optimal
+  internal render resolution to the display's native pixel resolution (e.g.
+  `sr_recommended_width / display_pixel_width`). It does **not** change with window
+  resize — the formula above naturally produces the correct render resolution for any
+  window size.
+- If the display processor exposes no rendering-mode table, or the active mode declares
+  no scale, the runtime falls back to the plug-in's display-level baseline (or `1.0`).
 - **Both eyes use the same scale factors.** The scale encodes a static display property
   (ratio of optimal render resolution to native pixels), which is identical for left and
   right eyes.
@@ -1277,6 +1283,16 @@ renderHeight = (uint32_t)(windowHeight * recommendedViewScaleY)
   multi-view interlacing).
 - Scale factors represent **quality scaling only**. Aspect ratio is controlled by the
   window viewport and projection.
+
+> **Implementation note (runtime ≥ v2.17.1).** This is what the field always reported
+> *after* a mode change: the runtime used to keep a scalar copy of the active mode's scale
+> and refresh it at each mode-change site. That cache is gone — the value is now derived
+> from the mode table on every query, so it is also per-mode **before** the first mode
+> change, where it previously handed back the plug-in's display-level baseline. On a
+> plug-in whose baseline equals its default mode's scale (and on `sim_display`, whose
+> baseline is the minimum across modes) nothing observable moves; on one where they differ,
+> a first query now agrees with `xrEnumerateDisplayRenderingModesDXR` instead of
+> disagreeing with it until the app changed mode.
 
 **Example:**
 - Display native resolution: 3840 x 2160.

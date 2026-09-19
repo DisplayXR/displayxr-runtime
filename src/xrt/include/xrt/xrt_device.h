@@ -1207,6 +1207,57 @@ xrt_device_get_property(struct xrt_device *xdev,
 }
 
 /*!
+ * The ACTIVE rendering mode's per-view scale — the single source of truth for
+ * "how much of the panel does one view cover right now".
+ *
+ * Per-mode truth lives in @ref xrt_rendering_mode::view_scale_x / _y, indexed by
+ * @ref xrt_hmd_parts::active_rendering_mode_index. Anything that wants the scale
+ * of the mode currently being painted MUST derive it here instead of caching a
+ * copy somewhere: a cached scalar has to be re-written at *every* mode-change
+ * path (the xrRequestDisplayRenderingModeDXR success path, the begin-time mode
+ * floor, the RENDERING_MODE_CHANGE event arm, and any future service/IPC or
+ * workspace flip), and one forgotten path is a silent wrong answer rather than a
+ * build error.
+ *
+ * The DISPLAY-level baseline — the vendor plug-in's own recommendation, or the
+ * worst case across the mode table when the plug-in offers none — is a different
+ * quantity and keeps living in
+ * @ref xrt_system_compositor_info::recommended_view_scale_x / _y, which is
+ * written once at system-compositor creation and never mutated afterwards.
+ *
+ * @param[in]  xdev        Device to read; NULL and non-HMD devices are handled.
+ * @param[out] out_scale_x Horizontal per-view scale, written only on success.
+ * @param[out] out_scale_y Vertical per-view scale, written only on success.
+ *
+ * @return true when the device has a usable mode table and the active mode
+ *         carries a positive scale; false with both outputs left untouched
+ *         otherwise, so a caller can keep whatever fallback it already holds.
+ *
+ * @public @memberof xrt_device
+ */
+static inline bool
+xrt_device_get_active_mode_view_scale(const struct xrt_device *xdev, float *out_scale_x, float *out_scale_y)
+{
+	if (xdev == NULL || xdev->hmd == NULL || xdev->rendering_mode_count == 0) {
+		return false;
+	}
+
+	uint32_t idx = xdev->hmd->active_rendering_mode_index;
+	if (idx >= xdev->rendering_mode_count || idx >= XRT_MAX_RENDERING_MODES) {
+		return false;
+	}
+
+	const struct xrt_rendering_mode *mode = &xdev->rendering_modes[idx];
+	if (mode->view_scale_x <= 0.0f || mode->view_scale_y <= 0.0f) {
+		return false;
+	}
+
+	*out_scale_x = mode->view_scale_x;
+	*out_scale_y = mode->view_scale_y;
+	return true;
+}
+
+/*!
  * Helper function for @ref xrt_device::destroy.
  *
  * Handles nulls, sets your pointer to null.
