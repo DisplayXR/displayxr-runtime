@@ -5062,10 +5062,41 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 	mcp_capture_uninstall();
 	mcp_capture_fini(&c->mcp_capture);
 
+	/*
+	 * #1522: SAVE the caller's GL context before claiming ours.
+	 *
+	 * Every other entry point that makes the compositor context current
+	 * saves and restores the caller's — create_swapchain, layer_commit
+	 * ("critical … app has its own context and needs it back"), and
+	 * comp_gl_compositor_create. This one did not: it claimed the
+	 * compositor context and ended with an unconditional
+	 * wglMakeCurrent(NULL, NULL), so xrDestroySession returned to the app
+	 * with NOTHING current on its thread. Every GL call the app then made
+	 * before its own next make-current went through a GLAD ICD entry point
+	 * with a null current context — an access violation inside the ICD, at
+	 * whatever call site happened to come first. Under the CTS's
+	 * session churn that reads as a nondeterministic teardown SIGSEGV with
+	 * no DisplayXR frame on the stack.
+	 *
+	 * Restored at the end of the platform block below, AFTER our own
+	 * context is deleted (deleting a context that is current on this thread
+	 * is undefined).
+	 */
 #ifdef XRT_OS_WINDOWS
+	HDC prev_hdc = wglGetCurrentDC();
+	HGLRC prev_hglrc = wglGetCurrentContext();
+
 	// Make compositor context current for GL resource cleanup
 	if (c->hglrc) {
 		wglMakeCurrent(c->hdc, c->hglrc);
+	}
+#elif defined(__APPLE__)
+	CGLContextObj prev_cgl_ctx = CGLGetCurrentContext();
+
+	// Same rule on the macOS leg: the glDelete* calls below belong on the
+	// compositor's context, not on whatever the app left current.
+	if (c->macos_window != NULL) {
+		comp_gl_window_macos_make_current(c->macos_window);
 	}
 #endif
 
@@ -5134,9 +5165,43 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 	gl_destroy_dcomp_present(c);
 
 	if (c->hglrc) {
+		/*
+		 * The app never runs on the compositor context, so this cannot
+		 * fire — but restoring a context we just deleted would be worse
+		 * than leaving none current, so drop the restore if it does.
+		 */
+		if (prev_hglrc == c->hglrc) {
+			prev_hglrc = NULL;
+		}
 		wglMakeCurrent(NULL, NULL);
 		wglDeleteContext(c->hglrc);
+		c->hglrc = NULL;
 	}
+
+	/*
+	 * #1522: hand the app back exactly what it had. A caller that genuinely
+	 * had nothing current keeps nothing current.
+	 */
+	if (prev_hglrc != NULL) {
+		wglMakeCurrent(prev_hdc, prev_hglrc);
+	}
+
+	/*
+	 * #1522: hand the common (cache) DC back. GetDC() borrowed it from a
+	 * bounded process-wide cache — neither the shared window module's class
+	 * nor an app's is CS_OWNDC — and nothing released it, so every GL session
+	 * leaked one for the life of the process. Must run while c->hwnd is still
+	 * valid, i.e. before the window destroy below, and after the context that
+	 * used it is gone. Harmless (returns 1) if the app's class happens to
+	 * carry CS_OWNDC.
+	 */
+	if (c->hdc != NULL) {
+		if (c->hwnd != NULL) {
+			ReleaseDC(c->hwnd, c->hdc);
+		}
+		c->hdc = NULL;
+	}
+
 	if (c->owns_window && c->own_window != NULL) {
 		comp_d3d11_window_destroy(&c->own_window);
 	} else if (c->owns_window && c->hwnd) {
@@ -5149,6 +5214,14 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 	if (c->iosurface_gl_texture) {
 		glDeleteTextures(1, &c->iosurface_gl_texture);
 	}
+
+	/*
+	 * #1522: restore BEFORE the window (and with it the compositor's
+	 * NSOpenGLContext) goes away, so the app's context is current again and
+	 * nothing is left pointing at a destroyed one.
+	 */
+	CGLSetCurrentContext(prev_cgl_ctx);
+
 	if (c->macos_window != NULL) {
 		comp_gl_window_macos_destroy(&c->macos_window);
 	}
@@ -5195,19 +5268,6 @@ gl_get_proc_addr(void *userptr, const char *name)
 	return ret;
 }
 
-static const wchar_t GL_WINDOW_CLASS[] = L"DisplayXRGLCompositor";
-
-static LRESULT CALLBACK
-gl_window_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
-{
-	switch (msg) {
-	case WM_CLOSE:
-		return 0; // Prevent close
-	default:
-		return DefWindowProcW(hwnd, msg, wParam, lParam);
-	}
-}
-
 static bool
 gl_create_window_and_context(struct comp_gl_compositor *c,
                               void *window_handle,
@@ -5217,15 +5277,15 @@ gl_create_window_and_context(struct comp_gl_compositor *c,
                               int32_t screen_left,
                               int32_t screen_top)
 {
-	// Register window class
-	WNDCLASSEXW wc = {0};
-	wc.cbSize = sizeof(wc);
-	wc.style = CS_OWNDC;
-	wc.lpfnWndProc = gl_window_proc;
-	wc.hInstance = GetModuleHandleW(NULL);
-	wc.lpszClassName = GL_WINDOW_CLASS;
-	RegisterClassExW(&wc);
-
+	/*
+	 * #1522: no window class is registered here any more. This function used
+	 * to register a private CS_OWNDC class "DisplayXRGLCompositor" with its
+	 * own window proc, but nothing ever created a window from it — the
+	 * self-owned window comes from comp_d3d11_window_create() below, and an
+	 * app-supplied HWND is the app's own class. The registration was dead
+	 * from the day the GL leg moved to the shared window module, and it
+	 * leaked one process-global class atom per GL session.
+	 */
 	if (window_handle != NULL) {
 		c->hwnd = (HWND)window_handle;
 		c->owns_window = false;
@@ -5249,6 +5309,12 @@ gl_create_window_and_context(struct comp_gl_compositor *c,
 		return false;
 	}
 
+	/*
+	 * #1522: a COMMON (cache) device context — neither the shared window
+	 * module's class nor an app's is CS_OWNDC, so this handle is on loan from
+	 * a bounded process-wide cache and MUST be handed back with ReleaseDC.
+	 * gl_compositor_destroy() does that, while c->hwnd is still alive.
+	 */
 	c->hdc = GetDC(c->hwnd);
 
 	// Set pixel format
