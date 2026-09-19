@@ -10,7 +10,6 @@
  */
 
 #include "oxr_frame_sync.h"
-#include "oxr_session_window_binding.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_session.h"
 #include "xrt/xrt_config_build.h" // IWYU pragma: keep
@@ -73,6 +72,7 @@
 #endif
 
 #include "oxr_objects.h"
+#include "oxr_session_window_binding.h"
 #include "oxr_mcp_tools.h"
 #include "oxr_logger.h"
 #include "oxr_two_call.h"
@@ -5012,22 +5012,66 @@ oxr_session_create(struct oxr_logger *log,
 		return ret;
 	}
 
-#ifdef XRT_BUILD_DRIVER_QWERTY
-	// Capture desktop Linux's late-decoded binding for the profile gate only.
-	// In particular, Android's backend flag can describe a runtime-created
-	// hosted window and must not change the shared rendering/input classification.
+	/*
+	 * Track whether this session has an APP-PROVIDED window / readback / shared
+	 * texture — i.e. is it an extension (`_handle`/`_texture`) session, or a
+	 * `_hosted` one whose window the runtime owns?
+	 *
+	 * This used to be a plain assignment from `xsi` alone, which OVERWROTE the
+	 * answer the graphics backend had already reached. On desktop Linux that was
+	 * always the wrong answer: `oxr_session_populate_vk_native()` sets the flag
+	 * from its `window_handle`, which for XR_DXR_xlib_window_binding /
+	 * XR_DXR_wayland_surface_binding is a stack-local
+	 * `comp_vk_native_xlib_handle` / `comp_vk_native_wayland_handle` decoded in
+	 * `oxr_session_create_impl` — deliberately NOT stored in `xsi`. `xsi`'s three
+	 * pointer slots are all NULL for such a session, so every Linux `_handle`
+	 * app was classified as HOSTED: xrLocateViews took the qwerty-synthesis and
+	 * space-chain branches meant for a runtime-owned window
+	 * (`server_display_relative` false) and the qwerty device stayed bound to it.
+	 *
+	 * Why the pointer is not simply stuffed into `xsi.external_window_handle`:
+	 * that field is dereferenced as an HWND (the workspace resize + modal init
+	 * below) and as an NSView, and `comp_multi_compositor.c` hands it to
+	 * `comp_target` factories as a platform window. A Linux Display + Window
+	 * pair there would be a foreign pointer to those consumers — and a dangling
+	 * one besides, since both handle structs are locals the compositor copies
+	 * synchronously. Deriving the BOOL from both sources leaves every
+	 * platform-specific dereference exactly as gated as it is today.
+	 *
+	 * The desktop-Linux qualifier inside the helper is load-bearing in the other
+	 * direction: on Android the same backend flag describes a RUNTIME-created
+	 * hosted SurfaceView, which must stay classified as hosted.
+	 *
+	 * Consumers audited — oxr_session_frame_end.c (window-space / local-2D /
+	 * zones gates), oxr_display_zones.c (caps), oxr_input.c (qwerty gate),
+	 * oxr_mcp_tools.c (reporting) and the xrLocateViews rig branches — all read
+	 * it as a bool; none dereferences anything. The three layer gates also OR in
+	 * `is_vk_native_compositor`, so zones / local-2D admission on Linux is
+	 * unchanged by this.
+	 */
 #if defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
 	const bool desktop_linux = true;
 #else
 	const bool desktop_linux = false;
 #endif
-	const bool profile_external_binding =
-	    oxr_camera_profile_has_external_binding(desktop_linux, sess->has_external_window, &xsi);
-#endif
-
-	// Track whether this session has an external window handle, offscreen readback, or shared texture
 	sess->has_external_window =
-	    (xsi.external_window_handle != NULL || xsi.readback_callback != NULL || xsi.shared_texture_handle != NULL);
+	    oxr_session_has_external_window_binding(desktop_linux, sess->has_external_window, &xsi);
+
+	// One line per session (a create is a lifecycle event, not a hot path): the
+	// class this session was actually given. The absence of any such line is
+	// what let the Linux misclassification sit unnoticed.
+	U_LOG_W("Session class: %s (has_external_window=%d; xsi.external_window=%p, readback=%p, shared_tex=%p)",
+	        sess->has_external_window ? "APP-PROVIDED window/surface/texture"
+	                                  : "HOSTED - the runtime owns the window",
+	        (int)sess->has_external_window, xsi.external_window_handle, (void *)xsi.readback_callback,
+	        xsi.shared_texture_handle);
+
+#ifdef XRT_BUILD_DRIVER_QWERTY
+	// The legacy-camera-profile gate wants exactly the classification above; it
+	// used to call the helper itself because the assignment here had already
+	// discarded the backend's answer.
+	const bool profile_external_binding = sess->has_external_window;
+#endif
 
 #if defined(OXR_HAVE_DXR_android_surface_binding)
 	// Adopt the ANativeWindow reference the binding parse took, so session
