@@ -79,8 +79,10 @@ still gets the number.
 [gl-run]: https://github.com/DisplayXR/displayxr-runtime/actions/runs/35433846568
 
 Beyond software rasterizers, **#1526** tracks a self-hosted Windows runner on a
-hybrid iGPU+dGPU box — a real-GPU lane is what turns the three software-ICD arms
-from "it ran" into a defensible submission, and it is also the only way to cover
+hybrid iGPU+dGPU box. A software-rasterized green is a real result but not a
+submittable one — a submission owes a run on an implementation a user could
+have. The real-GPU lane is also what retires the one quarantine entry (the
+frame budget is only unmeetable on a CPU rasterizer) and the only way to cover
 adapter selection (`DXR_D3D_FORCE_GPU` / `DXR_VK_FORCE_GPU`).
 
 ### Result artefacts
