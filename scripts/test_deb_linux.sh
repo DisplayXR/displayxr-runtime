@@ -17,11 +17,39 @@
 #   ./scripts/test_deb_linux.sh                 # build + verify
 #   ./scripts/test_deb_linux.sh --verify-only   # reuse dist/*.deb, just verify
 #   ./scripts/test_deb_linux.sh --rebuild-image # force-rebuild the builder image
+#
+# WHY THE BUILDER IMAGE IS PINNED, AND TO WHAT.
+# package_deb_linux.sh's compute_depends() derives the .deb's `Depends:` from
+# the BUILD host's dpkg file database (objdump NEEDED sonames -> owning
+# packages). So the builder image is not a free choice: build on a different
+# release than CI and this test validates a dependency set CI never ships.
+# The image therefore tracks the `Deb` job in .github/workflows/build-linux.yml,
+# which is `runs-on: ubuntu-latest` — resolved to the **ubuntu-24.04** runner
+# image as of 2026-09-19 (read off a live run's "Operating System / Image:"
+# line, not assumed). NB the `Package` job's `container: ubuntu:26.04` is a
+# DIFFERENT artifact (the tarball, which has no derived Depends at all) and is
+# not what this script mirrors.
+# ==> WHEN GITHUB MOVES ubuntu-latest TO 26.04, MOVE $IMAGE WITH IT. <==
+# The verify stage stays on the OLDEST supported LTS on purpose: that is a
+# genuine "the shipped .deb still installs on the oldest LTS we claim" check,
+# and it must NOT be re-pinned in lockstep with the builder.
+#
+# The apt line below must also stay in lockstep with that Deb job's: anything
+# it installs that this image lacks silently produces a differently-configured
+# runtime here (libwayland-dev/libdbus-1-dev gate the Wayland present path +
+# the #817 geometry provider; libxrandr-dev gates XRT_HAVE_XLIB_XRANDR, the
+# direct-scanout present path).
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Builder: must match the CI `Deb` job's runner image (see header). Bump the
+# tag alongside the FROM line so a stale cached layer can't masquerade as the
+# new image.
 IMAGE="displayxr-deb-builder:ubuntu2404"
+# Verify: the oldest LTS the .deb claims to install on — deliberately NOT
+# bumped in lockstep with the builder.
+VERIFY_IMAGE="ubuntu:24.04"
 
 VERIFY_ONLY=0
 REBUILD_IMAGE=0
@@ -41,15 +69,16 @@ if [ "$REBUILD_IMAGE" = 1 ] || ! docker image inspect "$IMAGE" >/dev/null 2>&1; 
     docker build -t "$IMAGE" -f - "$ROOT" <<'DOCKERFILE'
 FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
-# libwayland-dev + libdbus-1-dev must match the Deb job in build-linux.yml —
-# without them this image would build a Wayland-less .deb and the acceptance
-# test would not be testing the artifact CI ships.
+# libwayland-dev + libdbus-1-dev + libxrandr-dev must match the Deb job in
+# build-linux.yml — without them this image would build a Wayland-less /
+# Xrandr-less .deb and the acceptance test would not be testing the artifact
+# CI ships (different feature set AND different derived Depends).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake ninja-build pkg-config git ca-certificates \
         binutils dpkg-dev fakeroot \
         libvulkan-dev glslang-tools libeigen3-dev libcjson-dev \
         libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev \
-        libwayland-dev libdbus-1-dev \
+        libwayland-dev libdbus-1-dev libxrandr-dev \
     && rm -rf /var/lib/apt/lists/*
 DOCKERFILE
 fi
@@ -72,9 +101,10 @@ DEB="$(ls -t "$ROOT"/dist/displayxr-runtime_*_*.deb 2>/dev/null | head -1 || tru
 echo "==> Testing $(basename "$DEB")"
 
 # --- 3. Clean-install + env-free acceptance run ----------------------------
-# A pristine ubuntu:24.04 (NOT the builder) proves the Depends are complete and
-# nothing leaks in from the build environment.
-docker run --rm -v "$ROOT/dist":/deb:ro ubuntu:24.04 bash -c '
+# A pristine $VERIFY_IMAGE (NOT the builder) proves the Depends are complete
+# and nothing leaks in from the build environment.
+echo "==> Verifying in $VERIFY_IMAGE"
+docker run --rm -v "$ROOT/dist":/deb:ro "$VERIFY_IMAGE" bash -c '
     set -e
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
