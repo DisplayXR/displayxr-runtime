@@ -30,6 +30,28 @@
 
 DEBUG_GET_ONCE_FLOAT_OPTION(sim_display_nominal_z_m, "SIM_DISPLAY_NOMINAL_Z_M", 0.60f)
 
+/*!
+ * Audit the weave target against the declared panel (#817).
+ *
+ * sim_display writes its own pixels with a fullscreen triangle, so it renders
+ * correctly at ANY target size and at any position — none of its output modes
+ * (SBS/anaglyph/blend/squeezed/quad/passthrough) is column-interlaced, so none
+ * is sensitive to the woven texture's exact physical pixel size or to where the
+ * target lands on the panel. A real lenticular weaver is sensitive to both: the
+ * interlacing phase is a function of the target's absolute physical-pixel
+ * origin, and any resample between the woven texture and scanout destroys the
+ * pattern outright.
+ *
+ * That makes a green sim_display run silent on precisely the properties that
+ * decide whether real weaving will work. This option makes sim_display *check*
+ * them instead: it compares the weave target against the panel dimensions the
+ * driver declared (SIM_DISPLAY_PIXEL_W/H) and reports the canvas rect the
+ * compositor asked for, so a mis-sized or displaced target is visible with no
+ * vendor hardware present. Off by default — purely diagnostic, never changes
+ * what is rendered.
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(sim_display_strict_panel, "SIM_DISPLAY_STRICT_PANEL", false)
+
 // SPIR-V shader headers (generated at build time by spirv_shaders())
 #include "sim_display/shaders/fullscreen.vert.h"
 #include "sim_display/shaders/anaglyph.frag.h"
@@ -89,6 +111,13 @@ struct sim_display_processor
 	//! what an undeclaring runtime means, so the default is honest.
 	enum xrt_atlas_encoding atlas_encoding;
 	bool atlas_encoding_declared; //!< Distinguishes "declared ENCODED" from "never declared".
+
+	//! #817 — last geometry reported by the SIM_DISPLAY_STRICT_PANEL audit.
+	//! Change-gated so a steady state logs once, never per frame.
+	bool geom_reported;
+	uint32_t geom_last_target_w, geom_last_target_h;
+	int32_t geom_last_canvas_x, geom_last_canvas_y;
+	uint32_t geom_last_canvas_w, geom_last_canvas_h;
 };
 
 static inline struct sim_display_processor *
@@ -136,17 +165,60 @@ sim_dp_process_atlas(struct xrt_display_processor *xdp,
                      uint32_t canvas_height)
 {
 	// TODO(#85): Pass canvas_offset_x/y to vendor weaver for interlacing
-	// phase correction once Leia SR SDK supports sub-rect offset.
-	(void)canvas_offset_x;
-	(void)canvas_offset_y;
-	(void)canvas_width;
-	(void)canvas_height;
+	// phase correction once Leia SR SDK supports sub-rect offset. The canvas
+	// rect does not affect what sim_display renders (a fullscreen triangle is
+	// correct at any size or offset) — it is consumed below only by the
+	// SIM_DISPLAY_STRICT_PANEL audit, which reports the geometry a real
+	// lenticular weaver would be sensitive to.
 
 	(void)view_format; // colorspace handled by SRV/format selection, not this arg
 
 	(void)atlas_image; // sim_display uses atlas_view via shader sampling
 	(void)target_image; // sim_display uses target_fb via render pass
 	struct sim_display_processor *sdp = sim_display_processor(xdp);
+
+	// #817: report the weave geometry against the declared panel. Diagnostic
+	// only — it never changes what is rendered.
+	if (debug_get_bool_option_sim_display_strict_panel()) {
+		const bool changed = !sdp->geom_reported ||                        //
+		                     sdp->geom_last_target_w != target_width ||    //
+		                     sdp->geom_last_target_h != target_height ||   //
+		                     sdp->geom_last_canvas_x != canvas_offset_x || //
+		                     sdp->geom_last_canvas_y != canvas_offset_y || //
+		                     sdp->geom_last_canvas_w != canvas_width ||    //
+		                     sdp->geom_last_canvas_h != canvas_height;
+
+		if (changed) {
+			float panel_w_m = 0.0f, panel_h_m = 0.0f;
+			uint32_t panel_px_w = 0, panel_px_h = 0;
+			sim_display_get_panel_metrics(&panel_w_m, &panel_h_m, &panel_px_w, &panel_px_h);
+
+			const bool fills_panel = panel_px_w == target_width && panel_px_h == target_height;
+			const bool at_origin = canvas_offset_x == 0 && canvas_offset_y == 0;
+
+			U_LOG_W("sim_display STRICT PANEL (#817): weave target %ux%u, panel %ux%u (%.3fx%.3f m) — %s",
+			        target_width, target_height, panel_px_w, panel_px_h, (double)panel_w_m,
+			        (double)panel_h_m,
+			        fills_panel ? "target is EXACTLY panel-sized (a real weaver gets 1:1 pixels)"
+			                    : "target is NOT panel-sized — windowed, or the desktop is SCALED; a "
+			                      "real weaver would be resampled and lose the interlace pattern");
+			U_LOG_W(
+			    "sim_display STRICT PANEL (#817): canvas offset (%d,%d) size %ux%u%s; atlas view "
+			    "%ux%u grid %ux%u. sim_display ignores the offset (it has no set_present_origin "
+			    "slot), so phase errors are INVISIBLE here by construction.",
+			    canvas_offset_x, canvas_offset_y, canvas_width, canvas_height,
+			    at_origin ? " (panel origin)" : " (displaced — phase-critical for a real weaver)",
+			    view_width, view_height, tile_columns, tile_rows);
+
+			sdp->geom_reported = true;
+			sdp->geom_last_target_w = target_width;
+			sdp->geom_last_target_h = target_height;
+			sdp->geom_last_canvas_x = canvas_offset_x;
+			sdp->geom_last_canvas_y = canvas_offset_y;
+			sdp->geom_last_canvas_w = canvas_width;
+			sdp->geom_last_canvas_h = canvas_height;
+		}
+	}
 	struct vk_bundle *vk = sdp->vk;
 
 	// Read the current mode (may change at runtime via 1/2/3 keys).
