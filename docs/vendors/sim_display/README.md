@@ -25,16 +25,22 @@ sim_display supports several output modes for visualizing stereo content on a 2D
 - **Side-by-side (SBS)** — left view in left half, right view in right half. Default.
 - **Anaglyph (red/cyan)** — for use with red/cyan glasses.
 - **Blend** — interleaved or alpha-blended views for quick visual sanity checks.
+- **Interlaced** — 1-pixel-period column interlace: view 0 on even panel
+  columns, view 1 on odd, both sampled at the same UV. The only
+  phase-sensitive mode — see the next section.
 
-Mode is selected at driver init time. See `sim_display_processor.c` for the mode dispatch and `shaders/` for the per-mode compositing kernels.
+Mode is selected at driver init time
+(`SIM_DISPLAY_OUTPUT=2d|anaglyph|sbs|squeezed|quad|blend|interlaced`). See
+`sim_display_processor.c` for the mode dispatch and `shaders/` for the
+per-mode compositing kernels.
 
 ## What sim_display does NOT validate — weave geometry
 
-None of the output modes above is column-interlaced, so **none of them is
-sensitive to the woven texture's exact physical pixel size, or to where that
-texture lands on the panel**. A fullscreen triangle renders correctly at any
-size and any offset, so sim_display produces a plausible image whether or not
-the geometry is right.
+With the one exception of **interlaced** (below), none of the output modes
+above is column-interlaced, so **none of them is sensitive to the woven
+texture's exact physical pixel size, or to where that texture lands on the
+panel**. A fullscreen triangle renders correctly at any size and any offset, so
+sim_display produces a plausible image whether or not the geometry is right.
 
 A real lenticular weaver is sensitive to both. Its interlacing phase is a
 function of the target's absolute physical-pixel origin, and any resample
@@ -45,6 +51,40 @@ So a green sim_display run establishes plug-in discovery, the display-processor
 path, session and swapchain creation, the frame loop, and that the compositor
 hands the DP an atlas. It establishes **nothing** about geometric correctness.
 Do not conclude from it that weaving will work.
+
+### `SIM_DISPLAY_OUTPUT=interlaced` — making size and phase errors visible
+
+`SIM_DISPLAY_OUTPUT=interlaced` is a phase-sensitive *proxy* for a lenticular
+weave. The output pixel at panel column `X` shows view 0 when
+`(X + phase) % 2 == 0` and view 1 otherwise, both sampled at the same
+normalized UV — position-preserving like anaglyph, not a rearranging layout
+like SBS. `phase` is the weave target's panel-relative X origin
+(`canvas_offset_x`, as handed to `process_atlas`).
+
+That gives it the same two failure modes as the real thing:
+
+- **Any resample** — desktop scale != 100%, a mis-sized swapchain, a
+  compositing display server scaling the surface — smears the alternating
+  columns into flat grey or a moire beat. A correct 1:1 path stays crisp.
+- **A wrong origin** flips which eye lands on the even columns, so the image
+  goes pseudoscopic (inverted depth) rather than merely shifting.
+
+`SIM_DISPLAY_INTERLACE_PERIOD=N` widens the stripes to `N` pixels so the
+pattern — and the phase shift as the window moves — is visible by eye. The
+default is 1, because 1 is what a lenticular actually needs and what makes the
+mode sensitive.
+
+It is still a proxy. There is **no lens model** here: no slant, no pitch, no
+per-view crosstalk, no per-vendor calibration. Interlaced can show you that the
+geometry is wrong; it can never show you that a real vendor weave is right.
+That still needs vendor hardware, or a measurement that is itself
+phase-sensitive.
+
+Backend support: implemented on the **Vulkan** and **OpenGL** display
+processors. The **D3D11**, **D3D12** and **Metal** processors fall back to
+anaglyph and log a one-shot warning — they share a shader-constant-buffer
+layout that the phase would have to be threaded through, which has not been
+done yet.
 
 `SIM_DISPLAY_STRICT_PANEL=1` narrows that gap. It makes the Vulkan DP report,
 whenever the geometry changes, the weave target it received against the panel
@@ -66,9 +106,10 @@ Two limits are worth stating plainly. The audit compares the target against the
 **declared** panel, which is not the same as the **physical** panel — under a
 scaled desktop the two diverge, and only the runtime's own desktop-rect resolver
 (`display_desktop_rect_is_panel`, surfaced to apps as `isPanelConfirmed`) sees
-it. And sim_display implements no `set_present_origin` slot at all, so phase
-errors are invisible here by construction. The option is diagnostic only; it
-never changes what is rendered.
+it. And sim_display implements no `set_present_origin` slot at all, so in every
+mode *except* interlaced a phase error is invisible in what it draws — the
+audit reports the offset, and the interlaced output is what actually reacts to
+it. The option is diagnostic only; it never changes what is rendered.
 
 ## Eye-tracking mode
 
