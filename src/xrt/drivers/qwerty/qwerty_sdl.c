@@ -107,40 +107,58 @@ default_qwerty_controller(struct xrt_device **xdevs, size_t xdev_count, struct q
 void
 qwerty_process_event(struct xrt_device **xdevs, size_t xdev_count, SDL_Event event)
 {
-	static struct qwerty_system *qsys = NULL;
-
-	static bool ctrl_pressed = false; // CTRL = left controller focus
-	static bool alt_pressed = false;  // ALT = right controller focus
-
-	// Default focused device: the one focused when F and G are not pressed
-	static struct qwerty_device *default_qdev;
-	// Default focused controller: the one used for qwerty_controller specific methods
-	static struct qwerty_controller *default_qctrl;
-
 	// #1538: resolve from the caller's xdevs every call. The upstream comment
 	// here claimed "we can cache the devices as they don't get destroyed during
 	// runtime" — that holds for one xrt_system_devices, but the qwerty_system is
 	// free()d with it at xrDestroyInstance, and a process that builds several in
 	// sequence (the OpenXR CTS builds dozens) then uses a dangling pointer. Same
 	// defect as the win32 front-end, where it is the #1538 ACCESS_VIOLATION.
-	struct qwerty_system *live = find_qwerty_system(xdevs, xdev_count);
-	if (live == NULL) {
+	//
+	// INVARIANT: the caller owns the @p xdevs array it passes and keeps it alive
+	// for the duration of this call.
+	struct qwerty_system *qsys = find_qwerty_system(xdevs, xdev_count);
+	if (qsys == NULL) {
 		return; // No qwerty devices in this device list.
 	}
-	if (live != qsys) {
-		qsys = live;
-		default_qdev = default_qwerty_device(xdevs, xdev_count, qsys);
-		default_qctrl = default_qwerty_controller(xdevs, xdev_count, qsys);
-		// The latched state describes keys held on the PREVIOUS system, which no
-		// longer exists — start the new one clean.
-		ctrl_pressed = false;
-		alt_pressed = false;
+
+	// Latched front-end state lives in the system (see struct qwerty_system
+	// § "Platform input front-end state"). The SDL debug GUI is single-threaded,
+	// so the lock buys lifetime correctness rather than mutual exclusion here,
+	// but it is taken for uniformity with the other front-ends. input_lock is a
+	// LEAF — released before any qwerty_press_* / qwerty_release_* call below.
+	bool first_bind = false;
+	os_mutex_lock(&qsys->input_lock);
+	if (!qsys->input_bound) {
+		qsys->input_default_qdev = default_qwerty_device(xdevs, xdev_count, qsys);
+		qsys->input_default_qctrl = default_qwerty_controller(xdevs, xdev_count, qsys);
+		qsys->input_bound = true;
+		first_bind = true;
+	}
+	bool process_keys = qsys->process_keys;
+	// Default focused device: the one focused when F and G are not pressed
+	struct qwerty_device *default_qdev = qsys->input_default_qdev;
+	// Default focused controller: the one used for qwerty_controller specific methods
+	struct qwerty_controller *default_qctrl = qsys->input_default_qctrl;
+	bool ctrl_pressed = qsys->input_ctrl_pressed; // CTRL = left controller focus
+	bool alt_pressed = qsys->input_alt_pressed;   // ALT = right controller focus
+	os_mutex_unlock(&qsys->input_lock);
+
+	if (first_bind) {
 		U_LOG_W("QWERTY SDL input bound to qwerty system %p", (void *)qsys);
 	}
 
-	if (!qsys->process_keys) {
+	if (!process_keys) {
 		return;
 	}
+
+// Store the snapshot back. Must run before every exit from here on.
+#define QSDL_STORE_STATE()                                                                                             \
+	do {                                                                                                           \
+		os_mutex_lock(&qsys->input_lock);                                                                      \
+		qsys->input_ctrl_pressed = ctrl_pressed;                                                               \
+		qsys->input_alt_pressed = alt_pressed;                                                                 \
+		os_mutex_unlock(&qsys->input_lock);                                                                    \
+	} while (0)
 
 	// Initialize different views of the same pointers.
 
@@ -313,4 +331,7 @@ qwerty_process_event(struct xrt_device **xdevs, size_t xdev_count, SDL_Event eve
 			qwerty_reset_controller_pose(qright);
 		}
 	}
+
+	QSDL_STORE_STATE();
+#undef QSDL_STORE_STATE
 }

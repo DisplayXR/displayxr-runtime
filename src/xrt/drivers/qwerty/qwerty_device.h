@@ -73,6 +73,33 @@ struct qwerty_system
 	// Hardware config (set by target builder)
 	float nominal_viewer_z; //!< meters (e.g. 0.6 from sim_display)
 	float screen_height_m;  //!< meters (e.g. 0.194 from sim_display)
+
+	/*
+	 * Platform input front-end state (#1538).
+	 *
+	 * This used to live in function statics inside qwerty_{win32,macos,sdl},
+	 * which made it process-global: it survived the xrt_system_devices that
+	 * owned the devices it pointed at (the use-after-free #1538 crashed on),
+	 * and it was shared across every instance a process built. It lives here
+	 * now so its lifetime is exactly this system's lifetime.
+	 *
+	 * LOCK ORDER: @ref input_lock is a LEAF. Never hold it while taking
+	 * @ref view_lock or any qwerty_device::lock — the front-ends read/update
+	 * this block under the lock, drop it, and only then call the
+	 * qwerty_press_* / qwerty_release_* / view-tuning helpers (all of which
+	 * take their own locks).
+	 */
+	struct os_mutex input_lock;
+	bool input_bound;                              //!< Defaults below resolved; also gates the one-off bind log.
+	struct qwerty_device *input_default_qdev;      //!< Focused device when no modifier is held.
+	struct qwerty_controller *input_default_qctrl; //!< Ditto, for controller-only methods.
+	bool input_ctrl_pressed;                       //!< CTRL held = left controller focused.
+	bool input_alt_pressed;                        //!< ALT/Option held = right controller focused.
+	bool input_mouse_look_active;                  //!< RMB held: mouse drives rotation.
+	float input_last_mouse_x;                      //!< Screen-space mouse baseline for delta computation.
+	float input_last_mouse_y;
+	bool input_lmb_was_down; //!< LMB latch (touchpad drivers can swallow the messages).
+	bool input_mmb_was_down; //!< MMB latch, same reason.
 };
 
 /*!
