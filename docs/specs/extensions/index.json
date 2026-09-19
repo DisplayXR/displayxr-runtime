@@ -95,7 +95,7 @@
     "XR_DXR_wayland_surface_binding": {
       "group": "windowing",
       "title": "Wayland Surface Binding",
-      "summary": "App-provided wl_display and wl_surface (desktop Linux)"
+      "summary": "App-provided wl_display and wl_surface (desktop Linux), plus the app-declared surface size that makes windowed Wayland work"
     },
     "XR_DXR_android_surface_binding": {
       "group": "windowing",
