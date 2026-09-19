@@ -85,6 +85,30 @@ xrCreateSession(instance, &sessionInfo, &session);
 - Compositor: `comp_vk_native_compositor.c` (`XRT_OS_LINUX_DESKTOP` window block), `comp_vk_native_window_xcb.c` (`..._wrap_app_window`, `..._query_geometry`)
 - Validation vehicle: `test_apps/cube_handle_vk_linux` (app-owned Xlib window + this binding; built by `scripts/build_linux.sh --apps`)
 
+### Interlacing phase is refused when the X root is not panel-native
+
+The compositor feeds the display processor the window's on-panel origin
+(`xrt_display_processor_vk::set_present_origin`) so a vendor weaver can anchor
+its interlacing phase to where the window physically sits. That origin is read
+out of X11 **root** coordinates, which are only physical panel pixels when the
+resolved panel rect equals the panel's native resolution. Under XWayland at a
+non-unit scale the root is a fiction (e.g. a 3456x2160 root for a 2880x1800
+panel), and the display server resamples the surface on its way to the panel
+anyway.
+
+So the compositor gates the feed on
+`xrt_system_compositor_info::display_desktop_rect_is_panel` — the same fact apps
+read as `XrDisplayDesktopInfoDXR::isPanelConfirmed`. When it is false the origin
+is **not** sent, the DP stays display-scoped, and one WARN says why (suppressed
+to an INFO for a DP with no `set_present_origin` slot, which is fed nothing
+either way). This is the X11 twin of the Wayland refusal in
+[`wayland-window-geometry.md`](../runtime/wayland-window-geometry.md) §3 — every
+failure path ends at display-scoped weaving rather than at a known-wrong phase.
+
+The window-scoped Kooima projection (`get_window_metrics`) is deliberately **not**
+gated on the same flag: it consumes ratios within one coordinate space, which
+stay self-consistent under a uniformly scaled root.
+
 ## 6. Out of Scope / Future
 
 - **Texture class** (shared-texture content handoff, the `sharedTextureHandle` / readback fields of the win32/cocoa siblings) — deliberately absent from spec v1; add as a follow-up revision when a Linux `_texture` producer exists (#696 is the class taxonomy reference).
