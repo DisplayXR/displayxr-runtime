@@ -36,10 +36,11 @@
 # external_fence at all), and then by a SIGSEGV in SessionState. Neither was
 # ever a candidate for this file: a device-creation failure takes out EVERY
 # session-creating test rather than a nameable few, and a crash is not a test
-# name — listing either would have been renaming a blocker as a flake. Both
-# are now fixed (#1539, #1542 via #1550) and the arms still are not gated,
-# because "no known blocker" is not the same as a green run. If they ever do
-# need an entry here, it has to clear rule 2 on its own evidence.
+# name — listing either would have been renaming a blocker as a flake. All
+# three are now fixed (#1539, #1542 via #1550, #1558 via #1560) and BOTH ARMS
+# GATE as of the all-arm zero-red run 35458623141 — on a run, not on "no known
+# blocker". Neither needs an entry here; if one ever does, it has to clear
+# rule 2 on its own evidence.
 # See docs/roadmap/cts-windows-handoff.md § Software-rasterizer tier.
 #
 # WHY THERE IS EXACTLY ONE ENTRY.

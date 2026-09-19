@@ -109,37 +109,39 @@ jobs:
           # we advertise both, so both are owed a submission run (#1523).
           ALL_ARMS="d3d11 d3d12 opengl vulkan vulkan2"
 
-          # ===== THE EXPERIMENTAL FLAG — ONE LINE GATES AN ARM =====
+          # ===== THE EXPERIMENTAL FLAG — EMPTY, AND THAT IS THE POINT =====
           # An arm named here runs with continue-on-error and is EXCLUDED FROM
           # THE GATE (still reported, with real counts, in the summary table).
-          # Removing a name is all it takes to make that arm gate.
-          EXPERIMENTAL="vulkan vulkan2"
-          # =========================================================
-          # WHY opengl IS NO LONGER HERE (#1523). #1525 provisioned the
-          # software rasterizers, and once #1540 (qwerty use-after-free) and
-          # #1549 (comp_gl NULL layer slots) landed, the full non-interactive
-          # GL suite ran to completion on llvmpipe for the first time — run
-          # 35433846568, 27515 assertions / 1 failure / 0 errors / 42 skipped.
-          # The one failure was Timed_Pipelined_Frame_Submission's 108.6%
-          # frame-timing overhead against the CTS's 50% cap, which is a
-          # property of a CPU rasterizer on a 2-vCPU runner and not of the
-          # runtime (the same arm on a real GPU has no unexpected failures).
-          # It is quarantined BY NAME on the software tier only —
-          # scripts/cts_quarantine_software_tier.txt — so opengl now gates on
-          # everything else. The old note here said "~493 assertions before
-          # SIGSEGV (#1522)"; that crash is fixed and that number is stale.
+          # ALL FIVE WINDOWS ARMS NOW GATE, so the list is empty (#1523).
           #
-          # vulkan / vulkan2 stay here, for a blocker that MOVED TWICE. They
-          # used to run 1442 and stop at vkCreateDevice (the runtime required
-          # the Win32 external memory/semaphore/fence trio of every app);
-          # #1539 made that trio optional-if-present, so both arms create the
-          # device and PASS Swapchains, then SIGSEGV'd in SessionState
-          # (#1542) — the Vulkan sibling of the GL crash #1522 fixed. #1550
-          # has now landed for that too, so nothing KNOWN blocks them; they
-          # stay experimental only until a full run on this main proves it.
-          # Flipping them is a separate change with its own evidence, exactly
-          # as opengl got — a crash is never a quarantine entry, so a green
-          # full run is the only thing that earns the flip. See
+          # TO RE-ADD AN ARM: put its name back in this string — that is the
+          # whole mechanism, and nothing else in this file changes. Do it only
+          # with a reason recorded in docs/roadmap/cts-windows-handoff.md, and
+          # prefer it to deleting the arm: a reported-but-ungated arm still
+          # produces numbers, and a deleted one produces silence.
+          EXPERIMENTAL=""
+          # =================================================================
+          # HOW ALL FIVE GOT HERE, because an empty string records no history.
+          # d3d11 / d3d12 gated from the start on WARP. The other three needed
+          # a software ICD (#1525: Mesa llvmpipe for GL, lavapipe for Vulkan)
+          # and then real runtime fixes — two for GL, three for Vulkan:
+          #
+          #   opengl   — #1540 (qwerty use-after-free at instance teardown)
+          #              + #1549 (comp_gl NULL layer slots). Gated with ONE
+          #              by-name quarantine entry on the software tier,
+          #              Timed_Pipelined_Frame_Submission, whose 108.6%
+          #              frame-timing overhead is the CPU rasterizer and not
+          #              the runtime — scripts/cts_quarantine_software_tier.txt
+          #              carries the evidence.
+          #   vulkan   — #1539 (Win32 external memory/semaphore/fence trio made
+          #   vulkan2    optional-if-present, past vkCreateDevice), #1550 (the
+          #              #1542 SessionState SIGSEGV) and #1560 (#1558: map every
+          #              swapchain usage bit through vk_csci_get_image_usage_flags).
+          #
+          # The flip is earned by a run, never by "no known blocker": the whole
+          # non-interactive suite, all five arms, zero red —
+          # run 35458623141 (graphics=all scope=full software_gfx=on).
+          # Per-arm numbers are in the evidence table in
           # docs/roadmap/cts-windows-handoff.md § Software-rasterizer tier.
 
           # Which arms get Mesa llvmpipe/lavapipe. Exactly the ones that cannot
@@ -403,7 +405,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
-    # Experimental arms (see the flag in `plan`) report but never fail the lane.
+    # EXPERIMENTAL is empty today, so this is false for every arm and all five
+    # fail the lane when red. It stays wired for the re-add path (see `plan`).
     continue-on-error: ${{ matrix.experimental }}
     env:
       GH_TOKEN: ${{ github.token }}
@@ -652,7 +655,8 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # The lane's gate. Every arm's XML in one table; fails if any NON-experimental
-  # arm was red or produced nothing at all.
+  # arm was red or produced nothing at all — and EXPERIMENTAL is empty, so that
+  # is currently every arm.
   # ---------------------------------------------------------------------------
   summary:
     name: CTS summary
@@ -720,18 +724,21 @@ jobs:
                    "| arm | tests | failures | errors | status |",
                    "|---|---:|---:|---:|---|"]
           for arm, tests, failures, errors, status, exp in rows:
-              label = f"`{arm}`" + (" _(experimental, #1542)_" if exp else "")
+              # Generic on purpose: EXPERIMENTAL is empty today, so this only
+              # fires if someone re-adds an arm — and then the issue number
+              # belongs in the handoff doc with its reason, not hardcoded here.
+              label = f"`{arm}`" + (" _(experimental — reported, NOT gated)_" if exp else "")
               lines.append(f"| {label} | {tests} | {failures} | {errors} | {status} |")
           lines += ["",
-                    "`opengl` runs against Mesa **llvmpipe** on the hosted runner (#1525) and **is gated**",
-                    "(#1523), with `Timed_Pipelined_Frame_Submission` quarantined by name on the software",
-                    "tier only — its 108.6% frame-timing overhead is the CPU rasterizer, not the runtime",
-                    "(scripts/cts_quarantine_software_tier.txt).",
+                    "**All five Windows arms gate on the hosted lane** (#1523) — `d3d11`/`d3d12` on",
+                    "**WARP**, `opengl` on Mesa **llvmpipe**, `vulkan`/`vulkan2` on Mesa **lavapipe**",
+                    "(#1525). No arm is exempt; a red arm fails this lane.",
                     "",
-                    "Experimental arms (`vulkan` / `vulkan2`) run against **lavapipe**, report real counts,",
-                    "and are not gated yet: `vkCreateDevice` (#1539) and the `SessionState` SIGSEGV",
-                    "(#1542 / #1550) are both fixed, so nothing known blocks them — they flip once a",
-                    "full run on main proves it. See docs/roadmap/cts-windows-handoff.md."]
+                    "One by-name exclusion applies, and only on the software tier:",
+                    "`Timed_Pipelined_Frame_Submission`, whose 108.6% frame-timing overhead is the CPU",
+                    "rasterizer rather than the runtime (scripts/cts_quarantine_software_tier.txt).",
+                    "Tiers without a software ICD — the PR lane's WARP arms, the real-GPU tier (#1526) —",
+                    "run it. See docs/roadmap/cts-windows-handoff.md."]
           out = "\n".join(lines) + "\n"
           print(out)
           path = os.environ.get("GITHUB_STEP_SUMMARY")
