@@ -44,20 +44,45 @@ runs on today:
 |---|---|---|---|
 | `d3d11` | GitHub-hosted `windows-2022`, **WARP** (D3D software rasterizer, always present in the image) | **yes** | — |
 | `d3d12` | GitHub-hosted `windows-2022`, **WARP** | **yes** | — |
-| `opengl` | needs a **software ICD** (Mesa llvmpipe) — the hosted image has no usable GL 4.x context | no — `continue-on-error`, reported only | #1525, then #1522 (GL teardown race) |
-| `vulkan` | needs a **software ICD** (lavapipe / SwiftShader) — the hosted image ships no Vulkan ICD | no — `continue-on-error`, reported only | #1525 |
-| `vulkan2` | same as `vulkan` | no — `continue-on-error`, reported only | #1525 |
+| `opengl` | GitHub-hosted `windows-2022`, Mesa **llvmpipe** (provisioned — the image's own GL is GDI generic 1.1) | **yes** (#1523) | — · one software-tier quarantine entry, below |
+| `vulkan` | GitHub-hosted `windows-2022`, Mesa **lavapipe** (provisioned — the image ships no Vulkan ICD) | not yet — `continue-on-error`, reported only | none known: `vkCreateDevice` (#1539) and the `SessionState` SIGSEGV (#1542 / #1550) are both fixed. Awaiting a full run to earn the flip |
+| `vulkan2` | same as `vulkan` | not yet — `continue-on-error`, reported only | same as `vulkan` |
 | Linux `vulkan` / `vulkan2` | **real GPU** (hardware-validated on NVIDIA / Ubuntu 22.04) — no runner yet | not in CI | #1523 part 2 |
 | Android `vulkan` / `vulkan2` | **real device** — no runner yet | not in CI | #1523 part 2, #1212 |
 
-The three experimental Windows arms are driven by **one flag**: the
-`EXPERIMENTAL="opengl vulkan vulkan2"` line in `cts.yml`'s `plan` job. It sets
-each arm's `continue-on-error` and tells the `summary` job which arms to exclude
-from the gate. #1525 empties that string and nothing else changes.
+The remaining experimental Windows arms are driven by **one flag**: the
+`EXPERIMENTAL="vulkan vulkan2"` line in `cts.yml`'s `plan` job. It sets each
+arm's `continue-on-error` and tells the `summary` job which arms to exclude from
+the gate. Removing a name from that string is all it takes to make the arm gate;
+nothing else in the file changes.
+
+**`opengl` graduated (#1523).** #1525 provisioned llvmpipe, and once #1540
+(qwerty use-after-free at instance teardown) and #1549 (`comp_gl` NULL layer
+slots) landed, the full non-interactive GL suite ran to completion on llvmpipe
+for the first time — [run 35433846568][gl-run]: **27515 assertions, 1 failure,
+0 errors, 42 skipped**. The lone failure is `Timed_Pipelined_Frame_Submission`
+(`REQUIRE( timingResults.GetOverheadFactor() < 0.5 )`, expansion
+`1.08553478400000003 < 0.5` — an *Overhead score : 108.6%* against the CTS's
+hard 50% cap). That is a CPU rasterizer on a 2-vCPU runner missing a frame
+budget predicted as if a GPU were scanning out; the same arm on a real GPU has
+no unexpected failures. So it is quarantined **by name, on the software tier
+only**, and `opengl` gates on everything else. The earlier "dies at session
+teardown (#1522)" reading is fixed and stale — do not cite it.
+
+The one cost, stated where it can be found: the `Report frame-timing metrics`
+step scrapes that test's printed overhead to trend runner frame timing (#589),
+so on the software tier it now prints `No Timed_Pipelined_Frame_Submission
+metrics in console log` instead of a percentage. Any tier that does not pass
+the quarantine list — the PR lane's WARP arms, the real-GPU tier (#1526) —
+still gets the number.
+
+[gl-run]: https://github.com/DisplayXR/displayxr-runtime/actions/runs/35433846568
 
 Beyond software rasterizers, **#1526** tracks a self-hosted Windows runner on a
-hybrid iGPU+dGPU box — a real-GPU lane is what turns the three software-ICD arms
-from "it ran" into a defensible submission, and it is also the only way to cover
+hybrid iGPU+dGPU box. A software-rasterized green is a real result but not a
+submittable one — a submission owes a run on an implementation a user could
+have. The real-GPU lane is also what retires the one quarantine entry (the
+frame budget is only unmeetable on a CPU rasterizer) and the only way to cover
 adapter selection (`DXR_D3D_FORCE_GPU` / `DXR_VK_FORCE_GPU`).
 
 ### Result artefacts
@@ -244,9 +269,12 @@ on the hosted lane, same build, kill switch as the only variable:
 | `1` (old behaviour) | 1442 | 0 | 12 | `vkCreateDevice`, every session-creating test |
 | unset (default) | 418 | 1 | 0 | `Swapchains` **PASSES**; SIGSEGV in `SessionState/Cycle through all states` |
 
-So the next blocker on these arms is a **crash**, not an extension — the Vulkan
-sibling of the `opengl` SIGSEGV (#1522). Still not gateable, but for a new
-reason, and the real-GPU tier (#1526) remains the way to make these arms count.
+So the next blocker on these arms was a **crash**, not an extension — the Vulkan
+sibling of the `opengl` SIGSEGV (#1522). That one is fixed too (#1542, by
+#1550), which leaves **no known blocker** on `vulkan`/`vulkan2`: they stay
+experimental only until a full run on `main` proves it, and they flip the same
+way `opengl` did — on evidence, in a change of its own. The real-GPU tier
+(#1526) remains the way to make these arms actually count.
 
 Note the null compositor keeps the trio **required** on purpose
 (`null_compositor.c`): it creates its own `VkDevice` and is the export side of
@@ -301,7 +329,10 @@ Three more things that are easy to get wrong here:
 **Quarantine:** `scripts/cts_quarantine_software_tier.txt` is the single place
 software-tier exclusions live, passed via `run_cts.ps1 -QuarantineList` and
 **only** on this tier — a real-GPU tier gets an empty exclusion set by
-construction. A test quarantined on every tier is hiding a defect.
+construction. A test quarantined on every tier is hiding a defect. It holds
+**one** entry, `Timed_Pipelined_Frame_Submission` (108.6% frame-timing overhead
+vs the CTS's 50% cap on llvmpipe — see *`opengl` graduated* above); the file's
+own header carries the evidence and the re-check rule.
 
 Kill switch: workflow-level `DXR_CTS_SOFTWARE_ICD: '0'` in `cts.yml`.
 

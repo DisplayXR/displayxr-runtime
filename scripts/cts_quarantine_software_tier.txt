@@ -29,19 +29,51 @@
 #      that would now pass is worse than no entry.
 #
 # NOT A PLACE TO PUT THE VULKAN ARMS.
-# vulkan / vulkan2 are currently blocked on the hosted tier because no Windows
-# software ICD implements VK_KHR_external_memory_win32 (lavapipe and
-# SwiftShader are FD-only; Mesa dzn has memory+semaphore but no external_fence
-# at all), which the runtime requires unconditionally on Windows. That failure
-# is at vkCreateDevice, so it takes out EVERY session-creating test rather than
-# a nameable few — listing them here would be renaming a blocker as a flake.
+# Their history is the worked example of rule 2. They were blocked at
+# vkCreateDevice (the runtime required the Win32 external
+# memory/semaphore/fence trio unconditionally; no Windows software ICD has it
+# — lavapipe and SwiftShader are FD-only, Mesa dzn has memory+semaphore but no
+# external_fence at all), and then by a SIGSEGV in SessionState. Neither was
+# ever a candidate for this file: a device-creation failure takes out EVERY
+# session-creating test rather than a nameable few, and a crash is not a test
+# name — listing either would have been renaming a blocker as a flake. Both
+# are now fixed (#1539, #1542 via #1550) and the arms still are not gated,
+# because "no known blocker" is not the same as a green run. If they ever do
+# need an entry here, it has to clear rule 2 on its own evidence.
 # See docs/roadmap/cts-windows-handoff.md § Software-rasterizer tier.
 #
-# CURRENTLY EMPTY — ON PURPOSE.
-# The first software-tier runs have to be allowed to fail honestly before
-# anything is named here; pre-populating it from guesswork would quarantine
-# tests that pass and hide the ones that do not. Note in particular that
-# Timed_Pipelined_Frame_Submission is deliberately NOT listed: cts.yml scrapes
-# its printed overhead numbers to trend the runner's frame timing (#589), and
-# excluding it would blind that scrape exactly on the tier where the timing is
-# worst.
+# WHY THERE IS EXACTLY ONE ENTRY.
+# The first software-tier runs were allowed to fail honestly before anything
+# was named here; pre-populating from guesswork would have quarantined tests
+# that pass and hidden the ones that do not. The full non-interactive OpenGL
+# suite then ran to completion on llvmpipe and came back with ONE red
+# assertion out of 27515 — the entry below, and nothing else.
+
+# Timed_Pipelined_Frame_Submission — frame-pacing overhead on a CPU rasterizer.
+#   Evidence: run 35433846568 (workflow_dispatch on main, graphics=opengl
+#   scope=full software_gfx=on, CTS 1.1.63.0) — 27515 assertions, 1 failure,
+#   0 errors, 42 skipped. The one failure is
+#     REQUIRE( timingResults.GetOverheadFactor() < 0.5 )
+#     with expansion: 1.08553478400000003 < 0.5
+#   i.e. an "Overhead score : 108.6%" against the CTS's hard 50% cap
+#   (test_FrameSubmission.cpp:465). Overhead is
+#   (avg frame time / predicted display period) - 1, so it measures how much
+#   longer a frame takes than the runtime predicted — on llvmpipe every frame
+#   is rasterized on the CPU, on a 2-vCPU hosted runner, against a display
+#   period the runtime predicts as if a GPU were scanning out. The same arm on
+#   a real GPU has 0 unexpected failures (#1523), which is the property that
+#   makes this environmental rather than a runtime defect.
+#   Issue: #1523 (arm gating) / #589 (this test's timer sensitivity on Windows).
+#   Re-check: whenever the Mesa pin or the windows-2022 image moves, and drop
+#   this line the moment the hosted runner can hold the frame budget.
+Timed_Pipelined_Frame_Submission
+
+# COST OF THAT ENTRY, STATED OUT LOUD.
+# cts.yml's "Report frame-timing metrics" step scrapes this test's printed
+# overhead numbers to trend the runner's frame timing (#589). Excluding the
+# test by name means the software tier prints "No Timed_Pipelined_Frame_Submission
+# metrics in console log" instead of a percentage — the scrape is blind exactly
+# where the timing is worst. That is a deliberate trade: the alternative is an
+# opengl arm that can never gate, which buys nothing, because a known-red arm
+# is one nobody reads. The real-GPU tier (#1526) does not pass this file, so it
+# keeps both the test and the trend line.
