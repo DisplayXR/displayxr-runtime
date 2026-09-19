@@ -395,6 +395,35 @@ else()
 		LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/displayxr/plugins COMPONENT Runtime
 		)
 endif()
+
+# Keep the dev plug-in staging dir fresh on every build (desktop Linux).
+#
+# Linux plug-in discovery is JSON-manifest driven, and scripts/build_linux.sh
+# points XRT_PLUGIN_SEARCH_PATH at ${CMAKE_BINARY_DIR}/_plugins, into which it
+# copies the built .so's once per script run. That copy is the ONLY thing that
+# refreshes the staging dir, so editing plug-in code and rebuilding with a bare
+# `cmake --build` leaves the runtime silently loading the PREVIOUS plug-in — the
+# tree looks rebuilt, the behaviour is stale, and nothing says so. (Same class
+# of trap as a partial push-runtime-pf.sh copy on Windows.)
+#
+# Staging from the targets themselves closes that: the copy is now a
+# consequence of building the plug-in rather than of running the script.
+# copy_if_different keeps it a no-op when nothing changed. The manifests stay
+# the script's job — they carry absolute paths and never go stale.
+if(XRT_HAVE_LINUX AND NOT ANDROID)
+	foreach(_dxr_staged_plugin drv_sim_display_plugin drv_sim_input_plugin)
+		add_custom_command(
+			TARGET ${_dxr_staged_plugin}
+			POST_BUILD
+			COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/_plugins"
+			COMMAND ${CMAKE_COMMAND} -E copy_if_different
+				"$<TARGET_FILE:${_dxr_staged_plugin}>" "${CMAKE_BINARY_DIR}/_plugins/"
+			COMMENT "Staging $<TARGET_FILE_NAME:${_dxr_staged_plugin}> into _plugins/"
+			VERBATIM
+			)
+	endforeach()
+endif()
+
 ####
 # DisplayXR-NetInput input-provider plug-in DLL (ADR-034 / #823 Phase 2).
 #
