@@ -166,20 +166,23 @@ plugin_note_reject(const char *id, uint32_t probe_order)
 static const char *
 plugin_exclusive_id(void)
 {
-	static const char *s_id = NULL;
+	/* Copied, not aliased: a later putenv/_putenv in the host process may
+	 * free or move what getenv returned, and this pointer is consulted for
+	 * the process lifetime (every refresh pass). 64 == plugin_entry::id. */
+	static char s_id[64] = {0};
 	static bool s_read = false;
 	if (!s_read) {
 		s_read = true;
 		const char *env = getenv("DXR_PLUGIN_EXCLUSIVE");
 		if (env != NULL && env[0] != '\0') {
-			s_id = env;
+			snprintf(s_id, sizeof(s_id), "%s", env);
 			U_LOG_W(
 			    "plugin loader: DXR_PLUGIN_EXCLUSIVE='%s' — loading ONLY that display plug-in; "
 			    "every other registered plug-in is skipped (not loaded).",
 			    s_id);
 		}
 	}
-	return s_id;
+	return s_id[0] != '\0' ? s_id : NULL;
 }
 
 /*!
