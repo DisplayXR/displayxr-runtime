@@ -181,6 +181,117 @@ minimal backing or exclude via the run manifest — and **log every exclusion**
   profiles. A conformance submission *requires* one interactive-composition run
   per graphics API, so skipping them was never an option — #1523 § 4.)
 
+## Software-rasterizer tier — what produced a result file (#1525)
+
+A GitHub-hosted `windows-2022` runner has **no GPU driver**: its only DXGI
+adapter is Microsoft Basic Render Driver (WARP), its only OpenGL is the GDI
+generic **1.1** implementation, and it has **no Vulkan ICD at all**. So without
+provisioning, three of the five Windows arms cannot start — this is not "they
+fail", it is "they never reach a test".
+
+`scripts/fetch_mesa_rasterizers.ps1` provisions both from one pinned
+`pal1000/mesa-dist-win` archive (exact version + SHA256, verified before
+unpack):
+
+| Arm | Backed by | How it is wired |
+|---|---|---|
+| `d3d11`, `d3d12` | **WARP** | nothing provisioned; the D3D adapter resolver excludes software adapters and logs `no adapter survived the exclusions`, then the run continues on WARP |
+| `opengl` | Mesa **llvmpipe** | `opengl32.dll` + `libgallium_wgl.dll` staged into the *application directory* (opengl32 is not a KnownDLL, so the app dir beats System32), `GALLIUM_DRIVER=llvmpipe` |
+| `vulkan`, `vulkan2` | Mesa **lavapipe** | `lvp_icd.x86_64.json`, registered in `HKLM\SOFTWARE\Khronos\Vulkan\Drivers` **and** `VK_DRIVER_FILES` |
+
+### The Vulkan arms are BLOCKED, and not by anything a quarantine can fix
+
+lavapipe is provisioned, selected and confirmed live on the hosted lane:
+
+```
+[WARN ] [select_physical_device] Vulkan selected GPU 0: llvmpipe (LLVM 23.1.1, 256 bits) (VK_PHYSICAL_DEVICE_TYPE_CPU, driver 0x06801008)
+```
+
+so the ADR-037 worry does not apply — the Vulkan selector only *ranks* a CPU
+device lowest (`vk_bundle_init.c` `device_type_priority`), it never rejects
+one. `vkCreateDevice` is where it stops:
+
+```
+[ERROR] [build_device_extensions] VkPhysicalDevice does not support required extension VK_KHR_external_memory_win32
+```
+
+On Windows (`XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE` /
+`XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE`) `required_vk_device_extensions` in
+`oxr_vulkan.c` demands `VK_KHR_external_memory_win32`,
+`VK_KHR_external_semaphore_win32` **and** `VK_KHR_external_fence_win32`. No
+Windows software ICD provides that set — checked against upstream source, not
+guessed:
+
+| ICD | `external_memory_win32` | `external_semaphore_win32` | `external_fence_win32` |
+|---|---|---|---|
+| Mesa **lavapipe** (`lvp_device.c`) | ✗ — `_fd` only | ✗ — `_fd` only | ✗ — `_fd` only |
+| Mesa **dzn** / Dozen (`dzn_device.c`) | ✓ | ✓ | ✗ — no `external_fence` at all |
+| **SwiftShader** (`libVulkan.cpp`) | ✗ — opaque-FD and Fuchsia only | ✗ | ✗ |
+
+So switching ICD does not rescue this, and neither does naming tests in the
+quarantine list: the failure is at device creation, so it takes out *every*
+session-creating test rather than a nameable few. The `vulkan`/`vulkan2` arms
+need either the real-GPU tier (#1526) or a deliberate decision about that
+required set — note the asymmetry that the POSIX block marks the equivalent
+`_fd` sync extensions **optional** while the Win32 block marks them required,
+which looks inherited rather than reasoned. That is a runtime behaviour change
+and wants its own issue and hardware validation, not a CI workaround.
+
+What the hosted lane *does* now give for Vulkan: the CTS is built with the
+`vulkan`/`vulkan2` plugins at all (see below), and the arm gets as far as
+device creation with a named reason. Both are prerequisites for #1526.
+
+Three more things that are easy to get wrong here:
+
+- **The CTS must be *built* with Vulkan or there is no `vulkan`/`vulkan2` plugin
+  to select.** `find_package(Vulkan)` gates `XR_USE_GRAPHICS_API_VULKAN`, and
+  `fetch_build_cts.bat` used to clobber `VULKAN_SDK` unconditionally — the
+  hosted lane therefore built a Vulkan-less CTS and said so only in one
+  `-- Could NOT find Vulkan` line. It now honours a pre-set `VULKAN_SDK`, and
+  `cts.yml` points it at the vcpkg loader+headers the runtime already links.
+- **Enabling Vulkan in the CTS build puts a `vulkan-1.dll` import on the
+  d3d11 and d3d12 arms too.** `conformance_cli.exe`, `conformance_test.dll`
+  and `XrApiLayer_runtime_conformance.dll` all link the loader's import
+  library once `find_package(Vulkan)` succeeds. On a machine with no Vulkan
+  runtime installed the process then dies at *load* with `0xC0000135`
+  STATUS_DLL_NOT_FOUND — exit code `-1073741515`, no XML, no console log, no
+  message, and arms that never asked for Vulkan go down with it.
+  `fetch_build_cts.bat` stages the loader it linked against next to the exe as
+  part of the build, so it is cached with the build and no per-run cleanup
+  removes it. `run_cts.ps1` decodes that exit code in the log.
+- **CI steps run ELEVATED, and both loaders discard their path env vars
+  there.** The Vulkan loader reads `VK_DRIVER_FILES`, `VK_ICD_FILENAMES`,
+  `VK_LAYER_PATH` and `VK_ADD_LAYER_PATH` through a secure getenv and ignores
+  them in a high-integrity process — the same reason this harness drives the
+  Khronos OpenXR loader through `HKLM ActiveRuntime` instead of
+  `XR_RUNTIME_JSON`. An env var that shows up correctly in the log and is
+  being thrown away is the worst failure shape there is, so `run_cts.ps1`
+  registers the ICD and the CTS's Vulkan layer in HKLM as well, restores both
+  in its `finally`, and prints the elevation state on every run.
+- **The CTS's OpenXR conformance layer has a Vulkan face.** Enabling
+  `XR_APILAYER_KHRONOS_runtime_conformance` makes the CTS's Vulkan plugin
+  hard-require `VK_LAYER_OPENXR_xr_runtime_conformance` (same DLL). It is a
+  from-source build, so nothing puts its generated manifest on the loader's
+  path; `run_cts.ps1` writes one with an absolute `library_path` — the
+  generated manifest says `./<dll>`, and Ninja Multi-Config puts the DLL in a
+  per-config subdirectory the JSON is not in.
+- **Unstage before the cache is saved.** The `build-cts` cache is shared with
+  the d3d11/d3d12 lanes. A Mesa `opengl32.dll` left beside `conformance_cli.exe`
+  would be restored into an arm that never asked for software rendering, which
+  is a silent result change, not a build failure.
+- **Every result file must name its renderer.** `run_cts.ps1` writes
+  `cts_<tag>_graphics_identity.txt` next to the XML, carrying the pinned Mesa
+  version plus the runtime's own WARN lines (`GLAD loaded: … renderer: …` and
+  `Vulkan selected GPU n: …`). A CTS XML records the *plugin*, never the
+  implementation that answered it.
+
+**Quarantine:** `scripts/cts_quarantine_software_tier.txt` is the single place
+software-tier exclusions live, passed via `run_cts.ps1 -QuarantineList` and
+**only** on this tier — a real-GPU tier gets an empty exclusion set by
+construction. A test quarantined on every tier is hiding a defect.
+
+Kill switch: workflow-level `DXR_CTS_SOFTWARE_ICD: '0'` in `cts.yml`.
+
 ## Reference
 
 - **Known-red exclusions in the default spec: there are none.** The default spec

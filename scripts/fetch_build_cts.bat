@@ -56,7 +56,19 @@ set CTS_TAG=openxr-cts-1.1.63.0
 set CTS_ROOT=%REPO%build-cts
 set CTS_SRC=%CTS_ROOT%\OpenXR-CTS
 set CTS_BUILD=%CTS_ROOT%\build
-set VULKAN_SDK=C:\VulkanSDK\1.4.341.1
+:: VULKAN_SDK decides whether this build gets a Vulkan CTS at all: the CTS's
+:: find_package(Vulkan) is what gates XR_USE_GRAPHICS_API_VULKAN, and without it
+:: `conformance_cli -G vulkan` / `-G vulkan2` cannot start -- two of the five
+:: Windows arms #1523 owes. The old unconditional `set` clobbered any inherited
+:: value, so a machine (or a CI runner) with a perfectly good loader+headers
+:: elsewhere silently built a Vulkan-less CTS and logged only
+:: "-- Could NOT find Vulkan" 40 lines deep in the configure output (#1525).
+:: Honour a pre-set VULKAN_SDK; keep the LunarG default for a dev box that has
+:: the SDK installed. CI points this at the vcpkg tree, so the CTS links the
+:: SAME loader the runtime does -- see cts.yml and the "CI Vulkan = vendored
+:: vcpkg" note. CMake's FindVulkan wants <VULKAN_SDK>\Include and \Lib, which a
+:: vcpkg x64-windows tree satisfies case-insensitively (include\, lib\).
+if not defined VULKAN_SDK set VULKAN_SDK=C:\VulkanSDK\1.4.341.1
 set NINJA_DIR=%LOCALAPPDATA%\Microsoft\WinGet\Packages\Ninja-build.Ninja_Microsoft.Winget.Source_8wekyb3d8bbwe
 
 :: ------------------------------------------------------------
@@ -110,6 +122,12 @@ if not exist "%CTS_SRC%\.git" (
 ::    normal discovery (HKLM ActiveRuntime on Windows).
 :: ------------------------------------------------------------
 echo === CMake configure (CTS) ===
+echo     VULKAN_SDK=%VULKAN_SDK%
+if exist "%VULKAN_SDK%\Include\vulkan\vulkan.h" (
+    echo     Vulkan headers: found  ^-^> the vulkan / vulkan2 CTS plugins WILL be built
+) else (
+    echo     Vulkan headers: MISSING ^-^> conformance_cli will have NO vulkan/vulkan2 plugin
+)
 cmake -S "%CTS_SRC%" -B "%CTS_BUILD%" -G "Ninja Multi-Config"
 if %ERRORLEVEL% NEQ 0 ( echo CTS CMake configure FAILED & exit /b 1 )
 
@@ -149,6 +167,32 @@ set CTS_EXE=
 for /r "%CTS_BUILD%" %%F in (conformance_cli.exe) do if exist "%%F" set "CTS_EXE=%%F"
 if not defined CTS_EXE ( echo ERROR: conformance_cli.exe not found under %CTS_BUILD% after build. & exit /b 1 )
 if not exist "%CTS_EXE%" ( echo ERROR: resolved conformance_cli.exe path does not exist: %CTS_EXE% & exit /b 1 )
+
+:: ------------------------------------------------------------
+:: 5a. Stage the Vulkan loader next to conformance_cli.exe
+::
+:: Once find_package(Vulkan) succeeds, conformance_cli.exe, conformance_test.dll
+:: AND XrApiLayer_runtime_conformance.dll all carry a STATIC import on
+:: vulkan-1.dll. A machine with no Vulkan runtime installed -- a GitHub-hosted
+:: windows runner, for instance -- has no vulkan-1.dll in System32, so the
+:: process dies at load with 0xC0000135 STATUS_DLL_NOT_FOUND before a single
+:: test runs: no result XML, no console log, no message, and it takes down the
+:: d3d11 and d3d12 arms too, which never asked for Vulkan (#1525). Put the same
+:: loader the build linked against next to the exe -- the exe's own directory is
+:: the first place Windows looks. This belongs to the BUILD, not to any one arm,
+:: so it is cached with it and nothing per-run removes it.
+:: ------------------------------------------------------------
+for %%D in ("%CTS_EXE%") do set "CTS_EXE_DIR=%%~dpD"
+if exist "%VULKAN_SDK%\bin\vulkan-1.dll" (
+    echo === Staging vulkan-1.dll from %VULKAN_SDK%\bin next to conformance_cli.exe ===
+    copy /Y "%VULKAN_SDK%\bin\vulkan-1.dll" "%CTS_EXE_DIR%" >nul
+    :: !ERRORLEVEL!, not %ERRORLEVEL%: inside a parenthesised block cmd expands
+    :: % at PARSE time, so the check would read the value from before the copy
+    :: and never fire. Delayed expansion is enabled at the top of this script.
+    if !ERRORLEVEL! NEQ 0 ( echo ERROR: failed to copy vulkan-1.dll next to %CTS_EXE% & exit /b 1 )
+) else (
+    echo NOTE: no %VULKAN_SDK%\bin\vulkan-1.dll to stage; relying on a system-installed Vulkan loader.
+)
 
 where mt.exe >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (

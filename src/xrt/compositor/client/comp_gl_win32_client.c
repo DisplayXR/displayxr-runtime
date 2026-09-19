@@ -211,6 +211,21 @@ client_gl_win32_compositor_create(struct xrt_compositor_native *xcn, void *hDC, 
 		    glGetString(GL_VERSION),  //
 		    glGetString(GL_RENDERER), //
 		    glGetString(GL_VENDOR));  //
+
+		/*
+		 * #1525: the line above is DEBUG-only, so nothing in a default log
+		 * ever stated which GL implementation the app's context belongs to —
+		 * and on a software tier (Mesa llvmpipe) that is the one fact a result
+		 * file has to carry. Announce it once per process at WARN, matching
+		 * what the native GL compositor already does for its own context.
+		 * Once-only: the CTS creates hundreds of sessions.
+		 */
+		static bool gl_identity_announced = false;
+		if (!gl_identity_announced) {
+			gl_identity_announced = true;
+			U_LOG_W("OpenGL context: GL_RENDERER: %s (GL_VERSION: %s, GL_VENDOR: %s)",
+			        glGetString(GL_RENDERER), glGetString(GL_VERSION), glGetString(GL_VENDOR));
+		}
 	}
 
 

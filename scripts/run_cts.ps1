@@ -104,6 +104,14 @@
                       --autoSkipTimeout: it auto-advances interactive tests and
                       emits a WARN, and an unexplained warning invalidates a
                       submission.
+.PARAMETER QuarantineList
+                      Path to a newline-separated list of test-case names to
+                      exclude, appended to -TestSpec as `~name` filters. Used
+                      by the software-rasterizer tier only
+                      (scripts/cts_quarantine_software_tier.txt, #1525); pass
+                      nothing on a real-GPU tier so its exclusion set stays
+                      empty by construction. A missing file is a hard error, so
+                      a typo'd path can never silently mean "no exclusions".
 #>
 param(
   [string]$Plugin     = "sim-display",
@@ -116,6 +124,7 @@ param(
   [string]$Interactive        = "",
   [string]$InteractionProfile = "",
   [string[]]$ExtraCliArgs     = @(),
+  [string]$QuarantineList     = "",
   # Enable the CTS's required XR_APILAYER_KHRONOS_runtime_conformance layer for a
   # submission-valid run. Registered in HKLM (the elevated loader ignores
   # XR_API_LAYER_PATH) and requested via -L; snapshot/restored like the rest.
@@ -167,8 +176,38 @@ $console = "$tmp\${stem}_console.log"
 # $console for them found nothing. Capture stdout separately; $console keeps
 # the reporter output untouched.
 $stdoutLog = "$tmp\${stem}_stdout.log"
+# Which implementation produced this result. A CTS XML records the graphics
+# PLUGIN, never the renderer that answered it, so a run on llvmpipe and a run
+# on an RTX card are indistinguishable after the fact — an ambiguity a tiered
+# lane cannot afford (#1525). Same stem as everything else.
+$identity  = "$tmp\${stem}_graphics_identity.txt"
 
 foreach ($p in @($exe,$devManifest)) { if (-not (Test-Path $p)) { throw "missing: $p" } }
+
+# ---- quarantine list -> Catch2 `~name` exclusions (#1525) ----
+# Same Catch2 trap documented for -TestSpec above: patterns inside ONE filter
+# are ANDed (every m_required matches, no m_forbidden matches); a COMMA starts
+# a SECOND filter and filters are OR'd, so a comma here would exclude nothing.
+# Append "~name" with NO comma.
+if ($QuarantineList) {
+  if (-not (Test-Path $QuarantineList)) { throw "quarantine list not found: $QuarantineList" }
+  $names = @(Get-Content $QuarantineList |
+             ForEach-Object { ($_ -replace '#.*$', '').Trim() } |
+             Where-Object { $_ })
+  if ($names.Count -eq 0) {
+    Write-Output "QUARANTINE: $QuarantineList is empty — nothing excluded by name"
+  } else {
+    foreach ($n in $names) {
+      # Quote only when needed: Catch2 reads an unquoted token as a name
+      # pattern up to the next filter character, which is fine for the
+      # underscore-heavy CTS names.
+      $pat = if ($n -match '[\s,\[\]~"]') { '"' + $n + '"' } else { $n }
+      $TestSpec += "~$pat"
+      Write-Output "QUARANTINE: excluding '$n'"
+    }
+    Write-Output "QUARANTINE: $($names.Count) test(s) excluded from $QuarantineList"
+  }
+}
 
 $xrKey  = "HKLM:\Software\Khronos\OpenXR\1"
 $dpKey  = "HKLM:\Software\DisplayXR\DisplayProcessors\$Plugin"
@@ -227,6 +266,94 @@ if ($ConformanceLayer -and $explicitKeyPreexisted) {
   foreach ($lj in $layerJsons) { $preRegistered[$lj] = $null -ne (Get-ItemProperty $explicitKey -Name $lj -ErrorAction SilentlyContinue) }
 }
 
+# ---- the CTS's VULKAN conformance layer (#1525) ----
+# XR_APILAYER_KHRONOS_runtime_conformance ships a second face: a *Vulkan* layer
+# `VK_LAYER_OPENXR_xr_runtime_conformance`, implemented in the same DLL. When
+# the OpenXR layer is enabled, the CTS's Vulkan graphics plugin hard-requires
+# it — graphics_plugin_vulkan.cpp XRC_CHECK_THROWs on
+# `it != availableLayers.end()` — so EVERY session-creating test in the vulkan
+# and vulkan2 arms dies with "Check failed / Origin: it != availableLayers.end()"
+# if the Vulkan loader cannot see it. Not a runtime defect and not a
+# software-rasterizer limitation: the CTS is a from-source build, its generated
+# VkLayer_OPENXR_xr_runtime_conformance.json sits in the build tree, and
+# nothing puts that on the Vulkan loader's search path.
+#
+# Register it two ways on purpose:
+#   * HKLM ExplicitLayers — authoritative, and the only one that survives an
+#     ELEVATED process (the Vulkan loader reads its path env vars through a
+#     secure getenv, exactly like the Khronos OpenXR loader ignores
+#     XR_RUNTIME_JSON when elevated — the reason this script uses HKLM at all).
+#   * VK_ADD_LAYER_PATH — covers a non-elevated run.
+# Both are snapshotted and undone in the finally, like everything else here.
+#
+# The generated JSON's library_path is "./XrApiLayer_runtime_conformance.dll",
+# relative to the JSON — but under Ninja Multi-Config the DLL lands in a
+# per-config subdirectory while the JSON does not. Rather than depend on that
+# layout, write our own copy carrying an ABSOLUTE library_path.
+$vkLayerDir  = $null
+$vkLayerJson = $null
+$vkLayerKey  = "HKLM:\SOFTWARE\Khronos\Vulkan\ExplicitLayers"
+$vkLayerKeyPreexisted = $false
+if ($ConformanceLayer -and $Graphics -match '^vulkan') {
+  $confDll = Join-Path (Split-Path $runtimeConf) 'XrApiLayer_runtime_conformance.dll'
+  if (-not (Test-Path $confDll)) {
+    $hit = Get-ChildItem -Path $ctsBuild -Recurse -Filter 'XrApiLayer_runtime_conformance.dll' -File -ErrorAction SilentlyContinue |
+           Select-Object -First 1
+    if ($hit) { $confDll = $hit.FullName }
+  }
+  if (-not (Test-Path $confDll)) {
+    throw "could not locate XrApiLayer_runtime_conformance.dll under $ctsBuild — the vulkan/vulkan2 arms cannot run with -ConformanceLayer"
+  }
+  $vkLayerDir  = Join-Path $tmp "dxr_cts_vk_layer"
+  New-Item -ItemType Directory -Force -Path $vkLayerDir | Out-Null
+  $vkLayerJson = Join-Path $vkLayerDir "VkLayer_OPENXR_xr_runtime_conformance.json"
+  $vkManifest = [ordered]@{
+    file_format_version = "1.0.0"
+    layer = [ordered]@{
+      name                   = "VK_LAYER_OPENXR_xr_runtime_conformance"
+      type                   = "GLOBAL"
+      library_path           = $confDll
+      api_version            = "1.0.0"
+      implementation_version = "1"
+      description            = "API Layer to validate OpenXR runtime conformance"
+      disable_environment    = @{ OPENXR_xr_runtime_conformance_disabled = "1" }
+    }
+  }
+  $vkManifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $vkLayerJson -Encoding UTF8
+  $vkLayerKeyPreexisted = Test-Path $vkLayerKey
+  Write-Output "RESOLVED Vulkan conformance layer DLL: $confDll"
+  Write-Output "WROTE    Vulkan layer manifest:        $vkLayerJson"
+}
+
+# ---- the software Vulkan ICD, registered where an ELEVATED loader looks (#1525) ----
+# scripts/fetch_mesa_rasterizers.ps1 exports VK_DRIVER_FILES for lavapipe, and
+# that is enough for an ordinary process. It is NOT enough here: the Vulkan
+# loader reads every path-override variable (VK_DRIVER_FILES, VK_ICD_FILENAMES,
+# VK_LAYER_PATH, VK_ADD_LAYER_PATH) through a secure getenv and DISCARDS them in
+# a high-integrity process — the same hazard this script already works around
+# for the Khronos OpenXR loader and XR_RUNTIME_JSON. A GitHub-hosted windows
+# runner runs its steps elevated, so the ICD was invisible and vkCreateInstance
+# returned VK_ERROR_INCOMPATIBLE_DRIVER while the env var sat there looking
+# correct. Register in HKLM as well; snapshot + restore as usual.
+$vkIcdKey = "HKLM:\SOFTWARE\Khronos\Vulkan\Drivers"
+$vkIcdPaths = @()
+if ($env:VK_DRIVER_FILES) {
+  $vkIcdPaths = @($env:VK_DRIVER_FILES -split ';' | Where-Object { $_ -and (Test-Path $_) })
+}
+$vkIcdKeyPreexisted = Test-Path $vkIcdKey
+$vkIcdPreRegistered = @{}
+foreach ($p in $vkIcdPaths) {
+  $vkIcdPreRegistered[$p] = $vkIcdKeyPreexisted -and ($null -ne (Get-ItemProperty $vkIcdKey -Name $p -ErrorAction SilentlyContinue))
+}
+
+# Elevation is load-bearing for everything above, so state it rather than
+# leaving a future reader to infer it from a confusing symptom.
+$isElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+              ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+Write-Output "ELEVATED: $isElevated (if true, the OpenXR and Vulkan loaders ignore their path env vars; HKLM is the only channel)"
+
+$runStart = (Get-Date).AddSeconds(-5)   # slack for clock skew on the log stamps
+
 try {
   # ---- apply ----
   if (-not (Test-Path $xrKey)) { New-Item -Path $xrKey -Force | Out-Null }
@@ -243,6 +370,19 @@ try {
     Write-Output "APPLIED $($layerJsons.Count) conformance layers (HKLM Explicit)"
   }
 
+  if ($vkLayerJson) {
+    if (-not (Test-Path $vkLayerKey)) { New-Item -Path $vkLayerKey -Force | Out-Null }
+    New-ItemProperty -Path $vkLayerKey -Name $vkLayerJson -Value 0 -PropertyType DWord -Force | Out-Null
+    $env:VK_ADD_LAYER_PATH = $vkLayerDir
+    Write-Output "APPLIED VK_LAYER_OPENXR_xr_runtime_conformance (HKLM ExplicitLayers + VK_ADD_LAYER_PATH)"
+  }
+
+  if ($vkIcdPaths.Count) {
+    if (-not (Test-Path $vkIcdKey)) { New-Item -Path $vkIcdKey -Force | Out-Null }
+    foreach ($p in $vkIcdPaths) { New-ItemProperty -Path $vkIcdKey -Name $p -Value 0 -PropertyType DWord -Force | Out-Null }
+    Write-Output "APPLIED $($vkIcdPaths.Count) Vulkan ICD(s) (HKLM Drivers): $($vkIcdPaths -join '; ')"
+  }
+
   if (Test-Path $xml)     { Remove-Item $xml -Force }
   if (Test-Path $console) { Remove-Item $console -Force }
   if (Test-Path $stdoutLog) { Remove-Item $stdoutLog -Force }
@@ -251,7 +391,14 @@ try {
   # MCP spins a named-pipe server per instance; implicit Vulkan layers (e.g. an
   # FPS overlay) can crash the runtime's internal VK device. Neither is under test.
   $env:DISPLAYXR_MCP = "0"
-  $env:VK_LOADER_LAYERS_DISABLE = "*"
+  # `~implicit~`, NOT `*`: the blanket form also hides EXPLICIT layers from
+  # vkEnumerateInstanceLayerProperties, including the CTS's own
+  # VK_LAYER_OPENXR_xr_runtime_conformance — which the Vulkan graphics plugin
+  # hard-requires whenever the OpenXR conformance layer is on, so the whole
+  # vulkan/vulkan2 arm errors out before any test does real work (#1525).
+  # `~implicit~` keeps the original intent (no third-party overlay injecting
+  # itself into the runtime's VK device) and nothing else.
+  $env:VK_LOADER_LAYERS_DISABLE = "~implicit~"
   # The CTS app has no window of its own, so the D3D11 native compositor
   # self-creates one per session. Keep it windowed (not fullscreen) so a run
   # doesn't repeatedly take over the display.
@@ -302,6 +449,10 @@ try {
     Write-Output "EXITCODE: (killed)"
   } else {
     Write-Output "EXITCODE: $($proc.ExitCode)"
+    if ($proc.ExitCode -eq -1073741515) {
+      # Decoding this by hand cost a CI round once (#1525) — do it here forever.
+      Write-Output "HINT: 0xC0000135 STATUS_DLL_NOT_FOUND. conformance_cli died at LOAD time, before any test ran, so there is no XML and no console log to read. A dependent DLL is missing from the exe's own directory. The two this harness puts there: vulkan-1.dll (fetch_build_cts.bat, required once the CTS builds with Vulkan — it breaks the d3d11/d3d12 arms too) and Mesa's libgallium_wgl.dll beside opengl32.dll (fetch_mesa_rasterizers.ps1)."
+    }
   }
 
   # -RedirectStandardOutput can only target a FILE, so the live view of
@@ -327,6 +478,21 @@ finally {
     if (-not $explicitKeyPreexisted) { Remove-Item -Path $explicitKey -Force -ErrorAction SilentlyContinue }
     Write-Output "RESTORED conformance layer registration removed"
   }
+  if ($vkLayerJson) {
+    if (Test-Path $vkLayerKey) {
+      Remove-ItemProperty -Path $vkLayerKey -Name $vkLayerJson -ErrorAction SilentlyContinue
+      if (-not $vkLayerKeyPreexisted) { Remove-Item -Path $vkLayerKey -Force -ErrorAction SilentlyContinue }
+    }
+    Remove-Item -Path Env:\VK_ADD_LAYER_PATH -ErrorAction SilentlyContinue
+    Write-Output "RESTORED Vulkan conformance layer registration removed"
+  }
+  if ($vkIcdPaths.Count -and (Test-Path $vkIcdKey)) {
+    foreach ($p in $vkIcdPaths) {
+      if (-not $vkIcdPreRegistered[$p]) { Remove-ItemProperty -Path $vkIcdKey -Name $p -ErrorAction SilentlyContinue }
+    }
+    if (-not $vkIcdKeyPreexisted) { Remove-Item -Path $vkIcdKey -Force -ErrorAction SilentlyContinue }
+    Write-Output "RESTORED Vulkan ICD registration removed"
+  }
   if ($null -ne $origRuntime) {
     Set-ItemProperty $xrKey -Name ActiveRuntime -Value $origRuntime -Type String
     Write-Output "RESTORED ActiveRuntime = $((Get-ItemProperty $xrKey -Name ActiveRuntime -ErrorAction SilentlyContinue).ActiveRuntime)"
@@ -343,6 +509,53 @@ finally {
   }
 }
 
-Write-Output "XML:     $xml"
-Write-Output "CONSOLE: $console"
-Write-Output "STDOUT:  $stdoutLog"
+# ---- graphics identity (#1525) ----
+# "Every result file records the renderer/device that produced it." Scrape it
+# out of the runtime's own log and drop it beside the XML as an artefact.
+# Sources, both WARN-level so they are present without raising any log level:
+#   GL  — comp_gl_win32_client.c / comp_gl_compositor.cpp "GLAD loaded: …
+#         renderer: <GL_RENDERER>" / "OpenGL context: GL_RENDERER: …"
+#   VK  — vk_bundle_init.c       "Vulkan selected GPU n: <deviceName> (<type>)"
+try {
+  $idLines = New-Object System.Collections.Generic.List[string]
+  $idLines.Add("tag:        $Tag")
+  $idLines.Add("graphics:   $Graphics (OpenXR $ApiVersion)")
+  $idLines.Add("plugin:     $Plugin")
+  $swVer = $env:DXR_CTS_SOFTWARE_GFX_VERSION
+  if ($swVer) {
+    $idLines.Add("software:   $swVer")
+    $idLines.Add("            GALLIUM_DRIVER=$($env:GALLIUM_DRIVER) VK_DRIVER_FILES=$($env:VK_DRIVER_FILES)")
+  } else {
+    $idLines.Add("software:   (none provisioned — DXR_CTS_SOFTWARE_GFX_VERSION unset)")
+  }
+
+  $logDir = Join-Path $env:LOCALAPPDATA "DisplayXR"
+  $hits = @()
+  if (Test-Path $logDir) {
+    # Strip the leading "[timestamp] " before de-duplicating, or the adapter
+    # line — emitted once per session, i.e. hundreds of times — comes back as
+    # hundreds of "unique" strings and buries the one identity line that matters.
+    $hits = @(Get-ChildItem -Path $logDir -Filter "DisplayXR_conformance_cli*.log" -File -ErrorAction SilentlyContinue |
+              Where-Object { $_.LastWriteTime -ge $runStart } |
+              Select-String -Pattern 'GLAD loaded:|OpenGL context:|Vulkan selected GPU|render adapter: no adapter survived' |
+              ForEach-Object { ($_.Line -replace '^\s*\[[0-9][^\]]*\]\s*', '').Trim() } |
+              Select-Object -Unique |
+              Select-Object -First 10)
+  }
+  if ($hits.Count) {
+    $idLines.Add("renderer:")
+    foreach ($h in $hits) { $idLines.Add("  $h") }
+  } else {
+    $idLines.Add("renderer:   (no GLAD/Vulkan identity line found in $logDir)")
+  }
+  Set-Content -LiteralPath $identity -Value $idLines -Encoding UTF8
+  Write-Output "--- graphics identity ---"
+  $idLines | ForEach-Object { Write-Output $_ }
+} catch {
+  Write-Output "graphics-identity scrape failed (non-fatal): $_"
+}
+
+Write-Output "XML:      $xml"
+Write-Output "CONSOLE:  $console"
+Write-Output "STDOUT:   $stdoutLog"
+Write-Output "IDENTITY: $identity"

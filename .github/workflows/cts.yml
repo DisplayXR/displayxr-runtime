@@ -36,6 +36,8 @@ on:
       - 'src/xrt/include/**'
       - 'scripts/run_cts.ps1'
       - 'scripts/fetch_build_cts.bat'
+      - 'scripts/fetch_mesa_rasterizers.ps1'
+      - 'scripts/cts_quarantine_software_tier.txt'
       - '.github/workflows/cts.yml'
   push:
     tags:
@@ -55,6 +57,11 @@ on:
         type: choice
         default: smoke
         options: [smoke, full]
+      software_gfx:
+        description: 'Mesa llvmpipe/lavapipe (auto = on for opengl/vulkan/vulkan2)'
+        type: choice
+        default: auto
+        options: [auto, "on", "off"]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -62,6 +69,18 @@ concurrency:
 
 permissions:
   contents: read
+
+env:
+  # KILL SWITCH for the software-rasterizer tier (#1525). Set to 0 and every
+  # arm runs against whatever the runner natively provides — i.e. WARP for
+  # d3d11/d3d12 and nothing at all for opengl/vulkan/vulkan2. Nothing else in
+  # the lane has to change.
+  DXR_CTS_SOFTWARE_ICD: '1'
+  # Mesa pin for llvmpipe (OpenGL) + lavapipe (Vulkan). Exact version + SHA256,
+  # never "latest" — see scripts/fetch_mesa_rasterizers.ps1 for provenance and
+  # for why lavapipe rather than SwiftShader.
+  DXR_MESA_VERSION: '26.1.8'
+  DXR_MESA_SHA256: '4c6d32e653e0ff9ad07796e40c0bcfabf2764d849e3ce4f3b1590112c87e42f9'
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -100,6 +119,20 @@ jobs:
           # to the empty string — nothing else in this file needs to change.
           EXPERIMENTAL="opengl vulkan vulkan2"
           # =================================================================
+          # NOTE (#1525, landed): the software rasterizers ARE provisioned now
+          # and those three arms do start — opengl runs ~493 assertions on
+          # llvmpipe before SIGSEGV (#1522), vulkan/vulkan2 run 1442 and stop
+          # at vkCreateDevice because no Windows software ICD implements
+          # VK_KHR_external_memory_win32. So the list above stays as it is:
+          # they report real counts in the summary table instead of MISSING,
+          # but none of the three can gate yet. See
+          # docs/roadmap/cts-windows-handoff.md § Software-rasterizer tier.
+
+          # Which arms get Mesa llvmpipe/lavapipe. Exactly the ones that cannot
+          # START without one: the runner's only OpenGL is GDI generic 1.1 and
+          # it has no Vulkan ICD. d3d11/d3d12 keep running on WARP untouched.
+          SOFTWARE_ARMS="opengl vulkan vulkan2"
+          sw_input="auto"
 
           scope="smoke"
           arms="d3d11"   # PR lane: one fast arm.
@@ -108,6 +141,7 @@ jobs:
               scope="${{ inputs.scope }}"
               g="${{ inputs.graphics }}"
               if [ "$g" = "all" ]; then arms="$ALL_ARMS"; else arms="$g"; fi
+              if [ -n "${{ inputs.software_gfx }}" ]; then sw_input="${{ inputs.software_gfx }}"; fi
               ;;
             schedule|push)
               # schedule = nightly on main; push = a v* tag (see `on:` above).
@@ -140,14 +174,25 @@ jobs:
           fi
 
           # Build the matrix as include[] so each arm carries its own
-          # `experimental` flag for continue-on-error.
+          # `experimental` flag for continue-on-error and its own `software`
+          # flag for the Mesa provisioning steps.
           inc=""
           for a in $arms; do
             exp="false"
             for e in $EXPERIMENTAL; do
               if [ "$a" = "$e" ]; then exp="true"; fi
             done
-            inc="${inc}{\"graphics\":\"${a}\",\"experimental\":${exp}},"
+            sw="false"
+            if [ "${DXR_CTS_SOFTWARE_ICD:-1}" != "0" ]; then
+              if [ "$sw_input" = "on" ]; then
+                sw="true"
+              elif [ "$sw_input" = "auto" ]; then
+                for s in $SOFTWARE_ARMS; do
+                  if [ "$a" = "$s" ]; then sw="true"; fi
+                done
+              fi
+            fi
+            inc="${inc}{\"graphics\":\"${a}\",\"experimental\":${exp},\"software\":${sw}},"
           done
           matrix="{\"include\":[${inc%,}]}"
 
@@ -266,15 +311,40 @@ jobs:
             -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
           cmake --build build --config Release --target install
 
+      # The CTS's find_package(Vulkan) is what gates XR_USE_GRAPHICS_API_VULKAN,
+      # and therefore whether conformance_cli has a `vulkan` / `vulkan2` plugin
+      # at all. There is no Vulkan SDK on a hosted runner, so before #1525 the
+      # CTS configure logged "-- Could NOT find Vulkan" and two of the five
+      # Windows arms could not start. Point VULKAN_SDK at the SAME vcpkg
+      # loader+headers the runtime links (see the note above about not
+      # downloading the LunarG SDK); FindVulkan's <VULKAN_SDK>\Include + \Lib
+      # resolve case-insensitively against vcpkg's include\ + lib\.
+      - name: Resolve VULKAN_SDK for the CTS build from vcpkg
+        shell: pwsh
+        run: |
+          $lib = Get-ChildItem -Path "$env:GITHUB_WORKSPACE" -Recurse -Filter "vulkan-1.lib" -File -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FullName -match '[\\/]vcpkg_installed[\\/]x64-windows[\\/]lib[\\/]' } |
+                 Select-Object -First 1
+          if (-not $lib) { throw "vulkan-1.lib not found in any vcpkg_installed tree — the CTS would build without Vulkan" }
+          $sdk = Split-Path (Split-Path $lib.FullName)    # <...>/x64-windows
+          foreach ($p in @("$sdk\include\vulkan\vulkan.h", "$sdk\bin\vulkan-1.dll")) {
+            if (-not (Test-Path $p)) { throw "expected $p under the resolved VULKAN_SDK ($sdk)" }
+          }
+          "VULKAN_SDK=$sdk" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          Write-Host "VULKAN_SDK=$sdk"
+
       # Build the Khronos conformance_cli + conformance_test (+ the two CTS API
       # layers) pinned to the loader version. Cached on the harness script hash —
       # the `run` arms restore THIS cache rather than rebuilding (see below).
+      # The `-vk` suffix is a deliberate one-shot cache break: every cache
+      # written before #1525 holds a conformance_cli with NO vulkan/vulkan2
+      # plugin, and the key would otherwise still hit.
       - name: Cache CTS build
         id: cts-cache
         uses: actions/cache@v5
         with:
           path: build-cts
-          key: cts-${{ runner.os }}-${{ hashFiles('scripts/fetch_build_cts.bat') }}-1.1.63
+          key: cts-${{ runner.os }}-${{ hashFiles('scripts/fetch_build_cts.bat') }}-1.1.63-vk
 
       - name: Build CTS
         if: steps.cts-cache.outputs.cache-hit != 'true'
@@ -354,7 +424,7 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: build-cts
-          key: cts-${{ runner.os }}-${{ hashFiles('scripts/fetch_build_cts.bat') }}-1.1.63
+          key: cts-${{ runner.os }}-${{ hashFiles('scripts/fetch_build_cts.bat') }}-1.1.63-vk
           fail-on-cache-miss: true
 
       # Register the freshly-built sim-display plug-in for DP discovery, exactly
@@ -373,12 +443,54 @@ jobs:
           reg add $key /v DisplayName /t REG_SZ /d "Simulated 3D Display" /f | Out-Null
           Write-Host "Registered sim-display plug-in: $plugin"
 
+      # --- software rasterizers (#1525) ------------------------------------
+      # Only the arms that cannot start without one (matrix.software, set in
+      # `plan`). Cached on the pinned Mesa version alone: a pin bump is a new
+      # key, and the archive is checksum-verified on restore anyway.
+      - name: Cache Mesa software rasterizers
+        if: matrix.software
+        uses: actions/cache@v5
+        with:
+          path: mesa-sw-gfx
+          key: mesa-${{ runner.os }}-${{ env.DXR_MESA_VERSION }}
+
+      - name: Provision Mesa llvmpipe + lavapipe
+        if: matrix.software
+        shell: pwsh
+        run: |
+          # opengl32.dll must sit in the *application* directory to win over
+          # System32; stage it beside conformance_cli.exe (the process image)
+          # and also beside the runtime DLL + the sim-display plug-in, because
+          # either may be loaded with LOAD_WITH_ALTERED_SEARCH_PATH, which
+          # substitutes the loaded module's own directory for the app dir.
+          $ctsExe = Get-ChildItem -Path "$env:GITHUB_WORKSPACE\build-cts" -Recurse -Filter conformance_cli.exe -File |
+                    Select-Object -First 1
+          if (-not $ctsExe) { throw "conformance_cli.exe not found under build-cts" }
+          $stage = @(
+            $ctsExe.DirectoryName,
+            "$env:GITHUB_WORKSPACE\build\Release",
+            "$env:GITHUB_WORKSPACE\_package\bin\plugins"
+          )
+          & "$env:GITHUB_WORKSPACE\scripts\fetch_mesa_rasterizers.ps1" `
+            -Version "$env:DXR_MESA_VERSION" `
+            -Sha256 "$env:DXR_MESA_SHA256" `
+            -CacheDir "$env:GITHUB_WORKSPACE\mesa-sw-gfx" `
+            -StageTo $stage `
+            -GithubEnv
+
       - name: Run CTS (${{ needs.plan.outputs.scope }} / ${{ matrix.graphics }})
         shell: pwsh
         run: |
+          $quarantine = ""
+          if ("${{ matrix.software }}" -eq "true") {
+            # ONLY the software tier gets a quarantine list; every other tier
+            # runs with an empty exclusion set by construction (#1525).
+            $quarantine = "$env:GITHUB_WORKSPACE\scripts\cts_quarantine_software_tier.txt"
+          }
           & "$env:GITHUB_WORKSPACE\scripts\run_cts.ps1" `
             -TestSpec "${{ needs.plan.outputs.spec }}" `
             -Graphics "${{ matrix.graphics }}" `
+            -QuarantineList $quarantine `
             -ConformanceLayer `
             -TimeoutSec ${{ needs.plan.outputs.timeout }} `
             -Tag "$env:CTS_TAG"
@@ -472,9 +584,19 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force cts-results | Out-Null
-          foreach ($f in @("cts_$($env:CTS_TAG).xml", "cts_$($env:CTS_TAG)_console.log", "cts_$($env:CTS_TAG)_stdout.log")) {
+          foreach ($f in @("cts_$($env:CTS_TAG).xml", "cts_$($env:CTS_TAG)_console.log", "cts_$($env:CTS_TAG)_stdout.log",
+                           "cts_$($env:CTS_TAG)_graphics_identity.txt")) {
             $src = Join-Path $env:TEMP $f
             if (Test-Path $src) { Copy-Item $src cts-results\ }
+          }
+          # The runtime's own log is where the renderer/device identity and the
+          # adapter-resolver decisions live; without it a red arm has to be
+          # re-run locally to learn anything (#1525).
+          $rtLogs = Join-Path $env:LOCALAPPDATA "DisplayXR"
+          if (Test-Path $rtLogs) {
+            Get-ChildItem -Path $rtLogs -Filter "DisplayXR_conformance_cli*.log" -File -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime -Descending | Select-Object -First 3 |
+              ForEach-Object { Copy-Item $_.FullName cts-results\ }
           }
           Get-ChildItem cts-results | ForEach-Object { Write-Host "staged: $($_.Name) ($($_.Length) bytes)" }
 
@@ -493,6 +615,20 @@ jobs:
           # gated red off attempt 1's XML (run 35406623715), and the same
           # mechanism would just as happily report a stale green over a real red.
           overwrite: true
+
+      # Today this arm restores the CTS tree with actions/cache/RESTORE, which
+      # never saves, so Mesa cannot leak into the shared cache from here. Keep
+      # the cleanup anyway: that guarantee should not depend on which cache
+      # action a future edit reaches for. If the run job ever saves again, a
+      # Mesa opengl32.dll left beside conformance_cli.exe would be restored
+      # into the d3d11/d3d12 arms, which never asked for software rendering —
+      # a silent result change with no build failure to notice (#1525).
+      - name: Unstage Mesa from the CTS build tree
+        if: always() && matrix.software
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE\scripts\fetch_mesa_rasterizers.ps1" `
+            -CacheDir "$env:GITHUB_WORKSPACE\mesa-sw-gfx" -Unstage
 
   # ---------------------------------------------------------------------------
   # The lane's gate. Every arm's XML in one table; fails if any NON-experimental
@@ -567,9 +703,11 @@ jobs:
               label = f"`{arm}`" + (" _(experimental, #1525)_" if exp else "")
               lines.append(f"| {label} | {tests} | {failures} | {errors} | {status} |")
           lines += ["",
-                    "Experimental arms (`opengl` / `vulkan` / `vulkan2`) have no usable ICD on the",
-                    "hosted runner and are reported but not gated until #1525 lands the software",
-                    "rasterizers."]
+                    "Experimental arms (`opengl` / `vulkan` / `vulkan2`) run against Mesa's software",
+                    "rasterizers on the hosted runner (#1525) and report real counts, but are not",
+                    "gated: `opengl` still dies at session teardown (#1522), and `vulkan`/`vulkan2`",
+                    "stop at `vkCreateDevice` because no Windows software ICD implements",
+                    "`VK_KHR_external_memory_win32`. See docs/roadmap/cts-windows-handoff.md."]
           out = "\n".join(lines) + "\n"
           print(out)
           path = os.environ.get("GITHUB_STEP_SUMMARY")
