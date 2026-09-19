@@ -46,7 +46,13 @@ find_qwerty_system(struct xrt_device **xdevs, size_t xdev_count)
 {
 	struct xrt_device *xdev = NULL;
 	for (size_t i = 0; i < xdev_count; i++) {
-		if (xdevs[i] == NULL) {
+		// Guard tracking_origin (#59, ported from the macOS front-end): an
+		// out-of-process content client's xdevs are IPC proxies that may have no
+		// tracking origin, and during session exit they can be partially torn
+		// down while this is still pumped — derefing tracking_origin->name then
+		// crashes. This resolver now runs on every message (#1538), so the guard
+		// is load-bearing here too.
+		if (xdevs[i] == NULL || xdevs[i]->tracking_origin == NULL) {
 			continue;
 		}
 		// Check against tracker name to find qwerty devices
@@ -147,13 +153,13 @@ qwerty_process_win32(struct xrt_device **xdevs,
                      long long lParam,
                      bool *out_handled)
 {
-	// Cached state (persists across calls)
+	// Latched input state (persists across calls). These belong to whichever
+	// qwerty system is currently bound; they are reset when it changes.
 	static struct qwerty_system *qsys = NULL;
-	static bool ctrl_pressed = false;  // CTRL = left controller focus
-	static bool alt_pressed = false;   // ALT = right controller focus
+	static bool ctrl_pressed = false; // CTRL = left controller focus
+	static bool alt_pressed = false;  // ALT = right controller focus
 	static struct qwerty_device *default_qdev = NULL;
 	static struct qwerty_controller *default_qctrl = NULL;
-	static bool cached = false;
 	static bool mouse_look_active = false;
 	static POINT last_mouse_pos = {0, 0};
 	static bool lmb_was_down = false; // Tracks LMB state from wParam (touchpad fallback)
@@ -164,19 +170,39 @@ qwerty_process_win32(struct xrt_device **xdevs,
 		*out_handled = false;
 	}
 
-	// Initialize cache on first call
-	if (!cached) {
-		qsys = find_qwerty_system(xdevs, xdev_count);
-		if (qsys == NULL) {
-			return; // No qwerty devices found
-		}
+	// #1538: resolve the qwerty system from the xdevs the CALLER handed us, every
+	// call. These statics used to be populated once behind a `cached` flag that
+	// was never reset — but a qwerty_system belongs to ONE xrt_system_devices and
+	// is free()d with it at xrDestroyInstance (qwerty_device.c
+	// qwerty_system_destroy). A process that builds several instances in sequence
+	// — every OpenXR CTS run does, 46-59 of them in one conformance_cli process —
+	// then dereferenced the first one's freed system from the window thread on
+	// the next window's activation message, which is the nondeterministic
+	// ACCESS_VIOLATION in #1538. The caller's array is safe to resolve from: it
+	// is the window's own xsysd, and the window is torn down before it.
+	struct qwerty_system *live = find_qwerty_system(xdevs, xdev_count);
+	if (live == NULL) {
+		return; // No qwerty devices in this device list.
+	}
+	if (live != qsys) {
+		qsys = live;
 		default_qdev = default_qwerty_device(xdevs, xdev_count, qsys);
 		default_qctrl = default_qwerty_controller(xdevs, xdev_count, qsys);
-		cached = true;
-		U_LOG_W("QWERTY Win32 input initialized - WASDQE move, RMB+drag look, F/G controller focus");
+		// The latched state describes keys/buttons held on the PREVIOUS system,
+		// which no longer exists — start the new one clean.
+		ctrl_pressed = false;
+		alt_pressed = false;
+		mouse_look_active = false;
+		lmb_was_down = false;
+		mmb_was_down = false;
+		GetCursorPos(&last_mouse_pos);
+		U_LOG_W(
+		    "QWERTY Win32 input bound to qwerty system %p - WASDQE move, RMB+drag look, "
+		    "F/G controller focus",
+		    (void *)qsys);
 	}
 
-	if (qsys == NULL || !qsys->process_keys) {
+	if (!qsys->process_keys) {
 		return;
 	}
 

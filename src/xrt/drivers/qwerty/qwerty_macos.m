@@ -112,29 +112,40 @@ qwerty_process_macos(struct xrt_device **xdevs,
 {
 	NSEvent *event = (__bridge NSEvent *)ns_event_ptr;
 
-	// Cached state (persists across calls)
+	// Latched input state (persists across calls). These belong to whichever
+	// qwerty system is currently bound; they are reset when it changes.
 	static struct qwerty_system *qsys = NULL;
-	static bool ctrl_pressed = false;  // CTRL = left controller focus
-	static bool alt_pressed = false;   // ALT/Option = right controller focus
+	static bool ctrl_pressed = false; // CTRL = left controller focus
+	static bool alt_pressed = false;  // ALT/Option = right controller focus
 	static struct qwerty_device *default_qdev = NULL;
 	static struct qwerty_controller *default_qctrl = NULL;
-	static bool cached = false;
 	static bool mouse_look_active = false;
 	static NSPoint last_mouse_pos = {0, 0};
 
-	// Initialize cache on first call
-	if (!cached) {
-		qsys = find_qwerty_system(xdevs, xdev_count);
-		if (qsys == NULL) {
-			return; // No qwerty devices found
-		}
+	// #1538: resolve from the caller's xdevs every call rather than caching once
+	// behind a flag that is never reset. A qwerty_system belongs to ONE
+	// xrt_system_devices and is free()d with it at xrDestroyInstance, so a
+	// process that builds several instances in sequence (the OpenXR CTS builds
+	// dozens) otherwise dereferences the first one's freed system forever.
+	struct qwerty_system *live = find_qwerty_system(xdevs, xdev_count);
+	if (live == NULL) {
+		return; // No qwerty devices in this device list.
+	}
+	if (live != qsys) {
+		qsys = live;
 		default_qdev = default_qwerty_device(xdevs, xdev_count, qsys);
 		default_qctrl = default_qwerty_controller(xdevs, xdev_count, qsys);
-		cached = true;
-		U_LOG_W("QWERTY macOS input initialized - WASDQE move, RMB+drag look, F/G controller focus");
+		// The latched state describes keys/buttons held on the PREVIOUS system,
+		// which no longer exists — start the new one clean.
+		ctrl_pressed = false;
+		alt_pressed = false;
+		mouse_look_active = false;
+		U_LOG_W("QWERTY macOS input bound to qwerty system %p - WASDQE move, RMB+drag look, "
+		        "F/G controller focus",
+		        (void *)qsys);
 	}
 
-	if (qsys == NULL || !qsys->process_keys) {
+	if (!qsys->process_keys) {
 		return;
 	}
 

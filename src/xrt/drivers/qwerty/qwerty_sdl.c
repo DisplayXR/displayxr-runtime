@@ -9,6 +9,7 @@
 
 #include "qwerty_device.h"
 #include "util/u_device.h"
+#include "util/u_logging.h"
 #include "xrt/xrt_device.h"
 #include <SDL2/SDL.h>
 #include <SDL_scancode.h>
@@ -23,7 +24,9 @@ find_qwerty_system(struct xrt_device **xdevs, size_t xdev_count)
 {
 	struct xrt_device *xdev = NULL;
 	for (size_t i = 0; i < xdev_count; i++) {
-		if (xdevs[i] == NULL) {
+		// Guard tracking_origin (#59): a partially torn-down or IPC-proxy device
+		// may have none, and this resolver runs per event since #1538.
+		if (xdevs[i] == NULL || xdevs[i]->tracking_origin == NULL) {
 			continue;
 		}
 		// We check against tracker name instead of device name because the tracking overrides
@@ -37,7 +40,9 @@ find_qwerty_system(struct xrt_device **xdevs, size_t xdev_count)
 		}
 	}
 
-	assert(xdev != NULL && "There is no device in xdevs with the name of a qwerty device");
+	if (xdev == NULL) {
+		return NULL; // No qwerty device in this list — the caller bails out.
+	}
 	struct qwerty_device *qdev = qwerty_device(xdev);
 	struct qwerty_system *qsys = qdev->sys;
 	assert(qsys != NULL && "The qwerty_system of a qwerty_device was null");
@@ -112,13 +117,25 @@ qwerty_process_event(struct xrt_device **xdevs, size_t xdev_count, SDL_Event eve
 	// Default focused controller: the one used for qwerty_controller specific methods
 	static struct qwerty_controller *default_qctrl;
 
-	// We can cache the devices as they don't get destroyed during runtime
-	static bool cached = false;
-	if (!cached) {
-		qsys = find_qwerty_system(xdevs, xdev_count);
+	// #1538: resolve from the caller's xdevs every call. The upstream comment
+	// here claimed "we can cache the devices as they don't get destroyed during
+	// runtime" — that holds for one xrt_system_devices, but the qwerty_system is
+	// free()d with it at xrDestroyInstance, and a process that builds several in
+	// sequence (the OpenXR CTS builds dozens) then uses a dangling pointer. Same
+	// defect as the win32 front-end, where it is the #1538 ACCESS_VIOLATION.
+	struct qwerty_system *live = find_qwerty_system(xdevs, xdev_count);
+	if (live == NULL) {
+		return; // No qwerty devices in this device list.
+	}
+	if (live != qsys) {
+		qsys = live;
 		default_qdev = default_qwerty_device(xdevs, xdev_count, qsys);
 		default_qctrl = default_qwerty_controller(xdevs, xdev_count, qsys);
-		cached = true;
+		// The latched state describes keys held on the PREVIOUS system, which no
+		// longer exists — start the new one clean.
+		ctrl_pressed = false;
+		alt_pressed = false;
+		U_LOG_W("QWERTY SDL input bound to qwerty system %p", (void *)qsys);
 	}
 
 	if (!qsys->process_keys) {
