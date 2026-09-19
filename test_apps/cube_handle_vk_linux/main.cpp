@@ -120,6 +120,14 @@ static volatile bool g_running = true;
 //! the runtime's VkSurfaceKHR borrows its connection.
 static DxrLinuxWindow g_window;
 
+// TEST HOOK, off unless DXR_CUBE_TEST_RESIZE=WxH is set. Drives one
+// xrSetWaylandSurfaceGeometryDXR call after a warm-up so the runtime's Wayland
+// resize-follow is testable without a window manager in the loop.
+static uint32_t g_testResizeW = 0;
+static uint32_t g_testResizeH = 0;
+static bool g_testResizeDone = false;
+static uint64_t g_frameCounter = 0;
+
 //! Non-volatile mirror of g_running that the window helper can write through a
 //! plain bool*; copied back into g_running right after each pump.
 static bool g_windowRunning = true;
@@ -2145,6 +2153,12 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     sessionInfo.systemId = xr.systemId;
 
     XR_CHECK(xrCreateSession(xr.instance, &sessionInfo, &xr.session));
+    // Arm the mid-session geometry channel (XR_DXR_wayland_surface_binding
+    // spec v2). No-op on X11; on Wayland it resolves
+    // xrSetWaylandSurfaceGeometryDXR so later xdg_toplevel.configure resizes
+    // reach the runtime. An older runtime simply has no such function and the
+    // helper logs once.
+    g_window.attach_session(xr.instance, xr.session);
     LOG_INFO("Session created (%s via %s: %s)",
              DxrLinuxWindow::backend_name(g_window.backend()),
              g_window.required_openxr_extension(), g_window.describe().c_str());
@@ -2363,13 +2377,23 @@ static void PrintUsage(const char* argv0) {
         "  --backend=auto     (default) X11 whenever DISPLAY resolves and the runtime\n"
         "                     advertises the xlib binding - including under XWayland,\n"
         "                     which is the proven path; native Wayland otherwise.\n"
-        "  --windowed         Wayland only: skip xdg_toplevel.set_fullscreen. The\n"
-        "                     runtime's WSI swapchain is panel-sized and it never\n"
-        "                     follows a Wayland resize, so the weave will NOT be 1:1 -\n"
-        "                     this exists to observe that limitation, not to use it.\n"
+        "  --windowed         Wayland only: skip xdg_toplevel.set_fullscreen and run\n"
+        "                     windowed at DXR_CUBE_WINDOW's size. Supported since\n"
+        "                     XR_DXR_wayland_surface_binding spec 2 - the app declares\n"
+        "                     the surface size, so the runtime sizes its swapchain to\n"
+        "                     the window instead of resizing the window to the panel.\n"
+        "                     The weave PHASE still needs the compositor geometry\n"
+        "                     service (window-geometry@displayxr.org).\n"
         "\n"
         "Env: DXR_WINDOW_BACKEND=x11|wayland|auto (--backend wins)\n"
-        "     DXR_CUBE_WINDOW=WxH+X+Y            windowed size/pos, panel-relative (X11)\n",
+        "     DXR_CUBE_WINDOW=WxH+X+Y            windowed size/pos, panel-relative\n"
+        "                                        (position is X11-only; Wayland clients\n"
+        "                                        cannot place themselves)\n"
+        "     DXR_CUBE_TEST_RESIZE=WxH           TEST HOOK, off by default. After ~120\n"
+        "                                        frames, declare this new surface size\n"
+        "                                        via xrSetWaylandSurfaceGeometryDXR, to\n"
+        "                                        exercise the runtime's resize-follow\n"
+        "                                        without a user dragging a window edge.\n",
         argv0);
 }
 
@@ -2442,6 +2466,16 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (const char* renv = getenv("DXR_CUBE_TEST_RESIZE")) {
+        unsigned w = 0, h = 0;
+        if (sscanf(renv, "%ux%u", &w, &h) == 2 && w > 0 && h > 0) {
+            g_testResizeW = w;
+            g_testResizeH = h;
+            LOG_WARN("DXR_CUBE_TEST_RESIZE=%ux%u — TEST HOOK armed; the app will declare this size "
+                     "mid-session (Wayland only)", w, h);
+        }
+    }
+
     DxrLinuxWindowDesc winDesc = {};
     winDesc.width = winW;
     winDesc.height = winH;
@@ -2454,17 +2488,23 @@ int main(int argc, char** argv) {
     winDesc.fullscreen_on_wayland = true;
 
     if (xr.windowBackend == DxrWindowBackend::Wayland) {
-        // A Wayland client cannot place or size itself against the desktop, and
-        // the runtime's WSI swapchain is panel-sized regardless (it never sees a
-        // Wayland resize). DXR_CUBE_WINDOW therefore cannot be honoured here;
-        // say so instead of silently producing a wrong weave.
+        // A Wayland client cannot POSITION itself, so DXR_CUBE_WINDOW's offset
+        // is meaningless here. Its SIZE is honoured in windowed mode: the
+        // helper declares it through XrWaylandSurfaceGeometryDXR (extension
+        // spec v2) and the runtime sizes its WSI swapchain to match — which on
+        // Wayland is what actually sets the surface size, since the buffer
+        // defines the surface.
         if (cubeWindowRequested && !waylandWindowed) {
-            LOG_WARN("DXR_CUBE_WINDOW is ignored on the Wayland backend — windowed Wayland is not supported "
-                     "by the runtime yet (panel-sized WSI swapchain, no resize follow). Staying fullscreen; "
-                     "pass --windowed to force it anyway and observe the limitation.");
+            LOG_WARN("DXR_CUBE_WINDOW is ignored on the Wayland backend without --windowed — the default is "
+                     "fullscreen on the panel (the INV-1.3 substitute). Pass --windowed to run at the "
+                     "requested size.");
         }
         if (waylandWindowed) {
             winDesc.fullscreen_on_wayland = false;
+            if (cubeWindowRequested) {
+                LOG_INFO("Wayland windowed: %ux%u (DXR_CUBE_WINDOW's +X+Y offset is ignored — a Wayland "
+                         "client cannot place itself)", winDesc.width, winDesc.height);
+            }
         }
     } else if (waylandWindowed) {
         LOG_WARN("--windowed only affects the Wayland backend — ignored on X11 (use DXR_CUBE_WINDOW)");
@@ -2614,6 +2654,21 @@ int main(int argc, char** argv) {
         g_window.pump(OnWindowKey, &g_windowRunning);
         if (!g_windowRunning) {
             g_running = false; // one-way: never resurrect a SIGINT-cleared flag
+        }
+
+        // TEST HOOK (DXR_CUBE_TEST_RESIZE, off by default): declare a different
+        // surface size once, so the runtime's Wayland resize-follow can be
+        // exercised without a human dragging a window edge. Legitimate because
+        // on Wayland declaring a size IS how a client resizes itself — the
+        // buffer defines the surface.
+        if (g_testResizeW > 0 && !g_testResizeDone && ++g_frameCounter > 120) {
+            g_testResizeDone = true;
+            LOG_WARN("DXR_CUBE_TEST_RESIZE: declaring %ux%u after %llu frames",
+                     g_testResizeW, g_testResizeH, (unsigned long long)g_frameCounter);
+            if (!g_window.force_declare_geometry(g_testResizeW, g_testResizeH)) {
+                LOG_WARN("DXR_CUBE_TEST_RESIZE: declaration failed (Wayland backend + a spec-2 runtime "
+                         "are required)");
+            }
         }
         PollEvents(xr);
 
