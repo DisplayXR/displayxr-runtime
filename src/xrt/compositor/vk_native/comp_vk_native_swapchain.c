@@ -19,6 +19,7 @@
 #include "util/u_logging.h"
 #include "util/u_misc.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 /*!
@@ -58,7 +59,48 @@ struct comp_vk_native_swapchain
 
 	//! Per-image acquire/wait/release state. See util/comp_swapchain_ring.h.
 	struct comp_swapchain_ring ring;
+
+	//! #1559: the images really are the app-requested `*_SRGB` format, so the
+	//! compose blit must not read them directly (it would sRGB-decode).
+	bool true_srgb;
+
+	//! The format the runtime READS these images in — the UNORM sibling for an
+	//! sRGB swapchain (raw passthrough, Model A), else the image format itself.
+	VkFormat raw_format;
+
+	//! @name #1559 compose scratch
+	//! Lazily created UNORM staging image for the compose blit's source rect.
+	//! Only allocated for a `true_srgb` swapchain, grown to the largest source
+	//! rect seen, and freed with the swapchain.
+	//! @{
+	VkImage scratch_image;
+	VkDeviceMemory scratch_memory;
+	uint32_t scratch_w, scratch_h;
+	bool scratch_failed;
+	//! @}
 };
+
+/*!
+ * #1559 kill switch. Default ON: `xrEnumerateSwapchainImages` hands back
+ * `VkImage`s in the format the app asked for. `DXR_VK_SWAPCHAIN_TRUE_FORMAT=0`
+ * restores the pre-#1559 substitution (UNORM image behind an sRGB-capable
+ * format list) for a one-binary A/B.
+ */
+static bool
+vk_swapchain_true_format_enabled(void)
+{
+	static bool cached = false;
+	static bool value = true;
+	if (!cached) {
+		const char *env = getenv("DXR_VK_SWAPCHAIN_TRUE_FORMAT");
+		if (env != NULL && (env[0] == '0' || env[0] == 'n' || env[0] == 'N' || env[0] == 'f' || env[0] == 'F' ||
+		                    (env[0] == 'o' && (env[1] == 'f' || env[1] == 'F')))) {
+			value = false;
+		}
+		cached = true;
+	}
+	return value;
+}
 
 static inline struct comp_vk_native_swapchain *
 vk_sc(struct xrt_swapchain *xsc)
@@ -189,6 +231,14 @@ vk_swapchain_destroy(struct xrt_swapchain *xsc)
 		}
 	}
 
+	// #1559 compose scratch.
+	if (sc->scratch_image != VK_NULL_HANDLE) {
+		vk->vkDestroyImage(vk->device, sc->scratch_image, NULL);
+	}
+	if (sc->scratch_memory != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, sc->scratch_memory, NULL);
+	}
+
 	free(sc);
 }
 
@@ -220,33 +270,54 @@ comp_vk_native_swapchain_create(struct comp_vk_native_compositor *c,
 	sc->image_count = image_count;
 	comp_swapchain_ring_init(&sc->ring, image_count);
 
+	// Filled in below once the format decision is made (#1559); the destroy
+	// path runs on every early return, so keep them defined from the start.
+	sc->true_srgb = false;
+	sc->raw_format = VK_FORMAT_UNDEFINED;
+
 	VkFormat vk_format = xrt_format_to_vk(info->format);
 	bool depth = is_depth_format(vk_format);
 
-	// sRGB passthrough (mirrors the GL/D3D11/D3D12 fixes): the compose
-	// vkCmdBlitImage reads the source in the IMAGE's format, so an sRGB image
-	// would auto-decode sRGB->linear with no re-encode into the UNORM atlas,
-	// and the DP (which wants display-referred bytes) would get ~2.2x-too-dark
-	// content. There is no view to retag for a blit, so create the color image
-	// in the UNORM sibling — the blit then passes the app's stored bytes through
-	// unchanged. Expose the requested sRGB format via MUTABLE_FORMAT + a format
-	// list so the app can still create an sRGB view to render with encode.
-	VkFormat image_format = vk_format;
-	VkFormat srgb_view_format = VK_FORMAT_UNDEFINED;
+	/*
+	 * sRGB passthrough, and who gets to see which format (#1559).
+	 *
+	 * The compose vkCmdBlitImage reads its source in the IMAGE's format, so
+	 * blitting an sRGB image into the UNORM atlas auto-decodes sRGB->linear
+	 * with no re-encode and the DP (which wants display-referred bytes, Model
+	 * A / ADR-021) gets ~2.2x-too-dark content. The runtime therefore has to
+	 * READ these images as UNORM.
+	 *
+	 * It does NOT follow that the app must be handed a UNORM image, and
+	 * handing it one is a deviation from XR_KHR_vulkan_enable[2] (the returned
+	 * VkImage is specified to have XrSwapchainCreateInfo::format) that the CTS
+	 * conformance layer flags on every sRGB swapchain — 285 warnings a run.
+	 * So: create the image in the format the app asked for, keep
+	 * MUTABLE_FORMAT + a format list carrying both siblings, and give every
+	 * runtime-internal reader the UNORM sibling instead:
+	 *   - sampling paths use sc->views[], created below in `raw_format`;
+	 *   - the one format-sensitive reader, the compose blit, goes through
+	 *     comp_vk_native_swapchain_stage_unorm_copy() — a raw vkCmdCopyImage
+	 *     (size-compatible formats, no conversion anywhere) into an UNORM
+	 *     scratch, which is then the blit source;
+	 *   - zero-copy is disabled for these swapchains, so no DP is ever handed
+	 *     an sRGB VkImage (same shape as the #918 guard: a placement fact
+	 *     applied to u_tiling_can_zero_copy()'s RESULT, not a second gate).
+	 */
+	VkFormat unorm_sibling = VK_FORMAT_UNDEFINED;
 	if (!depth) {
 		switch (vk_format) {
-		case VK_FORMAT_R8G8B8A8_SRGB:
-			image_format = VK_FORMAT_R8G8B8A8_UNORM;
-			srgb_view_format = vk_format;
-			break;
-		case VK_FORMAT_B8G8R8A8_SRGB:
-			image_format = VK_FORMAT_B8G8R8A8_UNORM;
-			srgb_view_format = vk_format;
-			break;
+		case VK_FORMAT_R8G8B8A8_SRGB: unorm_sibling = VK_FORMAT_R8G8B8A8_UNORM; break;
+		case VK_FORMAT_B8G8R8A8_SRGB: unorm_sibling = VK_FORMAT_B8G8R8A8_UNORM; break;
 		default: break;
 		}
 	}
-	const bool mutable_srgb = (srgb_view_format != VK_FORMAT_UNDEFINED);
+	const bool srgb_requested = (unorm_sibling != VK_FORMAT_UNDEFINED);
+	bool true_srgb = srgb_requested && vk_swapchain_true_format_enabled();
+
+	// What the app gets, and what the runtime reads.
+	VkFormat image_format = true_srgb ? vk_format : (srgb_requested ? unorm_sibling : vk_format);
+	VkFormat raw_format = srgb_requested ? unorm_sibling : vk_format;
+	const bool mutable_srgb = srgb_requested;
 
 	/*
 	 * Usage flags. Go through vk_csci_get_image_usage_flags() rather than
@@ -262,9 +333,14 @@ comp_vk_native_swapchain_create(struct comp_vk_native_compositor *c,
 	 * set at vkCreateImage) hands the app a NULL descriptor and the shader
 	 * faults. Real GPU drivers tolerate it, which is why this hid for so long.
 	 *
-	 * Query against image_format, not vk_format: for the sRGB substitution
-	 * above the app's bits have to be satisfiable by the image we actually
-	 * create, and sRGB formats never advertise the storage-image feature.
+	 * Query against image_format, not vk_format: the app's bits have to be
+	 * satisfiable by the image we actually create.
+	 *
+	 * #1559 corollary: sRGB formats never advertise the storage-image feature,
+	 * so an app asking for UNORDERED_ACCESS on an sRGB swapchain can only be
+	 * served by the UNORM substitution. Rather than regress that app from
+	 * "works" to XR_ERROR_FEATURE_UNSUPPORTED for the sake of a truthful
+	 * format, fall back to the substitution for that one swapchain.
 	 *
 	 * MUTABLE_FORMAT is deliberately not the helper's job (it is an image
 	 * create flag, not a usage flag) and is handled by mutable_srgb below.
@@ -273,6 +349,23 @@ comp_vk_native_swapchain_create(struct comp_vk_native_compositor *c,
 	VkImageUsageFlags usage = 0;
 	if (mappable_bits != 0) {
 		usage = vk_csci_get_image_usage_flags(vk, image_format, mappable_bits);
+		if (usage == 0 && true_srgb) {
+			VkImageUsageFlags as_unorm = vk_csci_get_image_usage_flags(vk, raw_format, mappable_bits);
+			if (as_unorm != 0) {
+				static bool usage_fallback_reported = false;
+				if (!usage_fallback_reported) {
+					usage_fallback_reported = true;
+					U_LOG_W(
+					    "#1559: %s cannot carry every requested usage bit (0x%08x) — keeping "
+					    "the UNORM substitution for this swapchain (the returned VkImage will "
+					    "not match the requested format).",
+					    vk_format_string(image_format), (unsigned)mappable_bits);
+				}
+				true_srgb = false;
+				image_format = raw_format;
+				usage = as_unorm;
+			}
+		}
 		if (usage == 0) {
 			// One-shot: a mis-matched app would otherwise log per swapchain.
 			static bool reported = false;
@@ -309,7 +402,13 @@ comp_vk_native_swapchain_create(struct comp_vk_native_compositor *c,
 		}
 	}
 
-	VkFormat view_format_list[2] = {image_format, srgb_view_format};
+	// The usage fallback above can still turn true_srgb off, so latch after it.
+	sc->true_srgb = true_srgb;
+	sc->raw_format = raw_format;
+
+	// Both siblings, whichever way round the image itself was created — the app
+	// may make a view in the format it asked for, the runtime makes UNORM ones.
+	VkFormat view_format_list[2] = {vk_format, unorm_sibling};
 	VkImageFormatListCreateInfo format_list_ci = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
 	    .viewFormatCount = 2,
@@ -382,19 +481,21 @@ comp_vk_native_swapchain_create(struct comp_vk_native_compositor *c,
 		}
 
 		// Create image view (UNORM base for sRGB swapchains — passthrough, no
-		// sample-time decode; see the image-format note above).
+		// sample-time decode; see the image-format note above). Legal on a
+		// truthfully-sRGB image because of MUTABLE_FORMAT + the format list.
 		VkImageViewCreateInfo view_ci = {
 		    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
 		    .image = sc->images[i],
 		    .viewType = view_type,
-		    .format = image_format,
-		    .subresourceRange = {
-		        .aspectMask = aspect,
-		        .baseMipLevel = 0,
-		        .levelCount = image_ci.mipLevels,
-		        .baseArrayLayer = 0,
-		        .layerCount = image_ci.arrayLayers,
-		    },
+		    .format = raw_format,
+		    .subresourceRange =
+		        {
+		            .aspectMask = aspect,
+		            .baseMipLevel = 0,
+		            .levelCount = image_ci.mipLevels,
+		            .baseArrayLayer = 0,
+		            .layerCount = image_ci.arrayLayers,
+		        },
 		};
 
 		res = vk->vkCreateImageView(vk->device, &view_ci, NULL, &sc->views[i]);
@@ -416,6 +517,18 @@ comp_vk_native_swapchain_create(struct comp_vk_native_compositor *c,
 	sc->base.base.reference.count = 1;
 
 	*out_xsc = &sc->base.base;
+
+	// One-off (never per frame, never per swapchain): say once per process that
+	// the truthful-format path is live and what it costs.
+	if (sc->true_srgb) {
+		static bool true_srgb_reported = false;
+		if (!true_srgb_reported) {
+			true_srgb_reported = true;
+			U_LOG_W(
+			    "#1559: sRGB swapchain: truthful format, compose via UNORM scratch copy; "
+			    "zero-copy disabled (DXR_VK_SWAPCHAIN_TRUE_FORMAT=0 restores the substitution)");
+		}
+	}
 
 	U_LOG_I("Created VK native swapchain: %ux%u, %u images, format %d",
 	        info->width, info->height, image_count, (int)vk_format);
@@ -456,4 +569,209 @@ comp_vk_native_swapchain_get_array_size(struct xrt_swapchain *xsc)
 {
 	struct comp_vk_native_swapchain *sc = vk_sc(xsc);
 	return sc->info.array_size;
+}
+
+bool
+comp_vk_native_swapchain_is_true_srgb(struct xrt_swapchain *xsc)
+{
+	struct comp_vk_native_swapchain *sc = vk_sc(xsc);
+	return sc->true_srgb;
+}
+
+/*!
+ * Grow (or first create) the #1559 compose scratch so it covers @p need_w x
+ * @p need_h. Returns false once it has failed, so the caller degrades to a
+ * direct blit instead of retrying every frame.
+ */
+static bool
+vk_swapchain_ensure_scratch(struct comp_vk_native_swapchain *sc, uint32_t need_w, uint32_t need_h)
+{
+	struct vk_bundle *vk = sc->vk;
+
+	if (sc->scratch_failed) {
+		return false;
+	}
+	if (sc->scratch_image != VK_NULL_HANDLE && sc->scratch_w >= need_w && sc->scratch_h >= need_h) {
+		return true;
+	}
+
+	// Growing: the old one cannot be in flight — the compose records and
+	// submits within one frame and the caller is on that thread.
+	if (sc->scratch_image != VK_NULL_HANDLE) {
+		vk->vkDeviceWaitIdle(vk->device);
+		vk->vkDestroyImage(vk->device, sc->scratch_image, NULL);
+		sc->scratch_image = VK_NULL_HANDLE;
+	}
+	if (sc->scratch_memory != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, sc->scratch_memory, NULL);
+		sc->scratch_memory = VK_NULL_HANDLE;
+	}
+
+	uint32_t w = need_w > sc->scratch_w ? need_w : sc->scratch_w;
+	uint32_t h = need_h > sc->scratch_h ? need_h : sc->scratch_h;
+
+	VkImageCreateInfo image_ci = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+	    .imageType = VK_IMAGE_TYPE_2D,
+	    .format = sc->raw_format,
+	    .extent = {w, h, 1},
+	    .mipLevels = 1,
+	    .arrayLayers = 1,
+	    .samples = VK_SAMPLE_COUNT_1_BIT,
+	    .tiling = VK_IMAGE_TILING_OPTIMAL,
+	    .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+	    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	};
+
+	VkResult res = vk->vkCreateImage(vk->device, &image_ci, NULL, &sc->scratch_image);
+	if (res != VK_SUCCESS) {
+		sc->scratch_image = VK_NULL_HANDLE;
+		goto failed;
+	}
+
+	VkMemoryRequirements mem_reqs;
+	vk->vkGetImageMemoryRequirements(vk->device, sc->scratch_image, &mem_reqs);
+
+	uint32_t mem_type_index = 0;
+	VkPhysicalDeviceMemoryProperties mem_props;
+	vk->vkGetPhysicalDeviceMemoryProperties(vk->physical_device, &mem_props);
+	for (uint32_t j = 0; j < mem_props.memoryTypeCount; j++) {
+		if ((mem_reqs.memoryTypeBits & (1u << j)) &&
+		    (mem_props.memoryTypes[j].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+			mem_type_index = j;
+			break;
+		}
+	}
+
+	VkMemoryAllocateInfo alloc_info = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+	    .allocationSize = mem_reqs.size,
+	    .memoryTypeIndex = mem_type_index,
+	};
+	res = vk->vkAllocateMemory(vk->device, &alloc_info, NULL, &sc->scratch_memory);
+	if (res != VK_SUCCESS) {
+		sc->scratch_memory = VK_NULL_HANDLE;
+		goto failed;
+	}
+
+	res = vk->vkBindImageMemory(vk->device, sc->scratch_image, sc->scratch_memory, 0);
+	if (res != VK_SUCCESS) {
+		goto failed;
+	}
+
+	sc->scratch_w = w;
+	sc->scratch_h = h;
+	return true;
+
+failed:
+	if (sc->scratch_image != VK_NULL_HANDLE) {
+		vk->vkDestroyImage(vk->device, sc->scratch_image, NULL);
+		sc->scratch_image = VK_NULL_HANDLE;
+	}
+	if (sc->scratch_memory != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, sc->scratch_memory, NULL);
+		sc->scratch_memory = VK_NULL_HANDLE;
+	}
+	sc->scratch_w = 0;
+	sc->scratch_h = 0;
+	sc->scratch_failed = true;
+	U_LOG_W(
+	    "#1559: could not create the %ux%u UNORM compose scratch (%d) — blitting the sRGB image "
+	    "directly, which sRGB-decodes it. Set DXR_VK_SWAPCHAIN_TRUE_FORMAT=0 to go back to the "
+	    "UNORM substitution.",
+	    w, h, res);
+	return false;
+}
+
+uint64_t
+comp_vk_native_swapchain_stage_unorm_copy(struct xrt_swapchain *xsc,
+                                          void *cmd_ptr,
+                                          uint32_t index,
+                                          int32_t src_x,
+                                          int32_t src_y,
+                                          uint32_t src_w,
+                                          uint32_t src_h,
+                                          uint32_t array_layer)
+{
+	struct comp_vk_native_swapchain *sc = vk_sc(xsc);
+	struct vk_bundle *vk = sc->vk;
+	VkCommandBuffer cmd = (VkCommandBuffer)cmd_ptr;
+
+	// Not a truthful-sRGB swapchain: the image already IS the runtime's raw
+	// format, so the caller blits from it directly (zero added work).
+	if (!sc->true_srgb || cmd == VK_NULL_HANDLE || index >= sc->image_count) {
+		return 0;
+	}
+	if (sc->images[index] == VK_NULL_HANDLE || src_w == 0 || src_h == 0) {
+		return 0;
+	}
+
+	// Clamp the source rect into the image; vkCmdCopyImage has no filtering
+	// and no clamping, an out-of-bounds region is invalid usage.
+	if (src_x < 0) {
+		src_x = 0;
+	}
+	if (src_y < 0) {
+		src_y = 0;
+	}
+	if ((uint32_t)src_x >= sc->info.width || (uint32_t)src_y >= sc->info.height) {
+		return 0;
+	}
+	if ((uint32_t)src_x + src_w > sc->info.width) {
+		src_w = sc->info.width - (uint32_t)src_x;
+	}
+	if ((uint32_t)src_y + src_h > sc->info.height) {
+		src_h = sc->info.height - (uint32_t)src_y;
+	}
+
+	// The copy lands at the SAME offsets as in the app image, so the caller's
+	// srcOffsets need no adjusting — only the array layer collapses to 0.
+	if (!vk_swapchain_ensure_scratch(sc, (uint32_t)src_x + src_w, (uint32_t)src_y + src_h)) {
+		return 0;
+	}
+
+	VkImageMemoryBarrier to_dst = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = 0,
+	    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .image = sc->scratch_image,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0,
+	                         NULL, 1, &to_dst);
+
+	// Raw copy: R8G8B8A8_SRGB -> R8G8B8A8_UNORM (and the BGRA pair) are
+	// size-compatible, and vkCmdCopyImage never converts — the app's stored
+	// bytes arrive in the scratch untouched, which is exactly what Model A's
+	// passthrough needs. The caller's scaling blit then reads UNORM, as before.
+	VkImageCopy region = {
+	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, array_layer, 1},
+	    .srcOffset = {src_x, src_y, 0},
+	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .dstOffset = {src_x, src_y, 0},
+	    .extent = {src_w, src_h, 1},
+	};
+	vk->vkCmdCopyImage(cmd, sc->images[index], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sc->scratch_image,
+	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+	VkImageMemoryBarrier to_src = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .image = sc->scratch_image,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0,
+	                         NULL, 1, &to_src);
+
+	return (uint64_t)(uintptr_t)sc->scratch_image;
 }

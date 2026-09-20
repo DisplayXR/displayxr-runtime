@@ -1536,27 +1536,46 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 				}
 			}
 
+			/*
+			 * #1559: an sRGB swapchain now hands the app a VkImage in
+			 * the format it asked for, and vkCmdBlitImage reads its
+			 * source in the IMAGE's format — so blitting it straight
+			 * into the UNORM atlas would sRGB-decode it. Stage a raw
+			 * vkCmdCopyImage (no conversion) into the swapchain's UNORM
+			 * scratch and blit from there. Returns 0 — and costs
+			 * nothing — for every other swapchain, which is all of them
+			 * when DXR_VK_SWAPCHAIN_TRUE_FORMAT=0.
+			 */
+			VkImage blit_src = src_image;
+			uint32_t blit_layer = layer->data.proj.v[eye].sub.array_index;
+			uint64_t staged = comp_vk_native_swapchain_stage_unorm_copy(
+			    xsc, cmd, sc_index, sx0, sy0, (uint32_t)(sx1 - sx0), (uint32_t)(sy1 - sy0), blit_layer);
+			if (staged != 0) {
+				blit_src = (VkImage)(uintptr_t)staged;
+				blit_layer = 0;
+			}
+
 			VkImageBlit blit = {
-			    .srcSubresource = {
-			        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-			        .mipLevel = 0,
-			        .baseArrayLayer = layer->data.proj.v[eye].sub.array_index,
-			        .layerCount = 1,
-			    },
+			    .srcSubresource =
+			        {
+			            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+			            .mipLevel = 0,
+			            .baseArrayLayer = blit_layer,
+			            .layerCount = 1,
+			        },
 			    .srcOffsets = {{sx0, sy0, 0}, {sx1, sy1, 1}},
-			    .dstSubresource = {
-			        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-			        .mipLevel = 0,
-			        .baseArrayLayer = 0,
-			        .layerCount = 1,
-			    },
+			    .dstSubresource =
+			        {
+			            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+			            .mipLevel = 0,
+			            .baseArrayLayer = 0,
+			            .layerCount = 1,
+			        },
 			    .dstOffsets = {{dx0, dy0, 0}, {dx1, dy1, 1}},
 			};
 
-			vk->vkCmdBlitImage(cmd,
-			                    src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-			                    r->atlas_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-			                    1, &blit, VK_FILTER_LINEAR);
+			vk->vkCmdBlitImage(cmd, blit_src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r->atlas_image,
+			                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
 
 			cmd_image_barrier(vk, cmd, src_image,
 			                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
