@@ -16,6 +16,10 @@
 
 #include "util/comp_base.h"
 #include "util/comp_render.h"
+// #1580: is_view_index_right_n() / is_layer_view_visible_n() -- the
+// view-count-aware generalisation of the stereo parity rule below, kept in a
+// Vulkan-free header so the D3D11/D3D12/Metal/GL renderers can share it.
+#include "util/comp_layer_view_camera.h"
 
 #ifdef __cplusplus
 extern "C" {

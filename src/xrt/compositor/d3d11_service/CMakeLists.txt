@@ -39,6 +39,9 @@ add_library(
 	# Include layer accumulator directly (it has no Vulkan dependencies)
 	../util/comp_layer_accum.c
 	../util/comp_layer_accum.h
+	# #1580: the shared per-view camera resolver (no Vulkan deps either)
+	../util/comp_layer_view_camera.c
+	../util/comp_layer_view_camera.h
 	)
 
 target_link_libraries(

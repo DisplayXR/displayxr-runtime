@@ -47,6 +47,7 @@ set(tests
     tests_xrt_active_mode_scale
     tests_input_arbiter_rig
     tests_sim_input_nav
+    tests_comp_layer_view_camera
 	)
 if(XRT_BUILD_DRIVER_QWERTY)
 	list(APPEND tests tests_qwerty_camera_profile)
@@ -176,6 +177,20 @@ target_link_libraries(tests_quat_change_of_basis PRIVATE aux_math)
 target_link_libraries(tests_quat_swing_twist PRIVATE aux_math)
 target_link_libraries(tests_vec3_angle PRIVATE aux_math)
 target_link_libraries(tests_space_overseer_rig PRIVATE aux_math)
+
+# #1580 -- the shared per-view camera resolver every backend's quad/cylinder/
+# equirect/cube path consumes. Compiled straight into the unit (like
+# tests_rig_composer) rather than linked from comp_util, which is Vulkan-gated
+# and would drag a whole compositor into a test that needs no device at all.
+# aux_math carries displayxr::math_xrt, i.e. dxr_view_math.h.
+target_sources(
+	tests_comp_layer_view_camera
+	PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/comp_layer_view_camera.c
+	)
+target_include_directories(
+	tests_comp_layer_view_camera PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor
+	)
+target_link_libraries(tests_comp_layer_view_camera PRIVATE xrt-interfaces aux_math)
 
 if(TARGET tests_input_host_geometry)
 	target_link_libraries(tests_input_host_geometry PRIVATE target_lists xrt-interfaces)
