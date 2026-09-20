@@ -85,6 +85,20 @@ comp_split_gate_env_same_adapter(void)
 }
 
 bool
+comp_split_gate_env_same_adapter_explicit(void)
+{
+	static int set = -1;
+	if (set < 0) {
+		// #1571: presence, not value. The software-scanout decline below is a
+		// change of DEFAULT only — an operator who typed the variable gets
+		// what they typed, in both directions.
+		const char *e = getenv("DXR_SPLIT_SAME_ADAPTER");
+		set = (e != NULL && e[0] != '\0') ? 1 : 0;
+	}
+	return set == 1;
+}
+
+bool
 comp_split_gate_env_test_fail_stage_a(void)
 {
 	static int on = -1;
@@ -146,6 +160,27 @@ comp_split_gate_evaluate(const struct comp_split_gate_inputs *inputs, struct com
 			// policy rather than a law: see allow_same_adapter.)
 			out_result->reason = COMP_SPLIT_REASON_HANDLED;
 			out_result->short_reason = COMP_SPLIT_REASON_SAME_ADAPTER;
+			return;
+		}
+		/*
+		 * #1571: ...unless the one adapter is a SOFTWARE rasterizer (WARP /
+		 * Microsoft Basic Render Driver) or a remote adapter. ADR-039's
+		 * argument for engaging same-adapter is the decoupled FILL ENGINE;
+		 * a software adapter has no engine to decouple, so the split costs
+		 * a second device, two D3D12 copy queues and a 3-deep egress ring
+		 * on the same cores and buys nothing. Measured: 12-25 s
+		 * producer-link stalls on the first frame of a session on a 2-vCPU
+		 * hosted runner (#1571). A REAL GPU never reaches this branch.
+		 *
+		 * DEFAULT only — an explicit DXR_SPLIT_SAME_ADAPTER (either value)
+		 * still wins, so the split arm stays reachable on WARP on purpose.
+		 * `same_adapter` stays true and the reason stays HANDLED: like the
+		 * decline above this is not a failure, and the caller says it in
+		 * its own words rather than being followed by a fallback WARN.
+		 */
+		if (inputs->scanout_software && !comp_split_gate_env_same_adapter_explicit()) {
+			out_result->reason = COMP_SPLIT_REASON_HANDLED;
+			out_result->short_reason = COMP_SPLIT_REASON_SOFTWARE_SCANOUT;
 			return;
 		}
 		// ADR-039: engage. The split's load-bearing property is the

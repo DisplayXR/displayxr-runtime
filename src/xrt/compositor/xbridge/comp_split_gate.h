@@ -116,6 +116,24 @@ enum comp_split_ingress_policy
 #define COMP_SPLIT_REASON_KILLED_BY_ENV "killed_by_env"
 //! Render adapter IS the scanout adapter; the split has nothing to do.
 #define COMP_SPLIT_REASON_SAME_ADAPTER "same_adapter"
+/*!
+ * Render == scanout AND that one adapter is a SOFTWARE rasterizer (WARP / the
+ * Microsoft Basic Render Driver) or a remote adapter — so ADR-039's engage is
+ * declined even though the tier's policy says yes (#1571).
+ *
+ * ADR-039 engages same-adapter because the split's load-bearing property is a
+ * DECOUPLED FILL ENGINE: a second device with its own timeline, which keeps
+ * panel-rate fill through a system-wide slowdown. A software rasterizer has no
+ * engine to decouple — both "devices" are the same CPU — so what the split buys
+ * there is not headroom but a second D3D11 device, a D3D12 producer queue, a
+ * D3D12 consumer queue and a 3-deep shared-texture egress ring competing for
+ * the same cores, with the egress rebuild and its 2 s drains on the app thread.
+ * Measured cost on a 2-vCPU hosted CI runner: producer-link stalls of 12–25 s
+ * on the first frame of a session (#1571, run 35475409391).
+ *
+ * A REAL GPU is unaffected — this branch cannot be reached on one.
+ */
+#define COMP_SPLIT_REASON_SOFTWARE_SCANOUT "software_scanout"
 //! The scanout adapter could not be resolved, so there is no way to tell
 //! whether this session crosses adapters at all.
 #define COMP_SPLIT_REASON_SCANOUT_UNRESOLVABLE "scanout_unresolvable"
@@ -263,6 +281,18 @@ struct comp_split_gate_inputs
 	 * until their phase). Zero-init = false = the pre-ADR-039 decline.
 	 */
 	bool allow_same_adapter;
+	/*!
+	 * The scanout adapter is a software rasterizer or a remote adapter —
+	 * @ref d3d_adapter_is_software_or_remote, the same predicate the ADR-037
+	 * render ranking uses to drop a candidate.
+	 *
+	 * Only read on the same-adapter branch, and only when
+	 * @ref allow_same_adapter is set: on a cross-adapter box the scanout
+	 * adapter is whatever drives the panel and the split's original purpose
+	 * (moving the copy) still holds. Zero-init = false = the pre-#1571
+	 * behaviour, so a tier that does not resolve this is unchanged.
+	 */
+	bool scanout_software;
 };
 
 //! The gate's verdict — pure data, no side effects taken on the caller's behalf.
@@ -352,6 +382,20 @@ comp_split_gate_env_requested(void);
  */
 bool
 comp_split_gate_env_same_adapter(void);
+
+/*!
+ * Was `DXR_SPLIT_SAME_ADAPTER` set by hand at all — either way?
+ *
+ * #1571 makes the same-adapter engage conditional on the scanout adapter not
+ * being a software rasterizer (@ref COMP_SPLIT_REASON_SOFTWARE_SCANOUT). That
+ * is a change to the DEFAULT, so the env stays the manual override in BOTH
+ * directions: `=0` still forces the split off, and an explicit `=1` still
+ * forces it on — including on a software adapter, which is how the hosted CI
+ * lane or a developer can deliberately exercise the split arm on WARP.
+ * Latched once per process, like its sibling.
+ */
+bool
+comp_split_gate_env_same_adapter_explicit(void);
 
 /*!
  * The unlatched parser behind @ref comp_split_gate_env_requested, exposed so the

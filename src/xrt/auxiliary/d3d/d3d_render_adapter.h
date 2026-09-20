@@ -52,6 +52,27 @@ d3d_render_adapter_luid(int32_t panel_screen_left,
                         uint64_t *out_packed_luid,
                         const char **out_provenance);
 
+/*!
+ * Is this adapter one the ADR-037 §2 ranking excludes outright — a software
+ * rasterizer (a `DXGI_ADAPTER_FLAG_SOFTWARE` adapter, or the Microsoft Basic
+ * Render Driver, i.e. WARP) or a remote adapter?
+ *
+ * The same predicate the ranking itself uses to drop a candidate (the
+ * "software or remote" INFO line); exported because a caller that already
+ * holds an adapter for another reason — the SCANOUT adapter, which is chosen
+ * by the panel and never ranked — needs the same answer without re-deriving
+ * it. Takes the three `DXGI_ADAPTER_DESC1` fields it reads rather than the
+ * struct, so this stays a plain C header with no DXGI dependency.
+ *
+ * @param vendor_id `DXGI_ADAPTER_DESC1::VendorId`.
+ * @param device_id `DXGI_ADAPTER_DESC1::DeviceId`.
+ * @param dxgi_adapter_flags `DXGI_ADAPTER_DESC1::Flags`; pass 0 when only the
+ *        legacy `DXGI_ADAPTER_DESC` is in hand — the Basic Render Driver is
+ *        still caught by its vendor/device id.
+ */
+bool
+d3d_adapter_is_software_or_remote(uint32_t vendor_id, uint32_t device_id, uint32_t dxgi_adapter_flags);
+
 #ifdef __cplusplus
 }
 #endif
