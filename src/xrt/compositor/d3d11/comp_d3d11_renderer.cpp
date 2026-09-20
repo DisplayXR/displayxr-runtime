@@ -755,11 +755,9 @@ create_resources(struct comp_d3d11_renderer *r)
 static void
 render_projection_layer(struct comp_d3d11_renderer *r,
                         struct comp_layer *layer,
-                        uint32_t view_index,
-                        struct xrt_vec3 *eye_position)
+                        uint32_t view_index)
 {
 	auto internals = get_internals(r->c);
-	(void)eye_position;
 
 	// Get swapchain for this view
 	struct xrt_swapchain *xsc = layer->sc_array[view_index];
@@ -1371,8 +1369,7 @@ set_view_viewport(struct comp_d3d11_renderer *renderer,
 extern "C" xrt_result_t
 comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
                                          struct comp_layer_accum *layers,
-                                         struct xrt_vec3 *left_eye,
-                                         struct xrt_vec3 *right_eye,
+                                         const struct xrt_eye_positions *eyes,
                                          uint32_t target_width,
                                          uint32_t target_height,
                                          const struct xrt_window_metrics *canvas,
@@ -1429,6 +1426,14 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
 	 * The canvas metrics feed branch (b) only (a quad-only frame, where
 	 * there is no app camera to borrow). They are optional: without them the
 	 * resolver falls back, it does not fail.
+	 *
+	 * The WHOLE eye set goes in, plus this frame's active view count: the
+	 * left/right pair this used to take could not express either of the two
+	 * eye-set rules the state tracker applies before it reports a view, so a
+	 * quad-only frame composed through a camera the app was never handed —
+	 * eye 0's off-axis frustum in a mono mode (the modelviewer#100 lateral
+	 * shift), and eye 1 for every view of a 2x2 quad mode, where views 2/3
+	 * sit 64 mm higher. See comp_layer_view_camera_select_eyes().
 	 */
 	const bool have_wm =
 	    canvas != nullptr && canvas->valid && canvas->window_width_m > 0.0f && canvas->window_height_m > 0.0f;
@@ -1441,15 +1446,14 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
 	            : xrt_vec3{0.0f, 0.0f, 0.0f};
 	struct comp_layer_view_camera cameras[XRT_MAX_VIEWS] = {};
 	for (uint32_t view = 0; view < effective_views && view < XRT_MAX_VIEWS; view++) {
-		struct xrt_vec3 *eye = (view == 0) ? left_eye : right_eye;
-		comp_layer_view_camera_select_ex(layers, view, eye, have_wm ? &canvas_center : nullptr,
-		                                 have_wm ? canvas->window_width_m : 0.0f,
-		                                 have_wm ? canvas->window_height_m : 0.0f, &cameras[view]);
+		comp_layer_view_camera_select_eyes(layers, view, eyes, effective_views,
+		                                   have_wm ? &canvas_center : nullptr,
+		                                   have_wm ? canvas->window_width_m : 0.0f,
+		                                   have_wm ? canvas->window_height_m : 0.0f, &cameras[view]);
 	}
 
 	for (uint32_t view_index = 0; view_index < effective_views; view_index++) {
 		set_view_viewport(renderer, view_index, layout, target_width, target_height);
-		struct xrt_vec3 *eye = (view_index == 0) ? left_eye : right_eye;
 
 		for (uint32_t i = 0; i < layers->layer_count; i++) {
 			struct comp_layer *layer = &layers->layers[i];
@@ -1457,7 +1461,7 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
 			switch (layer->data.type) {
 			case XRT_LAYER_PROJECTION:
 			case XRT_LAYER_PROJECTION_DEPTH:
-				render_projection_layer(renderer, layer, view_index, eye);
+				render_projection_layer(renderer, layer, view_index);
 				break;
 
 			case XRT_LAYER_ZONE_3D: {
@@ -1494,7 +1498,7 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
 				// zone_3d.proj shares xrt_layer_projection_data's layout
 				// at union offset 0, so the projection draw body reads
 				// the right per-view sub/fov data unchanged.
-				render_projection_layer(renderer, layer, view_index, eye);
+				render_projection_layer(renderer, layer, view_index);
 				internals.context->OMSetBlendState(renderer->blend_opaque, nullptr, 0xFFFFFFFF);
 				set_view_viewport(renderer, view_index, layout, target_width, target_height);
 				break;
@@ -1575,15 +1579,14 @@ comp_d3d11_renderer_draw_window_space_pass(struct comp_d3d11_renderer *renderer,
 extern "C" xrt_result_t
 comp_d3d11_renderer_draw(struct comp_d3d11_renderer *renderer,
                          struct comp_layer_accum *layers,
-                         struct xrt_vec3 *left_eye,
-                         struct xrt_vec3 *right_eye,
+                         const struct xrt_eye_positions *eyes,
                          uint32_t target_width,
                          uint32_t target_height,
                          const struct xrt_window_metrics *canvas,
                          const struct comp_d3d11_eff_layout *layout)
 {
-	xrt_result_t xret = comp_d3d11_renderer_draw_projection_pass(renderer, layers, left_eye, right_eye,
-	                                                             target_width, target_height, canvas, layout);
+	xrt_result_t xret = comp_d3d11_renderer_draw_projection_pass(renderer, layers, eyes, target_width,
+	                                                             target_height, canvas, layout);
 	if (xret != XRT_SUCCESS) {
 		return xret;
 	}
