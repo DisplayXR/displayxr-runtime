@@ -5574,8 +5574,12 @@ render_quad_layer(struct d3d11_service_system *sys,
 	// View matrix
 	math_matrix_4x4_view_from_pose(view_pose, &view);
 
-	// Projection matrix (Vulkan-style infinite reverse)
-	math_matrix_4x4_projection_vulkan_infinite_reverse(fov, 0.1f, &proj);
+	// Projection matrix (infinite-far, reversed depth) in D3D11's Y-UP clip
+	// space. The Vulkan variant negates row 1, which mirrored the quad about
+	// the view's horizontal centre line relative to the projection layer's
+	// identity blit (#1580). quad_vs_hlsl already flips Y in model space, so
+	// only the projection changes here.
+	math_matrix_4x4_projection_d3d_infinite_reverse(fov, 0.1f, &proj);
 
 	// MVP
 	math_matrix_4x4_multiply(&view, &model, &mv);
@@ -5675,8 +5679,10 @@ render_cylinder_layer(struct d3d11_service_system *sys,
 	// View matrix
 	math_matrix_4x4_view_from_pose(view_pose, &view);
 
-	// Projection matrix
-	math_matrix_4x4_projection_vulkan_infinite_reverse(fov, 0.1f, &proj);
+	// Projection matrix -- D3D11 Y-UP clip space (#1580). The cylinder VS
+	// already maps v to a Y-up model space (mixed_v = 0.5 - uv.y), so the
+	// Vulkan Y-down matrix was mirroring it; only the projection changes.
+	math_matrix_4x4_projection_d3d_infinite_reverse(fov, 0.1f, &proj);
 
 	// MVP
 	math_matrix_4x4_multiply(&view, &model, &mv);

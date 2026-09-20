@@ -711,6 +711,12 @@ math_matrix_4x4_inverse_view_projection(const struct xrt_matrix_4x4 *view,
  * Compute a projection matrix with settings for Vulkan, it will also have it's
  * far plane at infinite and the NDC depth will be reversed.
  *
+ * Clip space: **Y-DOWN** (Vulkan). Row 1 of the result is negated relative to
+ * the Y-up form, so `a22 < 0`. Only Vulkan consumers may use this — a Y-up
+ * backend that uses it draws everything mirrored about the view's horizontal
+ * centre line (#1580). Use math_matrix_4x4_projection_d3d_infinite_reverse()
+ * from D3D11 / D3D12 / Metal / OpenGL.
+ *
  * @relates xrt_matrix_4x4
  * @ingroup aux_math
  */
@@ -718,6 +724,21 @@ void
 math_matrix_4x4_projection_vulkan_infinite_reverse(const struct xrt_fov *fov,
                                                    float near_plane,
                                                    struct xrt_matrix_4x4 *result);
+
+/*!
+ * Same infinite-far / reversed-depth projection as
+ * math_matrix_4x4_projection_vulkan_infinite_reverse(), but for a **Y-UP**
+ * clip space — the NDC convention of D3D11, D3D12, Metal and OpenGL. `a22 > 0`
+ * here; the two functions are exact Y-negations of each other and share one
+ * body in m_matrix_projection.cpp so they cannot drift (#1580).
+ *
+ * @relates xrt_matrix_4x4
+ * @ingroup aux_math
+ */
+void
+math_matrix_4x4_projection_d3d_infinite_reverse(const struct xrt_fov *fov,
+                                                float near_plane,
+                                                struct xrt_matrix_4x4 *result);
 
 
 /*

@@ -294,10 +294,16 @@ VS_OUTPUT VSMain(uint vertex_id : SV_VertexID)
     // Center the quad at origin
     float2 pos = in_uv - 0.5;
 
-    // No Y flip: the Vulkan-style projection (negative a22) already inverts Y,
-    // which maps OpenXR's +Y-up world to D3D11's screen correctly.
-    // (Vulkan compositor would need Y flip because Vulkan NDC has Y-down,
-    // but D3D11 NDC has Y-up, matching OpenGL convention.)
+    // Flip Y into OpenXR/model space. in_uv.y == 0 is the texture's TOP row
+    // (D3D texture origin is top-left) and OpenXR quad model space is Y-up,
+    // so the top row must sit at +Y. Under the Y-up (D3D) projection that
+    // puts the texture's top at the top of the view.
+    // (#1580: this flip used to be absent and the Vulkan Y-DOWN projection
+    // supplied it instead. The texture then came out upright, but the quad's
+    // PLACEMENT was mirrored about the view's horizontal centre line -- a
+    // Y-down projection negates the quad's world-space Y offset too, which
+    // the identity-blit projection layer in the same tile never gets.)
+    pos.y = -pos.y;
 
     // Transform position by MVP (which includes quad size scaling)
     output.position = mul(mvp, float4(pos, 0.0, 1.0));
@@ -942,8 +948,11 @@ render_quad_layer(struct comp_d3d11_renderer *r,
 	// View matrix
 	math_matrix_4x4_view_from_pose(view_pose, &view);
 
-	// Projection matrix (Vulkan-style infinite reverse)
-	math_matrix_4x4_projection_vulkan_infinite_reverse(fov, 0.1f, &proj);
+	// Projection matrix (infinite-far, reversed depth) in D3D11's Y-UP clip
+	// space. The Vulkan variant negates row 1, which mirrored every quad
+	// about the tile's horizontal centre line relative to the projection
+	// layer's identity blit (#1580).
+	math_matrix_4x4_projection_d3d_infinite_reverse(fov, 0.1f, &proj);
 
 	// MVP
 	math_matrix_4x4_multiply(&view, &model, &mv);
@@ -1041,13 +1050,24 @@ render_window_space_layer(struct comp_d3d11_renderer *r,
 	float frac_cx = ws->x + ws->width / 2.0f + eye_shift;
 	float frac_cy = ws->y + ws->height / 2.0f;
 
-	// Convert to NDC: x: frac*2-1, y: 1-frac*2 (Y is flipped in NDC)
+	// Convert to NDC: x: frac*2-1, y: 1-frac*2 (window-space Y is down,
+	// D3D11 NDC Y is up). This is a property of the *centre* only, so it is
+	// unaffected by the model-space orientation below.
 	float ndc_cx = frac_cx * 2.0f - 1.0f;
 	float ndc_cy = 1.0f - frac_cy * 2.0f;
 
-	// Scale in NDC (full window = 2.0 in NDC)
+	// Scale in NDC (full window = 2.0 in NDC).
+	//
+	// #1580: quad_vs now flips Y in MODEL space (pos.y = 0.5 - in_uv.y), so
+	// the texture's top row (in_uv.y == 0) arrives here at pos.y = +0.5.
+	// This MVP is a direct NDC mapping with no projection matrix, so the
+	// sign must follow the shader:
+	//   before: pos.y(top) = -0.5, ndc_sy = -2h  ->  ndc_y = ndc_cy + h
+	//   after:  pos.y(top) = +0.5, ndc_sy = +2h  ->  ndc_y = ndc_cy + h
+	// Same pixels, i.e. the HUD stays upright; leaving ndc_sy negative
+	// would have flipped it.
 	float ndc_sx = ws->width * 2.0f;
-	float ndc_sy = -(ws->height * 2.0f); // Negate to flip Y: D3D11 texture origin is top-left
+	float ndc_sy = ws->height * 2.0f;
 
 	// Build 2D orthographic MVP: scale then translate
 	// The quad vertex shader uses a [-0.5, 0.5] unit quad
