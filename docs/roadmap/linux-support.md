@@ -314,6 +314,47 @@ tarball, and gates on `displayxr-cli selftest` resolving everything from the
 installed XDG paths only. Remaining staged scope (#705): `.deb` → demo
 AppImages.
 
+### Conformance — the Linux CTS arms (#1527)
+
+Until #1527 the platform had **no conformance coverage at all**: `build-linux.yml`
+builds and runs the hardware-free `displayxr-cli selftest`, and nothing ran the
+Khronos suite. The by-hand NVIDIA / Ubuntu 22.04 validation above is real
+evidence but not a repeatable gate.
+
+`cts.yml` now carries a Linux leg — `build-linux-cts` → `run-linux` — running
+`vulkan` and `vulkan2` (the whole Linux matrix; the platform is Vulkan-only) on
+GitHub-hosted `ubuntu-latest`, against Mesa **lavapipe** under **Xvfb**, with
+the `sim-display` plug-in. Hardware-free, at the same pinned CTS
+(`openxr-cts-1.1.63.0`) and the same test specs as the Windows arms, so the
+result files assemble into one submission package.
+
+Both arms are **experimental — reported with real counts, not gated**. Linux is
+Preview rather than GA, so a red arm here is information first; and the Windows
+arms each earned their gate with a whole-suite zero-red run rather than with
+"no known blocker". Same bar applies. The mechanism is one string,
+`EXPERIMENTAL_LINUX` in `cts.yml`'s `plan` job.
+
+What this tier does **not** cover, and what still needs the real-GPU runner
+#1527 originally proposed: anything that depends on a real driver stack or a
+real panel — NVIDIA/AMD/Intel driver-specific behaviour, the frame-timing test
+(quarantined on any software tier, because the budget is unmeetable on a CPU
+rasterizer), the direct-scanout path (`DXR_LINUX_DIRECT_SCANOUT=1`), Wayland
+(the lane is X11/XCB only), and the installed `.deb` / tarball runtime path
+(the lane runs the dev build tree). Hosted first, hardware after.
+
+Running the same script by hand, on a bench box with a real GPU and a real X
+session, is the supported path — drop `--software` and the quarantine list goes
+with it:
+
+```bash
+./scripts/build_linux.sh
+./scripts/fetch_build_cts.sh --apt
+./scripts/run_cts.sh -g vulkan --scope full --conformance-layer
+```
+
+Full detail, including exactly what is and is not ported from the Windows
+harness: `docs/roadmap/cts-windows-handoff.md` § *Linux arms*.
+
 ## Decisions
 
 - **XCB first, Wayland later** — window-position queryability (above). The

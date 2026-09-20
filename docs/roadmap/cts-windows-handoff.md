@@ -47,7 +47,7 @@ runs on today:
 | `opengl` | GitHub-hosted `windows-2022`, Mesa **llvmpipe** (provisioned — the image's own GL is GDI generic 1.1) | **yes** (#1523) | — · one software-tier quarantine entry, below |
 | `vulkan` | GitHub-hosted `windows-2022`, Mesa **lavapipe** (provisioned — the image ships no Vulkan ICD) | **yes** (#1523) | — |
 | `vulkan2` | same as `vulkan` | **yes** (#1523) | — |
-| Linux `vulkan` / `vulkan2` | **real GPU** (hardware-validated on NVIDIA / Ubuntu 22.04) — no runner yet | not in CI | #1523 part 2 |
+| Linux `vulkan` / `vulkan2` | GitHub-hosted `ubuntu-latest`, Mesa **lavapipe** under **Xvfb** (#1527) | **no — experimental** | reported, not gated; see § Linux arms |
 | Android `vulkan` / `vulkan2` | **real device** — no runner yet | not in CI | #1523 part 2, #1212 |
 
 **All five Windows arms gate on the hosted lane** — `d3d11`/`d3d12` on WARP,
@@ -141,8 +141,139 @@ non-experimental arm was red or produced no XML** — which, with `EXPERIMENTAL`
 empty, means every arm. A single arm no longer gates alone.
 
 Triggers: PR → `smoke` / `d3d11` only (fast); nightly cron + `v*` tag → `full`
-over all five Windows arms; `workflow_dispatch` → any single plugin or `all`,
-at either scope.
+over all five Windows arms **plus both Linux arms**; `workflow_dispatch` → any
+single plugin or `all`, at either scope.
+
+## Linux arms — `vulkan` + `vulkan2` on the hosted lane (#1527)
+
+Despite the file's name, the Linux arms live in the same `cts.yml`, so they are
+documented here rather than in a second runbook. They are the **Linux mirror of
+the Windows software tier**: GitHub-hosted `ubuntu-latest`, Mesa **lavapipe**
+(from `mesa-vulkan-drivers`, not a download), an X11 session from **Xvfb**, the
+vendor-neutral `sim-display` plug-in, and the same pinned CTS.
+
+**Why hosted-and-software rather than a rented GPU.** #1527 originally argued
+for a `g4dn`-class NVIDIA instance, on the reasoning that Linux is Vulkan-only
+so the GPU-family problem is small and the validated configuration *is* NVIDIA.
+That is still the right argument for **coverage**, and it is still owed. It is
+the wrong argument for **first coverage**: today the number is zero, a hosted
+lane costs nothing on a public repo, and a software tier is what caught three
+real runtime defects on Windows (#1539, #1550, #1560) before any hardware was
+involved. Hosted first, hardware after — the two are complements, and the
+real-GPU tier is the one that retires the frame-timing quarantine and covers
+adapter selection, exactly as on Windows.
+
+### Shape
+
+`plan` resolves `arms_linux` as the intersection of the requested arms with
+`{vulkan, vulkan2}`, so the PR lane (`d3d11`) produces an **empty** Linux leg
+and both Linux jobs skip for free. `build-linux-cts` builds the runtime
+(`scripts/build_linux.sh`, `CMAKE_BUILD_TYPE=Release`, ending in the usual
+headless `displayxr-cli selftest`) plus the CTS (`scripts/fetch_build_cts.sh`,
+cached on that script's hash + the pin), then hands the build tree to the
+`run-linux` arms as an artifact. Results upload as
+**`cts-results-linux-<graphics>`**, and the files inside keep the Windows names
+(`cts_ci_<graphics>.xml`, `_console.log`, `_stdout.log`,
+`_graphics_identity.txt`, plus a Linux-only `_runtime.log` and `_xvfb.log`) so
+they drop into a submission package unmodified. Because **both** platforms write
+`cts_ci_vulkan.xml`, the `summary` job resolves each row by **artifact
+directory**, not by filename — changing that back would report a Linux XML as a
+Windows result.
+
+### Both arms are EXPERIMENTAL, deliberately
+
+`EXPERIMENTAL_LINUX="vulkan vulkan2"` in `plan`: both arms run with
+`continue-on-error`, appear in the summary table with real counts, and do not
+fail the lane. Two reasons, and neither is "we expect them to be red":
+
+1. Every Windows arm earned its gate with a whole-suite zero-red run, never
+   with "no known blocker". The same bar applies here.
+2. Linux is **Preview**, not GA (`docs/roadmap/linux-support.md`). A red Linux
+   arm is information about the platform; it is not automatically a release
+   blocker, and wiring it as one before the baseline is known would make the
+   nightly unreadable.
+
+**To gate an arm:** delete its name from `EXPERIMENTAL_LINUX`. Nothing else in
+`cts.yml` changes. Record the run that earned it in the table below.
+
+| Arm | Flip evidence | Gated? |
+|---|---|---|
+| Linux `vulkan` | _(pending — first full run)_ | no |
+| Linux `vulkan2` | _(pending — first full run)_ | no |
+
+### What is Linux-specific, and what deliberately is not
+
+`scripts/run_cts.sh` is a port of `run_cts.ps1`'s essentials, not a
+transliteration. Same CTS pin, same `-TestSpec` strings, same output stems, same
+`DXR_PLUGIN_EXCLUSIVE` / `DXR_INPUT_PROVIDERS=0` exclusivity, same
+quarantine-list semantics. What is **not** ported, and why:
+
+* **No registry, no restore, no `finally`.** All of that exists on Windows
+  because the Khronos and Vulkan loaders read their path env vars through a
+  secure `getenv` and discard them in an elevated process, so `HKLM` is the only
+  channel. Linux has no such downgrade: `XR_RUNTIME_JSON`, `XR_API_LAYER_PATH`,
+  `VK_ADD_LAYER_PATH` and `VK_DRIVER_FILES` are honoured as-is, everything the
+  script sets is process env, and there is no machine state that an aborted run
+  could leave mis-pointed.
+* **No DPI manifest.** #1506's embed exists because a DPI-unaware Win32 process
+  reads virtualised window geometry and every geometric CTS measurement comes
+  back wrong by the scale factor. X11 has no per-process geometry
+  virtualisation; the compositor reads real root-window pixels through
+  `xcb_get_geometry` / `xcb_translate_coordinates`.
+* **No loader staging next to the exe.** #1525's `vulkan-1.dll` copy exists
+  because a bare Windows runner has no Vulkan loader in `System32`. On Linux
+  `libvulkan.so.1` comes from `libvulkan1`, a hard dependency of every ICD
+  package.
+
+Linux-specific, on the other hand:
+
+* **`DISPLAY` is mandatory, a window manager is not.** The compositor presents
+  to an X11/XCB surface (`comp_vk_native_window_xcb.c`) and the CTS passes no
+  window binding, so the runtime self-creates the window. `xcb_map_window`
+  works on a bare X server, and — the part worth stating, because the Windows
+  lane has just learned that FOCUSED timeouts are a real failure mode (#1571) —
+  **FOCUSED does not depend on X input focus here**:
+  `oxr_session_gfx_vk_native.c` sets `compositor_focused = true`
+  unconditionally for the in-process native path, so the
+  SYNCHRONIZED → VISIBLE → FOCUSED ladder turns purely on frame submission. No
+  `openbox`/`fluxbox` is needed, and adding one would only introduce a
+  reparenting WM between the compositor and its own surface.
+* **`DXR_WINDOW_FULLSCREEN=0`, not `XRT_COMPOSITOR_START_WINDOWED`.** The latter
+  is read in exactly one place, `comp_d3d11_window.cpp`; it is a D3D11 knob and
+  setting it on Linux does nothing. Without a WM the EWMH
+  `_NET_WM_STATE_FULLSCREEN` property and the `_NET_WM_FULLSCREEN_MONITORS`
+  client message have nobody listening, so the request is a silent no-op —
+  turning it off keeps the window at the size the compositor asked for and the
+  log honest. `Xvfb` is started with `+extension RANDR` so
+  `xcb_randr_get_monitors` resolves and the "no RandR monitor" warning (which
+  reads like a failure) never fires.
+* **Runtime logs go to stderr.** `u_file_logging` is Windows-only
+  (`%LOCALAPPDATA%\DisplayXR`), so the graphics-identity scrape reads the
+  captured stderr (`Vulkan selected GPU …`, `XCB: created …`) instead of
+  sweeping a log directory. The identity file also records the resolved ICD
+  manifest and the head of `vulkaninfo --summary`, so a result file can never be
+  ambiguous about whether lavapipe or real silicon produced it.
+* **Double the Windows timeout.** A CPU rasterizer driving a real X11 present
+  path is slower than a WARP blit, and a timeout leaves a truncated XML that
+  still looks like a result file — the worst outcome available. Linux is the
+  ×1-weighted runner; pay the minutes.
+
+### Running the Linux arms by hand
+
+Same script, on any Linux box:
+
+```bash
+./scripts/build_linux.sh                 # runtime + sim-display plug-in
+./scripts/fetch_build_cts.sh --apt       # CTS at the pinned tag
+# hardware-free, exactly what CI runs:
+./scripts/run_cts.sh -g vulkan2 --scope smoke --conformance-layer --xvfb \
+    --software --quarantine-list scripts/cts_quarantine_software_tier.txt
+# on a real-GPU box, in a real X session — NO --software, so NO quarantine:
+./scripts/run_cts.sh -g vulkan --scope full --conformance-layer
+```
+
+`run_cts.sh` refuses `--quarantine-list` unless `--software` is also set, so
+"real GPU with the software exclusions applied" is not a state a typo can reach.
 
 ## What's already done (this branch)
 
