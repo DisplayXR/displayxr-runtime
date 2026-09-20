@@ -10,6 +10,8 @@
 #pragma once
 
 #include "xrt/xrt_defines.h"
+// #1580: the canvas metres branch (b) of the per-view camera resolver needs.
+#include "xrt/xrt_display_metrics.h"
 #include "xrt/xrt_results.h"
 
 #include <stdint.h>
@@ -137,6 +139,7 @@ comp_d3d11_renderer_draw(struct comp_d3d11_renderer *renderer,
                          struct xrt_vec3 *right_eye,
                          uint32_t target_width,
                          uint32_t target_height,
+                         const struct xrt_window_metrics *canvas,
                          const struct comp_d3d11_eff_layout *layout);
 
 /*!
@@ -155,12 +158,13 @@ comp_d3d11_renderer_draw(struct comp_d3d11_renderer *renderer,
  */
 xrt_result_t
 comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
-                                          struct comp_layer_accum *layers,
-                                          struct xrt_vec3 *left_eye,
-                                          struct xrt_vec3 *right_eye,
-                                          uint32_t target_width,
-                                          uint32_t target_height,
-                                          const struct comp_d3d11_eff_layout *layout);
+                                         struct comp_layer_accum *layers,
+                                         struct xrt_vec3 *left_eye,
+                                         struct xrt_vec3 *right_eye,
+                                         uint32_t target_width,
+                                         uint32_t target_height,
+                                         const struct xrt_window_metrics *canvas,
+                                         const struct comp_d3d11_eff_layout *layout);
 
 /*!
  * Render only window-space layers into the atlas, on top of whatever

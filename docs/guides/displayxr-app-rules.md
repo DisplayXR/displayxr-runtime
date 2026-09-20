@@ -614,6 +614,16 @@ its own content by definition, so there is no full-window backer. Reference apps
 - **INV-6.4 — Matrices are column-major (GL/VK/Metal); DirectX callers transpose.** Ref:
   `ColumnMajorToXMMatrix` `xr_session_common.h:223`; `kooima-projection.md:360-363`.
 
+- **INV-6.5 — One camera per view per frame, whatever the layer type.** The compositor projects a
+  quad / cylinder / equirect / cube layer through the SAME `{pose, fov}` `xrLocateViews` returned
+  for that view as it uses for your projection layer: both layer poses are resolved into one
+  head-relative space, and the projection layer is blitted with an identity MVP, so the view tile
+  IS that frustum. Practically — a quad you place at a world pose registers with projection content
+  at the same pose, and you must NOT pre-compensate for some other overlay camera. On a quad-only
+  frame (no projection layer to borrow the camera from) the runtime synthesises the same camera
+  from the tracked eye and your canvas size. Ref: #1580;
+  `src/xrt/compositor/util/comp_layer_view_camera.h`.
+
 ---
 
 ## 7. Frame capture — `XR_DXR_atlas_capture` (`xrCaptureAtlasDXR`)

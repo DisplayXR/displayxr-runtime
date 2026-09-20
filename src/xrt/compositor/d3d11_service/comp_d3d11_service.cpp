@@ -31,6 +31,8 @@
 #include "os/os_time.h"
 
 #include "util/comp_layer_accum.h"
+// #1580: the ONE per-view camera every layer type is projected through.
+#include "util/comp_layer_view_camera.h"
 #include "util/comp_dp_factory.h"
 
 #include "comp_d3d11_window.h"
@@ -5479,30 +5481,11 @@ blit_to_atlas_texture(struct d3d11_service_system *sys,
  *
  * Layer visibility check
  *
+ * #1580: the local view_index == 0 / == 1 rule lived here and in the D3D11
+ * renderer; both now call the shared, view-count-aware
+ * is_layer_view_visible_n() from util/comp_layer_view_camera.h, which is
+ * identical for 1- and 2-view frames and correct beyond them.
  */
-
-static bool
-is_layer_view_visible(const struct xrt_layer_data *data, uint32_t view_index)
-{
-	enum xrt_layer_eye_visibility visibility;
-
-	switch (data->type) {
-	case XRT_LAYER_QUAD: visibility = data->quad.visibility; break;
-	case XRT_LAYER_CYLINDER: visibility = data->cylinder.visibility; break;
-	case XRT_LAYER_EQUIRECT1: visibility = data->equirect1.visibility; break;
-	case XRT_LAYER_EQUIRECT2: visibility = data->equirect2.visibility; break;
-	case XRT_LAYER_CUBE: visibility = data->cube.visibility; break;
-	default: return true;  // Projection layers visible in both
-	}
-
-	switch (visibility) {
-	case XRT_LAYER_EYE_VISIBILITY_NONE: return false;
-	case XRT_LAYER_EYE_VISIBILITY_LEFT_BIT: return view_index == 0;
-	case XRT_LAYER_EYE_VISIBILITY_RIGHT_BIT: return view_index == 1;
-	case XRT_LAYER_EYE_VISIBILITY_BOTH: return true;
-	default: return true;
-	}
-}
 
 
 /*
@@ -20432,38 +20415,53 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		sys->context->RSSetState(sys->rasterizer_state.get());
 		sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
 
-		// Create default view poses and FOVs for each view
 		uint32_t ui_view_count = sys->hardware_display_3d
 		    ? (sys->tile_columns * sys->tile_rows) : 1;
 		if (ui_view_count > XRT_MAX_VIEWS)
 			ui_view_count = XRT_MAX_VIEWS;
 
-		struct xrt_pose view_poses[XRT_MAX_VIEWS];
-		struct xrt_fov fovs[XRT_MAX_VIEWS];
+		/*
+		 * #1580 -- ONE camera per view per frame, shared by every layer type:
+		 * the {pose, fov} xrLocateViews returned, in the head-relative layer
+		 * space. The projection draw below is an identity-MVP fullscreen blit,
+		 * so the view tile IS that frustum; a quad framed by any other camera
+		 * lands on different display pixels than projection content at the same
+		 * world pose. The eyes here were already real -- the +-45 deg FOV was
+		 * not -- and the resolver is the SAME comp_util function the in-process
+		 * D3D11 renderer calls.
+		 *
+		 * Canvas: this client's window, exactly the metrics the IPC view-pose
+		 * path (ipc_server_handler.c) feeds the Kooima core, so the camera this
+		 * frame is composed with is the one the app was handed. Over IPC the
+		 * layer space is centred on that canvas (the head relation is the
+		 * window pose), so the eye is rebased ONCE here and the canvas centre
+		 * passed as the origin.
+		 */
+		struct xrt_window_metrics ui_wm = {};
+		bool have_ui_wm = comp_d3d11_service_get_client_window_metrics(&sys->base, &c->base.base, &ui_wm) &&
+		                  ui_wm.valid && ui_wm.window_width_m > 0.0f && ui_wm.window_height_m > 0.0f;
+		if (!have_ui_wm) {
+			have_ui_wm =
+			    comp_d3d11_service_get_client_app_window_metrics(&sys->base, &c->base.base, &ui_wm) &&
+			    ui_wm.valid && ui_wm.window_width_m > 0.0f && ui_wm.window_height_m > 0.0f;
+		}
 
-		// Use eye positions from display processor (interpolate for N views)
-		const float fov_angle = 0.785f;  // ~45 degrees
+		struct comp_layer_view_camera ui_cameras[XRT_MAX_VIEWS] = {};
 		for (uint32_t view = 0; view < ui_view_count; view++) {
-			view_poses[view].orientation.x = 0.0f;
-			view_poses[view].orientation.y = 0.0f;
-			view_poses[view].orientation.z = 0.0f;
-			view_poses[view].orientation.w = 1.0f;
-
-			// Use eye position if available, fall back to interpolated stereo baseline
+			struct xrt_vec3 eye;
 			if (view < eye_pos.count) {
-				view_poses[view].position.x = eye_pos.eyes[view].x;
-				view_poses[view].position.y = eye_pos.eyes[view].y;
-				view_poses[view].position.z = eye_pos.eyes[view].z;
-			} else if (view == 0) {
-				view_poses[view].position = left_eye;
+				eye = {eye_pos.eyes[view].x, eye_pos.eyes[view].y, eye_pos.eyes[view].z};
 			} else {
-				view_poses[view].position = right_eye;
+				eye = (view == 0) ? left_eye : right_eye;
 			}
-
-			fovs[view].angle_left = -fov_angle;
-			fovs[view].angle_right = fov_angle;
-			fovs[view].angle_up = fov_angle;
-			fovs[view].angle_down = -fov_angle;
+			if (have_ui_wm) {
+				eye.x -= ui_wm.window_center_offset_x_m;
+				eye.y -= ui_wm.window_center_offset_y_m;
+				eye.z -= ui_wm.window_center_offset_z_m;
+			}
+			comp_layer_view_camera_select(&c->layer_accum, view, &eye,
+			                              have_ui_wm ? ui_wm.window_width_m : 0.0f,
+			                              have_ui_wm ? ui_wm.window_height_m : 0.0f, &ui_cameras[view]);
 		}
 		for (uint32_t view_index = 0; view_index < ui_view_count; view_index++) {
 			// Set viewport for this view
@@ -20497,10 +20495,10 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 				struct comp_layer *layer = &c->layer_accum.layers[i];
 				if (layer->data.type == XRT_LAYER_EQUIRECT2) {
-					if (is_layer_view_visible(&layer->data, view_index)) {
+					if (is_layer_view_visible_n(&layer->data, view_index, ui_view_count)) {
 						render_equirect2_layer(sys, layer, view_index,
-						                       &view_poses[view_index],
-						                       &fovs[view_index]);
+						                       &ui_cameras[view_index].pose,
+						                       &ui_cameras[view_index].fov);
 					}
 				}
 			}
@@ -20509,10 +20507,10 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 				struct comp_layer *layer = &c->layer_accum.layers[i];
 				if (layer->data.type == XRT_LAYER_CYLINDER) {
-					if (is_layer_view_visible(&layer->data, view_index)) {
+					if (is_layer_view_visible_n(&layer->data, view_index, ui_view_count)) {
 						render_cylinder_layer(sys, layer, view_index,
-						                      &view_poses[view_index],
-						                      &fovs[view_index]);
+						                      &ui_cameras[view_index].pose,
+						                      &ui_cameras[view_index].fov);
 					}
 				}
 			}
@@ -20521,10 +20519,9 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 				struct comp_layer *layer = &c->layer_accum.layers[i];
 				if (layer->data.type == XRT_LAYER_QUAD) {
-					if (is_layer_view_visible(&layer->data, view_index)) {
-						render_quad_layer(sys, layer, view_index,
-						                  &view_poses[view_index],
-						                  &fovs[view_index]);
+					if (is_layer_view_visible_n(&layer->data, view_index, ui_view_count)) {
+						render_quad_layer(sys, layer, view_index, &ui_cameras[view_index].pose,
+						                  &ui_cameras[view_index].fov);
 					}
 				}
 			}

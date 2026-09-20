@@ -3510,8 +3510,19 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		if (c->split_active) {
 			comp_xbridge_pre_render(c->xbridge);
 		}
-		xret = comp_d3d11_renderer_draw_projection_pass(
-		    c->renderer, &c->layer_accum, &left_eye, &right_eye, tgt_width, tgt_height, &c->eff_layout);
+		/*
+		 * #1580: the canvas the quad/cylinder/equirect/cube camera is
+		 * framed against when the frame carries NO projection layer to
+		 * borrow the app's own camera from. Optional -- a texture app with
+		 * no window, or a DP that reports no dimensions, simply leaves the
+		 * resolver on its eye-only/legacy branches.
+		 */
+		struct xrt_window_metrics canvas = {};
+		const bool have_canvas = comp_d3d11_compositor_get_window_metrics(xc, &canvas);
+
+		xret = comp_d3d11_renderer_draw_projection_pass(c->renderer, &c->layer_accum, &left_eye, &right_eye,
+		                                                tgt_width, tgt_height, have_canvas ? &canvas : nullptr,
+		                                                &c->eff_layout);
 		if (xret != XRT_SUCCESS) {
 			U_LOG_E("Failed to render projection pass");
 			return xret;
