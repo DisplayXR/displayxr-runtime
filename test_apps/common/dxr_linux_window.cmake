@@ -25,6 +25,22 @@ function(dxr_target_add_linux_window TARGET)
     target_sources(${TARGET} PRIVATE "${DXR_LINUX_WINDOW_DIR}/dxr_linux_window.cpp")
     target_include_directories(${TARGET} PRIVATE "${DXR_LINUX_WINDOW_DIR}")
 
+    # Xrandr (optional, libxrandr-dev). _NET_WM_FULLSCREEN_MONITORS targets a
+    # monitor by RandR INDEX, and XRRGetMonitors is what turns the panel rect
+    # into one (#729). Without it the helper still goes fullscreen — it just
+    # relies on the window already sitting on the right output, which is what
+    # the post-map move + pump arranges. NOTE: this must stay ABOVE the Wayland
+    # detection, which returns early when libwayland-client is absent.
+    find_package(X11 QUIET)
+    if(TARGET X11::Xrandr)
+        target_link_libraries(${TARGET} PRIVATE X11::Xrandr)
+        target_compile_definitions(${TARGET} PRIVATE DXR_APP_HAVE_XRANDR)
+        message(STATUS "${TARGET}: Xrandr found — X11 fullscreen targets the panel's monitor index")
+    else()
+        message(STATUS "${TARGET}: Xrandr NOT found — X11 fullscreen falls back to the window's "
+                       "current output (install libxrandr-dev for _NET_WM_FULLSCREEN_MONITORS)")
+    endif()
+
     find_package(PkgConfig QUIET)
     set(_wl_found FALSE)
     if(PkgConfig_FOUND)
