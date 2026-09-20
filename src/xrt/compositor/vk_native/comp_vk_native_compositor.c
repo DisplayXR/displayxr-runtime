@@ -9889,6 +9889,16 @@ vk_update_present_origin(struct comp_vk_native_compositor *c)
 	    (ox != c->last_present_origin_x || oy != c->last_present_origin_y)) {
 		comp_vk_native_target_note_origin_motion(c->target);
 	}
+	// On-change only (a drag produces a burst, a static window logs once): the
+	// one line that lets an unattended run prove WHICH origin reached the weaver
+	// — nothing downstream prints it (the DP setter stores it silently and the
+	// SDK call logs only on failure). INFO, never WARN: this fires on every
+	// pixel of a drag.
+	if (!c->have_last_present_origin || ox != c->last_present_origin_x || oy != c->last_present_origin_y) {
+		U_LOG_I("present origin: (%d, %d) = window (%d, %d) %ux%u - panel (%d, %d) %ux%u",
+		        ox, oy, m.window_screen_left, m.window_screen_top, m.window_pixel_width, m.window_pixel_height,
+		        m.display_screen_left, m.display_screen_top, m.display_pixel_width, m.display_pixel_height);
+	}
 	c->last_present_origin_x = ox;
 	c->last_present_origin_y = oy;
 	c->have_last_present_origin = true;
