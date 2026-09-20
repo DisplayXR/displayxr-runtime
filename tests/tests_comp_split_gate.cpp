@@ -121,6 +121,12 @@ TEST_CASE("#918: the gate always names a short reason when the split is off")
 	}
 }
 
+/*
+ * Covers BOTH Windows tiers by construction: the gate owns no graphics types
+ * and the D3D11 and D3D12 compositors feed it the identical
+ * `scanout_software` input from the identical `d3d_adapter_is_software_or_remote`
+ * predicate, so there is nothing tier-shaped left to parameterise here.
+ */
 TEST_CASE("#1571: a SOFTWARE scanout adapter declines the ADR-039 same-adapter engage")
 {
 	// The env is latched per process and is the manual override in both
