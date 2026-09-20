@@ -121,6 +121,24 @@ static bool g_app_paced = false;
 // under the compositor mutex (d3d11 c->mutex, the d3d12 reroute's lock_guard,
 // the VK tier's c->mutex). An unlocked present path would need atomics here.
 static bool g_repaint_holds_token = false;
+/*!
+ * #1571: the APP-side twin of g_repaint_holds_token. Stage 1 of weave_mark
+ * takes a frame-latency token, but the pick that decides whether this frame
+ * PRESENTS happens afterwards — and under the split it can legitimately come
+ * back with nothing (#918 F4: the frames before anything has crossed, and the
+ * frame after an egress realloc). The chain releases a token only when a
+ * present RETIRES, so a token taken by a frame that then skipped its present
+ * is gone for good: from that frame on every stage-1 wait runs to its full
+ * 100 ms bound with c->mutex held, and comp_d3d11_target_repaint_admit refuses
+ * every repaint forever, so the chain can never be re-primed either. Carrying
+ * it forward is the same accounting the repaint side already does (#1339);
+ * the comment on weave_mark_repaint states the failure mode in as many words.
+ *
+ * Plain static, like its repaint twin and for the same reason: weave_mark, the
+ * F4 skip and the app's present all run on the app thread under the
+ * compositor mutex. An unlocked present path would need an atomic here.
+ */
+static bool g_app_holds_token = false;
 // A repaint has been marked and its present is next on the repaint thread;
 // that present (and only a present on that thread) settles the token.
 static bool g_repaint_present_pending = false;
@@ -402,6 +420,12 @@ comp_d3d11_target_create(struct comp_d3d11_compositor *c,
 			const int lat = g_lw_gov_d3d11.base_latency();
 			sc2->SetMaximumFrameLatency(lat);
 			g_frame_latency_waitable = sc2->GetFrameLatencyWaitableObject();
+			// #1571: a fresh semaphore owes nobody anything. These statics
+			// outlive a session (one target per process on this path), so a
+			// carry left over from the previous chain would make this
+			// chain's first frame skip a wait it has not paid for.
+			g_app_holds_token = false;
+			g_repaint_holds_token = false;
 			sc2->Release();
 			U_LOG_W("Late-weave: D3D11 in-process swapchain waitable, max latency %d%s (waitable=%p)",
 			        lat,
@@ -541,6 +565,9 @@ comp_d3d11_target_destroy(struct comp_d3d11_target **target_ptr)
 		CloseHandle(g_frame_latency_waitable);
 		g_frame_latency_waitable = nullptr;
 		g_last_present_count = 0;
+		// #1571: the semaphore is gone; no token is outstanding against it.
+		g_app_holds_token = false;
+		g_repaint_holds_token = false;
 	}
 
 	if (target->rtv != nullptr) {
@@ -828,7 +855,18 @@ comp_d3d11_target_weave_mark(struct comp_d3d11_target *target, uint64_t predicte
 			}
 		}
 		const uint64_t wait_t0 = os_monotonic_get_ns();
-		wait_timed_out = WaitForSingleObject(g_frame_latency_waitable, 100) == WAIT_TIMEOUT;
+		if (g_app_holds_token) {
+			// #1571: the previous app frame took a token here and then
+			// SKIPPED its present (#918 F4). Nothing retired, so nothing
+			// was released — that token is still ours and no wait can
+			// produce another. Reuse it. Waiting instead is the bug: the
+			// full 100 ms bound, every frame, for the life of the chain.
+			wait_timed_out = false;
+		} else {
+			wait_timed_out = WaitForSingleObject(g_frame_latency_waitable, 100) == WAIT_TIMEOUT;
+			// A timeout took nothing, so there is nothing to carry.
+			g_app_holds_token = !wait_timed_out;
+		}
 		const uint64_t wait_t1 = os_monotonic_get_ns();
 		const bool wait_blocked = (wait_t1 - wait_t0) > 2000000; // >2 ms
 		// #1482: the two ends of the stage-1 distribution, for the trace row. A
@@ -1048,6 +1086,16 @@ comp_d3d11_target_present(struct comp_d3d11_target *target, uint32_t sync_interv
 		// Witness counts frames that actually reached the chain — the 50 ms
 		// drop path above intentionally shows up as a lower weave/s.
 		g_frame_witness_d3d11.count_present();
+	}
+	// #1571: the APP's token settles on a present that actually went out.
+	// Thread-keyed for the mirror image of the reason below: a repaint present
+	// must not settle the app's carry. A dropped present (FAILED, or the 50 ms
+	// deadline) released nothing, so the carry survives it and the next
+	// weave_mark reuses the token instead of blocking on one that will never
+	// come. g_repaint_thread_id is 0 until the first repaint mark, so app
+	// presents before that still take this branch.
+	if (SUCCEEDED(hr) && GetCurrentThreadId() != g_repaint_thread_id) {
+		g_app_holds_token = false;
 	}
 	// #1339: a repaint's present settles its token. Thread-keyed, because an
 	// app present can land between a bailed repaint's mark and its next tick

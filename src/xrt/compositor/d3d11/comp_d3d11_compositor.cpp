@@ -3794,6 +3794,16 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	 * With FLIP_DISCARD the correct degrade is simply not to present: the panel
 	 * keeps showing the last frame that WAS woven, for the one or two frames the
 	 * transition takes. The skip is counted, never logged per frame.
+	 *
+	 * #1571 — the token that weave_mark took above is NOT lost here. It is spent
+	 * by the present, and only by the present (comp_d3d11_target.cpp,
+	 * g_app_holds_token), so returning without presenting carries it to the next
+	 * app frame, which reuses it instead of blocking. Before that, one skip cost
+	 * the chain its only frame-latency token permanently: every later stage-1
+	 * wait ran to its full 100 ms bound with c->mutex held and
+	 * comp_d3d11_target_repaint_admit refused every repaint for the life of the
+	 * chain — a transient rebuild turned into a sustained ~10 fps floor. Anyone
+	 * adding a present on this path must keep that invariant.
 	 */
 	if (c->split_active && !weaving_done) {
 		d3d11_split_note_skipped_present(c, "the app frame");
