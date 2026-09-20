@@ -279,7 +279,14 @@ submit_fence(struct client_vk_compositor *c, xrt_result_t *out_xret)
 
 #if defined(XRT_GRAPHICS_SYNC_HANDLE_IS_FD)
 	// Using sync fds currently to match OpenGL extension.
-	bool sync_fence = vk->external.fence_sync_fd;
+	//
+	// #1576: `vk->external.*` is a PHYSICAL-device probe and says nothing
+	// about whether VK_KHR_external_fence_fd — optional-if-present on desktop
+	// Linux — was enabled on this logical device. Ask the logical device too,
+	// so a device without it takes submit_fallback() (vkQueueWaitIdle) rather
+	// than erroring out of every frame. Same degradation the native
+	// compositor's `disable_fence_sync` already produces.
+	bool sync_fence = vk->external.fence_sync_fd && vk_has_external_fence_fd(vk);
 #elif defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE)
 	bool sync_fence = vk->external.fence_win32_handle;
 #else

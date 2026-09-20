@@ -24,6 +24,14 @@
 #include "oxr_logger.h"
 #include "oxr_two_call.h"
 
+// Desktop Linux. Android also defines XRT_OS_LINUX, so anything that is true of
+// the X11/Wayland desktop only — the dma-buf import set, the fd sync pair — has
+// to be gated on "Linux AND NOT Android". Same local alias as
+// comp_vk_native_compositor.c. See docs/roadmap/linux-support.md.
+#if defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
+#define XRT_OS_LINUX_DESKTOP
+#endif
+
 
 /*
  *
@@ -72,10 +80,10 @@ oxr_vk_get_instance_exts(struct oxr_logger *log,
 }
 
 /*!
- * #1539: the enable1 answer, filtered against the suggested physical device.
- * Defined below with the extension lists; writes into @p buf and returns it, or
- * returns the static string when no filtering applies. @p buf must hold at
- * least `strlen(xrt_gfx_vk_device_extensions) + 1`.
+ * #1539/#1576: the enable1 answer, filtered against the suggested physical
+ * device. Defined below with the extension lists; writes into @p buf and
+ * returns it, or returns the static string when no filtering applies. @p buf
+ * must hold at least `strlen(xrt_gfx_vk_device_extensions) + 1`.
  */
 static const char *
 oxr_vk_device_exts_for_system(struct oxr_logger *log, struct oxr_system *sys, char *buf, size_t buf_size);
@@ -88,12 +96,12 @@ oxr_vk_get_device_exts(struct oxr_logger *log,
                        char *namesString)
 {
 	/*
-	 * #1539: `xrt_gfx_vk_device_extensions` (comp_vk_glue.c) is a compile-time
-	 * string the app must enable VERBATIM, so it cannot itself express
-	 * "optional-if-present" the way the enable2 list can. Filter it here
-	 * instead — on real Windows GPU drivers every name survives and the answer
-	 * is byte-identical to before; on a software ICD the Win32 external trio
-	 * drops out and vkCreateDevice stops failing.
+	 * #1539/#1576: `xrt_gfx_vk_device_extensions` (comp_vk_glue.c) is a
+	 * compile-time string the app must enable VERBATIM, so it cannot itself
+	 * express "optional-if-present" the way the enable2 list can. Filter it
+	 * here instead — on a real GPU driver every name survives and the answer is
+	 * byte-identical to before; on a software ICD this platform's optional
+	 * external extensions drop out and vkCreateDevice stops failing.
 	 */
 	char filtered[1024];
 	const char *exts = oxr_vk_device_exts_for_system(log, sys, filtered, ARRAY_SIZE(filtered));
@@ -227,21 +235,40 @@ static const char *required_vk_device_extensions[] = {
 };
 
 /*!
- * #1539: the three Win32 external-object extensions, kept as their own list so
- * the kill switch below can put them back in the REQUIRED set verbatim.
+ * The external-object device extensions that are OPTIONAL-if-present, kept as
+ * their own list so the enable1 string can be filtered against the physical
+ * device (`oxr_vk_device_exts_for_system()`) and so the kill switches below can
+ * put them back in the REQUIRED set verbatim.
  *
- * They were required for every Windows Vulkan app, but only the IPC client
- * compositor genuinely needs them (cross-process image + sync import); the
- * in-process `_handle`/`_hosted` compositors run on the app's own VkDevice
- * with no cross-device sharing at all, and the three sub-paths that do import
- * (texture-class shared texture, the DComp transparent bridge, the
- * DXR_VK_DEPOSIT path) are optional and gated. Requiring them blocked every
- * software ICD — lavapipe fails vkCreateDevice outright, which is what killed
- * the CTS `vulkan`/`vulkan2` arms (#1523, #1525).
+ * **Windows (#1539)** — the Win32 trio was required of every Windows Vulkan
+ * app, but only the IPC client compositor genuinely needs it (cross-process
+ * image + sync import); the in-process `_handle`/`_hosted` compositors run on
+ * the app's own VkDevice with no cross-device sharing at all, and the three
+ * sub-paths that do import (texture-class shared texture, the DComp
+ * transparent bridge, the DXR_VK_DEPOSIT path) are optional and gated.
+ *
+ * **Desktop Linux (#1576)** — the same shape, one platform over. `dma_buf` +
+ * `drm_format_modifier` (#757) are consumed only by the display processor's
+ * PipeWire desktop-background import, which `vk_bundle_init.c` already gates on
+ * a physical-device query; `semaphore_fd` + `fence_fd` are reached only from
+ * the IPC client and from the service's own device. The in-process XCB/Wayland
+ * `vk_native` path asks for none of the four — `comp_vk_native_compositor.c`
+ * passes `external_{fence,semaphore}_fd_enabled = false` outright. All four
+ * are ALREADY in `optional_device_extensions[]` below, so enable2 has always
+ * treated them as optional; this list is what finally makes enable1 agree.
+ *
+ * Requiring any of them blocked every software ICD — lavapipe fails
+ * vkCreateDevice outright, which is what killed the CTS `vulkan` arms on both
+ * lanes (#1523, #1525, #1527).
+ *
+ * NOT listed here: `VK_KHR_external_memory_fd`. It stays REQUIRED on the FD
+ * platforms — it is how the IPC client imports the service's swapchain images,
+ * it has no Linux equivalent of the Win32 fallback story, and lavapipe reports
+ * it anyway (proven by the `vulkan2` arm passing on the same ICD).
  */
 #if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE) && defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE)
-#define OXR_HAVE_WIN32_EXTERNAL_LIST
-static const char *win32_external_device_extensions[] = {
+#define OXR_HAVE_OPTIONAL_FILTERED_LIST
+static const char *optional_filtered_device_extensions[] = {
     VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,    //
     VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME, //
     VK_KHR_EXTERNAL_FENCE_WIN32_EXTENSION_NAME,     //
@@ -254,7 +281,36 @@ static const char *win32_external_device_extensions[] = {
  * `xrGetVulkanDeviceExtensionsKHR`. This lever exists because the change
  * touches device creation for *every* Windows Vulkan app.
  */
-DEBUG_GET_ONCE_BOOL_OPTION(vk_require_win32_external, "DXR_VK_REQUIRE_WIN32_EXTERNAL", false)
+DEBUG_GET_ONCE_BOOL_OPTION(vk_require_optional_filtered, "DXR_VK_REQUIRE_WIN32_EXTERNAL", false)
+#define OXR_OPTIONAL_FILTERED_ENV "DXR_VK_REQUIRE_WIN32_EXTERNAL"
+#define OXR_OPTIONAL_FILTERED_WHAT "Win32 external memory/semaphore/fence"
+
+#elif defined(XRT_OS_LINUX_DESKTOP) && defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_FD)
+#define OXR_HAVE_OPTIONAL_FILTERED_LIST
+static const char *optional_filtered_device_extensions[] = {
+#if defined(VK_EXT_external_memory_dma_buf)
+    VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,   //
+#endif
+#if defined(VK_EXT_image_drm_format_modifier)
+    VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME, //
+#endif
+    VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,     //
+    VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME,         //
+};
+
+/*!
+ * Kill switch for #1576, the desktop-Linux sibling of the Win32 one above.
+ * `DXR_VK_REQUIRE_LINUX_EXTERNAL=1` puts the four names back into the verbatim
+ * `xrGetVulkanDeviceExtensionsKHR` answer.
+ *
+ * Deliberately a SEPARATE variable rather than a rename of
+ * `DXR_VK_REQUIRE_WIN32_EXTERNAL`: that one shipped in v2.17.x and is recorded
+ * in the env-var census, and the two platform arms must be revertible
+ * independently — a Windows regression must not force Linux back too.
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(vk_require_optional_filtered, "DXR_VK_REQUIRE_LINUX_EXTERNAL", false)
+#define OXR_OPTIONAL_FILTERED_ENV "DXR_VK_REQUIRE_LINUX_EXTERNAL"
+#define OXR_OPTIONAL_FILTERED_WHAT "desktop-Linux dma-buf / DRM-modifier / fd-sync"
 #endif
 
 static const char *optional_device_extensions[] = {
@@ -351,13 +407,13 @@ vk_check_extension(VkExtensionProperties *props, uint32_t prop_count, const char
 static const char *
 oxr_vk_device_exts_for_system(struct oxr_logger *log, struct oxr_system *sys, char *buf, size_t buf_size)
 {
-#ifdef OXR_HAVE_WIN32_EXTERNAL_LIST
+#ifdef OXR_HAVE_OPTIONAL_FILTERED_LIST
 	if (buf == NULL || buf_size < strlen(xrt_gfx_vk_device_extensions) + 1) {
 		return xrt_gfx_vk_device_extensions;
 	}
 
 	// Kill switch: hand back exactly what we always handed back.
-	if (debug_get_bool_option_vk_require_win32_external()) {
+	if (debug_get_bool_option_vk_require_optional_filtered()) {
 		return xrt_gfx_vk_device_extensions;
 	}
 
@@ -373,7 +429,7 @@ oxr_vk_device_exts_for_system(struct oxr_logger *log, struct oxr_system *sys, ch
 		 */
 		oxr_warn(log,
 		         "xrGetVulkanDeviceExtensionsKHR called before xrGetVulkanGraphicsDeviceKHR - cannot filter "
-		         "the optional Win32 external extensions (#1539)");
+		         "the optional " OXR_OPTIONAL_FILTERED_WHAT " extensions (#1539/#1576)");
 		return xrt_gfx_vk_device_extensions;
 	}
 
@@ -397,7 +453,8 @@ oxr_vk_device_exts_for_system(struct oxr_logger *log, struct oxr_system *sys, ch
 		return xrt_gfx_vk_device_extensions;
 	}
 
-	// Rebuild the space-separated list, dropping any of the trio the device does not report.
+	// Rebuild the space-separated list, dropping any name in
+	// optional_filtered_device_extensions[] the device does not report.
 	size_t out = 0;
 	bool dropped = false;
 	const char *p = xrt_gfx_vk_device_extensions;
@@ -415,8 +472,8 @@ oxr_vk_device_exts_for_system(struct oxr_logger *log, struct oxr_system *sys, ch
 		}
 
 		bool keep = true;
-		for (uint32_t i = 0; i < ARRAY_SIZE(win32_external_device_extensions); i++) {
-			const char *name = win32_external_device_extensions[i];
+		for (uint32_t i = 0; i < ARRAY_SIZE(optional_filtered_device_extensions); i++) {
+			const char *name = optional_filtered_device_extensions[i];
 			if (strlen(name) == len && strncmp(start, name, len) == 0) {
 				keep = vk_check_extension(props, prop_count, name);
 				break;
@@ -439,8 +496,9 @@ oxr_vk_device_exts_for_system(struct oxr_logger *log, struct oxr_system *sys, ch
 
 	if (dropped) {
 		oxr_warn(log,
-		         "Win32 external memory/semaphore/fence not reported by the suggested physical device - "
-		         "dropped from xrGetVulkanDeviceExtensionsKHR (#1539). Answer: %s",
+		         OXR_OPTIONAL_FILTERED_WHAT
+		         " not reported by the suggested physical device - dropped from "
+		         "xrGetVulkanDeviceExtensionsKHR (#1539/#1576). Answer: %s",
 		         buf);
 	}
 
@@ -746,12 +804,13 @@ oxr_vk_create_vulkan_device(struct oxr_logger *log,
 	struct u_string_list *device_extension_list =
 	    u_string_list_create_from_array(required_vk_device_extensions, ARRAY_SIZE(required_vk_device_extensions));
 
-#ifdef OXR_HAVE_WIN32_EXTERNAL_LIST
-	// #1539 kill switch: put the Win32 external trio back in the REQUIRED set.
-	if (debug_get_bool_option_vk_require_win32_external()) {
-		oxr_log(log, "DXR_VK_REQUIRE_WIN32_EXTERNAL=1: Win32 external memory/semaphore/fence forced REQUIRED");
-		for (uint32_t i = 0; i < ARRAY_SIZE(win32_external_device_extensions); i++) {
-			u_string_list_append_unique(device_extension_list, win32_external_device_extensions[i]);
+#ifdef OXR_HAVE_OPTIONAL_FILTERED_LIST
+	// #1539/#1576 kill switch: put this platform's optional external
+	// extensions back in the REQUIRED set.
+	if (debug_get_bool_option_vk_require_optional_filtered()) {
+		oxr_log(log, OXR_OPTIONAL_FILTERED_ENV "=1: " OXR_OPTIONAL_FILTERED_WHAT " forced REQUIRED");
+		for (uint32_t i = 0; i < ARRAY_SIZE(optional_filtered_device_extensions); i++) {
+			u_string_list_append_unique(device_extension_list, optional_filtered_device_extensions[i]);
 		}
 	}
 #endif

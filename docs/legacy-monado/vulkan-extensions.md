@@ -85,6 +85,21 @@ client compositor genuinely needs them; in-process `_handle`/`_hosted` apps run
 on the app's own `VkDevice` with no cross-device sharing. Set
 `DXR_VK_REQUIRE_WIN32_EXTERNAL=1` to put them back in the required set.
 
+**DisplayXR note (#1576):** the same is true one platform over. On desktop
+Linux `VK_KHR_external_semaphore_fd`, `VK_KHR_external_fence_fd` and the
+dma-buf import pair `VK_EXT_external_memory_dma_buf` +
+`VK_EXT_image_drm_format_modifier` (#757) are **optional-if-present** for the
+app's device — they were already optional on the `xrCreateVulkanDeviceKHR`
+(enable2) path and are now filtered out of the `xrGetVulkanDeviceExtensionsKHR`
+(enable1) string too when the suggested physical device does not report them.
+Mesa's lavapipe gates all four behind `HAVE_LIBDRM` plus a real DRM device, so
+requiring them made every software ICD fail `vkCreateDevice`. The in-process
+XCB/Wayland `vk_native` compositor uses none of them; the dma-buf pair is the
+display processor's PipeWire desktop-background import and the fd sync pair is
+the IPC client's. `VK_KHR_external_memory_fd` stays **required** — cross-process
+image import has no fallback. Set `DXR_VK_REQUIRE_LINUX_EXTERNAL=1` to put the
+four back in the string.
+
 <!-- links to the extension references, out of line to keep the table source readable -->
 <!-- They don't show up like this in the formatted document. -->
 
