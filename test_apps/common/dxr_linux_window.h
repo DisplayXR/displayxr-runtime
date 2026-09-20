@@ -9,10 +9,24 @@
  * at RUNTIME so a single binary works in either session. The window-binding
  * struct it hands back is chained onto XrSessionCreateInfo by the app.
  *
- * Why one helper: the X11 leg is lifted verbatim out of cube_handle_vk_linux
- * (placement, ICCCM size hints, post-map XMoveWindow) and cube_zones_vk_linux
- * carried a byte-identical copy. Keeping one copy is what makes the Wayland
- * leg a single addition instead of two.
+ * Why one helper: the X11 leg is lifted out of cube_handle_vk_linux
+ * (placement, ICCCM size hints) and cube_zones_vk_linux carried a
+ * byte-identical copy. Keeping one copy is what makes the Wayland leg a single
+ * addition instead of two.
+ *
+ * X11 PLACEMENT CONTRACT (INV-1.3, #729):
+ *   A panel-sized window (desc.width/height == desc.panel_width/height) is made
+ *   genuinely FULLSCREEN on the panel's monitor, because mutter discards
+ *   client-requested geometry for such a window AND decorates it — the observed
+ *   result of asking for 3840x2160+3456+0 was a 3840x2086 client at (3456, 74)
+ *   under a mutter-x11-frames parent. Fullscreen is the one WM-cooperative
+ *   placement primitive, and it is what makes window origin ≡ panel origin
+ *   (which the weave phase depends on). The recipe, validated on GNOME 50 /
+ *   XWayland: map -> XMoveWindow onto the target output -> pump events briefly
+ *   -> EWMH _NET_WM_STATE_FULLSCREEN + _NET_WM_FULLSCREEN_MONITORS. Order
+ *   matters: a position request before the window is mapped is discarded, and
+ *   mutter fullscreens onto whichever output the window currently occupies.
+ *   A windowed size keeps the old behaviour; DXR_X11_NO_FULLSCREEN=1 opts out.
  *
  * ORDERING CONTRACT (both backends):
  *   create instance -> get system -> xrGetSystemProperties (panel rect, INV-1.3)
@@ -102,7 +116,8 @@ struct DxrLinuxWindowDesc
 	int32_t panel_left = 0;    //!< 3D panel top-left in virtual-desktop pixels
 	int32_t panel_top = 0;     //!< ...
 	uint32_t panel_width = 0;  //!< 3D panel size in pixels (0 = unknown)
-	uint32_t panel_height = 0; //!< ...
+	uint32_t panel_height = 0; //!< ... a window of exactly this size goes
+	                           //!< fullscreen on the panel's monitor (X11, #729)
 
 	const char *title = "DisplayXR";               //!< toplevel title
 	const char *app_id = "com.displayxr.test_app"; //!< Wayland xdg app-id

@@ -4,15 +4,20 @@
  * @file
  * @brief  Backend-neutral app-owned window for the desktop-Linux test apps.
  *
- * See dxr_linux_window.h for the contract. The X11 leg is the code that used
- * to live (twice, verbatim) in cube_handle_vk_linux/main.cpp and
- * cube_zones_vk_linux/main.cpp; it is preserved behaviour-for-behaviour,
- * including the ICCCM size hints and the post-map XMoveWindow.
+ * See dxr_linux_window.h for the contract. The X11 leg started as the code
+ * that used to live (twice, verbatim) in cube_handle_vk_linux/main.cpp and
+ * cube_zones_vk_linux/main.cpp; the ICCCM size hints and the post-map
+ * XMoveWindow survive from it, now followed by the EWMH fullscreen-on-monitor
+ * placement a panel-sized window needs under mutter (#729).
  */
 
 #include "dxr_linux_window.h"
 
 #include <X11/keysym.h> // XK_* for the X11 key mapping
+
+#ifdef DXR_APP_HAVE_XRANDR
+#include <X11/extensions/Xrandr.h> // XRRGetMonitors — resolve the panel's monitor INDEX
+#endif
 
 #ifdef DXR_APP_HAVE_WAYLAND
 #include "xdg-shell-client-protocol.h"
@@ -22,13 +27,22 @@
 #include <unistd.h>                  // close() the keymap fd we do not read
 #endif
 
+#include <chrono> // bounded event-pump budget in the X11 placement handshake
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread> // ...and the 5 ms breather between its polls
 
 // Same shape as the test apps' own macros, so helper output is indistinguishable
-// from app output in a run log.
-#define DXRW_INFO(fmt, ...) fprintf(stdout, "[INFO]  " fmt "\n", ##__VA_ARGS__)
+// from app output in a run log. INFO flushes: stdout is block-buffered when a
+// run is redirected to a file, and these apps are normally ended with a SIGTERM
+// (`timeout 20 …`) that discards the buffer — which would take the placement
+// line with it, exactly when it is wanted as evidence.
+#define DXRW_INFO(fmt, ...)                                                                                            \
+	do {                                                                                                           \
+		fprintf(stdout, "[INFO]  " fmt "\n", ##__VA_ARGS__);                                                   \
+		fflush(stdout);                                                                                        \
+	} while (0)
 #define DXRW_WARN(fmt, ...) fprintf(stderr, "[WARN]  " fmt "\n", ##__VA_ARGS__)
 #define DXRW_ERROR(fmt, ...) fprintf(stderr, "[ERROR] " fmt "\n", ##__VA_ARGS__)
 
@@ -155,15 +169,185 @@ DxrLinuxWindow::select(DxrWindowBackend requested, bool runtime_has_xlib, bool r
 
 /*
  *
- * X11 leg — lifted verbatim from cube_handle_vk_linux (behaviour preserved).
+ * X11 leg.
  *
  */
+
+namespace {
+
+//! Rect of the RandR monitor a fullscreen request was targeted at.
+struct X11MonitorRect
+{
+	int index = -1; //!< RandR monitor index, or -1 when unresolved
+	int x = 0, y = 0;
+	int width = 0, height = 0;
+	std::string name = "?";
+};
+
+/*!
+ * Resolve the RandR monitor INDEX that owns (@p left, @p top), for the
+ * _NET_WM_FULLSCREEN_MONITORS request. Xlib mirror of the runtime's own
+ * resolve_monitor_index() in comp_vk_native_window_xcb.c (#723).
+ *
+ * Prefers a monitor whose origin exactly matches the point; falls back to the
+ * monitor CONTAINING it. Returns index -1 when RandR is unavailable (the
+ * caller then falls back to plain _NET_WM_STATE_FULLSCREEN, which mutter
+ * applies to the output the window currently occupies).
+ */
+X11MonitorRect
+x11_resolve_monitor(Display *dpy, ::Window root, int32_t left, int32_t top)
+{
+	X11MonitorRect out;
+#ifdef DXR_APP_HAVE_XRANDR
+	int count = 0;
+	XRRMonitorInfo *mons = XRRGetMonitors(dpy, root, True /* active only */, &count);
+	if (mons == nullptr) {
+		return out;
+	}
+
+	int exact = -1;
+	int contains = -1;
+	for (int i = 0; i < count; i++) {
+		if (exact < 0 && mons[i].x == (int)left && mons[i].y == (int)top) {
+			exact = i;
+		}
+		if (contains < 0 && left >= mons[i].x && left < mons[i].x + mons[i].width && top >= mons[i].y &&
+		    top < mons[i].y + mons[i].height) {
+			contains = i;
+		}
+	}
+
+	const int chosen = exact >= 0 ? exact : contains;
+	if (chosen >= 0) {
+		out.index = chosen;
+		out.x = mons[chosen].x;
+		out.y = mons[chosen].y;
+		out.width = mons[chosen].width;
+		out.height = mons[chosen].height;
+		if (mons[chosen].name != None) {
+			char *nm = XGetAtomName(dpy, mons[chosen].name);
+			if (nm != nullptr) {
+				out.name = nm;
+				XFree(nm);
+			}
+		}
+	}
+	XRRFreeMonitors(mons);
+#else
+	(void)dpy;
+	(void)root;
+	(void)left;
+	(void)top;
+#endif
+	return out;
+}
+
+/*!
+ * Drain the X event queue for up to @p budget_ms, returning early as soon as
+ * @p done() is true. Never blocks indefinitely: XPending never waits, and the
+ * deadline is monotonic.
+ *
+ * Called only during create(), before the app's own pump() exists, so the
+ * events drained here are startup noise (Map/Configure/Reparent) that nothing
+ * is listening for yet.
+ */
+void
+x11_pump_for(Display *dpy, int budget_ms, const std::function<bool()> &done)
+{
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(budget_ms);
+	for (;;) {
+		XSync(dpy, False); // push our requests, take in whatever the WM replied
+		while (XPending(dpy) > 0) {
+			XEvent ev;
+			XNextEvent(dpy, &ev);
+		}
+		if (done && done()) {
+			return;
+		}
+		if (std::chrono::steady_clock::now() >= deadline) {
+			return;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+	}
+}
+
+//! Root-relative origin of @p win (what the WM actually did with it), as
+//! opposed to XGetWindowAttributes' x/y, which are parent-relative and so read
+//! as an offset INSIDE the frame once a WM reparents the window.
+void
+x11_root_origin(Display *dpy, ::Window win, int *out_x, int *out_y)
+{
+	::Window child = 0;
+	int rx = 0;
+	int ry = 0;
+	if (XTranslateCoordinates(dpy, win, DefaultRootWindow(dpy), 0, 0, &rx, &ry, &child) == 0) {
+		rx = 0;
+		ry = 0;
+	}
+	*out_x = rx;
+	*out_y = ry;
+}
+
+//! Post an EWMH client message to the root window (the WM listens for these on
+//! SubstructureRedirect|Notify).
+void
+x11_send_root_message(Display *dpy, ::Window win, Atom type, long d0, long d1, long d2, long d3, long d4)
+{
+	XEvent ev = {};
+	ev.xclient.type = ClientMessage;
+	ev.xclient.send_event = True;
+	ev.xclient.display = dpy;
+	ev.xclient.window = win;
+	ev.xclient.message_type = type;
+	ev.xclient.format = 32;
+	ev.xclient.data.l[0] = d0;
+	ev.xclient.data.l[1] = d1;
+	ev.xclient.data.l[2] = d2;
+	ev.xclient.data.l[3] = d3;
+	ev.xclient.data.l[4] = d4;
+	XSendEvent(dpy, DefaultRootWindow(dpy), False, SubstructureRedirectMask | SubstructureNotifyMask, &ev);
+}
+
+/*!
+ * Ask for an undecorated toplevel through the Motif hints.
+ *
+ * Belt-and-braces next to _NET_WM_STATE_FULLSCREEN: a fullscreen window is
+ * undecorated by EWMH rule anyway, but a WM that ignores EWMH (or that decides
+ * not to honour the fullscreen request) would otherwise reparent us into a
+ * title bar and steal 74 px off the top of the weave — exactly the #729
+ * symptom. Both mutter and KWin honour _MOTIF_WM_HINTS.
+ */
+void
+x11_set_undecorated(Display *dpy, ::Window win)
+{
+	Atom motif = XInternAtom(dpy, "_MOTIF_WM_HINTS", False);
+	if (motif == None) {
+		return;
+	}
+	// flags, functions, decorations, input_mode, status — flags=2 is
+	// MWM_HINTS_DECORATIONS, decorations=0 is "none".
+	unsigned long hints[5] = {2, 0, 0, 0, 0};
+	XChangeProperty(dpy, win, motif, motif, 32, PropModeReplace, (const unsigned char *)hints, 5);
+}
+
+} // namespace
 
 bool
 DxrLinuxWindow::create_x11(const DxrLinuxWindowDesc &desc)
 {
 	const int32_t screenLeft = desc.panel_left;
 	const int32_t screenTop = desc.panel_top;
+
+	// A window asking for exactly the panel's size IS the fullscreen demo
+	// mode, and must be genuinely fullscreen on the panel: exact 1:1, no
+	// decoration, no offset. Anything smaller is a deliberate windowed run
+	// (DXR_CUBE_WINDOW) and keeps the plain create-at-position behaviour.
+	// DXR_X11_NO_FULLSCREEN=1 forces the old path for A/B testing.
+	const char *no_fs = getenv("DXR_X11_NO_FULLSCREEN");
+	const bool fs_opt_out = no_fs != nullptr && no_fs[0] != '\0' && strcmp(no_fs, "0") != 0;
+	const bool panel_known = desc.panel_width > 0 && desc.panel_height > 0;
+	const bool want_fullscreen =
+	    panel_known && !fs_opt_out && desc.width == desc.panel_width && desc.height == desc.panel_height;
 
 	m_x_display = XOpenDisplay(nullptr);
 	if (m_x_display == nullptr) {
@@ -202,6 +386,13 @@ DxrLinuxWindow::create_x11(const DxrLinuxWindowDesc &desc)
 	m_x_wm_delete = XInternAtom(m_x_display, "WM_DELETE_WINDOW", False);
 	XSetWMProtocols(m_x_display, m_x_window, &m_x_wm_delete, 1);
 
+	// Decorations off BEFORE the map, so a frame is never created in the first
+	// place. Mutter reparenting us into a title bar is what clamped the #729
+	// window to 3840x2086 at (3456, 74).
+	if (want_fullscreen) {
+		x11_set_undecorated(m_x_display, m_x_window);
+	}
+
 	XMapWindow(m_x_display, m_x_window);
 	XFlush(m_x_display);
 
@@ -211,8 +402,97 @@ DxrLinuxWindow::create_x11(const DxrLinuxWindowDesc &desc)
 	XMoveWindow(m_x_display, m_x_window, screenLeft, screenTop);
 	XFlush(m_x_display);
 
-	DXRW_INFO("Created app-owned X11 window 0x%lx (%ux%u) at (%d, %d)", m_x_window, desc.width, desc.height,
-	          screenLeft, screenTop);
+	X11MonitorRect mon;
+	if (want_fullscreen) {
+		::Window root = DefaultRootWindow(m_x_display);
+		mon = x11_resolve_monitor(m_x_display, root, screenLeft, screenTop);
+
+		// Let the move land before asking for fullscreen: mutter fullscreens
+		// onto whichever output the window CURRENTLY occupies, and a position
+		// request issued before the window settles is simply discarded. Wait
+		// for the window's root origin to reach the target monitor, with a
+		// hard 400 ms ceiling so a WM that never moves us cannot hang startup.
+		const int mon_x = mon.index >= 0 ? mon.x : (int)screenLeft;
+		const int mon_y = mon.index >= 0 ? mon.y : (int)screenTop;
+		const int mon_w = mon.index >= 0 ? mon.width : 1;
+		const int mon_h = mon.index >= 0 ? mon.height : 1;
+		Display *dpy = m_x_display;
+		::Window win = m_x_window;
+		x11_pump_for(dpy, 400, [dpy, win, mon_x, mon_y, mon_w, mon_h]() {
+			int rx = 0;
+			int ry = 0;
+			x11_root_origin(dpy, win, &rx, &ry);
+			return rx >= mon_x && rx < mon_x + mon_w && ry >= mon_y && ry < mon_y + mon_h;
+		});
+
+		// EWMH fullscreen. _NET_WM_STATE add first (source 1 = application),
+		// then pin it to the panel's RandR monitor: single-monitor fullscreen
+		// means all four edges are the same index. Without RandR we still send
+		// the fullscreen request — mutter applies it to the output the window
+		// now occupies, which the pump above just made the right one.
+		Atom net_wm_state = XInternAtom(m_x_display, "_NET_WM_STATE", False);
+		Atom net_wm_state_fullscreen = XInternAtom(m_x_display, "_NET_WM_STATE_FULLSCREEN", False);
+		if (net_wm_state != None && net_wm_state_fullscreen != None) {
+			x11_send_root_message(m_x_display, m_x_window, net_wm_state, 1 /* _NET_WM_STATE_ADD */,
+			                      (long)net_wm_state_fullscreen, 0, 1 /* source: application */, 0);
+		}
+		if (mon.index >= 0) {
+			Atom net_fs_monitors = XInternAtom(m_x_display, "_NET_WM_FULLSCREEN_MONITORS", False);
+			if (net_fs_monitors != None) {
+				x11_send_root_message(m_x_display, m_x_window, net_fs_monitors, mon.index /* top */,
+				                      mon.index /* bottom */, mon.index /* left */,
+				                      mon.index /* right */, 1 /* source: application */);
+			}
+		}
+		XFlush(m_x_display);
+
+		// Second bounded wait: let the fullscreen configure arrive, so the log
+		// line below (and the runtime's first swapchain sizing) sees the truth.
+		const uint32_t want_w = desc.width;
+		const uint32_t want_h = desc.height;
+		x11_pump_for(dpy, 400, [dpy, win, want_w, want_h]() {
+			XWindowAttributes wa = {};
+			return XGetWindowAttributes(dpy, win, &wa) != 0 && (uint32_t)wa.width == want_w &&
+			       (uint32_t)wa.height == want_h;
+		});
+	} else {
+		// Windowed: no fullscreen handshake, but still give the WM a moment to
+		// reparent and place us, so the line below reports where the window
+		// really ended up rather than where it was a millisecond after the
+		// move request (under mutter those differ by the frame's title bar).
+		x11_pump_for(m_x_display, 250, {});
+	}
+
+	// One line, after the handshake: what was asked for and what the WM
+	// actually did. XTranslateCoordinates is the honest origin (XGetWindow-
+	// Attributes' x/y are parent-relative once a WM reparents us), so this
+	// proves placement without reaching for xwininfo.
+	{
+		XWindowAttributes wa = {};
+		int rx = 0;
+		int ry = 0;
+		XGetWindowAttributes(m_x_display, m_x_window, &wa);
+		x11_root_origin(m_x_display, m_x_window, &rx, &ry);
+		if (want_fullscreen) {
+			char where[96];
+			if (mon.index >= 0) {
+				snprintf(where, sizeof(where), "fullscreen on RandR monitor #%d (%s)", mon.index,
+				         mon.name.c_str());
+			} else {
+				snprintf(where, sizeof(where), "fullscreen on the current output (no RandR monitor at "
+				                               "the panel position)");
+			}
+			DXRW_INFO("Created app-owned X11 window 0x%lx: requested %ux%u at (%d, %d) %s; actual %dx%d "
+			          "at (%d, %d)",
+			          m_x_window, desc.width, desc.height, screenLeft, screenTop, where, wa.width,
+			          wa.height, rx, ry);
+		} else {
+			DXRW_INFO("Created app-owned X11 window 0x%lx: requested %ux%u at (%d, %d) windowed%s; "
+			          "actual %dx%d at (%d, %d)",
+			          m_x_window, desc.width, desc.height, screenLeft, screenTop,
+			          fs_opt_out ? " (DXR_X11_NO_FULLSCREEN)" : "", wa.width, wa.height, rx, ry);
+		}
+	}
 	return true;
 }
 
