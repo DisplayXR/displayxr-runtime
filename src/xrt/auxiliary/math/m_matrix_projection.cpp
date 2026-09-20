@@ -17,18 +17,27 @@
  *
  */
 
+/*!
+ * Shared body for both exported projection builders (#1580).
+ *
+ * @p vulkan_projection_space_y selects the clip-space Y direction, and it is
+ * the ONLY difference between them: `true` gives Vulkan's Y-down clip space
+ * (row 1 negated), `false` gives the Y-up clip space that OpenGL, D3D11,
+ * D3D12 and Metal all use. Keeping one body means the two conventions cannot
+ * drift apart.
+ */
 template <typename Scalar, typename ResultType>
 void
-calc_vulkan_projection_infinite_reverse(const xrt_fov &fov, Scalar near_plane, ResultType &result)
+calc_projection_infinite_reverse(const xrt_fov &fov,
+                                 Scalar near_plane,
+                                 bool vulkan_projection_space_y,
+                                 ResultType &result)
 {
 	const Scalar tan_left = static_cast<Scalar>(tan(fov.angle_left));
 	const Scalar tan_right = static_cast<Scalar>(tan(fov.angle_right));
 
 	const Scalar tan_down = static_cast<Scalar>(tan(fov.angle_down));
 	const Scalar tan_up = static_cast<Scalar>(tan(fov.angle_up));
-
-	// This is here for clarity.
-	const bool vulkan_projection_space_y = true;
 
 	const Scalar tan_width = tan_right - tan_left;
 	const Scalar tan_height = vulkan_projection_space_y  // Projection space y direction:
@@ -77,5 +86,13 @@ math_matrix_4x4_projection_vulkan_infinite_reverse(const struct xrt_fov *fov,
                                                    float near_plane,
                                                    struct xrt_matrix_4x4 *result)
 {
-	calc_vulkan_projection_infinite_reverse<float, xrt_matrix_4x4>(*fov, near_plane, *result);
+	calc_projection_infinite_reverse<float, xrt_matrix_4x4>(*fov, near_plane, true, *result);
+}
+
+extern "C" void
+math_matrix_4x4_projection_d3d_infinite_reverse(const struct xrt_fov *fov,
+                                                float near_plane,
+                                                struct xrt_matrix_4x4 *result)
+{
+	calc_projection_infinite_reverse<float, xrt_matrix_4x4>(*fov, near_plane, false, *result);
 }

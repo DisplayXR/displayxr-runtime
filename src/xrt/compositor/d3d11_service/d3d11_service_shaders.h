@@ -289,8 +289,13 @@ VS_OUTPUT VSMain(uint vertex_id : SV_VertexID)
     // Transform to model space (normalize in fragment shader)
     output.camera_ray = mul((float3x3)mv_inverse, ray_in_view_space);
 
-    // Go from [0 .. 1] to [-1 .. 1] for fullscreen NDC
-    float2 pos = uv * 2.0 - 1.0;
+    // Go from [0 .. 1] to NDC. The interpolated ray above is built with
+    // -tangent_factors.y, i.e. uv.y == 0 (the frustum's DOWN edge) yields a
+    // ray pointing UP -- the Vulkan Y-down raster convention. D3D11 NDC is
+    // Y-UP, so map uv.y == 0 to NDC +1 (screen TOP) and the vertex's screen
+    // position agrees with its ray again. Flipping the ray sign instead
+    // would fix the same mirror twice over -- one fix, here (#1580).
+    float2 pos = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     output.position = float4(pos, 0.0, 1.0);
 
     return output;
@@ -429,8 +434,13 @@ VS_OUTPUT VSMain(uint vertex_id : SV_VertexID)
     // Transform to model space
     output.view_dir = mul((float3x3)mv_inverse, view_dir_view);
 
-    // Fullscreen quad
-    float2 pos = uv * 2.0 - 1.0;
+    // Go from [0 .. 1] to NDC. The interpolated ray above is built with
+    // -tangent_factors.y, i.e. uv.y == 0 (the frustum's DOWN edge) yields a
+    // ray pointing UP -- the Vulkan Y-down raster convention. D3D11 NDC is
+    // Y-UP, so map uv.y == 0 to NDC +1 (screen TOP) and the vertex's screen
+    // position agrees with its ray again. Flipping the ray sign instead
+    // would fix the same mirror twice over -- one fix, here (#1580).
+    float2 pos = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     output.position = float4(pos, 0.0, 1.0);
 
     return output;

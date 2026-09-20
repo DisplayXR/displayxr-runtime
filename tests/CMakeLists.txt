@@ -48,6 +48,7 @@ set(tests
     tests_input_arbiter_rig
     tests_sim_input_nav
     tests_comp_layer_view_camera
+    tests_m_matrix_projection
 	)
 if(XRT_BUILD_DRIVER_QWERTY)
 	list(APPEND tests tests_qwerty_camera_profile)
@@ -177,6 +178,10 @@ target_link_libraries(tests_quat_change_of_basis PRIVATE aux_math)
 target_link_libraries(tests_quat_swing_twist PRIVATE aux_math)
 target_link_libraries(tests_vec3_angle PRIVATE aux_math)
 target_link_libraries(tests_space_overseer_rig PRIVATE aux_math)
+
+# #1580 -- the two infinite-far/reversed-depth projection builders. Pure
+# aux_math; no device, no compositor.
+target_link_libraries(tests_m_matrix_projection PRIVATE aux_math)
 
 # #1580 -- the shared per-view camera resolver every backend's quad/cylinder/
 # equirect/cube path consumes. Compiled straight into the unit (like
