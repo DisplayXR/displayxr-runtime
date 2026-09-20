@@ -55,7 +55,9 @@ GNOME Shell (Mutter)                        DisplayXR runtime process
 - **Consumer** — `comp_vk_native_wl_geom` (`src/xrt/compositor/vk_native/`,
   built when `XRT_HAVE_WAYLAND && XRT_HAVE_DBUS`, libdbus-1). Private
   session-bus connection; one blocking `GetWindows` at create (200 ms cap),
-  then a non-blocking signal pump per query. Created by the compositor when
+  then a non-blocking signal pump per query. The pump also watches
+  `org.freedesktop.DBus.NameOwnerChanged` (arg0-matched on the well-known name)
+  so it notices the publisher coming and going. Created by the compositor when
   the app binds a Wayland surface; queried from the existing
   `get_window_metrics` Linux branch as a third window source next to the two
   XCB ones. Match policy: windows of `getpid()`, focused first, else largest.
@@ -69,6 +71,7 @@ GNOME Shell (Mutter)                        DisplayXR runtime process
 | Extension not installed/enabled | Snapshot empty; bounded retry every 5 s; display-scoped until it appears |
 | No window matches our PID | `get_window_metrics` invalid; display-scoped |
 | Monitor scale ≠ 1.0 | Rect **refused**, one WARN; display-scoped until the display is set to 100 % scale (same constraint as X11 windowed weaving) |
+| Publisher goes away / comes back (screen lock) | Cache **dropped** on `NameOwnerChanged`, so display-scoped while it is gone; on its return the consumer re-takes `GetWindows` immediately rather than waiting for the next change. One WARN per transition |
 
 The scale row is the one that used to break the ladder's promise: the rect was
 returned with a warning, so the outcome was not pre-#817 behavior but *windowed
@@ -77,6 +80,21 @@ fallback. Mutter reports logical pixels, which equal physical pixels only at
 scale 1.0, and at any other scale the compositor additionally resamples the
 surface on its way to the panel, destroying a 1-pixel-period interlace pattern
 outright. No phase correction survives that, so the geometry is refused.
+
+The lock-screen row exists because the publisher is **intermittent by design**:
+GNOME disables user extensions whenever the screen shield is up and re-enables
+them on unlock, so the bus name really does disappear and reappear during a
+normal session. Absence was always handled (bounded retry, display-scoped), but
+two things about the *edges* were not. On the way out, the last snapshot stayed
+cached and kept anchoring the phase — and a window moved or resized behind the
+shield made that cached origin quietly wrong. On the way back, the publisher
+only emits `WindowsChanged` on the next geometry *change*, so the stale origin
+survived until the user happened to move the window again. Tracking
+`NameOwnerChanged` fixes both edges: losing the owner invalidates the cache
+(display-scoped is the honest answer once we cannot vouch for the origin), and
+gaining one invalidates it *and* re-takes the same bounded `GetWindows` the
+retry path already makes. These are rare lifecycle events, so each transition
+logs exactly one WARN; the per-frame pump still never blocks for anything else.
 
 ## 4. Packaging contract — the publisher is a shared asset
 

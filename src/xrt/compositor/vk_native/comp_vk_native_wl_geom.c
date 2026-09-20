@@ -6,8 +6,11 @@
  *
  * libdbus-1 client of the GNOME Shell extension `window-geometry@displayxr.org`
  * (contrib/gnome-shell/). One initial GetWindows snapshot at create, then a
- * non-blocking per-query pump of WindowsChanged signals. Single-threaded use
- * from the compositor frame loop — no locking.
+ * non-blocking per-query pump of WindowsChanged signals. The publisher is
+ * intermittent by design — GNOME disables user extensions whenever the screen
+ * shield is up — so NameOwnerChanged is tracked too, and the cache is dropped
+ * and re-taken across that gap. Single-threaded use from the compositor frame
+ * loop — no locking.
  *
  * @ingroup comp_vk_native
  */
@@ -29,6 +32,17 @@
 #define WLG_OBJ_PATH "/org/displayxr/WindowGeometry"
 #define WLG_IFACE "org.displayxr.WindowGeometry1"
 #define WLG_MATCH_RULE "type='signal',interface='" WLG_IFACE "',member='WindowsChanged'"
+
+//! The publisher comes and goes (see wlg_pump), so we also watch who owns its
+//! well-known name. The daemon supports arg0 matching, so this delivers only
+//! transitions of OUR name — not every name change on the session bus.
+#define WLG_OWNER_MATCH_RULE                                                                                           \
+	"type='signal',sender='" DBUS_SERVICE_DBUS "',interface='" DBUS_INTERFACE_DBUS                                 \
+	"',"                                                                                                           \
+	"member='NameOwnerChanged',arg0='" WLG_BUS_NAME "'"
+
+//! Bounded-retry period for the lazy GetWindows when we have no snapshot.
+#define WLG_RETRY_PERIOD_NS ((int64_t)5 * 1000 * 1000 * 1000)
 
 //! Highest payload schema version this consumer understands. Additive changes
 //! keep the version; anything that changes the MEANING of an existing field
@@ -151,6 +165,56 @@ wlg_parse_snapshot(struct comp_vk_native_wl_geom *g, const char *json)
 	cJSON_Delete(root);
 }
 
+static bool
+wlg_request_snapshot(struct comp_vk_native_wl_geom *g, int timeout_ms);
+
+//! Forget the cached snapshot. Callers then report "no rect" and the weave
+//! falls back to display-scoped — the honest outcome once we can no longer
+//! vouch for the cached origin.
+static void
+wlg_invalidate(struct comp_vk_native_wl_geom *g)
+{
+	g->window_count = 0;
+	g->have_snapshot = false;
+}
+
+//! Handle one NameOwnerChanged for our well-known name. Returns true when the
+//! caller should re-snapshot (the publisher just gained an owner).
+static bool
+wlg_handle_owner_changed(struct comp_vk_native_wl_geom *g, DBusMessage *msg)
+{
+	const char *name = NULL;
+	const char *old_owner = NULL;
+	const char *new_owner = NULL;
+	if (!dbus_message_get_args(msg, NULL, DBUS_TYPE_STRING, &name, DBUS_TYPE_STRING, &old_owner, DBUS_TYPE_STRING,
+	                           &new_owner, DBUS_TYPE_INVALID)) {
+		return false;
+	}
+	// arg0 matching should already have filtered this, but the rule is a hint
+	// to the daemon, not a guarantee about what a buggy peer can send us.
+	if (name == NULL || new_owner == NULL || strcmp(name, WLG_BUS_NAME) != 0) {
+		return false;
+	}
+
+	// Either direction invalidates: while the publisher was gone the window
+	// may have been moved or resized, and nothing told us. Serving the stale
+	// cache would weave at the pre-gap origin until the window next moves.
+	wlg_invalidate(g);
+
+	if (new_owner[0] != '\0') {
+		return true;
+	}
+
+	U_LOG_W("wl_geom: geometry service " WLG_BUS_NAME
+	        " went away (GNOME disables user extensions "
+	        "while the screen shield is up) — dropped the cached geometry rather than weave at an "
+	        "origin we can no longer vouch for; display-scoped until it returns.");
+	// The name has no owner, so an immediate GetWindows buys only an error
+	// reply. Hand the wait back to the bounded retry path.
+	g->next_retry_ns = os_monotonic_get_ns() + WLG_RETRY_PERIOD_NS;
+	return false;
+}
+
 //! Drain pending bus messages without blocking; keep the latest snapshot.
 static void
 wlg_pump(struct comp_vk_native_wl_geom *g)
@@ -161,6 +225,8 @@ wlg_pump(struct comp_vk_native_wl_geom *g)
 
 	dbus_connection_read_write(g->conn, 0);
 
+	bool owner_appeared = false;
+
 	DBusMessage *msg = NULL;
 	while ((msg = dbus_connection_pop_message(g->conn)) != NULL) {
 		if (dbus_message_is_signal(msg, WLG_IFACE, "WindowsChanged")) {
@@ -169,8 +235,36 @@ wlg_pump(struct comp_vk_native_wl_geom *g)
 			    json != NULL) {
 				wlg_parse_snapshot(g, json);
 			}
+		} else if (dbus_message_is_signal(msg, DBUS_INTERFACE_DBUS, "NameOwnerChanged")) {
+			owner_appeared |= wlg_handle_owner_changed(g, msg);
 		}
 		dbus_message_unref(msg);
+	}
+
+	if (!owner_appeared) {
+		return;
+	}
+
+	// Re-snapshot NOW rather than waiting for the publisher's next
+	// WindowsChanged: it only emits on the next geometry CHANGE, so a window
+	// that moved while the service was down would otherwise stay unknown (and
+	// pre-invalidation, stale) until the user happened to move it again.
+	// Same bounded call the retry path already makes — the pump never blocks
+	// for anything else.
+	const bool ok = wlg_request_snapshot(g, 25);
+	// Whether or not that answered, don't let get_window_rect's lazy retry
+	// fire a second GetWindows in this same frame.
+	g->next_retry_ns = os_monotonic_get_ns() + WLG_RETRY_PERIOD_NS;
+
+	if (ok) {
+		U_LOG_W("wl_geom: geometry service " WLG_BUS_NAME
+		        " came back — re-snapshotted %u windows; "
+		        "windowed weaving active again at the window's current origin.",
+		        g->window_count);
+	} else {
+		U_LOG_W("wl_geom: geometry service " WLG_BUS_NAME
+		        " came back but GetWindows did not answer "
+		        "— display-scoped until the bounded retry succeeds.");
 	}
 }
 
@@ -239,6 +333,17 @@ comp_vk_native_wl_geom_create(void)
 		U_LOG_W("wl_geom: add_match failed (%s)", err.message);
 		dbus_error_free(&err);
 	}
+	// Added BEFORE the first GetWindows, so a publisher that shows up during
+	// or right after create is noticed by the pump rather than only by the 5 s
+	// retry.
+	dbus_bus_add_match(g->conn, WLG_OWNER_MATCH_RULE, &err);
+	if (dbus_error_is_set(&err)) {
+		U_LOG_W(
+		    "wl_geom: NameOwnerChanged add_match failed (%s) — the cache will not be dropped when "
+		    "the geometry service restarts (e.g. across a screen lock)",
+		    err.message);
+		dbus_error_free(&err);
+	}
 	dbus_connection_flush(g->conn);
 
 	if (!wlg_request_snapshot(g, 200)) {
@@ -279,7 +384,7 @@ comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g,
 		if (now_ns < g->next_retry_ns) {
 			return false;
 		}
-		g->next_retry_ns = now_ns + (int64_t)5 * 1000 * 1000 * 1000;
+		g->next_retry_ns = now_ns + WLG_RETRY_PERIOD_NS;
 		wlg_request_snapshot(g, 25);
 		if (!g->have_snapshot) {
 			return false;
