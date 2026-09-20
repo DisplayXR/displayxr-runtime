@@ -1029,6 +1029,29 @@ oxr_session_locate_views(struct oxr_logger *log,
                          uint32_t *viewCountOutput,
                          XrView *views);
 
+/*!
+ * #1580: this frame's per-view cameras for the compositor, in the head-relative
+ * space every layer pose is expressed in.
+ *
+ * A second CALLER of @ref oxr_session_locate_views, never a change to it — the
+ * located view depends on session state (the chained / qwerty view rig, the
+ * external-window flag, the zone chain, the head device pose) that no
+ * compositor can re-derive. Publishes nothing: the #1502 VIEW-space offset is
+ * snapshotted and restored around the call. See the long comment at the
+ * definition.
+ *
+ * @param display_time  The frame's predicted display time (XrTime).
+ * @param[out] out_count    Views written; 0 when this frame has no usable view
+ *                          state (warm-up, no valid pose bits) — NOT an error.
+ * @param[out] out_cameras  At least @ref XRT_MAX_VIEWS entries.
+ */
+XrResult
+oxr_session_frame_view_cameras(struct oxr_logger *log,
+                               struct oxr_session *sess,
+                               XrTime display_time,
+                               uint32_t *out_count,
+                               struct xrt_frame_view_camera *out_cameras);
+
 XrResult
 oxr_session_frame_wait(struct oxr_logger *log, struct oxr_session *sess, XrFrameState *frameState);
 

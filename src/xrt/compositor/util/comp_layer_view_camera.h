@@ -54,6 +54,12 @@ enum comp_layer_view_camera_source
 	COMP_LAYER_VIEW_CAMERA_FROM_DISPLAY3D = 1,
 	//! Neither was available — the legacy ±32 mm / ±45° placeholder.
 	COMP_LAYER_VIEW_CAMERA_FALLBACK = 2,
+	/*!
+	 * The frame's own cameras, carried on @ref xrt_layer_frame_data by the
+	 * state tracker: LITERALLY what `xrLocateViews` reported for this
+	 * frame's display time, not a re-derivation of it.
+	 */
+	COMP_LAYER_VIEW_CAMERA_FROM_FRAME = 3,
 };
 
 /*!
@@ -78,11 +84,21 @@ struct comp_layer_view_camera
  *  (a) the frame's FIRST projection-class layer (projection, projection+depth
  *      or a 3D zone) that covers @p view_index → its `data.proj.v[view].pose`
  *      and `.fov` verbatim. This is the app's own camera, already in the
- *      layer space, so nothing is re-based.
+ *      layer space, so nothing is re-based. FIRST because the projection draw
+ *      is an identity-MVP blit: the view tile IS that frustum, so anything
+ *      composed beside it must use the same one even if the frame also carries
+ *      cameras.
+ *  (b') else, the frame's own cameras on `accum->data` (@ref
+ *      xrt_layer_frame_data::cameras), when `cameras_valid`. These are what
+ *      `xrLocateViews` reported for this frame — the state tracker measured
+ *      them; nothing here re-derives them. This is the ONLY branch that can be
+ *      right when the session runs a camera-centric rig (the qwerty default,
+ *      or a chained XR_DXR_view_rig), whose frustum is a fixed vFOV sheared by
+ *      the convergence and has no relation to the panel's Kooima frustum.
  *  (b) else, if an eye position and a canvas size are known → identity
- *      orientation at @p eye_pos, FOV from `dxr_display3d_compute_fov()` — the
- *      SHARED Kooima core the state tracker itself runs, so the synthesized
- *      camera is the one `xrLocateViews` would have handed out.
+ *      orientation at @p eye_pos, FOV from `dxr_display3d_compute_fov()`. A
+ *      best-effort DISPLAY-centric reconstruction, kept for callers with no
+ *      frame data (and for a session whose locate had no valid pose bits yet).
  *  (c) else the legacy placeholder camera ({∓0.032, 0, 0}, symmetric ±0.785
  *      rad) plus one process-lifetime U_LOG_W naming the fallback. Never
  *      logged per frame.

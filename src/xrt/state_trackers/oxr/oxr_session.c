@@ -3682,6 +3682,142 @@ oxr_session_locate_views(struct oxr_logger *log,
 	return oxr_session_success_result(sess);
 }
 
+/*
+ * #1580 — the frame's per-view cameras, for the compositor.
+ *
+ * WHY THIS EXISTS. A compositor cannot re-derive the view the app was handed.
+ * `oxr_session_locate_views` above resolves the frustum from session state that
+ * never reaches the compositor: a chained XR_DXR_view_rig descriptor, or — for
+ * every runtime-window session on a box with the qwerty driver built in, which
+ * is what an in-process hosted app is — the qwerty debug rig synthesised at
+ * `active_rig = &qwerty_rig` (see the block above, ~line 2408). qwerty defaults
+ * to `camera_mode = true` (qwerty_device.c `qs->camera_mode = true`), so the
+ * CAMERA-centric branch runs: a FIXED half_tan_vfov with the eye displacement
+ * times the convergence as shear. That frustum is not the panel's Kooima
+ * frustum and does not even depend on the nominal viewer distance. Re-deriving
+ * it from the DP eye and the canvas metres — which is all a compositor has —
+ * cannot reproduce it.
+ *
+ * SPACE. The cameras come back in the head-relative space every layer pose in
+ * the frame is expressed in. That is achieved by locating in the session's VIEW
+ * reference space and then composing the SAME `oxr_space_ref_offset` that
+ * `handle_space()` composes onto a VIEW-space layer pose — so a VIEW-space quad
+ * and this camera cannot disagree about the space they live in, by
+ * construction.
+ *
+ * NO SIDE EFFECTS. `oxr_session_locate_views` publishes the #1502 VIEW-space
+ * offset as a side effect of running. This call snapshots that offset first,
+ * uses the snapshot for both the base conversion (via the stack space) and the
+ * composition, and restores it afterwards — so `xrEndFrame` leaves exactly the
+ * value the app's own `xrLocateViews` published, and `handle_space()` later in
+ * the same frame composes that same value onto the quad poses. `xrLocateViews`
+ * itself is untouched: this is a second caller of it, not a change to it.
+ *
+ * The base space is a STACK `oxr_space`, not a handle: `oxr_session_locate_views`
+ * reaches into `baseSpc` only through `oxr_space_locate_device()` (which reads
+ * `space_type`, `pose` and `sess`) and the debug pretty-printer (same three), so
+ * no handle registration, ref-count or destroy is involved.
+ */
+XrResult
+oxr_session_frame_view_cameras(struct oxr_logger *log,
+                               struct oxr_session *sess,
+                               XrTime display_time,
+                               uint32_t *out_count,
+                               struct xrt_frame_view_camera *out_cameras)
+{
+	if (sess == NULL || out_count == NULL || out_cameras == NULL) {
+		return XR_ERROR_VALIDATION_FAILURE;
+	}
+	*out_count = 0;
+
+	/*
+	 * KNOWN GAP, deliberately reported as "no cameras" rather than as a
+	 * wrong one. An XR_DXR_view_rig descriptor drives the view math only on
+	 * the locate that CHAINS it (view_rig_update_from_chain returns NONE and
+	 * touches nothing when nothing is chained), and this locate chains
+	 * nothing — so for a session that has ever chained a rig, the cameras
+	 * below would be computed without it and would NOT be what the app was
+	 * handed. Bail out and let the compositor fall back.
+	 *
+	 * In practice a rig app submits a projection layer, which outranks these
+	 * cameras anyway (the tile IS its frustum), so this costs nothing today.
+	 * Closing it properly means re-chaining sess->view_rig here as a
+	 * descriptor, which is a follow-up.
+	 */
+	if (sess->view_rig.type != OXR_VIEW_RIG_NONE) {
+		return XR_SUCCESS;
+	}
+
+	// The VIEW-space offset the app's own locate published. Snapshot before,
+	// restore after: this call must not move it.
+	struct xrt_pose view_offset = XRT_POSE_IDENTITY;
+	oxr_session_get_view_space_offset(sess, &view_offset);
+
+	struct oxr_space view_space = {0};
+	view_space.sess = sess;
+	view_space.pose = (struct xrt_pose)XRT_POSE_IDENTITY;
+	view_space.space_type = OXR_SPACE_TYPE_REFERENCE_VIEW;
+
+	XrViewLocateInfo info = {
+	    .type = XR_TYPE_VIEW_LOCATE_INFO,
+	    .next = NULL,
+	    .viewConfigurationType = sess->view_config_type,
+	    .displayTime = display_time,
+	    .space = XRT_CAST_PTR_TO_OXR_HANDLE(XrSpace, &view_space),
+	};
+
+	XrViewState view_state = {.type = XR_TYPE_VIEW_STATE, .next = NULL};
+	XrView views[XRT_MAX_VIEWS];
+	for (uint32_t i = 0; i < XRT_MAX_VIEWS; i++) {
+		views[i] = (XrView){.type = XR_TYPE_VIEW, .next = NULL};
+	}
+
+	uint32_t count = 0;
+	XrResult ret = oxr_session_locate_views(log, sess, &info, &view_state, XRT_MAX_VIEWS, &count, views);
+
+	// Undo the #1502 publish this locate performed.
+	oxr_session_set_view_space_offset(sess, &view_offset);
+
+	if (ret != XR_SUCCESS) {
+		return ret;
+	}
+
+	const XrViewStateFlags need = XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT;
+	if ((view_state.viewStateFlags & need) != need) {
+		// Warm-up / tracking-less frame. Nothing to report; the caller
+		// leaves cameras_valid false and the compositor falls back.
+		return XR_SUCCESS;
+	}
+
+	if (count > XRT_MAX_VIEWS) {
+		count = XRT_MAX_VIEWS;
+	}
+
+	for (uint32_t i = 0; i < count; i++) {
+		// VIEW-relative -> head-relative, exactly as handle_space() does
+		// it for a VIEW-space layer pose (view_offset o spc->pose o P,
+		// with spc->pose identity here).
+		union {
+			XrPosef oxr;
+			struct xrt_pose xrt;
+		} p = {views[i].pose};
+		union {
+			XrFovf oxr;
+			struct xrt_fov xrt;
+		} f = {views[i].fov};
+
+		struct xrt_pose in_view = p.xrt;
+		if (!math_quat_validate(&in_view.orientation)) {
+			math_quat_normalize(&in_view.orientation);
+		}
+		math_pose_transform(&view_offset, &in_view, &out_cameras[i].pose);
+		out_cameras[i].fov = f.xrt;
+	}
+
+	*out_count = count;
+	return XR_SUCCESS;
+}
+
 static double
 ns_to_ms(int64_t ns)
 {

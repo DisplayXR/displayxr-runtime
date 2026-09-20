@@ -155,7 +155,25 @@ comp_layer_view_camera_select_ex(const struct comp_layer_accum *accum,
 	}
 
 	/*
-	 * (b) No projection layer this frame (a quad-only frame). Synthesize the
+	 * (b') The frame's own cameras — what xrLocateViews reported for this
+	 * frame's display time, carried across (and across IPC) on
+	 * xrt_layer_frame_data. Not a reconstruction: the state tracker is the
+	 * only place that knows which rig the session is running, and a
+	 * camera-centric rig (the qwerty default, or a chained XR_DXR_view_rig)
+	 * produces a frustum that the eye-and-canvas synthesis below cannot
+	 * express at all — a fixed vFOV sheared by the convergence, independent
+	 * of the nominal viewer distance.
+	 */
+	if (accum != NULL && accum->data.cameras_valid && view_index < accum->data.camera_count &&
+	    view_index < XRT_MAX_VIEWS) {
+		out->pose = accum->data.cameras[view_index].pose;
+		out->fov = accum->data.cameras[view_index].fov;
+		out->source = COMP_LAYER_VIEW_CAMERA_FROM_FRAME;
+		return true;
+	}
+
+	/*
+	 * (b) No projection layer and no frame cameras. Synthesize the
 	 * camera the state tracker would have handed out: the DP's eye with
 	 * identity orientation, and the Kooima off-axis FOV from the SHARED core
 	 * — the same dxr_display3d_compute_fov() oxr_session.c runs, so a quad
