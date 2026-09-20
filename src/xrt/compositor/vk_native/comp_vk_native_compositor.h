@@ -276,6 +276,42 @@ comp_vk_native_compositor_set_wayland_surface_geometry(struct xrt_compositor *xc
                                                        uint32_t refresh_mhz);
 
 /*!
+ * Phase-snap a proposed window top-left through the display processor
+ * (XR_DXR_weave `xrWeaveSnapWindowRectDXR`, runtime#1588).
+ *
+ * The window owner intercepts its own drag and asks here where the window may
+ * LAND; the DP answers with the nearest interlace-phase-aligned position. The
+ * lens pitch and slant never cross the boundary (ADR-019) — the runtime passes
+ * two points and reads back one.
+ *
+ * Coordinates are ABSOLUTE SCREEN pixels, because interlace phase is absolute.
+ * Only the top-left is snapped; the caller keeps the size.
+ *
+ * @param      xc        A vk_native compositor.
+ * @param      origin_x  Drag-start window left, absolute screen px.
+ * @param      origin_y  Drag-start window top, absolute screen px.
+ * @param      target_x  Proposed window left, absolute screen px.
+ * @param      target_y  Proposed window top, absolute screen px.
+ * @param[out] out_x     Snapped left; always written (identity on no support).
+ * @param[out] out_y     Snapped top; always written (identity on no support).
+ *
+ * @return true when the DP actually snapped. false means no DP, no
+ *         `snap_window_rect` slot (sim_display, any pre-#1588 plug-in) or a DP
+ *         that declined — and then out_x/out_y are the target unchanged, so the
+ *         caller can use them either way.
+ *
+ * @ingroup comp_vk_native
+ */
+bool
+comp_vk_native_compositor_snap_window_rect(struct xrt_compositor *xc,
+                                           int32_t origin_x,
+                                           int32_t origin_y,
+                                           int32_t target_x,
+                                           int32_t target_y,
+                                           int32_t *out_x,
+                                           int32_t *out_y);
+
+/*!
  * Get the vk_bundle from a VK native compositor (for sub-modules).
  *
  * @ingroup comp_vk_native

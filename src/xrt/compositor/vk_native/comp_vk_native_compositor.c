@@ -10093,6 +10093,36 @@ comp_vk_native_compositor_set_wayland_surface_geometry(struct xrt_compositor *xc
 #endif
 }
 
+bool
+comp_vk_native_compositor_snap_window_rect(struct xrt_compositor *xc,
+                                           int32_t origin_x,
+                                           int32_t origin_y,
+                                           int32_t target_x,
+                                           int32_t target_y,
+                                           int32_t *out_x,
+                                           int32_t *out_y)
+{
+	if (out_x == NULL || out_y == NULL) {
+		return false;
+	}
+	// Identity default — the caller may use the outputs whatever we return.
+	*out_x = target_x;
+	*out_y = target_y;
+	if (xc == NULL) {
+		return false;
+	}
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	if (c->display_processor == NULL) {
+		return false;
+	}
+	// Pure query: the DP computes, we do not move anything here. Whoever owns
+	// the window does the moving (that is the whole point — a snapped ORIGIN
+	// fed to a window that did not move would displace the interlace against
+	// the lens, which is worse than not snapping at all).
+	return xrt_display_processor_vk_snap_window_rect((struct xrt_display_processor_vk *)c->display_processor,
+	                                                 origin_x, origin_y, target_x, target_y, out_x, out_y);
+}
+
 struct vk_bundle *
 comp_vk_native_compositor_get_vk(struct comp_vk_native_compositor *c)
 {

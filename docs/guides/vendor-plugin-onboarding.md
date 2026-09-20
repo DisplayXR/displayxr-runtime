@@ -319,7 +319,11 @@ That is the whole implementation, and it needs no other new mechanism:
   window resolution with your declared tile geometry;
 - `snap_window_rect` → return the nearest placement your lens phase / cell grid
   actually supports. The runtime calls it for placement, drag and resize, and
-  for present-owning apps through `XR_DXR_weave`.
+  for present-owning apps through `XR_DXR_weave`. It exists on **both** the
+  D3D11 variant (slot 18) and the Vulkan one (appended, #1588) with the same
+  signature, so one body serves both. Snap on the invariant your lattice
+  actually has — with a slant that is `x + slant·y`, not `x` — and expect to be
+  asked once per pointer-motion event, so keep it arithmetic.
 
 **A `SCANOUT` chip needs the runtime to own the whole panel.** That is the
 fullscreen, panel-native composition the service compositor already performs

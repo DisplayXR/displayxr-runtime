@@ -54,6 +54,15 @@
 #include "xrt/xrt_display_metrics.h" // struct xrt_eye_positions (DP-tracked eyes; Leia M2)
 #endif
 
+#if defined(XRT_HAVE_VK_NATIVE_COMPOSITOR) && defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
+// Desktop Linux (#1588): the weave snap is a pure DP query, and on this
+// platform the DP lives on the native Vulkan compositor behind the multi
+// system compositor — so the handler walks multi_compositor -> msc -> xcn and
+// calls it directly. No weave service, nothing to borrow from comp_multi.
+#include "multi/comp_multi_private.h"
+#include "vk_native/comp_vk_native_compositor.h"
+#endif
+
 #if defined(XRT_OS_MACOS)
 // macOS service input forwarding (#48): drain the generic queue fed by the
 // AppKit pump's NSEvent capture (ipc_server_macos_appkit.m).
@@ -6672,6 +6681,32 @@ ipc_handle_weave_snap_window_rect(volatile struct ipc_client_state *ics,
 		*out_snapped = true;
 		*out_snapped_x = sx;
 		*out_snapped_y = sy;
+	}
+	return XRT_SUCCESS;
+#elif defined(XRT_HAVE_VK_NATIVE_COMPOSITOR) && defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
+	/*
+	 * Desktop Linux (#1588). There is no weave service here and no
+	 * comp_multi_weave_* leg to borrow — but the snap does not need one: it
+	 * is a pure query on the display processor, and on Linux the DP lives on
+	 * the native Vulkan compositor behind the multi system compositor. Reach
+	 * it directly rather than growing a weave engine that has nothing to do.
+	 *
+	 * The client-side xc is a multi_compositor; msc->xcn is the one native
+	 * compositor that owns the panel and therefore the phase, which is the
+	 * right thing to snap against no matter which client asked.
+	 */
+	{
+		struct multi_compositor *mc = multi_compositor(ics->xc);
+		if (mc == NULL || mc->msc == NULL || mc->msc->xcn == NULL) {
+			return XRT_SUCCESS; // identity, already defaulted above
+		}
+		int32_t sx = target_x, sy = target_y;
+		if (comp_vk_native_compositor_snap_window_rect(&mc->msc->xcn->base, origin_x, origin_y, target_x,
+		                                               target_y, &sx, &sy)) {
+			*out_snapped = true;
+			*out_snapped_x = sx;
+			*out_snapped_y = sy;
+		}
 	}
 	return XRT_SUCCESS;
 #else

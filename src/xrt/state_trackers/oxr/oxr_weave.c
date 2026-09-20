@@ -17,7 +17,12 @@
  * the weave runs in the D3D11 service compositor on Windows and in the
  * comp_multi Vulkan weave engine on macOS (#759: IOSurface in/out, synchronous
  * completion, no fence handle). An in-process session reports
- * XR_ERROR_FEATURE_UNSUPPORTED. The entry points forward to thin IPC-client
+ * XR_ERROR_FEATURE_UNSUPPORTED — with ONE exception, xrWeaveSnapWindowRectDXR
+ * (#1588), which is a pure query on the display processor and therefore works
+ * in-process too. On desktop Linux that is in fact the only part of this
+ * extension that exists at all: an X11 handle app owns and drags its own
+ * window, so it is the party that needs to ask where the window may land.
+ * The entry points forward to thin IPC-client
  * bridges (defined in ipc_client_compositor.c); st_oxr does not pull the
  * ipc_client include path, so the symbols resolve at link time — same pattern
  * as oxr_capture.c / oxr_workspace.c.
@@ -53,6 +58,14 @@
 #include "xrt/xrt_display_metrics.h"
 
 #include <openxr/XR_DXR_weave.h>
+
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+// Desktop Linux (#1588): xrWeaveSnapWindowRectDXR is the ONE weave entry point
+// an in-process session can serve, because the snap is a pure query on the
+// display processor and needs no weave service at all. st_oxr already links
+// comp_vk_native on this platform (see its CMakeLists).
+#include "vk_native/comp_vk_native_compositor.h"
+#endif
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -525,17 +538,42 @@ oxr_xrWeaveSnapWindowRectDXR(XrSession session,
 	OXR_VERIFY_ARG_NOT_NULL(&log, targetRect);
 	OXR_VERIFY_ARG_NOT_NULL(&log, snappedRect);
 
+	// Only the top-left is phase-snapped; the size passes through unchanged.
+	// On no DP snap support every route below returns the target unchanged, so
+	// the result is always a valid rect.
+	int32_t sx = targetRect->offset.x, sy = targetRect->offset.y;
+
 	if (!session_is_ipc(sess)) {
+		/*
+		 * In-process route (#1588). Unlike every other entry point here
+		 * this one needs no weave service: it moves no pixels and owns no
+		 * transport — it asks the display processor a question. The window
+		 * owner on desktop Linux is the APP (an X11 handle app dragging its
+		 * own undecorated window), and it is in-process by construction, so
+		 * refusing here would put the snap out of reach of the only caller
+		 * that can act on it.
+		 */
+#if defined(XRT_HAVE_VK_NATIVE_COMPOSITOR) && defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
+		if (sess->is_vk_native_compositor) {
+			// Identity when the DP has no snap_window_rect slot
+			// (sim_display, any plug-in built before #1588) — the outputs
+			// are written either way, so the return value only says
+			// whether the position moved.
+			(void)comp_vk_native_compositor_snap_window_rect(&sess->xcn->base, originRect->offset.x,
+			                                                 originRect->offset.y, targetRect->offset.x,
+			                                                 targetRect->offset.y, &sx, &sy);
+			snappedRect->offset.x = sx;
+			snappedRect->offset.y = sy;
+			snappedRect->extent = targetRect->extent;
+			return XR_SUCCESS;
+		}
+#endif
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrWeaveSnapWindowRectDXR: the weave service is only available on the "
-		                 "out-of-process (service) path");
+		                 "xrWeaveSnapWindowRectDXR: no in-process snap route for this session's "
+		                 "compositor (the rest of the weave service is out-of-process only)");
 	}
 
-	// Only the top-left is phase-snapped; the size passes through unchanged.
-	// On no DP snap support the bridge returns the target unchanged, so the
-	// result is always a valid rect.
 	bool snapped = false;
-	int32_t sx = targetRect->offset.x, sy = targetRect->offset.y;
 	xrt_result_t xret = comp_ipc_client_compositor_weave_snap_window_rect(
 	    &sess->xcn->base, originRect->offset.x, originRect->offset.y, targetRect->offset.x, targetRect->offset.y,
 	    &snapped, &sx, &sy);

@@ -4,7 +4,7 @@
 |---|---|
 | **Extension Name** | `XR_DXR_weave` |
 | **Spec Version** | 9 |
-| **Extension Type** | Instance extension (service path only — Windows/D3D11, macOS/comp_multi-Vulkan #759, Android/comp_multi-Vulkan #1036) |
+| **Extension Type** | Instance extension (service path — Windows/D3D11, macOS/comp_multi-Vulkan #759, Android/comp_multi-Vulkan #1036; **desktop Linux is snap-only and in-process too**, §5c / #1588) |
 | **Header** | `src/external/openxr_includes/openxr/XR_DXR_weave.h` (canonical; auto-syncs to `displayxr-extensions`) |
 | **Status** | Provisional (`1004999190–198` type block, pending Khronos registry; `199` reserved, see §2c; v9 additions in a fresh `1004999240–249` decade) |
 | **Design history** | `docs/roadmap/webxr-step-b-design.md` §13.6–13.9, `docs/roadmap/android-concurrent-multi-app.md` F11/§10.4, issues #625, #774, #1031/#1036, browser#88, browser#103 |
@@ -35,6 +35,13 @@ Five entry points:
 
 Only the out-of-process (service/IPC) path implements it; in-process sessions report
 `XR_ERROR_FEATURE_UNSUPPORTED`.
+
+**One exception, since #1588: `xrWeaveSnapWindowRectDXR` also works in-process.** It is the
+only entry point here that moves no pixels and owns no transport — it is a pure query on the
+display processor, asking where a window may *land*. The party that needs the answer is
+whoever owns the window, and on desktop Linux that is the app itself (see §5c). Requiring a
+weave service to ask a question the service is not involved in would put the answer out of
+reach of its only caller.
 
 ## 2. The two input-layout contracts (v3)
 
@@ -340,7 +347,7 @@ submit / snap contract with these platform substitutions (`comp_multi_weave_maco
 | Output sizing | bound window client rect | batch: **input IOSurface dims** (the v3 input is window-client-sized by contract); legacy: rect offset+extent |
 | `weavedTexture` | shared NT HANDLE (caller `CloseHandle`s) | retained IOSurfaceRef (caller `CFRelease`s) |
 | `fence` / `fenceValue` | shared D3D fence, GPU-wait | **no fence — completion is SYNCHRONOUS**: `xrWeaveSubmitDXR` returns after the weave finished on the GPU. `fence` stays NULL; `fenceValue` is a plain monotonic counter |
-| `xrWeaveSnapWindowRectDXR` | vendor DP lattice snap | identity (no VK DP snap slot yet) |
+| `xrWeaveSnapWindowRectDXR` | vendor DP lattice snap | identity (the VK DP snap slot exists since #1588, but sim/anaglyph has no lattice to snap to) |
 
 The batch algorithm is identical (all rects blitted into ONE window-sized 2×1 SBS scratch, ONE
 `process_atlas` per submit). Verification harness: `test_apps/probes/weave_probe_vk_macos`
@@ -379,6 +386,48 @@ Notes that only bite on Android:
   the submit return before the GPU finishes. Today's synchronous contract is the simplest one
   that is correct, and it is what macOS already ships.
 
+## 5c. Desktop Linux platform mapping (#1588) — snap only
+
+Desktop Linux is the one platform where this extension is advertised **without a weave
+service behind it**. There is no bind, no submit, no output/fence transport and no
+`comp_multi` weave engine on Linux; `xrWeaveBindWindowDXR`, `xrWeaveBindWindow2DXR`,
+`xrWeaveSubmitDXR`, `xrWeaveSetScreenFlatRegionsDXR` and `xrWeaveExportIpcConnectionDXR` all
+report `XR_ERROR_FEATURE_UNSUPPORTED` exactly as an in-process session does everywhere else.
+
+What Linux does have is the problem the snap exists to solve. A windowed weave anchors its
+interlace phase to the window's absolute position on the panel, so dragging the window walks
+the phase across the lens pitch a few pixels at a time and the 3D breaks up (#1588: ~91
+distinct origins over one 8-second drag). The cure is *invariance* — the window may only
+land on lattice points, so the pattern is identical at every drag position.
+
+| Contract point | Windows (D3D11 service) | Desktop Linux (in-process Vulkan) |
+|---|---|---|
+| Who intercepts the move | the runtime's own window proc (`WM_WINDOWPOSCHANGING`) | **the app**: X11 gives a client no hook into the WM's drag, so an undecorated handle app owns its drag and calls this entry point per motion event |
+| Session class | out-of-process present owner | **in-process** (`_handle`); the IPC route also exists for a service present owner |
+| DP slot | `xrt_display_processor_d3d11::snap_window_rect` (slot 18) | `xrt_display_processor_vk::snap_window_rect` (appended, `XRT_DP_VK_HAS_SNAP_WINDOW_RECT`) |
+| Every other entry point | implemented | `XR_ERROR_FEATURE_UNSUPPORTED` |
+| Wayland | n/a | the compositor owns the move and never tells the client where it went, so snapping is impossible by construction — the call still resolves and returns the target unchanged |
+
+Semantics are the Windows ones verbatim: absolute screen pixels in and out, only the top-left
+is snapped, the extent passes through. **Both coordinates matter.** A lenticular lattice is
+slanted, so the quantity a vendor holds invariant is generally `x + slant·y`, not `x` alone —
+an `x` that comes back changed for an unchanged `y`, or vice versa, is correct behaviour and
+a caller must apply both.
+
+A display processor that does not implement the slot — `sim_display`, and every plug-in built
+before #1588 — reads as identity: the snapped rect equals the target, the call succeeds, and
+the app places its window where it asked to. That is what makes the extension safe to
+advertise before any vendor has shipped the slot.
+
+Independently of the app-facing call, the compositor passes the origin it feeds
+`set_present_origin` through the same slot once per window move
+(`vk_update_present_origin`). That is **belt-and-braces only, and it is not the fix**:
+quantising a fed origin while the window itself sits off-lattice would displace the interlace
+against the lens by up to half a period — strictly worse than not snapping. It guards the
+narrow read/raster race where the window is already snapped but a metrics read caught it
+mid-flight. The on-change log line says so when it fires:
+`present origin: (x, y) [snapped from (rx, ry)] = window … - panel …`.
+
 ## 6. Version history
 
 | Version | Change |
@@ -392,6 +441,13 @@ Notes that only bite on Android:
 | 7 | `XrWeaveSubmitHandlesDXR` handle kinds + `xrWeaveBindWindow2DXR` / `XrWeaveWindowGeometryDXR` explicit window geometry; **Android** support (#1036). |
 | 8 | `XrWeaveSubmitFlatRegionsDXR` + `xrWeaveSetScreenFlatRegionsDXR` — per-region hardware wish on the weave path (browser#88). |
 | 9 | `xrWeaveExportIpcConnectionDXR` + `XrWeaveIpcConnectionDXR` — brokering a runtime IPC endpoint to a sandboxed sibling process (§4c); plus §4b, the error table making a dead connection report `XR_ERROR_INSTANCE_LOST` / `XR_ERROR_SESSION_LOST` (browser#103). |
+
+**Desktop Linux availability (#1588) is deliberately NOT a version bump.** No entry point,
+struct, enum or parameter changed — a platform that reported `XR_ERROR_EXTENSION_NOT_PRESENT`
+now advertises the extension and implements one of its six calls. An app discovers that the
+only way it ever could, through `xrEnumerateInstanceExtensionProperties` plus the per-call
+`XR_ERROR_FEATURE_UNSUPPORTED` that §5c tabulates; a `SPEC_VERSION` bump would tell a
+Windows or Android app that something about the API had changed, which would be false.
 
 §4b arrived first, and on its own would not have earned a bump — the entry points simply
 started reporting a dead connection with the same `XR_ERROR_INSTANCE_LOST` every other

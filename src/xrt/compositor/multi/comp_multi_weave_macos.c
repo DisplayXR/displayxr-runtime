@@ -1554,8 +1554,10 @@ comp_multi_weave_snap_window_rect(struct xrt_compositor *xc,
                                   int32_t *out_snapped_x,
                                   int32_t *out_snapped_y)
 {
-	// sim_display has no snap_window_rect (anaglyph has no interlace lattice)
-	// and the generic VK DP vtable carries no snap slot yet — identity snap.
+	// sim_display has no snap_window_rect (anaglyph has no interlace lattice).
+	// The VK DP vtable does carry the slot since #1588; wiring the macOS weave
+	// engine to it is a separate job (it would have to resolve the per-session
+	// DP first) and nothing on macOS drags a weaving window today.
 	(void)xc;
 	(void)origin_x;
 	(void)origin_y;

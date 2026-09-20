@@ -26,6 +26,7 @@ set(tests
     tests_vec3_angle
     tests_u_multi_display
     tests_dp_weave_scope
+    tests_dp_vk_snap_window_rect
     tests_space_overseer_rig
     tests_rig_composer
     tests_cli_dims_check

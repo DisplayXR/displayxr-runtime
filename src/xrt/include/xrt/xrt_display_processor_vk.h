@@ -481,6 +481,54 @@ struct xrt_display_processor_vk
 	 * @return true if the frame just handed to `process_atlas()` was dropped.
 	 */
 	bool (*get_last_frame_dropped)(struct xrt_display_processor_vk *xdp);
+
+	/*!
+	 * Snap a proposed window rect to the nearest interlace-phase-aligned
+	 * screen position (window-drag phase lock, #1588 / XR_DXR_weave). A
+	 * present-owner that moves its own window must keep the woven interlace
+	 * locked to the panel phase as the window travels, or the lenticular
+	 * subpixels shift under the lenses and the 3D collapses into crosstalk
+	 * jitter. The vendor owns the snap math + lens parameters (ADR-019), so
+	 * the runtime passes the drag-start origin top-left and the proposed
+	 * target top-left (absolute screen pixels — the phase is absolute) and
+	 * the DP returns the phase-snapped top-left. Only the top-left is
+	 * snapped; the caller keeps the size unchanged.
+	 *
+	 * This is the Vulkan twin of @ref
+	 * xrt_display_processor_d3d11::snap_window_rect (D3D11 slot 18) and has
+	 * exactly its signature and semantics, so a plug-in can share one body.
+	 * Because the lattice is slanted, the invariant a vendor snaps to is
+	 * generally `x + slant * y`, not `x` alone — which is why BOTH
+	 * coordinates are passed and BOTH may come back changed.
+	 *
+	 * Called from the window/drag path (never per weave) and, as
+	 * belt-and-braces, once per origin CHANGE from the compositor's present-
+	 * origin feed. Must be cheap, non-blocking and free of side effects: it
+	 * is a pure query, not a state change — it must not move a window,
+	 * re-phase a live weaver, or touch the hardware lens state.
+	 *
+	 * Optional — absent slot (older plug-in `struct_size`) or NULL ⟹ no
+	 * snap support; the runtime then leaves the window at @p target_x/y.
+	 * Appended per ADR-020 (append-only within a major; no version bump —
+	 * gated by the variant's `base.struct_size`).
+	 *
+	 * @param      xdp       Pointer to self.
+	 * @param      origin_x  Drag-start window left, absolute screen px.
+	 * @param      origin_y  Drag-start window top, absolute screen px.
+	 * @param      target_x  Proposed window left, absolute screen px.
+	 * @param      target_y  Proposed window top, absolute screen px.
+	 * @param[out] out_x     Phase-snapped window left, absolute screen px.
+	 * @param[out] out_y     Phase-snapped window top, absolute screen px.
+	 * @return true if a snap was produced (out_x/out_y valid); false ⟹ the
+	 *         caller uses target_x/target_y unchanged.
+	 */
+	bool (*snap_window_rect)(struct xrt_display_processor_vk *xdp,
+	                         int32_t origin_x,
+	                         int32_t origin_y,
+	                         int32_t target_x,
+	                         int32_t target_y,
+	                         int32_t *out_x,
+	                         int32_t *out_y);
 };
 
 /*!
@@ -589,7 +637,8 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, get_background_previ
  */
 #define XRT_DP_VK_HAS_BACKGROUND_PREVIEW 1
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, get_last_frame_dropped) == sizeof(struct xrt_display_processor) + 12 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 13 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, snap_window_rect)          == sizeof(struct xrt_display_processor) + 13 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 14 * sizeof(void *), XRT_DP_ABI_MSG);
 
 /*!
  * Defined when this header carries the @ref
@@ -598,6 +647,15 @@ XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_d
  * - the coupled-ABI-addition pattern used by every other appended slot.
  */
 #define XRT_DP_VK_HAS_FRAME_DROPPED 1
+
+/*!
+ * Defined when this header carries the @ref
+ * xrt_display_processor_vk::snap_window_rect slot (runtime#1588) — the Vulkan
+ * twin of the D3D11 slot-18 drag phase lock, so a plug-in built against an
+ * older runtime can #ifdef-guard its implementation. The coupled-ABI-addition
+ * pattern used by every other appended slot.
+ */
+#define XRT_DP_VK_HAS_SNAP_WINDOW_RECT 1
 // clang-format on
 
 /*!
@@ -941,6 +999,53 @@ xrt_display_processor_vk_get_last_frame_dropped(struct xrt_display_processor_vk 
 		return false;
 	}
 	return xdp->get_last_frame_dropped(xdp);
+}
+
+/*!
+ * @copydoc xrt_display_processor_vk::snap_window_rect
+ *
+ * Helper for calling through the function pointer. Returns false when the slot
+ * is absent (older plug-in `struct_size`) or NULL - and then writes the TARGET
+ * through to out_x/out_y, so an identity snap is always safe to use: a caller
+ * may ignore the return value and still get a valid position. That is
+ * deliberately friendlier than the D3D11 twin (which leaves the outputs
+ * untouched), because the Vulkan callers feed the result straight on.
+ *
+ * Like the wrappers above, the presence check reads `xdp->base.struct_size`
+ * because the variant embeds the base - see ADR-020.
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline bool
+xrt_display_processor_vk_snap_window_rect(struct xrt_display_processor_vk *xdp,
+                                          int32_t origin_x,
+                                          int32_t origin_y,
+                                          int32_t target_x,
+                                          int32_t target_y,
+                                          int32_t *out_x,
+                                          int32_t *out_y)
+{
+	if (out_x == NULL || out_y == NULL) {
+		return false;
+	}
+	// Identity by default - every failure path below leaves the caller with
+	// the position it proposed.
+	*out_x = target_x;
+	*out_y = target_y;
+	if (xdp == NULL) {
+		return false;
+	}
+	const char *slot_end = (const char *)&xdp->snap_window_rect + sizeof(xdp->snap_window_rect);
+	if (slot_end > (const char *)xdp + xdp->base.struct_size || xdp->snap_window_rect == NULL) {
+		return false;
+	}
+	int32_t sx = target_x, sy = target_y;
+	if (!xdp->snap_window_rect(xdp, origin_x, origin_y, target_x, target_y, &sx, &sy)) {
+		return false; // outputs stay at the target
+	}
+	*out_x = sx;
+	*out_y = sy;
+	return true;
 }
 
 #ifdef __cplusplus

@@ -390,6 +390,49 @@ bool (*get_background_preview)(struct xrt_display_processor_d3d11 *xdp,
   four floats zeroed is read as the documented normal case, `0,0,1,1`.
 - **Purely additive**, so no `XRT_PLUGIN_API_VERSION_CURRENT` bump (ADR-020).
 
+## Where the window may LAND: `snap_window_rect`
+
+A windowed weave takes its interlace phase from the window's absolute position on the panel.
+Move the window a few pixels and the phase walks across the lens pitch, the subpixels shift
+under the lenses, and the 3D dissolves into crosstalk jitter for the length of the drag. The
+fix is not to correct the phase afterwards; it is to make sure the window only ever lands on
+positions where the phase is the same. So the runtime asks:
+
+```c
+bool (*snap_window_rect)(struct xrt_display_processor_vk *xdp, /* or _d3d11 */
+                         int32_t origin_x, int32_t origin_y,   /* drag-start top-left */
+                         int32_t target_x, int32_t target_y,   /* proposed top-left */
+                         int32_t *out_x, int32_t *out_y);      /* snapped top-left */
+```
+
+- **Slot 18 on D3D11** (#625), and **appended at the end of the Vulkan variant** (#1588,
+  `XRT_DP_VK_HAS_SNAP_WINDOW_RECT`) with the identical signature, so a plug-in can share one
+  body across both. Guarded exactly like every other appended slot: the `struct_size`
+  read-clamp plus a NULL check, an `XRT_DP_<API>_HAS_*` define, and an `offsetof`
+  `static_assert`. **Purely additive**, so no `XRT_PLUGIN_API_VERSION_CURRENT` bump (ADR-020).
+- **The pitch never leaves the plug-in.** Two points go in, one comes back. The runtime holds
+  no lens parameter and derives none; that is the ADR-019 line, and it is the reason this is
+  a slot rather than a `get_lens_pitch()`.
+- **Both coordinates.** A lenticular lattice is slanted, so the invariant is generally
+  `x + slant·y`, not `x`. Snap on the invariant and return the `x` it implies for the given
+  `y`; the runtime does no arithmetic of its own on the result.
+- **Absolute screen pixels**, because phase is absolute. Only the top-left is snapped — the
+  caller keeps the size (on an edge-resize the caller compensates the extent itself).
+- **A pure query.** It must not move a window, re-phase a live weaver, or touch the hardware
+  lens state, and it must be cheap and non-blocking: on Windows it runs inside the window
+  proc's `WM_WINDOWPOSCHANGING`, and on Linux it can be called once per pointer-motion event.
+- **Optional.** An absent slot or a `false` return means "no lattice to snap to" and the
+  caller keeps its proposed position — which is what every platform did before the slot
+  existed, and what `sim_display` does today (anaglyph has no lattice).
+- **Who calls it.** The window owner, whoever that is: the runtime's own window proc for a
+  runtime-owned window, the D3D11 service for a cross-process present owner, and — on
+  desktop Linux, where a client cannot hook the window manager's drag — the **app**, through
+  `xrWeaveSnapWindowRectDXR`. The Vulkan compositor additionally passes the origin it feeds
+  `set_present_origin` through the slot once per window move, as a guard against a
+  mid-flight metrics read. That last one is belt-and-braces: quantising a fed origin while
+  the window sits off-lattice would displace the interlace against the lens by up to half a
+  period, which is worse than not snapping at all.
+
 ## Frame-timing inputs are an offer, never a requirement
 
 The runtime does a lot of work to make each frame reach the panel as late and
