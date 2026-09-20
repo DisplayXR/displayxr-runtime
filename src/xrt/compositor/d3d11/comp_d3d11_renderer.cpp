@@ -13,6 +13,8 @@
 #include "comp_d3d11_swapchain.h"
 
 #include "util/comp_layer_accum.h"
+// #1580: the ONE per-view camera every layer type is projected through.
+#include "util/comp_layer_view_camera.h"
 #include "util/u_logging.h"
 #include "math/m_api.h"
 
@@ -864,28 +866,9 @@ render_projection_layer(struct comp_d3d11_renderer *r,
 	internals.context->PSSetShaderResources(0, 1, &null_srv);
 }
 
-static bool
-is_layer_view_visible(const struct xrt_layer_data *data, uint32_t view_index)
-{
-	enum xrt_layer_eye_visibility visibility;
-
-	switch (data->type) {
-	case XRT_LAYER_QUAD: visibility = data->quad.visibility; break;
-	case XRT_LAYER_CYLINDER: visibility = data->cylinder.visibility; break;
-	case XRT_LAYER_EQUIRECT1: visibility = data->equirect1.visibility; break;
-	case XRT_LAYER_EQUIRECT2: visibility = data->equirect2.visibility; break;
-	case XRT_LAYER_CUBE: visibility = data->cube.visibility; break;
-	default: return true; // Projection layers visible in both
-	}
-
-	switch (visibility) {
-	case XRT_LAYER_EYE_VISIBILITY_NONE: return false;
-	case XRT_LAYER_EYE_VISIBILITY_LEFT_BIT: return view_index == 0;
-	case XRT_LAYER_EYE_VISIBILITY_RIGHT_BIT: return view_index == 1;
-	case XRT_LAYER_EYE_VISIBILITY_BOTH: return true;
-	default: return true;
-	}
-}
+// #1580: the local view_index == 0 / == 1 visibility rule that lived here is
+// gone -- is_layer_view_visible_n() in util/comp_layer_view_camera.h is the
+// shared, view-count-aware form (identical for 1- and 2-view frames).
 
 static void
 get_color_scale_bias(const struct xrt_layer_data *data, float color_scale[4], float color_bias[4])
@@ -918,6 +901,7 @@ static void
 render_quad_layer(struct comp_d3d11_renderer *r,
                   const struct comp_layer *layer,
                   uint32_t view_index,
+                  uint32_t view_count,
                   const struct xrt_pose *view_pose,
                   const struct xrt_fov *fov)
 {
@@ -925,8 +909,11 @@ render_quad_layer(struct comp_d3d11_renderer *r,
 	const struct xrt_layer_data *data = &layer->data;
 	const struct xrt_layer_quad_data *q = &data->quad;
 
-	// Check visibility for this eye
-	if (!is_layer_view_visible(data, view_index)) {
+	// Check visibility for this eye. View-count aware (#1580): the local
+	// view_index == 0 / == 1 rule silently dropped an eye-specific quad in
+	// every view beyond the second, which a 2x2 quad mode has. Identical to
+	// the old rule for 1- and 2-view frames.
+	if (!is_layer_view_visible_n(data, view_index, view_count)) {
 		return;
 	}
 
@@ -1363,12 +1350,13 @@ set_view_viewport(struct comp_d3d11_renderer *renderer,
 
 extern "C" xrt_result_t
 comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
-                                          struct comp_layer_accum *layers,
-                                          struct xrt_vec3 *left_eye,
-                                          struct xrt_vec3 *right_eye,
-                                          uint32_t target_width,
-                                          uint32_t target_height,
-                                          const struct comp_d3d11_eff_layout *layout)
+                                         struct comp_layer_accum *layers,
+                                         struct xrt_vec3 *left_eye,
+                                         struct xrt_vec3 *right_eye,
+                                         uint32_t target_width,
+                                         uint32_t target_height,
+                                         const struct xrt_window_metrics *canvas,
+                                         const struct comp_d3d11_eff_layout *layout)
 {
 	auto internals = get_internals(renderer->c);
 
@@ -1405,23 +1393,39 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
 	internals.context->OMSetDepthStencilState(renderer->depth_stencil_state, 0);
 	internals.context->OMSetBlendState(renderer->blend_opaque, nullptr, 0xFFFFFFFF);
 
-	// Default view poses and FOVs for non-projection 3D-positioned layers
-	// (quad / cylinder / equirect / cube). Projection layers carry their
-	// own per-view pose/FOV inside layer->data.proj.v[i]; these defaults
-	// are only consumed when a layer doesn't.
-	struct xrt_pose view_poses[2];
-	struct xrt_fov fovs[2];
-	view_poses[0] = {{0.0f, 0.0f, 0.0f, 1.0f}, {-0.032f, 0.0f, 0.0f}};
-	view_poses[1] = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.032f, 0.0f, 0.0f}};
-	const float fov_angle = 0.785f; // ~45 degrees
-	for (uint32_t view = 0; view < 2; view++) {
-		fovs[view].angle_left = -fov_angle;
-		fovs[view].angle_right = fov_angle;
-		fovs[view].angle_up = fov_angle;
-		fovs[view].angle_down = -fov_angle;
-	}
-
 	uint32_t effective_views = layout->views;
+
+	/*
+	 * #1580 -- ONE camera per view per frame, shared by every layer type: the
+	 * {pose, fov} xrLocateViews returned, in the compositor's head-relative
+	 * layer space. render_projection_layer() is an identity-MVP fullscreen
+	 * blit, so the view tile IS that frustum; a quad composed through any
+	 * other camera therefore lands on different display pixels than
+	 * projection content at the same world pose (which is exactly what the
+	 * CTS composition set catches). Resolution lives in comp_util so every
+	 * backend shares it -- see comp_layer_view_camera.h for the three
+	 * branches and the once-latched fallback warning.
+	 *
+	 * The canvas metrics feed branch (b) only (a quad-only frame, where
+	 * there is no app camera to borrow). They are optional: without them the
+	 * resolver falls back, it does not fail.
+	 */
+	const bool have_wm =
+	    canvas != nullptr && canvas->valid && canvas->window_width_m > 0.0f && canvas->window_height_m > 0.0f;
+	// Where the canvas centre sits in the layer space: in-process the head is
+	// at the DISPLAY-plane centre, so an off-centre window tilts the frustum
+	// without moving the view pose.
+	const struct xrt_vec3 canvas_center =
+	    have_wm ? xrt_vec3{canvas->window_center_offset_x_m, canvas->window_center_offset_y_m,
+	                       canvas->window_center_offset_z_m}
+	            : xrt_vec3{0.0f, 0.0f, 0.0f};
+	struct comp_layer_view_camera cameras[XRT_MAX_VIEWS] = {};
+	for (uint32_t view = 0; view < effective_views && view < XRT_MAX_VIEWS; view++) {
+		struct xrt_vec3 *eye = (view == 0) ? left_eye : right_eye;
+		comp_layer_view_camera_select_ex(layers, view, eye, have_wm ? &canvas_center : nullptr,
+		                                 have_wm ? canvas->window_width_m : 0.0f,
+		                                 have_wm ? canvas->window_height_m : 0.0f, &cameras[view]);
+	}
 
 	for (uint32_t view_index = 0; view_index < effective_views; view_index++) {
 		set_view_viewport(renderer, view_index, layout, target_width, target_height);
@@ -1476,10 +1480,14 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
 				break;
 			}
 
-			case XRT_LAYER_QUAD:
-				render_quad_layer(renderer, layer, view_index, &view_poses[view_index],
-				                  &fovs[view_index]);
+			case XRT_LAYER_QUAD: {
+				if (view_index >= XRT_MAX_VIEWS) {
+					break;
+				}
+				render_quad_layer(renderer, layer, view_index, effective_views,
+				                  &cameras[view_index].pose, &cameras[view_index].fov);
 				break;
+			}
 
 			case XRT_LAYER_CYLINDER: {
 				static bool cylinder_warned = false;
@@ -1551,10 +1559,11 @@ comp_d3d11_renderer_draw(struct comp_d3d11_renderer *renderer,
                          struct xrt_vec3 *right_eye,
                          uint32_t target_width,
                          uint32_t target_height,
+                         const struct xrt_window_metrics *canvas,
                          const struct comp_d3d11_eff_layout *layout)
 {
-	xrt_result_t xret = comp_d3d11_renderer_draw_projection_pass(
-	    renderer, layers, left_eye, right_eye, target_width, target_height, layout);
+	xrt_result_t xret = comp_d3d11_renderer_draw_projection_pass(renderer, layers, left_eye, right_eye,
+	                                                             target_width, target_height, canvas, layout);
 	if (xret != XRT_SUCCESS) {
 		return xret;
 	}
