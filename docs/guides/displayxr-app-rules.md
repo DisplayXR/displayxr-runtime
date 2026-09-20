@@ -160,11 +160,30 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
      because step 3 already put the window on the right output.
 
   Result: client `3840x2160+3456+0`, no frame, window origin ≡ panel origin — which is what
-  the weave phase depends on. A *windowed* size keeps plain create-at-position (it is a
-  deliberate off-centre-Kooima run and the WM is free to decorate it). Reference
-  implementation: `test_apps/common/dxr_linux_window.cpp` (`DxrLinuxWindow::create_x11`,
+  the weave phase depends on. Reference implementation:
+  `test_apps/common/dxr_linux_window.cpp` (`DxrLinuxWindow::create_x11`,
   `DXR_X11_NO_FULLSCREEN=1` opts out); the runtime's hosted window does the XCB equivalent in
   `src/xrt/compositor/vk_native/comp_vk_native_window_xcb.c` (#723).
+
+  **X11 windowed: own your drag, and snap it through `xrWeaveSnapWindowRectDXR` (#1588).**
+  A *windowed* handle app is free to sit off-centre (a deliberate off-centre-Kooima run),
+  but it is not free to let the window manager move it. The interlace phase is a function
+  of the window's absolute position in physical panel pixels, so a WM-owned drag re-lands
+  the phase on an arbitrary pixel every frame and the 3D shimmers; and a mutter
+  `_NET_WM_MOVERESIZE` grab cannot be intercepted by the client, which is where Windows
+  hooks the same problem (`WM_WINDOWPOSCHANGING` → the DP's `snap_window_rect`). So a
+  windowed X11 app should go undecorated (`_MOTIF_WM_HINTS decorations = 0`, as in step 1
+  above) and **own the drag itself**: button-1 press → latch the pointer position and the
+  window's root origin as the drag origin; motion → target = origin + pointer delta,
+  coalescing the queued `MotionNotify` and acting on the last; pass (origin, target) to
+  `xrWeaveSnapWindowRectDXR` and `XMoveWindow` to the returned point; release → ungrab.
+  Snapping, not correcting, is the cure — the window only ever lands on the lens lattice,
+  so the woven pattern is identical at every position the drag visits. The lattice (pitch,
+  slant) is the vendor's and never leaves the display processor; the app only asks where it
+  may land. Where the DP has no lattice snap the call returns the target unchanged and the
+  drag is merely unsnapped, so wire it unconditionally. Reference implementation:
+  `DxrLinuxWindow::set_snap_provider` + `test_apps/common/dxr_weave_snap.h`
+  (`DXR_X11_WM_DECORATIONS=1` restores the decorated, WM-dragged window).
 
   **Wayland substitute.** A Wayland client is never told where it is and cannot place
   itself, so there is no position to create at. The compliant substitute is
