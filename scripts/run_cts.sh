@@ -219,12 +219,12 @@ if [ -z "${DISPLAY:-}" ]; then
 fi
 
 # ---- software Vulkan ICD (lavapipe) ------------------------------------------
-# The hosted runner has no GPU. Mesa's lavapipe ships as
-# /usr/share/vulkan/icd.d/lvp_icd.<arch>.json in mesa-vulkan-drivers; pinning
-# VK_DRIVER_FILES to it makes the choice explicit AND excludes any other ICD
-# that happens to be installed, so a result file can never be ambiguous about
-# which implementation produced it (#1525's lesson: a CTS XML records the
-# graphics PLUGIN, never the renderer that answered it).
+# The hosted runner has no GPU. Mesa's lavapipe comes from the
+# mesa-vulkan-drivers package; pinning VK_DRIVER_FILES to its manifest makes
+# the choice explicit AND excludes any other ICD that happens to be installed,
+# so a result file can never be ambiguous about which implementation produced
+# it (#1525's lesson: a CTS XML records the graphics PLUGIN, never the
+# renderer that answered it).
 #
 # DISCOVERY IS BY CONTENT, NOT BY FILENAME, and that is not paranoia — it is
 # the bug this lane already hit. Upstream Mesa installs
@@ -443,7 +443,14 @@ echo "EXITCODE: $RC"
     echo "software:   (none — running against whatever ICD the box provides)"
   fi
   if command -v vulkaninfo >/dev/null 2>&1; then
-    echo "vulkaninfo --summary:"
+    # deviceName FIRST: the head of --summary is instance extensions and
+    # layers, and 40 lines of those pushed the one line that says WHICH
+    # implementation answered off the end of the identity file.
+    echo "vulkaninfo devices:"
+    vulkaninfo --summary 2>/dev/null |
+      grep -aE 'GPU[0-9]|deviceName|driverName|driverInfo|driverVersion|deviceType|apiVersion' |
+      sed 's/^/  /'
+    echo "vulkaninfo --summary (head):"
     vulkaninfo --summary 2>/dev/null | sed -n '1,40p' | sed 's/^/  /'
   else
     echo "vulkaninfo: (not installed — apt: vulkan-tools)"
