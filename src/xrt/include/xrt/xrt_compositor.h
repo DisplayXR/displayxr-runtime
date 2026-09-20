@@ -538,8 +538,34 @@ struct xrt_layer_data
 };
 
 /*!
+ * One view's camera for this frame (#1580): the `{pose, fov}` the runtime
+ * reports at `xrLocateViews` for @ref xrt_layer_frame_data::display_time_ns,
+ * expressed in the SAME head-relative space every layer pose in this frame is
+ * expressed in (what `handle_space()` in the OpenXR state tracker outputs, i.e.
+ * the space of `xrt_layer_quad_data::pose` and
+ * `xrt_layer_projection_view_data::pose`).
+ *
+ * This exists because a compositor cannot re-derive it. The located view is a
+ * function of session state the compositor does not have — the qwerty /
+ * XR_DXR_view_rig tunables (which select a CAMERA-centric frustum whose vFOV is
+ * fixed and whose shear is the convergence, not the panel's Kooima frustum at
+ * all), the external-window flag, the zone chain, and the head device pose.
+ *
+ * @ingroup xrt_iface comp_client
+ */
+struct xrt_frame_view_camera
+{
+	struct xrt_pose pose;
+	struct xrt_fov fov;
+};
+
+/*!
  * Per frame data for the layer submission calls, used in
  * @ref xrt_compositor::layer_begin.
+ *
+ * POD with no pointers, copied whole into the IPC shared-memory slot
+ * (`ipc_layer_slot::data`), so fields added here cross the IPC boundary with no
+ * serialisation work — see @ref ipc-design.
  */
 struct xrt_layer_frame_data
 {
@@ -547,6 +573,17 @@ struct xrt_layer_frame_data
 	XRT_ALIGNAS(8) int64_t frame_id;
 	int64_t display_time_ns;
 	enum xrt_blend_mode env_blend_mode;
+
+	/*!
+	 * #1580: this frame's per-view cameras, or @c cameras_valid false when
+	 * the state tracker had none to report (no layer needed one, or the
+	 * locate failed). Filled only when the frame carries a 3D-positioned
+	 * non-projection layer (quad / cylinder / equirect / cube) — the only
+	 * consumer — so a projection-only frame pays nothing.
+	 */
+	struct xrt_frame_view_camera cameras[XRT_MAX_VIEWS];
+	uint32_t camera_count;
+	bool cameras_valid;
 };
 
 

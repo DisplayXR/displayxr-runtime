@@ -2946,6 +2946,46 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 	    .env_blend_mode = blend_mode,
 	};
 
+	/*
+	 * #1580: hand the compositor THIS frame's per-view cameras — the
+	 * {pose, fov} xrLocateViews reports for this display time, in the same
+	 * head-relative space handle_space() puts every layer pose into below.
+	 *
+	 * A projection layer carries its own camera in proj.v[i].{pose,fov} and
+	 * is drawn as an identity-MVP blit, so the compositor prefers that and
+	 * needs nothing from here. Everything else — quad, cylinder, equirect,
+	 * cube — is projected by the compositor and has NO camera of its own;
+	 * without this it would be composed through a frustum re-derived from
+	 * the DP eye, which cannot reproduce a camera-centric (qwerty /
+	 * XR_DXR_view_rig) frustum at all.
+	 *
+	 * Gated on such a layer being present so the common projection-only
+	 * frame pays nothing: the locate costs a device pose fetch (an IPC round
+	 * trip in service mode) that a frame with no consumer must not pay.
+	 */
+	{
+		bool needs_camera = false;
+		for (uint32_t i = 0; i < frameEndInfo->layerCount && !needs_camera; i++) {
+			switch (frameEndInfo->layers[i]->type) {
+			case XR_TYPE_COMPOSITION_LAYER_QUAD:
+			case XR_TYPE_COMPOSITION_LAYER_CUBE_KHR:
+			case XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR:
+			case XR_TYPE_COMPOSITION_LAYER_EQUIRECT_KHR:
+			case XR_TYPE_COMPOSITION_LAYER_EQUIRECT2_KHR: needs_camera = true; break;
+			default: break;
+			}
+		}
+		if (needs_camera) {
+			uint32_t camera_count = 0;
+			XrResult cam_ret = oxr_session_frame_view_cameras( //
+			    log, sess, frameEndInfo->displayTime, &camera_count, data.cameras);
+			if (cam_ret == XR_SUCCESS && camera_count > 0) {
+				data.camera_count = camera_count;
+				data.cameras_valid = true;
+			}
+		}
+	}
+
 	xrt_result_t xret;
 	xret = xrt_comp_layer_begin(xc, &data);
 	OXR_CHECK_XRET(log, sess, xret, xrt_comp_layer_begin);
