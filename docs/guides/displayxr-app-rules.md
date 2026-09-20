@@ -136,6 +136,36 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   position** → create session with the binding. Hosted apps need none of this — the runtime
   places its own window (#715).
 
+  **X11/XWayland: create-at-the-panel-position is not enough for a panel-sized window.**
+  mutter (GNOME, the Ubuntu default, X11 apps via XWayland) **discards every client
+  geometry signal** for a toplevel that size — create-time x/y, `WM_NORMAL_HINTS`
+  `USPosition`, and the post-map `XMoveWindow`/ConfigureRequest alike — **and decorates it**.
+  Observed on a 3456×2160 primary + 3840×2160 panel at `+3456+0`: the app asked for
+  3840×2160 at (3456, 0) and got a 3840×**2086** client at (3456, **74**), reparented under
+  `mutter-x11-frames` — 74 px of title bar eaten out of the weave (#729). So when your
+  window size equals the panel size, **place it by going fullscreen on the panel's monitor**,
+  in this order (each step is load-bearing):
+
+  1. `_MOTIF_WM_HINTS` with `decorations = 0` **before** the map, so no frame is ever created.
+  2. `XMapWindow` — a position request before the map is discarded.
+  3. `XMoveWindow` to the panel's `left/top`, then **pump events briefly** (bounded: a few
+     hundred ms, or until the window's root origin lands inside the target monitor — never
+     an unbounded wait). mutter fullscreens onto whichever output the window *currently*
+     occupies, so it has to arrive there first.
+  4. `_NET_WM_STATE` ClientMessage to the **root** window adding `_NET_WM_STATE_FULLSCREEN`
+     (`_NET_WM_STATE_ADD`, source = 1, mask `SubstructureRedirect|SubstructureNotify`), then
+     `_NET_WM_FULLSCREEN_MONITORS` with the panel's RandR monitor index on all four edges
+     (`XRRGetMonitors`, matching the monitor whose origin is — or that contains — the
+     reported `left/top`). Without Xrandr, the plain fullscreen request alone still works,
+     because step 3 already put the window on the right output.
+
+  Result: client `3840x2160+3456+0`, no frame, window origin ≡ panel origin — which is what
+  the weave phase depends on. A *windowed* size keeps plain create-at-position (it is a
+  deliberate off-centre-Kooima run and the WM is free to decorate it). Reference
+  implementation: `test_apps/common/dxr_linux_window.cpp` (`DxrLinuxWindow::create_x11`,
+  `DXR_X11_NO_FULLSCREEN=1` opts out); the runtime's hosted window does the XCB equivalent in
+  `src/xrt/compositor/vk_native/comp_vk_native_window_xcb.c` (#723).
+
   **Wayland substitute.** A Wayland client is never told where it is and cannot place
   itself, so there is no position to create at. The compliant substitute is
   `xdg_toplevel_set_fullscreen()` on the `wl_output` matched to the reported panel rect
