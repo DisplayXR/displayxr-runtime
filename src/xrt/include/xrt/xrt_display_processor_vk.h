@@ -501,6 +501,42 @@ struct xrt_display_processor_vk
 	 * generally `x + slant * y`, not `x` alone — which is why BOTH
 	 * coordinates are passed and BOTH may come back changed.
 	 *
+	 * ## The two points must be in the SAME frame; WHICH frame is irrelevant
+	 *
+	 * Only the DISPLACEMENT is used. The vendor implementation canonicalises
+	 * `target - origin`, snaps that from (0, 0), and re-adds the origin; the
+	 * phase search minimises `remainder(ph - ph0, 1.0)` with
+	 * `ph = (x + slant * y) / pitch`, so a constant added to BOTH points
+	 * shifts `ph` and `ph0` equally and cancels exactly. The lattice is
+	 * anchored to the DRAG ORIGIN, not to the panel's or the desktop's.
+	 *
+	 * Desktop-absolute and panel-relative therefore produce the identical
+	 * snapped window, and the runtime must NOT convert between them — no
+	 * conversion is required, and one is not permitted. The only way to break
+	 * this call is to MIX frames between the two arguments, which is exactly
+	 * what a partial conversion would risk. (It would also have to ask the
+	 * platform where the panel is, and on Linux `srDisplayGetLocation` is the
+	 * call that answers (0,0) under XWayland.)
+	 *
+	 * ## DEVICE pixels, never logical/scaled ones
+	 *
+	 * Translation cancels; a SCALE FACTOR does not. On a fractionally-scaled
+	 * output a displacement expressed in logical pixels arrives multiplied by
+	 * the scale, snaps to the wrong lattice point, and still looks entirely
+	 * plausible. Pass raw device pixels. (The DS1 is safe because XWayland
+	 * reports it 1:1 native; a 1.667-scaled laptop eDP is not.)
+	 *
+	 * ## A snap PRESERVES a phase, it does not find a good one
+	 *
+	 * The result is the nearest position with the SAME phase the window
+	 * already had at @p origin_x / @p origin_y. A window that was badly phased
+	 * to begin with stays badly phased, and the call still succeeds — success
+	 * is not a statement that the 3D is correct, only that the drag did not
+	 * make it worse. A correct result also never travels far: the vendor
+	 * search radius is 2, so a snapped point more than ~2 px from the target
+	 * in canonical space means something is wrong (most likely mixed frames or
+	 * scaled pixels), not that the pitch is large.
+	 *
 	 * Called from the window/drag path (never per weave) and, as
 	 * belt-and-braces, once per origin CHANGE from the compositor's present-
 	 * origin feed. Must be cheap, non-blocking and free of side effects: it
@@ -513,12 +549,12 @@ struct xrt_display_processor_vk
 	 * gated by the variant's `base.struct_size`).
 	 *
 	 * @param      xdp       Pointer to self.
-	 * @param      origin_x  Drag-start window left, absolute screen px.
-	 * @param      origin_y  Drag-start window top, absolute screen px.
-	 * @param      target_x  Proposed window left, absolute screen px.
-	 * @param      target_y  Proposed window top, absolute screen px.
-	 * @param[out] out_x     Phase-snapped window left, absolute screen px.
-	 * @param[out] out_y     Phase-snapped window top, absolute screen px.
+	 * @param      origin_x  Drag-start window left, device px.
+	 * @param      origin_y  Drag-start window top, device px.
+	 * @param      target_x  Proposed window left, device px, SAME frame as the origin.
+	 * @param      target_y  Proposed window top, device px, SAME frame as the origin.
+	 * @param[out] out_x     Phase-snapped window left, in the caller's frame.
+	 * @param[out] out_y     Phase-snapped window top, in the caller's frame.
 	 * @return true if a snap was produced (out_x/out_y valid); false ⟹ the
 	 *         caller uses target_x/target_y unchanged.
 	 */
@@ -1004,7 +1040,11 @@ xrt_display_processor_vk_get_last_frame_dropped(struct xrt_display_processor_vk 
 /*!
  * @copydoc xrt_display_processor_vk::snap_window_rect
  *
- * Helper for calling through the function pointer. Returns false when the slot
+ * Helper for calling through the function pointer. Pass both points in ONE
+ * frame of DEVICE pixels - see the slot's doc comment; the wrapper does no
+ * conversion, because none is correct.
+ *
+ * Returns false when the slot
  * is absent (older plug-in `struct_size`) or NULL - and then writes the TARGET
  * through to out_x/out_y, so an identity snap is always safe to use: a caller
  * may ignore the return value and still get a valid position. That is

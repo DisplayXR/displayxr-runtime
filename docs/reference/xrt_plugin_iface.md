@@ -416,8 +416,22 @@ bool (*snap_window_rect)(struct xrt_display_processor_vk *xdp, /* or _d3d11 */
 - **Both coordinates.** A lenticular lattice is slanted, so the invariant is generally
   `x + slant·y`, not `x`. Snap on the invariant and return the `x` it implies for the given
   `y`; the runtime does no arithmetic of its own on the result.
-- **Absolute screen pixels**, because phase is absolute. Only the top-left is snapped — the
-  caller keeps the size (on an edge-resize the caller compensates the extent itself).
+- **One frame, and it does not matter which.** Only `target - origin` is used: the vendor
+  canonicalises the displacement, snaps from (0,0) and re-adds the origin, and the phase
+  search minimises `remainder(ph - ph0, 1.0)` — so a constant added to both points cancels.
+  The lattice is anchored to the **drag origin**, not the panel or the desktop.
+  Desktop-absolute and panel-relative give the identical answer, so **the runtime performs
+  no conversion, on any platform**. The only thing that breaks this call is *mixing* frames
+  between the two arguments.
+- **Device pixels, never logical/scaled ones.** Translation cancels; a scale factor does
+  not. A displacement in logical pixels on a fractionally-scaled output arrives multiplied
+  and snaps to the wrong lattice point while still looking plausible.
+- **A snap preserves the phase the window already had** — it does not search for a good one.
+  Success on a badly-phased window keeps it badly phased. A correct result also never moves
+  more than ~2 px in canonical space (the vendor search radius is 2); further than that means
+  mixed frames or scaled pixels, not a large pitch.
+- Only the top-left is snapped — the caller keeps the size (on an edge-resize the caller
+  compensates the extent itself).
 - **A pure query.** It must not move a window, re-phase a live weaver, or touch the hardware
   lens state, and it must be cheap and non-blocking: on Windows it runs inside the window
   proc's `WM_WINDOWPOSCHANGING`, and on Linux it can be called once per pointer-motion event.

@@ -9914,8 +9914,10 @@ vk_update_present_origin(struct comp_vk_native_compositor *c)
 	 * metrics read caught it a pixel or two mid-flight. On a window the owner
 	 * snapped, the snap here is a no-op by construction.
 	 *
-	 * The snap ABI is in ABSOLUTE screen pixels (phase is absolute), so we snap
-	 * the window's absolute top-left and re-derive the panel-relative origin.
+	 * Both points here are the window's absolute top-left in DEVICE pixels —
+	 * one frame, consistently, which is the slot's whole requirement (it uses
+	 * only the displacement, so which absolute frame this is does not matter;
+	 * mixing two would). We then re-derive the panel-relative origin to feed.
 	 * Only when the window actually moved: the slot is a pure query, but it is
 	 * a vendor call and this function runs on every weave. A fullscreen window
 	 * at the panel origin is identity — skip it entirely.
@@ -10197,6 +10199,11 @@ comp_vk_native_compositor_snap_window_rect(struct xrt_compositor *xc,
 	// the window does the moving (that is the whole point — a snapped ORIGIN
 	// fed to a window that did not move would displace the interlace against
 	// the lens, which is worse than not snapping at all).
+	//
+	// The app's coordinates go through verbatim. The slot canonicalises
+	// target-minus-origin and snaps from there, so the absolute frame cancels;
+	// what must hold is that both points share one frame of DEVICE pixels, and
+	// they do — they came from the same caller in the same call.
 	return xrt_display_processor_vk_snap_window_rect((struct xrt_display_processor_vk *)c->display_processor,
 	                                                 origin_x, origin_y, target_x, target_y, out_x, out_y);
 }

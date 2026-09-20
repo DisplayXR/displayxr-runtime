@@ -18,12 +18,27 @@
  *    because its callers feed the result straight on. A caller that ignored the
  *    return value and got uninitialised coordinates would move a window to
  *    garbage.
+ * 3. **The absolute frame cancels, so the runtime must not convert.** The
+ *    vendor uses only `target - origin`: it canonicalises the displacement,
+ *    snaps from (0, 0) and re-adds the origin, and its phase search minimises
+ *    `remainder(ph - ph0, 1.0)`. A constant added to BOTH points shifts `ph`
+ *    and `ph0` equally. The fake below models exactly that shape rather than
+ *    snapping an absolute coordinate, because a fake that snapped absolutely
+ *    would happily pass a runtime that converted frames — and converting is
+ *    the thing that could only ever introduce a mismatch between the two
+ *    arguments.
+ *
+ * What these tests deliberately do NOT cover: units. Translation cancels, a
+ * scale factor does not, so device-vs-logical pixels is a real failure mode —
+ * but it lives at the call sites that read window geometry, not in this
+ * arithmetic, and a unit test here could only restate the multiplication.
  */
 
 #include "catch_amalgamated.hpp"
 
 #include "xrt/xrt_display_processor_vk.h"
 
+#include <cmath>
 #include <cstring>
 
 namespace {
@@ -34,11 +49,21 @@ bool g_answer = true;
 int32_t g_last_origin_x = 0, g_last_origin_y = 0;
 int32_t g_last_target_x = 0, g_last_target_y = 0;
 
+//! Pitch of the fake lattice below. Not a real number; a small one that moves.
+constexpr int32_t kPitch = 8;
+
 /*!
- * A stand-in for a vendor snap. Deliberately snaps on the SLANTED invariant
- * `u = x + y` with period 8 — not because 8 or a slant of 1.0 are real, but
- * because a y-dependent x snap is the shape the runtime must not assume away:
- * both coordinates go in and the x that comes back depends on both.
+ * A stand-in for a vendor snap, shaped like the real one.
+ *
+ * Two properties are modelled on purpose:
+ *
+ * - it snaps the SLANTED invariant `u = x + y` (slant 1.0), because a
+ *   y-dependent x snap is the shape the runtime must not assume away — both
+ *   coordinates go in and the x that comes back depends on both;
+ * - it works on the DISPLACEMENT and re-adds the origin, so the result
+ *   preserves the phase the window had at the origin and the absolute frame
+ *   cancels. Snapping `target` absolutely would be the easier fake and a
+ *   strictly worse one: it would not catch a caller that mixed frames.
  */
 bool
 fake_snap(struct xrt_display_processor_vk *xdp,
@@ -58,10 +83,13 @@ fake_snap(struct xrt_display_processor_vk *xdp,
 	if (!g_answer) {
 		return false;
 	}
-	const int32_t u = target_x + target_y;
-	const int32_t u_snap = ((u + 4) / 8) * 8;
-	*out_x = u_snap - target_y;
-	*out_y = target_y;
+	const int32_t dx = target_x - origin_x;
+	const int32_t dy = target_y - origin_y;
+	// Canonicalise, snap from (0, 0), re-add the origin.
+	const int32_t du = dx + dy;
+	const int32_t du_snap = (int32_t)std::lround((double)du / kPitch) * kPitch;
+	*out_x = origin_x + (du_snap - dy);
+	*out_y = origin_y + dy;
 	return true;
 }
 
@@ -153,18 +181,24 @@ TEST_CASE("dp_vk_snap: both coordinates reach the vendor, and both may come back
 	struct xrt_display_processor_vk dp = make_dp((uint32_t)sizeof(dp), /*with_fn=*/true);
 
 	int32_t x = 0, y = 0;
-	CHECK(xrt_display_processor_vk_snap_window_rect(&dp, 100, 200, 137, 211, &x, &y) == true);
+	CHECK(xrt_display_processor_vk_snap_window_rect(&dp, 100, 200, 137, 213, &x, &y) == true);
 	CHECK(g_called == true);
-	// The runtime forwards the pair verbatim — it does no arithmetic of its own.
+	// The runtime forwards the pair VERBATIM - it does no arithmetic of its own,
+	// and in particular no frame conversion.
 	CHECK(g_last_origin_x == 100);
 	CHECK(g_last_origin_y == 200);
 	CHECK(g_last_target_x == 137);
-	CHECK(g_last_target_y == 211);
-	// u = 137 + 211 = 348 -> nearest multiple of 8 is 352 -> x = 352 - 211 = 141.
-	CHECK(x == 141);
-	CHECK(y == 211);
-	// The invariant, not the coordinate, is what the snap preserves.
-	CHECK(((x + y) % 8) == 0);
+	CHECK(g_last_target_y == 213);
+	// displacement (37, 13) -> du = 50 -> nearest multiple of 8 is 48
+	// -> x = 100 + (48 - 13) = 135, y = 200 + 13 = 213.
+	CHECK(x == 135);
+	CHECK(y == 213);
+	// What a snap preserves is the ORIGIN's phase, not a coordinate.
+	CHECK((((x - 100) + (y - 200)) % kPitch) == 0);
+	// ...and it gets there by moving a little: 2 px of canonical travel here,
+	// which is also the vendor's actual search radius. A result far from the
+	// target means mixed frames or scaled pixels, not a large pitch.
+	CHECK(std::abs((x + y) - (137 + 213)) <= 2);
 }
 
 TEST_CASE("dp_vk_snap: NULL outputs are refused, not crashed")
@@ -173,4 +207,60 @@ TEST_CASE("dp_vk_snap: NULL outputs are refused, not crashed")
 	int32_t x = 0;
 	CHECK(xrt_display_processor_vk_snap_window_rect(&dp, 0, 0, 1, 2, nullptr, nullptr) == false);
 	CHECK(xrt_display_processor_vk_snap_window_rect(&dp, 0, 0, 1, 2, &x, nullptr) == false);
+}
+
+/*
+ * ── The absolute frame cancels (#1588) ───────────────────────────────────
+ *
+ * This is the property that says the runtime must not convert frames, so it is
+ * worth an assertion rather than only a comment in a header.
+ */
+
+TEST_CASE("dp_vk_snap: shifting BOTH points by a constant shifts the answer by that constant")
+{
+	g_answer = true;
+	struct xrt_display_processor_vk dp = make_dp((uint32_t)sizeof(dp), /*with_fn=*/true);
+
+	// The same drag expressed panel-relative, then desktop-absolute for a
+	// panel whose top-left sits at (3456, 12) - the DS1's real offset, whose
+	// x is a multiple of the fake pitch and whose y is deliberately not, so a
+	// frame-sensitive implementation could not pass by luck.
+	const int32_t off_x = 3456, off_y = 12;
+
+	int32_t px = 0, py = 0, ax = 0, ay = 0;
+	const bool a = xrt_display_processor_vk_snap_window_rect(&dp, 100, 200, 137, 213, &px, &py);
+	const bool b = xrt_display_processor_vk_snap_window_rect( //
+	    &dp, 100 + off_x, 200 + off_y, 137 + off_x, 213 + off_y, &ax, &ay);
+
+	CHECK(a == b);
+	CHECK(ax == px + off_x);
+	CHECK(ay == py + off_y);
+}
+
+TEST_CASE("dp_vk_snap: a snap PRESERVES the origin's phase rather than finding a good one")
+{
+	g_answer = true;
+	struct xrt_display_processor_vk dp = make_dp((uint32_t)sizeof(dp), /*with_fn=*/true);
+
+	// An origin deliberately off the lattice (u = 101 + 200 = 301, not a
+	// multiple of 8). A snap must NOT quietly fix that: the window keeps
+	// whatever phase it had, and the call still succeeds. Success means "the
+	// drag did not make it worse", never "the 3D is correct".
+	int32_t x = 0, y = 0;
+	CHECK(xrt_display_processor_vk_snap_window_rect(&dp, 101, 200, 138, 213, &x, &y) == true);
+	CHECK((((x - 101) + (y - 200)) % kPitch) == 0); // same phase as the origin
+	CHECK(((x + y) % kPitch) != 0);                 // still off the absolute lattice
+}
+
+TEST_CASE("dp_vk_snap: a zero-length drag is a no-op")
+{
+	g_answer = true;
+	struct xrt_display_processor_vk dp = make_dp((uint32_t)sizeof(dp), /*with_fn=*/true);
+
+	// target == origin => displacement 0 => already on the lattice relative to
+	// itself. The window must not twitch when the pointer has not moved.
+	int32_t x = 0, y = 0;
+	CHECK(xrt_display_processor_vk_snap_window_rect(&dp, 4156, 374, 4156, 374, &x, &y) == true);
+	CHECK(x == 4156);
+	CHECK(y == 374);
 }

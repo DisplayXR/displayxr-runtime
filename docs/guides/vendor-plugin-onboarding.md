@@ -323,7 +323,12 @@ That is the whole implementation, and it needs no other new mechanism:
   D3D11 variant (slot 18) and the Vulkan one (appended, #1588) with the same
   signature, so one body serves both. Snap on the invariant your lattice
   actually has — with a slant that is `x + slant·y`, not `x` — and expect to be
-  asked once per pointer-motion event, so keep it arithmetic.
+  asked once per pointer-motion event, so keep it arithmetic. **Use only the
+  displacement** (`target - origin`), snap that, and re-add the origin: the
+  runtime does not promise any particular absolute frame, only that both points
+  are in the same one, and anchoring to the drag origin is what makes that safe.
+  Preserve the phase the window had rather than searching for a better one — a
+  drag must not re-phase mid-motion.
 
 **A `SCANOUT` chip needs the runtime to own the whole panel.** That is the
 fullscreen, panel-native composition the service compositor already performs

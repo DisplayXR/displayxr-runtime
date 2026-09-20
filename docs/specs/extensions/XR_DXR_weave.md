@@ -408,11 +408,28 @@ land on lattice points, so the pattern is identical at every drag position.
 | Every other entry point | implemented | `XR_ERROR_FEATURE_UNSUPPORTED` |
 | Wayland | n/a | the compositor owns the move and never tells the client where it went, so snapping is impossible by construction — the call still resolves and returns the target unchanged |
 
-Semantics are the Windows ones verbatim: absolute screen pixels in and out, only the top-left
-is snapped, the extent passes through. **Both coordinates matter.** A lenticular lattice is
+Semantics are the Windows ones verbatim: screen pixels in and out, only the top-left is
+snapped, the extent passes through. **Both coordinates matter.** A lenticular lattice is
 slanted, so the quantity a vendor holds invariant is generally `x + slant·y`, not `x` alone —
 an `x` that comes back changed for an unchanged `y`, or vice versa, is correct behaviour and
 a caller must apply both.
+
+Two properties of the frame are worth stating, because both are easy to get wrong in a way
+that still looks like it works:
+
+- **`origin` and `target` must be in the SAME frame; which frame is irrelevant.** Only the
+  displacement is used — the vendor canonicalises `target - origin`, snaps from (0,0) and
+  re-adds the origin, so a constant common to both cancels. The lattice is anchored to the
+  drag origin, not the panel. Desktop-absolute is the documented choice here and the runtime
+  converts nothing on any platform; mixing the two frames between arguments is the one
+  genuine error.
+- **Device pixels, never logical ones.** Translation cancels, a scale factor does not. On a
+  fractionally-scaled output a logical-pixel displacement is multiplied by the scale and
+  snaps to the wrong lattice point — plausibly, and silently.
+
+`XR_SUCCESS` means the drag did not disturb the phase, **not** that the phase is good: a
+snap preserves whatever phase the window had at `origin`. A correct result also never moves
+the window more than ~2 px in canonical space.
 
 A display processor that does not implement the slot — `sim_display`, and every plug-in built
 before #1588 — reads as identity: the snapped rect equals the target, the call succeeds, and

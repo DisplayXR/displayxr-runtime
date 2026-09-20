@@ -284,7 +284,14 @@ comp_vk_native_compositor_set_wayland_surface_geometry(struct xrt_compositor *xc
  * lens pitch and slant never cross the boundary (ADR-019) — the runtime passes
  * two points and reads back one.
  *
- * Coordinates are ABSOLUTE SCREEN pixels, because interlace phase is absolute.
+ * Coordinates are DEVICE pixels, and this entry point passes the app's own
+ * desktop-absolute ones straight through. That is not a frame choice the
+ * runtime makes on the app's behalf: the slot uses only `target - origin`, so
+ * any frame works as long as BOTH points are in it, and converting here could
+ * only introduce the one error that matters - a mismatch between the two
+ * arguments. Device pixels DO matter: translation cancels, a scale factor does
+ * not. See @ref xrt_display_processor_vk::snap_window_rect.
+ *
  * Only the top-left is snapped; the caller keeps the size.
  *
  * @param      xc        A vk_native compositor.
