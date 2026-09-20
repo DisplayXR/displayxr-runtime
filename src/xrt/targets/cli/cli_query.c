@@ -1351,11 +1351,21 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 	r->display_info = info;
 	r->display_info_ok = true;
 
-	// #1301 — widen the plug-in's panel ORIGIN into the full monitor rect apps
-	// are told to place their window in. Same resolver, same inputs as the
-	// runtime, so `info` reports what an app would actually receive.
-	r->desktop_info_ok =
-	    os_display_desktop_info_at(info.display_screen_left, info.display_screen_top, &r->desktop_info);
+	// #1301 — resolve the full monitor rect apps are told to place their window
+	// in. Same resolver, same inputs as the runtime (origin, native pixel size
+	// and physical size), so `info` reports what an app would actually receive,
+	// including WHICH rule picked the monitor.
+	{
+		const struct os_display_panel_hint hint = {
+		    .screen_left = info.display_screen_left,
+		    .screen_top = info.display_screen_top,
+		    .pixel_width = info.display_pixel_width,
+		    .pixel_height = info.display_pixel_height,
+		    .width_m = info.display_width_m,
+		    .height_m = info.display_height_m,
+		};
+		r->desktop_info_ok = os_display_desktop_info_for_panel(&hint, &r->desktop_info, &r->desktop_match);
+	}
 	// Caller-DPI space on both sides — the plug-in's dims are virtualised
 	// whenever this process is DPI-unaware, so the physical rect is the wrong
 	// thing to compare them against.
@@ -1651,15 +1661,39 @@ cli_query_print_info_text(const struct cli_query_result *r)
 	// Baseline hint only — the authoritative scale is per rendering mode (below).
 	PT("view scale:   (%.3f, %.3f) (baseline hint; see per-mode scale)\n", (double)i->recommended_view_scale_x,
 	   (double)i->recommended_view_scale_y);
-	PT("screen pos:   (%d, %d)\n", i->display_screen_left, i->display_screen_top);
-	// #1301: the full monitor rect apps place windows into, plus the GDI device
-	// name. "primary-fallback" means the plug-in reported no panel position, so
-	// this is just the primary monitor.
-	PT("desktop rect: %ux%u at (%d, %d) on '%s'%s%s\n", r->desktop_info.width, r->desktop_info.height,
+	// The origin APPS ARE GIVEN, which is not always the one the plug-in
+	// reported: on a size match the runtime overrides a (0, 0) with the
+	// resolved rect's origin (see fill_display_desktop_info). Print both when
+	// they differ — a bug report needs the plug-in's raw answer too.
+	{
+		const bool overridden =
+		    r->desktop_info_ok && r->desktop_info_is_panel &&
+		    r->desktop_match.rule == OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH &&
+		    (r->desktop_info.left != i->display_screen_left || r->desktop_info.top != i->display_screen_top);
+		if (overridden) {
+			PT("screen pos:   (%d, %d)  [runtime override by size match; plug-in reported "
+			   "(%d, %d)]\n",
+			   r->desktop_info.left, r->desktop_info.top, i->display_screen_left, i->display_screen_top);
+		} else {
+			PT("screen pos:   (%d, %d)\n", i->display_screen_left, i->display_screen_top);
+		}
+	}
+	// #1301: the full monitor rect apps place windows into, plus the device
+	// name. The RULE is the point of this line as much as the rect: "origin"
+	// is the plug-in's own answer, "size match" is a deduction from the panel's
+	// native resolution, "physical-size match" found the right monitor running
+	// a non-native mode, and "primary fallback" found nothing at all and is
+	// just the monitor at the desktop origin.
+	PT("desktop rect: %ux%u at (%d, %d) on '%s'%s [rule: %s] [%s]\n", r->desktop_info.width, r->desktop_info.height,
 	   r->desktop_info.left, r->desktop_info.top,
 	   r->desktop_info.device_name[0] != 0 ? r->desktop_info.device_name : "?",
-	   r->desktop_info.is_primary ? " [primary]" : "",
-	   r->desktop_info_is_panel ? "" : " [primary-fallback: not panel-confirmed]");
+	   r->desktop_info.is_primary ? " [primary]" : "", os_display_desktop_rule_str(r->desktop_match.rule),
+	   r->desktop_info_is_panel ? "panel-confirmed" : "not panel-confirmed");
+	if (r->desktop_match.rule == OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH && r->desktop_match.candidate_count > 1) {
+		PT("              ** AMBIGUOUS: %u of %u monitors match the panel size; tie broken on physical "
+		   "size / non-primary\n",
+		   r->desktop_match.candidate_count, r->desktop_match.monitor_count);
+	}
 	char et_buf[64];
 	PT("eye-tracking: supported=%s (0x%x) default=%s\n",
 	   eye_modes_label(i->supported_eye_tracking_modes, et_buf, sizeof(et_buf)), i->supported_eye_tracking_modes,
@@ -1866,6 +1900,17 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 		cJSON_AddStringToObject(dr, "device_name", r->desktop_info.device_name);
 		cJSON_AddBoolToObject(dr, "is_primary", r->desktop_info.is_primary);
 		cJSON_AddBoolToObject(dr, "is_panel_confirmed", r->desktop_info_is_panel);
+		cJSON_AddStringToObject(dr, "rule", os_display_desktop_rule_str(r->desktop_match.rule));
+		cJSON_AddNumberToObject(dr, "match_candidates", (double)r->desktop_match.candidate_count);
+		cJSON_AddNumberToObject(dr, "monitors_enumerated", (double)r->desktop_match.monitor_count);
+		// True when the runtime publishes THIS rect's origin to apps in place
+		// of the (0, 0) the plug-in reported. `screen_pos` above stays the
+		// plug-in's raw answer.
+		cJSON_AddBoolToObject(dr, "origin_overrides_plugin",
+		                      r->desktop_info_ok && r->desktop_info_is_panel &&
+		                          r->desktop_match.rule == OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH &&
+		                          (r->desktop_info.left != i->display_screen_left ||
+		                           r->desktop_info.top != i->display_screen_top));
 		cJSON *et = cJSON_AddObjectToObject(d, "eye_tracking");
 		cJSON_AddNumberToObject(et, "supported_modes", (double)i->supported_eye_tracking_modes);
 		cJSON_AddNumberToObject(et, "default_mode", (double)i->default_eye_tracking_mode);

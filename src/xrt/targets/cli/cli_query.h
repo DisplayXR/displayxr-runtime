@@ -205,6 +205,12 @@ struct cli_query_result
 	 * Valid iff desktop_info_ok. */
 	struct os_display_desktop_info desktop_info;
 	bool desktop_info_ok;
+	/* Which rule picked that monitor (origin / size match / physical-size
+	 * match / primary fallback) and how ambiguous the choice was. A rect
+	 * deduced from a size match and one read off a reported origin are very
+	 * different evidence, and a bug report has to be able to tell them
+	 * apart. */
+	struct os_display_panel_match desktop_match;
 	/* True when the resolved monitor's mode equals the plug-in's reported
 	 * native panel resolution — i.e. we really did land on the 3D panel. */
 	bool desktop_info_is_panel;
