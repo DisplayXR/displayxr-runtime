@@ -284,6 +284,12 @@ static const char *optional_filtered_device_extensions[] = {
 DEBUG_GET_ONCE_BOOL_OPTION(vk_require_optional_filtered, "DXR_VK_REQUIRE_WIN32_EXTERNAL", false)
 #define OXR_OPTIONAL_FILTERED_ENV "DXR_VK_REQUIRE_WIN32_EXTERNAL"
 #define OXR_OPTIONAL_FILTERED_WHAT "Win32 external memory/semaphore/fence"
+/*!
+ * On Windows #1539 moved the trio OUT of `required_vk_device_extensions[]`, so
+ * the kill switch has to put it back there for `xrCreateVulkanDeviceKHR` too.
+ * Not so on Linux — see the note on the sibling below.
+ */
+#define OXR_OPTIONAL_FILTERED_WAS_REQUIRED
 
 #elif defined(XRT_OS_LINUX_DESKTOP) && defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_FD)
 #define OXR_HAVE_OPTIONAL_FILTERED_LIST
@@ -311,6 +317,15 @@ static const char *optional_filtered_device_extensions[] = {
 DEBUG_GET_ONCE_BOOL_OPTION(vk_require_optional_filtered, "DXR_VK_REQUIRE_LINUX_EXTERNAL", false)
 #define OXR_OPTIONAL_FILTERED_ENV "DXR_VK_REQUIRE_LINUX_EXTERNAL"
 #define OXR_OPTIONAL_FILTERED_WHAT "desktop-Linux dma-buf / DRM-modifier / fd-sync"
+/*
+ * Deliberately NOT defining OXR_OPTIONAL_FILTERED_WAS_REQUIRED here. Unlike the
+ * Win32 trio, these four were ALREADY optional for xrCreateVulkanDeviceKHR
+ * before #1576 — they are in optional_device_extensions[] and always have been.
+ * #1576 changed only the enable1 string, so the kill switch must restore only
+ * the enable1 string. Forcing them into the enable2 required set would be a new
+ * behaviour, not a rollback, and would break enable2 on the very software ICDs
+ * this lever exists to debug.
+ */
 #endif
 
 static const char *optional_device_extensions[] = {
@@ -804,9 +819,11 @@ oxr_vk_create_vulkan_device(struct oxr_logger *log,
 	struct u_string_list *device_extension_list =
 	    u_string_list_create_from_array(required_vk_device_extensions, ARRAY_SIZE(required_vk_device_extensions));
 
-#ifdef OXR_HAVE_OPTIONAL_FILTERED_LIST
-	// #1539/#1576 kill switch: put this platform's optional external
-	// extensions back in the REQUIRED set.
+#ifdef OXR_OPTIONAL_FILTERED_WAS_REQUIRED
+	// #1539 kill switch: put the extensions this platform moved out of
+	// required_vk_device_extensions[] back into it. Linux does not define
+	// OXR_OPTIONAL_FILTERED_WAS_REQUIRED — #1576 never took anything out of
+	// that list there, so there is nothing for the lever to restore here.
 	if (debug_get_bool_option_vk_require_optional_filtered()) {
 		oxr_log(log, OXR_OPTIONAL_FILTERED_ENV "=1: " OXR_OPTIONAL_FILTERED_WHAT " forced REQUIRED");
 		for (uint32_t i = 0; i < ARRAY_SIZE(optional_filtered_device_extensions); i++) {
