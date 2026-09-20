@@ -48,10 +48,16 @@
 # ever a candidate for this file: a device-creation failure takes out EVERY
 # session-creating test rather than a nameable few, and a crash is not a test
 # name — listing either would have been renaming a blocker as a flake. All
-# three are now fixed (#1539, #1542 via #1550, #1558 via #1560) and BOTH ARMS
-# GATE as of the all-arm zero-red run 35458623141 — on a run, not on "no known
-# blocker". Neither needs an entry here; if one ever does, it has to clear
-# rule 2 on its own evidence.
+# three are now fixed (#1539, #1542 via #1550, #1558 via #1560) and BOTH
+# WINDOWS ARMS GATE as of the all-arm zero-red run 35458623141 — on a run, not
+# on "no known blocker".
+#
+# The LINUX vulkan arms went the same way and are the second worked example:
+# enable1 handed the CTS four extension names a headless lavapipe does not
+# expose, so every session-creating test died at vkCreateDevice — 62 errors,
+# again not a nameable few. #1577 (issue #1576) filtered the string, the arms
+# went zero-red, and BOTH LINUX ARMS GATE too. No arm on either platform needs
+# an entry here; if one ever does, it has to clear rule 2 on its own evidence.
 # See docs/roadmap/cts-windows-handoff.md § Software-rasterizer tier.
 #
 # WHY THERE IS EXACTLY ONE ENTRY.

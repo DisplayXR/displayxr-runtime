@@ -22,9 +22,9 @@ name: OpenXR CTS
 # different runner. Folding them into one matrix would mean an `if:` on nearly
 # every step of the Windows arms, and the one thing this change must not do is
 # alter what those arms execute. Linux is Vulkan-only, so its arms are exactly
-# `vulkan` + `vulkan2` on Mesa **lavapipe** under **Xvfb**; they are
-# EXPERIMENTAL (reported, not gated) until a full run has earned the flip, the
-# same way every Windows arm did.
+# `vulkan` + `vulkan2` on Mesa **lavapipe** under **Xvfb**. Both GATE, having
+# earned it the same way every Windows arm did — a zero-red full run, not an
+# absent blocker. The whole hosted matrix (5 Windows + 2 Linux) now gates.
 #
 # ON WINDOWS the runtime is registered for the (elevated) Khronos loader via
 # HKLM ActiveRuntime — XR_RUNTIME_JSON is ignored when elevated.
@@ -241,19 +241,34 @@ jobs:
           # EMPTY Linux leg and both Linux jobs skip, for free.
           LINUX_ALL_ARMS="vulkan vulkan2"
 
-          # ===== THE LINUX EXPERIMENTAL FLAG — NOT empty, and that is the point.
+          # ===== THE LINUX EXPERIMENTAL FLAG — EMPTY, same as Windows =====
           # An arm named here runs with continue-on-error and is EXCLUDED FROM
           # THE GATE, but still reported with real counts in the summary table.
-          # Both Linux arms start here because the Windows arms did: the flip is
-          # earned by a whole-suite zero-red run, never by "no known blocker"
-          # (see the Windows history above — five arms, three runtime fixes and
-          # a software ICD between the first run and the empty string). Linux is
-          # also Preview rather than GA, so a red arm here is information first.
-          # TO GATE AN ARM: remove its name from this string. Nothing else in
-          # this file changes. Record the run that earned it in
-          # docs/roadmap/cts-windows-handoff.md § Linux arms.
-          EXPERIMENTAL_LINUX="vulkan vulkan2"
+          # BOTH LINUX ARMS NOW GATE, so the list is empty (#1527, #1523).
+          #
+          # TO RE-ADD AN ARM: put its name back in this string — nothing else
+          # in this file changes. Record the reason in
+          # docs/roadmap/cts-windows-handoff.md § Linux arms, and prefer this
+          # to deleting the arm: a reported-but-ungated arm still produces
+          # numbers every run, a deleted one produces silence.
+          EXPERIMENTAL_LINUX=""
           # =========================================================
+          # HOW THEY GOT HERE. Both arms started experimental, exactly as the
+          # Windows five did, and were flipped by a zero-red full run rather
+          # than by "no known blocker". The one real finding in between was
+          # #1576: xrGetVulkanDeviceExtensionsKHR was unfiltered off Windows,
+          # so enable1 (where the APP creates the VkDevice) handed the CTS four
+          # extension names a headless lavapipe does not expose and every
+          # session-creating test died at vkCreateDevice with
+          # ERROR_EXTENSION_NOT_PRESENT — 62 errors on `vulkan`, while
+          # `vulkan2` was clean because enable2 lets the runtime create the
+          # device. #1577 generalised the #1539 filter to every platform and
+          # took that to 0. Numbers and run links: § Linux arms in the doc.
+          #
+          # Linux remains Preview rather than GA, which was the second original
+          # reason for holding these ungated. It is not a reason to keep a
+          # zero-red arm out of the gate: an arm that passes and does not gate
+          # teaches the lane to ignore it.
 
           arms_linux=""
           for a in $arms; do
@@ -827,9 +842,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix_linux) }}
-    # Both Linux arms are experimental today, so this is true for both: they
-    # are REPORTED in the summary table with real counts and do not fail the
-    # lane. See EXPERIMENTAL_LINUX in `plan` for how the flip is earned.
+    # EXPERIMENTAL_LINUX is empty today, so this is false for both arms and a
+    # red Linux arm fails the lane. Stays wired for the re-add path — see
+    # EXPERIMENTAL_LINUX in `plan`.
     continue-on-error: ${{ matrix.experimental }}
     env:
       # Same stem as Windows on purpose — cts_ci_<graphics>.xml — so a Linux
@@ -1028,8 +1043,8 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # The lane's gate. Every arm's XML in one table; fails if any NON-experimental
-  # arm was red or produced nothing at all — which today is every WINDOWS arm
-  # (EXPERIMENTAL is empty) and neither Linux arm (both experimental, #1527).
+  # arm was red or produced nothing at all — and BOTH experimental strings are
+  # empty, so that is every arm on both platforms: 5 Windows + 2 Linux.
   # ---------------------------------------------------------------------------
   summary:
     name: CTS summary
@@ -1118,12 +1133,12 @@ jobs:
           lines += ["",
                     "**All five Windows arms gate on the hosted lane** (#1523) — `d3d11`/`d3d12` on",
                     "**WARP**, `opengl` on Mesa **llvmpipe**, `vulkan`/`vulkan2` on Mesa **lavapipe**",
-                    "(#1525). No Windows arm is exempt; a red one fails this lane.",
+                    "(#1525). A red arm fails this lane.",
                     "",
-                    "**Both Linux arms are EXPERIMENTAL** (#1527) — `vulkan`/`vulkan2` on Mesa",
-                    "**lavapipe** under **Xvfb**. They are reported with real counts and do NOT gate;",
-                    "Linux is Preview, not GA, so a red arm there is information first. The flip is",
-                    "earned by a zero-red full run, recorded in docs/roadmap/cts-windows-handoff.md.",
+                    "**Both Linux arms gate too** (#1527) — `vulkan`/`vulkan2` on Mesa **lavapipe**",
+                    "under **Xvfb**. The whole hosted matrix — 5 Windows + 2 Linux — is gated; no arm",
+                    "anywhere is exempt. Linux is still Preview rather than GA, but a zero-red arm that",
+                    "does not gate only teaches the lane to ignore it.",
                     "",
                     "One by-name exclusion applies, and only on the software tier (both platforms):",
                     "`Timed_Pipelined_Frame_Submission`, whose frame-timing overhead is the CPU",

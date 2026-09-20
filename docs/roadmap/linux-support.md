@@ -336,11 +336,20 @@ the `sim-display` plug-in. Hardware-free, at the same pinned CTS
 (`openxr-cts-1.1.63.0`) and the same test specs as the Windows arms, so the
 result files assemble into one submission package.
 
-Both arms are **experimental — reported with real counts, not gated**. Linux is
-Preview rather than GA, so a red arm here is information first; and the Windows
-arms each earned their gate with a whole-suite zero-red run rather than with
-"no known blocker". Same bar applies. The mechanism is one string,
-`EXPERIMENTAL_LINUX` in `cts.yml`'s `plan` job.
+Both arms **gate on the hosted lane** (lavapipe under Xvfb): a red Linux arm
+fails the lane exactly like a red Windows one, and the whole hosted matrix —
+5 Windows + 2 Linux — is now gated.
+
+They earned that the same way every Windows arm did, with a whole-suite zero-red
+run rather than with "no known blocker": `vulkan` 40062 assertions / 0 failures
+/ 0 errors and `vulkan2` 40046 / 0 / 0, once #1577 (issue #1576) filtered the
+`xrGetVulkanDeviceExtensionsKHR` string on Linux and took `vulkan` from 62
+errors to none. Linux being **Preview rather than GA** was the other reason for
+holding them ungated; it stopped applying once they were green, because an arm
+that passes and does not gate just teaches the lane to ignore it. The mechanism
+is still one string, `EXPERIMENTAL_LINUX` in `cts.yml`'s `plan` job — now empty;
+put an arm's name back to exempt it, and record why. Per-arm evidence:
+`docs/roadmap/cts-windows-handoff.md` § *Linux arms*.
 
 What this tier does **not** cover, and what still needs the real-GPU runner
 #1527 originally proposed: anything that depends on a real driver stack or a
