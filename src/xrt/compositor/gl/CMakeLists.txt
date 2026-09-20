@@ -12,6 +12,9 @@ add_library(
 	# comp_layer_accum has no Vulkan deps — compile directly to avoid pulling in comp_util
 	${CMAKE_CURRENT_SOURCE_DIR}/../util/comp_layer_accum.c
 	${CMAKE_CURRENT_SOURCE_DIR}/../util/comp_layer_accum.h
+	# #1580: the shared per-view camera resolver (no Vulkan deps either)
+	${CMAKE_CURRENT_SOURCE_DIR}/../util/comp_layer_view_camera.c
+	${CMAKE_CURRENT_SOURCE_DIR}/../util/comp_layer_view_camera.h
 	)
 
 target_link_libraries(
