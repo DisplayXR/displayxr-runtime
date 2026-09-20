@@ -14,10 +14,25 @@ name: OpenXR CTS
 # five arms must not mean five builds. A `summary` job aggregates every arm's
 # result XML into one table and is the lane's real gate.
 #
-# The runtime is registered for the (elevated) Khronos loader via HKLM
-# ActiveRuntime — XR_RUNTIME_JSON is ignored when elevated. scripts/run_cts.ps1
-# owns that registration + the conformance API-layer registration, and restores
-# both in a finally. See docs/roadmap/cts-windows-handoff.md.
+# LINUX (#1527). The same shape, in its own pair of jobs
+# (`build-linux-cts` -> `run-linux`) rather than an `os` dimension on the
+# Windows matrix: the two platforms share the CTS pin, the test specs and the
+# output names, and NOTHING else — no registry ceremony, no Mesa download (the
+# ICD is an apt package), no DPI manifest, a different build script and a
+# different runner. Folding them into one matrix would mean an `if:` on nearly
+# every step of the Windows arms, and the one thing this change must not do is
+# alter what those arms execute. Linux is Vulkan-only, so its arms are exactly
+# `vulkan` + `vulkan2` on Mesa **lavapipe** under **Xvfb**; they are
+# EXPERIMENTAL (reported, not gated) until a full run has earned the flip, the
+# same way every Windows arm did.
+#
+# ON WINDOWS the runtime is registered for the (elevated) Khronos loader via
+# HKLM ActiveRuntime — XR_RUNTIME_JSON is ignored when elevated.
+# scripts/run_cts.ps1 owns that registration + the conformance API-layer
+# registration, and restores both in a finally. ON LINUX there is no such
+# downgrade: scripts/run_cts.sh sets XR_RUNTIME_JSON / XR_API_LAYER_PATH /
+# VK_DRIVER_FILES as process env and leaves no machine state behind at all.
+# See docs/roadmap/cts-windows-handoff.md.
 
 on:
   pull_request:
@@ -36,6 +51,8 @@ on:
       - 'src/xrt/include/**'
       - 'scripts/run_cts.ps1'
       - 'scripts/fetch_build_cts.bat'
+      - 'scripts/run_cts.sh'
+      - 'scripts/fetch_build_cts.sh'
       - 'scripts/fetch_mesa_rasterizers.ps1'
       - 'scripts/cts_quarantine_software_tier.txt'
       - '.github/workflows/cts.yml'
@@ -97,6 +114,10 @@ jobs:
       arms: ${{ steps.p.outputs.arms }}
       matrix: ${{ steps.p.outputs.matrix }}
       experimental: ${{ steps.p.outputs.experimental }}
+      arms_linux: ${{ steps.p.outputs.arms_linux }}
+      matrix_linux: ${{ steps.p.outputs.matrix_linux }}
+      experimental_linux: ${{ steps.p.outputs.experimental_linux }}
+      timeout_linux: ${{ steps.p.outputs.timeout_linux }}
     steps:
       - name: Resolve run parameters
         id: p
@@ -212,6 +233,63 @@ jobs:
           done
           matrix="{\"include\":[${inc%,}]}"
 
+          # ===== LINUX (#1527) =====
+          # Linux is Vulkan-only — a native Vulkan compositor over an X11/XCB
+          # surface, no D3D/Metal, and comp_gl has no Linux branch. So the
+          # Linux leg takes whatever intersection the requested `arms` has with
+          # these two, which also means the PR lane (arms=d3d11) produces an
+          # EMPTY Linux leg and both Linux jobs skip, for free.
+          LINUX_ALL_ARMS="vulkan vulkan2"
+
+          # ===== THE LINUX EXPERIMENTAL FLAG — NOT empty, and that is the point.
+          # An arm named here runs with continue-on-error and is EXCLUDED FROM
+          # THE GATE, but still reported with real counts in the summary table.
+          # Both Linux arms start here because the Windows arms did: the flip is
+          # earned by a whole-suite zero-red run, never by "no known blocker"
+          # (see the Windows history above — five arms, three runtime fixes and
+          # a software ICD between the first run and the empty string). Linux is
+          # also Preview rather than GA, so a red arm here is information first.
+          # TO GATE AN ARM: remove its name from this string. Nothing else in
+          # this file changes. Record the run that earned it in
+          # docs/roadmap/cts-windows-handoff.md § Linux arms.
+          EXPERIMENTAL_LINUX="vulkan vulkan2"
+          # =========================================================
+
+          arms_linux=""
+          for a in $arms; do
+            for l in $LINUX_ALL_ARMS; do
+              if [ "$a" = "$l" ]; then arms_linux="${arms_linux}${arms_linux:+ }$a"; fi
+            done
+          done
+
+          # Software tier on the hosted Linux lane is not a choice the way it is
+          # on Windows: a GitHub-hosted ubuntu runner has no GPU and no ICD but
+          # Mesa's, so `off` means "no Vulkan at all" rather than "the runner's
+          # own driver". Honour software_gfx=off anyway — it is the kill switch,
+          # and a lane that cannot start is a legitimate thing to prove.
+          inc_l=""
+          for a in $arms_linux; do
+            exp="false"
+            for e in $EXPERIMENTAL_LINUX; do
+              if [ "$a" = "$e" ]; then exp="true"; fi
+            done
+            sw="false"
+            if [ "${DXR_CTS_SOFTWARE_ICD:-1}" != "0" ] && [ "$sw_input" != "off" ]; then
+              sw="true"
+            fi
+            inc_l="${inc_l}{\"graphics\":\"${a}\",\"experimental\":${exp},\"software\":${sw}},"
+          done
+          matrix_linux="{\"include\":[${inc_l%,}]}"
+
+          # Linux gets DOUBLE the Windows timeout. Not superstition: the arm is
+          # a CPU rasterizer (lavapipe) driving a real X11 present path on a
+          # 4-vCPU hosted runner, where Windows' software tier only ever had to
+          # blit through WARP/llvmpipe. A timeout kills the run and leaves a
+          # TRUNCATED XML that still looks like a result file, which is the
+          # single worst outcome available here — pay the minutes (Linux is the
+          # ×1 runner) rather than risk reporting a half-suite as a red arm.
+          timeout_linux=$((timeout * 2))
+
           {
             echo "scope=$scope"
             echo "spec=$spec"
@@ -219,12 +297,18 @@ jobs:
             echo "arms=$arms"
             echo "experimental=$EXPERIMENTAL"
             echo "matrix=$matrix"
+            echo "arms_linux=$arms_linux"
+            echo "timeout_linux=$timeout_linux"
+            echo "experimental_linux=$EXPERIMENTAL_LINUX"
+            echo "matrix_linux=$matrix_linux"
           } >> "$GITHUB_OUTPUT"
 
           echo "scope=$scope timeout=$timeout"
           echo "arms=$arms  (experimental: $EXPERIMENTAL)"
+          echo "arms_linux=$arms_linux  (experimental: $EXPERIMENTAL_LINUX)"
           echo "spec=$spec"
           echo "matrix=$matrix"
+          echo "matrix_linux=$matrix_linux"
 
   # ---------------------------------------------------------------------------
   # ONE build for every arm: runtime + sim-display plug-in + the Khronos CTS.
@@ -654,13 +738,263 @@ jobs:
             -CacheDir "$env:GITHUB_WORKSPACE\mesa-sw-gfx" -Unstage
 
   # ---------------------------------------------------------------------------
+  # LINUX (#1527): ONE build for both Linux arms — the runtime (Release, so the
+  # CPU rasterizer is not also fighting an unoptimised compositor) plus the same
+  # pinned Khronos CTS. Skipped entirely when the plan resolved no Linux arms,
+  # which is exactly the PR lane (d3d11 only).
+  # ---------------------------------------------------------------------------
+  build-linux-cts:
+    name: Build runtime + CTS (Linux)
+    needs: plan
+    if: needs.plan.outputs.arms_linux != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository and submodules
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        # Runtime deps are build-linux.yml's list (they decide which features
+        # the runtime configures WITH — a missing libxcb*-dev silently produces
+        # a runtime with no on-screen compositor, which would look like a CTS
+        # failure). CTS deps ride along via fetch_build_cts.sh's own list.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build pkg-config python3 \
+            libvulkan-dev vulkan-validationlayers glslang-tools \
+            libeigen3-dev libcjson-dev libudev-dev \
+            libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev libwayland-dev \
+            libdbus-1-dev \
+            libgl1-mesa-dev libegl1-mesa-dev libxrandr-dev libxxf86vm-dev libxcb-glx0-dev \
+            libxkbcommon-dev
+
+      - name: Build runtime + sim-display plug-in (Release) + headless selftest
+        # build_linux.sh's default run ends in `displayxr-cli selftest`, the
+        # same hardware-free gate build-linux.yml uses. Free here, and it
+        # separates "the runtime cannot start at all" from "the CTS is red".
+        env:
+          CMAKE_BUILD_TYPE: Release
+        run: ./scripts/build_linux.sh
+
+      # Cached on the harness script's hash + the CTS pin, mirroring the
+      # Windows job. The run arms RESTORE this cache rather than rebuilding the
+      # CTS once per arm.
+      - name: Cache CTS build
+        id: cts-cache-linux
+        uses: actions/cache@v5
+        with:
+          path: build-cts
+          key: cts-linux-${{ hashFiles('scripts/fetch_build_cts.sh') }}-1.1.63
+
+      - name: Build CTS
+        if: steps.cts-cache-linux.outputs.cache-hit != 'true'
+        run: ./scripts/fetch_build_cts.sh
+
+      # Hand the run arms everything they need to EXECUTE without a toolchain.
+      # The dev manifest at build/openxr_displayxr-dev.json and the staged
+      # plug-in manifest in build/_plugins both carry ABSOLUTE paths — stable
+      # because every hosted Linux runner uses the same
+      # /home/runner/work/<repo>/<repo> workspace, the same property the
+      # Windows job relies on.
+      - name: Package the build tree for the run arms
+        run: |
+          tar -cf cts-build-tree-linux.tar \
+            --exclude='*.o' --exclude='*.a' --exclude='CMakeFiles' \
+            build
+          echo "cts-build-tree-linux.tar = $(du -h cts-build-tree-linux.tar | cut -f1)"
+
+      - name: Upload build tree
+        uses: actions/upload-artifact@v6
+        with:
+          name: cts-build-tree-linux
+          path: cts-build-tree-linux.tar
+          retention-days: 1
+          if-no-files-found: error
+          overwrite: true
+
+  # ---------------------------------------------------------------------------
+  # One arm per Linux graphics plugin (vulkan, vulkan2), both reusing the single
+  # build above, both on Mesa lavapipe under Xvfb.
+  # ---------------------------------------------------------------------------
+  run-linux:
+    name: CTS linux ${{ matrix.graphics }}
+    needs: [plan, build-linux-cts]
+    if: needs.plan.outputs.arms_linux != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix_linux) }}
+    # Both Linux arms are experimental today, so this is true for both: they
+    # are REPORTED in the summary table with real counts and do not fail the
+    # lane. See EXPERIMENTAL_LINUX in `plan` for how the flip is earned.
+    continue-on-error: ${{ matrix.experimental }}
+    env:
+      # Same stem as Windows on purpose — cts_ci_<graphics>.xml — so a Linux
+      # result file drops into a submission package unmodified. The artifact
+      # NAME carries the OS (cts-results-linux-<graphics>), which is what keeps
+      # the two platforms' files apart.
+      CTS_TAG: ci_${{ matrix.graphics }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install runtime dependencies
+        # Runtime-only (no -dev): the binaries arrive prebuilt. mesa-vulkan-drivers
+        # brings lavapipe, xvfb the X server, x11-utils xdpyinfo (the readiness
+        # probe), vulkan-tools the identity dump.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            xvfb x11-utils mesa-vulkan-drivers vulkan-tools \
+            libvulkan1 libxcb1 libxcb-randr0 libx11-6 libx11-xcb1 libxcb-glx0 \
+            libgl1 libegl1 libdbus-1-3
+
+      - name: Download build tree
+        uses: actions/download-artifact@v6
+        with:
+          name: cts-build-tree-linux
+
+      - name: Unpack build tree
+        run: |
+          tar -xf cts-build-tree-linux.tar
+          manifest="build/openxr_displayxr-dev.json"
+          if [ ! -f "$manifest" ]; then
+            echo "::error::dev runtime manifest missing after unpack: $manifest"
+            exit 1
+          fi
+          cat "$manifest"
+          ls -l build/_plugins/
+
+      - name: Restore CTS build
+        uses: actions/cache/restore@v5
+        with:
+          path: build-cts
+          key: cts-linux-${{ hashFiles('scripts/fetch_build_cts.sh') }}-1.1.63
+          fail-on-cache-miss: true
+
+      - name: Run CTS (${{ needs.plan.outputs.scope }} / linux ${{ matrix.graphics }})
+        run: |
+          set -o pipefail
+          args=(
+            --graphics "${{ matrix.graphics }}"
+            --test-spec "${{ needs.plan.outputs.spec }}"
+            --plugin sim-display
+            --conformance-layer
+            --xvfb
+            --timeout "${{ needs.plan.outputs.timeout_linux }}"
+            --tag "$CTS_TAG"
+            --out-dir "$GITHUB_WORKSPACE/cts-out"
+          )
+          if [ "${{ matrix.software }}" = "true" ]; then
+            # ONLY the software tier gets a quarantine list — the SAME file the
+            # Windows software tier uses, because the one entry in it
+            # (Timed_Pipelined_Frame_Submission) is a property of running on a
+            # CPU rasterizer, which is equally true of lavapipe.
+            args+=(--software --quarantine-list "$GITHUB_WORKSPACE/scripts/cts_quarantine_software_tier.txt")
+          fi
+          chmod +x scripts/run_cts.sh
+          ./scripts/run_cts.sh "${args[@]}"
+
+      - name: Evaluate results
+        run: |
+          xml="$GITHUB_WORKSPACE/cts-out/cts_${CTS_TAG}.xml"
+          if [ ! -f "$xml" ]; then
+            echo "::error::CTS produced no result XML — the run likely crashed before writing results."
+            echo "--- runtime stderr tail ---"
+            tail -40 "$GITHUB_WORKSPACE/cts-out/cts_${CTS_TAG}_runtime.log" 2>/dev/null || true
+            exit 1
+          fi
+          # Completeness BEFORE parsing: a crashed run leaves a truncated XML
+          # and the parser then dies with something opaque (#830).
+          if ! grep -q '</testsuites>' "$xml"; then
+            echo "--- console log tail ---"
+            tail -20 "$GITHUB_WORKSPACE/cts-out/cts_${CTS_TAG}_console.log" 2>/dev/null || true
+            echo "--- runtime stderr tail ---"
+            tail -40 "$GITHUB_WORKSPACE/cts-out/cts_${CTS_TAG}_runtime.log" 2>/dev/null || true
+            echo "::error::CTS crashed before writing complete results (XML truncated)."
+            exit 1
+          fi
+          python3 - "$xml" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          suite = root.find("testsuite") if root.tag == "testsuites" else root
+          if suite is None:
+              suite = root
+          tests = int(suite.get("tests", 0)); failures = int(suite.get("failures", 0))
+          errors = int(suite.get("errors", 0)); skipped = int(suite.get("skipped", 0))
+          print(f"CTS: {tests} assertions, {failures} failures, {errors} errors, {skipped} skipped")
+          if failures + errors:
+              print(f"::error::CTS reported {failures} failing assertions + {errors} errored test cases")
+              for tc in root.iter("testcase"):
+                  if tc.find("failure") is not None:
+                      print(f"  FAIL:  {tc.get('name')}")
+                  if tc.find("error") is not None:
+                      print(f"  ERROR: {tc.get('name')}")
+              sys.exit(1)
+          print("CTS passed.")
+          PY
+
+      # Same scrape as the Windows arms, same caveat: the software tier
+      # quarantines Timed_Pipelined_Frame_Submission by name, so it prints
+      # nothing here and "No ... metrics" is the honest reading, not a
+      # regression. A real-GPU Linux box running the same script WITHOUT
+      # --software keeps both the test and the trend line.
+      - name: Report frame-timing metrics
+        if: always()
+        run: |
+          log="$GITHUB_WORKSPACE/cts-out/cts_${CTS_TAG}_stdout.log"
+          [ -f "$log" ] || log="$GITHUB_WORKSPACE/cts-out/cts_${CTS_TAG}_console.log"
+          if [ ! -f "$log" ]; then echo "No CTS stdout/console log to scrape metrics from."; exit 0; fi
+          lines=$(grep -aE 'Average (xrWaitFrame|time spent|predicted|xrBeginFrame)|Overhead score' "$log" || true)
+          if [ -z "$lines" ]; then echo "No Timed_Pipelined_Frame_Submission metrics in console log."; exit 0; fi
+          {
+            echo "## CTS frame-timing — linux ${{ matrix.graphics }} (Timed_Pipelined_Frame_Submission)"
+            echo '```'
+            echo "$lines"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "$lines"
+          pct=$(echo "$lines" | sed -n 's/.*Overhead score[[:space:]]*:[[:space:]]*\([-0-9.]*\)%.*/\1/p' | head -1)
+          if [ -n "$pct" ]; then
+            if python3 -c "import sys; sys.exit(0 if float('$pct') >= 40.0 else 1)"; then
+              echo "::warning::CTS frame overhead ${pct}% is within 10pts of the 50% hard-fail (see #589)"
+            else
+              echo "CTS frame overhead ${pct}% — healthy margin under the 50% cap."
+            fi
+          fi
+
+      - name: Stage CTS results
+        if: always()
+        run: |
+          mkdir -p cts-results
+          for f in "cts_${CTS_TAG}.xml" "cts_${CTS_TAG}_console.log" "cts_${CTS_TAG}_stdout.log" \
+                   "cts_${CTS_TAG}_runtime.log" "cts_${CTS_TAG}_graphics_identity.txt" \
+                   "cts_${CTS_TAG}_xvfb.log"; do
+            src="$GITHUB_WORKSPACE/cts-out/$f"
+            [ -f "$src" ] && cp "$src" cts-results/
+          done
+          ls -l cts-results/ || true
+
+      - name: Upload CTS results
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: cts-results-linux-${{ matrix.graphics }}
+          path: cts-results/
+          if-no-files-found: warn
+          overwrite: true
+
+  # ---------------------------------------------------------------------------
   # The lane's gate. Every arm's XML in one table; fails if any NON-experimental
-  # arm was red or produced nothing at all — and EXPERIMENTAL is empty, so that
-  # is currently every arm.
+  # arm was red or produced nothing at all — which today is every WINDOWS arm
+  # (EXPERIMENTAL is empty) and neither Linux arm (both experimental, #1527).
   # ---------------------------------------------------------------------------
   summary:
     name: CTS summary
-    needs: [plan, run]
+    needs: [plan, run, run-linux]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -676,37 +1010,53 @@ jobs:
         env:
           ARMS: ${{ needs.plan.outputs.arms }}
           EXPERIMENTAL: ${{ needs.plan.outputs.experimental }}
+          ARMS_LINUX: ${{ needs.plan.outputs.arms_linux }}
+          EXPERIMENTAL_LINUX: ${{ needs.plan.outputs.experimental_linux }}
           SCOPE: ${{ needs.plan.outputs.scope }}
         run: |
           python3 - <<'PY'
           import os, sys, glob
           import xml.etree.ElementTree as ET
 
-          arms = os.environ.get("ARMS", "").split()
-          experimental = set(os.environ.get("EXPERIMENTAL", "").split())
           scope = os.environ.get("SCOPE", "?")
 
+          # (os, arm, experimental?, artifact-dir). The artifact directory is
+          # what keeps the two platforms apart: BOTH write cts_ci_<arm>.xml, on
+          # purpose — that filename is what a Khronos submission package wants,
+          # and `vulkan` exists on both matrices. Match on the directory, not
+          # the filename, or a Linux XML can be reported as a Windows result.
+          plan = []
+          for arm in os.environ.get("ARMS", "").split():
+              plan.append(("windows", arm,
+                           arm in set(os.environ.get("EXPERIMENTAL", "").split()),
+                           f"cts-results-{arm}"))
+          for arm in os.environ.get("ARMS_LINUX", "").split():
+              plan.append(("linux", arm,
+                           arm in set(os.environ.get("EXPERIMENTAL_LINUX", "").split()),
+                           f"cts-results-linux-{arm}"))
+
           rows, failed = [], []
-          for arm in arms:
-              # Depth-agnostic on purpose: actions/download-artifact only creates
-              # a per-artifact subdirectory when MORE THAN ONE artifact matches
-              # the pattern, so a single-arm lane (the PR's d3d11) lands the XML
-              # directly in all-results/ while a fan-out nests it under
-              # all-results/cts-results-<arm>/. The filename carries the arm, so
-              # matching on it is unambiguous either way.
-              hits = glob.glob(f"all-results/**/cts_ci_{arm}.xml", recursive=True)
-              exp = arm in experimental
+          for osname, arm, exp, artdir in plan:
+              # actions/download-artifact only creates a per-artifact
+              # subdirectory when MORE THAN ONE artifact matches the pattern,
+              # so a single-arm lane (the PR's d3d11) lands the XML directly in
+              # all-results/ while a fan-out nests it. Prefer the nested,
+              # OS-qualified path; fall back to the flat one only when this run
+              # has exactly one arm, where it cannot be ambiguous.
+              hits = glob.glob(f"all-results/{artdir}/**/cts_ci_{arm}.xml", recursive=True)
+              if not hits and len(plan) == 1:
+                  hits = glob.glob(f"all-results/**/cts_ci_{arm}.xml", recursive=True)
               if not hits:
-                  rows.append((arm, "—", "—", "—", "MISSING (no result XML)", exp))
+                  rows.append((osname, arm, "—", "—", "—", "MISSING (no result XML)", exp))
                   if not exp:
-                      failed.append(f"{arm}: produced no result XML")
+                      failed.append(f"{osname}/{arm}: produced no result XML")
                   continue
               try:
                   root = ET.parse(hits[0]).getroot()
               except ET.ParseError as e:
-                  rows.append((arm, "—", "—", "—", f"TRUNCATED ({e})", exp))
+                  rows.append((osname, arm, "—", "—", "—", f"TRUNCATED ({e})", exp))
                   if not exp:
-                      failed.append(f"{arm}: result XML is truncated/unparseable")
+                      failed.append(f"{osname}/{arm}: result XML is truncated/unparseable")
                   continue
               suite = root.find("testsuite") if root.tag == "testsuites" else root
               if suite is None:
@@ -716,29 +1066,31 @@ jobs:
               errors = int(suite.get("errors", 0))
               bad = failures + errors
               status = "PASS" if bad == 0 else f"FAIL ({bad} red)"
-              rows.append((arm, tests, failures, errors, status, exp))
+              rows.append((osname, arm, tests, failures, errors, status, exp))
               if bad and not exp:
-                  failed.append(f"{arm}: {failures} failures + {errors} errors")
+                  failed.append(f"{osname}/{arm}: {failures} failures + {errors} errors")
 
           lines = [f"## OpenXR CTS matrix — scope `{scope}`", "",
-                   "| arm | tests | failures | errors | status |",
-                   "|---|---:|---:|---:|---|"]
-          for arm, tests, failures, errors, status, exp in rows:
-              # Generic on purpose: EXPERIMENTAL is empty today, so this only
-              # fires if someone re-adds an arm — and then the issue number
-              # belongs in the handoff doc with its reason, not hardcoded here.
+                   "| os | arm | tests | failures | errors | status |",
+                   "|---|---|---:|---:|---:|---|"]
+          for osname, arm, tests, failures, errors, status, exp in rows:
               label = f"`{arm}`" + (" _(experimental — reported, NOT gated)_" if exp else "")
-              lines.append(f"| {label} | {tests} | {failures} | {errors} | {status} |")
+              lines.append(f"| {osname} | {label} | {tests} | {failures} | {errors} | {status} |")
           lines += ["",
                     "**All five Windows arms gate on the hosted lane** (#1523) — `d3d11`/`d3d12` on",
                     "**WARP**, `opengl` on Mesa **llvmpipe**, `vulkan`/`vulkan2` on Mesa **lavapipe**",
-                    "(#1525). No arm is exempt; a red arm fails this lane.",
+                    "(#1525). No Windows arm is exempt; a red one fails this lane.",
                     "",
-                    "One by-name exclusion applies, and only on the software tier:",
-                    "`Timed_Pipelined_Frame_Submission`, whose 108.6% frame-timing overhead is the CPU",
+                    "**Both Linux arms are EXPERIMENTAL** (#1527) — `vulkan`/`vulkan2` on Mesa",
+                    "**lavapipe** under **Xvfb**. They are reported with real counts and do NOT gate;",
+                    "Linux is Preview, not GA, so a red arm there is information first. The flip is",
+                    "earned by a zero-red full run, recorded in docs/roadmap/cts-windows-handoff.md.",
+                    "",
+                    "One by-name exclusion applies, and only on the software tier (both platforms):",
+                    "`Timed_Pipelined_Frame_Submission`, whose frame-timing overhead is the CPU",
                     "rasterizer rather than the runtime (scripts/cts_quarantine_software_tier.txt).",
-                    "Tiers without a software ICD — the PR lane's WARP arms, the real-GPU tier (#1526) —",
-                    "run it. See docs/roadmap/cts-windows-handoff.md."]
+                    "Tiers without a software ICD — the PR lane's WARP arms, the real-GPU tiers",
+                    "(#1526 Windows, #1527 Linux) — run it. See docs/roadmap/cts-windows-handoff.md."]
           out = "\n".join(lines) + "\n"
           print(out)
           path = os.environ.get("GITHUB_STEP_SUMMARY")
@@ -746,7 +1098,7 @@ jobs:
               with open(path, "a") as f:
                   f.write(out)
 
-          if not arms:
+          if not plan:
               print("::error::plan produced no arms — nothing ran")
               sys.exit(1)
           if failed:

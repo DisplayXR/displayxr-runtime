@@ -4,10 +4,21 @@
 # (llvmpipe / lavapipe) on a GitHub-hosted runner with no GPU.
 #
 # This file is the ONE place the software tier's exclusions live. It is passed
-# to scripts/run_cts.ps1 via -QuarantineList, and ONLY on the software tier:
+# to scripts/run_cts.ps1 via -QuarantineList (Windows) and to
+# scripts/run_cts.sh via --quarantine-list (Linux, #1527), and ONLY on the
+# software tier:
 #
 #   * the PR lane (d3d11/d3d12 on WARP)              -> not passed
 #   * the self-hosted, real-GPU tier (#1526)         -> not passed
+#   * a real-GPU Linux box (run_cts.sh without --software) -> not passed
+#      run_cts.sh REFUSES to apply the list unless --software is also set, so
+#      "real GPU + quarantine" is not a state a typo can reach.
+#
+# CROSS-PLATFORM BY CONSTRUCTION. The single entry below is a property of
+# rasterizing on the CPU, which is equally true of Windows llvmpipe/lavapipe
+# and of Linux lavapipe under Xvfb — so both software tiers read this same
+# file rather than forking a near-identical one. An entry that is true on only
+# one OS does not belong here; say so in a comment and gate it there instead.
 #
 # so an entry here can never silently hide a defect on a tier that has real
 # hardware. That is the point: a test quarantined *everywhere* is a defect
