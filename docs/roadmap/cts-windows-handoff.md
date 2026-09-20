@@ -47,17 +47,20 @@ runs on today:
 | `opengl` | GitHub-hosted `windows-2022`, Mesa **llvmpipe** (provisioned — the image's own GL is GDI generic 1.1) | **yes** (#1523) | — · one software-tier quarantine entry, below |
 | `vulkan` | GitHub-hosted `windows-2022`, Mesa **lavapipe** (provisioned — the image ships no Vulkan ICD) | **yes** (#1523) | — |
 | `vulkan2` | same as `vulkan` | **yes** (#1523) | — |
-| Linux `vulkan` / `vulkan2` | GitHub-hosted `ubuntu-latest`, Mesa **lavapipe** under **Xvfb** (#1527) | **no — experimental** | reported, not gated; see § Linux arms |
+| Linux `vulkan` / `vulkan2` | GitHub-hosted `ubuntu-latest`, Mesa **lavapipe** under **Xvfb** (#1527) | **yes** (#1527) | — · see § Linux arms |
 | Android `vulkan` / `vulkan2` | **real device** — no runner yet | not in CI | #1523 part 2, #1212 |
 
-**All five Windows arms gate on the hosted lane** — `d3d11`/`d3d12` on WARP,
-`opengl` on Mesa llvmpipe, `vulkan`/`vulkan2` on Mesa lavapipe. A red arm fails
-the lane; no arm is exempt.
+**The whole hosted matrix gates — 5 Windows + 2 Linux.** Windows: `d3d11`/`d3d12`
+on WARP, `opengl` on Mesa llvmpipe, `vulkan`/`vulkan2` on Mesa lavapipe. Linux:
+`vulkan`/`vulkan2` on Mesa lavapipe under Xvfb. A red arm on either platform
+fails the lane; no arm is exempt.
 
 The exemption mechanism still exists and is deliberately kept: the
-`EXPERIMENTAL=""` line in `cts.yml`'s `plan` job. Putting an arm's name back in
-that string sets its `continue-on-error` and tells the `summary` job to leave it
-out of the gate — nothing else in the file changes. Prefer that to deleting an
+`EXPERIMENTAL=""` and `EXPERIMENTAL_LINUX=""` lines in `cts.yml`'s `plan` job
+(one per platform — they are separate strings because the two legs are separate
+jobs). Putting an arm's name back in the right one sets its `continue-on-error`
+and tells the `summary` job to leave it out of the gate — nothing else in the
+file changes. Prefer that to deleting an
 arm if one ever regresses beyond a quick fix: a reported-but-ungated arm still
 produces numbers every run, and a deleted arm produces silence. Record the
 reason here when you do.
@@ -98,14 +101,13 @@ therefore *with* that test excluded. On `auto` — which is what the nightly, th
 tag lane and the PR lane use — the WARP arms get `software: false`, no quarantine
 list, and they do run it. The PR lane exercises exactly that and is green.
 
-**Real-GPU cross-check (win box, not CI).** Reported by the Windows box session
-against `main` `27260eaee` on an **RTX 3080**, full non-interactive suite:
-`vulkan` 40027 and `vulkan2` 40011 assertions, with only **two** reds, both the
-known layer-not-enabled case rather than runtime defects. Recorded here as
-**reported, not independently verified** — it came from a hand-run on hardware
-this lane cannot reach, there is no artefact URL to cite, and the numbers differ
-from the hosted lane's because the runs are not the same build. It is corroboration
-for #1526, not a substitute for it.
+**Real-GPU cross-check (off-CI, hand-run).** Against `main` `27260eaee` on an
+**NVIDIA RTX 3080**, full non-interactive suite: `vulkan` 40027 and `vulkan2`
+40011 assertions, with only **two** reds, both the known layer-not-enabled case
+rather than runtime defects. Recorded here as **reported, not independently
+verified** — it was a manual run on hardware this lane cannot reach, there is no
+artefact URL to cite, and the numbers differ from the hosted lane's because the
+runs are not the same build. It is corroboration for #1526, not a substitute.
 
 [gl-run]: https://github.com/DisplayXR/displayxr-runtime/actions/runs/35433846568
 [all-run]: https://github.com/DisplayXR/displayxr-runtime/actions/runs/35458623141
@@ -180,36 +182,60 @@ they drop into a submission package unmodified. Because **both** platforms write
 directory**, not by filename — changing that back would report a Linux XML as a
 Windows result.
 
-### Both arms are EXPERIMENTAL, deliberately
+### Both arms gate
 
-`EXPERIMENTAL_LINUX="vulkan vulkan2"` in `plan`: both arms run with
-`continue-on-error`, appear in the summary table with real counts, and do not
-fail the lane. Two reasons, and neither is "we expect them to be red":
+`EXPERIMENTAL_LINUX=""` in `plan`: neither arm runs with `continue-on-error`,
+and a red Linux arm fails the lane exactly like a red Windows one.
 
-1. Every Windows arm earned its gate with a whole-suite zero-red run, never
-   with "no known blocker". The same bar applies here.
-2. Linux is **Preview**, not GA (`docs/roadmap/linux-support.md`). A red Linux
-   arm is information about the platform; it is not automatically a release
-   blocker, and wiring it as one before the baseline is known would make the
-   nightly unreadable.
+They did not start that way. Both were held experimental on two arguments, and
+it is worth recording how each was discharged:
 
-**To gate an arm:** delete its name from `EXPERIMENTAL_LINUX`. Nothing else in
-`cts.yml` changes. Record the run that earned it in the table below.
+1. *Every Windows arm earned its gate with a whole-suite zero-red run, never
+   with "no known blocker."* Discharged by running it — see the table below.
+2. *Linux is Preview, not GA, so a red arm is information first.* Still true of
+   the platform, but it stopped being a reason once the arms were green: an arm
+   that passes and does not gate teaches the lane to ignore it, and the next
+   regression then lands unnoticed in a column nobody reads. Preview is a reason
+   to be careful about what a red arm **means**, not a reason to let it pass
+   silently.
+
+**To re-add an arm:** put its name back in `EXPERIMENTAL_LINUX`. Nothing else in
+`cts.yml` changes. Record the reason here.
 
 | Arm | Latest full-run evidence | Gated? |
 |---|---|---|
-| Linux `vulkan` | run 35483149562 — 20476 assertions, **0 failures, 62 errors**, 35 skipped. One cause, below. | no |
-| Linux `vulkan2` | run 35483149562 — 40046 assertions, **0 failures, 0 errors**, 39 skipped (63/63 test cases). Clean. | no |
+| Linux `vulkan` | [run 35487653057][lx-vk] — 40062 assertions, **0 failures, 0 errors**, 39 skipped | **yes** |
+| Linux `vulkan2` | [run 35488930910][lx-vk2] — 40046 assertions, **0 failures, 0 errors**, 39 skipped | **yes** |
 
-Identity recorded on both: `llvmpipe (LLVM 20.1.2, 256 bits)`,
-`PHYSICAL_DEVICE_TYPE_CPU`, Mesa 25.2.8, ICD
-`/usr/share/vulkan/icd.d/lvp_icd.json`.
+[lx-vk]: https://github.com/DisplayXR/displayxr-runtime/actions/runs/35487653057
+[lx-vk2]: https://github.com/DisplayXR/displayxr-runtime/actions/runs/35488930910
 
-### The one Linux finding: `xrGetVulkanDeviceExtensionsKHR` is unfiltered off Windows
+Those two are the post-#1577 runs that earned the flip, one arm each, taken on
+the #1577 branch (`d7f3a994d` and `904edc131`) before it squash-merged to `main`
+as `510f6d834`. Read the assertion counts the way the summary table prints them
+(`tests` in the JUnit XML); subtracting `skipped` gives numbers 39 lower per arm
+on Linux — the same trap as the Windows arms' 42, and the same advice: do not
+quote the two forms interchangeably.
 
-All 62 `vulkan` errors are the same exception, thrown by the **CTS's own**
-device creation (`graphics_plugin_vulkan.cpp:1383`, `InitializeDevice`) before
-any runtime code runs:
+**The Linux arms are already covered by the software-tier quarantine.**
+`run-linux` passes `--quarantine-list scripts/cts_quarantine_software_tier.txt`
+whenever `matrix.software` is true — the *same* file as Windows, because the one
+entry in it (`Timed_Pipelined_Frame_Submission`) is a property of running on a
+CPU rasterizer and lavapipe is one. Both runs above log
+`QUARANTINE: 1 test(s) excluded`, and the frame-timing scrape correspondingly
+prints `No Timed_Pipelined_Frame_Submission metrics in console log`. So there is
+no Linux-specific quarantine entry to add, and no second list: if that test ever
+needs excluding somewhere, it is already excluded on every software tier, and
+anywhere else would need its own evidence under the file's rule 2.
+
+### The Linux finding that had to be fixed first: `xrGetVulkanDeviceExtensionsKHR` was unfiltered off Windows
+
+**Fixed by #1577 (issue #1576).** Kept here because it is the clearest example
+of why the enable1 and enable2 arms are not redundant.
+
+Before the fix, all 62 `vulkan` errors were the same exception, thrown by the
+**CTS's own** device creation (`graphics_plugin_vulkan.cpp:1383`,
+`InitializeDevice`) before any runtime code ran:
 
 ```
 VkResult failure ERROR_EXTENSION_NOT_PRESENT
@@ -231,12 +257,18 @@ dmabuf / `native_fence_fd` caps, and a hosted runner has no `/dev/dri`:
 asks for the dma-buf pair at all. So the two lists disagree: what enable2 asks
 for and what the enable1 string advertises are not the same set.
 
-The fix shape already exists — #1539 built exactly this filter, dropping
-not-present names from the `xrGetVulkanDeviceExtensionsKHR` answer — but it is
+The fix shape already existed — #1539 built exactly this filter, dropping
+not-present names from the `xrGetVulkanDeviceExtensionsKHR` answer — but it was
 written inside `#ifdef OXR_HAVE_WIN32_EXTERNAL_LIST`
 (`oxr_vulkan.c::oxr_vk_device_exts_for_system`), so on Linux the function
-returns the compile-time constant unchanged. Generalising that filter to every
-platform is the work; no issue is filed for it here.
+returned the compile-time constant unchanged. **#1577 generalised it** (issue
+#1576): the desktop-Linux external-memory / modifier / fd extensions are now
+optional-if-present for enable1, with the kill switch scoped so Linux restores
+only the enable1 string. `vulkan` went 62 errors → **0**.
+
+Identity recorded on both arms: `llvmpipe (LLVM 20.1.2, 256 bits)`,
+`PHYSICAL_DEVICE_TYPE_CPU`, Mesa 25.2.8, ICD
+`/usr/share/vulkan/icd.d/lvp_icd.json`.
 
 Note what this is and is not. It is a real runtime/environment mismatch that a
 real-GPU Linux box would not show (an NVIDIA or Mesa-on-DRM device exposes all
