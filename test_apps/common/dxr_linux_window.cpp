@@ -349,6 +349,14 @@ DxrLinuxWindow::create_x11(const DxrLinuxWindowDesc &desc)
 	const bool want_fullscreen =
 	    panel_known && !fs_opt_out && desc.width == desc.panel_width && desc.height == desc.panel_height;
 
+	// #1588: a WINDOWED toplevel is undecorated + client-dragged as well, so
+	// every move can be routed through the weave's lattice snap. Opt out for
+	// the old decorated, WM-dragged behaviour.
+	const char *wm_dec = getenv("DXR_X11_WM_DECORATIONS");
+	m_x_wm_drag = !want_fullscreen && wm_dec != nullptr && wm_dec[0] != '\0' && strcmp(wm_dec, "0") != 0;
+	const bool client_drag = !want_fullscreen && !m_x_wm_drag;
+	m_x_client_drag = client_drag;
+
 	m_x_display = XOpenDisplay(nullptr);
 	if (m_x_display == nullptr) {
 		DXRW_ERROR("XOpenDisplay failed — is DISPLAY set?");
@@ -380,7 +388,12 @@ DxrLinuxWindow::create_x11(const DxrLinuxWindowDesc &desc)
 	}
 
 	XStoreName(m_x_display, m_x_window, desc.title);
-	XSelectInput(m_x_display, m_x_window, StructureNotifyMask | KeyPressMask);
+	// Button + motion events are what the client-owned drag runs on (#1588).
+	// Harmless when the drag is off; selecting them unconditionally keeps one
+	// input mask for both paths.
+	XSelectInput(m_x_display, m_x_window,
+	             StructureNotifyMask | KeyPressMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask |
+	                 Button1MotionMask);
 
 	// Clean close on the window manager's close button.
 	m_x_wm_delete = XInternAtom(m_x_display, "WM_DELETE_WINDOW", False);
@@ -388,8 +401,11 @@ DxrLinuxWindow::create_x11(const DxrLinuxWindowDesc &desc)
 
 	// Decorations off BEFORE the map, so a frame is never created in the first
 	// place. Mutter reparenting us into a title bar is what clamped the #729
-	// window to 3840x2086 at (3456, 74).
-	if (want_fullscreen) {
+	// window to 3840x2086 at (3456, 74) — and for a WINDOWED run (#1588) the
+	// frame is worse than an offset: it hands the drag to the WM, where the
+	// interlace phase cannot be snapped. Undecorated is therefore the default
+	// for both, and DXR_X11_WM_DECORATIONS=1 is the escape hatch.
+	if (want_fullscreen || client_drag) {
 		x11_set_undecorated(m_x_display, m_x_window);
 	}
 
@@ -487,13 +503,134 @@ DxrLinuxWindow::create_x11(const DxrLinuxWindowDesc &desc)
 			          m_x_window, desc.width, desc.height, screenLeft, screenTop, where, wa.width,
 			          wa.height, rx, ry);
 		} else {
-			DXRW_INFO("Created app-owned X11 window 0x%lx: requested %ux%u at (%d, %d) windowed%s; "
+			DXRW_INFO("Created app-owned X11 window 0x%lx: requested %ux%u at (%d, %d) windowed%s%s; "
 			          "actual %dx%d at (%d, %d)",
 			          m_x_window, desc.width, desc.height, screenLeft, screenTop,
-			          fs_opt_out ? " (DXR_X11_NO_FULLSCREEN)" : "", wa.width, wa.height, rx, ry);
+			          fs_opt_out ? " (DXR_X11_NO_FULLSCREEN)" : "",
+			          client_drag ? ", undecorated + client-owned drag" : " (DXR_X11_WM_DECORATIONS)",
+			          wa.width, wa.height, rx, ry);
+		}
+		m_x_drag_at_x = rx;
+		m_x_drag_at_y = ry;
+	}
+
+	// DXR_X11_TEST_DRAG=dx,dy,steps — TEST HOOK, off by default. Only meaningful
+	// where a drag is possible at all (windowed + client-owned).
+	if (client_drag) {
+		if (const char *tenv = getenv("DXR_X11_TEST_DRAG")) {
+			int dx = 0, dy = 0, steps = 0;
+			if (sscanf(tenv, "%d,%d,%d", &dx, &dy, &steps) == 3 && steps > 0) {
+				m_x_test_drag_armed = true;
+				m_x_test_drag_dx = dx;
+				m_x_test_drag_dy = dy;
+				m_x_test_drag_steps = steps;
+				DXRW_WARN("DXR_X11_TEST_DRAG=%d,%d,%d — TEST HOOK armed; the window will walk "
+				          "that offset in %d snapped steps after a warm-up",
+				          dx, dy, steps, steps);
+			} else {
+				DXRW_WARN("DXR_X11_TEST_DRAG=\"%s\" is not dx,dy,steps — ignored", tenv);
+			}
 		}
 	}
 	return true;
+}
+
+/*
+ *
+ * X11 client-owned drag (#1588).
+ *
+ */
+
+void
+DxrLinuxWindow::snap_origin(int origin_x, int origin_y, int target_x, int target_y, int *out_x, int *out_y)
+{
+	int32_t sx = (int32_t)target_x;
+	int32_t sy = (int32_t)target_y;
+	bool snapped = false;
+	if (m_snap_fn != nullptr) {
+		snapped = m_snap_fn(m_snap_userdata, (int32_t)origin_x, (int32_t)origin_y, (int32_t)target_x,
+		                    (int32_t)target_y, &sx, &sy);
+	}
+	if (!snapped) {
+		sx = (int32_t)target_x;
+		sy = (int32_t)target_y;
+	}
+	if (!m_snap_reported) {
+		m_snap_reported = true;
+		DXRW_INFO("drag: snap provider %s — %s",
+		          m_snap_fn != nullptr ? "installed" : "ABSENT (identity)",
+		          snapped ? "the display processor IS snapping window origins"
+		                  : "identity for now (no DP lattice snap on this runtime); "
+		                    "the drag mechanics are unaffected");
+	}
+	*out_x = (int)sx;
+	*out_y = (int)sy;
+}
+
+void
+DxrLinuxWindow::x11_move_snapped(int target_x, int target_y)
+{
+	if (m_x_display == nullptr || m_x_window == 0) {
+		return;
+	}
+	int sx = target_x;
+	int sy = target_y;
+	snap_origin(m_x_drag_origin_x, m_x_drag_origin_y, target_x, target_y, &sx, &sy);
+
+	if (sx != target_x || sy != target_y) {
+		m_x_drag_snapped++;
+		// On-change only: with an identity snap this never fires, which is
+		// the point — a per-motion log line would be per-event spam.
+		DXRW_INFO("drag: raw (%d, %d) -> snapped (%d, %d)", target_x, target_y, sx, sy);
+	}
+	if (sx == m_x_drag_at_x && sy == m_x_drag_at_y) {
+		return; // the lattice swallowed this step; do not churn the WM
+	}
+	XMoveWindow(m_x_display, m_x_window, sx, sy);
+	XFlush(m_x_display);
+	m_x_drag_at_x = sx;
+	m_x_drag_at_y = sy;
+	m_x_drag_moves++;
+}
+
+void
+DxrLinuxWindow::x11_drive_test_drag()
+{
+	// Warm-up: let the session come up and the first frames present before
+	// the window starts moving, so the runtime's origin trace is readable.
+	const uint64_t kWarmupFrames = 60;
+	if (!m_x_test_drag_armed || m_x_test_drag_done || m_x_pump_count < kWarmupFrames) {
+		return;
+	}
+
+	if (m_x_test_drag_step == 0) {
+		// Same bookkeeping a ButtonPress does: latch the drag origin.
+		x11_root_origin(m_x_display, m_x_window, &m_x_drag_origin_x, &m_x_drag_origin_y);
+		m_x_drag_at_x = m_x_drag_origin_x;
+		m_x_drag_at_y = m_x_drag_origin_y;
+		m_x_drag_moves = 0;
+		m_x_drag_snapped = 0;
+		DXRW_INFO("drag: start (TEST HOOK) — grab origin (%d, %d), walking %+d,%+d in %d steps",
+		          m_x_drag_origin_x, m_x_drag_origin_y, m_x_test_drag_dx, m_x_test_drag_dy,
+		          m_x_test_drag_steps);
+	}
+
+	m_x_test_drag_step++;
+	// Integer-exact endpoint: step i of N lands on origin + d*i/N, so the last
+	// step is origin + d with no rounding residue.
+	const int i = m_x_test_drag_step;
+	const int n = m_x_test_drag_steps;
+	const int tx = m_x_drag_origin_x + (int)((int64_t)m_x_test_drag_dx * i / n);
+	const int ty = m_x_drag_origin_y + (int)((int64_t)m_x_test_drag_dy * i / n);
+	x11_move_snapped(tx, ty);
+
+	if (i >= n) {
+		m_x_test_drag_done = true;
+		DXRW_INFO("drag: end (TEST HOOK) — %llu move(s), %llu snapped away from the raw target, "
+		          "origin (%d, %d) -> (%d, %d)",
+		          (unsigned long long)m_x_drag_moves, (unsigned long long)m_x_drag_snapped,
+		          m_x_drag_origin_x, m_x_drag_origin_y, m_x_drag_at_x, m_x_drag_at_y);
+	}
 }
 
 //! Map an X keysym onto the backend-neutral key identity.
@@ -1123,6 +1260,18 @@ DxrLinuxWindow::pump(const std::function<void(DxrKey)> &on_key, bool *running)
 		if (m_x_display == nullptr) {
 			return;
 		}
+		m_x_pump_count++;
+
+		// Motion coalescing (#1588): the X server can queue dozens of
+		// MotionNotify per frame and acting on each would issue dozens of
+		// XMoveWindow for one visible step. Only the LAST one matters — the
+		// target is derived from the absolute pointer position, not from a
+		// delta chain — so the whole queue is drained first and one move is
+		// issued below.
+		bool have_motion = false;
+		int motion_root_x = 0;
+		int motion_root_y = 0;
+
 		while (XPending(m_x_display) > 0) {
 			XEvent ev;
 			XNextEvent(m_x_display, &ev);
@@ -1136,8 +1285,51 @@ DxrLinuxWindow::pump(const std::function<void(DxrKey)> &on_key, bool *running)
 				if (k != DxrKey::Unknown) {
 					on_key(k);
 				}
+			} else if (ev.type == ButtonPress && ev.xbutton.button == Button1 && m_x_client_drag &&
+			           !m_x_test_drag_armed) {
+				// There is no title bar to aim at (the window is
+				// undecorated precisely so the WM does not own the drag),
+				// so button 1 ANYWHERE in the window starts a move. That
+				// is a test-app affordance, not a product one.
+				m_x_dragging = true;
+				m_x_drag_ptr_x = ev.xbutton.x_root;
+				m_x_drag_ptr_y = ev.xbutton.y_root;
+				x11_root_origin(m_x_display, m_x_window, &m_x_drag_origin_x, &m_x_drag_origin_y);
+				m_x_drag_at_x = m_x_drag_origin_x;
+				m_x_drag_at_y = m_x_drag_origin_y;
+				m_x_drag_moves = 0;
+				m_x_drag_snapped = 0;
+				// Grab so motion OUTSIDE the window keeps arriving: the
+				// pointer routinely leaves a window being dragged fast.
+				XGrabPointer(m_x_display, m_x_window, False,
+				             ButtonReleaseMask | PointerMotionMask | Button1MotionMask,
+				             GrabModeAsync, GrabModeAsync, None, None, CurrentTime);
+				DXRW_INFO("drag: start — grab origin (%d, %d), pointer (%d, %d)", m_x_drag_origin_x,
+				          m_x_drag_origin_y, m_x_drag_ptr_x, m_x_drag_ptr_y);
+			} else if (ev.type == MotionNotify && m_x_dragging) {
+				have_motion = true;
+				motion_root_x = ev.xmotion.x_root;
+				motion_root_y = ev.xmotion.y_root;
+			} else if (ev.type == ButtonRelease && ev.xbutton.button == Button1 && m_x_dragging) {
+				m_x_dragging = false;
+				XUngrabPointer(m_x_display, CurrentTime);
+				XFlush(m_x_display);
+				DXRW_INFO("drag: end — %llu move(s), %llu snapped away from the raw target, "
+				          "origin (%d, %d) -> (%d, %d)",
+				          (unsigned long long)m_x_drag_moves, (unsigned long long)m_x_drag_snapped,
+				          m_x_drag_origin_x, m_x_drag_origin_y, m_x_drag_at_x, m_x_drag_at_y);
 			}
 		}
+
+		if (have_motion && m_x_dragging) {
+			// Absolute, not incremental: origin + (pointer now - pointer at
+			// grab). A snap that holds the window back for a few pixels
+			// therefore never makes the window lag the pointer permanently.
+			x11_move_snapped(m_x_drag_origin_x + (motion_root_x - m_x_drag_ptr_x),
+			                 m_x_drag_origin_y + (motion_root_y - m_x_drag_ptr_y));
+		}
+
+		x11_drive_test_drag();
 		return;
 	}
 
@@ -1386,6 +1578,13 @@ DxrLinuxWindow::force_declare_geometry(uint32_t width, uint32_t height)
 	(void)height;
 	return false;
 #endif
+}
+
+void
+DxrLinuxWindow::set_snap_provider(SnapWindowOriginFn fn, void *userdata)
+{
+	m_snap_fn = fn;
+	m_snap_userdata = userdata;
 }
 
 const char *

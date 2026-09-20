@@ -36,6 +36,7 @@
 // headers, which is what makes those headers see the real Display / Window /
 // wl_display / wl_surface types instead of their self-contained stand-ins.
 #include "dxr_linux_window.h"
+#include "dxr_weave_snap.h"
 
 #include <vulkan/vulkan.h>
 
@@ -119,6 +120,11 @@ static volatile bool g_running = true;
 //! produces the matching XrSessionCreateInfo binding struct. Destroyed LAST —
 //! the runtime's VkSurfaceKHR borrows its connection.
 static DxrLinuxWindow g_window;
+
+//! xrWeaveSnapWindowRectDXR behind the window helper's plain snap callback
+//! (#1588). Identity until the runtime resolves the entry point; the drag
+//! mechanics are the same either way.
+static DxrWeaveSnap g_weaveSnap;
 
 // TEST HOOK, off unless DXR_CUBE_TEST_RESIZE=WxH is set. Drives one
 // xrSetWaylandSurfaceGeometryDXR call after a warm-up so the runtime's Wayland
@@ -1833,6 +1839,7 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
     bool hasWaylandBinding = false;
     bool hasDisplayInfo = false;
     bool hasViewRig = false;
+    bool hasWeave = false;
     for (const auto& ext : extensions) {
         if (strcmp(ext.extensionName, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME) == 0) {
             hasVulkan = true;
@@ -1848,6 +1855,9 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
         }
         if (strcmp(ext.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) {
             hasViewRig = true;
+        }
+        if (strcmp(ext.extensionName, XR_DXR_WEAVE_EXTENSION_NAME) == 0) {
+            hasWeave = true;
         }
     }
 
@@ -1909,6 +1919,19 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
     } else {
         LOG_INFO("XR_DXR_view_rig: %s — falling back to raw xrLocateViews fov",
                  hasViewRig ? "needs display_info" : "NOT FOUND");
+    }
+
+    // XR_DXR_weave (#1588): enabled for ONE entry point, xrWeaveSnapWindowRectDXR
+    // — the drag-time lattice snap that keeps the woven interlace phase invariant
+    // while a windowed 3D app is moved. This app is not a present-owner and never
+    // calls the weave SERVICE; the runtime's own compositor presents. Desktop Linux
+    // does not advertise the extension yet, in which case the snap stays identity
+    // and the client-owned drag behaves exactly the same, just unsnapped.
+    if (hasWeave) {
+        enabledExtensions.push_back(XR_DXR_WEAVE_EXTENSION_NAME);
+        LOG_INFO("XR_DXR_weave: AVAILABLE (enabled for the drag-time phase snap)");
+    } else {
+        LOG_INFO("XR_DXR_weave: NOT FOUND — window drags will not be phase-snapped");
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -2159,6 +2182,21 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     // reach the runtime. An older runtime simply has no such function and the
     // helper logs once.
     g_window.attach_session(xr.instance, xr.session);
+    // #1588: install the drag-time snap provider. The window helper owns the
+    // drag (undecorated toplevel + pointer grab, because a mutter-owned drag
+    // cannot be intercepted); the SNAP MATH is the vendor display processor's
+    // and is reached only through xrWeaveSnapWindowRectDXR.
+    {
+        uint32_t snapW = 0, snapH = 0;
+        g_window.current_size(&snapW, &snapH);
+        g_weaveSnap.attach(xr.instance, xr.session, snapW, snapH);
+        g_window.set_snap_provider(&DxrWeaveSnap::callback, &g_weaveSnap);
+        LOG_INFO("xrWeaveSnapWindowRectDXR: %s — a window drag %s",
+                 g_weaveSnap.available() ? "RESOLVED" : "unavailable on this runtime",
+                 g_weaveSnap.available()
+                     ? "will be phase-snapped by the display processor"
+                     : "lands on the raw pointer position (identity snap)");
+    }
     LOG_INFO("Session created (%s via %s: %s)",
              DxrLinuxWindow::backend_name(g_window.backend()),
              g_window.required_openxr_extension(), g_window.describe().c_str());
@@ -2393,7 +2431,16 @@ static void PrintUsage(const char* argv0) {
         "                                        frames, declare this new surface size\n"
         "                                        via xrSetWaylandSurfaceGeometryDXR, to\n"
         "                                        exercise the runtime's resize-follow\n"
-        "                                        without a user dragging a window edge.\n",
+        "                                        without a user dragging a window edge.\n"
+        "     DXR_X11_WM_DECORATIONS=1           X11 windowed: keep the WM's title bar and\n"
+        "                                        let the WM own the drag (the old\n"
+        "                                        behaviour). Default is undecorated +\n"
+        "                                        client-owned drag, so every move can be\n"
+        "                                        phase-snapped (#1588).\n"
+        "     DXR_X11_TEST_DRAG=dx,dy,steps      TEST HOOK, off by default. X11 windowed\n"
+        "                                        only: after ~60 frames walk the window\n"
+        "                                        dx,dy in `steps` snapped moves, through\n"
+        "                                        the same code path a pointer drag uses.\n",
         argv0);
 }
 
