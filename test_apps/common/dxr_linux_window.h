@@ -28,6 +28,21 @@
  *   mutter fullscreens onto whichever output the window currently occupies.
  *   A windowed size keeps the old behaviour; DXR_X11_NO_FULLSCREEN=1 opts out.
  *
+ * X11 CLIENT-OWNED DRAG (#1588):
+ *   A WINDOWED X11 toplevel is undecorated too, and this helper — not the
+ *   window manager — moves it. The reason is the weave: a WM-owned drag
+ *   (mutter's _NET_WM_MOVERESIZE grab) cannot be intercepted by the client, so
+ *   the window lands on an arbitrary pixel every frame and the lenticular
+ *   interlace phase re-lands with it, which reads as a shimmer/stutter. Windows
+ *   avoids this by snapping the window's position to the lens lattice DURING
+ *   the drag (WM_WINDOWPOSCHANGING -> the DP's snap_window_rect); the only way
+ *   to get the same hook under mutter is to own the drag. So: no decorations,
+ *   a button-1 pointer grab anywhere in the window, and every move routed
+ *   through the app-installed snap provider (see set_snap_provider(), which
+ *   the cube apps back with xrWeaveSnapWindowRectDXR) before XMoveWindow.
+ *   Post-map client moves ARE honoured by mutter (verified, #729).
+ *   DXR_X11_WM_DECORATIONS=1 restores the decorated, WM-dragged window.
+ *
  * ORDERING CONTRACT (both backends):
  *   create instance -> get system -> xrGetSystemProperties (panel rect, INV-1.3)
  *   -> DxrLinuxWindow::create() -> xrCreateSession with session_binding_chain()
@@ -231,6 +246,40 @@ public:
 	bool
 	force_declare_geometry(uint32_t width, uint32_t height);
 
+	/*!
+	 * Drag-time window-origin snap provider (#1588).
+	 *
+	 * A DELIBERATELY PLAIN function pointer: the snap math belongs to the
+	 * vendor display processor and reaches this helper through the app's
+	 * OpenXR session, but the helper itself must stay a window-system object
+	 * — it does not know what a session is and never calls OpenXR for this.
+	 *
+	 * @param userdata    whatever was handed to set_snap_provider()
+	 * @param origin_x/y  the window's root origin when the drag STARTED
+	 *                    (the phase reference — the snap is absolute, and the
+	 *                    DP wants to know where the travel began)
+	 * @param target_x/y  the proposed new root origin, pointer-derived
+	 * @param out_x/y     receives the lattice-snapped root origin
+	 * @return false when nothing was snapped; the helper then moves to the
+	 *         raw target and the out params are ignored.
+	 */
+	typedef bool (*SnapWindowOriginFn)(void *userdata,
+	                                   int32_t origin_x,
+	                                   int32_t origin_y,
+	                                   int32_t target_x,
+	                                   int32_t target_y,
+	                                   int32_t *out_x,
+	                                   int32_t *out_y);
+
+	/*!
+	 * Install (or clear, with @p fn nullptr) the snap provider. Call any time;
+	 * with none installed every drag move is an identity snap, which is the
+	 * correct behaviour against a runtime whose DP cannot snap — the drag
+	 * mechanics are the same either way.
+	 */
+	void
+	set_snap_provider(SnapWindowOriginFn fn, void *userdata);
+
 	//! Name of the binding extension this backend needs enabled at
 	//! xrCreateInstance, or nullptr when no window exists.
 	const char *
@@ -257,6 +306,60 @@ private:
 	Display *m_x_display = nullptr;
 	::Window m_x_window = 0;
 	Atom m_x_wm_delete = 0;
+
+	// --- Snap provider (#1588) ---------------------------------------------
+	SnapWindowOriginFn m_snap_fn = nullptr;
+	void *m_snap_userdata = nullptr;
+	//! One-shot: the first move of the first drag says whether anything snaps.
+	bool m_snap_reported = false;
+
+	// --- X11 client-owned drag (#1588) --------------------------------------
+	//! Windowed run with the WM's decorations + WM drag left in place
+	//! (DXR_X11_WM_DECORATIONS=1). No client drag then.
+	bool m_x_wm_drag = false;
+	/*!
+	 * This window owns its drag: windowed AND undecorated. FALSE for a
+	 * fullscreen window as well as for the DXR_X11_WM_DECORATIONS opt-out —
+	 * a fullscreen window must not be draggable at all, or a stray click
+	 * would slide the panel-sized weave off the panel.
+	 */
+	bool m_x_client_drag = false;
+	bool m_x_dragging = false;
+	int m_x_drag_ptr_x = 0;    //!< pointer root position at the grab
+	int m_x_drag_ptr_y = 0;    //!< ...
+	int m_x_drag_origin_x = 0; //!< window root origin at the grab (snap origin)
+	int m_x_drag_origin_y = 0; //!< ...
+	int m_x_drag_at_x = 0;     //!< where the window was last moved to
+	int m_x_drag_at_y = 0;     //!< ...
+	uint64_t m_x_drag_moves = 0;    //!< XMoveWindow calls this drag
+	uint64_t m_x_drag_snapped = 0;  //!< ...of which the snap changed the point
+
+	// --- X11 programmatic drag test hook (DXR_X11_TEST_DRAG, #1588) ---------
+	// Off by default. Walks the window along a straight path through the very
+	// same snap -> XMoveWindow code the pointer drag uses, so the mechanics
+	// are verifiable with nobody at the mouse. Not a fake X event: it drives
+	// the same code path one step per pump().
+	bool m_x_test_drag_armed = false;
+	bool m_x_test_drag_done = false;
+	int m_x_test_drag_dx = 0;
+	int m_x_test_drag_dy = 0;
+	int m_x_test_drag_steps = 0;
+	int m_x_test_drag_step = 0;
+	uint64_t m_x_pump_count = 0;
+
+	//! Run the snap provider, or identity when there is none / it declines.
+	//! Reports once, the first time it is asked, what it resolved to.
+	void
+	snap_origin(int origin_x, int origin_y, int target_x, int target_y, int *out_x, int *out_y);
+
+	//! snap_origin() + XMoveWindow, skipping a move that would not change the
+	//! window's position. Logs only when the snap actually moved the point.
+	void
+	x11_move_snapped(int target_x, int target_y);
+
+	//! One step of DXR_X11_TEST_DRAG, called from pump().
+	void
+	x11_drive_test_drag();
 
 	// --- Binding storage (handed to xrCreateSession) ------------------------
 	XrXlibWindowBindingCreateInfoDXR m_xlib_binding = {};
