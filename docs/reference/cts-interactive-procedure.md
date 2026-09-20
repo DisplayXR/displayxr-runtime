@@ -62,6 +62,26 @@ CTS reads every window rect, Kooima projection and view pose scaled wrong
 **If you build the CTS by hand, you lose that and every geometric judgement in
 this document is void.**
 
+**Verify the manifest is actually there before every interactive run — this is
+not optional, and a green-looking build does not prove it.** A
+`conformance_cli.exe` left on the box from *before* `fetch_build_cts.bat` grew
+the embed step is DPI-unaware and will be reused silently:
+
+```bat
+mt.exe -inputresource:conformance_cli.exe;#1 -out:m.xml
+findstr /i PerMonitorV2 m.xml
+```
+
+`PerMonitorV2` must be present. (`mt.exe` ships with the Windows SDK; it is on
+the path in a *Developer Command Prompt for VS 2022*.)
+
+**What it looks like when it is missing**, so you recognise it instead of
+filing it: the entire CTS scene renders at **1536×864 in the corner of the
+window**, with all text far too small to read. That is the DPI scale factor
+applied twice, not a compositor defect. It happened on the win box on
+2026-09-19 and cost a full composition pass. If you see it, stop, rebuild the
+CTS with `fetch_build_cts.bat`, re-check with `mt.exe`, and start the run over.
+
 ### 1.4 A clean, verified loader chain
 
 Before *and* after every run:
@@ -93,6 +113,21 @@ Pass `-ConformanceLayer`. It registers the Khronos
 `XR_APILAYER_KHRONOS_runtime_conformance` validation layer (and the
 `conformance_test_layer`) in HKLM and requests it with `-L`. A submission is not
 valid without it.
+
+> **Known open layer warning — expect it, do not re-diagnose it.** On the
+> composition category the layer currently warns on **every sub-case**:
+>
+> ```
+> XrEventDataSessionStateChanged: Suspicious session state transition to
+> XR_SESSION_STATE_SYNCHRONIZED when no frame(s) have been submitted and
+> session has not requested an exit.
+> ```
+>
+> This is **submission-relevant**, not cosmetic: the usage guide requires every
+> warning to be acceptably explained, and an unexplained one invalidates the
+> package. It is recorded in **#1580** and must be resolved or explained before
+> anything is submitted. Seeing it is not a reason to abort a practice run —
+> it is a reason not to call that run a submission.
 
 ---
 
@@ -247,20 +282,27 @@ an actions test silently burns its timeout.
 
 ### 4.4 The key map (source of truth: `qwerty_win32.c`)
 
-Focus is modal — the modifier you *hold* selects which controller the press goes
-to:
+Focus is modal, but **the modifier does not gate the controller buttons — it
+only redirects them.** `qwerty_process_win32()` resolves *two* independent
+targets each event, and this is the distinction that matters:
 
-| Modifier held | Target |
-|---|---|
-| *(none)* | HMD (present here), else the right controller |
-| **CTRL** | **left** controller |
-| **ALT** | **right** controller |
-| **CTRL + ALT** | **both** controllers simultaneously |
+| Modifier held | Movement / pose keys go to (`targets[]`) | Controller **buttons** go to (`ctrl_targets[]`) |
+|---|---|---|
+| *(none)* | the qwerty **HMD** (`default_qdev`) | the **right controller** (`default_qctrl`) |
+| **CTRL** | left controller | **left** controller |
+| **ALT** | right controller | **right** controller |
+| **CTRL + ALT** | both controllers | **both** controllers |
+
+With no modifier, `default_qdev` is the HMD but `default_qctrl` is resolved
+*separately* and is never the HMD — it is the right controller, by role or by
+fallback (`qwerty_win32.c`, `default_qwerty_controller()`). So **a bare
+left-click still fires a controller trigger and a bare `N` still fires a
+controller menu.** Only WASD/arrows/RMB-look change target with the modifier.
 
 Every modifier change calls `qwerty_release_all()` on all devices, so a button
 never "sticks" on the hand you just left.
 
-| Input | Action on the focused controller | OpenXR source path (simple profile) |
+| Input | Action on the targeted controller | OpenXR source path (simple profile) |
 |---|---|---|
 | **Left mouse button** | Trigger | `…/input/select/click` |
 | **N** | Menu | `…/input/menu/click` |
@@ -278,12 +320,23 @@ never "sticks" on the hand you just left.
 | Numpad + / − | Movement speed up / down | — |
 | TAB | Toggle the runtime HUD | — |
 
-So, in the two forms you will actually use:
+**For the composition and scenario categories, use no modifier at all:**
 
-- **Select, left hand** = hold **CTRL**, click **LMB**.
-- **Select, right hand** = hold **ALT**, click **LMB**.
-- **Menu, left hand** = hold **CTRL**, press **N**.
-- **Menu, right hand** = hold **ALT**, press **N**.
+| You want | Press |
+|---|---|
+| **Select** (= PASS) | **LMB** |
+| **Menu** (= show description + reference image) | **N**, held |
+| **FAIL** | hold **N**, click **LMB** while still holding, then release |
+
+That is the whole control set for judging a composition test. The CTS binds
+select and menu on **both** hands, so the bare (right-hand) press satisfies
+either binding — there is nothing to aim.
+
+**When the modifier does matter: the `[actions]` category.** Those tests name a
+specific top-level user path and wait for input *on that hand*, so there you
+must target explicitly — hold **CTRL** for `/user/hand/left`, **ALT** for
+`/user/hand/right` (§8.5). Elsewhere the modifier is noise, and worse than
+noise on a laptop (see the trackpad note below).
 
 Full table, including the HMD-focused stereo controls:
 [Qwerty Device Driver](qwerty-device.md) § 6.
@@ -368,8 +421,19 @@ hands**, so either hand works:
 - Releasing Menu returns to the content and the PASS prompt.
 
 So: **Select while looking at the content = PASS. Hold Menu, then Select =
-FAIL.** In this runtime's keys, with the left hand: `CTRL + LMB` passes;
-`CTRL+N` (held) then `CTRL + LMB` fails.
+FAIL.** In this runtime's keys, **with no modifier held**:
+
+| | Keys |
+|---|---|
+| PASS | click **LMB** |
+| See the description + reference image | hold **N** |
+| FAIL | hold **N**, click **LMB**, release **N** |
+
+Do **not** hold CTRL or ALT for this. A bare press already reaches a controller
+(§4.4), the CTS binds select/menu on both hands so it does not matter which,
+and holding a modifier while clicking is what triggers the Precision-Touchpad
+palm-rejection path — i.e. adding the modifier can only make the click *less*
+likely to register.
 
 There is no way to skip a test from inside the CTS. Judge it.
 
@@ -379,6 +443,24 @@ There is no way to skip a test from inside the CTS. Judge it.
 
 > Counts and names below are from the pinned tag **`openxr-cts-1.1.63.0`**.
 > Re-derive them if the pin moves.
+
+> ### ⚠ This category is currently runnable on `d3d11` only
+>
+> **#1581 — quad layers are accepted but never rendered on D3D12, Vulkan,
+> Vulkan2 and OpenGL.** Those renderers filter to projection / projection-depth
+> / zone layers and drop quads on the floor. Every CTS composition test puts its
+> **prompt, its labels and its reference image in quad layers**, so on four of
+> the five Windows graphics plug-ins the operator sees no prompt, no labels and
+> no quad content — the category is not merely failing there, it is
+> **unjudgeable**. Do not attempt a composition pass on `-Graphics d3d12`,
+> `vulkan`, `vulkan2` or `opengl` until #1581 lands; a run that produces no
+> visible prompt is a harness gap, not a result.
+>
+> **#1580 — projection-layer content is displaced relative to quad layers** on
+> the one plug-in that *does* draw quads (`d3d11`), so
+> `GradientFormatsLinearVsNonLinear` FAILs on every format sub-case and the
+> projection-vs-quad tests that make up most of this set are affected too. The
+> composition submission is blocked on both issues.
 
 **28 tests carry `[composition][interactive]`** at the pin. Ten of them skip on
 this runtime because the extension or view configuration they need is not
@@ -630,7 +712,7 @@ them:
 
 | Prompt (verbatim from the CTS) | What to do |
 |---|---|
-| `Use all controller inputs on\n/user/hand/left` — then a running counter `Used N/M inputs on: …` | Exercise **every** input on that hand. With CTRL held: **LMB** (trigger/select), **N** (menu), **MMB** (squeeze), **B** (system), **T/F/G/H** (thumbstick + trackpad), **V** (thumbstick click), RMB-drag and mouse-move (poses). Watch the counter climb; it tells you what is still missing. 600 s. |
+| `Use all controller inputs on\n/user/hand/left` — then a running counter `Used N/M inputs on: …` | Exercise **every** input on that hand. **This is the one category where the modifier is required** — the prompt names a hand, so hold **CTRL** for `/user/hand/left` (**ALT** for right) throughout: **LMB** (trigger/select), **N** (menu), **MMB** (squeeze), **B** (system), **T/F/G/H** (thumbstick + trackpad), **V** (thumbstick click), RMB-drag and mouse-move (poses). Watch the counter climb; it tells you what is still missing. 600 s. |
 | `Release all inputs` | Let go of everything. Release CTRL/ALT too — a modifier change calls `qwerty_release_all()`. Followed by a 2 s settle. |
 | `Activate any boolean .../click action when you feel the 3 second haptic vibration, e.g.: on <actions>` — and a short-pulse variant | **You will feel nothing.** See §8.6. |
 | `Place left controller somewhere static but trackable` / `Place right controller somewhere static but trackable. Keep left controller on and trackable.` / `Place controller somewhere static but trackable` (then a 5 s sleep) | **Do nothing at all.** See §8.7. |
@@ -1004,6 +1086,28 @@ The equirect1 table is the same six rows with `scale`/`bias` in place of the
 angles (`{1.0, 1.0}` / `{0, 0}` for 1–4, `{0.25, 0.5}` / `{0, 0}` for 5–6). You
 will not see them — the extension is off — but if `XRT_FEATURE_OPENXR_LAYER_
 EQUIRECT1` is ever turned on, the judgement rules above transfer unchanged.
+
+---
+
+## 11. Run evidence
+
+One row per recorded interactive run. A run is only submission evidence if it is
+listed here as **valid**; anything else is practice.
+
+| Date | Category | Graphics | DP / mode | Result | Status |
+|---|---|---|---|---|---|
+| 2026-09-19 | composition | `d3d11` | sim-display, `SIM_DISPLAY_OUTPUT=2d` | `interactive_composition_d3d11.xml` — 16 pass / 11 skip / 0 fail | **VOID — do not submit, must be redone** |
+
+**Why the 2026-09-19 `d3d11` composition run is void.** It was judged before the
+operator understood the controls (§4.4/§5.1: the doc then said a modifier was
+required for Select/Menu, which is wrong), so the pass/fail decisions in it do
+not reflect what was on screen. Its own headline result contradicts what a
+correct pass finds: `GradientFormatsLinearVsNonLinear` is now known to FAIL on
+every format sub-case (#1580), and it is recorded there as 0 fail. The XML,
+console log and stdout log are kept as an artefact of the defect hunt only.
+
+Redo it once **#1580** and **#1581** land, on a `conformance_cli.exe` whose DPI
+manifest has been verified with `mt.exe` (§1.3), and add a new row.
 
 ---
 
