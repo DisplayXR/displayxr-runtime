@@ -3271,6 +3271,10 @@ static void PrintUsage(const char* argv0) {
 }
 
 int main(int argc, char** argv) {
+    // Line-buffer stdout even when redirected: LOG_INFO writes are otherwise block-
+    // buffered and vanish when `timeout` SIGTERMs the process (every INFO line of a
+    // redirected run was lost; the runtime's stderr log survived, the app's did not).
+    setvbuf(stdout, nullptr, _IOLBF, 0);
     signal(SIGINT, SignalHandler);
     signal(SIGTERM, SignalHandler);
 
