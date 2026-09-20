@@ -196,10 +196,55 @@ fail the lane. Two reasons, and neither is "we expect them to be red":
 **To gate an arm:** delete its name from `EXPERIMENTAL_LINUX`. Nothing else in
 `cts.yml` changes. Record the run that earned it in the table below.
 
-| Arm | Flip evidence | Gated? |
+| Arm | Latest full-run evidence | Gated? |
 |---|---|---|
-| Linux `vulkan` | _(pending — first full run)_ | no |
-| Linux `vulkan2` | _(pending — first full run)_ | no |
+| Linux `vulkan` | run 35483149562 — 20476 assertions, **0 failures, 62 errors**, 35 skipped. One cause, below. | no |
+| Linux `vulkan2` | run 35483149562 — 40046 assertions, **0 failures, 0 errors**, 39 skipped (63/63 test cases). Clean. | no |
+
+Identity recorded on both: `llvmpipe (LLVM 20.1.2, 256 bits)`,
+`PHYSICAL_DEVICE_TYPE_CPU`, Mesa 25.2.8, ICD
+`/usr/share/vulkan/icd.d/lvp_icd.json`.
+
+### The one Linux finding: `xrGetVulkanDeviceExtensionsKHR` is unfiltered off Windows
+
+All 62 `vulkan` errors are the same exception, thrown by the **CTS's own**
+device creation (`graphics_plugin_vulkan.cpp:1383`, `InitializeDevice`) before
+any runtime code runs:
+
+```
+VkResult failure ERROR_EXTENSION_NOT_PRESENT
+```
+
+`XR_KHR_vulkan_enable` (enable1) has the **app** create the `VkDevice`, enabling
+verbatim whatever `xrGetVulkanDeviceExtensionsKHR` hands back. On desktop Linux
+that string (`comp_vk_glue.c`, the `XRT_GRAPHICS_BUFFER_HANDLE_IS_FD` arm)
+unconditionally names four extensions that a headless lavapipe does not expose —
+`lvp_device.c` enables each only behind `HAVE_LIBDRM` *and* a real DRM device's
+dmabuf / `native_fence_fd` caps, and a hosted runner has no `/dev/dri`:
+
+* `VK_EXT_external_memory_dma_buf` and `VK_EXT_image_drm_format_modifier`
+  (added for the PipeWire desktop-background capture, runtime#757)
+* `VK_KHR_external_semaphore_fd` and `VK_KHR_external_fence_fd`
+
+`vulkan2` is clean because **enable2 has the runtime create the device**, and
+`oxr_vulkan.c` already treats the FD sync pair as optional-if-present and never
+asks for the dma-buf pair at all. So the two lists disagree: what enable2 asks
+for and what the enable1 string advertises are not the same set.
+
+The fix shape already exists — #1539 built exactly this filter, dropping
+not-present names from the `xrGetVulkanDeviceExtensionsKHR` answer — but it is
+written inside `#ifdef OXR_HAVE_WIN32_EXTERNAL_LIST`
+(`oxr_vulkan.c::oxr_vk_device_exts_for_system`), so on Linux the function
+returns the compile-time constant unchanged. Generalising that filter to every
+platform is the work; no issue is filed for it here.
+
+Note what this is and is not. It is a real runtime/environment mismatch that a
+real-GPU Linux box would not show (an NVIDIA or Mesa-on-DRM device exposes all
+four), which is precisely the class of thing a software tier exists to find —
+the same shape as #1539 on Windows. It is **not** a quarantine candidate: a
+device-creation failure takes out every session-creating test rather than a
+nameable few, which is rule 2 of
+`scripts/cts_quarantine_software_tier.txt`.
 
 ### What is Linux-specific, and what deliberately is not
 

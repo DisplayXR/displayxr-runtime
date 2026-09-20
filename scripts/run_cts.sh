@@ -452,6 +452,17 @@ echo "EXITCODE: $RC"
       sed 's/^/  /'
     echo "vulkaninfo --summary (head):"
     vulkaninfo --summary 2>/dev/null | sed -n '1,40p' | sed 's/^/  /'
+    # The DEVICE extension set, recorded in full. An enable1 app enables
+    # verbatim whatever xrGetVulkanDeviceExtensionsKHR hands it, so a single
+    # name the ICD does not expose fails vkCreateDevice with
+    # VK_ERROR_EXTENSION_NOT_PRESENT and takes out every session-creating test
+    # at once — with no indication anywhere of WHICH name. That is how the
+    # linux `vulkan` arm reads in run 35483149562. Dump the list so the answer
+    # is a diff against the artifact instead of another CI round.
+    echo "device extensions reported by the ICD:"
+    vulkaninfo 2>/dev/null |
+      sed -n '/Device Extensions/,/^$/p' |
+      grep -aoE 'VK_[A-Za-z0-9_]+' | sort -u | sed 's/^/  /'
   else
     echo "vulkaninfo: (not installed — apt: vulkan-tools)"
   fi
