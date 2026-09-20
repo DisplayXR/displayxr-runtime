@@ -501,6 +501,24 @@ getRenderAdapter(int32_t panel_screen_left,
 	return RenderAdapterChoice{winner.adapter, winner.desc.AdapterLuid, provenance, false};
 }
 
+/*!
+ * #1571 — see the header. Defined INSIDE the namespace, above its closing
+ * brace, because `classify`/`can_present` are anonymous-namespace helpers of
+ * this file and the whole point is not to restate their rule. `extern "C"`
+ * still gives it C linkage and the unmangled name the C header declares.
+ */
+extern "C" bool
+d3d_adapter_is_software_or_remote(uint32_t vendor_id, uint32_t device_id, uint32_t dxgi_adapter_flags)
+{
+	// DedicatedVideoMemory is deliberately left at zero: it only separates
+	// Discrete from Integrated, and can_present() cares about neither.
+	DXGI_ADAPTER_DESC1 desc{};
+	desc.VendorId = vendor_id;
+	desc.DeviceId = device_id;
+	desc.Flags = dxgi_adapter_flags;
+	return !can_present(desc, classify(desc));
+}
+
 } // namespace xrt::auxiliary::d3d
 
 

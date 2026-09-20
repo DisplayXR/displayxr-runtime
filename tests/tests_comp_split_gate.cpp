@@ -20,6 +20,7 @@
 
 #include "catch_amalgamated.hpp"
 
+#include <stdlib.h>
 #include <string.h>
 
 static struct comp_split_luid
@@ -117,6 +118,61 @@ TEST_CASE("#918: the gate always names a short reason when the split is off")
 		CHECK(strcmp(out.reason, COMP_SPLIT_REASON_HANDLED) == 0);
 		REQUIRE(out.short_reason != nullptr);
 		CHECK(strcmp(out.short_reason, COMP_SPLIT_REASON_SAME_ADAPTER) == 0);
+	}
+}
+
+TEST_CASE("#1571: a SOFTWARE scanout adapter declines the ADR-039 same-adapter engage")
+{
+	// The env is latched per process and is the manual override in both
+	// directions, so these sections only mean anything with it unset — which
+	// is how ctest runs. Skip rather than assert a value the operator chose.
+	if (getenv("DXR_SPLIT_SAME_ADAPTER") != nullptr) {
+		SUCCEED("DXR_SPLIT_SAME_ADAPTER is set — the override, not the default, is under test");
+		return;
+	}
+
+	struct comp_split_gate_inputs in = {};
+	struct comp_split_gate_result out = {};
+	in.requested = true;
+	in.scanout_resolved = true;
+	in.allow_same_adapter = true; // the accepted ADR-039 default
+
+	SECTION("same adapter + real GPU still ENGAGES — a real GPU is unaffected")
+	{
+		in.render_luid = luid(0x1234, 0);
+		in.scanout_luid = luid(0x1234, 0);
+		in.scanout_software = false;
+		comp_split_gate_evaluate(&in, &out);
+		CHECK(out.split_active);
+		CHECK(out.same_adapter);
+	}
+
+	SECTION("same adapter + software rasterizer DECLINES, and names why")
+	{
+		in.render_luid = luid(0x1234, 0);
+		in.scanout_luid = luid(0x1234, 0);
+		in.scanout_software = true;
+		comp_split_gate_evaluate(&in, &out);
+		CHECK_FALSE(out.split_active);
+		CHECK(out.same_adapter);
+		// Not a failure: the caller logs its own line, so no fallback WARN.
+		REQUIRE(out.reason != nullptr);
+		CHECK(strcmp(out.reason, COMP_SPLIT_REASON_HANDLED) == 0);
+		REQUIRE(out.short_reason != nullptr);
+		CHECK(strcmp(out.short_reason, COMP_SPLIT_REASON_SOFTWARE_SCANOUT) == 0);
+	}
+
+	SECTION("a CROSS-adapter box is untouched by the software flag")
+	{
+		// The flag is only ever read on the same-adapter branch: when the
+		// panel is on another adapter the split's original purpose — moving
+		// the copy — still holds, whatever that adapter is.
+		in.render_luid = luid(0x1234, 0);
+		in.scanout_luid = luid(0x5678, 0);
+		in.scanout_software = true;
+		comp_split_gate_evaluate(&in, &out);
+		CHECK(out.split_active);
+		CHECK_FALSE(out.same_adapter);
 	}
 }
 

@@ -59,6 +59,7 @@
 #include "math/m_api.h"
 #include "d3d/d3d_dxgi_formats.h"
 #include "d3d/d3d_scanout_helpers.hpp"
+#include "d3d/d3d_render_adapter.h"
 #include "d3d/d3d_weave_placement.h"
 #include "util/u_tiling.h"
 #include "util/u_canvas.h"
@@ -4437,6 +4438,24 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 			gin.scanout_resolved = scanout && SUCCEEDED(scanout->GetDesc(&sdesc));
 			gin.render_luid = d3d11_split_luid(app_luid);
 			gin.scanout_luid = d3d11_split_luid(sdesc.AdapterLuid);
+			/*
+			 * #1571: is that adapter a software rasterizer (WARP / the
+			 * Microsoft Basic Render Driver) or a remote one? Only the
+			 * same-adapter branch of the gate reads this. DESC1 carries
+			 * the SOFTWARE/REMOTE flags; when the query is unavailable
+			 * we still pass the vendor/device id, which catches the
+			 * Basic Render Driver on its own.
+			 */
+			if (gin.scanout_resolved) {
+				UINT sflags = 0;
+				DXGI_ADAPTER_DESC1 sdesc1{};
+				auto scanout1 = scanout.try_query<IDXGIAdapter1>();
+				if (scanout1 && SUCCEEDED(scanout1->GetDesc1(&sdesc1))) {
+					sflags = sdesc1.Flags;
+				}
+				gin.scanout_software =
+				    d3d_adapter_is_software_or_remote(sdesc.VendorId, sdesc.DeviceId, (uint32_t)sflags);
+			}
 		}
 
 		// ADR-039 Phase C ACCEPTED (#1264, 2026-08-29: engage clean,
@@ -4469,6 +4488,25 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 			    "D3D11 output-device split: ADR-039 same-adapter ENGAGE on "
 			    "'%ls' LUID=%08lx:%08lx — one fill engine for every tier "
 			    "(DXR_SPLIT_SAME_ADAPTER=0 reverts)",
+			    sdesc.Description, (unsigned long)sdesc.AdapterLuid.HighPart,
+			    (unsigned long)sdesc.AdapterLuid.LowPart);
+		} else if (gate.same_adapter && split_off_reason != nullptr &&
+		           strcmp(split_off_reason, COMP_SPLIT_REASON_SOFTWARE_SCANOUT) == 0) {
+			/*
+			 * #1571: ADR-039 would have engaged, but the one adapter is a
+			 * software rasterizer, so there is no fill engine to decouple
+			 * and the split's machinery (a second device, two D3D12 copy
+			 * queues, a 3-deep egress ring, the egress rebuild's 2 s drains
+			 * on the app thread) would compete for the same cores. Say why,
+			 * once per session, so a WARP log never leaves this unexplained.
+			 * A real GPU never reaches this branch.
+			 */
+			U_LOG_W(
+			    "D3D11 output-device split: scanout adapter '%ls' LUID=%08lx:%08lx is a SOFTWARE "
+			    "or remote adapter — the ADR-039 same-adapter engage is declined, because there "
+			    "is no separate fill engine to decouple and the bridge would only contend for the "
+			    "same cores (#1571). A real GPU is unaffected; DXR_SPLIT_SAME_ADAPTER=1 forces "
+			    "the split on here anyway, =0 forces it off everywhere",
 			    sdesc.Description, (unsigned long)sdesc.AdapterLuid.HighPart,
 			    (unsigned long)sdesc.AdapterLuid.LowPart);
 		} else if (gate.same_adapter) {
