@@ -569,6 +569,8 @@ struct comp_vk_native_compositor
 	//! One-shot guard for the X11 present-origin refusal WARN (see
 	//! @ref vk_x11_present_origin_is_panel_native). Never per frame.
 	bool warned_x11_origin_units;
+	//! One-shot: window-scoped metrics took the runtime-resolved panel origin over the DP's (0,0).
+	bool warned_metrics_origin_override;
 #endif
 
 #ifdef XRT_OS_ANDROID
@@ -9495,6 +9497,30 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 	}
 	if (!have_disp) {
 		return false;
+	}
+	// ADR-033: the runtime's resolved panel origin is authoritative for
+	// window-scoped metrics. The DP's own screen position is whatever the vendor
+	// SDK reports, and on XWayland that is (0,0) — there is no RandR EDID
+	// property to match, and srDisplayGetLocation returns the CRTC rect — so
+	// taking it here put the window-centre offset, and with it the Kooima
+	// projection and the present-origin feed, in laptop-desktop coordinates: a
+	// panel-sized window on a second monitor at x=3456 was projected as if it
+	// sat 3456 px right of the panel's centre (observed on the DS1, 2026-09-20).
+	// sys_info carries the origin the desktop resolver validated or overrode
+	// (fill_display_desktop_info), so prefer it whenever it describes this panel.
+	if (c->sys_info_set && c->sys_info.display_pixel_width == disp_px_w &&
+	    c->sys_info.display_pixel_height == disp_px_h &&
+	    (c->sys_info.display_screen_left != disp_left || c->sys_info.display_screen_top != disp_top)) {
+		if (!c->warned_metrics_origin_override) {
+			U_LOG_W(
+			    "get_window_metrics: the display processor reports its panel at (%d, %d) but the runtime "
+			    "resolved it at (%d, %d) — using the runtime's origin for window-scoped metrics (Kooima "
+			    "projection + present origin), per ADR-033",
+			    disp_left, disp_top, c->sys_info.display_screen_left, c->sys_info.display_screen_top);
+			c->warned_metrics_origin_override = true;
+		}
+		disp_left = c->sys_info.display_screen_left;
+		disp_top = c->sys_info.display_screen_top;
 	}
 
 	uint32_t win_px_w = 0, win_px_h = 0;
