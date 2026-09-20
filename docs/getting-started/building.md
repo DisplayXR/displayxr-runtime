@@ -121,6 +121,30 @@ and a systemd `--user` unit — no root. `sudo ./install.sh --system` for
 machine-wide. Dev iteration without installing stays `XR_RUNTIME_JSON` +
 `XRT_PLUGIN_SEARCH_PATH` per `docs/roadmap/linux-support.md`.
 
+**Running the OpenXR CTS locally (#1527).** `scripts/fetch_build_cts.sh` clones
+and builds the Khronos conformance suite at the pin the whole matrix shares
+(`openxr-cts-1.1.63.0`); `scripts/run_cts.sh` runs it against the dev build's
+`openxr_displayxr-dev.json` + the staged `sim-display` plug-in. It needs an X
+server because the Vulkan compositor presents to an X11/XCB surface — but *only*
+an X server: no window manager, since the in-process native path reports the
+session focused without X input focus. On a box with a real GPU and a real X
+session, run the same thing CI runs minus the software flags — and the
+software-tier quarantine goes with them, so the frame-timing test is included:
+
+```bash
+./scripts/build_linux.sh                              # runtime + sim-display plug-in
+./scripts/fetch_build_cts.sh --apt                    # CTS at the pinned tag (sudo apt for deps)
+./scripts/run_cts.sh -g vulkan  --scope full --conformance-layer
+./scripts/run_cts.sh -g vulkan2 --scope full --conformance-layer
+```
+
+Headless (no display, e.g. over SSH) add `--xvfb --software`, which is exactly
+the hosted lane: a throwaway `Xvfb` plus Mesa lavapipe. `--scope smoke` for a
+fast slice. Results land in `$TMPDIR` as `cts_<tag>.xml` plus console/stdout/
+runtime logs and a `_graphics_identity.txt` recording which ICD answered —
+`--out-dir` moves them. Detail: `docs/roadmap/cts-windows-handoff.md` §
+*Linux arms*.
+
 ### Windows (recommended)
 ```bat
 scripts\build_windows.bat all
