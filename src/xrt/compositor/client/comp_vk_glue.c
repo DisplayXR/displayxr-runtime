@@ -78,6 +78,16 @@ const char *xrt_gfx_vk_device_extensions = VK_KHR_DEDICATED_ALLOCATION_EXTENSION
     // weaves with), so the device needs the dma-buf import set. Universally
     // supported by Mesa and the NVIDIA driver on the desktop-Linux targets we
     // ship (Preview).
+    //
+    // #1576: listed here, but OPTIONAL-if-present, exactly like the Win32
+    // trio below. Mesa's lavapipe gates both behind HAVE_LIBDRM plus a real
+    // DRM device, so a software ICD fails vkCreateDevice on this string alone.
+    // This is a compile-time constant and cannot express that, so the filter
+    // lives at the one place that reads it — oxr_vulkan.c's
+    // oxr_vk_get_device_exts(), which drops any name in
+    // optional_filtered_device_extensions[] that the suggested physical device
+    // does not report. Keep the names here so a real DRM GPU still gets the
+    // full, byte-identical list.
     " " VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME " " VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME
 #endif
 
@@ -122,6 +132,13 @@ const char *xrt_gfx_vk_device_extensions = VK_KHR_DEDICATED_ALLOCATION_EXTENSION
 #if !defined(XRT_OS_MACOS)
     // FD sync extensions are optional on macOS — MoltenVK may not support them.
     // They're handled as optional by oxr_vulkan.c's optional_device_extensions[].
+    //
+    // #1576: on desktop Linux they are optional-if-present for the SAME reason
+    // they are absent on macOS, just with a different ICD — lavapipe without a
+    // DRM node reports neither. Named unconditionally here and dropped by
+    // oxr_vk_get_device_exts()'s filter when the physical device lacks them;
+    // VK_KHR_external_memory_fd above stays REQUIRED (cross-process image
+    // import has no fallback, and every ICD we target reports it).
     " " VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME " " VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME
     " " VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME
 #endif

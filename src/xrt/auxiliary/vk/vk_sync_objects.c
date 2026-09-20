@@ -27,6 +27,19 @@ static VkExternalSemaphoreHandleTypeFlagBits
 vk_get_semaphore_handle_type(struct vk_bundle *vk)
 {
 #if defined(XRT_GRAPHICS_SYNC_HANDLE_IS_FD)
+	/*
+	 * #1576: the FD twin of the Win32 note below. `vk->external.*` reports what
+	 * the PHYSICAL DEVICE can do, which says nothing about whether the
+	 * now-optional VK_KHR_external_semaphore_fd was enabled on the logical
+	 * device — and on an adopted device `has_KHR_external_semaphore_fd` is
+	 * whatever the caller of vk_init_from_given claimed, which for every
+	 * enable1 app is an unconditional `true`. Export and import both ride that
+	 * extension's entry points, so answer "none" when it is absent and let the
+	 * caller degrade.
+	 */
+	if (!vk_has_external_semaphore_fd(vk)) {
+		return 0;
+	}
 	if (vk->external.binary_semaphore_opaque_fd) {
 		return VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
 	}
@@ -59,6 +72,10 @@ static VkExternalSemaphoreHandleTypeFlagBits
 vk_get_timeline_semaphore_handle_type(struct vk_bundle *vk)
 {
 #if defined(XRT_GRAPHICS_SYNC_HANDLE_IS_FD)
+	// #1576: see vk_get_semaphore_handle_type().
+	if (!vk_has_external_semaphore_fd(vk)) {
+		return 0;
+	}
 	if (vk->external.timeline_semaphore_opaque_fd) {
 		return VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
 	}
@@ -123,6 +140,13 @@ vk_create_and_submit_fence_native(struct vk_bundle *vk, xrt_graphics_sync_handle
 	VkResult ret;
 
 #if defined(XRT_GRAPHICS_SYNC_HANDLE_IS_FD)
+	// #1576: VK_KHR_external_fence_fd is optional-if-present on desktop Linux.
+	if (!vk_has_external_fence_fd(vk)) {
+		VK_ERROR(vk,
+		         "vk_create_and_submit_fence_native: VK_KHR_external_fence_fd is not enabled on this "
+		         "device - cannot export a fence fd");
+		return VK_ERROR_EXTENSION_NOT_PRESENT;
+	}
 	const VkExternalFenceHandleTypeFlags handle_type = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT;
 #elif defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE)
 	// #1539: VK_KHR_external_fence_win32 is optional-if-present.
@@ -239,6 +263,18 @@ create_semaphore_and_native(struct vk_bundle *vk,
 	xrt_graphics_sync_handle_t native = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
 	VkSemaphore semaphore = VK_NULL_HANDLE;
 	VkResult ret;
+
+#if defined(XRT_GRAPHICS_SYNC_HANDLE_IS_FD)
+	// #1576: VK_KHR_external_semaphore_fd is optional-if-present on desktop
+	// Linux. Both pickers already refuse without it, but this helper is the
+	// one that touches the entry point, so it checks for itself.
+	if (!vk_has_external_semaphore_fd(vk)) {
+		VK_ERROR(vk,
+		         "create_semaphore_and_native: VK_KHR_external_semaphore_fd is not enabled on this "
+		         "device - cannot export a semaphore fd");
+		return VK_ERROR_EXTENSION_NOT_PRESENT;
+	}
+#endif
 
 	VkExportSemaphoreCreateInfo export_info = {
 	    .sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
@@ -361,7 +397,15 @@ vk_create_fence_sync_from_native(struct vk_bundle *vk, xrt_graphics_sync_handle_
 	VkFence fence = VK_NULL_HANDLE;
 	VkResult ret;
 
-#if defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE)
+#if defined(XRT_GRAPHICS_SYNC_HANDLE_IS_FD)
+	// #1576: VK_KHR_external_fence_fd is optional-if-present on desktop Linux.
+	if (!vk_has_external_fence_fd(vk)) {
+		VK_ERROR(vk,
+		         "vk_create_fence_sync_from_native: VK_KHR_external_fence_fd is not enabled on this "
+		         "device - cannot import a fence fd");
+		return VK_ERROR_EXTENSION_NOT_PRESENT;
+	}
+#elif defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE)
 	// #1539: VK_KHR_external_fence_win32 is optional-if-present.
 	if (!vk_has_external_fence_win32(vk)) {
 		VK_ERROR(vk,
@@ -441,7 +485,18 @@ create_semaphore_from_native(struct vk_bundle *vk,
 {
 	VkResult ret;
 
-#if defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE)
+#if defined(XRT_GRAPHICS_SYNC_HANDLE_IS_FD)
+	// #1576: VK_KHR_external_semaphore_fd is optional-if-present on desktop
+	// Linux. vk_create_semaphore_from_native() hardcodes the OPAQUE_FD handle
+	// type rather than going through vk_get_semaphore_handle_type(), so the
+	// picker's refusal does not cover this path.
+	if (!vk_has_external_semaphore_fd(vk)) {
+		VK_ERROR(vk,
+		         "create_semaphore_from_native: VK_KHR_external_semaphore_fd is not enabled on this "
+		         "device - cannot import a semaphore fd");
+		return VK_ERROR_EXTENSION_NOT_PRESENT;
+	}
+#elif defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE)
 	// #1539: VK_KHR_external_semaphore_win32 is optional-if-present.
 	if (!vk_has_external_semaphore_win32(vk)) {
 		VK_ERROR(vk,

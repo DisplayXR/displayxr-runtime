@@ -745,6 +745,48 @@ vk_has_external_fence_win32(const struct vk_bundle *vk)
 
 /*
  *
+ * FD external-sync capability checks (#1576).
+ *
+ * The desktop-Linux twin of the block above. `VK_KHR_external_semaphore_fd`
+ * and `VK_KHR_external_fence_fd` have always been optional on the enable2 path
+ * (`optional_device_extensions[]`) and are now optional in the enable1 string
+ * too, so a device can legitimately arrive without them — a software ICD
+ * (lavapipe without a DRM node) reports neither, and the in-process
+ * XCB/Wayland `vk_native` compositor never asks for them
+ * (`vk_init_from_given(..., external_fence_fd_enabled = false,
+ * external_semaphore_fd_enabled = false, ...)`).
+ *
+ * The `has_KHR_external_{fence,semaphore}_fd` bools cannot answer this on an
+ * adopted device: `vk_init_from_given` sets them from what the CALLER claims,
+ * and `oxr_session_gfx_vk.c` claims true for every enable1 app on principle
+ * ("we always return these extensions as required for version 1"). Likewise
+ * `vk->external.*_opaque_fd` reports what the PHYSICAL DEVICE can do, which
+ * says nothing about the logical device. `vkGetDeviceProcAddr` is the one
+ * source that cannot lie: it returns NULL for a command whose device extension
+ * was not enabled.
+ *
+ * Same local-resolution rationale as the Win32 block — no new `vk_bundle`
+ * slot, because the bundle crosses the plug-in ABI boundary (ADR-020).
+ *
+ */
+
+//! Is `VK_KHR_external_semaphore_fd` enabled on this device? @ingroup aux_vk
+static inline bool
+vk_has_external_semaphore_fd(const struct vk_bundle *vk)
+{
+	return vk->vkImportSemaphoreFdKHR != NULL && vk->vkGetSemaphoreFdKHR != NULL;
+}
+
+//! Is `VK_KHR_external_fence_fd` enabled on this device? @ingroup aux_vk
+static inline bool
+vk_has_external_fence_fd(const struct vk_bundle *vk)
+{
+	return vk->vkImportFenceFdKHR != NULL && vk->vkGetFenceFdKHR != NULL;
+}
+
+
+/*
+ *
  * String helper functions.
  *
  */
