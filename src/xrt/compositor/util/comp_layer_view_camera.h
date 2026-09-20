@@ -30,6 +30,7 @@
 
 #include "xrt/xrt_compositor.h"
 #include "xrt/xrt_defines.h"
+#include "xrt/xrt_display_metrics.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -135,6 +136,47 @@ comp_layer_view_camera_select_ex(const struct comp_layer_accum *accum,
                                  float canvas_w_m,
                                  float canvas_h_m,
                                  struct comp_layer_view_camera *out);
+
+/*!
+ * @copybrief comp_layer_view_camera_select
+ *
+ * The full-fidelity entry point: takes the DP's WHOLE per-view eye set plus the
+ * frame's ACTIVE view count, and derives branch (b)'s render eye with exactly
+ * the two rules the state tracker applies before it computes the pose and FOV
+ * it hands the app at `xrLocateViews`. Both rules are invisible to a caller
+ * that only has a left/right pair, and both make the compositor's camera
+ * disagree with the located view when they bite:
+ *
+ *  - **Mono collapse.** When the active rendering mode has ONE view but the DP
+ *    still reports N >= 2 eyes, the render eye is the CENTROID of that set, not
+ *    eye 0. Pairing the centred pose oxr reports with eye 0's off-axis frustum
+ *    is the 2D lateral shift of modelviewer#100; the collapse lives in
+ *    `oxr_session_locate_views()` (oxr_session.c, the `active_view_count == 1`
+ *    branch) in-process and in `ipc_try_get_sr_view_poses()`
+ *    (ipc_server_handler.c, #521/#575) over IPC. This is its compositor twin.
+ *
+ *  - **Per-view eyes, surplus views clamped.** View i renders from eye i, not
+ *    from a left/right pair — a 4-view (2x2 quad) mode has four DISTINCT eyes,
+ *    two of them a full 64 mm apart vertically. Views past the reported eye
+ *    count reuse the LAST eye, which is the same surplus-slot rule the state
+ *    tracker's #615 eye-set coherence guard applies.
+ *
+ * @param eyes              The DP's per-view eye set, in the head-relative
+ *                          layer space (nullable / count 0 -> skip (b)).
+ * @param active_view_count The active rendering mode's view count; 0 means
+ *                          "same as @p eyes->count" (no collapse).
+ *
+ * @ingroup comp_util
+ */
+bool
+comp_layer_view_camera_select_eyes(const struct comp_layer_accum *accum,
+                                   uint32_t view_index,
+                                   const struct xrt_eye_positions *eyes,
+                                   uint32_t active_view_count,
+                                   const struct xrt_vec3 *canvas_center,
+                                   float canvas_w_m,
+                                   float canvas_h_m,
+                                   struct comp_layer_view_camera *out);
 
 /*!
  * N-view eye-visibility, the generalisation of the stereo parity rule.

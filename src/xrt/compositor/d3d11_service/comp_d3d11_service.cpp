@@ -20452,22 +20452,35 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			    ui_wm.valid && ui_wm.window_width_m > 0.0f && ui_wm.window_height_m > 0.0f;
 		}
 
+		/*
+		 * The eye set, rebased into the canvas-centred IPC layer space ONCE
+		 * (so the resolver's canvas centre stays the origin), then handed to
+		 * the shared resolver WHOLE along with this frame's active view
+		 * count. That count is what lets the resolver apply the mono collapse
+		 * the IPC server itself applies before it reports a view
+		 * (ipc_try_get_sr_view_poses, #521/#575): one view, two eyes => the
+		 * CENTROID, never eye 0's off-axis frustum.
+		 */
+		struct xrt_eye_positions ui_eyes = eye_pos;
+		if (ui_eyes.count == 0) {
+			ui_eyes.eyes[0] = {left_eye.x, left_eye.y, left_eye.z};
+			ui_eyes.eyes[1] = {right_eye.x, right_eye.y, right_eye.z};
+			ui_eyes.count = 2;
+		}
+		if (have_ui_wm) {
+			for (uint32_t i = 0; i < ui_eyes.count && i < XRT_MAX_VIEWS; i++) {
+				ui_eyes.eyes[i].x -= ui_wm.window_center_offset_x_m;
+				ui_eyes.eyes[i].y -= ui_wm.window_center_offset_y_m;
+				ui_eyes.eyes[i].z -= ui_wm.window_center_offset_z_m;
+			}
+		}
+
 		struct comp_layer_view_camera ui_cameras[XRT_MAX_VIEWS] = {};
 		for (uint32_t view = 0; view < ui_view_count; view++) {
-			struct xrt_vec3 eye;
-			if (view < eye_pos.count) {
-				eye = {eye_pos.eyes[view].x, eye_pos.eyes[view].y, eye_pos.eyes[view].z};
-			} else {
-				eye = (view == 0) ? left_eye : right_eye;
-			}
-			if (have_ui_wm) {
-				eye.x -= ui_wm.window_center_offset_x_m;
-				eye.y -= ui_wm.window_center_offset_y_m;
-				eye.z -= ui_wm.window_center_offset_z_m;
-			}
-			comp_layer_view_camera_select(&c->layer_accum, view, &eye,
-			                              have_ui_wm ? ui_wm.window_width_m : 0.0f,
-			                              have_ui_wm ? ui_wm.window_height_m : 0.0f, &ui_cameras[view]);
+			comp_layer_view_camera_select_eyes(&c->layer_accum, view, &ui_eyes, ui_view_count, nullptr,
+			                                   have_ui_wm ? ui_wm.window_width_m : 0.0f,
+			                                   have_ui_wm ? ui_wm.window_height_m : 0.0f,
+			                                   &ui_cameras[view]);
 		}
 		for (uint32_t view_index = 0; view_index < ui_view_count; view_index++) {
 			// Set viewport for this view

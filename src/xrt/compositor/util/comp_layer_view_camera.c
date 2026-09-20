@@ -13,6 +13,8 @@
 #include "util/comp_layer_accum.h"
 #include "util/u_logging.h"
 
+#include "xrt/xrt_compiler.h" // ARRAY_SIZE
+
 #include "dxr_view_math.h" // dxr_display3d_compute_fov — the shared Kooima core
 
 #include <stddef.h>
@@ -58,6 +60,72 @@ find_projection_view(const struct comp_layer_accum *accum, uint32_t view_index)
 	}
 
 	return NULL;
+}
+
+/*!
+ * Branch (b)'s render eye: the state tracker's two eye-set rules, verbatim.
+ *
+ * See comp_layer_view_camera_select_eyes() in the header for why each exists
+ * and where its twin lives in the state tracker / IPC server.
+ *
+ * @return false when there is no eye to render from (skip branch (b)).
+ */
+static bool
+resolve_render_eye(const struct xrt_eye_positions *eyes,
+                   uint32_t view_index,
+                   uint32_t active_view_count,
+                   struct xrt_vec3 *out_eye)
+{
+	if (eyes == NULL || eyes->count == 0) {
+		return false;
+	}
+
+	const uint32_t cap = (uint32_t)ARRAY_SIZE(eyes->eyes);
+	uint32_t n = eyes->count;
+	if (n > cap) {
+		n = cap;
+	}
+
+	const uint32_t avc = active_view_count != 0 ? active_view_count : n;
+
+	// Rule 1: mono collapse — one view, many eyes => the centroid.
+	if (avc == 1 && n >= 2) {
+		struct xrt_vec3 c = {0.0f, 0.0f, 0.0f};
+		for (uint32_t i = 0; i < n; i++) {
+			c.x += eyes->eyes[i].x;
+			c.y += eyes->eyes[i].y;
+			c.z += eyes->eyes[i].z;
+		}
+		const float inv = 1.0f / (float)n;
+		out_eye->x = c.x * inv;
+		out_eye->y = c.y * inv;
+		out_eye->z = c.z * inv;
+		return true;
+	}
+
+	// Rule 2: view i renders from eye i; surplus views reuse the last eye.
+	const uint32_t idx = view_index < n ? view_index : n - 1;
+	out_eye->x = eyes->eyes[idx].x;
+	out_eye->y = eyes->eyes[idx].y;
+	out_eye->z = eyes->eyes[idx].z;
+	return true;
+}
+
+bool
+comp_layer_view_camera_select_eyes(const struct comp_layer_accum *accum,
+                                   uint32_t view_index,
+                                   const struct xrt_eye_positions *eyes,
+                                   uint32_t active_view_count,
+                                   const struct xrt_vec3 *canvas_center,
+                                   float canvas_w_m,
+                                   float canvas_h_m,
+                                   struct comp_layer_view_camera *out)
+{
+	struct xrt_vec3 eye = {0.0f, 0.0f, 0.0f};
+	const bool have_eye = resolve_render_eye(eyes, view_index, active_view_count, &eye);
+
+	return comp_layer_view_camera_select_ex(accum, view_index, have_eye ? &eye : NULL, canvas_center, canvas_w_m,
+	                                        canvas_h_m, out);
 }
 
 bool

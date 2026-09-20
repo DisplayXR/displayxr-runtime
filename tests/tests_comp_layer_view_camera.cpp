@@ -38,6 +38,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <initializer_list>
 
 namespace {
 
@@ -73,6 +74,64 @@ push_quad(struct comp_layer_accum &accum,
 	layer.data.quad.visibility = visibility;
 	layer.data.quad.size = {0.5f, 0.5f};
 	layer.data.flags = XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+}
+
+struct xrt_eye_positions
+make_eyes(std::initializer_list<struct xrt_eye_position> list)
+{
+	struct xrt_eye_positions eyes = {};
+	for (const auto &e : list) {
+		eyes.eyes[eyes.count++] = e;
+	}
+	eyes.valid = true;
+	return eyes;
+}
+
+/*!
+ * The located view a DisplayXR session reports for one eye, computed from the
+ * closed-form Kooima relations rather than from the code under test.
+ *
+ * This is the oracle the compositor's camera must match: `xrLocateViews`
+ * reports the eye verbatim as the view POSE (oxr_session.c, the eye-override /
+ * tracked-eye branches, re-expressed head-relative) with identity orientation,
+ * and the off-axis frustum of that eye against the canvas as the FOV
+ * (dxr_display3d_compute_fov through dxr_xrt_display3d_compute_views, which
+ * reduces to exactly these four atans under the default tunables a session with
+ * no chained rig gets: ipd = parallax = perspective = 1, vH = screen height so
+ * m2v = 1).
+ */
+struct comp_layer_view_camera
+located_view(const struct xrt_vec3 &eye, float canvas_w_m, float canvas_h_m, const struct xrt_vec3 &canvas_center)
+{
+	const float ex = eye.x - canvas_center.x;
+	const float ey = eye.y - canvas_center.y;
+	const float ez = eye.z - canvas_center.z;
+
+	struct comp_layer_view_camera cam = {};
+	cam.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+	cam.pose.position = eye;
+	cam.fov.angle_left = std::atan((-canvas_w_m / 2 - ex) / ez);
+	cam.fov.angle_right = std::atan((canvas_w_m / 2 - ex) / ez);
+	cam.fov.angle_up = std::atan((canvas_h_m / 2 - ey) / ez);
+	cam.fov.angle_down = std::atan((-canvas_h_m / 2 - ey) / ez);
+	cam.source = COMP_LAYER_VIEW_CAMERA_FROM_DISPLAY3D;
+	return cam;
+}
+
+void
+check_same_camera(const struct comp_layer_view_camera &got, const struct comp_layer_view_camera &want)
+{
+	CHECK(got.pose.position.x == Catch::Approx(want.pose.position.x).margin(kEps));
+	CHECK(got.pose.position.y == Catch::Approx(want.pose.position.y).margin(kEps));
+	CHECK(got.pose.position.z == Catch::Approx(want.pose.position.z).margin(kEps));
+	CHECK(got.pose.orientation.x == Catch::Approx(want.pose.orientation.x).margin(kEps));
+	CHECK(got.pose.orientation.y == Catch::Approx(want.pose.orientation.y).margin(kEps));
+	CHECK(got.pose.orientation.z == Catch::Approx(want.pose.orientation.z).margin(kEps));
+	CHECK(got.pose.orientation.w == Catch::Approx(want.pose.orientation.w).margin(kEps));
+	CHECK(got.fov.angle_left == Catch::Approx(want.fov.angle_left).margin(kEps));
+	CHECK(got.fov.angle_right == Catch::Approx(want.fov.angle_right).margin(kEps));
+	CHECK(got.fov.angle_up == Catch::Approx(want.fov.angle_up).margin(kEps));
+	CHECK(got.fov.angle_down == Catch::Approx(want.fov.angle_down).margin(kEps));
 }
 
 } // namespace
@@ -239,6 +298,174 @@ TEST_CASE("comp_layer_view_camera: (c) fallback when neither is available")
 
 	// NULL out is the one hard failure.
 	CHECK_FALSE(comp_layer_view_camera_select(&accum, 0, &eye, 0.60f, 0.34f, nullptr));
+}
+
+TEST_CASE("comp_layer_view_camera: (b) a quad-only frame composes through the LOCATED view")
+{
+	/*
+	 * The reported #1580 shape: the Khronos CTS QuadPoses case on the
+	 * sim display. Quad layers only — nothing to borrow a camera from — with
+	 * the sim DP's nominal viewer 10 cm ABOVE the panel centre
+	 * (sim_display_processor.c: nominal_y_m = 0.1f) at
+	 * SIM_DISPLAY_NOMINAL_Z_M = 0.2, over the default 0.344 x 0.194 m panel
+	 * (sim_display_device.c). That is a violently asymmetric vertical
+	 * frustum — and it is precisely the frustum xrLocateViews reports, so
+	 * the compositor must reproduce it exactly rather than approximate it.
+	 */
+	struct comp_layer_accum accum = {};
+	push_quad(accum, {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, -1.0f}});
+
+	const float w = 0.344f;
+	const float h = 0.194f;
+	const struct xrt_vec3 origin = {0.0f, 0.0f, 0.0f};
+	const struct xrt_eye_positions eyes = make_eyes({{0.0f, 0.1f, 0.2f}});
+
+	struct comp_layer_view_camera cam = {};
+	REQUIRE(comp_layer_view_camera_select_eyes(&accum, 0, &eyes, 1, nullptr, w, h, &cam));
+
+	CHECK(cam.source == COMP_LAYER_VIEW_CAMERA_FROM_DISPLAY3D);
+	check_same_camera(cam, located_view({0.0f, 0.1f, 0.2f}, w, h, origin));
+
+	// Sanity on the oracle itself: the eye's own horizontal sits ABOVE the
+	// panel's top edge here, so BOTH vertical half-angles come out negative.
+	CHECK(cam.fov.angle_up < 0.0f);
+	CHECK(cam.fov.angle_down < cam.fov.angle_up);
+}
+
+TEST_CASE("comp_layer_view_camera: (a) and (b) agree for the same frame inputs")
+{
+	/*
+	 * The invariant in one assertion: adding a projection layer to a frame
+	 * must not move the quads. Branch (a) takes the app's submitted
+	 * proj.v[0].{pose,fov} — which IS what xrLocateViews handed it — and
+	 * branch (b) synthesises from the DP eye + canvas. Same frame, same
+	 * camera, or a quad lands on different display pixels depending on
+	 * whether the app happened to also submit projection content.
+	 */
+	const float w = 0.344f;
+	const float h = 0.194f;
+	const struct xrt_vec3 origin = {0.0f, 0.0f, 0.0f};
+	const struct xrt_vec3 eye = {-0.032f, 0.1f, 0.6f};
+	const struct xrt_eye_positions eyes = make_eyes({{eye.x, eye.y, eye.z}, {0.032f, 0.1f, 0.6f}});
+
+	// What the app got back from xrLocateViews for view 0, and therefore
+	// what it submits in its projection layer.
+	const struct comp_layer_view_camera reported = located_view(eye, w, h, origin);
+
+	struct comp_layer_accum with_proj = {};
+	struct xrt_pose proj_poses[2] = {reported.pose, reported.pose};
+	struct xrt_fov proj_fovs[2] = {reported.fov, reported.fov};
+	push_projection(with_proj, 2, proj_poses, proj_fovs);
+	push_quad(with_proj, {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, -1.0f}});
+
+	struct comp_layer_accum quads_only = {};
+	push_quad(quads_only, {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, -1.0f}});
+
+	struct comp_layer_view_camera from_a = {};
+	struct comp_layer_view_camera from_b = {};
+	REQUIRE(comp_layer_view_camera_select_eyes(&with_proj, 0, &eyes, 2, nullptr, w, h, &from_a));
+	REQUIRE(comp_layer_view_camera_select_eyes(&quads_only, 0, &eyes, 2, nullptr, w, h, &from_b));
+
+	CHECK(from_a.source == COMP_LAYER_VIEW_CAMERA_FROM_PROJECTION);
+	CHECK(from_b.source == COMP_LAYER_VIEW_CAMERA_FROM_DISPLAY3D);
+	check_same_camera(from_b, from_a);
+	check_same_camera(from_a, reported);
+}
+
+TEST_CASE("comp_layer_view_camera: (b) view i composes through eye i, not a left/right pair")
+{
+	/*
+	 * The sim display's 2x2 Quad mode reports FOUR eyes, the upper pair
+	 * 64 mm above the lower (sim_display_processor.c, the vc >= 4 branch).
+	 * The left/right pair this resolver used to be handed could only express
+	 * two of them, so views 2 and 3 were composed 64 mm below where
+	 * xrLocateViews put them — 3.7 deg of vertical error at 1 m.
+	 */
+	struct comp_layer_accum accum = {};
+	push_quad(accum, {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, -1.0f}});
+
+	const float w = 0.344f;
+	const float h = 0.194f;
+	const struct xrt_vec3 origin = {0.0f, 0.0f, 0.0f};
+	const struct xrt_eye_positions eyes = make_eyes({{-0.03f, 0.068f, 0.6f},
+	                                                 {0.03f, 0.068f, 0.6f},
+	                                                 {-0.03f, 0.132f, 0.6f},
+	                                                 {0.03f, 0.132f, 0.6f}});
+
+	for (uint32_t view = 0; view < 4; view++) {
+		struct comp_layer_view_camera cam = {};
+		REQUIRE(comp_layer_view_camera_select_eyes(&accum, view, &eyes, 4, nullptr, w, h, &cam));
+		const struct xrt_vec3 want = {eyes.eyes[view].x, eyes.eyes[view].y, eyes.eyes[view].z};
+		check_same_camera(cam, located_view(want, w, h, origin));
+	}
+
+	// Surplus views (a mode wider than the DP's reported set) reuse the LAST
+	// eye — the same rule the state tracker's #615 coherence guard applies.
+	struct comp_layer_view_camera surplus = {};
+	REQUIRE(comp_layer_view_camera_select_eyes(&accum, 6, &eyes, 8, nullptr, w, h, &surplus));
+	check_same_camera(surplus, located_view({0.03f, 0.132f, 0.6f}, w, h, origin));
+}
+
+TEST_CASE("comp_layer_view_camera: (b) a mono frame composes through the eye CENTROID")
+{
+	/*
+	 * A DP that keeps reporting two eyes while the active mode has ONE view
+	 * (the Windows 2D path). xrLocateViews collapses to the centroid for
+	 * active_view_count == 1 (oxr_session.c) and so does the IPC server
+	 * (ipc_server_handler.c, #521/#575); pairing that centred pose with eye
+	 * 0's off-axis frustum is the 2D lateral shift of modelviewer#100.
+	 */
+	struct comp_layer_accum accum = {};
+	push_quad(accum, {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, -1.0f}});
+
+	const float w = 0.344f;
+	const float h = 0.194f;
+	const struct xrt_vec3 origin = {0.0f, 0.0f, 0.0f};
+	const struct xrt_eye_positions eyes = make_eyes({{-0.032f, 0.1f, 0.6f}, {0.032f, 0.1f, 0.6f}});
+
+	struct comp_layer_view_camera mono = {};
+	REQUIRE(comp_layer_view_camera_select_eyes(&accum, 0, &eyes, 1, nullptr, w, h, &mono));
+	check_same_camera(mono, located_view({0.0f, 0.1f, 0.6f}, w, h, origin));
+	// Centred eye => a horizontally symmetric frustum.
+	CHECK(mono.fov.angle_left == Catch::Approx(-mono.fov.angle_right).margin(kEps));
+
+	// The SAME eye set in a 2-view mode must NOT collapse.
+	struct comp_layer_view_camera stereo = {};
+	REQUIRE(comp_layer_view_camera_select_eyes(&accum, 0, &eyes, 2, nullptr, w, h, &stereo));
+	check_same_camera(stereo, located_view({-0.032f, 0.1f, 0.6f}, w, h, origin));
+}
+
+TEST_CASE("comp_layer_view_camera: the eye-set entry point degrades like the single-eye one")
+{
+	struct comp_layer_accum accum = {};
+	push_quad(accum, {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, -1.0f}});
+
+	// No eyes at all, and an empty set, are both branch (c).
+	struct comp_layer_view_camera cam = {};
+	CHECK_FALSE(comp_layer_view_camera_select_eyes(&accum, 0, nullptr, 2, nullptr, 0.344f, 0.194f, &cam));
+	CHECK(cam.source == COMP_LAYER_VIEW_CAMERA_FALLBACK);
+
+	const struct xrt_eye_positions empty = {};
+	struct comp_layer_view_camera cam2 = {};
+	CHECK_FALSE(comp_layer_view_camera_select_eyes(&accum, 0, &empty, 2, nullptr, 0.344f, 0.194f, &cam2));
+	CHECK(cam2.source == COMP_LAYER_VIEW_CAMERA_FALLBACK);
+
+	// A one-eye set with no active count is exactly the single-eye entry
+	// point, so the two APIs cannot drift apart.
+	const struct xrt_eye_positions one = make_eyes({{0.0f, 0.1f, 0.6f}});
+	struct xrt_vec3 eye = {0.0f, 0.1f, 0.6f};
+	struct comp_layer_view_camera via_set = {};
+	struct comp_layer_view_camera via_single = {};
+	REQUIRE(comp_layer_view_camera_select_eyes(&accum, 0, &one, 0, nullptr, 0.344f, 0.194f, &via_set));
+	REQUIRE(comp_layer_view_camera_select(&accum, 0, &eye, 0.344f, 0.194f, &via_single));
+	check_same_camera(via_set, via_single);
+
+	// The canvas centre still rebases the FRUSTUM only, pose untouched.
+	const struct xrt_vec3 canvas_center = {0.10f, 0.0f, 0.0f};
+	struct comp_layer_view_camera offset = {};
+	REQUIRE(comp_layer_view_camera_select_eyes(&accum, 0, &one, 0, &canvas_center, 0.344f, 0.194f, &offset));
+	check_same_camera(offset, located_view(eye, 0.344f, 0.194f, canvas_center));
+	CHECK(offset.pose.position.x == Catch::Approx(eye.x).margin(kEps));
 }
 
 TEST_CASE("comp_layer_view_camera: a NULL accum just skips branch (a)")

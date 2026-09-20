@@ -120,8 +120,11 @@ comp_d3d11_renderer_destroy(struct comp_d3d11_renderer **renderer_ptr);
  *
  * @param renderer The renderer.
  * @param layers The accumulated layers.
- * @param left_eye Left eye position for projection (NULL for default).
- * @param right_eye Right eye position for projection (NULL for default).
+ * @param eyes The DP's per-view eye set, head-relative (#1580). The WHOLE set,
+ *        not a left/right pair: view i composes through eye i, and a mono mode
+ *        composes through the centroid — see
+ *        @ref comp_layer_view_camera_select_eyes. NULL / count 0 is allowed and
+ *        just drops the resolver to its fallback branch.
  * @param target_width Width of the render target (window). Used for mono
  *        viewport sizing so 2D content fills the full window.
  * @param target_height Height of the render target (window).
@@ -135,8 +138,7 @@ comp_d3d11_renderer_destroy(struct comp_d3d11_renderer **renderer_ptr);
 xrt_result_t
 comp_d3d11_renderer_draw(struct comp_d3d11_renderer *renderer,
                          struct comp_layer_accum *layers,
-                         struct xrt_vec3 *left_eye,
-                         struct xrt_vec3 *right_eye,
+                         const struct xrt_eye_positions *eyes,
                          uint32_t target_width,
                          uint32_t target_height,
                          const struct xrt_window_metrics *canvas,
@@ -159,8 +161,7 @@ comp_d3d11_renderer_draw(struct comp_d3d11_renderer *renderer,
 xrt_result_t
 comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
                                          struct comp_layer_accum *layers,
-                                         struct xrt_vec3 *left_eye,
-                                         struct xrt_vec3 *right_eye,
+                                         const struct xrt_eye_positions *eyes,
                                          uint32_t target_width,
                                          uint32_t target_height,
                                          const struct xrt_window_metrics *canvas,
