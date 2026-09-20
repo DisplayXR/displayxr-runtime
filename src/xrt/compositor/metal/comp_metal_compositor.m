@@ -22,6 +22,10 @@
 #include "comp_metal_compositor.h"
 
 #include "util/comp_layer_accum.h"
+// #1581 quad layers: the shared per-view camera (#1580) and the N-view
+// LEFT/RIGHT eye-visibility rule.
+#include "util/comp_layer_view_camera.h"
+#include "util/comp_render_helpers.h"
 // #1513 - the shared acquire/wait/release bookkeeping and the static-image
 // count rule, identical to the vk_native and OpenGL compositors.
 #include "util/comp_swapchain_ring.h"
@@ -146,6 +150,12 @@ struct comp_metal_compositor
 	id<MTLRenderPipelineState> zone_premult_pipeline;
 	id<MTLRenderPipelineState> zone_unpremult_pipeline;
 
+	//! #1581 XrCompositionLayerQuad. Straight-alpha
+	//! (XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT, which every CTS
+	//! quad sets) and premultiplied variants of the same quad shaders.
+	id<MTLRenderPipelineState> quad_straight_pipeline;
+	id<MTLRenderPipelineState> quad_premult_pipeline;
+
 	//! Render pipeline for fullscreen blit (atlas→target passthrough).
 	id<MTLRenderPipelineState> blit_pipeline;
 
@@ -261,6 +271,13 @@ struct comp_metal_compositor
 
 	//! System compositor info (for display dimensions, nominal viewer).
 	const struct xrt_system_compositor_info *sys_info;
+
+	//! #1581 — the DP's last valid predicted eye positions, cached AFTER
+	//! process_atlas (which updates the weaver's eye tracker) the way the GL
+	//! compositor does. The per-view camera helper needs an eye position
+	//! during layer composition, which runs before the next process_atlas.
+	struct xrt_eye_positions cached_eye_pos;
+	bool have_cached_eye_pos;
 
 	/*
 	 * XR_DXR_local_3d_zone consumer state (#439 Phase 3).
@@ -478,6 +495,88 @@ static NSString *const metal_shader_source = @
     "    float4 color = tex.sample(smp, in.texCoord);\n"
     "    if (pc.swizzle_rb > 0.5) color = float4(color.b, color.g, color.r, color.a);\n"
     "    return color * pc.color_scale + pc.color_bias;\n"
+    "}\n"
+    "\n"
+    "// #1581 -- XrCompositionLayerQuad. MSL port of the D3D11 quad shader pair\n"
+    "// (comp_d3d11_renderer.cpp quad_vs_source / quad_ps_source). A world-placed\n"
+    "// 1x1 quad centred on the origin, scaled by the layer size in the model\n"
+    "// matrix, drawn as a 4-vertex triangle strip generated from the vertex id.\n"
+    "//\n"
+    "// TWO Y negations, and BOTH are load-bearing. The MVP's projection is built\n"
+    "// by math_matrix_4x4_projection_vulkan_infinite_reverse, which is VULKAN\n"
+    "// convention: its a22 = 2/(tan_down - tan_up) is negative precisely because\n"
+    "// Vulkan's NDC +y is the BOTTOM of the framebuffer. Metal's NDC +y is the\n"
+    "// TOP (see blit_vertex: texCoord (0,0), the source's top-left, is emitted at\n"
+    "// NDC (-1,+1)), so that projection maps the fov's UP edge to ndc_y = -1,\n"
+    "// i.e. the bottom of the tile.\n"
+    "//\n"
+    "//   - `pos.y = -pos.y` (quad-local, before the model matrix) is the same\n"
+    "//     flip shaders/layer_quad.vert has: it pairs the texture's TOP row with\n"
+    "//     the quad's TOP edge in OpenXR's +Y-up quad space.\n"
+    "//   - `position.y = -position.y` (clip space, after the MVP) converts the\n"
+    "//     Vulkan-convention clip Y to Metal's.\n"
+    "//\n"
+    "// Neither alone is correct: the local flip by itself leaves the quad's\n"
+    "// PLACEMENT mirrored about the view axis (invisible under the old hardcoded\n"
+    "// symmetric +-45 deg camera with a quad near y=0; a gross displacement under\n"
+    "// the real, strongly asymmetric Kooima fov), and the clip flip by itself\n"
+    "// renders the texture upside down.\n"
+    "//\n"
+    "// WHY THE *VULKAN* HELPER HERE WHILE D3D11 USES THE Y-UP SIBLING, AND WHY\n"
+    "// THAT IS NOT AN OVERSIGHT TO 'UNIFY' AWAY. #1580 added\n"
+    "// math_matrix_4x4_projection_d3d_infinite_reverse (Y-up clip, a22 > 0); the\n"
+    "// two helpers share one body and differ ONLY by a negation of row 1, so\n"
+    "// `vulkan helper + clip.y = -clip.y` and `d3d helper + no clip flip` are the\n"
+    "// same transform. A/B MEASURED, not reasoned: built both ways and captured\n"
+    "// /tmp/dxr_atlas.png under SIM_DISPLAY_OUTPUT=quad -- all three quads'\n"
+    "// bounding boxes are IDENTICAL to the pixel in all four views, and quads B\n"
+    "// and C are bit-identical in their opaque regions. Either route is correct;\n"
+    "// this one is kept because it is the one the #1581 measurements below were\n"
+    "// taken against. What is NOT safe is changing one half: swapping in the d3d\n"
+    "// helper while KEEPING `clip.y = -clip.y` (or dropping the flip while\n"
+    "// keeping the vulkan helper) mirrors every quad about the tile's horizontal\n"
+    "// centre line -- silently, because a quad near the view axis barely moves.\n"
+    "// Change both together or neither.\n"
+    "//\n"
+    "// Measured on sim_display, 2-view Anaglyph, 1512x823 tiles: quad A is\n"
+    "// 294 px wide against a predicted 293.6 (0.1%), centred at (811.5, 289.0)\n"
+    "// against a predicted (811.8, 289.7); with only the local flip the centre\n"
+    "// landed at the tile's mirror position instead. The absolute pixel numbers\n"
+    "// track the frame's located fov, so they move with the viewer pose -- the\n"
+    "// invariant is measured == predicted, not any particular constant.\n"
+    "constant float2 quad_corners[4] = {\n"
+    "    float2(0.0, 0.0),\n"
+    "    float2(0.0, 1.0),\n"
+    "    float2(1.0, 0.0),\n"
+    "    float2(1.0, 1.0),\n"
+    "};\n"
+    "\n"
+    "struct QuadConstants {\n"
+    "    float4x4 mvp;\n"
+    "    float4 post_transform; // xy = uv offset, zw = uv scale\n"
+    "    float4 color_scale;\n"
+    "    float4 color_bias;\n"
+    "};\n"
+    "\n"
+    "vertex VertexOut quad_vertex(uint vid [[vertex_id]],\n"
+    "                             constant QuadConstants &qc [[buffer(0)]]) {\n"
+    "    VertexOut out;\n"
+    "    float2 in_uv = quad_corners[vid % 4];\n"
+    "    float2 pos = in_uv - 0.5;\n"
+    "    pos.y = -pos.y;                       // texture top <-> quad top (+Y up)\n"
+    "    float4 clip = qc.mvp * float4(pos, 0.0, 1.0);\n"
+    "    clip.y = -clip.y;                     // Vulkan-convention clip Y -> Metal\n"
+    "    out.position = clip;\n"
+    "    out.texCoord = in_uv * qc.post_transform.zw + qc.post_transform.xy;\n"
+    "    return out;\n"
+    "}\n"
+    "\n"
+    "fragment float4 quad_fragment(VertexOut in [[stage_in]],\n"
+    "                              texture2d<float> tex [[texture(0)]],\n"
+    "                              sampler smp [[sampler(0)]],\n"
+    "                              constant QuadConstants &qc [[buffer(0)]]) {\n"
+    "    float4 color = tex.sample(smp, in.texCoord);\n"
+    "    return color * qc.color_scale + qc.color_bias;\n"
     "}\n"
     "\n"
     "// #439 Phase 3 — masked 2D/3D composite (MSL port of the D3D11\n"
@@ -733,6 +832,61 @@ compile_shaders(struct comp_metal_compositor *c)
 		[zone_desc release];
 		if (c->zone_unpremult_pipeline == nil) {
 			U_LOG_E("Failed to create zone unpremult pipeline: %s",
+			        error.localizedDescription.UTF8String);
+			goto cleanup;
+		}
+	}
+
+	// Quad-layer pipelines (#1581, XrCompositionLayerQuad) — the world-placed
+	// quad shaders into the atlas, alpha-blended over whatever projection
+	// content is already in the tile. Cloned from the zone descriptors above;
+	// the only differences are the shader pair and which source-RGB factor is
+	// the DEFAULT. OpenXR's quad blend switch is
+	// XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT (set ⇒ straight
+	// alpha), the inverse sense of the zone/Local2D UNPREMULTIPLIED bit, so
+	// the two variants are named after what they do rather than after a flag.
+	// Every CTS composition quad sets the bit, so `straight` is the one
+	// conformance exercises. Depth is disabled at draw time
+	// (depth_stencil_state_disabled): a quad must neither depth-reject
+	// against the projection tile nor occlude a later quad.
+	{
+		id<MTLFunction> quad_vs = [library newFunctionWithName:@"quad_vertex"];
+		id<MTLFunction> quad_fs = [library newFunctionWithName:@"quad_fragment"];
+		if (quad_vs == nil || quad_fs == nil) {
+			U_LOG_E("Failed to find quad_vertex/quad_fragment");
+			[quad_fs release];
+			[quad_vs release];
+			goto cleanup;
+		}
+
+		MTLRenderPipelineDescriptor *quad_desc = [[MTLRenderPipelineDescriptor alloc] init];
+		quad_desc.vertexFunction = quad_vs;
+		quad_desc.fragmentFunction = quad_fs;
+		quad_desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+		quad_desc.colorAttachments[0].blendingEnabled = YES;
+		quad_desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+		quad_desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+		quad_desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+		quad_desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+		quad_desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+
+		c->quad_straight_pipeline = [c->device newRenderPipelineStateWithDescriptor:quad_desc error:&error];
+		if (c->quad_straight_pipeline == nil) {
+			U_LOG_E("Failed to create quad straight-alpha pipeline: %s",
+			        error.localizedDescription.UTF8String);
+			[quad_desc release];
+			[quad_fs release];
+			[quad_vs release];
+			goto cleanup;
+		}
+
+		quad_desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+		c->quad_premult_pipeline = [c->device newRenderPipelineStateWithDescriptor:quad_desc error:&error];
+		[quad_desc release];
+		[quad_fs release];
+		[quad_vs release];
+		if (c->quad_premult_pipeline == nil) {
+			U_LOG_E("Failed to create quad premultiplied pipeline: %s",
 			        error.localizedDescription.UTF8String);
 			goto cleanup;
 		}
@@ -3471,6 +3625,241 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			encoder = [cmd_buf renderCommandEncoderWithDescriptor:ws_pass];
 		}
 
+		// Quad layers (XrCompositionLayerQuad — #1581, epic #1523).
+		//
+		// The Metal compositor ACCEPTED quads (comp_layer_accum_quad) but
+		// never drew them, so every Khronos CTS interactive composition
+		// prompt, label and reference image was invisible on this backend.
+		//
+		// Placement is deliberately HERE: after the PROJECTION_ONLY capture
+		// above (so the MCP projection-only capture stays projection-only)
+		// and in the same encoder as the window-space pass below (whose
+		// render pass loads the atlas), so the /tmp/dxr_atlas_trigger dump —
+		// taken after both passes — shows the quads.
+		//
+		// The camera is the #1580 one: for each view, the frustum the app's
+		// own projection content for THAT view was rendered with. Selected
+		// ONCE PER VIEW PER FRAME and hoisted out of the layer loop — a
+		// hardcoded camera is exactly the defect #1580 documents (quad and
+		// projection content for the same world position landing on
+		// different display pixels).
+		{
+			uint32_t quad_view_count = atlas_cols * atlas_rows;
+			if (quad_view_count == 0) {
+				quad_view_count = 1;
+			}
+			if (quad_view_count > XRT_MAX_VIEWS) {
+				quad_view_count = XRT_MAX_VIEWS;
+			}
+
+			bool any_quad = false;
+			for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+				if (c->layer_accum.layers[i].data.type == XRT_LAYER_QUAD) {
+					any_quad = true;
+					break;
+				}
+			}
+			for (uint32_t view = 0; any_quad && view < quad_view_count; view++) {
+				// (1) Camera for this view — once, before any layer.
+				struct xrt_vec3 eye = {0.0f, 0.0f, 0.0f};
+				const struct xrt_vec3 *eye_ptr = NULL;
+				if (c->have_cached_eye_pos && view < c->cached_eye_pos.count) {
+					eye.x = c->cached_eye_pos.eyes[view].x;
+					eye.y = c->cached_eye_pos.eyes[view].y;
+					eye.z = c->cached_eye_pos.eyes[view].z;
+					eye_ptr = &eye;
+				}
+				// Canvas metres are passed as 0 (unknown) on purpose: every
+				// frame that carries a quad also carries a projection layer
+				// (this is true of the whole CTS composition set), so leg (a)
+				// of the helper always fires and the display3d synthesis is
+				// never needed. Wiring the canvas is a follow-up, not a gap.
+				// The return value is a DIAGNOSTIC, not "skip": `cam` is fully
+				// populated on EVERY branch, including the legacy placeholder
+				// (branch (c)), which returns false and logs once inside the
+				// helper. Dropping the quad on false would make a fallback
+				// frame silently quad-less.
+				struct comp_layer_view_camera cam;
+				(void)comp_layer_view_camera_select(&c->layer_accum, view, eye_ptr, 0.0f, 0.0f, &cam);
+
+				struct xrt_matrix_4x4 view_mat, proj_mat;
+				math_matrix_4x4_view_from_pose(&cam.pose, &view_mat);
+				math_matrix_4x4_projection_vulkan_infinite_reverse(&cam.fov, 0.1f, &proj_mat);
+
+				// (2) Tile box — viewport AND scissor. The scissor is
+				// mandatory, not belt-and-braces: unlike the fullscreen-
+				// triangle passes around it, a projected quad's geometry can
+				// extend past the viewport rect, and Metal viewports do not
+				// clip. The spill would land in the NEIGHBOUR view's tile and
+				// the DP would weave it as ghosting in the wrong eye.
+				const uint32_t tile_x = view % atlas_cols;
+				const uint32_t tile_y = view / atlas_cols;
+				const uint32_t ox = tile_x * atlas_view_w;
+				const uint32_t oy = tile_y * atlas_view_h;
+
+				MTLViewport vp;
+				vp.originX = (double)ox;
+				vp.originY = (double)oy;
+				vp.width = (double)atlas_view_w;
+				vp.height = (double)atlas_view_h;
+				vp.znear = 0.0;
+				vp.zfar = 1.0;
+				[encoder setViewport:vp];
+
+				const uint32_t att_w = (uint32_t)c->atlas_texture.width;
+				const uint32_t att_h = (uint32_t)c->atlas_texture.height;
+				if (ox >= att_w || oy >= att_h) {
+					continue;
+				}
+				MTLScissorRect sr;
+				sr.x = ox;
+				sr.y = oy;
+				sr.width = (ox + atlas_view_w > att_w) ? (att_w - ox) : atlas_view_w;
+				sr.height = (oy + atlas_view_h > att_h) ? (att_h - oy) : atlas_view_h;
+				if (sr.width == 0 || sr.height == 0) {
+					continue;
+				}
+				[encoder setScissorRect:sr];
+
+				// (3) The quads, in layer-list order.
+				for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+					struct comp_layer *layer = &c->layer_accum.layers[i];
+					const struct xrt_layer_data *data = &layer->data;
+					if (data->type != XRT_LAYER_QUAD) {
+						continue;
+					}
+					if (!is_layer_view_visible_n(data, view, quad_view_count)) {
+						continue;
+					}
+					const struct xrt_layer_quad_data *q = &data->quad;
+
+					struct xrt_swapchain *qsc = layer->sc_array[0];
+					if (qsc == NULL) {
+						continue;
+					}
+					struct comp_metal_swapchain *qmsc = metal_swapchain(qsc);
+					uint32_t img_idx = q->sub.image_index;
+					if (img_idx >= qmsc->image_count) {
+						continue;
+					}
+					id<MTLTexture> src_tex = qmsc->images[img_idx];
+					if (src_tex == nil) {
+						continue;
+					}
+
+					// Sample through a UNORM view so the GPU does NOT decode
+					// sRGB. The atlas is UNORM holding sRGB-ENCODED bytes, and
+					// zones/Local2D already blend in that encoded space; a
+					// quad that linearized here would blend against encoded
+					// neighbours and come out wrong. Array slice handled the
+					// same way as the projection pass.
+					{
+						MTLPixelFormat view_fmt = metal_srgb_to_unorm(src_tex.pixelFormat);
+						if (src_tex.textureType == MTLTextureType2DArray) {
+							uint32_t ai = q->sub.array_index;
+							id<MTLTexture> v = [src_tex
+							    newTextureViewWithPixelFormat:view_fmt
+							                      textureType:MTLTextureType2D
+							                           levels:NSMakeRange(
+							                                      0,
+							                                      src_tex.mipmapLevelCount)
+							                           slices:NSMakeRange(ai, 1)];
+							if (v != nil) {
+								src_tex = v;
+							}
+						} else if (view_fmt != src_tex.pixelFormat) {
+							id<MTLTexture> v =
+							    [src_tex newTextureViewWithPixelFormat:view_fmt];
+							if (v != nil) {
+								src_tex = v;
+							}
+						}
+					}
+
+					// MVP exactly as the D3D11 renderer's render_quad_layer:
+					// model = pose * scale(size.x, size.y, 1), view from the
+					// camera pose, Vulkan infinite-reverse projection from the
+					// camera fov at near = 0.1.
+					struct xrt_matrix_4x4 model, mv, mvp;
+					struct xrt_vec3 scale = {q->size.x, q->size.y, 1.0f};
+					math_matrix_4x4_model(&q->pose, &scale, &model);
+					math_matrix_4x4_multiply(&view_mat, &model, &mv);
+					math_matrix_4x4_multiply(&proj_mat, &mv, &mvp);
+
+					struct {
+						float mvp[16];
+						float post_transform[4];
+						float color_scale[4];
+						float color_bias[4];
+					} qc;
+
+					memcpy(qc.mvp, mvp.v, sizeof(qc.mvp));
+
+					struct xrt_normalized_rect nr = q->sub.norm_rect;
+					if (nr.w == 0.0f || nr.h == 0.0f) {
+						nr.x = 0.0f;
+						nr.y = 0.0f;
+						nr.w = 1.0f;
+						nr.h = 1.0f;
+					}
+					qc.post_transform[0] = nr.x;
+					qc.post_transform[1] = nr.y;
+					qc.post_transform[2] = nr.w;
+					qc.post_transform[3] = nr.h;
+					if (data->flip_y) {
+						qc.post_transform[1] += qc.post_transform[3];
+						qc.post_transform[3] = -qc.post_transform[3];
+					}
+
+					if (data->flags & XRT_LAYER_COMPOSITION_COLOR_BIAS_SCALE) {
+						qc.color_scale[0] = data->color_scale.r;
+						qc.color_scale[1] = data->color_scale.g;
+						qc.color_scale[2] = data->color_scale.b;
+						qc.color_scale[3] = data->color_scale.a;
+						qc.color_bias[0] = data->color_bias.r;
+						qc.color_bias[1] = data->color_bias.g;
+						qc.color_bias[2] = data->color_bias.b;
+						qc.color_bias[3] = data->color_bias.a;
+					} else {
+						qc.color_scale[0] = qc.color_scale[1] = qc.color_scale[2] =
+						    qc.color_scale[3] = 1.0f;
+						qc.color_bias[0] = qc.color_bias[1] = qc.color_bias[2] =
+						    qc.color_bias[3] = 0.0f;
+					}
+
+					// OpenXR's blend switch: SOURCE_ALPHA set ⇒ the texture
+					// carries STRAIGHT alpha (every CTS quad sets it);
+					// clear ⇒ premultiplied. Inverse sense to the zone /
+					// Local2D UNPREMULTIPLIED bit — mirrors D3D11.
+					const bool straight_alpha =
+					    (data->flags & XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT) != 0;
+					[encoder setRenderPipelineState:(straight_alpha
+					                                     ? c->quad_straight_pipeline
+					                                     : c->quad_premult_pipeline)];
+					[encoder setDepthStencilState:c->depth_stencil_state_disabled];
+					[encoder setFragmentTexture:src_tex atIndex:0];
+					[encoder setFragmentSamplerState:c->sampler_linear atIndex:0];
+					[encoder setVertexBytes:&qc length:sizeof(qc) atIndex:0];
+					[encoder setFragmentBytes:&qc length:sizeof(qc) atIndex:0];
+					[encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
+					            vertexStart:0
+					            vertexCount:4];
+				}
+			}
+
+			// Hand the encoder back with a full-attachment scissor — the
+			// window-space pass below sets its own viewport but NOT its own
+			// scissor, and a stale per-tile scissor would clip it.
+			if (any_quad && c->atlas_texture != nil) {
+				MTLScissorRect full;
+				full.x = 0;
+				full.y = 0;
+				full.width = (NSUInteger)c->atlas_texture.width;
+				full.height = (NSUInteger)c->atlas_texture.height;
+				[encoder setScissorRect:full];
+			}
+		}
+
 		// Window-space layers (XR_DXR_win32_window_binding) — drawn into
 		// each per-eye tile of the atlas with horizontal disparity shift,
 		// so the display processor weaves them in stereo just like projection
@@ -3768,6 +4157,20 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		[blit_encoder endEncoding];
 	}
 
+	// #1581 — cache the DP's predicted eye positions AFTER process_atlas
+	// (which is what updates the weaver's eye tracker), the way the GL
+	// compositor does. The per-view camera helper needs an eye position while
+	// composing layers, which happens before the NEXT process_atlas, so it can
+	// only ever see last frame's. No per-frame logging (CLAUDE.md).
+	if (c->display_processor != NULL) {
+		struct xrt_eye_positions fresh_eyes = {0};
+		if (xrt_display_processor_metal_get_predicted_eye_positions(c->display_processor, &fresh_eyes) &&
+		    fresh_eyes.valid) {
+			c->cached_eye_pos = fresh_eyes;
+			c->have_cached_eye_pos = true;
+		}
+	}
+
 	// #439 Phase 3 — masked 2D/3D composite. When a mask is active
 	// (explicit submitted mask, or implicit from this frame's Local2D
 	// layer rects) the post-weave output is mask-lerped against the
@@ -3947,6 +4350,10 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	c->zone_premult_pipeline = nil;
 	[c->zone_unpremult_pipeline release];
 	c->zone_unpremult_pipeline = nil;
+	[c->quad_straight_pipeline release];
+	c->quad_straight_pipeline = nil;
+	[c->quad_premult_pipeline release];
+	c->quad_premult_pipeline = nil;
 	[c->blit_pipeline release];
 	c->blit_pipeline = nil;
 	[c->sampler_linear release];

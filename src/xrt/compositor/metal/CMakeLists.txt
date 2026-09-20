@@ -20,6 +20,15 @@ if(APPLE AND XRT_HAVE_METAL)
 			aux_util
 			aux_os
 			aux_math
+			# HEADERS ONLY (#1581). The Metal compositor calls no Vulkan and
+			# links no Vulkan symbols, but util/comp_render_helpers.h — the
+			# home of the shared layer helpers, including the N-view
+			# eye-visibility rule the quad pass needs — includes
+			# render/render_interface.h, which includes vk_helpers.h. This is
+			# how the helper header reaches the include path. comp_metal
+			# already hard-depends on XRT_HAVE_VULKAN via comp_util, which is
+			# itself Vulkan-gated, so this adds no new configuration.
+			aux_vk
 			xrt-external-stb
 			"-framework Metal"
 			"-framework Cocoa"
