@@ -6575,7 +6575,20 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 							rws[v] = layer->data.proj.v[v].sub.rect.extent.w;
 							rhs_arr[v] = layer->data.proj.v[v].sub.rect.extent.h;
 						}
-						if (u_tiling_can_zero_copy(vc, rxs, rys, rws, rhs_arr, sw, sh, mode)) {
+						/*
+						 * #1559 — zero-copy hands the DP the app's own
+						 * swapchain image. A truthful-sRGB one would arrive
+						 * as an sRGB VkImage while the handoff declares the
+						 * atlas UNORM/ENCODED, so a DP that views the image
+						 * rather than the passed view would decode it. Same
+						 * shape as the #918 guard below: a placement fact
+						 * applied to u_tiling_can_zero_copy()'s RESULT, not
+						 * a second eligibility gate folded into it (ADR-030).
+						 */
+						const bool true_srgb =
+						    comp_vk_native_swapchain_is_true_srgb(layer->sc_array[0]);
+						if (!true_srgb &&
+						    u_tiling_can_zero_copy(vc, rxs, rys, rws, rhs_arr, sw, sh, mode)) {
 							zc_image_u64 = comp_vk_native_swapchain_get_image(layer->sc_array[0], img_idx);
 							zc_view_u64 = comp_vk_native_swapchain_get_image_view(layer->sc_array[0], img_idx);
 							if (zc_image_u64 != 0 && zc_view_u64 != 0) {

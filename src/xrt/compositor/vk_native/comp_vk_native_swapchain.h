@@ -85,6 +85,53 @@ comp_vk_native_swapchain_get_dimensions(struct xrt_swapchain *xsc, uint32_t *out
 uint32_t
 comp_vk_native_swapchain_get_array_size(struct xrt_swapchain *xsc);
 
+/*!
+ * #1559: true when this swapchain's `VkImage`s really are in the `*_SRGB`
+ * format the app asked for, rather than the UNORM sibling the runtime reads.
+ *
+ * Two callers care: the compose blit (which must stage a raw copy first, see
+ * comp_vk_native_swapchain_stage_unorm_copy()) and the zero-copy gate, which
+ * must stay off for these so no display processor is handed an sRGB image.
+ *
+ * @ingroup comp_vk_native
+ */
+bool
+comp_vk_native_swapchain_is_true_srgb(struct xrt_swapchain *xsc);
+
+/*!
+ * #1559: record a raw copy of a source rect into this swapchain's UNORM
+ * scratch image and return that image, so the compose blit reads the app's
+ * bytes without an sRGB decode.
+ *
+ * No-op returning 0 for a swapchain whose images are already in the runtime's
+ * raw format — and also on scratch-allocation failure, so the caller can
+ * simply fall back to blitting the app image. The copy lands at the SAME
+ * offsets it had in the app image, so only the array layer changes (to 0);
+ * the caller's `srcOffsets` are reusable as-is.
+ *
+ * The app image must already be in `VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL`; the
+ * returned scratch is left in `VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL`.
+ *
+ * @param xsc The swapchain.
+ * @param cmd_ptr The `VkCommandBuffer` being recorded.
+ * @param index Image index.
+ * @param src_x, src_y, src_w, src_h Source rect, clamped to the image.
+ * @param array_layer Source array layer.
+ * @return The scratch `VkImage` as uint64_t, or 0 if the caller should use the
+ *         app image directly.
+ *
+ * @ingroup comp_vk_native
+ */
+uint64_t
+comp_vk_native_swapchain_stage_unorm_copy(struct xrt_swapchain *xsc,
+                                          void *cmd_ptr,
+                                          uint32_t index,
+                                          int32_t src_x,
+                                          int32_t src_y,
+                                          uint32_t src_w,
+                                          uint32_t src_h,
+                                          uint32_t array_layer);
+
 #ifdef __cplusplus
 }
 #endif
