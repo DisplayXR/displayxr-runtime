@@ -35,11 +35,17 @@ the window walks the interlace phase across the lens pitch and the 3D stutters. 
 runtime half has landed: the Vulkan DP variant carries `snap_window_rect` (the twin of
 D3D11 slot 18, appended per ADR-020 — no ABI bump), `XR_DXR_weave` is advertised on
 desktop Linux as a **snap-only** extension so `xrWeaveSnapWindowRectDXR` reaches that slot
-both in-process and over IPC, and the compositor re-quantises the origin it feeds
-`set_present_origin` as a guard. None of it changes behaviour until a vendor implements
-the slot — an absent slot is identity everywhere. The two remaining halves are the
-**plug-in** (the actual lattice math, LeiaSR#224) and the **app-side drag** (an
-undecorated X11 window owning its own move, since a client cannot hook Mutter's).
+both in-process and over IPC. None of it changes behaviour until a vendor implements the
+slot — an absent slot is identity everywhere. The remaining half is the **plug-in** (the
+actual lattice math, LeiaSR#224); the **app-side drag** (an undecorated X11 window owning
+its own move, since a client cannot hook Mutter's) is what drives it.
+
+A compositor-side re-quantisation of the fed origin was tried and **removed**: on the DS1
+with a real Leia DP it diverged from the true window origin on 12 of 13 moves, by up to
+2 px, which is phase error against the lens rather than protection from it. The rule it
+established is worth keeping in mind anywhere else this comes up — the runtime feeds the
+window's TRUE origin and never quantises it, because only the window owner may move a
+window and therefore only the window owner may snap one.
 Windows does not have this problem because the plug-in snaps the window during
 `WM_MOVING`; X11 gives no such hook, which is why the app has to own the drag.
 

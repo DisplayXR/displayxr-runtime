@@ -436,14 +436,28 @@ before #1588 — reads as identity: the snapped rect equals the target, the call
 the app places its window where it asked to. That is what makes the extension safe to
 advertise before any vendor has shipped the slot.
 
-Independently of the app-facing call, the compositor passes the origin it feeds
-`set_present_origin` through the same slot once per window move
-(`vk_update_present_origin`). That is **belt-and-braces only, and it is not the fix**:
-quantising a fed origin while the window itself sits off-lattice would displace the interlace
-against the lens by up to half a period — strictly worse than not snapping. It guards the
-narrow read/raster race where the window is already snapped but a metrics read caught it
-mid-flight. The on-change log line says so when it fires:
-`present origin: (x, y) [snapped from (rx, ry)] = window … - panel …`.
+**The runtime feeds the window's TRUE origin and never quantises it.** Only the window owner
+may move a window, so only the window owner may snap one — through this call, before the
+move. Everything downstream reports where the window actually is.
+
+That rule is empirical. A Vulkan build briefly re-snapped the origin it fed
+`set_present_origin` (`vk_update_present_origin`), reasoning that it could only ever correct
+a metrics read that caught an already-snapped window mid-flight. On the DS1 with a real Leia
+DP, a programmatic 16-step drag disagreed: the fed origin diverged from the true window
+origin on **12 of 13 logged moves, by up to 2 px** — e.g. the window genuinely at
+panel-relative (726, 314) while the weaver was told (726, 316). Two failures, both
+structural: the compositor anchored each snap on its own previous output rather than on the
+drag origin the owner used, so it ran a second snap chain that drifted; and it could not
+distinguish "our read caught the window mid-flight" from "the window is genuinely
+off-lattice", which is precisely the premise such a guard needs. It has been removed. The
+on-change log line now always prints the window's own origin:
+`present origin: (x, y) = window … - panel …`.
+
+For completeness, what the same hardware run says about the app-side snap, which is the
+mechanism that works: 15 of 16 moves snapped, every snapped point inside the vendor's ±2 px
+per-axis search radius (max excursion exactly 2), and all 15 sharing one slanted-lattice
+phase (circular concentration 0.974 against a slanted fit; a plain x-only residue test fails,
+as it must for a slanted lattice).
 
 ## 6. Version history
 

@@ -554,24 +554,7 @@ struct comp_vk_native_compositor
 	//! shallow for the duration so the weave phase stays snapped (#912).
 	int last_present_origin_x;
 	int last_present_origin_y;
-	//! The same origin BEFORE the #1588 phase quantisation. The #912 drag edge
-	//! keys on this: a window that is moving is moving even on the frames the
-	//! snap holds the fed origin still.
-	int last_present_raw_x;
-	int last_present_raw_y;
 	bool have_last_present_origin;
-
-	//! Last window top-left in ABSOLUTE SCREEN px that we handed the DP's
-	//! `snap_window_rect` as the "origin" (drag-start) argument. The snap ABI
-	//! is absolute because interlace phase is absolute, while the origin we
-	//! FEED the DP is panel-relative — so the two cannot share a cache.
-	int last_snap_abs_x;
-	int last_snap_abs_y;
-	//! The RAW absolute window top-left the pair above was computed from, so
-	//! the (vendor) snap runs once per window MOVE and not once per weave.
-	int last_snap_raw_abs_x;
-	int last_snap_raw_abs_y;
-	bool have_last_snap_abs;
 
 	//! Last CLIENT-AREA size seen by @ref vk_update_present_origin, in panel
 	//! pixels. Cached rather than re-queried because @ref vk_dp_canvas_rect
@@ -9896,89 +9879,51 @@ vk_update_present_origin(struct comp_vk_native_compositor *c)
 		c->have_last_window_size = true;
 	}
 
-	const int rx = m.window_screen_left - m.display_screen_left;
-	const int ry = m.window_screen_top - m.display_screen_top;
-	int ox = rx, oy = ry;
-
 	/*
-	 * Belt-and-braces phase quantisation (#1588).
+	 * Feed the window's TRUE origin, always. The runtime never quantises it.
 	 *
-	 * The CURE for drag stutter is that the WINDOW only ever lands on lattice
-	 * points — the window owner intercepts its own move and asks the DP where
-	 * it may land (comp_vk_native_compositor_snap_window_rect ←
-	 * xrWeaveSnapWindowRectDXR). Quantising the origin we FEED while the window
-	 * sits off-lattice would be actively WRONG: the interlace would then be
-	 * physically displaced against the lens by up to half a period, which is
-	 * maximal crosstalk — worse than the stutter. So this is NOT the fix; it is
-	 * a guard for the read/raster race, where the window IS snapped but our
-	 * metrics read caught it a pixel or two mid-flight. On a window the owner
-	 * snapped, the snap here is a no-op by construction.
+	 * There WAS a "belt-and-braces" snap here (#1588), on the theory that
+	 * re-snapping a fed origin could only ever correct a metrics read that
+	 * caught an already-snapped window mid-flight. Hardware said otherwise: on
+	 * the DS1 with a real Leia DP, a 16-step drag fed an origin that differed
+	 * from the true window origin on 12 of 13 logged moves, by up to 2 px — e.g.
+	 * window at panel-relative (726, 314), weaver told (726, 316). That is pure
+	 * phase error against the lens, the exact failure the block's own comment
+	 * described and claimed to avoid.
 	 *
-	 * Both points here are the window's absolute top-left in DEVICE pixels —
-	 * one frame, consistently, which is the slot's whole requirement (it uses
-	 * only the displacement, so which absolute frame this is does not matter;
-	 * mixing two would). We then re-derive the panel-relative origin to feed.
-	 * Only when the window actually moved: the slot is a pure query, but it is
-	 * a vendor call and this function runs on every weave. A fullscreen window
-	 * at the panel origin is identity — skip it entirely.
-	 *
-	 * The pitch never crosses the boundary: we pass two points and read one
-	 * back (ADR-019). A DP with no `snap_window_rect` slot — sim_display, and
-	 * every plug-in built before #1588 — is identity, so this whole block is
-	 * behaviour-neutral until a vendor opts in.
+	 * It could not have worked. It anchored each snap at its OWN previous
+	 * output, not at the drag origin the window owner used, so it ran a second
+	 * snap chain whose reference drifted away from the app's; and it had no way
+	 * to tell "our read caught the window mid-flight" from "the window is
+	 * genuinely off-lattice", which is the premise the guard needed and cannot
+	 * have. Only the window owner knows where the window is going, so only the
+	 * window owner may snap it — through
+	 * comp_vk_native_compositor_snap_window_rect / xrWeaveSnapWindowRectDXR,
+	 * before it moves. The compositor's job is to report where the window
+	 * actually is.
 	 */
-	if (rx != 0 || ry != 0) {
-		if (!c->have_last_snap_abs || m.window_screen_left != c->last_snap_raw_abs_x ||
-		    m.window_screen_top != c->last_snap_raw_abs_y) {
-			const int32_t org_x =
-			    c->have_last_snap_abs ? (int32_t)c->last_snap_abs_x : (int32_t)m.window_screen_left;
-			const int32_t org_y =
-			    c->have_last_snap_abs ? (int32_t)c->last_snap_abs_y : (int32_t)m.window_screen_top;
-			int32_t sx = (int32_t)m.window_screen_left, sy = (int32_t)m.window_screen_top;
-			// Identity-on-absence: the helper writes the target through
-			// whatever it returns, so the result is always usable.
-			(void)xrt_display_processor_vk_snap_window_rect(
-			    (struct xrt_display_processor_vk *)c->display_processor, org_x, org_y,
-			    (int32_t)m.window_screen_left, (int32_t)m.window_screen_top, &sx, &sy);
-			c->last_snap_raw_abs_x = m.window_screen_left;
-			c->last_snap_raw_abs_y = m.window_screen_top;
-			c->last_snap_abs_x = sx;
-			c->last_snap_abs_y = sy;
-			c->have_last_snap_abs = true;
-		}
-		ox = c->last_snap_abs_x - m.display_screen_left;
-		oy = c->last_snap_abs_y - m.display_screen_top;
-	}
-
+	const int ox = m.window_screen_left - m.display_screen_left;
+	const int oy = m.window_screen_top - m.display_screen_top;
 	// Origin changed ⟹ the window is being dragged: have the target clamp
 	// its bridge queue shallow so the weave phase sampled here is still
 	// where the window IS when the frame reaches glass (#912 drag-shallow;
 	// repro was 3D stutter on avatar RMB-move at governor depth 2-3).
-	// Deliberately keyed on the RAW origin, not the snapped one: "the window is
-	// moving" is what the clamp reacts to, and that is true even on the frames
-	// where the snap holds the phase still.
 	if (c->have_last_present_origin && c->target != NULL &&
-	    (rx != c->last_present_raw_x || ry != c->last_present_raw_y)) {
+	    (ox != c->last_present_origin_x || oy != c->last_present_origin_y)) {
 		comp_vk_native_target_note_origin_motion(c->target);
 	}
 	// On-change only (a drag produces a burst, a static window logs once): the
 	// one line that lets an unattended run prove WHICH origin reached the weaver
 	// — nothing downstream prints it (the DP setter stores it silently and the
 	// SDK call logs only on failure). INFO, never WARN: this fires on every
-	// pixel of a drag. The "snapped from" clause appears only when the DP
-	// actually moved the origin, so an identity DP logs exactly today's line.
+	// pixel of a drag. It prints the window origin unmodified; there is no
+	// "snapped from" variant any more, because a divergence here would be a bug,
+	// not a feature to annotate.
 	if (!c->have_last_present_origin || ox != c->last_present_origin_x || oy != c->last_present_origin_y) {
-		char snapped_from[64] = {0};
-		if (ox != rx || oy != ry) {
-			snprintf(snapped_from, sizeof(snapped_from), " [snapped from (%d, %d)]", rx, ry);
-		}
-		U_LOG_I("present origin: (%d, %d)%s = window (%d, %d) %ux%u - panel (%d, %d) %ux%u", ox, oy,
-		        snapped_from, m.window_screen_left, m.window_screen_top, m.window_pixel_width,
-		        m.window_pixel_height, m.display_screen_left, m.display_screen_top, m.display_pixel_width,
-		        m.display_pixel_height);
+		U_LOG_I("present origin: (%d, %d) = window (%d, %d) %ux%u - panel (%d, %d) %ux%u", ox, oy,
+		        m.window_screen_left, m.window_screen_top, m.window_pixel_width, m.window_pixel_height,
+		        m.display_screen_left, m.display_screen_top, m.display_pixel_width, m.display_pixel_height);
 	}
-	c->last_present_raw_x = rx;
-	c->last_present_raw_y = ry;
 	c->last_present_origin_x = ox;
 	c->last_present_origin_y = oy;
 	c->have_last_present_origin = true;

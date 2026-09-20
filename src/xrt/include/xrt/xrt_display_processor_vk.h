@@ -537,9 +537,17 @@ struct xrt_display_processor_vk
 	 * in canonical space means something is wrong (most likely mixed frames or
 	 * scaled pixels), not that the pitch is large.
 	 *
-	 * Called from the window/drag path (never per weave) and, as
-	 * belt-and-braces, once per origin CHANGE from the compositor's present-
-	 * origin feed. Must be cheap, non-blocking and free of side effects: it
+	 * ## Only the window owner calls this
+	 *
+	 * It is called from the window/drag path, by whoever is about to MOVE the
+	 * window, and from nowhere else — never per weave, and in particular never
+	 * on the compositor's present-origin feed. The runtime reports the
+	 * window's TRUE origin to the weaver and quantises nothing: an origin
+	 * snapped without the window having moved to match is a phase error
+	 * against the lens, measured at up to 2 px on the DS1 (#1588). Whoever
+	 * knows where the window is GOING is the only party who can snap it.
+	 *
+	 * Must be cheap, non-blocking and free of side effects: it
 	 * is a pure query, not a state change — it must not move a window,
 	 * re-phase a live weaver, or touch the hardware lens state.
 	 *

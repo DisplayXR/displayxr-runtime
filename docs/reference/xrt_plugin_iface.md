@@ -438,14 +438,21 @@ bool (*snap_window_rect)(struct xrt_display_processor_vk *xdp, /* or _d3d11 */
 - **Optional.** An absent slot or a `false` return means "no lattice to snap to" and the
   caller keeps its proposed position — which is what every platform did before the slot
   existed, and what `sim_display` does today (anaglyph has no lattice).
-- **Who calls it.** The window owner, whoever that is: the runtime's own window proc for a
+- **Who calls it — the window owner, and nobody else.** The runtime's own window proc for a
   runtime-owned window, the D3D11 service for a cross-process present owner, and — on
   desktop Linux, where a client cannot hook the window manager's drag — the **app**, through
-  `xrWeaveSnapWindowRectDXR`. The Vulkan compositor additionally passes the origin it feeds
-  `set_present_origin` through the slot once per window move, as a guard against a
-  mid-flight metrics read. That last one is belt-and-braces: quantising a fed origin while
-  the window sits off-lattice would displace the interlace against the lens by up to half a
-  period, which is worse than not snapping at all.
+  `xrWeaveSnapWindowRectDXR`. Always *before* the window moves.
+
+  **The runtime feeds the weaver the window's TRUE origin and never quantises it.** This is
+  a rule hardware established, not a style preference. A Vulkan build briefly re-snapped the
+  origin it fed `set_present_origin`, on the theory that it could only ever correct a
+  metrics read that caught an already-snapped window mid-flight. Measured on the DS1 with a
+  real Leia DP, a 16-step drag: the fed origin diverged from the true window origin on **12
+  of 13 moves, by up to 2 px** — window at panel-relative (726, 314), weaver told (726,
+  316). Snapping an origin without moving the window to match *is* phase error against the
+  lens; and a second snap chain anchored on its own previous output drifts away from the
+  owner's, which is anchored on the drag origin. Only the party that knows where the window
+  is going may snap it.
 
 ## Frame-timing inputs are an offer, never a requirement
 
