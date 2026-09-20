@@ -851,6 +851,15 @@ jobs:
             xvfb x11-utils mesa-vulkan-drivers vulkan-tools \
             libvulkan1 libxcb1 libxcb-randr0 libx11-6 libx11-xcb1 libxcb-glx0 \
             libgl1 libegl1 libdbus-1-3
+          # Inventory the ICDs the image now has. Cheap, and it is the first
+          # thing anyone wants when an arm reports the wrong renderer or none:
+          # the manifest directory and file names are distro-and-release
+          # dependent, which is why run_cts.sh discovers them by content.
+          echo "--- vulkan ICD manifests ---"
+          for d in /usr/share/vulkan/icd.d /etc/vulkan/icd.d /usr/local/share/vulkan/icd.d; do
+            [ -d "$d" ] && ls -la "$d" || echo "$d (absent)"
+          done
+          dpkg -L mesa-vulkan-drivers 2>/dev/null | grep -iE 'icd|vulkan' | head -30 || true
 
       - name: Download build tree
         uses: actions/download-artifact@v6

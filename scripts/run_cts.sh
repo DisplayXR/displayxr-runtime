@@ -225,20 +225,51 @@ fi
 # that happens to be installed, so a result file can never be ambiguous about
 # which implementation produced it (#1525's lesson: a CTS XML records the
 # graphics PLUGIN, never the renderer that answered it).
+#
+# DISCOVERY IS BY CONTENT, NOT BY FILENAME, and that is not paranoia — it is
+# the bug this lane already hit. Upstream Mesa installs
+# `lvp_icd.<arch>.json`; Debian and Ubuntu patch the arch suffix out and ship
+# plain **`lvp_icd.json`**, so the upstream spelling matches nothing on the
+# hosted runner even with mesa-vulkan-drivers installed (run 35482014304:
+# "no lavapipe ICD manifest found" on an image that had one). Both names are
+# tried, then any manifest in the standard roots whose library_path actually
+# names the lavapipe driver.
 ICD_JSON=""
+ICD_SEARCH_DIRS="
+/usr/share/vulkan/icd.d
+/usr/local/share/vulkan/icd.d
+/etc/vulkan/icd.d
+/usr/lib/x86_64-linux-gnu/vulkan/icd.d
+/usr/lib/aarch64-linux-gnu/vulkan/icd.d
+"
 if [ "$SOFTWARE" = "ON" ]; then
-  for cand in \
-      /usr/share/vulkan/icd.d/lvp_icd.x86_64.json \
-      /usr/share/vulkan/icd.d/lvp_icd.aarch64.json \
-      /usr/local/share/vulkan/icd.d/lvp_icd.x86_64.json; do
-    [ -f "$cand" ] && { ICD_JSON="$cand"; break; }
+  for d in $ICD_SEARCH_DIRS; do
+    [ -d "$d" ] || continue
+    # Prefer an explicitly-named lavapipe manifest, then anything whose
+    # library_path names the lavapipe driver.
+    for f in "$d"/lvp_icd.json "$d"/lvp_icd.*.json "$d"/*lavapipe*.json; do
+      [ -f "$f" ] && { ICD_JSON="$f"; break; }
+    done
+    [ -n "$ICD_JSON" ] && break
+    for f in "$d"/*.json; do
+      [ -f "$f" ] || continue
+      if grep -qE '"library_path"[^,]*(lvp|lavapipe)' "$f"; then ICD_JSON="$f"; break; fi
+    done
+    [ -n "$ICD_JSON" ] && break
   done
   if [ -z "$ICD_JSON" ]; then
-    ICD_JSON="$(ls /usr/share/vulkan/icd.d/lvp_icd.*.json 2>/dev/null | head -1)"
-  fi
-  if [ -z "$ICD_JSON" ]; then
-    echo "ERROR: --software given but no lavapipe ICD manifest found under /usr/share/vulkan/icd.d/." >&2
-    echo "       Install mesa-vulkan-drivers." >&2
+    echo "ERROR: --software given but no lavapipe ICD manifest found." >&2
+    echo "       Searched:" >&2
+    for d in $ICD_SEARCH_DIRS; do
+      if [ -d "$d" ]; then
+        echo "       --- $d" >&2
+        ls -la "$d" >&2 || true
+      else
+        echo "       --- $d (absent)" >&2
+      fi
+    done
+    echo "       Install mesa-vulkan-drivers (and check what it shipped:" >&2
+    echo "       dpkg -L mesa-vulkan-drivers | grep -i icd)." >&2
     exit 1
   fi
   # Both spellings: VK_DRIVER_FILES is the modern name, VK_ICD_FILENAMES the
