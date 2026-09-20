@@ -79,6 +79,7 @@ struct comp_vk_split; // the reroute fields exist either way; the code does not
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include "d3d/d3d_scanout_helpers.hpp"
+#include "d3d/d3d_render_adapter.h"
 #include "d3d/d3d_weave_placement.h"
 #include <stdint.h>
 #include <stdlib.h>
@@ -2037,6 +2038,24 @@ d3d12_split_stage_a(struct comp_d3d12_compositor *c,
 		gin.render_luid.high = app_luid.HighPart;
 		gin.scanout_luid.low = sdesc.AdapterLuid.LowPart;
 		gin.scanout_luid.high = sdesc.AdapterLuid.HighPart;
+		/*
+		 * #1571: is that adapter a software rasterizer (WARP / the Microsoft
+		 * Basic Render Driver) or a remote one? Only the same-adapter branch
+		 * of the gate reads it. Same predicate and same shape as the D3D11
+		 * tier — DESC1 carries the SOFTWARE/REMOTE flags, and the
+		 * vendor/device id alone still catches the Basic Render Driver when
+		 * the query is unavailable.
+		 */
+		if (gin.scanout_resolved) {
+			UINT sflags = 0;
+			DXGI_ADAPTER_DESC1 sdesc1{};
+			auto scanout1 = scanout.try_query<IDXGIAdapter1>();
+			if (scanout1 && SUCCEEDED(scanout1->GetDesc1(&sdesc1))) {
+				sflags = sdesc1.Flags;
+			}
+			gin.scanout_software =
+			    d3d_adapter_is_software_or_remote(sdesc.VendorId, sdesc.DeviceId, (uint32_t)sflags);
+		}
 	}
 
 	// ADR-039 ACCEPTED for this tier via the heavy-d3d12 reroute (#1264,
@@ -2102,6 +2121,28 @@ d3d12_split_stage_a(struct comp_d3d12_compositor *c,
 		    "#918 output-device split: ADR-039 same-adapter ENGAGE on the OWN-LEGS arm on '%ls' "
 		    "LUID=%08lx:%08lx (DXR_SPLIT_D3D12_ROUTE=own — the A/B control; its event record did "
 		    "not pass the matrix, so the partition refuses on this arm)",
+		    sdesc.Description, (unsigned long)sdesc.AdapterLuid.HighPart,
+		    (unsigned long)sdesc.AdapterLuid.LowPart);
+	} else if (gate.same_adapter && c->split_off_reason != nullptr &&
+	           strcmp(c->split_off_reason, COMP_SPLIT_REASON_SOFTWARE_SCANOUT) == 0) {
+		/*
+		 * #1571: ADR-039 would have engaged (on the d3d11 fill arm, by
+		 * default), but the one adapter is a software rasterizer — there is
+		 * no separate fill engine to decouple, so the reroute's D3D11 device
+		 * + immediate context, the two D3D12 copy queues and the egress ring
+		 * would only contend for the same cores. Measured on the hosted lane
+		 * (one build, one VM, run 35485831504): this tier with the split
+		 * engaged took 167.6 s and failed Timed_Pipelined_Frame_Submission at
+		 * 322% overhead, against 91.9 s and zero failures on the D3D11 tier
+		 * that had already declined. One WARN per session; a real GPU never
+		 * reaches this branch.
+		 */
+		U_LOG_W(
+		    "#918 output-device split: scanout adapter '%ls' LUID=%08lx:%08lx is a SOFTWARE or "
+		    "remote adapter — the ADR-039 same-adapter engage is declined, because there is no "
+		    "separate fill engine to decouple and the reroute would only contend for the same "
+		    "cores (#1571). A real GPU is unaffected; DXR_SPLIT_SAME_ADAPTER=1 forces the split "
+		    "on here anyway, =0 forces it off everywhere",
 		    sdesc.Description, (unsigned long)sdesc.AdapterLuid.HighPart,
 		    (unsigned long)sdesc.AdapterLuid.LowPart);
 	} else if (gate.same_adapter) {
