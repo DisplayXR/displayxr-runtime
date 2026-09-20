@@ -278,26 +278,46 @@ resolve_render_adapter_luid(const struct xrt_plugin_display_info *pdi)
 }
 
 /*!
- * Fill the panel's desktop rect + device name from the origin the display
- * processor reported (#1301).
+ * Fill the panel's desktop rect + device name for the panel the display
+ * processor described (#1301).
  *
- * `display_screen_left/top` alone identifies the monitor; this widens it to the
- * full rect apps need for `SetWindowPos`, plus the GDI device name they need to
- * re-resolve the monitor after a hotplug or arrangement change.
+ * The plug-in's `display_screen_left/top` identifies the monitor when it is
+ * reported; this widens it to the full rect apps need for `SetWindowPos`, plus
+ * the device name they need to re-resolve the monitor after a hotplug or
+ * arrangement change.
  *
- * `display_desktop_rect_is_panel` is the honesty flag: a plug-in that reports no
- * position (sim_display, and the not-yet-wired Linux/macOS paths of #715) lands
- * us on the primary monitor, which is a legitimate rect but is NOT evidence
- * that we know where a 3D panel is. Comparing the resolved monitor's current
- * mode against the panel's reported native resolution separates the two, so an
- * app can decide whether moving its window is worth doing.
+ * When no position is reported — sim_display expressing no preference, and
+ * LeiaSR on Linux, whose `srDisplayGetLocation()` identifies the panel by EDID
+ * physical size and returns a (0,0) origin under a Wayland compositor — the
+ * resolver matches on the panel's size instead, because a 3D panel is a SECOND
+ * monitor on every real rig and "fall back to the primary" would silently pick
+ * the laptop screen. @ref os_display_desktop_info_for_panel owns those rules;
+ * this function feeds it the plug-in's numbers and reports which rule fired.
+ *
+ * `display_desktop_rect_is_panel` remains the honesty flag and keeps its exact
+ * meaning: the resolved monitor's current mode EQUALS the panel's reported
+ * native resolution, so the rect is 1:1 and weaving into it can be
+ * phase-correct.
+ *
+ * On a size match this function also becomes the AUTHORITY on the panel's
+ * origin, overriding the plug-in's (0, 0) — see the comment at the assignment
+ * for why a wrong origin is worse than an unknown one.
  */
 static void
 fill_display_desktop_info(struct xrt_system_compositor_info *info)
 {
 	struct os_display_desktop_info desktop = {0};
+	struct os_display_panel_match match = {0};
+	const struct os_display_panel_hint hint = {
+	    .screen_left = info->display_screen_left,
+	    .screen_top = info->display_screen_top,
+	    .pixel_width = info->display_pixel_width,
+	    .pixel_height = info->display_pixel_height,
+	    .width_m = info->display_width_m,
+	    .height_m = info->display_height_m,
+	};
 
-	if (!os_display_desktop_info_at(info->display_screen_left, info->display_screen_top, &desktop)) {
+	if (!os_display_desktop_info_for_panel(&hint, &desktop, &match)) {
 		// No implementation on this platform, or the query failed. Leave the
 		// zeroed defaults, which XR_DXR_display_info defines as "unknown".
 		U_LOG_I("Panel desktop rect unavailable for origin (%d, %d); apps get 'unknown'.",
@@ -308,11 +328,6 @@ fill_display_desktop_info(struct xrt_system_compositor_info *info)
 	info->display_desktop_width = desktop.width;
 	info->display_desktop_height = desktop.height;
 	info->display_is_primary = desktop.is_primary;
-
-	// The resolver may have snapped to the NEAREST monitor, so take its rect
-	// origin rather than trusting the point we asked about.
-	info->display_screen_left = desktop.left;
-	info->display_screen_top = desktop.top;
 
 	(void)snprintf(info->display_device_name, sizeof(info->display_device_name), "%s", desktop.device_name);
 
@@ -325,10 +340,61 @@ fill_display_desktop_info(struct xrt_system_compositor_info *info)
 	                                      desktop.width_in_caller_dpi == info->display_pixel_width &&
 	                                      desktop.height_in_caller_dpi == info->display_pixel_height;
 
-	U_LOG_W("XR_DXR_display_info panel rect: %ux%u at (%d, %d) on '%s'%s%s", desktop.width, desktop.height,
-	        (int)desktop.left, (int)desktop.top, desktop.device_name[0] != '\0' ? desktop.device_name : "?",
-	        desktop.is_primary ? ", primary" : "",
-	        info->display_desktop_rect_is_panel ? "" : " (size != panel native — primary-monitor fallback?)");
+	// The published origin.
+	//
+	// Under the ORIGIN rule this is the old snap-to-rect: the resolver may have
+	// landed on the NEAREST monitor, so the rect's own top-left is what apps
+	// can place against, not the point we asked about. Windows always takes
+	// this branch and its outcome is unchanged.
+	//
+	// Under the size-match rule it is the runtime asserting placement
+	// authority (ADR-033) over a plug-in that could not have it. The Leia
+	// plug-in resolves its panel's desktop position from EDID via RandR, but
+	// XWayland's RandR emulation publishes no EDID property, so the lookup
+	// fails and it reports (0, 0) — and the compositor then computes the
+	// present origin as `window_screen_left - display_screen_left`, which for
+	// a window on a panel at x=3456 yields ox≈3456 on a 3840-wide panel:
+	// wrong weave phase AND a phantom lateral eye offset. We know where the
+	// panel is; the plug-in does not, so we publish what we know.
+	//
+	// Never on the primary fallback: there the rect origin IS the desktop
+	// origin, so the assignment would be a no-op dressed as a decision.
+	const bool origin_from_plugin = match.rule == OS_DISPLAY_DESKTOP_RULE_ORIGIN;
+	const bool origin_from_size_match =
+	    match.rule == OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH && info->display_desktop_rect_is_panel;
+
+	if (origin_from_size_match &&
+	    (desktop.left != info->display_screen_left || desktop.top != info->display_screen_top)) {
+		U_LOG_W(
+		    "Plug-in reported panel origin (%d, %d); the desktop resolver found the panel at "
+		    "(%d, %d) on '%s' by size — using that. Window placement and the weave present "
+		    "origin both follow the resolver.",
+		    (int)info->display_screen_left, (int)info->display_screen_top, (int)desktop.left, (int)desktop.top,
+		    desktop.device_name[0] != '\0' ? desktop.device_name : "?");
+	}
+
+	if (origin_from_plugin || origin_from_size_match) {
+		info->display_screen_left = desktop.left;
+		info->display_screen_top = desktop.top;
+	}
+
+	U_LOG_W("XR_DXR_display_info panel rect: %ux%u at (%d, %d) on '%s'%s [rule: %s]%s", desktop.width,
+	        desktop.height, (int)desktop.left, (int)desktop.top,
+	        desktop.device_name[0] != '\0' ? desktop.device_name : "?", desktop.is_primary ? ", primary" : "",
+	        os_display_desktop_rule_str(match.rule),
+	        info->display_desktop_rect_is_panel ? "" : " (size != panel native — not panel-confirmed)");
+
+	// Two monitors matched the panel's pixel size, so the pick was a
+	// tie-break (closest physical size, else the non-primary one) rather than
+	// a deduction. Say so once, at init: it is the one case where the rect
+	// above could be the wrong monitor while still looking confident.
+	if (match.rule == OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH && match.candidate_count > 1) {
+		U_LOG_W(
+		    "Panel selection was AMBIGUOUS: %u of %u monitors are %ux%u — picked '%s'. "
+		    "A plug-in that reports its panel origin would settle this.",
+		    match.candidate_count, match.monitor_count, info->display_pixel_width, info->display_pixel_height,
+		    desktop.device_name[0] != '\0' ? desktop.device_name : "?");
+	}
 }
 
 static xrt_result_t

@@ -147,3 +147,24 @@ os_display_desktop_info_at(int32_t x, int32_t y, struct os_display_desktop_info 
 
 	return ok;
 }
+
+/*
+ * Enumeration is unimplemented here ON PURPOSE — see the rule list on
+ * @ref os_display_desktop_info_for_panel. The Windows plug-in reads the panel's
+ * origin out of EDID and reports it, so selection always takes the origin rule
+ * and never reaches the size rules; returning 0 keeps this platform on exactly
+ * the behaviour it had before those rules existed.
+ *
+ * An `EnumDisplayMonitors` walk would also have to answer this file's
+ * DPI-virtualisation question per monitor before its sizes could be compared
+ * with anything a plug-in reports, so it is not a two-line addition — and
+ * nothing needs it.
+ */
+uint32_t
+os_display_desktop_enumerate(struct os_display_desktop_info *out_infos, uint32_t max_infos)
+{
+	(void)out_infos;
+	(void)max_infos;
+
+	return 0;
+}

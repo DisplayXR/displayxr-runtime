@@ -123,3 +123,19 @@ os_display_desktop_info_at(int32_t x, int32_t y, struct os_display_desktop_info 
 
 	return true;
 }
+
+/*
+ * Not implemented: no 3D-panel plug-in ships on macOS, so nothing exercises the
+ * size-matching rules in @ref os_display_desktop_info_for_panel here, and
+ * returning 0 keeps selection on the origin/primary behaviour this file already
+ * had. `CGGetActiveDisplayList` + `CGDisplayScreenSize` would supply both
+ * matching factors the day one is needed.
+ */
+uint32_t
+os_display_desktop_enumerate(struct os_display_desktop_info *out_infos, uint32_t max_infos)
+{
+	(void)out_infos;
+	(void)max_infos;
+
+	return 0;
+}

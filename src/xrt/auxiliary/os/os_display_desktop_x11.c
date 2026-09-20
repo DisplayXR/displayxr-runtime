@@ -25,10 +25,16 @@
  * ## RandR 1.5 `XRRGetMonitors`, not CRTC walking
  *
  * `XRRGetMonitors` returns exactly this struct's shape in one call — rect,
- * primary flag, and a name atom per monitor — where the older CRTC/output walk
- * needs three round trips and its own mode bookkeeping. RandR 1.5 is 2015-era
- * and present on every distribution the runtime targets (Ubuntu 22.04 well
- * inside it).
+ * primary flag, EDID physical size, and a name atom per monitor — where the
+ * older CRTC/output walk needs three round trips and its own mode bookkeeping.
+ * RandR 1.5 is 2015-era and present on every distribution the runtime targets
+ * (Ubuntu 22.04 well inside it).
+ *
+ * ## Both entry points come off ONE walk
+ *
+ * The point lookup and @ref os_display_desktop_enumerate are two shapes of the
+ * same `XRRGetMonitors` result (@ref query_monitors), so they cannot disagree
+ * about the layout — which matters, because panel selection consults both.
  *
  * ## Wayland
  *
@@ -142,39 +148,46 @@ x11_fns_unload(struct x11_fns *f)
 
 //! Squared distance from (x, y) to the nearest edge of a monitor rect, 0 inside.
 static int64_t
-rect_distance_sq(const struct os_xrr_monitor_info *m, int32_t x, int32_t y)
+rect_distance_sq(const struct os_display_desktop_info *m, int32_t x, int32_t y)
 {
 	int64_t dx = 0;
 	int64_t dy = 0;
 
-	if (x < m->x) {
-		dx = (int64_t)m->x - x;
-	} else if (x >= m->x + m->width) {
-		dx = (int64_t)x - (m->x + m->width - 1);
+	if (x < m->left) {
+		dx = (int64_t)m->left - x;
+	} else if (x >= m->left + (int64_t)m->width) {
+		dx = (int64_t)x - (m->left + (int64_t)m->width - 1);
 	}
-	if (y < m->y) {
-		dy = (int64_t)m->y - y;
-	} else if (y >= m->y + m->height) {
-		dy = (int64_t)y - (m->y + m->height - 1);
+	if (y < m->top) {
+		dy = (int64_t)m->top - y;
+	} else if (y >= m->top + (int64_t)m->height) {
+		dy = (int64_t)y - (m->top + (int64_t)m->height - 1);
 	}
 
 	return dx * dx + dy * dy;
 }
 
-bool
-os_display_desktop_info_at(int32_t x, int32_t y, struct os_display_desktop_info *out_info)
+/*!
+ * The one X11 round trip: open the display, walk RandR's monitor list, fill our
+ * own structs.
+ *
+ * @return the number of monitors written, 0 on any failure (no X libraries, no
+ * $DISPLAY, RandR too old, nothing active).
+ */
+static uint32_t
+query_monitors(struct os_display_desktop_info *out_infos, uint32_t max_infos)
 {
-	if (out_info == NULL) {
-		return false;
+	if (out_infos == NULL || max_infos == 0) {
+		return 0;
 	}
-	memset(out_info, 0, sizeof(*out_info));
+	memset(out_infos, 0, sizeof(*out_infos) * max_infos);
 
 	struct x11_fns f;
 	if (!x11_fns_load(&f)) {
-		return false;
+		return 0;
 	}
 
-	bool ok = false;
+	uint32_t written = 0;
 
 	// NULL honours $DISPLAY. No display (headless, or pure Wayland with no
 	// XWayland) is a normal "unknown", not a failure to report.
@@ -185,55 +198,89 @@ os_display_desktop_info_at(int32_t x, int32_t y, struct os_display_desktop_info 
 		// only_active=1: mirrored/disabled outputs are not placeable.
 		struct os_xrr_monitor_info *mons = f.XRRGetMonitors(dpy, root, 1, &count);
 
-		if (mons != NULL && count > 0) {
-			// Nearest rather than strictly-containing, matching the Windows
-			// MONITOR_DEFAULTTONEAREST behaviour: a stale origin or a gap in
-			// a ragged arrangement still yields a placeable rect.
-			int best = 0;
-			int64_t best_d = rect_distance_sq(&mons[0], x, y);
-			for (int i = 1; i < count; i++) {
-				int64_t d = rect_distance_sq(&mons[i], x, y);
-				if (d < best_d) {
-					best_d = d;
-					best = i;
+		if (mons != NULL) {
+			for (int i = 0; i < count && written < max_infos; i++) {
+				const struct os_xrr_monitor_info *m = &mons[i];
+				if (m->width <= 0 || m->height <= 0) {
+					continue;
+				}
+
+				struct os_display_desktop_info *o = &out_infos[written++];
+				o->left = (int32_t)m->x;
+				o->top = (int32_t)m->y;
+				o->width = (uint32_t)m->width;
+				o->height = (uint32_t)m->height;
+				o->is_primary = m->primary != 0;
+
+				// X11 root coordinates are device pixels with no scaling
+				// layer, so the plug-in reads the same space we do.
+				o->width_in_caller_dpi = o->width;
+				o->height_in_caller_dpi = o->height;
+
+				// RandR passes the output's EDID physical size straight
+				// through. This is the SECOND matching factor: when a
+				// plug-in can report neither an identity nor a usable
+				// origin, millimetres are the only other property both
+				// sides know independently about the same panel.
+				o->physical_width_mm = (uint32_t)(m->mwidth > 0 ? m->mwidth : 0);
+				o->physical_height_mm = (uint32_t)(m->mheight > 0 ? m->mheight : 0);
+
+				// The monitor's name atom is the RandR output name
+				// ("HDMI-1", "eDP-1", "DP-2") — stable across sessions for
+				// a given physical connector, which is what makes it
+				// usable for re-resolution.
+				char *name = f.XGetAtomName(dpy, m->name);
+				if (name != NULL) {
+					(void)snprintf(o->device_name, sizeof(o->device_name), "%s", name);
+					f.XFree(name);
 				}
 			}
 
-			const struct os_xrr_monitor_info *m = &mons[best];
-			out_info->left = (int32_t)m->x;
-			out_info->top = (int32_t)m->y;
-			out_info->width = (uint32_t)(m->width > 0 ? m->width : 0);
-			out_info->height = (uint32_t)(m->height > 0 ? m->height : 0);
-			out_info->is_primary = m->primary != 0;
-
-			// X11 root coordinates are device pixels with no scaling layer, so
-			// the plug-in reads the same space we do.
-			out_info->width_in_caller_dpi = out_info->width;
-			out_info->height_in_caller_dpi = out_info->height;
-
-			// The monitor's name atom is the RandR output name ("HDMI-1",
-			// "eDP-1", "DP-2") — stable across sessions for a given physical
-			// connector, which is what makes it usable for re-resolution.
-			char *name = f.XGetAtomName(dpy, m->name);
-			if (name != NULL) {
-				(void)snprintf(out_info->device_name, sizeof(out_info->device_name), "%s", name);
-				f.XFree(name);
-			}
-
-			ok = out_info->width > 0 && out_info->height > 0;
-		}
-
-		if (mons != NULL) {
 			f.XRRFreeMonitors(mons);
 		}
+
 		f.XCloseDisplay(dpy);
 	}
 
 	x11_fns_unload(&f);
 
-	if (!ok) {
-		memset(out_info, 0, sizeof(*out_info));
+	return written;
+}
+
+uint32_t
+os_display_desktop_enumerate(struct os_display_desktop_info *out_infos, uint32_t max_infos)
+{
+	return query_monitors(out_infos, max_infos);
+}
+
+bool
+os_display_desktop_info_at(int32_t x, int32_t y, struct os_display_desktop_info *out_info)
+{
+	if (out_info == NULL) {
+		return false;
+	}
+	memset(out_info, 0, sizeof(*out_info));
+
+	struct os_display_desktop_info mons[OS_DISPLAY_DESKTOP_MAX_MONITORS];
+	uint32_t count = query_monitors(mons, OS_DISPLAY_DESKTOP_MAX_MONITORS);
+	if (count == 0) {
+		return false;
 	}
 
-	return ok;
+	// Nearest rather than strictly-containing, matching the Windows
+	// MONITOR_DEFAULTTONEAREST behaviour: a stale origin or a gap in a ragged
+	// arrangement still yields a placeable rect.
+	uint32_t best = 0;
+	int64_t best_d = rect_distance_sq(&mons[0], x, y);
+	for (uint32_t i = 1; i < count; i++) {
+		int64_t d = rect_distance_sq(&mons[i], x, y);
+		if (d < best_d) {
+			best_d = d;
+			best = i;
+		}
+	}
+
+	*out_info = mons[best];
+
+	return true;
 }

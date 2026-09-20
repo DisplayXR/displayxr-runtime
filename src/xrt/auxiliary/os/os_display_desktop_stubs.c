@@ -32,3 +32,12 @@ os_display_desktop_info_at(int32_t x, int32_t y, struct os_display_desktop_info 
 
 	return false;
 }
+
+uint32_t
+os_display_desktop_enumerate(struct os_display_desktop_info *out_infos, uint32_t max_infos)
+{
+	(void)out_infos;
+	(void)max_infos;
+
+	return 0;
+}

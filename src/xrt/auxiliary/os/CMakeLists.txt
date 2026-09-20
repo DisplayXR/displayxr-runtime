@@ -37,7 +37,10 @@ endif()
 # Deliberately light: no SetupAPI on Windows, and the X11 entry points are
 # dlopen'd rather than linked, so this respects the no-DSO rule at the top of
 # this file. Android and anything else falls through to the stub.
-target_sources(aux_os PRIVATE os_display_desktop.h)
+# The monitor-selection policy is platform-independent and lives in one file;
+# the platform files below only answer "which monitor is at this point" and
+# "what monitors are there".
+target_sources(aux_os PRIVATE os_display_desktop.h os_display_desktop_select.c)
 if(WIN32)
 	target_sources(aux_os PRIVATE os_display_desktop_win32.c)
 elseif(APPLE)
