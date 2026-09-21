@@ -1420,8 +1420,8 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
 
 	// XR_DXR_display_zones (ADR-027): a zones frame composes N placed zone
 	// layers into the window-spanning atlas — the unzoned area must weave
-	// to nothing (transparent), not the dark-blue debug clear, so the
-	// feathered wish edge blends toward the desktop.
+	// to nothing (transparent), so the feathered wish edge blends toward the
+	// desktop. Feeds the alpha term of the clear below.
 	bool zones_frame = false;
 	for (uint32_t i = 0; i < layers->layer_count; i++) {
 		if (layers->layers[i].data.type == XRT_LAYER_ZONE_3D) {
@@ -1433,12 +1433,28 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
 	// Set render target to atlas texture
 	internals.context->OMSetRenderTargets(1, &renderer->atlas_rtv, renderer->depth_dsv);
 
-	// Clear to dark blue (similar to Vulkan compositor); transparent in
-	// zones frames.
-	float clear_color[4] = {0.05f, 0.05f, 0.25f, 1.0f};
-	if (zones_frame) {
-		clear_color[0] = clear_color[1] = clear_color[2] = clear_color[3] = 0.0f;
-	}
+	/*
+	 * #1600 — clear BLACK, and honour the transparent session.
+	 *
+	 * This used to clear {0.05, 0.05, 0.25, 1} with a comment claiming it
+	 * was "similar to Vulkan compositor"; grep disproved that literal
+	 * anywhere else in the tree. D3D11 was the only backend clearing navy
+	 * AND the only one whose atlas clear ignored transparent_background —
+	 * the other four already agree on the line below (vk_native, Metal and
+	 * GL verbatim; D3D12 has the black but still owes the transparency
+	 * term). The spec initialises the composition accumulator to zero, and
+	 * the environment blend mode only reinterprets the FINAL composited
+	 * alpha, so nothing justifies a non-black clear: what the CTS
+	 * SourceAlphaBlendingWithEnvironment case blends against is black.
+	 *
+	 * The alpha term is the load-bearing half. A transparent-background
+	 * session composes over the live desktop, so every atlas pixel no layer
+	 * covers must stay see-through (#392/#573); same for the unzoned area of
+	 * a zones frame (ADR-027), so the feathered wish edge blends toward the
+	 * desktop rather than toward an opaque rectangle.
+	 */
+	const float clear_color[4] = {0.0f, 0.0f, 0.0f,
+	                              (internals.transparent_background || zones_frame) ? 0.0f : 1.0f};
 	internals.context->ClearRenderTargetView(renderer->atlas_rtv, clear_color);
 	internals.context->ClearDepthStencilView(renderer->depth_dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
 

@@ -688,6 +688,7 @@ comp_d3d11_compositor_get_internals(struct comp_d3d11_compositor *c)
 	out.device = c->device;
 	out.context = c->context;
 	out.dxgi_factory = c->dxgi_factory;
+	out.transparent_background = c->transparent_background;
 	return out;
 }
 
