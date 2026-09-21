@@ -40,7 +40,7 @@ endif()
 # The monitor-selection policy is platform-independent and lives in one file;
 # the platform files below only answer "which monitor is at this point" and
 # "what monitors are there".
-target_sources(aux_os PRIVATE os_display_desktop.h os_display_desktop_select.c)
+target_sources(aux_os PRIVATE os_display_desktop.h os_display_desktop_select.c os_display_scale.h)
 if(WIN32)
 	target_sources(aux_os PRIVATE os_display_desktop_win32.c)
 elseif(APPLE)
@@ -58,10 +58,16 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
 	# which only exists from CMake 3.25 and would silently evaluate FALSE here
 	# (this project requires 3.22), dropping us to the stub with no diagnostic.
 	target_sources(aux_os PRIVATE os_display_desktop_x11.c)
+	# X11 global-scale / placement-quantum detection: RandR rects joined to the
+	# DRM connector modes read from sysfs (no libdrm). See os_display_scale.h.
+	target_sources(aux_os PRIVATE os_display_scale_linux.c)
 	# dlopen/dlsym only; libX11/libXrandr themselves are NOT linked.
 	target_link_libraries(aux_os PRIVATE ${CMAKE_DL_LIBS})
 else()
 	target_sources(aux_os PRIVATE os_display_desktop_stubs.c)
+endif()
+if(NOT (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID))
+	target_sources(aux_os PRIVATE os_display_scale_stubs.c)
 endif()
 
 if(APPLE)
