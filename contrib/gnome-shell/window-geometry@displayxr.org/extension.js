@@ -15,6 +15,19 @@
 //   Method  GetWindows() -> (s)   JSON snapshot (schema below)
 //   Signal  WindowsChanged(s)     same JSON, emitted on any geometry change
 //
+// Service   : org.displayxr.WindowGeometry          (same bus name)
+// Object    : /org/displayxr/CaptureExclusion
+// Interface : org.displayxr.CaptureExclusion1       (extension version 2+)
+//   Method  Exclude(u pid) -> (u windows)   exclude a process's windows from
+//                                           screen capture (pid 0 = caller)
+//   Method  Release(u pid)                  drop the caller's exclusion
+//   Method  GetState() -> (s)               JSON diagnostics
+//   The exclusion is the GNOME equivalent of Windows'
+//   SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE): the window keeps drawing
+//   on screen but is absent from every OFF-SCREEN paint of the stage — mutter's
+//   ScreenCast RecordArea, screenshots, window thumbnails taken outside a
+//   frame. See docs/specs/runtime/wayland-window-geometry.md §6.
+//
 // This extension is a SHARED asset — a vendor SDK runtime package may ship it
 // to serve its own non-DisplayXR apps (one publisher, many consumers; ADR-033).
 // Keep the UUID/bus/interface identifiers and the schema rules below intact:
@@ -35,7 +48,8 @@
 //       "xwayland": false,
 //       "frame":  [x, y, w, h],             // Meta.Window.get_frame_rect()
 //       "buffer": [x, y, w, h],             // Meta.Window.get_buffer_rect()
-//       "monitor": { "x": 0, "y": 0, "w": 3840, "h": 2160, "scale": 1.0 }
+//       "monitor": { "x": 0, "y": 0, "w": 3840, "h": 2160, "scale": 1.0 },
+//       "capture_excluded": false           // ext v2+: CaptureExclusion1 active
 //     }, ...
 //   ]
 // }
@@ -46,6 +60,8 @@
 // runtime reads "frame" by default; "buffer" is published so validation can
 // decide how CSD shadow margins should be handled.
 
+import Clutter from 'gi://Clutter';
+import GObject from 'gi://GObject';
 import Meta from 'gi://Meta';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
@@ -63,6 +79,280 @@ const IFACE_XML = `
   </interface>
 </node>`;
 
+/*
+ * ── Capture exclusion (extension version 2) ──────────────────────────────
+ *
+ * WHY THIS WORKS. mutter paints the stage in two situations:
+ *
+ *   ON-SCREEN — once per stage view per frame, from the frame clock. Every one
+ *   of these paints runs between the stage's `before-paint` and `after-paint`
+ *   signals (clutter-stage-view.c, the view's redraw).
+ *
+ *   OFF-SCREEN — clutter_stage_paint_to_framebuffer()/_to_buffer(): the
+ *   ScreenCast RecordArea source (it re-renders the recorded area from an
+ *   idle callback, *after* the frame), Shell screenshots, window previews
+ *   taken outside a frame. None of these is inside that bracket.
+ *
+ * So an effect on the window actor that forwards the paint while the bracket
+ * is open and swallows it otherwise keeps the window on screen and drops it
+ * from every off-screen paint. The discriminator is TIMING rather than the
+ * paint context's framebuffer because the stage-view check is not reachable
+ * from JS (the typelib exposes get_framebuffer, not get_base_framebuffer); the
+ * spike cross-checked the two on ~8,800 paints with zero disagreements.
+ *
+ * WHY THE WINDOW BEHIND SHOWS THROUGH (no hole). mutter culls whatever an
+ * opaque window fully covers before painting. An actor with an active effect
+ * is exempt from that culling (meta-cullable.c), so the windows and wallpaper
+ * behind ours are still painted — and the off-screen paint, which skips ours,
+ * shows them intact.
+ *
+ * WHAT IT DOES NOT COVER. RecordMonitor on a view that mutter can blit
+ * straight from the view framebuffer is a copy of the ON-SCREEN paint, so an
+ * excluded window IS present in such a stream. DisplayXR uses RecordArea for
+ * exactly this reason; see docs/specs/runtime/wayland-window-geometry.md §6.
+ *
+ * IDENTIFICATION. A client registers a PID over D-Bus; every window of that
+ * PID — present now or mapped later — gets the effect, for as long as the
+ * registering client stays on the bus. The extension does not guess which
+ * processes are DisplayXR ones: it is a shared, runtime-agnostic asset (§4),
+ * and "every window of a process that happens to use a 3D panel" is not
+ * something it can know. The client lifetime is the bus connection, so a
+ * crashed app cannot leave a window invisible to screen capture forever.
+ */
+
+const EXCLUDE_EFFECT_NAME = 'displayxr-exclude-from-capture';
+
+//! True only while the stage is painting a view on screen (see above).
+let inStagePaint = false;
+//! Diagnostics — cheap counters, surfaced by GetState().
+const excludeStats = {onscreen: 0, skipped: 0};
+
+const ExcludeFromCaptureEffect = GObject.registerClass(
+class DisplayXRExcludeFromCaptureEffect extends Clutter.Effect {
+    vfunc_paint(node, paintContext, flags) {
+        if (inStagePaint) {
+            excludeStats.onscreen++;
+            super.vfunc_paint(node, paintContext, flags);
+        } else {
+            excludeStats.skipped++;
+        }
+    }
+});
+
+const EXCLUDE_IFACE_XML = `
+<node>
+  <interface name="org.displayxr.CaptureExclusion1">
+    <method name="Exclude">
+      <arg type="u" direction="in" name="pid"/>
+      <arg type="u" direction="out" name="windows"/>
+    </method>
+    <method name="Release">
+      <arg type="u" direction="in" name="pid"/>
+    </method>
+    <method name="GetState">
+      <arg type="s" direction="out" name="json"/>
+    </method>
+  </interface>
+</node>`;
+
+//! Protocol revision of CaptureExclusion1, reported by GetState().
+const CAPTURE_EXCLUSION_VERSION = 1;
+
+class CaptureExclusion {
+    constructor(onChanged) {
+        this._onChanged = onChanged;
+        // bus unique name -> {pids: Set<number>, watchId}
+        this._clients = new Map();
+        this._stageSignals = [
+            global.stage.connect('before-paint', () => {
+                inStagePaint = true;
+            }),
+            global.stage.connect('after-paint', () => {
+                inStagePaint = false;
+            }),
+        ];
+        this._wmSignals = [
+            // 'map' fires with the actor already built and before its first
+            // on-screen frame, so a newly mapped window is never painted
+            // off-screen without the effect.
+            global.window_manager.connect('map', (_wm, actor) => this._applyActor(actor)),
+        ];
+        this._dbus = Gio.DBusExportedObject.wrapJSObject(EXCLUDE_IFACE_XML, this);
+        this._dbus.export(Gio.DBus.session, '/org/displayxr/CaptureExclusion');
+    }
+
+    destroy() {
+        for (const id of this._stageSignals)
+            global.stage.disconnect(id);
+        this._stageSignals = [];
+        for (const id of this._wmSignals)
+            global.window_manager.disconnect(id);
+        this._wmSignals = [];
+        for (const client of this._clients.values())
+            Gio.bus_unwatch_name(client.watchId);
+        this._clients.clear();
+        // Remove EVERY effect we added, whether or not its owner is still
+        // registered: a disabled extension (lock screen, logout, user toggle)
+        // must leave no window invisible to capture.
+        for (const actor of global.get_window_actors())
+            actor.remove_effect_by_name(EXCLUDE_EFFECT_NAME);
+        inStagePaint = false;
+        if (this._dbus) {
+            this._dbus.unexport();
+            this._dbus = null;
+        }
+    }
+
+    //! A window was created: its actor may not exist yet — 'map' covers that.
+    onWindowCreated(win) {
+        const actor = win.get_compositor_private();
+        if (actor)
+            this._applyActor(actor);
+    }
+
+    isExcluded(win) {
+        const actor = win.get_compositor_private();
+        return !!(actor && actor.get_effect(EXCLUDE_EFFECT_NAME));
+    }
+
+    _wantedPids() {
+        const pids = new Set();
+        for (const client of this._clients.values())
+            for (const pid of client.pids)
+                pids.add(pid);
+        return pids;
+    }
+
+    _applyActor(actor, wanted = this._wantedPids()) {
+        const win = actor?.meta_window;
+        if (!win)
+            return;
+        const want = wanted.has(win.get_pid());
+        const has = !!actor.get_effect(EXCLUDE_EFFECT_NAME);
+        if (want && !has)
+            actor.add_effect_with_name(EXCLUDE_EFFECT_NAME, new ExcludeFromCaptureEffect());
+        else if (!want && has)
+            actor.remove_effect_by_name(EXCLUDE_EFFECT_NAME);
+    }
+
+    _applyAll() {
+        const wanted = this._wantedPids();
+        for (const actor of global.get_window_actors())
+            this._applyActor(actor, wanted);
+        this._onChanged?.();
+    }
+
+    _countFor(pid) {
+        let n = 0;
+        for (const actor of global.get_window_actors()) {
+            if (actor.meta_window?.get_pid() === pid && actor.get_effect(EXCLUDE_EFFECT_NAME))
+                n++;
+        }
+        return n;
+    }
+
+    _dropClient(sender) {
+        const client = this._clients.get(sender);
+        if (!client)
+            return;
+        Gio.bus_unwatch_name(client.watchId);
+        this._clients.delete(sender);
+        this._applyAll();
+    }
+
+    //! Resolve the caller's PID from the bus daemon, then run cb(pid|null).
+    _callerPid(sender, cb) {
+        Gio.DBus.session.call(
+            'org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus',
+            'GetConnectionUnixProcessID', new GLib.Variant('(s)', [sender]),
+            new GLib.VariantType('(u)'), Gio.DBusCallFlags.NONE, -1, null,
+            (conn, res) => {
+                try {
+                    cb(conn.call_finish(res).deepUnpack()[0]);
+                } catch (e) {
+                    cb(null);
+                }
+            });
+    }
+
+    // Exclude(u pid) -> (u windows). pid 0 means "the caller". A caller may
+    // only exclude its OWN process: hiding another process's windows from
+    // screen recording is not something an unrelated client should be able to
+    // do silently. (IPC/service mode, where the window owner is not the DP's
+    // process, needs the client PID plumbed — the same open item as §5.)
+    ExcludeAsync(params, invocation) {
+        const [pidArg] = params;
+        const sender = invocation.get_sender();
+        this._callerPid(sender, callerPid => {
+            if (callerPid === null) {
+                invocation.return_dbus_error('org.freedesktop.DBus.Error.Failed',
+                    'could not resolve the caller PID');
+                return;
+            }
+            const pid = pidArg === 0 ? callerPid : pidArg;
+            if (pid !== callerPid) {
+                invocation.return_dbus_error('org.freedesktop.DBus.Error.AccessDenied',
+                    `a client may only exclude its own windows (caller pid ${callerPid}, asked ${pid})`);
+                return;
+            }
+            if (!this._dbus) {
+                invocation.return_dbus_error('org.freedesktop.DBus.Error.Failed',
+                    'capture exclusion is shutting down');
+                return;
+            }
+            let client = this._clients.get(sender);
+            if (!client) {
+                client = {pids: new Set(), watchId: 0};
+                // The registration lives exactly as long as the caller's bus
+                // connection: exit, crash or a closed private connection
+                // all release it.
+                client.watchId = Gio.bus_watch_name_on_connection(
+                    Gio.DBus.session, sender, Gio.BusNameWatcherFlags.NONE,
+                    null, () => this._dropClient(sender));
+                this._clients.set(sender, client);
+            }
+            client.pids.add(pid);
+            this._applyAll();
+            invocation.return_value(new GLib.Variant('(u)', [this._countFor(pid)]));
+        });
+    }
+
+    ReleaseAsync(params, invocation) {
+        const [pidArg] = params;
+        const sender = invocation.get_sender();
+        this._callerPid(sender, callerPid => {
+            const client = this._clients.get(sender);
+            if (client) {
+                const pid = pidArg === 0 ? callerPid : pidArg;
+                client.pids.delete(pid);
+                if (client.pids.size === 0)
+                    this._dropClient(sender);
+                else
+                    this._applyAll();
+            }
+            invocation.return_value(null);
+        });
+    }
+
+    GetState() {
+        const clients = [];
+        for (const [sender, client] of this._clients)
+            clients.push({sender, pids: [...client.pids]});
+        const windows = [];
+        for (const actor of global.get_window_actors()) {
+            if (actor.get_effect(EXCLUDE_EFFECT_NAME)) {
+                const win = actor.meta_window;
+                windows.push({pid: win?.get_pid() ?? 0, title: win?.get_title() ?? ''});
+            }
+        }
+        return JSON.stringify({
+            version: CAPTURE_EXCLUSION_VERSION,
+            clients, windows,
+            paints: {onscreen: excludeStats.onscreen, skipped: excludeStats.skipped},
+        });
+    }
+}
+
 export default class WindowGeometryExtension extends Extension {
     enable() {
         this._windowSignals = new Map(); // Meta.Window -> [handler ids]
@@ -71,6 +361,9 @@ export default class WindowGeometryExtension extends Extension {
 
         this._dbus = Gio.DBusExportedObject.wrapJSObject(IFACE_XML, this);
         this._dbus.export(Gio.DBus.session, '/org/displayxr/WindowGeometry');
+        // Both objects are exported BEFORE the name is requested, so a client
+        // that sees the name appear can always reach CaptureExclusion1.
+        this._captureExclusion = new CaptureExclusion(() => this._queueEmit());
         this._nameId = Gio.DBus.session.own_name(
             'org.displayxr.WindowGeometry',
             Gio.BusNameOwnerFlags.NONE, null, null);
@@ -79,6 +372,7 @@ export default class WindowGeometryExtension extends Extension {
         this._displaySignals.push(
             display.connect('window-created', (_d, win) => {
                 this._trackWindow(win);
+                this._captureExclusion?.onWindowCreated(win);
                 this._queueEmit();
             }));
         this._displaySignals.push(
@@ -96,6 +390,11 @@ export default class WindowGeometryExtension extends Extension {
         for (const id of this._displaySignals)
             global.display.disconnect(id);
         this._displaySignals = [];
+
+        if (this._captureExclusion) {
+            this._captureExclusion.destroy();
+            this._captureExclusion = null;
+        }
 
         if (this._nameId) {
             Gio.DBus.session.unown_name(this._nameId);
@@ -180,6 +479,7 @@ export default class WindowGeometryExtension extends Extension {
                 frame: [frame.x, frame.y, frame.width, frame.height],
                 buffer: [buffer.x, buffer.y, buffer.width, buffer.height],
                 monitor,
+                capture_excluded: this._captureExclusion?.isExcluded(win) ?? false,
             });
         }
         return JSON.stringify({version: 1, windows});
