@@ -334,20 +334,51 @@ is_layer_view_visible_n(const struct xrt_layer_data *data, uint32_t view_index, 
 enum comp_layer_blend_mode
 {
 	/*!
-	 * The texture's alpha is IGNORED (treated as 1) and the layer covers
-	 * what is under it: blending off, the source written verbatim.
+	 * THE BASE BLIT — blending off, the source written VERBATIM, alpha
+	 * included. Reached through @ref comp_layer_tile_blend_mode (the first
+	 * layer into a tile), never from a layer's flags.
 	 *
-	 * Verbatim, not "alpha forced to 1": the destination alpha the runtime
+	 * Verbatim, not "alpha forced to one": the destination alpha the runtime
 	 * hands the display processor is load-bearing (#225 — the DP lerps the
 	 * desktop under the atlas alpha), and a transparent-background app's
 	 * single projection layer reaches the atlas through exactly this mode.
-	 * For the COLOUR channels the result is identical either way.
+	 *
+	 * That argument is about the FIRST, full-tile blit alone. There the
+	 * app's alpha IS the atlas alpha, so forcing it to one would drive
+	 * `dst.a` to 1 everywhere and kill the DP's alpha gate. A LATER
+	 * unflagged layer composites OVER something and is
+	 * @ref COMP_LAYER_BLEND_OPAQUE_COVER instead — see there for why the
+	 * two cannot share one mode.
 	 */
 	COMP_LAYER_BLEND_REPLACE = 0,
 	//! `out.rgb = src.rgb + dst.rgb * (1 - src.a)` — source already scaled.
 	COMP_LAYER_BLEND_PREMULTIPLIED = 1,
 	//! `out.rgb = src.rgb * src.a + dst.rgb * (1 - src.a)` — straight alpha.
 	COMP_LAYER_BLEND_STRAIGHT = 2,
+	/*!
+	 * A NON-BASE layer with no `SOURCE_ALPHA_BIT`: `out.rgb = src.rgb` and
+	 * `out.a = 1`. The layer covers what is under it in BOTH channels.
+	 *
+	 * OpenXR §10.6.2 initialises such a layer's alpha to one, so the
+	 * composition result is opaque wherever the layer draws. Writing
+	 * `src.a` there instead — which is what plain blending-off does, and
+	 * what @ref COMP_LAYER_BLEND_REPLACE did for every unflagged layer
+	 * until this split — stamps a possibly-zero TEXTURE alpha into the
+	 * atlas: in a transparent-background or zones session an opaque overlay
+	 * quad then punches a hole through the content beneath it and vanishes
+	 * at the DP's alpha gate. (Before #1599 the in-process D3D11 path hid
+	 * that, because its inverted test blended such layers premultiplied,
+	 * and premultiplied blending at least PRESERVES `dst.a`.)
+	 *
+	 * Fixed-function blending cannot produce a CONSTANT one out of an
+	 * arbitrary `src.a`: `ONE`/`ZERO` gives `src.a`, `BLEND_FACTOR`
+	 * multiplies it, and a colour-only write mask preserves `dst.a` rather
+	 * than raising it. So the one is emitted by the PIXEL SHADER, folded
+	 * into the colour scale/bias every layer shader already applies —
+	 * @ref comp_layer_blend_fold_opaque_cover. The blend STATE is the same
+	 * blending-off state @ref COMP_LAYER_BLEND_REPLACE uses.
+	 */
+	COMP_LAYER_BLEND_OPAQUE_COVER = 3,
 };
 
 /*!
@@ -356,11 +387,13 @@ enum comp_layer_blend_mode
  * Two flags, three outcomes, and BOTH flags matter:
  *
  *  - no `XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT`
- *      → @ref COMP_LAYER_BLEND_REPLACE. The spec initialises the layer alpha
- *        to one, i.e. the layer is an opaque cover. This is NOT "blend it
- *        premultiplied", which is what the D3D11 in-process renderer used to
- *        do (#1599): an inverted two-way test that blended opaque layers and
- *        ignored the unpremultiplied bit entirely.
+ *      → @ref COMP_LAYER_BLEND_OPAQUE_COVER. The spec initialises the layer
+ *        alpha to one, i.e. the layer covers what is under it — colour AND
+ *        alpha. This is NOT "blend it premultiplied", which is what the D3D11
+ *        in-process renderer used to do (#1599): an inverted two-way test that
+ *        blended opaque layers and ignored the unpremultiplied bit entirely;
+ *        and it is not @ref COMP_LAYER_BLEND_REPLACE either, which is the
+ *        base blit's verbatim-alpha mode and is NOT reachable from flags.
  *  - `SOURCE_ALPHA_BIT` alone → @ref COMP_LAYER_BLEND_PREMULTIPLIED.
  *  - `SOURCE_ALPHA_BIT` + `XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT`
  *      → @ref COMP_LAYER_BLEND_STRAIGHT.
@@ -371,6 +404,43 @@ enum comp_layer_blend_mode
  */
 enum comp_layer_blend_mode
 comp_layer_blend_mode(uint32_t layer_flags);
+
+/*!
+ * Fold @ref COMP_LAYER_BLEND_OPAQUE_COVER's "alpha is one" into the layer's
+ * colour scale and bias, i.e. make the PIXEL SHADER emit `a = 1`.
+ *
+ * Every layer shader in the tree ends in `color * color_scale + color_bias`
+ * (the XR_KHR_composition_layer_color_scale_bias channel, filled per draw and
+ * identity when the app asked for nothing). `scale.a = 0, bias.a = 1` turns
+ * that one line into the spec's alpha-of-one for free: no new cbuffer field,
+ * so no HLSL/C++ layout pair to keep matched, and no second shader variant to
+ * keep in step with the first. The colour channels are untouched.
+ *
+ * Call it AFTER filling the layer's scale/bias, and pair it with the
+ * blending-off state (see @ref COMP_LAYER_BLEND_OPAQUE_COVER for why the blend
+ * state alone cannot do this). A no-op for every other mode, so it is safe to
+ * call unconditionally on any layer draw.
+ *
+ * Ordering note: the spec applies colour scale/bias to the source, and THEN
+ * composites with the layer alpha treated as one — so overriding the alpha
+ * the scale/bias produced is the specified result, not a shortcut.
+ *
+ * @param mode        The mode this draw is using.
+ * @param color_scale In/out RGBA multiplier (nullable → no-op).
+ * @param color_bias  In/out RGBA offset (nullable → no-op).
+ *
+ * @ingroup comp_util
+ */
+static inline void
+comp_layer_blend_fold_opaque_cover(enum comp_layer_blend_mode mode, float color_scale[4], float color_bias[4])
+{
+	if (mode != COMP_LAYER_BLEND_OPAQUE_COVER || color_scale == NULL || color_bias == NULL) {
+		return;
+	}
+
+	color_scale[3] = 0.0f;
+	color_bias[3] = 1.0f;
+}
 
 /*!
  * Is a quad layer's front face turned toward the camera (#1590)?
@@ -462,7 +532,17 @@ comp_layer_tile_mark_composited(struct comp_layer_tile_state *tile)
  * every shipping app submits keeps exactly the state it has today.
  *
  * Nothing is under the first layer but the clear, so REPLACE is also what the
- * spec's painter's algorithm reduces to there.
+ * spec's painter's algorithm reduces to there. An unflagged LATER layer is a
+ * @ref COMP_LAYER_BLEND_OPAQUE_COVER, not a second REPLACE: it must raise
+ * `dst.a` to one where it draws, which is the whole reason the two modes are
+ * distinct.
+ *
+ * KNOWN DEVIATIONS, both in the in-process D3D11 renderer and both deliberate:
+ * its painter's-order loop covers the KHRONOS layer types only (Local2D /
+ * window-space is a runtime-owned 2D channel drawn in a later pass with its
+ * own blend rule), and a 3D-zone layer paints a sub-rect rather than a cover,
+ * so it marks the tile composited but bypasses this gate and keeps its own
+ * ADR-027 alpha-over rule.
  *
  * @param tile        This view's tile state; NULL means "treat as first".
  * @param layer_flags @ref xrt_layer_data::flags.

@@ -5520,17 +5520,25 @@ get_color_scale_bias(const struct xrt_layer_data *data, float color_scale[4], fl
 	}
 }
 
+/*!
+ * Bind the blend state for one shared blend mode.
+ *
+ * The OpenXR three-way rule (no SOURCE_ALPHA -> opaque cover; SOURCE_ALPHA ->
+ * premultiplied; + UNPREMULTIPLIED -> straight alpha) lives in
+ * comp_layer_blend_mode(); this function is only the D3D11 half of it, and the
+ * shared policy is what stops this path and the in-process renderer drifting
+ * apart again (#1599).
+ *
+ * REPLACE and OPAQUE_COVER bind the SAME blending-off state and differ only in
+ * the alpha the pixel shader emits, so every caller that can pass OPAQUE_COVER
+ * must also run comp_layer_blend_fold_opaque_cover() over the layer's colour
+ * scale/bias before it uploads its constant buffer. Taking the MODE rather
+ * than the layer data is what makes that pairing visible at each call site.
+ */
 static void
-set_blend_state(struct d3d11_service_system *sys, const struct xrt_layer_data *data)
+set_blend_state(struct d3d11_service_system *sys, enum comp_layer_blend_mode mode)
 {
-	// The OpenXR three-way rule (no SOURCE_ALPHA -> opaque cover;
-	// SOURCE_ALPHA -> premultiplied; + UNPREMULTIPLIED -> straight alpha).
-	//
-	// This function has always had it right — it is the D3D11 IN-PROCESS
-	// renderer that had it inverted (#1599). Calling the shared predicate
-	// here is a pure refactor, byte-for-byte the same three branches, and
-	// it is what stops the two paths drifting apart again.
-	switch (comp_layer_blend_mode(data->flags)) {
+	switch (mode) {
 	case COMP_LAYER_BLEND_STRAIGHT:
 		sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
 		break;
@@ -5538,6 +5546,7 @@ set_blend_state(struct d3d11_service_system *sys, const struct xrt_layer_data *d
 		sys->context->OMSetBlendState(sys->blend_premul.get(), nullptr, 0xFFFFFFFF);
 		break;
 	case COMP_LAYER_BLEND_REPLACE:
+	case COMP_LAYER_BLEND_OPAQUE_COVER:
 	default: sys->context->OMSetBlendState(sys->blend_opaque.get(), nullptr, 0xFFFFFFFF); break;
 	}
 }
@@ -5615,6 +5624,14 @@ render_quad_layer(struct d3d11_service_system *sys,
 
 	get_color_scale_bias(data, constants.color_scale, constants.color_bias);
 
+	// A quad is never a tile's base cover, so it takes its own flags. An
+	// unflagged one is an OPAQUE_COVER: the spec's alpha-of-one, emitted by
+	// quad_ps_hlsl's `color * color_scale + color_bias` line, because no
+	// fixed-function blend factor can turn an arbitrary src.a into a
+	// constant one (see comp_layer_view_camera.h).
+	const enum comp_layer_blend_mode mode = comp_layer_blend_mode(data->flags);
+	comp_layer_blend_fold_opaque_cover(mode, constants.color_scale, constants.color_bias);
+
 	// Update constant buffer
 	D3D11_MAPPED_SUBRESOURCE mapped;
 	HRESULT hr = sys->context->Map(sys->layer_constant_buffer.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
@@ -5636,7 +5653,7 @@ render_quad_layer(struct d3d11_service_system *sys,
 	sys->context->PSSetSamplers(0, 1, samplers);
 
 	// Set blend state
-	set_blend_state(sys, data);
+	set_blend_state(sys, mode);
 
 	// Draw quad (triangle strip, 4 vertices)
 	sys->context->Draw(4, 0);
@@ -5717,6 +5734,12 @@ render_cylinder_layer(struct d3d11_service_system *sys,
 
 	get_color_scale_bias(data, constants.color_scale, constants.color_bias);
 
+	// As for quads: an unflagged cylinder is an OPAQUE_COVER, and
+	// cylinder_ps_hlsl's scale/bias line is where its alpha-of-one comes
+	// from.
+	const enum comp_layer_blend_mode mode = comp_layer_blend_mode(data->flags);
+	comp_layer_blend_fold_opaque_cover(mode, constants.color_scale, constants.color_bias);
+
 	constants.radius = cyl->radius;
 	constants.central_angle = cyl->central_angle;
 	constants.aspect_ratio = cyl->aspect_ratio;
@@ -5742,7 +5765,7 @@ render_cylinder_layer(struct d3d11_service_system *sys,
 	sys->context->PSSetSamplers(0, 1, samplers);
 
 	// Set blend state
-	set_blend_state(sys, data);
+	set_blend_state(sys, mode);
 
 	// Draw cylinder (triangle strip, 2 * (subdivision + 2) vertices)
 	// Subdivision count of 64, so 132 vertices
@@ -5818,6 +5841,13 @@ render_equirect2_layer(struct d3d11_service_system *sys,
 
 	get_color_scale_bias(data, constants.color_scale, constants.color_bias);
 
+	// As for quads. NOTE: equirect2_ps_hlsl returns float4(0,0,0,0) for
+	// fragments OUTSIDE the layer's angular extent, an early-out that never
+	// reaches the scale/bias line — so the fold raises alpha exactly where
+	// the layer covers, which is what "the layer's alpha is one" means.
+	const enum comp_layer_blend_mode mode = comp_layer_blend_mode(data->flags);
+	comp_layer_blend_fold_opaque_cover(mode, constants.color_scale, constants.color_bias);
+
 	memcpy(constants.to_tangent, to_tangent, sizeof(constants.to_tangent));
 
 	// Handle infinite radius (spec says +INFINITY)
@@ -5847,7 +5877,7 @@ render_equirect2_layer(struct d3d11_service_system *sys,
 	sys->context->PSSetSamplers(0, 1, samplers);
 
 	// Set blend state
-	set_blend_state(sys, data);
+	set_blend_state(sys, mode);
 
 	// Draw fullscreen quad
 	sys->context->Draw(4, 0);
@@ -15621,9 +15651,21 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				// always opaque); per-tile alpha only affects how each
 				// client tile composes against the workspace background.
 				if (slot_flags_valid) {
-					struct xrt_layer_data fake_data = {};
-					fake_data.flags = slot_layer_flags;
-					set_blend_state(sys, &fake_data);
+					// This is a client's whole tile going
+					// into the combined atlas as the BASE
+					// of its region, not a layer stacked
+					// over one — so an unflagged client
+					// takes REPLACE (its alpha reaches the
+					// atlas verbatim, #225) rather than
+					// OPAQUE_COVER, whose alpha-of-one the
+					// blit shader does not emit anyway.
+					// Same blending-off state either way;
+					// naming it keeps the mapping honest.
+					enum comp_layer_blend_mode tile_mode = comp_layer_blend_mode(slot_layer_flags);
+					if (tile_mode == COMP_LAYER_BLEND_OPAQUE_COVER) {
+						tile_mode = COMP_LAYER_BLEND_REPLACE;
+					}
+					set_blend_state(sys, tile_mode);
 				} else {
 					// Capture clients (2D window snapshots) and clients
 					// with no projection layer this frame -> opaque blend.
