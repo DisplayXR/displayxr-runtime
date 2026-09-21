@@ -57,6 +57,7 @@ typedef int net_input_socket_t;
 
 #include "math/m_relation_history.h"
 
+#include "util/u_grip_surface.h"
 #include "util/u_var.h"
 #include "util/u_misc.h"
 #include "util/u_device.h"
@@ -80,6 +81,8 @@ typedef int net_input_socket_t;
 #define NET_INPUT_MENU 1
 #define NET_INPUT_GRIP 2
 #define NET_INPUT_AIM 3
+//! #1633: `grip_surface` / `palm_ext`, derived from NET_INPUT_GRIP.
+#define NET_INPUT_PALM 4
 
 struct net_input_hub;
 
@@ -524,7 +527,8 @@ net_input_device_get_tracked_pose(struct xrt_device *xdev,
 
 	switch (name) {
 	case XRT_INPUT_SIMPLE_GRIP_POSE:
-	case XRT_INPUT_SIMPLE_AIM_POSE: break;
+	case XRT_INPUT_SIMPLE_AIM_POSE:
+	case XRT_INPUT_GENERIC_PALM_POSE: break;
 	default:
 		// Plain message, not U_LOG_XDEV_UNSUPPORTED_INPUT — see the
 		// matching comment in sim_input_device.c (plug-in link vs the
@@ -543,6 +547,13 @@ net_input_device_get_tracked_pose(struct xrt_device *xdev,
 	}
 
 	*out_relation = rel;
+
+	// #1633: the palm pose is the grip pose plus a fixed hand-specific
+	// offset — one shared helper, never a per-driver constant.
+	if (name == XRT_INPUT_GENERIC_PALM_POSE) {
+		u_grip_surface_from_grip(dev->hand == NET_INPUT_HAND_LEFT, out_relation, out_relation);
+	}
+
 	return XRT_SUCCESS;
 }
 
@@ -581,10 +592,8 @@ net_input_device_set_output(struct xrt_device *xdev, enum xrt_output_name name, 
  */
 
 static enum xrt_input_name net_input_inputs_array[] = {
-    XRT_INPUT_SIMPLE_SELECT_CLICK,
-    XRT_INPUT_SIMPLE_MENU_CLICK,
-    XRT_INPUT_SIMPLE_GRIP_POSE,
-    XRT_INPUT_SIMPLE_AIM_POSE,
+    XRT_INPUT_SIMPLE_SELECT_CLICK, XRT_INPUT_SIMPLE_MENU_CLICK, XRT_INPUT_SIMPLE_GRIP_POSE, XRT_INPUT_SIMPLE_AIM_POSE,
+    XRT_INPUT_GENERIC_PALM_POSE, // NET_INPUT_PALM — `grip_surface` / `palm_ext` (#1633).
 };
 
 static enum xrt_output_name net_input_outputs_array[] = {

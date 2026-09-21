@@ -36,6 +36,7 @@
 
 #include "math/m_mathinclude.h"
 
+#include "util/u_grip_surface.h"
 #include "util/u_var.h"
 #include "util/u_misc.h"
 #include "util/u_device.h"
@@ -61,6 +62,8 @@
 #define SIM_INPUT_GRIP 2
 #define SIM_INPUT_AIM 3
 #define SIM_INPUT_HT 4
+//! #1633: `grip_surface` / `palm_ext`, derived from SIM_INPUT_GRIP.
+#define SIM_INPUT_PALM 5
 
 #define SIM_INPUT_CIRCLE_RADIUS_M 0.04f
 #define SIM_INPUT_CIRCLE_PERIOD_S 4.0
@@ -205,7 +208,8 @@ sim_input_get_tracked_pose(struct xrt_device *xdev,
 
 	switch (name) {
 	case XRT_INPUT_SIMPLE_GRIP_POSE:
-	case XRT_INPUT_SIMPLE_AIM_POSE: break;
+	case XRT_INPUT_SIMPLE_AIM_POSE:
+	case XRT_INPUT_GENERIC_PALM_POSE: break;
 	default:
 		// Plain message, not U_LOG_XDEV_UNSUPPORTED_INPUT: the u_pp
 		// helpers it uses aren't on the runtime DLL's aux export
@@ -223,6 +227,12 @@ sim_input_get_tracked_pose(struct xrt_device *xdev,
 	}
 
 	script_relation(sd, at_timestamp_ns, out_relation);
+
+	// #1633: the palm pose is the grip pose plus a fixed hand-specific
+	// offset — one shared helper, never a per-driver constant.
+	if (name == XRT_INPUT_GENERIC_PALM_POSE) {
+		u_grip_surface_from_grip(sd->hand == XRT_HAND_LEFT, out_relation, out_relation);
+	}
 
 	return XRT_SUCCESS;
 }
@@ -310,6 +320,7 @@ sim_input_set_output(struct xrt_device *xdev, enum xrt_output_name name, const s
 static enum xrt_input_name sim_input_inputs_array[] = {
     XRT_INPUT_SIMPLE_SELECT_CLICK,  XRT_INPUT_SIMPLE_MENU_CLICK, XRT_INPUT_SIMPLE_GRIP_POSE, XRT_INPUT_SIMPLE_AIM_POSE,
     XRT_INPUT_HT_UNOBSTRUCTED_LEFT, // SIM_INPUT_HT — patched to _RIGHT per hand in create.
+    XRT_INPUT_GENERIC_PALM_POSE,    // SIM_INPUT_PALM — `grip_surface` / `palm_ext` (#1633).
 };
 
 static enum xrt_output_name sim_input_outputs_array[] = {
