@@ -439,6 +439,25 @@ struct comp_gl_compositor
 	GLuint atlas_texture;    //!< Atlas texture (tile_columns * view_width x tile_rows * view_height)
 	uint32_t atlas_tex_width;  //!< Atlas texture width (fixed at init)
 	uint32_t atlas_tex_height; //!< Atlas texture height (fixed at init)
+
+	/*!
+	 * @name Capture source — what the DP will actually receive this frame (#1628)
+	 *
+	 * On an ordinary frame this is @ref atlas_texture. On a ZERO-COPY frame the
+	 * renderer atlas is never painted and the DP is handed the app's own
+	 * swapchain texture instead, so a capture that reads @ref atlas_texture
+	 * shows the previous frame or nothing at all — which is exactly why the one
+	 * path whose tile placement could be wrong was also the one path nobody
+	 * could photograph. Mirrors `vk_native`'s `capture_src_image_u64`.
+	 *
+	 * Re-resolved once per `layer_commit`, before any capture site runs.
+	 * @{
+	 */
+	GLuint capture_src_texture;  //!< Texture the DP consumes this frame.
+	uint32_t capture_src_width;  //!< Its width in pixels.
+	uint32_t capture_src_height; //!< Its height in pixels.
+	/*! @} */
+
 	uint32_t view_width;
 	uint32_t view_height;
 	uint32_t tile_columns;    //!< Tile columns in atlas layout (default 2 for stereo)
@@ -3949,8 +3968,14 @@ gl_sync_zone_mask_to_dp(struct comp_gl_compositor *c)
 // tile_rows × view_height — what actually got composited, matching what
 // the compositor crops and sends to the DP), flip Y, and write @p path
 // as PNG. Caller must have a current GL context.
+//
+// #1628: reads @ref comp_gl_compositor::capture_src_texture, NOT the renderer
+// atlas — on a zero-copy frame those are different textures and the atlas is
+// the stale one. @p force_opaque is the #425 alpha stamp; the MCP/atlas-capture
+// callers want it (an undefined-alpha PNG renders black), the file-trigger dump
+// historically wrote true alpha and keeps doing so.
 static bool
-gl_compositor_capture_atlas_to_png(struct comp_gl_compositor *c, const char *path)
+gl_compositor_capture_atlas_to_png(struct comp_gl_compositor *c, const char *path, bool force_opaque)
 {
 	// #542: capture the frame's effective content region (what the passes
 	// painted), falling back to the mode layout pre-first-commit.
@@ -3958,15 +3983,22 @@ gl_compositor_capture_atlas_to_png(struct comp_gl_compositor *c, const char *pat
 	uint32_t cap_rows = c->eff_rows > 0 ? c->eff_rows : c->tile_rows;
 	uint32_t cap_tile_w = c->eff_tile_w > 0 ? c->eff_tile_w : c->view_width;
 	uint32_t cap_tile_h = c->eff_tile_h > 0 ? c->eff_tile_h : c->view_height;
-	if (c->atlas_texture == 0 || cap_cols == 0 || cap_rows == 0 ||
-	    cap_tile_w == 0 || cap_tile_h == 0) {
+	// Fall back to the atlas for any caller that runs before layer_commit has
+	// resolved a source (capture_src_texture is only set there).
+	GLuint src_tex = c->capture_src_texture != 0 ? c->capture_src_texture : c->atlas_texture;
+	uint32_t src_w = c->capture_src_texture != 0 ? c->capture_src_width : c->atlas_tex_width;
+	uint32_t src_h = c->capture_src_texture != 0 ? c->capture_src_height : c->atlas_tex_height;
+	if (src_tex == 0 || src_w == 0 || src_h == 0 || cap_cols == 0 || cap_rows == 0 || cap_tile_w == 0 ||
+	    cap_tile_h == 0) {
 		return false;
 	}
 
 	uint32_t content_w = cap_cols * cap_tile_w;
 	uint32_t content_h = cap_rows * cap_tile_h;
-	if (content_w > c->atlas_tex_width)  content_w = c->atlas_tex_width;
-	if (content_h > c->atlas_tex_height) content_h = c->atlas_tex_height;
+	if (content_w > src_w)
+		content_w = src_w;
+	if (content_h > src_h)
+		content_h = src_h;
 
 	size_t row_pitch = (size_t)content_w * 4;
 	size_t bytes = row_pitch * content_h;
@@ -3978,17 +4010,20 @@ gl_compositor_capture_atlas_to_png(struct comp_gl_compositor *c, const char *pat
 		return false;
 	}
 
-	// Attach atlas to a temporary read FBO; glReadPixels returns origin-
-	// lower-left so we flip Y into top_down.
+	// Attach the capture SOURCE to a temporary read FBO; glReadPixels returns
+	// origin-lower-left so we flip Y into top_down.
 	GLuint prev_read_fbo = 0;
 	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, (GLint *)&prev_read_fbo);
 	GLuint fbo = 0;
 	glGenFramebuffers(1, &fbo);
 	glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
-	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, c->atlas_texture, 0);
+	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, src_tex, 0);
 	// Renderer renders content into FBO viewport (0, 0, content_w, content_h),
 	// which in GL's lower-left origin lands at the bottom of the texture. Read
 	// from y=0; the bottom_up→top_down flip below produces a top-down PNG.
+	// A zero-copy source needs the identical treatment: the APP also tiled it
+	// with glViewport from y=0 up, so the same read + flip yields an upright
+	// PNG of exactly what the DP is handed.
 	glReadPixels(0, 0, (GLsizei)content_w, (GLsizei)content_h, GL_RGBA, GL_UNSIGNED_BYTE, bottom_up);
 	glFinish();
 	glBindFramebuffer(GL_READ_FRAMEBUFFER, prev_read_fbo);
@@ -4010,7 +4045,7 @@ gl_compositor_capture_atlas_to_png(struct comp_gl_compositor *c, const char *pat
 	// acceptance leg unable to fail — and left GL unable to be compared
 	// against Metal, which already honoured the switch (#1621). Default is
 	// unchanged.
-	if (!u_image_capture_raw_alpha()) {
+	if (force_opaque && !u_image_capture_raw_alpha()) {
 		u_image_force_opaque_rgba8(top_down, content_w, content_h, row_pitch);
 	}
 
@@ -4028,7 +4063,7 @@ gl_compositor_dispatch_capture(struct comp_gl_compositor *c, uint32_t mode_filte
 	if (!u_capture_intent_should_capture(&c->capture_intent, mode_filter)) {
 		return;
 	}
-	bool ok = gl_compositor_capture_atlas_to_png(c, c->capture_intent.path);
+	bool ok = gl_compositor_capture_atlas_to_png(c, c->capture_intent.path, /*force_opaque=*/true);
 	if (ok) {
 		U_LOG_I("Atlas captured (mode=%u) to %s",
 		        c->capture_intent.mode, c->capture_intent.path);
@@ -4576,6 +4611,7 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 	// Zero-copy check: can we pass the app's swapchain directly to the DP?
 	bool zero_copy = false;
 	GLuint zc_texture = 0;
+	uint32_t zc_width = 0, zc_height = 0;
 	{
 		const struct xrt_rendering_mode *mode = NULL;
 		if (c->xdev != NULL && c->xdev->hmd != NULL) {
@@ -4641,11 +4677,28 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 						                           U_TILING_ORIGIN_BOTTOM_LEFT)) {
 							zero_copy = true;
 							zc_texture = gsc->textures[img_idx];
+							zc_width = gsc->info.width;
+							zc_height = gsc->info.height;
 						}
 					}
 				}
 			}
 		}
+	}
+
+	// #1628: record the frame's capture SOURCE = exactly what the DP will
+	// receive. On a zero-copy frame the renderer atlas below is never painted,
+	// so every capture site must read the app's swapchain instead or it shows
+	// the previous frame. Mirrors vk_native's capture_src_image_u64. Set BEFORE
+	// any capture site runs, and unconditionally, so it can never go stale.
+	if (zero_copy) {
+		c->capture_src_texture = zc_texture;
+		c->capture_src_width = zc_width;
+		c->capture_src_height = zc_height;
+	} else {
+		c->capture_src_texture = c->atlas_texture;
+		c->capture_src_width = c->atlas_tex_width;
+		c->capture_src_height = c->atlas_tex_height;
 	}
 
 	// --- Step 1: Render layers into atlas texture (skip if zero-copy) ---
@@ -5192,51 +5245,34 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 		glDisable(GL_BLEND);
 	}
 
+	} // end if (!zero_copy)
+
 	// File-triggered atlas dump for autonomous screenshot verification.
-	// `touch /tmp/dxr_atlas_trigger` and the next frame writes the
-	// composited content region to /tmp/dxr_atlas.png. Mirrors the
-	// Windows D3D11-service screenshot trigger pattern. Runs while
-	// c->fbo is still bound with atlas as the color attachment, after
-	// both projection and WS-layer passes have completed.
+	// `touch /tmp/dxr_atlas_trigger` and the next frame writes the composited
+	// content region to /tmp/dxr_atlas.png. Mirrors the Windows D3D11-service
+	// screenshot trigger pattern.
+	//
+	// #1628: this used to sit INSIDE the `if (!zero_copy)` block above, reading
+	// whatever the atlas FBO happened to have bound. So the one path whose tile
+	// placement could be wrong — zero-copy, which has no crop to re-place
+	// anything — was also the one path that silently produced no PNG at all,
+	// leaving the trigger file on disk looking like a broken capture. It now runs
+	// on every frame and reads capture_src_texture via the shared readback, so a
+	// zero-copy frame photographs the app's swapchain: the texture the DP is
+	// actually handed. Deliberately keeps this dump's TRUE alpha
+	// (force_opaque=false) — the MCP/atlas-capture callers stamp opaque per #425,
+	// this one never did, and existing recipes read its alpha.
 	{
 		struct stat _st;
-		if (c->atlas_texture != 0 && c->eff_cols > 0 && c->eff_rows > 0 &&
-		    c->eff_tile_w > 0 && c->eff_tile_h > 0 &&
-		    stat("/tmp/dxr_atlas_trigger", &_st) == 0) {
-			unlink("/tmp/dxr_atlas_trigger");
-			// Effective content region (#542): what this frame painted.
-			uint32_t cw = c->eff_cols * c->eff_tile_w;
-			uint32_t ch = c->eff_rows * c->eff_tile_h;
-			if (cw > c->atlas_tex_width)  cw = c->atlas_tex_width;
-			if (ch > c->atlas_tex_height) ch = c->atlas_tex_height;
-			size_t row_pitch = (size_t)cw * 4;
-			size_t bytes = row_pitch * ch;
-			uint8_t *bu = (uint8_t *)malloc(bytes);
-			uint8_t *td = (uint8_t *)malloc(bytes);
-			if (bu != NULL && td != NULL) {
-				glReadBuffer(GL_COLOR_ATTACHMENT0);
-				// Read from y = 0. The atlas texture is worst-case sized
-				// across every rendering mode (u_tiling_compute_system_atlas),
-				// but every pass tiles from viewport y = 0 up, and a GL
-				// framebuffer's origin is BOTTOM-left — so this frame's
-				// content region occupies the BOTTOM `ch` rows, not the top.
-				// The old `atlas_tex_height - ch` offset was a top-left-origin
-				// assumption: on any box whose worst-case atlas is taller than
-				// the active mode (any sim_display enumerating the 2x2 Quad
-				// mode: 1646 vs 823) it read the untouched upper half and
-				// wrote an all-black PNG. Found while validating #1581.
-				glReadPixels(0, 0, (GLsizei)cw, (GLsizei)ch, GL_RGBA, GL_UNSIGNED_BYTE, bu);
-				glFinish();
-				for (uint32_t y = 0; y < ch; y++) {
-					memcpy(td + (size_t)y * row_pitch,
-					       bu + (size_t)(ch - 1 - y) * row_pitch, row_pitch);
-				}
-				stbi_write_png("/tmp/dxr_atlas.png", (int)cw, (int)ch, 4, td, (int)row_pitch);
-			}
-			free(bu); free(td);
+		if (stat("/tmp/dxr_atlas_trigger", &_st) == 0) {
+		unlink("/tmp/dxr_atlas_trigger");
+		if (!gl_compositor_capture_atlas_to_png(c, "/tmp/dxr_atlas.png",
+			                                /*force_opaque=*/false)) {
+			U_LOG_W("dxr_atlas_trigger: capture failed (zero_copy=%d src_tex=%u %ux%u)", (int)zero_copy,
+				c->capture_src_texture, c->capture_src_width, c->capture_src_height);
+		}
 		}
 	}
-	} // end if (!zero_copy)
 
 	// --- Step 2: Present atlas texture ---
 	// Ensure VAO is bound for present draw calls (zero-copy skips the atlas
