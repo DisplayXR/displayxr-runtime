@@ -1428,16 +1428,22 @@ TEST_CASE("comp_layer_tile_blend_mode: the first layer into a tile REPLACES, wha
 }
 
 /*
- * #1590 x #1598 — the two rules meet at "did this layer actually paint?".
+ * #1590 x #1598 — the HELPER CONTRACT that makes "apply your skips first" a
+ * rule worth stating.
  *
- * comp_layer_tile_blend_mode() resolves AND marks in one call, so a backend
- * must apply every SKIP that is a normal outcome (per-eye visibility, a quad
- * turned away) BEFORE it asks for the mode — otherwise a layer that drew
- * nothing consumes the tile's base slot and the layer behind it silently
- * blends over a clear instead of replacing it. This models that loop, in
- * exactly the order the D3D11 service and vk_native walk it.
+ * Nothing here runs a backend: the loop below is re-implemented in the test, so
+ * this case cannot and does not pin any backend's ORDERING — the structural
+ * case further down does that, by naming. What it pins is the property the
+ * ordering rule rests on. comp_layer_tile_blend_mode() resolves AND marks in
+ * ONE call, so merely ASKING it about a layer that then turns out to be skipped
+ * (per-eye visibility, a quad turned away) permanently spends the tile's base
+ * slot and the layer behind it blends over a clear instead of replacing it. A
+ * helper that only resolved, or only marked, would make the rule unnecessary;
+ * these are the assertions showing it is not.
+ *
+ * The third section pins the other half: which layers may ask at all.
  */
-TEST_CASE("a layer skipped before the gate leaves the tile untouched (#1590 x #1598)")
+TEST_CASE("comp_layer_tile_blend_mode: asking for a mode is what spends the base slot (#1590 x #1598)")
 {
 	const struct xrt_vec3 camera = {0.0f, 0.0f, 0.0f};
 	const struct xrt_pose facing = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, -1.0f}};
@@ -1478,24 +1484,60 @@ TEST_CASE("a layer skipped before the gate leaves the tile untouched (#1590 x #1
 		CHECK_FALSE(comp_layer_is_first_in_tile(&tiles[1])); // drawn
 	}
 
-	SECTION("a tile seeded by an earlier pass makes the first quad blend")
+	SECTION("a SUB-RECT layer never reaches REPLACE, painted tile or not")
 	{
 		/*
-		 * The D3D11 SERVICE composites its projection layers in an
-		 * earlier pass than its quads, so it seeds each view's tile
-		 * state COMPOSITED when the frame carried a projection-class
-		 * layer. Without that seed the first quad of an ordinary
-		 * app frame resolves to REPLACE and stamps its texture alpha
-		 * over live content — a hole in a transparent session.
+		 * Only a FULL-TILE projection-class layer can be a tile's
+		 * base, so a quad / cylinder / equirect2 takes
+		 * comp_layer_subrect_blend_mode() and gets its own flags
+		 * whether or not anything has painted the tile yet.
+		 *
+		 * Routing one through the first-in-tile gate instead — which
+		 * the D3D11 service's UI pass briefly did — made the first UI
+		 * layer of a UI-ONLY frame a REPLACE. Two things are wrong
+		 * with that: a layer covering PART of a tile cannot establish
+		 * the tile's alpha, and the service's per-client atlas is not
+		 * cleared per frame (signature-change only, and never in
+		 * workspace mode or on the always-on pipeline), so "first into
+		 * the tile" is a fiction there — the REPLACE stamped a
+		 * verbatim, possibly-zero texture alpha over LAST frame's live
+		 * content and a SOURCE_ALPHA quad stopped blending entirely.
 		 */
-		struct comp_layer_tile_state seeded = {};
-		seeded.composited = true; // a projection layer painted this tile
-		CHECK(comp_layer_tile_blend_mode(&seeded, 0) == COMP_LAYER_BLEND_OPAQUE_COVER);
+		constexpr uint32_t kSrcAlpha = XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+		constexpr uint32_t kUnpremul = XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT;
 
-		// A UI-only frame has nothing under it, so its first quad is
-		// the base blit and keeps its alpha verbatim (#225).
-		struct comp_layer_tile_state unseeded = {};
-		CHECK(comp_layer_tile_blend_mode(&unseeded, 0) == COMP_LAYER_BLEND_REPLACE);
+		// An UNPAINTED tile — the case that used to resolve REPLACE.
+		struct comp_layer_tile_state fresh = {};
+		REQUIRE(comp_layer_is_first_in_tile(&fresh));
+		CHECK(comp_layer_subrect_blend_mode(&fresh, 0) == COMP_LAYER_BLEND_OPAQUE_COVER);
+
+		// A PAINTED one gives the same answers, which IS the point:
+		// the tile's history is not an input to a sub-rect layer.
+		struct comp_layer_tile_state painted = {};
+		painted.composited = true;
+		CHECK(comp_layer_subrect_blend_mode(&painted, 0) == COMP_LAYER_BLEND_OPAQUE_COVER);
+
+		// No flag combination, on a fresh tile, reaches the base blit;
+		// every one of them is exactly comp_layer_blend_mode()'s.
+		for (uint32_t flags : {0u, kSrcAlpha, kUnpremul, kSrcAlpha | kUnpremul}) {
+			struct comp_layer_tile_state tile = {};
+			CHECK(comp_layer_subrect_blend_mode(&tile, flags) != COMP_LAYER_BLEND_REPLACE);
+
+			struct comp_layer_tile_state again = {};
+			CHECK(comp_layer_subrect_blend_mode(&again, flags) == comp_layer_blend_mode(flags));
+		}
+
+		// It still MARKS, so a FULL-TILE layer composited after it
+		// blends over it instead of erasing it.
+		struct comp_layer_tile_state marked = {};
+		(void)comp_layer_subrect_blend_mode(&marked, kSrcAlpha);
+		CHECK_FALSE(comp_layer_is_first_in_tile(&marked));
+		CHECK(comp_layer_tile_blend_mode(&marked, 0) == COMP_LAYER_BLEND_OPAQUE_COVER);
+
+		// A NULL tile is legal where nothing downstream reads the mark
+		// — the D3D11 service's UI pass is the last to paint the
+		// per-client atlas.
+		CHECK(comp_layer_subrect_blend_mode(nullptr, kSrcAlpha | kUnpremul) == COMP_LAYER_BLEND_STRAIGHT);
 	}
 }
 
@@ -1530,5 +1572,24 @@ TEST_CASE("the D3D11 paths consult the shared facing and painter's rules (#1590,
 		INFO(rel << " never asks comp_layer_tile_blend_mode() — without the first-in-tile gate a "
 		         << "layer either erases the one beneath it or blends over a clear (#1598)");
 		CHECK(src.find("comp_layer_tile_blend_mode(") != std::string::npos);
+	}
+
+	/*
+	 * ...and the SERVICE composes its SUB-RECT layers in a pass of their
+	 * own, which must not reach for that gate: only a full-tile
+	 * projection-class layer can be a tile's base. Named here rather than
+	 * in the loop because the in-process renderer spells the same rule as a
+	 * direct comp_layer_blend_mode() call at its quad draw, and converging
+	 * the two spellings is not this change's business.
+	 */
+	{
+		const std::string path = std::string(DXR_COMP_SRC_DIR) + "/d3d11_service/comp_d3d11_service.cpp";
+		const std::string src = read_whole_file(path);
+
+		INFO(
+		    "the D3D11 service's UI pass must resolve quad / cylinder / equirect2 through "
+		    "comp_layer_subrect_blend_mode() — the first-in-tile REPLACE belongs to a full-tile "
+		    "projection-class base alone, and this path's atlas is not cleared per frame");
+		CHECK(src.find("comp_layer_subrect_blend_mode(") != std::string::npos);
 	}
 }
