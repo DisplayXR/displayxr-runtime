@@ -52,6 +52,8 @@ add_library(
 	u_git_tag.h
 	u_hand_tracking.c
 	u_hand_tracking.h
+	u_grip_surface.c
+	u_grip_surface.h
 	u_hand_simulation.c
 	u_hand_simulation.h
 	u_hud.c
