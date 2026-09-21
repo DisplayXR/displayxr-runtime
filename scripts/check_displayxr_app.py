@@ -54,7 +54,7 @@ RULES = {
     "F-1": "Run the frame loop from READY, gated on a 'session running' flag (not SYNCHRONIZED+); a compliant runtime only leaves READY on your first xrBeginFrame, so a SYNCHRONIZED+ gate deadlocks (black screen).",
     "INV-2.8": "Apps requesting MANUAL eye tracking SHOULD handle XrEventDataEyeTrackingStateChangedDXR (tracking loss is the app's problem in MANUAL).",
     "INV-3.1": "An N-view app BEGINS XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR (when enumerated; needs XR_DXR_display_info), locates into an XRT_MAX_VIEWS (8)-wide buffer and submits the active mode's viewCount. A stereo-fixed app stays on PRIMARY_STEREO and receives exactly 2. Deriving eyeCount from the rendering mode's viewCount without the opt-in is an error: PRIMARY_STEREO reports 2 and rejects viewCount>2.",
-    "INV-3.4": "A projection layer carries the LOCATED view count (what xrLocateViews returned), for every view configuration type. Render only the active mode's views, then alias the inactive tail [active, located) onto view 0's subImage keeping each view's own located pose/fov (DxrAliasInactiveViews in test_apps/common/dxr_view_config.h). Submitting the ACTIVE count is under-submit and xrEndFrame now refuses it (ADR-041). A 3D zone layer is a projection layer and obeys the same rule.",
+    "INV-3.4": "A projection layer carries the LOCATED view count (what xrLocateViews returned), for every view configuration type. Render only the active mode's views, then alias the inactive tail [active, located) onto view 0's subImage keeping each view's own located pose/fov (DxrAliasInactiveViews in dxr_view_config.h: test_apps/common in-tree, displayxr-common outside). Checked per leg: every platform directory of a multi-leg app must call it itself. Submitting the ACTIVE count is under-submit and xrEndFrame now refuses it (ADR-041). A 3D zone layer is a projection layer and obeys the same rule.",
     "INV-4.3": "Per-tile render size = window/canvas x scaleXY, never display size.",
     "INV-4.6": "Request an sRGB swapchain (and store a correctly-encoded image); don't double-encode.",
     "INV-4.7": "Write every pixel of the imageRect you declare — clear partial-tile renders to (0,0,0,0) first (or shrink the rect); undefined pixels read as opaque magenta on MoltenVK and break transparent-bg.",
@@ -193,8 +193,25 @@ MODE_ENUM_MARKER = re.compile(
 # The check only fires for an app whose per-frame count is MODE-DERIVED. An app
 # that renders every located view every frame has no tail to alias and needs
 # nothing.
-SUBMITS_PROJECTION = re.compile(r"\bXrCompositionLayerProjection\b(?!View)")
+#   Building the layer by hand is one spelling; handing the views to a shared
+#   submit helper (displayxr-common's EndFrame / EndFrameWith*(xr, time, views,
+#   count, ...), which builds the projection layer from `count`) is the other,
+#   and is how the demo Windows legs submit. `\b` keeps xrEndFrame out.
+SUBMITS_PROJECTION = re.compile(r"\bXrCompositionLayerProjection\b(?!View)|\bEndFrame(?:With\w+)?\s*\(")
 ALIASES_INACTIVE = re.compile(r"\bDxrAliasInactiveViews\b")
+# A DEFINITION of the helper (a vendored copy of dxr_view_config.h) is not a
+# call: it must not count as "this code aliases the tail".
+ALIASES_INACTIVE_DEFINITION = re.compile(r"\bvoid\s+DxrAliasInactiveViews\s*\(")
+
+# INV-3.4 is checked PER LEG (runtime #1612). A multi-platform app (the
+# displayxr-demo-* repos) keeps one leg per top-level platform directory, each
+# with its own session and submit code. An app-wide "does any file alias the
+# tail?" let one fixed leg hide every leg that still under-submits: the Linux
+# avatar adopting the helper silenced the Android leg. Files under one of these
+# top-level directories form that leg's group; everything else (single-dir test
+# apps, shared code) is one more group. An app with no leg directories is a
+# single group, exactly as before.
+LEG_DIRS = {"windows", "win", "macos", "mac", "linux", "android", "ios"}
 # Explicit opt-OUT for an app that enumerates rendering modes but is
 # deliberately 2-view (hard-capped submission, or never submits a projection
 # layer at all — e.g. a weave-RPC probe). The marker is a COMMENT token, so it is
@@ -241,11 +258,29 @@ def png_dimensions(path: Path):
     return (w, h)
 
 
+def leg_of(path: Path, root: Path) -> str:
+    """The leg a source file belongs to: its top-level directory when that is a
+    platform directory (LEG_DIRS), else "" (the app's shared/single group)."""
+    try:
+        parts = path.relative_to(root).parts
+    except ValueError:
+        return ""
+    if len(parts) > 1 and parts[0].lower() in LEG_DIRS:
+        return parts[0]
+    return ""
+
+
+def calls_alias_helper(text: str) -> bool:
+    """True when `text` CALLS DxrAliasInactiveViews (a definition doesn't count)."""
+    return len(ALIASES_INACTIVE.findall(text)) > len(ALIASES_INACTIVE_DEFINITION.findall(text))
+
+
 def scan_sources(root: Path, findings: list):
     # First pass: read files once; detect whether this is an N-view extension app
     # and whether an sRGB swapchain format appears anywhere.
     files = []
     stereo_fixed_marked = False
+    stereo_fixed_legs = set()
     for path in iter_source_files(root):
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
@@ -254,6 +289,7 @@ def scan_sources(root: Path, findings: list):
         files.append((path, strip_comments(text)))
         if STEREO_FIXED_MARKER.search(text):
             stereo_fixed_marked = True
+            stereo_fixed_legs.add(leg_of(path, root))
     is_multiview_app = any(MULTIVIEW_OPT_IN.search(t) for _, t in files)
     any_srgb = any(SRGB_TOKENS.search(t) for _, t in files)
 
@@ -297,13 +333,25 @@ def scan_sources(root: Path, findings: list):
 
     # INV-3.4 (ADR-041): a mode-derived count that is SUBMITTED as-is is
     # under-submit. The app must submit what xrLocateViews returned and alias the
-    # inactive tail. Scoped to apps that both derive a count from the rendering
-    # mode AND build a projection layer — a stereo-fixed app that always renders
+    # inactive tail. Scoped to code that both derives a count from the rendering
+    # mode AND builds a projection layer — a stereo-fixed app that always renders
     # both located views has no tail, and a weave-RPC probe never reaches
     # xrEndFrame at all.
-    if not stereo_fixed_marked and not any(ALIASES_INACTIVE.search(t) for _, t in files):
+    #
+    # Evaluated per leg (LEG_DIRS): each leg must call the helper in its OWN
+    # sources, and a DXR_STEREO_FIXED_APP marker exempts only the leg it is in.
+    # One finding per offending leg.
+    legs = {}
+    for path, text in files:
+        legs.setdefault(leg_of(path, root), []).append((path, text))
+    for leg in sorted(legs):
+        leg_files = legs[leg]
+        if leg in stereo_fixed_legs:
+            continue
+        if any(calls_alias_helper(t) for _, t in leg_files):
+            continue
         proj_loc = None
-        for path, text in files:
+        for path, text in leg_files:
             if not MODE_ENUM_MARKER.search(text):
                 continue
             m = SUBMITS_PROJECTION.search(text)
@@ -312,17 +360,19 @@ def scan_sources(root: Path, findings: list):
                 break
         if proj_loc:
             p, ln = proj_loc
+            where = f" (leg `{leg}/`)" if leg else ""
             findings.append(Finding(
                 ERROR, "INV-3.4", p, ln,
-                "Mode-derived view count submitted as the projection layer's viewCount — "
-                "xrEndFrame now requires the LOCATED count for every view configuration type "
-                "(ADR-041); the active count is under-submit and is refused.",
+                "Mode-derived view count submitted as the projection layer's viewCount"
+                f"{where} — xrEndFrame now requires the LOCATED count for every view "
+                "configuration type (ADR-041); the active count is under-submit and is refused.",
                 "Size the projection-view array to xrLocateViews' viewCountOutput, render only "
                 "the active views, then call DxrAliasInactiveViews(projViews, views, located, "
-                "active) (test_apps/common/dxr_view_config.h) and submit `located`. Chain "
-                "XrViewActivityStateDXR on XrViewState to read the active count from the "
-                "runtime instead of deriving it. 3D zone layers are projection layers and need "
-                "the same treatment, per zone.",
+                "active) (dxr_view_config.h — displayxr-common for apps outside this repo, "
+                "test_apps/common in-tree) and submit `located`. Every leg needs its own call: "
+                "another leg's fix does not cover this one. Chain XrViewActivityStateDXR on "
+                "XrViewState to read the active count from the runtime instead of deriving it. "
+                "3D zone layers are projection layers and need the same treatment, per zone.",
             ))
 
     swapchain_loc = None
