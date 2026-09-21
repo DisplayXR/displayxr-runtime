@@ -33,7 +33,8 @@
  *
  * The handles are BORROWED — no AddRef — and are fixed for the compositor's
  * lifetime, so a caller may cache the struct for the duration of one call as
- * the mirrors' `get_internals()` locals already did.
+ * the mirrors' `get_internals()` locals already did. The one non-handle member
+ * below is create-time-latched for the same reason.
  */
 
 #pragma once
@@ -62,6 +63,14 @@ struct comp_d3d11_compositor_internals
 	ID3D11DeviceContext *context;
 	//! DXGI factory for swapchain creation.
 	IDXGIFactory4 *dxgi_factory;
+	/*!
+	 * #573: this session composes over the LIVE desktop, so the atlas clear
+	 * must leave alpha 0 (#1600). Not a handle, but it belongs to the same
+	 * hand-over for the same reason: it is latched once in
+	 * comp_d3d11_compositor_create and never written again, so a caller may
+	 * cache it exactly like the pointers above.
+	 */
+	bool transparent_background;
 };
 
 /*!
