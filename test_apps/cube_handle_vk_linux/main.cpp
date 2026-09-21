@@ -2191,11 +2191,17 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
         g_window.current_size(&snapW, &snapH);
         g_weaveSnap.attach(xr.instance, xr.session, snapW, snapH);
         g_window.set_snap_provider(&DxrWeaveSnap::callback, &g_weaveSnap);
-        LOG_INFO("xrWeaveSnapWindowRectDXR: %s — a window drag %s",
-                 g_weaveSnap.available() ? "RESOLVED" : "unavailable on this runtime",
-                 g_weaveSnap.available()
-                     ? "will be phase-snapped by the display processor"
-                     : "lands on the raw pointer position (identity snap)");
+        LOG_INFO(
+            "xrWeaveSnapWindowRectDXR: %s — a window drag %s",
+            g_weaveSnap.available() ? "RESOLVED"
+                                    : "unavailable on this runtime",
+            g_weaveSnap.available()
+                ? "is routed through the display processor's snap; whether "
+                  "each "
+                  "snapped origin is actually reached is verified per move "
+                  "(see 'drag: placement' / the runtime's 'X11 placement "
+                  "quantum' line)"
+                : "lands on the raw pointer position (identity snap)");
     }
     LOG_INFO("Session created (%s via %s: %s)",
              DxrLinuxWindow::backend_name(g_window.backend()),

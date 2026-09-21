@@ -72,6 +72,8 @@
  */
 #pragma once
 
+#include "u_x11_scale.h" // placement-landing probe (shared with the runtime)
+
 // Xlib first: XR_DXR_xlib_window_binding.h wants the real Display / Window
 // types, not its self-contained stand-ins.
 #include <X11/Xlib.h>
@@ -334,7 +336,23 @@ private:
 	uint64_t m_x_drag_moves = 0;    //!< XMoveWindow calls this drag
 	uint64_t m_x_drag_snapped = 0;  //!< ...of which the snap changed the point
 
-	// --- X11 programmatic drag test hook (DXR_X11_TEST_DRAG, #1588) ---------
+        /*!
+         * Landing check: did the window go where the snap asked? A move is
+         * asynchronous, so the previous request is compared against the
+         * window's real origin just before the next move is issued (a pump
+         * later, by which time the server has placed it). Accumulates across
+         * drags; reports once. This is what would have caught the XWayland 2 px
+         * quantum in minutes: a snap the environment silently rounds away is
+         * indistinguishable from a working one unless someone reads the window
+         * back.
+         */
+        u_x11_placement_probe m_x_probe = {};
+        bool m_x_probe_pending = false;
+        int m_x_probe_want_x = 0;
+        int m_x_probe_want_y = 0;
+        void x11_check_landing();
+
+        // --- X11 programmatic drag test hook (DXR_X11_TEST_DRAG, #1588) ---------
 	// Off by default. Walks the window along a straight path through the very
 	// same snap -> XMoveWindow code the pointer drag uses, so the mechanics
 	// are verifiable with nobody at the mouse. Not a fake X event: it drives

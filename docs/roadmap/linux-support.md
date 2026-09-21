@@ -49,6 +49,24 @@ window and therefore only the window owner may snap one.
 Windows does not have this problem because the plug-in snaps the window during
 `WM_MOVING`; X11 gives no such hook, which is why the app has to own the drag.
 
+**Display scaling limits drag snapping, and one scaled display affects all of them.** XWayland
+runs the whole X screen at one global scale: the ceiling of the *most-scaled* output
+(Mutter's `xwayland-native-scaling`). An X11 window origin can only land on multiples of
+that scale. So *any* output above 100% makes odd device pixels unreachable everywhere. That
+includes a 166% laptop next to a DS1 at 100%. With the DS1 itself at 200%, the panel's own
+size checks all still pass (its X11 rect equals its native mode), which is what hid it. The DS1
+measurement: 54% of snapped targets were odd, 0% of landed positions were, and the drag
+stuttered. At 100% on every output: ~50% odd reached, 92% of snaps landed exactly, and
+correct by eye. **Every output at 100% is the supported configuration today.** Other
+configurations are detected (RandR vs DRM on every output) and reported by
+`displayxr-cli info` → *X11 coordinate space*. Under a quantum the runtime snaps on the
+reachable lattice: coarser drag steps, phase kept. When X11 pixels are not panel pixels
+at all, the snap is refused. The app helper checks every landing and says so when the
+display drops its snaps. Weaving itself is never stopped for this. Full mechanism, the
+solver's blind spot, and the assessment of what a truly scale-proof design would take
+(a fixed-origin surface, i.e. the shell's compose model):
+[linux-display-scaling.md](../reference/linux-display-scaling.md).
+
 ## TL;DR
 
 DisplayXR's **non-presentation substrate is already Linux-ready** — it survived

@@ -24,6 +24,10 @@ set(DXR_LINUX_WINDOW_DIR "${CMAKE_CURRENT_LIST_DIR}")
 function(dxr_target_add_linux_window TARGET)
     target_sources(${TARGET} PRIVATE "${DXR_LINUX_WINDOW_DIR}/dxr_linux_window.cpp")
     target_include_directories(${TARGET} PRIVATE "${DXR_LINUX_WINDOW_DIR}")
+    # u_x11_scale.h: header-only, dependency-free placement-quantum arithmetic
+    # shared with the runtime (and pinned by tests/tests_aux_x11_scale.cpp), so
+    # the helper's landing check and the runtime's lattice search agree.
+    target_include_directories(${TARGET} PRIVATE "${DXR_LINUX_WINDOW_DIR}/../../src/xrt/auxiliary/util")
 
     # Xrandr (optional, libxrandr-dev). _NET_WM_FULLSCREEN_MONITORS targets a
     # monitor by RandR INDEX, and XRRGetMonitors is what turns the panel rect
