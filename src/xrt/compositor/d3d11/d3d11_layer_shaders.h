@@ -223,6 +223,44 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
 }
 )";
 
+// #1601 — quad pixel shader variant for LAYERED (arraySize>1) swapchains. Same
+// relationship to quad_ps_source as projection_ps_array_source has to
+// projection_ps_source, and for the same reason: comp_d3d11_swapchain creates a
+// WHOLE-ARRAY Texture2DArray SRV whenever ArraySize > 1, so binding it to the
+// Texture2D shader above is a view-dimension mismatch that reads slice 0 no
+// matter what subImage.imageArrayIndex asked for. This selects the requested
+// slice via array_params.x.
+//
+// The gate is the SWAPCHAIN's shape, not array_index != 0 — what must match the
+// shader is the view dimension, so slice 0 OF AN ARRAY swapchain belongs here
+// too. Single-layer swapchains keep the Texture2D path unchanged.
+static const char *quad_ps_array_source = R"(
+cbuffer LayerCB : register(b0)
+{
+    float4x4 mvp;
+    float4 post_transform;
+    float4 color_scale;
+    float4 color_bias;
+    float4 array_params;   // x = array slice
+};
+
+Texture2DArray layer_tex : register(t0);
+SamplerState layer_samp : register(s0);
+
+struct VS_OUTPUT
+{
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+};
+
+float4 PSMain(VS_OUTPUT input) : SV_Target
+{
+    float4 color = layer_tex.Sample(layer_samp, float3(input.uv, array_params.x));
+    color = color * color_scale + color_bias;
+    return color;
+}
+)";
+
 // #439 Phase 3 — Local2D flatten. Draws one app Local2D layer image into the
 // runtime 2D scratch. The per-draw viewport (RSSetViewports, set by the caller)
 // restricts output to the clipped dest sub-rect; uv [0,1] over that viewport

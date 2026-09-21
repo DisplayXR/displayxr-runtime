@@ -68,6 +68,12 @@ struct comp_d3d11_renderer
 	//! Pixel shader for quad layers.
 	ID3D11PixelShader *quad_ps;
 
+	//! #1601: pixel shader for quad layers from LAYERED (array) swapchains
+	//! (Texture2DArray; selects the layer's imageArrayIndex slice). May be
+	//! null if it failed to compile — the draw site then falls back to
+	//! @ref quad_ps, i.e. degrades to slice 0 rather than not drawing.
+	ID3D11PixelShader *quad_ps_array;
+
 	//! Local2D flatten shaders (#439 Phase 3): draw one app Local2D layer
 	//! image into the runtime 2D scratch at a per-draw viewport.
 	ID3D11VertexShader *local2d_flatten_vs;
@@ -239,6 +245,24 @@ create_shaders(struct comp_d3d11_renderer *r)
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create quad pixel shader: 0x%08x", hr);
 		return XRT_ERROR_D3D;
+	}
+
+	// #1601: layered (array) quad pixel shader variant. Deliberately NOT fatal,
+	// unlike its projection sibling above: a quad on an array swapchain is the
+	// only thing that needs it, and losing it should cost that quad its slice
+	// selection (the pre-#1601 behaviour), not the whole renderer. The draw
+	// site treats a null here as "use quad_ps".
+	xret = compile_shader(internals.device, quad_ps_array_source, "PSMain", "ps_5_0", &blob);
+	if (xret != XRT_SUCCESS) {
+		U_LOG_W("Failed to compile array quad pixel shader — layered quads will sample slice 0");
+	} else {
+		hr = internals.device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+		                                         &r->quad_ps_array);
+		blob->Release();
+		if (FAILED(hr)) {
+			U_LOG_W("Array quad pixel shader unavailable (0x%08x) — quads sample slice 0", hr);
+			r->quad_ps_array = nullptr;
+		}
 	}
 
 	// Local2D flatten vertex shader (#439 Phase 3).
@@ -781,6 +805,18 @@ render_quad_layer(struct comp_d3d11_renderer *r,
 	const enum comp_layer_blend_mode mode = comp_layer_blend_mode(data->flags);
 	comp_layer_blend_fold_opaque_cover(mode, constants.color_scale, constants.color_bias);
 
+	// #1601: honour the quad's subImage.imageArrayIndex. Gated on the
+	// SWAPCHAIN's array size, not on array_index != 0 — comp_d3d11_swapchain
+	// hands back a whole-array Texture2DArray SRV for every arraySize>1
+	// swapchain, and it is the VIEW DIMENSION that has to match the shader, so
+	// even slice 0 of an array swapchain belongs on the array shader. Same
+	// condition GL (`target == GL_TEXTURE_2D_ARRAY`) and Metal
+	// (`textureType == MTLTextureType2DArray`) already use. A quad on an
+	// arraySize==1 swapchain takes the Texture2D path exactly as before.
+	const bool is_layered = comp_d3d11_swapchain_get_array_size(xsc) > 1;
+	const bool use_array_ps = is_layered && r->quad_ps_array != nullptr;
+	constants.array_params[0] = use_array_ps ? static_cast<float>(q->sub.array_index) : 0.0f;
+
 	// Update constant buffer
 	D3D11_MAPPED_SUBRESOURCE mapped;
 	HRESULT hr = internals.context->Map(r->constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
@@ -791,7 +827,7 @@ render_quad_layer(struct comp_d3d11_renderer *r,
 
 	// Set shaders - use quad shaders for proper 3D positioning
 	internals.context->VSSetShader(r->quad_vs, nullptr, 0);
-	internals.context->PSSetShader(r->quad_ps, nullptr, 0);
+	internals.context->PSSetShader(use_array_ps ? r->quad_ps_array : r->quad_ps, nullptr, 0);
 
 	// Bind resources
 	internals.context->VSSetConstantBuffers(0, 1, &r->constant_buffer);
@@ -1030,6 +1066,7 @@ comp_d3d11_renderer_destroy(struct comp_d3d11_renderer **renderer_ptr)
 	SAFE_RELEASE(r->local2d_flatten_ps);
 	SAFE_RELEASE(r->local2d_flatten_vs);
 	SAFE_RELEASE(r->quad_ps);
+	SAFE_RELEASE(r->quad_ps_array);
 	SAFE_RELEASE(r->quad_vs);
 	SAFE_RELEASE(r->projection_ps_array);
 	SAFE_RELEASE(r->projection_ps);
