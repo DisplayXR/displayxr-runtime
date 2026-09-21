@@ -44,6 +44,7 @@ set(tests
     tests_aux_tiling_zero_copy
     tests_aux_tiling_row_origin
     tests_aux_wayland_geom
+    tests_aux_display_mode_hold
     tests_comp_rear_budget
     tests_oxr_weave_latch
     tests_oxr_layer_space
