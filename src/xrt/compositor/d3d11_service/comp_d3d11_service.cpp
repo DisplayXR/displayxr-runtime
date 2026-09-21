@@ -23,6 +23,8 @@
 #include "xrt/xrt_display_processor_d3d11.h"
 #include "xrt/xrt_display_metrics.h"
 
+// #1589/#1610: the shared format-honesty policy (hatch + fast-path predicate).
+#include "util/u_color_encoding.h"
 #include "util/u_logging.h"
 #include "util/u_weave_scope.h"
 #include "util/u_misc.h"
@@ -453,6 +455,44 @@ struct d3d11_client_render_resources
 	//! Lazy-created on first use; reset whenever atlas_texture is recreated.
 	wil::com_ptr<ID3D11ShaderResourceView> atlas_srv_srgb;
 	wil::com_ptr<ID3D11RenderTargetView> atlas_rtv;
+
+	/*!
+	 * #1589/#1610 — the runtime-PRIVATE compose target. A TYPELESS twin of
+	 * @ref atlas_texture (same extent, same family) viewed through an `_SRGB`
+	 * RTV, so the fixed-function blender works in LINEAR and the sRGB OETF is
+	 * applied exactly once, on write, by the hardware. No compose shader does
+	 * gamma arithmetic — that would double-apply.
+	 *
+	 * The result is `CopyResource`d into @ref atlas_texture at the end of the
+	 * commit: same typeless family, so the copy reinterprets bits and the
+	 * atlas still holds ENCODED bytes. The atlas resource, its creation flags
+	 * (it is NOT shared — the crop texture is), its SRVs and
+	 * `service_single_client_atlas_encoding()` are all untouched.
+	 *
+	 * Lazily built on the first commit that needs it: a client that only ever
+	 * submits one `_SRGB` projection layer never allocates it.
+	 */
+	wil::com_ptr<ID3D11Texture2D> compose_texture;
+	wil::com_ptr<ID3D11RenderTargetView> compose_rtv;
+	uint32_t compose_width;
+	uint32_t compose_height;
+	DXGI_FORMAT compose_atlas_format;
+
+	/*!
+	 * Set for the duration of a COMPOSING commit; every site that writes this
+	 * client's atlas targets it instead (@ref client_write_rtv). nullptr ⟹
+	 * the fast path, i.e. byte-for-byte the pre-#1589 write sequence.
+	 */
+	ID3D11RenderTargetView *active_write_rtv;
+
+	/*!
+	 * Was the PREVIOUS commit composing? A false→true transition seeds the
+	 * private target from the atlas, because the per-client atlas is not
+	 * cleared per frame and a view whose blit is skipped legitimately reuses
+	 * last frame's tile (see @ref atlas_clear_signature). Without the seed
+	 * those tiles would come back black for one frame.
+	 */
+	bool compose_was_active;
 
 	//! Standalone atlas-clear bookkeeping. The per-commit clear-to-black is
 	//! only safe when every slot is guaranteed to be re-blitted this frame —
@@ -1441,6 +1481,24 @@ struct d3d11_service_system
 	//! every blit output to emit scene-linear (so content + chrome all reach the
 	//! DP linear). Bound once per frame; left at 0 for Model A.
 	wil::com_ptr<ID3D11Buffer> color_linearize_cb;
+
+	/*!
+	 * #1610: two IMMUTABLE 16-byte cbuffers for PS register b2, carrying 1.0
+	 * and 0.0 of `g_compose_passthrough`.
+	 *
+	 * A blit into the private compose target must emit its sample UNCHANGED:
+	 * the `_SRGB` RTV does the one conversion on write, so the shader must do
+	 * none — including the Model-B decode `color_linearize_cb` asks for at b1.
+	 * Those client blits run on an IPC thread and the combine pass runs on the
+	 * render thread, on the same immediate context and without a mutex
+	 * between them, so b1 cannot be relied on to say anything in particular
+	 * when a client draw executes. b2 is stated per draw instead.
+	 *
+	 * Immutable, so binding one is a pointer swap with no Map and no
+	 * cross-thread write to shared memory.
+	 */
+	wil::com_ptr<ID3D11Buffer> compose_passthrough_on_cb;
+	wil::com_ptr<ID3D11Buffer> compose_passthrough_off_cb;
 
 	//! Constant buffer for layer rendering
 	wil::com_ptr<ID3D11Buffer> layer_constant_buffer;
@@ -5297,6 +5355,27 @@ create_layer_resources(struct d3d11_service_system *sys)
 		return false;
 	}
 
+	// #1610: the two immutable b2 cbuffers. See the field doc for why the
+	// compose blit states this per draw instead of trusting b1.
+	{
+		const float on_data[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+		const float off_data[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+		D3D11_BUFFER_DESC imm_desc = {};
+		imm_desc.ByteWidth = 16;
+		imm_desc.Usage = D3D11_USAGE_IMMUTABLE;
+		imm_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		D3D11_SUBRESOURCE_DATA on_init = {on_data, 0, 0};
+		D3D11_SUBRESOURCE_DATA off_init = {off_data, 0, 0};
+		hr = sys->device->CreateBuffer(&imm_desc, &on_init, sys->compose_passthrough_on_cb.put());
+		if (SUCCEEDED(hr)) {
+			hr = sys->device->CreateBuffer(&imm_desc, &off_init, sys->compose_passthrough_off_cb.put());
+		}
+		if (FAILED(hr)) {
+			U_LOG_E("Failed to create compose-passthrough constant buffers: 0x%08lx", hr);
+			return false;
+		}
+	}
+
 	// Create linear sampler
 	D3D11_SAMPLER_DESC samp_desc = {};
 	samp_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
@@ -5422,6 +5501,114 @@ create_layer_resources(struct d3d11_service_system *sys)
  */
 
 /*!
+ * #1589/#1610 — the RTV every per-client atlas write goes to THIS COMMIT.
+ *
+ * A composing commit redirects them all to the private `_SRGB`-view target,
+ * whose content is copied into the atlas once at the end of the commit. A
+ * fast-path commit returns the atlas RTV, so the write sequence is
+ * byte-for-byte the pre-#1589 one.
+ */
+static inline ID3D11RenderTargetView *
+client_write_rtv(struct d3d11_client_render_resources *res)
+{
+	return res->active_write_rtv != nullptr ? res->active_write_rtv : res->atlas_rtv.get();
+}
+
+/*!
+ * #1589/#1610 — build (or rebuild) this client's private compose target to
+ * match its atlas, and return its `_SRGB` RTV.
+ *
+ * nullptr ⟹ the commit must stay on the legacy path: no atlas yet, no blit
+ * shader to encode with, an atlas family with no `_SRGB` member, or a
+ * creation failure. Every one of those is "keep doing what we did before",
+ * never a hard error.
+ */
+static ID3D11RenderTargetView *
+client_ensure_compose_target(struct d3d11_service_system *sys, struct d3d11_client_render_resources *res)
+{
+	if (res->atlas_texture == nullptr || res->atlas_rtv == nullptr || !sys->blit_vs || !sys->blit_ps) {
+		return nullptr;
+	}
+
+	D3D11_TEXTURE2D_DESC atlas_desc = {};
+	res->atlas_texture->GetDesc(&atlas_desc);
+
+	if (res->compose_rtv && res->compose_width == atlas_desc.Width && res->compose_height == atlas_desc.Height &&
+	    res->compose_atlas_format == atlas_desc.Format) {
+		return res->compose_rtv.get();
+	}
+
+	res->compose_rtv.reset();
+	res->compose_texture.reset();
+	res->compose_was_active = false; // force a re-seed from the atlas
+
+	const DXGI_FORMAT typeless = d3d_dxgi_format_to_typeless_dxgi(atlas_desc.Format);
+	const DXGI_FORMAT srgb_rtv = d3d_dxgi_format_srgb_rtv(atlas_desc.Format);
+	if (srgb_rtv == DXGI_FORMAT_UNKNOWN) {
+		static bool warned_no_srgb = false;
+		if (!warned_no_srgb) {
+			warned_no_srgb = true;
+			U_LOG_W(
+			    "Color (#1610) [d3d11_service]: atlas format 0x%X has no _SRGB sibling — "
+			    "composing in encoded space, as before #1610",
+			    (unsigned)atlas_desc.Format);
+		}
+		return nullptr;
+	}
+
+	D3D11_TEXTURE2D_DESC desc = {};
+	desc.Width = atlas_desc.Width;
+	desc.Height = atlas_desc.Height;
+	desc.MipLevels = 1;
+	desc.ArraySize = 1;
+	desc.Format = typeless;
+	desc.SampleDesc.Count = 1;
+	desc.Usage = D3D11_USAGE_DEFAULT;
+	desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+	// Service-LOCAL: never NT-shared, never nominated as a split ingress
+	// source, never handed to a display processor. The atlas keeps its own
+	// creation flags untouched.
+	desc.MiscFlags = 0;
+
+	HRESULT hr = sys->device->CreateTexture2D(&desc, nullptr, res->compose_texture.put());
+	if (FAILED(hr)) {
+		U_LOG_W(
+		    "Color (#1610) [d3d11_service]: compose target %ux%u failed: 0x%08lx — composing in "
+		    "encoded space, as before #1610",
+		    desc.Width, desc.Height, hr);
+		res->compose_texture.reset();
+		return nullptr;
+	}
+
+	D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
+	rtv_desc.Format = srgb_rtv;
+	rtv_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+	rtv_desc.Texture2D.MipSlice = 0;
+	hr = sys->device->CreateRenderTargetView(res->compose_texture.get(), &rtv_desc, res->compose_rtv.put());
+	if (FAILED(hr)) {
+		U_LOG_W("Color (#1610) [d3d11_service]: compose _SRGB RTV (0x%X) failed: 0x%08lx", (unsigned)srgb_rtv,
+		        hr);
+		res->compose_rtv.reset();
+		res->compose_texture.reset();
+		return nullptr;
+	}
+
+	res->compose_width = desc.Width;
+	res->compose_height = desc.Height;
+	res->compose_atlas_format = atlas_desc.Format;
+
+	// The line a hardware check greps to prove a commit LEFT the fast path.
+	// One-off per (re)allocation — a lifecycle event, never per frame.
+	U_LOG_W(
+	    "Color (#1610) [d3d11_service]: compose target %ux%u storage=0x%X rtv=0x%X -> atlas=0x%X "
+	    "(same typeless family=%d)",
+	    desc.Width, desc.Height, (unsigned)typeless, (unsigned)srgb_rtv, (unsigned)atlas_desc.Format,
+	    (int)d3d_dxgi_format_same_typeless_family(typeless, atlas_desc.Format));
+
+	return res->compose_rtv.get();
+}
+
+/*!
  * Blit a region from source texture to stereo texture with optional SRGB conversion.
  *
  * This replaces CopySubresourceRegion when the source is SRGB, ensuring proper
@@ -5526,8 +5713,23 @@ blit_to_atlas_texture(struct d3d11_service_system *sys,
 	sys->context->PSSetShaderResources(0, 1, &src_srv);
 	sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
 
-	// Set render target to per-client stereo texture (or the override target)
-	ID3D11RenderTargetView *rtvs[] = {rtv_override != nullptr ? rtv_override : res->atlas_rtv.get()};
+	// Set render target to per-client stereo texture (or the override target).
+	// #1610: without an explicit override this follows the commit's write RTV,
+	// which is the private compose target while composing.
+	ID3D11RenderTargetView *rtvs[] = {rtv_override != nullptr ? rtv_override : client_write_rtv(res)};
+
+	/*
+	 * #1610: state b2 for THIS draw. Writing into the compose target means
+	 * the `_SRGB` RTV applies the one conversion, so the shader must emit its
+	 * sample raw — including skipping the Model-B decode b1 may be asking
+	 * for, which the render thread set and this (IPC) thread cannot reason
+	 * about. Every other draw gets the OFF buffer, which is what an unbound
+	 * b2 already reads, so nothing else changes.
+	 */
+	const bool compose_blit = rtv_override == nullptr && res->active_write_rtv != nullptr;
+	sys->context->PSSetConstantBuffers(2, 1,
+	                                   compose_blit ? sys->compose_passthrough_on_cb.addressof()
+	                                                : sys->compose_passthrough_off_cb.addressof());
 	sys->context->OMSetRenderTargets(1, rtvs, nullptr);
 
 	// Viewport covers the full atlas (same dims as the NDC mapping above).
@@ -6110,6 +6312,10 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 	// underlying allocation while that open holds it.
 	svc_split_unshare_source(&res->split_share_handle, &res->split_share_key);
 	res->atlas_clear_signature = 0;
+	res->active_write_rtv = nullptr;
+	res->compose_was_active = false;
+	res->compose_rtv.reset();
+	res->compose_texture.reset();
 	res->atlas_rtv.reset();
 	res->atlas_srv.reset();
 	res->atlas_srv_srgb.reset();
@@ -6255,6 +6461,9 @@ init_client_render_resources(struct d3d11_service_system *sys,
                              struct d3d11_service_compositor *c)
 {
 	std::memset(res, 0, sizeof(*res));
+
+	// #1589: say which colour regime this service process is in, exactly once.
+	u_color_log_state_once("d3d11_service");
 
 	HRESULT hr;
 
@@ -15099,6 +15308,10 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			sys->context->Unmap(sys->color_linearize_cb.get(), 0);
 		}
 		sys->context->PSSetConstantBuffers(1, 1, sys->color_linearize_cb.addressof());
+		// #1610: and b2 OFF for the whole pass — these draws DO want the
+		// Model-B decode. Stated rather than assumed, because a client's
+		// compose blit on an IPC thread may have left the ON buffer bound.
+		sys->context->PSSetConstantBuffers(2, 1, sys->compose_passthrough_off_cb.addressof());
 	}
 
 	uint32_t dp_view_w = sys->view_width;
@@ -17571,8 +17784,11 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 	// this commit) skips the clear and composites the placed layers over
 	// the full-tile content instead.
 	if (!projection_rendered) {
+		// #1610: black is black in both spaces (the OETF fixes zero) and an
+		// RTV's sRGB conversion never touches alpha, so this needs no
+		// colour-space branch when it goes to the compose target.
 		float clear_rgba[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-		sys->context->ClearRenderTargetView(c->render.atlas_rtv.get(), clear_rgba);
+		sys->context->ClearRenderTargetView(client_write_rtv(&c->render), clear_rgba);
 	}
 
 	uint32_t zone_count = 0;
@@ -20642,6 +20858,15 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		// so a straight passthrough is impossible": UI/window-space/zones
 		// layers to blend, a view unsafe to read without a mutex, or workspace
 		// mode (Stage 2 composes N clients; per-client passthrough doesn't apply).
+		//
+		// #1589 adds one more of the same shape, on colour rather than
+		// geometry: zero-copy hands the APP'S OWN image to the display
+		// processor, which is told the atlas is ENCODED. A UNORM swapchain
+		// holds LINEAR values (ADR-021 §6) and there is no compositor pass on
+		// this branch in which to encode them, so such a client takes the
+		// atlas path, where the private `_SRGB`-view target does the encode.
+		// u_tiling_can_zero_copy() remains the sole TILING gate (ADR-030).
+		const bool color_blocks_zc = !view_is_srgb[0] && !u_color_legacy_unorm_encoded();
 		if (has_ui_layers) zc_reason = "ui_layers";
 		else if (has_window_space_layers) zc_reason = "window_space_layers";
 		else if (zones_frame || has_local_2d) zc_reason = "zones_layers";
@@ -20653,9 +20878,12 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			zc_reason = "multi_projection";
 		else if (!all_views_zc_eligible) zc_reason = "view_ineligible";
 		else if (sys->workspace_mode) zc_reason = "workspace_mode";
+		else if (color_blocks_zc)
+			zc_reason = "color_needs_encode";
 
 		if (!has_ui_layers && !has_window_space_layers && !zones_frame && !has_local_2d &&
-		    projection_layer_count <= 1 && all_views_zc_eligible && !sys->workspace_mode) {
+		    projection_layer_count <= 1 && all_views_zc_eligible && !sys->workspace_mode &&
+		    !color_blocks_zc) {
 			// Check all views reference the same swapchain image
 			bool all_same = true;
 			for (uint32_t eye = 1; eye < proj_view_count; eye++) {
@@ -20755,7 +20983,54 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			c->zc_last_logged_reason = zc_reason;
 		}
 
+		/*
+		 * #1589/#1610 — does this commit compose?
+		 *
+		 * The shipping case (one full-tile projection layer out of an `_SRGB`
+		 * swapchain, nothing else) owes neither an encode nor a blend, so it
+		 * keeps the raw `CopySubresourceRegion` into the atlas: the exact
+		 * write sequence, and the exact atlas bytes, as before this work. The
+		 * flags below are the ones the zero-copy gate already computed, so
+		 * "how many layers will paint" is not recounted.
+		 *
+		 * The seed is the non-obvious half. This atlas is NOT cleared per
+		 * frame (see atlas_clear_signature) and a view whose blit is skipped
+		 * deliberately reuses last frame's tile, so the first composing commit
+		 * after a fast-path one must start from what the atlas holds — else
+		 * those tiles come back black for a frame.
+		 */
 		if (!zero_copy) {
+			// #1598/#1676: every projection layer AFTER the base is a second
+			// painter too — it is deferred into the sub-rect pass and drawn
+			// there with a blend state, so a two-projection-layer frame owes
+			// the LINEAR blend exactly as a quad frame does. Counted from the
+			// pre-walk `projection_layer_count` rather than `proj_deferred_count`,
+			// which is still zero here: the base is the first layer visited.
+			// That counts a later layer which then fails its validity check and
+			// paints nothing, so the answer errs toward composing — the wrong
+			// side to be wrong on is the one that blends in encoded space.
+			const uint32_t later_projections =
+			    projection_layer_count > 1 ? projection_layer_count - 1 : 0u;
+			const uint32_t extra_layers = (has_ui_layers ? 1u : 0u) + (has_window_space_layers ? 1u : 0u) +
+			                              (zones_frame || has_local_2d ? 1u : 0u) + later_projections;
+			const bool color_fast_path =
+			    u_color_compose_fast_path(u_color_legacy_unorm_encoded(),
+			                              /*contributing_layers=*/1u + extra_layers,
+			                              /*base_is_projection=*/true, view_is_srgb[0]);
+			c->render.active_write_rtv = nullptr;
+			if (!color_fast_path) {
+				ID3D11RenderTargetView *compose = client_ensure_compose_target(sys, &c->render);
+				if (compose != nullptr) {
+					if (!c->render.compose_was_active) {
+						std::lock_guard<std::mutex> seed_lock(sys->immediate_ctx_mutex);
+						sys->context->CopyResource(c->render.compose_texture.get(),
+						                           c->render.atlas_texture.get());
+					}
+					c->render.active_write_rtv = compose;
+				}
+			}
+			c->render.compose_was_active = c->render.active_write_rtv != nullptr;
+
 			// #1018: the per-view tile submissions are the tear window — the
 			// render thread could submit its crop between two of them. Hold the
 			// client's atlas mutex across the whole set so a reader sees either
@@ -20874,9 +21149,20 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			// non-workspace source falls to the raw copy, which cannot
 			// resize and writes past the slot boundary
 			// (`feedback_atlas_stride_invariant`).
+			//
+			// #1589/#1610: a COMPOSING commit also has to take the shader,
+			// because a copy can do neither of the two things it is here
+			// for — it cannot apply the sRGB encode a UNORM (scene-linear)
+			// source owes, and it cannot land the base in the private
+			// `_SRGB`-view target the later layers blend into. The per-image
+			// SRV the service builds is ALREADY format-honest (it is created
+			// with the imported texture's own format), so an `_SRGB` source
+			// decodes on sample and a UNORM one reads linear — no second SRV
+			// is needed here, unlike in-process.
 			bool can_shader_blit = sys->blit_vs &&
 			    view_scs[eye]->images[view_img_indices[eye]].srv;
-			bool use_scale_shader = can_shader_blit && needs_scale;
+			bool composing = c->render.active_write_rtv != nullptr;
+			bool use_scale_shader = can_shader_blit && (needs_scale || composing);
 
 			if (use_scale_shader) {
 				// Oversized client content: scale through the shader using
@@ -20911,6 +21197,12 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				// Content already fits the tile, or the shader is
 				// unavailable: raw byte copy — the app's bytes reach the
 				// per-client atlas verbatim, in BOTH modes (#1591).
+				//
+				// #1610: when composing (only reachable here with no usable
+				// SRV, an already-logged degenerate case) the copy goes to
+				// the compose target, so the end-of-commit publish does not
+				// overwrite it. Those bytes skip the encode — a corner that
+				// was already colour-wrong before this work.
 				warn_once_projection_copy_cannot_blend(proj_blend);
 				D3D11_BOX box = {};
 				box.left = static_cast<UINT>(src_x);
@@ -20921,7 +21213,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				box.back = 1;
 
 				sys->context->CopySubresourceRegion(
-				    c->render.atlas_texture.get(),
+				    composing ? c->render.compose_texture.get() : c->render.atlas_texture.get(),
 				    0,                         // dst subresource
 				    static_cast<UINT>(tile_x), // dst x (tile position)
 				    static_cast<UINT>(tile_y), // dst y
@@ -21371,8 +21663,11 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				}
 			}
 		}
-		// Bind per-client stereo render target
-		ID3D11RenderTargetView *rtvs[] = {c->render.atlas_rtv.get()};
+		// Bind per-client stereo render target (#1610: the private compose
+		// target while composing — these quad/cylinder/equirect2 draws, and
+		// the deferred later projection draws #1676 folded into this pass,
+		// are exactly the ones the spec wants blended in LINEAR).
+		ID3D11RenderTargetView *rtvs[] = {client_write_rtv(&c->render)};
 		sys->context->OMSetRenderTargets(1, rtvs, nullptr);
 
 		// Set common rendering state
@@ -21874,6 +22169,26 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	}
 
 	profile_s3 = os_monotonic_get_ns(); // Phase 5a — end of UI-layers block.
+
+	/*
+	 * #1610 — publish the composed result into the atlas.
+	 *
+	 * `CopyResource`, deliberately: the compose target and the atlas are the
+	 * same typeless family, so this moves the ENCODED bytes the `_SRGB` RTV
+	 * just wrote WITHOUT touching them. A shader blit here, or any copy that
+	 * crossed families, would re-apply the transfer function and hand the
+	 * display processor a double-encoded atlas — the exact bug this design
+	 * exists to avoid. Do not "optimise" it into a draw.
+	 *
+	 * Under the same atlas mutex the per-view tile blits take, so a reader
+	 * sees either this whole frame's composite or the previous one.
+	 */
+	if (c->render.active_write_rtv != nullptr && c->render.compose_texture && c->render.atlas_texture) {
+		std::lock_guard<std::mutex> atlas_write_lock(c->atlas_submit_mutex);
+		std::lock_guard<std::mutex> ctx_lock(sys->immediate_ctx_mutex);
+		sys->context->CopyResource(c->render.atlas_texture.get(), c->render.compose_texture.get());
+	}
+	c->render.active_write_rtv = nullptr;
 
 	// Workspace mode: per-client atlas rendering is done. The multi-compositor
 	// composites all client atlases into the combined atlas and presents.
