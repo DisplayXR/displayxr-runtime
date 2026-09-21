@@ -62,6 +62,8 @@
 #include "d3d/d3d_render_adapter.h"
 #include "d3d/d3d_weave_placement.h"
 #include "util/u_tiling.h"
+// #1589: the zero-copy branch has a colour precondition — see its use below.
+#include "util/u_color_encoding.h"
 #include "util/u_canvas.h"
 #include "util/u_capture_intent.h"
 #include "util/u_capture_dims.h"
@@ -3453,9 +3455,35 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 						// submitted offset.y is already top-origin.
 						if (u_tiling_can_zero_copy(vc, rxs, rys, rws, rhs_arr, sw, sh, mode,
 						                           U_TILING_ORIGIN_TOP_LEFT)) {
-							zc_srv = comp_d3d11_swapchain_get_srv(layer->sc_array[0], img_idx);
-							if (zc_srv != nullptr)
-								zero_copy = true;
+							// #1589: zero-copy hands the APP'S OWN image to the
+							// display processor, which is told the atlas is
+							// ENCODED. That is only true when the app's
+							// swapchain says so. A UNORM swapchain holds
+							// LINEAR values (ADR-021 §6), and there is no
+							// compositor pass on this branch in which to
+							// encode them — so the frame takes the atlas path
+							// instead, where the private _SRGB-view target
+							// does the encode. u_tiling_can_zero_copy()
+							// remains the sole TILING gate (ADR-030); this is
+							// a colour precondition on its result, not a
+							// second eligibility rule.
+							if (!comp_d3d11_swapchain_is_srgb(layer->sc_array[0]) &&
+							    !u_color_legacy_unorm_encoded()) {
+								static bool zc_color_warned = false;
+								if (!zc_color_warned) {
+									zc_color_warned = true;
+									U_LOG_W(
+									    "[ZC] refused: reason=color_needs_encode "
+									    "— a UNORM swapchain is scene-linear and "
+									    "owes the sRGB encode, which only the "
+									    "compose path can apply (#1589)");
+								}
+							} else {
+								zc_srv = comp_d3d11_swapchain_get_srv(
+								    layer->sc_array[0], img_idx);
+								if (zc_srv != nullptr)
+									zero_copy = true;
+							}
 						}
 					}
 				}

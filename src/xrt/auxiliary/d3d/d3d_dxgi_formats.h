@@ -173,6 +173,59 @@ d3d_dxgi_format_to_unorm_sample(DXGI_FORMAT format)
 	}
 }
 
+/*!
+ * Do two DXGI formats share one TYPELESS family?
+ *
+ * That is the D3D11 legality rule for `CopyResource` /
+ * `CopySubresourceRegion` between differently-typed resources, and — more to
+ * the point — it is what makes such a copy a pure BIT REINTERPRETATION rather
+ * than a conversion. #1610's compose target is a TYPELESS twin of the atlas
+ * carrying an `_SRGB` RTV: the hardware encodes once on write, and the copy
+ * into the atlas must move those encoded bytes untouched. A shader blit, or a
+ * copy across families, would re-apply the transfer function.
+ *
+ * Identity-safe: an already-TYPELESS format maps to itself.
+ */
+static inline bool
+d3d_dxgi_format_same_typeless_family(DXGI_FORMAT a, DXGI_FORMAT b)
+{
+	return d3d_dxgi_format_to_typeless_dxgi(a) == d3d_dxgi_format_to_typeless_dxgi(b);
+}
+
+/*!
+ * The `_SRGB` member of a format's family — the RTV format that makes the
+ * fixed-function blender work in LINEAR and apply the sRGB OETF once, on
+ * write (#1589/#1610).
+ *
+ * `DXGI_FORMAT_UNKNOWN` when the family has no sRGB member (only the 8-bit
+ * BGRA/RGBA families do). A caller that gets UNKNOWN must keep the legacy
+ * path: there is no target it could compose into.
+ */
+static inline DXGI_FORMAT
+d3d_dxgi_format_srgb_rtv(DXGI_FORMAT format)
+{
+	switch (d3d_dxgi_format_to_typeless_dxgi(format)) {
+	case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+	case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+	default: return DXGI_FORMAT_UNKNOWN;
+	}
+}
+
+/*!
+ * Is this an `_SRGB` DXGI format — i.e. does the app's swapchain declare that
+ * its bytes are display-referred (ADR-021 §6)?
+ */
+static inline bool
+d3d_dxgi_format_is_srgb(DXGI_FORMAT format)
+{
+	switch (format) {
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+	case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB: return true;
+	default: return false;
+	}
+}
+
 static inline int64_t
 d3d_dxgi_format_to_vk(DXGI_FORMAT format)
 {

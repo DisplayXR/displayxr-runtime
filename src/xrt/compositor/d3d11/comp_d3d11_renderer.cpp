@@ -17,7 +17,10 @@
 #include "util/comp_layer_accum.h"
 // #1580: the ONE per-view camera every layer type is projected through.
 #include "util/comp_layer_view_camera.h"
+// #1589/#1610: the shared format-honesty policy (hatch + fast-path predicate).
+#include "util/u_color_encoding.h"
 #include "util/u_logging.h"
+#include "d3d/d3d_dxgi_formats.h"
 #include "math/m_api.h"
 
 #define WIN32_LEAN_AND_MEAN
@@ -151,6 +154,38 @@ struct comp_d3d11_renderer
 	//! Bumped on every GENUINE atlas (re)allocation, never on the #602
 	//! fits-early-out. Tells the bridge when to re-open the handle.
 	uint64_t atlas_generation;
+
+	/*!
+	 * #1589/#1610 — the runtime-PRIVATE compose target. A TYPELESS twin of
+	 * @ref atlas_texture (same extent, same family) carrying an `_SRGB` RTV,
+	 * so the fixed-function blender works in LINEAR and the sRGB OETF is
+	 * applied exactly once, on write, by the hardware. There is deliberately
+	 * no gamma arithmetic in any shader: that would double-apply.
+	 *
+	 * The composed result is then COPIED into the atlas. Same typeless
+	 * family ⟹ the copy reinterprets bits, so the atlas receives the encoded
+	 * bytes verbatim and the DP-facing resource, its format, its SRV and
+	 * `set_atlas_encoding(ENCODED)` are all untouched.
+	 *
+	 * Lazily created on the first frame that actually needs it, so a session
+	 * that only ever takes the fast path never allocates it. NULL otherwise.
+	 */
+	ID3D11Texture2D *compose_texture;
+	ID3D11RenderTargetView *compose_rtv;
+	uint32_t compose_width;
+	uint32_t compose_height;
+	//! The atlas format @ref compose_texture was matched against; a change
+	//! forces a rebuild.
+	DXGI_FORMAT compose_atlas_format;
+
+	//! THIS FRAME composes (set by the projection pass, read by the
+	//! window-space pass and by the per-layer SRV pick). False ⟹ every draw
+	//! goes to the atlas RTV through the non-decoding views, byte-identically
+	//! to the pre-#1589 renderer.
+	bool compose_active;
+
+	//! @ref u_color_legacy_unorm_encoded, cached at create.
+	bool legacy_color;
 };
 
 // The compositor's borrowed handles, handed over explicitly — see
@@ -600,6 +635,203 @@ create_resources(struct comp_d3d11_renderer *r)
 }
 
 /*!
+ * #1589/#1610 — build (or rebuild) the private compose target to match the
+ * atlas, and return its `_SRGB` RTV.
+ *
+ * Returns nullptr when the frame must stay on the legacy path: no atlas yet,
+ * an atlas whose family has no `_SRGB` member, or a creation failure. Every
+ * one of those is a "keep doing what we did before", never a hard error —
+ * getting a slightly wrong colour beats not drawing.
+ */
+static ID3D11RenderTargetView *
+renderer_ensure_compose_target(struct comp_d3d11_renderer *r)
+{
+	if (r->atlas_texture == nullptr) {
+		return nullptr;
+	}
+
+	D3D11_TEXTURE2D_DESC atlas_desc = {};
+	r->atlas_texture->GetDesc(&atlas_desc);
+
+	if (r->compose_rtv != nullptr && r->compose_width == atlas_desc.Width &&
+	    r->compose_height == atlas_desc.Height && r->compose_atlas_format == atlas_desc.Format) {
+		return r->compose_rtv;
+	}
+
+	// The atlas grew, changed format, or this is the first composing frame.
+	if (r->compose_rtv != nullptr) {
+		r->compose_rtv->Release();
+		r->compose_rtv = nullptr;
+	}
+	if (r->compose_texture != nullptr) {
+		r->compose_texture->Release();
+		r->compose_texture = nullptr;
+	}
+
+	const DXGI_FORMAT typeless = d3d_dxgi_format_to_typeless_dxgi(atlas_desc.Format);
+	const DXGI_FORMAT srgb_rtv = d3d_dxgi_format_srgb_rtv(atlas_desc.Format);
+	if (srgb_rtv == DXGI_FORMAT_UNKNOWN) {
+		static bool warned_no_srgb = false;
+		if (!warned_no_srgb) {
+			warned_no_srgb = true;
+			U_LOG_W(
+			    "Color (#1610) [d3d11]: atlas format 0x%X has no _SRGB sibling — composing in "
+			    "encoded space, as before #1610",
+			    (unsigned)atlas_desc.Format);
+		}
+		return nullptr;
+	}
+
+	D3D11_TEXTURE2D_DESC desc = {};
+	desc.Width = atlas_desc.Width;
+	desc.Height = atlas_desc.Height;
+	desc.MipLevels = 1;
+	desc.ArraySize = 1;
+	desc.Format = typeless;
+	desc.SampleDesc.Count = 1;
+	desc.Usage = D3D11_USAGE_DEFAULT;
+	desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+	// Runtime-private: never shared, never handed to the DP, never opened by
+	// the #918 bridge. The atlas keeps its own (possibly NT-shareable) flags.
+	desc.MiscFlags = 0;
+
+	auto internals = get_internals(r->c);
+	HRESULT hr = internals.device->CreateTexture2D(&desc, nullptr, &r->compose_texture);
+	if (FAILED(hr)) {
+		U_LOG_W(
+		    "Color (#1610) [d3d11]: compose target %ux%u failed: 0x%08x — composing in encoded "
+		    "space, as before #1610",
+		    desc.Width, desc.Height, (unsigned)hr);
+		r->compose_texture = nullptr;
+		return nullptr;
+	}
+
+	D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
+	rtv_desc.Format = srgb_rtv;
+	rtv_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+	rtv_desc.Texture2D.MipSlice = 0;
+	hr = internals.device->CreateRenderTargetView(r->compose_texture, &rtv_desc, &r->compose_rtv);
+	if (FAILED(hr)) {
+		U_LOG_W("Color (#1610) [d3d11]: compose _SRGB RTV (0x%X) failed: 0x%08x", (unsigned)srgb_rtv,
+		        (unsigned)hr);
+		r->compose_texture->Release();
+		r->compose_texture = nullptr;
+		r->compose_rtv = nullptr;
+		return nullptr;
+	}
+
+	r->compose_width = desc.Width;
+	r->compose_height = desc.Height;
+	r->compose_atlas_format = atlas_desc.Format;
+
+	// The line a hardware check greps to prove a frame LEFT the fast path.
+	// One-off per (re)allocation — a lifecycle event, never per frame.
+	U_LOG_W(
+	    "Color (#1610) [d3d11]: compose target %ux%u storage=0x%X rtv=0x%X -> atlas=0x%X (same "
+	    "typeless family=%d)",
+	    desc.Width, desc.Height, (unsigned)typeless, (unsigned)srgb_rtv, (unsigned)atlas_desc.Format,
+	    (int)d3d_dxgi_format_same_typeless_family(typeless, atlas_desc.Format));
+
+	return r->compose_rtv;
+}
+
+/*!
+ * #1610 — publish the composed result into the atlas.
+ *
+ * `CopyResource`, deliberately: the compose target and the atlas are the same
+ * typeless family, so this moves the ENCODED bytes the `_SRGB` RTV just wrote
+ * without touching them. A shader blit here, or any copy that crossed
+ * families, would re-apply the transfer function and hand the display
+ * processor a double-encoded atlas — the exact bug this design exists to
+ * avoid. Do not "optimise" it into a draw.
+ */
+static void
+renderer_publish_compose_to_atlas(struct comp_d3d11_renderer *r)
+{
+	if (!r->compose_active || r->compose_texture == nullptr || r->atlas_texture == nullptr) {
+		return;
+	}
+	auto internals = get_internals(r->c);
+	internals.context->CopyResource(r->atlas_texture, r->compose_texture);
+}
+
+/*!
+ * The SRV a layer is sampled through THIS FRAME.
+ *
+ * Composing ⟹ the format-honest view (input must be linear, because the
+ * target encodes on write). Fast path ⟹ the non-decoding view, which is
+ * byte-for-byte what every pre-#1589 frame used.
+ */
+static ID3D11ShaderResourceView *
+layer_source_srv(struct comp_d3d11_renderer *r, struct xrt_swapchain *xsc, uint32_t image_index)
+{
+	return static_cast<ID3D11ShaderResourceView *>(r->compose_active
+	                                                   ? comp_d3d11_swapchain_get_compose_srv(xsc, image_index)
+	                                                   : comp_d3d11_swapchain_get_srv(xsc, image_index));
+}
+
+/*!
+ * #1589/#1610 — does this frame take the raw (pre-#1589) path?
+ *
+ * Counts the layers this backend will actually PAINT (a type it only warns
+ * about does not count) and asks whether every source is already encoded,
+ * then defers to the shared predicate so all five backends answer alike.
+ */
+static bool
+renderer_frame_takes_fast_path(struct comp_d3d11_renderer *r, struct comp_layer_accum *layers)
+{
+	uint32_t contributing = 0;
+	bool base_is_projection = false;
+	bool all_sources_srgb = true;
+
+	for (uint32_t i = 0; i < layers->layer_count; i++) {
+		struct comp_layer *layer = &layers->layers[i];
+		uint32_t sc_count = 0;
+
+		switch (layer->data.type) {
+		case XRT_LAYER_PROJECTION:
+		case XRT_LAYER_PROJECTION_DEPTH:
+			if (contributing == 0) {
+				base_is_projection = true;
+			}
+			contributing++;
+			sc_count = layer->data.view_count;
+			break;
+		case XRT_LAYER_ZONE_3D:
+			contributing++;
+			sc_count = layer->data.view_count;
+			break;
+		case XRT_LAYER_QUAD:
+		case XRT_LAYER_WINDOW_SPACE:
+		// #1615/#1602: equirect2 IS drawn on this path now
+		// (render_equirect2_layer), so it contributes exactly like a quad
+		// does — a sub-rect draw that blends over whatever is under it, and
+		// whose source therefore owes the linear sample the compose target
+		// wants. Leaving it in `default:` would have let a lone equirect2
+		// frame take the fast path and blend in encoded space.
+		case XRT_LAYER_EQUIRECT2:
+			contributing++;
+			sc_count = 1;
+			break;
+		default:
+			// Cylinder / equirect1 / cube: warned about, never drawn.
+			break;
+		}
+
+		if (sc_count > XRT_MAX_VIEWS) {
+			sc_count = XRT_MAX_VIEWS;
+		}
+		for (uint32_t v = 0; v < sc_count; v++) {
+			if (layer->sc_array[v] != nullptr && !comp_d3d11_swapchain_is_srgb(layer->sc_array[v])) {
+				all_sources_srgb = false;
+			}
+		}
+	}
+
+	return u_color_compose_fast_path(r->legacy_color, contributing, base_is_projection, all_sources_srgb);
+}
+
+/*!
  * The blend state that implements one shared blend mode (#1599).
  *
  * REPLACE and OPAQUE_COVER share `blend_opaque` (blending DISABLED, write mask
@@ -653,9 +885,9 @@ render_projection_layer(struct comp_d3d11_renderer *r,
 
 	// Get the D3D11 swapchain's SRV for this image. For layered (array)
 	// swapchains this is a whole-array Texture2DArray SRV (all slices);
-	// for single-layer swapchains it is a Texture2D SRV.
-	ID3D11ShaderResourceView *srv = static_cast<ID3D11ShaderResourceView *>(
-	    comp_d3d11_swapchain_get_srv(xsc, image_index));
+	// for single-layer swapchains it is a Texture2D SRV. #1589 picks the
+	// format-honest twin when this frame composes.
+	ID3D11ShaderResourceView *srv = layer_source_srv(r, xsc, image_index);
 	if (srv == nullptr) {
 		U_LOG_W("render_projection_layer: SRV is null for swapchain image %u", image_index);
 		return;
@@ -831,9 +1063,9 @@ render_quad_layer(struct comp_d3d11_renderer *r,
 
 	uint32_t image_index = q->sub.image_index;
 
-	// Get the D3D11 swapchain's SRV for this image
-	ID3D11ShaderResourceView *srv = static_cast<ID3D11ShaderResourceView *>(
-	    comp_d3d11_swapchain_get_srv(xsc, image_index));
+	// Get the D3D11 swapchain's SRV for this image (#1589: format-honest
+	// when composing).
+	ID3D11ShaderResourceView *srv = layer_source_srv(r, xsc, image_index);
 	if (srv == nullptr) {
 		return false;
 	}
@@ -993,8 +1225,10 @@ render_equirect2_layer(struct comp_d3d11_renderer *r,
 		return false;
 	}
 
-	ID3D11ShaderResourceView *srv =
-	    static_cast<ID3D11ShaderResourceView *>(comp_d3d11_swapchain_get_srv(xsc, eq->sub.image_index));
+	// Get the D3D11 swapchain's SRV for this image (#1589: format-honest
+	// when composing — this is a shader draw that BLENDS, so a composing
+	// frame must sample it linear and let the `_SRGB` RTV encode once).
+	ID3D11ShaderResourceView *srv = layer_source_srv(r, xsc, eq->sub.image_index);
 	if (srv == nullptr) {
 		return false;
 	}
@@ -1106,9 +1340,9 @@ render_window_space_layer(struct comp_d3d11_renderer *r,
 
 	uint32_t image_index = ws->sub.image_index;
 
-	// Get the D3D11 swapchain's SRV for this image
-	ID3D11ShaderResourceView *srv = static_cast<ID3D11ShaderResourceView *>(
-	    comp_d3d11_swapchain_get_srv(xsc, image_index));
+	// Get the D3D11 swapchain's SRV for this image (#1589: format-honest
+	// when composing).
+	ID3D11ShaderResourceView *srv = layer_source_srv(r, xsc, image_index);
 	if (srv == nullptr) {
 		return;
 	}
@@ -1241,6 +1475,9 @@ comp_d3d11_renderer_create(struct comp_d3d11_compositor *c,
 	r->view_width = view_width;
 	r->view_height = view_height;
 	r->shared_nt = shared_nt;
+	// #1589: read once, and say which regime this process is in exactly once.
+	r->legacy_color = u_color_legacy_unorm_encoded();
+	u_color_log_state_once("d3d11");
 
 	// Initialize tile layout from the active rendering mode
 	auto ci = get_internals(c);
@@ -1322,6 +1559,8 @@ comp_d3d11_renderer_destroy(struct comp_d3d11_renderer **renderer_ptr)
 	SAFE_RELEASE(r->projection_vs);
 	SAFE_RELEASE(r->depth_dsv);
 	SAFE_RELEASE(r->depth_texture);
+	SAFE_RELEASE(r->compose_rtv);
+	SAFE_RELEASE(r->compose_texture);
 	SAFE_RELEASE(r->atlas_rtv);
 	SAFE_RELEASE(r->atlas_srv);
 	SAFE_RELEASE(r->atlas_texture);
@@ -1486,8 +1725,29 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
 		}
 	}
 
-	// Set render target to atlas texture
-	internals.context->OMSetRenderTargets(1, &renderer->atlas_rtv, renderer->depth_dsv);
+	/*
+	 * #1589/#1610 — where this frame's layers land.
+	 *
+	 * The shipping case (one full-tile projection layer out of an `_SRGB`
+	 * swapchain) owes neither an encode nor a blend, so it draws straight
+	 * into the atlas through the non-decoding views: the exact call sequence,
+	 * and the exact atlas bytes, as before this work. Everything else — a
+	 * UNORM source, whose values are LINEAR and owe the encode, or a second
+	 * layer, which owes a LINEAR blend — goes into the private `_SRGB`-view
+	 * target and is copied out at the end of the pass.
+	 */
+	renderer->compose_active = false;
+	ID3D11RenderTargetView *target_rtv = renderer->atlas_rtv;
+	if (!renderer_frame_takes_fast_path(renderer, layers)) {
+		ID3D11RenderTargetView *compose_rtv = renderer_ensure_compose_target(renderer);
+		if (compose_rtv != nullptr) {
+			renderer->compose_active = true;
+			target_rtv = compose_rtv;
+		}
+	}
+
+	// Set render target (the atlas, or this frame's private compose target)
+	internals.context->OMSetRenderTargets(1, &target_rtv, renderer->depth_dsv);
 
 	/*
 	 * #1600 — clear BLACK, and honour the transparent session.
@@ -1508,10 +1768,15 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
 	 * covers must stay see-through (#392/#573); same for the unzoned area of
 	 * a zones frame (ADR-027), so the feathered wish edge blends toward the
 	 * desktop rather than toward an opaque rectangle.
+	 *
+	 * #1610: unchanged when this goes through the compose target's `_SRGB`
+	 * RTV. Black is black in both spaces (the OETF fixes zero) and an RTV's
+	 * sRGB conversion never touches alpha, so the clear needs no colour-space
+	 * branch — which is half of why black was the right clear to land on.
 	 */
 	const float clear_color[4] = {0.0f, 0.0f, 0.0f,
 	                              (internals.transparent_background || zones_frame) ? 0.0f : 1.0f};
-	internals.context->ClearRenderTargetView(renderer->atlas_rtv, clear_color);
+	internals.context->ClearRenderTargetView(target_rtv, clear_color);
 	internals.context->ClearDepthStencilView(renderer->depth_dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
 
 	// Set common state
@@ -1767,6 +2032,12 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
 		}
 	}
 
+	// #1610: publish what the private target now holds, so the atlas is
+	// correct for the projection-only capture the compositor may take between
+	// the two passes. The compose target KEEPS its content — the window-space
+	// pass below draws on top of it and republishes.
+	renderer_publish_compose_to_atlas(renderer);
+
 	return XRT_SUCCESS;
 }
 
@@ -1777,6 +2048,28 @@ comp_d3d11_renderer_draw_window_space_pass(struct comp_d3d11_renderer *renderer,
                                             uint32_t target_height,
                                             const struct comp_d3d11_eff_layout *layout)
 {
+	// #1610: nothing to do, and nothing to republish, when no window-space
+	// layer will draw — so a composing frame without one pays for exactly one
+	// atlas copy, not two.
+	bool any_window_space = false;
+	for (uint32_t i = 0; i < layers->layer_count; i++) {
+		if (layers->layers[i].data.type == XRT_LAYER_WINDOW_SPACE) {
+			any_window_space = true;
+			break;
+		}
+	}
+	if (!any_window_space) {
+		return XRT_SUCCESS;
+	}
+
+	// The projection pass left its target bound, but a capture may have run
+	// between the two passes and rebound things, so a composing frame states
+	// its target again rather than inheriting one.
+	if (renderer->compose_active && renderer->compose_rtv != nullptr) {
+		auto internals = get_internals(renderer->c);
+		internals.context->OMSetRenderTargets(1, &renderer->compose_rtv, renderer->depth_dsv);
+	}
+
 	uint32_t effective_views = layout->views;
 	for (uint32_t view_index = 0; view_index < effective_views; view_index++) {
 		set_view_viewport(renderer, view_index, layout, target_width, target_height);
@@ -1787,6 +2080,8 @@ comp_d3d11_renderer_draw_window_space_pass(struct comp_d3d11_renderer *renderer,
 			}
 		}
 	}
+
+	renderer_publish_compose_to_atlas(renderer);
 	return XRT_SUCCESS;
 }
 
@@ -1946,6 +2241,12 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
 
 	SAFE_RELEASE(renderer->depth_dsv);
 	SAFE_RELEASE(renderer->depth_texture);
+	// #1610: the private compose target tracks the atlas's extent, so a
+	// genuine realloc retires it too. renderer_ensure_compose_target rebuilds
+	// it on the next composing frame; a session that only ever takes the fast
+	// path never rebuilds it at all.
+	SAFE_RELEASE(renderer->compose_rtv);
+	SAFE_RELEASE(renderer->compose_texture);
 	SAFE_RELEASE(renderer->atlas_rtv);
 	SAFE_RELEASE(renderer->atlas_srv);
 	SAFE_RELEASE(renderer->atlas_texture);
