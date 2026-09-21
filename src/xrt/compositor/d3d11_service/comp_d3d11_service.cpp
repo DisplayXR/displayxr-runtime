@@ -17379,11 +17379,18 @@ struct service_acquired_image_scope
 };
 
 /*!
- * Resolve the SRV to sample a zone/Local-2D source through. Workspace mode
- * samples raw bytes (the per-client atlas stays gamma-encoded; the multi-comp
- * pipeline handles color downstream — `feedback_srgb_blit_paths`). Standalone
- * mode linearizes honest-sRGB sources through an sRGB SRV, mirroring the
- * projection blit (the DP expects linear input on that path).
+ * Resolve the SRV to sample a zone/Local-2D source through: always the plain,
+ * NON-decoding per-image SRV, in both modes.
+ *
+ * #1591: the standalone (non-workspace) branch used to build an sRGB-typed SRV
+ * over an honest `_SRGB` source so the sample auto-decoded to linear, "because
+ * the DP expects linear input". Nothing re-encoded it and the handoff is
+ * declared ENCODED (service_single_client_atlas_encoding), so that was the #409
+ * half-conversion in a third branch — the zones twin of the projection blit.
+ * Both now sample raw, byte-identically to the shell path.
+ *
+ * @p srgb_srv_out / @p out_is_srgb_blit are retained so the (unchanged) call
+ * sites keep compiling; the flag is now always false.
  */
 static ID3D11ShaderResourceView *
 zones_resolve_src_srv(struct d3d11_service_system *sys,
@@ -17393,31 +17400,10 @@ zones_resolve_src_srv(struct d3d11_service_system *sys,
                       wil::com_ptr<ID3D11ShaderResourceView> &srgb_srv_out,
                       bool *out_is_srgb_blit)
 {
+	(void)sys;
+	(void)desc;
+	(void)srgb_srv_out;
 	*out_is_srgb_blit = false;
-	if (!sys->workspace_mode && is_srgb_format(desc->Format)) {
-		D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
-		srv_desc.Format = get_srgb_format(desc->Format);
-		// ADR-032 (#225): a LAYERED (arraySize>1) source needs a whole-array
-		// SRGB SRV so the array PS can select the slice — matching the plain
-		// per-image SRV, which create/import already builds as a Texture2DArray
-		// for layered sources. Tiled (arraySize==1) sources keep Texture2D.
-		if (desc->ArraySize > 1) {
-			srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
-			srv_desc.Texture2DArray.MostDetailedMip = 0;
-			srv_desc.Texture2DArray.MipLevels = 1;
-			srv_desc.Texture2DArray.FirstArraySlice = 0;
-			srv_desc.Texture2DArray.ArraySize = desc->ArraySize;
-		} else {
-			srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-			srv_desc.Texture2D.MipLevels = 1;
-			srv_desc.Texture2D.MostDetailedMip = 0;
-		}
-		if (SUCCEEDED(sys->device->CreateShaderResourceView(
-		        sc->images[img].texture.get(), &srv_desc, srgb_srv_out.put()))) {
-			*out_is_srgb_blit = true;
-			return srgb_srv_out.get();
-		}
-	}
 	return sc->images[img].srv.get();
 }
 
@@ -20714,9 +20700,15 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				                                  U_TILING_ORIGIN_TOP_LEFT)) {
 					zc_reason = "tiling_mismatch";
 				} else {
-					// Texture matches atlas dims exactly — zero-copy is safe
+					// Texture matches atlas dims exactly — zero-copy is safe.
+					//
+					// #1591: view the app image through its NON-decoding
+					// sibling. The handoff is declared ENCODED, so an SRGB
+					// SRV here would hand the DP linear bytes labelled
+					// encoded — the same unmatched decode the blit path
+					// above just lost, on the branch that bypasses it.
 					D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
-					srv_desc.Format = view_is_srgb[0] ? get_srgb_format(view_descs[0].Format) : view_descs[0].Format;
+					srv_desc.Format = d3d_dxgi_format_to_unorm_sample(view_descs[0].Format);
 					srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
 					srv_desc.Texture2D.MipLevels = 1;
 					srv_desc.Texture2D.MostDetailedMip = 0;
@@ -20860,66 +20852,37 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			const bool is_layered = pvb.is_array;
 			const uint32_t src_slice = pvb.array_slice;
 
-			// Color-space handling diverges between modes
-			// (`feedback_srgb_blit_paths`):
-			//   - non-workspace SRGB: sample through SRGB SRV → linearize on
-			//     sample → write linear bytes to atlas. The DP expects
-			//     linear input.
-			//   - workspace mode:     atlas stays gamma-encoded;
-			//     multi_compositor_render reads it as-is and the multi-comp
-			//     pipeline downstream handles color space. Linearizing here
-			//     would double-handle gamma.
+			// #1591: color-space handling is now IDENTICAL in both modes
+			// (`feedback_srgb_blit_paths`). The per-client atlas holds the
+			// app's bytes VERBATIM and the handoff is declared ENCODED
+			// (service_single_client_atlas_encoding), so there is nothing
+			// to decode here in either mode.
+			//
+			// The non-workspace branch used to sample an honest `_SRGB`
+			// client through an SRGB SRV — a hardware decode to linear with
+			// no matching re-encode anywhere, while still declaring the
+			// atlas ENCODED. That is the #409 half-conversion surviving in
+			// one branch: an `_SRGB` app running as a direct IPC client
+			// reached the DP ~2.2x too dark, while the same app under the
+			// shell (raw copy) did not. Dropped — this path is now
+			// byte-identical to the shell path.
+			//
+			// The scale shader loses its `workspace_mode` restriction with
+			// it: it is a pure resize (default, non-decoding SRV), and it
+			// was previously reachable in non-workspace mode only as a side
+			// effect of the SRGB branch. Without it an oversized
+			// non-workspace source falls to the raw copy, which cannot
+			// resize and writes past the slot boundary
+			// (`feedback_atlas_stride_invariant`).
 			bool can_shader_blit = sys->blit_vs &&
 			    view_scs[eye]->images[view_img_indices[eye]].srv;
-			bool use_srgb_shader = can_shader_blit && view_is_srgb[eye] && !sys->workspace_mode;
-			bool use_scale_shader = can_shader_blit && needs_scale && sys->workspace_mode;
+			bool use_scale_shader = can_shader_blit && needs_scale;
 
-			if (use_srgb_shader) {
-				// Non-workspace SRGB: shader blit with SRGB SRV for linearization.
-				// The GPU auto-linearizes when sampling through an SRGB SRV.
-				// The DP expects linear input — without this, colors are washed out.
-				wil::com_ptr<ID3D11ShaderResourceView> srgb_srv;
-				D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
-				srv_desc.Format = get_srgb_format(view_descs[eye].Format);
-				if (is_layered) {
-					// Whole-array SRGB SRV so the array PS can select the slice.
-					srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
-					srv_desc.Texture2DArray.MostDetailedMip = 0;
-					srv_desc.Texture2DArray.MipLevels = 1;
-					srv_desc.Texture2DArray.FirstArraySlice = 0;
-					srv_desc.Texture2DArray.ArraySize = view_descs[eye].ArraySize;
-				} else {
-					srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-					srv_desc.Texture2D.MipLevels = 1;
-					srv_desc.Texture2D.MostDetailedMip = 0;
-				}
-				HRESULT blit_hr = sys->device->CreateShaderResourceView(
-				    view_textures[eye], &srv_desc, srgb_srv.put());
-				if (SUCCEEDED(blit_hr)) {
-					blit_to_atlas_texture(sys, &c->render, srgb_srv.get(), src_x, src_y, src_w,
-						              src_h, (float)view_descs[eye].Width,
-						              (float)view_descs[eye].Height, (float)tile_x,
-						              (float)tile_y, dst_w, dst_h, true,
-						              /*blend=*/proj_blend, /*rtv_override=*/nullptr,
-						              /*dst_tex_w=*/0.0f, /*dst_tex_h=*/0.0f,
-						              /*is_array=*/is_layered, /*array_slice=*/src_slice);
-				} else {
-					// Fallback to raw copy
-					warn_once_projection_copy_cannot_blend(proj_blend);
-					D3D11_BOX box = {};
-					box.left = (UINT)src_x; box.top = (UINT)src_y;
-					box.right = (UINT)(src_x + src_w); box.bottom = (UINT)(src_y + src_h);
-					box.front = 0; box.back = 1;
-					sys->context->CopySubresourceRegion(
-					    c->render.atlas_texture.get(), 0, static_cast<UINT>(tile_x),
-					    static_cast<UINT>(tile_y), 0, view_textures[eye],
-					    layer->data.proj.v[eye].sub.array_index, &box);
-				}
-			} else if (use_scale_shader) {
-				// Workspace mode + oversized client content: scale through the
-				// shader using the default (non-SRGB) SRV so sampling reads
-				// raw bytes and writes them unmodified — keeps the per-client
-				// atlas in gamma space, matching the raw-copy path that
+			if (use_scale_shader) {
+				// Oversized client content: scale through the shader using
+				// the default (non-SRGB) SRV so sampling reads raw bytes and
+				// writes them unmodified — keeps the per-client atlas in the
+				// app's own space, matching the raw-copy path that
 				// multi_compositor_render expects. The per-image SRV is already
 				// a Texture2DArray for layered sources (ADR-032, create/import).
 				blit_to_atlas_texture(
@@ -20945,9 +20908,9 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				    /*dst_tex_w=*/0.0f, /*dst_tex_h=*/0.0f,
 				    /*is_array=*/is_layered, /*array_slice=*/src_slice);
 			} else {
-				// Non-SRGB, or workspace mode with content already fitting the
-				// tile, or shader unavailable: raw byte copy. Multi-comp
-				// (workspace) and non-SRGB DP handle the rest as today.
+				// Content already fits the tile, or the shader is
+				// unavailable: raw byte copy — the app's bytes reach the
+				// per-client atlas verbatim, in BOTH modes (#1591).
 				warn_once_projection_copy_cannot_blend(proj_blend);
 				D3D11_BOX box = {};
 				box.left = static_cast<UINT>(src_x);
