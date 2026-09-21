@@ -1393,6 +1393,9 @@ struct d3d11_service_system
 	//! Cylinder layer shaders
 	wil::com_ptr<ID3D11VertexShader> cylinder_vs;
 	wil::com_ptr<ID3D11PixelShader> cylinder_ps;
+	//! #1601: Texture2DArray source variant of cylinder_ps. Same gate and
+	//! same non-fatal fallback as quad_ps_array.
+	wil::com_ptr<ID3D11PixelShader> cylinder_ps_array;
 
 	//! Equirect2 layer shaders
 	wil::com_ptr<ID3D11VertexShader> equirect2_vs;
@@ -5059,6 +5062,21 @@ create_layer_shaders(struct d3d11_service_system *sys)
 		return false;
 	}
 
+	// #1601: layered (array) cylinder pixel shader variant. Non-fatal, as the
+	// quad one is.
+	hr = compile_shader(cylinder_ps_array_hlsl, "PSMain", "ps_5_0", &blob);
+	if (FAILED(hr)) {
+		U_LOG_W("Array cylinder pixel shader unavailable — cylinders sample slice 0");
+	} else {
+		hr = sys->device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+		                                    sys->cylinder_ps_array.put());
+		blob->Release();
+		if (FAILED(hr)) {
+			U_LOG_W("Array cylinder pixel shader unavailable (0x%08lx) — sampling slice 0", hr);
+			sys->cylinder_ps_array = nullptr;
+		}
+	}
+
 	// Equirect2 vertex shader
 	hr = compile_shader(equirect2_vs_hlsl, "VSMain", "vs_5_0", &blob);
 	if (FAILED(hr)) {
@@ -5785,6 +5803,13 @@ render_cylinder_layer(struct d3d11_service_system *sys,
 	constants.central_angle = cyl->central_angle;
 	constants.aspect_ratio = cyl->aspect_ratio;
 
+	// #1601: same slice bug and same fix as the quad path above — a cylinder
+	// carries an xrt_sub_image and reaches the same whole-array
+	// Texture2DArray SRV. Gated on the swapchain's array size.
+	const bool is_layered = sc->info.array_size > 1;
+	const bool use_array_ps = is_layered && sys->cylinder_ps_array;
+	constants.array_params[0] = use_array_ps ? static_cast<float>(cyl->sub.array_index) : 0.0f;
+
 	// Update constant buffer
 	D3D11_MAPPED_SUBRESOURCE mapped;
 	HRESULT hr = sys->context->Map(sys->layer_constant_buffer.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
@@ -5795,7 +5820,7 @@ render_cylinder_layer(struct d3d11_service_system *sys,
 
 	// Set shaders
 	sys->context->VSSetShader(sys->cylinder_vs.get(), nullptr, 0);
-	sys->context->PSSetShader(sys->cylinder_ps.get(), nullptr, 0);
+	sys->context->PSSetShader(use_array_ps ? sys->cylinder_ps_array.get() : sys->cylinder_ps.get(), nullptr, 0);
 
 	// Bind resources
 	ID3D11Buffer *cbs[] = {sys->layer_constant_buffer.get()};
@@ -24467,8 +24492,10 @@ system_destroy(struct xrt_system_compositor *xsysc)
 	sys->equirect2_ps.reset();
 	sys->equirect2_vs.reset();
 	sys->cylinder_ps.reset();
+	sys->cylinder_ps_array.reset();
 	sys->cylinder_vs.reset();
 	sys->quad_ps.reset();
+	sys->quad_ps_array.reset();
 	sys->quad_vs.reset();
 
 	// Clean up blit shader resources

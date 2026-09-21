@@ -34,6 +34,7 @@ struct CylinderLayerConstants
 	float central_angle;     // Angular extent (radians)
 	float aspect_ratio;      // Height / arc_length
 	float padding;
+	float array_params[4]; // #1601: x = source array slice; yzw pad
 };
 
 //! Constant buffer layout for equirect2 layers
@@ -271,6 +272,41 @@ struct VS_OUTPUT
 float4 PSMain(VS_OUTPUT input) : SV_Target
 {
     float4 color = layer_tex.Sample(layer_samp, input.uv);
+    color = color * color_scale + color_bias;
+    return color;
+}
+)";
+
+//! #1601 — cylinder pixel shader variant for LAYERED (arraySize>1) swapchains.
+//! A cylinder layer takes the same xrt_sub_image as a quad and reaches the
+//! same whole-array Texture2DArray SRV, so it had the same slice bug. Shares
+//! cylinder_vs_hlsl; only the sample changes.
+static const char *cylinder_ps_array_hlsl = R"(
+cbuffer LayerCB : register(b0)
+{
+    float4x4 mvp;
+    float4 post_transform;
+    float4 color_scale;
+    float4 color_bias;
+    float radius;
+    float central_angle;
+    float aspect_ratio;
+    float padding;
+    float4 array_params;   // x = array slice
+};
+
+Texture2DArray layer_tex : register(t0);
+SamplerState layer_samp : register(s0);
+
+struct VS_OUTPUT
+{
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+};
+
+float4 PSMain(VS_OUTPUT input) : SV_Target
+{
+    float4 color = layer_tex.Sample(layer_samp, float3(input.uv, array_params.x));
     color = color * color_scale + color_bias;
     return color;
 }
