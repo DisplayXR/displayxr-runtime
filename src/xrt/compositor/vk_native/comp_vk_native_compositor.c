@@ -129,6 +129,8 @@
 #if defined(XRT_HAVE_WAYLAND) && defined(XRT_HAVE_DBUS)
 #define DXR_HAVE_WL_GEOM
 #include "vk_native/comp_vk_native_wl_geom.h"
+// THE logical->device conversion + the 1:1 decision (#1595/#1596).
+#include "util/u_wayland_geom.h"
 #endif
 
 #include <string.h>
@@ -587,6 +589,15 @@ struct comp_vk_native_compositor
 	//! One-shot: the Wayland surface turned out to be on an output that is not
 	//! the 3D panel, so it has no panel-scoped metrics (#1596).
 	bool warned_wl_window_off_panel;
+	/*!
+	 * #1595, desktop-Linux twin of @ref android_container_scaled: the display
+	 * server cannot present our buffer to the panel 1:1, so the compositor
+	 * degrades to flat 2D rather than weave into a resample. Set only on a
+	 * transition — see @ref vk_linux_update_surface_not_1to1.
+	 */
+	bool linux_surface_not_1to1;
+	//! One-shot: said once that the 1:1 gate has nothing to measure.
+	bool warned_1to1_unknown;
 #endif
 
 #ifdef XRT_OS_ANDROID
@@ -3851,6 +3862,150 @@ vk_android_update_container_scaled(struct comp_vk_native_compositor *c)
 }
 #endif // XRT_OS_ANDROID
 
+#ifdef XRT_OS_LINUX_DESKTOP
+/*!
+ * Refuse rather than resample, desktop-Linux edition (#1595).
+ *
+ * ## The rule
+ *
+ * A lenticular weave is a ~1-pixel-period interlace. It is correct only if the
+ * woven texture reaches scanout UNRESAMPLED, at native panel resolution. Once
+ * the display server applies a scaling filter after we are done, every view
+ * leaks into its neighbour uniformly across the whole panel: a double image
+ * with no vantage point where it resolves, and nothing we publish downstream
+ * can undo it. Flat 2D is *correct content in the wrong dimensionality* —
+ * legible, honest, and recoverable the instant the session becomes 1:1. So
+ * degrading is strictly better than weaving into a resample.
+ *
+ * The rule was written down in several places and enforced in none. On
+ * 2026-09-20 the app helper printed "The weave CANNOT be 1:1 in this session."
+ * and the compositor wove six frames anyway.
+ *
+ * ## Shape: the Android precedent
+ *
+ * Deliberately the same shape as @ref vk_android_update_container_scaled —
+ * one authority, a lifecycle-only log line, a TRANSITION rather than a
+ * per-frame decision, `request_display_mode(false)` plus the DP's
+ * `on_pause`/`on_resume` pair to release the session's lens preference
+ * (#1039), and @ref vk_compute_effective_layout collapsing the frame to tile 0.
+ *
+ * ## Scope: the Wayland arm only, and why
+ *
+ * X11 is deliberately NOT gated here. The only signal available there is
+ * `display_desktop_rect_is_panel`, and that flag is false on every dev box by
+ * construction — sim_display declares a 1920x1080 panel no real desktop rect
+ * matches — so gating the weave on it would put every X11 sim session into
+ * flat 2D. It already gates the weave PHASE
+ * (@ref vk_x11_present_origin_is_panel_native), which is the part it can
+ * honestly speak to. Wayland is where the measurement exists: the geometry
+ * service publishes the surface's monitor and its scale, so the destination
+ * extent is a number rather than an inference.
+ *
+ * ## Never degrade on ignorance
+ *
+ * Three states, not two. "Cannot be 1:1" degrades; "is 1:1" weaves; "we do not
+ * know" keeps whatever state we are in. Without the geometry service there is
+ * no destination extent to compare against, so the session stays exactly as it
+ * behaved before this function existed.
+ */
+static void
+vk_linux_update_surface_not_1to1(struct comp_vk_native_compositor *c)
+{
+#if defined(XRT_HAVE_WAYLAND) && defined(DXR_HAVE_WL_GEOM)
+	if (!c->use_wayland || c->wl_geom == NULL || c->target == NULL) {
+		return;
+	}
+
+	// Panel native size, same preference order get_window_metrics uses: the
+	// display processor when it reports pixel info, else the runtime's own
+	// resolved system info.
+	uint32_t panel_px_w = 0, panel_px_h = 0;
+	{
+		int32_t ignored_left = 0, ignored_top = 0;
+		if (!(vk_dp_has_any(c) &&
+		      vk_dp_display_pixel_info(c, &panel_px_w, &panel_px_h, &ignored_left, &ignored_top) &&
+		      panel_px_w > 0 && panel_px_h > 0)) {
+			panel_px_w = c->sys_info_set ? c->sys_info.display_pixel_width : 0;
+			panel_px_h = c->sys_info_set ? c->sys_info.display_pixel_height : 0;
+		}
+	}
+
+	// What we actually hand the compositor: the swapchain extent, which on
+	// this path IS the wl_buffer the WSI attaches.
+	uint32_t buf_px_w = 0, buf_px_h = 0;
+	comp_vk_native_target_get_dimensions(c->target, &buf_px_w, &buf_px_h);
+
+	// Where it lands, in device pixels. The geometry service is the only
+	// source for this: a Wayland client is told its LOGICAL configure size and
+	// nothing else, and the logical size is exactly the quantity that hides
+	// the resample.
+	struct comp_vk_native_wl_window_rect wr = {0};
+	const bool have_rect = comp_vk_native_wl_geom_get_window_rect(c->wl_geom, &wr);
+
+	if (panel_px_w == 0 || panel_px_h == 0 || buf_px_w == 0 || buf_px_h == 0 || !have_rect) {
+		if (!c->warned_1to1_unknown) {
+			c->warned_1to1_unknown = true;
+			U_LOG_W(
+			    "1:1 gate: nothing to measure yet (panel %ux%u, buffer %ux%u, window geometry %s) "
+			    "— keeping the current weave state. Install the window-geometry@displayxr.org "
+			    "GNOME Shell extension to arm the refuse-rather-than-resample check (#1595).",
+			    panel_px_w, panel_px_h, buf_px_w, buf_px_h, have_rect ? "yes" : "NO");
+		}
+		return;
+	}
+
+	// Two independent ways this session cannot be 1:1, both measured tonight:
+	//
+	//  (a) the surface is not on the 3D panel at all — no wl_output matched
+	//      the panel rect, so xdg_toplevel_set_fullscreen(NULL) let the
+	//      compositor choose and it chose the laptop;
+	//  (b) the surface IS on the panel, but the buffer we attach is not the
+	//      size of the region the compositor paints it into — the classic
+	//      "declared the LOGICAL configure size" mistake, which on a 1.6667
+	//      desktop hands the weaver an image to be upscaled by 5/3.
+	const bool on_panel = (wr.monitor_width_px == panel_px_w && wr.monitor_height_px == panel_px_h);
+	const bool fits_window = u_wl_present_is_1to1(buf_px_w, buf_px_h, wr.width_px, wr.height_px);
+	const bool not_1to1 = !on_panel || !fits_window;
+
+	if (not_1to1 == c->linux_surface_not_1to1) {
+		return;
+	}
+	c->linux_surface_not_1to1 = not_1to1;
+
+	// ONE line per transition. A silent 2D fallback is its own debugging trap,
+	// so the line names both extents AND which of the two reasons fired.
+	if (not_1to1) {
+		U_LOG_W(
+		    "NOT_1TO1: presenting 2D (no weave) — %s. buffer %ux%u px, surface %ux%u px on a %ux%u px "
+		    "output, 3D panel %ux%u px. A resampled weave is a uniform double image; flat 2D is "
+		    "correct content and recovers as soon as the session is 1:1. (#1595)",
+		    !on_panel ? "this surface is not on the 3D panel"
+		              : "the buffer is not the size of the region the compositor paints it into",
+		    buf_px_w, buf_px_h, wr.width_px, wr.height_px, wr.monitor_width_px, wr.monitor_height_px,
+		    panel_px_w, panel_px_h);
+	} else {
+		U_LOG_W(
+		    "NOT_1TO1 cleared: buffer %ux%u px now lands 1:1 on the %ux%u px panel — weaving again. "
+		    "(#1595)",
+		    buf_px_w, buf_px_h, panel_px_w, panel_px_h);
+	}
+
+	// Same degrade the Android arm performs: ask the panel for hardware 2D and
+	// release this session's lens preference, because the Leia DP only ever
+	// re-asserts the lens from inside a weave and with the weave gone nothing
+	// else would let go (#1039). Both no-ops on a DP implementing neither slot.
+	comp_vk_native_compositor_request_display_mode(&c->base.base, !not_1to1);
+	if (not_1to1) {
+		xrt_display_processor_on_pause(c->display_processor);
+	} else {
+		xrt_display_processor_on_resume(c->display_processor);
+	}
+#else
+	(void)c;
+#endif
+}
+#endif // XRT_OS_LINUX_DESKTOP
+
 // Per-frame effective CONTENT layout (#542) — same policy as the D3D11/D3D12/
 // GL legs: the content recipe is the ACTIVE MODE's, submissions are clamped
 // to it (always-stereo apps submit identical views in a mono mode; zone
@@ -3882,6 +4037,20 @@ vk_compute_effective_layout(struct comp_vk_native_compositor *c)
 	 * correct 2D, same code path as any mono mode.
 	 */
 	if (c->android_container_scaled && view_w > 0 && view_h > 0) {
+		c->eff_layout.views = 1;
+		c->eff_layout.cols = 1;
+		c->eff_layout.rows = 1;
+		c->eff_layout.tile_w = view_w;
+		c->eff_layout.tile_h = view_h;
+		return;
+	}
+#endif
+#ifdef XRT_OS_LINUX_DESKTOP
+	// #1595 content half, identical in shape to the Android one above: a
+	// session that cannot be 1:1 collapses to TILE 0 — still a full stereo
+	// pair painted at view_w x view_h, with the right view dropped, so the
+	// tile keeps its own width and the DP takes its mono passthrough.
+	if (c->linux_surface_not_1to1 && view_w > 0 && view_h > 0) {
 		c->eff_layout.views = 1;
 		c->eff_layout.cols = 1;
 		c->eff_layout.rows = 1;
@@ -6623,6 +6792,13 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 	// weaves at all. Cheap (one atomic read of the published rect) and only
 	// acts on a transition.
 	vk_android_update_container_scaled(c);
+#endif
+#ifdef XRT_OS_LINUX_DESKTOP
+	// #1595, same position and the same reason: refuse-rather-than-resample
+	// decides whether this frame weaves at all, so it must precede the layout.
+	// Cheap (a non-blocking D-Bus pump the metrics path already performs) and
+	// only acts on a transition.
+	vk_linux_update_surface_not_1to1(c);
 #endif
 
 	// Per-frame effective CONTENT layout (#542): tile grid/dims from the
@@ -9578,10 +9754,11 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 		if (wr.monitor_width_px != disp_px_w || wr.monitor_height_px != disp_px_h) {
 			if (!c->warned_wl_window_off_panel) {
 				c->warned_wl_window_off_panel = true;
-				U_LOG_W("wl_geom: this surface is on a %ux%u px output, but the 3D panel is %ux%u "
-				        "— the window is not on the panel, so it has no panel-scoped metrics and "
-				        "no weave phase. Display-scoped. (#1596)",
-				        wr.monitor_width_px, wr.monitor_height_px, disp_px_w, disp_px_h);
+				U_LOG_W(
+				    "wl_geom: this surface is on a %ux%u px output, but the 3D panel is %ux%u "
+				    "— the window is not on the panel, so it has no panel-scoped metrics and "
+				    "no weave phase. Display-scoped. (#1596)",
+				    wr.monitor_width_px, wr.monitor_height_px, disp_px_w, disp_px_h);
 			}
 			return false;
 		}
@@ -9996,9 +10173,10 @@ vk_update_present_origin(struct comp_vk_native_compositor *c)
 	 * monitor rect and Mutter's fractional scale, so the origin is CONVERTED to
 	 * device pixels at the provider boundary and arrives here already correct.
 	 * What survives of that refusal is the part that was really about pixels
-	 * rather than units — whether the buffer reaches glass unresampled — which
-	 * is a property of the BUFFER, not of the origin, and is enforced
-	 * separately (#1595).
+	 * rather than units — whether the buffer reaches glass unresampled — and
+	 * that is @ref vk_linux_update_surface_not_1to1 (#1595), which stops the
+	 * weave outright rather than merely withholding its phase. Gate on it here
+	 * too so a degraded session cannot leave a stale origin latched on the DP.
 	 */
 #ifdef XRT_HAVE_WAYLAND
 	const bool origin_from_x11 = !c->use_wayland;
@@ -10007,6 +10185,9 @@ vk_update_present_origin(struct comp_vk_native_compositor *c)
 #endif
 	if (origin_from_x11 && !vk_x11_present_origin_is_panel_native(c)) {
 		return; // display-scoped weaving; the DP's origin stays (0,0)
+	}
+	if (!origin_from_x11 && c->linux_surface_not_1to1) {
+		return; // degraded to 2D; there is no phase to anchor
 	}
 #endif
 
