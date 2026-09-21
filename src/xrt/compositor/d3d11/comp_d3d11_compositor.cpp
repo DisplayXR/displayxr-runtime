@@ -3449,7 +3449,10 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 							rws[v] = layer->data.proj.v[v].sub.rect.extent.w;
 							rhs_arr[v] = layer->data.proj.v[v].sub.rect.extent.h;
 						}
-						if (u_tiling_can_zero_copy(vc, rxs, rys, rws, rhs_arr, sw, sh, mode)) {
+						// #1628: D3D11_VIEWPORT::TopLeftY counts down, so the
+						// submitted offset.y is already top-origin.
+						if (u_tiling_can_zero_copy(vc, rxs, rys, rws, rhs_arr, sw, sh, mode,
+						                           U_TILING_ORIGIN_TOP_LEFT)) {
 							zc_srv = comp_d3d11_swapchain_get_srv(layer->sc_array[0], img_idx);
 							if (zc_srv != nullptr)
 								zero_copy = true;

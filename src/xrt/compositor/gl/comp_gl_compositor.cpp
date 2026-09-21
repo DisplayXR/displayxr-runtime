@@ -4629,8 +4629,16 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 							rws[v] = layer->data.proj.v[v].sub.rect.extent.w;
 							rhs_arr[v] = layer->data.proj.v[v].sub.rect.extent.h;
 						}
+						// #1628: the app tiled its swapchain with glViewport,
+						// whose Y origin is the BOTTOM — so its offset.y
+						// counts UP, mirroring the top-origin expectation
+						// every other backend submits in. Reading it
+						// top-origin made view 0 and view N-1 compare equal
+						// while naming opposite rows, and a zero-copy frame
+						// has no crop to re-place them. No-op at rows == 1.
 						if (u_tiling_can_zero_copy(vc, rxs, rys, rws, rhs_arr,
-						                           gsc->info.width, gsc->info.height, mode)) {
+						                           gsc->info.width, gsc->info.height, mode,
+						                           U_TILING_ORIGIN_BOTTOM_LEFT)) {
 							zero_copy = true;
 							zc_texture = gsc->textures[img_idx];
 						}

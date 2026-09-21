@@ -214,8 +214,43 @@ u_tiling_view_origin_gl(uint32_t view_index,
 }
 
 /*!
+ * Which end of the submitted image the app's `subImage.imageRect.offset.y` is
+ * measured from (#1628).
+ *
+ * The offset is a bare number that the app computes with the SAME expression it
+ * feeds its own viewport call, so its meaning follows the app's framebuffer
+ * origin — and a D3D/Metal/Vulkan app and an OpenGL app disagree about which
+ * row `y = 0` names. #1625 settled the atlas side ("view 0 is the top-left tile
+ * as displayed"); this enum is the submission side of the same statement, and
+ * it must be passed explicitly because a predicate that silently means
+ * different things to different callers is exactly what hid this.
+ */
+enum u_tiling_origin
+{
+	//! `offset.y` counts DOWN from the top edge — D3D11, D3D12, Metal, Vulkan.
+	U_TILING_ORIGIN_TOP_LEFT = 0,
+	//! `offset.y` counts UP from the bottom edge — OpenGL (`glViewport`).
+	U_TILING_ORIGIN_BOTTOM_LEFT = 1,
+};
+
+/*!
  * Check whether a view's subImage rect matches the expected tile position
  * for zero-copy passthrough.
+ *
+ * **Origin (#1628).** @p origin says which end of the submitted image
+ * `rect_y` is measured from. Under `U_TILING_ORIGIN_BOTTOM_LEFT` the
+ * expectation is @ref u_tiling_view_origin_gl's, i.e. row `view_index / cols`
+ * counted from the BOTTOM — because a GL app writes its tiles with
+ * `glViewport`, whose Y origin is the bottom, so `rect_y == 0` names the
+ * geometrically BOTTOM row while the top-origin expectation reads the same 0 as
+ * the TOP row. They agree numerically and mean opposite rows. The two collapse
+ * to the same test at `tile_rows == 1`, which is every mode any shipped vendor
+ * plug-in publishes.
+ *
+ * The bottom-origin expectation is well defined only because the caller has
+ * already required swapchain == atlas (see @ref u_tiling_can_zero_copy): the
+ * row count to flip against is the mode's, and it only describes the submitted
+ * image when that image IS the atlas.
  *
  * @param view_index       Index of the view (0..N-1).
  * @param rect_x           subImage.imageRect.offset.x
@@ -223,6 +258,7 @@ u_tiling_view_origin_gl(uint32_t view_index,
  * @param rect_w           subImage.imageRect.extent.width
  * @param rect_h           subImage.imageRect.extent.height
  * @param mode             Active rendering mode.
+ * @param origin           Which end of the image @p rect_y is measured from.
  * @return true if the rect matches the expected tile position and size.
  */
 static inline bool
@@ -231,12 +267,19 @@ u_tiling_view_matches_tile(uint32_t view_index,
                            int32_t rect_y,
                            uint32_t rect_w,
                            uint32_t rect_h,
-                           const struct xrt_rendering_mode *mode)
+                           const struct xrt_rendering_mode *mode,
+                           enum u_tiling_origin origin)
 {
 	uint32_t expected_x, expected_y;
-	u_tiling_view_origin(view_index, mode->tile_columns,
-	                     mode->view_width_pixels, mode->view_height_pixels,
-	                     &expected_x, &expected_y);
+	if (origin == U_TILING_ORIGIN_BOTTOM_LEFT) {
+		u_tiling_view_origin_gl(view_index, mode->tile_columns, mode->tile_rows,
+		                        mode->view_width_pixels, mode->view_height_pixels,
+		                        &expected_x, &expected_y);
+	} else {
+		u_tiling_view_origin(view_index, mode->tile_columns,
+		                     mode->view_width_pixels, mode->view_height_pixels,
+		                     &expected_x, &expected_y);
+	}
 
 	return (uint32_t)rect_x == expected_x &&
 	       (uint32_t)rect_y == expected_y &&
@@ -259,6 +302,11 @@ u_tiling_view_matches_tile(uint32_t view_index,
  * @param swapchain_w      Swapchain width.
  * @param swapchain_h      Swapchain height.
  * @param mode             Active rendering mode.
+ * @param origin           Which end of the submitted image the rect Y offsets
+ *                         are measured from — the caller's backend decides
+ *                         (#1628). Not a second eligibility gate: it changes
+ *                         what the SAME question means, not which submissions
+ *                         are allowed to answer it.
  * @return true if zero-copy is possible.
  */
 static inline bool
@@ -269,7 +317,8 @@ u_tiling_can_zero_copy(uint32_t view_count,
                        const uint32_t *rect_hs,
                        uint32_t swapchain_w,
                        uint32_t swapchain_h,
-                       const struct xrt_rendering_mode *mode)
+                       const struct xrt_rendering_mode *mode,
+                       enum u_tiling_origin origin)
 {
 	// ADR-041: the submission must COVER the mode, not equal it. The app's view
 	// count is fixed by its view configuration (R) while the mode's tile count
@@ -292,11 +341,14 @@ u_tiling_can_zero_copy(uint32_t view_count,
 	    swapchain_h != mode->atlas_height_pixels)
 		return false;
 
-	// Each ACTIVE view's rect must match its expected tile position. The
-	// inactive tail is deliberately not inspected — see above.
+	// Each ACTIVE view's rect must match its expected tile position, read in
+	// the caller's own Y origin (#1628). The swapchain == atlas test above is
+	// what makes a bottom-origin expectation meaningful, so it must stay
+	// ahead of this loop. The inactive tail is deliberately not inspected —
+	// see above.
 	for (uint32_t i = 0; i < mode->view_count; i++) {
 		if (!u_tiling_view_matches_tile(i, rect_xs[i], rect_ys[i],
-		                                rect_ws[i], rect_hs[i], mode))
+		                                rect_ws[i], rect_hs[i], mode, origin))
 			return false;
 	}
 

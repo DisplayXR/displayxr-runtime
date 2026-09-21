@@ -3371,8 +3371,12 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 							rws[v] = layer->data.proj.v[v].sub.rect.extent.w;
 							rhs[v] = layer->data.proj.v[v].sub.rect.extent.h;
 						}
+						// #1628: Metal addresses texel row 0 at the TOP, and a
+						// Metal app's MTLViewport.originY counts down, so the
+						// submitted offset.y is already top-origin.
 						if (u_tiling_can_zero_copy(vc, rxs, rys, rws, rhs,
-						                           msc->info.width, msc->info.height, mode)) {
+						                           msc->info.width, msc->info.height, mode,
+						                           U_TILING_ORIGIN_TOP_LEFT)) {
 							zero_copy = true;
 							zc_texture = msc->images[img_idx];
 						}
