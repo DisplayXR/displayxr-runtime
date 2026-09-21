@@ -304,8 +304,11 @@ enum comp_layer_blend_mode
 comp_layer_blend_mode(uint32_t layer_flags)
 {
 	if ((layer_flags & XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT) == 0) {
-		// The spec initialises the layer alpha to one: an opaque cover.
-		return COMP_LAYER_BLEND_REPLACE;
+		// The spec initialises the layer alpha to one: an opaque cover,
+		// in the alpha channel as much as in colour. NOT REPLACE —
+		// that mode writes the source alpha verbatim and belongs to the
+		// tile's base blit alone (#225).
+		return COMP_LAYER_BLEND_OPAQUE_COVER;
 	}
 
 	if ((layer_flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0) {

@@ -755,12 +755,18 @@ create_resources(struct comp_d3d11_renderer *r)
 /*!
  * The blend state that implements one shared blend mode (#1599).
  *
- * `blend_opaque` has blending DISABLED, so a REPLACE writes the source RGBA
- * verbatim. That is deliberate and load-bearing: the spec's "treat the layer
- * alpha as one" is a statement about coverage, and forcing dst.a to 1 here
- * would break the compose-under contract the first blit of a
- * transparent-background app depends on (#225). The colour channels are the
- * same either way.
+ * REPLACE and OPAQUE_COVER share `blend_opaque` (blending DISABLED, write mask
+ * ALL) and differ only in the ALPHA THE PIXEL SHADER EMITS:
+ *
+ *  - REPLACE is the tile's base blit and writes the source RGBA verbatim. That
+ *    is load-bearing: forcing dst.a to 1 there would break the compose-under
+ *    contract a transparent-background app's first blit depends on (#225).
+ *  - OPAQUE_COVER is a LATER unflagged layer, whose alpha the spec treats as
+ *    one; comp_layer_blend_fold_opaque_cover() makes the shader emit it (no
+ *    fixed-function blend factor can synthesise a constant one — see the enum).
+ *
+ * So every caller that can produce OPAQUE_COVER must fold the mode into its
+ * constant buffer as well as bind the state returned here.
  */
 static ID3D11BlendState *
 blend_state_for(struct comp_d3d11_renderer *r, enum comp_layer_blend_mode mode)
@@ -769,14 +775,21 @@ blend_state_for(struct comp_d3d11_renderer *r, enum comp_layer_blend_mode mode)
 	case COMP_LAYER_BLEND_PREMULTIPLIED: return r->blend_premul;
 	case COMP_LAYER_BLEND_STRAIGHT: return r->blend_alpha;
 	case COMP_LAYER_BLEND_REPLACE:
+	case COMP_LAYER_BLEND_OPAQUE_COVER:
 	default: return r->blend_opaque;
 	}
 }
 
+/*!
+ * @param mode How this layer composites; only used to fold OPAQUE_COVER's
+ *             alpha-of-one into the constant buffer. The CALLER binds the
+ *             matching blend state (blend_state_for()).
+ */
 static void
 render_projection_layer(struct comp_d3d11_renderer *r,
                         struct comp_layer *layer,
-                        uint32_t view_index)
+                        uint32_t view_index,
+                        enum comp_layer_blend_mode mode)
 {
 	auto internals = get_internals(r->c);
 
@@ -866,6 +879,11 @@ render_projection_layer(struct comp_d3d11_renderer *r,
 		constants.color_bias[2] = 0.0f;
 		constants.color_bias[3] = 0.0f;
 	}
+
+	// A LATER unflagged projection layer covers what is under it in alpha
+	// too (OpenXR 10.6.2). The shader is where that one comes from; the
+	// base blit (REPLACE) keeps the app's alpha verbatim for #225.
+	comp_layer_blend_fold_opaque_cover(mode, constants.color_scale, constants.color_bias);
 
 	// Map and update constant buffer
 	D3D11_MAPPED_SUBRESOURCE mapped;
@@ -1011,6 +1029,21 @@ render_quad_layer(struct comp_d3d11_renderer *r,
 
 	get_color_scale_bias(data, constants.color_scale, constants.color_bias);
 
+	// #1599: the SHARED three-way rule, not the inverted two-way test that
+	// used to live here (`(flags & SOURCE_ALPHA_BIT) == 0` read as
+	// "premultiplied") — that blended opaque quads and ignored
+	// UNPREMULTIPLIED_ALPHA_BIT entirely, which is exactly the combination
+	// the CTS SourceAlphaBlending case submits. A quad is never the tile's
+	// base cover, so it takes its own flags: the first-layer REPLACE gate
+	// (#1598) belongs to the full-tile projection blit alone.
+	//
+	// Resolved BEFORE the constant buffer is written because an unflagged
+	// quad is an OPAQUE_COVER, whose alpha-of-one is emitted by the shader
+	// (fixed-function blending cannot make a constant one) — the fold below
+	// is half of that mode, the blend state bound further down is the other.
+	const enum comp_layer_blend_mode mode = comp_layer_blend_mode(data->flags);
+	comp_layer_blend_fold_opaque_cover(mode, constants.color_scale, constants.color_bias);
+
 	// Update constant buffer
 	D3D11_MAPPED_SUBRESOURCE mapped;
 	HRESULT hr = internals.context->Map(r->constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
@@ -1029,14 +1062,7 @@ render_quad_layer(struct comp_d3d11_renderer *r,
 	internals.context->PSSetShaderResources(0, 1, &srv);
 	internals.context->PSSetSamplers(0, 1, &r->sampler_linear);
 
-	// #1599: the SHARED three-way rule, not the inverted two-way test that
-	// used to live here (`(flags & SOURCE_ALPHA_BIT) == 0` read as
-	// "premultiplied") — that blended opaque quads and ignored
-	// UNPREMULTIPLIED_ALPHA_BIT entirely, which is exactly the combination
-	// the CTS SourceAlphaBlending case submits. A quad is never the tile's
-	// base cover, so it takes its own flags: the first-layer REPLACE gate
-	// (#1598) belongs to the full-tile projection blit alone.
-	internals.context->OMSetBlendState(blend_state_for(r, comp_layer_blend_mode(data->flags)), nullptr, 0xFFFFFFFF);
+	internals.context->OMSetBlendState(blend_state_for(r, mode), nullptr, 0xFFFFFFFF);
 
 	// Draw quad (triangle strip, 4 vertices)
 	internals.context->Draw(4, 0);
@@ -1557,16 +1583,21 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
 				 * default, so the single-projection-layer
 				 * frame every shipping app submits issues the
 				 * exact same D3D11 call sequence as before.
+				 * OPAQUE_COVER shares that default state and
+				 * differs in the alpha the SHADER emits, which
+				 * render_projection_layer() folds in from the
+				 * mode — so the mode goes down with it.
 				 */
-				ID3D11BlendState *bs = blend_state_for(
-				    renderer, comp_layer_tile_blend_mode(&tile, layer->data.flags));
+				const enum comp_layer_blend_mode mode =
+				    comp_layer_tile_blend_mode(&tile, layer->data.flags);
+				ID3D11BlendState *bs = blend_state_for(renderer, mode);
 				if (bs != renderer->blend_opaque) {
 					internals.context->OMSetBlendState(bs, nullptr, 0xFFFFFFFF);
-					render_projection_layer(renderer, layer, view_index);
+					render_projection_layer(renderer, layer, view_index, mode);
 					internals.context->OMSetBlendState(renderer->blend_opaque, nullptr,
 					                                   0xFFFFFFFF);
 				} else {
-					render_projection_layer(renderer, layer, view_index);
+					render_projection_layer(renderer, layer, view_index, mode);
 				}
 				break;
 			}
@@ -1608,12 +1639,17 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
 				comp_layer_tile_mark_composited(&tile);
 				const bool unpremul =
 				    (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0;
-				internals.context->OMSetBlendState(
-				    unpremul ? renderer->blend_alpha : renderer->blend_premul, nullptr, 0xFFFFFFFF);
+				// Alpha-over either way, so never an OPAQUE_COVER:
+				// the mode passed down leaves the zone's alpha
+				// exactly as its texture had it.
+				const enum comp_layer_blend_mode zone_mode =
+				    unpremul ? COMP_LAYER_BLEND_STRAIGHT : COMP_LAYER_BLEND_PREMULTIPLIED;
+				internals.context->OMSetBlendState(blend_state_for(renderer, zone_mode), nullptr,
+				                                   0xFFFFFFFF);
 				// zone_3d.proj shares xrt_layer_projection_data's layout
 				// at union offset 0, so the projection draw body reads
 				// the right per-view sub/fov data unchanged.
-				render_projection_layer(renderer, layer, view_index);
+				render_projection_layer(renderer, layer, view_index, zone_mode);
 				internals.context->OMSetBlendState(renderer->blend_opaque, nullptr, 0xFFFFFFFF);
 				set_view_viewport(renderer, view_index, layout, target_width, target_height);
 				break;

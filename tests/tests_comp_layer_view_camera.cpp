@@ -1096,13 +1096,19 @@ TEST_CASE("comp_layer_blend_mode: the OpenXR 10.6.2 truth table, all four flag c
 	// is the case the D3D11 in-process renderer had INVERTED (#1599): it
 	// read `(flags & SOURCE_ALPHA) == 0` as "premultiplied" and blended
 	// exactly the layers that must not blend.
-	CHECK(comp_layer_blend_mode(0) == COMP_LAYER_BLEND_REPLACE);
+	//
+	// OPAQUE_COVER, never REPLACE: the flags cannot ask for the base blit's
+	// verbatim alpha. "Alpha is one" is a statement about the COMPOSITION
+	// result, so such a layer must raise dst.a where it draws; REPLACE
+	// would stamp the texture's own (possibly zero) alpha into the atlas
+	// and punch a hole in a transparent-background session.
+	CHECK(comp_layer_blend_mode(0) == COMP_LAYER_BLEND_OPAQUE_COVER);
 
 	// ... and UNPREMULTIPLIED on its own means nothing without it. That
 	// combination (unpremultiplied alpha, no source-alpha bit, alpha = 0
 	// texture) is precisely what the CTS SourceAlphaBlending case submits,
 	// and the old two-way rule turned it into a blend.
-	CHECK(comp_layer_blend_mode(kUnpremul) == COMP_LAYER_BLEND_REPLACE);
+	CHECK(comp_layer_blend_mode(kUnpremul) == COMP_LAYER_BLEND_OPAQUE_COVER);
 
 	CHECK(comp_layer_blend_mode(kSrcAlpha) == COMP_LAYER_BLEND_PREMULTIPLIED);
 	CHECK(comp_layer_blend_mode(kSrcAlpha | kUnpremul) == COMP_LAYER_BLEND_STRAIGHT);
@@ -1111,7 +1117,82 @@ TEST_CASE("comp_layer_blend_mode: the OpenXR 10.6.2 truth table, all four flag c
 	CHECK(comp_layer_blend_mode(kSrcAlpha | XRT_LAYER_COMPOSITION_VIEW_SPACE_BIT) ==
 	      COMP_LAYER_BLEND_PREMULTIPLIED);
 	CHECK(comp_layer_blend_mode(XRT_LAYER_COMPOSITION_CORRECT_CHROMATIC_ABERRATION_BIT) ==
-	      COMP_LAYER_BLEND_REPLACE);
+	      COMP_LAYER_BLEND_OPAQUE_COVER);
+
+	// No flag combination reaches the base-blit mode.
+	for (uint32_t flags : {0u, kSrcAlpha, kUnpremul, kSrcAlpha | kUnpremul}) {
+		CHECK(comp_layer_blend_mode(flags) != COMP_LAYER_BLEND_REPLACE);
+	}
+}
+
+TEST_CASE("comp_layer_blend_fold_opaque_cover: the alpha-of-one the shader emits")
+{
+	// The D3D11 blend state for OPAQUE_COVER is blending OFF, which writes
+	// src.a — so the one has to come out of the pixel shader. Every layer
+	// shader ends in `color * color_scale + color_bias`; this is that fold.
+	SECTION("OPAQUE_COVER zeroes the alpha scale and biases it to one")
+	{
+		float scale[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+		float bias[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+		comp_layer_blend_fold_opaque_cover(COMP_LAYER_BLEND_OPAQUE_COVER, scale, bias);
+
+		CHECK(scale[3] == 0.0f);
+		CHECK(bias[3] == 1.0f);
+
+		// out.a = src.a * 0 + 1 == 1 for ANY source alpha, which is the
+		// property no fixed-function blend factor can provide.
+		for (float src_a : {0.0f, 0.25f, 1.0f}) {
+			CHECK(src_a * scale[3] + bias[3] == 1.0f);
+		}
+
+		// Colour is untouched: this mode covers, it does not recolour.
+		CHECK(scale[0] == 1.0f);
+		CHECK(scale[1] == 1.0f);
+		CHECK(scale[2] == 1.0f);
+		CHECK(bias[0] == 0.0f);
+		CHECK(bias[1] == 0.0f);
+		CHECK(bias[2] == 0.0f);
+	}
+
+	SECTION("it overrides an app's own alpha scale/bias, which is the spec order")
+	{
+		// XR_KHR_composition_layer_color_scale_bias applies to the
+		// SOURCE; the layer alpha is then treated as one at composition
+		// time. So the app's alpha scale cannot survive here.
+		float scale[4] = {0.5f, 0.5f, 0.5f, 0.5f};
+		float bias[4] = {0.1f, 0.1f, 0.1f, 0.25f};
+		comp_layer_blend_fold_opaque_cover(COMP_LAYER_BLEND_OPAQUE_COVER, scale, bias);
+
+		CHECK(scale[3] == 0.0f);
+		CHECK(bias[3] == 1.0f);
+		// ... while the colour scale/bias it asked for still applies.
+		CHECK(scale[0] == 0.5f);
+		CHECK(bias[0] == 0.1f);
+	}
+
+	SECTION("every other mode is left alone — REPLACE especially (#225)")
+	{
+		for (enum comp_layer_blend_mode mode :
+		     {COMP_LAYER_BLEND_REPLACE, COMP_LAYER_BLEND_PREMULTIPLIED, COMP_LAYER_BLEND_STRAIGHT}) {
+			float scale[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+			float bias[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+			comp_layer_blend_fold_opaque_cover(mode, scale, bias);
+
+			// The base blit's alpha reaches the atlas verbatim.
+			CHECK(scale[3] == 1.0f);
+			CHECK(bias[3] == 0.0f);
+		}
+	}
+
+	SECTION("a null buffer is a no-op, not a crash")
+	{
+		float scale[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+		float bias[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+		comp_layer_blend_fold_opaque_cover(COMP_LAYER_BLEND_OPAQUE_COVER, nullptr, bias);
+		comp_layer_blend_fold_opaque_cover(COMP_LAYER_BLEND_OPAQUE_COVER, scale, nullptr);
+		CHECK(scale[3] == 1.0f);
+		CHECK(bias[3] == 0.0f);
+	}
 }
 
 TEST_CASE("comp_layer_quad_is_front_facing: +Z is the front face (#1590)")
@@ -1192,8 +1273,23 @@ TEST_CASE("comp_layer_tile_blend_mode: the first layer into a tile REPLACES, wha
 		CHECK(comp_layer_tile_blend_mode(&tile, kSrcAlpha | kUnpremul) == COMP_LAYER_BLEND_STRAIGHT);
 		// Layer 3: no blend bit — legitimately covers what is under it
 		// (§10.6.2: alpha initialised to one). NOT privileged as a base
-		// layer, just opaque.
-		CHECK(comp_layer_tile_blend_mode(&tile, 0) == COMP_LAYER_BLEND_REPLACE);
+		// layer, just opaque: an OPAQUE_COVER, which raises dst.a to
+		// one, and NOT a second REPLACE, which would write the
+		// texture's own alpha over content that is already there.
+		CHECK(comp_layer_tile_blend_mode(&tile, 0) == COMP_LAYER_BLEND_OPAQUE_COVER);
+	}
+
+	SECTION("the same flags mean different things first and later")
+	{
+		// The defect this split fixes: an unflagged overlay quad used to
+		// take the base blit's verbatim-alpha mode, so a texture with
+		// alpha 0 punched a hole through the projection layer under it
+		// and disappeared at the DP's alpha gate.
+		for (uint32_t flags : {0u, kUnpremul}) {
+			struct comp_layer_tile_state tile = {};
+			CHECK(comp_layer_tile_blend_mode(&tile, flags) == COMP_LAYER_BLEND_REPLACE);
+			CHECK(comp_layer_tile_blend_mode(&tile, flags) == COMP_LAYER_BLEND_OPAQUE_COVER);
+		}
 	}
 
 	SECTION("tiles are independent: view 1 starts fresh")
