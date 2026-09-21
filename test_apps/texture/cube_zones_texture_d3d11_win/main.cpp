@@ -726,7 +726,11 @@ static void PresentAndMaybeDump(RenderState& rs) {
 
     if (rs.appBackBufferRTV) {
         float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-        ClearRenderTargetViewDisplayReferred(renderer, rs.appBackBufferRTV.Get(), clearColor);
+        // Raw clear ON PURPOSE: this is the app's own UNORM window back buffer, not
+        // an XR swapchain. ClearRenderTargetViewDisplayReferred() decodes on the
+        // process-wide dxr::RenderSceneLinear() flag, not on this view's format, so
+        // it would DARKEN a UNORM target.
+        renderer.context->ClearRenderTargetView(rs.appBackBufferRTV.Get(), clearColor);
         BlitSharedTextureToBackBuffer(renderer, rs.appBackBufferRTV.Get(),
                                       g_windowWidth, g_windowHeight);
         if (rs.appSwapchain) rs.appSwapchain->Present(1, 0);
