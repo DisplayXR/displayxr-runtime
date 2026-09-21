@@ -412,8 +412,14 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   ```
 
   `DxrAliasInactiveViews()` lives in `test_apps/common/dxr_view_config.h` and every in-tree
-  app uses it. `activity.activeViewCount` is the runtime's own answer for how many views are
+  app uses it; apps outside this repo take the same helper from displayxr-common's
+  `dxr_view_config.h` (`displayxr::rules`) rather than pasting a copy.
+  `activity.activeViewCount` is the runtime's own answer for how many views are
   live this frame — prefer it to deriving the number from the rendering mode.
+
+  **Every leg of a multi-platform app needs its own call.** `check_displayxr_app.py` checks
+  INV-3.4 per top-level platform directory (`windows/`, `macos/`, `linux/`, `android/`, …):
+  one leg adopting the helper does not cover another that still under-submits (#1612).
 
   Two consequences that catch people:
   - **A 3D zone layer is a projection layer.** `XR_DXR_display_zones` submits each 3D zone as
