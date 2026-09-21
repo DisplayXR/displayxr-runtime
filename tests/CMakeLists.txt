@@ -35,6 +35,7 @@ set(tests
     tests_comp_zone_tier1
     tests_comp_swapchain_ring
     tests_aux_bg_neutrality
+    tests_aux_color_encoding
     tests_aux_rear_budget
     tests_aux_route_policy
     tests_aux_overlay_lease
