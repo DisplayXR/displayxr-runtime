@@ -9879,6 +9879,29 @@ vk_update_present_origin(struct comp_vk_native_compositor *c)
 		c->have_last_window_size = true;
 	}
 
+	/*
+	 * Feed the window's TRUE origin, always. The runtime never quantises it.
+	 *
+	 * There WAS a "belt-and-braces" snap here (#1588), on the theory that
+	 * re-snapping a fed origin could only ever correct a metrics read that
+	 * caught an already-snapped window mid-flight. Hardware said otherwise: on
+	 * the DS1 with a real Leia DP, a 16-step drag fed an origin that differed
+	 * from the true window origin on 12 of 13 logged moves, by up to 2 px — e.g.
+	 * window at panel-relative (726, 314), weaver told (726, 316). That is pure
+	 * phase error against the lens, the exact failure the block's own comment
+	 * described and claimed to avoid.
+	 *
+	 * It could not have worked. It anchored each snap at its OWN previous
+	 * output, not at the drag origin the window owner used, so it ran a second
+	 * snap chain whose reference drifted away from the app's; and it had no way
+	 * to tell "our read caught the window mid-flight" from "the window is
+	 * genuinely off-lattice", which is the premise the guard needed and cannot
+	 * have. Only the window owner knows where the window is going, so only the
+	 * window owner may snap it — through
+	 * comp_vk_native_compositor_snap_window_rect / xrWeaveSnapWindowRectDXR,
+	 * before it moves. The compositor's job is to report where the window
+	 * actually is.
+	 */
 	const int ox = m.window_screen_left - m.display_screen_left;
 	const int oy = m.window_screen_top - m.display_screen_top;
 	// Origin changed ⟹ the window is being dragged: have the target clamp
@@ -9893,10 +9916,12 @@ vk_update_present_origin(struct comp_vk_native_compositor *c)
 	// one line that lets an unattended run prove WHICH origin reached the weaver
 	// — nothing downstream prints it (the DP setter stores it silently and the
 	// SDK call logs only on failure). INFO, never WARN: this fires on every
-	// pixel of a drag.
+	// pixel of a drag. It prints the window origin unmodified; there is no
+	// "snapped from" variant any more, because a divergence here would be a bug,
+	// not a feature to annotate.
 	if (!c->have_last_present_origin || ox != c->last_present_origin_x || oy != c->last_present_origin_y) {
-		U_LOG_I("present origin: (%d, %d) = window (%d, %d) %ux%u - panel (%d, %d) %ux%u",
-		        ox, oy, m.window_screen_left, m.window_screen_top, m.window_pixel_width, m.window_pixel_height,
+		U_LOG_I("present origin: (%d, %d) = window (%d, %d) %ux%u - panel (%d, %d) %ux%u", ox, oy,
+		        m.window_screen_left, m.window_screen_top, m.window_pixel_width, m.window_pixel_height,
 		        m.display_screen_left, m.display_screen_top, m.display_pixel_width, m.display_pixel_height);
 	}
 	c->last_present_origin_x = ox;
@@ -10091,6 +10116,41 @@ comp_vk_native_compositor_set_wayland_surface_geometry(struct xrt_compositor *xc
 	(void)refresh_mhz;
 	return false;
 #endif
+}
+
+bool
+comp_vk_native_compositor_snap_window_rect(struct xrt_compositor *xc,
+                                           int32_t origin_x,
+                                           int32_t origin_y,
+                                           int32_t target_x,
+                                           int32_t target_y,
+                                           int32_t *out_x,
+                                           int32_t *out_y)
+{
+	if (out_x == NULL || out_y == NULL) {
+		return false;
+	}
+	// Identity default — the caller may use the outputs whatever we return.
+	*out_x = target_x;
+	*out_y = target_y;
+	if (xc == NULL) {
+		return false;
+	}
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	if (c->display_processor == NULL) {
+		return false;
+	}
+	// Pure query: the DP computes, we do not move anything here. Whoever owns
+	// the window does the moving (that is the whole point — a snapped ORIGIN
+	// fed to a window that did not move would displace the interlace against
+	// the lens, which is worse than not snapping at all).
+	//
+	// The app's coordinates go through verbatim. The slot canonicalises
+	// target-minus-origin and snaps from there, so the absolute frame cancels;
+	// what must hold is that both points share one frame of DEVICE pixels, and
+	// they do — they came from the same caller in the same call.
+	return xrt_display_processor_vk_snap_window_rect((struct xrt_display_processor_vk *)c->display_processor,
+	                                                 origin_x, origin_y, target_x, target_y, out_x, out_y);
 }
 
 struct vk_bundle *

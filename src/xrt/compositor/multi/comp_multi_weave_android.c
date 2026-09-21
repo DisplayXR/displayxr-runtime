@@ -2423,9 +2423,10 @@ comp_multi_weave_snap_window_rect(struct xrt_compositor *xc,
                                   int32_t *out_snapped_y)
 {
 	// Identity snap: on Android the app does not drag its own window pixel by
-	// pixel (the window manager does), and the VK DP vtable carries no snap slot
-	// — the per-window phase contract is set_window_screen_rect instead, which
-	// reports geometry and leaves ALL phase to the weaver (ADR-033).
+	// pixel (the window manager does), so there is nothing to snap. The VK DP
+	// vtable does carry a snap slot since #1588, but Android's per-window phase
+	// contract is set_window_screen_rect, which reports geometry and leaves ALL
+	// phase to the weaver (ADR-033).
 	(void)xc;
 	(void)origin_x;
 	(void)origin_y;

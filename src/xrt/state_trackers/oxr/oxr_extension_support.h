@@ -726,9 +726,21 @@
  * comp_multi Vulkan weave engine, IOSurface transport, synchronous completion
  * (#759). Android: the same comp_multi Vulkan weave engine with AHardwareBuffer
  * transport and explicit window geometry (spec v7, #1036).
+ *
+ * Desktop Linux (#1588) is the SNAP-ONLY platform: there is no weave service at
+ * all — no bind, no submit, no output/fence transport — and those entry points
+ * report XR_ERROR_FEATURE_UNSUPPORTED exactly as an in-process session does
+ * everywhere else. What Linux does have is a window owner (an X11 handle app,
+ * or the service's present owner) that must place its own window on the lens
+ * lattice while it drags, so xrWeaveSnapWindowRectDXR is routed through to the
+ * Vulkan DP's snap_window_rect slot. Spec §5c says so normatively; the
+ * extension is advertised because that one call is genuinely available, and
+ * withholding it would leave the app no way to ask. Gate on "Linux AND NOT
+ * Android" (the XRT_OS_LINUX_DESKTOP pattern), like XR_DXR_xlib_window_binding
+ * — Android also defines XRT_OS_LINUX and has its own arm above.
  */
-#if defined(XR_DXR_weave) &&                                                                                           \
-    (defined(XR_USE_PLATFORM_WIN32) || defined(XR_USE_PLATFORM_MACOS) || defined(XR_USE_PLATFORM_ANDROID))
+#if defined(XR_DXR_weave) && (defined(XR_USE_PLATFORM_WIN32) || defined(XR_USE_PLATFORM_MACOS) ||                      \
+                              defined(XR_USE_PLATFORM_ANDROID) || (defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)))
 #define OXR_HAVE_DXR_weave
 #define OXR_EXTENSION_SUPPORT_DXR_weave(_) \
     _(DXR_weave, DXR_WEAVE)
