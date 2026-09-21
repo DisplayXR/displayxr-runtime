@@ -48,8 +48,26 @@ struct comp_vk_native_swapchain
 	//! VkDeviceMemory for each image.
 	VkDeviceMemory memories[MAX_SWAPCHAIN_IMAGES];
 
-	//! VkImageViews for sampling.
+	//! VkImageViews for sampling in @ref raw_format — NON-decoding, the
+	//! UNORM sibling for an sRGB swapchain. Model A / the blit path.
 	VkImageView views[MAX_SWAPCHAIN_IMAGES];
+
+	/*!
+	 * VkImageViews in the format the APP ASKED FOR (#1589/#1610).
+	 *
+	 * The compose render pass composites in LINEAR light, so it wants the
+	 * GPU to decode an `_SRGB` source on sample — the opposite of what
+	 * @ref views does. For a non-sRGB swapchain these are the same format
+	 * and the two arrays are interchangeable; for an sRGB one this is the
+	 * only view that reads the app's bytes as what they are.
+	 *
+	 * Creatable in every case because #1559/#1572 already set
+	 * MUTABLE_FORMAT plus a two-entry format list on exactly the
+	 * swapchains that need it, so an sRGB view is legal even when the
+	 * IMAGE is the UNORM sibling (which it is whenever the true-format
+	 * feature is off).
+	 */
+	VkImageView true_views[MAX_SWAPCHAIN_IMAGES];
 
 	//! Number of images.
 	uint32_t image_count;
@@ -221,6 +239,10 @@ vk_swapchain_destroy(struct xrt_swapchain *xsc)
 	struct vk_bundle *vk = sc->vk;
 
 	for (uint32_t i = 0; i < sc->image_count; i++) {
+		if (sc->true_views[i] != VK_NULL_HANDLE) {
+			vk->vkDestroyImageView(vk->device, sc->true_views[i], NULL);
+			sc->true_views[i] = VK_NULL_HANDLE;
+		}
 		if (sc->views[i] != VK_NULL_HANDLE) {
 			vk->vkDestroyImageView(vk->device, sc->views[i], NULL);
 		}
@@ -504,6 +526,20 @@ comp_vk_native_swapchain_create(struct comp_vk_native_compositor *c,
 			U_LOG_W("Failed to create image view for swapchain %u: %d", i, res);
 		}
 
+		/*
+		 * The TRUE-format twin (#1589/#1610): the format the APP asked
+		 * for, so the compose render pass gets the GPU to decode an
+		 * `_SRGB` source to linear on sample. Identical to the view
+		 * above for every non-sRGB swapchain — created anyway so the
+		 * pass never has to ask which array to use.
+		 */
+		view_ci.format = vk_format;
+		res = vk->vkCreateImageView(vk->device, &view_ci, NULL, &sc->true_views[i]);
+		if (res != VK_SUCCESS) {
+			U_LOG_W("Failed to create true-format image view for swapchain %u: %d", i, res);
+			sc->true_views[i] = VK_NULL_HANDLE;
+		}
+
 		// Populate xrt_swapchain_vk.images[] so vk_enumerate_images can return them
 		sc->base.images[i] = sc->images[i];
 	}
@@ -545,6 +581,36 @@ comp_vk_native_swapchain_get_image_view(struct xrt_swapchain *xsc, uint32_t inde
 		return 0;
 	}
 	return (uint64_t)(uintptr_t)sc->views[index];
+}
+
+uint64_t
+comp_vk_native_swapchain_get_true_image_view(struct xrt_swapchain *xsc, uint32_t index)
+{
+	struct comp_vk_native_swapchain *sc = vk_sc(xsc);
+	if (index >= sc->image_count) {
+		return 0;
+	}
+	// Fall back to the non-decoding view if the true-format one could not be
+	// created: passthrough is wrong for colour but is what the blit path has
+	// always done, which is a better failure than sampling nothing.
+	if (sc->true_views[index] == VK_NULL_HANDLE) {
+		return (uint64_t)(uintptr_t)sc->views[index];
+	}
+	return (uint64_t)(uintptr_t)sc->true_views[index];
+}
+
+bool
+comp_vk_native_swapchain_is_srgb(struct xrt_swapchain *xsc)
+{
+	if (xsc == NULL) {
+		return false;
+	}
+	struct comp_vk_native_swapchain *sc = vk_sc(xsc);
+	// The format the APP REQUESTED, never the IMAGE's: the image is the
+	// UNORM sibling whenever the true-format feature is off, and
+	// `true_srgb` answers about the image, not about the app's intent.
+	const VkFormat f = xrt_format_to_vk(sc->info.format);
+	return f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FORMAT_B8G8R8A8_SRGB;
 }
 
 uint64_t

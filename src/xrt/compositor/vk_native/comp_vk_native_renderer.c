@@ -198,6 +198,34 @@ struct comp_vk_native_renderer
 		 */
 		VkPipeline pipelines[VK_COMPOSE_BLEND_COUNT][VK_COMPOSE_SAMPLER_COUNT];
 		VkDescriptorPool descriptor_pool;
+
+		/*!
+		 * @name The private compose target (#1589/#1610)
+		 *
+		 * The pass does NOT render into the atlas. It renders into a
+		 * runtime-private image of the SAME format, created
+		 * MUTABLE_FORMAT with a {UNORM, SRGB} format list, through its
+		 * **_SRGB** view — so the fixed-function blender decodes,
+		 * blends in LINEAR light and re-encodes on write, which is what
+		 * OpenXR specifies and what the CTS reference images are. The
+		 * result is then handed to the atlas with vkCmdCopyImage:
+		 * identical formats, so raw bytes, NO conversion.
+		 *
+		 * Deliberately a copy and never a blit — vkCmdBlitImage
+		 * CONVERTS between sRGB and UNORM, which would apply the encode
+		 * a second time.
+		 *
+		 * The atlas itself is untouched: same image, same UNORM format,
+		 * same ENCODED bytes, same `process_atlas` format argument. No
+		 * DP change, no plug-in ABI change.
+		 * @{
+		 */
+		VkImage compose_image;
+		VkDeviceMemory compose_memory;
+		VkImageView compose_view;   //!< _SRGB — the render-pass attachment.
+		uint32_t compose_w, compose_h;
+		//! @}
+
 		bool ready;
 		bool failed; //!< init failed once — stay on the blit fallback
 	} zone;
@@ -305,6 +333,42 @@ compose_layer_view_count(const struct comp_layer *layer, const struct comp_vk_na
 	return n == 0 ? 1 : n;
 }
 
+/*!
+ * Is every colour source this frame already an honest `_SRGB` swapchain?
+ *
+ * The blit fast path passes bytes through unchanged, which is only correct
+ * when the app already encoded them. A UNORM swapchain holds LINEAR values
+ * (ADR-021 §6, and OpenXR: "All other formats will be treated as linear
+ * values"), so passing those through to a display processor that is handed
+ * ENCODED bytes renders them far too dark. Such a frame has to take the
+ * render pass, where the _SRGB attachment applies the encode.
+ *
+ * Asks the app's REQUESTED format, never the image's.
+ */
+static bool
+compose_frame_source_is_srgb(const struct comp_layer_accum *layers)
+{
+	if (layers == NULL) {
+		return false;
+	}
+	for (uint32_t i = 0; i < layers->layer_count; i++) {
+		const struct comp_layer *layer = &layers->layers[i];
+		if (!compose_pass_draws_layer(layer)) {
+			continue;
+		}
+		for (uint32_t v = 0; v < XRT_MAX_VIEWS; v++) {
+			struct xrt_swapchain *xsc = layer->sc_array[v];
+			if (xsc == NULL) {
+				continue;
+			}
+			if (!comp_vk_native_swapchain_is_srgb(xsc)) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
 //! How many layers this frame would the compose pass actually draw?
 static uint32_t
 compose_pass_layer_count(const struct comp_layer_accum *layers)
@@ -334,6 +398,27 @@ zone_draw_destroy_framebuffer(struct comp_vk_native_renderer *r)
 		r->zone.fb_view[i] = VK_NULL_HANDLE;
 	}
 	r->zone.framebuffer = VK_NULL_HANDLE;
+}
+
+//! Drop the private compose target (it is sized to the atlas allocation).
+static void
+zone_compose_target_destroy(struct comp_vk_native_renderer *r)
+{
+	struct vk_bundle *vk = r->vk;
+	if (r->zone.compose_view != VK_NULL_HANDLE) {
+		vk->vkDestroyImageView(vk->device, r->zone.compose_view, NULL);
+		r->zone.compose_view = VK_NULL_HANDLE;
+	}
+	if (r->zone.compose_image != VK_NULL_HANDLE) {
+		vk->vkDestroyImage(vk->device, r->zone.compose_image, NULL);
+		r->zone.compose_image = VK_NULL_HANDLE;
+	}
+	if (r->zone.compose_memory != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, r->zone.compose_memory, NULL);
+		r->zone.compose_memory = VK_NULL_HANDLE;
+	}
+	r->zone.compose_w = 0;
+	r->zone.compose_h = 0;
 }
 
 static void
@@ -813,15 +898,21 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
 
 	// Render pass: clear the whole atlas (zones frames own the frame's 3D
 	// content), end in SHADER_READ_ONLY for the display processor.
+	/*
+	 * The attachment is the PRIVATE compose target's _SRGB view, not the
+	 * atlas — so the blender works in linear light (#1610) and the encode
+	 * happens on write. `finalLayout` is TRANSFER_SRC because the pass is
+	 * followed by a raw vkCmdCopyImage into the (UNORM, ENCODED) atlas.
+	 */
 	VkAttachmentDescription attachment = {
-	    .format = r->format,
+	    .format = VK_FORMAT_B8G8R8A8_SRGB,
 	    .samples = VK_SAMPLE_COUNT_1_BIT,
 	    .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
 	    .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
 	    .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
 	    .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
 	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-	    .finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	    .finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 	};
 
 	VkAttachmentReference color_ref = {
@@ -848,9 +939,9 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
 	        .srcSubpass = 0,
 	        .dstSubpass = VK_SUBPASS_EXTERNAL,
 	        .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-	        .dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+	        .dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT,
 	        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-	        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+	        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
 	    },
 	};
 
@@ -1124,62 +1215,143 @@ deposit_chain_signal(struct comp_vk_native_renderer *r,
 	}
 }
 
-//! (Re)create the framebuffer over the current atlas view.
+/*!
+ * Create (or resize) the private compose target — see the struct comment.
+ *
+ * Same format as the atlas, MUTABLE_FORMAT with a {UNORM, SRGB} format list,
+ * viewed as _SRGB. A/B'd on MoltenVK against a natively-_SRGB image: both
+ * blend 50% linear white over linear black to byte 188 (linear blending), and
+ * the two routes are byte-identical, so the mutable-view route is sound on
+ * that driver. Re-run that check on a new GPU vendor or driver stack.
+ */
+static bool
+zone_compose_target_ensure(struct comp_vk_native_renderer *r)
+{
+	struct vk_bundle *vk = r->vk;
+	const uint32_t w = r->atlas_alloc_width;
+	const uint32_t h = r->atlas_alloc_height;
+	if (w == 0 || h == 0) {
+		return false;
+	}
+	if (r->zone.compose_image != VK_NULL_HANDLE && r->zone.compose_w == w && r->zone.compose_h == h) {
+		return true;
+	}
+	zone_compose_target_destroy(r);
+
+	VkFormat list[2] = {VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_SRGB};
+	VkImageFormatListCreateInfo fmt_list = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
+	    .viewFormatCount = 2,
+	    .pViewFormats = list,
+	};
+	VkImageCreateInfo ici = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+	    .pNext = &fmt_list,
+	    .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
+	    .imageType = VK_IMAGE_TYPE_2D,
+	    .format = VK_FORMAT_B8G8R8A8_UNORM,
+	    .extent = {w, h, 1},
+	    .mipLevels = 1,
+	    .arrayLayers = 1,
+	    .samples = VK_SAMPLE_COUNT_1_BIT,
+	    .tiling = VK_IMAGE_TILING_OPTIMAL,
+	    .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	};
+	VkResult res = vk->vkCreateImage(vk->device, &ici, NULL, &r->zone.compose_image);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("VK compose: failed to create the private compose target: %d", res);
+		zone_compose_target_destroy(r);
+		return false;
+	}
+	VkMemoryRequirements mr;
+	vk->vkGetImageMemoryRequirements(vk->device, r->zone.compose_image, &mr);
+	uint32_t type_id = 0;
+	if (!vk_get_memory_type(vk, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &type_id)) {
+		U_LOG_E("VK compose: no device-local memory type for the compose target");
+		zone_compose_target_destroy(r);
+		return false;
+	}
+	VkMemoryAllocateInfo mai = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+	    .allocationSize = mr.size,
+	    .memoryTypeIndex = type_id,
+	};
+	res = vk->vkAllocateMemory(vk->device, &mai, NULL, &r->zone.compose_memory);
+	if (res == VK_SUCCESS) {
+		res = vk->vkBindImageMemory(vk->device, r->zone.compose_image, r->zone.compose_memory, 0);
+	}
+	if (res != VK_SUCCESS) {
+		U_LOG_E("VK compose: failed to back the compose target: %d", res);
+		zone_compose_target_destroy(r);
+		return false;
+	}
+	VkImageViewCreateInfo vci = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+	    .image = r->zone.compose_image,
+	    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+	    .format = VK_FORMAT_B8G8R8A8_SRGB,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	res = vk->vkCreateImageView(vk->device, &vci, NULL, &r->zone.compose_view);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("VK compose: failed to create the compose target's _SRGB view: %d", res);
+		zone_compose_target_destroy(r);
+		return false;
+	}
+	r->zone.compose_w = w;
+	r->zone.compose_h = h;
+	U_LOG_W("VK compose: private linear-blend target %ux%u (UNORM+MUTABLE, _SRGB view) ready", w, h);
+	return true;
+}
+
 static bool
 zone_draw_ensure_framebuffer(struct comp_vk_native_renderer *r)
 {
 	struct vk_bundle *vk = r->vk;
 
-	if (r->atlas_view == VK_NULL_HANDLE) {
+	/*
+	 * The attachment is the PRIVATE compose target, not the atlas.
+	 *
+	 * That collapses what used to be a per-atlas-view framebuffer cache:
+	 * the atlas view alternates every frame on the VK-0 deposit ring
+	 * (#1178), so the old code kept one framebuffer per ring slot to avoid
+	 * rebuilding it on the render path. The compose target is owned by this
+	 * renderer and stable across the ring, so there is exactly one
+	 * framebuffer and it only changes when the atlas ALLOCATION changes.
+	 */
+	if (!zone_compose_target_ensure(r)) {
 		return false;
 	}
 
-	// Already have one for this view? (Always true after the first zones
-	// frame on the owned atlas; alternates between two entries on the
-	// VK-0 deposit ring.)
-	for (uint32_t i = 0; i < COMP_VK_DEPOSIT_RING; i++) {
-		if (r->zone.fb[i] != VK_NULL_HANDLE && r->zone.fb_view[i] == r->atlas_view) {
-			r->zone.framebuffer = r->zone.fb[i];
-			return true;
-		}
+	if (r->zone.fb[0] != VK_NULL_HANDLE && r->zone.fb_view[0] == r->zone.compose_view) {
+		r->zone.framebuffer = r->zone.fb[0];
+		return true;
 	}
-
-	uint32_t slot = 0;
-	bool found_free = false;
-	for (uint32_t i = 0; i < COMP_VK_DEPOSIT_RING; i++) {
-		if (r->zone.fb[i] == VK_NULL_HANDLE) {
-			slot = i;
-			found_free = true;
-			break;
-		}
-	}
-	if (!found_free) {
-		// Cache is sized to the ring, so this is unreachable in practice;
-		// evict rather than leak if the atlas view set ever grows.
+	if (r->zone.fb[0] != VK_NULL_HANDLE) {
 		vk->vkDestroyFramebuffer(vk->device, r->zone.fb[0], NULL);
 		r->zone.fb[0] = VK_NULL_HANDLE;
 		r->zone.fb_view[0] = VK_NULL_HANDLE;
-		slot = 0;
 	}
 
 	VkFramebufferCreateInfo fb_ci = {
 	    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
 	    .renderPass = r->zone.render_pass,
 	    .attachmentCount = 1,
-	    .pAttachments = &r->atlas_view,
-	    .width = r->atlas_alloc_width,
-	    .height = r->atlas_alloc_height,
+	    .pAttachments = &r->zone.compose_view,
+	    .width = r->zone.compose_w,
+	    .height = r->zone.compose_h,
 	    .layers = 1,
 	};
 
-	VkResult res = vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &r->zone.fb[slot]);
+	VkResult res = vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &r->zone.fb[0]);
 	if (res != VK_SUCCESS) {
-		U_LOG_E("VK zones: failed to create framebuffer: %d", res);
-		r->zone.fb[slot] = VK_NULL_HANDLE;
+		U_LOG_E("VK compose: failed to create framebuffer: %d", res);
+		r->zone.fb[0] = VK_NULL_HANDLE;
 		return false;
 	}
-	r->zone.fb_view[slot] = r->atlas_view;
-	r->zone.framebuffer = r->zone.fb[slot];
+	r->zone.fb_view[0] = r->zone.compose_view;
+	r->zone.framebuffer = r->zone.fb[0];
 	return true;
 }
 
@@ -1436,9 +1608,21 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 					continue;
 				}
 			}
+			/*
+			 * Sample through the view in the format the APP ASKED
+			 * FOR, so the GPU DECODES an `_SRGB` source to linear
+			 * and passes a UNORM one through as the linear values
+			 * it holds (#1589). The pass composites in linear light
+			 * and the attachment re-encodes on write, so this is the
+			 * read half of a matched pair — never a lone decode.
+			 *
+			 * The blit fast path keeps using the non-decoding view
+			 * and #1572's UNORM scratch; neither is wired in here,
+			 * and wiring them in would double-encode.
+			 */
 			VkImageView src_view =
-			    (VkImageView)(uintptr_t)comp_vk_native_swapchain_get_image_view(xsc,
-			                                                                    sub->image_index);
+			    (VkImageView)(uintptr_t)comp_vk_native_swapchain_get_true_image_view(
+			        xsc, sub->image_index);
 			if (src_view == VK_NULL_HANDLE) {
 				continue;
 			}
@@ -1642,6 +1826,39 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 
 	vk->vkCmdEndRenderPass(cmd);
 
+	/*
+	 * Hand the composed frame to the atlas: a RAW COPY, never a blit.
+	 *
+	 * Both images are VK_FORMAT_B8G8R8A8_UNORM, so vkCmdCopyImage moves
+	 * bytes with no conversion of any kind — which is the whole point. The
+	 * private target's _SRGB VIEW already did the encode on write, so the
+	 * atlas receives display-referred bytes exactly as it always has.
+	 * vkCmdBlitImage here would CONVERT between the sRGB and UNORM
+	 * interpretations and apply the encode a second time.
+	 *
+	 * The atlas is unchanged in every respect a consumer can observe:
+	 * same image, same UNORM format, same ENCODED contents, same value
+	 * reported to the display processor. No DP change, no ABI change.
+	 */
+	cmd_image_barrier(vk, cmd, r->atlas_image, VK_IMAGE_LAYOUT_UNDEFINED,
+	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+	                   VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+	VkImageCopy copy = {
+	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .srcOffset = {0, 0, 0},
+	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .dstOffset = {0, 0, 0},
+	    .extent = {r->zone.compose_w, r->zone.compose_h, 1},
+	};
+	vk->vkCmdCopyImage(cmd, r->zone.compose_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r->atlas_image,
+	                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+
+	cmd_image_barrier(vk, cmd, r->atlas_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+	                   VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+
 	// Hand the source images back to the apps' steady-state layout.
 	for (uint32_t t = 0; t < transitioned_count; t++) {
 		cmd_image_barrier(vk, cmd, transitioned[t],
@@ -1748,14 +1965,20 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	 * how "the pass reproduces the blit" is checked at all, since every
 	 * other frame takes one path or the other and never both.
 	 *
-	 * NOT gated on colour yet. #1589/#1610 will add "…and the source is
-	 * already _SRGB" to the fast path, because a UNORM source will then
-	 * need the pass to encode it. Today both paths produce identical bytes,
-	 * so adding that clause now would push single-layer UNORM frames — i.e.
-	 * most of the app population — onto the new path for no benefit.
+	 * GATED ON COLOUR (#1589). A single UNORM layer can no longer take the
+	 * blit: the blit passes bytes through, and a UNORM swapchain holds
+	 * LINEAR values that the display processor — which is handed ENCODED
+	 * bytes — would render far too dark. Only a source that is already
+	 * `_SRGB` is safe to pass through, and that is exactly the app
+	 * population the migration is moving everything to. The cost is honest:
+	 * a legacy UNORM app loses the fast path until it asks for the `_SRGB`
+	 * sibling, which is one more reason to migrate rather than to sit on
+	 * the old behaviour.
 	 */
 	const uint32_t drawable = compose_pass_layer_count(layers);
-	const bool want_pass = zones_frame || drawable > 1 || debug_get_bool_option_vk_force_compose_pass();
+	const bool colour_needs_pass = !compose_frame_source_is_srgb(layers);
+	const bool want_pass =
+	    zones_frame || drawable > 1 || colour_needs_pass || debug_get_bool_option_vk_force_compose_pass();
 
 	if (want_pass && zone_pass_usable(r, layers, layout)) {
 		return draw_zones_pass(r, layers, target_width, target_height, layout);

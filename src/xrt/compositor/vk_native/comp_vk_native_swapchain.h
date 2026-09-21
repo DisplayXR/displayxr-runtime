@@ -62,6 +62,33 @@ uint64_t
 comp_vk_native_swapchain_get_image(struct xrt_swapchain *xsc, uint32_t index);
 
 /*!
+ * The sampling view in the format the APP ASKED FOR (#1589/#1610).
+ *
+ * @ref comp_vk_native_swapchain_get_image_view returns the NON-decoding view
+ * (the UNORM sibling of an sRGB swapchain) that the blit path needs. The
+ * compose render pass composites in linear light and wants the opposite: the
+ * GPU decoding an `_SRGB` source on sample. Identical for a non-sRGB
+ * swapchain.
+ *
+ * @ingroup comp_vk_native
+ */
+uint64_t
+comp_vk_native_swapchain_get_true_image_view(struct xrt_swapchain *xsc, uint32_t index);
+
+/*!
+ * Was this swapchain created with an `_SRGB` colour format?
+ *
+ * Answered from the app's requested format, NEVER from the image's: the image
+ * is the UNORM sibling whenever DXR_VK_SWAPCHAIN_TRUE_FORMAT is off, so
+ * `comp_vk_native_swapchain_is_true_srgb()` (which asks about the IMAGE) is a
+ * different question and the wrong one for a colour decision.
+ *
+ * @ingroup comp_vk_native
+ */
+bool
+comp_vk_native_swapchain_is_srgb(struct xrt_swapchain *xsc);
+
+/*!
  * Get the dimensions of a swapchain.
  *
  * @param xsc The swapchain.
