@@ -120,27 +120,27 @@ exposed by a given vendor's weaver is documented under that vendor's docs
 The compose-space encoding is an **internal** DisplayXR decision about compositing
 correctness, now decoupled from whatever any DP wants:
 
-- **Model A (baseline, today):** compose in **encoded** space (passthrough). Apps in
-  this ecosystem write display-referred bytes into both sRGB and UNORM swapchains, so
-  passthrough is the coherent baseline. The in-process path is already here (post
-  #407/#408); the service/workspace path must drop the unmatched decode on its
-  sRGB-client branch (use the UNORM SRV / raw bytes). Until then that branch is guarded
-  with a one-shot warning in `multi_compositor_render`.
-- **Model B (sanctioned future):** compose in **linear** space — decode iff sRGB →
-  compose linear → convert to the DP's declared handoff state. This is the *correct*
-  model for alpha compositing, premultiplied-alpha math, and the compose-under-background
-  transparency feature, all wrong in non-linear space.
+- **Model A (baseline):** the **atlas** is in **encoded** space. What varies is how each
+  source reaches it — see §6 and *As shipped (#1589/#1610)*: an `_SRGB` source is already
+  encoded and passes through; a UNORM source is linear and is encoded on the way in.
+  The service/workspace path had to drop the unmatched decode on its sRGB-client branch
+  (use the raw bytes) — done in #1591.
+- **Model B (sanctioned, shipped on one path):** hand the DP a **linear** atlas and let it
+  perform the single output encode. Distinct from "blend in linear", which Model A now
+  also does (§6): B is about the *handoff* state, not the compose state.
 
-  Key property: **B degenerates to A (passthrough) wherever there is nothing to blend**
-  (decode-then-immediately-reconvert is the identity). So B only costs more on the
-  **workspace/service compose path** where surfaces overlap — exactly where the
-  transparency feature lives. It is gated on that feature needing correct blending.
+  Key property: **B degenerates to A wherever there is nothing to convert**
+  (decode-then-immediately-reconvert is the identity). It engages only on the
+  workspace/service combine pass, under the gate recorded below.
 
 ### 6. Format is the source of truth for a swapchain's encoding state
 
 `*_SRGB` ⟺ encoded; UNORM / float ⟺ linear. This requires apps to declare honestly
-(request an sRGB swapchain and store correctly-encoded pixels). Some test apps violate
-this today (encoded bytes in UNORM swapchains); see *Consequences*.
+(request an sRGB swapchain and store correctly-encoded pixels). Since #1589 the runtime
+**acts** on the rule rather than merely asserting it: it samples each source through a
+view of that source's TRUE format, so an `_SRGB` source decodes on sample and a UNORM
+source is read as the linear values it holds. An app that stores encoded bytes in a
+UNORM swapchain is now simply wrong and looks washed out; the fix is the app's.
 
 ## Consequences
 
@@ -166,15 +166,14 @@ this today (encoded bytes in UNORM swapchains); see *Consequences*.
   steps live in that vendor's docs, not in this ADR.
 - **One rule for all paths.** "Is this path balanced?" becomes a mechanical check
   against the per-hop encoding table — and a regression test, not a code review.
-- **The latent service-path bug is documented and guarded**, with a defined fix: under
-  Model A, passthrough the sRGB-SRV branch; the conversion-to-handoff machinery (§4) is
-  what ultimately replaces the ad-hoc branch.
+- **The latent service-path bug is fixed** (#1591): the sRGB-SRV branches are gone and
+  every direct-client write reaches the atlas as raw, encoded bytes.
 - **Vendor curve removed.** `linear_to_srgb()` (a vendor power-law) is deleted from
   runtime shaders; any panel curve is DP-internal.
-- **App colorspace contract becomes load-bearing.** Honest declaration is required for
-  Model B; a transitional per-app `treat-as-encoded` override is the escape hatch for
-  legacy/test apps that put encoded bytes in UNORM. Our own test apps should migrate to
-  honest sRGB swapchains.
+- **App colorspace contract is load-bearing.** Honest declaration is required (§6);
+  `DXR_COLOR_LEGACY_UNORM_ENCODED=1` is the transitional process-wide escape hatch for
+  apps that put encoded bytes in UNORM. Our own test apps should migrate to honest sRGB
+  swapchains.
 - **Verification gap closed.** The cube test apps gained `DXR_SWAPCHAIN_ENCODING=srgb|unorm`
   + `DXR_TRUE_LINEAR` modes (a true-linear-into-UNORM source), and `sim_display`'s D3D11
   variant declares `EITHER` + encodes on `LINEAR` — the in-repo DP test double for the
@@ -202,18 +201,56 @@ implementation forced:
 - The mechanism is otherwise as in §3–§5: raw-sample → linear compose → `set_atlas_encoding(LINEAR)`
   → the weaver's output encode. In-process paths and UNORM workspaces are unchanged Model A.
 
-## Encoding state at each hop (current baseline = Model A; DP configured for encoded passthrough)
+### As shipped (#1591 + #1589/#1610, D3D11)
+
+Three changes, in that order:
+
+- **#1591 — the unmatched decode is gone.** The direct single-client service path decoded
+  an honest `_SRGB` client through an sRGB SRV in three places (projection blit, the zones
+  / Local-2D twin, and the zero-copy SRV) while still declaring the atlas `ENCODED`. That
+  is §1 violated in its last branches. All three now sample raw, byte-identically to the
+  shell path.
+- **#1589 — format-honest sources.** Each layer is sampled through a view of its TRUE
+  format (an `_SRGB` swapchain gets an `_SRGB` view, a UNORM swapchain a UNORM view), so
+  the values entering the compositor are linear in both cases. This is §6 made
+  operational, and it is what makes linear 0.5 in a UNORM swapchain reach the atlas as
+  **188** rather than 128.
+- **#1610 — layers blend in linear.** Layers are composed into a **runtime-private**
+  target: a texture of the atlas's size and typeless family, viewed through an `_SRGB`
+  RTV. The hardware therefore blends in linear and performs the single encode on write.
+  The composed result is then **copied** (same typeless family ⟹ a bit reinterpretation,
+  never a converting blit) into the atlas, so the DP-facing atlas resource, its format,
+  its SRV and `set_atlas_encoding(ENCODED)` are all unchanged — no DP change, no plug-in
+  ABI change, no `versions.json` coupling.
+
+Two properties are load-bearing:
+
+- **No gamma arithmetic in any compose shader.** The encode is a property of the render
+  target. A `linear_to_srgb()` in the pixel shader would double-apply the moment the
+  target encodes on write — and re-adding a vendor curve would violate §2 besides.
+- **A single-layer `_SRGB` frame takes the old path verbatim.** No private target, no
+  copy, byte-identical atlas. That is the whole shipping app population, so it is both
+  the performance guard and the no-regression proof. A single *UNORM* layer does not
+  qualify (it owes the encode), and neither does any 2+-layer frame (it owes the blend).
+  The predicate is `u_color_compose_fast_path()` in `auxiliary/util/u_color_encoding.h`.
+- **`DXR_COLOR_LEGACY_UNORM_ENCODED=1`** restores the pre-#1589 reading wholesale (UNORM
+  treated as already encoded, non-decoding views, no private target, no linear blend) for
+  apps that cannot be migrated. Transitional. Each component logs one WARN at init stating
+  which regime it is in.
+
+## Encoding state at each hop (Model A; DP configured for encoded passthrough)
 
 | Hop | In-process | IPC / service | Workspace / shell |
 |---|---|---|---|
-| App swapchain | encoded (in sRGB or UNORM) | encoded | encoded |
-| Sample into compose | passthrough (UNORM SRV / skip-decode) | passthrough (raw copy) | passthrough (raw copy → TYPELESS atlas) |
-| Compose / atlas | encoded | encoded | encoded (UNORM SRV branch) / **linear (sRGB SRV branch — unmatched decode, guarded, to be removed)** |
-| Compose → handoff (per DP decl.) | passthrough (DP accepts encoded) | passthrough | passthrough except the sRGB-SRV branch |
-| DP handoff | **encoded** ✓ | **encoded** ✓ | **encoded** ✓ except the sRGB-SRV branch |
+| App swapchain | encoded (`_SRGB`) **or linear (UNORM)** | same | same |
+| Sample into compose | **format-honest** view ⟹ linear | **format-honest** view ⟹ linear | same |
+| Compose | linear, in the private `_SRGB`-view target | linear | linear |
+| Compose → atlas | **encode on write**, then same-family COPY | same | same |
+| Compose / atlas | encoded | encoded | encoded |
+| Compose → handoff (per DP decl.) | passthrough (DP accepts encoded) | passthrough | passthrough, or the Model-B decode |
+| DP handoff | **encoded** ✓ | **encoded** ✓ | **encoded** ✓ (or **linear** ✓ under B) |
 
-Under Model B (future) the "Compose / atlas" row becomes **linear** on the
-workspace/service path, and the "Compose → handoff" row carries the matched conversion
-to whatever the DP declared (encode-to-sRGB for an `ENCODED` DP; passthrough for a
-`LINEAR` DP). The in-process row is unchanged (passthrough == A == B with nothing to
-blend).
+The two middle rows collapse to a passthrough on the single-layer `_SRGB` fast path and
+under `DXR_COLOR_LEGACY_UNORM_ENCODED=1`, which is why the atlas stays byte-identical
+there. Under Model B the workspace "DP handoff" row becomes **linear** and the DP performs
+the one matched encode.
