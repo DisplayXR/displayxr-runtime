@@ -922,7 +922,13 @@ get_color_scale_bias(const struct xrt_layer_data *data, float color_scale[4], fl
 	}
 }
 
-static void
+/*!
+ * @return true when the quad was actually drawn into this view's tile — the
+ *         caller uses that to keep the #1598 painter's-order bookkeeping
+ *         honest. A quad that is invisible in this eye or turned away has NOT
+ *         painted the tile, so it must not make the NEXT layer a non-first one.
+ */
+static bool
 render_quad_layer(struct comp_d3d11_renderer *r,
                   const struct comp_layer *layer,
                   uint32_t view_index,
@@ -939,7 +945,7 @@ render_quad_layer(struct comp_d3d11_renderer *r,
 	// every view beyond the second, which a 2x2 quad mode has. Identical to
 	// the old rule for 1- and 2-view frames.
 	if (!is_layer_view_visible_n(data, view_index, view_count)) {
-		return;
+		return false;
 	}
 
 	// #1590: "Only front face of the quad surface is visible; the back face
@@ -949,13 +955,13 @@ render_quad_layer(struct comp_d3d11_renderer *r,
 	// is what the CTS QuadOcclusion case looks for. A predicate, not
 	// rasterizer culling: the pipeline is CULL_NONE (see the shared helper).
 	if (!comp_layer_quad_is_front_facing(&q->pose, &view_pose->position)) {
-		return;
+		return false;
 	}
 
 	// Get swapchain
 	struct xrt_swapchain *xsc = layer->sc_array[0];
 	if (xsc == nullptr) {
-		return;
+		return false;
 	}
 
 	uint32_t image_index = q->sub.image_index;
@@ -964,7 +970,7 @@ render_quad_layer(struct comp_d3d11_renderer *r,
 	ID3D11ShaderResourceView *srv = static_cast<ID3D11ShaderResourceView *>(
 	    comp_d3d11_swapchain_get_srv(xsc, image_index));
 	if (srv == nullptr) {
-		return;
+		return false;
 	}
 
 	// Build MVP matrix
@@ -1041,6 +1047,7 @@ render_quad_layer(struct comp_d3d11_renderer *r,
 
 	// Restore opaque blend state for subsequent layers
 	internals.context->OMSetBlendState(r->blend_opaque, nullptr, 0xFFFFFFFF);
+	return true;
 }
 
 /*!
@@ -1512,14 +1519,57 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
 	for (uint32_t view_index = 0; view_index < effective_views; view_index++) {
 		set_view_viewport(renderer, view_index, layout, target_width, target_height);
 
+		/*
+		 * #1598 — painter's order WITHIN this tile. The loop below already
+		 * walks the layers in SUBMISSION order across types (comp_layer_accum
+		 * is append-only and nothing sorts it), which is what §10.6 asks for;
+		 * what was missing is that every projection layer was blitted with
+		 * blending OFF, so layer N+1 simply erased layer N. This tracks
+		 * whether anything has landed in the tile yet, which is the ONLY
+		 * thing the first-layer rule needs to know.
+		 */
+		struct comp_layer_tile_state tile = {};
+
 		for (uint32_t i = 0; i < layers->layer_count; i++) {
 			struct comp_layer *layer = &layers->layers[i];
 
 			switch (layer->data.type) {
 			case XRT_LAYER_PROJECTION:
-			case XRT_LAYER_PROJECTION_DEPTH:
-				render_projection_layer(renderer, layer, view_index);
+			case XRT_LAYER_PROJECTION_DEPTH: {
+				/*
+				 * FIRST into the tile => REPLACE, whatever the
+				 * flags say (the #225 compose-under contract —
+				 * see comp_layer_tile_blend_mode). Every LATER
+				 * projection layer takes its own flags: no
+				 * blend bit means it legitimately covers what
+				 * is under it, which for a full-tile blit is
+				 * today's behaviour and is what the spec says
+				 * an unflagged layer does.
+				 *
+				 * The mark is eager — a projection layer that
+				 * fails to draw (null swapchain, already a
+				 * logged WARN) still counts as the tile's
+				 * base. That keeps "which layer is the base"
+				 * a pure function of the layer LIST rather
+				 * than of a transient swapchain hiccup.
+				 *
+				 * The state is bound only when it is not the
+				 * default, so the single-projection-layer
+				 * frame every shipping app submits issues the
+				 * exact same D3D11 call sequence as before.
+				 */
+				ID3D11BlendState *bs = blend_state_for(
+				    renderer, comp_layer_tile_blend_mode(&tile, layer->data.flags));
+				if (bs != renderer->blend_opaque) {
+					internals.context->OMSetBlendState(bs, nullptr, 0xFFFFFFFF);
+					render_projection_layer(renderer, layer, view_index);
+					internals.context->OMSetBlendState(renderer->blend_opaque, nullptr,
+					                                   0xFFFFFFFF);
+				} else {
+					render_projection_layer(renderer, layer, view_index);
+				}
 				break;
+			}
 
 			case XRT_LAYER_ZONE_3D: {
 				// XR_DXR_display_zones: scaled-blit this zone's view
@@ -1548,6 +1598,14 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
 					break;
 				}
 				internals.context->RSSetViewports(1, &zvp);
+				// #1598: a zone paints a SUB-RECT of the tile, so
+				// it is not a base cover and keeps its own blend
+				// rule verbatim (ADR-027 alpha-over in list
+				// order, over a clear that is already
+				// transparent in a zones frame). It does mark
+				// the tile, so a projection layer submitted
+				// after it blends over it instead of erasing it.
+				comp_layer_tile_mark_composited(&tile);
 				const bool unpremul =
 				    (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0;
 				internals.context->OMSetBlendState(
@@ -1565,8 +1623,15 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
 				if (view_index >= XRT_MAX_VIEWS) {
 					break;
 				}
-				render_quad_layer(renderer, layer, view_index, effective_views,
-				                  &cameras[view_index].pose, &cameras[view_index].fov);
+				// Marked only when it actually drew: per-eye
+				// visibility and back-facing (#1590) are normal
+				// outcomes, not errors, and a quad that did not
+				// paint this tile must not turn a following
+				// projection layer into a non-first one.
+				if (render_quad_layer(renderer, layer, view_index, effective_views,
+				                      &cameras[view_index].pose, &cameras[view_index].fov)) {
+					comp_layer_tile_mark_composited(&tile);
+				}
 				break;
 			}
 

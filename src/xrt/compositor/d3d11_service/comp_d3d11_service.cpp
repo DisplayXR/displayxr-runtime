@@ -20522,6 +20522,32 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			viewport.MaxDepth = 1.0f;
 			sys->context->RSSetViewports(1, &viewport);
 
+			/*
+			 * TODO(#1598): these three passes are TYPE-ordered, and
+			 * the spec's painter's algorithm is SUBMISSION-ordered.
+			 * Every index is discarded across types here — equirect2,
+			 * then cylinder, then quad, whatever order the app sent
+			 * them in — so a quad submitted UNDER an equirect2 still
+			 * lands on top of it. The in-process renderer walks one
+			 * submission-ordered loop and is correct; this path is
+			 * structurally wrong, and deliberately OUT of scope for
+			 * the #1598 in-process fix.
+			 *
+			 * Collapsing them is ~60-100 lines: one loop over
+			 * layer_accum in index order dispatching on type, plus a
+			 * `comp_layer_tile_state` per view fed through
+			 * comp_layer_tile_blend_mode() exactly as the in-process
+			 * renderer now does. The hard part is upstream of here —
+			 * the projection pass above blits with
+			 * CopySubresourceRegion on two fallback paths (the
+			 * non-SRGB / already-fitting raw copy and the
+			 * failed-SRGB-SRV copy), and a transfer copy CANNOT
+			 * blend, so a non-first projection layer has to be
+			 * promoted to the shader blit (blit_to_atlas_texture,
+			 * which already takes a blend state) before submission
+			 * order means anything on this path.
+			 */
+
 			// Render equirect2 layers first (background/skybox)
 			for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 				struct comp_layer *layer = &c->layer_accum.layers[i];
