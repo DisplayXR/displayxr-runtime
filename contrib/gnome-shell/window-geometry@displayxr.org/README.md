@@ -21,7 +21,52 @@ measure. Without version 2 the display processor refuses to capture and falls
 back to silhouette intersection. Full contract:
 `docs/specs/runtime/wayland-window-geometry.md` §6.
 
-## Install (manual, until packaged)
+## Install
+
+Both Linux packages install it. Only GNOME Shell loads it, so it has no effect
+on other desktops.
+
+| Package | Installs to | Enabled for |
+|---|---|---|
+| `displayxr-runtime` `.deb` | `/usr/share/gnome-shell/extensions/window-geometry@displayxr.org/` | Every user, at their next GNOME login, by `/etc/xdg/autostart/displayxr-gnome-extension-enable.desktop`. It never re-enables the extension for a user who disabled it. |
+| Tarball, `./install.sh` | `~/.local/share/gnome-shell/extensions/window-geometry@displayxr.org/` | The installing user, straight away (in their settings). |
+| Tarball, `sudo ./install.sh --system` | `/usr/local/share/gnome-shell/extensions/window-geometry@displayxr.org/` | Every user at their next login, as for the `.deb`. |
+
+**Then log out and back in.** A Wayland session cannot reload GNOME Shell, so
+a newly installed extension, or a new version of an installed one, loads only
+at the next login. Until then the runtime logs that the extension is installed
+but not active, and falls back to display-scoped weaving (and, for
+transparent apps on a Leia panel, silhouette intersection).
+
+**How "enabled for every user" works, and why this way.** GNOME keeps the list
+of enabled extensions per user (`org.gnome.shell enabled-extensions`). A dconf
+system default for that key reaches only users who have never written it, and
+anyone who has ever toggled an extension has, so for most people it would do
+nothing. The package therefore runs
+`/usr/lib/displayxr/bin/displayxr-gnome-extension-enable` at each GNOME login.
+The script:
+
+- acts **once per user**. After the first time it records a stamp in
+  `~/.local/state/displayxr/` and does nothing more, so the extension is never
+  re-added once the user has removed it, however they removed it;
+- does nothing for a user whose `disabled-extensions` lists the UUID. That is
+  GNOME's own record of "I switched this off";
+- does nothing while the user has switched off all extensions
+  (`disable-user-extensions`), and tries again at a later login;
+- does nothing if an administrator has locked the key;
+- writes the setting directly instead of calling `gnome-extensions enable`,
+  because a running shell refuses to enable an extension it did not see at
+  startup.
+
+No dconf lock is involved. Users can always disable it.
+
+To turn it back on after disabling it:
+
+```bash
+gnome-extensions enable window-geometry@displayxr.org   # then log out and back in
+```
+
+Manual install from this directory (development):
 
 ```bash
 UUID=window-geometry@displayxr.org
@@ -33,6 +78,10 @@ gnome-extensions enable $UUID
 # shell keeps the old code until then (`gnome-extensions info $UUID` shows the
 # version it loaded).
 ```
+
+A copy in `~/.local/share` takes precedence over the system one, so a leftover
+manual install shadows a packaged update. Remove it when switching to a
+package.
 
 Verify it's live:
 
@@ -86,8 +135,10 @@ the same geometry to serve its own non-DisplayXR apps). The full contract is in
   virtual name rather than on any vendor's package.
 - **Install system-wide** to
   `/usr/share/gnome-shell/extensions/window-geometry@displayxr.org/` (the
-  per-user path above is for manual dev installs). Enabling is still per user
-  session; seed it via a dconf default for `org.gnome.shell enabled-extensions`.
+  per-user path above is for manual dev installs). Enabling is still per user.
+  A dconf default for `org.gnome.shell enabled-extensions` reaches only users
+  who never set that key. The runtime `.deb` enables it at each user's login
+  instead, as described under *Install*.
 - **Schema is additive within a version.** Add fields freely; bump `version` in
   the payload only when the *meaning* of an existing field changes (e.g.
   logical → physical pixels). Consumers refuse a version they don't understand
@@ -103,7 +154,11 @@ the same geometry to serve its own non-DisplayXR apps). The full contract is in
   knows is wrong (runtime#1557) — the compositor also resamples the surface at
   non-unit scale, which destroys an interlace regardless of phase.
 - GNOME Shell versions 45–50 (`shell-version` in `metadata.json`). Validated
-  live on GNOME 50.1 / Ubuntu 26.04 (runtime#817). A newly installed extension
-  is only picked up at the next login — Wayland cannot restart the shell.
+  live on GNOME 50.1 / Ubuntu 26.04 (runtime#817). That covers Ubuntu 24.04
+  (GNOME 46) and 26.04 (GNOME 50), but **not 22.04 (GNOME 42)**: the extension
+  is an ES module, which GNOME only loads from 45 onwards. There it installs
+  but GNOME reports it as out of date and never loads it. A newly installed
+  extension is only picked up at the next login — Wayland cannot restart the
+  shell.
 - Runtime matches windows by PID → works for in-process apps; IPC/service
   mode needs the client PID plumbed (tracked in runtime#817).
