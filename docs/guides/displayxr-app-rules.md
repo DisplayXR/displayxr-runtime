@@ -187,16 +187,29 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
 
   **Wayland substitute.** A Wayland client is never told where it is and cannot place
   itself, so there is no position to create at. The compliant substitute is
-  `xdg_toplevel_set_fullscreen()` on the `wl_output` matched to the reported panel rect
-  (compare `wl_output.geometry(x,y)` + the current `wl_output.mode(width,height)` against
-  `XrDisplayDesktopPositionDXR` `left/top` + `XrDisplayInfoDXR` `displayPixelWidth/Height`);
-  fall back to `set_fullscreen(NULL)` and log when nothing matches. The match only works at
-  **desktop scale 1.0** — `wl_output` geometry is logical, the runtime's rect is device
-  pixels. **Also declare your size.** A `wl_surface` has no intrinsic size — the buffer
-  the runtime attaches is what *defines* it — so chain `XrWaylandSurfaceGeometryDXR`
-  (spec v2) with the size from the configure you just acked, plus the matched output's
-  `wl_output.mode` refresh, and call `xrSetWaylandSurfaceGeometryDXR` on every later
-  configure that changes the size. Omit it and the runtime falls back to sizing the
+  `xdg_toplevel_set_fullscreen()` on the `wl_output` matched to the reported panel rect;
+  fall back to `set_fullscreen(NULL)` and log when nothing matches. **Match in DEVICE
+  pixels.** `wl_output.geometry(x,y)` is *logical* and the runtime's panel rect
+  (`XrDisplayDesktopPositionDXR` `left/top` + `XrDisplayInfoDXR`
+  `displayPixelWidth/Height`) is *device* pixels, so comparing them directly cannot
+  succeed on a scaled desktop — measured 2026-09-20, nothing matched `3840x2160+3456+0`
+  and the surface fullscreened on the laptop. The recipe: take each output's logical rect
+  from `zxdg_output_v1.logical_position`/`logical_size`, derive its scale as
+  `wl_output.mode ÷ logical_size` (**never** `wl_output.scale` — an integer by protocol,
+  it reports 2 for a 1.6667 output), match **size** first (`wl_output.mode` and
+  `displayPixelWidth/Height` are both device pixels, so they compare with no conversion at
+  all) — take an unambiguous single size match even when the converted origin disagrees,
+  with a warning — and use the converted device origin (`logical_position × scale`) as the
+  tie-break when several outputs share the panel's mode size. A fractionally-scaled desktop is workable this way; what is not is a buffer
+  the compositor has to resample — the runtime degrades such a session to flat 2D rather
+  than weave into it (`NOT_1TO1:` in the log, #1595).
+
+  **Also declare your size, in device pixels.** A `wl_surface` has no intrinsic size —
+  the buffer the runtime attaches is what *defines* it — so chain
+  `XrWaylandSurfaceGeometryDXR` (spec v2) with the **matched output's `wl_output.mode`
+  size**, not the logical size from the configure you just acked (they are equal only at
+  scale 1.0), plus that output's `wl_output.mode` refresh, and call
+  `xrSetWaylandSurfaceGeometryDXR` on every later configure that changes the size. Omit it and the runtime falls back to sizing the
   swapchain to the panel, which on Wayland does not mis-size your window — it *resizes*
   it to the panel. Windowed Wayland additionally needs the compositor geometry service
   (`docs/specs/runtime/wayland-window-geometry.md`) for the phase anchor: the size comes

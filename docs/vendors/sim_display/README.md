@@ -45,7 +45,16 @@ sim_display produces a plausible image whether or not the geometry is right.
 A real lenticular weaver is sensitive to both. Its interlacing phase is a
 function of the target's absolute physical-pixel origin, and any resample
 between the woven texture and scanout destroys the pattern outright — a
-half-pixel error is visible, and a desktop running at non-100% scale is fatal.
+half-pixel error is visible.
+
+What is fatal is the *resample*, not the scale setting as such. A desktop at
+non-100% scale is the usual way to get one, and it is also the usual way to get
+a wrong origin, because the geometry the display server reports is then in
+logical rather than device pixels (#1596). But a surface that declares a buffer
+equal to the region the compositor paints it into still reaches scanout 1:1 on a
+scaled desktop, which is why desktop Linux now measures the buffer against its
+destination and refuses to weave when they differ, rather than gating on the
+scale factor (#1595, `vk_linux_update_surface_not_1to1`).
 
 So a green sim_display run establishes plug-in discovery, the display-processor
 path, session and swapchain creation, the frame loop, and that the compositor
@@ -63,9 +72,10 @@ like SBS. `phase` is the weave target's panel-relative X origin
 
 That gives it the same two failure modes as the real thing:
 
-- **Any resample** — desktop scale != 100%, a mis-sized swapchain, a
-  compositing display server scaling the surface — smears the alternating
-  columns into flat grey or a moire beat. A correct 1:1 path stays crisp.
+- **Any resample** — a mis-sized swapchain, a compositing display server
+  scaling the surface, a buffer declared in logical rather than device pixels —
+  smears the alternating columns into flat grey or a moire beat. A correct 1:1
+  path stays crisp at any desktop scale.
 - **A wrong origin** flips which eye lands on the even columns, so the image
   goes pseudoscopic (inverted depth) rather than merely shifting.
 
