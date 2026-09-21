@@ -8435,7 +8435,9 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	c->app_keyed_mutex = app_keyed_mutex;
 	c->hardware_display_3d = true;
 	c->last_3d_mode_index = 1;
+#ifdef XRT_OS_LINUX_DESKTOP
 	u_display_mode_hold_init(&c->display_mode_hold, true); // sessions begin 3D
+#endif
 
 	// #868: before ANY path that can reach vk_compositor_destroy — it both
 	// joins the repaint thread and destroys this mutex, so they must be valid
@@ -10275,6 +10277,9 @@ comp_vk_native_compositor_request_display_mode(struct xrt_compositor *xc, bool e
 	// forwarded: the panel stays 2D for the hold's reason. Reported as
 	// accepted, because it WILL be applied — the same promise the no-DP-yet
 	// deferral in vk_dp_request_display_mode makes.
+#ifdef XRT_OS_LINUX_DESKTOP
+	// The hold exists only where its degrade does (the Wayland NOT_1TO1 gate).
+	// Every other platform forwards the request directly, as before.
 	if (!u_display_mode_hold_request(&c->display_mode_hold, enable_3d)) {
 		U_LOG_W(
 		    "vk_native: hardware %s requested while the runtime holds the panel in 2D "
@@ -10282,6 +10287,7 @@ comp_vk_native_compositor_request_display_mode(struct xrt_compositor *xc, bool e
 		    enable_3d ? "3D" : "2D");
 		return true;
 	}
+#endif
 	return vk_dp_request_display_mode(c, enable_3d);
 }
 
