@@ -24,6 +24,7 @@ if(WIN32 AND XRT_HAVE_D3D11)
 		comp_d3d11_swapchain.h
 		comp_d3d11_target.cpp
 		comp_d3d11_target.h
+		d3d11_layer_shaders.h
 		)
 
 	target_link_libraries(
