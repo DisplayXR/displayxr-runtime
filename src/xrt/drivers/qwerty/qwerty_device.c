@@ -15,6 +15,7 @@
 
 #include "util/u_device.h"
 #include "util/u_distortion_mesh.h"
+#include "util/u_grip_surface.h"
 #include "util/u_var.h"
 #include "util/u_logging.h"
 #include "util/u_time.h"
@@ -81,6 +82,9 @@ reset_controller_for_mode(struct qwerty_system *qs, struct qwerty_controller *qc
 #define QWERTY_TRACKPAD_CLICK 8
 #define QWERTY_GRIP 9
 #define QWERTY_AIM 10
+//! `grip_surface` / `palm_ext`, derived from QWERTY_GRIP (#1633).
+#define QWERTY_PALM 11
+#define QWERTY_CONTROLLER_INPUT_COUNT 12
 #define QWERTY_VIBRATION 0
 
 #define QWERTY_TRACE(qd, ...) U_LOG_XDEV_IFL_T(&qd->base, qd->sys->log_level, __VA_ARGS__)
@@ -89,7 +93,15 @@ reset_controller_for_mode(struct qwerty_system *qs, struct qwerty_controller *qc
 #define QWERTY_WARN(qd, ...) U_LOG_XDEV_IFL_W(&qd->base, qd->sys->log_level, __VA_ARGS__)
 #define QWERTY_ERROR(qd, ...) U_LOG_XDEV_IFL_E(&qd->base, qd->sys->log_level, __VA_ARGS__)
 
-static struct xrt_binding_input_pair touch_inputs[19] = {
+/*
+ * #1633: every profile below carries the identity pair for
+ * XRT_INPUT_GENERIC_PALM_POSE. The `grip_surface` / `palm_ext` virtual profile
+ * binds to that GENERIC name whichever controller profile it extends, so
+ * without a pair here do_inputs() finds no device mapping under an alternate
+ * profile (the CTS suggests bindings for khr/simple_controller) and the action
+ * space never becomes locatable.
+ */
+static struct xrt_binding_input_pair touch_inputs[20] = {
     {XRT_INPUT_TOUCH_X_CLICK, XRT_INPUT_WMR_MENU_CLICK},
     {XRT_INPUT_TOUCH_X_TOUCH, XRT_INPUT_WMR_MENU_CLICK},
     {XRT_INPUT_TOUCH_Y_CLICK, XRT_INPUT_WMR_HOME_CLICK},
@@ -109,13 +121,14 @@ static struct xrt_binding_input_pair touch_inputs[19] = {
     {XRT_INPUT_TOUCH_THUMBREST_TOUCH, XRT_INPUT_WMR_TRACKPAD_TOUCH},
     {XRT_INPUT_TOUCH_GRIP_POSE, XRT_INPUT_WMR_GRIP_POSE},
     {XRT_INPUT_TOUCH_AIM_POSE, XRT_INPUT_WMR_AIM_POSE},
+    {XRT_INPUT_GENERIC_PALM_POSE, XRT_INPUT_GENERIC_PALM_POSE},
 };
 
 static struct xrt_binding_output_pair touch_outputs[1] = {
     {XRT_OUTPUT_NAME_TOUCH_HAPTIC, XRT_OUTPUT_NAME_WMR_HAPTIC},
 };
 
-static struct xrt_binding_input_pair index_inputs[19] = {
+static struct xrt_binding_input_pair index_inputs[20] = {
     {XRT_INPUT_INDEX_SYSTEM_CLICK, XRT_INPUT_WMR_HOME_CLICK},
     {XRT_INPUT_INDEX_SYSTEM_TOUCH, XRT_INPUT_WMR_HOME_CLICK},
     {XRT_INPUT_INDEX_A_CLICK, XRT_INPUT_WMR_MENU_CLICK},
@@ -135,13 +148,14 @@ static struct xrt_binding_input_pair index_inputs[19] = {
     {XRT_INPUT_INDEX_TRACKPAD, XRT_INPUT_WMR_TRACKPAD},
     {XRT_INPUT_INDEX_GRIP_POSE, XRT_INPUT_WMR_GRIP_POSE},
     {XRT_INPUT_INDEX_AIM_POSE, XRT_INPUT_WMR_AIM_POSE},
+    {XRT_INPUT_GENERIC_PALM_POSE, XRT_INPUT_GENERIC_PALM_POSE},
 };
 
 static struct xrt_binding_output_pair index_outputs[1] = {
     {XRT_OUTPUT_NAME_INDEX_HAPTIC, XRT_OUTPUT_NAME_WMR_HAPTIC},
 };
 
-static struct xrt_binding_input_pair vive_inputs[10] = {
+static struct xrt_binding_input_pair vive_inputs[11] = {
     {XRT_INPUT_VIVE_SYSTEM_CLICK, XRT_INPUT_WMR_HOME_CLICK},
     {XRT_INPUT_VIVE_SQUEEZE_CLICK, XRT_INPUT_WMR_SQUEEZE_CLICK},
     {XRT_INPUT_VIVE_MENU_CLICK, XRT_INPUT_WMR_MENU_CLICK},
@@ -152,13 +166,14 @@ static struct xrt_binding_input_pair vive_inputs[10] = {
     {XRT_INPUT_VIVE_TRACKPAD_TOUCH, XRT_INPUT_WMR_TRACKPAD_TOUCH},
     {XRT_INPUT_VIVE_GRIP_POSE, XRT_INPUT_WMR_GRIP_POSE},
     {XRT_INPUT_VIVE_AIM_POSE, XRT_INPUT_WMR_AIM_POSE},
+    {XRT_INPUT_GENERIC_PALM_POSE, XRT_INPUT_GENERIC_PALM_POSE},
 };
 
 static struct xrt_binding_output_pair vive_outputs[1] = {
     {XRT_OUTPUT_NAME_VIVE_HAPTIC, XRT_OUTPUT_NAME_WMR_HAPTIC},
 };
 
-static struct xrt_binding_input_pair wmr_inputs[11] = {
+static struct xrt_binding_input_pair wmr_inputs[12] = {
     {XRT_INPUT_WMR_MENU_CLICK, XRT_INPUT_WMR_MENU_CLICK},
     {XRT_INPUT_WMR_SQUEEZE_CLICK, XRT_INPUT_WMR_SQUEEZE_CLICK},
     {XRT_INPUT_WMR_TRIGGER_VALUE, XRT_INPUT_WMR_TRIGGER_VALUE},
@@ -170,17 +185,19 @@ static struct xrt_binding_input_pair wmr_inputs[11] = {
     {XRT_INPUT_WMR_GRIP_POSE, XRT_INPUT_WMR_GRIP_POSE},
     {XRT_INPUT_WMR_AIM_POSE, XRT_INPUT_WMR_AIM_POSE},
     {XRT_INPUT_WMR_HOME_CLICK, XRT_INPUT_WMR_HOME_CLICK},
+    {XRT_INPUT_GENERIC_PALM_POSE, XRT_INPUT_GENERIC_PALM_POSE},
 };
 
 static struct xrt_binding_output_pair wmr_outputs[1] = {
     {XRT_OUTPUT_NAME_WMR_HAPTIC, XRT_OUTPUT_NAME_WMR_HAPTIC},
 };
 
-static struct xrt_binding_input_pair simple_inputs[4] = {
+static struct xrt_binding_input_pair simple_inputs[5] = {
     {XRT_INPUT_SIMPLE_SELECT_CLICK, XRT_INPUT_WMR_TRIGGER_VALUE},
     {XRT_INPUT_SIMPLE_MENU_CLICK, XRT_INPUT_WMR_MENU_CLICK},
     {XRT_INPUT_SIMPLE_GRIP_POSE, XRT_INPUT_WMR_GRIP_POSE},
     {XRT_INPUT_SIMPLE_AIM_POSE, XRT_INPUT_WMR_AIM_POSE},
+    {XRT_INPUT_GENERIC_PALM_POSE, XRT_INPUT_GENERIC_PALM_POSE},
 };
 
 static struct xrt_binding_output_pair simple_outputs[1] = {
@@ -343,6 +360,22 @@ qwerty_set_output(struct xrt_device *xd, enum xrt_output_name name, const struct
 	return XRT_SUCCESS;
 }
 
+/*!
+ * #1633: `grip_surface` / `palm_ext` is a fixed rigid offset from grip, never
+ * a measurement of its own, so it is applied to the finished grip relation at
+ * every exit of qwerty_get_tracked_pose(). Flags ride along untouched — the
+ * palm pose is exactly as tracked as the grip pose it came from.
+ */
+static void
+qwerty_apply_grip_surface(struct xrt_device *xd, enum xrt_input_name name, struct xrt_space_relation *relation)
+{
+	if (name != XRT_INPUT_GENERIC_PALM_POSE) {
+		return;
+	}
+
+	u_grip_surface_from_grip(xd->device_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER, relation, relation);
+}
+
 static xrt_result_t
 qwerty_get_tracked_pose(struct xrt_device *xd,
                         enum xrt_input_name name,
@@ -351,7 +384,8 @@ qwerty_get_tracked_pose(struct xrt_device *xd,
 {
 	struct qwerty_device *qd = qwerty_device(xd);
 
-	if (name != XRT_INPUT_GENERIC_HEAD_POSE && name != XRT_INPUT_WMR_GRIP_POSE && name != XRT_INPUT_WMR_AIM_POSE) {
+	if (name != XRT_INPUT_GENERIC_HEAD_POSE && name != XRT_INPUT_WMR_GRIP_POSE && name != XRT_INPUT_WMR_AIM_POSE &&
+	    name != XRT_INPUT_GENERIC_PALM_POSE) {
 		U_LOG_XDEV_UNSUPPORTED_INPUT(&qd->base, qd->sys->log_level, name);
 		return XRT_ERROR_INPUT_UNSUPPORTED;
 	}
@@ -392,6 +426,7 @@ qwerty_get_tracked_pose(struct xrt_device *xd,
 		out_relation->relation_flags =
 		    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT |
 		    XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT;
+		qwerty_apply_grip_surface(xd, name, out_relation);
 		os_mutex_unlock(&qd->lock); // #958
 		return XRT_SUCCESS;
 	}
@@ -475,7 +510,8 @@ qwerty_get_tracked_pose(struct xrt_device *xd,
 
 	// HMD Parenting
 
-	bool qd_is_ctrl = name == XRT_INPUT_WMR_GRIP_POSE || name == XRT_INPUT_WMR_AIM_POSE;
+	bool qd_is_ctrl =
+	    name == XRT_INPUT_WMR_GRIP_POSE || name == XRT_INPUT_WMR_AIM_POSE || name == XRT_INPUT_GENERIC_PALM_POSE;
 	struct qwerty_controller *qc = qd_is_ctrl ? qwerty_controller(&qd->base) : NULL;
 	if (qd_is_ctrl && qc->follow_hmd) {
 		struct xrt_relation_chain relation_chain = {0};
@@ -489,6 +525,7 @@ qwerty_get_tracked_pose(struct xrt_device *xd,
 	out_relation->relation_flags =
 	    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT |
 	    XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT;
+	qwerty_apply_grip_surface(xd, name, out_relation);
 
 	os_mutex_unlock(&qd->lock); // #958
 	return XRT_SUCCESS;
@@ -572,7 +609,8 @@ qwerty_hmd_create(void)
 struct qwerty_controller *
 qwerty_controller_create(bool is_left, struct qwerty_hmd *qhmd)
 {
-	struct qwerty_controller *qc = U_DEVICE_ALLOCATE(struct qwerty_controller, U_DEVICE_ALLOC_TRACKING_NONE, 11, 1);
+	struct qwerty_controller *qc =
+	    U_DEVICE_ALLOCATE(struct qwerty_controller, U_DEVICE_ALLOC_TRACKING_NONE, QWERTY_CONTROLLER_INPUT_COUNT, 1);
 	assert(qc);
 	qc->follow_hmd = qhmd != NULL;
 
@@ -615,6 +653,9 @@ qwerty_controller_create(bool is_left, struct qwerty_hmd *qhmd)
 	xd->inputs[QWERTY_GRIP].name = XRT_INPUT_WMR_GRIP_POSE;
 	//!< @todo: aim input offset not implemented, equal to grip pose
 	xd->inputs[QWERTY_AIM].name = XRT_INPUT_WMR_AIM_POSE;
+	// #1633: `grip_surface` (OpenXR 1.1) / `palm_ext` (XR_EXT_palm_pose),
+	// derived from the grip pose by u_grip_surface_from_grip().
+	xd->inputs[QWERTY_PALM].name = XRT_INPUT_GENERIC_PALM_POSE;
 	xd->outputs[QWERTY_VIBRATION].name = XRT_OUTPUT_NAME_WMR_HAPTIC;
 
 	xd->binding_profiles = binding_profiles;
