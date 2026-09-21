@@ -752,6 +752,27 @@ create_resources(struct comp_d3d11_renderer *r)
 	return XRT_SUCCESS;
 }
 
+/*!
+ * The blend state that implements one shared blend mode (#1599).
+ *
+ * `blend_opaque` has blending DISABLED, so a REPLACE writes the source RGBA
+ * verbatim. That is deliberate and load-bearing: the spec's "treat the layer
+ * alpha as one" is a statement about coverage, and forcing dst.a to 1 here
+ * would break the compose-under contract the first blit of a
+ * transparent-background app depends on (#225). The colour channels are the
+ * same either way.
+ */
+static ID3D11BlendState *
+blend_state_for(struct comp_d3d11_renderer *r, enum comp_layer_blend_mode mode)
+{
+	switch (mode) {
+	case COMP_LAYER_BLEND_PREMULTIPLIED: return r->blend_premul;
+	case COMP_LAYER_BLEND_STRAIGHT: return r->blend_alpha;
+	case COMP_LAYER_BLEND_REPLACE:
+	default: return r->blend_opaque;
+	}
+}
+
 static void
 render_projection_layer(struct comp_d3d11_renderer *r,
                         struct comp_layer *layer,
@@ -921,6 +942,16 @@ render_quad_layer(struct comp_d3d11_renderer *r,
 		return;
 	}
 
+	// #1590: "Only front face of the quad surface is visible; the back face
+	// is not visible and must not be drawn by the runtime." The front normal
+	// is the quad's +Z, and the camera is THIS view's (#1580) — so a quad
+	// turned away in one eye and toward the other is dropped per eye, which
+	// is what the CTS QuadOcclusion case looks for. A predicate, not
+	// rasterizer culling: the pipeline is CULL_NONE (see the shared helper).
+	if (!comp_layer_quad_is_front_facing(&q->pose, &view_pose->position)) {
+		return;
+	}
+
 	// Get swapchain
 	struct xrt_swapchain *xsc = layer->sc_array[0];
 	if (xsc == nullptr) {
@@ -992,13 +1023,14 @@ render_quad_layer(struct comp_d3d11_renderer *r,
 	internals.context->PSSetShaderResources(0, 1, &srv);
 	internals.context->PSSetSamplers(0, 1, &r->sampler_linear);
 
-	// Set blend state for alpha blending (quads often have transparent areas)
-	bool is_premultiplied = (data->flags & XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT) == 0;
-	if (is_premultiplied) {
-		internals.context->OMSetBlendState(r->blend_premul, nullptr, 0xFFFFFFFF);
-	} else {
-		internals.context->OMSetBlendState(r->blend_alpha, nullptr, 0xFFFFFFFF);
-	}
+	// #1599: the SHARED three-way rule, not the inverted two-way test that
+	// used to live here (`(flags & SOURCE_ALPHA_BIT) == 0` read as
+	// "premultiplied") — that blended opaque quads and ignored
+	// UNPREMULTIPLIED_ALPHA_BIT entirely, which is exactly the combination
+	// the CTS SourceAlphaBlending case submits. A quad is never the tile's
+	// base cover, so it takes its own flags: the first-layer REPLACE gate
+	// (#1598) belongs to the full-tile projection blit alone.
+	internals.context->OMSetBlendState(blend_state_for(r, comp_layer_blend_mode(data->flags)), nullptr, 0xFFFFFFFF);
 
 	// Draw quad (triangle strip, 4 vertices)
 	internals.context->Draw(4, 0);
@@ -1114,7 +1146,16 @@ render_window_space_layer(struct comp_d3d11_renderer *r,
 	internals.context->PSSetShaderResources(0, 1, &srv);
 	internals.context->PSSetSamplers(0, 1, &r->sampler_linear);
 
-	// Set blend state for alpha blending
+	// Set blend state for alpha blending.
+	//
+	// #1599 deliberately stops at the Khronos layer types. This is Local2D
+	// (XR_DXR window-space), a runtime-owned 2D channel whose submitters
+	// treat layerFlags == 0 as "premultiplied bytes" and expect a BLEND —
+	// cube_handle_d3d11_win's own panels do (main.cpp, `layerFlags = 0;
+	// // premultiplied bytes`), as does the out-of-tree shell chrome.
+	// Converging it on comp_layer_blend_mode() would turn every such panel
+	// into an opaque rectangle, so it needs its own decision and its own
+	// eyeball, not a silent ride-along on a CTS fix.
 	bool is_premultiplied = (data->flags & XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT) == 0;
 	if (is_premultiplied) {
 		internals.context->OMSetBlendState(r->blend_premul, nullptr, 0xFFFFFFFF);
