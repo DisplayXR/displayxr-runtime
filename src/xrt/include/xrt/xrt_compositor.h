@@ -593,11 +593,14 @@ struct xrt_layer_frame_data
 	 * anything expressed relative to the head into the frame every layer
 	 * pose in this frame lives in.
 	 *
-	 * Filled on EVERY frame (one device pose fetch), unlike @ref cameras,
-	 * because its consumer is the compositor's own eye-and-canvas camera
-	 * synthesis — `comp_layer_view_camera_select_eyes()` branch (b) — which
-	 * runs precisely on the frames that have NO cameras and no projection
-	 * layer. The display processor reports its eyes relative to the head
+	 * Filled under the SAME gate as @ref cameras — only when the frame
+	 * carries a non-projection layer — because the fetch is a blocking IPC
+	 * round trip on the head device in service mode and a projection-only
+	 * frame has no consumer for it. The consumer is the compositor's own
+	 * eye-and-canvas camera synthesis —
+	 * `comp_layer_view_camera_select_eyes()` branch (b) — which matters on
+	 * the frames that have a non-projection layer but NO cameras (e.g. the
+	 * view_rig bail-out). The display processor reports its eyes relative to the head
 	 * (the display plane), so branch (b) must compose this to end up in the
 	 * same frame as the quad it is about to project; without it a VIEW quad
 	 * would render right and a LOCAL quad wrong.

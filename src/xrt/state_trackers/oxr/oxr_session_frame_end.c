@@ -2994,10 +2994,12 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 	 * compositor's branch-(b) synthesis has only the DP eye, so it needs this
 	 * to reach the frame handle_space() puts the layers in.
 	 *
-	 * Filled unconditionally, NOT gated on a non-projection layer being
-	 * present like the cameras below: it is one device pose fetch, and the
-	 * consumer (the compositor) decides per view, per layer, long after the
-	 * gate could have been evaluated here.
+	 * Gated on a non-projection layer being present, exactly like the cameras
+	 * below and for the same reason: on the head device this fetch is a
+	 * BLOCKING IPC round trip in service mode (ipc_client_xdev.c), its only
+	 * consumer is the compositor's branch (b) for non-projection layers, and
+	 * it re-enters the vendor DP's pose path. A projection-only frame — every
+	 * shell / engine / browser frame — must not pay it.
 	 *
 	 * ORDER MATTERS, and it is BEFORE the cameras block on purpose.
 	 * qwerty_get_tracked_pose() (qwerty_device.c:347) is stateful: it
@@ -3010,7 +3012,18 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 	 * alongside. Magnitudes are safe either way (time-based integration,
 	 * consume-once deltas: nothing is double-applied or scaled).
 	 */
-	{
+	bool needs_camera = false;
+	for (uint32_t i = 0; i < frameEndInfo->layerCount && !needs_camera; i++) {
+		switch (frameEndInfo->layers[i]->type) {
+		case XR_TYPE_COMPOSITION_LAYER_QUAD:
+		case XR_TYPE_COMPOSITION_LAYER_CUBE_KHR:
+		case XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR:
+		case XR_TYPE_COMPOSITION_LAYER_EQUIRECT_KHR:
+		case XR_TYPE_COMPOSITION_LAYER_EQUIRECT2_KHR: needs_camera = true; break;
+		default: break;
+		}
+	}
+	if (needs_camera) {
 		struct xrt_space_relation head_rel = XRT_SPACE_RELATION_ZERO;
 		xrt_device_get_tracked_pose(xdev, XRT_INPUT_GENERIC_HEAD_POSE, xrt_display_time_ns, &head_rel);
 		const enum xrt_space_relation_flags need =
@@ -3040,26 +3053,13 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 	 * frame pays nothing: the locate costs a device pose fetch (an IPC round
 	 * trip in service mode) that a frame with no consumer must not pay.
 	 */
-	{
-		bool needs_camera = false;
-		for (uint32_t i = 0; i < frameEndInfo->layerCount && !needs_camera; i++) {
-			switch (frameEndInfo->layers[i]->type) {
-			case XR_TYPE_COMPOSITION_LAYER_QUAD:
-			case XR_TYPE_COMPOSITION_LAYER_CUBE_KHR:
-			case XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR:
-			case XR_TYPE_COMPOSITION_LAYER_EQUIRECT_KHR:
-			case XR_TYPE_COMPOSITION_LAYER_EQUIRECT2_KHR: needs_camera = true; break;
-			default: break;
-			}
-		}
-		if (needs_camera) {
-			uint32_t camera_count = 0;
-			XrResult cam_ret = oxr_session_frame_view_cameras( //
-			    log, sess, frameEndInfo->displayTime, &camera_count, data.cameras);
-			if (cam_ret == XR_SUCCESS && camera_count > 0) {
-				data.camera_count = camera_count;
-				data.cameras_valid = true;
-			}
+	if (needs_camera) {
+		uint32_t camera_count = 0;
+		XrResult cam_ret = oxr_session_frame_view_cameras( //
+		    log, sess, frameEndInfo->displayTime, &camera_count, data.cameras);
+		if (cam_ret == XR_SUCCESS && camera_count > 0) {
+			data.camera_count = camera_count;
+			data.cameras_valid = true;
 		}
 	}
 
