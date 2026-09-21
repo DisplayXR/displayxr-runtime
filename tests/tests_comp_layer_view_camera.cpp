@@ -1086,3 +1086,138 @@ TEST_CASE("comp_layer_view_camera: no backend gates its draw on the return value
 		CHECK(calls > 0);
 	}
 }
+
+TEST_CASE("comp_layer_blend_mode: the OpenXR 10.6.2 truth table, all four flag combos")
+{
+	constexpr uint32_t kSrcAlpha = XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+	constexpr uint32_t kUnpremul = XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT;
+
+	// No SOURCE_ALPHA -> the layer alpha is one, i.e. an opaque cover. This
+	// is the case the D3D11 in-process renderer had INVERTED (#1599): it
+	// read `(flags & SOURCE_ALPHA) == 0` as "premultiplied" and blended
+	// exactly the layers that must not blend.
+	CHECK(comp_layer_blend_mode(0) == COMP_LAYER_BLEND_REPLACE);
+
+	// ... and UNPREMULTIPLIED on its own means nothing without it. That
+	// combination (unpremultiplied alpha, no source-alpha bit, alpha = 0
+	// texture) is precisely what the CTS SourceAlphaBlending case submits,
+	// and the old two-way rule turned it into a blend.
+	CHECK(comp_layer_blend_mode(kUnpremul) == COMP_LAYER_BLEND_REPLACE);
+
+	CHECK(comp_layer_blend_mode(kSrcAlpha) == COMP_LAYER_BLEND_PREMULTIPLIED);
+	CHECK(comp_layer_blend_mode(kSrcAlpha | kUnpremul) == COMP_LAYER_BLEND_STRAIGHT);
+
+	// Unrelated bits never move the answer.
+	CHECK(comp_layer_blend_mode(kSrcAlpha | XRT_LAYER_COMPOSITION_VIEW_SPACE_BIT) ==
+	      COMP_LAYER_BLEND_PREMULTIPLIED);
+	CHECK(comp_layer_blend_mode(XRT_LAYER_COMPOSITION_CORRECT_CHROMATIC_ABERRATION_BIT) ==
+	      COMP_LAYER_BLEND_REPLACE);
+}
+
+TEST_CASE("comp_layer_quad_is_front_facing: +Z is the front face (#1590)")
+{
+	// The camera at the origin, the quad a metre down -Z with an identity
+	// rotation: its normal is +Z, pointing back at the camera. This is the
+	// ordinary case, and the -Z formula the issue first proposed would have
+	// dropped it.
+	const struct xrt_vec3 camera = {0.0f, 0.0f, 0.0f};
+	const struct xrt_pose facing_camera = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, -1.0f}};
+	CHECK(comp_layer_quad_is_front_facing(&facing_camera, &camera));
+
+	// Rotated 180 degrees about Y: normal is now -Z, i.e. turned away.
+	// "the back face is not visible and must not be drawn by the runtime"
+	// — this is the CTS QuadOcclusion red quad.
+	const struct xrt_pose turned_away = {{0.0f, 1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f}};
+	CHECK_FALSE(comp_layer_quad_is_front_facing(&turned_away, &camera));
+
+	// Edge-on: the camera sits IN the quad's plane, so the dot product is
+	// exactly zero. A zero-area sliver has no defined facing -> not drawn.
+	const struct xrt_pose at_origin = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+	const struct xrt_vec3 in_plane = {1.0f, 0.0f, 0.0f};
+	CHECK_FALSE(comp_layer_quad_is_front_facing(&at_origin, &in_plane));
+
+	// The camera BEHIND a front-facing quad sees its back.
+	const struct xrt_vec3 behind = {0.0f, 0.0f, -2.0f};
+	CHECK_FALSE(comp_layer_quad_is_front_facing(&facing_camera, &behind));
+	// ... and the turned-away quad is visible from there.
+	CHECK(comp_layer_quad_is_front_facing(&turned_away, &behind));
+
+	// Facing follows the ORIENTATION, not the position: a quad off to the
+	// side but still square-on to the camera plane is front-facing.
+	const struct xrt_pose off_axis = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.5f, 0.3f, -1.0f}};
+	CHECK(comp_layer_quad_is_front_facing(&off_axis, &camera));
+
+	// A missing input draws rather than drops.
+	CHECK(comp_layer_quad_is_front_facing(nullptr, &camera));
+	CHECK(comp_layer_quad_is_front_facing(&facing_camera, nullptr));
+}
+
+TEST_CASE("comp_layer_tile_blend_mode: the first layer into a tile REPLACES, whatever its flags")
+{
+	constexpr uint32_t kSrcAlpha = XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+	constexpr uint32_t kUnpremul = XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT;
+
+	SECTION("a single-projection-layer frame is today's path, byte for byte")
+	{
+		/*
+		 * Every shipping app submits ONE projection layer, and a
+		 * transparent-background one sets SOURCE_ALPHA on it
+		 * (cube_handle_gl_win, cube_handle_vk_win, every cube_zones_*).
+		 * The gate must NOT look at that bit: blending that blit over
+		 * the clear would drive dst.a to 1 everywhere and kill the
+		 * display processor's alpha gate / compose-under (#225).
+		 */
+		struct comp_layer_tile_state tile = {};
+		CHECK(comp_layer_is_first_in_tile(&tile));
+		CHECK(comp_layer_tile_blend_mode(&tile, kSrcAlpha) == COMP_LAYER_BLEND_REPLACE);
+		CHECK_FALSE(comp_layer_is_first_in_tile(&tile));
+	}
+
+	SECTION("first wins over every flag combination")
+	{
+		for (uint32_t flags : {0u, kSrcAlpha, kUnpremul, kSrcAlpha | kUnpremul}) {
+			struct comp_layer_tile_state tile = {};
+			CHECK(comp_layer_tile_blend_mode(&tile, flags) == COMP_LAYER_BLEND_REPLACE);
+		}
+	}
+
+	SECTION("later layers take their flags — this is the painter's algorithm")
+	{
+		struct comp_layer_tile_state tile = {};
+		// Layer 0: the base blit.
+		CHECK(comp_layer_tile_blend_mode(&tile, 0) == COMP_LAYER_BLEND_REPLACE);
+		// Layer 1: a blended overlay.
+		CHECK(comp_layer_tile_blend_mode(&tile, kSrcAlpha) == COMP_LAYER_BLEND_PREMULTIPLIED);
+		// Layer 2: straight alpha.
+		CHECK(comp_layer_tile_blend_mode(&tile, kSrcAlpha | kUnpremul) == COMP_LAYER_BLEND_STRAIGHT);
+		// Layer 3: no blend bit — legitimately covers what is under it
+		// (§10.6.2: alpha initialised to one). NOT privileged as a base
+		// layer, just opaque.
+		CHECK(comp_layer_tile_blend_mode(&tile, 0) == COMP_LAYER_BLEND_REPLACE);
+	}
+
+	SECTION("tiles are independent: view 1 starts fresh")
+	{
+		struct comp_layer_tile_state tiles[2] = {};
+		CHECK(comp_layer_tile_blend_mode(&tiles[0], kSrcAlpha) == COMP_LAYER_BLEND_REPLACE);
+		CHECK(comp_layer_tile_blend_mode(&tiles[0], kSrcAlpha) == COMP_LAYER_BLEND_PREMULTIPLIED);
+		// The second eye's tile has had nothing painted into it yet.
+		CHECK(comp_layer_is_first_in_tile(&tiles[1]));
+		CHECK(comp_layer_tile_blend_mode(&tiles[1], kSrcAlpha) == COMP_LAYER_BLEND_REPLACE);
+	}
+
+	SECTION("a NULL tile is 'treat as first' — a caller that tracks nothing never blends")
+	{
+		CHECK(comp_layer_is_first_in_tile(nullptr));
+		CHECK(comp_layer_tile_blend_mode(nullptr, kSrcAlpha | kUnpremul) == COMP_LAYER_BLEND_REPLACE);
+	}
+
+	SECTION("marking is idempotent")
+	{
+		struct comp_layer_tile_state tile = {};
+		comp_layer_tile_mark_composited(&tile);
+		comp_layer_tile_mark_composited(&tile);
+		CHECK_FALSE(comp_layer_is_first_in_tile(&tile));
+		comp_layer_tile_mark_composited(nullptr); // must not crash
+	}
+}
