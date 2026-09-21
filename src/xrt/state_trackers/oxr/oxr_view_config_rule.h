@@ -78,18 +78,23 @@
  * @ref oxr_projection_view_count_verdict is that rule, parameterised on the
  * DXR_UNDER_SUBMIT switch so the removal is staged rather than abrupt:
  *
- *   | DXR_UNDER_SUBMIT | PRIMARY_STEREO          | PRIMARY_MULTIVIEW_DXR |
- *   |------------------|-------------------------|-----------------------|
- *   | 0 strict         | == R (2)                | == R (device max)     |
- *   | 1 DEFAULT        | == R, or 1 (DEPRECATED, | == R                  |
- *   |                  | ext + a 1-view mode in   |                       |
- *   |                  | play: active OR begun)   |                       |
- *   | 2 kill switch    | pre-ADR-041 tight rule  | pre-ADR-041 permissive|
+ *   | DXR_UNDER_SUBMIT | PRIMARY_STEREO          | PRIMARY_MULTIVIEW_DXR   |
+ *   |------------------|-------------------------|-------------------------|
+ *   | 0 strict         | == R (2)                | == R (device max)       |
+ *   | 1 DEFAULT        | == R, or 1 (DEPRECATED, | == R, or 1 (DEPRECATED, |
+ *   |                  | ext + a 1-view mode in   | ext + a 1-view mode in   |
+ *   |                  | play: active OR begun)   | play: active OR begun)   |
+ *   | 2 kill switch    | pre-ADR-041 tight rule  | pre-ADR-041 permissive  |
  *
  * The 1-view arm survives at the default ONLY because RELEASED demos submit one
- * view in 2D mode; it answers OXR_VIEW_COUNT_OK_DEPRECATED so the caller can
- * log it once per session. It is unreachable from a CTS run either way — a
- * conformance session never enables XR_DXR_display_info, which the arm requires.
+ * view in 2D mode — under either view configuration, since those demos moved to
+ * PRIMARY_MULTIVIEW_DXR before ADR-041 landed (#1612). It is the SAME arm for
+ * both types: exactly one view, the extension enabled, and a 1-view mode in
+ * play. Any other under-submission (2 of 4 in a stereo mode, 1 in a 3D mode)
+ * is refused at the default. It answers OXR_VIEW_COUNT_OK_DEPRECATED so the
+ * caller can log it once per session. It is unreachable from a CTS run either
+ * way — a conformance session never enables XR_DXR_display_info, which the arm
+ * requires. The window closes once every demo aliases its inactive views.
  *
  * Both are pure integer decisions with no runtime dependency, so they are pinned
  * on the host (tests/tests_oxr_view_config_rule.cpp) — the real entry point
@@ -186,7 +191,8 @@ enum oxr_under_submit_mode
 {
 	//! Every type submits exactly the located count. No relaxation at all.
 	OXR_UNDER_SUBMIT_STRICT = 0,
-	//! DEFAULT: as STRICT, plus the deprecated PRIMARY_STEREO 1-view arm.
+	//! DEFAULT: as STRICT, plus the deprecated 1-view-in-a-1-view-mode arm
+	//! (both PRIMARY_STEREO and PRIMARY_MULTIVIEW_DXR, #1612).
 	OXR_UNDER_SUBMIT_COMPAT = 1,
 	//! Kill switch: the pre-ADR-041 rules, including MULTIVIEW under-submit.
 	OXR_UNDER_SUBMIT_LEGACY = 2,
@@ -276,15 +282,21 @@ oxr_projection_view_count_verdict(uint32_t submitted,
 		return OXR_VIEW_COUNT_OK;
 	}
 
-	// The one compat arm. MULTIVIEW never gets it: nothing released
-	// under-submits there, so there is no compat window to hold open.
+	// The one compat arm, identical for both types. Released demos submit a
+	// single view in 2D mode, and they were moved to PRIMARY_MULTIVIEW_DXR
+	// before ADR-041 landed, so a STEREO-only arm froze their 2D frames (every
+	// one rejected, the last 3D weave left on the panel — #1612). Scoped to
+	// exactly that case: ONE view, the extension on, a 1-view mode in play.
+	// A MULTIVIEW session submitting 2 of 4 in a stereo mode, or 1 in a 3D
+	// mode, is still refused here — nothing released does that.
 	//
 	// #1528's mode-edge grace applies HERE too, not just on the legacy path: a
 	// released 1-view app is exactly the app a 2D->3D switch can catch in
 	// flight, and ADR-041 changed which function decides, not whose fault the
 	// race is. Judging only the LIVE mode would drop one frame per crossing
 	// again — the regression #1528 measured 4/4 on the win box with Unity.
-	if (under_submit == OXR_UNDER_SUBMIT_COMPAT && !is_multiview && submitted == 1 && display_info_enabled &&
+	(void)is_multiview; // Same arm for both types; only the LEGACY path splits.
+	if (under_submit == OXR_UNDER_SUBMIT_COMPAT && submitted == 1 && display_info_enabled &&
 	    (active_mode_view_count == 1 || begun_mode_view_count == 1)) {
 		return OXR_VIEW_COUNT_OK_DEPRECATED;
 	}

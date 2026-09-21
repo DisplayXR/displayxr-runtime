@@ -57,10 +57,13 @@ DEBUG_GET_ONCE_BOOL_OPTION(views_change_event, "DXR_VIEWS_CHANGE_EVENT", true)
  * ADR-041 staging switch for the fixed-view-count submission contract.
  *
  *   0 = strict     every view configuration submits exactly the located count.
- *                  By definition this also drops the deprecated PRIMARY_STEREO
- *                  1-view arm below.
- *   1 = DEFAULT    strict, plus that one deprecated arm, because RELEASED demos
- *                  submit a single view in 2D mode and need a compat window.
+ *                  By definition this also drops the deprecated 1-view arm
+ *                  below, for BOTH PRIMARY_STEREO and PRIMARY_MULTIVIEW_DXR.
+ *   1 = DEFAULT    strict, plus that one deprecated arm — one view, while a
+ *                  1-view mode is in play, XR_DXR_display_info enabled — for
+ *                  both types, because RELEASED demos submit a single view in
+ *                  2D mode and need a compat window (#1612). Closed once every
+ *                  demo aliases its inactive views.
  *   2 = kill       the pre-ADR-041 rules, MULTIVIEW under-submit included.
  *
  * CI stays on the default: a CTS session never enables XR_DXR_display_info, and
@@ -805,9 +808,11 @@ verify_projection_view_count(struct oxr_session *sess,
 			U_LOG_W(
 			    "DEPRECATED projection submission: this session began %s, which reports %u "
 			    "view(s) per frame, but submitted a projection layer with viewCount == %u. "
-			    "Accepted for now (DXR_UNDER_SUBMIT=1). Fix: submit xrLocateViews' count and "
-			    "alias inactive views (XR_DXR_display_info v21) — chain "
-			    "XrViewActivityStateDXR on XrViewState to learn how many are active.",
+			    "Accepted for now (DXR_UNDER_SUBMIT=1); this compatibility window will be "
+			    "removed (#1612). Fix: submit every view xrLocateViews returned and alias the "
+			    "inactive ones onto a rendered subimage (XR_DXR_display_info v21, e.g. "
+			    "DxrAliasInactiveViews) — chain XrViewActivityStateDXR on XrViewState to "
+			    "learn how many are active.",
 			    is_multiview ? "XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR"
 			                 : "XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO",
 			    reported, proj->viewCount);
