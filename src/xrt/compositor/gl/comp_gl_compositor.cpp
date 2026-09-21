@@ -202,15 +202,26 @@ static const char *VS_FULLSCREEN_QUAD =
     "}\n";
 
 //! Fragment shader: blit single texture to screen.
+//!
+//! u_color_scale / u_color_bias is the same `color * scale + bias` channel the
+//! quad shaders end in. Nothing here implements
+//! XR_KHR_composition_layer_color_scale_bias yet; the channel exists so
+//! comp_layer_blend_fold_opaque_cover() can make this shader emit alpha = 1 for
+//! a COMP_LAYER_BLEND_OPAQUE_COVER draw (#1621) — no fixed-function blend
+//! factor can synthesise a constant one. Seeded to identity right after link
+//! (gl_seed_blit_color_identity) so every other blit call site is unaffected,
+//! and restored to identity by the only loop that ever changes it.
 static const char *FS_BLIT =
     "#version 330 core\n"
     "in vec2 v_uv;\n"
     "out vec4 fragColor;\n"
     "uniform sampler2D u_texture;\n"
     "uniform vec4 u_src_rect;\n" // x, y, w, h in normalized coords
+    "uniform vec4 u_color_scale;\n"
+    "uniform vec4 u_color_bias;\n"
     "void main() {\n"
     "    vec2 uv = u_src_rect.xy + v_uv * u_src_rect.zw;\n"
-    "    fragColor = texture(u_texture, uv);\n"
+    "    fragColor = texture(u_texture, uv) * u_color_scale + u_color_bias;\n"
     "}\n";
 
 //! Fragment shader: blit one layer of an ARRAY texture to the atlas. Under
@@ -223,11 +234,13 @@ static const char *FS_BLIT_ARRAY =
     "in vec2 v_uv;\n"
     "out vec4 fragColor;\n"
     "uniform sampler2DArray u_texture;\n"
-    "uniform vec4 u_src_rect;\n" // x, y, w, h in normalized coords
-    "uniform float u_layer;\n"   // array slice (imageArrayIndex)
+    "uniform vec4 u_src_rect;\n"    // x, y, w, h in normalized coords
+    "uniform float u_layer;\n"      // array slice (imageArrayIndex)
+    "uniform vec4 u_color_scale;\n" // see FS_BLIT
+    "uniform vec4 u_color_bias;\n"
     "void main() {\n"
     "    vec2 uv = u_src_rect.xy + v_uv * u_src_rect.zw;\n"
-    "    fragColor = texture(u_texture, vec3(uv, u_layer));\n"
+    "    fragColor = texture(u_texture, vec3(uv, u_layer)) * u_color_scale + u_color_bias;\n"
     "}\n";
 
 //! Vertex shader: positioned quad for window-space layers.
@@ -1770,6 +1783,66 @@ create_program(const char *vs_src, const char *fs_src)
 		return 0;
 	}
 	return prog;
+}
+
+/*!
+ * Write identity into a blit program's colour scale/bias (#1621).
+ *
+ * GL uniform state is per-PROGRAM and persists, and the default value of an
+ * unwritten uniform is zero — which for a multiplier means every pixel black.
+ * So identity is written once after link, and the one loop that folds an
+ * OPAQUE_COVER alpha-of-one into these restores identity afterwards.
+ */
+static void
+gl_seed_blit_color_identity(GLuint prog)
+{
+	if (prog == 0) {
+		return;
+	}
+	glUseProgram(prog);
+	glUniform4f(glGetUniformLocation(prog, "u_color_scale"), 1.0f, 1.0f, 1.0f, 1.0f);
+	glUniform4f(glGetUniformLocation(prog, "u_color_bias"), 0.0f, 0.0f, 0.0f, 0.0f);
+	glUseProgram(0);
+}
+
+/*!
+ * Bind the GL blend state that implements one shared blend mode (#1621).
+ *
+ * REPLACE and OPAQUE_COVER share BLENDING OFF and differ only in the ALPHA THE
+ * FRAGMENT SHADER EMITS:
+ *
+ *  - REPLACE is the tile's base blit and writes the source RGBA verbatim.
+ *    Forcing dst.a to 1 there would break the compose-under contract a
+ *    transparent-background app's first blit depends on (#225).
+ *  - OPAQUE_COVER is a LATER unflagged layer, whose alpha the spec treats as
+ *    one; comp_layer_blend_fold_opaque_cover() makes the shader emit it. No
+ *    fixed-function blend factor can synthesise a constant one — GL_ONE/GL_ZERO
+ *    gives src.a and a colour-only write mask preserves dst.a instead of
+ *    raising it (see the enum in comp_layer_view_camera.h).
+ *
+ * So every caller that can produce OPAQUE_COVER must fold the mode into its
+ * colour scale/bias as well as call this.
+ *
+ * The alpha factors are GL_ONE / GL_ONE_MINUS_SRC_ALPHA in both blended modes
+ * so the source's own transparency survives into the atlas; the modes differ
+ * only in the source RGB factor.
+ */
+static void
+gl_apply_blend_mode(enum comp_layer_blend_mode mode)
+{
+	switch (mode) {
+	case COMP_LAYER_BLEND_PREMULTIPLIED:
+		glEnable(GL_BLEND);
+		glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+		break;
+	case COMP_LAYER_BLEND_STRAIGHT:
+		glEnable(GL_BLEND);
+		glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+		break;
+	case COMP_LAYER_BLEND_REPLACE:
+	case COMP_LAYER_BLEND_OPAQUE_COVER:
+	default: glDisable(GL_BLEND); break;
+	}
 }
 
 static GLenum
@@ -3930,7 +4003,16 @@ gl_compositor_capture_atlas_to_png(struct comp_gl_compositor *c, const char *pat
 
 	// Swapchain alpha is undefined for display output — force opaque so the
 	// PNG doesn't render fully transparent/black (issue #425).
-	u_image_force_opaque_rgba8(top_down, content_w, content_h, row_pitch);
+	//
+	// DXR_ATLAS_CAPTURE_RAW_ALPHA=1 keeps the atlas's true alpha, which the
+	// OpenXR §10.6.2 opaque-cover check has to read back (0 = the fix is
+	// missing, 255 = present). Stamping 255 unconditionally made that
+	// acceptance leg unable to fail — and left GL unable to be compared
+	// against Metal, which already honoured the switch (#1621). Default is
+	// unchanged.
+	if (!u_image_capture_raw_alpha()) {
+		u_image_force_opaque_rgba8(top_down, content_w, content_h, row_pitch);
+	}
 
 	bool ok = stbi_write_png(path, (int)content_w, (int)content_h, 4, top_down, (int)row_pitch) != 0;
 	free(top_down);
@@ -4615,6 +4697,20 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 	GLint loc_layer_arr = glGetUniformLocation(c->program_blit_array, "u_layer");
 	GLint loc_flip_arr = glGetUniformLocation(c->program_blit_array, "u_flip_y");
 
+	// OPAQUE_COVER's alpha-of-one, folded into the blit shaders' colour
+	// scale/bias (#1621). Identity for every other mode.
+	GLint loc_cscale = glGetUniformLocation(c->program_blit, "u_color_scale");
+	GLint loc_cbias = glGetUniformLocation(c->program_blit, "u_color_bias");
+	GLint loc_cscale_arr = glGetUniformLocation(c->program_blit_array, "u_color_scale");
+	GLint loc_cbias_arr = glGetUniformLocation(c->program_blit_array, "u_color_bias");
+	bool blit_color_folded = false;
+
+	// Painter's-order state, ONE per tile (#1598/#1621). The FIRST layer into
+	// a tile is a REPLACE whatever its flags say — the #225 compose-under
+	// contract — and only later layers blend per their own flags. The shared
+	// gate is comp_layer_tile_blend_mode().
+	struct comp_layer_tile_state tiles[XRT_MAX_VIEWS] = {};
+
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		struct comp_layer *layer = &c->layer_accum.layers[i];
 
@@ -4633,6 +4729,25 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 		if (view_count > c->eff_views) view_count = c->eff_views;
 		if (view_count == 0) view_count = 1;
 		for (uint32_t eye = 0; eye < view_count; eye++) {
+			// How this draw composites (#1621), resolved BEFORE the draw
+			// can bail out so "which layer is the tile's base" is a pure
+			// function of the layer LIST, not of a transient swapchain
+			// hiccup (D3D11 parity).
+			//
+			// A zone paints a SUB-RECT, so it is never a base cover and
+			// keeps its own ADR-027 alpha-over rule verbatim — it marks the
+			// tile (a projection layer after it blends over it) but
+			// bypasses the first-layer gate.
+			enum comp_layer_blend_mode mode;
+			if (eye < XRT_MAX_VIEWS && is_zone) {
+				comp_layer_tile_mark_composited(&tiles[eye]);
+				mode = (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0
+				           ? COMP_LAYER_BLEND_STRAIGHT
+				           : COMP_LAYER_BLEND_PREMULTIPLIED;
+			} else {
+				mode = comp_layer_tile_blend_mode(eye < XRT_MAX_VIEWS ? &tiles[eye] : NULL,
+				                                  layer->data.flags);
+			}
 
 			struct xrt_swapchain *sc = layer->sc_array[eye];
 			if (sc == NULL) {
@@ -4675,7 +4790,7 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 				// framebuffer, so the placement Y flips within the
 				// tile (zone content stays GL-oriented, like a
 				// projection tile). Premul vs straight alpha-over per
-				// the UNPREMULTIPLIED flag.
+				// the UNPREMULTIPLIED flag (resolved above).
 				if (zones_target_w == 0 || zones_target_h == 0) {
 					continue;
 				}
@@ -4692,17 +4807,17 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 					continue;
 				}
 				glViewport(zx, zy, zw, zh);
-				glEnable(GL_BLEND);
-				if ((layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0) {
-					glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE,
-					                    GL_ONE_MINUS_SRC_ALPHA);
-				} else {
-					glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE,
-					                    GL_ONE_MINUS_SRC_ALPHA);
-				}
 			} else {
 				glViewport(tbx, tby, tbw, tbh);
 			}
+
+			// The shared blend state, plus the OPAQUE_COVER alpha-of-one
+			// the fixed-function blender cannot produce.
+			gl_apply_blend_mode(mode);
+			float cscale[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+			float cbias[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+			comp_layer_blend_fold_opaque_cover(mode, cscale, cbias);
+			blit_color_folded = blit_color_folded || mode == COMP_LAYER_BLEND_OPAQUE_COVER;
 
 			// Honor the projection view's array layer (imageArrayIndex).
 			// Layered swapchains sample the requested slice via the
@@ -4718,11 +4833,15 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 				glUniform1i(loc_tex_arr, 0);
 				glUniform4f(loc_rect_arr, nr.x, nr.y, nr.w, nr.h);
 				glUniform1f(loc_layer_arr, (float)array_index);
+				glUniform4fv(loc_cscale_arr, 1, cscale);
+				glUniform4fv(loc_cbias_arr, 1, cbias);
 			} else {
 				glUseProgram(c->program_blit);
 				glBindTexture(GL_TEXTURE_2D, gsc->textures[img_idx]);
 				glUniform1i(loc_tex, 0);
 				glUniform4f(loc_rect, nr.x, nr.y, nr.w, nr.h);
+				glUniform4fv(loc_cscale, 1, cscale);
+				glUniform4fv(loc_cbias, 1, cbias);
 			}
 
 			// One-shot diagnostic: log blit params for both eyes
@@ -4741,13 +4860,17 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 
 			// Draw fullscreen quad (3 vertices, generated in vertex shader)
 			glDrawArrays(GL_TRIANGLES, 0, 3);
-
-			// XR_DXR_display_zones: restore the REPLACE blit state for
-			// the next (projection) draw.
-			if (is_zone) {
-				glDisable(GL_BLEND);
-			}
 		}
+	}
+
+	// Hand the pass back the way it was found: blending off, and the blit
+	// programs' colour scale/bias back at identity for every other call site
+	// (GL uniform state is per-program and persists — see
+	// gl_seed_blit_color_identity).
+	glDisable(GL_BLEND);
+	if (blit_color_folded) {
+		gl_seed_blit_color_identity(c->program_blit);
+		gl_seed_blit_color_identity(c->program_blit_array);
 	}
 
 	// Projection-only capture point — atlas now contains projection
@@ -4910,19 +5033,28 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 					cbias[3] = data->color_bias.a;
 				}
 
-				// OpenXR's blend switch: SOURCE_ALPHA set ⇒ the texture carries
-				// STRAIGHT alpha (every CTS quad sets it); clear ⇒
-				// premultiplied. Inverse sense to the zone / Local2D
-				// UNPREMULTIPLIED bit — mirrors D3D11 and Metal.
-				const bool straight_alpha =
-				    (data->flags & XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT) != 0;
-				if (straight_alpha) {
-					glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE,
-					                    GL_ONE_MINUS_SRC_ALPHA);
-				} else {
-					glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE,
-					                    GL_ONE_MINUS_SRC_ALPHA);
-				}
+				// #1621: the SHARED three-way rule, not the inverted two-way
+				// test that used to live here (SOURCE_ALPHA_BIT read as
+				// "straight"). The spec's straight-alpha switch is
+				// XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT, so
+				// SOURCE_ALPHA_BIT *alone* is PREMULTIPLIED and no
+				// source-alpha bit at all is an OPAQUE_COVER. The old mapping
+				// came from the design brief this port was written from, not
+				// from the port — and it made GL and Metal disagree with
+				// D3D11 on the same layer.
+				//
+				// A quad is never the tile's base cover, so it takes its own
+				// flags: the first-layer REPLACE gate (#1598) belongs to the
+				// full-tile projection blit alone.
+				//
+				// Resolved BEFORE the uniforms are written because an
+				// unflagged quad is an OPAQUE_COVER, whose alpha-of-one is
+				// emitted by the shader (fixed-function blending cannot make
+				// a constant one) — the fold is half of that mode, the blend
+				// state is the other.
+				const enum comp_layer_blend_mode mode = comp_layer_blend_mode(data->flags);
+				comp_layer_blend_fold_opaque_cover(mode, cscale, cbias);
+				gl_apply_blend_mode(mode);
 
 				const bool layered = qgsc->target == GL_TEXTURE_2D_ARRAY;
 				const GLuint prog = layered ? c->program_quad_array : c->program_quad;
@@ -5740,11 +5872,20 @@ gl_init_resources(struct comp_gl_compositor *c, uint32_t width, uint32_t height)
 	c->program_quad = create_program(VS_QUAD, FS_QUAD);
 	c->program_quad_array = create_program(VS_QUAD, FS_QUAD_ARRAY);
 
-	if (!c->program_blit || !c->program_window_space || !c->program_masked_composite ||
+	if (!c->program_blit || !c->program_blit_array || !c->program_window_space || !c->program_masked_composite ||
 	    !c->program_quad || !c->program_quad_array) {
 		U_LOG_E("Failed to compile GL compositor shaders");
 		return false;
 	}
+
+	// Seed the blit programs' colour scale/bias to IDENTITY (#1621). GL
+	// uniforms default to zero, and a zero scale is BLACK — so the default
+	// has to be written once, here, rather than relied upon. Only the atlas
+	// projection loop ever changes it (to fold an OPAQUE_COVER alpha-of-one),
+	// and it restores identity when it is done; every other blit call site
+	// therefore never touches these two.
+	gl_seed_blit_color_identity(c->program_blit);
+	gl_seed_blit_color_identity(c->program_blit_array);
 
 	// Empty VAO for vertex-shader-generated geometry
 	glGenVertexArrays(1, &c->vao_empty);
