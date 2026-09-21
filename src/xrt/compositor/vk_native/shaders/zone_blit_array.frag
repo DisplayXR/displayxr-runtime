@@ -1,26 +1,27 @@
 // Copyright 2026, DisplayXR
 // SPDX-License-Identifier: BSL-1.0
 //
-// LAYERED (arraySize > 1) twin of zone_blit.frag.
+// Compose-pass fragment shader (sampler2DArray source).
 //
-// Under single-pass-instanced stereo an app submits ONE swapchain with
-// arraySize = 2 and addresses each view by subImage.imageArrayIndex
-// (ADR-032). Its VkImageView is then a VK_IMAGE_VIEW_TYPE_2D_ARRAY, which a
-// `sampler2D` cannot bind — so before this variant existed the draw pass
-// refused the WHOLE FRAME and fell back to vkCmdBlitImage (which cannot
-// blend). Same split as D3D11's projection_ps_array_source and GL's
-// FS_BLIT_ARRAY.
-//
-// The slice rides the push block rather than a specialization constant
-// because it changes per draw, not per pipeline.
+// Ends in `color * color_scale + color_bias` — the
+// XR_KHR_composition_layer_color_scale_bias channel every layer shader in the
+// tree applies, identity when the app asked for nothing. That one line is
+// also how COMP_LAYER_BLEND_OPAQUE_COVER gets its spec-mandated alpha of one:
+// comp_layer_blend_fold_opaque_cover() sets scale.a = 0, bias.a = 1 on the
+// CPU side. Fixed-function blending cannot synthesise a constant 1 from an
+// arbitrary src.a, and folding it here costs no extra push-constant field and
+// no second shader variant.
 
 #version 450
 
 layout(binding = 0) uniform sampler2DArray src_tex;
 
-layout(push_constant) uniform ZoneParams {
-	vec4 src_rect; // x, y, w, h — normalized source-texture coordinates
-	vec4 params;   // x = array slice (subImage.imageArrayIndex); yzw reserved
+layout(push_constant) uniform ComposeParams {
+	mat4 mvp;
+	vec4 src_rect;
+	vec4 params;      // x = array slice; y = quad flag
+	vec4 color_scale;
+	vec4 color_bias;
 } pc;
 
 layout(location = 0) in vec2 in_uv;
@@ -28,5 +29,5 @@ layout(location = 0) out vec4 out_color;
 
 void main()
 {
-	out_color = texture(src_tex, vec3(in_uv, pc.params.x));
+	out_color = texture(src_tex, vec3(in_uv, pc.params.x)) * pc.color_scale + pc.color_bias;
 }
