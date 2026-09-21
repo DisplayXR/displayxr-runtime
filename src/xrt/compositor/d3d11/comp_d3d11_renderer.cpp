@@ -934,6 +934,16 @@ render_window_space_layer(struct comp_d3d11_renderer *r,
 
 	get_color_scale_bias(data, constants.color_scale, constants.color_bias);
 
+	// #1601: a window-space layer carries an xrt_sub_image exactly as a quad
+	// does, reaches the same whole-array Texture2DArray SRV, and reuses the
+	// same quad shaders — so it had the identical slice bug, and takes the
+	// identical fix. comp_multi_system.c:1555 already honours
+	// ws->sub.array_index on the multi-compositor path; this is the
+	// in-process path agreeing with it.
+	const bool is_layered = comp_d3d11_swapchain_get_array_size(xsc) > 1;
+	const bool use_array_ps = is_layered && r->quad_ps_array != nullptr;
+	constants.array_params[0] = use_array_ps ? static_cast<float>(ws->sub.array_index) : 0.0f;
+
 	// Update constant buffer
 	D3D11_MAPPED_SUBRESOURCE mapped;
 	HRESULT hr = internals.context->Map(r->constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
@@ -944,7 +954,7 @@ render_window_space_layer(struct comp_d3d11_renderer *r,
 
 	// Set shaders - reuse quad shaders (screen-aligned quad with MVP)
 	internals.context->VSSetShader(r->quad_vs, nullptr, 0);
-	internals.context->PSSetShader(r->quad_ps, nullptr, 0);
+	internals.context->PSSetShader(use_array_ps ? r->quad_ps_array : r->quad_ps, nullptr, 0);
 
 	// Bind resources
 	internals.context->VSSetConstantBuffers(0, 1, &r->constant_buffer);
