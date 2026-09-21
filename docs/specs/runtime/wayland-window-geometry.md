@@ -1,6 +1,6 @@
 # Wayland Window Geometry Provider (windowed weaving under Wayland)
 
-- **Issues:** #817 (the provider), #1596 (the logical→device conversion), #1595 (refuse rather than resample)
+- **Issues:** #817 (the provider), #1596 (the logical→device conversion), #1595 (refuse rather than resample); capture exclusion (§6) is the GNOME equivalent of `WDA_EXCLUDEFROMCAPTURE` for Linux transparency (#757)
 - **Status:** Prototype — pending on-hardware validation. What is proven: the D-Bus wire, the PID match, and that the conversion and the present-origin path are exercised (the arithmetic is isolated in `u_wayland_geom.h`, platform-free, and pinned by `tests/tests_aux_wayland_geom.cpp` against both of the measured box's scales — 1.6667 and 2.0). What is open: the weave's phase and scale on a real 3D panel in a Wayland session — sim_display cannot establish either, since its anaglyph/SBS output degrades gracefully under exactly the errors this document exists to prevent.
 - **Scope:** desktop Linux, Wayland sessions, apps using `XR_DXR_wayland_surface_binding`
 - **Governing boundary rule:** [ADR-033](../../adr/ADR-033-placement-reports-geometry-weaver-owns-phase.md) — geometry crosses the runtime↔vendor boundary; phase math (incl. snapping) never does
@@ -82,6 +82,11 @@ GNOME Shell (Mutter)                        DisplayXR runtime process
   - `GetWindows() -> (s)` — JSON snapshot of all normal windows.
   - `WindowsChanged(s)` — same JSON on any position/size/focus/lifetime
     change, coalesced to at most one signal per compositor redraw.
+  - Since extension version 2 the same bus name also serves
+    `org.displayxr.CaptureExclusion1` at `/org/displayxr/CaptureExclusion`
+    (§6), and each window entry carries an additive `capture_excluded`
+    boolean. The geometry payload stays schema `version: 1` — the new field
+    changes the meaning of nothing.
 
   Payload (version 1): per window `pid`, `app_id`, `title`, `focus`,
   `xwayland`, `frame` `[x,y,w,h]` (`get_frame_rect()`), `buffer` `[x,y,w,h]`
@@ -243,6 +248,8 @@ is what lets any package ship it and any runtime consume it.
 
 ## 5. Known limitations / follow-ups (#817)
 
+(Capture-exclusion limitations are listed with it, in §6.6.)
+
 - **Frame vs buffer rect** — the phase needs the rect where the *surface
   pixels* land. For CSD toolkits the buffer rect includes shadow margins;
   both rects are published, `frame` is consumed. Hardware validation decides
@@ -258,3 +265,158 @@ is what lets any package ship it and any runtime consume it.
 - Mutter emits geometry transactionally with its own redraw, so tracking
   during interactive drags is expected to be at least as good as the X11
   per-frame poll; validate visually (phase lock while dragging).
+
+## 6. Capture exclusion — `org.displayxr.CaptureExclusion1` (extension version 2)
+
+### 6.1 Why it exists
+
+A transparent 3D window needs the desktop **behind** it: the weaver flattens
+alpha, so the display processor composes a captured desktop under the stereo
+fringe before weaving (the band where some views are transparent and others
+are not). On Windows the capture excludes the app's own window with
+`SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`. GNOME has no such API, and
+a capture that contains our own window composes our **previous woven frame**
+under the new one, putting both views into both eyes — the double image
+confirmed on a DS1 panel. Without a clean capture the only safe choice is to punch
+where *any* view is transparent (silhouette intersection), which shrinks the
+silhouette by the disparity and — for the rear depth budget (ADR-040) — leaves
+no background to measure, so the runtime clips permanently.
+
+This interface is that missing API, implemented in the compositor where it has
+to live. It lives in this extension rather than a second one because this
+extension is already installed and already required for windowed weaving; one
+extension also means one lifecycle (a single logout activates both).
+
+### 6.2 Mechanism
+
+A `Clutter.Effect` is attached to each excluded window actor. Its `paint`
+forwards to the actor only while the stage is painting a view **on screen** and
+swallows every other paint:
+
+- **On-screen paints** happen once per stage view per frame and always run
+  between the stage's `before-paint` and `after-paint` signals
+  (`clutter-stage-view.c`).
+- **Off-screen paints** — `clutter_stage_paint_to_framebuffer()` /
+  `_to_buffer()` — happen outside that bracket: mutter's ScreenCast
+  `RecordArea` source re-renders the recorded area from an idle callback after
+  the frame, and Shell screenshots / out-of-frame window grabs do the same.
+
+The discriminator is therefore *timing*. The more obvious test, "is this paint
+context's framebuffer a stage view's", is not reachable from JS (the typelib
+exposes `get_framebuffer`, not `get_base_framebuffer`). The spike cross-checked
+the two on ~8,800 paints with zero disagreements.
+
+The window **behind** an excluded one is not left with a hole: mutter culls
+what an opaque window fully covers before painting, but an actor with an active
+effect is exempt from that culling (`meta-cullable.c`), so the occluded windows
+are still painted and the off-screen paint shows them intact.
+
+**Scope.** `RecordArea` (what DisplayXR uses) and screenshots exclude the
+window. A `RecordMonitor` stream that mutter serves by blitting the on-screen
+view framebuffer is a copy of the on-screen paint and **does contain** the
+window — this is weaker than `WDA_EXCLUDEFROMCAPTURE`, which also hides from
+full-monitor capture. Consumers that need exclusion must use `RecordArea`.
+
+### 6.3 D-Bus surface
+
+Service `org.displayxr.WindowGeometry` (the same, singly owned name), object
+`/org/displayxr/CaptureExclusion`, interface `org.displayxr.CaptureExclusion1`:
+
+| Member | Semantics |
+|---|---|
+| `Exclude(u pid) -> (u windows)` | Exclude every window of `pid` — present now **and mapped later** — from off-screen paints. `pid = 0` means the caller. Returns how many windows are excluded right now (`0` is normal before the caller's window maps). |
+| `Release(u pid)` | Drop the caller's registration for `pid` (`0` = caller). |
+| `GetState() -> (s json)` | Diagnostics: `{version, clients:[{sender,pids}], windows:[{pid,title}], paints:{onscreen,skipped}}`. |
+
+**Identification — by registered PID, not guessed.** The extension does not
+decide which processes are "DisplayXR" ones: it is a shared, runtime-agnostic
+asset (§4) and has no way to know which process is driving a 3D panel. The
+display processor (in the app's process for in-process apps) registers its own
+PID. Every window of that PID gets the effect, including dialogs and popups,
+and a window that maps later gets it from the window manager's `map` signal —
+before its first on-screen frame, so no off-screen paint ever sees it
+un-excluded.
+
+**Only your own PID.** A caller may exclude only its own process; anything
+else returns `org.freedesktop.DBus.Error.AccessDenied`. Hiding another process's
+windows from screen recording is not something an unrelated client should be
+able to do silently. IPC/service mode, where the window owner is not the display
+processor's process, needs the client PID plumbed — the same open item as §5's
+PID matching.
+
+**Lifetime is the caller's bus connection.** The registration is dropped when
+the caller's connection goes away (exit, crash, a closed private connection),
+so a dead app can never leave a window invisible to capture. There is no timer
+and no heartbeat.
+
+**Disable removes everything.** `disable()` removes every effect the extension
+added, whether or not its owner is still registered. GNOME disables user
+extensions whenever the screen shield is up, so this happens routinely: the bus
+name disappears, every window becomes capturable again, and on unlock the name
+returns with **no** registrations. Consumers must watch `NameOwnerChanged` and
+re-register (§6.5).
+
+### 6.4 Detecting it
+
+A consumer calls `Exclude(0)` and reads the outcome:
+
+| Result | Meaning |
+|---|---|
+| success | Exclusion live for this connection. |
+| `ServiceUnknown` / `NameHasNoOwner` | Extension not installed / not enabled (or the screen is locked). |
+| `UnknownMethod` / `UnknownObject` / `UnknownInterface` | A version-1 extension: geometry only, no exclusion. |
+
+`metadata.json` carries `"version": 2`; `GetState()` reports the protocol
+revision of `CaptureExclusion1` (`version: 1`).
+
+### 6.5 The consumer: the Leia Linux display processor
+
+`displayxr-leia-plugin` `src/drv_leia_linux/leia_bg_capture_linux.c` +
+`leia_mutter_capture_linux.c`, on one private session-bus connection:
+
+1. `CaptureExclusion1.Exclude(0)` — **first**. If it fails, no capture is started
+   at all; the DP logs once that installing/updating this extension is what
+   enables correct transparency, and runs silhouette intersection.
+2. `org.gnome.Mutter.DisplayConfig.GetCurrentState` — the panel's rectangle in
+   **logical** (stage) coordinates, which is what `RecordArea` takes. The panel
+   is matched by EDID vendor + product (serial breaks ties), then by connector
+   name, then by being the only external monitor at the panel's resolution.
+   Never derived from X11: XWayland's root space is itself scaled.
+3. `org.gnome.Mutter.ScreenCast` `CreateSession` → `RecordArea` over the panel's
+   **full** logical rectangle (the area is fixed when the stream is created, so
+   the panel is recorded, not the window) with `cursor-mode` hidden → `Start` →
+   the stream's `PipeWireStreamAdded(node)`; the PipeWire node is consumed over
+   the default PipeWire socket. Torn down with `Stop` (and by mutter when the
+   connection closes).
+
+**Units, end to end.** `RecordArea` takes logical coordinates and streams
+`area × the highest overlapping monitor scale`, so an area that is exactly the
+panel comes back in the panel's **device** pixels: at 200 % a 1920×1080 logical
+area is a 3840×2160 stream; at 5/3 a 2304×1296 area is 3840×2160. The window
+rectangle the DP receives (present origin + target extent) is already device
+pixels relative to the panel (§1.1), so it is normalised by the panel's device
+size — never by a logical size — to address the stream.
+
+**Trust.** The captured desktop is used only while the exclusion is live. When
+the name owner disappears the capture is distrusted immediately (silhouette
+intersection); when it returns the DP re-registers and additionally skips as
+many frames as the PipeWire pool holds, because *publish* order is not *record*
+order: a frame mutter recorded before the effect was back can still be in the
+pool (observed in the nested-shell test). A session closed by mutter — e.g. the
+user pressing *Stop Screen Sharing* — ends the capture for that session.
+
+### 6.6 Limitations
+
+- **Screen-sharing indicator.** Any mutter ScreenCast session registers a
+  remote-access handle, so while a transparent DisplayXR app runs GNOME shows
+  its "screen is being shared" indicator, whose *Stop* button ends every such
+  session, ours included. The DP treats that as "no capture for the rest of the
+  session" and falls back cleanly. (The portal path had the same indicator, plus
+  a consent dialog.)
+- **Cost.** Each captured frame is one extra off-screen render of the recorded
+  area — the whole panel — by mutter, plus a CPU copy of the frame into the
+  display processor. The effect itself is a few JS calls per paint. Not yet
+  measured at 4K on the panel.
+- `RecordMonitor` streams served by a view blit are not covered (§6.2).
+- GNOME only; another compositor needs its own implementation of the same
+  interface.
