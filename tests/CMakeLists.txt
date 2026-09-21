@@ -41,6 +41,7 @@ set(tests
     tests_aux_mini_window_tell
     tests_aux_zone_canvas
     tests_aux_tiling_zero_copy
+    tests_aux_wayland_geom
     tests_comp_rear_budget
     tests_oxr_weave_latch
     tests_oxr_layer_space
