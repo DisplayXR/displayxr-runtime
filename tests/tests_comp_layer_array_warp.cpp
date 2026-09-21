@@ -38,6 +38,14 @@
  * precedent for a device-backed check in this suite). If no device can be
  * created at all the test SKIPs rather than failing — a machine without D3D11
  * should not turn the suite red.
+ *
+ * Fidelity note, learned the hard way: this must reproduce the renderer's
+ * PIPELINE STATE, not just its shaders. `quad_vs` flips Y in model space, so
+ * its strip is counter-clockwise in NDC, and D3D11's default rasterizer state
+ * (CULL_BACK, front == clockwise) culls it outright. The renderer binds
+ * CULL_NONE; the first CI run of this test did not, and read the magenta clear
+ * for both slices. Anything else this test leaves at a D3D11 default is a
+ * latent version of the same mistake.
  */
 
 #include "d3d11/d3d11_layer_shaders.h"
@@ -93,14 +101,15 @@ struct Fixture
 	ID3D11PixelShader *ps = nullptr;
 	ID3D11Buffer *cb = nullptr;
 	ID3D11SamplerState *samp = nullptr;
+	ID3D11RasterizerState *rast = nullptr;
 
 	~Fixture()
 	{
 		for (IUnknown *p :
-		     {static_cast<IUnknown *>(samp), static_cast<IUnknown *>(cb), static_cast<IUnknown *>(ps),
-		      static_cast<IUnknown *>(vs), static_cast<IUnknown *>(staging), static_cast<IUnknown *>(rtv),
-		      static_cast<IUnknown *>(rt), static_cast<IUnknown *>(srv), static_cast<IUnknown *>(src),
-		      static_cast<IUnknown *>(ctx), static_cast<IUnknown *>(dev)}) {
+		     {static_cast<IUnknown *>(rast), static_cast<IUnknown *>(samp), static_cast<IUnknown *>(cb),
+		      static_cast<IUnknown *>(ps), static_cast<IUnknown *>(vs), static_cast<IUnknown *>(staging),
+		      static_cast<IUnknown *>(rtv), static_cast<IUnknown *>(rt), static_cast<IUnknown *>(srv),
+		      static_cast<IUnknown *>(src), static_cast<IUnknown *>(ctx), static_cast<IUnknown *>(dev)}) {
 			if (p != nullptr) {
 				p->Release();
 			}
@@ -219,6 +228,25 @@ setup(Fixture &f)
 	smp.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
 	smp.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
 	REQUIRE(SUCCEEDED(f.dev->CreateSamplerState(&smp, &f.samp)));
+
+	// CULL_NONE, copied from comp_d3d11_renderer.cpp's create_shaders
+	// (D3D11_CULL_NONE / FrontCounterClockwise FALSE / DepthClipEnable TRUE),
+	// and NOT optional.
+	//
+	// quad_vs flips Y in model space, which makes its triangle strip
+	// counter-clockwise in NDC. D3D11's DEFAULT rasterizer state is
+	// CULL_BACK with FrontCounterClockwise FALSE, i.e. front == clockwise —
+	// so leaving the state unset culls the quad entirely and the readback
+	// returns the clear colour. That is exactly what happened on the first CI
+	// run of this test: both slices read (255,0,255,255), the magenta clear.
+	// The renderer never had the bug because it binds CULL_NONE; the test had
+	// it because it did not reproduce that part of the pipeline.
+	D3D11_RASTERIZER_DESC rs = {};
+	rs.FillMode = D3D11_FILL_SOLID;
+	rs.CullMode = D3D11_CULL_NONE;
+	rs.FrontCounterClockwise = FALSE;
+	rs.DepthClipEnable = TRUE;
+	REQUIRE(SUCCEEDED(f.dev->CreateRasterizerState(&rs, &f.rast)));
 	return true;
 }
 
@@ -260,6 +288,7 @@ draw_slice(Fixture &f, float slice)
 	vp.Height = float(kTargetDim);
 	vp.MaxDepth = 1.0f;
 	f.ctx->RSSetViewports(1, &vp);
+	f.ctx->RSSetState(f.rast);
 	f.ctx->OMSetRenderTargets(1, &f.rtv, nullptr);
 	f.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 	f.ctx->IASetInputLayout(nullptr);
@@ -295,6 +324,21 @@ TEST_CASE("#1601 the array quad shader samples the slice array_params names")
 
 	INFO("slice 0 -> " << got0 << " (expected " << kSlice0 << ")");
 	INFO("slice 1 -> " << got1 << " (expected " << kSlice1 << ")");
+
+	// Separate "the draw never happened" from "the draw sampled the wrong
+	// slice" BEFORE the colour checks, because they need opposite responses
+	// and the colour checks alone cannot tell them apart -- an uncovered
+	// pixel fails all three below and looks like a total slice failure.
+	// Magenta is the clear and nothing in this test can legitimately produce
+	// it. (This is not hypothetical: the first CI run of this test read
+	// magenta for both slices because the rasterizer state was left at
+	// D3D11's CULL_BACK default and the quad was culled.)
+	const Rgba kClear = {255, 0, 255, 255};
+	INFO("a read of " << kClear
+	                  << " means the draw never covered the pixel -- a pipeline-state problem, "
+	                     "NOT a wrong-slice problem");
+	REQUIRE_FALSE(got0 == kClear);
+	REQUIRE_FALSE(got1 == kClear);
 
 	// The load-bearing assertion. Before the fix there was no array shader at
 	// all, and the behaviour it replaced was "always slice 0" — so this is the
