@@ -133,14 +133,29 @@ u_tiling_compute_system_atlas_oriented(const struct xrt_rendering_mode *modes,
 }
 
 /*!
- * Compute the origin of a view within the atlas.
+ * Compute the origin of a view within the atlas, for a TOP-LEFT-origin API.
+ *
+ * **Tile order (#1625).** View @p view_index occupies the tile at column
+ * `view_index % cols`, row `view_index / cols`, counting rows **downward from
+ * the TOP edge of the atlas as displayed** — the picture a human sees, not a
+ * texel address. **View 0 is the top-left tile on every backend and every
+ * platform.** X needs no such statement: no graphics API flips X.
+ *
+ * This variant returns the Y of the tile's **top** edge, which is what D3D11,
+ * D3D12, Metal and Vulkan want (`TopLeftY` / `MTLViewport.originY` /
+ * `VkViewport.y` all address texel row 0 at the top).
+ *
+ * **OpenGL must use @ref u_tiling_view_origin_gl instead** — a GL framebuffer's
+ * origin is the BOTTOM-left, so handing `glViewport` the Y this function
+ * returns places view 0 in the bottom row and mirrors the whole tile grid
+ * against every other backend. That was #1625.
  *
  * @param view_index  Index of the view (0..N-1).
  * @param cols        Tile columns.
  * @param view_w      Per-view width.
  * @param view_h      Per-view height.
  * @param[out] out_x  X origin in pixels.
- * @param[out] out_y  Y origin in pixels.
+ * @param[out] out_y  Y origin in pixels, from the TOP edge.
  */
 static inline void
 u_tiling_view_origin(uint32_t view_index,
@@ -152,6 +167,50 @@ u_tiling_view_origin(uint32_t view_index,
 {
 	*out_x = (view_index % cols) * view_w;
 	*out_y = (view_index / cols) * view_h;
+}
+
+/*!
+ * @ref u_tiling_view_origin for a BOTTOM-LEFT-origin API (OpenGL).
+ *
+ * Same physical tile, expressed as the `glViewport` Y of its **lower** edge:
+ * row `r = view_index / cols` counted from the top becomes row
+ * `rows - 1 - r` counted from the bottom. Hence view 0 lands at
+ * `(rows - 1) * view_h` — the top tile row as displayed, matching every other
+ * backend.
+ *
+ * A GL display processor must index the atlas the mirrored way to match: tile
+ * row `r` occupies `v ∈ [1 - (r+1)/rows, 1 - r/rows]`, i.e. sample view
+ * `view_index` at `v = (local_v + (rows - 1 - r)) / rows`. The compositor half
+ * and the DP half are one statement and **must change together** — see
+ * `sim_display_processor_gl.c`.
+ *
+ * Identity when `rows == 1`, which is every mode any shipped vendor plug-in
+ * publishes.
+ *
+ * @param view_index  Index of the view (0..N-1).
+ * @param cols        Tile columns.
+ * @param rows        Tile rows.
+ * @param view_w      Per-view width.
+ * @param view_h      Per-view height.
+ * @param[out] out_x  X origin in pixels.
+ * @param[out] out_y  Y origin in pixels, from the BOTTOM edge.
+ */
+static inline void
+u_tiling_view_origin_gl(uint32_t view_index,
+                        uint32_t cols,
+                        uint32_t rows,
+                        uint32_t view_w,
+                        uint32_t view_h,
+                        uint32_t *out_x,
+                        uint32_t *out_y)
+{
+	uint32_t c = cols > 0 ? cols : 1;
+	uint32_t r = rows > 0 ? rows : 1;
+	uint32_t row = view_index / c;
+	uint32_t flipped = row < r ? (r - 1u - row) : 0u;
+
+	*out_x = (view_index % c) * view_w;
+	*out_y = flipped * view_h;
 }
 
 /*!

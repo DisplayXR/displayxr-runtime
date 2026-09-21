@@ -85,6 +85,30 @@ struct xrt_display_processor_gl
 	 * and set the viewport before calling. The implementation renders
 	 * the display-specific output (interlacing, etc.) to the bound FBO.
 	 *
+	 * **Atlas tile order (#1625).** View `i` occupies the tile at column
+	 * `i % tile_columns`, row `i / tile_columns`, counting rows DOWNWARD from
+	 * the TOP edge of the atlas **as displayed** — view 0 is the top-left tile,
+	 * on every backend and every platform. X never needs this statement: no
+	 * graphics API flips X.
+	 *
+	 * **OpenGL is the one API where that needs translating, and getting it
+	 * wrong is invisible until you compare backends.** A GL framebuffer's
+	 * origin is the BOTTOM-left, so `v = 0` is the bottom of the atlas and tile
+	 * row `r` occupies
+	 *
+	 *     v ∈ [1 − (r + 1)/tile_rows,  1 − r/tile_rows]
+	 *
+	 * Sample view `i` (row `r = i / tile_columns`) at
+	 *
+	 *     u = (local_u + (i % tile_columns)) / tile_columns
+	 *     v = (local_v + (tile_rows − 1 − r)) / tile_rows
+	 *
+	 * i.e. view 0 lives in the atlas's TOP half of `v`, not the bottom. This is
+	 * a no-op whenever `tile_rows == 1`. The GL compositor places tiles with the
+	 * matching `glViewport(x, (tile_rows − 1 − r) * view_height, …)`; the two
+	 * halves are one statement and must agree. Full contract:
+	 * `docs/specs/runtime/multiview-tiling.md`.
+	 *
 	 * @param      xdp              Pointer to self.
 	 * @param      atlas_texture   Atlas texture (GLuint).
 	 * @param      view_width       Width of one eye view in pixels.

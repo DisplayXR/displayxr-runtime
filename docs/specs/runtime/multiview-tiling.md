@@ -201,6 +201,59 @@ All compositors use the general tiling model:
 
 No more stereo special case -- all view layouts handled through tiling.
 
+### Tile origin: view 0 is the TOP-LEFT tile, as displayed (#1625)
+
+The offsets above are **row-major from the top-left of the upright image** —
+the picture as a human sees it on the panel or in a capture, not a texel
+address in any one API:
+
+> **View `i` occupies the tile at column `i % tile_columns` and row
+> `i / tile_columns`, counting rows DOWNWARD from the TOP edge of the atlas
+> as displayed. View 0 is the top-left tile. This holds on every backend and
+> every platform.**
+
+"As displayed" is the contract because it is the only statement that means the
+same thing in five graphics APIs. D3D11, D3D12, Metal and Vulkan address texel
+row 0 at the top, so for them the `Y offset` formula is literal: view `i`'s
+tile starts at texel row `(i / tile_columns) * view_height`.
+
+**OpenGL is the one API where it needs translating, and the translation is the
+whole rule for a GL display processor.** A GL framebuffer's origin is the
+**bottom**-left, so `v = 0` is the bottom of the atlas and rows run the other
+way. Tile row `r` therefore occupies
+
+```
+v ∈ [1 − (r + 1)/tile_rows,  1 − r/tile_rows]
+```
+
+so a GL DP samples view `i` (row `r = i / tile_columns`) at
+
+```
+u = (local_u + (i % tile_columns)) / tile_columns
+v = (local_v + (tile_rows − 1 − r)) / tile_rows
+```
+
+and the GL compositor places that tile with
+`glViewport(x, (tile_rows − 1 − r) * view_height, …)`. Both halves are the
+same statement and **must move together** — a GL compositor and a GL DP that
+agree with each other but not with this rule look correct in isolation and
+disagree with every other backend, which is exactly how #1625 went unnoticed
+(everything is a no-op when `tile_rows == 1`, and no shipped vendor plug-in
+publishes a mode with more than one tile row).
+
+X never needs this treatment: no graphics API flips X, so
+`(i % tile_columns) * view_width` is literal everywhere.
+
+**Not covered by this rule: where the content region sits inside the
+worst-case-sized swapchain.** "The content occupies the top-left corner of the
+swapchain image"
+([below](#per-frame-atlas-is-typically-smaller)) is an offset in each API's own
+addressing — offset `(0, 0)` — which on GL is the geometric *bottom*-left. That
+stays unobservable by construction: the compositor crops exactly that region
+before the DP, and the atlas capture reads exactly that region, so no consumer
+ever sees the padding. The tile order above is different precisely because a DP
+*does* see it.
+
 ## Compositor-Side Contract: Swapchain → Crop → Display Processor
 
 ### Two Distinct Swapchains

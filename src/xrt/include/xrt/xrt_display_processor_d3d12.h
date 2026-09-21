@@ -84,6 +84,23 @@ struct xrt_display_processor_d3d12
 	 * Records draw commands onto the provided command list. The caller
 	 * is responsible for executing the command list and synchronization.
 	 *
+	 * **Atlas tile order (#1625).** View `i` occupies the tile at column
+	 * `i % tile_columns`, row `i / tile_columns`, counting rows DOWNWARD from
+	 * the TOP edge of the atlas **as displayed** — view 0 is the top-left tile,
+	 * on every backend and every platform. X never needs this statement: no
+	 * graphics API flips X.
+	 *
+	 * This API addresses texel row 0 at the **top**, so the rule is literal
+	 * here: view `i`'s tile begins at texel row
+	 * `(i / tile_columns) * view_height`, and tile row `r` occupies
+	 * `v ∈ [r/tile_rows, (r+1)/tile_rows]`.
+	 *
+	 * OpenGL is the one API where "as displayed" needs translating — a GL
+	 * framebuffer's origin is the BOTTOM-left, so there `v = 0` is the bottom
+	 * and tile row `r` occupies `v ∈ [1 − (r+1)/tile_rows, 1 − r/tile_rows]`.
+	 * A DP ported between the two must flip the row index, not just the
+	 * sampler. Full contract: `docs/specs/runtime/multiview-tiling.md`.
+	 *
 	 * @param      xdp                   Pointer to self.
 	 * @param      d3d12_command_list     Command list (ID3D12GraphicsCommandList*).
 	 * @param      atlas_texture_resource Atlas texture resource (ID3D12Resource*), may be NULL.
