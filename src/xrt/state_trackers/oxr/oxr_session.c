@@ -5671,6 +5671,14 @@ oxr_session_request_display_refresh_rate(struct oxr_logger *log, struct oxr_sess
 		return oxr_session_success_result(sess);
 	}
 
+	// The compositor may advertise XR_FB_display_refresh_rate (for enumerate /
+	// get) yet not implement the request — e.g. the sim/native compositor.
+	// Report it unsupported rather than silently succeeding, matching
+	// oxr_session_set_perf_level below.
+	if (xc->request_display_refresh_rate == NULL) {
+		return XR_ERROR_FUNCTION_UNSUPPORTED;
+	}
+
 	xrt_result_t xret = xrt_comp_request_display_refresh_rate(xc, displayRefreshRate);
 	OXR_CHECK_XRET(log, sess, xret, xrt_comp_request_display_refresh_rate);
 
