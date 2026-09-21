@@ -27,6 +27,7 @@
 #include "comp_vk_native_deposit.h"
 
 #include "util/comp_layer_accum.h"
+#include "util/comp_layer_view_camera.h"
 
 #include "xrt/xrt_vulkan_includes.h"
 #include "vk/vk_helpers.h"
@@ -34,6 +35,8 @@
 #include "util/u_debug.h"
 #include "util/u_logging.h"
 #include "util/u_misc.h"
+
+#include "math/m_api.h"
 
 #include <string.h>
 #include <math.h>
@@ -61,24 +64,53 @@
 DEBUG_GET_ONCE_BOOL_OPTION(vk_force_compose_pass, "DXR_VK_FORCE_COMPOSE_PASS", false)
 
 /*!
- * How a draw composites onto what is already in the tile.
+ * Blend STATES the pass needs — three, not four.
  *
- * LOCAL AND TEMPORARY. #1611 is landing the shared vocabulary in
- * comp_layer_view_camera.h (`comp_layer_blend_mode` + the painter's-order
- * first-layer gate, and an OPAQUE_COVER mode this does not have yet); when
- * that merges, this enum is deleted and the table below is re-indexed on it.
- * It exists only so this step does not have to wait, and deliberately does
- * NOT try to pre-empt the final spelling.
+ * #1611's `enum comp_layer_blend_mode` has four modes, but two of them share
+ * one pipeline: COMP_LAYER_BLEND_OPAQUE_COVER is the same blending-OFF state
+ * as COMP_LAYER_BLEND_REPLACE, and differs only in that the shader emits
+ * alpha = 1 — which comp_layer_blend_fold_opaque_cover() achieves by folding
+ * `scale.a = 0, bias.a = 1` into the colour scale/bias the fragment shader
+ * already applies. So the table is 3 states x 2 samplers = 6 pipelines, not
+ * 4 x 2 = 8, and there is no specialisation constant and no fourth shader.
+ *
+ * @ref vk_compose_blend_state maps the shared mode onto these.
  */
 enum vk_compose_blend
 {
-	//! Blending off: the source written verbatim, RGBA. What a blit did.
-	VK_COMPOSE_BLEND_REPLACE = 0,
+	//! Blending off. Serves both REPLACE and OPAQUE_COVER.
+	VK_COMPOSE_BLEND_OFF = 0,
 	//! out.rgb = src.rgb + dst.rgb * (1 - src.a)
 	VK_COMPOSE_BLEND_PREMULT = 1,
 	//! out.rgb = src.rgb * src.a + dst.rgb * (1 - src.a)
 	VK_COMPOSE_BLEND_UNPREMULT = 2,
 	VK_COMPOSE_BLEND_COUNT,
+};
+
+//! Shared policy mode -> the pipeline's blend state.
+static inline enum vk_compose_blend
+vk_compose_blend_state(enum comp_layer_blend_mode mode)
+{
+	switch (mode) {
+	case COMP_LAYER_BLEND_PREMULTIPLIED: return VK_COMPOSE_BLEND_PREMULT;
+	case COMP_LAYER_BLEND_STRAIGHT: return VK_COMPOSE_BLEND_UNPREMULT;
+	case COMP_LAYER_BLEND_REPLACE:
+	case COMP_LAYER_BLEND_OPAQUE_COVER:
+	default: return VK_COMPOSE_BLEND_OFF;
+	}
+}
+
+/*!
+ * The push-constant block, byte-identical to the `ComposeParams` every shader
+ * in shaders/ declares. 128 bytes — the guaranteed minimum, see the range.
+ */
+struct vk_compose_push
+{
+	float mvp[16];         //!< Quad only; the fullscreen path ignores it.
+	float src_rect[4];     //!< xy = src origin (norm), zw = src size (norm).
+	float params[4];       //!< x = array slice, y = quad flag; zw reserved.
+	float color_scale[4];  //!< XR_KHR_composition_layer_color_scale_bias.
+	float color_bias[4];   //!< ditto.
 };
 
 //! Which sampler the source view needs.
@@ -207,16 +239,70 @@ layers_contain_zone_3d(const struct comp_layer_accum *layers)
 /*!
  * Does the compose pass draw this layer type?
  *
- * Projection-class and 3D zones. Quad / cylinder / equirect are accumulated
- * but not yet drawn on this backend (#1581) — they are skipped here exactly
- * as the blit path skipped them, so this change neither adds nor removes
- * content.
+ * Projection-class, 3D zones, and QUADS (#1581 — the Vulkan backend accepted
+ * `comp_layer_accum_quad` and never drew it, so every Khronos CTS interactive
+ * composition prompt, label and reference image was invisible here).
+ * Cylinder / equirect / cube remain accumulated and undrawn.
  */
 static bool
 compose_pass_draws_layer(const struct comp_layer *layer)
 {
 	const enum xrt_layer_type t = layer->data.type;
-	return t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH || t == XRT_LAYER_ZONE_3D;
+	return t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH || t == XRT_LAYER_ZONE_3D ||
+	       t == XRT_LAYER_QUAD;
+}
+
+/*!
+ * Resolve the source a (layer, view) pair samples.
+ *
+ * Projection-class and zone layers carry a per-view swapchain and a per-view
+ * sub-image; a QUAD carries ONE swapchain and one sub-image shown in every
+ * view it is visible in. Both shapes resolve here so the transition loop and
+ * the draw loop cannot disagree about which image a draw touches — they must
+ * agree, or an image is sampled in the wrong layout.
+ */
+static bool
+compose_layer_source(const struct comp_layer *layer,
+                     uint32_t view,
+                     struct xrt_swapchain **out_xsc,
+                     const struct xrt_sub_image **out_sub)
+{
+	if (layer->data.type == XRT_LAYER_QUAD) {
+		*out_xsc = layer->sc_array[0];
+		*out_sub = &layer->data.quad.sub;
+	} else {
+		*out_xsc = layer->sc_array[view];
+		*out_sub = &layer->data.proj.v[view].sub;
+	}
+	return *out_xsc != NULL;
+}
+
+/*!
+ * How many views does this layer contribute to?
+ *
+ * A quad is a single world-placed surface: it is a candidate in EVERY tile
+ * and `is_layer_view_visible_n` decides which ones. Everything else is
+ * per-view content bounded by its own view_count.
+ */
+static uint32_t
+compose_layer_view_count(const struct comp_layer *layer, const struct comp_vk_native_eff_layout *layout)
+{
+	uint32_t n;
+	if (layer->data.type == XRT_LAYER_QUAD) {
+		n = layout->views;
+	} else {
+		n = layer->data.view_count;
+		if (n > layout->views) {
+			n = layout->views;
+		}
+	}
+	// Clamped to XRT_MAX_VIEWS because the per-view camera and per-tile
+	// painter's-order arrays are sized by it: an effective layout claiming
+	// more views than that would otherwise index off the end of both.
+	if (n > XRT_MAX_VIEWS) {
+		n = XRT_MAX_VIEWS;
+	}
+	return n == 0 ? 1 : n;
 }
 
 //! How many layers this frame would the compose pass actually draw?
@@ -646,9 +732,13 @@ zone_create_pipeline(struct comp_vk_native_renderer *r,
 	    .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
 	};
 
-	// REPLACE is blending OFF — the source written verbatim, RGBA, which is
-	// exactly what vkCmdBlitImage did and is what a projection layer needs
-	// so its own alpha reaches the atlas for the #225 compose-under gate.
+	// Blending OFF serves two shared modes. REPLACE (the first layer into a
+	// tile) writes the source verbatim, RGBA — exactly what vkCmdBlitImage
+	// did, and what a transparent-background app's single projection layer
+	// needs so its own alpha reaches the atlas for the #225 compose-under
+	// gate. OPAQUE_COVER (a LATER unflagged layer) uses the same state and
+	// gets its spec-mandated alpha of one from the shader, via
+	// comp_layer_blend_fold_opaque_cover().
 	//
 	// Alpha-over: premultiplied (One/OneMinusSrcAlpha) by default, straight
 	// alpha only swaps the source color factor. Alpha factors are
@@ -656,7 +746,7 @@ zone_create_pipeline(struct comp_vk_native_renderer *r,
 	// into the atlas (D3D11 blend_premul/blend_alpha parity).
 	const bool unpremultiplied = (blend == VK_COMPOSE_BLEND_UNPREMULT);
 	VkPipelineColorBlendAttachmentState blend_attachment = {
-	    .blendEnable = (blend == VK_COMPOSE_BLEND_REPLACE) ? VK_FALSE : VK_TRUE,
+	    .blendEnable = (blend == VK_COMPOSE_BLEND_OFF) ? VK_FALSE : VK_TRUE,
 	    .srcColorBlendFactor =
 	        unpremultiplied ? VK_BLEND_FACTOR_SRC_ALPHA : VK_BLEND_FACTOR_ONE,
 	    .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
@@ -802,20 +892,40 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
 	}
 
 	/*
-	 * 32 bytes, visible to BOTH stages: vec4 src_rect (vertex) + vec4 params
-	 * (fragment; x = array slice). The range was 16 bytes VERTEX-only, which
-	 * left the fragment stage with no per-draw channel at all — the array
-	 * variant needs one, and so will the per-layer colour flag. Well inside
-	 * the 128-byte guaranteed maxPushConstantsSize.
+	 * 128 bytes, visible to BOTH stages:
+	 *   mat4 mvp (64, vertex, quad only)
+	 *   vec4 src_rect (16, vertex)
+	 *   vec4 params (16; x = array slice [fragment], y = quad flag [vertex])
+	 *   vec4 color_scale + vec4 color_bias (32, fragment)
 	 *
-	 * Every shader in the bundle declares this block identically; Vulkan
+	 * That is EXACTLY the guaranteed minimum maxPushConstantsSize, which is
+	 * legal (the limit is inclusive) but leaves no headroom: anything added
+	 * later has to move into a descriptor, not into this block. Asserted
+	 * against the device limit below rather than assumed, because a silent
+	 * overflow here would be a validation error on the narrowest device and
+	 * nothing at all on this one.
+	 *
+	 * Every shader in the bundle declares the block identically; Vulkan
 	 * requires one layout across the stages of a pipeline.
 	 */
 	VkPushConstantRange push_range = {
 	    .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 	    .offset = 0,
-	    .size = 8 * sizeof(float), // vec4 src_rect + vec4 params
+	    .size = sizeof(struct vk_compose_push),
 	};
+
+	{
+		VkPhysicalDeviceProperties props;
+		vk->vkGetPhysicalDeviceProperties(vk->physical_device, &props);
+		if (props.limits.maxPushConstantsSize < push_range.size) {
+			U_LOG_E("VK compose: device maxPushConstantsSize %u < %u required — draw path "
+			        "disabled, falling back to blits",
+			        props.limits.maxPushConstantsSize, push_range.size);
+			zone_draw_destroy(r);
+			r->zone.failed = true;
+			return false;
+		}
+	}
 
 	VkPipelineLayoutCreateInfo pl_ci = {
 	    .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
@@ -1089,16 +1199,11 @@ zone_pass_usable(struct comp_vk_native_renderer *r,
 		if (!compose_pass_draws_layer(layer)) {
 			continue;
 		}
-		uint32_t view_count = layer->data.view_count;
-		if (view_count > layout->views) {
-			view_count = layout->views;
-		}
-		if (view_count == 0) {
-			view_count = 1;
-		}
+		const uint32_t view_count = compose_layer_view_count(layer, layout);
 		for (uint32_t eye = 0; eye < view_count; eye++) {
-			struct xrt_swapchain *xsc = layer->sc_array[eye];
-			if (xsc == NULL) {
+			struct xrt_swapchain *xsc = NULL;
+			const struct xrt_sub_image *sub = NULL;
+			if (!compose_layer_source(layer, eye, &xsc, &sub)) {
 				continue;
 			}
 			// A LAYERED (arraySize > 1) source used to bail the whole
@@ -1108,8 +1213,7 @@ zone_pass_usable(struct comp_vk_native_renderer *r,
 			// stereo (ADR-032) its alpha-over compositing, frame-wide,
 			// for one layered layer. zone_blit_array.frag handles it
 			// now and the draw below picks the matching pipeline.
-			uint32_t sc_index = layer->data.proj.v[eye].sub.image_index;
-			if (comp_vk_native_swapchain_get_image_view(xsc, sc_index) == 0) {
+			if (comp_vk_native_swapchain_get_image_view(xsc, sub->image_index) == 0) {
 				return false;
 			}
 		}
@@ -1161,20 +1265,15 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 		if (!compose_pass_draws_layer(layer)) {
 			continue;
 		}
-		uint32_t view_count = layer->data.view_count;
-		if (view_count > layout->views) {
-			view_count = layout->views;
-		}
-		if (view_count == 0) {
-			view_count = 1;
-		}
+		const uint32_t view_count = compose_layer_view_count(layer, layout);
 		for (uint32_t eye = 0; eye < view_count; eye++) {
-			struct xrt_swapchain *xsc = layer->sc_array[eye];
-			if (xsc == NULL) {
+			struct xrt_swapchain *xsc = NULL;
+			const struct xrt_sub_image *sub = NULL;
+			if (!compose_layer_source(layer, eye, &xsc, &sub)) {
 				continue;
 			}
-			uint32_t sc_index = layer->data.proj.v[eye].sub.image_index;
-			VkImage img = (VkImage)(uintptr_t)comp_vk_native_swapchain_get_image(xsc, sc_index);
+			VkImage img =
+			    (VkImage)(uintptr_t)comp_vk_native_swapchain_get_image(xsc, sub->image_index);
 			if (img == VK_NULL_HANDLE) {
 				continue;
 			}
@@ -1244,6 +1343,42 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 	};
 	vk->vkCmdBeginRenderPass(cmd, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
 
+	/*
+	 * ONE camera per view per frame (#1580), hoisted out of the layer loop.
+	 *
+	 * Only quads consume it, but it is resolved for every view up front so
+	 * two quads in the same view cannot end up on two different cameras.
+	 *
+	 * THE RETURN VALUE IS A DIAGNOSTIC, NOT "SKIP". `cam` is fully
+	 * populated on every branch, including the legacy placeholder, which
+	 * returns false and logs once inside the helper. Dropping the layer on
+	 * false would make a fallback frame silently quad-less — the header
+	 * carries a @warning about this and main has a structural test
+	 * asserting no backend gates on it. Hence the explicit (void).
+	 *
+	 * Canvas metres are 0 (unknown) on purpose: every frame carrying a quad
+	 * also carries a projection layer, so leg (a) of the helper fires and
+	 * the display3d synthesis is never reached. Same call shape as Metal
+	 * and GL.
+	 */
+	struct comp_layer_view_camera cams[XRT_MAX_VIEWS];
+	const uint32_t tile_count = layout->views > XRT_MAX_VIEWS ? XRT_MAX_VIEWS : layout->views;
+	for (uint32_t v = 0; v < tile_count; v++) {
+		(void)comp_layer_view_camera_select(layers, v, NULL, 0.0f, 0.0f, &cams[v]);
+	}
+
+	/*
+	 * Painter's-order state, one per tile, zeroed for this frame (#1598).
+	 *
+	 * The FIRST layer into a tile is a REPLACE whatever its flags say — a
+	 * transparent-background app sets SOURCE_ALPHA on its single projection
+	 * layer, and that blit has to write alpha verbatim or the DP's alpha
+	 * gate dies (#225). Later layers blend by their flags, and an unflagged
+	 * one is OPAQUE_COVER, not REPLACE. comp_layer_tile_blend_mode() owns
+	 * that whole rule; this backend just carries the state.
+	 */
+	struct comp_layer_tile_state tiles[XRT_MAX_VIEWS] = {0};
+
 	uint32_t draw_count = 0;
 	for (uint32_t i = 0; i < layers->layer_count; i++) {
 		struct comp_layer *layer = &layers->layers[i];
@@ -1251,20 +1386,13 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 			continue;
 		}
 		const bool is_zone = layer->data.type == XRT_LAYER_ZONE_3D;
+		const bool is_quad = layer->data.type == XRT_LAYER_QUAD;
 
-		uint32_t view_count = layer->data.view_count;
-		if (view_count > layout->views) {
-			view_count = layout->views;
-		}
-		if (view_count == 0) {
-			view_count = 1;
-		}
-
-		const bool unpremul =
-		    (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0;
+		const uint32_t view_count = compose_layer_view_count(layer, layout);
 
 		for (uint32_t eye = 0; eye < view_count; eye++) {
-			struct xrt_swapchain *xsc = layer->sc_array[eye];
+			struct xrt_swapchain *xsc = NULL;
+			const struct xrt_sub_image *sub = NULL;
 			if (draw_count >= VK_ZONE_MAX_DRAWS) {
 				// Same silent-drop hazard as the transition loop above:
 				// warn once rather than quietly losing a zone.
@@ -1279,12 +1407,38 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 				}
 				continue;
 			}
-			if (xsc == NULL) {
+			if (!compose_layer_source(layer, eye, &xsc, &sub)) {
 				continue;
 			}
-			uint32_t sc_index = layer->data.proj.v[eye].sub.image_index;
+			if (is_quad) {
+				// Eye visibility, N-view aware: the parity rule
+				// is right for 2 views and meaningless for a 2x2
+				// quad mode, where the halves overlap by one.
+				if (!is_layer_view_visible_n(&layer->data, eye, tile_count)) {
+					continue;
+				}
+				/*
+				 * Back-face cull (#1590). The spec: "Only front
+				 * face of the quad surface is visible; the back
+				 * face is not visible and must not be drawn by
+				 * the runtime", with the front normal at +Z.
+				 *
+				 * Against THIS VIEW's camera, not a display-space
+				 * eye — a quad can face one eye and not the
+				 * other, and the shared predicate is documented
+				 * to take comp_layer_view_camera::pose.position.
+				 * A skipped quad must NOT mark the tile
+				 * composited: it drew nothing, so the next layer
+				 * is still the first one in.
+				 */
+				if (!comp_layer_quad_is_front_facing(&layer->data.quad.pose,
+				                                     &cams[eye].pose.position)) {
+					continue;
+				}
+			}
 			VkImageView src_view =
-			    (VkImageView)(uintptr_t)comp_vk_native_swapchain_get_image_view(xsc, sc_index);
+			    (VkImageView)(uintptr_t)comp_vk_native_swapchain_get_image_view(xsc,
+			                                                                    sub->image_index);
 			if (src_view == VK_NULL_HANDLE) {
 				continue;
 			}
@@ -1322,6 +1476,13 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 			    .minDepth = 0.0f,
 			    .maxDepth = 1.0f,
 			};
+			// A QUAD is placed by its MVP, so its viewport is the
+			// whole tile box — and the SCISSOR below is then
+			// load-bearing rather than belt-and-braces: a projected
+			// quad's geometry can extend past the viewport rect and
+			// Vulkan viewports do not clip, so the spill would land
+			// in the NEIGHBOUR view's tile and the DP would weave it
+			// as ghosting in the wrong eye.
 			if (is_zone) {
 				const struct xrt_rect *zr = &layer->data.zone_3d.rect;
 				const float zsx = (dx1 - dx0) / (float)target_width;
@@ -1397,20 +1558,60 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 			if (sc_w == 0 || sc_h == 0) {
 				continue;
 			}
-			const struct xrt_rect *sr = &layer->data.proj.v[eye].sub.rect;
-			// vec4 src_rect + vec4 params (params.x = array slice).
-			// Layout must match the block every shader in the bundle
-			// declares; the range is VERTEX | FRAGMENT.
-			float push[8] = {
-			    (float)sr->offset.w / (float)sc_w,
-			    (float)sr->offset.h / (float)sc_h,
-			    (float)sr->extent.w / (float)sc_w,
-			    (float)sr->extent.h / (float)sc_h,
-			    (float)layer->data.proj.v[eye].sub.array_index,
-			    0.0f,
-			    0.0f,
-			    0.0f,
+			const struct xrt_rect *sr = &sub->rect;
+			struct vk_compose_push push = {
+			    .src_rect =
+			        {
+			            (float)sr->offset.w / (float)sc_w,
+			            (float)sr->offset.h / (float)sc_h,
+			            (float)sr->extent.w / (float)sc_w,
+			            (float)sr->extent.h / (float)sc_h,
+			        },
+			    .params = {(float)sub->array_index, is_quad ? 1.0f : 0.0f, 0.0f, 0.0f},
+			    .color_scale = {1.0f, 1.0f, 1.0f, 1.0f},
+			    .color_bias = {0.0f, 0.0f, 0.0f, 0.0f},
 			};
+
+			/*
+			 * THE PAINTER'S RULE (#1598), for every layer type.
+			 *
+			 * Part 1 pinned projection layers to REPLACE because the
+			 * shared vocabulary was still being finalised; it is
+			 * merged now, so they join the rule here. First layer
+			 * into this tile -> REPLACE (verbatim RGBA); later ones
+			 * -> OPAQUE_COVER / PREMULTIPLIED / STRAIGHT by their
+			 * flags. Zones reach it through the same call, so their
+			 * previous "always alpha-over" is now "alpha-over unless
+			 * they are the first thing in the tile" — which is what
+			 * a zones frame's transparent clear already implied.
+			 */
+			const enum comp_layer_blend_mode mode =
+			    comp_layer_tile_blend_mode(&tiles[eye], layer->data.flags);
+
+			// OPAQUE_COVER's alpha-of-one is emitted by the SHADER,
+			// folded into the scale/bias it already applies: fixed-
+			// function blending cannot make a constant 1 out of an
+			// arbitrary src.a. No-op for every other mode.
+			comp_layer_blend_fold_opaque_cover(mode, push.color_scale, push.color_bias);
+
+			if (is_quad) {
+				// model = pose * scale(size.x, size.y, 1); view
+				// from the camera pose; VULKAN infinite-reverse
+				// projection from the camera fov at near 0.1.
+				// The vulkan helper pairs with NO clip-Y flip in
+				// the vertex shader — see the shader comment;
+				// change both together or neither.
+				struct xrt_matrix_4x4 view_mat, proj_mat, model, mv, mvp;
+				const struct xrt_layer_quad_data *q = &layer->data.quad;
+				struct xrt_vec3 qscale = {q->size.x, q->size.y, 1.0f};
+				math_matrix_4x4_view_from_pose(&cams[eye].pose, &view_mat);
+				math_matrix_4x4_projection_vulkan_infinite_reverse(&cams[eye].fov, 0.1f,
+				                                                    &proj_mat);
+				math_matrix_4x4_model(&q->pose, &qscale, &model);
+				math_matrix_4x4_multiply(&view_mat, &model, &mv);
+				math_matrix_4x4_multiply(&proj_mat, &mv, &mvp);
+				memcpy(push.mvp, mvp.v, sizeof(push.mvp));
+			}
 
 			// The view the swapchain handed us is a 2D_ARRAY view iff
 			// the swapchain is layered, and a `sampler2D` cannot bind
@@ -1420,24 +1621,9 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 			    comp_vk_native_swapchain_get_array_size(xsc) > 1 ? VK_COMPOSE_SAMPLER_2D_ARRAY
 			                                                     : VK_COMPOSE_SAMPLER_2D;
 
-			/*
-			 * Blend mode. ZONES keep alpha-over in layer-list order,
-			 * bit-for-bit what they did before this pass grew a
-			 * second caller. A PROJECTION layer takes REPLACE, which
-			 * is what its vkCmdBlitImage did: overwrite, alpha
-			 * verbatim.
-			 *
-			 * This is NOT yet the OpenXR painter's-order rule
-			 * (#1598: first-into-tile replaces, later layers blend
-			 * by their flags). That rule arrives with #1611's shared
-			 * helper; deciding it here would mean inventing a second
-			 * copy of a policy that is still being finalised, and
-			 * would change what two overlapping projection layers do
-			 * inside a step whose whole job is to change nothing.
-			 */
-			const enum vk_compose_blend blend =
-			    !is_zone ? VK_COMPOSE_BLEND_REPLACE
-			             : (unpremul ? VK_COMPOSE_BLEND_UNPREMULT : VK_COMPOSE_BLEND_PREMULT);
+			// OPAQUE_COVER shares REPLACE's blending-off state; the
+			// difference is entirely in the folded scale/bias above.
+			const enum vk_compose_blend blend = vk_compose_blend_state(mode);
 
 			vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
 			                       r->zone.pipelines[blend][sampler_kind]);
@@ -1447,8 +1633,9 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 			                             r->zone.pipeline_layout, 0, 1, &set, 0, NULL);
 			vk->vkCmdPushConstants(cmd, r->zone.pipeline_layout,
 			                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-			                        sizeof(push), push);
-			vk->vkCmdDraw(cmd, 3, 1, 0, 0);
+			                        sizeof(push), &push);
+			// 3 = fullscreen triangle; 6 = the quad's two triangles.
+			vk->vkCmdDraw(cmd, is_quad ? 6 : 3, 1, 0, 0);
 			draw_count++;
 		}
 	}

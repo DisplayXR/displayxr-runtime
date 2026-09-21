@@ -188,6 +188,42 @@ static const uint32_t HUD_PIXEL_WIDTH = 380;
 static const uint32_t HUD_PIXEL_HEIGHT = 470;
 static const float HUD_WIDTH_FRACTION = 0.20f;
 
+// #1581 — DXR_TEST_QUAD=1 submits real XrCompositionLayerQuad layers so the
+// vk_native quad pass can be judged on pixels. Default OFF: without it this
+// app's layer list is byte-identical to before.
+//
+// Three quads, all sharing one deliberately NON-symmetric 256x256 probe
+// texture (coloured checker, a large "Q" with its tail bottom-right, four
+// distinct corner blocks, an 8 px white border, and a half-alpha quadrant):
+//   (A) LOCAL space, axis-aligned, BOTH eyes, STRAIGHT alpha — the
+//       measurement / alpha / stereo-disparity quad.
+//   (B) LOCAL space, yawed -15 deg about up, BOTH eyes, PREMULTIPLIED — the
+//       other blend state, and a world-locked non-fronto-parallel case.
+//   (C) LOCAL space, LEFT EYE ONLY, straight alpha — the eye-visibility
+//       check (see the submission site for why it is not VIEW space).
+// Sizes and positions are fractions of the CANVAS, not absolute metres: a 3D
+// display's Kooima frustum is narrow and strongly off-axis, so metre-scale
+// poses tuned for an HMD land off-tile. Values match the GL (#1581) and Metal
+// (#1584) probes so the three backends' atlas dumps are directly comparable.
+static bool g_quadTest = false;
+static bool g_quadActive = false;
+static XrSwapchain g_quadSwapchain = XR_NULL_HANDLE;
+static VkImage g_quadVkImage = VK_NULL_HANDLE;
+static uint32_t g_quadTexSize = 256;
+static const float kQuadFracA = 0.53f;  // (A) edge, as a fraction of canvas height
+static const float kQuadFracB = 0.67f;  // (B)
+static const float kQuadFracC = 0.375f; // (C)
+
+// (A)'s LOCAL pose, in canvas units. The ZDP is the display plane (z = 0), so
+// a quad AT z = 0 has zero stereo disparity and tells you nothing; (A) is
+// placed just BEHIND it, at about the depth of the spinning cube, so its
+// per-tile offset is directly comparable with the cube's. It also sits over
+// the cube, so its half-alpha quadrant has something to show through.
+static const float kQuadAx = 0.057f;  // × canvas width
+static const float kQuadAy = 0.207f;  // × canvas height
+static const float kQuadAz = -0.08f;  // × canvas height (-z = behind the plane)
+static const uint64_t kQuadActivationFrame = 10;
+
 // Cached HUD section strings, refreshed at HUD throttle rate (~2 Hz).
 static std::wstring g_hudSessionText, g_hudModeText, g_hudPerfText;
 static std::wstring g_hudDisplayText, g_hudEyeText, g_hudCameraText;
@@ -2829,6 +2865,267 @@ static bool UploadHudPixels(HudVkUploader& up, VkImage hudImage,
     return true;
 }
 
+// ============================================================================
+// #1581 quad-layer probe
+// ============================================================================
+
+// Fill one static 256x256 RGBA image and hand it to a swapchain (acquire /
+// fill / release once; the layers reference the released image every frame —
+// the same lifecycle the GL and Metal probes use, so the three are comparable).
+//
+// Every feature here exists to make a specific defect visible in the atlas
+// dump, so do not "tidy" it into a symmetric pattern:
+//   - 8 px opaque WHITE border  -> the quad's exact extent, so its width can
+//                                  be MEASURED in tile pixels and compared
+//                                  against the fov the app was handed.
+//   - four distinct corner blocks (TL red, TR green, BL blue, BR yellow)
+//                                  -> catches a transpose or a 180 deg flip
+//                                     that a mirror-symmetric pattern hides.
+//   - a large "Q" with its tail at the BOTTOM-RIGHT
+//                                  -> catches a Y flip (tail moves to the
+//                                     top) and a UV transpose (tail moves to
+//                                     the left).
+//   - 24 px coloured checker      -> filtering / scale sanity.
+//   - bottom-left quadrant at alpha 128 (STRAIGHT alpha)
+//                                  -> the alpha blend: the cube must show
+//                                     through it.
+//
+// Rows are authored TOP-DOWN (row 0 = the image's top) and uploaded with
+// vkCmdCopyBufferToImage, so uv.y = 0 is the top — the same mapping the GL
+// probe gets from glTexSubImage2D and the Metal one from replaceRegion.
+static bool CreateAndFillQuadTexture(AppXrSession& xr, uint32_t size,
+                                     VkDevice device, VkPhysicalDevice phys,
+                                     VkQueue queue, VkCommandPool pool)
+{
+    // Pick an RGBA8 UNORM format if the runtime offers one: the bytes below
+    // are authored linear, and an _SRGB view would re-encode them.
+    uint32_t formatCount = 0;
+    if (XR_FAILED(xrEnumerateSwapchainFormats(xr.session, 0, &formatCount, nullptr)) ||
+        formatCount == 0) {
+        return false;
+    }
+    std::vector<int64_t> formats(formatCount);
+    if (XR_FAILED(xrEnumerateSwapchainFormats(xr.session, formatCount, &formatCount,
+                                              formats.data()))) {
+        return false;
+    }
+    int64_t selectedFormat = formats[0];
+    const int64_t preferred[] = {(int64_t)VK_FORMAT_R8G8B8A8_UNORM,
+                                 (int64_t)VK_FORMAT_R8G8B8A8_SRGB,
+                                 (int64_t)VK_FORMAT_B8G8R8A8_UNORM};
+    bool picked = false;
+    for (int64_t pref : preferred) {
+        for (int64_t f : formats) {
+            if (f == pref) { selectedFormat = pref; picked = true; break; }
+        }
+        if (picked) break;
+    }
+    const bool bgra = (selectedFormat == (int64_t)VK_FORMAT_B8G8R8A8_UNORM);
+    LOG_INFO("Quad probe swapchain format: %lld (%s)", (long long)selectedFormat,
+             bgra ? "BGRA8" : "RGBA8");
+
+    XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+                     XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
+                     XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    sci.format = selectedFormat;
+    sci.sampleCount = 1;
+    sci.width = size;
+    sci.height = size;
+    sci.faceCount = 1;
+    sci.arraySize = 1;
+    sci.mipCount = 1;
+    if (XR_FAILED(xrCreateSwapchain(xr.session, &sci, &g_quadSwapchain))) {
+        return false;
+    }
+
+    uint32_t n = 0;
+    xrEnumerateSwapchainImages(g_quadSwapchain, 0, &n, nullptr);
+    std::vector<XrSwapchainImageVulkanKHR> imgs(n, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+    if (n == 0 || XR_FAILED(xrEnumerateSwapchainImages(g_quadSwapchain, n, &n,
+                                                       (XrSwapchainImageBaseHeader*)imgs.data()))) {
+        return false;
+    }
+
+    XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    uint32_t idx = 0;
+    if (XR_FAILED(xrAcquireSwapchainImage(g_quadSwapchain, &ai, &idx))) {
+        return false;
+    }
+    XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wi.timeout = XR_INFINITE_DURATION;
+    xrWaitSwapchainImage(g_quadSwapchain, &wi);
+
+    const size_t stride = (size_t)size * 4;
+    const size_t bytes = stride * size;
+    uint8_t* buf = (uint8_t*)malloc(bytes);
+    if (buf == nullptr) {
+        XrSwapchainImageReleaseInfo rr = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        xrReleaseSwapchainImage(g_quadSwapchain, &rr);
+        return false;
+    }
+
+    auto put = [&](uint32_t x, uint32_t y, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+        uint8_t* px = buf + (size_t)y * stride + (size_t)x * 4;
+        if (bgra) { px[0] = b; px[1] = g; px[2] = r; }
+        else      { px[0] = r; px[1] = g; px[2] = b; }
+        px[3] = a;
+    };
+
+    const float fs = (float)size;
+    const uint32_t border = 8;
+    const uint32_t corner = size / 5;
+
+    // Ring + tail geometry for the "Q" (normalized, origin top-left).
+    const float cx = 0.47f * fs, cy = 0.46f * fs;
+    const float rOut = 0.28f * fs, rIn = 0.175f * fs;
+    const float tx0 = 0.56f * fs, ty0 = 0.60f * fs;   // tail start (inside the ring)
+    const float tx1 = 0.80f * fs, ty1 = 0.86f * fs;   // tail end (bottom-right)
+    const float tailHalf = 0.035f * fs;
+
+    for (uint32_t y = 0; y < size; y++) {
+        for (uint32_t x = 0; x < size; x++) {
+            // Coloured checker base (same RGB values as the GL/Metal probes).
+            bool check = (((x / 24) + (y / 24)) & 1) != 0;
+            uint8_t r = check ? 120 : 25;
+            uint8_t g = check ? 185 : 75;
+            uint8_t b = check ? 190 : 100;
+
+            // Corner blocks, inside the border.
+            const bool left = (x >= border && x < border + corner);
+            const bool right = (x + border + corner >= size && x + border < size);
+            const bool top = (y >= border && y < border + corner);
+            const bool bottom = (y + border + corner >= size && y + border < size);
+            if (left && top)          { r = 255; g = 0;   b = 0;   }  // TL red
+            else if (right && top)    { r = 40;  g = 210; b = 40;  }  // TR green
+            else if (left && bottom)  { r = 0;   g = 60;  b = 255; }  // BL blue
+            else if (right && bottom) { r = 235; g = 220; b = 20;  }  // BR yellow
+
+            // The "Q": black ring + a tail running to the bottom-right.
+            const float dx = (float)x - cx, dy = (float)y - cy;
+            const float d = sqrtf(dx * dx + dy * dy);
+            bool ink = (d <= rOut && d >= rIn);
+            if (!ink) {
+                // Distance from the point to the tail segment.
+                const float sx = tx1 - tx0, sy = ty1 - ty0;
+                const float px = (float)x - tx0, py = (float)y - ty0;
+                float t = (px * sx + py * sy) / (sx * sx + sy * sy);
+                t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+                const float qx = px - t * sx, qy = py - t * sy;
+                ink = sqrtf(qx * qx + qy * qy) <= tailHalf;
+            }
+            if (ink) { r = 15; g = 15; b = 15; }
+
+            // Bottom-left quadrant at half alpha (STRAIGHT alpha bytes).
+            uint8_t a = (x < size / 2 && y >= size / 2) ? 128 : 255;
+
+            // Opaque white border last, so it is never punched by the alpha
+            // quadrant — it is the measurement fiducial.
+            if (x < border || y < border || x + border >= size || y + border >= size) {
+                r = g = b = 255;
+                a = 255;
+            }
+
+            put(x, y, r, g, b, a);
+        }
+    }
+
+    // --- Upload: host-visible staging buffer -> vkCmdCopyBufferToImage. The
+    // image is left in SHADER_READ_ONLY_OPTIMAL, which is what the vk_native
+    // compositor samples a released swapchain image from (same contract as
+    // UploadHudPixels above).
+    bool ok = false;
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMem = VK_NULL_HANDLE;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    do {
+        VkBufferCreateInfo bci = {};
+        bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bci.size = bytes;
+        bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (vkCreateBuffer(device, &bci, nullptr, &staging) != VK_SUCCESS) break;
+
+        VkMemoryRequirements memReqs;
+        vkGetBufferMemoryRequirements(device, staging, &memReqs);
+        uint32_t memType = 0;
+        if (!VkFindMemoryTypeForHud(phys, memReqs.memoryTypeBits,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                &memType)) {
+            break;
+        }
+        VkMemoryAllocateInfo mai = {};
+        mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        mai.allocationSize = memReqs.size;
+        mai.memoryTypeIndex = memType;
+        if (vkAllocateMemory(device, &mai, nullptr, &stagingMem) != VK_SUCCESS) break;
+        if (vkBindBufferMemory(device, staging, stagingMem, 0) != VK_SUCCESS) break;
+
+        void* mapped = nullptr;
+        if (vkMapMemory(device, stagingMem, 0, bytes, 0, &mapped) != VK_SUCCESS) break;
+        memcpy(mapped, buf, bytes);
+        vkUnmapMemory(device, stagingMem);
+
+        VkCommandBufferAllocateInfo ca = {};
+        ca.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        ca.commandPool = pool;
+        ca.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        ca.commandBufferCount = 1;
+        if (vkAllocateCommandBuffers(device, &ca, &cmd) != VK_SUCCESS) break;
+
+        VkCommandBufferBeginInfo bi = {};
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cmd, &bi);
+
+        VkImageMemoryBarrier b = {};
+        b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = imgs[idx].image;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        b.srcAccessMask = 0;
+        b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+
+        VkBufferImageCopy region = {};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {size, size, 1};
+        vkCmdCopyBufferToImage(cmd, staging, imgs[idx].image,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+
+        vkEndCommandBuffer(cmd);
+        VkSubmitInfo si = {};
+        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &cmd;
+        if (vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE) != VK_SUCCESS) break;
+        vkQueueWaitIdle(queue);
+        ok = true;
+    } while (false);
+
+    if (cmd != VK_NULL_HANDLE) vkFreeCommandBuffers(device, pool, 1, &cmd);
+    if (stagingMem != VK_NULL_HANDLE) vkFreeMemory(device, stagingMem, nullptr);
+    if (staging != VK_NULL_HANDLE) vkDestroyBuffer(device, staging, nullptr);
+    free(buf);
+
+    g_quadVkImage = imgs[idx].image;
+    XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    xrReleaseSwapchainImage(g_quadSwapchain, &ri);
+    g_quadTexSize = size;
+    return ok;
+}
+
 static bool EndFrame(AppXrSession& xr, XrTime displayTime,
     const XrCompositionLayerProjectionView* views, uint32_t viewCount = 2) {
     XrCompositionLayerProjection projectionLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
@@ -2844,6 +3141,94 @@ static bool EndFrame(AppXrSession& xr, XrTime displayTime,
     endInfo.displayTime = displayTime;
     endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
     endInfo.layerCount = 1;
+    endInfo.layers = layers;
+    return XR_SUCCEEDED(xrEndFrame(xr.session, &endInfo));
+}
+
+// #1581 — the DXR_TEST_QUAD variant of EndFrame: the same projection layer,
+// plus three XrCompositionLayerQuad layers on the one probe texture. Kept as a
+// separate function so the default (no DXR_TEST_QUAD) path above is untouched.
+static bool EndFrameWithQuads(AppXrSession& xr, XrTime displayTime,
+    const XrCompositionLayerProjectionView* views, uint32_t viewCount) {
+    XrCompositionLayerProjection projectionLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+    projectionLayer.space = xr.localSpace;
+    projectionLayer.viewCount = viewCount;
+    projectionLayer.views = views;
+
+    const XrCompositionLayerBaseHeader* layers[8] = {
+        (XrCompositionLayerBaseHeader*)&projectionLayer
+    };
+    uint32_t layerCount = 1;
+
+    XrCompositionLayerQuad quadA = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+    XrCompositionLayerQuad quadB = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+    XrCompositionLayerQuad quadC = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+
+    XrSwapchainSubImage sub = {};
+    sub.swapchain = g_quadSwapchain;
+    sub.imageRect.offset = {0, 0};
+    sub.imageRect.extent = {(int32_t)g_quadTexSize, (int32_t)g_quadTexSize};
+    sub.imageArrayIndex = 0;
+
+    // Everything is sized and placed in units of the CANVAS, not in absolute
+    // metres: a 3D display's Kooima frustum is narrow and strongly off-axis
+    // vertically, so absolute-metre poses that read fine on an HMD land
+    // off-tile here. Fractions of the canvas keep all three quads inside both
+    // tiles on any display, which is what makes the picture judgeable.
+    const float cw = (g_input.canvasWidthM > 0.01f) ? g_input.canvasWidthM : 0.44f;
+    const float ch = (g_input.canvasHeightM > 0.01f) ? g_input.canvasHeightM : 0.24f;
+
+    // (A) LOCAL space, axis-aligned, both eyes, STRAIGHT alpha. This is the
+    // measurement quad: LOCAL is the same space the projection layer's view
+    // poses are submitted in, so the expected projected width is exactly
+    // computable from xrLocateViews (see [QUAD-EXPECT]). Also the alpha and
+    // stereo-disparity probe.
+    quadA.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+    quadA.space = xr.localSpace;
+    quadA.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+    quadA.subImage = sub;
+    quadA.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+    quadA.pose.position = {kQuadAx * cw, kQuadAy * ch, kQuadAz * ch};
+    quadA.size = {kQuadFracA * ch, kQuadFracA * ch};
+    layers[layerCount++] = (XrCompositionLayerBaseHeader*)&quadA;
+
+    // (B) LOCAL space, yawed -15 deg about up, both eyes, and deliberately
+    // WITHOUT the source-alpha bit — the OPAQUE_COVER case (its half-alpha
+    // quadrant reads brighter than (A)'s — expected).
+    const float halfYaw = -15.0f * 0.5f * (float)M_PI / 180.0f;
+    quadB.layerFlags = 0;
+    quadB.space = xr.localSpace;
+    quadB.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+    quadB.subImage = sub;
+    quadB.pose.orientation = {0.0f, sinf(halfYaw), 0.0f, cosf(halfYaw)};
+    quadB.pose.position = {0.45f * cw, -0.29f * ch, -0.5f * ch};
+    quadB.size = {kQuadFracB * ch, kQuadFracB * ch};
+    layers[layerCount++] = (XrCompositionLayerBaseHeader*)&quadB;
+
+    // (C) LEFT EYE ONLY — its absence from the right-hand tile is the
+    // eye-visibility check.
+    //
+    // LOCAL, not VIEW, and that is a finding rather than a preference: a
+    // VIEW-space layer pose comes out of oxr_session_frame_end's handle_space
+    // HEAD-RELATIVE, but every other layer pose — and the projection view
+    // poses the camera is built from — is resolved into the head xdev's
+    // TRACKING frame, in which the head sits ~1.6 m up. So a VIEW-space quad
+    // lands ~1.6 m below everything else and falls straight out of the
+    // frustum. This is a pre-existing cross-backend space bug (#1584 confirmed
+    // it on Metal, and D3D11 has it too), not a #1581 regression.
+    quadC.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+    quadC.space = xr.localSpace;
+    quadC.eyeVisibility = XR_EYE_VISIBILITY_LEFT;
+    quadC.subImage = sub;
+    quadC.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+    quadC.pose.position = {-0.379f * cw, -0.311f * ch, 0.0f};
+    quadC.size = {kQuadFracC * ch, kQuadFracC * ch};
+    layers[layerCount++] = (XrCompositionLayerBaseHeader*)&quadC;
+
+    XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
+    endInfo.displayTime = displayTime;
+    endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    endInfo.layerCount = layerCount;
     endInfo.layers = layers;
     return XR_SUCCEEDED(xrEndFrame(xr.session, &endInfo));
 }
@@ -2951,6 +3336,20 @@ int main() {
     signal(SIGTERM, SignalHandler);
 
     LOG_INFO("=== Sim Cube OpenXR + External macOS Window ===");
+
+    // #1581 quad layers.
+    {
+        const char* e = getenv("DXR_TEST_QUAD");
+        g_quadTest = (e != NULL && e[0] != '\0' && e[0] != '0');
+        if (g_quadTest) {
+            // The HUD is a window-space layer drawn AFTER the quads; keep it
+            // off so the atlas dump is unambiguous. (It is already off by
+            // default in this app — this makes the guarantee explicit.)
+            g_input.hudVisible = false;
+            LOG_INFO("DXR_TEST_QUAD=1 — submitting 3 XrCompositionLayerQuad layers "
+                     "(axis-aligned, yawed, LEFT-eye-only)");
+        }
+    }
 
     // Initial rendering mode is sourced from the runtime via v13 `isActive`
     // (set during xrEnumerateDisplayRenderingModesDXR). Fallback is mode 1
@@ -3283,6 +3682,18 @@ int main() {
         g_frameCount++;
         g_avgFrameTime = g_avgFrameTime * 0.95 + deltaTime * 0.05;
 
+        // #1581: create + fill the quad probe texture once the session runs.
+        if (g_quadTest && !g_quadActive && g_frameCount >= kQuadActivationFrame) {
+            static bool quadAttempted = false;
+            if (!quadAttempted) {
+                quadAttempted = true;
+                g_quadActive = CreateAndFillQuadTexture(xr, 256, vkDevice, physDevice,
+                                                        graphicsQueue, vkRenderer.commandPool);
+                LOG_INFO("Quad probe texture %s (256x256, VkImage %p)",
+                         g_quadActive ? "ready" : "FAILED", (void*)g_quadVkImage);
+            }
+        }
+
         UpdateCameraMovement(g_input, deltaTime, xr.displayHeightM);
 
         vkRenderer.cubeRotation += deltaTime * 0.5f;
@@ -3600,6 +4011,80 @@ int main() {
                         } else {
                             rendered = false;
                         }
+
+                        // #1581 — publish what the quad pass OUGHT to produce,
+                        // so the atlas dump can be checked against arithmetic
+                        // instead of against a feeling.
+                        //
+                        // Quad (A) is axis-aligned with the eye and lives in
+                        // LOCAL — the same space the projection layer's view
+                        // poses are submitted in — so its projected width is
+                        // exactly
+                        //     px = size_m * tile_w_px / ((tan(fovR) - tan(fovL)) * d)
+                        // where d is the eye-to-quad distance along the eye's
+                        // -Z. Everything on the right-hand side is read from
+                        // what the runtime just handed us at xrLocateViews;
+                        // nothing is assumed about the compositor's camera. A
+                        // compositor using the old hardcoded +-45 deg camera
+                        // misses this by 1.7-2.7x, which is the whole point.
+                        if (g_quadTest && g_quadActive && viewCount >= 1 && g_renderW > 0) {
+                            static int quadExpectLogged = 0;
+                            if (g_frameCount > 60 && quadExpectLogged < 2) {
+                                quadExpectLogged++;
+                                const float cw = (g_input.canvasWidthM > 0.01f)
+                                                     ? g_input.canvasWidthM : 0.44f;
+                                const float ch = (g_input.canvasHeightM > 0.01f)
+                                                     ? g_input.canvasHeightM : 0.24f;
+                                const float sizeA = kQuadFracA * ch;
+                                const XrVector3f qa = {kQuadAx * cw, kQuadAy * ch, kQuadAz * ch};
+
+                                LOG_INFO("[QUAD-EXPECT] canvas=%.4fx%.4f m  quadA size=%.4f m at LOCAL "
+                                         "(%.4f,%.4f,%.4f)",
+                                         cw, ch, sizeA, qa.x, qa.y, qa.z);
+
+                                for (uint32_t v = 0; v < viewCount && v < 8; v++) {
+                                    const XrPosef& e = views[v].pose;
+                                    XrQuaternionf inv = {-e.orientation.x, -e.orientation.y,
+                                                         -e.orientation.z, e.orientation.w};
+                                    float lx, ly, lz;
+                                    quat_rotate_vec3(inv, qa.x - e.position.x, qa.y - e.position.y,
+                                                     qa.z - e.position.z, &lx, &ly, &lz);
+                                    const float dEye = -lz;
+                                    const float tanL = tanf(views[v].fov.angleLeft);
+                                    const float tanR = tanf(views[v].fov.angleRight);
+                                    const float tanSpanX = tanR - tanL;
+                                    const float expectPx =
+                                        (dEye > 0.001f && tanSpanX > 0.0001f)
+                                            ? (sizeA * (float)g_renderW / (tanSpanX * dEye))
+                                            : 0.0f;
+                                    // Tile-local x and y of the quad CENTRE, same
+                                    // derivation. y matters as much as x: the
+                                    // vertical mapping is where a Vulkan-vs-GL
+                                    // clip-Y convention slip hides, and an
+                                    // asymmetric Kooima fov turns that slip into a
+                                    // large displacement rather than a no-op.
+                                    const float tanU = tanf(views[v].fov.angleUp);
+                                    const float tanD = tanf(views[v].fov.angleDown);
+                                    const float tanSpanY = tanU - tanD;
+                                    const float centrePx =
+                                        (dEye > 0.001f && tanSpanX > 0.0001f)
+                                            ? ((lx / dEye) - tanL) / tanSpanX * (float)g_renderW
+                                            : 0.0f;
+                                    const float centrePy =
+                                        (dEye > 0.001f && tanSpanY > 0.0001f)
+                                            ? (tanU - (ly / dEye)) / tanSpanY * (float)g_renderH
+                                            : 0.0f;
+                                    LOG_INFO("[QUAD-EXPECT] view=%u tile=%ux%u fovLRUD=(%.4f,%.4f,%.4f,%.4f) rad "
+                                             "eye=(%.4f,%.4f,%.4f) quadA_eyerel=(%.4f,%.4f,%.4f) d=%.4f m "
+                                             "tanSpanX=%.4f -> width %.1f px (%.1f%% of tile), centre (%.1f, %.1f) px",
+                                             v, g_renderW, g_renderH, views[v].fov.angleLeft,
+                                             views[v].fov.angleRight, views[v].fov.angleUp,
+                                             views[v].fov.angleDown, e.position.x, e.position.y,
+                                             e.position.z, lx, ly, lz, dEye, tanSpanX, expectPx,
+                                             100.0f * expectPx / (float)g_renderW, centrePx, centrePy);
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -3635,7 +4120,13 @@ int main() {
                         projectionViews.data(), locatedCount,
                         hudSwapchain, 0.0f, 0.0f, fracW, fracH, 0.0f);
                 } else if (rendered) {
-                    EndFrame(xr, frameState.predictedDisplayTime, projectionViews.data(), locatedCount);
+                    // #1581: identical projection layer, plus the three quads.
+                    if (g_quadTest && g_quadActive && g_quadSwapchain != XR_NULL_HANDLE) {
+                        EndFrameWithQuads(xr, frameState.predictedDisplayTime,
+                                          projectionViews.data(), locatedCount);
+                    } else {
+                        EndFrame(xr, frameState.predictedDisplayTime, projectionViews.data(), locatedCount);
+                    }
                 } else {
                     XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
                     endInfo.displayTime = frameState.predictedDisplayTime;
@@ -3779,6 +4270,10 @@ int main() {
     if (hudSwapchain.swapchain != XR_NULL_HANDLE) {
         // Destroy before CleanupOpenXR releases the session.
         xrDestroySwapchain(hudSwapchain.swapchain);
+    }
+    if (g_quadSwapchain != XR_NULL_HANDLE) { // #1581
+        xrDestroySwapchain(g_quadSwapchain);
+        g_quadSwapchain = XR_NULL_HANDLE;
     }
 
     CleanupVkRenderer(vkRenderer);
