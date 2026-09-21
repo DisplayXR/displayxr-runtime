@@ -1063,7 +1063,14 @@ client_dll_ok:
 			DetailPrint "Skipping immediate service start (/NOSTART)."
 		${Else}
 			DetailPrint "Starting DisplayXR Service..."
-			Exec '"$INSTDIR\displayxr-service.exe"'
+			; #1478: this installer runs elevated, so a plain Exec would hand the
+			; service a High-integrity token. The IPC layer assumes the service is
+			; Medium (clients are Medium or Low; a Medium client cannot
+			; OpenProcess(PROCESS_DUP_HANDLE) a High service, and every child the
+			; service spawns would inherit the elevation). Route the launch through
+			; the user's explorer.exe, which is Medium, so the service starts the
+			; same way the logon Run key starts it.
+			Exec 'explorer.exe "$INSTDIR\displayxr-service.exe"'
 		${EndIf}
 	skip_service_autostart:
 
