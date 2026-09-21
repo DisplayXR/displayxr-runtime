@@ -3698,20 +3698,55 @@ oxr_session_locate_views(struct oxr_logger *log,
  * it from the DP eye and the canvas metres — which is all a compositor has —
  * cannot reproduce it.
  *
- * SPACE. The cameras come back in the head-relative space every layer pose in
- * the frame is expressed in. That is achieved by locating in the session's VIEW
- * reference space and then composing the SAME `oxr_space_ref_offset` that
- * `handle_space()` composes onto a VIEW-space layer pose — so a VIEW-space quad
- * and this camera cannot disagree about the space they live in, by
- * construction.
+ * SPACE (#1594 / #1607). The cameras come back in the head device's
+ * TRACKING-ORIGIN ("root") frame — the one frame every layer pose in the frame
+ * is expressed in since #1607 deleted handle_space()'s VIEW special case. That
+ * is achieved by locating the views in a stack VIEW space and then running each
+ * located pose through `oxr_session_layer_pose_in_compositor_frame()`, i.e.
+ * THE function handle_space() forwards to, with THE same stack VIEW space. So
+ * "the camera for view i" is literally "handle_space() of a VIEW-space quad at
+ * the view origin": the two cannot disagree about their frame, because there is
+ * only one implementation to disagree with.
+ *
+ * What this replaced was `math_pose_transform(view_offset, views[i].pose)` —
+ * the old head-relative composition, deliberately matching the pre-#1607 VIEW
+ * branch. Composing `oxr_space_ref_offset` here on TOP of the generic locate
+ * would double it (the locate already applies it as its base offset), so the
+ * explicit composition is gone, not merely extended.
  *
  * NO SIDE EFFECTS. `oxr_session_locate_views` publishes the #1502 VIEW-space
- * offset as a side effect of running. This call snapshots that offset first,
- * uses the snapshot for both the base conversion (via the stack space) and the
- * composition, and restores it afterwards — so `xrEndFrame` leaves exactly the
- * value the app's own `xrLocateViews` published, and `handle_space()` later in
- * the same frame composes that same value onto the quad poses. `xrLocateViews`
- * itself is untouched: this is a second caller of it, not a change to it.
+ * offset as a side effect of running. This call snapshots that offset first and
+ * restores it BEFORE the conversion below — so the conversion's locate reads
+ * exactly the offset the app's own `xrLocateViews` published, which is the same
+ * value `handle_space()` reads later in the same frame, and `xrEndFrame` leaves
+ * the published value untouched. Still needed after #1607: the offset is no
+ * longer composed by hand here, but it is still the base offset the locate
+ * applies. `xrLocateViews` itself is untouched: this is a second caller of it,
+ * not a change to it.
+ *
+ * SIDE-EFFECT AUDIT (asked of #1580 on 2026-09-20: can this second locate per
+ * frame perturb what the app's own `xrLocateViews` returns?). Every PERSISTENT
+ * write inside `oxr_session_locate_views`:
+ *   - the #1502 VIEW-offset publish (:3601) — snapshotted and restored here;
+ *   - `sess->display_zones.{warned_bad_locate_rect,located_count,
+ *     located_next_slot}` (:2442-2463) — gated on a chained XrDisplayZoneDXR,
+ *     and this locate chains NOTHING, so the ring is never rotated;
+ *   - `sess->last_is_tracking` + the #441 eye-tracking event (:3663-3672) —
+ *     edge-triggered, so the event still fires exactly once with the correct
+ *     value; only its timing moves at most one frame earlier. No output struct
+ *     is chained here, so XrViewEyeTrackingStateDXR is untouched;
+ *   - static log counters / `warned_*` flags — throttling only;
+ *   - `qwerty_get_tracked_pose()` (qwerty_device.c:347) — genuinely stateful:
+ *     time-based integration plus CONSUME-ONCE mouse deltas. An extra poll
+ *     delivers the accumulated mouse-look one frame earlier and splits that
+ *     frame's dt in two; magnitudes are preserved (nothing double-applies or
+ *     scales), and it is qwerty-only, so it cannot move a sim rig's eye
+ *     geometry.
+ * None of these changes the pose or FOV a subsequent `xrLocateViews` reports.
+ * The 0.1422 VIEW eye_y on the 4-view sim rig is NOT from here: it is the
+ * intended #1502 centroid, computed at :3582-3601 over the views just written
+ * (the spec's "centroid of the view origins"), and equals (0.0953 + 0.1890)/2
+ * for that rig exactly.
  *
  * The base space is a STACK `oxr_space`, not a handle: `oxr_session_locate_views`
  * reaches into `baseSpc` only through `oxr_space_locate_device()` (which reads
@@ -3775,7 +3810,10 @@ oxr_session_frame_view_cameras(struct oxr_logger *log,
 	uint32_t count = 0;
 	XrResult ret = oxr_session_locate_views(log, sess, &info, &view_state, XRT_MAX_VIEWS, &count, views);
 
-	// Undo the #1502 publish this locate performed.
+	// Undo the #1502 publish this locate performed — BEFORE the conversion
+	// loop below, whose locate reads the offset back as its base offset. The
+	// app's published value is what handle_space() will read for this frame's
+	// VIEW layers, so the camera must read the same one.
 	oxr_session_set_view_space_offset(sess, &view_offset);
 
 	if (ret != XR_SUCCESS) {
@@ -3794,9 +3832,10 @@ oxr_session_frame_view_cameras(struct oxr_logger *log,
 	}
 
 	for (uint32_t i = 0; i < count; i++) {
-		// VIEW-relative -> head-relative, exactly as handle_space() does
-		// it for a VIEW-space layer pose (view_offset o spc->pose o P,
-		// with spc->pose identity here).
+		// VIEW-relative -> ROOT, through the SAME function handle_space()
+		// forwards to, with the SAME stack VIEW space (#1594/#1607). No
+		// offset is composed here: the locate inside applies
+		// oxr_space_ref_offset() as its base offset already.
 		union {
 			XrPosef oxr;
 			struct xrt_pose xrt;
@@ -3807,10 +3846,19 @@ oxr_session_frame_view_cameras(struct oxr_logger *log,
 		} f = {views[i].fov};
 
 		struct xrt_pose in_view = p.xrt;
-		if (!math_quat_validate(&in_view.orientation)) {
-			math_quat_normalize(&in_view.orientation);
+		if (!oxr_session_layer_pose_in_compositor_frame(log, sess, &view_space, &in_view, display_time,
+		                                               &out_cameras[i].pose)) {
+			// Defensive: unreachable for a VIEW space today, because
+			// the VIEW leg of the conversion degrades to the
+			// pre-#1594 head-relative composition (behind its own
+			// once-latched warning) instead of failing — which is
+			// also what this frame's VIEW layers will do, so the
+			// camera still matches them. If that ever changes,
+			// report NO cameras rather than a camera in a frame the
+			// layers are not in.
+			*out_count = 0;
+			return XR_SUCCESS;
 		}
-		math_pose_transform(&view_offset, &in_view, &out_cameras[i].pose);
 		out_cameras[i].fov = f.xrt;
 	}
 

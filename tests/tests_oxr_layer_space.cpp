@@ -232,3 +232,71 @@ TEST_CASE("oxr_layer_space: the pre-#1594 head-relative shortcut misses by the h
 	REQUIRE_THAT(dy, Catch::Matchers::WithinAbs(T_root_head.position.y, 1e-3f));
 	REQUIRE(dy > 1.5f); // the ~1.6 m the CTS prompt quads fell by
 }
+
+TEST_CASE("oxr_layer_space: the frame camera is handle_space of a VIEW quad at the view origin",
+          "[oxr_layer_space]")
+{
+	/*
+	 * #1594 follow-up to #1607. `oxr_session_frame_view_cameras()` locates
+	 * the views in a stack VIEW space and then runs each located pose
+	 * through `oxr_session_layer_pose_in_compositor_frame()` — which is the
+	 * function `handle_space()` forwards to — with THAT SAME stack VIEW
+	 * space. So the camera for view i is, by construction, what a VIEW-space
+	 * quad submitted at `views[i].pose` would resolve to; there is one
+	 * implementation, so there is nothing for the two to disagree about.
+	 *
+	 * This section pins that identity on the one piece of that call chain
+	 * that has arithmetic in it, and measures what the DELETED composition
+	 * (`math_pose_transform(view_offset, views[i].pose)`, matching the
+	 * pre-#1607 VIEW branch) would have produced instead: short by exactly
+	 * the head pose, which is #1594 all over again with the opposite sign.
+	 */
+	const xrt_pose T_root_local = make_T_root_local();
+	const xrt_pose T_root_head = make_T_root_head();
+	const xrt_pose view_offset = make_view_space_offset();
+	const xrt_pose T_root_view = compose(T_root_head, view_offset);
+	const xrt_space_relation rel_view = origin_located_in(T_root_view);
+	const xrt_space_relation rel_local = origin_located_in(T_root_local);
+
+	// What xrLocateViews reports in a VIEW-space locate: the two eyes about
+	// the centroid, which VIEW's own origin sits at (#1502).
+	xrt_pose located[2];
+	located[0] = XRT_POSE_IDENTITY;
+	located[0].position = {-0.032f, 0.0f, 0.0f};
+	located[1] = XRT_POSE_IDENTITY;
+	located[1].position = {0.032f, 0.0f, 0.0f};
+
+	for (uint32_t i = 0; i < 2; i++) {
+		// The camera: the located view through the shared conversion.
+		xrt_pose camera = XRT_POSE_IDENTITY;
+		REQUIRE(oxr_layer_pose_in_xdev_frame(&rel_view, &located[i], &camera));
+
+		// The A/D pair, camera side: a quad the app submits in LOCAL at
+		// the pose denoting the SAME physical place as this view origin
+		// must resolve ONTO the camera. Different space, different app
+		// pose, one frame.
+		const xrt_pose P_local = compose(invert(T_root_local), compose(T_root_view, located[i]));
+		xrt_pose quad = XRT_POSE_IDENTITY;
+		REQUIRE(oxr_layer_pose_in_xdev_frame(&rel_local, &P_local, &quad));
+		require_pose_eq(camera, quad);
+
+		// And that is the ROOT frame, not a head-relative one.
+		require_pose_eq(camera, compose(T_root_view, located[i]));
+
+		// The deleted head-relative composition misses by the head pose.
+		const xrt_pose legacy = compose(view_offset, located[i]);
+		REQUIRE_THAT(camera.position.y - legacy.position.y,
+		             Catch::Matchers::WithinAbs(T_root_head.position.y, 1e-3f));
+	}
+
+	// The lift is rigid: the baseline survives it unchanged, so a camera
+	// that agreed with the layers but collapsed the eyes would still fail.
+	xrt_pose c0 = XRT_POSE_IDENTITY;
+	xrt_pose c1 = XRT_POSE_IDENTITY;
+	REQUIRE(oxr_layer_pose_in_xdev_frame(&rel_view, &located[0], &c0));
+	REQUIRE(oxr_layer_pose_in_xdev_frame(&rel_view, &located[1], &c1));
+	const float dx = c1.position.x - c0.position.x;
+	const float dy = c1.position.y - c0.position.y;
+	const float dz = c1.position.z - c0.position.z;
+	REQUIRE_THAT(std::sqrt(dx * dx + dy * dy + dz * dz), Catch::Matchers::WithinAbs(0.064f, 1e-4f));
+}

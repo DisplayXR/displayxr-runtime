@@ -15,11 +15,13 @@
  * Two facts this file pins, because they are what makes branch (a) legal:
  *
  *  1. `data.quad.pose` and `data.proj.v[i].pose` come out of the SAME
- *     `handle_space()` call in oxr_session_frame_end.c — including the #1502
- *     VIEW-reference-space path, which composes the eye-centroid offset in
- *     exactly as a locate does. Both are therefore already in the head
- *     device's space, so reusing a projection layer's per-view pose as the
- *     quad's camera needs NO re-basing.
+ *     `handle_space()` call in oxr_session_frame_end.c — including the
+ *     VIEW-reference-space path, which since #1607 goes through the very same
+ *     head-device locate (the #1502 eye-centroid offset riding along as that
+ *     locate's base offset). Both are therefore already in the head device's
+ *     TRACKING-ORIGIN ("root") frame, so reusing a projection layer's per-view
+ *     pose as the quad's camera needs NO re-basing — while branch (b), which
+ *     starts from the HEAD-relative DP eye, does (#1594).
  *
  *  2. Every CTS quad sets XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
  *     so straight (unpremultiplied-source) alpha is the variant conformance
@@ -35,6 +37,8 @@
 
 #include "util/comp_layer_accum.h"
 #include "util/comp_layer_view_camera.h"
+
+#include "math/m_api.h"
 
 #include <cmath>
 #include <cstring>
@@ -135,6 +139,47 @@ set_frame_cameras(struct comp_layer_accum &accum,
 		accum.data.cameras[accum.data.camera_count++] = c;
 	}
 	accum.data.cameras_valid = accum.data.camera_count > 0;
+}
+
+/*!
+ * #1594: T_root_head, the ROOT-frame pose of the head device for this frame,
+ * the way the state tracker fills it at xrEndFrame
+ * (oxr_session_frame_end.c, `xrt_device_get_tracked_pose(head, ...)`).
+ *
+ * Deliberately non-trivial — a yaw AND a translation. A translation-only head
+ * would let an orientation bug through, and an identity head would let a
+ * MISSING lift through, which is the whole point of the follow-up.
+ */
+struct xrt_pose
+make_head_pose()
+{
+	struct xrt_pose p = {};
+	// 30 deg about +Y.
+	p.orientation = {0.0f, 0.258819f, 0.0f, 0.9659258f};
+	// The measured sim-rig head pose from #1594, moved off-axis in x so a
+	// dropped rotation cannot hide.
+	p.position = {0.05f, 0.100f, 0.600f};
+	return p;
+}
+
+void
+set_head_pose(struct comp_layer_accum &accum, const struct xrt_pose &head)
+{
+	accum.data.head_pose = head;
+	accum.data.head_pose_valid = true;
+}
+
+//! head o head_relative, with math_pose_transform's exact semantics.
+struct xrt_pose
+lift_to_root(const struct xrt_pose &head, const struct xrt_vec3 &head_relative_pos)
+{
+	struct xrt_pose in = {};
+	in.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+	in.position = head_relative_pos;
+
+	struct xrt_pose out = {};
+	math_pose_transform(&head, &in, &out);
+	return out;
 }
 
 void
@@ -247,9 +292,9 @@ TEST_CASE("comp_layer_view_camera: (b) synthesised from eye + canvas metres")
 
 	CHECK(cam.source == COMP_LAYER_VIEW_CAMERA_FROM_DISPLAY3D);
 
-	// The pose is the eye verbatim, identity orientation — the same thing
-	// xrLocateViews reports, in the same head-relative space the quad pose
-	// already lives in.
+	// No head pose on this frame, so the pose is the eye verbatim with
+	// identity orientation — the pre-#1594 head-relative result. The lifted
+	// case is pinned in "(b) is lifted into the ROOT layer frame" below.
 	CHECK(cam.pose.position.x == Catch::Approx(eye.x).epsilon(kEps));
 	CHECK(cam.pose.position.y == Catch::Approx(eye.y).epsilon(kEps));
 	CHECK(cam.pose.position.z == Catch::Approx(eye.z).epsilon(kEps));
@@ -281,7 +326,8 @@ TEST_CASE("comp_layer_view_camera: (b) the canvas centre moves the frustum, not 
 	REQUIRE(comp_layer_view_camera_select_ex(&accum, 0, &eye, &canvas_center, w, h, &cam));
 
 	CHECK(cam.source == COMP_LAYER_VIEW_CAMERA_FROM_DISPLAY3D);
-	// Pose stays in the LAYER space (display-plane-relative) — untouched.
+	// Pose stays at the eye (no head pose on this frame) — untouched by the
+	// canvas rebase, which is a FOV-only concern.
 	CHECK(cam.pose.position.x == Catch::Approx(0.0f).margin(kEps));
 	// FOV is rebased.
 	CHECK(cam.fov.angle_left == Catch::Approx(std::atan((-w / 2 + 0.10f) / eye.z)).epsilon(kEps));
@@ -645,12 +691,249 @@ TEST_CASE("comp_layer_view_camera: the eye-set entry point degrades like the sin
 	CHECK(offset.pose.position.x == Catch::Approx(eye.x).margin(kEps));
 }
 
+TEST_CASE("comp_layer_view_camera: (b) is lifted into the ROOT layer frame by head_pose")
+{
+	/*
+	 * #1594 follow-up. Since #1607 EVERY layer pose handle_space() emits is
+	 * in the head device's tracking-origin ("root") frame — VIEW-space quads
+	 * included, which is the bit that changed. Branch (b) starts from the DP
+	 * eye, which is HEAD-relative, so it must compose T_root_head or it
+	 * reproduces the #1594 defect with the opposite sign: the VIEW quad would
+	 * register and the LOCAL quad would miss by the head pose.
+	 */
+	const float w = 0.344f;
+	const float h = 0.194f;
+	const struct xrt_vec3 eye = {-0.032f, 0.0f, 0.600f}; // DP eye, HEAD-relative
+	const struct xrt_pose head = make_head_pose();
+
+	struct comp_layer_accum accum = {};
+	push_quad(accum, {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, -1.0f}});
+	set_head_pose(accum, head);
+
+	struct comp_layer_view_camera cam = {};
+	REQUIRE(comp_layer_view_camera_select(&accum, 0, &eye, w, h, &cam));
+
+	CHECK(cam.source == COMP_LAYER_VIEW_CAMERA_FROM_DISPLAY3D);
+	CHECK_FALSE(cam.head_relative_fallback);
+
+	// The pose is head_pose o eye — position AND orientation.
+	const struct xrt_pose want = lift_to_root(head, eye);
+	CHECK(cam.pose.position.x == Catch::Approx(want.position.x).margin(kEps));
+	CHECK(cam.pose.position.y == Catch::Approx(want.position.y).margin(kEps));
+	CHECK(cam.pose.position.z == Catch::Approx(want.position.z).margin(kEps));
+	CHECK(cam.pose.orientation.x == Catch::Approx(head.orientation.x).margin(kEps));
+	CHECK(cam.pose.orientation.y == Catch::Approx(head.orientation.y).margin(kEps));
+	CHECK(cam.pose.orientation.z == Catch::Approx(head.orientation.z).margin(kEps));
+	CHECK(cam.pose.orientation.w == Catch::Approx(head.orientation.w).margin(kEps));
+
+	// A non-trivial head pose actually moved it: a missing lift cannot pass.
+	CHECK(std::abs(cam.pose.position.z - eye.z) > 0.3f);
+	CHECK(std::abs(cam.pose.orientation.w - 1.0f) > 0.01f);
+
+	// The FOV is untouched by the lift — it is a function of the eye
+	// relative to the CANVAS, both of which stay head-relative.
+	const struct comp_layer_view_camera head_relative = located_view(eye, w, h, {0, 0, 0});
+	CHECK(cam.fov.angle_left == Catch::Approx(head_relative.fov.angle_left).margin(kEps));
+	CHECK(cam.fov.angle_right == Catch::Approx(head_relative.fov.angle_right).margin(kEps));
+	CHECK(cam.fov.angle_up == Catch::Approx(head_relative.fov.angle_up).margin(kEps));
+	CHECK(cam.fov.angle_down == Catch::Approx(head_relative.fov.angle_down).margin(kEps));
+}
+
+TEST_CASE("comp_layer_view_camera: (b) without head_pose falls back head-relative, and SAYS so")
+{
+	const float w = 0.344f;
+	const float h = 0.194f;
+	const struct xrt_vec3 eye = {-0.032f, 0.0f, 0.600f};
+
+	struct comp_layer_accum accum = {};
+	push_quad(accum, {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, -1.0f}});
+	// head_pose_valid stays false: the state tracker could not locate the head.
+
+	struct comp_layer_view_camera cam = {};
+	REQUIRE(comp_layer_view_camera_select(&accum, 0, &eye, w, h, &cam));
+
+	CHECK(cam.source == COMP_LAYER_VIEW_CAMERA_FROM_DISPLAY3D);
+	// Never silent: the flag is the in-band half of the report (the other
+	// half is the once-per-process U_LOG_W the resolver emits).
+	CHECK(cam.head_relative_fallback);
+	check_same_camera(cam, located_view(eye, w, h, {0, 0, 0}));
+
+	// And a populated-but-invalid head pose is ignored, not half-applied.
+	accum.data.head_pose = make_head_pose();
+	accum.data.head_pose_valid = false;
+	struct comp_layer_view_camera again = {};
+	REQUIRE(comp_layer_view_camera_select(&accum, 0, &eye, w, h, &again));
+	CHECK(again.head_relative_fallback);
+	check_same_camera(again, cam);
+}
+
+TEST_CASE("comp_layer_view_camera: the eye set reaches the same ROOT camera as the single eye")
+{
+	const float w = 0.344f;
+	const float h = 0.194f;
+	const struct xrt_pose head = make_head_pose();
+
+	struct comp_layer_accum accum = {};
+	push_quad(accum, {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, -1.0f}});
+	set_head_pose(accum, head);
+
+	const struct xrt_eye_positions eyes = make_eyes({{-0.032f, 0.0f, 0.600f}, {0.032f, 0.0f, 0.600f}});
+
+	for (uint32_t view = 0; view < 2; view++) {
+		struct comp_layer_view_camera cam = {};
+		REQUIRE(comp_layer_view_camera_select_eyes(&accum, view, &eyes, 2, nullptr, w, h, &cam));
+		CHECK(cam.source == COMP_LAYER_VIEW_CAMERA_FROM_DISPLAY3D);
+		CHECK_FALSE(cam.head_relative_fallback);
+
+		const struct xrt_vec3 e = {eyes.eyes[view].x, eyes.eyes[view].y, eyes.eyes[view].z};
+		const struct xrt_pose want = lift_to_root(head, e);
+		CHECK(cam.pose.position.x == Catch::Approx(want.position.x).margin(kEps));
+		CHECK(cam.pose.position.y == Catch::Approx(want.position.y).margin(kEps));
+		CHECK(cam.pose.position.z == Catch::Approx(want.position.z).margin(kEps));
+	}
+
+	// The two views are still a real baseline apart after the lift — the
+	// head rotation must not have collapsed them onto each other.
+	struct comp_layer_view_camera l = {};
+	struct comp_layer_view_camera r = {};
+	REQUIRE(comp_layer_view_camera_select_eyes(&accum, 0, &eyes, 2, nullptr, w, h, &l));
+	REQUIRE(comp_layer_view_camera_select_eyes(&accum, 1, &eyes, 2, nullptr, w, h, &r));
+	const float dx = r.pose.position.x - l.pose.position.x;
+	const float dz = r.pose.position.z - l.pose.position.z;
+	CHECK(std::sqrt(dx * dx + dz * dz) == Catch::Approx(0.064f).margin(1e-4f));
+}
+
+TEST_CASE("comp_layer_view_camera: (b') and (a) are already root-framed, head_pose must not move them")
+{
+	/*
+	 * Legs (a) and (b') come from the state tracker, which resolved them
+	 * through handle_space() / oxr_session_frame_view_cameras() — already in
+	 * the layer frame. Composing head_pose onto them again would double it.
+	 */
+	const float w = 0.344f;
+	const float h = 0.194f;
+	const struct xrt_pose head = make_head_pose();
+	const struct xrt_eye_positions eyes = make_eyes({{-0.032f, 0.0f, 0.600f}, {0.032f, 0.0f, 0.600f}});
+
+	struct xrt_frame_view_camera frame_cam = {};
+	frame_cam.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+	frame_cam.pose.position = {0.011f, 1.722f, 0.567f}; // a ROOT-frame camera
+	frame_cam.fov = {-0.5227f, 0.5227f, 0.2683f, -0.3587f};
+
+	SECTION("(b') verbatim")
+	{
+		struct comp_layer_accum accum = {};
+		push_quad(accum, {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, -1.0f}});
+		set_frame_cameras(accum, {frame_cam, frame_cam});
+		set_head_pose(accum, head);
+
+		struct comp_layer_view_camera cam = {};
+		REQUIRE(comp_layer_view_camera_select_eyes(&accum, 0, &eyes, 2, nullptr, w, h, &cam));
+		CHECK(cam.source == COMP_LAYER_VIEW_CAMERA_FROM_FRAME);
+		CHECK_FALSE(cam.head_relative_fallback);
+
+		struct comp_layer_view_camera want = {};
+		want.pose = frame_cam.pose;
+		want.fov = frame_cam.fov;
+		check_same_camera(cam, want);
+	}
+
+	SECTION("(a) verbatim")
+	{
+		struct xrt_pose proj_pose = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.011f, 1.742f, 0.878f}};
+		struct xrt_fov proj_fov = {-0.4f, 0.41f, 0.3f, -0.31f};
+		struct xrt_pose poses[2] = {proj_pose, proj_pose};
+		struct xrt_fov fovs[2] = {proj_fov, proj_fov};
+
+		struct comp_layer_accum accum = {};
+		push_projection(accum, 2, poses, fovs);
+		push_quad(accum, {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, -1.0f}});
+		set_head_pose(accum, head);
+
+		struct comp_layer_view_camera cam = {};
+		REQUIRE(comp_layer_view_camera_select_eyes(&accum, 0, &eyes, 2, nullptr, w, h, &cam));
+		CHECK(cam.source == COMP_LAYER_VIEW_CAMERA_FROM_PROJECTION);
+		CHECK_FALSE(cam.head_relative_fallback);
+
+		struct comp_layer_view_camera want = {};
+		want.pose = proj_pose;
+		want.fov = proj_fov;
+		check_same_camera(cam, want);
+	}
+}
+
+TEST_CASE("comp_layer_view_camera: a FALSE return is a diagnostic — out is still fully usable")
+{
+	/*
+	 * THE FOOTGUN. Every entry point returns false on branch (c) while
+	 * still writing a complete, drawable camera into `out`. An adopter who
+	 * reads that as a go/no-go and writes
+	 *
+	 *     if (!comp_layer_view_camera_select(...)) { continue; }
+	 *
+	 * draws NO quads at all on a fallback frame — which is how the Metal
+	 * port (#1584) lost its layers. The signature is not changing (mac's
+	 * #1584 and #1608 already call it), so this case exists to make the
+	 * contract executable: on a FALSE return `out` must still be a camera a
+	 * renderer can build an MVP from.
+	 */
+	struct comp_layer_accum accum = {};
+	push_quad(accum, {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, -1.0f}});
+
+	// Poison every field first, so "populated" cannot pass by accident.
+	struct comp_layer_view_camera cam = {};
+	cam.pose.orientation = {9.0f, 9.0f, 9.0f, 9.0f};
+	cam.pose.position = {9.0f, 9.0f, 9.0f};
+	cam.fov = {9.0f, 9.0f, 9.0f, 9.0f};
+	cam.source = COMP_LAYER_VIEW_CAMERA_FROM_PROJECTION;
+
+	// Branch (c): no eye, no canvas, no frame cameras, no projection layer.
+	const bool from_real_data = comp_layer_view_camera_select(&accum, 0, nullptr, 0.0f, 0.0f, &cam);
+	CHECK_FALSE(from_real_data); // the diagnostic...
+
+	// ...and yet: a complete, usable camera. Nothing left poisoned.
+	CHECK(cam.source == COMP_LAYER_VIEW_CAMERA_FALLBACK);
+	CHECK(cam.head_relative_fallback);
+
+	// A unit quaternion (a renderer can invert it to build a view matrix).
+	const float qlen = std::sqrt(
+	    cam.pose.orientation.x * cam.pose.orientation.x + cam.pose.orientation.y * cam.pose.orientation.y +
+	    cam.pose.orientation.z * cam.pose.orientation.z + cam.pose.orientation.w * cam.pose.orientation.w);
+	CHECK(qlen == Catch::Approx(1.0f).margin(kEps));
+
+	// A finite position, not the poison.
+	CHECK(std::isfinite(cam.pose.position.x));
+	CHECK(std::isfinite(cam.pose.position.y));
+	CHECK(std::isfinite(cam.pose.position.z));
+	CHECK(cam.pose.position.x != Catch::Approx(9.0f).margin(kEps));
+
+	// A non-degenerate frustum: left < right, down < up, all finite.
+	CHECK(cam.fov.angle_left < cam.fov.angle_right);
+	CHECK(cam.fov.angle_down < cam.fov.angle_up);
+	CHECK(std::isfinite(cam.fov.angle_left));
+	CHECK(std::isfinite(cam.fov.angle_right));
+	CHECK(std::isfinite(cam.fov.angle_up));
+	CHECK(std::isfinite(cam.fov.angle_down));
+	CHECK(std::abs(cam.fov.angle_right - cam.fov.angle_left) > 0.01f);
+	CHECK(std::abs(cam.fov.angle_up - cam.fov.angle_down) > 0.01f);
+
+	// Same promise through the eye-set entry point the D3D11 renderers use.
+	struct comp_layer_view_camera via_eyes = {};
+	via_eyes.fov = {9.0f, 9.0f, 9.0f, 9.0f};
+	CHECK_FALSE(comp_layer_view_camera_select_eyes(&accum, 0, nullptr, 2, nullptr, 0.0f, 0.0f, &via_eyes));
+	check_same_camera(via_eyes, cam);
+	CHECK(via_eyes.source == COMP_LAYER_VIEW_CAMERA_FALLBACK);
+}
+
 TEST_CASE("comp_layer_view_camera: a NULL accum just skips branch (a)")
 {
 	struct xrt_vec3 eye = {0.0f, 0.0f, 0.5f};
 	struct comp_layer_view_camera cam = {};
 	REQUIRE(comp_layer_view_camera_select(nullptr, 0, &eye, 0.5f, 0.3f, &cam));
 	CHECK(cam.source == COMP_LAYER_VIEW_CAMERA_FROM_DISPLAY3D);
+	// ...and, with no accum, no head pose either — so it is head-relative and
+	// says so rather than silently claiming the layer frame (#1594).
+	CHECK(cam.head_relative_fallback);
 }
 
 TEST_CASE("is_layer_view_visible_n: N = 1, 2, 3, 4 truth table")

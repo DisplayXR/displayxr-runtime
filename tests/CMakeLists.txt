@@ -205,13 +205,15 @@ target_link_libraries(tests_m_matrix_projection PRIVATE aux_math)
 # equirect/cube path consumes. Compiled straight into the unit (like
 # tests_rig_composer) rather than linked from comp_util, which is Vulkan-gated
 # and would drag a whole compositor into a test that needs no device at all.
-# aux_math carries displayxr::math_xrt, i.e. dxr_view_math.h.
+# aux_math carries displayxr::math_xrt, i.e. dxr_view_math.h; the auxiliary dir
+# is on the include path for math/m_api.h (the #1594 head -> root lift).
 target_sources(
 	tests_comp_layer_view_camera
 	PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/comp_layer_view_camera.c
 	)
 target_include_directories(
 	tests_comp_layer_view_camera PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor
+					     ${PROJECT_SOURCE_DIR}/src/xrt/auxiliary
 	)
 target_link_libraries(tests_comp_layer_view_camera PRIVATE xrt-interfaces aux_math)
 # #1581 -- the "no backend gates its draw on the return value" guard reads the

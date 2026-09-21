@@ -13,6 +13,8 @@
 #include "util/comp_layer_accum.h"
 #include "util/u_logging.h"
 
+#include "math/m_api.h" // math_pose_transform — the #1594 head -> root lift
+
 #include "xrt/xrt_compiler.h" // ARRAY_SIZE
 
 #include "dxr_view_math.h" // dxr_display3d_compute_fov — the shared Kooima core
@@ -111,6 +113,27 @@ resolve_render_eye(const struct xrt_eye_positions *eyes,
 	return true;
 }
 
+/*!
+ * #1594: say ONCE that a camera stayed head-relative.
+ *
+ * The frame carried no valid `xrt_layer_frame_data::head_pose`, so branch (b)
+ * could not lift the DP eye into the layer frame. The result is the pre-#1594
+ * camera: correct for a VIEW-space quad, off by the whole head pose for
+ * everything else. Never per frame (docs/reference/debug-logging.md).
+ */
+static void
+warn_head_relative_once(void)
+{
+	static bool warned = false;
+	if (warned) {
+		return;
+	}
+	warned = true;
+	U_LOG_W(
+	    "#1594: frame carries no valid head_pose — composing 3D-positioned layers through a "
+	    "HEAD-RELATIVE camera; layers in a non-VIEW space will be displaced by the head pose");
+}
+
 bool
 comp_layer_view_camera_select_eyes(const struct comp_layer_accum *accum,
                                    uint32_t view_index,
@@ -141,10 +164,13 @@ comp_layer_view_camera_select_ex(const struct comp_layer_accum *accum,
 		return false;
 	}
 
+	out->head_relative_fallback = false;
+
 	/*
 	 * (a) The app's own camera. data.proj.v[i].pose and data.quad.pose come
 	 * out of the SAME handle_space() call in the state tracker, so they are
-	 * already one head-relative space — no re-basing, no new plumbing.
+	 * already one frame — the ROOT frame (#1594) — no re-basing, no new
+	 * plumbing.
 	 */
 	const struct xrt_layer_projection_view_data *vd = find_projection_view(accum, view_index);
 	if (vd != NULL) {
@@ -179,10 +205,16 @@ comp_layer_view_camera_select_ex(const struct comp_layer_accum *accum,
 	 * — the same dxr_display3d_compute_fov() oxr_session.c runs, so a quad
 	 * lands where a projection layer at the same pose would have.
 	 *
-	 * The FOV is a function of the eye relative to the CANVAS centre; the
-	 * pose is expressed in the layer space. Those two origins differ whenever
-	 * the app's window is off the display centre, hence the rebase here and
-	 * the untouched pose below.
+	 * The FOV is a function of the eye relative to the CANVAS centre; both
+	 * live in the head-relative space the DP reports eyes in. Those two
+	 * origins differ whenever the app's window is off the display centre,
+	 * hence the rebase here.
+	 *
+	 * #1594: the POSE, however, must come out in the LAYER frame — root —
+	 * because that is where handle_space() put the quad this camera is about
+	 * to project. `head_pose` (T_root_head) is that lift, and the state
+	 * tracker fills it on every frame. The FOV is origin-independent and is
+	 * NOT touched by it.
 	 */
 	if (eye_pos != NULL && canvas_w_m > 0.0f && canvas_h_m > 0.0f) {
 		dxr_vec3 eye_canvas = {eye_pos->x, eye_pos->y, eye_pos->z};
@@ -194,8 +226,17 @@ comp_layer_view_camera_select_ex(const struct comp_layer_accum *accum,
 
 		dxr_fov fov = dxr_display3d_compute_fov(eye_canvas, canvas_w_m, canvas_h_m);
 
-		out->pose.orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
-		out->pose.position = *eye_pos;
+		struct xrt_pose head_relative = XRT_POSE_IDENTITY;
+		head_relative.position = *eye_pos;
+
+		if (accum != NULL && accum->data.head_pose_valid) {
+			math_pose_transform(&accum->data.head_pose, &head_relative, &out->pose);
+		} else {
+			out->pose = head_relative;
+			out->head_relative_fallback = true;
+			warn_head_relative_once();
+		}
+
 		out->fov.angle_left = fov.angle_left;
 		out->fov.angle_right = fov.angle_right;
 		out->fov.angle_up = fov.angle_up;
@@ -233,6 +274,9 @@ comp_layer_view_camera_select_ex(const struct comp_layer_accum *accum,
 	out->fov.angle_up = COMP_LAYER_VIEW_CAMERA_FALLBACK_HALF_FOV_RAD;
 	out->fov.angle_down = -COMP_LAYER_VIEW_CAMERA_FALLBACK_HALF_FOV_RAD;
 	out->source = COMP_LAYER_VIEW_CAMERA_FALLBACK;
+	// A made-up baseline about the head, never lifted into the layer frame:
+	// (c) is a "keep drawing something" placeholder and claims no frame.
+	out->head_relative_fallback = true;
 	return false;
 }
 

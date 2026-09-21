@@ -1730,26 +1730,13 @@ verify_zones_frame(struct oxr_session *sess,
  *
  */
 
-/**
- * Turn the poses supplied with a composition layer into the poses the compositor wants.
- *
- * @param log logger
- * @param sess session
- * @param spc space that @p pose_ptr is supplied in
- * @param pose_ptr pose supplied with layer
- * @param inv_offset inverse of the tracking origin offset
- * @param timestamp timestamp for pose
- * @param[out] out_pose Resulting pose in the head xdev's tracking-origin frame
- * @return true if successfully transformed into that frame
- */
-static bool
-handle_space(struct oxr_logger *log,
-             struct oxr_session *sess,
-             struct oxr_space *spc,
-             const struct xrt_pose *pose_ptr,
-             const struct xrt_pose *inv_offset,
-             uint64_t timestamp,
-             struct xrt_pose *out_pose)
+bool
+oxr_session_layer_pose_in_compositor_frame(struct oxr_logger *log,
+                                           struct oxr_session *sess,
+                                           struct oxr_space *spc,
+                                           const struct xrt_pose *pose_ptr,
+                                           XrTime timestamp,
+                                           struct xrt_pose *out_pose)
 {
 	// Aka T_offset_layer
 	struct xrt_pose T_space_layer = *pose_ptr;
@@ -1818,6 +1805,38 @@ handle_space(struct oxr_logger *log,
 	}
 
 	return false;
+}
+
+/**
+ * Turn the poses supplied with a composition layer into the poses the compositor wants.
+ *
+ * Thin forwarder onto @ref oxr_session_layer_pose_in_compositor_frame, which is
+ * the ONE implementation of the frame contract and is ALSO what
+ * `oxr_session_frame_view_cameras()` runs each located view through — so this
+ * frame's cameras and this frame's layer poses cannot end up in different
+ * frames (#1594 follow-up to #1607).
+ *
+ * @param log logger
+ * @param sess session
+ * @param spc space that @p pose_ptr is supplied in
+ * @param pose_ptr pose supplied with layer
+ * @param inv_offset unused since #1594 removed the VIEW special case; kept so
+ *                   the eight submit_*_layer() call sites stay untouched.
+ * @param timestamp timestamp for pose
+ * @param[out] out_pose Resulting pose in the head xdev's tracking-origin frame
+ * @return true if successfully transformed into that frame
+ */
+static bool
+handle_space(struct oxr_logger *log,
+             struct oxr_session *sess,
+             struct oxr_space *spc,
+             const struct xrt_pose *pose_ptr,
+             const struct xrt_pose *inv_offset,
+             uint64_t timestamp,
+             struct xrt_pose *out_pose)
+{
+	(void)inv_offset;
+	return oxr_session_layer_pose_in_compositor_frame(log, sess, spc, pose_ptr, (XrTime)timestamp, out_pose);
 }
 
 static XrResult
@@ -2966,9 +2985,48 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 	};
 
 	/*
+	 * #1594: T_root_head for this frame.
+	 *
+	 * The head device's pose in its own tracking origin IS the root frame's
+	 * view of the head — the very `world_head_*` oxr_session_locate_views()
+	 * composes the display processor's head-relative eyes onto before
+	 * reporting a view pose (oxr_session.c, the DISPLAY MODE branch). The
+	 * compositor's branch-(b) synthesis has only the DP eye, so it needs this
+	 * to reach the frame handle_space() puts the layers in.
+	 *
+	 * Filled unconditionally, NOT gated on a non-projection layer being
+	 * present like the cameras below: it is one device pose fetch, and the
+	 * consumer (the compositor) decides per view, per layer, long after the
+	 * gate could have been evaluated here.
+	 *
+	 * ORDER MATTERS, and it is BEFORE the cameras block on purpose.
+	 * qwerty_get_tracked_pose() (qwerty_device.c:347) is stateful: it
+	 * integrates by ELAPSED WALL TIME (storing `last_integrate_ns`, :417)
+	 * and CONSUMES the mouse deltas (`qd->x_pos_delta = 0`, :430-434). So
+	 * whichever poll runs first in a frame banks that frame's mouse-look.
+	 * Fetching here, ahead of the cameras' own locate, guarantees both see
+	 * the SAME post-consume head pose — a head_pose from after the locate
+	 * could describe a different head than the cameras it is meant to lift
+	 * alongside. Magnitudes are safe either way (time-based integration,
+	 * consume-once deltas: nothing is double-applied or scaled).
+	 */
+	{
+		struct xrt_space_relation head_rel = XRT_SPACE_RELATION_ZERO;
+		xrt_device_get_tracked_pose(xdev, XRT_INPUT_GENERIC_HEAD_POSE, xrt_display_time_ns, &head_rel);
+		const enum xrt_space_relation_flags need =
+		    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT;
+		if ((head_rel.relation_flags & need) == need) {
+			data.head_pose = head_rel.pose;
+			data.head_pose_valid = true;
+		}
+	}
+
+	/*
 	 * #1580: hand the compositor THIS frame's per-view cameras — the
 	 * {pose, fov} xrLocateViews reports for this display time, in the same
-	 * head-relative space handle_space() puts every layer pose into below.
+	 * ROOT frame handle_space() puts every layer pose into below (#1594:
+	 * oxr_session_frame_view_cameras() runs each located view through the
+	 * very function handle_space() forwards to, so the two cannot diverge).
 	 *
 	 * A projection layer carries its own camera in proj.v[i].{pose,fov} and
 	 * is drawn as an identity-MVP blit, so the compositor prefers that and

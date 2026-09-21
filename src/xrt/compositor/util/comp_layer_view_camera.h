@@ -8,18 +8,26 @@
  *
  * #1580 — THE INVARIANT: one camera per view per frame, shared by every layer
  * type. That camera is the {pose, fov} pair `xrLocateViews` handed the app,
- * expressed in the compositor's head-relative layer space; because the
- * projection layer is drawn as an identity-MVP fullscreen blit, the view tile
- * IS that frustum, so quad / cylinder / equirect / cube layers must be
- * projected through the SAME one or their world pose lands on different
- * display pixels than the projection content at that pose.
+ * expressed in the compositor's layer frame; because the projection layer is
+ * drawn as an identity-MVP fullscreen blit, the view tile IS that frustum, so
+ * quad / cylinder / equirect / cube layers must be projected through the SAME
+ * one or their world pose lands on different display pixels than the
+ * projection content at that pose.
  *
- * Head-relative layer space: `handle_space()` in oxr_session_frame_end.c
- * resolves EVERY layer pose — `data.quad.pose` and `data.proj.v[i].pose`
- * alike — into the head device's space (and, for VIEW reference spaces,
- * composes the #1502 eye-centroid offset in exactly as a locate does). So a
- * projection layer's per-view pose is already in the space quad poses live in
- * and needs no re-basing.
+ * THE LAYER FRAME is the head device's TRACKING-ORIGIN ("root") space
+ * (#1594/#1607). `handle_space()` in oxr_session_frame_end.c resolves EVERY
+ * layer pose — `data.quad.pose` and `data.proj.v[i].pose` alike — into it
+ * through one call on the head device, VIEW reference spaces included (the
+ * #1502 eye-centroid offset rides along as that locate's base offset). So a
+ * projection layer's per-view pose, and the frame cameras the state tracker
+ * carries on @ref xrt_layer_frame_data, need no re-basing.
+ *
+ * What DOES need re-basing is the display processor's eye: the DP reports eyes
+ * relative to the head (the display plane), so branch (b) below lifts one into
+ * the layer frame with `xrt_layer_frame_data::head_pose` (`T_root_head`). Before
+ * #1594 the layer frame WAS head-relative and no lift was needed; a branch-(b)
+ * camera left head-relative today puts VIEW quads right and LOCAL quads a whole
+ * head pose wrong.
  *
  * This lives in comp_util (Vulkan-free, C) so every backend — D3D11, D3D12,
  * Metal, GL, vk_native — consumes ONE implementation instead of each renderer
@@ -69,12 +77,23 @@ enum comp_layer_view_camera_source
  */
 struct comp_layer_view_camera
 {
-	//! View pose in the head-relative layer space (see file comment).
+	//! View pose in the layer frame — ROOT, see the file comment.
 	struct xrt_pose pose;
 	//! Signed, possibly asymmetric (Kooima off-axis) FOV angles, radians.
 	struct xrt_fov fov;
 	//! Which branch produced this camera.
 	enum comp_layer_view_camera_source source;
+	/*!
+	 * #1594: true when @ref pose could NOT be lifted into the layer frame
+	 * and is therefore still HEAD-RELATIVE — the frame carried no valid
+	 * `xrt_layer_frame_data::head_pose`, so branches (b) and (c) fell back
+	 * to what they returned before #1594. Never silent: the same condition
+	 * emits one process-lifetime `U_LOG_W`.
+	 *
+	 * Always false on branches (a) and (b'), whose poses come from the state
+	 * tracker already in the layer frame.
+	 */
+	bool head_relative_fallback;
 };
 
 /*!
@@ -96,25 +115,28 @@ struct comp_layer_view_camera
  *      or a chained XR_DXR_view_rig), whose frustum is a fixed vFOV sheared by
  *      the convergence and has no relation to the panel's Kooima frustum.
  *  (b) else, if an eye position and a canvas size are known → identity
- *      orientation at @p eye_pos, FOV from `dxr_display3d_compute_fov()`. A
- *      best-effort DISPLAY-centric reconstruction, kept for callers with no
- *      frame data (and for a session whose locate had no valid pose bits yet).
+ *      orientation at @p eye_pos, FOV from `dxr_display3d_compute_fov()`,
+ *      the whole pose then lifted out of head-relative space into the layer
+ *      frame by `accum->data.head_pose` (#1594). A best-effort DISPLAY-centric
+ *      reconstruction, kept for callers with no frame data (and for a session
+ *      whose locate had no valid pose bits yet).
  *  (c) else the legacy placeholder camera ({∓0.032, 0, 0}, symmetric ±0.785
  *      rad) plus one process-lifetime U_LOG_W naming the fallback. Never
  *      logged per frame.
  *
  * @param accum      The frame's accumulated layers (may be NULL → skip (a)).
  * @param view_index View to resolve.
- * @param eye_pos    This view's eye, in the head-relative layer space
- *                   (nullable → skip (b)). Used verbatim as the view pose
- *                   position in branch (b).
+ * @param eye_pos    This view's eye, relative to the HEAD device (the display
+ *                   plane) exactly as the DP reports it — not in the layer
+ *                   frame (nullable → skip (b)). Branch (b) uses it verbatim as
+ *                   the view pose position and then lifts the result by
+ *                   `head_pose`.
  * @param canvas_w_m Canvas (window) width in metres; <= 0 → skip (b).
  * @param canvas_h_m Canvas (window) height in metres; <= 0 → skip (b).
  * @param[out] out   ALWAYS fully populated when non-NULL, on every branch.
  *
- * @return true when the camera came from real data ((a) or (b)); false when
- *         branch (c) supplied the placeholder. @p out is valid either way —
- *         a false return is a diagnostic, not "don't draw".
+ * @return true when the camera came from real data ((a), (b') or (b)); false
+ *         when branch (c) supplied the placeholder.
  *
  * @warning NEVER gate the draw on the return value. @p out is usable on every
  *          branch, so `if (!select(...)) continue;` turns a fallback frame into
@@ -140,11 +162,11 @@ comp_layer_view_camera_select(const struct comp_layer_accum *accum,
  * `xrt_window_metrics::window_center_offset_*_m`). The FOV is a function of
  * the eye RELATIVE TO the canvas centre, so branch (b) rebases the eye by
  * @p canvas_center before calling the Kooima core — while the view POSE stays
- * at @p eye_pos, because that is the frame layer poses are expressed in. The
- * FOV is origin-independent, so a zero offset and a rebased eye agree.
+ * at @p eye_pos (then lifted by `head_pose`, #1594). The FOV is
+ * origin-independent, so a zero offset and a rebased eye agree.
  *
- * @param canvas_center Canvas centre in the head-relative layer space
- *                      (nullable → the origin, i.e. identical to
+ * @param canvas_center Canvas centre in the SAME head-relative space as
+ *                      @p eye_pos (nullable → the origin, i.e. identical to
  *                      @ref comp_layer_view_camera_select).
  *
  * @warning The return value is a diagnostic, not a validity flag — see
@@ -185,8 +207,8 @@ comp_layer_view_camera_select_ex(const struct comp_layer_accum *accum,
  *    count reuse the LAST eye, which is the same surplus-slot rule the state
  *    tracker's #615 eye-set coherence guard applies.
  *
- * @param eyes              The DP's per-view eye set, in the head-relative
- *                          layer space (nullable / count 0 -> skip (b)).
+ * @param eyes              The DP's per-view eye set, relative to the HEAD
+ *                          device (nullable / count 0 -> skip (b)).
  * @param active_view_count The active rendering mode's view count; 0 means
  *                          "same as @p eyes->count" (no collapse).
  *
