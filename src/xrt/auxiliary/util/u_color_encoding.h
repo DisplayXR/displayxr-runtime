@@ -115,6 +115,23 @@ u_color_legacy_unorm_encoded(void)
  * proof. A single UNORM source does NOT qualify: it is linear and owes the
  * encode.
  *
+ * @warning This answers "may this frame skip the COLOUR WORK?" — NOT "may
+ *          this frame skip the compose path?". With the hatch on it returns
+ *          true for ANY frame, multi-layer ones included. That is harmless
+ *          where the fast path is only a different colour treatment of the
+ *          same draws (Direct3D 11: it selects the target view and the source
+ *          views, and every layer is still drawn). It is a silent
+ *          compositing regression where the fast path is a different
+ *          MECHANISM that cannot blend or draw a quad (a whole-image blit):
+ *          there, turning the colour rollback on would drop zones and every
+ *          quad layer with no error anywhere. Such a backend must AND this
+ *          with its own structural term (e.g. "no zones and at most one
+ *          drawable layer") — and must NOT replace it with a local colour
+ *          rule, which is how two backends come to carry diverging copies of
+ *          one decision. A backend whose private target IS its quad / zone
+ *          render pass keeps that target under the hatch and attaches the
+ *          non-`_SRGB` view instead.
+ *
  * @param legacy_hatch          @ref u_color_legacy_unorm_encoded.
  * @param contributing_layers   Layers that will actually paint this frame
  *                              (types the backend draws; a layer type it
