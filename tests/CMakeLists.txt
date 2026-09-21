@@ -125,7 +125,7 @@ endforeach()
 
 # For tests that require more than just aux_util, link those other libs down here.
 
-target_include_directories(tests_oxr_session_window_binding PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/state_trackers/oxr)
+target_include_directories(tests_oxr_session_window_binding PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr)
 
 # #1594 -- compiles oxr_layer_space.c straight into the unit and injects the
 # relations oxr_space_locate_device() would have returned, so the VIEW/LOCAL
@@ -176,7 +176,7 @@ endif()
 if(WIN32 AND XRT_HAVE_D3D11 AND XRT_FEATURE_OPENXR AND XRT_FEATURE_OPENXR_HEADLESS AND RUNTIME_TARGET)
 	# Explicit acceptance probe: opens native windows, so never an automatic CTest.
 	add_executable(tests_oxr_camera_profile EXCLUDE_FROM_ALL tests_oxr_camera_profile.cpp)
-	target_include_directories(tests_oxr_camera_profile PRIVATE ${CMAKE_SOURCE_DIR}/src/external/openxr_includes)
+	target_include_directories(tests_oxr_camera_profile PRIVATE ${PROJECT_SOURCE_DIR}/src/external/openxr_includes)
 	target_compile_definitions(tests_oxr_camera_profile PRIVATE "DXR_RUNTIME_LIB_PATH=\"$<TARGET_FILE:${RUNTIME_TARGET}>\"")
 	target_link_libraries(tests_oxr_camera_profile PRIVATE d3d11 dxgi)
 	add_dependencies(tests_oxr_camera_profile ${RUNTIME_TARGET})
@@ -255,7 +255,7 @@ target_link_libraries(tests_rig_composer PRIVATE xrt-interfaces aux_math aux_os)
 
 if(TARGET tests_oxr_view_space)
 	target_include_directories(
-		tests_oxr_view_space PRIVATE ${CMAKE_SOURCE_DIR}/src/external/openxr_includes
+		tests_oxr_view_space PRIVATE ${PROJECT_SOURCE_DIR}/src/external/openxr_includes
 		)
 	target_compile_definitions(
 		tests_oxr_view_space PRIVATE "DXR_RUNTIME_LIB_PATH=\"$<TARGET_FILE:${RUNTIME_TARGET}>\""
@@ -356,7 +356,7 @@ target_link_libraries(tests_input_arbiter_rig PRIVATE xrt-interfaces aux_os)
 # itself is not host-drivable), so it needs the st_oxr include path and nothing
 # else.
 target_include_directories(
-	tests_oxr_weave_latch PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/state_trackers/oxr
+	tests_oxr_weave_latch PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
 	)
 
 # #1486 — the two xrEndFrame projection-layer viewCount rules (tight
@@ -365,7 +365,7 @@ target_include_directories(
 # the same reason as the weave latch above: the entry point needs a submitted
 # frame, so only the rule is host-drivable.
 target_include_directories(
-	tests_oxr_view_config_rule PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/state_trackers/oxr
+	tests_oxr_view_config_rule PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
 	)
 
 # #1510 — the legacy mode floor and the compromise view scale it implies. Same
@@ -373,7 +373,7 @@ target_include_directories(
 # device and a plug-in, so only the rule is host-drivable. It reads
 # xrt_rendering_mode, hence xrt-interfaces (headers only).
 target_include_directories(
-	tests_oxr_legacy_mode_rule PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/state_trackers/oxr
+	tests_oxr_legacy_mode_rule PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
 	)
 target_link_libraries(tests_oxr_legacy_mode_rule PRIVATE xrt-interfaces)
 
@@ -383,7 +383,7 @@ target_link_libraries(tests_oxr_legacy_mode_rule PRIVATE xrt-interfaces)
 # the RULE that is host-drivable (the wiring needs an instance, a system, a head
 # device and a plug-in), so the same include + xrt-interfaces and nothing else.
 target_include_directories(
-	tests_oxr_mode_fillable_rule PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/state_trackers/oxr
+	tests_oxr_mode_fillable_rule PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
 	)
 target_link_libraries(tests_oxr_mode_fillable_rule PRIVATE xrt-interfaces)
 
@@ -396,17 +396,17 @@ target_link_libraries(tests_xrt_active_mode_scale PRIVATE xrt-interfaces)
 # #1201 — the self-test rule that makes `display_dims` prove its number instead
 # of printing it. A header of pure integer decisions (the probe that feeds it is
 # Windows-only, the rule is not), so there is nothing to link but the include.
-target_include_directories(tests_cli_dims_check PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/targets/cli)
+target_include_directories(tests_cli_dims_check PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/cli)
 
 # Android late-weave / repaint pacing (#868/#902). The vblank grid is
 # header-only and deliberately free of Vulkan and DXGI types — that is what
 # lets its drift / staleness / mode-switch logic be tested on the host, where
 # those bugs are actually findable.
-target_include_directories(tests_comp_vblank_grid PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/compositor)
+target_include_directories(tests_comp_vblank_grid PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 # ADR-027 tier-1 dispatch (#1331). Header-only pure logic -- no compositor
 # library, no graphics API, no device -- so it needs the include path and
 # nothing else.
-target_include_directories(tests_comp_zone_tier1 PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/compositor)
+target_include_directories(tests_comp_zone_tier1 PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 
 # #1504 / #1513 -- the acquire/wait/release ring the vk_native, OpenGL and Metal
 # swapchains all share. Same shape as the two above: a header of pure index
@@ -468,13 +468,13 @@ if(XRT_HAVE_D3D11)
 	# #918 bridge-plane transport policy — a header of pure decisions, no D3D
 	# link needed (the point of extracting it was that none of these need a GPU).
 	target_include_directories(
-		tests_comp_xbridge_plane_policy PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/compositor/xbridge
+		tests_comp_xbridge_plane_policy PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/xbridge
 		)
 	# #918 Phase 3 — the split's activation decision. Pure C, no device, no
 	# graphics types at all (the reason it was extracted), so the unit links the
 	# gate's own static lib and nothing else.
 	target_include_directories(
-		tests_comp_split_gate PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/compositor/xbridge
+		tests_comp_split_gate PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/xbridge
 		)
 	if(TARGET comp_xbridge)
 		target_link_libraries(tests_comp_split_gate PRIVATE comp_xbridge)
@@ -490,7 +490,7 @@ if(WIN32 AND (XRT_HAVE_D3D11 OR XRT_HAVE_D3D12))
 	# The shader strings are a header of embedded HLSL — no compositor library
 	# to link, only the compiler/reflection the units themselves use.
 	target_include_directories(
-		tests_comp_masked_composite_shaders PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/compositor
+		tests_comp_masked_composite_shaders PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor
 		)
 	target_link_libraries(tests_comp_masked_composite_shaders PRIVATE d3dcompiler)
 endif()
