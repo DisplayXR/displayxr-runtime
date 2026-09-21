@@ -20,6 +20,7 @@
 
 #include "xrt/xrt_plugin.h"
 #include "os/os_display_desktop.h"
+#include "os/os_display_scale.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_display_zones.h"
 
@@ -214,6 +215,13 @@ struct cli_query_result
 	/* True when the resolved monitor's mode equals the plug-in's reported
 	 * native panel resolution — i.e. we really did land on the 3D panel. */
 	bool desktop_info_is_panel;
+
+	/* X11 window-placement granularity (XWayland global scale). Every RandR
+	 * output's X11 size against its DRM connector mode; answers "3D stutters
+	 * when I drag" without log forensics. Valid iff x11_scale_ok (Linux
+	 * desktop with an X server reachable). */
+	struct os_display_scale_report x11_scale;
+	bool x11_scale_ok;
 
 	/* #1201 — the authoritative panel mode, so `display_dims` can PROVE the
 	 * plug-in's `display_pixel_*` instead of printing it. Windows-only:

@@ -1226,6 +1226,10 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 	snprintf(r->git_tag, sizeof(r->git_tag), "%s", u_git_tag);
 	r->plugin_abi_version = (uint32_t)XRT_PLUGIN_API_VERSION_CURRENT;
 	r->result_code = CLI_SELFTEST_INIT_FAIL;
+	// X11 placement quantum — vendor-blind, so measured before anything that
+	// can return early for want of a display processor. Stub (false) off Linux
+	// desktop, so this is free everywhere else.
+	r->x11_scale_ok = os_display_scale_query(&r->x11_scale);
 	// Default-true so the ActiveRuntime verdict is a PASS everywhere the
 	// concept does not exist (non-Windows); read_active_runtime() below is
 	// the only thing that may clear it.
@@ -1606,6 +1610,66 @@ zone_granularity_label(uint32_t g)
 	}
 }
 
+/*!
+ * One sentence on whether a window drag can be phase-snapped in this session.
+ * Shared by `info` and the `x11_placement` self-test row so they never
+ * disagree.
+ */
+static const char *
+x11_snap_capability(const struct cli_query_result *r)
+{
+	if (!r->x11_scale_ok || r->x11_scale.verdict.state == U_X11_SCALE_UNKNOWN) {
+		return "unknown — no X11/DRM evidence to compare (snap behaviour unchanged)";
+	}
+	if (r->head_ok && r->desktop_info_ok && !r->desktop_info_is_panel) {
+		return "NO — the 3D panel's X11 rect is not its native size, so X11 pixels are not panel "
+		       "pixels; the runtime refuses drag snaps and the weave phase feed";
+	}
+	if (r->x11_scale.verdict.state == U_X11_SCALE_QUANTIZED) {
+		return "PARTIAL — window origins land only on the reachable lattice; the runtime snaps on "
+		       "it, so 3D stays phased but the window follows the pointer in coarser steps. Every "
+		       "output at 100% restores 1 px drags";
+	}
+	return "yes — X11 is device pixels and every pixel is reachable";
+}
+
+static void
+print_x11_scale_text(const struct cli_query_result *r)
+{
+	if (!r->x11_scale_ok) {
+		return;
+	}
+	const struct os_display_scale_report *s = &r->x11_scale;
+	P(" :: X11 coordinate space (XWayland global scale / window-placement quantum)\n");
+	PT("verdict:      %s", os_display_scale_state_str(s->verdict.state));
+	if (s->verdict.state == U_X11_SCALE_QUANTIZED) {
+		printf(" — placement quantum %u px, driven by '%s' at %.0f%%", s->verdict.quantum,
+		       s->verdict.culprit >= 0 ? s->outputs[s->verdict.culprit].name : "?",
+		       s->verdict.culprit_scale * 100.0);
+	}
+	printf("\n");
+	PT("drag snap:    %s\n", x11_snap_capability(r));
+	PT("X root:       %ux%u X11 px (native width of matched outputs: %u px)%s\n", s->root_w, s->root_h,
+	   s->native_sum_w, s->drm_available ? "" : " [no DRM modes in /sys/class/drm]");
+	for (uint32_t i = 0; i < s->output_count; i++) {
+		const struct u_x11_output_sizes *o = &s->outputs[i];
+		if (o->native_w > 0) {
+			// Derived monitor scale = native * G / X11 — the number the user
+			// set in Settings. Any output above 100% forces G >= 2.
+			const uint32_t g = s->verdict.quantum > 0 ? s->verdict.quantum : 1u;
+			const double scale = (double)o->native_w * (double)g / (double)o->x11_w;
+			PT("  %-10s X11 %ux%u  DRM %ux%u  scale %.0f%%%s\n", o->name, o->x11_w, o->x11_h, o->native_w,
+			   o->native_h, scale * 100.0, scale > 1.02 ? "  <- above 100%" : "");
+		} else {
+			PT("  %-10s X11 %ux%u  DRM ?\n", o->name, o->x11_w, o->x11_h);
+		}
+	}
+	if (s->verdict.state == U_X11_SCALE_DEVICE_PIXELS) {
+		PT("              (geometry cannot see a UNIFORM integer scale — all outputs at 200%% looks\n");
+		PT("               like 100%%; the app's 'drag: placement' check catches that case)\n");
+	}
+}
+
 void
 cli_query_print_info_text(const struct cli_query_result *r)
 {
@@ -1618,6 +1682,8 @@ cli_query_print_info_text(const struct cli_query_result *r)
 		P(" :: Active OpenXR runtime (HKLM\\Software\\Khronos\\OpenXR\\1\\ActiveRuntime)\n");
 		PT("%s\n", r->active_runtime_set ? r->active_runtime : "<unset>");
 	}
+
+	print_x11_scale_text(r);
 
 	P(" :: Display processor\n");
 	if (!r->head_ok) {
@@ -1824,6 +1890,30 @@ cJSON *
 cli_query_info_to_cjson(const struct cli_query_result *r)
 {
 	cJSON *root = cJSON_CreateObject();
+
+	if (r->x11_scale_ok) {
+		cJSON *xs = cJSON_AddObjectToObject(root, "x11_coordinate_space");
+		cJSON_AddStringToObject(xs, "verdict", os_display_scale_state_str(r->x11_scale.verdict.state));
+		cJSON_AddNumberToObject(xs, "placement_quantum", (double)r->x11_scale.verdict.quantum);
+		cJSON_AddStringToObject(
+		    xs, "culprit",
+		    r->x11_scale.verdict.culprit >= 0 ? r->x11_scale.outputs[r->x11_scale.verdict.culprit].name : "");
+		cJSON_AddNumberToObject(xs, "culprit_scale", r->x11_scale.verdict.culprit_scale);
+		cJSON_AddStringToObject(xs, "drag_snap", x11_snap_capability(r));
+		cJSON_AddNumberToObject(xs, "root_w", (double)r->x11_scale.root_w);
+		cJSON_AddNumberToObject(xs, "root_h", (double)r->x11_scale.root_h);
+		cJSON *outs = cJSON_AddArrayToObject(xs, "outputs");
+		for (uint32_t i = 0; i < r->x11_scale.output_count; i++) {
+			const struct u_x11_output_sizes *o = &r->x11_scale.outputs[i];
+			cJSON *oj = cJSON_CreateObject();
+			cJSON_AddStringToObject(oj, "name", o->name);
+			cJSON_AddNumberToObject(oj, "x11_w", (double)o->x11_w);
+			cJSON_AddNumberToObject(oj, "x11_h", (double)o->x11_h);
+			cJSON_AddNumberToObject(oj, "native_w", (double)o->native_w);
+			cJSON_AddNumberToObject(oj, "native_h", (double)o->native_h);
+			cJSON_AddItemToArray(outs, oj);
+		}
+	}
 
 	cJSON *rt = cJSON_AddObjectToObject(root, "runtime");
 	cJSON_AddStringToObject(rt, "description", r->runtime_description);
@@ -2362,6 +2452,19 @@ build_checks(const struct cli_query_result *r, struct check *out)
 	c->name = "rig_role";
 	c->ok = !r->rig_evaluated || (r->rig_role_ok && r->rig_moves_ok && r->rig_recenter_ok);
 	snprintf(c->detail, sizeof(c->detail), "%s", r->rig_note[0] != '\0' ? r->rig_note : "not evaluated");
+
+	// X11 window-placement quantum. INFORMATIONAL — always ok: a scaled
+	// output is a user display setting, not a broken install, and failing
+	// selftest on it would make CI and every HiDPI laptop red. The detail
+	// line is the visible warning. Only present where the probe ran.
+	if (r->x11_scale_ok) {
+		c = &out[n++];
+		c->name = "x11_placement";
+		c->ok = true;
+		snprintf(c->detail, sizeof(c->detail), "%s%s",
+		         r->x11_scale.verdict.state == U_X11_SCALE_QUANTIZED ? "WARNING: " : "",
+		         x11_snap_capability(r));
+	}
 
 	return n;
 }
