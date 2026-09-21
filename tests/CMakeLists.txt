@@ -214,6 +214,14 @@ target_include_directories(
 	tests_comp_layer_view_camera PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor
 	)
 target_link_libraries(tests_comp_layer_view_camera PRIVATE xrt-interfaces aux_math)
+# #1581 -- the "no backend gates its draw on the return value" guard reads the
+# backend sources as text (no device to render with), so it needs the compositor
+# root as a path. PROJECT_SOURCE_DIR, not CMAKE_SOURCE_DIR: the vendor plug-in's
+# signing recipe builds this runtime as a sub-project.
+target_compile_definitions(
+	tests_comp_layer_view_camera
+	PRIVATE "DXR_COMP_SRC_DIR=\"${PROJECT_SOURCE_DIR}/src/xrt/compositor\""
+	)
 
 if(TARGET tests_input_host_geometry)
 	target_link_libraries(tests_input_host_geometry PRIVATE target_lists xrt-interfaces)
