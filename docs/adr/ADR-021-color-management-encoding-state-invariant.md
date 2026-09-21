@@ -238,6 +238,29 @@ Two properties are load-bearing:
   apps that cannot be migrated. Transitional. Each component logs one WARN at init stating
   which regime it is in.
 
+### As shipped (vk_native, #1589 + #1610)
+
+The Vulkan compose path is the same design as the D3D11 one above — format-honest
+sources, a runtime-private compose target that encodes on write, a raw copy into the
+unchanged ENCODED atlas, `set_atlas_encoding` never called — expressed in Vulkan terms:
+
+- **Format-honest sources.** Each layer is sampled through a view in the format the app
+  requested: an `_SRGB` source is hardware-decoded on sample, a UNORM one read as the
+  linear values the OpenXR spec says it holds.
+- **The private target.** Same `VkFormat` as the atlas, created `MUTABLE_FORMAT` with a
+  `{UNORM, SRGB}` view-format list and attached through its **`_SRGB` view**, so the
+  fixed-function blender decodes the destination, blends in linear and re-encodes on
+  store.
+- **Handoff is `vkCmdCopyImage`, never `vkCmdBlitImage`.** Identical formats mean raw
+  bytes; a blit would convert and apply the encode twice.
+- **The blit fast path is gated on colour** by the same `u_color_compose_fast_path()`
+  predicate: a single UNORM layer owes the encode and must take the render pass.
+- **Driver assumption, checked.** That an `_SRGB` view over a `MUTABLE_FORMAT` UNORM image
+  blends exactly like a native `_SRGB` image is a *driver* property, not a runtime one.
+  `tools/vk_srgb_blend_probe.c` A/Bs the two (expect centre BGRA `(188,188,188,128)` for
+  both). It is deliberately not a ctest; re-run it on a new GPU vendor or driver stack
+  (Adreno/Mali in particular have not been checked).
+
 ## Encoding state at each hop (Model A; DP configured for encoded passthrough)
 
 | Hop | In-process | IPC / service | Workspace / shell |
