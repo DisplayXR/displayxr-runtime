@@ -13,9 +13,16 @@
  * below must match the HLSL below them, and nothing but a test can check that.
  * D3DCompile and D3DReflect need no device, so the interface these strings
  * declare is pinnable on the same hardware-free footing as the rest of tests/.
+ *
+ * #1602: equirect2 is NOT here. Its VS/PS and `Equirect2LayerConstants` live in
+ * d3d_shared/comp_equirect2_shaders.h, included below, because the D3D11
+ * service compiles the same text — a sphere-intersection shader is not worth
+ * two hand-maintained copies. Everything in this file is in-process-only.
  */
 
 #pragma once
+
+#include "d3d_shared/comp_equirect2_shaders.h"
 
 /*!
  * Shader constant buffer layout.
