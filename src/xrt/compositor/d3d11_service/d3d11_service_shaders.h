@@ -604,6 +604,19 @@ cbuffer ColorCB : register(b1)
     float3 _color_pad;
 };
 
+// #1610: a blit into the runtime-PRIVATE compose target must emit its sample
+// UNCHANGED - that target carries an `_SRGB` RTV and the hardware applies the
+// one conversion on write. Those draws run on a client's IPC thread while the
+// combine pass runs on the render thread, on the SAME immediate context with
+// no mutex between them, so b1 cannot be trusted to say anything in particular
+// when a client draw executes. b2 is stated per draw instead. Unbound - and for
+// every pre-#1610 draw - it reads 0, i.e. exactly today's behaviour.
+cbuffer ComposeCB : register(b2)
+{
+    float g_compose_passthrough; // >0.5 => emit raw; the RTV converts
+    float3 _compose_pad;
+};
+
 Texture2D src_tex : register(t0);
 // Phase 2.K Commit 8.D: optional HUD layer source. Bound by content-blit draws
 // in workspace mode when the slot has an active XR_EXT_window_space_layer; left
@@ -635,7 +648,7 @@ float3 srgb_to_linear(float3 c)
 // else passthrough. Apply to the straight (un-premultiplied) RGB.
 float3 oetf_out(float3 c)
 {
-    return (g_linearize_output > 0.5) ? srgb_to_linear(c) : c;
+    return (g_linearize_output > 0.5 && g_compose_passthrough < 0.5) ? srgb_to_linear(c) : c;
 }
 
 float4 PSMain(VS_OUTPUT input) : SV_Target
@@ -888,6 +901,19 @@ cbuffer ColorCB : register(b1)
     float3 _color_pad;
 };
 
+// #1610: a blit into the runtime-PRIVATE compose target must emit its sample
+// UNCHANGED - that target carries an `_SRGB` RTV and the hardware applies the
+// one conversion on write. Those draws run on a client's IPC thread while the
+// combine pass runs on the render thread, on the SAME immediate context with
+// no mutex between them, so b1 cannot be trusted to say anything in particular
+// when a client draw executes. b2 is stated per draw instead. Unbound - and for
+// every pre-#1610 draw - it reads 0, i.e. exactly today's behaviour.
+cbuffer ComposeCB : register(b2)
+{
+    float g_compose_passthrough; // >0.5 => emit raw; the RTV converts
+    float3 _compose_pad;
+};
+
 // Layered source: eyes are array slices, sampled at float3(uv, array_slice).
 Texture2DArray src_tex : register(t0);
 Texture2D hud_tex : register(t1);
@@ -906,7 +932,7 @@ float3 srgb_to_linear(float3 c)
 }
 float3 oetf_out(float3 c)
 {
-    return (g_linearize_output > 0.5) ? srgb_to_linear(c) : c;
+    return (g_linearize_output > 0.5 && g_compose_passthrough < 0.5) ? srgb_to_linear(c) : c;
 }
 
 float4 PSMain(VS_OUTPUT input) : SV_Target
@@ -1067,13 +1093,26 @@ cbuffer ColorCB : register(b1)
     float g_linearize_output;
     float3 _color_pad;
 };
+
+// #1610: a blit into the runtime-PRIVATE compose target must emit its sample
+// UNCHANGED - that target carries an `_SRGB` RTV and the hardware applies the
+// one conversion on write. Those draws run on a client's IPC thread while the
+// combine pass runs on the render thread, on the SAME immediate context with
+// no mutex between them, so b1 cannot be trusted to say anything in particular
+// when a client draw executes. b2 is stated per draw instead. Unbound - and for
+// every pre-#1610 draw - it reads 0, i.e. exactly today's behaviour.
+cbuffer ComposeCB : register(b2)
+{
+    float g_compose_passthrough; // >0.5 => emit raw; the RTV converts
+    float3 _compose_pad;
+};
 float3 srgb_to_linear(float3 c)
 {
     return (c <= 0.04045) ? (c / 12.92) : pow((c + 0.055) / 1.055, 2.4);
 }
 float3 oetf_out(float3 c)
 {
-    return (g_linearize_output > 0.5) ? srgb_to_linear(c) : c;
+    return (g_linearize_output > 0.5 && g_compose_passthrough < 0.5) ? srgb_to_linear(c) : c;
 }
 
 struct VS_OUTPUT
