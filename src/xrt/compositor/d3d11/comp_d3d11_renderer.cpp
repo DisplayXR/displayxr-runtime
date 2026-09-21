@@ -27,6 +27,7 @@
 #include <dxgi1_2.h> // IDXGIResource1 — #918 atlas NT share handle
 
 #include <algorithm>
+#include <cmath> // tanf / std::isinf — the equirect2 frustum tangents and its +INFINITY radius
 #include <cstring>
 
 /*!
@@ -73,6 +74,22 @@ struct comp_d3d11_renderer
 	//! null if it failed to compile — the draw site then falls back to
 	//! @ref quad_ps, i.e. degrades to slice 0 rather than not drawing.
 	ID3D11PixelShader *quad_ps_array;
+
+	//! #1602: vertex shader for equirect2 layers. A fullscreen [0,1] strip that
+	//! carries a per-pixel camera ray into the pixel shader; no MVP, so nothing
+	//! about it is per-path (see d3d_shared/comp_equirect2_shaders.h).
+	ID3D11VertexShader *equirect2_vs;
+
+	//! #1602: pixel shader for equirect2 layers — ray/sphere intersection into
+	//! spherical UVs.
+	ID3D11PixelShader *equirect2_ps;
+
+	//! #1602: Texture2DArray variant of @ref equirect2_ps, built from the SAME
+	//! source with `DXR_LAYERED` defined rather than a second copy. May be null
+	//! if it failed to compile — the draw site then falls back to
+	//! @ref equirect2_ps, i.e. degrades to slice 0 rather than not drawing,
+	//! exactly as @ref quad_ps_array does.
+	ID3D11PixelShader *equirect2_ps_array;
 
 	//! Local2D flatten shaders (#439 Phase 3): draw one app Local2D layer
 	//! image into the runtime 2D scratch at a per-draw viewport.
@@ -144,16 +161,22 @@ get_internals(struct comp_d3d11_compositor *c)
 	return comp_d3d11_compositor_get_internals(c);
 }
 
+//! @p defines is an optional D3D_SHADER_MACRO list, NULL-terminated as
+//! D3DCompile requires. #1602 added it here for the same reason #1601 added it
+//! to the service's twin: the long equirect2 pixel shader yields its
+//! Texture2DArray variant from ONE source instead of a second hand-maintained
+//! copy of ~100 lines of ray-march math that would drift.
 static xrt_result_t
 compile_shader(ID3D11Device *device,
                const char *source,
                const char *entry,
                const char *target,
-               ID3DBlob **out_blob)
+               ID3DBlob **out_blob,
+               const D3D_SHADER_MACRO *defines = nullptr)
 {
 	ID3DBlob *errors = nullptr;
-	HRESULT hr = D3DCompile(source, strlen(source), nullptr, nullptr, nullptr, entry, target, 0, 0, out_blob,
-	                        &errors);
+	HRESULT hr =
+	    D3DCompile(source, strlen(source), nullptr, defines, nullptr, entry, target, 0, 0, out_blob, &errors);
 	if (FAILED(hr)) {
 		if (errors != nullptr) {
 			U_LOG_E("Shader compile error: %s", (char *)errors->GetBufferPointer());
@@ -262,6 +285,56 @@ create_shaders(struct comp_d3d11_renderer *r)
 		if (FAILED(hr)) {
 			U_LOG_W("Array quad pixel shader unavailable (0x%08x) — quads sample slice 0", hr);
 			r->quad_ps_array = nullptr;
+		}
+	}
+
+	// #1602: equirect2 vertex shader. Fatal if it fails — unlike the array
+	// variants below, there is no degraded equirect2 to fall back to.
+	xret = compile_shader(internals.device, equirect2_vs_hlsl, "VSMain", "vs_5_0", &blob);
+	if (xret != XRT_SUCCESS) {
+		U_LOG_E("Failed to compile equirect2 vertex shader");
+		return xret;
+	}
+	hr = internals.device->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+	                                          &r->equirect2_vs);
+	blob->Release();
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create equirect2 vertex shader: 0x%08x", hr);
+		return XRT_ERROR_D3D;
+	}
+
+	// #1602: equirect2 pixel shader.
+	xret = compile_shader(internals.device, equirect2_ps_hlsl, "PSMain", "ps_5_0", &blob);
+	if (xret != XRT_SUCCESS) {
+		U_LOG_E("Failed to compile equirect2 pixel shader");
+		return xret;
+	}
+	hr = internals.device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+	                                         &r->equirect2_ps);
+	blob->Release();
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create equirect2 pixel shader: 0x%08x", hr);
+		return XRT_ERROR_D3D;
+	}
+
+	// #1602: the layered (array) equirect2 pixel shader is the SAME source with
+	// DXR_LAYERED defined, which swaps the Texture2D declaration and the sample
+	// for their Texture2DArray forms. Non-fatal for the same reason the quad
+	// array variant above is: losing it costs a layered equirect2 its slice
+	// selection, not the renderer.
+	{
+		const D3D_SHADER_MACRO layered_defines[] = {{"DXR_LAYERED", "1"}, {nullptr, nullptr}};
+		xret = compile_shader(internals.device, equirect2_ps_hlsl, "PSMain", "ps_5_0", &blob, layered_defines);
+		if (xret != XRT_SUCCESS) {
+			U_LOG_W("Failed to compile array equirect2 pixel shader — layered equirect2 samples slice 0");
+		} else {
+			hr = internals.device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(),
+			                                         nullptr, &r->equirect2_ps_array);
+			blob->Release();
+			if (FAILED(hr)) {
+				U_LOG_W("Array equirect2 pixel shader unavailable (0x%08x) — sampling slice 0", hr);
+				r->equirect2_ps_array = nullptr;
+			}
 		}
 	}
 
@@ -403,9 +476,22 @@ create_resources(struct comp_d3d11_renderer *r)
 		return XRT_ERROR_D3D;
 	}
 
-	// Create constant buffer
+	// Create constant buffer — the LARGEST of every layer-constant struct that
+	// is mapped into it, computed rather than asserted.
+	//
+	// #1602: this used to read `sizeof(LayerConstants)` alone, which was true
+	// while quad and projection were the only layer draws and became a 32-byte
+	// buffer overrun the moment equirect2 arrived: `LayerConstants` is 128
+	// bytes, `Equirect2LayerConstants` is 160, and every draw site Maps
+	// WRITE_DISCARD and memcpy's `sizeof(constants)` into the result. The
+	// service acquired exactly this latent bug by writing down which struct was
+	// biggest in a comment instead of asking (see its #1601 note), so take the
+	// max — a future layer type that outgrows both is then correct by default.
+	size_t cb_size = sizeof(LayerConstants);
+	cb_size = std::max(cb_size, sizeof(Equirect2LayerConstants));
+
 	D3D11_BUFFER_DESC cbDesc = {};
-	cbDesc.ByteWidth = sizeof(LayerConstants);
+	cbDesc.ByteWidth = static_cast<UINT>((cb_size + 15) & ~static_cast<size_t>(15)); // 16-byte aligned
 	cbDesc.Usage = D3D11_USAGE_DYNAMIC;
 	cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
 	cbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -850,6 +936,156 @@ render_quad_layer(struct comp_d3d11_renderer *r,
 }
 
 /*!
+ * Render one `XR_KHR_composition_layer_equirect2` layer into this view's tile
+ * (#1602).
+ *
+ * Mechanically unlike every other draw in this file: there is no model geometry
+ * and no MVP. The vertex shader emits a fullscreen strip carrying a per-pixel
+ * CAMERA RAY, and the pixel shader intersects that ray with the layer's sphere
+ * and reads spherical UVs off the hit. So what goes down the constant buffer is
+ * the INVERSE model-view (rays are cast in the layer's model space) plus the
+ * frustum's tangent extents, not a forward transform.
+ *
+ * The camera is this view's (#1580) — the same `comp_layer_view_camera` the
+ * quad path takes — so an equirect2 background and a quad at the same world
+ * pose land on consistent display pixels.
+ *
+ * @param mode How this layer composites. Resolved by the CALLER straight from
+ *             the layer flags: an equirect2 layer paints a SUB-RECT of the tile
+ *             (the sphere section it covers) and therefore can never be the
+ *             tile's base, so it never sees `comp_layer_tile_blend_mode`. Only
+ *             a full-tile projection-class layer can establish a tile's alpha.
+ *
+ * @return true when the draw was issued — the caller uses that for the #1598
+ *         painter's-order bookkeeping. False means this eye never saw the
+ *         layer at all (per-eye visibility, or a swapchain the compositor
+ *         cannot read), so it must not count as having painted the tile.
+ *         Note the one honest gap: a layer whose angular extent happens to miss
+ *         every pixel of this tile still returns true, because that is decided
+ *         in the pixel shader and nothing CPU-side can see it. That matches the
+ *         eager mark the projection case documents.
+ */
+static bool
+render_equirect2_layer(struct comp_d3d11_renderer *r,
+                       const struct comp_layer *layer,
+                       uint32_t view_index,
+                       uint32_t view_count,
+                       const struct xrt_pose *view_pose,
+                       const struct xrt_fov *fov,
+                       enum comp_layer_blend_mode mode)
+{
+	auto internals = get_internals(r->c);
+	const struct xrt_layer_data *data = &layer->data;
+	const struct xrt_layer_equirect2_data *eq = &data->equirect2;
+
+	// Per-eye visibility, view-count aware (#1580).
+	if (!is_layer_view_visible_n(data, view_index, view_count)) {
+		return false;
+	}
+
+	// No front-facing test: a sphere has no back face to cull. The #1590 rule
+	// is normative for QUADS specifically ("only front face of the quad surface
+	// is visible"), and applying it here would drop a viewer standing inside
+	// the sphere, which is the ordinary case for a 360 background.
+
+	struct xrt_swapchain *xsc = layer->sc_array[0];
+	if (xsc == nullptr) {
+		return false;
+	}
+
+	ID3D11ShaderResourceView *srv =
+	    static_cast<ID3D11ShaderResourceView *>(comp_d3d11_swapchain_get_srv(xsc, eq->sub.image_index));
+	if (srv == nullptr) {
+		return false;
+	}
+
+	// Inverse model-view: the shader casts rays FROM the camera INTO the
+	// layer's model space, so it needs the inverse of the forward transform.
+	struct xrt_matrix_4x4 model, view, mv, mv_inv;
+	struct xrt_vec3 scale = {1.0f, 1.0f, 1.0f};
+	math_matrix_4x4_model(&eq->pose, &scale, &model);
+	math_matrix_4x4_view_from_pose(view_pose, &view);
+	math_matrix_4x4_multiply(&view, &model, &mv);
+	math_matrix_4x4_inverse(&mv, &mv_inv);
+
+	Equirect2LayerConstants constants = {};
+	memcpy(constants.mv_inverse, &mv_inv, sizeof(constants.mv_inverse));
+
+	// The frustum's tangent extents at the unit plane, which is how the vertex
+	// shader turns a [0,1] screen position into a ray. This is the ONLY place
+	// the view's FOV enters — there is no projection matrix to pick a clip-space
+	// handedness for, which is why this draw needs no D3D-vs-Vulkan variant the
+	// way the quad MVP did (#1580).
+	constants.to_tangent[0] = tanf(fov->angle_left);
+	constants.to_tangent[1] = tanf(fov->angle_down);
+	constants.to_tangent[2] = tanf(fov->angle_right) - tanf(fov->angle_left);
+	constants.to_tangent[3] = tanf(fov->angle_up) - tanf(fov->angle_down);
+
+	// UV transform for the sub-image.
+	constants.post_transform[0] = eq->sub.norm_rect.x;
+	constants.post_transform[1] = eq->sub.norm_rect.y;
+	constants.post_transform[2] = eq->sub.norm_rect.w;
+	constants.post_transform[3] = eq->sub.norm_rect.h;
+
+	if (data->flip_y) {
+		constants.post_transform[1] += constants.post_transform[3];
+		constants.post_transform[3] = -constants.post_transform[3];
+	}
+
+	get_color_scale_bias(data, constants.color_scale, constants.color_bias);
+
+	// As for quads: an unflagged layer is an OPAQUE_COVER whose alpha-of-one the
+	// SHADER emits, folded into the scale/bias channel. Fragments outside the
+	// layer's angular extent never reach that line — they `discard` — so the
+	// fold raises alpha exactly where the layer covers and nowhere else, which
+	// is what "the layer's alpha is one" means.
+	comp_layer_blend_fold_opaque_cover(mode, constants.color_scale, constants.color_bias);
+
+	// The spec says +INFINITY for "as far away as possible"; the shader spells
+	// that zero and skips the intersection entirely, using the ray direction.
+	constants.radius = std::isinf(eq->radius) ? 0.0f : eq->radius;
+	constants.central_horizontal_angle = eq->central_horizontal_angle;
+	constants.upper_vertical_angle = eq->upper_vertical_angle;
+	constants.lower_vertical_angle = eq->lower_vertical_angle;
+
+	// Honour subImage.imageArrayIndex. Gated on the SWAPCHAIN's array size, not
+	// on array_index != 0 — comp_d3d11_swapchain hands back a whole-array
+	// Texture2DArray SRV for every arraySize>1 swapchain, and it is the VIEW
+	// DIMENSION that has to match the shader, so even slice 0 of an array
+	// swapchain belongs on the array shader (#1601/#1642).
+	const bool is_layered = comp_d3d11_swapchain_get_array_size(xsc) > 1;
+	const bool use_array_ps = is_layered && r->equirect2_ps_array != nullptr;
+	constants.array_params[0] = use_array_ps ? static_cast<float>(eq->sub.array_index) : 0.0f;
+
+	D3D11_MAPPED_SUBRESOURCE mapped;
+	HRESULT hr = internals.context->Map(r->constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+	if (SUCCEEDED(hr)) {
+		memcpy(mapped.pData, &constants, sizeof(constants));
+		internals.context->Unmap(r->constant_buffer, 0);
+	}
+
+	internals.context->VSSetShader(r->equirect2_vs, nullptr, 0);
+	internals.context->PSSetShader(use_array_ps ? r->equirect2_ps_array : r->equirect2_ps, nullptr, 0);
+
+	internals.context->VSSetConstantBuffers(0, 1, &r->constant_buffer);
+	internals.context->PSSetConstantBuffers(0, 1, &r->constant_buffer);
+	internals.context->PSSetShaderResources(0, 1, &srv);
+	internals.context->PSSetSamplers(0, 1, &r->sampler_linear);
+
+	internals.context->OMSetBlendState(blend_state_for(r, mode), nullptr, 0xFFFFFFFF);
+
+	// Fullscreen strip, 4 vertices — the viewport already restricts it to this
+	// view's tile.
+	internals.context->Draw(4, 0);
+
+	ID3D11ShaderResourceView *null_srv = nullptr;
+	internals.context->PSSetShaderResources(0, 1, &null_srv);
+
+	internals.context->OMSetBlendState(r->blend_opaque, nullptr, 0xFFFFFFFF);
+	return true;
+}
+
+/*!
  * Render a window-space layer. Positioned in fractional window coordinates
  * with per-eye disparity shift. Uses the same quad shaders.
  */
@@ -1073,6 +1309,9 @@ comp_d3d11_renderer_destroy(struct comp_d3d11_renderer **renderer_ptr)
 	SAFE_RELEASE(r->sampler_linear);
 	SAFE_RELEASE(r->constant_buffer);
 	SAFE_RELEASE(r->flatten_cb);
+	SAFE_RELEASE(r->equirect2_ps);
+	SAFE_RELEASE(r->equirect2_ps_array);
+	SAFE_RELEASE(r->equirect2_vs);
 	SAFE_RELEASE(r->local2d_flatten_ps);
 	SAFE_RELEASE(r->local2d_flatten_vs);
 	SAFE_RELEASE(r->quad_ps);
@@ -1464,12 +1703,45 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
 				break;
 			}
 
-			case XRT_LAYER_EQUIRECT1:
 			case XRT_LAYER_EQUIRECT2: {
-				static bool equirect_warned = false;
-				if (!equirect_warned) {
-					U_LOG_W("Equirect layers not yet implemented in D3D11 compositor");
-					equirect_warned = true;
+				if (view_index >= XRT_MAX_VIEWS) {
+					break;
+				}
+				/*
+				 * #1602. The blend mode comes STRAIGHT FROM THE
+				 * FLAGS, never from comp_layer_tile_blend_mode:
+				 * an equirect2 layer paints only the sphere
+				 * section it covers, so it cannot establish the
+				 * tile's alpha and must not take the base slot,
+				 * cleared atlas or not. Only a full-tile
+				 * projection-class layer can be a tile's base —
+				 * which is why the first-layer gate above sits
+				 * INSIDE the projection case. Same rule, same
+				 * shape as the quad arm below.
+				 *
+				 * It does MARK the tile, so a projection layer
+				 * submitted after it blends over it rather than
+				 * erasing it.
+				 */
+				const enum comp_layer_blend_mode mode = comp_layer_blend_mode(layer->data.flags);
+				if (render_equirect2_layer(renderer, layer, view_index, effective_views,
+				                           &cameras[view_index].pose, &cameras[view_index].fov, mode)) {
+					comp_layer_tile_mark_composited(&tile);
+				}
+				break;
+			}
+
+			case XRT_LAYER_EQUIRECT1: {
+				// Split out from equirect2 by #1602 and still
+				// unimplemented. NOT the same layer: equirect1
+				// carries scale/bias over the image rather than
+				// the four angles equirect2 does, so it needs
+				// its own shader, and XR_KHR_composition_layer_
+				// equirect (1) is a separate extension.
+				static bool equirect1_warned = false;
+				if (!equirect1_warned) {
+					U_LOG_W("Equirect1 layers not yet implemented in D3D11 compositor");
+					equirect1_warned = true;
 				}
 				break;
 			}
