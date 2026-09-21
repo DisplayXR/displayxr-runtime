@@ -14,6 +14,7 @@
 
 #include "xrt/xrt_handles.h"
 
+#include "util/u_color_encoding.h"
 #include "util/u_logging.h"
 #include "util/u_misc.h"
 
@@ -43,8 +44,24 @@ struct comp_d3d11_swapchain
 	//! D3D11 textures.
 	ID3D11Texture2D *images[MAX_SWAPCHAIN_IMAGES];
 
-	//! Shader resource views for each image.
+	//! Shader resource views for each image. Deliberately NON-decoding: the
+	//! `_SRGB` sibling is coerced to UNORM so a sample reads the app's bytes
+	//! verbatim. This is the view the pre-#1589 paths use and still the right
+	//! one wherever the atlas wants those bytes unchanged (the single-layer
+	//! fast path, zero-copy).
 	ID3D11ShaderResourceView *srvs[MAX_SWAPCHAIN_IMAGES];
+
+	//! #1589: the FORMAT-HONEST view of the same images — the app's own typed
+	//! format, so an `_SRGB` swapchain decodes to linear on sample and a UNORM
+	//! swapchain reads the linear values it holds. Bound only by the compose
+	//! path, which writes through an `_SRGB` RTV and therefore needs linear
+	//! input. NULL when it would be identical to @ref srvs (UNORM sources) or
+	//! when creation failed; @ref comp_d3d11_swapchain_get_compose_srv falls
+	//! back in both cases.
+	ID3D11ShaderResourceView *compose_srvs[MAX_SWAPCHAIN_IMAGES];
+
+	//! The app's requested colour format (DXGI_FORMAT_UNKNOWN for depth).
+	DXGI_FORMAT color_format;
 
 	//! Render target views for each image.
 	ID3D11RenderTargetView *rtvs[MAX_SWAPCHAIN_IMAGES];
@@ -223,6 +240,9 @@ d3d11_swapchain_destroy(struct xrt_swapchain *xsc)
 		if (sc->rtvs[i] != nullptr) {
 			sc->rtvs[i]->Release();
 		}
+		if (sc->compose_srvs[i] != nullptr) {
+			sc->compose_srvs[i]->Release();
+		}
 		if (sc->srvs[i] != nullptr) {
 			sc->srvs[i]->Release();
 		}
@@ -296,6 +316,8 @@ comp_d3d11_swapchain_create(struct comp_d3d11_compositor *c,
 	DXGI_FORMAT dsv_format = dxgi_format;
 	DXGI_FORMAT srv_format = dxgi_format;
 	DXGI_FORMAT rtv_format = dxgi_format;
+	//! #1589: format-honest compose view; UNKNOWN = none needed (see below).
+	DXGI_FORMAT compose_srv_format = DXGI_FORMAT_UNKNOWN;
 	bool is_depth = false;
 
 	if (bind_flags & D3D11_BIND_DEPTH_STENCIL) {
@@ -347,14 +369,30 @@ comp_d3d11_swapchain_create(struct comp_d3d11_compositor *c,
 			// rtv_format remains the original concrete format so the app's own
 			// render path (incl. any sRGB encode it relies on) is unchanged.
 		}
-		// The runtime's internal SRV samples this image to build the composited
-		// atlas handed to the display processor. Use the UNORM sibling of an
-		// sRGB format so the sample does NOT auto-decode sRGB->linear: the DP
-		// expects display-referred (sRGB-encoded) bytes, so pass the app's
-		// bytes through unchanged. No-op for already-UNORM formats. Mirrors the
-		// GL GL_SKIP_DECODE_EXT fix. (Only the composited path samples this SRV;
-		// the single-layer zero-copy path hands the texture straight to the DP.)
+		sc->color_format = dxgi_format;
+
+		// The runtime keeps TWO views of every colour image (#1589):
+		//
+		//  - `srv_format` below is the NON-decoding one: the UNORM sibling of
+		//    an sRGB format, so a sample reads the app's bytes verbatim. That
+		//    is what the paths which hand those bytes on UNCHANGED want — the
+		//    single-layer fast path and zero-copy, where the atlas is declared
+		//    ENCODED and the app already encoded. (Mirrors the GL
+		//    GL_SKIP_DECODE_EXT fix.)
+		//  - `compose_srv_format` is the app's TRUE format. The compose path
+		//    writes through an `_SRGB` RTV, which blends in linear and encodes
+		//    on write, so its input must BE linear: an `_SRGB` source has to
+		//    decode on sample, and a UNORM source already holds linear values
+		//    (ADR-021 §6). Same bytes, two readings — the swapchain format
+		//    picks which is correct, which is the whole of #1589.
+		//
+		// Under the escape hatch the compose view is never built: nothing
+		// composes, so nothing would bind it.
+		compose_srv_format = srv_format;
 		srv_format = d3d_dxgi_format_srgb_to_unorm(srv_format);
+		if (u_color_legacy_unorm_encoded() || compose_srv_format == srv_format) {
+			compose_srv_format = DXGI_FORMAT_UNKNOWN; // nothing extra to build
+		}
 	}
 
 	// Create textures
@@ -397,6 +435,24 @@ comp_d3d11_swapchain_create(struct comp_d3d11_compositor *c,
 			if (FAILED(hr)) {
 				U_LOG_W("Failed to create SRV for swapchain texture %u: 0x%08x", i, hr);
 				// Non-fatal, continue without SRV
+			}
+
+			// #1589: the format-honest twin, same dimensions, true format.
+			// The texture is TYPELESS (above), which is exactly what makes a
+			// second typed view legal. Non-fatal: the compose path falls back
+			// to the non-decoding view, which is the pre-#1589 behaviour.
+			if (compose_srv_format != DXGI_FORMAT_UNKNOWN) {
+				srvDesc.Format = compose_srv_format;
+				hr = internals.device->CreateShaderResourceView(sc->images[i], &srvDesc,
+				                                                &sc->compose_srvs[i]);
+				if (FAILED(hr)) {
+					U_LOG_W(
+					    "#1589: no format-honest SRV for swapchain texture %u "
+					    "(fmt 0x%X): 0x%08x — that layer composes as if it were "
+					    "already encoded",
+					    i, (unsigned)compose_srv_format, hr);
+					sc->compose_srvs[i] = nullptr;
+				}
 			}
 		}
 
@@ -459,6 +515,38 @@ comp_d3d11_swapchain_get_srv(struct xrt_swapchain *xsc, uint32_t index)
 	}
 
 	return sc->srvs[index];
+}
+
+/*!
+ * #1589: the FORMAT-HONEST SRV for a swapchain image — the view the compose
+ * path samples through.
+ *
+ * Falls back to @ref comp_d3d11_swapchain_get_srv when the two views would be
+ * identical (a UNORM source: its values are already linear), when the escape
+ * hatch is on, or when the extra view could not be created.
+ */
+extern "C" void *
+comp_d3d11_swapchain_get_compose_srv(struct xrt_swapchain *xsc, uint32_t index)
+{
+	struct comp_d3d11_swapchain *sc = d3d11_sc(xsc);
+
+	if (index >= sc->image_count) {
+		return nullptr;
+	}
+
+	return sc->compose_srvs[index] != nullptr ? sc->compose_srvs[index] : sc->srvs[index];
+}
+
+/*!
+ * #1589: did the app ask for an `*_SRGB` colour swapchain, i.e. does it
+ * declare that its bytes are display-referred?
+ */
+extern "C" bool
+comp_d3d11_swapchain_is_srgb(struct xrt_swapchain *xsc)
+{
+	struct comp_d3d11_swapchain *sc = d3d11_sc(xsc);
+
+	return d3d_dxgi_format_is_srgb(sc->color_format);
 }
 
 /*!

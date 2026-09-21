@@ -51,6 +51,38 @@ void *
 comp_d3d11_swapchain_get_srv(struct xrt_swapchain *xsc, uint32_t index);
 
 /*!
+ * #1589: the FORMAT-HONEST shader resource view for a swapchain image — the
+ * app's TRUE format, so an `_SRGB` source decodes to linear on sample and a
+ * UNORM source reads the linear values it holds.
+ *
+ * This is what the compose path binds, because it writes through an `_SRGB`
+ * render target that blends in linear and encodes once on write. Every other
+ * path keeps @ref comp_d3d11_swapchain_get_srv, whose non-decoding view is
+ * what "hand the app's bytes on unchanged" means. Falls back to that view
+ * when the two would be identical, under the escape hatch, or on failure.
+ *
+ * @param xsc The swapchain.
+ * @param index Image index.
+ * @return The SRV as void pointer, or NULL if not available.
+ *
+ * @ingroup comp_d3d11
+ */
+void *
+comp_d3d11_swapchain_get_compose_srv(struct xrt_swapchain *xsc, uint32_t index);
+
+/*!
+ * #1589: did the app request an `*_SRGB` colour swapchain?
+ *
+ * ADR-021 §6: the format IS the declaration. True ⟹ the bytes are
+ * display-referred and may be handed to the ENCODED atlas unchanged; false ⟹
+ * they are scene-linear and owe the encode.
+ *
+ * @ingroup comp_d3d11
+ */
+bool
+comp_d3d11_swapchain_is_srgb(struct xrt_swapchain *xsc);
+
+/*!
  * Get the render target view for a swapchain image.
  *
  * @param xsc The swapchain.
