@@ -17,6 +17,10 @@
 #endif
 
 #include "util/comp_layer_accum.h"
+// #1581 quad layers: the shared per-view camera (#1580) and the N-view
+// LEFT/RIGHT eye-visibility rule.
+#include "util/comp_layer_view_camera.h"
+#include "util/comp_render_helpers.h"
 // #1513 — the shared acquire/wait/release bookkeeping and the static-image
 // count rule. Header-only (no Vulkan), so it costs no comp_util link.
 #include "util/comp_swapchain_ring.h"
@@ -259,6 +263,97 @@ static const char *FS_TEXTURED =
     "    fragColor = texture(u_texture, uv);\n"
     "}\n";
 
+/*
+ * #1581 — XrCompositionLayerQuad. GLSL port of `shaders/layer_quad.vert` +
+ * `shaders/layer_shared.frag` (the same pair the D3D11 renderer and the Metal
+ * compositor draw quads with): a world-placed 1×1 quad centred on the origin,
+ * scaled by the layer size in the model matrix, emitted as a 4-vertex triangle
+ * strip generated from `gl_VertexID`.
+ *
+ * ── Y CONVENTION — ONE quad-local flip, and a Y-UP projection ──
+ *
+ * There are exactly two places a Y convention can enter, and OpenGL needs one
+ * of each — the same pairing `comp_d3d11_renderer.cpp` settled on in #1580:
+ *
+ *   - `pos.y = -pos.y` (quad-local, BEFORE the model matrix) — the flip
+ *     `shaders/layer_quad.vert` already has. It pairs the texture's TOP row
+ *     with the quad's TOP edge in OpenXR's +Y-up quad space. Without it the
+ *     texture is drawn upside down. Kept here.
+ *   - The PROJECTION's clip convention. `math_matrix_4x4_projection_vulkan_infinite_reverse`
+ *     is Y-DOWN (`a22 < 0`, Vulkan's NDC `+y` is the BOTTOM of the
+ *     framebuffer); `math_matrix_4x4_projection_d3d_infinite_reverse` is the
+ *     Y-UP twin (`a22 > 0`) — the two are exact Y-negations sharing one body.
+ *     **GL takes the D3D one**, because GL's NDC `+y` is the TOP of the
+ *     viewport, exactly like D3D's, D3D12's and Metal's.
+ *
+ * "GL's framebuffer origin is bottom-left, so its Y must be the odd one out"
+ * is the trap. The framebuffer-origin convention and the NDC convention are
+ * independent: GL's `glViewport` measures from the bottom AND its NDC `+y` is
+ * up, which is self-consistent, and leaves Vulkan as the only Y-DOWN clip
+ * space of the five backends.
+ *
+ * Proven on sim_display with `DXR_TEST_QUAD=1` (823 px tile, canvas
+ * 0.3012 × 0.1640 m, per-view fov L/R/U/D (-0.198, 0.292, -0.025, -0.290) rad —
+ * strongly asymmetric, which is what makes the check discriminating): quad A's
+ * centre lands at **289.0 px** measured against **289.7 px** predicted from
+ * what `xrLocateViews` handed the app. Swapping in the Y-DOWN Vulkan helper
+ * and changing nothing else moves it to **533.0 px** — the exact mirror about
+ * the tile's horizontal centre line (411.5 ± 122), with x unchanged. That is
+ * invisible under the legacy symmetric ±45° camera with a quad near y=0, and
+ * gross under a real asymmetric Kooima fov: the #1580 defect.
+ *
+ * (An earlier revision of this pass used the Vulkan helper plus a
+ * `clip.y = -clip.y` in this shader and measured bit-identically at 289.0. The
+ * D3D helper is the same transform with the negation folded into the matrix,
+ * and is the form #1580 made canonical for every Y-up backend — prefer it, so
+ * the convention lives in one place instead of in five shaders.)
+ */
+static const char *VS_QUAD =
+    "#version 330 core\n"
+    "out vec2 v_uv;\n"
+    "uniform mat4 u_mvp;\n"
+    "uniform vec4 u_post_transform;\n" // xy = uv offset, zw = uv scale
+    "void main() {\n"
+    "    vec2 corners[4] = vec2[4](vec2(0.0, 0.0), vec2(0.0, 1.0),\n"
+    "                              vec2(1.0, 0.0), vec2(1.0, 1.0));\n"
+    "    vec2 in_uv = corners[gl_VertexID % 4];\n"
+    "    vec2 pos = in_uv - 0.5;\n"
+    "    pos.y = -pos.y;\n"                     // texture top <-> quad top (+Y up)
+    // u_mvp carries the Y-UP (D3D-convention) projection — see the block
+    // comment above; no clip-space negation here.
+    "    gl_Position = u_mvp * vec4(pos, 0.0, 1.0);\n"
+    "    v_uv = in_uv * u_post_transform.zw + u_post_transform.xy;\n"
+    "}\n";
+
+//! Fragment shader: quad layer (#1581). color_scale/color_bias are
+//! XR_KHR_composition_layer_color_scale_bias; identity when the layer does not
+//! set XRT_LAYER_COMPOSITION_COLOR_BIAS_SCALE.
+static const char *FS_QUAD =
+    "#version 330 core\n"
+    "in vec2 v_uv;\n"
+    "out vec4 fragColor;\n"
+    "uniform sampler2D u_texture;\n"
+    "uniform vec4 u_color_scale;\n"
+    "uniform vec4 u_color_bias;\n"
+    "void main() {\n"
+    "    fragColor = texture(u_texture, v_uv) * u_color_scale + u_color_bias;\n"
+    "}\n";
+
+//! Quad-layer fragment shader for LAYERED (arraySize>1) swapchains — the
+//! sampler2DArray twin of FS_QUAD, selected per-draw by `subImage.imageArrayIndex`
+//! exactly as FS_BLIT_ARRAY is for projection tiles.
+static const char *FS_QUAD_ARRAY =
+    "#version 330 core\n"
+    "in vec2 v_uv;\n"
+    "out vec4 fragColor;\n"
+    "uniform sampler2DArray u_texture;\n"
+    "uniform float u_layer;\n"
+    "uniform vec4 u_color_scale;\n"
+    "uniform vec4 u_color_bias;\n"
+    "void main() {\n"
+    "    fragColor = texture(u_texture, vec3(v_uv, u_layer)) * u_color_scale + u_color_bias;\n"
+    "}\n";
+
 //! Fragment shader: masked 2D-over-3D composite (#439 Phase 3 GL leg), by
 //! u_composite_mode:
 //! 0 (LERP): final = M*weave + (1-M)*twod (explicit authored mask).
@@ -320,6 +415,12 @@ struct comp_gl_compositor
 	GLuint program_blit;      //!< Shader for blitting eye to atlas texture
 	GLuint program_blit_array; //!< Blit shader for LAYERED (array) swapchains (sampler2DArray)
 	GLuint program_window_space; //!< Window-space layer (positioned quad)
+	//! #1581 XrCompositionLayerQuad — world-placed quad through the per-view
+	//! camera. Straight vs premultiplied alpha is blend STATE in GL, so one
+	//! program covers both; the `_array` twin only exists for arraySize>1
+	//! swapchains (sampler2DArray), like program_blit_array.
+	GLuint program_quad;
+	GLuint program_quad_array;
 	GLuint vao_empty;         //!< Empty VAO for vertex-shader-generated fullscreen quad
 	GLuint fbo;               //!< Framebuffer for rendering into atlas texture
 	GLuint atlas_texture;    //!< Atlas texture (tile_columns * view_width x tile_rows * view_height)
@@ -4656,6 +4757,203 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 	// glReadPixels (origin lower-left).
 	gl_compositor_dispatch_capture(c, MCP_CAPTURE_MODE_PROJECTION_ONLY);
 
+	// --- Step 1a½: Quad layers (XrCompositionLayerQuad — #1581, epic #1523) ---
+	//
+	// The GL compositor ACCEPTED quads (comp_layer_accum_quad) but never drew
+	// them, so every Khronos CTS interactive composition prompt, label and
+	// reference image was invisible on this backend.
+	//
+	// Placement is deliberately HERE: after the PROJECTION_ONLY capture above
+	// (so the MCP projection-only capture stays projection-only) and before
+	// the window-space pass below, with the atlas FBO still bound — so the
+	// /tmp/dxr_atlas_trigger dump, taken after both passes, shows the quads.
+	//
+	// The camera is the #1580 one: for each view, the frustum the app's own
+	// projection content for THAT view was rendered with. Resolved ONCE PER
+	// VIEW PER FRAME and hoisted out of the layer loop — a hardcoded camera is
+	// exactly the defect #1580 documents (quad and projection content for the
+	// same world position landing on different display pixels).
+	{
+		bool any_quad = false;
+		for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+			if (c->layer_accum.layers[i].data.type == XRT_LAYER_QUAD) {
+				any_quad = true;
+				break;
+			}
+		}
+
+		uint32_t quad_view_count = c->eff_views;
+		if (quad_view_count == 0) {
+			quad_view_count = 1;
+		}
+		if (quad_view_count > XRT_MAX_VIEWS) {
+			quad_view_count = XRT_MAX_VIEWS;
+		}
+		const uint32_t quad_cols = c->eff_cols > 0 ? c->eff_cols : 1;
+
+		if (any_quad) {
+			glDisable(GL_DEPTH_TEST);
+			// The atlas holds sRGB-ENCODED bytes in a UNORM texture and every
+			// other pass (zones, Local2D, window-space) blends in that encoded
+			// space. GL_FRAMEBUFFER_SRGB would re-encode on write and produce a
+			// quad ~2.2x too bright against encoded neighbours; the sampled
+			// swapchain's decode is suppressed below for the same reason.
+#ifdef GL_FRAMEBUFFER_SRGB
+			glDisable(GL_FRAMEBUFFER_SRGB);
+#endif
+			glEnable(GL_BLEND);
+			glEnable(GL_SCISSOR_TEST);
+		}
+
+		for (uint32_t view = 0; any_quad && view < quad_view_count; view++) {
+			// (1) Camera for this view — once, before any layer. The WHOLE
+			// DP eye set goes in, plus the frame's active view count, so
+			// branch (b) gets the state tracker's mono-collapse and
+			// per-view-eye rules (#1580); a left/right pair cannot express
+			// either. Canvas metres are 0 (unknown): every frame that carries
+			// a quad also carries a projection layer (true of the whole CTS
+			// composition set), so branch (a) fires and (b) is unreachable
+			// from here. Wiring the GL canvas metrics is a follow-up.
+			struct comp_layer_view_camera cam;
+			if (!comp_layer_view_camera_select_eyes(&c->layer_accum, view,
+			                                        c->have_cached_eye_pos ? &c->cached_eye_pos : NULL,
+			                                        quad_view_count, NULL, 0.0f, 0.0f, &cam)) {
+				continue;
+			}
+
+			struct xrt_matrix_4x4 view_mat, proj_mat;
+			math_matrix_4x4_view_from_pose(&cam.pose, &view_mat);
+			// Y-UP clip space (#1580). The Vulkan variant negates row 1, which
+			// mirrors every quad about the tile's horizontal centre line
+			// relative to the projection layer's identity blit.
+			math_matrix_4x4_projection_d3d_infinite_reverse(&cam.fov, 0.1f, &proj_mat);
+
+			// (2) Tile box — viewport AND scissor, in the same effective grid
+			// (#542) the projection and window-space passes tile by. The
+			// scissor is mandatory, not belt-and-braces: unlike the
+			// fullscreen-triangle passes around it, a projected quad's
+			// geometry can extend past the viewport rect and GL viewports do
+			// not clip. The spill would land in the NEIGHBOUR view's tile and
+			// the DP would weave it as ghosting in the wrong eye.
+			const uint32_t tile_x = view % quad_cols;
+			const uint32_t tile_y = view / quad_cols;
+			const GLint vx = (GLint)(tile_x * c->eff_tile_w);
+			const GLint vy = (GLint)(tile_y * c->eff_tile_h);
+			glViewport(vx, vy, (GLsizei)c->eff_tile_w, (GLsizei)c->eff_tile_h);
+			glScissor(vx, vy, (GLsizei)c->eff_tile_w, (GLsizei)c->eff_tile_h);
+
+			// (3) The quads, in layer-list order.
+			for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+				struct comp_layer *layer = &c->layer_accum.layers[i];
+				const struct xrt_layer_data *data = &layer->data;
+				if (data->type != XRT_LAYER_QUAD) {
+					continue;
+				}
+				if (!is_layer_view_visible_n(data, view, quad_view_count)) {
+					continue;
+				}
+				const struct xrt_layer_quad_data *q = &data->quad;
+
+				struct xrt_swapchain *qsc = layer->sc_array[0];
+				if (qsc == NULL) {
+					continue;
+				}
+				struct comp_gl_swapchain *qgsc = gl_swapchain(qsc);
+				uint32_t img_idx = q->sub.image_index;
+				if (img_idx >= qgsc->image_count) {
+					continue;
+				}
+
+				// MVP exactly as the D3D11 renderer's render_quad_layer:
+				// model = pose * scale(size.x, size.y, 1), view from the
+				// camera pose, Y-up infinite-reverse projection from the
+				// camera fov at near = 0.1.
+				struct xrt_matrix_4x4 model, mv, mvp;
+				struct xrt_vec3 qscale = {q->size.x, q->size.y, 1.0f};
+				math_matrix_4x4_model(&q->pose, &qscale, &model);
+				math_matrix_4x4_multiply(&view_mat, &model, &mv);
+				math_matrix_4x4_multiply(&proj_mat, &mv, &mvp);
+
+				struct xrt_normalized_rect nr = q->sub.norm_rect;
+				if (nr.w == 0.0f || nr.h == 0.0f) {
+					nr.x = 0.0f;
+					nr.y = 0.0f;
+					nr.w = 1.0f;
+					nr.h = 1.0f;
+				}
+				float pt[4] = {nr.x, nr.y, nr.w, nr.h};
+				if (data->flip_y) {
+					pt[1] += pt[3];
+					pt[3] = -pt[3];
+				}
+
+				float cscale[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+				float cbias[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+				if (data->flags & XRT_LAYER_COMPOSITION_COLOR_BIAS_SCALE) {
+					cscale[0] = data->color_scale.r;
+					cscale[1] = data->color_scale.g;
+					cscale[2] = data->color_scale.b;
+					cscale[3] = data->color_scale.a;
+					cbias[0] = data->color_bias.r;
+					cbias[1] = data->color_bias.g;
+					cbias[2] = data->color_bias.b;
+					cbias[3] = data->color_bias.a;
+				}
+
+				// OpenXR's blend switch: SOURCE_ALPHA set ⇒ the texture carries
+				// STRAIGHT alpha (every CTS quad sets it); clear ⇒
+				// premultiplied. Inverse sense to the zone / Local2D
+				// UNPREMULTIPLIED bit — mirrors D3D11 and Metal.
+				const bool straight_alpha =
+				    (data->flags & XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT) != 0;
+				if (straight_alpha) {
+					glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE,
+					                    GL_ONE_MINUS_SRC_ALPHA);
+				} else {
+					glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE,
+					                    GL_ONE_MINUS_SRC_ALPHA);
+				}
+
+				const bool layered = qgsc->target == GL_TEXTURE_2D_ARRAY;
+				const GLuint prog = layered ? c->program_quad_array : c->program_quad;
+				glUseProgram(prog);
+				glUniformMatrix4fv(glGetUniformLocation(prog, "u_mvp"), 1, GL_FALSE, mvp.v);
+				glUniform4fv(glGetUniformLocation(prog, "u_post_transform"), 1, pt);
+				glUniform4fv(glGetUniformLocation(prog, "u_color_scale"), 1, cscale);
+				glUniform4fv(glGetUniformLocation(prog, "u_color_bias"), 1, cbias);
+
+				glActiveTexture(GL_TEXTURE0);
+				glBindTexture(qgsc->target, qgsc->textures[img_idx]);
+				// Suppress the sample-time sRGB decode, as the projection
+				// swapchain path does at creation and the window-space /
+				// Local2D paths re-assert per draw: the atlas is UNORM holding
+				// sRGB-ENCODED bytes, so a quad that linearized here would
+				// blend against encoded neighbours and come out wrong.
+				if (gl_has_srgb_decode_ext()) {
+					glTexParameteri(qgsc->target, GL_TEXTURE_SRGB_DECODE_EXT,
+					                GL_SKIP_DECODE_EXT);
+				}
+				glUniform1i(glGetUniformLocation(prog, "u_texture"), 0);
+				if (layered) {
+					glUniform1f(glGetUniformLocation(prog, "u_layer"),
+					            (float)q->sub.array_index);
+				}
+
+				glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+			}
+		}
+
+		if (any_quad) {
+			// Hand the pass back the way it was found: the window-space loop
+			// below sets its own viewport and blend but no scissor, and a
+			// stale per-tile scissor would clip it.
+			glDisable(GL_SCISSOR_TEST);
+			glDisable(GL_BLEND);
+			glViewport(0, 0, (GLsizei)(c->tile_columns * c->view_width),
+			           (GLsizei)(c->tile_rows * c->view_height));
+		}
+	}
+
 	// --- Step 1b: Render window-space layers (HUD overlays) ---
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		struct comp_layer *layer = &c->layer_accum.layers[i];
@@ -5134,6 +5432,8 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 	if (c->program_blit_array) glDeleteProgram(c->program_blit_array);
 	if (c->program_window_space) glDeleteProgram(c->program_window_space);
 	if (c->program_masked_composite) glDeleteProgram(c->program_masked_composite);
+	if (c->program_quad) glDeleteProgram(c->program_quad);
+	if (c->program_quad_array) glDeleteProgram(c->program_quad_array);
 	if (c->vao_empty) glDeleteVertexArrays(1, &c->vao_empty);
 	if (c->fbo) glDeleteFramebuffers(1, &c->fbo);
 	if (c->atlas_texture) glDeleteTextures(1, &c->atlas_texture);
@@ -5426,8 +5726,12 @@ gl_init_resources(struct comp_gl_compositor *c, uint32_t width, uint32_t height)
 	c->program_window_space = create_program(VS_WINDOW_SPACE, FS_TEXTURED);
 	// #439 Phase 3 — masked 2D-over-3D composite (flatten reuses program_window_space).
 	c->program_masked_composite = create_program(VS_FULLSCREEN_QUAD, FS_MASKED_COMPOSITE);
+	// #1581 — XrCompositionLayerQuad.
+	c->program_quad = create_program(VS_QUAD, FS_QUAD);
+	c->program_quad_array = create_program(VS_QUAD, FS_QUAD_ARRAY);
 
-	if (!c->program_blit || !c->program_window_space || !c->program_masked_composite) {
+	if (!c->program_blit || !c->program_window_space || !c->program_masked_composite ||
+	    !c->program_quad || !c->program_quad_array) {
 		U_LOG_E("Failed to compile GL compositor shaders");
 		return false;
 	}

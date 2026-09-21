@@ -30,6 +30,18 @@ target_link_libraries(
 
 target_include_directories(comp_gl PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
+# HEADERS ONLY (#1581). The GL compositor calls no Vulkan and links no Vulkan
+# symbols, but util/comp_render_helpers.h — the home of the shared layer
+# helpers, including the N-view eye-visibility rule the quad pass needs —
+# includes render/render_interface.h, which includes vk_helpers.h. This is how
+# that header reaches the include path. Guarded because, unlike comp_metal,
+# comp_gl is NOT itself gated on XRT_HAVE_VULKAN (see compositor/CMakeLists.txt);
+# in every shipped configuration (Windows + macOS both require the Vulkan SDK)
+# the guard is true.
+if(XRT_HAVE_VULKAN)
+	target_link_libraries(comp_gl PRIVATE aux_vk)
+endif()
+
 # comp_layer_accum lives in util/ — include path needed
 target_include_directories(comp_gl PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../util)
 
