@@ -214,9 +214,14 @@ dpkg refuses to install both, and consumers depend on the virtual name rather
 than on any particular vendor. Files install system-wide to
 `/usr/share/gnome-shell/extensions/window-geometry@displayxr.org/` (not the
 per-user `~/.local/share/...` path used for manual dev installs). Note the
-extension still has to be *enabled* per user session — a package can seed this
-via a dconf default for `org.gnome.shell enabled-extensions`, but it cannot be
-force-enabled for users who have opted out. A package must also **say in its
+extension still has to be *enabled* per user session. A dconf default for
+`org.gnome.shell enabled-extensions` reaches only users who have never written
+that key, which excludes anyone who has toggled an extension. The
+`displayxr-runtime` `.deb` therefore enables it from an `/etc/xdg/autostart`
+entry, once per user at login. It skips a user whose `disabled-extensions` lists
+the UUID, and it never uses a dconf lock
+(`scripts/linux/displayxr-gnome-extension-enable`). No package may force-enable
+the extension for a user who has opted out. A package must also **say in its
 post-install output that a newly installed extension only takes effect at the
 user's next login** — a Wayland session cannot restart GNOME Shell the way Alt+F2
 `r` does under X11, so until the user logs out the publisher is simply absent and

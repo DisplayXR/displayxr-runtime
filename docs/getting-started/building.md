@@ -118,8 +118,32 @@ Builds the runtime, OpenXR loader, and test apps. The macOS Vulkan native compos
 `install.sh` registers the OpenXR ActiveRuntime (`~/.config/openxr/1/`), the
 sim-display display processor (`~/.local/share/DisplayXR/DisplayProcessors/`),
 and a systemd `--user` unit — no root. `sudo ./install.sh --system` for
-machine-wide. Dev iteration without installing stays `XR_RUNTIME_JSON` +
-`XRT_PLUGIN_SEARCH_PATH` per `docs/roadmap/linux-support.md`.
+machine-wide. Every `v*` release also attaches `displayxr-runtime_<ver>_amd64.deb`
+(`scripts/package_deb_linux.sh`). Dev iteration without installing stays
+`XR_RUNTIME_JSON` + `XRT_PLUGIN_SEARCH_PATH` per `docs/roadmap/linux-support.md`.
+
+**GNOME Shell extension (GNOME on Wayland).** Windowed weaving under Wayland
+and transparent apps on a Leia panel both depend on the
+`window-geometry@displayxr.org` extension (`contrib/gnome-shell/`). Without it
+the runtime weaves display-scoped and transparency falls back to silhouette
+intersection. Both packages install it:
+
+| Package | Location | Enabling |
+|---|---|---|
+| `.deb` | `/usr/share/gnome-shell/extensions/` | For every user at their next GNOME login, by an `/etc/xdg/autostart` entry. It acts once per user and never overrides a user who disabled it. |
+| tarball `install.sh` | `~/.local/share/gnome-shell/extensions/` | For the installing user, immediately. |
+| tarball `install.sh --system` | `/usr/local/share/gnome-shell/extensions/` | As for the `.deb`. |
+
+Either way, **log out and back in** afterwards, and after every update. A
+Wayland session cannot reload GNOME Shell, so the extension only starts at the
+next login. Check it with `gnome-extensions info window-geometry@displayxr.org`
+(`State: ACTIVE`). A user who disabled it turns it back on with
+`gnome-extensions enable window-geometry@displayxr.org`, then logs out and in.
+When an app binds a Wayland surface and the extension is not answering, the
+runtime logs a `wl_geom:` line that says whether it is not installed or
+installed but not active. The extension needs GNOME Shell 45 or newer, so it
+does not load on Ubuntu 22.04 (GNOME 42). Details and the enabling rules:
+`contrib/gnome-shell/window-geometry@displayxr.org/README.md`.
 
 **Running the OpenXR CTS locally (#1527).** `scripts/fetch_build_cts.sh` clones
 and builds the Khronos conformance suite at the pin the whole matrix shares
