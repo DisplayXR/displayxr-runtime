@@ -45,7 +45,10 @@ fi
 
 RUNTIME_SO="$(find_runtime)"
 CLI_BIN="$(find "$BUILD_DIR/src/xrt/targets/cli" -maxdepth 1 -name displayxr-cli -type f | head -1)"
-SERVICE_BIN="$(find "$BUILD_DIR/src/xrt/targets/service" -maxdepth 1 -name displayxr-service -type f 2>/dev/null | head -1)"
+# `|| true`: a build without --service has no targets/service dir, so find exits
+# non-zero and, under pipefail + set -e, used to abort the script silently here
+# instead of reaching the "packaging without it" note below.
+SERVICE_BIN="$(find "$BUILD_DIR/src/xrt/targets/service" -maxdepth 1 -name displayxr-service -type f 2>/dev/null | head -1 || true)"
 PLUGIN_SO="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimDisplay.so" -type f | head -1)"
 
 for f in "$RUNTIME_SO" "$CLI_BIN" "$PLUGIN_SO"; do
