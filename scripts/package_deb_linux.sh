@@ -15,6 +15,18 @@
 #   /usr/lib/displayxr/plugins/200-sim-display.json      (its discovery manifest)
 #   /usr/bin/displayxr-cli -> ../lib/displayxr/bin/displayxr-cli  (PATH symlink;
 #       exec'd via the symlink, ld.so still takes $ORIGIN from the real target)
+#   /usr/share/gnome-shell/extensions/window-geometry@displayxr.org/
+#       the GNOME Shell extension from contrib/gnome-shell/ (window geometry for
+#       windowed Wayland weaving; capture exclusion for transparency)
+#   /usr/lib/displayxr/bin/displayxr-gnome-extension-enable
+#   /etc/xdg/autostart/displayxr-gnome-extension-enable.desktop
+#       enable the extension ONCE per user at their GNOME login, never over an
+#       explicit opt-out (the script's header has the rules, and why a dconf
+#       default alone would not reach most users)
+#
+#   Provides/Conflicts/Replaces the virtual package
+#   displayxr-window-geometry-publisher: exactly one installed package may own
+#   the extension's D-Bus name (docs/specs/runtime/wayland-window-geometry.md §4).
 #
 #   postinst writes /etc/xdg/openxr/1/active_runtime.json (the Khronos loader
 #   well-known path — the Linux ActiveRuntime equivalent) pointing at the
@@ -90,6 +102,16 @@ for f in "$RUNTIME_SO" "$CLI_BIN" "$PLUGIN_SO"; do
     [ -n "$f" ] || { echo "error: missing build artifact (runtime/cli/plugin)" >&2; exit 1; }
 done
 
+# The GNOME Shell extension is source, not a build artifact: ship it from the
+# checkout. docs/specs/runtime/wayland-window-geometry.md §4 is the packaging
+# contract this follows (system path, virtual-package trio, login notice).
+EXT_UUID="window-geometry@displayxr.org"
+EXT_SRC="$ROOT/contrib/gnome-shell/$EXT_UUID"
+EXT_ENABLE="$ROOT/scripts/linux/displayxr-gnome-extension-enable"
+for f in "$EXT_SRC/extension.js" "$EXT_SRC/metadata.json" "$EXT_ENABLE"; do
+    [ -f "$f" ] || { echo "error: missing $f (GNOME Shell extension payload)" >&2; exit 1; }
+done
+
 # --- Version: turn `git describe` into a Debian-legal upstream version. -----
 # v2.1.0 -> 2.1.0 ; v2.1.0-3-gabc123 -> 2.1.0+3.gabc123 ; dirty -> +dirty
 RAW="$(git -C "$ROOT" describe --tags --always --dirty 2>/dev/null || echo 0.0.0)"
@@ -112,13 +134,35 @@ mkdir -p "$STAGE/DEBIAN" \
          "$STAGE/usr/bin" \
          "$STAGE/usr/lib/displayxr/bin" \
          "$STAGE/usr/lib/displayxr/lib" \
-         "$STAGE/usr/lib/displayxr/plugins"
+         "$STAGE/usr/lib/displayxr/plugins" \
+         "$STAGE/usr/share/gnome-shell/extensions/$EXT_UUID" \
+         "$STAGE/etc/xdg/autostart"
 
 install -m 0755 "$CLI_BIN"     "$STAGE/usr/lib/displayxr/bin/displayxr-cli"
 install -m 0644 "$RUNTIME_SO"  "$STAGE/usr/lib/displayxr/lib/openxr_displayxr.so"
 install -m 0644 "$PLUGIN_SO"   "$STAGE/usr/lib/displayxr/plugins/DisplayXR-SimDisplay.so"
 # PATH entry — relative symlink so it stays valid regardless of install root.
 ln -s ../lib/displayxr/bin/displayxr-cli "$STAGE/usr/bin/displayxr-cli"
+
+# --- GNOME Shell extension + the per-user enable at login -------------------
+install -m 0644 "$EXT_SRC/extension.js" "$EXT_SRC/metadata.json" \
+    "$STAGE/usr/share/gnome-shell/extensions/$EXT_UUID/"
+install -m 0755 "$EXT_ENABLE" "$STAGE/usr/lib/displayxr/bin/displayxr-gnome-extension-enable"
+# Deliberately NOT a conffile (not in DEBIAN/conffiles): `apt remove` deletes it
+# with the script it runs instead of leaving an entry behind (TryExec also
+# guards a dangling one).
+cat > "$STAGE/etc/xdg/autostart/displayxr-gnome-extension-enable.desktop" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=DisplayXR GNOME Shell extension
+Comment=Enables the DisplayXR window-geometry extension once per user, never over an opt-out
+Exec=/usr/lib/displayxr/bin/displayxr-gnome-extension-enable
+TryExec=/usr/lib/displayxr/bin/displayxr-gnome-extension-enable
+OnlyShowIn=GNOME;
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+DESKTOP
+chmod 0644 "$STAGE/etc/xdg/autostart/displayxr-gnome-extension-enable.desktop"
 
 # --- Packaged display-processor discovery manifest -------------------------
 # binary_path is fixed at the installed location, so we ship the manifest as a
@@ -178,6 +222,21 @@ compute_depends() {
 DEPENDS="$(compute_depends)"
 echo "==> Depends: $DEPENDS"
 
+# The runtime must link libdbus-1: it is the Wayland window-geometry provider
+# (#817) that consumes the GNOME Shell extension this package ships. It is an
+# OPTIONAL CMake dependency, so a build host without libdbus-1-dev silently
+# drops the provider and libdbus-1-3 with it — v2.17.1 shipped exactly that
+# (Depends had no libdbus-1-3; fixed in CI by #1565). Refuse such a package here
+# rather than rely on every build host's apt line. (PipeWire is deliberately
+# absent: the desktop capture lives in the vendor plug-in, not the runtime.)
+# (Captured first: `objdump | grep -q` under pipefail can fail on SIGPIPE.)
+RUNTIME_NEEDED="$(objdump -p "$RUNTIME_SO" 2>/dev/null | awk '/NEEDED/{print $2}')"
+if ! echo "$RUNTIME_NEEDED" | grep -qx 'libdbus-1.so.3'; then
+    echo "error: $RUNTIME_SO does not link libdbus-1 — the Wayland window-geometry provider" >&2
+    echo "       was compiled out. Install libdbus-1-dev and rebuild." >&2
+    exit 1
+fi
+
 INSTALLED_KB="$(du -sk "$STAGE/usr" | cut -f1)"
 
 # --- control ---------------------------------------------------------------
@@ -188,6 +247,9 @@ Section: libs
 Priority: optional
 Architecture: $ARCH
 Depends: $DEPENDS
+Provides: displayxr-window-geometry-publisher
+Conflicts: displayxr-window-geometry-publisher
+Replaces: displayxr-window-geometry-publisher
 Installed-Size: $INSTALLED_KB
 Maintainer: The DisplayXR Project <noreply@displayxr.dev>
 Homepage: https://github.com/DisplayXR/displayxr-runtime
@@ -204,6 +266,11 @@ Description: DisplayXR OpenXR runtime for 3D displays (in-process, sim-display)
  probe_order and claims the display automatically when present; otherwise
  sim-display drives apps. The out-of-process service is not included on Linux
  yet (see issue #710).
+ .
+ It also installs the GNOME Shell extension window-geometry@displayxr.org,
+ which windowed weaving under Wayland and transparent apps on a 3D panel both
+ need. It is enabled for each user at their next GNOME login, except for a
+ user who has disabled it, and takes effect from that login.
 EOF
 
 # --- maintainer scripts ----------------------------------------------------
@@ -237,6 +304,17 @@ configure)
 JSON
     echo "displayxr-runtime: OpenXR ActiveRuntime -> $ACTIVE"
     echo "displayxr-runtime: verify with  displayxr-cli selftest"
+    # Required notice (wayland-window-geometry.md §4): until the user logs in
+    # again the extension is absent and every consumer silently falls back
+    # (display-scoped weaving, silhouette transparency).
+    echo ""
+    echo "displayxr-runtime: GNOME Shell extension window-geometry@displayxr.org installed"
+    echo "  in /usr/share/gnome-shell/extensions/. It is enabled for every user at their"
+    echo "  next GNOME login, except a user who has disabled it. It takes effect only"
+    echo "  after you LOG OUT AND BACK IN: a Wayland session cannot reload GNOME Shell,"
+    echo "  and the same applies when this package updates the extension."
+    echo "  To turn it back on after disabling it:"
+    echo "      gnome-extensions enable window-geometry@displayxr.org"
     ;;
 esac
 
