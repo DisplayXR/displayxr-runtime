@@ -4756,9 +4756,17 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 			uint8_t *td = (uint8_t *)malloc(bytes);
 			if (bu != NULL && td != NULL) {
 				glReadBuffer(GL_COLOR_ATTACHMENT0);
-				GLint sy = (GLint)c->atlas_tex_height - (GLint)ch;
-				if (sy < 0) sy = 0;
-				glReadPixels(0, sy, (GLsizei)cw, (GLsizei)ch, GL_RGBA, GL_UNSIGNED_BYTE, bu);
+				// Read from y = 0. The atlas texture is worst-case sized
+				// across every rendering mode (u_tiling_compute_system_atlas),
+				// but every pass tiles from viewport y = 0 up, and a GL
+				// framebuffer's origin is BOTTOM-left — so this frame's
+				// content region occupies the BOTTOM `ch` rows, not the top.
+				// The old `atlas_tex_height - ch` offset was a top-left-origin
+				// assumption: on any box whose worst-case atlas is taller than
+				// the active mode (any sim_display enumerating the 2x2 Quad
+				// mode: 1646 vs 823) it read the untouched upper half and
+				// wrote an all-black PNG. Found while validating #1581.
+				glReadPixels(0, 0, (GLsizei)cw, (GLsizei)ch, GL_RGBA, GL_UNSIGNED_BYTE, bu);
 				glFinish();
 				for (uint32_t y = 0; y < ch; y++) {
 					memcpy(td + (size_t)y * row_pitch,
