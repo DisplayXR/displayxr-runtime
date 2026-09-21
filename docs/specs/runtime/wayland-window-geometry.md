@@ -415,8 +415,12 @@ user pressing *Stop Screen Sharing* — ends the capture for that session.
   a consent dialog.)
 - **Cost.** Each captured frame is one extra off-screen render of the recorded
   area — the whole panel — by mutter, plus a CPU copy of the frame into the
-  display processor. The effect itself is a few JS calls per paint. Not yet
-  measured at 4K on the panel.
+  display processor. Mutter records only on damage, and the Leia DP caps
+  delivery at 66 ms by offering that as the stream's `maxFramerate` (Windows
+  parity, `LEIA_DP_CAPTURE_MIN_INTERVAL_MS`; 0 = uncapped). So the worst case
+  is about 15 full-panel re-renders a second under motion, and nothing on a
+  quiet desktop. The effect itself is a few JS calls per paint. GPU cost at
+  4K on the panel is not yet measured.
 - `RecordMonitor` streams served by a view blit are not covered (§6.2).
 - GNOME only; another compositor needs its own implementation of the same
   interface.
