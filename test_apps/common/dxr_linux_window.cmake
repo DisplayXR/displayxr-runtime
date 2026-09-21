@@ -8,10 +8,16 @@
 # test app needs it). Wayland is OPTIONAL and detected here: with
 # libwayland-client present the helper's Wayland leg is compiled in and
 # DXR_APP_HAVE_WAYLAND is defined; without it the app still builds and runs,
-# X11-only. The xdg-shell client glue is generated at build time by
-# wayland-scanner from the XML VENDORED at common/wayland-protocols/ — the
+# X11-only. The xdg-shell and xdg-output client glue is generated at build time
+# by wayland-scanner from the XML VENDORED at common/wayland-protocols/ — the
 # wayland-protocols package ships that XML and is not installed everywhere
 # (notably not in CI images), so the tree carries its own copy.
+#
+# xdg-output (#1596) is what makes the panel match possible at all. Core
+# wl_output publishes a LOGICAL origin, a DEVICE-pixel mode, and an INTEGER
+# scale — and the integer is wrong on any fractionally-scaled output (2 for a
+# 1.6667 monitor on the measured box), so it cannot bridge the two spaces.
+# zxdg_output_v1.logical_size can: mode / logical_size IS the fractional scale.
 #
 # Usage, from an app's CMakeLists.txt, AFTER add_executable():
 #     include(${CMAKE_SOURCE_DIR}/../common/dxr_linux_window.cmake)
@@ -28,6 +34,20 @@ function(dxr_target_add_linux_window TARGET)
     # shared with the runtime (and pinned by tests/tests_aux_x11_scale.cpp), so
     # the helper's landing check and the runtime's lattice search agree.
     target_include_directories(${TARGET} PRIVATE "${DXR_LINUX_WINDOW_DIR}/../../src/xrt/auxiliary/util")
+
+    # ONE definition of the logical->device conversion (#1595/#1596), shared
+    # verbatim with the runtime rather than re-derived app-side: the app matches
+    # outputs in device pixels, the runtime converts the window rect in device
+    # pixels, and the two agreeing is the whole point. Header-only, no link
+    # dependency — this pulls in src/xrt/auxiliary/util/u_wayland_geom.h and
+    # nothing else.
+    get_filename_component(_dxr_aux "${DXR_LINUX_WINDOW_DIR}/../../src/xrt/auxiliary" ABSOLUTE)
+    if(NOT EXISTS "${_dxr_aux}/util/u_wayland_geom.h")
+        message(FATAL_ERROR
+            "${TARGET}: u_wayland_geom.h not found at ${_dxr_aux}/util — this helper must be built "
+            "from inside a displayxr-runtime checkout")
+    endif()
+    target_include_directories(${TARGET} PRIVATE "${_dxr_aux}")
 
     # Xrandr (optional, libxrandr-dev). _NET_WM_FULLSCREEN_MONITORS targets a
     # monitor by RandR INDEX, and XRRGetMonitors is what turns the panel rect
@@ -78,29 +98,37 @@ function(dxr_target_add_linux_window TARGET)
         return()
     endif()
 
-    set(_xml "${DXR_LINUX_WINDOW_DIR}/wayland-protocols/xdg-shell.xml")
     set(_gen "${CMAKE_CURRENT_BINARY_DIR}/wayland-generated")
-    set(_hdr "${_gen}/xdg-shell-client-protocol.h")
-    set(_src "${_gen}/xdg-shell-protocol.c")
+    set(_wl_generated "")
+    # One entry per protocol, named by its XML STEM — that is both the file's
+    # basename and the prefix wayland-scanner gives its outputs, and therefore
+    # the name the #includes in dxr_linux_window.cpp use. (A list of "a;b"
+    # pairs would not survive foreach, which flattens its arguments.)
+    foreach(_stem "xdg-shell" "xdg-output-unstable-v1")
+        set(_xml "${DXR_LINUX_WINDOW_DIR}/wayland-protocols/${_stem}.xml")
+        set(_hdr "${_gen}/${_stem}-client-protocol.h")
+        set(_src "${_gen}/${_stem}-protocol.c")
 
-    add_custom_command(
-        OUTPUT "${_hdr}"
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${_gen}"
-        COMMAND "${_scanner}" client-header "${_xml}" "${_hdr}"
-        DEPENDS "${_xml}"
-        COMMENT "wayland-scanner client-header xdg-shell (${TARGET})"
-        VERBATIM
-    )
-    add_custom_command(
-        OUTPUT "${_src}"
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${_gen}"
-        COMMAND "${_scanner}" private-code "${_xml}" "${_src}"
-        DEPENDS "${_xml}"
-        COMMENT "wayland-scanner private-code xdg-shell (${TARGET})"
-        VERBATIM
-    )
+        add_custom_command(
+            OUTPUT "${_hdr}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${_gen}"
+            COMMAND "${_scanner}" client-header "${_xml}" "${_hdr}"
+            DEPENDS "${_xml}"
+            COMMENT "wayland-scanner client-header ${_stem} (${TARGET})"
+            VERBATIM
+        )
+        add_custom_command(
+            OUTPUT "${_src}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${_gen}"
+            COMMAND "${_scanner}" private-code "${_xml}" "${_src}"
+            DEPENDS "${_xml}"
+            COMMENT "wayland-scanner private-code ${_stem} (${TARGET})"
+            VERBATIM
+        )
+        list(APPEND _wl_generated "${_hdr}" "${_src}")
+    endforeach()
 
-    target_sources(${TARGET} PRIVATE "${_hdr}" "${_src}")
+    target_sources(${TARGET} PRIVATE ${_wl_generated})
     target_include_directories(${TARGET} PRIVATE "${_gen}" ${WAYLAND_CLIENT_INCLUDE_DIRS})
     target_link_libraries(${TARGET} PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
     target_link_directories(${TARGET} PRIVATE ${WAYLAND_CLIENT_LIBRARY_DIRS})

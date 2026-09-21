@@ -398,13 +398,43 @@ private:
 
 #ifdef DXR_APP_HAVE_WAYLAND
 	// --- Wayland leg -------------------------------------------------------
+	/*!
+	 * One output, with EVERY field's coordinate space in its name (#1596).
+	 *
+	 * The bug this naming exists to prevent: the panel match used to compare
+	 * `wl_output.geometry`'s LOGICAL origin against the runtime's DEVICE-pixel
+	 * panel rect, so on the measured box it compared 1728 against 3456 and
+	 * could never succeed — the app then fullscreened on whatever output the
+	 * compositor picked (the laptop) and wove into a resample.
+	 */
 	struct WlOutput
 	{
 		struct wl_output *output = nullptr;
+		//! zxdg_output_v1, when the compositor advertises the manager. It is
+		//! the ONLY source of an output's logical SIZE, and therefore the only
+		//! way to derive a fractional scale (mode / logical_size).
+		struct zxdg_output_v1 *xdg_output = nullptr;
 		uint32_t name = 0;
-		int32_t x = 0, y = 0;
-		int32_t width = 0, height = 0;
-		int32_t scale = 1;
+
+		//! Position in the global LOGICAL layout. Seeded from
+		//! wl_output.geometry, superseded by xdg_output.logical_position.
+		int32_t logical_x = 0, logical_y = 0;
+		//! Size in LOGICAL px, from xdg_output.logical_size only.
+		int32_t logical_w = 0, logical_h = 0;
+		bool have_logical_size = false;
+
+		//! Current mode, DEVICE px (wl_output.mode). Directly comparable with
+		//! the runtime's panel size, which is device px by contract.
+		int32_t mode_w = 0, mode_h = 0;
+
+		/*!
+		 * wl_output.scale. An INTEGER by protocol, and therefore NOT the
+		 * conversion factor: this box's 1.6667 laptop advertises 2. Kept only
+		 * so a diagnostic can say what the compositor claimed; every
+		 * conversion goes through u_wl_monitor_scale().
+		 */
+		int32_t int_scale = 1;
+
 		int32_t refresh_mhz = 0; //!< wl_output.mode refresh, milli-hertz
 	};
 
@@ -413,6 +443,11 @@ private:
 	struct wl_compositor *m_wl_compositor = nullptr;
 	struct xdg_wm_base *m_wl_wm_base = nullptr;
 	struct wl_seat *m_wl_seat = nullptr;
+	//! zxdg_output_manager_v1 (#1596). Absent on a compositor that does not
+	//! advertise it — the match then falls back to mode size alone, which is
+	//! still device-vs-device and still correct, just without the origin as a
+	//! tie-break.
+	struct zxdg_output_manager_v1 *m_wl_xdg_output_manager = nullptr;
 	struct wl_keyboard *m_wl_keyboard = nullptr;
 	struct wl_surface *m_wl_surface = nullptr;
 	struct xdg_surface *m_wl_xdg_surface = nullptr;
@@ -455,6 +490,12 @@ private:
 	void
 	destroy_wayland();
 
+	//! Give an output its zxdg_output_v1 once the manager exists. Idempotent,
+	//! and called from both directions (output-first and manager-first) so
+	//! registry ordering cannot leave an output without a logical size.
+	void
+	wl_attach_xdg_output(WlOutput &out);
+
 	// Static trampolines (wayland-client listeners are C function pointers).
 	static void
 	s_registry_global(void *data, struct wl_registry *r, uint32_t name, const char *iface, uint32_t version);
@@ -493,6 +534,16 @@ private:
 	s_output_name(void *data, struct wl_output *o, const char *name);
 	static void
 	s_output_description(void *data, struct wl_output *o, const char *desc);
+	static void
+	s_xdg_output_logical_position(void *data, struct zxdg_output_v1 *o, int32_t x, int32_t y);
+	static void
+	s_xdg_output_logical_size(void *data, struct zxdg_output_v1 *o, int32_t w, int32_t h);
+	static void
+	s_xdg_output_done(void *data, struct zxdg_output_v1 *o);
+	static void
+	s_xdg_output_name(void *data, struct zxdg_output_v1 *o, const char *name);
+	static void
+	s_xdg_output_description(void *data, struct zxdg_output_v1 *o, const char *desc);
 	static void
 	s_seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps);
 	static void

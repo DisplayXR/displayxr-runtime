@@ -21,6 +21,11 @@
 
 #ifdef DXR_APP_HAVE_WAYLAND
 #include "xdg-shell-client-protocol.h"
+#include "xdg-output-unstable-v1-client-protocol.h"
+// THE logical->device conversion, shared verbatim with the runtime so the
+// app's output match and the runtime's window-rect conversion cannot drift
+// apart (#1595/#1596). Header-only; see src/xrt/auxiliary/util/.
+#include "util/u_wayland_geom.h"
 
 #include <linux/input-event-codes.h> // raw evdev keycodes — no xkbcommon dependency
 #include <poll.h>                    // non-blocking socket check in pump()
@@ -755,6 +760,17 @@ DxrLinuxWindow::s_registry_global(void *data, struct wl_registry *r, uint32_t na
 		    s_seat_name,
 		};
 		wl_seat_add_listener(self->m_wl_seat, &kSeatListener, self);
+	} else if (strcmp(iface, zxdg_output_manager_v1_interface.name) == 0) {
+		// #1596. Core wl_output cannot express a fractional scale, so without
+		// this the app has no way to convert a logical origin into the device
+		// pixels the runtime's panel rect is expressed in.
+		self->m_wl_xdg_output_manager = static_cast<struct zxdg_output_manager_v1 *>(
+		    wl_registry_bind(r, name, &zxdg_output_manager_v1_interface, version < 2 ? version : 2));
+		// Outputs may have arrived before the manager did; give them their
+		// xdg_output now rather than relying on registry ordering.
+		for (auto &out : self->m_wl_outputs) {
+			self->wl_attach_xdg_output(out);
+		}
 	} else if (strcmp(iface, wl_output_interface.name) == 0) {
 		WlOutput out = {};
 		out.name = name;
@@ -765,7 +781,23 @@ DxrLinuxWindow::s_registry_global(void *data, struct wl_registry *r, uint32_t na
 		    s_output_geometry, s_output_mode, s_output_done, s_output_scale, s_output_name, s_output_description,
 		};
 		wl_output_add_listener(out.output, &kOutputListener, self);
+		self->wl_attach_xdg_output(self->m_wl_outputs.back());
 	}
+}
+
+void
+DxrLinuxWindow::wl_attach_xdg_output(WlOutput &out)
+{
+	if (m_wl_xdg_output_manager == nullptr || out.xdg_output != nullptr || out.output == nullptr) {
+		return;
+	}
+	out.xdg_output = zxdg_output_manager_v1_get_xdg_output(m_wl_xdg_output_manager, out.output);
+	static const struct zxdg_output_v1_listener kXdgOutputListener = {
+	    s_xdg_output_logical_position, s_xdg_output_logical_size,
+	    s_xdg_output_done,             s_xdg_output_name,
+	    s_xdg_output_description,
+	};
+	zxdg_output_v1_add_listener(out.xdg_output, &kXdgOutputListener, this);
 }
 
 void
@@ -777,6 +809,9 @@ DxrLinuxWindow::s_registry_global_remove(void *data, struct wl_registry *r, uint
 	// state, so all we must do is stop tracking the record.
 	for (auto it = self->m_wl_outputs.begin(); it != self->m_wl_outputs.end(); ++it) {
 		if (it->name == name) {
+			if (it->xdg_output != nullptr) {
+				zxdg_output_v1_destroy(it->xdg_output);
+			}
 			self->m_wl_outputs.erase(it);
 			return;
 		}
@@ -857,8 +892,11 @@ DxrLinuxWindow::s_output_geometry(void *data,
 	auto *self = static_cast<DxrLinuxWindow *>(data);
 	for (auto &out : self->m_wl_outputs) {
 		if (out.output == o) {
-			out.x = x;
-			out.y = y;
+			// LOGICAL, despite the event's name. xdg_output.logical_position
+			// supersedes this when the manager exists; this is the seed for a
+			// compositor that has no xdg-output.
+			out.logical_x = x;
+			out.logical_y = y;
 			return;
 		}
 	}
@@ -873,8 +911,9 @@ DxrLinuxWindow::s_output_mode(void *data, struct wl_output *o, uint32_t flags, i
 	auto *self = static_cast<DxrLinuxWindow *>(data);
 	for (auto &out : self->m_wl_outputs) {
 		if (out.output == o) {
-			out.width = w;
-			out.height = h;
+			// DEVICE pixels — the one core-protocol geometry that already is.
+			out.mode_w = w;
+			out.mode_h = h;
 			// Already milli-hertz on the wire; XrWaylandSurfaceGeometryDXR
 			// takes the same unit, so it passes through untouched. The runtime
 			// needs it because Wayland has no XCB connection for the RandR
@@ -899,7 +938,9 @@ DxrLinuxWindow::s_output_scale(void *data, struct wl_output *o, int32_t factor)
 	auto *self = static_cast<DxrLinuxWindow *>(data);
 	for (auto &out : self->m_wl_outputs) {
 		if (out.output == o) {
-			out.scale = factor > 0 ? factor : 1;
+			// Recorded for diagnostics ONLY — this is an integer by protocol
+			// and is 2 on this box's 1.6667 output. Never a conversion factor.
+			out.int_scale = factor > 0 ? factor : 1;
 			return;
 		}
 	}
@@ -915,6 +956,59 @@ DxrLinuxWindow::s_output_name(void *data, struct wl_output *o, const char *name)
 
 void
 DxrLinuxWindow::s_output_description(void *data, struct wl_output *o, const char *desc)
+{
+	(void)data;
+	(void)o;
+	(void)desc;
+}
+
+void
+DxrLinuxWindow::s_xdg_output_logical_position(void *data, struct zxdg_output_v1 *o, int32_t x, int32_t y)
+{
+	auto *self = static_cast<DxrLinuxWindow *>(data);
+	for (auto &out : self->m_wl_outputs) {
+		if (out.xdg_output == o) {
+			out.logical_x = x;
+			out.logical_y = y;
+			return;
+		}
+	}
+}
+
+void
+DxrLinuxWindow::s_xdg_output_logical_size(void *data, struct zxdg_output_v1 *o, int32_t w, int32_t h)
+{
+	// THE missing number (#1596). Nothing in core wl_output reports an
+	// output's logical SIZE, and without it `mode / logical_size` — the only
+	// honest fractional scale a client can compute — is unavailable.
+	auto *self = static_cast<DxrLinuxWindow *>(data);
+	for (auto &out : self->m_wl_outputs) {
+		if (out.xdg_output == o) {
+			out.logical_w = w;
+			out.logical_h = h;
+			out.have_logical_size = (w > 0 && h > 0);
+			return;
+		}
+	}
+}
+
+void
+DxrLinuxWindow::s_xdg_output_done(void *data, struct zxdg_output_v1 *o)
+{
+	(void)data;
+	(void)o;
+}
+
+void
+DxrLinuxWindow::s_xdg_output_name(void *data, struct zxdg_output_v1 *o, const char *name)
+{
+	(void)data;
+	(void)o;
+	(void)name;
+}
+
+void
+DxrLinuxWindow::s_xdg_output_description(void *data, struct zxdg_output_v1 *o, const char *desc)
 {
 	(void)data;
 	(void)o;
@@ -1053,7 +1147,12 @@ DxrLinuxWindow::create_wayland(const DxrLinuxWindowDesc &desc)
 	wl_registry_add_listener(m_wl_registry, &kRegistryListener, this);
 
 	// First roundtrip: globals. Second: the per-output geometry/mode/scale
-	// bursts the first one only triggered.
+	// bursts the first one only triggered. Third: the zxdg_output_v1 bursts
+	// (#1596) — an xdg_output created during the registry callback, or during
+	// the manager's own bind, only answers on the NEXT round trip, and without
+	// its logical_size there is no fractional scale and therefore no
+	// device-pixel panel match.
+	wl_display_roundtrip(m_wl_display);
 	wl_display_roundtrip(m_wl_display);
 	wl_display_roundtrip(m_wl_display);
 
@@ -1093,40 +1192,104 @@ DxrLinuxWindow::create_wayland(const DxrLinuxWindowDesc &desc)
 	m_wl_config_h = (int32_t)desc.height;
 
 	if (desc.fullscreen_on_wayland) {
-		// INV-1.3 substitute. A Wayland client cannot place itself, so the only
-		// way to land on the 3D panel is to go fullscreen on the wl_output that
-		// IS the panel. Match by comparing the output's logical position and
-		// current mode against the panel rect the runtime reported.
-		//
-		// This match only succeeds when the desktop scale is 1.0 — wl_output
-		// geometry is in LOGICAL coordinates while the panel rect the runtime
-		// reports is in device pixels, so any fractional/HiDPI scale makes the
-		// two incomparable and we fall back to letting the compositor choose.
+		/*
+		 * INV-1.3 substitute. A Wayland client cannot place itself, so the
+		 * only way to land on the 3D panel is to go fullscreen on the
+		 * wl_output that IS the panel.
+		 *
+		 * The match is made in DEVICE PIXELS (#1596). It used to compare
+		 * `wl_output.geometry`'s LOGICAL origin against the runtime's
+		 * device-pixel panel rect, which on a scaled desktop can never
+		 * succeed: on the measured box the DS1 sits at logical x=1728 and
+		 * device x=3456, so the comparison was 1728 == 3456 and the app
+		 * fullscreened on whatever output the compositor chose — the laptop.
+		 *
+		 * SIZE is the reliable half and needs no conversion at all: an
+		 * output's `wl_output.mode` is device pixels by protocol and the
+		 * runtime's `displayPixelWidth/Height` is device pixels by contract.
+		 * The converted ORIGIN is the corroborating half, and it is only
+		 * required as a TIE-BREAK, because a single size match is already
+		 * unambiguous and the two coordinate spaces can legitimately disagree
+		 * (an XWayland root scales the whole layout by one integer factor
+		 * while each output has its own). Same rule, and the same reason, as
+		 * the runtime's own `OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH`.
+		 */
 		struct wl_output *chosen = nullptr;
-		for (const auto &out : m_wl_outputs) {
-			if (desc.panel_width == 0 || desc.panel_height == 0) {
-				break;
+		if (desc.panel_width != 0 && desc.panel_height != 0) {
+			const WlOutput *size_match = nullptr;
+			const WlOutput *exact_match = nullptr;
+			size_t size_match_count = 0;
+			bool any_logical_size = false;
+
+			for (const auto &out : m_wl_outputs) {
+				// mode / logical_size, never the integer wl_output.scale.
+				// With no xdg_output the scale is unresolvable and only the
+				// size half of the match can run — still device-vs-device,
+				// still correct, just without the origin tie-break.
+				struct u_wl_monitor mon = {};
+				mon.logical_x = out.logical_x;
+				mon.logical_y = out.logical_y;
+				mon.logical_w = out.have_logical_size ? out.logical_w : 0;
+				mon.logical_h = out.have_logical_size ? out.logical_h : 0;
+				mon.mode_w = out.mode_w;
+				mon.mode_h = out.mode_h;
+				any_logical_size |= out.have_logical_size;
+
+				bool origin_agrees = false;
+				if (!u_wl_monitor_is_panel(&mon, desc.panel_left, desc.panel_top, desc.panel_width,
+				                           desc.panel_height, &origin_agrees)) {
+					continue;
+				}
+				size_match_count++;
+				if (size_match == nullptr) {
+					size_match = &out;
+				}
+				if (origin_agrees && exact_match == nullptr) {
+					exact_match = &out;
+				}
 			}
-			if (out.x == desc.panel_left && out.y == desc.panel_top &&
-			    out.width == (int32_t)desc.panel_width && out.height == (int32_t)desc.panel_height) {
-				chosen = out.output;
-				m_wl_refresh_mhz = out.refresh_mhz > 0 ? (uint32_t)out.refresh_mhz : 0;
+
+			const WlOutput *picked = exact_match != nullptr ? exact_match : nullptr;
+			if (picked == nullptr && size_match_count == 1) {
+				picked = size_match;
+			}
+
+			if (picked != nullptr) {
+				chosen = picked->output;
+				m_wl_refresh_mhz = picked->refresh_mhz > 0 ? (uint32_t)picked->refresh_mhz : 0;
 				// Device-pixel mode size — the buffer size that lands 1:1 on
 				// this output. See m_wl_fullscreen_mode_w in the header.
-				m_wl_fullscreen_mode_w = out.width;
-				m_wl_fullscreen_mode_h = out.height;
-				break;
+				m_wl_fullscreen_mode_w = picked->mode_w;
+				m_wl_fullscreen_mode_h = picked->mode_h;
+
+				if (exact_match != nullptr) {
+					DXRW_INFO("Wayland: fullscreen on the wl_output matching the 3D panel rect "
+					          "%ux%u+%d+%d in device pixels (logical origin %d,%d)",
+					          desc.panel_width, desc.panel_height, desc.panel_left,
+					          desc.panel_top, picked->logical_x, picked->logical_y);
+				} else {
+					DXRW_WARN("Wayland: one wl_output is the 3D panel's size (%ux%u device px) but "
+					          "its converted origin does not match the runtime's %d,%d — taking it "
+					          "anyway, since the size match is unambiguous. The two coordinate "
+					          "spaces disagreeing is expected when the runtime resolved the panel "
+					          "through XWayland's RandR view of the layout.",
+					          desc.panel_width, desc.panel_height, desc.panel_left, desc.panel_top);
+				}
+			} else if (size_match_count > 1) {
+				DXRW_WARN("Wayland: %zu wl_outputs are %ux%u device px and none has the runtime's "
+				          "origin %d,%d — cannot tell which is the 3D panel, so going fullscreen on "
+				          "the compositor's choice. INV-1.3 placement is not guaranteed.",
+				          size_match_count, desc.panel_width, desc.panel_height, desc.panel_left,
+				          desc.panel_top);
+			} else {
+				DXRW_WARN("Wayland: no wl_output is %ux%u device pixels (%zu output(s) seen%s) — "
+				          "going fullscreen on the compositor's choice. INV-1.3 placement is not "
+				          "guaranteed, and the runtime will refuse to weave into the resample that "
+				          "follows (#1595).",
+				          desc.panel_width, desc.panel_height, m_wl_outputs.size(),
+				          any_logical_size ? "" : ", none reporting a logical size — is "
+				                                  "zxdg_output_manager_v1 advertised?");
 			}
-		}
-		if (chosen != nullptr) {
-			DXRW_INFO("Wayland: fullscreen on the wl_output matching the 3D panel rect %dx%d+%d+%d",
-			          desc.panel_width, desc.panel_height, desc.panel_left, desc.panel_top);
-		} else {
-			DXRW_WARN("Wayland: no wl_output matches the reported panel rect %ux%u+%d+%d (%zu output(s) seen) "
-			          "— going fullscreen on the compositor's choice. INV-1.3 placement is not guaranteed; a "
-			          "desktop scale other than 100%% makes wl_output logical geometry incomparable with the "
-			          "runtime's pixel rect.",
-			          desc.panel_width, desc.panel_height, desc.panel_left, desc.panel_top, m_wl_outputs.size());
 		}
 		xdg_toplevel_set_fullscreen(m_wl_toplevel, chosen);
 	} else {
@@ -1206,7 +1369,10 @@ DxrLinuxWindow::create_wayland(const DxrLinuxWindowDesc &desc)
 		if (dw != desc.panel_width || dh != desc.panel_height) {
 			DXRW_WARN("Wayland: fullscreen buffer will be %ux%u but the 3D panel is %ux%u — no wl_output "
 			          "matched, so the declared size is the LOGICAL configure size and the compositor "
-			          "will resample it. The weave CANNOT be 1:1 in this session.",
+			          "will resample it. The weave CANNOT be 1:1 in this session; expect the runtime "
+			          "to present flat 2D rather than weave into the resample (look for its NOT_1TO1 "
+			          "line, #1595). This warning is advisory — the app cannot refuse on the "
+			          "runtime's behalf, and no longer has to.",
 			          dw, dh, desc.panel_width, desc.panel_height);
 		}
 	}
@@ -1238,11 +1404,19 @@ DxrLinuxWindow::destroy_wayland()
 		m_wl_seat = nullptr;
 	}
 	for (auto &out : m_wl_outputs) {
+		if (out.xdg_output != nullptr) {
+			zxdg_output_v1_destroy(out.xdg_output);
+			out.xdg_output = nullptr;
+		}
 		if (out.output != nullptr) {
 			wl_output_destroy(out.output);
 		}
 	}
 	m_wl_outputs.clear();
+	if (m_wl_xdg_output_manager != nullptr) {
+		zxdg_output_manager_v1_destroy(m_wl_xdg_output_manager);
+		m_wl_xdg_output_manager = nullptr;
+	}
 	if (m_wl_wm_base != nullptr) {
 		xdg_wm_base_destroy(m_wl_wm_base);
 		m_wl_wm_base = nullptr;
