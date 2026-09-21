@@ -144,6 +144,29 @@ struct comp_vk_native_renderer
 	struct comp_vk_deposit *deposit;
 };
 
+/*!
+ * Does this frame carry any XR_DXR_display_zones 3D zone layer?
+ *
+ * Both compose paths need the answer, for the same reason — a zones frame
+ * clears the atlas transparent so the unzoned area stays see-through
+ * (ADR-027) — so it is one function rather than two copies of the loop that
+ * can drift apart, which is exactly how the draw pass came to hardcode a
+ * transparent clear while the blit path asked a wider question.
+ */
+static bool
+layers_contain_zone_3d(const struct comp_layer_accum *layers)
+{
+	if (layers == NULL) {
+		return false;
+	}
+	for (uint32_t i = 0; i < layers->layer_count; i++) {
+		if (layers->layers[i].data.type == XRT_LAYER_ZONE_3D) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static void
 zone_draw_destroy_framebuffer(struct comp_vk_native_renderer *r)
 {
@@ -1124,7 +1147,25 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 		}
 	}
 
-	VkClearValue clear_value = {.color = {{0.0f, 0.0f, 0.0f, 0.0f}}};
+	/*
+	 * Clear alpha must follow the SAME rule as the blit path, not a
+	 * hardcoded 0.
+	 *
+	 * This was `{0,0,0,0}` unconditionally. That is right for a zones frame
+	 * — the unzoned area has to stay see-through so the feathered wish edge
+	 * blends toward the desktop — and it was safe only because zones frames
+	 * were the sole user of this pass. The blit path has always asked a
+	 * wider question (`transparent_background || zones_frame`), and as soon
+	 * as an ordinary opaque frame composes through here it would inherit a
+	 * fully transparent atlas: the display processor's alpha gate (#225)
+	 * would then lerp the desktop in across the whole window.
+	 *
+	 * Fixed ahead of the generalisation rather than inside it, so the two
+	 * changes cannot be confused for one another if this ever bisects.
+	 */
+	const bool zones_frame = layers_contain_zone_3d(layers);
+	const float clear_alpha = (r->transparent_background || zones_frame) ? 0.0f : 1.0f;
+	VkClearValue clear_value = {.color = {{0.0f, 0.0f, 0.0f, clear_alpha}}};
 	VkRenderPassBeginInfo rp_begin = {
 	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
 	    .renderPass = r->zone.render_pass,
@@ -1401,13 +1442,7 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	// XR_DXR_display_zones (ADR-027): a zones frame composes N placed zone
 	// layers into the window-spanning atlas — the unzoned area must stay
 	// transparent so the feathered wish edge blends toward the desktop.
-	bool zones_frame = false;
-	for (uint32_t i = 0; i < layers->layer_count; i++) {
-		if (layers->layers[i].data.type == XRT_LAYER_ZONE_3D) {
-			zones_frame = true;
-			break;
-		}
-	}
+	const bool zones_frame = layers_contain_zone_3d(layers);
 
 	// Zones frames take the draw-based pass so overlapping zones composite
 	// alpha-over in layer-list order; blits cannot blend. Falls back to the
