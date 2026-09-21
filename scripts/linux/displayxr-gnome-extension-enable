@@ -1,0 +1,106 @@
+#!/bin/sh
+# Enable the DisplayXR GNOME Shell extension (window-geometry@displayxr.org)
+# for the CURRENT user, once, without ever overriding the user's own choice.
+#
+#   displayxr-gnome-extension-enable            # login mode (the autostart entry)
+#   displayxr-gnome-extension-enable --install  # installer mode (install.sh)
+#
+# Why it exists. The extension publishes window geometry (windowed weaving on
+# Wayland) and capture exclusion (transparency on a 3D panel) — without it both
+# degrade silently. A package can install it machine-wide, but GNOME enables
+# extensions per user, in each user's `org.gnome.shell enabled-extensions`. A
+# dconf SYSTEM default for that key only reaches users who have never written
+# it, and anyone who has toggled any extension has — so it silently does
+# nothing for most real users. The runtime .deb therefore ships an
+# /etc/xdg/autostart entry that runs this script in each user's GNOME session.
+#
+# The rules, in order:
+#   1. Not GNOME, no gsettings, no org.gnome.shell schema  -> do nothing.
+#   2. The key is not writable (an administrator locked it) -> do nothing.
+#   3. Login mode, and this user was already handled once  -> do nothing.
+#      (A per-user stamp. Acting only once means that however the user later
+#      removes the extension from the list — GNOME's own Extensions app, a
+#      third-party manager, `gsettings reset` — we never put it back.)
+#   4. The UUID is in `disabled-extensions`                 -> do nothing, and
+#      stamp: that is GNOME's own record of "the user turned this off", and it
+#      takes precedence over `enabled-extensions` inside the shell anyway.
+#   5. `disable-user-extensions` is true (every extension off) -> do nothing and
+#      do NOT stamp, so the extension is enabled at a later login if the user
+#      turns extensions back on.
+#   6. Otherwise append the UUID to `enabled-extensions`, then stamp.
+#
+# It writes gsettings rather than calling `gnome-extensions enable`: the latter
+# asks the running shell over D-Bus, and a shell refuses to enable an extension
+# it did not see at startup — which is every extension installed during the
+# current session. The setting is honored by the next shell to start, and
+# immediately by a shell that already knows the extension.
+#
+# A new or updated extension still only LOADS when the user logs out and back
+# in: a Wayland session cannot restart GNOME Shell.
+
+UUID="window-geometry@displayxr.org"
+SCHEMA="org.gnome.shell"
+
+MODE="login"
+case "${1:-}" in
+"") ;;
+--install) MODE="install" ;;
+*) echo "usage: $0 [--install]" >&2; exit 2 ;;
+esac
+
+say() { [ "$MODE" = install ] && echo "    $*"; return 0; }
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/displayxr"
+STAMP="$STATE_DIR/gnome-extension-autoenabled"
+stamp() { mkdir -p "$STATE_DIR" 2>/dev/null && echo "$UUID" >"$STAMP" 2>/dev/null; return 0; }
+
+# Every later login ends here: one stat, no gsettings.
+[ "$MODE" = login ] && [ -f "$STAMP" ] && exit 0
+
+command -v gsettings >/dev/null 2>&1 || { say "(gsettings not found — not a GNOME desktop; skipped)"; exit 0; }
+gsettings list-keys "$SCHEMA" >/dev/null 2>&1 || { say "(no $SCHEMA schema — GNOME Shell not installed; skipped)"; exit 0; }
+
+if [ "$MODE" = login ]; then
+	case ":${XDG_CURRENT_DESKTOP:-}:" in
+	*:GNOME:* | *:GNOME-Classic:*) ;;
+	*) exit 0 ;;
+	esac
+fi
+
+[ "$(gsettings writable "$SCHEMA" enabled-extensions 2>/dev/null)" = "true" ] || {
+	say "(enabled-extensions is locked by an administrator — not changed)"
+	exit 0
+}
+
+# `gsettings get` prints a GVariant string array: @as [] or ['a', 'b'].
+has_uuid() { case "$1" in *"'$UUID'"*) return 0 ;; esac; return 1; }
+
+if has_uuid "$(gsettings get "$SCHEMA" disabled-extensions 2>/dev/null)"; then
+	say "(you disabled $UUID earlier — left disabled; re-enable with: gnome-extensions enable $UUID)"
+	stamp
+	exit 0
+fi
+
+if [ "$(gsettings get "$SCHEMA" disable-user-extensions 2>/dev/null)" = "true" ]; then
+	say "(all GNOME extensions are switched off for this user — not changed)"
+	exit 0
+fi
+
+ENABLED="$(gsettings get "$SCHEMA" enabled-extensions 2>/dev/null)" || exit 0
+if has_uuid "$ENABLED"; then
+	say "$UUID already enabled"
+	stamp
+	exit 0
+fi
+
+case "$ENABLED" in
+"@as []" | "[]" | "") NEW="['$UUID']" ;;
+*"]") NEW="${ENABLED%]}, '$UUID']" ;;
+*) say "(unexpected enabled-extensions value — not changed)"; exit 0 ;;
+esac
+
+if gsettings set "$SCHEMA" enabled-extensions "$NEW" 2>/dev/null; then
+	say "enabled $UUID for $(id -un 2>/dev/null || echo this user)"
+	stamp
+fi
+exit 0
