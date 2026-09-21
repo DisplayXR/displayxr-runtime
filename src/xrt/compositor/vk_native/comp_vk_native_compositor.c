@@ -6911,7 +6911,11 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 						const bool true_srgb =
 						    comp_vk_native_swapchain_is_true_srgb(layer->sc_array[0]);
 						if (!true_srgb &&
-						    u_tiling_can_zero_copy(vc, rxs, rys, rws, rhs_arr, sw, sh, mode)) {
+						    // #1628: VkViewport.y with a positive height counts
+						    // down — top-origin. (A negative-height viewport is an
+						    // app-side choice we do not use anywhere.)
+						    u_tiling_can_zero_copy(vc, rxs, rys, rws, rhs_arr, sw, sh, mode,
+						                           U_TILING_ORIGIN_TOP_LEFT)) {
 							zc_image_u64 = comp_vk_native_swapchain_get_image(layer->sc_array[0], img_idx);
 							zc_view_u64 = comp_vk_native_swapchain_get_image_view(layer->sc_array[0], img_idx);
 							if (zc_image_u64 != 0 && zc_view_u64 != 0) {

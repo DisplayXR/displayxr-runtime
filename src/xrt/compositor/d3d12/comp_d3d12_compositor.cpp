@@ -4766,7 +4766,9 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 						// split's (ADR-030's gate stays the sole eligibility
 						// test).
 						if (!c->split_active && !c->reroute.active &&
-						    u_tiling_can_zero_copy(vc, rxs, rys, rws, rhs_arr, sw, sh, mode)) {
+						    // #1628: D3D12_VIEWPORT::TopLeftY counts down — top-origin.
+						    u_tiling_can_zero_copy(vc, rxs, rys, rws, rhs_arr, sw, sh, mode,
+						                           U_TILING_ORIGIN_TOP_LEFT)) {
 							zc_resource = comp_d3d12_swapchain_get_resource(layer->sc_array[0], img_idx);
 							if (zc_resource != nullptr)
 								zero_copy = true;

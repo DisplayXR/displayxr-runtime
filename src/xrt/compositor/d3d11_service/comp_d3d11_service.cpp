@@ -20016,8 +20016,16 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 				if (active_mode == nullptr) {
 					zc_reason = "no_active_mode";
+					// #1628: behaviour-preserving. The client's atlas is a D3D11
+					// texture and this path has always read its offsets top-origin.
+					// A GL IPC client's content is bottom-up (comp_gl_client.c
+					// toggles data.flip_y for exactly that reason), so this site may
+					// need the same treatment — but that is #1639, which also owns
+					// the atlas_flip_y the zero-copy branch below never applies, and
+					// it needs a Windows box to confirm. Do not guess here.
 				} else if (!u_tiling_can_zero_copy(proj_view_count, rect_xs, rect_ys, rect_ws, rect_hs,
-				                                  view_descs[0].Width, view_descs[0].Height, active_mode)) {
+				                                  view_descs[0].Width, view_descs[0].Height, active_mode,
+				                                  U_TILING_ORIGIN_TOP_LEFT)) {
 					zc_reason = "tiling_mismatch";
 				} else {
 					// Texture matches atlas dims exactly — zero-copy is safe
