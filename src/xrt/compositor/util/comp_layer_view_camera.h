@@ -14,7 +14,9 @@
  *     eye visibility (@ref is_layer_view_visible_n), quad facing
  *     (@ref comp_layer_quad_is_front_facing, #1590), the src/dst blend rule
  *     (@ref comp_layer_blend_mode, #1599) and the painter's-order first-layer
- *     gate (@ref comp_layer_tile_blend_mode, #1598/#1600).
+ *     gate (@ref comp_layer_tile_blend_mode for a FULL-TILE layer,
+ *     @ref comp_layer_subrect_blend_mode for one that covers part of a tile,
+ *     #1598/#1600).
  *
  * Every one of them is a PREDICATE the renderer consults, never a pipeline
  * state it inherits — see comp_layer_quad_is_front_facing() for why facing in
@@ -336,7 +338,9 @@ enum comp_layer_blend_mode
 	/*!
 	 * THE BASE BLIT — blending off, the source written VERBATIM, alpha
 	 * included. Reached through @ref comp_layer_tile_blend_mode (the first
-	 * layer into a tile), never from a layer's flags.
+	 * FULL-TILE projection-class layer into a tile), never from a layer's
+	 * flags, and never by a SUB-RECT layer — a quad, cylinder, equirect or
+	 * zone goes through @ref comp_layer_subrect_blend_mode instead.
 	 *
 	 * Verbatim, not "alpha forced to one": the destination alpha the runtime
 	 * hands the display processor is load-bearing (#225 — the DP lerps the
@@ -518,7 +522,7 @@ comp_layer_tile_mark_composited(struct comp_layer_tile_state *tile)
 }
 
 /*!
- * The blend mode for the next layer into a tile, and mark the tile painted.
+ * The blend mode for the next FULL-TILE layer into a tile, and mark it painted.
  *
  * THE FIRST layer composited into a tile is a @ref COMP_LAYER_BLEND_REPLACE,
  * whatever its flags say, and only later layers blend per
@@ -537,24 +541,66 @@ comp_layer_tile_mark_composited(struct comp_layer_tile_state *tile)
  * `dst.a` to one where it draws, which is the whole reason the two modes are
  * distinct.
  *
- * KNOWN DEVIATIONS, both in the in-process D3D11 renderer and both deliberate:
- * its painter's-order loop covers the KHRONOS layer types only (Local2D /
- * window-space is a runtime-owned 2D channel drawn in a later pass with its
- * own blend rule), and a 3D-zone layer paints a sub-rect rather than a cover,
- * so it marks the tile composited but bypasses this gate and keeps its own
- * ADR-027 alpha-over rule.
+ * ONLY A FULL-TILE PROJECTION-CLASS LAYER MAY ASK THIS. A SUB-RECT layer — a
+ * quad, cylinder, equirect or 3D zone — takes @ref comp_layer_subrect_blend_mode
+ * and can never reach REPLACE. Two reasons, and the second bites even where the
+ * first would not:
  *
- * THE D3D11 SERVICE carries the same two, plus three of its own — it composes
- * a client's frame in TWO passes on different mechanisms, not one loop:
+ *  - A SUB-RECT LAYER CANNOT ESTABLISH A TILE'S ALPHA. REPLACE means "this blit
+ *    IS the tile", which is exactly what makes writing the source alpha
+ *    verbatim the right answer (#225). A layer covering PART of the tile writes
+ *    its alpha over that part and leaves the rest at whatever was there, so the
+ *    atlas alpha the display processor gates on is no longer any one layer's.
+ *  - "FIRST INTO THE TILE" IS ONLY MEANINGFUL OVER A TILE CLEARED THIS FRAME,
+ *    and one of the two callers does not clear. The D3D11 service's per-client
+ *    atlas is cleared only when the atlas/tile SIGNATURE changes, and in
+ *    workspace mode or on the always-on pipeline never at all (the
+ *    `atlas_clear_signature` block in comp_d3d11_service.cpp — deliberate: the
+ *    fence / keyed-mutex paths skip a view's blit and reuse the slot's previous
+ *    content, so a per-frame clear turns that reuse into a black tile). There
+ *    the tile holds LAST frame's pixels, "first" is a fiction, and a REPLACE
+ *    stamps a verbatim, possibly-zero texture alpha over live content — a
+ *    SOURCE_ALPHA quad stops alpha-blending altogether.
+ *
+ * The in-process D3D11 renderer has always worked this way (its quad draw takes
+ * @ref comp_layer_blend_mode directly and only MARKS the tile), and it is the
+ * same notion `u_color_compose_fast_path()`'s `base_is_projection` parameter
+ * already encodes: a sub-rect layer blends over the clear even when it is the
+ * only thing in the frame.
+ *
+ * KNOWN DEVIATIONS, all deliberate:
+ *
+ *  - THE IN-PROCESS D3D11 RENDERER's painter's-order loop covers the KHRONOS
+ *    layer types only. Local2D / window-space is a runtime-owned 2D channel
+ *    drawn in a later pass with its own blend rule.
+ *  - A 3D ZONE IS A SUB-RECT LAYER WITH ITS OWN MODE. It bypasses this gate
+ *    like every other sub-rect layer, but it does not take
+ *    @ref comp_layer_subrect_blend_mode either: ADR-027 makes it alpha-over in
+ *    list order, so an unflagged zone is PREMULTIPLIED rather than
+ *    @ref COMP_LAYER_BLEND_OPAQUE_COVER — its texture alpha must survive.
+ *  - A LAYER THAT PAINTED NOTHING CAN STILL HOLD THE BASE SLOT. The mark is
+ *    eager on purpose — "which layer is the base" stays a pure function of the
+ *    layer LIST, not of a transient swapchain hiccup — so a first projection
+ *    layer that times out on the cross-process keyed mutex in EVERY view
+ *    contributes no pixels and still consumes the REPLACE, and the layer behind
+ *    it blends over whatever the tile already held. Not fixed: the alternative
+ *    makes the base slot depend on GPU timing.
+ *
+ * THE D3D11 SERVICE carries those, plus three of its own — it composes a
+ * client's frame in TWO passes on different mechanisms, not one loop:
  *
  *  - PROJECTION-CLASS LAYERS ARE A SEPARATE, EARLIER PASS. That pass owns the
  *    cross-process keyed-mutex acquire, the zero-copy decision and the
  *    content-dims record, so it cannot simply be folded into the layer loop.
  *    It applies this gate among ITSELF (submission-ordered, first one in is
- *    the REPLACE), and the UI pass then seeds each tile COMPOSITED when the
- *    frame carried one. What is lost is the cross-pass order: a projection
- *    layer submitted AFTER a quad still composites BEFORE it, so it cannot
- *    cover it.
+ *    the REPLACE); the UI pass that follows needs nothing from it, because
+ *    every layer there is a sub-rect one and blends by its flags whatever ran
+ *    before. What is lost is the cross-pass ORDER: a projection layer submitted
+ *    AFTER a quad still composites BEFORE it, so it cannot cover it. THEORETICAL
+ *    for the shipping workspace controller — its chrome is a slot-registered
+ *    swapchain composited in `multi_compositor_render()`, never an
+ *    `XRT_LAYER_QUAD` in a client's own accum — so only an app that itself
+ *    submits a projection layer after a quad can observe it.
  *  - A LATER UNFLAGGED PROJECTION LAYER GETS NO ALPHA-OF-ONE. Its pass blits
  *    through a shader with no colour-scale/bias channel to fold
  *    @ref comp_layer_blend_fold_opaque_cover into, so OPAQUE_COVER degrades to
@@ -578,6 +624,33 @@ comp_layer_tile_blend_mode(struct comp_layer_tile_state *tile, uint32_t layer_fl
 	const bool first = comp_layer_is_first_in_tile(tile);
 	comp_layer_tile_mark_composited(tile);
 	return first ? COMP_LAYER_BLEND_REPLACE : comp_layer_blend_mode(layer_flags);
+}
+
+/*!
+ * The blend mode for a SUB-RECT layer — a quad, cylinder, equirect or 3D zone.
+ *
+ * Always @ref comp_layer_blend_mode, never @ref COMP_LAYER_BLEND_REPLACE, even
+ * when nothing has been composited into the tile yet: such a layer covers part
+ * of the tile, so it cannot be its base, and one of the two D3D11 callers does
+ * not clear the tile per frame anyway. The reasoning is at
+ * @ref comp_layer_tile_blend_mode; this exists so the rule is reachable by NAME
+ * and a sub-rect layer never has to be routed through the first-in-tile gate to
+ * get an answer.
+ *
+ * It still MARKS the tile, so a FULL-TILE layer composited after it blends over
+ * it rather than replacing it. @p tile may be NULL where the caller's pass is
+ * the last one to paint (nothing downstream reads the mark).
+ *
+ * @param tile        This view's tile state, or NULL — nothing to mark.
+ * @param layer_flags @ref xrt_layer_data::flags.
+ *
+ * @ingroup comp_util
+ */
+static inline enum comp_layer_blend_mode
+comp_layer_subrect_blend_mode(struct comp_layer_tile_state *tile, uint32_t layer_flags)
+{
+	comp_layer_tile_mark_composited(tile);
+	return comp_layer_blend_mode(layer_flags);
 }
 
 #ifdef __cplusplus

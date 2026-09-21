@@ -5657,11 +5657,20 @@ warn_once_projection_copy_cannot_blend(ID3D11BlendState *blend)
 }
 
 /*!
- * @param mode How this layer composites into the tile, already resolved by the
- *        caller through comp_layer_tile_blend_mode() so the painter's-order
- *        gate is applied exactly once per layer per view (#1598). Used both to
- *        bind the blend state and to fold OPAQUE_COVER's alpha-of-one into the
- *        constant buffer — the two halves of that mode, see set_blend_state().
+ * Draw one quad layer into this view's tile.
+ *
+ * ONE call site: the per-client UI pass in compositor_layer_commit(), over that
+ * client's own `layer_accum`. The workspace controller's chrome does NOT arrive
+ * this way — it is a slot-registered swapchain
+ * (comp_d3d11_service_workspace_register_chrome_swapchain_by_slot) blitted in
+ * multi_compositor_render(), never an XRT_LAYER_QUAD.
+ *
+ * @param mode How this layer composites into the tile, resolved by the caller
+ *        through comp_layer_subrect_blend_mode(): a quad covers PART of the
+ *        tile, so it is never the tile's base and never a REPLACE (#1598).
+ *        Used both to bind the blend state and to fold OPAQUE_COVER's
+ *        alpha-of-one into the constant buffer — the two halves of that mode,
+ *        see set_blend_state().
  */
 static void
 render_quad_layer(struct d3d11_service_system *sys,
@@ -19493,11 +19502,6 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			break;
 		}
 	}
-	// #1598: the UI-layer pass runs AFTER the projection blit loop and the
-	// zones composite, both of which paint the whole tile — so when the frame
-	// carries either, the tile is already composited when the first quad is
-	// reached and that quad blends rather than replacing.
-	const bool projection_class_frame = projection_layer_count > 0 || zones_frame;
 
 	// XR_DXR_display_zones tier-1 wish fallback (#549): zones clients never
 	// call xrRequestDisplayRenderingModeDXR — in-process the published zone
@@ -20754,27 +20758,26 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		}
 
 		/*
-		 * #1598 — painter's-order state, one per tile, for THIS frame.
+		 * #1598 — this pass carries NO painter's-order tile state, and
+		 * that is the rule, not an omission.
 		 *
-		 * Seeded COMPOSITED when the frame carried a projection-class
-		 * layer, because the projection blit loop and the zones
-		 * composite above have already painted every tile by the time
-		 * this pass runs. Without that seed the first quad of an
-		 * app-with-a-projection frame would resolve to REPLACE and
-		 * stamp its texture alpha over live content.
-		 *
-		 * A UI-ONLY frame starts unpainted, so its first layer is the
-		 * tile's base blit and writes alpha verbatim (#225) — the same
-		 * rule vk_native applies. (The per-client atlas is persistent
-		 * and is not cleared on such a frame, so what the base blit
-		 * lands on is last frame's pixels; that staleness predates
-		 * #1598 and is untouched here.)
+		 * Every layer here is a SUB-RECT one (quad, cylinder,
+		 * equirect2), so none of them can be a tile's base: they all
+		 * take comp_layer_subrect_blend_mode() and none can reach
+		 * REPLACE. It used to seed a per-view tile state COMPOSITED on
+		 * a projection-class frame so the first quad would blend — but
+		 * the seed only masked the UI-ONLY frame, where the first quad
+		 * still resolved REPLACE over a per-client atlas this path does
+		 * NOT clear per frame (see the atlas_clear_signature block
+		 * above: signature-change only, and never in workspace mode or
+		 * on the always-on pipeline). "First into the tile" is a
+		 * fiction there — the tile holds last frame's pixels — so the
+		 * REPLACE wrote a verbatim, possibly-zero texture alpha over
+		 * live content and a SOURCE_ALPHA quad stopped blending. The
+		 * in-process renderer never did this; now neither does this
+		 * path. Nothing downstream of this pass reads a mark, so there
+		 * is no state left to keep.
 		 */
-		struct comp_layer_tile_state ui_tiles[XRT_MAX_VIEWS] = {};
-		for (uint32_t view = 0; view < ui_view_count; view++) {
-			ui_tiles[view].composited = projection_class_frame;
-		}
-
 		for (uint32_t view_index = 0; view_index < ui_view_count; view_index++) {
 			// Set viewport for this view
 			D3D11_VIEWPORT viewport = {};
@@ -20811,9 +20814,11 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			 * index entirely: a quad submitted UNDER an equirect2
 			 * still landed on top of it. The accum is append-only
 			 * and nothing sorts it, so walking it once in index
-			 * order IS the spec's painter's algorithm; the blend
-			 * decision is the shared one, and the first layer into
-			 * a tile is a REPLACE whatever its flags say.
+			 * order IS the spec's painter's algorithm, and the
+			 * blend decision is the shared one — which for every
+			 * layer in THIS loop is its own flags, because they
+			 * are all SUB-RECT layers and none can be a tile's
+			 * base (comp_layer_subrect_blend_mode).
 			 *
 			 * Projection-class layers are NOT in this loop — they
 			 * are blitted (and, since #1598, blended) in the
@@ -20851,17 +20856,14 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				 * rasterizer culling: the pipeline is
 				 * CULL_NONE (see the shared helper).
 				 *
-				 * Tested here rather than inside the draw
-				 * because a culled quad must NOT mark the tile
-				 * composited — it painted nothing, so the next
-				 * layer is still the first one in.
+				 * Tested in the LOOP rather than inside the
+				 * draw so a culled quad costs nothing beyond
+				 * the dot product.
 				 */
 				if (type == XRT_LAYER_QUAD &&
 				    !comp_layer_quad_is_front_facing(&layer->data.quad.pose,
 				                                     &ui_cameras[view_index].pose.position)) {
-					// Say it ONCE per process. This path also
-					// composes an out-of-tree workspace
-					// controller's chrome quads, so "a panel
+					// Say it ONCE per process: "a panel
 					// element disappeared after the #1590
 					// leg landed" needs to be one grep away
 					// — without turning a per-frame,
@@ -20880,18 +20882,17 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				}
 
 				/*
-				 * Resolve AND mark in one call. The mark is
-				 * eager past this point: a layer that then
-				 * fails on a null swapchain or an out-of-range
-				 * image index still counts as having taken its
-				 * slot, which keeps "which layer is the base"
-				 * a pure function of the layer LIST rather
-				 * than of a transient swapchain hiccup — the
-				 * same rule the in-process projection loop
-				 * states.
+				 * A SUB-RECT layer, so its own flags decide —
+				 * never the first-in-tile REPLACE, which
+				 * belongs to a full-tile projection-class base
+				 * alone (see comp_layer_subrect_blend_mode).
+				 * This is what the in-process renderer's quad
+				 * draw has always done. NULL tile: this pass is
+				 * the last thing to paint the per-client atlas,
+				 * so nothing downstream reads the mark.
 				 */
 				const enum comp_layer_blend_mode mode =
-				    comp_layer_tile_blend_mode(&ui_tiles[view_index], layer->data.flags);
+				    comp_layer_subrect_blend_mode(nullptr, layer->data.flags);
 
 				switch (type) {
 				case XRT_LAYER_EQUIRECT2:
