@@ -40,6 +40,7 @@
 // SPIR-V shader headers (generated at build time by spirv_shaders())
 #include "shaders/zone_blit.vert.h"
 #include "shaders/zone_blit.frag.h"
+#include "shaders/zone_blit_array.frag.h"
 
 //! Upper bound on zone draws (and so descriptor sets) per frame:
 //! zones (OXR_DISPLAY_ZONES_MAX_ZONES_3D = 32) × views (XRT_MAX_VIEWS = 8).
@@ -117,6 +118,16 @@ struct comp_vk_native_renderer
 		VkSampler sampler;
 		VkPipeline pipeline_premult;
 		VkPipeline pipeline_unpremult;
+		/*!
+		 * LAYERED (arraySize > 1) twins of the two above, using
+		 * zone_blit_array.frag's `sampler2DArray`. Before these existed
+		 * a single layered source made zone_pass_usable() refuse the
+		 * WHOLE FRAME back to the blit path, which cannot blend — so an
+		 * engine submitting single-pass-instanced stereo (ADR-032) lost
+		 * alpha-over compositing entirely.
+		 */
+		VkPipeline pipeline_premult_array;
+		VkPipeline pipeline_unpremult_array;
 		VkDescriptorPool descriptor_pool;
 		bool ready;
 		bool failed; //!< init failed once — stay on the blit fallback
@@ -161,6 +172,14 @@ zone_draw_destroy(struct comp_vk_native_renderer *r)
 	if (r->zone.pipeline_unpremult != VK_NULL_HANDLE) {
 		vk->vkDestroyPipeline(vk->device, r->zone.pipeline_unpremult, NULL);
 		r->zone.pipeline_unpremult = VK_NULL_HANDLE;
+	}
+	if (r->zone.pipeline_premult_array != VK_NULL_HANDLE) {
+		vk->vkDestroyPipeline(vk->device, r->zone.pipeline_premult_array, NULL);
+		r->zone.pipeline_premult_array = VK_NULL_HANDLE;
+	}
+	if (r->zone.pipeline_unpremult_array != VK_NULL_HANDLE) {
+		vk->vkDestroyPipeline(vk->device, r->zone.pipeline_unpremult_array, NULL);
+		r->zone.pipeline_unpremult_array = VK_NULL_HANDLE;
 	}
 	if (r->zone.descriptor_pool != VK_NULL_HANDLE) {
 		vk->vkDestroyDescriptorPool(vk->device, r->zone.descriptor_pool, NULL);
@@ -695,10 +714,20 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
 		return false;
 	}
 
+	/*
+	 * 32 bytes, visible to BOTH stages: vec4 src_rect (vertex) + vec4 params
+	 * (fragment; x = array slice). The range was 16 bytes VERTEX-only, which
+	 * left the fragment stage with no per-draw channel at all — the array
+	 * variant needs one, and so will the per-layer colour flag. Well inside
+	 * the 128-byte guaranteed maxPushConstantsSize.
+	 *
+	 * Every shader in the bundle declares this block identically; Vulkan
+	 * requires one layout across the stages of a pipeline.
+	 */
 	VkPushConstantRange push_range = {
-	    .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+	    .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 	    .offset = 0,
-	    .size = 4 * sizeof(float), // normalized src rect
+	    .size = 8 * sizeof(float), // vec4 src_rect + vec4 params
 	};
 
 	VkPipelineLayoutCreateInfo pl_ci = {
@@ -758,6 +787,7 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
 
 	VkShaderModule vert = VK_NULL_HANDLE;
 	VkShaderModule frag = VK_NULL_HANDLE;
+	VkShaderModule frag_array = VK_NULL_HANDLE;
 	VkShaderModuleCreateInfo sm_ci = {
 	    .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
 	    .codeSize = sizeof(shaders_zone_blit_vert),
@@ -769,10 +799,18 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
 		sm_ci.pCode = shaders_zone_blit_frag;
 		res = vk->vkCreateShaderModule(vk->device, &sm_ci, NULL, &frag);
 	}
+	if (res == VK_SUCCESS) {
+		sm_ci.codeSize = sizeof(shaders_zone_blit_array_frag);
+		sm_ci.pCode = shaders_zone_blit_array_frag;
+		res = vk->vkCreateShaderModule(vk->device, &sm_ci, NULL, &frag_array);
+	}
 	if (res != VK_SUCCESS) {
 		U_LOG_E("VK zones: failed to create shader modules: %d", res);
 		if (vert != VK_NULL_HANDLE) {
 			vk->vkDestroyShaderModule(vk->device, vert, NULL);
+		}
+		if (frag != VK_NULL_HANDLE) {
+			vk->vkDestroyShaderModule(vk->device, frag, NULL);
 		}
 		zone_draw_destroy(r);
 		r->zone.failed = true;
@@ -780,10 +818,13 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
 	}
 
 	bool ok = zone_create_pipeline(r, vert, frag, false, &r->zone.pipeline_premult) &&
-	          zone_create_pipeline(r, vert, frag, true, &r->zone.pipeline_unpremult);
+	          zone_create_pipeline(r, vert, frag, true, &r->zone.pipeline_unpremult) &&
+	          zone_create_pipeline(r, vert, frag_array, false, &r->zone.pipeline_premult_array) &&
+	          zone_create_pipeline(r, vert, frag_array, true, &r->zone.pipeline_unpremult_array);
 
 	vk->vkDestroyShaderModule(vk->device, vert, NULL);
 	vk->vkDestroyShaderModule(vk->device, frag, NULL);
+	vk->vkDestroyShaderModule(vk->device, frag_array, NULL);
 
 	if (!ok) {
 		zone_draw_destroy(r);
@@ -793,7 +834,7 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
 
 	r->zone.failed = false;
 	r->zone.ready = true;
-	U_LOG_W("VK zones: alpha-over draw path ready (premult + unpremult pipelines)");
+	U_LOG_W("VK zones: alpha-over draw path ready (premult + unpremult, 2D + 2D_ARRAY pipelines)");
 	return true;
 }
 
@@ -969,16 +1010,13 @@ zone_pass_usable(struct comp_vk_native_renderer *r,
 			if (xsc == NULL) {
 				continue;
 			}
-			if (comp_vk_native_swapchain_get_array_size(xsc) != 1 ||
-			    layer->data.proj.v[eye].sub.array_index != 0) {
-				static bool layered_warned = false;
-				if (!layered_warned) {
-					layered_warned = true;
-					U_LOG_W("VK zones: layered zone swapchain — falling back to the "
-					        "blit path (overlap overwrites; one-time warning)");
-				}
-				return false;
-			}
+			// A LAYERED (arraySize > 1) source used to bail the whole
+			// frame to the blit path here, because zone_blit.frag is a
+			// `sampler2D` and the swapchain's view is a 2D_ARRAY. The
+			// bail cost every engine submitting single-pass-instanced
+			// stereo (ADR-032) its alpha-over compositing, frame-wide,
+			// for one layered layer. zone_blit_array.frag handles it
+			// now and the draw below picks the matching pipeline.
 			uint32_t sc_index = layer->data.proj.v[eye].sub.image_index;
 			if (comp_vk_native_swapchain_get_image_view(xsc, sc_index) == 0) {
 				return false;
@@ -1240,20 +1278,40 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 				continue;
 			}
 			const struct xrt_rect *sr = &layer->data.proj.v[eye].sub.rect;
-			float push[4] = {
+			// vec4 src_rect + vec4 params (params.x = array slice).
+			// Layout must match the block every shader in the bundle
+			// declares; the range is VERTEX | FRAGMENT.
+			float push[8] = {
 			    (float)sr->offset.w / (float)sc_w,
 			    (float)sr->offset.h / (float)sc_h,
 			    (float)sr->extent.w / (float)sc_w,
 			    (float)sr->extent.h / (float)sc_h,
+			    (float)layer->data.proj.v[eye].sub.array_index,
+			    0.0f,
+			    0.0f,
+			    0.0f,
 			};
 
-			vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-			                       unpremul ? r->zone.pipeline_unpremult : r->zone.pipeline_premult);
+			// The view the swapchain handed us is a 2D_ARRAY view iff
+			// the swapchain is layered, and a `sampler2D` cannot bind
+			// one — so the pipeline must match the SOURCE, not the
+			// layer's flags.
+			const bool layered = comp_vk_native_swapchain_get_array_size(xsc) > 1;
+			VkPipeline pipeline;
+			if (layered) {
+				pipeline = unpremul ? r->zone.pipeline_unpremult_array
+				                    : r->zone.pipeline_premult_array;
+			} else {
+				pipeline = unpremul ? r->zone.pipeline_unpremult : r->zone.pipeline_premult;
+			}
+
+			vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 			vk->vkCmdSetViewport(cmd, 0, 1, &vp);
 			vk->vkCmdSetScissor(cmd, 0, 1, &scissor);
 			vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
 			                             r->zone.pipeline_layout, 0, 1, &set, 0, NULL);
-			vk->vkCmdPushConstants(cmd, r->zone.pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+			vk->vkCmdPushConstants(cmd, r->zone.pipeline_layout,
+			                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
 			                        sizeof(push), push);
 			vk->vkCmdDraw(cmd, 3, 1, 0, 0);
 			draw_count++;

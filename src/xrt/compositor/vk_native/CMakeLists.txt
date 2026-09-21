@@ -15,6 +15,7 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 		SOURCES
 		shaders/zone_blit.vert
 		shaders/zone_blit.frag
+		shaders/zone_blit_array.frag
 		)
 
 	add_library(

@@ -8,8 +8,13 @@
 
 #version 450
 
+// Must stay byte-identical to the block in zone_blit.frag /
+// zone_blit_array.frag: Vulkan requires one push-constant layout across every
+// stage of a pipeline, and the range is declared VERTEX | FRAGMENT so the
+// fragment stage can read `params`.
 layout(push_constant) uniform ZoneParams {
 	vec4 src_rect; // x, y, w, h — normalized source-texture coordinates
+	vec4 params;   // x = array slice (fragment stage); yzw reserved
 } pc;
 
 layout(location = 0) out vec2 out_uv;
