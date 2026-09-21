@@ -5656,6 +5656,16 @@ oxr_session_get_display_refresh_rate(struct oxr_logger *log, struct oxr_session 
 		return oxr_session_success_result(sess);
 	}
 
+	// The in-process native compositors don't implement get; the system
+	// compositor already knows the panel rate, so report that rather than fail.
+	if (xc->get_display_refresh_rate == NULL) {
+		if (sess->sys->xsysc->info.refresh_rate_count >= 1) {
+			*displayRefreshRate = sess->sys->xsysc->info.refresh_rates_hz[0];
+			return XR_SUCCESS;
+		}
+		return oxr_error(log, XR_ERROR_FEATURE_UNSUPPORTED, "No display refresh rate available");
+	}
+
 	xrt_result_t xret = xrt_comp_get_display_refresh_rate(xc, displayRefreshRate);
 	OXR_CHECK_XRET(log, sess, xret, xrt_comp_get_display_refresh_rate);
 
@@ -5671,11 +5681,18 @@ oxr_session_request_display_refresh_rate(struct oxr_logger *log, struct oxr_sess
 		return oxr_session_success_result(sess);
 	}
 
-	// The system compositor may advertise XR_FB_display_refresh_rate (for
-	// enumerate / get) while the in-process native compositor that receives the
-	// request does not implement it. Report it unsupported rather than silently
-	// succeeding or crashing on the null pointer.
+	// The in-process native compositors don't implement the request, yet the
+	// null-based system compositor advertises the panel's current rate. A
+	// request for that rate is a request for the current state, so succeed;
+	// anything else is genuinely unsupported. (Two-decimal compare, matching
+	// oxr_xrRequestDisplayRefreshRateFB's list check.) The header helper is a
+	// backstop; this keeps a spec-following app that requests an enumerated rate
+	// from getting an error for a no-op.
 	if (xc->request_display_refresh_rate == NULL) {
+		if (sess->sys->xsysc->info.refresh_rate_count >= 1 &&
+		    (int)(displayRefreshRate * 100.0f) == (int)(sess->sys->xsysc->info.refresh_rates_hz[0] * 100.0f)) {
+			return XR_SUCCESS;
+		}
 		return oxr_error(log, XR_ERROR_FEATURE_UNSUPPORTED,
 		                 "Compositor does not support changing the display refresh rate");
 	}
