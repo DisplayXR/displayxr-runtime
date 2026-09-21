@@ -116,6 +116,11 @@ struct comp_layer_view_camera
  *         branch (c) supplied the placeholder. @p out is valid either way —
  *         a false return is a diagnostic, not "don't draw".
  *
+ * @warning NEVER gate the draw on the return value. @p out is usable on every
+ *          branch, so `if (!select(...)) continue;` turns a fallback frame into
+ *          a silently empty one. The only genuine failure is @p out == NULL,
+ *          which a caller passing a stack object cannot hit. (#1581.)
+ *
  * @ingroup comp_util
  */
 bool
@@ -141,6 +146,9 @@ comp_layer_view_camera_select(const struct comp_layer_accum *accum,
  * @param canvas_center Canvas centre in the head-relative layer space
  *                      (nullable → the origin, i.e. identical to
  *                      @ref comp_layer_view_camera_select).
+ *
+ * @warning The return value is a diagnostic, not a validity flag — see
+ *          @ref comp_layer_view_camera_select. Never gate the draw on it.
  *
  * @ingroup comp_util
  */
@@ -181,6 +189,11 @@ comp_layer_view_camera_select_ex(const struct comp_layer_accum *accum,
  *                          layer space (nullable / count 0 -> skip (b)).
  * @param active_view_count The active rendering mode's view count; 0 means
  *                          "same as @p eyes->count" (no collapse).
+ *
+ * @warning The return value is a diagnostic, not a validity flag — see
+ *          @ref comp_layer_view_camera_select. A NULL / empty eye set only
+ *          skips branch (b); @p out is still populated and must still be
+ *          drawn with. Never gate the draw on it.
  *
  * @ingroup comp_util
  */

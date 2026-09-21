@@ -38,7 +38,10 @@
 
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <initializer_list>
+#include <sstream>
+#include <string>
 
 namespace {
 
@@ -733,4 +736,70 @@ TEST_CASE("CTS quads set BLEND_TEXTURE_SOURCE_ALPHA, so straight alpha is the ex
 
 	CHECK((accum.layers[0].data.flags & XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT) != 0);
 	CHECK((accum.layers[0].data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) == 0);
+}
+
+/*
+ * #1581 follow-up: no backend may GATE its draw on the resolver's return.
+ *
+ * The "(c) fallback" case above already pins "a false return still yields a
+ * usable camera" — but that is the helper's own side of the deal, and the GL
+ * compositor shipped `if (!comp_layer_view_camera_select_eyes(...)) continue;`
+ * anyway, so a fallback frame silently drew no quads at all. The behaviour
+ * that would catch that directly — "a fallback frame still draws its quads" —
+ * lives in each backend's render pass and needs a live GL / Metal / D3D device
+ * plus swapchains, which this harness has none of. So the pin is structural
+ * instead: every call site in the tree must DISCARD the result.
+ *
+ * A gated call is recognised by anything other than whitespace or a `(void)`
+ * cast sitting between the start of the line and the call.
+ */
+static std::string
+read_whole_file(const std::string &path)
+{
+	std::ifstream f(path);
+	REQUIRE(f.good());
+	std::stringstream ss;
+	ss << f.rdbuf();
+	return ss.str();
+}
+
+TEST_CASE("comp_layer_view_camera: no backend gates its draw on the return value (#1581)")
+{
+	// Every native compositor that composes non-projection layers through the
+	// shared resolver, relative to the compositor source root.
+	const char *const backends[] = {
+	    "gl/comp_gl_compositor.cpp",
+	    "metal/comp_metal_compositor.m",
+	    "d3d11/comp_d3d11_renderer.cpp",
+	    "d3d11_service/comp_d3d11_service.cpp",
+	};
+
+	for (const char *rel : backends) {
+		const std::string path = std::string(DXR_COMP_SRC_DIR) + "/" + rel;
+		const std::string src = read_whole_file(path);
+
+		size_t pos = 0;
+		uint32_t calls = 0;
+		while ((pos = src.find("comp_layer_view_camera_select", pos)) != std::string::npos) {
+			const size_t nl = src.rfind('\n', pos);
+			const size_t bol = nl == std::string::npos ? 0 : nl + 1;
+			const std::string prefix = src.substr(bol, pos - bol);
+			pos += 1;
+
+			// Trim the indentation; a comment mention is not a call.
+			const size_t first = prefix.find_first_not_of(" \t");
+			const std::string lead = first == std::string::npos ? "" : prefix.substr(first);
+			if (lead.rfind("*", 0) == 0 || lead.rfind("//", 0) == 0) {
+				continue;
+			}
+			calls++;
+
+			INFO(rel << ": \"" << lead << "\" precedes the call — the return value is a "
+			         << "DIAGNOSTIC (see the @warning in comp_layer_view_camera.h); gating "
+			         << "the draw on it drops every layer on a fallback frame");
+			CHECK((lead.empty() || lead == "(void)"));
+		}
+		INFO(rel << " has no resolver call at all — did the file move?");
+		CHECK(calls > 0);
+	}
 }

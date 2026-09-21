@@ -4814,12 +4814,22 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 			// a quad also carries a projection layer (true of the whole CTS
 			// composition set), so branch (a) fires and (b) is unreachable
 			// from here. Wiring the GL canvas metrics is a follow-up.
-			struct comp_layer_view_camera cam;
-			if (!comp_layer_view_camera_select_eyes(&c->layer_accum, view,
-			                                        c->have_cached_eye_pos ? &c->cached_eye_pos : NULL,
-			                                        quad_view_count, NULL, 0.0f, 0.0f, &cam)) {
-				continue;
-			}
+			//
+			// The return value is a DIAGNOSTIC, not "don't draw" — see the
+			// @warning on all three entry points in
+			// comp_layer_view_camera.h: `cam` is ALWAYS fully populated when
+			// the out pointer is non-NULL, including on the legacy-placeholder
+			// branch (c), which returns false and logs once inside the helper.
+			// Gating the draw on it (as this call site did until #1581's
+			// follow-up) makes a fallback frame silently quad-less. `&cam` is
+			// a stack object, so the one genuine failure the helper has —
+			// out == NULL — cannot occur here; there is nothing left to guard.
+			// Matches comp_metal_compositor.m and both D3D11 sites, which all
+			// discard the result.
+			struct comp_layer_view_camera cam = {};
+			(void)comp_layer_view_camera_select_eyes(&c->layer_accum, view,
+			                                         c->have_cached_eye_pos ? &c->cached_eye_pos : NULL,
+			                                         quad_view_count, NULL, 0.0f, 0.0f, &cam);
 
 			struct xrt_matrix_4x4 view_mat, proj_mat;
 			math_matrix_4x4_view_from_pose(&cam.pose, &view_mat);
