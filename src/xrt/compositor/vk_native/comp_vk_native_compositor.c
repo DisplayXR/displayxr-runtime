@@ -584,6 +584,9 @@ struct comp_vk_native_compositor
 	bool warned_snap_no_lattice_point;
 	//! One-shot: window-scoped metrics took the runtime-resolved panel origin over the DP's (0,0).
 	bool warned_metrics_origin_override;
+	//! One-shot: the Wayland surface turned out to be on an output that is not
+	//! the 3D panel, so it has no panel-scoped metrics (#1596).
+	bool warned_wl_window_off_panel;
 #endif
 
 #ifdef XRT_OS_ANDROID
@@ -9541,15 +9544,51 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 	int32_t wlg_left = 0, wlg_top = 0;
 	bool have_wlg_rect = false;
 	if (have_wayland_geom) {
-		float wlg_scale = 1.0f;
-		have_wlg_rect = comp_vk_native_wl_geom_get_window_rect(c->wl_geom, &wlg_left, &wlg_top, &win_px_w,
-		                                                       &win_px_h, &wlg_scale);
+		/*
+		 * #1596. The provider hands back DEVICE pixels with the origin
+		 * RELATIVE to the window's own monitor — see
+		 * comp_vk_native_wl_geom.h for why an absolute Wayland device
+		 * origin is not a well-defined thing on a mixed-scale layout.
+		 *
+		 * Two consequences here:
+		 *
+		 * 1. The window is only ON this panel when its monitor's device
+		 *    size IS the panel's native size. That test is the one that
+		 *    would have caught the 2026-09-20 session: no wl_output matched
+		 *    the panel rect, the surface fullscreened on the 2880x1800
+		 *    laptop, and every metric below was computed as though it sat
+		 *    on the 3840x2160 panel. Refuse instead — display-scoped is the
+		 *    honest answer, and the weave itself is stopped separately by
+		 *    the 1:1 gate (#1595).
+		 * 2. Absolute coordinates are synthesised by adding the runtime's
+		 *    own resolved panel origin (already applied just above, per
+		 *    ADR-033). The Wayland arm therefore needs no equivalent of the
+		 *    X11 origin override: it never reads a plug-in origin at all,
+		 *    and `window_screen_* - display_screen_*` is exact by
+		 *    construction whatever space that origin is expressed in.
+		 */
+		struct comp_vk_native_wl_window_rect wr = {0};
+		have_wlg_rect = comp_vk_native_wl_geom_get_window_rect(c->wl_geom, &wr);
 		if (!have_wlg_rect) {
 			// Geometry service has no window for this process yet
 			// (extension absent / window unmapped) — no metrics, the
 			// caller stays display-scoped.
 			return false;
 		}
+		if (wr.monitor_width_px != disp_px_w || wr.monitor_height_px != disp_px_h) {
+			if (!c->warned_wl_window_off_panel) {
+				c->warned_wl_window_off_panel = true;
+				U_LOG_W("wl_geom: this surface is on a %ux%u px output, but the 3D panel is %ux%u "
+				        "— the window is not on the panel, so it has no panel-scoped metrics and "
+				        "no weave phase. Display-scoped. (#1596)",
+				        wr.monitor_width_px, wr.monitor_height_px, disp_px_w, disp_px_h);
+			}
+			return false;
+		}
+		wlg_left = wr.left_px;
+		wlg_top = wr.top_px;
+		win_px_w = wr.width_px;
+		win_px_h = wr.height_px;
 	} else
 #endif
 	    if (have_app_window) {
@@ -9583,10 +9622,11 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 	bool have_pos;
 #ifdef DXR_HAVE_WL_GEOM
 	if (have_wayland_geom) {
-		// Mutter global coordinates == X11 root coordinates at scale 1.0,
-		// so the display-origin subtraction below applies unchanged.
-		win_left = wlg_left;
-		win_top = wlg_top;
+		// Monitor-relative DEVICE px + the runtime's resolved panel origin =
+		// an absolute rect in the runtime's own space, so the subtraction
+		// below (and vk_update_present_origin's) is exact by construction.
+		win_left = disp_left + wlg_left;
+		win_top = disp_top + wlg_top;
 		have_pos = have_wlg_rect;
 	} else
 #endif
@@ -9943,10 +9983,22 @@ vk_update_present_origin(struct comp_vk_native_compositor *c)
 
 #ifdef XRT_OS_LINUX_DESKTOP
 	/*
-	 * Phase-unit honesty. The Wayland arm already refuses inside
-	 * comp_vk_native_wl_geom_get_window_rect() (#1557) — by the time we get
-	 * here a Wayland session's metrics are known-good, so only the X11 arm
-	 * needs the check.
+	 * Phase-unit honesty, one arm each.
+	 *
+	 * X11 has no conversion available: root coordinates are whatever the
+	 * server's root happens to be, and under XWayland at a non-unit scale that
+	 * is a fiction with no published factor to undo it. So the X11 arm still
+	 * REFUSES (vk_x11_present_origin_is_panel_native).
+	 *
+	 * Wayland used to refuse too, inside comp_vk_native_wl_geom_get_window_rect
+	 * (#1557), and that is what left this path with no present origin at all on
+	 * a scaled desktop (#1596). It no longer does: the payload carries the
+	 * monitor rect and Mutter's fractional scale, so the origin is CONVERTED to
+	 * device pixels at the provider boundary and arrives here already correct.
+	 * What survives of that refusal is the part that was really about pixels
+	 * rather than units — whether the buffer reaches glass unresampled — which
+	 * is a property of the BUFFER, not of the origin, and is enforced
+	 * separately (#1595).
 	 */
 #ifdef XRT_HAVE_WAYLAND
 	const bool origin_from_x11 = !c->use_wayland;

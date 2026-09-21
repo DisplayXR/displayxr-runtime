@@ -18,6 +18,7 @@
 #include "comp_vk_native_wl_geom.h"
 
 #include "util/u_logging.h"
+#include "util/u_wayland_geom.h"
 #include "util/u_json.h"
 #include "util/u_misc.h"
 #include "os/os_time.h"
@@ -51,13 +52,27 @@
 
 // One entry per published window we care about (own-PID filter is applied at
 // query time, not parse time, so the cache mirrors the full snapshot).
+//
+// EVERY geometry field here is LOGICAL — this is the wire payload, unconverted.
+// The `logical_` prefix is not decoration: the 2026-09-20 faults all came from
+// two coordinate spaces sharing one variable name, so the cache keeps the
+// payload's space in the name and the conversion happens at exactly one place
+// (@ref comp_vk_native_wl_geom_get_window_rect, which is the public boundary).
 struct wlg_window
 {
 	int32_t pid;
 	bool focus;
-	int32_t x, y;
-	int32_t w, h;
-	float scale;
+	//! Frame rect, LOGICAL px, in Mutter's global stage coordinates.
+	int32_t logical_x, logical_y;
+	int32_t logical_w, logical_h;
+	//! The monitor this window is on, LOGICAL px, same coordinates.
+	int32_t mon_logical_x, mon_logical_y;
+	int32_t mon_logical_w, mon_logical_h;
+	//! Mutter's FRACTIONAL monitor scale (Meta.Display.get_monitor_scale) —
+	//! 1.6667 on the measured box's laptop. Never an integer wl_output.scale.
+	float mon_scale;
+	//! False when Mutter published no `monitor` object (window on no monitor).
+	bool have_monitor;
 };
 
 #define WLG_MAX_WINDOWS 64
@@ -70,8 +85,9 @@ struct comp_vk_native_wl_geom
 	uint32_t window_count;
 	bool have_snapshot;      //!< at least one successfully parsed payload
 	bool warned_unavailable; //!< one-shot WARN guard (extension missing)
-	bool warned_scale;       //!< one-shot WARN guard (monitor scale != 1.0)
+	bool warned_scale;       //!< one-shot INFO guard (says which scale is being applied)
 	bool warned_schema;      //!< one-shot WARN guard (publisher schema too new)
+	bool warned_no_monitor;  //!< one-shot WARN guard (payload carried no monitor rect)
 	int64_t next_retry_ns;   //!< earliest monotonic time for the next blocking GetWindows retry
 };
 
@@ -138,22 +154,38 @@ wlg_parse_snapshot(struct comp_vk_native_wl_geom *g, const char *json)
 		}
 
 		struct wlg_window *out = &g->windows[count];
+		U_ZERO(out);
 		out->pid = (int32_t)pid;
-		out->x = (int32_t)cJSON_GetArrayItem(frame, 0)->valuedouble;
-		out->y = (int32_t)cJSON_GetArrayItem(frame, 1)->valuedouble;
-		out->w = (int32_t)cJSON_GetArrayItem(frame, 2)->valuedouble;
-		out->h = (int32_t)cJSON_GetArrayItem(frame, 3)->valuedouble;
+		out->logical_x = (int32_t)cJSON_GetArrayItem(frame, 0)->valuedouble;
+		out->logical_y = (int32_t)cJSON_GetArrayItem(frame, 1)->valuedouble;
+		out->logical_w = (int32_t)cJSON_GetArrayItem(frame, 2)->valuedouble;
+		out->logical_h = (int32_t)cJSON_GetArrayItem(frame, 3)->valuedouble;
 
 		bool focus = false;
 		u_json_get_bool(u_json_get(win, "focus"), &focus);
 		out->focus = focus;
 
-		out->scale = 1.0f;
+		// The monitor rect + scale are what make the logical payload
+		// convertible (#1596). Schema v1 has published them since #817; they
+		// were simply never read, which is why the provider could only refuse
+		// a scaled monitor instead of converting it.
+		out->mon_scale = 1.0f;
 		const cJSON *monitor = u_json_get(win, "monitor");
 		if (cJSON_IsObject(monitor)) {
+			int mx = 0, my = 0, mw = 0, mh = 0;
 			float scale = 1.0f;
+			if (u_json_get_int(u_json_get(monitor, "x"), &mx) &&
+			    u_json_get_int(u_json_get(monitor, "y"), &my) &&
+			    u_json_get_int(u_json_get(monitor, "w"), &mw) &&
+			    u_json_get_int(u_json_get(monitor, "h"), &mh) && mw > 0 && mh > 0) {
+				out->mon_logical_x = (int32_t)mx;
+				out->mon_logical_y = (int32_t)my;
+				out->mon_logical_w = (int32_t)mw;
+				out->mon_logical_h = (int32_t)mh;
+				out->have_monitor = true;
+			}
 			if (u_json_get_float(u_json_get(monitor, "scale"), &scale) && scale > 0.0f) {
-				out->scale = scale;
+				out->mon_scale = scale;
 			}
 		}
 
@@ -361,14 +393,9 @@ comp_vk_native_wl_geom_create(void)
 }
 
 bool
-comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g,
-                                       int32_t *out_left_px,
-                                       int32_t *out_top_px,
-                                       uint32_t *out_width_px,
-                                       uint32_t *out_height_px,
-                                       float *out_scale)
+comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g, struct comp_vk_native_wl_window_rect *out_rect)
 {
-	if (g == NULL || g->conn == NULL) {
+	if (g == NULL || g->conn == NULL || out_rect == NULL) {
 		return false;
 	}
 
@@ -395,11 +422,12 @@ comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g,
 	const struct wlg_window *best = NULL;
 	for (uint32_t i = 0; i < g->window_count; i++) {
 		const struct wlg_window *w = &g->windows[i];
-		if (w->pid != pid || w->w <= 0 || w->h <= 0) {
+		if (w->pid != pid || w->logical_w <= 0 || w->logical_h <= 0) {
 			continue;
 		}
 		if (best == NULL || (w->focus && !best->focus) ||
-		    (w->focus == best->focus && (int64_t)w->w * w->h > (int64_t)best->w * best->h)) {
+		    (w->focus == best->focus &&
+		     (int64_t)w->logical_w * w->logical_h > (int64_t)best->logical_w * best->logical_h)) {
 			best = w;
 		}
 	}
@@ -407,48 +435,74 @@ comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g,
 		return false;
 	}
 
-	// Fractional/integer desktop scaling makes this rect unusable, so refuse it
-	// rather than hand back a position we know is in the wrong units.
-	//
-	// Mutter reports LOGICAL pixels. At scale 1.0 those are physical desktop
-	// pixels; at any other scale they are not, so the weave phase derived from
-	// them is wrong by exactly that factor. Worse, the compositor also resamples
-	// the surface on its way to the panel, which destroys a 1-pixel-period
-	// interlace pattern outright — no phase correction can survive it.
-	//
-	// Returning the rect anyway produced windowed weaving at a KNOWN-wrong
-	// phase: visibly broken 3D. Display-scoped weaving is the honest outcome and
-	// is what the spec's degradation ladder already specifies — every failure
-	// path ends at pre-#817 behavior. This path was the one exception.
-	// See docs/specs/runtime/wayland-window-geometry.md §3.
-	if (best->scale != 1.0f) {
-		if (!g->warned_scale) {
-			U_LOG_W(
-			    "wl_geom: monitor scale %.2f != 1.0 — logical != physical pixels, so the "
-			    "window origin cannot anchor the weave phase (and the compositor resamples "
-			    "the surface anyway). Falling back to display-scoped weaving; set the 3D "
-			    "display to 100%% scale for windowed weaving.",
-			    (double)best->scale);
-			g->warned_scale = true;
+	/*
+	 * THE conversion (#1596). Everything above this line is logical;
+	 * everything the caller sees is device pixels.
+	 *
+	 * Until #1596 this is where the provider gave up instead: a rect from a
+	 * monitor at any scale other than 1.0 was REFUSED (#1557), on the grounds
+	 * that logical pixels cannot anchor a weave phase. True, and the wrong
+	 * remedy — the payload carries the monitor rect AND Mutter's fractional
+	 * scale, so the logical rect is convertible, and refusing it left the box
+	 * with no present origin at all. (The other half of that refusal — that
+	 * the compositor may resample the surface on its way to the panel, which
+	 * no phase correction survives — is real, but it is a property of the
+	 * BUFFER vs the destination, not of the origin's units. It is enforced
+	 * where it belongs, in the compositor's 1:1 gate, #1595.)
+	 *
+	 * The monitor rect is required, not optional: without it there is no
+	 * scale to apply and no way to tell whether this window is even on the 3D
+	 * panel, and a rect whose space we cannot name is exactly what produced a
+	 * silently wrong phase before.
+	 */
+	if (!best->have_monitor) {
+		if (!g->warned_no_monitor) {
+			g->warned_no_monitor = true;
+			U_LOG_W("wl_geom: the geometry payload carries no monitor rect for this window, so its "
+			        "logical coordinates cannot be converted to device pixels — display-scoped "
+			        "weaving. (Mutter omits `monitor` only for a window on no monitor.)");
 		}
 		return false;
 	}
 
-	if (out_left_px != NULL) {
-		*out_left_px = best->x;
+	const struct u_wl_monitor mon = {
+	    .logical_x = best->mon_logical_x,
+	    .logical_y = best->mon_logical_y,
+	    .logical_w = best->mon_logical_w,
+	    .logical_h = best->mon_logical_h,
+	    .scale = (double)best->mon_scale,
+	    .mode_w = 0, // Mutter publishes the fractional scale, not the mode.
+	    .mode_h = 0,
+	};
+
+	struct u_wl_rect_px win_px = {0, 0, 0, 0};
+	int32_t mon_w_px = 0, mon_h_px = 0;
+	if (!u_wl_window_rect_px_on_monitor(&mon, best->logical_x, best->logical_y, best->logical_w, best->logical_h,
+	                                    &win_px) ||
+	    !u_wl_monitor_size_px(&mon, &mon_w_px, &mon_h_px) || win_px.w <= 0 || win_px.h <= 0) {
+		return false;
 	}
-	if (out_top_px != NULL) {
-		*out_top_px = best->y;
+
+	if (!g->warned_scale) {
+		g->warned_scale = true;
+		// One INFO, at the first conversion: the line that lets an
+		// unattended run prove WHICH space reached the weaver. Not a WARN —
+		// a scaled desktop is now a supported configuration for the phase
+		// feed, not a degradation.
+		U_LOG_I("wl_geom: monitor scale %.4f — window logical %d,%d %dx%d on a %dx%d logical monitor "
+		        "converts to DEVICE %d,%d %dx%d on a %dx%d px monitor (#1596)",
+		        (double)best->mon_scale, best->logical_x, best->logical_y, best->logical_w, best->logical_h,
+		        best->mon_logical_w, best->mon_logical_h, win_px.x, win_px.y, win_px.w, win_px.h, mon_w_px,
+		        mon_h_px);
 	}
-	if (out_width_px != NULL) {
-		*out_width_px = (uint32_t)best->w;
-	}
-	if (out_height_px != NULL) {
-		*out_height_px = (uint32_t)best->h;
-	}
-	if (out_scale != NULL) {
-		*out_scale = best->scale;
-	}
+
+	out_rect->left_px = win_px.x;
+	out_rect->top_px = win_px.y;
+	out_rect->width_px = (uint32_t)win_px.w;
+	out_rect->height_px = (uint32_t)win_px.h;
+	out_rect->monitor_width_px = (uint32_t)mon_w_px;
+	out_rect->monitor_height_px = (uint32_t)mon_h_px;
+	out_rect->scale = best->mon_scale;
 	return true;
 }
 

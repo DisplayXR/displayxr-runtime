@@ -9,13 +9,25 @@
  * provider consumes the geometry the compositor publishes over the session
  * D-Bus — GNOME Shell extension `window-geometry@displayxr.org` (see
  * contrib/gnome-shell/), service `org.displayxr.WindowGeometry` — and hands
- * the runtime the same window rect X11 gets from xcb_translate_coordinates.
- * The rest of the chain (get_window_metrics → vk_update_present_origin →
- * DP set_present_origin) is source-agnostic and unchanged.
+ * the runtime a window rect in the same units X11 gets from
+ * xcb_translate_coordinates. The rest of the chain (get_window_metrics →
+ * vk_update_present_origin → DP set_present_origin) is source-agnostic and
+ * unchanged.
  *
- * Degradation: extension absent / bus unreachable / no matching window →
- * comp_vk_native_wl_geom_get_window_rect returns false and the compositor
- * stays display-scoped, exactly the pre-#817 Wayland behavior.
+ * ## This file is the logical → device boundary (#1596)
+ *
+ * The wire payload is LOGICAL (Mutter stage) pixels. Everything past this
+ * file's public API is DEVICE pixels, because that is the only space the
+ * weaver has — the vendor SDK guarantees the same thing from its side, so the
+ * conversion is ours to perform and it happens here, once. Prior to #1596 this
+ * file instead REFUSED any rect from a non-1.0 monitor (#1557), which is why a
+ * fractionally-scaled desktop produced no present origin at all rather than a
+ * converted one.
+ *
+ * Degradation: extension absent / bus unreachable / no matching window / the
+ * window is on no monitor → comp_vk_native_wl_geom_get_window_rect returns
+ * false and the compositor stays display-scoped, exactly the pre-#817 Wayland
+ * behavior.
  *
  * Only built when XRT_HAVE_WAYLAND && XRT_HAVE_DBUS.
  *
@@ -45,25 +57,47 @@ struct comp_vk_native_wl_geom *
 comp_vk_native_wl_geom_create(void);
 
 /*!
- * Current global rect of the calling process's window, in desktop pixels
- * (Mutter global coordinates — identical to X11 root coordinates at monitor
- * scale 1.0).
+ * The calling process's window, in DEVICE pixels, as this provider resolves it.
+ *
+ * Every length here is device pixels. The ORIGIN is deliberately relative to
+ * the window's own monitor rather than global: a mixed-scale Wayland layout has
+ * no single global device grid (two outputs at different scales cannot tile
+ * one), but a displacement inside one output is exact, and it is precisely what
+ * the weave phase needs. The caller adds the runtime's own resolved panel
+ * origin back on — see `comp_vk_native_compositor_get_window_metrics`.
+ */
+struct comp_vk_native_wl_window_rect
+{
+	//! Window top-left in DEVICE px, RELATIVE to its monitor's top-left.
+	int32_t left_px, top_px;
+	//! Window size in DEVICE px.
+	uint32_t width_px, height_px;
+	//! The monitor's own size in DEVICE px. The caller compares this against
+	//! the panel's native size to decide whether the window is on the 3D panel
+	//! at all — the check that would have caught the 2026-09-20 session, where
+	//! the surface fullscreened on the laptop and wove anyway.
+	uint32_t monitor_width_px, monitor_height_px;
+	//! The factor applied. 1.0 means the wire values were already device px.
+	float scale;
+};
+
+/*!
+ * Current rect of the calling process's window, converted to DEVICE pixels.
  *
  * Pumps pending D-Bus messages (non-blocking), then picks the best window
  * owned by this PID: focused first, else the largest. Uses the frame rect
  * (see #817 for the frame-vs-buffer-rect validation note).
  *
- * @param out_scale  Monitor scale under the window (1.0 when unknown).
- *                   Weaving requires 1.0; the caller decides how to react.
- * @return true when a matching window with a live rect was found.
+ * Requires the payload's `monitor` object: without it there is no scale and no
+ * monitor rect, so neither the conversion nor the on-the-panel check can be
+ * made, and this refuses rather than serving a rect whose space it cannot name.
+ * Mutter omits it only for a window on no monitor.
+ *
+ * @return true when a matching window with a live, convertible rect was found.
  */
 bool
 comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g,
-                                       int32_t *out_left_px,
-                                       int32_t *out_top_px,
-                                       uint32_t *out_width_px,
-                                       uint32_t *out_height_px,
-                                       float *out_scale);
+                                       struct comp_vk_native_wl_window_rect *out_rect);
 
 void
 comp_vk_native_wl_geom_destroy(struct comp_vk_native_wl_geom **g_ptr);
