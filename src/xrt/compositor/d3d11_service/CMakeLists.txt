@@ -27,6 +27,7 @@ add_custom_command(
 
 add_library(
 	comp_d3d11_service STATIC
+	../d3d_shared/comp_equirect2_shaders.h
 	comp_d3d11_service.cpp
 	comp_d3d11_service.h
 	d3d11_service_shaders.h
