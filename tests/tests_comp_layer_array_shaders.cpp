@@ -246,15 +246,21 @@ TEST_CASE("#1601 array_params sits where the C++ struct memcpy'd into the cbuffe
 	}
 }
 
-TEST_CASE("#1601 the layer constant buffer is sized for the LARGEST layer struct")
+TEST_CASE("#1601 equirect2 is still the largest layer struct (canary for the old hardcode)")
 {
 	// create_layer_resources sizes one shared cbuffer for all three service
 	// layer types. It used to hardcode sizeof(Equirect2LayerConstants) with
 	// the comment "Largest" -- true when written, enforced by nothing, and
-	// growing any other struct past it would have produced a buffer too small
-	// for the memcpy that follows. It now takes a max; this is the assertion
-	// that max is actually needed, i.e. that the property is about all three
-	// and not about equirect2 in particular.
+	// growing any OTHER struct past it would have produced a buffer too small
+	// for the memcpy that follows. It now takes a real max over the three.
+	//
+	// Note what this checks, which is NOT that the max is load-bearing today:
+	// it asserts equirect2 is still the biggest, i.e. that the old hardcode
+	// would ALSO still be correct. That makes it a canary, not a regression
+	// test -- it fires the day someone grows quad's or cylinder's constants
+	// past equirect2's, which is exactly the change that used to be silently
+	// wrong. Keep it for that; do not read a pass as evidence the max is
+	// doing any work right now.
 	const size_t largest = sizeof(Equirect2LayerConstants);
 	CHECK(sizeof(QuadLayerConstants) <= largest);
 	CHECK(sizeof(CylinderLayerConstants) <= largest);
