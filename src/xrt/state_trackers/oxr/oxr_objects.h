@@ -1030,8 +1030,45 @@ oxr_session_locate_views(struct oxr_logger *log,
                          XrView *views);
 
 /*!
- * #1580: this frame's per-view cameras for the compositor, in the head-relative
- * space every layer pose is expressed in.
+ * The ONE composition-layer frame conversion (#1594): re-express a pose given
+ * in some OpenXR space into the frame every native compositor consumes — the
+ * head device's TRACKING-ORIGIN ("root") space, which is also the frame
+ * `xrt_layer_projection_view_data::pose` arrives in.
+ *
+ * `handle_space()` in oxr_session_frame_end.c is a forwarder onto this, and so
+ * is the per-view camera loop in @ref oxr_session_frame_view_cameras — a
+ * frame's cameras and its layer poses therefore cannot land in different
+ * frames, by construction rather than by two transforms agreeing.
+ *
+ * VIEW is not special-cased: `xso->semantic.view` is a pose space on the head,
+ * so the generic @ref oxr_space_locate_device call inside yields
+ * `T_root_head ∘ view_space_offset ∘ spc->pose ∘ P` (#1607). Do NOT compose
+ * @ref oxr_space_ref_offset on top of the result — it is already applied as the
+ * locate's base offset (#1502), and a caller that applies it again re-introduces
+ * the head-pose error with the opposite sign.
+ *
+ * @param spc       The space @p pose_ptr is expressed in.
+ * @param pose_ptr  The pose, in that space. Orientation need not be normalised.
+ * @param timestamp The frame's predicted display time (XrTime).
+ * @param[out] out_pose The pose in the head xdev's tracking-origin frame;
+ *                      untouched on a false return.
+ * @return false when the head could not be located in @p spc (the layer, or the
+ *         camera, is dropped). A VIEW-space pose degrades to the pre-#1594
+ *         head-relative composition instead, behind a once-latched warning.
+ */
+bool
+oxr_session_layer_pose_in_compositor_frame(struct oxr_logger *log,
+                                           struct oxr_session *sess,
+                                           struct oxr_space *spc,
+                                           const struct xrt_pose *pose_ptr,
+                                           XrTime timestamp,
+                                           struct xrt_pose *out_pose);
+
+/*!
+ * #1580: this frame's per-view cameras for the compositor, in the ROOT frame
+ * every layer pose is expressed in (#1594 — see
+ * @ref oxr_session_layer_pose_in_compositor_frame, which each located view is
+ * run through here).
  *
  * A second CALLER of @ref oxr_session_locate_views, never a change to it — the
  * located view depends on session state (the chained / qwerty view rig, the

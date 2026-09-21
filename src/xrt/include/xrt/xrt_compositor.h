@@ -540,10 +540,12 @@ struct xrt_layer_data
 /*!
  * One view's camera for this frame (#1580): the `{pose, fov}` the runtime
  * reports at `xrLocateViews` for @ref xrt_layer_frame_data::display_time_ns,
- * expressed in the SAME head-relative space every layer pose in this frame is
- * expressed in (what `handle_space()` in the OpenXR state tracker outputs, i.e.
- * the space of `xrt_layer_quad_data::pose` and
- * `xrt_layer_projection_view_data::pose`).
+ * expressed in the SAME frame every layer pose in this frame is expressed in —
+ * the head device's TRACKING-ORIGIN ("root") space, which is what
+ * `handle_space()` in the OpenXR state tracker outputs for
+ * `xrt_layer_quad_data::pose` and `xrt_layer_projection_view_data::pose` alike
+ * (#1594/#1607; it used to be head-relative, and VIEW-space layers were the
+ * only thing that agreed with it).
  *
  * This exists because a compositor cannot re-derive it. The located view is a
  * function of session state the compositor does not have — the qwerty /
@@ -584,6 +586,28 @@ struct xrt_layer_frame_data
 	struct xrt_frame_view_camera cameras[XRT_MAX_VIEWS];
 	uint32_t camera_count;
 	bool cameras_valid;
+
+	/*!
+	 * #1594: the head device's pose in the ROOT (tracking-origin) frame at
+	 * @ref display_time_ns — i.e. `T_root_head`, the transform that lifts
+	 * anything expressed relative to the head into the frame every layer
+	 * pose in this frame lives in.
+	 *
+	 * Filled on EVERY frame (one device pose fetch), unlike @ref cameras,
+	 * because its consumer is the compositor's own eye-and-canvas camera
+	 * synthesis — `comp_layer_view_camera_select_eyes()` branch (b) — which
+	 * runs precisely on the frames that have NO cameras and no projection
+	 * layer. The display processor reports its eyes relative to the head
+	 * (the display plane), so branch (b) must compose this to end up in the
+	 * same frame as the quad it is about to project; without it a VIEW quad
+	 * would render right and a LOCAL quad wrong.
+	 *
+	 * @c head_pose_valid false means the state tracker could not locate the
+	 * head for this frame; the compositor then falls back to a head-relative
+	 * camera and says so, rather than pretending.
+	 */
+	struct xrt_pose head_pose;
+	bool head_pose_valid;
 };
 
 
