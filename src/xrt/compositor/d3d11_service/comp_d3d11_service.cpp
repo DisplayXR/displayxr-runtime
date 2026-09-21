@@ -1384,6 +1384,11 @@ struct d3d11_service_system
 	//! Quad layer shaders
 	wil::com_ptr<ID3D11VertexShader> quad_vs;
 	wil::com_ptr<ID3D11PixelShader> quad_ps;
+	//! #1601: Texture2DArray source variant of quad_ps. Bound by
+	//! render_quad_layer when the layer's swapchain is LAYERED (arraySize>1)
+	//! — samples the slice named by subImage.imageArrayIndex. Non-fatal if
+	//! compilation fails (layered quads then fall back to slice 0).
+	wil::com_ptr<ID3D11PixelShader> quad_ps_array;
 
 	//! Cylinder layer shaders
 	wil::com_ptr<ID3D11VertexShader> cylinder_vs;
@@ -5009,6 +5014,23 @@ create_layer_shaders(struct d3d11_service_system *sys)
 		return false;
 	}
 
+	// #1601: layered (array) quad pixel shader variant. Non-fatal, exactly
+	// like blit_ps_array below — losing it should cost a layered quad its
+	// slice selection, not the whole service. render_quad_layer reads a null
+	// here as "use quad_ps".
+	hr = compile_shader(quad_ps_array_hlsl, "PSMain", "ps_5_0", &blob);
+	if (FAILED(hr)) {
+		U_LOG_W("Array quad pixel shader unavailable — quads sample slice 0");
+	} else {
+		hr = sys->device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+		                                    sys->quad_ps_array.put());
+		blob->Release();
+		if (FAILED(hr)) {
+			U_LOG_W("Array quad pixel shader unavailable (0x%08lx) — quads sample slice 0", hr);
+			sys->quad_ps_array = nullptr;
+		}
+	}
+
 	// Cylinder vertex shader
 	hr = compile_shader(cylinder_vs_hlsl, "VSMain", "vs_5_0", &blob);
 	if (FAILED(hr)) {
@@ -5157,8 +5179,17 @@ create_layer_resources(struct d3d11_service_system *sys)
 {
 	HRESULT hr;
 
-	// Create constant buffer (largest of all layer constant structs)
-	size_t cb_size = sizeof(Equirect2LayerConstants);  // Largest
+	// Create constant buffer (largest of all layer constant structs).
+	//
+	// #1601: this used to read `sizeof(Equirect2LayerConstants) // Largest`,
+	// which was true when written and is not a property anything enforced —
+	// growing any OTHER layer's constants past equirect2's would have
+	// silently produced a too-small buffer and a Map that overruns it. Take
+	// the max over all three instead, so the invariant is computed rather
+	// than asserted in a comment.
+	size_t cb_size = sizeof(QuadLayerConstants);
+	cb_size = std::max(cb_size, sizeof(CylinderLayerConstants));
+	cb_size = std::max(cb_size, sizeof(Equirect2LayerConstants));
 	D3D11_BUFFER_DESC cb_desc = {};
 	cb_desc.ByteWidth = static_cast<UINT>((cb_size + 15) & ~15);  // 16-byte aligned
 	cb_desc.Usage = D3D11_USAGE_DYNAMIC;
@@ -5632,6 +5663,16 @@ render_quad_layer(struct d3d11_service_system *sys,
 	const enum comp_layer_blend_mode mode = comp_layer_blend_mode(data->flags);
 	comp_layer_blend_fold_opaque_cover(mode, constants.color_scale, constants.color_bias);
 
+	// #1601: honour the quad's subImage.imageArrayIndex. Gated on the
+	// SWAPCHAIN's array size, not on array_index != 0 — the SRV fetched above
+	// is a whole-array Texture2DArray view for every arraySize>1 swapchain,
+	// and it is the VIEW DIMENSION that has to match the shader, so even slice
+	// 0 of an array swapchain belongs on the array shader. Same condition GL
+	// and Metal already use; both were already correct.
+	const bool is_layered = sc->info.array_size > 1;
+	const bool use_array_ps = is_layered && sys->quad_ps_array;
+	constants.array_params[0] = use_array_ps ? static_cast<float>(q->sub.array_index) : 0.0f;
+
 	// Update constant buffer
 	D3D11_MAPPED_SUBRESOURCE mapped;
 	HRESULT hr = sys->context->Map(sys->layer_constant_buffer.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
@@ -5642,7 +5683,7 @@ render_quad_layer(struct d3d11_service_system *sys,
 
 	// Set shaders
 	sys->context->VSSetShader(sys->quad_vs.get(), nullptr, 0);
-	sys->context->PSSetShader(sys->quad_ps.get(), nullptr, 0);
+	sys->context->PSSetShader(use_array_ps ? sys->quad_ps_array.get() : sys->quad_ps.get(), nullptr, 0);
 
 	// Bind resources
 	ID3D11Buffer *cbs[] = {sys->layer_constant_buffer.get()};

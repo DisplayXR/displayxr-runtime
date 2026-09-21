@@ -16,6 +16,11 @@ struct QuadLayerConstants
 	float post_transform[4]; // xy = offset, zw = scale (UV)
 	float color_scale[4];    // RGBA multiplier
 	float color_bias[4];     // RGBA offset
+	// #1601: x = source array slice (subImage.imageArrayIndex) for LAYERED
+	// swapchains, read only by the Texture2DArray shader variants; yzw pad.
+	// Written unconditionally (the CB is mapped WRITE_DISCARD), which is
+	// harmless for the Texture2D variants — they do not declare it.
+	float array_params[4];
 };
 
 //! Constant buffer layout for cylinder layers
@@ -113,6 +118,43 @@ struct VS_OUTPUT
 float4 PSMain(VS_OUTPUT input) : SV_Target
 {
     float4 color = layer_tex.Sample(layer_samp, input.uv);
+    color = color * color_scale + color_bias;
+    return color;
+}
+)";
+
+//! #1601 — quad pixel shader variant for LAYERED (arraySize>1) swapchains.
+//! Same relationship to quad_ps_hlsl as blit_ps_array_hlsl has to
+//! blit_ps_hlsl, and for the same reason: the service creates a WHOLE-ARRAY
+//! Texture2DArray SRV whenever ArraySize > 1 (comp_d3d11_service.cpp:7384),
+//! so binding it to the Texture2D shader above is a view-dimension mismatch
+//! that reads slice 0 whatever subImage.imageArrayIndex asked for.
+//!
+//! Gated on the SWAPCHAIN's array size, never on array_index != 0 — the view
+//! dimension is what must match the shader, so slice 0 of an array swapchain
+//! belongs here too. Single-layer swapchains keep the Texture2D path.
+static const char *quad_ps_array_hlsl = R"(
+cbuffer LayerCB : register(b0)
+{
+    float4x4 mvp;
+    float4 post_transform;
+    float4 color_scale;
+    float4 color_bias;
+    float4 array_params;   // x = array slice
+};
+
+Texture2DArray layer_tex : register(t0);
+SamplerState layer_samp : register(s0);
+
+struct VS_OUTPUT
+{
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+};
+
+float4 PSMain(VS_OUTPUT input) : SV_Target
+{
+    float4 color = layer_tex.Sample(layer_samp, float3(input.uv, array_params.x));
     color = color * color_scale + color_bias;
     return color;
 }
