@@ -500,7 +500,12 @@ source comments and, until this section, in no document at all.
   `on_pause`/`on_resume` pair (the Leia DP only re-asserts the lens from inside
   a weave, #1039), and `vk_compute_effective_layout` collapsing the frame to
   tile 0. Grep a log for `NOT_1TO1:` — and for `NOT_1TO1 cleared:`, because the
-  degrade is reversible rather than sticky. **Three states, never two:**
+  degrade is reversible rather than sticky. The clear edge restores the
+  session's **own** last hardware choice, not 3D, and requests made during the
+  episode are held until it clears: under the Leia srSDK (LeiaSR #266) the
+  degrade's 2D request takes the lens preference from the weaver for good, so
+  that restore is the only thing that brings the lens back
+  ([lens-preference ownership](../specs/vendor/lens-preference-ownership.md)). **Three states, never two:**
   cannot-be-1:1 degrades, is-1:1 weaves, *don't know* keeps the current state —
   so a session without the `window-geometry@displayxr.org` service has no
   destination extent to compare against and behaves exactly as it did before
