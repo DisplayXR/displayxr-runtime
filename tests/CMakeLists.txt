@@ -84,6 +84,12 @@ if(WIN32 AND (XRT_HAVE_D3D11 OR XRT_HAVE_D3D12))
 	# comp_d3d12_outcomp both compile. D3DCompile/D3DReflect need no device.
 	list(APPEND tests tests_comp_masked_composite_shaders)
 endif()
+if(WIN32 AND XRT_HAVE_D3D11)
+	# #1601 — the layered (Texture2DArray) layer-shader variants that carry
+	# subImage.imageArrayIndex, in the in-process D3D11 renderer and in the
+	# D3D11 service. Reflection only; D3DCompile/D3DReflect need no device.
+	list(APPEND tests tests_comp_layer_array_shaders)
+endif()
 if(XRT_HAVE_VULKAN)
 	list(APPEND tests tests_comp_client_vulkan tests_uv_to_tangent)
 endif()
@@ -494,6 +500,15 @@ if(WIN32 AND (XRT_HAVE_D3D11 OR XRT_HAVE_D3D12))
 		tests_comp_masked_composite_shaders PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor
 		)
 	target_link_libraries(tests_comp_masked_composite_shaders PRIVATE d3dcompiler)
+endif()
+
+if(WIN32 AND XRT_HAVE_D3D11)
+	# #1601 — same setup: both shader sets are headers of embedded HLSL, so
+	# there is no compositor library to link, only the compiler/reflection.
+	target_include_directories(
+		tests_comp_layer_array_shaders PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor
+		)
+	target_link_libraries(tests_comp_layer_array_shaders PRIVATE d3dcompiler)
 endif()
 
 if(XRT_HAVE_D3D12)
