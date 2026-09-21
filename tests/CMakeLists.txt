@@ -41,6 +41,7 @@ set(tests
     tests_aux_mini_window_tell
     tests_aux_zone_canvas
     tests_aux_tiling_zero_copy
+    tests_aux_tiling_row_origin
     tests_aux_wayland_geom
     tests_comp_rear_budget
     tests_oxr_weave_latch
@@ -183,6 +184,11 @@ endif()
 # ADR-030/ADR-041 -- u_tiling_can_zero_copy(), the sole zero-copy gate. Header
 # arithmetic only; it reads xrt_rendering_mode, hence xrt-interfaces.
 target_link_libraries(tests_aux_tiling_zero_copy PRIVATE xrt-interfaces)
+
+# #1625 -- the atlas tile ROW ORIGIN: view 0 is the top-left tile as displayed,
+# on every backend. The GL-vs-everyone-else disagreement was two lines of
+# integer arithmetic, so it is pinned on the host rather than on five GPUs.
+target_link_libraries(tests_aux_tiling_row_origin PRIVATE xrt-interfaces)
 
 target_link_libraries(tests_cxx_wrappers PRIVATE xrt-interfaces)
 target_link_libraries(tests_history_buf PRIVATE aux_math)

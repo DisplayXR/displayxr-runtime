@@ -4773,12 +4773,15 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 			// by the effective grid (#542). Mono content (views == 1)
 			// gets one tile spanning the full content region; the DP
 			// weaves or flattens per its own mode_3d.
+			//
+			// #1625: view 0 is the TOP-left tile AS DISPLAYED on every
+			// backend. glViewport's Y origin is the BOTTOM, so the row
+			// index has to be flipped here — u_tiling_view_origin_gl()
+			// is that flip. Identity when eff_rows == 1.
 			uint32_t tbx, tby, tbw, tbh; // per-view tile box
 			{
-				uint32_t tile_x = eye % c->eff_cols;
-				uint32_t tile_y = eye / c->eff_cols;
-				tbx = tile_x * c->eff_tile_w;
-				tby = tile_y * c->eff_tile_h;
+				u_tiling_view_origin_gl(eye, c->eff_cols, c->eff_rows, c->eff_tile_w, c->eff_tile_h,
+					                &tbx, &tby);
 				tbw = c->eff_tile_w;
 				tbh = c->eff_tile_h;
 			}
@@ -4913,6 +4916,7 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 			quad_view_count = XRT_MAX_VIEWS;
 		}
 		const uint32_t quad_cols = c->eff_cols > 0 ? c->eff_cols : 1;
+		const uint32_t quad_rows = c->eff_rows > 0 ? c->eff_rows : 1;
 
 		if (any_quad) {
 			glDisable(GL_DEPTH_TEST);
@@ -4968,10 +4972,15 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 			// geometry can extend past the viewport rect and GL viewports do
 			// not clip. The spill would land in the NEIGHBOUR view's tile and
 			// the DP would weave it as ghosting in the wrong eye.
-			const uint32_t tile_x = view % quad_cols;
-			const uint32_t tile_y = view / quad_cols;
-			const GLint vx = (GLint)(tile_x * c->eff_tile_w);
-			const GLint vy = (GLint)(tile_y * c->eff_tile_h);
+			//
+			// #1625: the row index is flipped for GL's bottom-left
+			// framebuffer origin, exactly as in the projection pass —
+			// a quad must land in the same physical tile its view's
+			// projection did.
+			uint32_t tox = 0, toy = 0;
+			u_tiling_view_origin_gl(view, quad_cols, quad_rows, c->eff_tile_w, c->eff_tile_h, &tox, &toy);
+			const GLint vx = (GLint)tox;
+			const GLint vy = (GLint)toy;
 			glViewport(vx, vy, (GLsizei)c->eff_tile_w, (GLsizei)c->eff_tile_h);
 			glScissor(vx, vy, (GLsizei)c->eff_tile_w, (GLsizei)c->eff_tile_h);
 
@@ -5137,12 +5146,14 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 		// (#542), independent of the hardware weave-state.
 		uint32_t effective_views = c->eff_views > 0 ? c->eff_views : 1;
 		for (uint32_t eye = 0; eye < effective_views; eye++) {
-			// Set viewport for this eye in the effective grid
+			// Set viewport for this eye in the effective grid — same
+			// #1625 bottom-left-origin row flip as the projection and
+			// quad passes, so the HUD lands in its view's tile.
 			{
-				uint32_t tile_x = eye % c->eff_cols;
-				uint32_t tile_y = eye / c->eff_cols;
-				glViewport(tile_x * c->eff_tile_w, tile_y * c->eff_tile_h,
-				           c->eff_tile_w, c->eff_tile_h);
+				uint32_t wsx = 0, wsy = 0;
+				u_tiling_view_origin_gl(eye, c->eff_cols, c->eff_rows, c->eff_tile_w, c->eff_tile_h,
+					                &wsx, &wsy);
+				glViewport((GLint)wsx, (GLint)wsy, c->eff_tile_w, c->eff_tile_h);
 			}
 
 			// Per-view disparity, graded across the view sweep (#413):

@@ -48,6 +48,26 @@ DEBUG_GET_ONCE_NUM_OPTION(sim_display_interlace_period_gl, "SIM_DISPLAY_INTERLAC
  *
  */
 
+/*!
+ * #1625 -- the atlas row index, flipped for GL's bottom-left framebuffer origin.
+ *
+ * The contract (`docs/specs/runtime/multiview-tiling.md`,
+ * `xrt_display_processor_gl.h`) is that view `i` sits in the tile at row
+ * `i / tile_columns` counted DOWNWARD from the TOP of the atlas as displayed --
+ * view 0 is the top-left tile on every backend. GL addresses `v = 0` at the
+ * BOTTOM, so tile row `r` occupies `v` in `[1 - (r+1)/rows, 1 - r/rows]` and a
+ * GL shader must sample row `rows - 1 - r`.
+ *
+ * Paired with `u_tiling_view_origin_gl()` in comp_gl_compositor.cpp: the
+ * compositor writes the flipped row and this reads it back. Changing one
+ * without the other swaps the eyes on every `tile_rows > 1` mode. Identity when
+ * `u_tile_rows == 1`, which is every mode a shipped vendor plug-in publishes.
+ */
+#define GLSL_ATLAS_ROW_FN                                                                                              \
+	"float dxr_atlas_row(float view_index) {\n"                                                                    \
+	"    return u_tile_rows - 1.0 - floor(view_index / u_tile_cols);\n"                                            \
+	"}\n"
+
 static const char *VS_FULLSCREEN =
     "#version 330 core\n"
     "out vec2 v_uv;\n"
@@ -68,17 +88,18 @@ static const char *FS_SBS =
     "uniform float u_tile_cols_inv;\n"
     "uniform float u_tile_rows_inv;\n"
     "uniform float u_tile_cols;\n"
-    "uniform float u_tile_rows;\n"
+    "uniform float u_tile_rows;\n" GLSL_ATLAS_ROW_FN
     "void main() {\n"
     "    float x = v_uv.x;\n"
     "    float col_right = mod(1.0, u_tile_cols);\n"
-    "    float row_right = floor(1.0 / u_tile_cols);\n"
+    "    float row_left = dxr_atlas_row(0.0);\n"
+    "    float row_right = dxr_atlas_row(1.0);\n"
     "    float src_u;\n"
     "    float src_v;\n"
     "    if (x < 0.5) {\n"
     "        float eye_u = x / 0.5;\n"
     "        src_u = (0.25 + eye_u * 0.5) * u_tile_cols_inv;\n"
-    "        src_v = v_uv.y * u_tile_rows_inv;\n"
+    "        src_v = (v_uv.y + row_left) * u_tile_rows_inv;\n"
     "    } else {\n"
     "        float eye_u = (x - 0.5) / 0.5;\n"
     "        src_u = (0.25 + eye_u * 0.5 + col_right) * u_tile_cols_inv;\n"
@@ -96,11 +117,12 @@ static const char *FS_ANAGLYPH =
     "uniform float u_tile_cols_inv;\n"
     "uniform float u_tile_rows_inv;\n"
     "uniform float u_tile_cols;\n"
-    "uniform float u_tile_rows;\n"
+    "uniform float u_tile_rows;\n" GLSL_ATLAS_ROW_FN
     "void main() {\n"
-    "    vec2 uv_left = vec2(v_uv.x * u_tile_cols_inv, v_uv.y * u_tile_rows_inv);\n"
+    "    float row_left = dxr_atlas_row(0.0);\n"
+    "    vec2 uv_left = vec2(v_uv.x * u_tile_cols_inv, (v_uv.y + row_left) * u_tile_rows_inv);\n"
     "    float col = mod(1.0, u_tile_cols);\n"
-    "    float row = floor(1.0 / u_tile_cols);\n"
+    "    float row = dxr_atlas_row(1.0);\n"
     "    vec2 uv_right = vec2((v_uv.x + col) * u_tile_cols_inv, (v_uv.y + row) * u_tile_rows_inv);\n"
     "    vec4 left = texture(u_texture, uv_left);\n"
     "    vec4 right = texture(u_texture, uv_right);\n"
@@ -120,19 +142,26 @@ static const char *FS_SQUEEZED_SBS =
     "uniform float u_tile_cols_inv;\n"
     "uniform float u_tile_rows_inv;\n"
     "uniform float u_tile_cols;\n"
-    "uniform float u_tile_rows;\n"
+    "uniform float u_tile_rows;\n" GLSL_ATLAS_ROW_FN
     "void main() {\n"
     "    float x = v_uv.x;\n"
     "    float eye_index = (x < 0.5) ? 0.0 : 1.0;\n"
     "    float eye_u = (x < 0.5) ? (x / 0.5) : ((x - 0.5) / 0.5);\n"
     "    float col = mod(eye_index, u_tile_cols);\n"
-    "    float row = floor(eye_index / u_tile_cols);\n"
+    "    float row = dxr_atlas_row(eye_index);\n"
     "    float src_u = (eye_u + col) * u_tile_cols_inv;\n"
     "    float src_v = (v_uv.y + row) * u_tile_rows_inv;\n"
     "    fragColor = texture(u_texture, vec2(src_u, src_v));\n"
     "}\n";
 
-//! Quad: 2x2 grid — TL=view0, TR=view1, BL=view2, BR=view3.
+//! Quad: 2x2 grid. `v_uv.y` comes from the fullscreen triangle's NDC, so
+//! `v_uv.y < 0.5` is the BOTTOM half of the window on this GL path — the
+//! on-screen order is BL=view0, BR=view1, TL=view2, TR=view3, vertically
+//! mirrored from the VK/Metal quad shaders' TL=view0. That is this simulated
+//! display's own output arrangement and is unaffected by #1625: the ROW FLIP
+//! below keeps each quadrant fed from the same view it always was, now that
+//! the atlas itself is top-left-origin. Making the on-screen order match the
+//! other backends is a separate change.
 static const char *FS_QUAD =
     "#version 330 core\n"
     "in vec2 v_uv;\n"
@@ -141,7 +170,7 @@ static const char *FS_QUAD =
     "uniform float u_tile_cols_inv;\n"
     "uniform float u_tile_rows_inv;\n"
     "uniform float u_tile_cols;\n"
-    "uniform float u_tile_rows;\n"
+    "uniform float u_tile_rows;\n" GLSL_ATLAS_ROW_FN
     "void main() {\n"
     "    float col_idx = (v_uv.x < 0.5) ? 0.0 : 1.0;\n"
     "    float row_idx = (v_uv.y < 0.5) ? 0.0 : 1.0;\n"
@@ -149,7 +178,7 @@ static const char *FS_QUAD =
     "    float local_u = fract(v_uv.x * 2.0);\n"
     "    float local_v = fract(v_uv.y * 2.0);\n"
     "    float col = mod(view_index, u_tile_cols);\n"
-    "    float row = floor(view_index / u_tile_cols);\n"
+    "    float row = dxr_atlas_row(view_index);\n"
     "    float atlas_u = (local_u + col) * u_tile_cols_inv;\n"
     "    float atlas_v = (local_v + row) * u_tile_rows_inv;\n"
     "    fragColor = texture(u_texture, vec2(atlas_u, atlas_v));\n"
@@ -164,11 +193,12 @@ static const char *FS_BLEND =
     "uniform float u_tile_cols_inv;\n"
     "uniform float u_tile_rows_inv;\n"
     "uniform float u_tile_cols;\n"
-    "uniform float u_tile_rows;\n"
+    "uniform float u_tile_rows;\n" GLSL_ATLAS_ROW_FN
     "void main() {\n"
-    "    vec2 uv_left = vec2(v_uv.x * u_tile_cols_inv, v_uv.y * u_tile_rows_inv);\n"
+    "    float row_left = dxr_atlas_row(0.0);\n"
+    "    vec2 uv_left = vec2(v_uv.x * u_tile_cols_inv, (v_uv.y + row_left) * u_tile_rows_inv);\n"
     "    float col = mod(1.0, u_tile_cols);\n"
-    "    float row = floor(1.0 / u_tile_cols);\n"
+    "    float row = dxr_atlas_row(1.0);\n"
     "    vec2 uv_right = vec2((v_uv.x + col) * u_tile_cols_inv, (v_uv.y + row) * u_tile_rows_inv);\n"
     "    vec4 left = texture(u_texture, uv_left);\n"
     "    vec4 right = texture(u_texture, uv_right);\n"
@@ -183,9 +213,9 @@ static const char *FS_PASSTHROUGH =
     "uniform float u_tile_cols_inv;\n"
     "uniform float u_tile_rows_inv;\n"
     "uniform float u_tile_cols;\n"
-    "uniform float u_tile_rows;\n"
+    "uniform float u_tile_rows;\n" GLSL_ATLAS_ROW_FN
     "void main() {\n"
-    "    vec2 atlas_uv = vec2(v_uv.x * u_tile_cols_inv, v_uv.y * u_tile_rows_inv);\n"
+    "    vec2 atlas_uv = vec2(v_uv.x * u_tile_cols_inv, (v_uv.y + dxr_atlas_row(0.0)) * u_tile_rows_inv);\n"
     "    fragColor = texture(u_texture, atlas_uv);\n"
     "}\n";
 
@@ -207,13 +237,13 @@ static const char *FS_INTERLACED =
     "uniform float u_tile_cols;\n"
     "uniform float u_tile_rows;\n"
     "uniform float u_phase_px;\n"
-    "uniform float u_period_px;\n"
+    "uniform float u_period_px;\n" GLSL_ATLAS_ROW_FN
     "void main() {\n"
     "    float period = max(u_period_px, 1.0);\n"
     "    float panel_col = floor(gl_FragCoord.x) + u_phase_px;\n"
     "    float eye_index = mod(floor(panel_col / period), 2.0);\n"
     "    float col = mod(eye_index, u_tile_cols);\n"
-    "    float row = floor(eye_index / u_tile_cols);\n"
+    "    float row = dxr_atlas_row(eye_index);\n"
     "    vec2 uv = vec2((v_uv.x + col) * u_tile_cols_inv, (v_uv.y + row) * u_tile_rows_inv);\n"
     "    fragColor = texture(u_texture, uv);\n"
     "}\n";

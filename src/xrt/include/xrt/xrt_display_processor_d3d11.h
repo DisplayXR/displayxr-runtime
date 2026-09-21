@@ -85,6 +85,23 @@ struct xrt_display_processor_d3d11
 	 * The implementation will set the viewport and perform the display-
 	 * specific processing (interlacing, etc.).
 	 *
+	 * **Atlas tile order (#1625).** View `i` occupies the tile at column
+	 * `i % tile_columns`, row `i / tile_columns`, counting rows DOWNWARD from
+	 * the TOP edge of the atlas **as displayed** — view 0 is the top-left tile,
+	 * on every backend and every platform. X never needs this statement: no
+	 * graphics API flips X.
+	 *
+	 * This API addresses texel row 0 at the **top**, so the rule is literal
+	 * here: view `i`'s tile begins at texel row
+	 * `(i / tile_columns) * view_height`, and tile row `r` occupies
+	 * `v ∈ [r/tile_rows, (r+1)/tile_rows]`.
+	 *
+	 * OpenGL is the one API where "as displayed" needs translating — a GL
+	 * framebuffer's origin is the BOTTOM-left, so there `v = 0` is the bottom
+	 * and tile row `r` occupies `v ∈ [1 − (r+1)/tile_rows, 1 − r/tile_rows]`.
+	 * A DP ported between the two must flip the row index, not just the
+	 * sampler. Full contract: `docs/specs/runtime/multiview-tiling.md`.
+	 *
 	 * @param      xdp              Pointer to self.
 	 * @param      d3d11_context    D3D11 device context (ID3D11DeviceContext*).
 	 * @param      atlas_srv       Atlas texture SRV (ID3D11ShaderResourceView*).
