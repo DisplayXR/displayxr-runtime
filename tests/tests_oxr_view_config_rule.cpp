@@ -348,7 +348,7 @@ TEST_CASE("ADR-041: every type submits the located count, at every knob value", 
 		}
 	}
 
-	SECTION("MULTIVIEW under-submit dies at the default and lives only under the kill switch")
+	SECTION("MULTIVIEW under-submit in a 3D mode dies at the default and lives only under the kill switch")
 	{
 		// The contradiction ADR-041 removes: a 4-view session submitting 2
 		// because the panel happens to be in a stereo mode. Core OpenXR says
@@ -360,14 +360,85 @@ TEST_CASE("ADR-041: every type submits the located count, at every knob value", 
 		CHECK(oxr_projection_view_count_verdict(2, 4, true, 2, 0, true, kSimDisplayModes, kSimDisplayModeCount,
 		                                        OXR_UNDER_SUBMIT_LEGACY) == OXR_VIEW_COUNT_OK);
 
-		// One view is the same story.
-		CHECK(oxr_projection_view_count_verdict(1, 4, true, 1, 0, true, kSimDisplayModes, kSimDisplayModeCount,
+		// One view in a 3D (2-view) mode is the same story.
+		CHECK(oxr_projection_view_count_verdict(1, 4, true, 2, 0, true, kSimDisplayModes, kSimDisplayModeCount,
 		                                        OXR_UNDER_SUBMIT_COMPAT) == OXR_VIEW_COUNT_REJECT);
 		CHECK(oxr_projection_view_count_verdict(1, 4, true, 1, 0, true, kSimDisplayModes, kSimDisplayModeCount,
 		                                        OXR_UNDER_SUBMIT_LEGACY) == OXR_VIEW_COUNT_OK);
 	}
 
-	SECTION("the ONE compat arm: PRIMARY_STEREO + extension + 1-view mode, and it is marked")
+	SECTION("#1612: MULTIVIEW gets the SAME 1-view compat arm as STEREO, and nothing wider")
+	{
+		// Released demos began PRIMARY_MULTIVIEW_DXR and submit a single view
+		// in 2D mode. Refusing that at the default rejected every 2D frame and
+		// left the last 3D weave frozen on the panel. The default must accept
+		// it — marked, so it is logged once.
+		CHECK(oxr_projection_view_count_verdict(1, 4, true, 1, 0, true, kSimDisplayModes, kSimDisplayModeCount,
+		                                        OXR_UNDER_SUBMIT_COMPAT) == OXR_VIEW_COUNT_OK_DEPRECATED);
+		// Same on a stereo-only panel (R = 2 under MULTIVIEW).
+		CHECK(oxr_projection_view_count_verdict(1, 2, true, 1, 0, true, kStereoOnlyModes, kStereoOnlyModeCount,
+		                                        OXR_UNDER_SUBMIT_COMPAT) == OXR_VIEW_COUNT_OK_DEPRECATED);
+
+		// Strict drops it for MULTIVIEW exactly as it does for STEREO.
+		CHECK(oxr_projection_view_count_verdict(1, 4, true, 1, 0, true, kSimDisplayModes, kSimDisplayModeCount,
+		                                        OXR_UNDER_SUBMIT_STRICT) == OXR_VIEW_COUNT_REJECT);
+		CHECK(oxr_projection_view_count_verdict(1, 2, true, 1, 0, true, kStereoOnlyModes, kStereoOnlyModeCount,
+		                                        OXR_UNDER_SUBMIT_STRICT) == OXR_VIEW_COUNT_REJECT);
+
+		// Under-submit in a 3D mode is still refused at the default: one view
+		// in a 2-view mode, one view in the 4-view mode, and 2 of 4.
+		CHECK(oxr_projection_view_count_verdict(1, 4, true, 2, 2, true, kSimDisplayModes, kSimDisplayModeCount,
+		                                        OXR_UNDER_SUBMIT_COMPAT) == OXR_VIEW_COUNT_REJECT);
+		CHECK(oxr_projection_view_count_verdict(1, 4, true, 4, 4, true, kSimDisplayModes, kSimDisplayModeCount,
+		                                        OXR_UNDER_SUBMIT_COMPAT) == OXR_VIEW_COUNT_REJECT);
+		CHECK(oxr_projection_view_count_verdict(1, 2, true, 2, 0, true, kStereoOnlyModes, kStereoOnlyModeCount,
+		                                        OXR_UNDER_SUBMIT_COMPAT) == OXR_VIEW_COUNT_REJECT);
+		// A 1-view mode does NOT license any other under-submission: 2 or 3
+		// of 4 in 2D mode is refused.
+		CHECK(oxr_projection_view_count_verdict(2, 4, true, 1, 1, true, kSimDisplayModes, kSimDisplayModeCount,
+		                                        OXR_UNDER_SUBMIT_COMPAT) == OXR_VIEW_COUNT_REJECT);
+		CHECK(oxr_projection_view_count_verdict(3, 4, true, 1, 1, true, kSimDisplayModes, kSimDisplayModeCount,
+		                                        OXR_UNDER_SUBMIT_COMPAT) == OXR_VIEW_COUNT_REJECT);
+		// Zero views is never a submission.
+		CHECK(oxr_projection_view_count_verdict(0, 4, true, 1, 1, true, kSimDisplayModes, kSimDisplayModeCount,
+		                                        OXR_UNDER_SUBMIT_COMPAT) == OXR_VIEW_COUNT_REJECT);
+
+		// The #1528 mode-edge grace carries over, one frame wide, as for STEREO.
+		CHECK(oxr_projection_view_count_verdict(1, 4, true, /*active*/ 2, /*begun*/ 1, true, kSimDisplayModes,
+		                                        kSimDisplayModeCount,
+		                                        OXR_UNDER_SUBMIT_COMPAT) == OXR_VIEW_COUNT_OK_DEPRECATED);
+		CHECK(oxr_projection_view_count_verdict(1, 4, true, /*active*/ 2, /*begun*/ 1, true, kSimDisplayModes,
+		                                        kSimDisplayModeCount,
+		                                        OXR_UNDER_SUBMIT_STRICT) == OXR_VIEW_COUNT_REJECT);
+
+		// The arm keeps its extension gate (defensive: a MULTIVIEW session
+		// cannot exist without the extension, but the rule must not rely on it).
+		CHECK(oxr_projection_view_count_verdict(1, 4, true, 1, 1, false, kSimDisplayModes, kSimDisplayModeCount,
+		                                        OXR_UNDER_SUBMIT_COMPAT) == OXR_VIEW_COUNT_REJECT);
+
+		// Both types now answer identically for every compat-arm input.
+		for (uint32_t a : {1u, 2u, 4u}) {
+			for (uint32_t b : {0u, 1u, 2u, 4u}) {
+				for (bool ext : {false, true}) {
+					for (auto k : knobs) {
+						if (k == OXR_UNDER_SUBMIT_LEGACY) {
+							continue; // The legacy rules differ by design.
+						}
+						INFO("active = " << a << ", begun = " << b << ", ext = " << ext
+						                 << ", knob = " << (int)k);
+						CHECK(oxr_projection_view_count_verdict(1, 2, false, a, b, ext,
+						                                        kSimDisplayModes,
+						                                        kSimDisplayModeCount, k) ==
+						      oxr_projection_view_count_verdict(1, 4, true, a, b, ext,
+						                                        kSimDisplayModes,
+						                                        kSimDisplayModeCount, k));
+					}
+				}
+			}
+		}
+	}
+
+	SECTION("the ONE compat arm: extension + 1 view + 1-view mode, and it is marked (STEREO)")
 	{
 		// Released demos submit one view in 2D mode; the arm is what keeps
 		// them running, and OK_DEPRECATED is what gets that fact into the log
