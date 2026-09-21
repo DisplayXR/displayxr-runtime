@@ -1134,6 +1134,19 @@ TEST_CASE("comp_layer_blend_mode: no backend reimplements the blend rule (#1621)
 	    {"metal/comp_metal_compositor.m", 0},
 	    // The Local2D / window-space channel, above.
 	    {"d3d11/comp_d3d11_renderer.cpp", 1},
+	    /*
+	     * The service has TWO legal reads, neither of them the blend rule:
+	     *
+	     *  - the same Local2D / window-space channel, which on this path is
+	     *    composited in multi_compositor_render() rather than in the
+	     *    per-client pass;
+	     *  - the zones snapshot, which SYNTHESISES a flag value
+	     *    (`projection_flags_snapshot = ...SOURCE_ALPHA_BIT`) to feed the
+	     *    workspace tile blit, because a pure zones frame has no
+	     *    projection layer to take flags from. Constructing an INPUT to
+	     *    comp_layer_blend_mode() is not re-deriving its output.
+	     */
+	    {"d3d11_service/comp_d3d11_service.cpp", 2},
 	};
 
 	for (const auto &backend : backends) {
@@ -1411,5 +1424,111 @@ TEST_CASE("comp_layer_tile_blend_mode: the first layer into a tile REPLACES, wha
 		comp_layer_tile_mark_composited(&tile);
 		CHECK_FALSE(comp_layer_is_first_in_tile(&tile));
 		comp_layer_tile_mark_composited(nullptr); // must not crash
+	}
+}
+
+/*
+ * #1590 x #1598 — the two rules meet at "did this layer actually paint?".
+ *
+ * comp_layer_tile_blend_mode() resolves AND marks in one call, so a backend
+ * must apply every SKIP that is a normal outcome (per-eye visibility, a quad
+ * turned away) BEFORE it asks for the mode — otherwise a layer that drew
+ * nothing consumes the tile's base slot and the layer behind it silently
+ * blends over a clear instead of replacing it. This models that loop, in
+ * exactly the order the D3D11 service and vk_native walk it.
+ */
+TEST_CASE("a layer skipped before the gate leaves the tile untouched (#1590 x #1598)")
+{
+	const struct xrt_vec3 camera = {0.0f, 0.0f, 0.0f};
+	const struct xrt_pose facing = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, -1.0f}};
+	const struct xrt_pose turned_away = {{0.0f, 1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f}};
+
+	SECTION("a back-facing quad does not consume the base slot")
+	{
+		struct comp_layer_tile_state tile = {};
+
+		// Layer 0 is turned away: skipped, and the tile is untouched.
+		if (comp_layer_quad_is_front_facing(&turned_away, &camera)) {
+			(void)comp_layer_tile_blend_mode(&tile, 0);
+		}
+		CHECK(comp_layer_is_first_in_tile(&tile));
+
+		// Layer 1 faces the camera, so IT is the first one in.
+		REQUIRE(comp_layer_quad_is_front_facing(&facing, &camera));
+		CHECK(comp_layer_tile_blend_mode(&tile, 0) == COMP_LAYER_BLEND_REPLACE);
+	}
+
+	SECTION("the same pair of quads, per eye, can disagree")
+	{
+		// The quad sits at the origin edge-on to eye 0 and square-on to
+		// eye 1, so eye 1's tile gets a base layer and eye 0's does not.
+		// A single shared tile state would leak one eye's answer into
+		// the other; XRT_MAX_VIEWS of them is why the backends carry an
+		// array rather than a scalar.
+		const struct xrt_pose at_origin = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+		const struct xrt_vec3 eyes[2] = {{1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f}};
+		struct comp_layer_tile_state tiles[2] = {};
+
+		for (uint32_t view = 0; view < 2; view++) {
+			if (comp_layer_quad_is_front_facing(&at_origin, &eyes[view])) {
+				(void)comp_layer_tile_blend_mode(&tiles[view], 0);
+			}
+		}
+		CHECK(comp_layer_is_first_in_tile(&tiles[0]));       // edge-on -> skipped
+		CHECK_FALSE(comp_layer_is_first_in_tile(&tiles[1])); // drawn
+	}
+
+	SECTION("a tile seeded by an earlier pass makes the first quad blend")
+	{
+		/*
+		 * The D3D11 SERVICE composites its projection layers in an
+		 * earlier pass than its quads, so it seeds each view's tile
+		 * state COMPOSITED when the frame carried a projection-class
+		 * layer. Without that seed the first quad of an ordinary
+		 * app frame resolves to REPLACE and stamps its texture alpha
+		 * over live content — a hole in a transparent session.
+		 */
+		struct comp_layer_tile_state seeded = {};
+		seeded.composited = true; // a projection layer painted this tile
+		CHECK(comp_layer_tile_blend_mode(&seeded, 0) == COMP_LAYER_BLEND_OPAQUE_COVER);
+
+		// A UI-only frame has nothing under it, so its first quad is
+		// the base blit and keeps its alpha verbatim (#225).
+		struct comp_layer_tile_state unseeded = {};
+		CHECK(comp_layer_tile_blend_mode(&unseeded, 0) == COMP_LAYER_BLEND_REPLACE);
+	}
+}
+
+/*
+ * #1590 / #1598, structurally, for the two D3D11 paths.
+ *
+ * The behaviour needs a live device and swapchains, which this harness has
+ * none of — same reasoning as the two structural cases above. What is pinnable
+ * is that each path CONSULTS the shared rules rather than owning a private
+ * copy: the back-face predicate at its quad draw, and the painter's-order gate
+ * at its layer loop.
+ *
+ * Scoped to D3D11 in-process + service deliberately: GL and Metal draw quads
+ * but do not apply the facing predicate yet (their #1590 legs are still open),
+ * and a test that fails for a known-open leg is noise, not a guard.
+ */
+TEST_CASE("the D3D11 paths consult the shared facing and painter's rules (#1590, #1598)")
+{
+	const char *const backends[] = {
+	    "d3d11/comp_d3d11_renderer.cpp",
+	    "d3d11_service/comp_d3d11_service.cpp",
+	};
+
+	for (const char *rel : backends) {
+		const std::string path = std::string(DXR_COMP_SRC_DIR) + "/" + rel;
+		const std::string src = read_whole_file(path);
+
+		INFO(rel << " draws quads but never asks comp_layer_quad_is_front_facing() — the spec says "
+		         << "the back face MUST NOT be drawn, on every path (#1590)");
+		CHECK(src.find("comp_layer_quad_is_front_facing(") != std::string::npos);
+
+		INFO(rel << " never asks comp_layer_tile_blend_mode() — without the first-in-tile gate a "
+		         << "layer either erases the one beneath it or blends over a clear (#1598)");
+		CHECK(src.find("comp_layer_tile_blend_mode(") != std::string::npos);
 	}
 }
