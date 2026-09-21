@@ -182,7 +182,13 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
     } else {
         float2 distances = sphere_intersect(ray_origin, ray_dir, float3(0, 0, 0), radius);
 
+        // The ray misses the sphere: this fragment is not part of the layer at
+        // all. DISCARD, never "return transparent black" -- see the note at the
+        // foot of this shader. The return below is unreachable and is there
+        // only because HLSL requires every path of a value-returning function
+        // to end in one.
         if (distances.y < 0) {
+            discard;
             return float4(0, 0, 0, 0);
         }
 
@@ -219,6 +225,24 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
 #endif
         return color * color_scale + color_bias;
     } else {
+        // OUTSIDE the layer's angular extent. Same rule as the sphere miss
+        // above, and this is the one that bites in practice.
+        //
+        // An equirect2 layer paints only the sphere section it covers, so it is
+        // a SUB-RECT of the tile: it may mark the tile composited, but it can
+        // never be the tile's base. A layer with no
+        // BLEND_TEXTURE_SOURCE_ALPHA_BIT resolves to OPAQUE_COVER, whose blend
+        // state has blending DISABLED -- so a `return float4(0,0,0,0)` here is
+        // not a no-op, it OVERWRITES the destination with transparent black and
+        // erases whatever the tile already held, everywhere the section does
+        // not reach. On a narrow centralHorizontalAngle that is most of the
+        // tile: a sub-rect layer behaving as a full-tile base, which is exactly
+        // what the rule forbids.
+        //
+        // `discard` is correct in every mode, not just that one: under both
+        // blended modes a source of (0,0,0,0) was already a no-op, so nothing
+        // that composited before composites differently now.
+        discard;
         return float4(0, 0, 0, 0);
     }
 }
