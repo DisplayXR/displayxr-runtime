@@ -29,6 +29,7 @@ add_library(
 	u_builders.h
 	u_capture_dims.c
 	u_capture_dims.h
+	u_color_encoding.h
 	u_debug.c
 	u_debug.h
 	u_deque.cpp
