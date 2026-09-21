@@ -36,6 +36,8 @@ add_library(
 	oxr_input_transform.c
 	oxr_input_transform.h
 	oxr_instance.c
+	oxr_layer_space.c
+	oxr_layer_space.h
 	oxr_local_3d_zone.c
 	oxr_logger.c
 	oxr_logger.h

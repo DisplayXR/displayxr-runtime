@@ -26,6 +26,7 @@
 #include "math/m_space.h"
 
 #include "oxr_objects.h"
+#include "oxr_layer_space.h"
 #include "oxr_mcp_tools.h"
 #include "oxr_logger.h"
 #include "oxr_two_call.h"
@@ -1738,8 +1739,8 @@ verify_zones_frame(struct oxr_session *sess,
  * @param pose_ptr pose supplied with layer
  * @param inv_offset inverse of the tracking origin offset
  * @param timestamp timestamp for pose
- * @param[out] out_pose Resulting view-space pose
- * @return true if successfully transformed into a view space pose
+ * @param[out] out_pose Resulting pose in the head xdev's tracking-origin frame
+ * @return true if successfully transformed into that frame
  */
 static bool
 handle_space(struct oxr_logger *log,
@@ -1759,13 +1760,51 @@ handle_space(struct oxr_logger *log,
 	}
 
 	/*
-	 * poses in view space are already in the space the compositor expects
+	 * #1594: EVERY space, VIEW included, goes through the head device here.
+	 *
+	 * The compositor doesn't know about spaces: it consumes one frame, the
+	 * head xdev's TRACKING-ORIGIN ("root") space — the same frame
+	 * oxr_session_locate_views() does its view math in (#1370, see the long
+	 * comment above its base-space conversion in oxr_session.c). The upstream
+	 * comment this replaced said VIEW-space poses were "already in the space
+	 * the compositor expects"; that was true of Monado, where the compositor
+	 * renders head-relative, and stopped being true here the moment projection
+	 * view poses started resolving into the root frame. Composing only
+	 * oxr_space_ref_offset() left VIEW-space layers short by exactly the head
+	 * pose and dropped them out of the frustum.
+	 *
+	 * xso->semantic.view IS a pose space on the head, so the generic call
+	 * below resolves VIEW correctly, and oxr_space_locate_device() already
+	 * applies oxr_space_ref_offset() as the base offset (#1502) — applying it
+	 * again here would double the eye-centroid offset.
+	 */
+	struct xrt_device *head_xdev = GET_XDEV_BY_ROLE(sess->sys, head);
+	struct xrt_space_relation T_space_xdev = XRT_SPACE_RELATION_ZERO;
+
+	XrResult ret = oxr_space_locate_device(log, head_xdev, spc, timestamp, &T_space_xdev);
+	if (ret != XR_SUCCESS) {
+		return false;
+	}
+
+	if (oxr_layer_pose_in_xdev_frame(&T_space_xdev, &T_space_layer, out_pose)) {
+		return true;
+	}
+
+	/*
+	 * #1594: the head relation carries no pose. Every other space already
+	 * dropped the layer here, but VIEW never could, so degrade to the
+	 * pre-#1594 composition rather than making a HUD blink out on a tracking
+	 * hiccup. Once per process — never per frame (docs/reference/debug-logging.md).
 	 */
 	if (spc->space_type == OXR_SPACE_TYPE_REFERENCE_VIEW) {
-		// #1502: the compositor's "view space" is the HEAD device pose, but
-		// VIEW is now head o view_space_offset (the eye centroid). Compose the
-		// offset in, exactly as oxr_space_ref_offset does on a locate, so a
-		// VIEW-space layer stays where the app put it relative to its views.
+		static bool warned_view_no_head_relation = false;
+		if (!warned_view_no_head_relation) {
+			warned_view_no_head_relation = true;
+			U_LOG_W(
+			    "#1594: head device unlocatable in VIEW — composing VIEW-space layers "
+			    "head-relative (they will not register with projection content)");
+		}
+
 		struct xrt_pose T_head_space = XRT_POSE_IDENTITY;
 		oxr_space_ref_offset(spc, &T_head_space); // view_space_offset o spc->pose
 
@@ -1778,27 +1817,7 @@ handle_space(struct oxr_logger *log,
 		return true;
 	}
 
-	// The compositor doesn't know about spaces, so we want the space in the xdev's "space".
-	struct xrt_device *head_xdev = GET_XDEV_BY_ROLE(sess->sys, head);
-	struct xrt_space_relation T_space_xdev = XRT_SPACE_RELATION_ZERO;
-
-	XrResult ret = oxr_space_locate_device(log, head_xdev, spc, timestamp, &T_space_xdev);
-	if (ret != XR_SUCCESS) {
-		return false;
-	}
-	if (T_space_xdev.relation_flags == 0) {
-		return false;
-	}
-
-	struct xrt_space_relation T_xdev_layer;
-	struct xrt_relation_chain xrc = {0};
-	m_relation_chain_push_pose_if_not_identity(&xrc, &T_space_layer);
-	m_relation_chain_push_inverted_relation(&xrc, &T_space_xdev); // T_xdev_space
-	m_relation_chain_resolve(&xrc, &T_xdev_layer);
-
-	*out_pose = T_xdev_layer.pose;
-
-	return true;
+	return false;
 }
 
 static XrResult

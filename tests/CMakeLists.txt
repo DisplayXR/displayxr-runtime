@@ -42,6 +42,7 @@ set(tests
     tests_aux_tiling_zero_copy
     tests_comp_rear_budget
     tests_oxr_weave_latch
+    tests_oxr_layer_space
     tests_oxr_view_config_rule
     tests_oxr_legacy_mode_rule
     tests_oxr_mode_fillable_rule
@@ -121,6 +122,20 @@ endforeach()
 # For tests that require more than just aux_util, link those other libs down here.
 
 target_include_directories(tests_oxr_session_window_binding PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/state_trackers/oxr)
+
+# #1594 -- compiles oxr_layer_space.c straight into the unit and injects the
+# relations oxr_space_locate_device() would have returned, so the VIEW/LOCAL
+# coincidence is pinned with no session, no device and no GPU.
+target_sources(
+	tests_oxr_layer_space
+	PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr/oxr_layer_space.c
+	)
+target_include_directories(
+	tests_oxr_layer_space
+	PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
+		${PROJECT_SOURCE_DIR}/src/xrt/auxiliary
+	)
+target_link_libraries(tests_oxr_layer_space PRIVATE aux_math)
 
 if(TARGET tests_oxr_view_config_views_change)
 	# PROJECT_SOURCE_DIR, not CMAKE_SOURCE_DIR -- the vendor plug-in's signing
