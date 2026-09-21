@@ -271,3 +271,30 @@ TEST_CASE("#1601 equirect2 is still the largest layer struct (canary for the old
 	CHECK(sizeof(CylinderLayerConstants) % 16 == 0);
 	CHECK(sizeof(Equirect2LayerConstants) % 16 == 0);
 }
+
+TEST_CASE("#1602 the IN-PROCESS layer cbuffer cannot be sized from LayerConstants alone")
+{
+	// The in-process renderer maps ONE shared constant buffer for every layer
+	// draw, and before #1602 it sized that buffer `sizeof(LayerConstants)`.
+	// That was fine while quad and projection were the only draws and became a
+	// buffer overrun the moment equirect2 arrived, because each draw site
+	// memcpy's `sizeof(constants)` into a WRITE_DISCARD mapping — 160 bytes
+	// into 128, silently, on the very first equirect2 frame.
+	//
+	// This is the fact that makes a computed maximum load-bearing rather than
+	// decorative, so assert it directly: equirect2's constants ARE bigger. If
+	// this ever stops holding, the max in create_resources becomes a no-op and
+	// somebody should find out from a red test rather than by reasoning.
+	CHECK(sizeof(Equirect2LayerConstants) > sizeof(LayerConstants));
+
+	// Both are whole cbuffer registers, for the same reason as above.
+	CHECK(sizeof(LayerConstants) % 16 == 0);
+	CHECK(sizeof(Equirect2LayerConstants) % 16 == 0);
+
+	// And the source the in-process path compiles really is the one-source
+	// two-variants form, not a Texture2D-only copy that would quietly sample
+	// slice 0 for every layered equirect2. Checked on the TEXT rather than by
+	// comparing pointers: both headers resolve to the same shared definition,
+	// so a pointer check here would be true however wrong the content was.
+	CHECK(std::string(equirect2_ps_hlsl).find("DXR_LAYERED") != std::string::npos);
+}

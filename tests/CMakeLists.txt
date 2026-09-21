@@ -94,6 +94,10 @@ if(WIN32 AND XRT_HAVE_D3D11)
 	# index actually reach the sampler. WARP, so no GPU; SKIPs if no D3D11
 	# device exists at all.
 	list(APPEND tests tests_comp_layer_array_warp)
+	# #1602 — the equirect2 shader pair: does a screen ray land on the right
+	# part of the sphere, and does a layer stay inside its angular extent.
+	# WARP, same as above; SKIPs if no D3D11 device exists at all.
+	list(APPEND tests tests_comp_layer_equirect2_warp)
 endif()
 if(XRT_HAVE_VULKAN)
 	list(APPEND tests tests_comp_client_vulkan tests_uv_to_tangent)
@@ -534,6 +538,14 @@ if(WIN32 AND XRT_HAVE_D3D11)
 		tests_comp_layer_array_warp PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor
 		)
 	target_link_libraries(tests_comp_layer_array_warp PRIVATE d3dcompiler d3d11)
+
+	# #1602 — draws through d3d_shared/comp_equirect2_shaders.h, reached via
+	# the in-process d3d11/d3d11_layer_shaders.h. Still header-only HLSL, so
+	# again no compositor library to link.
+	target_include_directories(
+		tests_comp_layer_equirect2_warp PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor
+		)
+	target_link_libraries(tests_comp_layer_equirect2_warp PRIVATE d3dcompiler d3d11)
 endif()
 
 if(XRT_HAVE_D3D12)
