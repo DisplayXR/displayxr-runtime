@@ -16,6 +16,11 @@ struct QuadLayerConstants
 	float post_transform[4]; // xy = offset, zw = scale (UV)
 	float color_scale[4];    // RGBA multiplier
 	float color_bias[4];     // RGBA offset
+	// #1601: x = source array slice (subImage.imageArrayIndex) for LAYERED
+	// swapchains, read only by the Texture2DArray shader variants; yzw pad.
+	// Written unconditionally (the CB is mapped WRITE_DISCARD), which is
+	// harmless for the Texture2D variants — they do not declare it.
+	float array_params[4];
 };
 
 //! Constant buffer layout for cylinder layers
@@ -29,6 +34,7 @@ struct CylinderLayerConstants
 	float central_angle;     // Angular extent (radians)
 	float aspect_ratio;      // Height / arc_length
 	float padding;
+	float array_params[4]; // #1601: x = source array slice; yzw pad
 };
 
 //! Constant buffer layout for equirect2 layers
@@ -43,6 +49,7 @@ struct Equirect2LayerConstants
 	float central_horizontal_angle;   // Horizontal angle
 	float upper_vertical_angle;       // Upper vertical angle
 	float lower_vertical_angle;       // Lower vertical angle
+	float array_params[4];            // #1601: x = source array slice; yzw pad
 };
 
 //! Vertex shader for quad layers - positioned 3D quad
@@ -113,6 +120,43 @@ struct VS_OUTPUT
 float4 PSMain(VS_OUTPUT input) : SV_Target
 {
     float4 color = layer_tex.Sample(layer_samp, input.uv);
+    color = color * color_scale + color_bias;
+    return color;
+}
+)";
+
+//! #1601 — quad pixel shader variant for LAYERED (arraySize>1) swapchains.
+//! Same relationship to quad_ps_hlsl as blit_ps_array_hlsl has to
+//! blit_ps_hlsl, and for the same reason: the service creates a WHOLE-ARRAY
+//! Texture2DArray SRV whenever ArraySize > 1 (comp_d3d11_service.cpp:7384),
+//! so binding it to the Texture2D shader above is a view-dimension mismatch
+//! that reads slice 0 whatever subImage.imageArrayIndex asked for.
+//!
+//! Gated on the SWAPCHAIN's array size, never on array_index != 0 — the view
+//! dimension is what must match the shader, so slice 0 of an array swapchain
+//! belongs here too. Single-layer swapchains keep the Texture2D path.
+static const char *quad_ps_array_hlsl = R"(
+cbuffer LayerCB : register(b0)
+{
+    float4x4 mvp;
+    float4 post_transform;
+    float4 color_scale;
+    float4 color_bias;
+    float4 array_params;   // x = array slice
+};
+
+Texture2DArray layer_tex : register(t0);
+SamplerState layer_samp : register(s0);
+
+struct VS_OUTPUT
+{
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+};
+
+float4 PSMain(VS_OUTPUT input) : SV_Target
+{
+    float4 color = layer_tex.Sample(layer_samp, float3(input.uv, array_params.x));
     color = color * color_scale + color_bias;
     return color;
 }
@@ -234,6 +278,41 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
 }
 )";
 
+//! #1601 — cylinder pixel shader variant for LAYERED (arraySize>1) swapchains.
+//! A cylinder layer takes the same xrt_sub_image as a quad and reaches the
+//! same whole-array Texture2DArray SRV, so it had the same slice bug. Shares
+//! cylinder_vs_hlsl; only the sample changes.
+static const char *cylinder_ps_array_hlsl = R"(
+cbuffer LayerCB : register(b0)
+{
+    float4x4 mvp;
+    float4 post_transform;
+    float4 color_scale;
+    float4 color_bias;
+    float radius;
+    float central_angle;
+    float aspect_ratio;
+    float padding;
+    float4 array_params;   // x = array slice
+};
+
+Texture2DArray layer_tex : register(t0);
+SamplerState layer_samp : register(s0);
+
+struct VS_OUTPUT
+{
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+};
+
+float4 PSMain(VS_OUTPUT input) : SV_Target
+{
+    float4 color = layer_tex.Sample(layer_samp, float3(input.uv, array_params.x));
+    color = color * color_scale + color_bias;
+    return color;
+}
+)";
+
 //! Vertex shader for equirect2 layers - fullscreen with ray direction
 static const char *equirect2_vs_hlsl = R"(
 cbuffer LayerCB : register(b0)
@@ -302,7 +381,16 @@ VS_OUTPUT VSMain(uint vertex_id : SV_VertexID)
 }
 )";
 
-//! Pixel shader for equirect2 layers - spherical UV mapping
+//! Pixel shader for equirect2 layers - spherical UV mapping.
+//!
+//! #1601: compiled TWICE — once plain, once with DXR_LAYERED defined, which
+//! yields the Texture2DArray variant that samples subImage.imageArrayIndex.
+//! The two short layer shaders (quad, cylinder) each got a hand-written array
+//! twin, matching the blit_ps/blit_ps_array precedent in this file; this one
+//! does not, because a second copy of ~100 lines of ray-march math would drift
+//! from the original the first time either is touched. Same reason the variant
+//! is a #ifdef over the declaration and the sample rather than a #ifdef over
+//! the whole body.
 static const char *equirect2_ps_hlsl = R"(
 cbuffer LayerCB : register(b0)
 {
@@ -315,9 +403,14 @@ cbuffer LayerCB : register(b0)
     float central_horizontal_angle;
     float upper_vertical_angle;
     float lower_vertical_angle;
+    float4 array_params;   // x = array slice; read only under DXR_LAYERED
 };
 
+#ifdef DXR_LAYERED
+Texture2DArray layer_tex : register(t0);
+#else
 Texture2D layer_tex : register(t0);
+#endif
 SamplerState layer_samp : register(s0);
 
 struct VS_OUTPUT
@@ -387,7 +480,11 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
 
         float2 uv_sub = sample_point * post_transform.zw + post_transform.xy;
 
+#ifdef DXR_LAYERED
+        float4 color = layer_tex.Sample(layer_samp, float3(uv_sub, array_params.x));
+#else
         float4 color = layer_tex.Sample(layer_samp, uv_sub);
+#endif
         return color * color_scale + color_bias;
     } else {
         return float4(0, 0, 0, 0);

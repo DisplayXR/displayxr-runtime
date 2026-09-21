@@ -11,6 +11,8 @@
 #include "comp_d3d11_compositor.h"
 #include "comp_d3d11_compositor_internals.h"
 #include "comp_d3d11_swapchain.h"
+// The embedded HLSL and the constant-buffer structs that must match it.
+#include "d3d11_layer_shaders.h"
 
 #include "util/comp_layer_accum.h"
 // #1580: the ONE per-view camera every layer type is projected through.
@@ -26,29 +28,6 @@
 
 #include <algorithm>
 #include <cstring>
-
-/*!
- * Shader constant buffer layout.
- */
-struct LayerConstants
-{
-	float mvp[16];          // Model-view-projection matrix
-	float post_transform[4]; // xy = offset, zw = scale
-	float color_scale[4];    // Color multiplier
-	float color_bias[4];     // Color offset
-	float array_params[4];   // x = array slice (imageArrayIndex) for layered swapchains; yzw pad
-};
-
-/*!
- * Local2D flatten constant buffer (#439 Phase 3). One float4: the source
- * sub-rect in normalized [0,1] swapchain-image coords. The viewport's uv [0,1]
- * maps through it as `src_uv = xy + uv*zw`. The caller bakes the dest-clip
- * fractions, the layer's norm_rect, and flip_y (negative zw.y) into it.
- */
-struct FlattenParams
-{
-	float src_rect[4]; // xy = src origin (norm), zw = src size (norm; zw.y < 0 ⇒ flip_y)
-};
 
 /*!
  * D3D11 renderer structure.
@@ -88,6 +67,12 @@ struct comp_d3d11_renderer
 
 	//! Pixel shader for quad layers.
 	ID3D11PixelShader *quad_ps;
+
+	//! #1601: pixel shader for quad layers from LAYERED (array) swapchains
+	//! (Texture2DArray; selects the layer's imageArrayIndex slice). May be
+	//! null if it failed to compile — the draw site then falls back to
+	//! @ref quad_ps, i.e. degrades to slice 0 rather than not drawing.
+	ID3D11PixelShader *quad_ps_array;
 
 	//! Local2D flatten shaders (#439 Phase 3): draw one app Local2D layer
 	//! image into the runtime 2D scratch at a per-draw viewport.
@@ -158,248 +143,6 @@ get_internals(struct comp_d3d11_compositor *c)
 {
 	return comp_d3d11_compositor_get_internals(c);
 }
-
-// Embedded HLSL shader source
-static const char *projection_vs_source = R"(
-cbuffer LayerCB : register(b0)
-{
-    float4x4 mvp;
-    float4 post_transform;
-    float4 color_scale;
-    float4 color_bias;
-};
-
-struct VS_OUTPUT
-{
-    float4 position : SV_Position;
-    float2 uv : TEXCOORD0;
-};
-
-static const float2 quad_positions[4] = {
-    float2(-1.0, -1.0),
-    float2(-1.0,  1.0),
-    float2( 1.0, -1.0),
-    float2( 1.0,  1.0),
-};
-
-static const float2 quad_uvs[4] = {
-    float2(0.0, 1.0),
-    float2(0.0, 0.0),
-    float2(1.0, 1.0),
-    float2(1.0, 0.0),
-};
-
-VS_OUTPUT VSMain(uint vertex_id : SV_VertexID)
-{
-    VS_OUTPUT output;
-    float2 pos = quad_positions[vertex_id];
-    float2 uv = quad_uvs[vertex_id];
-    output.position = mul(mvp, float4(pos, 0.0, 1.0));
-    output.uv = uv * post_transform.zw + post_transform.xy;
-    return output;
-}
-)";
-
-static const char *projection_ps_source = R"(
-cbuffer LayerCB : register(b0)
-{
-    float4x4 mvp;
-    float4 post_transform;
-    float4 color_scale;
-    float4 color_bias;
-};
-
-Texture2D layer_tex : register(t0);
-SamplerState layer_samp : register(s0);
-
-struct VS_OUTPUT
-{
-    float4 position : SV_Position;
-    float2 uv : TEXCOORD0;
-};
-
-float4 PSMain(VS_OUTPUT input) : SV_Target
-{
-    float4 color = layer_tex.Sample(layer_samp, input.uv);
-    color = color * color_scale + color_bias;
-    return color;
-}
-)";
-
-// Projection pixel shader variant for LAYERED (array) swapchains. Under
-// single-pass-instanced the app submits ONE swapchain with arraySize=2 and two
-// projection views referencing subImage.imageArrayIndex 0 (left) / 1 (right).
-// The whole-array Texture2DArray SRV (FirstArraySlice=0, ArraySize=N) is bound;
-// this shader selects the requested slice via array_params.x. A plain Texture2D
-// shader (above) always views slice 0, so both eyes would sample the left image
-// (flat output) — this is the D3D11 analog of the D3D12 #656 fix. Single-layer
-// swapchains keep the Texture2D path unchanged.
-static const char *projection_ps_array_source = R"(
-cbuffer LayerCB : register(b0)
-{
-    float4x4 mvp;
-    float4 post_transform;
-    float4 color_scale;
-    float4 color_bias;
-    float4 array_params;   // x = array slice
-};
-
-Texture2DArray layer_tex : register(t0);
-SamplerState layer_samp : register(s0);
-
-struct VS_OUTPUT
-{
-    float4 position : SV_Position;
-    float2 uv : TEXCOORD0;
-};
-
-float4 PSMain(VS_OUTPUT input) : SV_Target
-{
-    float4 color = layer_tex.Sample(layer_samp, float3(input.uv, array_params.x));
-    color = color * color_scale + color_bias;
-    return color;
-}
-)";
-
-// Quad layer vertex shader - positioned 3D quad
-static const char *quad_vs_source = R"(
-cbuffer LayerCB : register(b0)
-{
-    float4x4 mvp;
-    float4 post_transform;
-    float4 color_scale;
-    float4 color_bias;
-};
-
-struct VS_OUTPUT
-{
-    float4 position : SV_Position;
-    float2 uv : TEXCOORD0;
-};
-
-// Quad centered at origin, 1x1 size in local space
-static const float2 quad_positions[4] = {
-    float2(0.0, 0.0),   // Bottom-left
-    float2(0.0, 1.0),   // Top-left
-    float2(1.0, 0.0),   // Bottom-right
-    float2(1.0, 1.0),   // Top-right
-};
-
-VS_OUTPUT VSMain(uint vertex_id : SV_VertexID)
-{
-    VS_OUTPUT output;
-
-    float2 in_uv = quad_positions[vertex_id % 4];
-
-    // Center the quad at origin
-    float2 pos = in_uv - 0.5;
-
-    // Flip Y into OpenXR/model space. in_uv.y == 0 is the texture's TOP row
-    // (D3D texture origin is top-left) and OpenXR quad model space is Y-up,
-    // so the top row must sit at +Y. Under the Y-up (D3D) projection that
-    // puts the texture's top at the top of the view.
-    // (#1580: this flip used to be absent and the Vulkan Y-DOWN projection
-    // supplied it instead. The texture then came out upright, but the quad's
-    // PLACEMENT was mirrored about the view's horizontal centre line -- a
-    // Y-down projection negates the quad's world-space Y offset too, which
-    // the identity-blit projection layer in the same tile never gets.)
-    pos.y = -pos.y;
-
-    // Transform position by MVP (which includes quad size scaling)
-    output.position = mul(mvp, float4(pos, 0.0, 1.0));
-
-    // Apply UV transform for sub-image
-    output.uv = in_uv * post_transform.zw + post_transform.xy;
-
-    return output;
-}
-)";
-
-// Quad layer pixel shader
-static const char *quad_ps_source = R"(
-cbuffer LayerCB : register(b0)
-{
-    float4x4 mvp;
-    float4 post_transform;
-    float4 color_scale;
-    float4 color_bias;
-};
-
-Texture2D layer_tex : register(t0);
-SamplerState layer_samp : register(s0);
-
-struct VS_OUTPUT
-{
-    float4 position : SV_Position;
-    float2 uv : TEXCOORD0;
-};
-
-float4 PSMain(VS_OUTPUT input) : SV_Target
-{
-    float4 color = layer_tex.Sample(layer_samp, input.uv);
-    color = color * color_scale + color_bias;
-    return color;
-}
-)";
-
-// #439 Phase 3 — Local2D flatten. Draws one app Local2D layer image into the
-// runtime 2D scratch. The per-draw viewport (RSSetViewports, set by the caller)
-// restricts output to the clipped dest sub-rect; uv [0,1] over that viewport
-// maps through src_rect into the source swapchain image (dest-clip fractions,
-// the layer norm_rect, and flip_y are all baked into src_rect by the caller).
-// Premultiplied-vs-unpremultiplied is the caller's blend-state choice; the
-// shader passes the sampled texel straight through (sRGB-passthrough: the
-// source SRV is the swapchain's UNORM sibling, so no auto-decode).
-static const char *local2d_flatten_vs_source = R"(
-struct VS_OUTPUT
-{
-    float4 position : SV_Position;
-    float2 uv : TEXCOORD0;
-};
-
-// Fullscreen triangle, uv [0,1] with top-left origin (uv grows right/down),
-// matching D3D texture-sampling convention.
-static const float2 positions[3] = {
-    float2(-1.0,  1.0),
-    float2(-1.0, -3.0),
-    float2( 3.0,  1.0),
-};
-static const float2 uvs[3] = {
-    float2(0.0, 0.0),
-    float2(0.0, 2.0),
-    float2(2.0, 0.0),
-};
-
-VS_OUTPUT VSMain(uint vertex_id : SV_VertexID)
-{
-    VS_OUTPUT o;
-    o.position = float4(positions[vertex_id], 0.0, 1.0);
-    o.uv = uvs[vertex_id];
-    return o;
-}
-)";
-
-static const char *local2d_flatten_ps_source = R"(
-Texture2D src_tex  : register(t0);
-SamplerState samp  : register(s0);
-
-cbuffer FlattenParams : register(b0)
-{
-    float4 src_rect; // xy = src origin (norm), zw = src size (norm; zw.y < 0 = flip_y)
-};
-
-struct VS_OUTPUT
-{
-    float4 position : SV_Position;
-    float2 uv : TEXCOORD0;
-};
-
-float4 PSMain(VS_OUTPUT input) : SV_Target
-{
-    float2 src_uv = src_rect.xy + input.uv * src_rect.zw;
-    return src_tex.Sample(samp, src_uv);
-}
-)";
 
 static xrt_result_t
 compile_shader(ID3D11Device *device,
@@ -502,6 +245,24 @@ create_shaders(struct comp_d3d11_renderer *r)
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create quad pixel shader: 0x%08x", hr);
 		return XRT_ERROR_D3D;
+	}
+
+	// #1601: layered (array) quad pixel shader variant. Deliberately NOT fatal,
+	// unlike its projection sibling above: a quad on an array swapchain is the
+	// only thing that needs it, and losing it should cost that quad its slice
+	// selection (the pre-#1601 behaviour), not the whole renderer. The draw
+	// site treats a null here as "use quad_ps".
+	xret = compile_shader(internals.device, quad_ps_array_source, "PSMain", "ps_5_0", &blob);
+	if (xret != XRT_SUCCESS) {
+		U_LOG_W("Failed to compile array quad pixel shader — layered quads will sample slice 0");
+	} else {
+		hr = internals.device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+		                                         &r->quad_ps_array);
+		blob->Release();
+		if (FAILED(hr)) {
+			U_LOG_W("Array quad pixel shader unavailable (0x%08x) — quads sample slice 0", hr);
+			r->quad_ps_array = nullptr;
+		}
 	}
 
 	// Local2D flatten vertex shader (#439 Phase 3).
@@ -1044,6 +805,18 @@ render_quad_layer(struct comp_d3d11_renderer *r,
 	const enum comp_layer_blend_mode mode = comp_layer_blend_mode(data->flags);
 	comp_layer_blend_fold_opaque_cover(mode, constants.color_scale, constants.color_bias);
 
+	// #1601: honour the quad's subImage.imageArrayIndex. Gated on the
+	// SWAPCHAIN's array size, not on array_index != 0 — comp_d3d11_swapchain
+	// hands back a whole-array Texture2DArray SRV for every arraySize>1
+	// swapchain, and it is the VIEW DIMENSION that has to match the shader, so
+	// even slice 0 of an array swapchain belongs on the array shader. Same
+	// condition GL (`target == GL_TEXTURE_2D_ARRAY`) and Metal
+	// (`textureType == MTLTextureType2DArray`) already use. A quad on an
+	// arraySize==1 swapchain takes the Texture2D path exactly as before.
+	const bool is_layered = comp_d3d11_swapchain_get_array_size(xsc) > 1;
+	const bool use_array_ps = is_layered && r->quad_ps_array != nullptr;
+	constants.array_params[0] = use_array_ps ? static_cast<float>(q->sub.array_index) : 0.0f;
+
 	// Update constant buffer
 	D3D11_MAPPED_SUBRESOURCE mapped;
 	HRESULT hr = internals.context->Map(r->constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
@@ -1054,7 +827,7 @@ render_quad_layer(struct comp_d3d11_renderer *r,
 
 	// Set shaders - use quad shaders for proper 3D positioning
 	internals.context->VSSetShader(r->quad_vs, nullptr, 0);
-	internals.context->PSSetShader(r->quad_ps, nullptr, 0);
+	internals.context->PSSetShader(use_array_ps ? r->quad_ps_array : r->quad_ps, nullptr, 0);
 
 	// Bind resources
 	internals.context->VSSetConstantBuffers(0, 1, &r->constant_buffer);
@@ -1161,6 +934,16 @@ render_window_space_layer(struct comp_d3d11_renderer *r,
 
 	get_color_scale_bias(data, constants.color_scale, constants.color_bias);
 
+	// #1601: a window-space layer carries an xrt_sub_image exactly as a quad
+	// does, reaches the same whole-array Texture2DArray SRV, and reuses the
+	// same quad shaders — so it had the identical slice bug, and takes the
+	// identical fix. comp_multi_system.c:1555 already honours
+	// ws->sub.array_index on the multi-compositor path; this is the
+	// in-process path agreeing with it.
+	const bool is_layered = comp_d3d11_swapchain_get_array_size(xsc) > 1;
+	const bool use_array_ps = is_layered && r->quad_ps_array != nullptr;
+	constants.array_params[0] = use_array_ps ? static_cast<float>(ws->sub.array_index) : 0.0f;
+
 	// Update constant buffer
 	D3D11_MAPPED_SUBRESOURCE mapped;
 	HRESULT hr = internals.context->Map(r->constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
@@ -1171,7 +954,7 @@ render_window_space_layer(struct comp_d3d11_renderer *r,
 
 	// Set shaders - reuse quad shaders (screen-aligned quad with MVP)
 	internals.context->VSSetShader(r->quad_vs, nullptr, 0);
-	internals.context->PSSetShader(r->quad_ps, nullptr, 0);
+	internals.context->PSSetShader(use_array_ps ? r->quad_ps_array : r->quad_ps, nullptr, 0);
 
 	// Bind resources
 	internals.context->VSSetConstantBuffers(0, 1, &r->constant_buffer);
@@ -1293,6 +1076,7 @@ comp_d3d11_renderer_destroy(struct comp_d3d11_renderer **renderer_ptr)
 	SAFE_RELEASE(r->local2d_flatten_ps);
 	SAFE_RELEASE(r->local2d_flatten_vs);
 	SAFE_RELEASE(r->quad_ps);
+	SAFE_RELEASE(r->quad_ps_array);
 	SAFE_RELEASE(r->quad_vs);
 	SAFE_RELEASE(r->projection_ps_array);
 	SAFE_RELEASE(r->projection_ps);

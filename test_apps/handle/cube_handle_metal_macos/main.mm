@@ -1144,6 +1144,38 @@ static const float kQuadFracC = 0.375f; // (C)
 static const float kQuadAx = 0.057f;  // × canvas width
 static const float kQuadAy = 0.207f;  // × canvas height
 static const float kQuadAz = -0.08f;  // × canvas height (-z = behind the plane)
+// #1601 — DXR_TEST_QUAD_ARRAY=1 is a SEPARATE, much simpler probe from
+// DXR_TEST_QUAD above, and deliberately so: this one exists to answer exactly
+// one question with one pixel comparison, and mixing it into the three-quad
+// blend probe would make both harder to read. DXR_TEST_QUAD's layer list stays
+// byte-identical whether or not this is set.
+//
+// ONE swapchain with arraySize = 2: slice 0 filled solid BLUE, slice 1 solid
+// YELLOW. Two quads side by side, same swapchain, same imageRect, differing
+// ONLY in subImage.imageArrayIndex (left = 0, right = 1).
+//
+//   fixed    -> left BLUE,  right YELLOW
+//   unfixed  -> left BLUE,  right BLUE   (the right quad samples slice 0)
+//
+// That is the conformance Subimage oracle ("bottom row reads 7-12, not 1-6
+// again") reduced to a hue comparison between two rectangles.
+//
+// The discriminator is deliberately HUE, never alpha. Captures run
+// u_image_force_opaque_rgba8 by default (#425), which stamps alpha to 255 and
+// would make any alpha-based oracle read the same on a fixed and an unfixed
+// build — vacuous, and exactly the trap this is written to avoid. Both fills
+// are fully opaque and both quads are OPAQUE_COVER (layerFlags = 0), so the
+// composite cannot tint either one: what lands in the atlas is the slice's own
+// colour or it is a bug.
+static bool g_quadArrayTest = false;
+static bool g_quadArrayActive = false;
+static XrSwapchain g_quadArraySwapchain = XR_NULL_HANDLE;
+static const uint32_t kQuadArrayTexSize = 128;
+// Solid fills, far apart in every channel so a capture read cannot confuse
+// them, and neither is close to the cube, the checker probe or the clear.
+static const uint8_t kSlice0BGRA[4] = {255, 40, 0, 255};  // BLUE  (B=255, R=0)
+static const uint8_t kSlice1BGRA[4] = {0, 220, 255, 255}; // YELLOW (B=0, R=255)
+
 static long g_frameCounter = 0;
 static const int g_l2dActivationFrame = 10;
 static uint32_t g_renderW = 0, g_renderH = 0;
@@ -2189,6 +2221,100 @@ static bool CreateAndFillQuadTexture(AppXrSession &app, uint32_t size)
     return true;
 }
 
+// #1601 — one arraySize=2 swapchain, slice 0 solid blue, slice 1 solid yellow.
+// Deliberately solid: the question is "which slice did the compositor sample",
+// and any internal structure would only invite reading the answer off the
+// wrong feature.
+static bool CreateAndFillQuadArrayTexture(AppXrSession &app,
+                                          MetalRenderer &renderer) {
+  XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+  sci.usageFlags =
+      XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+  sci.format = (int64_t)MTLPixelFormatBGRA8Unorm;
+  sci.sampleCount = 1;
+  sci.width = kQuadArrayTexSize;
+  sci.height = kQuadArrayTexSize;
+  sci.faceCount = 1;
+  sci.arraySize = 2; // the whole point
+  sci.mipCount = 1;
+  if (XR_FAILED(xrCreateSwapchain(app.session, &sci, &g_quadArraySwapchain))) {
+    LOG_INFO("DXR_TEST_QUAD_ARRAY: xrCreateSwapchain(arraySize=2) FAILED");
+    return false;
+  }
+
+  uint32_t n = 0;
+  xrEnumerateSwapchainImages(g_quadArraySwapchain, 0, &n, nullptr);
+  std::vector<XrSwapchainImageMetalKHR> imgs(
+      n, {XR_TYPE_SWAPCHAIN_IMAGE_METAL_KHR});
+  if (n == 0 || XR_FAILED(xrEnumerateSwapchainImages(
+                    g_quadArraySwapchain, n, &n,
+                    (XrSwapchainImageBaseHeader *)imgs.data()))) {
+    return false;
+  }
+
+  XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+  uint32_t idx = 0;
+  if (XR_FAILED(xrAcquireSwapchainImage(g_quadArraySwapchain, &ai, &idx))) {
+    return false;
+  }
+  XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+  wi.timeout = XR_INFINITE_DURATION;
+  xrWaitSwapchainImage(g_quadArraySwapchain, &wi);
+
+  id<MTLTexture> tex = (__bridge id<MTLTexture>)imgs[idx].texture;
+  bool ok = false;
+  if (tex != nil && tex.textureType == MTLTextureType2DArray &&
+      tex.arrayLength >= 2) {
+    // Fill each slice with a CLEAR RENDER PASS, not -replaceRegion:.
+    //
+    // This is not a style choice. comp_metal_compositor.m allocates layered
+    // swapchain images MTLStorageModePrivate (they have no IOSurface
+    // backing and no CPU access path — see the `layered` branch in
+    // metal_swapchain_create), so -replaceRegion: on one is invalid and
+    // segfaults. A render pass targeting the slice is the supported way to
+    // write it, and the descriptor already carries MTLTextureUsageRenderTarget.
+    //
+    // MTLClearColor components are (r,g,b,a) whatever the pixel format's
+    // channel order is, so these are written red-first even though the
+    // texture is BGRA8Unorm and the constants above are stored BGRA.
+    id<MTLCommandBuffer> cmd = [renderer.commandQueue commandBuffer];
+    for (uint32_t slice = 0; slice < 2; slice++) {
+      const uint8_t *c = (slice == 0) ? kSlice0BGRA : kSlice1BGRA;
+      MTLRenderPassDescriptor *rp =
+          [MTLRenderPassDescriptor renderPassDescriptor];
+      rp.colorAttachments[0].texture = tex;
+      rp.colorAttachments[0].slice = slice;
+      rp.colorAttachments[0].level = 0;
+      rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+      rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+      rp.colorAttachments[0].clearColor =
+          MTLClearColorMake((double)c[2] / 255.0, (double)c[1] / 255.0,
+                            (double)c[0] / 255.0, (double)c[3] / 255.0);
+      id<MTLRenderCommandEncoder> enc =
+          [cmd renderCommandEncoderWithDescriptor:rp];
+      [enc endEncoding]; // the clear IS the fill
+    }
+    [cmd commit];
+    // Block: the very next frame submits these quads, and an unfinished
+    // clear would show as the wrong colour exactly once -- which would be
+    // indistinguishable from the bug under test.
+    [cmd waitUntilCompleted];
+    ok = true;
+  } else {
+    // Worth an explicit line: if the runtime handed back a plain 2D
+    // texture the probe would silently degrade into "both quads blue",
+    // which is indistinguishable from the bug it is meant to detect.
+    LOG_INFO("DXR_TEST_QUAD_ARRAY: swapchain image is NOT a 2D array (type=%lu "
+             "len=%lu) — probe INVALID",
+             (unsigned long)(tex != nil ? tex.textureType : 0),
+             (unsigned long)(tex != nil ? tex.arrayLength : 0));
+  }
+
+  XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+  xrReleaseSwapchainImage(g_quadArraySwapchain, &ri);
+  return ok;
+}
+
 // ============================================================================
 // Event handling
 // ============================================================================
@@ -2358,6 +2484,23 @@ int main(int argc, char **argv)
         }
     }
 
+    // #1601 array-slice probe (see the g_quadArrayTest globals block).
+    {
+      const char *e = getenv("DXR_TEST_QUAD_ARRAY");
+      g_quadArrayTest = (e != NULL && e[0] != '\0' && e[0] != '0');
+      if (g_quadArrayTest) {
+        // Same reason as above: the HUD is a window-space layer drawn
+        // after the quads, and it would sit on top of the two rectangles
+        // this probe is read from.
+        g_input.hudVisible = false;
+        LOG_INFO(
+            "DXR_TEST_QUAD_ARRAY=1 — one arraySize=2 swapchain, two quads: "
+            "LEFT imageArrayIndex=0 (expect BLUE), RIGHT imageArrayIndex=1 "
+            "(expect YELLOW). "
+            "Right reading BLUE means the slice index was ignored (#1601).");
+      }
+    }
+
     // Initialize Metal renderer
     MetalRenderer renderer = {};
     if (!InitRenderer(renderer)) {
@@ -2517,6 +2660,18 @@ int main(int argc, char **argv)
                 g_quadActive = CreateAndFillQuadTexture(app, 256);
                 LOG_INFO("Quad probe texture %s (256x256)", g_quadActive ? "ready" : "FAILED");
             }
+        }
+
+        // #1601: same lifecycle, separate swapchain.
+        if (g_quadArrayTest && !g_quadArrayActive &&
+            g_frameCounter >= g_l2dActivationFrame) {
+          static bool quadArrayAttempted = false;
+          if (!quadArrayAttempted) {
+            quadArrayAttempted = true;
+            g_quadArrayActive = CreateAndFillQuadArrayTexture(app, renderer);
+            LOG_INFO("Quad array probe %s (128x128 x2 slices)",
+                     g_quadArrayActive ? "ready" : "FAILED");
+          }
         }
 
         // #439 cases 2/3/4 activation: create + fill the panel swapchain(s)
@@ -2981,6 +3136,10 @@ int main(int argc, char **argv)
             XrCompositionLayerQuad quadA = {XR_TYPE_COMPOSITION_LAYER_QUAD};
             XrCompositionLayerQuad quadB = {XR_TYPE_COMPOSITION_LAYER_QUAD};
             XrCompositionLayerQuad quadC = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+            // #1601 — must outlive the submission below, like quadA/B/C.
+            XrCompositionLayerQuad quadArr[2] = {
+                {XR_TYPE_COMPOSITION_LAYER_QUAD},
+                {XR_TYPE_COMPOSITION_LAYER_QUAD}};
             if (layerCount > 0 && g_quadActive && g_quadSwapchain != XR_NULL_HANDLE) {
                 XrSwapchainSubImage sub = {};
                 sub.swapchain = g_quadSwapchain;
@@ -3067,6 +3226,47 @@ int main(int argc, char **argv)
                 quadC.pose.position = {-0.379f * cw, -0.311f * ch, 0.0f};
                 quadC.size = {kQuadFracC * ch, kQuadFracC * ch};
                 layers[layerCount++] = (XrCompositionLayerBaseHeader *)&quadC;
+            }
+            // #1601 — the two array-slice quads. Same swapchain, same rect,
+            // same flags, same size, same depth; the ONLY difference between
+            // them is imageArrayIndex. Anything else that differed would give
+            // a second explanation for a colour difference, which is the one
+            // thing this probe must not have.
+            if (layerCount > 0 && g_quadArrayActive &&
+                g_quadArraySwapchain != XR_NULL_HANDLE) {
+              const float cw =
+                  (g_input.canvasWidthM > 0.01f) ? g_input.canvasWidthM : 0.44f;
+              const float ch = (g_input.canvasHeightM > 0.01f)
+                                   ? g_input.canvasHeightM
+                                   : 0.24f;
+
+              XrSwapchainSubImage asub = {};
+              asub.swapchain = g_quadArraySwapchain;
+              asub.imageRect.offset = {0, 0};
+              asub.imageRect.extent = {(int32_t)kQuadArrayTexSize,
+                                       (int32_t)kQuadArrayTexSize};
+
+              const float edge = 0.30f * ch;
+              for (uint32_t s = 0; s < 2; s++) {
+                XrCompositionLayerQuad &q = quadArr[s];
+                q = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+                // OPAQUE_COVER: no blend flags, so nothing underneath can
+                // tint the fill and the captured pixel IS the slice's
+                // colour. Keeps the oracle a hue comparison, never an
+                // alpha one (see the globals block on #425).
+                q.layerFlags = 0;
+                q.space = app.localSpace;
+                q.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                q.subImage = asub;
+                q.subImage.imageArrayIndex = s;
+                q.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+                // Side by side, centred, at the same depth as quad (A) so
+                // both land well inside every tile.
+                q.pose.position = {(s == 0 ? -0.20f : 0.20f) * cw, 0.30f * ch,
+                                   kQuadAz * ch};
+                q.size = {edge, edge};
+                layers[layerCount++] = (XrCompositionLayerBaseHeader *)&q;
+              }
             }
             if (layerCount > 0 && g_l2dActive && g_panel1.swapchain != XR_NULL_HANDLE) {
                 panel1Layer.layerFlags = 0; // premultiplied bytes

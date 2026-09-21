@@ -1385,14 +1385,26 @@ struct d3d11_service_system
 	//! Quad layer shaders
 	wil::com_ptr<ID3D11VertexShader> quad_vs;
 	wil::com_ptr<ID3D11PixelShader> quad_ps;
+	//! #1601: Texture2DArray source variant of quad_ps. Bound by
+	//! render_quad_layer when the layer's swapchain is LAYERED (arraySize>1)
+	//! — samples the slice named by subImage.imageArrayIndex. Non-fatal if
+	//! compilation fails (layered quads then fall back to slice 0).
+	wil::com_ptr<ID3D11PixelShader> quad_ps_array;
 
 	//! Cylinder layer shaders
 	wil::com_ptr<ID3D11VertexShader> cylinder_vs;
 	wil::com_ptr<ID3D11PixelShader> cylinder_ps;
+	//! #1601: Texture2DArray source variant of cylinder_ps. Same gate and
+	//! same non-fatal fallback as quad_ps_array.
+	wil::com_ptr<ID3D11PixelShader> cylinder_ps_array;
 
 	//! Equirect2 layer shaders
 	wil::com_ptr<ID3D11VertexShader> equirect2_vs;
 	wil::com_ptr<ID3D11PixelShader> equirect2_ps;
+	//! #1601: Texture2DArray source variant of equirect2_ps, built from the
+	//! same HLSL with DXR_LAYERED defined. Same gate and non-fatal fallback
+	//! as quad_ps_array.
+	wil::com_ptr<ID3D11PixelShader> equirect2_ps_array;
 
 	//! Cube layer shaders
 	wil::com_ptr<ID3D11VertexShader> cube_vs;
@@ -4958,12 +4970,20 @@ get_srgb_format(DXGI_FORMAT format)
  *
  */
 
+//! @p defines is an optional D3D_SHADER_MACRO list, NULL-terminated as
+//! D3DCompile requires. #1601 added it so the long equirect2 pixel shader can
+//! yield its Texture2DArray variant from one source instead of a second
+//! hand-maintained copy of ~100 lines of ray-march math that would drift.
 static HRESULT
-compile_shader(const char *source, const char *entry, const char *target, ID3DBlob **out_blob)
+compile_shader(const char *source,
+               const char *entry,
+               const char *target,
+               ID3DBlob **out_blob,
+               const D3D_SHADER_MACRO *defines = nullptr)
 {
 	ID3DBlob *errors = nullptr;
-	HRESULT hr = D3DCompile(source, strlen(source), nullptr, nullptr, nullptr, entry, target, 0, 0, out_blob,
-	                        &errors);
+	HRESULT hr =
+	    D3DCompile(source, strlen(source), nullptr, defines, nullptr, entry, target, 0, 0, out_blob, &errors);
 	if (FAILED(hr)) {
 		if (errors != nullptr) {
 			U_LOG_E("Shader compile error: %s", (char *)errors->GetBufferPointer());
@@ -5010,6 +5030,23 @@ create_layer_shaders(struct d3d11_service_system *sys)
 		return false;
 	}
 
+	// #1601: layered (array) quad pixel shader variant. Non-fatal, exactly
+	// like blit_ps_array below — losing it should cost a layered quad its
+	// slice selection, not the whole service. render_quad_layer reads a null
+	// here as "use quad_ps".
+	hr = compile_shader(quad_ps_array_hlsl, "PSMain", "ps_5_0", &blob);
+	if (FAILED(hr)) {
+		U_LOG_W("Array quad pixel shader unavailable — quads sample slice 0");
+	} else {
+		hr = sys->device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+		                                    sys->quad_ps_array.put());
+		blob->Release();
+		if (FAILED(hr)) {
+			U_LOG_W("Array quad pixel shader unavailable (0x%08lx) — quads sample slice 0", hr);
+			sys->quad_ps_array = nullptr;
+		}
+	}
+
 	// Cylinder vertex shader
 	hr = compile_shader(cylinder_vs_hlsl, "VSMain", "vs_5_0", &blob);
 	if (FAILED(hr)) {
@@ -5038,6 +5075,21 @@ create_layer_shaders(struct d3d11_service_system *sys)
 		return false;
 	}
 
+	// #1601: layered (array) cylinder pixel shader variant. Non-fatal, as the
+	// quad one is.
+	hr = compile_shader(cylinder_ps_array_hlsl, "PSMain", "ps_5_0", &blob);
+	if (FAILED(hr)) {
+		U_LOG_W("Array cylinder pixel shader unavailable — cylinders sample slice 0");
+	} else {
+		hr = sys->device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+		                                    sys->cylinder_ps_array.put());
+		blob->Release();
+		if (FAILED(hr)) {
+			U_LOG_W("Array cylinder pixel shader unavailable (0x%08lx) — sampling slice 0", hr);
+			sys->cylinder_ps_array = nullptr;
+		}
+	}
+
 	// Equirect2 vertex shader
 	hr = compile_shader(equirect2_vs_hlsl, "VSMain", "vs_5_0", &blob);
 	if (FAILED(hr)) {
@@ -5064,6 +5116,25 @@ create_layer_shaders(struct d3d11_service_system *sys)
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create equirect2 pixel shader: 0x%08lx", hr);
 		return false;
+	}
+
+	// #1601: layered (array) equirect2 pixel shader — the SAME source with
+	// DXR_LAYERED defined, so the ray-march body cannot drift between the two.
+	// Non-fatal, as the quad and cylinder variants are.
+	{
+		const D3D_SHADER_MACRO layered_defines[] = {{"DXR_LAYERED", "1"}, {nullptr, nullptr}};
+		hr = compile_shader(equirect2_ps_hlsl, "PSMain", "ps_5_0", &blob, layered_defines);
+		if (FAILED(hr)) {
+			U_LOG_W("Array equirect2 pixel shader unavailable — sampling slice 0");
+		} else {
+			hr = sys->device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+			                                    sys->equirect2_ps_array.put());
+			blob->Release();
+			if (FAILED(hr)) {
+				U_LOG_W("Array equirect2 pixel shader unavailable (0x%08lx) — sampling slice 0", hr);
+				sys->equirect2_ps_array = nullptr;
+			}
+		}
 	}
 
 	// Cube vertex shader
@@ -5158,8 +5229,17 @@ create_layer_resources(struct d3d11_service_system *sys)
 {
 	HRESULT hr;
 
-	// Create constant buffer (largest of all layer constant structs)
-	size_t cb_size = sizeof(Equirect2LayerConstants);  // Largest
+	// Create constant buffer (largest of all layer constant structs).
+	//
+	// #1601: this used to read `sizeof(Equirect2LayerConstants) // Largest`,
+	// which was true when written and is not a property anything enforced —
+	// growing any OTHER layer's constants past equirect2's would have
+	// silently produced a too-small buffer and a Map that overruns it. Take
+	// the max over all three instead, so the invariant is computed rather
+	// than asserted in a comment.
+	size_t cb_size = sizeof(QuadLayerConstants);
+	cb_size = std::max(cb_size, sizeof(CylinderLayerConstants));
+	cb_size = std::max(cb_size, sizeof(Equirect2LayerConstants));
 	D3D11_BUFFER_DESC cb_desc = {};
 	cb_desc.ByteWidth = static_cast<UINT>((cb_size + 15) & ~15);  // 16-byte aligned
 	cb_desc.Usage = D3D11_USAGE_DYNAMIC;
@@ -5633,6 +5713,16 @@ render_quad_layer(struct d3d11_service_system *sys,
 	const enum comp_layer_blend_mode mode = comp_layer_blend_mode(data->flags);
 	comp_layer_blend_fold_opaque_cover(mode, constants.color_scale, constants.color_bias);
 
+	// #1601: honour the quad's subImage.imageArrayIndex. Gated on the
+	// SWAPCHAIN's array size, not on array_index != 0 — the SRV fetched above
+	// is a whole-array Texture2DArray view for every arraySize>1 swapchain,
+	// and it is the VIEW DIMENSION that has to match the shader, so even slice
+	// 0 of an array swapchain belongs on the array shader. Same condition GL
+	// and Metal already use; both were already correct.
+	const bool is_layered = sc->info.array_size > 1;
+	const bool use_array_ps = is_layered && sys->quad_ps_array;
+	constants.array_params[0] = use_array_ps ? static_cast<float>(q->sub.array_index) : 0.0f;
+
 	// Update constant buffer
 	D3D11_MAPPED_SUBRESOURCE mapped;
 	HRESULT hr = sys->context->Map(sys->layer_constant_buffer.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
@@ -5643,7 +5733,7 @@ render_quad_layer(struct d3d11_service_system *sys,
 
 	// Set shaders
 	sys->context->VSSetShader(sys->quad_vs.get(), nullptr, 0);
-	sys->context->PSSetShader(sys->quad_ps.get(), nullptr, 0);
+	sys->context->PSSetShader(use_array_ps ? sys->quad_ps_array.get() : sys->quad_ps.get(), nullptr, 0);
 
 	// Bind resources
 	ID3D11Buffer *cbs[] = {sys->layer_constant_buffer.get()};
@@ -5745,6 +5835,13 @@ render_cylinder_layer(struct d3d11_service_system *sys,
 	constants.central_angle = cyl->central_angle;
 	constants.aspect_ratio = cyl->aspect_ratio;
 
+	// #1601: same slice bug and same fix as the quad path above — a cylinder
+	// carries an xrt_sub_image and reaches the same whole-array
+	// Texture2DArray SRV. Gated on the swapchain's array size.
+	const bool is_layered = sc->info.array_size > 1;
+	const bool use_array_ps = is_layered && sys->cylinder_ps_array;
+	constants.array_params[0] = use_array_ps ? static_cast<float>(cyl->sub.array_index) : 0.0f;
+
 	// Update constant buffer
 	D3D11_MAPPED_SUBRESOURCE mapped;
 	HRESULT hr = sys->context->Map(sys->layer_constant_buffer.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
@@ -5755,7 +5852,7 @@ render_cylinder_layer(struct d3d11_service_system *sys,
 
 	// Set shaders
 	sys->context->VSSetShader(sys->cylinder_vs.get(), nullptr, 0);
-	sys->context->PSSetShader(sys->cylinder_ps.get(), nullptr, 0);
+	sys->context->PSSetShader(use_array_ps ? sys->cylinder_ps_array.get() : sys->cylinder_ps.get(), nullptr, 0);
 
 	// Bind resources
 	ID3D11Buffer *cbs[] = {sys->layer_constant_buffer.get()};
@@ -5857,6 +5954,13 @@ render_equirect2_layer(struct d3d11_service_system *sys,
 	constants.upper_vertical_angle = eq->upper_vertical_angle;
 	constants.lower_vertical_angle = eq->lower_vertical_angle;
 
+	// #1601: same slice bug and same fix as quad and cylinder — equirect2
+	// carries an xrt_sub_image and reaches the same whole-array
+	// Texture2DArray SRV. Gated on the swapchain's array size.
+	const bool is_layered = sc->info.array_size > 1;
+	const bool use_array_ps = is_layered && sys->equirect2_ps_array;
+	constants.array_params[0] = use_array_ps ? static_cast<float>(eq->sub.array_index) : 0.0f;
+
 	// Update constant buffer
 	D3D11_MAPPED_SUBRESOURCE mapped;
 	HRESULT hr = sys->context->Map(sys->layer_constant_buffer.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
@@ -5867,7 +5971,7 @@ render_equirect2_layer(struct d3d11_service_system *sys,
 
 	// Set shaders
 	sys->context->VSSetShader(sys->equirect2_vs.get(), nullptr, 0);
-	sys->context->PSSetShader(sys->equirect2_ps.get(), nullptr, 0);
+	sys->context->PSSetShader(use_array_ps ? sys->equirect2_ps_array.get() : sys->equirect2_ps.get(), nullptr, 0);
 
 	// Bind resources
 	ID3D11Buffer *cbs[] = {sys->layer_constant_buffer.get()};
@@ -24446,10 +24550,13 @@ system_destroy(struct xrt_system_compositor *xsysc)
 	sys->cube_ps.reset();
 	sys->cube_vs.reset();
 	sys->equirect2_ps.reset();
+	sys->equirect2_ps_array.reset();
 	sys->equirect2_vs.reset();
 	sys->cylinder_ps.reset();
+	sys->cylinder_ps_array.reset();
 	sys->cylinder_vs.reset();
 	sys->quad_ps.reset();
+	sys->quad_ps_array.reset();
 	sys->quad_vs.reset();
 
 	// Clean up blit shader resources
