@@ -31,6 +31,7 @@
 #include "xrt/xrt_vulkan_includes.h"
 #include "vk/vk_helpers.h"
 
+#include "util/u_debug.h"
 #include "util/u_logging.h"
 #include "util/u_misc.h"
 
@@ -49,6 +50,44 @@
 //! app was told about (xrGetDisplayZoneCapabilitiesDXR). If the zone cap is
 //! raised, raise this with it.
 #define VK_ZONE_MAX_DRAWS 256
+
+/*!
+ * Route even a single-layer frame through the compose render pass.
+ *
+ * Diagnostic only. The fast path and the pass never both run on the same
+ * frame, so this is the only way to feed them identical input and assert the
+ * pass reproduces the blit byte-for-byte.
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(vk_force_compose_pass, "DXR_VK_FORCE_COMPOSE_PASS", false)
+
+/*!
+ * How a draw composites onto what is already in the tile.
+ *
+ * LOCAL AND TEMPORARY. #1611 is landing the shared vocabulary in
+ * comp_layer_view_camera.h (`comp_layer_blend_mode` + the painter's-order
+ * first-layer gate, and an OPAQUE_COVER mode this does not have yet); when
+ * that merges, this enum is deleted and the table below is re-indexed on it.
+ * It exists only so this step does not have to wait, and deliberately does
+ * NOT try to pre-empt the final spelling.
+ */
+enum vk_compose_blend
+{
+	//! Blending off: the source written verbatim, RGBA. What a blit did.
+	VK_COMPOSE_BLEND_REPLACE = 0,
+	//! out.rgb = src.rgb + dst.rgb * (1 - src.a)
+	VK_COMPOSE_BLEND_PREMULT = 1,
+	//! out.rgb = src.rgb * src.a + dst.rgb * (1 - src.a)
+	VK_COMPOSE_BLEND_UNPREMULT = 2,
+	VK_COMPOSE_BLEND_COUNT,
+};
+
+//! Which sampler the source view needs.
+enum vk_compose_sampler
+{
+	VK_COMPOSE_SAMPLER_2D = 0,
+	VK_COMPOSE_SAMPLER_2D_ARRAY = 1,
+	VK_COMPOSE_SAMPLER_COUNT,
+};
 
 /*!
  * Vulkan renderer structure.
@@ -116,18 +155,16 @@ struct comp_vk_native_renderer
 		VkDescriptorSetLayout set_layout;
 		VkPipelineLayout pipeline_layout;
 		VkSampler sampler;
-		VkPipeline pipeline_premult;
-		VkPipeline pipeline_unpremult;
 		/*!
-		 * LAYERED (arraySize > 1) twins of the two above, using
-		 * zone_blit_array.frag's `sampler2DArray`. Before these existed
-		 * a single layered source made zone_pass_usable() refuse the
-		 * WHOLE FRAME back to the blit path, which cannot blend — so an
-		 * engine submitting single-pass-instanced stereo (ADR-032) lost
-		 * alpha-over compositing entirely.
+		 * [blend mode][layered] — @ref enum vk_compose_blend by
+		 * @ref VK_COMPOSE_SAMPLER_2D / _2D_ARRAY.
+		 *
+		 * The layered column uses zone_blit_array.frag's
+		 * `sampler2DArray`: a layered swapchain's view is a
+		 * VK_IMAGE_VIEW_TYPE_2D_ARRAY and a `sampler2D` cannot bind one,
+		 * so the pipeline must match the SOURCE, not the layer's flags.
 		 */
-		VkPipeline pipeline_premult_array;
-		VkPipeline pipeline_unpremult_array;
+		VkPipeline pipelines[VK_COMPOSE_BLEND_COUNT][VK_COMPOSE_SAMPLER_COUNT];
 		VkDescriptorPool descriptor_pool;
 		bool ready;
 		bool failed; //!< init failed once — stay on the blit fallback
@@ -167,6 +204,37 @@ layers_contain_zone_3d(const struct comp_layer_accum *layers)
 	return false;
 }
 
+/*!
+ * Does the compose pass draw this layer type?
+ *
+ * Projection-class and 3D zones. Quad / cylinder / equirect are accumulated
+ * but not yet drawn on this backend (#1581) — they are skipped here exactly
+ * as the blit path skipped them, so this change neither adds nor removes
+ * content.
+ */
+static bool
+compose_pass_draws_layer(const struct comp_layer *layer)
+{
+	const enum xrt_layer_type t = layer->data.type;
+	return t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH || t == XRT_LAYER_ZONE_3D;
+}
+
+//! How many layers this frame would the compose pass actually draw?
+static uint32_t
+compose_pass_layer_count(const struct comp_layer_accum *layers)
+{
+	uint32_t n = 0;
+	if (layers == NULL) {
+		return 0;
+	}
+	for (uint32_t i = 0; i < layers->layer_count; i++) {
+		if (compose_pass_draws_layer(&layers->layers[i])) {
+			n++;
+		}
+	}
+	return n;
+}
+
 static void
 zone_draw_destroy_framebuffer(struct comp_vk_native_renderer *r)
 {
@@ -188,21 +256,13 @@ zone_draw_destroy(struct comp_vk_native_renderer *r)
 	struct vk_bundle *vk = r->vk;
 
 	zone_draw_destroy_framebuffer(r);
-	if (r->zone.pipeline_premult != VK_NULL_HANDLE) {
-		vk->vkDestroyPipeline(vk->device, r->zone.pipeline_premult, NULL);
-		r->zone.pipeline_premult = VK_NULL_HANDLE;
-	}
-	if (r->zone.pipeline_unpremult != VK_NULL_HANDLE) {
-		vk->vkDestroyPipeline(vk->device, r->zone.pipeline_unpremult, NULL);
-		r->zone.pipeline_unpremult = VK_NULL_HANDLE;
-	}
-	if (r->zone.pipeline_premult_array != VK_NULL_HANDLE) {
-		vk->vkDestroyPipeline(vk->device, r->zone.pipeline_premult_array, NULL);
-		r->zone.pipeline_premult_array = VK_NULL_HANDLE;
-	}
-	if (r->zone.pipeline_unpremult_array != VK_NULL_HANDLE) {
-		vk->vkDestroyPipeline(vk->device, r->zone.pipeline_unpremult_array, NULL);
-		r->zone.pipeline_unpremult_array = VK_NULL_HANDLE;
+	for (int b = 0; b < VK_COMPOSE_BLEND_COUNT; b++) {
+		for (int sm = 0; sm < VK_COMPOSE_SAMPLER_COUNT; sm++) {
+			if (r->zone.pipelines[b][sm] != VK_NULL_HANDLE) {
+				vk->vkDestroyPipeline(vk->device, r->zone.pipelines[b][sm], NULL);
+				r->zone.pipelines[b][sm] = VK_NULL_HANDLE;
+			}
+		}
 	}
 	if (r->zone.descriptor_pool != VK_NULL_HANDLE) {
 		vk->vkDestroyDescriptorPool(vk->device, r->zone.descriptor_pool, NULL);
@@ -538,7 +598,7 @@ static bool
 zone_create_pipeline(struct comp_vk_native_renderer *r,
                      VkShaderModule vert,
                      VkShaderModule frag,
-                     bool unpremultiplied,
+                     enum vk_compose_blend blend,
                      VkPipeline *out_pipeline)
 {
 	struct vk_bundle *vk = r->vk;
@@ -586,12 +646,17 @@ zone_create_pipeline(struct comp_vk_native_renderer *r,
 	    .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
 	};
 
+	// REPLACE is blending OFF — the source written verbatim, RGBA, which is
+	// exactly what vkCmdBlitImage did and is what a projection layer needs
+	// so its own alpha reaches the atlas for the #225 compose-under gate.
+	//
 	// Alpha-over: premultiplied (One/OneMinusSrcAlpha) by default, straight
 	// alpha only swaps the source color factor. Alpha factors are
 	// One/OneMinusSrcAlpha in both so the zone's own transparency survives
 	// into the atlas (D3D11 blend_premul/blend_alpha parity).
+	const bool unpremultiplied = (blend == VK_COMPOSE_BLEND_UNPREMULT);
 	VkPipelineColorBlendAttachmentState blend_attachment = {
-	    .blendEnable = VK_TRUE,
+	    .blendEnable = (blend == VK_COMPOSE_BLEND_REPLACE) ? VK_FALSE : VK_TRUE,
 	    .srcColorBlendFactor =
 	        unpremultiplied ? VK_BLEND_FACTOR_SRC_ALPHA : VK_BLEND_FACTOR_ONE,
 	    .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
@@ -635,8 +700,7 @@ zone_create_pipeline(struct comp_vk_native_renderer *r,
 	VkResult res =
 	    vk->vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 1, &pipeline_ci, NULL, out_pipeline);
 	if (res != VK_SUCCESS) {
-		U_LOG_E("VK zones: failed to create %s pipeline: %d",
-		        unpremultiplied ? "unpremultiplied" : "premultiplied", res);
+		U_LOG_E("VK compose: failed to create blend-mode-%d pipeline: %d", (int)blend, res);
 		return false;
 	}
 	return true;
@@ -840,10 +904,13 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
 		return false;
 	}
 
-	bool ok = zone_create_pipeline(r, vert, frag, false, &r->zone.pipeline_premult) &&
-	          zone_create_pipeline(r, vert, frag, true, &r->zone.pipeline_unpremult) &&
-	          zone_create_pipeline(r, vert, frag_array, false, &r->zone.pipeline_premult_array) &&
-	          zone_create_pipeline(r, vert, frag_array, true, &r->zone.pipeline_unpremult_array);
+	bool ok = true;
+	for (int b = 0; b < VK_COMPOSE_BLEND_COUNT && ok; b++) {
+		ok = zone_create_pipeline(r, vert, frag, (enum vk_compose_blend)b,
+		                          &r->zone.pipelines[b][VK_COMPOSE_SAMPLER_2D]) &&
+		     zone_create_pipeline(r, vert, frag_array, (enum vk_compose_blend)b,
+		                          &r->zone.pipelines[b][VK_COMPOSE_SAMPLER_2D_ARRAY]);
+	}
 
 	vk->vkDestroyShaderModule(vk->device, vert, NULL);
 	vk->vkDestroyShaderModule(vk->device, frag, NULL);
@@ -857,7 +924,8 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
 
 	r->zone.failed = false;
 	r->zone.ready = true;
-	U_LOG_W("VK zones: alpha-over draw path ready (premult + unpremult, 2D + 2D_ARRAY pipelines)");
+	U_LOG_W("VK compose: draw path ready (%d blend modes x 2D/2D_ARRAY = %d pipelines)",
+        VK_COMPOSE_BLEND_COUNT, VK_COMPOSE_BLEND_COUNT * VK_COMPOSE_SAMPLER_COUNT);
 	return true;
 }
 
@@ -1018,7 +1086,7 @@ zone_pass_usable(struct comp_vk_native_renderer *r,
 
 	for (uint32_t i = 0; i < layers->layer_count; i++) {
 		struct comp_layer *layer = &layers->layers[i];
-		if (layer->data.type != XRT_LAYER_ZONE_3D) {
+		if (!compose_pass_draws_layer(layer)) {
 			continue;
 		}
 		uint32_t view_count = layer->data.view_count;
@@ -1090,7 +1158,7 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 	uint32_t transitioned_count = 0;
 	for (uint32_t i = 0; i < layers->layer_count; i++) {
 		struct comp_layer *layer = &layers->layers[i];
-		if (layer->data.type != XRT_LAYER_ZONE_3D) {
+		if (!compose_pass_draws_layer(layer)) {
 			continue;
 		}
 		uint32_t view_count = layer->data.view_count;
@@ -1179,9 +1247,10 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 	uint32_t draw_count = 0;
 	for (uint32_t i = 0; i < layers->layer_count; i++) {
 		struct comp_layer *layer = &layers->layers[i];
-		if (layer->data.type != XRT_LAYER_ZONE_3D) {
+		if (!compose_pass_draws_layer(layer)) {
 			continue;
 		}
+		const bool is_zone = layer->data.type == XRT_LAYER_ZONE_3D;
 
 		uint32_t view_count = layer->data.view_count;
 		if (view_count > layout->views) {
@@ -1241,17 +1310,27 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 			if (target_width == 0 || target_height == 0) {
 				continue;
 			}
-			const struct xrt_rect *zr = &layer->data.zone_3d.rect;
-			const float zsx = (dx1 - dx0) / (float)target_width;
-			const float zsy = (dy1 - dy0) / (float)target_height;
+			// A ZONE is placed by its window-space rect scaled into
+			// the tile box; a PROJECTION layer fills the tile box
+			// outright, which is what its vkCmdBlitImage destination
+			// rect was. Same dx/dy box either way.
 			VkViewport vp = {
-			    .x = dx0 + (float)zr->offset.w * zsx,
-			    .y = dy0 + (float)zr->offset.h * zsy,
-			    .width = (float)zr->extent.w * zsx,
-			    .height = (float)zr->extent.h * zsy,
+			    .x = dx0,
+			    .y = dy0,
+			    .width = dx1 - dx0,
+			    .height = dy1 - dy0,
 			    .minDepth = 0.0f,
 			    .maxDepth = 1.0f,
 			};
+			if (is_zone) {
+				const struct xrt_rect *zr = &layer->data.zone_3d.rect;
+				const float zsx = (dx1 - dx0) / (float)target_width;
+				const float zsy = (dy1 - dy0) / (float)target_height;
+				vp.x = dx0 + (float)zr->offset.w * zsx;
+				vp.y = dy0 + (float)zr->offset.h * zsy;
+				vp.width = (float)zr->extent.w * zsx;
+				vp.height = (float)zr->extent.h * zsy;
+			}
 			if (vp.width <= 0.0f || vp.height <= 0.0f) {
 				continue;
 			}
@@ -1335,18 +1414,33 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 
 			// The view the swapchain handed us is a 2D_ARRAY view iff
 			// the swapchain is layered, and a `sampler2D` cannot bind
-			// one — so the pipeline must match the SOURCE, not the
+			// one — so the sampler must match the SOURCE, not the
 			// layer's flags.
-			const bool layered = comp_vk_native_swapchain_get_array_size(xsc) > 1;
-			VkPipeline pipeline;
-			if (layered) {
-				pipeline = unpremul ? r->zone.pipeline_unpremult_array
-				                    : r->zone.pipeline_premult_array;
-			} else {
-				pipeline = unpremul ? r->zone.pipeline_unpremult : r->zone.pipeline_premult;
-			}
+			const enum vk_compose_sampler sampler_kind =
+			    comp_vk_native_swapchain_get_array_size(xsc) > 1 ? VK_COMPOSE_SAMPLER_2D_ARRAY
+			                                                     : VK_COMPOSE_SAMPLER_2D;
 
-			vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+			/*
+			 * Blend mode. ZONES keep alpha-over in layer-list order,
+			 * bit-for-bit what they did before this pass grew a
+			 * second caller. A PROJECTION layer takes REPLACE, which
+			 * is what its vkCmdBlitImage did: overwrite, alpha
+			 * verbatim.
+			 *
+			 * This is NOT yet the OpenXR painter's-order rule
+			 * (#1598: first-into-tile replaces, later layers blend
+			 * by their flags). That rule arrives with #1611's shared
+			 * helper; deciding it here would mean inventing a second
+			 * copy of a policy that is still being finalised, and
+			 * would change what two overlapping projection layers do
+			 * inside a step whose whole job is to change nothing.
+			 */
+			const enum vk_compose_blend blend =
+			    !is_zone ? VK_COMPOSE_BLEND_REPLACE
+			             : (unpremul ? VK_COMPOSE_BLEND_UNPREMULT : VK_COMPOSE_BLEND_PREMULT);
+
+			vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+			                       r->zone.pipelines[blend][sampler_kind]);
 			vk->vkCmdSetViewport(cmd, 0, 1, &vp);
 			vk->vkCmdSetScissor(cmd, 0, 1, &scissor);
 			vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -1444,12 +1538,48 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	// transparent so the feathered wish edge blends toward the desktop.
 	const bool zones_frame = layers_contain_zone_3d(layers);
 
-	// Zones frames take the draw-based pass so overlapping zones composite
-	// alpha-over in layer-list order; blits cannot blend. Falls back to the
-	// blit path below (overlap overwrites, one-shot WARN) if the pipeline
-	// bundle cannot be created or a zone swapchain is layered.
-	if (zones_frame && zone_pass_usable(r, layers, layout)) {
+	/*
+	 * Which compose path owns this frame?
+	 *
+	 * The decision is taken ONCE, here, before any command is recorded,
+	 * because the render pass is `loadOp = CLEAR` over the whole atlas:
+	 * a frame cannot be half-blitted and half-drawn, or the pass's clear
+	 * erases whatever the blits already put down. All-or-nothing per frame
+	 * is a property of the pass, not a simplification.
+	 *
+	 *  - FAST PATH — one drawable layer and no zones: the blit, verbatim.
+	 *    This is every shipping app, it is the perf path, and because the
+	 *    commands are literally unchanged it is also the no-regression
+	 *    proof: the atlas is byte-identical to before this change.
+	 *  - PASS — zones (which must blend), or more than one drawable layer.
+	 *  - FALLBACK — the pass cannot be built (sticky `zone.failed`): the
+	 *    blit runs instead and content degrades exactly to main's behaviour
+	 *    (overlaps overwrite), which is a degradation, never a corruption.
+	 *
+	 * DXR_VK_FORCE_COMPOSE_PASS=1 routes a single-layer frame through the
+	 * pass so the two paths can be compared on identical input. That A/B is
+	 * how "the pass reproduces the blit" is checked at all, since every
+	 * other frame takes one path or the other and never both.
+	 *
+	 * NOT gated on colour yet. #1589/#1610 will add "…and the source is
+	 * already _SRGB" to the fast path, because a UNORM source will then
+	 * need the pass to encode it. Today both paths produce identical bytes,
+	 * so adding that clause now would push single-layer UNORM frames — i.e.
+	 * most of the app population — onto the new path for no benefit.
+	 */
+	const uint32_t drawable = compose_pass_layer_count(layers);
+	const bool want_pass = zones_frame || drawable > 1 || debug_get_bool_option_vk_force_compose_pass();
+
+	if (want_pass && zone_pass_usable(r, layers, layout)) {
 		return draw_zones_pass(r, layers, target_width, target_height, layout);
+	}
+	if (want_pass) {
+		static bool fallback_warned = false;
+		if (!fallback_warned) {
+			fallback_warned = true;
+			U_LOG_W("VK compose: draw pass unavailable — falling back to the blit path for the "
+			        "whole frame (overlaps OVERWRITE instead of blending; one-time warning)");
+		}
 	}
 
 	VkCommandBufferAllocateInfo alloc_info = {
