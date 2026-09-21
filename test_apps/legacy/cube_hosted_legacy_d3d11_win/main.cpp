@@ -236,7 +236,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
                             // Clear entire color+depth once before eye loop
                             float clearColor[4] = {0.05f, 0.05f, 0.25f, 1.0f};
-                            renderer.context->ClearRenderTargetView(rtv, clearColor);
+                            ClearRenderTargetViewDisplayReferred(renderer, rtv, clearColor);
                             renderer.context->ClearDepthStencilView(depthDSV.Get(),
                                 D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
 

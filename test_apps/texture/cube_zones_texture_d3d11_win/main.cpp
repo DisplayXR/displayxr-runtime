@@ -726,6 +726,10 @@ static void PresentAndMaybeDump(RenderState& rs) {
 
     if (rs.appBackBufferRTV) {
         float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+        // Raw clear ON PURPOSE: this is the app's own UNORM window back buffer, not
+        // an XR swapchain. ClearRenderTargetViewDisplayReferred() decodes on the
+        // process-wide dxr::RenderSceneLinear() flag, not on this view's format, so
+        // it would DARKEN a UNORM target.
         renderer.context->ClearRenderTargetView(rs.appBackBufferRTV.Get(), clearColor);
         BlitSharedTextureToBackBuffer(renderer, rs.appBackBufferRTV.Get(),
                                       g_windowWidth, g_windowHeight);
@@ -1384,7 +1388,7 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
         // Per-zone clear (premultiplied RGBA). Zone A is opaque; zone B's
         // semi-transparent background demonstrates the alpha-over composite
         // (the cube geometry itself renders opaque in both).
-        renderer.context->ClearRenderTargetView(rtv, z.clearColor);
+        ClearRenderTargetViewDisplayReferred(renderer, rtv, z.clearColor);
         renderer.context->ClearDepthStencilView(z.depthDSV.Get(),
             D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
 
@@ -1910,7 +1914,7 @@ static void RenderOneFrame(RenderState& rs) {
                     static_cast<DXGI_FORMAT>(xr.swapchain.format), &rtv);
 
                 float clearColor[4] = {0.05f, 0.05f, 0.25f, 1.0f};
-                renderer.context->ClearRenderTargetView(rtv, clearColor);
+                ClearRenderTargetViewDisplayReferred(renderer, rtv, clearColor);
                 renderer.context->ClearDepthStencilView(rs.depthDSV.Get(),
                     D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
 
