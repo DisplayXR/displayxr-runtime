@@ -544,6 +544,29 @@ comp_layer_tile_mark_composited(struct comp_layer_tile_state *tile)
  * so it marks the tile composited but bypasses this gate and keeps its own
  * ADR-027 alpha-over rule.
  *
+ * THE D3D11 SERVICE carries the same two, plus three of its own — it composes
+ * a client's frame in TWO passes on different mechanisms, not one loop:
+ *
+ *  - PROJECTION-CLASS LAYERS ARE A SEPARATE, EARLIER PASS. That pass owns the
+ *    cross-process keyed-mutex acquire, the zero-copy decision and the
+ *    content-dims record, so it cannot simply be folded into the layer loop.
+ *    It applies this gate among ITSELF (submission-ordered, first one in is
+ *    the REPLACE), and the UI pass then seeds each tile COMPOSITED when the
+ *    frame carried one. What is lost is the cross-pass order: a projection
+ *    layer submitted AFTER a quad still composites BEFORE it, so it cannot
+ *    cover it.
+ *  - A LATER UNFLAGGED PROJECTION LAYER GETS NO ALPHA-OF-ONE. Its pass blits
+ *    through a shader with no colour-scale/bias channel to fold
+ *    @ref comp_layer_blend_fold_opaque_cover into, so OPAQUE_COVER degrades to
+ *    the verbatim cover it shares colour with. Visible only as atlas alpha, in
+ *    a transparent session, on a frame with two or more projection layers.
+ *  - LOCAL2D / WINDOW-SPACE IS LATER STILL: not a later pass over the client's
+ *    own atlas but a later STAGE, `multi_compositor_render()`, which blits it
+ *    onto the COMBINED atlas. Its per-client tile blit maps an unflagged
+ *    client to REPLACE rather than OPAQUE_COVER on purpose: that blit is the
+ *    base of the client's region, not a layer stacked over one, so its alpha
+ *    must reach the combined atlas verbatim (#225).
+ *
  * @param tile        This view's tile state; NULL means "treat as first".
  * @param layer_flags @ref xrt_layer_data::flags.
  *
