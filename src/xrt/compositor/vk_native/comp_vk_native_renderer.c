@@ -28,6 +28,7 @@
 
 #include "util/comp_layer_accum.h"
 #include "util/comp_layer_view_camera.h"
+#include "util/u_color_encoding.h"
 
 #include "xrt/xrt_vulkan_includes.h"
 #include "vk/vk_helpers.h"
@@ -112,6 +113,31 @@ struct vk_compose_push
 	float color_scale[4];  //!< XR_KHR_composition_layer_color_scale_bias.
 	float color_bias[4];   //!< ditto.
 };
+
+/*!
+ * The format the private compose target is ATTACHED through — the single
+ * switch the escape hatch flips.
+ *
+ * `_SRGB` (default): the hardware decodes each source on sample, blends in
+ * linear and encodes once on write — the #1589/#1610 model.
+ *
+ * `UNORM` (`DXR_COLOR_LEGACY_UNORM_ENCODED=1`): no encode on write, so layers
+ * blend in encoded space exactly as they did before this work. Paired with
+ * sampling through the NON-decoding views, that is one switch and one
+ * behaviour, the same shape the Direct3D side uses.
+ *
+ * Vulkan keeps the private target even under the hatch, where the shared
+ * header describes the Direct3D side as not creating one. The target is not
+ * only a colour device here — it is the render pass that draws quads and
+ * blends zones, so dropping it would drop those too. Attaching it UNORM is
+ * byte-equivalent to the old behaviour and costs one extra image copy on a
+ * transitional path.
+ */
+static inline VkFormat
+zone_compose_view_format(void)
+{
+	return u_color_legacy_unorm_encoded() ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_B8G8R8A8_SRGB;
+}
 
 //! Which sampler the source view needs.
 enum vk_compose_sampler
@@ -367,6 +393,30 @@ compose_frame_source_is_srgb(const struct comp_layer_accum *layers)
 		}
 	}
 	return true;
+}
+
+/*!
+ * Is the frame's single contributing layer a full-tile projection blit?
+ *
+ * An input to @ref u_color_compose_fast_path, not a policy: a quad, a zone or
+ * a Local2D layer covers a SUB-RECT and composites over the clear, so it is a
+ * compose case even when it is the only layer.
+ */
+static bool
+compose_frame_base_is_projection(const struct comp_layer_accum *layers)
+{
+	if (layers == NULL) {
+		return false;
+	}
+	for (uint32_t i = 0; i < layers->layer_count; i++) {
+		const struct comp_layer *layer = &layers->layers[i];
+		if (!compose_pass_draws_layer(layer)) {
+			continue;
+		}
+		const enum xrt_layer_type t = layer->data.type;
+		return t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH;
+	}
+	return false;
 }
 
 //! How many layers this frame would the compose pass actually draw?
@@ -633,6 +683,10 @@ comp_vk_native_renderer_create(struct comp_vk_native_compositor *c,
 	if (r == NULL) {
 		return XRT_ERROR_ALLOCATION;
 	}
+
+	// Colour provenance: one line per process saying which regime ran, so a
+	// capture's log proves what it was taken under.
+	u_color_log_state_once("vk_native");
 
 	r->vk = vk;
 	r->format = VK_FORMAT_B8G8R8A8_UNORM;
@@ -905,7 +959,7 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
 	 * followed by a raw vkCmdCopyImage into the (UNORM, ENCODED) atlas.
 	 */
 	VkAttachmentDescription attachment = {
-	    .format = VK_FORMAT_B8G8R8A8_SRGB,
+	    .format = zone_compose_view_format(),
 	    .samples = VK_SAMPLE_COUNT_1_BIT,
 	    .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
 	    .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
@@ -1290,7 +1344,7 @@ zone_compose_target_ensure(struct comp_vk_native_renderer *r)
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
 	    .image = r->zone.compose_image,
 	    .viewType = VK_IMAGE_VIEW_TYPE_2D,
-	    .format = VK_FORMAT_B8G8R8A8_SRGB,
+	    .format = zone_compose_view_format(),
 	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
 	};
 	res = vk->vkCreateImageView(vk->device, &vci, NULL, &r->zone.compose_view);
@@ -1620,9 +1674,11 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 			 * and #1572's UNORM scratch; neither is wired in here,
 			 * and wiring them in would double-encode.
 			 */
-			VkImageView src_view =
-			    (VkImageView)(uintptr_t)comp_vk_native_swapchain_get_true_image_view(
-			        xsc, sub->image_index);
+			const uint64_t src_view_u64 =
+			    u_color_legacy_unorm_encoded()
+			        ? comp_vk_native_swapchain_get_image_view(xsc, sub->image_index)
+			        : comp_vk_native_swapchain_get_true_image_view(xsc, sub->image_index);
+			VkImageView src_view = (VkImageView)(uintptr_t)src_view_u64;
 			if (src_view == VK_NULL_HANDLE) {
 				continue;
 			}
@@ -1976,9 +2032,32 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	 * the old behaviour.
 	 */
 	const uint32_t drawable = compose_pass_layer_count(layers);
-	const bool colour_needs_pass = !compose_frame_source_is_srgb(layers);
+
+	/*
+	 * The COLOUR half of the decision comes from the shared predicate, so
+	 * this backend cannot drift from Direct3D on when the encode is owed.
+	 * The three inputs are gathered locally (they need VkFormat knowledge,
+	 * which the backend-neutral header deliberately has none of) but the
+	 * RULE is not restated here — that restating is exactly how the
+	 * inverted-alpha divergence (#1621) happened.
+	 */
+	const bool colour_allows_raw = u_color_compose_fast_path(u_color_legacy_unorm_encoded(), drawable,
+	                                                          compose_frame_base_is_projection(layers),
+	                                                          compose_frame_source_is_srgb(layers));
+
+	/*
+	 * The STRUCTURAL half is this backend's own and must be ANDed with it,
+	 * not replaced by it. On Vulkan the "fast path" is literally
+	 * vkCmdBlitImage, which cannot blend and cannot draw a quad — so zones,
+	 * multi-layer frames and quad frames need the render pass whatever the
+	 * colour answer is. Note the hatch makes the shared predicate return
+	 * true unconditionally; without this AND, turning the hatch on would
+	 * silently take alpha-over compositing and quads away with it.
+	 */
+	const bool structure_allows_raw = !zones_frame && drawable <= 1;
+
 	const bool want_pass =
-	    zones_frame || drawable > 1 || colour_needs_pass || debug_get_bool_option_vk_force_compose_pass();
+	    !(colour_allows_raw && structure_allows_raw) || debug_get_bool_option_vk_force_compose_pass();
 
 	if (want_pass && zone_pass_usable(r, layers, layout)) {
 		return draw_zones_pass(r, layers, target_width, target_height, layout);
