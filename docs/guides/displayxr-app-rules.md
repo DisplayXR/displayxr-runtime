@@ -105,6 +105,13 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   the weaved 3D, submit an `XrCompositionLayerWindowSpaceDXR` layer (window-relative `[0,1]`
   coordinates) after your projection layer — see `XR_DXR_win32_window_binding` §3 and
   `xr_session_common.cpp` (`EndFrameWithWindowSpaceHud`). Not required for a basic app.
+- **F-7 — A layer without `XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT` is OPAQUE.** Per
+  OpenXR §10.6.2 its alpha is *treated as one*: a quad (or any later layer) submitted without the
+  flag covers what is under it and writes alpha 1, whatever its texture's alpha channel holds. A
+  translucent overlay must set the flag deliberately (plus `UNPREMULTIPLIED_ALPHA_BIT` for straight
+  alpha). The one exception is the **first** layer into a view: its alpha reaches the atlas
+  verbatim, which is what a transparent-window app relies on. Layers are composited in submission
+  order, and a quad's back face is never drawn.
 
 ---
 
