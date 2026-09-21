@@ -22,9 +22,11 @@ desktops.
 is the shipping path: Phase 2b service-side render (**#710**, service/IPC mode
 only); windowed-3D phase origin (**#729/#730**, twin of Windows #85); Wayland
 windowed weaving (**#817**) — the extension + runtime consumer are validated
-live on GNOME 50 / Ubuntu 26.04 (2026-09-19), but the weave *phase* still needs
-a 3D panel, and windowed Wayland is fullscreen-on-panel only today (see
-[Wayland](#wayland)); X11 is unaffected; the
+live on GNOME 50 / Ubuntu 26.04 (2026-09-19), and the logical→device conversion
+that actually feeds the phase landed with **#1596** (plus **#1595**, which
+degrades a session to flat 2D rather than weaving into a resample), but none of
+that is hardware-validated: the weave *phase and scale* still need a 3D panel
+in a Wayland session (see [Wayland](#wayland)); X11 is unaffected; the
 deployment target (Ubuntu 26.04 + Intel Arc), blocked on hardware; and the Track B
 shippable re-pin onto a merged `sr-sdk-v*` tag. Note that vendor-side weave
 maturity is tracked separately from runtime readiness — the runtime hands the
@@ -80,7 +82,11 @@ A **second present path for Wayland sessions** landed alongside Phase 3 —
 `XR_DXR_wayland_surface_binding` plus the #817 window-geometry provider — and
 has its own section: [Wayland](#wayland). Its extension and runtime consumer
 are validated live (GNOME 50 / Ubuntu 26.04, 2026-09-19); weave phase is not,
-because that needs a 3D panel.
+because that needs a 3D panel. The rule that governs that path: **Wayland
+reports geometry in logical coordinates, everything the weaver consumes is
+device pixels, and the conversion is the runtime's to perform at its Wayland
+boundary** (#1596) — and where the buffer cannot reach the glass unresampled,
+the session degrades to flat 2D rather than weaving into the resample (#1595).
 
 ## What already works on Linux (inherited from Monado, kept compiling)
 
@@ -449,18 +455,72 @@ source comments and, until this section, in no document at all.
 
 ### Constraints (all of them current, none of them bugs to file twice)
 
-- **100 % desktop scale is required.** Mutter reports *logical* pixels, which
-  equal physical pixels only at scale 1.0, and at any other scale the
-  compositor additionally resamples the surface on its way to the panel —
-  which destroys a 1-pixel-period interlace pattern outright, with no phase
-  correction possible. The provider therefore **refuses** a rect from a
-  non-1.0 monitor (one WARN) and falls back to display-scoped rather than
-  weave at a known-wrong phase. Same constraint as X11 windowed weaving.
-- **Fullscreen-on-panel only, today.** The Wayland target is created at the
-  panel dimensions (`settings.preferred.width/height`) and the live-resize poll
-  is the XCB geometry path, which a Wayland surface has no equivalent of — so a
-  resize is not followed. A window that is not covering the panel is a
-  display-scoped weave at best.
+- **Wayland reports geometry in LOGICAL coordinates; everything the weaver
+  consumes is DEVICE pixels, and the conversion is ours to perform.** The
+  vendor ships the same guarantee from its side — every geometry its SDK
+  reports or accepts is device pixels, unconditionally
+  (`docs/reference/xrt_plugin_iface.md`,
+  [`XR_DXR_weave`](../specs/extensions/XR_DXR_weave.md)) — so there is exactly
+  one place in the stack where the two spaces meet, and it is the runtime's
+  Wayland boundary. Since **#1596** that boundary **converts** instead of
+  refusing: the geometry payload has carried the window's `monitor` rect *and*
+  Mutter's fractional scale since schema v1 (they were simply never read), so
+  `comp_vk_native_wl_geom` puts the logical rect through
+  `auxiliary/util/u_wayland_geom.h` and hands the compositor device pixels —
+  origin relative to the window's own monitor, which
+  `get_window_metrics` turns back into an absolute rect by adding the runtime's
+  own resolved panel origin (ADR-033). A fractionally-scaled monitor is
+  therefore a supported configuration for the phase feed; the earlier #1557
+  behaviour (refuse any rect from a non-1.0 monitor) is gone, and with it the
+  reason a scaled desktop produced no present origin at all. Note that
+  `wl_output.scale` is **not** the conversion factor — it is an integer by
+  protocol and advertises 2 for the measured box's 1.6667 output, a 20 % error
+  that looks entirely plausible. The two honest sources are
+  `wl_output.mode ÷ xdg_output.logical_size`, or a compositor-published
+  fractional scale (`wp_fractional_scale_v1`; GNOME's
+  `Meta.Display.get_monitor_scale()`, which the geometry extension already
+  forwards). What a scaled desktop still costs is not the *units* but the
+  *resample* — see the next bullet. **X11 is unchanged** and still refuses the
+  phase at a non-panel-native root
+  (`vk_x11_present_origin_is_panel_native`): root coordinates there are
+  whatever the server's root happens to be, and under XWayland at a non-unit
+  scale that is a fiction with no published factor to undo.
+- **Refuse rather than resample (#1595).** A resampled weave is not degraded
+  3D. A ~1-pixel-period interlace run through a scaling filter is a uniform
+  double image across the whole surface with no vantage point where it
+  resolves, and nothing the runtime publishes downstream can undo it — flat 2D
+  is correct content in the wrong dimensionality, legible and recoverable, so
+  degrading is strictly better. `vk_linux_update_surface_not_1to1()` enforces
+  that on the Wayland arm. It fires on a **transition** when either (a) the
+  window's monitor is not the 3D panel, or (b) the buffer being presented is
+  not the window's DEVICE extent, and then does exactly what the Android
+  precedent `vk_android_update_container_scaled()` does: one WARN naming both
+  extents and which of the two reasons fired,
+  `request_display_mode(false)` plus the display processor's
+  `on_pause`/`on_resume` pair (the Leia DP only re-asserts the lens from inside
+  a weave, #1039), and `vk_compute_effective_layout` collapsing the frame to
+  tile 0. Grep a log for `NOT_1TO1:` — and for `NOT_1TO1 cleared:`, because the
+  degrade is reversible rather than sticky. **Three states, never two:**
+  cannot-be-1:1 degrades, is-1:1 weaves, *don't know* keeps the current state —
+  so a session without the `window-geometry@displayxr.org` service has no
+  destination extent to compare against and behaves exactly as it did before
+  the gate existed. The Wayland present-origin feed is gated on the same flag,
+  so a degraded session cannot leave a stale phase latched on the DP.
+  Deliberately **Wayland-only**: X11's only available signal is
+  `display_desktop_rect_is_panel`, which is false on every dev box by
+  construction (sim_display declares a 1920x1080 panel that no real desktop
+  rect matches), so gating the weave on it would put every X11 sim session into
+  flat 2D.
+- **Fullscreen-on-panel is the validated shape.** A Wayland surface has no
+  intrinsic size and no XCB geometry to poll, so the app declares its buffer
+  size (`XrWaylandSurfaceGeometryDXR` / `xrSetWaylandSurfaceGeometryDXR`, spec
+  v2) and the runtime follows resizes from that push rather than from a poll;
+  absent a declaration the target is created at the panel dimensions
+  (`settings.preferred.width/height`), which on Wayland does not mis-size the
+  window but resizes it. A windowed surface now gets a converted, device-pixel
+  phase anchor (#1596) rather than none — but it only weaves if its buffer
+  equals its device extent, which is the 1:1 gate above, and none of the
+  windowed case has been seen on a panel.
 - **Position comes from the geometry service, never from the client.** Wayland
   has no `xcb_translate_coordinates`; if the extension is absent, disabled, or
   the session bus is unavailable, the runtime degrades to display-scoped. The
@@ -468,10 +528,24 @@ source comments and, until this section, in no document at all.
 - **The extension takes effect at the next login.** Wayland cannot hot-reload
   GNOME Shell, so installing or updating the publisher requires a log out/in
   before `gnome-extensions enable` has any effect on a running session.
-- **Weave phase is NOT validated.** Everything above was proven on sim_display
-  and on the D-Bus wire. sim_display's anaglyph/SBS output degrades gracefully
-  under resampling and a wrong origin, so it cannot establish geometric
-  correctness at all — that needs a real 3D panel in a Wayland session.
+- **The phase feed now EXISTS on Wayland, and is still NOT validated.** Before
+  #1596 nothing on this path ever reached the DP's `set_present_origin`: the
+  measured session on 2026-09-20 (GNOME 50 / Ubuntu 26.04, a real Leia DP)
+  produced **zero** `present origin:` lines in the whole run, because the
+  provider refused every rect from the 1.6667-scaled monitor. It is fed now, in
+  device pixels. What is *proven* is the conversion itself: it is pure
+  arithmetic in `u_wayland_geom.h`, with no Wayland or platform dependency
+  precisely so a host test can pin it, and `tests/tests_aux_wayland_geom.cpp`
+  does — 22 cases against **both** of the measured box's scales, because an
+  integer-only implementation passes every 2.0 case and fails every 1.6667 one.
+  The 1:1 gate's *decision* is pinned by the same test. What has NOT been
+  re-measured since #1596 is a Wayland run against a real panel — neither that
+  `present origin:` now appears, nor the phase and scale it produces. Treat the
+  chain as built and unit-tested, not as observed. Everything else here was
+  proven on sim_display and on the D-Bus
+  wire, and sim_display's anaglyph/SBS output degrades gracefully under
+  resampling and a wrong origin, so it cannot establish geometric correctness
+  at all — that needs a real 3D panel in a Wayland session.
 - **PID matching assumes in-process.** The consumer matches windows owned by
   `getpid()`; service/IPC mode needs the client PID plumbed through (#817
   follow-up).
@@ -485,12 +559,12 @@ source comments and, until this section, in no document at all.
 - `contrib/gnome-shell/window-geometry@displayxr.org/README.md` — install,
   verify with `gdbus call`, and the distributor notes.
 - `docs/specs/extensions/XR_DXR_wayland_surface_binding.md` — the extension
-  spec. **Not on `main` yet** — the extension is published (header
-  `src/external/openxr_includes/openxr/XR_DXR_wayland_surface_binding.h`,
-  `SPEC_VERSION 1`, noted in `docs/specs/extensions/index.json`) but has no
-  prose spec, so until that file lands the authoritative description is the
-  header plus the `oxr_session.c` / `comp_vk_native_target.cpp` Wayland arms
-  cited above.
+  spec, now on `main` and current at **spec version 2** (the version that added
+  `XrWaylandSurfaceGeometryDXR` + `xrSetWaylandSurfaceGeometryDXR`, so an app
+  declares its own buffer size). Header:
+  `src/external/openxr_includes/openxr/XR_DXR_wayland_surface_binding.h`, noted
+  in `docs/specs/extensions/index.json`. Its §4.6/§4.7 carry the app-side
+  output-matching recipe in device pixels.
 
 ## Decisions
 
