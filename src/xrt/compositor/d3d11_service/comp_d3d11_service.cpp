@@ -5632,20 +5632,45 @@ set_blend_state(struct d3d11_service_system *sys, enum comp_layer_blend_mode mod
 	}
 }
 
+/*!
+ * Say ONCE that a projection layer that asked to blend had to be copied.
+ *
+ * `CopySubresourceRegion` is a transfer, not a draw: it cannot blend, so on the
+ * copy fallbacks a later projection layer composites as an overwrite and the
+ * layer under it is lost — the #1598 symptom, narrowed to whatever made the
+ * shader blit unavailable (no `blit_vs`, or no SRV on the client's image). A
+ * no-op for @p blend == nullptr, which is every REPLACE / OPAQUE_COVER layer
+ * and therefore every single-projection frame. Never per frame (#1598 is a
+ * composition bug, not a hot-path one).
+ */
+static void
+warn_once_projection_copy_cannot_blend(ID3D11BlendState *blend)
+{
+	static bool warned = false;
+	if (blend == nullptr || warned) {
+		return;
+	}
+	warned = true;
+	U_LOG_W(
+	    "#1598: a blending projection layer fell back to CopySubresourceRegion — it cannot blend, so "
+	    "the layer beneath it is overwritten on this frame");
+}
+
+/*!
+ * @param mode How this layer composites into the tile, already resolved by the
+ *        caller through comp_layer_tile_blend_mode() so the painter's-order
+ *        gate is applied exactly once per layer per view (#1598). Used both to
+ *        bind the blend state and to fold OPAQUE_COVER's alpha-of-one into the
+ *        constant buffer — the two halves of that mode, see set_blend_state().
+ */
 static void
 render_quad_layer(struct d3d11_service_system *sys,
                   const struct comp_layer *layer,
                   uint32_t view_index,
                   const struct xrt_pose *view_pose,
-                  const struct xrt_fov *fov)
+                  const struct xrt_fov *fov,
+                  enum comp_layer_blend_mode mode)
 {
-	// TODO(#1590): the back-face skip the in-process renderer now applies
-	// (`comp_layer_quad_is_front_facing(&q->pose, &view_pose->position)`)
-	// belongs here too — the spec says the back face "must not be drawn by
-	// the runtime" on every path. It is NOT applied here yet on purpose:
-	// under the shell this call also composes out-of-tree workspace chrome,
-	// so turning culling on is a visible change that needs a panel eyeball
-	// first. One `if` once that is done.
 	const struct xrt_layer_data *data = &layer->data;
 	const struct xrt_layer_quad_data *q = &data->quad;
 
@@ -5705,12 +5730,11 @@ render_quad_layer(struct d3d11_service_system *sys,
 
 	get_color_scale_bias(data, constants.color_scale, constants.color_bias);
 
-	// A quad is never a tile's base cover, so it takes its own flags. An
-	// unflagged one is an OPAQUE_COVER: the spec's alpha-of-one, emitted by
-	// quad_ps_hlsl's `color * color_scale + color_bias` line, because no
-	// fixed-function blend factor can turn an arbitrary src.a into a
-	// constant one (see comp_layer_view_camera.h).
-	const enum comp_layer_blend_mode mode = comp_layer_blend_mode(data->flags);
+	// An unflagged LATER quad is an OPAQUE_COVER: the spec's alpha-of-one,
+	// emitted by quad_ps_hlsl's `color * color_scale + color_bias` line,
+	// because no fixed-function blend factor can turn an arbitrary src.a
+	// into a constant one (see comp_layer_view_camera.h). A no-op for the
+	// first-in-tile REPLACE, whose alpha must stay verbatim (#225).
 	comp_layer_blend_fold_opaque_cover(mode, constants.color_scale, constants.color_bias);
 
 	// #1601: honour the quad's subImage.imageArrayIndex. Gated on the
@@ -5767,7 +5791,8 @@ render_cylinder_layer(struct d3d11_service_system *sys,
                       const struct comp_layer *layer,
                       uint32_t view_index,
                       const struct xrt_pose *view_pose,
-                      const struct xrt_fov *fov)
+                      const struct xrt_fov *fov,
+                      enum comp_layer_blend_mode mode)
 {
 	const struct xrt_layer_data *data = &layer->data;
 	const struct xrt_layer_cylinder_data *cyl = &data->cylinder;
@@ -5825,10 +5850,9 @@ render_cylinder_layer(struct d3d11_service_system *sys,
 
 	get_color_scale_bias(data, constants.color_scale, constants.color_bias);
 
-	// As for quads: an unflagged cylinder is an OPAQUE_COVER, and
+	// As for quads: an unflagged LATER cylinder is an OPAQUE_COVER, and
 	// cylinder_ps_hlsl's scale/bias line is where its alpha-of-one comes
-	// from.
-	const enum comp_layer_blend_mode mode = comp_layer_blend_mode(data->flags);
+	// from. The mode is the caller's (#1598).
 	comp_layer_blend_fold_opaque_cover(mode, constants.color_scale, constants.color_bias);
 
 	constants.radius = cyl->radius;
@@ -5879,7 +5903,8 @@ render_equirect2_layer(struct d3d11_service_system *sys,
                        const struct comp_layer *layer,
                        uint32_t view_index,
                        const struct xrt_pose *view_pose,
-                       const struct xrt_fov *fov)
+                       const struct xrt_fov *fov,
+                       enum comp_layer_blend_mode mode)
 {
 	const struct xrt_layer_data *data = &layer->data;
 	const struct xrt_layer_equirect2_data *eq = &data->equirect2;
@@ -5939,11 +5964,11 @@ render_equirect2_layer(struct d3d11_service_system *sys,
 
 	get_color_scale_bias(data, constants.color_scale, constants.color_bias);
 
-	// As for quads. NOTE: equirect2_ps_hlsl returns float4(0,0,0,0) for
-	// fragments OUTSIDE the layer's angular extent, an early-out that never
-	// reaches the scale/bias line — so the fold raises alpha exactly where
-	// the layer covers, which is what "the layer's alpha is one" means.
-	const enum comp_layer_blend_mode mode = comp_layer_blend_mode(data->flags);
+	// As for quads, with the caller's mode (#1598). NOTE: equirect2_ps_hlsl
+	// returns float4(0,0,0,0) for fragments OUTSIDE the layer's angular
+	// extent, an early-out that never reaches the scale/bias line — so the
+	// fold raises alpha exactly where the layer covers, which is what "the
+	// layer's alpha is one" means.
 	comp_layer_blend_fold_opaque_cover(mode, constants.color_scale, constants.color_bias);
 
 	memcpy(constants.to_tangent, to_tangent, sizeof(constants.to_tangent));
@@ -19438,8 +19463,16 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	bool has_window_space_layers = false;
 	bool zones_frame = false;
 	bool has_local_2d = false;
+	// #1598: how many projection-class layers this frame carries. One is the
+	// shipping case and keeps every path below byte-identical; two or more
+	// means they must composite in submission order rather than last-one-wins,
+	// which disqualifies zero-copy (there is nothing to pass through) and
+	// promotes every layer past the first to a blending blit.
+	uint32_t projection_layer_count = 0;
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		switch (c->layer_accum.layers[i].data.type) {
+		case XRT_LAYER_PROJECTION:
+		case XRT_LAYER_PROJECTION_DEPTH: projection_layer_count++; break;
 		case XRT_LAYER_QUAD:
 		case XRT_LAYER_CYLINDER:
 		case XRT_LAYER_EQUIRECT2:
@@ -19460,6 +19493,11 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			break;
 		}
 	}
+	// #1598: the UI-layer pass runs AFTER the projection blit loop and the
+	// zones composite, both of which paint the whole tile — so when the frame
+	// carries either, the tile is already composited when the first quad is
+	// reached and that quad blends rather than replacing.
+	const bool projection_class_frame = projection_layer_count > 0 || zones_frame;
 
 	// XR_DXR_display_zones tier-1 wish fallback (#549): zones clients never
 	// call xrRequestDisplayRenderingModeDXR — in-process the published zone
@@ -19689,6 +19727,19 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 	profile_s1 = os_monotonic_get_ns(); // Phase 5a — end of pre-loop setup.
 
+	/*
+	 * #1598 — painter's-order state for the projection blits.
+	 *
+	 * ONE state for the whole atlas, not one per view: every projection
+	 * layer blits every view of the frame, so "has anything landed in this
+	 * tile yet" has the same answer in all of them and the gate is resolved
+	 * once per LAYER. The loop below already walks the accum in submission
+	 * order (it is append-only and nothing sorts it); what was missing is
+	 * that every layer blitted with blending off, so layer N+1 erased
+	 * layer N — the CTS ProjectionQuadProjection case.
+	 */
+	struct comp_layer_tile_state proj_tile = {};
+
 	// Render projection layers to stereo texture (via copy)
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		struct comp_layer *layer = &c->layer_accum.layers[i];
@@ -19777,6 +19828,39 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		}
 		if (!views_valid) continue;
 		projection_rendered = true;
+
+		/*
+		 * #1598 — how THIS projection layer composites into the tiles.
+		 *
+		 * Resolved once per layer, after the validity check so a layer
+		 * that blits nothing does not consume the tile's base slot.
+		 *
+		 *   REPLACE       the first one in — verbatim RGBA, which is
+		 *                 the compose-under contract (#225) and is
+		 *                 exactly today's copy/blit.
+		 *   PREMULTIPLIED
+		 *   STRAIGHT      a later layer that asked to blend; the blit
+		 *                 below binds the matching state.
+		 *   OPAQUE_COVER  a later UNFLAGGED layer. Its colour is a
+		 *                 verbatim cover, so today's path is already
+		 *                 right there; its alpha-of-one is NOT emitted
+		 *                 on this path, because blit_ps has no
+		 *                 colour-scale/bias channel to fold it into and
+		 *                 no fixed-function blend factor can synthesise
+		 *                 a constant one. The residue is atlas alpha in
+		 *                 a transparent session on a frame with two or
+		 *                 more projection layers where the later one is
+		 *                 unflagged — no shipping app, and fixing it
+		 *                 means touching a pixel shader shared with the
+		 *                 chrome/weave/zone blits.
+		 */
+		const enum comp_layer_blend_mode proj_mode = comp_layer_tile_blend_mode(&proj_tile, layer->data.flags);
+		ID3D11BlendState *proj_blend = nullptr; // nullptr = today's opaque overwrite
+		if (proj_mode == COMP_LAYER_BLEND_PREMULTIPLIED) {
+			proj_blend = sys->blend_premul.get();
+		} else if (proj_mode == COMP_LAYER_BLEND_STRAIGHT) {
+			proj_blend = sys->blend_alpha.get();
+		}
 
 		// Phase 1 Task 1.2 — drop service-thread KeyedMutex timeout from
 		// 100 ms to a frame-budget value (4 ms, matching the chrome-overlay
@@ -20084,11 +20168,17 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		if (has_ui_layers) zc_reason = "ui_layers";
 		else if (has_window_space_layers) zc_reason = "window_space_layers";
 		else if (zones_frame || has_local_2d) zc_reason = "zones_layers";
+		// #1598: two projection layers must COMPOSITE, and a passthrough
+		// composites nothing — the old gate let the second layer set
+		// `use_zero_copy` and hand the display processor whichever app
+		// texture happened to be last, discarding the other entirely.
+		else if (projection_layer_count > 1)
+			zc_reason = "multi_projection";
 		else if (!all_views_zc_eligible) zc_reason = "view_ineligible";
 		else if (sys->workspace_mode) zc_reason = "workspace_mode";
 
 		if (!has_ui_layers && !has_window_space_layers && !zones_frame && !has_local_2d &&
-		    all_views_zc_eligible && !sys->workspace_mode) {
+		    projection_layer_count <= 1 && all_views_zc_eligible && !sys->workspace_mode) {
 			// Check all views reference the same swapchain image
 			bool all_same = true;
 			for (uint32_t eye = 1; eye < proj_view_count; eye++) {
@@ -20360,16 +20450,16 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				HRESULT blit_hr = sys->device->CreateShaderResourceView(
 				    view_textures[eye], &srv_desc, srgb_srv.put());
 				if (SUCCEEDED(blit_hr)) {
-					blit_to_atlas_texture(sys, &c->render, srgb_srv.get(),
-					    src_x, src_y, src_w, src_h,
-					    (float)view_descs[eye].Width, (float)view_descs[eye].Height,
-					    (float)tile_x, (float)tile_y,
-					    dst_w, dst_h, true,
-					    /*blend=*/nullptr, /*rtv_override=*/nullptr,
-					    /*dst_tex_w=*/0.0f, /*dst_tex_h=*/0.0f,
-					    /*is_array=*/is_layered, /*array_slice=*/src_slice);
+					blit_to_atlas_texture(sys, &c->render, srgb_srv.get(), src_x, src_y, src_w,
+						              src_h, (float)view_descs[eye].Width,
+						              (float)view_descs[eye].Height, (float)tile_x,
+						              (float)tile_y, dst_w, dst_h, true,
+						              /*blend=*/proj_blend, /*rtv_override=*/nullptr,
+						              /*dst_tex_w=*/0.0f, /*dst_tex_h=*/0.0f,
+						              /*is_array=*/is_layered, /*array_slice=*/src_slice);
 				} else {
 					// Fallback to raw copy
+					warn_once_projection_copy_cannot_blend(proj_blend);
 					D3D11_BOX box = {};
 					box.left = (UINT)src_x; box.top = (UINT)src_y;
 					box.right = (UINT)(src_x + src_w); box.bottom = (UINT)(src_y + src_h);
@@ -20385,19 +20475,33 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				// atlas in gamma space, matching the raw-copy path that
 				// multi_compositor_render expects. The per-image SRV is already
 				// a Texture2DArray for layered sources (ADR-032, create/import).
-				blit_to_atlas_texture(sys, &c->render,
-				    view_scs[eye]->images[view_img_indices[eye]].srv.get(),
-				    src_x, src_y, src_w, src_h,
-				    (float)view_descs[eye].Width, (float)view_descs[eye].Height,
-				    (float)tile_x, (float)tile_y,
-				    dst_w, dst_h, false,
-				    /*blend=*/nullptr, /*rtv_override=*/nullptr,
+				blit_to_atlas_texture(
+				    sys, &c->render, view_scs[eye]->images[view_img_indices[eye]].srv.get(), src_x,
+				    src_y, src_w, src_h, (float)view_descs[eye].Width, (float)view_descs[eye].Height,
+				    (float)tile_x, (float)tile_y, dst_w, dst_h, false,
+				    /*blend=*/proj_blend, /*rtv_override=*/nullptr,
+				    /*dst_tex_w=*/0.0f, /*dst_tex_h=*/0.0f,
+				    /*is_array=*/is_layered, /*array_slice=*/src_slice);
+			} else if (proj_blend != nullptr && can_shader_blit) {
+				// #1598: a LATER projection layer that asked to blend. A
+				// transfer copy cannot blend at all, so this one view is
+				// promoted to the shader blit — same source SRV and the
+				// same raw-bytes (is_srgb=false) semantics the copy below
+				// has, plus the blend state. Only reachable on a frame
+				// with two or more projection layers; the first one, and
+				// every single-projection frame, still takes the copy.
+				blit_to_atlas_texture(
+				    sys, &c->render, view_scs[eye]->images[view_img_indices[eye]].srv.get(), src_x,
+				    src_y, src_w, src_h, (float)view_descs[eye].Width, (float)view_descs[eye].Height,
+				    (float)tile_x, (float)tile_y, dst_w, dst_h, false,
+				    /*blend=*/proj_blend, /*rtv_override=*/nullptr,
 				    /*dst_tex_w=*/0.0f, /*dst_tex_h=*/0.0f,
 				    /*is_array=*/is_layered, /*array_slice=*/src_slice);
 			} else {
 				// Non-SRGB, or workspace mode with content already fitting the
 				// tile, or shader unavailable: raw byte copy. Multi-comp
 				// (workspace) and non-SRGB DP handle the rest as today.
+				warn_once_projection_copy_cannot_blend(proj_blend);
 				D3D11_BOX box = {};
 				box.left = static_cast<UINT>(src_x);
 				box.top = static_cast<UINT>(src_y);
@@ -20414,7 +20518,6 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				    layer->data.proj.v[eye].sub.array_index,  // src subresource
 				    &box);
 			}
-
 		}
 		} // !zero_copy
 
@@ -20649,6 +20752,29 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			                                   have_ui_wm ? ui_wm.window_height_m : 0.0f,
 			                                   &ui_cameras[view]);
 		}
+
+		/*
+		 * #1598 — painter's-order state, one per tile, for THIS frame.
+		 *
+		 * Seeded COMPOSITED when the frame carried a projection-class
+		 * layer, because the projection blit loop and the zones
+		 * composite above have already painted every tile by the time
+		 * this pass runs. Without that seed the first quad of an
+		 * app-with-a-projection frame would resolve to REPLACE and
+		 * stamp its texture alpha over live content.
+		 *
+		 * A UI-ONLY frame starts unpainted, so its first layer is the
+		 * tile's base blit and writes alpha verbatim (#225) — the same
+		 * rule vk_native applies. (The per-client atlas is persistent
+		 * and is not cleared on such a frame, so what the base blit
+		 * lands on is last frame's pixels; that staleness predates
+		 * #1598 and is untouched here.)
+		 */
+		struct comp_layer_tile_state ui_tiles[XRT_MAX_VIEWS] = {};
+		for (uint32_t view = 0; view < ui_view_count; view++) {
+			ui_tiles[view].composited = projection_class_frame;
+		}
+
 		for (uint32_t view_index = 0; view_index < ui_view_count; view_index++) {
 			// Set viewport for this view
 			D3D11_VIEWPORT viewport = {};
@@ -20678,63 +20804,109 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			sys->context->RSSetViewports(1, &viewport);
 
 			/*
-			 * TODO(#1598): these three passes are TYPE-ordered, and
-			 * the spec's painter's algorithm is SUBMISSION-ordered.
-			 * Every index is discarded across types here — equirect2,
-			 * then cylinder, then quad, whatever order the app sent
-			 * them in — so a quad submitted UNDER an equirect2 still
-			 * lands on top of it. The in-process renderer walks one
-			 * submission-ordered loop and is correct; this path is
-			 * structurally wrong, and deliberately OUT of scope for
-			 * the #1598 in-process fix.
+			 * #1598 — ONE loop, in SUBMISSION order.
 			 *
-			 * Collapsing them is ~60-100 lines: one loop over
-			 * layer_accum in index order dispatching on type, plus a
-			 * `comp_layer_tile_state` per view fed through
-			 * comp_layer_tile_blend_mode() exactly as the in-process
-			 * renderer now does. The hard part is upstream of here —
-			 * the projection pass above blits with
-			 * CopySubresourceRegion on two fallback paths (the
-			 * non-SRGB / already-fitting raw copy and the
-			 * failed-SRGB-SRV copy), and a transfer copy CANNOT
-			 * blend, so a non-first projection layer has to be
-			 * promoted to the shader blit (blit_to_atlas_texture,
-			 * which already takes a blend state) before submission
-			 * order means anything on this path.
+			 * This used to be three TYPE-ordered passes (equirect2,
+			 * then cylinder, then quad), which discards the app's
+			 * index entirely: a quad submitted UNDER an equirect2
+			 * still landed on top of it. The accum is append-only
+			 * and nothing sorts it, so walking it once in index
+			 * order IS the spec's painter's algorithm; the blend
+			 * decision is the shared one, and the first layer into
+			 * a tile is a REPLACE whatever its flags say.
+			 *
+			 * Projection-class layers are NOT in this loop — they
+			 * are blitted (and, since #1598, blended) in the
+			 * earlier pass, which owns the keyed-mutex acquire, the
+			 * zero-copy decision and the content-dims record.
+			 * Consequence, and the one ordering deviation left on
+			 * this path: a projection layer submitted AFTER a quad
+			 * is composited BEFORE it, so it cannot cover it. Same
+			 * split as the in-process renderer's Local2D /
+			 * window-space channel, which is likewise a later pass
+			 * (here it is later still — multi_compositor_render).
 			 */
-
-			// Render equirect2 layers first (background/skybox)
 			for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 				struct comp_layer *layer = &c->layer_accum.layers[i];
-				if (layer->data.type == XRT_LAYER_EQUIRECT2) {
-					if (is_layer_view_visible_n(&layer->data, view_index, ui_view_count)) {
-						render_equirect2_layer(sys, layer, view_index,
-						                       &ui_cameras[view_index].pose,
-						                       &ui_cameras[view_index].fov);
-					}
+				const enum xrt_layer_type type = layer->data.type;
+				if (type != XRT_LAYER_EQUIRECT2 && type != XRT_LAYER_CYLINDER &&
+				    type != XRT_LAYER_QUAD) {
+					continue;
 				}
-			}
 
-			// Render cylinder layers
-			for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
-				struct comp_layer *layer = &c->layer_accum.layers[i];
-				if (layer->data.type == XRT_LAYER_CYLINDER) {
-					if (is_layer_view_visible_n(&layer->data, view_index, ui_view_count)) {
-						render_cylinder_layer(sys, layer, view_index,
-						                      &ui_cameras[view_index].pose,
-						                      &ui_cameras[view_index].fov);
-					}
+				// Per-eye visibility, view-count aware (#1580).
+				if (!is_layer_view_visible_n(&layer->data, view_index, ui_view_count)) {
+					continue;
 				}
-			}
 
-			// Render quad layers last (on top)
-			for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
-				struct comp_layer *layer = &c->layer_accum.layers[i];
-				if (layer->data.type == XRT_LAYER_QUAD) {
-					if (is_layer_view_visible_n(&layer->data, view_index, ui_view_count)) {
-						render_quad_layer(sys, layer, view_index, &ui_cameras[view_index].pose,
-						                  &ui_cameras[view_index].fov);
+				/*
+				 * #1590: "Only front face of the quad surface
+				 * is visible; the back face is not visible and
+				 * must not be drawn by the runtime." The front
+				 * normal is the quad's +Z, and the camera is
+				 * THIS view's (#1580) — the SAME one the MVP
+				 * inside render_quad_layer() is built from — so
+				 * a quad turned away in one eye and toward the
+				 * other is dropped per eye. A predicate, not
+				 * rasterizer culling: the pipeline is
+				 * CULL_NONE (see the shared helper).
+				 *
+				 * Tested here rather than inside the draw
+				 * because a culled quad must NOT mark the tile
+				 * composited — it painted nothing, so the next
+				 * layer is still the first one in.
+				 */
+				if (type == XRT_LAYER_QUAD &&
+				    !comp_layer_quad_is_front_facing(&layer->data.quad.pose,
+				                                     &ui_cameras[view_index].pose.position)) {
+					// Say it ONCE per process. This path also
+					// composes an out-of-tree workspace
+					// controller's chrome quads, so "a panel
+					// element disappeared after the #1590
+					// leg landed" needs to be one grep away
+					// — without turning a per-frame,
+					// per-quad, per-view decision into a
+					// per-frame log.
+					static bool culled_warned = false;
+					if (!culled_warned) {
+						culled_warned = true;
+						U_LOG_W(
+						    "#1590: dropped a back-facing quad layer (its +Z faces "
+						    "away from view %u's camera); a quad meant to be seen "
+						    "from here needs its pose re-oriented",
+						    view_index);
 					}
+					continue;
+				}
+
+				/*
+				 * Resolve AND mark in one call. The mark is
+				 * eager past this point: a layer that then
+				 * fails on a null swapchain or an out-of-range
+				 * image index still counts as having taken its
+				 * slot, which keeps "which layer is the base"
+				 * a pure function of the layer LIST rather
+				 * than of a transient swapchain hiccup — the
+				 * same rule the in-process projection loop
+				 * states.
+				 */
+				const enum comp_layer_blend_mode mode =
+				    comp_layer_tile_blend_mode(&ui_tiles[view_index], layer->data.flags);
+
+				switch (type) {
+				case XRT_LAYER_EQUIRECT2:
+					render_equirect2_layer(sys, layer, view_index, &ui_cameras[view_index].pose,
+					                       &ui_cameras[view_index].fov, mode);
+					break;
+				case XRT_LAYER_CYLINDER:
+					render_cylinder_layer(sys, layer, view_index, &ui_cameras[view_index].pose,
+					                      &ui_cameras[view_index].fov, mode);
+					break;
+				case XRT_LAYER_QUAD:
+					render_quad_layer(sys, layer, view_index, &ui_cameras[view_index].pose,
+					                  &ui_cameras[view_index].fov, mode);
+					break;
+				default: break;
 				}
 			}
 		}
