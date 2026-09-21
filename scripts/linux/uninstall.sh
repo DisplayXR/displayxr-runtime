@@ -17,6 +17,7 @@ if [ "$SYSTEM" = 1 ]; then
     PREFIX=/usr/local
     OPENXR_CONF_DIR=/etc/xdg/openxr/1
     DP_ROOT=/usr/local/share/displayxr/DisplayProcessors
+    EXT_ROOT=/usr/local/share/gnome-shell/extensions
     UNIT=""
 else
     DATA_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}"
@@ -24,6 +25,7 @@ else
     PREFIX="$DATA_ROOT/displayxr"
     OPENXR_CONF_DIR="$CONFIG_ROOT/openxr/1"
     DP_ROOT="$DATA_ROOT/DisplayXR/DisplayProcessors"
+    EXT_ROOT="$DATA_ROOT/gnome-shell/extensions"
     UNIT="$CONFIG_ROOT/systemd/user/displayxr.service"
 fi
 
@@ -46,9 +48,16 @@ rm -f "$DP_ROOT/200-sim-display.json"
 # Leave other vendors' manifests + the shared root in place; prune if empty.
 rmdir "$DP_ROOT" 2>/dev/null || true
 
+# GNOME Shell extension: remove the files install.sh placed. Users' own
+# enabled-extensions lists are left alone — a UUID with no files is inert, and
+# another package (e.g. the .deb) may still provide the extension.
+rm -rf "$EXT_ROOT/window-geometry@displayxr.org"
+[ "$SYSTEM" = 1 ] && rm -f /etc/xdg/autostart/displayxr-gnome-extension-enable.desktop
+
 if [ "$SYSTEM" = 1 ]; then
     # /usr/local is shared — remove only what install.sh placed.
     rm -f "$PREFIX/bin/displayxr-cli" "$PREFIX/bin/displayxr-service" \
+        "$PREFIX/bin/displayxr-gnome-extension-enable" \
         "$PREFIX/lib/openxr_displayxr.so" "$PREFIX/lib/displayxr/plugins/DisplayXR-SimDisplay.so"
     rmdir -p "$PREFIX/lib/displayxr/plugins" 2>/dev/null || true
 else
