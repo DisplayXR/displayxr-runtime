@@ -503,13 +503,19 @@ DxrLinuxWindow::create_x11(const DxrLinuxWindowDesc &desc)
 			          m_x_window, desc.width, desc.height, screenLeft, screenTop, where, wa.width,
 			          wa.height, rx, ry);
 		} else {
-			DXRW_INFO("Created app-owned X11 window 0x%lx: requested %ux%u at (%d, %d) windowed%s%s; "
-			          "actual %dx%d at (%d, %d)",
-			          m_x_window, desc.width, desc.height, screenLeft, screenTop,
-			          fs_opt_out ? " (DXR_X11_NO_FULLSCREEN)" : "",
-			          client_drag ? ", undecorated + client-owned drag" : " (DXR_X11_WM_DECORATIONS)",
-			          wa.width, wa.height, rx, ry);
-		}
+                  DXRW_INFO("Created app-owned X11 window 0x%lx: requested "
+                            "%ux%u at (%d, %d) windowed%s%s; "
+                            "actual %dx%d at (%d, %d)",
+                            m_x_window, desc.width, desc.height, screenLeft,
+                            screenTop,
+                            fs_opt_out ? " (DXR_X11_NO_FULLSCREEN)" : "",
+                            client_drag ? ", undecorated + client-owned drag "
+                                          "(snap offered by the display "
+                                          "processor; each landing is "
+                                          "verified, see 'drag: placement')"
+                                        : " (DXR_X11_WM_DECORATIONS)",
+                            wa.width, wa.height, rx, ry);
+                }
 		m_x_drag_at_x = rx;
 		m_x_drag_at_y = ry;
 	}
@@ -557,12 +563,18 @@ DxrLinuxWindow::snap_origin(int origin_x, int origin_y, int target_x, int target
 	}
 	if (!m_snap_reported) {
 		m_snap_reported = true;
-		DXRW_INFO("drag: snap provider %s — %s",
-		          m_snap_fn != nullptr ? "installed" : "ABSENT (identity)",
-		          snapped ? "the display processor IS snapping window origins"
-		                  : "identity for now (no DP lattice snap on this runtime); "
-		                    "the drag mechanics are unaffected");
-	}
+                DXRW_INFO("drag: snap provider %s — %s",
+                          m_snap_fn != nullptr ? "installed"
+                                               : "ABSENT (identity)",
+                          snapped ? "the display processor is OFFERING snapped "
+                                    "origins — whether the window "
+                                    "actually lands on them is checked per "
+                                    "move ('drag: placement')"
+                                  : "identity (no DP lattice snap on this "
+                                    "runtime, or the runtime refused "
+                                    "the snap — see its log); the drag "
+                                    "mechanics are unaffected");
+        }
 	*out_x = (int)sx;
 	*out_y = (int)sy;
 }
@@ -573,7 +585,9 @@ DxrLinuxWindow::x11_move_snapped(int target_x, int target_y)
 	if (m_x_display == nullptr || m_x_window == 0) {
 		return;
 	}
-	int sx = target_x;
+        x11_check_landing();
+
+        int sx = target_x;
 	int sy = target_y;
 	snap_origin(m_x_drag_origin_x, m_x_drag_origin_y, target_x, target_y, &sx, &sy);
 
@@ -591,6 +605,43 @@ DxrLinuxWindow::x11_move_snapped(int target_x, int target_y)
 	m_x_drag_at_x = sx;
 	m_x_drag_at_y = sy;
 	m_x_drag_moves++;
+        m_x_probe_pending = true;
+        m_x_probe_want_x = sx;
+        m_x_probe_want_y = sy;
+}
+
+void DxrLinuxWindow::x11_check_landing() {
+  if (!m_x_probe_pending || m_x_display == nullptr || m_x_window == 0) {
+    return;
+  }
+  m_x_probe_pending = false;
+  int got_x = 0, got_y = 0;
+  x11_root_origin(m_x_display, m_x_window, &got_x, &got_y);
+  u_x11_placement_probe_note(&m_x_probe, m_x_probe_want_x, m_x_probe_want_y,
+                             got_x, got_y);
+
+  if (!m_x_probe.reported && u_x11_placement_probe_is_quantized(&m_x_probe)) {
+    m_x_probe.reported = true;
+    // One line, once per process: the claim a snapped drag makes is
+    // "the window lands where the lens wants it". It does not, so say so,
+    // and name the cause that has actually produced this.
+    DXRW_WARN("drag: placement NOT honoured — %u of %u moves landed somewhere "
+              "other than the "
+              "requested origin (worst %u px); landed positions fall on a %u "
+              "px lattice. The "
+              "window cannot reach every pixel, so the 3D will stutter while "
+              "dragging. Most "
+              "likely cause: XWayland is running the X screen at global scale "
+              "%u because some "
+              "output (often NOT the 3D panel) is scaled above 100%%. Fix: "
+              "every output at "
+              "100%%, or set DXR_X11_PLACEMENT_QUANTUM=%u so the runtime snaps "
+              "on the reachable "
+              "lattice. `displayxr-cli info` shows the per-output evidence.",
+              m_x_probe.diverged, m_x_probe.moves, m_x_probe.worst_delta,
+              m_x_probe.inferred_quantum, m_x_probe.inferred_quantum,
+              m_x_probe.inferred_quantum);
+  }
 }
 
 void
@@ -626,11 +677,16 @@ DxrLinuxWindow::x11_drive_test_drag()
 
 	if (i >= n) {
 		m_x_test_drag_done = true;
-		DXRW_INFO("drag: end (TEST HOOK) — %llu move(s), %llu snapped away from the raw target, "
-		          "origin (%d, %d) -> (%d, %d)",
-		          (unsigned long long)m_x_drag_moves, (unsigned long long)m_x_drag_snapped,
-		          m_x_drag_origin_x, m_x_drag_origin_y, m_x_drag_at_x, m_x_drag_at_y);
-	}
+                DXRW_INFO("drag: end (TEST HOOK) — %llu move(s), %llu snapped "
+                          "away from the raw target, "
+                          "origin (%d, %d) -> (%d, %d); placement so far: %u "
+                          "of %u verified moves landed exactly",
+                          (unsigned long long)m_x_drag_moves,
+                          (unsigned long long)m_x_drag_snapped,
+                          m_x_drag_origin_x, m_x_drag_origin_y, m_x_drag_at_x,
+                          m_x_drag_at_y, m_x_probe.moves - m_x_probe.diverged,
+                          m_x_probe.moves);
+        }
 }
 
 //! Map an X keysym onto the backend-neutral key identity.
@@ -1314,11 +1370,18 @@ DxrLinuxWindow::pump(const std::function<void(DxrKey)> &on_key, bool *running)
 				m_x_dragging = false;
 				XUngrabPointer(m_x_display, CurrentTime);
 				XFlush(m_x_display);
-				DXRW_INFO("drag: end — %llu move(s), %llu snapped away from the raw target, "
-				          "origin (%d, %d) -> (%d, %d)",
-				          (unsigned long long)m_x_drag_moves, (unsigned long long)m_x_drag_snapped,
-				          m_x_drag_origin_x, m_x_drag_origin_y, m_x_drag_at_x, m_x_drag_at_y);
-			}
+                                DXRW_INFO("drag: end — %llu move(s), %llu "
+                                          "snapped away from the raw target, "
+                                          "origin (%d, %d) -> (%d, %d); "
+                                          "placement so far: %u of %u verified "
+                                          "moves landed exactly",
+                                          (unsigned long long)m_x_drag_moves,
+                                          (unsigned long long)m_x_drag_snapped,
+                                          m_x_drag_origin_x, m_x_drag_origin_y,
+                                          m_x_drag_at_x, m_x_drag_at_y,
+                                          m_x_probe.moves - m_x_probe.diverged,
+                                          m_x_probe.moves);
+                        }
 		}
 
 		if (have_motion && m_x_dragging) {
