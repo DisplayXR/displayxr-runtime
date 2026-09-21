@@ -423,8 +423,9 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
     `xrEndFrame` is out of scope; mark it `DXR_STEREO_FIXED_APP` and move on.
 
   The old under-submit allowance is staged out through `DXR_UNDER_SUBMIT` (default `1`, which
-  still accepts a 1-view `PRIMARY_STEREO` layer in a 1-view mode and logs it once per
-  session). Do not build on it.
+  still accepts a 1-view layer in a 1-view mode — `PRIMARY_STEREO` or `PRIMARY_MULTIVIEW_DXR`,
+  #1612 — and logs it once per session). Do not build on it: the window closes once every demo
+  aliases its inactive views.
 
 ---
 
