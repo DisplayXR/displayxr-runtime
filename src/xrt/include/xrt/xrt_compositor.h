@@ -2151,13 +2151,20 @@ xrt_comp_layer_commit_with_semaphore(struct xrt_compositor *xc, struct xrt_compo
 /*!
  * @copydoc xrt_compositor::get_display_refresh_rate
  *
- * Helper for calling through the function pointer.
+ * Helper for calling through the function pointer. Returns
+ * XRT_ERROR_FEATURE_NOT_SUPPORTED when the compositor doesn't implement it (the
+ * in-process native compositors do not); the state tracker gates this with
+ * refresh_rate_count, so the guard is defensive.
  *
  * @public @memberof xrt_compositor
  */
 static inline xrt_result_t
 xrt_comp_get_display_refresh_rate(struct xrt_compositor *xc, float *out_display_refresh_rate_hz)
 {
+	if (xc->get_display_refresh_rate == NULL) {
+		*out_display_refresh_rate_hz = 0.0f;
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
 	return xc->get_display_refresh_rate(xc, out_display_refresh_rate_hz);
 }
 
@@ -2165,7 +2172,9 @@ xrt_comp_get_display_refresh_rate(struct xrt_compositor *xc, float *out_display_
  * @copydoc xrt_compositor::request_display_refresh_rate
  *
  * Helper for calling through the function pointer. No-op (returns success) when
- * the compositor doesn't implement it (in-process native, null compositor).
+ * the compositor doesn't implement it: the in-process native compositors
+ * (vk_native, d3d11, d3d12, gl, metal) do not; multi, null and the IPC client
+ * do. The app-facing rejection is reported by the state tracker.
  *
  * @public @memberof xrt_compositor
  */

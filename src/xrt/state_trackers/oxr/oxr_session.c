@@ -5671,12 +5671,13 @@ oxr_session_request_display_refresh_rate(struct oxr_logger *log, struct oxr_sess
 		return oxr_session_success_result(sess);
 	}
 
-	// The compositor may advertise XR_FB_display_refresh_rate (for enumerate /
-	// get) yet not implement the request — e.g. the sim/native compositor.
-	// Report it unsupported rather than silently succeeding, matching
-	// oxr_session_set_perf_level below.
+	// The system compositor may advertise XR_FB_display_refresh_rate (for
+	// enumerate / get) while the in-process native compositor that receives the
+	// request does not implement it. Report it unsupported rather than silently
+	// succeeding or crashing on the null pointer.
 	if (xc->request_display_refresh_rate == NULL) {
-		return XR_ERROR_FUNCTION_UNSUPPORTED;
+		return oxr_error(log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "Compositor does not support changing the display refresh rate");
 	}
 
 	xrt_result_t xret = xrt_comp_request_display_refresh_rate(xc, displayRefreshRate);
@@ -5696,7 +5697,8 @@ oxr_session_set_perf_level(struct oxr_logger *log,
 	struct xrt_compositor *xc = &sess->xcn->base;
 
 	if (xc->set_performance_level == NULL) {
-		return XR_ERROR_FUNCTION_UNSUPPORTED;
+		return oxr_error(log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "Compositor does not support performance level changes");
 	}
 	enum xrt_perf_domain oxr_domain = xr_perf_domain_to_xrt(domain);
 	enum xrt_perf_set_level oxr_level = xr_perf_level_to_xrt(level);
