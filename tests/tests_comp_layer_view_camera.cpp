@@ -23,9 +23,10 @@
  *     pose as the quad's camera needs NO re-basing — while branch (b), which
  *     starts from the HEAD-relative DP eye, does (#1594).
  *
- *  2. Every CTS quad sets XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
- *     so straight (unpremultiplied-source) alpha is the variant conformance
- *     actually exercises — the D3D11 quad draw must honour that bit.
+ *  2. Every CTS quad sets XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT
+ *     and NOT XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT, so PREMULTIPLIED
+ *     is the variant conformance actually exercises (#1621 — this line said
+ *     "straight" until the three backends were compared on one layer).
  *
  * `comp_layer_accum` is a plain aggregate (an array of `struct comp_layer` plus
  * a count), so the fixtures below fill it directly rather than going through
@@ -1009,11 +1010,14 @@ TEST_CASE("is_layer_view_visible_n: N = 1, 2, 3, 4 truth table")
 	}
 }
 
-TEST_CASE("CTS quads set BLEND_TEXTURE_SOURCE_ALPHA, so straight alpha is the exercised path")
+TEST_CASE("CTS quads set BLEND_TEXTURE_SOURCE_ALPHA and NOT the unpremultiplied bit")
 {
-	// Not a renderer test (no D3D device here) — it pins the flag the D3D11
-	// quad draw must branch on, so a later refactor that drops the bit from
-	// the blend-state choice trips something.
+	// Not a renderer test (no D3D device here) — it pins what the CTS quad
+	// fixture actually submits, which is what comp_layer_blend_mode() is fed
+	// in conformance. That combination is PREMULTIPLIED (#1621): the spec's
+	// straight-alpha switch is UNPREMULTIPLIED_ALPHA_BIT, which the CTS quad
+	// does not set. (This case read "so straight alpha is the exercised path"
+	// until #1621 — the same inversion the Metal and GL ports carried.)
 	struct comp_layer_accum accum = {};
 	push_quad(accum, {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, -1.0f}});
 
@@ -1084,6 +1088,98 @@ TEST_CASE("comp_layer_view_camera: no backend gates its draw on the return value
 		}
 		INFO(rel << " has no resolver call at all — did the file move?");
 		CHECK(calls > 0);
+	}
+}
+
+/*
+ * #1621: the three-way blend rule is the SHARED helper's, in every backend.
+ *
+ * Metal and GL each shipped their own two-way quad mapping —
+ * `flags & BLEND_TEXTURE_SOURCE_ALPHA_BIT ? straight : premultiplied` — which
+ * is the INVERSE of the rule for the SOURCE_ALPHA-alone case, and has no
+ * OPAQUE_COVER at all. The error came from the design brief those two ports
+ * were written from, so both implemented it faithfully and each measured
+ * self-consistently; only comparing backends on one layer exposed it.
+ *
+ * The truth table above pins the helper's own contract, which those backends
+ * never called. What is worth pinning here is therefore STRUCTURAL: that the
+ * backends CALL it rather than reimplementing it. A live composite would need
+ * a D3D / Metal / GL device plus swapchains, which this harness has none of —
+ * same reasoning as the #1615 gating test above, and the same file read.
+ *
+ * The negative half matters as much as the positive: a backend that still
+ * names BLEND_TEXTURE_SOURCE_ALPHA_BIT in CODE is deciding the blend locally
+ * again. Comment mentions are fine (and expected — that is where the rule is
+ * explained); only code counts, and the allowance per backend is a number,
+ * not a wildcard, so a NEW local test trips this even where one legal one
+ * already exists.
+ *
+ * D3D11's one allowance is Local2D / window-space (XR_DXR, not Khronos): a
+ * runtime-owned 2D channel whose submitters treat `layerFlags == 0` as
+ * "premultiplied bytes" and expect a blend, so converging it on the shared
+ * rule would turn every such panel into an opaque rectangle. #1599 stopped at
+ * the Khronos layer types on purpose; see the call site.
+ */
+TEST_CASE("comp_layer_blend_mode: no backend reimplements the blend rule (#1621)")
+{
+	// Every native compositor that composites layers by their blend flags,
+	// relative to the compositor source root, with the number of legal
+	// CODE reads of the raw source-alpha bit left in it.
+	const struct
+	{
+		const char *rel;
+		uint32_t allowed_flag_reads;
+	} backends[] = {
+	    {"gl/comp_gl_compositor.cpp", 0},
+	    {"metal/comp_metal_compositor.m", 0},
+	    // The Local2D / window-space channel, above.
+	    {"d3d11/comp_d3d11_renderer.cpp", 1},
+	};
+
+	for (const auto &backend : backends) {
+		const char *const rel = backend.rel;
+		const std::string path = std::string(DXR_COMP_SRC_DIR) + "/" + rel;
+		const std::string src = read_whole_file(path);
+
+		// Positive: the shared resolver is what decides the mode. Both
+		// spellings count — comp_layer_tile_blend_mode() for the tile's
+		// painter's-order gate, comp_layer_blend_mode() for a layer that is
+		// never a base cover (a quad).
+		INFO(rel << " must resolve its blend mode through comp_layer_blend_mode() / "
+		         << "comp_layer_tile_blend_mode() (comp_layer_view_camera.h)");
+		CHECK(src.find("comp_layer_blend_mode(") != std::string::npos);
+
+		// ...and OPAQUE_COVER's alpha-of-one must be folded into the shader,
+		// since no fixed-function blend factor can synthesise a constant one.
+		INFO(rel << " resolves the mode but never folds OPAQUE_COVER's alpha-of-one — "
+		         << "the blend state alone cannot produce it");
+		CHECK(src.find("comp_layer_blend_fold_opaque_cover(") != std::string::npos);
+
+		// Negative: no local re-derivation from the raw flag, in code.
+		uint32_t flag_reads = 0;
+		size_t pos = 0;
+		while ((pos = src.find("XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT", pos)) !=
+		       std::string::npos) {
+			const size_t nl = src.rfind('\n', pos);
+			const size_t bol = nl == std::string::npos ? 0 : nl + 1;
+			const std::string prefix = src.substr(bol, pos - bol);
+			pos += 1;
+
+			// Trim the indentation; a comment mention is not a read.
+			const size_t first = prefix.find_first_not_of(" \t");
+			const std::string lead = first == std::string::npos ? "" : prefix.substr(first);
+			if (lead.rfind("*", 0) == 0 || lead.rfind("//", 0) == 0) {
+				continue;
+			}
+			flag_reads++;
+		}
+
+		INFO(rel << " reads BLEND_TEXTURE_SOURCE_ALPHA_BIT in CODE " << flag_reads << " time(s), expected "
+		         << backend.allowed_flag_reads
+		         << ". The three-way rule is comp_layer_blend_mode()'s, and a local two-way test "
+		         << "of this bit is how Metal and GL came to disagree with D3D11 (#1621). "
+		         << "Explain it in a comment; decide it in the helper.");
+		CHECK(flag_reads == backend.allowed_flag_reads);
 	}
 }
 

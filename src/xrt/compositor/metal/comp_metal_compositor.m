@@ -144,18 +144,23 @@ struct comp_metal_compositor
 	//! Render pipeline for atlas layer compositing.
 	id<MTLRenderPipelineState> projection_pipeline;
 
-	//! XR_DXR_display_zones (ADR-027): projection-shader variants with
-	//! alpha-over blending for zone draws into the atlas, so overlapping
-	//! zones composite in layer-list order instead of overwriting. Mirrors
-	//! D3D11's blend_premul / blend_alpha pair on the same draw site.
-	id<MTLRenderPipelineState> zone_premult_pipeline;
-	id<MTLRenderPipelineState> zone_unpremult_pipeline;
+	//! Blended variants of the PROJECTION shaders: the same pass with
+	//! premultiplied / straight "over" blending instead of blending off.
+	//! Used by XR_DXR_display_zones (ADR-027 — overlapping zones composite in
+	//! layer-list order instead of overwriting) and, since #1621, by any
+	//! projection layer that is NOT the tile's base blit and carries
+	//! SOURCE_ALPHA_BIT. Mirrors D3D11's blend_premul / blend_alpha pair.
+	id<MTLRenderPipelineState> proj_premult_pipeline;
+	id<MTLRenderPipelineState> proj_straight_pipeline;
 
-	//! #1581 XrCompositionLayerQuad. Straight-alpha
-	//! (XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT, which every CTS
-	//! quad sets) and premultiplied variants of the same quad shaders.
+	//! #1581 XrCompositionLayerQuad, one pipeline per @ref
+	//! comp_layer_blend_mode: premultiplied (SOURCE_ALPHA_BIT alone),
+	//! straight (SOURCE_ALPHA_BIT + UNPREMULTIPLIED_ALPHA_BIT), and blending
+	//! OFF for REPLACE / OPAQUE_COVER (no source-alpha bit — the alpha-of-one
+	//! comes from the shader, see comp_layer_blend_fold_opaque_cover).
 	id<MTLRenderPipelineState> quad_straight_pipeline;
 	id<MTLRenderPipelineState> quad_premult_pipeline;
+	id<MTLRenderPipelineState> quad_opaque_pipeline;
 
 	//! Render pipeline for fullscreen blit (atlas→target passthrough).
 	id<MTLRenderPipelineState> blit_pipeline;
@@ -798,56 +803,62 @@ compile_shaders(struct comp_metal_compositor *c)
 		}
 	}
 
-	// Zone alpha-over pipelines (XR_DXR_display_zones, ADR-027): the same
-	// projection shaders + depth attachment, but with "over" blending so
-	// overlapping zones composite in layer-list order (the no-blend rationale
-	// above protects full-canvas projection alpha passthrough; zone draws are
-	// placed sub-rects whose content alpha is the compositing contract —
-	// rule 4). Premultiplied by default; the unpremultiplied variant only
-	// changes the source RGB factor (XR_COMPOSITION_LAYER_UNPREMULTIPLIED_
-	// ALPHA_BIT). Alpha factors are One/OneMinusSrcAlpha in both so the
-	// zone's own transparency survives into the atlas (the unzoned/zoned
-	// alpha drives the desktop show-through downstream).
+	// Blended projection pipelines: the same projection shaders + depth
+	// attachment, but with "over" blending so a draw composites onto what is
+	// already in the tile instead of overwriting it (the no-blend rationale
+	// above protects the full-canvas BASE blit's alpha passthrough; these are
+	// for everything that is not that base).
+	//
+	// Two consumers: XR_DXR_display_zones (ADR-027 — overlapping zones
+	// composite in layer-list order; a zone is a placed sub-rect whose content
+	// alpha is the compositing contract, rule 4) and, since #1621, a
+	// non-first projection layer carrying SOURCE_ALPHA_BIT.
+	// COMP_LAYER_BLEND_PREMULTIPLIED and COMP_LAYER_BLEND_STRAIGHT differ only
+	// in the source RGB factor. Alpha factors are One/OneMinusSrcAlpha in both
+	// so the source's own transparency survives into the atlas (the
+	// unzoned/zoned alpha drives the desktop show-through downstream).
 	{
-		MTLRenderPipelineDescriptor *zone_desc = [[MTLRenderPipelineDescriptor alloc] init];
-		zone_desc.vertexFunction = proj_vs;
-		zone_desc.fragmentFunction = proj_fs;
-		zone_desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-		zone_desc.colorAttachments[0].blendingEnabled = YES;
-		zone_desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
-		zone_desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-		zone_desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
-		zone_desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-		zone_desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+		MTLRenderPipelineDescriptor *pb_desc = [[MTLRenderPipelineDescriptor alloc] init];
+		pb_desc.vertexFunction = proj_vs;
+		pb_desc.fragmentFunction = proj_fs;
+		pb_desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+		pb_desc.colorAttachments[0].blendingEnabled = YES;
+		pb_desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+		pb_desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+		pb_desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+		pb_desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+		pb_desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
 
-		c->zone_premult_pipeline = [c->device newRenderPipelineStateWithDescriptor:zone_desc error:&error];
-		if (c->zone_premult_pipeline == nil) {
-			U_LOG_E("Failed to create zone premult pipeline: %s",
+		c->proj_premult_pipeline = [c->device newRenderPipelineStateWithDescriptor:pb_desc error:&error];
+		if (c->proj_premult_pipeline == nil) {
+			U_LOG_E("Failed to create projection premultiplied pipeline: %s",
 			        error.localizedDescription.UTF8String);
-			[zone_desc release];
+			[pb_desc release];
 			goto cleanup;
 		}
 
-		zone_desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
-		c->zone_unpremult_pipeline = [c->device newRenderPipelineStateWithDescriptor:zone_desc error:&error];
-		[zone_desc release];
-		if (c->zone_unpremult_pipeline == nil) {
-			U_LOG_E("Failed to create zone unpremult pipeline: %s",
+		pb_desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+		c->proj_straight_pipeline = [c->device newRenderPipelineStateWithDescriptor:pb_desc error:&error];
+		[pb_desc release];
+		if (c->proj_straight_pipeline == nil) {
+			U_LOG_E("Failed to create projection straight-alpha pipeline: %s",
 			        error.localizedDescription.UTF8String);
 			goto cleanup;
 		}
 	}
 
 	// Quad-layer pipelines (#1581, XrCompositionLayerQuad) — the world-placed
-	// quad shaders into the atlas, alpha-blended over whatever projection
-	// content is already in the tile. Cloned from the zone descriptors above;
-	// the only differences are the shader pair and which source-RGB factor is
-	// the DEFAULT. OpenXR's quad blend switch is
-	// XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT (set ⇒ straight
-	// alpha), the inverse sense of the zone/Local2D UNPREMULTIPLIED bit, so
-	// the two variants are named after what they do rather than after a flag.
-	// Every CTS composition quad sets the bit, so `straight` is the one
-	// conformance exercises. Depth is disabled at draw time
+	// quad shaders into the atlas, composited over whatever projection content
+	// is already in the tile. Cloned from the projection blend descriptors
+	// above; the only differences are the shader pair and the blend state.
+	//
+	// ONE PIPELINE PER comp_layer_blend_mode, and the mode comes from the
+	// SHARED helper (#1621) — never from a local reading of the flags. The
+	// blending-OFF variant serves COMP_LAYER_BLEND_OPAQUE_COVER (a quad with
+	// no source-alpha bit covers what is under it in alpha too); its
+	// alpha-of-one is emitted by the SHADER via
+	// comp_layer_blend_fold_opaque_cover, because no fixed-function blend
+	// factor can synthesise a constant one. Depth is disabled at draw time
 	// (depth_stencil_state_disabled): a quad must neither depth-reject
 	// against the projection tile nor occlude a later quad.
 	{
@@ -883,11 +894,24 @@ compile_shaders(struct comp_metal_compositor *c)
 
 		quad_desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
 		c->quad_premult_pipeline = [c->device newRenderPipelineStateWithDescriptor:quad_desc error:&error];
+		if (c->quad_premult_pipeline == nil) {
+			U_LOG_E("Failed to create quad premultiplied pipeline: %s",
+			        error.localizedDescription.UTF8String);
+			[quad_desc release];
+			[quad_fs release];
+			[quad_vs release];
+			goto cleanup;
+		}
+
+		// REPLACE / OPAQUE_COVER: blending off, exactly as the projection
+		// base blit. The two differ only in the alpha the shader emits.
+		quad_desc.colorAttachments[0].blendingEnabled = NO;
+		c->quad_opaque_pipeline = [c->device newRenderPipelineStateWithDescriptor:quad_desc error:&error];
 		[quad_desc release];
 		[quad_fs release];
 		[quad_vs release];
-		if (c->quad_premult_pipeline == nil) {
-			U_LOG_E("Failed to create quad premultiplied pipeline: %s",
+		if (c->quad_opaque_pipeline == nil) {
+			U_LOG_E("Failed to create quad opaque pipeline: %s",
 			        error.localizedDescription.UTF8String);
 			goto cleanup;
 		}
@@ -3077,6 +3101,49 @@ metal_sync_zone_mask_to_dp(struct comp_metal_compositor *c)
 	}
 }
 
+/*!
+ * The PROJECTION-shader pipeline that implements one shared blend mode (#1621).
+ *
+ * REPLACE and OPAQUE_COVER share the blending-OFF projection pipeline and
+ * differ only in the ALPHA THE FRAGMENT SHADER EMITS:
+ *
+ *  - REPLACE is the tile's base blit and writes the source RGBA verbatim.
+ *    Forcing dst.a to 1 there would break the compose-under contract a
+ *    transparent-background app's first blit depends on (#225).
+ *  - OPAQUE_COVER is a LATER unflagged layer, whose alpha the spec treats as
+ *    one; comp_layer_blend_fold_opaque_cover() makes the shader emit it (no
+ *    fixed-function blend factor can synthesise a constant one — see the enum
+ *    in comp_layer_view_camera.h).
+ *
+ * So every caller that can produce OPAQUE_COVER must fold the mode into its
+ * per-draw constants as well as bind the pipeline returned here.
+ */
+static id<MTLRenderPipelineState>
+metal_proj_pipeline_for(struct comp_metal_compositor *c, enum comp_layer_blend_mode mode)
+{
+	switch (mode) {
+	case COMP_LAYER_BLEND_PREMULTIPLIED: return c->proj_premult_pipeline;
+	case COMP_LAYER_BLEND_STRAIGHT: return c->proj_straight_pipeline;
+	case COMP_LAYER_BLEND_REPLACE:
+	case COMP_LAYER_BLEND_OPAQUE_COVER:
+	default: return c->projection_pipeline;
+	}
+}
+
+//! The QUAD-shader pipeline for one shared blend mode; same OPAQUE_COVER
+//! caveat as @ref metal_proj_pipeline_for.
+static id<MTLRenderPipelineState>
+metal_quad_pipeline_for(struct comp_metal_compositor *c, enum comp_layer_blend_mode mode)
+{
+	switch (mode) {
+	case COMP_LAYER_BLEND_PREMULTIPLIED: return c->quad_premult_pipeline;
+	case COMP_LAYER_BLEND_STRAIGHT: return c->quad_straight_pipeline;
+	case COMP_LAYER_BLEND_REPLACE:
+	case COMP_LAYER_BLEND_OPAQUE_COVER:
+	default: return c->quad_opaque_pipeline;
+	}
+}
+
 static xrt_result_t
 metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -3367,6 +3434,13 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			}
 		}
 
+		// Painter's-order state, ONE per tile (#1598/#1621). The FIRST
+		// layer into a tile is a REPLACE whatever its flags say — the
+		// #225 compose-under contract — and only later layers blend per
+		// their own flags. Zero-initialised per frame; the shared gate is
+		// comp_layer_tile_blend_mode().
+		struct comp_layer_tile_state tiles[XRT_MAX_VIEWS] = {0};
+
 		// Render each projection / zone layer (XR_DXR_display_zones: zone
 		// layers blit through the same pass at a sub-tile viewport).
 		for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
@@ -3447,6 +3521,27 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				}
 			}
 			for (uint32_t eye = 0; eye < view_count; eye++) {
+				// How this draw composites (#1621), resolved BEFORE the
+				// draw can bail out so "which layer is the tile's base"
+				// is a pure function of the layer LIST, not of a
+				// transient swapchain hiccup (D3D11 parity).
+				//
+				// A zone paints a SUB-RECT, so it is never a base cover
+				// and keeps its own ADR-027 alpha-over rule verbatim —
+				// it marks the tile (a projection layer after it blends
+				// over it) but bypasses the first-layer gate.
+				enum comp_layer_blend_mode mode;
+				if (eye < XRT_MAX_VIEWS && is_zone) {
+					comp_layer_tile_mark_composited(&tiles[eye]);
+					mode = (layer->data.flags &
+					        XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0
+					           ? COMP_LAYER_BLEND_STRAIGHT
+					           : COMP_LAYER_BLEND_PREMULTIPLIED;
+				} else {
+					mode = comp_layer_tile_blend_mode(
+					    eye < XRT_MAX_VIEWS ? &tiles[eye] : NULL, layer->data.flags);
+				}
+
 				struct xrt_swapchain *sc = layer->sc_array[eye];
 				if (sc == NULL) {
 					continue;
@@ -3542,20 +3637,13 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				vp.zfar = 1.0;
 				[encoder setViewport:vp];
 
-				// Set pipeline and textures. Zone draws blend alpha-over
-				// (premultiplied unless the layer declares straight alpha)
-				// with depth disabled — a later overlapping zone must
-				// neither be depth-rejected nor overwrite (D3D11 parity).
-				if (is_zone) {
-					const bool unpremul =
-					    (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0;
-					[encoder setRenderPipelineState:(unpremul ? c->zone_unpremult_pipeline
-					                                          : c->zone_premult_pipeline)];
-					[encoder setDepthStencilState:c->depth_stencil_state_disabled];
-				} else {
-					[encoder setRenderPipelineState:c->projection_pipeline];
-					[encoder setDepthStencilState:c->depth_stencil_state];
-				}
+				// Set pipeline and textures. The blend state comes from
+				// the shared mode resolved above; depth stays disabled
+				// for zone draws — a later overlapping zone must neither
+				// be depth-rejected nor overwrite (D3D11 parity).
+				[encoder setRenderPipelineState:metal_proj_pipeline_for(c, mode)];
+				[encoder setDepthStencilState:(is_zone ? c->depth_stencil_state_disabled
+				                                       : c->depth_stencil_state)];
 				[encoder setFragmentTexture:src_tex atIndex:0];
 				[encoder setFragmentSamplerState:c->sampler_linear atIndex:0];
 
@@ -3594,6 +3682,14 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				constants.color_bias[1] = 0.0f;
 				constants.color_bias[2] = 0.0f;
 				constants.color_bias[3] = 0.0f;
+
+				// A LATER unflagged projection layer covers what is under
+				// it in alpha too (OpenXR 10.6.2). The shader is where
+				// that one comes from; the base blit (REPLACE) keeps the
+				// app's alpha verbatim for #225.
+				comp_layer_blend_fold_opaque_cover(mode, constants.color_scale,
+				                                   constants.color_bias);
+
 				constants.swizzle_rb = c->source_is_gl ? 1.0f : 0.0f;
 				constants._pad[0] = constants._pad[1] = constants._pad[2] = 0.0f;
 
@@ -3833,15 +3929,29 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 						    qc.color_bias[3] = 0.0f;
 					}
 
-					// OpenXR's blend switch: SOURCE_ALPHA set ⇒ the texture
-					// carries STRAIGHT alpha (every CTS quad sets it);
-					// clear ⇒ premultiplied. Inverse sense to the zone /
-					// Local2D UNPREMULTIPLIED bit — mirrors D3D11.
-					const bool straight_alpha =
-					    (data->flags & XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT) != 0;
-					[encoder setRenderPipelineState:(straight_alpha
-					                                     ? c->quad_straight_pipeline
-					                                     : c->quad_premult_pipeline)];
+					// #1621: the SHARED three-way rule, not the inverted
+					// two-way test that used to live here (SOURCE_ALPHA_BIT
+					// read as "straight"). The spec's straight-alpha switch
+					// is XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT, so
+					// SOURCE_ALPHA_BIT *alone* is PREMULTIPLIED and no
+					// source-alpha bit at all is an OPAQUE_COVER. The old
+					// mapping came from the design brief this port was
+					// written from, not from the port — and it made Metal
+					// and GL disagree with D3D11 on the same layer.
+					//
+					// A quad is never the tile's base cover, so it takes its
+					// own flags: the first-layer REPLACE gate (#1598)
+					// belongs to the full-tile projection blit alone.
+					//
+					// Resolved BEFORE the constants are written because an
+					// unflagged quad is an OPAQUE_COVER, whose alpha-of-one
+					// is emitted by the shader (fixed-function blending
+					// cannot make a constant one) — the fold is half of that
+					// mode, the pipeline below is the other.
+					const enum comp_layer_blend_mode mode = comp_layer_blend_mode(data->flags);
+					comp_layer_blend_fold_opaque_cover(mode, qc.color_scale, qc.color_bias);
+
+					[encoder setRenderPipelineState:metal_quad_pipeline_for(c, mode)];
 					[encoder setDepthStencilState:c->depth_stencil_state_disabled];
 					[encoder setFragmentTexture:src_tex atIndex:0];
 					[encoder setFragmentSamplerState:c->sampler_linear atIndex:0];
@@ -4352,14 +4462,16 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	c->depth_texture = nil;
 	[c->projection_pipeline release];
 	c->projection_pipeline = nil;
-	[c->zone_premult_pipeline release];
-	c->zone_premult_pipeline = nil;
-	[c->zone_unpremult_pipeline release];
-	c->zone_unpremult_pipeline = nil;
+	[c->proj_premult_pipeline release];
+	c->proj_premult_pipeline = nil;
+	[c->proj_straight_pipeline release];
+	c->proj_straight_pipeline = nil;
 	[c->quad_straight_pipeline release];
 	c->quad_straight_pipeline = nil;
 	[c->quad_premult_pipeline release];
 	c->quad_premult_pipeline = nil;
+	[c->quad_opaque_pipeline release];
+	c->quad_opaque_pipeline = nil;
 	[c->blit_pipeline release];
 	c->blit_pipeline = nil;
 	[c->sampler_linear release];

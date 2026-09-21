@@ -781,13 +781,25 @@ static const float HUD_WIDTH_FRACTION = 0.20f;
 //
 // Three quads, all sharing one deliberately NON-symmetric 256x256 probe
 // texture (coloured checker, a large "Q" with its tail bottom-right, four
-// distinct corner blocks, an 8 px white border, and a half-alpha quadrant):
-//   (A) LOCAL space, axis-aligned, BOTH eyes, STRAIGHT alpha — the
-//       measurement / alpha / stereo-disparity quad.
-//   (B) LOCAL space, yawed -15 deg about up, BOTH eyes, PREMULTIPLIED — the
-//       other blend state, and a world-locked non-fronto-parallel case.
-//   (C) LOCAL space, LEFT EYE ONLY, straight alpha — the eye-visibility
-//       check (see the submission site for why it is not VIEW space).
+// distinct corner blocks, an 8 px white border, and a half-alpha quadrant).
+//
+// The three cover the three OpenXR 10.6.2 blend outcomes exactly once each,
+// and the LABELS ARE THE FLAGS (#1621 — they were not: (A) said "STRAIGHT
+// alpha" while setting only SOURCE_ALPHA_BIT, which the finalised rule reads
+// as PREMULTIPLIED, so the expected pixel values derived from it were wrong):
+//   (A) SOURCE_ALPHA | UNPREMULTIPLIED -> STRAIGHT. LOCAL space,
+//       axis-aligned, BOTH eyes. The measurement / alpha / stereo-disparity
+//       quad; the probe texture's bytes ARE straight alpha, so this is the
+//       one whose composite is predictable by hand.
+//   (B) no blend flags -> OPAQUE_COVER. LOCAL space, yawed -15 deg about up,
+//       BOTH eyes. Covers what is under it in COLOUR AND ALPHA, so its
+//       half-alpha quadrant is fully opaque and its atlas alpha is 255 —
+//       also a world-locked non-fronto-parallel case.
+//   (C) SOURCE_ALPHA alone -> PREMULTIPLIED. LOCAL space, LEFT EYE ONLY —
+//       the eye-visibility check (see the submission site for why it is not
+//       VIEW space), and the premultiplied blend state. The texture is
+//       straight-alpha, so its half-alpha quadrant reads BRIGHTER here than
+//       in (A); that is the rule being exercised, not a defect.
 // Sizes and positions are fractions of the CANVAS, not absolute metres: a 3D
 // display's Kooima frustum is narrow and strongly off-axis, so metre-scale
 // poses tuned for an HMD land off-tile. Values match the Metal probe (#1584)
@@ -1555,9 +1567,14 @@ static bool CreateSwapchain(AppXrSession &app)
 //                                     top) and a UV transpose (tail moves to
 //                                     the left).
 //   - 24 px coloured checker      -> filtering / scale sanity.
-//   - bottom-left quadrant at alpha 128 (STRAIGHT alpha)
-//                                  -> the alpha blend: the cube must show
-//                                     through it.
+//   - bottom-left quadrant at alpha 128 (STRAIGHT alpha bytes)
+//                                  -> the alpha blend. Under quad (A)'s
+//                                     STRAIGHT rule the cube must show
+//                                     through it; under (C)'s PREMULTIPLIED
+//                                     rule the same bytes read brighter; and
+//                                     under (B)'s OPAQUE_COVER the quadrant
+//                                     is fully opaque. Three quads, three
+//                                     outcomes, one texture (#1621).
 //
 // Rows are authored TOP-DOWN (row 0 = the image's top) and uploaded with
 // glTexSubImage2D, so uv.y = 0 is the top — the same mapping the Metal probe
@@ -1759,8 +1776,9 @@ int main(int argc, char **argv)
             // off so the atlas dump is unambiguous. (It is already off by
             // default in this app — this makes the guarantee explicit.)
             g_input.hudVisible = false;
-            LOG_INFO("DXR_TEST_QUAD=1 — submitting 3 XrCompositionLayerQuad layers "
-                     "(axis-aligned, yawed, LEFT-eye-only)");
+            LOG_INFO("DXR_TEST_QUAD=1 — submitting 3 XrCompositionLayerQuad layers: "
+                     "(A) axis-aligned STRAIGHT, (B) yawed OPAQUE_COVER (no blend flags), "
+                     "(C) LEFT-eye-only PREMULTIPLIED");
         }
     }
 
@@ -2337,7 +2355,14 @@ int main(int argc, char **argv)
                 // expected projected width is exactly computable from
                 // xrLocateViews (see [QUAD-EXPECT] above). Also the alpha and
                 // stereo-disparity probe.
-                quadA.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                //
+                // BOTH bits (#1621). SOURCE_ALPHA_BIT alone is PREMULTIPLIED
+                // under the finalised rule, and this probe texture's bytes are
+                // STRAIGHT alpha — so the unpremultiplied bit is what makes
+                // the label true and the composite predictable. Quad (C)
+                // carries SOURCE_ALPHA alone and is the premultiplied case.
+                quadA.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
+                                   XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
                 quadA.space = app.localSpace;
                 quadA.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
                 quadA.subImage = sub;
@@ -2347,9 +2372,14 @@ int main(int argc, char **argv)
                 layers[layerCount++] = (XrCompositionLayerBaseHeader *)&quadA;
 
                 // (B) LOCAL space, yawed -15 deg about up, both eyes, and
-                // deliberately WITHOUT the source-alpha bit so the
-                // premultiplied blend state is exercised too (its half-alpha
-                // quadrant reads brighter than (A)'s — expected).
+                // deliberately WITHOUT the source-alpha bit — so it is an
+                // OPAQUE_COVER (#1621): OpenXR 10.6.2 initialises an unflagged
+                // layer's alpha to one, so this quad covers what is under it
+                // in COLOUR AND ALPHA. Expect its half-alpha quadrant to be
+                // fully opaque (no cube showing through) and its atlas alpha
+                // to read 255 across the whole footprint — that is the
+                // later-unflagged-layer half of the rule, and the thing a
+                // "blend it premultiplied" reading gets wrong.
                 const float halfYaw = -15.0f * 0.5f * (float)M_PI / 180.0f;
                 quadB.layerFlags = 0;
                 quadB.space = app.localSpace;
@@ -2361,7 +2391,9 @@ int main(int argc, char **argv)
                 layers[layerCount++] = (XrCompositionLayerBaseHeader *)&quadB;
 
                 // (C) LEFT EYE ONLY — its absence from the right-hand tile is
-                // the eye-visibility check.
+                // the eye-visibility check. SOURCE_ALPHA_BIT alone, i.e.
+                // PREMULTIPLIED (#1621): the third blend outcome, and the one
+                // the old inverted mapping composited as straight.
                 //
                 // LOCAL, not VIEW, and that is a finding rather than a
                 // preference: a VIEW-space layer pose comes out of
