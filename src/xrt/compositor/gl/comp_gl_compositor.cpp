@@ -3930,7 +3930,10 @@ gl_compositor_capture_atlas_to_png(struct comp_gl_compositor *c, const char *pat
 
 	// Swapchain alpha is undefined for display output — force opaque so the
 	// PNG doesn't render fully transparent/black (issue #425).
-	u_image_force_opaque_rgba8(top_down, content_w, content_h, row_pitch);
+	// DXR_ATLAS_CAPTURE_RAW_ALPHA=1 opts out (see u_image_capture_raw_alpha()).
+	if (!u_image_capture_raw_alpha()) {
+		u_image_force_opaque_rgba8(top_down, content_w, content_h, row_pitch);
+	}
 
 	bool ok = stbi_write_png(path, (int)content_w, (int)content_h, 4, top_down, (int)row_pitch) != 0;
 	free(top_down);

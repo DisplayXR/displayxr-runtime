@@ -90,6 +90,19 @@ struct comp_vk_split; // the reroute fields exist either way; the code does not
 #include <cmath>
 
 /*!
+ * Should an atlas / post-weave capture keep the TRUE alpha channel?
+ *
+ * One switch across every backend: `DXR_ATLAS_CAPTURE_RAW_ALPHA=1`
+ * (u_image_capture_raw_alpha()). `DXR_CAPTURE_KEEP_ALPHA` is this backend's
+ * older #672 spelling, kept as an alias so existing recipes keep working.
+ */
+static bool
+d3d12_capture_keep_alpha(void)
+{
+	return u_image_capture_raw_alpha() || getenv("DXR_CAPTURE_KEEP_ALPHA") != nullptr;
+}
+
+/*!
  * Minimal settings struct for D3D12 compositor.
  */
 struct comp_settings
@@ -3443,7 +3456,7 @@ d3d12_compositor_capture_atlas_to_png(struct comp_d3d12_compositor *c, const cha
 			// so the PNG doesn't render fully transparent/black (issue #425).
 			// #672 diag: DXR_CAPTURE_KEEP_ALPHA=1 preserves the real atlas
 			// alpha so transparency (zone bg / margins alpha=0) can be verified.
-			if (getenv("DXR_CAPTURE_KEEP_ALPHA") == nullptr) {
+			if (!d3d12_capture_keep_alpha()) {
 				u_image_force_opaque_rgba8(tight, content_w, content_h, tight_pitch);
 			}
 			ok = stbi_write_png(path, (int)content_w, (int)content_h, 4,
@@ -3570,7 +3583,7 @@ d3d12_capture_backbuffer_to_png(struct comp_d3d12_compositor *c,
 			// #672: keep real alpha when DXR_CAPTURE_KEEP_ALPHA is set, so a
 			// zone the post-weave alpha-gate wrongly zeroed (→ transparent →
 			// invisible on panel) is distinguishable from opaque woven content.
-			if (getenv("DXR_CAPTURE_KEEP_ALPHA") == nullptr) {
+			if (!d3d12_capture_keep_alpha()) {
 				u_image_force_opaque_rgba8(tight, w, h, tight_pitch);
 			}
 			ok = stbi_write_png(path, (int)w, (int)h, 4, tight, (int)tight_pitch) != 0;

@@ -1748,7 +1748,11 @@ d3d11_capture_texture_to_png(ID3D11Device *device,
 		for (uint32_t y = 0; y < content_h; y++) {
 			memcpy(tight + (size_t)y * tight_pitch, src + (size_t)y * m.RowPitch, tight_pitch);
 		}
-		u_image_force_opaque_rgba8(tight, content_w, content_h, tight_pitch);
+		// DXR_ATLAS_CAPTURE_RAW_ALPHA=1 keeps the atlas's true alpha (the
+		// capture as an ORACLE, not a picture) — see u_image_capture_raw_alpha().
+		if (!u_image_capture_raw_alpha()) {
+			u_image_force_opaque_rgba8(tight, content_w, content_h, tight_pitch);
+		}
 
 		// Optional resample to (dst_w × dst_h) — see header comment (#431).
 		if (dst_w != 0 && dst_h != 0 && (dst_w != content_w || dst_h != content_h)) {

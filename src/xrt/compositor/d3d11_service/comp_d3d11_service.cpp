@@ -25162,7 +25162,12 @@ comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
 		}
 		// Swapchain alpha is undefined for display output — force opaque so the
 		// PNG doesn't render fully transparent/black (issue #425).
-		u_image_force_opaque_rgba8(buf.data(), used_w, used_h, (size_t)used_w * 4u);
+		// DXR_ATLAS_CAPTURE_RAW_ALPHA=1 opts out: the atlas's true alpha is the
+		// only way to test compose-under / opaque-cover alpha (see
+		// u_image_capture_raw_alpha()).
+		if (!u_image_capture_raw_alpha()) {
+			u_image_force_opaque_rgba8(buf.data(), used_w, used_h, (size_t)used_w * 4u);
+		}
 		// Encode the atlas geometry into the suffix so consumers don't re-derive
 		// it: "_atlas_<viewCount>_<cols>x<rows>.png" (issue #425). viewCount is
 		// the tile count (cols*rows for all current DisplayXR layouts).
