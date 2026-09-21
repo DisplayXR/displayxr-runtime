@@ -101,6 +101,8 @@
 
 #ifdef XRT_OS_LINUX_DESKTOP
 #include "vk_native/comp_vk_native_window_xcb.h"
+#include "os/os_display_scale.h"
+#include "util/u_x11_scale.h"
 #endif
 
 #ifdef XRT_OS_ANDROID
@@ -569,6 +571,17 @@ struct comp_vk_native_compositor
 	//! One-shot guard for the X11 present-origin refusal WARN (see
 	//! @ref vk_x11_present_origin_is_panel_native). Never per frame.
 	bool warned_x11_origin_units;
+
+	//! X11 placement quantum (#1588 follow-up): measured once, on the first
+	//! snap request, by @ref vk_x11_placement_quantum. 0 = unknown, 1 = every
+	//! device pixel is addressable, >1 = window origins land only on
+	//! multiples of it (XWayland global scale). Never re-measured per frame.
+	uint32_t x11_quantum;
+	bool x11_quantum_measured;
+	//! One-shot guards for the snap-path WARNs. Never per frame.
+	bool warned_snap_units;
+	bool warned_snap_lattice;
+	bool warned_snap_no_lattice_point;
 	//! One-shot: window-scoped metrics took the runtime-resolved panel origin over the DP's (0,0).
 	bool warned_metrics_origin_override;
 #endif
@@ -10118,6 +10131,75 @@ comp_vk_native_compositor_set_wayland_surface_geometry(struct xrt_compositor *xc
 #endif
 }
 
+#ifdef XRT_OS_LINUX_DESKTOP
+/*!
+ * The X11 window-placement quantum, measured once.
+ *
+ * XWayland runs the whole X screen at ONE integer scale — the ceiling of the
+ * most-scaled monitor (Mutter's `xwayland-native-scaling`, MR !3567) — and an
+ * X11 window origin survives the round trip through Mutter's logical space
+ * only at multiples of it. So a fractionally-scaled LAPTOP makes odd device
+ * pixels unreachable on an UNSCALED 3D panel, and when the panel itself sits
+ * at 200% every size check the runtime owns still passes (its X11 rect is its
+ * native size). Measured on the DS1, 2026-09-20: 54% of snapped targets were
+ * odd, 0% of landed positions were.
+ *
+ * Source order: `DXR_X11_PLACEMENT_QUANTUM` (a forced value, for testing and
+ * for the uniform-integer-scale case the geometry cannot see — see
+ * util/u_x11_scale.h), else the RandR-vs-DRM solve.
+ */
+static uint32_t
+vk_x11_placement_quantum(struct comp_vk_native_compositor *c)
+{
+	if (c->x11_quantum_measured) {
+		return c->x11_quantum;
+	}
+	c->x11_quantum_measured = true;
+
+	const char *forced = getenv("DXR_X11_PLACEMENT_QUANTUM");
+	if (forced != NULL && forced[0] != '\0') {
+		const long v = strtol(forced, NULL, 10);
+		c->x11_quantum = (v >= 1 && v <= 8) ? (uint32_t)v : 0u;
+		U_LOG_W("X11 placement quantum FORCED to %u by DXR_X11_PLACEMENT_QUANTUM", c->x11_quantum);
+		return c->x11_quantum;
+	}
+
+	struct os_display_scale_report rep;
+	if (!os_display_scale_query(&rep) || rep.verdict.state == U_X11_SCALE_UNKNOWN) {
+		c->x11_quantum = 0;
+		U_LOG_W(
+		    "X11 placement quantum: unknown (%s) — drag snapping unchanged. "
+		    "`displayxr-cli info` shows the per-output evidence.",
+		    rep.drm_available ? "no consistent global scale" : "no DRM connector modes in sysfs");
+		return 0;
+	}
+	c->x11_quantum = rep.verdict.quantum;
+	if (rep.verdict.state == U_X11_SCALE_QUANTIZED) {
+		const char *who = (rep.verdict.culprit >= 0) ? rep.outputs[rep.verdict.culprit].name : "?";
+		U_LOG_W(
+		    "X11 placement quantum = %u: XWayland runs the whole X screen at global scale %u (the ceiling "
+		    "of the most-scaled output, here '%s' at %.0f%%; ANY output above 100%% forces it) — window "
+		    "origins land only on multiples of %u px, on EVERY output "
+		    "including the 3D panel. Drag snapping will search the reachable lattice instead of "
+		    "asking for positions the window cannot reach. Every output at 100%% removes the "
+		    "quantum. (root %ux%u X11 px vs %u px of native width)",
+		    rep.verdict.quantum, rep.verdict.quantum, who, rep.verdict.culprit_scale * 100.0,
+		    rep.verdict.quantum, rep.root_w, rep.root_h, rep.native_sum_w);
+	} else {
+		U_LOG_I("X11 placement quantum = 1: the X root is device pixels on all %u compared output(s).",
+		        rep.verdict.outputs_compared);
+	}
+	return c->x11_quantum;
+}
+
+static inline bool
+vk_on_reachable_lattice(int32_t anchor, int32_t v, uint32_t q)
+{
+	const int32_t d = v - anchor;
+	return q <= 1 || (d % (int32_t)q) == 0;
+}
+#endif // XRT_OS_LINUX_DESKTOP
+
 bool
 comp_vk_native_compositor_snap_window_rect(struct xrt_compositor *xc,
                                            int32_t origin_x,
@@ -10149,8 +10231,120 @@ comp_vk_native_compositor_snap_window_rect(struct xrt_compositor *xc,
 	// target-minus-origin and snaps from there, so the absolute frame cancels;
 	// what must hold is that both points share one frame of DEVICE pixels, and
 	// they do — they came from the same caller in the same call.
-	return xrt_display_processor_vk_snap_window_rect((struct xrt_display_processor_vk *)c->display_processor,
-	                                                 origin_x, origin_y, target_x, target_y, out_x, out_y);
+	struct xrt_display_processor_vk *vdp = (struct xrt_display_processor_vk *)c->display_processor;
+
+#ifdef XRT_OS_LINUX_DESKTOP
+#ifdef XRT_HAVE_WAYLAND
+	const bool drag_is_x11 = !c->use_wayland;
+#else
+	const bool drag_is_x11 = true;
+#endif
+	if (drag_is_x11) {
+		/*
+		 * Units gate. The slot needs a displacement in DEVICE pixels. If
+		 * the panel's X11 rect is not its native size, one X11 pixel is not
+		 * one panel pixel and every snap lands on a wrong-but-plausible
+		 * lattice point — so refuse, and say so once. Same condition the
+		 * present-origin feed already refuses on
+		 * (@ref vk_x11_present_origin_is_panel_native); a snap and a phase
+		 * that disagree about units is the one outcome worse than neither.
+		 */
+		if (!(c->sys_info_set && c->sys_info.display_desktop_rect_is_panel)) {
+			if (!c->warned_snap_units) {
+				c->warned_snap_units = true;
+				U_LOG_W(
+				    "drag snap REFUSED: the 3D panel's X11 rect (%ux%u) is not its native size "
+				    "(%ux%u), so X11 pixels are not panel pixels and a phase snap computed in "
+				    "them is wrong. The window moves unsnapped. Under XWayland this happens when "
+				    "another output is scaled higher than the 3D panel; every output at 100%% is "
+				    "the supported configuration.",
+				    c->sys_info_set ? c->sys_info.display_desktop_width : 0u,
+				    c->sys_info_set ? c->sys_info.display_desktop_height : 0u,
+				    c->sys_info_set ? c->sys_info.display_pixel_width : 0u,
+				    c->sys_info_set ? c->sys_info.display_pixel_height : 0u);
+			}
+			return false;
+		}
+
+		const uint32_t q = vk_x11_placement_quantum(c);
+		if (q > 1) {
+			/*
+			 * Placement is quantised. The DP's snap searches every pixel
+			 * within radius 2 and, left alone, answers an odd position
+			 * about half the time; the server then silently rounds it to
+			 * its even neighbour and the window lands one pixel out of
+			 * phase — a stutter that varies frame to frame. So search the
+			 * lattice of positions the window CAN reach, origin + q*Z^2,
+			 * and take the nearest one the DP itself would snap to a
+			 * reachable point. The DP stays the only owner of the lens
+			 * math (ADR-019): we never compute a phase, we only choose
+			 * which positions to offer it.
+			 *
+			 * Honest cost: the reachable phase-correct positions are
+			 * sparser than q = 1, so the window tracks the pointer in
+			 * coarser steps (a few px). That trade — coarser motion, exact
+			 * 3D — is the point; a smooth drag at a wrong phase is the
+			 * stutter we are removing.
+			 */
+			if (!c->warned_snap_lattice) {
+				c->warned_snap_lattice = true;
+				U_LOG_W(
+				    "drag snap: placement quantum %u — searching the reachable lattice "
+				    "(origin + %u*Z^2) for a phase-correct position.",
+				    q, q);
+			}
+			int32_t sx = target_x, sy = target_y;
+			if (!xrt_display_processor_vk_snap_window_rect(vdp, origin_x, origin_y, target_x, target_y, &sx,
+			                                               &sy)) {
+				return false; // the DP does not snap; nothing to improve
+			}
+			if (vk_on_reachable_lattice(origin_x, sx, q) && vk_on_reachable_lattice(origin_y, sy, q)) {
+				*out_x = sx;
+				*out_y = sy;
+				return true;
+			}
+			const int32_t bx = u_x11_reachable_round(origin_x, sx, q);
+			const int32_t by = u_x11_reachable_round(origin_y, sy, q);
+			// 3 rings = 49 candidates, within 3q px of the DP's own answer.
+			// Each is a pure in-process arithmetic query; this runs only on
+			// a drag step, never per frame.
+			const uint32_t n = u_x11_lattice_candidate_count(3);
+			for (uint32_t k = 0; k < n; k++) {
+				int32_t i = 0, j = 0;
+				u_x11_lattice_candidate(k, &i, &j);
+				const int32_t px = bx + i * (int32_t)q;
+				const int32_t py = by + j * (int32_t)q;
+				int32_t rx = px, ry = py;
+				if (!xrt_display_processor_vk_snap_window_rect(vdp, origin_x, origin_y, px, py, &rx,
+				                                               &ry)) {
+					continue;
+				}
+				if (vk_on_reachable_lattice(origin_x, rx, q) &&
+				    vk_on_reachable_lattice(origin_y, ry, q)) {
+					*out_x = rx;
+					*out_y = ry;
+					return true;
+				}
+			}
+			// Nothing reachable within reach: land on the nearest reachable
+			// point so at least the window goes where it will actually go,
+			// and report that the snap could not be honoured.
+			if (!c->warned_snap_no_lattice_point) {
+				c->warned_snap_no_lattice_point = true;
+				U_LOG_W(
+				    "drag snap: no phase-correct position reachable within %u px of the target "
+				    "under quantum %u — landing on the nearest reachable pixel; the 3D may "
+				    "stutter on this drag. Every output at 100%% avoids this.",
+				    3u * q, q);
+			}
+			*out_x = bx;
+			*out_y = by;
+			return true;
+		}
+	}
+#endif // XRT_OS_LINUX_DESKTOP
+
+	return xrt_display_processor_vk_snap_window_rect(vdp, origin_x, origin_y, target_x, target_y, out_x, out_y);
 }
 
 struct vk_bundle *
