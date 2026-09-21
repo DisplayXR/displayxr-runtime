@@ -445,7 +445,39 @@ _package/DisplayXR-macOS/run_cube_handle_metal.sh > /tmp/log 2>&1 &
 sleep 4 && touch /tmp/dxr_atlas_trigger && sleep 2
 pkill -f cube_handle_metal_macos   # then Read /tmp/dxr_atlas.png
 ```
-(vk_native has no trigger yet — use the in-app `stbi_write_png` trick.)
+
+**`vk_native` HAS a file-trigger capture too — but at a DIFFERENT path, and that
+mismatch is the trap.** (This line used to read "vk_native has no trigger yet"; it
+was stale, and it cost a session a redundant port before the existing one was
+found. Verified working 2026-09-21: a 287,637-byte PNG from `cube_handle_vk_macos`.)
+The Vulkan compositor goes through the shared `u_capture_intent` machinery
+(`u_capture_intent_poll` → `vk_native_dispatch_capture`), which resolves its
+directory from **`$TMPDIR`** — and on macOS `$TMPDIR` is a *per-user*
+`/var/folders/...` path, **not** `/tmp`. So:
+
+| backend | trigger | output |
+|---|---|---|
+| Metal, GL | `/tmp/dxr_atlas_trigger` | `/tmp/dxr_atlas.png` |
+| vk_native | `$TMPDIR/displayxr_atlas_trigger` | `$TMPDIR/displayxr_atlas.png` |
+
+```bash
+rm -f "$TMPDIR/displayxr_atlas.png" "$TMPDIR/displayxr_atlas_trigger"
+_package/DisplayXR-macOS/run_cube_handle_vk.sh > /tmp/log 2>&1 &
+sleep 4 && touch "$TMPDIR/displayxr_atlas_trigger" && sleep 2
+pkill -f cube_handle_vk_macos   # then Read "$TMPDIR/displayxr_atlas.png"
+```
+`vk_native` also honours `…_trigger.projection` (projection-only), the per-exe
+suffixes, and MCP / `xrCaptureAtlasDXR` — see `u_capture_intent.h`. Touching the
+Metal/GL path while running a Vulkan app looks exactly like a broken capture: the
+trigger file simply stays on disk, unconsumed. **Do not unify the two paths
+casually** — the Metal/GL names are baked into existing recipes and notes.
+
+**Alpha is forced opaque by default in every capture** (`u_image_force_opaque_rgba8`,
+issue #425: undefined swapchain alpha otherwise renders the PNG black). That is right
+for eyeballing and **wrong for an oracle** — any check on the atlas's alpha channel
+(e.g. the OpenXR §10.6.2 opaque-cover rule, where 0 means unfixed and 255 means fixed)
+reads 255 either way and cannot fail. Set **`DXR_ATLAS_CAPTURE_RAW_ALPHA=1`** to write
+the true alpha (vk_native + Metal today).
 
 ### Crash debugging (procdump + cdb)
 ```bash

@@ -48,6 +48,7 @@
 #include "util/u_tiling.h"
 #include "util/u_canvas.h"
 #include "util/u_capture_intent.h"
+#include "util/u_image_capture.h"
 #include <displayxr_mcp/mcp_capture.h>
 
 // STB_IMAGE_WRITE_STATIC scopes all stbi_write_* to this TU so linking
@@ -2033,15 +2034,20 @@ metal_compositor_capture_atlas_to_png(struct comp_metal_compositor *c,
 		// Atlas format is BGRA8Unorm — swap into RGBA for stbi_write_png.
 		uint8_t *bgra = (uint8_t *)staging.contents;
 		uint8_t *rgba = malloc(buf_bytes);
+		// Force opaque: swapchain alpha is undefined for display output, and
+		// left as-is the PNG renders transparent/black (issue #425).
+		//
+		// DXR_ATLAS_CAPTURE_RAW_ALPHA=1 keeps the atlas's true alpha, which
+		// the OpenXR §10.6.2 opaque-cover check has to read back (0 = the
+		// fix is missing, 255 = present). Stamping 255 unconditionally made
+		// that acceptance leg unable to fail. Default is unchanged.
+		const bool raw_alpha = u_image_capture_raw_alpha();
 		if (rgba != NULL) {
 			for (size_t i = 0; i < buf_bytes; i += 4) {
 				rgba[i + 0] = bgra[i + 2];
 				rgba[i + 1] = bgra[i + 1];
 				rgba[i + 2] = bgra[i + 0];
-				// Force opaque: swapchain alpha is undefined for display
-				// output, and left as-is the PNG renders transparent/black
-				// (issue #425).
-				rgba[i + 3] = 255;
+				rgba[i + 3] = raw_alpha ? bgra[i + 3] : 255;
 			}
 			ok = stbi_write_png(path, (int)content_w, (int)content_h, 4, rgba, (int)row_pitch) != 0;
 			free(rgba);
