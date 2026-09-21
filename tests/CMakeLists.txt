@@ -36,6 +36,7 @@ set(tests
     tests_comp_swapchain_ring
     tests_aux_bg_neutrality
     tests_aux_color_encoding
+    tests_aux_grip_surface
     tests_aux_rear_budget
     tests_aux_route_policy
     tests_aux_overlay_lease
@@ -193,6 +194,10 @@ target_link_libraries(tests_aux_tiling_zero_copy PRIVATE xrt-interfaces)
 target_link_libraries(tests_aux_tiling_row_origin PRIVATE xrt-interfaces)
 
 target_link_libraries(tests_cxx_wrappers PRIVATE xrt-interfaces)
+# part of #1633 -- u_grip_surface(), the one grip -> grip_surface transform.
+# Pure geometry, so it needs the math library and nothing else.
+target_link_libraries(tests_aux_grip_surface PRIVATE aux_math)
+
 target_link_libraries(tests_history_buf PRIVATE aux_math)
 target_link_libraries(tests_lowpass_float PRIVATE aux_math)
 target_link_libraries(tests_lowpass_integer PRIVATE aux_math)
