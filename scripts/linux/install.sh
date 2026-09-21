@@ -7,12 +7,16 @@
 #     OpenXR ActiveRuntime  -> $XDG_CONFIG_HOME/openxr/1/active_runtime.json
 #     DP discovery manifest -> $XDG_DATA_HOME/DisplayXR/DisplayProcessors/200-sim-display.json
 #     systemd --user unit   -> $XDG_CONFIG_HOME/systemd/user/displayxr.service (if service present)
+#     GNOME Shell extension -> $XDG_DATA_HOME/gnome-shell/extensions/window-geometry@displayxr.org
+#                              and enabled for this user (unless they disabled it)
 #
 #   sudo ./install.sh --system
 #     runtime + plug-in     -> /usr/local/{bin,lib}
 #     OpenXR ActiveRuntime  -> /etc/xdg/openxr/1/active_runtime.json
 #     DP discovery manifest -> /usr/local/share/displayxr/DisplayProcessors/200-sim-display.json
 #     (no systemd unit in system mode, v1 — start displayxr-service per user)
+#     GNOME Shell extension -> /usr/local/share/gnome-shell/extensions/window-geometry@displayxr.org
+#                              + /etc/xdg/autostart entry enabling it once per user at login
 #
 # The DisplayProcessors directory is a SHARED discovery root: a vendor plug-in
 # installer (e.g. Leia SR) drops its own .so + <probe-order>-<id>.json next to
@@ -21,6 +25,7 @@
 #
 # Flags: --system  system-wide (needs root)
 #        --no-service  skip the systemd --user unit
+#        --no-gnome-extension  skip the GNOME Shell extension
 
 set -euo pipefail
 
@@ -28,11 +33,13 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 
 SYSTEM=0
 NO_SERVICE=0
+NO_GNOME_EXT=0
 for arg in "$@"; do
     case "$arg" in
     --system) SYSTEM=1 ;;
     --no-service) NO_SERVICE=1 ;;
-    *) echo "Unknown option: $arg (supported: --system --no-service)" >&2; exit 2 ;;
+    --no-gnome-extension) NO_GNOME_EXT=1 ;;
+    *) echo "Unknown option: $arg (supported: --system --no-service --no-gnome-extension)" >&2; exit 2 ;;
     esac
 done
 
@@ -46,13 +53,16 @@ if [ "$SYSTEM" = 1 ]; then
     PREFIX=/usr/local
     OPENXR_CONF_DIR=/etc/xdg/openxr/1
     DP_ROOT=/usr/local/share/displayxr/DisplayProcessors
+    EXT_ROOT=/usr/local/share/gnome-shell/extensions
 else
     DATA_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}"
     CONFIG_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}"
     PREFIX="$DATA_ROOT/displayxr"
     OPENXR_CONF_DIR="$CONFIG_ROOT/openxr/1"
     DP_ROOT="$DATA_ROOT/DisplayXR/DisplayProcessors"
+    EXT_ROOT="$DATA_ROOT/gnome-shell/extensions"
 fi
+EXT_UUID="window-geometry@displayxr.org"
 
 echo "==> Installing DisplayXR runtime to $PREFIX"
 mkdir -p "$PREFIX"
@@ -118,6 +128,35 @@ EOF
         echo "    (no systemd user session detected — enable manually later:"
         echo "     systemctl --user daemon-reload && systemctl --user enable displayxr)"
     fi
+fi
+
+# --- GNOME Shell extension (windowed Wayland weaving + capture exclusion) ----
+# Required on GNOME/Wayland for both features; harmless elsewhere (GNOME Shell
+# is the only thing that ever loads it). Enabling is per user: the installing
+# user here, every user at their next login for --system.
+EXT_SRC="$HERE/share/gnome-shell/extensions/$EXT_UUID"
+if [ "$NO_GNOME_EXT" = 0 ] && [ -f "$EXT_SRC/metadata.json" ]; then
+    mkdir -p "$EXT_ROOT/$EXT_UUID"
+    cp "$EXT_SRC/extension.js" "$EXT_SRC/metadata.json" "$EXT_ROOT/$EXT_UUID/"
+    echo "==> GNOME Shell extension: $EXT_ROOT/$EXT_UUID"
+    if [ "$SYSTEM" = 1 ]; then
+        mkdir -p /etc/xdg/autostart
+        cat > /etc/xdg/autostart/displayxr-gnome-extension-enable.desktop <<EOF
+[Desktop Entry]
+Type=Application
+Name=DisplayXR GNOME Shell extension
+Comment=Enables the DisplayXR window-geometry extension once per user, never over an opt-out
+Exec=$PREFIX/bin/displayxr-gnome-extension-enable
+TryExec=$PREFIX/bin/displayxr-gnome-extension-enable
+OnlyShowIn=GNOME;
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+EOF
+        echo "    enabled for each user at their next GNOME login (not for a user who disabled it)"
+    else
+        "$PREFIX/bin/displayxr-gnome-extension-enable" --install || true
+    fi
+    echo "    LOG OUT AND BACK IN for it to load: a Wayland session cannot reload GNOME Shell."
 fi
 
 echo ""

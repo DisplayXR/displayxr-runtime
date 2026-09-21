@@ -8,8 +8,12 @@
 #
 # Output: dist/displayxr-runtime-linux-<arch>-<version>.tar.gz containing
 #   bin/displayxr-cli [bin/displayxr-service]
+#   bin/displayxr-gnome-extension-enable
 #   lib/openxr_displayxr.so
 #   lib/displayxr/plugins/DisplayXR-SimDisplay.so
+#   share/gnome-shell/extensions/window-geometry@displayxr.org/  (GNOME Shell
+#       extension: windowed Wayland weaving + capture exclusion; install.sh
+#       installs and enables it for the installing user)
 #   install.sh / uninstall.sh / README.md / VERSION
 #
 # v1 scope (#705): runtime + sim_display, user-level default. All config files
@@ -56,6 +60,12 @@ for f in "$RUNTIME_SO" "$CLI_BIN" "$PLUGIN_SO"; do
 done
 [ -n "$SERVICE_BIN" ] || echo "note: displayxr-service not built — packaging without it (--service build adds it)"
 
+EXT_UUID="window-geometry@displayxr.org"
+EXT_SRC="$ROOT/contrib/gnome-shell/$EXT_UUID"
+for f in "$EXT_SRC/extension.js" "$EXT_SRC/metadata.json" "$ROOT/scripts/linux/displayxr-gnome-extension-enable"; do
+    [ -f "$f" ] || { echo "error: missing $f (GNOME Shell extension payload)" >&2; exit 1; }
+done
+
 VERSION="$(git -C "$ROOT" describe --tags --always --dirty 2>/dev/null || echo unknown)"
 ARCH="$(uname -m)"
 NAME="displayxr-runtime-linux-$ARCH-$VERSION"
@@ -63,11 +73,13 @@ STAGE="$DIST_DIR/$NAME"
 
 echo "==> Staging $NAME"
 rm -rf "$STAGE"
-mkdir -p "$STAGE/bin" "$STAGE/lib/displayxr/plugins"
+mkdir -p "$STAGE/bin" "$STAGE/lib/displayxr/plugins" "$STAGE/share/gnome-shell/extensions/$EXT_UUID"
 cp "$CLI_BIN" "$STAGE/bin/"
 [ -n "$SERVICE_BIN" ] && cp "$SERVICE_BIN" "$STAGE/bin/"
 cp "$RUNTIME_SO" "$STAGE/lib/"
 cp "$PLUGIN_SO" "$STAGE/lib/displayxr/plugins/"
+cp "$EXT_SRC/extension.js" "$EXT_SRC/metadata.json" "$STAGE/share/gnome-shell/extensions/$EXT_UUID/"
+install -m 0755 "$ROOT/scripts/linux/displayxr-gnome-extension-enable" "$STAGE/bin/"
 cp "$ROOT/scripts/linux/install.sh" "$ROOT/scripts/linux/uninstall.sh" "$STAGE/"
 chmod +x "$STAGE/install.sh" "$STAGE/uninstall.sh"
 echo "$VERSION" > "$STAGE/VERSION"
@@ -88,6 +100,20 @@ root, and (when present) a systemd --user unit for displayxr-service.
 
 System-wide instead: \`sudo ./install.sh --system\` (no systemd unit, v1).
 Remove with \`./uninstall.sh\` (same flag).
+
+## GNOME: the window-geometry extension
+
+On GNOME, \`install.sh\` also installs the GNOME Shell extension
+\`window-geometry@displayxr.org\` (needed for windowed weaving under Wayland
+and for transparent apps on a 3D panel) and enables it for you, unless you
+disabled it before. **Log out and back in** afterwards: a Wayland session
+cannot reload GNOME Shell, so the extension (or a new version of it) only
+starts at your next login. \`--system\` installs it for every user instead,
+each enabled at their next GNOME login.
+
+Check it is running:
+
+    gnome-extensions info window-geometry@displayxr.org
 
 ## Verify
 
