@@ -1421,7 +1421,7 @@ static void RenderOneFrame(RenderState& rs) {
                         if (!arrayLayout) {
                             CreateRenderTargetView(renderer, swapchainTexture,
                                 static_cast<DXGI_FORMAT>(xr.swapchain.format), &rtv);
-                            renderer.context->ClearRenderTargetView(rtv, clearColor);
+                            ClearRenderTargetViewDisplayReferred(renderer, rtv, clearColor);
                         }
                         renderer.context->ClearDepthStencilView(rs.depthDSV.Get(),
                             D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
@@ -1470,7 +1470,7 @@ static void RenderOneFrame(RenderState& rs) {
                                     LOG_ERROR("array RTV creation failed for slice %d", eye);
                                     continue;
                                 }
-                                renderer.context->ClearRenderTargetView(sliceRtv, clearColor);
+                                ClearRenderTargetViewDisplayReferred(renderer, sliceRtv, clearColor);
                                 // Each slice is rendered full-viewport into the SAME
                                 // shared depth buffer, so depth MUST be cleared per
                                 // slice — otherwise slice 1 z-tests against slice 0's

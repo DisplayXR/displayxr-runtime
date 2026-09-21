@@ -482,7 +482,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                 CreateRenderTargetView(renderer, swapchainTexture,
                     static_cast<DXGI_FORMAT>(xr.swapchain.format), &rtv);
                 float clearColor[4] = {0.05f, 0.1f, 0.15f, 1.0f};
-                renderer.context->ClearRenderTargetView(rtv, clearColor);
+                ClearRenderTargetViewDisplayReferred(renderer, rtv, clearColor);
                 if (rtv) rtv->Release();
 
                 for (int eye = 0; eye < eyeCount; eye++) {

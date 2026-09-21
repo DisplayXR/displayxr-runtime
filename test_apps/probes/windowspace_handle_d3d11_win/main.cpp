@@ -245,7 +245,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                 float clearColor[4] = {
                     wsl::kBgR / 255.0f, wsl::kBgG / 255.0f, wsl::kBgB / 255.0f, wsl::kBgA / 255.0f
                 };
-                renderer.context->ClearRenderTargetView(rtv, clearColor);
+                ClearRenderTargetViewDisplayReferred(renderer, rtv, clearColor);
                 if (rtv) rtv->Release();
 
                 // Build per-view projection subImage rects (tile layout).

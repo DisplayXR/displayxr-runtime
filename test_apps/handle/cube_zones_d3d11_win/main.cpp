@@ -1131,7 +1131,7 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
         if (!arrayLayout) {
             CreateRenderTargetView(renderer, z.images[imageIndex].texture,
                                    static_cast<DXGI_FORMAT>(z.format), &rtv);
-            renderer.context->ClearRenderTargetView(rtv, z.clearColor);
+            ClearRenderTargetViewDisplayReferred(renderer, rtv, z.clearColor);
         }
         renderer.context->ClearDepthStencilView(z.depthDSV.Get(),
             D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
@@ -1157,7 +1157,7 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
                     LOG_ERROR("[zones] zone %u view %u: array RTV creation failed", z.zoneId, vi);
                     continue;
                 }
-                renderer.context->ClearRenderTargetView(sliceRtv, z.clearColor);
+                ClearRenderTargetViewDisplayReferred(renderer, sliceRtv, z.clearColor);
                 // Each slice renders full-viewport into the SAME shared depth
                 // buffer, so depth MUST be cleared per slice — otherwise slice 1
                 // z-tests against slice 0's depth and the other eye's cube punches
@@ -1696,7 +1696,7 @@ static void RenderOneFrame(RenderState& rs) {
                     static_cast<DXGI_FORMAT>(xr.swapchain.format), &rtv);
 
                 float clearColor[4] = {0.05f, 0.05f, 0.25f, 1.0f};
-                renderer.context->ClearRenderTargetView(rtv, clearColor);
+                ClearRenderTargetViewDisplayReferred(renderer, rtv, clearColor);
                 renderer.context->ClearDepthStencilView(rs.depthDSV.Get(),
                     D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
 
