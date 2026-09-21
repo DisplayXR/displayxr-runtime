@@ -16,8 +16,8 @@ The cube test apps select their color swapchain via `DXR_SWAPCHAIN_ENCODING`
 
 | Value | Swapchain | Bytes reaching the runtime | Exercises |
 |---|---|---|---|
-| `srgb` | an advertised `*_SRGB` format | GPU auto-encodes on the per-frame RTV write → **honest encoded**; runtime sets `atlas_holds_srgb_bytes=true` | the **Model B decode leg** when ≥2 such clients blend |
-| `unorm` | a plain UNORM format | app writes raw → **encoded-into-UNORM** (today's default) / **true-linear-into-UNORM** (content = whatever the renderer wrote) | Model A passthrough |
+| `srgb` | an advertised `*_SRGB` format | GPU auto-encodes on the per-frame RTV write → **honest encoded**; runtime sets `atlas_holds_srgb_bytes=true` | the **single-layer fast path** (raw, byte-identical atlas) and the **Model B decode leg** when ≥2 such clients blend |
+| `unorm` | a plain UNORM format | app writes raw. Since #1589 the runtime reads these as **scene-linear** and encodes them on the way to the atlas — so an app that wrote *encoded* bytes here now looks washed out, and that is the app's bug | the **encode** leg |
 | unset | runtime-preferred (`formats[0]`) | unchanged | default behavior |
 
 Set it process-level (the runtime DLL has its own static-CRT env block; use a real
@@ -86,5 +86,33 @@ The D3D11 service compositor captures the combined atlas **post-compose, pre-DP*
 rm -f "$TEMP/workspace_screenshot_atlas.png"
 touch "$TEMP/workspace_screenshot_trigger"   # wait ~3s, then read the PNG
 ```
-- **No double-encode (Model A):** cubes are UNORM-encoded; the captured atlas bytes must equal the app's output (no ~2.2× darkening).
+- **No double-encode (Model A):** the captured atlas bytes must equal the app's output for an `_SRGB` client (no ~2.2× darkening).
 - **Model B:** the captured atlas is intentionally **linear** (numerically darker) — the encode happens *after* capture, in the DP — so a dark pre-DP atlas under B is expected, not a regression. Confirm the on-screen (post-DP) result is correct by eyeballing the live display (screenshots during eye-tracking warmup miss UI).
+
+### The #1589 numerical oracle (hardware-free arithmetic, hardware-read bytes)
+
+A **true-linear** value written into a **UNORM** swapchain must arrive in the atlas
+encoded. The four acceptance bytes are pinned CPU-side in
+`tests/tests_aux_color_encoding.cpp` and read back from the capture PNG:
+
+| linear in a UNORM swapchain | atlas byte (correct) | atlas byte (pre-#1589 passthrough) |
+|---|---|---|
+| 0.0 | 0 | 0 |
+| 0.2 | **124** | 51 |
+| 0.5 | **188** | 128 |
+| 1.0 | 255 | 255 |
+
+`128` for a linear 0.5 is the **negative control**: the frame did not take the encode.
+0.0 and 1.0 are fixed points and prove nothing on their own.
+
+**Which path a frame took** is readable from the log without a debugger:
+- one `Color (#1589) [<component>]:` WARN at init states whether
+  `DXR_COLOR_LEGACY_UNORM_ENCODED` is on (legacy) or off (format-honest);
+- a `Color (#1610) [<component>]: compose target` WARN the first time the private
+  `_SRGB`-view target is created, naming its format and the atlas format. **No such
+  line ⟹ every frame so far took the fast path**, and the atlas is byte-identical to
+  the pre-#1589 runtime — which is what a single-layer `_SRGB` app must show.
+
+**Blend oracle (#1610).** The CTS `SourceAlphaBlending` case on the panel: mid **G 209**
+(encoded-space blending gives 164), unpremultiplied **B 160** (vs 90), semi-white over
+black ≈ **156** (vs 84).
