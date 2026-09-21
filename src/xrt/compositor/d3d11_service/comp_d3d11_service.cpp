@@ -1400,6 +1400,10 @@ struct d3d11_service_system
 	//! Equirect2 layer shaders
 	wil::com_ptr<ID3D11VertexShader> equirect2_vs;
 	wil::com_ptr<ID3D11PixelShader> equirect2_ps;
+	//! #1601: Texture2DArray source variant of equirect2_ps, built from the
+	//! same HLSL with DXR_LAYERED defined. Same gate and non-fatal fallback
+	//! as quad_ps_array.
+	wil::com_ptr<ID3D11PixelShader> equirect2_ps_array;
 
 	//! Cube layer shaders
 	wil::com_ptr<ID3D11VertexShader> cube_vs;
@@ -4965,12 +4969,20 @@ get_srgb_format(DXGI_FORMAT format)
  *
  */
 
+//! @p defines is an optional D3D_SHADER_MACRO list, NULL-terminated as
+//! D3DCompile requires. #1601 added it so the long equirect2 pixel shader can
+//! yield its Texture2DArray variant from one source instead of a second
+//! hand-maintained copy of ~100 lines of ray-march math that would drift.
 static HRESULT
-compile_shader(const char *source, const char *entry, const char *target, ID3DBlob **out_blob)
+compile_shader(const char *source,
+               const char *entry,
+               const char *target,
+               ID3DBlob **out_blob,
+               const D3D_SHADER_MACRO *defines = nullptr)
 {
 	ID3DBlob *errors = nullptr;
-	HRESULT hr = D3DCompile(source, strlen(source), nullptr, nullptr, nullptr, entry, target, 0, 0, out_blob,
-	                        &errors);
+	HRESULT hr =
+	    D3DCompile(source, strlen(source), nullptr, defines, nullptr, entry, target, 0, 0, out_blob, &errors);
 	if (FAILED(hr)) {
 		if (errors != nullptr) {
 			U_LOG_E("Shader compile error: %s", (char *)errors->GetBufferPointer());
@@ -5103,6 +5115,25 @@ create_layer_shaders(struct d3d11_service_system *sys)
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create equirect2 pixel shader: 0x%08lx", hr);
 		return false;
+	}
+
+	// #1601: layered (array) equirect2 pixel shader — the SAME source with
+	// DXR_LAYERED defined, so the ray-march body cannot drift between the two.
+	// Non-fatal, as the quad and cylinder variants are.
+	{
+		const D3D_SHADER_MACRO layered_defines[] = {{"DXR_LAYERED", "1"}, {nullptr, nullptr}};
+		hr = compile_shader(equirect2_ps_hlsl, "PSMain", "ps_5_0", &blob, layered_defines);
+		if (FAILED(hr)) {
+			U_LOG_W("Array equirect2 pixel shader unavailable — sampling slice 0");
+		} else {
+			hr = sys->device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+			                                    sys->equirect2_ps_array.put());
+			blob->Release();
+			if (FAILED(hr)) {
+				U_LOG_W("Array equirect2 pixel shader unavailable (0x%08lx) — sampling slice 0", hr);
+				sys->equirect2_ps_array = nullptr;
+			}
+		}
 	}
 
 	// Cube vertex shader
@@ -5922,6 +5953,13 @@ render_equirect2_layer(struct d3d11_service_system *sys,
 	constants.upper_vertical_angle = eq->upper_vertical_angle;
 	constants.lower_vertical_angle = eq->lower_vertical_angle;
 
+	// #1601: same slice bug and same fix as quad and cylinder — equirect2
+	// carries an xrt_sub_image and reaches the same whole-array
+	// Texture2DArray SRV. Gated on the swapchain's array size.
+	const bool is_layered = sc->info.array_size > 1;
+	const bool use_array_ps = is_layered && sys->equirect2_ps_array;
+	constants.array_params[0] = use_array_ps ? static_cast<float>(eq->sub.array_index) : 0.0f;
+
 	// Update constant buffer
 	D3D11_MAPPED_SUBRESOURCE mapped;
 	HRESULT hr = sys->context->Map(sys->layer_constant_buffer.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
@@ -5932,7 +5970,7 @@ render_equirect2_layer(struct d3d11_service_system *sys,
 
 	// Set shaders
 	sys->context->VSSetShader(sys->equirect2_vs.get(), nullptr, 0);
-	sys->context->PSSetShader(sys->equirect2_ps.get(), nullptr, 0);
+	sys->context->PSSetShader(use_array_ps ? sys->equirect2_ps_array.get() : sys->equirect2_ps.get(), nullptr, 0);
 
 	// Bind resources
 	ID3D11Buffer *cbs[] = {sys->layer_constant_buffer.get()};
@@ -24490,6 +24528,7 @@ system_destroy(struct xrt_system_compositor *xsysc)
 	sys->cube_ps.reset();
 	sys->cube_vs.reset();
 	sys->equirect2_ps.reset();
+	sys->equirect2_ps_array.reset();
 	sys->equirect2_vs.reset();
 	sys->cylinder_ps.reset();
 	sys->cylinder_ps_array.reset();
