@@ -11,6 +11,16 @@ On X11 this is unnecessary — the runtime queries `xcb_translate_coordinates`
 directly. This extension only matters for Wayland sessions with apps using
 `XR_DXR_wayland_surface_binding`.
 
+**Version 2 adds capture exclusion** — the GNOME equivalent of Windows'
+`WDA_EXCLUDEFROMCAPTURE`. A process can ask for its own windows to be left out
+of every off-screen stage paint (mutter ScreenCast `RecordArea`, screenshots)
+while they keep drawing on screen. The Leia Linux display processor uses it to
+capture the desktop *behind* a transparent 3D window, which is what removes the
+double image and the halo and gives the rear depth budget a real background to
+measure. Without version 2 the display processor refuses to capture and falls
+back to silhouette intersection. Full contract:
+`docs/specs/runtime/wayland-window-geometry.md` §6.
+
 ## Install (manual, until packaged)
 
 ```bash
@@ -19,6 +29,9 @@ mkdir -p ~/.local/share/gnome-shell/extensions/$UUID
 cp extension.js metadata.json ~/.local/share/gnome-shell/extensions/$UUID/
 # Log out/in (Wayland cannot hot-reload the shell), then:
 gnome-extensions enable $UUID
+# Updating an already-enabled copy: copy the files, then log out/in. A running
+# shell keeps the old code until then (`gnome-extensions info $UUID` shows the
+# version it loaded).
 ```
 
 Verify it's live:
@@ -36,6 +49,19 @@ gdbus call --session --dest org.displayxr.WindowGeometry \
 - `GetWindows() -> (s)`: JSON snapshot of all normal windows.
 - `WindowsChanged(s)`: same JSON, emitted (coalesced per redraw) on any
   position/size/focus/lifetime change.
+- Version 2: object `/org/displayxr/CaptureExclusion`, interface
+  `org.displayxr.CaptureExclusion1` — `Exclude(u pid) -> (u windows)` (pid 0 =
+  the caller; only your own PID), `Release(u pid)`, `GetState() -> (s)`. The
+  exclusion lasts as long as the caller's bus connection, and `disable()`
+  (including the lock screen) removes every effect.
+
+Verify capture exclusion is live:
+
+```bash
+gdbus call --session --dest org.displayxr.WindowGeometry \
+  --object-path /org/displayxr/CaptureExclusion \
+  --method org.displayxr.CaptureExclusion1.GetState
+```
 
 Schema and coordinate-space notes are documented at the top of
 `extension.js` and in `docs/specs/runtime/wayland-window-geometry.md`.
