@@ -22708,6 +22708,19 @@ comp_d3d11_service_weave_bind_window(struct xrt_compositor *xc, uint64_t hwnd)
 		return false;
 	}
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	// browser-pvt#147: refuse a handle that is not a live window. A present-owner
+	// that caches its HWND across a reconnect can hand us a window that has since
+	// been destroyed (the browser's first-run setup window, replaced by the real
+	// frame). Accepting it binds the panel lease, wish mask and phase anchor to a
+	// rect nobody can read, and every later weave_submit is refused with a message
+	// that points at the device split rather than at the window. Fail the bind
+	// here instead, where the cause is one WARN line away from the symptom.
+	if (hwnd != 0 && !IsWindow((HWND)(uintptr_t)hwnd)) {
+		U_LOG_W("#625 weave: REFUSING to bind hwnd=%p — not a live window (destroyed or never created); "
+		        "the client must re-resolve its frame window and bind again",
+		        (void *)(uintptr_t)hwnd);
+		return false;
+	}
 	c->render.weave_hwnd = (HWND)(uintptr_t)hwnd;
 	// #964: binding a window IS the declaration "I am a present-owner". There
 	// is no earlier signal the compositor can see (the session info carries no
