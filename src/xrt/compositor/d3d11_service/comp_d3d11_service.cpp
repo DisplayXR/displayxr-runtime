@@ -5523,17 +5523,22 @@ get_color_scale_bias(const struct xrt_layer_data *data, float color_scale[4], fl
 static void
 set_blend_state(struct d3d11_service_system *sys, const struct xrt_layer_data *data)
 {
-	// OpenXR semantics:
-	//   BLEND_TEXTURE_SOURCE_ALPHA_BIT clear  -> layer is opaque, no blend.
-	//   BLEND_TEXTURE_SOURCE_ALPHA_BIT set + UNPREMULTIPLIED_ALPHA_BIT clear -> premultiplied.
-	//   BLEND_TEXTURE_SOURCE_ALPHA_BIT set + UNPREMULTIPLIED_ALPHA_BIT set   -> straight alpha.
-	const enum xrt_layer_composition_flags f = data->flags;
-	if ((f & XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT) == 0) {
-		sys->context->OMSetBlendState(sys->blend_opaque.get(), nullptr, 0xFFFFFFFF);
-	} else if ((f & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0) {
+	// The OpenXR three-way rule (no SOURCE_ALPHA -> opaque cover;
+	// SOURCE_ALPHA -> premultiplied; + UNPREMULTIPLIED -> straight alpha).
+	//
+	// This function has always had it right — it is the D3D11 IN-PROCESS
+	// renderer that had it inverted (#1599). Calling the shared predicate
+	// here is a pure refactor, byte-for-byte the same three branches, and
+	// it is what stops the two paths drifting apart again.
+	switch (comp_layer_blend_mode(data->flags)) {
+	case COMP_LAYER_BLEND_STRAIGHT:
 		sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
-	} else {
+		break;
+	case COMP_LAYER_BLEND_PREMULTIPLIED:
 		sys->context->OMSetBlendState(sys->blend_premul.get(), nullptr, 0xFFFFFFFF);
+		break;
+	case COMP_LAYER_BLEND_REPLACE:
+	default: sys->context->OMSetBlendState(sys->blend_opaque.get(), nullptr, 0xFFFFFFFF); break;
 	}
 }
 
@@ -5544,6 +5549,13 @@ render_quad_layer(struct d3d11_service_system *sys,
                   const struct xrt_pose *view_pose,
                   const struct xrt_fov *fov)
 {
+	// TODO(#1590): the back-face skip the in-process renderer now applies
+	// (`comp_layer_quad_is_front_facing(&q->pose, &view_pose->position)`)
+	// belongs here too — the spec says the back face "must not be drawn by
+	// the runtime" on every path. It is NOT applied here yet on purpose:
+	// under the shell this call also composes out-of-tree workspace chrome,
+	// so turning culling on is a visible change that needs a panel eyeball
+	// first. One `if` once that is done.
 	const struct xrt_layer_data *data = &layer->data;
 	const struct xrt_layer_quad_data *q = &data->quad;
 
