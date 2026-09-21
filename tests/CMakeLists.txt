@@ -29,6 +29,7 @@ set(tests
     tests_dp_vk_snap_window_rect
     tests_space_overseer_rig
     tests_rig_composer
+    tests_aux_x11_scale
     tests_cli_dims_check
     tests_comp_vblank_grid
     tests_comp_zone_tier1
