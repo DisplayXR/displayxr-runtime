@@ -43,6 +43,7 @@
 #include "util/u_logging.h"
 #include "util/u_setting.h"
 #include "util/u_weave_scope.h"
+#include "util/u_display_mode_hold.h"
 #include "util/u_debug.h"
 #include "util/u_misc.h"
 #include "util/u_time.h"
@@ -596,6 +597,18 @@ struct comp_vk_native_compositor
 	 * transition — see @ref vk_linux_update_surface_not_1to1.
 	 */
 	bool linux_surface_not_1to1;
+	/*!
+	 * The session's own hardware 2D/3D choice, and whether a runtime degrade
+	 * (today only @ref vk_linux_update_surface_not_1to1) is holding the panel
+	 * in 2D over it. Every request through
+	 * @ref comp_vk_native_compositor_request_display_mode records the choice;
+	 * while held it is not forwarded, and releasing the hold restores it —
+	 * never a forced 3D. Under a vendor where the first explicit lens call
+	 * takes ownership from the weaver (Leia srSDK, LeiaSR #266) that restore
+	 * is the only thing that ever turns the lens back on.
+	 * docs/specs/vendor/lens-preference-ownership.md.
+	 */
+	struct u_display_mode_hold display_mode_hold;
 	//! One-shot: said once that the 1:1 gate has nothing to measure.
 	bool warned_1to1_unknown;
 #endif
@@ -3869,6 +3882,9 @@ vk_android_update_container_scaled(struct comp_vk_native_compositor *c)
 }
 #endif // XRT_OS_ANDROID
 
+static bool
+vk_dp_request_display_mode(struct comp_vk_native_compositor *c, bool enable_3d);
+
 #ifdef XRT_OS_LINUX_DESKTOP
 /*!
  * Refuse rather than resample, desktop-Linux edition (#1595).
@@ -3992,16 +4008,23 @@ vk_linux_update_surface_not_1to1(struct comp_vk_native_compositor *c)
 		    panel_px_w, panel_px_h);
 	} else {
 		U_LOG_W(
-		    "NOT_1TO1 cleared: buffer %ux%u px now lands 1:1 on the %ux%u px panel — weaving again. "
-		    "(#1595)",
-		    buf_px_w, buf_px_h, panel_px_w, panel_px_h);
+		    "NOT_1TO1 cleared: buffer %ux%u px now lands 1:1 on the %ux%u px panel — weaving again, "
+		    "restoring the session's own hardware %s. (#1595)",
+		    buf_px_w, buf_px_h, panel_px_w, panel_px_h, c->display_mode_hold.wanted_3d ? "3D" : "2D");
 	}
 
 	// Same degrade the Android arm performs: ask the panel for hardware 2D and
 	// release this session's lens preference, because the Leia DP only ever
 	// re-asserts the lens from inside a weave and with the weave gone nothing
 	// else would let go (#1039). Both no-ops on a DP implementing neither slot.
-	comp_vk_native_compositor_request_display_mode(&c->base.base, !not_1to1);
+	//
+	// The restore is the SESSION's last choice, not 3D: an app that chose 2D
+	// stays 2D. And it must be explicit. Under the Leia srSDK (LeiaSR #266) the
+	// 2D request below takes this SR context's lens preference away from the
+	// weaver for good, so if the clear edge did not ask for the lens back,
+	// nobody ever would. While the hold is on, the session's own requests are
+	// recorded, not forwarded (comp_vk_native_compositor_request_display_mode).
+	(void)vk_dp_request_display_mode(c, u_display_mode_hold_set(&c->display_mode_hold, not_1to1));
 	if (not_1to1) {
 		xrt_display_processor_on_pause(c->display_processor);
 	} else {
@@ -8412,6 +8435,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	c->app_keyed_mutex = app_keyed_mutex;
 	c->hardware_display_3d = true;
 	c->last_3d_mode_index = 1;
+	u_display_mode_hold_init(&c->display_mode_hold, true); // sessions begin 3D
 
 	// #868: before ANY path that can reach vk_compositor_destroy — it both
 	// joins the repaint thread and destroys this mutex, so they must be valid
@@ -10202,12 +10226,15 @@ vk_update_present_origin(struct comp_vk_native_compositor *c)
 	                                            ox, oy);
 }
 
-bool
-comp_vk_native_compositor_request_display_mode(struct xrt_compositor *xc, bool enable_3d)
+/*!
+ * Forward a hardware 2D/3D request to whatever owns the panel (the DP, the
+ * split's weaver, or a deferral until the DP exists). No hold check: the
+ * session's entry point is @ref comp_vk_native_compositor_request_display_mode;
+ * the runtime's own degrade calls this directly.
+ */
+static bool
+vk_dp_request_display_mode(struct comp_vk_native_compositor *c, bool enable_3d)
 {
-	if (xc == NULL) return false;
-	struct comp_vk_native_compositor *c = vk_comp(xc);
-
 	U_LOG_W("HW3D_DBG vk_native request enable_3d=%d dp=%p has_slot=%d slot=%p", (int)enable_3d,
 	        (void *)c->display_processor,
 	        c->display_processor ? (int)XRT_DP_HAS_SLOT(c->display_processor, request_display_mode) : -1,
@@ -10235,6 +10262,27 @@ comp_vk_native_compositor_request_display_mode(struct xrt_compositor *xc, bool e
 	c->hw3d_request_value = enable_3d;
 	U_LOG_W("HW3D_DBG vk_native: no display processor yet — deferring enable_3d=%d", (int)enable_3d);
 	return true;
+}
+
+bool
+comp_vk_native_compositor_request_display_mode(struct xrt_compositor *xc, bool enable_3d)
+{
+	if (xc == NULL) return false;
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+
+	// The session's choice (app, V key, zones fallback) is always recorded, so
+	// a runtime hold releases back to it. While a hold is on it is not
+	// forwarded: the panel stays 2D for the hold's reason. Reported as
+	// accepted, because it WILL be applied — the same promise the no-DP-yet
+	// deferral in vk_dp_request_display_mode makes.
+	if (!u_display_mode_hold_request(&c->display_mode_hold, enable_3d)) {
+		U_LOG_W(
+		    "vk_native: hardware %s requested while the runtime holds the panel in 2D "
+		    "(NOT_1TO1) — recorded, applied when the hold clears",
+		    enable_3d ? "3D" : "2D");
+		return true;
+	}
+	return vk_dp_request_display_mode(c, enable_3d);
 }
 
 void
