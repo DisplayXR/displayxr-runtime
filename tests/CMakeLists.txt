@@ -89,6 +89,10 @@ if(WIN32 AND XRT_HAVE_D3D11)
 	# subImage.imageArrayIndex, in the in-process D3D11 renderer and in the
 	# D3D11 service. Reflection only; D3DCompile/D3DReflect need no device.
 	list(APPEND tests tests_comp_layer_array_shaders)
+	# #1601 — the pixel oracle the reflection suite cannot be: does the slice
+	# index actually reach the sampler. WARP, so no GPU; SKIPs if no D3D11
+	# device exists at all.
+	list(APPEND tests tests_comp_layer_array_warp)
 endif()
 if(XRT_HAVE_VULKAN)
 	list(APPEND tests tests_comp_client_vulkan tests_uv_to_tangent)
@@ -509,6 +513,11 @@ if(WIN32 AND XRT_HAVE_D3D11)
 		tests_comp_layer_array_shaders PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor
 		)
 	target_link_libraries(tests_comp_layer_array_shaders PRIVATE d3dcompiler)
+
+	target_include_directories(
+		tests_comp_layer_array_warp PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor
+		)
+	target_link_libraries(tests_comp_layer_array_warp PRIVATE d3dcompiler d3d11)
 endif()
 
 if(XRT_HAVE_D3D12)
