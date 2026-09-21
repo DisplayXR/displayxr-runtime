@@ -2164,13 +2164,17 @@ xrt_comp_get_display_refresh_rate(struct xrt_compositor *xc, float *out_display_
 /*!
  * @copydoc xrt_compositor::request_display_refresh_rate
  *
- * Helper for calling through the function pointer.
+ * Helper for calling through the function pointer. No-op (returns success) when
+ * the compositor doesn't implement it (in-process native, null compositor).
  *
  * @public @memberof xrt_compositor
  */
 static inline xrt_result_t
 xrt_comp_request_display_refresh_rate(struct xrt_compositor *xc, float display_refresh_rate_hz)
 {
+	if (xc->request_display_refresh_rate == NULL) {
+		return XRT_SUCCESS;
+	}
 	return xc->request_display_refresh_rate(xc, display_refresh_rate_hz);
 }
 
