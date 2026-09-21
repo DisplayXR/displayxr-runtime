@@ -458,9 +458,10 @@ comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g, struct 
 	if (!best->have_monitor) {
 		if (!g->warned_no_monitor) {
 			g->warned_no_monitor = true;
-			U_LOG_W("wl_geom: the geometry payload carries no monitor rect for this window, so its "
-			        "logical coordinates cannot be converted to device pixels — display-scoped "
-			        "weaving. (Mutter omits `monitor` only for a window on no monitor.)");
+			U_LOG_W(
+			    "wl_geom: the geometry payload carries no monitor rect for this window, so its "
+			    "logical coordinates cannot be converted to device pixels — display-scoped "
+			    "weaving. (Mutter omits `monitor` only for a window on no monitor.)");
 		}
 		return false;
 	}
@@ -489,11 +490,12 @@ comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g, struct 
 		// unattended run prove WHICH space reached the weaver. Not a WARN —
 		// a scaled desktop is now a supported configuration for the phase
 		// feed, not a degradation.
-		U_LOG_I("wl_geom: monitor scale %.4f — window logical %d,%d %dx%d on a %dx%d logical monitor "
-		        "converts to DEVICE %d,%d %dx%d on a %dx%d px monitor (#1596)",
-		        (double)best->mon_scale, best->logical_x, best->logical_y, best->logical_w, best->logical_h,
-		        best->mon_logical_w, best->mon_logical_h, win_px.x, win_px.y, win_px.w, win_px.h, mon_w_px,
-		        mon_h_px);
+		U_LOG_I(
+		    "wl_geom: monitor scale %.4f — window logical %d,%d %dx%d on a %dx%d logical monitor "
+		    "converts to DEVICE %d,%d %dx%d on a %dx%d px monitor (#1596)",
+		    (double)best->mon_scale, best->logical_x, best->logical_y, best->logical_w, best->logical_h,
+		    best->mon_logical_w, best->mon_logical_h, win_px.x, win_px.y, win_px.w, win_px.h, mon_w_px,
+		    mon_h_px);
 	}
 
 	out_rect->left_px = win_px.x;
