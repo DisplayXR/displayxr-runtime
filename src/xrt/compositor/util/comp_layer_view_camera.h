@@ -2,9 +2,23 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Per-view camera selection for non-projection composition layers.
+ * @brief  Per-view camera selection and the shared layer-composition policy.
  * @author David Fattal
  * @ingroup comp_util
+ *
+ * Two things live here, and both for the same reason: the answer must not
+ * depend on which backend is asking.
+ *
+ *  1. the per-view CAMERA every layer type is projected through (#1580), and
+ *  2. the composition POLICY a renderer applies once it has that camera —
+ *     eye visibility (@ref is_layer_view_visible_n), quad facing
+ *     (@ref comp_layer_quad_is_front_facing, #1590), the src/dst blend rule
+ *     (@ref comp_layer_blend_mode, #1599) and the painter's-order first-layer
+ *     gate (@ref comp_layer_tile_blend_mode, #1598/#1600).
+ *
+ * Every one of them is a PREDICATE the renderer consults, never a pipeline
+ * state it inherits — see comp_layer_quad_is_front_facing() for why facing in
+ * particular cannot be rasterizer culling here.
  *
  * #1580 — THE INVARIANT: one camera per view per frame, shared by every layer
  * type. That camera is the {pose, fov} pair `xrLocateViews` handed the app,
@@ -41,6 +55,7 @@
 #include "xrt/xrt_display_metrics.h"
 
 #include <stdbool.h>
+#include <stddef.h> // NULL
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -309,6 +324,157 @@ is_layer_view_visible_n(const struct xrt_layer_data *data, uint32_t view_index, 
 	case XRT_LAYER_EYE_VISIBILITY_NONE:
 	default: return false;
 	}
+}
+
+/*!
+ * How a layer's texture alpha composites onto what is already in the tile.
+ *
+ * @ingroup comp_util
+ */
+enum comp_layer_blend_mode
+{
+	/*!
+	 * The texture's alpha is IGNORED (treated as 1) and the layer covers
+	 * what is under it: blending off, the source written verbatim.
+	 *
+	 * Verbatim, not "alpha forced to 1": the destination alpha the runtime
+	 * hands the display processor is load-bearing (#225 — the DP lerps the
+	 * desktop under the atlas alpha), and a transparent-background app's
+	 * single projection layer reaches the atlas through exactly this mode.
+	 * For the COLOUR channels the result is identical either way.
+	 */
+	COMP_LAYER_BLEND_REPLACE = 0,
+	//! `out.rgb = src.rgb + dst.rgb * (1 - src.a)` — source already scaled.
+	COMP_LAYER_BLEND_PREMULTIPLIED = 1,
+	//! `out.rgb = src.rgb * src.a + dst.rgb * (1 - src.a)` — straight alpha.
+	COMP_LAYER_BLEND_STRAIGHT = 2,
+};
+
+/*!
+ * The OpenXR §10.6.2 three-way blend rule, from a layer's composition flags.
+ *
+ * Two flags, three outcomes, and BOTH flags matter:
+ *
+ *  - no `XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT`
+ *      → @ref COMP_LAYER_BLEND_REPLACE. The spec initialises the layer alpha
+ *        to one, i.e. the layer is an opaque cover. This is NOT "blend it
+ *        premultiplied", which is what the D3D11 in-process renderer used to
+ *        do (#1599): an inverted two-way test that blended opaque layers and
+ *        ignored the unpremultiplied bit entirely.
+ *  - `SOURCE_ALPHA_BIT` alone → @ref COMP_LAYER_BLEND_PREMULTIPLIED.
+ *  - `SOURCE_ALPHA_BIT` + `XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT`
+ *      → @ref COMP_LAYER_BLEND_STRAIGHT.
+ *
+ * @param layer_flags @ref xrt_layer_data::flags.
+ *
+ * @ingroup comp_util
+ */
+enum comp_layer_blend_mode
+comp_layer_blend_mode(uint32_t layer_flags);
+
+/*!
+ * Is a quad layer's front face turned toward the camera (#1590)?
+ *
+ * The spec is normative: *"Only front face of the quad surface is visible; the
+ * back face is not visible and must not be drawn by the runtime"*, and a quad
+ * with an identity rotation has *"its front face normal vector coinciding with
+ * the +z axis"*. So the normal is `orientation * (0, 0, 1)` — **+Z**, not -Z —
+ * and the quad is visible exactly when
+ *
+ *     dot(normal, camera_pos - quad_pos) > 0
+ *
+ * Edge-on (dot == 0) counts as NOT visible: a zero-area sliver whose facing is
+ * undefined.
+ *
+ * A PREDICATE, deliberately, not rasterizer culling. Every pipeline in the tree
+ * is created `CULL_NONE` (D3D11 in-process and service, D3D12, vk_native, and
+ * GL explicitly `glDisable(GL_CULL_FACE)`), so switching to culling would mean
+ * a per-backend winding audit for no benefit. In-tree precedent for the dot
+ * product: the inherited compute path in shaders/layer.comp rejects a quad
+ * backface the same way.
+ *
+ * @param quad_pose  The quad's pose, in the compositor's head-relative layer
+ *                   space (@ref xrt_layer_quad_data::pose).
+ * @param camera_pos The view's camera position in that SAME space — i.e.
+ *                   @ref comp_layer_view_camera::pose.position for this view,
+ *                   never a display-space eye.
+ *
+ * @return true when the quad must be drawn. NULL arguments return true: a
+ *         missing input is a caller bug, and dropping content is the worse
+ *         failure.
+ *
+ * @ingroup comp_util
+ */
+bool
+comp_layer_quad_is_front_facing(const struct xrt_pose *quad_pose, const struct xrt_vec3 *camera_pos);
+
+/*!
+ * Painter's-order state for ONE tile (one view) of one frame (#1598).
+ *
+ * Zero-initialise per view per frame; a backend keeps one of these per tile it
+ * paints and hands it to @ref comp_layer_tile_blend_mode for every layer it is
+ * about to composite.
+ *
+ * @ingroup comp_util
+ */
+struct comp_layer_tile_state
+{
+	//! Has anything been composited into this tile this frame yet?
+	bool composited;
+};
+
+/*!
+ * Has nothing been composited into this tile yet?
+ *
+ * @ingroup comp_util
+ */
+static inline bool
+comp_layer_is_first_in_tile(const struct comp_layer_tile_state *tile)
+{
+	return tile == NULL || !tile->composited;
+}
+
+/*!
+ * Record that a layer was composited into this tile.
+ *
+ * @ingroup comp_util
+ */
+static inline void
+comp_layer_tile_mark_composited(struct comp_layer_tile_state *tile)
+{
+	if (tile != NULL) {
+		tile->composited = true;
+	}
+}
+
+/*!
+ * The blend mode for the next layer into a tile, and mark the tile painted.
+ *
+ * THE FIRST layer composited into a tile is a @ref COMP_LAYER_BLEND_REPLACE,
+ * whatever its flags say, and only later layers blend per
+ * @ref comp_layer_blend_mode. That gate is flag-INDEPENDENT on purpose:
+ * transparent-background apps set `SOURCE_ALPHA_BIT` on their SINGLE
+ * projection layer (every `cube_handle_*`, every `cube_zones_*`), and the
+ * shaped / compose-under contract requires that first blit to be a replace so
+ * the app's alpha reaches the atlas verbatim (#225). Blending it over the
+ * clear instead would drive `dst.a` to 1 everywhere and silently kill the
+ * display processor's alpha gate. As a side effect the single-layer frame
+ * every shipping app submits keeps exactly the state it has today.
+ *
+ * Nothing is under the first layer but the clear, so REPLACE is also what the
+ * spec's painter's algorithm reduces to there.
+ *
+ * @param tile        This view's tile state; NULL means "treat as first".
+ * @param layer_flags @ref xrt_layer_data::flags.
+ *
+ * @ingroup comp_util
+ */
+static inline enum comp_layer_blend_mode
+comp_layer_tile_blend_mode(struct comp_layer_tile_state *tile, uint32_t layer_flags)
+{
+	const bool first = comp_layer_is_first_in_tile(tile);
+	comp_layer_tile_mark_composited(tile);
+	return first ? COMP_LAYER_BLEND_REPLACE : comp_layer_blend_mode(layer_flags);
 }
 
 #ifdef __cplusplus

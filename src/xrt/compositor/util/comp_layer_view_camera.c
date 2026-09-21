@@ -2,11 +2,12 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Per-view camera selection for non-projection composition layers.
+ * @brief  Per-view camera selection and the shared layer-composition policy.
  * @author David Fattal
  * @ingroup comp_util
  *
- * See comp_layer_view_camera.h for the invariant this implements (#1580).
+ * See comp_layer_view_camera.h for the invariant this implements (#1580) and
+ * for the composition policy that sits on top of it (#1590/#1598/#1599).
  */
 
 #include "util/comp_layer_view_camera.h"
@@ -17,6 +18,7 @@
 
 #include "xrt/xrt_compiler.h" // ARRAY_SIZE
 
+#include "math/m_api.h"    // math_quat_rotate_vec3
 #include "dxr_view_math.h" // dxr_display3d_compute_fov — the shared Kooima core
 
 #include <stddef.h>
@@ -289,4 +291,52 @@ comp_layer_view_camera_select(const struct comp_layer_accum *accum,
                               struct comp_layer_view_camera *out)
 {
 	return comp_layer_view_camera_select_ex(accum, view_index, eye_pos, NULL, canvas_w_m, canvas_h_m, out);
+}
+
+
+/*
+ *
+ * Shared layer-composition policy.
+ *
+ */
+
+enum comp_layer_blend_mode
+comp_layer_blend_mode(uint32_t layer_flags)
+{
+	if ((layer_flags & XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT) == 0) {
+		// The spec initialises the layer alpha to one: an opaque cover.
+		return COMP_LAYER_BLEND_REPLACE;
+	}
+
+	if ((layer_flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0) {
+		return COMP_LAYER_BLEND_STRAIGHT;
+	}
+
+	return COMP_LAYER_BLEND_PREMULTIPLIED;
+}
+
+bool
+comp_layer_quad_is_front_facing(const struct xrt_pose *quad_pose, const struct xrt_vec3 *camera_pos)
+{
+	if (quad_pose == NULL || camera_pos == NULL) {
+		return true;
+	}
+
+	// The quad's front face normal is +Z in its own frame (see the header:
+	// the -Z the issue first proposed would have culled every visible quad
+	// and drawn every back-facing one).
+	const struct xrt_vec3 plus_z = {0.0f, 0.0f, 1.0f};
+	struct xrt_vec3 normal = {0.0f, 0.0f, 1.0f};
+	math_quat_rotate_vec3(&quad_pose->orientation, &plus_z, &normal);
+
+	const struct xrt_vec3 to_camera = {
+	    camera_pos->x - quad_pose->position.x,
+	    camera_pos->y - quad_pose->position.y,
+	    camera_pos->z - quad_pose->position.z,
+	};
+
+	const float facing = normal.x * to_camera.x + normal.y * to_camera.y + normal.z * to_camera.z;
+
+	// Strict: edge-on is a zero-area sliver with no defined facing.
+	return facing > 0.0f;
 }
