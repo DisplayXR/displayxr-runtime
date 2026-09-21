@@ -752,7 +752,7 @@ views; this type is how an application reaches the rest.
 | Advertised by `xrEnumerateViewConfigurations` | always (on a non-mono system) | **only when `XR_DXR_display_info` is enabled** on the instance |
 | `xrEnumerateViewConfigurationViews` count | exactly **2** | the device's **maximum view count across all rendering modes** |
 | `xrLocateViews` `viewCountOutput` | 2 | the same maximum |
-| `xrEndFrame` projection `viewCount` | **exactly 2** — the located count (ADR-041). An instance that enabled this extension may still submit 1 while a **1-view mode is in play** — the mode active now, or the one active when this frame's `xrBeginFrame` was called (#1528) — **deprecated**, see below | **exactly the located count** (the device maximum). ADR-041 removed the old "any rendering mode's `viewCount`" allowance |
+| `xrEndFrame` projection `viewCount` | **exactly 2** — the located count (ADR-041). An instance that enabled this extension may still submit 1 while a **1-view mode is in play** — the mode active now, or the one active when this frame's `xrBeginFrame` was called (#1528) — **deprecated**, see below | **exactly the located count** (the device maximum). ADR-041 removed the old "any rendering mode's `viewCount`" allowance. The same deprecated 1-view arm applies (#1612) |
 
 - **Fixed per instance.** The count this type reports is the device maximum across modes
   (e.g. 4 on a display with a quad mode; **2** on a stereo-only display). It does **not**
@@ -786,13 +786,17 @@ views; this type is how an application reaches the rest.
   **What this replaced.** Until v21, `PRIMARY_MULTIVIEW_DXR` accepted a layer whose
   `viewCount` matched *any* rendering mode's, so a session that located 4 views could
   submit 2 in a stereo mode. That contradicted both core sentences above and is now
-  `XR_ERROR_VALIDATION_FAILURE`. Nothing released depended on it.
+  `XR_ERROR_VALIDATION_FAILURE` — except the one 1-view case below, which released demos
+  depend on under this type too (#1612).
 
   **The one deprecated arm.** An instance that enabled this extension and began
-  `PRIMARY_STEREO` may still submit `viewCount == 1` **while the active rendering mode is
-  itself 1-view** — the 2D/mono submission path described under *Mono Submission in 2D
+  `PRIMARY_STEREO` **or `PRIMARY_MULTIVIEW_DXR`** may still submit `viewCount == 1` **while
+  the active rendering mode is itself 1-view** — the 2D/mono submission path described under *Mono Submission in 2D
   Mode* below. It is accepted, logs **once per session**, and names the fix. It exists only
-  because released demos submit one view in 2D mode. Both halves of its gate are required:
+  because released demos submit one view in 2D mode — on both types, since they moved to
+  `PRIMARY_MULTIVIEW_DXR` before v21 (#1612). It is exactly that case and nothing wider: a
+  `PRIMARY_MULTIVIEW_DXR` layer with 1 view in a 3D mode, or 2 of 4 views in any mode, is
+  refused. Both halves of its gate are required:
   a core-only app — which is every OpenXR CTS session — cannot enumerate a rendering mode,
   request one, or be told the active one changed, so a relaxation scoped to the active mode
   would make `PRIMARY_STEREO`'s meaning depend on state that app cannot observe. (Gating on
@@ -820,7 +824,7 @@ views; this type is how an application reaches the rest.
   | value | `PRIMARY_STEREO` | `PRIMARY_MULTIVIEW_DXR` |
   |---|---|---|
   | `0` strict | the located count (2) | the located count (device max) |
-  | `1` **default** | the located count, **or** 1 while a 1-view mode is in play (active **or** begun, #1528) → accepted, logged once | the located count |
+  | `1` **default** | the located count, **or** 1 while a 1-view mode is in play (active **or** begun, #1528) → accepted, logged once | the same: the located count, **or** 1 while a 1-view mode is in play → accepted, logged once (#1612) |
   | `2` kill switch | pre-v21 behaviour | pre-v21 behaviour (under-submit accepted) |
 
   Out-of-range values clamp to an end rather than falling back to the default, so a typo
@@ -830,13 +834,14 @@ views; this type is how an application reaches the rest.
   **Deprecation timeline — the trigger is a shipment, not a date.** The default flips from
   `1` to `0` in the **first runtime release after `displayxr-common` and the five
   `displayxr-demo-*` demos ship the alias submission**. Until every one of those has
-  shipped it, the default stays at `1`. When it flips, the 1-view arm is gone and
+  shipped it, the default stays at `1`. When it flips, the 1-view arm is gone for both
+  types and
   `DXR_UNDER_SUBMIT=2` is the only way back — itself temporary.
 
   **The recommended path for any mode-driven count is `PRIMARY_MULTIVIEW_DXR`**: begin with
   it, locate, render the active views, alias the rest, submit the located count. The
-  `PRIMARY_STEREO` allowance above is back-compatibility for apps already shipping on that
-  type, not a design to build on.
+  1-view allowance above is back-compatibility for apps already shipping a single view in
+  2D mode, not a design to build on.
 - **How to opt in.** Enable `XR_DXR_display_info` at `xrCreateInstance`, call
   `xrEnumerateViewConfigurations`, and if this type is present pass it as
   `XrSessionBeginInfo::primaryViewConfigurationType` (and as
@@ -1638,8 +1643,8 @@ and is now told so.
 **v21 (ADR-041) narrows this further, in the other direction.** `PRIMARY_MULTIVIEW_DXR` no
 longer accepts "any rendering mode's `viewCount`" — it accepts the located count and nothing
 else, because the old rule contradicted two core *musts* about projection-layer view counts.
-The 1-view `PRIMARY_STEREO` allowance above survives as a **deprecated, logged** compat arm on
-the same shipped-two-view path, and `DXR_UNDER_SUBMIT` stages its removal.
+The 1-view allowance above survives as a **deprecated, logged** compat arm on both types
+(#1612), and `DXR_UNDER_SUBMIT` stages its removal.
 
 Because the value is a vendor enum, a conformance or validation
 layer that exact-matches `XrViewConfigurationType` against the Khronos registry will not

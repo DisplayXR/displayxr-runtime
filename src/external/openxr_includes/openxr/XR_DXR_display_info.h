@@ -648,8 +648,8 @@ typedef struct XrEventDataDisplayModeRequestDeniedDXR {
  * second call.
  *
  * DEPRECATED, still accepted: an app that enabled this extension and began
- * PRIMARY_STEREO may submit a 1-view projection layer while the active mode is
- * itself 1-view. That is the pre-v21 2D submission path; it logs a one-shot
+ * PRIMARY_STEREO or PRIMARY_MULTIVIEW_DXR may submit a 1-view projection layer
+ * while the active mode is itself 1-view. That is the pre-v21 2D submission path; it logs a one-shot
  * warning and is removed once the SDK + the shipped demos alias instead. The
  * DXR_UNDER_SUBMIT runtime switch selects the behaviour (see
  * docs/specs/extensions/XR_DXR_display_info.md).

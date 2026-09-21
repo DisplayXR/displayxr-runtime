@@ -67,9 +67,20 @@ Three parts:
    holds verbatim, with no DisplayXR carve-out.
 
 3. **`DXR_UNDER_SUBMIT`**, a three-state staging switch, because one arm of the old rule is
-   load-bearing for *released* software: `0` strict; `1` (default) strict plus the deprecated
-   `PRIMARY_STEREO` 1-view arm, which logs once per session and names the fix; `2` the
-   pre-ADR-041 behaviour, as a kill switch.
+   load-bearing for *released* software: `0` strict, for both view configuration types; `1`
+   (default) strict plus one deprecated 1-view arm, which logs once per session and names the
+   fix; `2` the pre-ADR-041 behaviour, as a kill switch.
+
+   The deprecated arm is the **same for `PRIMARY_STEREO` and `PRIMARY_MULTIVIEW_DXR`**, and it
+   is exactly one case: a layer with `viewCount == 1`, from an instance that enabled
+   `XR_DXR_display_info`, while a 1-view rendering mode is in play (the active mode, or the one
+   latched at this frame's `xrBeginFrame`, #1528). Every other under-submission — a
+   `PRIMARY_MULTIVIEW_DXR` session submitting 2 of 4 in a stereo mode, or 1 view in a 3D mode —
+   is refused at the default. (The first cut of this ADR scoped the arm to `PRIMARY_STEREO`
+   alone, on the belief that nothing released under-submitted on `PRIMARY_MULTIVIEW_DXR`. That
+   was wrong: demos that submit a single view in 2D mode had already moved to
+   `PRIMARY_MULTIVIEW_DXR`, so the default rejected every 2D frame and left the last 3D weave
+   frozen on the panel — #1612.)
 
 ### What this is NOT
 
@@ -98,9 +109,11 @@ and inspects only the first `mode->view_count` rects. A submission that does not
 reachable now; the other four backends had the check (as an equality, relaxed here to `>=`).
 
 **Compat is a window, not a promise.** The deprecated 1-view arm exists because released demos
-submit one view in 2D mode. The default flips to strict in the first runtime release after
-`displayxr-common` and the five demos ship the alias submission — the trigger is that shipment,
-not a date.
+submit one view in 2D mode, under either view configuration type (#1612). The window is
+removed — the default flips to strict, for both types — in the first runtime release after
+`displayxr-common` and every demo ship the alias submission (every located view submitted,
+inactive ones aliased, e.g. with `DxrAliasInactiveViews()`) — the trigger is that shipment, not
+a date.
 
 **CTS is unaffected at every knob value.** A conformance session never enables
 `XR_DXR_display_info`, and the deprecated arm requires it, so the switch cannot open a hole under

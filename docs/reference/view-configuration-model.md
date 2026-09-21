@@ -78,7 +78,7 @@ must handle it needs an explicit `case`.
 | `xrEnumerateViewConfigurationViews` count | 1 | **2** | device **max across modes** (4 on sim-display, 2 on Leia) |
 | `xrLocateViews` `*viewCountOutput` | 1 | **2** | same max |
 | `xrLocateViews` capacity required | 1 | 2 | max (size to `XRT_MAX_VIEWS` = 8) |
-| `xrEndFrame` projection `viewCount` accepted | 1 | **exactly 2** — the located count. An `XR_DXR_display_info` app may still submit 1 while a **1-view mode is in play** — the mode active now **or** the one latched at this frame's `xrBeginFrame` (#1528): **deprecated** (ADR-041), accepted, logged once per session | **exactly the located count** (the device max). ADR-041 removed the old "any rendering mode's `viewCount`" |
+| `xrEndFrame` projection `viewCount` accepted | 1 | **exactly 2** — the located count. An `XR_DXR_display_info` app may still submit 1 while a **1-view mode is in play** — the mode active now **or** the one latched at this frame's `xrBeginFrame` (#1528): **deprecated** (ADR-041), accepted, logged once per session | **exactly the located count** (the device max). ADR-041 removed the old "any rendering mode's `viewCount`". The same deprecated 1-view arm as `PRIMARY_STEREO` applies at the default (#1612): 1 view while a 1-view mode is in play, accepted, logged once per session — nothing wider |
 | Fixed for the instance lifetime? | yes | yes | yes |
 
 > **A core-only app gets exact-2, full stop.** If the instance did not enable
@@ -128,8 +128,8 @@ must handle it needs an explicit `case`.
 >
 > **`PRIMARY_MULTIVIEW_DXR` is the recommended path for any mode-driven count**,
 > including the 1-view case: begin with it and submit the active mode's count
-> without a special case. The relaxation above is back-compatibility for apps
-> already shipping on `PRIMARY_STEREO`. (The permissive rule never consulted the
+> without a special case. The 1-view relaxation above is back-compatibility for
+> apps already shipping a single view in 2D mode, on either type (#1612). (The permissive rule never consulted the
 > active mode at all, precisely because of this race — #1528 gives the tight rule
 > the narrow, one-frame version of the same concession, and ADR-041 keeps it.)
 >
@@ -167,13 +167,17 @@ goes through the same gate and carries the located count too, aliased per zone.
 | value | `PRIMARY_STEREO` | `PRIMARY_MULTIVIEW_DXR` |
 |---|---|---|
 | `0` strict | the located count (2) | the located count |
-| `1` **default** | the located count, **or** 1 while the active mode is 1-view → accepted + one-shot `U_LOG_W` naming the fix | the located count |
+| `1` **default** | the located count, **or** 1 while a 1-view mode is in play (active or begun, #1528) → accepted + one-shot `U_LOG_W` naming the fix | **the same**: the located count, **or** 1 while a 1-view mode is in play → accepted + the same one-shot `U_LOG_W` (#1612). Any other under-submit (1 in a 3D mode, 2 of 4) is refused |
 | `2` kill switch | pre-ADR-041 rule | pre-ADR-041 rule (under-submit accepted) |
 
-Out-of-range values clamp to an end, never to the default. The default flips to
-`0` in the first runtime release after `displayxr-common` and the five
-`displayxr-demo-*` demos ship the alias submission — the trigger is that
-shipment, not a date.
+Out-of-range values clamp to an end, never to the default. The 1-view arm is
+identical for both types because demos that submit a single view in 2D mode ship
+on **both** — they moved to `PRIMARY_MULTIVIEW_DXR` before ADR-041 landed, and a
+`PRIMARY_STEREO`-only arm rejected every one of their 2D frames, leaving the last
+3D weave frozen on the panel (#1612). The compatibility window is removed — the
+default flips to `0` for both types — in the first runtime release after
+`displayxr-common` and every `displayxr-demo-*` demo alias their inactive views
+(`DxrAliasInactiveViews()`) — the trigger is that shipment, not a date.
 
 CI stays on the default: a CTS session never enables `XR_DXR_display_info`, and
 the deprecated arm requires it, so conformance is on the strict path at every knob
