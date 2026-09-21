@@ -10433,6 +10433,47 @@ vk_on_reachable_lattice(int32_t anchor, int32_t v, uint32_t q)
 }
 #endif // XRT_OS_LINUX_DESKTOP
 
+#ifdef XRT_OS_LINUX_DESKTOP
+/*
+ * Reachable-lattice search statistics (#1609 follow-up). Counts how many display-
+ * processor snap calls each quantised drag step needed, so the cost of doing the
+ * search outside the vendor SDK is measured rather than assumed. calls = 1 means
+ * the DP's own first answer was reachable; 1 + k means the k-th ring candidate
+ * was accepted; fallbacks are steps where no candidate within the rings worked.
+ * Summarised at INFO every VK_SNAP_STATS_EVERY steps — never per frame.
+ */
+#define VK_SNAP_STATS_EVERY 64u
+static struct
+{
+	uint64_t steps, calls_sum, fallbacks;
+	uint32_t calls_max;
+	uint32_t hist[5]; // calls: 1, 2-5, 6-13, 14-29, 30+
+} g_snap_stats;
+
+static void
+vk_snap_stats_record(uint32_t calls, bool fallback)
+{
+	g_snap_stats.steps++;
+	g_snap_stats.calls_sum += calls;
+	if (calls > g_snap_stats.calls_max) {
+		g_snap_stats.calls_max = calls;
+	}
+	if (fallback) {
+		g_snap_stats.fallbacks++;
+	}
+	const uint32_t b = calls <= 1 ? 0 : calls <= 5 ? 1 : calls <= 13 ? 2 : calls <= 29 ? 3 : 4;
+	g_snap_stats.hist[b]++;
+	if (g_snap_stats.steps % VK_SNAP_STATS_EVERY == 0) {
+		U_LOG_I("drag snap stats: %llu steps, mean %.2f DP calls/step, max %u, fallbacks %llu; "
+		        "calls histogram [1]=%u [2-5]=%u [6-13]=%u [14-29]=%u [30+]=%u",
+		        (unsigned long long)g_snap_stats.steps,
+		        (double)g_snap_stats.calls_sum / (double)g_snap_stats.steps, g_snap_stats.calls_max,
+		        (unsigned long long)g_snap_stats.fallbacks, g_snap_stats.hist[0], g_snap_stats.hist[1],
+		        g_snap_stats.hist[2], g_snap_stats.hist[3], g_snap_stats.hist[4]);
+	}
+}
+#endif
+
 bool
 comp_vk_native_compositor_snap_window_rect(struct xrt_compositor *xc,
                                            int32_t origin_x,
@@ -10534,6 +10575,7 @@ comp_vk_native_compositor_snap_window_rect(struct xrt_compositor *xc,
 			if (vk_on_reachable_lattice(origin_x, sx, q) && vk_on_reachable_lattice(origin_y, sy, q)) {
 				*out_x = sx;
 				*out_y = sy;
+				vk_snap_stats_record(1u, false);
 				return true;
 			}
 			const int32_t bx = u_x11_reachable_round(origin_x, sx, q);
@@ -10556,6 +10598,7 @@ comp_vk_native_compositor_snap_window_rect(struct xrt_compositor *xc,
 				    vk_on_reachable_lattice(origin_y, ry, q)) {
 					*out_x = rx;
 					*out_y = ry;
+					vk_snap_stats_record(2u + k, false);
 					return true;
 				}
 			}
@@ -10570,6 +10613,7 @@ comp_vk_native_compositor_snap_window_rect(struct xrt_compositor *xc,
 				    "stutter on this drag. Every output at 100%% avoids this.",
 				    3u * q, q);
 			}
+			vk_snap_stats_record(1u + n, true);
 			*out_x = bx;
 			*out_y = by;
 			return true;
