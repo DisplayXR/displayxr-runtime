@@ -490,6 +490,15 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
       RTV / an sRGB color attachment, *or*
     - write display-referred (already gamma-encoded) bytes directly with GPU sRGB-write off.
     Don't do both (double-encode → washed out).
+  - **Vulkan: "GPU sRGB-write off" means a raw copy, not a blit or a clear.** Since v2.18.0
+    (#1559) the `VkImage` you get back is really `*_SRGB`, as `XR_KHR_vulkan_enable` requires
+    (earlier runtimes handed back an UNORM image, which hid the mistakes below). On an `*_SRGB`
+    image, `vkCmdBlitImage` encodes on write (and decodes an `*_SRGB` source on read), and clear
+    values (`vkCmdClearColorImage`, render-pass `loadOp` clears) are linear and get encoded. So:
+    - to move display-referred bytes from an UNORM intermediate into the swapchain, blit into a
+      scratch image of the swapchain's UNORM sibling, then `vkCmdCopyImage` into the swapchain
+      (a copy never converts). This is byte-exact on any runtime;
+    - clear with the linearized colour (sRGB EOTF), not the display-referred one.
   - **A linear / UNORM swapchain (`R8G8B8A8_UNORM`, `GL_RGBA8`, …) is NOT color-managed** on the
     in-process path: the compositor passes the bytes straight through with no linear→sRGB encode.
     It's only correct if you write display-referred bytes into it; writing genuinely-linear values
