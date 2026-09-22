@@ -20609,6 +20609,138 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		}
 	}
 
+	/*
+	 * #1662 — THE THIRD READINESS PRODUCER: A UI-ONLY FRAME.
+	 *
+	 * `service_update_slot_content_dims()` is what flips the slot's
+	 * `has_first_frame_committed`, and it used to be reached from exactly two
+	 * producers: the projection loop and the zones composite above. A client
+	 * whose frames carry ONLY quad / cylinder / equirect2 layers — CTS
+	 * QuadOcclusion, a pure-UI panel app — therefore never became ready, so
+	 * `pipeline_slot_presenting()` never picked it, no lease was ever granted
+	 * and the panel stayed black for the whole session while this client's
+	 * atlas was being written on every single commit (`session=av-`,
+	 * `lease=none`, `pipe_active_present=0`).
+	 *
+	 * The rule: a UI-only frame IS submitted content. The quads are in the
+	 * atlas by the time the UI pass ends, exactly as the projection blit and
+	 * the zones composite leave theirs there, so the UI pass is the third
+	 * readiness producer next to projection and zones and records its content
+	 * dims like they do. This is the SAME omission the zones composite above
+	 * was fixed for (#549 — see its comment: "A pure zones frame (no projection
+	 * layer) also drives the content dims + slot readiness bookkeeping from
+	 * here ... without this the workspace slot never flips
+	 * has_first_frame_committed (spinner forever)"); a pure sub-rect frame is
+	 * the third shape of the same thing.
+	 *
+	 * What `content_view_w/_h` MEAN for a pure sub-rect frame: the slot field
+	 * they are stamped onto is "Actual rendered content dimensions per view
+	 * (from last layer_commit)" — the layout of the REAL painted pixels, which
+	 * is why #1140 stopped publishing the `sys->view_*` placeholder on a
+	 * commit that painted nothing. For quads / cylinders / equirect2 that is
+	 * the UI pass's VIEWPORT — the whole tile — and NOT any individual layer's
+	 * extent: sub-rect layers land wherever their pose puts them inside that
+	 * viewport, so no smaller rect describes the frame. The readiness flag is
+	 * what actually matters at this site; the dims only have to stay inside
+	 * the atlas slot so the stride invariant holds (clamped below).
+	 *
+	 * Guarded by `!content_dims_painted` rather than the zones site's
+	 * `!projection_rendered`: it is the strictly stronger form of the same
+	 * guard here (both earlier producers set it, and this pass is last), so a
+	 * projection layer's or a zones composite's recorded dims can never be
+	 * clobbered by this block.
+	 *
+	 * Recorded HERE, before the pass, rather than after it — the smallest
+	 * correct change:
+	 *   - the dims are a pure function of `sys->` state (the pass's own
+	 *     viewport computation below reads nothing else), so they are already
+	 *     known at this point;
+	 *   - it keeps the single `content_dims_painted` branch below — recipe
+	 *     hold, `painted_content_*`, the witness counter — as the ONE place
+	 *     that bookkeeps a painting commit, instead of duplicating it after
+	 *     the pass;
+	 *   - and it cannot publish readiness early, because
+	 *     `pipeline_slot_presenting()` is a CONJUNCTION with
+	 *     `c->pipe_frame_ready`, which is set only at the very end of this
+	 *     commit (see the pipeline publish below). The first frame this slot
+	 *     can be picked on is therefore one whose UI draws are already queued
+	 *     on the immediate context.
+	 *
+	 * Gated on the pass's OWN entry condition so "dims recorded" and "pass ran"
+	 * can never disagree. (`has_ui_layers` also covers EQUIRECT1 / CUBE, which
+	 * the pass does not draw; such a frame marks the slot ready on a viewport
+	 * that painted nothing, which is still the right answer — the client is
+	 * committing frames and the atlas keeps whatever the last painting commit
+	 * left in it.)
+	 */
+	if (has_ui_layers && sys->quad_vs && !content_dims_painted) {
+		// The view count the pass paints — same expression it uses for
+		// `ui_view_count` below. Zero (a 3D mode with no tiles yet) means the
+		// pass will draw nothing, so there is no content to declare.
+		uint32_t ui_views = sys->hardware_display_3d ? (sys->tile_columns * sys->tile_rows) : 1;
+		if (ui_views > XRT_MAX_VIEWS) {
+			ui_views = XRT_MAX_VIEWS;
+		}
+		if (ui_views > 0) {
+			// The dims the pass's viewport actually covers, mirroring its
+			// mono/stereo split below: the window capped to the display in
+			// mono, one canonical tile per view in stereo.
+			uint32_t ui_content_w;
+			uint32_t ui_content_h;
+			if (!sys->hardware_display_3d) {
+				ui_content_w =
+				    (sys->output_width < sys->display_width) ? sys->output_width : sys->display_width;
+				ui_content_h = (sys->output_height < sys->display_height) ? sys->output_height
+				                                                          : sys->display_height;
+			} else {
+				ui_content_w = sys->view_width;
+				ui_content_h = sys->view_height;
+			}
+
+			// Same atlas-slot clamp the projection site applies (see the
+			// `feedback_atlas_stride_invariant` note there): content can be
+			// smaller than the slot but never larger, and the clamp must use
+			// the SAME atlas-derived slot width the readers do. Zero-guarded
+			// on the grid like service_update_slot_content_dims itself, since
+			// this path also runs on frames the projection loop never sees.
+			if (c->render.atlas_texture) {
+				D3D11_TEXTURE2D_DESC ui_atlas_desc = {};
+				c->render.atlas_texture->GetDesc(&ui_atlas_desc);
+				uint32_t ui_tc = sys->tile_columns > 0 ? sys->tile_columns : 1;
+				uint32_t ui_tr = sys->tile_rows > 0 ? sys->tile_rows : 1;
+				uint32_t ui_slot_w = ui_atlas_desc.Width / ui_tc;
+				uint32_t ui_slot_h = ui_atlas_desc.Height / ui_tr;
+				if (ui_content_w > ui_slot_w)
+					ui_content_w = ui_slot_w;
+				if (ui_content_h > ui_slot_h)
+					ui_content_h = ui_slot_h;
+			}
+
+			content_view_w = ui_content_w;
+			content_view_h = ui_content_h;
+			// #575 / ADR-030: the recipe follows what was PACKED. A UI-only
+			// frame on 2D hardware packs exactly one mono viewport, so the
+			// grid must collapse to 1×1 (`eff_view_count == 1` below) instead
+			// of inheriting a possibly-still-3D sys->tile_columns — the same
+			// mono left-shift the projection path guards against. In 3D this
+			// is the tile count the pass looped over, so the grid is unchanged.
+			eff_view_count = ui_views;
+			content_dims_painted = true;
+			service_update_slot_content_dims(sys, c, content_view_w, content_view_h);
+
+			// One-shot: this is the log discriminator that says the #1662 path
+			// fired at all (never per-frame — the pass runs every commit).
+			static bool ui_only_ready_warned = false;
+			if (!ui_only_ready_warned) {
+				ui_only_ready_warned = true;
+				U_LOG_W(
+				    "#1662: UI-only frame marked the slot ready (content=%ux%u views=%u) — "
+				    "a frame with no projection and no zone is still submitted content",
+				    content_view_w, content_view_h, eff_view_count);
+			}
+		}
+	}
+
 	// #1215 -- reverse handshake. Every read this commit will ever make of the
 	// client's swapchain images has now been QUEUED on sys->context (projection
 	// blits and zones composite above; both submit from this thread, and the
