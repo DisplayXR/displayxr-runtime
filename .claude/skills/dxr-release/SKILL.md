@@ -825,28 +825,41 @@ release on purpose".
 ```bash
 # Resolve the bump by its RESULT, not by "newest run": several components release
 # concurrently (2026-09-18: shell, modelviewer, avatar, earthview, mediaplayer bumped within
-# minutes) and `.[0]` then returns another component's run. The pin on runtime/main is the
-# authoritative signal; the run id is looked up afterwards by matching its display title.
+# minutes; 2026-09-22: gauss + earthview three minutes apart) and `.[0]` then returns
+# another component's run. The pin on runtime/main is the authoritative signal; the run
+# id is looked up afterwards.
 for i in $(seq 1 40); do
   PINNED=$(gh api repos/DisplayXR/displayxr-runtime/contents/versions.json --jq .content | base64 -d | jq -r ".${FIELD}")
   [ "$PINNED" = "$NEW_TAG" ] && break
   sleep 15
 done
-BUMP_RUN=$(gh run list -R DisplayXR/displayxr-runtime \
-            --workflow=versions-bump.yml --event=repository_dispatch --limit=15 \
-            --json databaseId,displayTitle,createdAt \
-            --jq "[.[] | select(.displayTitle | test(\"${FIELD}|${NEW_TAG}\"))] | sort_by(.createdAt) | last | .databaseId // empty")
-[ -n "$BUMP_RUN" ] || BUMP_RUN=$(gh run list -R DisplayXR/displayxr-runtime \
-            --workflow=versions-bump.yml --event=repository_dispatch --limit=3 \
-            --json databaseId --jq '.[0].databaseId // empty')   # fallback; say "run id ambiguous" in the report
-while :; do
+# Run-id lookup: grep each recent dispatch run's LOG, not its title. Every versions-bump
+# run has the bare displayTitle "versions-bump" (repository_dispatch carries no
+# per-field title), so a title regex matches nothing and silently falls to "newest run"
+# — both release agents hit exactly that on 2026-09-22. The workflow's "Resolve inputs"
+# step echoes `FIELD="<field>"` and `TAG="<tag>"`; the same step also echoes `FIELD=""`
+# for the other dispatch shapes, so match BOTH exact quoted values, never a bare substring.
+BUMP_RUN=""
+for _id in $(gh run list -R DisplayXR/displayxr-runtime --workflow=versions-bump.yml \
+               --event=repository_dispatch --limit=12 --json databaseId --jq '.[].databaseId'); do
+  _log=$(gh run view "$_id" -R DisplayXR/displayxr-runtime --log 2>/dev/null)
+  if grep -q -F "FIELD=\"${FIELD}\"" <<<"$_log" && grep -q -F "TAG=\"${NEW_TAG}\"" <<<"$_log"; then
+    BUMP_RUN="$_id"; break
+  fi
+done
+# A run still in progress has no log yet: if nothing matched, wait and retry once, then
+# fall back to the bump COMMIT on runtime/main (`chore(versions): bump <field> → <tag>`)
+# as the evidence and say "run id unresolved" in the report — never `.[0]`.
+[ -n "$BUMP_RUN" ] || { sleep 30; for _id in $(gh run list -R DisplayXR/displayxr-runtime --workflow=versions-bump.yml --event=repository_dispatch --limit=12 --json databaseId --jq '.[].databaseId'); do _log=$(gh run view "$_id" -R DisplayXR/displayxr-runtime --log 2>/dev/null); if grep -q -F "FIELD=\"${FIELD}\"" <<<"$_log" && grep -q -F "TAG=\"${NEW_TAG}\"" <<<"$_log"; then BUMP_RUN="$_id"; break; fi; done; }
+[ -n "$BUMP_RUN" ] || echo "bump run id unresolved for ${FIELD}=${NEW_TAG} — cite the bump commit on runtime/main instead"
+BUMP_CONC="unresolved"
+[ -n "$BUMP_RUN" ] && while :; do
   S=$(gh run view "$BUMP_RUN" -R DisplayXR/displayxr-runtime --json status,conclusion \
         --jq '.status + "/" + (.conclusion // "?")')
   echo "  bump: $S"
-  [[ "$S" == completed* ]] && break
+  [[ "$S" == completed* ]] && { BUMP_CONC="${S#completed/}"; break; }
   sleep 15
 done
-BUMP_CONC="${S#completed/}"
 ```
 
 `success` for `leia-plugin` is ambiguous (ABI gate may have passed-and-bumped
