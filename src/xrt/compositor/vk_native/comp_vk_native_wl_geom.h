@@ -79,6 +79,11 @@ struct comp_vk_native_wl_window_rect
 	uint32_t monitor_width_px, monitor_height_px;
 	//! The factor applied. 1.0 means the wire values were already device px.
 	float scale;
+	//! The committed SURFACE's size in DEVICE px (the compositor's buffer rect
+	//! for the window), or 0 when the publisher does not report it. Differs
+	//! from width_px/height_px when the client's buffer is not mapped to its
+	//! configured size — the surface is then painted at this size, not that one.
+	uint32_t surface_width_px, surface_height_px;
 };
 
 /*!
