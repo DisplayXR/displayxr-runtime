@@ -41,19 +41,25 @@ enum xb_source_format_verdict
 	 */
 	XB_SRC_FMT_TYPELESS_TO_CONCRETE,
 	/*!
-	 * Refused: two CONCRETE formats in one typeless family — `UNORM` against
-	 * `UNORM_SRGB`. The copy is perfectly legal and moves the right bits; what
-	 * changes is what those bits MEAN to the next sampler, which is the
-	 * #1589 / #1610 colour trap. Accepting the family wholesale would trade a
-	 * loud refusal for a silent colour error, so this stays refused.
+	 * Refused: ONE typeless family, but not the one safe pair — the source is
+	 * neither the chain's own format nor the family's TYPELESS member. The copy
+	 * is perfectly legal and moves the right bits; what changes is what those
+	 * bits MEAN to the next sampler.
 	 *
-	 * Also the verdict for the mirror case — a concrete source into a TYPELESS
-	 * chain — which defers the encoding question to whatever later views that
-	 * chain rather than answering it. The bridge's chains are concrete in
-	 * practice (see `XB_FORMAT_DEFAULT`), so this is the conservative posture
-	 * on a case that does not arise, not a considered allowance.
+	 * The motivating case, and the one worth remembering, is `UNORM` against
+	 * `UNORM_SRGB`: the #1589 / #1610 colour trap. Accepting the family
+	 * wholesale would trade a loud refusal for a silent colour error.
+	 *
+	 * But the verdict covers the whole remainder of the family, not just that
+	 * pair — including the mirror direction, a CONCRETE source into a TYPELESS
+	 * chain, which defers the encoding question to whatever later views that
+	 * chain rather than answering it. (The bridge's chains are concrete in
+	 * practice, see `XB_FORMAT_DEFAULT`, so that one is the conservative
+	 * posture on a case that does not arise, not a considered allowance.) Hence
+	 * the name: SAME_FAMILY_UNSAFE, not SRGB — a reader debugging the mirror
+	 * case must not be told "sRGB sibling" about a pair with no sRGB in it.
 	 */
-	XB_SRC_FMT_REFUSED_SRGB_SIBLING,
+	XB_SRC_FMT_REFUSED_SAME_FAMILY_UNSAFE,
 	/*!
 	 * Refused: different typeless families — `B8G8R8A8_*` against
 	 * `R8G8B8A8_*`. `CopySubresourceRegion` / `CopyTextureRegion` do not fail
@@ -109,9 +115,9 @@ xb_typeless_family(DXGI_FORMAT f)
  *
  * TWO formats are accepted and no more: the chain's own, and the TYPELESS member
  * of the chain's family. Everything else is refused, INCLUDING the rest of that
- * family — see @ref XB_SRC_FMT_REFUSED_SRGB_SIBLING, the case that is copy-legal
- * and colour-wrong and is therefore the reason this predicate is a tested unit
- * rather than a comment.
+ * family — see @ref XB_SRC_FMT_REFUSED_SAME_FAMILY_UNSAFE, the copy-legal and
+ * colour-wrong case that is the reason this predicate is a tested unit rather
+ * than a comment.
  *
  * @return the verdict; @ref xb_source_format_accepted turns it into a bool.
  */
@@ -136,7 +142,7 @@ xb_source_format_compatible(DXGI_FORMAT chain_fmt, DXGI_FORMAT src_fmt)
 	if (src_fmt == chain_family) {
 		return XB_SRC_FMT_TYPELESS_TO_CONCRETE;
 	}
-	return XB_SRC_FMT_REFUSED_SRGB_SIBLING;
+	return XB_SRC_FMT_REFUSED_SAME_FAMILY_UNSAFE;
 }
 
 //! True for the two accepted verdicts. @see xb_source_format_compatible

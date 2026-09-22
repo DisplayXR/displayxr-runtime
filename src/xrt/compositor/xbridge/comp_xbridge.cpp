@@ -1033,12 +1033,11 @@ xb_check_source_format(struct comp_xbridge *xb, DXGI_FORMAT chain_fmt, DXGI_FORM
 	const char *why =
 	    "A D3D copy across DXGI typeless families is SILENTLY DROPPED, not failed, so the "
 	    "frame is REFUSED rather than transported as nothing.";
-	if (verdict == XB_SRC_FMT_REFUSED_SRGB_SIBLING) {
+	if (verdict == XB_SRC_FMT_REFUSED_SAME_FAMILY_UNSAFE) {
 		why =
-		    "Both are CONCRETE formats in ONE typeless family: the copy is legal and moves the right "
-		    "bits, but it REINTERPRETS what they mean to the next sampler (UNORM vs UNORM_SRGB is the "
-		    "#1589/#1610 colour trap), so the frame is REFUSED rather than transported as the wrong "
-		    "colour.";
+		    "Same typeless family, but not the typeless member: the copy is legal and moves the right "
+		    "bits, but it REINTERPRETS the bytes' encoding (e.g. UNORM vs UNORM_SRGB, the #1589/#1610 "
+		    "colour trap), so the frame is REFUSED rather than transported as the wrong colour.";
 	} else if (verdict == XB_SRC_FMT_REFUSED_UNKNOWN) {
 		why =
 		    "At least one side is a format this unit cannot place in a typeless family, so it cannot "

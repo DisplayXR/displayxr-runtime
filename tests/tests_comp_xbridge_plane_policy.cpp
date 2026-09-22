@@ -343,7 +343,7 @@ TEST_CASE("a freshly authored plane transports on its own frame and lands on the
  * The guard around it is a throttled U_LOG_E on a live bridge, so on hardware
  * the only two outcomes anyone ever sees are "it works" and "the panel is black
  * and the bridge degraded". Both refusals below are invisible in a screenshot,
- * and the sRGB-sibling one is worse than invisible: the copy is LEGAL, so a
+ * and the same-family one is worse than invisible: the copy is LEGAL, so a
  * reader meeting the guard later has every reason to think it is over-strict and
  * relax it back to a plain same-family test. That is why it is a test.
  */
@@ -388,9 +388,9 @@ TEST_CASE("xb_source_format_compatible accepts exactly two sources")
 	SECTION("two CONCRETE formats in one family are refused, both directions")
 	{
 		CHECK(xb_source_format_compatible(DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) ==
-		      XB_SRC_FMT_REFUSED_SRGB_SIBLING);
+		      XB_SRC_FMT_REFUSED_SAME_FAMILY_UNSAFE);
 		CHECK(xb_source_format_compatible(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UNORM) ==
-		      XB_SRC_FMT_REFUSED_SRGB_SIBLING);
+		      XB_SRC_FMT_REFUSED_SAME_FAMILY_UNSAFE);
 		CHECK_FALSE(xb_source_format_accepted(
 		    xb_source_format_compatible(DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)));
 	}
