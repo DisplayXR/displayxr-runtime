@@ -8054,9 +8054,37 @@ vk_make_dp_vk(struct comp_vk_native_compositor *c,
 #ifdef XRT_OS_WINDOWS
 		dp_window_handle = c->hwnd;
 #elif defined(XRT_OS_LINUX_DESKTOP)
-		dp_window_handle = (void *)(uintptr_t)c->xcb_handle.window;
-		U_LOG_W("VK DP factory: passing X11 window XID 0x%lx to the weaver (0 = windowless/display-scoped)",
-		        (unsigned long)c->xcb_handle.window);
+#ifdef XRT_HAVE_WAYLAND
+		if (c->use_wayland) {
+			/*
+			 * Wayland: windowless BY CONSTRUCTION, never whatever XID happens
+			 * to be in xcb_handle (an app that chained both bindings leaves
+			 * one there, and the Wayland one wins — a weaver scoped to that X
+			 * window would anchor to a surface we do not present). A weaver
+			 * constructed with window = 0 always weaves; it is confined to
+			 * this surface's own swapchain image, with the canvas as its
+			 * viewport/scissor (vk_dp_canvas_rect), and its phase comes from
+			 * set_present_origin (vk_update_present_origin), fed from the
+			 * compositor's window-geometry service.
+			 */
+			dp_window_handle = NULL;
+#ifdef DXR_HAVE_WL_GEOM
+			const char *geom = "the window-geometry service";
+#else
+			const char *geom = "nothing (built without D-Bus: display-scoped)";
+#endif
+			U_LOG_W(
+			    "VK DP factory: Wayland surface — windowless weaver (window = 0), confined to this "
+			    "surface's swapchain; phase via set_present_origin from %s",
+			    geom);
+		} else
+#endif
+		{
+			dp_window_handle = (void *)(uintptr_t)c->xcb_handle.window;
+			U_LOG_W(
+			    "VK DP factory: passing X11 window XID 0x%lx to the weaver (0 = windowless/display-scoped)",
+			    (unsigned long)c->xcb_handle.window);
+		}
 #endif
 		/*
 		 * #868: resolve the runtime-owned queue BEFORE the display processor
