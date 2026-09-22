@@ -201,11 +201,13 @@ public:
 	void
 	pump(const std::function<void(DxrKey)> &on_key, bool *running);
 
-	//! Live window size in surface pixels. X11 reads XGetWindowAttributes;
-	//! Wayland returns the last xdg_toplevel.configure size (the compositor
-	//! never tells a client its buffer size, and this helper never sets a
-	//! buffer scale, so the configure size IS the surface size). False when no
-	//! size is known yet — the caller should fall back to its own envelope.
+	//! Live window size in BUFFER pixels — the space the runtime's swapchain
+	//! and every rect handed to it live in. X11 reads XGetWindowAttributes;
+	//! Wayland returns the size declared through XrWaylandSurfaceGeometryDXR
+	//! (the matched output's mode when fullscreen, else the last
+	//! xdg_toplevel.configure), never the logical configure size of a
+	//! fractionally-scaled fullscreen surface. False when no size is known
+	//! yet — the caller should fall back to its own envelope.
 	bool
 	current_size(uint32_t *w, uint32_t *h) const;
 

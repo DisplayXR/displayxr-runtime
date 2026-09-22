@@ -570,6 +570,10 @@ struct comp_vk_native_compositor
 	uint32_t last_window_px_h;
 	bool have_last_window_size;
 
+	//! Last canvas / view / submitted-tile sizes logged by the handle-app
+	//! VIEW_DIMS line in layer_commit — logged on change only, never per frame.
+	uint32_t view_dims_logged[6];
+
 #ifdef XRT_OS_LINUX_DESKTOP
 	//! One-shot guard for the X11 present-origin refusal WARN (see
 	//! @ref vk_x11_present_origin_is_panel_native). Never per frame.
@@ -4043,6 +4047,44 @@ vk_linux_update_surface_not_1to1(struct comp_vk_native_compositor *c)
 // content — divergence is the hardware-state override
 // (xrRequestDisplayModeDXR), under which this layout keeps following the
 // mode and the DP keeps weaving.
+#if !defined(XRT_OS_ANDROID) && (defined(XRT_OS_WINDOWS) || defined(__APPLE__) || defined(XRT_OS_LINUX_DESKTOP))
+/*!
+ * One line, on change only, that shows how a handle app's tiles were sized and
+ * what the app actually submitted into them: canvas (window, buffer px) x the
+ * mode's per-view scale = the tile the compositor crops and the DP weaves, next
+ * to the first projection view's submitted rect. A submitted rect smaller than
+ * the tile is upscaled by the compose pass — the signature of an app that sized
+ * its eyes from a different (e.g. logical) window size than the one it declared.
+ * Lifecycle only (a resize or a mode switch), so WARN is acceptable.
+ */
+static void
+vk_log_view_dims_on_change(struct comp_vk_native_compositor *c,
+                           const struct xrt_rendering_mode *mode,
+                           uint32_t view_w,
+                           uint32_t view_h)
+{
+	uint32_t sub_w = 0, sub_h = 0;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		const struct xrt_layer_data *d = &c->layer_accum.layers[i].data;
+		if (d->type == XRT_LAYER_PROJECTION || d->type == XRT_LAYER_PROJECTION_DEPTH) {
+			sub_w = (uint32_t)d->proj.v[0].sub.rect.extent.w;
+			sub_h = (uint32_t)d->proj.v[0].sub.rect.extent.h;
+			break;
+		}
+	}
+	const uint32_t now[6] = {
+	    c->settings.preferred.width, c->settings.preferred.height, view_w, view_h, sub_w, sub_h};
+	if (memcmp(now, c->view_dims_logged, sizeof(now)) == 0) {
+		return;
+	}
+	memcpy(c->view_dims_logged, now, sizeof(now));
+	const bool upscaled = sub_w > 0 && sub_h > 0 && (sub_w < view_w || sub_h < view_h);
+	U_LOG_W("VIEW_DIMS: canvas %ux%u x mode scale %.3fx%.3f -> tile %ux%u; app submits %ux%u per view%s", now[0],
+	        now[1], (double)mode->view_scale_x, (double)mode->view_scale_y, view_w, view_h, sub_w, sub_h,
+	        upscaled ? " — SMALLER than the tile, so the compose pass upscales it" : "");
+}
+#endif
+
 static void
 vk_compute_effective_layout(struct comp_vk_native_compositor *c)
 {
@@ -6760,6 +6802,7 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 						u_tiling_compute_canvas_view(mode, c->settings.preferred.width,
 						                             c->settings.preferred.height,
 						                             &new_vw, &new_vh);
+						vk_log_view_dims_on_change(c, mode, new_vw, new_vh);
 					}
 #endif
 					if (new_vw > 0 && new_vh > 0) {
