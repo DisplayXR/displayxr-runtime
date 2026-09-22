@@ -72,8 +72,11 @@ set(DISPLAYXR_EXTENSIONS_INCLUDE_DIR "${_dxr_ext_includes}" CACHE PATH
 FetchContent_Declare(
     displayxr_common
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    GIT_TAG v2.17.0
-    GIT_SHALLOW TRUE
+    # TEMPORARY: displayxr-common feat/csd-font-1p5 head (displayxr-common#55 —
+    # the 1.5x title, which replaced TitleBar::kLogicalHeight with
+    # logicalHeight()). v2.17.0, which the base branch pins, does not carry it.
+    # Replace with the tag that ships #55 once it is merged and tagged.
+    GIT_TAG 0a5513a6d206488f270e96526bd72b8a2dda53f9
 )
 FetchContent_MakeAvailable(displayxr_common)
 
