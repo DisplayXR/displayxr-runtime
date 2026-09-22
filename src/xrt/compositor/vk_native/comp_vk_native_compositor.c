@@ -600,6 +600,8 @@ struct comp_vk_native_compositor
 	bool warned_wl_snap_scale;
 	bool warned_wl_snap_grab;
 #endif
+	//! Last SPAN_2D band count logged, so the line fires on change only.
+	uint32_t last_offpanel_band_count;
 	//! X11 placement quantum (#1588 follow-up): measured once, on the first
 	//! snap request, by @ref vk_x11_placement_quantum. 0 = unknown, 1 = every
 	//! device pixel is addressable, >1 = window origins land only on
@@ -2845,6 +2847,208 @@ vk_hud_prepare(struct comp_vk_native_compositor *c, uint32_t target_width, uint3
 	*out_dirty = u_hud_update(c->hud, &data);
 	return true;
 }
+
+
+/*
+ *
+ * Off-panel 2D (a window that spans the 3D panel and another monitor) — #1654.
+ *
+ */
+
+#if defined(XRT_OS_LINUX_DESKTOP) && defined(XRT_HAVE_WAYLAND)
+/*!
+ * Paint the off-panel part of the woven target with flat 2D (#1654).
+ *
+ * Source: one view's tile from the atlas the display processor just wove — a
+ * single eye is what a flat presentation of a stereo pair is, and it is
+ * already the exact content, in register with the weave at the seam. Scaled
+ * with a linear blit because the tile is the view size and the target is the
+ * window size, which differ whenever the mode packs more than one view.
+ *
+ * Runs after the weave and after the Local2D composite, before the HUD, so a
+ * band never overwrites chrome the app asked for and the HUD stays readable on
+ * either side of the seam.
+ *
+ * DXR_WAYLAND_SPAN_2D=0 turns it off (the whole surface is then woven, which
+ * is the pre-#1654 behaviour and shows the interlace on the other monitor).
+ */
+static void
+vk_composite_offpanel_2d(struct comp_vk_native_compositor *c,
+                         VkCommandBuffer cmd,
+                         VkImage target_image,
+                         uint32_t target_width,
+                         uint32_t target_height,
+                         VkImageLayout target_layout)
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		const char *e = getenv("DXR_WAYLAND_SPAN_2D");
+		enabled = (e != NULL && e[0] == '0') ? 0 : 1;
+	}
+	if (enabled == 0 || !c->use_wayland || cmd == VK_NULL_HANDLE || target_image == VK_NULL_HANDLE) {
+		return;
+	}
+	// Where the window is, and how big the panel is. Both from the same
+	// metrics read the present origin uses, so the bands and the weave phase
+	// can never disagree.
+	if (!c->have_last_present_origin || !c->have_last_window_size) {
+		return;
+	}
+	uint32_t panel_w = 0, panel_h = 0;
+	{
+		int32_t ignored_left = 0, ignored_top = 0;
+		if (!(vk_dp_has_any(c) &&
+		      vk_dp_display_pixel_info(c, &panel_w, &panel_h, &ignored_left, &ignored_top) && panel_w > 0 &&
+		      panel_h > 0)) {
+			panel_w = c->sys_info_set ? c->sys_info.display_pixel_width : 0;
+			panel_h = c->sys_info_set ? c->sys_info.display_pixel_height : 0;
+		}
+	}
+	// The band geometry is pure arithmetic and lives with its sibling rules in
+	// u_wayland_geom.h, where tests_aux_wayland_geom pins it.
+	// DXR_TEST_SPAN_2D_INSET=N (test hook, off by default) pretends the panel
+	// is N px narrower and shorter than it is, so the band path is reachable on
+	// a box where nothing can be dragged past the panel's edge. Diagnostics
+	// only: it makes the runtime paint 2D over pixels that really are on the
+	// panel.
+	{
+		static long inset = -1;
+		if (inset < 0) {
+			const char *e = getenv("DXR_TEST_SPAN_2D_INSET");
+			inset = e != NULL ? strtol(e, NULL, 10) : 0;
+			if (inset < 0) {
+				inset = 0;
+			}
+		}
+		if (inset > 0 && panel_w > (uint32_t)inset && panel_h > (uint32_t)inset) {
+			panel_w -= (uint32_t)inset;
+			panel_h -= (uint32_t)inset;
+		}
+	}
+
+	struct u_wl_rect_px bands[4];
+	const uint32_t band_count = u_wl_offpanel_bands(c->last_present_origin_x, c->last_present_origin_y, panel_w,
+	                                                panel_h, target_width, target_height, bands);
+	if (band_count != c->last_offpanel_band_count) {
+		c->last_offpanel_band_count = band_count;
+		U_LOG_W(
+		    "SPAN_2D: window at (%d, %d) %ux%u on a %ux%u panel — %u off-panel band(s) painted flat 2D "
+		    "(the weave is only correct where the lens is)",
+		    c->last_present_origin_x, c->last_present_origin_y, target_width, target_height, panel_w, panel_h,
+		    band_count);
+	}
+	if (band_count == 0) {
+		return;
+	}
+
+	// The view tile to show: the middle one, which for a stereo pair is the
+	// left eye and for an odd view count is the centre view.
+	uint32_t cols = 1, rows = 1, view_w = 0, view_h = 0;
+	if (c->eff_layout.views > 0 && c->eff_layout.tile_w > 0 && c->eff_layout.tile_h > 0) {
+		cols = c->eff_layout.cols;
+		rows = c->eff_layout.rows;
+		view_w = c->eff_layout.tile_w;
+		view_h = c->eff_layout.tile_h;
+	} else {
+		comp_vk_native_renderer_get_tile_layout(c->renderer, &cols, &rows);
+		comp_vk_native_renderer_get_view_dimensions(c->renderer, &view_w, &view_h);
+	}
+	if (cols == 0 || rows == 0 || view_w == 0 || view_h == 0) {
+		return;
+	}
+	const uint32_t view_index = (cols * rows) / 2 > 0 ? ((cols * rows) - 1) / 2 : 0;
+	const uint32_t tile_x = (view_index % cols) * view_w;
+	const uint32_t tile_y = (view_index / cols) * view_h;
+
+	uint64_t atlas_u64 = c->capture_src_image_u64 != 0 ? c->capture_src_image_u64
+	                                                   : comp_vk_native_renderer_get_atlas_image(c->renderer);
+	VkImage atlas_image = (VkImage)(uintptr_t)atlas_u64;
+	if (atlas_image == VK_NULL_HANDLE) {
+		return;
+	}
+
+	struct vk_bundle *vk = &c->vk;
+	const VkImageSubresourceRange color = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+	VkImageMemoryBarrier to_src = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+	    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	    .image = atlas_image,
+	    .subresourceRange = color,
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL,
+	                         0, NULL, 1, &to_src);
+
+	VkImageMemoryBarrier to_dst = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .oldLayout = target_layout,
+	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	    .image = target_image,
+	    .subresourceRange = color,
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+	                         0, NULL, 0, NULL, 1, &to_dst);
+
+	for (uint32_t i = 0; i < band_count; i++) {
+		const struct u_wl_rect_px r = bands[i];
+		// Target-local px -> the view tile's own pixels.
+		const double sx0 = (double)r.x / (double)target_width;
+		const double sy0 = (double)r.y / (double)target_height;
+		const double sx1 = (double)(r.x + r.w) / (double)target_width;
+		const double sy1 = (double)(r.y + r.h) / (double)target_height;
+		VkImageBlit blit = {
+		    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+		    .srcOffsets =
+		        {
+		            {(int32_t)(tile_x + (uint32_t)(sx0 * view_w)), (int32_t)(tile_y + (uint32_t)(sy0 * view_h)),
+		             0},
+		            {(int32_t)(tile_x + (uint32_t)(sx1 * view_w)), (int32_t)(tile_y + (uint32_t)(sy1 * view_h)),
+		             1},
+		        },
+		    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+		    .dstOffsets =
+		        {
+		            {r.x, r.y, 0},
+		            {r.x + r.w, r.y + r.h, 1},
+		        },
+		};
+		if (blit.srcOffsets[1].x <= blit.srcOffsets[0].x || blit.srcOffsets[1].y <= blit.srcOffsets[0].y) {
+			continue; // a band thinner than one source pixel
+		}
+		vk->vkCmdBlitImage(cmd, atlas_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target_image,
+		                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+	}
+
+	VkImageMemoryBarrier back_target = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .dstAccessMask = 0,
+	    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	    .newLayout = target_layout,
+	    .image = target_image,
+	    .subresourceRange = color,
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL,
+	                         0, NULL, 1, &back_target);
+
+	VkImageMemoryBarrier back_atlas = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+	    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	    .image = atlas_image,
+	    .subresourceRange = color,
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL,
+	                         0, NULL, 1, &back_atlas);
+}
+#endif // XRT_OS_LINUX_DESKTOP && XRT_HAVE_WAYLAND
 
 static void
 vk_compositor_render_hud(struct comp_vk_native_compositor *c,
@@ -5564,6 +5768,19 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 			    dp_self_submits ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
 			                    : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
 			    /*reuse_twod=*/is_repaint);
+
+#if defined(XRT_OS_LINUX_DESKTOP) && defined(XRT_HAVE_WAYLAND)
+			// A window that spans the panel and another monitor: the part
+			// off the panel gets flat 2D, because the weave is only correct
+			// where the lens is (#1654). No-op when the window is entirely
+			// on the panel, which is the common case.
+			if (!frame_dropped) {
+				vk_composite_offpanel_2d(c, cmd, (VkImage)(uintptr_t)target_image, tgt_width,
+				                         tgt_height,
+				                         dp_self_submits ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+				                                         : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+			}
+#endif
 
 			// Diagnostic HUD overlay (TAB key toggle)
 			if (!frame_dropped) {
