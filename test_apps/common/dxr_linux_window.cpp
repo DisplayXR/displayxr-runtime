@@ -1655,13 +1655,21 @@ DxrLinuxWindow::current_size(uint32_t *w, uint32_t *h) const
 
 #ifdef DXR_APP_HAVE_WAYLAND
 	if (m_backend == DxrWindowBackend::Wayland) {
-		// The last xdg_toplevel.configure. This helper never calls
-		// wl_surface_set_buffer_scale, so the surface's buffer size is its
-		// logical size and the configure value is directly comparable to the
-		// X11 XGetWindowAttributes reading.
-		if (m_wl_config_w > 0 && m_wl_config_h > 0) {
-			*w = (uint32_t)m_wl_config_w;
-			*h = (uint32_t)m_wl_config_h;
+		// The BUFFER size — the one declared to the runtime through
+		// XrWaylandSurfaceGeometryDXR, which is the swapchain the runtime
+		// presents and so the space every caller's numbers live in (eye
+		// tiles, zone rects). NOT the xdg_toplevel.configure size: that is
+		// logical, and on a fullscreen output at a non-unit scale the declared
+		// buffer is the output's MODE instead. Reading the configure there
+		// (1920x1080 on a 3840x2160 panel at 200 %) rendered each eye at a
+		// quarter of its tile and left the compositor to upscale it — the
+		// XWayland leg, whose X11 window is already device-sized, never did.
+		// Equal to the configure size at scale 1.0 and for a windowed surface.
+		uint32_t dw = 0, dh = 0;
+		wl_declared_size(&dw, &dh);
+		if (dw > 0 && dh > 0) {
+			*w = dw;
+			*h = dh;
 			return true;
 		}
 		if (m_desc.width > 0 && m_desc.height > 0) {
