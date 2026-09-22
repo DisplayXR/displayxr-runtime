@@ -2217,8 +2217,10 @@ xrt_comp_layer_commit_with_semaphore(struct xrt_compositor *xc, struct xrt_compo
  *
  * Helper for calling through the function pointer. Returns
  * XRT_ERROR_FEATURE_NOT_SUPPORTED when the compositor doesn't implement it (the
- * in-process native compositors do not); the state tracker gates this with
- * refresh_rate_count, so the guard is defensive.
+ * in-process native compositors do not). The state tracker's refresh_rate_count
+ * check does NOT protect this slot: that count comes from the null-based system
+ * compositor, not the session's native one (#1636). oxr_session checks the slot
+ * itself and falls back to the system compositor's rate; this guard is a backstop.
  *
  * @public @memberof xrt_compositor
  */
