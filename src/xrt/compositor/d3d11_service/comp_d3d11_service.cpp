@@ -17072,6 +17072,146 @@ service_ui_pass_layout(struct d3d11_service_system *sys,
 }
 
 /*!
+ * Where ONE projection view's pixels come from, and where in the per-client
+ * atlas they land.
+ *
+ * #1676: extracted because two passes now place projection views — the
+ * projection loop for the tile's base, and the submission-ordered sub-rect pass
+ * for every later projection layer. Both must place at the SAME stride
+ * (`feedback_atlas_stride_invariant`: `slot = atlas / grid`, applied identically
+ * at write and at read), and two hand-written copies of this arithmetic drifting
+ * apart is exactly what #1666 was.
+ *
+ * @p out_dst_w / @p out_dst_h are 0 when the source fits its slot — the blit
+ * then keeps the source size and the content sits top-left, which is the
+ * stride invariant's "content can be smaller than the slot" case.
+ */
+struct service_proj_view_blit
+{
+	float src_x, src_y, src_w, src_h; //!< source sub-rect, in source pixels
+	float src_tex_w, src_tex_h;       //!< source texture dims
+	float dst_x, dst_y;               //!< tile origin, at the atlas slot stride
+	float dst_w, dst_h;               //!< 0 = no scale (source fits the slot)
+	bool is_array;                    //!< ADR-032 layered source
+	uint32_t array_slice;
+};
+
+static void
+service_proj_view_blit_resolve(struct d3d11_service_system *sys,
+                               struct d3d11_service_compositor *c,
+                               const struct comp_layer *layer,
+                               uint32_t eye,
+                               const D3D11_TEXTURE2D_DESC *view_desc,
+                               bool bridge_override,
+                               uint32_t active_vw,
+                               uint32_t active_vh,
+                               struct service_proj_view_blit *out)
+{
+	float src_x = static_cast<float>(layer->data.proj.v[eye].sub.rect.offset.w);
+	float src_y = static_cast<float>(layer->data.proj.v[eye].sub.rect.offset.h);
+	float src_w = static_cast<float>(layer->data.proj.v[eye].sub.rect.extent.w);
+	float src_h = static_cast<float>(layer->data.proj.v[eye].sub.rect.extent.h);
+
+	if (bridge_override) {
+		// Override: use active per-view dims (display × viewScale) instead of
+		// Chrome's compromise-scaled subImage.imageRect extent. The bridge
+		// sample rendered at this size. BUT honor Chrome's sub.rect.offset for
+		// the tile position — Chrome may allocate an fb larger than
+		// tileColumns * active_vw (e.g. 7680×2160 instead of 3840×2160 when it
+		// uses max-view-size per eye); each view's sub-image is then placed at
+		// Chrome's offset, and the bridge sample renders content at the TOP-LEFT
+		// of that slot. Using tileX * active_vw for src_x would miss it for
+		// bigger fbs.
+		src_w = static_cast<float>(active_vw);
+		src_h = static_cast<float>(active_vh);
+		// src_x, src_y keep their values from Chrome's sub.rect.offset above.
+	}
+
+	// Tile layout for atlas placement. The slot stride is derived from the
+	// actual per-client atlas size, not from `sys->view_width` — in workspace
+	// mode the per-client atlas is created at native display pixels (e.g. 3840
+	// wide) while `sys->view_width` tracks the SCALED runtime view dim (e.g.
+	// 960). They DIVERGE in workspace mode and using `sys->view_width` as the
+	// tile stride forces a downsample of any source larger than the scaled view
+	// but smaller than the native slot — costing resolution and distorting
+	// aspect.
+	//
+	// `feedback_atlas_stride_invariant`: the invariant is
+	// `slot_w = atlas_width / tile_columns`, applied identically at write (here)
+	// and at read (multi_compositor_render). Content can be smaller than the
+	// slot — sits top-left. Content larger than the slot (Chrome's headset-scale
+	// frames against a 1920-wide slot, etc.) is shader-scaled to slot.
+	uint32_t cols = sys->tile_columns > 0 ? sys->tile_columns : 1;
+	uint32_t rows = sys->tile_rows > 0 ? sys->tile_rows : 1;
+	uint32_t layout_vw = sys->view_width;
+	uint32_t layout_vh = sys->view_height;
+	if (c->render.atlas_texture) {
+		D3D11_TEXTURE2D_DESC atlas_desc = {};
+		c->render.atlas_texture->GetDesc(&atlas_desc);
+		layout_vw = atlas_desc.Width / cols;
+		layout_vh = atlas_desc.Height / rows;
+	}
+	uint32_t tile_x = 0, tile_y = 0;
+	u_tiling_view_origin(eye, cols, layout_vw, layout_vh, &tile_x, &tile_y);
+
+	// Scale only when source exceeds the slot. Handle apps in workspace with
+	// reasonable HWND sizes typically render below the native slot dim → raw
+	// copy at full source resolution.
+	float tile_w = static_cast<float>(layout_vw);
+	float tile_h = static_cast<float>(layout_vh);
+	bool needs_scale = (src_w > tile_w || src_h > tile_h);
+
+	out->src_x = src_x;
+	out->src_y = src_y;
+	out->src_w = src_w;
+	out->src_h = src_h;
+	out->src_tex_w = static_cast<float>(view_desc->Width);
+	out->src_tex_h = static_cast<float>(view_desc->Height);
+	out->dst_x = static_cast<float>(tile_x);
+	out->dst_y = static_cast<float>(tile_y);
+	out->dst_w = needs_scale ? tile_w : 0.0f;
+	out->dst_h = needs_scale ? tile_h : 0.0f;
+	// ADR-032: a LAYERED (arraySize>1) source packs its eyes as array slices.
+	// Every array-aware path samples slice `sub.array_index`; single-layer
+	// sources (ArraySize==1) keep the byte-identical Texture2D path. The raw-copy
+	// fallback already selects the source subresource via `sub.array_index`, so
+	// it needs no change.
+	out->is_array = view_desc->ArraySize > 1;
+	out->array_slice = static_cast<uint32_t>(layer->data.proj.v[eye].sub.array_index);
+}
+
+/*!
+ * #1676 — one projection-class layer of a commit that is NOT the tile's base,
+ * deferred from the projection loop to the submission-ordered sub-rect pass so
+ * OpenXR 10.6.1's cross-type layer order is honoured.
+ *
+ * Carries only what the later pass cannot re-derive for itself: the accum index
+ * (its place in submission order), how many views the projection loop resolved
+ * for it, the #1598 blend state the tile-state gate produced, and the commit's
+ * per-view freshness ruling (#1667). The keyed-mutex acquire is NOT here — it is
+ * taken by the sub-rect pass's own #1664 registry, so no acquire ever spans the
+ * two passes.
+ */
+struct service_deferred_projection
+{
+	uint32_t layer_index;
+	uint32_t view_count;
+	ID3D11BlendState *blend;       //!< nullptr = opaque cover (no blending)
+	bool view_skip[XRT_MAX_VIEWS]; //!< true: this view must not be composed this commit
+};
+
+static struct service_deferred_projection *
+service_deferred_projection_find(struct service_deferred_projection *deferred, uint32_t count, uint32_t layer_index)
+{
+	for (uint32_t d = 0; d < count; d++) {
+		if (deferred[d].layer_index == layer_index) {
+			return &deferred[d];
+		}
+	}
+	return nullptr;
+}
+
+/*!
  * Has the client's GPU reached `signaled` on its workspace_sync_fence?
  *
  * #922 replaced the original "queue an `ID3D11DeviceContext4::Wait`" design
@@ -19926,6 +20066,42 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	// hardware proof that the per-commit rule fires (see the one-shot below).
 	uint32_t commit_fence_layers_composed = 0;
 
+	/*
+	 * #1676 — a projection-class layer past the tile's BASE composes in the
+	 * submission-ordered sub-rect pass below, not in this loop.
+	 *
+	 * OpenXR 10.6.1 composites layers in submission order across layer TYPES,
+	 * and this function has always run two passes on two mechanisms: this one
+	 * (copy / blit, which owns the zero-copy decision and the content-dims
+	 * record) and the sub-rect pass (quad / cylinder / equirect2 shader draws,
+	 * #1611). A commit shaped `proj0, quad, proj1` therefore composed proj1
+	 * BEFORE the quad, and the quad covered it — CTS ProjectionQuadProjection's
+	 * yellow projection hidden under its green quad, out-of-process only (the
+	 * in-process renderer has one loop and was always right).
+	 *
+	 * The FIRST projection layer to paint stays here: it is the tile's base and
+	 * owns every duty that hangs off being the base — the copy / zero-copy path,
+	 * the keyed-mutex acquire for its own views, the content dims,
+	 * `atlas_holds_srgb_bytes`, the slot readiness record (#1662/#1664/#1666).
+	 * Every later one is ALREADY a blending shader blit (#1598, `proj_blend`),
+	 * which is precisely what the sub-rect pass can issue, so it is recorded
+	 * here and drawn there at its accum index among the quads.
+	 *
+	 * What this loop still resolves for a deferred layer is the commit's
+	 * FRESHNESS ruling (#1667) and nothing else. Its keyed-mutex acquire belongs
+	 * to the sub-rect pass's own #1664 registry, so no acquire spans the two
+	 * passes: this loop cannot leak one into the pass, and the pass cannot
+	 * self-block on one this loop still holds.
+	 *
+	 * Bounded by XRT_MAX_LAYERS, which also bounds `layer_accum.layer_count`, so
+	 * the capacity check below cannot trip.
+	 */
+	struct service_deferred_projection proj_deferred[XRT_MAX_LAYERS];
+	uint32_t proj_deferred_count = 0;
+	//! #1676: projection-class layers of this commit that passed the validity
+	//! check. The first owns the tile's base; every later one is deferred.
+	uint32_t projection_layers_painted = 0;
+
 	// Render projection layers to stereo texture (via copy)
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		struct comp_layer *layer = &c->layer_accum.layers[i];
@@ -19960,7 +20136,16 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		// #575: remember what this frame actually packed (see eff_view_count
 		// decl). The handoff/crop below derive their grid from this, not the
 		// possibly-lagging sys->tile_columns.
-		eff_view_count = proj_view_count;
+		//
+		// #1676: the FIRST projection layer to paint owns the recipe, exactly as
+		// it owns the content dims — a later layer composes INTO the grid the
+		// base laid down and never re-declares it. (Before, the last layer of a
+		// multi-projection commit overwrote this; every such layer of a commit
+		// resolves the same count in practice, and single-projection frames are
+		// untouched either way.)
+		if (projection_layers_painted == 0) {
+			eff_view_count = proj_view_count;
+		}
 
 		// Extract per-view swapchains, textures, and image indices
 		struct d3d11_service_swapchain *view_scs[XRT_MAX_VIEWS] = {};
@@ -20046,6 +20231,45 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			proj_blend = sys->blend_premul.get();
 		} else if (proj_mode == COMP_LAYER_BLEND_STRAIGHT) {
 			proj_blend = sys->blend_alpha.get();
+		}
+
+		/*
+		 * #1676 — the tile's base stays here; every later projection layer is
+		 * handed to the submission-ordered sub-rect pass below.
+		 *
+		 * "Later" means the same thing here as it does for `proj_tile` above: a
+		 * layer that fails the validity check never consumes the base slot, so
+		 * the counter is incremented at this line and not earlier. Recorded,
+		 * then `continue` — this layer touches NONE of the per-layer bookkeeping
+		 * that follows (the acquire, the zero-copy decision, the blit, the
+		 * content dims, `atlas_holds_srgb_bytes`, `service_update_slot_content_dims`,
+		 * the release loop), all of which are the base's by #1662/#1664/#1666 and
+		 * are unchanged by this.
+		 *
+		 * The per-view verdict carried across is the COMMIT's freshness ruling
+		 * (#1667), decided by the base layer's visit to each view: a view this
+		 * commit ruled stale must not take a later layer blended onto last
+		 * frame's pixels — the mixed-generation tile #1667's acquire-failure
+		 * demotion exists to prevent. On the legacy keyed-mutex path there is no
+		 * such ruling (`commit_fence_decided` stays false) and the sub-rect
+		 * pass's own 4 ms acquire is the verdict, exactly as it is for a quad.
+		 *
+		 * Deferral needs the shader blit, because the #1598 promotion IS a shader
+		 * blit. A build with no `blit_vs` has nothing the later pass could issue,
+		 * so it keeps the pre-#1676 in-place path verbatim.
+		 */
+		const bool proj_is_base = (projection_layers_painted++ == 0);
+		if (!proj_is_base && sys->blit_vs) {
+			if (proj_deferred_count < ARRAY_SIZE(proj_deferred)) {
+				struct service_deferred_projection *d = &proj_deferred[proj_deferred_count++];
+				d->layer_index = i;
+				d->view_count = proj_view_count;
+				d->blend = proj_blend;
+				for (uint32_t eye = 0; eye < proj_view_count; eye++) {
+					d->view_skip[eye] = commit_fence_decided[eye] && !commit_fence_fresh[eye];
+				}
+			}
+			continue;
 		}
 
 		// Phase 1 Task 1.2 — drop service-thread KeyedMutex timeout from
@@ -20616,62 +20840,25 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			if (view_skip_blit[eye]) {
 				continue;
 			}
-			float src_x = static_cast<float>(layer->data.proj.v[eye].sub.rect.offset.w);
-			float src_y = static_cast<float>(layer->data.proj.v[eye].sub.rect.offset.h);
-			float src_w = static_cast<float>(layer->data.proj.v[eye].sub.rect.extent.w);
-			float src_h = static_cast<float>(layer->data.proj.v[eye].sub.rect.extent.h);
-
-			if (bridge_override) {
-				// Override: use active per-view dims (display × viewScale)
-				// instead of Chrome's compromise-scaled subImage.imageRect
-				// extent. The bridge sample rendered at this size. BUT
-				// honor Chrome's sub.rect.offset for the tile position —
-				// Chrome may allocate an fb larger than
-				// tileColumns * active_vw (e.g. 7680×2160 instead of
-				// 3840×2160 when it uses max-view-size per eye); each
-				// view's sub-image is then placed at Chrome's offset, and
-				// the bridge sample renders content at the TOP-LEFT of
-				// that slot. Using tileX * active_vw for src_x would miss
-				// it for bigger fbs.
-				src_w = static_cast<float>(active_vw);
-				src_h = static_cast<float>(active_vh);
-				// src_x, src_y keep their values from Chrome's
-				// sub.rect.offset above.
-			}
-
-			// Tile layout for atlas placement. The slot stride is
-			// derived from the actual per-client atlas size, not from
-			// `sys->view_width` — in workspace mode the per-client atlas is
-			// created at native display pixels (e.g. 3840 wide) while
-			// `sys->view_width` tracks the SCALED runtime view dim
-			// (e.g. 960). They DIVERGE in workspace mode and using
-			// `sys->view_width` as the tile stride forces a downsample
-			// of any source larger than the scaled view but smaller than
-			// the native slot — costing resolution and distorting aspect.
-			//
-			// `feedback_atlas_stride_invariant`: the invariant is
-			// `slot_w = atlas_width / tile_columns`, applied identically
-			// at write (here) and at read (multi_compositor_render).
-			// Content can be smaller than the slot — sits top-left.
-			// Content larger than the slot (Chrome's headset-scale frames
-			// against a 1920-wide slot, etc.) is shader-scaled to slot.
-			D3D11_TEXTURE2D_DESC atlas_desc = {};
-			c->render.atlas_texture->GetDesc(&atlas_desc);
-			uint32_t layout_vw = atlas_desc.Width / sys->tile_columns;
-			uint32_t layout_vh = atlas_desc.Height / sys->tile_rows;
-			uint32_t tile_x, tile_y;
-			u_tiling_view_origin(eye, sys->tile_columns,
-			                     layout_vw, layout_vh,
-			                     &tile_x, &tile_y);
-
-			// Scale only when source exceeds the slot. Handle apps in
-			// workspace with reasonable HWND sizes typically render below the
-			// native slot dim → raw copy at full source resolution.
-			float tile_w = static_cast<float>(layout_vw);
-			float tile_h = static_cast<float>(layout_vh);
-			bool needs_scale = (src_w > tile_w || src_h > tile_h);
-			float dst_w = needs_scale ? tile_w : 0.0f;
-			float dst_h = needs_scale ? tile_h : 0.0f;
+			// #1676: the source sub-rect (bridge override included), the
+			// tile origin at the atlas slot stride, the scale decision and
+			// the ADR-032 array slice — resolved by the helper the deferred
+			// later-layer draw in the sub-rect pass calls too, so the two
+			// passes can never place the same view differently.
+			struct service_proj_view_blit pvb = {};
+			service_proj_view_blit_resolve(sys, c, layer, eye, &view_descs[eye], bridge_override, active_vw,
+				                       active_vh, &pvb);
+			const float src_x = pvb.src_x;
+			const float src_y = pvb.src_y;
+			const float src_w = pvb.src_w;
+			const float src_h = pvb.src_h;
+			const float tile_x = pvb.dst_x;
+			const float tile_y = pvb.dst_y;
+			const float dst_w = pvb.dst_w;
+			const float dst_h = pvb.dst_h;
+			const bool needs_scale = (dst_w > 0.0f);
+			const bool is_layered = pvb.is_array;
+			const uint32_t src_slice = pvb.array_slice;
 
 			// Color-space handling diverges between modes
 			// (`feedback_srgb_blit_paths`):
@@ -20686,14 +20873,6 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			    view_scs[eye]->images[view_img_indices[eye]].srv;
 			bool use_srgb_shader = can_shader_blit && view_is_srgb[eye] && !sys->workspace_mode;
 			bool use_scale_shader = can_shader_blit && needs_scale && sys->workspace_mode;
-
-			// ADR-032: a LAYERED (arraySize>1) source packs its eyes as array
-			// slices. Every array-aware path samples slice `sub.array_index`;
-			// single-layer sources (ArraySize==1) keep the byte-identical
-			// Texture2D path. The raw-copy fallback already selects the source
-			// subresource via `sub.array_index`, so it needs no change.
-			bool is_layered = view_descs[eye].ArraySize > 1;
-			uint32_t src_slice = static_cast<uint32_t>(layer->data.proj.v[eye].sub.array_index);
 
 			if (use_srgb_shader) {
 				// Non-workspace SRGB: shader blit with SRGB SRV for linearization.
@@ -20731,8 +20910,9 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 					box.left = (UINT)src_x; box.top = (UINT)src_y;
 					box.right = (UINT)(src_x + src_w); box.bottom = (UINT)(src_y + src_h);
 					box.front = 0; box.back = 1;
-					sys->context->CopySubresourceRegion(c->render.atlas_texture.get(), 0,
-					    tile_x, tile_y, 0, view_textures[eye],
+					sys->context->CopySubresourceRegion(
+					    c->render.atlas_texture.get(), 0, static_cast<UINT>(tile_x),
+					    static_cast<UINT>(tile_y), 0, view_textures[eye],
 					    layer->data.proj.v[eye].sub.array_index, &box);
 				}
 			} else if (use_scale_shader) {
@@ -20779,10 +20959,12 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 				sys->context->CopySubresourceRegion(
 				    c->render.atlas_texture.get(),
-				    0,                            // dst subresource
-				    tile_x, tile_y, 0,            // dst x, y, z (tile position)
+				    0,                         // dst subresource
+				    static_cast<UINT>(tile_x), // dst x (tile position)
+				    static_cast<UINT>(tile_y), // dst y
+				    0,                         // dst z
 				    view_textures[eye],
-				    layer->data.proj.v[eye].sub.array_index,  // src subresource
+				    layer->data.proj.v[eye].sub.array_index, // src subresource
 				    &box);
 			}
 		}
@@ -20999,6 +21181,13 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	// image until it lands. Skipped views were dropped, not deferred (see the
 	// skip sites), so this signal never licenses a rewrite of an image the
 	// service still intends to read.
+	//
+	// The sub-rect pass BELOW also reads client images — the quads since #1664,
+	// and every later projection layer since #1676 — so this signal is not the
+	// last read of the commit. What protects those is not queue order but the
+	// keyed mutex: that pass acquires each source before sampling it, and the
+	// client's next write blocks on the key until the pass's RAII scope releases
+	// it. See the #1664 block for the full statement of the rule.
 	if (c->read_done_fence) {
 		uint64_t rd_v = c->last_signaled_fence_value.load(std::memory_order_acquire);
 		if (rd_v > c->read_done_value) {
@@ -21061,8 +21250,13 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		service_update_zone_wish_publish(sys, c, zones_frame);
 	}
 
-	// Render UI layers if any exist and shaders are ready
-	if (has_ui_layers && sys->quad_vs) {
+	// The submission-ordered compose pass: sub-rect layers (quad / cylinder /
+	// equirect2) and, since #1676, every projection-class layer past the tile's
+	// base. It runs when either has something to draw — a `proj0, proj1` commit
+	// with no sub-rect layer at all still needs proj1 composed HERE, because the
+	// projection loop deferred it.
+	const bool ui_draws_subrect = has_ui_layers && sys->quad_vs;
+	if (ui_draws_subrect || proj_deferred_count > 0) {
 		/*
 		 * #1664 — THE CROSS-PROCESS ACQUIRE THIS PASS NEVER DID.
 		 *
@@ -21130,13 +21324,20 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		struct service_acquired_image_scope ui_acquired_scope = {ui_acquired, &ui_acquired_count};
 		bool ui_layer_drawable[XRT_MAX_LAYERS] = {};
 
-		for (uint32_t i = 0; i < c->layer_accum.layer_count && i < XRT_MAX_LAYERS; i++) {
+		for (uint32_t i = 0; ui_draws_subrect && i < c->layer_accum.layer_count && i < XRT_MAX_LAYERS; i++) {
 			struct comp_layer *layer = &c->layer_accum.layers[i];
 			uint32_t img = 0;
 			switch (layer->data.type) {
 			case XRT_LAYER_QUAD: img = layer->data.quad.sub.image_index; break;
 			case XRT_LAYER_CYLINDER: img = layer->data.cylinder.sub.image_index; break;
 			case XRT_LAYER_EQUIRECT2: img = layer->data.equirect2.sub.image_index; break;
+			case XRT_LAYER_PROJECTION:
+			case XRT_LAYER_PROJECTION_DEPTH:
+				// #1676: a deferred later projection layer names one image PER
+				// VIEW, not one for the whole layer — it is acquired by the walk
+				// just below, into this same registry and under the same RAII
+				// release.
+				continue;
 			default: continue; // not this pass's business
 			}
 			struct xrt_swapchain *xsc = layer->sc_array[0];
@@ -21160,6 +21361,51 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				// it — the tile keeps what it held, the same policy as the
 				// projection loop's `view_skip_blit`.
 				sys->render_diag_ui_acq_skip.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+
+		/*
+		 * #1676 — the deferred later projection layers' VIEW images, into the
+		 * same registry, with the same de-dup and the same RAII release.
+		 *
+		 * This is the whole acquire story for a deferred layer: the projection
+		 * loop took no mutex for it, so nothing is held across the two passes and
+		 * neither pass can leak into or self-block on the other. A view the
+		 * commit already ruled stale (#1667) is not acquired at all — re-blending
+		 * a layer over a tile whose base was NOT refreshed would composite it
+		 * twice onto last frame's pixels.
+		 *
+		 * `view_skip` is the single per-view drawable flag from here on: an
+		 * unusable swapchain / image and a failed acquire both set it, so the
+		 * draw loop below asks one question.
+		 */
+		for (uint32_t d = 0; d < proj_deferred_count; d++) {
+			struct service_deferred_projection *dp = &proj_deferred[d];
+			struct comp_layer *player = &c->layer_accum.layers[dp->layer_index];
+			for (uint32_t eye = 0; eye < dp->view_count && eye < XRT_MAX_VIEWS; eye++) {
+				if (dp->view_skip[eye]) {
+					continue;
+				}
+				struct xrt_swapchain *pxsc = player->sc_array[eye];
+				if (pxsc == nullptr) {
+					dp->view_skip[eye] = true;
+					continue;
+				}
+				struct d3d11_service_swapchain *psc = d3d11_service_swapchain_from_xrt(pxsc);
+				uint32_t pimg = player->data.proj.v[eye].sub.image_index;
+				if (pimg >= psc->image_count || psc->images[pimg].srv == nullptr ||
+				    psc->images[pimg].texture == nullptr) {
+					dp->view_skip[eye] = true;
+					continue;
+				}
+				if (!service_acquire_source_image(sys, c, psc, pimg, ui_use_fence_path,
+				                                  ui_fence_signaled, &ui_fence_wait_queued, ui_acquired,
+				                                  &ui_acquired_count, ARRAY_SIZE(ui_acquired))) {
+					// Same policy as a quad's: skip and count, the tile keeps
+					// what it held.
+					dp->view_skip[eye] = true;
+					sys->render_diag_ui_acq_skip.fetch_add(1, std::memory_order_relaxed);
+				}
 			}
 		}
 		// Bind per-client stereo render target
@@ -21326,22 +21572,113 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			 * are all SUB-RECT layers and none can be a tile's
 			 * base (comp_layer_subrect_blend_mode).
 			 *
-			 * Projection-class layers are NOT in this loop — they
-			 * are blitted (and, since #1598, blended) in the
-			 * earlier pass, which owns the keyed-mutex acquire, the
-			 * zero-copy decision and the content-dims record.
-			 * Consequence, and the one ordering deviation left on
-			 * this path: a projection layer submitted AFTER a quad
-			 * is composited BEFORE it, so it cannot cover it. Same
-			 * split as the in-process renderer's Local2D /
-			 * window-space channel, which is likewise a later pass
-			 * (here it is later still — multi_compositor_render).
+			 * #1676 — projection-class layers ARE in this loop,
+			 * past the tile's base.
+			 *
+			 * The BASE projection layer is still composed in the
+			 * earlier pass, which owns the copy / zero-copy path, its
+			 * own keyed-mutex acquire and the content-dims record;
+			 * every projection layer after it is already a blending
+			 * shader blit (#1598) and is drawn HERE, at its accum
+			 * index among the sub-rect layers. A commit shaped
+			 * `proj0, quad, proj1` therefore composes proj0 → quad →
+			 * proj1, and proj1 covers the quad — OpenXR 10.6.1's
+			 * submission order ACROSS layer types, which the two-pass
+			 * split used to break (CTS ProjectionQuadProjection
+			 * showed blue + green and never the yellow on top).
+			 *
+			 * A deferred layer's blend mode is still the one the
+			 * projection loop resolved from the tile state
+			 * (comp_layer_tile_blend_mode): "is this the tile's base"
+			 * is that pass's question, not this loop's, and a
+			 * deferred layer is by construction never the base.
+			 * Sub-rect layers keep taking their own flags
+			 * (comp_layer_subrect_blend_mode) exactly as before.
+			 *
+			 * Local2D / window-space layers remain a later channel
+			 * still (multi_compositor_render) — the one ordering
+			 * deviation left on this path.
 			 */
 			for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 				struct comp_layer *layer = &c->layer_accum.layers[i];
 				const enum xrt_layer_type type = layer->data.type;
-				if (type != XRT_LAYER_EQUIRECT2 && type != XRT_LAYER_CYLINDER &&
-				    type != XRT_LAYER_QUAD) {
+				// `ui_draws_subrect` is folded in so a pass entered ONLY for a
+				// deferred projection layer (no sub-rect shaders on this build)
+				// cannot reach a draw that needs them — the pre-#1676 gate was
+				// the whole `if`, and this keeps its effect.
+				const bool is_subrect =
+				    ui_draws_subrect && (type == XRT_LAYER_EQUIRECT2 || type == XRT_LAYER_CYLINDER ||
+				                         type == XRT_LAYER_QUAD);
+				struct service_deferred_projection *dproj = nullptr;
+				if (type == XRT_LAYER_PROJECTION || type == XRT_LAYER_PROJECTION_DEPTH) {
+					dproj = service_deferred_projection_find(proj_deferred, proj_deferred_count, i);
+				}
+				if (!is_subrect && dproj == nullptr) {
+					continue;
+				}
+
+				if (dproj != nullptr) {
+					/*
+					 * #1676 — a deferred later projection layer, at its
+					 * place in submission order.
+					 *
+					 * The blit is the one the projection loop's #1598
+					 * promoted branch issues: the per-image SRV (a
+					 * Texture2DArray for a layered source, ADR-032), raw
+					 * bytes (`is_srgb=false`), the geometry from the
+					 * SHARED resolver so this placement cannot drift from
+					 * the base's, and the layer's own blend state.
+					 *
+					 * Its source was acquired into this pass's registry
+					 * above, so the read is bracketed by AcquireSync /
+					 * ReleaseSync exactly as a quad's is. That is also
+					 * what keeps it safe after the #1215 read-done signal,
+					 * which fires ABOVE this pass, not below it: the
+					 * signal releases the client's next `wait_image`, but
+					 * the client's write then blocks on this key until the
+					 * scope guard releases it (#1664 states the same rule
+					 * for the quads).
+					 */
+					if (view_index >= dproj->view_count || view_index >= XRT_MAX_VIEWS ||
+					    dproj->view_skip[view_index]) {
+						continue;
+					}
+					struct d3d11_service_swapchain *psc =
+					    d3d11_service_swapchain_from_xrt(layer->sc_array[view_index]);
+					uint32_t pimg = layer->data.proj.v[view_index].sub.image_index;
+					D3D11_TEXTURE2D_DESC pdesc = {};
+					psc->images[pimg].texture->GetDesc(&pdesc);
+
+					struct service_proj_view_blit pvb = {};
+					service_proj_view_blit_resolve(sys, c, layer, view_index, &pdesc,
+					                               bridge_override, active_vw, active_vh, &pvb);
+					blit_to_atlas_texture(sys, &c->render, psc->images[pimg].srv.get(), pvb.src_x,
+					                      pvb.src_y, pvb.src_w, pvb.src_h, pvb.src_tex_w,
+					                      pvb.src_tex_h, pvb.dst_x, pvb.dst_y, pvb.dst_w, pvb.dst_h,
+					                      /*is_srgb=*/false, /*blend=*/dproj->blend,
+					                      /*rtv_override=*/nullptr, /*dst_tex_w=*/0.0f,
+					                      /*dst_tex_h=*/0.0f, /*is_array=*/pvb.is_array,
+					                      /*array_slice=*/pvb.array_slice);
+
+					// `blit_to_atlas_texture` owns the pipeline for its own
+					// draw and deliberately UNBINDS the atlas RTV at the end
+					// (the render thread samples the atlas). Re-arm the two
+					// things this pass set OUTSIDE the layer loop, so a
+					// sub-rect layer submitted after this one still draws into
+					// the same target at the same viewport. Topology, input
+					// layout, rasterizer and depth state are left by the blit
+					// at the identical values this pass sets.
+					sys->context->OMSetRenderTargets(1, rtvs, nullptr);
+					sys->context->RSSetViewports(1, &viewport);
+
+					static bool logged_1676 = false;
+					if (!logged_1676) {
+						logged_1676 = true;
+						U_LOG_W(
+						    "#1676: later projection layer %u composed in "
+						    "submission order (after a sub-rect layer)",
+						    i);
+					}
 					continue;
 				}
 
