@@ -57,8 +57,9 @@
 // Coordinates are Mutter's global (stage) coordinates — logical pixels. At
 // monitor scale 1.0 (the only mode windowed weaving supports anyway) these are
 // physical desktop pixels, the same space X11's root coordinates live in. The
-// runtime reads "frame" by default; "buffer" is published so validation can
-// decide how CSD shadow margins should be handled.
+// runtime anchors to "buffer" (the main surface — where its pixels land) and
+// falls back to "frame" (the window geometry, which includes a client-side
+// title bar) only when "buffer" is absent (displayxr-runtime#1654).
 
 import Clutter from 'gi://Clutter';
 import GObject from 'gi://GObject';

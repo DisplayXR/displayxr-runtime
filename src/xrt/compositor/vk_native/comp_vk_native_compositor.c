@@ -3991,15 +3991,19 @@ vk_linux_update_surface_not_1to1(struct comp_vk_native_compositor *c)
 	//      "declared the LOGICAL configure size" mistake, which on a 1.6667
 	//      desktop hands the weaver an image to be upscaled by 5/3.
 	const bool on_panel = (wr.monitor_width_px == panel_px_w && wr.monitor_height_px == panel_px_h);
+	// wr.width/height_px is the CONTENT — the committed surface's rect when
+	// the geometry service publishes it, not the window frame (#1654): a
+	// client-side title bar is part of the frame but not of the surface we
+	// present into, and comparing the buffer against bar + content would read
+	// every decorated window as a resample.
 	const bool fits_window = u_wl_present_is_1to1(buf_px_w, buf_px_h, wr.width_px, wr.height_px);
-	//  (c) the buffer matches the window, but the compositor did not paint it
-	//      AT the window: the committed surface (buffer rect) is another size,
-	//      because the client mapped no viewport / buffer scale onto it. The
-	//      frame then reads right while the surface spills past the output —
-	//      measured on a 3840x2160 panel at 200 %: frame 1920x1080, buffer 3840x2160 at
-	//      scale 1, i.e. a surface twice the output. Unknown (0) never degrades.
-	const bool fits_surface = wr.surface_width_px == 0 || wr.surface_height_px == 0 ||
-	                          u_wl_present_is_1to1(buf_px_w, buf_px_h, wr.surface_width_px, wr.surface_height_px);
+	//  (c) the compositor did not paint the surface AT the window: the
+	//      committed surface spills past the window frame, because the client
+	//      mapped no viewport / buffer scale onto its buffer. Measured on a
+	//      3840x2160 panel at 200 %: frame 1920x1080, buffer 3840x2160 at
+	//      scale 1, i.e. a surface twice the output. A surface INSIDE the frame
+	//      (a title bar above it) is fine. Unknown never degrades.
+	const bool fits_surface = wr.surface_within_frame;
 	const bool not_1to1 = !on_panel || !fits_window || !fits_surface;
 
 	if (not_1to1 == c->linux_surface_not_1to1) {
@@ -4015,7 +4019,7 @@ vk_linux_update_surface_not_1to1(struct comp_vk_native_compositor *c)
 		    "output, 3D panel %ux%u px. A resampled weave is a uniform double image; flat 2D is "
 		    "correct content and recovers as soon as the session is 1:1. (#1595)",
 		    !on_panel       ? "this surface is not on the 3D panel"
-		    : !fits_surface ? "the committed surface is not the window's size (buffer not mapped to it)"
+		    : !fits_surface ? "the committed surface spills past the window frame (buffer not mapped to it)"
 		                    : "the buffer is not the size of the region the compositor paints it into",
 		    buf_px_w, buf_px_h, wr.width_px, wr.height_px, wr.monitor_width_px, wr.monitor_height_px,
 		    panel_px_w, panel_px_h);

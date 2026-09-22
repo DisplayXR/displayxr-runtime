@@ -744,12 +744,22 @@ DxrLinuxWindow::s_registry_global(void *data, struct wl_registry *r, uint32_t na
 {
 	auto *self = static_cast<DxrLinuxWindow *>(data);
 
+#ifdef DXR_APP_HAVE_WL_CHROME
+	// wl_shm / wl_subcompositor / decoration manager / cursor shapes (#1654).
+	if (self->m_wl_chrome.on_global(r, name, iface, version)) {
+		return;
+	}
+#endif
+
 	if (strcmp(iface, wl_compositor_interface.name) == 0) {
 		self->m_wl_compositor = static_cast<struct wl_compositor *>(
 		    wl_registry_bind(r, name, &wl_compositor_interface, version < 4 ? version : 4));
 	} else if (strcmp(iface, xdg_wm_base_interface.name) == 0) {
-		self->m_wl_wm_base =
-		    static_cast<struct xdg_wm_base *>(wl_registry_bind(r, name, &xdg_wm_base_interface, 1));
+		// v2+ is what reports the TILED_* toplevel states (the title bar squares
+		// its corners for them, as GNOME does); the toplevel listener below
+		// covers every event up to v5.
+		self->m_wl_wm_base = static_cast<struct xdg_wm_base *>(
+		    wl_registry_bind(r, name, &xdg_wm_base_interface, version < 5 ? version : 5));
 		static const struct xdg_wm_base_listener kWmBaseListener = {
 		    s_wm_base_ping,
 		};
@@ -844,6 +854,11 @@ DxrLinuxWindow::s_xdg_surface_configure(void *data, struct xdg_surface *s, uint3
 	// Pending state; Mesa's WSI commits it with its next present (before the
 	// session, the first present is the first commit that carries a buffer).
 	self->wl_apply_buffer_mapping();
+#ifdef DXR_APP_HAVE_WL_CHROME
+	// Window geometry (pending on the same surface, same WSI commit) and the
+	// bar itself (its own desync commit) follow the new content size.
+	self->m_wl_chrome.update(self->m_wl_config_w, self->m_wl_config_h, self->wl_surface_scale());
+#endif
 }
 
 void
@@ -866,10 +881,22 @@ void
 DxrLinuxWindow::s_toplevel_configure(void *data, struct xdg_toplevel *t, int32_t w, int32_t h, struct wl_array *states)
 {
 	(void)t;
-	(void)states;
 	auto *self = static_cast<DxrLinuxWindow *>(data);
+#ifdef DXR_APP_HAVE_WL_CHROME
+	// States first: whether the bar is shown (not when fullscreen) decides how
+	// much of the size below is bar.
+	self->m_wl_chrome.on_toplevel_states(states, w > 0 && h > 0);
+#else
+	(void)states;
+#endif
 	// 0x0 means "you choose"; keep whatever we asked for.
 	if (w > 0 && h > 0) {
+#ifdef DXR_APP_HAVE_WL_CHROME
+		// The configure size is the WINDOW GEOMETRY, which with client-side
+		// decorations is bar + content (#1654). The bound surface — and so
+		// everything declared to the runtime — is the content alone.
+		self->m_wl_chrome.frame_to_content(&w, &h);
+#endif
 		self->m_wl_config_w = w;
 		self->m_wl_config_h = h;
 	}
@@ -1047,6 +1074,9 @@ void
 DxrLinuxWindow::s_seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps)
 {
 	auto *self = static_cast<DxrLinuxWindow *>(data);
+#ifdef DXR_APP_HAVE_WL_CHROME
+	self->m_wl_chrome.on_seat_capabilities(seat, caps);
+#endif
 	const bool has_kb = (caps & WL_SEAT_CAPABILITY_KEYBOARD) != 0;
 	if (has_kb && self->m_wl_keyboard == nullptr) {
 		self->m_wl_keyboard = wl_seat_get_keyboard(seat);
@@ -1347,6 +1377,14 @@ DxrLinuxWindow::create_wayland(const DxrLinuxWindowDesc &desc)
 		          "weaves display-scoped, which is wrong for a window that is not at the panel origin.");
 	}
 
+#ifdef DXR_APP_HAVE_WL_CHROME
+	// Title bar (#1654). Before the commit below: the chrome subsurface's
+	// position is state of THIS surface and rides on that commit, and the
+	// server-side-decoration request must precede the initial configure.
+	m_wl_chrome.attach(m_wl_display, m_wl_compositor, m_wl_surface, m_wl_xdg_surface, m_wl_toplevel,
+	                   m_wl_viewporter, desc.title, desc.fullscreen_on_wayland);
+#endif
+
 	// The role is attached and the state requested; commit so the compositor
 	// sends the initial configure. NOTE: this is the ONLY commit this helper
 	// ever performs — once the session exists, Mesa's WSI owns attach/damage/
@@ -1396,9 +1434,16 @@ DxrLinuxWindow::create_wayland(const DxrLinuxWindowDesc &desc)
 		}
 	}
 
-	DXRW_INFO("Created app-owned Wayland surface %p (xdg toplevel, %s), configure size %dx%d @ %u mHz",
+	DXRW_INFO("Created app-owned Wayland surface %p (xdg toplevel, %s), content size %dx%d @ %u mHz, "
+	          "decorations %s",
 	          (void *)m_wl_surface, desc.fullscreen_on_wayland ? "fullscreen" : "windowed", m_wl_config_w,
-	          m_wl_config_h, m_wl_refresh_mhz);
+	          m_wl_config_h, m_wl_refresh_mhz,
+#ifdef DXR_APP_HAVE_WL_CHROME
+	          m_wl_chrome.mode_name()
+#else
+	          "none (built without displayxr::csd)"
+#endif
+	);
 
 	// A fullscreen surface only weaves 1:1 when the buffer we declare covers
 	// the panel exactly. It normally does (the declared size is the matched
@@ -1425,6 +1470,10 @@ DxrLinuxWindow::create_wayland(const DxrLinuxWindowDesc &desc)
 void
 DxrLinuxWindow::destroy_wayland()
 {
+#ifdef DXR_APP_HAVE_WL_CHROME
+	// Before the content surface: the chrome is its subsurface.
+	m_wl_chrome.destroy();
+#endif
 	if (m_wl_frac != nullptr) {
 		wp_fractional_scale_v1_destroy(m_wl_frac);
 		m_wl_frac = nullptr;
@@ -1661,6 +1710,14 @@ DxrLinuxWindow::pump(const std::function<void(DxrKey)> &on_key, bool *running)
 		}
 		wl_display_flush(m_wl_display);
 
+#ifdef DXR_APP_HAVE_WL_CHROME
+		if (m_wl_chrome.take_close_request()) {
+			m_wl_close_requested = true;
+		}
+		// Hover / focus / scale changes from the dispatch above repaint the
+		// bar here; a no-op when nothing it shows changed.
+		m_wl_chrome.update(m_wl_config_w, m_wl_config_h, wl_surface_scale());
+#endif
 		if (m_wl_close_requested) {
 			m_wl_close_requested = false;
 			DXRW_INFO("Window closed by user — exiting");

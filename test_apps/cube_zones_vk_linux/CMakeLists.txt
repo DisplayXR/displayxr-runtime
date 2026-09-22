@@ -60,7 +60,9 @@ if(NOT OPENXR_FOUND)
 endif()
 
 # Shared scaffolding (stb_image header + impl TU) via displayxr::common, pinned by
-# tag. OpenXR (set up above) is reused, not re-fetched.
+# tag. OpenXR (set up above) is reused, not re-fetched. Also provides
+# displayxr::csd, the title-bar painter the native-Wayland leg of
+# dxr_linux_window draws its chrome with (#1654) — hence >= v2.17.0.
 include(FetchContent)
 set(DISPLAYXR_COMMON_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 get_filename_component(_dxr_ext_includes
@@ -70,8 +72,9 @@ set(DISPLAYXR_EXTENSIONS_INCLUDE_DIR "${_dxr_ext_includes}" CACHE PATH
 FetchContent_Declare(
     displayxr_common
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    GIT_TAG v2.0.0
-    GIT_SHALLOW TRUE
+    # TEMPORARY: displayxr-common feat/csd-titlebar head (displayxr-common#53).
+    # Replace with `GIT_TAG v2.17.0` + `GIT_SHALLOW TRUE` once that is tagged.
+    GIT_TAG 85c7cb3a71134e26447de7218449b890e53c31c7
 )
 FetchContent_MakeAvailable(displayxr_common)
 

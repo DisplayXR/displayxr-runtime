@@ -104,7 +104,12 @@ function(dxr_target_add_linux_window TARGET)
     # basename and the prefix wayland-scanner gives its outputs, and therefore
     # the name the #includes in dxr_linux_window.cpp use. (A list of "a;b"
     # pairs would not survive foreach, which flattens its arguments.)
-    foreach(_stem "xdg-shell" "xdg-output-unstable-v1" "viewporter" "fractional-scale-v1")
+    # xdg-decoration / cursor-shape (+ tablet-v2, which cursor-shape references)
+    # / ext-background-effect (blur behind the translucent bar) serve the title
+    # bar (#1654, dxr_wl_chrome.cpp).
+    foreach(_stem "xdg-shell" "xdg-output-unstable-v1" "viewporter" "fractional-scale-v1"
+                  "xdg-decoration-unstable-v1" "cursor-shape-v1" "tablet-v2"
+                  "ext-background-effect-v1")
         set(_xml "${DXR_LINUX_WINDOW_DIR}/wayland-protocols/${_stem}.xml")
         set(_hdr "${_gen}/${_stem}-client-protocol.h")
         set(_src "${_gen}/${_stem}-protocol.c")
@@ -133,6 +138,21 @@ function(dxr_target_add_linux_window TARGET)
     target_link_libraries(${TARGET} PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
     target_link_directories(${TARGET} PRIVATE ${WAYLAND_CLIENT_LIBRARY_DIRS})
     target_compile_definitions(${TARGET} PRIVATE DXR_APP_HAVE_WAYLAND)
+
+    # Title bar for the native-Wayland leg (#1654): the Wayland glue here, the
+    # painter from displayxr-common's displayxr::csd (the ONE chrome
+    # implementation, shared with the X11 demos — displayxr-common#52). An app
+    # pinned to a displayxr-common older than v2.17.0 has no such target and
+    # simply builds without chrome (the pre-#1654 undecorated window).
+    if(TARGET displayxr::csd)
+        target_sources(${TARGET} PRIVATE "${DXR_LINUX_WINDOW_DIR}/dxr_wl_chrome.cpp")
+        target_link_libraries(${TARGET} PRIVATE displayxr::csd)
+        target_compile_definitions(${TARGET} PRIVATE DXR_APP_HAVE_WL_CHROME)
+        message(STATUS "${TARGET}: Wayland title bar ENABLED (displayxr::csd)")
+    else()
+        message(STATUS "${TARGET}: displayxr::csd NOT available (displayxr-common < v2.17.0) — "
+                       "native-Wayland windows build without a title bar")
+    endif()
 
     message(STATUS "${TARGET}: Wayland backend ENABLED "
                    "(wayland-client ${WAYLAND_CLIENT_VERSION}, scanner ${_scanner})")

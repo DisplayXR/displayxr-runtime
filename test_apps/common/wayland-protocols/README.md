@@ -46,3 +46,25 @@ output — and spills onto the neighbouring monitor.
 `wp_fractional_scale_v1.preferred_scale` supplies the scale for a windowed
 surface; both are optional (the helper falls back to `wl_surface.set_buffer_scale`
 for an integer scale, and to no mapping otherwise).
+
+## xdg-decoration, cursor-shape, tablet-v2, ext-background-effect (#1654)
+
+The window chrome (`test_apps/common/dxr_wl_chrome.cpp`) uses four more
+protocols. All are copied verbatim from wayland-protocols **1.47**, under the
+same MIT terms:
+
+- `xdg-decoration-unstable-v1.xml` (`unstable/xdg-decoration/`): asks for
+  server-side decorations where the compositor offers them. GNOME does not, so
+  there the helper draws its own title bar.
+- `cursor-shape-v1.xml` (`staging/cursor-shape/`): resize and default cursors
+  over the bar and the window edges, with no cursor-theme loading.
+- `tablet-v2.xml` (`stable/tablet/`): only because cursor-shape-v1 references
+  `zwp_tablet_tool_v2`. The generated glue has to define that interface or the
+  link fails. The helper never uses tablets.
+- `ext-background-effect-v1.xml` (`staging/ext-background-effect/`): blurs the
+  background behind the translucent title bar where the compositor supports it.
+  It is the standardised successor of KDE's `org_kde_kwin_blur`. GNOME offers
+  no client blur protocol, so there the bar is plain translucency.
+
+Every one of them is optional at runtime. A missing global only disables the
+corresponding nicety.

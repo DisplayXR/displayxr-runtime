@@ -77,6 +77,19 @@ struct u_wl_rect_px
 };
 
 /*!
+ * A rectangle in LOGICAL pixels (a compositor's global stage coordinates, as
+ * the `window-geometry@displayxr.org` payload carries them). Its own type so
+ * it can never be passed where @ref u_wl_rect_px is expected.
+ *
+ * @ingroup aux_util
+ */
+struct u_wl_rect_logical
+{
+	int32_t logical_x, logical_y;
+	int32_t logical_w, logical_h;
+};
+
+/*!
  * One Wayland output / Mutter monitor, exactly as the two publishers describe
  * it — **all fields logical except `mode_*`**.
  *
@@ -353,6 +366,61 @@ u_wl_present_is_1to1(uint32_t buffer_w_px, uint32_t buffer_h_px, uint32_t dest_w
 		return false;
 	}
 	return buffer_w_px == dest_w_px && buffer_h_px == dest_h_px;
+}
+
+/*!
+ * Where a window's PIXELS are, given the two rects Mutter publishes for it
+ * (#1654): the rect to use for the present origin, the Kooima canvas and the
+ * 1:1 check is the one the client's surface occupies, not the one the user
+ * sees as "the window".
+ *
+ *   - `frame`  is the window geometry (`Meta.Window.get_frame_rect`). With
+ *              client-side decorations it includes the title bar, which the
+ *              client draws in a subsurface ABOVE the bound surface.
+ *   - `buffer` is the main surface (`Meta.Window.get_buffer_rect`) — the very
+ *              surface bound through XR_DXR_wayland_surface_binding, whose
+ *              buffer is the runtime's swapchain.
+ *
+ * Without decorations the two are equal, so preferring the buffer changes
+ * nothing there; with a title bar the frame would put the weave phase, the
+ * canvas and the 1:1 comparison a bar-height off.
+ *
+ * @param buffer  NULL, or a rect with a non-positive size, when the publisher
+ *                did not report one — the frame is then the only answer.
+ * @return true when the buffer rect was chosen.
+ *
+ * @ingroup aux_util
+ */
+static inline bool
+u_wl_window_content_rect(const struct u_wl_rect_logical *frame,
+                         const struct u_wl_rect_logical *buffer,
+                         struct u_wl_rect_logical *out)
+{
+	if (buffer != NULL && buffer->logical_w > 0 && buffer->logical_h > 0) {
+		*out = *buffer;
+		return true;
+	}
+	*out = *frame;
+	return false;
+}
+
+/*!
+ * Whether the committed surface lies inside the window frame (±1 logical px
+ * of rounding). True for an undecorated window (equal rects) and for one with
+ * a client-side title bar (the surface is the frame minus the bar). False is
+ * the signature of a buffer not mapped to its configured size — e.g. a
+ * device-pixel buffer with no wp_viewport destination at 200 %, which makes the
+ * surface twice the frame and spills it onto the next output.
+ *
+ * @ingroup aux_util
+ */
+static inline bool
+u_wl_surface_within_frame(const struct u_wl_rect_logical *frame, const struct u_wl_rect_logical *buffer)
+{
+	const int32_t tol = 1;
+	return buffer->logical_x >= frame->logical_x - tol && buffer->logical_y >= frame->logical_y - tol &&
+	       buffer->logical_x + buffer->logical_w <= frame->logical_x + frame->logical_w + tol &&
+	       buffer->logical_y + buffer->logical_h <= frame->logical_y + frame->logical_h + tol;
 }
 
 #ifdef __cplusplus
