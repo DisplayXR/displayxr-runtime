@@ -1142,6 +1142,24 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 
 	fill_surplus_view_poses(xdev, eye_count, view_count, out_fovs, out_poses);
 
+	/*
+	 * #1674 — tell THIS client's compositor what it is about to be handed.
+	 *
+	 * The client renders its projection layers with these views, and the
+	 * service's UI-layer pass projects quad / cylinder / equirect2 layers into
+	 * the same tile; unless both use this frustum they disagree, and the
+	 * compositor cannot re-derive it (the rig lives here). AFTER
+	 * fill_surplus_view_poses so the surplus views are recorded exactly as the
+	 * client receives them.
+	 *
+	 * A RECORD ONLY — nothing above is re-read, and the reply is byte-for-byte
+	 * what it was. The headless-relay early return above deliberately does not
+	 * record: it hands back raw display-centric eyes and device-default FOVs for
+	 * a client that composes nothing through this service.
+	 */
+	comp_d3d11_service_compositor_record_located_views(xc, at_timestamp_ns, view_count, &out_head_relation->pose,
+	                                                   out_fovs, out_poses);
+
 	return true;
 }
 #endif // XRT_HAVE_D3D11_SERVICE_COMPOSITOR

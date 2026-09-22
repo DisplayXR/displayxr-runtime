@@ -1013,6 +1013,37 @@ void
 comp_d3d11_service_compositor_set_workspace_sync_fence_value(struct xrt_compositor *xc, uint64_t value);
 
 /*!
+ * #1674 — record the per-view `{pose, fov}` the IPC server is about to hand this
+ * client at `xrLocateViews`, so the service's UI-layer pass can compose quad /
+ * cylinder / equirect2 layers through the SAME camera the client rendered its
+ * projection layers with.
+ *
+ * Called from `ipc_try_get_sr_view_poses()` once it has produced a view set, on
+ * the client's own IPC thread. It RECORDS only — the reply the client receives is
+ * unchanged, and nothing here feeds back into the rig math.
+ *
+ * @p poses are HEAD-LOCAL (`T_head_view`), exactly as the reply carries them, and
+ * @p head_pose is the `out_head_relation` pose they are relative to
+ * (`T_root_head`). The consumer does the lift, the same one
+ * `comp_layer_view_camera_select_eyes()` branch (b) does (#1594) — see
+ * comp_d3d11_service_located_views.h.
+ *
+ * No-op when @p xc is not a D3D11 service compositor, so the IPC handler stays
+ * indifferent to the backend.
+ *
+ * @param display_time_ns The locate's display time in monotonic ns — the clock
+ *                        `xrt_layer_frame_data::display_time_ns` is in, which is
+ *                        how a commit finds ITS frame's views.
+ */
+void
+comp_d3d11_service_compositor_record_located_views(struct xrt_compositor *xc,
+                                                   int64_t display_time_ns,
+                                                   uint32_t view_count,
+                                                   const struct xrt_pose *head_pose,
+                                                   const struct xrt_fov *fovs,
+                                                   const struct xrt_pose *poses);
+
+/*!
  * #551 — export the per-client SHARED transparent-output texture handle (+ its
  * pixel dims) for the IPC client to import and present transparently via its
  * own DirectComposition swap chain. Returns false when @p xc is not a D3D11

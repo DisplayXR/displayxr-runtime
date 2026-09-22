@@ -247,9 +247,12 @@ target_link_libraries(tests_comp_layer_view_camera PRIVATE xrt-interfaces aux_ma
 # backend sources as text (no device to render with), so it needs the compositor
 # root as a path. PROJECT_SOURCE_DIR, not CMAKE_SOURCE_DIR: the vendor plug-in's
 # signing recipe builds this runtime as a sub-project.
+# #1674 adds the IPC server root for the same reason: the guard that the server
+# RECORDS the views it hands a client reads ipc_server_handler.c as text.
 target_compile_definitions(
 	tests_comp_layer_view_camera
 	PRIVATE "DXR_COMP_SRC_DIR=\"${PROJECT_SOURCE_DIR}/src/xrt/compositor\""
+		"DXR_IPC_SRC_DIR=\"${PROJECT_SOURCE_DIR}/src/xrt/ipc\""
 	)
 
 if(TARGET tests_input_host_geometry)

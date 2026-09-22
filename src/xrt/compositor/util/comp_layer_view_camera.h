@@ -85,6 +85,18 @@ enum comp_layer_view_camera_source
 	 * frame's display time, not a re-derivation of it.
 	 */
 	COMP_LAYER_VIEW_CAMERA_FROM_FRAME = 3,
+	/*!
+	 * #1674: the views the IPC SERVICE handed this client at `xrLocateViews`
+	 * for this frame, recorded server-side as it replied
+	 * (`ipc_try_get_sr_view_poses()` →
+	 * @ref comp_d3d11_service_located_views_record).
+	 *
+	 * NEVER produced by this resolver — an out-of-process caller stamps it
+	 * after the fact, when it has a record of its own that outranks branch
+	 * (b)'s display-centric synthesis. The value exists so such a camera does
+	 * not masquerade as a re-derivation.
+	 */
+	COMP_LAYER_VIEW_CAMERA_FROM_SERVICE_LOCATE = 4,
 };
 
 /*!

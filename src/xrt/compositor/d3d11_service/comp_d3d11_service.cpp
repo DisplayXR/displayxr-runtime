@@ -8,6 +8,8 @@
  */
 
 #include "comp_d3d11_service.h"
+// #1674: the views the IPC server handed this client, kept for its own commit.
+#include "comp_d3d11_service_located_views.h"
 #include "comp_eye_dp_policy.h"
 #include "d3d11_service_shaders.h"
 #include "d3d11_bitmap_font.h"
@@ -945,6 +947,26 @@ struct d3d11_service_compositor
 
 	//! Accumulated layers for the current frame
 	struct comp_layer_accum layer_accum;
+
+	/*!
+	 * #1674 — the views the IPC server last handed THIS client at
+	 * `xrLocateViews`, i.e. the camera it rendered its projection layers with.
+	 * The UI-layer pass in compositor_layer_commit() composes through these
+	 * rather than re-deriving a display-centric Kooima frustum from the DP eye
+	 * and the client's window metrics, which is a different frustum for every
+	 * rig but the Kooima-from-window one. See
+	 * comp_d3d11_service_located_views.h.
+	 */
+	struct comp_d3d11_service_located_view_ring located_views;
+
+	/*!
+	 * Guards @ref located_views. The locate handler and the layer-sync handler
+	 * are both this client's IPC thread today, so it is never contended — it is
+	 * here because "today" is a property of the IPC dispatch, not of this file,
+	 * and the ring is a multi-word record. Its own lock, not @ref mutex, which
+	 * compositor_layer_commit() takes around the whole commit.
+	 */
+	std::mutex located_views_mutex;
 
 	//! Logging level
 	enum u_logging_level log_level;
@@ -17060,6 +17082,104 @@ service_ui_pass_layout(struct d3d11_service_system *sys,
 }
 
 /*!
+ * #1674 — the UI pass's camera is the one the CLIENT was handed, not a
+ * re-derivation of it.
+ *
+ * TWO AUTHORITIES, one frame. The client rendered its projection layers with
+ * the views this service handed it at `xrLocateViews` —
+ * `ipc_try_get_sr_view_poses()` in ipc_server_handler.c, whose frustum is
+ * whatever rig that client runs (a camera rig, a chained `XR_DXR_view_rig`, the
+ * workspace override, the qwerty synthesis). Those pixels arrive as an
+ * identity-MVP blit, so the view tile IS that frustum. The UI pass PROJECTS its
+ * layers and needs a camera, and `comp_layer_view_camera_select_eyes()` answers
+ * from the frame when it can: the app's own projection layer (branch a) or the
+ * cameras the state tracker carries (branch b'). When it cannot, branch (b)
+ * synthesises a DISPLAY-centric Kooima frustum from the DP eye and this client's
+ * window metrics — which equals the client's rig only when that rig IS the
+ * Kooima-from-window one. For any other rig the quad is composed through a
+ * frustum the client never rendered with, and lands at a different size than the
+ * projection content at the same world pose.
+ *
+ * THE RULE: the frame's own authorities win (they are literally what
+ * `xrLocateViews` returned, measured by the one component that knows the
+ * session's rig — and that is what the in-process D3D11 renderer composes with),
+ * then the server's own record of what it handed this client, then the
+ * synthesis. So this only ever replaces branch (b) / the placeholder; a
+ * Kooima-from-window rig is unchanged either way, because there the record and
+ * the synthesis are the same frustum computed from the same inputs.
+ *
+ * THE LIFT, ONCE, AND WITH THE HEAD THE VIEWS CAME WITH. The handed poses are
+ * HEAD-LOCAL (`T_head_view`) and the layer frame is ROOT (#1594), so exactly one
+ * `T_root_head` applies. It is the RECORDED one — `out_head_relation` from the
+ * same reply — not `xrt_layer_frame_data::head_pose`, because the client composed
+ * its own views against exactly that pose and the two are not always the same
+ * value: the display-centric path returns an IDENTITY head relation for a client
+ * the runtime does not own the qwerty head for, while the state tracker's
+ * `head_pose` is the head device's tracked pose. Lifting with the frame's head
+ * there would displace the camera by the difference. Applying both lifts would be
+ * the #1613 double-apply; applying neither puts a LOCAL quad a whole head pose
+ * wrong.
+ */
+static void
+service_ui_cameras_from_client_views(struct d3d11_service_compositor *c,
+                                     uint32_t view_count,
+                                     struct comp_layer_view_camera *cameras)
+{
+	if (c == nullptr || cameras == nullptr || view_count == 0) {
+		return;
+	}
+
+	struct comp_d3d11_service_located_views handed = {};
+	{
+		std::lock_guard<std::mutex> lock(c->located_views_mutex);
+		const struct comp_d3d11_service_located_views *found =
+		    comp_d3d11_service_located_views_for_frame(&c->located_views, c->layer_accum.data.display_time_ns);
+		if (found == nullptr) {
+			// A client the SR view-pose path never served (device-default
+			// view poses, a non-D3D11-service backend). Nothing recorded,
+			// nothing to prefer — the resolver's answer stands.
+			return;
+		}
+		handed = *found;
+	}
+
+	const struct xrt_pose *lift = &handed.head_pose;
+
+	bool applied = false;
+	for (uint32_t view = 0; view < view_count && view < XRT_MAX_VIEWS && view < handed.count; view++) {
+		if (cameras[view].source == COMP_LAYER_VIEW_CAMERA_FROM_PROJECTION ||
+		    cameras[view].source == COMP_LAYER_VIEW_CAMERA_FROM_FRAME) {
+			continue;
+		}
+
+		const struct xrt_pose head_local = handed.poses[view];
+		math_pose_transform(lift, &head_local, &cameras[view].pose);
+		cameras[view].fov = handed.fovs[view];
+		cameras[view].source = COMP_LAYER_VIEW_CAMERA_FROM_SERVICE_LOCATE;
+		cameras[view].head_relative_fallback = false;
+		applied = true;
+	}
+
+	if (!applied) {
+		return;
+	}
+
+	// Once per process — the discriminator for "did the UI pass and the client
+	// agree on the camera this session?", never a per-frame line
+	// (docs/reference/debug-logging.md).
+	static bool logged = false;
+	if (!logged) {
+		logged = true;
+		const float h = (handed.fovs[0].angle_right - handed.fovs[0].angle_left) * 180.0f / (float)M_PI;
+		const float v = (handed.fovs[0].angle_up - handed.fovs[0].angle_down) * 180.0f / (float)M_PI;
+		U_LOG_W(
+		    "#1674: UI pass composing with the client's handed-out views (fov H=%.1f° V=%.1f°) instead of "
+		    "window-metrics Kooima",
+		    (double)h, (double)v);
+	}
+}
+
+/*!
  * Has the client's GPU reached `signaled` on its workspace_sync_fence?
  *
  * #922 replaced the original "queue an `ID3D11DeviceContext4::Wait`" design
@@ -21103,6 +21223,17 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		}
 
 		/*
+		 * #1674 — and where the resolver had to SYNTHESISE a camera (no
+		 * projection layer covering the view, no frame cameras — the
+		 * `XR_DXR_view_rig` bail-out in oxr_session_frame_view_cameras(), a
+		 * mono client under a multi-tile atlas, a warm-up frame), the canvas
+		 * metrics above are NOT this client's frustum: it rendered with the
+		 * views this service handed it at `xrLocateViews`. Prefer those; see
+		 * the helper for the ordering rule and the single head -> root lift.
+		 */
+		service_ui_cameras_from_client_views(c, ui_view_count, ui_cameras);
+
+		/*
 		 * #1598 — this pass carries NO painter's-order tile state, and
 		 * that is the rule, not an omission.
 		 *
@@ -22712,6 +22843,23 @@ comp_d3d11_service_compositor_set_workspace_sync_fence_value(struct xrt_composit
 	}
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 	c->last_signaled_fence_value.store(value, std::memory_order_release);
+}
+
+extern "C" void
+comp_d3d11_service_compositor_record_located_views(struct xrt_compositor *xc,
+                                                   int64_t display_time_ns,
+                                                   uint32_t view_count,
+                                                   const struct xrt_pose *head_pose,
+                                                   const struct xrt_fov *fovs,
+                                                   const struct xrt_pose *poses)
+{
+	if (xc == nullptr || xc->destroy != compositor_destroy) {
+		return;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+
+	std::lock_guard<std::mutex> lock(c->located_views_mutex);
+	comp_d3d11_service_located_views_record(&c->located_views, display_time_ns, view_count, head_pose, fovs, poses);
 }
 
 // #551 — export the shared transparent-output texture handle (+ its dims) for

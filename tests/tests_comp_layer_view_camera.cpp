@@ -1593,3 +1593,172 @@ TEST_CASE("the D3D11 paths consult the shared facing and painter's rules (#1590,
 		CHECK(src.find("comp_layer_subrect_blend_mode(") != std::string::npos);
 	}
 }
+
+/*
+ * #1674 — the D3D11 service's third authority: the views the IPC server handed
+ * a client at `xrLocateViews`.
+ *
+ * The resolver above answers from the FRAME. Where it cannot — no projection
+ * layer covering the view and no frame cameras (the `XR_DXR_view_rig` bail-out
+ * in oxr_session_frame_view_cameras(), a warm-up locate, a view the client
+ * under-submitted) — branch (b) synthesises a display-centric Kooima frustum
+ * from the DP eye and the client's window metrics, which is the client's rig
+ * ONLY when the rig is that same Kooima-from-window one. So the service keeps a
+ * record of what it handed out and prefers it to the synthesis.
+ *
+ * The record and its lookup are pure, so they are pinned here rather than left
+ * to a hardware leg; the compositor-side application of them (which camera a
+ * given frame ends up with) needs a D3D11 device and is text-scanned below.
+ */
+
+#include "d3d11_service/comp_d3d11_service_located_views.h"
+
+namespace {
+
+struct xrt_fov
+make_fov(float h_rad)
+{
+	struct xrt_fov fov = {};
+	fov.angle_left = -h_rad * 0.5f;
+	fov.angle_right = h_rad * 0.5f;
+	fov.angle_up = h_rad * 0.25f;
+	fov.angle_down = -h_rad * 0.25f;
+	return fov;
+}
+
+void
+record(struct comp_d3d11_service_located_view_ring &ring, int64_t t, float h_rad, float x)
+{
+	struct xrt_fov fovs[2] = {make_fov(h_rad), make_fov(h_rad)};
+	struct xrt_pose poses[2] = {};
+	poses[0].orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+	poses[1].orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+	poses[0].position = {-x, 0.0f, 0.0f};
+	poses[1].position = {x, 0.0f, 0.0f};
+
+	struct xrt_pose head = {};
+	head.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+	head.position = {0.0f, 1.6f, 0.0f};
+
+	comp_d3d11_service_located_views_record(&ring, t, 2, &head, fovs, poses);
+}
+
+} // namespace
+
+TEST_CASE("located views: an empty ring has nothing to offer (#1674)")
+{
+	struct comp_d3d11_service_located_view_ring ring = {};
+
+	CHECK(comp_d3d11_service_located_views_for_frame(&ring, 0) == nullptr);
+	CHECK(comp_d3d11_service_located_views_for_frame(&ring, 12345) == nullptr);
+	CHECK(comp_d3d11_service_located_views_for_frame(nullptr, 12345) == nullptr);
+}
+
+TEST_CASE("located views: a commit finds ITS frame, not the newest one (#1674)")
+{
+	struct comp_d3d11_service_located_view_ring ring = {};
+
+	record(ring, 1000, 1.0472f, 0.032f); // 60 deg
+	record(ring, 2000, 0.5585f, 0.031f); // 32 deg
+	record(ring, 3000, 0.7854f, 0.030f); // 45 deg
+
+	const struct comp_d3d11_service_located_views *got = comp_d3d11_service_located_views_for_frame(&ring, 1000);
+	REQUIRE(got != nullptr);
+	CHECK(got->display_time_ns == 1000);
+	CHECK(got->count == 2);
+	CHECK(got->fovs[0].angle_right == Catch::Approx(0.5236f).margin(kEps));
+	CHECK(got->poses[1].position.x == Catch::Approx(0.032f).margin(kEps));
+
+	// The head the views are relative to rides along: the lift into the layer
+	// frame is the consumer's, and it must use THIS head (#1594/#1613).
+	CHECK(got->head_pose.position.y == Catch::Approx(1.6f).margin(kEps));
+
+	const struct comp_d3d11_service_located_views *mid = comp_d3d11_service_located_views_for_frame(&ring, 2000);
+	REQUIRE(mid != nullptr);
+	CHECK(mid->display_time_ns == 2000);
+}
+
+TEST_CASE("located views: an unmatched display time falls back to the newest set (#1674)")
+{
+	struct comp_d3d11_service_located_view_ring ring = {};
+
+	record(ring, 1000, 1.0472f, 0.032f);
+	record(ring, 2000, 0.5585f, 0.031f);
+
+	// Nothing in OpenXR makes xrEndFrame's display time equal the one the app
+	// located with, so the miss must still land on the right RIG — the newest
+	// set — rather than on nothing.
+	const struct comp_d3d11_service_located_views *got = comp_d3d11_service_located_views_for_frame(&ring, 4242);
+	REQUIRE(got != nullptr);
+	CHECK(got->display_time_ns == 2000);
+}
+
+TEST_CASE("located views: the ring forgets in order, and only the oldest (#1674)")
+{
+	struct comp_d3d11_service_located_view_ring ring = {};
+
+	for (uint32_t i = 0; i < COMP_D3D11_SERVICE_LOCATED_VIEW_SLOTS + 1; i++) {
+		record(ring, 1000 + (int64_t)i, 1.0472f, 0.032f);
+	}
+
+	// The first record has been overwritten; every later one is still findable,
+	// and the newest is the fallback.
+	CHECK(comp_d3d11_service_located_views_for_frame(&ring, 1000)->display_time_ns ==
+	      1000 + COMP_D3D11_SERVICE_LOCATED_VIEW_SLOTS);
+	for (uint32_t i = 1; i <= COMP_D3D11_SERVICE_LOCATED_VIEW_SLOTS; i++) {
+		const int64_t t = 1000 + (int64_t)i;
+		INFO("slot " << i << " (display time " << t << ") must still be its own frame");
+		CHECK(comp_d3d11_service_located_views_for_frame(&ring, t)->display_time_ns == t);
+	}
+}
+
+TEST_CASE("located views: an empty hand-out never shadows a usable one (#1674)")
+{
+	struct comp_d3d11_service_located_view_ring ring = {};
+
+	record(ring, 1000, 1.0472f, 0.032f);
+
+	struct xrt_fov fov = make_fov(1.0472f);
+	struct xrt_pose pose = {};
+	comp_d3d11_service_located_views_record(&ring, 2000, 0, nullptr, &fov, &pose);
+
+	const struct comp_d3d11_service_located_views *got = comp_d3d11_service_located_views_for_frame(&ring, 2000);
+	REQUIRE(got != nullptr);
+	CHECK(got->display_time_ns == 1000);
+}
+
+/*
+ * #1674 — the structural half: the service's UI pass must actually prefer that
+ * record to the window-metrics synthesis. Which camera a frame ends up with
+ * needs a D3D11 device and a live IPC client, so what is pinnable here is that
+ * the two ends are wired: the IPC server records what it hands out, and the
+ * compositor consults it. Same file-read reasoning as the #1581 / #1621 guards.
+ */
+TEST_CASE("the D3D11 service composes UI layers with the client's handed-out views (#1674)")
+{
+	{
+		const std::string path = std::string(DXR_COMP_SRC_DIR) + "/d3d11_service/comp_d3d11_service.cpp";
+		const std::string src = read_whole_file(path);
+
+		INFO(
+		    "the service's UI pass never consults the views the client was handed - quad / cylinder / "
+		    "equirect2 would be composed through a window-metrics Kooima frustum the client never "
+		    "rendered with (#1674)");
+		CHECK(src.find("service_ui_cameras_from_client_views(c,") != std::string::npos);
+
+		INFO(
+		    "the handed-out poses are HEAD-LOCAL; without the lift a LOCAL-space quad lands a whole "
+		    "head pose wrong (#1594), and lifting twice is the #1613 double-apply");
+		CHECK(src.find("math_pose_transform(lift,") != std::string::npos);
+	}
+
+	{
+		const std::string path = std::string(DXR_IPC_SRC_DIR) + "/server/ipc_server_handler.c";
+		const std::string src = read_whole_file(path);
+
+		INFO(
+		    "ipc_try_get_sr_view_poses() hands a client its views and records nothing - the compositor "
+		    "has no way to reach the rig it was given (#1674)");
+		CHECK(src.find("comp_d3d11_service_compositor_record_located_views(") != std::string::npos);
+	}
+}
