@@ -3992,7 +3992,15 @@ vk_linux_update_surface_not_1to1(struct comp_vk_native_compositor *c)
 	//      desktop hands the weaver an image to be upscaled by 5/3.
 	const bool on_panel = (wr.monitor_width_px == panel_px_w && wr.monitor_height_px == panel_px_h);
 	const bool fits_window = u_wl_present_is_1to1(buf_px_w, buf_px_h, wr.width_px, wr.height_px);
-	const bool not_1to1 = !on_panel || !fits_window;
+	//  (c) the buffer matches the window, but the compositor did not paint it
+	//      AT the window: the committed surface (buffer rect) is another size,
+	//      because the client mapped no viewport / buffer scale onto it. The
+	//      frame then reads right while the surface spills past the output —
+	//      measured on a 3840x2160 panel at 200 %: frame 1920x1080, buffer 3840x2160 at
+	//      scale 1, i.e. a surface twice the output. Unknown (0) never degrades.
+	const bool fits_surface = wr.surface_width_px == 0 || wr.surface_height_px == 0 ||
+	                          u_wl_present_is_1to1(buf_px_w, buf_px_h, wr.surface_width_px, wr.surface_height_px);
+	const bool not_1to1 = !on_panel || !fits_window || !fits_surface;
 
 	if (not_1to1 == c->linux_surface_not_1to1) {
 		return;
@@ -4006,8 +4014,9 @@ vk_linux_update_surface_not_1to1(struct comp_vk_native_compositor *c)
 		    "NOT_1TO1: presenting 2D (no weave) — %s. buffer %ux%u px, surface %ux%u px on a %ux%u px "
 		    "output, 3D panel %ux%u px. A resampled weave is a uniform double image; flat 2D is "
 		    "correct content and recovers as soon as the session is 1:1. (#1595)",
-		    !on_panel ? "this surface is not on the 3D panel"
-		              : "the buffer is not the size of the region the compositor paints it into",
+		    !on_panel       ? "this surface is not on the 3D panel"
+		    : !fits_surface ? "the committed surface is not the window's size (buffer not mapped to it)"
+		                    : "the buffer is not the size of the region the compositor paints it into",
 		    buf_px_w, buf_px_h, wr.width_px, wr.height_px, wr.monitor_width_px, wr.monitor_height_px,
 		    panel_px_w, panel_px_h);
 	} else {

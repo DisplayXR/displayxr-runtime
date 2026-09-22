@@ -76,6 +76,11 @@ struct wlg_window
 	float mon_scale;
 	//! False when Mutter published no `monitor` object (window on no monitor).
 	bool have_monitor;
+	//! Buffer rect SIZE, LOGICAL px (Meta.Window.get_buffer_rect): the size
+	//! the compositor actually gives the committed surface, as opposed to the
+	//! frame the toplevel was configured to. False when not published.
+	int32_t buffer_logical_w, buffer_logical_h;
+	bool have_buffer;
 };
 
 #define WLG_MAX_WINDOWS 64
@@ -91,6 +96,8 @@ struct comp_vk_native_wl_geom
 	bool warned_scale;       //!< one-shot INFO guard (says which scale is being applied)
 	bool warned_schema;      //!< one-shot WARN guard (publisher schema too new)
 	bool warned_no_monitor;  //!< one-shot WARN guard (payload carried no monitor rect)
+	//! Last surface-vs-frame comparison logged (logical px), on change only.
+	int32_t logged_surface_w, logged_surface_h, logged_frame_w, logged_frame_h;
 	int64_t next_retry_ns;   //!< earliest monotonic time for the next blocking GetWindows retry
 };
 
@@ -163,6 +170,13 @@ wlg_parse_snapshot(struct comp_vk_native_wl_geom *g, const char *json)
 		out->logical_y = (int32_t)cJSON_GetArrayItem(frame, 1)->valuedouble;
 		out->logical_w = (int32_t)cJSON_GetArrayItem(frame, 2)->valuedouble;
 		out->logical_h = (int32_t)cJSON_GetArrayItem(frame, 3)->valuedouble;
+
+		const cJSON *buffer = u_json_get(win, "buffer");
+		if (cJSON_IsArray(buffer) && cJSON_GetArraySize(buffer) == 4) {
+			out->buffer_logical_w = (int32_t)cJSON_GetArrayItem(buffer, 2)->valuedouble;
+			out->buffer_logical_h = (int32_t)cJSON_GetArrayItem(buffer, 3)->valuedouble;
+			out->have_buffer = out->buffer_logical_w > 0 && out->buffer_logical_h > 0;
+		}
 
 		bool focus = false;
 		u_json_get_bool(u_json_get(win, "focus"), &focus);
@@ -585,6 +599,50 @@ comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g, struct 
 	out_rect->monitor_width_px = (uint32_t)mon_w_px;
 	out_rect->monitor_height_px = (uint32_t)mon_h_px;
 	out_rect->scale = best->mon_scale;
+
+	/*
+	 * The committed SURFACE, which is not necessarily the frame above. The
+	 * frame is what the toplevel was configured to; the buffer rect is what
+	 * the compositor actually sized the surface to from the attached buffer,
+	 * its buffer scale and its viewport. They differ when the client attaches
+	 * a device-pixel buffer with no wp_viewport destination and no
+	 * wl_surface.set_buffer_scale: at 200 % a 3840x2160 buffer then IS a
+	 * 3840x2160-logical surface, twice the output, and spills onto the next
+	 * monitor while the frame still reads 1920x1080. Logged on change so a
+	 * run can never again look right in the log and wrong on the glass.
+	 */
+	out_rect->surface_width_px = 0;
+	out_rect->surface_height_px = 0;
+	if (best->have_buffer) {
+		out_rect->surface_width_px =
+		    (uint32_t)u_wl_logical_to_px(best->buffer_logical_w, (double)best->mon_scale);
+		out_rect->surface_height_px =
+		    (uint32_t)u_wl_logical_to_px(best->buffer_logical_h, (double)best->mon_scale);
+		if (best->buffer_logical_w != g->logged_surface_w || best->buffer_logical_h != g->logged_surface_h ||
+		    best->logical_w != g->logged_frame_w || best->logical_h != g->logged_frame_h) {
+			g->logged_surface_w = best->buffer_logical_w;
+			g->logged_surface_h = best->buffer_logical_h;
+			g->logged_frame_w = best->logical_w;
+			g->logged_frame_h = best->logical_h;
+			const bool match = abs(best->buffer_logical_w - best->logical_w) <= 1 &&
+			                   abs(best->buffer_logical_h - best->logical_h) <= 1;
+			if (match) {
+				U_LOG_I("wl_geom: committed surface %dx%d logical matches the window frame %dx%d",
+				        best->buffer_logical_w, best->buffer_logical_h, best->logical_w,
+				        best->logical_h);
+			} else {
+				U_LOG_W(
+				    "wl_geom: committed SURFACE is %dx%d logical but the window FRAME is %dx%d — the "
+				    "attached buffer is not mapped to the configured size (the client set no "
+				    "wp_viewport "
+				    "destination / wl_surface.set_buffer_scale matching it), so the window on screen "
+				    "is the "
+				    "surface size, not the frame. (Monitor scale %.4f.)",
+				    best->buffer_logical_w, best->buffer_logical_h, best->logical_w, best->logical_h,
+				    (double)best->mon_scale);
+			}
+		}
+	}
 	return true;
 }
 
