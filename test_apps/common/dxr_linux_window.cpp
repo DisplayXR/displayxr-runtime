@@ -22,6 +22,8 @@
 #ifdef DXR_APP_HAVE_WAYLAND
 #include "xdg-shell-client-protocol.h"
 #include "xdg-output-unstable-v1-client-protocol.h"
+#include "viewporter-client-protocol.h"
+#include "fractional-scale-v1-client-protocol.h"
 // THE logical->device conversion, shared verbatim with the runtime so the
 // app's output match and the runtime's window-rect conversion cannot drift
 // apart (#1595/#1596). Header-only; see src/xrt/auxiliary/util/.
@@ -760,6 +762,12 @@ DxrLinuxWindow::s_registry_global(void *data, struct wl_registry *r, uint32_t na
 		    s_seat_name,
 		};
 		wl_seat_add_listener(self->m_wl_seat, &kSeatListener, self);
+	} else if (strcmp(iface, wp_viewporter_interface.name) == 0) {
+		self->m_wl_viewporter =
+		    static_cast<struct wp_viewporter *>(wl_registry_bind(r, name, &wp_viewporter_interface, 1));
+	} else if (strcmp(iface, wp_fractional_scale_manager_v1_interface.name) == 0) {
+		self->m_wl_frac_manager = static_cast<struct wp_fractional_scale_manager_v1 *>(
+		    wl_registry_bind(r, name, &wp_fractional_scale_manager_v1_interface, 1));
 	} else if (strcmp(iface, zxdg_output_manager_v1_interface.name) == 0) {
 		// #1596. Core wl_output cannot express a fractional scale, so without
 		// this the app has no way to convert a logical origin into the device
@@ -832,6 +840,26 @@ DxrLinuxWindow::s_xdg_surface_configure(void *data, struct xdg_surface *s, uint3
 	auto *self = static_cast<DxrLinuxWindow *>(data);
 	xdg_surface_ack_configure(s, serial);
 	self->m_wl_configured = true;
+	// The configure size may have changed: re-map the declared buffer onto it.
+	// Pending state; Mesa's WSI commits it with its next present (before the
+	// session, the first present is the first commit that carries a buffer).
+	self->wl_apply_buffer_mapping();
+}
+
+void
+DxrLinuxWindow::s_frac_preferred_scale(void *data, struct wp_fractional_scale_v1 *f, uint32_t scale_120)
+{
+	(void)f;
+	auto *self = static_cast<DxrLinuxWindow *>(data);
+	if (scale_120 == 0 || scale_120 == self->m_wl_pref_scale_120) {
+		return;
+	}
+	DXRW_INFO("Wayland: compositor's preferred surface scale %.4f (wp_fractional_scale_v1)",
+	          (double)scale_120 / 120.0);
+	self->m_wl_pref_scale_120 = scale_120;
+	// A windowed surface's declared buffer is configure x this scale, so the
+	// mapping (and, in pump(), the runtime's declared geometry) follows it.
+	self->wl_apply_buffer_mapping();
 }
 
 void
@@ -1170,6 +1198,20 @@ DxrLinuxWindow::create_wayland(const DxrLinuxWindowDesc &desc)
 		DXRW_ERROR("wl_compositor_create_surface failed");
 		return false;
 	}
+	if (m_wl_viewporter != nullptr) {
+		m_wl_viewport = wp_viewporter_get_viewport(m_wl_viewporter, m_wl_surface);
+	}
+	if (m_wl_frac_manager != nullptr) {
+		m_wl_frac = wp_fractional_scale_manager_v1_get_fractional_scale(m_wl_frac_manager, m_wl_surface);
+		static const struct wp_fractional_scale_v1_listener kFracListener = {
+		    s_frac_preferred_scale,
+		};
+		wp_fractional_scale_v1_add_listener(m_wl_frac, &kFracListener, this);
+	}
+	DXRW_INFO("Wayland: buffer mapping via %s; preferred scale via %s",
+	          m_wl_viewport != nullptr ? "wp_viewport destination"
+	                                   : "wl_surface.set_buffer_scale (integer scales only — wp_viewporter absent)",
+	          m_wl_frac != nullptr ? "wp_fractional_scale_v1" : "nothing (windowed surfaces assume scale 1)");
 
 	m_wl_xdg_surface = xdg_wm_base_get_xdg_surface(m_wl_wm_base, m_wl_surface);
 	static const struct xdg_surface_listener kXdgSurfaceListener = {
@@ -1383,6 +1425,22 @@ DxrLinuxWindow::create_wayland(const DxrLinuxWindowDesc &desc)
 void
 DxrLinuxWindow::destroy_wayland()
 {
+	if (m_wl_frac != nullptr) {
+		wp_fractional_scale_v1_destroy(m_wl_frac);
+		m_wl_frac = nullptr;
+	}
+	if (m_wl_viewport != nullptr) {
+		wp_viewport_destroy(m_wl_viewport);
+		m_wl_viewport = nullptr;
+	}
+	if (m_wl_frac_manager != nullptr) {
+		wp_fractional_scale_manager_v1_destroy(m_wl_frac_manager);
+		m_wl_frac_manager = nullptr;
+	}
+	if (m_wl_viewporter != nullptr) {
+		wp_viewporter_destroy(m_wl_viewporter);
+		m_wl_viewporter = nullptr;
+	}
 	if (m_wl_toplevel != nullptr) {
 		xdg_toplevel_destroy(m_wl_toplevel);
 		m_wl_toplevel = nullptr;
@@ -1737,14 +1795,71 @@ DxrLinuxWindow::wl_declared_size(uint32_t *w, uint32_t *h) const
 		*h = (uint32_t)m_wl_fullscreen_mode_h;
 		return;
 	}
-	// Windowed (or fullscreen with no output match): the configure size is the
-	// only thing known. It equals the buffer size at desktop scale 1.0, which
-	// is the only scale at which a Wayland weave can be 1:1 anyway — #817 has
-	// the runtime refuse window geometry at any other scale.
+	// Windowed (or fullscreen with no output match): the configure size (the
+	// LOGICAL size the compositor will paint) times the surface's preferred
+	// scale from wp_fractional_scale_v1 — the device-pixel buffer that the
+	// wp_viewport destination then maps 1:1 onto that region. Before the
+	// compositor has sent a preferred scale (it does once the surface enters
+	// an output) this is the configure size, and the runtime's 1:1 gate keeps
+	// the session flat until the scale arrives and the declaration follows.
 	if (m_wl_config_w > 0 && m_wl_config_h > 0) {
-		*w = (uint32_t)m_wl_config_w;
-		*h = (uint32_t)m_wl_config_h;
+		double scale = 1.0;
+		// A fractional buffer size needs the viewport; an integer scale can
+		// also be expressed with set_buffer_scale.
+		if (m_wl_pref_scale_120 > 0 &&
+		    (m_wl_viewport != nullptr || m_wl_pref_scale_120 % 120 == 0)) {
+			scale = (double)m_wl_pref_scale_120 / 120.0;
+		}
+		*w = (uint32_t)((double)m_wl_config_w * scale + 0.5);
+		*h = (uint32_t)((double)m_wl_config_h * scale + 0.5);
 	}
+#endif
+}
+
+void
+DxrLinuxWindow::wl_apply_buffer_mapping()
+{
+#ifdef DXR_APP_HAVE_WAYLAND
+	if (m_wl_surface == nullptr || m_wl_config_w <= 0 || m_wl_config_h <= 0) {
+		return;
+	}
+	uint32_t bw = 0, bh = 0;
+	wl_declared_size(&bw, &bh);
+	if (bw == 0 || bh == 0) {
+		return;
+	}
+	if (m_wl_viewport != nullptr) {
+		// Destination = the configure size, whatever the buffer is: the
+		// compositor scales the whole buffer onto exactly the configured
+		// region, which is 1:1 whenever the buffer is logical x scale.
+		if (m_wl_config_w == m_wl_map_dst_w && m_wl_config_h == m_wl_map_dst_h) {
+			return;
+		}
+		wp_viewport_set_destination(m_wl_viewport, m_wl_config_w, m_wl_config_h);
+		m_wl_map_dst_w = m_wl_config_w;
+		m_wl_map_dst_h = m_wl_config_h;
+		DXRW_INFO("Wayland: %ux%u buffer -> wp_viewport destination %dx%d logical", bw, bh, m_wl_config_w,
+		          m_wl_config_h);
+		return;
+	}
+	// No viewporter: only an exact integer ratio can be expressed.
+	int32_t scale = 1;
+	if (bw % (uint32_t)m_wl_config_w == 0 && bh % (uint32_t)m_wl_config_h == 0 &&
+	    bw / (uint32_t)m_wl_config_w == bh / (uint32_t)m_wl_config_h) {
+		scale = (int32_t)(bw / (uint32_t)m_wl_config_w);
+	} else {
+		DXRW_WARN("Wayland: %ux%u buffer for a %dx%d logical surface is not an integer scale and "
+		          "wp_viewporter is absent — the compositor cannot map it 1:1; the surface will be "
+		          "the wrong size and the runtime will present flat 2D.",
+		          bw, bh, m_wl_config_w, m_wl_config_h);
+	}
+	if (scale == m_wl_map_buffer_scale) {
+		return;
+	}
+	wl_surface_set_buffer_scale(m_wl_surface, scale);
+	m_wl_map_buffer_scale = scale;
+	DXRW_INFO("Wayland: %ux%u buffer -> wl_surface.set_buffer_scale(%d) for %dx%d logical", bw, bh, scale,
+	          m_wl_config_w, m_wl_config_h);
 #endif
 }
 

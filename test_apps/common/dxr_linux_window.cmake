@@ -104,7 +104,7 @@ function(dxr_target_add_linux_window TARGET)
     # basename and the prefix wayland-scanner gives its outputs, and therefore
     # the name the #includes in dxr_linux_window.cpp use. (A list of "a;b"
     # pairs would not survive foreach, which flattens its arguments.)
-    foreach(_stem "xdg-shell" "xdg-output-unstable-v1")
+    foreach(_stem "xdg-shell" "xdg-output-unstable-v1" "viewporter" "fractional-scale-v1")
         set(_xml "${DXR_LINUX_WINDOW_DIR}/wayland-protocols/${_stem}.xml")
         set(_hdr "${_gen}/${_stem}-client-protocol.h")
         set(_src "${_gen}/${_stem}-protocol.c")

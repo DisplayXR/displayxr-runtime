@@ -32,3 +32,17 @@ Replace the file with the same path from a newer wayland-protocols release and
 update the version above. The apps only use `xdg_wm_base` v1 requests
 (`get_xdg_surface`, `pong`) plus `xdg_toplevel.set_fullscreen`, so any stable
 xdg-shell revision works.
+
+## viewporter and fractional-scale-v1
+
+`viewporter.xml` (`stable/viewporter/`) and `fractional-scale-v1.xml`
+(`staging/fractional-scale/`) are copied verbatim from wayland-protocols
+**1.47**, same MIT terms. They are what makes a DEVICE-pixel buffer land 1:1 on a
+scaled output: the helper attaches a buffer of `logical size x output scale` and
+sets the `wp_viewport` destination to the logical (configure) size, so the
+compositor maps it onto exactly the configured region. Without them a
+3840x2160 buffer on a 200 % output is a 3840x2160-LOGICAL surface — twice the
+output — and spills onto the neighbouring monitor.
+`wp_fractional_scale_v1.preferred_scale` supplies the scale for a windowed
+surface; both are optional (the helper falls back to `wl_surface.set_buffer_scale`
+for an integer scale, and to no mapping otherwise).
