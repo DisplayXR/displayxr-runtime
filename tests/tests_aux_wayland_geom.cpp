@@ -460,3 +460,67 @@ TEST_CASE("a fractionally-scaled monitor has none, and must not be pretended int
 	REQUIRE_FALSE(u_wl_placement_quantum(0.0, 0.01, &q));
 	REQUIRE_FALSE(u_wl_placement_quantum(-2.0, 0.01, &q));
 }
+
+
+/*
+ *
+ * Off-panel bands: a window spanning the panel and another monitor (#1654).
+ *
+ */
+
+TEST_CASE("a window entirely on the panel has no off-panel band")
+{
+	struct u_wl_rect_px b[4] = {};
+	REQUIRE(u_wl_offpanel_bands(100, 50, kPanelModeW, kPanelModeH, 1280, 720, b) == 0);
+	// Flush against the panel's far edge is still entirely on it.
+	REQUIRE(u_wl_offpanel_bands((int32_t)kPanelModeW - 1280, (int32_t)kPanelModeH - 720, kPanelModeW, kPanelModeH,
+	                            1280, 720, b) == 0);
+}
+
+TEST_CASE("a window hanging off the panel's left edge gets one band")
+{
+	// 300 px of a 1280-wide window are to the left of the panel.
+	struct u_wl_rect_px b[4] = {};
+	REQUIRE(u_wl_offpanel_bands(-300, 100, kPanelModeW, kPanelModeH, 1280, 720, b) == 1);
+	REQUIRE(b[0].x == 0);
+	REQUIRE(b[0].y == 0);
+	REQUIRE(b[0].w == 300);
+	REQUIRE(b[0].h == 720);
+}
+
+TEST_CASE("a corner overhang gets two bands that do not overlap")
+{
+	// 200 px above the panel and 100 px to its left.
+	struct u_wl_rect_px b[4] = {};
+	const uint32_t n = u_wl_offpanel_bands(-100, -200, kPanelModeW, kPanelModeH, 1280, 720, b);
+	REQUIRE(n == 2);
+	// The full-width strip above comes first, then the left strip BELOW it,
+	// so together they cover the corner exactly once.
+	REQUIRE(b[0].y == 0);
+	REQUIRE(b[0].h == 200);
+	REQUIRE(b[0].w == 1280);
+	REQUIRE(b[1].x == 0);
+	REQUIRE(b[1].y == 200);
+	REQUIRE(b[1].w == 100);
+	REQUIRE(b[1].h == 520);
+	int64_t area = 0;
+	for (uint32_t i = 0; i < n; i++) {
+		area += (int64_t)b[i].w * b[i].h;
+	}
+	REQUIRE(area == (int64_t)1280 * 200 + (int64_t)100 * 520);
+}
+
+TEST_CASE("a window entirely off the panel is one band covering it")
+{
+	struct u_wl_rect_px b[4] = {};
+	REQUIRE(u_wl_offpanel_bands(-2000, 0, kPanelModeW, kPanelModeH, 1280, 720, b) == 1);
+	REQUIRE(b[0].w == 1280);
+	REQUIRE(b[0].h == 720);
+}
+
+TEST_CASE("an unknown panel or window produces no bands, never a full-window one")
+{
+	struct u_wl_rect_px b[4] = {};
+	REQUIRE(u_wl_offpanel_bands(0, 0, 0, 0, 1280, 720, b) == 0);
+	REQUIRE(u_wl_offpanel_bands(0, 0, kPanelModeW, kPanelModeH, 0, 0, b) == 0);
+}
