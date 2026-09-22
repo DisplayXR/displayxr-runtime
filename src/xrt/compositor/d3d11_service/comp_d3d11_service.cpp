@@ -1856,6 +1856,14 @@ struct d3d11_service_system
 	//! (a keyed-mutex timeout, or a client fence not yet complete). The tile
 	//! keeps last frame's composite; the dominant cause of `recipe_hold`.
 	std::atomic<uint32_t> render_diag_zones_skip{0};
+	//! #1664: UI layers (quad / cylinder / equirect2) whose client image could
+	//! not be acquired for reading this commit, counted once per layer per
+	//! frame. The layer is not drawn — the tile keeps whatever it held — so a
+	//! standing rate here is the UI-pass twin of `zones_skip`: a client whose
+	//! sources are chronically late, not a fault in the pass. It reads ZERO on
+	//! an in-process or imported-swapchain client, which have no keyed mutex to
+	//! acquire in the first place.
+	std::atomic<uint32_t> render_diag_ui_acq_skip{0};
 };
 
 /*!
@@ -9158,11 +9166,13 @@ emit_render_diag_if_window_elapsed(struct d3d11_service_system *sys)
 		int pk = sys->render_diag_pipe_presenter.load(std::memory_order_relaxed);
 		uint32_t rh = sys->render_diag_recipe_hold.exchange(0, std::memory_order_relaxed);
 		uint32_t zk = sys->render_diag_zones_skip.exchange(0, std::memory_order_relaxed);
+		uint32_t uk = sys->render_diag_ui_acq_skip.exchange(0, std::memory_order_relaxed);
 		U_LOG_W(
 		    "[RENDER] pipe_active_present=%u pipe_active_skip=%u pipe_active_backoff=%u "
 		    "pipe_flat_present=%u pipe_flat_skip=%u pipe_rebind=%u dp_stale_recreate=%u "
-		    "atlas_contention=%u presenter=%d recipe_hold=%u zones_skip=%u window_s=10",
-		    ap, as, ab, fp, fs, rb, sr, ac, pk, rh, zk);
+		    "atlas_contention=%u presenter=%d recipe_hold=%u zones_skip=%u ui_acq_skip=%u "
+		    "window_s=10",
+		    ap, as, ab, fp, fs, rb, sr, ac, pk, rh, zk, uk);
 
 		/*
 		 * #918: the split's own window. `xb_kb` is atlas transport per window,
@@ -17020,37 +17030,49 @@ service_fence_reached(struct d3d11_service_compositor *c, uint64_t signaled)
 }
 
 /*!
- * One acquired cross-process image during the zones composite. Acquires are
- * deduped per (swapchain, image) across the whole pass — a second
- * AcquireSync(0) on the same image from this thread would self-block.
+ * One acquired cross-process image during a compose pass. Acquires are deduped
+ * per (swapchain, image) across the whole pass — a second AcquireSync(0) on the
+ * same image from this thread would self-block.
+ *
+ * #1664: shared by the zones composite and the UI-layer (quad / cylinder /
+ * equirect2) pass, which is why the name lost its `zones_` prefix. The two
+ * passes differ only in what a failed acquire costs them; the registry and the
+ * self-block rule are the same.
  */
-struct zones_acquired_image
+struct service_acquired_image
 {
 	struct d3d11_service_swapchain *sc;
 	uint32_t img;
 };
 
 /*!
- * Acquire one zone/Local-2D source image for reading, honoring the same
- * cross-process sync contract as the projection-layer loop: fence-path
- * clients get a 0-timeout AcquireSync (the SHARED_KEYEDMUTEX barrier —
+ * Acquire one client source image for reading, honoring the same cross-process
+ * sync contract as the projection-layer loop: fence-path clients get a 0-timeout
+ * AcquireSync (the SHARED_KEYEDMUTEX barrier —
  * `feedback_acquiresync_load_bearing`) plus one queued GPU fence Wait per
- * commit; legacy clients block up to 4 ms. On failure the caller skips this
- * placement's blit — the composite draws over a freshly cleared tile, so a
- * skipped placement is transparent for one frame (layers are advisory), not
- * stale-reused like the persistent projection slot.
+ * commit; legacy clients block up to 4 ms. An imported (not service-created)
+ * swapchain, or an image with no keyed mutex, needs no acquire and reports
+ * success — the same gate the projection loop applies.
+ *
+ * On failure the CALLER decides what a missing source costs, and the two callers
+ * differ:
+ *   - the zones composite skips that placement's blit; it draws over a freshly
+ *     cleared tile, so a skipped placement is transparent for one frame (layers
+ *     are advisory), not stale-reused like the persistent projection slot;
+ *   - the UI-layer pass (#1664) skips that layer's draw for the frame and counts
+ *     it, leaving whatever the tile already held.
  */
 static bool
-zones_acquire_image(struct d3d11_service_system *sys,
-                    struct d3d11_service_compositor *c,
-                    struct d3d11_service_swapchain *sc,
-                    uint32_t img,
-                    bool use_fence_path,
-                    uint64_t fence_signaled,
-                    bool *fence_wait_queued,
-                    struct zones_acquired_image *acquired,
-                    uint32_t *acquired_count,
-                    uint32_t acquired_cap)
+service_acquire_source_image(struct d3d11_service_system *sys,
+                             struct d3d11_service_compositor *c,
+                             struct d3d11_service_swapchain *sc,
+                             uint32_t img,
+                             bool use_fence_path,
+                             uint64_t fence_signaled,
+                             bool *fence_wait_queued,
+                             struct service_acquired_image *acquired,
+                             uint32_t *acquired_count,
+                             uint32_t acquired_cap)
 {
 	if (!sc->service_created || sc->images[img].keyed_mutex == nullptr) {
 		return true; // No cross-process mutex on this image.
@@ -17094,6 +17116,29 @@ zones_acquire_image(struct d3d11_service_system *sys,
 	(*acquired_count)++;
 	return true;
 }
+
+/*!
+ * #1664 — RAII release for a @ref service_acquired_image registry.
+ *
+ * A leaked acquire does not degrade the frame, it WEDGES the client: the app's
+ * next `wait_image` blocks on `AcquireSync(0)` for a key this process still
+ * holds, for ever. The zones composite releases on each of its own hand-written
+ * exit paths; the UI-layer pass hands its registry to this instead, so an early
+ * return or an exception added to that pass later cannot leak one.
+ */
+struct service_acquired_image_scope
+{
+	struct service_acquired_image *imgs;
+	uint32_t *count;
+
+	~service_acquired_image_scope()
+	{
+		for (uint32_t a = 0; a < *count; a++) {
+			imgs[a].sc->images[imgs[a].img].keyed_mutex->ReleaseSync(0);
+		}
+		*count = 0;
+	}
+};
 
 /*!
  * Resolve the SRV to sample a zone/Local-2D source through. Workspace mode
@@ -17253,7 +17298,7 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 	bool use_fence_path = c->workspace_sync_fence && fence_signaled != 0;
 	bool fence_wait_queued = false;
 
-	struct zones_acquired_image acquired[XRT_MAX_LAYERS * XRT_MAX_VIEWS];
+	struct service_acquired_image acquired[XRT_MAX_LAYERS * XRT_MAX_VIEWS];
 	uint32_t acquired_count = 0;
 
 	// Acquire EVERY source image up front, all-or-nothing: the composite
@@ -17286,7 +17331,7 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 			if (img >= sc->image_count || sc->images[img].srv == nullptr) {
 				continue;
 			}
-			if (!zones_acquire_image(sys, c, sc, img, use_fence_path, fence_signaled,
+			if (!service_acquire_source_image(sys, c, sc, img, use_fence_path, fence_signaled,
 			                         &fence_wait_queued, acquired, &acquired_count,
 			                         ARRAY_SIZE(acquired))) {
 				for (uint32_t a = 0; a < acquired_count; a++) {
@@ -17342,7 +17387,7 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 					views_skipped++;
 					continue;
 				}
-				if (!zones_acquire_image(sys, c, sc, img, use_fence_path, fence_signaled,
+				if (!service_acquire_source_image(sys, c, sc, img, use_fence_path, fence_signaled,
 				                         &fence_wait_queued, acquired, &acquired_count,
 				                         ARRAY_SIZE(acquired))) {
 					views_skipped++;
@@ -17405,7 +17450,7 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 			if (img >= sc->image_count || sc->images[img].srv == nullptr) {
 				continue;
 			}
-			if (!zones_acquire_image(sys, c, sc, img, use_fence_path, fence_signaled,
+			if (!service_acquire_source_image(sys, c, sc, img, use_fence_path, fence_signaled,
 			                         &fence_wait_queued, acquired, &acquired_count,
 			                         ARRAY_SIZE(acquired))) {
 				continue;
@@ -20814,9 +20859,105 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 	// Render UI layers if any exist and shaders are ready
 	if (has_ui_layers && sys->quad_vs) {
+		/*
+		 * #1664 — THE CROSS-PROCESS ACQUIRE THIS PASS NEVER DID.
+		 *
+		 * `render_quad_layer()` and its cylinder / equirect2 siblings bind
+		 * `sc->images[i].srv` and Draw. Under IPC that texture is a
+		 * cross-process, NT-shared, `SHARED_KEYEDMUTEX` image the CLIENT wrote
+		 * on its own device, and the rule for reading one is stated at the
+		 * window-space HUD cache: "`feedback_acquiresync_load_bearing`:
+		 * AcquireSync(0) is the cross-process cache barrier — without it the
+		 * reader sees stale (or zero-init) content even when the writer has
+		 * fenced." Every other reader in this service obeys it — the projection
+		 * blit per view, the zones composite, chrome, overlay, cursor, the weave
+		 * input. This pass was the one that did not, so it sampled the
+		 * never-synchronised view of the shared texture: zero-init, i.e. every
+		 * quad drawn BLACK, at the right place and the right size. Worst case
+		 * with a STATIC swapchain (the CTS writes each solid-colour quad once at
+		 * creation): there is no later write for the un-acquired read to catch
+		 * up with, so it is black for the whole session.
+		 *
+		 * In-process needs none of this: the app and the compositor share one
+		 * D3D11 device, the images carry no keyed mutex at all, and the same
+		 * draw code is correct as written. That is why this only ever showed up
+		 * under IPC — and why it stayed hidden until #1662 let a UI-only IPC
+		 * client be presented in the first place.
+		 *
+		 * Acquire every DISTINCT (swapchain, image) the frame's UI layers name,
+		 * before the view loop, because a layer is drawn once per view and a
+		 * second AcquireSync(0) on the same image from this thread would
+		 * SELF-BLOCK (the de-dup the zones composite carries for the same
+		 * reason; the registry and helper are shared with it). A layer whose
+		 * image is not acquired is not drawn, and is counted rather than logged.
+		 *
+		 * The acquire is also what makes this pass safe AFTER the #1215
+		 * read-done signal above: that signal releases the client's next
+		 * `wait_image`, but its write then blocks on this key until the scope
+		 * guard below releases it.
+		 */
+		uint64_t ui_fence_signaled =
+		    c->workspace_sync_fence ? c->last_signaled_fence_value.load(std::memory_order_acquire) : 0;
+		bool ui_use_fence_path = c->workspace_sync_fence && ui_fence_signaled != 0;
+		bool ui_fence_wait_queued = false;
+		/*
+		 * The fence-path acquire is 0-timeout and the helper POLLS the client's
+		 * fence, so resolve the fence first — bounded, and deliberately BEFORE
+		 * the context lock, since waiting under `immediate_ctx_mutex` would
+		 * stall the render thread. This is the same bounded wait the projection
+		 * loop takes on this same (client IPC) thread; the zones composite polls
+		 * instead only because it runs under `render_mutex`. The result is not
+		 * branched on: a client that is still not complete simply fails the
+		 * helper's poll below and has its layers skipped for the frame.
+		 */
+		if (ui_use_fence_path) {
+			(void)service_fence_reached(c, ui_fence_signaled);
+		}
+
 		// #939: same rule as the tile blits above — a state-setting sequence on
 		// the shared immediate context, outside render_mutex.
 		std::lock_guard<std::mutex> ctx_lock(sys->immediate_ctx_mutex);
+
+		// One entry per UI layer: at most one image each, and a distinct image
+		// is registered once. `ui_layer_drawable[i]` mirrors the accum index so
+		// the draw loop can ask "was layer i's source acquired?" in O(1).
+		struct service_acquired_image ui_acquired[XRT_MAX_LAYERS];
+		uint32_t ui_acquired_count = 0;
+		struct service_acquired_image_scope ui_acquired_scope = {ui_acquired, &ui_acquired_count};
+		bool ui_layer_drawable[XRT_MAX_LAYERS] = {};
+
+		for (uint32_t i = 0; i < c->layer_accum.layer_count && i < XRT_MAX_LAYERS; i++) {
+			struct comp_layer *layer = &c->layer_accum.layers[i];
+			uint32_t img = 0;
+			switch (layer->data.type) {
+			case XRT_LAYER_QUAD: img = layer->data.quad.sub.image_index; break;
+			case XRT_LAYER_CYLINDER: img = layer->data.cylinder.sub.image_index; break;
+			case XRT_LAYER_EQUIRECT2: img = layer->data.equirect2.sub.image_index; break;
+			default: continue; // not this pass's business
+			}
+			struct xrt_swapchain *xsc = layer->sc_array[0];
+			if (xsc == nullptr) {
+				continue; // the draw would have returned early anyway
+			}
+			struct d3d11_service_swapchain *sc = d3d11_service_swapchain_from_xrt(xsc);
+			if (img >= sc->image_count || sc->images[img].srv == nullptr) {
+				continue; // ditto — nothing to acquire, nothing to draw
+			}
+			// Imported swapchains and images with no keyed mutex report success
+			// without acquiring anything (the helper's own gate, same as the
+			// projection loop's `service_created && keyed_mutex` test).
+			if (service_acquire_source_image(sys, c, sc, img, ui_use_fence_path, ui_fence_signaled,
+			                                 &ui_fence_wait_queued, ui_acquired, &ui_acquired_count,
+			                                 ARRAY_SIZE(ui_acquired))) {
+				ui_layer_drawable[i] = true;
+			} else {
+				// Not acquirable this commit (keyed-mutex timeout, or the
+				// client's fence still incomplete). Skip the layer and count
+				// it — the tile keeps what it held, the same policy as the
+				// projection loop's `view_skip_blit`.
+				sys->render_diag_ui_acq_skip.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
 		// Bind per-client stereo render target
 		ID3D11RenderTargetView *rtvs[] = {c->render.atlas_rtv.get()};
 		sys->context->OMSetRenderTargets(1, rtvs, nullptr);
@@ -20968,6 +21109,13 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				const enum xrt_layer_type type = layer->data.type;
 				if (type != XRT_LAYER_EQUIRECT2 && type != XRT_LAYER_CYLINDER &&
 				    type != XRT_LAYER_QUAD) {
+					continue;
+				}
+
+				// #1664: only a layer whose client image was acquired at the
+				// top of this pass may be sampled. Already counted there —
+				// per LAYER, not per layer per view.
+				if (i >= XRT_MAX_LAYERS || !ui_layer_drawable[i]) {
 					continue;
 				}
 
