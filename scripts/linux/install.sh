@@ -64,6 +64,24 @@ else
 fi
 EXT_UUID="window-geometry@displayxr.org"
 
+# --- glibc floor (#1656) ---------------------------------------------------
+# The tarball is a relocatable binary drop with no dependency metadata, so
+# nothing else stops it being unpacked on a distribution older than the one it
+# was built on — where every dlopen() of the runtime then fails with
+# "GLIBC_x.yz not found", far from here. package_linux.sh records the highest
+# glibc symbol version the binaries reference; refuse early and say so.
+if [ -f "$HERE/GLIBC_FLOOR" ]; then
+    NEED="$(cat "$HERE/GLIBC_FLOOR")"
+    HAVE="$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}')"
+    [ -n "$HAVE" ] || HAVE="$(ldd --version 2>/dev/null | head -1 | awk '{print $NF}')"
+    if [ -n "$HAVE" ] && [ "$(printf '%s\n%s\n' "$NEED" "$HAVE" | sort -V | tail -1)" != "$HAVE" ]; then
+        echo "error: this build needs glibc >= $NEED but this system has $HAVE." >&2
+        echo "       Use a build made for this distribution (the .deb declares the same" >&2
+        echo "       floor as a versioned libc6 dependency), or build from source." >&2
+        exit 1
+    fi
+fi
+
 echo "==> Installing DisplayXR runtime to $PREFIX"
 mkdir -p "$PREFIX"
 cp -R "$HERE/bin" "$PREFIX/"

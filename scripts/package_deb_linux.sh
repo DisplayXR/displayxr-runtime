@@ -69,7 +69,7 @@ done
 
 command -v dpkg-deb >/dev/null 2>&1 || {
     echo "error: dpkg-deb not found — run this on a Debian/Ubuntu host or in the" >&2
-    echo "       ubuntu:24.04 container (see scripts/test_deb_linux.sh)." >&2
+    echo "       ubuntu:22.04 container (see scripts/test_deb_linux.sh)." >&2
     exit 1
 }
 
@@ -182,45 +182,91 @@ cat > "$STAGE/usr/lib/displayxr/plugins/200-sim-display.json" <<EOF
 EOF
 chmod 0644 "$STAGE/usr/lib/displayxr/plugins/200-sim-display.json"
 
-# --- Depends: resolve the shared libs the binaries actually NEED to the ----
-# Debian packages that provide them (works because this runs in the same
-# ubuntu:24.04 base the .deb is installed into). Falls back to a conservative
-# hardcoded set if objdump/dpkg aren't available.
-compute_depends() {
-    local sonames pkgs="" so pkg
-    sonames="$(objdump -p "$RUNTIME_SO" "$CLI_BIN" "$PLUGIN_SO" 2>/dev/null \
-                | awk '/NEEDED/{print $2}' | sort -u)"
-    # (libdbus-1-3: the #817 Wayland window-geometry provider. NOT
-    # libwayland-client0 — no wl_* symbol is referenced, so --as-needed drops
-    # -lwayland-client and libwayland-dev is a build-time-only dependency.)
-    [ -n "$sonames" ] || { echo "libc6, libcjson1, libvulkan1, libx11-6, libx11-xcb1, libxcb1, libxcb-randr0, libdbus-1-3"; return; }
-    for so in $sonames; do
-        # Resolve the soname to its owning package via dpkg's file DB. Search by
-        # BARE soname (no leading '/': a leading slash makes dpkg-query treat it
-        # as an absolute path and miss) — a substring match that is immune to the
-        # /lib-vs-/usr/lib usr-merge split that broke `dpkg -S <ldconfig-path>`
-        # (which had dropped libcjson1/libvulkan1). Keep only the line whose file
-        # basename is EXACTLY the soname (so libfoo.so.1.2.3 / dev symlinks don't
-        # match), then strip dpkg's ':arch' qualifier off the package name.
-        # Only accept a match whose file lives in a SYSTEM linker dir (/lib,
-        # /usr/lib, /lib64, ...), EXCLUDING the wrong-arch 32-bit multiarch trees
-        # (i386/lib32/libx32), and never the vendor SR runtime:
-        #   - the Leia SR runtime bundles copies of common .so's under
-        #     /opt/leiasr/lib, so a bare `dpkg -S <soname>` can attribute a system
-        #     lib to `leiasr-runtime` — the runtime .deb must NEVER Depend on the
-        #     commercial SR package (cube-hw finding B);
-        #   - amd64 runners carry i386 multiarch, so `dpkg -S libc.so.6` also
-        #     matches /usr/lib/i386-linux-gnu/libc.so.6 (libc6-i386); picking that
-        #     added a bogus 32-bit Depend to the amd64 .deb (seen on v2.1.1).
-        pkg="$(dpkg -S "$so" 2>/dev/null \
-               | awk -F': ' -v s="$so" '$2 ~ /^\/(usr\/)?lib(32|64)?\// && $2 !~ /(i386-linux-gnu|\/lib32\/|\/libx32\/)/ {n=split($2,a,"/"); if (a[n]==s){p=$1; sub(/:.*/,"",p); if (p!="leiasr-runtime"){print p; exit}}}')"
-        [ -n "$pkg" ] && pkgs="$pkgs $pkg"
-    done
-    # Always include libc6; dedupe; comma-join.
-    echo "libc6 $pkgs" | tr ' ' '\n' | sed '/^$/d' | sort -u | paste -sd, - | sed 's/,/, /g'
+# --- Depends (#1656) ---------------------------------------------------------
+# ONE .deb for Ubuntu 22.04, 24.04 and 26.04. Two things make that true, and
+# both are checked here rather than trusted to the build host:
+#
+#   1. The glibc / libstdc++ floor is the BUILD host's. The release .deb is
+#      built on the OLDEST supported release (the CI Deb job runs in an
+#      ubuntu:22.04 container), and dpkg-shlibdeps turns the symbol versions
+#      the binaries actually reference into versioned Depends — so a package
+#      built on a newer host (a dev box, or a runner image bump) says
+#      `libc6 (>= 2.38)` and apt REFUSES it on 22.04 instead of installing a
+#      runtime that then fails at dlopen() (v2.19.1 shipped unversioned
+#      `libc6` with a GLIBC_2.38 / GLIBCXX_3.4.31 floor).
+#      DXR_DEB_MAX_GLIBC (CI sets 2.35 = Ubuntu 22.04) turns a floor above the
+#      oldest release into a hard error at package time.
+#   2. Every DT_NEEDED soname must be on STABLE_SONAMES: libraries whose
+#      package name is the same on all three releases. A new system library
+#      fails the build here — its package may be renamed on another release
+#      (t64 transition, soname bumps), which would make the .deb uninstallable
+#      there. Adding one is a claim about all three releases; CI's DebInstall
+#      matrix (scripts/verify_deb_install_linux.sh) proves it.
+#
+# (libdbus-1-3: the #817 Wayland window-geometry provider. NOT
+# libwayland-client0 — no wl_* symbol is referenced, so --as-needed drops
+# -lwayland-client and libwayland-dev is a build-time-only dependency.)
+STABLE_SONAMES=(
+    libc.so.6 libm.so.6 libdl.so.2 libpthread.so.0 librt.so.1 ld-linux-x86-64.so.2
+    libstdc++.so.6 libgcc_s.so.1
+    libvulkan.so.1                  # libvulkan1
+    libcjson.so.1                   # libcjson1
+    libdbus-1.so.3                  # libdbus-1-3
+    libudev.so.1                    # libudev1
+    libX11.so.6 libX11-xcb.so.1     # libx11-6, libx11-xcb1
+    libxcb.so.1 libxcb-randr.so.0   # libxcb1, libxcb-randr0
+    libXrandr.so.2                  # libxrandr2
+)
+ELF_FILES=("$RUNTIME_SO" "$CLI_BIN" "$PLUGIN_SO")
+
+command -v dpkg-shlibdeps >/dev/null 2>&1 || {
+    echo "error: dpkg-shlibdeps not found — install dpkg-dev." >&2
+    exit 1
 }
-DEPENDS="$(compute_depends)"
+
+bad=""
+for so in $(objdump -p "${ELF_FILES[@]}" | awk '/NEEDED/{print $2}' | sort -u); do
+    ok=0
+    for s in "${STABLE_SONAMES[@]}"; do [ "$so" = "$s" ] && ok=1 && break; done
+    [ "$ok" = 1 ] || bad="$bad $so"
+done
+if [ -n "$bad" ]; then
+    echo "error: DT_NEEDED on system libraries not known to share a package name across" >&2
+    echo "       Ubuntu 22.04/24.04/26.04:$bad" >&2
+    echo "       Drop the dependency, link it statically, or add it to STABLE_SONAMES once" >&2
+    echo "       CI's DebInstall matrix proves the package exists under that name on all three." >&2
+    exit 1
+fi
+
+# dpkg-shlibdeps wants a debian/control to read; give it a throwaway one. It
+# resolves each soname through the linker search path and the owning package's
+# shlibs/symbols files, so the result carries real version floors.
+SHLIBS_TMP="$(mktemp -d)"
+mkdir -p "$SHLIBS_TMP/debian"
+printf 'Source: %s\n\nPackage: %s\nArchitecture: any\n' "$PKG" "$PKG" >"$SHLIBS_TMP/debian/control"
+DEPENDS="$(cd "$SHLIBS_TMP" && dpkg-shlibdeps -O "${ELF_FILES[@]}" | sed -n 's/^shlibs:Depends=//p')"
+rm -rf "$SHLIBS_TMP"
+[ -n "$DEPENDS" ] || { echo "error: dpkg-shlibdeps produced no Depends." >&2; exit 1; }
+# The Leia SR runtime bundles copies of common .so's under /opt/leiasr/lib; on
+# an SR box whose linker path reaches them, the owner would come out as
+# leiasr-runtime. The runtime .deb must NEVER Depend on the commercial SR
+# package (cube-hw finding B).
+if echo "$DEPENDS" | grep -q leiasr; then
+    echo "error: Depends names the vendor SR package: $DEPENDS" >&2
+    echo "       (an SR runtime's bundled lib shadowed a system one on this host's linker path)" >&2
+    exit 1
+fi
 echo "==> Depends: $DEPENDS"
+
+GLIBC_FLOOR="$(objdump -T "${ELF_FILES[@]}" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)"
+GLIBCXX_FLOOR="$(objdump -T "${ELF_FILES[@]}" | grep -o 'GLIBCXX_[0-9.]*' | sed 's/GLIBCXX_//' | sort -uV | tail -1)"
+echo "==> glibc floor: GLIBC_$GLIBC_FLOOR, GLIBCXX_$GLIBCXX_FLOOR"
+if [ -n "${DXR_DEB_MAX_GLIBC:-}" ] &&
+    [ "$(printf '%s\n%s\n' "$GLIBC_FLOOR" "$DXR_DEB_MAX_GLIBC" | sort -V | tail -1)" != "$DXR_DEB_MAX_GLIBC" ]; then
+    echo "error: the binaries need GLIBC_$GLIBC_FLOOR, above DXR_DEB_MAX_GLIBC=$DXR_DEB_MAX_GLIBC" >&2
+    echo "       (the oldest supported release). Build the .deb on that release." >&2
+    exit 1
+fi
 
 # The runtime must link libdbus-1: it is the Wayland window-geometry provider
 # (#817) that consumes the GNOME Shell extension this package ships. It is an

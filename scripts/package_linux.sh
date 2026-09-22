@@ -88,6 +88,25 @@ cp "$ROOT/scripts/linux/install.sh" "$ROOT/scripts/linux/uninstall.sh" "$STAGE/"
 chmod +x "$STAGE/install.sh" "$STAGE/uninstall.sh"
 echo "$VERSION" > "$STAGE/VERSION"
 
+# --- glibc floor (#1656) ---------------------------------------------------
+# A tarball built on a newer distribution than the user's unpacks fine and then
+# fails at every dlopen(). Record the highest glibc symbol version the shipped
+# binaries reference so install.sh can refuse such a host with a clear message.
+# (The release tarball is built in the oldest supported container — the Package
+# job in .github/workflows/build-linux.yml — so the recorded floor is that
+# release's; a locally built tarball honestly records the local one.)
+# (`|| true`: objdump exits non-zero on the shell script in bin/, and under
+# pipefail that would abort the script.)
+GLIBC_SYMS="$(objdump -T "$STAGE/bin"/* "$STAGE/lib/openxr_displayxr.so" \
+    "$STAGE/lib/displayxr/plugins/DisplayXR-SimDisplay.so" 2>/dev/null || true)"
+GLIBC_FLOOR="$(echo "$GLIBC_SYMS" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1 || true)"
+if [ -n "$GLIBC_FLOOR" ]; then
+    echo "$GLIBC_FLOOR" > "$STAGE/GLIBC_FLOOR"
+    echo "==> glibc floor: $GLIBC_FLOOR (recorded in GLIBC_FLOOR; install.sh refuses older hosts)"
+else
+    echo "note: objdump unavailable — no GLIBC_FLOOR recorded in the tarball" >&2
+fi
+
 cat > "$STAGE/README.md" <<EOF
 # DisplayXR runtime for Linux ($VERSION)
 

@@ -16,14 +16,22 @@ name: Build Linux
 # ipc_client/ipc_server, comp_multi). CI has no display, so build-green is the
 # Phase 2 gate; the IPC round-trip is hardware work (Phase 1b).
 #
-# Package job (#705): build in the ubuntu:26.04 container, produce the
-# tarball, install from it, and gate on selftest resolving everything from
-# the installed XDG paths.
+# Package job (#705): build in the OLDEST supported container (ubuntu:22.04,
+# #1656), produce the tarball, install from it, and gate on selftest resolving
+# everything from the installed XDG paths.
 #
-# Deb job (#781 Phase 3): build the runtime .deb (scripts/package_deb_linux.sh)
-# on every PR, and on a v* tag attach displayxr-runtime_<ver>_amd64.deb to the
-# GitHub Release — the asset the Linux meta-bundle (displayxr-installer) fetches.
-# Not a required context (release-asset + extra build validation, not a gate).
+# Newest job (#1656): the "still compiles on the newest release" coverage the
+# Package job used to provide before it moved to 22.04 — build + selftest in an
+# ubuntu:26.04 container, no packaging.
+#
+# Deb job (#781 Phase 3, #1656): build the runtime .deb
+# (scripts/package_deb_linux.sh) on every PR, in an ubuntu:22.04 container so
+# the shipped binaries carry the oldest supported release's glibc floor.
+# DebInstall then installs it into pristine 22.04 / 24.04 / 26.04 containers and
+# runs it there; DebRelease attaches displayxr-runtime_<ver>_amd64.deb to a v*
+# GitHub Release — the asset the Linux meta-bundle (displayxr-installer)
+# fetches — only after that passes. Not required contexts (release-asset +
+# extra build validation, not a gate).
 
 on:
   workflow_dispatch: {}
@@ -117,14 +125,22 @@ jobs:
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: ./scripts/build_linux.sh --apps
 
-  # Packaging gate (#705): build in the NEXT-LTS container, produce the
-  # tarball, run the tarball's own install.sh (user-level), and prove the
-  # installed tree works end-to-end — selftest resolving the runtime + plug-in
-  # purely from the installed XDG paths (no XRT_PLUGIN_SEARCH_PATH).
+  # Packaging gate (#705): produce the tarball, run its own install.sh
+  # (user-level), and prove the installed tree works end-to-end — selftest
+  # resolving the runtime + plug-in purely from the installed XDG paths (no
+  # XRT_PLUGIN_SEARCH_PATH).
+  #
+  # Built in the OLDEST supported container (#1656), like the Deb job: the
+  # tarball is a relocatable binary drop with no dependency metadata at all, so
+  # a newer build host's glibc floor is even less visible there than in a .deb —
+  # install.sh would happily unpack a tree that cannot dlopen. package_linux.sh
+  # records the floor in the tarball's GLIBC_FLOOR file and install.sh refuses a
+  # host below it. (Building on the NEXT LTS moved to the Newest job below, so
+  # that toolchain coverage is kept.)
   Package:
     needs: DetectChanges
     runs-on: ubuntu-latest
-    container: ubuntu:26.04
+    container: ubuntu:22.04
     steps:
       - name: Docs-only short-circuit
         if: needs.DetectChanges.outputs.docs_only == 'true'
@@ -137,7 +153,7 @@ jobs:
           SUDO=""; [ "$(id -u)" != 0 ] && SUDO=sudo
           $SUDO apt-get update
           $SUDO apt-get install -y \
-            build-essential cmake ninja-build pkg-config git \
+            build-essential cmake ninja-build pkg-config git ca-certificates python3 \
             libvulkan-dev vulkan-validationlayers glslang-tools \
             libeigen3-dev libcjson-dev libudev-dev \
             libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev libwayland-dev \
@@ -181,6 +197,44 @@ jobs:
           path: dist/displayxr-runtime-linux-*.tar.gz
           if-no-files-found: error
 
+  # Newest-toolchain gate (#1656): the Package job used to build in the NEXT-LTS
+  # container and moved to 22.04 so the tarball it produces is portable, so the
+  # "does the tree still compile on the newest release" coverage lives here.
+  # Build + headless selftest only — no packaging.
+  Newest:
+    needs: DetectChanges
+    runs-on: ubuntu-latest
+    container: ubuntu:26.04
+    steps:
+      - name: Docs-only short-circuit
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "Doc-only change — reporting success without building."
+
+      - name: Install dependencies
+        # Container runs as root — no sudo binary; hosted-runner parity shim.
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config git ca-certificates python3 \
+            libvulkan-dev vulkan-validationlayers glslang-tools \
+            libeigen3-dev libcjson-dev libudev-dev \
+            libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev libwayland-dev \
+            libdbus-1-dev \
+            libgl-dev libglvnd-dev libegl1-mesa-dev libxrandr-dev libxxf86vm-dev libxcb-glx0-dev
+
+      - uses: actions/checkout@v5
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        with:
+          submodules: recursive
+
+      - name: Build service + IPC-client runtime + headless selftest
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          ./scripts/build_linux.sh --service
+
   Service:
     needs: DetectChanges
     runs-on: ubuntu-latest
@@ -216,59 +270,82 @@ jobs:
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: ./scripts/build_linux.sh --service
 
-  # Build the runtime .deb and, on a v* tag, attach it to the GitHub Release —
-  # the CI-published asset the Linux meta-bundle fetches (#781 Phase 3). Runs on
-  # every PR too (build-only) so a broken package_deb_linux.sh is caught before
-  # release. NB: deliberately does NOT install the GL/EGL dev libs — NOT because
-  # they would break the build (comp_gl is gated `(WIN32 OR APPLE) AND
+  # Build the ONE runtime .deb — the CI-published asset the Linux meta-bundle
+  # fetches (#781 Phase 3). Runs on every PR too so a broken
+  # package_deb_linux.sh is caught before release; DebRelease below attaches it
+  # to a v* release once DebInstall has proved it.
+  #
+  # PORTABLE BY CONSTRUCTION (#1656): the same .deb must install and run on
+  # Ubuntu 22.04, 24.04 and 26.04, so it is built on the OLDEST — an
+  # ubuntu:22.04 container (glibc 2.35 / GCC 11 floor). v2.19.1 was built on
+  # ubuntu-latest (24.04), needed GLIBC_2.38 + GLIBCXX_3.4.31, and declared an
+  # unversioned `libc6`, so apt installed it on 22.04 and every app then failed
+  # at dlopen(). package_deb_linux.sh derives versioned Depends with
+  # dpkg-shlibdeps, refuses a DT_NEEDED outside its cross-release STABLE_SONAMES
+  # list, and — with DXR_DEB_MAX_GLIBC — refuses a glibc floor above 22.04's.
+  #
+  # NB: deliberately does NOT install the GL/EGL dev libs — NOT because they
+  # would break the build (comp_gl is gated `(WIN32 OR APPLE) AND
   # XRT_HAVE_OPENGL` in src/xrt/compositor/CMakeLists.txt, so on Linux GL only
-  # reaches the sim_display GL DP + aux_ogl, and a 26.04 build with GL/EGL ON is
-  # green), but because Linux has no GL compositor at all: flipping
-  # XRT_HAVE_OPENGL/XRT_HAVE_EGL on would only add unusable code and extra
-  # runtime Depends to the shipped .deb. (The Selftest/Service jobs install them
-  # on purpose — they exist to keep the platform gate itself honest, #709.) The
-  # vendor Leia plug-in .deb is NOT built here: Track B needs the commercial SR
-  # SDK, so it is produced on an SR-equipped box, not public CI.
+  # reaches the sim_display GL DP + aux_ogl), but because Linux has no GL
+  # compositor at all: flipping XRT_HAVE_OPENGL/XRT_HAVE_EGL on would only add
+  # unusable code and extra runtime Depends to the shipped .deb. (The
+  # Selftest/Service jobs install them on purpose — they exist to keep the
+  # platform gate itself honest, #709.) The vendor Leia plug-in .deb is NOT
+  # built here: Track B needs the commercial SR SDK, so it is produced on an
+  # SR-equipped box, not public CI.
   Deb:
     needs: DetectChanges
     runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    env:
+      DXR_DEB_MAX_GLIBC: "2.35" # Ubuntu 22.04 — the oldest supported release
     steps:
       - name: Docs-only short-circuit
         if: needs.DetectChanges.outputs.docs_only == 'true'
         run: echo "Doc-only change — skipping .deb build."
+
+      - name: Install dependencies
+        # Bare image, root: installed BEFORE checkout so actions/checkout finds
+        # git (else it falls back to a tarball with no tags and git describe
+        # cannot version the .deb). python3: the build's code generators.
+        # libwayland-dev + libdbus-1-dev are REQUIRED here (unlike GL/EGL above):
+        # they gate XRT_HAVE_WAYLAND/XRT_HAVE_DBUS, so without them the released
+        # .deb would ship a runtime with no Wayland present path
+        # (XR_DXR_wayland_surface_binding unadvertised — package_deb_linux.sh
+        # refuses that via check_linux_runtime_wayland.sh) and no #817 wl_geom
+        # window-geometry provider. Cost at runtime: libdbus-1-3 only (present on
+        # every GNOME/KDE desktop). libwayland-dev is build-time ONLY: nothing
+        # references a wl_* symbol (the app's wl_display*/wl_surface* go straight
+        # into VkWaylandSurfaceCreateInfoKHR), so --as-needed drops
+        # -lwayland-client and libwayland-client0 never enters Depends. (No
+        # wayland-protocols: the runtime generates no protocol code; the vendored
+        # XML under test_apps/common/wayland-protocols/ is test-app only.)
+        # libxrandr-dev is REQUIRED too: with x11+xrandr absent, pkg_check_modules
+        # leaves XRT_HAVE_XLIB_XRANDR OFF and the released .deb ships with no
+        # DXR_LINUX_DIRECT_SCANOUT present path (adds libxrandr2 + libx11-6 to the
+        # derived Depends). Keep in lockstep with scripts/test_deb_linux.sh.
+        # 22.04's apt cmake is 3.22.1 = CMakeLists' floor, so no pinned CMake.
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config git ca-certificates \
+            python3 file binutils \
+            libvulkan-dev glslang-tools \
+            libeigen3-dev libcjson-dev libudev-dev \
+            libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev libwayland-dev \
+            libdbus-1-dev \
+            libxrandr-dev \
+            dpkg-dev fakeroot
+          cmake --version | head -1
 
       - uses: actions/checkout@v5
         if: needs.DetectChanges.outputs.docs_only != 'true'
         with:
           submodules: recursive
           fetch-depth: 0 # git describe needs tags for the .deb version
-
-      - name: Install dependencies
-        # libwayland-dev + libdbus-1-dev are REQUIRED here (unlike GL/EGL above):
-        # they gate XRT_HAVE_WAYLAND/XRT_HAVE_DBUS, so without them the released
-        # .deb would ship a runtime with no Wayland present path
-        # (XR_DXR_wayland_surface_binding unadvertised) and no #817 wl_geom
-        # window-geometry provider — a different runtime from the dev build and
-        # the tarball, which both install them. Cost at runtime: libdbus-1-3 only
-        # (present on every GNOME/KDE desktop). libwayland-dev is build-time ONLY:
-        # nothing references a wl_* symbol (the app's wl_display*/wl_surface* go
-        # straight into VkWaylandSurfaceCreateInfoKHR), so --as-needed drops
-        # -lwayland-client and libwayland-client0 never enters Depends.
-        # libxrandr-dev is REQUIRED too: with x11+xrandr absent, pkg_check_modules
-        # leaves XRT_HAVE_XLIB_XRANDR OFF and the released .deb ships with no
-        # DXR_LINUX_DIRECT_SCANOUT present path (adds libxrandr2 + libx11-6 to the
-        # derived Depends). Keep in lockstep with scripts/test_deb_linux.sh.
-        if: needs.DetectChanges.outputs.docs_only != 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential cmake ninja-build pkg-config \
-            libvulkan-dev vulkan-validationlayers glslang-tools \
-            libeigen3-dev libcjson-dev libudev-dev \
-            libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev libwayland-dev \
-            libdbus-1-dev \
-            libxrandr-dev \
-            dpkg-dev fakeroot
 
       - name: Build runtime .deb (clean Release build)
         if: needs.DetectChanges.outputs.docs_only != 'true'
@@ -285,8 +362,62 @@ jobs:
           path: dist/displayxr-runtime_*_amd64.deb
           if-no-files-found: error
 
-      - name: Attach .deb to the GitHub Release (tags only)
-        if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/v')
+  # Install the .deb from the Deb job into a PRISTINE container of every
+  # supported release, without Recommends, and run it there
+  # (scripts/verify_deb_install_linux.sh): apt must resolve Depends from that
+  # release's archive, `ldd -r` must be clean on every shipped ELF, every
+  # Depends/Recommends/Suggests name must exist there, and `displayxr-cli
+  # selftest` must pass env-free on the packaged sim-display. The Package job's
+  # tarball (which also carries displayxr-service) is checked for the same
+  # glibc / libstdc++ floor.
+  DebInstall:
+    name: DebInstall (Ubuntu ${{ matrix.release }})
+    needs: [DetectChanges, Deb, Package]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ["22.04", "24.04", "26.04"]
+    steps:
+      - name: Docs-only short-circuit
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "Doc-only change — no .deb to verify."
+
+      - uses: actions/checkout@v5
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+
+      - uses: actions/download-artifact@v6
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        with:
+          name: displayxr-runtime-deb
+          path: dist
+
+      - uses: actions/download-artifact@v6
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        with:
+          name: displayxr-runtime-linux-tarball
+          path: dist
+
+      - name: apt install + ldd -r + selftest in clean ubuntu:${{ matrix.release }}
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w "ubuntu:${{ matrix.release }}" \
+            ./scripts/verify_deb_install_linux.sh \
+              dist/displayxr-runtime_*_amd64.deb dist/displayxr-runtime-linux-*.tar.gz
+
+  # Attach the .deb to the GitHub Release on a v* tag — only once DebInstall
+  # has proved it on every supported release.
+  DebRelease:
+    needs: [DetectChanges, Deb, DebInstall]
+    if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          name: displayxr-runtime-deb
+          path: dist
+
+      - name: Attach .deb to the GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/displayxr-runtime_*_amd64.deb
