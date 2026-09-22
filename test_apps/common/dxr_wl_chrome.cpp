@@ -321,7 +321,10 @@ DxrWlChrome::update(int32_t content_w, int32_t content_h, double scale)
 	// WSI's next present commits it (the app never commits that surface once
 	// the session exists). Not touched at all without CSD: an undecorated or
 	// server-decorated window keeps the compositor's default (the surface).
-	if (m_mode == Mode::ClientSide) {
+	if (m_mode == Mode::ClientSide || m_geom_set) {
+		// (m_geom_set with another mode: the compositor switched to server-side
+		// decorations after we had drawn our own — hand the geometry back to
+		// the plain surface rect.)
 		const int32_t gx = 0, gy = want_shown ? -bar : 0;
 		const int32_t gw = content_w, gh = content_h + (want_shown ? bar : 0);
 		if (!m_geom_set || gx != m_geom_x || gy != m_geom_y || gw != m_geom_w || gh != m_geom_h) {
