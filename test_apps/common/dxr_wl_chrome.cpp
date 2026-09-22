@@ -211,8 +211,8 @@ DxrWlChrome::attach(struct wl_display *display,
 	m_subsurface = wl_subcompositor_get_subsurface(m_subcompositor, m_surface, content);
 	// Parent state: applied by the helper's one pre-session commit of the
 	// content surface, and never changed afterwards — the bar is always
-	// kLogicalHeight LOGICAL px, whatever the scale.
-	wl_subsurface_set_position(m_subsurface, 0, -(int32_t)dxr_csd::TitleBar::kLogicalHeight);
+	// Style::barHeight LOGICAL px, whatever the scale.
+	wl_subsurface_set_position(m_subsurface, 0, -m_bar.logicalHeight());
 	// Desync: the bar repaints on its own commits, never waiting on the WSI's.
 	wl_subsurface_set_desync(m_subsurface);
 	if (viewporter != nullptr) {
@@ -287,7 +287,7 @@ DxrWlChrome::on_toplevel_states(struct wl_array *states, bool sized)
 int32_t
 DxrWlChrome::bar_logical() const
 {
-	return (m_mode == Mode::ClientSide && !m_fullscreen) ? (int32_t)dxr_csd::TitleBar::kLogicalHeight : 0;
+	return (m_mode == Mode::ClientSide && !m_fullscreen) ? m_bar.logicalHeight() : 0;
 }
 
 const char *
@@ -315,7 +315,7 @@ DxrWlChrome::update(int32_t content_w, int32_t content_h, double scale)
 		return;
 	}
 	const bool want_shown = bar_logical() > 0;
-	const int32_t bar = (int32_t)dxr_csd::TitleBar::kLogicalHeight;
+	const int32_t bar = m_bar.logicalHeight();
 
 	// Window geometry = the visible frame. Pending on the CONTENT surface; the
 	// WSI's next present commits it (the app never commits that surface once
@@ -424,7 +424,7 @@ DxrWlChrome::repaint()
 
 	wl_surface_attach(m_surface, b->buffer, 0, 0);
 	if (m_viewport != nullptr) {
-		wp_viewport_set_destination(m_viewport, m_content_w, (int32_t)dxr_csd::TitleBar::kLogicalHeight);
+		wp_viewport_set_destination(m_viewport, m_content_w, m_bar.logicalHeight());
 	} else {
 		wl_surface_set_buffer_scale(m_surface, (int32_t)m_scale);
 	}
@@ -435,7 +435,7 @@ DxrWlChrome::repaint()
 	if (!m_shown) {
 		CHROME_INFO("Wayland chrome: title bar shown — %ux%u px buffer for %dx%d logical at scale %.4f, "
 		            "corner radius %u px",
-		            w, h, m_content_w, (int)dxr_csd::TitleBar::kLogicalHeight, m_scale, m_bar.cornerRadius());
+		            w, h, m_content_w, (int)m_bar.logicalHeight(), m_scale, m_bar.cornerRadius());
 	}
 	m_shown = true;
 	m_buf_w = w;
@@ -477,7 +477,7 @@ DxrWlChrome::update_blur_region()
 	// corners are approximated one logical row at a time — close enough that
 	// no blurred square corner shows outside the anti-aliased edge.
 	struct wl_region *region = wl_compositor_create_region(m_compositor);
-	const int32_t bar = (int32_t)dxr_csd::TitleBar::kLogicalHeight;
+	const int32_t bar = m_bar.logicalHeight();
 	const double r = m_scale > 0.0 ? (double)radius / m_scale : 0.0;
 	const int32_t rows = (int32_t)std::ceil(r);
 	for (int32_t y = 0; y < rows && y < bar; y++) {

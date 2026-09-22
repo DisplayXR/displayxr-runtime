@@ -135,7 +135,8 @@ enum class DxrKey
 	V,
 	Num1,
 	Num2,
-	Num3
+	Num3,
+	F11 //!< handled INSIDE pump() (toggle_fullscreen); never reaches on_key
 };
 
 //! What to create. Sizes are panel pixels; the panel rect comes from
@@ -215,6 +216,25 @@ public:
 	 */
 	void
 	pump(const std::function<void(DxrKey)> &on_key, bool *running);
+
+	/*!
+	 * F11: toggle fullscreen. Onto the 3D panel's output / RandR monitor when
+	 * one was matched at create, else wherever the compositor puts it. pump()
+	 * calls this itself on F11, on both backends, so apps need not.
+	 *
+	 * Wayland: xdg_toplevel.set_fullscreen(panel wl_output) / unset. The
+	 * declared buffer follows (the panel's MODE while fullscreen on it, the
+	 * windowed configure x scale after), and the title bar hides / returns.
+	 * X11: _NET_WM_STATE_FULLSCREEN + _NET_WM_FULLSCREEN_MONITORS, and the
+	 * client-owned drag is disabled while fullscreen.
+	 *
+	 * @return false when there is no window to toggle.
+	 */
+	bool
+	toggle_fullscreen();
+
+	bool
+	is_fullscreen() const;
 
 	//! Live window size in BUFFER pixels — the space the runtime's swapchain
 	//! and every rect handed to it live in. X11 reads XGetWindowAttributes;
@@ -343,6 +363,8 @@ private:
 	 * would slide the panel-sized weave off the panel.
 	 */
 	bool m_x_client_drag = false;
+	//! Fullscreen now (created panel-sized, or toggled by F11).
+	bool m_x_fullscreen = false;
 	bool m_x_dragging = false;
 	int m_x_drag_ptr_x = 0;    //!< pointer root position at the grab
 	int m_x_drag_ptr_y = 0;    //!< ...
@@ -381,6 +403,7 @@ private:
 	int m_x_test_drag_steps = 0;
 	int m_x_test_drag_step = 0;
 	uint64_t m_x_pump_count = 0;
+	uint64_t m_test_fs_pumps = 0; //!< DXR_TEST_FULLSCREEN_TOGGLE counter
 
 	//! Run the snap provider, or identity when there is none / it declines.
 	//! Reports once, the first time it is asked, what it resolved to.
@@ -524,6 +547,24 @@ private:
 	 */
 	int32_t m_wl_fullscreen_mode_w = 0;
 	int32_t m_wl_fullscreen_mode_h = 0;
+
+	//! The wl_output matched to the 3D panel at create (NULL when none), and
+	//! its mode — the F11 target and its 1:1 buffer size.
+	struct wl_output *m_wl_panel_output = nullptr;
+	int32_t m_wl_panel_mode_w = 0, m_wl_panel_mode_h = 0;
+	//! Fullscreen now, per the last sized configure (or the create request).
+	bool m_wl_fullscreen = false;
+	//! We sent unset_fullscreen and have not seen its configure yet.
+	bool m_wl_unfullscreen_pending = false;
+	//! The current / last fullscreen request targeted the panel output.
+	bool m_wl_fs_on_panel = true;
+	//! Last windowed CONTENT size, logical — where leaving fullscreen returns.
+	int32_t m_wl_windowed_w = 0, m_wl_windowed_h = 0;
+
+	//! Apply a fullscreen state change from a configure. @p cfg_w/h is the
+	//! configure size (may be 0x0 = "you choose").
+	void
+	wl_set_fullscreen_state(bool fs, int32_t *cfg_w, int32_t *cfg_h);
 
 	//! Size to declare to the runtime: the fullscreen output mode when there
 	//! is one, else the acked configure size.

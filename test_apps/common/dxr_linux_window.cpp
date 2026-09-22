@@ -363,6 +363,7 @@ DxrLinuxWindow::create_x11(const DxrLinuxWindowDesc &desc)
 	m_x_wm_drag = !want_fullscreen && wm_dec != nullptr && wm_dec[0] != '\0' && strcmp(wm_dec, "0") != 0;
 	const bool client_drag = !want_fullscreen && !m_x_wm_drag;
 	m_x_client_drag = client_drag;
+	m_x_fullscreen = want_fullscreen;
 
 	m_x_display = XOpenDisplay(nullptr);
 	if (m_x_display == nullptr) {
@@ -713,6 +714,7 @@ dxr_key_from_keysym(KeySym ks)
 	case XK_1: return DxrKey::Num1;
 	case XK_2: return DxrKey::Num2;
 	case XK_3: return DxrKey::Num3;
+	case XK_F11: return DxrKey::F11;
 	default: return DxrKey::Unknown;
 	}
 }
@@ -889,6 +891,24 @@ DxrLinuxWindow::s_toplevel_configure(void *data, struct xdg_toplevel *t, int32_t
 #else
 	(void)states;
 #endif
+	// Fullscreen state, for F11 and for the declared buffer size. Only a
+	// SIZED configure may clear it: mutter's first configure after a pre-map
+	// set_fullscreen is 0x0 and carries no fullscreen state yet.
+	bool fs = false, maximized = false;
+	if (states != nullptr) {
+		const uint32_t *st = static_cast<const uint32_t *>(states->data);
+		for (size_t i = 0; i < states->size / sizeof(uint32_t); i++) {
+			fs |= st[i] == XDG_TOPLEVEL_STATE_FULLSCREEN;
+			maximized |= st[i] == XDG_TOPLEVEL_STATE_MAXIMIZED;
+		}
+	}
+	if (fs || (w > 0 && h > 0) || self->m_wl_unfullscreen_pending) {
+		// (An unset_fullscreen WE asked for may be answered with 0x0 — the
+		// compositor has no windowed size to restore for a window that
+		// started fullscreen — and that answer must still count.)
+		self->m_wl_unfullscreen_pending = false;
+		self->wl_set_fullscreen_state(fs, &w, &h);
+	}
 	// 0x0 means "you choose"; keep whatever we asked for.
 	if (w > 0 && h > 0) {
 #ifdef DXR_APP_HAVE_WL_CHROME
@@ -899,7 +919,50 @@ DxrLinuxWindow::s_toplevel_configure(void *data, struct xdg_toplevel *t, int32_t
 #endif
 		self->m_wl_config_w = w;
 		self->m_wl_config_h = h;
+		if (!fs && !maximized) {
+			// Remembered so leaving fullscreen can come back to it.
+			self->m_wl_windowed_w = w;
+			self->m_wl_windowed_h = h;
+		}
 	}
+}
+
+void
+DxrLinuxWindow::wl_set_fullscreen_state(bool fs, int32_t *cfg_w, int32_t *cfg_h)
+{
+	if (fs == m_wl_fullscreen) {
+		return;
+	}
+	m_wl_fullscreen = fs;
+#ifdef DXR_APP_HAVE_WL_CHROME
+	// Authoritative for the bar too: a 0x0 unfullscreen configure carries
+	// nothing the chrome could read the transition from.
+	m_wl_chrome.set_fullscreen(fs);
+#endif
+	if (fs) {
+		// On the panel output the declared buffer is the panel's MODE — the
+		// 1:1 size, whatever the preferred scale says yet.
+		m_wl_fullscreen_mode_w = m_wl_fs_on_panel ? m_wl_panel_mode_w : 0;
+		m_wl_fullscreen_mode_h = m_wl_fs_on_panel ? m_wl_panel_mode_h : 0;
+		DXRW_INFO("Wayland: now fullscreen%s", m_wl_fs_on_panel ? " on the 3D panel's output" : "");
+		return;
+	}
+	m_wl_fullscreen_mode_w = 0;
+	m_wl_fullscreen_mode_h = 0;
+	// Leaving fullscreen with a 0x0 configure ("you choose"): a window that
+	// STARTED fullscreen has no size of its own for the compositor to restore,
+	// so pick one — the last windowed size, else two thirds of the output.
+	if (*cfg_w <= 0 || *cfg_h <= 0) {
+		int32_t ww = m_wl_windowed_w, wh = m_wl_windowed_h;
+		if (ww <= 0 || wh <= 0) {
+			ww = m_wl_config_w * 2 / 3;
+			wh = m_wl_config_h * 2 / 3;
+		}
+		m_wl_config_w = ww > 0 ? ww : 1280;
+		m_wl_config_h = wh > 0 ? wh : 720;
+	}
+	DXRW_INFO("Wayland: left fullscreen — windowed %dx%d logical", *cfg_w > 0 ? *cfg_w : m_wl_config_w,
+	          *cfg_h > 0 ? *cfg_h : m_wl_config_h);
 }
 
 void
@@ -1156,6 +1219,7 @@ DxrLinuxWindow::s_kb_key(void *data, struct wl_keyboard *kb, uint32_t serial, ui
 	case KEY_1: k = DxrKey::Num1; break;
 	case KEY_2: k = DxrKey::Num2; break;
 	case KEY_3: k = DxrKey::Num3; break;
+	case KEY_F11: k = DxrKey::F11; break;
 	default: return;
 	}
 	self->m_wl_key_queue.push_back(k);
@@ -1263,7 +1327,9 @@ DxrLinuxWindow::create_wayland(const DxrLinuxWindowDesc &desc)
 	m_wl_config_w = (int32_t)desc.width;
 	m_wl_config_h = (int32_t)desc.height;
 
-	if (desc.fullscreen_on_wayland) {
+	// The panel's wl_output is resolved whether or not the window starts
+	// fullscreen: F11 (toggle_fullscreen) fullscreens onto it later.
+	{
 		/*
 		 * INV-1.3 substitute. A Wayland client cannot place itself, so the
 		 * only way to land on the 3D panel is to go fullscreen on the
@@ -1335,7 +1401,7 @@ DxrLinuxWindow::create_wayland(const DxrLinuxWindowDesc &desc)
 				m_wl_fullscreen_mode_h = picked->mode_h;
 
 				if (exact_match != nullptr) {
-					DXRW_INFO("Wayland: fullscreen on the wl_output matching the 3D panel rect "
+					DXRW_INFO("Wayland: found the wl_output matching the 3D panel rect "
 					          "%ux%u+%d+%d in device pixels (logical origin %d,%d)",
 					          desc.panel_width, desc.panel_height, desc.panel_left,
 					          desc.panel_top, picked->logical_x, picked->logical_y);
@@ -1363,8 +1429,20 @@ DxrLinuxWindow::create_wayland(const DxrLinuxWindowDesc &desc)
 				                                  "zxdg_output_manager_v1 advertised?");
 			}
 		}
-		xdg_toplevel_set_fullscreen(m_wl_toplevel, chosen);
+		m_wl_panel_output = chosen;
+		m_wl_panel_mode_w = m_wl_fullscreen_mode_w;
+		m_wl_panel_mode_h = m_wl_fullscreen_mode_h;
+	}
+	if (desc.fullscreen_on_wayland) {
+		xdg_toplevel_set_fullscreen(m_wl_toplevel, m_wl_panel_output);
+		m_wl_fullscreen = true;
+		m_wl_fs_on_panel = m_wl_panel_output != nullptr;
 	} else {
+		// Not fullscreen (yet): the declared size is configure x scale.
+		m_wl_fullscreen_mode_w = 0;
+		m_wl_fullscreen_mode_h = 0;
+		m_wl_windowed_w = (int32_t)desc.width;
+		m_wl_windowed_h = (int32_t)desc.height;
 		// Windowed is supported from extension spec v2: the size below is
 		// declared through XrWaylandSurfaceGeometryDXR, so the runtime sizes
 		// its swapchain to this surface instead of resizing it to the panel.
@@ -1590,6 +1668,24 @@ DxrLinuxWindow::create(DxrWindowBackend backend, const DxrLinuxWindowDesc &desc)
 void
 DxrLinuxWindow::pump(const std::function<void(DxrKey)> &on_key, bool *running)
 {
+	// DXR_TEST_FULLSCREEN_TOGGLE=N (test hook, off by default): press F11 at
+	// pump N and again at 2N, so the toggle is verifiable with nobody at the
+	// keyboard — the same toggle_fullscreen() the key drives.
+	{
+		static const long s_toggle_every = [] {
+			const char *e = getenv("DXR_TEST_FULLSCREEN_TOGGLE");
+			return e != nullptr ? strtol(e, nullptr, 10) : 0L;
+		}();
+		if (s_toggle_every > 0) {
+			m_test_fs_pumps++;
+			if (m_test_fs_pumps == (uint64_t)s_toggle_every || m_test_fs_pumps == 2 * (uint64_t)s_toggle_every) {
+				DXRW_INFO("DXR_TEST_FULLSCREEN_TOGGLE: simulated F11 at pump %llu",
+				          (unsigned long long)m_test_fs_pumps);
+				toggle_fullscreen();
+			}
+		}
+	}
+
 	if (m_backend == DxrWindowBackend::X11) {
 		// Pump pending X events. The runtime borrows this Display's connection
 		// for its XCB surface but never reads events from it, so the app owns
@@ -1617,9 +1713,11 @@ DxrLinuxWindow::pump(const std::function<void(DxrKey)> &on_key, bool *running)
 				if (running != nullptr) {
 					*running = false;
 				}
-			} else if (ev.type == KeyPress && on_key) {
+			} else if (ev.type == KeyPress) {
 				DxrKey k = dxr_key_from_keysym(XLookupKeysym(&ev.xkey, 0));
-				if (k != DxrKey::Unknown) {
+				if (k == DxrKey::F11) {
+					toggle_fullscreen(); // a window concern: handled here
+				} else if (k != DxrKey::Unknown && on_key) {
 					on_key(k);
 				}
 			} else if (ev.type == ButtonPress && ev.xbutton.button == Button1 && m_x_client_drag &&
@@ -1730,8 +1828,10 @@ DxrLinuxWindow::pump(const std::function<void(DxrKey)> &on_key, bool *running)
 		// currentExtent — so republish before the next frame is drawn.
 		publish_wayland_geometry_if_changed();
 
-		if (on_key) {
-			for (DxrKey k : m_wl_key_queue) {
+		for (DxrKey k : m_wl_key_queue) {
+			if (k == DxrKey::F11) {
+				toggle_fullscreen(); // a window concern: handled here
+			} else if (on_key) {
 				on_key(k);
 			}
 		}
@@ -1993,6 +2093,75 @@ DxrLinuxWindow::force_declare_geometry(uint32_t width, uint32_t height)
 #else
 	(void)width;
 	(void)height;
+	return false;
+#endif
+}
+
+bool
+DxrLinuxWindow::toggle_fullscreen()
+{
+	if (m_backend == DxrWindowBackend::X11 && m_x_display != nullptr && m_x_window != 0) {
+		// Same EWMH recipe create_x11() uses for a panel-sized window: the
+		// fullscreen state, pinned to the panel's RandR monitor.
+		const bool want = !m_x_fullscreen;
+		Atom net_wm_state = XInternAtom(m_x_display, "_NET_WM_STATE", False);
+		Atom net_wm_state_fullscreen = XInternAtom(m_x_display, "_NET_WM_STATE_FULLSCREEN", False);
+		if (net_wm_state == None || net_wm_state_fullscreen == None) {
+			return false;
+		}
+		if (want) {
+			const X11MonitorRect mon = x11_resolve_monitor(m_x_display, DefaultRootWindow(m_x_display),
+			                                               m_desc.panel_left, m_desc.panel_top);
+			if (mon.index >= 0) {
+				Atom net_fs_monitors = XInternAtom(m_x_display, "_NET_WM_FULLSCREEN_MONITORS", False);
+				if (net_fs_monitors != None) {
+					x11_send_root_message(m_x_display, m_x_window, net_fs_monitors, mon.index,
+					                      mon.index, mon.index, mon.index, 1 /* source: application */);
+				}
+			}
+		}
+		x11_send_root_message(m_x_display, m_x_window, net_wm_state, want ? 1 /* ADD */ : 0 /* REMOVE */,
+		                      (long)net_wm_state_fullscreen, 0, 1 /* source: application */, 0);
+		XFlush(m_x_display);
+		m_x_fullscreen = want;
+		// A fullscreen window must not be draggable (a stray click would slide
+		// the panel-sized weave off the panel); a windowed one owns its drag
+		// unless the WM does.
+		m_x_client_drag = !want && !m_x_wm_drag;
+		DXRW_INFO("F11: X11 window %s", want ? "fullscreen on the 3D panel's monitor" : "windowed");
+		return true;
+	}
+#ifdef DXR_APP_HAVE_WAYLAND
+	if (m_backend == DxrWindowBackend::Wayland && m_wl_toplevel != nullptr) {
+		if (m_wl_fullscreen) {
+			xdg_toplevel_unset_fullscreen(m_wl_toplevel);
+			m_wl_unfullscreen_pending = true;
+			DXRW_INFO("F11: leaving fullscreen");
+		} else {
+			// Onto the 3D panel's output when one matched (a 3D app belongs
+			// there, and it is the INV-1.3 start-up placement too); else the
+			// compositor's choice — the output the window is on.
+			m_wl_fs_on_panel = m_wl_panel_output != nullptr;
+			xdg_toplevel_set_fullscreen(m_wl_toplevel, m_wl_panel_output);
+			DXRW_INFO("F11: fullscreen on %s", m_wl_fs_on_panel ? "the 3D panel's wl_output"
+			                                                   : "the compositor's choice (no panel output matched)");
+		}
+		wl_display_flush(m_wl_display);
+		return true;
+	}
+#endif
+	return false;
+}
+
+bool
+DxrLinuxWindow::is_fullscreen() const
+{
+	if (m_backend == DxrWindowBackend::X11) {
+		return m_x_fullscreen;
+	}
+#ifdef DXR_APP_HAVE_WAYLAND
+	return m_wl_fullscreen;
+#else
 	return false;
 #endif
 }

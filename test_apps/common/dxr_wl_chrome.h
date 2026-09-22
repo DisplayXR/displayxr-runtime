@@ -125,6 +125,13 @@ public:
 	void
 	on_toplevel_states(struct wl_array *states, bool sized);
 
+	//! The window's fullscreen state changed (the window tracks it; F11).
+	void
+	set_fullscreen(bool fs)
+	{
+		m_fullscreen = fs;
+	}
+
 	//! Bar height in LOGICAL px while the chrome is shown, else 0.
 	int32_t
 	bar_logical() const;
