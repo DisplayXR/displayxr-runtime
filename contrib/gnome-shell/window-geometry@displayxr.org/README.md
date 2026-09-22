@@ -21,6 +21,15 @@ measure. Without version 2 the display processor refuses to capture and falls
 back to silhouette intersection. Full contract:
 `docs/specs/runtime/wayland-window-geometry.md` §6.
 
+**Version 3 adds window placement** — `org.displayxr.WindowPlacement1`, one
+method that moves a window of the *calling process* to a given logical
+position, plus a `moving` flag on every published window. A Wayland client
+cannot position itself, but a weaving window has to land on the interlace
+lattice after a drag or the 3D shimmers, and only the compositor can put it
+there. Without version 3 the runtime keeps whatever phase the window was
+dropped on. Full contract:
+`docs/specs/runtime/wayland-window-geometry.md` §7.
+
 ## Install
 
 Both Linux packages install it. Only GNOME Shell loads it, so it has no effect

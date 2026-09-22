@@ -18,6 +18,7 @@
 #include "sim_display_zone_common.h"
 
 #include "xrt/xrt_display_processor.h"
+#include "xrt/xrt_display_processor_vk.h" // the snap_window_rect slot (#1588 / #1609)
 #include "xrt/xrt_display_metrics.h"
 
 #include "vk/vk_helpers.h"
@@ -79,7 +80,13 @@ DEBUG_GET_ONCE_NUM_OPTION(sim_display_interlace_period, "SIM_DISPLAY_INTERLACE_P
  */
 struct sim_display_processor
 {
-	struct xrt_display_processor base;
+	/*!
+	 * The VULKAN variant, so this test double can implement
+	 * @ref xrt_display_processor_vk::snap_window_rect (#1609). `base_vk.base`
+	 * is the plain base every other slot lives in, and it is the first member,
+	 * so the `(struct sim_display_processor *)xdp` cast below still holds.
+	 */
+	struct xrt_display_processor_vk base_vk;
 	struct vk_bundle *vk;
 	VkRenderPass render_pass;
 	//! One per output mode (SBS, anaglyph, blend, squeezed SBS, quad,
@@ -869,6 +876,43 @@ sim_dp_publish_local_zone_mask(struct xrt_display_processor *xdp,
 	return true;
 }
 
+/*!
+ * #1588 / #1609 — the test double's phase lattice.
+ *
+ * A real vendor weaver snaps a window origin onto the lens lattice and never
+ * publishes what that lattice is; sim_display has one it CAN state:
+ * SIM_DISPLAY_INTERLACE_PERIOD, the stripe width its interlaced output draws
+ * with. Phase is preserved when the displacement from @p origin_x is a whole
+ * number of stripes, so that is what this snaps to — horizontally only, as a
+ * vertical lenticular's phase does not depend on y.
+ *
+ * With the default period of 1 every position is phase-correct and this is the
+ * identity, which is exactly what a test double should be until asked
+ * otherwise. Set SIM_DISPLAY_INTERLACE_PERIOD=8 to exercise the runtime's
+ * reachable-lattice search and the Wayland post-drop move without hardware.
+ */
+static bool
+sim_dp_snap_window_rect(struct xrt_display_processor_vk *xdp,
+                        int32_t origin_x,
+                        int32_t origin_y,
+                        int32_t target_x,
+                        int32_t target_y,
+                        int32_t *out_x,
+                        int32_t *out_y)
+{
+	struct sim_display_processor *sdp = (struct sim_display_processor *)xdp;
+	if (out_x == NULL || out_y == NULL) {
+		return false;
+	}
+	const int32_t period = sdp->interlace_period_px > 0 ? sdp->interlace_period_px : 1;
+	const int32_t dx = target_x - origin_x;
+	// Round to the nearest whole number of stripes, halves away from zero.
+	const int32_t n = dx >= 0 ? (dx + period / 2) / period : -((-dx + period / 2) / period);
+	*out_x = origin_x + n * period;
+	*out_y = target_y;
+	return true;
+}
+
 static bool
 sim_dp_clear_local_zone_mask(struct xrt_display_processor *xdp)
 {
@@ -905,19 +949,23 @@ sim_display_processor_create(enum sim_display_output_mode mode,
 
 	// ADR-020 rule 1: advertise the vtable size so the runtime knows which
 	// slots this plug-in actually built (calloc already zeroed reserved_0).
-	sdp->base.struct_size = (uint32_t)sizeof(struct xrt_display_processor);
-	sdp->base.destroy = sim_dp_destroy;
-	sdp->base.get_render_pass = sim_dp_get_render_pass;
-	sdp->base.get_predicted_eye_positions = sim_dp_get_predicted_eye_positions;
-	sdp->base.get_display_dimensions = sim_dp_get_display_dimensions;   // #856
-	sdp->base.get_display_pixel_info = sim_dp_get_display_pixel_info;   // #856
-	sdp->base.is_alpha_native = sim_dp_is_alpha_native;
-	sdp->base.set_background_2d = sim_dp_set_background_2d; // #491 part 3
-	sdp->base.get_handoff_color_capability = sim_dp_get_handoff_color_capability; // #1484 / ADR-021
-	sdp->base.set_atlas_encoding = sim_dp_set_atlas_encoding;                     // #1484 / ADR-021
-	sdp->base.get_local_zone_caps = sim_dp_get_local_zone_caps;          // #224 / ADR-027
-	sdp->base.publish_local_zone_mask = sim_dp_publish_local_zone_mask;  // #224 / ADR-027
-	sdp->base.clear_local_zone_mask = sim_dp_clear_local_zone_mask;      // #224 / ADR-027
+	// ADR-020: advertise the VK variant's size — this DP fills base slots plus
+	// the vk snap_window_rect below; every other vk slot stays NULL (calloc),
+	// and the runtime's wrappers check both the size and the pointer.
+	sdp->base_vk.base.struct_size = (uint32_t)sizeof(struct xrt_display_processor_vk);
+	sdp->base_vk.snap_window_rect = sim_dp_snap_window_rect; // #1588 / #1609
+	sdp->base_vk.base.destroy = sim_dp_destroy;
+	sdp->base_vk.base.get_render_pass = sim_dp_get_render_pass;
+	sdp->base_vk.base.get_predicted_eye_positions = sim_dp_get_predicted_eye_positions;
+	sdp->base_vk.base.get_display_dimensions = sim_dp_get_display_dimensions; // #856
+	sdp->base_vk.base.get_display_pixel_info = sim_dp_get_display_pixel_info; // #856
+	sdp->base_vk.base.is_alpha_native = sim_dp_is_alpha_native;
+	sdp->base_vk.base.set_background_2d = sim_dp_set_background_2d;                       // #491 part 3
+	sdp->base_vk.base.get_handoff_color_capability = sim_dp_get_handoff_color_capability; // #1484 / ADR-021
+	sdp->base_vk.base.set_atlas_encoding = sim_dp_set_atlas_encoding;                     // #1484 / ADR-021
+	sdp->base_vk.base.get_local_zone_caps = sim_dp_get_local_zone_caps;                   // #224 / ADR-027
+	sdp->base_vk.base.publish_local_zone_mask = sim_dp_publish_local_zone_mask;           // #224 / ADR-027
+	sdp->base_vk.base.clear_local_zone_mask = sim_dp_clear_local_zone_mask;               // #224 / ADR-027
 
 	// #224 / ADR-027 zone test double config (shared parser).
 	sim_zone_config_from_env(&sdp->zone_cfg, "VK");
@@ -942,11 +990,11 @@ sim_display_processor_create(enum sim_display_output_mode mode,
 	}
 
 	sdp->vk = vk;
-	sdp->base.process_atlas = sim_dp_process_atlas;
+	sdp->base_vk.base.process_atlas = sim_dp_process_atlas;
 
 	if (!create_pipeline_resources(sdp, target_format)) {
 		U_LOG_E("sim_display: Failed to create pipeline resources");
-		sim_dp_destroy(&sdp->base);
+		sim_dp_destroy(&sdp->base_vk.base);
 		return XRT_ERROR_VULKAN;
 	}
 
@@ -961,7 +1009,7 @@ sim_display_processor_create(enum sim_display_output_mode mode,
 	        mode == SIM_DISPLAY_OUTPUT_INTERLACED      ? "Interlaced" :
 	        mode == SIM_DISPLAY_OUTPUT_PASSTHROUGH     ? "Passthrough" : "Blend");
 
-	*out_xdp = &sdp->base;
+	*out_xdp = &sdp->base_vk.base;
 	return XRT_SUCCESS;
 }
 

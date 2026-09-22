@@ -101,6 +101,22 @@ struct comp_vk_native_wl_window_rect
 	//! Content top minus frame top, DEVICE px: the client-side title bar's
 	//! height, 0 without one. Diagnostic only.
 	int32_t frame_inset_top_px;
+
+	/*!
+	 * The window FRAME's top-left in the publisher's LOGICAL stage
+	 * coordinates — the space @ref comp_vk_native_wl_geom_move_window speaks,
+	 * and the only field here that is not device pixels (its name says so).
+	 */
+	int32_t frame_logical_x, frame_logical_y;
+
+	/*!
+	 * An interactive grab (move / resize) is in progress on this window: the
+	 * user is still dragging it, so nothing may reposition it (#1609).
+	 * Requires publisher version 3; @ref have_moving is false against an older
+	 * one, and the caller must then settle on geometry alone.
+	 */
+	bool moving;
+	bool have_moving;
 };
 
 /*!
@@ -121,6 +137,24 @@ struct comp_vk_native_wl_window_rect
 bool
 comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g,
                                        struct comp_vk_native_wl_window_rect *out_rect);
+
+/*!
+ * Ask the compositor to move this process's window so its FRAME's top-left
+ * lands on (@p frame_logical_x, @p frame_logical_y) — the publisher's logical
+ * stage coordinates, i.e. the space @ref comp_vk_native_wl_window_rect
+ * ::frame_logical_x reports.
+ *
+ * This is the one thing a Wayland client cannot do for itself and the
+ * lenticular phase needs after a drag (#1609). The publisher only ever moves
+ * windows of the CALLING process, and refuses while the user is still
+ * dragging.
+ *
+ * @return true when the compositor reported the window moved. False covers
+ *         "publisher too old to have the method" as well as a refusal, and is
+ *         never fatal: the window simply stays where the user dropped it.
+ */
+bool
+comp_vk_native_wl_geom_move_window(struct comp_vk_native_wl_geom *g, int32_t frame_logical_x, int32_t frame_logical_y);
 
 void
 comp_vk_native_wl_geom_destroy(struct comp_vk_native_wl_geom **g_ptr);
