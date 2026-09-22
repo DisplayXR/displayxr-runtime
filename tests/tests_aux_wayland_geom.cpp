@@ -376,3 +376,58 @@ TEST_CASE("a windowed surface is 1:1 against its own DEVICE extent")
 	REQUIRE(u_wl_present_is_1to1(1920, 1080, (uint32_t)win.w, (uint32_t)win.h));
 	REQUIRE_FALSE(u_wl_present_is_1to1(960, 540, (uint32_t)win.w, (uint32_t)win.h));
 }
+
+
+/*
+ *
+ * Frame vs buffer: which rect is the content (#1654).
+ *
+ */
+
+TEST_CASE("an undecorated window: frame and buffer agree, the buffer is used")
+{
+	const struct u_wl_rect_logical frame = {257, 173, 1280, 720};
+	const struct u_wl_rect_logical buffer = frame;
+	struct u_wl_rect_logical out = {};
+	REQUIRE(u_wl_window_content_rect(&frame, &buffer, &out));
+	REQUIRE(out.logical_y == 173);
+	REQUIRE(u_wl_surface_within_frame(&frame, &buffer));
+}
+
+TEST_CASE("a client-side title bar: the content is the buffer, a bar-height below the frame")
+{
+	// Measured on GNOME 50 (1.6667 laptop): cube_handle_vk_linux --windowed
+	// with its 46 px title bar in a subsurface at y = -46. Mutter's frame is
+	// the window geometry (bar + content); its buffer rect is the bound
+	// surface alone.
+	const struct u_wl_rect_logical frame = {257, 173, 1280, 766};
+	const struct u_wl_rect_logical buffer = {257, 219, 1280, 720};
+	struct u_wl_rect_logical out = {};
+	REQUIRE(u_wl_window_content_rect(&frame, &buffer, &out));
+	REQUIRE(out.logical_x == 257);
+	REQUIRE(out.logical_y == 219);
+	REQUIRE(out.logical_w == 1280);
+	REQUIRE(out.logical_h == 720);
+	// A bar is not a mapping fault.
+	REQUIRE(u_wl_surface_within_frame(&frame, &buffer));
+}
+
+TEST_CASE("no published buffer rect: fall back to the frame")
+{
+	const struct u_wl_rect_logical frame = {10, 20, 800, 600};
+	struct u_wl_rect_logical out = {};
+	REQUIRE_FALSE(u_wl_window_content_rect(&frame, nullptr, &out));
+	REQUIRE(out.logical_y == 20);
+	const struct u_wl_rect_logical empty = {0, 0, 0, 0};
+	REQUIRE_FALSE(u_wl_window_content_rect(&frame, &empty, &out));
+	REQUIRE(out.logical_h == 600);
+}
+
+TEST_CASE("an unmapped device-pixel buffer spills past the frame")
+{
+	// The #1653 case: frame 1920x1080 logical, a 3840x2160 buffer attached
+	// with no viewport at 200 % -> a 3840x2160-LOGICAL surface.
+	const struct u_wl_rect_logical frame = {1728, 0, 1920, 1080};
+	const struct u_wl_rect_logical buffer = {1728, 0, 3840, 2160};
+	REQUIRE_FALSE(u_wl_surface_within_frame(&frame, &buffer));
+}

@@ -50,6 +50,18 @@
  *   VkSurfaceKHR borrows the Xlib Display / wl_display connection for its
  *   lifetime, so the connection must outlive the session.
  *
+ * WAYLAND WINDOW CHROME (#1654):
+ *   GNOME's mutter gives Wayland clients no server-side decorations, so a
+ *   WINDOWED native-Wayland toplevel gets a client-side title bar: the shared
+ *   displayxr::csd painter (displayxr-common#52) in a wl_subsurface ABOVE the
+ *   bound surface — see dxr_wl_chrome.h. The bound surface stays exactly the
+ *   content rect (the bar never reaches the swapchain, the atlas or the
+ *   weave); window geometry is bar + content, so xdg_toplevel.configure sizes
+ *   are frame sizes and the helper subtracts the bar before declaring the
+ *   content size. Fullscreen hides the bar. Server-side decorations are
+ *   preferred where zxdg_decoration_manager_v1 offers them; DXR_WL_CSD=0
+ *   turns the chrome off, DXR_WL_CSD=force draws it regardless.
+ *
  * WAYLAND CONTRACT (see docs/specs/extensions/XR_DXR_wayland_surface_binding.md):
  *   - The surface must already have an xdg role and its first configure must be
  *     ACKED before xrCreateSession: the runtime calls vkCreateWaylandSurfaceKHR
@@ -83,6 +95,9 @@
 // Likewise: the Wayland binding header forward-declares wl_display/wl_surface,
 // so the real definitions have to come first.
 #include <wayland-client.h>
+#ifdef DXR_APP_HAVE_WL_CHROME
+#include "dxr_wl_chrome.h" // title bar for the native-Wayland leg (#1654)
+#endif
 #endif
 
 #include <openxr/openxr.h>
@@ -440,6 +455,18 @@ private:
 		int32_t refresh_mhz = 0; //!< wl_output.mode refresh, milli-hertz
 	};
 
+#ifdef DXR_APP_HAVE_WL_CHROME
+	//! Title bar (client-side decorations) — see dxr_wl_chrome.h, #1654.
+	DxrWlChrome m_wl_chrome;
+#endif
+
+	//! Logical -> device scale of the surface, for the chrome's raster.
+	double
+	wl_surface_scale() const
+	{
+		return m_wl_pref_scale_120 > 0 ? (double)m_wl_pref_scale_120 / 120.0 : 1.0;
+	}
+
 	struct wl_display *m_wl_display = nullptr;
 	struct wl_registry *m_wl_registry = nullptr;
 	struct wl_compositor *m_wl_compositor = nullptr;
@@ -475,6 +502,8 @@ private:
 	std::vector<WlOutput> m_wl_outputs;
 
 	bool m_wl_configured = false;
+	//! CONTENT size, LOGICAL px: the last xdg_toplevel.configure minus the
+	//! title bar (#1654) — the size of the bound surface, never the frame.
 	int32_t m_wl_config_w = 0;
 	int32_t m_wl_config_h = 0;
 	//! Refresh of the output the surface went fullscreen on (0 = unknown).

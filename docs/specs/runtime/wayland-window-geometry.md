@@ -255,10 +255,22 @@ is what lets any package ship it and any runtime consume it.
 
 (Capture-exclusion limitations are listed with it, in §6.6.)
 
-- **Frame vs buffer rect** — the phase needs the rect where the *surface
-  pixels* land. For CSD toolkits the buffer rect includes shadow margins;
-  both rects are published, `frame` is consumed. Hardware validation decides
-  whether a per-toolkit correction is needed.
+- **Frame vs buffer rect — resolved (#1654): the `buffer` rect is consumed.**
+  The phase, the Kooima canvas and the 1:1 check all need the rect where the
+  bound surface's pixels land, and that is Mutter's buffer rect
+  (`get_buffer_rect()`, the main surface), not the frame (`get_frame_rect()`,
+  the window geometry). An undecorated surface has the two equal, so nothing
+  changed for it. A client-side-decorated one differs by the title bar. The
+  test apps draw that bar in a subsurface above the bound surface and set the
+  window geometry to bar + content. Measured on GNOME 50 at 1.6667, a
+  1280x720 windowed cube reports frame `[257,173,1280,766]` and buffer
+  `[257,219,1280,720]`, and the present origin follows the buffer. The frame
+  is kept for two things. It is the fallback when a publisher reports no
+  buffer. And a surface that spills **past** the frame is the #1653
+  signature of a buffer not mapped to its configured size, which the 1:1
+  gate still degrades on (`u_wl_surface_within_frame`). A toolkit whose main
+  surface carries shadow margins would weave into those margins too. That is
+  a property of the app's surface, not of this provider.
 - **PID matching** assumes the in-process app path (window owner ==
   runtime process). IPC/service mode needs the client PID plumbed through.
 - **GNOME only** — KDE could be served by the existing

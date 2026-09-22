@@ -76,9 +76,12 @@ struct wlg_window
 	float mon_scale;
 	//! False when Mutter published no `monitor` object (window on no monitor).
 	bool have_monitor;
-	//! Buffer rect SIZE, LOGICAL px (Meta.Window.get_buffer_rect): the size
-	//! the compositor actually gives the committed surface, as opposed to the
-	//! frame the toplevel was configured to. False when not published.
+	//! Buffer rect, LOGICAL px, same coordinates (Meta.Window.get_buffer_rect):
+	//! where the committed MAIN surface actually is — the surface bound to the
+	//! runtime. Differs from the frame by a client-side title bar (#1654) or by
+	//! a buffer not mapped to its configured size (#1653). False when not
+	//! published.
+	int32_t buffer_logical_x, buffer_logical_y;
 	int32_t buffer_logical_w, buffer_logical_h;
 	bool have_buffer;
 };
@@ -97,7 +100,7 @@ struct comp_vk_native_wl_geom
 	bool warned_schema;      //!< one-shot WARN guard (publisher schema too new)
 	bool warned_no_monitor;  //!< one-shot WARN guard (payload carried no monitor rect)
 	//! Last surface-vs-frame comparison logged (logical px), on change only.
-	int32_t logged_surface_w, logged_surface_h, logged_frame_w, logged_frame_h;
+	int32_t logged_surface_w, logged_surface_h, logged_frame_w, logged_frame_h, logged_inset_y;
 	int64_t next_retry_ns;   //!< earliest monotonic time for the next blocking GetWindows retry
 };
 
@@ -173,6 +176,8 @@ wlg_parse_snapshot(struct comp_vk_native_wl_geom *g, const char *json)
 
 		const cJSON *buffer = u_json_get(win, "buffer");
 		if (cJSON_IsArray(buffer) && cJSON_GetArraySize(buffer) == 4) {
+			out->buffer_logical_x = (int32_t)cJSON_GetArrayItem(buffer, 0)->valuedouble;
+			out->buffer_logical_y = (int32_t)cJSON_GetArrayItem(buffer, 1)->valuedouble;
 			out->buffer_logical_w = (int32_t)cJSON_GetArrayItem(buffer, 2)->valuedouble;
 			out->buffer_logical_h = (int32_t)cJSON_GetArrayItem(buffer, 3)->valuedouble;
 			out->have_buffer = out->buffer_logical_w > 0 && out->buffer_logical_h > 0;
@@ -570,10 +575,26 @@ comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g, struct 
 	    .mode_h = 0,
 	};
 
+	/*
+	 * WHICH rect (#1654): the one the bound surface occupies — Mutter's
+	 * buffer rect — not the frame. The frame is the window geometry, and a
+	 * client-side-decorated window (the test apps' native-Wayland leg draws
+	 * its title bar in a subsurface above the bound surface) makes that bar +
+	 * content. Anchoring the present origin, the Kooima canvas or the 1:1
+	 * comparison to it puts all three a bar-height off. Undecorated, the two
+	 * rects are equal and nothing changes.
+	 */
+	const struct u_wl_rect_logical frame_logical = {best->logical_x, best->logical_y, best->logical_w,
+	                                                best->logical_h};
+	const struct u_wl_rect_logical buffer_logical = {best->buffer_logical_x, best->buffer_logical_y,
+	                                                 best->buffer_logical_w, best->buffer_logical_h};
+	struct u_wl_rect_logical content_logical = frame_logical;
+	u_wl_window_content_rect(&frame_logical, best->have_buffer ? &buffer_logical : NULL, &content_logical);
+
 	struct u_wl_rect_px win_px = {0, 0, 0, 0};
 	int32_t mon_w_px = 0, mon_h_px = 0;
-	if (!u_wl_window_rect_px_on_monitor(&mon, best->logical_x, best->logical_y, best->logical_w, best->logical_h,
-	                                    &win_px) ||
+	if (!u_wl_window_rect_px_on_monitor(&mon, content_logical.logical_x, content_logical.logical_y,
+	                                    content_logical.logical_w, content_logical.logical_h, &win_px) ||
 	    !u_wl_monitor_size_px(&mon, &mon_w_px, &mon_h_px) || win_px.w <= 0 || win_px.h <= 0) {
 		return false;
 	}
@@ -585,11 +606,11 @@ comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g, struct 
 		// a scaled desktop is now a supported configuration for the phase
 		// feed, not a degradation.
 		U_LOG_I(
-		    "wl_geom: monitor scale %.4f — window logical %d,%d %dx%d on a %dx%d logical monitor "
+		    "wl_geom: monitor scale %.4f — window content logical %d,%d %dx%d on a %dx%d logical monitor "
 		    "converts to DEVICE %d,%d %dx%d on a %dx%d px monitor (#1596)",
-		    (double)best->mon_scale, best->logical_x, best->logical_y, best->logical_w, best->logical_h,
-		    best->mon_logical_w, best->mon_logical_h, win_px.x, win_px.y, win_px.w, win_px.h, mon_w_px,
-		    mon_h_px);
+		    (double)best->mon_scale, content_logical.logical_x, content_logical.logical_y,
+		    content_logical.logical_w, content_logical.logical_h, best->mon_logical_w, best->mon_logical_h,
+		    win_px.x, win_px.y, win_px.w, win_px.h, mon_w_px, mon_h_px);
 	}
 
 	out_rect->left_px = win_px.x;
@@ -601,43 +622,62 @@ comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g, struct 
 	out_rect->scale = best->mon_scale;
 
 	/*
-	 * The committed SURFACE, which is not necessarily the frame above. The
-	 * frame is what the toplevel was configured to; the buffer rect is what
-	 * the compositor actually sized the surface to from the attached buffer,
-	 * its buffer scale and its viewport. They differ when the client attaches
-	 * a device-pixel buffer with no wp_viewport destination and no
-	 * wl_surface.set_buffer_scale: at 200 % a 3840x2160 buffer then IS a
-	 * 3840x2160-logical surface, twice the output, and spills onto the next
-	 * monitor while the frame still reads 1920x1080. Logged on change so a
-	 * run can never again look right in the log and wrong on the glass.
+	 * The committed SURFACE vs the FRAME. Two different reasons they differ,
+	 * and only one is a fault:
+	 *
+	 *  - the surface lies INSIDE the frame: client-side decorations (#1654).
+	 *    The frame is the window geometry, i.e. title bar + content; the
+	 *    surface is the content. Expected — the rect above already is the
+	 *    surface.
+	 *  - the surface spills PAST the frame: the client attached a device-pixel
+	 *    buffer with no wp_viewport destination and no
+	 *    wl_surface.set_buffer_scale (#1653). At 200 % a 3840x2160 buffer
+	 *    then IS a 3840x2160-logical surface, twice the output, spilling onto
+	 *    the next monitor while the frame still reads 1920x1080.
+	 *
+	 * surface_within_frame carries that verdict to the 1:1 gate; the log line
+	 * is on change only, so a run can never again look right in the log and
+	 * wrong on the glass.
 	 */
 	out_rect->surface_width_px = 0;
 	out_rect->surface_height_px = 0;
+	out_rect->surface_within_frame = true;
+	out_rect->frame_inset_top_px = 0;
 	if (best->have_buffer) {
 		out_rect->surface_width_px =
 		    (uint32_t)u_wl_logical_to_px(best->buffer_logical_w, (double)best->mon_scale);
 		out_rect->surface_height_px =
 		    (uint32_t)u_wl_logical_to_px(best->buffer_logical_h, (double)best->mon_scale);
+		out_rect->surface_within_frame = u_wl_surface_within_frame(&frame_logical, &buffer_logical);
+		const int32_t inset_y = best->buffer_logical_y - best->logical_y;
+		out_rect->frame_inset_top_px = u_wl_logical_to_px(inset_y, (double)best->mon_scale);
 		if (best->buffer_logical_w != g->logged_surface_w || best->buffer_logical_h != g->logged_surface_h ||
-		    best->logical_w != g->logged_frame_w || best->logical_h != g->logged_frame_h) {
+		    best->logical_w != g->logged_frame_w || best->logical_h != g->logged_frame_h ||
+		    inset_y != g->logged_inset_y) {
 			g->logged_surface_w = best->buffer_logical_w;
 			g->logged_surface_h = best->buffer_logical_h;
 			g->logged_frame_w = best->logical_w;
 			g->logged_frame_h = best->logical_h;
-			const bool match = abs(best->buffer_logical_w - best->logical_w) <= 1 &&
+			g->logged_inset_y = inset_y;
+			const bool equal = abs(best->buffer_logical_w - best->logical_w) <= 1 &&
 			                   abs(best->buffer_logical_h - best->logical_h) <= 1;
-			if (match) {
+			if (equal) {
 				U_LOG_I("wl_geom: committed surface %dx%d logical matches the window frame %dx%d",
 				        best->buffer_logical_w, best->buffer_logical_h, best->logical_w,
 				        best->logical_h);
+			} else if (out_rect->surface_within_frame) {
+				U_LOG_W(
+				    "wl_geom: window frame %dx%d logical contains the committed surface %dx%d at "
+				    "+%d,+%d — client-side decorations (#1654). Present origin, canvas and the 1:1 "
+				    "check follow the SURFACE, not the frame.",
+				    best->logical_w, best->logical_h, best->buffer_logical_w, best->buffer_logical_h,
+				    best->buffer_logical_x - best->logical_x, inset_y);
 			} else {
 				U_LOG_W(
 				    "wl_geom: committed SURFACE is %dx%d logical but the window FRAME is %dx%d — the "
 				    "attached buffer is not mapped to the configured size (the client set no "
-				    "wp_viewport "
-				    "destination / wl_surface.set_buffer_scale matching it), so the window on screen "
-				    "is the "
-				    "surface size, not the frame. (Monitor scale %.4f.)",
+				    "wp_viewport destination / wl_surface.set_buffer_scale matching it), so the "
+				    "window on screen is the surface size, not the frame. (Monitor scale %.4f.)",
 				    best->buffer_logical_w, best->buffer_logical_h, best->logical_w, best->logical_h,
 				    (double)best->mon_scale);
 			}

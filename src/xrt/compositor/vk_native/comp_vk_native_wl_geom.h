@@ -68,9 +68,16 @@ comp_vk_native_wl_geom_create(void);
  */
 struct comp_vk_native_wl_window_rect
 {
-	//! Window top-left in DEVICE px, RELATIVE to its monitor's top-left.
+	/*!
+	 * The window's CONTENT — the bound surface, where the runtime's pixels
+	 * land — top-left in DEVICE px, RELATIVE to its monitor's top-left.
+	 *
+	 * Mutter's buffer rect when the publisher reports it, else the frame
+	 * (#1654): with client-side decorations the frame includes a title bar
+	 * that is not part of the surface. Undecorated, the two are equal.
+	 */
 	int32_t left_px, top_px;
-	//! Window size in DEVICE px.
+	//! Content size in DEVICE px (same source as the origin).
 	uint32_t width_px, height_px;
 	//! The monitor's own size in DEVICE px. The caller compares this against
 	//! the panel's native size to decide whether the window is on the 3D panel
@@ -84,14 +91,25 @@ struct comp_vk_native_wl_window_rect
 	//! from width_px/height_px when the client's buffer is not mapped to its
 	//! configured size — the surface is then painted at this size, not that one.
 	uint32_t surface_width_px, surface_height_px;
+	/*!
+	 * False when the committed surface spills PAST the window frame — a
+	 * buffer not mapped to its configured size (#1653). True when it lies
+	 * inside it (undecorated, or client-side decorations around it), and
+	 * when nothing is known.
+	 */
+	bool surface_within_frame;
+	//! Content top minus frame top, DEVICE px: the client-side title bar's
+	//! height, 0 without one. Diagnostic only.
+	int32_t frame_inset_top_px;
 };
 
 /*!
  * Current rect of the calling process's window, converted to DEVICE pixels.
  *
  * Pumps pending D-Bus messages (non-blocking), then picks the best window
- * owned by this PID: focused first, else the largest. Uses the frame rect
- * (see #817 for the frame-vs-buffer-rect validation note).
+ * owned by this PID: focused first, else the largest. Reports the buffer rect
+ * (the bound surface) when published, else the frame (#1654; #817 carries the
+ * original frame-vs-buffer validation note).
  *
  * Requires the payload's `monitor` object: without it there is no scale and no
  * monitor rect, so neither the conversion nor the on-the-panel check can be
