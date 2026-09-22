@@ -10,8 +10,16 @@
 
 #include "client/comp_vk_client.h"
 #include "xrt/xrt_config_os.h"
+#include "xrt/xrt_config_have.h"
 
 #include <stdlib.h>
+
+// Same guard as oxr_vulkan.c: an enable1 app enables exactly the string below,
+// so a Wayland-enabled build that lost VK_USE_PLATFORM_WAYLAND_KHR on the way to
+// the Vulkan headers would ship a runtime that can never create a Wayland surface.
+#if defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID) && defined(XRT_HAVE_WAYLAND) && !defined(VK_KHR_wayland_surface)
+#error "XRT_HAVE_WAYLAND without VK_KHR_wayland_surface: see xrt_config_vulkan.h"
+#endif
 
 // If you update either list of extensions here, please update the "Client"
 // column in `vulkan-extensions.md`

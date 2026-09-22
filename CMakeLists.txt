@@ -654,6 +654,21 @@ message(STATUS "#    XLIB_XRANDR:     ${XRT_HAVE_XLIB_XRANDR}  (direct-scanout p
 message(STATUS "#    WAYLAND:         ${XRT_HAVE_WAYLAND}  (app-surface present path)")
 message(STATUS "#    DBUS:            ${XRT_HAVE_DBUS}  (Wayland window geometry, #817)")
 message(STATUS "#")
+# Both are optional dependencies, so a build host missing libwayland-dev or
+# libdbus-1-dev drops them without an error. On desktop Linux that yields a
+# runtime that cannot present to a native-Wayland app, or weaves it
+# display-scoped. Say so where every CI log will show it; the release packaging
+# scripts (package_deb_linux.sh, package_linux.sh) refuse such an artefact.
+if(XRT_HAVE_LINUX AND NOT ANDROID AND XRT_HAVE_VULKAN)
+	if(NOT XRT_HAVE_WAYLAND)
+		message(WARNING "XRT_HAVE_WAYLAND is OFF (wayland-client not found?): this runtime has no "
+		                "native-Wayland present path. Install libwayland-dev for a release build.")
+	endif()
+	if(NOT XRT_HAVE_DBUS)
+		message(WARNING "XRT_HAVE_DBUS is OFF (dbus-1 not found?): native-Wayland windows weave "
+		                "display-scoped. Install libdbus-1-dev for a release build.")
+	endif()
+endif()
 message(STATUS "#    MODULE_COMPOSITOR:           ${XRT_MODULE_COMPOSITOR}")
 message(STATUS "#    MODULE_COMPOSITOR_MAIN:      ${XRT_MODULE_COMPOSITOR_MAIN}")
 message(STATUS "#    MODULE_COMPOSITOR_NULL:      ${XRT_MODULE_COMPOSITOR_NULL}")

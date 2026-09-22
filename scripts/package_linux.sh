@@ -60,6 +60,10 @@ for f in "$RUNTIME_SO" "$CLI_BIN" "$PLUGIN_SO"; do
 done
 [ -n "$SERVICE_BIN" ] || echo "note: displayxr-service not built — packaging without it (--service build adds it)"
 
+# Refuse a runtime without the native-Wayland present path (see the script for
+# why this is a strings check rather than a NEEDED one).
+"$ROOT/scripts/check_linux_runtime_wayland.sh" "$RUNTIME_SO" || exit 1
+
 EXT_UUID="window-geometry@displayxr.org"
 EXT_SRC="$ROOT/contrib/gnome-shell/$EXT_UUID"
 for f in "$EXT_SRC/extension.js" "$EXT_SRC/metadata.json" "$ROOT/scripts/linux/displayxr-gnome-extension-enable"; do
