@@ -451,6 +451,24 @@ private:
 	//! tie-break.
 	struct zxdg_output_manager_v1 *m_wl_xdg_output_manager = nullptr;
 	struct wl_keyboard *m_wl_keyboard = nullptr;
+	/*!
+	 * Buffer -> surface mapping. The buffer the runtime attaches is in DEVICE
+	 * pixels (logical size x output scale); without a mapping the compositor
+	 * treats buffer pixels as LOGICAL pixels, so at 200 % a panel-mode buffer
+	 * becomes a surface twice the output and spills onto the next monitor.
+	 * wp_viewport's destination (= the configure size) is the mapping that
+	 * works at any scale; set_buffer_scale is the integer-only fallback.
+	 * wp_fractional_scale_v1 supplies a windowed surface's preferred scale.
+	 * All optional; NULL when the compositor does not advertise them.
+	 */
+	struct wp_viewporter *m_wl_viewporter = nullptr;
+	struct wp_viewport *m_wl_viewport = nullptr;
+	struct wp_fractional_scale_manager_v1 *m_wl_frac_manager = nullptr;
+	struct wp_fractional_scale_v1 *m_wl_frac = nullptr;
+	//! wp_fractional_scale_v1.preferred_scale, in 120ths; 0 = not received.
+	uint32_t m_wl_pref_scale_120 = 0;
+	//! Mapping last applied to the surface (so it is re-sent only on change).
+	int32_t m_wl_map_dst_w = 0, m_wl_map_dst_h = 0, m_wl_map_buffer_scale = 1;
 	struct wl_surface *m_wl_surface = nullptr;
 	struct xdg_surface *m_wl_xdg_surface = nullptr;
 	struct xdg_toplevel *m_wl_toplevel = nullptr;
@@ -483,6 +501,12 @@ private:
 	void
 	wl_declared_size(uint32_t *w, uint32_t *h) const;
 
+	//! Map the declared (device-pixel) buffer onto the configure (logical)
+	//! size: wp_viewport destination, else an integer set_buffer_scale.
+	//! Pending surface state only — the WSI's next present commits it.
+	void
+	wl_apply_buffer_mapping();
+
 	// Per-frame scratch, set by the listeners and consumed by pump().
 	std::vector<DxrKey> m_wl_key_queue;
 	bool m_wl_close_requested = false;
@@ -507,6 +531,8 @@ private:
 	s_wm_base_ping(void *data, struct xdg_wm_base *b, uint32_t serial);
 	static void
 	s_xdg_surface_configure(void *data, struct xdg_surface *s, uint32_t serial);
+	static void
+	s_frac_preferred_scale(void *data, struct wp_fractional_scale_v1 *f, uint32_t scale_120);
 	static void
 	s_toplevel_configure(void *data, struct xdg_toplevel *t, int32_t w, int32_t h, struct wl_array *states);
 	static void
