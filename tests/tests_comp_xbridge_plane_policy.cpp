@@ -12,6 +12,7 @@
  */
 
 #include "comp_xbridge_plane_policy.h"
+#include "comp_xbridge_format_policy.h"
 
 #include "catch_amalgamated.hpp"
 
@@ -334,4 +335,112 @@ TEST_CASE("a freshly authored plane transports on its own frame and lands on the
 	// session, which is the documented cost of the Tier-3 plane.
 	CHECK(copies == kRing);
 	CHECK(ever_valid);
+}
+
+/*
+ * #1663 — the bridge's ingress format decision.
+ *
+ * The guard around it is a throttled U_LOG_E on a live bridge, so on hardware
+ * the only two outcomes anyone ever sees are "it works" and "the panel is black
+ * and the bridge degraded". Both refusals below are invisible in a screenshot,
+ * and the sRGB-sibling one is worse than invisible: the copy is LEGAL, so a
+ * reader meeting the guard later has every reason to think it is over-strict and
+ * relax it back to a plain same-family test. That is why it is a test.
+ */
+TEST_CASE("xb_source_format_compatible accepts exactly two sources")
+{
+	SECTION("the chain's own format is the trivial accept")
+	{
+		CHECK(xb_source_format_compatible(DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM) ==
+		      XB_SRC_FMT_EXACT);
+		CHECK(xb_source_format_accepted(
+		    xb_source_format_compatible(DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM)));
+	}
+
+	/*
+	 * The #1663 case itself. The per-client atlas is allocated TYPELESS so
+	 * UNORM and UNORM_SRGB views can share it; a display-filling submission
+	 * bypasses the UNORM crop texture and hands that atlas to the bridge. The
+	 * copy is a plain byte move and the source carries no encoding of its own,
+	 * so the chain's supplies it. Refusing this refused every full-screen frame
+	 * under the split.
+	 */
+	SECTION("the TYPELESS member of the chain's family is accepted")
+	{
+		CHECK(xb_source_format_compatible(DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_TYPELESS) ==
+		      XB_SRC_FMT_TYPELESS_TO_CONCRETE);
+		CHECK(xb_source_format_accepted(
+		    xb_source_format_compatible(DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_TYPELESS)));
+		// The same holds for an SRGB chain: the encoding is the CHAIN's.
+		CHECK(xb_source_format_compatible(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_TYPELESS) ==
+		      XB_SRC_FMT_TYPELESS_TO_CONCRETE);
+		// ...and for the other family, so this is a rule and not a special case.
+		CHECK(xb_source_format_compatible(DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_TYPELESS) ==
+		      XB_SRC_FMT_TYPELESS_TO_CONCRETE);
+	}
+
+	/*
+	 * The trap this guard must NOT be relaxed into. One typeless family, so the
+	 * copy is legal and moves the right bits — and the next sampler then reads
+	 * them under a different transfer function (#1589 / #1610). A silent colour
+	 * error is worse than a loud refusal.
+	 */
+	SECTION("two CONCRETE formats in one family are refused, both directions")
+	{
+		CHECK(xb_source_format_compatible(DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) ==
+		      XB_SRC_FMT_REFUSED_SRGB_SIBLING);
+		CHECK(xb_source_format_compatible(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UNORM) ==
+		      XB_SRC_FMT_REFUSED_SRGB_SIBLING);
+		CHECK_FALSE(xb_source_format_accepted(
+		    xb_source_format_compatible(DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)));
+	}
+
+	/*
+	 * #1178's original hazard, unchanged: different channel order, so Windows
+	 * drops the copy without failing it and the destination keeps what it held.
+	 */
+	SECTION("a cross-family source stays refused")
+	{
+		CHECK(xb_source_format_compatible(DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM) ==
+		      XB_SRC_FMT_REFUSED_CROSS_FAMILY);
+		CHECK(xb_source_format_compatible(DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM) ==
+		      XB_SRC_FMT_REFUSED_CROSS_FAMILY);
+		// Not even the typeless member of the WRONG family.
+		CHECK(xb_source_format_compatible(DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8A8_TYPELESS) ==
+		      XB_SRC_FMT_REFUSED_CROSS_FAMILY);
+		CHECK_FALSE(xb_source_format_accepted(
+		    xb_source_format_compatible(DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM)));
+	}
+
+	SECTION("a format this unit cannot place is refused, even against itself")
+	{
+		CHECK(xb_source_format_compatible(DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_BC7_UNORM) ==
+		      XB_SRC_FMT_REFUSED_UNKNOWN);
+		CHECK(xb_source_format_compatible(DXGI_FORMAT_BC7_UNORM, DXGI_FORMAT_BC7_UNORM) ==
+		      XB_SRC_FMT_REFUSED_UNKNOWN);
+		CHECK(xb_source_format_compatible(DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN) ==
+		      XB_SRC_FMT_REFUSED_UNKNOWN);
+	}
+}
+
+/*
+ * The family map has to be CLOSED for the guard's "is the source the typeless
+ * member of the chain's family" test to mean anything: the value it returns must
+ * itself map to the same family, or a representative would be unplaceable and
+ * every typeless source would fall into REFUSED_UNKNOWN.
+ */
+TEST_CASE("xb_typeless_family is closed over its own representatives")
+{
+	const DXGI_FORMAT known[] = {
+	    DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UNORM,    DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+	    DXGI_FORMAT_B8G8R8A8_TYPELESS, DXGI_FORMAT_B8G8R8A8_UNORM,    DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+	    DXGI_FORMAT_R8_UNORM,          DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
+	};
+	for (DXGI_FORMAT f : known) {
+		const DXGI_FORMAT fam = xb_typeless_family(f);
+		INFO("DXGI_FORMAT " << (unsigned)f);
+		CHECK(fam != DXGI_FORMAT_UNKNOWN);
+		CHECK(xb_typeless_family(fam) == fam);
+	}
+	CHECK(xb_typeless_family(DXGI_FORMAT_BC7_UNORM) == DXGI_FORMAT_UNKNOWN);
 }
