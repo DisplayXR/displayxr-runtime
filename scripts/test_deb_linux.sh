@@ -4,12 +4,12 @@
 # Runs entirely in Docker, so it works from a macOS/Linux dev box that has no
 # dpkg toolchain of its own. Two stages:
 #
-#   1. BUILD  — an ubuntu:24.04 builder image (build deps cached) builds the
+#   1. BUILD  — an ubuntu:22.04 builder image (build deps cached) builds the
 #               in-process runtime and packages it via package_deb_linux.sh.
-#   2. VERIFY — a PRISTINE ubuntu:24.04 container `apt-get install`s the .deb
-#               (deps resolved from the archive) and, with NO DisplayXR env
-#               vars set, runs `displayxr-cli selftest` (must PASS on
-#               sim-display) and `displayxr-cli info` (must show the sim modes).
+#   2. VERIFY — a PRISTINE container of EVERY supported release (22.04, 24.04,
+#               26.04) `apt-get install`s the .deb (deps resolved from that
+#               release's archive) and, with NO DisplayXR env vars set, runs
+#               `displayxr-cli info` + `selftest` (must PASS on sim-display).
 #
 # This is the CI-adoptable gate: a green run proves an end user gets a working
 # runtime from the .deb alone — zero configuration.
@@ -18,21 +18,21 @@
 #   ./scripts/test_deb_linux.sh --verify-only   # reuse dist/*.deb, just verify
 #   ./scripts/test_deb_linux.sh --rebuild-image # force-rebuild the builder image
 #
-# WHY THE BUILDER IMAGE IS PINNED, AND TO WHAT.
-# package_deb_linux.sh's compute_depends() derives the .deb's `Depends:` from
-# the BUILD host's dpkg file database (objdump NEEDED sonames -> owning
-# packages). So the builder image is not a free choice: build on a different
-# release than CI and this test validates a dependency set CI never ships.
-# The image therefore tracks the `Deb` job in .github/workflows/build-linux.yml,
-# which is `runs-on: ubuntu-latest` — resolved to the **ubuntu-24.04** runner
-# image as of 2026-09-19 (read off a live run's "Operating System / Image:"
-# line, not assumed). NB the `Package` job's `container: ubuntu:26.04` is a
-# DIFFERENT artifact (the tarball, which has no derived Depends at all) and is
-# not what this script mirrors.
-# ==> WHEN GITHUB MOVES ubuntu-latest TO 26.04, MOVE $IMAGE WITH IT. <==
-# The verify stage stays on the OLDEST supported LTS on purpose: that is a
-# genuine "the shipped .deb still installs on the oldest LTS we claim" check,
-# and it must NOT be re-pinned in lockstep with the builder.
+# WHY THE BUILDER IMAGE IS PINNED, AND TO WHAT (#1656).
+# The .deb's glibc / libstdc++ floor is whatever the BUILD host has, and
+# package_deb_linux.sh derives versioned Depends from that host with
+# dpkg-shlibdeps. So the builder image is not a free choice: it must be the
+# OLDEST release the package claims to install on, which is what the CI `Deb`
+# job uses (`container: ubuntu:22.04`). Building on a newer one produces a
+# package that apt correctly REFUSES on 22.04 — which is the v2.19.1 bug
+# (GLIBC_2.38 binaries, unversioned `libc6`) turned into a hard failure, not a
+# passing test. The DXR_DEB_MAX_GLIBC below makes the mismatch fail at package
+# time instead.
+# ==> KEEP $IMAGE EQUAL TO THE Deb JOB'S CONTAINER. <==
+# The verify stage runs on EVERY supported release, oldest first, via
+# scripts/verify_deb_install_linux.sh — the same script CI's DebInstall matrix
+# runs. NB the `Newest` job's ubuntu:26.04 build is a different thing (compile
+# coverage, no packaging) and is not what this script mirrors.
 #
 # The apt line below must also stay in lockstep with that Deb job's: anything
 # it installs that this image lacks silently produces a differently-configured
@@ -46,10 +46,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # Builder: must match the CI `Deb` job's runner image (see header). Bump the
 # tag alongside the FROM line so a stale cached layer can't masquerade as the
 # new image.
-IMAGE="displayxr-deb-builder:ubuntu2404"
-# Verify: the oldest LTS the .deb claims to install on — deliberately NOT
-# bumped in lockstep with the builder.
-VERIFY_IMAGE="ubuntu:24.04"
+IMAGE="displayxr-deb-builder:ubuntu2204"
+# Verify: every release the .deb claims to install on.
+VERIFY_IMAGES=("ubuntu:22.04" "ubuntu:24.04" "ubuntu:26.04")
 
 VERIFY_ONLY=0
 REBUILD_IMAGE=0
@@ -67,14 +66,14 @@ command -v docker >/dev/null 2>&1 || { echo "error: docker not found" >&2; exit 
 if [ "$REBUILD_IMAGE" = 1 ] || ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     echo "==> Building builder image $IMAGE"
     docker build -t "$IMAGE" -f - "$ROOT" <<'DOCKERFILE'
-FROM ubuntu:24.04
+FROM ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
 # libwayland-dev + libdbus-1-dev + libxrandr-dev must match the Deb job in
 # build-linux.yml — without them this image would build a Wayland-less /
 # Xrandr-less .deb and the acceptance test would not be testing the artifact
 # CI ships (different feature set AND different derived Depends).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential cmake ninja-build pkg-config git ca-certificates \
+        build-essential cmake ninja-build pkg-config git ca-certificates python3 \
         binutils dpkg-dev fakeroot \
         libvulkan-dev glslang-tools libeigen3-dev libcjson-dev \
         libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev \
@@ -90,7 +89,8 @@ if [ "$VERIFY_ONLY" = 0 ]; then
     # so a stale host build/ cache can't collide with the container's /src path
     # and the build runs on the fast container fs. DIST_DIR defaults to /src/dist
     # (mounted) so the .deb lands back on the host.
-    docker run --rm -v "$ROOT":/src -w /src -e BUILD_DIR=/root/dxr-build "$IMAGE" bash -c '
+    docker run --rm -v "$ROOT":/src -w /src -e BUILD_DIR=/root/dxr-build \
+        -e DXR_DEB_MAX_GLIBC=2.35 "$IMAGE" bash -c '
         set -e
         git config --global --add safe.directory /src
         ./scripts/package_deb_linux.sh'
@@ -100,37 +100,17 @@ DEB="$(ls -t "$ROOT"/dist/displayxr-runtime_*_*.deb 2>/dev/null | head -1 || tru
 [ -n "$DEB" ] || { echo "error: no dist/displayxr-runtime_*_*.deb found" >&2; exit 1; }
 echo "==> Testing $(basename "$DEB")"
 
-# --- 3. Clean-install + env-free acceptance run ----------------------------
-# A pristine $VERIFY_IMAGE (NOT the builder) proves the Depends are complete
-# and nothing leaks in from the build environment.
-echo "==> Verifying in $VERIFY_IMAGE"
-docker run --rm -v "$ROOT/dist":/deb:ro "$VERIFY_IMAGE" bash -c '
-    set -e
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
-    echo "=== apt-get install ./'"$(basename "$DEB")"' ==="
-    apt-get install -y -qq "/deb/'"$(basename "$DEB")"'"
-
-    echo "=== assert ZERO DisplayXR env vars are set ==="
-    if env | grep -E "^(XR_RUNTIME_JSON|XRT_PLUGIN_SEARCH_PATH)=" ; then
-        echo "FAIL: a DisplayXR env var is set — the test would not prove the env-free path"; exit 1
-    fi
-    echo "ok — no XR_RUNTIME_JSON / XRT_PLUGIN_SEARCH_PATH"
-
-    echo "=== installed files of interest ==="
-    ls -l /etc/xdg/openxr/1/active_runtime.json /usr/lib/displayxr/plugins/
-    echo "--- active_runtime.json ---"; cat /etc/xdg/openxr/1/active_runtime.json
-
-    echo "=== displayxr-cli info (must show sim-display + its modes) ==="
-    displayxr-cli info | tee /tmp/info.txt
-
-    echo "=== displayxr-cli selftest (must PASS on sim-display) ==="
-    displayxr-cli selftest
-
-    # Content assertion: info must name the sim-display plug-in.
-    grep -qi "sim-display\|Sim Display" /tmp/info.txt || {
-        echo "FAIL: displayxr-cli info did not mention sim-display"; exit 1; }
-
+# --- 3. Clean-install + env-free acceptance run, on every supported release -
+# A pristine image (NOT the builder) proves the Depends are complete, resolvable
+# on that release, and that nothing leaks in from the build environment.
+# scripts/verify_deb_install_linux.sh is the same script CI's DebInstall job
+# runs, so a green run here predicts CI.
+for img in "${VERIFY_IMAGES[@]}"; do
     echo ""
-    echo "ACCEPTANCE PASS — env-free .deb install runs the runtime on sim-display."
-'
+    echo "==> Verifying in $img"
+    docker run --rm -v "$ROOT":/w:ro -w /w "$img" \
+        ./scripts/verify_deb_install_linux.sh "dist/$(basename "$DEB")"
+done
+
+echo ""
+echo "ACCEPTANCE PASS — the .deb installs and runs env-free on ${VERIFY_IMAGES[*]}."

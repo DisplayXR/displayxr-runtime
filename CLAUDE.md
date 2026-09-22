@@ -117,7 +117,10 @@ Builds runtime, OpenXR loader, test apps. The macOS Vulkan native compositor run
 ./scripts/build_linux.sh --apps       # + test apps (cube_hosted/handle vk_linux; --backend=x11|wayland|auto picks the window system)
 ./scripts/build_linux.sh --clean      # after installing a dependency into an already-configured tree (#1556)
 ./scripts/package_linux.sh            # dist/*.tar.gz + user-level install.sh (#705)
+./scripts/test_deb_linux.sh           # Docker: build the .deb on 22.04, install+run it on 22.04/24.04/26.04
 ```
+**Release artifacts are built on the OLDEST supported release (Ubuntu 22.04) — #1656.** The `.deb` and the tarball must install and run on 22.04, 24.04 and 26.04, and a binary's glibc floor is its build host's: v2.19.1 was built on 24.04, needed `GLIBC_2.38`, declared an unversioned `libc6`, and so installed on 22.04 and then failed at every `dlopen`. CI's `Deb` and `Package` jobs therefore run in an `ubuntu:22.04` container; `package_deb_linux.sh` derives versioned `Depends` with `dpkg-shlibdeps` and refuses both a `DT_NEEDED` outside its cross-release `STABLE_SONAMES` list and (with `DXR_DEB_MAX_GLIBC`) a floor above 22.04's; the `DebInstall` matrix installs + runs the package in pristine 22.04/24.04/26.04 containers before `DebRelease` attaches it. The tarball records the floor in `GLIBC_FLOOR` and `install.sh` enforces it. Newest-toolchain compile coverage lives in the `Newest` job (26.04).
+
 Linux is **Vulkan-only** — a native Vulkan compositor presents over an X11/XCB surface (`comp_vk_native_window_xcb.c`); no D3D/Metal/GL backend. Apps pass their window via `XR_DXR_xlib_window_binding`. Full walkthrough: `docs/getting-started/building.md` § *Linux*; status + phases: `docs/roadmap/linux-support.md`. **Guard convention:** desktop-Linux code must gate on **`XRT_OS_LINUX_DESKTOP`** (`= XRT_OS_LINUX && !XRT_OS_ANDROID`) — a bare `XRT_OS_LINUX` also matches Android and will pull desktop-only symbols into the Android build.
 
 ### Standard CMake

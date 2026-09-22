@@ -360,10 +360,27 @@ vendor plug-in installer drops its own `.so` + manifest alongside, lower
 probe-order wins), and a systemd `--user` unit for `displayxr-service`
 (gracefully skipped without a user bus). `sudo ./install.sh --system` targets
 `/usr/local` + `/etc/xdg/openxr/1/` (no unit, v1). CI's `Package` job
-(`build-linux.yml`) builds in the **26.04 container**, installs from the
-tarball, and gates on `displayxr-cli selftest` resolving everything from the
-installed XDG paths only. Remaining staged scope (#705): `.deb` → demo
-AppImages.
+(`build-linux.yml`) builds in the **22.04 container** (the oldest supported
+release — #1656; the newest-toolchain coverage it used to give moved to the
+`Newest` job's 26.04 container), installs from the tarball, and gates on
+`displayxr-cli selftest` resolving everything from the installed XDG paths only.
+Remaining staged scope (#705): `.deb` → demo AppImages.
+
+**One artifact for 22.04 / 24.04 / 26.04 (#1656).** A binary's glibc floor is
+its build host's, so both release artifacts are built in the **oldest**
+supported container. v2.19.1 was built on 24.04 (`GLIBC_2.38`,
+`GLIBCXX_3.4.31`) and declared an unversioned `libc6`, so apt installed it on
+22.04 and every app failed at `dlopen`. `package_deb_linux.sh` now derives
+`Depends` with `dpkg-shlibdeps` (versioned floors), refuses a `DT_NEEDED`
+outside its cross-release `STABLE_SONAMES` list or a glibc floor above
+`DXR_DEB_MAX_GLIBC`, and the `DebInstall` matrix installs + runs the `.deb` in
+pristine 22.04 / 24.04 / 26.04 containers (`ldd -r`, dependency-name existence,
+env-free `displayxr-cli selftest`) before `DebRelease` attaches it to a release.
+The tarball, which has no dependency metadata, records the floor in a
+`GLIBC_FLOOR` file that its `install.sh` enforces. Caveat that predates this and
+is unchanged: the GNOME Shell extension needs Shell 45+, so on 22.04 (GNOME 42)
+it is installed but never loads, and the runtime falls back to display-scoped
+weaving.
 
 ### Conformance — the Linux CTS arms (#1527)
 

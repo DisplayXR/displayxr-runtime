@@ -122,6 +122,35 @@ machine-wide. Every `v*` release also attaches `displayxr-runtime_<ver>_amd64.de
 (`scripts/package_deb_linux.sh`). Dev iteration without installing stays
 `XR_RUNTIME_JSON` + `XRT_PLUGIN_SEARCH_PATH` per `docs/roadmap/linux-support.md`.
 
+**Supported releases, and why the release artifacts are built on the oldest one
+(#1656).** The published `.deb` and tarball must install and run on **Ubuntu
+22.04, 24.04 and 26.04**, so CI builds both in an **`ubuntu:22.04` container**
+(the `Deb` and `Package` jobs) — a binary's glibc / libstdc++ floor is its build
+host's. v2.19.1 was built on 24.04, needed `GLIBC_2.38` / `GLIBCXX_3.4.31`, and
+declared an unversioned `libc6`, so apt installed it on 22.04 and every OpenXR
+app then failed at `dlopen` with `GLIBC_2.38 not found`. Three guards now make
+that impossible to ship:
+
+- `package_deb_linux.sh` derives `Depends` with **`dpkg-shlibdeps`**, so the
+  floors are versioned (`libc6 (>= 2.35), libstdc++6 (>= 12), …`) and apt
+  refuses a too-new package instead of installing a broken runtime;
+- it refuses a `DT_NEEDED` soname outside its `STABLE_SONAMES` list (libraries
+  whose *package name* is the same on all three releases) and, when
+  `DXR_DEB_MAX_GLIBC` is set (CI sets `2.35`), a glibc floor above the oldest
+  release;
+- the **`DebInstall`** CI matrix installs the built `.deb` into pristine
+  `ubuntu:22.04`, `24.04` and `26.04` containers without Recommends, runs
+  `ldd -r` on every shipped ELF, checks every `Depends`/`Recommends`/`Suggests`
+  name exists there, and runs `displayxr-cli info` + `selftest` env-free on the
+  packaged sim-display. `DebRelease` attaches the asset to the GitHub Release
+  only after that passes. Locally: `scripts/test_deb_linux.sh` (Docker) does the
+  same build + tri-release verify, and
+  `scripts/verify_deb_install_linux.sh <deb> [tarball]` is the verifier itself.
+
+The tarball carries no dependency metadata, so `package_linux.sh` records the
+same floor in a `GLIBC_FLOOR` file and its `install.sh` refuses a host below it
+rather than unpacking a tree that cannot `dlopen`.
+
 **GNOME Shell extension (GNOME on Wayland).** Windowed weaving under Wayland
 and transparent apps on a Leia panel both depend on the
 `window-geometry@displayxr.org` extension (`contrib/gnome-shell/`). Without it
