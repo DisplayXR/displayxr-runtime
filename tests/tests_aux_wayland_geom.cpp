@@ -431,3 +431,32 @@ TEST_CASE("an unmapped device-pixel buffer spills past the frame")
 	const struct u_wl_rect_logical buffer = {1728, 0, 3840, 2160};
 	REQUIRE_FALSE(u_wl_surface_within_frame(&frame, &buffer));
 }
+
+
+/*
+ *
+ * Wayland placement quantum (#1609).
+ *
+ */
+
+TEST_CASE("an integer-scaled monitor has a placement lattice")
+{
+	uint32_t q = 0;
+	REQUIRE(u_wl_placement_quantum(1.0, 0.01, &q));
+	REQUIRE(q == 1);
+	REQUIRE(u_wl_placement_quantum(2.0, 0.01, &q));
+	REQUIRE(q == 2);
+	// Mutter's 200 % is published as exactly 2.0, but tolerate float noise.
+	REQUIRE(u_wl_placement_quantum(1.9999, 0.01, &q));
+	REQUIRE(q == 2);
+}
+
+TEST_CASE("a fractionally-scaled monitor has none, and must not be pretended into one")
+{
+	uint32_t q = 0;
+	REQUIRE_FALSE(u_wl_placement_quantum(1.6666666, 0.01, &q));
+	REQUIRE_FALSE(u_wl_placement_quantum(1.25, 0.01, &q));
+	REQUIRE_FALSE(u_wl_placement_quantum(1.5, 0.01, &q));
+	REQUIRE_FALSE(u_wl_placement_quantum(0.0, 0.01, &q));
+	REQUIRE_FALSE(u_wl_placement_quantum(-2.0, 0.01, &q));
+}

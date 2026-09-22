@@ -28,6 +28,19 @@
 //   ScreenCast RecordArea, screenshots, window thumbnails taken outside a
 //   frame. See docs/specs/runtime/wayland-window-geometry.md §6.
 //
+// Service   : org.displayxr.WindowGeometry          (same bus name)
+// Object    : /org/displayxr/WindowPlacement
+// Interface : org.displayxr.WindowPlacement1         (extension version 3+)
+//   Method  MoveWindow(u pid, i x, i y) -> (b moved)
+//   Moves the CALLING process's window frame to the given LOGICAL position.
+//   A Wayland client cannot position itself, but a weaving window must land on
+//   the display's interlace lattice or the 3D shimmers, and only the
+//   compositor can put it there. The caller's PID is taken from the bus, not
+//   from the argument: a client may only move its OWN windows, and the
+//   argument must match (0 = "me"). Refused while an interactive grab is in
+//   progress on that window — the user is still dragging it. See
+//   displayxr-runtime#1609 and docs/specs/runtime/wayland-window-geometry.md §7.
+//
 // This extension is a SHARED asset — a vendor SDK runtime package may ship it
 // to serve its own non-DisplayXR apps (one publisher, many consumers; ADR-033).
 // Keep the UUID/bus/interface identifiers and the schema rules below intact:
@@ -49,7 +62,12 @@
 //       "frame":  [x, y, w, h],             // Meta.Window.get_frame_rect()
 //       "buffer": [x, y, w, h],             // Meta.Window.get_buffer_rect()
 //       "monitor": { "x": 0, "y": 0, "w": 3840, "h": 2160, "scale": 1.0 },
-//       "capture_excluded": false           // ext v2+: CaptureExclusion1 active
+//       "capture_excluded": false,          // ext v2+: CaptureExclusion1 active
+//       "moving": false                     // ext v3+: an interactive grab
+//                                           // (move/resize) is in progress on
+//                                           // this window. A consumer that
+//                                           // repositions a window waits for
+//                                           // this to go false.
 //     }, ...
 //   ]
 // }
@@ -354,6 +372,103 @@ class CaptureExclusion {
     }
 }
 
+/*
+ * ── Window placement (extension version 3) ───────────────────────────────
+ *
+ * The one thing a Wayland client cannot do for itself and the compositor can:
+ * put a window at a given position. DisplayXR needs it because the lenticular
+ * interlace phase is a function of the window's position in panel pixels, so
+ * after a drag the window has to land on the lattice the display can actually
+ * render — on X11 the client does that itself during the drag.
+ *
+ * Deliberately NOT a general window-placement API: a caller may only move a
+ * window of its own process, identified by the bus connection's PID rather
+ * than by the argument it passes.
+ */
+
+const PLACEMENT_IFACE_XML = `
+<node>
+  <interface name="org.displayxr.WindowPlacement1">
+    <method name="MoveWindow">
+      <arg type="u" direction="in" name="pid"/>
+      <arg type="i" direction="in" name="x"/>
+      <arg type="i" direction="in" name="y"/>
+      <arg type="b" direction="out" name="moved"/>
+    </method>
+  </interface>
+</node>`;
+
+class WindowPlacement {
+    constructor(getGrabbedWindow) {
+        this._getGrabbedWindow = getGrabbedWindow;
+        this._dbus = Gio.DBusExportedObject.wrapJSObject(PLACEMENT_IFACE_XML, this);
+        this._dbus.export(Gio.DBus.session, '/org/displayxr/WindowPlacement');
+    }
+
+    destroy() {
+        if (this._dbus) {
+            this._dbus.unexport();
+            this._dbus = null;
+        }
+    }
+
+    //! The caller's PID, from the bus daemon. Async: never block the shell.
+    _senderPid(sender, cb) {
+        Gio.DBus.session.call(
+            'org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus',
+            'GetConnectionUnixProcessID', new GLib.Variant('(s)', [sender]),
+            new GLib.VariantType('(u)'), Gio.DBusCallFlags.NONE, 1000, null,
+            (conn, res) => {
+                let pid = 0;
+                try {
+                    pid = conn.call_finish(res).deepUnpack()[0];
+                } catch (e) {
+                    pid = 0;
+                }
+                cb(pid);
+            });
+    }
+
+    //! The caller's best window: focused first, else the largest — the same
+    //! choice the runtime's geometry consumer makes.
+    _windowOfPid(pid) {
+        const focus = global.display.focus_window;
+        let best = null;
+        for (const actor of global.get_window_actors()) {
+            const win = actor.meta_window;
+            if (!win || win.get_pid() !== pid || win.get_window_type() !== Meta.WindowType.NORMAL)
+                continue;
+            if (best === null || (win === focus && best !== focus)) {
+                best = win;
+                continue;
+            }
+            if (best !== focus) {
+                const a = win.get_frame_rect(), b = best.get_frame_rect();
+                if (a.width * a.height > b.width * b.height)
+                    best = win;
+            }
+        }
+        return best;
+    }
+
+    MoveWindowAsync([pid, x, y], invocation) {
+        this._senderPid(invocation.get_sender(), senderPid => {
+            let moved = false;
+            if (senderPid > 0 && (pid === 0 || pid === senderPid)) {
+                const win = this._windowOfPid(senderPid);
+                // Never fight the user: while a grab is running on this window
+                // the position is theirs, and a move would stutter against it.
+                if (win && win !== this._getGrabbedWindow() && !win.is_fullscreen() &&
+                    win.allows_move?.() !== false) {
+                    win.move_frame(true, x, y);
+                    moved = true;
+                }
+            }
+            invocation.return_value(new GLib.Variant('(b)', [moved]));
+        });
+    }
+}
+
 export default class WindowGeometryExtension extends Extension {
     enable() {
         this._windowSignals = new Map(); // Meta.Window -> [handler ids]
@@ -365,6 +480,8 @@ export default class WindowGeometryExtension extends Extension {
         // Both objects are exported BEFORE the name is requested, so a client
         // that sees the name appear can always reach CaptureExclusion1.
         this._captureExclusion = new CaptureExclusion(() => this._queueEmit());
+        this._grabbedWindow = null;
+        this._placement = new WindowPlacement(() => this._grabbedWindow);
         this._nameId = Gio.DBus.session.own_name(
             'org.displayxr.WindowGeometry',
             Gio.BusNameOwnerFlags.NONE, null, null);
@@ -378,6 +495,21 @@ export default class WindowGeometryExtension extends Extension {
             }));
         this._displaySignals.push(
             display.connect('notify::focus-window', () => this._queueEmit()));
+        // Interactive grabs (move / resize). Published as `moving` so a
+        // consumer that repositions a window knows to wait for the user to let
+        // go. The signal's argument list grew a `screen` parameter in older
+        // shells, so the window is found by type rather than by position.
+        const grabWindow = args => args.find(a => a instanceof Meta.Window) ?? null;
+        this._displaySignals.push(
+            display.connect('grab-op-begin', (..._args) => {
+                this._grabbedWindow = grabWindow(_args);
+                this._queueEmit();
+            }));
+        this._displaySignals.push(
+            display.connect('grab-op-end', (..._args) => {
+                this._grabbedWindow = null;
+                this._queueEmit();
+            }));
 
         for (const actor of global.get_window_actors())
             this._trackWindow(actor.meta_window);
@@ -396,6 +528,11 @@ export default class WindowGeometryExtension extends Extension {
             this._captureExclusion.destroy();
             this._captureExclusion = null;
         }
+        if (this._placement) {
+            this._placement.destroy();
+            this._placement = null;
+        }
+        this._grabbedWindow = null;
 
         if (this._nameId) {
             Gio.DBus.session.unown_name(this._nameId);
@@ -481,6 +618,7 @@ export default class WindowGeometryExtension extends Extension {
                 buffer: [buffer.x, buffer.y, buffer.width, buffer.height],
                 monitor,
                 capture_excluded: this._captureExclusion?.isExcluded(win) ?? false,
+                moving: win === this._grabbedWindow,
             });
         }
         return JSON.stringify({version: 1, windows});

@@ -441,3 +441,60 @@ user pressing *Stop Screen Sharing* — ends the capture for that session.
 - `RecordMonitor` streams served by a view blit are not covered (§6.2).
 - GNOME only; another compositor needs its own implementation of the same
   interface.
+
+
+## 7. Window placement — `org.displayxr.WindowPlacement1` (extension version 3)
+
+### 7.1 Why the compositor has to move the window
+
+The interlace phase is a function of the window's position in panel pixels, so
+after a drag the window must sit on a position the lens can be phased to. On
+X11 the app owns the drag and snaps **every step** before the window moves
+(#1588, #1609); on Wayland it owns none of it — the move runs inside the
+compositor's grab, and a client cannot position itself at all. So the snap
+happens **once, after the drop**, and the move has to be asked of the
+compositor.
+
+```
+Method  MoveWindow(u pid, i x, i y) -> (b moved)
+Object  /org/displayxr/WindowPlacement      Interface  org.displayxr.WindowPlacement1
+```
+
+`x`/`y` are the window FRAME's top-left in the same logical stage coordinates
+`GetWindows` reports. The PID is taken from the **bus connection**, never from
+the argument (which must match, or be 0 for "me"): a client may only move its
+own windows. The extension refuses while an interactive grab is running on the
+window — the user is still dragging it — and for fullscreen windows.
+
+Additive schema field for the same reason: every window now carries
+`"moving"`, true while an interactive grab (move or resize) is in progress on
+it. A consumer that repositions windows waits for it to go false. A publisher
+older than version 3 omits it, and the runtime then settles on stillness alone
+(six unchanged polls), which is less exact but never wrong.
+
+### 7.2 What the runtime does with it
+
+`vk_wayland_phase_snap` (`comp_vk_native_compositor.c`), once per settled move:
+
+1. The window's content origin comes from the geometry payload as usual, in
+   device pixels relative to the panel.
+2. **Reachability.** Mutter positions windows at integer LOGICAL pixels, so on
+   a monitor at scale `q` only every `q`-th device pixel can be reached. That
+   is a lattice only when `q` is an integer — `u_wl_placement_quantum()` — and
+   a fractionally-scaled output (1.6667) has none, so the runtime refuses to
+   snap rather than name a position that does not exist. `DXR_WL_SNAP_QUANTUM`
+   forces one for diagnostics; it is not a fix.
+3. **The phase-correct position** is searched on that lattice with
+   `vk_snap_search_lattice()`, the same function the X11 drag uses: the display
+   processor stays the only owner of the lens math (ADR-019) — the runtime
+   never computes a phase, it only chooses which positions to offer
+   `snap_window_rect`. The DP is given the pre-move origin as the phase
+   reference and the drop position as the reachability anchor; on X11 those
+   coincide, after a compositor-run drag they do not.
+4. If the answer differs from the drop, the runtime calls `MoveWindow` with the
+   frame origin plus the (exact, whole-quantum) delta, and logs one line either
+   way. At most two attempts per settle, so a compositor that constrains the
+   move cannot make it oscillate.
+
+Every failure ends where the session was before: the window keeps the phase it
+was dropped on, which is the pre-#1609 behaviour.
