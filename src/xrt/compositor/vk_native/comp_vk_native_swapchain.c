@@ -70,8 +70,9 @@ struct comp_vk_native_swapchain
 
 	//! @name #1559 compose scratch
 	//! Lazily created UNORM staging image for the compose blit's source rect.
-	//! Only allocated for a `true_srgb` swapchain, grown to the largest source
-	//! rect seen, and freed with the swapchain.
+	//! Only allocated for a `true_srgb` swapchain, at the swapchain's full
+	//! extent on first use, never resized (see vk_swapchain_ensure_scratch),
+	//! and freed with the swapchain.
 	//! @{
 	VkImage scratch_image;
 	VkDeviceMemory scratch_memory;
@@ -579,36 +580,37 @@ comp_vk_native_swapchain_is_true_srgb(struct xrt_swapchain *xsc)
 }
 
 /*!
- * Grow (or first create) the #1559 compose scratch so it covers @p need_w x
- * @p need_h. Returns false once it has failed, so the caller degrades to a
- * direct blit instead of retrying every frame.
+ * Create the #1559 compose scratch on first use, at the swapchain's FULL
+ * extent, and never resize it. Returns false once it has failed, so the caller
+ * degrades to a direct blit instead of retrying every frame.
+ *
+ * Never grow it. The scratch is staged into once per VIEW, and every view of a
+ * frame is recorded into the SAME command buffer before one submit. It used to
+ * be sized to the rect in hand and grown on demand, so on a tiled atlas view 0
+ * (the left tile) created it tile-wide and view 1 (the next tile over) then
+ * destroyed it to make a wider one — while view 0's already-recorded copy and
+ * blit still referenced it. Destroying an image a command buffer references
+ * invalidates that command buffer; submitting it anyway was VK_ERROR_DEVICE_LOST
+ * on the first two-tile frame and every frame after (a transparent window with
+ * no content, for every app on the blit compose path with an sRGB swapchain).
+ * The vkDeviceWaitIdle that guarded the destroy could not help: nothing had
+ * been submitted yet. A swapchain's extent is fixed for its lifetime, so the
+ * full-size scratch is the only size it ever needs.
  */
 static bool
-vk_swapchain_ensure_scratch(struct comp_vk_native_swapchain *sc, uint32_t need_w, uint32_t need_h)
+vk_swapchain_ensure_scratch(struct comp_vk_native_swapchain *sc)
 {
 	struct vk_bundle *vk = sc->vk;
 
 	if (sc->scratch_failed) {
 		return false;
 	}
-	if (sc->scratch_image != VK_NULL_HANDLE && sc->scratch_w >= need_w && sc->scratch_h >= need_h) {
+	if (sc->scratch_image != VK_NULL_HANDLE) {
 		return true;
 	}
 
-	// Growing: the old one cannot be in flight — the compose records and
-	// submits within one frame and the caller is on that thread.
-	if (sc->scratch_image != VK_NULL_HANDLE) {
-		vk->vkDeviceWaitIdle(vk->device);
-		vk->vkDestroyImage(vk->device, sc->scratch_image, NULL);
-		sc->scratch_image = VK_NULL_HANDLE;
-	}
-	if (sc->scratch_memory != VK_NULL_HANDLE) {
-		vk->vkFreeMemory(vk->device, sc->scratch_memory, NULL);
-		sc->scratch_memory = VK_NULL_HANDLE;
-	}
-
-	uint32_t w = need_w > sc->scratch_w ? need_w : sc->scratch_w;
-	uint32_t h = need_h > sc->scratch_h ? need_h : sc->scratch_h;
+	uint32_t w = sc->info.width;
+	uint32_t h = sc->info.height;
 
 	VkImageCreateInfo image_ci = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -727,7 +729,7 @@ comp_vk_native_swapchain_stage_unorm_copy(struct xrt_swapchain *xsc,
 
 	// The copy lands at the SAME offsets as in the app image, so the caller's
 	// srcOffsets need no adjusting — only the array layer collapses to 0.
-	if (!vk_swapchain_ensure_scratch(sc, (uint32_t)src_x + src_w, (uint32_t)src_y + src_h)) {
+	if (!vk_swapchain_ensure_scratch(sc)) {
 		return 0;
 	}
 
