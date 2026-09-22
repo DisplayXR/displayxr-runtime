@@ -378,6 +378,18 @@ so e.g. `xrCaptureAtlasDXR` routes through the IPC branch, not the in-process
 one. (`XRT_FORCE_MODE=ipc` must be set process-level via the env, not the run
 script, since the DLL has its own static-CRT environment block.)
 
+**The service reads its OWN environment, not the client's.** Under forced IPC the
+process doing the composition is `displayxr-service.exe`, which auto-starts from the
+HKLM `Run` key with the *logon* environment — so any `DXR_*` knob you set on the
+client (`DXR_LEGACY_CAMERA_RIG`, `DXR_ATLAS_CAPTURE_RAW_ALPHA`, `DXR_SPLIT_SAME_ADAPTER`,
+…) silently does not reach it, and a forced-IPC CTS run is judged against the service's
+default 60° rig while the client asked for 100°. Benign for a silhouette (QuadOcclusion),
+wrong for anything judged on position or size (Subimage's grid, the gradient rects) — a
+false FAIL there looks exactly like a compositor bug. To put a knob in the service, stop
+it and relaunch it from a `.bat` that sets the env, via `explorer.exe <bat>` so it stays
+Medium-integrity (an elevated harness's child would not match the clients). Same trap
+class as the caveat above: a knob set on one process while another does the work.
+
 ### macOS test apps
 Copy binaries to `_package/DisplayXR-macOS/bin/`. Generated `run_*.sh` set `XRT_PLUGIN_SEARCH_PATH=$DIR/lib/displayxr/plugins` so the dev tree's `DisplayXR-SimDisplay.dylib` (+ `200-sim-display.json`) is discovered without touching `~/Library/Application Support/`.
 
