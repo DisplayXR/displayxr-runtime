@@ -592,6 +592,9 @@ struct comp_vk_native_compositor
 	//! Where this move started — the phase reference the DP is given.
 	int32_t wl_snap_anchor_x, wl_snap_anchor_y;
 	bool wl_snap_moving;    //!< a move is in progress
+	//! A move request is out and its landing has not been read back yet.
+	bool wl_snap_verify_pending;
+	int32_t wl_snap_want_x, wl_snap_want_y; //!< what that request asked for
 	uint32_t wl_snap_still; //!< consecutive polls with an unchanged origin
 	uint32_t wl_snap_tries; //!< move requests made for THIS settle (cap 2)
 	bool warned_wl_snap_scale;
@@ -10188,7 +10191,8 @@ vk_snap_search_lattice(struct comp_vk_native_compositor *c,
                        int32_t target_y,
                        uint32_t q,
                        int32_t *out_x,
-                       int32_t *out_y);
+                       int32_t *out_y,
+                       bool *out_exact);
 
 //! Polls with an unchanged origin before a Wayland move counts as finished,
 //! for a publisher too old to report `moving` (~100 ms at 60 Hz).
@@ -10230,6 +10234,39 @@ vk_wayland_phase_snap(struct comp_vk_native_compositor *c)
 	}
 
 	const int32_t cur_x = wr.left_px, cur_y = wr.top_px;
+
+	/*
+	 * Did the move we asked for LAND? (#1609 follow-up.) An accepted
+	 * WindowPlacement1 call is not evidence that the window is where we asked:
+	 * the compositor constrains a move to keep a window reachable, and a
+	 * publisher that moved the FRAME while this lattice was computed for the
+	 * CONTENT rect would land a constant bar-height off. So read the achieved
+	 * origin back and say, in one line, what actually happened. Checked before
+	 * anything else, so the move we caused is never mistaken for a new drag.
+	 */
+	if (c->wl_snap_verify_pending) {
+		c->wl_snap_verify_pending = false;
+		const int32_t dx = cur_x - c->wl_snap_want_x;
+		const int32_t dy = cur_y - c->wl_snap_want_y;
+		if (dx == 0 && dy == 0) {
+			U_LOG_W("phase snap: LANDED at (%d, %d) px, exactly where the lattice asked", cur_x, cur_y);
+		} else {
+			U_LOG_W(
+			    "phase snap: asked for (%d, %d) px but the window LANDED at (%d, %d) — off by (%d, %d) "
+			    "px. The weave is phased to where it actually is (the origin feed is read back every "
+			    "frame), but the drop is not on the lattice. A constant offset the size of the title "
+			    "bar means the compositor moved the FRAME where this asked for the CONTENT.",
+			    c->wl_snap_want_x, c->wl_snap_want_y, cur_x, cur_y, dx, dy);
+		}
+		c->wl_snap_last_x = cur_x;
+		c->wl_snap_last_y = cur_y;
+		c->wl_snap_anchor_x = cur_x;
+		c->wl_snap_anchor_y = cur_y;
+		c->wl_snap_moving = false;
+		c->wl_snap_still = 0;
+		return;
+	}
+
 	if (!c->wl_snap_have_last) {
 		c->wl_snap_have_last = true;
 		c->wl_snap_last_x = cur_x;
@@ -10315,12 +10352,80 @@ vk_wayland_phase_snap(struct comp_vk_native_compositor *c)
 	}
 
 	struct xrt_display_processor_vk *vdp = (struct xrt_display_processor_vk *)c->display_processor;
+
+	// The display processor's OWN answer, unconstrained by what a window can
+	// reach. Logged next to the reachable one because the difference is the
+	// whole question on a scaled output: a 200 % monitor can only place a
+	// window on EVEN device pixels, so a phase that wants an odd one cannot be
+	// reached by moving at all.
+	int32_t dp_x = cur_x, dp_y = cur_y;
+	const bool dp_answered =
+	    xrt_display_processor_vk_snap_window_rect(vdp, c->wl_snap_anchor_x, c->wl_snap_anchor_y, cur_x, cur_y,
+	                                              &dp_x, &dp_y);
+
+	// DXR_WL_SNAP_PROBE=1: ask the DP which nearby positions it considers
+	// phase-correct and print the two axes. Pure queries, no moves, once per
+	// drop. This is what turns "the lattice is/isn't reachable" from an
+	// argument into a measurement: it shows the period AND the parity.
+	{
+		static int probe = -1;
+		if (probe < 0) {
+			const char *e = getenv("DXR_WL_SNAP_PROBE");
+			probe = (e != NULL && e[0] == '1') ? 1 : 0;
+		}
+		if (probe == 1) {
+			char xs[192] = {0}, ys[192] = {0};
+			size_t xn = 0, yn = 0;
+			for (int32_t d = -8; d <= 8; d++) {
+				int32_t rx = cur_x + d, ry = cur_y;
+				if (xrt_display_processor_vk_snap_window_rect(vdp, c->wl_snap_anchor_x,
+				                                             c->wl_snap_anchor_y, cur_x + d, cur_y,
+				                                             &rx, &ry) &&
+				    rx == cur_x + d && xn + 8 < sizeof(xs)) {
+					xn += (size_t)snprintf(xs + xn, sizeof(xs) - xn, "%s%d", xn ? "," : "", d);
+				}
+				int32_t px = cur_x, py = cur_y + d;
+				if (xrt_display_processor_vk_snap_window_rect(vdp, c->wl_snap_anchor_x,
+				                                             c->wl_snap_anchor_y, cur_x, cur_y + d,
+				                                             &px, &py) &&
+				    py == cur_y + d && yn + 8 < sizeof(ys)) {
+					yn += (size_t)snprintf(ys + yn, sizeof(ys) - yn, "%s%d", yn ? "," : "", d);
+				}
+			}
+			// Per AXIS on purpose: an offset counts when the DP leaves THAT
+			// coordinate alone, whatever it does with the other one. Requiring
+			// both at once reports "none" for an axis the DP is happy with
+			// merely because the other axis is off its lattice.
+			U_LOG_W("snap probe at (%d, %d) px, quantum %u: DP-accepted dx offsets [%s]; dy offsets "
+			        "[%s]. Only offsets that are multiples of %u are reachable by moving the window — an "
+			        "accepted offset list with no even entry means the phase this drop needs cannot be "
+			        "reached by placing the window at all.",
+			        cur_x, cur_y, q, xs[0] != '\0' ? xs : "none", ys[0] != '\0' ? ys : "none", q);
+		}
+	}
+
 	int32_t sx = cur_x, sy = cur_y;
+	bool exact = false;
 	// Phase reference: where the move began. Reachability: where it ended —
 	// the compositor ran the drag, so the drop is not on the anchor's lattice.
 	if (!vk_snap_search_lattice(c, vdp, c->wl_snap_anchor_x, c->wl_snap_anchor_y, cur_x, cur_y, cur_x, cur_y, q,
-	                            &sx, &sy)) {
+	                            &sx, &sy, &exact)) {
 		return; // the DP does not snap; nothing to improve
+	}
+	if (!exact) {
+		/*
+		 * No REACHABLE position is phase-correct. Moving the window to the
+		 * nearest reachable one would buy nothing — it is as misphased as the
+		 * drop, only somewhere else — so decline, and say what was wanted and
+		 * why it cannot be had. The runtime keeps feeding the TRUE origin, so
+		 * the weave is still phased for where the window actually is.
+		 */
+		U_LOG_W("phase snap: NOT MOVING — no reachable position is phase-correct. The display processor "
+		        "wants (%d, %d) px, the window can only be placed on multiples of %u px from (%d, %d), and "
+		        "the nearest such point (%d, %d) is not phase-correct either. The weave keeps the phase it "
+		        "was dropped on. (Run with DXR_WL_SNAP_PROBE=1 to see which offsets the DP accepts.)",
+		        dp_x, dp_y, q, cur_x, cur_y, sx, sy);
+		return;
 	}
 	if (sx == cur_x && sy == cur_y) {
 		U_LOG_I("phase snap: dropped at (%d, %d) px, already on the lattice", cur_x, cur_y);
@@ -10333,21 +10438,20 @@ vk_wayland_phase_snap(struct comp_vk_native_compositor *c)
 
 	// Device px -> the publisher's logical stage coordinates. Exact by
 	// construction: every offset the search returns is a multiple of q.
-	const int32_t dx = (sx - cur_x) / (int32_t)q;
-	const int32_t dy = (sy - cur_y) / (int32_t)q;
+	const int32_t mdx = (sx - cur_x) / (int32_t)q;
+	const int32_t mdy = (sy - cur_y) / (int32_t)q;
 	const bool ok =
-	    comp_vk_native_wl_geom_move_window(c->wl_geom, wr.frame_logical_x + dx, wr.frame_logical_y + dy);
-	U_LOG_W(
-	    "phase snap: drop at (%d, %d) px -> lattice (%d, %d) px, asking the compositor to move the window "
-	    "by (%d, %d) logical px%s",
-	    cur_x, cur_y, sx, sy, dx, dy, ok ? "" : " — REFUSED, the window keeps the phase it was dropped on");
+	    comp_vk_native_wl_geom_move_window(c->wl_geom, wr.frame_logical_x + mdx, wr.frame_logical_y + mdy);
+	U_LOG_W("phase snap: drop at (%d, %d) px, DP wants (%d, %d)%s -> reachable phase-correct (%d, %d); asking "
+	        "the compositor to move the window by (%d, %d) logical px%s",
+	        cur_x, cur_y, dp_x, dp_y, dp_answered ? "" : " (DP declined)", sx, sy, mdx, mdy,
+	        ok ? "" : " — REFUSED, the window keeps the phase it was dropped on (a drop at a screen edge is "
+	                  "clamped by the compositor; the origin feed stays truthful either way)");
 	if (ok) {
-		// Expect to observe exactly this next poll, so the move we asked for
-		// is not mistaken for a new drag.
-		c->wl_snap_last_x = sx;
-		c->wl_snap_last_y = sy;
-		c->wl_snap_anchor_x = sx;
-		c->wl_snap_anchor_y = sy;
+		// Verify the landing on the next poll rather than assume it.
+		c->wl_snap_verify_pending = true;
+		c->wl_snap_want_x = sx;
+		c->wl_snap_want_y = sy;
 	}
 }
 #endif // XRT_OS_LINUX_DESKTOP && XRT_HAVE_WAYLAND && DXR_HAVE_WL_GEOM
@@ -10844,8 +10948,17 @@ vk_snap_stats_record(uint32_t calls, bool fallback)
  * a phase, it only chooses which positions to offer.
  *
  * @return false when the DP does not snap at all. Otherwise @p out_x/@p out_y
- *         is a reachable position: phase-correct when one was found within
- *         reach, else the nearest reachable point to the DP's own answer.
+ *         is a reachable position and @p out_exact says which kind: true = the
+ *         display processor considers it phase-correct (it is a fixed point of
+ *         its own snap), false = NO reachable position is, and this is merely
+ *         the nearest reachable point to the DP's answer.
+ *
+ * That distinction is the caller's to act on, and the two callers act
+ * differently. An X11 drag is already moving the window, so landing on the
+ * nearest reachable pixel is strictly better than landing on an arbitrary one.
+ * A Wayland drop is NOT moving anything yet, so moving the window to a
+ * position that is not phase-correct buys nothing and costs a visible jump —
+ * it declines instead and lets the true origin stand.
  */
 static bool
 vk_snap_search_lattice(struct comp_vk_native_compositor *c,
@@ -10858,8 +10971,12 @@ vk_snap_search_lattice(struct comp_vk_native_compositor *c,
                        int32_t target_y,
                        uint32_t q,
                        int32_t *out_x,
-                       int32_t *out_y)
+                       int32_t *out_y,
+                       bool *out_exact)
 {
+	if (out_exact != NULL) {
+		*out_exact = false;
+	}
 	int32_t sx = target_x, sy = target_y;
 	if (!xrt_display_processor_vk_snap_window_rect(vdp, origin_x, origin_y, target_x, target_y, &sx, &sy)) {
 		return false; // the DP does not snap; nothing to improve
@@ -10867,6 +10984,9 @@ vk_snap_search_lattice(struct comp_vk_native_compositor *c,
 	if (vk_on_reachable_lattice(reach_x, sx, q) && vk_on_reachable_lattice(reach_y, sy, q)) {
 		*out_x = sx;
 		*out_y = sy;
+		if (out_exact != NULL) {
+			*out_exact = true;
+		}
 		vk_snap_stats_record(1u, false);
 		return true;
 	}
@@ -10888,6 +11008,9 @@ vk_snap_search_lattice(struct comp_vk_native_compositor *c,
 		if (vk_on_reachable_lattice(reach_x, rx, q) && vk_on_reachable_lattice(reach_y, ry, q)) {
 			*out_x = rx;
 			*out_y = ry;
+			if (out_exact != NULL) {
+				*out_exact = true;
+			}
 			vk_snap_stats_record(2u + k, false);
 			return true;
 		}
@@ -11006,8 +11129,10 @@ comp_vk_native_compositor_snap_window_rect(struct xrt_compositor *xc,
 			}
 			// X11: the app snapped every step from the drag origin, so the
 			// origin is both the phase reference and the reachability anchor.
+			// X11 takes the nearest reachable point either way: the window
+			// is already moving, so an inexact landing beats an arbitrary one.
 			return vk_snap_search_lattice(c, vdp, origin_x, origin_y, origin_x, origin_y, target_x,
-			                              target_y, q, out_x, out_y);
+			                              target_y, q, out_x, out_y, NULL);
 		}
 	}
 #endif // XRT_OS_LINUX_DESKTOP
