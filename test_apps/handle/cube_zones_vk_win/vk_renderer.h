@@ -72,6 +72,13 @@ struct VkRenderer {
     // Fence for frame synchronization
     VkFence frameFence = VK_NULL_HANDLE;
 
+    // ADR-021 / INV-4.6: does this renderer emit SCENE-LINEAR? Latched once, at
+    // InitializeVkRenderer(), from dxr::RenderSceneLinear() -- the pipelines bake
+    // the matching `uLinearize` specialization constant, so the per-frame clear
+    // colour must follow the SAME latched decision rather than re-reading the
+    // environment and drifting out of step with the baked shaders.
+    bool sceneLinear = false;
+
     // Scene state
     float cubeRotation = 0.0f;
 };
