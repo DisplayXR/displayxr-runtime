@@ -13,6 +13,7 @@
 
 #include "comp_xbridge.h"
 #include "comp_xbridge_plane_policy.h"
+#include "comp_xbridge_format_policy.h"
 
 #include "util/u_logging.h"
 #include "util/u_crash_guard.h"
@@ -963,6 +964,11 @@ xb_fmt_name(DXGI_FORMAT f)
 	case DXGI_FORMAT_R8_UNORM: return "R8_UNORM";
 	case DXGI_FORMAT_R10G10B10A2_UNORM: return "R10G10B10A2_UNORM";
 	case DXGI_FORMAT_R16G16B16A16_FLOAT: return "R16G16B16A16_FLOAT";
+	// #1663: the remaining family representatives @ref xb_typeless_family can
+	// return, so the refusal line can name a family as well as a format.
+	case DXGI_FORMAT_R8_TYPELESS: return "R8_TYPELESS";
+	case DXGI_FORMAT_R10G10B10A2_TYPELESS: return "R10G10B10A2_TYPELESS";
+	case DXGI_FORMAT_R16G16B16A16_TYPELESS: return "R16G16B16A16_TYPELESS";
 	default: return "?";
 	}
 }
@@ -984,26 +990,73 @@ xb_fmt_name(DXGI_FORMAT f)
  * visible symptom) and prints a line naming both formats, rather than issuing a
  * copy that will succeed at doing nothing.
  *
+ * #1663 — ONE case is added to the exact-enum test, and deliberately only one: a
+ * TYPELESS SOURCE into its own family's concrete chain. The decision itself is
+ * @ref xb_source_format_compatible, extracted into `comp_xbridge_format_policy.h`
+ * and unit-tested; everything below is the logging the decision does not own.
+ *
+ * `R8G8B8A8_TYPELESS` → `R8G8B8A8_UNORM` is a plain byte move, and a typeless
+ * source carries NO colour interpretation of its own — the chain's format
+ * supplies it, which is the whole reason a resource is allocated typeless. That
+ * is exactly what a display-filling submission hands this unit: the per-client
+ * atlas is allocated TYPELESS so UNORM and UNORM_SRGB views can share it, and
+ * when the content exactly fills the display the service's crop step passes that
+ * atlas through instead of the UNORM crop texture. The old exact-enum test
+ * refused every such frame, so the bridge received nothing, the watchdog
+ * DEGRADED it and the panel stayed black while every counter read healthy.
+ *
+ * What is NOT accepted, and must not be: the rest of the family. A copy is legal
+ * across a whole typeless family, so a plain same-family test would also pass
+ * `UNORM` ↔ `UNORM_SRGB` — copy-legal, and it silently changes what the bytes
+ * MEAN to the next sampler (#1589 / #1610). Trading a loud refusal for a silent
+ * colour error is a bad trade, so two CONCRETE formats must still match exactly.
+ * Unknown formats stay refused too: an unstatable rule is not a licence.
+ *
+ * The two refusals are therefore different failures and say so — a cross-family
+ * source is a copy that transports nothing, a same-family concrete mismatch is a
+ * copy that transports the right bits under the wrong encoding.
+ *
  * Logged on the first refusal and at most every @ref XB_FMT_REFUSE_LOG_NS
  * afterwards — loud, but never the per-frame U_LOG_E the repo forbids.
  */
 static bool
 xb_check_source_format(struct comp_xbridge *xb, DXGI_FORMAT chain_fmt, DXGI_FORMAT src_fmt, const char *where)
 {
-	if (src_fmt == chain_fmt) {
+	const enum xb_source_format_verdict verdict = xb_source_format_compatible(chain_fmt, src_fmt);
+	if (xb_source_format_accepted(verdict)) {
 		return true;
 	}
+
+	// Each refusal is a DIFFERENT failure and says which: a dropped copy that
+	// transports nothing, the right bits under the wrong encoding, or a rule
+	// this unit cannot state at all.
+	const char *why =
+	    "A D3D copy across DXGI typeless families is SILENTLY DROPPED, not failed, so the "
+	    "frame is REFUSED rather than transported as nothing.";
+	if (verdict == XB_SRC_FMT_REFUSED_SRGB_SIBLING) {
+		why =
+		    "Both are CONCRETE formats in ONE typeless family: the copy is legal and moves the right "
+		    "bits, but it REINTERPRETS what they mean to the next sampler (UNORM vs UNORM_SRGB is the "
+		    "#1589/#1610 colour trap), so the frame is REFUSED rather than transported as the wrong "
+		    "colour.";
+	} else if (verdict == XB_SRC_FMT_REFUSED_UNKNOWN) {
+		why =
+		    "At least one side is a format this unit cannot place in a typeless family, so it cannot "
+		    "state whether the copy is legal — and an unstatable rule is not a licence.";
+	}
+
 	xb->fmt_refused++;
 	const uint64_t now = os_monotonic_get_ns();
 	if (xb->fmt_refuse_log_ns == 0 || now - xb->fmt_refuse_log_ns >= XB_FMT_REFUSE_LOG_NS) {
 		xb->fmt_refuse_log_ns = now;
 		U_LOG_E(
-		    "%s: ATLAS FORMAT MISMATCH at %s — the source is %s (0x%x) but that chain is %s "
-		    "(0x%x). A D3D copy across DXGI typeless families is SILENTLY DROPPED, not failed, so the "
-		    "frame is REFUSED rather than transported as nothing. Fix the caller's "
+		    "%s: ATLAS FORMAT MISMATCH at %s — the source is %s (0x%x, family %s) but that chain is %s "
+		    "(0x%x, family %s). %s Only the chain's own format and the TYPELESS member of its family "
+		    "are accepted (a typeless source carries no encoding of its own, #1663). Fix the caller's "
 		    "comp_xbridge_info::atlas_format (#1178). %llu refusals so far.",
-		    XB_TAG(xb), where, xb_fmt_name(src_fmt), (unsigned)src_fmt, xb_fmt_name(chain_fmt),
-		    (unsigned)chain_fmt, (unsigned long long)xb->fmt_refused);
+		    XB_TAG(xb), where, xb_fmt_name(src_fmt), (unsigned)src_fmt,
+		    xb_fmt_name(xb_typeless_family(src_fmt)), xb_fmt_name(chain_fmt), (unsigned)chain_fmt,
+		    xb_fmt_name(xb_typeless_family(chain_fmt)), why, (unsigned long long)xb->fmt_refused);
 	}
 	return false;
 }
