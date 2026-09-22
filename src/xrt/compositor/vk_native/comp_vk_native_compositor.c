@@ -10824,6 +10824,7 @@ vk_snap_stats_record(uint32_t calls, bool fallback)
 }
 #endif
 
+#ifdef XRT_OS_LINUX_DESKTOP
 /*!
  * The reachable-lattice search, shared by the X11 drag snap and the Wayland
  * post-drag snap (#1609). Under a placement quantum @p q the window can only
@@ -10907,6 +10908,8 @@ vk_snap_search_lattice(struct comp_vk_native_compositor *c,
 	*out_y = by;
 	return true;
 }
+
+#endif // XRT_OS_LINUX_DESKTOP
 
 bool
 comp_vk_native_compositor_snap_window_rect(struct xrt_compositor *xc,
