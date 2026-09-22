@@ -237,6 +237,14 @@ if ! echo "$RUNTIME_NEEDED" | grep -qx 'libdbus-1.so.3'; then
     exit 1
 fi
 
+# The runtime must carry the native-Wayland present path. Unlike libdbus this
+# cannot be checked with NEEDED: the path makes no libwayland-client call (the
+# app owns the Wayland connection; the runtime only calls
+# vkCreateWaylandSurfaceKHR), so the linker rightly drops that library and the
+# package correctly has no libwayland Depends. What proves the path is compiled
+# in is the extension it advertises and the VkInstance extension it requests.
+"$ROOT/scripts/check_linux_runtime_wayland.sh" "$RUNTIME_SO" || exit 1
+
 INSTALLED_KB="$(du -sk "$STAGE/usr" | cut -f1)"
 
 # --- control ---------------------------------------------------------------

@@ -16,6 +16,7 @@
 #include "util/u_logging.h"
 #include "util/u_debug.h"
 #include "util/u_misc.h"
+#include "util/u_git_tag.h"
 #include "util/comp_late_weave_lookahead.h"
 
 #include "os/os_threading.h"
@@ -1807,7 +1808,19 @@ comp_vk_native_target_create(struct comp_vk_native_compositor *c,
 		PFN_vkCreateWaylandSurfaceKHR pfnCreateWaylandSurface =
 		    (PFN_vkCreateWaylandSurfaceKHR)vk->vkGetInstanceProcAddr(vk->instance, "vkCreateWaylandSurfaceKHR");
 		if (pfnCreateWaylandSurface == NULL) {
-			U_LOG_E("vkCreateWaylandSurfaceKHR not available — VK_KHR_wayland_surface must be enabled");
+			// The app's VkInstance was created without VK_KHR_wayland_surface.
+			// This runtime asks for it on both enable paths (#1561), so the
+			// usual causes are: a runtime that predates that (check the
+			// "loaded from:" line and this tag), an enable1 app that did not
+			// enable every name xrGetVulkanInstanceExtensionsKHR returned, or
+			// a Vulkan loader/ICD with no Wayland WSI (enable2 then logs the
+			// instance's extension list without it).
+			U_LOG_E(
+			    "vkCreateWaylandSurfaceKHR not available — the app's VkInstance lacks "
+			    "VK_KHR_wayland_surface (runtime %s requests it on vulkan_enable2 and returns it "
+			    "from xrGetVulkanInstanceExtensionsKHR on vulkan_enable1; an enable1 app must "
+			    "enable every name in that string, and the loader must advertise it)",
+			    u_git_tag);
 			free(target);
 			return XRT_ERROR_VULKAN;
 		}

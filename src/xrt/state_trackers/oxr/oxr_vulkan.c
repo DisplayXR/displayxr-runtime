@@ -32,6 +32,19 @@
 #define XRT_OS_LINUX_DESKTOP
 #endif
 
+/*
+ * A Wayland-enabled build whose Vulkan headers were included without
+ * VK_USE_PLATFORM_WAYLAND_KHR would silently drop VK_KHR_wayland_surface from
+ * every instance-extension list in this TU, while comp_vk_native still compiles
+ * its Wayland present path — the session would then fail at xrCreateSession
+ * with "vkCreateWaylandSurfaceKHR not available". The macro comes from
+ * xrt_config_vulkan.h (set from XRT_HAVE_WAYLAND in the top-level CMakeLists);
+ * refuse to build rather than ship that skew.
+ */
+#if defined(XRT_OS_LINUX_DESKTOP) && defined(XRT_HAVE_WAYLAND) && !defined(VK_KHR_wayland_surface)
+#error "XRT_HAVE_WAYLAND without VK_KHR_wayland_surface: see xrt_config_vulkan.h"
+#endif
+
 
 /*
  *
@@ -162,15 +175,16 @@ static const char *required_vk_instance_extensions[] = {
     // xrCreateVulkanInstanceKHR builds, which runs long before xrCreateSession
     // — so the runtime does not yet know whether the app will chain
     // XR_DXR_xlib_window_binding or XR_DXR_wayland_surface_binding. Both
-    // compiled-in platforms must therefore be enabled unconditionally; an
+    // compiled-in platforms must therefore be enabled whenever available; an
     // unused surface extension costs nothing on any Linux ICD, whereas a
     // missing one is unrecoverable by the time the binding is known.
+    //
+    // VK_KHR_wayland_surface is in optional_vk_instance_extensions below, not
+    // here: requested whenever the loader advertises it, but a loader/ICD
+    // without Wayland WSI must not fail instance creation for an X11 session.
     VK_KHR_SURFACE_EXTENSION_NAME, //
 #ifdef VK_KHR_xcb_surface
     VK_KHR_XCB_SURFACE_EXTENSION_NAME, //
-#endif
-#ifdef VK_KHR_wayland_surface
-    VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME, //
 #endif
 #endif
 };
@@ -178,6 +192,13 @@ static const char *required_vk_instance_extensions[] = {
 static const char *optional_vk_instance_extensions[] = {
 #if defined(VK_EXT_debug_utils)
     VK_EXT_DEBUG_UTILS_EXTENSION_NAME,
+#endif
+#if defined(XRT_OS_LINUX_DESKTOP) && defined(VK_KHR_wayland_surface)
+    // Wayland present path (XR_DXR_wayland_surface_binding): see the desktop
+    // Linux arm of required_vk_instance_extensions above for why it is always
+    // requested. Availability-checked, so an ICD without Wayland WSI degrades to
+    // a clear error at xrCreateSession for a Wayland binding only.
+    VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME,
 #endif
 };
 
