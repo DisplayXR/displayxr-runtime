@@ -34,7 +34,7 @@
 #include <unistd.h>                  // close() the keymap fd we do not read
 #endif
 
-#include <chrono> // bounded event-pump budget in the X11 placement handshake
+#include <chrono> // bounded event-pump budget in the X11 placement handshake, and the drag's timing line
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1252,6 +1252,161 @@ DxrLinuxWindow::s_kb_repeat_info(void *data, struct wl_keyboard *kb, int32_t rat
 	(void)delay;
 }
 
+#ifdef DXR_APP_HAVE_WL_CHROME
+/*
+ *
+ * App-owned, phase-snapped Wayland drag (#1609).
+ *
+ * The rule the X11 leg has always followed: whoever decides the next position
+ * must snap it BEFORE the window gets there, or the interlace phase changes
+ * under the content and the 3D breaks up while the window moves. Windows does
+ * it in its move loop, X11 does it here (snap -> XMoveWindow), and Wayland
+ * could not do it at all until the geometry extension grew a placement method
+ * — a client has no positioning protocol of its own.
+ *
+ * What the app does NOT do is guess where the window ended up: the runtime
+ * keeps reading the real position from the compositor and weaves for THAT.
+ * A requested position is not a fact.
+ */
+
+bool
+DxrLinuxWindow::wl_drag_begin()
+{
+	const char *env = getenv("DXR_WL_CLIENT_DRAG");
+	const bool forced = env != nullptr && env[0] == '1';
+	if (env != nullptr && env[0] == '0') {
+		return false; // A/B: let the compositor run the drag
+	}
+	if (!m_wl_placement.available() || m_snap_fn == nullptr) {
+		return false;
+	}
+	// Reachability: the compositor places windows at integer LOGICAL
+	// positions, so only every q-th device pixel exists for us. That is a
+	// lattice only when the output scale is an integer; on a fractional one
+	// the snapped position is unreachable and an app-owned drag would be a
+	// jerkier compositor drag with no phase benefit.
+	const double scale = wl_surface_scale();
+	const double nearest = (double)(int32_t)(scale + 0.5);
+	const bool integer_scale = scale >= 1.0 && (scale > nearest ? scale - nearest : nearest - scale) <= 0.01;
+	if (!integer_scale && !forced) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			DXRW_WARN("drag: this output's scale is %.4f, not an integer, so a snapped position is not "
+			          "reachable — letting the compositor run the drag (unsnapped). DXR_WL_CLIENT_DRAG=1 "
+			          "forces the app-owned drag anyway, for latency comparisons.",
+			          scale);
+		}
+		return false;
+	}
+	m_wl_drag_quantum = integer_scale ? (uint32_t)nearest : 1u;
+	m_wl_client_drag = true;
+	m_wl_drag_applied_x = 0;
+	m_wl_drag_applied_y = 0;
+	m_wl_drag_moves = 0;
+	m_wl_drag_requests = 0;
+	m_wl_drag_snapped = 0;
+	m_wl_drag_start_ns = (int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                         std::chrono::steady_clock::now().time_since_epoch())
+	                         .count();
+	DXRW_INFO("drag: app-owned (phase-snapped every step), quantum %u device px at scale %.4f",
+	          m_wl_drag_quantum, scale);
+	return true;
+}
+
+void
+DxrLinuxWindow::wl_drag_move(double dx_logical, double dy_logical)
+{
+	if (!m_wl_client_drag) {
+		return;
+	}
+	m_wl_drag_moves++;
+
+	/*
+	 * Where the pointer is now, relative to the press, in the DESKTOP's frame.
+	 * The surface-local delta shrinks as the window follows, so what we have
+	 * already applied is added back — that sum is what the user has asked for.
+	 */
+	const double want_logical_x = dx_logical + (double)m_wl_drag_applied_x;
+	const double want_logical_y = dy_logical + (double)m_wl_drag_applied_y;
+	const double scale = m_wl_drag_quantum > 0 ? (double)m_wl_drag_quantum : 1.0;
+	const int32_t want_dev_x = (int32_t)(want_logical_x * scale + (want_logical_x >= 0 ? 0.5 : -0.5));
+	const int32_t want_dev_y = (int32_t)(want_logical_y * scale + (want_logical_y >= 0 ? 0.5 : -0.5));
+
+	/*
+	 * Snap the DISPLACEMENT, with the drag's start as the origin — held for
+	 * the whole drag, never re-anchored to the last step, or the phase error
+	 * accumulates. Only the displacement matters to the snap, so the app needs
+	 * no absolute position (Wayland would not give it one anyway).
+	 */
+	int32_t snap_x = want_dev_x, snap_y = want_dev_y;
+	snap_origin(0, 0, want_dev_x, want_dev_y, &snap_x, &snap_y);
+
+	// Reachability: round the snapped displacement to the lattice the window
+	// can actually land on. A residual of up to half a quantum stays, and it
+	// is the same residual the drop-time snap reports.
+	const int32_t q = (int32_t)(m_wl_drag_quantum > 0 ? m_wl_drag_quantum : 1);
+	auto round_to_q = [q](int32_t v) {
+		const int32_t half = q / 2;
+		return v >= 0 ? ((v + half) / q) * q : -(((-v + half) / q) * q);
+	};
+	const int32_t reach_x = round_to_q(snap_x);
+	const int32_t reach_y = round_to_q(snap_y);
+	if (reach_x != want_dev_x || reach_y != want_dev_y) {
+		m_wl_drag_snapped++;
+	}
+
+	const int32_t req_x = reach_x / q;
+	const int32_t req_y = reach_y / q;
+	const int32_t step_x = req_x - m_wl_drag_applied_x;
+	const int32_t step_y = req_y - m_wl_drag_applied_y;
+	if (step_x == 0 && step_y == 0) {
+		return; // the window is already where this motion asks for
+	}
+	if (!m_wl_placement.move_by(step_x, step_y)) {
+		return;
+	}
+	m_wl_drag_requests++;
+	m_wl_drag_applied_x = req_x;
+	m_wl_drag_applied_y = req_y;
+
+	// DXR_WL_DRAG_TRACE=1: one line per request, with the time since the press.
+	// Paired with the runtime's own `present origin:` lines (same log, same
+	// process) it measures how long a requested move takes to become the
+	// position the weaver is fed — the latency an app-owned drag adds.
+	static const bool trace = [] {
+		const char *e = getenv("DXR_WL_DRAG_TRACE");
+		return e != nullptr && e[0] == '1';
+	}();
+	if (trace) {
+		const int64_t t_ns = (int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                         std::chrono::steady_clock::now().time_since_epoch())
+		                         .count();
+		DXRW_INFO("drag trace: request #%llu at t=%.1f ms — step (%+d, %+d) logical, cumulative (%+d, %+d), "
+		          "raw pointer (%+d, %+d) device, snapped to (%+d, %+d)",
+		          (unsigned long long)m_wl_drag_requests, (double)(t_ns - m_wl_drag_start_ns) / 1000000.0,
+		          step_x, step_y, req_x, req_y, want_dev_x, want_dev_y, reach_x, reach_y);
+	}
+}
+
+void
+DxrLinuxWindow::wl_drag_end()
+{
+	if (!m_wl_client_drag) {
+		return;
+	}
+	m_wl_client_drag = false;
+	const int64_t now_ns = (int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                           std::chrono::steady_clock::now().time_since_epoch())
+	                           .count();
+	const double ms = (double)(now_ns - m_wl_drag_start_ns) / 1000000.0;
+	DXRW_INFO("drag: end — %llu motion event(s) in %.0f ms, %llu move request(s), %llu of them snapped away "
+	          "from the raw pointer position; total %d,%d logical px",
+	          (unsigned long long)m_wl_drag_moves, ms, (unsigned long long)m_wl_drag_requests,
+	          (unsigned long long)m_wl_drag_snapped, m_wl_drag_applied_x, m_wl_drag_applied_y);
+}
+#endif // DXR_APP_HAVE_WL_CHROME
+
 bool
 DxrLinuxWindow::create_wayland(const DxrLinuxWindowDesc &desc)
 {
@@ -1461,6 +1616,13 @@ DxrLinuxWindow::create_wayland(const DxrLinuxWindowDesc &desc)
 	// server-side-decoration request must precede the initial configure.
 	m_wl_chrome.attach(m_wl_display, m_wl_compositor, m_wl_surface, m_wl_xdg_surface, m_wl_toplevel,
 	                   m_wl_viewporter, desc.title, desc.fullscreen_on_wayland);
+	// App-owned drag (#1609): available only with the compositor's placement
+	// service. Probed once here so a drag never has to find out mid-gesture.
+	m_wl_placement.connect();
+	DXRW_INFO("drag: window placement service — %s", m_wl_placement.describe());
+	m_wl_chrome.set_drag_hooks([this] { return wl_drag_begin(); },
+	                           [this](double dx, double dy) { wl_drag_move(dx, dy); },
+	                           [this] { wl_drag_end(); });
 #endif
 
 	// The role is attached and the state requested; commit so the compositor

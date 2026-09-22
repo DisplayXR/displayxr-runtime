@@ -586,6 +586,22 @@ DxrWlChrome::on_pointer_motion(double x, double y)
 {
 	m_ptr_x = x;
 	m_ptr_y = y;
+	if (m_client_dragging) {
+		/*
+		 * Displacement since the press, in SURFACE-LOCAL logical px.
+		 *
+		 * The surface moves under the pointer as the window follows, so this
+		 * number shrinks back toward zero exactly as far as the window has
+		 * already gone. The receiver adds what it has already applied to
+		 * recover where the pointer is in the desktop's frame — which is the
+		 * quantity a drag is actually about, and the one Wayland never tells a
+		 * client directly.
+		 */
+		if (m_drag_move) {
+			m_drag_move(x - m_drag_press_x, y - m_drag_press_y);
+		}
+		return;
+	}
 	if (m_ptr_surface == m_surface && m_surface != nullptr) {
 		// Surface-local LOGICAL -> the bar raster's device px.
 		const dxr_csd::Hit h = m_bar.hitTest((int)(x * m_scale), (int)(y * m_scale), m_buf_w);
@@ -641,6 +657,23 @@ DxrWlChrome::on_pointer_button(uint32_t serial, uint32_t time, uint32_t button, 
 				CHROME_INFO("Wayland chrome: double-click — %s", m_maximized ? "restore" : "maximise");
 				return;
 			}
+			/*
+			 * App-owned drag first (#1609): the window is moved by us, so
+			 * every step can be phase-snapped BEFORE it lands, which is what
+			 * keeps the interlace still while the window moves. Wayland's
+			 * implicit pointer grab keeps motion coming to this surface until
+			 * the button is released, so no extra grab is needed.
+			 *
+			 * Falling back to xdg_toplevel.move hands the whole drag to the
+			 * compositor — smoother and with its edge/workspace affordances,
+			 * but unsnapped.
+			 */
+			if (m_drag_begin && m_drag_begin()) {
+				m_client_dragging = true;
+				m_drag_press_x = m_ptr_x;
+				m_drag_press_y = m_ptr_y;
+				return;
+			}
 			// The compositor's own move — the same one Super+drag runs, so
 			// the runtime's geometry-service phase tracking is unchanged.
 			xdg_toplevel_move(m_toplevel, m_seat, serial);
@@ -656,6 +689,13 @@ DxrWlChrome::on_pointer_button(uint32_t serial, uint32_t time, uint32_t button, 
 	}
 
 	// Release.
+	if (m_client_dragging) {
+		m_client_dragging = false;
+		if (m_drag_end) {
+			m_drag_end();
+		}
+		return;
+	}
 	const dxr_csd::Hit down = m_bar.pressed();
 	m_bar.setPressed(dxr_csd::Hit::Outside);
 	if (down == dxr_csd::Hit::Outside || down != h) {

@@ -96,7 +96,8 @@
 // so the real definitions have to come first.
 #include <wayland-client.h>
 #ifdef DXR_APP_HAVE_WL_CHROME
-#include "dxr_wl_chrome.h" // title bar for the native-Wayland leg (#1654)
+#include "dxr_wl_chrome.h"    // title bar for the native-Wayland leg (#1654)
+#include "dxr_wl_placement.h" // app-owned, phase-snapped window drag (#1609)
 #endif
 #endif
 
@@ -481,6 +482,34 @@ private:
 #ifdef DXR_APP_HAVE_WL_CHROME
 	//! Title bar (client-side decorations) — see dxr_wl_chrome.h, #1654.
 	DxrWlChrome m_wl_chrome;
+
+	/*!
+	 * @name App-owned, phase-snapped Wayland drag (#1609)
+	 *
+	 * The X11 leg has always owned its drag so every step goes through the
+	 * display processor's snap before the window moves; this is the Wayland
+	 * equivalent, built on the compositor's placement service. Without the
+	 * service (or on a fractionally-scaled output, where the reachable
+	 * positions are not a lattice) the title bar falls back to
+	 * xdg_toplevel.move and the compositor runs the drag unsnapped.
+	 * @{
+	 */
+	DxrWlPlacement m_wl_placement;
+	bool m_wl_client_drag = false;   //!< a client-owned drag is in progress
+	uint32_t m_wl_drag_quantum = 0;  //!< reachable step, DEVICE px (the output scale)
+	//! What we have already ASKED the compositor for, logical px since the press.
+	int32_t m_wl_drag_applied_x = 0, m_wl_drag_applied_y = 0;
+	//! Counters for the one line the drag logs when it ends.
+	uint64_t m_wl_drag_moves = 0, m_wl_drag_requests = 0, m_wl_drag_snapped = 0;
+	int64_t m_wl_drag_start_ns = 0;
+
+	bool
+	wl_drag_begin();
+	void
+	wl_drag_move(double dx_logical, double dy_logical);
+	void
+	wl_drag_end();
+	/*! @} */
 #endif
 
 	//! Logical -> device scale of the surface, for the chrome's raster.

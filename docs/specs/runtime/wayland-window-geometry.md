@@ -523,3 +523,66 @@ older than version 3 omits it, and the runtime then settles on stillness alone
 
 Every failure ends where the session was before: the window keeps the phase it
 was dropped on, which is the pre-#1609 behaviour.
+
+
+## 8. App-owned window drag (extension version 4)
+
+### 8.1 Why the app runs the drag
+
+The interlace phase must not CHANGE while the window moves, or the 3D breaks
+up mid-drag. That is a stronger requirement than the drop-time snap in §7, and
+it can only be met by whoever decides the next position, because the position
+has to be snapped **before** the window gets there:
+
+| platform | who decides the next position | where the snap happens |
+|---|---|---|
+| Windows | the app's move loop | the DP rewrites the proposal in `WM_WINDOWPOSCHANGING` |
+| X11 | the app (`XMoveWindow`) | `snap_window_rect` before every move |
+| Wayland, `xdg_toplevel.move` | the compositor | nowhere — the client only learns afterwards |
+| Wayland, this | the app | `snap_window_rect` before every `MoveWindowBy` |
+
+```
+Method  MoveWindowBy(u pid, i dx, i dy) -> (b moved)
+```
+
+Same object, interface and PID rule as `MoveWindow` (§7.1): a client may only
+move its own windows. Relative, because a client driving a drag knows how far
+it wants to go, not where it is — asking it to learn its absolute position
+first would add a round trip per motion event and a second coordinate frame to
+get wrong.
+
+### 8.2 What the app does per motion event
+
+`test_apps/common/dxr_linux_window.cpp` (`wl_drag_move`), the reference:
+
+1. Wayland's implicit pointer grab keeps motion on the title-bar surface until
+   the button is released, so no extra grab is needed.
+2. The surface-local delta shrinks as the window follows, so the app adds what
+   it has already applied — that sum is where the pointer is in the desktop's
+   frame, which Wayland never states directly.
+3. The **displacement** is snapped through `xrWeaveSnapWindowRectDXR`, with the
+   drag's start as the origin, **held for the whole drag**. Re-anchoring to the
+   last step lets the phase error accumulate. Only the displacement matters, so
+   the app needs no absolute position at all.
+4. The result is rounded to the lattice the window can reach (integer logical
+   positions, hence multiples of the output scale in device px), and the
+   difference from what has already been applied is sent as one fire-and-forget
+   `MoveWindowBy`. No reply is waited for: a round trip in the motion path is
+   the latency this design exists to avoid.
+5. The runtime keeps feeding the weaver the position the geometry service
+   REPORTS, never the one the app asked for. A requested position is not a
+   fact, and a frame woven for a position the window never reached has wrong
+   views.
+
+### 8.3 What it costs, and when it declines
+
+- **The compositor's drag affordances are not available while the button is
+  held**: edge tiling, drag-to-workspace, drag-to-monitor. The compositor is
+  not running this drag.
+- **The window follows the pointer with client latency** instead of being moved
+  inside the compositor's input handling.
+- It **declines** — and `xdg_toplevel.move` runs the drag unsnapped — when the
+  placement service is absent, when the app installed no snap provider, or when
+  the output's scale is not an integer (the reachable positions are then not a
+  lattice, §7.2). `DXR_WL_CLIENT_DRAG=0` forces the compositor drag for an A/B;
+  `=1` forces the app-owned one even where it would decline.

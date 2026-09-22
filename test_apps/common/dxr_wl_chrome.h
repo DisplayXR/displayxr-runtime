@@ -63,6 +63,7 @@
 #include "csd_titlebar.h"
 
 #include <cstdint>
+#include <functional>
 #include <string>
 
 struct xdg_surface;
@@ -124,6 +125,27 @@ public:
 	 */
 	void
 	on_toplevel_states(struct wl_array *states, bool sized);
+
+	/*!
+	 * Install an APP-OWNED drag (#1609). With these set, a press on the title
+	 * bar runs the drag through the app instead of handing it to the
+	 * compositor with xdg_toplevel.move — which is what lets every step be
+	 * phase-snapped before the window gets there, as Windows and X11 do.
+	 *
+	 * @param begin  called on the press; return false to let the compositor
+	 *               run this drag after all (no placement service, no snap,
+	 *               a non-integer output scale, ...).
+	 * @param move   called on each motion with the pointer's displacement
+	 *               since the press, in LOGICAL px.
+	 * @param end    called on the release.
+	 */
+	void
+	set_drag_hooks(std::function<bool()> begin, std::function<void(double, double)> move, std::function<void()> end)
+	{
+		m_drag_begin = std::move(begin);
+		m_drag_move = std::move(move);
+		m_drag_end = std::move(end);
+	}
 
 	//! The window's fullscreen state changed (the window tracks it; F11).
 	void
@@ -279,4 +301,11 @@ private:
 	uint32_t m_cursor_shape = 0;
 
 	bool m_close_requested = false;
+
+	// App-owned drag (#1609). Empty hooks = the compositor runs the drag.
+	std::function<bool()> m_drag_begin;
+	std::function<void(double, double)> m_drag_move;
+	std::function<void()> m_drag_end;
+	bool m_client_dragging = false;
+	double m_drag_press_x = 0.0, m_drag_press_y = 0.0;
 };

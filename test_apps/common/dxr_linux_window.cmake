@@ -145,7 +145,25 @@ function(dxr_target_add_linux_window TARGET)
     # pinned to a displayxr-common older than v2.17.0 has no such target and
     # simply builds without chrome (the pre-#1654 undecorated window).
     if(TARGET displayxr::csd)
-        target_sources(${TARGET} PRIVATE "${DXR_LINUX_WINDOW_DIR}/dxr_wl_chrome.cpp")
+        target_sources(${TARGET} PRIVATE "${DXR_LINUX_WINDOW_DIR}/dxr_wl_chrome.cpp"
+                                         "${DXR_LINUX_WINDOW_DIR}/dxr_wl_placement.cpp")
+        # libdbus-1 (optional): the client of the compositor's window-placement
+        # service, which is what lets the app run — and phase-snap — its own
+        # window drag (#1609). Without it the title bar still drags, through
+        # xdg_toplevel.move, and the compositor runs it unsnapped.
+        if(PkgConfig_FOUND)
+            pkg_check_modules(DXR_DBUS QUIET dbus-1)
+        endif()
+        if(DXR_DBUS_FOUND)
+            target_include_directories(${TARGET} PRIVATE ${DXR_DBUS_INCLUDE_DIRS})
+            target_link_libraries(${TARGET} PRIVATE ${DXR_DBUS_LIBRARIES})
+            target_link_directories(${TARGET} PRIVATE ${DXR_DBUS_LIBRARY_DIRS})
+            target_compile_definitions(${TARGET} PRIVATE DXR_APP_HAVE_DBUS)
+            message(STATUS "${TARGET}: app-owned Wayland drag ENABLED (libdbus ${DXR_DBUS_VERSION})")
+        else()
+            message(STATUS "${TARGET}: libdbus-1 NOT found — the title-bar drag is compositor-owned "
+                           "(install libdbus-1-dev for the phase-snapped app-owned drag)")
+        endif()
         target_link_libraries(${TARGET} PRIVATE displayxr::csd)
         target_compile_definitions(${TARGET} PRIVATE DXR_APP_HAVE_WL_CHROME)
         message(STATUS "${TARGET}: Wayland title bar ENABLED (displayxr::csd)")
