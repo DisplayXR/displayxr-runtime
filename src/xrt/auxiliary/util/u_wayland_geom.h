@@ -423,6 +423,35 @@ u_wl_surface_within_frame(const struct u_wl_rect_logical *frame, const struct u_
 	       buffer->logical_y + buffer->logical_h <= frame->logical_y + frame->logical_h + tol;
 }
 
+/*!
+ * The placement quantum of a Wayland monitor, in DEVICE pixels — how far apart
+ * the positions a window can actually be placed at are (#1609).
+ *
+ * A compositor positions windows in integer LOGICAL pixels, so on a monitor at
+ * scale `s` only every `s`-th device pixel is reachable. That is a lattice
+ * only when `s` is an integer: at 1.6667 the reachable device positions are
+ * `round(k * 1.6667)` — 0, 2, 3, 5, 7, 8 … — which has no period, so no
+ * phase-correct position can be named and a caller must not pretend otherwise.
+ *
+ * @param[out] out_q  the quantum, when true is returned (1 at scale 1.0).
+ * @return false when @p scale is not a positive integer within @p tol.
+ *
+ * @ingroup aux_util
+ */
+static inline bool
+u_wl_placement_quantum(double scale, double tol, uint32_t *out_q)
+{
+	if (out_q == NULL || !(scale >= 1.0)) {
+		return false;
+	}
+	const double nearest = (double)(int32_t)(scale + 0.5);
+	if (nearest < 1.0 || (scale > nearest ? scale - nearest : nearest - scale) > tol) {
+		return false;
+	}
+	*out_q = (uint32_t)nearest;
+	return true;
+}
+
 #ifdef __cplusplus
 }
 #endif

@@ -34,6 +34,9 @@
 #define WLG_BUS_NAME "org.displayxr.WindowGeometry"
 #define WLG_OBJ_PATH "/org/displayxr/WindowGeometry"
 #define WLG_IFACE "org.displayxr.WindowGeometry1"
+//! Window placement (publisher version 3+), on the same bus name (#1609).
+#define WLG_PLACEMENT_PATH "/org/displayxr/WindowPlacement"
+#define WLG_PLACEMENT_IFACE "org.displayxr.WindowPlacement1"
 #define WLG_EXT_UUID "window-geometry@displayxr.org"
 #define WLG_MATCH_RULE "type='signal',interface='" WLG_IFACE "',member='WindowsChanged'"
 
@@ -84,6 +87,9 @@ struct wlg_window
 	int32_t buffer_logical_x, buffer_logical_y;
 	int32_t buffer_logical_w, buffer_logical_h;
 	bool have_buffer;
+	//! An interactive grab is running on this window (publisher v3+).
+	bool moving;
+	bool have_moving;
 };
 
 #define WLG_MAX_WINDOWS 64
@@ -99,6 +105,7 @@ struct comp_vk_native_wl_geom
 	bool warned_scale;       //!< one-shot INFO guard (says which scale is being applied)
 	bool warned_schema;      //!< one-shot WARN guard (publisher schema too new)
 	bool warned_no_monitor;  //!< one-shot WARN guard (payload carried no monitor rect)
+	bool warned_no_placement; //!< one-shot WARN guard (publisher has no WindowPlacement1)
 	//! Last surface-vs-frame comparison logged (logical px), on change only.
 	int32_t logged_surface_w, logged_surface_h, logged_frame_w, logged_frame_h, logged_inset_y;
 	int64_t next_retry_ns;   //!< earliest monotonic time for the next blocking GetWindows retry
@@ -186,6 +193,15 @@ wlg_parse_snapshot(struct comp_vk_native_wl_geom *g, const char *json)
 		bool focus = false;
 		u_json_get_bool(u_json_get(win, "focus"), &focus);
 		out->focus = focus;
+
+		// Publisher v3+. Absent = this publisher cannot say, and a consumer
+		// that repositions windows must then settle on geometry alone.
+		const cJSON *moving = u_json_get(win, "moving");
+		bool is_moving = false;
+		if (u_json_get_bool(moving, &is_moving)) {
+			out->moving = is_moving;
+			out->have_moving = true;
+		}
 
 		// The monitor rect + scale are what make the logical payload
 		// convertible (#1596). Schema v1 has published them since #817; they
@@ -613,6 +629,11 @@ comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g, struct 
 		    win_px.x, win_px.y, win_px.w, win_px.h, mon_w_px, mon_h_px);
 	}
 
+	out_rect->frame_logical_x = best->logical_x;
+	out_rect->frame_logical_y = best->logical_y;
+	out_rect->moving = best->moving;
+	out_rect->have_moving = best->have_moving;
+
 	out_rect->left_px = win_px.x;
 	out_rect->top_px = win_px.y;
 	out_rect->width_px = (uint32_t)win_px.w;
@@ -684,6 +705,53 @@ comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g, struct 
 		}
 	}
 	return true;
+}
+
+bool
+comp_vk_native_wl_geom_move_window(struct comp_vk_native_wl_geom *g, int32_t frame_logical_x, int32_t frame_logical_y)
+{
+	if (g == NULL || g->conn == NULL) {
+		return false;
+	}
+	DBusMessage *call =
+	    dbus_message_new_method_call(WLG_BUS_NAME, WLG_PLACEMENT_PATH, WLG_PLACEMENT_IFACE, "MoveWindow");
+	if (call == NULL) {
+		return false;
+	}
+	dbus_uint32_t pid = (dbus_uint32_t)getpid();
+	dbus_int32_t x = (dbus_int32_t)frame_logical_x;
+	dbus_int32_t y = (dbus_int32_t)frame_logical_y;
+	if (!dbus_message_append_args(call, DBUS_TYPE_UINT32, &pid, DBUS_TYPE_INT32, &x, DBUS_TYPE_INT32, &y,
+	                              DBUS_TYPE_INVALID)) {
+		dbus_message_unref(call);
+		return false;
+	}
+	// Bounded and blocking, like the GetWindows retry: this runs once when a
+	// drag ends, never per frame, and the answer decides whether the runtime
+	// may claim the window was snapped.
+	DBusError err;
+	dbus_error_init(&err);
+	DBusMessage *reply = dbus_connection_send_with_reply_and_block(g->conn, call, 60, &err);
+	dbus_message_unref(call);
+	if (reply == NULL) {
+		if (!g->warned_no_placement) {
+			g->warned_no_placement = true;
+			U_LOG_W("wl_geom: the geometry service has no " WLG_PLACEMENT_IFACE
+			        " (%s) — a Wayland window cannot be moved onto the interlace lattice after a drag, "
+			        "so the weave phase is whatever pixel the user dropped it on. Update the "
+			        "window-geometry@displayxr.org GNOME Shell extension to version 3 (then log out and "
+			        "back in).",
+			        dbus_error_is_set(&err) ? err.message : "no reply");
+		}
+		dbus_error_free(&err);
+		return false;
+	}
+	dbus_bool_t moved = FALSE;
+	if (!dbus_message_get_args(reply, NULL, DBUS_TYPE_BOOLEAN, &moved, DBUS_TYPE_INVALID)) {
+		moved = FALSE;
+	}
+	dbus_message_unref(reply);
+	return moved == TRUE;
 }
 
 void
