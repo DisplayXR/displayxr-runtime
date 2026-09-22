@@ -155,7 +155,13 @@ fi
 EXT_SRC="$HERE/share/gnome-shell/extensions/$EXT_UUID"
 if [ "$NO_GNOME_EXT" = 0 ] && [ -f "$EXT_SRC/metadata.json" ]; then
     mkdir -p "$EXT_ROOT/$EXT_UUID"
-    cp "$EXT_SRC/extension.js" "$EXT_SRC/metadata.json" "$EXT_ROOT/$EXT_UUID/"
+    # Both entry-point forms plus the logic they share. Which one ends up in
+    # the extension.js slot GNOME reads depends on the running shell and is
+    # decided by displayxr-gnome-extension-enable (GNOME 45+ loads an ES
+    # module; 40-44, e.g. Ubuntu 22.04's GNOME 42, cannot parse one).
+    for f in extension.js extension-gnome42.js lib.js metadata.json; do
+        cp "$EXT_SRC/$f" "$EXT_ROOT/$EXT_UUID/"
+    done
     echo "==> GNOME Shell extension: $EXT_ROOT/$EXT_UUID"
     if [ "$SYSTEM" = 1 ]; then
         mkdir -p /etc/xdg/autostart

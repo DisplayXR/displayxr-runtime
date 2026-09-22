@@ -213,7 +213,22 @@ so a vendor runtime .deb and a DisplayXR .deb can each satisfy the dependency,
 dpkg refuses to install both, and consumers depend on the virtual name rather
 than on any particular vendor. Files install system-wide to
 `/usr/share/gnome-shell/extensions/window-geometry@displayxr.org/` (not the
-per-user `~/.local/share/...` path used for manual dev installs). Note the
+per-user `~/.local/share/...` path used for manual dev installs).
+
+**Ship both entry-point forms, and select by the running shell.** GNOME Shell
+45 loads an extension as an ES module; 40–44 (Ubuntu 22.04 is GNOME 42) loads
+it with the legacy importer, for which ESM syntax is a parse error. The
+publisher therefore carries two thin entry points — `extension.js` (45+) and
+`extension-gnome42.js` (40–44) — over one shared, import-free `lib.js` that
+both module systems can read, and one `metadata.json` whose `shell-version` is
+the union of both ranges. A directory holds one `extension.js`, so the
+installer chooses: `displayxr-gnome-extension-enable` reads
+`gnome-shell --version` and, below 45, puts the legacy form in that slot — in
+place where the install is user-writable, otherwise as a per-user shadow copy
+of the system one, which GNOME prefers — and reverses that on a 45+ shell so a
+distribution upgrade needs no repair. A package that ships only the ES module
+is not wrong, but it silently serves no pre-45 desktop; a consumer there sees
+the bus name simply absent and degrades per §3. Note the
 extension still has to be *enabled* per user session. A dconf default for
 `org.gnome.shell enabled-extensions` reaches only users who have never written
 that key, which excludes anyone who has toggled an extension. The
@@ -277,8 +292,13 @@ is what lets any package ship it and any runtime consume it.
   `plasma-window-management` geometry events; other compositors need their
   own publisher speaking the same D-Bus interface (the runtime side is
   compositor-agnostic by construction).
-- **Packaging** — the extension is not yet installed/enabled by the .deb /
-  bundle; manual install per `contrib/gnome-shell/.../README.md`.
+- **GNOME 42 is shipped but not hardware-validated** (#1663). The legacy
+  entry point is syntax-checked in CI and every mutter/Clutter API it uses is
+  present in 42.9, but no 22.04 desktop has run it. The measurement that
+  settles the one genuinely uncertain part — whether the
+  `before-paint`/`after-paint` bracket still discriminates off-screen paints
+  on mutter 42 — is `CaptureExclusion1.GetState`'s `paints.skipped` going
+  non-zero while an area screencast runs. Steps in the extension's `README.md`.
 - Mutter emits geometry transactionally with its own redraw, so tracking
   during interactive drags is expected to be at least as good as the X11
   per-frame poll; validate visually (phase lock while dragging).

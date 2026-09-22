@@ -1,6 +1,8 @@
 #!/bin/sh
 # Enable the DisplayXR GNOME Shell extension (window-geometry@displayxr.org)
-# for the CURRENT user, once, without ever overriding the user's own choice.
+# for the CURRENT user, once, without ever overriding the user's own choice —
+# and first make sure the entry point on disk is the one the running GNOME
+# Shell can actually parse.
 #
 #   displayxr-gnome-extension-enable            # login mode (the autostart entry)
 #   displayxr-gnome-extension-enable --install  # installer mode (install.sh)
@@ -13,6 +15,31 @@
 # it, and anyone who has toggled any extension has — so it silently does
 # nothing for most real users. The runtime .deb therefore ships an
 # /etc/xdg/autostart entry that runs this script in each user's GNOME session.
+#
+# ── Part 1: pick the entry point that matches the running shell ────────────
+#
+# GNOME Shell 45 loads an extension as an ES MODULE; GNOME 40-44 loads it with
+# the LEGACY importer, for which ESM syntax is a parse error. One extension
+# UUID can only hold one `extension.js`, so the package ships both forms —
+# `extension.js` (45+) and `extension-gnome42.js` (40-44, e.g. Ubuntu 22.04's
+# GNOME 42) — plus the shared `lib.js` they both load, and this script puts the
+# right one in the slot GNOME reads:
+#
+#   * a USER install (the tarball's `./install.sh`, a dev copy) is writable, so
+#     the slot is switched in place. The modern entry is first kept aside as
+#     `extension-gnome45.js` so the switch is reversible;
+#   * a SYSTEM install (the .deb, `./install.sh --system`) is not writable by
+#     the user this runs as, so on an older shell a per-user SHADOW copy is
+#     materialised in ~/.local/share/gnome-shell/extensions/ — which GNOME
+#     prefers over the system one — carrying a marker file so this script can
+#     recognise, refresh and later remove its own copy and nothing else. On a
+#     45+ shell a marked shadow is removed and the system copy takes over
+#     again, so a distribution upgrade heals itself.
+#
+# Nothing here is a no-op only when the version changed: the copies are
+# content-compared, so a package update of lib.js reaches an existing shadow.
+#
+# ── Part 2: enable it for this user, once ──────────────────────────────────
 #
 # The rules, in order:
 #   1. Not GNOME, no gsettings, no org.gnome.shell schema  -> do nothing.
@@ -35,11 +62,23 @@
 # current session. The setting is honored by the next shell to start, and
 # immediately by a shell that already knows the extension.
 #
-# A new or updated extension still only LOADS when the user logs out and back
-# in: a Wayland session cannot restart GNOME Shell.
+# A new or updated extension — including a variant switch made by part 1 —
+# still only LOADS when the user logs out and back in: a Wayland session cannot
+# restart GNOME Shell.
+#
+# Testing the part-1 logic without the matching shell: set
+# DISPLAYXR_GNOME_SHELL_VERSION (e.g. 42.9) to override the probe.
 
 UUID="window-geometry@displayxr.org"
 SCHEMA="org.gnome.shell"
+
+# The slot GNOME reads, and the two forms that can occupy it.
+SLOT="extension.js"
+LEGACY_ENTRY="extension-gnome42.js" # GNOME 40-44: legacy importer + init()
+MODERN_KEPT="extension-gnome45.js"  # a copy of the shipped modern SLOT
+SHARED_LIB="lib.js"                 # loaded by both entry points
+SHADOW_MARKER=".displayxr-shadow"   # "this whole directory is ours"
+FIRST_ESM_SHELL=45                  # the first shell that loads ES modules
 
 MODE="login"
 case "${1:-}" in
@@ -49,23 +88,159 @@ case "${1:-}" in
 esac
 
 say() { [ "$MODE" = install ] && echo "    $*"; return 0; }
+# Always visible: the few events worth finding in the journal afterwards.
+note() { if [ "$MODE" = install ]; then echo "    $*"; else echo "displayxr-gnome-extension-enable: $*" >&2; fi; }
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/displayxr"
 STAMP="$STATE_DIR/gnome-extension-autoenabled"
 stamp() { mkdir -p "$STATE_DIR" 2>/dev/null && echo "$UUID" >"$STAMP" 2>/dev/null; return 0; }
 
-# Every later login ends here: one stat, no gsettings.
-[ "$MODE" = login ] && [ -f "$STAMP" ] && exit 0
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+USERDIR="$DATA_HOME/gnome-shell/extensions/$UUID"
 
-command -v gsettings >/dev/null 2>&1 || { say "(gsettings not found — not a GNOME desktop; skipped)"; exit 0; }
-gsettings list-keys "$SCHEMA" >/dev/null 2>&1 || { say "(no $SCHEMA schema — GNOME Shell not installed; skipped)"; exit 0; }
-
+# In login mode, only a GNOME session is ours to touch.
 if [ "$MODE" = login ]; then
 	case ":${XDG_CURRENT_DESKTOP:-}:" in
 	*:GNOME:* | *:GNOME-Classic:*) ;;
 	*) exit 0 ;;
 	esac
 fi
+
+# --- part 1: entry-point variant -------------------------------------------
+
+# The running shell's major version, or nothing if it cannot be determined.
+shell_major() {
+	_v="${DISPLAYXR_GNOME_SHELL_VERSION:-}"
+	if [ -z "$_v" ]; then
+		command -v gnome-shell >/dev/null 2>&1 || return 0
+		_v="$(gnome-shell --version 2>/dev/null)" || return 0
+	fi
+	_v="${_v##*[!0-9.]}" # "GNOME Shell 42.9" -> "42.9"
+	_v="${_v%%.*}"       # -> "42"
+	case "$_v" in "" | *[!0-9]*) return 0 ;; esac
+	echo "$_v"
+}
+
+# The system-wide copy GNOME would load if this user had none of their own.
+# Searched in XDG_DATA_DIRS order, then the two standard roots.
+system_ext_dir() (
+	IFS=:
+	for d in ${XDG_DATA_DIRS:-/usr/local/share:/usr/share} /usr/local/share /usr/share; do
+		[ -n "$d" ] || continue
+		[ -f "$d/gnome-shell/extensions/$UUID/metadata.json" ] || continue
+		printf '%s\n' "$d/gnome-shell/extensions/$UUID"
+		return 0
+	done
+	return 1
+)
+
+# cp only when the content differs, so an unchanged install writes nothing.
+# 0 = copied, 1 = already identical or failed.
+copy_if_diff() {
+	cmp -s "$1" "$2" 2>/dev/null && return 1
+	cp -f "$1" "$2" 2>/dev/null || { note "could not write $2"; return 1; }
+	chmod 0644 "$2" 2>/dev/null
+	return 0
+}
+
+# Materialise/refresh the per-user shadow of a system install, holding the
+# legacy entry point. Every file is ours, hence the marker.
+make_legacy_shadow() {
+	_src="$1"
+	if [ ! -f "$_src/$LEGACY_ENTRY" ]; then
+		note "$_src has no $LEGACY_ENTRY — this package predates GNOME 42 support; not switched"
+		return 0
+	fi
+	mkdir -p "$USERDIR" 2>/dev/null || { note "could not create $USERDIR"; return 0; }
+	_changed=0
+	copy_if_diff "$_src/metadata.json" "$USERDIR/metadata.json" && _changed=1
+	copy_if_diff "$_src/$SHARED_LIB" "$USERDIR/$SHARED_LIB" && _changed=1
+	copy_if_diff "$_src/$LEGACY_ENTRY" "$USERDIR/$SLOT" && _changed=1
+	[ -f "$USERDIR/$SHADOW_MARKER" ] || {
+		echo "Created by displayxr-gnome-extension-enable: the GNOME 40-44 form of" >"$USERDIR/$SHADOW_MARKER"
+		echo "$UUID, shadowing $_src. Delete this directory to go back to it." >>"$USERDIR/$SHADOW_MARKER"
+		_changed=1
+	}
+	[ "$_changed" = 1 ] && note "installed the GNOME 40-44 entry point in $USERDIR (takes effect at your next login)"
+	return 0
+}
+
+select_variant() {
+	_major="$(shell_major)"
+	if [ -z "$_major" ]; then
+		say "(GNOME Shell version unknown — left the installed entry point alone)"
+		return 0
+	fi
+	if [ "$_major" -ge "$FIRST_ESM_SHELL" ]; then _want=modern; else _want=legacy; fi
+
+	if [ -f "$USERDIR/$SHADOW_MARKER" ]; then
+		_role=shadow
+	elif [ -f "$USERDIR/metadata.json" ]; then
+		_role=install
+	else
+		_role=none
+	fi
+
+	_sys="$(system_ext_dir)" || _sys=""
+
+	if [ "$_want" = legacy ]; then
+		case "$_role" in
+		install)
+			# Writable: switch the slot in place, keeping the modern entry.
+			if [ ! -f "$USERDIR/$LEGACY_ENTRY" ]; then
+				note "$USERDIR has no $LEGACY_ENTRY — GNOME $_major cannot load this copy (reinstall to get it)"
+				return 0
+			fi
+			[ -f "$USERDIR/$MODERN_KEPT" ] || cp -f "$USERDIR/$SLOT" "$USERDIR/$MODERN_KEPT" 2>/dev/null
+			copy_if_diff "$USERDIR/$LEGACY_ENTRY" "$USERDIR/$SLOT" &&
+				note "switched $USERDIR to the GNOME 40-44 entry point (takes effect at your next login)"
+			;;
+		shadow)
+			[ -n "$_sys" ] && make_legacy_shadow "$_sys"
+			;;
+		none)
+			if [ -n "$_sys" ]; then
+				make_legacy_shadow "$_sys"
+			else
+				say "(no installed copy of $UUID found)"
+			fi
+			;;
+		esac
+		return 0
+	fi
+
+	# Modern shell. Undo anything an older one left behind, so a distribution
+	# upgrade needs no manual repair.
+	case "$_role" in
+	install)
+		# Only touch the slot if it is currently the legacy form.
+		cmp -s "$USERDIR/$SLOT" "$USERDIR/$LEGACY_ENTRY" 2>/dev/null || return 0
+		if [ -f "$USERDIR/$MODERN_KEPT" ]; then
+			copy_if_diff "$USERDIR/$MODERN_KEPT" "$USERDIR/$SLOT" &&
+				note "restored the GNOME 45+ entry point in $USERDIR (takes effect at your next login)"
+		else
+			note "$USERDIR holds the GNOME 40-44 entry point and GNOME $_major cannot load it; reinstall to repair"
+		fi
+		;;
+	shadow)
+		# Ours, entirely: drop it so the system copy is visible again.
+		rm -rf "$USERDIR" 2>/dev/null &&
+			note "removed the GNOME 40-44 copy in $USERDIR; GNOME $_major uses the system one"
+		;;
+	none) ;;
+	esac
+	return 0
+}
+
+select_variant
+
+# --- part 2: enable it for this user ---------------------------------------
+
+# Every later login ends here: one stat, no gsettings.
+[ "$MODE" = login ] && [ -f "$STAMP" ] && exit 0
+
+command -v gsettings >/dev/null 2>&1 || { say "(gsettings not found — not a GNOME desktop; skipped)"; exit 0; }
+gsettings list-keys "$SCHEMA" >/dev/null 2>&1 || { say "(no $SCHEMA schema — GNOME Shell not installed; skipped)"; exit 0; }
 
 [ "$(gsettings writable "$SCHEMA" enabled-extensions 2>/dev/null)" = "true" ] || {
 	say "(enabled-extensions is locked by an administrator — not changed)"

@@ -52,7 +52,27 @@ rmdir "$DP_ROOT" 2>/dev/null || true
 # enabled-extensions lists are left alone — a UUID with no files is inert, and
 # another package (e.g. the .deb) may still provide the extension.
 rm -rf "$EXT_ROOT/window-geometry@displayxr.org"
-[ "$SYSTEM" = 1 ] && rm -f /etc/xdg/autostart/displayxr-gnome-extension-enable.desktop
+# (An `if` rather than `[ ... ] && ...`: under `set -e` a false test as a
+# whole statement aborts the script, which used to cut a user-level uninstall
+# short right here, before the binaries were removed.)
+if [ "$SYSTEM" = 1 ]; then
+    rm -f /etc/xdg/autostart/displayxr-gnome-extension-enable.desktop
+    # On a pre-45 GNOME the login script materialises a per-user copy of the
+    # legacy entry point that shadows the system one. Remove the invoking
+    # user's (it is entirely ours -- hence the marker it carries); another
+    # user's goes at their next login, when the script finds no system install
+    # to refresh it from.
+    SHADOW_HOME="$HOME"
+    if [ -n "${SUDO_USER:-}" ]; then
+        SHADOW_HOME="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)"
+        [ -n "$SHADOW_HOME" ] || SHADOW_HOME="$HOME"
+    fi
+    SHADOW="$SHADOW_HOME/.local/share/gnome-shell/extensions/window-geometry@displayxr.org"
+    if [ -f "$SHADOW/.displayxr-shadow" ]; then
+        rm -rf "$SHADOW"
+        echo "==> Removed the per-user GNOME 40-44 copy in $SHADOW"
+    fi
+fi
 
 if [ "$SYSTEM" = 1 ]; then
     # /usr/local is shared — remove only what install.sh placed.

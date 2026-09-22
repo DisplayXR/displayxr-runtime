@@ -108,9 +108,15 @@ done
 EXT_UUID="window-geometry@displayxr.org"
 EXT_SRC="$ROOT/contrib/gnome-shell/$EXT_UUID"
 EXT_ENABLE="$ROOT/scripts/linux/displayxr-gnome-extension-enable"
-for f in "$EXT_SRC/extension.js" "$EXT_SRC/metadata.json" "$EXT_ENABLE"; do
-    [ -f "$f" ] || { echo "error: missing $f (GNOME Shell extension payload)" >&2; exit 1; }
+# Both entry-point forms ship: extension.js is the GNOME 45+ ES module (the
+# slot GNOME reads), extension-gnome42.js the GNOME 40-44 legacy one, lib.js
+# the logic they share. The per-user login script materialises the legacy form
+# on an older shell -- Ubuntu 22.04, which this .deb installs on, is GNOME 42.
+EXT_FILES="extension.js extension-gnome42.js lib.js metadata.json"
+for f in $EXT_FILES; do
+    [ -f "$EXT_SRC/$f" ] || { echo "error: missing $EXT_SRC/$f (GNOME Shell extension payload)" >&2; exit 1; }
 done
+[ -f "$EXT_ENABLE" ] || { echo "error: missing $EXT_ENABLE" >&2; exit 1; }
 
 # --- Version: turn `git describe` into a Debian-legal upstream version. -----
 # v2.1.0 -> 2.1.0 ; v2.1.0-3-gabc123 -> 2.1.0+3.gabc123 ; dirty -> +dirty
@@ -145,8 +151,9 @@ install -m 0644 "$PLUGIN_SO"   "$STAGE/usr/lib/displayxr/plugins/DisplayXR-SimDi
 ln -s ../lib/displayxr/bin/displayxr-cli "$STAGE/usr/bin/displayxr-cli"
 
 # --- GNOME Shell extension + the per-user enable at login -------------------
-install -m 0644 "$EXT_SRC/extension.js" "$EXT_SRC/metadata.json" \
-    "$STAGE/usr/share/gnome-shell/extensions/$EXT_UUID/"
+for f in $EXT_FILES; do
+    install -m 0644 "$EXT_SRC/$f" "$STAGE/usr/share/gnome-shell/extensions/$EXT_UUID/"
+done
 install -m 0755 "$EXT_ENABLE" "$STAGE/usr/lib/displayxr/bin/displayxr-gnome-extension-enable"
 # Deliberately NOT a conffile (not in DEBIAN/conffiles): `apt remove` deletes it
 # with the script it runs instead of leaving an entry behind (TryExec also
