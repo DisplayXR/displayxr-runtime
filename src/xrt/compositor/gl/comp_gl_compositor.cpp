@@ -4976,8 +4976,14 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 		if (quad_view_count > XRT_MAX_VIEWS) {
 			quad_view_count = XRT_MAX_VIEWS;
 		}
-		const uint32_t quad_cols = c->eff_cols > 0 ? c->eff_cols : 1;
-		const uint32_t quad_rows = c->eff_rows > 0 ? c->eff_rows : 1;
+		// Same fallback as every other site that tiles into this atlas
+		// (gl_compute_effective_layout ran at the top of this commit, so
+		// eff_cols/eff_rows are always non-zero here and the fallback is
+		// unreachable) -- but it must READ the same, because a 1-vs-columns
+		// disagreement is exactly the stride bug #1666 was on the service,
+		// and a reader should not have to prove unreachability to rule it out.
+		const uint32_t quad_cols = c->eff_cols > 0 ? c->eff_cols : c->tile_columns;
+		const uint32_t quad_rows = c->eff_rows > 0 ? c->eff_rows : c->tile_rows;
 
 		if (any_quad) {
 			glDisable(GL_DEPTH_TEST);
