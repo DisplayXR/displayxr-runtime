@@ -39,8 +39,14 @@ set(DISPLAYXR_EXTENSIONS_INCLUDE_DIR "${_dxr_ext_includes}" CACHE PATH
 FetchContent_Declare(
     displayxr_common
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    GIT_TAG v2.16.0
-    GIT_SHALLOW TRUE
+    # TEMPORARY SHA PIN — pin to the #1647 helper commit until common tags it.
+    # displayxr-common#56 ("display-referred clears for Vulkan, D3D12 and GL")
+    # landed on main AFTER v2.18.0, and the D3D12 apps below need its
+    # common/d3d12_clear.h. Move back to a vX.Y.Z tag the moment one contains it.
+    # GIT_SHALLOW must be FALSE for a commit pin: a shallow fetch wants a
+    # branch or tag name.
+    GIT_TAG aed49ca43d191f406afd21565fdcaeedd7e413db
+    GIT_SHALLOW FALSE
 )
 FetchContent_MakeAvailable(displayxr_common)
 

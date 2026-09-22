@@ -6,6 +6,7 @@
  */
 
 #include "d3d12_renderer.h"
+#include "d3d12_clear.h"   // dxr::ClearRenderTargetViewDisplayReferred (#1647)
 #include "logging.h"
 #include "mip_chain.h"
 #include <d3d12sdklayers.h>
@@ -904,7 +905,14 @@ void RenderScene(
             clearColor[0] = 0.05f; clearColor[1] = 0.05f;
             clearColor[2] = 0.25f; clearColor[3] = 1.0f;
         }
-        cmdList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
+        // #1647: clearColor is authored DISPLAY-REFERRED. An _SRGB RTV encodes
+        // on write, so a raw clear brightens it (13,13,64 -> 63,63,137 measured
+        // on the panel). Derive the space from the format these RTVs were
+        // CREATED with -- D3D12 cannot query it back off the descriptor handle,
+        // and the swapchain resource is TYPELESS, so the view's format is the
+        // only thing that answers.
+        dxr::ClearRenderTargetViewDisplayReferred(cmdList, rtvHandle,
+            renderer.swapchainFormat, clearColor);
         cmdList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
             1.0f, 0, 0, nullptr);
     }

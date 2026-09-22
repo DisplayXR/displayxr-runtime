@@ -78,6 +78,7 @@
 
 #include "atlas_capture.h"
 #include "d3d12_renderer.h"
+#include "d3d12_clear.h"   // dxr::ClearRenderTargetViewDisplayReferred (#1647)
 #include "dxr_view_config.h" // ADR-041: DxrAliasInactiveViews
 #include "hud_renderer.h"
 #include "input_handler.h"
@@ -807,6 +808,10 @@ static void BlitSharedTextureToBackBuffer(D3D12Renderer& renderer) {
     D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = g_appRtvHeap->GetCPUDescriptorHandleForHeapStart();
     rtvHandle.ptr += bbIndex * g_appRtvDescriptorSize;
     float clearColor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    // Raw clear ON PURPOSE (#1647): this is the app's OWN window back buffer,
+    // not an XR swapchain image, so renderer.swapchainFormat does not describe
+    // it -- and the value is black, a fixed point of the sRGB transfer function,
+    // so there is nothing for the display-referred helper to convert either way.
     g_blitCmdList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
 
     g_blitCmdList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
@@ -1551,7 +1556,11 @@ static void ClearZoneImage(D3D12Renderer& renderer, DisplayZone& z,
     // COMMON trace on this app.
     D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = renderer.rtvHeap->GetCPUDescriptorHandleForHeapStart();
     rtvHandle.ptr += (SIZE_T)rtvIndex * renderer.rtvDescriptorSize;
-    g_zoneCmdList->ClearRenderTargetView(rtvHandle, z.clearColor, 0, nullptr);
+    // #1647: z.clearColor is an authored DISPLAY-REFERRED (premultiplied) tint;
+    // an _SRGB RTV encodes on write. These RTVs live in renderer.rtvHeap and
+    // were created with renderer.swapchainFormat.
+    dxr::ClearRenderTargetViewDisplayReferred(g_zoneCmdList.Get(), rtvHandle,
+        renderer.swapchainFormat, z.clearColor);
 
     ZoneCmdSubmitAndWait(renderer);
 }
@@ -1574,7 +1583,11 @@ static void PaintViewColor(D3D12Renderer& renderer, ID3D12Resource* rt, int rtvI
     D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = renderer.rtvHeap->GetCPUDescriptorHandleForHeapStart();
     rtvHandle.ptr += (SIZE_T)rtvIndex * renderer.rtvDescriptorSize;
     D3D12_RECT rect = {(LONG)vpX, 0, (LONG)(vpX + tileW), (LONG)tileH};
-    g_zoneCmdList->ClearRenderTargetView(rtvHandle, color, 1, &rect);
+    // #1647: the probe colour is authored display-referred, and an oracle reads
+    // the STORED bytes back, so it must land unchanged whichever format the
+    // swapchain chose.
+    dxr::ClearRenderTargetViewDisplayReferred(g_zoneCmdList.Get(), rtvHandle,
+        renderer.swapchainFormat, color, 1, &rect);
 
     ZoneCmdSubmitAndWait(renderer);
 }
