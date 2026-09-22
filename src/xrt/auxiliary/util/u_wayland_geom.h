@@ -452,6 +452,96 @@ u_wl_placement_quantum(double scale, double tol, uint32_t *out_q)
 	return true;
 }
 
+/*!
+ * The part of a window that is NOT on the 3D panel, as up to four bands
+ * (#1654).
+ *
+ * A weave is only correct where the panel's lens is. A window dragged half
+ * onto an ordinary monitor is still ONE surface and one weave, so the half off
+ * the panel would show the lenticular pattern as a double image. The runtime
+ * paints those bands flat instead. (On X11 the weaver is window-bound and
+ * clips itself; the Wayland weaver is windowless, so the runtime does it.)
+ *
+ * Every length is DEVICE pixels. @p ox / @p oy is the window's top-left
+ * relative to the panel's, i.e. exactly the present origin the weaver is fed,
+ * so the bands and the weave phase can never disagree.
+ *
+ * The bands tile the off-panel area without overlapping: the full-width strips
+ * above and below the visible rows first, then the left and right strips
+ * between them.
+ *
+ * @param[out] out  up to four rects in WINDOW-local pixels
+ * @return how many were written; 0 when the window is entirely on the panel,
+ *         and 1 (the whole window) when it is entirely off it.
+ *
+ * @ingroup aux_util
+ */
+static inline uint32_t
+u_wl_offpanel_bands(int32_t ox,
+                    int32_t oy,
+                    uint32_t panel_w,
+                    uint32_t panel_h,
+                    uint32_t win_w,
+                    uint32_t win_h,
+                    struct u_wl_rect_px out[4])
+{
+	if (out == NULL || win_w == 0 || win_h == 0 || panel_w == 0 || panel_h == 0) {
+		return 0;
+	}
+	// The visible (on-panel) rect, in window-local coordinates.
+	int32_t vx0 = -ox, vy0 = -oy;
+	int32_t vx1 = (int32_t)panel_w - ox, vy1 = (int32_t)panel_h - oy;
+	if (vx0 < 0) {
+		vx0 = 0;
+	}
+	if (vy0 < 0) {
+		vy0 = 0;
+	}
+	if (vx1 > (int32_t)win_w) {
+		vx1 = (int32_t)win_w;
+	}
+	if (vy1 > (int32_t)win_h) {
+		vy1 = (int32_t)win_h;
+	}
+	if (vx0 >= vx1 || vy0 >= vy1) {
+		out[0].x = 0;
+		out[0].y = 0;
+		out[0].w = (int32_t)win_w;
+		out[0].h = (int32_t)win_h;
+		return 1;
+	}
+	uint32_t n = 0;
+	if (vy0 > 0) {
+		out[n].x = 0;
+		out[n].y = 0;
+		out[n].w = (int32_t)win_w;
+		out[n].h = vy0;
+		n++;
+	}
+	if (vy1 < (int32_t)win_h) {
+		out[n].x = 0;
+		out[n].y = vy1;
+		out[n].w = (int32_t)win_w;
+		out[n].h = (int32_t)win_h - vy1;
+		n++;
+	}
+	if (vx0 > 0) {
+		out[n].x = 0;
+		out[n].y = vy0;
+		out[n].w = vx0;
+		out[n].h = vy1 - vy0;
+		n++;
+	}
+	if (vx1 < (int32_t)win_w) {
+		out[n].x = vx1;
+		out[n].y = vy0;
+		out[n].w = (int32_t)win_w - vx1;
+		out[n].h = vy1 - vy0;
+		n++;
+	}
+	return n;
+}
+
 #ifdef __cplusplus
 }
 #endif

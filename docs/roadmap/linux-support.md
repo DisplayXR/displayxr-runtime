@@ -555,6 +555,23 @@ source comments and, until this section, in no document at all.
   `getpid()`; service/IPC mode needs the client PID plumbed through (#817
   follow-up).
 
+- **A window that spans the 3D panel and another monitor weaves only on the
+  panel (#1654).** The weave is correct only where the lens is, and a spanning
+  window is still ONE surface with ONE weave — so the half on an ordinary
+  monitor would show the lenticular pattern as a double image. On X11 the
+  weaver is window-bound and clips itself; the Wayland weaver is windowless (it
+  is handed the surface plus a present origin), so the runtime paints the
+  off-panel part itself: `u_wl_offpanel_bands()` cuts the window rect against
+  the panel rect — in the same device pixels the present origin is expressed
+  in, so the bands and the weave phase cannot disagree — and
+  `vk_composite_offpanel_2d()` blits one view's tile from the atlas over each
+  band after the weave. Flat 2D there, woven 3D inside the panel, one seam.
+  Two cases it deliberately does NOT rescue: a window whose *majority* is on
+  the other monitor (its buffer then follows that monitor's scale, so the part
+  over the panel is resampled and the whole session degrades to 2D — the
+  refuse-rather-than-resample rule, #1595), and a compositor that is not
+  publishing geometry at all. Kill switch `DXR_WAYLAND_SPAN_2D=0`.
+
 ### Where the detail lives
 
 - `docs/specs/runtime/wayland-window-geometry.md` — the #817 provider: D-Bus
