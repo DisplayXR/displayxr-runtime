@@ -1052,6 +1052,10 @@ struct d3d11_service_compositor
 	//! on its own IPC thread, so one event per client is enough.
 	HANDLE fence_wait_event;
 	std::atomic<uint64_t> last_signaled_fence_value;
+	//! #1667: the fence value this view was last composed FROM. Written once
+	//! per COMMIT per view (the first projection layer of the commit that
+	//! visits the view decides), never once per projection-layer visit — a
+	//! second projection layer in the same commit is not a second frame.
 	uint64_t last_composed_fence_value[XRT_MAX_VIEWS];
 
 	//! Phase 2 diagnostic — `[FENCE]` rate-limited (1× / 10 s) per-client
@@ -1059,6 +1063,10 @@ struct d3d11_service_compositor
 	//! `[MUTEX]` window pattern above so the bench harness can A/B compare
 	//! `acquires` vs `waits_queued` directly.
 	int64_t fence_window_start_ns;
+	//! Counted once per successful fence-path AcquireSync, i.e. once per
+	//! (projection layer × view) that actually composed — so a commit
+	//! carrying two projection layers contributes twice per view while its
+	//! stale counters below contribute at most once (#1667).
 	uint32_t fence_waits_queued_in_window;
 	uint32_t fence_stale_views_in_window;
 	//! Split of `fence_stale_views_in_window` by cause, so a stale burst can be
@@ -1066,6 +1074,10 @@ struct d3d11_service_compositor
 	//! value since we last composed this view; `incomplete` = a new value was
 	//! shipped but the GPU has not reached it yet (#922 gate); `acqfail` = the
 	//! value completed but the 0-timeout AcquireSync lost the race.
+	//! #1667: `nonew` and `incomplete` are FRESHNESS verdicts and are counted
+	//! once per commit per view (the commit's decision), not once per
+	//! projection-layer visit; `acqfail` is a per-layer event (each layer
+	//! acquires its own image) and stays per (layer × view).
 	uint32_t fence_stale_nonew_in_window;
 	uint32_t fence_stale_incomplete_in_window;
 	uint32_t fence_stale_acqfail_in_window;
@@ -19875,6 +19887,45 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	 */
 	struct comp_layer_tile_state proj_tile = {};
 
+	/*
+	 * #1667 — fence freshness is a property of the COMMIT, not of a layer visit.
+	 *
+	 * The fence path asks "has the client produced a new frame since we last
+	 * composed this view?" by comparing the value the client shipped for this
+	 * commit against `c->last_composed_fence_value[eye]`. That bookkeeping used
+	 * to live inside the per-layer visit: the FIRST projection layer of a commit
+	 * recorded the value, and the SECOND projection layer of the SAME commit then
+	 * saw its own value already recorded and judged itself "no new frame" —
+	 * every frame, forever. A second layer is not a second frame; the client
+	 * signals once per xrEndFrame, so the answer is the same for every layer of
+	 * the commit and must be resolved ONCE.
+	 *
+	 * Symptom that paid for this comment: CTS ProjectionQuadProjection (blue
+	 * projection, green quad, yellow projection) never showed yellow under the
+	 * service, and `[FENCE] ... stale_views=1205 (nonew=1200 ...)` per 10 s is
+	 * exactly 2 views × 60 Hz — one projection layer's worth of views skipped on
+	 * every single commit. It also made the #1598 later-layer blend promotion
+	 * (`proj_blend`) unreachable on the service path.
+	 *
+	 * These two arrays hold the commit's verdict per view: the first projection
+	 * layer to visit a view on the fence path decides, every later projection
+	 * layer of the same commit consults. FRESH means "this commit may read the
+	 * client's images"; each layer still does its OWN keyed-mutex acquire below,
+	 * because each layer may name a different swapchain image — only the
+	 * freshness DECISION is per commit, the acquire/copy/blit stay per layer.
+	 *
+	 * The #1215 read-done signal is untouched and stays correct: it fires once,
+	 * after this whole loop, with the value the client shipped, and it means
+	 * "every read this commit will ever make has been queued". Letting more of
+	 * this commit's layers read only adds queued reads BEFORE that signal.
+	 */
+	bool commit_fence_decided[XRT_MAX_VIEWS] = {};
+	bool commit_fence_fresh[XRT_MAX_VIEWS] = {};
+	// #1667 discriminator: how many projection layers of THIS commit actually
+	// composed at least one view through the fence path. Reaching 2 is the
+	// hardware proof that the per-commit rule fires (see the one-shot below).
+	uint32_t commit_fence_layers_composed = 0;
+
 	// Render projection layers to stereo texture (via copy)
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		struct comp_layer *layer = &c->layer_accum.layers[i];
@@ -20004,6 +20055,9 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		// content — a 1-frame quality blip on that one tile rather than a
 		// ~100 ms render-thread stall that drops 6 frames at 60 Hz.
 		const DWORD mutex_timeout_ms = 4;
+		// #1667: did THIS projection layer read at least one view through the
+		// fence path? Feeds the multi-projection discriminator below.
+		bool layer_composed_fence_view = false;
 		for (uint32_t eye = 0; eye < proj_view_count; eye++) {
 			// Skip mutex for views sharing the same swapchain+image as a prior view
 			bool already_locked = false;
@@ -20058,14 +20112,79 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 					// fence rather than a 4 ms wall-clock
 					// timeout).
 					uint64_t signaled = fence_signaled;
-					if (signaled == c->last_composed_fence_value[eye]) {
-						// Client hasn't produced a new frame
-						// since we last composed this view —
-						// reuse persistent atlas slot content.
+
+					/*
+					 * #1667 -- the FRESHNESS verdict is per COMMIT,
+					 * not per layer visit. The client signals its
+					 * fence exactly once per xrEndFrame, so "has a
+					 * new frame arrived?" has ONE answer for the
+					 * whole commit. Testing it again inside the
+					 * second projection layer of the same commit
+					 * answered "no" -- the first layer had just
+					 * recorded the value into
+					 * `last_composed_fence_value[eye]` -- and that
+					 * layer was skipped as stale on EVERY frame. A
+					 * second layer is not a second frame. The first
+					 * projection layer of the commit to visit this
+					 * view decides below; every later projection
+					 * layer consults `commit_fence_fresh[eye]`
+					 * instead of re-testing the value.
+					 */
+					if (!commit_fence_decided[eye]) {
+						commit_fence_decided[eye] = true;
+						if (signaled == c->last_composed_fence_value[eye]) {
+							// Client hasn't produced a new frame
+							// since we last composed this view --
+							// reuse persistent atlas slot content.
+							commit_fence_fresh[eye] = false;
+							c->fence_stale_views_in_window++;
+							c->fence_stale_nonew_in_window++;
+						} else if (!service_fence_reached(c, signaled)) {
+							// #922: NEVER queue a context Wait for a fence value
+							// that has not completed yet. The client ships
+							// `signaled` at xrEndFrame BEFORE its GPU work
+							// finishes; if the client dies in that window (e.g.
+							// DELETE-key exit request mid-frame), the value never
+							// signals and the queued Wait JAMS the immediate
+							// context -- weave, blits, and every other client's
+							// AcquireSync flush queue behind it until the dead
+							// client's fence is destroyed (observed: 9 s workspace
+							// freezes on app close). By compose time the client's
+							// GPU work has virtually always completed, so gating
+							// on GetCompletedValue() costs nothing in steady
+							// state; a not-yet-complete frame is treated exactly
+							// like the timeout path -- reuse the previous atlas
+							// tile and retry next compose (last_composed is NOT
+							// updated, so the frame is picked up when it lands).
+							// #922 keeps its "never queue a GPU Wait" rule; the wait
+							// is BOUNDED on the CPU instead of merely polled --
+							// see service_fence_reached().
+							commit_fence_fresh[eye] = false;
+							c->fence_stale_views_in_window++;
+							c->fence_stale_incomplete_in_window++;
+							// #1215 drop-not-defer: with the read-done fence in
+							// play, a deferred pickup can never happen -- the app
+							// blocks in wait_image and no further commit arrives
+							// to do the picking up (deadlock). Drop this frame
+							// instead (tile reuses the previous composite) and
+							// let the end-of-commit signal release the app.
+							if (c->read_done_fence) {
+								c->last_composed_fence_value[eye] = signaled;
+								svc_read_done_note_drop(c, "gpu-incomplete", eye,
+								                        signaled);
+							}
+						} else {
+							commit_fence_fresh[eye] = true;
+						}
+					}
+
+					if (!commit_fence_fresh[eye]) {
+						// This commit already ruled the view stale (no
+						// new value, or its GPU work has not landed).
+						// EVERY projection layer of the commit takes the
+						// same ruling -- #1667.
 						view_skip_blit[eye] = true;
 						view_zc_eligible[eye] = false;
-						c->fence_stale_views_in_window++;
-						c->fence_stale_nonew_in_window++;
 					} else {
 						// Fresh frame. The shared swapchain
 						// texture still has
@@ -20076,7 +20195,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 						// D3D11 spec, every cross-process
 						// access to such a texture must be
 						// bracketed by AcquireSync /
-						// ReleaseSync — that is what issues
+						// ReleaseSync -- that is what issues
 						// the cross-process GPU memory
 						// barrier. Skipping it on the reader
 						// side means stale / undefined data
@@ -20092,65 +20211,45 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 						// WAIT_TIMEOUT if the writer is
 						// still mid-release (treat as a
 						// stale view, reuse the persistent
-						// atlas slot — same Phase 1 trick).
-						// This is the cheapest possible
-						// CPU touchpoint that preserves the
-						// SHARED_KEYEDMUTEX contract; the
-						// real GPU sync still rides on the
-						// fence Wait below.
-						// #922: NEVER queue a context Wait for a fence value
-						// that has not completed yet. The client ships
-						// `signaled` at xrEndFrame BEFORE its GPU work
-						// finishes; if the client dies in that window (e.g.
-						// DELETE-key exit request mid-frame), the value never
-						// signals and the queued Wait JAMS the immediate
-						// context — weave, blits, and every other client's
-						// AcquireSync flush queue behind it until the dead
-						// client's fence is destroyed (observed: 9 s workspace
-						// freezes on app close). By compose time the client's
-						// GPU work has virtually always completed, so gating
-						// on GetCompletedValue() costs nothing in steady
-						// state; a not-yet-complete frame is treated exactly
-						// like the timeout path — reuse the previous atlas
-						// tile and retry next compose (last_composed is NOT
-						// updated, so the frame is picked up when it lands).
-						// #922 keeps its "never queue a GPU Wait" rule; the wait
-						// is now BOUNDED on the CPU instead of merely polled —
-						// see service_fence_reached().
-						if (!service_fence_reached(c, signaled)) {
+						// atlas slot -- same Phase 1 trick).
+						//
+						// #1667: the ACQUIRE stays per layer per view --
+						// each projection layer may name a DIFFERENT
+						// swapchain image, and the release loop at the
+						// end of this layer hands the mutex back before
+						// the next layer asks for it. Only the freshness
+						// decision above is per commit.
+						HRESULT hr_a = view_scs[eye]
+						                   ->images[view_img_indices[eye]]
+						                   .keyed_mutex->AcquireSync(0, 0);
+						if (SUCCEEDED(hr_a)) {
+							view_mutex_acquired[eye] = true;
+							// Idempotent within the commit: the verdict
+							// above fixed `signaled` for this view, so a
+							// later projection layer of the same commit
+							// rewrites the identical value (#1667).
+							c->last_composed_fence_value[eye] = signaled;
+							c->fence_waits_queued_in_window++;
+							layer_composed_fence_view = true;
+						} else {
 							view_skip_blit[eye] = true;
 							view_zc_eligible[eye] = false;
 							c->fence_stale_views_in_window++;
-							c->fence_stale_incomplete_in_window++;
-							// #1215 drop-not-defer: with the read-done fence in
-							// play, a deferred pickup can never happen -- the app
-							// blocks in wait_image and no further commit arrives
-							// to do the picking up (deadlock). Drop this frame
-							// instead (tile reuses the previous composite) and
-							// let the end-of-commit signal release the app.
+							c->fence_stale_acqfail_in_window++;
+							// #1667: an acquire failure also DEMOTES the
+							// commit's verdict for this view. The failure
+							// itself is per layer, but a tile whose earlier
+							// layer could not be read must not then take a
+							// later layer blended onto last frame's pixels --
+							// that is a mixed-generation tile. All-or-nothing
+							// per view per commit; the whole tile reuses the
+							// previous composite.
+							commit_fence_fresh[eye] = false;
+							// #1215 drop-not-defer -- see the incomplete
+							// branch above.
 							if (c->read_done_fence) {
 								c->last_composed_fence_value[eye] = signaled;
-								svc_read_done_note_drop(c, "gpu-incomplete", eye, signaled);
-							}
-						} else {
-							HRESULT hr_a =
-							    view_scs[eye]->images[view_img_indices[eye]].keyed_mutex->AcquireSync(
-							        0, 0);
-							if (SUCCEEDED(hr_a)) {
-								view_mutex_acquired[eye] = true;
-								c->last_composed_fence_value[eye] = signaled;
-								c->fence_waits_queued_in_window++;
-							} else {
-								view_skip_blit[eye] = true;
-								view_zc_eligible[eye] = false;
-								c->fence_stale_views_in_window++;
-								c->fence_stale_acqfail_in_window++;
-								// #1215 drop-not-defer -- see the incomplete
-								// branch above.
-								if (c->read_done_fence) {
-									c->last_composed_fence_value[eye] = signaled;
-									svc_read_done_note_drop(c, "mutex-acqfail", eye, signaled);
-								}
+								svc_read_done_note_drop(c, "mutex-acqfail", eye, signaled);
 							}
 						}
 						// Phase 2 leaves zero-copy semantics
@@ -20164,6 +20263,12 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 						// removes the workspace_mode gate.
 					}
 				} else {
+					// Legacy KeyedMutex path. #1667 does not touch it:
+					// it carries no "already composed this value"
+					// bookkeeping at all — each layer simply acquires
+					// (4 ms budget) and blits — so a second projection
+					// layer of the same commit was never skipped here.
+					// Nothing to hoist per commit.
 					int64_t acq_start_ns = os_monotonic_get_ns();
 					HRESULT hr = view_scs[eye]->images[view_img_indices[eye]].keyed_mutex->AcquireSync(0, mutex_timeout_ms);
 					int64_t acq_dt_ns = os_monotonic_get_ns() - acq_start_ns;
@@ -20199,6 +20304,23 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			}
 		}
 
+		// #1667 — the hardware discriminator. One-shot (never per frame): the
+		// first time a single commit composes a SECOND projection layer on the
+		// fence path, the per-commit freshness rule has demonstrably fired. Before
+		// the fix this line could not print at all — layer 2 was always judged
+		// "no new frame" because layer 1 had just recorded the value.
+		if (layer_composed_fence_view) {
+			commit_fence_layers_composed++;
+			static bool logged_1667_second_layer = false;
+			if (!logged_1667_second_layer && commit_fence_layers_composed >= 2) {
+				logged_1667_second_layer = true;
+				U_LOG_W(
+				    "#1667: composed projection layer %u of a multi-projection commit "
+				    "(fresh) — freshness is per commit, not per layer",
+				    i);
+			}
+		}
+
 		// Phase 1 Task 1.3 — emit one [MUTEX] line per client per ~10 s
 		// window summarising acquire health on the service render thread.
 		// Greppable from the service log under %LOCALAPPDATA%\DisplayXR\.
@@ -20231,6 +20353,16 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		// summarising the new GPU-wait path. Mirrors the [MUTEX] window
 		// pattern so the bench harness can A/B compare directly.
 		// Greppable; emitted at U_LOG_W (the project filter drops U_LOG_I).
+		//
+		// #1667 changed what two of these fields count. `nonew` and
+		// `incomplete` are the COMMIT's freshness verdict and now tick at most
+		// once per commit per view; `waits_queued` and `acqfail` are per
+		// (projection layer × view), because the acquire is. A single-projection
+		// client is therefore numerically unchanged — one layer, one visit — and
+		// a steadily rendering client reports `nonew` ≈ 0 whatever its layer
+		// count. Before the fix a 2-projection client at 60 Hz reported
+		// `nonew` ≈ 2 views × 60 Hz × window_s (1200 per 10 s): one whole
+		// projection layer skipped on every commit.
 		{
 			int64_t now_ns = os_monotonic_get_ns();
 			if (c->fence_window_start_ns == 0) {
