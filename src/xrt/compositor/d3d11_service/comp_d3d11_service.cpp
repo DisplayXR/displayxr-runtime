@@ -16974,6 +16974,92 @@ service_update_slot_content_dims(struct d3d11_service_system *sys,
 }
 
 /*!
+ * #1666 — where the UI-layer pass (quad / cylinder / equirect2) puts its view
+ * tiles, and how big a region it paints on a frame that has no other producer.
+ *
+ * `feedback_atlas_stride_invariant`: a tile's stride is `atlas / grid`, applied
+ * identically at write and at read. Every sibling obeys it — the projection blit
+ * (`layout_vw = atlas_desc.Width / sys->tile_columns`), the zones composite, the
+ * readiness helper above, the content clamp, and `service_crop_atlas_for_dp`,
+ * which states the reason: `sys->view_width/height` track the SCALED runtime
+ * view dims and DIVERGE from the slot stride whenever the per-client atlas is
+ * created at native pixels (3840x2160 atlas against a 960x1080 `sys->view` on
+ * the hybrid box). The UI pass was placing and sizing by `sys->view_*`, so on a
+ * native-pixel atlas view 1's quads landed at x=960 — inside tile 0 — at half
+ * the scale of the projection content beside them, and tile 1 got none.
+ *
+ * The GRID is the one the pass actually paints, not the global
+ * `sys->tile_columns`: mono collapses to 1x1 (one viewport at the origin),
+ * matching the `eff_view_count == 1` the UI-only frame publishes, so the dims
+ * declared, the region painted, the crop and the DP recipe are one number on
+ * both the split and non-split paths.
+ *
+ * @p out_content_* is the region for a UI-ONLY frame. A frame where a projection
+ * or zones producer already painted uses ITS content dims instead — the quads
+ * then share that producer's camera frame and pixel scale, which is the whole
+ * point of placing them in the same tile.
+ */
+static void
+service_ui_pass_layout(struct d3d11_service_system *sys,
+                       struct d3d11_service_compositor *c,
+                       uint32_t *out_cols,
+                       uint32_t *out_rows,
+                       uint32_t *out_slot_w,
+                       uint32_t *out_slot_h,
+                       uint32_t *out_content_w,
+                       uint32_t *out_content_h)
+{
+	uint32_t cols = 1;
+	uint32_t rows = 1;
+	if (sys->hardware_display_3d) {
+		cols = sys->tile_columns > 0 ? sys->tile_columns : 1;
+		rows = sys->tile_rows > 0 ? sys->tile_rows : 1;
+	}
+
+	// No atlas (nothing for the pass to draw into): fall back to the scaled
+	// runtime view dims, the pre-#1666 behaviour. Nothing reads this — the pass
+	// binds the atlas RTV and draws zero layers without one — but a zero here
+	// would travel into the readiness gate as "no content".
+	uint32_t slot_w = sys->view_width;
+	uint32_t slot_h = sys->view_height;
+	if (c->render.atlas_texture) {
+		D3D11_TEXTURE2D_DESC atlas_desc = {};
+		c->render.atlas_texture->GetDesc(&atlas_desc);
+		slot_w = atlas_desc.Width / cols;
+		slot_h = atlas_desc.Height / rows;
+	}
+
+	uint32_t content_w = slot_w;
+	uint32_t content_h = slot_h;
+	if (!sys->hardware_display_3d) {
+		/*
+		 * The mono window clamp, kept. It is load-bearing and not a stride
+		 * question: in mono the DP stretches the declared content region to
+		 * the back buffer, and this pass's camera is built from the client's
+		 * WINDOW metrics — so painting the full slot (the whole atlas, which
+		 * is sized for the worst case, not for this window) would hand the DP
+		 * a region of the atlas's aspect to stretch into a window of another.
+		 * Clamped to the slot as well, so the stride invariant still holds.
+		 */
+		uint32_t mono_w = (sys->output_width < sys->display_width) ? sys->output_width : sys->display_width;
+		uint32_t mono_h = (sys->output_height < sys->display_height) ? sys->output_height : sys->display_height;
+		if (mono_w > 0 && mono_w < content_w) {
+			content_w = mono_w;
+		}
+		if (mono_h > 0 && mono_h < content_h) {
+			content_h = mono_h;
+		}
+	}
+
+	*out_cols = cols;
+	*out_rows = rows;
+	*out_slot_w = slot_w;
+	*out_slot_h = slot_h;
+	*out_content_w = content_w;
+	*out_content_h = content_h;
+}
+
+/*!
  * Has the client's GPU reached `signaled` on its workspace_sync_fence?
  *
  * #922 replaced the original "queue an `ID3D11DeviceContext4::Wait`" design
@@ -20683,11 +20769,16 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	 * (from last layer_commit)" — the layout of the REAL painted pixels, which
 	 * is why #1140 stopped publishing the `sys->view_*` placeholder on a
 	 * commit that painted nothing. For quads / cylinders / equirect2 that is
-	 * the UI pass's VIEWPORT — the whole tile — and NOT any individual layer's
-	 * extent: sub-rect layers land wherever their pose puts them inside that
-	 * viewport, so no smaller rect describes the frame. The readiness flag is
-	 * what actually matters at this site; the dims only have to stay inside
-	 * the atlas slot so the stride invariant holds (clamped below).
+	 * the UI pass's VIEWPORT — the whole SLOT, at the slot stride — and NOT
+	 * any individual layer's extent: sub-rect layers land wherever their pose
+	 * puts them inside that viewport, so no smaller rect describes the frame.
+	 *
+	 * #1666: "the whole slot" is `atlas / grid`, NOT `sys->view_*`. The two
+	 * diverge whenever the per-client atlas is at native pixels, and the pass
+	 * below now paints at the slot stride like every sibling producer
+	 * (`feedback_atlas_stride_invariant`), so the dims declared here, the
+	 * region painted, the crop and the DP recipe are all one number — see
+	 * @ref service_ui_pass_layout, which both sites call.
 	 *
 	 * Guarded by `!content_dims_painted` rather than the zones site's
 	 * `!projection_rendered`: it is the strictly stronger form of the same
@@ -20727,39 +20818,16 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			ui_views = XRT_MAX_VIEWS;
 		}
 		if (ui_views > 0) {
-			// The dims the pass's viewport actually covers, mirroring its
-			// mono/stereo split below: the window capped to the display in
-			// mono, one canonical tile per view in stereo.
-			uint32_t ui_content_w;
-			uint32_t ui_content_h;
-			if (!sys->hardware_display_3d) {
-				ui_content_w =
-				    (sys->output_width < sys->display_width) ? sys->output_width : sys->display_width;
-				ui_content_h = (sys->output_height < sys->display_height) ? sys->output_height
-				                                                          : sys->display_height;
-			} else {
-				ui_content_w = sys->view_width;
-				ui_content_h = sys->view_height;
-			}
-
-			// Same atlas-slot clamp the projection site applies (see the
-			// `feedback_atlas_stride_invariant` note there): content can be
-			// smaller than the slot but never larger, and the clamp must use
-			// the SAME atlas-derived slot width the readers do. Zero-guarded
-			// on the grid like service_update_slot_content_dims itself, since
-			// this path also runs on frames the projection loop never sees.
-			if (c->render.atlas_texture) {
-				D3D11_TEXTURE2D_DESC ui_atlas_desc = {};
-				c->render.atlas_texture->GetDesc(&ui_atlas_desc);
-				uint32_t ui_tc = sys->tile_columns > 0 ? sys->tile_columns : 1;
-				uint32_t ui_tr = sys->tile_rows > 0 ? sys->tile_rows : 1;
-				uint32_t ui_slot_w = ui_atlas_desc.Width / ui_tc;
-				uint32_t ui_slot_h = ui_atlas_desc.Height / ui_tr;
-				if (ui_content_w > ui_slot_w)
-					ui_content_w = ui_slot_w;
-				if (ui_content_h > ui_slot_h)
-					ui_content_h = ui_slot_h;
-			}
+			// #1666: the region the pass paints, at the ATLAS SLOT STRIDE —
+			// the full slot, or the mono window clamped into it. The pass
+			// below places its viewports from the same helper, so "declared"
+			// and "painted" cannot drift apart. The stride invariant (content
+			// <= slot) holds by construction here rather than by a clamp.
+			uint32_t ui_cols = 1, ui_rows = 1;
+			uint32_t ui_slot_w = 0, ui_slot_h = 0;
+			uint32_t ui_content_w = 0, ui_content_h = 0;
+			service_ui_pass_layout(sys, c, &ui_cols, &ui_rows, &ui_slot_w, &ui_slot_h, &ui_content_w,
+			                       &ui_content_h);
 
 			content_view_w = ui_content_w;
 			content_view_h = ui_content_h;
@@ -20774,14 +20842,18 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			service_update_slot_content_dims(sys, c, content_view_w, content_view_h);
 
 			// One-shot: this is the log discriminator that says the #1662 path
-			// fired at all (never per-frame — the pass runs every commit).
+			// fired at all (never per-frame — the pass runs every commit). It
+			// prints the slot stride beside the declared content (#1666), so a
+			// capture that looks mis-tiled can be judged from the log alone.
 			static bool ui_only_ready_warned = false;
 			if (!ui_only_ready_warned) {
 				ui_only_ready_warned = true;
 				U_LOG_W(
-				    "#1662: UI-only frame marked the slot ready (content=%ux%u views=%u) — "
-				    "a frame with no projection and no zone is still submitted content",
-				    content_view_w, content_view_h, eff_view_count);
+				    "#1662: UI-only frame marked the slot ready (content=%ux%u slot=%ux%u "
+				    "grid=%ux%u views=%u) — a frame with no projection and no zone is still "
+				    "submitted content",
+				    content_view_w, content_view_h, ui_slot_w, ui_slot_h, ui_cols, ui_rows,
+				    eff_view_count);
 			}
 		}
 	}
@@ -21051,30 +21123,59 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		 * path. Nothing downstream of this pass reads a mark, so there
 		 * is no state left to keep.
 		 */
+		/*
+		 * #1666 — resolved ONCE for the pass, because it describes the atlas,
+		 * not the view: only the origin varies per view.
+		 */
+		uint32_t ui_grid_cols = 1, ui_grid_rows = 1;
+		uint32_t ui_grid_slot_w = 0, ui_grid_slot_h = 0;
+		uint32_t ui_only_region_w = 0, ui_only_region_h = 0;
+		service_ui_pass_layout(sys, c, &ui_grid_cols, &ui_grid_rows, &ui_grid_slot_w, &ui_grid_slot_h,
+		                       &ui_only_region_w, &ui_only_region_h);
+		// `content_view_*` is seeded non-zero at the top of every commit, so the
+		// fallback is belt-and-braces — and when it does fire it is the UI-only
+		// region (window-clamped in mono), never the raw slot.
+		const uint32_t ui_region_w = content_view_w > 0 ? content_view_w : ui_only_region_w;
+		const uint32_t ui_region_h = content_view_h > 0 ? content_view_h : ui_only_region_h;
+
 		for (uint32_t view_index = 0; view_index < ui_view_count; view_index++) {
-			// Set viewport for this view
+			/*
+			 * #1666 — the viewport is this view's CONTENT REGION, placed at
+			 * the ATLAS SLOT STRIDE.
+			 *
+			 * ORIGIN: `u_tiling_view_origin` over `slot = atlas / grid`, the
+			 * formula the projection blit places tiles with and the one
+			 * `service_crop_atlas_for_dp` reads them back at —
+			 * `feedback_atlas_stride_invariant` says write and read must use
+			 * the SAME stride. This pass used `sys->view_*`, which tracks the
+			 * SCALED runtime view dims and diverges from the slot the moment
+			 * the per-client atlas is created at native pixels (3840-wide
+			 * atlas, `sys->view_width` 960). View 1's quads therefore landed
+			 * at x=960 — INSIDE tile 0 — at half the scale of the projection
+			 * content beside them, and tile 1 got no quads at all.
+			 *
+			 * SIZE: `content_view_w/_h`, the one number this commit has
+			 * already settled on. A frame where a projection or zones producer
+			 * painted uses THEIR region, so the quads share that producer's
+			 * camera frame and pixel scale and sit where its content sits; a
+			 * UI-only frame got its dims from the same
+			 * @ref service_ui_pass_layout this line places with (#1662). Either
+			 * way, the region drawn is the region declared, cropped and woven.
+			 *
+			 * MONO collapses to a single slot at the origin (grid 1x1) — the
+			 * `eff_view_count == 1` a UI-only mono frame publishes — and keeps
+			 * the window clamp inside the helper; see its comment for why that
+			 * one is not a stride question.
+			 */
+			uint32_t tile_x = 0, tile_y = 0;
+			u_tiling_view_origin(view_index, ui_grid_cols, ui_grid_slot_w, ui_grid_slot_h, &tile_x,
+			                     &tile_y);
+
 			D3D11_VIEWPORT viewport = {};
-			if (!sys->hardware_display_3d) {
-				// MONO: use output (window) dimensions so 2D content
-				// fills the full window, capped to stereo texture size.
-				uint32_t mono_w = (sys->output_width < sys->display_width)
-				                      ? sys->output_width : sys->display_width;
-				uint32_t mono_h = (sys->output_height < sys->display_height)
-				                      ? sys->output_height : sys->display_height;
-				viewport.TopLeftX = 0.0f;
-				viewport.Width = static_cast<float>(mono_w);
-				viewport.Height = static_cast<float>(mono_h);
-			} else {
-				// STEREO: tiled atlas layout
-				uint32_t tile_x, tile_y;
-				u_tiling_view_origin(view_index, sys->tile_columns,
-				                     sys->view_width, sys->view_height,
-				                     &tile_x, &tile_y);
-				viewport.TopLeftX = static_cast<float>(tile_x);
-				viewport.TopLeftY = static_cast<float>(tile_y);
-				viewport.Width = static_cast<float>(sys->view_width);
-				viewport.Height = static_cast<float>(sys->view_height);
-			}
+			viewport.TopLeftX = static_cast<float>(tile_x);
+			viewport.TopLeftY = static_cast<float>(tile_y);
+			viewport.Width = static_cast<float>(ui_region_w);
+			viewport.Height = static_cast<float>(ui_region_h);
 			viewport.MinDepth = 0.0f;
 			viewport.MaxDepth = 1.0f;
 			sys->context->RSSetViewports(1, &viewport);
