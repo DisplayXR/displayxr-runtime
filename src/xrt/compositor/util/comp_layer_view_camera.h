@@ -339,8 +339,9 @@ enum comp_layer_blend_mode
 	 * THE BASE BLIT — blending off, the source written VERBATIM, alpha
 	 * included. Reached through @ref comp_layer_tile_blend_mode (the first
 	 * FULL-TILE projection-class layer into a tile), never from a layer's
-	 * flags, and never by a SUB-RECT layer — a quad, cylinder, equirect or
-	 * zone goes through @ref comp_layer_subrect_blend_mode instead.
+	 * flags, and never by a SUB-RECT layer — a quad, cylinder or equirect
+	 * goes through @ref comp_layer_subrect_blend_mode instead, and a 3D zone
+	 * takes its own ADR-027 alpha-over path (see KNOWN DEVIATIONS below).
 	 *
 	 * Verbatim, not "alpha forced to one": the destination alpha the runtime
 	 * hands the display processor is load-bearing (#225 — the DP lerps the
@@ -542,8 +543,9 @@ comp_layer_tile_mark_composited(struct comp_layer_tile_state *tile)
  * distinct.
  *
  * ONLY A FULL-TILE PROJECTION-CLASS LAYER MAY ASK THIS. A SUB-RECT layer — a
- * quad, cylinder, equirect or 3D zone — takes @ref comp_layer_subrect_blend_mode
- * and can never reach REPLACE. Two reasons, and the second bites even where the
+ * quad, cylinder or equirect — takes @ref comp_layer_subrect_blend_mode and can
+ * never reach REPLACE (a 3D zone is also sub-rect but takes neither: ADR-027,
+ * see KNOWN DEVIATIONS). Two reasons, and the second bites even where the
  * first would not:
  *
  *  - A SUB-RECT LAYER CANNOT ESTABLISH A TILE'S ALPHA. REPLACE means "this blit
@@ -627,7 +629,12 @@ comp_layer_tile_blend_mode(struct comp_layer_tile_state *tile, uint32_t layer_fl
 }
 
 /*!
- * The blend mode for a SUB-RECT layer — a quad, cylinder, equirect or 3D zone.
+ * The blend mode for a SUB-RECT Khronos layer — a quad, cylinder or equirect.
+ *
+ * NOT for a 3D zone: a zone is sub-rect too, but ADR-027 keeps it alpha-over
+ * regardless of flags (an unflagged zone stays PREMULTIPLIED so its texture
+ * alpha survives), so routing it through here would turn it OPAQUE_COVER and
+ * break transparent zones. See the KNOWN DEVIATIONS note above.
  *
  * Always @ref comp_layer_blend_mode, never @ref COMP_LAYER_BLEND_REPLACE, even
  * when nothing has been composited into the tile yet: such a layer covers part
