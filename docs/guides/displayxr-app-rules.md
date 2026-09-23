@@ -124,7 +124,7 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   (X11 `Display*` + `Window`), or `XrWaylandSurfaceBindingCreateInfoDXR`
   (`wl_display*` + `wl_surface*`). Hosted apps pass NULL and the runtime self-creates a
   native-resolution window. On desktop Linux a single binary can carry both legs and pick
-  at runtime — see `test_apps/common/dxr_linux_window.{h,cpp}` and `cube_handle_vk_linux`
+  at runtime — see displayxr-common's `displayxr::linux_window` (`common/linux/dxr_linux_window.{h,cpp}`) and `cube_handle_vk_linux`
   (`--backend=x11|wayland|auto`).
   Ref: `test_apps/handle/cube_handle_d3d11_win/main.cpp:675`, `xr_session.cpp:193-194`.
 
@@ -168,7 +168,7 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
 
   Result: client `3840x2160+3456+0`, no frame, window origin ≡ panel origin — which is what
   the weave phase depends on. Reference implementation:
-  `test_apps/common/dxr_linux_window.cpp` (`DxrLinuxWindow::create_x11`,
+  displayxr-common's `common/linux/dxr_linux_window.cpp` (`DxrLinuxWindow::create_x11`,
   `DXR_X11_NO_FULLSCREEN=1` opts out); the runtime's hosted window does the XCB equivalent in
   `src/xrt/compositor/vk_native/comp_vk_native_window_xcb.c` (#723).
 
@@ -189,7 +189,7 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   slant) is the vendor's and never leaves the display processor; the app only asks where it
   may land. Where the DP has no lattice snap the call returns the target unchanged and the
   drag is merely unsnapped, so wire it unconditionally. Reference implementation:
-  `DxrLinuxWindow::set_snap_provider` + `test_apps/common/dxr_weave_snap.h`
+  `DxrLinuxWindow::set_snap_provider` + displayxr-common's `common/linux/dxr_weave_snap.h`
   (`DXR_X11_WM_DECORATIONS=1` restores the decorated, WM-dragged window).
 
   **Wayland substitute.** A Wayland client is never told where it is and cannot place
@@ -221,7 +221,7 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   it to the panel. Windowed Wayland additionally needs the compositor geometry service
   (`docs/specs/runtime/wayland-window-geometry.md`) for the phase anchor: the size comes
   from you, the position comes from the compositor. Reference implementation:
-  `test_apps/common/dxr_linux_window.cpp` (`DxrLinuxWindow::create_wayland`); full
+  displayxr-common's `common/linux/dxr_linux_window.cpp` (`DxrLinuxWindow::create_wayland`); full
   contract: `docs/specs/extensions/XR_DXR_wayland_surface_binding.md`.
 
 - **INV-1.4 (Android) — Opt out of view-bounds sandboxing in YOUR manifest.** The runtime

@@ -27,9 +27,9 @@
  * headlessly; DXR_ZONES_VALIDATE=1 chains the validate bit. Without
  * XR_DXR_display_zones the app degrades to the plain cube (base render path).
  *
- * ONE BINARY, TWO WINDOW BACKENDS (shared helper test_apps/common/
- * dxr_linux_window.{h,cpp}, same as cube_handle_vk_linux): `--backend=x11`
- * binds an X11 toplevel via XR_DXR_xlib_window_binding, `--backend=wayland`
+ * ONE BINARY, TWO WINDOW BACKENDS (displayxr-common's displayxr::linux_window,
+ * dxr_linux_window.{h,cpp}, same as cube_handle_vk_linux): `--platform=x11`
+ * binds an X11 toplevel via XR_DXR_xlib_window_binding, `--platform=wayland`
  * binds a native Wayland xdg toplevel via XR_DXR_wayland_surface_binding
  * (fullscreen-only — the runtime's WSI swapchain is panel-sized and never
  * follows a Wayland resize). Default `auto` prefers X11. The app owns the
@@ -3286,13 +3286,16 @@ static void SignalHandler(int sig) {
 
 static void PrintUsage(const char* argv0) {
     fprintf(stdout,
-        "Usage: %s [--backend=x11|wayland|auto] [--windowed] [--help]\n"
+        "Usage: %s [--platform=x11|wayland|auto] [--windowed] [--help]\n"
         "\n"
-        "  --backend=x11      app-owned X11 window, XR_DXR_xlib_window_binding\n"
-        "  --backend=wayland  app-owned Wayland surface, XR_DXR_wayland_surface_binding\n"
-        "  --backend=auto     (default) X11 whenever DISPLAY resolves and the runtime\n"
-        "                     advertises the xlib binding - including under XWayland,\n"
-        "                     which is the proven path; native Wayland otherwise.\n"
+        "  --platform=x11     app-owned X11 window, XR_DXR_xlib_window_binding\n"
+        "  --platform=wayland app-owned Wayland surface, XR_DXR_wayland_surface_binding\n"
+        "  --platform=auto    (default) X11 whenever an X server answers and the runtime\n"
+        "                     advertises the xlib binding - including XWayland, which\n"
+        "                     is the proven path; native Wayland otherwise. Decided by\n"
+        "                     probing connections, never by session env vars (the\n"
+        "                     probe also logs whether native Wayland is ready).\n"
+        "                     --backend= is the older spelling and still accepted.\n"
         "  --windowed         Wayland only: skip xdg_toplevel.set_fullscreen and run\n"
         "                     windowed at DXR_CUBE_WINDOW's size. Supported since\n"
         "                     XR_DXR_wayland_surface_binding spec 2 - the app declares\n"
@@ -3302,7 +3305,7 @@ static void PrintUsage(const char* argv0) {
         "                     service (window-geometry@displayxr.org).\n"
         "\n"
         "Keys: M = cycle wish mode, O = toggle zone B overlap, ESC/Q = exit\n"
-        "Env:  DXR_WINDOW_BACKEND=x11|wayland|auto (--backend wins)\n"
+        "Env:  DXR_WINDOW_BACKEND=x11|wayland|auto (an explicit request; --platform wins)\n"
         "      DXR_CUBE_WINDOW=WxH+X+Y            windowed size/pos, panel-relative\n"
         "                                         (position is X11-only; Wayland clients\n"
         "                                         cannot place themselves)\n"
@@ -3338,9 +3341,10 @@ int main(int argc, char** argv) {
     }
     for (int i = 1; i < argc; i++) {
         const char* a = argv[i];
-        if (strncmp(a, "--backend=", 10) == 0) {
-            if (!DxrLinuxWindow::parse_backend(a + 10, &requestedBackend)) {
-                LOG_ERROR("--backend must be one of x11|wayland|auto (got \"%s\")", a + 10);
+        if (strncmp(a, "--backend=", 10) == 0 || strncmp(a, "--platform=", 11) == 0) {
+            const char* v = strchr(a, '=') + 1;
+            if (!DxrLinuxWindow::parse_backend(v, &requestedBackend)) {
+                LOG_ERROR("--platform must be one of x11|wayland|auto (got \"%s\")", v);
                 return 2;
             }
         } else if (strcmp(a, "--windowed") == 0) {
