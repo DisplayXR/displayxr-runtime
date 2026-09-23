@@ -106,19 +106,30 @@ pose.position += pos_delta
 
 Sprint (SHIFT) multiplies `movement_speed` by `1.25^5 = ~3.05x`.
 
-### 3.2 Rotation (Mouse Look / Arrow Keys)
+### 3.2 Rotation (Mouse Look / Arrow Keys / Z-X Roll)
 
-Rotation accumulates yaw and pitch:
+Rotation accumulates yaw, pitch and roll:
 
 ```
-yaw_speed   = look_speed * (look_left - look_right) + yaw_delta
-pitch_speed = look_speed * (look_up - look_down) + pitch_delta
+look_step   = look_speed * sprint_boost          // SHIFT boosts look as it boosts movement
+yaw_speed   = look_step * (look_left - look_right) + yaw_delta
+pitch_speed = look_step * (look_up - look_down)  + pitch_delta
+roll_speed  = look_step * (roll_left - roll_right)
 
 pitch: local-space rotation around X axis (device tilts up/down)
+roll:  local-space rotation around Z axis (device banks; positive = right side up)
 yaw:   base-space rotation around Y axis (device turns left/right, always upright)
 ```
 
 Yaw in base-space prevents gimbal lock and keeps the horizon level.
+
+**Roll (Z / X) and the sprint-boosted look rate exist because the keyboard had
+to be able to reach every rotation axis at a usable rate (#1692).** Without
+roll only two of the three angular axes were driveable at all, and an
+unboosted controller tops out at `0.05 * 60 = 3 rad/s`, under the 6 rad/s
+per axis the OpenXR CTS `SpaceOffsets` auto-pass asks for. With SHIFT the
+controller reaches ~9.16 rad/s on each axis. Mouse deltas are one-shot
+impulses rather than rates, so sprint deliberately does not scale them.
 
 ### 3.3 Mouse XY Translation (Controllers Only)
 
@@ -156,6 +167,36 @@ Default startup is camera mode at (0, 1.6, 0). Display mode position is derived 
 | Controller | 0.005 | meters/frame |
 
 Speed is adjusted by mouse wheel or numpad +/- in exponential steps of 1.25x.
+
+### 3.7 Velocity
+
+Every relation qwerty returns carries `linear_velocity` and `angular_velocity`
+with `LINEAR_/ANGULAR_VELOCITY_VALID_BIT` set, in the same (base) frame as the
+pose — m/s and rad/s.
+
+The value is **analytic, not a finite difference of sampled poses**. The driver
+already knows the exact translation and the exact rotation it just applied, so
+the step's rate is `delta / dt` with no sampling noise, and the angular part is
+rebuilt from the two small per-step rotations rather than from
+`after * before⁻¹` (at the sub-millisecond `dt` a multi-consumer poll produces,
+differencing two near-equal orientations is float noise).
+
+Two properties follow, and both matter to a consumer:
+
+- **The pair is coherent.** The velocity describes the step that produced the
+  pose the same call returns. For a held key `delta / dt` is exactly the
+  instantaneous rate (`speed_per_frame * 60`), so it reads the same on every
+  poll however short the step — a second consumer polling the device 50 µs
+  later gets the same rate, not a different one.
+- **Validity never toggles with the keyboard.** A frame with no input reports
+  *zero* velocity with the bits still set. Zero is a measurement here; the
+  device is a simulation and always knows its own motion. (The bridge-relay
+  freeze is the same story: frozen means standing still, not "unknown".)
+
+A controller parented to the HMD (§3.4) composes through
+`m_relation_chain_push_relation`, so the chain contributes the frame rotation
+and the lever-arm term (`ω × r`) for free — and so a parented controller is not
+reported motionless while the head moves.
 
 ---
 
@@ -300,8 +341,9 @@ Focus is determined by `GetAsyncKeyState()` for reliability (avoids stuck keys f
 |-----|--------|-------|
 | W / A / S / D | Move forward / left / backward / right | Focused device |
 | Q / E | Move down / up | Focused device |
-| Arrow keys | Rotate (look) | Focused device |
-| SHIFT | Sprint (3x speed boost) | Focused device |
+| Arrow keys | Rotate — pitch (up/down) and yaw (left/right) | Focused device |
+| Z / X | Roll left / right (the third rotation axis) | Focused device |
+| SHIFT | Sprint — 3x boost on **both** movement and look speed | Focused device |
 | Numpad +/- | Increase/decrease movement speed | Focused device |
 | R | Reset controller pose | Both (no mod) or focused (with mod) |
 | C | Toggle HMD parenting | Both (no mod) or focused (with mod) |
