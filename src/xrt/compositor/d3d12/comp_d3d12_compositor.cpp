@@ -4468,6 +4468,16 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	struct xrt_vec3 left_eye = {eye_pos.eyes[0].x, eye_pos.eyes[0].y, eye_pos.eyes[0].z};
 	struct xrt_vec3 right_eye = {eye_pos.eyes[1].x, eye_pos.eyes[1].y, eye_pos.eyes[1].z};
 
+	/*
+	 * #1580: the layer-composition camera set, snapshotted BEFORE the
+	 * active-mode clamp below. The clamp truncates the DP's set to the mode's
+	 * view count, which would turn a mono frame's two-eye set into "eye 0" and
+	 * so hand the quad camera the LEFT eye's off-axis frustum — while
+	 * xrLocateViews reports the CENTROID for the same frame. The resolver does
+	 * that collapse itself, from the full set.
+	 */
+	const struct xrt_eye_positions render_eyes = eye_pos;
+
 	// Sync hardware_display_3d and tile layout from device's active rendering mode
 	if (c->xdev != NULL && c->xdev->hmd != NULL) {
 		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
@@ -4865,8 +4875,19 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			}
 		}
 #endif
-		xret = comp_d3d12_renderer_draw_projection_pass(
-		    c->renderer, c->cmd_list, &c->layer_accum, &left_eye, &right_eye, tgt_width, tgt_height, &c->eff_layout);
+		/*
+		 * #1580: the canvas the quad/cylinder/equirect/cube camera is
+		 * framed against when the frame carries NO projection layer to
+		 * borrow the app's own camera from. Optional — a texture app with
+		 * no window, or a DP that reports no dimensions, simply leaves the
+		 * resolver on its eye-only/legacy branches.
+		 */
+		struct xrt_window_metrics canvas = {};
+		const bool have_canvas = comp_d3d12_compositor_get_window_metrics(xc, &canvas);
+
+		xret = comp_d3d12_renderer_draw_projection_pass(c->renderer, c->cmd_list, &c->layer_accum, &left_eye,
+		                                                &right_eye, &render_eyes, tgt_width, tgt_height,
+		                                                have_canvas ? &canvas : nullptr, &c->eff_layout);
 		if (xret != XRT_SUCCESS) {
 			U_LOG_E("Failed to render projection pass");
 			return xret;
