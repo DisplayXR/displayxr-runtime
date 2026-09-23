@@ -16,11 +16,14 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 		shaders/zone_blit.vert
 		shaders/zone_blit.frag
 		shaders/zone_blit_array.frag
+		shaders/alpha_probe.comp
 		)
 
 	add_library(
 		comp_vk_native STATIC
 		${VK_NATIVE_SHADER_HEADERS}
+		comp_vk_native_alpha_probe.c
+		comp_vk_native_alpha_probe.h
 		comp_vk_native_compositor.c
 		comp_vk_native_compositor.h
 		comp_vk_native_deposit.cpp

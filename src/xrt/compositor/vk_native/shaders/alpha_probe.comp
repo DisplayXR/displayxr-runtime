@@ -1,0 +1,60 @@
+// Copyright 2026, DisplayXR
+// SPDX-License-Identifier: BSL-1.0
+//
+// Content-transparency probe (lazy transparency, comp_vk_native_alpha_probe.c).
+//
+// Answers ONE question per frame for the atlas the display processor is about
+// to weave: does any sampled texel have alpha below `threshold`? Each
+// invocation reads one texel on a `stride` lattice; a workgroup ORs its hits in
+// shared memory and adds at most one count to the result, so the global atomic
+// traffic is one add per transparent 8x8-sample block, never one per texel.
+//
+// The count (transparent blocks) is only used for logging; the policy reads it
+// as zero / non-zero.
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D atlas;
+
+layout(set = 0, binding = 1, std430) buffer Result
+{
+	uint transparent_blocks;
+	uint total_blocks;
+}
+result;
+
+layout(push_constant) uniform Push
+{
+	uvec2 extent;    // atlas content extent, pixels
+	uint stride;     // sample one texel every `stride` pixels in x and y
+	float threshold; // alpha strictly below this counts as transparent
+}
+pc;
+
+shared uint wg_hit;
+
+void
+main()
+{
+	if (gl_LocalInvocationIndex == 0u) {
+		wg_hit = 0u;
+	}
+	barrier();
+
+	uvec2 p = gl_GlobalInvocationID.xy * pc.stride + uvec2(pc.stride / 2u);
+	if (p.x < pc.extent.x && p.y < pc.extent.y) {
+		if (texelFetch(atlas, ivec2(p), 0).a < pc.threshold) {
+			atomicOr(wg_hit, 1u);
+		}
+	}
+	barrier();
+
+	if (gl_LocalInvocationIndex == 0u) {
+		atomicAdd(result.total_blocks, 1u);
+		if (wg_hit != 0u) {
+			atomicAdd(result.transparent_blocks, 1u);
+		}
+	}
+}

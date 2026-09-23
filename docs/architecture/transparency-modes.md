@@ -115,6 +115,22 @@ baked number quoted without stating the shaping state is unusable; always say
 which. And since shaped is the product default (above), the flip is off the
 table and the smear of rule 5 is the deciding factor.
 
+## Capable is not active: lazy transparency (desktop Linux, Vulkan)
+
+Transparency **capability** is fixed at session creation (window visual, swapchain
+alpha mode). Whether the content is transparent is a per-frame fact that only the
+pixels carry — an app with a transparency toggle submits identical layers, flags and
+blend mode either way. So on desktop Linux the Vulkan compositor probes the atlas for
+alpha < 1 every app frame and tells the display processor through
+`set_transparency_active` (`docs/reference/xrt_plugin_iface.md`): active on the
+first transparent frame, idle after 60 opaque ones. While idle the Leia DP runs no
+desktop capture, no compose-under and no alpha-gate, so an opaque frame of a
+transparency-capable app costs what an opaque app's frame costs. On the idle→active
+edge exactly one frame weaves opaque (the probe reads back a frame late), then
+silhouette intersection until the restarted capture's first trusted frame, then
+compose-under-capture. Windows has the same always-on capture for capable-but-opaque
+apps and is not covered yet (#1690). `DXR_LAZY_TRANSPARENCY=0` restores always-on.
+
 ## Rules (each learned the hard way)
 
 1. **Shaping only punches through what you carve.** Kept surface (OS frame,

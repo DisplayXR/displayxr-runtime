@@ -180,6 +180,7 @@ if(XRT_HAVE_VULKAN)
 		util/comp_layer_accum.c
 		util/comp_layer_view_camera.h
 		util/comp_layer_view_camera.c
+		util/comp_lazy_transparency.h
 		util/comp_rear_budget.h
 		util/comp_rear_budget.c
 		util/comp_render.h
