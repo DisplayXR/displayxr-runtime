@@ -538,6 +538,156 @@ static bool CreateAndFillL2DPanel(XrSessionManager& xr, uint32_t w, uint32_t h, 
     return true;
 }
 
+/*
+ * #1581 — DXR_TEST_QUAD=1 submits real XrCompositionLayerQuad layers so the GL
+ * quad pass can be judged on PIXELS rather than on reasoning. Default OFF:
+ * without it this app's layer list is byte-identical to before. The Windows
+ * twin of cube_handle_gl_macos's probe, reduced to the three things #1581's GL
+ * leg had to get right, each of which fails VISIBLY and unambiguously:
+ *
+ *   (A) after the projection, front-facing  -> DRAWN, and the "Q" upright.
+ *   (B) after (A), same centre, 1.5x bigger, yawed 180 deg about up -> NOT
+ *       drawn. Its front normal (the quad's +Z, per the spec) points away, so
+ *       comp_layer_quad_is_front_facing() must reject it in this view. If the
+ *       predicate is missing it covers (A) completely — which is exactly the
+ *       shape the CTS QuadOcclusion case showed on this backend: a full-view
+ *       back-face over everything.
+ *   (C) submitted BEFORE the projection layer -> NOT visible, because the
+ *       full-tile projection blit composites over it. Only true while quads
+ *       are composed in the same submission-ordered loop as the projection
+ *       layers; the separate later pass this replaced drew (C) on top.
+ *
+ * ── THE TEXTURE'S Y ORIGIN IS THE POINT OF (A) ──
+ *
+ * The probe is generated top-down (row 0 = the top of the picture) and then
+ * uploaded ROW-REVERSED, so the GL texture's v = 0 is the BOTTOM of the
+ * picture. That is what a GL app's swapchain image looks like — whether it
+ * renders into it through an FBO (GL's framebuffer origin is bottom-left) or,
+ * like the OpenXR CTS's OpenGL plugin, uploads a CPU image a row at a time in
+ * reverse. A probe that uploads top-down instead (cube_handle_gl_macos's does,
+ * without setting XR_COMPOSITION_LAYER_IMAGE_LAYOUT_VERTICAL_FLIP_BIT_FB) is
+ * the odd one out and will read upside down here — that is the probe's bug,
+ * not the compositor's, and it is how the D3D top-left flip survived in
+ * VS_QUAD as long as it did.
+ */
+static bool g_quadTest = false;
+static bool g_quadActive = false;
+static XrSwapchain g_quadSwapchain = XR_NULL_HANDLE;
+static uint32_t g_quadTexSize = 256;
+
+static bool CreateAndFillQuadTexture(XrSessionManager& xr, uint32_t size) {
+    XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+    sci.format = 0x8058; // GL_RGBA8
+    sci.sampleCount = 1;
+    sci.width = size;
+    sci.height = size;
+    sci.faceCount = 1;
+    sci.arraySize = 1;
+    sci.mipCount = 1;
+    if (XR_FAILED(xrCreateSwapchain(xr.session, &sci, &g_quadSwapchain))) {
+        LOG_ERROR("DXR_TEST_QUAD: xrCreateSwapchain failed");
+        return false;
+    }
+
+    uint32_t n = 0;
+    xrEnumerateSwapchainImages(g_quadSwapchain, 0, &n, nullptr);
+    std::vector<XrSwapchainImageOpenGLKHR> imgs(n, {XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR});
+    if (n == 0 || XR_FAILED(xrEnumerateSwapchainImages(g_quadSwapchain, n, &n,
+                                                       (XrSwapchainImageBaseHeader*)imgs.data()))) {
+        LOG_ERROR("DXR_TEST_QUAD: xrEnumerateSwapchainImages failed");
+        return false;
+    }
+
+    XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    uint32_t idx = 0;
+    if (XR_FAILED(xrAcquireSwapchainImage(g_quadSwapchain, &ai, &idx))) {
+        return false;
+    }
+    XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wi.timeout = XR_INFINITE_DURATION;
+    xrWaitSwapchainImage(g_quadSwapchain, &wi);
+
+    // Generated TOP-DOWN: y = 0 is the top of the picture.
+    const size_t stride = (size_t)size * 4;
+    std::vector<uint8_t> buf(stride * size);
+    const float fs = (float)size;
+    const uint32_t border = 8;
+    const uint32_t corner = size / 5;
+    const float cx = 0.47f * fs, cy = 0.46f * fs;
+    const float rOut = 0.28f * fs, rIn = 0.175f * fs;
+    const float tx0 = 0.56f * fs, ty0 = 0.60f * fs; // "Q" tail start
+    const float tx1 = 0.80f * fs, ty1 = 0.86f * fs; // tail end, bottom-right
+    const float tailHalf = 0.035f * fs;
+
+    for (uint32_t y = 0; y < size; y++) {
+        for (uint32_t x = 0; x < size; x++) {
+            bool check = (((x / 24) + (y / 24)) & 1) != 0;
+            uint8_t r = check ? 120 : 25;
+            uint8_t g = check ? 185 : 75;
+            uint8_t b = check ? 190 : 100;
+
+            // Four DISTINCT corner blocks: the orientation fiducial. Red is
+            // TOP-LEFT of the picture, so a red block at the bottom-left of
+            // the panel means the texture came out vertically flipped.
+            const bool left = (x >= border && x < border + corner);
+            const bool right = (x + border + corner >= size && x + border < size);
+            const bool top = (y >= border && y < border + corner);
+            const bool bottom = (y + border + corner >= size && y + border < size);
+            if (left && top)          { r = 255; g = 0;   b = 0;   }  // TL red
+            else if (right && top)    { r = 40;  g = 210; b = 40;  }  // TR green
+            else if (left && bottom)  { r = 0;   g = 60;  b = 255; }  // BL blue
+            else if (right && bottom) { r = 235; g = 220; b = 20;  }  // BR yellow
+
+            // A "Q": black ring plus a tail running to the bottom-right. Reads
+            // as a letter only one way up, which is the whole point.
+            const float dx = (float)x - cx, dy = (float)y - cy;
+            const float d = sqrtf(dx * dx + dy * dy);
+            bool ink = (d <= rOut && d >= rIn);
+            if (!ink) {
+                const float sx = tx1 - tx0, sy = ty1 - ty0;
+                const float px = (float)x - tx0, py = (float)y - ty0;
+                float t = (px * sx + py * sy) / (sx * sx + sy * sy);
+                t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+                const float qx = px - t * sx, qy = py - t * sy;
+                ink = sqrtf(qx * qx + qy * qy) <= tailHalf;
+            }
+            if (ink) { r = 15; g = 15; b = 15; }
+
+            uint8_t a = (x < size / 2 && y >= size / 2) ? 128 : 255;
+            if (x < border || y < border || x + border >= size || y + border >= size) {
+                r = g = b = 255;
+                a = 255;
+            }
+
+            uint8_t* px = buf.data() + (size_t)y * stride + (size_t)x * 4;
+            px[0] = r; px[1] = g; px[2] = b; px[3] = a;
+        }
+    }
+
+    // Upload ROW-REVERSED: picture row 0 (the top) lands at the texture's LAST
+    // row, so texture v = 1 is the top of the picture — the GL convention, and
+    // what the CTS's OpenGL plugin does. See the block comment.
+    GLint prev = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev);
+    glBindTexture(GL_TEXTURE_2D, imgs[idx].image);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    for (uint32_t y = 0; y < size; y++) {
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, (GLint)(size - 1 - y), (GLsizei)size, 1,
+                        GL_RGBA, GL_UNSIGNED_BYTE, buf.data() + (size_t)y * stride);
+    }
+    GLenum glErr = glGetError();
+    glBindTexture(GL_TEXTURE_2D, (GLuint)prev);
+    if (glErr != GL_NO_ERROR) {
+        LOG_WARN("DXR_TEST_QUAD: glTexSubImage2D error 0x%X", glErr);
+    }
+
+    XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    xrReleaseSwapchainImage(g_quadSwapchain, &ri);
+    g_quadTexSize = size;
+    return true;
+}
+
 static void RenderThreadFunc(
     HWND hwnd,
     HDC hDC,
@@ -1182,6 +1332,93 @@ static void RenderThreadFunc(
                         hud = nullptr;  // Disable HUD for subsequent frames
                     }
                     LOG_DEBUG("[Frame] EndFrame with HUD returned");
+                } else if (g_quadTest) {
+                    // #1581 — the quad probe's own layer list (see
+                    // CreateAndFillQuadTexture). Built by hand because the
+                    // shared EndFrame helper carries no quad type, and because
+                    // the ORDER relative to the projection layer is half of
+                    // what is being tested.
+                    if (!g_quadActive && g_quadSwapchain == XR_NULL_HANDLE) {
+                        g_quadActive = CreateAndFillQuadTexture(*xr, 256);
+                        LOG_INFO("DXR_TEST_QUAD: probe texture %s", g_quadActive ? "ready" : "FAILED");
+                    }
+
+                    XrCompositionLayerProjection projLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+                    projLayer.layerFlags = TransparentBackgroundEnabled()
+                        ? XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT
+                        : 0;
+                    projLayer.space = xr->localSpace;
+                    projLayer.viewCount = submitViewCount;
+                    projLayer.views = projectionViews.data();
+
+                    XrCompositionLayerQuad quadA = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+                    XrCompositionLayerQuad quadB = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+                    XrCompositionLayerQuad quadC = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+                    const XrCompositionLayerBaseHeader* layers[4] = {nullptr, nullptr, nullptr, nullptr};
+                    uint32_t layerCount = 0;
+
+                    if (g_quadActive && g_quadSwapchain != XR_NULL_HANDLE) {
+                        XrSwapchainSubImage sub = {};
+                        sub.swapchain = g_quadSwapchain;
+                        sub.imageRect.offset = {0, 0};
+                        sub.imageRect.extent = {(int32_t)g_quadTexSize, (int32_t)g_quadTexSize};
+                        sub.imageArrayIndex = 0;
+
+                        // Sized and placed in units of the CANVAS, not absolute
+                        // metres: a 3D display's Kooima frustum is narrow and
+                        // strongly off-axis, so metre-scale poses tuned for an
+                        // HMD land off-tile.
+                        const float cw = (xr->displayWidthM > 0.01f) ? xr->displayWidthM : 0.44f;
+                        const float ch = (xr->displayHeightM > 0.01f) ? xr->displayHeightM : 0.24f;
+
+                        // (C) BEFORE the projection: the painter's-order probe.
+                        quadC.layerFlags = 0;
+                        quadC.space = xr->localSpace;
+                        quadC.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                        quadC.subImage = sub;
+                        quadC.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+                        quadC.pose.position = {-0.26f * cw, -0.12f * ch, -0.10f * ch};
+                        quadC.size = {0.40f * ch, 0.40f * ch};
+                        layers[layerCount++] = (XrCompositionLayerBaseHeader*)&quadC;
+
+                        layers[layerCount++] = (XrCompositionLayerBaseHeader*)&projLayer;
+
+                        // (A) the readable one. STRAIGHT alpha: the probe's
+                        // bytes are unpremultiplied, so both bits.
+                        quadA.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
+                                           XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+                        quadA.space = xr->localSpace;
+                        quadA.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                        quadA.subImage = sub;
+                        quadA.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+                        quadA.pose.position = {0.057f * cw, 0.207f * ch, -0.08f * ch};
+                        quadA.size = {0.53f * ch, 0.53f * ch};
+                        layers[layerCount++] = (XrCompositionLayerBaseHeader*)&quadA;
+
+                        // (B) the back-face. Yaw 180 deg about up, so the
+                        // quad's +Z front normal points AWAY from the viewer.
+                        // Bigger than (A) and submitted after it, so a missing
+                        // facing predicate is unmissable.
+                        quadB.layerFlags = 0;
+                        quadB.space = xr->localSpace;
+                        quadB.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                        quadB.subImage = sub;
+                        quadB.pose.orientation = {0.0f, 1.0f, 0.0f, 0.0f};
+                        quadB.pose.position = {0.057f * cw, 0.207f * ch, -0.04f * ch};
+                        quadB.size = {0.80f * ch, 0.80f * ch};
+                        layers[layerCount++] = (XrCompositionLayerBaseHeader*)&quadB;
+                    } else {
+                        layers[layerCount++] = (XrCompositionLayerBaseHeader*)&projLayer;
+                    }
+
+                    XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
+                    endInfo.displayTime = frameState.predictedDisplayTime;
+                    endInfo.environmentBlendMode = xr->runtimeSupportsAlphaBlend
+                        ? XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND
+                        : XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+                    endInfo.layerCount = layerCount;
+                    endInfo.layers = layers;
+                    xrEndFrame(xr->session, &endInfo);
                 } else {
                     XrCompositionLayerFlags projLayerFlags = TransparentBackgroundEnabled()
                         ? XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT
@@ -1218,6 +1455,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // #439 Phase 3 — handle + mask + Local2D layer modes (§8 cases 2/3/4).
     {
+        // #1581 — the quad-layer probe. OFF by default; see
+        // CreateAndFillQuadTexture for what the three quads prove.
+        const char* q = getenv("DXR_TEST_QUAD");
+        if (q && *q != '\0' && *q != '0') {
+            g_quadTest = true;
+            LOG_INFO("DXR_TEST_QUAD=1 — submitting 3 XrCompositionLayerQuad layers "
+                     "(C before the projection, A front-facing, B back-facing)");
+        }
+
         const char* e = getenv("DXR_LOCAL2D_PANEL");
         if (e && *e == '1') g_l2dPanel = true;
         e = getenv("DXR_LOCAL2D_MASK");
