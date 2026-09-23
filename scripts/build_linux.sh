@@ -282,7 +282,7 @@ if [ "$BUILD_APPS" = "ON" ]; then
   #                                 XR_DXR_xlib_window_binding, native Wayland via
   #                                 XR_DXR_wayland_surface_binding (fullscreen-only —
   #                                 docs/specs/extensions/XR_DXR_wayland_surface_binding.md).
-  #                                 Default auto prefers X11 (incl. XWayland).
+  #                                 Default auto: native Wayland when ready, else X11.
   #   cube_zones_vk_linux         — handle + XR_DXR_display_zones (ADR-027):
   #                                 2 clear-based 3D zones + a Local2D strip. Same
   #                                 --platform / DXR_WINDOW_BACKEND selection.
@@ -314,9 +314,9 @@ if [ "$BUILD_APPS" = "ON" ]; then
 # auto; DXR_WINDOW_BACKEND sets the same thing, --platform wins; --backend= is
 # the older spelling) and pass every argument straight through, e.g.
 #   \$0 --platform=wayland
-# auto probes connections (never session env vars) and prefers X11 whenever an
-# X server answers, including XWayland; it logs whether native Wayland is
-# ready. --help lists the rest.
+# auto probes connections (never session env vars): native Wayland when the
+# compositor is ready (fractional-scale + viewporter + the window-geometry
+# extension), else X11 (XWayland counts). --help lists the rest.
 # OXR_ENABLE_VK_NATIVE_COMPOSITOR=1 selects the native Vulkan compositor path;
 # SIM_DISPLAY_OUTPUT picks the sim-display weave (anaglyph/sbs/...).
 export XR_RUNTIME_JSON="$BUILD_DIR/openxr_displayxr-dev.json"

@@ -76,7 +76,7 @@ FetchContent_Declare(
     # TEMPORARY: the displayxr-common PR commit that adds displayxr::linux_window
     # (displayxr-common#58). Switch to `GIT_TAG v2.20.0` + `GIT_SHALLOW TRUE`
     # once that tag is cut, before this merges.
-    GIT_TAG 5f5043f246204f8f4e31a290589999003b8ee5cc
+    GIT_TAG 66486d18533545da74c6c559bbd9d1574b710ec4
     GIT_SHALLOW FALSE
 )
 FetchContent_MakeAvailable(displayxr_common)

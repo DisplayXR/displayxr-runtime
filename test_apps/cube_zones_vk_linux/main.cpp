@@ -32,7 +32,7 @@
  * binds an X11 toplevel via XR_DXR_xlib_window_binding, `--platform=wayland`
  * binds a native Wayland xdg toplevel via XR_DXR_wayland_surface_binding
  * (fullscreen-only — the runtime's WSI swapchain is panel-sized and never
- * follows a Wayland resize). Default `auto` prefers X11. The app owns the
+ * follows a Wayland resize). Default `auto` prefers native Wayland when the compositor is ready, else X11. The app owns the
  * window-system event loop (pumped once per frame) and the window lifecycle,
  * because the runtime pumps neither.
  */
@@ -3290,11 +3290,11 @@ static void PrintUsage(const char* argv0) {
         "\n"
         "  --platform=x11     app-owned X11 window, XR_DXR_xlib_window_binding\n"
         "  --platform=wayland app-owned Wayland surface, XR_DXR_wayland_surface_binding\n"
-        "  --platform=auto    (default) X11 whenever an X server answers and the runtime\n"
-        "                     advertises the xlib binding - including XWayland, which\n"
-        "                     is the proven path; native Wayland otherwise. Decided by\n"
-        "                     probing connections, never by session env vars (the\n"
-        "                     probe also logs whether native Wayland is ready).\n"
+        "  --platform=auto    (default) native Wayland when the compositor is ready\n"
+        "                     (fractional-scale + viewporter + the window-geometry\n"
+        "                     extension on D-Bus), else X11 (XWayland counts), else\n"
+        "                     native Wayland. Decided by probing connections, never by\n"
+        "                     session env vars; the verdict is logged.\n"
         "                     --backend= is the older spelling and still accepted.\n"
         "  --windowed         Wayland only: skip xdg_toplevel.set_fullscreen and run\n"
         "                     windowed at DXR_CUBE_WINDOW's size. Supported since\n"

@@ -18,8 +18,8 @@
  * DXR_WINDOW_BACKEND, default auto — a capability probe, never session env):
  *   X11     -> XR_DXR_xlib_window_binding    (runtime: XGetXCBConnection +
  *              VK_KHR_xcb_surface). Windowed or fullscreen; the proven path,
- *              and what `auto` picks whenever an X server answers — including
- *              XWayland.
+ *              and what `auto` picks when native Wayland is not "ready"
+ *              (see the helper) — including XWayland.
  *   Wayland -> XR_DXR_wayland_surface_binding (runtime: VK_KHR_wayland_surface).
  *              This app is the first in the tree to exercise it. FULLSCREEN
  *              ONLY: the runtime sizes its WSI swapchain to the panel and never
@@ -2420,11 +2420,11 @@ static void PrintUsage(const char* argv0) {
         "\n"
         "  --platform=x11     app-owned X11 window, XR_DXR_xlib_window_binding\n"
         "  --platform=wayland app-owned Wayland surface, XR_DXR_wayland_surface_binding\n"
-        "  --platform=auto    (default) X11 whenever an X server answers and the runtime\n"
-        "                     advertises the xlib binding - including XWayland, which\n"
-        "                     is the proven path; native Wayland otherwise. Decided by\n"
-        "                     probing connections, never by session env vars (the\n"
-        "                     probe also logs whether native Wayland is ready).\n"
+        "  --platform=auto    (default) native Wayland when the compositor is ready\n"
+        "                     (fractional-scale + viewporter + the window-geometry\n"
+        "                     extension on D-Bus), else X11 (XWayland counts), else\n"
+        "                     native Wayland. Decided by probing connections, never by\n"
+        "                     session env vars; the verdict is logged.\n"
         "                     --backend= is the older spelling and still accepted.\n"
         "  --windowed         Wayland only: skip xdg_toplevel.set_fullscreen and run\n"
         "                     windowed at DXR_CUBE_WINDOW's size. Supported since\n"
