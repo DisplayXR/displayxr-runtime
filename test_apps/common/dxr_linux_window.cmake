@@ -145,7 +145,24 @@ function(dxr_target_add_linux_window TARGET)
     # pinned to a displayxr-common older than v2.17.0 has no such target and
     # simply builds without chrome (the pre-#1654 undecorated window).
     if(TARGET displayxr::csd)
-        target_sources(${TARGET} PRIVATE "${DXR_LINUX_WINDOW_DIR}/dxr_wl_chrome.cpp")
+        target_sources(${TARGET} PRIVATE "${DXR_LINUX_WINDOW_DIR}/dxr_wl_chrome.cpp"
+                                         "${DXR_LINUX_WINDOW_DIR}/dxr_wl_placement.cpp")
+        # libdbus-1 (optional): the client of the compositor's drag lattice,
+        # which keeps the interlace phase still while the compositor drags the
+        # window (#1609). Without it the title bar drags exactly as before.
+        if(PkgConfig_FOUND)
+            pkg_check_modules(DXR_DBUS QUIET dbus-1)
+        endif()
+        if(DXR_DBUS_FOUND)
+            target_include_directories(${TARGET} PRIVATE ${DXR_DBUS_INCLUDE_DIRS})
+            target_link_libraries(${TARGET} PRIVATE ${DXR_DBUS_LIBRARIES})
+            target_link_directories(${TARGET} PRIVATE ${DXR_DBUS_LIBRARY_DIRS})
+            target_compile_definitions(${TARGET} PRIVATE DXR_APP_HAVE_DBUS)
+            message(STATUS "${TARGET}: drag lattice client ENABLED (libdbus ${DXR_DBUS_VERSION})")
+        else()
+            message(STATUS "${TARGET}: libdbus-1 NOT found — title-bar drags are unconstrained "
+                           "(install libdbus-1-dev for the phase-snapped drag)")
+        endif()
         target_link_libraries(${TARGET} PRIVATE displayxr::csd)
         target_compile_definitions(${TARGET} PRIVATE DXR_APP_HAVE_WL_CHROME)
         message(STATUS "${TARGET}: Wayland title bar ENABLED (displayxr::csd)")
