@@ -122,6 +122,69 @@ static const IID IID_ID3D11Texture2D_local = {
 #endif
 
 /*
+ * #1610 — glCopyImageSubData where the platform's GL header stops at 4.1.
+ *
+ * The two loaders this file has are not the same shape. Windows and Android go
+ * through GLAD (`ogl/ogl_api.h`, generated for `gl:core=4.6`), which DECLARES
+ * every entry point up to 4.6 and leaves the pointer NULL when the live context
+ * does not provide it — so `glCopyImageSubData == NULL` is already exactly the
+ * capability test gl_ensure_compose_target() wants. macOS has no loader at all:
+ * it links straight against OpenGL.framework through <OpenGL/gl3.h>, whose
+ * ceiling is OpenGL 4.1, so GL 4.3's glCopyImageSubData is not declared and the
+ * runtime refusal designed for that very platform never got to run — the file
+ * did not compile (PR #1705).
+ *
+ * So macOS gets the same CONTRACT by hand: one file-scope pointer, resolved
+ * once at init, NULL when the platform does not have it. The #define keeps the
+ * GL spelling at every call site, so there is exactly ONE name for this entry
+ * point in the file and the capability test reads identically on all three
+ * platforms.
+ */
+#if defined(__APPLE__)
+#include <dlfcn.h>
+typedef void (*PFN_dxr_glCopyImageSubData)(GLuint srcName,
+                                           GLenum srcTarget,
+                                           GLint srcLevel,
+                                           GLint srcX,
+                                           GLint srcY,
+                                           GLint srcZ,
+                                           GLuint dstName,
+                                           GLenum dstTarget,
+                                           GLint dstLevel,
+                                           GLint dstX,
+                                           GLint dstY,
+                                           GLint dstZ,
+                                           GLsizei srcWidth,
+                                           GLsizei srcHeight,
+                                           GLsizei srcDepth);
+static PFN_dxr_glCopyImageSubData dxr_glCopyImageSubData = NULL;
+#define glCopyImageSubData dxr_glCopyImageSubData
+
+/*!
+ * Resolve the post-4.1 entry points this file uses. There is one, and on Apple
+ * it is expected to stay NULL: that GL caps at 4.1 and exports no 4.3 symbol,
+ * which is precisely the case gl_ensure_compose_target() refuses on. Written as
+ * a lookup rather than a hardcoded NULL so the day a platform does export it,
+ * the compose path lights up without a code change.
+ */
+static void
+gl_load_post_41_entry_points(void)
+{
+	static bool tried = false;
+	if (tried) {
+		return;
+	}
+	tried = true;
+	dxr_glCopyImageSubData = (PFN_dxr_glCopyImageSubData)dlsym(RTLD_DEFAULT, "glCopyImageSubData");
+}
+#else
+//! GLAD already resolved these against the live context; nothing to do.
+static inline void
+gl_load_post_41_entry_points(void)
+{}
+#endif
+
+/*
  * WGL_NV_DX_interop2 function types (loaded dynamically via wglGetProcAddress)
  */
 #ifdef XRT_OS_WINDOWS
@@ -3023,6 +3086,9 @@ gl_ensure_compose_target(struct comp_gl_compositor *c)
 		return false;
 	}
 
+	// The capability test, identical on every platform because the entry point
+	// has one name here: GLAD leaves it NULL on a context below 4.3, and the
+	// macOS shim leaves it NULL when the framework exports no such symbol.
 	if (glCopyImageSubData == NULL) {
 		// Without a same-family copy the composite could only reach the
 		// atlas through a DRAW, which would re-apply the transfer
@@ -3031,8 +3097,8 @@ gl_ensure_compose_target(struct comp_gl_compositor *c)
 		static bool warned_no_copy = false;
 		if (!warned_no_copy) {
 			warned_no_copy = true;
-			U_LOG_W("Color (#1610) [gl]: no glCopyImageSubData (needs GL 4.3 / ARB_copy_image) — "
-			        "composing in encoded space, as before #1610");
+			U_LOG_W("Color (#1610) [gl]: glCopyImageSubData did not resolve (GL 4.3 / ARB_copy_image; "
+			        "Apple's GL caps at 4.1) — composing in encoded space, as before #1610");
 		}
 		return false;
 	}
@@ -6459,6 +6525,10 @@ gl_init_resources(struct comp_gl_compositor *c, uint32_t width, uint32_t height)
 	glBindTexture(GL_TEXTURE_2D, 0);
 
 	c->hardware_display_3d = true;
+
+	// #1610: resolve the one post-4.1 entry point the compose path needs,
+	// once, with the context current. A no-op where GLAD already did it.
+	gl_load_post_41_entry_points();
 
 	// #1589/#1610 — latch the escape hatch once and state the regime once.
 	// That WARN is the only evidence a capture has for which colour regime
