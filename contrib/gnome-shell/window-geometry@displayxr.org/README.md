@@ -194,6 +194,11 @@ systemctl --user unset-environment DISPLAYXR_DEBUG   # then log out/in again
   `ClearDragLattice(u pid)`, signal `DragLatticeNeeded(u pid, i dx, i dy)`.
   During the caller's next compositor drag, every position is moved on to the
   nearest table entry before it is painted. See the spec, §8.
+- Version 7, same interface: signal
+  `DragLatticeDone(u pid, u moves, u corrected, u misses, u maxCorrection, u tables, b landedOnTable)`
+  at the end of every drag that had a table. A table may now arrive
+  mid-grab, and the next piece is requested ahead of the drag. Every window
+  in the geometry snapshot gains `lattice_drop`. See the spec, §8.5.
 
 Verify capture exclusion is live:
 

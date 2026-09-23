@@ -590,3 +590,27 @@ relies on that signal staying synchronous inside `move_resize`.
   in the shell's environment. The extension README explains how to get it
   there: environment.d is not re-read at logout.
 
+### 8.5 Version 7 — follow-ups from hardware
+
+- **Mid-drag tables.** A drag that starts on a fractionally scaled output has
+  no reachable lattice there, so the app sends no table at the press. When
+  the window reaches an integer-scale output (the 3D panel) during the drag,
+  the app derives a table then. The extension accepts it mid-grab, with its
+  origin where the window is on arrival. Leaving the panel drops it
+  (`ClearDragLattice`).
+- **Ask ahead.** The next piece is requested once the drag is half-way from
+  the table's centre to its edge, centred ~150 ms ahead in the direction of
+  motion, not on the first miss. The app probes on a worker thread, so
+  neither a mid-drag table nor an extension stalls rendering.
+- **Grab-only correction.** A table corrects only moves made by a grab. The
+  runtime's drop-time `MoveWindow` is never pulled towards the table.
+- **One owner per drop.** `lattice_drop: true` in the snapshot means the last
+  drag ended on its table and the window has not moved since. The drop-time
+  snap accepts such a position as is.
+- **Drop-snap verification.** `MoveWindow` is asynchronous, so the landing is
+  judged once the window reaches the target (or after ~0.5 s), and every
+  change until then is the snap's own. Judging it on the next poll made a
+  drop ping-pong between two phase-correct neighbours.
+- **`DragLatticeDone`** carries one drag's statistics, so the app logs a
+  one-line summary in its own log.
+
