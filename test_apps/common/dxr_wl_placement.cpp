@@ -60,7 +60,7 @@ DxrWlPlacement::connect()
 	DBusMessage *reply = dbus_connection_send_with_reply_and_block(conn, call, 200, &err);
 	dbus_message_unref(call);
 	if (reply == nullptr) {
-		m_why = "the geometry extension is older than version 4 (no drag lattice) — the title bar drags "
+		m_why = "the geometry extension is older than version 6 (no drag lattice) — the title bar drags "
 		        "through the compositor unsnapped";
 		dbus_error_free(&err);
 		return false;
