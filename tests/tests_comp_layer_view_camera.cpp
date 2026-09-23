@@ -1611,3 +1611,174 @@ TEST_CASE("the D3D paths consult the shared facing and painter's rules (#1590, #
 		CHECK(src.find("comp_layer_subrect_blend_mode(") != std::string::npos);
 	}
 }
+
+/*
+ * #1602, structurally, for the equirect2 draw on both D3D legs.
+ *
+ * The guards above are FILE-scoped: they prove the file consults the shared
+ * rules SOMEWHERE. That was enough while a file had one non-projection draw in
+ * it; D3D12 now has two (quad, #1581; equirect2, #1602), and a file-scoped
+ * check is satisfied by the quad alone — the exact hole a second port falls
+ * through. So these read the equirect2 FUNCTION BODY.
+ *
+ * Both what it must ask and what it must NOT:
+ *
+ *  - It must take per-eye visibility from is_layer_view_visible_n() and build
+ *    its frustum tangents from a per-view FOV. An equirect2 draw casts rays,
+ *    so the FOV is the ONLY place the camera's framing enters — get it from
+ *    anywhere but this frame's camera and the sphere lands on different display
+ *    pixels than projection content at the same world pose (#1580).
+ *  - It must fold OPAQUE_COVER's alpha-of-one, which no fixed-function blend
+ *    factor can synthesise.
+ *  - It must NOT reach comp_layer_tile_blend_mode(): a sphere section covers
+ *    part of the tile, so it can never be the tile's base (#1598).
+ *  - It must NOT apply comp_layer_quad_is_front_facing(). #1590 is normative
+ *    for QUADS — "only front face of the quad surface is visible" — and a
+ *    sphere has no back face. Culling here would drop a viewer standing INSIDE
+ *    the sphere, which is the ordinary case for a 360 background and is
+ *    literally CTS Equirect2 subtests 1-4.
+ *
+ * Comment mentions are not code, so the negatives run over a comment-stripped
+ * copy: the reasons above are explained AT those call sites, and a guard that
+ * failed on its own explanation would be worse than no guard.
+ */
+static std::string
+code_only(const std::string &src)
+{
+	std::string out;
+	size_t bol = 0;
+	while (bol <= src.size()) {
+		const size_t nl = src.find('\n', bol);
+		const size_t eol = nl == std::string::npos ? src.size() : nl;
+		const std::string line = src.substr(bol, eol - bol);
+
+		const size_t first = line.find_first_not_of(" \t");
+		const std::string lead = first == std::string::npos ? "" : line.substr(first);
+		if (lead.rfind("*", 0) != 0 && lead.rfind("//", 0) != 0 && lead.rfind("/*", 0) != 0) {
+			out += line;
+		}
+		out += "\n";
+
+		if (nl == std::string::npos) {
+			break;
+		}
+		bol = nl + 1;
+	}
+	return out;
+}
+
+/*!
+ * The body of a top-level function definition, by name. Relies on this tree's
+ * style — a definition's name starts a line and its closing brace is the next
+ * `}` in column 0 — which every backend source here follows.
+ */
+static std::string
+function_body(const std::string &src, const std::string &name)
+{
+	const std::string needle = "\n" + name + "(";
+	const size_t start = src.find(needle);
+	if (start == std::string::npos) {
+		return "";
+	}
+	const size_t end = src.find("\n}", start);
+	if (end == std::string::npos) {
+		return "";
+	}
+	return src.substr(start, end - start);
+}
+
+TEST_CASE("the equirect2 draw consults the shared rules on both D3D legs (#1602)")
+{
+	const char *const backends[] = {
+	    "d3d11/comp_d3d11_renderer.cpp",
+	    // #1602: D3D12 joined here; before it, the layer was accepted into
+	    // the accumulator and silently never drawn.
+	    "d3d12/comp_d3d12_renderer.cpp",
+	};
+
+	for (const char *rel : backends) {
+		const std::string path = std::string(DXR_COMP_SRC_DIR) + "/" + rel;
+		const std::string src = read_whole_file(path);
+		const std::string body = function_body(src, "render_equirect2_layer");
+
+		INFO(rel << " has no render_equirect2_layer() definition — did it move, or did the "
+		         << "equirect2 draw get dropped?");
+		REQUIRE_FALSE(body.empty());
+
+		const std::string code = code_only(body);
+
+		INFO(rel << ": the equirect2 draw must take per-eye visibility from "
+		         << "is_layer_view_visible_n() — the view-count-aware one (#1580)");
+		CHECK(code.find("is_layer_view_visible_n(") != std::string::npos);
+
+		INFO(rel << ": the equirect2 draw must build its frustum tangents from this view's FOV — "
+		         << "that is the only place the camera's framing enters a ray-cast draw (#1580)");
+		CHECK(code.find("angle_left") != std::string::npos);
+		CHECK(code.find("angle_down") != std::string::npos);
+
+		INFO(rel << ": the equirect2 draw must fold OPAQUE_COVER's alpha-of-one into the colour "
+		         << "scale/bias — no fixed-function blend factor can produce a constant one");
+		CHECK(code.find("comp_layer_blend_fold_opaque_cover(") != std::string::npos);
+
+		INFO(rel << ": the equirect2 draw must NOT reach comp_layer_tile_blend_mode() — a sphere "
+		         << "section covers part of the tile, so it can never be the tile's base (#1598)");
+		CHECK(code.find("comp_layer_tile_blend_mode(") == std::string::npos);
+
+		INFO(rel << ": the equirect2 draw must NOT apply comp_layer_quad_is_front_facing() — #1590 "
+		         << "is normative for quads, and culling a sphere's 'back face' drops the viewer "
+		         << "standing inside it, which is CTS Equirect2 1-4");
+		CHECK(code.find("comp_layer_quad_is_front_facing(") == std::string::npos);
+	}
+
+	/*
+	 * ...and the D3D12-specific half. Three things this leg can get wrong
+	 * that D3D11 structurally cannot:
+	 *
+	 *  - the blend mode has to be named through the SUB-RECT spelling here,
+	 *    because D3D12 composes its sub-rect layers in the SAME loop as its
+	 *    projection blits — there is no separate pass whose every layer is
+	 *    sub-rect by construction (the in-process D3D11 leg resolves it at
+	 *    the call site instead, which is why this half is D3D12-only);
+	 *  - the PSO bakes the render target's format, so the pick must go
+	 *    through the helper that knows which target this frame paints
+	 *    (#1610). A literal `equirect2_pso[...]` index would draw into the
+	 *    `_SRGB` compose target with the UNORM-baked pipeline;
+	 *  - the source SRV's format must come from layer_source_format(), the
+	 *    one place that decides whether this frame samples format-honest
+	 *    (#1589/#1694). A blend in the wrong space is not a crash — it is
+	 *    one graphics API a stop brighter than another.
+	 */
+	const std::string d3d12 = read_whole_file(std::string(DXR_COMP_SRC_DIR) + "/d3d12/comp_d3d12_renderer.cpp");
+	const std::string d3d12_body = code_only(function_body(d3d12, "render_equirect2_layer"));
+	REQUIRE_FALSE(d3d12_body.empty());
+
+	INFO("the D3D12 equirect2 draw must resolve its blend mode through comp_layer_subrect_blend_mode()");
+	CHECK(d3d12_body.find("comp_layer_subrect_blend_mode(") != std::string::npos);
+
+	INFO(
+	    "the D3D12 equirect2 draw must pick its PSO through equirect2_pso_for(), the only place that "
+	    "knows which render target this frame paints (#1610)");
+	CHECK(d3d12_body.find("equirect2_pso_for(") != std::string::npos);
+
+	INFO("the D3D12 equirect2 draw must take its source SRV format from layer_source_format() (#1589/#1694)");
+	CHECK(d3d12_body.find("layer_source_format(") != std::string::npos);
+
+	/*
+	 * The shader is SHARED, not forked. d3d_shared/comp_equirect2_shaders.h
+	 * exists because the ray/sphere march is ~100 lines that three backends
+	 * compile, and its own preamble says a per-path copy would drift the
+	 * first time either was touched. `sphere_intersect` is the tell: it
+	 * appears exactly once in the tree, in that header.
+	 */
+	const char *const shader_consumers[] = {
+	    "d3d11/comp_d3d11_renderer.cpp",
+	    "d3d11_service/comp_d3d11_service.cpp",
+	    "d3d12/comp_d3d12_renderer.cpp",
+	};
+	for (const char *rel : shader_consumers) {
+		const std::string src = read_whole_file(std::string(DXR_COMP_SRC_DIR) + "/" + rel);
+		INFO(rel << " carries its own copy of the equirect2 ray/sphere HLSL — it belongs in "
+		         << "d3d_shared/comp_equirect2_shaders.h, which every D3D leg compiles (#1602)");
+		CHECK(src.find("sphere_intersect") == std::string::npos);
+	}
+}
