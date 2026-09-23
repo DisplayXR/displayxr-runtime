@@ -23,7 +23,7 @@
 
 'use strict';
 
-const {Clutter, GObject, Meta, Gio, GLib} = imports.gi;
+const {Clutter, GObject, Meta, Gio, GLib, Graphene} = imports.gi;
 const ExtensionUtils = imports.misc.extensionUtils;
 
 let service = null;
@@ -36,7 +36,7 @@ function init() {
     void Me.imports.lib;
 
     const {WindowGeometryService} =
-        globalThis.displayxrWindowGeometry.build({Clutter, GObject, Meta, Gio, GLib});
+        globalThis.displayxrWindowGeometry.build({Clutter, GObject, Meta, Gio, GLib, Graphene});
     service = new WindowGeometryService();
     // Shells that take init()'s return value use it as the state object and
     // call enable()/disable() on IT; shells that ignore the return value call

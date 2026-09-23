@@ -147,7 +147,7 @@
         },
     };
 
-    function buildModule({Clutter, GObject, Meta, Gio, GLib}) {
+    function buildModule({Clutter, GObject, Meta, Gio, GLib, Graphene}) {
         const IFACE_XML = `
 <node>
   <interface name="org.displayxr.WindowGeometry1">
@@ -489,6 +489,7 @@
     <method name="ClearDragLattice">
       <arg type="u" direction="in" name="pid"/>
     </method>
+
     <signal name="DragLatticeNeeded">
       <arg type="u" name="pid"/>
       <arg type="i" name="dx"/>
@@ -498,40 +499,41 @@
 </node>`;
 
         /*
-         * ── Drag lattice (extension version 4) ───────────────────────────
+         * ── Drag lattice (extension version 6) ───────────────────────────
          *
          * Keeps the interlace phase still WHILE the compositor runs a drag,
-         * which is what the drop-time snap above cannot do: it only fixes where
-         * the window comes to rest.
+         * which the drop-time snap above cannot do: it only fixes where the
+         * window comes to rest.
          *
          * The rule every platform follows — whoever decides the next position
-         * snaps it before the window gets there — has exactly one hook in
-         * mutter: Meta.ExternalConstraint. Its constrain() runs LAST in the
-         * constraint pipeline (after the on-screen and titlebar-visible
-         * constraints), receives MOVE for move actions including a grab-driven
-         * drag, and edits the proposed rect in place; nothing later overrides
-         * it. Windows' equivalent is the display processor rewriting the
-         * proposal in WM_WINDOWPOSCHANGING.
+         * snaps it before the window is SEEN there. At the press the app sends
+         * a TABLE: the displacements from the drag start its own display
+         * processor calls phase-correct (probed through its public snap, the
+         * same oracle the X11 drag uses), restricted to positions the
+         * compositor can place. mutter keeps running the drag — its feel, edge
+         * tiling and workspace drag survive — and every time it moves the
+         * window, `position-changed` fires SYNCHRONOUSLY inside mutter's
+         * move_resize, and the handler moves the window on to the nearest
+         * table entry before the stage next paints. Measured in a headless
+         * mutter 50: raw (697,355) corrected to (696,356), 13 frames painted,
+         * 13 on the lattice, 0 off.
          *
-         * What it snaps to is a TABLE the app sends at the press: displacements
-         * from the drag start that the app found phase-correct by probing its
-         * own display processor's snap (the same oracle the X11 drag uses),
-         * restricted to positions the compositor can actually place. So:
-         *   - no IPC into the app during the grab — constrain() is an array
-         *     lookup, and mutter's move path can never stall on a busy app;
-         *   - the lens geometry never crosses a process boundary: the table is
-         *     the app's own transient answer set, derived per drag, and holds
-         *     no pitch, slant or distance (the vendor retired those getters
-         *     from its public API; do not reintroduce them here);
-         *   - mutter keeps the drag, so its feel, edge tiling and workspace
-         *     drag all survive, and the position it places is the position the
-         *     geometry payload reports.
+         * Why not Meta.ExternalConstraint, which is the proper hook: it is
+         * called for every move, but GJS hands the constraint `new_rect` as a
+         * COPY, and assigning the field throws "Writing field
+         * Meta.ExternalConstraintInfo.new_rect is not supported". From an
+         * extension it cannot move a window at all. It is kept behind
+         * DISPLAYXR_LATTICE_CONSTRAINT=1 for when mutter makes the rect
+         * writable; the correction then becomes unnecessary.
+         *
+         * What crosses the process boundary: the app's own transient answer
+         * set, derived per drag. No lens pitch, slant or viewing distance —
+         * the vendor retired those getters from its public API; do not
+         * reintroduce them here. No call goes into the app during the grab,
+         * so a busy app can never stall the desktop's move path.
          *
          * A drag that leaves the table's coverage moves unsnapped and asks for
          * more (DragLatticeNeeded, async). A table no grab follows expires.
-         *
-         * Feature-detected: mutter only grew ExternalConstraint recently, so
-         * an older shell reports no capability and the app drags as before.
          */
         const HAVE_EXTERNAL_CONSTRAINT =
             typeof Meta.ExternalConstraint !== 'undefined' &&
@@ -539,6 +541,16 @@
         const PLACEMENT_CAP_DRAG_LATTICE = 1;
         //! A table no grab follows stops constraining after this long.
         const LATTICE_PRE_GRAB_US = 2 * 1000 * 1000;
+        //! DISPLAYXR_TEST=1 (never in production): tables audit their paints
+        //! from the moment they land and wait longer for a grab to start. (A
+        //! virtual-pointer grab driver crashed a headless mutter 50 inside
+        //! begin_grab_op and was removed; do not reintroduce it.)
+        const LATTICE_TEST = GLib.getenv('DISPLAYXR_TEST') === '1';
+        //! DISPLAYXR_LATTICE_CONSTRAINT=1: register the Meta.ExternalConstraint
+        //! as well. It CANNOT move the window from GJS on mutter 50 (the rect is
+        //! a read-only copy — see "Drag lattice"), so it is off by default and
+        //! kept only for when mutter makes the rect writable.
+        const LATTICE_USE_CONSTRAINT = GLib.getenv('DISPLAYXR_LATTICE_CONSTRAINT') === '1';
 
         let DragLatticeConstraint = null;
         if (HAVE_EXTERNAL_CONSTRAINT) {
@@ -557,15 +569,121 @@
                 this._debug = debug;
                 this._tables = new Map();      // Meta.Window -> table
                 this._constraints = new Map(); // Meta.Window -> constraint object
+                this._posHandlers = new Map(); // Meta.Window -> position-changed handler id
+                this._correcting = false;       // re-entry guard for our own move_frame
                 this._stats = {constrained: 0, snapped: 0, misses: 0, propagate: 'untested'};
+                this._resetDragStats();
+            }
+
+            _resetDragStats() {
+                this._drag = {corrected: 0, moves: 0, paintedOn: 0, paintedOff: 0, offSamples: [],
+                    maxCorrection: 0};
             }
 
             supported() {
-                return HAVE_EXTERNAL_CONSTRAINT;
+                // The correction path moves the window with move_frame and needs
+                // nothing newer than the placement service itself.
+                return true;
+            }
+
+            /*
+             * THE CORRECTION (what actually moves the window on mutter 50).
+             *
+             * mutter's move grab places the window from the pointer's
+             * displacement against the grab anchor, not from where the window
+             * currently is. So correcting each placement to the nearest table
+             * entry does not fight the grab: the next pointer event simply
+             * re-proposes the raw position and it is corrected again. The one
+             * question is ORDER — whether the stage can paint the raw position
+             * before the correction lands — and that is what auditPaint()
+             * measures instead of assuming.
+             */
+            _onPositionChanged(win) {
+                if (this._correcting)
+                    return; // our own corrective move
+                const t = this._tables.get(win);
+                if (!t)
+                    return;
+                if (!t.grabbing && GLib.get_monotonic_time() > t.expiresUs) {
+                    this._tables.delete(win);
+                    return;
+                }
+                this._drag.moves++;
+                const r = win.get_frame_rect();
+                const dx = r.x - t.startX, dy = r.y - t.startY;
+                const inside = dx >= t.minDx && dx <= t.maxDx && dy >= t.minDy && dy <= t.maxDy;
+                const best = inside ? this._nearest(t, dx, dy) : null;
+                if (!best) {
+                    this._stats.misses++;
+                    if (!t.asked) {
+                        t.asked = true;
+                        const pid = t.pid;
+                        GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+                            this._emitNeeded(pid, dx, dy);
+                            return GLib.SOURCE_REMOVE;
+                        });
+                    }
+                    return;
+                }
+                const nx = t.startX + best[0], ny = t.startY + best[1];
+                if (nx === r.x && ny === r.y)
+                    return;
+                const c = Math.max(Math.abs(nx - r.x), Math.abs(ny - r.y));
+                if (c > this._drag.maxCorrection)
+                    this._drag.maxCorrection = c;
+                this._correcting = true;
+                try {
+                    win.move_frame(true, nx, ny);
+                } finally {
+                    this._correcting = false;
+                }
+                this._drag.corrected++;
+                if (this._debug && this._drag.corrected <= 4) {
+                    const a = win.get_frame_rect();
+                    log(`displayxr: corrected raw=(${r.x},${r.y}) -> (${nx},${ny}); frame now (${a.x},${a.y})`);
+                }
+            }
+
+            /*
+             * What the stage actually PAINTED, per frame, during a drag: the
+             * window actor's position (which is what is drawn), converted to the
+             * frame origin and checked against the table. A raw, uncorrected
+             * position reaching the screen shows up here as paintedOff.
+             */
+            auditPaint() {
+                for (const [win, t] of this._tables) {
+                    if (!t.grabbing)
+                        continue;
+                    const actor = win.get_compositor_private();
+                    if (!actor)
+                        continue;
+                    const [ax, ay] = actor.get_position();
+                    const f = win.get_frame_rect(), b = win.get_buffer_rect();
+                    const px = Math.round(ax + (f.x - b.x)), py = Math.round(ay + (f.y - b.y));
+                    const key = `${px - t.startX},${py - t.startY}`;
+                    if (t.members.has(key)) {
+                        this._drag.paintedOn++;
+                    } else {
+                        this._drag.paintedOff++;
+                        if (this._drag.offSamples.length < 5)
+                            this._drag.offSamples.push(`(${px - t.startX},${py - t.startY})`);
+                    }
+                }
+            }
+
+            //! Is a drag with a table in progress (so the audit is worth running)?
+            anyGrabbing() {
+                for (const t of this._tables.values()) {
+                    if (t.grabbing)
+                        return true;
+                }
+                return false;
             }
 
             set(win, pid, extend, cell, bounds, dxs, dys) {
-                if (!HAVE_EXTERNAL_CONSTRAINT || !win || dxs.length !== dys.length || cell < 1)
+                // The correction path needs no Meta.ExternalConstraint (it moves
+                // the window with move_frame), so it works on any shell.
+                if (!win || dxs.length !== dys.length || cell < 1)
                     return false;
                 const prev = this._tables.get(win);
                 // A replacement (extend) keeps the drag's origin — the
@@ -589,15 +707,38 @@
                         buckets.set(key, b = []);
                     b.push(dxs[i], dys[i]);
                 }
+                const members = new Set();
+                for (let i = 0; i < dxs.length; i++)
+                    members.add(`${dxs[i]},${dys[i]}`);
                 this._tables.set(win, {
-                    pid, startX, startY, cell, buckets,
+                    pid, startX, startY, cell, buckets, members,
                     minDx: bounds[0], minDy: bounds[1], maxDx: bounds[2], maxDy: bounds[3],
                     asked: false,
                     grabbing: prev?.grabbing ?? false,
-                    expiresUs: GLib.get_monotonic_time() + LATTICE_PRE_GRAB_US,
+                    expiresUs: GLib.get_monotonic_time() +
+                        (LATTICE_TEST ? 120 * 1000 * 1000 : LATTICE_PRE_GRAB_US),
                     entries: dxs.length,
                 });
-                if (!this._constraints.has(win)) {
+                if (LATTICE_TEST) {
+                    // Test mode: audit paints from the moment the table lands,
+                    // so a programmatic move (a MOVE through the same
+                    // move_resize path a grab uses) is measured without any
+                    // virtual input, and report after a second.
+                    this._tables.get(win).grabbing = true;
+                    GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1500, () => {
+                        const d = this._drag;
+                        log(`displayxr: TEST audit — ${d.moves} move(s), ${d.corrected} corrected ` +
+                            `(largest ${d.maxCorrection} px); PAINTED on-lattice ${d.paintedOn}, ` +
+                            `OFF-lattice ${d.paintedOff}` +
+                            `${d.offSamples.length ? ` e.g. ${d.offSamples.join(' ')}` : ''}`);
+                        return GLib.SOURCE_REMOVE;
+                    });
+                }
+                if (!this._posHandlers.has(win)) {
+                    this._posHandlers.set(win,
+                        win.connect('position-changed', () => this._onPositionChanged(win)));
+                }
+                if (LATTICE_USE_CONSTRAINT && HAVE_EXTERNAL_CONSTRAINT && !this._constraints.has(win)) {
                     const c = new DragLatticeConstraint();
                     c._lattice = this;
                     win.add_external_constraint(c);
@@ -628,16 +769,28 @@
             onGrabEnd(win) {
                 if (win && this._tables.has(win)) {
                     if (this._debug) {
-                        const s = this._stats;
-                        log(`displayxr: drag lattice done — ${s.constrained} proposal(s), ${s.snapped} ` +
-                            `snapped, ${s.misses} outside coverage; new_rect edits ${s.propagate}`);
+                        const d = this._drag;
+                        log(`displayxr: drag lattice done — ${d.moves} compositor move(s), ${d.corrected} ` +
+                            `corrected (largest ${d.maxCorrection} logical px), ${this._stats.misses} outside ` +
+                            `coverage; PAINTED on-lattice ${d.paintedOn} frame(s), OFF-lattice ` +
+                            `${d.paintedOff}${d.offSamples.length ? ` e.g. ${d.offSamples.join(' ')}` : ''}`);
                     }
                     this._tables.delete(win);
+                    this._resetDragStats();
                 }
             }
 
             forget(win) {
                 this._tables.delete(win);
+                const h = this._posHandlers.get(win);
+                if (h) {
+                    try {
+                        win.disconnect(h);
+                    } catch (e) {
+                        // the window is already gone
+                    }
+                    this._posHandlers.delete(win);
+                }
                 const c = this._constraints.get(win);
                 if (c) {
                     c._lattice = null;
@@ -651,8 +804,15 @@
             }
 
             destroy() {
-                for (const win of [...this._constraints.keys()])
+                for (const win of new Set([...this._constraints.keys(), ...this._posHandlers.keys()]))
                     this.forget(win);
+            }
+
+            //! The window a test drag should act on: the one holding a table.
+            anyTableWindow() {
+                for (const win of this._tables.keys())
+                    return win;
+                return null;
             }
 
             _nearest(t, dx, dy) {
@@ -779,6 +939,12 @@
                     this._dbus.emit_signal('DragLatticeNeeded',
                         new GLib.Variant('(uii)', [pid >>> 0, Math.round(dx), Math.round(dy)]));
                 }
+            }
+
+            //! Per-frame paint audit, forwarded by the service's stage hook.
+            auditPaint() {
+                if (this._lattice?.anyGrabbing())
+                    this._lattice.auditPaint();
             }
 
             GetPlacementCapabilities() {
@@ -937,9 +1103,21 @@
 
                 for (const actor of global.get_window_actors())
                     this._trackWindow(actor.meta_window);
+
+                // Drag-lattice paint audit (debug builds of a drag only): what
+                // each frame actually shows, checked against the table. Cheap —
+                // it returns at once unless a drag with a table is in progress.
+                if (GLib.getenv('DISPLAYXR_DEBUG') === '1') {
+                    this._auditId = global.stage.connect('after-paint',
+                        () => this._placement?.auditPaint());
+                }
             }
 
             disable() {
+                if (this._auditId) {
+                    global.stage.disconnect(this._auditId);
+                    this._auditId = 0;
+                }
                 for (const [win, ids] of this._windowSignals)
                     for (const id of ids)
                         win.disconnect(id);

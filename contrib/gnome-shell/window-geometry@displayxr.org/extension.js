@@ -15,6 +15,7 @@ import GObject from 'gi://GObject';
 import Meta from 'gi://Meta';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
+import Graphene from 'gi://Graphene';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 // Side-effect import: defines globalThis.displayxrWindowGeometry. `lib.js`
@@ -23,7 +24,7 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import './lib.js';
 
 const {WindowGeometryService} =
-    globalThis.displayxrWindowGeometry.build({Clutter, GObject, Meta, Gio, GLib});
+    globalThis.displayxrWindowGeometry.build({Clutter, GObject, Meta, Gio, GLib, Graphene});
 
 export default class WindowGeometryExtension extends Extension {
     enable() {
