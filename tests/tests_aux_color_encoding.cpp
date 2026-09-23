@@ -114,6 +114,80 @@ TEST_CASE("u_color_compose_fast_path — the truth table")
 	}
 }
 
+TEST_CASE("u_color_atlas_holds_encoded — what the RUNTIME did, not the app's format")
+{
+	const bool hatch_off = false;
+	const bool hatch_on = true;
+	const bool composed = true;
+	const bool passthrough = false;
+
+	SECTION("a composing frame lands on encoded bytes whatever the source was")
+	{
+		// THE #1610 shell case: two UNORM (scene-linear) clients each
+		// composed through the private `_SRGB`-view target. The hardware
+		// applied the OETF on write, so both atlases hold display-referred
+		// bytes and the combine pass's decode is matched. Answering
+		// `false` here — which is what asking the app's format does — let
+		// those encoded bytes pass as linear: a stop too bright.
+		CHECK(u_color_atlas_holds_encoded(/*source_is_srgb=*/false, composed, hatch_off));
+		CHECK(u_color_atlas_holds_encoded(/*source_is_srgb=*/true, composed, hatch_off));
+	}
+
+	SECTION("a passthrough write is encoded exactly when its source was")
+	{
+		// The fast path (raw copy of an honest `_SRGB` source) and the
+		// zones composite: the runtime moved the bytes without touching
+		// them, so the source's format IS what it did.
+		CHECK(u_color_atlas_holds_encoded(/*source_is_srgb=*/true, passthrough, hatch_off));
+		CHECK_FALSE(u_color_atlas_holds_encoded(/*source_is_srgb=*/false, passthrough, hatch_off));
+	}
+
+	SECTION("a compose target that failed to allocate is not a compose")
+	{
+		// Asked of the RTV that was actually bound: with no private
+		// target the writes went to the atlas unencoded, and claiming
+		// otherwise would make the combine decode bytes nobody encoded.
+		CHECK_FALSE(u_color_atlas_holds_encoded(/*source_is_srgb=*/false, passthrough, hatch_off));
+	}
+
+	SECTION("the hatch answers the pre-#1589 question verbatim")
+	{
+		// Nothing composes under the rollback, so the answer is the
+		// source's format — and stays that even if a caller passed a
+		// stale compose flag.
+		CHECK(u_color_atlas_holds_encoded(/*source_is_srgb=*/true, passthrough, hatch_on));
+		CHECK_FALSE(u_color_atlas_holds_encoded(/*source_is_srgb=*/false, passthrough, hatch_on));
+		CHECK_FALSE(u_color_atlas_holds_encoded(/*source_is_srgb=*/false, composed, hatch_on));
+	}
+
+	SECTION("it agrees with the fast-path predicate on every frame shape")
+	{
+		// The two decisions are one design: a frame that takes the fast
+		// path wrote through no target, so its atlas is encoded iff the
+		// source was; a frame that does not take it composed, so its
+		// atlas is encoded either way. Walk the truth table of
+		// u_color_compose_fast_path and assert the pair is consistent.
+		for (int layers = 0; layers <= 3; layers++) {
+			for (int proj = 0; proj <= 1; proj++) {
+				for (int srgb = 0; srgb <= 1; srgb++) {
+					const bool fast = u_color_compose_fast_path(hatch_off, (uint32_t)layers,
+					                                            proj != 0, srgb != 0);
+					const bool encoded =
+					    u_color_atlas_holds_encoded(srgb != 0, /*composed=*/!fast, hatch_off);
+					// A composing frame is ALWAYS encoded; a
+					// fast-path frame only when honest.
+					CHECK(encoded == (!fast || srgb != 0));
+					// And the fast path is never reached with a
+					// linear source left unencoded.
+					if (fast) {
+						CHECK(srgb != 0);
+					}
+				}
+			}
+		}
+	}
+}
+
 TEST_CASE("DXR_COLOR_LEGACY_UNORM_ENCODED is OFF by default")
 {
 	// The flip is the default; the hatch is opt-in. ctest runs with a clean

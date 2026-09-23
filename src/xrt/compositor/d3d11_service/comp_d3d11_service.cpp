@@ -448,10 +448,11 @@ struct d3d11_client_render_resources
 	wil::com_ptr<ID3D11Texture2D> atlas_texture;
 	wil::com_ptr<ID3D11ShaderResourceView> atlas_srv;
 	//! Parallel SRV that reinterprets the (UNORM) atlas storage as SRGB-typed
-	//! so sampling auto-linearizes. Used by multi_compositor_render when the
-	//! client submitted an SRGB swapchain (its swapchain bytes are gamma-
-	//! encoded, and raw-copied into atlas_texture verbatim — sampling them
-	//! through this SRV is what produces the linear values the DP expects).
+	//! so sampling auto-linearizes. NOT used by the combine pass any more:
+	//! #1591 removed the last unmatched hardware decode, and ADR-021 Model B
+	//! does its decode in the blit shader (b1) over the whole pass instead, so
+	//! multi_compositor_render always samples the raw @ref atlas_srv. Kept
+	//! built for a caller that wants a decoding view of the atlas.
 	//! Lazy-created on first use; reset whenever atlas_texture is recreated.
 	wil::com_ptr<ID3D11ShaderResourceView> atlas_srv_srgb;
 	wil::com_ptr<ID3D11RenderTargetView> atlas_rtv;
@@ -975,12 +976,25 @@ struct d3d11_service_compositor
 	//! True if the client's atlas content is Y-flipped (GL clients)
 	bool atlas_flip_y;
 
-	//! True if the client's most-recent swapchain submission used an SRGB
-	//! format. Atlas storage is always UNORM, but raw-copy preserves the
-	//! source bytes verbatim — so when this is true, the bytes in the atlas
-	//! are gamma-encoded and need to be linearized on sample by reading
-	//! through render.atlas_srv_srgb. When false, the bytes are already
-	//! linear (UNORM swapchain) and the default UNORM atlas_srv is correct.
+	//! True when the bytes now sitting in this client's atlas are gamma-encoded
+	//! (display-referred); false when they are scene-linear.
+	//!
+	//! #1665: this records what the RUNTIME DID to the bytes, never the app's
+	//! swapchain format. The two coincide only on a passthrough write (the raw
+	//! copy / non-decoding blit of the fast path, and the zones composite),
+	//! where the atlas ends up encoded exactly when the source was. A COMPOSING
+	//! commit breaks the coincidence: it writes through the private `_SRGB`-view
+	//! target (@ref d3d11_client_render_resources::compose_texture), so the
+	//! hardware applies the OETF on write and the atlas holds ENCODED bytes
+	//! whatever the source format — a UNORM (scene-linear) client included.
+	//! Written through @ref u_color_atlas_holds_encoded at every site, so there
+	//! is one rule rather than one per write path.
+	//!
+	//! Read by multi_compositor_render: the combine pass always samples the raw
+	//! UNORM `atlas_srv` and does its decode in the shader (b1), so this flag is
+	//! what says whether that decode is MATCHED. Deciding it by the app's format
+	//! made two UNORM clients under the shell compose in encoded space and reach
+	//! the panel a stop too bright (#1610).
 	bool atlas_holds_srgb_bytes;
 
 	//! Accumulated layers for the current frame
@@ -6514,9 +6528,10 @@ init_client_render_resources(struct d3d11_service_system *sys,
 		sys->device->CreateShaderResourceView(
 		    res->atlas_texture.get(), &unorm_srv_desc, res->atlas_srv.put());
 
-		// Parallel SRGB SRV — for gamma-encoded-byte content. Selected
-		// at sample time by multi_compositor_render based on the
-		// per-client `atlas_holds_srgb_bytes` flag.
+		// Parallel SRGB SRV — a decoding view of the same storage. The
+		// combine pass does NOT select it (it samples raw and decodes in
+		// the shader under Model B); `atlas_holds_srgb_bytes` says
+		// whether that shader decode is matched, not which SRV to bind.
 		D3D11_SHADER_RESOURCE_VIEW_DESC srgb_srv_desc = {};
 		srgb_srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
 		srgb_srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
@@ -14974,8 +14989,10 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		}
 		enum xrt_dp_color_capability cap0 =
 		    xrt_display_processor_d3d11_get_handoff_color_capability(mc->display_processor);
-		// Must mirror the compose_linear gate below (incl. the all-honest-sRGB
-		// requirement) so the backdrop matches the atlas encoding the DP receives.
+		// Must mirror the compose_linear gate below (incl. the requirement that
+		// every placed client's atlas holds ENCODED bytes — #1665: what the
+		// runtime did, not the app's format) so the backdrop matches the atlas
+		// encoding the DP receives.
 		const bool clear_linear = (cap0 == XRT_DP_COLOR_LINEAR || cap0 == XRT_DP_COLOR_EITHER) &&
 		                          placed_count > 1 && placed_srgb == placed_count;
 		const float bg = clear_linear ? 0.01034f : 0.102f; // #1a1a1a (linear vs encoded)
@@ -15259,15 +15276,23 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	    (dp_color_cap == XRT_DP_COLOR_LINEAR || dp_color_cap == XRT_DP_COLOR_EITHER);
 	// Model B engages only when the DP accepts a linear handoff, more than one
 	// layer composites (a single opaque layer is pure passthrough = A), AND every
-	// contributing client is genuinely sRGB-format. The blit shader's b1-gated
-	// srgb_to_linear (applied to client content + runtime chrome alike) is a
-	// *matched* decode only when the client content really is display-referred —
-	// which we can only trust from an honest sRGB swapchain. A UNORM swapchain is
-	// ambiguous: it may hold encoded bytes (our test cubes) OR already-linear
-	// bytes (the VK demos), and decoding the latter over-darkens it. So UNORM
-	// clients stay on Model A passthrough (always correct), and Model B is
-	// confined to honest-sRGB content where the decode→linear-blend→DP-encode
-	// round-trip is provably right (ADR-021 §6: format is the source of truth).
+	// contributing client's atlas HOLDS ENCODED BYTES. The blit shader's b1-gated
+	// srgb_to_linear is applied to the whole pass (client content + runtime
+	// chrome alike), so it is a *matched* decode only if every source it reads is
+	// display-referred; one linear-holding atlas in the set would be
+	// over-darkened, which is why this is an all-or-nothing count and not a
+	// per-client choice.
+	//
+	// #1665/#1610: the count is over `atlas_holds_srgb_bytes`, which since the
+	// private compose target landed records what the RUNTIME DID, not the app's
+	// swapchain format — a UNORM (scene-linear) client that composed through the
+	// `_SRGB`-view target holds encoded bytes and COUNTS. Reading the app's
+	// format here instead kept two such clients on Model A, blending them in
+	// encoded space and passing the encoded bytes on as linear. The gate itself
+	// is deliberately NOT widened to "any two clients": an atlas that genuinely
+	// holds linear bytes still exists (a pure-zones UNORM commit, and every
+	// client under DXR_COLOR_LEGACY_UNORM_ENCODED=1), and Model B would
+	// double-decode it.
 	int honest_srgb_count = 0;
 	for (int ri = 0; ri < render_count; ri++) {
 		struct d3d11_service_compositor *cc_b = mc->clients[render_order[ri]].compositor;
@@ -17837,9 +17862,22 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 				sc->images[img].texture->GetDesc(&sd);
 				// Mixed frames keep the projection layer's flag — it owns
 				// the bulk of the atlas bytes.
+				//
+				// #1665: the same "what the runtime DID" rule as the
+				// projection stamp, through the same helper. A pure-zones
+				// commit never reaches the compose decision (it lives on
+				// the projection write path — the known gap), so
+				// `active_write_rtv` is null here today and the answer is
+				// the source's format, which is correct BECAUSE this write
+				// is a passthrough: zones sample raw (#1591) and the
+				// composite goes to the atlas RTV. Written this way so
+				// wiring the gap up cannot leave the flag lying.
 				if (!src_format_recorded && !projection_rendered) {
 					src_format_recorded = true;
-					c->atlas_holds_srgb_bytes = is_srgb_format(sd.Format);
+					c->atlas_holds_srgb_bytes = u_color_atlas_holds_encoded(
+					    is_srgb_format(sd.Format),
+					    /*composed_through_srgb_target=*/c->render.active_write_rtv != nullptr,
+					    u_color_legacy_unorm_encoded());
 				}
 				// ADR-032 (#225): a LAYERED (arraySize>1) zone source packs
 				// its eyes as array slices — the SPI render path the Unity
@@ -21251,13 +21289,27 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		}
 		content_dims_painted = true; // #1140: these dims describe real pixels
 
-		// Track whether the bytes the raw-copy just placed in the atlas are
-		// gamma-encoded (SRGB swapchain) or linear (UNORM swapchain).
-		// multi_compositor_render uses this to pick atlas_srv vs
-		// atlas_srv_srgb when sampling, so the DP receives linear bytes
-		// regardless of the source swapchain's color-space. Eyes within a
-		// projection layer share a swapchain format in practice; pick view 0.
-		c->atlas_holds_srgb_bytes = view_is_srgb[0];
+		// What did this commit DO to the bytes now in the atlas? (#1665)
+		//
+		// A passthrough write (the fast path's raw copy, or the non-decoding
+		// shader blit) leaves them encoded exactly when the source was. A
+		// COMPOSING commit wrote them through the private `_SRGB`-view target,
+		// so the hardware encoded them on write and they are display-referred
+		// whatever the source format — which is why the app's format is the
+		// wrong thing to ask. Asked of `active_write_rtv` rather than of the
+		// fast-path predicate, so a compose target that failed to allocate
+		// (writes went straight to the atlas, unencoded) answers honestly.
+		//
+		// multi_compositor_render's combine pass always samples the raw
+		// `atlas_srv` and decodes in the shader (b1, whole-pass), so this flag
+		// is what decides whether that decode is matched — and the ADR-021
+		// Model-A/B gate is that decision counted over the placed clients.
+		// Eyes within a projection layer share a swapchain format in practice;
+		// pick view 0.
+		c->atlas_holds_srgb_bytes =
+		    u_color_atlas_holds_encoded(view_is_srgb[0],
+		                                /*composed_through_srgb_target=*/c->render.active_write_rtv != nullptr,
+		                                u_color_legacy_unorm_encoded());
 
 		// Store content dims on multi-comp slot for multi_compositor_render
 		// (readiness gate + per-slot stride snapshot — see the helper).

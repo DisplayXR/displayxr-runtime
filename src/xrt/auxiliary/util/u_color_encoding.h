@@ -157,6 +157,46 @@ u_color_compose_fast_path(bool legacy_hatch,
 }
 
 /*!
+ * Does the composite this frame produced hold ENCODED (display-referred) bytes?
+ *
+ * The companion to @ref u_color_compose_fast_path, and the rule #1665 states:
+ * a flag that describes bytes must record what the RUNTIME DID to them, never
+ * what format the app asked for. Both inputs are facts about the just-finished
+ * write:
+ *
+ *   - `composed_through_srgb_target` — the frame went through the private
+ *     `_SRGB`-view compose target, so the hardware applied the OETF on write
+ *     and the result is encoded NO MATTER what the source format was. This is
+ *     the case the app's format gets wrong: a UNORM (scene-linear) source
+ *     composed this way lands on encoded bytes, and a consumer that decides by
+ *     the source format reads them as linear — a stop too bright (#1610, the
+ *     shell combine pass over two UNORM clients).
+ *   - `source_is_srgb` — no compose target ran, so the write was a passthrough
+ *     (a raw copy, or a shader blit sampling and emitting the same bytes) and
+ *     the result is encoded exactly when the source was.
+ *
+ * Under the hatch nothing ever composes, so the answer is the pre-#1589 one
+ * verbatim: the source's format. That is the rollback's whole promise.
+ *
+ * @param source_is_srgb  The source swapchain this frame read is `*_SRGB`.
+ * @param composed_through_srgb_target  The frame's writes landed in the
+ *                                      private `_SRGB`-view compose target
+ *                                      (asked of the target that was actually
+ *                                      bound, so a target that failed to
+ *                                      allocate answers false — correctly, its
+ *                                      writes went to the atlas unencoded).
+ * @param legacy_hatch    @ref u_color_legacy_unorm_encoded.
+ */
+static inline bool
+u_color_atlas_holds_encoded(bool source_is_srgb, bool composed_through_srgb_target, bool legacy_hatch)
+{
+	if (legacy_hatch) {
+		return source_is_srgb;
+	}
+	return composed_through_srgb_target || source_is_srgb;
+}
+
+/*!
  * One WARN per component at init, stating the hatch state either way.
  *
  * Logged unconditionally (not only when the hatch is on) because it is the
