@@ -16,7 +16,33 @@
 
 #pragma once
 
+#include "xrt/xrt_config_os.h"
+#include "xrt/xrt_config_build.h"
 #include "xrt/xrt_compositor.h"
+
+
+/*!
+ * @def COMP_MULTI_HAVE_WEAVE
+ * Defined when this build carries a comp_multi XR_DXR_weave engine — the
+ * `comp_multi_weave_*` entry points declared in comp_multi_private.h, called
+ * from the IPC server's weave handlers exactly where the Windows build calls
+ * `comp_d3d11_service_weave_*`.
+ *
+ * The ONE compile-time gate for that question: comp_multi's declarations and
+ * teardown, and every weave fence in src/xrt/ipc/, key on it, so the engine's
+ * callers and its implementation cannot disagree about whether it exists.
+ *
+ * - macOS: comp_multi_weave_macos.c (IOSurface, #759).
+ * - Android: comp_multi_weave_android.c (AHardwareBuffer, #1036).
+ * - Desktop Linux: comp_multi_weave_linux.c (dma-buf fd, #1699 piece R2),
+ *   opt-in via XRT_FEATURE_COMP_MULTI_WEAVE_LINUX until that engine lands.
+ *   `XRT_OS_LINUX && !XRT_OS_ANDROID` is the XRT_OS_LINUX_DESKTOP condition
+ *   spelled out until that macro is defined globally in xrt_config_os.h (#1702).
+ */
+#if defined(XRT_OS_MACOS) || defined(XRT_OS_ANDROID) ||                                                                \
+    (defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID) && defined(XRT_FEATURE_COMP_MULTI_WEAVE_LINUX))
+#define COMP_MULTI_HAVE_WEAVE
+#endif
 
 
 #ifdef __cplusplus

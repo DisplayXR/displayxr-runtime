@@ -1406,9 +1406,9 @@ multi_compositor_destroy(struct xrt_compositor *xc)
 	// compositor pointer never inherits a stale entry / dangling swapchain ref.
 	comp_multi_workspace_chrome_clear(xc);
 
-#if defined(XRT_OS_MACOS) || defined(XRT_OS_ANDROID)
-	// XR_DXR_weave present-owner resources (#759 macOS / #1036 Android) — no-op
-	// if this client never used the weave service.
+#ifdef COMP_MULTI_HAVE_WEAVE
+	// XR_DXR_weave present-owner resources (#759 macOS / #1036 Android /
+	// #1699 desktop Linux) — no-op if this client never used the weave service.
 	comp_multi_weave_fini(mc);
 #endif
 
