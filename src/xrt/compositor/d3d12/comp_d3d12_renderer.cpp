@@ -594,6 +594,33 @@ get_color_scale_bias(const struct xrt_layer_data *data, float color_scale[4], fl
 
 
 /*!
+ * The blit PSO that implements one shared blend mode (#1598/#1599) for a
+ * FULL-TILE projection-class draw.
+ *
+ * REPLACE and OPAQUE_COVER share @c blit_pso — blending DISABLED, write mask
+ * ALL — and in every other backend they differ in the ALPHA THE PIXEL SHADER
+ * EMITS. Not here: the blit shader has no colour-scale/bias channel to fold
+ * comp_layer_blend_fold_opaque_cover()'s alpha-of-one into, so OPAQUE_COVER
+ * degrades to the verbatim cover it shares colour with. That is the same
+ * documented deviation the D3D11 SERVICE's projection pass carries (see KNOWN
+ * DEVIATIONS in comp_layer_view_camera.h), and it is visible only as atlas
+ * ALPHA, in a transparent session, on a frame carrying two or more projection
+ * layers — never on a single-projection frame, where the mode is REPLACE.
+ */
+static ID3D12PipelineState *
+blit_pso_for(struct comp_d3d12_renderer *r, enum comp_layer_blend_mode mode)
+{
+	switch (mode) {
+	case COMP_LAYER_BLEND_PREMULTIPLIED: return r->blit_pso_premul;
+	case COMP_LAYER_BLEND_STRAIGHT: return r->blit_pso_alpha;
+	case COMP_LAYER_BLEND_REPLACE:
+	case COMP_LAYER_BLEND_OPAQUE_COVER:
+	default: return r->blit_pso;
+	}
+}
+
+
+/*!
  * Render a window-space layer onto the atlas for a given view.
  * Ported from D3D11's render_window_space_layer().
  */
@@ -1547,6 +1574,18 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 		                                   have_wm ? canvas->window_height_m : 0.0f, &cameras[view]);
 	}
 
+	/*
+	 * #1598 — painter's order WITHIN each tile. The loop below already walks
+	 * the layers in SUBMISSION order (comp_layer_accum is append-only and
+	 * nothing sorts it), and because the views are the INNER loop each tile
+	 * still sees the layers in that same order — the identical per-tile
+	 * sequence the D3D11 leg's views-outer loop produces. What was missing
+	 * is that every projection layer was blitted with blending OFF, so layer
+	 * N+1 simply erased layer N. This tracks whether anything has landed in
+	 * a tile yet, which is the ONLY thing the first-layer rule needs to know.
+	 */
+	struct comp_layer_tile_state tiles[XRT_MAX_VIEWS] = {};
+
 	// For each projection / zone layer, stretch-blit swapchain images into
 	// atlas tiles (zone layers land at the zone rect scaled into the tile
 	// box — XR_DXR_display_zones; alpha-over in layer-list order falls out
@@ -1563,6 +1602,35 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 		uint32_t layer_view_count = layer->data.view_count;
 
 		for (uint32_t vi = 0; vi < layer_view_count && vi < view_count; vi++) {
+			/*
+			 * #1598: resolved BEFORE the swapchain lookups below, so
+			 * the mark is EAGER — a projection layer that fails to
+			 * draw (null swapchain) still counts as the tile's base,
+			 * which keeps "which layer is the base" a pure function
+			 * of the layer LIST rather than of a transient swapchain
+			 * hiccup. Only the views this layer actually covers are
+			 * marked; a tile no view of this layer reaches has had
+			 * nothing composited into it.
+			 *
+			 * FIRST into the tile => REPLACE, whatever the flags say
+			 * (the #225 compose-under contract — see
+			 * comp_layer_tile_blend_mode). Every LATER projection
+			 * layer takes its own flags.
+			 *
+			 * A ZONE takes neither, and is marked further down instead
+			 * (after its rect is known to be non-degenerate, as on the
+			 * D3D11 leg): it paints a SUB-RECT of the tile, so it can
+			 * never be the tile's base cover, and ADR-027 keeps it
+			 * alpha-over in list order regardless of flags (an
+			 * unflagged zone must stay PREMULTIPLIED so its texture
+			 * alpha survives).
+			 */
+			struct comp_layer_tile_state *tile = vi < XRT_MAX_VIEWS ? &tiles[vi] : nullptr;
+			enum comp_layer_blend_mode proj_mode = COMP_LAYER_BLEND_REPLACE;
+			if (!is_zone) {
+				proj_mode = comp_layer_tile_blend_mode(tile, layer->data.flags);
+			}
+
 			struct xrt_swapchain *xsc = layer->sc_array[vi];
 			if (xsc == nullptr) {
 				continue;
@@ -1751,11 +1819,27 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 					cmd_list->ResourceBarrier(1, &src_barrier);
 					continue;
 				}
+				// #1598: a zone MARKS the tile, so a projection layer
+				// submitted after it blends over it rather than
+				// erasing it — but it never consumes the base slot.
+				comp_layer_tile_mark_composited(tile);
 				const bool unpremul =
 				    (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0;
 				cmd_list->SetPipelineState(unpremul ? renderer->blit_pso_alpha
 				                                    : renderer->blit_pso_premul);
 			}
+
+			// #1598: a LATER projection layer blends over what the tile
+			// already holds instead of erasing it. Bound only when the
+			// mode is not the default REPLACE state, so the
+			// single-projection-layer frame every shipping app submits
+			// records the exact same command sequence as before.
+			ID3D12PipelineState *proj_pso = is_zone ? nullptr : blit_pso_for(renderer, proj_mode);
+			const bool proj_pso_bound = proj_pso != nullptr && proj_pso != renderer->blit_pso;
+			if (proj_pso_bound) {
+				cmd_list->SetPipelineState(proj_pso);
+			}
+
 			cmd_list->RSSetViewports(1, &vp);
 
 			D3D12_RECT scissor = {};
@@ -1790,9 +1874,10 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 			// effective grid), so there is no second tile to fill. The DP
 			// weaves or flattens whatever arrives per its own mode_3d.
 
-			// XR_DXR_display_zones: restore the REPLACE blit PSO for the
-			// next (projection) draw.
-			if (is_zone) {
+			// XR_DXR_display_zones / #1598: restore the REPLACE blit PSO
+			// for the next draw, so every iteration starts from the same
+			// bound state this pass set up before the loop.
+			if (is_zone || proj_pso_bound) {
 				cmd_list->SetPipelineState(renderer->blit_pso);
 			}
 
