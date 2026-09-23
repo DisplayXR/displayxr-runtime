@@ -495,6 +495,25 @@ struct d3d11_client_render_resources
 	 */
 	bool compose_was_active;
 
+	/*!
+	 * #1610 — does the private target still mirror the atlas OUTSIDE whatever
+	 * this frame paints?
+	 *
+	 * The publish is a per-tile `CopySubresourceRegion` over the painted boxes
+	 * whenever the commit's only painter was the projection layer (the shipping
+	 * shell frame): 2x1280x720 instead of a whole 3840x2160 `CopyResource`, i.e.
+	 * ~66 MB/commit/client of copy bandwidth that the render thread was
+	 * competing with — the measured cause of `atlas_contention` going 0 → 14 per
+	 * 10 s window against `main` on the two-client shell leg.
+	 *
+	 * The cost of a region publish is that the two textures then DIVERGE outside
+	 * those boxes, so a later whole-atlas publish (a zones / UI / multi-
+	 * projection commit, which can paint anywhere) would push the private
+	 * target's stale elsewhere back over the atlas. This flag records the
+	 * divergence; such a commit re-seeds first. false ⟹ re-seed before painting.
+	 */
+	bool compose_mirrors_atlas;
+
 	//! Standalone atlas-clear bookkeeping. The per-commit clear-to-black is
 	//! only safe when every slot is guaranteed to be re-blitted this frame —
 	//! and it is NOT: the fence / KeyedMutex paths deliberately skip a view's
@@ -1484,6 +1503,29 @@ struct d3d11_service_system
 	//! (arraySize>1) swapchain — samples the requested eye's array slice.
 	//! Non-fatal if compilation fails (layered clients fall back to slice 0).
 	wil::com_ptr<ID3D11PixelShader> blit_ps_array;
+	/*!
+	 * #1610: the `DXR_COMPOSE_PASSTHROUGH` twins of @ref blit_ps /
+	 * @ref blit_ps_array. Identical but for `oetf_out()`, which is the identity
+	 * — a blit into a client's private compose target must emit its sample raw
+	 * because that target's `_SRGB` RTV applies the one conversion on write.
+	 *
+	 * A VARIANT rather than a cbuffer flag, and that is the whole point: those
+	 * draws run on a client's IPC thread while `multi_compositor_render`'s
+	 * combine pass runs on the render thread, on the same immediate context and
+	 * with no mutex between them. Any cbuffer register the client binds is
+	 * STICKY — it survives into every later draw of the render thread's pass, so
+	 * one interleave (which is exactly what `[RENDER] atlas_contention` counts)
+	 * silently disabled the Model-B decode for the REST of that pass and put
+	 * encoded bytes into the linear combined atlas: a ~10x-too-bright, white
+	 * flash at the contention rate. The combine pass already re-states
+	 * `PSSetShader` per draw, so putting the decision in the shader object makes
+	 * it per-draw by construction and unable to leak.
+	 *
+	 * Missing (compile failure) ⟹ the client simply never composes; see
+	 * @ref client_ensure_compose_target. Never fall back to the decoding twin.
+	 */
+	wil::com_ptr<ID3D11PixelShader> blit_ps_compose;
+	wil::com_ptr<ID3D11PixelShader> blit_ps_array_compose;
 	//! #308: premultiplied box-blur variant of blit_ps. Used only for the
 	//! empty-state splash logo while it's pushed behind the launcher band, to
 	//! give it depth-of-field. Blur radius (UV) comes from glow_falloff.
@@ -1495,24 +1537,6 @@ struct d3d11_service_system
 	//! every blit output to emit scene-linear (so content + chrome all reach the
 	//! DP linear). Bound once per frame; left at 0 for Model A.
 	wil::com_ptr<ID3D11Buffer> color_linearize_cb;
-
-	/*!
-	 * #1610: two IMMUTABLE 16-byte cbuffers for PS register b2, carrying 1.0
-	 * and 0.0 of `g_compose_passthrough`.
-	 *
-	 * A blit into the private compose target must emit its sample UNCHANGED:
-	 * the `_SRGB` RTV does the one conversion on write, so the shader must do
-	 * none — including the Model-B decode `color_linearize_cb` asks for at b1.
-	 * Those client blits run on an IPC thread and the combine pass runs on the
-	 * render thread, on the same immediate context and without a mutex
-	 * between them, so b1 cannot be relied on to say anything in particular
-	 * when a client draw executes. b2 is stated per draw instead.
-	 *
-	 * Immutable, so binding one is a pointer swap with no Map and no
-	 * cross-thread write to shared memory.
-	 */
-	wil::com_ptr<ID3D11Buffer> compose_passthrough_on_cb;
-	wil::com_ptr<ID3D11Buffer> compose_passthrough_off_cb;
 
 	//! Constant buffer for layer rendering
 	wil::com_ptr<ID3D11Buffer> layer_constant_buffer;
@@ -5299,6 +5323,40 @@ create_layer_shaders(struct d3d11_service_system *sys)
 		U_LOG_W("Failed to compile layered blit pixel shader (layered clients degrade)");
 	}
 
+	// #1610: the DXR_COMPOSE_PASSTHROUGH twins. Non-fatal — without them a
+	// client keeps the pre-#1610 encoded-space write path (see
+	// client_ensure_compose_target), which is wrong on colour but never wrong
+	// on threading. Compiled from the SAME sources, so the two can never drift.
+	{
+		const D3D_SHADER_MACRO compose_defines[] = {{"DXR_COMPOSE_PASSTHROUGH", "1"}, {nullptr, nullptr}};
+		hr = compile_shader(blit_ps_hlsl, "PSMain", "ps_5_0", &blob, compose_defines);
+		if (SUCCEEDED(hr)) {
+			hr = sys->device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+			                                    sys->blit_ps_compose.put());
+			blob->Release();
+			if (FAILED(hr)) {
+				U_LOG_W(
+				    "Failed to create compose blit pixel shader: 0x%08lx (clients stay on the "
+				    "pre-#1610 path)",
+				    hr);
+			}
+		} else {
+			U_LOG_W("Failed to compile compose blit pixel shader (clients stay on the pre-#1610 path)");
+		}
+
+		hr = compile_shader(blit_ps_array_hlsl, "PSMain", "ps_5_0", &blob, compose_defines);
+		if (SUCCEEDED(hr)) {
+			hr = sys->device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+			                                    sys->blit_ps_array_compose.put());
+			blob->Release();
+			if (FAILED(hr)) {
+				U_LOG_W("Failed to create layered compose blit pixel shader: 0x%08lx", hr);
+			}
+		} else {
+			U_LOG_W("Failed to compile layered compose blit pixel shader");
+		}
+	}
+
 	// #308: blur variant for the pushed-back empty-state splash (non-fatal).
 	hr = compile_shader(blit_blur_ps_hlsl, "PSMain", "ps_5_0", &blob);
 	if (SUCCEEDED(hr)) {
@@ -5367,27 +5425,6 @@ create_layer_resources(struct d3d11_service_system *sys)
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create color linearize constant buffer: 0x%08lx", hr);
 		return false;
-	}
-
-	// #1610: the two immutable b2 cbuffers. See the field doc for why the
-	// compose blit states this per draw instead of trusting b1.
-	{
-		const float on_data[4] = {1.0f, 0.0f, 0.0f, 0.0f};
-		const float off_data[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-		D3D11_BUFFER_DESC imm_desc = {};
-		imm_desc.ByteWidth = 16;
-		imm_desc.Usage = D3D11_USAGE_IMMUTABLE;
-		imm_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-		D3D11_SUBRESOURCE_DATA on_init = {on_data, 0, 0};
-		D3D11_SUBRESOURCE_DATA off_init = {off_data, 0, 0};
-		hr = sys->device->CreateBuffer(&imm_desc, &on_init, sys->compose_passthrough_on_cb.put());
-		if (SUCCEEDED(hr)) {
-			hr = sys->device->CreateBuffer(&imm_desc, &off_init, sys->compose_passthrough_off_cb.put());
-		}
-		if (FAILED(hr)) {
-			U_LOG_E("Failed to create compose-passthrough constant buffers: 0x%08lx", hr);
-			return false;
-		}
 	}
 
 	// Create linear sampler
@@ -5536,11 +5573,17 @@ client_write_rtv(struct d3d11_client_render_resources *res)
  * shader to encode with, an atlas family with no `_SRGB` member, or a
  * creation failure. Every one of those is "keep doing what we did before",
  * never a hard error.
+ *
+ * #1610: `blit_ps_compose` is a HARD precondition, not a fallback. Composing
+ * with the decoding twin would run the Model-B `srgb_to_linear` inside a draw
+ * whose `_SRGB` RTV then encodes — and, worse, would make the client's draws
+ * depend on a b1 the render thread owns. No compose shader ⟹ no composing.
  */
 static ID3D11RenderTargetView *
 client_ensure_compose_target(struct d3d11_service_system *sys, struct d3d11_client_render_resources *res)
 {
-	if (res->atlas_texture == nullptr || res->atlas_rtv == nullptr || !sys->blit_vs || !sys->blit_ps) {
+	if (res->atlas_texture == nullptr || res->atlas_rtv == nullptr || !sys->blit_vs || !sys->blit_ps ||
+	    !sys->blit_ps_compose) {
 		return nullptr;
 	}
 
@@ -5554,7 +5597,8 @@ client_ensure_compose_target(struct d3d11_service_system *sys, struct d3d11_clie
 
 	res->compose_rtv.reset();
 	res->compose_texture.reset();
-	res->compose_was_active = false; // force a re-seed from the atlas
+	res->compose_was_active = false;    // force a re-seed from the atlas
+	res->compose_mirrors_atlas = false; // a fresh allocation mirrors nothing
 
 	const DXGI_FORMAT typeless = d3d_dxgi_format_to_typeless_dxgi(atlas_desc.Format);
 	const DXGI_FORMAT srgb_rtv = d3d_dxgi_format_srgb_rtv(atlas_desc.Format);
@@ -5716,12 +5760,29 @@ blit_to_atlas_texture(struct d3d11_service_system *sys,
 
 	sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
 
+	/*
+	 * #1610: is this draw painting the client's PRIVATE compose target? If so it
+	 * must emit its sample raw — the target's `_SRGB` RTV applies the one
+	 * conversion on write — which is what the DXR_COMPOSE_PASSTHROUGH variant
+	 * does. Stated as a SHADER, not a cbuffer register: this runs on a client's
+	 * IPC thread, concurrently with the render thread's combine pass on the same
+	 * immediate context, and a register bound here would stay bound for the rest
+	 * of that pass (see the blit_ps_compose field doc).
+	 */
+	const bool compose_blit = rtv_override == nullptr && res->active_write_rtv != nullptr;
+
 	// Set up pipeline for blit. ADR-032: bind the Texture2DArray variant for
 	// LAYERED sources (falls back to the plain blit_ps if the array shader
 	// failed to compile — degrades to slice 0 rather than crashing).
-	bool use_array_ps = is_array && sys->blit_ps_array;
+	bool use_array_ps = is_array && (compose_blit ? (bool)sys->blit_ps_array_compose : (bool)sys->blit_ps_array);
+	ID3D11PixelShader *blit_ps_for_draw;
+	if (compose_blit) {
+		blit_ps_for_draw = use_array_ps ? sys->blit_ps_array_compose.get() : sys->blit_ps_compose.get();
+	} else {
+		blit_ps_for_draw = use_array_ps ? sys->blit_ps_array.get() : sys->blit_ps.get();
+	}
 	sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
-	sys->context->PSSetShader(use_array_ps ? sys->blit_ps_array.get() : sys->blit_ps.get(), nullptr, 0);
+	sys->context->PSSetShader(blit_ps_for_draw, nullptr, 0);
 	sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
 	sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
 	sys->context->PSSetShaderResources(0, 1, &src_srv);
@@ -5731,19 +5792,6 @@ blit_to_atlas_texture(struct d3d11_service_system *sys,
 	// #1610: without an explicit override this follows the commit's write RTV,
 	// which is the private compose target while composing.
 	ID3D11RenderTargetView *rtvs[] = {rtv_override != nullptr ? rtv_override : client_write_rtv(res)};
-
-	/*
-	 * #1610: state b2 for THIS draw. Writing into the compose target means
-	 * the `_SRGB` RTV applies the one conversion, so the shader must emit its
-	 * sample raw — including skipping the Model-B decode b1 may be asking
-	 * for, which the render thread set and this (IPC) thread cannot reason
-	 * about. Every other draw gets the OFF buffer, which is what an unbound
-	 * b2 already reads, so nothing else changes.
-	 */
-	const bool compose_blit = rtv_override == nullptr && res->active_write_rtv != nullptr;
-	sys->context->PSSetConstantBuffers(2, 1,
-	                                   compose_blit ? sys->compose_passthrough_on_cb.addressof()
-	                                                : sys->compose_passthrough_off_cb.addressof());
 	sys->context->OMSetRenderTargets(1, rtvs, nullptr);
 
 	// Viewport covers the full atlas (same dims as the NDC mapping above).
@@ -6328,6 +6376,7 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 	res->atlas_clear_signature = 0;
 	res->active_write_rtv = nullptr;
 	res->compose_was_active = false;
+	res->compose_mirrors_atlas = false;
 	res->compose_rtv.reset();
 	res->compose_texture.reset();
 	res->atlas_rtv.reset();
@@ -15333,10 +15382,11 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			sys->context->Unmap(sys->color_linearize_cb.get(), 0);
 		}
 		sys->context->PSSetConstantBuffers(1, 1, sys->color_linearize_cb.addressof());
-		// #1610: and b2 OFF for the whole pass — these draws DO want the
-		// Model-B decode. Stated rather than assumed, because a client's
-		// compose blit on an IPC thread may have left the ON buffer bound.
-		sys->context->PSSetConstantBuffers(2, 1, sys->compose_passthrough_off_cb.addressof());
+		// #1610: b1 is safe to state once per pass because NOTHING a client's
+		// IPC thread does touches it. The compose-passthrough decision is NOT a
+		// register for exactly that reason — it is a shader variant a client
+		// selects for its own draw (blit_ps_compose), so it cannot outlive that
+		// draw and poison the rest of this pass.
 	}
 
 	uint32_t dp_view_w = sys->view_width;
@@ -19615,6 +19665,10 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			float clear_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
 			sys->context->ClearRenderTargetView(c->render.atlas_rtv.get(), clear_color);
 			c->render.atlas_clear_signature = sig;
+			// #1610: this wrote the atlas behind the private compose target's
+			// back, so the target no longer mirrors it — a later whole-atlas
+			// publish must re-seed or it would undo this clear.
+			c->render.compose_mirrors_atlas = false;
 		}
 	}
 
@@ -20342,6 +20396,32 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	//! check. The first owns the tile's base; every later one is deferred.
 	uint32_t projection_layers_painted = 0;
 
+	/*!
+	 * @name #1610 — the publish region of a COMPOSING commit.
+	 *
+	 * A composing commit paints the runtime-private `_SRGB`-view target and then
+	 * copies the result into the atlas. Copying the WHOLE atlas is 3840x2160 on
+	 * a native-panel box — ~66 MB of read+write per client per commit, at the
+	 * client's submit rate — and that bandwidth is what made the render thread
+	 * start losing its `try_lock` on `atlas_submit_mutex` (`atlas_contention`
+	 * 0 → 14 per 10 s window against `main`, two shell clients).
+	 *
+	 * So the publish copies only what was painted, when the commit's only
+	 * painter was the projection layer: one box per view, at the SAME tile
+	 * origin and extent `service_proj_view_blit_resolve` gave the blit, so the
+	 * copy can never place a view differently from the draw that produced it. A
+	 * commit with any other painter (zones / Local-2D / UI / window-space / a
+	 * later projection layer) can put pixels anywhere and keeps the whole-atlas
+	 * `CopyResource`; see `compose_mirrors_atlas` for the re-seed that pairs
+	 * with it.
+	 * @{
+	 */
+	D3D11_BOX compose_publish_boxes[XRT_MAX_VIEWS];
+	uint32_t compose_publish_box_count = 0;
+	//! Any painter other than the base projection layer ⟹ publish everything.
+	bool compose_publish_full = true;
+	/*! @} */
+
 	// Render projection layers to stereo texture (via copy)
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		struct comp_layer *layer = &c->layer_accum.layers[i];
@@ -21055,14 +21135,25 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			    u_color_compose_fast_path(u_color_legacy_unorm_encoded(),
 			                              /*contributing_layers=*/1u + extra_layers,
 			                              /*base_is_projection=*/true, view_is_srgb[0]);
+			// #1610: a commit whose only painter is this base projection layer
+			// publishes per-view boxes; anything else can paint anywhere and
+			// publishes the whole atlas.
+			compose_publish_full = (extra_layers != 0);
 			c->render.active_write_rtv = nullptr;
 			if (!color_fast_path) {
 				ID3D11RenderTargetView *compose = client_ensure_compose_target(sys, &c->render);
 				if (compose != nullptr) {
-					if (!c->render.compose_was_active) {
+					// Seed when the private target cannot be trusted outside
+					// what this commit will paint: after a fast-path commit
+					// (the atlas moved on without it), or before a whole-atlas
+					// publish that would otherwise push the divergence left by
+					// earlier REGION publishes back over the atlas.
+					if (!c->render.compose_was_active ||
+					    (compose_publish_full && !c->render.compose_mirrors_atlas)) {
 						std::lock_guard<std::mutex> seed_lock(sys->immediate_ctx_mutex);
 						sys->context->CopyResource(c->render.compose_texture.get(),
 						                           c->render.atlas_texture.get());
+						c->render.compose_mirrors_atlas = true;
 					}
 					c->render.active_write_rtv = compose;
 				}
@@ -21164,6 +21255,28 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			const bool needs_scale = (dst_w > 0.0f);
 			const bool is_layered = pvb.is_array;
 			const uint32_t src_slice = pvb.array_slice;
+
+			// #1610: remember exactly what this view is about to paint, so the
+			// end-of-commit publish copies that and not the whole 3840x2160
+			// atlas. Same origin and extent the blit below uses — read off the
+			// same `pvb`, never recomputed. A view whose blit was skipped above
+			// contributes no box, which is right: its atlas tile must keep last
+			// frame's content, and the private target's copy of it is stale.
+			if (compose_publish_box_count < ARRAY_SIZE(compose_publish_boxes)) {
+				const float paint_w = needs_scale ? dst_w : src_w;
+				const float paint_h = needs_scale ? dst_h : src_h;
+				D3D11_BOX *pb = &compose_publish_boxes[compose_publish_box_count++];
+				pb->left = static_cast<UINT>(tile_x);
+				pb->top = static_cast<UINT>(tile_y);
+				pb->right = static_cast<UINT>(tile_x + paint_w);
+				pb->bottom = static_cast<UINT>(tile_y + paint_h);
+				pb->front = 0;
+				pb->back = 1;
+			} else {
+				// More views than boxes (cannot happen: both are XRT_MAX_VIEWS)
+				// — degrade to the whole-atlas publish rather than under-copy.
+				compose_publish_full = true;
+			}
 
 			// #1591: color-space handling is now IDENTICAL in both modes
 			// (`feedback_srgb_blit_paths`). The per-client atlas holds the
@@ -22225,20 +22338,59 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	/*
 	 * #1610 — publish the composed result into the atlas.
 	 *
-	 * `CopyResource`, deliberately: the compose target and the atlas are the
+	 * A TRANSFER COPY, deliberately: the compose target and the atlas are the
 	 * same typeless family, so this moves the ENCODED bytes the `_SRGB` RTV
 	 * just wrote WITHOUT touching them. A shader blit here, or any copy that
 	 * crossed families, would re-apply the transfer function and hand the
 	 * display processor a double-encoded atlas — the exact bug this design
 	 * exists to avoid. Do not "optimise" it into a draw.
 	 *
-	 * Under the same atlas mutex the per-view tile blits take, so a reader
-	 * sees either this whole frame's composite or the previous one.
+	 * The REGION is the optimisation that belongs here instead. A whole-atlas
+	 * `CopyResource` is 3840x2160 on a native-panel box whatever the client
+	 * actually painted — ~66 MB of read+write per client per commit, which is
+	 * what pushed `atlas_contention` from 0 (main) to 14 per 10 s window on the
+	 * two-client shell leg. When the base projection layer was this commit's
+	 * only painter, copy its per-view boxes instead (2x1280x720 there) and leave
+	 * the rest of the atlas alone; `compose_publish_full` and the paired re-seed
+	 * (see `compose_mirrors_atlas`) keep the two textures consistent for the
+	 * commits that CAN paint anywhere.
+	 *
+	 * Under the same atlas mutex the per-view tile blits take, so a reader sees
+	 * either this whole frame's composite or the previous one. Whole-atlas or
+	 * per-box makes no difference to that: both are submitted inside one hold.
 	 */
 	if (c->render.active_write_rtv != nullptr && c->render.compose_texture && c->render.atlas_texture) {
+		const bool publish_region = !compose_publish_full && compose_publish_box_count > 0;
 		std::lock_guard<std::mutex> atlas_write_lock(c->atlas_submit_mutex);
 		std::lock_guard<std::mutex> ctx_lock(sys->immediate_ctx_mutex);
-		sys->context->CopyResource(c->render.atlas_texture.get(), c->render.compose_texture.get());
+		if (publish_region) {
+			for (uint32_t bi = 0; bi < compose_publish_box_count; bi++) {
+				// Clamp to the target extent. D3D11 DROPS a CopySubresourceRegion
+				// whose box leaves the resource — silently in a release runtime —
+				// and a dropped publish is a frozen tile, so an over-wide source
+				// rect must cost the overhang and not the whole view.
+				D3D11_BOX b = compose_publish_boxes[bi];
+				if (b.right > c->render.compose_width) {
+					b.right = c->render.compose_width;
+				}
+				if (b.bottom > c->render.compose_height) {
+					b.bottom = c->render.compose_height;
+				}
+				if (b.right <= b.left || b.bottom <= b.top) {
+					continue;
+				}
+				sys->context->CopySubresourceRegion(c->render.atlas_texture.get(), 0, b.left, b.top, 0,
+				                                    c->render.compose_texture.get(), 0, &b);
+			}
+			c->render.compose_mirrors_atlas = false;
+		} else if (!compose_publish_full && compose_publish_box_count == 0) {
+			// Composing, but every view's blit was skipped: nothing was
+			// painted, so publishing anything would only push the private
+			// target's stale copy over tiles that must keep last frame.
+		} else {
+			sys->context->CopyResource(c->render.atlas_texture.get(), c->render.compose_texture.get());
+			c->render.compose_mirrors_atlas = true;
+		}
 	}
 	c->render.active_write_rtv = nullptr;
 
