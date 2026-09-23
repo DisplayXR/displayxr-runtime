@@ -78,8 +78,62 @@ contains_in_code(const std::string &src, const std::string &needle)
 	return false;
 }
 
+/*!
+ * The body of the function whose definition line STARTS with @p name, up to the
+ * first line that is a lone closing brace. Crude on purpose — it only has to be
+ * right for the tree's own formatting, where a top-level definition's name sits
+ * at column 0 and its closing brace is the first `}` at column 0 after it.
+ *
+ * Needed because one of the pins below is about what a SPECIFIC function does,
+ * not about what the file contains: "the publish is a copy" cannot be checked
+ * file-wide in the GL leg, which legitimately blits elsewhere.
+ */
+std::string
+function_body(const std::string &src, const std::string &name)
+{
+	const size_t def = src.find("\n" + name + "(");
+	if (def == std::string::npos) {
+		return "";
+	}
+	const size_t open = src.find("\n{", def);
+	if (open == std::string::npos) {
+		return "";
+	}
+	const size_t close = src.find("\n}", open + 1);
+	if (close == std::string::npos) {
+		return "";
+	}
+	return src.substr(open, close - open);
+}
+
+//! How many CODE (non-comment, non-preprocessor) lines of @p src mention
+//! @p needle. The preprocessor exclusion matters for the GL leg, where the GL
+//! enums it uses are #defined locally (they are not in the tree's GLAD spec).
+size_t
+count_code_lines_with(const std::string &src, const std::string &needle)
+{
+	size_t n = 0;
+	std::stringstream ss(src);
+	std::string line;
+	while (std::getline(ss, line)) {
+		const size_t first = line.find_first_not_of(" \t");
+		if (first == std::string::npos) {
+			continue;
+		}
+		const std::string lead = line.substr(first);
+		if (lead.rfind("*", 0) == 0 || lead.rfind("//", 0) == 0 || lead.rfind("/*", 0) == 0 ||
+		    lead.rfind("#", 0) == 0) {
+			continue;
+		}
+		if (line.find(needle) != std::string::npos) {
+			n++;
+		}
+	}
+	return n;
+}
+
 //! Every native compositor that composes layers into an atlas the display
-//! processor consumes, relative to the compositor source root. GL, Metal and
+//! processor consumes, relative to the compositor source root. Metal and
 //! vk_native are deliberately absent: their #1589 legs are still open, and a
 //! test that fails for a known-open leg is noise, not a guard. Add a backend
 //! here the moment it grows a compose target.
@@ -87,14 +141,31 @@ const char *const kColorBackends[] = {
     "d3d11/comp_d3d11_renderer.cpp",
     "d3d11_service/comp_d3d11_service.cpp",
     "d3d12/comp_d3d12_renderer.cpp",
+    "gl/comp_gl_compositor.cpp",
 };
 
-//! The two IN-PROCESS compositors that own the zero-copy branch. (The service's
-//! lives in comp_d3d11_service.cpp, which is in the list above.)
+/*!
+ * The backends whose compose target is a D3D one, and whose publish is
+ * therefore `CopyResource` over a TYPELESS family.
+ *
+ * The rule is the same everywhere — the encode is a property of the RENDER
+ * TARGET and the composite reaches the atlas as a raw same-family copy — but
+ * its SPELLING is per-API, so the pins split here rather than the rule doing
+ * so. GL's half is the case below this list's users.
+ */
+const char *const kD3DColorBackends[] = {
+    "d3d11/comp_d3d11_renderer.cpp",
+    "d3d11_service/comp_d3d11_service.cpp",
+    "d3d12/comp_d3d12_renderer.cpp",
+};
+
+//! The three IN-PROCESS compositors that own the zero-copy branch. (The
+//! service's lives in comp_d3d11_service.cpp, which is in the list above.)
 const char *const kZeroCopyOwners[] = {
     "d3d11/comp_d3d11_compositor.cpp",
     "d3d12/comp_d3d12_compositor.cpp",
     "d3d11_service/comp_d3d11_service.cpp",
+    "gl/comp_gl_compositor.cpp",
 };
 
 } // namespace
@@ -132,7 +203,7 @@ TEST_CASE("colour: no backend re-derives the fast-path decision (#1589/#1610)")
 
 TEST_CASE("colour: the encode is a render target, never shader arithmetic (#1610)")
 {
-	for (const char *rel : kColorBackends) {
+	for (const char *rel : kD3DColorBackends) {
 		const std::string path = std::string(DXR_COMP_SRC_DIR) + "/" + rel;
 		const std::string src = read_whole_file(path);
 
@@ -151,11 +222,17 @@ TEST_CASE("colour: the encode is a render target, never shader arithmetic (#1610
 		INFO(rel << " must publish its composite with a same-family COPY; a draw would "
 		         << "re-apply the transfer function");
 		CHECK(contains_in_code(src, "CopyResource("));
+	}
+
+	for (const char *rel : kColorBackends) {
+		const std::string path = std::string(DXR_COMP_SRC_DIR) + "/" + rel;
+		const std::string src = read_whole_file(path);
 
 		/*
-		 * No transfer function in any compose shader. The HLSL lives in
-		 * these files as string literals (D3D12) or beside them
-		 * (D3D11's shaders/), and a hand-rolled encode is recognisable
+		 * No transfer function in any compose shader. The shader source
+		 * lives in these files as string literals (D3D12's HLSL, GL's
+		 * GLSL) or beside them (D3D11's shaders/), and a hand-rolled
+		 * encode is recognisable
 		 * by its constants: 1.055, 0.055, 2.4 or 1.0/2.4, and the
 		 * 0.0031308 knee. u_color_srgb_encode() is allowed to hold them
 		 * — it IS the oracle — but no backend may.
@@ -238,4 +315,66 @@ TEST_CASE("colour: the D3D12 leg keeps its two source views apart (#1589)")
 	        "in comp_d3d12_renderer_flatten_local_2d(), which hands the app's bytes on unchanged. "
 	        "A new direct call is a draw that blends in the wrong space.");
 	CHECK(direct == 2);
+}
+
+TEST_CASE("colour: the GL leg spells the same model in GL (#1589/#1610)")
+{
+	/*
+	 * GL states the SAME model with different machinery, and each of the
+	 * three differences is a place a faithful-looking local reinvention
+	 * would go unnoticed:
+	 *
+	 *   - the encode is the ATTACHMENT's format plus GL_FRAMEBUFFER_SRGB,
+	 *     not a view (D3D11) or a baked PSO format (D3D12);
+	 *   - "does this sampler decode?" is texture-object state, so the twin
+	 *     of layer_source_format() is a twin BIND;
+	 *   - the publish is glCopyImageSubData, and this file legitimately
+	 *     calls glBlitFramebuffer elsewhere (the DP crop), so "the publish
+	 *     is a copy" has to be asked of the publish FUNCTION, not of the
+	 *     file.
+	 */
+	const std::string path = std::string(DXR_COMP_SRC_DIR) + "/gl/comp_gl_compositor.cpp";
+	const std::string src = read_whole_file(path);
+
+	INFO("the GL compositor must compose into a GL_SRGB8_ALPHA8 target — that format IS the "
+	     "encode, and it is what makes the fixed-function blender work in linear");
+	CHECK(contains_in_code(src, "GL_SRGB8_ALPHA8"));
+
+	INFO("...and must turn the write-side conversion ON for the composing pass. Without "
+	     "glEnable(GL_FRAMEBUFFER_SRGB) the sRGB attachment is written raw and nothing encodes");
+	CHECK(contains_in_code(src, "glEnable(GL_FRAMEBUFFER_SRGB)"));
+
+	const std::string publish = function_body(src, "gl_publish_compose_to_atlas");
+	INFO("gl_publish_compose_to_atlas() must exist — the publish is one named step, not a copy "
+	     "pasted into each pass");
+	REQUIRE_FALSE(publish.empty());
+
+	INFO("...and must publish with glCopyImageSubData(): GL_SRGB8_ALPHA8 and GL_RGBA8 are the "
+	     "same 32-bit RGBA class, so that moves the encoded bytes verbatim");
+	CHECK(publish.find("glCopyImageSubData(") != std::string::npos);
+
+	// A draw re-applies the transfer function; a glBlitFramebuffer's sRGB
+	// behaviour depends on GL_FRAMEBUFFER_SRGB and drivers have disagreed
+	// about it. Either one looks exactly like the copy in review.
+	for (const char *forbidden : {"glDrawArrays", "glDrawElements", "glBlitFramebuffer"}) {
+		INFO("gl_publish_compose_to_atlas() calls " << forbidden
+		                                            << " — the publish must be a raw same-class copy, "
+		                                               "never a draw or a filtered/converting blit");
+		CHECK(publish.find(forbidden) == std::string::npos);
+	}
+
+	INFO("the GL compositor must pick its source read through ONE helper, so a new bind site "
+	     "cannot quietly keep the non-decoding read while the target encodes");
+	CHECK(contains_in_code(src, "gl_bind_layer_source("));
+
+	// The GL analogue of the D3D12 direct-call count. GL_SKIP_DECODE_EXT IS
+	// the non-decoding read, so every code mention of it outside the helper
+	// is a site deciding for itself. (Preprocessor lines are excluded: the
+	// enum is #defined here because it is not in the tree's GLAD spec.)
+	const size_t direct_skip = count_code_lines_with(src, "GL_SKIP_DECODE_EXT");
+	INFO("the GL compositor names GL_SKIP_DECODE_EXT in " << direct_skip
+	                                                      << " code line(s), expected 1 — the one inside "
+	                                                         "gl_bind_layer_source(). Another is a read that "
+	                                                         "decided its own colour space.");
+	CHECK(direct_skip == 1);
 }
