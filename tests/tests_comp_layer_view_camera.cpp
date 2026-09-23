@@ -1552,7 +1552,7 @@ TEST_CASE("comp_layer_tile_blend_mode: asking for a mode is what spends the base
 }
 
 /*
- * #1590 / #1598, structurally, for the two D3D11 paths.
+ * #1590 / #1598, structurally, for every path that draws a quad.
  *
  * The behaviour needs a live device and swapchains, which this harness has
  * none of — same reasoning as the two structural cases above. What is pinnable
@@ -1560,17 +1560,20 @@ TEST_CASE("comp_layer_tile_blend_mode: asking for a mode is what spends the base
  * copy: the back-face predicate at its quad draw, and the painter's-order gate
  * at its layer loop.
  *
- * Scoped to the D3D paths deliberately: GL and Metal draw quads but do not
- * apply the facing predicate yet (their #1590 legs are still open), and a test
- * that fails for a known-open leg is noise, not a guard. D3D12 joined with
- * #1581, which is where it learned to draw a quad at all.
+ * METAL is the one quad-drawing backend still outside this guard: its #1590 leg
+ * is open, and a test that fails for a known-open leg is noise, not a guard.
+ * D3D12 joined with #1581, which is where it learned to draw a quad at all; GL
+ * joined with #1581's GL leg, which is where it learned to CULL one — before
+ * that its quad pass drew back-faces, and the CTS QuadOcclusion case showed a
+ * full-view red rectangle on that backend.
  */
-TEST_CASE("the D3D paths consult the shared facing and painter's rules (#1590, #1598)")
+TEST_CASE("the quad-drawing paths consult the shared facing and painter's rules (#1590, #1598)")
 {
 	const char *const backends[] = {
 	    "d3d11/comp_d3d11_renderer.cpp",
 	    "d3d11_service/comp_d3d11_service.cpp",
 	    "d3d12/comp_d3d12_renderer.cpp",
+	    "gl/comp_gl_compositor.cpp",
 	};
 
 	for (const char *rel : backends) {
@@ -1589,9 +1592,10 @@ TEST_CASE("the D3D paths consult the shared facing and painter's rules (#1590, #
 	/*
 	 * ...and a SUB-RECT layer must not reach for that gate: only a full-tile
 	 * projection-class layer can be a tile's base. The D3D11 service composes
-	 * its sub-rect layers in a pass of their own; D3D12 composes its quads in
-	 * the same loop as its projection blits (#1581) and still owes the same
-	 * distinction. Named here rather than in the loop above because the
+	 * its sub-rect layers in a pass of their own; D3D12 and GL compose their
+	 * quads in the same loop as their projection blits (#1581) and so owe the
+	 * distinction most of all — there the quad is walking past the very gate
+	 * it must not take. Named here rather than in the loop above because the
 	 * in-process D3D11 renderer spells the same rule as a direct
 	 * comp_layer_blend_mode() call at its quad draw, and converging the two
 	 * spellings is not this change's business.
@@ -1599,6 +1603,7 @@ TEST_CASE("the D3D paths consult the shared facing and painter's rules (#1590, #
 	const char *const subrect_backends[] = {
 	    "d3d11_service/comp_d3d11_service.cpp",
 	    "d3d12/comp_d3d12_renderer.cpp",
+	    "gl/comp_gl_compositor.cpp",
 	};
 
 	for (const char *rel : subrect_backends) {
