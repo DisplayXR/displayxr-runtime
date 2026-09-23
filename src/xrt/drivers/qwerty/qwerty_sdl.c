@@ -228,6 +228,12 @@ qwerty_process_event(struct xrt_device **xdevs, size_t xdev_count, SDL_Event eve
 	if (event.type == SDL_KEYDOWN && event.key.keysym.scancode == SDL_SCANCODE_DOWN) qwerty_press_look_down(qdev);
 	if (event.type == SDL_KEYUP && event.key.keysym.scancode == SDL_SCANCODE_DOWN) qwerty_release_look_down(qdev);
 
+	// Z/X roll — the arrow keys only reach pitch and yaw (#1692)
+	if (event.type == SDL_KEYDOWN && event.key.keysym.scancode == SDL_SCANCODE_Z) qwerty_press_roll_left(qdev);
+	if (event.type == SDL_KEYUP && event.key.keysym.scancode == SDL_SCANCODE_Z) qwerty_release_roll_left(qdev);
+	if (event.type == SDL_KEYDOWN && event.key.keysym.scancode == SDL_SCANCODE_X) qwerty_press_roll_right(qdev);
+	if (event.type == SDL_KEYUP && event.key.keysym.scancode == SDL_SCANCODE_X) qwerty_release_roll_right(qdev);
+
 	// Mouse wheel: 3D controls (HMD focused) or movement speed (controller focused)
 	if (event.type == SDL_MOUSEWHEEL && event.wheel.y != 0) {
 		if (qdev == qd_hmd) {

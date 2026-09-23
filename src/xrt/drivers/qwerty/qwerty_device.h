@@ -131,13 +131,62 @@ struct qwerty_device
 	bool look_right_pressed;
 	bool look_up_pressed;
 	bool look_down_pressed;
+	//! #1692: roll, the third rotation axis. Device-local, like pitch.
+	bool roll_left_pressed;
+	bool roll_right_pressed;
 
-	bool sprint_pressed; //!< Movement speed boost
+	bool sprint_pressed; //!< Movement and look speed boost
 	float yaw_delta;     //!< How much extra yaw to add for the next pose. Then reset to 0.
 	float pitch_delta;   //!< Similar to `yaw_delta`
 	float x_pos_delta;   //!< Mouse-driven position delta in world X. Reset to 0 each frame.
 	float y_pos_delta;   //!< Mouse-driven position delta in world Y. Reset to 0 each frame.
+
+	/*!
+	 * #1692: velocity of @ref pose over the integration step that produced
+	 * it, in the same (base) frame as the pose — m/s and rad/s. Always
+	 * meaningful: a step with no input reports zero, which is a real value,
+	 * not an unknown one. Written under @ref lock by
+	 * qwerty_get_tracked_pose(), read there and by a parented controller
+	 * reading its HMD.
+	 */
+	struct xrt_vec3 linear_velocity;
+	struct xrt_vec3 angular_velocity;
 };
+
+/*!
+ * #1692: the velocity of one integration step, in the BASE frame.
+ *
+ * Analytic, not a finite difference of two sampled poses: the driver already
+ * knows the exact translation and the exact rotation it just applied, so the
+ * step's rate is `delta / dt` with no sampling noise. The rotation is rebuilt
+ * from the two SMALL per-step rotations rather than from `after * before^-1`,
+ * because every consumer polling this device shortens the step — at a
+ * microsecond dt the difference of two near-equal orientations is float noise,
+ * while the small rotations keep every significant bit.
+ *
+ * The step is `after = base_rotation * before * local_rotation` (the driver
+ * applies pitch and roll in the device's own frame and yaw in the base frame),
+ * so the base-frame rotation of the step is
+ * `base_rotation * (before * local_rotation * before^-1)`.
+ *
+ * @param pos_delta      Translation applied this step, base frame, metres.
+ * @param ori_before     Orientation at the start of the step.
+ * @param local_rotation Rotation applied in the device's own frame (pitch, roll).
+ * @param base_rotation  Rotation applied in the base frame (yaw).
+ * @param dt_s           Step length in seconds; <= 0 yields zero velocity.
+ * @param[out] out_linear  Linear velocity, base frame, m/s.
+ * @param[out] out_angular Angular velocity, base frame, rad/s.
+ *
+ * @public @memberof qwerty_device
+ */
+void
+qwerty_step_velocity(const struct xrt_vec3 *pos_delta,
+                     const struct xrt_quat *ori_before,
+                     const struct xrt_quat *local_rotation,
+                     const struct xrt_quat *base_rotation,
+                     float dt_s,
+                     struct xrt_vec3 *out_linear,
+                     struct xrt_vec3 *out_angular);
 
 /*!
  * @implements qwerty_device
@@ -275,7 +324,27 @@ void
 qwerty_release_look_down(struct qwerty_device *qd);
 
 /*!
- * Momentarily increase `movement_speed` until `qwerty_release_sprint()`
+ * Roll — the third rotation axis, device-local like pitch (#1692). Positive
+ * ("left") tips the device's right side up, matching `look_left` turning left.
+ * Bound to Z / X; before it, only two of the three angular axes were driveable
+ * from the keyboard at all, so no keyboard recipe could exercise roll.
+ * @public @memberof qwerty_device
+ */
+void
+qwerty_press_roll_left(struct qwerty_device *qd);
+//! @public @memberof qwerty_device
+void
+qwerty_release_roll_left(struct qwerty_device *qd);
+//! @public @memberof qwerty_device
+void
+qwerty_press_roll_right(struct qwerty_device *qd);
+//! @public @memberof qwerty_device
+void
+qwerty_release_roll_right(struct qwerty_device *qd);
+
+/*!
+ * Momentarily increase `movement_speed` *and* `look_speed` until
+ * `qwerty_release_sprint()`
  * @public @memberof qwerty_device
  */
 void
