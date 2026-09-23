@@ -57,6 +57,7 @@ set(tests
     tests_input_arbiter_rig
     tests_sim_input_nav
     tests_comp_layer_view_camera
+    tests_comp_color_policy
     tests_m_matrix_projection
 	)
 if(XRT_BUILD_DRIVER_QWERTY)
@@ -251,6 +252,16 @@ target_link_libraries(tests_comp_layer_view_camera PRIVATE xrt-interfaces aux_ma
 target_compile_definitions(
 	tests_comp_layer_view_camera
 	PRIVATE "DXR_COMP_SRC_DIR=\"${PROJECT_SOURCE_DIR}/src/xrt/compositor\""
+	)
+
+# #1589/#1610 -- the colour-policy guard reads the same backend sources as text
+# (the encode is done by a hardware _SRGB render target, and there is no device
+# here), so it needs the same compositor root. Registered unconditionally: it
+# compiles no D3D header and links nothing, and a non-Windows CI run is exactly
+# where a D3D backend quietly growing a local colour rule should still be
+# caught. PROJECT_SOURCE_DIR, not CMAKE_SOURCE_DIR -- see above.
+target_compile_definitions(
+	tests_comp_color_policy PRIVATE "DXR_COMP_SRC_DIR=\"${PROJECT_SOURCE_DIR}/src/xrt/compositor\""
 	)
 
 if(TARGET tests_input_host_geometry)
