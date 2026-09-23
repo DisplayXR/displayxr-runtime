@@ -612,6 +612,7 @@ struct comp_vk_native_compositor
 	//! A move request is out and its landing has not been read back yet.
 	bool wl_snap_verify_pending;
 	int32_t wl_snap_want_x, wl_snap_want_y; //!< what that request asked for
+	uint32_t wl_snap_verify_polls;          //!< polls spent waiting for it to apply
 	uint32_t wl_snap_still; //!< consecutive polls with an unchanged origin
 	uint32_t wl_snap_tries; //!< move requests made for THIS settle (cap 2)
 	bool warned_wl_snap_scale;
@@ -10589,6 +10590,10 @@ vk_snap_search_lattice(struct comp_vk_native_compositor *c,
 //! for a publisher too old to report `moving` (~100 ms at 60 Hz).
 #define VK_WL_SETTLE_POLLS 6
 
+//! Polls a drop-snap move request may take to apply before its landing is
+//! judged (~0.5 s at 60 Hz). Every position change until then is ours.
+#define VK_WL_VERIFY_POLLS 30
+
 /*!
  * Snap a Wayland window onto the interlace lattice after the user drops it
  * (#1609).
@@ -10635,10 +10640,37 @@ vk_wayland_phase_snap(struct comp_vk_native_compositor *c)
 	 * origin back and say, in one line, what actually happened. Checked before
 	 * anything else, so the move we caused is never mistaken for a new drag.
 	 */
-	if (c->wl_snap_verify_pending) {
+	if (c->wl_snap_verify_pending && wr.have_moving && wr.moving) {
+		// The user grabbed it again before our move was judged: that is a new
+		// drag, not our landing.
 		c->wl_snap_verify_pending = false;
+	}
+	if (c->wl_snap_verify_pending) {
+		/*
+		 * The request is ASYNCHRONOUS (a D-Bus call into the shell), so the
+		 * next poll usually still sees the drop position. Reading that as
+		 * "landed 2 px off" and then taking the move when it did apply for
+		 * a NEW drag is exactly how a drop ping-ponged on hardware: drop at
+		 * A, ask B, "landed at A", window reaches B, "new drag from A",
+		 * snap relative to A asks A, ... forever. So wait until the window
+		 * reaches the target, or stops changing for a while, and treat
+		 * every change in between as ours.
+		 */
 		const int32_t dx = cur_x - c->wl_snap_want_x;
 		const int32_t dy = cur_y - c->wl_snap_want_y;
+		const bool arrived = dx == 0 && dy == 0;
+		const bool changed = cur_x != c->wl_snap_last_x || cur_y != c->wl_snap_last_y;
+		c->wl_snap_last_x = cur_x;
+		c->wl_snap_last_y = cur_y;
+		if (!arrived) {
+			if (changed) {
+				c->wl_snap_verify_polls = 0; // still settling from our move
+			}
+			if (++c->wl_snap_verify_polls < VK_WL_VERIFY_POLLS) {
+				return;
+			}
+		}
+		c->wl_snap_verify_pending = false;
 		if (dx == 0 && dy == 0) {
 			U_LOG_W("phase snap: LANDED at (%d, %d) px, exactly where the lattice asked", cur_x, cur_y);
 		} else {
@@ -10706,6 +10738,18 @@ vk_wayland_phase_snap(struct comp_vk_native_compositor *c)
 	}
 	c->wl_snap_moving = false;
 	c->wl_snap_still = 0;
+
+	/*
+	 * ONE OWNER PER DROP. When the drag ran on the compositor's drag lattice
+	 * and ended on it, the lattice already chose this position with the same
+	 * display-processor oracle. A second opinion here can only name a
+	 * different phase-correct neighbour (the two use different origins), and
+	 * two owners of the last 2 px is a visible jitter at the end of a drag.
+	 */
+	if (wr.lattice_drop) {
+		U_LOG_I("phase snap: dropped at (%d, %d) px on the drag lattice — accepted as is", cur_x, cur_y);
+		return;
+	}
 
 	// Reachability: integer monitor scales only (@ref u_wl_placement_quantum).
 	// 1.6667 has no lattice a window can be placed on, so refusing is the
@@ -10841,6 +10885,7 @@ vk_wayland_phase_snap(struct comp_vk_native_compositor *c)
 	if (ok) {
 		// Verify the landing on the next poll rather than assume it.
 		c->wl_snap_verify_pending = true;
+		c->wl_snap_verify_polls = 0;
 		c->wl_snap_want_x = sx;
 		c->wl_snap_want_y = sy;
 	}

@@ -65,6 +65,9 @@
 //             -> (b accepted, i startX, i startY)
 //   Method  ClearDragLattice(u pid)
 //   Signal  DragLatticeNeeded(u pid, i dx, i dy)
+//   Signal  DragLatticeDone(u pid, u moves, u corrected, u misses,
+//                           u maxCorrection, u tables, b landedOnTable)
+//             (version 7) one summary per drag that had a table, at grab end
 //   A table of displacements from the drag start that the caller found
 //   phase-correct; while it is active, every compositor-proposed position of
 //   the caller's window is replaced by the nearest entry (see "Drag lattice").
@@ -99,6 +102,10 @@
 //       "buffer": [x, y, w, h],             // Meta.Window.get_buffer_rect()
 //       "monitor": { "x": 0, "y": 0, "w": 3840, "h": 2160, "scale": 1.0 },
 //       "capture_excluded": false,          // ext v2+: CaptureExclusion1 active
+//       "lattice_drop": false,              // ext v7+: the last drag ended ON
+//                                           // the drag lattice and the window
+//                                           // has not moved since. A consumer
+//                                           // that snaps drops leaves it alone.
 //       "moving": false                     // ext v3+: an interactive grab
 //                                           // (move/resize) is in progress on
 //                                           // this window. A consumer that
@@ -495,6 +502,15 @@
       <arg type="i" name="dx"/>
       <arg type="i" name="dy"/>
     </signal>
+    <signal name="DragLatticeDone">
+      <arg type="u" name="pid"/>
+      <arg type="u" name="moves"/>
+      <arg type="u" name="corrected"/>
+      <arg type="u" name="misses"/>
+      <arg type="u" name="maxCorrection"/>
+      <arg type="u" name="tables"/>
+      <arg type="b" name="landedOnTable"/>
+    </signal>
   </interface>
 </node>`;
 
@@ -564,9 +580,12 @@
         }
 
         class DragLattice {
-            constructor(emitNeeded, debug) {
+            constructor(emitNeeded, emitDone, isGrabbed, debug) {
                 this._emitNeeded = emitNeeded;
+                this._emitDone = emitDone;
+                this._isGrabbed = isGrabbed; // (win) -> is a grab running on it NOW
                 this._debug = debug;
+                this._landed = new Map();       // Meta.Window -> [x, y] of an on-table drop
                 this._tables = new Map();      // Meta.Window -> table
                 this._constraints = new Map(); // Meta.Window -> constraint object
                 this._posHandlers = new Map(); // Meta.Window -> position-changed handler id
@@ -577,7 +596,7 @@
 
             _resetDragStats() {
                 this._drag = {corrected: 0, moves: 0, paintedOn: 0, paintedOff: 0, offSamples: [],
-                    maxCorrection: 0};
+                    maxCorrection: 0, misses: 0, tables: 0};
             }
 
             supported() {
@@ -604,8 +623,16 @@
                 const t = this._tables.get(win);
                 if (!t)
                     return;
-                if (!t.grabbing && GLib.get_monotonic_time() > t.expiresUs) {
-                    this._tables.delete(win);
+                if (!t.grabbing) {
+                    /*
+                     * Correct ONLY what the user's drag proposes. A table that
+                     * is waiting for its grab must not touch any other move — in
+                     * particular the runtime's drop-time snap (MoveWindow),
+                     * which it would pull 2 px off towards the table's own
+                     * origin while the snap pulled it back (#1609 follow-up).
+                     */
+                    if (GLib.get_monotonic_time() > t.expiresUs)
+                        this._tables.delete(win);
                     return;
                 }
                 this._drag.moves++;
@@ -615,6 +642,7 @@
                 const best = inside ? this._nearest(t, dx, dy) : null;
                 if (!best) {
                     this._stats.misses++;
+                    this._drag.misses++;
                     if (!t.asked) {
                         t.asked = true;
                         const pid = t.pid;
@@ -625,6 +653,7 @@
                     }
                     return;
                 }
+                this._askAhead(t, dx, dy);
                 const nx = t.startX + best[0], ny = t.startY + best[1];
                 if (nx === r.x && ny === r.y)
                     return;
@@ -642,6 +671,43 @@
                     const a = win.get_frame_rect();
                     log(`displayxr: corrected raw=(${r.x},${r.y}) -> (${nx},${ny}); frame now (${a.x},${a.y})`);
                 }
+            }
+
+            /*
+             * Ask for the next piece EARLY and AHEAD (#1609 follow-up). Waiting
+             * for a miss meant every long drag ran unconstrained at the table's
+             * edge for as long as the app took to probe the next one (~100 ms
+             * against a real display processor), which showed as an occasional
+             * stutter. Ask once the drag is half-way from the table's centre to
+             * its edge, centred where the window will be ~150 ms from now.
+             */
+            _askAhead(t, dx, dy) {
+                const now = GLib.get_monotonic_time();
+                let vx = 0, vy = 0;
+                if (t.lastUs !== undefined && now > t.lastUs) {
+                    const dt = (now - t.lastUs) / 1e6;
+                    vx = (dx - t.lastDx) / dt;
+                    vy = (dy - t.lastDy) / dt;
+                }
+                t.lastDx = dx;
+                t.lastDy = dy;
+                t.lastUs = now;
+                if (t.asked)
+                    return;
+                const cx = (t.minDx + t.maxDx) / 2, cy = (t.minDy + t.maxDy) / 2;
+                const half = Math.min(t.maxDx - t.minDx, t.maxDy - t.minDy) / 2;
+                if (Math.max(Math.abs(dx - cx), Math.abs(dy - cy)) < half / 2)
+                    return;
+                const lim = half / 2;
+                const lead = v => Math.max(-lim, Math.min(lim, v * 0.15));
+                const ax = Math.round(dx + lead(vx)), ay = Math.round(dy + lead(vy));
+                t.asked = true;
+                this._drag.asksAhead = (this._drag.asksAhead ?? 0) + 1;
+                const pid = t.pid;
+                GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+                    this._emitNeeded(pid, ax, ay);
+                    return GLib.SOURCE_REMOVE;
+                });
             }
 
             /*
@@ -714,7 +780,11 @@
                     pid, startX, startY, cell, buckets, members,
                     minDx: bounds[0], minDy: bounds[1], maxDx: bounds[2], maxDy: bounds[3],
                     asked: false,
-                    grabbing: prev?.grabbing ?? false,
+                    // A table can arrive MID-grab: the app sends one when its
+                    // window enters the 3D panel during a drag that began on
+                    // another monitor. Its start is the window's position now,
+                    // and it constrains from the next move on.
+                    grabbing: (prev?.grabbing ?? false) || this._isGrabbed(win),
                     expiresUs: GLib.get_monotonic_time() +
                         (LATTICE_TEST ? 120 * 1000 * 1000 : LATTICE_PRE_GRAB_US),
                     entries: dxs.length,
@@ -734,6 +804,11 @@
                         return GLib.SOURCE_REMOVE;
                     });
                 }
+                // A fresh table outside a grab starts a new drag's statistics.
+                if (!extend && !this._isGrabbed(win))
+                    this._resetDragStats();
+                this._drag.tables++;
+                this._landed.delete(win);
                 if (!this._posHandlers.has(win)) {
                     this._posHandlers.set(win,
                         win.connect('position-changed', () => this._onPositionChanged(win)));
@@ -761,17 +836,35 @@
             }
 
             onGrabBegin(win) {
+                if (win)
+                    this._landed.delete(win);
                 const t = win && this._tables.get(win);
                 if (t)
                     t.grabbing = true; // no expiry while the user holds it
             }
 
+            //! Did this window's last drag end on its table, and has it stayed there?
+            landedOnTable(win) {
+                const l = this._landed.get(win);
+                if (!l)
+                    return false;
+                const r = win.get_frame_rect();
+                return r.x === l[0] && r.y === l[1];
+            }
+
             onGrabEnd(win) {
                 if (win && this._tables.has(win)) {
+                    const t = this._tables.get(win);
+                    const r = win.get_frame_rect();
+                    const onTable = t.members.has(`${r.x - t.startX},${r.y - t.startY}`);
+                    if (onTable)
+                        this._landed.set(win, [r.x, r.y]);
+                    const d = this._drag;
+                    this._emitDone(t.pid, d.moves, d.corrected, d.misses, d.maxCorrection, d.tables, onTable);
                     if (this._debug) {
                         const d = this._drag;
                         log(`displayxr: drag lattice done — ${d.moves} compositor move(s), ${d.corrected} ` +
-                            `corrected (largest ${d.maxCorrection} logical px), ${this._stats.misses} outside ` +
+                            `corrected (largest ${d.maxCorrection} logical px), ${d.misses} outside ` +
                             `coverage; PAINTED on-lattice ${d.paintedOn} frame(s), OFF-lattice ` +
                             `${d.paintedOff}${d.offSamples.length ? ` e.g. ${d.offSamples.join(' ')}` : ''}`);
                     }
@@ -782,6 +875,7 @@
 
             forget(win) {
                 this._tables.delete(win);
+                this._landed.delete(win);
                 const h = this._posHandlers.get(win);
                 if (h) {
                     try {
@@ -915,7 +1009,11 @@
                 // DISPLAYXR_DEBUG=1 in the shell's environment: per-drag lattice
                 // lines in the journal.
                 this._debug = GLib.getenv('DISPLAYXR_DEBUG') === '1';
-                this._lattice = new DragLattice((pid, dx, dy) => this._emitNeeded(pid, dx, dy), this._debug);
+                this._lattice = new DragLattice(
+                    (pid, dx, dy) => this._emitNeeded(pid, dx, dy),
+                    (...a) => this._emitDone(...a),
+                    win => win !== null && win === this._getGrabbedWindow(),
+                    this._debug);
                 this._dbus = Gio.DBusExportedObject.wrapJSObject(PLACEMENT_IFACE_XML, this);
                 this._dbus.export(Gio.DBus.session, '/org/displayxr/WindowPlacement');
             }
@@ -939,6 +1037,19 @@
                     this._dbus.emit_signal('DragLatticeNeeded',
                         new GLib.Variant('(uii)', [pid >>> 0, Math.round(dx), Math.round(dy)]));
                 }
+            }
+
+            _emitDone(pid, moves, corrected, misses, maxCorrection, tables, landed) {
+                if (this._dbus) {
+                    this._dbus.emit_signal('DragLatticeDone', new GLib.Variant('(uuuuuub)',
+                        [pid >>> 0, moves >>> 0, corrected >>> 0, misses >>> 0, maxCorrection >>> 0,
+                            tables >>> 0, landed]));
+                }
+            }
+
+            //! For the published snapshot: see "lattice_drop".
+            latticeDrop(win) {
+                return this._lattice?.landedOnTable(win) ?? false;
             }
 
             //! Per-frame paint audit, forwarded by the service's stage hook.
@@ -1232,6 +1343,7 @@
                         buffer: [buffer.x, buffer.y, buffer.width, buffer.height],
                         monitor,
                         capture_excluded: this._captureExclusion?.isExcluded(win) ?? false,
+                        lattice_drop: this._placement?.latticeDrop(win) ?? false,
                         moving: win === this._grabbedWindow,
                     });
                 }
