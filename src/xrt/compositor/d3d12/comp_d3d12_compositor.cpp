@@ -56,6 +56,8 @@ struct comp_vk_split; // the reroute fields exist either way; the code does not
 
 #include "math/m_api.h"
 #include "util/u_tiling.h"
+// #1589: the zero-copy branch has a colour precondition — see its use below.
+#include "util/u_color_encoding.h"
 #include "util/u_canvas.h"
 #include "util/u_capture_intent.h"
 #include "util/u_repaint_gate.h"
@@ -4779,9 +4781,39 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 						    // #1628: D3D12_VIEWPORT::TopLeftY counts down — top-origin.
 						    u_tiling_can_zero_copy(vc, rxs, rys, rws, rhs_arr, sw, sh, mode,
 						                           U_TILING_ORIGIN_TOP_LEFT)) {
-							zc_resource = comp_d3d12_swapchain_get_resource(layer->sc_array[0], img_idx);
-							if (zc_resource != nullptr)
+							void *cand = comp_d3d12_swapchain_get_resource(
+							    layer->sc_array[0], img_idx);
+							/*
+							 * #1589: zero-copy hands the APP'S OWN image to
+							 * the display processor, which is told the atlas
+							 * is ENCODED. That is only true when the app's
+							 * swapchain says so. A UNORM swapchain holds
+							 * LINEAR values (ADR-021 §6), and there is no
+							 * compositor pass on this branch in which to
+							 * encode them — so the frame takes the atlas
+							 * path instead, where the private _SRGB-view
+							 * compose target does the encode.
+							 * u_tiling_can_zero_copy() remains the sole
+							 * TILING gate (ADR-030); this is a colour
+							 * precondition on its result, not a second
+							 * eligibility rule.
+							 */
+							if (cand != nullptr &&
+							    !comp_d3d12_swapchain_resource_is_srgb(cand) &&
+							    !u_color_legacy_unorm_encoded()) {
+								static bool zc_color_warned = false;
+								if (!zc_color_warned) {
+									zc_color_warned = true;
+									U_LOG_W(
+									    "[ZC] refused: reason=color_needs_encode "
+									    "— a UNORM swapchain is scene-linear and "
+									    "owes the sRGB encode, which only the "
+									    "compose path can apply (#1589)");
+								}
+							} else if (cand != nullptr) {
+								zc_resource = cand;
 								zero_copy = true;
+							}
 						}
 					}
 				}
