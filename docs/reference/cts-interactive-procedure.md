@@ -468,6 +468,39 @@ There is no way to skip a test from inside the CTS. Judge it.
 > (in progress). #1580 (projection content displaced relative to quads) is
 > resolved on both lanes.
 >
+> **`opengl` needs a patched CTS for `GradientFormatsLinearVsNonLinear`.** The
+> CTS's own GL plugin (`framework/graphics_plugin_opengl.cpp`, `RenderView` and
+> `ClearImageSlice`) renders into the swapchain through an FBO without ever
+> enabling `GL_FRAMEBUFFER_SRGB`, so its "sRGB" swapchain holds the shader's
+> *linear* bytes — bit-identical to its UNORM swapchain (measured through the
+> `DXR_COLOR_LEGACY_UNORM_ENCODED=1` passthrough: 7/29/57/97/170 at five x in
+> both). D3D/Vulkan `_SRGB` views encode on write unconditionally, which is why
+> the same CTS code is right there. No format-honest runtime can render two
+> swapchains with the same bytes alike, so on stock CTS every UNORM-vs-sRGB
+> pair fails on `opengl` (0/7; the sRGB/sRGB pair reads "identical but NOT
+> linear") and always did. Upstream half-knows (`SelectColorSwapchainFormat`:
+> *"sRGB formats skipped due to CTS bug"*). The local fix is two brackets in
+> those two functions, gated on the colour attachment being `GL_SRGB8_ALPHA8` /
+> `GL_SRGB8`:
+>
+> ```cpp
+> const int64_t fmt = swapchainData->GetCreateInfo().format;
+> const bool srgbTarget = (fmt == GL_SRGB8_ALPHA8 || fmt == GL_SRGB8);
+> if (srgbTarget) { XRC_CHECK_THROW_GLCMD(glEnable(GL_FRAMEBUFFER_SRGB)); }
+> … existing viewport/scissor/clear or draw …
+> if (srgbTarget) { XRC_CHECK_THROW_GLCMD(glDisable(GL_FRAMEBUFFER_SRGB)); }
+> ```
+>
+> With it: 7/7 (PR #1705). It changes nothing for the D3D/Vulkan plugins.
+> `fetch_build_cts.bat` re-fetches the pinned tag and drops the patch; check
+> `git -C build-cts/OpenXR-CTS diff`. **Rebuild trap:** `conformance_cli` loads
+> the `conformance_test.dll` *next to the exe*
+> (`build-cts/build/src/conformance/conformance_cli/RelWithDebInfo/`), which
+> `cmake --build` does not refresh — copy it from
+> `…/conformance_test/RelWithDebInfo/` after the build, and build with the real
+> ninja first on `PATH` (depot_tools' `ninja.bat` exits 0 doing nothing outside a
+> Chromium checkout).
+>
 > **Scenario cases are not composition cases:** their Menu key is not "Help" —
 > `SpaceOffsets` treats Menu as FAIL and `GripAndAimPose` as "swap hands", so
 > capture them without the Help step. `GripAndAimPose` / `SpaceOffsets` /
