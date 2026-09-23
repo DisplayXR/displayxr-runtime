@@ -221,10 +221,23 @@ qwerty_process_win32(struct xrt_device **xdevs,
 	os_mutex_unlock(&qsys->input_lock);
 
 	if (first_bind) {
+		// #1700: name the message that bound the system. "The first message a
+		// qwerty system ever sees" turned out to be the interesting instant,
+		// and the old line did not say which message it was.
 		U_LOG_W(
-		    "QWERTY Win32 input bound to qwerty system %p - WASDQE move, RMB+drag look, "
-		    "F/G controller focus",
-		    (void *)qsys);
+		    "QWERTY Win32 input bound to qwerty system %p by msg=0x%x wParam=0x%llx - WASDQE move, "
+		    "RMB+drag look, F/G controller focus",
+		    (void *)qsys, message, wParam);
+	}
+
+	// #1700: trace every message that reaches qwerty. WM_MOUSEMOVE is excluded
+	// (it is the one genuinely per-frame message when a pointer sits on the
+	// window); its button-state edges get their own line below. Without this,
+	// "no QTRACE line" only ever proved that the handled-message list had no
+	// logging in it — which is how a self-firing trigger stayed invisible.
+	if (message != WM_MOUSEMOVE && debug_get_bool_option_qw32_qtrace()) {
+		U_LOG_W("[QTRACE] W32 MSG msg=0x%x wParam=0x%llx lParam=0x%llx extra=0x%llx", message, wParam,
+		        (unsigned long long)lParam, (unsigned long long)GetMessageExtraInfo());
 	}
 
 	if (!process_keys) {
@@ -702,6 +715,11 @@ qwerty_process_win32(struct xrt_device **xdevs,
 		for (int i = 0; i < target_count; i++)
 			qwerty_press_trigger(ctrl_targets[i]);
 		lmb_was_down = true;
+		// #1700: the select edge the CTS reacts to starts HERE — trace it.
+		if (debug_get_bool_option_qw32_qtrace()) {
+			U_LOG_W("[QTRACE] W32 LBUTTONDOWN ntargets=%d target0=%p extra=0x%llx", target_count,
+			        (void *)ctrl_targets[0], (unsigned long long)GetMessageExtraInfo());
+		}
 		if (out_handled != NULL) {
 			*out_handled = true;
 		}
@@ -711,6 +729,10 @@ qwerty_process_win32(struct xrt_device **xdevs,
 		for (int i = 0; i < target_count; i++)
 			qwerty_release_trigger(ctrl_targets[i]);
 		lmb_was_down = false;
+		if (debug_get_bool_option_qw32_qtrace()) {
+			U_LOG_W("[QTRACE] W32 LBUTTONUP ntargets=%d target0=%p extra=0x%llx", target_count,
+			        (void *)ctrl_targets[0], (unsigned long long)GetMessageExtraInfo());
+		}
 		if (out_handled != NULL) {
 			*out_handled = true;
 		}
@@ -750,6 +772,13 @@ qwerty_process_win32(struct xrt_device **xdevs,
 					qwerty_release_trigger(ctrl_targets[i]);
 			}
 			lmb_was_down = lmb_down;
+			// #1700: the touchpad fallback is a second, silent way to
+			// produce a select edge — trace it like the real button.
+			if (debug_get_bool_option_qw32_qtrace()) {
+				U_LOG_W("[QTRACE] W32 MOUSEMOVE LMB-SYNTH %s wParam=0x%llx async=%d ntargets=%d",
+				        lmb_down ? "DOWN" : "UP", wParam,
+				        (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0 ? 1 : 0, target_count);
+			}
 		}
 		if (mmb_down != mmb_was_down) {
 			for (int i = 0; i < target_count; i++) {
