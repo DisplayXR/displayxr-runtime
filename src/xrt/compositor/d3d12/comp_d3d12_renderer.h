@@ -10,6 +10,8 @@
 #pragma once
 
 #include "xrt/xrt_defines.h"
+// #1580: the eye set and the canvas metres the per-view camera resolver takes.
+#include "xrt/xrt_display_metrics.h"
 #include "xrt/xrt_results.h"
 
 #include <stdint.h>
@@ -90,8 +92,12 @@ comp_d3d12_renderer_destroy(struct comp_d3d12_renderer **renderer_ptr);
  * @param layers The accumulated layers.
  * @param left_eye Left eye position for projection (NULL for default).
  * @param right_eye Right eye position for projection (NULL for default).
+ * @param eyes The display processor's WHOLE per-view eye set (#1580), for the
+ *        shared per-view camera resolver — nullable.
  * @param target_width Width of the render target (window).
  * @param target_height Height of the render target (window).
+ * @param canvas The app window's metrics (#1580), nullable — the camera
+ *        resolver's canvas-metres branch only.
  * @param layout The frame's effective content layout (#542), from
  *        @ref comp_d3d12_renderer_compute_effective_layout.
  *
@@ -105,8 +111,10 @@ comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
                          struct comp_layer_accum *layers,
                          struct xrt_vec3 *left_eye,
                          struct xrt_vec3 *right_eye,
+                         const struct xrt_eye_positions *eyes,
                          uint32_t target_width,
                          uint32_t target_height,
+                         const struct xrt_window_metrics *canvas,
                          const struct comp_d3d12_eff_layout *layout);
 
 /*!
@@ -119,17 +127,24 @@ comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
  * Pair with @ref comp_d3d12_renderer_draw_window_space_pass; insert
  * a capture call between them for the projection-only mode (#210).
  *
+ * @p eyes and @p canvas feed the shared per-view camera resolver (#1580) that
+ * every non-projection layer is projected through; both are optional (the
+ * resolver falls back, it never fails) and neither affects the projection blit,
+ * which stays an identity-MVP stretch into the view's tile.
+ *
  * @ingroup comp_d3d12
  */
 xrt_result_t
 comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
-                                          void *cmd_list,
-                                          struct comp_layer_accum *layers,
-                                          struct xrt_vec3 *left_eye,
-                                          struct xrt_vec3 *right_eye,
-                                          uint32_t target_width,
-                                          uint32_t target_height,
-                                          const struct comp_d3d12_eff_layout *layout);
+                                         void *cmd_list,
+                                         struct comp_layer_accum *layers,
+                                         struct xrt_vec3 *left_eye,
+                                         struct xrt_vec3 *right_eye,
+                                         const struct xrt_eye_positions *eyes,
+                                         uint32_t target_width,
+                                         uint32_t target_height,
+                                         const struct xrt_window_metrics *canvas,
+                                         const struct comp_d3d12_eff_layout *layout);
 
 /*!
  * Window-space-pass half of @ref comp_d3d12_renderer_draw. Records:

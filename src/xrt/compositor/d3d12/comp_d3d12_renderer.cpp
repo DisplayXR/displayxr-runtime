@@ -12,6 +12,11 @@
 #include "comp_d3d12_swapchain.h"
 
 #include "util/comp_layer_accum.h"
+// #1580: the ONE per-view camera every layer type is projected through, plus
+// the composition policy (eye visibility, quad facing, the blend rule) that
+// goes with it. Shared across every backend so the answer cannot depend on
+// which one is asking.
+#include "util/comp_layer_view_camera.h"
 #include "util/u_logging.h"
 #include "d3d/d3d_dxgi_formats.h"
 #include "math/m_api.h"
@@ -1429,13 +1434,15 @@ comp_d3d12_renderer_destroy(struct comp_d3d12_renderer **renderer_ptr)
 
 extern "C" xrt_result_t
 comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
-                                          void *cmd_list_ptr,
-                                          struct comp_layer_accum *layers,
-                                          struct xrt_vec3 *left_eye,
-                                          struct xrt_vec3 *right_eye,
-                                          uint32_t target_width,
-                                          uint32_t target_height,
-                                          const struct comp_d3d12_eff_layout *layout)
+                                         void *cmd_list_ptr,
+                                         struct comp_layer_accum *layers,
+                                         struct xrt_vec3 *left_eye,
+                                         struct xrt_vec3 *right_eye,
+                                         const struct xrt_eye_positions *eyes,
+                                         uint32_t target_width,
+                                         uint32_t target_height,
+                                         const struct xrt_window_metrics *canvas,
+                                         const struct comp_d3d12_eff_layout *layout)
 {
 	ID3D12GraphicsCommandList *cmd_list = static_cast<ID3D12GraphicsCommandList *>(cmd_list_ptr);
 
@@ -1500,6 +1507,45 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 	// CONTENT view count from the SUBMISSION-derived effective layout
 	// (#542) — no longer clamped by the hardware weave-state.
 	uint32_t view_count = layout->views;
+
+	/*
+	 * #1580 — ONE camera per view per frame, shared by every layer type: the
+	 * {pose, fov} xrLocateViews returned, in the compositor's layer space.
+	 * The projection draw below is an identity-MVP stretch into the view's
+	 * tile, so the tile IS that frustum; a quad composed through any other
+	 * camera lands on different display pixels than projection content at
+	 * the same world pose. Resolution lives in comp_util so D3D12 consumes
+	 * the SAME implementation as D3D11, Metal, GL and vk_native — see
+	 * comp_layer_view_camera.h for the branches and the once-latched
+	 * fallback warning.
+	 *
+	 * The WHOLE eye set goes in, plus this frame's active view count, so the
+	 * resolver can apply the two eye-set rules the state tracker applies
+	 * before it reports a view (mono centroid collapse; per-view eyes with
+	 * surplus views clamped). The canvas metres feed the display-centric
+	 * branch only — the one a quad-only frame, with no app camera to borrow,
+	 * falls back to. Both are optional: without them the resolver falls
+	 * back, it does not fail, and the return value is a DIAGNOSTIC that must
+	 * never gate a draw.
+	 *
+	 * left_eye / right_eye are untouched: they remain the display
+	 * processor's L/R pair for the projection path.
+	 */
+	const bool have_wm =
+	    canvas != nullptr && canvas->valid && canvas->window_width_m > 0.0f && canvas->window_height_m > 0.0f;
+	// Where the canvas centre sits in the layer space: in-process the head is
+	// at the DISPLAY-plane centre, so an off-centre window tilts the frustum
+	// without moving the view pose.
+	const struct xrt_vec3 canvas_center =
+	    have_wm ? xrt_vec3{canvas->window_center_offset_x_m, canvas->window_center_offset_y_m,
+	                       canvas->window_center_offset_z_m}
+	            : xrt_vec3{0.0f, 0.0f, 0.0f};
+	struct comp_layer_view_camera cameras[XRT_MAX_VIEWS] = {};
+	for (uint32_t view = 0; view < view_count && view < XRT_MAX_VIEWS; view++) {
+		comp_layer_view_camera_select_eyes(layers, view, eyes, view_count, have_wm ? &canvas_center : nullptr,
+		                                   have_wm ? canvas->window_width_m : 0.0f,
+		                                   have_wm ? canvas->window_height_m : 0.0f, &cameras[view]);
+	}
 
 	// For each projection / zone layer, stretch-blit swapchain images into
 	// atlas tiles (zone layers land at the zone rect scaled into the tile
@@ -1823,13 +1869,14 @@ comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
                          struct comp_layer_accum *layers,
                          struct xrt_vec3 *left_eye,
                          struct xrt_vec3 *right_eye,
+                         const struct xrt_eye_positions *eyes,
                          uint32_t target_width,
                          uint32_t target_height,
+                         const struct xrt_window_metrics *canvas,
                          const struct comp_d3d12_eff_layout *layout)
 {
 	xrt_result_t xret = comp_d3d12_renderer_draw_projection_pass(
-	    renderer, cmd_list_ptr, layers, left_eye, right_eye,
-	    target_width, target_height, layout);
+	    renderer, cmd_list_ptr, layers, left_eye, right_eye, eyes, target_width, target_height, canvas, layout);
 	if (xret != XRT_SUCCESS) {
 		return xret;
 	}
