@@ -10,6 +10,9 @@
 #include "comp_d3d12_renderer.h"
 #include "comp_d3d12_compositor.h"
 #include "comp_d3d12_swapchain.h"
+// #1602: the equirect2 HLSL, shared verbatim with both D3D11 paths. The ray /
+// sphere math is ~100 lines and must not be forked — see the header's preamble.
+#include "d3d_shared/comp_equirect2_shaders.h"
 
 #include "util/comp_layer_accum.h"
 // #1580: the ONE per-view camera every layer type is projected through, plus
@@ -466,6 +469,21 @@ struct comp_d3d12_renderer
 	 */
 	ID3D12PipelineState *quad_layer_pso[2][2][3];
 
+	/*!
+	 * #1602 — `XR_KHR_composition_layer_equirect2`. Its own root signature
+	 * because its constant block is 40 DWORDs where the quad's is 32, and its
+	 * own pipelines because the shaders are different; the INDEXING is the
+	 * quad's, for the same three reasons —
+	 * [target is the _SRGB compose target][source is a Texture2DArray][blend
+	 * slot], three slots because a sphere section is a SUB-RECT of the tile
+	 * and can never be its base cover.
+	 *
+	 * @see kEquirect2RootConstants for the constant layout, which is pinned
+	 *      to Equirect2LayerConstants in d3d_shared/comp_equirect2_shaders.h.
+	 */
+	ID3D12RootSignature *equirect2_root_signature;
+	ID3D12PipelineState *equirect2_pso[2][2][3];
+
 	//! Root signature for the masked 2D-over-3D composite (#439).
 	ID3D12RootSignature *composite_root_signature;
 
@@ -588,12 +606,18 @@ struct comp_d3d12_renderer
 static constexpr DXGI_FORMAT kComposeRtvFormat = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
 
 
+//! @p defines lets one HLSL source compile to more than one shader — #1602's
+//! `DXR_LAYERED` equirect2 twin is the only user today. NULL for everything else.
 static HRESULT
-compile_shader(const char *source, const char *entry, const char *target, ID3DBlob **out_blob)
+compile_shader(const char *source,
+               const char *entry,
+               const char *target,
+               ID3DBlob **out_blob,
+               const D3D_SHADER_MACRO *defines = nullptr)
 {
 	ID3DBlob *error_blob = nullptr;
-	HRESULT hr = D3DCompile(source, strlen(source), nullptr, nullptr, nullptr, entry, target, 0, 0, out_blob,
-	                        &error_blob);
+	HRESULT hr =
+	    D3DCompile(source, strlen(source), nullptr, defines, nullptr, entry, target, 0, 0, out_blob, &error_blob);
 	if (FAILED(hr)) {
 		if (error_blob != nullptr) {
 			U_LOG_E("D3D12 renderer: shader compile error: %s",
@@ -795,6 +819,72 @@ quad_layer_pso_for(struct comp_d3d12_renderer *r, enum comp_layer_blend_mode mod
 		// here: the blending-off state, plus the alpha-of-one the caller
 		// folds into the colour scale/bias this shader already applies.
 		return r->quad_layer_pso[rt][tex][QUAD_LAYER_BLEND_SLOT_OPAQUE];
+	}
+}
+
+/*!
+ * #1602 — the equirect2 root-constant block, in DWORDs.
+ *
+ * THE LAYOUT IS @ref Equirect2LayerConstants' AND IT IS NOT FREE TO DRIFT. That
+ * struct, in d3d_shared/comp_equirect2_shaders.h, sits directly beside the
+ * `cbuffer LayerCB : register(b0)` both legs compile, which is the whole reason
+ * it lives there; the D3D11 leg memcpy's it into a mapped constant buffer, and
+ * this leg pushes the SAME struct as root constants in ONE call, because root
+ * constants fill b0 sequentially with no padding of their own. So there is no
+ * second hand-written offset table to disagree with the shader — the only thing
+ * that could drift is the SIZE, and the asserts below pin that:
+ *
+ *   dword  0..15  float4x4 mv_inverse
+ *   dword 16..19  float4   post_transform  (xy = UV offset, zw = UV scale)
+ *   dword 20..23  float4   color_scale
+ *   dword 24..27  float4   color_bias
+ *   dword 28..31  float4   to_tangent      (xy = tan(left,down), zw = the spans)
+ *   dword 32      float    radius          (0 == the spec's +INFINITY)
+ *   dword 33      float    central_horizontal_angle
+ *   dword 34      float    upper_vertical_angle
+ *   dword 35      float    lower_vertical_angle
+ *   dword 36..39  float4   array_params    (x = source array slice; yzw pad)
+ *
+ * The four scalars at 32..35 exactly fill one 16-byte register, which is why
+ * `array_params` lands at 36 with no explicit pad — HLSL packing and C++
+ * packing agree here, and the static_assert is what keeps that true.
+ *
+ * The VERTEX shader declares only the first 36 DWORDs and the plain PIXEL
+ * shader likewise; a root signature that PROVIDES more constants than a shader
+ * declares is legal and the surplus is never sourced. Same arrangement the
+ * 32-DWORD quad signature already relies on.
+ */
+static constexpr uint32_t kEquirect2RootConstants =
+    static_cast<uint32_t>(sizeof(Equirect2LayerConstants) / sizeof(uint32_t));
+static_assert(sizeof(Equirect2LayerConstants) == 160,
+              "Equirect2LayerConstants must stay the 160-byte block the shared HLSL cbuffer declares");
+static_assert(kEquirect2RootConstants == 40, "the equirect2 root signature is sized for exactly 40 DWORDs");
+static_assert(kEquirect2RootConstants + 1 <= 64,
+              "root signature cost: 40 constants + 1 descriptor table must fit D3D12's 64-DWORD budget");
+
+/*!
+ * The equirect2 PSO that implements one shared blend mode (#1602).
+ *
+ * @param layered Does the layer's swapchain need the Texture2DArray variant?
+ */
+static ID3D12PipelineState *
+equirect2_pso_for(struct comp_d3d12_renderer *r, enum comp_layer_blend_mode mode, bool layered)
+{
+	// #1610: the RTV format is baked into the PSO — see quad_layer_pso_for.
+	const uint32_t rt = r->compose_active ? 1u : 0u;
+	const uint32_t tex = layered ? 1u : 0u;
+
+	switch (mode) {
+	case COMP_LAYER_BLEND_PREMULTIPLIED: return r->equirect2_pso[rt][tex][QUAD_LAYER_BLEND_SLOT_PREMUL];
+	case COMP_LAYER_BLEND_STRAIGHT: return r->equirect2_pso[rt][tex][QUAD_LAYER_BLEND_SLOT_STRAIGHT];
+	case COMP_LAYER_BLEND_REPLACE:
+	case COMP_LAYER_BLEND_OPAQUE_COVER:
+	default:
+		// As for a quad: OPAQUE_COVER is the blending-off state plus the
+		// alpha-of-one the caller folds into the colour scale/bias, which
+		// this shader's `color * color_scale + color_bias` applies. REPLACE
+		// is unreachable for a sub-rect layer and shares the state.
+		return r->equirect2_pso[rt][tex][QUAD_LAYER_BLEND_SLOT_OPAQUE];
 	}
 }
 
@@ -1047,15 +1137,22 @@ renderer_frame_takes_fast_path(struct comp_d3d12_renderer *r, struct comp_layer_
 			break;
 		case XRT_LAYER_QUAD:
 		case XRT_LAYER_WINDOW_SPACE:
-			// Both cover a SUB-RECT and blend over whatever is under
-			// them, so either one alone is already a compose case.
+		// #1602: equirect2 IS drawn on this backend now
+		// (render_equirect2_layer), so it contributes exactly like a quad
+		// does — a sub-rect draw that blends over whatever is under it,
+		// and whose source therefore owes the linear sample the compose
+		// target wants. Leaving it in `default:` would have let a lone
+		// equirect2 frame take the fast path and blend in encoded space.
+		case XRT_LAYER_EQUIRECT2:
+			// All cover a SUB-RECT and blend over whatever is under
+			// them, so any one of them alone is already a compose case.
 			contributing++;
 			sc_count = 1;
 			break;
 		default:
-			// Cylinder / equirect1 / equirect2 / cube: accepted by the
-			// compositor, warned about, never drawn on this backend
-			// (#1581). A type that starts drawing here must move up.
+			// Cylinder / equirect1 / cube: accepted by the compositor,
+			// warned about, never drawn on this backend (#1581). A type
+			// that starts drawing here must move up.
 			break;
 		}
 
@@ -1471,6 +1568,263 @@ render_quad_layer(struct comp_d3d12_renderer *r,
 		if (!first_quad_logged) {
 			first_quad_logged = true;
 			U_LOG_W("#1581: D3D12 drew its first quad layer");
+		}
+	}
+
+	src_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+	src_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	cmd_list->ResourceBarrier(1, &src_barrier);
+}
+
+
+/*!
+ * Render one `XR_KHR_composition_layer_equirect2` layer into every view tile it
+ * is visible in (#1602). Ported from the D3D11 reference
+ * render_equirect2_layer(), off the SAME HLSL
+ * (d3d_shared/comp_equirect2_shaders.h) and the same shared policy helpers.
+ *
+ * Mechanically unlike every other draw in this file: there is no model geometry
+ * and no MVP. The vertex shader emits a fullscreen strip carrying a per-pixel
+ * CAMERA RAY, and the pixel shader intersects that ray with the layer's sphere
+ * and reads spherical UVs off the hit. So what goes down the constant block is
+ * the INVERSE model-view (rays are cast in the layer's model space) plus the
+ * frustum's tangent extents, not a forward transform — which is also why this
+ * draw needs no D3D-vs-Vulkan clip-space variant the way the quad MVP did
+ * (#1580): no projection matrix is ever built.
+ *
+ * The strip is fullscreen in NDC, so the per-view VIEWPORT is what confines it
+ * to the tile — exactly as the D3D11 leg relies on.
+ *
+ * Structured like render_quad_layer: the views are the INNER loop, so the
+ * source is transitioned and given an SRV descriptor ONCE per layer rather than
+ * once per tile.
+ *
+ * @param cameras This frame's per-view cameras (#1580) — the same ones the
+ *                projection blit framed its tiles by, so an equirect2
+ *                background and a quad at the same world pose land on
+ *                consistent display pixels.
+ * @param tiles   Per-view painter's-order state (#1598). An equirect2 layer
+ *                paints only the sphere section it covers, so it MARKS the tile
+ *                (a projection layer submitted after it blends over it rather
+ *                than erasing it) but can never take the base slot.
+ */
+static void
+render_equirect2_layer(struct comp_d3d12_renderer *r,
+                       ID3D12GraphicsCommandList *cmd_list,
+                       const struct comp_layer *layer,
+                       uint32_t view_count,
+                       const struct comp_layer_view_camera *cameras,
+                       struct comp_layer_tile_state *tiles,
+                       uint32_t target_width,
+                       uint32_t target_height,
+                       const struct comp_d3d12_eff_layout *layout)
+{
+	auto internals = get_internals(r->c);
+	ID3D12Device *device = internals->device;
+	const struct xrt_layer_data *data = &layer->data;
+	const struct xrt_layer_equirect2_data *eq = &data->equirect2;
+
+	/*
+	 * Per-eye visibility, view-count aware (#1580). No front-facing test:
+	 * a sphere has no back face to cull. The #1590 rule is normative for
+	 * QUADS specifically ("only front face of the quad surface is visible"),
+	 * and applying it here would drop a viewer standing INSIDE the sphere,
+	 * which is the ordinary case for a 360 background.
+	 */
+	bool visible[XRT_MAX_VIEWS] = {};
+	bool any_visible = false;
+	for (uint32_t vi = 0; vi < view_count && vi < XRT_MAX_VIEWS; vi++) {
+		visible[vi] = is_layer_view_visible_n(data, vi, view_count);
+		any_visible = any_visible || visible[vi];
+	}
+	if (!any_visible) {
+		return;
+	}
+
+	struct xrt_swapchain *xsc = layer->sc_array[0];
+	if (xsc == nullptr) {
+		return;
+	}
+
+	ID3D12Resource *src_resource =
+	    static_cast<ID3D12Resource *>(comp_d3d12_swapchain_get_resource(xsc, eq->sub.image_index));
+	if (src_resource == nullptr) {
+		return;
+	}
+
+	// One descriptor for the whole layer: the source, the slice and the
+	// sampler are the same in every view — only the constants, which ride in
+	// the root signature and ARE versioned per draw, differ.
+	uint32_t srv_slot = r->next_srv_slot++;
+	if (srv_slot >= r->srv_heap_size) {
+		U_LOG_E("D3D12 renderer: SRV heap overflow in equirect2 layer (slot %u >= %u)", srv_slot,
+		        r->srv_heap_size);
+		return;
+	}
+
+	// #1601: honour subImage.imageArrayIndex. Gated on the SWAPCHAIN's array
+	// size, not on array_index != 0 — it is the SRV's VIEW DIMENSION that has
+	// to match the shader's declaration, so even slice 0 of an array swapchain
+	// belongs on the Texture2DArray variant.
+	const D3D12_RESOURCE_DESC src_desc = src_resource->GetDesc();
+	const bool layered = src_desc.DepthOrArraySize > 1;
+
+	D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+	// #1589: format-honest when composing — this is a shader draw that BLENDS,
+	// so a composing frame must sample it LINEAR and let the `_SRGB` RTV apply
+	// the OETF once. (An equirect2 frame never takes the fast path: the layer
+	// is a sub-rect contributor, so renderer_frame_takes_fast_path() counts it.)
+	srv_desc.Format = layer_source_format(r, src_resource);
+	srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	if (layered) {
+		srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+		srv_desc.Texture2DArray.MostDetailedMip = 0;
+		srv_desc.Texture2DArray.MipLevels = 1;
+		srv_desc.Texture2DArray.FirstArraySlice = 0;
+		srv_desc.Texture2DArray.ArraySize = src_desc.DepthOrArraySize;
+		srv_desc.Texture2DArray.PlaneSlice = 0;
+	} else {
+		srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+		srv_desc.Texture2D.MipLevels = 1;
+	}
+
+	D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu = r->srv_heap->GetCPUDescriptorHandleForHeapStart();
+	srv_cpu.ptr += r->srv_descriptor_size * srv_slot;
+	device->CreateShaderResourceView(src_resource, &srv_desc, srv_cpu);
+
+	D3D12_GPU_DESCRIPTOR_HANDLE gpu_srv = r->srv_heap->GetGPUDescriptorHandleForHeapStart();
+	gpu_srv.ptr += r->srv_descriptor_size * srv_slot;
+
+	// #747: a released swapchain image IS in RENDER_TARGET per
+	// XR_KHR_D3D12_enable, and must be handed back in it. Byte-for-byte the
+	// quad draw's pair of barriers.
+	D3D12_RESOURCE_BARRIER src_barrier = {};
+	src_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	src_barrier.Transition.pResource = src_resource;
+	src_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	src_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+	src_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	cmd_list->ResourceBarrier(1, &src_barrier);
+
+	ID3D12DescriptorHeap *heaps[] = {r->srv_heap};
+	cmd_list->SetDescriptorHeaps(1, heaps);
+	cmd_list->SetGraphicsRootSignature(r->equirect2_root_signature);
+	cmd_list->SetGraphicsRootDescriptorTable(0, gpu_srv);
+
+	D3D12_CPU_DESCRIPTOR_HANDLE rtv = renderer_target_rtv(r);
+	cmd_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+	cmd_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+
+	// Same mono clamp the projection, quad and window-space passes apply.
+	uint32_t vp_w = layout->tile_w;
+	uint32_t vp_h = layout->tile_h;
+	if (layout->views == 1) {
+		if (target_width < layout->tile_w) {
+			vp_w = target_width;
+		}
+		if (target_height < r->texture_height) {
+			vp_h = target_height;
+		}
+	}
+
+	for (uint32_t vi = 0; vi < view_count && vi < XRT_MAX_VIEWS; vi++) {
+		if (!visible[vi]) {
+			continue;
+		}
+
+		// Inverse model-view: the shader casts rays FROM the camera INTO
+		// the layer's model space, so it needs the inverse of the forward
+		// transform. No projection matrix is built — see the note above.
+		struct xrt_matrix_4x4 model, view, mv, mv_inv;
+		const struct xrt_vec3 scale = {1.0f, 1.0f, 1.0f};
+		math_matrix_4x4_model(&eq->pose, &scale, &model);
+		math_matrix_4x4_view_from_pose(&cameras[vi].pose, &view);
+		math_matrix_4x4_multiply(&view, &model, &mv);
+		math_matrix_4x4_inverse(&mv, &mv_inv);
+
+		Equirect2LayerConstants constants = {};
+		memcpy(constants.mv_inverse, mv_inv.v, sizeof(constants.mv_inverse));
+
+		// The frustum's tangent extents at the unit plane, which is how the
+		// vertex shader turns a [0,1] screen position into a ray. THE ONLY
+		// place this view's FOV enters.
+		const struct xrt_fov *fov = &cameras[vi].fov;
+		constants.to_tangent[0] = tanf(fov->angle_left);
+		constants.to_tangent[1] = tanf(fov->angle_down);
+		constants.to_tangent[2] = tanf(fov->angle_right) - tanf(fov->angle_left);
+		constants.to_tangent[3] = tanf(fov->angle_up) - tanf(fov->angle_down);
+
+		constants.post_transform[0] = eq->sub.norm_rect.x;
+		constants.post_transform[1] = eq->sub.norm_rect.y;
+		constants.post_transform[2] = eq->sub.norm_rect.w;
+		constants.post_transform[3] = eq->sub.norm_rect.h;
+		if (data->flip_y) {
+			constants.post_transform[1] += constants.post_transform[3];
+			constants.post_transform[3] = -constants.post_transform[3];
+		}
+
+		get_color_scale_bias(data, constants.color_scale, constants.color_bias);
+
+		/*
+		 * #1599: the SHARED three-way rule, through the SUB-RECT spelling.
+		 * An equirect2 layer paints only the sphere section it covers, so
+		 * it cannot establish the tile's alpha and must never take the base
+		 * slot — cleared atlas or not. It still marks the tile.
+		 *
+		 * An unflagged layer is an OPAQUE_COVER whose alpha-of-one the
+		 * SHADER emits, folded into the scale/bias channel below. Fragments
+		 * outside the layer's angular extent never reach that line — they
+		 * `discard` — so the fold raises alpha exactly where the layer
+		 * covers and nowhere else, which is what "the layer's alpha is one"
+		 * means.
+		 */
+		const enum comp_layer_blend_mode mode = comp_layer_subrect_blend_mode(&tiles[vi], data->flags);
+		comp_layer_blend_fold_opaque_cover(mode, constants.color_scale, constants.color_bias);
+
+		// The spec says +INFINITY for "as far away as possible"; the shader
+		// spells that zero and skips the intersection entirely, using the
+		// ray direction.
+		constants.radius = std::isinf(eq->radius) ? 0.0f : eq->radius;
+		constants.central_horizontal_angle = eq->central_horizontal_angle;
+		constants.upper_vertical_angle = eq->upper_vertical_angle;
+		constants.lower_vertical_angle = eq->lower_vertical_angle;
+
+		constants.array_params[0] = layered ? static_cast<float>(eq->sub.array_index) : 0.0f;
+
+		cmd_list->SetPipelineState(equirect2_pso_for(r, mode, layered));
+		// ONE push of the whole block — see kEquirect2RootConstants for why
+		// there is no per-field offset table to keep in step with the HLSL.
+		cmd_list->SetGraphicsRoot32BitConstants(1, kEquirect2RootConstants, &constants, 0);
+
+		const uint32_t tile_x = (vi % layout->cols) * layout->tile_w;
+		const uint32_t tile_y = (vi / layout->cols) * layout->tile_h;
+
+		D3D12_VIEWPORT vp = {};
+		vp.TopLeftX = static_cast<float>(tile_x);
+		vp.TopLeftY = static_cast<float>(tile_y);
+		vp.Width = static_cast<float>(vp_w);
+		vp.Height = static_cast<float>(vp_h);
+		vp.MinDepth = 0.0f;
+		vp.MaxDepth = 1.0f;
+		cmd_list->RSSetViewports(1, &vp);
+
+		D3D12_RECT scissor = {};
+		scissor.left = tile_x;
+		scissor.top = tile_y;
+		scissor.right = tile_x + vp_w;
+		scissor.bottom = tile_y + vp_h;
+		cmd_list->RSSetScissorRects(1, &scissor);
+
+		// Fullscreen strip, 4 vertices — the viewport restricts it to the tile.
+		cmd_list->DrawInstanced(4, 1, 0, 0);
+
+		// One line per process, at the first equirect2 D3D12 ever draws —
+		// the hardware leg's discriminator between "the port is live" and
+		// "the frame carried no equirect2". NEVER per frame.
+		static bool first_equirect2_logged = false;
+		if (!first_equirect2_logged) {
+			first_equirect2_logged = true;
+			U_LOG_W("#1602: D3D12 drew its first equirect2 layer");
 		}
 	}
 
@@ -1930,6 +2284,151 @@ comp_d3d12_renderer_create(struct comp_d3d12_compositor *c,
 		}
 	}
 
+	// --- #1602: equirect2 root signature (SRV table [t0] + 40 root constants
+	// [b0, see kEquirect2RootConstants] + the same static LINEAR sampler). ---
+	//
+	// Its OWN signature rather than the quad's: the constant block is 40 DWORDs
+	// where the quad's is 32, and growing the quad signature to fit would make
+	// every window-space and quad draw pay for constants it never declares.
+	D3D12_DESCRIPTOR_RANGE eq2_srv_range = {};
+	eq2_srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+	eq2_srv_range.NumDescriptors = 1;
+	eq2_srv_range.BaseShaderRegister = 0;
+	eq2_srv_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+	D3D12_ROOT_PARAMETER eq2_root_params[2] = {};
+	eq2_root_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+	eq2_root_params[0].DescriptorTable.NumDescriptorRanges = 1;
+	eq2_root_params[0].DescriptorTable.pDescriptorRanges = &eq2_srv_range;
+	eq2_root_params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+	// VISIBILITY_ALL, not PIXEL: the vertex shader reads mv_inverse and
+	// to_tangent out of the same b0 to build the per-pixel camera ray.
+	eq2_root_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+	eq2_root_params[1].Constants.ShaderRegister = 0;
+	eq2_root_params[1].Constants.RegisterSpace = 0;
+	eq2_root_params[1].Constants.Num32BitValues = kEquirect2RootConstants;
+	eq2_root_params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+	D3D12_STATIC_SAMPLER_DESC eq2_sampler = {};
+	eq2_sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+	eq2_sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+	eq2_sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+	eq2_sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+	eq2_sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+	eq2_sampler.MaxLOD = D3D12_FLOAT32_MAX;
+	eq2_sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+	D3D12_ROOT_SIGNATURE_DESC eq2_rs_desc = {};
+	eq2_rs_desc.NumParameters = 2;
+	eq2_rs_desc.pParameters = eq2_root_params;
+	eq2_rs_desc.NumStaticSamplers = 1;
+	eq2_rs_desc.pStaticSamplers = &eq2_sampler;
+	eq2_rs_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+	sig_blob = nullptr;
+	error_blob = nullptr;
+	hr = D3D12SerializeRootSignature(&eq2_rs_desc, D3D_ROOT_SIGNATURE_VERSION_1, &sig_blob, &error_blob);
+	if (FAILED(hr)) {
+		if (error_blob != nullptr) {
+			U_LOG_E("Equirect2 root signature serialize error: %s",
+			        static_cast<const char *>(error_blob->GetBufferPointer()));
+			error_blob->Release();
+		}
+		comp_d3d12_renderer_destroy(&r);
+		return XRT_ERROR_D3D;
+	}
+	hr = device->CreateRootSignature(0, sig_blob->GetBufferPointer(), sig_blob->GetBufferSize(),
+	                                 __uuidof(ID3D12RootSignature),
+	                                 reinterpret_cast<void **>(&r->equirect2_root_signature));
+	sig_blob->Release();
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create equirect2 root signature: 0x%08x", hr);
+		comp_d3d12_renderer_destroy(&r);
+		return XRT_ERROR_D3D;
+	}
+
+	// --- #1602: the twelve equirect2 pipelines ---
+	//
+	// The SAME twelve-way shape as the quad-layer set above and for the same
+	// three reasons: the plain and the Texture2DArray pixel shader (#1601 —
+	// one HLSL source, compiled twice, the second with DXR_LAYERED), each in
+	// the three blend states a SUB-RECT layer can need, each against both
+	// render-target formats (#1610).
+	//
+	// Both pixel-shader variants are FATAL here, unlike the D3D11 leg where a
+	// failed array compile degrades to slice 0: a D3D12 PSO bakes its shader,
+	// so there is nothing to fall back TO — binding the Texture2D pipeline
+	// against a Texture2DArray SRV is an invalid draw, not a degraded one.
+	{
+		ID3DBlob *eq2_vs_blob = nullptr;
+		ID3DBlob *eq2_ps_blob[2] = {nullptr, nullptr};
+		const D3D_SHADER_MACRO layered_defines[] = {{"DXR_LAYERED", "1"}, {nullptr, nullptr}};
+
+		hr = compile_shader(equirect2_vs_hlsl, "VSMain", "vs_5_0", &eq2_vs_blob);
+		if (SUCCEEDED(hr)) {
+			hr = compile_shader(equirect2_ps_hlsl, "PSMain", "ps_5_0", &eq2_ps_blob[0]);
+		}
+		if (SUCCEEDED(hr)) {
+			hr = compile_shader(equirect2_ps_hlsl, "PSMain", "ps_5_0", &eq2_ps_blob[1], layered_defines);
+		}
+		if (FAILED(hr)) {
+			U_LOG_E("Failed to compile equirect2 shaders: 0x%08x", hr);
+			if (eq2_vs_blob != nullptr) {
+				eq2_vs_blob->Release();
+			}
+			if (eq2_ps_blob[0] != nullptr) {
+				eq2_ps_blob[0]->Release();
+			}
+			comp_d3d12_renderer_destroy(&r);
+			return XRT_ERROR_D3D;
+		}
+
+		D3D12_GRAPHICS_PIPELINE_STATE_DESC eq2_desc = quad_pso_desc;
+		eq2_desc.pRootSignature = r->equirect2_root_signature;
+		eq2_desc.VS.pShaderBytecode = eq2_vs_blob->GetBufferPointer();
+		eq2_desc.VS.BytecodeLength = eq2_vs_blob->GetBufferSize();
+
+		for (uint32_t target = 0; target < 2 && SUCCEEDED(hr); target++) {
+			eq2_desc.RTVFormats[0] = target == 0 ? DXGI_FORMAT_R8G8B8A8_UNORM : kComposeRtvFormat;
+
+			for (uint32_t tex = 0; tex < 2 && SUCCEEDED(hr); tex++) {
+				eq2_desc.PS.pShaderBytecode = eq2_ps_blob[tex]->GetBufferPointer();
+				eq2_desc.PS.BytecodeLength = eq2_ps_blob[tex]->GetBufferSize();
+
+				for (uint32_t slot = 0; slot < 3 && SUCCEEDED(hr); slot++) {
+					D3D12_RENDER_TARGET_BLEND_DESC &rt = eq2_desc.BlendState.RenderTarget[0];
+					// Identical to the quad-layer table: OPAQUE_COVER
+					// (and the unreachable REPLACE) write the source
+					// verbatim, and the alpha-of-one that separates
+					// them is the caller's colour-scale/bias fold.
+					rt.BlendEnable = slot == QUAD_LAYER_BLEND_SLOT_OPAQUE ? FALSE : TRUE;
+					rt.SrcBlend = slot == QUAD_LAYER_BLEND_SLOT_STRAIGHT ? D3D12_BLEND_SRC_ALPHA
+					                                                     : D3D12_BLEND_ONE;
+					rt.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+					rt.BlendOp = D3D12_BLEND_OP_ADD;
+					rt.SrcBlendAlpha = D3D12_BLEND_ONE;
+					rt.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+					rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+					rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+					hr = device->CreateGraphicsPipelineState(
+					    &eq2_desc, __uuidof(ID3D12PipelineState),
+					    reinterpret_cast<void **>(&r->equirect2_pso[target][tex][slot]));
+				}
+			}
+		}
+
+		eq2_vs_blob->Release();
+		eq2_ps_blob[0]->Release();
+		eq2_ps_blob[1]->Release();
+
+		if (FAILED(hr)) {
+			U_LOG_E("Failed to create equirect2 PSO: 0x%08x", hr);
+			comp_d3d12_renderer_destroy(&r);
+			return XRT_ERROR_D3D;
+		}
+	}
+
 	// --- Masked-composite root signature (#439): SRV table of 3 (t0 2D /
 	// t1 mask / t2 weave snapshot) + 8 root constants (CompositeParams, b0)
 	// + static POINT sampler (byte-identity with the strip copies). ---
@@ -2233,6 +2732,21 @@ comp_d3d12_renderer_destroy(struct comp_d3d12_renderer **renderer_ptr)
 	if (r->composite_root_signature != nullptr) {
 		r->composite_root_signature->Release();
 	}
+	// #1602/#1610: the twelve equirect2 pipelines and their own signature.
+	for (uint32_t target = 0; target < 2; target++) {
+		for (uint32_t tex = 0; tex < 2; tex++) {
+			for (uint32_t slot = 0; slot < 3; slot++) {
+				if (r->equirect2_pso[target][tex][slot] != nullptr) {
+					r->equirect2_pso[target][tex][slot]->Release();
+					r->equirect2_pso[target][tex][slot] = nullptr;
+				}
+			}
+		}
+	}
+	if (r->equirect2_root_signature != nullptr) {
+		r->equirect2_root_signature->Release();
+		r->equirect2_root_signature = nullptr;
+	}
 	// #1581/#1610: the twelve world-space quad-layer pipelines.
 	for (uint32_t target = 0; target < 2; target++) {
 		for (uint32_t tex = 0; tex < 2; tex++) {
@@ -2498,9 +3012,34 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 			continue;
 		}
 
-		// #1581: cylinder, equirect1, equirect2 and cube are accepted by
-		// the compositor and still not drawn on this backend — the quad is
-		// the one the CTS composition category turns on.
+		/*
+		 * #1602 — equirect2, composited in this same submission-ordered
+		 * loop for the same reason the quad is: each tile then sees every
+		 * layer type in the order the app submitted them, so a projection
+		 * layer submitted after an equirect2 background correctly
+		 * composites OVER it.
+		 *
+		 * Like the quad arm, the draw swaps the root signature and the
+		 * pipeline, so the blit pair is re-stated afterwards for the next
+		 * projection draw. Root arguments do not survive a root-signature
+		 * change, and the projection path sets its descriptor table and
+		 * root constants per draw, so nothing else has to be restored.
+		 */
+		if (layer->data.type == XRT_LAYER_EQUIRECT2) {
+			render_equirect2_layer(renderer, cmd_list, layer, view_count, cameras, tiles, target_width,
+			                       target_height, layout);
+			cmd_list->SetGraphicsRootSignature(renderer->root_signature);
+			cmd_list->SetPipelineState(renderer->blit_pso[renderer->compose_active ? 1u : 0u]);
+			cmd_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+			cmd_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+			continue;
+		}
+
+		// #1581/#1602: cylinder, equirect1 and cube are accepted by the
+		// compositor and still not drawn on this backend. Quad (#1581) and
+		// equirect2 (#1602) are the two the CTS composition category turns
+		// on; each of the other three needs its own shader and its own
+		// constant layout, so they stay accepted-but-undrawn until ported.
 
 		const bool is_zone = layer->data.type == XRT_LAYER_ZONE_3D;
 		if (layer->data.type != XRT_LAYER_PROJECTION &&
