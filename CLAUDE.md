@@ -8,7 +8,7 @@ Guidance for Claude Code (claude.ai/code) when working in this repository.
 
 DisplayXR is a lightweight standalone OpenXR runtime purpose-built for 3D displays (originally forked from **Monado**). It implements the Khronos OpenXR API on Windows, macOS, Linux, and Android. The runtime is vendor-agnostic — any 3D display vendor integrates via a plug-in DLL; **Leia SR** is the first integration.
 
-**Current state:** native compositors ship for all major graphics APIs (D3D11, D3D12, Metal, OpenGL, Vulkan). The display extensions and the vendor plug-in extraction are complete. The spatial shell ships on Windows (macOS port deferred). Linux (X11/XCB, Vulkan-only compositor) **ships** — code-complete on `main`, hardware-validated on real Vulkan+X11 hardware, and published as a `.deb` attached to every `v*` release (#781) plus a tarball via `scripts/package_linux.sh`. Full status: [milestone tracker](https://github.com/DisplayXR/displayxr-runtime/milestones) · [Linux Support](docs/roadmap/linux-support.md).
+**Current state:** native compositors ship for all major graphics APIs (D3D11, D3D12, Metal, OpenGL, Vulkan). The display extensions and the vendor plug-in extraction are complete. The spatial shell ships on Windows (macOS port deferred). Linux (X11/XCB, Vulkan-only compositor) **ships** on Ubuntu 22.04/24.04/26.04 — code-complete on `main`, hardware-validated on real Vulkan+X11 hardware (24.04/26.04), and published as a `.deb` attached to every `v*` release (#781) plus a tarball via `scripts/package_linux.sh`. Full status: [milestone tracker](https://github.com/DisplayXR/displayxr-runtime/milestones) · [Linux Support](docs/roadmap/linux-support.md).
 
 ## Architecture
 
@@ -109,7 +109,7 @@ First run downloads deps (vcpkg, OpenXR loader). Requires VS 2022 (C++ workload)
 ```
 Builds runtime, OpenXR loader, test apps. The macOS Vulkan native compositor runs via MoltenVK over a CAMetalLayer-backed surface (`cube_handle_vk_macos`); an earlier `VK_ERROR_EXTENSION_NOT_PRESENT` failure was a MoltenVK-era issue since resolved. The one dev gotcha is the two-`libvulkan` loader-image conflict (dev build vs installed runtime) — see `docs/getting-started/building.md` and pin `XR_RUNTIME_JSON` / share one loader image.
 
-### Linux (shipping — HW-validated on NVIDIA/Ubuntu 22.04; `.deb` on every release)
+### Linux (shipping — Ubuntu 22.04/24.04/26.04; `.deb` on every release)
 ```bash
 # apt deps listed in the script header (Vulkan, XCB, glslang, …)
 ./scripts/build_linux.sh              # headless build + selftest
@@ -120,6 +120,8 @@ Builds runtime, OpenXR loader, test apps. The macOS Vulkan native compositor run
 ./scripts/test_deb_linux.sh           # Docker: build the .deb on 22.04, install+run it on 22.04/24.04/26.04
 ```
 **Release artifacts are built on the OLDEST supported release (Ubuntu 22.04) — #1656.** The `.deb` and the tarball must install and run on 22.04, 24.04 and 26.04, and a binary's glibc floor is its build host's: v2.19.1 was built on 24.04, needed `GLIBC_2.38`, declared an unversioned `libc6`, and so installed on 22.04 and then failed at every `dlopen`. CI's `Deb` and `Package` jobs therefore run in an `ubuntu:22.04` container; `package_deb_linux.sh` derives versioned `Depends` with `dpkg-shlibdeps` and refuses both a `DT_NEEDED` outside its cross-release `STABLE_SONAMES` list and (with `DXR_DEB_MAX_GLIBC`) a floor above 22.04's; the `DebInstall` matrix installs + runs the package in pristine 22.04/24.04/26.04 containers before `DebRelease` attaches it. The tarball records the floor in `GLIBC_FLOOR` and `install.sh` enforces it. Newest-toolchain compile coverage lives in the `Newest` job (26.04).
+
+**Supported releases: Ubuntu 22.04, 24.04 and 26.04 — on 22.04, recommend an X11 session.** GNOME 42 has no `wp_fractional_scale_v1`, so a native-Wayland window on a scaled 22.04 desktop cannot present a 1:1 buffer and `vk_linux_update_surface_not_1to1()` degrades it to flat 2D (#1595). Everything 22.04 is CI evidence — build, package, install, headless `selftest`; **no panel has been run on 22.04 against the current artifacts**, and the GNOME 42 extension entry point (#1677) has never run on a GNOME 42 desktop. Hardware validation to date is 24.04 + 26.04. Don't upgrade those to "validated" without a panel run.
 
 Linux is **Vulkan-only** — a native Vulkan compositor presents over an X11/XCB surface (`comp_vk_native_window_xcb.c`); no D3D/Metal/GL backend. Apps pass their window via `XR_DXR_xlib_window_binding`. Full walkthrough: `docs/getting-started/building.md` § *Linux*; status + phases: `docs/roadmap/linux-support.md`. **Guard convention:** desktop-Linux code must gate on **`XRT_OS_LINUX_DESKTOP`** (`= XRT_OS_LINUX && !XRT_OS_ANDROID`) — a bare `XRT_OS_LINUX` also matches Android and will pull desktop-only symbols into the Android build.
 

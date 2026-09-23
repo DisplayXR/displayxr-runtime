@@ -34,8 +34,12 @@ plug-in (see *How do display vendors integrate?*).
 
 ### Which operating systems and graphics APIs?
 
-- **OS:** Windows and macOS ship today; Linux (Vulkan-only, X11/XCB) is a hardware-validated
-  preview; Android is supported.
+- **OS:** Windows, macOS, Android and Linux all ship. On Linux (Vulkan-only, X11/XCB),
+  **Ubuntu 22.04, 24.04 and 26.04 are supported** — on 22.04, use an X11 session, because
+  GNOME 42 does not implement the Wayland fractional-scale protocol and a native-Wayland
+  window cannot then be guaranteed 1:1 with the panel on a scaled desktop. Packages are
+  built on 22.04 and CI-verified to install and headlessly self-test on all three;
+  hardware validation to date is on 24.04 and 26.04.
 - **Graphics APIs:** each API gets a **native compositor** — D3D11, D3D12, Vulkan, Metal,
   and OpenGL — with no interop layer or Vulkan intermediary. On Windows all five are
   available; Linux is Vulkan-only; macOS uses Metal/Vulkan(MoltenVK)/GL.

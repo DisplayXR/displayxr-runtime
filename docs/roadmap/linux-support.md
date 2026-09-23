@@ -4,19 +4,22 @@ Status: **Shipping — code-complete, hardware-validated, and published on every
 release.** Linux is a supported platform alongside Windows, macOS and Android.
 Phases 0/1a/2a/3a are complete on `main`; hosted + handle
 (`XR_DXR_xlib_window_binding`) sessions bring up the native Vulkan/XCB compositor
-and render the stereo cube on real Vulkan+X11 hardware (Ubuntu 22.04, RTX 3080 +
-Acer SpatialLabs DS1; #708 / #706), and the **Track B real srSDK Vulkan weave is
-HW-validated on the DS1** (lens enables). Runtime **v1.28.0** was the first tag
+and render the stereo cube on real Vulkan+X11 hardware (#708 / #706), and the
+**Track B real srSDK Vulkan weave is HW-validated on a real panel** (lens
+enables). That bring-up pass ran on a 22.04 box, but it long predates the
+current packaging (#1656/#1659) and the GNOME 42 entry point (#1677), so it is
+**not** evidence for either — see [Supported
+releases](#supported-releases). Runtime **v1.28.0** was the first tag
 with complete Linux support. **Distribution:** a `displayxr-runtime_<ver>_amd64.deb`
 is built on every PR and attached to every `v*` GitHub Release (#781), alongside
 the user-level tarball from `scripts/package_linux.sh` (#705/#713); the `.deb` is
 built with `libwayland-dev` + `libdbus-1-dev` like every other Linux artifact, so
 it carries the Wayland present path and the #817 window-geometry provider (only
 `libdbus-1-3` lands in its derived `Depends` — no `wl_*` symbol is referenced, so
-`--as-needed` drops `-lwayland-client`). **CI:** a tri-LTS matrix (Ubuntu
-22.04/24.04/26.04) is a required check on the runtime and
-all 5 demos (#714/#722); all 5 demos are build-green on real 22.04/24.04/26.04
-desktops.
+`--as-needed` drops `-lwayland-client`).
+
+**Supported releases and what CI actually gates:** see [Supported
+releases](#supported-releases) below.
 
 **Still open** — none of these gate an in-process `_handle`/`_hosted` app, which
 is the shipping path: Phase 2b service-side render (**#710**, service/IPC mode
@@ -68,6 +71,39 @@ display drops its snaps. Weaving itself is never stopped for this. Full mechanis
 solver's blind spot, and the assessment of what a truly scale-proof design would take
 (a fixed-origin surface, i.e. the shell's compose model):
 [linux-display-scaling.md](../reference/linux-display-scaling.md).
+
+## Supported releases
+
+**Ubuntu 22.04, 24.04 and 26.04 are supported. On 22.04, use an X11 session:
+GNOME 42 does not implement the Wayland fractional-scale protocol
+(`wp_fractional_scale_v1`), so a native-Wayland window cannot be guaranteed 1:1
+with the panel on a scaled desktop and the runtime degrades it to flat 2D
+rather than weave into a resample. Packages are built on 22.04 and CI-verified
+to install and headlessly self-test on all three releases. Hardware validation
+to date is on 24.04 and 26.04 — no panel has been run against the 22.04-built
+packages, and the GNOME 42 extension entry point has never run on a GNOME 42
+desktop.**
+
+That statement is the one to copy; every other page here should say the same
+thing. Two things it deliberately does not claim, because nothing enforces
+them: the vendor plug-in's own glibc floor is *measured* at its 22.04 CI
+baseline rather than asserted by a check, and the by-hand 22.04 weave and
+tracking pass (#1663) is outstanding.
+
+**What CI actually gates, precisely (#714/#722/#1656/#1659).** Earlier revisions
+of this page said a tri-LTS matrix "is a required check on the runtime and all 5
+demos". Half of that was an overclaim, so here is the real shape:
+
+| | Tri-LTS matrix | Required status check? | What it proves |
+|---|---|---|---|
+| Runtime (`build-linux.yml`) | `DebInstall (Ubuntu 22.04 \| 24.04 \| 26.04)` | **No** | Installs the `.deb` + tarball in pristine containers of all three and runs `ldd -r` + env-free `displayxr-cli selftest`. Not in the ruleset, but `DebRelease` `needs:` it, so a red leg blocks the release asset. |
+| Runtime, required Linux checks | — | **Yes**: `Selftest`, `Service`, `Package` | `Package` builds in the `ubuntu:22.04` container and installs from the tarball; `Newest` (26.04) covers the new toolchain and is *not* required. |
+| Demos (all 5) | `Build (Ubuntu 22.04 / 24.04 / 26.04)` | **Yes** | Build-green only — the demos are not run on CI (no display). Four expose the three legs directly; one aggregates them into a single required `Build Linux` check. |
+
+So on the runtime the tri-LTS coverage gates the *release artifact*, not the
+merge; on the demos it gates the merge but proves compilation, not execution.
+Every claim in the table above is CI evidence: build, package, install, and a
+headless self-test. Nothing in it puts pixels on a panel.
 
 ## TL;DR
 
@@ -384,14 +420,18 @@ ships **both** entry-point forms over one shared `lib.js` and the login script
 puts the one the running shell can parse in place (#1663); `shell-version` is
 `42`–`50` and CI asserts it covers every release the `.deb` installs into.
 Loading on GNOME 42 is not hardware-validated yet — no 22.04 desktop box here;
-the by-hand pass is written out in the extension's `README.md`.
+the by-hand pass is written out in the extension's `README.md`. Independently of
+whether it loads, GNOME 42 has no `wp_fractional_scale_v1`, so a native-Wayland
+window on a scaled 22.04 desktop cannot present a 1:1 buffer and the runtime
+degrades it to flat 2D (see *Refuse rather than resample*, #1595). **X11 is the
+recommended session on 22.04.**
 
 ### Conformance — the Linux CTS arms (#1527)
 
 Until #1527 the platform had **no conformance coverage at all**: `build-linux.yml`
 builds and runs the hardware-free `displayxr-cli selftest`, and nothing ran the
-Khronos suite. The by-hand NVIDIA / Ubuntu 22.04 validation above is real
-evidence but not a repeatable gate.
+Khronos suite. The by-hand NVIDIA validation above is real evidence but not a
+repeatable gate.
 
 `cts.yml` now carries a Linux leg — `build-linux-cts` → `run-linux` — running
 `vulkan` and `vulkan2` (the whole Linux matrix; the platform is Vulkan-only) on
@@ -618,10 +658,17 @@ source comments and, until this section, in no document at all.
   present-origin chain — `docs/specs/runtime/wayland-window-geometry.md`.
 - **sim_display is the bring-up display processor** for all phases — the plug-in
   ABI is platform-neutral so no ABI work was required. The vendor plug-in now
-  has a **Linux arm scaffold** (leia-plugin#82, Track A of leia-plugin#81):
-  `DisplayXR-LeiaSR.so` with a **stub weaver** (passthrough SBS blit), built
-  against runtime v1.28.0, CI-validated on Ubuntu 22.04/24.04/26.04
-  (discovery + ABI-green `displayxr-cli selftest`). The SDK-facing seam is
+  has a **Linux arm** (leia-plugin#82, Track A of leia-plugin#81):
+  `DisplayXR-LeiaSR.so`, first shipped with a **stub weaver** (passthrough SBS
+  blit) built against runtime v1.28.0, CI-validated on Ubuntu 22.04/24.04/26.04
+  (discovery + ABI-green `displayxr-cli selftest`). The **real-weaver track is
+  now built and packaged in an `ubuntu:22.04` container too, and installed on
+  all three releases** (leia-plugin#260), on the same portable-packaging pattern
+  as the runtime. Two limits are worth stating plainly: the vendor's own Linux
+  runtime uses 22.04 as its CI build baseline with a **measured** glibc floor of
+  2.35 and a gcc 11 SDK build — measured, because no check asserts it, so it can
+  drift without failing anything — and no 22.04 box has run the real weaver on a
+  panel. The SDK-facing seam is
   fixed by the plug-in repo's `docs/leia-linux-sdk-contract.md` (PROPOSED);
   real weaving lands with Track B when the LeiaSR Linux SDK ships. The stub
   probe declines unless `DXR_LEIA_FORCE_PROBE=1`, so sim_display remains the

@@ -299,6 +299,11 @@ is what lets any package ship it and any runtime consume it.
   `before-paint`/`after-paint` bracket still discriminates off-screen paints
   on mutter 42 — is `CaptureExclusion1.GetState`'s `paints.skipped` going
   non-zero while an area screencast runs. Steps in the extension's `README.md`.
+  Separately from whether it loads: GNOME 42 predates `wp_fractional_scale_v1`,
+  so a native-Wayland client on a scaled 22.04 desktop cannot present a buffer
+  at its device extent, and the 1:1 gate
+  (`vk_linux_update_surface_not_1to1()`, #1595) degrades the session to flat 2D. **X11 is the recommended session on Ubuntu 22.04**, and this
+  provider is not needed there.
 - Mutter emits geometry transactionally with its own redraw, so tracking
   during interactive drags is expected to be at least as good as the X11
   per-frame poll; validate visually (phase lock while dragging).
