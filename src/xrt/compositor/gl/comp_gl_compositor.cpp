@@ -5193,10 +5193,38 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 						if (u_tiling_can_zero_copy(vc, rxs, rys, rws, rhs_arr,
 						                           gsc->info.width, gsc->info.height, mode,
 						                           U_TILING_ORIGIN_BOTTOM_LEFT)) {
-							zero_copy = true;
-							zc_texture = gsc->textures[img_idx];
-							zc_width = gsc->info.width;
-							zc_height = gsc->info.height;
+							/*
+							 * #1589: zero-copy hands the APP'S OWN
+							 * image to the display processor, which is
+							 * told the atlas is ENCODED. That is only
+							 * true when the app's swapchain says so. A
+							 * GL_RGBA8 swapchain holds LINEAR values
+							 * (ADR-021 §6), and there is no compositor
+							 * pass on this branch in which to encode
+							 * them — so the frame takes the atlas path
+							 * instead, where the private
+							 * GL_SRGB8_ALPHA8 compose target does the
+							 * encode. u_tiling_can_zero_copy() remains
+							 * the sole TILING gate (ADR-030); this is a
+							 * colour precondition on its result, not a
+							 * second eligibility rule.
+							 */
+							if (!gl_swapchain_is_srgb(gsc) && !c->legacy_color) {
+								static bool zc_color_warned = false;
+								if (!zc_color_warned) {
+									zc_color_warned = true;
+									U_LOG_W(
+									    "[ZC] refused: reason=color_needs_encode "
+									    "— a UNORM swapchain is scene-linear and "
+									    "owes the sRGB encode, which only the "
+									    "compose path can apply (#1589)");
+								}
+							} else {
+								zero_copy = true;
+								zc_texture = gsc->textures[img_idx];
+								zc_width = gsc->info.width;
+								zc_height = gsc->info.height;
+							}
 						}
 					}
 				}
