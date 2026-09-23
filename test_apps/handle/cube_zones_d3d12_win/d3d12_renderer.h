@@ -104,6 +104,12 @@ void UpdateScene(D3D12Renderer& renderer, float deltaTime, float spinSpeed = 0.5
 //   whenever the render area is <= the shared depth dimensions.
 // clearColorOverride: when non-null AND clear==true, clear the RTV to this
 //   premultiplied RGBA (per-zone tint) instead of the built-in default.
+// rtvFormatOverride: the DXGI format `rtvOverride` was CREATED with. Required
+//   whenever rtvOverride is passed, because #1647's display-referred clear has
+//   to know whether the target encodes on write and a
+//   D3D12_CPU_DESCRIPTOR_HANDLE carries no format to query back (unlike a
+//   D3D11 RTV). DXGI_FORMAT_UNKNOWN falls back to renderer.swapchainFormat,
+//   which is right for the renderer's own heap.
 void RenderScene(
     D3D12Renderer& renderer,
     ID3D12Resource* renderTarget,
@@ -119,7 +125,8 @@ void RenderScene(
     float cubeSize = 0.06f,
     const D3D12_CPU_DESCRIPTOR_HANDLE* rtvOverride = nullptr,
     const D3D12_CPU_DESCRIPTOR_HANDLE* dsvOverride = nullptr,
-    const float* clearColorOverride = nullptr
+    const float* clearColorOverride = nullptr,
+    DXGI_FORMAT rtvFormatOverride = DXGI_FORMAT_UNKNOWN
 );
 
 // Wait for GPU to finish

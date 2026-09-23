@@ -1081,7 +1081,8 @@ static void RenderZonesFrame(XrSessionManager& xr, D3D12Renderer& renderer,
                         /*viewportX*/0, /*viewportY*/0, z.tileW, z.tileH,
                         viewMatrix, projMatrix, /*zoomScale*/1.0f, /*clear*/true,
                         /*cubeHeight*/0.03f, /*cubeZ*/0.0f, /*cubeSize*/0.06f,
-                        &rtv, /*dsvOverride*/nullptr, z.clearColor);
+                        &rtv, /*dsvOverride*/nullptr, z.clearColor,
+                        /*rtvFormatOverride*/(DXGI_FORMAT)z.format);
 
             projViews[zi][vi].subImage.swapchain = z.swapchain;
             projViews[zi][vi].subImage.imageRect.offset = {0, 0};

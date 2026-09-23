@@ -6,6 +6,7 @@
  */
 
 #include "d3d12_renderer.h"
+#include "d3d12_clear.h"   // dxr::ClearRenderTargetViewDisplayReferred (#1647)
 #include "logging.h"
 #include "mip_chain.h"
 #include <d3d12sdklayers.h>
@@ -840,7 +841,8 @@ void RenderScene(
     float cubeSize,
     const D3D12_CPU_DESCRIPTOR_HANDLE* rtvOverride,
     const D3D12_CPU_DESCRIPTOR_HANDLE* dsvOverride,
-    const float* clearColorOverride
+    const float* clearColorOverride,
+    DXGI_FORMAT rtvFormatOverride
 ) {
     HRESULT hr;
 
@@ -923,7 +925,17 @@ void RenderScene(
                 clearColor[2] = 0.25f; clearColor[3] = 1.0f;
             }
         }
-        cmdList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
+        // #1647: clearColor is authored DISPLAY-REFERRED (the per-zone tint
+        // included). An _SRGB RTV encodes on write, so a raw clear brightens it
+        // (13,13,64 -> 63,63,137 measured on the panel). Derive the space from
+        // the format this RTV was CREATED with -- D3D12 cannot query it back off
+        // the descriptor handle, and the swapchain resource is TYPELESS, so the
+        // view's format is the only thing that answers. On the ARRAY leg that is
+        // the zone's own format, which the caller states via rtvFormatOverride.
+        dxr::ClearRenderTargetViewDisplayReferred(cmdList, rtvHandle,
+            rtvFormatOverride != DXGI_FORMAT_UNKNOWN ? rtvFormatOverride
+                                                     : renderer.swapchainFormat,
+            clearColor);
         cmdList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
             1.0f, 0, 0, nullptr);
     }

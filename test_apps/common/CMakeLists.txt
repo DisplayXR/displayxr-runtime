@@ -39,7 +39,9 @@ set(DISPLAYXR_EXTENSIONS_INCLUDE_DIR "${_dxr_ext_includes}" CACHE PATH
 FetchContent_Declare(
     displayxr_common
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    GIT_TAG v2.16.0
+    # v2.19.0 = displayxr-common#56 ("display-referred clears for Vulkan, D3D12
+    # and GL"): the D3D12 apps below clear through its common/d3d12_clear.h.
+    GIT_TAG v2.19.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)

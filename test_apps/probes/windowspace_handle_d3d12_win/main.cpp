@@ -18,6 +18,7 @@
 #include "logging.h"
 #include "xr_session.h"
 #include "d3d12_renderer.h"
+#include "d3d12_clear.h"   // dxr::ClearRenderTargetViewDisplayReferred (#1647)
 #include "xr_window_space_hud.h"
 #include "windowspace_layers.h"
 
@@ -273,7 +274,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                 rtvHandle.ptr += (SIZE_T)rtvIdx * renderer.rtvDescriptorSize;
                 const float clearColor[4] = {
                     wsl::kBgR / 255.0f, wsl::kBgG / 255.0f, wsl::kBgB / 255.0f, wsl::kBgA / 255.0f };
-                cmdList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
+                // #1647: wsl::kBg* is an authored DISPLAY-REFERRED byte colour;
+                // an _SRGB RTV would encode it on write. The RTVs in
+                // renderer.rtvHeap were created with renderer.swapchainFormat.
+                dxr::ClearRenderTargetViewDisplayReferred(cmdList.Get(), rtvHandle,
+                    renderer.swapchainFormat, clearColor);
                 D3D12_RESOURCE_BARRIER toCommon = toRT;
                 toCommon.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
                 toCommon.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
