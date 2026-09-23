@@ -46,6 +46,9 @@
 #include "os/os_threading.h"
 
 #include "util/u_logging.h"
+// #1589/#1610: the two shared colour decisions — the fast-path predicate and
+// the escape hatch. Backend-neutral by design; see its file comment.
+#include "util/u_color_encoding.h"
 #include "util/u_setting.h"
 #include "util/u_weave_scope.h"
 #include "util/u_misc.h"
@@ -456,6 +459,30 @@ struct comp_gl_compositor
 	GLuint atlas_texture;    //!< Atlas texture (tile_columns * view_width x tile_rows * view_height)
 	uint32_t atlas_tex_width;  //!< Atlas texture width (fixed at init)
 	uint32_t atlas_tex_height; //!< Atlas texture height (fixed at init)
+
+	/*!
+	 * @name #1589/#1610 — the private compose target
+	 *
+	 * The atlas is GL_RGBA8 and the display processor is told it holds
+	 * ENCODED bytes. A frame that owes an encode (a scene-linear UNORM
+	 * source) or a blend (two or more layers) therefore cannot paint it
+	 * directly: it paints @ref compose_texture, a GL_SRGB8_ALPHA8 twin of the
+	 * atlas, with GL_FRAMEBUFFER_SRGB on — so the fixed-function blender
+	 * works in LINEAR and the sRGB OETF is applied exactly once, on write, by
+	 * the hardware — and the result is then COPIED verbatim into the atlas.
+	 *
+	 * `compose_active` false ⟹ the #1589 fast path: every draw goes to the
+	 * atlas through the non-decoding binds, byte-identically to the
+	 * pre-#1589 renderer.
+	 * @{
+	 */
+	GLuint compose_texture;     //!< GL_SRGB8_ALPHA8 twin of the atlas, or 0.
+	GLuint compose_fbo;         //!< FBO used to publish it (see gl_publish_compose_to_atlas).
+	uint32_t compose_width;     //!< Its width — always the atlas's.
+	uint32_t compose_height;    //!< Its height — always the atlas's.
+	bool compose_active;        //!< Is THIS frame composing? Resolved once per layer_commit.
+	bool legacy_color;          //!< @ref u_color_legacy_unorm_encoded, cached at init.
+	/*! @} */
 
 	/*!
 	 * @name Capture source — what the DP will actually receive this frame (#1628)
@@ -1898,6 +1925,9 @@ xrt_format_to_gl_internal(int64_t fmt)
 #ifndef GL_TEXTURE_SRGB_DECODE_EXT
 #define GL_TEXTURE_SRGB_DECODE_EXT 0x8A48
 #endif
+#ifndef GL_DECODE_EXT
+#define GL_DECODE_EXT 0x8A49
+#endif
 #ifndef GL_SKIP_DECODE_EXT
 #define GL_SKIP_DECODE_EXT 0x8A4A
 #endif
@@ -1921,6 +1951,45 @@ gl_has_srgb_decode_ext(void)
 		}
 	}
 	return cached != 0;
+}
+
+/*!
+ * #1589 — bind an app swapchain image as a layer SOURCE, in the reading this
+ * frame's render target demands.
+ *
+ * GL has no per-view format the way D3D does: "does this sampler decode?" is
+ * texture-object state (GL_EXT_texture_sRGB_decode), so the twin of D3D12's
+ * `layer_source_format()` is a twin BIND rather than a twin view. Same two
+ * readings, same rule for picking between them:
+ *
+ *   - @p compose true — the frame is painting the private GL_SRGB8_ALPHA8
+ *     compose target, which encodes on write and blends in linear, so the
+ *     input must BE linear: let the hardware decode an sRGB source on sample
+ *     (GL_DECODE_EXT, which is also the GL default). A GL_RGBA8 source is
+ *     unaffected by this parameter and already holds the linear values
+ *     ADR-021 §6 says it does.
+ *   - @p compose false — the fast path hands the app's bytes on UNCHANGED
+ *     into the ENCODED atlas, so the sample-time decode is suppressed
+ *     (GL_SKIP_DECODE_EXT). Byte-for-byte what every pre-#1589 frame did.
+ *
+ * ONE helper, not a decision per site: there are three of these in the atlas
+ * pass (projection/zone blit, quad, window-space) and three-out-of-four is the
+ * bug — a site that keeps the non-decoding bind while the target encodes emits
+ * a bar a stop too bright, which is one half of every failing CTS
+ * GradientFormatsLinearVsNonLinear pair.
+ *
+ * Without GL_EXT_texture_sRGB_decode there is no way to express the
+ * non-decoding read at all, which is why the fast path is capability-gated on
+ * it (see gl_frame_takes_fast_path).
+ */
+static void
+gl_bind_layer_source(GLenum target, GLuint texture, bool compose)
+{
+	glBindTexture(target, texture);
+	if (!gl_has_srgb_decode_ext()) {
+		return;
+	}
+	glTexParameteri(target, GL_TEXTURE_SRGB_DECODE_EXT, compose ? GL_DECODE_EXT : GL_SKIP_DECODE_EXT);
 }
 
 
@@ -2112,19 +2181,13 @@ gl_compositor_create_swapchain(struct xrt_compositor *xc,
 		glTexParameteri(sc->target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 		glTexParameteri(sc->target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-		// sRGB passthrough: apps write display-referred bytes into the sRGB
-		// swapchain image (typically with GL_FRAMEBUFFER_SRGB off). When the
-		// compositor later samples it, a GL_SRGB8_ALPHA8 texture would auto
-		// decode sRGB->linear, and since compose writes to a non-sRGB atlas
-		// with no re-encode the DP receives ~2.2x-too-dark content. The Leia
-		// DP expects sRGB-encoded bytes, so skip the sample-time decode and
-		// pass the stored bytes through unchanged. This is correct for apps
-		// that DO enable GL_FRAMEBUFFER_SRGB too (their encoded bytes also
-		// pass through). Only the in-process native GL path samples these
-		// textures, so this never affects app-side rendering.
-		if (internal_format == GL_SRGB8_ALPHA8 && gl_has_srgb_decode_ext()) {
-			glTexParameteri(sc->target, GL_TEXTURE_SRGB_DECODE_EXT, GL_SKIP_DECODE_EXT);
-		}
+		// #1589: the sample-time sRGB decode is NOT pinned here any more.
+		// Whether a sampler decodes is a property of the PATH about to read
+		// this image, not of the image (ADR-021 §6) — the fast path hands
+		// the app's bytes on unchanged and must not decode, the compose path
+		// writes them through a target that encodes and must. Every read site
+		// states its own answer through gl_bind_layer_source(); this used to
+		// state one of them here, for every path, forever.
 
 		// Store GL texture name in the swapchain_gl images array
 		// (this is what the state tracker reads via xrt_swapchain_gl)
@@ -3210,7 +3273,7 @@ gl_update_zone_feather_mask(struct comp_gl_compositor *c,
 // Y is flipped for the bottom-left GL framebuffer.
 static void
 gl_flatten_one_local2d_layer(struct comp_gl_compositor *c, struct comp_layer *layer, uint32_t region_w,
-                             uint32_t region_h, GLint loc_rect, GLint loc_tex, GLint loc_src, bool skip_decode)
+                             uint32_t region_h, GLint loc_rect, GLint loc_tex, GLint loc_src)
 {
 	struct xrt_swapchain *sc = layer->sc_array[0];
 	if (sc == NULL) {
@@ -3271,10 +3334,14 @@ gl_flatten_one_local2d_layer(struct comp_gl_compositor *c, struct comp_layer *la
 	}
 
 	glActiveTexture(GL_TEXTURE0);
-	glBindTexture(GL_TEXTURE_2D, src_tex);
-	if (skip_decode) {
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SRGB_DECODE_EXT, GL_SKIP_DECODE_EXT);
-	}
+	// #1589: DELIBERATELY the non-decoding read, never this frame's
+	// compose_active. The Local2D flatten is not part of the atlas pass — it
+	// hands the app's bytes on into local2d_scratch, which the POST-weave
+	// composite mixes with the DP's already-encoded output, so encoded is the
+	// space that scratch lives in. Same deliberate exception the D3D12 leg
+	// carries (its flatten is the one direct comp_d3d12_swapchain_sample_format
+	// call left in the renderer).
+	gl_bind_layer_source(GL_TEXTURE_2D, src_tex, /*compose=*/false);
 	glUniform1i(loc_tex, 0);
 	glUniform4f(loc_rect, nx, ny, nw, nh);
 	glUniform4f(loc_src, src_x, src_y, src_w, src_h);
@@ -3299,7 +3366,6 @@ gl_flatten_local_2d_layers(struct comp_gl_compositor *c, uint32_t region_w, uint
 	GLint loc_rect = glGetUniformLocation(c->program_window_space, "u_rect");
 	GLint loc_tex = glGetUniformLocation(c->program_window_space, "u_texture");
 	GLint loc_src = glGetUniformLocation(c->program_window_space, "u_src_rect");
-	const bool skip_decode = gl_has_srgb_decode_ext();
 
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		struct comp_layer *layer = &c->layer_accum.layers[i];
@@ -3310,7 +3376,7 @@ gl_flatten_local_2d_layers(struct comp_gl_compositor *c, uint32_t region_w, uint
 		if (proj_idx >= 0 && (int32_t)i < proj_idx) {
 			continue;
 		}
-		gl_flatten_one_local2d_layer(c, layer, region_w, region_h, loc_rect, loc_tex, loc_src, skip_decode);
+		gl_flatten_one_local2d_layer(c, layer, region_w, region_h, loc_rect, loc_tex, loc_src);
 	}
 
 	glDisable(GL_BLEND);
@@ -3382,14 +3448,13 @@ gl_flatten_backdrop_2d(struct comp_gl_compositor *c, uint32_t dst_w, uint32_t ds
 	GLint loc_rect = glGetUniformLocation(c->program_window_space, "u_rect");
 	GLint loc_tex = glGetUniformLocation(c->program_window_space, "u_texture");
 	GLint loc_src = glGetUniformLocation(c->program_window_space, "u_src_rect");
-	const bool skip_decode = gl_has_srgb_decode_ext();
 
 	for (int32_t i = 0; i < proj_idx; i++) {
 		struct comp_layer *layer = &c->layer_accum.layers[i];
 		if (layer->data.type != XRT_LAYER_LOCAL_2D) {
 			continue;
 		}
-		gl_flatten_one_local2d_layer(c, layer, region_w, region_h, loc_rect, loc_tex, loc_src, skip_decode);
+		gl_flatten_one_local2d_layer(c, layer, region_w, region_h, loc_rect, loc_tex, loc_src);
 	}
 
 	glDisable(GL_BLEND);
@@ -4531,15 +4596,14 @@ gl_render_quad_layer(struct comp_gl_compositor *c,
 		return;
 	}
 
-	// The atlas holds sRGB-ENCODED bytes in a UNORM texture and every other
-	// pass (projection, zones, Local2D, window-space) blends in that encoded
-	// space. GL_FRAMEBUFFER_SRGB would re-encode on write and produce a quad
-	// ~2.2x too bright against encoded neighbours; the sampled swapchain's
-	// decode is suppressed below for the same reason.
+	// #1610: GL_FRAMEBUFFER_SRGB belongs to the PASS, not to this draw — it
+	// is on for the whole atlas pass when that pass is painting the private
+	// GL_SRGB8_ALPHA8 compose target and off when it is painting the atlas
+	// directly, and a quad that toggled it here would blend in a different
+	// space from the projection tile it sits on. This used to disable it
+	// unconditionally, which was right only while the atlas was the sole
+	// target. The matching sample-side decision is the bind below.
 	glDisable(GL_DEPTH_TEST);
-#ifdef GL_FRAMEBUFFER_SRGB
-	glDisable(GL_FRAMEBUFFER_SRGB);
-#endif
 
 	struct xrt_normalized_rect nr = q->sub.norm_rect;
 	if (nr.w == 0.0f || nr.h == 0.0f) {
@@ -4568,15 +4632,10 @@ gl_render_quad_layer(struct comp_gl_compositor *c,
 	glUniform4fv(loc_pt, 1, pt);
 
 	glActiveTexture(GL_TEXTURE0);
-	glBindTexture(qgsc->target, qgsc->textures[img_idx]);
-	// Suppress the sample-time sRGB decode, as the projection swapchain path
-	// does at creation and the window-space / Local2D paths re-assert per
-	// draw: the atlas is UNORM holding sRGB-ENCODED bytes, so a quad that
-	// linearized here would blend against encoded neighbours and come out
-	// wrong.
-	if (gl_has_srgb_decode_ext()) {
-		glTexParameteri(qgsc->target, GL_TEXTURE_SRGB_DECODE_EXT, GL_SKIP_DECODE_EXT);
-	}
+	// #1589: the same reading of this frame's target the projection blit and
+	// the window-space pass take — decode when the target encodes on write,
+	// pass the bytes through when it does not.
+	gl_bind_layer_source(qgsc->target, qgsc->textures[img_idx], c->compose_active);
 	glUniform1i(glGetUniformLocation(prog, "u_texture"), 0);
 	if (layered) {
 		glUniform1f(glGetUniformLocation(prog, "u_layer"), (float)q->sub.array_index);
@@ -4731,6 +4790,12 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 	glDisable(GL_BLEND);
 	glDisable(GL_CULL_FACE);
 	glDisable(GL_SCISSOR_TEST);
+	// #1610: the write-side half of the colour decision, and PASS state — the
+	// atlas pass below turns it on for the frames that paint the private
+	// GL_SRGB8_ALPHA8 compose target. Stated here so no individual draw has to
+	// (the quad draw used to), and so every pass that follows the atlas one
+	// finds it off.
+	glDisable(GL_FRAMEBUFFER_SRGB);
 
 	// Runtime-side 2D/3D toggle from qwerty V key
 #ifdef XRT_BUILD_DRIVER_QWERTY
@@ -5189,7 +5254,7 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 				uint32_t array_index = layer->data.proj.v[eye].sub.array_index;
 				glUseProgram(c->program_blit_array);
 				glUniform1f(loc_flip_arr, 0.0f);
-				glBindTexture(GL_TEXTURE_2D_ARRAY, gsc->textures[img_idx]);
+				gl_bind_layer_source(GL_TEXTURE_2D_ARRAY, gsc->textures[img_idx], c->compose_active);
 				glUniform1i(loc_tex_arr, 0);
 				glUniform4f(loc_rect_arr, nr.x, nr.y, nr.w, nr.h);
 				glUniform1f(loc_layer_arr, (float)array_index);
@@ -5197,7 +5262,7 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 				glUniform4fv(loc_cbias_arr, 1, cbias);
 			} else {
 				glUseProgram(c->program_blit);
-				glBindTexture(GL_TEXTURE_2D, gsc->textures[img_idx]);
+				gl_bind_layer_source(GL_TEXTURE_2D, gsc->textures[img_idx], c->compose_active);
 				glUniform1i(loc_tex, 0);
 				glUniform4f(loc_rect, nr.x, nr.y, nr.w, nr.h);
 				glUniform4fv(loc_cscale, 1, cscale);
@@ -5312,7 +5377,7 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 			glUniform4f(loc_ws_rect, ndc_x, ndc_y, ndc_w, ndc_h);
 			glUniform4f(loc_ws_src, nr.x, nr.y, nr.w, nr.h);
 			glActiveTexture(GL_TEXTURE0);
-			glBindTexture(GL_TEXTURE_2D, gsc->textures[img_idx]);
+			gl_bind_layer_source(GL_TEXTURE_2D, gsc->textures[img_idx], c->compose_active);
 			glUniform1i(loc_ws_tex, 0);
 
 			glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
@@ -6048,6 +6113,12 @@ gl_init_resources(struct comp_gl_compositor *c, uint32_t width, uint32_t height)
 	glBindTexture(GL_TEXTURE_2D, 0);
 
 	c->hardware_display_3d = true;
+
+	// #1589/#1610 — latch the escape hatch once and state the regime once.
+	// That WARN is the only evidence a capture has for which colour regime
+	// produced it, so it is logged either way, not only when the hatch is on.
+	c->legacy_color = u_color_legacy_unorm_encoded();
+	u_color_log_state_once("gl");
 
 	U_LOG_W("GL compositor resources initialized: %ux%u per eye, atlas %ux%u (%u cols x %u rows)",
 	         c->view_width, c->view_height, atlas_width, atlas_height, c->tile_columns, c->tile_rows);
