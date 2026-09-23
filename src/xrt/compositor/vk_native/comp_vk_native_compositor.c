@@ -9853,6 +9853,26 @@ comp_vk_native_compositor_get_rear_budget(struct xrt_compositor *xc, struct u_re
 	return comp_rear_budget_get(&vk_comp(xc)->rear_budget, out);
 }
 
+/*!
+ * Window metrics, for one of two consumers that need different answers when a
+ * Wayland window is NOT on the 3D panel (#1654).
+ *
+ * - The PHASE consumer (@ref vk_update_present_origin, and the drop-time snap
+ *   behind it) must be refused: an origin on another monitor is meaningless to
+ *   the lens, and a snap there would move a window on the wrong monitor.
+ * - The PROJECTION consumer (the session's Kooima) still needs the window's
+ *   own ASPECT. Refused, it falls back to display-scoped Kooima, which uses the
+ *   panel's 16:9 aspect for a window of any shape. The 2D picture then looked
+ *   squashed on the other monitor and correct on the panel: a 1485x799 window
+ *   (1.86:1) drew a 16:9 frustum, 4 % short vertically. So with
+ *   @p off_panel_for_projection this returns the window's own size, centred on
+ *   the panel. It is not a position, and nothing phase-related reads it.
+ */
+static bool
+vk_get_window_metrics(struct comp_vk_native_compositor *c,
+                      struct xrt_window_metrics *out_metrics,
+                      bool off_panel_for_projection);
+
 bool
 comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
                                               struct xrt_window_metrics *out_metrics)
@@ -9861,8 +9881,15 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 		if (out_metrics != NULL) out_metrics->valid = false;
 		return false;
 	}
+	return vk_get_window_metrics(vk_comp(xc), out_metrics, true);
+}
 
-	struct comp_vk_native_compositor *c = vk_comp(xc);
+static bool
+vk_get_window_metrics(struct comp_vk_native_compositor *c,
+                      struct xrt_window_metrics *out_metrics,
+                      bool off_panel_for_projection)
+{
+	(void)off_panel_for_projection; // read on the Wayland arm only
 	memset(out_metrics, 0, sizeof(*out_metrics));
 
 #ifdef XRT_OS_WINDOWS
@@ -10078,6 +10105,7 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 #ifdef DXR_HAVE_WL_GEOM
 	int32_t wlg_left = 0, wlg_top = 0;
 	bool have_wlg_rect = false;
+	bool wl_off_panel = false;
 	if (have_wayland_geom) {
 		/*
 		 * #1596. The provider hands back DEVICE pixels with the origin
@@ -10119,7 +10147,12 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 				    "no weave phase. Display-scoped. (#1596)",
 				    wr.monitor_width_px, wr.monitor_height_px, disp_px_w, disp_px_h);
 			}
-			return false;
+			if (!off_panel_for_projection || wr.width_px == 0 || wr.height_px == 0) {
+				return false;
+			}
+			// Projection only: the window's own size (hence aspect), centred
+			// on the panel. See vk_get_window_metrics.
+			wl_off_panel = true;
 		}
 		wlg_left = wr.left_px;
 		wlg_top = wr.top_px;
@@ -10161,9 +10194,16 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 		// Monitor-relative DEVICE px + the runtime's resolved panel origin =
 		// an absolute rect in the runtime's own space, so the subtraction
 		// below (and vk_update_present_origin's) is exact by construction.
-		win_left = disp_left + wlg_left;
-		win_top = disp_top + wlg_top;
-		have_pos = have_wlg_rect;
+		have_pos = have_wlg_rect && !wl_off_panel;
+		if (have_pos) {
+			win_left = disp_left + wlg_left;
+			win_top = disp_top + wlg_top;
+		} else {
+			// Off the panel: no position on it. Centred, so the frustum is
+			// symmetric and only its aspect comes from the window.
+			win_left = disp_left + ((int32_t)disp_px_w - (int32_t)win_px_w) / 2;
+			win_top = disp_top + ((int32_t)disp_px_h - (int32_t)win_px_h) / 2;
+		}
 	} else
 #endif
 	{
@@ -10730,7 +10770,7 @@ vk_update_present_origin(struct comp_vk_native_compositor *c)
 #endif
 
 	struct xrt_window_metrics m;
-	if (!comp_vk_native_compositor_get_window_metrics(&c->base.base, &m) || !m.valid) {
+	if (!vk_get_window_metrics(c, &m, false) || !m.valid) {
 		// No live window metrics (headless / no window) — leave the DP
 		// display-scoped (its present origin defaults to (0,0)).
 		return;
