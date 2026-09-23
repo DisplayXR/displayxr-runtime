@@ -17,6 +17,10 @@
 // goes with it. Shared across every backend so the answer cannot depend on
 // which one is asking.
 #include "util/comp_layer_view_camera.h"
+// #1589/#1610: the shared format-honesty policy (hatch + fast-path predicate).
+// Every backend makes the same two colour decisions and must make them
+// identically, so they live there and are never re-derived here.
+#include "util/u_color_encoding.h"
 #include "util/u_logging.h"
 #include "d3d/d3d_dxgi_formats.h"
 #include "math/m_api.h"
@@ -409,32 +413,49 @@ struct comp_d3d12_renderer
 	//! Root signature for blit operations.
 	ID3D12RootSignature *root_signature;
 
+	/*!
+	 * #1610 — every pipeline that paints the atlas exists TWICE, indexed
+	 * `[target is the _SRGB-view compose target]`. D3D12 bakes the render
+	 * target's format into the PSO, so a backend whose compose target
+	 * carries an `_SRGB` RTV cannot simply re-bind it: the pipeline has to
+	 * agree, or the draw is invalid. That is the one structural difference
+	 * between this port and the D3D11 one, where a format-agnostic RTV made
+	 * the whole question disappear.
+	 *
+	 * Index 0 is the atlas's own UNORM format — the fast path, byte-for-byte
+	 * the pipeline set every pre-#1589 frame used. Index 1 writes through the
+	 * `_SRGB` RTV, where the fixed-function blender works in LINEAR and the
+	 * hardware applies the OETF exactly once, on write. The SHADERS are
+	 * identical in both: a manual gamma would double-apply the moment the
+	 * target encodes (ADR-021 §2).
+	 */
 	//! Blit PSO.
-	ID3D12PipelineState *blit_pso;
+	ID3D12PipelineState *blit_pso[2];
 
 	//! Blit PSO blend variants for 3D display zone layers
 	//! (XR_DXR_display_zones, ADR-027): same shaders/root signature as
 	//! blit_pso, alpha-over blend baked into the PSO (D3D12's analog of the
 	//! D3D11 renderer's blend_premul/blend_alpha OM states). Premul:
 	//! SrcBlend = ONE; straight: SrcBlend = SRC_ALPHA.
-	ID3D12PipelineState *blit_pso_premul;
-	ID3D12PipelineState *blit_pso_alpha;
+	ID3D12PipelineState *blit_pso_premul[2];
+	ID3D12PipelineState *blit_pso_alpha[2];
 
 	//! Root signature for quad (window-space layer) operations.
 	ID3D12RootSignature *quad_root_signature;
 
 	//! Quad PSO with alpha blending.
-	ID3D12PipelineState *quad_pso;
+	ID3D12PipelineState *quad_pso[2];
 
 	//! Quad PSO with premultiplied alpha blending.
-	ID3D12PipelineState *quad_pso_premul;
+	ID3D12PipelineState *quad_pso_premul[2];
 
 	/*!
 	 * #1581 — WORLD-space quad LAYER pipelines (XrCompositionLayerQuad),
-	 * indexed [source is a Texture2DArray][blend slot]. Distinct from the
-	 * quad_pso pair above, which is the window-space / Local2D channel: a
-	 * different vertex shader (see quad_layer_vs_source) and a blend set
-	 * driven by the SHARED three-way rule rather than by a local flag test.
+	 * indexed [target is the _SRGB compose target][source is a
+	 * Texture2DArray][blend slot]. Distinct from the quad_pso pair above,
+	 * which is the window-space / Local2D channel: a different vertex shader
+	 * (see quad_layer_vs_source) and a blend set driven by the SHARED
+	 * three-way rule rather than by a local flag test.
 	 *
 	 * Three blend slots, not four: a quad paints a SUB-RECT of the tile, so
 	 * it can never be that tile's base cover and COMP_LAYER_BLEND_REPLACE is
@@ -443,7 +464,7 @@ struct comp_d3d12_renderer
 	 * emits, which comp_layer_blend_fold_opaque_cover() folds into the
 	 * colour scale/bias — so the state is the opaque slot.
 	 */
-	ID3D12PipelineState *quad_layer_pso[2][3];
+	ID3D12PipelineState *quad_layer_pso[2][2][3];
 
 	//! Root signature for the masked 2D-over-3D composite (#439).
 	ID3D12RootSignature *composite_root_signature;
@@ -510,7 +531,61 @@ struct comp_d3d12_renderer
 	//! When true, view dims are fixed at legacy compromise scale and
 	//! set_tile_layout must not recompute them.
 	bool legacy_app_tile_scaling;
+
+	/*!
+	 * #1589/#1610 — the runtime-PRIVATE compose target. A TYPELESS twin of
+	 * @ref atlas_texture (same extent, same family) carrying an `_SRGB` RTV
+	 * in RTV heap slot 1, so the fixed-function blender works in LINEAR and
+	 * the sRGB OETF is applied exactly once, on write, by the hardware.
+	 * There is deliberately no gamma arithmetic in any shader: that would
+	 * double-apply.
+	 *
+	 * The composed result is then COPIED into the atlas. Same typeless
+	 * family ⟹ the copy reinterprets bits, so the atlas receives the encoded
+	 * bytes verbatim and the DP-facing resource, its format, its SRV and the
+	 * encoding the display processor latches are all untouched.
+	 *
+	 * Lazily created on the first frame that actually needs it, so a session
+	 * that only ever takes the fast path never allocates it. NULL otherwise.
+	 * Kept in RENDER_TARGET between frames; only the publish copy dips it
+	 * into COPY_SOURCE and back.
+	 */
+	ID3D12Resource *compose_texture;
+	uint32_t compose_width;
+	uint32_t compose_height;
+	//! The atlas format @ref compose_texture was matched against; a change
+	//! forces a rebuild.
+	DXGI_FORMAT compose_atlas_format;
+
+	//! THIS FRAME composes (set by the projection pass, read by the
+	//! window-space pass, the PSO pick and the per-layer SRV format). False
+	//! ⟹ every draw goes to the atlas RTV through the non-decoding views,
+	//! byte-identically to the pre-#1589 renderer.
+	bool compose_active;
+
+	//! @ref u_color_legacy_unorm_encoded, cached at create.
+	bool legacy_color;
 };
+
+/*!
+ * RTV heap layout. Slot 0 is the atlas (owned or, under the #1264 reroute,
+ * the imported deposit slot); slot 1 is the #1610 private compose target.
+ */
+#define D3D12_RTV_SLOT_ATLAS 0u
+#define D3D12_RTV_SLOT_COMPOSE 1u
+#define D3D12_RTV_HEAP_SLOTS 2u
+
+/*!
+ * #1610 — the ONE format the `_SRGB` PSO variants are baked for.
+ *
+ * The atlas is R8G8B8A8_UNORM on every path this renderer has (owned:
+ * create_atlas_texture; imported: the deposit ring, which is R8G8B8A8_UNORM
+ * too), so one `_SRGB` variant covers it. renderer_ensure_compose_target()
+ * still DERIVES the RTV format from the live atlas and refuses to compose if
+ * the answer is anything else, rather than assuming — a BGRA atlas would
+ * otherwise get an RGBA-baked pipeline and an invalid draw.
+ */
+static constexpr DXGI_FORMAT kComposeRtvFormat = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
 
 
 static HRESULT
@@ -705,18 +780,21 @@ enum quad_layer_blend_slot
 static ID3D12PipelineState *
 quad_layer_pso_for(struct comp_d3d12_renderer *r, enum comp_layer_blend_mode mode, bool layered)
 {
+	// #1610: which RENDER TARGET this frame paints picks the variant — the
+	// PSO bakes its format, so an `_SRGB`-view target needs its own.
+	const uint32_t rt = r->compose_active ? 1u : 0u;
 	const uint32_t tex = layered ? 1u : 0u;
 
 	switch (mode) {
-	case COMP_LAYER_BLEND_PREMULTIPLIED: return r->quad_layer_pso[tex][QUAD_LAYER_BLEND_SLOT_PREMUL];
-	case COMP_LAYER_BLEND_STRAIGHT: return r->quad_layer_pso[tex][QUAD_LAYER_BLEND_SLOT_STRAIGHT];
+	case COMP_LAYER_BLEND_PREMULTIPLIED: return r->quad_layer_pso[rt][tex][QUAD_LAYER_BLEND_SLOT_PREMUL];
+	case COMP_LAYER_BLEND_STRAIGHT: return r->quad_layer_pso[rt][tex][QUAD_LAYER_BLEND_SLOT_STRAIGHT];
 	case COMP_LAYER_BLEND_REPLACE:
 	case COMP_LAYER_BLEND_OPAQUE_COVER:
 	default:
 		// Unlike the blit path below, OPAQUE_COVER is honoured in full
 		// here: the blending-off state, plus the alpha-of-one the caller
 		// folds into the colour scale/bias this shader already applies.
-		return r->quad_layer_pso[tex][QUAD_LAYER_BLEND_SLOT_OPAQUE];
+		return r->quad_layer_pso[rt][tex][QUAD_LAYER_BLEND_SLOT_OPAQUE];
 	}
 }
 
@@ -737,13 +815,267 @@ quad_layer_pso_for(struct comp_d3d12_renderer *r, enum comp_layer_blend_mode mod
 static ID3D12PipelineState *
 blit_pso_for(struct comp_d3d12_renderer *r, enum comp_layer_blend_mode mode)
 {
+	// #1610: see quad_layer_pso_for — the RTV format is baked in.
+	const uint32_t rt = r->compose_active ? 1u : 0u;
+
 	switch (mode) {
-	case COMP_LAYER_BLEND_PREMULTIPLIED: return r->blit_pso_premul;
-	case COMP_LAYER_BLEND_STRAIGHT: return r->blit_pso_alpha;
+	case COMP_LAYER_BLEND_PREMULTIPLIED: return r->blit_pso_premul[rt];
+	case COMP_LAYER_BLEND_STRAIGHT: return r->blit_pso_alpha[rt];
 	case COMP_LAYER_BLEND_REPLACE:
 	case COMP_LAYER_BLEND_OPAQUE_COVER:
-	default: return r->blit_pso;
+	default: return r->blit_pso[rt];
 	}
+}
+
+/*!
+ * The render-target view this frame's layers are painted through: the atlas's
+ * own UNORM RTV on the fast path, the private `_SRGB` one when composing.
+ */
+static D3D12_CPU_DESCRIPTOR_HANDLE
+renderer_target_rtv(struct comp_d3d12_renderer *r)
+{
+	D3D12_CPU_DESCRIPTOR_HANDLE rtv = r->rtv_heap->GetCPUDescriptorHandleForHeapStart();
+	if (r->compose_active) {
+		rtv.ptr += (SIZE_T)r->rtv_descriptor_size * D3D12_RTV_SLOT_COMPOSE;
+	}
+	return rtv;
+}
+
+/*!
+ * The SRV format a layer's source is sampled through THIS FRAME.
+ *
+ * Composing ⟹ the format-honest view (the input must BE linear, because the
+ * target encodes on write). Fast path ⟹ the non-decoding view, which is
+ * byte-for-byte what every pre-#1589 frame used.
+ */
+static DXGI_FORMAT
+layer_source_format(struct comp_d3d12_renderer *r, ID3D12Resource *src_resource)
+{
+	return r->compose_active ? comp_d3d12_swapchain_compose_format(src_resource)
+	                         : comp_d3d12_swapchain_sample_format(src_resource);
+}
+
+/*!
+ * #1589/#1610 — build (or rebuild) the private compose target to match the
+ * atlas. Returns false when the frame must stay on the legacy path: no atlas
+ * yet, an atlas whose family has no `_SRGB` member, an `_SRGB` member no
+ * pipeline was baked for, or a creation failure. Every one of those is a "keep
+ * doing what we did before", never a hard error — a slightly wrong colour
+ * beats not drawing.
+ */
+static bool
+renderer_ensure_compose_target(struct comp_d3d12_renderer *r)
+{
+	if (r->atlas_texture == nullptr) {
+		return false;
+	}
+
+	const D3D12_RESOURCE_DESC atlas_desc = r->atlas_texture->GetDesc();
+	const uint32_t atlas_w = (uint32_t)atlas_desc.Width;
+	const uint32_t atlas_h = (uint32_t)atlas_desc.Height;
+
+	if (r->compose_texture != nullptr && r->compose_width == atlas_w && r->compose_height == atlas_h &&
+	    r->compose_atlas_format == atlas_desc.Format) {
+		return true;
+	}
+
+	// The atlas grew, changed format, or this is the first composing frame.
+	// Deliberately NOT keyed on the atlas RESOURCE: under the #1264 reroute
+	// the deposit ring alternates between two same-sized slots every frame,
+	// and the compose target is a private scratch that is copied INTO
+	// whichever one is current — rebuilding it per frame would be pure churn.
+	if (r->compose_texture != nullptr) {
+		r->compose_texture->Release();
+		r->compose_texture = nullptr;
+	}
+
+	const DXGI_FORMAT typeless = d3d_dxgi_format_to_typeless_dxgi(atlas_desc.Format);
+	const DXGI_FORMAT srgb_rtv = d3d_dxgi_format_srgb_rtv(atlas_desc.Format);
+	if (srgb_rtv != kComposeRtvFormat) {
+		// Either the family has no `_SRGB` member at all, or it has one no
+		// pipeline in this renderer was baked for (D3D12 bakes the RTV
+		// format into the PSO — see the blit_pso doc). Composing anyway
+		// would be an invalid draw, so the frame keeps the legacy path.
+		static bool warned_no_srgb = false;
+		if (!warned_no_srgb) {
+			warned_no_srgb = true;
+			U_LOG_W(
+			    "Color (#1610) [d3d12]: atlas format 0x%X has no PSO-backed _SRGB sibling (got "
+			    "0x%X, expected 0x%X) — composing in encoded space, as before #1610",
+			    (unsigned)atlas_desc.Format, (unsigned)srgb_rtv, (unsigned)kComposeRtvFormat);
+		}
+		return false;
+	}
+
+	D3D12_HEAP_PROPERTIES heap_props = {};
+	heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+	D3D12_RESOURCE_DESC desc = {};
+	desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	desc.Width = atlas_w;
+	desc.Height = atlas_h;
+	desc.DepthOrArraySize = 1;
+	desc.MipLevels = 1;
+	// TYPELESS storage is what makes BOTH the `_SRGB` RTV and the
+	// same-family CopyResource into the atlas legal.
+	desc.Format = typeless;
+	desc.SampleDesc.Count = 1;
+	desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+	desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+	D3D12_CLEAR_VALUE clear_value = {};
+	clear_value.Format = srgb_rtv;
+
+	auto internals = get_internals(r->c);
+	ID3D12Device *device = internals->device;
+	HRESULT hr = device->CreateCommittedResource(
+	    &heap_props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_RENDER_TARGET, &clear_value,
+	    __uuidof(ID3D12Resource), reinterpret_cast<void **>(&r->compose_texture));
+	if (FAILED(hr)) {
+		U_LOG_W(
+		    "Color (#1610) [d3d12]: compose target %ux%u failed: 0x%08x — composing in encoded space, "
+		    "as before #1610",
+		    atlas_w, atlas_h, (unsigned)hr);
+		r->compose_texture = nullptr;
+		return false;
+	}
+	// #747: name it so the debug layer can attribute barrier complaints.
+	r->compose_texture->SetName(L"DXR.compose_target_srgb");
+
+	D3D12_RENDER_TARGET_VIEW_DESC rtv_desc = {};
+	rtv_desc.Format = srgb_rtv;
+	rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+	rtv_desc.Texture2D.MipSlice = 0;
+	D3D12_CPU_DESCRIPTOR_HANDLE rtv = r->rtv_heap->GetCPUDescriptorHandleForHeapStart();
+	rtv.ptr += (SIZE_T)r->rtv_descriptor_size * D3D12_RTV_SLOT_COMPOSE;
+	device->CreateRenderTargetView(r->compose_texture, &rtv_desc, rtv);
+
+	r->compose_width = atlas_w;
+	r->compose_height = atlas_h;
+	r->compose_atlas_format = atlas_desc.Format;
+
+	// The line a hardware check greps to prove a frame LEFT the fast path.
+	// One-off per (re)allocation — a lifecycle event, never per frame.
+	U_LOG_W(
+	    "Color (#1610) [d3d12]: compose target %ux%u storage=0x%X rtv=0x%X -> atlas=0x%X (same typeless "
+	    "family=%d)",
+	    atlas_w, atlas_h, (unsigned)typeless, (unsigned)srgb_rtv, (unsigned)atlas_desc.Format,
+	    (int)d3d_dxgi_format_same_typeless_family(typeless, atlas_desc.Format));
+
+	return true;
+}
+
+/*!
+ * #1610 — publish the composed result into the atlas.
+ *
+ * `CopyResource`, deliberately: the compose target and the atlas are the same
+ * typeless family, so this moves the ENCODED bytes the `_SRGB` RTV just wrote
+ * without touching them. A shader blit here, or any copy that crossed
+ * families, would re-apply the transfer function and hand the display
+ * processor a double-encoded atlas — the exact bug this design exists to
+ * avoid. Do not "optimise" it into a draw.
+ *
+ * The atlas is dipped RENDER_TARGET -> COPY_DEST -> RENDER_TARGET rather than
+ * left in COPY_DEST, so the atlas is in the SAME state at every pass boundary
+ * as it was before #1610 and no caller (the projection-only capture round trip
+ * in particular) has to learn about this path.
+ */
+static void
+renderer_publish_compose_to_atlas(struct comp_d3d12_renderer *r, ID3D12GraphicsCommandList *cmd_list)
+{
+	if (!r->compose_active || r->compose_texture == nullptr || r->atlas_texture == nullptr) {
+		return;
+	}
+
+	D3D12_RESOURCE_BARRIER to_copy[2] = {};
+	to_copy[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	to_copy[0].Transition.pResource = r->compose_texture;
+	to_copy[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	to_copy[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	to_copy[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	to_copy[1] = to_copy[0];
+	to_copy[1].Transition.pResource = r->atlas_texture;
+	to_copy[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+	cmd_list->ResourceBarrier(2, to_copy);
+
+	cmd_list->CopyResource(r->atlas_texture, r->compose_texture);
+
+	D3D12_RESOURCE_BARRIER back[2] = {};
+	back[0] = to_copy[0];
+	back[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	back[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	back[1] = to_copy[1];
+	back[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+	back[1].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	cmd_list->ResourceBarrier(2, back);
+}
+
+/*!
+ * #1589/#1610 — does this frame take the raw (pre-#1589) path?
+ *
+ * Counts the layers this backend will actually PAINT (a type it only warns
+ * about does not count) and asks whether every source is already encoded, then
+ * defers to the SHARED predicate so all five backends answer alike. The answer
+ * is a different TARGET and different SOURCE VIEWS for the same draws — every
+ * layer is still drawn either way — which is what makes the shared predicate
+ * directly usable here (see its @warning: a backend whose fast path is a
+ * different MECHANISM would have to AND in a structural term).
+ */
+static bool
+renderer_frame_takes_fast_path(struct comp_d3d12_renderer *r, struct comp_layer_accum *layers)
+{
+	uint32_t contributing = 0;
+	bool base_is_projection = false;
+	bool all_sources_srgb = true;
+
+	for (uint32_t i = 0; i < layers->layer_count; i++) {
+		struct comp_layer *layer = &layers->layers[i];
+		uint32_t sc_count = 0;
+
+		switch (layer->data.type) {
+		case XRT_LAYER_PROJECTION:
+		case XRT_LAYER_PROJECTION_DEPTH:
+			if (contributing == 0) {
+				base_is_projection = true;
+			}
+			contributing++;
+			sc_count = layer->data.view_count;
+			break;
+		case XRT_LAYER_ZONE_3D:
+			contributing++;
+			sc_count = layer->data.view_count;
+			break;
+		case XRT_LAYER_QUAD:
+		case XRT_LAYER_WINDOW_SPACE:
+			// Both cover a SUB-RECT and blend over whatever is under
+			// them, so either one alone is already a compose case.
+			contributing++;
+			sc_count = 1;
+			break;
+		default:
+			// Cylinder / equirect1 / equirect2 / cube: accepted by the
+			// compositor, warned about, never drawn on this backend
+			// (#1581). A type that starts drawing here must move up.
+			break;
+		}
+
+		if (sc_count > XRT_MAX_VIEWS) {
+			sc_count = XRT_MAX_VIEWS;
+		}
+		for (uint32_t v = 0; v < sc_count; v++) {
+			if (layer->sc_array[v] == nullptr) {
+				continue;
+			}
+			// The format is a property of the SWAPCHAIN, not of the
+			// image, so image 0 answers for all of them.
+			void *res = comp_d3d12_swapchain_get_resource(layer->sc_array[v], 0);
+			if (res != nullptr && !comp_d3d12_swapchain_resource_is_srgb(res)) {
+				all_sources_srgb = false;
+			}
+		}
+	}
+
+	return u_color_compose_fast_path(r->legacy_color, contributing, base_is_projection, all_sources_srgb);
 }
 
 
@@ -801,11 +1133,14 @@ render_window_space_layer(struct comp_d3d12_renderer *r,
 	}
 
 	D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
-	// Sample app color swapchains as UNORM (not their sRGB sibling) so the GPU
-	// does NOT auto-decode sRGB->linear; the DP wants display-referred bytes, so
-	// pass them through. #1503: app swapchain images are TYPELESS, so the view
-	// format comes from the typed format the app requested, not from GetDesc().
-	srv_desc.Format = comp_d3d12_swapchain_sample_format(src_resource);
+	// #1589: which reading of the app's bytes is correct is a property of the
+	// PATH, not of the format. A composing frame samples format-honest (an
+	// `_SRGB` source decodes to linear) because its `_SRGB` target re-encodes
+	// on write; the fast path samples through the non-decoding view, so the
+	// app's display-referred bytes reach the DP unchanged. #1503: app
+	// swapchain images are TYPELESS, so either way the view format comes from
+	// the typed format the app requested, not from GetDesc().
+	srv_desc.Format = layer_source_format(r, src_resource);
 	srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 	srv_desc.Texture2D.MipLevels = 1;
 	srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -854,9 +1189,11 @@ render_window_space_layer(struct comp_d3d12_renderer *r,
 	float color_bias[4];
 	get_color_scale_bias(data, color_scale, color_bias);
 
-	// Set quad root signature and PSO
+	// Set quad root signature and PSO (#1610: the variant baked for the RTV
+	// format this frame paints through).
+	const uint32_t rt = r->compose_active ? 1u : 0u;
 	bool is_premultiplied = (data->flags & XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT) == 0;
-	ID3D12PipelineState *pso = is_premultiplied ? r->quad_pso_premul : r->quad_pso;
+	ID3D12PipelineState *pso = is_premultiplied ? r->quad_pso_premul[rt] : r->quad_pso[rt];
 
 	cmd_list->SetGraphicsRootSignature(r->quad_root_signature);
 	cmd_list->SetPipelineState(pso);
@@ -875,9 +1212,10 @@ render_window_space_layer(struct comp_d3d12_renderer *r,
 	gpu_srv.ptr += r->srv_descriptor_size * srv_slot;
 	cmd_list->SetGraphicsRootDescriptorTable(0, gpu_srv);
 
-	// Set RTV (atlas as render target) — viewport for the current view tile
-	// (tile origin from the caller's effective layout, #542).
-	D3D12_CPU_DESCRIPTOR_HANDLE rtv = r->rtv_heap->GetCPUDescriptorHandleForHeapStart();
+	// Set RTV (the atlas, or this frame's private compose target) — viewport
+	// for the current view tile (tile origin from the caller's effective
+	// layout, #542).
+	D3D12_CPU_DESCRIPTOR_HANDLE rtv = renderer_target_rtv(r);
 	cmd_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
 
 	D3D12_VIEWPORT vp = {};
@@ -996,10 +1334,13 @@ render_quad_layer(struct comp_d3d12_renderer *r,
 	const bool layered = src_desc.DepthOrArraySize > 1;
 
 	D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
-	// Sample as UNORM, never the sRGB sibling: the DP wants display-referred
-	// bytes, so no auto-decode (#1503 resolves the app's requested format,
-	// since the image itself is TYPELESS).
-	srv_desc.Format = comp_d3d12_swapchain_sample_format(src_resource);
+	// #1589: format-honest when composing — this is a shader draw that
+	// BLENDS, so a composing frame must sample it LINEAR and let the `_SRGB`
+	// RTV apply the OETF once. On the fast path (which a lone quad never
+	// takes) the non-decoding view passes the app's bytes through. (#1503
+	// resolves the app's requested format, since the image itself is
+	// TYPELESS.)
+	srv_desc.Format = layer_source_format(r, src_resource);
 	srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 	if (layered) {
 		srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
@@ -1035,7 +1376,7 @@ render_quad_layer(struct comp_d3d12_renderer *r,
 	cmd_list->SetGraphicsRootSignature(r->quad_root_signature);
 	cmd_list->SetGraphicsRootDescriptorTable(0, gpu_srv);
 
-	D3D12_CPU_DESCRIPTOR_HANDLE rtv = r->rtv_heap->GetCPUDescriptorHandleForHeapStart();
+	D3D12_CPU_DESCRIPTOR_HANDLE rtv = renderer_target_rtv(r);
 	cmd_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
 	cmd_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 
@@ -1154,6 +1495,11 @@ comp_d3d12_renderer_create(struct comp_d3d12_compositor *c,
 	r->c = c;
 	r->view_width = view_width;
 	r->view_height = view_height;
+	// #1589: read once, and say which colour regime this process is in
+	// exactly once. The line a hardware check greps to prove which regime a
+	// session ran under.
+	r->legacy_color = u_color_legacy_unorm_encoded();
+	u_color_log_state_once("d3d12");
 
 	// Initialize tile layout from the active rendering mode
 	if (internals->xdev != NULL && internals->xdev->hmd != NULL) {
@@ -1178,9 +1524,10 @@ comp_d3d12_renderer_create(struct comp_d3d12_compositor *c,
 	r->rtv_descriptor_size = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 	r->srv_descriptor_size = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
-	// Create RTV descriptor heap (1 for atlas texture)
+	// Create RTV descriptor heap: slot 0 = atlas texture, slot 1 = the #1610
+	// private `_SRGB`-view compose target (written when it is first built).
 	D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc = {};
-	rtv_heap_desc.NumDescriptors = 1;
+	rtv_heap_desc.NumDescriptors = D3D12_RTV_HEAP_SLOTS;
 	rtv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
 	rtv_heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
 
@@ -1315,32 +1662,46 @@ comp_d3d12_renderer_create(struct comp_d3d12_compositor *c,
 	pso_desc.RasterizerState.DepthClipEnable = TRUE;
 	pso_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
 	pso_desc.NumRenderTargets = 1;
-	pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
 	pso_desc.SampleDesc.Count = 1;
 	pso_desc.SampleMask = UINT_MAX;
 
-	hr = device->CreateGraphicsPipelineState(&pso_desc, __uuidof(ID3D12PipelineState),
-	                                          reinterpret_cast<void **>(&r->blit_pso));
+	/*
+	 * #1610 — the same three blit pipelines against BOTH render-target
+	 * formats: the atlas's UNORM (index 0, the fast path) and the private
+	 * compose target's `_SRGB` (index 1, where the blender works in linear
+	 * and the hardware encodes once on write). Identical shaders and
+	 * identical blend states; only the baked RTV format differs, because
+	 * that is the only thing D3D12 will not let a PSO be agnostic about.
+	 */
+	for (uint32_t rt = 0; rt < 2 && SUCCEEDED(hr); rt++) {
+		pso_desc.RTVFormats[0] = rt == 0 ? DXGI_FORMAT_R8G8B8A8_UNORM : kComposeRtvFormat;
 
-	// XR_DXR_display_zones (ADR-027): alpha-over blend variants of the blit
-	// PSO for zone-layer draws (zone rect scaled into the tile box; later
-	// zones composite over earlier ones in layer-list order). Alpha channel
-	// composes Porter-Duff over so stacked zones accumulate coverage.
-	if (SUCCEEDED(hr)) {
-		pso_desc.BlendState.RenderTarget[0].BlendEnable = TRUE;
-		pso_desc.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE; // premultiplied
-		pso_desc.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
-		pso_desc.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
-		pso_desc.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
-		pso_desc.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
-		pso_desc.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+		pso_desc.BlendState.RenderTarget[0].BlendEnable = FALSE;
+		pso_desc.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;
 		hr = device->CreateGraphicsPipelineState(&pso_desc, __uuidof(ID3D12PipelineState),
-		                                          reinterpret_cast<void **>(&r->blit_pso_premul));
-	}
-	if (SUCCEEDED(hr)) {
-		pso_desc.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA; // straight
-		hr = device->CreateGraphicsPipelineState(&pso_desc, __uuidof(ID3D12PipelineState),
-		                                          reinterpret_cast<void **>(&r->blit_pso_alpha));
+		                                         reinterpret_cast<void **>(&r->blit_pso[rt]));
+
+		// XR_DXR_display_zones (ADR-027): alpha-over blend variants of the
+		// blit PSO for zone-layer draws (zone rect scaled into the tile
+		// box; later zones composite over earlier ones in layer-list
+		// order). Alpha channel composes Porter-Duff over so stacked zones
+		// accumulate coverage.
+		if (SUCCEEDED(hr)) {
+			pso_desc.BlendState.RenderTarget[0].BlendEnable = TRUE;
+			pso_desc.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE; // premultiplied
+			pso_desc.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+			pso_desc.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+			pso_desc.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+			pso_desc.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+			pso_desc.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+			hr = device->CreateGraphicsPipelineState(&pso_desc, __uuidof(ID3D12PipelineState),
+			                                         reinterpret_cast<void **>(&r->blit_pso_premul[rt]));
+		}
+		if (SUCCEEDED(hr)) {
+			pso_desc.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA; // straight
+			hr = device->CreateGraphicsPipelineState(&pso_desc, __uuidof(ID3D12PipelineState),
+			                                         reinterpret_cast<void **>(&r->blit_pso_alpha[rt]));
+		}
 	}
 	vs_blob->Release();
 	ps_blob->Release();
@@ -1460,41 +1821,43 @@ comp_d3d12_renderer_create(struct comp_d3d12_compositor *c,
 	quad_pso_desc.RasterizerState.DepthClipEnable = TRUE;
 	quad_pso_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
 	quad_pso_desc.NumRenderTargets = 1;
-	quad_pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
 	quad_pso_desc.SampleDesc.Count = 1;
 	quad_pso_desc.SampleMask = UINT_MAX;
 
-	hr = device->CreateGraphicsPipelineState(&quad_pso_desc, __uuidof(ID3D12PipelineState),
-	                                          reinterpret_cast<void **>(&r->quad_pso));
-	if (FAILED(hr)) {
-		U_LOG_E("Failed to create quad PSO: 0x%08x", hr);
-		quad_vs_blob->Release();
-		quad_ps_blob->Release();
-		comp_d3d12_renderer_destroy(&r);
-		return XRT_ERROR_D3D;
+	// #1610: both RTV formats, as for the blit pair above.
+	for (uint32_t rt = 0; rt < 2 && SUCCEEDED(hr); rt++) {
+		quad_pso_desc.RTVFormats[0] = rt == 0 ? DXGI_FORMAT_R8G8B8A8_UNORM : kComposeRtvFormat;
+
+		quad_pso_desc.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+		quad_pso_desc.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+		hr = device->CreateGraphicsPipelineState(&quad_pso_desc, __uuidof(ID3D12PipelineState),
+		                                         reinterpret_cast<void **>(&r->quad_pso[rt]));
+
+		// Premultiplied alpha blend PSO
+		if (SUCCEEDED(hr)) {
+			quad_pso_desc.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;
+			quad_pso_desc.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+			hr = device->CreateGraphicsPipelineState(&quad_pso_desc, __uuidof(ID3D12PipelineState),
+			                                         reinterpret_cast<void **>(&r->quad_pso_premul[rt]));
+		}
 	}
-
-	// Premultiplied alpha blend PSO
-	quad_pso_desc.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;
-	quad_pso_desc.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
-
-	hr = device->CreateGraphicsPipelineState(&quad_pso_desc, __uuidof(ID3D12PipelineState),
-	                                          reinterpret_cast<void **>(&r->quad_pso_premul));
 	quad_vs_blob->Release();
 	quad_ps_blob->Release();
 
 	if (FAILED(hr)) {
-		U_LOG_E("Failed to create quad premul PSO: 0x%08x", hr);
+		U_LOG_E("Failed to create quad PSO: 0x%08x", hr);
 		comp_d3d12_renderer_destroy(&r);
 		return XRT_ERROR_D3D;
 	}
 
 	// --- #1581: world-space quad LAYER PSOs (XrCompositionLayerQuad) ---
 	//
-	// Six of them: the world-space vertex shader against the plain and the
+	// Twelve of them: the world-space vertex shader against the plain and the
 	// Texture2DArray pixel shader, each in the three blend states a SUB-RECT
-	// layer can need. They share the quad root signature and everything but
-	// the blend state with the window-space pair above.
+	// layer can need, each against both render-target formats (#1610 — the
+	// atlas's UNORM and the private compose target's `_SRGB`). They share the
+	// quad root signature and everything but the blend state with the
+	// window-space pair above.
 	{
 		ID3DBlob *ql_vs_blob = nullptr;
 		ID3DBlob *ql_ps_blob[2] = {nullptr, nullptr};
@@ -1522,32 +1885,37 @@ comp_d3d12_renderer_create(struct comp_d3d12_compositor *c,
 		ql_desc.VS.pShaderBytecode = ql_vs_blob->GetBufferPointer();
 		ql_desc.VS.BytecodeLength = ql_vs_blob->GetBufferSize();
 
-		for (uint32_t tex = 0; tex < 2 && SUCCEEDED(hr); tex++) {
-			ql_desc.PS.pShaderBytecode = ql_ps_blob[tex]->GetBufferPointer();
-			ql_desc.PS.BytecodeLength = ql_ps_blob[tex]->GetBufferSize();
+		for (uint32_t target = 0; target < 2 && SUCCEEDED(hr); target++) {
+			ql_desc.RTVFormats[0] = target == 0 ? DXGI_FORMAT_R8G8B8A8_UNORM : kComposeRtvFormat;
 
-			for (uint32_t slot = 0; slot < 3 && SUCCEEDED(hr); slot++) {
-				D3D12_RENDER_TARGET_BLEND_DESC &rt = ql_desc.BlendState.RenderTarget[0];
-				// OPAQUE_COVER (and the unreachable REPLACE) write the
-				// source verbatim; the alpha-of-one that separates the
-				// two is the caller's colour-scale/bias fold, not a
-				// blend factor — no fixed-function factor can make a
-				// constant one (comp_layer_view_camera.h).
-				rt.BlendEnable = slot == QUAD_LAYER_BLEND_SLOT_OPAQUE ? FALSE : TRUE;
-				rt.SrcBlend =
-				    slot == QUAD_LAYER_BLEND_SLOT_STRAIGHT ? D3D12_BLEND_SRC_ALPHA : D3D12_BLEND_ONE;
-				rt.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
-				rt.BlendOp = D3D12_BLEND_OP_ADD;
-				// Porter-Duff "over" on alpha too, so dst.a survives
-				// layered composition (#225).
-				rt.SrcBlendAlpha = D3D12_BLEND_ONE;
-				rt.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
-				rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
-				rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+			for (uint32_t tex = 0; tex < 2 && SUCCEEDED(hr); tex++) {
+				ql_desc.PS.pShaderBytecode = ql_ps_blob[tex]->GetBufferPointer();
+				ql_desc.PS.BytecodeLength = ql_ps_blob[tex]->GetBufferSize();
 
-				hr = device->CreateGraphicsPipelineState(
-				    &ql_desc, __uuidof(ID3D12PipelineState),
-				    reinterpret_cast<void **>(&r->quad_layer_pso[tex][slot]));
+				for (uint32_t slot = 0; slot < 3 && SUCCEEDED(hr); slot++) {
+					D3D12_RENDER_TARGET_BLEND_DESC &rt = ql_desc.BlendState.RenderTarget[0];
+					// OPAQUE_COVER (and the unreachable REPLACE) write
+					// the source verbatim; the alpha-of-one that
+					// separates the two is the caller's
+					// colour-scale/bias fold, not a blend factor — no
+					// fixed-function factor can make a constant one
+					// (comp_layer_view_camera.h).
+					rt.BlendEnable = slot == QUAD_LAYER_BLEND_SLOT_OPAQUE ? FALSE : TRUE;
+					rt.SrcBlend = slot == QUAD_LAYER_BLEND_SLOT_STRAIGHT ? D3D12_BLEND_SRC_ALPHA
+					                                                     : D3D12_BLEND_ONE;
+					rt.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+					rt.BlendOp = D3D12_BLEND_OP_ADD;
+					// Porter-Duff "over" on alpha too, so dst.a survives
+					// layered composition (#225).
+					rt.SrcBlendAlpha = D3D12_BLEND_ONE;
+					rt.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+					rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+					rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+					hr = device->CreateGraphicsPipelineState(
+					    &ql_desc, __uuidof(ID3D12PipelineState),
+					    reinterpret_cast<void **>(&r->quad_layer_pso[target][tex][slot]));
+				}
 			}
 		}
 
@@ -1865,35 +2233,55 @@ comp_d3d12_renderer_destroy(struct comp_d3d12_renderer **renderer_ptr)
 	if (r->composite_root_signature != nullptr) {
 		r->composite_root_signature->Release();
 	}
-	// #1581: the six world-space quad-layer pipelines.
-	for (uint32_t tex = 0; tex < 2; tex++) {
-		for (uint32_t slot = 0; slot < 3; slot++) {
-			if (r->quad_layer_pso[tex][slot] != nullptr) {
-				r->quad_layer_pso[tex][slot]->Release();
-				r->quad_layer_pso[tex][slot] = nullptr;
+	// #1581/#1610: the twelve world-space quad-layer pipelines.
+	for (uint32_t target = 0; target < 2; target++) {
+		for (uint32_t tex = 0; tex < 2; tex++) {
+			for (uint32_t slot = 0; slot < 3; slot++) {
+				if (r->quad_layer_pso[target][tex][slot] != nullptr) {
+					r->quad_layer_pso[target][tex][slot]->Release();
+					r->quad_layer_pso[target][tex][slot] = nullptr;
+				}
 			}
 		}
 	}
-	if (r->quad_pso_premul != nullptr) {
-		r->quad_pso_premul->Release();
-	}
-	if (r->quad_pso != nullptr) {
-		r->quad_pso->Release();
+	// #1610: each of these exists once per render-target format.
+	for (uint32_t rt = 0; rt < 2; rt++) {
+		if (r->quad_pso_premul[rt] != nullptr) {
+			r->quad_pso_premul[rt]->Release();
+			r->quad_pso_premul[rt] = nullptr;
+		}
+		if (r->quad_pso[rt] != nullptr) {
+			r->quad_pso[rt]->Release();
+			r->quad_pso[rt] = nullptr;
+		}
 	}
 	if (r->quad_root_signature != nullptr) {
 		r->quad_root_signature->Release();
 	}
-	if (r->blit_pso_alpha != nullptr) {
-		r->blit_pso_alpha->Release();
+	for (uint32_t rt = 0; rt < 2; rt++) {
+		if (r->blit_pso_alpha[rt] != nullptr) {
+			r->blit_pso_alpha[rt]->Release();
+			r->blit_pso_alpha[rt] = nullptr;
+		}
+		if (r->blit_pso_premul[rt] != nullptr) {
+			r->blit_pso_premul[rt]->Release();
+			r->blit_pso_premul[rt] = nullptr;
+		}
 	}
-	if (r->blit_pso_premul != nullptr) {
-		r->blit_pso_premul->Release();
-	}
-	if (r->blit_pso != nullptr) {
-		r->blit_pso->Release();
+	for (uint32_t rt = 0; rt < 2; rt++) {
+		if (r->blit_pso[rt] != nullptr) {
+			r->blit_pso[rt]->Release();
+			r->blit_pso[rt] = nullptr;
+		}
 	}
 	if (r->root_signature != nullptr) {
 		r->root_signature->Release();
+	}
+	// #1610: the private compose target is runtime-owned, never shared and
+	// never handed to the DP, so it goes with the renderer.
+	if (r->compose_texture != nullptr) {
+		r->compose_texture->Release();
+		r->compose_texture = nullptr;
 	}
 	if (r->atlas_texture != nullptr && !r->external_atlas) {
 		// An external atlas is a BORROWED deposit slot — the deposit owns it.
@@ -1960,7 +2348,10 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 
 	// Transition atlas to RENDER_TARGET for shader-based stretch-blit.
 	// External (imported) atlases live in COMMON between draws — see the
-	// external_atlas field doc.
+	// external_atlas field doc. This stays RENDER_TARGET even on a composing
+	// frame, which never draws into the atlas: the publish copy dips it into
+	// COPY_DEST and straight back, so the atlas is in exactly the state every
+	// caller already expects at both pass boundaries.
 	D3D12_RESOURCE_BARRIER barrier = {};
 	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 	barrier.Transition.pResource = renderer->atlas_texture;
@@ -1970,14 +2361,49 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 	cmd_list->ResourceBarrier(1, &barrier);
 
-	// Clear atlas to black; transparent in zones frames.
-	D3D12_CPU_DESCRIPTOR_HANDLE rtv = renderer->rtv_heap->GetCPUDescriptorHandleForHeapStart();
+	/*
+	 * #1589/#1610 — where this frame's layers land.
+	 *
+	 * The shipping case (one full-tile projection layer out of an `_SRGB`
+	 * swapchain) owes neither an encode nor a blend, so it draws straight
+	 * into the atlas through the non-decoding views: the exact call sequence,
+	 * and the exact atlas bytes, as before this work. Everything else — a
+	 * UNORM source, whose values are LINEAR and owe the encode, or a second
+	 * layer, which owes a LINEAR blend — goes into the private `_SRGB`-view
+	 * target and is copied out at the end of the pass.
+	 *
+	 * There is no `atlas_holds_srgb_bytes` to stamp on this leg, and that is
+	 * a property of the design rather than an omission: the in-process D3D12
+	 * compositor never calls set_atlas_encoding, so the display processor
+	 * latches ENCODED — and after this change that declaration is TRUE on
+	 * both branches. u_color_atlas_holds_encoded()'s two inputs are
+	 * `composed_through_srgb_target || source_is_srgb`, and the fast path is
+	 * only ever taken when every source IS `_SRGB` while the compose path
+	 * encodes whatever it was handed. (The D3D11 SERVICE has to stamp the
+	 * flag because its combine pass reads several clients' atlases back and
+	 * must know which were encoded; nothing reads one back here.) The one
+	 * case that still lies is a compose target that failed to allocate, which
+	 * is the documented "a slightly wrong colour beats not drawing" fallback
+	 * and says so in the log.
+	 */
+	renderer->compose_active = false;
+	if (!renderer_frame_takes_fast_path(renderer, layers)) {
+		renderer->compose_active = renderer_ensure_compose_target(renderer);
+	}
+
+	// Clear the target to black; transparent in zones frames.
+	//
+	// #1610: unchanged when this goes through the compose target's `_SRGB`
+	// RTV. Black is black in both spaces (the OETF fixes zero) and an RTV's
+	// sRGB conversion never touches alpha, so the clear needs no colour-space
+	// branch — which is half of why black was the right clear to land on.
+	D3D12_CPU_DESCRIPTOR_HANDLE rtv = renderer_target_rtv(renderer);
 	float clear_color[4] = {0.0f, 0.0f, 0.0f, zones_frame ? 0.0f : 1.0f};
 	cmd_list->ClearRenderTargetView(rtv, clear_color, 0, nullptr);
 
 	// Set blit pipeline (shared across all projection views)
 	cmd_list->SetGraphicsRootSignature(renderer->root_signature);
-	cmd_list->SetPipelineState(renderer->blit_pso);
+	cmd_list->SetPipelineState(renderer->blit_pso[renderer->compose_active ? 1u : 0u]);
 	ID3D12DescriptorHeap *heaps[] = {renderer->srv_heap};
 	cmd_list->SetDescriptorHeaps(1, heaps);
 	cmd_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
@@ -2066,7 +2492,7 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 			render_quad_layer(renderer, cmd_list, layer, view_count, cameras, tiles, target_width,
 			                  target_height, layout);
 			cmd_list->SetGraphicsRootSignature(renderer->root_signature);
-			cmd_list->SetPipelineState(renderer->blit_pso);
+			cmd_list->SetPipelineState(renderer->blit_pso[renderer->compose_active ? 1u : 0u]);
 			cmd_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
 			cmd_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 			continue;
@@ -2198,11 +2624,14 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 			}
 
 			D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
-			// UNORM sample (see the other SRV site): no sRGB auto-decode; the
-			// app's display-referred bytes pass through to the DP unchanged.
-			// #1503: the image is TYPELESS, so resolve through its stamped
+			// #1589 (see the other SRV sites): the fast path samples through
+			// the non-decoding view, so the app's display-referred bytes pass
+			// through to the DP unchanged; a composing frame samples
+			// format-honest, so an `_SRGB` source decodes to linear and the
+			// private `_SRGB` target re-encodes once on write. #1503: the
+			// image is TYPELESS, so either resolve goes through its stamped
 			// requested format rather than src_desc.Format.
-			srv_desc.Format = comp_d3d12_swapchain_sample_format(src_resource);
+			srv_desc.Format = layer_source_format(renderer, src_resource);
 			srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 			// Honor the projection view's array layer. Under single-pass-instanced
 			// the app submits ONE swapchain with viewCount=2 and per-view
@@ -2308,8 +2737,9 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 				comp_layer_tile_mark_composited(tile);
 				const bool unpremul =
 				    (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0;
-				cmd_list->SetPipelineState(unpremul ? renderer->blit_pso_alpha
-				                                    : renderer->blit_pso_premul);
+				const uint32_t zrt = renderer->compose_active ? 1u : 0u;
+				cmd_list->SetPipelineState(unpremul ? renderer->blit_pso_alpha[zrt]
+				                                    : renderer->blit_pso_premul[zrt]);
 			}
 
 			// #1598: a LATER projection layer blends over what the tile
@@ -2318,7 +2748,8 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 			// single-projection-layer frame every shipping app submits
 			// records the exact same command sequence as before.
 			ID3D12PipelineState *proj_pso = is_zone ? nullptr : blit_pso_for(renderer, proj_mode);
-			const bool proj_pso_bound = proj_pso != nullptr && proj_pso != renderer->blit_pso;
+			const bool proj_pso_bound =
+			    proj_pso != nullptr && proj_pso != renderer->blit_pso[renderer->compose_active ? 1u : 0u];
 			if (proj_pso_bound) {
 				cmd_list->SetPipelineState(proj_pso);
 			}
@@ -2361,7 +2792,7 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 			// for the next draw, so every iteration starts from the same
 			// bound state this pass set up before the loop.
 			if (is_zone || proj_pso_bound) {
-				cmd_list->SetPipelineState(renderer->blit_pso);
+				cmd_list->SetPipelineState(renderer->blit_pso[renderer->compose_active ? 1u : 0u]);
 			}
 
 			// Transition swapchain image back: PIXEL_SHADER_RESOURCE →
@@ -2373,6 +2804,13 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 			cmd_list->ResourceBarrier(1, &src_barrier);
 		}
 	}
+
+	// #1610: publish what the private target now holds, so the atlas is
+	// correct for the projection-only capture the compositor may take between
+	// the two passes. The compose target KEEPS its content — the window-space
+	// pass below draws on top of it and republishes. A no-op on a fast-path
+	// frame, which drew into the atlas directly.
+	renderer_publish_compose_to_atlas(renderer, cmd_list);
 
 	// Atlas left in RENDER_TARGET; window-space pass continues into the
 	// same cmd_list (or after a capture round-trip through PSR).
@@ -2404,7 +2842,9 @@ comp_d3d12_renderer_draw_window_space_pass(struct comp_d3d12_renderer *renderer,
 		if (target_height < renderer->texture_height) ws_vp_h = target_height;
 	}
 
-	// Draw window-space layers (atlas is in RENDER_TARGET state)
+	// Draw window-space layers (atlas is in RENDER_TARGET state; a composing
+	// frame paints the private target instead and republishes below).
+	bool any_window_space = false;
 	for (uint32_t vi = 0; vi < view_count; vi++) {
 		uint32_t tile_x = (vi % layout->cols) * layout->tile_w;
 		uint32_t tile_y = (vi / layout->cols) * layout->tile_h;
@@ -2413,8 +2853,18 @@ comp_d3d12_renderer_draw_window_space_pass(struct comp_d3d12_renderer *renderer,
 			if (layer->data.type != XRT_LAYER_WINDOW_SPACE) {
 				continue;
 			}
+			any_window_space = true;
 			render_window_space_layer(renderer, cmd_list, layer, vi, tile_x, tile_y, ws_vp_w, ws_vp_h);
 		}
+	}
+
+	// #1610: republish only when this pass actually drew, so a composing
+	// frame without a window-space layer pays for exactly one atlas copy, not
+	// two. (Each render_window_space_layer states its own target, so the
+	// capture round trip the caller may have run in between costs nothing to
+	// recover from.)
+	if (any_window_space) {
+		renderer_publish_compose_to_atlas(renderer, cmd_list);
 	}
 
 	// Final transition: RENDER_TARGET → PIXEL_SHADER_RESOURCE for the DP —
@@ -2681,6 +3131,14 @@ comp_d3d12_renderer_resize(struct comp_d3d12_renderer *renderer,
 	if (renderer->atlas_texture != nullptr) {
 		renderer->atlas_texture->Release();
 		renderer->atlas_texture = nullptr;
+	}
+	// #1610: the private compose target tracks the atlas's extent, so a
+	// genuine realloc retires it too. renderer_ensure_compose_target()
+	// rebuilds it on the next composing frame; a session that only ever takes
+	// the fast path never rebuilds it at all.
+	if (renderer->compose_texture != nullptr) {
+		renderer->compose_texture->Release();
+		renderer->compose_texture = nullptr;
 	}
 
 	renderer->view_width = new_view_width;
