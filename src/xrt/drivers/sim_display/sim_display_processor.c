@@ -110,6 +110,10 @@ struct sim_display_processor
 	//! weave target to alpha=0 so alpha<1 regions stay see-through.
 	bool transparent_bg;
 
+	//! Lazy transparency test double: last state the runtime reported.
+	bool transparency_active;
+	bool transparency_active_known;
+
 	//! #491 part 3 — the runtime's flattened 2D-under backdrop for the next
 	//! process_atlas (set via set_background_2d). sim_display is a test double:
 	//! it records the handoff (proving the runtime wiring) but does not capture
@@ -913,6 +917,28 @@ sim_dp_snap_window_rect(struct xrt_display_processor_vk *xdp,
 	return true;
 }
 
+/*!
+ * Lazy transparency test double (xrt_display_processor_vk::set_transparency_active).
+ *
+ * sim_display has no desktop capture or alpha-gate to idle, so this only
+ * reports the runtime's transitions — which is what makes the runtime half of
+ * lazy transparency (the per-frame alpha probe and its debounce) observable
+ * without vendor hardware: run a transparency-capable app, flip its content
+ * between opaque and transparent, and watch these lines.
+ */
+static void
+sim_dp_set_transparency_active(struct xrt_display_processor_vk *xdp, bool active)
+{
+	struct sim_display_processor *sdp = (struct sim_display_processor *)xdp;
+	if (sdp->transparency_active_known && sdp->transparency_active == active) {
+		return;
+	}
+	sdp->transparency_active_known = true;
+	sdp->transparency_active = active;
+	U_LOG_W("SIM TRANSPARENCY %s (lazy transparency test double: a vendor DP would %s its desktop capture)",
+	        active ? "ACTIVE" : "IDLE", active ? "start" : "stop");
+}
+
 static bool
 sim_dp_clear_local_zone_mask(struct xrt_display_processor *xdp)
 {
@@ -950,10 +976,12 @@ sim_display_processor_create(enum sim_display_output_mode mode,
 	// ADR-020 rule 1: advertise the vtable size so the runtime knows which
 	// slots this plug-in actually built (calloc already zeroed reserved_0).
 	// ADR-020: advertise the VK variant's size — this DP fills base slots plus
-	// the vk snap_window_rect below; every other vk slot stays NULL (calloc),
+	// the vk snap_window_rect and set_transparency_active below; every other vk
+	// slot stays NULL (calloc),
 	// and the runtime's wrappers check both the size and the pointer.
 	sdp->base_vk.base.struct_size = (uint32_t)sizeof(struct xrt_display_processor_vk);
 	sdp->base_vk.snap_window_rect = sim_dp_snap_window_rect; // #1588 / #1609
+	sdp->base_vk.set_transparency_active = sim_dp_set_transparency_active; // lazy transparency
 	sdp->base_vk.base.destroy = sim_dp_destroy;
 	sdp->base_vk.base.get_render_pass = sim_dp_get_render_pass;
 	sdp->base_vk.base.get_predicted_eye_positions = sim_dp_get_predicted_eye_positions;

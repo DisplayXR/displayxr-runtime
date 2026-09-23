@@ -47,6 +47,7 @@ set(tests
     tests_aux_wayland_geom
     tests_aux_display_mode_hold
     tests_comp_rear_budget
+    tests_comp_lazy_transparency
     tests_oxr_weave_latch
     tests_oxr_layer_space
     tests_oxr_view_config_rule
@@ -427,6 +428,7 @@ target_include_directories(tests_comp_vblank_grid PRIVATE ${PROJECT_SOURCE_DIR}/
 # library, no graphics API, no device -- so it needs the include path and
 # nothing else.
 target_include_directories(tests_comp_zone_tier1 PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+target_include_directories(tests_comp_lazy_transparency PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 
 # #1504 / #1513 -- the acquire/wait/release ring the vk_native, OpenGL and Metal
 # swapchains all share. Same shape as the two above: a header of pure index

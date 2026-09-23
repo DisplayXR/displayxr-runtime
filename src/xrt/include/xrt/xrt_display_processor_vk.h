@@ -573,6 +573,64 @@ struct xrt_display_processor_vk
 	                         int32_t target_y,
 	                         int32_t *out_x,
 	                         int32_t *out_y);
+
+	/*!
+	 * Tell the DP whether the content it weaves is transparent RIGHT NOW —
+	 * lazy transparency. A per-frame fact layered under the per-session
+	 * capability @ref set_transparent_background declares.
+	 *
+	 * ## Why a second signal
+	 *
+	 * Transparency capability has to be declared at session creation (the
+	 * window visual and the swapchain alpha mode are fixed then), so an app
+	 * that CAN go transparent — an opaque scene with a Ctrl+T toggle — declares
+	 * it from the start. Without this slot the DP cannot tell that app's
+	 * opaque frames from a transparent app's, so it runs its whole
+	 * transparency machinery — on Leia/Linux a full-panel desktop capture
+	 * (a mutter ScreenCast over PipeWire, re-uploaded every frame), the
+	 * compose-under pass and the post-weave alpha-gate — for content with no
+	 * transparent pixel in it.
+	 *
+	 * The runtime owns the policy and the measurement (it probes the atlas'
+	 * alpha each app frame, the same atlas it hands @ref
+	 * xrt_display_processor::process_atlas); the DP owns what "idle" means for
+	 * its own resources. This mirrors the rear-depth-budget split (ADR-040):
+	 * runtime policy, DP pixels.
+	 *
+	 * ## Contract
+	 *
+	 * - Meaningful only while @ref set_transparent_background has enabled
+	 *   transparency; ignored otherwise.
+	 * - **Default is ACTIVE.** A DP must behave exactly as before until it is
+	 *   told otherwise, because an older runtime never calls this slot.
+	 * - The runtime calls it only on TRANSITIONS, from the compositor's frame
+	 *   thread, before the @ref xrt_display_processor::process_atlas of the
+	 *   frame it applies to. It may call it once with @p active = false BEFORE
+	 *   @ref set_transparent_background(true) so a DP that starts expensive
+	 *   work on enable (a capture session) can defer it until the content is
+	 *   actually transparent.
+	 * - The runtime debounces: ACTIVE on the first app frame whose atlas
+	 *   carries any alpha < 1, IDLE only after a run of fully opaque frames.
+	 *   The measurement lags one frame, so the first transparent frame after
+	 *   an idle stretch is woven with the DP still idle.
+	 * - While IDLE the woven output must be opaque (the content is opaque, so
+	 *   skipping the alpha-gate is correct), and the DP should release
+	 *   anything whose only purpose is a transparent background.
+	 * - Must not block the frame thread for long: a DP whose capture start is
+	 *   slow should start it asynchronously and fall back (e.g. silhouette
+	 *   intersection) until its first frame arrives.
+	 *
+	 * Optional — absent slot (older plug-in `struct_size`) or NULL ⟹ the
+	 * runtime never probes and transparency stays active for the whole
+	 * session, exactly as before. Appended after @ref snap_window_rect per
+	 * ADR-020 (append-only within a major; no version bump — gated by the
+	 * variant's `base.struct_size`).
+	 *
+	 * @param xdp     Pointer to self.
+	 * @param active  true ⟹ the content is transparent now; false ⟹ it is
+	 *                opaque and the DP may idle its transparency work.
+	 */
+	void (*set_transparency_active)(struct xrt_display_processor_vk *xdp, bool active);
 };
 
 /*!
@@ -682,7 +740,8 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, get_background_previ
 #define XRT_DP_VK_HAS_BACKGROUND_PREVIEW 1
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, get_last_frame_dropped) == sizeof(struct xrt_display_processor) + 12 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, snap_window_rect)          == sizeof(struct xrt_display_processor) + 13 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 14 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_transparency_active)   == sizeof(struct xrt_display_processor) + 14 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 15 * sizeof(void *), XRT_DP_ABI_MSG);
 
 /*!
  * Defined when this header carries the @ref
@@ -700,6 +759,15 @@ XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_d
  * pattern used by every other appended slot.
  */
 #define XRT_DP_VK_HAS_SNAP_WINDOW_RECT 1
+
+/*!
+ * Defined when this header carries the @ref
+ * xrt_display_processor_vk::set_transparency_active slot (lazy transparency),
+ * so a plug-in built against an older runtime can #ifdef-guard its
+ * implementation - the coupled-ABI-addition pattern used by every other
+ * appended slot.
+ */
+#define XRT_DP_VK_HAS_TRANSPARENCY_ACTIVE 1
 // clang-format on
 
 /*!
@@ -1093,6 +1161,43 @@ xrt_display_processor_vk_snap_window_rect(struct xrt_display_processor_vk *xdp,
 	}
 	*out_x = sx;
 	*out_y = sy;
+	return true;
+}
+
+/*!
+ * @copydoc xrt_display_processor_vk::set_transparency_active
+ *
+ * Returns false if not supported (the plug-in's `base.struct_size` doesn't
+ * cover the slot, or the pointer is NULL) — the caller must then leave
+ * transparency active for the session, which is the pre-slot behaviour.
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline bool
+xrt_display_processor_vk_supports_transparency_active(struct xrt_display_processor_vk *xdp)
+{
+	if (xdp == NULL) {
+		return false;
+	}
+	const char *slot_end = (const char *)&xdp->set_transparency_active + sizeof(xdp->set_transparency_active);
+	return slot_end <= (const char *)xdp + xdp->base.struct_size && xdp->set_transparency_active != NULL;
+}
+
+/*!
+ * @copydoc xrt_display_processor_vk::set_transparency_active
+ *
+ * No-op returning false if not supported; see
+ * @ref xrt_display_processor_vk_supports_transparency_active.
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline bool
+xrt_display_processor_vk_set_transparency_active(struct xrt_display_processor_vk *xdp, bool active)
+{
+	if (!xrt_display_processor_vk_supports_transparency_active(xdp)) {
+		return false;
+	}
+	xdp->set_transparency_active(xdp, active);
 	return true;
 }
 

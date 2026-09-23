@@ -17,6 +17,7 @@
 #include "comp_vk_native_swapchain.h"
 #include "comp_vk_native_target.h"
 #include "comp_vk_native_renderer.h"
+#include "comp_vk_native_alpha_probe.h"
 
 #include "util/comp_swapchain_ring.h"
 #include "util/comp_zone_tier1.h"
@@ -25,6 +26,7 @@
 // XR_DXR_depth_budget: the API-agnostic runner (validate -> analyse -> policy
 // -> publish -> dump). Only the typed get_background_preview call stays here.
 #include "util/comp_rear_budget.h"
+#include "util/comp_lazy_transparency.h"
 #ifdef XRT_OS_WINDOWS
 #include "util/comp_display_refresh_win.h"
 #endif
@@ -156,6 +158,12 @@ DEBUG_GET_ONCE_BOOL_OPTION(present_opaque, "DXR_PRESENT_OPAQUE", false)
 // A/B measurement (the win is GPU fill, so compare GPU busy time, not the
 // frame-stage timer — that stage also spans the submit + whole-frame wait).
 DEBUG_GET_ONCE_BOOL_OPTION(local2d_clip, "DXR_L2D_CLIP", true)
+// Lazy transparency: a transparency-CAPABLE session only runs the DP's
+// transparency machinery (desktop capture, compose-under, alpha-gate) while its
+// content actually carries alpha < 1. On by default where the DP supports
+// set_transparency_active; DXR_LAZY_TRANSPARENCY=0 keeps it active for the
+// whole session (the pre-slot behaviour) for A/B measurement.
+DEBUG_GET_ONCE_BOOL_OPTION(lazy_transparency, "DXR_LAZY_TRANSPARENCY", true)
 
 // Frame pipelining (#837): per-stage CPU timing of the windowed layer_commit
 // path — where does the non-GPU-busy frame time go? Accumulates per stage and
@@ -507,6 +515,15 @@ struct comp_vk_native_compositor
 	//! present uses a transparent compositeAlpha. Cached for the macOS Local2D
 	//! flat-2D-over-desktop rule (#568) in vk_composite_local_2d.
 	bool transparent_background;
+
+	/*!
+	 * Lazy transparency (xrt_display_processor_vk::set_transparency_active).
+	 * `alpha_probe` measures, per app frame, whether the atlas handed to the
+	 * DP has any alpha < 1; `lazy` debounces that into DP transitions. Both
+	 * NULL / disengaged ⟹ the DP's transparency stays active all session.
+	 */
+	struct comp_vk_alpha_probe *alpha_probe;
+	struct comp_lazy_transparency lazy;
 
 	/*!
 	 * XR_DXR_depth_budget (rear depth budget).
@@ -4993,6 +5010,112 @@ vk_publish_rear_budget_zones(struct comp_vk_native_compositor *c)
  */
 #define DXR_DROP_VERBOSE_RUNS 32
 
+/*
+ * ── Lazy transparency ────────────────────────────────────────────────────────
+ *
+ * A session declares transparency CAPABILITY at xrCreateSession, because the
+ * window visual and the swapchain alpha mode are fixed there. Whether the
+ * content is transparent is a per-frame fact nobody declares: an app that
+ * starts opaque and offers a transparent-background toggle submits the same
+ * layers, flags and blend mode either way — only the pixels' alpha differs.
+ * Before this, such an app paid for the DP's whole transparency machinery on
+ * every opaque frame: on Leia/Linux a full-panel mutter ScreenCast over
+ * PipeWire re-uploaded each frame, plus the compose-under and alpha-gate
+ * passes.
+ *
+ * Layering (separation-of-concerns: the runtime owns policy, the DP owns
+ * pixels, the same split as the rear depth budget):
+ * - the runtime MEASURES, on the atlas it hands process_atlas, whether any
+ *   alpha < 1 is present (comp_vk_native_alpha_probe),
+ * - comp_lazy_transparency DEBOUNCES that (active on the first transparent
+ *   frame, idle after a run of opaque ones),
+ * - the DP DECIDES what idle means for its resources
+ *   (xrt_display_processor_vk::set_transparency_active).
+ *
+ * Engaged only when the session is transparency-capable, the DP implements the
+ * slot, and the frame reaches the DP through vk_dp_weave_and_present. Scoped to
+ * desktop Linux for now: the Windows #918 split and the shared-texture path
+ * weave through other call sites that do not run the probe, and a DP told
+ * "idle" there would never hear "active" again.
+ */
+static void
+vk_lazy_transparency_setup(struct comp_vk_native_compositor *c, bool transparent_background)
+{
+	c->lazy.engaged = false;
+#ifdef XRT_OS_LINUX_DESKTOP
+	struct xrt_display_processor_vk *dp_vk = (struct xrt_display_processor_vk *)c->display_processor;
+	if (!transparent_background || c->has_shared_texture) {
+		return;
+	}
+	if (!xrt_display_processor_vk_supports_transparency_active(dp_vk)) {
+		U_LOG_W(
+		    "lazy transparency: display processor has no set_transparency_active slot — "
+		    "transparency stays active for the whole session");
+		return;
+	}
+	if (!debug_get_bool_option_lazy_transparency()) {
+		U_LOG_W(
+		    "lazy transparency: disabled (DXR_LAZY_TRANSPARENCY=0) — transparency stays active "
+		    "for the whole session");
+		return;
+	}
+	if (c->alpha_probe == NULL) {
+		c->alpha_probe = comp_vk_alpha_probe_create(&c->vk);
+	}
+	if (c->alpha_probe == NULL) {
+		return; // logged by the probe
+	}
+	// Declare IDLE before the DP enables transparency, so a DP that starts a
+	// capture on enable defers it until the content is actually transparent.
+	xrt_display_processor_vk_set_transparency_active(dp_vk, false);
+	comp_lazy_transparency_engage(&c->lazy, 0);
+	U_LOG_W(
+	    "lazy transparency: engaged — the DP idles its transparency work until a frame carries "
+	    "alpha < 1, and again after %u consecutive opaque frames",
+	    c->lazy.idle_after);
+#else
+	(void)transparent_background;
+#endif
+}
+
+/*!
+ * Once per APP frame (never on a repaint), before process_atlas: consume the
+ * previous frame's probe verdict, forward any transition to the DP, then probe
+ * this frame's atlas. The verdict lags one frame, so the first transparent
+ * frame after an idle stretch is woven with the DP still idle.
+ */
+static void
+vk_lazy_transparency_frame(struct comp_vk_native_compositor *c,
+                           VkCommandBuffer cmd,
+                           VkImageView atlas_view,
+                           uint32_t content_w,
+                           uint32_t content_h)
+{
+	if (!c->lazy.engaged || c->alpha_probe == NULL) {
+		return;
+	}
+	struct comp_vk_alpha_probe_result r;
+	if (comp_vk_alpha_probe_read(c->alpha_probe, &r)) {
+		const enum comp_lazy_transparency_transition t =
+		    comp_lazy_transparency_update(&c->lazy, r.transparent_blocks != 0);
+		if (t != COMP_LAZY_TRANSPARENCY_NONE) {
+			const bool active = (t == COMP_LAZY_TRANSPARENCY_TO_ACTIVE);
+			xrt_display_processor_vk_set_transparency_active(
+			    (struct xrt_display_processor_vk *)c->display_processor, active);
+			// A transition is a user-visible state change (a transparency
+			// toggle), debounced to at most one per second of opaque content:
+			// lifecycle-rare, so WARN is the right level.
+			if (active) {
+				U_LOG_W("lazy transparency: ACTIVE — %u/%u sample blocks carry alpha < 1",
+				        r.transparent_blocks, r.total_blocks);
+			} else {
+				U_LOG_W("lazy transparency: IDLE — content opaque for %u frames", c->lazy.idle_after);
+			}
+		}
+	}
+	comp_vk_alpha_probe_record(c->alpha_probe, cmd, atlas_view, content_w, content_h);
+}
+
 static xrt_result_t
 vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
                         bool is_repaint,
@@ -5342,6 +5465,14 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 				}
 				vk_crop_atlas_for_dp(c, cmd, &src_image_u64, &src_view_u64,
 				                      content_w, content_h, atlas_w, atlas_h);
+
+				// Lazy transparency: probe the exact atlas the DP weaves.
+				// Recorded here, before the dp_self_submits flush below, so it
+				// rides the pre-DP submit for a self-submitting DP too.
+				if (!is_repaint) {
+					vk_lazy_transparency_frame(c, cmd, (VkImageView)(uintptr_t)src_view_u64,
+					                           content_w, content_h);
+				}
 			}
 
 			// Create temporary framebuffer from the target's swapchain image.
@@ -8168,6 +8299,8 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 		comp_vk_native_renderer_destroy(&c->renderer);
 	}
 
+	comp_vk_alpha_probe_destroy(&c->alpha_probe);
+
 	if (c->target != NULL) {
 		comp_vk_native_target_destroy(&c->target);
 	}
@@ -8489,6 +8622,7 @@ vk_make_dp_vk(struct comp_vk_native_compositor *c,
 		        (int)c->hw3d_request_value, (int)ok);
 	}
 	if (c->display_processor != NULL) {
+		vk_lazy_transparency_setup(c, transparent_background);
 		xrt_display_processor_vk_set_transparent_background(
 		    (struct xrt_display_processor_vk *)c->display_processor, transparent_background, false);
 

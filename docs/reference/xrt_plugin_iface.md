@@ -454,6 +454,49 @@ bool (*snap_window_rect)(struct xrt_display_processor_vk *xdp, /* or _d3d11 */
   owner's, which is anchored on the drag origin. Only the party that knows where the window
   is going may snap it.
 
+## Whether the content is transparent NOW: `set_transparency_active`
+
+`set_transparent_background` is a **session capability**: it is declared at
+`xrCreateSession`, because the window visual and the swapchain alpha mode are fixed
+there. An app that *can* go transparent (an opaque scene with a transparency toggle)
+therefore declares it from its first frame, and a DP that starts a desktop capture on
+that call pays for the capture, the compose-under and the alpha-gate on every opaque
+frame. Measured before this slot: a transparency-capable Linux app, opaque, cost the
+same as a transparent one.
+
+```c
+void (*set_transparency_active)(struct xrt_display_processor_vk *xdp, bool active);
+```
+
+- **The runtime measures, the DP decides.** Every app frame the Vulkan compositor
+  probes the atlas it is about to hand `process_atlas` for any alpha < 1 (a compute
+  pass sampling one texel per 4x4 block, read back one frame later without a stall)
+  and debounces the verdict: **ACTIVE on the first transparent frame, IDLE after 60
+  consecutive opaque frames** (`comp_lazy_transparency.h`). The DP only hears
+  transitions. What "idle" releases is the DP's business.
+- **Default ACTIVE.** A runtime that predates the slot never calls it, so a DP must
+  behave exactly as before until told otherwise. The runtime may call it once with
+  `false` *before* `set_transparent_background(true)`, so a DP that starts a capture
+  on enable can defer it until the content is transparent.
+- **While IDLE the output must be opaque** — which it already is when the alpha-gate
+  is skipped, because the content has no transparent pixel for it to punch.
+- **The first transparent frame after an idle stretch weaves with the DP still idle**
+  (the probe reads back one frame late). After that, the DP runs whatever it runs for
+  a frame without a trusted background — on Leia/Linux, silhouette intersection —
+  until its restarted capture delivers. Nothing captured before the idle stretch is
+  reused: the desktop behind the window has had all that time to change.
+- **Do not block the frame thread.** Starting a capture can take a large fraction of
+  a second; start and stop it off-thread.
+- **Scope today: desktop Linux, windowed `vk_native` sessions.** The shared-texture
+  path and the Windows #918 split weave through call sites that do not run the probe,
+  so the runtime never engages the policy there (a DP told "idle" there would never
+  hear "active" again). `DXR_LAZY_TRANSPARENCY=0` disables it for A/B.
+- Appended at the end of the Vulkan variant, `XRT_DP_VK_HAS_TRANSPARENCY_ACTIVE`,
+  guarded like every other appended slot. **Purely additive** — no
+  `XRT_PLUGIN_API_VERSION_CURRENT` bump (ADR-020). `sim_display` implements it as a
+  logging test double (`SIM TRANSPARENCY ACTIVE/IDLE`), which is how the runtime half
+  is verified without vendor hardware.
+
 ## Frame-timing inputs are an offer, never a requirement
 
 The runtime does a lot of work to make each frame reach the panel as late and

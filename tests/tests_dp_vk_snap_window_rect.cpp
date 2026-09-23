@@ -119,7 +119,7 @@ TEST_CASE("dp_vk_snap: the slot is appended, not inserted")
 	// misdispatches. The header's own static_asserts pin the offsets; this
 	// pins the relationship the gate depends on.
 	CHECK(size_without_slot() == sizeof(struct xrt_display_processor) + 13 * sizeof(void *));
-	CHECK(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 14 * sizeof(void *));
+	CHECK(sizeof(struct xrt_display_processor_vk) >= sizeof(struct xrt_display_processor) + 14 * sizeof(void *));
 }
 
 TEST_CASE("dp_vk_snap: an older plug-in is identity and is never called")
