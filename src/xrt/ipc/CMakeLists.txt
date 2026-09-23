@@ -138,19 +138,6 @@ if(WIN32 AND XRT_FEATURE_HYBRID_MODE)
 	target_compile_definitions(ipc_server PRIVATE XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 endif()
 
-# Desktop Linux (#1588): xrWeaveSnapWindowRectDXR is a pure query on the display
-# processor, and on Linux the DP hangs off the native Vulkan compositor behind
-# the multi system compositor — so the handler calls
-# comp_vk_native_compositor_snap_window_rect() directly. Same ADR-019 shape as
-# the D3D11 arm above: the lens math stays in the plug-in, the IPC layer only
-# forwards two points.
-if(XRT_HAVE_LINUX AND NOT ANDROID)
-	if(XRT_HAVE_VULKAN AND TARGET comp_vk_native)
-		target_link_libraries(ipc_server PRIVATE comp_vk_native)
-		target_compile_definitions(ipc_server PRIVATE XRT_HAVE_VK_NATIVE_COMPOSITOR)
-	endif()
-endif()
-
 # Qwerty driver stereo state access for camera-centric controls
 if(XRT_BUILD_DRIVER_QWERTY)
 	target_include_directories(ipc_server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../drivers/qwerty)

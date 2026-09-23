@@ -60,17 +60,6 @@
 #include "xrt/xrt_display_metrics.h" // struct xrt_eye_positions (DP-tracked eyes; Leia M2)
 #endif
 
-// `XRT_OS_LINUX && !XRT_OS_ANDROID` is the XRT_OS_LINUX_DESKTOP condition spelled
-// out until that macro is defined globally in xrt_config_os.h (#1702).
-#if defined(XRT_HAVE_VK_NATIVE_COMPOSITOR) && defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
-// Desktop Linux (#1588): the weave snap is a pure DP query, and on this
-// platform the DP lives on the native Vulkan compositor behind the multi
-// system compositor — so the handler walks multi_compositor -> msc -> xcn and
-// calls it directly. No weave service, nothing to borrow from comp_multi.
-#include "multi/comp_multi_private.h"
-#include "vk_native/comp_vk_native_compositor.h"
-#endif
-
 #if defined(XRT_OS_MACOS)
 // macOS service input forwarding (#48): drain the generic queue fed by the
 // AppKit pump's NSEvent capture (ipc_server_macos_appkit.m).
@@ -6712,41 +6701,14 @@ ipc_handle_weave_snap_window_rect(volatile struct ipc_client_state *ics,
 		*out_snapped_y = sy;
 	}
 	return XRT_SUCCESS;
-#elif defined(XRT_HAVE_VK_NATIVE_COMPOSITOR) && defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
-	// (the XRT_OS_LINUX_DESKTOP condition spelled out until #1702 lands)
-	/*
-	 * Desktop Linux (#1588). There is no weave service here and no
-	 * comp_multi_weave_* leg to borrow — but the snap does not need one: it
-	 * is a pure query on the display processor, and on Linux the DP lives on
-	 * the native Vulkan compositor behind the multi system compositor. Reach
-	 * it directly rather than growing a weave engine that has nothing to do.
-	 *
-	 * The client-side xc is a multi_compositor; msc->xcn is the one native
-	 * compositor that owns the panel and therefore the phase, which is the
-	 * right thing to snap against no matter which client asked.
-	 *
-	 * Ordered BEFORE the COMP_MULTI_HAVE_WEAVE arm on purpose (#1699): once
-	 * desktop Linux grows a comp_multi weave engine, this arm must still win —
-	 * the vk_native DP snap is real here, whereas comp_multi_weave_snap_window_rect
-	 * is identity on macOS / Android.
-	 */
-	{
-		struct multi_compositor *mc = multi_compositor(ics->xc);
-		if (mc == NULL || mc->msc == NULL || mc->msc->xcn == NULL) {
-			return XRT_SUCCESS; // identity, already defaulted above
-		}
-		int32_t sx = target_x, sy = target_y;
-		if (comp_vk_native_compositor_snap_window_rect(&mc->msc->xcn->base, origin_x, origin_y, target_x,
-		                                               target_y, &sx, &sy)) {
-			*out_snapped = true;
-			*out_snapped_x = sx;
-			*out_snapped_y = sy;
-		}
-	}
-	return XRT_SUCCESS;
 #elif defined(COMP_MULTI_HAVE_WEAVE)
-	// Identity today (sim_display has no interlace lattice); routes to a
-	// future VK DP snap slot in one place (#759).
+	// The weave engine owns the service-side display processor, so the snap
+	// routes through it: its xrt_display_processor_vk's snap_window_rect slot
+	// (the same slot the in-process vk_native compositor uses). Identity today
+	// on macOS / Android (sim_display has no interlace lattice, #759); on
+	// desktop Linux this is where the real snap lands once the engine exists
+	// (#1699 R2). Until then the Linux service has no DP to ask and takes the
+	// identity #else below.
 	int32_t sx = target_x, sy = target_y;
 	if (comp_multi_weave_snap_window_rect(ics->xc, origin_x, origin_y, target_x, target_y, &sx, &sy)) {
 		*out_snapped = true;
