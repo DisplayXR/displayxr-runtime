@@ -23,6 +23,14 @@ name: lint
 #   plug-in built against another apiVersion and every in-process app
 #   silently runs in 2D. See scripts/check_cnsdk_pins.py.
 #
+# - GNOME Shell extension guard: contrib/gnome-shell/ has to load on
+#   every GNOME our .deb installs on, and those straddle the GNOME 45
+#   ES-module break (Ubuntu 22.04 is GNOME 42, 26.04 is GNOME 50). The
+#   check asserts metadata.json's shell-version covers the releases
+#   build-linux.yml packages for, compiles the shared lib.js under both
+#   of GJS's module goals, and unit-tests the installer's entry-point
+#   chooser. See scripts/check_gnome_extension.py.
+#
 # Add other lightweight lint jobs here as needed (yaml validity,
 # CLAUDE.md presence, etc.).
 
@@ -118,6 +126,36 @@ jobs:
             exit 1
           fi
           echo "docs/vendors/ is index-only. ✓"
+
+  gnome-extension-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install gjs
+        # The engine GNOME Shell itself runs, so the syntax check is the real
+        # one. ~10 s, no X, no GPU.
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends gjs
+
+      - name: GNOME Shell extension loads on every release we package for
+        # The extension spans the GNOME 45 module-system break: 45+ loads an
+        # ES module, 40-44 the legacy importer, for which ESM syntax is a
+        # parse error. It therefore ships two entry points over one shared
+        # lib.js. This asserts metadata.json's shell-version covers every
+        # release build-linux.yml installs the .deb into (22.04 = GNOME 42),
+        # and compiles lib.js under BOTH goals -- which is the property that
+        # makes one shared file possible at all.
+        run: python3 scripts/check_gnome_extension.py --require-gjs
+
+      - name: Entry-point selection picks the right form
+        # Unit test for the install/login-time chooser. Hermetic: fake HOME,
+        # fake system data root, DISPLAYXR_GNOME_SHELL_VERSION instead of a
+        # shell. No GNOME needed.
+        run: ./scripts/test_gnome_extension_variant.sh
 
   cnsdk-pin-guard:
     runs-on: ubuntu-latest

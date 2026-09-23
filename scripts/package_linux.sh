@@ -66,9 +66,17 @@ done
 
 EXT_UUID="window-geometry@displayxr.org"
 EXT_SRC="$ROOT/contrib/gnome-shell/$EXT_UUID"
-for f in "$EXT_SRC/extension.js" "$EXT_SRC/metadata.json" "$ROOT/scripts/linux/displayxr-gnome-extension-enable"; do
-    [ -f "$f" ] || { echo "error: missing $f (GNOME Shell extension payload)" >&2; exit 1; }
+# Both entry-point forms ship: extension.js is the GNOME 45+ ES module (the
+# slot GNOME reads), extension-gnome42.js the GNOME 40-44 legacy one, lib.js
+# the logic they share. install.sh's enable script puts the right one in the
+# slot for the running shell (Ubuntu 22.04 is GNOME 42).
+EXT_FILES="extension.js extension-gnome42.js lib.js metadata.json"
+for f in $EXT_FILES; do
+    [ -f "$EXT_SRC/$f" ] || { echo "error: missing $EXT_SRC/$f (GNOME Shell extension payload)" >&2; exit 1; }
 done
+[ -f "$ROOT/scripts/linux/displayxr-gnome-extension-enable" ] || {
+    echo "error: missing scripts/linux/displayxr-gnome-extension-enable" >&2; exit 1
+}
 
 VERSION="$(git -C "$ROOT" describe --tags --always --dirty 2>/dev/null || echo unknown)"
 ARCH="$(uname -m)"
@@ -82,7 +90,7 @@ cp "$CLI_BIN" "$STAGE/bin/"
 [ -n "$SERVICE_BIN" ] && cp "$SERVICE_BIN" "$STAGE/bin/"
 cp "$RUNTIME_SO" "$STAGE/lib/"
 cp "$PLUGIN_SO" "$STAGE/lib/displayxr/plugins/"
-cp "$EXT_SRC/extension.js" "$EXT_SRC/metadata.json" "$STAGE/share/gnome-shell/extensions/$EXT_UUID/"
+for f in $EXT_FILES; do cp "$EXT_SRC/$f" "$STAGE/share/gnome-shell/extensions/$EXT_UUID/"; done
 install -m 0755 "$ROOT/scripts/linux/displayxr-gnome-extension-enable" "$STAGE/bin/"
 cp "$ROOT/scripts/linux/install.sh" "$ROOT/scripts/linux/uninstall.sh" "$STAGE/"
 chmod +x "$STAGE/install.sh" "$STAGE/uninstall.sh"

@@ -377,10 +377,14 @@ outside its cross-release `STABLE_SONAMES` list or a glibc floor above
 pristine 22.04 / 24.04 / 26.04 containers (`ldd -r`, dependency-name existence,
 env-free `displayxr-cli selftest`) before `DebRelease` attaches it to a release.
 The tarball, which has no dependency metadata, records the floor in a
-`GLIBC_FLOOR` file that its `install.sh` enforces. Caveat that predates this and
-is unchanged: the GNOME Shell extension needs Shell 45+, so on 22.04 (GNOME 42)
-it is installed but never loads, and the runtime falls back to display-scoped
-weaving.
+`GLIBC_FLOOR` file that its `install.sh` enforces. The GNOME Shell extension
+used to be the one part that did not reach 22.04 — it is an ES module, which
+only GNOME 45+ loads, so on GNOME 42 it installed and never loaded. It now
+ships **both** entry-point forms over one shared `lib.js` and the login script
+puts the one the running shell can parse in place (#1663); `shell-version` is
+`42`–`50` and CI asserts it covers every release the `.deb` installs into.
+Loading on GNOME 42 is not hardware-validated yet — no 22.04 desktop box here;
+the by-hand pass is written out in the extension's `README.md`.
 
 ### Conformance — the Linux CTS arms (#1527)
 
