@@ -31,6 +31,7 @@
 #include "util/comp_display_refresh_win.h"
 #endif
 
+#include "xrt/xrt_config_os.h"
 #include "xrt/xrt_handles.h"
 #include "xrt/xrt_limits.h"
 #include "xrt/xrt_vulkan_includes.h"
@@ -93,13 +94,6 @@
 #ifdef XRT_OS_MACOS
 #include "vk_native/comp_vk_native_window_macos.h"
 #include <IOSurface/IOSurface.h>
-#endif
-
-// Desktop Linux (X11/XCB present path). Android also defines XRT_OS_LINUX, so the
-// XCB code must be gated on "Linux AND NOT Android" — Android uses the
-// VK_KHR_android_surface path, not XCB. See docs/roadmap/linux-support.md.
-#if defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
-#define XRT_OS_LINUX_DESKTOP
 #endif
 
 #ifdef XRT_OS_LINUX_DESKTOP

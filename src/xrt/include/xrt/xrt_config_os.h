@@ -55,3 +55,13 @@
 #error "OS type not found during compile"
 #endif
 #undef XRT_OS_WAS_AUTODETECTED
+
+/*
+ * Desktop Linux (X11/Wayland). Android also defines XRT_OS_LINUX, so anything
+ * desktop-only — XCB/Wayland surfaces, dma-buf import, xlib window binding —
+ * must gate on this, never on a bare XRT_OS_LINUX, or it leaks into the
+ * Android build. See docs/roadmap/linux-support.md.
+ */
+#if defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
+#define XRT_OS_LINUX_DESKTOP
+#endif
