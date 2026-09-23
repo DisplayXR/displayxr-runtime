@@ -187,6 +187,14 @@ elseif(XRT_HAVE_LINUX)
 	target_sources(
 		ipc_server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_mainloop_linux.c
 		)
+	# The desktop-Linux weave arms (#1699) include multi/comp_multi_private.h,
+	# which pulls in the Vulkan headers; aux_vk exposes ${Vulkan_INCLUDE_DIR}
+	# publicly — same reason as the macOS arm below. Harmless when the weave
+	# engine is not built (XRT_FEATURE_COMP_MULTI_WEAVE_LINUX OFF): a static
+	# library nobody references adds nothing to the link.
+	if(XRT_HAVE_VULKAN)
+		target_link_libraries(ipc_server PRIVATE aux_vk)
+	endif()
 elseif(APPLE)
 	target_sources(
 		ipc_server

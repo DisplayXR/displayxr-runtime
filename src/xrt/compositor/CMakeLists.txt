@@ -340,6 +340,17 @@ if(ANDROID)
 	target_sources(comp_multi PRIVATE multi/comp_multi_weave_android.c)
 endif()
 
+if(XRT_FEATURE_COMP_MULTI_WEAVE_LINUX)
+	# XR_DXR_weave present-owner service on desktop Linux (#1699, piece R2):
+	# dma-buf fd in/out + the same Vulkan weave engine as macOS / Android.
+	# comp_multi already links aux_vk PRIVATE on every platform above, so the
+	# engine needs no extra link here. The source file does not exist yet —
+	# R2 adds it together with:
+	#   target_sources(comp_multi PRIVATE multi/comp_multi_weave_linux.c)
+	# Until then this option is OFF by default and, when forced ON, the build
+	# stops at link time on the comp_multi_weave_* symbols R2 must provide.
+endif()
+
 ###
 # Mock native compositor
 add_library(comp_mock STATIC mock/mock_compositor.cpp mock/mock_compositor.h)
