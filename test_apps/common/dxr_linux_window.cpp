@@ -877,6 +877,14 @@ DxrLinuxWindow::s_frac_preferred_scale(void *data, struct wp_fractional_scale_v1
 	// A windowed surface's declared buffer is configure x this scale, so the
 	// mapping (and, in pump(), the runtime's declared geometry) follows it.
 	self->wl_apply_buffer_mapping();
+#ifdef DXR_APP_HAVE_WL_CHROME
+	// The title bar is its own surface with its own buffer: redraw it at the
+	// new scale too, or it stays rasterised for the monitor the window left
+	// (the right size, since its viewport destination is logical, but blurry).
+	if (self->m_wl_config_w > 0 && self->m_wl_config_h > 0) {
+		self->m_wl_chrome.update(self->m_wl_config_w, self->m_wl_config_h, self->wl_surface_scale());
+	}
+#endif
 }
 
 void
