@@ -61,8 +61,10 @@ endif()
 
 # Shared scaffolding (stb_image header + impl TU) via displayxr::common, pinned by
 # tag. OpenXR (set up above) is reused, not re-fetched. Also provides
-# displayxr::csd, the title-bar painter the native-Wayland leg of
-# dxr_linux_window draws its chrome with (#1654) — hence v2.17.0.
+# displayxr::linux_window — THE desktop-Linux app window (X11 or native Wayland
+# in one binary, chosen by capability probe; the title bar, input events and
+# the phase-snapped drag), which used to live here as test_apps/common/
+# dxr_linux_window and is now shared with every demo — hence v2.20.0.
 include(FetchContent)
 set(DISPLAYXR_COMMON_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 get_filename_component(_dxr_ext_includes
@@ -72,12 +74,13 @@ set(DISPLAYXR_EXTENSIONS_INCLUDE_DIR "${_dxr_ext_includes}" CACHE PATH
 FetchContent_Declare(
     displayxr_common
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    # v2.18.0 ships the 1.5x title and logicalHeight() (displayxr-common#55),
-    # which the Wayland chrome glue uses.
-    GIT_TAG v2.18.0
+    GIT_TAG v2.20.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
+
+# u_x11_scale.h / u_wayland_geom.h: common's copies must match the runtime's.
+include(${CMAKE_SOURCE_DIR}/../common/dxr_linux_window_aux_guard.cmake)
 
 # stb_image_impl.cpp supplies the stb_image definition on Linux (displayxr::common
 # only ships a macOS-gated impl TU; main.cpp is declarations-only). See that file.
@@ -88,11 +91,13 @@ target_include_directories(cube_zones_vk_linux PRIVATE
     ${CMAKE_SOURCE_DIR}/../common
 )
 
-# Dual-backend app-owned window (X11 always; native Wayland when
-# libwayland-client + wayland-scanner are present, which also defines
-# DXR_APP_HAVE_WAYLAND and generates the xdg-shell glue from the vendored XML).
-include(${CMAKE_SOURCE_DIR}/../common/dxr_linux_window.cmake)
-dxr_target_add_linux_window(cube_zones_vk_linux)
+# Dual-backend app-owned window: displayxr::linux_window (X11 always; native
+# Wayland when libwayland-client + wayland-scanner were found — see
+# displayxr-common's common/linux/dxr_linux_window.cmake).
+if(NOT TARGET displayxr::linux_window)
+    message(FATAL_ERROR "displayxr::linux_window is not available (libx11-dev missing?)")
+endif()
+target_link_libraries(cube_zones_vk_linux PRIVATE displayxr::linux_window)
 
 # Copy texture files next to the built executable.
 file(GLOB TEXTURE_FILES "${CMAKE_SOURCE_DIR}/../common/textures/*.jpg")

@@ -33,7 +33,7 @@
  * surviving set is decided by a monitor the 3D app may not even be on.
  *
  * Three configurations measured on one box, laptop eDP-1 2880x1800 next to an
- * Acer SpatialLabs DS1 3840x2160:
+ * external 3840x2160 3D panel:
  *
  * | laptop | panel | X11 sees panel | X11 sees laptop | root      | G | verdict |
  * |--------|-------|----------------|-----------------|-----------|---|---------|

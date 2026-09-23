@@ -19,7 +19,7 @@
  * wrong frame are subtracted — a halved displacement lands on a plausible-looking
  * but wrong lattice. It fails silently rather than visibly, which is why the
  * measured session on 2026-09-20 produced three separate faults from one cause:
- * `wl_output.geometry` put the DS1 at logical x=1728 while the runtime's panel
+ * `wl_output.geometry` put the 3D panel at logical x=1728 while the runtime's panel
  * rect had it at device x=3456, so the output match could never succeed, the
  * surface fullscreened on the laptop, and the weave ran anyway.
  *

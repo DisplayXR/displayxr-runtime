@@ -323,7 +323,7 @@ jobs:
         # into VkWaylandSurfaceCreateInfoKHR), so --as-needed drops
         # -lwayland-client and libwayland-client0 never enters Depends. (No
         # wayland-protocols: the runtime generates no protocol code; the vendored
-        # XML under test_apps/common/wayland-protocols/ is test-app only.)
+        # protocol XML lives in displayxr-common's displayxr::linux_window, test-app only.)
         # libxrandr-dev is REQUIRED too: with x11+xrandr absent, pkg_check_modules
         # leaves XRT_HAVE_XLIB_XRANDR OFF and the released .deb ships with no
         # DXR_LINUX_DIRECT_SCANOUT present path (adds libxrandr2 + libx11-6 to the

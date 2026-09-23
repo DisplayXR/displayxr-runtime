@@ -277,15 +277,15 @@ if [ "$BUILD_APPS" = "ON" ]; then
   #   cube_hosted_legacy_vk_linux — hosted: runtime self-creates the XCB window.
   #   cube_handle_vk_linux        — handle: app creates its own window and passes
   #                                 it to the runtime. ONE binary, TWO backends,
-  #                                 picked at runtime with --backend=x11|wayland|auto
+  #                                 picked at runtime with --platform=x11|wayland|auto
   #                                 (or DXR_WINDOW_BACKEND): X11 via
   #                                 XR_DXR_xlib_window_binding, native Wayland via
   #                                 XR_DXR_wayland_surface_binding (fullscreen-only —
   #                                 docs/specs/extensions/XR_DXR_wayland_surface_binding.md).
-  #                                 Default auto prefers X11 (incl. XWayland).
+  #                                 Default auto: native Wayland when ready, else X11.
   #   cube_zones_vk_linux         — handle + XR_DXR_display_zones (ADR-027):
   #                                 2 clear-based 3D zones + a Local2D strip. Same
-  #                                 --backend / DXR_WINDOW_BACKEND selection.
+  #                                 --platform / DXR_WINDOW_BACKEND selection.
   for APP in cube_hosted_legacy_vk_linux cube_handle_vk_linux cube_zones_vk_linux; do
     APP_DIR="$ROOT/test_apps/$APP"
     # CANDIDATE PATCH (#706 Linux validation): the apps aren't all flat under
@@ -310,12 +310,13 @@ if [ "$BUILD_APPS" = "ON" ]; then
 # Run $APP against the dev runtime build. Needs a Vulkan GPU and either an X
 # server (DISPLAY) or a Wayland compositor (WAYLAND_DISPLAY).
 #
-# The cube_handle / cube_zones apps take --backend=x11|wayland|auto (default
-# auto; DXR_WINDOW_BACKEND sets the same thing, --backend wins) and pass every
-# argument straight through, e.g.
-#   \$0 --backend=wayland
-# auto prefers X11 whenever DISPLAY resolves, including under XWayland: the
-# native Wayland path is fullscreen-only today. --help lists the rest.
+# The cube_handle / cube_zones apps take --platform=x11|wayland|auto (default
+# auto; DXR_WINDOW_BACKEND sets the same thing, --platform wins; --backend= is
+# the older spelling) and pass every argument straight through, e.g.
+#   \$0 --platform=wayland
+# auto probes connections (never session env vars): native Wayland when the
+# compositor is ready (fractional-scale + viewporter + the window-geometry
+# extension), else X11 (XWayland counts). --help lists the rest.
 # OXR_ENABLE_VK_NATIVE_COMPOSITOR=1 selects the native Vulkan compositor path;
 # SIM_DISPLAY_OUTPUT picks the sim-display weave (anaglyph/sbs/...).
 export XR_RUNTIME_JSON="$BUILD_DIR/openxr_displayxr-dev.json"
