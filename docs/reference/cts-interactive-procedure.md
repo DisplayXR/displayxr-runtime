@@ -315,8 +315,9 @@ never "sticks" on the hand you just left.
 | R | Reset controller pose — both, or the focused one with a modifier | — |
 | C | Toggle controller-follows-HMD parenting | — |
 | W A S D / Q E | Move the focused device | head or grip/aim pose |
-| Arrow keys | Rotate the focused device | — |
-| SHIFT | Sprint (3× movement speed) | — |
+| Arrow keys | Rotate the focused device — pitch (up/down), yaw (left/right) | — |
+| **Z / X** | **Roll** the focused device left / right — the third rotation axis (#1692) | grip + aim pose |
+| SHIFT | Sprint — 3× on **both** movement and look speed (#1692) | — |
 | Numpad + / − | Movement speed up / down | — |
 | TAB | Toggle the runtime HUD | — |
 
@@ -577,8 +578,8 @@ pass on a single API."* Do it on `d3d11`.
 |---|---|---|
 | `GripAndAimPose` | Core. Skips if the system reports no orientation/position tracking. | Move a controller (hold CTRL or ALT, drag with RMB / move the mouse) and confirm the grip and aim poses behave as the instructions describe. |
 | `HapticInterrupt` | **Core, no guard at all.** | Haptics you cannot feel — see §7.3. |
-| `InteractiveThrow` | Core + tracking. | Move a controller and release; judge the reported motion. |
-| `SpaceOffsets` | Core + tracking. | Follow the on-screen instructions about offset spaces. |
+| `InteractiveThrow` | Core + tracking. | Move a controller and release; judge the reported motion. Needs the reported velocity — **§10.8**. |
+| `SpaceOffsets` | Core + tracking. | **Auto-passes on velocity, not on looks** — drive all six axes per **§10.8**. Menu is FAIL. |
 | `local_floor-local` | `FeatureSet{XR_VERSION_1_1}` — satisfied because `run_cts.ps1` passes `--minApiVersion 1.1`. | Confirm the local-floor space behaves as described. |
 | `XR_EXT_local_floor-local` | `FeatureSet{XR_VERSION_1_0, XR_EXT_local_floor}` — `XRT_FEATURE_OPENXR_SPACE_LOCAL_FLOOR` is **ON**. | As above, through the extension rather than 1.1 core. |
 
@@ -1116,6 +1117,57 @@ The equirect1 table is the same six rows with `scale`/`bias` in place of the
 angles (`{1.0, 1.0}` / `{0, 0}` for 1–4, `{0.25, 0.5}` / `{0, 0}` for 5–6). You
 will not see them — the extension is off — but if `XRT_FEATURE_OPENXR_LAYER_
 EQUIRECT1` is ever turned on, the judgement rules above transfer unchanged.
+
+### 10.8 `SpaceOffsets` and `InteractiveThrow` — the six velocity criteria, driven from the keyboard
+
+**Rule: these two auto-pass on velocity, not on looks. Drive all six axes and
+let the test end itself; Menu is FAIL, never "done".**
+
+`SpaceOffsets` renders its gnomons and then waits for the *runtime-reported*
+`XrSpaceVelocity` of the controller's base space to have reached **0.5 m/s**
+along each of X, Y and Z and **6 rad/s** about each of X, Y and Z
+(`test_SpaceOffsets.cpp:105-112`). Until #1692 the qwerty controllers reported
+no velocity at all, so every criterion read zero, nothing could ever fail and
+nothing could ever pass, and the only exit was Menu = "user has failed the
+test". They now report both velocities analytically (`docs/reference/qwerty-device.md` §3.7),
+and the sprint-boosted look rate plus the new Z/X roll axis (§4) put all six
+criteria inside keyboard reach. `InteractiveThrow` reads the same linear
+velocity at the moment of release.
+
+The recipe. **Hold CTRL+ALT throughout** (both hands focused — `SpaceOffsets`
+locates both `/user/hand/left` and `/user/hand/right`, and driving both at once
+halves the work). Park the mouse cursor *before* taking the modifiers and do not
+move it while one is held (§10.6). Each row: press and hold for **~300 ms**,
+then release the key. The velocity is correct from the first poll after the
+press, so the hold only has to outlive a few frames; 300 ms is slack, and short
+holds keep the controller near its reset pose.
+
+| Criterion | Hold | Reported |
+|---|---|---|
+| X linear ≥ 0.5 m/s | `D` (or `A`) | ±0.60 m/s on base X |
+| Y linear ≥ 0.5 m/s | `E` (or `Q`) | ±0.60 m/s on base Y |
+| Z linear ≥ 0.5 m/s | `S` (or `W`) | ±0.60 m/s on base Z |
+| X angular ≥ 6 rad/s | **SHIFT** + `↑` (or `↓`) | ±9.16 rad/s about base X |
+| Y angular ≥ 6 rad/s | **SHIFT** + `←` (or `→`) | ±9.16 rad/s about base Y |
+| Z angular ≥ 6 rad/s | **SHIFT** + `Z` (or `X`) | ±9.16 rad/s about base Z |
+
+Two things make or break it:
+
+- **SHIFT is mandatory on the three angular rows.** Unboosted the controller
+  turns at `0.05 * 60 = 3 rad/s`, exactly half the criterion — it will look
+  like it is rotating perfectly well and still never satisfy anything.
+- **Tap `R` between the angular rows.** `R` resets both controllers to the
+  identity orientation, which is what makes "the device's own axis" and "the
+  base axis" the same axis. Pitch and roll are device-local: roll after a 60°
+  pitch is reported about a tilted axis, and its base-Z component drops below
+  6 rad/s while the controller is visibly spinning. The linear rows do not
+  need this (Q/E is base-space, and W/A/S/D is rotated by an orientation that
+  `R` has just made identity).
+
+Order does not matter — each criterion latches the first time it is met — but
+the CTS only *counts* a frame whose offset-space velocities agree with its own
+prediction from the base-space velocity, so drive one axis at a time rather
+than mashing several keys together.
 
 ---
 
