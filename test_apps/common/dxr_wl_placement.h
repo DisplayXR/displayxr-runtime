@@ -92,12 +92,26 @@ public:
 	bool
 	observed(int32_t *x, int32_t *y) const;
 
-	//! How many reports have arrived; a caller can tell "nothing yet" from
-	//! "reported the same position again".
+	//! How many APPLIED reports have arrived; a caller can tell "nothing yet"
+	//! from "reported the same position again".
 	uint64_t
 	observed_seq() const
 	{
 		return m_seq;
+	}
+
+	//! Every report, applied or not, and the refused subset. The pair
+	//! separates "the compositor refused the move" from "no report reached
+	//! us", which look identical from a stalled drag but are different bugs.
+	uint64_t
+	reports() const
+	{
+		return m_reports;
+	}
+	uint64_t
+	refusals() const
+	{
+		return m_refusals;
 	}
 
 	//! Human-readable state for the create log.
@@ -113,5 +127,5 @@ private:
 	const char *m_why = "not attempted";
 	int32_t m_obs_x = 0, m_obs_y = 0;
 	bool m_have_obs = false;
-	uint64_t m_seq = 0;
+	uint64_t m_seq = 0, m_reports = 0, m_refusals = 0;
 };

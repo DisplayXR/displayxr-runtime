@@ -145,11 +145,19 @@ DxrWlPlacement::poll()
 			if (dbus_message_get_args(msg, NULL, DBUS_TYPE_UINT32, &pid, DBUS_TYPE_INT32, &x,
 			                          DBUS_TYPE_INT32, &y, DBUS_TYPE_BOOLEAN, &applied,
 			                          DBUS_TYPE_INVALID) &&
-			    (int32_t)pid == (int32_t)getpid() && applied == TRUE) {
-				m_obs_x = (int32_t)x;
-				m_obs_y = (int32_t)y;
-				m_have_obs = true;
-				m_seq++;
+			    (int32_t)pid == (int32_t)getpid()) {
+				m_reports++;
+				if (applied == TRUE) {
+					m_obs_x = (int32_t)x;
+					m_obs_y = (int32_t)y;
+					m_have_obs = true;
+					m_seq++;
+				} else {
+					// The publisher declined this move. Counted separately so
+					// "the compositor refused" is never mistaken for "no report
+					// arrived" — they call for different answers.
+					m_refusals++;
+				}
 			}
 		}
 		dbus_message_unref(msg);

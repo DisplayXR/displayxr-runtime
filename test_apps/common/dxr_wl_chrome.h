@@ -147,6 +147,15 @@ public:
 		m_drag_end = std::move(end);
 	}
 
+	//! Maximised or tiled on any edge (from xdg_toplevel.configure states).
+	//! A compositor will not move such a window on request — mutter's
+	//! allows_move() is false for it — so an app-owned drag must not try.
+	bool
+	maximized() const
+	{
+		return m_maximized;
+	}
+
 	//! The window's fullscreen state changed (the window tracks it; F11).
 	void
 	set_fullscreen(bool fs)

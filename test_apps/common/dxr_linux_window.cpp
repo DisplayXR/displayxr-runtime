@@ -1291,6 +1291,18 @@ DxrLinuxWindow::wl_drag_begin()
 	if (!m_wl_placement.available() || m_snap_fn == nullptr) {
 		return false;
 	}
+	/*
+	 * A MAXIMISED or TILED window is not movable on request: mutter's
+	 * allows_move() is false for it, so every placement call would be refused
+	 * and the drag would go nowhere. The compositor's own drag handles this
+	 * case properly — it unmaximises the window under the pointer — so hand it
+	 * over rather than compete with it.
+	 */
+	if (m_wl_chrome.maximized()) {
+		DXRW_INFO("drag: the window is maximised or tiled, which a compositor will not move on request "
+		          "— using its own drag (which unmaximises as the user pulls)");
+		return false;
+	}
 	// Reachability: the compositor places windows at integer LOGICAL
 	// positions, so only every q-th device pixel exists for us. That is a
 	// lattice only when the output scale is an integer; on a fractional one
@@ -1427,10 +1439,18 @@ DxrLinuxWindow::wl_drag_move(double dx_logical, double dy_logical)
 	if (m_wl_placement.observed_seq() == m_wl_drag_seq_at_start && ++m_wl_drag_unmoved_requests >= 5) {
 		m_wl_client_drag = false;
 		m_wl_client_drag_broken = true;
-		DXRW_WARN("drag: the compositor reported no movement after %u requests — abandoning the app-owned "
-		          "drag for this session; press and drag again for the compositor's own (unsnapped) drag. "
-		          "Check the shell's journal for 'displayxr: MoveWindowBy' lines.",
-		          m_wl_drag_unmoved_requests);
+		// Name WHICH failure this is: the compositor answering "refused" and the
+		// compositor never answering are different bugs with different fixes.
+		DXRW_WARN("drag: the window did not move after %u requests — abandoning the app-owned drag for "
+		          "this session; press and drag again for the compositor's own (unsnapped) drag. The "
+		          "compositor sent %llu report(s), %llu of them REFUSALS. %s",
+		          m_wl_drag_unmoved_requests, (unsigned long long)m_wl_placement.reports(),
+		          (unsigned long long)m_wl_placement.refusals(),
+		          m_wl_placement.refusals() > 0
+		              ? "A refusal means the compositor declined to move the window — see the shell's "
+		                "journal for 'MoveWindowBy REFUSED' and the reason."
+		              : "No refusals, so the moves were accepted and did not stick (or the report never "
+		                "arrived) — see the shell's journal for 'MoveWindowBy' / 'REVERTED' lines.");
 		return;
 	}
 
