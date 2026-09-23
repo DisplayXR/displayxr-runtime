@@ -12,6 +12,7 @@
 #include "b_generated_bindings_helpers.h"
 #include "oxr_bindings/b_oxr_generated_bindings.h"
 #include "util/u_debug.h"
+#include "util/u_logging.h"
 #include "util/u_time.h"
 #include "util/u_misc.h"
 #include "math/m_vec2.h"
@@ -33,6 +34,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+
+// [QTRACE] boolean-action edge tracer, off unless DXR_QTRACE=1
+// (docs/reference/debug-logging.md). #1700: the CTS's interactive prompts pass
+// on `changedSinceLastSync && currentState` of `select/click`, so an edge here
+// is the exact event a self-advancing prompt has to be explained by.
+DEBUG_GET_ONCE_BOOL_OPTION(oxr_input_qtrace, "DXR_QTRACE", false)
 
 
 /*
@@ -1367,6 +1374,11 @@ oxr_action_attachment_update(struct oxr_logger *log,
 
 		act_attached->any_state.value.boolean = value;
 		changed = active && !oxr_state_equal_bool(&last, &act_attached->any_state);
+		// #1700: edge-only, so this is not a per-sync log.
+		if (changed && last.active && debug_get_bool_option_oxr_input_qtrace()) {
+			U_LOG_W("[QTRACE] ACTION BOOL EDGE '%s' -> %s (sess=%p)", act_attached->act_ref->name,
+			        value ? "TRUE" : "FALSE", (void *)sess);
+		}
 		break;
 	}
 	case XR_ACTION_TYPE_FLOAT_INPUT: {

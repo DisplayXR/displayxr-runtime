@@ -1072,6 +1072,11 @@ qwerty_release_all(struct qwerty_device *qd)
 void
 qwerty_press_trigger(struct qwerty_controller *qc)
 {
+	// #1700: trace every edge of the input the OpenXR `select/click` action is
+	// bound to, so "who pressed select?" is answerable from the log alone.
+	if (!qc->trigger_clicked && debug_get_bool_option_qwerty_qtrace()) {
+		U_LOG_W("[QTRACE] TRIGGER PRESS qc=%p", (void *)qc);
+	}
 	qc->trigger_clicked = true;
 	qc->trigger_timestamp = os_monotonic_get_ns();
 }
@@ -1079,6 +1084,9 @@ qwerty_press_trigger(struct qwerty_controller *qc)
 void
 qwerty_release_trigger(struct qwerty_controller *qc)
 {
+	if (qc->trigger_clicked && debug_get_bool_option_qwerty_qtrace()) {
+		U_LOG_W("[QTRACE] TRIGGER RELEASE qc=%p", (void *)qc);
+	}
 	qc->trigger_clicked = false;
 	qc->trigger_timestamp = os_monotonic_get_ns();
 }
