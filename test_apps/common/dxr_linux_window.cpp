@@ -1272,10 +1272,21 @@ DxrLinuxWindow::s_kb_repeat_info(void *data, struct wl_keyboard *kb, int32_t rat
 bool
 DxrLinuxWindow::wl_drag_begin()
 {
+	/*
+	 * OPT-IN, and it stays that way until it is proven on hardware.
+	 *
+	 * The first hardware run of this path could not drag the window at all —
+	 * a worse outcome for a user than the shimmer it removes — so the default
+	 * is the compositor's drag, which always works. DXR_WL_CLIENT_DRAG=1 asks
+	 * for the app-owned one.
+	 */
 	const char *env = getenv("DXR_WL_CLIENT_DRAG");
 	const bool forced = env != nullptr && env[0] == '1';
-	if (env != nullptr && env[0] == '0') {
-		return false; // A/B: let the compositor run the drag
+	if (!forced) {
+		return false;
+	}
+	if (m_wl_client_drag_broken) {
+		return false; // a previous drag in this session never moved the window
 	}
 	if (!m_wl_placement.available() || m_snap_fn == nullptr) {
 		return false;
@@ -1303,6 +1314,18 @@ DxrLinuxWindow::wl_drag_begin()
 	m_wl_client_drag = true;
 	m_wl_drag_applied_x = 0;
 	m_wl_drag_applied_y = 0;
+	// The loop closes on the OBSERVED position, so start from whatever the
+	// compositor last reported (nothing yet is fine — the first report
+	// establishes the base).
+	m_wl_placement.poll();
+	// Establish the base from the compositor, not from a guess: one bounded
+	// round trip at the press, never per motion.
+	m_wl_drag_have_base = m_wl_placement.fetch_origin(&m_wl_drag_base_x, &m_wl_drag_base_y) ||
+	                      m_wl_placement.observed(&m_wl_drag_base_x, &m_wl_drag_base_y);
+	m_wl_drag_obs_x = m_wl_drag_base_x;
+	m_wl_drag_obs_y = m_wl_drag_base_y;
+	m_wl_drag_seq_at_start = m_wl_placement.observed_seq();
+	m_wl_drag_unmoved_requests = 0;
 	m_wl_drag_moves = 0;
 	m_wl_drag_requests = 0;
 	m_wl_drag_snapped = 0;
@@ -1323,12 +1346,34 @@ DxrLinuxWindow::wl_drag_move(double dx_logical, double dy_logical)
 	m_wl_drag_moves++;
 
 	/*
-	 * Where the pointer is now, relative to the press, in the DESKTOP's frame.
-	 * The surface-local delta shrinks as the window follows, so what we have
-	 * already applied is added back — that sum is what the user has asked for.
+	 * CLOSE THE LOOP ON WHAT THE COMPOSITOR DID, NOT ON WHAT WE ASKED FOR.
+	 *
+	 * The pointer arrives in the SURFACE's frame, which moves with the window,
+	 * so the desktop-frame displacement is (surface delta + how far the window
+	 * has actually moved). The first version of this added how far we had
+	 * REQUESTED instead — an open integrator. On hardware the moves were not
+	 * applied, every event re-reported the same surface delta, and the request
+	 * ran away to +1278 logical px while the window sat still. Feeding back
+	 * the OBSERVED position cannot do that: if the window stops moving, the
+	 * target stops growing, and the watchdog below ends the gesture.
 	 */
-	const double want_logical_x = dx_logical + (double)m_wl_drag_applied_x;
-	const double want_logical_y = dy_logical + (double)m_wl_drag_applied_y;
+	m_wl_placement.poll();
+	int32_t obs_x = m_wl_drag_obs_x, obs_y = m_wl_drag_obs_y;
+	if (m_wl_placement.observed(&obs_x, &obs_y)) {
+		if (!m_wl_drag_have_base) {
+			// First report of the drag: it IS the base.
+			m_wl_drag_have_base = true;
+			m_wl_drag_base_x = obs_x;
+			m_wl_drag_base_y = obs_y;
+		}
+		m_wl_drag_obs_x = obs_x;
+		m_wl_drag_obs_y = obs_y;
+	}
+	const int32_t moved_x = m_wl_drag_have_base ? m_wl_drag_obs_x - m_wl_drag_base_x : 0;
+	const int32_t moved_y = m_wl_drag_have_base ? m_wl_drag_obs_y - m_wl_drag_base_y : 0;
+
+	const double want_logical_x = dx_logical + (double)moved_x;
+	const double want_logical_y = dy_logical + (double)moved_y;
 	const double scale = m_wl_drag_quantum > 0 ? (double)m_wl_drag_quantum : 1.0;
 	const int32_t want_dev_x = (int32_t)(want_logical_x * scale + (want_logical_x >= 0 ? 0.5 : -0.5));
 	const int32_t want_dev_y = (int32_t)(want_logical_y * scale + (want_logical_y >= 0 ? 0.5 : -0.5));
@@ -1356,19 +1401,38 @@ DxrLinuxWindow::wl_drag_move(double dx_logical, double dy_logical)
 		m_wl_drag_snapped++;
 	}
 
-	const int32_t req_x = reach_x / q;
-	const int32_t req_y = reach_y / q;
-	const int32_t step_x = req_x - m_wl_drag_applied_x;
-	const int32_t step_y = req_y - m_wl_drag_applied_y;
+	// The step is measured from where the window IS, so a request that was
+	// never applied is simply re-issued rather than compounded.
+	const int32_t step_x = reach_x / q - moved_x;
+	const int32_t step_y = reach_y / q - moved_y;
 	if (step_x == 0 && step_y == 0) {
-		return; // the window is already where this motion asks for
+		return;
 	}
 	if (!m_wl_placement.move_by(step_x, step_y)) {
 		return;
 	}
 	m_wl_drag_requests++;
-	m_wl_drag_applied_x = req_x;
-	m_wl_drag_applied_y = req_y;
+	m_wl_drag_applied_x = moved_x + step_x;
+	m_wl_drag_applied_y = moved_y + step_y;
+
+	/*
+	 * WATCHDOG. If the compositor is not moving the window, an app-owned drag
+	 * costs the user the ability to drag at all — strictly worse than the
+	 * shimmer it exists to remove. After a few requests with no movement
+	 * reported, give up: end this gesture, mark the path unusable for the
+	 * session, and let every later press go to the compositor's own drag
+	 * (which cannot be handed the current gesture — xdg_toplevel.move needs a
+	 * serial from a fresh button press).
+	 */
+	if (m_wl_placement.observed_seq() == m_wl_drag_seq_at_start && ++m_wl_drag_unmoved_requests >= 5) {
+		m_wl_client_drag = false;
+		m_wl_client_drag_broken = true;
+		DXRW_WARN("drag: the compositor reported no movement after %u requests — abandoning the app-owned "
+		          "drag for this session; press and drag again for the compositor's own (unsnapped) drag. "
+		          "Check the shell's journal for 'displayxr: MoveWindowBy' lines.",
+		          m_wl_drag_unmoved_requests);
+		return;
+	}
 
 	// DXR_WL_DRAG_TRACE=1: one line per request, with the time since the press.
 	// Paired with the runtime's own `present origin:` lines (same log, same
@@ -1382,11 +1446,65 @@ DxrLinuxWindow::wl_drag_move(double dx_logical, double dy_logical)
 		const int64_t t_ns = (int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
 		                         std::chrono::steady_clock::now().time_since_epoch())
 		                         .count();
-		DXRW_INFO("drag trace: request #%llu at t=%.1f ms — step (%+d, %+d) logical, cumulative (%+d, %+d), "
-		          "raw pointer (%+d, %+d) device, snapped to (%+d, %+d)",
+		DXRW_INFO("drag trace: request #%llu at t=%.1f ms — step (%+d, %+d) logical; the window has MOVED "
+		          "(%+d, %+d) logical so far, pointer asks for (%+d, %+d) device, snapped to (%+d, %+d)",
 		          (unsigned long long)m_wl_drag_requests, (double)(t_ns - m_wl_drag_start_ns) / 1000000.0,
-		          step_x, step_y, req_x, req_y, want_dev_x, want_dev_y, reach_x, reach_y);
+		          step_x, step_y, moved_x, moved_y, want_dev_x, want_dev_y, reach_x, reach_y);
 	}
+}
+
+void
+DxrLinuxWindow::wl_drive_test_drag()
+{
+	static const struct Cfg
+	{
+		int dx = 0, dy = 0, steps = 0;
+		bool armed = false;
+	} cfg = [] {
+		Cfg c;
+		const char *e = getenv("DXR_WL_TEST_DRAG");
+		if (e != nullptr && sscanf(e, "%d,%d,%d", &c.dx, &c.dy, &c.steps) == 3 && c.steps > 0) {
+			c.armed = true;
+		}
+		return c;
+	}();
+	if (!cfg.armed || m_wl_test_drag_done) {
+		return;
+	}
+	m_wl_test_drag_pumps++;
+	// Give the surface a moment to exist and the compositor to report a
+	// position before pretending a button went down.
+	if (m_wl_test_drag_pumps < 120) {
+		return;
+	}
+	if (!m_wl_client_drag) {
+		if (m_wl_test_drag_step > 0) {
+			// The drag ended (or the watchdog fired) — stop here.
+			m_wl_test_drag_done = true;
+			wl_drag_end();
+			return;
+		}
+		if (!wl_drag_begin()) {
+			DXRW_WARN("DXR_WL_TEST_DRAG: the app-owned drag declined to start — nothing to test "
+			          "(set DXR_WL_CLIENT_DRAG=1, and check the placement service line above)");
+			m_wl_test_drag_done = true;
+			return;
+		}
+		DXRW_INFO("DXR_WL_TEST_DRAG: walking %d,%d logical px over %d steps", cfg.dx, cfg.dy, cfg.steps);
+	}
+	m_wl_test_drag_step++;
+	if (m_wl_test_drag_step > cfg.steps) {
+		wl_drag_end();
+		m_wl_test_drag_done = true;
+		return;
+	}
+	// What a real pointer would report: the desired total, minus how far the
+	// window has already gone (the surface moves under the pointer).
+	const double want_x = (double)cfg.dx * (double)m_wl_test_drag_step / (double)cfg.steps;
+	const double want_y = (double)cfg.dy * (double)m_wl_test_drag_step / (double)cfg.steps;
+	const int32_t moved_x = m_wl_drag_have_base ? m_wl_drag_obs_x - m_wl_drag_base_x : 0;
+	const int32_t moved_y = m_wl_drag_have_base ? m_wl_drag_obs_y - m_wl_drag_base_y : 0;
+	wl_drag_move(want_x - (double)moved_x, want_y - (double)moved_y);
 }
 
 void
@@ -1396,14 +1514,21 @@ DxrLinuxWindow::wl_drag_end()
 		return;
 	}
 	m_wl_client_drag = false;
+	m_wl_placement.poll();
 	const int64_t now_ns = (int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
 	                           std::chrono::steady_clock::now().time_since_epoch())
 	                           .count();
 	const double ms = (double)(now_ns - m_wl_drag_start_ns) / 1000000.0;
+	int32_t end_x = m_wl_drag_obs_x, end_y = m_wl_drag_obs_y;
+	m_wl_placement.observed(&end_x, &end_y);
 	DXRW_INFO("drag: end — %llu motion event(s) in %.0f ms, %llu move request(s), %llu of them snapped away "
-	          "from the raw pointer position; total %d,%d logical px",
+	          "from the raw pointer position; the window actually moved %d,%d logical px (%llu position "
+	          "report(s) from the compositor)",
 	          (unsigned long long)m_wl_drag_moves, ms, (unsigned long long)m_wl_drag_requests,
-	          (unsigned long long)m_wl_drag_snapped, m_wl_drag_applied_x, m_wl_drag_applied_y);
+	          (unsigned long long)m_wl_drag_snapped,
+	          m_wl_drag_have_base ? end_x - m_wl_drag_base_x : 0,
+	          m_wl_drag_have_base ? end_y - m_wl_drag_base_y : 0,
+	          (unsigned long long)(m_wl_placement.observed_seq() - m_wl_drag_seq_at_start));
 }
 #endif // DXR_APP_HAVE_WL_CHROME
 
@@ -1830,6 +1955,18 @@ DxrLinuxWindow::create(DxrWindowBackend backend, const DxrLinuxWindowDesc &desc)
 void
 DxrLinuxWindow::pump(const std::function<void(DxrKey)> &on_key, bool *running)
 {
+#ifdef DXR_APP_HAVE_WL_CHROME
+	// DXR_WL_TEST_DRAG="dx,dy,steps" (test hook, off by default): walk the
+	// app-owned drag through the very same wl_drag_begin/move/end path a
+	// pointer drives, one step per pump, with nobody at the mouse. The
+	// simulated pointer delta is what a real one would report — the desired
+	// total MINUS how far the window has actually moved — so the closed loop,
+	// the snap and the compositor's placement are all exercised for real.
+	if (m_backend == DxrWindowBackend::Wayland) {
+		wl_drive_test_drag();
+	}
+#endif
+
 	// DXR_TEST_FULLSCREEN_TOGGLE=N (test hook, off by default): press F11 at
 	// pump N and again at 2N, so the toggle is verifiable with nobody at the
 	// keyboard — the same toggle_fullscreen() the key drives.
@@ -1989,6 +2126,11 @@ DxrLinuxWindow::pump(const std::function<void(DxrKey)> &on_key, bool *running)
 		// runtime has no other way to learn it — Wayland gives the WSI no
 		// currentExtent — so republish before the next frame is drawn.
 		publish_wayland_geometry_if_changed();
+#ifdef DXR_APP_HAVE_WL_CHROME
+		// Drain WindowMoved even between motion events, so a drag that ends
+		// with the window still catching up reports where it really landed.
+		m_wl_placement.poll();
+#endif
 
 		for (DxrKey k : m_wl_key_queue) {
 			if (k == DxrKey::F11) {

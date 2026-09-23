@@ -66,6 +66,40 @@ public:
 	bool
 	move_by(int32_t dx, int32_t dy);
 
+	/*!
+	 * Drain pending `WindowMoved` signals. Call once per frame (and after a
+	 * request) so @ref observed() is current.
+	 */
+	void
+	poll();
+
+	/*!
+	 * Ask for the window's frame position now (one bounded round trip). Used
+	 * once at the start of a drag to establish the base; the per-motion path
+	 * uses the pushed reports instead.
+	 */
+	bool
+	fetch_origin(int32_t *x, int32_t *y);
+
+	/*!
+	 * The window's ACHIEVED frame position, as the compositor last reported
+	 * it. This is what a drag must close its loop on: integrating one's own
+	 * requests runs away the moment a move is not applied — measured on
+	 * hardware, a cumulative of +1278 logical px while the window never moved.
+	 *
+	 * @return false until the first report arrives.
+	 */
+	bool
+	observed(int32_t *x, int32_t *y) const;
+
+	//! How many reports have arrived; a caller can tell "nothing yet" from
+	//! "reported the same position again".
+	uint64_t
+	observed_seq() const
+	{
+		return m_seq;
+	}
+
 	//! Human-readable state for the create log.
 	const char *
 	describe() const;
@@ -77,4 +111,7 @@ private:
 	void *m_conn = nullptr; //!< DBusConnection, opaque so the header stays clean
 	bool m_available = false;
 	const char *m_why = "not attempted";
+	int32_t m_obs_x = 0, m_obs_y = 0;
+	bool m_have_obs = false;
+	uint64_t m_seq = 0;
 };

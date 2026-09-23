@@ -574,6 +574,25 @@ get wrong.
    fact, and a frame woven for a position the window never reached has wrong
    views.
 
+### 8.2a Closing the loop — the failure this design invites
+
+The pointer arrives in the SURFACE's frame, which moves with the window. So the
+desktop-frame displacement is *surface delta + how far the window has actually
+moved*, and the second term is the trap: the obvious implementation adds how far
+the client has **requested** instead, which is an open integrator. Measured on a
+200 % panel, first attempt: every motion event re-reported the same surface
+delta, each request added the whole cumulative again, and the ask ran away to
+**+1278 logical px** while the window sat clamped against the compositor's
+keep-it-on-screen constraint. To the user the window "could not be dragged".
+
+So the publisher reports what it did — `WindowMoved(pid, x, y, applied)` after
+every move, and `GetWindowOrigin(pid)` for the base at the press — and the
+client measures from the ACHIEVED position. A request that was not applied is
+then simply re-issued, never compounded. That reporting channel is also the
+capability probe: a publisher without `GetWindowOrigin` cannot support an
+app-owned drag at all, and the client keeps the compositor's drag rather than
+run blind.
+
 ### 8.3 What it costs, and when it declines
 
 - **The compositor's drag affordances are not available while the button is
@@ -581,8 +600,16 @@ get wrong.
   not running this drag.
 - **The window follows the pointer with client latency** instead of being moved
   inside the compositor's input handling.
+- It is **opt-in** (`DXR_WL_CLIENT_DRAG=1`) until it is proven on hardware: a
+  drag that does not work costs a user more than the shimmer it removes.
 - It **declines** — and `xdg_toplevel.move` runs the drag unsnapped — when the
-  placement service is absent, when the app installed no snap provider, or when
-  the output's scale is not an integer (the reachable positions are then not a
-  lattice, §7.2). `DXR_WL_CLIENT_DRAG=0` forces the compositor drag for an A/B;
-  `=1` forces the app-owned one even where it would decline.
+  publisher is older than version 5, when the app installed no snap provider,
+  or when the output's scale is not an integer (the reachable positions are
+  then not a lattice, §7.2).
+- If the compositor stops reporting movement mid-drag, the client **abandons
+  the gesture and the path for the session** rather than keep asking. The
+  current gesture cannot be handed back — `xdg_toplevel.move` needs a serial
+  from a fresh button press — so the user releases and drags again, and that
+  press goes to the compositor.
+- `DXR_WL_TEST_DRAG="dx,dy,steps"` walks the whole path with no pointer, which
+  is how the loop is exercised without a human at the mouse.

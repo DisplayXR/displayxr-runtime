@@ -502,9 +502,29 @@ private:
 	//! Counters for the one line the drag logs when it ends.
 	uint64_t m_wl_drag_moves = 0, m_wl_drag_requests = 0, m_wl_drag_snapped = 0;
 	int64_t m_wl_drag_start_ns = 0;
+	/*!
+	 * The window's OBSERVED frame position (compositor-reported), and where it
+	 * was when the drag began. The loop closes on these, never on what was
+	 * requested: an open integrator ran away to +1278 logical px on hardware
+	 * while the window never moved (#1609).
+	 */
+	int32_t m_wl_drag_base_x = 0, m_wl_drag_base_y = 0;
+	int32_t m_wl_drag_obs_x = 0, m_wl_drag_obs_y = 0;
+	bool m_wl_drag_have_base = false;
+	uint64_t m_wl_drag_seq_at_start = 0;
+	uint32_t m_wl_drag_unmoved_requests = 0;
+	//! Set once the compositor has proved it will not move this window; every
+	//! later press then goes to the compositor's own drag.
+	bool m_wl_client_drag_broken = false;
 
 	bool
 	wl_drag_begin();
+	//! DXR_WL_TEST_DRAG="dx,dy,steps" — drive the drag with no pointer.
+	void
+	wl_drive_test_drag();
+	uint64_t m_wl_test_drag_pumps = 0;
+	int m_wl_test_drag_step = 0;
+	bool m_wl_test_drag_done = false;
 	void
 	wl_drag_move(double dx_logical, double dy_logical);
 	void

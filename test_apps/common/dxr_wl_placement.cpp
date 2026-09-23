@@ -8,6 +8,7 @@
 #include "dxr_wl_placement.h"
 
 #include <cstdio>
+#include <unistd.h> // getpid, to filter WindowMoved to our own window
 
 #ifdef DXR_APP_HAVE_DBUS
 #include <dbus/dbus.h>
@@ -22,6 +23,7 @@
 #define WLP_BUS "org.displayxr.WindowGeometry"
 #define WLP_PATH "/org/displayxr/WindowPlacement"
 #define WLP_IFACE "org.displayxr.WindowPlacement1"
+#define WLP_MOVED_MATCH "type='signal',interface='" WLP_IFACE "',member='WindowMoved'"
 
 DxrWlPlacement::~DxrWlPlacement()
 {
@@ -49,28 +51,119 @@ DxrWlPlacement::connect()
 	dbus_connection_set_exit_on_disconnect(conn, FALSE);
 	m_conn = conn;
 
-	// One bounded probe at start-up, so the drag path never has to discover
-	// mid-gesture that the service is missing. A relative move of (0,0) is a
-	// no-op the publisher answers exactly as it would answer a real one.
-	DBusMessage *call = dbus_message_new_method_call(WLP_BUS, WLP_PATH, WLP_IFACE, "MoveWindowBy");
+	// WindowMoved carries the ACHIEVED position after every move. Subscribed
+	// before the probe below, so no report can be missed.
+	dbus_bus_add_match(conn, WLP_MOVED_MATCH, &err);
+	if (dbus_error_is_set(&err)) {
+		dbus_error_free(&err);
+	}
+	dbus_connection_flush(conn);
+
+	/*
+	 * One bounded probe at start-up, so the drag path never has to discover
+	 * mid-gesture what the publisher can do. GetWindowOrigin is the probe on
+	 * purpose: it exists only alongside the WindowMoved signal, and WITHOUT
+	 * that signal a client cannot observe whether its moves are being applied
+	 * — which is the difference between a drag and a runaway. (Measured: an
+	 * open loop asked for +1278 logical px while the window sat clamped.)
+	 */
+	DBusMessage *call = dbus_message_new_method_call(WLP_BUS, WLP_PATH, WLP_IFACE, "GetWindowOrigin");
 	if (call == nullptr) {
 		m_why = "out of memory";
 		return false;
 	}
 	dbus_uint32_t pid = 0; // 0 = "me"; the publisher takes the PID from the bus
-	dbus_int32_t zero = 0;
-	dbus_message_append_args(call, DBUS_TYPE_UINT32, &pid, DBUS_TYPE_INT32, &zero, DBUS_TYPE_INT32, &zero,
-	                         DBUS_TYPE_INVALID);
+	dbus_message_append_args(call, DBUS_TYPE_UINT32, &pid, DBUS_TYPE_INVALID);
 	DBusMessage *reply = dbus_connection_send_with_reply_and_block(conn, call, 200, &err);
 	dbus_message_unref(call);
 	if (reply == nullptr) {
-		m_why = "the geometry extension has no WindowPlacement1.MoveWindowBy (version 4 or newer needed)";
+		m_why = "the geometry extension is older than version 5 (no WindowPlacement1.GetWindowOrigin / "
+		        "WindowMoved), so a client cannot see whether its moves land — the title bar keeps the "
+		        "compositor's own drag";
 		dbus_error_free(&err);
 		return false;
 	}
 	dbus_message_unref(reply);
 	m_available = true;
-	m_why = "ready";
+	m_why = "ready (version 5+: moves are reported back, so a drag can close its loop)";
+	return true;
+}
+
+bool
+DxrWlPlacement::fetch_origin(int32_t *x, int32_t *y)
+{
+	if (m_conn == nullptr || !m_available) {
+		return false;
+	}
+	DBusMessage *call = dbus_message_new_method_call(WLP_BUS, WLP_PATH, WLP_IFACE, "GetWindowOrigin");
+	if (call == nullptr) {
+		return false;
+	}
+	dbus_uint32_t pid = 0;
+	dbus_message_append_args(call, DBUS_TYPE_UINT32, &pid, DBUS_TYPE_INVALID);
+	DBusMessage *reply = dbus_connection_send_with_reply_and_block((DBusConnection *)m_conn, call, 100, nullptr);
+	dbus_message_unref(call);
+	if (reply == nullptr) {
+		return false;
+	}
+	dbus_int32_t rx = 0, ry = 0;
+	dbus_bool_t ok = FALSE;
+	const bool got = dbus_message_get_args(reply, nullptr, DBUS_TYPE_INT32, &rx, DBUS_TYPE_INT32, &ry,
+	                                       DBUS_TYPE_BOOLEAN, &ok, DBUS_TYPE_INVALID) == TRUE &&
+	                 ok == TRUE;
+	dbus_message_unref(reply);
+	if (!got) {
+		return false;
+	}
+	m_obs_x = (int32_t)rx;
+	m_obs_y = (int32_t)ry;
+	m_have_obs = true;
+	m_seq++;
+	if (x != nullptr) {
+		*x = m_obs_x;
+	}
+	if (y != nullptr) {
+		*y = m_obs_y;
+	}
+	return true;
+}
+
+void
+DxrWlPlacement::poll()
+{
+	if (m_conn == nullptr) {
+		return;
+	}
+	DBusConnection *conn = (DBusConnection *)m_conn;
+	dbus_connection_read_write(conn, 0);
+	DBusMessage *msg = NULL;
+	while ((msg = dbus_connection_pop_message(conn)) != NULL) {
+		if (dbus_message_is_signal(msg, WLP_IFACE, "WindowMoved")) {
+			dbus_uint32_t pid = 0;
+			dbus_int32_t x = 0, y = 0;
+			dbus_bool_t applied = FALSE;
+			if (dbus_message_get_args(msg, NULL, DBUS_TYPE_UINT32, &pid, DBUS_TYPE_INT32, &x,
+			                          DBUS_TYPE_INT32, &y, DBUS_TYPE_BOOLEAN, &applied,
+			                          DBUS_TYPE_INVALID) &&
+			    (int32_t)pid == (int32_t)getpid() && applied == TRUE) {
+				m_obs_x = (int32_t)x;
+				m_obs_y = (int32_t)y;
+				m_have_obs = true;
+				m_seq++;
+			}
+		}
+		dbus_message_unref(msg);
+	}
+}
+
+bool
+DxrWlPlacement::observed(int32_t *x, int32_t *y) const
+{
+	if (!m_have_obs || x == NULL || y == NULL) {
+		return false;
+	}
+	*x = m_obs_x;
+	*y = m_obs_y;
 	return true;
 }
 
@@ -125,6 +218,27 @@ DxrWlPlacement::move_by(int32_t dx, int32_t dy)
 {
 	(void)dx;
 	(void)dy;
+	return false;
+}
+
+void
+DxrWlPlacement::poll()
+{
+}
+
+bool
+DxrWlPlacement::fetch_origin(int32_t *x, int32_t *y)
+{
+	(void)x;
+	(void)y;
+	return false;
+}
+
+bool
+DxrWlPlacement::observed(int32_t *x, int32_t *y) const
+{
+	(void)x;
+	(void)y;
 	return false;
 }
 
