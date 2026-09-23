@@ -145,6 +145,33 @@ gdbus call --session --dest org.displayxr.WindowGeometry \
   --method org.displayxr.WindowGeometry1.GetWindows
 ```
 
+## Diagnostics (`DISPLAYXR_DEBUG=1`)
+
+With `DISPLAYXR_DEBUG=1` in **the shell's** environment, the extension logs a
+per-move placement line and, after each phase-snapped drag, one summary. The
+summary includes a per-frame paint check that confirms each corrected position
+was painted before the frame:
+
+```
+displayxr: drag lattice done — N compositor move(s), C corrected (largest P logical px), …; PAINTED on-lattice A frame(s), OFF-lattice B
+```
+
+The shell is started by the **systemd user manager**
+(`org.gnome.Shell@*.service`), and that manager usually outlives a logout.
+So `~/.config/environment.d/` is read only when the manager itself starts, and
+editing it followed by logging out has no effect. Set the variable in the
+running manager instead, then log out and back in:
+
+```bash
+systemctl --user set-environment DISPLAYXR_DEBUG=1
+# log out, log in, drag, then:
+journalctl --user -b -o cat /usr/bin/gnome-shell | grep displayxr
+# check it reached the shell:
+tr '\0' '\n' < /proc/$(pgrep -u "$USER" -xo gnome-shell)/environ | grep DISPLAYXR
+# afterwards:
+systemctl --user unset-environment DISPLAYXR_DEBUG   # then log out/in again
+```
+
 ## D-Bus surface
 
 - Service `org.displayxr.WindowGeometry`, object
