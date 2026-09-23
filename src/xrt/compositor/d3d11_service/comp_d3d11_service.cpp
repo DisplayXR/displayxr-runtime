@@ -1759,6 +1759,12 @@ struct d3d11_service_system
 	//! #1018: times a reader had to skip an atlas because the owning client
 	//! was mid-write. Non-zero proves the tear window is real AND closed.
 	std::atomic<uint32_t> render_diag_atlas_contention{0};
+	//! #1589/#1610: times the combine pass had to WAIT for
+	//! @ref immediate_ctx_mutex — i.e. a client's IPC-thread draw sequence was
+	//! mid-flight on the shared immediate context when the render thread wanted
+	//! it. This is the honest measure of that interleave; `atlas_contention`
+	//! only ever counted the ATLAS guard and says nothing about context state.
+	std::atomic<uint32_t> render_diag_ctx_waits{0};
 	std::atomic<int> render_diag_pipe_presenter{0};
 	/*! @} */
 
@@ -2485,6 +2491,46 @@ struct render_mutex_fair_lock
 	}
 	render_mutex_fair_lock(const render_mutex_fair_lock &) = delete;
 	render_mutex_fair_lock &operator=(const render_mutex_fair_lock &) = delete;
+};
+
+/*!
+ * #1589/#1610 — hold `immediate_ctx_mutex` for ONE draw sequence of the
+ * combine pass, counting the acquisitions that had to wait.
+ *
+ * The lock itself is the fix; the counter is the instrument. `#939` introduced
+ * `immediate_ctx_mutex` because D3D11's multithread protection serialises
+ * CALLS, not SEQUENCES — and every IPC-thread sequence took it while
+ * `multi_compositor_render`, the biggest state-setting sequence in the process,
+ * never did. That was survivable only while a plain projection client's commit
+ * was a raw `CopySubresourceRegion` (no bound state to leak). #1610's compose
+ * blit made it a DRAW, and the render thread's tiles started landing with the
+ * client's RTV / viewport / scissor / cbuffer — replicas of a window's content
+ * at another window's position.
+ *
+ * ORDER: this is the innermost lock (`render_mutex` → `c->mutex` →
+ * `atlas_submit_mutex` → this). The render thread already holds `render_mutex`
+ * throughout `multi_compositor_render`, and no IPC path takes `render_mutex`
+ * while holding this one, so the pairing is the documented one, not a new edge.
+ * Never held across a wait — every use below is Map/SetState/Draw only, with
+ * the keyed-mutex acquires deliberately left outside.
+ */
+struct combine_ctx_lock
+{
+	explicit combine_ctx_lock(struct d3d11_service_system *s) : sys(s)
+	{
+		if (!sys->immediate_ctx_mutex.try_lock()) {
+			sys->render_diag_ctx_waits.fetch_add(1, std::memory_order_relaxed);
+			sys->immediate_ctx_mutex.lock();
+		}
+	}
+	~combine_ctx_lock()
+	{
+		sys->immediate_ctx_mutex.unlock();
+	}
+	combine_ctx_lock(const combine_ctx_lock &) = delete;
+	combine_ctx_lock &operator=(const combine_ctx_lock &) = delete;
+
+	struct d3d11_service_system *sys;
 };
 
 
@@ -9448,6 +9494,7 @@ emit_render_diag_if_window_elapsed(struct d3d11_service_system *sys)
 		uint32_t rb = sys->render_diag_pipe_rebind.exchange(0, std::memory_order_relaxed);
 		uint32_t sr = sys->render_diag_dp_stale_recreate.exchange(0, std::memory_order_relaxed);
 		uint32_t ac = sys->render_diag_atlas_contention.exchange(0, std::memory_order_relaxed);
+		uint32_t cw = sys->render_diag_ctx_waits.exchange(0, std::memory_order_relaxed);
 		int pk = sys->render_diag_pipe_presenter.load(std::memory_order_relaxed);
 		uint32_t rh = sys->render_diag_recipe_hold.exchange(0, std::memory_order_relaxed);
 		uint32_t zk = sys->render_diag_zones_skip.exchange(0, std::memory_order_relaxed);
@@ -9455,9 +9502,9 @@ emit_render_diag_if_window_elapsed(struct d3d11_service_system *sys)
 		U_LOG_W(
 		    "[RENDER] pipe_active_present=%u pipe_active_skip=%u pipe_active_backoff=%u "
 		    "pipe_flat_present=%u pipe_flat_skip=%u pipe_rebind=%u dp_stale_recreate=%u "
-		    "atlas_contention=%u presenter=%d recipe_hold=%u zones_skip=%u ui_acq_skip=%u "
-		    "window_s=10",
-		    ap, as, ab, fp, fs, rb, sr, ac, pk, rh, zk, uk);
+		    "atlas_contention=%u ctx_waits=%u presenter=%d recipe_hold=%u zones_skip=%u "
+		    "ui_acq_skip=%u window_s=10",
+		    ap, as, ab, fp, fs, rb, sr, ac, cw, pk, rh, zk, uk);
 
 		/*
 		 * #918: the split's own window. `xb_kb` is atlas transport per window,
@@ -15103,6 +15150,10 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		}
 		const float gap = gh * 0.8f; // gap between logo and hint text
 
+		// #1589/#1610: one state-setting sequence on the shared immediate
+		// context — bound once here and relied on by every glyph draw below.
+		// See combine_ctx_lock.
+		combine_ctx_lock ctx_lock(sys);
 		sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
 		sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
 		sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
@@ -15677,6 +15728,41 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		if (slot_tc == 0) slot_tc = sys->tile_columns > 0 ? sys->tile_columns : 1;
 		if (slot_tr == 0) slot_tr = sys->tile_rows > 0 ? sys->tile_rows : 1;
 		for (uint32_t v = 0; v < num_views && v < XRT_MAX_VIEWS; v++) {
+			/*
+			 * The two locks this view's draw needs, taken here in the
+			 * documented order (`atlas_submit_mutex` → `immediate_ctx_mutex`)
+			 * and held across the WHOLE sequence below.
+			 *
+			 * #1018 `atlas_submit_mutex` (try, NEVER blocks): the client whose
+			 * atlas this view samples may be mid-write. On a miss we draw
+			 * anyway — see the GAUSS BLINK FIX note at the content bind below,
+			 * which is where this guard used to sit. It moved up only so its
+			 * order against the context lock stays the documented one; the
+			 * semantics are unchanged.
+			 *
+			 * #1589/#1610 `immediate_ctx_mutex`: the scissor, the constant
+			 * buffer, the render target, the viewport, the SRVs and the blend
+			 * state below are ONE sequence on a context shared with the
+			 * clients' IPC threads. Before #1610 a plain projection client's
+			 * commit was a raw `CopySubresourceRegion` — no bound state, so
+			 * this pass got away with never taking the #939 lock every
+			 * IPC-thread sequence already takes. The compose blit made that
+			 * commit a DRAW, and an interleave then re-pointed this tile at the
+			 * client's compose target / viewport / scissor: a replica of that
+			 * window's content, at another position on the panel.
+			 */
+			struct d3d11_service_compositor *slot_cc = mc->clients[s].compositor;
+			std::unique_lock<std::mutex> slot_atlas_lock;
+			if (slot_cc != nullptr) {
+				slot_atlas_lock =
+				    std::unique_lock<std::mutex>(slot_cc->atlas_submit_mutex, std::try_to_lock);
+				if (!slot_atlas_lock.owns_lock()) {
+					sys->render_diag_atlas_contention.fetch_add(1, std::memory_order_relaxed);
+					// fall through: draw unguarded (see above).
+				}
+			}
+			combine_ctx_lock ctx_lock(sys);
+
 			uint32_t src_col = v % sys->tile_columns;
 			uint32_t src_row = v / sys->tile_columns;
 
@@ -16064,17 +16150,11 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				// flash. Still counted (the counter now means "unguarded draws",
 				// not dropouts), never blocking, no lock-ordering change (the
 				// leaf is simply not held).
-				struct d3d11_service_compositor *slot_cc = mc->clients[s].compositor;
-				std::unique_lock<std::mutex> slot_atlas_lock;
-				if (slot_cc != nullptr) {
-					slot_atlas_lock =
-					    std::unique_lock<std::mutex>(slot_cc->atlas_submit_mutex, std::try_to_lock);
-					if (!slot_atlas_lock.owns_lock()) {
-						sys->render_diag_atlas_contention.fetch_add(1,
-						                                            std::memory_order_relaxed);
-						// fall through: draw unguarded (see above).
-					}
-				}
+				//
+				// #1589/#1610: the guard itself now lives at the top of this
+				// view loop, together with `immediate_ctx_mutex` — same
+				// try_lock, same fall-through, taken in the documented order.
+				// Nothing about the trade above changed.
 				ID3D11ShaderResourceView *content_srvs[2] = {slot_srv, hud_srv_to_bind};
 				sys->context->PSSetShaderResources(0, 2, content_srvs);
 				sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
@@ -16232,6 +16312,12 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				csc->images[0].texture->GetDesc(&chrome_desc);
 
 				for (uint32_t v3 = 0; v3 < num_views && v3 < XRT_MAX_VIEWS; v3++) {
+					// #1589/#1610: this iteration states its whole pipeline
+					// (scissor → shaders → RTV → blend → viewport → cbuffer
+					// → SRV → Draw), so the lock belongs here and the keyed
+					// acquire above stays outside it. See combine_ctx_lock.
+					combine_ctx_lock ctx_lock(sys);
+
 					uint32_t col3 = v3 % sys->tile_columns;
 					uint32_t row3 = v3 / sys->tile_columns;
 					int eye_idx3 = (col3 < 2) ? (int)col3 : 0;
@@ -16428,6 +16514,11 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			// The controller renders the overlay with Direct2D, which outputs
 			// PREMULTIPLIED alpha — so composite with the premultiplied blend
 			// (ONE, INV_SRC_ALPHA), not the straight-alpha state the cursor uses.
+			//
+			// #1589/#1610: bound ONCE here and relied on by every per-tile
+			// draw below, so the lock spans the whole block. The keyed-mutex
+			// acquire above is deliberately outside it. See combine_ctx_lock.
+			combine_ctx_lock ctx_lock(sys);
 			ID3D11RenderTargetView *ortvs[] = {mc->combined_atlas_rtv.get()};
 			sys->context->OMSetRenderTargets(1, ortvs, nullptr);
 			sys->context->OMSetBlendState(sys->blend_premul.get(), nullptr, 0xFFFFFFFF);
@@ -16638,7 +16729,12 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			// previous hardcoded 0.30 until the first controller push.
 			const float body_tint[4]  = {1.00f, 1.00f, 1.00f, mc->cursor_dim_factor};
 
-			// Common pipeline state
+			// Common pipeline state.
+			//
+			// #1589/#1610: bound ONCE here and relied on by every per-tile
+			// draw below, so the lock spans the whole block. The keyed-mutex
+			// acquire above is deliberately outside it. See combine_ctx_lock.
+			combine_ctx_lock ctx_lock(sys);
 			ID3D11RenderTargetView *crtvs[] = {mc->combined_atlas_rtv.get()};
 			sys->context->OMSetRenderTargets(1, crtvs, nullptr);
 			sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
