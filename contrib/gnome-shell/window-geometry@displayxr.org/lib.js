@@ -58,6 +58,16 @@
 // Object    : /org/displayxr/WindowPlacement
 // Interface : org.displayxr.WindowPlacement1         (extension version 3+)
 //   Method  MoveWindow(u pid, i x, i y) -> (b moved)
+//   Method  GetPlacementCapabilities() -> (u caps)            (version 4+)
+//             bit 0: drag lattice (needs Meta.ExternalConstraint)
+//   Method  SetDragLattice(u pid, b extend, i cell, i minDx, i minDy,
+//                          i maxDx, i maxDy, ai dx, ai dy)
+//             -> (b accepted, i startX, i startY)
+//   Method  ClearDragLattice(u pid)
+//   Signal  DragLatticeNeeded(u pid, i dx, i dy)
+//   A table of displacements from the drag start that the caller found
+//   phase-correct; while it is active, every compositor-proposed position of
+//   the caller's window is replaced by the nearest entry (see "Drag lattice").
 //   Moves the CALLING process's window frame to the given LOGICAL position.
 //   A Wayland client cannot position itself, but a weaving window must land on
 //   the display's interlace lattice or the 3D shimmers, and only the
@@ -459,17 +469,354 @@
       <arg type="i" direction="in" name="y"/>
       <arg type="b" direction="out" name="moved"/>
     </method>
+    <method name="GetPlacementCapabilities">
+      <arg type="u" direction="out" name="caps"/>
+    </method>
+    <method name="SetDragLattice">
+      <arg type="u" direction="in" name="pid"/>
+      <arg type="b" direction="in" name="extend"/>
+      <arg type="i" direction="in" name="cell"/>
+      <arg type="i" direction="in" name="minDx"/>
+      <arg type="i" direction="in" name="minDy"/>
+      <arg type="i" direction="in" name="maxDx"/>
+      <arg type="i" direction="in" name="maxDy"/>
+      <arg type="ai" direction="in" name="dx"/>
+      <arg type="ai" direction="in" name="dy"/>
+      <arg type="b" direction="out" name="accepted"/>
+      <arg type="i" direction="out" name="startX"/>
+      <arg type="i" direction="out" name="startY"/>
+    </method>
+    <method name="ClearDragLattice">
+      <arg type="u" direction="in" name="pid"/>
+    </method>
+    <signal name="DragLatticeNeeded">
+      <arg type="u" name="pid"/>
+      <arg type="i" name="dx"/>
+      <arg type="i" name="dy"/>
+    </signal>
   </interface>
 </node>`;
+
+        /*
+         * ── Drag lattice (extension version 4) ───────────────────────────
+         *
+         * Keeps the interlace phase still WHILE the compositor runs a drag,
+         * which is what the drop-time snap above cannot do: it only fixes where
+         * the window comes to rest.
+         *
+         * The rule every platform follows — whoever decides the next position
+         * snaps it before the window gets there — has exactly one hook in
+         * mutter: Meta.ExternalConstraint. Its constrain() runs LAST in the
+         * constraint pipeline (after the on-screen and titlebar-visible
+         * constraints), receives MOVE for move actions including a grab-driven
+         * drag, and edits the proposed rect in place; nothing later overrides
+         * it. Windows' equivalent is the display processor rewriting the
+         * proposal in WM_WINDOWPOSCHANGING.
+         *
+         * What it snaps to is a TABLE the app sends at the press: displacements
+         * from the drag start that the app found phase-correct by probing its
+         * own display processor's snap (the same oracle the X11 drag uses),
+         * restricted to positions the compositor can actually place. So:
+         *   - no IPC into the app during the grab — constrain() is an array
+         *     lookup, and mutter's move path can never stall on a busy app;
+         *   - the lens geometry never crosses a process boundary: the table is
+         *     the app's own transient answer set, derived per drag, and holds
+         *     no pitch, slant or distance (the vendor retired those getters
+         *     from its public API; do not reintroduce them here);
+         *   - mutter keeps the drag, so its feel, edge tiling and workspace
+         *     drag all survive, and the position it places is the position the
+         *     geometry payload reports.
+         *
+         * A drag that leaves the table's coverage moves unsnapped and asks for
+         * more (DragLatticeNeeded, async). A table no grab follows expires.
+         *
+         * Feature-detected: mutter only grew ExternalConstraint recently, so
+         * an older shell reports no capability and the app drags as before.
+         */
+        const HAVE_EXTERNAL_CONSTRAINT =
+            typeof Meta.ExternalConstraint !== 'undefined' &&
+            typeof Meta.Window.prototype.add_external_constraint === 'function';
+        const PLACEMENT_CAP_DRAG_LATTICE = 1;
+        //! A table no grab follows stops constraining after this long.
+        const LATTICE_PRE_GRAB_US = 2 * 1000 * 1000;
+
+        let DragLatticeConstraint = null;
+        if (HAVE_EXTERNAL_CONSTRAINT) {
+            DragLatticeConstraint = GObject.registerClass({
+                Implements: [Meta.ExternalConstraint],
+            }, class DisplayXRDragLatticeConstraint extends GObject.Object {
+                vfunc_constrain(window, info) {
+                    return this._lattice ? this._lattice.constrain(window, info) : true;
+                }
+            });
+        }
+
+        class DragLattice {
+            constructor(emitNeeded, debug) {
+                this._emitNeeded = emitNeeded;
+                this._debug = debug;
+                this._tables = new Map();      // Meta.Window -> table
+                this._constraints = new Map(); // Meta.Window -> constraint object
+                this._stats = {constrained: 0, snapped: 0, misses: 0, propagate: 'untested'};
+            }
+
+            supported() {
+                return HAVE_EXTERNAL_CONSTRAINT;
+            }
+
+            set(win, pid, extend, cell, bounds, dxs, dys) {
+                if (!HAVE_EXTERNAL_CONSTRAINT || !win || dxs.length !== dys.length || cell < 1)
+                    return false;
+                const prev = this._tables.get(win);
+                // A replacement (extend) keeps the drag's origin — the
+                // displacements in every table of one drag are relative to the
+                // same start. A fresh table takes the window's position NOW,
+                // before the grab moves it.
+                let startX, startY;
+                if (extend && prev) {
+                    startX = prev.startX;
+                    startY = prev.startY;
+                } else {
+                    const r = win.get_frame_rect();
+                    startX = r.x;
+                    startY = r.y;
+                }
+                const buckets = new Map();
+                for (let i = 0; i < dxs.length; i++) {
+                    const key = `${Math.floor(dxs[i] / cell)},${Math.floor(dys[i] / cell)}`;
+                    let b = buckets.get(key);
+                    if (!b)
+                        buckets.set(key, b = []);
+                    b.push(dxs[i], dys[i]);
+                }
+                this._tables.set(win, {
+                    pid, startX, startY, cell, buckets,
+                    minDx: bounds[0], minDy: bounds[1], maxDx: bounds[2], maxDy: bounds[3],
+                    asked: false,
+                    grabbing: prev?.grabbing ?? false,
+                    expiresUs: GLib.get_monotonic_time() + LATTICE_PRE_GRAB_US,
+                    entries: dxs.length,
+                });
+                if (!this._constraints.has(win)) {
+                    const c = new DragLatticeConstraint();
+                    c._lattice = this;
+                    win.add_external_constraint(c);
+                    this._constraints.set(win, c);
+                }
+                if (this._debug) {
+                    log(`displayxr: SetDragLattice pid=${pid} extend=${extend} entries=${dxs.length} ` +
+                        `cell=${cell} bounds=[${bounds}] start=(${startX},${startY})`);
+                }
+                return true;
+            }
+
+            clear(win) {
+                this._tables.delete(win);
+            }
+
+            startOf(win) {
+                const t = this._tables.get(win);
+                return t ? [t.startX, t.startY] : null;
+            }
+
+            onGrabBegin(win) {
+                const t = win && this._tables.get(win);
+                if (t)
+                    t.grabbing = true; // no expiry while the user holds it
+            }
+
+            onGrabEnd(win) {
+                if (win && this._tables.has(win)) {
+                    if (this._debug) {
+                        const s = this._stats;
+                        log(`displayxr: drag lattice done — ${s.constrained} proposal(s), ${s.snapped} ` +
+                            `snapped, ${s.misses} outside coverage; new_rect edits ${s.propagate}`);
+                    }
+                    this._tables.delete(win);
+                }
+            }
+
+            forget(win) {
+                this._tables.delete(win);
+                const c = this._constraints.get(win);
+                if (c) {
+                    c._lattice = null;
+                    try {
+                        win.remove_external_constraint(c);
+                    } catch (e) {
+                        // the window is already gone
+                    }
+                    this._constraints.delete(win);
+                }
+            }
+
+            destroy() {
+                for (const win of [...this._constraints.keys()])
+                    this.forget(win);
+            }
+
+            _nearest(t, dx, dy) {
+                const bx = Math.floor(dx / t.cell), by = Math.floor(dy / t.cell);
+                let best = null, bestD = Infinity;
+                for (let j = -2; j <= 2; j++) {
+                    for (let i = -2; i <= 2; i++) {
+                        const b = t.buckets.get(`${bx + i},${by + j}`);
+                        if (!b)
+                            continue;
+                        for (let k = 0; k < b.length; k += 2) {
+                            const ex = b[k] - dx, ey = b[k + 1] - dy;
+                            const d = ex * ex + ey * ey;
+                            if (d < bestD) {
+                                bestD = d;
+                                best = [b[k], b[k + 1]];
+                            }
+                        }
+                    }
+                }
+                return best;
+            }
+
+            constrain(window, info) {
+                // Diagnostics: DISPLAYXR_LATTICE_NOOP=1 registers the constraint
+                // but never touches the rect, to separate what mutter does on its
+                // own from what this constraint does.
+                if (this._noop === undefined)
+                    this._noop = GLib.getenv('DISPLAYXR_LATTICE_NOOP') === '1';
+                if (this._noop)
+                    return true;
+                const t = this._tables.get(window);
+                if (!t || !(info.flags & Meta.ExternalConstraintFlags.MOVE))
+                    return true;
+                if (!t.grabbing && GLib.get_monotonic_time() > t.expiresUs) {
+                    this._tables.delete(window); // nobody dragged: stop constraining
+                    return true;
+                }
+                this._stats.constrained++;
+                const r = info.new_rect;
+                const dx = r.x - t.startX, dy = r.y - t.startY;
+                const inside = dx >= t.minDx && dx <= t.maxDx && dy >= t.minDy && dy <= t.maxDy;
+                const best = inside ? this._nearest(t, dx, dy) : null;
+                if (!best) {
+                    // Outside what we were told: move unsnapped rather than
+                    // clamp the user's drag, and ask for more — once, async, and
+                    // never from inside mutter's constraint pass.
+                    this._stats.misses++;
+                    if (!t.asked) {
+                        t.asked = true;
+                        const pid = t.pid;
+                        GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+                            this._emitNeeded(pid, dx, dy);
+                            return GLib.SOURCE_REMOVE;
+                        });
+                    }
+                    return true;
+                }
+                const nx = t.startX + best[0], ny = t.startY + best[1];
+                if (this._debug && this._stats.constrained <= 5) {
+                    log(`displayxr: constrain proposed=(${r.x},${r.y}) d=(${dx},${dy}) ` +
+                        `nearest=(${best[0]},${best[1]}) -> (${nx},${ny})`);
+                }
+                if (nx !== r.x || ny !== r.y) {
+                    this._stats.snapped++;
+                    // GJS may hand us the rect by value; write through the
+                    // pointer if it did not alias, and record which it was so a
+                    // failure to take effect is diagnosable rather than silent.
+                    r.x = nx;
+                    r.y = ny;
+                    if (this._debug && this._stats.constrained <= 5) {
+                        log(`displayxr: constrain wrote (${r.x},${r.y}); info.new_rect now ` +
+                            `(${info.new_rect.x},${info.new_rect.y})`);
+                    }
+                    if (info.new_rect.x !== nx || info.new_rect.y !== ny) {
+                        try {
+                            info.new_rect = r;
+                            this._stats.propagate = 'needed assignment';
+                            if (this._debug && this._stats.constrained <= 5) {
+                                log(`displayxr: constrain assigned; info.new_rect now ` +
+                                    `(${info.new_rect.x},${info.new_rect.y}) flags=${info.flags} ` +
+                                    `gravity=${info.resize_gravity}`);
+                            }
+                        } catch (e) {
+                            this._stats.propagate = `DID NOT PROPAGATE (${e})`;
+                            if (this._debug)
+                                log(`displayxr: constrain assignment THREW: ${e}`);
+                        }
+                    } else if (this._stats.propagate === 'untested') {
+                        this._stats.propagate = 'propagate in place';
+                    }
+                }
+                return true;
+            }
+        }
 
         class WindowPlacement {
             constructor(getGrabbedWindow) {
                 this._getGrabbedWindow = getGrabbedWindow;
+                // DISPLAYXR_DEBUG=1 in the shell's environment: per-drag lattice
+                // lines in the journal.
+                this._debug = GLib.getenv('DISPLAYXR_DEBUG') === '1';
+                this._lattice = new DragLattice((pid, dx, dy) => this._emitNeeded(pid, dx, dy), this._debug);
                 this._dbus = Gio.DBusExportedObject.wrapJSObject(PLACEMENT_IFACE_XML, this);
                 this._dbus.export(Gio.DBus.session, '/org/displayxr/WindowPlacement');
             }
 
+            //! Grab lifecycle, forwarded by the service (it owns the display
+            //! signals).
+            onGrabBegin(win) {
+                this._lattice.onGrabBegin(win);
+            }
+
+            onGrabEnd(win) {
+                this._lattice.onGrabEnd(win);
+            }
+
+            onWindowUnmanaged(win) {
+                this._lattice.forget(win);
+            }
+
+            _emitNeeded(pid, dx, dy) {
+                if (this._dbus) {
+                    this._dbus.emit_signal('DragLatticeNeeded',
+                        new GLib.Variant('(uii)', [pid >>> 0, Math.round(dx), Math.round(dy)]));
+                }
+            }
+
+            GetPlacementCapabilities() {
+                return this._lattice.supported() ? PLACEMENT_CAP_DRAG_LATTICE : 0;
+            }
+
+            SetDragLatticeAsync([pid, extend, cell, minDx, minDy, maxDx, maxDy, dxs, dys], invocation) {
+                this._senderPid(invocation.get_sender(), senderPid => {
+                    let ok = false, sx = 0, sy = 0;
+                    if (senderPid > 0 && (pid === 0 || pid === senderPid)) {
+                        const win = this._windowOfPid(senderPid);
+                        ok = this._lattice.set(win, senderPid, extend, cell,
+                            [minDx, minDy, maxDx, maxDy], dxs, dys);
+                        const start = ok ? this._lattice.startOf(win) : null;
+                        if (start)
+                            [sx, sy] = start;
+                    }
+                    // The drag's origin as recorded, so the caller can log and
+                    // test against it without ever learning its position any
+                    // other way.
+                    invocation.return_value(new GLib.Variant('(bii)', [ok, sx, sy]));
+                });
+            }
+
+            ClearDragLatticeAsync([pid], invocation) {
+                this._senderPid(invocation.get_sender(), senderPid => {
+                    if (senderPid > 0 && (pid === 0 || pid === senderPid)) {
+                        const win = this._windowOfPid(senderPid);
+                        if (win)
+                            this._lattice.clear(win);
+                    }
+                    invocation.return_value(null);
+                });
+            }
+
             destroy() {
+                this._lattice?.destroy();
+                this._lattice = null;
                 if (this._dbus) {
                     this._dbus.unexport();
                     this._dbus = null;
@@ -578,10 +925,12 @@
                 this._displaySignals.push(
                     display.connect('grab-op-begin', (..._args) => {
                         this._grabbedWindow = grabWindow(_args);
+                        this._placement?.onGrabBegin(this._grabbedWindow);
                         this._queueEmit();
                     }));
                 this._displaySignals.push(
                     display.connect('grab-op-end', (..._args) => {
+                        this._placement?.onGrabEnd(grabWindow(_args) ?? this._grabbedWindow);
                         this._grabbedWindow = null;
                         this._queueEmit();
                     }));
@@ -626,6 +975,7 @@
                     win.connect('position-changed', () => this._queueEmit()),
                     win.connect('size-changed', () => this._queueEmit()),
                     win.connect('unmanaged', () => {
+                        this._placement?.onWindowUnmanaged(win);
                         const old = this._windowSignals.get(win);
                         if (old) {
                             for (const id of old)

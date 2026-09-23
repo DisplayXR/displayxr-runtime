@@ -643,6 +643,11 @@ DxrWlChrome::on_pointer_button(uint32_t serial, uint32_t time, uint32_t button, 
 			}
 			// The compositor's own move — the same one Super+drag runs, so
 			// the runtime's geometry-service phase tracking is unchanged.
+			// Phase-snapped drag (#1609): the compositor runs the drag, and the
+			// window hands it the lattice to constrain it to first.
+			if (m_drag_prepare) {
+				m_drag_prepare();
+			}
 			xdg_toplevel_move(m_toplevel, m_seat, serial);
 			return;
 		}

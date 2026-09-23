@@ -63,6 +63,7 @@
 #include "csd_titlebar.h"
 
 #include <cstdint>
+#include <functional>
 #include <string>
 
 struct xdg_surface;
@@ -126,6 +127,26 @@ public:
 	on_toplevel_states(struct wl_array *states, bool sized);
 
 	//! The window's fullscreen state changed (the window tracks it; F11).
+	/*!
+	 * Called on a title-bar press, immediately BEFORE xdg_toplevel.move hands
+	 * the drag to the compositor. The window uses it to send the compositor
+	 * the drag lattice (#1609) — the table must be in place before the grab
+	 * begins, because nothing can be sent into the compositor's move path once
+	 * it has.
+	 */
+	void
+	set_drag_prepare(std::function<void()> fn)
+	{
+		m_drag_prepare = std::move(fn);
+	}
+
+	//! Maximised or tiled on any edge (from xdg_toplevel.configure states).
+	bool
+	maximized() const
+	{
+		return m_maximized;
+	}
+
 	void
 	set_fullscreen(bool fs)
 	{
@@ -279,4 +300,7 @@ private:
 	uint32_t m_cursor_shape = 0;
 
 	bool m_close_requested = false;
+
+	//! Runs before each compositor drag starts (#1609). Empty = none.
+	std::function<void()> m_drag_prepare;
 };
