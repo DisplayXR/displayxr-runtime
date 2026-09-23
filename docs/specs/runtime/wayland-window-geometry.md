@@ -523,3 +523,70 @@ older than version 3 omits it, and the runtime then settles on stillness alone
 
 Every failure ends where the session was before: the window keeps the phase it
 was dropped on, which is the pre-#1609 behaviour.
+
+## 8. Phase-snapped drag — the drag lattice (extension version 6)
+
+### 8.1 Why
+
+§7 snaps a window once, after the drop, so the 3D is correct only when the
+window is parked. While it moves, the compositor runs the drag and places the
+window at positions the lens does not accept, and the interlace visibly
+shimmers. On Windows and X11 the app owns the drag and snaps every step before
+the window moves. A Wayland client cannot: it has no positioning protocol, and
+it learns where its window is only after the compositor has put it there.
+The display vendor's own SDK example refuses windowed mode on native Wayland
+entirely, so a compositor extension is the only known route to a phase-clean
+Wayland drag.
+
+### 8.2 Mechanism: correct after apply
+
+1. **At the title-bar press, in the app.** Before `xdg_toplevel.move`, the app
+   probes the display processor's own snap (`xrWeaveSnapWindowRectDXR`) over a
+   grid of displacements from the drag start (±192 logical px, every 3 px:
+   16,641 probes, 1.6–6 ms). It keeps the phase-correct entries that the
+   compositor can actually reach (whole logical px, so an integer output scale
+   q), and sends them with `SetDragLattice`. The table holds displacements
+   only. It carries no lens pitch, slant or viewing distance, and nothing is
+   published: it is the app's own answer set, for this drag only.
+2. **During the compositor's drag, in the extension.** Mutter emits
+   `position-changed` synchronously inside `move_resize`. The handler moves the
+   window on to the nearest table entry with `move_frame` before the stage
+   paints again, and a re-entry guard ignores its own move. The grab places the
+   window from the pointer's displacement against the grab anchor, not from the
+   window's current position, so the correction never fights the grab. The next
+   event proposes the raw position again, and it is corrected again.
+3. **Coverage.** A drag that leaves the table moves unsnapped and signals
+   `DragLatticeNeeded`. The app answers with the next piece (`extend = true`).
+   The table is dropped at grab end.
+
+The drag keeps everything the compositor's own drag has: feel, latency, edge
+tiling and drag-to-workspace. No call goes into the app during the grab, so a
+busy app cannot stall the desktop's move path.
+
+The app enables this whenever `GetPlacementCapabilities` reports bit 0.
+`DXR_WL_DRAG_LATTICE=0` turns it off. An older extension, or a maximised or
+fullscreen window, gets the plain compositor drag, which is the pre-#1609
+behaviour.
+
+### 8.3 Why not `Meta.ExternalConstraint`
+
+It is the proper hook: external constraints run last, receive `MOVE` for
+grab-driven moves, and their rect is final. But from GJS on mutter 50 it
+cannot change anything. The constraint receives `info.new_rect` as a copy,
+and writing the field throws
+`Writing field Meta.ExternalConstraintInfo.new_rect is not supported`.
+The code stays behind `DISPLAYXR_LATTICE_CONSTRAINT=1` for when mutter makes the
+rect writable (an upstream request is drafted). Correcting in `position-changed`
+relies on that signal staying synchronous inside `move_resize`.
+
+### 8.4 Verified
+
+- **Headless mutter 50, programmatic move:** a raw (697,355) was corrected to
+  (696,356), the nearest entry in both axes. The paint audit counted 13 frames:
+  13 on the lattice, 0 off.
+- **Hardware, 3840x2160 lenticular panel at scale 2:** native drag feel,
+  stable 3D while moving, and no stutter.
+- The per-frame audit under a real grab is available with `DISPLAYXR_DEBUG=1`
+  in the shell's environment. The extension README explains how to get it
+  there: environment.d is not re-read at logout.
+
