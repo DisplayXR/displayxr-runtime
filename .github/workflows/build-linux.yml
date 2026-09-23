@@ -4,7 +4,8 @@ name: Build Linux
 # PR-triggered required check (#660 CI-promotion task): runs on every PR like
 # build-windows.yml / build-macos.yml, with the same DetectChanges docs_only
 # short-circuit so doc-only PRs report success in seconds without building.
-# Required contexts (main-protection ruleset): Selftest, Service, Package.
+# Required contexts (main-protection ruleset): Selftest, Service, Package,
+# Linux Packaging.
 #
 # Selftest job (Phase 0/1): configure + build the runtime + displayxr-cli +
 # the sim_display plug-in, run `displayxr-cli selftest` (the hardware-free gate
@@ -30,8 +31,10 @@ name: Build Linux
 # DebInstall then installs it into pristine 22.04 / 24.04 / 26.04 containers and
 # runs it there; DebRelease attaches displayxr-runtime_<ver>_amd64.deb to a v*
 # GitHub Release — the asset the Linux meta-bundle (displayxr-installer)
-# fetches — only after that passes. Not required contexts (release-asset +
-# extra build validation, not a gate).
+# fetches — only after that passes. Deb / DebInstall are not required contexts
+# themselves (DebInstall is a matrix, so its context names move when the
+# supported-release list changes); the LinuxPackaging aggregator below carries
+# the stable required context "Linux Packaging" on their behalf.
 
 on:
   workflow_dispatch: {}
@@ -404,6 +407,71 @@ jobs:
           docker run --rm -v "$PWD:/w" -w /w "ubuntu:${{ matrix.release }}" \
             ./scripts/verify_deb_install_linux.sh \
               dist/displayxr-runtime_*_amd64.deb dist/displayxr-runtime-linux-*.tar.gz
+
+  # Single stable required context for the whole Linux packaging lane.
+  #
+  # Why an aggregator rather than requiring the legs directly: DebInstall is a
+  # matrix, so its contexts are "DebInstall (Ubuntu 22.04)", "… 24.04",
+  # "… 26.04" — names that change the moment a release is added or dropped, and
+  # a ruleset still demanding a context no job produces blocks every PR forever.
+  # This job's name is fixed, so the matrix can grow or shrink freely.
+  #
+  # The gap it closes: DebInstall installs the built .deb into pristine
+  # containers of every supported release and runs it there, and DebRelease
+  # depends on it — so it already gates the release asset. But nothing gated
+  # MERGING with it red, which is how #1656 (a .deb built on a newer host,
+  # declaring an unversioned libc6, that apt happily installed on 22.04 and that
+  # then failed at every dlopen) reached a release.
+  #
+  # Doc-only PRs: Deb / Package / DebInstall all RUN and report success on the
+  # docs_only path (they short-circuit per-step, the same pattern as Runtime in
+  # build-windows.yml), so this job's needs are satisfied and it reports success
+  # in seconds without asserting anything. It must never be the thing that
+  # leaves a doc PR permanently unmergeable.
+  #
+  # `if: always()` is load-bearing: without it a failed leg would SKIP this job,
+  # and a skipped check counts as neutral/green for a required context — the
+  # aggregator would silently stop gating exactly when it matters. Running
+  # unconditionally and asserting on needs.*.result is what makes it a gate.
+  LinuxPackaging:
+    name: Linux Packaging
+    needs: [DetectChanges, Deb, Package, DebInstall]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Docs-only short-circuit
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "Doc-only change — packaging legs short-circuited; reporting success without asserting."
+
+      - name: Assert every packaging leg succeeded
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        env:
+          # DetectChanges is included on purpose: if it failed, docs_only is ''
+          # (!= 'true'), so we land here — and must fail rather than green-light
+          # a run whose change classification never happened.
+          RESULT_DETECTCHANGES: ${{ needs.DetectChanges.result }}
+          RESULT_DEB: ${{ needs.Deb.result }}
+          RESULT_PACKAGE: ${{ needs.Package.result }}
+          # Matrix job: 'success' only when every leg succeeded (fail-fast is
+          # off, so one red release still surfaces here).
+          RESULT_DEBINSTALL: ${{ needs.DebInstall.result }}
+        run: |
+          set -u
+          rc=0
+          for leg in DETECTCHANGES DEB PACKAGE DEBINSTALL; do
+            var="RESULT_${leg}"
+            result="${!var}"
+            printf '%-14s %s\n' "$leg" "${result:-<missing>}"
+            # Anything that is not an outright success fails the gate —
+            # including 'skipped', which on the non-docs_only path can only
+            # mean a leg was bypassed by a condition it should not have been.
+            [ "$result" = "success" ] || rc=1
+          done
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::Linux packaging lane is not green — see the leg results above."
+            exit 1
+          fi
+          echo "All Linux packaging legs succeeded."
 
   # Attach the .deb to the GitHub Release on a v* tag — only once DebInstall
   # has proved it on every supported release.

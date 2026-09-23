@@ -96,14 +96,32 @@ demos". Half of that was an overclaim, so here is the real shape:
 
 | | Tri-LTS matrix | Required status check? | What it proves |
 |---|---|---|---|
-| Runtime (`build-linux.yml`) | `DebInstall (Ubuntu 22.04 \| 24.04 \| 26.04)` | **No** | Installs the `.deb` + tarball in pristine containers of all three and runs `ldd -r` + env-free `displayxr-cli selftest`. Not in the ruleset, but `DebRelease` `needs:` it, so a red leg blocks the release asset. |
-| Runtime, required Linux checks | — | **Yes**: `Selftest`, `Service`, `Package` | `Package` builds in the `ubuntu:22.04` container and installs from the tarball; `Newest` (26.04) covers the new toolchain and is *not* required. |
+| Runtime (`build-linux.yml`) | `DebInstall (Ubuntu 22.04 \| 24.04 \| 26.04)` | **Yes, via `Linux Packaging`** | Installs the `.deb` + tarball in pristine containers of all three and runs `ldd -r` + env-free `displayxr-cli selftest`. The matrix legs are not in the ruleset by name — the `LinuxPackaging` aggregator `needs:` them (plus `Deb` and `Package`) and carries the required context on their behalf. `DebRelease` still `needs:` `DebInstall`, so a red leg blocks the release asset too. |
+| Runtime, required Linux checks | — | **Yes**: `Selftest`, `Service`, `Package`, `Linux Packaging` | `Package` builds in the `ubuntu:22.04` container and installs from the tarball; `Newest` (26.04) covers the new toolchain and is *not* required. |
 | Demos (all 5) | `Build (Ubuntu 22.04 / 24.04 / 26.04)` | **Yes** | Build-green only — the demos are not run on CI (no display). Four expose the three legs directly; one aggregates them into a single required `Build Linux` check. |
 
-So on the runtime the tri-LTS coverage gates the *release artifact*, not the
-merge; on the demos it gates the merge but proves compilation, not execution.
-Every claim in the table above is CI evidence: build, package, install, and a
-headless self-test. Nothing in it puts pixels on a panel.
+So the runtime's tri-LTS install coverage now gates the *merge* as well as the
+release artifact; on the demos it gates the merge but proves compilation, not
+execution. Every claim in the table above is CI evidence: build, package,
+install, and a headless self-test. Nothing in it puts pixels on a panel.
+
+**Why an aggregator and not three required matrix contexts.** A matrix leg's
+check context embeds its matrix value (`DebInstall (Ubuntu 24.04)`), so adding
+or retiring a supported release renames it — and a ruleset that still demands a
+context no job emits blocks every PR, permanently. The aggregator's name is
+fixed, so the release list stays a workflow-level decision. Two properties make
+it a real gate rather than decoration: it runs `if: always()` (a *skipped* job
+counts as green for a required context, so an aggregator that skipped when a leg
+failed would stop gating exactly when it mattered), and it fails on any
+`needs.*.result` that is not `success` — including `skipped`. Doc-only PRs stay
+mergeable because `Deb`/`Package`/`DebInstall` all still *run* on the
+`docs_only` path and short-circuit per-step, so the aggregator's `needs:` are
+satisfied and it reports success in seconds. That short-circuit is the
+precondition for promoting **any** job here to required.
+
+This closes the #1656 shape directly: `DebRelease` already depended on
+`DebInstall`, so a `.deb` that could not `dlopen` on 22.04 was caught — but only
+at release time, after the change had merged.
 
 ## TL;DR
 
