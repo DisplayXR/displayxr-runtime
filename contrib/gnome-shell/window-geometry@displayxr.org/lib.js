@@ -58,6 +58,14 @@
 // Object    : /org/displayxr/WindowPlacement
 // Interface : org.displayxr.WindowPlacement1         (extension version 3+)
 //   Method  MoveWindow(u pid, i x, i y) -> (b moved)
+//   Method  MoveWindowBy(u pid, i dx, i dy) -> (b moved)      (version 6+)
+//   Method  GetWindowOrigin(u pid) -> (i x, i y, b ok)        (version 6+)
+//   Signal  WindowMoved(u pid, i x, i y, b applied)           (version 6+)
+//   WindowMoved is the ACHIEVED frame position after every move request. A
+//   client driving its own drag must close its loop on it, not on what it
+//   asked for: integrating its own requests runs away the instant one is not
+//   applied. GetWindowOrigin exists only alongside WindowMoved, so its presence
+//   is the probe for both.
 //   Moves the CALLING process's window frame to the given LOGICAL position.
 //   A Wayland client cannot position itself, but a weaving window must land on
 //   the display's interlace lattice or the 3D shimmers, and only the
@@ -459,12 +467,32 @@
       <arg type="i" direction="in" name="y"/>
       <arg type="b" direction="out" name="moved"/>
     </method>
+    <method name="MoveWindowBy">
+      <arg type="u" direction="in" name="pid"/>
+      <arg type="i" direction="in" name="dx"/>
+      <arg type="i" direction="in" name="dy"/>
+      <arg type="b" direction="out" name="moved"/>
+    </method>
+    <method name="GetWindowOrigin">
+      <arg type="u" direction="in" name="pid"/>
+      <arg type="i" direction="out" name="x"/>
+      <arg type="i" direction="out" name="y"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+    <signal name="WindowMoved">
+      <arg type="u" name="pid"/>
+      <arg type="i" name="x"/>
+      <arg type="i" name="y"/>
+      <arg type="b" name="applied"/>
+    </signal>
   </interface>
 </node>`;
 
         class WindowPlacement {
             constructor(getGrabbedWindow) {
                 this._getGrabbedWindow = getGrabbedWindow;
+                // DISPLAYXR_DEBUG=1 in the shell's environment turns on the per-move log.
+                this._debug = GLib.getenv('DISPLAYXR_DEBUG') === '1';
                 this._dbus = Gio.DBusExportedObject.wrapJSObject(PLACEMENT_IFACE_XML, this);
                 this._dbus.export(Gio.DBus.session, '/org/displayxr/WindowPlacement');
             }
@@ -527,9 +555,77 @@
                             win.allows_move?.() !== false) {
                             win.move_frame(true, x, y);
                             moved = true;
+                            const after = win.get_frame_rect();
+                            this._emitMoved(senderPid, after, true);
+                            if (this._debug) {
+                                log(`displayxr: MoveWindow pid=${senderPid} to=(${x},${y}) ` +
+                                    `after=(${after.x},${after.y})`);
+                            }
                         }
                     }
                     invocation.return_value(new GLib.Variant('(b)', [moved]));
+                });
+            }
+
+            _emitMoved(pid, rect, applied) {
+                if (!this._dbus)
+                    return;
+                this._dbus.emit_signal('WindowMoved', new GLib.Variant('(uiib)',
+                    [pid >>> 0, rect ? rect.x : 0, rect ? rect.y : 0, applied]));
+            }
+
+            /*
+             * RELATIVE move. A client driving its own drag knows how far it
+             * wants to go; the compositor knows where the window is. The
+             * achieved position is always reported back (WindowMoved), and
+             * every refusal names its reason under DISPLAYXR_DEBUG=1.
+             */
+            MoveWindowByAsync([pid, dx, dy], invocation) {
+                this._senderPid(invocation.get_sender(), senderPid => {
+                    let moved = false, after = null;
+                    if (senderPid > 0 && (pid === 0 || pid === senderPid)) {
+                        const win = this._windowOfPid(senderPid);
+                        let why = 'ok';
+                        if (!win)
+                            why = 'no window for this pid';
+                        else if (win === this._getGrabbedWindow())
+                            why = 'a compositor grab op is running on it';
+                        else if (win.is_fullscreen())
+                            why = 'the window is fullscreen';
+                        else if (win.allows_move?.() === false)
+                            why = 'allows_move() is false';
+                        if (why === 'ok') {
+                            const before = win.get_frame_rect();
+                            win.move_frame(true, before.x + dx, before.y + dy);
+                            after = win.get_frame_rect();
+                            moved = true;
+                            if (this._debug) {
+                                log(`displayxr: MoveWindowBy pid=${senderPid} d=(${dx},${dy}) ` +
+                                    `before=(${before.x},${before.y}) after=(${after.x},${after.y})`);
+                            }
+                        } else if (this._debug) {
+                            log(`displayxr: MoveWindowBy REFUSED pid=${senderPid} d=(${dx},${dy}) — ${why}`);
+                        }
+                    }
+                    this._emitMoved(senderPid, after, moved);
+                    invocation.return_value(new GLib.Variant('(b)', [moved]));
+                });
+            }
+
+            //! Where the caller's own window is now (frame top-left, logical).
+            GetWindowOriginAsync([pid], invocation) {
+                this._senderPid(invocation.get_sender(), senderPid => {
+                    let x = 0, y = 0, ok = false;
+                    if (senderPid > 0 && (pid === 0 || pid === senderPid)) {
+                        const win = this._windowOfPid(senderPid);
+                        if (win) {
+                            const r = win.get_frame_rect();
+                            x = r.x;
+                            y = r.y;
+                            ok = true;
+                        }
+                    }
+                    invocation.return_value(new GLib.Variant('(iib)', [x, y, ok]));
                 });
             }
         }

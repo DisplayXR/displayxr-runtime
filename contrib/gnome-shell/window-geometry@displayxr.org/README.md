@@ -30,6 +30,11 @@ there. Without version 3 the runtime keeps whatever phase the window was
 dropped on. Full contract:
 `docs/specs/runtime/wayland-window-geometry.md` §7.
 
+**Version 6 adds what an app driving its own drag needs** — `MoveWindowBy`,
+`GetWindowOrigin`, and a `WindowMoved` signal carrying the *achieved* position
+after every move request, which the app closes its loop on (#1609). All three
+are additive.
+
 ## Two entry points, one set of logic
 
 GNOME Shell 45 changed how an extension is loaded. From 45 it is an **ES

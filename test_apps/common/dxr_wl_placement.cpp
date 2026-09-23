@@ -77,7 +77,7 @@ DxrWlPlacement::connect()
 	DBusMessage *reply = dbus_connection_send_with_reply_and_block(conn, call, 200, &err);
 	dbus_message_unref(call);
 	if (reply == nullptr) {
-		m_why = "the geometry extension is older than version 5 (no WindowPlacement1.GetWindowOrigin / "
+		m_why = "the geometry extension is older than version 6 (no WindowPlacement1.GetWindowOrigin / "
 		        "WindowMoved), so a client cannot see whether its moves land — the title bar keeps the "
 		        "compositor's own drag";
 		dbus_error_free(&err);
@@ -85,7 +85,7 @@ DxrWlPlacement::connect()
 	}
 	dbus_message_unref(reply);
 	m_available = true;
-	m_why = "ready (version 5+: moves are reported back, so a drag can close its loop)";
+	m_why = "ready (version 6+: moves are reported back, so a drag can close its loop)";
 	return true;
 }
 
