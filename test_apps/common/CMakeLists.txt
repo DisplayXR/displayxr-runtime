@@ -41,7 +41,10 @@ FetchContent_Declare(
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
     # v2.19.0 = displayxr-common#56 ("display-referred clears for Vulkan, D3D12
     # and GL"): the D3D12 apps below clear through its common/d3d12_clear.h.
-    GIT_TAG v2.19.0
+    # v2.21.0 moves this pin level with the Linux apps' own: it adds
+    # displayxr::linux_window (displayxr-common#58) and its drag-lattice
+    # follow-ups (#59, runtime#1697), both desktop-Linux only.
+    GIT_TAG v2.21.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
