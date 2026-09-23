@@ -86,6 +86,9 @@
 #include <string.h>
 #include <assert.h>
 #include <ctype.h>
+// #1602: std::isinf, for the equirect2 "+INFINITY radius means as far away as
+// possible" case the shader spells as a zero radius.
+#include <cmath>
 
 #ifdef XRT_OS_WINDOWS
 #include <windows.h>
@@ -450,6 +453,206 @@ static const char *FS_QUAD_ARRAY =
     "    fragColor = texture(u_texture, vec3(v_uv, u_layer)) * u_color_scale + u_color_bias;\n"
     "}\n";
 
+/*
+ * #1602 — `XR_KHR_composition_layer_equirect2`, the GLSL twin of the HLSL in
+ * d3d_shared/comp_equirect2_shaders.h that all three D3D legs compile.
+ *
+ * ── WHY A TWIN AND NOT A SHARE ──
+ *
+ * The three D3D paths share ONE text because they share ONE language; GL cannot
+ * join them, so the ray/sphere march is transliterated here line for line and
+ * the two texts are meant to be diff-read side by side. Every deliberate
+ * divergence is called out in a comment below with the convention that forces
+ * it; anything NOT commented is meant to be identical, and a difference there is
+ * a bug in this file. (vk_native has a third expression of the same math in
+ * shaders/layer.comp's `do_equirect2` — a COMPUTE squash over a UBO array, not a
+ * per-layer draw — which is why it could not be reused either.)
+ *
+ * ── THE CONSTANTS ARE `Equirect2LayerConstants`, FIELD FOR FIELD ──
+ *
+ * D3D pushes one 160-byte block; GL has no constant buffer in this file (every
+ * other program here uses loose uniforms) so the same fields arrive as
+ * individual uniforms, split across the two stages by who reads them:
+ *
+ *   HLSL `cbuffer LayerCB`            GLSL uniform                      stage
+ *   ----------------------------      ----------------------------      -----
+ *   float4x4 mv_inverse               mat4  u_mv_inverse                VS
+ *   float4   to_tangent               vec4  u_to_tangent                VS
+ *   float4   post_transform           vec4  u_post_transform            FS
+ *   float4   color_scale              vec4  u_color_scale               FS
+ *   float4   color_bias               vec4  u_color_bias                FS
+ *   float    radius                   float u_radius                    FS
+ *   float    central_horizontal_angle float u_central_horizontal_angle   FS
+ *   float    upper_vertical_angle     float u_upper_vertical_angle       FS
+ *   float    lower_vertical_angle     float u_lower_vertical_angle       FS
+ *   float4   array_params (x = slice) float u_layer (ARRAY variant only)  FS
+ *
+ * The matrix needs no transpose on the way in: an HLSL `float4x4` in a constant
+ * buffer is column-major and `mul(M, v)` is M·v, which is exactly
+ * `glUniformMatrix4fv(..., GL_FALSE, m.v)` plus `M * v` — the same pairing
+ * VS_QUAD's `u_mvp` already relies on. `mat3(u_mv_inverse)` is HLSL's
+ * `(float3x3)mv_inverse`: the upper-left 3×3 in both languages.
+ *
+ * ── THE ONE DIVERGENCE: the TEXTURE origin (see VS_QUAD's block comment) ──
+ *
+ * A D3D texture's row 0 is the TOP of the picture; a GL swapchain image's row 0
+ * is its BOTTOM. The HLSL pixel shader's `sample_point.y` runs 0 at the TOP of
+ * the sphere section (small `lat` is UP), which pairs correctly with a D3D
+ * texture and is exactly wrong here — so this fragment shader flips it, at the
+ * one line marked below. That is the same correction VS_QUAD makes by DROPPING
+ * the D3D shaders' `pos.y = -pos.y`; equirect2 has no geometry to re-pair, so
+ * the flip has to land on the sampled coordinate instead.
+ *
+ * Folding the flip into `u_post_transform` on the CPU (`y += h; h = -h`, which
+ * is what `flip_y` does) is algebraically the SAME map — (1-s)·h + y ==
+ * (y+h) - s·h — so it is a free choice, and the shader is where it belongs:
+ * the uniforms then keep `Equirect2LayerConstants`' semantics unchanged, and a
+ * reader diffing the two texts sees the divergence rather than having to find
+ * it in the C++.
+ *
+ * ── CLIP SPACE NEEDS NO DIVERGENCE ──
+ *
+ * The `[0,1] -> NDC` map is copied verbatim, including its `1.0 - uv.y * 2.0`:
+ * GL's NDC +y is the TOP of the viewport exactly as D3D's is (only Vulkan is
+ * Y-down), and this shader builds no projection matrix at all — rays come from
+ * `mv_inverse` + `to_tangent` — so the #1580 handedness question that VS_QUAD's
+ * MVP had to answer never arises.
+ */
+static const char *VS_EQUIRECT2 =
+    "#version 330 core\n"
+    "out vec3 v_camera_position;\n"
+    "out vec3 v_camera_ray;\n"
+    "uniform mat4 u_mv_inverse;\n"
+    "uniform vec4 u_to_tangent;\n"
+    "void main() {\n"
+    "    vec2 positions[4] = vec2[4](vec2(0.0, 0.0), vec2(0.0, 1.0),\n"
+    "                                vec2(1.0, 0.0), vec2(1.0, 1.0));\n"
+    "    vec2 uv = positions[gl_VertexID % 4];\n"
+    // Camera position in the layer's MODEL space.
+    "    v_camera_position = (u_mv_inverse * vec4(0.0, 0.0, 0.0, 1.0)).xyz;\n"
+    // [0..1] to tangent lengths at the unit plane, then flip Y for the OpenXR
+    // coordinate system. Normalized in the fragment shader, as in the HLSL.
+    "    vec2 tangent_factors = uv * u_to_tangent.zw + u_to_tangent.xy;\n"
+    "    vec3 ray_in_view_space = vec3(tangent_factors.x, -tangent_factors.y, -1.0);\n"
+    "    v_camera_ray = mat3(u_mv_inverse) * ray_in_view_space;\n"
+    // uv.y == 0 is the frustum's DOWN edge and yields a ray pointing UP, so it
+    // must map to NDC +1 (viewport TOP) for the vertex position to agree with
+    // its own ray. Identical to the HLSL — GL's NDC is Y-up like D3D's.
+    "    gl_Position = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);\n"
+    "}\n";
+
+//! The equirect2 ray/sphere march. `#define DXR_EQ2_ARRAY` is not available in
+//! a GLSL string the way HLSL's `defines` parameter is, so the two sampler
+//! variants are assembled from THIS body plus a per-variant preamble and sample
+//! line (FS_EQUIRECT2 / FS_EQUIRECT2_ARRAY below) — the same one-copy-of-the-math
+//! rule the HLSL's `DXR_LAYERED` #ifdef keeps.
+static const char *FS_EQUIRECT2_BODY =
+    "const float PI = 3.14159265359;\n"
+    "vec2 sphere_intersect(vec3 ray_origin, vec3 ray_direction, vec3 sphere_center, float r) {\n"
+    "    vec3 ray_sphere_diff = ray_origin - sphere_center;\n"
+    "    float B = dot(ray_sphere_diff, ray_direction);\n"
+    "    vec3 QC = ray_sphere_diff - B * ray_direction;\n"
+    "    float H = r * r - dot(QC, QC);\n"
+    "    if (H < 0.0) {\n"
+    "        return vec2(-1.0, -1.0);\n" // No intersection
+    "    }\n"
+    "    H = sqrt(H);\n"
+    "    return vec2(-B - H, -B + H);\n"
+    "}\n"
+    "void main() {\n"
+    "    vec3 ray_origin = v_camera_position;\n"
+    "    vec3 ray_dir = normalize(v_camera_ray);\n"
+    "    vec3 dir_from_sph;\n"
+    // The CPU spells +INFINITY as a zero radius.
+    "    if (u_radius == 0.0) {\n"
+    "        dir_from_sph = ray_dir;\n"
+    "    } else {\n"
+    "        vec2 distances = sphere_intersect(ray_origin, ray_dir, vec3(0.0, 0.0, 0.0), u_radius);\n"
+    // The ray misses the sphere: this fragment is not part of the layer.
+    // DISCARD, never "write transparent black" — see the note at the foot.
+    "        if (distances.y < 0.0) {\n"
+    "            discard;\n"
+    "        }\n"
+    "        vec3 pos = ray_origin + (ray_dir * distances.y);\n"
+    "        dir_from_sph = normalize(pos);\n"
+    "    }\n"
+    // Spherical coordinates. GLSL's two-argument atan(y, x) is HLSL's
+    // atan2(y, x), same argument order.
+    "    float lon = atan(dir_from_sph.x, -dir_from_sph.z) / (2.0 * PI) + 0.5;\n"
+    "    float lat = acos(dir_from_sph.y) / PI;\n"
+    "    float chan = u_central_horizontal_angle / (PI * 2.0);\n"
+    // Normalize [0, 2pi] to [0, 1]
+    "    float uhan = 0.5 + chan / 2.0;\n"
+    "    float lhan = 0.5 - chan / 2.0;\n"
+    // Normalize [-pi/2, pi/2] to [0, 1]
+    "    float uvan = u_upper_vertical_angle / PI + 0.5;\n"
+    "    float lvan = u_lower_vertical_angle / PI + 0.5;\n"
+    "    if (lat < uvan && lat > lvan && lon < uhan && lon > lhan) {\n"
+    // Map the configured display region to the whole texture.
+    "        vec2 ll_offset = vec2(lhan, lvan);\n"
+    "        vec2 ll_extent = vec2(uhan - lhan, uvan - lvan);\n"
+    "        vec2 sample_point = (vec2(lon, lat) - ll_offset) / ll_extent;\n"
+    // THE ONE DIVERGENCE FROM THE HLSL. sample_point.y == 0 is the TOP of the
+    // sphere section (small lat is UP); a GL swapchain image's v == 1 is the
+    // top of the picture, so the section's top must sample v == 1. Without
+    // this the whole layer is vertically mirrored — see the block comment.
+    "        sample_point.y = 1.0 - sample_point.y;\n"
+    "        vec2 uv_sub = sample_point * u_post_transform.zw + u_post_transform.xy;\n"
+    "        fragColor = DXR_EQ2_SAMPLE(uv_sub) * u_color_scale + u_color_bias;\n"
+    "    } else {\n"
+    /*
+     * OUTSIDE the layer's angular extent, and this is the one that bites.
+     *
+     * An equirect2 layer paints only the sphere section it covers, so it is a
+     * SUB-RECT of the tile: it may mark the tile composited, but it can never
+     * be the tile's base. An unflagged layer resolves to OPAQUE_COVER, whose
+     * blend state has blending DISABLED — so writing (0,0,0,0) here would not
+     * be a no-op, it would OVERWRITE the destination and erase whatever the
+     * tile already held everywhere the section does not reach. On a narrow
+     * centralHorizontalAngle that is most of the tile (CTS Equirect2 5/6).
+     *
+     * `discard` is correct in every mode, not just that one: under both
+     * blended modes a source of (0,0,0,0) was already a no-op.
+     */
+    "        discard;\n"
+    "    }\n"
+    "}\n";
+
+//! Non-layered variant: plain sampler2D.
+static const char *FS_EQUIRECT2_PREAMBLE =
+    "#version 330 core\n"
+    "in vec3 v_camera_position;\n"
+    "in vec3 v_camera_ray;\n"
+    "out vec4 fragColor;\n"
+    "uniform sampler2D u_texture;\n"
+    "uniform vec4 u_post_transform;\n"
+    "uniform vec4 u_color_scale;\n"
+    "uniform vec4 u_color_bias;\n"
+    "uniform float u_radius;\n"
+    "uniform float u_central_horizontal_angle;\n"
+    "uniform float u_upper_vertical_angle;\n"
+    "uniform float u_lower_vertical_angle;\n"
+    "#define DXR_EQ2_SAMPLE(uv) texture(u_texture, uv)\n";
+
+//! LAYERED (arraySize>1) variant: sampler2DArray plus the slice, the GLSL twin
+//! of the HLSL's `DXR_LAYERED` branch. Selected per-draw off the SWAPCHAIN's
+//! target, exactly as FS_QUAD_ARRAY is (#1601).
+static const char *FS_EQUIRECT2_ARRAY_PREAMBLE =
+    "#version 330 core\n"
+    "in vec3 v_camera_position;\n"
+    "in vec3 v_camera_ray;\n"
+    "out vec4 fragColor;\n"
+    "uniform sampler2DArray u_texture;\n"
+    "uniform float u_layer;\n"
+    "uniform vec4 u_post_transform;\n"
+    "uniform vec4 u_color_scale;\n"
+    "uniform vec4 u_color_bias;\n"
+    "uniform float u_radius;\n"
+    "uniform float u_central_horizontal_angle;\n"
+    "uniform float u_upper_vertical_angle;\n"
+    "uniform float u_lower_vertical_angle;\n"
+    "#define DXR_EQ2_SAMPLE(uv) texture(u_texture, vec3(uv, u_layer))\n";
+
 //! Fragment shader: masked 2D-over-3D composite (#439 Phase 3 GL leg), by
 //! u_composite_mode:
 //! 0 (LERP): final = M*weave + (1-M)*twod (explicit authored mask).
@@ -517,6 +720,12 @@ struct comp_gl_compositor
 	//! swapchains (sampler2DArray), like program_blit_array.
 	GLuint program_quad;
 	GLuint program_quad_array;
+	//! #1602 XR_KHR_composition_layer_equirect2 — a fullscreen ray-march
+	//! through the same per-view camera. Like the quad pair, blending is STATE
+	//! so one program covers every blend mode; the `_array` twin exists only
+	//! for arraySize>1 swapchains (sampler2DArray).
+	GLuint program_equirect2;
+	GLuint program_equirect2_array;
 	GLuint vao_empty;         //!< Empty VAO for vertex-shader-generated fullscreen quad
 	GLuint fbo;               //!< Framebuffer for rendering into atlas texture
 	GLuint atlas_texture;    //!< Atlas texture (tile_columns * view_width x tile_rows * view_height)
@@ -1861,11 +2070,29 @@ gl_dcomp_readback_present_frame(struct comp_gl_compositor *c)
  *
  */
 
+/*!
+ * Compile one shader stage from one or two source strings, concatenated by GL
+ * itself — `glShaderSource` takes an ARRAY, so no std::string and no second
+ * copy of anything.
+ *
+ * #1602 is the reason it exists: the two equirect2 fragment variants
+ * (sampler2D / sampler2DArray) are ONE shared ray/sphere body plus a
+ * per-variant preamble that declares the sampler and `#define`s the sample
+ * expression. That is how GL expresses what the HLSL does with `DXR_LAYERED`
+ * and D3DCompile's `defines` parameter — GLSL has no equivalent compile-time
+ * define channel, and duplicating ~40 lines of march per variant is exactly
+ * what that #ifdef exists to avoid.
+ *
+ * @param part_b NULL for a single-string stage (every other program here).
+ */
 static GLuint
-compile_shader(GLenum type, const char *source)
+compile_shader_parts(GLenum type, const char *part_a, const char *part_b)
 {
+	const char *sources[2] = {part_a, part_b};
+	const GLsizei count = part_b != NULL ? 2 : 1;
+
 	GLuint shader = glCreateShader(type);
-	glShaderSource(shader, 1, &source, NULL);
+	glShaderSource(shader, count, sources, NULL);
 	glCompileShader(shader);
 
 	GLint ok = 0;
@@ -1880,11 +2107,20 @@ compile_shader(GLenum type, const char *source)
 	return shader;
 }
 
+//! @copydoc compile_shader_parts
 static GLuint
-create_program(const char *vs_src, const char *fs_src)
+compile_shader(GLenum type, const char *source)
+{
+	return compile_shader_parts(type, source, NULL);
+}
+
+//! Link a program whose FRAGMENT stage is @p fs_a followed by @p fs_b
+//! (@p fs_b NULL for the one-string case). See compile_shader_parts().
+static GLuint
+create_program_parts(const char *vs_src, const char *fs_a, const char *fs_b)
 {
 	GLuint vs = compile_shader(GL_VERTEX_SHADER, vs_src);
-	GLuint fs = compile_shader(GL_FRAGMENT_SHADER, fs_src);
+	GLuint fs = compile_shader_parts(GL_FRAGMENT_SHADER, fs_a, fs_b);
 	if (!vs || !fs) {
 		if (vs) glDeleteShader(vs);
 		if (fs) glDeleteShader(fs);
@@ -1908,6 +2144,13 @@ create_program(const char *vs_src, const char *fs_src)
 		return 0;
 	}
 	return prog;
+}
+
+//! @copydoc create_program_parts
+static GLuint
+create_program(const char *vs_src, const char *fs_src)
+{
+	return create_program_parts(vs_src, fs_src, NULL);
 }
 
 /*!
@@ -2537,10 +2780,15 @@ gl_compositor_layer_quad(struct xrt_compositor *xc,
  * xrEndFrame. A NULL slot must fail the layer, not the process; all four are
  * wired so no build configuration can put the crash back.
  *
- * Accumulate-only, exactly like d3d11/d3d12/vk_native. The GL render path
- * filters on PROJECTION/PROJECTION_DEPTH/ZONE_3D/LOCAL_2D/WINDOW_SPACE, so
- * these shapes are accumulated and never drawn — the same net behaviour as
- * the d3d11 renderer, which logs once and breaks out of its layer switch.
+ * Accumulate-only for cube / cylinder / equirect1, exactly like
+ * d3d11/d3d12/vk_native: the GL render path draws
+ * PROJECTION/PROJECTION_DEPTH/ZONE_3D/LOCAL_2D/WINDOW_SPACE, plus QUAD (#1581)
+ * and EQUIRECT2 (#1602), so these three shapes are accumulated and never drawn
+ * — the same net behaviour as the d3d11 renderer, which logs once and breaks
+ * out of its layer switch.
+ *
+ * gl_compositor_layer_equirect2() below is therefore NOT one of them any more:
+ * it accumulates a layer the loop goes on to draw, so it logs nothing.
  */
 static xrt_result_t
 gl_compositor_layer_cube(struct xrt_compositor *xc,
@@ -2597,11 +2845,9 @@ gl_compositor_layer_equirect2(struct xrt_compositor *xc,
                               const struct xrt_layer_data *data)
 {
 	struct comp_gl_compositor *c = gl_comp(xc);
-	static bool noted = false;
-	if (!noted) {
-		U_LOG_I("GL compositor: equirect2 layers are accepted but not drawn (#1544)");
-		noted = true;
-	}
+	// #1602: DRAWN on this backend — gl_render_equirect2_layer(), in the same
+	// submission-ordered loop as the projection blits. No "accepted but not
+	// drawn" note: the frame's first actual draw logs once instead.
 	comp_layer_accum_equirect2(&c->layer_accum, xsc, data);
 	return XRT_SUCCESS;
 }
@@ -4970,6 +5216,239 @@ gl_render_quad_layer(struct comp_gl_compositor *c,
 }
 
 /*!
+ * Render one `XR_KHR_composition_layer_equirect2` layer into every view tile it
+ * is visible in (#1602). Ported from the D3D11 reference render_equirect2_layer()
+ * and the D3D12 port of it, off a GLSL twin of the same shader (VS_EQUIRECT2 /
+ * FS_EQUIRECT2_* above) and sharing every policy decision with them through
+ * comp_layer_view_camera.h rather than restating any of it here.
+ *
+ * Mechanically unlike every other draw in this file: there is no model geometry
+ * and no MVP. The vertex shader emits a fullscreen strip carrying a per-pixel
+ * CAMERA RAY, and the fragment shader intersects that ray with the layer's
+ * sphere and reads spherical UVs off the hit. So what goes down is the INVERSE
+ * model-view (rays are cast in the layer's model space) plus the frustum's
+ * tangent extents, not a forward transform — which is also why this draw needs
+ * no Y-up-vs-Y-down decision the way the quad MVP did (#1580): no projection
+ * matrix is ever built.
+ *
+ * The strip is fullscreen in NDC, so the per-view VIEWPORT is what confines it
+ * to the tile, and the SCISSOR is what keeps it there (GL viewports do not
+ * clip) — the same pair gl_render_quad_layer relies on.
+ *
+ * Structured like gl_render_quad_layer: views are the INNER loop, so the source
+ * is bound and its sRGB-decode parameter set ONCE per layer rather than once
+ * per tile; only the constants, the blend mode and the viewport differ per view.
+ *
+ * @param view_count This frame's active view count — the same one the projection
+ *                   blit tiled by.
+ * @param cameras    This frame's per-view cameras (#1580), the SAME ones the
+ *                   projection tiles were framed by, so an equirect2 background
+ *                   and a quad at the same world pose land on consistent
+ *                   display pixels.
+ * @param tiles      Per-view painter's-order state (#1598). An equirect2 layer
+ *                   paints only the sphere section it covers, so it MARKS the
+ *                   tile (a projection layer submitted after it blends over it
+ *                   rather than erasing it) but can never take the base slot.
+ */
+static void
+gl_render_equirect2_layer(struct comp_gl_compositor *c,
+                          const struct comp_layer *layer,
+                          uint32_t view_count,
+                          const struct comp_layer_view_camera *cameras,
+                          struct comp_layer_tile_state *tiles)
+{
+	const struct xrt_layer_data *data = &layer->data;
+	const struct xrt_layer_equirect2_data *eq = &data->equirect2;
+
+	/*
+	 * Per-eye visibility, view-count aware (#1580). NO front-facing test: a
+	 * sphere has no back face to cull. #1590's rule is normative for QUADS
+	 * specifically ("only front face of the quad surface is visible"), and
+	 * applying it here would drop a viewer standing INSIDE the sphere, which
+	 * is the ordinary case for a 360 background and is literally CTS
+	 * Equirect2 subtests 1-4.
+	 */
+	bool visible[XRT_MAX_VIEWS] = {};
+	bool any_visible = false;
+	for (uint32_t vi = 0; vi < view_count && vi < XRT_MAX_VIEWS; vi++) {
+		visible[vi] = is_layer_view_visible_n(data, vi, view_count);
+		any_visible = any_visible || visible[vi];
+	}
+	if (!any_visible) {
+		return;
+	}
+
+	struct xrt_swapchain *xsc = layer->sc_array[0];
+	if (xsc == NULL) {
+		return;
+	}
+	struct comp_gl_swapchain *gsc = gl_swapchain(xsc);
+	const uint32_t img_idx = eq->sub.image_index;
+	if (img_idx >= gsc->image_count) {
+		return;
+	}
+
+	// #1610: GL_FRAMEBUFFER_SRGB belongs to the PASS, not to this draw — see
+	// the same note in gl_render_quad_layer. Toggling it here would blend this
+	// layer in a different space from the projection tile it sits on.
+	glDisable(GL_DEPTH_TEST);
+
+	// #1601: honour subImage.imageArrayIndex. Gated on the SWAPCHAIN's target,
+	// not on array_index != 0 — it is the SAMPLER's dimension that has to
+	// match, so even slice 0 of an arraySize>1 swapchain belongs on the
+	// sampler2DArray variant.
+	const bool layered = gsc->target == GL_TEXTURE_2D_ARRAY;
+	const GLuint prog = layered ? c->program_equirect2_array : c->program_equirect2;
+	glUseProgram(prog);
+
+	const GLint loc_mv_inv = glGetUniformLocation(prog, "u_mv_inverse");
+	const GLint loc_to_tangent = glGetUniformLocation(prog, "u_to_tangent");
+	const GLint loc_pt = glGetUniformLocation(prog, "u_post_transform");
+	const GLint loc_cscale = glGetUniformLocation(prog, "u_color_scale");
+	const GLint loc_cbias = glGetUniformLocation(prog, "u_color_bias");
+
+	/*
+	 * The three sphere constants and the sub-rect are per LAYER, not per view
+	 * — only the camera-derived ones below change per tile.
+	 *
+	 * The spec says +INFINITY for "as far away as possible"; the shader spells
+	 * that zero and skips the intersection entirely, using the ray direction.
+	 */
+	glUniform1f(glGetUniformLocation(prog, "u_radius"), std::isinf(eq->radius) ? 0.0f : eq->radius);
+	glUniform1f(glGetUniformLocation(prog, "u_central_horizontal_angle"), eq->central_horizontal_angle);
+	glUniform1f(glGetUniformLocation(prog, "u_upper_vertical_angle"), eq->upper_vertical_angle);
+	glUniform1f(glGetUniformLocation(prog, "u_lower_vertical_angle"), eq->lower_vertical_angle);
+
+	// Sub-rect, read exactly as the quad draw and the projection blit read
+	// theirs. The GL texture-origin flip is the SHADER's (see VS_EQUIRECT2's
+	// block comment) so these keep Equirect2LayerConstants' semantics.
+	struct xrt_normalized_rect nr = eq->sub.norm_rect;
+	if (nr.w == 0.0f || nr.h == 0.0f) {
+		nr.x = 0.0f;
+		nr.y = 0.0f;
+		nr.w = 1.0f;
+		nr.h = 1.0f;
+	}
+	float pt[4] = {nr.x, nr.y, nr.w, nr.h};
+	if (data->flip_y) {
+		pt[1] += pt[3];
+		pt[3] = -pt[3];
+	}
+	glUniform4fv(loc_pt, 1, pt);
+
+	glActiveTexture(GL_TEXTURE0);
+	// #1589: the same reading of this frame's target every other layer source
+	// in this pass takes — decode when the target encodes on write, pass the
+	// bytes through when it does not. An equirect2 frame never actually takes
+	// the fast path (gl_frame_takes_fast_path counts this layer as a
+	// contributor), but the bind asks rather than assuming.
+	gl_bind_layer_source(gsc->target, gsc->textures[img_idx], c->compose_active);
+	glUniform1i(glGetUniformLocation(prog, "u_texture"), 0);
+	if (layered) {
+		glUniform1f(glGetUniformLocation(prog, "u_layer"), (float)eq->sub.array_index);
+	}
+
+	// Same effective grid (#542) the projection, quad and window-space passes
+	// tile by, read the same way.
+	const uint32_t cols = c->eff_cols > 0 ? c->eff_cols : c->tile_columns;
+	const uint32_t rows = c->eff_rows > 0 ? c->eff_rows : c->tile_rows;
+	const uint32_t tile_w = c->eff_tile_w > 0 ? c->eff_tile_w : c->view_width;
+	const uint32_t tile_h = c->eff_tile_h > 0 ? c->eff_tile_h : c->view_height;
+
+	// Mandatory, not belt-and-braces: the strip is FULLSCREEN in NDC, so
+	// without the scissor every tile's draw would paint the whole atlas and
+	// the last view would win. (For the quad it is the projected geometry that
+	// can spill; here it always does.)
+	glEnable(GL_SCISSOR_TEST);
+
+	for (uint32_t vi = 0; vi < view_count && vi < XRT_MAX_VIEWS; vi++) {
+		if (!visible[vi]) {
+			continue;
+		}
+
+		// Inverse model-view: the shader casts rays FROM the camera INTO
+		// the layer's model space, so it needs the inverse of the forward
+		// transform. No projection matrix is built — see the note above.
+		struct xrt_matrix_4x4 model, view_mat, mv, mv_inv;
+		const struct xrt_vec3 scale = {1.0f, 1.0f, 1.0f};
+		math_matrix_4x4_model(&eq->pose, &scale, &model);
+		math_matrix_4x4_view_from_pose(&cameras[vi].pose, &view_mat);
+		math_matrix_4x4_multiply(&view_mat, &model, &mv);
+		math_matrix_4x4_inverse(&mv, &mv_inv);
+		glUniformMatrix4fv(loc_mv_inv, 1, GL_FALSE, mv_inv.v);
+
+		// The frustum's tangent extents at the unit plane, which is how the
+		// vertex shader turns a [0,1] screen position into a ray. THE ONLY
+		// place this view's FOV enters.
+		const struct xrt_fov *fov = &cameras[vi].fov;
+		float to_tangent[4];
+		to_tangent[0] = tanf(fov->angle_left);
+		to_tangent[1] = tanf(fov->angle_down);
+		to_tangent[2] = tanf(fov->angle_right) - tanf(fov->angle_left);
+		to_tangent[3] = tanf(fov->angle_up) - tanf(fov->angle_down);
+		glUniform4fv(loc_to_tangent, 1, to_tangent);
+
+		float cscale[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+		float cbias[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+		if (data->flags & XRT_LAYER_COMPOSITION_COLOR_BIAS_SCALE) {
+			cscale[0] = data->color_scale.r;
+			cscale[1] = data->color_scale.g;
+			cscale[2] = data->color_scale.b;
+			cscale[3] = data->color_scale.a;
+			cbias[0] = data->color_bias.r;
+			cbias[1] = data->color_bias.g;
+			cbias[2] = data->color_bias.b;
+			cbias[3] = data->color_bias.a;
+		}
+
+		/*
+		 * #1599: the SHARED three-way rule, through the SUB-RECT spelling.
+		 * An equirect2 layer paints only the sphere section it covers, so
+		 * it cannot establish the tile's alpha and must never take the base
+		 * slot — cleared atlas or not. It still MARKS the tile.
+		 *
+		 * An unflagged layer is an OPAQUE_COVER whose alpha-of-one the
+		 * SHADER emits, folded into the scale/bias channel here. Fragments
+		 * outside the layer's angular extent never reach that line — they
+		 * `discard` — so the fold raises alpha exactly where the layer
+		 * covers and nowhere else, which is what "the layer's alpha is one"
+		 * means.
+		 */
+		const enum comp_layer_blend_mode mode = comp_layer_subrect_blend_mode(&tiles[vi], data->flags);
+		comp_layer_blend_fold_opaque_cover(mode, cscale, cbias);
+		gl_apply_blend_mode(mode);
+
+		glUniform4fv(loc_cscale, 1, cscale);
+		glUniform4fv(loc_cbias, 1, cbias);
+
+		// #1625: the row index is flipped for GL's bottom-left framebuffer
+		// origin, exactly as in the projection and quad passes — this layer
+		// must land in the same physical tile its view's projection content
+		// did.
+		uint32_t tox = 0, toy = 0;
+		u_tiling_view_origin_gl(vi, cols, rows, tile_w, tile_h, &tox, &toy);
+		glViewport((GLint)tox, (GLint)toy, (GLsizei)tile_w, (GLsizei)tile_h);
+		glScissor((GLint)tox, (GLint)toy, (GLsizei)tile_w, (GLsizei)tile_h);
+
+		// Fullscreen strip, 4 vertices — the viewport/scissor restrict it.
+		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+		// One line per process, at the first equirect2 GL ever draws — the
+		// hardware leg's discriminator between "the port is live" and "the
+		// frame carried no equirect2". NEVER per frame.
+		static bool first_equirect2_logged = false;
+		if (!first_equirect2_logged) {
+			first_equirect2_logged = true;
+			U_LOG_W("#1602: GL drew its first equirect2 layer");
+		}
+	}
+
+	// Hand the pass back the way the projection blit expects it — same
+	// contract as gl_render_quad_layer's tail.
+	glDisable(GL_SCISSOR_TEST);
+}
+
+/*!
  * #1589/#1610 — does this frame take the raw (pre-#1589) path?
  *
  * Counts the layers this backend will actually PAINT into the atlas (a type it
@@ -5016,8 +5495,15 @@ gl_frame_takes_fast_path(struct comp_gl_compositor *c)
 			break;
 		case XRT_LAYER_QUAD:
 		case XRT_LAYER_WINDOW_SPACE:
-			// Both cover a SUB-RECT of the tile and blend over
-			// whatever is under them, so either one alone is already a
+		// #1602: equirect2 IS drawn on this backend now
+		// (gl_render_equirect2_layer), so it contributes exactly like a
+		// quad does — it covers a sphere SECTION of the tile and blends
+		// over what is under it. Leaving it in `default:` would let a
+		// lone equirect2 frame take the fast path and blend in encoded
+		// space.
+		case XRT_LAYER_EQUIRECT2:
+			// All three cover a SUB-RECT of the tile and blend over
+			// whatever is under them, so any one alone is already a
 			// compose case.
 			contributing++;
 			sc_count = 1;
@@ -5026,10 +5512,10 @@ gl_frame_takes_fast_path(struct comp_gl_compositor *c)
 			// Local2D is composited POST-weave, not into the atlas, so
 			// it is not this decision's business (and keeps its own
 			// passthrough read — see gl_flatten_one_local2d_layer).
-			// Cylinder / equirect1 / equirect2 / cube are accepted by
-			// the compositor, warned about, and never drawn on this
-			// backend (#1581/#1602). A type that starts drawing into
-			// the atlas here must move up.
+			// Cylinder / equirect1 / cube are accepted by the
+			// compositor, warned about, and never drawn on this backend
+			// (#1544). A type that starts drawing into the atlas here
+			// must move up.
 			break;
 		}
 
@@ -5485,15 +5971,20 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 	if (quad_view_count > XRT_MAX_VIEWS) {
 		quad_view_count = XRT_MAX_VIEWS;
 	}
-	bool any_quad = false;
+	bool any_camera_layer = false;
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
-		if (c->layer_accum.layers[i].data.type == XRT_LAYER_QUAD) {
-			any_quad = true;
+		// #1602: equirect2 is camera-framed too — its rays come from THIS
+		// view's fov. A gate that still named only QUAD resolved nothing
+		// for a frame carrying only an equirect2 background, and the draw
+		// would have cast every ray through a zeroed camera.
+		const enum xrt_layer_type t = c->layer_accum.layers[i].data.type;
+		if (t == XRT_LAYER_QUAD || t == XRT_LAYER_EQUIRECT2) {
+			any_camera_layer = true;
 			break;
 		}
 	}
 	struct comp_layer_view_camera cameras[XRT_MAX_VIEWS] = {};
-	for (uint32_t view = 0; any_quad && view < quad_view_count; view++) {
+	for (uint32_t view = 0; any_camera_layer && view < quad_view_count; view++) {
 		(void)comp_layer_view_camera_select_eyes(&c->layer_accum, view,
 		                                         c->have_cached_eye_pos ? &c->cached_eye_pos : NULL,
 		                                         quad_view_count, NULL, 0.0f, 0.0f, &cameras[view]);
@@ -5524,9 +6015,23 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 			continue;
 		}
 
-		// #1581/#1602: cylinder, equirect1, equirect2 and cube are accepted
-		// by the compositor and still not drawn on this backend. Each needs
-		// its own shader, so they stay accepted-but-undrawn until ported.
+		/*
+		 * #1602 — XR_KHR_composition_layer_equirect2, in the SAME
+		 * submission-ordered loop and for the same reason: a projection
+		 * layer submitted after an equirect2 background must composite
+		 * over it, which is what a 360 backdrop with content in front of
+		 * it is. The other Khronos layer type the CTS composition category
+		 * turns on.
+		 */
+		if (layer->data.type == XRT_LAYER_EQUIRECT2) {
+			gl_render_equirect2_layer(c, layer, quad_view_count, cameras, tiles);
+			continue;
+		}
+
+		// #1544: cylinder, equirect1 and cube are accepted by the
+		// compositor and still not drawn on this backend. Each needs its
+		// own shader and its own uniform set, so they stay
+		// accepted-but-undrawn until ported.
 
 		// XR_DXR_display_zones: zone layers blit through the same pass at
 		// a sub-tile viewport (alpha-over in layer-list order).
@@ -6183,6 +6688,10 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 	if (c->program_masked_composite) glDeleteProgram(c->program_masked_composite);
 	if (c->program_quad) glDeleteProgram(c->program_quad);
 	if (c->program_quad_array) glDeleteProgram(c->program_quad_array);
+	if (c->program_equirect2)
+		glDeleteProgram(c->program_equirect2);
+	if (c->program_equirect2_array)
+		glDeleteProgram(c->program_equirect2_array);
 	if (c->vao_empty) glDeleteVertexArrays(1, &c->vao_empty);
 	if (c->fbo) glDeleteFramebuffers(1, &c->fbo);
 	if (c->atlas_texture) glDeleteTextures(1, &c->atlas_texture);
@@ -6479,9 +6988,13 @@ gl_init_resources(struct comp_gl_compositor *c, uint32_t width, uint32_t height)
 	// #1581 — XrCompositionLayerQuad.
 	c->program_quad = create_program(VS_QUAD, FS_QUAD);
 	c->program_quad_array = create_program(VS_QUAD, FS_QUAD_ARRAY);
+	// #1602 — XR_KHR_composition_layer_equirect2. One shared math body, two
+	// sampler preambles; see compile_shader_parts().
+	c->program_equirect2 = create_program_parts(VS_EQUIRECT2, FS_EQUIRECT2_PREAMBLE, FS_EQUIRECT2_BODY);
+	c->program_equirect2_array = create_program_parts(VS_EQUIRECT2, FS_EQUIRECT2_ARRAY_PREAMBLE, FS_EQUIRECT2_BODY);
 
 	if (!c->program_blit || !c->program_blit_array || !c->program_window_space || !c->program_masked_composite ||
-	    !c->program_quad || !c->program_quad_array) {
+	    !c->program_quad || !c->program_quad_array || !c->program_equirect2 || !c->program_equirect2_array) {
 		U_LOG_E("Failed to compile GL compositor shaders");
 		return false;
 	}
