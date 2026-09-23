@@ -185,6 +185,16 @@ systemctl --user unset-environment DISPLAYXR_DEBUG   # then log out/in again
   exclusion lasts as long as the caller's bus connection, and `disable()`
   (including the lock screen) removes every effect.
 
+- Version 3: object `/org/displayxr/WindowPlacement`, interface
+  `org.displayxr.WindowPlacement1` — `MoveWindow(u pid, i x, i y) -> (b)`
+  (only your own window; refused during a grab).
+- Version 6, same interface: the **drag lattice** (#1609) —
+  `GetPlacementCapabilities() -> (u)` (bit 0),
+  `SetDragLattice(u pid, b extend, i cell, i minDx, i minDy, i maxDx, i maxDy, ai dx, ai dy) -> (b, i startX, i startY)`,
+  `ClearDragLattice(u pid)`, signal `DragLatticeNeeded(u pid, i dx, i dy)`.
+  During the caller's next compositor drag, every position is moved on to the
+  nearest table entry before it is painted. See the spec, §8.
+
 Verify capture exclusion is live:
 
 ```bash

@@ -58,8 +58,8 @@
 // Object    : /org/displayxr/WindowPlacement
 // Interface : org.displayxr.WindowPlacement1         (extension version 3+)
 //   Method  MoveWindow(u pid, i x, i y) -> (b moved)
-//   Method  GetPlacementCapabilities() -> (u caps)            (version 4+)
-//             bit 0: drag lattice (needs Meta.ExternalConstraint)
+//   Method  GetPlacementCapabilities() -> (u caps)            (version 6+)
+//             bit 0: drag lattice (the table methods below)
 //   Method  SetDragLattice(u pid, b extend, i cell, i minDx, i minDy,
 //                          i maxDx, i maxDy, ai dx, ai dy)
 //             -> (b accepted, i startX, i startY)
