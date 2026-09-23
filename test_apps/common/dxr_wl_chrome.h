@@ -137,7 +137,8 @@ public:
 	 *               a non-integer output scale, ...).
 	 * @param move   called on each motion with the pointer's displacement
 	 *               since the press, in LOGICAL px.
-	 * @param end    called on the release.
+	 * @param end    called when the drag ends, for ANY reason (see
+	 *               end_client_drag()).
 	 */
 	void
 	set_drag_hooks(std::function<bool()> begin, std::function<void(double, double)> move, std::function<void()> end)
@@ -145,6 +146,23 @@ public:
 		m_drag_begin = std::move(begin);
 		m_drag_move = std::move(move);
 		m_drag_end = std::move(end);
+	}
+
+	/*!
+	 * Watchdog for an app-owned drag; call once per frame. Ends the drag when
+	 * no pointer event (motion or button) has arrived for a while. A release
+	 * this client never sees would otherwise leave the window stuck to the
+	 * pointer: the window follows the pointer, so the pointer stays over the
+	 * window and keeps sending motion.
+	 */
+	void
+	drag_watchdog();
+
+	//! True while an app-owned drag is running.
+	bool
+	client_dragging() const
+	{
+		return m_client_dragging;
 	}
 
 	//! Maximised or tiled on any edge (from xdg_toplevel.configure states).
@@ -316,5 +334,15 @@ private:
 	std::function<void(double, double)> m_drag_move;
 	std::function<void()> m_drag_end;
 	bool m_client_dragging = false;
-	double m_drag_press_x = 0.0, m_drag_press_y = 0.0;
+	double m_drag_press_x = 0.0, m_drag_press_y = 0.0; //!< bar-surface frame
+	int64_t m_drag_last_event_ns = 0;                  //!< last pointer event during the drag
+	uint64_t m_drag_events = 0;                        //!< pointer events during the drag
+	uint64_t m_drag_foreign_events = 0;                //!< ...of which on a surface other than the bar
+	//! End an app-owned drag, naming why. Idempotent.
+	void
+	end_client_drag(const char *reason);
+	//! Pointer position in the BAR surface's frame, whichever of our
+	//! surfaces the event was reported on.
+	void
+	to_bar_frame(double x, double y, double *bx, double *by) const;
 };

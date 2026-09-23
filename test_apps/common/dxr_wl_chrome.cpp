@@ -19,6 +19,7 @@
 #include <unistd.h>                  // ftruncate, close
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -279,6 +280,9 @@ DxrWlChrome::on_toplevel_states(struct wl_array *states, bool sized)
 		m_fullscreen = fullscreen;
 	}
 	m_maximized = maximized;
+	if (m_client_dragging && m_activated && !activated) {
+		end_client_drag("the window lost focus");
+	}
 	m_activated = activated;
 	m_bar.setMaximized(maximized);
 	m_bar.setFocused(activated);
@@ -581,12 +585,76 @@ hit_edge(dxr_csd::Hit h)
 	}
 }
 
+static int64_t
+chrome_now_ns()
+{
+	return (int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+	           std::chrono::steady_clock::now().time_since_epoch())
+	    .count();
+}
+
+static const char *
+button_name(uint32_t button)
+{
+	switch (button) {
+	case BTN_LEFT: return "left";
+	case BTN_RIGHT: return "right";
+	case BTN_MIDDLE: return "middle";
+	default: return "other";
+	}
+}
+
+void
+DxrWlChrome::to_bar_frame(double x, double y, double *bx, double *by) const
+{
+	// The bar is a subsurface of the content surface at (0, -barH), so a point
+	// in the content surface's frame is barH lower in the bar's frame.
+	*bx = x;
+	*by = (m_ptr_surface == m_content && m_content != nullptr) ? y + (double)m_bar.logicalHeight() : y;
+}
+
+void
+DxrWlChrome::end_client_drag(const char *reason)
+{
+	if (!m_client_dragging) {
+		return;
+	}
+	m_client_dragging = false;
+	CHROME_INFO("drag: end (%s) — %llu pointer event(s) during the drag, %llu of them on a surface other "
+	            "than the title bar",
+	            reason, (unsigned long long)m_drag_events, (unsigned long long)m_drag_foreign_events);
+	if (m_drag_end) {
+		m_drag_end();
+	}
+}
+
+void
+DxrWlChrome::drag_watchdog()
+{
+	if (!m_client_dragging) {
+		return;
+	}
+	// 2 s without a single pointer event. Holding the button perfectly still
+	// for that long also ends the drag; pressing again resumes it. That is
+	// the cost of never being able to leave a window stuck to the pointer.
+	if (chrome_now_ns() - m_drag_last_event_ns > 2000000000LL) {
+		end_client_drag("watchdog: no pointer event for 2 s");
+	}
+}
+
 void
 DxrWlChrome::on_pointer_motion(double x, double y)
 {
 	m_ptr_x = x;
 	m_ptr_y = y;
 	if (m_client_dragging) {
+		m_drag_last_event_ns = chrome_now_ns();
+		m_drag_events++;
+		if (m_ptr_surface != m_surface) {
+			m_drag_foreign_events++;
+		}
+		double bx = x, by = y;
+		to_bar_frame(x, y, &bx, &by);
 		/*
 		 * Displacement since the press, in SURFACE-LOCAL logical px.
 		 *
@@ -598,7 +666,7 @@ DxrWlChrome::on_pointer_motion(double x, double y)
 		 * client directly.
 		 */
 		if (m_drag_move) {
-			m_drag_move(x - m_drag_press_x, y - m_drag_press_y);
+			m_drag_move(bx - m_drag_press_x, by - m_drag_press_y);
 		}
 		return;
 	}
@@ -617,6 +685,31 @@ DxrWlChrome::on_pointer_button(uint32_t serial, uint32_t time, uint32_t button, 
 {
 	const bool pressed = state == WL_POINTER_BUTTON_STATE_PRESSED;
 	if (m_seat == nullptr || m_toplevel == nullptr) {
+		return;
+	}
+
+	/*
+	 * An app-owned drag ends on ANY button event, before anything looks at
+	 * which surface the pointer is over.
+	 *
+	 * The first hardware run of this path never ended a drag: the release
+	 * was only handled when the pointer was over the title-bar surface. The
+	 * window trails the pointer, so the pointer can be over the content
+	 * surface (or off the window) at the moment of release, and the release
+	 * was dropped. The window then followed the pointer indefinitely. A
+	 * PRESS during a drag also ends it: a second click is how a user gets a
+	 * stuck window to let go.
+	 */
+	if (m_client_dragging) {
+		m_drag_last_event_ns = chrome_now_ns();
+		m_drag_events++;
+		const char *where = m_ptr_surface == m_surface   ? "title bar"
+		                    : m_ptr_surface == m_content ? "content"
+		                                                 : "no surface of ours";
+		char reason[128];
+		snprintf(reason, sizeof(reason), "%s button %s, pointer on %s", button_name(button),
+		         pressed ? "PRESSED during the drag" : "released", where);
+		end_client_drag(reason);
 		return;
 	}
 
@@ -670,8 +763,12 @@ DxrWlChrome::on_pointer_button(uint32_t serial, uint32_t time, uint32_t button, 
 			 */
 			if (m_drag_begin && m_drag_begin()) {
 				m_client_dragging = true;
-				m_drag_press_x = m_ptr_x;
+				m_drag_press_x = m_ptr_x; // on the bar surface: already its frame
 				m_drag_press_y = m_ptr_y;
+				m_drag_last_event_ns = chrome_now_ns();
+				m_drag_events = 0;
+				m_drag_foreign_events = 0;
+				CHROME_INFO("drag: begin (app-owned) at %.1f,%.1f on the title bar", m_ptr_x, m_ptr_y);
 				return;
 			}
 			// The compositor's own move — the same one Super+drag runs, so
@@ -688,14 +785,7 @@ DxrWlChrome::on_pointer_button(uint32_t serial, uint32_t time, uint32_t button, 
 		return;
 	}
 
-	// Release.
-	if (m_client_dragging) {
-		m_client_dragging = false;
-		if (m_drag_end) {
-			m_drag_end();
-		}
-		return;
-	}
+	// Release. (An app-owned drag was ended at the top of this function.)
 	const dxr_csd::Hit down = m_bar.pressed();
 	m_bar.setPressed(dxr_csd::Hit::Outside);
 	if (down == dxr_csd::Hit::Outside || down != h) {
@@ -716,6 +806,17 @@ DxrWlChrome::s_ptr_enter(void *data, struct wl_pointer *p, uint32_t serial, stru
 {
 	(void)p;
 	auto *self = static_cast<DxrWlChrome *>(data);
+	/*
+	 * An enter during an app-owned drag means the pointer focus changed under
+	 * it. An enter says nothing about button state, so whether the button is
+	 * still held is unknown. End the drag rather than risk a window that
+	 * follows a released pointer. (A leave normally ends it first; see
+	 * s_ptr_leave.)
+	 */
+	if (self->m_client_dragging) {
+		self->end_client_drag(s == self->m_content ? "pointer ENTERED the content surface during the drag"
+		                                           : "pointer ENTERED a surface during the drag");
+	}
 	self->m_ptr_surface = s;
 	self->m_ptr_enter_serial = serial;
 	self->m_cursor_shape = 0; // unknown after an enter: force the next set
@@ -732,6 +833,14 @@ DxrWlChrome::s_ptr_leave(void *data, struct wl_pointer *p, uint32_t serial, stru
 	(void)serial;
 	(void)s;
 	auto *self = static_cast<DxrWlChrome *>(data);
+	/*
+	 * A leave during an app-owned drag: the compositor no longer routes this
+	 * pointer to us, so the release will not arrive here either. End now.
+	 */
+	if (self->m_client_dragging) {
+		self->end_client_drag(s == self->m_content ? "pointer LEFT the content surface during the drag"
+		                                           : "pointer LEFT the title bar during the drag");
+	}
 	self->m_ptr_surface = nullptr;
 	self->m_bar.setHover(dxr_csd::Hit::Outside);
 	self->m_bar.setPressed(dxr_csd::Hit::Outside);

@@ -2187,6 +2187,7 @@ DxrLinuxWindow::pump(const std::function<void(DxrKey)> &on_key, bool *running)
 		// and send the newest held target once the previous one is reported.
 		m_wl_placement.poll();
 		wl_drag_flush();
+		m_wl_chrome.drag_watchdog();
 #endif
 
 		for (DxrKey k : m_wl_key_queue) {
