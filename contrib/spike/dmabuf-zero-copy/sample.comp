@@ -1,0 +1,15 @@
+#version 450
+// Real sampled read of the imported dma-buf (through a VkImageView + VkSampler,
+// the way a weaver samples its input), packed to RGBA8 in a host-visible buffer.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(binding = 0) uniform sampler2D tex;
+layout(binding = 1, std430) writeonly buffer Out { uint px[]; };
+layout(push_constant) uniform PC { ivec2 size; } pc;
+void main()
+{
+	ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(p, pc.size)))
+		return;
+	vec4 c = textureLod(tex, (vec2(p) + 0.5) / vec2(pc.size), 0.0);
+	px[p.y * pc.size.x + p.x] = packUnorm4x8(c);
+}
