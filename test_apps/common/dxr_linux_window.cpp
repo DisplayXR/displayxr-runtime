@@ -1390,10 +1390,12 @@ void
 DxrLinuxWindow::wl_drag_prepare()
 {
 	m_wl_lattice_active = false;
-	// Opt-in for the first hardware run; the compositor drag without a table
-	// is exactly today's behaviour.
+	// On by default whenever the geometry extension offers it (version 6+),
+	// since hardware confirmed it (stable 3D while dragging, native drag feel).
+	// DXR_WL_DRAG_LATTICE=0 turns it off; the compositor drag without a table
+	// is exactly the pre-#1609 behaviour.
 	const char *env = getenv("DXR_WL_DRAG_LATTICE");
-	if (env == nullptr || env[0] != '1') {
+	if (env != nullptr && env[0] == '0') {
 		return;
 	}
 	if (!m_wl_placement.has_drag_lattice() || m_snap_fn == nullptr) {
@@ -1889,7 +1891,7 @@ DxrLinuxWindow::pump(const std::function<void(DxrKey)> &on_key, bool *running)
 				          m_wl_lattice_start_x, m_wl_lattice_start_y, tx, ty, tl.dx, tl.dy,
 				          moved ? "accepted" : "REFUSED");
 			} else {
-				DXRW_WARN("DXR_WL_TEST_LATTICE: no lattice was sent — nothing to test (set DXR_WL_DRAG_LATTICE=1 "
+				DXRW_WARN("DXR_WL_TEST_LATTICE: no lattice was sent — nothing to test (is DXR_WL_DRAG_LATTICE=0 set? "
 				          "and check the 'drag lattice' lines above)");
 			}
 		}
