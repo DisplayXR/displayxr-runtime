@@ -1618,13 +1618,14 @@ TEST_CASE("the quad-drawing paths consult the shared facing and painter's rules 
 }
 
 /*
- * #1602, structurally, for the equirect2 draw on both D3D legs.
+ * #1602, structurally, for the equirect2 draw on every backend that has one:
+ * both D3D legs and, since the GL port, OpenGL.
  *
  * The guards above are FILE-scoped: they prove the file consults the shared
  * rules SOMEWHERE. That was enough while a file had one non-projection draw in
- * it; D3D12 now has two (quad, #1581; equirect2, #1602), and a file-scoped
- * check is satisfied by the quad alone — the exact hole a second port falls
- * through. So these read the equirect2 FUNCTION BODY.
+ * it; D3D12 and GL now have two each (quad, #1581; equirect2, #1602), and a
+ * file-scoped check is satisfied by the quad alone — the exact hole a second
+ * port falls through. So these read the equirect2 FUNCTION BODY.
  *
  * Both what it must ask and what it must NOT:
  *
@@ -1692,21 +1693,32 @@ function_body(const std::string &src, const std::string &name)
 	return src.substr(start, end - start);
 }
 
-TEST_CASE("the equirect2 draw consults the shared rules on both D3D legs (#1602)")
+TEST_CASE("the equirect2 draw consults the shared rules on every backend that has one (#1602)")
 {
-	const char *const backends[] = {
-	    "d3d11/comp_d3d11_renderer.cpp",
+	// The backend source and the NAME of its equirect2 draw. GL prefixes its
+	// statics, so the function name is per-backend rather than assumed.
+	const struct
+	{
+		const char *rel;
+		const char *fn;
+	} backends[] = {
+	    {"d3d11/comp_d3d11_renderer.cpp", "render_equirect2_layer"},
 	    // #1602: D3D12 joined here; before it, the layer was accepted into
 	    // the accumulator and silently never drawn.
-	    "d3d12/comp_d3d12_renderer.cpp",
+	    {"d3d12/comp_d3d12_renderer.cpp", "render_equirect2_layer"},
+	    // ...and GL joined next, off a GLSL twin of the same shader. It had
+	    // the same defect for the same reason: accepted into the accumulator,
+	    // never drawn, six blank CTS subtests on `-G opengl`.
+	    {"gl/comp_gl_compositor.cpp", "gl_render_equirect2_layer"},
 	};
 
-	for (const char *rel : backends) {
+	for (const auto &backend : backends) {
+		const char *const rel = backend.rel;
 		const std::string path = std::string(DXR_COMP_SRC_DIR) + "/" + rel;
 		const std::string src = read_whole_file(path);
-		const std::string body = function_body(src, "render_equirect2_layer");
+		const std::string body = function_body(src, backend.fn);
 
-		INFO(rel << " has no render_equirect2_layer() definition — did it move, or did the "
+		INFO(rel << " has no " << backend.fn << "() definition — did it move, or did the "
 		         << "equirect2 draw get dropped?");
 		REQUIRE_FALSE(body.empty());
 
@@ -1769,11 +1781,82 @@ TEST_CASE("the equirect2 draw consults the shared rules on both D3D legs (#1602)
 	CHECK(d3d12_body.find("layer_source_format(") != std::string::npos);
 
 	/*
-	 * The shader is SHARED, not forked. d3d_shared/comp_equirect2_shaders.h
-	 * exists because the ray/sphere march is ~100 lines that three backends
-	 * compile, and its own preamble says a per-path copy would drift the
-	 * first time either was touched. `sphere_intersect` is the tell: it
-	 * appears exactly once in the tree, in that header.
+	 * ...and the GL-specific half. Three things this leg can get wrong that
+	 * neither D3D leg can:
+	 *
+	 *  - the same SUB-RECT spelling D3D12 owes, and for the same reason: GL
+	 *    composes its sub-rect layers in the same loop as its projection
+	 *    blits, so the equirect2 draw walks straight past the first-in-tile
+	 *    gate it must not take;
+	 *  - the source read must go through gl_bind_layer_source(), the GL twin
+	 *    of layer_source_format(). In GL "does this sampler decode?" is
+	 *    TEXTURE-OBJECT state, so a plain glBindTexture() here would inherit
+	 *    whatever the previous draw left on that texture — a colour bug that
+	 *    depends on layer ORDER, which is worse than a consistent one;
+	 *  - it must NOT touch GL_FRAMEBUFFER_SRGB. That is PASS state (#1610):
+	 *    on for the whole atlas pass when the pass paints the private
+	 *    GL_SRGB8_ALPHA8 compose target, off when it paints the atlas
+	 *    directly. A draw that toggled it would blend this layer in a
+	 *    different space from the projection tile underneath it.
+	 */
+	const std::string gl = read_whole_file(std::string(DXR_COMP_SRC_DIR) + "/gl/comp_gl_compositor.cpp");
+	const std::string gl_body = code_only(function_body(gl, "gl_render_equirect2_layer"));
+	REQUIRE_FALSE(gl_body.empty());
+
+	INFO("the GL equirect2 draw must resolve its blend mode through comp_layer_subrect_blend_mode()");
+	CHECK(gl_body.find("comp_layer_subrect_blend_mode(") != std::string::npos);
+
+	INFO(
+	    "the GL equirect2 draw must bind its source through gl_bind_layer_source() (#1589/#1610) — "
+	    "a bare glBindTexture() inherits the previous draw's sRGB-decode parameter");
+	CHECK(gl_body.find("gl_bind_layer_source(") != std::string::npos);
+
+	INFO(
+	    "the GL equirect2 draw must not touch GL_FRAMEBUFFER_SRGB — the encode is PASS state, and "
+	    "a per-draw toggle blends this layer in a different space from the tile under it (#1610)");
+	CHECK(gl_body.find("GL_FRAMEBUFFER_SRGB") == std::string::npos);
+
+	/*
+	 * A sphere SECTION is a sub-rect contributor, so a frame carrying one owes
+	 * a LINEAR blend and must not take the #1589 fast path — which would
+	 * compose it in encoded space. Both same-loop backends decide that in one
+	 * named predicate, and equirect2 has to be a case in it rather than
+	 * falling into `default:`. Read as a function body, because the file
+	 * mentions the enum in several other places.
+	 */
+	const struct
+	{
+		const char *rel;
+		const char *fn;
+	} fast_path_owners[] = {
+	    {"d3d12/comp_d3d12_renderer.cpp", "renderer_frame_takes_fast_path"},
+	    {"gl/comp_gl_compositor.cpp", "gl_frame_takes_fast_path"},
+	};
+	for (const auto &owner : fast_path_owners) {
+		const std::string src = read_whole_file(std::string(DXR_COMP_SRC_DIR) + "/" + owner.rel);
+		const std::string body = code_only(function_body(src, owner.fn));
+		INFO(owner.rel << " has no " << owner.fn << "() — did the fast-path decision move?");
+		REQUIRE_FALSE(body.empty());
+
+		INFO(owner.rel << ": " << owner.fn
+		               << "() must count XRT_LAYER_EQUIRECT2 as a CONTRIBUTING layer now that this "
+		                  "backend draws it — left in `default:`, a lone equirect2 frame takes the "
+		                  "fast path and blends in ENCODED space (#1589/#1610)");
+		CHECK(body.find("XRT_LAYER_EQUIRECT2") != std::string::npos);
+	}
+
+	/*
+	 * The shader is SHARED, not forked — once per LANGUAGE, never once per
+	 * backend. d3d_shared/comp_equirect2_shaders.h exists because the
+	 * ray/sphere march is ~100 lines that three D3D backends compile, and its
+	 * own preamble says a per-path copy would drift the first time either was
+	 * touched. `sphere_intersect` is the tell: no D3D backend may name it,
+	 * because naming it means carrying a private copy of the HLSL.
+	 *
+	 * GL is deliberately NOT in this list: it cannot compile HLSL, so its GLSL
+	 * twin (VS_EQUIRECT2 / FS_EQUIRECT2_*) is a second LANGUAGE rather than a
+	 * second copy, and it does name `sphere_intersect`. vk_native is a third
+	 * such expression, in shaders/layer.comp's `do_equirect2` compute squash.
 	 */
 	const char *const shader_consumers[] = {
 	    "d3d11/comp_d3d11_renderer.cpp",
