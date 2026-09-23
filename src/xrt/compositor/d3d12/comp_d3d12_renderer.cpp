@@ -1193,9 +1193,13 @@ comp_d3d12_renderer_create(struct comp_d3d12_compositor *c,
 	}
 
 	// Create SRV descriptor heap (shader visible).
-	// Slot 0 = atlas; slots 1..N allocated per-frame for each layer draw.
-	// 16 slots is plenty for typical usage (1 atlas + up to 15 layer SRVs).
-	r->srv_heap_size = 16;
+	// Slot 0 = atlas; slots 1..N allocated per-frame, one per layer DRAW: a
+	// projection layer takes one per view (the slice is pinned in the SRV),
+	// a sub-rect layer one for the whole layer. Size it for the worst case
+	// the accumulator can hold — 16 slots dropped the 16th projection layer
+	// of the CTS MinLayers case (slot 16 >= 16), and a stereo frame of the
+	// OpenXR-minimum 16 layers already needs 33. Descriptors are cheap.
+	r->srv_heap_size = 1 + XRT_MAX_LAYERS * XRT_MAX_VIEWS;
 	r->next_srv_slot = 1;
 
 	D3D12_DESCRIPTOR_HEAP_DESC srv_heap_desc = {};
