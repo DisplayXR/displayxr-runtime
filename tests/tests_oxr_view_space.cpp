@@ -1563,3 +1563,57 @@ TEST_CASE("the system reports tracking when a tracked role device exists (#1631)
 
 	tear_down(rt);
 }
+
+TEST_CASE("the CTS configuration (no input providers) still reports tracking (#1631)",
+          "[oxr][view_space][tracking_props_noproviders]")
+{
+	// #1631 REGRESSION arm, and the one that caught the real bug. The first
+	// cut of the fix read the dynamic roles through GET_XDEV_BY_ROLE, i.e.
+	// out of oxr_system::dynamic_roles_cache, which is only refreshed at
+	// xrSyncActions — so the answer silently depended on whether an
+	// input-provider plug-in was loaded (a provider populates the STATIC
+	// hand-tracking roles, which ARE read live). With DXR_INPUT_PROVIDERS=0,
+	// which scripts/run_cts.ps1:431 ALWAYS sets so the hands stay on qwerty,
+	// nothing static held a role and the flags collapsed back to XR_FALSE —
+	// exactly the configuration the CTS runs in, so the three files kept
+	// skipping while the plain arm above passed.
+	//
+	// The variable is read through CRT getenv at the process's FIRST instance
+	// create and the scan is one-shot (`g_input_load_attempted`), so this arm
+	// needs its OWN process — hence tests_oxr_view_space_no_input_providers
+	// in tests/CMakeLists.txt, the same pattern as the legacy / mode_floor
+	// arms above.
+	const char *no_providers = std::getenv("DXR_INPUT_PROVIDERS");
+	if (no_providers == nullptr || std::strcmp(no_providers, "0") != 0) {
+		// SUCCEED, not SKIP: build-windows.yml reads any "SKIPPED:" from this
+		// binary as "the headless runtime did not come up" (#1370).
+		WARN("this arm needs DXR_INPUT_PROVIDERS=0 - see tests_oxr_view_space_no_input_providers "
+		     "in tests/CMakeLists.txt");
+		SUCCEED("not the no-provider process; the plain [tracking_props] arm covers the other configuration");
+		return;
+	}
+
+	Runtime rt;
+	if (!bring_up(rt)) {
+		return;
+	}
+
+	auto getProps = rt.fn<PFN_xrGetSystemProperties>("xrGetSystemProperties");
+	XrSystemProperties props{XR_TYPE_SYSTEM_PROPERTIES};
+	REQUIRE(XR_SUCCEEDED(getProps(rt.instance, rt.system, &props)));
+
+	INFO("orientationTracking=" << props.trackingProperties.orientationTracking
+	                            << " positionTracking=" << props.trackingProperties.positionTracking);
+
+#if DXR_TEST_HAVE_QWERTY
+	// Deliberately asked BEFORE any xrSyncActions, like the CTS does at
+	// test_SpaceOffsets.cpp:125 - that timing is the whole point.
+	CHECK(props.trackingProperties.orientationTracking == XR_TRUE);
+	CHECK(props.trackingProperties.positionTracking == XR_TRUE);
+#else
+	WARN("built without the qwerty driver - no tracked role device, so FALSE is correct here");
+	SUCCEED("no role devices in this build; the rule itself is pinned on the host");
+#endif
+
+	tear_down(rt);
+}

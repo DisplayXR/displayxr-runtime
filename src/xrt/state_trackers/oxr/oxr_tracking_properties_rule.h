@@ -33,6 +33,19 @@
  *      or one of the hand-tracking roles. These are the devices that supply
  *      located poses to `xrLocateSpace` / action poses.
  *
+ * ### Term 3 must be read LIVE
+ *
+ * The dynamic roles (left / right / gamepad) are cached in
+ * `oxr_system::dynamic_roles_cache`, seeded to `XRT_SYSTEM_ROLES_INIT` (every
+ * index -1) and refreshed only at `xrSyncActions`. `xrGetSystemProperties` is
+ * always asked before any sync — the CTS calls it right after
+ * `xrCreateSession` — so the call site must take the roles from
+ * `xrt_system_devices_get_roles()` rather than through `GET_XDEV_BY_ROLE`,
+ * which answers from that cache. Reading the cache made the answer depend on
+ * whether an input-provider plug-in happened to be loaded (a provider fills the
+ * STATIC hand-tracking roles, which are not cached), so under the CTS's own
+ * `DXR_INPUT_PROVIDERS=0` the whole rule collapsed back to XR_FALSE.
+ *
  * A bare sim-display with no eye tracking (`SIM_DISPLAY_FAKE_TRACKING` unset,
  * so `supported_eye_tracking_modes == 0`) and no role devices still reports
  * FALSE — the head really is untracked there and nothing else in the system
