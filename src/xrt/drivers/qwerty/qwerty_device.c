@@ -376,6 +376,61 @@ qwerty_apply_grip_surface(struct xrt_device *xd, enum xrt_input_name name, struc
 	u_grip_surface_from_grip(xd->device_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER, relation, relation);
 }
 
+/*!
+ * #1692: every relation qwerty hands out is fully valid, fully tracked and
+ * carries both velocities. The device is a simulation — it knows its own
+ * motion exactly — so validity never toggles with the keyboard: a frame with
+ * no keys held reports zero velocity, which is a measurement, not a gap.
+ */
+static const enum xrt_space_relation_flags qwerty_relation_flags = (enum xrt_space_relation_flags)(
+    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT |
+    XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT |
+    XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT | XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT);
+
+//! @see qwerty_device.h for the derivation and why this is not a finite difference.
+void
+qwerty_step_velocity(const struct xrt_vec3 *pos_delta,
+                     const struct xrt_quat *ori_before,
+                     const struct xrt_quat *local_rotation,
+                     const struct xrt_quat *base_rotation,
+                     float dt_s,
+                     struct xrt_vec3 *out_linear,
+                     struct xrt_vec3 *out_angular)
+{
+	*out_linear = (struct xrt_vec3)XRT_VEC3_ZERO;
+	*out_angular = (struct xrt_vec3)XRT_VEC3_ZERO;
+
+	if (!(dt_s > 0.0f)) {
+		return;
+	}
+
+	const float inv_dt = 1.0f / dt_s;
+
+	out_linear->x = pos_delta->x * inv_dt;
+	out_linear->y = pos_delta->y * inv_dt;
+	out_linear->z = pos_delta->z * inv_dt;
+
+	// delta = base_rotation * (ori_before * local_rotation * ori_before^-1)
+	struct xrt_quat ori_before_inv;
+	math_quat_invert(ori_before, &ori_before_inv);
+
+	struct xrt_quat tmp;
+	struct xrt_quat local_in_base;
+	struct xrt_quat delta;
+	math_quat_rotate(ori_before, local_rotation, &tmp);
+	math_quat_rotate(&tmp, &ori_before_inv, &local_in_base);
+	math_quat_rotate(base_rotation, &local_in_base, &delta);
+	math_quat_normalize(&delta);
+
+	// ln() of a unit quaternion is (angle / 2) * axis, so the rotation
+	// vector of the step is twice it; divide by dt for the rate.
+	struct xrt_vec3 half_angle = XRT_VEC3_ZERO;
+	math_quat_ln(&delta, &half_angle);
+	out_angular->x = 2.0f * half_angle.x * inv_dt;
+	out_angular->y = 2.0f * half_angle.y * inv_dt;
+	out_angular->z = 2.0f * half_angle.z * inv_dt;
+}
+
 static xrt_result_t
 qwerty_get_tracked_pose(struct xrt_device *xd,
                         enum xrt_input_name name,
@@ -422,10 +477,12 @@ qwerty_get_tracked_pose(struct xrt_device *xd,
 		// to any single-consumer test because nothing else sets this flag.
 		// Freezing motion must not BANK time.
 		qd->last_integrate_ns = os_monotonic_get_ns();
+		// #1692: frozen means standing still, not "velocity unknown".
+		qd->linear_velocity = (struct xrt_vec3)XRT_VEC3_ZERO;
+		qd->angular_velocity = (struct xrt_vec3)XRT_VEC3_ZERO;
+		*out_relation = (struct xrt_space_relation)XRT_SPACE_RELATION_ZERO;
 		out_relation->pose = qd->pose;
-		out_relation->relation_flags =
-		    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT |
-		    XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT;
+		out_relation->relation_flags = qwerty_relation_flags;
 		qwerty_apply_grip_surface(xd, name, out_relation);
 		os_mutex_unlock(&qd->lock); // #958
 		return XRT_SUCCESS;
@@ -461,19 +518,27 @@ qwerty_get_tracked_pose(struct xrt_device *xd,
 	math_quat_rotate_vec3(&qd->pose.orientation, &pos_delta, &pos_delta);
 	pos_delta.y += mov_speed * (qd->up_pressed - qd->down_pressed);
 
-	math_vec3_accum(&pos_delta, &qd->pose.position);
-
-	// Mouse-driven position delta (world space XY, not rotated by device orientation)
-	qd->pose.position.x += qd->x_pos_delta;
-	qd->pose.position.y += qd->y_pos_delta;
+	// Mouse-driven position delta (world space XY, not rotated by device orientation).
+	// Folded into pos_delta so the reported velocity covers it too (#1692).
+	pos_delta.x += qd->x_pos_delta;
+	pos_delta.y += qd->y_pos_delta;
 	qd->x_pos_delta = 0;
 	qd->y_pos_delta = 0;
 
+	math_vec3_accum(&pos_delta, &qd->pose.position);
+
 	// Orientation
 
-	// View rotation caused by keys (time-based, see above)
-	float y_look_speed = qd->look_speed * dt_frames * (qd->look_left_pressed - qd->look_right_pressed);
-	float x_look_speed = qd->look_speed * dt_frames * (qd->look_up_pressed - qd->look_down_pressed);
+	// View rotation caused by keys (time-based, see above). #1692: the sprint
+	// modifier boosts the look rate exactly as it boosts the movement rate.
+	// Unboosted, the keyboard tops out at look_speed * 60 rad/s — 3 rad/s on a
+	// controller — which cannot reach the 6 rad/s per axis the CTS SpaceOffsets
+	// criteria ask for. Mouse deltas are one-shot impulses, not rates, so they
+	// are deliberately left unscaled.
+	float look_step = qd->look_speed * sprint_boost * dt_frames;
+	float y_look_speed = look_step * (qd->look_left_pressed - qd->look_right_pressed);
+	float x_look_speed = look_step * (qd->look_up_pressed - qd->look_down_pressed);
+	float z_look_speed = look_step * (qd->roll_left_pressed - qd->roll_right_pressed);
 
 	// View rotation caused by mouse
 	y_look_speed += qd->yaw_delta;
@@ -484,18 +549,46 @@ qwerty_get_tracked_pose(struct xrt_device *xd,
 
 	struct xrt_quat x_rotation;
 	struct xrt_quat y_rotation;
+	struct xrt_quat z_rotation;
 	const struct xrt_vec3 x_axis = XRT_VEC3_UNIT_X;
 	const struct xrt_vec3 y_axis = XRT_VEC3_UNIT_Y;
+	const struct xrt_vec3 z_axis = XRT_VEC3_UNIT_Z;
 	math_quat_from_angle_vector(x_look_speed, &x_axis, &x_rotation);
 	math_quat_from_angle_vector(y_look_speed, &y_axis, &y_rotation);
-	math_quat_rotate(&qd->pose.orientation, &x_rotation, &qd->pose.orientation); // local-space pitch
-	math_quat_rotate(&y_rotation, &qd->pose.orientation, &qd->pose.orientation); // base-space yaw
+	math_quat_from_angle_vector(z_look_speed, &z_axis, &z_rotation);
+
+	// Pitch and roll are device-local, yaw is base-space (keeps the horizon
+	// level and dodges gimbal lock). Compose the two local rotations first so
+	// the same pair drives the pose and the reported angular velocity.
+	struct xrt_quat local_rotation;
+	math_quat_rotate(&x_rotation, &z_rotation, &local_rotation);
+
+	const struct xrt_quat ori_before = qd->pose.orientation;
+	math_quat_rotate(&qd->pose.orientation, &local_rotation, &qd->pose.orientation); // local-space pitch + roll
+	math_quat_rotate(&y_rotation, &qd->pose.orientation, &qd->pose.orientation);     // base-space yaw
 	math_quat_normalize(&qd->pose.orientation);
+
+	/*
+	 * #1692: the velocity of the step just integrated, for the pose this same
+	 * call is about to return. dt is the one the integration used, so for a
+	 * held key `delta / dt` is exactly the instantaneous rate
+	 * (speed_per_frame * 60) and is the same on every poll however short the
+	 * step — the returned pair is coherent both ways: the pose at t, and the
+	 * rate that carries it forward from t. A step of zero length (two polls
+	 * inside one nanosecond) integrated nothing, so the previous step's rate
+	 * still describes this pose; keep it rather than reporting a false stop.
+	 */
+	const float dt_s = dt_frames * (1.0f / 60.0f);
+	if (dt_s > 0.0f) {
+		qwerty_step_velocity(&pos_delta, &ori_before, &local_rotation, &y_rotation, dt_s, &qd->linear_velocity,
+		                     &qd->angular_velocity);
+	}
 
 	if (debug_get_bool_option_qwerty_qtrace()) {
 		bool moving = qd->forward_pressed || qd->backward_pressed || qd->left_pressed || qd->right_pressed ||
 		              qd->up_pressed || qd->down_pressed || qd->look_left_pressed || qd->look_right_pressed ||
-		              qd->look_up_pressed || qd->look_down_pressed;
+		              qd->look_up_pressed || qd->look_down_pressed || qd->roll_left_pressed ||
+		              qd->roll_right_pressed;
 		if (moving || qt_yaw != 0.f || qt_pitch != 0.f || pos_delta.x != 0.f || pos_delta.y != 0.f ||
 		    pos_delta.z != 0.f) {
 			U_LOG_W("[QTRACE] QD qd=%p name=%d dtf=%.3f yaw=%.4f pitch=%.4f keys=%d%d%d%d -> pos=(%.4f,%.4f,%.4f) "
@@ -513,18 +606,34 @@ qwerty_get_tracked_pose(struct xrt_device *xd,
 	bool qd_is_ctrl =
 	    name == XRT_INPUT_WMR_GRIP_POSE || name == XRT_INPUT_WMR_AIM_POSE || name == XRT_INPUT_GENERIC_PALM_POSE;
 	struct qwerty_controller *qc = qd_is_ctrl ? qwerty_controller(&qd->base) : NULL;
+
+	struct xrt_space_relation self = {0};
+	self.relation_flags = qwerty_relation_flags;
+	self.pose = qd->pose;
+	self.linear_velocity = qd->linear_velocity;
+	self.angular_velocity = qd->angular_velocity;
+
 	if (qd_is_ctrl && qc->follow_hmd) {
-		struct xrt_relation_chain relation_chain = {0};
 		struct qwerty_device *qd_hmd = &qd->sys->hmd->base;
-		m_relation_chain_push_pose(&relation_chain, &qd->pose);     // controller pose
-		m_relation_chain_push_pose(&relation_chain, &qd_hmd->pose); // base space is hmd space
+
+		// #1692: push RELATIONS, not bare poses. A pose-only step carries
+		// zero velocity, so composing one would have reported a parented
+		// controller as motionless however fast it (or the head) was moving.
+		// The chain then does the frame rotation and the lever-arm term for
+		// free. The HMD's fields are read unlocked, as its pose always was.
+		struct xrt_space_relation hmd = {0};
+		hmd.relation_flags = qwerty_relation_flags;
+		hmd.pose = qd_hmd->pose;
+		hmd.linear_velocity = qd_hmd->linear_velocity;
+		hmd.angular_velocity = qd_hmd->angular_velocity;
+
+		struct xrt_relation_chain relation_chain = {0};
+		m_relation_chain_push_relation(&relation_chain, &self); // controller relation
+		m_relation_chain_push_relation(&relation_chain, &hmd);  // base space is hmd space
 		m_relation_chain_resolve(&relation_chain, out_relation);
 	} else {
-		out_relation->pose = qd->pose;
+		*out_relation = self;
 	}
-	out_relation->relation_flags =
-	    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT |
-	    XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT;
 	qwerty_apply_grip_surface(xd, name, out_relation);
 
 	os_mutex_unlock(&qd->lock); // #958
@@ -883,6 +992,10 @@ void qwerty_press_look_up(struct qwerty_device *qd) { qd->look_up_pressed = true
 void qwerty_release_look_up(struct qwerty_device *qd) { qd->look_up_pressed = false; }
 void qwerty_press_look_down(struct qwerty_device *qd) { qd->look_down_pressed = true; }
 void qwerty_release_look_down(struct qwerty_device *qd) { qd->look_down_pressed = false; }
+void qwerty_press_roll_left(struct qwerty_device *qd) { qd->roll_left_pressed = true; }
+void qwerty_release_roll_left(struct qwerty_device *qd) { qd->roll_left_pressed = false; }
+void qwerty_press_roll_right(struct qwerty_device *qd) { qd->roll_right_pressed = true; }
+void qwerty_release_roll_right(struct qwerty_device *qd) { qd->roll_right_pressed = false; }
 // clang-format on
 
 void
@@ -944,6 +1057,8 @@ qwerty_release_all(struct qwerty_device *qd)
 	qd->look_right_pressed = false;
 	qd->look_up_pressed = false;
 	qd->look_down_pressed = false;
+	qd->roll_left_pressed = false;
+	qd->roll_right_pressed = false;
 	qd->sprint_pressed = false;
 	qd->yaw_delta = 0;
 	qd->pitch_delta = 0;

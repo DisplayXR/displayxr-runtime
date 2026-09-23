@@ -472,6 +472,24 @@ qwerty_process_win32(struct xrt_device **xdevs,
 			}
 			break;
 
+		// Z/X roll — the arrow keys only reach pitch and yaw (#1692)
+		case 'Z':
+			for (int i = 0; i < target_count; i++) {
+				if (is_keydown)
+					qwerty_press_roll_left(targets[i]);
+				else
+					qwerty_release_roll_left(targets[i]);
+			}
+			break;
+		case 'X':
+			for (int i = 0; i < target_count; i++) {
+				if (is_keydown)
+					qwerty_press_roll_right(targets[i]);
+				else
+					qwerty_release_roll_right(targets[i]);
+			}
+			break;
+
 		// Sprint
 		case VK_LSHIFT:
 		case VK_SHIFT:

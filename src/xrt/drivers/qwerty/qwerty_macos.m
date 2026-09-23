@@ -323,6 +323,20 @@ qwerty_process_macos(struct xrt_device **xdevs,
 			}
 			break;
 
+		// Z/X roll — the arrow keys only reach pitch and yaw (#1692)
+		case kVK_ANSI_Z:
+			for (int i = 0; i < target_count; i++) {
+				if (is_down) qwerty_press_roll_left(targets[i]);
+				else qwerty_release_roll_left(targets[i]);
+			}
+			break;
+		case kVK_ANSI_X:
+			for (int i = 0; i < target_count; i++) {
+				if (is_down) qwerty_press_roll_right(targets[i]);
+				else qwerty_release_roll_right(targets[i]);
+			}
+			break;
+
 		// Sprint
 		case kVK_Shift:
 			for (int i = 0; i < target_count; i++) {
