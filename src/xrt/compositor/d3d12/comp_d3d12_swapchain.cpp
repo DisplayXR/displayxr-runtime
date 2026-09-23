@@ -410,6 +410,24 @@ comp_d3d12_swapchain_get_resource(struct xrt_swapchain *xsc, uint32_t index)
 	return sc->images[index];
 }
 
+/*!
+ * The typed DXGI format @p res was created for: the app's request, stamped at
+ * create time (the resource itself is TYPELESS, #1503). Foreign resources — a
+ * runtime scratch, an engine-supplied shared texture — carry no stamp, so they
+ * fall back to their own descriptor.
+ */
+static DXGI_FORMAT
+requested_typed_format(ID3D12Resource *res)
+{
+	DXGI_FORMAT typed = DXGI_FORMAT_UNKNOWN;
+	UINT size = (UINT)sizeof(typed);
+	if (FAILED(res->GetPrivateData(kDxrRequestedViewFormatGuid, &size, &typed)) || size != (UINT)sizeof(typed) ||
+	    typed == DXGI_FORMAT_UNKNOWN) {
+		typed = res->GetDesc().Format;
+	}
+	return typed;
+}
+
 extern "C" DXGI_FORMAT
 comp_d3d12_swapchain_sample_format(void *resource)
 {
@@ -418,19 +436,45 @@ comp_d3d12_swapchain_sample_format(void *resource)
 		return DXGI_FORMAT_R8G8B8A8_UNORM;
 	}
 
-	// Prefer the typed format the app requested (stamped at create). Foreign
-	// resources — a runtime scratch, an engine-supplied shared texture — carry
-	// no stamp, so fall back to their own descriptor.
-	DXGI_FORMAT typed = DXGI_FORMAT_UNKNOWN;
-	UINT size = (UINT)sizeof(typed);
-	if (FAILED(res->GetPrivateData(kDxrRequestedViewFormatGuid, &size, &typed)) || size != (UINT)sizeof(typed) ||
-	    typed == DXGI_FORMAT_UNKNOWN) {
-		typed = res->GetDesc().Format;
+	// Sample an sRGB colour image through its UNORM sibling so the GPU does
+	// NOT auto-decode sRGB->linear: this is the view for the paths that hand
+	// the app's bytes on UNCHANGED (the #1589 fast path, zero-copy, the
+	// Local2D flatten), where the atlas is declared ENCODED and the app
+	// already encoded. This also resolves any still-typeless format to a
+	// viewable one. The composing paths take
+	// comp_d3d12_swapchain_compose_format() instead.
+	return d3d_dxgi_format_to_unorm_sample(requested_typed_format(res));
+}
+
+extern "C" DXGI_FORMAT
+comp_d3d12_swapchain_compose_format(void *resource)
+{
+	auto *res = static_cast<ID3D12Resource *>(resource);
+	if (res == nullptr) {
+		return DXGI_FORMAT_R8G8B8A8_UNORM;
 	}
 
-	// Sample an sRGB colour image through its UNORM sibling so the GPU does
-	// NOT auto-decode sRGB->linear: the display processor wants
-	// display-referred bytes, so the app's bytes pass through unchanged. This
-	// also resolves any still-typeless format to a viewable one.
+	const DXGI_FORMAT typed = requested_typed_format(res);
+
+	// #1589: the format-honest reading. An `_SRGB` request keeps its `_SRGB`
+	// view, so the hardware decodes to linear on sample — which is what the
+	// private `_SRGB`-view compose target needs, since it blends in linear
+	// and re-applies the OETF once on write. Everything else goes through the
+	// same resolve as the sampling view: a UNORM request already holds linear
+	// values, and a TYPELESS or unstamped resource still has to land on a
+	// format a view will accept.
+	if (d3d_dxgi_format_is_srgb(typed)) {
+		return typed;
+	}
 	return d3d_dxgi_format_to_unorm_sample(typed);
+}
+
+extern "C" bool
+comp_d3d12_swapchain_resource_is_srgb(void *resource)
+{
+	auto *res = static_cast<ID3D12Resource *>(resource);
+	if (res == nullptr) {
+		return false;
+	}
+	return d3d_dxgi_format_is_srgb(requested_typed_format(res));
 }

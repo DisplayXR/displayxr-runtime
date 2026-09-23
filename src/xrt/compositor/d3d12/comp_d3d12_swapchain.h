@@ -82,6 +82,43 @@ comp_d3d12_swapchain_get_resource(struct xrt_swapchain *xsc, uint32_t index);
 DXGI_FORMAT
 comp_d3d12_swapchain_sample_format(void *resource);
 
+/*!
+ * #1589 — the FORMAT-HONEST view format for @p resource: the app's TRUE
+ * format, so an `_SRGB` swapchain decodes to linear on sample and a UNORM
+ * swapchain reads the linear values it holds (ADR-021 §6).
+ *
+ * The twin of @ref comp_d3d12_swapchain_sample_format, and the only difference
+ * between them is the sRGB -> UNORM coercion: that one is right wherever the
+ * runtime hands the app's bytes on UNCHANGED (the single-layer fast path,
+ * zero-copy, the Local2D flatten), this one wherever the runtime writes
+ * through an `_SRGB` render target that blends in linear and encodes once on
+ * write. Same bytes, two readings — the swapchain format picks which is
+ * correct, which is the whole of #1589.
+ *
+ * Still resolves a TYPELESS resource to something a view will accept, so it is
+ * a safe drop-in at any SRV site.
+ *
+ * @param resource An `ID3D12Resource *`. NULL yields R8G8B8A8_UNORM.
+ *
+ * @ingroup comp_d3d12
+ */
+DXGI_FORMAT
+comp_d3d12_swapchain_compose_format(void *resource);
+
+/*!
+ * #1589 — did the app request an `*_SRGB` colour swapchain for @p resource?
+ *
+ * ADR-021 §6: the format IS the declaration. True ⟹ the bytes are
+ * display-referred and may reach the ENCODED atlas unchanged; false ⟹ they are
+ * scene-linear and owe the encode, which only the compose target can apply.
+ *
+ * @param resource An `ID3D12Resource *`. NULL yields false.
+ *
+ * @ingroup comp_d3d12
+ */
+bool
+comp_d3d12_swapchain_resource_is_srgb(void *resource);
+
 #ifdef __cplusplus
 }
 #endif
