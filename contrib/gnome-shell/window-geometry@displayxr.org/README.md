@@ -78,7 +78,15 @@ on other desktops.
 a newly installed extension, or a new version of an installed one, loads only
 at the next login. Until then the runtime logs that the extension is installed
 but not active, and falls back to display-scoped weaving (and, for
-transparent apps on a Leia panel, silhouette intersection).
+transparent apps on a 3D panel, silhouette intersection).
+
+**On a pre-45 shell (Ubuntu 22.04 / GNOME 42) that is TWO logins, not one.**
+The entry-point swap runs from `/etc/xdg/autostart`, which fires *after* GNOME
+Shell has already loaded its extensions — so the first login after installing
+still tries the ES module, logs a JS parse error, and leaves the extension
+inactive; the swap it performs takes effect at the **second** login. Nothing is
+wrong; log out and back in once more. (`displayxr-gnome-extension-enable
+--install` does the swap up front if you would rather not spend the login.)
 
 **How "enabled for every user" works, and why this way.** GNOME keeps the list
 of enabled extensions per user (`org.gnome.shell enabled-extensions`). A dconf
@@ -199,15 +207,23 @@ the same geometry to serve its own non-DisplayXR apps). The full contract is in
 
 ## Constraints
 
+- **On 22.04, an X11 session is the recommendation anyway, and this extension
+  is not what fixes that.** GNOME 42 predates `wp_fractional_scale_v1`, so a
+  native-Wayland client on a scaled 22.04 desktop cannot present a buffer at
+  its device extent; the runtime sees buffer ≠ device extent and degrades the
+  session to flat 2D rather than weave into a resample (runtime#1595). This
+  extension supplies the *position*, which is a different missing piece — it
+  cannot make a resampled surface 1:1. On X11 none of this applies, and the
+  runtime reads the geometry itself.
 - Coordinates are logical pixels; windowed weaving requires monitor scale 1.0.
   The provider reports the scale, and at anything other than 1.0 the runtime
   **refuses** the rect and stays display-scoped rather than weave at a phase it
   knows is wrong (runtime#1557) — the compositor also resamples the surface at
   non-unit scale, which destroys an interlace regardless of phase.
 - GNOME Shell versions 42–50 (`shell-version` in `metadata.json`), covering
-  Ubuntu 22.04 (GNOME 42), 24.04 (GNOME 46) and 26.04 (GNOME 50). Validated
-  live on GNOME 50.1 / Ubuntu 26.04 (runtime#817). **The GNOME 42 path is not
-  hardware-validated yet** — the APIs are all present in mutter 42.9 and the
+  every supported release: **Ubuntu 22.04 (GNOME 42), 24.04 (GNOME 46) and
+  26.04 (GNOME 50)**. Validated live on GNOME 50.1 / Ubuntu 26.04
+  (runtime#817). **The GNOME 42 path is not hardware-validated yet** — the APIs are all present in mutter 42.9 and the
   form is syntax-checked in CI, but nobody has watched it run; see
   *Validating on GNOME 42* below. A newly installed extension, or a newly
   selected entry point, is only picked up at the next login — Wayland cannot

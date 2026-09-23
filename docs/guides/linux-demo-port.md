@@ -83,8 +83,14 @@ same shape with three swaps:
    build fallback), and drop `OBJCXX` from `LANGUAGES` on Linux.
 
 3. **`.github/workflows/build-linux.yml`** (new, **non-required** at first) —
-   `ubuntu-latest`, apt-install the deps below, run `scripts/build_linux.sh`.
-   Promote to a required check once it's reliably green.
+   apt-install the deps below and run `scripts/build_linux.sh` on a **tri-LTS
+   matrix (Ubuntu 22.04 / 24.04 / 26.04)**, which is what all 5 shipped demos
+   now require on `main`. Anything that produces a **release artifact** must
+   build in the **`ubuntu:22.04` container**, not on `ubuntu-latest`: a binary's
+   glibc floor is its build host's, so a 24.04-built package installs on 22.04
+   and then fails at every `dlopen` (runtime#1656). Promote the matrix to a
+   required check once it's reliably green — either as three checks, or
+   aggregated behind one job that `needs:` the matrix.
 
 ### apt deps (Debian/Ubuntu)
 

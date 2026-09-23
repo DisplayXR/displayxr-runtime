@@ -106,7 +106,17 @@ Builds the runtime, OpenXR loader, and test apps. The macOS Vulkan native compos
 
 ### Linux
 
-> **Preview — hardware-validated on NVIDIA / Ubuntu 22.04, pre-GA.** Linux is Vulkan-only (native compositor over an X11/XCB surface) and distributed as a user-level tarball; no installer asset ships on releases yet. Phase status: `docs/roadmap/linux-support.md`.
+> **Ubuntu 22.04, 24.04 and 26.04 are supported.** On 22.04, use an X11
+> session: GNOME 42 does not implement the Wayland fractional-scale protocol
+> (`wp_fractional_scale_v1`), so a native-Wayland window cannot be guaranteed
+> 1:1 with the panel on a scaled desktop. Packages are built on 22.04 and
+> CI-verified to install and headlessly self-test on all three releases.
+> Hardware validation to date is on 24.04 and 26.04.
+>
+> Linux is Vulkan-only (native compositor over an X11/XCB surface). Every `v*`
+> release attaches a `displayxr-runtime_<ver>_amd64.deb`; the user-level
+> tarball from `scripts/package_linux.sh` is the other supported install.
+> Phase status and the exact CI gates: `docs/roadmap/linux-support.md`.
 
 ```bash
 ./scripts/build_linux.sh              # headless build + selftest (deps list in the script header)
@@ -122,7 +132,7 @@ machine-wide. Every `v*` release also attaches `displayxr-runtime_<ver>_amd64.de
 (`scripts/package_deb_linux.sh`). Dev iteration without installing stays
 `XR_RUNTIME_JSON` + `XRT_PLUGIN_SEARCH_PATH` per `docs/roadmap/linux-support.md`.
 
-**Supported releases, and why the release artifacts are built on the oldest one
+**Why the release artifacts are built on the oldest supported release
 (#1656).** The published `.deb` and tarball must install and run on **Ubuntu
 22.04, 24.04 and 26.04**, so CI builds both in an **`ubuntu:22.04` container**
 (the `Deb` and `Package` jobs) — a binary's glibc / libstdc++ floor is its build
@@ -170,8 +180,19 @@ next login. Check it with `gnome-extensions info window-geometry@displayxr.org`
 `gnome-extensions enable window-geometry@displayxr.org`, then logs out and in.
 When an app binds a Wayland surface and the extension is not answering, the
 runtime logs a `wl_geom:` line that says whether it is not installed or
-installed but not active. The extension needs GNOME Shell 45 or newer, so it
-does not load on Ubuntu 22.04 (GNOME 42). Details and the enabling rules:
+installed but not active.
+
+It loads on **GNOME 42 as well as 45+** (#1677). GNOME 45 changed an extension
+into an ES module, so the package ships two ~20-line entry points over one
+shared `lib.js` and the login script puts the one the running shell can parse
+in the `extension.js` slot, picked by `gnome-shell --version`. Two consequences
+on a pre-45 shell: the swap runs from `/etc/xdg/autostart`, i.e. *after* the
+shell has already loaded its extensions, so the **first login after installing
+logs a JS parse error and the extension is inactive — it becomes active at the
+second login**; and the GNOME 42 path has never run on a GNOME 42 desktop, so
+treat it as shipped-but-unvalidated. On 22.04 the fractional-scale gap above is
+the bigger reason to prefer an X11 session anyway. Details, the enabling rules
+and the by-hand GNOME 42 validation pass:
 `contrib/gnome-shell/window-geometry@displayxr.org/README.md`.
 
 **Running the OpenXR CTS locally (#1527).** `scripts/fetch_build_cts.sh` clones

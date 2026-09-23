@@ -41,9 +41,9 @@ Every graphics API gets its own native compositor — no Vulkan intermediary, no
 | D3D12 | Shipping | — | — | — |
 | Metal | — | Shipping | — | — |
 | OpenGL | Shipping | Shipping | — | — |
-| Vulkan | Shipping | Shipping | Preview | Shipping |
+| Vulkan | Shipping | Shipping | Shipping | Shipping |
 
-Linux is **Vulkan-only** (native compositor over an X11/XCB surface) and in **Preview** — hardware-validated on NVIDIA / Ubuntu 22.04, not yet GA. See [Linux Support](docs/roadmap/linux-support.md).
+Linux is **Vulkan-only** (native compositor over an X11/XCB surface). **Ubuntu 22.04, 24.04 and 26.04 are supported** — on 22.04, use an X11 session, because GNOME 42 does not implement the Wayland fractional-scale protocol and a native-Wayland window cannot then be guaranteed 1:1 with the panel on a scaled desktop. Packages are built on 22.04 and CI-verified to install and headlessly self-test on all three releases; hardware validation to date is on 24.04 and 26.04. See [Linux Support](docs/roadmap/linux-support.md).
 
 ## Quick Start
 
@@ -73,12 +73,12 @@ For full control, install each component directly from its release page. Order: 
 
 | Component | Windows | macOS | Linux |
 |---|---|---|---|
-| **DisplayXR Runtime** (required) | [`DisplayXRSetup-*.exe`](https://github.com/DisplayXR/displayxr-runtime/releases) | [`DisplayXR-Installer-*.pkg`](https://github.com/DisplayXR/displayxr-runtime/releases) | tarball ([`package_linux.sh`](scripts/package_linux.sh)) — Preview |
+| **DisplayXR Runtime** (required) | [`DisplayXRSetup-*.exe`](https://github.com/DisplayXR/displayxr-runtime/releases) | [`DisplayXR-Installer-*.pkg`](https://github.com/DisplayXR/displayxr-runtime/releases) | [`displayxr-runtime_*_amd64.deb`](https://github.com/DisplayXR/displayxr-runtime/releases) or tarball ([`package_linux.sh`](scripts/package_linux.sh)) |
 | **DisplayXR Shell** (optional, spatial workspace UX) | [`DisplayXRShellSetup-*.exe`](https://github.com/DisplayXR/displayxr-shell-releases/releases) | — (deferred) | — (not ported) |
 | **Leia SR plug-in** (Leia hardware only) | [`DisplayXRLeiaSRSetup-*.exe`](https://github.com/DisplayXR/displayxr-leia-plugin/releases) | — (vendor SDK is Windows-only) | — (in progress) |
 | **MCP Tools** (optional, AI-agent / voice control) | [`DisplayXRMCPSetup-*.exe`](https://github.com/DisplayXR/displayxr-mcp/releases) | — (future) | — (future) |
 
-On Linux the runtime installs from a user-level tarball (`scripts/package_linux.sh` → `dist/*.tar.gz` with `install.sh`); there is no released installer yet.
+On Linux, every `v*` release attaches `displayxr-runtime_<ver>_amd64.deb` (`apt install ./displayxr-runtime_*_amd64.deb`); the user-level, no-root tarball (`scripts/package_linux.sh` → `dist/*.tar.gz` with `install.sh`) is the alternative. Both are built on Ubuntu 22.04 and CI-verified to install on 22.04, 24.04 and 26.04.
 
 The website's [Get Started](https://displayxr.org/getting-started) page walks through the manual flow end-to-end with verification steps.
 
