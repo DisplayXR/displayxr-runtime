@@ -1020,6 +1020,24 @@ jitter and no tracking loss. A test that asks for a quad "at each hand" is
 therefore asking whether the quad follows the pose the runtime reported, which
 is a question qwerty answers perfectly well.
 
+**Raise the hands first — they start below the camera's field of view.** The
+controller offset `(±0.2, −0.3, −0.5)` is head-*local*, and the controllers are
+parented to the head, so moving or pitching the head never changes where they
+sit in the view (that is why an unmodified `E` "moves the camera": with no
+CTRL/ALT registered the HMD is the target and the hands ride along). Under the
+100° legacy camera profile (`DXR_LEGACY_CAMERA_RIG={"horizontalFovDeg":100,
+"convergenceDiopters":0}`, half-vFOV 33.8°) the quad centres sit 3° *below* the
+frustum and only their top ~18 % shows. The fix is a controller-local move:
+hold **CTRL+ALT** (both hands focused), press **E** for ~500 ms (qwerty moves
+0.6 m/s, time-integrated → +0.30 m, i.e. eye level, mid-frustum; anything in
+220–860 ms lands inside the view), release **E**, then ALT, then CTRL. Park the
+cursor *before* the modifiers, never move the mouse while one is held, and never
+release ALT without a key in between (system-menu mode). Oracle: run the CTS
+with `DXR_QTRACE=1` — `[QTRACE] QD … pos=(x,y,z)` is printed per moved device; a
+controller's `y` walks −0.300 → 0.000, whereas 1.6 → 1.9 means the head moved
+and the modifier never reached the window. (The service window's log line
+"F/G controller focus" is stale: F/G/T/H are the thumbstick; focus is CTRL/ALT.)
+
 Press **R** to reset both controllers to their defaults before judging, so both
 hands start symmetric and you can see at a glance that **L** and **R** are not
 swapped. Then hold CTRL (or ALT) and move the mouse to translate one hand, and
