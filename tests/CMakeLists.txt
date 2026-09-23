@@ -52,6 +52,7 @@ set(tests
     tests_oxr_view_config_rule
     tests_oxr_legacy_mode_rule
     tests_oxr_mode_fillable_rule
+    tests_oxr_tracking_properties_rule
     tests_xrt_active_mode_scale
     tests_input_arbiter_rig
     tests_sim_input_nav
@@ -285,6 +286,15 @@ if(TARGET tests_oxr_view_space)
 		target_link_libraries(tests_oxr_view_space PRIVATE ${CMAKE_DL_LIBS})
 	endif()
 
+	# #1631 — whether this build HAS a tracked role device to find. The
+	# sim-display builder always adds the qwerty controllers, and those are the
+	# only role devices a hardware-free headless session gets; without that
+	# driver the system genuinely does not track and XR_FALSE is correct, so the
+	# arm must know which build it is in rather than guess from the answer.
+	target_compile_definitions(
+		tests_oxr_view_space PRIVATE "DXR_TEST_HAVE_QWERTY=$<BOOL:${XRT_BUILD_DRIVER_QWERTY}>"
+		)
+
 	# #1486 -- the DXR_VIEW_CONFIG_LEGACY kill switch, in a SECOND ctest running
 	# the SAME binary. It has to be its own process: the runtime reads the
 	# variable through DEBUG_GET_ONCE_BOOL_OPTION, which caches the first read
@@ -406,6 +416,16 @@ target_include_directories(
 	tests_oxr_mode_fillable_rule PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
 	)
 target_link_libraries(tests_oxr_mode_fillable_rule PRIVATE xrt-interfaces)
+
+# #1631 — what XrSystemTrackingProperties advertises on a 3D display: the head's
+# own flags OR the display processor's eye-tracking capability OR any tracked
+# role device. Same reason as the three rules above that it is only the RULE
+# which is host-drivable (the real answer needs an instance, a system, a head, a
+# plug-in and role devices). Pure bools/uint32 over <stdbool.h>, so unlike those
+# it needs no xrt-interfaces either -- the include is the whole dependency.
+target_include_directories(
+	tests_oxr_tracking_properties_rule PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
+	)
 
 # One source of truth for the ACTIVE mode's per-view scale. The accessor is a
 # static inline over xrt_device / xrt_rendering_mode, so headers are all it
