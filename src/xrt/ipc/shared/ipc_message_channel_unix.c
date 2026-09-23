@@ -208,13 +208,31 @@ ipc_receive_fds(struct ipc_message_channel *imc, void *out_data, size_t size, in
 		return XRT_ERROR_IPC_FAILURE;
 	}
 
+	/*
+	 * Every slot the peer did not fill reads as -1 (the invalid fd), never as
+	 * whatever the caller's array held. Callers zero-initialise their arrays,
+	 * and 0 is a VALID fd — so a handler that releases what it received (the
+	 * weave_submit cleanup paths, #1699) would otherwise close the service's
+	 * own stdin on a short or fd-less message.
+	 */
+	for (uint32_t i = 0; i < handle_count; i++) {
+		out_handles[i] = -1;
+	}
+
 	// Did the other side actually send file descriptors.
 	struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-	if (cmsg == NULL) {
+	if (cmsg == NULL || cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS ||
+	    cmsg->cmsg_len < CMSG_LEN(0)) {
 		return XRT_SUCCESS;
 	}
 
-	memcpy(out_handles, (int *)CMSG_DATA(cmsg), fds_size);
+	// Copy only the descriptors that actually arrived (the kernel discards any
+	// beyond our control buffer and sets MSG_CTRUNC).
+	size_t received = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+	if (received > handle_count) {
+		received = handle_count;
+	}
+	memcpy(out_handles, (int *)CMSG_DATA(cmsg), received * sizeof(int));
 
 	return XRT_SUCCESS;
 }

@@ -6328,6 +6328,30 @@ ipc_handle_weave_set_screen_flat_regions(volatile struct ipc_client_state *ics,
 #endif
 }
 
+/*!
+ * Release graphics-buffer handles a weave_submit received but is not handing to
+ * a weave engine. The IPC receive installs them in this process and nobody else
+ * owns them, so every return path that does not pass them on must drop them.
+ *
+ * Only POSIX handle kinds (fd, AHardwareBuffer, IOSurfaceRef) are released here;
+ * u_graphics_buffer_unref skips invalid slots (the fd receive marks unfilled
+ * slots -1). Win32 handles carry a DXGI-vs-NT low-bit tag and are the D3D11
+ * service's business, so this is a no-op there.
+ */
+static void
+weave_submit_release_handles(const xrt_graphics_buffer_handle_t *handles, uint32_t handle_count)
+{
+#if !defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
+	for (uint32_t i = 0; i < handle_count; i++) {
+		xrt_graphics_buffer_handle_t h = handles[i];
+		u_graphics_buffer_unref(&h);
+	}
+#else
+	(void)handles;
+	(void)handle_count;
+#endif
+}
+
 xrt_result_t
 ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
                         const struct ipc_arg_weave_submit *args,
@@ -6344,6 +6368,7 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	*out_have_output = false;
 	xrt_result_t auth = require_present_owner(ics, "weave_submit");
 	if (auth != XRT_SUCCESS) {
+		weave_submit_release_handles(handles, handle_count);
 		return auth;
 	}
 	*out_width = 0;
@@ -6354,6 +6379,7 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	if (ics->xc == NULL) {
 		// Client state, not transport — same code the bind/geometry/flat
 		// siblings already return for this (browser#103).
+		weave_submit_release_handles(handles, handle_count);
 		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
 	}
 	if (handle_count < 1) {
@@ -6558,8 +6584,12 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	*out_eyes = eyes;
 	return XRT_SUCCESS;
 #else
+	// No weave engine in this build (e.g. desktop Linux until #1699 R2). The
+	// handles are still ours: on an fd platform they are live descriptors the
+	// kernel installed in this process, so refusing without closing them leaks
+	// one per submit — a present-owner retrying every frame exhausts the fd table.
 	(void)args;
-	(void)handles;
+	weave_submit_release_handles(handles, handle_count);
 	return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 #endif
 }
