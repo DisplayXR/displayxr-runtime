@@ -513,6 +513,16 @@ private:
 	bool m_wl_drag_have_base = false;
 	uint64_t m_wl_drag_seq_at_start = 0;
 	uint32_t m_wl_drag_unmoved_requests = 0;
+	// One request in flight at a time; the newest target waits here.
+	int32_t m_wl_drag_pending_x = 0, m_wl_drag_pending_y = 0;
+	bool m_wl_drag_have_pending = false;
+	int32_t m_wl_drag_sent_x = 0, m_wl_drag_sent_y = 0;
+	bool m_wl_drag_inflight = false;
+	uint64_t m_wl_drag_inflight_seq = 0;
+	int64_t m_wl_drag_inflight_ns = 0;
+	void
+	wl_drag_flush();
+
 	//! Set once the compositor has proved it will not move this window; every
 	//! later press then goes to the compositor's own drag.
 	bool m_wl_client_drag_broken = false;

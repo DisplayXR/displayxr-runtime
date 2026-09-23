@@ -114,6 +114,14 @@ public:
 		return m_refusals;
 	}
 
+	/*!
+	 * Move this process's window so its FRAME's top-left is at @p x / @p y
+	 * (logical stage px). Fire-and-forget, and absolute — so re-sending is
+	 * idempotent, unlike move_by().
+	 */
+	bool
+	move_to(int32_t x, int32_t y);
+
 	//! Human-readable state for the create log.
 	const char *
 	describe() const;

@@ -201,6 +201,32 @@ DxrWlPlacement::move_by(int32_t dx, int32_t dy)
 	return sent;
 }
 
+bool
+DxrWlPlacement::move_to(int32_t x, int32_t y)
+{
+	if (!m_available || m_conn == nullptr) {
+		return false;
+	}
+	DBusMessage *call = dbus_message_new_method_call(WLP_BUS, WLP_PATH, WLP_IFACE, "MoveWindow");
+	if (call == nullptr) {
+		return false;
+	}
+	// ABSOLUTE and fire-and-forget. Re-sending an absolute target is
+	// idempotent: there is nothing to accumulate, so a request that raced a
+	// report cannot compound the way a relative step did (measured: relative
+	// steps against asynchronous reports oscillated to 1.4k px off the
+	// pointer on hardware).
+	dbus_message_set_no_reply(call, TRUE);
+	dbus_uint32_t pid = 0;
+	dbus_int32_t ax = (dbus_int32_t)x, ay = (dbus_int32_t)y;
+	dbus_message_append_args(call, DBUS_TYPE_UINT32, &pid, DBUS_TYPE_INT32, &ax, DBUS_TYPE_INT32, &ay,
+	                         DBUS_TYPE_INVALID);
+	const bool sent = dbus_connection_send((DBusConnection *)m_conn, call, nullptr) == TRUE;
+	dbus_message_unref(call);
+	dbus_connection_flush((DBusConnection *)m_conn);
+	return sent;
+}
+
 void
 DxrWlPlacement::disconnect()
 {
@@ -232,6 +258,14 @@ DxrWlPlacement::move_by(int32_t dx, int32_t dy)
 void
 DxrWlPlacement::poll()
 {
+}
+
+bool
+DxrWlPlacement::move_to(int32_t x, int32_t y)
+{
+	(void)x;
+	(void)y;
+	return false;
 }
 
 bool

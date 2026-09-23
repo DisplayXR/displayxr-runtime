@@ -1338,6 +1338,10 @@ DxrLinuxWindow::wl_drag_begin()
 	m_wl_drag_obs_y = m_wl_drag_base_y;
 	m_wl_drag_seq_at_start = m_wl_placement.observed_seq();
 	m_wl_drag_unmoved_requests = 0;
+	m_wl_drag_have_pending = false;
+	m_wl_drag_inflight = false;
+	m_wl_drag_sent_x = m_wl_drag_base_x;
+	m_wl_drag_sent_y = m_wl_drag_base_y;
 	m_wl_drag_moves = 0;
 	m_wl_drag_requests = 0;
 	m_wl_drag_snapped = 0;
@@ -1413,47 +1417,23 @@ DxrLinuxWindow::wl_drag_move(double dx_logical, double dy_logical)
 		m_wl_drag_snapped++;
 	}
 
-	// The step is measured from where the window IS, so a request that was
-	// never applied is simply re-issued rather than compounded.
-	const int32_t step_x = reach_x / q - moved_x;
-	const int32_t step_y = reach_y / q - moved_y;
-	if (step_x == 0 && step_y == 0) {
-		return;
-	}
-	if (!m_wl_placement.move_by(step_x, step_y)) {
-		return;
-	}
-	m_wl_drag_requests++;
-	m_wl_drag_applied_x = moved_x + step_x;
-	m_wl_drag_applied_y = moved_y + step_y;
-
 	/*
-	 * WATCHDOG. If the compositor is not moving the window, an app-owned drag
-	 * costs the user the ability to drag at all — strictly worse than the
-	 * shimmer it exists to remove. After a few requests with no movement
-	 * reported, give up: end this gesture, mark the path unusable for the
-	 * session, and let every later press go to the compositor's own drag
-	 * (which cannot be handed the current gesture — xdg_toplevel.move needs a
-	 * serial from a fresh button press).
+	 * ABSOLUTE target, AT MOST ONE REQUEST IN FLIGHT.
+	 *
+	 * Relative steps against asynchronous reports are an oscillator: several
+	 * motion events fire before the compositor's report of the previous move
+	 * arrives, each computes "target minus where the window was last seen",
+	 * and the same outstanding distance is sent two or three times. Measured on
+	 * a laptop output: the window ended 1.4k px from the pointer. An absolute
+	 * target has nothing to accumulate, and holding back until the previous
+	 * request is reported means the compositor only ever sees the newest.
 	 */
-	if (m_wl_placement.observed_seq() == m_wl_drag_seq_at_start && ++m_wl_drag_unmoved_requests >= 5) {
-		m_wl_client_drag = false;
-		m_wl_client_drag_broken = true;
-		// Name WHICH failure this is: the compositor answering "refused" and the
-		// compositor never answering are different bugs with different fixes.
-		DXRW_WARN("drag: the window did not move after %u requests — abandoning the app-owned drag for "
-		          "this session; press and drag again for the compositor's own (unsnapped) drag. The "
-		          "compositor sent %llu report(s), %llu of them REFUSALS. %s",
-		          m_wl_drag_unmoved_requests, (unsigned long long)m_wl_placement.reports(),
-		          (unsigned long long)m_wl_placement.refusals(),
-		          m_wl_placement.refusals() > 0
-		              ? "A refusal means the compositor declined to move the window — see the shell's "
-		                "journal for 'MoveWindowBy REFUSED' and the reason."
-		              : "No refusals, so the moves were accepted and did not stick (or the report never "
-		                "arrived) — see the shell's journal for 'MoveWindowBy' / 'REVERTED' lines.");
-		return;
-	}
-
+	const int32_t target_x = m_wl_drag_base_x + reach_x / q;
+	const int32_t target_y = m_wl_drag_base_y + reach_y / q;
+	m_wl_drag_pending_x = target_x;
+	m_wl_drag_pending_y = target_y;
+	m_wl_drag_have_pending = true;
+	wl_drag_flush();
 	// DXR_WL_DRAG_TRACE=1: one line per request, with the time since the press.
 	// Paired with the runtime's own `present origin:` lines (same log, same
 	// process) it measures how long a requested move takes to become the
@@ -1466,10 +1446,65 @@ DxrLinuxWindow::wl_drag_move(double dx_logical, double dy_logical)
 		const int64_t t_ns = (int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
 		                         std::chrono::steady_clock::now().time_since_epoch())
 		                         .count();
-		DXRW_INFO("drag trace: request #%llu at t=%.1f ms — step (%+d, %+d) logical; the window has MOVED "
-		          "(%+d, %+d) logical so far, pointer asks for (%+d, %+d) device, snapped to (%+d, %+d)",
-		          (unsigned long long)m_wl_drag_requests, (double)(t_ns - m_wl_drag_start_ns) / 1000000.0,
-		          step_x, step_y, moved_x, moved_y, want_dev_x, want_dev_y, reach_x, reach_y);
+		DXRW_INFO("drag trace: motion at t=%.1f ms — target (%+d, %+d) logical from the base; the window has "
+		          "MOVED (%+d, %+d) so far; pointer asks for (%+d, %+d) device, snapped to (%+d, %+d); %s",
+		          (double)(t_ns - m_wl_drag_start_ns) / 1000000.0, reach_x / q, reach_y / q, moved_x, moved_y,
+		          want_dev_x, want_dev_y, reach_x, reach_y,
+		          m_wl_drag_inflight ? "held (a request is in flight)" : "sent");
+	}
+}
+
+void
+DxrLinuxWindow::wl_drag_flush()
+{
+	if (!m_wl_client_drag || !m_wl_drag_have_pending) {
+		return;
+	}
+	const int64_t now_ns = (int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                           std::chrono::steady_clock::now().time_since_epoch())
+	                           .count();
+	// A report retires the request in flight. So does a timeout: a refused
+	// move produces no WindowMoved report with applied=true, and a drag that
+	// waited for one forever would freeze.
+	if (m_wl_drag_inflight &&
+	    (m_wl_placement.observed_seq() != m_wl_drag_inflight_seq || now_ns - m_wl_drag_inflight_ns > 100000000)) {
+		m_wl_drag_inflight = false;
+	}
+	if (m_wl_drag_inflight) {
+		return; // hold the newest target until the previous one is reported
+	}
+	if (m_wl_drag_pending_x == m_wl_drag_sent_x && m_wl_drag_pending_y == m_wl_drag_sent_y &&
+	    m_wl_drag_requests > 0) {
+		m_wl_drag_have_pending = false;
+		return; // already there (or already asked)
+	}
+	if (!m_wl_placement.move_to(m_wl_drag_pending_x, m_wl_drag_pending_y)) {
+		return;
+	}
+	m_wl_drag_requests++;
+	m_wl_drag_sent_x = m_wl_drag_pending_x;
+	m_wl_drag_sent_y = m_wl_drag_pending_y;
+	m_wl_drag_have_pending = false;
+	m_wl_drag_inflight = true;
+	m_wl_drag_inflight_seq = m_wl_placement.observed_seq();
+	m_wl_drag_inflight_ns = now_ns;
+
+	/*
+	 * WATCHDOG. If the compositor never reports a move, an app-owned drag
+	 * costs the user the ability to drag at all — strictly worse than the
+	 * shimmer it exists to remove. After a few unreported requests, end this
+	 * gesture and the path for the session; later presses go to the
+	 * compositor's own drag. (This gesture cannot be handed over:
+	 * xdg_toplevel.move needs a serial from a fresh button press.)
+	 */
+	if (m_wl_placement.observed_seq() == m_wl_drag_seq_at_start && ++m_wl_drag_unmoved_requests >= 5) {
+		m_wl_client_drag = false;
+		m_wl_client_drag_broken = true;
+		DXRW_WARN("drag: the window did not move after %u requests — abandoning the app-owned drag for "
+		          "this session; press and drag again for the compositor's own (unsnapped) drag. The "
+		          "compositor sent %llu report(s), %llu of them REFUSALS.",
+		          m_wl_drag_unmoved_requests, (unsigned long long)m_wl_placement.reports(),
+		          (unsigned long long)m_wl_placement.refusals());
 	}
 }
 
@@ -2148,8 +2183,10 @@ DxrLinuxWindow::pump(const std::function<void(DxrKey)> &on_key, bool *running)
 		publish_wayland_geometry_if_changed();
 #ifdef DXR_APP_HAVE_WL_CHROME
 		// Drain WindowMoved even between motion events, so a drag that ends
-		// with the window still catching up reports where it really landed.
+		// with the window still catching up reports where it really landed —
+		// and send the newest held target once the previous one is reported.
 		m_wl_placement.poll();
+		wl_drag_flush();
 #endif
 
 		for (DxrKey k : m_wl_key_queue) {
