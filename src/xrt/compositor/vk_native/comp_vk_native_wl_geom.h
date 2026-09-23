@@ -117,6 +117,15 @@ struct comp_vk_native_wl_window_rect
 	 */
 	bool moving;
 	bool have_moving;
+
+	/*!
+	 * The window's last drag ran on the drag lattice and ENDED on it, and the
+	 * window has not moved since (publisher version 7). The lattice already
+	 * chose this position with the same display-processor oracle, so the
+	 * drop-time snap must accept it rather than pick a neighbour of its own:
+	 * two owners of the last 2 px is how a drop ping-pongs. False when absent.
+	 */
+	bool lattice_drop;
 };
 
 /*!

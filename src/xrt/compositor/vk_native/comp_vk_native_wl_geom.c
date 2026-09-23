@@ -90,6 +90,9 @@ struct wlg_window
 	//! An interactive grab is running on this window (publisher v3+).
 	bool moving;
 	bool have_moving;
+	//! The last drag ended on the drag lattice and the window has not moved
+	//! since (publisher v7+; false when absent).
+	bool lattice_drop;
 };
 
 #define WLG_MAX_WINDOWS 64
@@ -202,6 +205,11 @@ wlg_parse_snapshot(struct comp_vk_native_wl_geom *g, const char *json)
 			out->moving = is_moving;
 			out->have_moving = true;
 		}
+
+		// Publisher v7+: the drag lattice owns this drop (#1609 follow-up).
+		bool lattice_drop = false;
+		u_json_get_bool(u_json_get(win, "lattice_drop"), &lattice_drop);
+		out->lattice_drop = lattice_drop;
 
 		// The monitor rect + scale are what make the logical payload
 		// convertible (#1596). Schema v1 has published them since #817; they
@@ -633,6 +641,7 @@ comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g, struct 
 	out_rect->frame_logical_y = best->logical_y;
 	out_rect->moving = best->moving;
 	out_rect->have_moving = best->have_moving;
+	out_rect->lattice_drop = best->lattice_drop;
 
 	out_rect->left_px = win_px.x;
 	out_rect->top_px = win_px.y;
