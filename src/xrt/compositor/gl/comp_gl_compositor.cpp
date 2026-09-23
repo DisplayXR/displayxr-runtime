@@ -283,15 +283,29 @@ static const char *FS_TEXTURED =
  * scaled by the layer size in the model matrix, emitted as a 4-vertex triangle
  * strip generated from `gl_VertexID`.
  *
- * ── Y CONVENTION — ONE quad-local flip, and a Y-UP projection ──
+ * ── Y CONVENTION — the TEXTURE origin, and the CLIP-space origin ──
  *
- * There are exactly two places a Y convention can enter, and OpenGL needs one
- * of each — the same pairing `comp_d3d11_renderer.cpp` settled on in #1580:
+ * Two INDEPENDENT conventions, and GL differs from D3D on exactly one of them.
  *
- *   - `pos.y = -pos.y` (quad-local, BEFORE the model matrix) — the flip
- *     `shaders/layer_quad.vert` already has. It pairs the texture's TOP row
- *     with the quad's TOP edge in OpenXR's +Y-up quad space. Without it the
- *     texture is drawn upside down. Kept here.
+ *   - THE TEXTURE ORIGIN — where GL genuinely is the odd one out.
+ *     `shaders/layer_quad.vert` and both D3D quad vertex shaders pair uv
+ *     `v = 0` with the quad's TOP edge (D3D11 spells it `pos.y = -pos.y`,
+ *     D3D12 bakes it into its uv table), because a D3D texture's row 0 IS the
+ *     top of the image. A GL swapchain image is a plain GL texture the app
+ *     renders into through an FBO, so its row 0 is the BOTTOM of the image and
+ *     `v = 1` is the top. That quad-local flip is therefore exactly wrong
+ *     here, and this shader does NOT carry it: uv `v` runs with the quad's
+ *     +Y.
+ *
+ *     The projection blit is the oracle. It maps the bottom of the tile to
+ *     `v = 0` (VS_FULLSCREEN_QUAD, `u_flip_y` pinned to 0 at the atlas pass)
+ *     and is right on the panel, so a quad sampling the same kind of
+ *     swapchain must agree with it or the two disagree about which way is up
+ *     for the SAME world pose. #1581 shipped with the D3D flip copied over
+ *     verbatim: every quad's texture — the CTS title and the "Press Select"
+ *     prompt above all — came out upside down, while the quad's PLACEMENT,
+ *     symmetric about its own centre, still measured right. A placement
+ *     measurement cannot see this bug; only reading the label can.
  *   - The PROJECTION's clip convention. `math_matrix_4x4_projection_vulkan_infinite_reverse`
  *     is Y-DOWN (`a22 < 0`, Vulkan's NDC `+y` is the BOTTOM of the
  *     framebuffer); `math_matrix_4x4_projection_d3d_infinite_reverse` is the
@@ -299,11 +313,12 @@ static const char *FS_TEXTURED =
  *     **GL takes the D3D one**, because GL's NDC `+y` is the TOP of the
  *     viewport, exactly like D3D's, D3D12's and Metal's.
  *
- * "GL's framebuffer origin is bottom-left, so its Y must be the odd one out"
- * is the trap. The framebuffer-origin convention and the NDC convention are
- * independent: GL's `glViewport` measures from the bottom AND its NDC `+y` is
- * up, which is self-consistent, and leaves Vulkan as the only Y-DOWN clip
- * space of the five backends.
+ * "GL's framebuffer origin is bottom-left, so its CLIP Y must be the odd one
+ * out too" is the trap. The framebuffer-origin convention and the NDC
+ * convention are independent: GL's `glViewport` measures from the bottom AND
+ * its NDC `+y` is up, which is self-consistent, and leaves Vulkan as the only
+ * Y-DOWN clip space of the five backends. The bottom-left framebuffer origin
+ * pays out in the TEXTURE bullet above, not this one.
  *
  * Proven on sim_display with `DXR_TEST_QUAD=1` (823 px tile, canvas
  * 0.3012 × 0.1640 m, per-view fov L/R/U/D (-0.198, 0.292, -0.025, -0.290) rad —
@@ -330,8 +345,10 @@ static const char *VS_QUAD =
     "    vec2 corners[4] = vec2[4](vec2(0.0, 0.0), vec2(0.0, 1.0),\n"
     "                              vec2(1.0, 0.0), vec2(1.0, 1.0));\n"
     "    vec2 in_uv = corners[gl_VertexID % 4];\n"
+    // No quad-local Y negation: a GL texture's v = 1 IS the top of the image,
+    // so uv v runs WITH the quad's +Y. The D3D shaders' `pos.y = -pos.y`
+    // belongs to their top-left texture origin — see the block comment above.
     "    vec2 pos = in_uv - 0.5;\n"
-    "    pos.y = -pos.y;\n"                     // texture top <-> quad top (+Y up)
     // u_mvp carries the Y-UP (D3D-convention) projection — see the block
     // comment above; no clip-space negation here.
     "    gl_Position = u_mvp * vec4(pos, 0.0, 1.0);\n"

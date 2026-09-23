@@ -1576,12 +1576,22 @@ static bool CreateSwapchain(AppXrSession &app)
 //                                     is fully opaque. Three quads, three
 //                                     outcomes, one texture (#1621).
 //
-// Rows are authored TOP-DOWN (row 0 = the image's top) and uploaded with
-// glTexSubImage2D, so uv.y = 0 is the top — the same mapping the Metal probe
-// gets from replaceRegion. That is what VS_QUAD's `pos.y = -pos.y` pairs with.
-// (A GL app that RENDERS into its swapchain instead gets the opposite
-// orientation and signals it with XR_COMPOSITION_LAYER_IMAGE_LAYOUT_VERTICAL_FLIP_BIT_FB
-// -> xrt_layer_data::flip_y, which the compositor honours in post_transform.)
+// Rows are authored TOP-DOWN (row 0 = the image's top) and uploaded
+// ROW-REVERSED, so the GL texture's v = 1 is the top of the picture. #1581's
+// GL leg: a GL swapchain image's v = 0 is its BOTTOM — that is what an app
+// rendering into it through an FBO produces, what the OpenXR CTS's OpenGL
+// plugin produces (it uploads a CPU image a row at a time in reverse for
+// exactly this reason), and what VS_QUAD now pairs with.
+//
+// This probe originally uploaded TOP-DOWN and so matched VS_QUAD's old, copied
+// -from-D3D `pos.y = -pos.y`. Two wrongs that cancelled: the probe read upright
+// while every real GL app's quad — the CTS title and prompt labels included —
+// came out upside down. The Metal probe is unaffected; a Metal texture's row 0
+// really is the top, which is why the Metal shader keeps its flip.
+//
+// (An app that genuinely hands over a top-down image says so with
+// XR_COMPOSITION_LAYER_IMAGE_LAYOUT_VERTICAL_FLIP_BIT_FB -> xrt_layer_data::flip_y,
+// which the compositor honours in post_transform.)
 static bool CreateAndFillQuadTexture(AppXrSession &app, uint32_t size)
 {
     XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
@@ -1689,8 +1699,12 @@ static bool CreateAndFillQuadTexture(AppXrSession &app, uint32_t size)
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev);
     glBindTexture(GL_TEXTURE_2D, imgs[idx].image);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)size, (GLsizei)size,
-                    GL_RGBA, GL_UNSIGNED_BYTE, buf);
+    // ROW-REVERSED — picture row 0 (the top) lands at the texture's LAST row.
+    // See the block comment: a GL swapchain image's v = 0 is its bottom.
+    for (uint32_t row = 0; row < size; row++) {
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, (GLint)(size - 1 - row), (GLsizei)size, 1,
+                        GL_RGBA, GL_UNSIGNED_BYTE, buf + (size_t)row * stride);
+    }
     glBindTexture(GL_TEXTURE_2D, (GLuint)prev);
     g_quadGLTexture = imgs[idx].image;
     free(buf);
