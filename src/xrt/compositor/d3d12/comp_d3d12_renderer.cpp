@@ -140,6 +140,83 @@ float4 main(VS_OUTPUT input) : SV_Target {
 }
 )";
 
+// #1581 — WORLD-space quad layer vertex shader (XrCompositionLayerQuad).
+//
+// A second VS rather than a reuse of quad_vs_source above, because the two
+// disagree on where v = 0 lands. The window-space VS derives the position FROM
+// the uv (`pos = in_uv - 0.5`), so v = 0 sits at the BOTTOM of the quad, and
+// its caller compensates with a negative Y scale in the orthographic MVP it
+// builds by hand. A world-space quad's MVP comes from math_matrix_4x4_model /
+// _view_from_pose / _projection_d3d_infinite_reverse and carries no such flip,
+// so the mapping has to be right here: the quad's +Y (the spec's "up") takes
+// v = 0, the top of the image. Same vertex order and the same [-0.5, 0.5] unit
+// quad as the D3D11 reference (d3d11/shaders/layer_quad.hlsl), so both legs
+// rasterize the same triangle strip.
+static const char *quad_layer_vs_source = R"(
+cbuffer LayerCB : register(b0) {
+	float4x4 mvp;
+	float4 post_transform;
+	float4 color_scale;
+	float4 color_bias;
+};
+
+struct VS_OUTPUT {
+	float4 position : SV_Position;
+	float2 uv : TEXCOORD0;
+};
+
+static const float2 quad_positions[4] = {
+	float2(-0.5, -0.5),
+	float2(-0.5,  0.5),
+	float2( 0.5, -0.5),
+	float2( 0.5,  0.5),
+};
+
+static const float2 quad_uvs[4] = {
+	float2(0.0, 1.0),
+	float2(0.0, 0.0),
+	float2(1.0, 1.0),
+	float2(1.0, 0.0),
+};
+
+VS_OUTPUT main(uint vertex_id : SV_VertexID) {
+	VS_OUTPUT output;
+	float2 pos = quad_positions[vertex_id % 4];
+	output.position = mul(mvp, float4(pos, 0.0, 1.0));
+	output.uv = quad_uvs[vertex_id % 4] * post_transform.zw + post_transform.xy;
+	return output;
+}
+)";
+
+// #1581/#1601 — the Texture2DArray twin of quad_ps_source, for a quad whose
+// swapchain is layered (arraySize > 1, the single-pass-instanced shape). The
+// slice comes down as array_params.x, which extends the constant buffer to 32
+// DWORDs; the plain variant and the window-space path keep reading the first
+// 28 and are unaffected. Byte-aligned with the D3D11 quad_ps_array_source.
+static const char *quad_layer_ps_array_source = R"(
+cbuffer LayerCB : register(b0) {
+	float4x4 mvp;
+	float4 post_transform;
+	float4 color_scale;
+	float4 color_bias;
+	float4 array_params;   // x = array slice
+};
+
+Texture2DArray layer_tex : register(t0);
+SamplerState layer_samp : register(s0);
+
+struct VS_OUTPUT {
+	float4 position : SV_Position;
+	float2 uv : TEXCOORD0;
+};
+
+float4 main(VS_OUTPUT input) : SV_Target {
+	float4 color = layer_tex.Sample(layer_samp, float3(input.uv, array_params.x));
+	color = color * color_scale + color_bias;
+	return color;
+}
+)";
+
 // Masked 2D-over-3D composite (#439 cross-API leg). Keep byte-aligned with
 // the D3D11 reference (comp_d3d11_renderer.cpp / shaders/masked_composite.hlsl).
 // The lerp path samples the authored mask (t1) against the weave snapshot (t2);
@@ -351,6 +428,22 @@ struct comp_d3d12_renderer
 
 	//! Quad PSO with premultiplied alpha blending.
 	ID3D12PipelineState *quad_pso_premul;
+
+	/*!
+	 * #1581 — WORLD-space quad LAYER pipelines (XrCompositionLayerQuad),
+	 * indexed [source is a Texture2DArray][blend slot]. Distinct from the
+	 * quad_pso pair above, which is the window-space / Local2D channel: a
+	 * different vertex shader (see quad_layer_vs_source) and a blend set
+	 * driven by the SHARED three-way rule rather than by a local flag test.
+	 *
+	 * Three blend slots, not four: a quad paints a SUB-RECT of the tile, so
+	 * it can never be that tile's base cover and COMP_LAYER_BLEND_REPLACE is
+	 * unreachable (comp_layer_subrect_blend_mode). OPAQUE_COVER shares the
+	 * blending-OFF state with it and differs in the alpha the PIXEL SHADER
+	 * emits, which comp_layer_blend_fold_opaque_cover() folds into the
+	 * colour scale/bias — so the state is the opaque slot.
+	 */
+	ID3D12PipelineState *quad_layer_pso[2][3];
 
 	//! Root signature for the masked 2D-over-3D composite (#439).
 	ID3D12RootSignature *composite_root_signature;
@@ -594,6 +687,40 @@ get_color_scale_bias(const struct xrt_layer_data *data, float color_scale[4], fl
 
 
 /*!
+ * Blend slots of @ref comp_d3d12_renderer::quad_layer_pso — see there for why
+ * there are three of them and not four.
+ */
+enum quad_layer_blend_slot
+{
+	QUAD_LAYER_BLEND_SLOT_OPAQUE = 0,   //!< blending disabled
+	QUAD_LAYER_BLEND_SLOT_PREMUL = 1,   //!< SrcBlend = ONE
+	QUAD_LAYER_BLEND_SLOT_STRAIGHT = 2, //!< SrcBlend = SRC_ALPHA
+};
+
+/*!
+ * The quad-layer PSO that implements one shared blend mode (#1599).
+ *
+ * @param layered Does the layer's swapchain need the Texture2DArray variant?
+ */
+static ID3D12PipelineState *
+quad_layer_pso_for(struct comp_d3d12_renderer *r, enum comp_layer_blend_mode mode, bool layered)
+{
+	const uint32_t tex = layered ? 1u : 0u;
+
+	switch (mode) {
+	case COMP_LAYER_BLEND_PREMULTIPLIED: return r->quad_layer_pso[tex][QUAD_LAYER_BLEND_SLOT_PREMUL];
+	case COMP_LAYER_BLEND_STRAIGHT: return r->quad_layer_pso[tex][QUAD_LAYER_BLEND_SLOT_STRAIGHT];
+	case COMP_LAYER_BLEND_REPLACE:
+	case COMP_LAYER_BLEND_OPAQUE_COVER:
+	default:
+		// Unlike the blit path below, OPAQUE_COVER is honoured in full
+		// here: the blending-off state, plus the alpha-of-one the caller
+		// folds into the colour scale/bias this shader already applies.
+		return r->quad_layer_pso[tex][QUAD_LAYER_BLEND_SLOT_OPAQUE];
+	}
+}
+
+/*!
  * The blit PSO that implements one shared blend mode (#1598/#1599) for a
  * FULL-TILE projection-class draw.
  *
@@ -774,6 +901,238 @@ render_window_space_layer(struct comp_d3d12_renderer *r,
 	cmd_list->DrawInstanced(4, 1, 0, 0);
 
 	// Transition swapchain image back to RENDER_TARGET
+	src_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+	src_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	cmd_list->ResourceBarrier(1, &src_barrier);
+}
+
+
+/*!
+ * Render one `XrCompositionLayerQuad` into every view tile it is visible in
+ * (#1581). Ported from the D3D11 reference render_quad_layer(), and sharing
+ * every policy decision with it through comp_layer_view_camera.h.
+ *
+ * Loops the views internally rather than once per view, so the source image is
+ * transitioned and given an SRV descriptor ONCE per layer instead of once per
+ * tile — D3D12 reads descriptors at GPU-execute time, so a slot cannot be
+ * reused across draws, and the heap holds 16.
+ *
+ * @param cameras This frame's per-view cameras (#1580) — the SAME ones the
+ *                projection blit's tiles were framed by, which is the whole
+ *                point: a quad composed through any other camera lands on
+ *                different display pixels than projection content at the same
+ *                world pose.
+ * @param tiles   Per-view painter's-order state (#1598). A quad MARKS the tile
+ *                it painted, so a projection layer submitted after it blends
+ *                over it, but it can never take the base slot.
+ */
+static void
+render_quad_layer(struct comp_d3d12_renderer *r,
+                  ID3D12GraphicsCommandList *cmd_list,
+                  const struct comp_layer *layer,
+                  uint32_t view_count,
+                  const struct comp_layer_view_camera *cameras,
+                  struct comp_layer_tile_state *tiles,
+                  uint32_t target_width,
+                  uint32_t target_height,
+                  const struct comp_d3d12_eff_layout *layout)
+{
+	auto internals = get_internals(r->c);
+	ID3D12Device *device = internals->device;
+	const struct xrt_layer_data *data = &layer->data;
+	const struct xrt_layer_quad_data *q = &data->quad;
+
+	/*
+	 * Which tiles does this quad reach at all? Per-eye visibility is
+	 * view-count aware (#1580) — the local `view_index == 0 / == 1` rule the
+	 * other backends started from silently dropped an eye-specific quad in
+	 * every view beyond the second, which a 2x2 quad mode has — and #1590's
+	 * facing test is a PREDICATE, not rasterizer culling: every pipeline in
+	 * the tree is CULL_NONE, and the quad is turned away per EYE, which is
+	 * exactly what the CTS QuadOcclusion case looks for.
+	 *
+	 * Resolved up front so a quad no view can see costs no barrier and no
+	 * descriptor slot.
+	 */
+	bool visible[XRT_MAX_VIEWS] = {};
+	bool any_visible = false;
+	for (uint32_t vi = 0; vi < view_count && vi < XRT_MAX_VIEWS; vi++) {
+		visible[vi] = is_layer_view_visible_n(data, vi, view_count) &&
+		              comp_layer_quad_is_front_facing(&q->pose, &cameras[vi].pose.position);
+		any_visible = any_visible || visible[vi];
+	}
+	if (!any_visible) {
+		return;
+	}
+
+	struct xrt_swapchain *xsc = layer->sc_array[0];
+	if (xsc == nullptr) {
+		return;
+	}
+
+	ID3D12Resource *src_resource =
+	    static_cast<ID3D12Resource *>(comp_d3d12_swapchain_get_resource(xsc, q->sub.image_index));
+	if (src_resource == nullptr) {
+		return;
+	}
+
+	// One descriptor for the whole layer: the source, the slice and the
+	// sampler are the same in every view — only the MVP, which rides in root
+	// constants, differs. Root constants ARE versioned per draw.
+	uint32_t srv_slot = r->next_srv_slot++;
+	if (srv_slot >= r->srv_heap_size) {
+		U_LOG_E("D3D12 renderer: SRV heap overflow in quad layer (slot %u >= %u)", srv_slot, r->srv_heap_size);
+		return;
+	}
+
+	// #1581/#1601: honour the quad's subImage.imageArrayIndex. Gated on the
+	// SWAPCHAIN's array size, not on array_index != 0 — it is the SRV's VIEW
+	// DIMENSION that has to match the shader's declaration, so even slice 0
+	// of an array swapchain belongs on the Texture2DArray variant. The whole
+	// array is viewed and the slice picked in the shader (array_params.x),
+	// which is what the D3D11 leg does; the projection blit pins the slice in
+	// the SRV instead, and the two must not be confused.
+	const D3D12_RESOURCE_DESC src_desc = src_resource->GetDesc();
+	const bool layered = src_desc.DepthOrArraySize > 1;
+
+	D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+	// Sample as UNORM, never the sRGB sibling: the DP wants display-referred
+	// bytes, so no auto-decode (#1503 resolves the app's requested format,
+	// since the image itself is TYPELESS).
+	srv_desc.Format = comp_d3d12_swapchain_sample_format(src_resource);
+	srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	if (layered) {
+		srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+		srv_desc.Texture2DArray.MostDetailedMip = 0;
+		srv_desc.Texture2DArray.MipLevels = 1;
+		srv_desc.Texture2DArray.FirstArraySlice = 0;
+		srv_desc.Texture2DArray.ArraySize = src_desc.DepthOrArraySize;
+		srv_desc.Texture2DArray.PlaneSlice = 0;
+	} else {
+		srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+		srv_desc.Texture2D.MipLevels = 1;
+	}
+
+	D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu = r->srv_heap->GetCPUDescriptorHandleForHeapStart();
+	srv_cpu.ptr += r->srv_descriptor_size * srv_slot;
+	device->CreateShaderResourceView(src_resource, &srv_desc, srv_cpu);
+
+	D3D12_GPU_DESCRIPTOR_HANDLE gpu_srv = r->srv_heap->GetGPUDescriptorHandleForHeapStart();
+	gpu_srv.ptr += r->srv_descriptor_size * srv_slot;
+
+	// #747: a released swapchain image IS in RENDER_TARGET per
+	// XR_KHR_D3D12_enable, and must be handed back in it.
+	D3D12_RESOURCE_BARRIER src_barrier = {};
+	src_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	src_barrier.Transition.pResource = src_resource;
+	src_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	src_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+	src_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	cmd_list->ResourceBarrier(1, &src_barrier);
+
+	ID3D12DescriptorHeap *heaps[] = {r->srv_heap};
+	cmd_list->SetDescriptorHeaps(1, heaps);
+	cmd_list->SetGraphicsRootSignature(r->quad_root_signature);
+	cmd_list->SetGraphicsRootDescriptorTable(0, gpu_srv);
+
+	D3D12_CPU_DESCRIPTOR_HANDLE rtv = r->rtv_heap->GetCPUDescriptorHandleForHeapStart();
+	cmd_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+	cmd_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+
+	// Same mono clamp the projection and window-space passes apply.
+	uint32_t vp_w = layout->tile_w;
+	uint32_t vp_h = layout->tile_h;
+	if (layout->views == 1) {
+		if (target_width < layout->tile_w) {
+			vp_w = target_width;
+		}
+		if (target_height < r->texture_height) {
+			vp_h = target_height;
+		}
+	}
+
+	for (uint32_t vi = 0; vi < view_count && vi < XRT_MAX_VIEWS; vi++) {
+		if (!visible[vi]) {
+			continue;
+		}
+
+		// Model * view * projection, through THIS view's camera. The
+		// projection is the D3D (Y-up, infinite-far, reversed-depth) clip
+		// space, shared with D3D11 — the Vulkan variant negates row 1 and
+		// would mirror every quad about the tile's horizontal centre line
+		// relative to the projection layer's blit (#1580).
+		struct xrt_matrix_4x4 model, view, proj, mv, mvp;
+		const struct xrt_vec3 scale = {q->size.x, q->size.y, 1.0f};
+		math_matrix_4x4_model(&q->pose, &scale, &model);
+		math_matrix_4x4_view_from_pose(&cameras[vi].pose, &view);
+		math_matrix_4x4_projection_d3d_infinite_reverse(&cameras[vi].fov, 0.1f, &proj);
+		math_matrix_4x4_multiply(&view, &model, &mv);
+		math_matrix_4x4_multiply(&proj, &mv, &mvp);
+
+		float post_transform[4] = {q->sub.norm_rect.x, q->sub.norm_rect.y, q->sub.norm_rect.w,
+		                           q->sub.norm_rect.h};
+		if (data->flip_y) {
+			post_transform[1] += post_transform[3];
+			post_transform[3] = -post_transform[3];
+		}
+
+		float color_scale[4];
+		float color_bias[4];
+		get_color_scale_bias(data, color_scale, color_bias);
+
+		/*
+		 * #1599: the SHARED three-way rule. A quad is never a tile's base
+		 * cover, so it takes its own flags and can never reach REPLACE —
+		 * the first-layer gate belongs to the full-tile projection blit
+		 * alone. Resolved BEFORE the constants go down because an
+		 * unflagged quad is an OPAQUE_COVER, whose alpha-of-one the
+		 * SHADER emits: the fold below is half of that mode, the
+		 * blending-off pipeline state the other.
+		 */
+		const enum comp_layer_blend_mode mode = comp_layer_subrect_blend_mode(&tiles[vi], data->flags);
+		comp_layer_blend_fold_opaque_cover(mode, color_scale, color_bias);
+
+		const float array_params[4] = {layered ? static_cast<float>(q->sub.array_index) : 0.0f, 0.0f, 0.0f,
+		                               0.0f};
+
+		cmd_list->SetPipelineState(quad_layer_pso_for(r, mode, layered));
+		cmd_list->SetGraphicsRoot32BitConstants(1, 16, mvp.v, 0);
+		cmd_list->SetGraphicsRoot32BitConstants(1, 4, post_transform, 16);
+		cmd_list->SetGraphicsRoot32BitConstants(1, 4, color_scale, 20);
+		cmd_list->SetGraphicsRoot32BitConstants(1, 4, color_bias, 24);
+		cmd_list->SetGraphicsRoot32BitConstants(1, 4, array_params, 28);
+
+		const uint32_t tile_x = (vi % layout->cols) * layout->tile_w;
+		const uint32_t tile_y = (vi / layout->cols) * layout->tile_h;
+
+		D3D12_VIEWPORT vp = {};
+		vp.TopLeftX = static_cast<float>(tile_x);
+		vp.TopLeftY = static_cast<float>(tile_y);
+		vp.Width = static_cast<float>(vp_w);
+		vp.Height = static_cast<float>(vp_h);
+		vp.MinDepth = 0.0f;
+		vp.MaxDepth = 1.0f;
+		cmd_list->RSSetViewports(1, &vp);
+
+		D3D12_RECT scissor = {};
+		scissor.left = tile_x;
+		scissor.top = tile_y;
+		scissor.right = tile_x + vp_w;
+		scissor.bottom = tile_y + vp_h;
+		cmd_list->RSSetScissorRects(1, &scissor);
+
+		cmd_list->DrawInstanced(4, 1, 0, 0);
+
+		// One line per process, at the first quad D3D12 ever draws — the
+		// hardware leg's discriminator between "the port is live" and "the
+		// frame carried no quad". NEVER per frame.
+		static bool first_quad_logged = false;
+		if (!first_quad_logged) {
+			first_quad_logged = true;
+			U_LOG_W("#1581: D3D12 drew its first quad layer");
+		}
+	}
+
 	src_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 	src_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
 	cmd_list->ResourceBarrier(1, &src_barrier);
@@ -1003,11 +1362,18 @@ comp_d3d12_renderer_create(struct comp_d3d12_compositor *c,
 	quad_root_params[0].DescriptorTable.pDescriptorRanges = &quad_srv_range;
 	quad_root_params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-	// Param 1: 28 root constants (mvp[16] + post_transform[4] + color_scale[4] + color_bias[4])
+	// Param 1: 32 root constants (mvp[16] + post_transform[4] + color_scale[4]
+	// + color_bias[4] + array_params[4]).
+	//
+	// #1581/#1601: the last four are the layered quad-layer pixel shader's
+	// array slice. Everything else — the window-space channel, the plain
+	// quad pixel shader — declares the first 28 and writes only those; a
+	// root signature that PROVIDES more constants than a shader declares is
+	// legal, and the four it never reads are never sourced.
 	quad_root_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 	quad_root_params[1].Constants.ShaderRegister = 0;
 	quad_root_params[1].Constants.RegisterSpace = 0;
-	quad_root_params[1].Constants.Num32BitValues = 28;
+	quad_root_params[1].Constants.Num32BitValues = 32;
 	quad_root_params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
 	D3D12_STATIC_SAMPLER_DESC quad_sampler = {};
@@ -1117,6 +1483,79 @@ comp_d3d12_renderer_create(struct comp_d3d12_compositor *c,
 		U_LOG_E("Failed to create quad premul PSO: 0x%08x", hr);
 		comp_d3d12_renderer_destroy(&r);
 		return XRT_ERROR_D3D;
+	}
+
+	// --- #1581: world-space quad LAYER PSOs (XrCompositionLayerQuad) ---
+	//
+	// Six of them: the world-space vertex shader against the plain and the
+	// Texture2DArray pixel shader, each in the three blend states a SUB-RECT
+	// layer can need. They share the quad root signature and everything but
+	// the blend state with the window-space pair above.
+	{
+		ID3DBlob *ql_vs_blob = nullptr;
+		ID3DBlob *ql_ps_blob[2] = {nullptr, nullptr};
+
+		hr = compile_shader(quad_layer_vs_source, "main", "vs_5_0", &ql_vs_blob);
+		if (SUCCEEDED(hr)) {
+			hr = compile_shader(quad_ps_source, "main", "ps_5_0", &ql_ps_blob[0]);
+		}
+		if (SUCCEEDED(hr)) {
+			hr = compile_shader(quad_layer_ps_array_source, "main", "ps_5_0", &ql_ps_blob[1]);
+		}
+		if (FAILED(hr)) {
+			U_LOG_E("Failed to compile quad layer shaders: 0x%08x", hr);
+			if (ql_vs_blob != nullptr) {
+				ql_vs_blob->Release();
+			}
+			if (ql_ps_blob[0] != nullptr) {
+				ql_ps_blob[0]->Release();
+			}
+			comp_d3d12_renderer_destroy(&r);
+			return XRT_ERROR_D3D;
+		}
+
+		D3D12_GRAPHICS_PIPELINE_STATE_DESC ql_desc = quad_pso_desc;
+		ql_desc.VS.pShaderBytecode = ql_vs_blob->GetBufferPointer();
+		ql_desc.VS.BytecodeLength = ql_vs_blob->GetBufferSize();
+
+		for (uint32_t tex = 0; tex < 2 && SUCCEEDED(hr); tex++) {
+			ql_desc.PS.pShaderBytecode = ql_ps_blob[tex]->GetBufferPointer();
+			ql_desc.PS.BytecodeLength = ql_ps_blob[tex]->GetBufferSize();
+
+			for (uint32_t slot = 0; slot < 3 && SUCCEEDED(hr); slot++) {
+				D3D12_RENDER_TARGET_BLEND_DESC &rt = ql_desc.BlendState.RenderTarget[0];
+				// OPAQUE_COVER (and the unreachable REPLACE) write the
+				// source verbatim; the alpha-of-one that separates the
+				// two is the caller's colour-scale/bias fold, not a
+				// blend factor — no fixed-function factor can make a
+				// constant one (comp_layer_view_camera.h).
+				rt.BlendEnable = slot == QUAD_LAYER_BLEND_SLOT_OPAQUE ? FALSE : TRUE;
+				rt.SrcBlend =
+				    slot == QUAD_LAYER_BLEND_SLOT_STRAIGHT ? D3D12_BLEND_SRC_ALPHA : D3D12_BLEND_ONE;
+				rt.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+				rt.BlendOp = D3D12_BLEND_OP_ADD;
+				// Porter-Duff "over" on alpha too, so dst.a survives
+				// layered composition (#225).
+				rt.SrcBlendAlpha = D3D12_BLEND_ONE;
+				rt.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+				rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+				rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+				hr = device->CreateGraphicsPipelineState(
+				    &ql_desc, __uuidof(ID3D12PipelineState),
+				    reinterpret_cast<void **>(&r->quad_layer_pso[tex][slot]));
+			}
+		}
+
+		ql_vs_blob->Release();
+		ql_ps_blob[0]->Release();
+		ql_ps_blob[1]->Release();
+
+		if (FAILED(hr)) {
+			U_LOG_E("Failed to create quad layer PSO: 0x%08x", hr);
+			comp_d3d12_renderer_destroy(&r);
+			return XRT_ERROR_D3D;
+		}
 	}
 
 	// --- Masked-composite root signature (#439): SRV table of 3 (t0 2D /
@@ -1422,6 +1861,15 @@ comp_d3d12_renderer_destroy(struct comp_d3d12_renderer **renderer_ptr)
 	if (r->composite_root_signature != nullptr) {
 		r->composite_root_signature->Release();
 	}
+	// #1581: the six world-space quad-layer pipelines.
+	for (uint32_t tex = 0; tex < 2; tex++) {
+		for (uint32_t slot = 0; slot < 3; slot++) {
+			if (r->quad_layer_pso[tex][slot] != nullptr) {
+				r->quad_layer_pso[tex][slot]->Release();
+				r->quad_layer_pso[tex][slot] = nullptr;
+			}
+		}
+	}
 	if (r->quad_pso_premul != nullptr) {
 		r->quad_pso_premul->Release();
 	}
@@ -1592,6 +2040,37 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 	// of the layers-outer loop running in submission order per tile).
 	for (uint32_t li = 0; li < layers->layer_count; li++) {
 		struct comp_layer *layer = &layers->layers[li];
+
+		/*
+		 * #1581 — the sub-rect Khronos layers, composited IN SUBMISSION
+		 * ORDER with the projection-class ones rather than in a later
+		 * pass, because this loop already walks the accum in that order
+		 * and each tile therefore sees every layer type in it. That is
+		 * what the in-process D3D11 leg does (one loop, all types), and
+		 * it keeps the cross-type ordering the D3D11 SERVICE's two-pass
+		 * split has to give up (KNOWN DEVIATIONS, comp_layer_view_camera.h):
+		 * a projection layer submitted after a quad correctly composites
+		 * over it here.
+		 *
+		 * The quad draw swaps the root signature and pipeline, so the
+		 * blit pair is re-stated afterwards for the next projection draw.
+		 * Root arguments do not survive a root-signature change, but the
+		 * projection path sets its descriptor table and root constants
+		 * per draw, so nothing else has to be restored.
+		 */
+		if (layer->data.type == XRT_LAYER_QUAD) {
+			render_quad_layer(renderer, cmd_list, layer, view_count, cameras, tiles, target_width,
+			                  target_height, layout);
+			cmd_list->SetGraphicsRootSignature(renderer->root_signature);
+			cmd_list->SetPipelineState(renderer->blit_pso);
+			cmd_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+			cmd_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+			continue;
+		}
+
+		// #1581: cylinder, equirect1, equirect2 and cube are accepted by
+		// the compositor and still not drawn on this backend — the quad is
+		// the one the CTS composition category turns on.
 
 		const bool is_zone = layer->data.type == XRT_LAYER_ZONE_3D;
 		if (layer->data.type != XRT_LAYER_PROJECTION &&

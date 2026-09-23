@@ -1059,6 +1059,8 @@ TEST_CASE("comp_layer_view_camera: no backend gates its draw on the return value
 	    "metal/comp_metal_compositor.m",
 	    "d3d11/comp_d3d11_renderer.cpp",
 	    "d3d11_service/comp_d3d11_service.cpp",
+	    // #1581: D3D12 resolves the same cameras for its quad draw.
+	    "d3d12/comp_d3d12_renderer.cpp",
 	};
 
 	for (const char *rel : backends) {
@@ -1147,6 +1149,9 @@ TEST_CASE("comp_layer_blend_mode: no backend reimplements the blend rule (#1621)
 	     *    comp_layer_blend_mode() is not re-deriving its output.
 	     */
 	    {"d3d11_service/comp_d3d11_service.cpp", 2},
+	    // #1581: D3D12's one allowance is the SAME Local2D / window-space
+	    // channel D3D11's is — render_window_space_layer(), ported from it.
+	    {"d3d12/comp_d3d12_renderer.cpp", 1},
 	};
 
 	for (const auto &backend : backends) {
@@ -1154,13 +1159,18 @@ TEST_CASE("comp_layer_blend_mode: no backend reimplements the blend rule (#1621)
 		const std::string path = std::string(DXR_COMP_SRC_DIR) + "/" + rel;
 		const std::string src = read_whole_file(path);
 
-		// Positive: the shared resolver is what decides the mode. Both
+		// Positive: the shared resolver is what decides the mode. All three
 		// spellings count — comp_layer_tile_blend_mode() for the tile's
-		// painter's-order gate, comp_layer_blend_mode() for a layer that is
-		// never a base cover (a quad).
+		// painter's-order gate, comp_layer_subrect_blend_mode() for a layer
+		// that covers only part of a tile, and comp_layer_blend_mode() where
+		// a caller names the rule directly. They are one rule; which name a
+		// backend reaches for is not what this guard is about.
 		INFO(rel << " must resolve its blend mode through comp_layer_blend_mode() / "
-		         << "comp_layer_tile_blend_mode() (comp_layer_view_camera.h)");
-		CHECK(src.find("comp_layer_blend_mode(") != std::string::npos);
+		         << "comp_layer_tile_blend_mode() / comp_layer_subrect_blend_mode() "
+		         << "(comp_layer_view_camera.h)");
+		CHECK((src.find("comp_layer_blend_mode(") != std::string::npos ||
+		       src.find("comp_layer_tile_blend_mode(") != std::string::npos ||
+		       src.find("comp_layer_subrect_blend_mode(") != std::string::npos));
 
 		// ...and OPAQUE_COVER's alpha-of-one must be folded into the shader,
 		// since no fixed-function blend factor can synthesise a constant one.
@@ -1550,15 +1560,17 @@ TEST_CASE("comp_layer_tile_blend_mode: asking for a mode is what spends the base
  * copy: the back-face predicate at its quad draw, and the painter's-order gate
  * at its layer loop.
  *
- * Scoped to D3D11 in-process + service deliberately: GL and Metal draw quads
- * but do not apply the facing predicate yet (their #1590 legs are still open),
- * and a test that fails for a known-open leg is noise, not a guard.
+ * Scoped to the D3D paths deliberately: GL and Metal draw quads but do not
+ * apply the facing predicate yet (their #1590 legs are still open), and a test
+ * that fails for a known-open leg is noise, not a guard. D3D12 joined with
+ * #1581, which is where it learned to draw a quad at all.
  */
-TEST_CASE("the D3D11 paths consult the shared facing and painter's rules (#1590, #1598)")
+TEST_CASE("the D3D paths consult the shared facing and painter's rules (#1590, #1598)")
 {
 	const char *const backends[] = {
 	    "d3d11/comp_d3d11_renderer.cpp",
 	    "d3d11_service/comp_d3d11_service.cpp",
+	    "d3d12/comp_d3d12_renderer.cpp",
 	};
 
 	for (const char *rel : backends) {
@@ -1575,21 +1587,27 @@ TEST_CASE("the D3D11 paths consult the shared facing and painter's rules (#1590,
 	}
 
 	/*
-	 * ...and the SERVICE composes its SUB-RECT layers in a pass of their
-	 * own, which must not reach for that gate: only a full-tile
-	 * projection-class layer can be a tile's base. Named here rather than
-	 * in the loop because the in-process renderer spells the same rule as a
-	 * direct comp_layer_blend_mode() call at its quad draw, and converging
-	 * the two spellings is not this change's business.
+	 * ...and a SUB-RECT layer must not reach for that gate: only a full-tile
+	 * projection-class layer can be a tile's base. The D3D11 service composes
+	 * its sub-rect layers in a pass of their own; D3D12 composes its quads in
+	 * the same loop as its projection blits (#1581) and still owes the same
+	 * distinction. Named here rather than in the loop above because the
+	 * in-process D3D11 renderer spells the same rule as a direct
+	 * comp_layer_blend_mode() call at its quad draw, and converging the two
+	 * spellings is not this change's business.
 	 */
-	{
-		const std::string path = std::string(DXR_COMP_SRC_DIR) + "/d3d11_service/comp_d3d11_service.cpp";
+	const char *const subrect_backends[] = {
+	    "d3d11_service/comp_d3d11_service.cpp",
+	    "d3d12/comp_d3d12_renderer.cpp",
+	};
+
+	for (const char *rel : subrect_backends) {
+		const std::string path = std::string(DXR_COMP_SRC_DIR) + "/" + rel;
 		const std::string src = read_whole_file(path);
 
-		INFO(
-		    "the D3D11 service's UI pass must resolve quad / cylinder / equirect2 through "
-		    "comp_layer_subrect_blend_mode() — the first-in-tile REPLACE belongs to a full-tile "
-		    "projection-class base alone, and this path's atlas is not cleared per frame");
+		INFO(rel << " must resolve its quad / cylinder / equirect2 draws through "
+		         << "comp_layer_subrect_blend_mode() — the first-in-tile REPLACE belongs to a "
+		         << "full-tile projection-class base alone");
 		CHECK(src.find("comp_layer_subrect_blend_mode(") != std::string::npos);
 	}
 }
