@@ -477,7 +477,6 @@ struct comp_gl_compositor
 	 * @{
 	 */
 	GLuint compose_texture;     //!< GL_SRGB8_ALPHA8 twin of the atlas, or 0.
-	GLuint compose_fbo;         //!< FBO used to publish it (see gl_publish_compose_to_atlas).
 	uint32_t compose_width;     //!< Its width — always the atlas's.
 	uint32_t compose_height;    //!< Its height — always the atlas's.
 	bool compose_active;        //!< Is THIS frame composing? Resolved once per layer_commit.
@@ -1954,6 +1953,26 @@ gl_has_srgb_decode_ext(void)
 }
 
 /*!
+ * #1589 — did the app request an sRGB colour swapchain?
+ *
+ * ADR-021 §6: the format IS the declaration. True ⟹ the bytes are
+ * display-referred (encoded) and may reach the ENCODED atlas unchanged;
+ * false ⟹ they are scene-linear and owe the encode, which only the compose
+ * target can apply. The GL twin of comp_d3d12_swapchain_resource_is_srgb(),
+ * asked by exactly the two policy questions that need it: the fast-path
+ * predicate and the zero-copy colour precondition.
+ *
+ * Read from the app's REQUEST (`info.format`) through the same mapping the
+ * texture was allocated with, so a format this backend does not know falls back
+ * to GL_RGBA8 here exactly as it did there — one answer, not two.
+ */
+static bool
+gl_swapchain_is_srgb(const struct comp_gl_swapchain *sc)
+{
+	return sc != NULL && xrt_format_to_gl_internal(sc->info.format) == GL_SRGB8_ALPHA8;
+}
+
+/*!
  * #1589 — bind an app swapchain image as a layer SOURCE, in the reading this
  * frame's render target demands.
  *
@@ -2943,6 +2962,122 @@ gl_ensure_color_tex_fbo(GLuint *tex, GLuint *fbo, uint32_t *cur_w, uint32_t *cur
 	*cur_w = w;
 	*cur_h = h;
 	return true;
+}
+
+/*!
+ * #1589/#1610 — build (or rebuild) the private compose target to match the
+ * atlas.
+ *
+ * A GL_SRGB8_ALPHA8 texture of the atlas's size: painted with
+ * GL_FRAMEBUFFER_SRGB on, the fixed-function blender therefore works in LINEAR
+ * and the sRGB OETF is applied exactly once, on write, by the hardware. There
+ * is deliberately no gamma arithmetic in any compose shader — it would
+ * double-apply the moment the target encodes, and ADR-021 §2 wants no transfer
+ * function in runtime shader code at all.
+ *
+ * Returns false when the frame must stay on the legacy path: no atlas yet, no
+ * `glCopyImageSubData` (the publish below is the only same-family copy GL
+ * offers, and it is GL 4.3 / ARB_copy_image — an Apple 4.1 context has
+ * neither), or an allocation that did not come out framebuffer-complete. Every
+ * one of those is a "keep doing what we did before", never a hard error — a
+ * slightly wrong colour beats not drawing — and each logs once.
+ */
+static bool
+gl_ensure_compose_target(struct comp_gl_compositor *c)
+{
+	if (c->atlas_texture == 0 || c->atlas_tex_width == 0 || c->atlas_tex_height == 0) {
+		return false;
+	}
+
+	if (glCopyImageSubData == NULL) {
+		// Without a same-family copy the composite could only reach the
+		// atlas through a DRAW, which would re-apply the transfer
+		// function and hand the display processor a double-encoded
+		// atlas. Refusing is the honest answer.
+		static bool warned_no_copy = false;
+		if (!warned_no_copy) {
+			warned_no_copy = true;
+			U_LOG_W("Color (#1610) [gl]: no glCopyImageSubData (needs GL 4.3 / ARB_copy_image) — "
+			        "composing in encoded space, as before #1610");
+		}
+		return false;
+	}
+
+	if (c->compose_texture != 0 && c->compose_width == c->atlas_tex_width &&
+	    c->compose_height == c->atlas_tex_height) {
+		return true;
+	}
+
+	// The atlas changed size, or this is the first composing frame.
+	if (c->compose_texture != 0) {
+		glDeleteTextures(1, &c->compose_texture);
+		c->compose_texture = 0;
+	}
+
+	glGenTextures(1, &c->compose_texture);
+	glBindTexture(GL_TEXTURE_2D, c->compose_texture);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_SRGB8_ALPHA8, (GLsizei)c->atlas_tex_width, (GLsizei)c->atlas_tex_height, 0,
+	             GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glBindTexture(GL_TEXTURE_2D, 0);
+
+	// Prove it can actually be rendered into before any frame depends on it:
+	// a driver that will not take GL_SRGB8_ALPHA8 as a colour attachment
+	// would otherwise show up as an incomplete-FBO frame with no output.
+	GLuint prev_fbo = 0;
+	glGetIntegerv(GL_FRAMEBUFFER_BINDING, (GLint *)&prev_fbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, c->fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, c->compose_texture, 0);
+	const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+	glBindFramebuffer(GL_FRAMEBUFFER, prev_fbo);
+	if (status != GL_FRAMEBUFFER_COMPLETE) {
+		U_LOG_W("Color (#1610) [gl]: compose target %ux%u is not framebuffer-complete (0x%x) — "
+		        "composing in encoded space, as before #1610",
+		        c->atlas_tex_width, c->atlas_tex_height, (unsigned)status);
+		glDeleteTextures(1, &c->compose_texture);
+		c->compose_texture = 0;
+		return false;
+	}
+
+	c->compose_width = c->atlas_tex_width;
+	c->compose_height = c->atlas_tex_height;
+
+	// The line a hardware check greps to prove a frame LEFT the fast path.
+	// One-off per (re)allocation — a lifecycle event, never per frame.
+	U_LOG_W("Color (#1610) [gl]: compose target %ux%u storage=GL_SRGB8_ALPHA8 -> atlas=GL_RGBA8 "
+	        "(same 32-bit RGBA class, published by glCopyImageSubData)",
+	        c->compose_width, c->compose_height);
+	return true;
+}
+
+/*!
+ * #1610 — publish the composed result into the atlas.
+ *
+ * `glCopyImageSubData`, deliberately: GL_SRGB8_ALPHA8 and GL_RGBA8 are the same
+ * compatibility class (32-bit RGBA, 8 bits per component), so this moves the
+ * ENCODED bytes the sRGB attachment just wrote without touching them. A shader
+ * blit here — or a `glBlitFramebuffer`, whose sRGB behaviour is
+ * GL_FRAMEBUFFER_SRGB-dependent and has a history of driver disagreement —
+ * would risk re-applying the transfer function and handing the display
+ * processor a double-encoded atlas. Do not "optimise" it into a draw.
+ *
+ * The atlas resource, its format, everything that samples it and the ENCODED
+ * the display processor latches are all untouched, so no caller — the
+ * projection-only capture round trip in particular — has to learn about this
+ * path.
+ */
+static void
+gl_publish_compose_to_atlas(struct comp_gl_compositor *c)
+{
+	if (!c->compose_active || c->compose_texture == 0 || c->atlas_texture == 0) {
+		return;
+	}
+	glCopyImageSubData(c->compose_texture, GL_TEXTURE_2D, 0, 0, 0, 0,  //
+	                   c->atlas_texture, GL_TEXTURE_2D, 0, 0, 0, 0,    //
+	                   (GLsizei)c->compose_width, (GLsizei)c->compose_height, 1);
 }
 
 // #439 Phase 3 — (re)rasterize the IMPLICIT R8 zone mask from the frame's
@@ -4735,6 +4870,90 @@ gl_render_quad_layer(struct comp_gl_compositor *c,
 }
 
 /*!
+ * #1589/#1610 — does this frame take the raw (pre-#1589) path?
+ *
+ * Counts the layers this backend will actually PAINT into the atlas (a type it
+ * only warns about does not count) and asks whether every source is already
+ * encoded, then defers to the SHARED predicate so all five backends answer
+ * alike. The answer is a different TARGET and a different SOURCE BIND for the
+ * same draws — every layer is still drawn either way — which is what makes the
+ * shared predicate directly usable here (see its @warning: a backend whose fast
+ * path is a different MECHANISM would have to AND in a structural term).
+ *
+ * GL does AND in one term, and it is a CAPABILITY rather than a colour rule:
+ * the fast path's whole premise is reading an sRGB source WITHOUT decoding,
+ * which only GL_EXT_texture_sRGB_decode can express. On a stack without it the
+ * hardware decodes whether we ask or not, so a "fast" frame would write linear
+ * values into the ENCODED atlas and come out ~a stop too dark — the compose
+ * target, which decodes on sample and encodes on write, is the CORRECT answer
+ * there. The hatch is checked first so it stays one switch: under
+ * DXR_COLOR_LEGACY_UNORM_ENCODED nothing ever composes, whatever the stack can
+ * or cannot express.
+ */
+static bool
+gl_frame_takes_fast_path(struct comp_gl_compositor *c)
+{
+	uint32_t contributing = 0;
+	bool base_is_projection = false;
+	bool all_sources_srgb = true;
+
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		struct comp_layer *layer = &c->layer_accum.layers[i];
+		uint32_t sc_count = 0;
+
+		switch (layer->data.type) {
+		case XRT_LAYER_PROJECTION:
+		case XRT_LAYER_PROJECTION_DEPTH:
+			if (contributing == 0) {
+				base_is_projection = true;
+			}
+			contributing++;
+			sc_count = layer->data.view_count;
+			break;
+		case XRT_LAYER_ZONE_3D:
+			contributing++;
+			sc_count = layer->data.view_count;
+			break;
+		case XRT_LAYER_QUAD:
+		case XRT_LAYER_WINDOW_SPACE:
+			// Both cover a SUB-RECT of the tile and blend over
+			// whatever is under them, so either one alone is already a
+			// compose case.
+			contributing++;
+			sc_count = 1;
+			break;
+		default:
+			// Local2D is composited POST-weave, not into the atlas, so
+			// it is not this decision's business (and keeps its own
+			// passthrough read — see gl_flatten_one_local2d_layer).
+			// Cylinder / equirect1 / equirect2 / cube are accepted by
+			// the compositor, warned about, and never drawn on this
+			// backend (#1581/#1602). A type that starts drawing into
+			// the atlas here must move up.
+			break;
+		}
+
+		if (sc_count > XRT_MAX_VIEWS) {
+			sc_count = XRT_MAX_VIEWS;
+		}
+		for (uint32_t v = 0; v < sc_count; v++) {
+			if (layer->sc_array[v] == NULL) {
+				continue;
+			}
+			if (!gl_swapchain_is_srgb(gl_swapchain(layer->sc_array[v]))) {
+				all_sources_srgb = false;
+			}
+		}
+	}
+
+	if (c->legacy_color) {
+		return true;
+	}
+	return u_color_compose_fast_path(c->legacy_color, contributing, base_is_projection, all_sources_srgb) &&
+	       gl_has_srgb_decode_ext();
+}
+
+/*!
  * The frame path proper. Runs with c->mutex HELD — see the locking wrapper
  * below. Keeps its early returns, which is why the lock lives in the wrapper.
  */
@@ -4903,6 +5122,10 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 	// they must all agree on the frame's geometry.
 	gl_compute_effective_layout(c);
 
+	// #1610: frame-local, and cleared BEFORE the zero-copy probe so it can never
+	// carry a previous frame's answer into a frame that paints nothing.
+	c->compose_active = false;
+
 	// Zero-copy check: can we pass the app's swapchain directly to the DP?
 	bool zero_copy = false;
 	GLuint zc_texture = 0;
@@ -4998,9 +5221,45 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 
 	// --- Step 1: Render layers into atlas texture (skip if zero-copy) ---
 	if (!zero_copy) {
+	/*
+	 * #1589/#1610 — which target do this frame's layers paint?
+	 *
+	 * The shipping case (one full-tile projection layer out of an sRGB
+	 * swapchain) owes neither an encode nor a blend, so it draws straight
+	 * into the atlas through the non-decoding binds: the exact call
+	 * sequence, and the exact atlas bytes, as before this work. Everything
+	 * else — a GL_RGBA8 source, whose values are LINEAR and owe the encode,
+	 * or a second layer, which owes a LINEAR blend — goes into the private
+	 * GL_SRGB8_ALPHA8 target and is copied out at the end of the pass.
+	 *
+	 * There is no `atlas_holds_srgb_bytes` to stamp on this leg, and that is
+	 * a property of the design rather than an omission: the in-process GL
+	 * compositor never calls set_atlas_encoding, so the display processor
+	 * latches ENCODED — and after this change that declaration is TRUE on
+	 * both branches. u_color_atlas_holds_encoded()'s two inputs are
+	 * `composed_through_srgb_target || source_is_srgb`, and the fast path is
+	 * only ever taken when every source IS sRGB while the compose path
+	 * encodes whatever it was handed. The one case that still lies is a
+	 * compose target that could not be built, which is the documented "a
+	 * slightly wrong colour beats not drawing" fallback and says so in the
+	 * log.
+	 */
+	if (!gl_frame_takes_fast_path(c)) {
+		c->compose_active = gl_ensure_compose_target(c);
+	}
+
 	glBindFramebuffer(GL_FRAMEBUFFER, c->fbo);
 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
-	                        c->atlas_texture, 0);
+	                        c->compose_active ? c->compose_texture : c->atlas_texture, 0);
+	// The write-side half of the #1610 model: ON ⟹ the hardware applies the
+	// sRGB OETF once, on write, and the fixed-function blender therefore
+	// works in linear. OFF ⟹ the atlas is painted directly and every byte
+	// passes through, as before.
+	if (c->compose_active) {
+		glEnable(GL_FRAMEBUFFER_SRGB);
+	} else {
+		glDisable(GL_FRAMEBUFFER_SRGB);
+	}
 
 	glViewport(0, 0, c->tile_columns * c->view_width, c->tile_rows * c->view_height);
 	// Transparent-background apps clear their views to alpha=0; the atlas must
@@ -5012,6 +5271,11 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 	// layers into the window-spanning atlas — the unzoned area must weave to
 	// nothing (transparent) so the MODE_ZONES composite (and any #803
 	// feather ramp) blends toward the desktop.
+	//
+	// #1610: unchanged when this goes through the compose target. Black is
+	// black in both spaces (the OETF fixes zero) and an sRGB attachment's
+	// conversion never touches alpha, so the clear needs no colour-space
+	// branch — which is half of why black was the right clear to land on.
 	glClearColor(0.0f, 0.0f, 0.0f, (c->transparent_background || c->zones_frame) ? 0.0f : 1.0f);
 	glClear(GL_COLOR_BUFFER_BIT);
 
@@ -5298,6 +5562,11 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 		gl_seed_blit_color_identity(c->program_blit_array);
 	}
 
+	// #1610: publish the composite BEFORE the capture below, so the
+	// projection-only round trip photographs a correct atlas. A no-op on the
+	// fast path, where the draws above already landed in the atlas.
+	gl_publish_compose_to_atlas(c);
+
 	// Projection-only capture point — atlas now contains projection-class
 	// layers (projection, projection-depth, zone, quad) for every tile;
 	// window-space layers haven't been rendered yet. Same boundary the D3D11
@@ -5308,6 +5577,10 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 	gl_compositor_dispatch_capture(c, MCP_CAPTURE_MODE_PROJECTION_ONLY);
 
 	// --- Step 1b: Render window-space layers (HUD overlays) ---
+	// #1610: a composing frame pays for ONE more copy here, and only when a
+	// window-space layer actually drew — the publish above already covered
+	// the projection pass.
+	bool window_space_drew = false;
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		struct comp_layer *layer = &c->layer_accum.layers[i];
 
@@ -5381,10 +5654,20 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 			glUniform1i(loc_ws_tex, 0);
 
 			glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+			window_space_drew = true;
 		}
 
 		glDisable(GL_BLEND);
 	}
+
+	// #1610: republish only if the window-space pass actually painted, then
+	// hand the pass back with the encode OFF — everything downstream (the
+	// Local2D flatten, the weave, the present blit) writes GL_RGBA8 targets
+	// that already hold encoded bytes.
+	if (window_space_drew) {
+		gl_publish_compose_to_atlas(c);
+	}
+	glDisable(GL_FRAMEBUFFER_SRGB);
 
 	} // end if (!zero_copy)
 
@@ -5775,6 +6058,7 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 	if (c->vao_empty) glDeleteVertexArrays(1, &c->vao_empty);
 	if (c->fbo) glDeleteFramebuffers(1, &c->fbo);
 	if (c->atlas_texture) glDeleteTextures(1, &c->atlas_texture);
+	if (c->compose_texture) glDeleteTextures(1, &c->compose_texture); // #1610 private compose target
 	// #439 Phase 3 — Local2D composite scratch.
 	if (c->weave_tex) glDeleteTextures(1, &c->weave_tex);
 	if (c->weave_fbo) glDeleteFramebuffers(1, &c->weave_fbo);
