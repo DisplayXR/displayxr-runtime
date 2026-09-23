@@ -205,6 +205,11 @@ qwerty_process_win32(struct xrt_device **xdevs,
 		GetCursorPos(&p);
 		qsys->input_last_mouse_x = (float)p.x;
 		qsys->input_last_mouse_y = (float)p.y;
+		// #1700: seed the button latches from the LIVE device state, not from
+		// "assume up". A system whose first message arrives while a button is
+		// genuinely held must not read that as a fresh press below.
+		qsys->input_lmb_was_down = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+		qsys->input_mmb_was_down = (GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0;
 		qsys->input_bound = true;
 		first_bind = true;
 	}
@@ -761,8 +766,25 @@ qwerty_process_win32(struct xrt_device **xdevs,
 		// Some Windows Precision Touchpad drivers suppress WM_LBUTTONDOWN/UP
 		// when system modifier keys (CTRL/ALT) are held (palm rejection).
 		// wParam contains MK_LBUTTON/MK_MBUTTON even when the event messages are lost.
-		bool lmb_down = (wParam & MK_LBUTTON) != 0;
-		bool mmb_down = (wParam & MK_MBUTTON) != 0;
+		//
+		// #1700: wParam's button bits are the *message's* per-thread-queue
+		// snapshot, NOT the live device state, and a window thread that never
+		// received the matching WM_LBUTTONUP keeps reporting the button held.
+		// That is the normal case at an interactive-CTS case boundary: the
+		// runtime destroys the hosted window ~20 ms after the app passes a
+		// prompt on the select click — well inside the ~60 ms the button is
+		// held — so no runtime window ever sees the UP, and the NEXT session's
+		// window then gets a first WM_MOUSEMOVE still claiming MK_LBUTTON.
+		// This fallback turned that into a phantom trigger press and silently
+		// passed the next prompt with nobody judging it.
+		//
+		// Corroborate with the live physical state. The touchpad case this
+		// fallback exists for still works (the button really IS down, only the
+		// event was suppressed), while a stale queue bit can no longer
+		// manufacture an edge. Backend-independent — the GL leg hit it first
+		// because its window teardown beats the button hold.
+		bool lmb_down = (wParam & MK_LBUTTON) != 0 && (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+		bool mmb_down = (wParam & MK_MBUTTON) != 0 && (GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0;
 
 		if (lmb_down != lmb_was_down) {
 			for (int i = 0; i < target_count; i++) {
