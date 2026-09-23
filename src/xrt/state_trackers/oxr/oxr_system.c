@@ -693,24 +693,56 @@ oxr_system_get_properties(struct oxr_logger *log, struct oxr_system *sys, XrSyst
 	 */
 	const bool dp_eye_tracking = oxr_dp_tracks_eyes(info ? info->supported_eye_tracking_modes : 0u);
 
+	/*
+	 * The dynamic roles (left / right / gamepad) must be read LIVE, not
+	 * through GET_XDEV_BY_ROLE. That macro answers from
+	 * oxr_system::dynamic_roles_cache, which is seeded to
+	 * XRT_SYSTEM_ROLES_INIT (every index -1) at oxr_system_fill_in() and
+	 * refreshed ONLY at xrSyncActions (oxr_api_action.c:151-160). Every
+	 * caller of xrGetSystemProperties asks before it has ever synced —
+	 * test_SpaceOffsets.cpp:125 calls it right after xrCreateSession — so
+	 * the cache is still empty and all three would read NULL.
+	 *
+	 * That is not theoretical: it made the answer depend on whether an
+	 * input-provider plug-in happened to be loaded. A provider populates the
+	 * STATIC hand-tracking roles, which are read straight off
+	 * xrt_system_devices and so were seen; with DXR_INPUT_PROVIDERS=0 (what
+	 * scripts/run_cts.ps1 always sets, so the hands stay on qwerty) nothing
+	 * static held a role, the cache was empty, and the whole rule collapsed
+	 * back to XR_FALSE. Same helper and same reason as the "Selected
+	 * devices" log at oxr_instance.c:252-254, whose comment reads "the
+	 * system cache might not have been updated yet".
+	 */
+	struct xrt_system_roles live_roles = XRT_SYSTEM_ROLES_INIT;
+	if (sys->xsysd != NULL) {
+		xrt_system_devices_get_roles(sys->xsysd, &live_roles);
+	}
+
 	bool role_orientation = false;
 	bool role_position = false;
-#define OXR_OR_ROLE_TRACKING(ROLE)                                                                                     \
+#define OXR_OR_XDEV_TRACKING(XDEV)                                                                                     \
 	{                                                                                                              \
-		const struct xrt_device *role_xdev = GET_XDEV_BY_ROLE(sys, ROLE);                                      \
+		const struct xrt_device *role_xdev = (XDEV);                                                           \
 		if (role_xdev != NULL) {                                                                               \
 			role_orientation = role_orientation || role_xdev->supported.orientation_tracking;               \
 			role_position = role_position || role_xdev->supported.position_tracking;                       \
 		}                                                                                                      \
 	}
-	OXR_OR_ROLE_TRACKING(left)
-	OXR_OR_ROLE_TRACKING(right)
-	OXR_OR_ROLE_TRACKING(gamepad)
-	OXR_OR_ROLE_TRACKING(hand_tracking_unobstructed_left)
-	OXR_OR_ROLE_TRACKING(hand_tracking_unobstructed_right)
-	OXR_OR_ROLE_TRACKING(hand_tracking_conforming_left)
-	OXR_OR_ROLE_TRACKING(hand_tracking_conforming_right)
-#undef OXR_OR_ROLE_TRACKING
+	// Dynamic roles: live indices into xrt_system_devices::xdevs.
+#define OXR_OR_DYN_ROLE_TRACKING(IDX)                                                                                  \
+	OXR_OR_XDEV_TRACKING((sys->xsysd != NULL && (IDX) >= 0 && (IDX) < (int32_t)ARRAY_SIZE(sys->xsysd->xdevs))       \
+	                         ? sys->xsysd->xdevs[(IDX)]                                                            \
+	                         : NULL)
+	OXR_OR_DYN_ROLE_TRACKING(live_roles.left)
+	OXR_OR_DYN_ROLE_TRACKING(live_roles.right)
+	OXR_OR_DYN_ROLE_TRACKING(live_roles.gamepad)
+	// Static roles: read straight off xrt_system_devices, no cache involved.
+	OXR_OR_XDEV_TRACKING(GET_XDEV_BY_ROLE(sys, hand_tracking_unobstructed_left))
+	OXR_OR_XDEV_TRACKING(GET_XDEV_BY_ROLE(sys, hand_tracking_unobstructed_right))
+	OXR_OR_XDEV_TRACKING(GET_XDEV_BY_ROLE(sys, hand_tracking_conforming_left))
+	OXR_OR_XDEV_TRACKING(GET_XDEV_BY_ROLE(sys, hand_tracking_conforming_right))
+#undef OXR_OR_DYN_ROLE_TRACKING
+#undef OXR_OR_XDEV_TRACKING
 
 	properties->trackingProperties.orientationTracking =
 	    oxr_system_orientation_tracking(xdev->supported.orientation_tracking, dp_eye_tracking, role_orientation)

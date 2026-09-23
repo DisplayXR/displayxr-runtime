@@ -339,6 +339,21 @@ if(TARGET tests_oxr_view_space)
 	# has already answered "on" cannot also answer "off". This is what makes the
 	# switch mean something -- the other arms only prove that the TEST reads the
 	# variable, not that the runtime does.
+	# #1631 — the CTS's own input configuration, in a process of its OWN for the
+	# same one-shot reason as the arms above: DXR_INPUT_PROVIDERS is read through
+	# CRT getenv at the FIRST instance create and the provider scan is latched
+	# (`g_input_load_attempted`), so one process cannot host both "a provider is
+	# loaded" and "none is". scripts/run_cts.ps1 always sets it to 0 so the hands
+	# stay on qwerty, and that is precisely the configuration in which the
+	# dynamic-role CACHE (empty until xrSyncActions) used to make
+	# xrGetSystemProperties answer XR_FALSE.
+	add_test(NAME tests_oxr_view_space_no_input_providers
+		 COMMAND tests_oxr_view_space "[tracking_props_noproviders]" --success --allow-running-no-tests
+		)
+	set_tests_properties(
+		tests_oxr_view_space_no_input_providers PROPERTIES ENVIRONMENT "DXR_INPUT_PROVIDERS=0"
+		)
+
 	add_test(NAME tests_oxr_view_space_mode_floor_off
 		 COMMAND tests_oxr_view_space "[mode_floor_off]" --success --allow-running-no-tests
 		)

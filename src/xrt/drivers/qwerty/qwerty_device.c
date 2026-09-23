@@ -630,6 +630,17 @@ qwerty_controller_create(bool is_left, struct qwerty_hmd *qhmd)
 	snprintf(xd->str, XRT_DEVICE_NAME_LEN, "%s", controller_name);
 	snprintf(xd->serial, XRT_DEVICE_NAME_LEN, "%s", controller_name);
 
+	// #1631: say what this device already DELIVERS. Every pose
+	// qwerty_get_tracked_pose() returns for a controller carries
+	// ORIENTATION_TRACKED_BIT | POSITION_TRACKED_BIT (see the flag store
+	// above it), so the capability flags were simply missing — the HMD
+	// below sets them for the same reason and says so. Without them a
+	// qwerty-only system (DXR_INPUT_PROVIDERS=0, which the CTS harness
+	// always sets) holds the left/right roles with two devices that claim
+	// no tracking, and xrGetSystemProperties answers XR_FALSE.
+	xd->supported.orientation_tracking = true;
+	xd->supported.position_tracking = true;
+
 	// Share the HMD's tracking origin so all qwerty devices occupy the same
 	// node in the space overseer graph. With separate origins the IPC client
 	// may treat cross-origin xrLocateSpace as invalid, zeroing controller poses.
