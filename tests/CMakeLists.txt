@@ -61,7 +61,7 @@ set(tests
     tests_m_matrix_projection
 	)
 if(XRT_BUILD_DRIVER_QWERTY)
-	list(APPEND tests tests_qwerty_camera_profile)
+	list(APPEND tests tests_qwerty_camera_profile tests_qwerty_velocity)
 endif()
 
 # #1380 -- the input-provider host iface's display-geometry cache. Needs the
@@ -189,6 +189,10 @@ endif()
 
 if(TARGET tests_qwerty_camera_profile)
 	target_link_libraries(tests_qwerty_camera_profile PRIVATE drv_qwerty drv_qwerty_includes)
+endif()
+
+if(TARGET tests_qwerty_velocity)
+	target_link_libraries(tests_qwerty_velocity PRIVATE drv_qwerty drv_qwerty_includes aux_math)
 endif()
 
 if(WIN32 AND XRT_HAVE_D3D11 AND XRT_FEATURE_OPENXR AND XRT_FEATURE_OPENXR_HEADLESS AND RUNTIME_TARGET)
