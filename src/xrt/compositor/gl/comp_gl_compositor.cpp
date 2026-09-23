@@ -4463,6 +4463,219 @@ gl_repaint_thread(void *ptr)
 }
 
 /*!
+ * Render one `XrCompositionLayerQuad` into every view tile it is visible in
+ * (#1581). Ported from the D3D11 reference `render_quad_layer()` and the D3D12
+ * port of it, and sharing every policy decision with them through
+ * comp_layer_view_camera.h rather than restating any of it here.
+ *
+ * Views are the INNER loop, so the source texture is bound and its sRGB-decode
+ * parameter set ONCE per layer rather than once per tile; only the MVP, the
+ * blend mode and the viewport differ per view.
+ *
+ * @param view_count This frame's active view count — the same one the
+ *                   projection blit tiled by.
+ * @param cameras    This frame's per-view cameras (#1580), the SAME ones the
+ *                   projection tiles were framed by. A quad composed through
+ *                   any other camera lands on different display pixels than
+ *                   projection content at the same world pose.
+ * @param tiles      Per-view painter's-order state (#1598). A quad MARKS the
+ *                   tile it painted so a projection layer submitted after it
+ *                   blends over it, but it can never take the base slot.
+ */
+static void
+gl_render_quad_layer(struct comp_gl_compositor *c,
+                     const struct comp_layer *layer,
+                     uint32_t view_count,
+                     const struct comp_layer_view_camera *cameras,
+                     struct comp_layer_tile_state *tiles)
+{
+	const struct xrt_layer_data *data = &layer->data;
+	const struct xrt_layer_quad_data *q = &data->quad;
+
+	/*
+	 * Which tiles does this quad reach at all?
+	 *
+	 * Per-eye visibility is view-count aware (#1580): the local
+	 * `view_index == 0 / == 1` rule every backend started from silently
+	 * dropped an eye-specific quad in every view past the second, which a
+	 * 2x2 quad mode has.
+	 *
+	 * #1590's facing test is a PREDICATE, not rasterizer culling — this
+	 * pipeline, like every other in the tree, never enables GL_CULL_FACE.
+	 * The spec is normative ("the back face is not visible and must not be
+	 * drawn by the runtime") and the camera is THIS view's, so a quad turned
+	 * away in one eye and toward the other is dropped per eye. Its absence
+	 * is what left the CTS QuadOcclusion case showing a full-view red
+	 * back-face on this backend.
+	 *
+	 * Resolved up front so a quad no view can see costs no bind at all.
+	 */
+	bool visible[XRT_MAX_VIEWS] = {};
+	bool any_visible = false;
+	for (uint32_t vi = 0; vi < view_count && vi < XRT_MAX_VIEWS; vi++) {
+		visible[vi] = is_layer_view_visible_n(data, vi, view_count) &&
+		              comp_layer_quad_is_front_facing(&q->pose, &cameras[vi].pose.position);
+		any_visible = any_visible || visible[vi];
+	}
+	if (!any_visible) {
+		return;
+	}
+
+	struct xrt_swapchain *qsc = layer->sc_array[0];
+	if (qsc == NULL) {
+		return;
+	}
+	struct comp_gl_swapchain *qgsc = gl_swapchain(qsc);
+	const uint32_t img_idx = q->sub.image_index;
+	if (img_idx >= qgsc->image_count) {
+		return;
+	}
+
+	// The atlas holds sRGB-ENCODED bytes in a UNORM texture and every other
+	// pass (projection, zones, Local2D, window-space) blends in that encoded
+	// space. GL_FRAMEBUFFER_SRGB would re-encode on write and produce a quad
+	// ~2.2x too bright against encoded neighbours; the sampled swapchain's
+	// decode is suppressed below for the same reason.
+	glDisable(GL_DEPTH_TEST);
+#ifdef GL_FRAMEBUFFER_SRGB
+	glDisable(GL_FRAMEBUFFER_SRGB);
+#endif
+
+	struct xrt_normalized_rect nr = q->sub.norm_rect;
+	if (nr.w == 0.0f || nr.h == 0.0f) {
+		nr.x = 0.0f;
+		nr.y = 0.0f;
+		nr.w = 1.0f;
+		nr.h = 1.0f;
+	}
+	float pt[4] = {nr.x, nr.y, nr.w, nr.h};
+	if (data->flip_y) {
+		pt[1] += pt[3];
+		pt[3] = -pt[3];
+	}
+
+	// #1601: honour subImage.imageArrayIndex. Gated on the SWAPCHAIN's
+	// target, not on array_index != 0 — it is the SAMPLER's dimension that
+	// has to match, so even slice 0 of an arraySize>1 swapchain belongs on
+	// the sampler2DArray variant.
+	const bool layered = qgsc->target == GL_TEXTURE_2D_ARRAY;
+	const GLuint prog = layered ? c->program_quad_array : c->program_quad;
+	glUseProgram(prog);
+	const GLint loc_mvp = glGetUniformLocation(prog, "u_mvp");
+	const GLint loc_pt = glGetUniformLocation(prog, "u_post_transform");
+	const GLint loc_cscale = glGetUniformLocation(prog, "u_color_scale");
+	const GLint loc_cbias = glGetUniformLocation(prog, "u_color_bias");
+	glUniform4fv(loc_pt, 1, pt);
+
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(qgsc->target, qgsc->textures[img_idx]);
+	// Suppress the sample-time sRGB decode, as the projection swapchain path
+	// does at creation and the window-space / Local2D paths re-assert per
+	// draw: the atlas is UNORM holding sRGB-ENCODED bytes, so a quad that
+	// linearized here would blend against encoded neighbours and come out
+	// wrong.
+	if (gl_has_srgb_decode_ext()) {
+		glTexParameteri(qgsc->target, GL_TEXTURE_SRGB_DECODE_EXT, GL_SKIP_DECODE_EXT);
+	}
+	glUniform1i(glGetUniformLocation(prog, "u_texture"), 0);
+	if (layered) {
+		glUniform1f(glGetUniformLocation(prog, "u_layer"), (float)q->sub.array_index);
+	}
+
+	// Same effective grid (#542) the projection and window-space passes tile
+	// by, read the same way — a 1-vs-columns disagreement is exactly the
+	// stride bug #1666 was on the service.
+	const uint32_t cols = c->eff_cols > 0 ? c->eff_cols : c->tile_columns;
+	const uint32_t rows = c->eff_rows > 0 ? c->eff_rows : c->tile_rows;
+	const uint32_t tile_w = c->eff_tile_w > 0 ? c->eff_tile_w : c->view_width;
+	const uint32_t tile_h = c->eff_tile_h > 0 ? c->eff_tile_h : c->view_height;
+
+	// The scissor is mandatory, not belt-and-braces: unlike the
+	// fullscreen-triangle passes around it, a projected quad's geometry can
+	// extend past the viewport rect and GL viewports do not clip. The spill
+	// would land in the NEIGHBOUR view's tile and the DP would weave it as
+	// ghosting in the wrong eye.
+	glEnable(GL_SCISSOR_TEST);
+
+	for (uint32_t vi = 0; vi < view_count && vi < XRT_MAX_VIEWS; vi++) {
+		if (!visible[vi]) {
+			continue;
+		}
+
+		// Model * view * projection through THIS view's camera, exactly
+		// as the D3D11 reference's render_quad_layer: model = pose *
+		// scale(size.x, size.y, 1), view from the camera pose, Y-up
+		// infinite-reverse projection from the camera fov at near = 0.1.
+		struct xrt_matrix_4x4 model, view_mat, proj_mat, mv, mvp;
+		const struct xrt_vec3 qscale = {q->size.x, q->size.y, 1.0f};
+		math_matrix_4x4_model(&q->pose, &qscale, &model);
+		math_matrix_4x4_view_from_pose(&cameras[vi].pose, &view_mat);
+		math_matrix_4x4_projection_d3d_infinite_reverse(&cameras[vi].fov, 0.1f, &proj_mat);
+		math_matrix_4x4_multiply(&view_mat, &model, &mv);
+		math_matrix_4x4_multiply(&proj_mat, &mv, &mvp);
+
+		float cscale[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+		float cbias[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+		if (data->flags & XRT_LAYER_COMPOSITION_COLOR_BIAS_SCALE) {
+			cscale[0] = data->color_scale.r;
+			cscale[1] = data->color_scale.g;
+			cscale[2] = data->color_scale.b;
+			cscale[3] = data->color_scale.a;
+			cbias[0] = data->color_bias.r;
+			cbias[1] = data->color_bias.g;
+			cbias[2] = data->color_bias.b;
+			cbias[3] = data->color_bias.a;
+		}
+
+		/*
+		 * #1599/#1621: the SHARED three-way rule. A quad covers part of a
+		 * tile, so it is never the tile's base cover and can never reach
+		 * REPLACE — the first-in-tile gate belongs to the full-tile
+		 * projection blit alone. It does MARK the tile, so a projection
+		 * layer submitted after it blends over it rather than erasing it,
+		 * which is the whole point of composing the two in one loop.
+		 *
+		 * Resolved BEFORE the uniforms go down because an unflagged quad
+		 * is an OPAQUE_COVER, whose alpha-of-one is emitted by the SHADER
+		 * (no fixed-function blend factor can synthesise a constant one) —
+		 * the fold is half of that mode, the blend state is the other.
+		 */
+		const enum comp_layer_blend_mode mode = comp_layer_subrect_blend_mode(&tiles[vi], data->flags);
+		comp_layer_blend_fold_opaque_cover(mode, cscale, cbias);
+		gl_apply_blend_mode(mode);
+
+		glUniformMatrix4fv(loc_mvp, 1, GL_FALSE, mvp.v);
+		glUniform4fv(loc_cscale, 1, cscale);
+		glUniform4fv(loc_cbias, 1, cbias);
+
+		// #1625: the row index is flipped for GL's bottom-left framebuffer
+		// origin, exactly as in the projection pass — a quad must land in
+		// the same physical tile its view's projection content did.
+		uint32_t tox = 0, toy = 0;
+		u_tiling_view_origin_gl(vi, cols, rows, tile_w, tile_h, &tox, &toy);
+		glViewport((GLint)tox, (GLint)toy, (GLsizei)tile_w, (GLsizei)tile_h);
+		glScissor((GLint)tox, (GLint)toy, (GLsizei)tile_w, (GLsizei)tile_h);
+
+		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+		// One line per process, at the first quad GL ever draws — the
+		// hardware leg's discriminator between "the port is live" and "the
+		// frame carried no quad". NEVER per frame.
+		static bool first_quad_logged = false;
+		if (!first_quad_logged) {
+			first_quad_logged = true;
+			U_LOG_W("#1581: GL drew its first quad layer");
+		}
+	}
+
+	// Hand the pass back the way the projection blit expects it: no scissor
+	// (the blits around this one set a viewport but never a scissor, and a
+	// stale per-tile one would clip them). Blending is re-stated per draw by
+	// every caller in the loop, so it is left as the last mode set it.
+	glDisable(GL_SCISSOR_TEST);
+}
+
+/*!
  * The frame path proper. Runs with c->mutex HELD — see the locking wrapper
  * below. Keeps its early returns, which is why the lock lives in the wrapper.
  */
@@ -4789,8 +5002,74 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 	// gate is comp_layer_tile_blend_mode().
 	struct comp_layer_tile_state tiles[XRT_MAX_VIEWS] = {};
 
+	/*
+	 * #1580/#1581 — ONE camera per view per frame, shared by every layer
+	 * type: the {pose, fov} `xrLocateViews` reported, in the compositor's
+	 * ROOT layer space. The projection blit below is an identity-MVP
+	 * fullscreen blit, so the view tile IS that frustum; a quad composed
+	 * through any other camera lands on different display pixels than
+	 * projection content at the same world pose. Resolved ONCE PER VIEW PER
+	 * FRAME and hoisted out of the layer loop.
+	 *
+	 * The WHOLE DP eye set goes in, plus the frame's active view count, so
+	 * branch (b) gets the state tracker's mono-collapse and per-view-eye
+	 * rules; a left/right pair cannot express either. Canvas metres are 0
+	 * (the GL leg does not wire its window metrics yet), which only limits
+	 * branch (b) — every frame carrying a quad in the CTS composition set
+	 * also carries a projection layer, so branch (a) fires.
+	 *
+	 * The return value is a DIAGNOSTIC, not "don't draw" — see the @warning
+	 * on all three entry points in comp_layer_view_camera.h. `cameras[]` is
+	 * ALWAYS fully populated, including on the legacy-placeholder branch (c),
+	 * which returns false and logs once inside the helper. Gating a draw on
+	 * it makes a fallback frame silently quad-less.
+	 */
+	uint32_t quad_view_count = c->eff_views > 0 ? c->eff_views : 1;
+	if (quad_view_count > XRT_MAX_VIEWS) {
+		quad_view_count = XRT_MAX_VIEWS;
+	}
+	bool any_quad = false;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		if (c->layer_accum.layers[i].data.type == XRT_LAYER_QUAD) {
+			any_quad = true;
+			break;
+		}
+	}
+	struct comp_layer_view_camera cameras[XRT_MAX_VIEWS] = {};
+	for (uint32_t view = 0; any_quad && view < quad_view_count; view++) {
+		(void)comp_layer_view_camera_select_eyes(&c->layer_accum, view,
+		                                         c->have_cached_eye_pos ? &c->cached_eye_pos : NULL,
+		                                         quad_view_count, NULL, 0.0f, 0.0f, &cameras[view]);
+	}
+
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		struct comp_layer *layer = &c->layer_accum.layers[i];
+
+		/*
+		 * #1581 — XrCompositionLayerQuad, composited IN SUBMISSION ORDER
+		 * with the projection-class layers rather than in a later pass,
+		 * because this loop already walks the accum in that order and each
+		 * tile therefore sees every layer type in it. That is what the
+		 * in-process D3D11 leg does (one loop, all types) and what the
+		 * D3D12 port does, and it is the only way a projection layer
+		 * submitted AFTER a quad can composite over it — which is exactly
+		 * what the CTS ProjectionQuadProjection case submits. The separate
+		 * later pass this replaces always drew quads on top, whatever the
+		 * app asked for.
+		 *
+		 * The quad draw swaps program, viewport and scissor; the
+		 * projection body below re-states its own program, viewport and
+		 * blend per draw, so nothing has to be restored beyond the scissor
+		 * (which gl_render_quad_layer disables on the way out).
+		 */
+		if (layer->data.type == XRT_LAYER_QUAD) {
+			gl_render_quad_layer(c, layer, quad_view_count, cameras, tiles);
+			continue;
+		}
+
+		// #1581/#1602: cylinder, equirect1, equirect2 and cube are accepted
+		// by the compositor and still not drawn on this backend. Each needs
+		// its own shader, so they stay accepted-but-undrawn until ported.
 
 		// XR_DXR_display_zones: zone layers blit through the same pass at
 		// a sub-tile viewport (alpha-over in layer-list order).
@@ -4954,240 +5233,14 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 		gl_seed_blit_color_identity(c->program_blit_array);
 	}
 
-	// Projection-only capture point — atlas now contains projection
-	// content for every tile; window-space layers haven't been rendered
-	// yet. Atlas is bound as the FBO color attachment; the capture
-	// readback temporarily attaches its own FBO and reads via
-	// glReadPixels (origin lower-left).
+	// Projection-only capture point — atlas now contains projection-class
+	// layers (projection, projection-depth, zone, quad) for every tile;
+	// window-space layers haven't been rendered yet. Same boundary the D3D11
+	// and D3D12 legs capture at (#1581 put the quad draw inside their layer
+	// loops too), so the three backends photograph the same stage. Atlas is
+	// bound as the FBO color attachment; the capture readback temporarily
+	// attaches its own FBO and reads via glReadPixels (origin lower-left).
 	gl_compositor_dispatch_capture(c, MCP_CAPTURE_MODE_PROJECTION_ONLY);
-
-	// --- Step 1a½: Quad layers (XrCompositionLayerQuad — #1581, epic #1523) ---
-	//
-	// The GL compositor ACCEPTED quads (comp_layer_accum_quad) but never drew
-	// them, so every Khronos CTS interactive composition prompt, label and
-	// reference image was invisible on this backend.
-	//
-	// Placement is deliberately HERE: after the PROJECTION_ONLY capture above
-	// (so the MCP projection-only capture stays projection-only) and before
-	// the window-space pass below, with the atlas FBO still bound — so the
-	// /tmp/dxr_atlas_trigger dump, taken after both passes, shows the quads.
-	//
-	// The camera is the #1580 one: for each view, the frustum the app's own
-	// projection content for THAT view was rendered with. Resolved ONCE PER
-	// VIEW PER FRAME and hoisted out of the layer loop — a hardcoded camera is
-	// exactly the defect #1580 documents (quad and projection content for the
-	// same world position landing on different display pixels).
-	{
-		bool any_quad = false;
-		for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
-			if (c->layer_accum.layers[i].data.type == XRT_LAYER_QUAD) {
-				any_quad = true;
-				break;
-			}
-		}
-
-		uint32_t quad_view_count = c->eff_views;
-		if (quad_view_count == 0) {
-			quad_view_count = 1;
-		}
-		if (quad_view_count > XRT_MAX_VIEWS) {
-			quad_view_count = XRT_MAX_VIEWS;
-		}
-		// Same fallback as every other site that tiles into this atlas
-		// (gl_compute_effective_layout ran at the top of this commit, so
-		// eff_cols/eff_rows are always non-zero here and the fallback is
-		// unreachable) -- but it must READ the same, because a 1-vs-columns
-		// disagreement is exactly the stride bug #1666 was on the service,
-		// and a reader should not have to prove unreachability to rule it out.
-		const uint32_t quad_cols = c->eff_cols > 0 ? c->eff_cols : c->tile_columns;
-		const uint32_t quad_rows = c->eff_rows > 0 ? c->eff_rows : c->tile_rows;
-
-		if (any_quad) {
-			glDisable(GL_DEPTH_TEST);
-			// The atlas holds sRGB-ENCODED bytes in a UNORM texture and every
-			// other pass (zones, Local2D, window-space) blends in that encoded
-			// space. GL_FRAMEBUFFER_SRGB would re-encode on write and produce a
-			// quad ~2.2x too bright against encoded neighbours; the sampled
-			// swapchain's decode is suppressed below for the same reason.
-#ifdef GL_FRAMEBUFFER_SRGB
-			glDisable(GL_FRAMEBUFFER_SRGB);
-#endif
-			glEnable(GL_BLEND);
-			glEnable(GL_SCISSOR_TEST);
-		}
-
-		for (uint32_t view = 0; any_quad && view < quad_view_count; view++) {
-			// (1) Camera for this view — once, before any layer. The WHOLE
-			// DP eye set goes in, plus the frame's active view count, so
-			// branch (b) gets the state tracker's mono-collapse and
-			// per-view-eye rules (#1580); a left/right pair cannot express
-			// either. Canvas metres are 0 (unknown): every frame that carries
-			// a quad also carries a projection layer (true of the whole CTS
-			// composition set), so branch (a) fires and (b) is unreachable
-			// from here. Wiring the GL canvas metrics is a follow-up.
-			//
-			// The return value is a DIAGNOSTIC, not "don't draw" — see the
-			// @warning on all three entry points in
-			// comp_layer_view_camera.h: `cam` is ALWAYS fully populated when
-			// the out pointer is non-NULL, including on the legacy-placeholder
-			// branch (c), which returns false and logs once inside the helper.
-			// Gating the draw on it (as this call site did until #1581's
-			// follow-up) makes a fallback frame silently quad-less. `&cam` is
-			// a stack object, so the one genuine failure the helper has —
-			// out == NULL — cannot occur here; there is nothing left to guard.
-			// Matches comp_metal_compositor.m and both D3D11 sites, which all
-			// discard the result.
-			struct comp_layer_view_camera cam = {};
-			(void)comp_layer_view_camera_select_eyes(&c->layer_accum, view,
-			                                         c->have_cached_eye_pos ? &c->cached_eye_pos : NULL,
-			                                         quad_view_count, NULL, 0.0f, 0.0f, &cam);
-
-			struct xrt_matrix_4x4 view_mat, proj_mat;
-			math_matrix_4x4_view_from_pose(&cam.pose, &view_mat);
-			// Y-UP clip space (#1580). The Vulkan variant negates row 1, which
-			// mirrors every quad about the tile's horizontal centre line
-			// relative to the projection layer's identity blit.
-			math_matrix_4x4_projection_d3d_infinite_reverse(&cam.fov, 0.1f, &proj_mat);
-
-			// (2) Tile box — viewport AND scissor, in the same effective grid
-			// (#542) the projection and window-space passes tile by. The
-			// scissor is mandatory, not belt-and-braces: unlike the
-			// fullscreen-triangle passes around it, a projected quad's
-			// geometry can extend past the viewport rect and GL viewports do
-			// not clip. The spill would land in the NEIGHBOUR view's tile and
-			// the DP would weave it as ghosting in the wrong eye.
-			//
-			// #1625: the row index is flipped for GL's bottom-left
-			// framebuffer origin, exactly as in the projection pass —
-			// a quad must land in the same physical tile its view's
-			// projection did.
-			uint32_t tox = 0, toy = 0;
-			u_tiling_view_origin_gl(view, quad_cols, quad_rows, c->eff_tile_w, c->eff_tile_h, &tox, &toy);
-			const GLint vx = (GLint)tox;
-			const GLint vy = (GLint)toy;
-			glViewport(vx, vy, (GLsizei)c->eff_tile_w, (GLsizei)c->eff_tile_h);
-			glScissor(vx, vy, (GLsizei)c->eff_tile_w, (GLsizei)c->eff_tile_h);
-
-			// (3) The quads, in layer-list order.
-			for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
-				struct comp_layer *layer = &c->layer_accum.layers[i];
-				const struct xrt_layer_data *data = &layer->data;
-				if (data->type != XRT_LAYER_QUAD) {
-					continue;
-				}
-				if (!is_layer_view_visible_n(data, view, quad_view_count)) {
-					continue;
-				}
-				const struct xrt_layer_quad_data *q = &data->quad;
-
-				struct xrt_swapchain *qsc = layer->sc_array[0];
-				if (qsc == NULL) {
-					continue;
-				}
-				struct comp_gl_swapchain *qgsc = gl_swapchain(qsc);
-				uint32_t img_idx = q->sub.image_index;
-				if (img_idx >= qgsc->image_count) {
-					continue;
-				}
-
-				// MVP exactly as the D3D11 renderer's render_quad_layer:
-				// model = pose * scale(size.x, size.y, 1), view from the
-				// camera pose, Y-up infinite-reverse projection from the
-				// camera fov at near = 0.1.
-				struct xrt_matrix_4x4 model, mv, mvp;
-				struct xrt_vec3 qscale = {q->size.x, q->size.y, 1.0f};
-				math_matrix_4x4_model(&q->pose, &qscale, &model);
-				math_matrix_4x4_multiply(&view_mat, &model, &mv);
-				math_matrix_4x4_multiply(&proj_mat, &mv, &mvp);
-
-				struct xrt_normalized_rect nr = q->sub.norm_rect;
-				if (nr.w == 0.0f || nr.h == 0.0f) {
-					nr.x = 0.0f;
-					nr.y = 0.0f;
-					nr.w = 1.0f;
-					nr.h = 1.0f;
-				}
-				float pt[4] = {nr.x, nr.y, nr.w, nr.h};
-				if (data->flip_y) {
-					pt[1] += pt[3];
-					pt[3] = -pt[3];
-				}
-
-				float cscale[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-				float cbias[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-				if (data->flags & XRT_LAYER_COMPOSITION_COLOR_BIAS_SCALE) {
-					cscale[0] = data->color_scale.r;
-					cscale[1] = data->color_scale.g;
-					cscale[2] = data->color_scale.b;
-					cscale[3] = data->color_scale.a;
-					cbias[0] = data->color_bias.r;
-					cbias[1] = data->color_bias.g;
-					cbias[2] = data->color_bias.b;
-					cbias[3] = data->color_bias.a;
-				}
-
-				// #1621: the SHARED three-way rule, not the inverted two-way
-				// test that used to live here (SOURCE_ALPHA_BIT read as
-				// "straight"). The spec's straight-alpha switch is
-				// XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT, so
-				// SOURCE_ALPHA_BIT *alone* is PREMULTIPLIED and no
-				// source-alpha bit at all is an OPAQUE_COVER. The old mapping
-				// came from the design brief this port was written from, not
-				// from the port — and it made GL and Metal disagree with
-				// D3D11 on the same layer.
-				//
-				// A quad is never the tile's base cover, so it takes its own
-				// flags: the first-layer REPLACE gate (#1598) belongs to the
-				// full-tile projection blit alone.
-				//
-				// Resolved BEFORE the uniforms are written because an
-				// unflagged quad is an OPAQUE_COVER, whose alpha-of-one is
-				// emitted by the shader (fixed-function blending cannot make
-				// a constant one) — the fold is half of that mode, the blend
-				// state is the other.
-				const enum comp_layer_blend_mode mode = comp_layer_blend_mode(data->flags);
-				comp_layer_blend_fold_opaque_cover(mode, cscale, cbias);
-				gl_apply_blend_mode(mode);
-
-				const bool layered = qgsc->target == GL_TEXTURE_2D_ARRAY;
-				const GLuint prog = layered ? c->program_quad_array : c->program_quad;
-				glUseProgram(prog);
-				glUniformMatrix4fv(glGetUniformLocation(prog, "u_mvp"), 1, GL_FALSE, mvp.v);
-				glUniform4fv(glGetUniformLocation(prog, "u_post_transform"), 1, pt);
-				glUniform4fv(glGetUniformLocation(prog, "u_color_scale"), 1, cscale);
-				glUniform4fv(glGetUniformLocation(prog, "u_color_bias"), 1, cbias);
-
-				glActiveTexture(GL_TEXTURE0);
-				glBindTexture(qgsc->target, qgsc->textures[img_idx]);
-				// Suppress the sample-time sRGB decode, as the projection
-				// swapchain path does at creation and the window-space /
-				// Local2D paths re-assert per draw: the atlas is UNORM holding
-				// sRGB-ENCODED bytes, so a quad that linearized here would
-				// blend against encoded neighbours and come out wrong.
-				if (gl_has_srgb_decode_ext()) {
-					glTexParameteri(qgsc->target, GL_TEXTURE_SRGB_DECODE_EXT,
-					                GL_SKIP_DECODE_EXT);
-				}
-				glUniform1i(glGetUniformLocation(prog, "u_texture"), 0);
-				if (layered) {
-					glUniform1f(glGetUniformLocation(prog, "u_layer"),
-					            (float)q->sub.array_index);
-				}
-
-				glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-			}
-		}
-
-		if (any_quad) {
-			// Hand the pass back the way it was found: the window-space loop
-			// below sets its own viewport and blend but no scissor, and a
-			// stale per-tile scissor would clip it.
-			glDisable(GL_SCISSOR_TEST);
-			glDisable(GL_BLEND);
-			glViewport(0, 0, (GLsizei)(c->tile_columns * c->view_width),
-			           (GLsizei)(c->tile_rows * c->view_height));
-		}
-	}
 
 	// --- Step 1b: Render window-space layers (HUD overlays) ---
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
