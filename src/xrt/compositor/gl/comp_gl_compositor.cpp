@@ -1965,6 +1965,21 @@ gl_has_srgb_decode_ext(void)
  * Read from the app's REQUEST (`info.format`) through the same mapping the
  * texture was allocated with, so a format this backend does not know falls back
  * to GL_RGBA8 here exactly as it did there — one answer, not two.
+ *
+ * @note The format is the ONLY signal, and on GL it is the one an app can
+ *       silently contradict: `glEnable(GL_FRAMEBUFFER_SRGB)` is opt-in, so a GL
+ *       app that renders into a GL_SRGB8_ALPHA8 swapchain without enabling it
+ *       stores scene-linear values in a swapchain declared display-referred.
+ *       The OpenXR CTS's own GL plugin does exactly this — `RenderView()` and
+ *       `ClearImageSlice()` in `graphics_plugin_opengl.cpp` bind the swapchain
+ *       texture to an FBO and draw with the enable never set anywhere in its
+ *       tree — which is why GradientFormatsLinearVsNonLinear cannot pass on
+ *       `-G opengl` against ANY format-honest runtime: measured, its UNORM and
+ *       its sRGB swapchain hold bit-identical bytes. Its own
+ *       `SelectColorSwapchainFormat()` says "sRGB formats skipped due to CTS
+ *       bug"; this test reaches them anyway through `GetSRGBA8Format()`. Do NOT
+ *       "fix" that by making this function lie — it would un-do #1589 for every
+ *       honest app and re-break the SourceAlphaBlending cases that now pass.
  */
 static bool
 gl_swapchain_is_srgb(const struct comp_gl_swapchain *sc)
@@ -2227,8 +2242,27 @@ gl_compositor_create_swapchain(struct xrt_compositor *xc,
 
 	*out_xsc = &sc->base.base;
 
-	U_LOG_W("Created GL swapchain: %ux%u, %u images, format 0x%x",
-	         info->width, info->height, image_count, (unsigned)info->format);
+	/*
+	 * #1589: state the COLOUR CONTRACT this format implies, once per
+	 * swapchain, because GL is the one API where an app can silently break it.
+	 *
+	 * In D3D and Vulkan an `_SRGB` render target view encodes on write
+	 * unconditionally, so an app CANNOT leave scene-linear values in an sRGB
+	 * swapchain. In GL the encode is opt-in — `glEnable(GL_FRAMEBUFFER_SRGB)`
+	 * — so an app that renders into a GL_SRGB8_ALPHA8 swapchain without
+	 * enabling it stores linear values in a swapchain whose format declares
+	 * them display-referred. The runtime believes the format (ADR-021 §6) and
+	 * decodes, so that app's content lands a stop dark and looks exactly like
+	 * a runtime bug. This line is the discriminator, with no rebuild.
+	 */
+	U_LOG_W("Created GL swapchain: %ux%u, %u images, format 0x%x — %s",
+	         info->width, info->height, image_count, (unsigned)info->format,
+	         internal_format == GL_SRGB8_ALPHA8
+	             ? "sRGB: the runtime reads these bytes as ENCODED and decodes them on sample. An app "
+	               "RENDERING into this swapchain must glEnable(GL_FRAMEBUFFER_SRGB) (GL does not encode "
+	               "otherwise) or it stores scene-linear values the runtime will read as display-referred"
+	             : "linear: the runtime reads these bytes as scene-linear and encodes them on the way to "
+	               "the atlas");
 
 	// Restore previous GL context
 #ifdef XRT_OS_WINDOWS
