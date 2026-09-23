@@ -25,6 +25,7 @@
 #include "oxr_api_verify.h"
 #include "oxr_conversions.h"
 #include "oxr_legacy_mode_rule.h"
+#include "oxr_tracking_properties_rule.h"
 
 
 DEBUG_GET_ONCE_NUM_OPTION(scale_percentage, "OXR_VIEWPORT_SCALE_PERCENTAGE", 100)
@@ -668,8 +669,56 @@ oxr_system_get_properties(struct oxr_logger *log, struct oxr_system *sys, XrSyst
 	}
 	properties->graphicsProperties.maxSwapchainImageWidth = 1024 * 16;
 	properties->graphicsProperties.maxSwapchainImageHeight = 1024 * 16;
-	properties->trackingProperties.orientationTracking = xdev->supported.orientation_tracking;
-	properties->trackingProperties.positionTracking = xdev->supported.position_tracking;
+	/*
+	 * #1631: XrSystemTrackingProperties describes the SYSTEM, not the head.
+	 *
+	 * This used to be a straight copy off the head xdev, and in a display
+	 * session the head is the display driver's — so both flags read false
+	 * even while the system was handing out fully tracked controller poses.
+	 * The rule (option (b) on the issue, @ref oxr_tracking_properties_rule.h)
+	 * ORs three terms: the head's own flags, the display processor's
+	 * eye-tracking capability, and any tracked ROLE device (left/right
+	 * controller-or-hand, gamepad, hand trackers).
+	 *
+	 * Two consumers care. The CTS skips test_SpaceOffsets.cpp,
+	 * test_InteractiveThrow.cpp and test_ActionPoses.cpp outright with
+	 * "System does not support orientation or position tracking"; and some
+	 * WebXR pages read the same flag to decide whether to draw controllers
+	 * (qwerty_device.c:591-596 says so where it sets the flags on its HMD).
+	 *
+	 * A bare sim-display with no eye tracking (SIM_DISPLAY_FAKE_TRACKING
+	 * unset => supported_eye_tracking_modes == 0) and no role devices still
+	 * reports FALSE: the head really is untracked there, and nothing else in
+	 * the system tracks either.
+	 */
+	const bool dp_eye_tracking = oxr_dp_tracks_eyes(info ? info->supported_eye_tracking_modes : 0u);
+
+	bool role_orientation = false;
+	bool role_position = false;
+#define OXR_OR_ROLE_TRACKING(ROLE)                                                                                     \
+	{                                                                                                              \
+		const struct xrt_device *role_xdev = GET_XDEV_BY_ROLE(sys, ROLE);                                      \
+		if (role_xdev != NULL) {                                                                               \
+			role_orientation = role_orientation || role_xdev->supported.orientation_tracking;               \
+			role_position = role_position || role_xdev->supported.position_tracking;                       \
+		}                                                                                                      \
+	}
+	OXR_OR_ROLE_TRACKING(left)
+	OXR_OR_ROLE_TRACKING(right)
+	OXR_OR_ROLE_TRACKING(gamepad)
+	OXR_OR_ROLE_TRACKING(hand_tracking_unobstructed_left)
+	OXR_OR_ROLE_TRACKING(hand_tracking_unobstructed_right)
+	OXR_OR_ROLE_TRACKING(hand_tracking_conforming_left)
+	OXR_OR_ROLE_TRACKING(hand_tracking_conforming_right)
+#undef OXR_OR_ROLE_TRACKING
+
+	properties->trackingProperties.orientationTracking =
+	    oxr_system_orientation_tracking(xdev->supported.orientation_tracking, dp_eye_tracking, role_orientation)
+	        ? XR_TRUE
+	        : XR_FALSE;
+	properties->trackingProperties.positionTracking =
+	    oxr_system_position_tracking(xdev->supported.position_tracking, dp_eye_tracking, role_position) ? XR_TRUE
+	                                                                                                   : XR_FALSE;
 
 #ifdef OXR_HAVE_EXT_hand_tracking
 	XrSystemHandTrackingPropertiesEXT *hand_tracking_props = NULL;

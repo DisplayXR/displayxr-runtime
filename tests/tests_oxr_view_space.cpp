@@ -1519,3 +1519,47 @@ TEST_CASE("DXR_MODE_FLOOR=0 restores the pre-#1499 behaviour", "[oxr][view_space
 
 	tear_down(rt);
 }
+
+TEST_CASE("the system reports tracking when a tracked role device exists (#1631)", "[oxr][view_space][tracking_props]")
+{
+	// #1631 WIRING arm. The RULE (head flags OR the display processor's
+	// eye-tracking capability OR any tracked role device) is pinned on the
+	// host in tests/tests_oxr_tracking_properties_rule.cpp; what is pinned
+	// HERE is that oxr_system_get_properties() actually feeds it the role
+	// devices, which is the half that used to be missing — it read the head
+	// xdev and nothing else, and in a display session the head is the display
+	// driver's, so both flags came back false.
+	//
+	// Why this session is a TRUE case with no eye tracker and no hardware:
+	// the sim-display builder always adds the qwerty keyboard/mouse input
+	// devices (`t_builder_add_qwerty_input` in target_builder_sim_display.c),
+	// and the qwerty controllers set both supported.orientation_tracking and
+	// supported.position_tracking. Hence the DXR_TEST_HAVE_QWERTY gate — in a
+	// build without that driver there is no role device, nothing else in a
+	// bare sim-display system tracks, and FALSE is the correct answer.
+	Runtime rt;
+	if (!bring_up(rt)) {
+		return;
+	}
+
+	auto getProps = rt.fn<PFN_xrGetSystemProperties>("xrGetSystemProperties");
+	XrSystemProperties props{XR_TYPE_SYSTEM_PROPERTIES};
+	REQUIRE(XR_SUCCEEDED(getProps(rt.instance, rt.system, &props)));
+
+	INFO("orientationTracking=" << props.trackingProperties.orientationTracking
+	                            << " positionTracking=" << props.trackingProperties.positionTracking);
+
+#if DXR_TEST_HAVE_QWERTY
+	// The three CTS files that used to skip outright — test_SpaceOffsets.cpp,
+	// test_InteractiveThrow.cpp, test_ActionPoses.cpp — gate on exactly this.
+	CHECK(props.trackingProperties.orientationTracking == XR_TRUE);
+	CHECK(props.trackingProperties.positionTracking == XR_TRUE);
+#else
+	// SUCCEED, not SKIP: build-windows.yml reads any "SKIPPED:" from this
+	// binary as "the headless runtime did not come up" (#1370).
+	WARN("built without the qwerty driver - no tracked role device, so FALSE is correct here");
+	SUCCEED("no role devices in this build; the rule itself is pinned on the host");
+#endif
+
+	tear_down(rt);
+}
