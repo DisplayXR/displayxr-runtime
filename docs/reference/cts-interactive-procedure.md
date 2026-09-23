@@ -444,23 +444,35 @@ There is no way to skip a test from inside the CTS. Judge it.
 > Counts and names below are from the pinned tag **`openxr-cts-1.1.63.0`**.
 > Re-derive them if the pin moves.
 
-> ### ⚠ This category is currently runnable on `d3d11` only
+> ### ⚠ This category is runnable on `d3d11` and `d3d12` only (2026-09-23)
 >
-> **#1581 — quad layers are accepted but never rendered on D3D12, Vulkan,
-> Vulkan2 and OpenGL.** Those renderers filter to projection / projection-depth
-> / zone layers and drop quads on the floor. Every CTS composition test puts its
-> **prompt, its labels and its reference image in quad layers**, so on four of
-> the five Windows graphics plug-ins the operator sees no prompt, no labels and
-> no quad content — the category is not merely failing there, it is
-> **unjudgeable**. Do not attempt a composition pass on `-Graphics d3d12`,
-> `vulkan`, `vulkan2` or `opengl` until #1581 lands; a run that produces no
-> visible prompt is a harness gap, not a result.
+> **#1581 — quad layers are accepted but never rendered on Vulkan, Vulkan2 and
+> OpenGL.** Those renderers filter to projection / projection-depth / zone
+> layers and drop quads on the floor. Every CTS composition test puts its
+> **prompt, its labels and its reference image in quad layers**, so on those
+> plug-ins the operator sees no prompt, no labels and no quad content — the
+> category is not merely failing there, it is **unjudgeable**. Do not attempt a
+> composition pass on `-Graphics vulkan`, `vulkan2` or `opengl` until their
+> #1581 legs land; a run that produces no visible prompt is a harness gap, not
+> a result.
 >
-> **#1580 — projection-layer content is displaced relative to quad layers** on
-> the one plug-in that *does* draw quads (`d3d11`), so
-> `GradientFormatsLinearVsNonLinear` FAILs on every format sub-case and the
-> projection-vs-quad tests that make up most of this set are affected too. The
-> composition submission is blocked on both issues.
+> **`d3d11`** is the reference lane: 0 runtime-attributable failures on `main`
+> since #1606 (gradients 11/11, SourceAlphaBlending, the environment-blend
+> pair; `QuadHands` needs the qwerty hands raised first — §10.6).
+> **`d3d12`** joined it with #1689 (quad drawing, per-view cameras, painter's
+> order, the SRV heap sized for `XRT_MAX_LAYERS × XRT_MAX_VIEWS`) and #1694 (the
+> same private `_SRGB`-view compose model as D3D11): every judgeable case
+> passes there too, except the six **`Equirect2`** subtests, which stay blank
+> because the equirect2 layer type is accepted but not yet drawn on D3D12
+> (in progress). #1580 (projection content displaced relative to quads) is
+> resolved on both lanes.
+>
+> **Scenario cases are not composition cases:** their Menu key is not "Help" —
+> `SpaceOffsets` treats Menu as FAIL and `GripAndAimPose` as "swap hands", so
+> capture them without the Help step. `GripAndAimPose` / `SpaceOffsets` /
+> `InteractiveThrow` un-skip since #1693 (`trackingProperties` now reflects the
+> live role devices); the latter two cannot auto-pass on the qwerty rig until
+> the controllers report `XrSpaceVelocity` (#1692).
 
 **28 tests carry `[composition][interactive]`** at the pin. Ten of them skip on
 this runtime because the extension or view configuration they need is not
