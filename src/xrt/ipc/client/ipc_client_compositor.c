@@ -12,6 +12,7 @@
 #include "xrt/xrt_compositor.h"
 #include "xrt/xrt_defines.h"
 #include "xrt/xrt_config_os.h"
+#include "xrt/xrt_weave_dmabuf.h"
 
 #include <stdbool.h>
 
@@ -537,6 +538,81 @@ comp_ipc_client_compositor_weave_set_window_geometry(struct xrt_compositor *xc,
 	return ipc_call_weave_set_window_geometry(icc->ipc_c, origin_x, origin_y, client_w, client_h, display_id);
 }
 
+/*!
+ * Pack the platform-neutral half of a weave submit into its wire POD. Shared by
+ * weave_submit and the desktop-Linux weave_submit_dmabuf (#1699), so the two
+ * calls cannot drift in what rects / overlay / layout / flat regions mean.
+ */
+static void
+weave_pack_submit_args(struct ipc_arg_weave_submit *args,
+                       int32_t rect_x,
+                       int32_t rect_y,
+                       uint32_t rect_w,
+                       uint32_t rect_h,
+                       uint32_t rect_count,
+                       const struct xrt_rect *rects,
+                       bool have_overlay,
+                       uint32_t overlay_rect_count,
+                       const struct xrt_rect *overlay_rects,
+                       bool weave_frame_first,
+                       const struct xrt_weave_atlas_layout *layout,
+                       uint32_t flat_rect_count,
+                       const struct xrt_rect *flat_rects)
+{
+	U_ZERO(args);
+	args->rect_x = rect_x;
+	args->rect_y = rect_y;
+	args->rect_w = rect_w;
+	args->rect_h = rect_h;
+	// rect_count == 0 keeps the legacy single-rect layout (spec v2 wire
+	// bytes); >= 1 selects the batch layout (window-sized input, rects[]).
+	args->rect_count = rect_count;
+	for (uint32_t i = 0; i < rect_count; i++) {
+		args->rects[i].x = rects[i].offset.w; // xrt_offset fields are named w/h
+		args->rects[i].y = rects[i].offset.h;
+		args->rects[i].w = (uint32_t)rects[i].extent.w;
+		args->rects[i].h = (uint32_t)rects[i].extent.h;
+	}
+
+	// v4 overlay atlas (browser#18): a valid overlay_handle rides as a SECOND
+	// in_handle (index 1); have_overlay signals its presence to the server. The
+	// whole atlas is composited (premul alpha authoritative), so per-overlay
+	// rects are NOT marshalled — only the hint count crosses (keeps the message
+	// within IPC_BUF_SIZE; a second rects[] array would overflow it).
+	args->have_overlay = have_overlay ? 1u : 0u;
+	args->overlay_rect_count = overlay_rect_count;
+	(void)overlay_rects;
+
+	// v5 (browser#22): the first submit of a frame clears the runtime's woven
+	// output to transparent so gaps between tiles are transparent (not stale),
+	// letting a present-owner draw the woven output back WHOLE-WINDOW.
+	args->weave_frame_first = weave_frame_first ? 1u : 0u;
+
+	// v6 (#774): a declared N-view layout switches the input contract from
+	// per-rect squeezed SBS to a worst-case-sized multiview atlas (tiles packed
+	// contiguously top-left at content_view_w/h). view_count 0 — including a
+	// NULL layout from a pre-v6 caller — keeps the legacy behaviour.
+	if (layout != NULL && layout->view_count > 0) {
+		args->view_count = layout->view_count;
+		args->tile_columns = layout->tile_columns;
+		args->tile_rows = layout->tile_rows;
+		args->content_view_w = layout->content_view_w;
+		args->content_view_h = layout->content_view_h;
+	}
+
+	// v8 (browser#88): regions of this submit that must be physically flat. The
+	// service subtracts them from the weave rects to derive the published
+	// per-region hardware wish. Advisory and hardware-only — count 0 (a pre-v8
+	// caller) leaves the wire bytes and the behaviour unchanged.
+	args->flat_rect_count = flat_rect_count;
+	for (uint32_t i = 0; i < flat_rect_count; i++) {
+		args->flat_rects[i].x = flat_rects[i].offset.w; // xrt_offset fields are named w/h
+		args->flat_rects[i].y = flat_rects[i].offset.h;
+		args->flat_rects[i].w = (uint32_t)flat_rects[i].extent.w;
+		args->flat_rects[i].h = (uint32_t)flat_rects[i].extent.h;
+	}
+}
+
 xrt_result_t
 comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         xrt_graphics_buffer_handle_t in_handle,
@@ -586,58 +662,9 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
 	}
 
 	struct ipc_arg_weave_submit args = {0};
-	args.rect_x = rect_x;
-	args.rect_y = rect_y;
-	args.rect_w = rect_w;
-	args.rect_h = rect_h;
-	// rect_count == 0 keeps the legacy single-rect layout (spec v2 wire
-	// bytes); >= 1 selects the batch layout (window-sized input, rects[]).
-	args.rect_count = rect_count;
-	for (uint32_t i = 0; i < rect_count; i++) {
-		args.rects[i].x = rects[i].offset.w; // xrt_offset fields are named w/h
-		args.rects[i].y = rects[i].offset.h;
-		args.rects[i].w = (uint32_t)rects[i].extent.w;
-		args.rects[i].h = (uint32_t)rects[i].extent.h;
-	}
-
-	// v4 overlay atlas (browser#18): a valid overlay_handle rides as a SECOND
-	// in_handle (index 1); have_overlay signals its presence to the server. The
-	// whole atlas is composited (premul alpha authoritative), so per-overlay
-	// rects are NOT marshalled — only the hint count crosses (keeps the message
-	// within IPC_BUF_SIZE; a second rects[] array would overflow it).
 	const bool have_overlay = (overlay_handle != XRT_GRAPHICS_BUFFER_HANDLE_INVALID);
-	args.have_overlay = have_overlay ? 1u : 0u;
-	args.overlay_rect_count = overlay_rect_count;
-	(void)overlay_rects;
-
-	// v5 (browser#22): the first submit of a frame clears the runtime's woven
-	// output to transparent so gaps between tiles are transparent (not stale),
-	// letting a present-owner draw the woven output back WHOLE-WINDOW.
-	args.weave_frame_first = weave_frame_first ? 1u : 0u;
-
-	// v6 (#774): a declared N-view layout switches the input contract from
-	// per-rect squeezed SBS to a worst-case-sized multiview atlas (tiles packed
-	// contiguously top-left at content_view_w/h). view_count 0 — including a
-	// NULL layout from a pre-v6 caller — keeps the legacy behaviour.
-	if (layout != NULL && layout->view_count > 0) {
-		args.view_count = layout->view_count;
-		args.tile_columns = layout->tile_columns;
-		args.tile_rows = layout->tile_rows;
-		args.content_view_w = layout->content_view_w;
-		args.content_view_h = layout->content_view_h;
-	}
-
-	// v8 (browser#88): regions of this submit that must be physically flat. The
-	// service subtracts them from the weave rects to derive the published
-	// per-region hardware wish. Advisory and hardware-only — count 0 (a pre-v8
-	// caller) leaves the wire bytes and the behaviour unchanged.
-	args.flat_rect_count = flat_rect_count;
-	for (uint32_t i = 0; i < flat_rect_count; i++) {
-		args.flat_rects[i].x = flat_rects[i].offset.w; // xrt_offset fields are named w/h
-		args.flat_rects[i].y = flat_rects[i].offset.h;
-		args.flat_rects[i].w = (uint32_t)flat_rects[i].extent.w;
-		args.flat_rects[i].h = (uint32_t)flat_rects[i].extent.h;
-	}
+	weave_pack_submit_args(&args, rect_x, rect_y, rect_w, rect_h, rect_count, rects, have_overlay,
+	                       overlay_rect_count, overlay_rects, weave_frame_first, layout, flat_rect_count, flat_rects);
 
 	xrt_graphics_buffer_handle_t handles[2] = {in_handle, overlay_handle};
 	uint32_t handle_count = have_overlay ? 2u : 1u;
@@ -768,6 +795,192 @@ comp_ipc_client_compositor_weave_get_fence(struct xrt_compositor *xc,
 	*out_handle = h;
 	return XRT_SUCCESS;
 }
+
+#ifdef XRT_OS_LINUX_DESKTOP
+static void
+weave_pack_dmabuf(struct ipc_weave_dmabuf *dst, const struct xrt_weave_dmabuf_desc *src)
+{
+	U_ZERO(dst);
+	dst->drm_modifier = src->drm_modifier;
+	dst->buffer_id = src->buffer_id;
+	dst->width = src->width;
+	dst->height = src->height;
+	dst->drm_fourcc = src->drm_fourcc;
+	dst->plane_count = src->plane_count;
+	for (uint32_t i = 0; i < src->plane_count && i < IPC_WEAVE_DMABUF_MAX_PLANES; i++) {
+		dst->offsets[i] = src->offsets[i];
+		dst->strides[i] = src->strides[i];
+	}
+}
+
+/*!
+ * XR_DXR_weave v10 (#1699): the desktop-Linux dma-buf submit. Same POD as
+ * weave_submit for everything platform-neutral; the input / overlay dma-buf
+ * layouts ride beside it, and the fds (input, overlay, acquire sync_file) ride as
+ * in_handles — see @ref ipc_arg_weave_dmabuf for the slot map.
+ *
+ * FD ownership: this does NOT consume @p in->fd, @p overlay->fd or
+ * @p acquire_fence_fd — SCM_RIGHTS installs copies in the service and the
+ * originals stay the caller's (oxr_weave.c closes them only once the whole
+ * xrWeaveSubmitDXR has succeeded, per the spec's "runtime-owned on XR_SUCCESS"
+ * rule). @p out_release_fence_fd is a NEW fd this process owns, or -1 when the
+ * service completed the weave synchronously.
+ */
+xrt_result_t
+comp_ipc_client_compositor_weave_submit_dmabuf(struct xrt_compositor *xc,
+                                               const struct xrt_weave_dmabuf_desc *in,
+                                               const struct xrt_weave_dmabuf_desc *overlay,
+                                               int acquire_fence_fd,
+                                               int32_t rect_x,
+                                               int32_t rect_y,
+                                               uint32_t rect_w,
+                                               uint32_t rect_h,
+                                               uint32_t rect_count,
+                                               const struct xrt_rect *rects,
+                                               uint32_t overlay_rect_count,
+                                               bool weave_frame_first,
+                                               const struct xrt_weave_atlas_layout *layout,
+                                               uint32_t flat_rect_count,
+                                               const struct xrt_rect *flat_rects,
+                                               int *out_release_fence_fd,
+                                               bool *out_have_output,
+                                               uint32_t *out_width,
+                                               uint32_t *out_height,
+                                               uint64_t *out_fence_value,
+                                               struct xrt_eye_positions *out_eyes)
+{
+	if (xc == NULL || in == NULL || out_release_fence_fd == NULL || out_have_output == NULL ||
+	    out_width == NULL || out_height == NULL || out_fence_value == NULL || out_eyes == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	*out_release_fence_fd = -1;
+	if (in->fd < 0 || (overlay != NULL && overlay->fd < 0)) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	if (rect_count > IPC_WEAVE_SUBMIT_RECTS_MAX || (rect_count > 0 && rects == NULL)) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	if (overlay_rect_count > IPC_WEAVE_SUBMIT_RECTS_MAX) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	if (flat_rect_count > IPC_WEAVE_SUBMIT_FLAT_RECTS_MAX || (flat_rect_count > 0 && flat_rects == NULL)) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	*out_have_output = false;
+	*out_width = 0;
+	*out_height = 0;
+	*out_fence_value = 0;
+	U_ZERO(out_eyes);
+
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	struct ipc_arg_weave_submit args;
+	weave_pack_submit_args(&args, rect_x, rect_y, rect_w, rect_h, rect_count, rects, overlay != NULL,
+	                       overlay_rect_count, NULL, weave_frame_first, layout, flat_rect_count, flat_rects);
+
+	struct ipc_arg_weave_dmabuf dmabuf = {0};
+	weave_pack_dmabuf(&dmabuf.input, in);
+
+	// Slot map (ipc_arg_weave_dmabuf): [0] input, [1] overlay iff have_overlay,
+	// then the acquire sync_file. Both handle typedefs are `int` on desktop
+	// Linux, which is what lets a sync_file ride the buffer-typed array.
+	xrt_graphics_buffer_handle_t handles[3] = {in->fd, -1, -1};
+	uint32_t handle_count = 1;
+	if (overlay != NULL) {
+		weave_pack_dmabuf(&dmabuf.overlay, overlay);
+		handles[handle_count++] = overlay->fd;
+	}
+	if (acquire_fence_fd >= 0) {
+		dmabuf.acquire_fence_slot = handle_count;
+		handles[handle_count++] = acquire_fence_fd;
+	}
+
+	bool have = false;
+	uint32_t w = 0, h = 0;
+	uint64_t fv = 0;
+	struct xrt_eye_positions eyes = {0};
+	xrt_graphics_sync_handle_t release[1] = {XRT_GRAPHICS_SYNC_HANDLE_INVALID};
+	// Generated arg order: in args, in_handles (copied, not consumed), out args,
+	// then the out handles (the reply's release sync_file, received into
+	// release[] — a new descriptor in this process, or -1).
+	xrt_result_t xret = ipc_call_weave_submit_dmabuf(icc->ipc_c, &args, &dmabuf, handles, handle_count, &have,
+	                                                 &w, &h, &fv, &eyes, release, 1);
+	if (xret != XRT_SUCCESS) {
+		// The reply carries the result; a refused submit sends no fence, but
+		// never leak one if a service did.
+		if (release[0] >= 0) {
+			u_graphics_sync_unref(&release[0]);
+		}
+		return xret;
+	}
+	*out_release_fence_fd = release[0];
+	*out_have_output = have;
+	*out_width = w;
+	*out_height = h;
+	*out_fence_value = fv;
+	*out_eyes = eyes;
+	return XRT_SUCCESS;
+}
+
+/*!
+ * XR_DXR_weave v10 (#1699): export the woven output as a dma-buf with its
+ * layout. @p out_desc->fd is a NEW descriptor this process owns (-1 when there is
+ * nothing to hand out — before the first weave, or on a service without the
+ * desktop-Linux engine). A designed "nothing" is XRT_SUCCESS with
+ * @p out_have_output false, exactly like weave_get_output (#1427).
+ */
+xrt_result_t
+comp_ipc_client_compositor_weave_get_output_dmabuf(struct xrt_compositor *xc,
+                                                   bool *out_have_output,
+                                                   struct xrt_weave_dmabuf_output_desc *out_desc)
+{
+	if (xc == NULL || out_have_output == NULL || out_desc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	*out_have_output = false;
+	U_ZERO(out_desc);
+	out_desc->fd = -1;
+
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	bool have = false;
+	struct ipc_weave_dmabuf_output desc = {0};
+	xrt_graphics_buffer_handle_t handle[1] = {XRT_GRAPHICS_BUFFER_HANDLE_INVALID};
+	xrt_result_t xret = ipc_call_weave_get_output_dmabuf(icc->ipc_c, &have, &desc, handle, 1);
+	if (xret != XRT_SUCCESS) {
+		if (handle[0] >= 0) {
+			u_graphics_buffer_unref(&handle[0]);
+		}
+		return xret;
+	}
+	if (!have || handle[0] < 0 || desc.plane_count == 0 || desc.plane_count > IPC_WEAVE_DMABUF_MAX_PLANES) {
+		// Nothing usable: never hand the caller an fd without a layout.
+		if (handle[0] >= 0) {
+			u_graphics_buffer_unref(&handle[0]);
+		}
+		return XRT_SUCCESS;
+	}
+	*out_have_output = true;
+	out_desc->fd = handle[0];
+	out_desc->width = desc.width;
+	out_desc->height = desc.height;
+	out_desc->drm_fourcc = desc.drm_fourcc;
+	out_desc->drm_modifier = desc.drm_modifier;
+	out_desc->plane_count = desc.plane_count;
+	for (uint32_t i = 0; i < desc.plane_count; i++) {
+		out_desc->offsets[i] = desc.offsets[i];
+		out_desc->strides[i] = desc.strides[i];
+	}
+	out_desc->size = desc.size;
+	return XRT_SUCCESS;
+}
+#endif // XRT_OS_LINUX_DESKTOP
 
 xrt_result_t
 comp_ipc_client_compositor_weave_snap_window_rect(struct xrt_compositor *xc,

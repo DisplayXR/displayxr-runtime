@@ -160,8 +160,9 @@ class Arg:
 class HandleType:
     """A native handle type requiring special treatment."""
 
-    # Keep this synchronized with the definition in the JSON Schema.
+    # Keep these synchronized with the definitions in the JSON Schema.
     HANDLE_RE = re.compile(r"xrt_([a-z_]+)_handle_t")
+    NAME_RE = re.compile(r"^[a-z][a-z0-9_]*s$")
 
     def __init__(self, config_dict):
         """Construct from dict, originating in JSON."""
@@ -172,7 +173,16 @@ class HandleType:
                 + str(config_dict))
         self.typename = match.group(0)
         self.stem = match.group(1)
-        self.argstem = 'handles'
+        # Optional "name" (#1699): the argument stem, so a call can carry BOTH
+        # in_handles and out_handles without the two default "handles" /
+        # "handle_count" parameters colliding in ipc_call_*. Must be a plural
+        # (the count argument is the stem minus its trailing "s" + "_count").
+        name = config_dict.get("name", "handles")
+        if not self.NAME_RE.match(name):
+            raise RuntimeError(
+                "Handle 'name' must be a lower-case plural identifier "
+                "ending in 's': " + str(config_dict))
+        self.argstem = name
 
     def __str__(self):
         """Convert to string by returning the type name."""
@@ -316,6 +326,23 @@ class Call:
             self.id = "IPC_" + name.upper()
         if self.varlen and (self.in_handles or self.out_handles):
             raise Exception("Can not have handles with varlen functions")
+        if self.in_handles and self.out_handles:
+            # A call with both (weave_submit_dmabuf, #1699) passes both sets
+            # through ipc_call_*'s one parameter list, so their names must
+            # differ. The server side already prefixes in_ / out_, but the
+            # client proxy does not.
+            in_names = set(self.in_handles.arg_names)
+            out_names = set(self.out_handles.arg_names)
+            if in_names & out_names:
+                raise RuntimeError(
+                    "Call " + name + " has in_handles and out_handles with "
+                    "colliding argument names " + str(sorted(in_names & out_names))
+                    + "; give one of them a distinct 'name'")
+            arg_names = set(a.name for a in self.in_args + self.out_args)
+            if (in_names | out_names) & arg_names:
+                raise RuntimeError(
+                    "Call " + name + " has handle argument names colliding "
+                    "with in/out argument names")
 
 
 class Proto:

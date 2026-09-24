@@ -30,6 +30,7 @@
 #include <unistd.h>
 #endif
 
+#include <assert.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -6326,6 +6327,10 @@ ipc_handle_weave_set_screen_flat_regions(volatile struct ipc_client_state *ics,
  * u_graphics_buffer_unref skips invalid slots (the fd receive marks unfilled
  * slots -1). Win32 handles carry a DXGI-vs-NT low-bit tag and are the D3D11
  * service's business, so this is a no-op there.
+ *
+ * weave_submit_dmabuf (v10, #1699) passes its WHOLE in_handles array here, so the
+ * acquire sync_file slot is covered too: on desktop Linux both handle typedefs
+ * are `int`, and closing a sync_file is the same close() as closing a dma-buf.
  */
 static void
 weave_submit_release_handles(const xrt_graphics_buffer_handle_t *handles, uint32_t handle_count)
@@ -6661,6 +6666,304 @@ ipc_handle_weave_get_fence(volatile struct ipc_client_state *ics,
 		*out_handle_count = 1;
 		*out_have_fence = true;
 	}
+#else
+	(void)out_handles;
+#endif
+
+	return XRT_SUCCESS;
+}
+
+/*
+ * XR_DXR_weave v10 (#1699): the desktop-Linux dma-buf calls.
+ *
+ * Ownership, end to end (fds only; nothing here is shared memory):
+ *
+ *   in_handles[*]  received by SCM_RIGHTS = new fds owned by THIS handler. They
+ *                  pass to comp_multi_weave_submit_dmabuf, which owns them from
+ *                  the call on (xrt_weave_dmabuf.h: import consumes, cache hit or
+ *                  failure closes). Every return BEFORE that call closes them
+ *                  (weave_submit_release_handles).
+ *   release fence  a fresh fd the engine returns per frame, owned by this
+ *                  handler; sent as the reply's out handle (the client gets its
+ *                  own copy) and parked in ics->weave_deferred_close_fds, closed
+ *                  by the next dma-buf weave call or client teardown.
+ *   output fd      one dup per comp_multi_weave_export_output_dmabuf call, owned
+ *                  by this handler; same send-then-park rule.
+ */
+#ifdef XRT_OS_LINUX_DESKTOP
+void
+ipc_server_client_weave_flush_deferred_fds(volatile struct ipc_client_state *ics)
+{
+	uint32_t n = ics->weave_deferred_close_count;
+	if (n > ARRAY_SIZE(ics->weave_deferred_close_fds)) {
+		n = ARRAY_SIZE(ics->weave_deferred_close_fds);
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		int fd = ics->weave_deferred_close_fds[i];
+		if (fd >= 0) {
+			close(fd);
+		}
+		ics->weave_deferred_close_fds[i] = -1;
+	}
+	ics->weave_deferred_close_count = 0;
+}
+
+#if defined(COMP_MULTI_HAVE_WEAVE)
+//! Park @p fd to be closed once the reply carrying it is sent. The slots are
+//! drained at the top of every dma-buf weave call, so at most two are ever live
+//! (one release fence + one output dup); if that invariant ever breaks, close
+//! the OLDEST now rather than leak — its reply went out calls ago.
+static void
+weave_defer_close(volatile struct ipc_client_state *ics, int fd)
+{
+	if (fd < 0) {
+		return;
+	}
+	const uint32_t cap = ARRAY_SIZE(ics->weave_deferred_close_fds);
+	if (ics->weave_deferred_close_count >= cap) {
+		close(ics->weave_deferred_close_fds[0]);
+		for (uint32_t i = 1; i < cap; i++) {
+			ics->weave_deferred_close_fds[i - 1] = ics->weave_deferred_close_fds[i];
+		}
+		ics->weave_deferred_close_count = cap - 1;
+	}
+	ics->weave_deferred_close_fds[ics->weave_deferred_close_count++] = fd;
+}
+
+//! DRM_FORMAT_MOD_INVALID, spelled out so the IPC server needs no libdrm header.
+#define WEAVE_DRM_FORMAT_MOD_INVALID 0x00ffffffffffffffULL
+
+//! Wire POD + received fd -> the engine's descriptor. False = malformed.
+static bool
+weave_unpack_dmabuf(const struct ipc_weave_dmabuf *src, int fd, struct xrt_weave_dmabuf_desc *dst)
+{
+	if (fd < 0 || src->width == 0 || src->height == 0 || src->drm_fourcc == 0 ||
+	    src->drm_modifier == WEAVE_DRM_FORMAT_MOD_INVALID || src->plane_count == 0 ||
+	    src->plane_count > IPC_WEAVE_DMABUF_MAX_PLANES || src->plane_count > XRT_WEAVE_DMABUF_MAX_PLANES) {
+		return false;
+	}
+	U_ZERO(dst);
+	dst->fd = fd;
+	dst->width = src->width;
+	dst->height = src->height;
+	dst->drm_fourcc = src->drm_fourcc;
+	dst->drm_modifier = src->drm_modifier;
+	dst->plane_count = src->plane_count;
+	for (uint32_t i = 0; i < src->plane_count; i++) {
+		dst->offsets[i] = src->offsets[i];
+		dst->strides[i] = src->strides[i];
+	}
+	dst->buffer_id = src->buffer_id;
+	return true;
+}
+#endif // COMP_MULTI_HAVE_WEAVE
+#endif // XRT_OS_LINUX_DESKTOP
+
+// The dma-buf submit is the largest message on the wire; keep it honest.
+static_assert(sizeof(struct ipc_weave_submit_dmabuf_msg) <= IPC_BUF_SIZE,
+              "weave_submit_dmabuf message exceeds IPC_BUF_SIZE");
+static_assert(sizeof(struct ipc_weave_submit_msg) <= IPC_BUF_SIZE, "weave_submit message exceeds IPC_BUF_SIZE");
+
+xrt_result_t
+ipc_handle_weave_submit_dmabuf(volatile struct ipc_client_state *ics,
+                               const struct ipc_arg_weave_submit *args,
+                               const struct ipc_arg_weave_dmabuf *dmabuf,
+                               bool *out_have_output,
+                               uint32_t *out_width,
+                               uint32_t *out_height,
+                               uint64_t *out_fence_value,
+                               struct xrt_eye_positions *out_eyes,
+                               uint32_t max_release_fence_count,
+                               xrt_graphics_sync_handle_t *out_release_fences,
+                               uint32_t *out_release_fence_count,
+                               const xrt_graphics_buffer_handle_t *handles,
+                               uint32_t handle_count)
+{
+	IPC_TRACE_MARKER();
+
+	*out_have_output = false;
+	*out_width = 0;
+	*out_height = 0;
+	*out_fence_value = 0;
+	U_ZERO(out_eyes);
+	*out_release_fence_count = 0;
+
+#ifdef XRT_OS_LINUX_DESKTOP
+	// The previous dma-buf reply is on the wire by now: drop what it carried.
+	ipc_server_client_weave_flush_deferred_fds(ics);
+#endif
+
+	xrt_result_t auth = require_present_owner(ics, "weave_submit_dmabuf");
+	if (auth != XRT_SUCCESS) {
+		weave_submit_release_handles(handles, handle_count);
+		return auth;
+	}
+	if (ics->xc == NULL) {
+		weave_submit_release_handles(handles, handle_count);
+		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
+	}
+
+#if defined(COMP_MULTI_HAVE_WEAVE) && defined(XRT_OS_LINUX_DESKTOP)
+	// The wire is not trusted: every bound is re-checked, and every malformed
+	// request still closes what it was sent.
+	const uint32_t expect_handles =
+	    1u + (args->have_overlay ? 1u : 0u) + (dmabuf->acquire_fence_slot != 0 ? 1u : 0u);
+	bool bad = handle_count != expect_handles || max_release_fence_count < 1 ||
+	           args->rect_count > IPC_WEAVE_SUBMIT_RECTS_MAX ||
+	           args->flat_rect_count > IPC_WEAVE_SUBMIT_FLAT_RECTS_MAX ||
+	           (dmabuf->acquire_fence_slot != 0 && dmabuf->acquire_fence_slot != expect_handles - 1u);
+
+	struct xrt_weave_dmabuf_desc in_desc;
+	struct xrt_weave_dmabuf_desc overlay_desc;
+	if (!bad) {
+		bad = !weave_unpack_dmabuf(&dmabuf->input, handles[0], &in_desc);
+	}
+	if (!bad && args->have_overlay) {
+		bad = !weave_unpack_dmabuf(&dmabuf->overlay, handles[1], &overlay_desc);
+	}
+	int acquire_fd = -1;
+	if (!bad && dmabuf->acquire_fence_slot != 0) {
+		acquire_fd = handles[dmabuf->acquire_fence_slot];
+		bad = acquire_fd < 0;
+	}
+
+	struct xrt_weave_atlas_layout layout = {0};
+	if (!bad && args->view_count > 0) {
+		bad = args->tile_columns == 0 || args->tile_rows == 0 || args->content_view_w == 0 ||
+		      args->content_view_h == 0 || args->view_count > XRT_MAX_VIEWS ||
+		      args->view_count != args->tile_columns * args->tile_rows;
+		layout.view_count = args->view_count;
+		layout.tile_columns = args->tile_columns;
+		layout.tile_rows = args->tile_rows;
+		layout.content_view_w = args->content_view_w;
+		layout.content_view_h = args->content_view_h;
+	}
+	if (bad) {
+		weave_submit_release_handles(handles, handle_count);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	struct xrt_rect rects[IPC_WEAVE_SUBMIT_RECTS_MAX];
+	for (uint32_t i = 0; i < args->rect_count; i++) {
+		rects[i].offset.w = args->rects[i].x; // xrt_offset fields are named w/h
+		rects[i].offset.h = args->rects[i].y;
+		rects[i].extent.w = (int)args->rects[i].w;
+		rects[i].extent.h = (int)args->rects[i].h;
+	}
+	struct xrt_rect flat_rects[IPC_WEAVE_SUBMIT_FLAT_RECTS_MAX];
+	for (uint32_t i = 0; i < args->flat_rect_count; i++) {
+		flat_rects[i].offset.w = args->flat_rects[i].x;
+		flat_rects[i].offset.h = args->flat_rects[i].y;
+		flat_rects[i].extent.w = (int)args->flat_rects[i].w;
+		flat_rects[i].extent.h = (int)args->flat_rects[i].h;
+	}
+
+	// From here on every received fd is the ENGINE's (xrt_weave_dmabuf.h), on
+	// success and on refusal alike — nothing below may close them.
+	int release_fd = -1;
+	uint32_t w = 0, h = 0;
+	uint64_t fv = 0;
+	struct xrt_eye_positions eyes = {0};
+	bool ok = comp_multi_weave_submit_dmabuf(                   //
+	    ics->xc, &in_desc,                                      //
+	    args->have_overlay ? &overlay_desc : NULL,              //
+	    acquire_fd,                                             //
+	    args->rect_x, args->rect_y, args->rect_w, args->rect_h, //
+	    args->rect_count, args->rect_count > 0 ? rects : NULL,  //
+	    args->weave_frame_first != 0,                           //
+	    layout.view_count > 0 ? &layout : NULL,                 //
+	    args->flat_rect_count,                                  //
+	    args->flat_rect_count > 0 ? flat_rects : NULL,           //
+	    &release_fd, &w, &h, &fv, &eyes);
+	if (!ok) {
+		// Transient engine refusal, not a dead pipe (browser#103). A refused
+		// submit owes the caller no fence; never leak one an engine returned.
+		if (release_fd >= 0) {
+			close(release_fd);
+		}
+		return XRT_ERROR_WEAVE_REFUSED;
+	}
+	if (release_fd >= 0) {
+		out_release_fences[0] = release_fd;
+		*out_release_fence_count = 1;
+		weave_defer_close(ics, release_fd); // closed after this reply is sent
+	}
+	*out_have_output = true;
+	*out_width = w;
+	*out_height = h;
+	*out_fence_value = fv;
+	*out_eyes = eyes;
+	return XRT_SUCCESS;
+#else
+	// No desktop-Linux weave engine in this build (every other platform, and
+	// Linux with XRT_FEATURE_COMP_MULTI_WEAVE_LINUX off). The fds are still
+	// live descriptors in this process — close them, or a present owner that
+	// retries every frame exhausts the fd table.
+	(void)args;
+	(void)dmabuf;
+	(void)max_release_fence_count;
+	(void)out_release_fences;
+	weave_submit_release_handles(handles, handle_count);
+	return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+#endif
+}
+
+xrt_result_t
+ipc_handle_weave_get_output_dmabuf(volatile struct ipc_client_state *ics,
+                                   bool *out_have_output,
+                                   struct ipc_weave_dmabuf_output *out_desc,
+                                   uint32_t max_handle_count,
+                                   xrt_graphics_buffer_handle_t *out_handles,
+                                   uint32_t *out_handle_count)
+{
+	IPC_TRACE_MARKER();
+
+	*out_have_output = false;
+	U_ZERO(out_desc);
+	*out_handle_count = 0;
+
+#ifdef XRT_OS_LINUX_DESKTOP
+	ipc_server_client_weave_flush_deferred_fds(ics);
+#endif
+
+	xrt_result_t auth = require_present_owner(ics, "weave_get_output_dmabuf");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (ics->xc == NULL || max_handle_count < 1) {
+		return XRT_SUCCESS;
+	}
+
+#if defined(COMP_MULTI_HAVE_WEAVE) && defined(XRT_OS_LINUX_DESKTOP)
+	struct xrt_weave_dmabuf_output_desc d;
+	U_ZERO(&d);
+	d.fd = -1;
+	if (!comp_multi_weave_export_output_dmabuf(ics->xc, &d)) {
+		if (d.fd >= 0) {
+			close(d.fd); // defensive: a refusal hands nothing out
+		}
+		return XRT_SUCCESS; // designed "nothing yet" (#1427), not an error
+	}
+	if (d.fd < 0 || d.plane_count == 0 || d.plane_count > IPC_WEAVE_DMABUF_MAX_PLANES) {
+		if (d.fd >= 0) {
+			close(d.fd);
+		}
+		return XRT_SUCCESS;
+	}
+	out_desc->drm_modifier = d.drm_modifier;
+	out_desc->size = d.size;
+	out_desc->width = d.width;
+	out_desc->height = d.height;
+	out_desc->drm_fourcc = d.drm_fourcc;
+	out_desc->plane_count = d.plane_count;
+	for (uint32_t i = 0; i < d.plane_count; i++) {
+		out_desc->offsets[i] = d.offsets[i];
+		out_desc->strides[i] = d.strides[i];
+	}
+	out_handles[0] = d.fd;
+	*out_handle_count = 1;
+	*out_have_output = true;
+	weave_defer_close(ics, d.fd); // the dup is ours; the client gets its own copy
 #else
 	(void)out_handles;
 #endif
