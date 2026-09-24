@@ -47,6 +47,13 @@
  * --no-release-wait skips that wait: the negative control, which must FAIL.
  * --linear forces LINEAR inputs.
  *
+ * --span2d (#1654 on the service path): the off-panel part of the window must
+ * come back FLAT 2D (one view of the input, in register with the window), the
+ * on-panel part still woven. The probe reads the panel's desktop rect through
+ * XR_DXR_display_info, re-binds the window geometry straddling the panel's
+ * left edge, straddling its bottom edge, wholly off it and back on, and checks
+ * pixels in each (batch + v4 overlay), then the v6 N-view layout straddling.
+ *
  * Run (service already started with the sim display plug-in):
  *   SIM_DISPLAY_OUTPUT=anaglyph XRT_PLUGIN_SEARCH_PATH=build/_plugins \
  *     build/src/xrt/targets/service/displayxr-service &
@@ -61,6 +68,7 @@
 #include <openxr/openxr_platform.h>
 #include <openxr/XR_DXR_weave.h>
 #include <openxr/XR_DXR_view_rig.h>
+#include <openxr/XR_DXR_display_info.h>
 
 // The dma-buf transport calls, shared with weave/weave_present_vk_linux.
 #include "weave_dmabuf_vk.h"
@@ -999,12 +1007,271 @@ run_dmabuf(Vk &vk,
 	return pass;
 }
 
+
+/*
+ *
+ * --span2d: off-panel flat 2D (#1654 on the service path).
+ *
+ */
+
+struct PanelRect
+{
+	int32_t left = 0, top = 0;
+	uint32_t w = 0, h = 0;
+};
+
+//! One pixel check: @p want is the expected RGB (each channel within 60) with alpha > 200.
+static bool
+span_check(const std::vector<uint8_t> &px,
+           uint32_t w,
+           const char *what,
+           int x,
+           int y,
+           uint8_t wr,
+           uint8_t wg,
+           uint8_t wb)
+{
+	uint8_t r, g, b, a;
+	sample(px, w, x, y, &r, &g, &b, &a);
+	auto near = [](uint8_t v, uint8_t want) { return (v > want ? v - want : want - v) <= 60; };
+	const bool ok = near(r, wr) && near(g, wg) && near(b, wb) && a > 200;
+	LOG("  %-34s @(%4d,%3d) = (%3u,%3u,%3u,a=%3u) want (%3u,%3u,%3u) -> %s", what, x, y, r, g, b, a, wr, wg, wb,
+	    ok ? "OK" : "WRONG");
+	return ok;
+}
+
+static bool
+span_bind(XrSession session, PFN_xrWeaveBindWindow2DXR pfn_bind2, int32_t x, int32_t y, uint32_t w, uint32_t h)
+{
+	XrWeaveWindowGeometryDXR geom = {(XrStructureType)XR_TYPE_WEAVE_WINDOW_GEOMETRY_DXR};
+	geom.windowOriginOnScreen = {x, y};
+	geom.clientSize = {(int32_t)w, (int32_t)h};
+	geom.displayId = -1;
+	XrWeaveBindWindowInfoDXR bind = {(XrStructureType)XR_TYPE_WEAVE_BIND_WINDOW_INFO_DXR};
+	bind.next = &geom;
+	bind.windowHandle = (void *)(uintptr_t)0x1;
+	XrResult r = pfn_bind2(session, &bind);
+	if (XR_FAILED(r)) {
+		LOG("FAIL: re-bind geometry (%d,%d) -> %d", x, y, (int)r);
+		return false;
+	}
+	return true;
+}
+
+/*!
+ * Submit @p submit a few times and read the output back. The output fd is
+ * handed out once per allocation; @p out_img keeps the import across calls and
+ * is replaced when the service hands a new one (a v6 resize).
+ */
+static bool
+span_submit_readback(Vk &vk,
+                     XrSession session,
+                     PFN_xrWeaveSubmitDXR pfn_submit,
+                     const XrWeaveSubmitInfoDXR &submit,
+                     Image &out_img,
+                     std::vector<uint8_t> &px)
+{
+	for (int frame = 0; frame < 3; frame++) {
+		XrWeaveOutputDXR out = {(XrStructureType)XR_TYPE_WEAVE_OUTPUT_DXR};
+		XrResult r = pfn_submit(session, &submit, &out);
+		if (XR_FAILED(r)) {
+			LOG("FAIL: xrWeaveSubmitDXR -> %d", (int)r);
+			return false;
+		}
+		if (out.weavedTexture != nullptr) {
+			if (out_img.image != VK_NULL_HANDLE) {
+				destroy_image(vk, out_img);
+			}
+			if (!import_output_image(vk, (int)(intptr_t)out.weavedTexture, out.width, out.height, out_img)) {
+				LOG("FAIL: import of the woven output");
+				return false;
+			}
+		}
+	}
+	if (out_img.image == VK_NULL_HANDLE) {
+		LOG("FAIL: no woven output was handed back");
+		return false;
+	}
+	return readback(vk, out_img, px);
+}
+
+static bool
+run_span2d(Vk &vk,
+           XrSession session,
+           PFN_xrWeaveBindWindow2DXR pfn_bind2,
+           PFN_xrWeaveSubmitDXR pfn_submit,
+           const PanelRect &panel,
+           const std::string &dump_dir)
+{
+	LOG("span2d: panel at (%d,%d) %ux%u; window %ux%u", panel.left, panel.top, panel.w, panel.h, kWinW, kWinH);
+
+	// Batch input. Rect A's left eye is split WHITE | BLACK so the flat 2D
+	// must land in register: the unsqueezed left eye is white over the rect's
+	// left half and black over its right half. Its right eye is black, so the
+	// on-panel anaglyph weave is RED | BLACK. Rect B: left BLACK, right WHITE
+	// -> flat BLACK, woven CYAN.
+	std::vector<uint8_t> in_px((size_t)kWinW * kWinH * 4);
+	for (uint32_t y = 0; y < kWinH; y++) {
+		for (uint32_t x = 0; x < kWinW; x++) {
+			put_px(in_px, kWinW, (int)x, (int)y, 32, 32, 32);
+		}
+	}
+	fill_sbs_rect(in_px, kWinW, kRectA, 0x00, 0x00);
+	for (int y = kRectA.offset.y; y < kRectA.offset.y + kRectA.extent.height; y++) {
+		for (int x = kRectA.offset.x; x < kRectA.offset.x + kRectA.extent.width / 4; x++) {
+			put_px(in_px, kWinW, x, y, 0xFF, 0xFF, 0xFF);
+		}
+	}
+	fill_sbs_rect(in_px, kWinW, kRectB, 0x00, 0xFF);
+	std::vector<uint8_t> ov_px((size_t)kWinW * kWinH * 4, 0);
+	for (int y = kOverlayBar.offset.y; y < kOverlayBar.offset.y + kOverlayBar.extent.height; y++) {
+		for (int x = kOverlayBar.offset.x; x < kOverlayBar.offset.x + kOverlayBar.extent.width; x++) {
+			put_px(ov_px, kWinW, x, y, 230, 13, 230, 255);
+		}
+	}
+	Image input, overlay, out_img;
+	if (!create_exported_image(vk, kWinW, kWinH, input) || !upload_and_release(vk, input, in_px) ||
+	    !create_exported_image(vk, kWinW, kWinH, overlay) || !upload_and_release(vk, overlay, ov_px)) {
+		LOG("FAIL: span2d image setup");
+		return false;
+	}
+
+	XrRect2Di rects[2] = {kRectA, kRectB};
+	XrWeaveSubmitOverlaysDXR ov = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_OVERLAYS_DXR};
+	ov.overlayTexture = (void *)(intptr_t)overlay.fd;
+	XrWeaveSubmitRectsDXR batch = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_RECTS_DXR};
+	batch.next = &ov;
+	batch.rectCount = 2;
+	batch.rects = rects;
+	XrWeaveSubmitInfoDXR submit = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_INFO_DXR};
+	submit.next = &batch;
+	submit.firstChunk = XR_TRUE;
+	submit.inputTexture = (void *)(intptr_t)input.fd;
+
+	const uint8_t W = 255, K = 0;
+	// Sample points (window px). A's flat left half / right half, B's centre,
+	// the overlay bar on both sides of x = 640.
+	const int ax_l = kRectA.offset.x + kRectA.extent.width / 4;     // 180: flat WHITE, woven RED
+	const int ax_r = kRectA.offset.x + 3 * kRectA.extent.width / 4; // 340: BLACK either way
+	const int ay = kRectA.offset.y + kRectA.extent.height / 2;
+	const int bx = kRectB.offset.x + kRectB.extent.width / 2;
+	const int by = kRectB.offset.y + kRectB.extent.height / 2;
+	const int bar_y = kOverlayBar.offset.y + kOverlayBar.extent.height / 2;
+
+	bool pass = true;
+	std::vector<uint8_t> px;
+	struct Case
+	{
+		const char *name;
+		int32_t x, y; // window origin, desktop-absolute
+	} cases[] = {
+	    // Left 640 columns off the panel (to its left): rect A flat, B woven.
+	    {"straddle-left", panel.left - 640, panel.top + 48},
+	    // Rows >= 300 off the panel (below it): rect B flat, A woven.
+	    {"straddle-bottom", panel.left + 64, panel.top + (int32_t)panel.h - 300},
+	    // Entirely off (left of the panel): everything flat, weave skipped.
+	    {"off-panel", panel.left - (int32_t)kWinW - 100, panel.top + 48},
+	    // Back on: the plain weave again.
+	    {"on-panel", panel.left + 64, panel.top + 48},
+	};
+	for (const Case &c : cases) {
+		LOG("span2d case %s: window at (%d,%d)", c.name, c.x, c.y);
+		if (!span_bind(session, pfn_bind2, c.x, c.y, kWinW, kWinH) ||
+		    !span_submit_readback(vk, session, pfn_submit, submit, out_img, px)) {
+			pass = false;
+			break;
+		}
+		if (out_img.w != kWinW || out_img.h != kWinH) {
+			LOG("FAIL: output %ux%u != window", out_img.w, out_img.h);
+			pass = false;
+			break;
+		}
+		dump_ppm(px, out_img.w, out_img.h, dump_dir + "/weave_probe_linux_span2d_" + c.name + ".ppm");
+		const bool a_off = strcmp(c.name, "straddle-left") == 0 || strcmp(c.name, "off-panel") == 0;
+		const bool b_off = strcmp(c.name, "straddle-bottom") == 0 || strcmp(c.name, "off-panel") == 0;
+		bool ok = true;
+		if (a_off) {
+			ok &= span_check(px, kWinW, "rectA left half (flat WHITE)", ax_l, ay, W, W, W);
+		} else {
+			ok &= span_check(px, kWinW, "rectA left half (woven RED)", ax_l, ay, W, K, K);
+		}
+		ok &= span_check(px, kWinW, "rectA right half (BLACK)", ax_r, ay, K, K, K);
+		if (b_off) {
+			ok &= span_check(px, kWinW, "rectB (flat BLACK)", bx, by, K, K, K);
+		} else {
+			ok &= span_check(px, kWinW, "rectB (woven CYAN)", bx, by, K, W, W);
+		}
+		ok &= span_check(px, kWinW, "overlay bar x=300 (MAGENTA)", 300, bar_y, 230, 13, 230);
+		ok &= span_check(px, kWinW, "overlay bar x=900 (MAGENTA)", 900, bar_y, 230, 13, 230);
+		{
+			uint8_t r, g, b, a;
+			sample(px, kWinW, 10, 10, &r, &g, &b, &a);
+			const bool gap = a < 40;
+			LOG("  %-34s @(%4d,%3d) alpha=%u want ~0 -> %s", "gap outside every rect", 10, 10, a,
+			    gap ? "OK" : "WRONG");
+			ok &= gap;
+		}
+		LOG("span2d case %s: %s", c.name, ok ? "PASS" : "FAIL");
+		pass = pass && ok;
+	}
+	destroy_image(vk, out_img);
+
+	// v6 N-view atlas (2x1 red|cyan, content view 640x360 = the 1280x720
+	// window at viewScale 0.5), window straddling the panel's left edge: the
+	// output's left half (window x < 640 -> output x < 320) is flat = the
+	// centre tile (view 0, RED); the right half is woven (anaglyph WHITE).
+	if (pass) {
+		const uint32_t cvw = 640, cvh = 360;
+		std::vector<uint8_t> nv_px((size_t)2 * cvw * cvh * 4);
+		for (uint32_t y = 0; y < cvh; y++) {
+			for (uint32_t x = 0; x < cvw; x++) {
+				put_px(nv_px, 2 * cvw, (int)x, (int)y, 0xFF, 0x00, 0x00);
+				put_px(nv_px, 2 * cvw, (int)(cvw + x), (int)y, 0x00, 0xFF, 0xFF);
+			}
+		}
+		Image nv_input;
+		bool ok = create_exported_image(vk, 2 * cvw, cvh, nv_input) && upload_and_release(vk, nv_input, nv_px);
+		XrWeaveSubmitLayoutDXR lay = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_LAYOUT_DXR};
+		lay.viewCount = 2;
+		lay.tileColumns = 2;
+		lay.tileRows = 1;
+		lay.contentViewWidth = cvw;
+		lay.contentViewHeight = cvh;
+		XrWeaveSubmitInfoDXR v6 = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_INFO_DXR};
+		v6.next = &lay;
+		v6.inputTexture = (void *)(intptr_t)nv_input.fd;
+		v6.firstChunk = XR_TRUE;
+		LOG("span2d case v6-straddle-left: window at (%d,%d)", panel.left - 640, panel.top + 48);
+		ok = ok && span_bind(session, pfn_bind2, panel.left - 640, panel.top + 48, kWinW, kWinH) &&
+		     span_submit_readback(vk, session, pfn_submit, v6, out_img, px);
+		if (ok && (out_img.w != cvw || out_img.h != cvh)) {
+			LOG("FAIL: v6 output %ux%u != %ux%u", out_img.w, out_img.h, cvw, cvh);
+			ok = false;
+		}
+		if (ok) {
+			dump_ppm(px, cvw, cvh, dump_dir + "/weave_probe_linux_span2d_v6.ppm");
+			ok &= span_check(px, cvw, "v6 off-panel half (flat RED)", 160, 180, W, K, K);
+			ok &= span_check(px, cvw, "v6 seam, off side (flat RED)", 318, 180, W, K, K);
+			ok &= span_check(px, cvw, "v6 seam, on side (woven WHITE)", 322, 180, W, W, W);
+			ok &= span_check(px, cvw, "v6 on-panel half (woven WHITE)", 480, 180, W, W, W);
+		}
+		LOG("span2d case v6-straddle-left: %s", ok ? "PASS" : "FAIL");
+		pass = pass && ok;
+		destroy_image(vk, out_img);
+		destroy_image(vk, nv_input);
+	}
+
+	destroy_image(vk, input);
+	destroy_image(vk, overlay);
+	return pass;
+}
+
 int
 main(int argc, char **argv)
 {
 	int frames = 600;
 	long service_pid = 0;
-	bool dmabuf = false, release_wait = true, force_linear = false;
+	bool dmabuf = false, release_wait = true, force_linear = false, span2d = false;
 	std::string dump_dir = "/tmp";
 	if (const char *t = getenv("TMPDIR")) {
 		dump_dir = t;
@@ -1022,9 +1289,11 @@ main(int argc, char **argv)
 			release_wait = false; // negative control: must FAIL the pixel check
 		} else if (strcmp(argv[i], "--linear") == 0) {
 			force_linear = true; // LINEAR inputs instead of the driver's pick
+		} else if (strcmp(argv[i], "--span2d") == 0) {
+			span2d = true; // off-panel flat 2D (#1654 on the service path)
 		} else {
 			LOG("usage: %s [--frames=N] [--service-pid=PID] [--dump-dir=DIR] [--dmabuf [--no-release-wait] "
-			    "[--linear]]",
+			    "[--linear]] [--span2d]",
 			    argv[0]);
 			return 2;
 		}
@@ -1038,11 +1307,12 @@ main(int argc, char **argv)
 	XR_CHECK(xrEnumerateInstanceExtensionProperties(nullptr, 0, &ext_count, nullptr));
 	std::vector<XrExtensionProperties> exts(ext_count, {XR_TYPE_EXTENSION_PROPERTIES});
 	XR_CHECK(xrEnumerateInstanceExtensionProperties(nullptr, ext_count, &ext_count, exts.data()));
-	bool has_weave = false, has_vk = false, has_rig = false;
+	bool has_weave = false, has_vk = false, has_rig = false, has_display_info = false;
 	for (const auto &e : exts) {
 		has_weave = has_weave || strcmp(e.extensionName, XR_DXR_WEAVE_EXTENSION_NAME) == 0;
 		has_vk = has_vk || strcmp(e.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0;
 		has_rig = has_rig || strcmp(e.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0;
+		has_display_info = has_display_info || strcmp(e.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0;
 	}
 	LOG("XR_DXR_weave:         %s", has_weave ? "AVAILABLE" : "NOT FOUND");
 	LOG("XR_KHR_vulkan_enable: %s", has_vk ? "AVAILABLE" : "NOT FOUND");
@@ -1053,16 +1323,27 @@ main(int argc, char **argv)
 	// XR_DXR_view_rig (optional): its XrViewDisplayRawDXR output routes
 	// xrLocateViews through the server-side Kooima and reports the canvas the
 	// service resolved — how the probe checks the weave-geometry window metrics.
-	const char *enabled[] = {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME, XR_DXR_WEAVE_EXTENSION_NAME,
-	                         XR_DXR_VIEW_RIG_EXTENSION_NAME};
+	std::vector<const char *> enabled = {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME, XR_DXR_WEAVE_EXTENSION_NAME};
+	if (has_rig) {
+		enabled.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
+	}
+	// --span2d reads the panel's desktop rect (XR_DXR_display_info); only
+	// then, so the default run's instance is unchanged.
+	if (span2d) {
+		if (!has_display_info) {
+			LOG("--span2d needs XR_DXR_display_info (the panel rect)");
+			return 1;
+		}
+		enabled.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
+	}
 	XrInstanceCreateInfo ici = {XR_TYPE_INSTANCE_CREATE_INFO};
 	snprintf(ici.applicationInfo.applicationName, sizeof(ici.applicationInfo.applicationName), "%s",
 	         "DXRWeaveProbeLinux");
 	ici.applicationInfo.applicationVersion = 1;
 	snprintf(ici.applicationInfo.engineName, sizeof(ici.applicationInfo.engineName), "%s", "None");
 	ici.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
-	ici.enabledExtensionCount = has_rig ? 3 : 2;
-	ici.enabledExtensionNames = enabled;
+	ici.enabledExtensionCount = (uint32_t)enabled.size();
+	ici.enabledExtensionNames = enabled.data();
 	XrInstance instance = XR_NULL_HANDLE;
 	XR_CHECK(xrCreateInstance(&ici, &instance));
 
@@ -1070,6 +1351,24 @@ main(int argc, char **argv)
 	sgi.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
 	XrSystemId system_id = XR_NULL_SYSTEM_ID;
 	XR_CHECK(xrGetSystem(instance, &sgi, &system_id));
+
+	PanelRect panel;
+	if (span2d) {
+		XrDisplayDesktopPositionDXR pos = {XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR};
+		XrDisplayInfoDXR di = {XR_TYPE_DISPLAY_INFO_DXR};
+		di.next = &pos;
+		XrSystemProperties props = {XR_TYPE_SYSTEM_PROPERTIES};
+		props.next = &di;
+		XR_CHECK(xrGetSystemProperties(instance, system_id, &props));
+		panel.left = pos.left;
+		panel.top = pos.top;
+		panel.w = di.displayPixelWidth;
+		panel.h = di.displayPixelHeight;
+		if (panel.w < kWinW || panel.h < kWinH) {
+			LOG("--span2d: panel %ux%u is smaller than the %ux%u window", panel.w, panel.h, kWinW, kWinH);
+			return 1;
+		}
+	}
 
 	// ---- Headless Vulkan device per XR_KHR_vulkan_enable.
 	PFN_xrGetVulkanGraphicsRequirementsKHR pfn_req = nullptr;
@@ -1243,6 +1542,18 @@ main(int argc, char **argv)
 	bind.windowHandle = (void *)(uintptr_t)0x1;
 	XR_CHECK(pfn_bind2(session, &bind));
 	LOG("bound fake window 0x1 at (%d,%d) %ux%u", kWinOrigin.x, kWinOrigin.y, kWinW, kWinH);
+
+	if (span2d) {
+		bool pass = run_span2d(vk, session, pfn_bind2, pfn_submit, panel, dump_dir);
+		xrDestroySession(session);
+		xrDestroyInstance(instance);
+		vkDestroyFence(vk.device, vk.fence, nullptr);
+		vkDestroyCommandPool(vk.device, vk.pool, nullptr);
+		vkDestroyDevice(vk.device, nullptr);
+		vkDestroyInstance(vk.instance, nullptr);
+		LOG("span2d: %s", pass ? "PASS" : "FAIL");
+		return pass ? 0 : 1;
+	}
 
 	if (dmabuf) {
 		bool pass = run_dmabuf(vk, session, pfn_submit, frames, service_pid, release_wait, force_linear, dump_dir);
