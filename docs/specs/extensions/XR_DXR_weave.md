@@ -3,11 +3,11 @@
 | Field | Value |
 |---|---|
 | **Extension Name** | `XR_DXR_weave` |
-| **Spec Version** | 10 |
-| **Extension Type** | Instance extension (service path — Windows/D3D11, macOS/comp_multi-Vulkan #759, Android/comp_multi-Vulkan #1036, desktop Linux/comp_multi-Vulkan dma-buf #1699 when the service carries its engine; the snap also works in-process on desktop Linux, §5c / #1588) |
+| **Spec Version** | 11 |
+| **Extension Type** | Instance extension (service path — Windows/D3D11, macOS/comp_multi-Vulkan #759, Android/comp_multi-Vulkan #1036, desktop Linux/comp_multi-Vulkan dma-buf #1699 when the service carries its engine; the snap and its bulk grid form also work in-process on desktop Linux, §5c / #1588 / #1723) |
 | **Header** | `src/external/openxr_includes/openxr/XR_DXR_weave.h` (canonical; auto-syncs to `displayxr-extensions`) |
-| **Status** | Provisional (`1004999190–198` type block, pending Khronos registry; `199` reserved, see §2c; v9/v10 additions in a fresh `1004999240–249` decade — 240 v9, 241–245 v10) |
-| **Design history** | `docs/roadmap/webxr-step-b-design.md` §13.6–13.9, `docs/roadmap/android-concurrent-multi-app.md` F11/§10.4, issues #625, #774, #1031/#1036, browser#88, browser#103, #1699 |
+| **Status** | Provisional (`1004999190–198` type block, pending Khronos registry; `199` reserved, see §2c; v9+ additions in a fresh `1004999240–249` decade — 240 v9, 241–245 v10, 246 v11) |
+| **Design history** | `docs/roadmap/webxr-step-b-design.md` §13.6–13.9, `docs/roadmap/android-concurrent-multi-app.md` F11/§10.4, issues #625, #774, #1031/#1036, browser#88, browser#103, #1699, #1723 |
 
 ## 1. What it is
 
@@ -465,6 +465,107 @@ per-axis search radius (max excursion exactly 2), and all 15 sharing one slanted
 phase (circular concentration 0.974 against a slanted fit; a plain x-only residue test fails,
 as it must for a slanted lattice).
 
+### Bulk: `xrWeaveSnapWindowGridDXR` (v11, #1723)
+
+```c
+#define XR_TYPE_WEAVE_SNAP_GRID_INFO_DXR   ((XrStructureType)1004999246)
+#define XR_WEAVE_SNAP_GRID_MAX_POINTS_DXR  (1024u * 1024u)
+#define XR_WEAVE_SNAP_GRID_MAX_AXIS_DXR    1024u
+#define XR_WEAVE_SNAP_GRID_NO_DELTA_DXR    (-128)
+
+typedef struct XrWeaveSnapGridInfoDXR {
+    XrStructureType          type;        // XR_TYPE_WEAVE_SNAP_GRID_INFO_DXR
+    const void* XR_MAY_ALIAS next;
+    XrRect2Di                originRect;  // drag-start window rect (offset used)
+    XrOffset2Di              firstTarget; // proposed top-left of grid point (0, 0)
+    XrExtent2Di              step;        // grid pitch, device px, each >= 1
+    uint32_t                 countX;
+    uint32_t                 countY;
+} XrWeaveSnapGridInfoDXR;
+
+typedef struct XrWeaveSnapGridPointDXR { int8_t dx; int8_t dy; } XrWeaveSnapGridPointDXR;
+
+XrResult xrWeaveSnapWindowGridDXR(XrSession session, const XrWeaveSnapGridInfoDXR* gridInfo,
+                                  uint32_t pointCapacityInput, uint32_t* pointCountOutput,
+                                  XrWeaveSnapGridPointDXR* points, XrBool32* declined);
+```
+
+**Why it exists: round trips.** The Wayland drag lattice
+([wayland-window-geometry.md §8](../runtime/wayland-window-geometry.md#8-phase-snapped-drag--the-drag-lattice-extension-version-6))
+is built at every title-bar press by asking the snap about a 129 × 129 grid of displacements:
+16,641 calls, plus a small search around any answer the compositor cannot place. In-process
+that costs 1.6–6 ms. For an IPC client every call is one service round trip, and a press
+measured **2,297–2,503 ms** on the Linux dev box — the client's frame loop stalls and the
+`xdg_toplevel.move` that follows goes out with a stale serial. The same probe through this
+call is one round trip: the runtime runs the loop next to the display processor.
+
+**Semantics.** Point (i, j) proposes `firstTarget + (i · step.width, j · step.height)` and is
+snapped from `originRect` exactly as `xrWeaveSnapWindowRectDXR` would snap it — same frame
+rules (any frame, as long as origin and targets share it; device pixels), same answer. The
+result is row-major (index `j · countX + i`) and each entry is the snapped top-left **minus**
+the proposed one. Standard two-call idiom (`pointCapacityInput` 0 returns `countX · countY`
+and evaluates nothing). Everything is validated before anything is evaluated: each count
+1..`XR_WEAVE_SNAP_GRID_MAX_AXIS_DXR`, their product ≤ `XR_WEAVE_SNAP_GRID_MAX_POINTS_DXR`,
+steps ≥ 1, every target within ±2²⁸ px — `XR_ERROR_VALIDATION_FAILURE` otherwise.
+
+**Encoding: two int8 per point, and why not less.** The obvious smaller encodings do not
+carry what the one consumer uses. The lattice probe (displayxr-common
+`dxr_wl_lattice::probe`) reads, for each grid point, the DP's snapped position itself: it
+maps it back to a logical displacement, keeps it if the compositor can place it, and
+otherwise searches ±2 logical px around **that** position for one the DP leaves unchanged.
+The table entry it keeps is a position, and the search is centred on a position; a
+fixed/reachable bit per point would force the caller to re-ask the DP where to search.
+int8 is generous rather than tight: a correct snap stays within the vendor's ~2 px search
+radius (§5c above), so a delta outside ±127 means a broken snap, and it is reported as
+`XR_WEAVE_SNAP_GRID_NO_DELTA_DXR` in both fields instead of being clamped into a wrong but
+plausible position (the caller asks that one point per point). A 129 × 129 grid is 33 KB.
+
+**Declined.** `*declined` is `XR_TRUE` when the display processor produced no snap — no snap
+support, no usable viewing distance yet (a vendor SDK's "declined"), the service's DP
+not up before its first submit. The loop stops at the first such answer and every point is
+(0, 0): a caller that ignores the flag degrades exactly like the per-point call, which hands
+the target back on a decline. A caller that honours it drags unconstrained, because there
+is no phase to protect.
+
+**Where it runs.** Wherever the per-point call does, through the same per-point function, so
+the two can never disagree: in-process on desktop Linux (`comp_vk_native_compositor_snap_window_rect`),
+the `comp_multi` weave engine behind IPC (`comp_multi_weave_snap_window_rect` → the engine
+DP's `snap_window_rect` slot) on desktop Linux, macOS and Android, and the D3D11 service on
+Windows. `XR_ERROR_FEATURE_UNSUPPORTED` exactly where the per-point call reports it. **No new
+display-processor slot:** the runtime loops the existing per-point slot (one shared loop,
+`u_snap_grid.c`), so no vendor change is needed and the lens lattice is still never
+published — the result is the same derived answer set the app already sends to the
+compositor extension.
+
+**Wire.** One varlen IPC call, `weave_snap_window_grid`: the fixed message carries the grid
+(eight integers — well inside the 1024-byte message budget), the reply header carries
+`{result, declined, point_count}`, and the points follow as one `2 · point_count`-byte
+payload on the same connection. No chunking and no shared-memory path is needed: the
+transport (a `SOCK_STREAM` socket; a blocking message-mode pipe on Windows) carries a
+variable-length reply the way `device_get_visibility_mask` and `space_locate_spaces`
+already do. A rejected grid is reported in `result` over a healthy pipe (never as
+`XRT_ERROR_IPC_FAILURE`, which would mark the session lost).
+
+**Cost.** Server-side the loop costs what the in-process probe always did (per-point DP
+calls; the service takes the weave engine's mutex per point, so a submit is never blocked
+for the whole grid). Headless against a worktree service with `sim_display`
+(`weave_probe_vk_linux`), 129 × 129: **1.4–2.7 ms** in one call, against 236–332 ms for
+the same points one call each on an idle box (the 2.4 s figure above was measured with a
+live weave on the service). The maximum 1024 × 1024 grid, a 2 MB reply, took ~140 ms. The
+vendor per-point cost is a single SDK query, and 16,641 of them (plus the search) are what
+the in-process 1.6–6 ms figure measures — so a server-side loop costs the service a few
+milliseconds per press, not seconds.
+
+**Consumers.** The per-point callback seam in displayxr-common (`SnapWindowOriginFn`) is
+unchanged. The Linux test apps install `test_apps/common/dxr_weave_snap_grid.h`, which
+recognises the lattice probe's first question, fetches that table in one grid call and
+serves the probe from it — a memo of the DP's own answers, falling back to the per-point
+call for anything it cannot answer (and for any runtime older than v11). A fresh table (every
+press) is **one** call at any output scale: the grid itself at scale 1; every s-th device
+pixel over the table at an integer scale s ≥ 2, which also covers the probe's search; every
+device pixel over the table at a fractional scale. `DXR_WEAVE_SNAP_GRID=0` forces the
+per-point path for an A/B.
+
 ## 5d. Desktop-Linux dma-buf transport and sync_file fences (v10, #1699)
 
 A file descriptor is an `int`, not a pointer, and a dma-buf carries no dimensions, format or
@@ -589,6 +690,11 @@ duplicates rather than transfers. Engine contract: `src/xrt/include/xrt/xrt_weav
 | 8 | `XrWeaveSubmitFlatRegionsDXR` + `xrWeaveSetScreenFlatRegionsDXR` — per-region hardware wish on the weave path (browser#88). |
 | 9 | `xrWeaveExportIpcConnectionDXR` + `XrWeaveIpcConnectionDXR` — brokering a runtime IPC endpoint to a sandboxed sibling process (§4c); plus §4b, the error table making a dead connection report `XR_ERROR_INSTANCE_LOST` / `XR_ERROR_SESSION_LOST` (browser#103). |
 | 10 | Desktop-Linux dma-buf transport (§5d, #1699): `XR_WEAVE_HANDLE_KIND_DMABUF_DXR` / `_OPAQUE_FD_DXR`, `XrWeaveDmabufDescDXR` + `XrWeaveOverlayDmabufDescDXR` in, `XrWeaveOutputDmabufDXR` out, `sync_file` fences `XrWeaveSubmitSyncDXR` (acquire) / `XrWeaveOutputSyncDXR` (release, per frame). Desktop Linux becomes a full weave platform when the service carries its engine. |
+| 11 | `xrWeaveSnapWindowGridDXR` + `XrWeaveSnapGridInfoDXR` / `XrWeaveSnapGridPointDXR` — bulk grid snap: the per-point snap evaluated over a grid by the runtime, one call (one IPC round trip) instead of one per point (§5c, #1723). |
+
+**v11 is a bump** for the same reason v10 is: a new entry point and structure type a caller
+must be able to test for. A caller gates `xrWeaveSnapWindowGridDXR` on `extensionVersion >= 11`
+(or simply on `xrGetInstanceProcAddr` resolving it) and falls back to the per-point call.
 
 **v10 IS a bump**, unlike #1588 below: it adds enums, structure types and fields a caller must be
 able to test for. A caller gates the dma-buf chains on `extensionVersion >= 10`: an older runtime
