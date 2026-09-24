@@ -289,7 +289,13 @@ if [ "$BUILD_APPS" = "ON" ]; then
   #   weave_probe_vk_linux        — headless XR_DXR_weave present-owner probe
   #                                 (#1699 R2): no window; needs a running
   #                                 displayxr-service (its run script forces IPC).
-  for APP in cube_hosted_legacy_vk_linux cube_handle_vk_linux cube_zones_vk_linux weave_probe_vk_linux; do
+  #   weave_present_vk_linux      — XR_DXR_weave present-owner WITH a window
+  #                                 (#1699): renders SBS into a dma-buf, the
+  #                                 service weaves it, the app presents the woven
+  #                                 dma-buf in its own swapchain. Same service
+  #                                 requirement; --headless N self-checks offscreen.
+  for APP in cube_hosted_legacy_vk_linux cube_handle_vk_linux cube_zones_vk_linux weave_probe_vk_linux \
+             weave_present_vk_linux; do
     APP_DIR="$ROOT/test_apps/$APP"
     # CANDIDATE PATCH (#706 Linux validation): the apps aren't all flat under
     # test_apps/ — cube_hosted_legacy_vk_linux lives in test_apps/legacy/. Fall
@@ -311,8 +317,16 @@ if [ "$BUILD_APPS" = "ON" ]; then
     # The weave probe is a present-owner: it only works on the IPC path, against
     # a displayxr-service started separately (see the probe's file header).
     FORCE_IPC=""
+    PLUGIN_LINE="export XRT_PLUGIN_SEARCH_PATH=\"$PLUGIN_DIR\""
     case "$APP" in
       weave_probe_*) FORCE_IPC='export XRT_FORCE_MODE="${XRT_FORCE_MODE:-ipc}"' ;;
+      weave_present_*)
+        FORCE_IPC='export XRT_FORCE_MODE="${XRT_FORCE_MODE:-ipc}"'
+        # The display processor lives in the SERVICE, which reads its own
+        # environment: the client never loads a plug-in, so the run script
+        # passes XRT_PLUGIN_SEARCH_PATH through only when the caller set it.
+        PLUGIN_LINE='# XRT_PLUGIN_SEARCH_PATH: inherited only (the service, not this client, loads the display processor)'
+        ;;
     esac
     cat > "$RUN" <<EOF
 #!/bin/bash
@@ -330,7 +344,7 @@ if [ "$BUILD_APPS" = "ON" ]; then
 # SIM_DISPLAY_OUTPUT picks the sim-display weave (anaglyph/sbs/...).
 export XR_RUNTIME_JSON="$BUILD_DIR/openxr_displayxr-dev.json"
 export LD_LIBRARY_PATH="$OPENXR_DIR/lib:\${LD_LIBRARY_PATH:-}"
-export XRT_PLUGIN_SEARCH_PATH="$PLUGIN_DIR"
+$PLUGIN_LINE
 # #902: dev-tree manifest for VK_LAYER_DXR_queue_lock, so the runtime-injected
 # queue-serialization layer is discoverable (shared-queue late-weave repaint on
 # single-graphics-queue GPUs). Installed builds use the system manifest path.
