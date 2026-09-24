@@ -31,6 +31,13 @@ name: lint
 #   of GJS's module goals, and unit-tests the installer's entry-point
 #   chooser. See scripts/check_gnome_extension.py.
 #
+# - Downstream pin-bump gate: unit tests for scripts/downstream_pin_bump.py
+#   (the per-track bump_when policy runtime-pin-bump.yml applies on every
+#   v* tag), a manifest schema check, and a guard that every
+#   xrt_display_processor*.h is in the features gate's header set. The full
+#   clone lets the history tests replay v2.21.0 -> v2.21.1 (must bump on
+#   XRT_DP_VK_HAS_TRANSPARENCY_ACTIVE) and v2.20.1 -> v2.21.0 (must not).
+#
 # Add other lightweight lint jobs here as needed (yaml validity,
 # CLAUDE.md presence, etc.).
 
@@ -182,3 +189,18 @@ jobs:
         # be a weaker duplicate of that. Rationale in full: the docstring of
         # scripts/check_cnsdk_pins.py.
         run: python3 scripts/check_cnsdk_pins.py
+
+  downstream-pin-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Tags, so the history tests replay real releases instead of skipping.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Pin-bump gate unit tests
+        run: python3 scripts/tests/test_downstream_pin_bump.py

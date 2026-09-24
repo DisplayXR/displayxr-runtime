@@ -269,11 +269,17 @@ Full spec: `docs/specs/runtime/versions-json-autobump.md`.
 `versions.json` records what siblings released; **`downstream-pins.json`** records where
 they pin *the runtime* in their own sources (`DXR_RUNTIME_GIT_TAG` / `RUNTIME_REF`).
 On a `v*` tag, `runtime-pin-bump.yml` opens repin **PRs** (never direct commits — a source
-pin changes what compiles, so downstream CI must gate it). Bumps are **ABI-gated, not
-tag-chasing**: a release that changes no plug-in ABI is skipped, because a vendor's
-`installer/CMakeLists.txt` derives `MIN_RUNTIME_VERSION` from the pin, so chasing patches
-would make its installer reject a runtime it works fine against. A track (e.g. leia's
-Linux pin) can be marked manual and is then never touched. `pin-rot-canary.yml` weekly-checks
+pin changes what compiles, so downstream CI must gate it). Bumps are **gated, not
+tag-chasing**, and each track's gate is data (`bump_when` in the manifest): `abi` repins only
+when `XRT_PLUGIN_API_VERSION_CURRENT` changed; `features` repins when a DP feature macro
+(`XRT_*_HAS_*`), a vtable slot, or the ABI changed in the track's headers (leia's Linux track,
+Vulkan headers only); `manual` is never touched. A release that trips neither is skipped,
+because a vendor's `installer/CMakeLists.txt` derives `MIN_RUNTIME_VERSION` from the pin, so
+chasing patches would make its installer reject a runtime it works fine against. The ABI gate
+alone is blind to ADR-020's append-only slot + macro, which ships at an unchanged ABI: ABI has
+been 5 since v2.16.0, yet leia-plugin#264's `XRT_DP_VK_HAS_TRANSPARENCY_ACTIVE` code compiled
+out at the old Linux pin until it was repinned by hand. Dry-run any pair of tags with
+`scripts/downstream_pin_bump.py verdict --from vA --to vB --repo R --track T`. `pin-rot-canary.yml` weekly-checks
 each pinned third-party SDK still resolves **and still unpacks `Include/`+`Lib/`** — a URL
 check alone passes a pin that cannot build.
 
