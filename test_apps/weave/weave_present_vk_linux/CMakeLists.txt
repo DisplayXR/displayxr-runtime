@@ -79,6 +79,7 @@ target_include_directories(weave_present_vk_linux PRIVATE
     ${OPENXR_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../common
+    ${_dxr_root}/test_apps/common   # dxr_weave_snap_grid.h (#1723)
 )
 target_link_libraries(weave_present_vk_linux PRIVATE
     displayxr::linux_window

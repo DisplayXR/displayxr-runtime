@@ -61,6 +61,7 @@ target_include_directories(weave_probe_vk_linux PRIVATE
     # weave_dmabuf_vk.h: the dma-buf transport calls, shared with
     # weave/weave_present_vk_linux.
     ${CMAKE_CURRENT_SOURCE_DIR}/../../weave/common
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../common   # dxr_weave_snap_grid.h (#1723)
 )
 
 target_link_libraries(weave_probe_vk_linux PRIVATE

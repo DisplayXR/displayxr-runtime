@@ -38,7 +38,7 @@
 // headers, which is what makes those headers see the real Display / Window /
 // wl_display / wl_surface types instead of their self-contained stand-ins.
 #include "dxr_linux_window.h"
-#include "dxr_weave_snap.h"
+#include "dxr_weave_snap_grid.h" // #1723: the drag-lattice probe as ONE grid call
 
 #include <vulkan/vulkan.h>
 
@@ -125,8 +125,10 @@ static DxrLinuxWindow g_window;
 
 //! xrWeaveSnapWindowRectDXR behind the window helper's plain snap callback
 //! (#1588). Identity until the runtime resolves the entry point; the drag
-//! mechanics are the same either way.
-static DxrWeaveSnap g_weaveSnap;
+//! mechanics are the same either way. The Wayland drag-lattice probe is
+//! fetched as ONE xrWeaveSnapWindowGridDXR per table and served from it
+//! (#1723) — per point it is one service round trip each under forced IPC.
+static DxrWeaveSnapGrid g_weaveSnap;
 
 // TEST HOOK, off unless DXR_CUBE_TEST_RESIZE=WxH is set. Drives one
 // xrSetWaylandSurfaceGeometryDXR call after a warm-up so the runtime's Wayland
@@ -2192,7 +2194,7 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
         uint32_t snapW = 0, snapH = 0;
         g_window.current_size(&snapW, &snapH);
         g_weaveSnap.attach(xr.instance, xr.session, snapW, snapH);
-        g_window.set_snap_provider(&DxrWeaveSnap::callback, &g_weaveSnap);
+        g_window.set_snap_provider(&DxrWeaveSnapGrid::callback, &g_weaveSnap);
         LOG_INFO(
             "xrWeaveSnapWindowRectDXR: %s — a window drag %s",
             g_weaveSnap.available() ? "RESOLVED"
@@ -2205,6 +2207,10 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
                   "quantum' line)"
                 : "lands on the raw pointer position (identity snap)");
     }
+    LOG_INFO("xrWeaveSnapWindowGridDXR: %s",
+             g_weaveSnap.grid_available()
+                 ? "RESOLVED — a Wayland drag-lattice table costs one call"
+                 : "unavailable — the drag lattice is probed point by point");
     LOG_INFO("Session created (%s via %s: %s)",
              DxrLinuxWindow::backend_name(g_window.backend()),
              g_window.required_openxr_extension(), g_window.describe().c_str());
@@ -2395,6 +2401,7 @@ static void CleanupOpenXR(AppXrSession& xr) {
         xr.localSpace = XR_NULL_HANDLE;
     }
     if (xr.session != XR_NULL_HANDLE) {
+        g_weaveSnap.flush_log(); // the last lattice table's IPC cost
         xrDestroySession(xr.session);
         xr.session = XR_NULL_HANDLE;
     }
