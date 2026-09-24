@@ -10,6 +10,7 @@
 #include "comp_vk_native_target.h"
 #include "comp_vk_native_compositor.h"
 
+#include "xrt/xrt_config_os.h"
 #include "xrt/xrt_vulkan_includes.h"
 #include "vk/vk_helpers.h"
 
@@ -296,12 +297,6 @@ dxr_acquire_timeout_ns(void)
 	}
 	return cached > 0 ? (uint64_t)cached * 1000000ULL : UINT64_MAX;
 }
-
-// Desktop Linux (X11/XCB). Android also defines XRT_OS_LINUX but uses
-// VK_KHR_android_surface, so the XCB path is gated on "Linux AND NOT Android".
-#if defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
-#define XRT_OS_LINUX_DESKTOP
-#endif
 
 #ifdef XRT_OS_LINUX_DESKTOP
 // X11/XCB present path: vkCreateXcbSurfaceKHR from a connection + window id

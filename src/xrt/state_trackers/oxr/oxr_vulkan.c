@@ -18,19 +18,12 @@
 
 #include "vk/vk_helpers.h"
 
+#include "xrt/xrt_config_os.h"
 #include "xrt/xrt_gfx_vk.h"
 
 #include "oxr_objects.h"
 #include "oxr_logger.h"
 #include "oxr_two_call.h"
-
-// Desktop Linux. Android also defines XRT_OS_LINUX, so anything that is true of
-// the X11/Wayland desktop only — the dma-buf import set, the fd sync pair — has
-// to be gated on "Linux AND NOT Android". Same local alias as
-// comp_vk_native_compositor.c. See docs/roadmap/linux-support.md.
-#if defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
-#define XRT_OS_LINUX_DESKTOP
-#endif
 
 /*
  * A Wayland-enabled build whose Vulkan headers were included without

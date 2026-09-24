@@ -16,6 +16,7 @@
 #include "null_interfaces.h"
 
 #include "xrt/xrt_config_build.h"
+#include "xrt/xrt_config_os.h"
 
 #include "os/os_time.h"
 
@@ -97,12 +98,13 @@ static const char *instance_extensions_common[] = {
     // comp_window_macos → vkCreateMetalSurfaceEXT (MoltenVK).
     VK_EXT_METAL_SURFACE_EXTENSION_NAME,                    //
 #endif
-#if defined(VK_KHR_xcb_surface) && defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
-    // Desktop Linux (#660 Phase 2): the service's out-of-process window-present
-    // arm is not wired yet (no comp_window_xcb comp_target, and
-    // null_compositor_init_target_service has no Linux branch — Phase 1b
-    // hardware work). Advertise VK_KHR_xcb_surface now so the service's
-    // VkInstance can build an XCB surface once that arm lands.
+#if defined(VK_KHR_xcb_surface) && defined(XRT_OS_LINUX_DESKTOP)
+    // Desktop Linux (#660 Phase 2): null_compositor_init_target_service's
+    // Linux arm wires get_vk only (#1699) — enough for a service-side weave
+    // engine. The out-of-process window-present arm is still not wired (no
+    // comp_window_xcb comp_target, so create_from_window stays NULL).
+    // Advertise VK_KHR_xcb_surface now so the service's VkInstance can build
+    // an XCB surface once that arm lands.
     VK_KHR_XCB_SURFACE_EXTENSION_NAME,                      //
 #endif
 };
@@ -962,6 +964,22 @@ null_target_service_get_vk_macos(struct comp_target_service *service)
 
 #endif // XRT_OS_MACOS
 
+#if defined(XRT_OS_LINUX_DESKTOP)
+/*!
+ * Desktop Linux (#1699): a service-side weave engine needs only the service's
+ * Vulkan bundle, so this is the sole slot the Linux arm fills. There is no
+ * per-session window target — create_from_window / destroy_target stay NULL,
+ * and the comp_target_service_* wrappers turn that into
+ * XRT_ERROR_DEVICE_CREATION_FAILED / a no-op rather than a NULL call.
+ */
+static struct vk_bundle *
+null_target_service_get_vk_linux(struct comp_target_service *service)
+{
+	struct null_compositor *nc = (struct null_compositor *)service->context;
+	return get_vk(nc);
+}
+#endif // XRT_OS_LINUX_DESKTOP
+
 /*!
  * Initialize the target service on a null compositor.
  * Called during compositor creation after Vulkan init.
@@ -986,6 +1004,12 @@ null_compositor_init_target_service(struct null_compositor *nc)
 	nc->target_service.create_from_window = null_target_service_create_from_window_macos;
 	nc->target_service.destroy_target = null_target_service_destroy_target_macos;
 	nc->target_service.get_vk = null_target_service_get_vk_macos;
+	nc->target_service.context = nc;
+#elif defined(XRT_OS_LINUX_DESKTOP)
+	// Desktop Linux (#1699): get_vk only — the service's weave engine runs on
+	// the null compositor's Vulkan device. No window-present arm yet, so
+	// create_from_window / destroy_target are deliberately left NULL.
+	nc->target_service.get_vk = null_target_service_get_vk_linux;
 	nc->target_service.context = nc;
 #endif
 }
