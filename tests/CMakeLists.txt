@@ -105,6 +105,16 @@ endif()
 if(XRT_HAVE_VULKAN)
 	list(APPEND tests tests_comp_client_vulkan tests_uv_to_tangent)
 endif()
+if(XRT_HAVE_VULKAN
+   AND CMAKE_SYSTEM_NAME STREQUAL "Linux"
+   AND NOT ANDROID
+	)
+	# #1699 R5 -- vk/vk_dmabuf.h: dma-buf export/import round trip, SYNC_FD
+	# semaphores, fd hygiene, failure paths closing the fd. Headless; runs on
+	# every Vulkan device present and SKIPs when none offers dma-buf + DRM
+	# format modifiers (a CI runner's lavapipe has no DRM device).
+	list(APPEND tests tests_vk_dmabuf)
+endif()
 if(XRT_FEATURE_OPENXR)
 	list(APPEND tests tests_input_transform)
 endif()
@@ -617,6 +627,9 @@ if(XRT_HAVE_VULKAN)
 		tests_comp_client_vulkan PRIVATE comp_client comp_mock comp_util aux_vk ipc_client
 		)
 	target_link_libraries(tests_uv_to_tangent PRIVATE comp_render)
+endif()
+if(TARGET tests_vk_dmabuf)
+	target_link_libraries(tests_vk_dmabuf PRIVATE comp_util aux_vk)
 endif()
 
 if(XRT_FEATURE_OPENXR)
