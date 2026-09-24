@@ -155,6 +155,35 @@ enum multi_dp_visibility
 	MULTI_DP_VIS_HIDDEN,      //!< on_pause pushed; lens preference released.
 };
 
+#ifdef XRT_OS_LINUX_DESKTOP
+//! Import-cache depth of the desktop-Linux weave engine (#1699 R2).
+#define COMP_MULTI_WEAVE_LINUX_SLOTS 4
+
+/*!
+ * One cached import of a caller buffer (input or overlay) in the desktop-Linux
+ * weave engine (comp_multi_weave_linux.c). Keyed by the caller's buffer id
+ * when it sends one (stage B), else by the fd's underlying file.
+ */
+struct comp_multi_weave_linux_slot
+{
+	bool used;
+	uint64_t buffer_id; //!< Caller-chosen identity (0 = none, key on dev/ino).
+	uint64_t dev;       //!< fstat st_dev of the received fd.
+	uint64_t ino;       //!< fstat st_ino of the received fd.
+	VkImage image;
+	VkDeviceMemory memory;
+	VkImageView view;
+	uint32_t w, h;
+	VkFormat format;
+	//! Queue family the producer releases the image to / acquires it from:
+	//! VK_QUEUE_FAMILY_EXTERNAL for a same-driver OPAQUE_FD (stage A),
+	//! VK_QUEUE_FAMILY_FOREIGN_EXT for a dma-buf (stage B).
+	uint32_t ext_queue_family;
+	bool first_use;     //!< Diagnostic: the first frame of a fresh import.
+	uint64_t last_used; //!< LRU tick.
+};
+#endif
+
 struct multi_compositor
 {
 	struct xrt_compositor_native base;
@@ -770,6 +799,117 @@ struct multi_compositor
 		//! @}
 	} weave;
 #endif
+
+#ifdef XRT_OS_LINUX_DESKTOP
+	/*!
+	 * XR_DXR_weave present-owner state (#1699 R2) — the desktop-Linux sibling
+	 * of the Android block above (minus the Arch-C satellite), with fds in
+	 * place of AHardwareBuffers. The caller owns its window and presents
+	 * itself; we import its buffer fd (stage A: OPAQUE_FD from the same
+	 * driver + device; stage B: a dma-buf with a DRM modifier), blit every
+	 * submitted rect into a window-sized 2x1 SBS scratch atlas (or sample its
+	 * v6 N-view atlas directly), run ONE DP process_atlas into an exportable
+	 * output, and wait completion before the IPC reply (stage A synchronous
+	 * contract). Implemented in comp_multi_weave_linux.c.
+	 */
+	struct
+	{
+		bool mutex_initialized;
+		struct os_mutex mutex; //!< Serializes submits + teardown for this client.
+
+		bool engine_initialized;
+		bool engine_failed; //!< One-shot: don't retry a hopeless bring-up every frame.
+		VkCommandPool cmd_pool;
+		VkCommandBuffer cmd;
+		//! Post-weave half of the split submission for a self-submitting DP
+		//! (the Android ordering fix, DXR_LINUX_WEAVE_SPLIT).
+		VkCommandBuffer cmd_post;
+		VkFence fence;
+		VkRenderPass render_pass; //!< Output fb's pass (DP-compatible, BGRA8).
+		struct xrt_display_processor *dp;
+
+		uint64_t window_id;   //!< Present-owner window id from bind (an XID; recorded only).
+		uint64_t fence_value; //!< Monotonic; completion is synchronous in stage A.
+
+		//! @name Explicit window geometry (spec v7 XrWeaveWindowGeometryDXR)
+		//! Device pixels, desktop-absolute. Fed to the DP as a panel-relative
+		//! present origin (`set_present_origin`) before every weave; also the
+		//! window-metrics source for a weave-only session (#1116).
+		//! @{
+		bool have_geometry;
+		int32_t win_x, win_y;
+		uint32_t win_w, win_h;
+		int32_t win_display_id;
+		bool geometry_dirty; //!< Log the change once, not per frame.
+		bool metrics_logged; //!< One-shot log of the first metrics report (#1116).
+		//! @}
+
+		//! @name Input + overlay import caches (keyed by buffer id / fd inode)
+		//! A received fd is a new number on every submit, so the key is the
+		//! underlying file (`fstat` st_dev/st_ino) or, in stage B, the
+		//! caller's `buffer_id`. N slots so a producer rotating a small pool
+		//! does not re-import every frame.
+		//! @{
+		struct comp_multi_weave_linux_slot in_slots[COMP_MULTI_WEAVE_LINUX_SLOTS];
+		struct comp_multi_weave_linux_slot ov_slots[COMP_MULTI_WEAVE_LINUX_SLOTS];
+		uint64_t slot_clock;    //!< LRU tick, bumped per lookup.
+		bool size_probe_warned; //!< One-shot: lseek could not size an opaque fd.
+		//! @}
+
+		//! @name v6 N-view crop staging (#774) — see the macOS block.
+		//! @{
+		VkImage crop_image;
+		VkDeviceMemory crop_memory;
+		VkImageView crop_view;
+		uint32_t crop_w, crop_h;
+		bool crop_first_use;
+		//! @}
+
+		//! @name Window-sized 2x1 SBS scratch atlas (2*out_w x out_h)
+		//! @{
+		VkImage sbs_image;
+		VkDeviceMemory sbs_memory;
+		VkImageView sbs_view;
+		uint32_t sbs_w, sbs_h;
+		bool sbs_first_use;
+		//! @}
+
+		//! @name Exportable weaved output (handed to the caller)
+		//! @{
+		VkImage out_image;
+		VkDeviceMemory out_memory;
+		VkDeviceSize out_size; //!< Allocation size (what an OPAQUE_FD importer needs).
+		VkImageView out_view;
+		VkFramebuffer out_fb;
+		/*!
+		 * The ONE exported fd of the current output allocation (-1 = none).
+		 * Exported once per (re)allocation — every vkGetMemoryFdKHR mints a
+		 * new fd, and the IPC send dups without closing, so exporting per
+		 * call would leak one fd per weave_get_output. Closed on release.
+		 */
+		int out_fd;
+		uint32_t out_w, out_h;
+		VkImageLayout out_layout; //!< Layout the last weave retired the output in (#1387 d3).
+		//! @}
+
+		//! @name v4 DP-composited 2D overlay atlas (browser#18)
+		//! @{
+		struct vk_local2d_composite overlay_blend;
+		bool overlay_blend_initialized;
+		//! @}
+
+		//! @name Stage B seams (#1699 R4/R5) — dma-buf + sync_file
+		//! Created by the engine once R5's aux_vk helpers (vk_dmabuf.h) land;
+		//! nothing new ever goes into struct vk_bundle (plug-in ABI, xrt_plugin.h).
+		//! @{
+		VkSemaphore acquire_sem; //!< Imported SYNC_FD (temporary) per frame.
+		//! Exportable SYNC_FD, signalled by the final submit. The per-frame
+		//! release sync_file exported from it is NOT engine state: the IPC
+		//! handler owns, sends and closes it after the reply (#1712).
+		VkSemaphore release_sem;
+		//! @}
+	} weave;
+#endif
 };
 
 /*!
@@ -1092,8 +1232,12 @@ multi_system_request_display_mode_any(struct xrt_system_compositor *xsysc, bool 
  * shape, two backends: comp_multi_weave_macos.c (IOSurface) and
  * comp_multi_weave_android.c (AHardwareBuffer); desktop Linux's
  * comp_multi_weave_linux.c (#1699) joins them behind the same gate
- * (COMP_MULTI_HAVE_WEAVE, comp_multi_interface.h). Both are synchronous — the
- * submit returns after the weave completed on the GPU, so there is no fence.
+ * (COMP_MULTI_HAVE_WEAVE, comp_multi_interface.h). The plain-handle entry points
+ * below are synchronous on every platform — the submit returns after the weave
+ * completed on the GPU, so export_fence reports none. Desktop Linux adds the
+ * dma-buf variants further down, whose submit carries a sync_file acquire fence
+ * in and returns a per-frame release sync_file (stage B; stubs until the R5
+ * aux_vk helpers land).
  * @{
  */
 bool

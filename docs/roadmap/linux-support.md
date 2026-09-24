@@ -345,6 +345,34 @@ gaps to wire when a display exists, all mirroring the macOS arms:
 **Done when:** a handle/hosted app runs out-of-process against
 `displayxr-service` on Linux.
 
+**Phase 2c — `XR_DXR_weave` present-owner engine on the service (#1699) — stage A
+landed.** `comp_multi_weave_linux.c` (built by default,
+`XRT_FEATURE_COMP_MULTI_WEAVE_LINUX`) is the desktop-Linux sibling of the macOS
+and Android comp_multi weave engines: a present-owner (the browser's GPU
+process, or any app that owns its window and present) submits pre-weave SBS /
+v6 N-view pixels, the service weaves them through **its own** DP instance
+(built from the plug-in's Vulkan factory; the service is null + comp_multi, so
+there is no other DP to borrow) and hands back a woven buffer. The bound
+window's geometry (spec v7, desktop-absolute device pixels) feeds the DP's
+`set_present_origin` slot, the window metrics (#1116) and the server-side
+per-window Kooima (`ipc_try_get_oop_view_poses`, now built on Linux too);
+`xrWeaveSnapWindowRectDXR` over IPC reaches the engine DP's `snap_window_rect`.
+
+- **Stage A (done):** same-driver `OPAQUE_FD` input and output, synchronous
+  completion (bounded 1 s fence wait), `VK_QUEUE_FAMILY_EXTERNAL` ownership
+  transfers in `GENERAL`. The plain-handle wire carries no extent, so it is
+  inferred (bound geometry for a batch submit, the packed grid for v6 — i.e.
+  v6 zero-copy only). Verified headless with
+  `test_apps/probes/weave_probe_vk_linux` against sim_display: batch + v4
+  overlay + v5 firstChunk + v6, output imported and read back, fd counts flat
+  over 600 frames in both processes.
+- **Stage B (pending R4 wire #1712 + R5 `vk_dmabuf` helpers #1710):** dma-buf
+  with a DRM modifier in and out, `FOREIGN_EXT` ownership, sync_file acquire
+  / per-frame release fences — `comp_multi_weave_submit_dmabuf` /
+  `_export_output_dmabuf` are refusing stubs until then. This is the path
+  Chromium's (GL) GPU process needs; stage A only serves a Vulkan client on
+  the service's own GPU.
+
 ### Phase 3 — `XR_DXR_xlib_window_binding`
 
 **Phase 3a — extension + app-window path, build-green on CI ✅ (done, #660).**
