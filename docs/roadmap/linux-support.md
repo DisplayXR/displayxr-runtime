@@ -708,6 +708,13 @@ source comments and, until this section, in no document at all.
   over the panel is resampled and the whole session degrades to 2D — the
   refuse-rather-than-resample rule, #1595), and a compositor that is not
   publishing geometry at all. Kill switch `DXR_WAYLAND_SPAN_2D=0`.
+  The service weave engine (`comp_multi_weave_linux.c`, the `XR_DXR_weave`
+  present-owner path the browser uses) does the same on X11 and Wayland alike,
+  from the caller-published window geometry: each off-panel band of the woven
+  output is painted with the centre view of the pre-weave atlas, before the v4
+  overlay, and a window entirely off the panel skips the weave; kill switch
+  `DXR_SPAN_2D=0` (either name works on both paths), headless proof
+  `weave_probe_vk_linux --span2d`.
 
 ### Where the detail lives
 
