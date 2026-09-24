@@ -380,6 +380,28 @@ per-window Kooima (`ipc_try_get_oop_view_poses`, now built on Linux too);
   stale frames (the fence is doing work). This is the path Chromium's (GL)
   GPU process needs; stage A only serves a Vulkan client on the service's own
   GPU. Still to prove: a real GL producer and a real panel.
+- **Windowed present-owner (headless-verified; first panel run pending):**
+  `test_apps/weave/weave_present_vk_linux` is the browser's GPU process in
+  miniature and the vehicle for the first woven frame on a panel through the
+  service. It owns a real window (`displayxr::linux_window`: native Wayland or
+  X11, CSD bar, F11) and its own Vulkan swapchain; per frame it ray-casts an
+  off-axis stereo scene into one of two window-sized dma-buf inputs, submits
+  them with a live acquire sync_file plus a DP-composited HUD overlay, and
+  copies the woven dma-buf into its swapchain after waiting the release
+  sync_file on the GPU. It re-binds its client rect (desktop-absolute device
+  pixels: `XTranslateCoordinates` on X11, the GNOME extension's `GetWindows`
+  converted through `u_wayland_geom.h` on Wayland) whenever it changes, drags
+  through `xrWeaveSnapWindowRectDXR` (every step on X11, the drag lattice on
+  Wayland) and, after a Wayland drop, snaps and `MoveWindow`s itself — the job
+  the in-process compositor does for a `_handle` app. `--sbs` presents the
+  unwoven input, `--anaglyph-check` dumps both on a file trigger, and
+  `--headless N` runs the same pipeline offscreen and self-checks it: against
+  sim_display's anaglyph weave the presented frame equals the woven output
+  byte for byte, the woven output matches anaglyph(input) to a mean error of
+  0.6/255, the HUD is composited, a mid-run reallocation (`--test-resize`) is
+  followed, and fd counts stay flat over 600 frames in both processes. The
+  dma-buf transport calls are shared with the probe
+  (`test_apps/weave/common/weave_dmabuf_vk.h`).
 
 ### Phase 3 — `XR_DXR_xlib_window_binding`
 
