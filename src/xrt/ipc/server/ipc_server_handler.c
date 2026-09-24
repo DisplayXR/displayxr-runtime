@@ -75,10 +75,12 @@ static struct xrt_compositor *
 macos_workspace_find_client_xc(struct ipc_server *s, uint32_t client_id);
 #endif
 
-#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR) || defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS)
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR) || defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS) ||                  \
+    defined(COMP_MULTI_HAVE_WEAVE)
 // Shared Kooima rig math (#396 W7): same displayxr-common core as the
 // in-process oxr_session.c path and every app/engine consumer. Both server-side
-// Kooima paths (D3D11 service on Windows, null+comp_multi on Android/macOS) use it.
+// Kooima paths (D3D11 service on Windows, null+comp_multi on Android/macOS and
+// on desktop Linux with the weave engine, #1699) use it.
 #include "displayxr_math_xrt.h"
 #endif
 
@@ -417,7 +419,8 @@ validate_device_id(volatile struct ipc_client_state *ics, int64_t device_id, str
 // ics->xscs[] / ics->xcsems[] (raw wire uint32s indexing fixed arrays = OOB read/write).
 #define IPC_CHECK_SWAPCHAIN_ID(ICS, ID) do { if ((ID) >= IPC_MAX_CLIENT_SWAPCHAINS) { IPC_ERROR((ICS)->server, "swapchain id %u out of range", (ID)); return XRT_ERROR_IPC_FAILURE; } } while (0)
 #define IPC_CHECK_SEMAPHORE_ID(ICS, ID) do { if ((ID) >= IPC_MAX_CLIENT_SEMAPHORES) { IPC_ERROR((ICS)->server, "semaphore id %u out of range", (ID)); return XRT_ERROR_IPC_FAILURE; } } while (0)
-#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR) || defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS)
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR) || defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS) ||                  \
+    defined(COMP_MULTI_HAVE_WEAVE)
 /*!
  * Fill surplus view slots [from, view_count) with valid poses.
  *
@@ -453,7 +456,7 @@ fill_surplus_view_poses(struct xrt_device *xdev,
 		}
 	}
 }
-#endif // D3D11 service || Android || macOS — fill_surplus_view_poses
+#endif // D3D11 service || Android || macOS || comp_multi weave (Linux) — fill_surplus_view_poses
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 /*!
@@ -1143,10 +1146,10 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 }
 #endif // XRT_HAVE_D3D11_SERVICE_COMPOSITOR
 
-#if defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS)
+#if defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS) || defined(COMP_MULTI_HAVE_WEAVE)
 /*!
  * Server-side Kooima for the out-of-process null+comp_multi path (Android #510,
- * macOS #48).
+ * macOS #48, desktop Linux with the weave engine #1699).
  *
  * On Android and macOS the runtime service runs the null compositor + comp_multi
  * (NOT the D3D11 service compositor), so ipc_try_get_sr_view_poses above is
@@ -1304,6 +1307,40 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 					         (double)win_eye_offset_x, (double)win_eye_offset_y);
 				}
 			}
+		}
+	}
+#endif
+
+#ifdef XRT_OS_LINUX_DESKTOP
+	// PER-WINDOW Kooima for a desktop-Linux weave present-owner (#1699) — the
+	// Linux counterpart of the Android #1034 block above. The window metrics
+	// come from the geometry the caller published (xrWeaveBindWindow2DXR /
+	// set_window_geometry, desktop-absolute device pixels, re-based to the
+	// panel by multi_compositor_get_window_metrics): screen = the window's
+	// metres, render eyes rebased to the window centre, so the off-axis frustum
+	// looks THROUGH the window instead of spanning the panel. Same shape as the
+	// in-process vk_native path (window metrics -> Kooima). No published rect →
+	// the display-scoped behaviour above, unchanged.
+	if (have_wm && wm.valid && wm.window_width_m > 0.0f && wm.window_height_m > 0.0f) {
+		screen_width_m = wm.window_width_m;
+		screen_height_m = wm.window_height_m;
+		win_eye_offset_x = wm.window_center_offset_x_m;
+		win_eye_offset_y = wm.window_center_offset_y_m;
+		win_eye_offset_z = 0.0f;
+		// Lifecycle only (a window moved or resized), never per frame.
+		static int32_t logged_x = INT32_MIN, logged_y = INT32_MIN;
+		static uint32_t logged_w = 0, logged_h = 0;
+		if (wm.window_screen_left != logged_x || wm.window_screen_top != logged_y ||
+		    wm.window_pixel_width != logged_w || wm.window_pixel_height != logged_h) {
+			logged_x = wm.window_screen_left;
+			logged_y = wm.window_screen_top;
+			logged_w = wm.window_pixel_width;
+			logged_h = wm.window_pixel_height;
+			IPC_WARN(
+			    s,
+			    "oop Kooima: per-window rect=(%d,%d %ux%u)px canvas=%.4fx%.4fm offset=(%.4f,%.4f)m (#1699)",
+			    logged_x, logged_y, logged_w, logged_h, (double)screen_width_m, (double)screen_height_m,
+			    (double)win_eye_offset_x, (double)win_eye_offset_y);
 		}
 	}
 #endif
@@ -1754,7 +1791,7 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 
 	return true;
 }
-#endif // XRT_OS_ANDROID || XRT_OS_MACOS
+#endif // XRT_OS_ANDROID || XRT_OS_MACOS || COMP_MULTI_HAVE_WEAVE
 
 
 static xrt_result_t
@@ -6706,9 +6743,8 @@ ipc_handle_weave_snap_window_rect(volatile struct ipc_client_state *ics,
 	// routes through it: its xrt_display_processor_vk's snap_window_rect slot
 	// (the same slot the in-process vk_native compositor uses). Identity today
 	// on macOS / Android (sim_display has no interlace lattice, #759); on
-	// desktop Linux this is where the real snap lands once the engine exists
-	// (#1699 R2). Until then the Linux service has no DP to ask and takes the
-	// identity #else below.
+	// desktop Linux it is the real snap through the weave engine's own DP
+	// (#1699 R2) — identity until the first submit has brought that DP up.
 	int32_t sx = target_x, sy = target_y;
 	if (comp_multi_weave_snap_window_rect(ics->xc, origin_x, origin_y, target_x, target_y, &sx, &sy)) {
 		*out_snapped = true;
@@ -7065,9 +7101,10 @@ ipc_handle_session_locate_views_rig(volatile struct ipc_client_state *ics,
 	                               out_info->fovs, out_info->poses)) {
 		return XRT_SUCCESS;
 	}
-#elif defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS)
-	// Out-of-process Android (#510) / macOS (#48): the service runs null+comp_multi,
-	// not the D3D11 service compositor, so run the server-side Kooima for that path.
+#elif defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS) || defined(COMP_MULTI_HAVE_WEAVE)
+	// Out-of-process Android (#510) / macOS (#48) / desktop Linux (#1699): the
+	// service runs null+comp_multi, not the D3D11 service compositor, so run the
+	// server-side Kooima for that path.
 	if (ipc_try_get_oop_view_poses(ics, head, &fallback_eye_relation, at_timestamp_ns, view_count, rig,
 	                               out_info, &out_info->head_relation, out_info->fovs, out_info->poses)) {
 		return XRT_SUCCESS;
