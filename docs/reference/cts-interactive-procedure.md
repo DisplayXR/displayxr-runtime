@@ -445,28 +445,36 @@ There is no way to skip a test from inside the CTS. Judge it.
 > Counts and names below are from the pinned tag **`openxr-cts-1.1.63.0`**.
 > Re-derive them if the pin moves.
 
-> ### ⚠ This category is runnable on `d3d11` and `d3d12` only (2026-09-23)
+> ### ⚠ This category is runnable on `d3d11`, `d3d12` and `opengl` (2026-09-23)
 >
-> **#1581 — quad layers are accepted but never rendered on Vulkan, Vulkan2 and
-> OpenGL.** Those renderers filter to projection / projection-depth / zone
-> layers and drop quads on the floor. Every CTS composition test puts its
-> **prompt, its labels and its reference image in quad layers**, so on those
-> plug-ins the operator sees no prompt, no labels and no quad content — the
-> category is not merely failing there, it is **unjudgeable**. Do not attempt a
-> composition pass on `-Graphics vulkan`, `vulkan2` or `opengl` until their
-> #1581 legs land; a run that produces no visible prompt is a harness gap, not
-> a result.
+> **#1581 — quad layers are accepted but never rendered on Vulkan and
+> Vulkan2** on `main`. Those renderers filter to projection / projection-depth
+> / zone layers and drop quads on the floor. Every CTS composition test puts
+> its **prompt, its labels and its reference image in quad layers**, so on
+> those plug-ins the operator sees no prompt, no labels and no quad content —
+> the category is not merely failing there, it is **unjudgeable**. The
+> `vk_native` leg is draft PR #1623 (quads + colour model); a Windows
+> `-Graphics vulkan` hardware run of that branch passed QuadOcclusion, the
+> gradients (13/13), SourceAlphaBlending and the environment-blend pair, so it
+> is judgeable *on that branch*. A run that produces no visible prompt is a
+> harness gap, not a result.
 >
 > **`d3d11`** is the reference lane: 0 runtime-attributable failures on `main`
 > since #1606 (gradients 11/11, SourceAlphaBlending, the environment-blend
 > pair; `QuadHands` needs the qwerty hands raised first — §10.6).
 > **`d3d12`** joined it with #1689 (quad drawing, per-view cameras, painter's
-> order, the SRV heap sized for `XRT_MAX_LAYERS × XRT_MAX_VIEWS`) and #1694 (the
-> same private `_SRGB`-view compose model as D3D11): every judgeable case
-> passes there too, except the six **`Equirect2`** subtests, which stay blank
-> because the equirect2 layer type is accepted but not yet drawn on D3D12
-> (in progress). #1580 (projection content displaced relative to quads) is
-> resolved on both lanes.
+> order, the SRV heap sized for `XRT_MAX_LAYERS × XRT_MAX_VIEWS`), #1694 (the
+> same private `_SRGB`-view compose model as D3D11) and #1695 (equirect2) —
+> every judgeable case passes, matching d3d11 case for case.
+> **`opengl`** joined with #1704 (quads drawn through the shared rules; the GL
+> texture-origin flip; the #1700 phantom-select fix), #1705 (the compose model
+> on a private `GL_SRGB8_ALPHA8` target) and #1706 (equirect2): every judgeable
+> case passes there too, **provided the CTS carries the GL-plugin patch
+> below** for the gradients. On the GL and Vulkan lanes the hosted view fills
+> the window's client area where D3D's letterboxes ~40 px top and bottom, so
+> a GL/VK frame is never pixel-identical to a D3D one — compare content, not
+> pixels. #1580 (projection content displaced relative to quads) is resolved
+> on all three lanes.
 >
 > **`opengl` needs a patched CTS for `GradientFormatsLinearVsNonLinear`.** The
 > CTS's own GL plugin (`framework/graphics_plugin_opengl.cpp`, `RenderView` and
