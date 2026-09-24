@@ -2880,7 +2880,7 @@ vk_hud_prepare(struct comp_vk_native_compositor *c, uint32_t target_width, uint3
  * band never overwrites chrome the app asked for and the HUD stays readable on
  * either side of the seam.
  *
- * DXR_WAYLAND_SPAN_2D=0 turns it off (the whole surface is then woven, which
+ * DXR_SPAN_2D=0 (or DXR_WAYLAND_SPAN_2D=0) turns it off (the whole surface is then woven, which
  * is the pre-#1654 behaviour and shows the interlace on the other monitor).
  */
 static void
@@ -2893,7 +2893,12 @@ vk_composite_offpanel_2d(struct comp_vk_native_compositor *c,
 {
 	static int enabled = -1;
 	if (enabled < 0) {
-		const char *e = getenv("DXR_WAYLAND_SPAN_2D");
+		// DXR_SPAN_2D is the platform-neutral name the service weave engine
+		// reads too; DXR_WAYLAND_SPAN_2D is the original one.
+		const char *e = getenv("DXR_SPAN_2D");
+		if (e == NULL) {
+			e = getenv("DXR_WAYLAND_SPAN_2D");
+		}
 		enabled = (e != NULL && e[0] == '0') ? 0 : 1;
 	}
 	if (enabled == 0 || !c->use_wayland || cmd == VK_NULL_HANDLE || target_image == VK_NULL_HANDLE) {
