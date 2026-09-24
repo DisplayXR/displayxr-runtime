@@ -2990,13 +2990,21 @@ struct xrt_system_compositor_info
 
 	/*!
 	 * Optional callback: re-derive the dp_factory_* pointers above from the
-	 * runtime's plug-in loader. Long-lived service-mode compositors invoke
-	 * this once at per-client compositor create, so a vendor plug-in
-	 * installed AFTER the service started (#342) is picked up on the first
-	 * app launch without a service restart. NULL on the in-process / handle
-	 * path — those create a fresh instance per app launch and never need it.
-	 * The callee may swap in a strictly-better (lower ProbeOrder) plug-in
-	 * and leak the old DLL; see ADR-020 and `target_plugin_loader.c`.
+	 * runtime's plug-in loader, and re-pull the plug-in's display info
+	 * (display_*, nominal viewer, tiling / atlas, recommended view scale)
+	 * when the plug-in now reports geometry different from what was applied
+	 * at instance create — a service that auto-started before the vendor
+	 * backend identified the panel otherwise carries 0/fallback geometry
+	 * for its whole life. Long-lived service-mode compositors invoke this
+	 * once per client connect (before the IPC shared-memory snapshot of the
+	 * head's mode table) and once at per-client compositor create, so a
+	 * vendor plug-in installed AFTER the service started (#342) or a panel
+	 * identified after it started is picked up on the next client without a
+	 * service restart. Cheap and idempotent when nothing changed. NULL on
+	 * the in-process / handle path — those create a fresh instance per app
+	 * launch and never need it. The callee may swap in a strictly-better
+	 * (lower ProbeOrder) plug-in and leak the old DLL; see ADR-020 and
+	 * `target_plugin_loader.c`.
 	 */
 	void (*refresh_display_processors)(struct xrt_system_compositor_info *info);
 

@@ -258,6 +258,8 @@ a disagreeing value does not survive the first mode switch anyway.
 
 **NULL is allowed.** A NULL pointer is treated as if the call returned `false`. Required to be non-NULL for plug-ins that ship a `create_device` implementation, otherwise the runtime has no source of display dimensions and falls back to OpenXR defaults.
 
+**Called again after startup — keep it cheap.** A long-lived service can start before the vendor backend has identified the panel (an unattended reboot with the panel asleep; even a healthy boot needs a few seconds after the vendor platform service is up). The runtime therefore calls `get_display_info` not only at instance create but again on every client connect / per-client compositor create (`xrt_system_compositor_info::refresh_display_processors`), and re-applies the answer whenever the reported geometry (physical size, pixel size, nominal viewer, screen origin) differs from what it last applied — logging one `display info refreshed from plug-in after startup` WARN. The contract for the repeat calls: return `false` **fast** while the panel is still unknown (no blocking retry — spend any startup budget once, in `create_device`), and `true` with the real numbers once it is; keep your own head `xrt_device` (views, FOV, `hmd->views[].display`) correct in place, because the runtime re-derives only its own tiling / atlas / `xsysc->info` from the struct. Return values must be stable between calls for the same panel so the refresh stays a no-op.
+
 ### `set_pose_source`
 
 ```c

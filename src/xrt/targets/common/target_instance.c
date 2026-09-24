@@ -17,11 +17,14 @@
 
 
 #include "os/os_time.h"
+#include "os/os_threading.h"
 #include "os/os_display_edid.h"
 #include "os/os_display_desktop.h"
 
 #include "util/u_debug.h"
+#include "util/u_misc.h"
 #include "util/u_system.h"
+#include "util/u_time.h"
 #include "util/u_tiling.h"
 #include "util/u_trace_marker.h"
 #include "util/u_system_helpers.h"
@@ -164,22 +167,275 @@ build_dp_registry(struct xrt_system_compositor_info *info)
 	target_plugin_resolve_displays(descs, dn, &info->dp_registry);
 }
 
+static void
+fill_display_desktop_info(struct xrt_system_compositor_info *info);
+
+/*
+ *
+ * Plug-in display info: startup pull + post-startup refresh.
+ *
+ * A long-lived service can start BEFORE the vendor backend has identified the
+ * panel (a Windows-Update reboot from idle sleep leaves the panel asleep; even
+ * a healthy boot needs several seconds after the SR platform's own service is
+ * up). `get_display_info` then returns false at instance create and, until
+ * this block existed, was never asked again — `xsysc->info.display_*` stayed 0
+ * for the life of the process and every later IPC client got
+ * "get_display_dimensions FAILED, skipping SR poses". The refresh callback now
+ * re-pulls on every client connect / compositor create and re-applies when the
+ * plug-in finally has (or changes) real geometry.
+ *
+ * One system per process on the service path, so the head device and the
+ * last-applied snapshot live in file statics, guarded by a mutex: the callback
+ * runs on per-client threads and two clients can connect at once.
+ *
+ */
+
+//! The head device the display info describes; NULL until a system exists.
+static struct xrt_device *g_display_info_head = NULL;
+//! The plug-in display info that was last APPLIED to `xsysc->info` — what the
+//! refresh compares against, so it is idempotent regardless of what
+//! `fill_display_desktop_info` later overrides on the info struct itself.
+static struct xrt_plugin_display_info g_display_info_applied;
+static bool g_display_info_applied_valid = false;
+static struct os_mutex g_display_info_mutex;
+static bool g_display_info_mutex_initialized = false;
+//! When the plug-in last DECLINED (returned false); re-asking is throttled for
+//! @ref DISPLAY_INFO_DECLINE_RETRY_NS after that. A compliant plug-in declines
+//! fast, but a pre-contract one may spend its whole SR query budget inside the
+//! call — and the callback fires twice per client (connect + compositor
+//! create), on the IPC accept path, under the server's global lock.
+static int64_t g_display_info_last_decline_ns = 0;
+#define DISPLAY_INFO_DECLINE_RETRY_NS (2 * (int64_t)U_TIME_1S_IN_NS)
+
+/*!
+ * `get_display_info` through the struct_size gate every caller uses; false
+ * when the plug-in is absent, too old to carry the method, or declined.
+ */
+static bool
+query_plugin_display_info(const struct xrt_plugin_iface *plugin,
+                          struct xrt_device *head,
+                          struct xrt_plugin_display_info *out_pdi)
+{
+	if (plugin == NULL || head == NULL ||
+	    plugin->struct_size <
+	        offsetof(struct xrt_plugin_iface, get_display_info) + sizeof(plugin->get_display_info) ||
+	    plugin->get_display_info == NULL) {
+		return false;
+	}
+	U_ZERO(out_pdi);
+	out_pdi->struct_size = (uint32_t)sizeof(*out_pdi);
+	return plugin->get_display_info(target_plugin_get_active_instance(), head, out_pdi);
+}
+
+/*!
+ * Does @p b describe a different panel geometry than @p a? Only the fields
+ * that change when the vendor backend goes from "default display" to the real
+ * panel: physical size, pixel size, nominal viewer, screen origin.
+ */
+static bool
+plugin_display_info_geometry_differs(const struct xrt_plugin_display_info *a, const struct xrt_plugin_display_info *b)
+{
+	return a->display_width_m != b->display_width_m || a->display_height_m != b->display_height_m ||
+	       a->display_pixel_width != b->display_pixel_width || a->display_pixel_height != b->display_pixel_height ||
+	       a->nominal_viewer_x_m != b->nominal_viewer_x_m || a->nominal_viewer_y_m != b->nominal_viewer_y_m ||
+	       a->nominal_viewer_z_m != b->nominal_viewer_z_m || a->display_screen_left != b->display_screen_left ||
+	       a->display_screen_top != b->display_screen_top;
+}
+
+/*!
+ * Copy a successful `get_display_info` answer into the system compositor info
+ * and derive everything that hangs off it: per-mode tiling + the worst-case
+ * atlas on the head's mode table, the recommended view scale, the per-API DP
+ * factories. Runs at instance create and again from the refresh callback when
+ * the plug-in's geometry changes after startup; the caller owns the ordering
+ * with `build_dp_registry` / `fill_display_desktop_info`.
+ *
+ * Caller holds @ref g_display_info_mutex on the refresh path (instance create
+ * is single-threaded).
+ */
+static void
+apply_plugin_display_info(struct xrt_system_compositor_info *info,
+                          struct xrt_device *head,
+                          const struct xrt_plugin_iface *plugin,
+                          const struct xrt_plugin_display_info *pdi)
+{
+	info->display_width_m = pdi->display_width_m;
+	info->display_height_m = pdi->display_height_m;
+	info->nominal_viewer_x_m = pdi->nominal_viewer_x_m;
+	info->nominal_viewer_y_m = pdi->nominal_viewer_y_m;
+	info->nominal_viewer_z_m = pdi->nominal_viewer_z_m;
+	info->display_pixel_width = pdi->display_pixel_width;
+	info->display_pixel_height = pdi->display_pixel_height;
+	info->display_screen_left = pdi->display_screen_left;
+	info->display_screen_top = pdi->display_screen_top;
+	info->supported_eye_tracking_modes = pdi->supported_eye_tracking_modes;
+	info->default_eye_tracking_mode = pdi->default_eye_tracking_mode;
+
+	// Consistency rule (#441): supported_eye_tracking_modes != 0
+	// ⇔ at least one rendering mode claims HAS_TRACKING. A
+	// mismatch means the plug-in's capability advertisement and
+	// its per-mode flags disagree — apps would see impossible
+	// combinations (e.g. MANAGED offered but isTracking pinned
+	// FALSE). One-shot WARN per apply, not fatal.
+	{
+		bool any_tracked = false;
+		for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {
+			if (head->rendering_modes[mi].mode_flags & XRT_RENDERING_MODE_FLAG_HAS_TRACKING) {
+				any_tracked = true;
+				break;
+			}
+		}
+		if ((pdi->supported_eye_tracking_modes != 0) != any_tracked) {
+			U_LOG_W(
+			    "Plug-in '%s' tracking advertisement inconsistent: "
+			    "supported_eye_tracking_modes=0x%x but %s rendering "
+			    "mode sets XRT_RENDERING_MODE_FLAG_HAS_TRACKING "
+			    "(see #441 consistency rule)",
+			    plugin->id ? plugin->id : "?", pdi->supported_eye_tracking_modes,
+			    any_tracked ? "at least one" : "no");
+		}
+	}
+
+	// Compute tiling once we have native pixel dims. The per-mode
+	// fields are filled for the current orientation, but the
+	// system-wide atlas is the worst case ACROSS orientations for
+	// modes that can rotate (XRT_RENDERING_MODE_FLAG_CAN_ROTATE) —
+	// on Android the app's render swapchain is never recreated on a
+	// device flip, so it must be allocated large enough for either.
+	if (pdi->display_pixel_width > 0 && pdi->display_pixel_height > 0) {
+		for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {
+			u_tiling_compute_mode(&head->rendering_modes[mi], pdi->display_pixel_width,
+			                      pdi->display_pixel_height);
+		}
+		u_tiling_compute_system_atlas_oriented(head->rendering_modes, head->rendering_mode_count,
+		                                       pdi->display_pixel_width, pdi->display_pixel_height,
+		                                       &info->atlas_width_pixels, &info->atlas_height_pixels);
+	}
+
+	// Recommended view scale: prefer iface-supplied (Leia SR
+	// gives this from its weaver); otherwise derive worst-case
+	// from rendering modes (the sim_display path).
+	//
+	// THIS IS THE ONLY WRITER. The field is the display-level
+	// baseline and is immutable between applies: mode changes do
+	// not overwrite it, because the active mode's scale is
+	// derived from head->rendering_modes[] on demand through
+	// xrt_device_get_active_mode_view_scale().
+	if (pdi->recommended_view_scale_x > 0.0f && pdi->recommended_view_scale_y > 0.0f) {
+		info->recommended_view_scale_x = pdi->recommended_view_scale_x;
+		info->recommended_view_scale_y = pdi->recommended_view_scale_y;
+	} else {
+		float min_scale_x = 1.0f, min_scale_y = 1.0f;
+		for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {
+			if (head->rendering_modes[mi].view_scale_x > 0.0f &&
+			    head->rendering_modes[mi].view_scale_x < min_scale_x)
+				min_scale_x = head->rendering_modes[mi].view_scale_x;
+			if (head->rendering_modes[mi].view_scale_y > 0.0f &&
+			    head->rendering_modes[mi].view_scale_y < min_scale_y)
+				min_scale_y = head->rendering_modes[mi].view_scale_y;
+		}
+		info->recommended_view_scale_x = min_scale_x;
+		info->recommended_view_scale_y = min_scale_y;
+	}
+
+	// Per-API DP factories from the iface — factored into
+	// a helper so the refresh callback uses the same
+	// per-platform mask. See @ref fill_dp_factories_from_plugin.
+	fill_dp_factories_from_plugin(info, plugin);
+
+	U_LOG_W(
+	    "XR_DXR_display_info (iface=%s): display=%.4f x %.4f m, "
+	    "nominal=(%.4f, %.4f, %.4f) m, scale=%.4f x %.4f, "
+	    "pixels=%ux%u, atlas=%ux%u",
+	    plugin->id ? plugin->id : "?", pdi->display_width_m, pdi->display_height_m, pdi->nominal_viewer_x_m,
+	    pdi->nominal_viewer_y_m, pdi->nominal_viewer_z_m, info->recommended_view_scale_x,
+	    info->recommended_view_scale_y, pdi->display_pixel_width, pdi->display_pixel_height,
+	    info->atlas_width_pixels, info->atlas_height_pixels);
+
+	g_display_info_applied = *pdi;
+	g_display_info_applied_valid = true;
+}
+
+/*!
+ * Post-startup half: ask the plug-in again and re-apply only if it now
+ * reports geometry different from what was last applied (or reports for the
+ * first time after declining at startup). Cheap and idempotent when nothing
+ * changed — the plug-in contract is "false fast while the panel is unknown,
+ * true with real numbers once identified" (see docs/reference/xrt_plugin_iface.md).
+ *
+ * @return true if `info` was re-applied and the caller should re-resolve the
+ *         desktop rect.
+ */
+static bool
+refresh_display_info_from_plugin(struct xrt_system_compositor_info *info, const struct xrt_plugin_iface *plugin)
+{
+	if (info == NULL || plugin == NULL || !g_display_info_mutex_initialized) {
+		return false;
+	}
+
+	os_mutex_lock(&g_display_info_mutex);
+
+	bool applied = false;
+	struct xrt_device *head = g_display_info_head;
+	struct xrt_plugin_display_info pdi;
+	const int64_t now_ns = os_monotonic_get_ns();
+	const bool throttled = g_display_info_last_decline_ns != 0 &&
+	                       now_ns - g_display_info_last_decline_ns < DISPLAY_INFO_DECLINE_RETRY_NS;
+	bool answered = false;
+	if (head != NULL && !throttled) {
+		answered = query_plugin_display_info(plugin, head, &pdi);
+		g_display_info_last_decline_ns = answered ? 0 : now_ns;
+	}
+	if (answered &&
+	    (!g_display_info_applied_valid || plugin_display_info_geometry_differs(&g_display_info_applied, &pdi))) {
+		const struct xrt_plugin_display_info before = g_display_info_applied;
+		const bool had_before = g_display_info_applied_valid;
+		apply_plugin_display_info(info, head, plugin, &pdi);
+		U_LOG_W(
+		    "display info refreshed from plug-in after startup: %s -> %ux%u px, %.4f x %.4f m, "
+		    "nominal=(%.4f, %.4f, %.4f) m, origin=(%d, %d) (iface=%s)",
+		    had_before ? "geometry changed" : "startup query had failed, first real answer",
+		    pdi.display_pixel_width, pdi.display_pixel_height, pdi.display_width_m, pdi.display_height_m,
+		    pdi.nominal_viewer_x_m, pdi.nominal_viewer_y_m, pdi.nominal_viewer_z_m,
+		    (int)pdi.display_screen_left, (int)pdi.display_screen_top, plugin->id ? plugin->id : "?");
+		if (had_before) {
+			U_LOG_W("  previous: %ux%u px, %.4f x %.4f m, nominal=(%.4f, %.4f, %.4f) m, origin=(%d, %d)",
+			        before.display_pixel_width, before.display_pixel_height, before.display_width_m,
+			        before.display_height_m, before.nominal_viewer_x_m, before.nominal_viewer_y_m,
+			        before.nominal_viewer_z_m, (int)before.display_screen_left,
+			        (int)before.display_screen_top);
+		}
+		applied = true;
+	}
+
+	os_mutex_unlock(&g_display_info_mutex);
+	return applied;
+}
+
 /*!
  * Installed on @ref xrt_system_compositor_info::refresh_display_processors so a
  * long-lived service-mode compositor can pick up a vendor plug-in registered
- * AFTER the service started (issue #342). Each per-client compositor-create
- * path invokes it once, before any DP-factory read; the call is cheap when no
- * better plug-in has appeared. See ADR-020 / `target_plugin_refresh_active`.
+ * AFTER the service started (issue #342), and display geometry the plug-in
+ * could only report after startup (panel identified late). Invoked once per
+ * client connect (before the IPC shared-memory snapshot of the head's mode
+ * table) and once per per-client compositor create, before any DP-factory
+ * read; cheap when nothing changed. See ADR-020 / `target_plugin_refresh_active`.
  */
 static void
 refresh_display_processors_cb(struct xrt_system_compositor_info *info)
 {
 	const struct xrt_plugin_iface *plugin = target_plugin_refresh_active();
 	fill_dp_factories_from_plugin(info, plugin);
+	const bool geometry_changed = refresh_display_info_from_plugin(info, plugin);
 	// Rebuild the per-monitor registry too — refresh_active invalidates the
 	// loader's source cache on a swap, so this re-resolves against the new
 	// winner (#69 / ADR-015).
 	build_dp_registry(info);
+	// New geometry means a new panel rect / device name for apps (#1301) —
+	// same order as instance create: apply, registry, then the desktop rect.
+	if (geometry_changed) {
+		fill_display_desktop_info(info);
+	}
 }
 
 /*!
@@ -461,22 +717,13 @@ t_instance_create_system(struct xrt_instance *xinst,
 	uint64_t render_adapter_luid = 0;
 	{
 		const struct xrt_plugin_iface *rr_plugin = target_plugin_get_active();
-		if (rr_plugin != NULL &&
-		    rr_plugin->struct_size >=
-		        offsetof(struct xrt_plugin_iface, get_display_info) + sizeof(rr_plugin->get_display_info) &&
-		    rr_plugin->get_display_info != NULL) {
-			struct xrt_plugin_display_info rr_pdi = {0};
-			rr_pdi.struct_size = (uint32_t)sizeof(rr_pdi);
-			if (rr_plugin->get_display_info(target_plugin_get_active_instance(), head, &rr_pdi)) {
-				if (rr_pdi.refresh_mhz > 0) {
-					sr_refresh_rate_hz = (float)rr_pdi.refresh_mhz / 1000.0f;
-				}
-				scanout_adapter_luid = resolve_scanout_adapter_luid(&rr_pdi);
-				render_adapter_luid = resolve_render_adapter_luid(&rr_pdi);
-			} else {
-				resolve_scanout_adapter_luid(NULL);
-				render_adapter_luid = resolve_render_adapter_luid(NULL);
+		struct xrt_plugin_display_info rr_pdi;
+		if (query_plugin_display_info(rr_plugin, head, &rr_pdi)) {
+			if (rr_pdi.refresh_mhz > 0) {
+				sr_refresh_rate_hz = (float)rr_pdi.refresh_mhz / 1000.0f;
 			}
+			scanout_adapter_luid = resolve_scanout_adapter_luid(&rr_pdi);
+			render_adapter_luid = resolve_render_adapter_luid(&rr_pdi);
 		} else {
 			resolve_scanout_adapter_luid(NULL);
 			render_adapter_luid = resolve_render_adapter_luid(NULL);
@@ -550,7 +797,14 @@ out:
 		// In-process / handle apps never call it — they create a fresh
 		// instance per launch, so their initial discovery is already
 		// post-install. Install unconditionally so the path works even
-		// when the initial `get_display_info` below failed / had no plug-in.
+		// when the initial `get_display_info` below failed / had no plug-in
+		// — that failure is exactly the case the callback's display-info
+		// re-pull exists for (panel identified after the service started).
+		if (!g_display_info_mutex_initialized) {
+			g_display_info_mutex_initialized = os_mutex_init(&g_display_info_mutex) == 0;
+		}
+		g_display_info_head = head;
+		g_display_info_applied_valid = false;
 		xsysc->info.refresh_display_processors = refresh_display_processors_cb;
 
 		// Vendor-neutral display-info population through the plug-in
@@ -562,114 +816,15 @@ out:
 		// "already filled in" guards and skip themselves.
 		bool plugin_filled_display_info = false;
 		const struct xrt_plugin_iface *plugin = target_plugin_get_active();
-		if (plugin != NULL &&
-		    plugin->struct_size >=
-		        offsetof(struct xrt_plugin_iface, get_display_info) + sizeof(plugin->get_display_info) &&
-		    plugin->get_display_info != NULL) {
-			struct xrt_plugin_display_info pdi = {0};
-			pdi.struct_size = (uint32_t)sizeof(pdi);
-			if (plugin->get_display_info(target_plugin_get_active_instance(), head, &pdi)) {
-				xsysc->info.display_width_m = pdi.display_width_m;
-				xsysc->info.display_height_m = pdi.display_height_m;
-				xsysc->info.nominal_viewer_x_m = pdi.nominal_viewer_x_m;
-				xsysc->info.nominal_viewer_y_m = pdi.nominal_viewer_y_m;
-				xsysc->info.nominal_viewer_z_m = pdi.nominal_viewer_z_m;
-				xsysc->info.display_pixel_width = pdi.display_pixel_width;
-				xsysc->info.display_pixel_height = pdi.display_pixel_height;
-				xsysc->info.display_screen_left = pdi.display_screen_left;
-				xsysc->info.display_screen_top = pdi.display_screen_top;
-				xsysc->info.supported_eye_tracking_modes = pdi.supported_eye_tracking_modes;
-				xsysc->info.default_eye_tracking_mode = pdi.default_eye_tracking_mode;
-
-				// Consistency rule (#441): supported_eye_tracking_modes != 0
-				// ⇔ at least one rendering mode claims HAS_TRACKING. A
-				// mismatch means the plug-in's capability advertisement and
-				// its per-mode flags disagree — apps would see impossible
-				// combinations (e.g. MANAGED offered but isTracking pinned
-				// FALSE). One-shot init WARN, not fatal.
-				{
-					bool any_tracked = false;
-					for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {
-						if (head->rendering_modes[mi].mode_flags &
-						    XRT_RENDERING_MODE_FLAG_HAS_TRACKING) {
-							any_tracked = true;
-							break;
-						}
-					}
-					if ((pdi.supported_eye_tracking_modes != 0) != any_tracked) {
-						U_LOG_W("Plug-in '%s' tracking advertisement inconsistent: "
-						        "supported_eye_tracking_modes=0x%x but %s rendering "
-						        "mode sets XRT_RENDERING_MODE_FLAG_HAS_TRACKING "
-						        "(see #441 consistency rule)",
-						        plugin->id ? plugin->id : "?",
-						        pdi.supported_eye_tracking_modes,
-						        any_tracked ? "at least one" : "no");
-					}
-				}
-
-				// Compute tiling once we have native pixel dims. The per-mode
-				// fields are filled for the current orientation, but the
-				// system-wide atlas is the worst case ACROSS orientations for
-				// modes that can rotate (XRT_RENDERING_MODE_FLAG_CAN_ROTATE) —
-				// on Android the app's render swapchain is never recreated on a
-				// device flip, so it must be allocated large enough for either.
-				if (pdi.display_pixel_width > 0 && pdi.display_pixel_height > 0) {
-					for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {
-						u_tiling_compute_mode(&head->rendering_modes[mi],
-						                      pdi.display_pixel_width,
-						                      pdi.display_pixel_height);
-					}
-					u_tiling_compute_system_atlas_oriented(
-					    head->rendering_modes, head->rendering_mode_count,
-					    pdi.display_pixel_width, pdi.display_pixel_height,
-					    &xsysc->info.atlas_width_pixels,
-					    &xsysc->info.atlas_height_pixels);
-				}
-
-				// Recommended view scale: prefer iface-supplied (Leia SR
-				// gives this from its weaver); otherwise derive worst-case
-				// from rendering modes (the sim_display path).
-				//
-				// THIS IS THE ONLY WRITE. The field is the display-level
-				// baseline and is immutable from here on: mode changes no
-				// longer overwrite it, because the active mode's scale is
-				// derived from head->rendering_modes[] on demand through
-				// xrt_device_get_active_mode_view_scale().
-				if (pdi.recommended_view_scale_x > 0.0f && pdi.recommended_view_scale_y > 0.0f) {
-					xsysc->info.recommended_view_scale_x = pdi.recommended_view_scale_x;
-					xsysc->info.recommended_view_scale_y = pdi.recommended_view_scale_y;
-				} else {
-					float min_scale_x = 1.0f, min_scale_y = 1.0f;
-					for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {
-						if (head->rendering_modes[mi].view_scale_x > 0.0f &&
-						    head->rendering_modes[mi].view_scale_x < min_scale_x)
-							min_scale_x = head->rendering_modes[mi].view_scale_x;
-						if (head->rendering_modes[mi].view_scale_y > 0.0f &&
-						    head->rendering_modes[mi].view_scale_y < min_scale_y)
-							min_scale_y = head->rendering_modes[mi].view_scale_y;
-					}
-					xsysc->info.recommended_view_scale_x = min_scale_x;
-					xsysc->info.recommended_view_scale_y = min_scale_y;
-				}
-
-				// Per-API DP factories from the iface — factored into
-				// a helper so the refresh callback below uses the same
-				// per-platform mask. See @ref fill_dp_factories_from_plugin.
-				fill_dp_factories_from_plugin(&xsysc->info, plugin);
-
-				U_LOG_W("XR_DXR_display_info (iface=%s): display=%.4f x %.4f m, "
-				        "nominal=(%.4f, %.4f, %.4f) m, scale=%.4f x %.4f, "
-				        "pixels=%ux%u, atlas=%ux%u",
-				        plugin->id ? plugin->id : "?",
-				        pdi.display_width_m, pdi.display_height_m,
-				        pdi.nominal_viewer_x_m, pdi.nominal_viewer_y_m, pdi.nominal_viewer_z_m,
-				        xsysc->info.recommended_view_scale_x,
-				        xsysc->info.recommended_view_scale_y, pdi.display_pixel_width,
-				        pdi.display_pixel_height, xsysc->info.atlas_width_pixels,
-				        xsysc->info.atlas_height_pixels);
-
-				plugin_filled_display_info = true;
-			}
+		struct xrt_plugin_display_info pdi;
+		if (query_plugin_display_info(plugin, head, &pdi)) {
+			apply_plugin_display_info(&xsysc->info, head, plugin, &pdi);
+			plugin_filled_display_info = true;
+		} else if (plugin != NULL) {
+			U_LOG_W(
+			    "Plug-in '%s' get_display_info declined at instance create — display info stays "
+			    "unknown until a client connect re-pulls it (panel not identified yet?)",
+			    plugin->id ? plugin->id : "?");
 		}
 
 		// Build the per-monitor DP factory registry (#69 / ADR-015) from the

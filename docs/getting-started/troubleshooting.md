@@ -320,6 +320,51 @@ Tracked as [#1205](https://github.com/DisplayXR/displayxr-runtime/issues/1205).
 
 ---
 
+## 3D is wrong after an unattended reboot (panel asleep at logon) until the service is restarted
+
+**Symptom.** After a reboot nobody was sitting at (Windows Update overnight is the classic),
+every IPC client — the browser, shell apps — gets wrong view poses / flat or mis-converged 3D,
+and restarting `displayxr-service.exe` by hand fixes it instantly. The service log
+(`%LOCALAPPDATA%\DisplayXR\DisplayXR_displayxr-service.exe.<pid>_*.log`) shows the boot-time
+plug-in query failing and a later client falling over the stale cache:
+
+```
+[ERROR] [leiasr_query_recommended_view_dimensions] Failed to query SR recommended dimensions within 2.0 seconds
+[WARN]  [leia_hmd_create] Created Leia 3D display: 3840x2160 px, 0.3440x0.1940 m ... (geometry from hardcoded defaults)
+...
+[WARN]  [ipc_try_get_sr_view_poses] ipc_try_get_sr_view_poses: get_display_dimensions FAILED, skipping SR poses
+```
+
+**Cause.** The service auto-starts at logon in the same second as the SR platform's own
+session process, and the SR platform has no readiness signal: until it has read the panel's
+serial (over the panel's USB/serial link — which is *down* while the panel sleeps) it reports a
+placeholder "default display". The plug-in's startup query therefore fails (or, on a healthy
+boot, needs 4–7 s the first budget doesn't cover), and older runtimes copied display info into
+the service's `xrt_system_compositor_info` **once**, at startup, never asking again — so the
+service carried 0/fallback geometry for the life of the process, even though the panel was
+identified the moment someone woke it. The SR side of the timeline is in
+`C:\ProgramData\Simulated Reality\Server\Log\SRService*.txt` ("Device is suspending on Monitor
+Power Event" right after boot, "Device resumed" when the panel wakes) and
+`C:\ProgramData\Simulated Reality\Applications\SR Session\Log\` ("Active display changed to
+default display" → later "Active display changed to serial number: …").
+
+**Fix.** Self-healing on current runtimes: the service re-asks the plug-in on every client
+connect and re-applies the geometry once the panel is identified — look for
+`display info refreshed from plug-in after startup` in the service log on the first client
+after the panel woke. On older runtimes, or if that line never appears while the panel is
+demonstrably awake, restart the service (non-elevated):
+
+```bat
+taskkill /IM displayxr-service.exe /F
+start "" "C:\Program Files\DisplayXR\Runtime\displayxr-service.exe"
+```
+
+To reproduce deliberately: `net stop "SR Service"` (elevated), start `displayxr-service.exe`,
+`net start "SR Service"`, wait for the SR Session log to show the serial-number line, then
+connect a client and expect the `display info refreshed` WARN plus correct poses.
+
+---
+
 ## Eye tracking doesn't work, or the app hangs waiting for tracking
 
 **Symptom.** 3D looks wrong / doesn't follow your head, tracking never engages, or the app

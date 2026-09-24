@@ -1396,6 +1396,18 @@ ipc_server_handle_client_connected(struct ipc_server *vs, xrt_ipc_handle_t ipc_h
 	ics->plane_detection_ids = NULL;
 	ics->plane_detection_xdev = NULL;
 
+	// Re-pull the vendor plug-in's display info BEFORE init_shm snapshots the
+	// head's mode table (per-view pixel dims, rendering_modes[]) into this
+	// client's shared memory. A service that auto-started before the panel was
+	// identified has 0/fallback geometry in xsysc->info and untiled modes; the
+	// callback re-applies the real numbers once the plug-in has them, so the
+	// snapshot below is not stale for the life of this client. Cheap and
+	// idempotent when nothing changed (the compositor-create path calls it
+	// again, as before, for the DP factories).
+	if (vs->xsysc != NULL && vs->xsysc->info.refresh_display_processors != NULL) {
+		vs->xsysc->info.refresh_display_processors(&vs->xsysc->info);
+	}
+
 	xrt_result_t xret = init_shm(vs, ics);
 	if (xret != XRT_SUCCESS) {
 
