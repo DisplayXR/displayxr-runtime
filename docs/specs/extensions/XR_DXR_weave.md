@@ -3,11 +3,11 @@
 | Field | Value |
 |---|---|
 | **Extension Name** | `XR_DXR_weave` |
-| **Spec Version** | 9 |
-| **Extension Type** | Instance extension (service path — Windows/D3D11, macOS/comp_multi-Vulkan #759, Android/comp_multi-Vulkan #1036; **desktop Linux is snap-only and in-process too**, §5c / #1588) |
+| **Spec Version** | 10 |
+| **Extension Type** | Instance extension (service path — Windows/D3D11, macOS/comp_multi-Vulkan #759, Android/comp_multi-Vulkan #1036, desktop Linux/comp_multi-Vulkan dma-buf #1699 when the service carries its engine; the snap also works in-process on desktop Linux, §5c / #1588) |
 | **Header** | `src/external/openxr_includes/openxr/XR_DXR_weave.h` (canonical; auto-syncs to `displayxr-extensions`) |
-| **Status** | Provisional (`1004999190–198` type block, pending Khronos registry; `199` reserved, see §2c; v9 additions in a fresh `1004999240–249` decade) |
-| **Design history** | `docs/roadmap/webxr-step-b-design.md` §13.6–13.9, `docs/roadmap/android-concurrent-multi-app.md` F11/§10.4, issues #625, #774, #1031/#1036, browser#88, browser#103 |
+| **Status** | Provisional (`1004999190–198` type block, pending Khronos registry; `199` reserved, see §2c; v9/v10 additions in a fresh `1004999240–249` decade — 240 v9, 241–245 v10) |
+| **Design history** | `docs/roadmap/webxr-step-b-design.md` §13.6–13.9, `docs/roadmap/android-concurrent-multi-app.md` F11/§10.4, issues #625, #774, #1031/#1036, browser#88, browser#103, #1699 |
 
 ## 1. What it is
 
@@ -384,15 +384,21 @@ Notes that only bite on Android:
   sender did not send would hang rather than fail.
 - **Follow-up, not a correctness gap:** an fd-based (`sync_file`) acquire/release pair would let
   the submit return before the GPU finishes. Today's synchronous contract is the simplest one
-  that is correct, and it is what macOS already ships.
+  that is correct, and it is what macOS already ships. v10 defines that pair (§5d) but accepts
+  it on desktop Linux only; bringing it to Android is a later, additive step.
 
-## 5c. Desktop Linux platform mapping (#1588) — snap only
+## 5c. Desktop Linux platform mapping — the snap (#1588), and a full weave platform (#1699)
 
-Desktop Linux is the one platform where this extension is advertised **without a weave
-service behind it**. There is no bind, no submit, no output/fence transport and no
-`comp_multi` weave engine on Linux; `xrWeaveBindWindowDXR`, `xrWeaveBindWindow2DXR`,
-`xrWeaveSubmitDXR`, `xrWeaveSetScreenFlatRegionsDXR` and `xrWeaveExportIpcConnectionDXR` all
-report `XR_ERROR_FEATURE_UNSUPPORTED` exactly as an in-process session does everywhere else.
+Desktop Linux became a **full weave platform in v10** (§5d): the transport, the fences and the
+wire exist, and a service built with the desktop-Linux `comp_multi` weave engine
+(`comp_multi_weave_linux.c`, CMake `XRT_FEATURE_COMP_MULTI_WEAVE_LINUX`) serves bind, submit
+and output export exactly as macOS and Android do. **A service built without that engine is
+still honest about it:** `xrWeaveSubmitDXR` then reports `XR_ERROR_FEATURE_UNSUPPORTED`
+(permanent — not the retryable `XR_ERROR_RUNTIME_FAILURE`), and the service closes every fd it
+was sent. `xrWeaveExportIpcConnectionDXR` is unchanged by v10. An in-process session reports
+`XR_ERROR_FEATURE_UNSUPPORTED` for everything but the snap, as on every platform.
+
+The rest of this section is the snap, which predates v10 and works either way.
 
 What Linux does have is the problem the snap exists to solve. A windowed weave anchors its
 interlace phase to the window's absolute position on the panel, so dragging the window walks
@@ -405,7 +411,7 @@ land on lattice points, so the pattern is identical at every drag position.
 | Who intercepts the move | the runtime's own window proc (`WM_WINDOWPOSCHANGING`) | **the app**: X11 gives a client no hook into the WM's drag, so an undecorated handle app owns its drag and calls this entry point per motion event |
 | Session class | out-of-process present owner | **in-process** (`_handle`); the IPC route also exists for a service present owner |
 | DP slot | `xrt_display_processor_d3d11::snap_window_rect` (slot 18) | `xrt_display_processor_vk::snap_window_rect` (appended, `XRT_DP_VK_HAS_SNAP_WINDOW_RECT`) |
-| Every other entry point | implemented | `XR_ERROR_FEATURE_UNSUPPORTED` |
+| Every other entry point | implemented | in-process: `XR_ERROR_FEATURE_UNSUPPORTED`; service: implemented when the service carries the Linux engine (§5d), `XR_ERROR_FEATURE_UNSUPPORTED` from submit otherwise |
 | Wayland | n/a | the compositor owns the move and never tells the client where it went, so snapping is impossible by construction — the call still resolves and returns the target unchanged |
 
 Semantics are the Windows ones verbatim: screen pixels in and out, only the top-left is
@@ -459,6 +465,116 @@ per-axis search radius (max excursion exactly 2), and all 15 sharing one slanted
 phase (circular concentration 0.974 against a slanted fit; a plain x-only residue test fails,
 as it must for a slanted lattice).
 
+## 5d. Desktop-Linux dma-buf transport and sync_file fences (v10, #1699)
+
+A file descriptor is an `int`, not a pointer, and a dma-buf carries no dimensions, format or
+tiling of its own. v10 therefore does not squeeze it into `inputTexture` (whose `void*` stays for
+ABI); it adds typed chains. Everything in this section is **desktop Linux only** as far as input
+goes; the two output chains are portable (a platform with nothing to put in them writes `-1`).
+
+```c
+#define XR_WEAVE_DMABUF_MAX_PLANES_DXR 4
+#define XR_WEAVE_HANDLE_KIND_DMABUF_DXR    5   // XrWeaveHandleKindDXR
+#define XR_WEAVE_HANDLE_KIND_OPAQUE_FD_DXR 6
+
+typedef struct XrWeaveDmabufDescDXR {          // XR_TYPE_WEAVE_DMABUF_DESC_DXR (1004999241)
+    XrStructureType type; const void* next;    // chain on XrWeaveSubmitInfoDXR
+    int32_t  fd;                               // runtime-owned on XR_SUCCESS
+    uint32_t width, height;
+    uint32_t drmFourcc;                        // DRM_FORMAT_*
+    uint64_t drmModifier;                      // verbatim; never DRM_FORMAT_MOD_INVALID
+    uint32_t planeCount;                       // 1..4, all planes are offsets into fd
+    uint32_t offsets[4], strides[4];
+    uint64_t bufferId;                         // stable buffer identity for the import cache; 0 = none
+} XrWeaveDmabufDescDXR;
+// XrWeaveOverlayDmabufDescDXR (1004999242): identical fields, describes the overlay atlas.
+
+typedef struct XrWeaveOutputDmabufDXR {        // XR_TYPE_WEAVE_OUTPUT_DMABUF_DXR (1004999243)
+    XrStructureType type; void* next;          // chain on XrWeaveOutputDXR
+    int32_t  fd;                               // caller-owned; -1 on steady-state frames
+    uint32_t width, height, drmFourcc;
+    uint64_t drmModifier;
+    uint32_t planeCount, offsets[4], strides[4];
+    uint64_t size;                             // allocation size in bytes
+} XrWeaveOutputDmabufDXR;
+
+typedef struct XrWeaveSubmitSyncDXR {          // XR_TYPE_WEAVE_SUBMIT_SYNC_DXR (1004999244)
+    XrStructureType type; const void* next;    // chain on XrWeaveSubmitInfoDXR, with a dma-buf input
+    int32_t acquireFenceFd;                    // sync_file, -1 = none; runtime-owned on XR_SUCCESS
+} XrWeaveSubmitSyncDXR;
+
+typedef struct XrWeaveOutputSyncDXR {          // XR_TYPE_WEAVE_OUTPUT_SYNC_DXR (1004999245)
+    XrStructureType type; void* next;          // chain on XrWeaveOutputDXR
+    int32_t releaseFenceFd;                    // EVERY frame; caller-owned; -1 = already complete
+} XrWeaveOutputSyncDXR;
+```
+
+**Two structure types for one layout.** The input and the overlay are both described by the
+same fields, but they travel in one `next` chain, and a structure type appears in a chain once.
+`XrWeaveOverlayDmabufDescDXR` exists only for that; it requires the `XrWeaveSubmitOverlaysDXR` it
+describes (whose `overlayTexture` is then ignored).
+
+**Handle kinds.**
+
+| Kind | What `inputTexture` is | Where it works |
+|---|---|---|
+| `PLATFORM_DEFAULT` | on desktop Linux: `OPAQUE_FD`, unless an `XrWeaveDmabufDescDXR` is chained, which selects `DMABUF` | everywhere |
+| `DMABUF` (5) | ignored — the fd and its layout are in `XrWeaveDmabufDescDXR` | desktop Linux; any producer (GL/EGL, Vulkan, GBM), any driver the service's GPU can import from |
+| `OPAQUE_FD` (6) | `(void*)(intptr_t)fd`, a Vulkan `OPAQUE_FD` memory export | desktop Linux; **same driver and device** as the service only, since it names no format or tiling. The pre-v10 Linux behaviour, kept for a Vulkan producer on the service's own GPU |
+
+A dma-buf input takes only a dma-buf overlay; `DMABUF` without a descriptor, a descriptor with
+any kind but `DMABUF`/`PLATFORM_DEFAULT`, or any v10 input chain on another platform is
+`XR_ERROR_VALIDATION_FAILURE`. `drmModifier == DRM_FORMAT_MOD_INVALID` (implicit) is rejected: a
+producer resolves it first (`LINEAR` = 0).
+
+**Lifetimes.** The woven dma-buf follows `weavedTexture`: delivered on the first successful
+submit and on every reallocation, `fd = -1` in between. The release fence does **not**: it is a
+fresh `sync_file` **every frame**, because a sync_file signals once. So a caller imports the
+output buffer once per allocation but receives, waits and closes one release fd per submit.
+`fenceValue` stays the monotonic per-submit counter it is on macOS and Android; `fence` is never
+set on Linux.
+
+**Fences.**
+
+- *Acquire* (in). A sync_file that signals when the caller's GPU has finished **writing the
+  input (and overlay) and reading the previous woven output** — one fence covers both hazards.
+  The runtime waits it on the GPU before touching either, so the caller need not finish its GPU
+  work before submitting. Absent / `-1` = the caller already finished (the v9 contract).
+- *Release* (out). A sync_file that signals when this submit's woven output is complete; the
+  caller waits it (GPU import or `poll`) before sampling the output. `-1` = the submit completed
+  synchronously. **Without `XrWeaveOutputSyncDXR` the runtime keeps the v9 contract for the
+  caller**: it waits the release fence itself (bounded 1 s) before `xrWeaveSubmitDXR` returns.
+
+**FD ownership — the Vulkan external-handle rule.** Every fd the caller passes **in** (`fd`,
+`acquireFenceFd`) is the runtime's once `xrWeaveSubmitDXR` returns `XR_SUCCESS`, and stays the
+caller's on any other result — including `XR_ERROR_RUNTIME_FAILURE` (a refused frame) and
+`XR_ERROR_INSTANCE_LOST`. A caller that wants to keep a buffer passes a `dup()`. Every fd handed
+**out** (`XrWeaveOutputDmabufDXR::fd`, `releaseFenceFd`) is the caller's to close.
+
+**The import cache.** An fd is not an identity: every hand-off is a new number. The service
+keys its input import cache on `bufferId` when non-zero and on the fd's `(st_dev, st_ino)`
+otherwise, so a producer rotating a small pool re-uses imports instead of re-importing each
+frame. Two different buffers must never share a non-zero `bufferId` within a session.
+
+| Contract point | macOS / Android (comp_multi Vulkan) | Desktop Linux (comp_multi Vulkan, v10) |
+|---|---|---|
+| Window binding | opaque id / explicit geometry | explicit geometry (`xrWeaveBindWindow2DXR` + `XrWeaveWindowGeometryDXR`), device pixels, desktop-absolute; required under Wayland, where the compositor never tells the client its position |
+| `inputTexture` | IOSurfaceRef / `AHardwareBuffer *` | ignored under `DMABUF` (the fd is in `XrWeaveDmabufDescDXR`); `(void*)(intptr_t)fd` under `OPAQUE_FD` |
+| Handle kind | `IOSURFACE` / `AHARDWAREBUFFER` | `DMABUF` or `OPAQUE_FD` |
+| Input-ready sync | caller finishes writes before submit | acquire `sync_file` (GPU wait), or caller finishes writes before submit |
+| `weavedTexture` | runtime-allocated IOSurfaceRef / `AHardwareBuffer *` | NULL when `XrWeaveOutputDmabufDXR` is chained (the dma-buf is there); an `OPAQUE_FD` as `(void*)(intptr_t)fd` otherwise |
+| `fence` / `fenceValue` | no fence, synchronous; `fenceValue` monotonic | `fence` never set; per-frame release `sync_file` in `XrWeaveOutputSyncDXR`, or synchronous without it; `fenceValue` monotonic |
+| `xrWeaveSnapWindowRectDXR` | identity | the Vulkan DP's `snap_window_rect` (§5c) |
+| Without the service's engine | n/a | submit: `XR_ERROR_FEATURE_UNSUPPORTED` |
+
+**Wire (runtime-internal, for reviewers).** Two IPC calls, not a grown `weave_submit`, so the
+shipping Windows/macOS/Android wire is byte-identical: `weave_submit_dmabuf` (the unchanged
+`ipc_arg_weave_submit` + a 136-byte `ipc_arg_weave_dmabuf`, 968 of the 1024-byte message; in
+handles `[input, overlay?, acquire?]`, one out handle — the release fence) and
+`weave_get_output_dmabuf` (the output's layout beside its fd). The service parks the fds it sends
+out and closes them at the next dma-buf weave call or at client teardown, since the transport
+duplicates rather than transfers. Engine contract: `src/xrt/include/xrt/xrt_weave_dmabuf.h`.
+
 ## 6. Version history
 
 | Version | Change |
@@ -472,6 +588,12 @@ as it must for a slanted lattice).
 | 7 | `XrWeaveSubmitHandlesDXR` handle kinds + `xrWeaveBindWindow2DXR` / `XrWeaveWindowGeometryDXR` explicit window geometry; **Android** support (#1036). |
 | 8 | `XrWeaveSubmitFlatRegionsDXR` + `xrWeaveSetScreenFlatRegionsDXR` — per-region hardware wish on the weave path (browser#88). |
 | 9 | `xrWeaveExportIpcConnectionDXR` + `XrWeaveIpcConnectionDXR` — brokering a runtime IPC endpoint to a sandboxed sibling process (§4c); plus §4b, the error table making a dead connection report `XR_ERROR_INSTANCE_LOST` / `XR_ERROR_SESSION_LOST` (browser#103). |
+| 10 | Desktop-Linux dma-buf transport (§5d, #1699): `XR_WEAVE_HANDLE_KIND_DMABUF_DXR` / `_OPAQUE_FD_DXR`, `XrWeaveDmabufDescDXR` + `XrWeaveOverlayDmabufDescDXR` in, `XrWeaveOutputDmabufDXR` out, `sync_file` fences `XrWeaveSubmitSyncDXR` (acquire) / `XrWeaveOutputSyncDXR` (release, per frame). Desktop Linux becomes a full weave platform when the service carries its engine. |
+
+**v10 IS a bump**, unlike #1588 below: it adds enums, structure types and fields a caller must be
+able to test for. A caller gates the dma-buf chains on `extensionVersion >= 10`: an older runtime
+skips unknown chained structs, so it would read the (NULL) `inputTexture` as the input instead —
+the same silent-misread shape §2b warns about for v6.
 
 **Desktop Linux availability (#1588) is deliberately NOT a version bump.** No entry point,
 struct, enum or parameter changed — a platform that reported `XR_ERROR_EXTENSION_NOT_PRESENT`
@@ -492,6 +614,7 @@ implicit. §4c's entry point + struct settle it: **v9**.
 | DisplayXR Browser (Chromium fork) | GPU-process sync weave | Batch (v3) when the runtime reports spec ≥ 3; per-element legacy loop otherwise |
 | CEF weave host (Step A) | Browser-process sync | Legacy |
 | DisplayXR Browser on Android | Chromium GPU process → satellite compositor (ADR-036 D3) | Batch (v3/v7) — AHardwareBuffer handles + published window geometry |
+| DisplayXR Browser on desktop Linux (planned, #1699) | Chromium GPU process (GL/EGL) → comp_multi service | v10 dma-buf + `sync_file` fences; gate on spec ≥ 10 |
 
 When changing the header, byte-sync every consumer's vendored copy and rebuild it
 (`third_party/displayxr` in the fork) — coupled-PR order: runtime → extensions auto-sync →

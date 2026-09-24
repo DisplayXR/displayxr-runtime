@@ -727,15 +727,15 @@
  * (#759). Android: the same comp_multi Vulkan weave engine with AHardwareBuffer
  * transport and explicit window geometry (spec v7, #1036).
  *
- * Desktop Linux (#1588) is the SNAP-ONLY platform: there is no weave service at
- * all — no bind, no submit, no output/fence transport — and those entry points
- * report XR_ERROR_FEATURE_UNSUPPORTED exactly as an in-process session does
- * everywhere else. What Linux does have is a window owner (an X11 handle app,
- * or the service's present owner) that must place its own window on the lens
- * lattice while it drags, so xrWeaveSnapWindowRectDXR is routed through to the
- * Vulkan DP's snap_window_rect slot. Spec §5c says so normatively; the
- * extension is advertised because that one call is genuinely available, and
- * withholding it would leave the app no way to ask. Gate on "Linux AND NOT
+ * Desktop Linux: spec v10 (#1699) makes it a full weave platform — dma-buf in
+ * (XrWeaveDmabufDescDXR, fd + DRM fourcc + modifier + plane layout), a typed
+ * dma-buf out, and sync_file acquire/release fences, served by the comp_multi
+ * weave engine when the service is built with XRT_FEATURE_COMP_MULTI_WEAVE_LINUX
+ * (spec §5d). A service built without it answers every submit
+ * XR_ERROR_FEATURE_UNSUPPORTED, as an in-process session does everywhere. The
+ * one call that needs no service at all is xrWeaveSnapWindowRectDXR (#1588): an
+ * X11 handle app owns and drags its own window, so it is routed to the Vulkan
+ * DP's snap_window_rect slot in-process too (spec §5c). Gate on "Linux AND NOT
  * Android" (the XRT_OS_LINUX_DESKTOP pattern), like XR_DXR_xlib_window_binding
  * — Android also defines XRT_OS_LINUX and has its own arm above.
  */
