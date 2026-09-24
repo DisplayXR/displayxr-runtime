@@ -2094,8 +2094,9 @@ multi_compositor_get_predicted_eye_positions(struct multi_compositor *mc, struct
 		                                                         out_eye_pos);
 	}
 
-#if defined(XRT_OS_MACOS) || defined(XRT_OS_ANDROID)
-	// #1116 sibling: a weave-only present-owner session has no session_render
+#ifdef COMP_MULTI_HAVE_WEAVE
+	// #1116 sibling (macOS / Android / desktop Linux #1699): a weave-only
+	// present-owner session has no session_render
 	// and therefore no per-session DP — but its weave engine holds the DP that
 	// is already steering the head-tracked weave. Without this, the view-pose
 	// path falls back to the nominal viewer and rig locates lose parallax while
@@ -2274,8 +2275,8 @@ multi_compositor_get_window_metrics(struct multi_compositor *mc, struct xrt_wind
 #endif
 	}
 
-#if defined(XRT_OS_MACOS) || defined(XRT_OS_ANDROID)
-	// XR_DXR_weave present-owner sessions (#1116).
+#ifdef COMP_MULTI_HAVE_WEAVE
+	// XR_DXR_weave present-owner sessions (#1116; desktop Linux #1699).
 	//
 	// A weave-only session (`xrWeaveSubmitDXR` caller: its own window, its own
 	// present, no runtime swapchain) never brings up `session_render`, so every
@@ -2329,7 +2330,21 @@ multi_compositor_get_window_metrics(struct multi_compositor *mc, struct xrt_wind
 		uint32_t panel_h = info->display_pixel_height;
 		float panel_w_m = info->display_width_m;
 		float panel_h_m = info->display_height_m;
-		if (panel_w > 0 && panel_h > 0 && (win_w > panel_w || win_h > panel_h)) {
+#ifdef XRT_OS_LINUX_DESKTOP
+		// Desktop Linux (#1699): the published rect is desktop-ABSOLUTE (the
+		// panel is one monitor of a multi-monitor desktop), and a desktop
+		// panel is not held rotated, so there is no transpose to infer — a
+		// window larger than the panel is just a window spilling off it. The
+		// panel's own screen origin re-bases the centre offset below.
+		const int32_t disp_left = info->display_screen_left;
+		const int32_t disp_top = info->display_screen_top;
+		const bool may_transpose = false;
+#else
+		const int32_t disp_left = 0;
+		const int32_t disp_top = 0;
+		const bool may_transpose = true;
+#endif
+		if (may_transpose && panel_w > 0 && panel_h > 0 && (win_w > panel_w || win_h > panel_h)) {
 			uint32_t t_px = panel_w;
 			panel_w = panel_h;
 			panel_h = t_px;
@@ -2341,8 +2356,8 @@ multi_compositor_get_window_metrics(struct multi_compositor *mc, struct xrt_wind
 		out_metrics->display_pixel_height = panel_h;
 		out_metrics->display_width_m = panel_w_m;
 		out_metrics->display_height_m = panel_h_m;
-		out_metrics->display_screen_left = 0;
-		out_metrics->display_screen_top = 0;
+		out_metrics->display_screen_left = disp_left;
+		out_metrics->display_screen_top = disp_top;
 
 		// Square-pixel pitch from the NATIVE dims — orientation-invariant, so it
 		// stays valid against the (possibly transposed) baseline above. Unknown
@@ -2355,8 +2370,8 @@ multi_compositor_get_window_metrics(struct multi_compositor *mc, struct xrt_wind
 		if (pitch > 0.0f && panel_w > 0 && panel_h > 0) {
 			out_metrics->window_width_m = (float)win_w * pitch;
 			out_metrics->window_height_m = (float)win_h * pitch;
-			const float win_center_x = (float)win_x + (float)win_w * 0.5f;
-			const float win_center_y = (float)win_y + (float)win_h * 0.5f;
+			const float win_center_x = (float)(win_x - disp_left) + (float)win_w * 0.5f;
+			const float win_center_y = (float)(win_y - disp_top) + (float)win_h * 0.5f;
 			// +x right in both frames; y negated because screen pixels are
 			// y-down and eye coordinates are y-up.
 			out_metrics->window_center_offset_x_m = (win_center_x - (float)panel_w * 0.5f) * pitch;
