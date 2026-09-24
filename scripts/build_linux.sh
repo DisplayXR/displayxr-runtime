@@ -286,7 +286,10 @@ if [ "$BUILD_APPS" = "ON" ]; then
   #   cube_zones_vk_linux         — handle + XR_DXR_display_zones (ADR-027):
   #                                 2 clear-based 3D zones + a Local2D strip. Same
   #                                 --platform / DXR_WINDOW_BACKEND selection.
-  for APP in cube_hosted_legacy_vk_linux cube_handle_vk_linux cube_zones_vk_linux; do
+  #   weave_probe_vk_linux        — headless XR_DXR_weave present-owner probe
+  #                                 (#1699 R2): no window; needs a running
+  #                                 displayxr-service (its run script forces IPC).
+  for APP in cube_hosted_legacy_vk_linux cube_handle_vk_linux cube_zones_vk_linux weave_probe_vk_linux; do
     APP_DIR="$ROOT/test_apps/$APP"
     # CANDIDATE PATCH (#706 Linux validation): the apps aren't all flat under
     # test_apps/ — cube_hosted_legacy_vk_linux lives in test_apps/legacy/. Fall
@@ -305,6 +308,12 @@ if [ "$BUILD_APPS" = "ON" ]; then
 
     # Run script — dev runtime manifest + sim-display plug-in + loader.
     RUN="$BUILD_DIR/run_${APP}.sh"
+    # The weave probe is a present-owner: it only works on the IPC path, against
+    # a displayxr-service started separately (see the probe's file header).
+    FORCE_IPC=""
+    case "$APP" in
+      weave_probe_*) FORCE_IPC='export XRT_FORCE_MODE="${XRT_FORCE_MODE:-ipc}"' ;;
+    esac
     cat > "$RUN" <<EOF
 #!/bin/bash
 # Run $APP against the dev runtime build. Needs a Vulkan GPU and either an X
@@ -328,6 +337,7 @@ export XRT_PLUGIN_SEARCH_PATH="$PLUGIN_DIR"
 export VK_LAYER_PATH="$BUILD_DIR/src/xrt/targets/vk_layer\${VK_LAYER_PATH:+:\$VK_LAYER_PATH}"
 export OXR_ENABLE_VK_NATIVE_COMPOSITOR="\${OXR_ENABLE_VK_NATIVE_COMPOSITOR:-1}"
 export SIM_DISPLAY_OUTPUT="\${SIM_DISPLAY_OUTPUT:-anaglyph}"
+$FORCE_IPC
 exec "$APP_DIR/build/$APP" "\$@"
 EOF
     chmod +x "$RUN"
