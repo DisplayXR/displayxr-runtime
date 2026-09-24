@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "name": "Weave Present VK Linux",
+  "id": "weave-present-vk-linux",
+  "type": "3d",
+  "category": "test",
+  "display_mode": "auto",
+  "description": "XR_DXR_weave present-owner on desktop Linux: renders a stereo test scene into a dma-buf, has the weave service weave it, and presents the woven dma-buf in its own window. Needs a running displayxr-service.",
+  "icon": "icon.png",
+  "icon_3d": "icon_sbs.png",
+  "icon_3d_layout": "sbs-lr"
+}
