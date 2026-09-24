@@ -679,6 +679,13 @@ handles `[input, overlay?, acquire?]`, one out handle — the release fence) and
 out and closes them at the next dma-buf weave call or at client teardown, since the transport
 duplicates rather than transfers. Engine contract: `src/xrt/include/xrt/xrt_weave_dmabuf.h`.
 
+**Off-panel 2D (#1654).** The part of the bound window that the published geometry puts off the
+panel comes back flat, not woven: the runtime paints each off-panel band of the output with the
+centre view of the submitted content (for a batch rect, its left half unsqueezed; for v6, the
+centre tile), in register with the window and under the v4 overlay, and skips the weave entirely
+for a window wholly off the panel — so a caller composites the output as usual and never clips it
+itself. `DXR_SPAN_2D=0` restores the fully woven output.
+
 ## 6. Version history
 
 | Version | Change |
