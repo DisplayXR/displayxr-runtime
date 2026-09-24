@@ -359,20 +359,35 @@ apply_plugin_display_info(struct xrt_system_compositor_info *info,
 }
 
 /*!
+ * What @ref refresh_display_info_from_plugin found, so the caller can tell
+ * "nothing to do" apart from "nothing known yet".
+ */
+enum display_info_refresh_result
+{
+	//! The plug-in reported new geometry and `info` was re-applied.
+	DISPLAY_INFO_REFRESH_APPLIED,
+	//! Geometry is known and did not change (same answer, throttled, or not asked).
+	DISPLAY_INFO_REFRESH_UNCHANGED,
+	//! Still nothing: the plug-in declined again (or is absent / too old to be
+	//! asked) and no geometry has ever been applied.
+	DISPLAY_INFO_REFRESH_UNKNOWN,
+};
+
+/*!
  * Post-startup half: ask the plug-in again and re-apply only if it now
  * reports geometry different from what was last applied (or reports for the
  * first time after declining at startup). Cheap and idempotent when nothing
  * changed — the plug-in contract is "false fast while the panel is unknown,
  * true with real numbers once identified" (see docs/reference/xrt_plugin_iface.md).
  *
- * @return true if `info` was re-applied and the caller should re-resolve the
- *         desktop rect.
+ * @return @ref DISPLAY_INFO_REFRESH_APPLIED if `info` was re-applied and the
+ *         caller should re-resolve the desktop rect; see the enum for the rest.
  */
-static bool
+static enum display_info_refresh_result
 refresh_display_info_from_plugin(struct xrt_system_compositor_info *info, const struct xrt_plugin_iface *plugin)
 {
 	if (info == NULL || plugin == NULL || !g_display_info_mutex_initialized) {
-		return false;
+		return g_display_info_applied_valid ? DISPLAY_INFO_REFRESH_UNCHANGED : DISPLAY_INFO_REFRESH_UNKNOWN;
 	}
 
 	os_mutex_lock(&g_display_info_mutex);
@@ -409,9 +424,15 @@ refresh_display_info_from_plugin(struct xrt_system_compositor_info *info, const 
 		}
 		applied = true;
 	}
+	enum display_info_refresh_result result = DISPLAY_INFO_REFRESH_UNKNOWN;
+	if (applied) {
+		result = DISPLAY_INFO_REFRESH_APPLIED;
+	} else if (g_display_info_applied_valid) {
+		result = DISPLAY_INFO_REFRESH_UNCHANGED;
+	}
 
 	os_mutex_unlock(&g_display_info_mutex);
-	return applied;
+	return result;
 }
 
 /*!
@@ -429,16 +450,31 @@ refresh_display_info_from_plugin(struct xrt_system_compositor_info *info, const 
 static void
 refresh_display_processors_cb(struct xrt_system_compositor_info *info)
 {
+	// refresh_active signals a swap through its return value only: it hands
+	// back the unchanged current iface, or the newly loaded one (the previous
+	// DLL is leaked, never unmapped, so the pointers cannot alias).
+	const struct xrt_plugin_iface *before = target_plugin_get_active();
 	const struct xrt_plugin_iface *plugin = target_plugin_refresh_active();
+	const bool swapped = plugin != before;
 	fill_dp_factories_from_plugin(info, plugin);
-	const bool geometry_changed = refresh_display_info_from_plugin(info, plugin);
+	const enum display_info_refresh_result refreshed = refresh_display_info_from_plugin(info, plugin);
+	// #1721/#1722: while the panel is still unidentified this runs once a
+	// second from the IPC main loop, and a registry rebuild is not free — it
+	// re-enumerates the monitors and round-trips every plug-in's
+	// probe_displays, where vendor plug-ins log (335 WARN lines in 62 s on
+	// hardware). Declined again with no new plug-in = nothing to re-resolve
+	// against; the registry from instance create still stands. Known geometry
+	// (client connect / compositor create, #342) keeps rebuilding as before.
+	if (!swapped && refreshed == DISPLAY_INFO_REFRESH_UNKNOWN) {
+		return;
+	}
 	// Rebuild the per-monitor registry too — refresh_active invalidates the
 	// loader's source cache on a swap, so this re-resolves against the new
 	// winner (#69 / ADR-015).
 	build_dp_registry(info);
 	// New geometry means a new panel rect / device name for apps (#1301) —
 	// same order as instance create: apply, registry, then the desktop rect.
-	if (geometry_changed) {
+	if (refreshed == DISPLAY_INFO_REFRESH_APPLIED) {
 		fill_display_desktop_info(info);
 	}
 }
