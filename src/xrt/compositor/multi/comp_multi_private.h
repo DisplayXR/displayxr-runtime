@@ -175,6 +175,10 @@ struct comp_multi_weave_linux_slot
 	VkImageView view;
 	uint32_t w, h;
 	VkFormat format;
+	//! Stage B: the descriptor's DRM fourcc + modifier (0 / 0 for an OPAQUE_FD
+	//! import). A change on the same key means the producer reallocated.
+	uint32_t drm_fourcc;
+	uint64_t drm_modifier;
 	//! Queue family the producer releases the image to / acquires it from:
 	//! VK_QUEUE_FAMILY_EXTERNAL for a same-driver OPAQUE_FD (stage A),
 	//! VK_QUEUE_FAMILY_FOREIGN_EXT for a dma-buf (stage B).
@@ -550,6 +554,14 @@ struct multi_compositor
 		VkCommandPool cmd_pool;
 		VkCommandBuffer cmd;
 		VkFence fence;
+		/*!
+		 * The last final submit's fence has not been waited yet. Stage B
+		 * leaves it pending (the caller waits the release sync_file instead)
+		 * and the NEXT submit waits it — bounded — before it resets a command
+		 * buffer or evicts a cache slot; a timed-out stage-A wait leaves it
+		 * pending too. Never reset a fence while this is set.
+		 */
+		bool fence_pending;
 		VkRenderPass render_pass; //!< Output fb's pass (DP-compatible, BGRA8).
 		struct xrt_display_processor *dp;
 
@@ -809,8 +821,9 @@ struct multi_compositor
 	 * driver + device; stage B: a dma-buf with a DRM modifier), blit every
 	 * submitted rect into a window-sized 2x1 SBS scratch atlas (or sample its
 	 * v6 N-view atlas directly), run ONE DP process_atlas into an exportable
-	 * output, and wait completion before the IPC reply (stage A synchronous
-	 * contract). Implemented in comp_multi_weave_linux.c.
+	 * output, and either wait completion before the IPC reply (stage A) or
+	 * hand back a release sync_file and wait the frame at the start of the
+	 * next submit (stage B). Implemented in comp_multi_weave_linux.c.
 	 */
 	struct
 	{
@@ -825,6 +838,14 @@ struct multi_compositor
 		//! (the Android ordering fix, DXR_LINUX_WEAVE_SPLIT).
 		VkCommandBuffer cmd_post;
 		VkFence fence;
+		/*!
+		 * The last final submit's fence has not been waited yet. Stage B
+		 * leaves it pending (the caller waits the release sync_file instead)
+		 * and the NEXT submit waits it — bounded — before it resets a command
+		 * buffer or evicts a cache slot; a timed-out stage-A wait leaves it
+		 * pending too. Never reset a fence while this is set.
+		 */
+		bool fence_pending;
 		VkRenderPass render_pass; //!< Output fb's pass (DP-compatible, BGRA8).
 		struct xrt_display_processor *dp;
 
@@ -854,6 +875,7 @@ struct multi_compositor
 		struct comp_multi_weave_linux_slot ov_slots[COMP_MULTI_WEAVE_LINUX_SLOTS];
 		uint64_t slot_clock;    //!< LRU tick, bumped per lookup.
 		bool size_probe_warned; //!< One-shot: lseek could not size an opaque fd.
+		uint32_t imports_logged; //!< Import WARNs emitted (capped; a re-importing producer would spam).
 		//! @}
 
 		//! @name v6 N-view crop staging (#774) — see the macOS block.
@@ -888,6 +910,19 @@ struct multi_compositor
 		 * call would leak one fd per weave_get_output. Closed on release.
 		 */
 		int out_fd;
+		/*!
+		 * Stage B: the output is a DRM-modifier dma-buf (vk_create_exportable_dmabuf_image,
+		 * released to VK_QUEUE_FAMILY_FOREIGN_EXT) rather than a stage-A OPAQUE_FD
+		 * allocation (released to VK_QUEUE_FAMILY_EXTERNAL). One allocation serves
+		 * one kind: the engine allocates the kind the client last asked for
+		 * (out_kind_req) and reallocates on the next submit when a client asks for
+		 * the other one.
+		 */
+		bool out_is_dmabuf;
+		//! 0 = nobody asked yet (first submit's path decides), 1 = OPAQUE_FD, 2 = dma-buf.
+		uint8_t out_kind_req;
+		//! Cached descriptor of the dma-buf output (its fd field is unused: out_fd is the one fd).
+		struct xrt_weave_dmabuf_output_desc out_dmabuf;
 		uint32_t out_w, out_h;
 		VkImageLayout out_layout; //!< Layout the last weave retired the output in (#1387 d3).
 		//! @}
@@ -898,16 +933,23 @@ struct multi_compositor
 		bool overlay_blend_initialized;
 		//! @}
 
-		//! @name Stage B seams (#1699 R4/R5) — dma-buf + sync_file
-		//! Created by the engine once R5's aux_vk helpers (vk_dmabuf.h) land;
-		//! nothing new ever goes into struct vk_bundle (plug-in ABI, xrt_plugin.h).
+		//! @name Stage B (#1699 R2) — dma-buf + sync_file
+		//! Built on R5's aux_vk helpers (vk_dmabuf.h); nothing new ever goes
+		//! into struct vk_bundle (plug-in ABI, xrt_plugin.h). Both semaphores
+		//! exist only when vk_dmabuf_sync_fd_supported(); otherwise the acquire
+		//! fence is CPU-polled and completion stays synchronous.
 		//! @{
-		VkSemaphore acquire_sem; //!< Imported SYNC_FD (temporary) per frame.
+		VkSemaphore acquire_sem; //!< Plain binary; a SYNC_FD is imported into it (temporary) per frame.
 		//! Exportable SYNC_FD, signalled by the final submit. The per-frame
 		//! release sync_file exported from it is NOT engine state: the IPC
 		//! handler owns, sends and closes it after the reply (#1712).
 		VkSemaphore release_sem;
-		//! @}
+		bool dmabuf_unsupported_warned; //!< One-shot: the device cannot import dma-bufs.
+		bool modifier_refused_warned;   //!< One-shot: a non-LINEAR import failed (cross-device?).
+		bool acquire_fallback_warned;   //!< One-shot: acquire fence CPU-polled / timed out.
+		bool release_fallback_warned;   //!< One-shot: release export failed, back to synchronous.
+		bool out_kind_warned;           //!< One-shot: output kind switched on a client request.
+		                                //! @}
 	} weave;
 #endif
 };

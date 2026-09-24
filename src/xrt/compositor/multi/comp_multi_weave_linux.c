@@ -25,38 +25,57 @@
  *  - Handles are fds (XRT_GRAPHICS_BUFFER_HANDLE_IS_FD,
  *    CONSUMED_BY_VULKAN_IMPORT). An fd is NOT an identity — every SCM_RIGHTS
  *    receive installs a new number — and carries no dims, format or tiling.
- *  - STAGE A (this file today): the plain-handle submit carries an OPAQUE_FD
+ *  - STAGE A: the plain-handle submit carries an OPAQUE_FD
  *    exported by the SAME driver on the SAME physical device. It is imported
  *    with the tree helper vk_create_image_from_native. The image parameters are
  *    a fixed contract (see WEAVE_STAGE_A_BITS / WEAVE_VK_FORMAT below); the
  *    extent is inferred from the submit (see weave_stage_a_input_dims), and the
  *    allocation size is probed with lseek(fd, 0, SEEK_END).
- *  - STAGE B (R4 wire + R5 aux_vk helpers): a dma-buf with a DRM format
- *    modifier plus sync_file acquire / release fences, through
- *    comp_multi_weave_submit_dmabuf / comp_multi_weave_export_output_dmabuf.
- *    Stubs today — look for the `R5:` / `R4:` markers.
+ *  - STAGE B (R4 wire + R5 aux_vk vk_dmabuf.h): comp_multi_weave_submit_dmabuf
+ *    takes a dma-buf with an explicit DRM format modifier + plane layout
+ *    (vk_create_image_from_dmabuf; any modifier the device imports, LINEAR
+ *    included — a failed non-LINEAR import is refused with one WARN, the
+ *    cross-device signature; no copy tier), an optional sync_file acquire
+ *    fence (imported TEMPORARY into acquire_sem and waited on the GPU; CPU
+ *    poll fallback) and returns a per-frame release sync_file exported from
+ *    release_sem. The output is a DRM-modifier dma-buf too
+ *    (vk_create_exportable_dmabuf_image; driver-picked modifier, or LINEAR
+ *    with DXR_WEAVE_OUTPUT_LINEAR=1), described by
+ *    comp_multi_weave_export_output_dmabuf.
+ *  - Output kind: one allocation, one kind. The first submit's path picks it
+ *    (dma-buf submit -> dma-buf output, plain -> OPAQUE_FD); an export call of
+ *    the other kind records the request, answers "nothing yet" and the next
+ *    submit reallocates. (A single allocation exportable as both would need
+ *    both handle types declared at creation, and OPAQUE_FD + DRM-modifier
+ *    tiling is not a combination drivers promise.)
  *  - fd ownership (the handler hands the engine every received fd):
- *      1. every received fd is closed by the engine exactly once, in the submit
- *         epilogue — on a cache hit, a miss, a refusal and an error alike;
+ *      1. every received input / overlay fd is closed by the engine exactly
+ *         once, in the submit epilogue — on a cache hit, a miss, a refusal and
+ *         an error alike; the acquire sync_file is consumed by the semaphore
+ *         import (or the poll fallback), or closed on a refusal before it;
  *      2. an import never consumes the received fd: it is handed a dup(), which
  *         a successful import consumes (the driver owns it) and a failed import
- *         does not (the engine closes it — Vulkan never takes ownership on
- *         failure);
- *      3. the output is exported ONCE per allocation (vkGetMemoryFdKHR mints a
- *         new fd per call and the IPC send dups without closing), cached, and
- *         closed on release; export_output hands the cached number out.
+ *         does not (the engine / vk_dmabuf helper closes it);
+ *      3. the output is exported ONCE per allocation, cached in out_fd, and
+ *         closed on release. The plain export_output hands the cached number
+ *         out (its handler sends without closing); export_output_dmabuf hands
+ *         out a FRESH dup() per call (its handler parks and closes it after the
+ *         reply, #1712);
+ *      4. the per-frame release sync_file is a new fd each frame; the handler
+ *         sends it and closes it after the reply.
  *  - Queue-family ownership: the imported input / overlay are acquired from the
  *    producer's queue family and released back every frame (never the macOS
- *    GENERAL-only pattern). For a same-driver OPAQUE_FD that family is
- *    VK_QUEUE_FAMILY_EXTERNAL (core since 1.1, no extension); for a stage-B
- *    dma-buf it is VK_QUEUE_FAMILY_FOREIGN_EXT, which needs
- *    VK_EXT_queue_family_foreign enabled on the service device first (R5). The
- *    layout contract across the boundary is GENERAL on both sides, with
- *    oldLayout == newLayout == GENERAL in the ownership-transfer barriers.
- *  - Completion: SYNCHRONOUS in stage A — a bounded (1 s) fence wait under the
- *    queue lock before the IPC reply, so xrWeaveSubmitDXR returning IS the
- *    completion signal. export_fence reports none; fenceValue is a monotonic
- *    counter.
+ *    GENERAL-only pattern), and so is the output. For a same-driver OPAQUE_FD
+ *    that family is VK_QUEUE_FAMILY_EXTERNAL; for a stage-B dma-buf it is
+ *    VK_QUEUE_FAMILY_FOREIGN_EXT (vk_dmabuf_cmd_acquire_foreign /
+ *    _release_foreign). The layout across the boundary is GENERAL both sides.
+ *  - Completion: stage A is SYNCHRONOUS — a bounded (1 s) fence wait before the
+ *    IPC reply, so xrWeaveSubmitDXR returning IS the completion signal. Stage B
+ *    with SYNC_FD semaphores is not: the release sync_file is the signal, and
+ *    the NEXT submit waits the previous frame's fence (bounded) before it
+ *    reuses a command buffer or evicts a cache slot — one frame in flight, no
+ *    vkQueueWaitIdle in the steady state. export_fence reports none on either;
+ *    fenceValue is a monotonic counter.
  *  - Window geometry: the caller publishes it (spec v7 XrWeaveWindowGeometryDXR,
  *    device pixels, desktop-absolute). A Linux service cannot derive it — on
  *    Wayland a client is never told its position, and the window owner is not
@@ -81,6 +100,7 @@
 #include "util/u_debug.h"
 
 #include "vk/vk_helpers.h"
+#include "vk/vk_dmabuf.h"
 #include "vk/vk_image_allocator.h"
 #include "vk/vk_local2d_composite.h"
 
@@ -91,6 +111,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
@@ -101,6 +122,12 @@
 // Android #1036 ordering fix, which applies to any DP that submits its own
 // command buffer during process_atlas.
 DEBUG_GET_ONCE_BOOL_OPTION(dxr_linux_weave_split, "DXR_LINUX_WEAVE_SPLIT", true)
+
+// Stage B output modifier policy (default OFF = driver-pick from every modifier
+// the device can export for the output format + usage). ON forces
+// {DRM_FORMAT_MOD_LINEAR}: the one layout every importer (EGL on another GPU,
+// the CPU) can read, at the cost of bandwidth on a tiled/compressed-capable GPU.
+DEBUG_GET_ONCE_BOOL_OPTION(dxr_weave_output_linear, "DXR_WEAVE_OUTPUT_LINEAR", false)
 
 /*
  *
@@ -320,6 +347,95 @@ weave_import_opaque_fd(struct vk_bundle *vk,
 	return true;
 }
 
+/*!
+ * Stage B: import a dma-buf described by @p desc into a VkImage (+ view), with
+ * its explicit DRM format modifier (vk_create_image_from_dmabuf).
+ *
+ * @p desc->fd is BORROWED, like the stage-A path: the helper is handed a dup(),
+ * which it always consumes (Vulkan owns it on success, the helper closes it on
+ * failure); the received fd is closed by the submit epilogue.
+ *
+ * A failed import of a non-LINEAR modifier is the cross-device signature (a
+ * tiled / compressed layout from another GPU or driver never imports): ONE
+ * WARN naming the modifier, then the submit is refused. No copy tier.
+ */
+static bool
+weave_import_dmabuf(struct vk_bundle *vk,
+                    struct multi_compositor *mc,
+                    const struct xrt_weave_dmabuf_desc *desc,
+                    VkImage *out_image,
+                    VkDeviceMemory *out_memory,
+                    VkImageView *out_view,
+                    VkFormat *out_format,
+                    const char *what)
+{
+	bool has_alpha = true;
+	VkFormat format = vk_dmabuf_fourcc_to_vk_format(desc->drm_fourcc, &has_alpha);
+	if (format == VK_FORMAT_UNDEFINED) {
+		U_LOG_E("weave(#1699): %s dma-buf fourcc 0x%08x has no Vulkan format mapping", what, desc->drm_fourcc);
+		return false;
+	}
+
+	struct xrt_weave_dmabuf_desc d = *desc;
+	d.fd = fcntl(desc->fd, F_DUPFD_CLOEXEC, 0);
+	if (d.fd < 0) {
+		U_LOG_E("weave(#1699): dup(%s dma-buf fd) failed: %s", what, strerror(errno));
+		return false;
+	}
+
+	VkImage image = VK_NULL_HANDLE;
+	VkDeviceMemory memory = VK_NULL_HANDLE;
+	VkResult ret = vk_create_image_from_dmabuf(vk, &d, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+	                                           &image, &memory, NULL);
+	// d.fd is consumed either way (vk_dmabuf.h "always consumed").
+	if (ret != VK_SUCCESS) {
+		if (desc->drm_modifier != DRM_FORMAT_MOD_LINEAR) {
+			if (!mc->weave.modifier_refused_warned) {
+				mc->weave.modifier_refused_warned = true;
+				U_LOG_W(
+				    "weave(#1699): %s dma-buf import REFUSED: modifier 0x%016" PRIx64
+				    " (fourcc 0x%08x, %ux%u, %u plane(s)) does not import on the service's device "
+				    "(%s). "
+				    "A tiled / compressed layout only imports on the GPU + driver that produced it: "
+				    "render on the service's GPU, or hand over a LINEAR buffer. No copy fallback.",
+				    what, desc->drm_modifier, desc->drm_fourcc, desc->width, desc->height,
+				    desc->plane_count, vk_result_string(ret));
+			}
+		} else {
+			U_LOG_E("weave(#1699): %s dma-buf import (LINEAR, fourcc 0x%08x %ux%u) failed: %s", what,
+			        desc->drm_fourcc, desc->width, desc->height, vk_result_string(ret));
+		}
+		return false;
+	}
+
+	// X-variant fourccs carry an undefined fourth byte: sample it as 1.
+	VkComponentMapping components = {
+	    .r = VK_COMPONENT_SWIZZLE_IDENTITY,
+	    .g = VK_COMPONENT_SWIZZLE_IDENTITY,
+	    .b = VK_COMPONENT_SWIZZLE_IDENTITY,
+	    .a = has_alpha ? VK_COMPONENT_SWIZZLE_IDENTITY : VK_COMPONENT_SWIZZLE_ONE,
+	};
+	VkImageSubresourceRange range = {
+	    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+	    .levelCount = 1,
+	    .layerCount = 1,
+	};
+	VkImageView view = VK_NULL_HANDLE;
+	ret = vk_create_view_swizzle(vk, image, VK_IMAGE_VIEW_TYPE_2D, format, range, components, &view);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("weave(#1699): vk_create_view(%s dma-buf) failed: %s", what, vk_result_string(ret));
+		vk->vkDestroyImage(vk->device, image, NULL);
+		vk->vkFreeMemory(vk->device, memory, NULL); // releases the dma-buf reference
+		return false;
+	}
+
+	*out_image = image;
+	*out_memory = memory;
+	*out_view = view;
+	*out_format = format;
+	return true;
+}
+
 static void
 weave_slot_release(struct vk_bundle *vk, struct comp_multi_weave_linux_slot *slot)
 {
@@ -350,19 +466,28 @@ weave_slots_release_all(struct vk_bundle *vk, struct comp_multi_weave_linux_slot
  * from, or NULL. @p fd stays BORROWED either way (closed by the submit
  * epilogue): a hit needs nothing from it, a miss hands the import a dup.
  *
- * Key: the caller's @p buffer_id when non-zero (stage B), else the fd's file
- * (st_dev, st_ino) — every SCM_RIGHTS receive of one buffer is the same open
- * file description, so the same inode. Our cached import keeps the underlying
- * memory alive, so its inode cannot be recycled for another buffer while the
- * slot exists. A hit with different dims (the producer reallocated at the same
- * identity) re-imports into that slot.
+ * @p desc selects the import: NULL = stage-A OPAQUE_FD (@p w x @p h inferred
+ * from the submit), non-NULL = stage-B dma-buf (dims, fourcc, modifier and
+ * plane layout from the descriptor; @p w / @p h are its dims).
+ *
+ * Key: the caller's buffer id when non-zero (stage B, authoritative), else the
+ * fd's file (st_dev, st_ino) — every SCM_RIGHTS receive of one buffer is the
+ * same open file description, so the same inode. Our cached import keeps the
+ * underlying memory alive, so its inode cannot be recycled for another buffer
+ * while the slot exists. A hit with a different extent / format / modifier /
+ * kind (the producer reallocated at the same identity) re-imports into that
+ * slot.
+ *
+ * Eviction needs no queue idle: every submit first waits the previous frame's
+ * fence (weave_wait_prev_frame), and one frame is in flight at most, so the
+ * frame that last used any slot has completed by the time we get here.
  */
 static struct comp_multi_weave_linux_slot *
 weave_cache_acquire(struct vk_bundle *vk,
                     struct multi_compositor *mc,
                     struct comp_multi_weave_linux_slot *slots,
                     int fd,
-                    uint64_t buffer_id,
+                    const struct xrt_weave_dmabuf_desc *desc,
                     uint32_t w,
                     uint32_t h,
                     const char *what)
@@ -374,7 +499,12 @@ weave_cache_acquire(struct vk_bundle *vk,
 	}
 	const uint64_t dev = (uint64_t)st.st_dev;
 	const uint64_t ino = (uint64_t)st.st_ino;
+	const uint64_t buffer_id = desc != NULL ? desc->buffer_id : 0;
 	const uint64_t tick = ++mc->weave.slot_clock;
+
+	const uint32_t want_family = desc != NULL ? VK_QUEUE_FAMILY_FOREIGN_EXT : VK_QUEUE_FAMILY_EXTERNAL;
+	const uint32_t want_fourcc = desc != NULL ? desc->drm_fourcc : 0;
+	const uint64_t want_modifier = desc != NULL ? desc->drm_modifier : 0;
 
 	struct comp_multi_weave_linux_slot *victim = NULL;
 	for (uint32_t i = 0; i < COMP_MULTI_WEAVE_LINUX_SLOTS; i++) {
@@ -385,13 +515,15 @@ weave_cache_acquire(struct vk_bundle *vk,
 			}
 			continue;
 		}
-		const bool same = buffer_id != 0 ? s->buffer_id == buffer_id : (s->dev == dev && s->ino == ino);
+		const bool same =
+		    buffer_id != 0 ? s->buffer_id == buffer_id : (s->buffer_id == 0 && s->dev == dev && s->ino == ino);
 		if (same) {
-			if (s->w == w && s->h == h && s->format == WEAVE_VK_FORMAT) {
+			if (s->w == w && s->h == h && s->ext_queue_family == want_family &&
+			    s->drm_fourcc == want_fourcc && s->drm_modifier == want_modifier) {
 				s->last_used = tick;
 				return s; // hit
 			}
-			victim = s; // same buffer identity, new extent: re-import in place
+			victim = s; // same buffer identity, new extent / layout: re-import in place
 			break;
 		}
 		if (victim == NULL || (victim->used && s->last_used < victim->last_used)) {
@@ -400,22 +532,18 @@ weave_cache_acquire(struct vk_bundle *vk,
 	}
 
 	if (victim->used) {
-		// The slot may still be referenced by work another path left in
-		// flight (a timed-out fence). Rare (misses only) — never yank it.
-		weave_queue_wait_idle(vk);
-		weave_slot_release(vk, victim);
+		weave_slot_release(vk, victim); // its last frame has completed (see above)
 	}
 
 	VkImage image = VK_NULL_HANDLE;
 	VkDeviceMemory memory = VK_NULL_HANDLE;
 	VkImageView view = VK_NULL_HANDLE;
-	// R5: a stage-B dma-buf descriptor takes vk_create_image_from_dmabuf here
-	// (explicit modifier, DMA_BUF handle type; handed a dup, which it always
-	// consumes) with ext_queue_family = VK_QUEUE_FAMILY_FOREIGN_EXT, and its
-	// barriers become vk_dmabuf_cmd_acquire_foreign / _release_foreign — once
-	// the service device enables VK_EXT_external_memory_dma_buf /
-	// _image_drm_format_modifier / _queue_family_foreign (vk_dmabuf_supported).
-	if (!weave_import_opaque_fd(vk, mc, fd, dev, ino, w, h, &image, &memory, &view, what)) {
+	VkFormat format = WEAVE_VK_FORMAT;
+	if (desc != NULL) {
+		if (!weave_import_dmabuf(vk, mc, desc, &image, &memory, &view, &format, what)) {
+			return NULL;
+		}
+	} else if (!weave_import_opaque_fd(vk, mc, fd, dev, ino, w, h, &image, &memory, &view, what)) {
 		return NULL;
 	}
 
@@ -428,11 +556,29 @@ weave_cache_acquire(struct vk_bundle *vk,
 	victim->view = view;
 	victim->w = w;
 	victim->h = h;
-	victim->format = WEAVE_VK_FORMAT;
-	victim->ext_queue_family = VK_QUEUE_FAMILY_EXTERNAL;
+	victim->format = format;
+	victim->drm_fourcc = want_fourcc;
+	victim->drm_modifier = want_modifier;
+	victim->ext_queue_family = want_family;
 	victim->first_use = true;
 	victim->last_used = tick;
-	U_LOG_W("weave(#1699): %s import cached (OPAQUE_FD %ux%u, inode %" PRIu64 ")", what, w, h, ino);
+	// Lifecycle WARN for the first imports only: a producer that hands a new
+	// buffer every frame (no pool) would otherwise log per frame.
+	const bool log_warn = mc->weave.imports_logged < 16;
+	if (log_warn) {
+		mc->weave.imports_logged++;
+	}
+	if (!log_warn) {
+		U_LOG_I("weave(#1699): %s import cached (%s %ux%u)", what, desc != NULL ? "dma-buf" : "OPAQUE_FD", w,
+		        h);
+	} else if (desc != NULL) {
+		U_LOG_W("weave(#1699): %s import cached (dma-buf %ux%u fourcc 0x%08x modifier 0x%016" PRIx64
+		        ", %s %" PRIu64 ")",
+		        what, w, h, want_fourcc, want_modifier, buffer_id != 0 ? "buffer id" : "inode",
+		        buffer_id != 0 ? buffer_id : ino);
+	} else {
+		U_LOG_W("weave(#1699): %s import cached (OPAQUE_FD %ux%u, inode %" PRIu64 ")", what, w, h, ino);
+	}
 	return victim;
 }
 
@@ -572,53 +718,25 @@ weave_release_output(struct vk_bundle *vk, struct multi_compositor *mc)
 	}
 	// The caller's copies (sent over SCM_RIGHTS) are theirs; ours goes here.
 	weave_close_fd(&mc->weave.out_fd);
+	mc->weave.out_is_dmabuf = false;
+	U_ZERO(&mc->weave.out_dmabuf);
+	mc->weave.out_dmabuf.fd = -1;
 	mc->weave.out_size = 0;
 	mc->weave.out_w = 0;
 	mc->weave.out_h = 0;
 	mc->weave.out_layout = VK_IMAGE_LAYOUT_UNDEFINED; // #1387: a fresh allocation starts undefined
 }
 
-/*!
- * Exportable output image + view + framebuffer, and its ONE exported fd.
- *
- * Stage A: an OPAQUE_FD allocation from the tree's image allocator (dedicated,
- * TILING_OPTIMAL, WEAVE_STAGE_A_BITS) — readable by a same-driver Vulkan / GL
- * consumer on the same device. R5: stage B allocates it with
- * vk_create_exportable_dmabuf_image (DMA_BUF handle type, LINEAR unless the
- * caller advertises modifiers) and records modifier + plane layout for
- * comp_multi_weave_export_output_dmabuf.
- */
+//! Output view + framebuffer against the engine's render pass (both output kinds).
 static bool
-weave_create_output(struct vk_bundle *vk, struct multi_compositor *mc, uint32_t w, uint32_t h)
+weave_create_output_view_fb(struct vk_bundle *vk, struct multi_compositor *mc, uint32_t w, uint32_t h)
 {
-	struct xrt_swapchain_create_info info = weave_sci(w, h, WEAVE_VK_FORMAT, WEAVE_STAGE_A_BITS);
-	struct vk_image_collection vkic;
-	U_ZERO(&vkic);
-	VkResult ret = vk_ic_allocate(vk, &info, 1, &vkic);
-	if (ret != VK_SUCCESS) {
-		U_LOG_E("weave(#1699): output allocation (%ux%u, OPAQUE_FD) failed: %s", w, h, vk_result_string(ret));
-		return false;
-	}
-	mc->weave.out_image = vkic.images[0].handle;
-	mc->weave.out_memory = vkic.images[0].memory;
-	mc->weave.out_size = vkic.images[0].size;
-	mc->weave.out_w = w;
-	mc->weave.out_h = h;
-
-	xrt_graphics_buffer_handle_t fd = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
-	ret = vk_get_native_handle_from_device_memory(vk, mc->weave.out_memory, &fd);
-	if (ret != VK_SUCCESS || fd < 0) {
-		U_LOG_E("weave(#1699): output vkGetMemoryFdKHR failed: %s", vk_result_string(ret));
-		return false;
-	}
-	mc->weave.out_fd = fd;
-
 	VkImageSubresourceRange range = {
 	    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
 	    .levelCount = 1,
 	    .layerCount = 1,
 	};
-	ret =
+	VkResult ret =
 	    vk_create_view(vk, mc->weave.out_image, VK_IMAGE_VIEW_TYPE_2D, WEAVE_VK_FORMAT, range, &mc->weave.out_view);
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("weave(#1699): vk_create_view(output) failed: %s", vk_result_string(ret));
@@ -639,6 +757,133 @@ weave_create_output(struct vk_bundle *vk, struct multi_compositor *mc, uint32_t 
 		return false;
 	}
 	return true;
+}
+
+/*!
+ * Stage A output: an OPAQUE_FD allocation from the tree's image allocator
+ * (dedicated, TILING_OPTIMAL, WEAVE_STAGE_A_BITS) — readable by a same-driver
+ * Vulkan / GL consumer on the same device — and its ONE exported fd.
+ */
+static bool
+weave_create_output_opaque(struct vk_bundle *vk, struct multi_compositor *mc, uint32_t w, uint32_t h)
+{
+	struct xrt_swapchain_create_info info = weave_sci(w, h, WEAVE_VK_FORMAT, WEAVE_STAGE_A_BITS);
+	struct vk_image_collection vkic;
+	U_ZERO(&vkic);
+	VkResult ret = vk_ic_allocate(vk, &info, 1, &vkic);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("weave(#1699): output allocation (%ux%u, OPAQUE_FD) failed: %s", w, h, vk_result_string(ret));
+		return false;
+	}
+	mc->weave.out_image = vkic.images[0].handle;
+	mc->weave.out_memory = vkic.images[0].memory;
+	mc->weave.out_size = vkic.images[0].size;
+	mc->weave.out_w = w;
+	mc->weave.out_h = h;
+	mc->weave.out_is_dmabuf = false;
+
+	xrt_graphics_buffer_handle_t fd = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+	ret = vk_get_native_handle_from_device_memory(vk, mc->weave.out_memory, &fd);
+	if (ret != VK_SUCCESS || fd < 0) {
+		U_LOG_E("weave(#1699): output vkGetMemoryFdKHR failed: %s", vk_result_string(ret));
+		return false;
+	}
+	mc->weave.out_fd = fd;
+	return weave_create_output_view_fb(vk, mc, w, h);
+}
+
+//! Usage of the stage-B dma-buf output: the DP renders it and the v4 overlay is
+//! drawn over it (COLOR_ATTACHMENT); the rest mirrors the stage-A set so a
+//! consumer's expectations do not depend on the output kind.
+#define WEAVE_OUTPUT_DMABUF_USAGE                                                                                      \
+	(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |          \
+	 VK_IMAGE_USAGE_TRANSFER_DST_BIT)
+
+/*!
+ * Stage B output: a DRM-modifier dma-buf (vk_create_exportable_dmabuf_image),
+ * its ONE exported fd (cached in out_fd for the allocation's lifetime; every
+ * export hands out a dup) and its descriptor (modifier + plane layout + size).
+ *
+ * Modifier policy: by default the driver picks from EVERY modifier the device
+ * can export for the output format + usage — on the #1699 spike's GPU that is a
+ * compressed one, and a GL consumer re-imported it bit-exact. There is no
+ * client modifier list on the wire yet, so "what the consumer can import" is
+ * assumed to be "what this device exports", i.e. a same-device consumer.
+ * DXR_WEAVE_OUTPUT_LINEAR=1 forces {LINEAR} for anything else.
+ */
+static bool
+weave_create_output_dmabuf(struct vk_bundle *vk, struct multi_compositor *mc, uint32_t w, uint32_t h)
+{
+	const VkImageUsageFlags usage = WEAVE_OUTPUT_DMABUF_USAGE;
+	uint64_t mods[32];
+	uint32_t mod_count = 0;
+	const bool force_linear = debug_get_bool_option_dxr_weave_output_linear();
+	if (!force_linear) {
+		struct vk_dmabuf_modifier_info infos[32];
+		uint32_t n = 0;
+		VkResult qret = vk_dmabuf_query_modifiers(vk, WEAVE_VK_FORMAT, usage, infos, ARRAY_SIZE(infos), &n);
+		if (qret == VK_SUCCESS || qret == VK_INCOMPLETE) {
+			n = n > ARRAY_SIZE(infos) ? ARRAY_SIZE(infos) : n;
+			for (uint32_t i = 0; i < n; i++) {
+				if (infos[i].exportable) {
+					mods[mod_count++] = infos[i].modifier;
+				}
+			}
+		}
+	}
+
+	struct xrt_weave_dmabuf_output_desc desc;
+	U_ZERO(&desc);
+	desc.fd = -1;
+	VkResult ret = vk_create_exportable_dmabuf_image(vk, w, h, WEAVE_VK_FORMAT, usage, mod_count > 0 ? mods : NULL,
+	                                                 mod_count, &desc, &mc->weave.out_image, &mc->weave.out_memory);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("weave(#1699): output allocation (%ux%u, dma-buf, %u candidate modifier(s)) failed: %s", w, h,
+		        mod_count, vk_result_string(ret));
+		return false;
+	}
+	mc->weave.out_fd = desc.fd; // the engine's one fd; export hands out dups
+	mc->weave.out_dmabuf = desc;
+	mc->weave.out_dmabuf.fd = -1;
+	mc->weave.out_size = desc.size;
+	mc->weave.out_w = w;
+	mc->weave.out_h = h;
+	mc->weave.out_is_dmabuf = true;
+	U_LOG_W("weave(#1699): output %ux%u is a dma-buf: fourcc 0x%08x modifier 0x%016" PRIx64
+	        " (%s from %u), %u plane(s), plane0 offset %u stride %u, %" PRIu64 " bytes",
+	        w, h, desc.drm_fourcc, desc.drm_modifier,
+	        force_linear ? "DXR_WEAVE_OUTPUT_LINEAR" : (mod_count > 0 ? "driver-picked" : "LINEAR fallback"),
+	        mod_count, desc.plane_count, desc.offsets[0], desc.strides[0], desc.size);
+	return weave_create_output_view_fb(vk, mc, w, h);
+}
+
+static void
+weave_destroy_sync_semaphores(struct vk_bundle *vk, struct multi_compositor *mc)
+{
+	if (mc->weave.acquire_sem != VK_NULL_HANDLE) {
+		vk->vkDestroySemaphore(vk->device, mc->weave.acquire_sem, NULL);
+		mc->weave.acquire_sem = VK_NULL_HANDLE;
+	}
+	if (mc->weave.release_sem != VK_NULL_HANDLE) {
+		vk->vkDestroySemaphore(vk->device, mc->weave.release_sem, NULL);
+		mc->weave.release_sem = VK_NULL_HANDLE;
+	}
+}
+
+//! Replace acquire_sem with a fresh binary semaphore (after a frame that
+//! imported a payload into it but never submitted the wait).
+static void
+weave_reset_acquire_sem(struct vk_bundle *vk, struct multi_compositor *mc)
+{
+	if (mc->weave.acquire_sem == VK_NULL_HANDLE) {
+		return;
+	}
+	vk->vkDestroySemaphore(vk->device, mc->weave.acquire_sem, NULL);
+	mc->weave.acquire_sem = VK_NULL_HANDLE;
+	VkSemaphoreCreateInfo sem_ci = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+	if (vk->vkCreateSemaphore(vk->device, &sem_ci, NULL, &mc->weave.acquire_sem) != VK_SUCCESS) {
+		mc->weave.acquire_sem = VK_NULL_HANDLE; // acquire fences fall back to the CPU poll
+	}
 }
 
 /*!
@@ -733,17 +978,26 @@ weave_ensure_engine(struct vk_bundle *vk, struct multi_compositor *mc)
 		return false;
 	}
 
-	// R5: stage B creates acquire_sem (plain binary; vk_semaphore_import_sync_fd
-	// per frame) and release_sem (vk_create_exportable_sync_fd_semaphore) here,
-	// gated on vk_dmabuf_sync_fd_supported. vkGetMemoryFdPropertiesKHR is
-	// resolved inside R5's helpers via vk->vkGetDeviceProcAddr — never a
-	// vk_bundle member (plug-in ABI).
+	// Stage B sync_file semaphores (vk_dmabuf.h). Optional: without them the
+	// acquire fence is CPU-polled and completion stays synchronous, so a
+	// failure here is not a failed bring-up.
+	const bool sync_fd = vk_dmabuf_sync_fd_supported(vk);
+	if (sync_fd) {
+		VkSemaphoreCreateInfo sem_ci = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+		if (vk->vkCreateSemaphore(vk->device, &sem_ci, NULL, &mc->weave.acquire_sem) != VK_SUCCESS ||
+		    vk_create_exportable_sync_fd_semaphore(vk, &mc->weave.release_sem) != VK_SUCCESS) {
+			U_LOG_W("weave(#1699): sync_file semaphores could not be created — stage B stays synchronous");
+			weave_destroy_sync_semaphores(vk, mc);
+		}
+	}
 
 	mc->weave.engine_initialized = true;
 	mc->weave.engine_failed = false;
 	U_LOG_W(
-	    "weave(#1699): desktop-Linux weave engine initialized (BGRA8, OPAQUE_FD stage A, synchronous; "
-	    "DP self-submitting=%d)",
+	    "weave(#1699): desktop-Linux weave engine initialized (BGRA8 output; OPAQUE_FD stage A: yes; dma-buf "
+	    "stage B: %s; sync_file fences: %s; DP self-submitting=%d)",
+	    vk_dmabuf_supported(vk) ? "yes" : "NO (device lacks dma-buf / DRM modifier / foreign queue)",
+	    mc->weave.release_sem != VK_NULL_HANDLE ? "GPU (SYNC_FD semaphores)" : "none (CPU poll + synchronous)",
 	    (int)xrt_display_processor_is_self_submitting(mc->weave.dp));
 	return true;
 }
@@ -809,6 +1063,111 @@ weave_layout_barrier(struct vk_bundle *vk,
 }
 
 /*!
+ * Take a cached caller image from its producer's queue family for this frame's
+ * reads (GENERAL on both sides; the caller transitions onward itself). A stage-B
+ * dma-buf comes from VK_QUEUE_FAMILY_FOREIGN_EXT through the R5 helper; a
+ * stage-A same-driver OPAQUE_FD from VK_QUEUE_FAMILY_EXTERNAL.
+ */
+static void
+weave_acquire_slot(struct vk_bundle *vk,
+                   VkCommandBuffer cmd,
+                   const struct comp_multi_weave_linux_slot *slot,
+                   VkPipelineStageFlags stage,
+                   VkAccessFlags access)
+{
+	if (slot->ext_queue_family == VK_QUEUE_FAMILY_FOREIGN_EXT) {
+		vk_dmabuf_cmd_acquire_foreign(vk, cmd, slot->image, VK_IMAGE_LAYOUT_GENERAL, stage, access);
+	} else {
+		weave_ownership_barrier(vk, cmd, slot->image, slot->ext_queue_family, true, stage, access);
+	}
+}
+
+//! The release half of weave_acquire_slot (the image must be back in GENERAL).
+static void
+weave_release_slot(struct vk_bundle *vk,
+                   VkCommandBuffer cmd,
+                   const struct comp_multi_weave_linux_slot *slot,
+                   VkPipelineStageFlags stage,
+                   VkAccessFlags access)
+{
+	if (slot->ext_queue_family == VK_QUEUE_FAMILY_FOREIGN_EXT) {
+		vk_dmabuf_cmd_release_foreign(vk, cmd, slot->image, VK_IMAGE_LAYOUT_GENERAL, stage, access);
+	} else {
+		weave_ownership_barrier(vk, cmd, slot->image, slot->ext_queue_family, false, stage, access);
+	}
+}
+
+/*!
+ * Wait the previous frame's final fence if it is still pending (stage B
+ * leaves it so; a timed-out stage-A wait does too). Bounded: a wedged GPU must
+ * not hang the caller's present thread. Returns false when it is STILL not
+ * signalled, in which case nothing it guards (command buffers, scratch, cache
+ * slots, the output) may be touched, and the submit is refused.
+ *
+ * Deliberately NOT under vk_queue_lock: a fence wait is not a queue operation,
+ * and holding the service's queue lock for up to a second would stall every
+ * other client's submits behind this one.
+ */
+static bool
+weave_wait_prev_frame(struct vk_bundle *vk, struct multi_compositor *mc)
+{
+	if (!mc->weave.fence_pending) {
+		return true;
+	}
+	VkResult ret = vk->vkWaitForFences(vk->device, 1, &mc->weave.fence, VK_TRUE, WEAVE_FENCE_TIMEOUT_NS);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("weave(#1699): previous weave still not complete after 1 s (%s) — refusing this submit",
+		        vk_result_string(ret));
+		return false;
+	}
+	vk->vkResetFences(vk->device, 1, &mc->weave.fence);
+	mc->weave.fence_pending = false;
+	return true;
+}
+
+/*!
+ * Acquire fence of a stage-B submit. With SYNC_FD semaphores it is imported
+ * (temporarily) into acquire_sem and waited on the GPU by this frame's first
+ * submit (*out_wait = true). Without them — or if the import fails — it is
+ * polled on the CPU, bounded. @p fd is consumed on every path (-1 = none).
+ * Returns false if the fence never signalled: the frame is refused.
+ */
+static bool
+weave_take_acquire_fence(struct vk_bundle *vk, struct multi_compositor *mc, int fd, bool *out_wait)
+{
+	*out_wait = false;
+	if (fd < 0) {
+		return true; // the caller had already finished (the v9 contract)
+	}
+	if (mc->weave.acquire_sem != VK_NULL_HANDLE) {
+		// The helper always consumes what it is handed; keep the original for
+		// the poll fallback should the import fail.
+		int dup_fd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+		if (dup_fd >= 0 && vk_semaphore_import_sync_fd(vk, mc->weave.acquire_sem, dup_fd) == VK_SUCCESS) {
+			close(fd);
+			*out_wait = true;
+			return true;
+		}
+		if (!mc->weave.acquire_fallback_warned) {
+			mc->weave.acquire_fallback_warned = true;
+			U_LOG_W("weave(#1699): acquire sync_file import failed — CPU-polling it instead");
+		}
+	}
+	struct pollfd pfd = {.fd = fd, .events = POLLIN};
+	int r;
+	do {
+		r = poll(&pfd, 1, (int)(WEAVE_FENCE_TIMEOUT_NS / 1000000ULL));
+	} while (r < 0 && errno == EINTR);
+	close(fd);
+	if (r <= 0) {
+		U_LOG_E("weave(#1699): acquire sync_file not signalled after 1 s (%s) — refusing this submit",
+		        r == 0 ? "timeout" : strerror(errno));
+		return false;
+	}
+	return true;
+}
+
+/*!
  * Per-window weave phase: hand the DP the present-owner's client origin on the
  * panel (`set_present_origin`, panel-relative; (0,0) = display-scoped) — the
  * slot the Linux vendor DP honours, and the same value the in-process vk_native
@@ -833,6 +1192,534 @@ weave_feed_dp_geometry(struct multi_compositor *mc)
 	}
 }
 
+
+/*!
+ * Which output kind to (re)allocate. A client's explicit request (an export of
+ * the other kind) wins; otherwise the first submit's path decides — a dma-buf
+ * submit gets a dma-buf output, a plain one keeps stage A's OPAQUE_FD. A device
+ * without dma-buf export always gets OPAQUE_FD.
+ */
+static bool
+weave_want_dmabuf_output(struct vk_bundle *vk, struct multi_compositor *mc, bool dmabuf_submit)
+{
+	if (mc->weave.out_kind_req == 0) {
+		mc->weave.out_kind_req = dmabuf_submit ? 2 : 1;
+	}
+	return mc->weave.out_kind_req == 2 && vk_dmabuf_supported(vk);
+}
+
+/*!
+ * Record, submit and complete ONE weave of @p in (+ @p ov) into the output —
+ * shared by the stage-A plain-handle submit and the stage-B dma-buf submit,
+ * which differ only in how the slots were imported (their queue family says
+ * which ownership barriers to record), whether an acquire semaphore is waited,
+ * and whether completion is a release sync_file or a synchronous wait.
+ *
+ * Called with the engine lock held, after weave_wait_prev_frame succeeded.
+ * *out_release_fd is written only on the asynchronous path.
+ */
+static bool
+weave_run_frame(struct vk_bundle *vk,
+                struct multi_compositor *mc,
+                struct comp_multi_weave_linux_slot *in,
+                struct comp_multi_weave_linux_slot *ov,
+                int32_t rect_x,
+                int32_t rect_y,
+                uint32_t rect_w,
+                uint32_t rect_h,
+                uint32_t rect_count,
+                const struct xrt_rect *rects,
+                bool weave_frame_first,
+                const struct xrt_weave_atlas_layout *layout,
+                bool want_dmabuf_out,
+                bool wait_acquire,
+                bool want_release_fd,
+                int *out_release_fd,
+                uint32_t *out_width,
+                uint32_t *out_height,
+                uint64_t *out_fence_value,
+                struct xrt_eye_positions *out_eyes)
+{
+	// Spec-v6 N-view atlas (#774): tiles contiguous from the top-left at
+	// (content_view_w, content_view_h); crop the packed region if the atlas
+	// is bigger (ADR-030 crop-before-DP) and weave once.
+	const bool nview = (layout != NULL && layout->view_count > 0);
+	uint32_t cvw = 0, cvh = 0, packed_w = 0, packed_h = 0;
+	if (nview) {
+		cvw = layout->content_view_w;
+		cvh = layout->content_view_h;
+		packed_w = layout->tile_columns * cvw;
+		packed_h = layout->tile_rows * cvh;
+		if (packed_w > in->w || packed_h > in->h) {
+			U_LOG_E(
+			    "weave(#1699) v6: packed region %ux%u exceeds input atlas %ux%u "
+			    "(views=%u grid=%ux%u content=%ux%u)",
+			    packed_w, packed_h, in->w, in->h, layout->view_count, layout->tile_columns,
+			    layout->tile_rows, cvw, cvh);
+			return false;
+		}
+	}
+
+	// Output dims: v6 = one content view; batch = the (window-client-sized)
+	// input; legacy = rect offset+extent.
+	uint32_t want_w = 0, want_h = 0;
+	if (nview) {
+		want_w = cvw;
+		want_h = cvh;
+	} else if (rect_count > 0) {
+		want_w = in->w;
+		want_h = in->h;
+	} else {
+		want_w = (uint32_t)rect_x + rect_w;
+		want_h = (uint32_t)rect_y + rect_h;
+	}
+	if (want_w == 0 || want_h == 0) {
+		return false;
+	}
+
+	// (Re)allocate output (+ SBS scratch on the non-v6 paths) on resize, and
+	// when a client asked for the other output kind (see out_kind_req).
+	if (mc->weave.out_image == VK_NULL_HANDLE || mc->weave.out_w != want_w || mc->weave.out_h != want_h ||
+	    mc->weave.out_is_dmabuf != want_dmabuf_out) {
+		// Never yank resources out from under in-flight GPU work (the previous
+		// frame was already waited; this also covers other queue users).
+		weave_queue_wait_idle(vk);
+		weave_release_output(vk, mc);
+		weave_release_scratch(vk, mc);
+		const bool created = want_dmabuf_out ? weave_create_output_dmabuf(vk, mc, want_w, want_h)
+		                                     : weave_create_output_opaque(vk, mc, want_w, want_h);
+		if (!created) {
+			weave_release_output(vk, mc);
+			return false;
+		}
+		if (!nview) {
+			if (!weave_create_local(vk, want_w * 2, want_h, &mc->weave.sbs_image, &mc->weave.sbs_memory,
+			                        &mc->weave.sbs_view)) {
+				return false;
+			}
+			mc->weave.sbs_w = want_w * 2;
+			mc->weave.sbs_h = want_h;
+			mc->weave.sbs_first_use = true;
+		}
+		U_LOG_W("weave(#1699): output %ux%u (%s layout), exported %s %" PRIu64 " bytes", want_w, want_h,
+		        nview ? "v6 N-view" : (rect_count > 0 ? "v3 batch" : "legacy"),
+		        want_dmabuf_out ? "dma-buf" : "OPAQUE_FD", (uint64_t)mc->weave.out_size);
+	}
+
+	// v6 crop staging: (re)create when the packed region is smaller than the
+	// input. Zero-copy (packed == input) samples the input directly.
+	const bool v6_zero_copy = nview && (packed_w == in->w && packed_h == in->h);
+	if (nview && !v6_zero_copy &&
+	    (mc->weave.crop_image == VK_NULL_HANDLE || mc->weave.crop_w != packed_w || mc->weave.crop_h != packed_h)) {
+		weave_queue_wait_idle(vk);
+		weave_release_crop(vk, mc);
+		if (!weave_create_local(vk, packed_w, packed_h, &mc->weave.crop_image, &mc->weave.crop_memory,
+		                        &mc->weave.crop_view)) {
+			return false;
+		}
+		mc->weave.crop_w = packed_w;
+		mc->weave.crop_h = packed_h;
+		mc->weave.crop_first_use = true;
+	}
+
+	// ---- Record ----
+	// Stage B: the caller's acquire sync_file, imported into acquire_sem, is
+	// waited by this frame's FIRST submit at ALL_COMMANDS — not just TRANSFER |
+	// FRAGMENT — because the FOREIGN acquire barriers (and the output's
+	// UNDEFINED transition, which the fence also guards: it covers the caller's
+	// reads of the previous output) source TOP_OF_PIPE, which a narrower wait
+	// stage would not order behind the fence.
+	bool acquire_wait_pending = wait_acquire;
+	const VkPipelineStageFlags acquire_wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+	VkCommandBuffer cmd = mc->weave.cmd;
+	vk->vkResetCommandBuffer(cmd, 0);
+	VkCommandBufferBeginInfo begin = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+	    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+	};
+	if (vk->vkBeginCommandBuffer(cmd, &begin) != VK_SUCCESS) {
+		return false;
+	}
+
+	VkImageSubresourceRange range = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1};
+
+	// Take the input from the producer's queue family (GENERAL both sides).
+	// Mandatory for external memory: without the acquire, the producer's
+	// writes are not guaranteed visible (and a compressed / aux-surface
+	// image may not be resolved) on this queue.
+	const VkPipelineStageFlags in_stage =
+	    v6_zero_copy ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT;
+	const VkAccessFlags in_access = v6_zero_copy ? VK_ACCESS_SHADER_READ_BIT : VK_ACCESS_TRANSFER_READ_BIT;
+	weave_acquire_slot(vk, cmd, in, in_stage, in_access);
+	in->first_use = false;
+
+	VkImage dp_src_image = mc->weave.sbs_image;
+	VkImageView dp_src_view = mc->weave.sbs_view;
+	uint32_t atlas_view_w = mc->weave.out_w;
+	uint32_t atlas_view_h = mc->weave.out_h;
+	uint32_t grid_cols = 2, grid_rows = 1;
+	VkImageLayout in_layout = VK_IMAGE_LAYOUT_GENERAL; // where the input sits after the reads
+	VkFormat dp_src_format = WEAVE_VK_FORMAT;
+
+	if (nview) {
+		if (v6_zero_copy) {
+			// The packed atlas fills the input exactly — sample it directly.
+			weave_layout_barrier(vk, cmd, in->image, VK_IMAGE_LAYOUT_GENERAL,
+			                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, VK_ACCESS_SHADER_READ_BIT,
+			                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+			                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+			in_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+			dp_src_image = in->image;
+			dp_src_view = in->view;
+			dp_src_format = in->format; // a stage-B RGBA input is sampled as RGBA
+		} else {
+			// Crop the top-left packed region: ONE box copy.
+			weave_layout_barrier(vk, cmd, in->image, VK_IMAGE_LAYOUT_GENERAL,
+			                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 0, VK_ACCESS_TRANSFER_READ_BIT,
+			                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+			in_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+			weave_layout_barrier(vk, cmd, mc->weave.crop_image,
+			                     mc->weave.crop_first_use ? VK_IMAGE_LAYOUT_UNDEFINED
+			                                              : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
+			                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+			                     VK_PIPELINE_STAGE_TRANSFER_BIT);
+			mc->weave.crop_first_use = false;
+
+			if (in->format == WEAVE_VK_FORMAT) {
+				VkImageCopy copy = {
+				    .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
+				    .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
+				    .extent = {packed_w, packed_h, 1},
+				};
+				vk->vkCmdCopyImage(cmd, in->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+				                   mc->weave.crop_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+				                   &copy);
+			} else {
+				// A stage-B RGBA input (DRM ABGR8888) into the BGRA staging:
+				// vkCmdCopyImage would copy raw bytes (R/B swapped); a 1:1
+				// blit converts the channel order.
+				VkImageBlit blit = {
+				    .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
+				    .srcOffsets = {{0, 0, 0}, {(int32_t)packed_w, (int32_t)packed_h, 1}},
+				    .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
+				    .dstOffsets = {{0, 0, 0}, {(int32_t)packed_w, (int32_t)packed_h, 1}},
+				};
+				vk->vkCmdBlitImage(cmd, in->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+				                   mc->weave.crop_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+				                   VK_FILTER_NEAREST);
+			}
+
+			weave_layout_barrier(vk, cmd, mc->weave.crop_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+			                     VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+			                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+			dp_src_image = mc->weave.crop_image;
+			dp_src_view = mc->weave.crop_view;
+		}
+		atlas_view_w = cvw;
+		atlas_view_h = cvh;
+		grid_cols = layout->tile_columns;
+		grid_rows = layout->tile_rows;
+	} else {
+		// Batch / legacy: the input stays in GENERAL (the acquire above
+		// already made the producer's writes visible to TRANSFER reads).
+
+		// Scratch -> TRANSFER_DST (persists across frames: stale regions
+		// from closed elements re-weave harmlessly; the caller composites
+		// back only its current rects).
+		weave_layout_barrier(
+		    vk, cmd, mc->weave.sbs_image,
+		    mc->weave.sbs_first_use ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+		    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+		mc->weave.sbs_first_use = false;
+
+		// v5 firstChunk (browser#22): clear the SBS scratch to premultiplied
+		// transparent on the first submit of a frame.
+		if (weave_frame_first) {
+			VkClearColorValue sbs_transparent = {.float32 = {0.0f, 0.0f, 0.0f, 0.0f}};
+			vk->vkCmdClearColorImage(cmd, mc->weave.sbs_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			                         &sbs_transparent, 1, &range);
+			// Order the whole-image clear before the per-rect blits.
+			weave_layout_barrier(vk, cmd, mc->weave.sbs_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+			                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+			                     VK_PIPELINE_STAGE_TRANSFER_BIT);
+		}
+
+		// Blit each rect's squeezed-SBS halves into the two atlas tiles:
+		// left half -> left tile at the rect's window position (stretched to
+		// full rect width), right half -> right tile offset by out_w.
+		struct xrt_rect legacy_rect = {
+		    .offset = {.w = 0, .h = 0},
+		    .extent = {.w = (int)want_w, .h = (int)want_h},
+		};
+		const struct xrt_rect *blit_rects = rect_count > 0 ? rects : &legacy_rect;
+		uint32_t blit_count = rect_count > 0 ? rect_count : 1;
+
+		for (uint32_t i = 0; i < blit_count; i++) {
+			// xrt_offset names its fields w/h; they hold x/y here.
+			int32_t rx = blit_rects[i].offset.w;
+			int32_t ry = blit_rects[i].offset.h;
+			int32_t rw = blit_rects[i].extent.w;
+			int32_t rh = blit_rects[i].extent.h;
+			if (rw <= 0 || rh <= 0) {
+				continue;
+			}
+			if (rx < 0 || ry < 0 || (uint32_t)(rx + rw) > in->w || (uint32_t)(ry + rh) > in->h) {
+				continue;
+			}
+			int32_t half = rw / 2;
+			if (half <= 0) {
+				continue;
+			}
+			VkImageBlit blits[2] = {
+			    // Left eye: input rect's left half -> left tile, unsqueezed.
+			    {
+			        .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
+			        .srcOffsets = {{rx, ry, 0}, {rx + half, ry + rh, 1}},
+			        .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
+			        .dstOffsets = {{rx, ry, 0}, {rx + rw, ry + rh, 1}},
+			    },
+			    // Right eye: input rect's right half -> right tile (+out_w).
+			    {
+			        .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
+			        .srcOffsets = {{rx + half, ry, 0}, {rx + rw, ry + rh, 1}},
+			        .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
+			        .dstOffsets = {{(int32_t)mc->weave.out_w + rx, ry, 0},
+			                       {(int32_t)mc->weave.out_w + rx + rw, ry + rh, 1}},
+			    },
+			};
+			vk->vkCmdBlitImage(cmd, in->image, VK_IMAGE_LAYOUT_GENERAL, mc->weave.sbs_image,
+			                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 2, blits, VK_FILTER_LINEAR);
+		}
+
+		// Scratch -> SHADER_READ for the DP sample.
+		weave_layout_barrier(vk, cmd, mc->weave.sbs_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+		                     VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+	}
+
+	// Output -> COLOR_ATTACHMENT. Fully re-rendered every submit, so the
+	// discard from UNDEFINED is fine — and needs no acquire from the
+	// caller's family: contents that are not preserved need no transfer.
+	weave_layout_barrier(vk, cmd, mc->weave.out_image, VK_IMAGE_LAYOUT_UNDEFINED,
+	                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+
+	weave_feed_dp_geometry(mc);
+
+	// SELF-SUBMITTING DP ORDERING (Android #1036's one-frame trail fix): a
+	// DP that submits its own batch during process_atlas would otherwise
+	// execute BEFORE this frame's blits (still unsubmitted in cmd). Flush
+	// the pre-weave batch first; same-queue submission order then puts the
+	// DP's batch after it. The final submit + fence below retire both.
+	const bool self_submits = xrt_display_processor_is_self_submitting(mc->weave.dp);
+	if (self_submits && debug_get_bool_option_dxr_linux_weave_split()) {
+		if (vk->vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+			U_LOG_E("weave(#1699): vkEndCommandBuffer (pre-weave) failed");
+			return false;
+		}
+		VkSubmitInfo pre_submit = {
+		    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+		    .waitSemaphoreCount = acquire_wait_pending ? 1u : 0u,
+		    .pWaitSemaphores = &mc->weave.acquire_sem,
+		    .pWaitDstStageMask = &acquire_wait_stage,
+		    .commandBufferCount = 1,
+		    .pCommandBuffers = &cmd,
+		};
+		vk_queue_lock(vk->main_queue);
+		VkResult pre_ret = vk->vkQueueSubmit(vk->main_queue->queue, 1, &pre_submit, VK_NULL_HANDLE);
+		vk_queue_unlock(vk->main_queue);
+		if (pre_ret != VK_SUCCESS) {
+			U_LOG_E("weave(#1699): pre-weave vkQueueSubmit failed: %s", vk_result_string(pre_ret));
+			return false;
+		}
+		cmd = mc->weave.cmd_post;
+		vk->vkResetCommandBuffer(cmd, 0);
+		if (vk->vkBeginCommandBuffer(cmd, &begin) != VK_SUCCESS) {
+			U_LOG_E("weave(#1699): vkBeginCommandBuffer (post-weave) failed");
+			return false;
+		}
+		if (acquire_wait_pending) {
+			// The acquire semaphore was consumed by the pre-weave batch; the
+			// overlay's FOREIGN acquire below sources TOP_OF_PIPE, so chain
+			// this batch behind everything submitted before it (which waited
+			// the caller's fence) with one full execution + memory dependency.
+			VkMemoryBarrier mb = {
+			    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+			    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+			    .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+			};
+			vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+			                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+			acquire_wait_pending = false;
+		}
+	}
+
+	// ONE process_atlas per submit. Legacy/batch: 2x1 SBS, per-eye dims =
+	// the window. v6: the caller's grid at content_view dims. A
+	// self-submitting DP gets VK_NULL_HANDLE (xrt_display_processor
+	// contract; it records into its own buffer).
+	xrt_display_processor_set_target_color_view(mc->weave.dp, mc->weave.out_view);
+	xrt_display_processor_process_atlas(mc->weave.dp, self_submits ? VK_NULL_HANDLE : cmd, //
+	                                    (VkImage_XDP)dp_src_image, dp_src_view,            //
+	                                    atlas_view_w, atlas_view_h,                        //
+	                                    grid_cols, grid_rows,                              //
+	                                    (VkFormat_XDP)dp_src_format,                       //
+	                                    mc->weave.out_fb,                                  //
+	                                    (VkImage_XDP)mc->weave.out_image,                  //
+	                                    mc->weave.out_w, mc->weave.out_h,                  //
+	                                    (VkFormat_XDP)WEAVE_VK_FORMAT,                     //
+	                                    0, 0, 0, 0);
+
+	// Input back to GENERAL (if a v6 path moved it) and released to the
+	// producer's family, so its next writes land in a defined state.
+	if (in_layout != VK_IMAGE_LAYOUT_GENERAL) {
+		weave_layout_barrier(vk, cmd, in->image, in_layout, VK_IMAGE_LAYOUT_GENERAL, in_access, 0, in_stage,
+		                     in_stage);
+	}
+	weave_release_slot(vk, cmd, in, in_stage, in_access);
+
+	// v4 overlay atlas (browser#18): composite the caller's window-sized
+	// premultiplied 2D atlas OVER the woven output — not woven, drawn after
+	// process_atlas onto the same attachment.
+	if (ov != NULL) {
+		bool blend_ready = mc->weave.overlay_blend_initialized;
+		if (!blend_ready) {
+			blend_ready =
+			    vk_local2d_composite_init(&mc->weave.overlay_blend, vk, WEAVE_VK_FORMAT, WEAVE_VK_FORMAT);
+			mc->weave.overlay_blend_initialized = blend_ready;
+			if (blend_ready) {
+				U_LOG_W("weave(#1699) v4: premul-over blend pipeline ready");
+			} else {
+				U_LOG_E("weave(#1699) v4: premul-over blend init failed");
+			}
+		}
+		if (blend_ready) {
+			weave_acquire_slot(vk, cmd, ov, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+			                   VK_ACCESS_SHADER_READ_BIT);
+			weave_layout_barrier(vk, cmd, ov->image, VK_IMAGE_LAYOUT_GENERAL,
+			                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, VK_ACCESS_SHADER_READ_BIT,
+			                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+			                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+			ov->first_use = false;
+
+			weave_layout_barrier(vk, cmd, mc->weave.out_image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			                     VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+			                     VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+			                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+			                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+
+			vk_local2d_composite_begin_frame(&mc->weave.overlay_blend, vk);
+			vk_local2d_composite_flatten_draw(&mc->weave.overlay_blend, vk, cmd, mc->weave.out_fb,
+			                                  mc->weave.out_w, mc->weave.out_h,
+			                                  ov->view, //
+			                                  0, 0, mc->weave.out_w,
+			                                  mc->weave.out_h,        // dst = full window
+			                                  0.0f, 0.0f, 1.0f, 1.0f, // src = whole atlas
+			                                  /*unpremultiplied*/ false);
+
+			weave_layout_barrier(vk, cmd, ov->image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			                     VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT, 0,
+			                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+			                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+			weave_release_slot(vk, cmd, ov, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+			                   VK_ACCESS_SHADER_READ_BIT);
+		}
+	}
+
+	// Output handed to the caller in GENERAL. A stage-B dma-buf goes to
+	// VK_QUEUE_FAMILY_FOREIGN_EXT (any API / process reads it); a stage-A
+	// OPAQUE_FD to VK_QUEUE_FAMILY_EXTERNAL (a same-driver Vulkan / GL peer).
+	if (mc->weave.out_is_dmabuf) {
+		vk_dmabuf_cmd_release_foreign(vk, cmd, mc->weave.out_image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		                              VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+	} else {
+		weave_layout_barrier(vk, cmd, mc->weave.out_image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		                     VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		                     VK_ACCESS_MEMORY_READ_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		                     VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+		weave_ownership_barrier(vk, cmd, mc->weave.out_image, VK_QUEUE_FAMILY_EXTERNAL, false,
+		                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT);
+	}
+	mc->weave.out_layout = VK_IMAGE_LAYOUT_GENERAL; // #1387 d3: the one authority
+
+	if (vk->vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+		return false;
+	}
+
+	// ---- Submit + completion ----
+	// Stage B with SYNC_FD semaphores: the final submit signals release_sem,
+	// exported right after as this frame's release sync_file, and NOTHING waits
+	// here — the next submit waits this fence first (weave_wait_prev_frame).
+	// Otherwise (stage A / no sync_file support) the completion is synchronous:
+	// a bounded wait before the IPC reply, so returning IS the completion signal.
+	const bool signal_release = want_release_fd && mc->weave.release_sem != VK_NULL_HANDLE;
+	VkSubmitInfo submit = {
+	    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+	    .waitSemaphoreCount = acquire_wait_pending ? 1u : 0u,
+	    .pWaitSemaphores = &mc->weave.acquire_sem,
+	    .pWaitDstStageMask = &acquire_wait_stage,
+	    .commandBufferCount = 1,
+	    .pCommandBuffers = &cmd,
+	    .signalSemaphoreCount = signal_release ? 1u : 0u,
+	    .pSignalSemaphores = &mc->weave.release_sem,
+	};
+	vk_queue_lock(vk->main_queue);
+	VkResult ret = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit, mc->weave.fence);
+	vk_queue_unlock(vk->main_queue);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("weave(#1699): vkQueueSubmit failed: %s", vk_result_string(ret));
+		return false;
+	}
+	mc->weave.fence_pending = true;
+
+	bool synchronous = true;
+	if (signal_release) {
+		int release_fd = -1;
+		ret = vk_semaphore_export_sync_fd(vk, mc->weave.release_sem, &release_fd);
+		if (ret == VK_SUCCESS) {
+			*out_release_fd = release_fd; // -1 = already signalled, i.e. complete
+			synchronous = false;
+		} else if (!mc->weave.release_fallback_warned) {
+			mc->weave.release_fallback_warned = true;
+			U_LOG_W(
+			    "weave(#1699): release sync_file export failed (%s) — synchronous completion from now on",
+			    vk_result_string(ret));
+		}
+	}
+	if (synchronous) {
+		if (!weave_wait_prev_frame(vk, mc)) {
+			return false; // stays pending; the next submit re-waits it
+		}
+		if (signal_release) {
+			// release_sem holds a signal nobody will consume, and a binary
+			// semaphore must not be signalled twice: drop both semaphores and
+			// stay synchronous from here on.
+			weave_destroy_sync_semaphores(vk, mc);
+		}
+	}
+
+	mc->weave.fence_value++;
+
+	*out_width = mc->weave.out_w;
+	*out_height = mc->weave.out_h;
+	*out_fence_value = mc->weave.fence_value;
+
+	// Eyes flow OUT for the caller's next off-axis frame; the weave itself
+	// reads the tracker DP-internally.
+	U_ZERO(out_eyes);
+	if (!xrt_display_processor_get_predicted_eye_positions(mc->weave.dp, out_eyes)) {
+		U_ZERO(out_eyes);
+	}
+
+	return true;
+}
 
 /*
  *
@@ -935,14 +1822,14 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 
 	bool ok = false;
 	do {
-		if (!weave_ensure_engine(vk, mc)) {
+		if (!weave_ensure_engine(vk, mc) || !weave_wait_prev_frame(vk, mc)) {
 			break;
 		}
 
 		uint32_t in_w = 0, in_h = 0;
 		weave_stage_a_input_dims(mc, rect_x, rect_y, rect_w, rect_h, rect_count, rects, layout, &in_w, &in_h);
 		struct comp_multi_weave_linux_slot *in =
-		    weave_cache_acquire(vk, mc, mc->weave.in_slots, in_fd, 0, in_w, in_h, "input");
+		    weave_cache_acquire(vk, mc, mc->weave.in_slots, in_fd, NULL, in_w, in_h, "input");
 		if (in == NULL) {
 			break;
 		}
@@ -953,416 +1840,17 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		if (ov_fd >= 0) {
 			uint32_t ov_w = mc->weave.have_geometry ? mc->weave.win_w : in_w;
 			uint32_t ov_h = mc->weave.have_geometry ? mc->weave.win_h : in_h;
-			ov = weave_cache_acquire(vk, mc, mc->weave.ov_slots, ov_fd, 0, ov_w, ov_h, "overlay");
+			ov = weave_cache_acquire(vk, mc, mc->weave.ov_slots, ov_fd, NULL, ov_w, ov_h, "overlay");
 		}
 
-		// Spec-v6 N-view atlas (#774): tiles contiguous from the top-left at
-		// (content_view_w, content_view_h); crop the packed region if the atlas
-		// is bigger (ADR-030 crop-before-DP) and weave once.
-		const bool nview = (layout != NULL && layout->view_count > 0);
-		uint32_t cvw = 0, cvh = 0, packed_w = 0, packed_h = 0;
-		if (nview) {
-			cvw = layout->content_view_w;
-			cvh = layout->content_view_h;
-			packed_w = layout->tile_columns * cvw;
-			packed_h = layout->tile_rows * cvh;
-			if (packed_w > in->w || packed_h > in->h) {
-				U_LOG_E(
-				    "weave(#1699) v6: packed region %ux%u exceeds input atlas %ux%u "
-				    "(views=%u grid=%ux%u content=%ux%u)",
-				    packed_w, packed_h, in->w, in->h, layout->view_count, layout->tile_columns,
-				    layout->tile_rows, cvw, cvh);
-				break;
-			}
-		}
-
-		// Output dims: v6 = one content view; batch = the (window-client-sized)
-		// input; legacy = rect offset+extent.
-		uint32_t want_w = 0, want_h = 0;
-		if (nview) {
-			want_w = cvw;
-			want_h = cvh;
-		} else if (rect_count > 0) {
-			want_w = in->w;
-			want_h = in->h;
-		} else {
-			want_w = (uint32_t)rect_x + rect_w;
-			want_h = (uint32_t)rect_y + rect_h;
-		}
-		if (want_w == 0 || want_h == 0) {
+		const bool want_dmabuf_out = weave_want_dmabuf_output(vk, mc, false);
+		int unused_release_fd = -1;
+		if (!weave_run_frame(vk, mc, in, ov, rect_x, rect_y, rect_w, rect_h, rect_count, rects,
+		                     weave_frame_first, layout, want_dmabuf_out, false /* no acquire sem */,
+		                     false /* synchronous */, &unused_release_fd, out_width, out_height,
+		                     out_fence_value, out_eyes)) {
 			break;
 		}
-
-		// (Re)allocate output (+ SBS scratch on the non-v6 paths) on resize.
-		if (mc->weave.out_image == VK_NULL_HANDLE || mc->weave.out_w != want_w || mc->weave.out_h != want_h) {
-			// Never yank resources out from under in-flight GPU work.
-			weave_queue_wait_idle(vk);
-			weave_release_output(vk, mc);
-			weave_release_scratch(vk, mc);
-			if (!weave_create_output(vk, mc, want_w, want_h)) {
-				weave_release_output(vk, mc);
-				break;
-			}
-			if (!nview) {
-				if (!weave_create_local(vk, want_w * 2, want_h, &mc->weave.sbs_image,
-				                        &mc->weave.sbs_memory, &mc->weave.sbs_view)) {
-					break;
-				}
-				mc->weave.sbs_w = want_w * 2;
-				mc->weave.sbs_h = want_h;
-				mc->weave.sbs_first_use = true;
-			}
-			U_LOG_W("weave(#1699): output %ux%u (%s layout), exported OPAQUE_FD %" PRIu64 " bytes", want_w,
-			        want_h, nview ? "v6 N-view" : (rect_count > 0 ? "v3 batch" : "legacy"),
-			        (uint64_t)mc->weave.out_size);
-		}
-
-		// v6 crop staging: (re)create when the packed region is smaller than the
-		// input. Zero-copy (packed == input) samples the input directly.
-		const bool v6_zero_copy = nview && (packed_w == in->w && packed_h == in->h);
-		if (nview && !v6_zero_copy &&
-		    (mc->weave.crop_image == VK_NULL_HANDLE || mc->weave.crop_w != packed_w ||
-		     mc->weave.crop_h != packed_h)) {
-			weave_queue_wait_idle(vk);
-			weave_release_crop(vk, mc);
-			if (!weave_create_local(vk, packed_w, packed_h, &mc->weave.crop_image, &mc->weave.crop_memory,
-			                        &mc->weave.crop_view)) {
-				break;
-			}
-			mc->weave.crop_w = packed_w;
-			mc->weave.crop_h = packed_h;
-			mc->weave.crop_first_use = true;
-		}
-
-		// ---- Record ----
-		VkCommandBuffer cmd = mc->weave.cmd;
-		vk->vkResetCommandBuffer(cmd, 0);
-		VkCommandBufferBeginInfo begin = {
-		    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-		    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-		};
-		if (vk->vkBeginCommandBuffer(cmd, &begin) != VK_SUCCESS) {
-			break;
-		}
-
-		VkImageSubresourceRange range = {
-		    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1};
-
-		// Take the input from the producer's queue family (GENERAL both sides).
-		// Mandatory for external memory: without the acquire, the producer's
-		// writes are not guaranteed visible (and a compressed / aux-surface
-		// image may not be resolved) on this queue.
-		const VkPipelineStageFlags in_stage =
-		    v6_zero_copy ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT;
-		const VkAccessFlags in_access = v6_zero_copy ? VK_ACCESS_SHADER_READ_BIT : VK_ACCESS_TRANSFER_READ_BIT;
-		weave_ownership_barrier(vk, cmd, in->image, in->ext_queue_family, true, in_stage, in_access);
-		in->first_use = false;
-
-		VkImage dp_src_image = mc->weave.sbs_image;
-		VkImageView dp_src_view = mc->weave.sbs_view;
-		uint32_t atlas_view_w = mc->weave.out_w;
-		uint32_t atlas_view_h = mc->weave.out_h;
-		uint32_t grid_cols = 2, grid_rows = 1;
-		VkImageLayout in_layout = VK_IMAGE_LAYOUT_GENERAL; // where the input sits after the reads
-
-		if (nview) {
-			if (v6_zero_copy) {
-				// The packed atlas fills the input exactly — sample it directly.
-				weave_layout_barrier(vk, cmd, in->image, VK_IMAGE_LAYOUT_GENERAL,
-				                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0,
-				                     VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-				                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-				in_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-				dp_src_image = in->image;
-				dp_src_view = in->view;
-			} else {
-				// Crop the top-left packed region: ONE box copy.
-				weave_layout_barrier(vk, cmd, in->image, VK_IMAGE_LAYOUT_GENERAL,
-				                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 0,
-				                     VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-				                     VK_PIPELINE_STAGE_TRANSFER_BIT);
-				in_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-				weave_layout_barrier(
-				    vk, cmd, mc->weave.crop_image,
-				    mc->weave.crop_first_use ? VK_IMAGE_LAYOUT_UNDEFINED
-				                             : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-				    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
-				    VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-				    VK_PIPELINE_STAGE_TRANSFER_BIT);
-				mc->weave.crop_first_use = false;
-
-				VkImageCopy copy = {
-				    .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
-				    .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
-				    .extent = {packed_w, packed_h, 1},
-				};
-				vk->vkCmdCopyImage(cmd, in->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-				                   mc->weave.crop_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
-				                   &copy);
-
-				weave_layout_barrier(
-				    vk, cmd, mc->weave.crop_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-				    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
-				    VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-				    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-				dp_src_image = mc->weave.crop_image;
-				dp_src_view = mc->weave.crop_view;
-			}
-			atlas_view_w = cvw;
-			atlas_view_h = cvh;
-			grid_cols = layout->tile_columns;
-			grid_rows = layout->tile_rows;
-		} else {
-			// Batch / legacy: the input stays in GENERAL (the acquire above
-			// already made the producer's writes visible to TRANSFER reads).
-
-			// Scratch -> TRANSFER_DST (persists across frames: stale regions
-			// from closed elements re-weave harmlessly; the caller composites
-			// back only its current rects).
-			weave_layout_barrier(vk, cmd, mc->weave.sbs_image,
-			                     mc->weave.sbs_first_use ? VK_IMAGE_LAYOUT_UNDEFINED
-			                                             : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-			                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
-			                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-			                     VK_PIPELINE_STAGE_TRANSFER_BIT);
-			mc->weave.sbs_first_use = false;
-
-			// v5 firstChunk (browser#22): clear the SBS scratch to premultiplied
-			// transparent on the first submit of a frame.
-			if (weave_frame_first) {
-				VkClearColorValue sbs_transparent = {.float32 = {0.0f, 0.0f, 0.0f, 0.0f}};
-				vk->vkCmdClearColorImage(cmd, mc->weave.sbs_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-				                         &sbs_transparent, 1, &range);
-				// Order the whole-image clear before the per-rect blits.
-				weave_layout_barrier(vk, cmd, mc->weave.sbs_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-				                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
-				                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-				                     VK_PIPELINE_STAGE_TRANSFER_BIT);
-			}
-
-			// Blit each rect's squeezed-SBS halves into the two atlas tiles:
-			// left half -> left tile at the rect's window position (stretched to
-			// full rect width), right half -> right tile offset by out_w.
-			struct xrt_rect legacy_rect = {
-			    .offset = {.w = 0, .h = 0},
-			    .extent = {.w = (int)want_w, .h = (int)want_h},
-			};
-			const struct xrt_rect *blit_rects = rect_count > 0 ? rects : &legacy_rect;
-			uint32_t blit_count = rect_count > 0 ? rect_count : 1;
-
-			for (uint32_t i = 0; i < blit_count; i++) {
-				// xrt_offset names its fields w/h; they hold x/y here.
-				int32_t rx = blit_rects[i].offset.w;
-				int32_t ry = blit_rects[i].offset.h;
-				int32_t rw = blit_rects[i].extent.w;
-				int32_t rh = blit_rects[i].extent.h;
-				if (rw <= 0 || rh <= 0) {
-					continue;
-				}
-				if (rx < 0 || ry < 0 || (uint32_t)(rx + rw) > in->w || (uint32_t)(ry + rh) > in->h) {
-					continue;
-				}
-				int32_t half = rw / 2;
-				if (half <= 0) {
-					continue;
-				}
-				VkImageBlit blits[2] = {
-				    // Left eye: input rect's left half -> left tile, unsqueezed.
-				    {
-				        .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
-				        .srcOffsets = {{rx, ry, 0}, {rx + half, ry + rh, 1}},
-				        .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
-				        .dstOffsets = {{rx, ry, 0}, {rx + rw, ry + rh, 1}},
-				    },
-				    // Right eye: input rect's right half -> right tile (+out_w).
-				    {
-				        .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
-				        .srcOffsets = {{rx + half, ry, 0}, {rx + rw, ry + rh, 1}},
-				        .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
-				        .dstOffsets = {{(int32_t)mc->weave.out_w + rx, ry, 0},
-				                       {(int32_t)mc->weave.out_w + rx + rw, ry + rh, 1}},
-				    },
-				};
-				vk->vkCmdBlitImage(cmd, in->image, VK_IMAGE_LAYOUT_GENERAL, mc->weave.sbs_image,
-				                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 2, blits, VK_FILTER_LINEAR);
-			}
-
-			// Scratch -> SHADER_READ for the DP sample.
-			weave_layout_barrier(vk, cmd, mc->weave.sbs_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-			                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
-			                     VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-			                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-		}
-
-		// Output -> COLOR_ATTACHMENT. Fully re-rendered every submit, so the
-		// discard from UNDEFINED is fine — and needs no acquire from the
-		// caller's family: contents that are not preserved need no transfer.
-		weave_layout_barrier(vk, cmd, mc->weave.out_image, VK_IMAGE_LAYOUT_UNDEFINED,
-		                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-		                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
-
-		weave_feed_dp_geometry(mc);
-
-		// SELF-SUBMITTING DP ORDERING (Android #1036's one-frame trail fix): a
-		// DP that submits its own batch during process_atlas would otherwise
-		// execute BEFORE this frame's blits (still unsubmitted in cmd). Flush
-		// the pre-weave batch first; same-queue submission order then puts the
-		// DP's batch after it. The final submit + fence below retire both.
-		const bool self_submits = xrt_display_processor_is_self_submitting(mc->weave.dp);
-		if (self_submits && debug_get_bool_option_dxr_linux_weave_split()) {
-			if (vk->vkEndCommandBuffer(cmd) != VK_SUCCESS) {
-				U_LOG_E("weave(#1699): vkEndCommandBuffer (pre-weave) failed");
-				break;
-			}
-			VkSubmitInfo pre_submit = {
-			    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-			    .commandBufferCount = 1,
-			    .pCommandBuffers = &cmd,
-			};
-			vk_queue_lock(vk->main_queue);
-			VkResult pre_ret = vk->vkQueueSubmit(vk->main_queue->queue, 1, &pre_submit, VK_NULL_HANDLE);
-			vk_queue_unlock(vk->main_queue);
-			if (pre_ret != VK_SUCCESS) {
-				U_LOG_E("weave(#1699): pre-weave vkQueueSubmit failed: %s", vk_result_string(pre_ret));
-				break;
-			}
-			cmd = mc->weave.cmd_post;
-			vk->vkResetCommandBuffer(cmd, 0);
-			if (vk->vkBeginCommandBuffer(cmd, &begin) != VK_SUCCESS) {
-				U_LOG_E("weave(#1699): vkBeginCommandBuffer (post-weave) failed");
-				break;
-			}
-		}
-
-		// ONE process_atlas per submit. Legacy/batch: 2x1 SBS, per-eye dims =
-		// the window. v6: the caller's grid at content_view dims. A
-		// self-submitting DP gets VK_NULL_HANDLE (xrt_display_processor
-		// contract; it records into its own buffer).
-		xrt_display_processor_set_target_color_view(mc->weave.dp, mc->weave.out_view);
-		xrt_display_processor_process_atlas(mc->weave.dp, self_submits ? VK_NULL_HANDLE : cmd, //
-		                                    (VkImage_XDP)dp_src_image, dp_src_view,            //
-		                                    atlas_view_w, atlas_view_h,                        //
-		                                    grid_cols, grid_rows,                              //
-		                                    (VkFormat_XDP)WEAVE_VK_FORMAT,                     //
-		                                    mc->weave.out_fb,                                  //
-		                                    (VkImage_XDP)mc->weave.out_image,                  //
-		                                    mc->weave.out_w, mc->weave.out_h,                  //
-		                                    (VkFormat_XDP)WEAVE_VK_FORMAT,                     //
-		                                    0, 0, 0, 0);
-
-		// Input back to GENERAL (if a v6 path moved it) and released to the
-		// producer's family, so its next writes land in a defined state.
-		if (in_layout != VK_IMAGE_LAYOUT_GENERAL) {
-			weave_layout_barrier(vk, cmd, in->image, in_layout, VK_IMAGE_LAYOUT_GENERAL, in_access, 0,
-			                     in_stage, in_stage);
-		}
-		weave_ownership_barrier(vk, cmd, in->image, in->ext_queue_family, false, in_stage, in_access);
-
-		// v4 overlay atlas (browser#18): composite the caller's window-sized
-		// premultiplied 2D atlas OVER the woven output — not woven, drawn after
-		// process_atlas onto the same attachment.
-		if (ov != NULL) {
-			bool blend_ready = mc->weave.overlay_blend_initialized;
-			if (!blend_ready) {
-				blend_ready = vk_local2d_composite_init(&mc->weave.overlay_blend, vk, WEAVE_VK_FORMAT,
-				                                        WEAVE_VK_FORMAT);
-				mc->weave.overlay_blend_initialized = blend_ready;
-				if (blend_ready) {
-					U_LOG_W("weave(#1699) v4: premul-over blend pipeline ready");
-				} else {
-					U_LOG_E("weave(#1699) v4: premul-over blend init failed");
-				}
-			}
-			if (blend_ready) {
-				weave_ownership_barrier(vk, cmd, ov->image, ov->ext_queue_family, true,
-				                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-				                        VK_ACCESS_SHADER_READ_BIT);
-				weave_layout_barrier(vk, cmd, ov->image, VK_IMAGE_LAYOUT_GENERAL,
-				                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0,
-				                     VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-				                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-				ov->first_use = false;
-
-				weave_layout_barrier(
-				    vk, cmd, mc->weave.out_image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-				    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-				    VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-				    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-				    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
-
-				vk_local2d_composite_begin_frame(&mc->weave.overlay_blend, vk);
-				vk_local2d_composite_flatten_draw(&mc->weave.overlay_blend, vk, cmd, mc->weave.out_fb,
-				                                  mc->weave.out_w, mc->weave.out_h,
-				                                  ov->view, //
-				                                  0, 0, mc->weave.out_w,
-				                                  mc->weave.out_h,        // dst = full window
-				                                  0.0f, 0.0f, 1.0f, 1.0f, // src = whole atlas
-				                                  /*unpremultiplied*/ false);
-
-				weave_layout_barrier(vk, cmd, ov->image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-				                     VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT, 0,
-				                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-				                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-				weave_ownership_barrier(vk, cmd, ov->image, ov->ext_queue_family, false,
-				                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-				                        VK_ACCESS_SHADER_READ_BIT);
-			}
-		}
-
-		// Output -> GENERAL, then released to the caller's family (GENERAL both
-		// sides) for its cross-process read.
-		weave_layout_barrier(vk, cmd, mc->weave.out_image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-		                     VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-		                     VK_ACCESS_MEMORY_READ_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-		                     VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
-		weave_ownership_barrier(vk, cmd, mc->weave.out_image, VK_QUEUE_FAMILY_EXTERNAL, false,
-		                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT);
-		mc->weave.out_layout = VK_IMAGE_LAYOUT_GENERAL; // #1387 d3: the one authority
-
-		if (vk->vkEndCommandBuffer(cmd) != VK_SUCCESS) {
-			break;
-		}
-
-		// ---- Submit + synchronous completion (stage A) ----
-		// R4/R5: stage B waits the imported acquire semaphore here
-		// (pWaitDstStageMask = TRANSFER | FRAGMENT_SHADER), signals
-		// release_sem and exports it (vk_semaphore_export_sync_fd) as the
-		// per-frame *out_release_fence_fd — which the IPC handler owns, sends
-		// and closes after the reply (#1712) — and replaces the CPU wait below
-		// with a wait on the PREVIOUS frame's fence at the top of the next
-		// submit (command buffers / scratch reuse).
-		VkSubmitInfo submit = {
-		    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-		    .commandBufferCount = 1,
-		    .pCommandBuffers = &cmd,
-		};
-		vk_queue_lock(vk->main_queue);
-		VkResult ret = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit, mc->weave.fence);
-		vk_queue_unlock(vk->main_queue);
-		if (ret != VK_SUCCESS) {
-			U_LOG_E("weave(#1699): vkQueueSubmit failed: %s", vk_result_string(ret));
-			break;
-		}
-		ret = vk->vkWaitForFences(vk->device, 1, &mc->weave.fence, VK_TRUE, WEAVE_FENCE_TIMEOUT_NS);
-		vk->vkResetFences(vk->device, 1, &mc->weave.fence);
-		if (ret != VK_SUCCESS) {
-			U_LOG_E("weave(#1699): weave did not complete within 1s: %s", vk_result_string(ret));
-			break;
-		}
-
-		mc->weave.fence_value++;
-
-		*out_width = mc->weave.out_w;
-		*out_height = mc->weave.out_h;
-		*out_fence_value = mc->weave.fence_value;
-
-		// Eyes flow OUT for the caller's next off-axis frame; the weave itself
-		// reads the tracker DP-internally.
-		U_ZERO(out_eyes);
-		if (!xrt_display_processor_get_predicted_eye_positions(mc->weave.dp, out_eyes)) {
-			U_ZERO(out_eyes);
-		}
-
 		ok = true;
 	} while (false);
 
@@ -1387,7 +1875,17 @@ comp_multi_weave_export_output(struct xrt_compositor *xc,
 	}
 	os_mutex_lock(&mc->weave.mutex);
 	bool ok = false;
-	if (mc->weave.out_fd >= 0 && mc->weave.out_w != 0) {
+	if (mc->weave.out_is_dmabuf) {
+		// This caller wants the stage-A OPAQUE_FD kind; the current allocation
+		// is a dma-buf, which cannot be exported as OPAQUE_FD. Nothing this
+		// frame ("nothing yet", #1427 — the client retries); the next submit
+		// reallocates the kind asked for.
+		mc->weave.out_kind_req = 1;
+		if (!mc->weave.out_kind_warned) {
+			mc->weave.out_kind_warned = true;
+			U_LOG_W("weave(#1699): client asked for an OPAQUE_FD output over a dma-buf one — reallocating");
+		}
+	} else if (mc->weave.out_fd >= 0 && mc->weave.out_w != 0) {
 		// Hand out the CACHED fd without a dup: the plain weave_get_output
 		// handler sends it (generated out_handles → ipc_send_fds, SCM_RIGHTS
 		// installs the peer's own copy) and never closes it — unchanged by the
@@ -1410,7 +1908,7 @@ bool
 comp_multi_weave_export_fence(struct xrt_compositor *xc, xrt_graphics_sync_handle_t *out_handle)
 {
 	// Stage A is synchronous: xrWeaveSubmitDXR returning is the completion
-	// signal, so there is no fence to export. R4: stage B's per-frame release
+	// signal, so there is no fence to export. Stage B's per-frame release
 	// sync_file rides the submit reply (comp_multi_weave_submit_dmabuf), not
 	// this latched once-per-allocation call.
 	(void)xc;
@@ -1439,64 +1937,135 @@ comp_multi_weave_submit_dmabuf(struct xrt_compositor *xc,
                                uint64_t *out_fence_value,
                                struct xrt_eye_positions *out_eyes)
 {
-	// R5: STUB until aux_vk grows vk_create_image_from_dmabuf /
-	// vk_semaphore_import_sync_fd / vk_semaphore_export_sync_fd and the
-	// FOREIGN_EXT barrier helpers. The fd plumbing honours the contract
-	// already (xrt_weave_dmabuf.h): every fd handed in is ours, so a refusal
-	// closes them all and returns no release fence.
-	(void)xc;
-	(void)rect_x;
-	(void)rect_y;
-	(void)rect_w;
-	(void)rect_h;
-	(void)rect_count;
-	(void)rects;
-	(void)weave_frame_first;
-	(void)layout;
-	(void)flat_rect_count;
+	(void)flat_rect_count; // v8: accepted and ignored (see comp_multi_weave_submit)
 	(void)flat_rects;
-	(void)out_width;
-	(void)out_height;
-	(void)out_fence_value;
-	(void)out_eyes;
-
-	static bool warned = false;
-	if (!warned) {
-		warned = true;
-		U_LOG_W(
-		    "weave(#1699): dma-buf submit is not implemented yet (stage B, pending the R5 aux_vk "
-		    "dma-buf helpers) — refusing; use the plain OPAQUE_FD submit");
-	}
-	if (in != NULL && in->fd >= 0) {
-		close(in->fd);
-	}
-	if (overlay != NULL && overlay->fd >= 0) {
-		close(overlay->fd);
-	}
-	if (acquire_fence_fd >= 0) {
-		close(acquire_fence_fd);
-	}
 	if (out_release_fence_fd != NULL) {
 		*out_release_fence_fd = -1;
 	}
-	return false;
+
+	// Every fd handed in is the engine's from here (xrt_weave_dmabuf.h): the
+	// received input / overlay fds are closed exactly once at the bottom (the
+	// imports are handed dups), and the acquire fence is consumed by
+	// weave_take_acquire_fence or closed on a refusal before it.
+	int in_fd = in != NULL ? in->fd : -1;
+	int ov_fd = overlay != NULL ? overlay->fd : -1;
+	int acq_fd = acquire_fence_fd;
+
+	struct multi_compositor *mc = multi_compositor(xc);
+	struct vk_bundle *vk = weave_get_vk(mc);
+	if (mc == NULL || mc->msc == NULL || vk == NULL || in_fd < 0 || out_release_fence_fd == NULL) {
+		weave_close_fd(&in_fd);
+		weave_close_fd(&ov_fd);
+		weave_close_fd(&acq_fd);
+		return false;
+	}
+
+	weave_ensure_mutex(mc);
+	os_mutex_lock(&mc->weave.mutex);
+
+	bool ok = false;
+	do {
+		if (!weave_ensure_engine(vk, mc)) {
+			break;
+		}
+		if (!vk_dmabuf_supported(vk)) {
+			if (!mc->weave.dmabuf_unsupported_warned) {
+				mc->weave.dmabuf_unsupported_warned = true;
+				U_LOG_W(
+				    "weave(#1699): dma-buf submit REFUSED — the service's Vulkan device lacks "
+				    "VK_EXT_external_memory_dma_buf / _image_drm_format_modifier / "
+				    "_queue_family_foreign");
+			}
+			break;
+		}
+		// Frame N-1 must be complete before its command buffers, scratch and
+		// cache slots are reused (the stage-B completion model).
+		if (!weave_wait_prev_frame(vk, mc)) {
+			break;
+		}
+
+		struct comp_multi_weave_linux_slot *in_slot =
+		    weave_cache_acquire(vk, mc, mc->weave.in_slots, in_fd, in, in->width, in->height, "input");
+		if (in_slot == NULL) {
+			break;
+		}
+		struct comp_multi_weave_linux_slot *ov_slot = NULL;
+		if (ov_fd >= 0) {
+			ov_slot = weave_cache_acquire(vk, mc, mc->weave.ov_slots, ov_fd, overlay, overlay->width,
+			                              overlay->height, "overlay");
+		}
+
+		// Last step before recording: the acquire fence (consumed here on
+		// every path, so no refusal below may leave it open).
+		bool wait_acquire = false;
+		int fence = acq_fd;
+		acq_fd = -1;
+		if (!weave_take_acquire_fence(vk, mc, fence, &wait_acquire)) {
+			break;
+		}
+
+		const bool want_dmabuf_out = weave_want_dmabuf_output(vk, mc, true);
+		int release_fd = -1;
+		if (!weave_run_frame(vk, mc, in_slot, ov_slot, rect_x, rect_y, rect_w, rect_h, rect_count, rects,
+		                     weave_frame_first, layout, want_dmabuf_out, wait_acquire,
+		                     true /* release sync_file */, &release_fd, out_width, out_height, out_fence_value,
+		                     out_eyes)) {
+			if (wait_acquire) {
+				// The temporary payload may be unconsumed (nothing was
+				// submitted): replace acquire_sem so the next import starts
+				// from a clean binary semaphore.
+				weave_reset_acquire_sem(vk, mc);
+			}
+			break;
+		}
+		*out_release_fence_fd = release_fd; // the handler owns it: sends + closes it after the reply
+		ok = true;
+	} while (false);
+
+	os_mutex_unlock(&mc->weave.mutex);
+
+	weave_close_fd(&in_fd);
+	weave_close_fd(&ov_fd);
+	weave_close_fd(&acq_fd);
+	return ok;
 }
 
 bool
 comp_multi_weave_export_output_dmabuf(struct xrt_compositor *xc, struct xrt_weave_dmabuf_output_desc *out)
 {
-	// R5: STUB — stage B exports the LINEAR/modifier output allocated by
-	// vk_create_exportable_dmabuf_image (one dup per call, per the contract).
-	(void)xc;
-	static bool warned = false;
-	if (!warned) {
-		warned = true;
-		U_LOG_W("weave(#1699): dma-buf output export is not implemented yet (stage B, pending R5)");
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (out == NULL) {
+		return false;
 	}
-	if (out != NULL) {
-		out->fd = -1;
+	out->fd = -1;
+	if (mc == NULL || !mc->weave.mutex_initialized) {
+		return false;
 	}
-	return false;
+	os_mutex_lock(&mc->weave.mutex);
+	bool ok = false;
+	if (mc->weave.out_image != VK_NULL_HANDLE && !mc->weave.out_is_dmabuf) {
+		// This caller wants a dma-buf; the current allocation is stage A's
+		// OPAQUE_FD. "Nothing yet" this frame; the next submit reallocates.
+		mc->weave.out_kind_req = 2;
+		if (!mc->weave.out_kind_warned) {
+			mc->weave.out_kind_warned = true;
+			U_LOG_W("weave(#1699): client asked for a dma-buf output over an OPAQUE_FD one — reallocating");
+		}
+	} else if (mc->weave.out_is_dmabuf && mc->weave.out_fd >= 0) {
+		// A FRESH dup per call: the dma-buf handler parks what it is handed
+		// and closes it after the reply (#1712), while the engine keeps its
+		// own fd for the allocation's lifetime.
+		int fd = fcntl(mc->weave.out_fd, F_DUPFD_CLOEXEC, 0);
+		if (fd >= 0) {
+			*out = mc->weave.out_dmabuf;
+			out->fd = fd;
+			ok = true;
+		} else {
+			U_LOG_E("weave(#1699): dup(output dma-buf) failed: %s", strerror(errno));
+		}
+	}
+	os_mutex_unlock(&mc->weave.mutex);
+	return ok;
 }
 
 bool
@@ -1541,9 +2110,10 @@ comp_multi_weave_fini(struct multi_compositor *mc)
 	os_mutex_lock(&mc->weave.mutex);
 	if (vk != NULL) {
 		if (mc->weave.engine_initialized) {
-			// Submits are synchronous, but a timed-out fence can leave work in
-			// flight — idle before tearing anything down.
+			// Stage B leaves the last frame in flight (and a timed-out stage-A
+			// wait can too) — idle before tearing anything down.
 			weave_queue_wait_idle(vk);
+			mc->weave.fence_pending = false;
 		}
 		weave_slots_release_all(vk, mc->weave.in_slots);
 		weave_slots_release_all(vk, mc->weave.ov_slots);
@@ -1561,6 +2131,7 @@ comp_multi_weave_fini(struct multi_compositor *mc)
 			vk->vkDestroyRenderPass(vk->device, mc->weave.render_pass, NULL);
 			mc->weave.render_pass = VK_NULL_HANDLE;
 		}
+		weave_destroy_sync_semaphores(vk, mc);
 		if (mc->weave.fence != VK_NULL_HANDLE) {
 			vk->vkDestroyFence(vk->device, mc->weave.fence, NULL);
 			mc->weave.fence = VK_NULL_HANDLE;
