@@ -345,8 +345,8 @@ gaps to wire when a display exists, all mirroring the macOS arms:
 **Done when:** a handle/hosted app runs out-of-process against
 `displayxr-service` on Linux.
 
-**Phase 2c — `XR_DXR_weave` present-owner engine on the service (#1699) — stage A
-landed.** `comp_multi_weave_linux.c` (built by default,
+**Phase 2c — `XR_DXR_weave` present-owner engine on the service (#1699) — stages A
+and B landed.** `comp_multi_weave_linux.c` (built by default,
 `XRT_FEATURE_COMP_MULTI_WEAVE_LINUX`) is the desktop-Linux sibling of the macOS
 and Android comp_multi weave engines: a present-owner (the browser's GPU
 process, or any app that owns its window and present) submits pre-weave SBS /
@@ -366,12 +366,20 @@ per-window Kooima (`ipc_try_get_oop_view_poses`, now built on Linux too);
   `test_apps/probes/weave_probe_vk_linux` against sim_display: batch + v4
   overlay + v5 firstChunk + v6, output imported and read back, fd counts flat
   over 600 frames in both processes.
-- **Stage B (pending R4 wire #1712 + R5 `vk_dmabuf` helpers #1710):** dma-buf
-  with a DRM modifier in and out, `FOREIGN_EXT` ownership, sync_file acquire
-  / per-frame release fences — `comp_multi_weave_submit_dmabuf` /
-  `_export_output_dmabuf` are refusing stubs until then. This is the path
-  Chromium's (GL) GPU process needs; stage A only serves a Vulkan client on
-  the service's own GPU.
+- **Stage B (done, headless-verified):** dma-buf with an explicit DRM format
+  modifier in and out (`vk_dmabuf.h`, #1710, over the spec-v10 wire #1712),
+  `VK_QUEUE_FAMILY_FOREIGN_EXT` ownership, a sync_file acquire fence waited on
+  the GPU and a per-frame release sync_file; the engine waits the previous
+  frame at the start of the next submit instead of before the reply. The
+  output's modifier is the driver's pick from everything the device exports
+  (`DXR_WEAVE_OUTPUT_LINEAR=1` forces LINEAR); a non-LINEAR input that does not
+  import (another GPU's layout) is refused with one WARN — no copy tier. The
+  probe's `--dmabuf` mode drives it with compressed (CCS) inputs of both byte
+  orders, reads every frame back after waiting its release fence (600/600
+  correct, fd counts flat), and a `--no-release-wait` negative control reads
+  stale frames (the fence is doing work). This is the path Chromium's (GL)
+  GPU process needs; stage A only serves a Vulkan client on the service's own
+  GPU. Still to prove: a real GL producer and a real panel.
 
 ### Phase 3 — `XR_DXR_xlib_window_binding`
 
