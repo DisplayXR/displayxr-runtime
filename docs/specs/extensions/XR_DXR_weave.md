@@ -686,6 +686,13 @@ centre tile), in register with the window and under the v4 overlay, and skips th
 for a window wholly off the panel — so a caller composites the output as usual and never clips it
 itself. `DXR_SPAN_2D=0` restores the fully woven output.
 
+**Flat regions (v8) on desktop Linux.** With no per-region lens on any desktop-Linux display
+processor to wish to, the runtime instead paints the union of the submit's
+`XrWeaveSubmitFlatRegionsDXR` rects and the latched `xrWeaveSetScreenFlatRegionsDXR` rects
+(clipped to the bound window, taking effect at the next submit) flat in the woven output — the
+input pixels 1:1 for a batch submit, the centre view for v6 — a platform exception to §2c's
+"pixels unaffected" that `DXR_WEAVE_FLAT_2D=0` switches off.
+
 ## 6. Version history
 
 | Version | Change |

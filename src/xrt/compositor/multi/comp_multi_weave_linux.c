@@ -99,6 +99,7 @@
 #include "util/u_handles.h"
 #include "util/u_debug.h"
 #include "util/u_weave_span2d.h"
+#include "util/u_weave_flat.h"
 
 #include "vk/vk_helpers.h"
 #include "vk/vk_dmabuf.h"
@@ -1327,6 +1328,94 @@ weave_offpanel_bands(struct multi_compositor *mc, bool nview, struct u_wl_rect_p
 	return n;
 }
 
+/*
+ *
+ * Flat regions (spec v8, browser#88, on desktop Linux).
+ *
+ */
+
+//! Wire caps (IPC_WEAVE_SUBMIT_FLAT_RECTS_MAX / _SET_SCREEN_FLAT_RECTS_MAX,
+//! ipc_protocol.h — not included by the compositor).
+#define WEAVE_SUBMIT_FLAT_MAX 16
+#define WEAVE_SCREEN_FLAT_MAX 8
+//! Per-submit + sticky flat rects; also bounds one paint call.
+#define WEAVE_FLAT_MAX_RECTS (WEAVE_SUBMIT_FLAT_MAX + WEAVE_SCREEN_FLAT_MAX)
+#define WEAVE_PAINT_MAX_RECTS WEAVE_FLAT_MAX_RECTS
+
+/*!
+ * DXR_WEAVE_FLAT_2D=0 turns the flat-region paint off: the flat lists are then
+ * accepted and ignored, exactly as before (and as on macOS / Android).
+ */
+static bool
+weave_flat_2d_enabled(void)
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		const char *e = getenv("DXR_WEAVE_FLAT_2D");
+		enabled = (e != NULL && e[0] == '0') ? 0 : 1;
+	}
+	return enabled == 1;
+}
+
+/*!
+ * The caller's flat regions in OUTPUT pixels: union of this submit's
+ * window-relative @p flat_rects and the sticky screen-space latch
+ * (comp_multi_weave_set_screen_flat_regions), clipped to the window.
+ *
+ * Why painted, not wished. On Windows these rects are subtracted from a
+ * per-region hardware wish the DP turns into a local lens switch, and the
+ * woven pixels are untouched. No desktop-Linux DP has a per-region lens: the
+ * only vendor one (Leia, drv_leia_linux) takes the same publish_local_zone_mask
+ * slot but reduces it to one global on/off (zone_grid 1x1). So a flat region
+ * would stay woven — a browser popup over inline 3D shown through the
+ * interlace, split into two "eyes" of page pixels. Instead the runtime paints
+ * those rects flat, from the same source the pixels came from (the input page
+ * for a batch submit; the centre view otherwise), exactly as the off-panel
+ * bands are painted. The window geometry is needed for the sticky latch (it
+ * is screen-absolute) and for the v6 scale; without it only the per-submit
+ * rects apply, 1:1 on the output.
+ *
+ * @return the rect count (0 = nothing flat, the common case).
+ */
+static uint32_t
+weave_flat_rects(struct multi_compositor *mc,
+                 bool nview,
+                 uint32_t flat_rect_count,
+                 const struct xrt_rect *flat_rects,
+                 struct u_wl_rect_px out[WEAVE_FLAT_MAX_RECTS])
+{
+	uint32_t n = 0;
+	if (weave_flat_2d_enabled() && mc->weave.out_w != 0 && mc->weave.out_h != 0) {
+		struct u_wl_rect_px win_rects[WEAVE_SUBMIT_FLAT_MAX];
+		struct u_wl_rect_px scr_rects[WEAVE_SCREEN_FLAT_MAX];
+		uint32_t win_count = 0, scr_count = 0;
+		for (uint32_t i = 0; flat_rects != NULL && i < flat_rect_count && i < ARRAY_SIZE(win_rects); i++) {
+			// xrt_offset names its fields w/h; they hold x/y here.
+			win_rects[win_count++] = (struct u_wl_rect_px){flat_rects[i].offset.w, flat_rects[i].offset.h,
+			                                               flat_rects[i].extent.w, flat_rects[i].extent.h};
+		}
+		const bool geo = mc->weave.have_geometry && mc->weave.win_w != 0 && mc->weave.win_h != 0;
+		for (uint32_t i = 0; geo && i < mc->weave.screen_flat_rect_count && i < ARRAY_SIZE(scr_rects); i++) {
+			const struct xrt_rect *r = &mc->weave.screen_flat_rects[i];
+			scr_rects[scr_count++] =
+			    (struct u_wl_rect_px){r->offset.w, r->offset.h, r->extent.w, r->extent.h};
+		}
+		const uint32_t win_w = geo ? mc->weave.win_w : mc->weave.out_w;
+		const uint32_t win_h = geo ? mc->weave.win_h : mc->weave.out_h;
+		n = u_wl_flat_rects_to_output(win_rects, win_count, scr_rects, scr_count, mc->weave.win_x,
+		                              mc->weave.win_y, win_w, win_h, mc->weave.out_w, mc->weave.out_h,
+		                              nview && geo, out, WEAVE_FLAT_MAX_RECTS);
+	}
+
+	// Log on a change of the painted count only, never per frame.
+	if (n != mc->weave.last_flat_count) {
+		mc->weave.last_flat_count = n;
+		U_LOG_W("weave(#1699) FLAT_2D: %u flat region(s) painted flat in the %ux%u output (%u sticky latched)",
+		        n, mc->weave.out_w, mc->weave.out_h, mc->weave.screen_flat_rect_count);
+	}
+	return n;
+}
+
 //! One-time init of the premul-over pipeline (shared by the overlay and the
 //! off-panel bands) and ONE descriptor-pool reset per frame (the pool must not
 //! be reset between two draws recorded into the same frame).
@@ -1351,7 +1440,10 @@ weave_blend_begin(struct vk_bundle *vk, struct multi_compositor *mc, bool *begun
 }
 
 /*!
- * Paint each off-panel band of the output with flat 2D: one view of the
+ * Paint each rect of the output (an off-panel band, or a flat region — see
+ * weave_flat_rects) with flat 2D copied from @p src_view at the rect's own
+ * output coordinates offset by (@p tile_x, @p tile_y). For an off-panel band
+ * the source is one view of the
  * pre-weave atlas the DP consumed — the centre tile, which for a stereo pair
  * is the left eye. That tile is output-sized and in register with the window
  * on every layout (batch: the SBS scratch's left tile, i.e. each rect's left
@@ -1403,7 +1495,10 @@ weave_paint_offpanel(struct vk_bundle *vk,
 	    .colorAttachment = 0,
 	    .clearValue = {.color = {.float32 = {0.0f, 0.0f, 0.0f, 0.0f}}},
 	};
-	VkClearRect clear_rects[4];
+	VkClearRect clear_rects[WEAVE_PAINT_MAX_RECTS];
+	if (band_count > WEAVE_PAINT_MAX_RECTS) {
+		band_count = WEAVE_PAINT_MAX_RECTS;
+	}
 	for (uint32_t i = 0; i < band_count; i++) {
 		clear_rects[i] = (VkClearRect){
 		    .rect = {{bands[i].x, bands[i].y}, {(uint32_t)bands[i].w, (uint32_t)bands[i].h}},
@@ -1454,6 +1549,8 @@ weave_run_frame(struct vk_bundle *vk,
                 const struct xrt_rect *rects,
                 bool weave_frame_first,
                 const struct xrt_weave_atlas_layout *layout,
+                uint32_t flat_rect_count,
+                const struct xrt_rect *flat_rects,
                 bool want_dmabuf_out,
                 bool wait_acquire,
                 bool want_release_fd,
@@ -1827,6 +1924,41 @@ weave_run_frame(struct vk_bundle *vk,
 		                     &blend_begun);
 	}
 
+	// Flat regions (spec v8) -> flat 2D, AFTER the off-panel bands (a popup
+	// that is also off the panel must still show the popup) and before the v4
+	// overlay. Source: for a batch submit the input page itself, 1:1 — the
+	// flat region IS page content (a popup / menu / DOM over 3D), and the
+	// input is window-sized in register with the output; otherwise (v6 /
+	// legacy, where the input holds views, not a page) the centre view the
+	// off-panel bands use.
+	{
+		struct u_wl_rect_px flat[WEAVE_FLAT_MAX_RECTS];
+		const uint32_t flat_count = weave_flat_rects(mc, nview, flat_rect_count, flat_rects, flat);
+		if (flat_count > 0) {
+			const bool page_source = !nview && rect_count > 0;
+			if (page_source) {
+				// The batch input sat in GENERAL for the TRANSFER blits;
+				// sample it in SHADER_READ_ONLY and put it back.
+				weave_layout_barrier(vk, cmd, in->image, VK_IMAGE_LAYOUT_GENERAL,
+				                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0,
+				                     VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+				                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+				weave_paint_offpanel(vk, mc, cmd, flat, flat_count, in->view, in->w, in->h, 0, 0,
+				                     &blend_begun);
+				weave_layout_barrier(vk, cmd, in->image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+				                     VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT, 0,
+				                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+				                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+			} else {
+				const uint32_t tiles = grid_cols * grid_rows;
+				const uint32_t view_index = tiles > 0 ? (tiles - 1) / 2 : 0;
+				weave_paint_offpanel(vk, mc, cmd, flat, flat_count, dp_src_view, dp_src_w, dp_src_h,
+				                     (view_index % grid_cols) * atlas_view_w,
+				                     (view_index / grid_cols) * atlas_view_h, &blend_begun);
+			}
+		}
+	}
+
 	// Input back to GENERAL (if a v6 path moved it) and released to the
 	// producer's family, so its next writes land in a defined state.
 	if (in_layout != VK_IMAGE_LAYOUT_GENERAL) {
@@ -2038,11 +2170,8 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
                         uint64_t *out_fence_value,
                         struct xrt_eye_positions *out_eyes)
 {
-	// v8 (browser#88): accepted and ignored, as on macOS / Android — the
-	// per-region hardware wish has no desktop-Linux channel yet. Conformant:
-	// the wish is advisory and hardware-only (ADR-027 D6), pixels are unaffected.
-	(void)flat_rect_count;
-	(void)flat_rects;
+	// v8 (browser#88): the flat regions are painted flat in the output
+	// (weave_flat_rects — no desktop-Linux DP has a per-region lens to wish).
 
 	// Every received fd is ours from here and is closed exactly once, at the
 	// bottom — hit, miss, refusal or error (file header, rule 1).
@@ -2086,9 +2215,9 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		const bool want_dmabuf_out = weave_want_dmabuf_output(vk, mc, false);
 		int unused_release_fd = -1;
 		if (!weave_run_frame(vk, mc, in, ov, rect_x, rect_y, rect_w, rect_h, rect_count, rects,
-		                     weave_frame_first, layout, want_dmabuf_out, false /* no acquire sem */,
-		                     false /* synchronous */, &unused_release_fd, out_width, out_height,
-		                     out_fence_value, out_eyes)) {
+		                     weave_frame_first, layout, flat_rect_count, flat_rects, want_dmabuf_out,
+		                     false /* no acquire sem */, false /* synchronous */, &unused_release_fd, out_width,
+		                     out_height, out_fence_value, out_eyes)) {
 			break;
 		}
 		ok = true;
@@ -2177,8 +2306,6 @@ comp_multi_weave_submit_dmabuf(struct xrt_compositor *xc,
                                uint64_t *out_fence_value,
                                struct xrt_eye_positions *out_eyes)
 {
-	(void)flat_rect_count; // v8: accepted and ignored (see comp_multi_weave_submit)
-	(void)flat_rects;
 	if (out_release_fence_fd != NULL) {
 		*out_release_fence_fd = -1;
 	}
@@ -2247,9 +2374,9 @@ comp_multi_weave_submit_dmabuf(struct xrt_compositor *xc,
 		const bool want_dmabuf_out = weave_want_dmabuf_output(vk, mc, true);
 		int release_fd = -1;
 		if (!weave_run_frame(vk, mc, in_slot, ov_slot, rect_x, rect_y, rect_w, rect_h, rect_count, rects,
-		                     weave_frame_first, layout, want_dmabuf_out, wait_acquire,
-		                     true /* release sync_file */, &release_fd, out_width, out_height, out_fence_value,
-		                     out_eyes)) {
+		                     weave_frame_first, layout, flat_rect_count, flat_rects, want_dmabuf_out,
+		                     wait_acquire, true /* release sync_file */, &release_fd, out_width, out_height,
+		                     out_fence_value, out_eyes)) {
 			if (wait_acquire) {
 				// The temporary payload may be unconsumed (nothing was
 				// submitted): replace acquire_sem so the next import starts
@@ -2306,6 +2433,35 @@ comp_multi_weave_export_output_dmabuf(struct xrt_compositor *xc, struct xrt_weav
 	}
 	os_mutex_unlock(&mc->weave.mutex);
 	return ok;
+}
+
+bool
+comp_multi_weave_set_screen_flat_regions(struct xrt_compositor *xc,
+                                         uint32_t rect_count,
+                                         const struct xrt_rect *screen_rects)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (mc == NULL || mc->msc == NULL || rect_count > WEAVE_SCREEN_FLAT_MAX ||
+	    (rect_count > 0 && screen_rects == NULL)) {
+		return false;
+	}
+	weave_ensure_mutex(mc);
+	os_mutex_lock(&mc->weave.mutex);
+	// SET, not add: the latch is replaced wholesale, and count 0 clears it.
+	for (uint32_t i = 0; i < rect_count; i++) {
+		mc->weave.screen_flat_rects[i] = screen_rects[i];
+	}
+	const bool changed = rect_count != mc->weave.screen_flat_rect_count;
+	mc->weave.screen_flat_rect_count = rect_count;
+	os_mutex_unlock(&mc->weave.mutex);
+	if (changed) {
+		// A caller may re-latch the same furniture on every layout pass; log
+		// a change of count only.
+		U_LOG_W(
+		    "weave(#1699): sticky screen flat regions latched: %u rect(s) (painted flat from the next submit)",
+		    rect_count);
+	}
+	return true;
 }
 
 bool
