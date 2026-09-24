@@ -34,8 +34,8 @@
  *
  * - macOS: comp_multi_weave_macos.c (IOSurface, #759).
  * - Android: comp_multi_weave_android.c (AHardwareBuffer, #1036).
- * - Desktop Linux: comp_multi_weave_linux.c (dma-buf fd, #1699 piece R2),
- *   opt-in via XRT_FEATURE_COMP_MULTI_WEAVE_LINUX until that engine lands.
+ * - Desktop Linux: comp_multi_weave_linux.c (fd transport, #1699 piece R2),
+ *   behind XRT_FEATURE_COMP_MULTI_WEAVE_LINUX (default ON).
  *   `XRT_OS_LINUX && !XRT_OS_ANDROID` is the XRT_OS_LINUX_DESKTOP condition
  *   spelled out until that macro is defined globally in xrt_config_os.h (#1702).
  */
