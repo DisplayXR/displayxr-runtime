@@ -19,6 +19,7 @@
 #include "xrt/xrt_compiler.h"
 #include "xrt/xrt_defines.h"
 #include "xrt/xrt_limits.h"
+#include "xrt/xrt_weave_dmabuf.h"
 #include "xrt/xrt_compositor.h"
 #include "xrt/xrt_display_processor.h"
 
@@ -1171,6 +1172,45 @@ comp_multi_weave_export_output(struct xrt_compositor *xc,
 
 bool
 comp_multi_weave_export_fence(struct xrt_compositor *xc, xrt_graphics_sync_handle_t *out_handle);
+
+#ifdef XRT_OS_LINUX_DESKTOP
+/*!
+ * @name Desktop-Linux dma-buf transport (#1699, spec v10 / R4 wire, R2 engine)
+ * The fd-plus-modifier variants of submit / export_output. The plain handle
+ * variants above stay valid on Linux for an OPAQUE_FD producer (stage A); a
+ * caller that chains a dma-buf descriptor takes these instead. Fences are
+ * sync_file fds: the engine takes ownership of @p acquire_fence_fd (-1 = none)
+ * and waits it on the GPU before reading the input; it returns a fresh
+ * @p out_release_fence_fd every frame (-1 = the submit completed
+ * synchronously) that the caller owns and must wait before sampling the
+ * output.
+ * @{
+ */
+bool
+comp_multi_weave_submit_dmabuf(struct xrt_compositor *xc,
+                               const struct xrt_weave_dmabuf_desc *in,
+                               const struct xrt_weave_dmabuf_desc *overlay, // NULL when absent
+                               int acquire_fence_fd,
+                               int32_t rect_x,
+                               int32_t rect_y,
+                               uint32_t rect_w,
+                               uint32_t rect_h,
+                               uint32_t rect_count,
+                               const struct xrt_rect *rects,
+                               bool weave_frame_first,
+                               const struct xrt_weave_atlas_layout *layout,
+                               uint32_t flat_rect_count,
+                               const struct xrt_rect *flat_rects,
+                               int *out_release_fence_fd,
+                               uint32_t *out_width,
+                               uint32_t *out_height,
+                               uint64_t *out_fence_value,
+                               struct xrt_eye_positions *out_eyes);
+
+bool
+comp_multi_weave_export_output_dmabuf(struct xrt_compositor *xc, struct xrt_weave_dmabuf_output_desc *out);
+/*! @} */
+#endif // XRT_OS_LINUX_DESKTOP
 
 bool
 comp_multi_weave_snap_window_rect(struct xrt_compositor *xc,
