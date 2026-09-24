@@ -195,6 +195,42 @@ static const char *optional_device_extensions[] = {
 #ifdef VK_EXT_robustness2
     VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 #endif
+
+#if defined(XRT_OS_LINUX_DESKTOP) && defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_FD)
+/*
+ * #1699 R5: the desktop-Linux weave engine imports client dma-bufs with
+ * explicit DRM format modifiers, exports its woven output as a dma-buf,
+ * and moves ownership through VK_QUEUE_FAMILY_FOREIGN_EXT (see
+ * vk/vk_dmabuf.h). The service's device is also the display processor's
+ * device here, so this is the same set comp_vk_glue.c asks of an app
+ * device for the DP (#757). All optional-if-present: a software ICD
+ * without a DRM device (a CI runner's lavapipe) may offer none of them, and
+ * vk_dmabuf_supported() reports what the device actually got.
+ *
+ * The instance is created at API 1.0, so VK_EXT_image_drm_format_modifier's
+ * dependencies are extensions, not core: VK_KHR_bind_memory2,
+ * VK_KHR_image_format_list and VK_KHR_sampler_ycbcr_conversion (itself on
+ * VK_KHR_maintenance1 + get_memory_requirements2, both already listed).
+ * They come first so they are selected before the extension that needs
+ * them; every driver that offers the modifier extension offers them.
+ * VK_KHR_external_{semaphore,fence}_fd are already optional above.
+ */
+#ifdef VK_KHR_bind_memory2
+    VK_KHR_BIND_MEMORY_2_EXTENSION_NAME,
+#endif
+#ifdef VK_KHR_sampler_ycbcr_conversion
+    VK_KHR_SAMPLER_YCBCR_CONVERSION_EXTENSION_NAME,
+#endif
+#ifdef VK_EXT_external_memory_dma_buf
+    VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
+#endif
+#ifdef VK_EXT_image_drm_format_modifier
+    VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
+#endif
+#ifdef VK_EXT_queue_family_foreign
+    VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME,
+#endif
+#endif // XRT_OS_LINUX_DESKTOP && XRT_GRAPHICS_BUFFER_HANDLE_IS_FD
 };
 
 static VkResult
