@@ -18,9 +18,10 @@
  * comp_multi Vulkan weave engine on macOS (#759: IOSurface in/out, synchronous
  * completion, no fence handle). An in-process session reports
  * XR_ERROR_FEATURE_UNSUPPORTED — with ONE exception, xrWeaveSnapWindowRectDXR
- * (#1588), which is a pure query on the display processor and therefore works
- * in-process too (an X11 handle app owns and drags its own window, so it is
- * the party that needs to ask where the window may land).
+ * (#1588) and its bulk form xrWeaveSnapWindowGridDXR (#1723), which are pure
+ * queries on the display processor and therefore work in-process too (an X11
+ * handle app owns and drags its own window, so it is the party that needs to
+ * ask where the window may land).
  *
  * Desktop Linux (spec v10, #1699) carries the full service when the service is
  * built with its comp_multi weave engine (XRT_FEATURE_COMP_MULTI_WEAVE_LINUX):
@@ -57,6 +58,7 @@
 
 #include "util/u_trace_marker.h"
 #include "util/u_logging.h"
+#include "util/u_snap_grid.h"
 
 #include "oxr_api_funcs.h"
 #include "oxr_api_verify.h"
@@ -90,6 +92,13 @@
 #endif
 
 #ifdef OXR_HAVE_DXR_weave
+
+// Spec v11 (#1723): the grid points are filled in place by u_snap_grid.
+static_assert(sizeof(XrWeaveSnapGridPointDXR) == 2 && offsetof(XrWeaveSnapGridPointDXR, dy) == 1,
+              "XrWeaveSnapGridPointDXR must be the {int8 dx, int8 dy} pair u_snap_grid writes");
+static_assert(XR_WEAVE_SNAP_GRID_MAX_POINTS_DXR == U_SNAP_GRID_MAX_POINTS, "grid point bound mismatch");
+static_assert(XR_WEAVE_SNAP_GRID_MAX_AXIS_DXR == U_SNAP_GRID_MAX_AXIS, "grid axis bound mismatch");
+static_assert(XR_WEAVE_SNAP_GRID_NO_DELTA_DXR == U_SNAP_GRID_NO_DELTA, "grid sentinel mismatch");
 
 // Forward decls of the IPC-bridge wrappers (defined in ipc_client_compositor.c).
 struct xrt_compositor;
@@ -192,6 +201,12 @@ comp_ipc_client_compositor_weave_snap_window_rect(struct xrt_compositor *xc,
                                                   bool *out_snapped,
                                                   int32_t *out_snapped_x,
                                                   int32_t *out_snapped_y);
+
+xrt_result_t
+comp_ipc_client_compositor_weave_snap_window_grid(struct xrt_compositor *xc,
+                                                  const struct u_snap_grid *grid,
+                                                  int8_t *out_dxdy,
+                                                  bool *out_declined);
 
 /*!
  * Is @p kind a handle kind THIS platform can accept (spec v7, #1036)?
@@ -942,6 +957,96 @@ oxr_xrWeaveSnapWindowRectDXR(XrSession session,
 	snappedRect->offset.x = sx;
 	snappedRect->offset.y = sy;
 	snappedRect->extent = targetRect->extent;
+	return XR_SUCCESS;
+}
+
+#if defined(XRT_HAVE_VK_NATIVE_COMPOSITOR) && defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
+//! u_snap_grid_point_fn over the in-process vk_native DP's per-point snap.
+static bool
+grid_point_vk_native(void *userdata,
+                     int32_t origin_x,
+                     int32_t origin_y,
+                     int32_t target_x,
+                     int32_t target_y,
+                     int32_t *out_x,
+                     int32_t *out_y)
+{
+	return comp_vk_native_compositor_snap_window_rect((struct xrt_compositor *)userdata, origin_x, origin_y,
+	                                                  target_x, target_y, out_x, out_y);
+}
+#endif
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrWeaveSnapWindowGridDXR(XrSession session,
+                             const XrWeaveSnapGridInfoDXR *gridInfo,
+                             uint32_t pointCapacityInput,
+                             uint32_t *pointCountOutput,
+                             XrWeaveSnapGridPointDXR *points,
+                             XrBool32 *declined)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrWeaveSnapWindowGridDXR");
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_weave);
+	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, gridInfo, XR_TYPE_WEAVE_SNAP_GRID_INFO_DXR);
+	OXR_VERIFY_ARG_NOT_NULL(&log, pointCountOutput);
+
+	// Same shape the IPC wire and every service arm validate (u_snap_grid.h):
+	// bounded before anything is allocated or looped.
+	const struct u_snap_grid grid = {
+	    .origin_x = gridInfo->originRect.offset.x,
+	    .origin_y = gridInfo->originRect.offset.y,
+	    .first_x = gridInfo->firstTarget.x,
+	    .first_y = gridInfo->firstTarget.y,
+	    .step_x = gridInfo->step.width,
+	    .step_y = gridInfo->step.height,
+	    .count_x = gridInfo->countX,
+	    .count_y = gridInfo->countY,
+	};
+	const char *why = NULL;
+	if (!u_snap_grid_validate(&grid, &why)) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "(gridInfo) %s", why);
+	}
+	const uint32_t n = u_snap_grid_point_count(&grid);
+	*pointCountOutput = n;
+	if (pointCapacityInput == 0) {
+		return XR_SUCCESS; // two-call idiom: the count only, nothing evaluated
+	}
+	if (pointCapacityInput < n) {
+		return oxr_error(&log, XR_ERROR_SIZE_INSUFFICIENT, "(pointCapacityInput == %u) need %u",
+		                 pointCapacityInput, n);
+	}
+	OXR_VERIFY_ARG_NOT_NULL(&log, points);
+	// XrWeaveSnapGridPointDXR is exactly the {int8 dx, int8 dy} pair
+	// u_snap_grid writes, so the loop fills the caller's array directly.
+	int8_t *out = (int8_t *)points;
+	bool dec = false;
+
+	if (!session_is_ipc(sess)) {
+		// In-process: the same route the per-point call takes (#1588), looped
+		// here. Anywhere that call reports FEATURE_UNSUPPORTED, so does this.
+#if defined(XRT_HAVE_VK_NATIVE_COMPOSITOR) && defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
+		if (sess->is_vk_native_compositor) {
+			u_snap_grid_eval(&grid, grid_point_vk_native, &sess->xcn->base, out, &dec, NULL, NULL);
+			if (declined != NULL) {
+				*declined = dec ? XR_TRUE : XR_FALSE;
+			}
+			return XR_SUCCESS;
+		}
+#endif
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "xrWeaveSnapWindowGridDXR: no in-process snap route for this session's "
+		                 "compositor (the rest of the weave service is out-of-process only)");
+	}
+
+	xrt_result_t xret = comp_ipc_client_compositor_weave_snap_window_grid(&sess->xcn->base, &grid, out, &dec);
+	OXR_CHECK_XRET_MSG(&log, sess, xret, "xrWeaveSnapWindowGridDXR: grid snap failed (xrt_result=%d)", (int)xret);
+	if (declined != NULL) {
+		*declined = dec ? XR_TRUE : XR_FALSE;
+	}
 	return XR_SUCCESS;
 }
 

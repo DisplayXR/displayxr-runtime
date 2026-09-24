@@ -1060,6 +1060,15 @@ oxr_xrWeaveSnapWindowRectDXR(XrSession session,
                             const XrRect2Di *targetRect,
                             XrRect2Di *snappedRect);
 
+//! OpenXR API function @ep{xrWeaveSnapWindowGridDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrWeaveSnapWindowGridDXR(XrSession session,
+                             const XrWeaveSnapGridInfoDXR *gridInfo,
+                             uint32_t pointCapacityInput,
+                             uint32_t *pointCountOutput,
+                             XrWeaveSnapGridPointDXR *points,
+                             XrBool32 *declined);
+
 //! OpenXR API function @ep{xrWeaveSetScreenFlatRegionsDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrWeaveSetScreenFlatRegionsDXR(XrSession session, uint32_t rectCount, const XrRect2Di *screenRects);
