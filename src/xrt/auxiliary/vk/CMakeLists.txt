@@ -31,6 +31,12 @@ add_library(
 	vk_sync_objects.c
 	vk_time.c
 	)
+# #1699 R5 -- dma-buf + DRM-format-modifier + sync_file helpers for the
+# desktop-Linux weave engine. The body is gated on XRT_OS_LINUX_DESKTOP too.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+	target_sources(aux_vk PRIVATE vk_dmabuf.c vk_dmabuf.h)
+endif()
+
 target_link_libraries(aux_vk PUBLIC aux_os aux_util)
 target_link_libraries(aux_vk PUBLIC Vulkan::Vulkan)
 target_include_directories(aux_vk PUBLIC ${Vulkan_INCLUDE_DIR})
