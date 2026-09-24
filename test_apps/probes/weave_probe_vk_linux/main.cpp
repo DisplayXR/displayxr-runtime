@@ -64,8 +64,6 @@
 
 // The dma-buf transport calls, shared with weave/weave_present_vk_linux.
 #include "weave_dmabuf_vk.h"
-// The app-side table the Linux test apps install as their drag snap (#1723).
-#include "dxr_weave_snap_grid.h"
 
 #include <dirent.h>
 #include <time.h>
@@ -1001,54 +999,6 @@ run_dmabuf(Vk &vk,
 	return pass;
 }
 
-/*
- * A press's drag-lattice probe as displayxr-common v2.23.0 runs it
- * (dxr_wl_lattice::probe, integer scale s): the 129 x 129 grid at 3 logical px
- * around the drag start, and the +-2 logical-px search when the DP's answer is
- * not a whole logical pixel. Returns the table (logical displacements) and
- * whether the DP declined. Replicated here so the press can be timed headless,
- * through the same SnapWindowOriginFn the apps install.
- */
-typedef bool (*probe_snap_fn)(void *, int32_t, int32_t, int32_t, int32_t, int32_t *, int32_t *);
-static std::vector<std::pair<int32_t, int32_t>>
-press_probe(probe_snap_fn fn, void *ud, int32_t s, bool *declined)
-{
-	std::vector<std::pair<int32_t, int32_t>> out;
-	*declined = false;
-	for (int32_t gy = -192; gy <= 192 && !*declined; gy += 3) {
-		for (int32_t gx = -192; gx <= 192; gx += 3) {
-			int32_t sx = gx * s, sy = gy * s;
-			if (!fn(ud, 0, 0, gx * s, gy * s, &sx, &sy)) {
-				*declined = true;
-				break;
-			}
-			bool found = sx % s == 0 && sy % s == 0;
-			int32_t ax = sx / s, ay = sy / s;
-			const int32_t bx = (int32_t)lround((double)sx / s), by = (int32_t)lround((double)sy / s);
-			for (int32_t ring = 0; ring <= 2 && !found; ring++) {
-				for (int32_t j = -ring; j <= ring && !found; j++) {
-					for (int32_t i = -ring; i <= ring && !found; i++) {
-						if (abs(i) != ring && abs(j) != ring) {
-							continue;
-						}
-						int32_t rx = 0, ry = 0;
-						if (fn(ud, 0, 0, (bx + i) * s, (by + j) * s, &rx, &ry) && rx == (bx + i) * s &&
-						    ry == (by + j) * s) {
-							ax = bx + i;
-							ay = by + j;
-							found = true;
-						}
-					}
-				}
-			}
-			if (found) {
-				out.emplace_back(ax, ay);
-			}
-		}
-	}
-	return out;
-}
-
 int
 main(int argc, char **argv)
 {
@@ -1578,45 +1528,6 @@ main(int argc, char **argv)
 		r = pfn_grid(session, &gi, (uint32_t)pts.size(), &n, pts.data(), &declined);
 		ok = ok && XR_SUCCEEDED(r);
 		LOG("grid snap: oversize axis / zero step / short buffer rejected, next call fine -> %s", ok ? "OK" : "WRONG");
-		pass = pass && ok;
-	}
-
-	// ---- A title-bar press, timed (#1723): the drag-lattice probe through
-	// the provider the Linux apps install (DxrWeaveSnapGrid: one grid call per
-	// table), against the pre-#1723 provider (every point a service round
-	// trip). DXR_PROBE_LATTICE_SCALE=N probes at integer scale N (default 1).
-	{
-		int32_t scale = 1;
-		if (const char *e = getenv("DXR_PROBE_LATTICE_SCALE")) {
-			scale = atoi(e) >= 1 && atoi(e) <= 4 ? atoi(e) : 1;
-		}
-		auto ms_since = [](const struct timespec &a) {
-			struct timespec b;
-			clock_gettime(CLOCK_MONOTONIC, &b);
-			return (double)(b.tv_sec - a.tv_sec) * 1e3 + (double)(b.tv_nsec - a.tv_nsec) / 1e6;
-		};
-		static DxrWeaveSnapGrid per_point, tabled;
-		per_point.attach_functions(session, pfn_snap, nullptr, kWinW, kWinH);
-		tabled.attach_functions(session, pfn_snap, pfn_grid, kWinW, kWinH);
-
-		bool d0 = false, d1 = false;
-		struct timespec t0;
-		clock_gettime(CLOCK_MONOTONIC, &t0);
-		const auto want = press_probe(&DxrWeaveSnapGrid::callback, &per_point, scale, &d0);
-		const double per_point_ms = ms_since(t0);
-		clock_gettime(CLOCK_MONOTONIC, &t0);
-		const auto got = press_probe(&DxrWeaveSnapGrid::callback, &tabled, scale, &d1);
-		const double tabled_ms = ms_since(t0);
-		tabled.flush_log();
-		const DxrWeaveSnapGrid::Stats a = per_point.stats(), b = tabled.stats();
-		const uint64_t ipc = b.grid_ipc + b.per_point_ipc;
-		bool ok = want == got && d0 == d1 && ipc <= 3;
-		LOG("press at scale %d: per-point provider %.1f ms, %llu IPC calls; grid provider %.2f ms, %llu IPC "
-		    "call(s) (%llu grid + %llu per point, %.2f ms in the grid call); %zu table entries, identical=%d -> "
-		    "%s",
-		    scale, per_point_ms, (unsigned long long)a.per_point_ipc, tabled_ms, (unsigned long long)ipc,
-		    (unsigned long long)b.grid_ipc, (unsigned long long)b.per_point_ipc, b.grid_ms, got.size(),
-		    (int)(want == got), ok ? "OK" : "WRONG");
 		pass = pass && ok;
 	}
 

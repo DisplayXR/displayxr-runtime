@@ -155,13 +155,6 @@ endforeach()
 
 # For tests that require more than just aux_util, link those other libs down here.
 
-# #1723 -- XR_DXR_weave v11 grid snap: the runtime loop (aux_util) and the
-# app-side table in test_apps/common, which needs the OpenXR extension headers.
-target_include_directories(
-	tests_weave_snap_grid PRIVATE ${CMAKE_SOURCE_DIR}/test_apps/common
-				      ${CMAKE_SOURCE_DIR}/src/external/openxr_includes
-	)
-
 target_include_directories(tests_oxr_session_window_binding PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr)
 
 # #1594 -- compiles oxr_layer_space.c straight into the unit and injects the

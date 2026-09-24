@@ -50,7 +50,11 @@ FetchContent_Declare(
     # v2.23.0: the native-Wayland drag stays phase-snapped at ANY output scale
     # (150 %, 166.67 %, ...), not only 100/200 % (displayxr-common#61,
     # runtime#1709).
-    GIT_TAG v2.23.0
+    # v2.24.0: the Wayland drag move is sent at once and the first lattice
+    # table is built on the worker, from the new grid snap provider
+    # (set_snap_grid_provider + DxrWeaveSnap::grid_callback, XR_DXR_weave
+    # spec >= 11; displayxr-common#62/#63, runtime#1723).
+    GIT_TAG v2.24.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
