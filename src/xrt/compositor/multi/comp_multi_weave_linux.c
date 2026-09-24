@@ -98,6 +98,7 @@
 #include "util/u_logging.h"
 #include "util/u_handles.h"
 #include "util/u_debug.h"
+#include "util/u_wayland_geom.h"
 
 #include "vk/vk_helpers.h"
 #include "vk/vk_dmabuf.h"
@@ -114,6 +115,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -1208,6 +1210,226 @@ weave_want_dmabuf_output(struct vk_bundle *vk, struct multi_compositor *mc, bool
 	return mc->weave.out_kind_req == 2 && vk_dmabuf_supported(vk);
 }
 
+/*
+ *
+ * Off-panel 2D (#1654 on the service path).
+ *
+ */
+
+/*!
+ * DXR_SPAN_2D=0 (or the in-process name DXR_WAYLAND_SPAN_2D=0) turns the
+ * off-panel 2D off: the whole output is then woven, which shows the interlace
+ * on whatever monitor the rest of the window is on.
+ */
+static bool
+weave_span_2d_enabled(void)
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		const char *e = getenv("DXR_SPAN_2D");
+		if (e == NULL) {
+			e = getenv("DXR_WAYLAND_SPAN_2D");
+		}
+		enabled = (e != NULL && e[0] == '0') ? 0 : 1;
+	}
+	return enabled == 1;
+}
+
+/*!
+ * The part of the output that is NOT on the 3D panel, in OUTPUT pixels.
+ *
+ * The weave is only correct where the lens is. A present-owner window dragged
+ * partly (or wholly) onto an ordinary monitor is still one output, so its
+ * off-panel part would show the interlace as a double image; it gets flat 2D
+ * instead, exactly as the in-process Vulkan compositor does
+ * (vk_composite_offpanel_2d). Not a vendor concern: the DP weaves what it is
+ * given, and deciding where the panel is is the runtime's job.
+ *
+ * Platform-neutral on purpose: the window rect is the caller-published
+ * geometry (device px, desktop-absolute — Wayland or X11 alike), and the
+ * panel rect is the one the present origin is computed against
+ * (weave_feed_dp_geometry), so the bands and the weave phase never disagree.
+ *
+ * The bands come from u_wl_offpanel_bands (pure arithmetic, pinned by
+ * tests_aux_wayland_geom) in window pixels and are mapped to the output: 1:1
+ * for the batch / legacy layouts (the output IS the window client area, from
+ * its top-left), scaled by output/window for the v6 N-view layout (the output
+ * is one content view, the window at viewScale).
+ *
+ * @return the band count; 0 = entirely on the panel (the common case), or no
+ *         geometry, or turned off.
+ */
+static uint32_t
+weave_offpanel_bands(struct multi_compositor *mc, bool nview, struct u_wl_rect_px out[4], bool *out_whole)
+{
+	*out_whole = false;
+	if (!weave_span_2d_enabled() || !mc->weave.have_geometry || mc->weave.win_w == 0 || mc->weave.win_h == 0 ||
+	    mc->weave.out_w == 0 || mc->weave.out_h == 0) {
+		return 0;
+	}
+	const struct xrt_system_compositor_info *info = &mc->msc->base.info;
+
+	// Panel size: the DP's own answer when it has one (what vk_native uses),
+	// else the plug-in's display info.
+	uint32_t panel_w = 0, panel_h = 0;
+	{
+		int32_t ignored_left = 0, ignored_top = 0;
+		if (mc->weave.dp == NULL ||
+		    !xrt_display_processor_get_display_pixel_info(mc->weave.dp, &panel_w, &panel_h, &ignored_left,
+		                                                  &ignored_top) ||
+		    panel_w == 0 || panel_h == 0) {
+			panel_w = info->display_pixel_width;
+			panel_h = info->display_pixel_height;
+		}
+	}
+	// DXR_TEST_SPAN_2D_INSET=N (test hook, off by default): pretend the panel
+	// is N px narrower and shorter, so the band path is reachable without a
+	// second monitor. Diagnostics only — it paints 2D over real panel pixels.
+	{
+		static long inset = -1;
+		if (inset < 0) {
+			const char *e = getenv("DXR_TEST_SPAN_2D_INSET");
+			inset = e != NULL ? strtol(e, NULL, 10) : 0;
+			if (inset < 0) {
+				inset = 0;
+			}
+		}
+		if (inset > 0 && panel_w > (uint32_t)inset && panel_h > (uint32_t)inset) {
+			panel_w -= (uint32_t)inset;
+			panel_h -= (uint32_t)inset;
+		}
+	}
+
+	const int32_t ox = mc->weave.win_x - info->display_screen_left;
+	const int32_t oy = mc->weave.win_y - info->display_screen_top;
+	struct u_wl_rect_px win_bands[4];
+	const uint32_t win_count =
+	    u_wl_offpanel_bands(ox, oy, panel_w, panel_h, mc->weave.win_w, mc->weave.win_h, win_bands);
+
+	// Window px -> output px (pure arithmetic, pinned by tests_aux_wayland_geom).
+	bool whole = false;
+	const uint32_t n = u_wl_offpanel_bands_to_output(win_bands, win_count, mc->weave.win_w, mc->weave.win_h,
+	                                                 mc->weave.out_w, mc->weave.out_h, nview, out, &whole);
+
+	// Log on a change of state only (band count, or "entirely off"), never per
+	// frame and not per drag step.
+	const uint32_t state = n | (whole ? 0x100u : 0u);
+	if (state != mc->weave.last_offpanel_band_count) {
+		mc->weave.last_offpanel_band_count = state;
+		U_LOG_W(
+		    "weave(#1699) SPAN_2D: window at (%d, %d) %ux%u panel-relative on a %ux%u panel — %u off-panel "
+		    "band(s) painted flat 2D%s",
+		    ox, oy, mc->weave.win_w, mc->weave.win_h, panel_w, panel_h, n,
+		    whole ? " (entirely off the panel: weave skipped)" : "");
+	}
+	*out_whole = whole;
+	return n;
+}
+
+//! One-time init of the premul-over pipeline (shared by the overlay and the
+//! off-panel bands) and ONE descriptor-pool reset per frame (the pool must not
+//! be reset between two draws recorded into the same frame).
+static bool
+weave_blend_begin(struct vk_bundle *vk, struct multi_compositor *mc, bool *begun)
+{
+	if (!mc->weave.overlay_blend_initialized) {
+		mc->weave.overlay_blend_initialized =
+		    vk_local2d_composite_init(&mc->weave.overlay_blend, vk, WEAVE_VK_FORMAT, WEAVE_VK_FORMAT);
+		if (mc->weave.overlay_blend_initialized) {
+			U_LOG_W("weave(#1699): premul-over blend pipeline ready");
+		} else {
+			U_LOG_E("weave(#1699): premul-over blend init failed");
+			return false;
+		}
+	}
+	if (!*begun) {
+		vk_local2d_composite_begin_frame(&mc->weave.overlay_blend, vk);
+		*begun = true;
+	}
+	return true;
+}
+
+/*!
+ * Paint each off-panel band of the output with flat 2D: one view of the
+ * pre-weave atlas the DP consumed — the centre tile, which for a stereo pair
+ * is the left eye. That tile is output-sized and in register with the window
+ * on every layout (batch: the SBS scratch's left tile, i.e. each rect's left
+ * half unsqueezed at the rect's own position; v6: one content view), so a band
+ * samples it 1:1 at its own output coordinates.
+ *
+ * The band is cleared to transparent first and the tile drawn premul-over onto
+ * that, i.e. a copy — outside the rects the scratch is transparent, exactly as
+ * the weave's output is there. Output in COLOR_ATTACHMENT_OPTIMAL on entry and
+ * exit; @p src_view in SHADER_READ_ONLY_OPTIMAL.
+ */
+static void
+weave_paint_offpanel(struct vk_bundle *vk,
+                     struct multi_compositor *mc,
+                     VkCommandBuffer cmd,
+                     const struct u_wl_rect_px *bands,
+                     uint32_t band_count,
+                     VkImageView src_view,
+                     uint32_t src_w,
+                     uint32_t src_h,
+                     uint32_t tile_x,
+                     uint32_t tile_y,
+                     bool *blend_begun)
+{
+	if (band_count == 0 || src_view == VK_NULL_HANDLE || src_w == 0 || src_h == 0 ||
+	    !weave_blend_begin(vk, mc, blend_begun)) {
+		return;
+	}
+
+	// Order after the weave's writes (or the UNDEFINED transition when the
+	// weave was skipped).
+	weave_layout_barrier(vk, cmd, mc->weave.out_image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	                     VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+
+	// Clear the bands inside a render pass: vkCmdClearAttachments needs no
+	// transfer usage or format feature on the (possibly DRM-modifier) output.
+	VkRenderPassBeginInfo rp_bi = {
+	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+	    .renderPass = mc->weave.render_pass,
+	    .framebuffer = mc->weave.out_fb,
+	    .renderArea = {{0, 0}, {mc->weave.out_w, mc->weave.out_h}},
+	};
+	vk->vkCmdBeginRenderPass(cmd, &rp_bi, VK_SUBPASS_CONTENTS_INLINE);
+	VkClearAttachment clear = {
+	    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+	    .colorAttachment = 0,
+	    .clearValue = {.color = {.float32 = {0.0f, 0.0f, 0.0f, 0.0f}}},
+	};
+	VkClearRect clear_rects[4];
+	for (uint32_t i = 0; i < band_count; i++) {
+		clear_rects[i] = (VkClearRect){
+		    .rect = {{bands[i].x, bands[i].y}, {(uint32_t)bands[i].w, (uint32_t)bands[i].h}},
+		    .baseArrayLayer = 0,
+		    .layerCount = 1,
+		};
+	}
+	vk->vkCmdClearAttachments(cmd, 1, &clear, band_count, clear_rects);
+	vk->vkCmdEndRenderPass(cmd);
+
+	weave_layout_barrier(vk, cmd, mc->weave.out_image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	                     VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+
+	for (uint32_t i = 0; i < band_count; i++) {
+		const struct u_wl_rect_px r = bands[i];
+		vk_local2d_composite_flatten_draw(&mc->weave.overlay_blend, vk, cmd, mc->weave.out_fb, mc->weave.out_w,
+		                                  mc->weave.out_h, src_view, r.x, r.y, (uint32_t)r.w, (uint32_t)r.h,
+		                                  (float)(tile_x + (uint32_t)r.x) / (float)src_w,
+		                                  (float)(tile_y + (uint32_t)r.y) / (float)src_h,
+		                                  (float)r.w / (float)src_w, (float)r.h / (float)src_h,
+		                                  /*unpremultiplied*/ false);
+	}
+}
+
 /*!
  * Record, submit and complete ONE weave of @p in (+ @p ov) into the output —
  * shared by the stage-A plain-handle submit and the stage-B dma-buf submit,
@@ -1360,6 +1582,7 @@ weave_run_frame(struct vk_bundle *vk,
 	uint32_t grid_cols = 2, grid_rows = 1;
 	VkImageLayout in_layout = VK_IMAGE_LAYOUT_GENERAL; // where the input sits after the reads
 	VkFormat dp_src_format = WEAVE_VK_FORMAT;
+	uint32_t dp_src_w = mc->weave.sbs_w, dp_src_h = mc->weave.sbs_h;
 
 	if (nview) {
 		if (v6_zero_copy) {
@@ -1372,6 +1595,8 @@ weave_run_frame(struct vk_bundle *vk,
 			dp_src_image = in->image;
 			dp_src_view = in->view;
 			dp_src_format = in->format; // a stage-B RGBA input is sampled as RGBA
+			dp_src_w = in->w;
+			dp_src_h = in->h;
 		} else {
 			// Crop the top-left packed region: ONE box copy.
 			weave_layout_barrier(vk, cmd, in->image, VK_IMAGE_LAYOUT_GENERAL,
@@ -1416,6 +1641,8 @@ weave_run_frame(struct vk_bundle *vk,
 			                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
 			dp_src_image = mc->weave.crop_image;
 			dp_src_view = mc->weave.crop_view;
+			dp_src_w = mc->weave.crop_w;
+			dp_src_h = mc->weave.crop_h;
 		}
 		atlas_view_w = cvw;
 		atlas_view_h = cvh;
@@ -1511,13 +1738,21 @@ weave_run_frame(struct vk_bundle *vk,
 
 	weave_feed_dp_geometry(mc);
 
+	// Off-panel 2D (#1654): the bands of the output that are not on the panel.
+	// A window entirely off the panel is one band covering the whole output,
+	// and then the weave is skipped — nothing of it would be seen.
+	struct u_wl_rect_px offpanel[4];
+	bool skip_weave = false;
+	const uint32_t offpanel_count = weave_offpanel_bands(mc, nview, offpanel, &skip_weave);
+	bool blend_begun = false;
+
 	// SELF-SUBMITTING DP ORDERING (Android #1036's one-frame trail fix): a
 	// DP that submits its own batch during process_atlas would otherwise
 	// execute BEFORE this frame's blits (still unsubmitted in cmd). Flush
 	// the pre-weave batch first; same-queue submission order then puts the
 	// DP's batch after it. The final submit + fence below retire both.
 	const bool self_submits = xrt_display_processor_is_self_submitting(mc->weave.dp);
-	if (self_submits && debug_get_bool_option_dxr_linux_weave_split()) {
+	if (self_submits && !skip_weave && debug_get_bool_option_dxr_linux_weave_split()) {
 		if (vk->vkEndCommandBuffer(cmd) != VK_SUCCESS) {
 			U_LOG_E("weave(#1699): vkEndCommandBuffer (pre-weave) failed");
 			return false;
@@ -1563,17 +1798,33 @@ weave_run_frame(struct vk_bundle *vk,
 	// the window. v6: the caller's grid at content_view dims. A
 	// self-submitting DP gets VK_NULL_HANDLE (xrt_display_processor
 	// contract; it records into its own buffer).
-	xrt_display_processor_set_target_color_view(mc->weave.dp, mc->weave.out_view);
-	xrt_display_processor_process_atlas(mc->weave.dp, self_submits ? VK_NULL_HANDLE : cmd, //
-	                                    (VkImage_XDP)dp_src_image, dp_src_view,            //
-	                                    atlas_view_w, atlas_view_h,                        //
-	                                    grid_cols, grid_rows,                              //
-	                                    (VkFormat_XDP)dp_src_format,                       //
-	                                    mc->weave.out_fb,                                  //
-	                                    (VkImage_XDP)mc->weave.out_image,                  //
-	                                    mc->weave.out_w, mc->weave.out_h,                  //
-	                                    (VkFormat_XDP)WEAVE_VK_FORMAT,                     //
-	                                    0, 0, 0, 0);
+	if (!skip_weave) {
+		xrt_display_processor_set_target_color_view(mc->weave.dp, mc->weave.out_view);
+		xrt_display_processor_process_atlas(mc->weave.dp, self_submits ? VK_NULL_HANDLE : cmd, //
+		                                    (VkImage_XDP)dp_src_image, dp_src_view,            //
+		                                    atlas_view_w, atlas_view_h,                        //
+		                                    grid_cols, grid_rows,                              //
+		                                    (VkFormat_XDP)dp_src_format,                       //
+		                                    mc->weave.out_fb,                                  //
+		                                    (VkImage_XDP)mc->weave.out_image,                  //
+		                                    mc->weave.out_w, mc->weave.out_h,                  //
+		                                    (VkFormat_XDP)WEAVE_VK_FORMAT,                     //
+		                                    0, 0, 0, 0);
+	}
+
+	// Off-panel bands -> flat 2D, from the centre tile of the atlas the DP
+	// consumed (for a stereo pair, the left eye). After the weave and BEFORE
+	// the v4 overlay, as in-process (#1654): 2D overlays are composited over
+	// the bands too, so they stay readable on both sides of the seam. Here,
+	// while the input is still in the layout the weave sampled it in (the
+	// zero-copy v6 source IS the input).
+	if (offpanel_count > 0) {
+		const uint32_t tiles = grid_cols * grid_rows;
+		const uint32_t view_index = tiles > 0 ? (tiles - 1) / 2 : 0;
+		weave_paint_offpanel(vk, mc, cmd, offpanel, offpanel_count, dp_src_view, dp_src_w, dp_src_h,
+		                     (view_index % grid_cols) * atlas_view_w, (view_index / grid_cols) * atlas_view_h,
+		                     &blend_begun);
+	}
 
 	// Input back to GENERAL (if a v6 path moved it) and released to the
 	// producer's family, so its next writes land in a defined state.
@@ -1587,18 +1838,7 @@ weave_run_frame(struct vk_bundle *vk,
 	// premultiplied 2D atlas OVER the woven output — not woven, drawn after
 	// process_atlas onto the same attachment.
 	if (ov != NULL) {
-		bool blend_ready = mc->weave.overlay_blend_initialized;
-		if (!blend_ready) {
-			blend_ready =
-			    vk_local2d_composite_init(&mc->weave.overlay_blend, vk, WEAVE_VK_FORMAT, WEAVE_VK_FORMAT);
-			mc->weave.overlay_blend_initialized = blend_ready;
-			if (blend_ready) {
-				U_LOG_W("weave(#1699) v4: premul-over blend pipeline ready");
-			} else {
-				U_LOG_E("weave(#1699) v4: premul-over blend init failed");
-			}
-		}
-		if (blend_ready) {
+		if (weave_blend_begin(vk, mc, &blend_begun)) {
 			weave_acquire_slot(vk, cmd, ov, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 			                   VK_ACCESS_SHADER_READ_BIT);
 			weave_layout_barrier(vk, cmd, ov->image, VK_IMAGE_LAYOUT_GENERAL,
@@ -1614,7 +1854,6 @@ weave_run_frame(struct vk_bundle *vk,
 			                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 			                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
 
-			vk_local2d_composite_begin_frame(&mc->weave.overlay_blend, vk);
 			vk_local2d_composite_flatten_draw(&mc->weave.overlay_blend, vk, cmd, mc->weave.out_fb,
 			                                  mc->weave.out_w, mc->weave.out_h,
 			                                  ov->view, //

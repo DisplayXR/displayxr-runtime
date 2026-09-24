@@ -863,6 +863,10 @@ struct multi_compositor
 		int32_t win_display_id;
 		bool geometry_dirty; //!< Log the change once, not per frame.
 		bool metrics_logged; //!< One-shot log of the first metrics report (#1116).
+		//! Off-panel state of the last submit (#1654 on the service path): the
+		//! band count, | 0x100 when the window is entirely off the panel. The
+		//! WARN fires on a change only.
+		uint32_t last_offpanel_band_count;
 		//! @}
 
 		//! @name Input + overlay import caches (keyed by buffer id / fd inode)
