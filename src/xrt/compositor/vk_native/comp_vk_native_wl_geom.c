@@ -639,6 +639,10 @@ comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g, struct 
 
 	out_rect->frame_logical_x = best->logical_x;
 	out_rect->frame_logical_y = best->logical_y;
+	out_rect->content_logical_x = content_logical.logical_x;
+	out_rect->content_logical_y = content_logical.logical_y;
+	out_rect->mon_logical_x = best->mon_logical_x;
+	out_rect->mon_logical_y = best->mon_logical_y;
 	out_rect->moving = best->moving;
 	out_rect->have_moving = best->have_moving;
 	out_rect->lattice_drop = best->lattice_drop;

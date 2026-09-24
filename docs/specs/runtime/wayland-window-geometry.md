@@ -503,21 +503,23 @@ older than version 3 omits it, and the runtime then settles on stillness alone
 
 1. The window's content origin comes from the geometry payload as usual, in
    device pixels relative to the panel.
-2. **Reachability.** Mutter positions windows at integer LOGICAL pixels, so on
-   a monitor at scale `q` only every `q`-th device pixel can be reached. That
-   is a lattice only when `q` is an integer — `u_wl_placement_quantum()` — and
-   a fractionally-scaled output (1.6667) has none, so the runtime refuses to
-   snap rather than name a position that does not exist. `DXR_WL_SNAP_QUANTUM`
-   forces one for diagnostics; it is not a fix.
-3. **The phase-correct position** is searched on that lattice with
-   `vk_snap_search_lattice()`, the same function the X11 drag uses: the display
+2. **Reachability, at any scale.** Mutter positions windows at integer LOGICAL
+   pixels and draws each at `roundf((content - monitor) * scale)` device px
+   (mutter 50, `meta-window-actor-wayland.c`, `surface_container_apply_transform`),
+   which is `u_wl_logical_to_px()`. So every logical move lands on a KNOWN
+   device position: every q-th pixel at an integer scale q, an irregular but
+   equally known set at 1.25, 1.5 or 1.6667. The search runs over logical
+   moves through that mapping; it used to refuse any non-integer scale.
+3. **The phase-correct position** is searched over the logical moves nearest
+   the display processor's own answer (49 within 3 logical px, in the same ring
+   order the X11 drag's `vk_snap_search_lattice()` uses): the display
    processor stays the only owner of the lens math (ADR-019) — the runtime
    never computes a phase, it only chooses which positions to offer
    `snap_window_rect`. The DP is given the pre-move origin as the phase
    reference and the drop position as the reachability anchor; on X11 those
    coincide, after a compositor-run drag they do not.
 4. If the answer differs from the drop, the runtime calls `MoveWindow` with the
-   frame origin plus the (exact, whole-quantum) delta, and logs one line either
+   frame origin plus the chosen logical move, and logs one line either
    way. At most two attempts per settle, so a compositor that constrains the
    move cannot make it oscillate.
 
@@ -613,4 +615,32 @@ relies on that signal staying synchronous inside `move_resize`.
   drop ping-pong between two phase-correct neighbours.
 - **`DragLatticeDone`** carries one drag's statistics, so the app logs a
   one-line summary in its own log.
+
+### 8.6 Version 8 — any output scale
+
+The drag lattice used to be built only at an integer scale ("every q-th device
+pixel"). At 150 % the panel dragged unconstrained, and stuttered. Now:
+
+- **The table is built over LOGICAL displacements.** Each displacement is
+  mapped to the device displacement Mutter actually produces,
+  `roundf((surface - monitor) * scale)` (§7.2). The display processor's snap
+  is asked about that device displacement, and a logical entry is kept when
+  the device position it lands on is phase-correct. At an integer scale this
+  is identical to the old build, and a unit test in displayxr-common pins
+  that.
+- **A table is valid only for its start.** At a fractional scale the device
+  displacement of a logical move depends on where the move starts (the
+  rounding): at 1.5, one logical px from an even position is 2 device px, and
+  from an odd one it is 1. So the app reads its start (frame, buffer, monitor
+  and scale) from `GetWindows` and hands it back with the table:
+  `SetDragLatticeAt(pid, startX, startY, …)`, capability bit 1. A table built
+  mid-drag, for a position the window has since left, stays correct.
+- **The trigger is the panel, not the scale.** A table is built at the press
+  when the window is on the 3D panel's output, and mid-drag when it reaches
+  it: on a `wl_surface.enter`, and re-checked every ~1/3 s until the window's
+  monitor is the panel.
+- The ask-ahead, the search window and the correction were already in logical
+  pixels and are unchanged.
+
+An app against a v7 extension keeps the integer-scale-only behaviour.
 
