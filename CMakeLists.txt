@@ -318,6 +318,15 @@ option_with_deps(XRT_FEATURE_DEBUG_GUI "Enable debug window to be used" DEPENDS 
 # browser) without two mutually-exclusive installs.
 option_with_deps(XRT_FEATURE_HYBRID_MODE "Enable hybrid in-process/IPC mode (native compositor for normal apps, IPC for sandboxed/present-owner apps)" DEFAULT OFF DEPENDS "WIN32 OR APPLE OR ANDROID" XRT_MODULE_IPC XRT_FEATURE_OPENXR "XRT_HAVE_D3D11 OR APPLE OR ANDROID")
 
+# Desktop-Linux XR_DXR_weave engine on the comp_multi service path (#1699, piece
+# R2): the comp_multi_weave_linux.c counterpart of comp_multi_weave_macos.c /
+# comp_multi_weave_android.c. DEFAULT OFF because that engine does not exist yet
+# — the IPC server's weave fences already key on it (via COMP_MULTI_HAVE_WEAVE in
+# comp_multi_interface.h), so turning it on today fails to link with exactly the
+# comp_multi_weave_* symbols R2 must provide. R2 flips the default to ON (or
+# drops the option) in the same change that adds the source file.
+option_with_deps(XRT_FEATURE_COMP_MULTI_WEAVE_LINUX "Build the desktop-Linux XR_DXR_weave engine on comp_multi (#1699; not implemented yet)" DEFAULT OFF DEPENDS "XRT_HAVE_LINUX AND NOT ANDROID" XRT_HAVE_VULKAN XRT_MODULE_COMPOSITOR)
+
 if (XRT_FEATURE_SERVICE)
 	# Disable the client debug gui by default for out-of-proc -
 	# too many clients have problems with depending on SDL/GStreamer/etc and we rarely use it in this configuration
@@ -727,6 +736,7 @@ message(STATUS "#    FEATURE_RENDERDOC:                             ${XRT_FEATUR
 message(STATUS "#    FEATURE_SERVICE:                               ${XRT_FEATURE_SERVICE}")
 message(STATUS "#    FEATURE_SERVICE_SYSTEMD:                       ${XRT_FEATURE_SERVICE_SYSTEMD}")
 message(STATUS "#    FEATURE_HYBRID_MODE:                           ${XRT_FEATURE_HYBRID_MODE}")
+message(STATUS "#    FEATURE_COMP_MULTI_WEAVE_LINUX:                ${XRT_FEATURE_COMP_MULTI_WEAVE_LINUX}")
 message(STATUS "#    FEATURE_SSE2:                                  ${XRT_FEATURE_SSE2}")
 message(STATUS "#    FEATURE_TRACING:                               ${XRT_FEATURE_TRACING}")
 message(STATUS "#    FEATURE_WINDOW_PEEK:                           ${XRT_FEATURE_WINDOW_PEEK}")

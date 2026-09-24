@@ -1083,13 +1083,15 @@ multi_compositor_init_session_render(struct multi_compositor *mc);
 bool
 multi_system_request_display_mode_any(struct xrt_system_compositor *xsysc, bool enable_3d);
 
-#if defined(XRT_OS_MACOS) || defined(XRT_OS_ANDROID)
+#ifdef COMP_MULTI_HAVE_WEAVE
 /*!
  * @name XR_DXR_weave on the comp_multi service path (macOS #759, Android #1036)
  * Present-owner weave entry points, called from ipc_server_handler.c exactly
  * where the Windows build calls comp_d3d11_service_weave_* (#625). One engine
  * shape, two backends: comp_multi_weave_macos.c (IOSurface) and
- * comp_multi_weave_android.c (AHardwareBuffer). Both are synchronous — the
+ * comp_multi_weave_android.c (AHardwareBuffer); desktop Linux's
+ * comp_multi_weave_linux.c (#1699) joins them behind the same gate
+ * (COMP_MULTI_HAVE_WEAVE, comp_multi_interface.h). Both are synchronous — the
  * submit returns after the weave completed on the GPU, so there is no fence.
  * @{
  */
@@ -1183,7 +1185,7 @@ comp_multi_weave_snap_window_rect(struct xrt_compositor *xc,
 void
 comp_multi_weave_fini(struct multi_compositor *mc);
 /*! @} */
-#endif // XRT_OS_MACOS || XRT_OS_ANDROID
+#endif // COMP_MULTI_HAVE_WEAVE
 
 /*!
  * Check if a multi_compositor has per-session rendering enabled.

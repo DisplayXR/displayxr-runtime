@@ -45,22 +45,19 @@
 #include "d3d11_service/comp_d3d11_service.h"
 #endif
 
-#if defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS)
+// COMP_MULTI_HAVE_WEAVE: the one gate for "this build has a comp_multi
+// XR_DXR_weave engine" (macOS, Android, desktop Linux behind
+// XRT_FEATURE_COMP_MULTI_WEAVE_LINUX — #1699). Header-only, safe everywhere.
+#include "multi/comp_multi_interface.h"
+
+#if defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS) || defined(COMP_MULTI_HAVE_WEAVE)
 // Out-of-process non-D3D11 service path (Android #510, macOS #48): the per-client
 // compositor is a multi_compositor; the server pulls its live present-target
 // extent for the client's Kooima and runs the server-side Kooima for the
-// null+comp_multi path (no D3D11 service).
+// null+comp_multi path (no D3D11 service). The comp_multi weave engine's entry
+// points (comp_multi_weave_*) are declared here too.
 #include "multi/comp_multi_private.h"
 #include "xrt/xrt_display_metrics.h" // struct xrt_eye_positions (DP-tracked eyes; Leia M2)
-#endif
-
-#if defined(XRT_HAVE_VK_NATIVE_COMPOSITOR) && defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
-// Desktop Linux (#1588): the weave snap is a pure DP query, and on this
-// platform the DP lives on the native Vulkan compositor behind the multi
-// system compositor — so the handler walks multi_compositor -> msc -> xcn and
-// calls it directly. No weave service, nothing to borrow from comp_multi.
-#include "multi/comp_multi_private.h"
-#include "vk_native/comp_vk_native_compositor.h"
 #endif
 
 #if defined(XRT_OS_MACOS)
@@ -6212,7 +6209,7 @@ ipc_handle_weave_bind_window(volatile struct ipc_client_state *ics, uint64_t hwn
 		return XRT_ERROR_WEAVE_REFUSED;
 	}
 	return XRT_SUCCESS;
-#elif defined(XRT_OS_MACOS) || defined(XRT_OS_ANDROID)
+#elif defined(COMP_MULTI_HAVE_WEAVE)
 	if (!comp_multi_weave_bind_window(ics->xc, hwnd)) {
 		return XRT_ERROR_WEAVE_REFUSED;
 	}
@@ -6249,7 +6246,7 @@ ipc_handle_weave_set_window_geometry(volatile struct ipc_client_state *ics,
 		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
 	}
 
-#if defined(XRT_OS_MACOS) || defined(XRT_OS_ANDROID)
+#if defined(COMP_MULTI_HAVE_WEAVE)
 	// Engine refusal, not a dead pipe (browser#103).
 	if (!comp_multi_weave_set_window_geometry(ics->xc, origin_x, origin_y, client_w, client_h, display_id)) {
 		return XRT_ERROR_WEAVE_REFUSED;
@@ -6320,6 +6317,30 @@ ipc_handle_weave_set_screen_flat_regions(volatile struct ipc_client_state *ics,
 #endif
 }
 
+/*!
+ * Release graphics-buffer handles a weave_submit received but is not handing to
+ * a weave engine. The IPC receive installs them in this process and nobody else
+ * owns them, so every return path that does not pass them on must drop them.
+ *
+ * Only POSIX handle kinds (fd, AHardwareBuffer, IOSurfaceRef) are released here;
+ * u_graphics_buffer_unref skips invalid slots (the fd receive marks unfilled
+ * slots -1). Win32 handles carry a DXGI-vs-NT low-bit tag and are the D3D11
+ * service's business, so this is a no-op there.
+ */
+static void
+weave_submit_release_handles(const xrt_graphics_buffer_handle_t *handles, uint32_t handle_count)
+{
+#if !defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
+	for (uint32_t i = 0; i < handle_count; i++) {
+		xrt_graphics_buffer_handle_t h = handles[i];
+		u_graphics_buffer_unref(&h);
+	}
+#else
+	(void)handles;
+	(void)handle_count;
+#endif
+}
+
 xrt_result_t
 ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
                         const struct ipc_arg_weave_submit *args,
@@ -6336,6 +6357,7 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	*out_have_output = false;
 	xrt_result_t auth = require_present_owner(ics, "weave_submit");
 	if (auth != XRT_SUCCESS) {
+		weave_submit_release_handles(handles, handle_count);
 		return auth;
 	}
 	*out_width = 0;
@@ -6346,6 +6368,7 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	if (ics->xc == NULL) {
 		// Client state, not transport — same code the bind/geometry/flat
 		// siblings already return for this (browser#103).
+		weave_submit_release_handles(handles, handle_count);
 		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
 	}
 	if (handle_count < 1) {
@@ -6454,9 +6477,10 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	*out_fence_value = fv;
 	*out_eyes = eyes;
 	return XRT_SUCCESS;
-#elif defined(XRT_OS_MACOS) || defined(XRT_OS_ANDROID)
+#elif defined(COMP_MULTI_HAVE_WEAVE)
 	// handles[0] is the retained IOSurfaceRef (macOS) / acquired AHardwareBuffer
-	// (Android) the IPC receive looked up; the
+	// (Android) / received dma-buf fd (desktop Linux, #1699) the IPC receive
+	// looked up; the
 	// weave engine takes ownership (adopts it into its import cache or
 	// releases it). No DXGI low-bit tag exists on POSIX handles.
 	// v4 overlay atlas (browser#18): handles[1] is a second retained IOSurfaceRef
@@ -6549,8 +6573,12 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	*out_eyes = eyes;
 	return XRT_SUCCESS;
 #else
+	// No weave engine in this build (e.g. desktop Linux until #1699 R2). The
+	// handles are still ours: on an fd platform they are live descriptors the
+	// kernel installed in this process, so refusing without closing them leaks
+	// one per submit — a present-owner retrying every frame exhausts the fd table.
 	(void)args;
-	(void)handles;
+	weave_submit_release_handles(handles, handle_count);
 	return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 #endif
 }
@@ -6589,7 +6617,7 @@ ipc_handle_weave_get_output(volatile struct ipc_client_state *ics,
 		*out_width = w;
 		*out_height = ht;
 	}
-#elif defined(XRT_OS_MACOS) || defined(XRT_OS_ANDROID)
+#elif defined(COMP_MULTI_HAVE_WEAVE)
 	xrt_graphics_buffer_handle_t h = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
 	uint32_t w = 0, ht = 0;
 	if (comp_multi_weave_export_output(ics->xc, &h, &w, &ht)) {
@@ -6673,40 +6701,19 @@ ipc_handle_weave_snap_window_rect(volatile struct ipc_client_state *ics,
 		*out_snapped_y = sy;
 	}
 	return XRT_SUCCESS;
-#elif defined(XRT_OS_MACOS) || defined(XRT_OS_ANDROID)
-	// Identity today (sim_display has no interlace lattice); routes to a
-	// future VK DP snap slot in one place (#759).
+#elif defined(COMP_MULTI_HAVE_WEAVE)
+	// The weave engine owns the service-side display processor, so the snap
+	// routes through it: its xrt_display_processor_vk's snap_window_rect slot
+	// (the same slot the in-process vk_native compositor uses). Identity today
+	// on macOS / Android (sim_display has no interlace lattice, #759); on
+	// desktop Linux this is where the real snap lands once the engine exists
+	// (#1699 R2). Until then the Linux service has no DP to ask and takes the
+	// identity #else below.
 	int32_t sx = target_x, sy = target_y;
 	if (comp_multi_weave_snap_window_rect(ics->xc, origin_x, origin_y, target_x, target_y, &sx, &sy)) {
 		*out_snapped = true;
 		*out_snapped_x = sx;
 		*out_snapped_y = sy;
-	}
-	return XRT_SUCCESS;
-#elif defined(XRT_HAVE_VK_NATIVE_COMPOSITOR) && defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
-	/*
-	 * Desktop Linux (#1588). There is no weave service here and no
-	 * comp_multi_weave_* leg to borrow — but the snap does not need one: it
-	 * is a pure query on the display processor, and on Linux the DP lives on
-	 * the native Vulkan compositor behind the multi system compositor. Reach
-	 * it directly rather than growing a weave engine that has nothing to do.
-	 *
-	 * The client-side xc is a multi_compositor; msc->xcn is the one native
-	 * compositor that owns the panel and therefore the phase, which is the
-	 * right thing to snap against no matter which client asked.
-	 */
-	{
-		struct multi_compositor *mc = multi_compositor(ics->xc);
-		if (mc == NULL || mc->msc == NULL || mc->msc->xcn == NULL) {
-			return XRT_SUCCESS; // identity, already defaulted above
-		}
-		int32_t sx = target_x, sy = target_y;
-		if (comp_vk_native_compositor_snap_window_rect(&mc->msc->xcn->base, origin_x, origin_y, target_x,
-		                                               target_y, &sx, &sy)) {
-			*out_snapped = true;
-			*out_snapped_x = sx;
-			*out_snapped_y = sy;
-		}
 	}
 	return XRT_SUCCESS;
 #else
