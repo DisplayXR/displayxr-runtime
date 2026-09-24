@@ -26954,11 +26954,18 @@ comp_d3d11_service_get_display_dimensions(struct xrt_system_compositor *xsysc,
 	render_mutex_fair_lock render_lock(sys);
 
 	// Try to get display dimensions from display processor.
-	// In workspace mode, use multi-comp's DP; in normal mode, use active compositor's DP.
+	// Whenever the panel DP owns the clients — workspace mode OR the always-on
+	// pipeline (#964), same gate as resolve_eye_display_processor — ask the
+	// multi-comp's panel DP; only legacy standalone has a per-client DP to
+	// fall back to. The old `workspace_mode`-only gate never asked the live
+	// panel DP in the default always-on mode (per-client render.display_processor
+	// is always NULL there), so a service that started before the panel was
+	// identified fell through to the 0-valued cache and FAILED every client.
 	// #1002: a lost device means no DP call at all -- fall through to the
 	// cached xrt_system_compositor_info values below, which are still true.
 	struct xrt_display_processor_d3d11 *dp = nullptr;
-	if (!service_device_removed(sys) && sys->workspace_mode && sys->multi_comp != nullptr) {
+	if (!service_device_removed(sys) && (sys->workspace_mode || pipeline_always_on(sys)) &&
+	    sys->multi_comp != nullptr) {
 		dp = sys->multi_comp->display_processor;
 	}
 	if (dp == nullptr) {
@@ -27004,13 +27011,15 @@ comp_d3d11_service_get_window_metrics(struct xrt_system_compositor *xsysc,
 	// UAF as get_predicted_eye_positions. render_mutex is recursive.
 	render_mutex_fair_lock render_lock(sys);
 
-	// In workspace mode, use multi-comp's window and DP.
-	// In normal mode, use the active compositor's.
+	// When the panel DP owns the clients (workspace mode or the always-on
+	// pipeline, #964 — same gate as resolve_eye_display_processor), use the
+	// multi-comp's window and DP; only legacy standalone has a per-client one.
 	struct xrt_display_processor_d3d11 *dp = nullptr;
 	HWND metrics_hwnd = nullptr;
 
-	if (!service_device_removed(sys) && sys->workspace_mode && sys->multi_comp != nullptr && // #1002
-	    sys->multi_comp->display_processor != nullptr && sys->multi_comp->hwnd != nullptr) {
+	if (!service_device_removed(sys) && (sys->workspace_mode || pipeline_always_on(sys)) && // #1002
+	    sys->multi_comp != nullptr && sys->multi_comp->display_processor != nullptr &&
+	    sys->multi_comp->hwnd != nullptr) {
 		dp = sys->multi_comp->display_processor;
 		metrics_hwnd = sys->multi_comp->hwnd;
 	} else {
