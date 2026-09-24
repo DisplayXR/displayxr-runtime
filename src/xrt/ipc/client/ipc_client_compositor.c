@@ -24,9 +24,11 @@
 #include "util/u_handles.h"
 #include "util/u_trace_marker.h"
 #include "util/u_limited_unique_id.h"
+#include "util/u_snap_grid.h"
 
 #include "shared/ipc_protocol.h"
 #include "client/ipc_client.h"
+#include "client/ipc_client_connection.h"
 #include "ipc_client_generated.h"
 
 // Phase 2.D: the workspace input-event bridge translates wire events into
@@ -1018,6 +1020,73 @@ comp_ipc_client_compositor_weave_snap_window_rect(struct xrt_compositor *xc,
 	return XRT_SUCCESS;
 }
 
+
+/*!
+ * XR_DXR_weave v11 (#1723): the whole grid in ONE round trip. Varlen call: the
+ * fixed message carries the grid, the reply header says how many points
+ * follow, and the points arrive as one payload of point_count {dx, dy} int8
+ * pairs written straight into the caller's buffer.
+ *
+ * A reply whose point_count is not the grid's (a service/client mismatch) is
+ * still drained in full, so the connection stays framed, and then reported as
+ * version skew (not XRT_ERROR_IPC_FAILURE, which would mark the session lost).
+ */
+xrt_result_t
+comp_ipc_client_compositor_weave_snap_window_grid(struct xrt_compositor *xc,
+                                                  const struct u_snap_grid *grid,
+                                                  int8_t *out_dxdy,
+                                                  bool *out_declined)
+{
+	if (xc == NULL || grid == NULL || out_dxdy == NULL || out_declined == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_connection *ipc_c = icc->ipc_c;
+	const uint32_t want = u_snap_grid_point_count(grid);
+	*out_declined = false;
+
+	ipc_client_connection_lock(ipc_c);
+
+	xrt_result_t xret =
+	    ipc_send_weave_snap_window_grid_locked(ipc_c, grid->origin_x, grid->origin_y, grid->first_x, grid->first_y,
+	                                           grid->step_x, grid->step_y, grid->count_x, grid->count_y);
+	if (xret != XRT_SUCCESS) {
+		ipc_client_connection_unlock(ipc_c);
+		return xret;
+	}
+
+	bool declined = false;
+	uint32_t count = 0;
+	xrt_result_t result = ipc_receive_weave_snap_window_grid_locked(ipc_c, &declined, &count);
+	if (result != XRT_SUCCESS) {
+		// Either the receive itself failed (xret-class, pipe broken) or the
+		// service rejected the grid; in both cases no payload follows.
+		ipc_client_connection_unlock(ipc_c);
+		return result;
+	}
+
+	if (count == want) {
+		xret = count > 0 ? ipc_receive(&ipc_c->imc, out_dxdy, 2 * (size_t)count) : XRT_SUCCESS;
+	} else {
+		// Drain what the service says it sent, then fail: never desync.
+		IPC_ERROR(ipc_c, "weave_snap_window_grid: service sent %u points for a %u-point grid", count, want);
+		int8_t *junk = count > 0 && count <= U_SNAP_GRID_MAX_POINTS ? malloc(2 * (size_t)count) : NULL;
+		xret = junk != NULL ? ipc_receive(&ipc_c->imc, junk, 2 * (size_t)count) : XRT_ERROR_IPC_FAILURE;
+		free(junk);
+		if (xret == XRT_SUCCESS) {
+			xret = XRT_ERROR_IPC_VERSION_SKEW; // drained: the pipe is still framed
+		}
+	}
+	ipc_client_connection_unlock(ipc_c);
+
+	if (xret == XRT_SUCCESS) {
+		*out_declined = declined;
+	}
+	return xret;
+}
 
 /*
  * Workspace controller bridges — thin accessors used by the OpenXR state

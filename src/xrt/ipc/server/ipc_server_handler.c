@@ -16,6 +16,7 @@
 #include "util/u_visibility_mask.h"
 #include "util/u_trace_marker.h"
 #include "util/u_canvas.h" // XR_DXR_display_zones P5: zone-scoped locate rebase
+#include "util/u_snap_grid.h" // XR_DXR_weave v11: bulk grid snap (#1723)
 
 #include "server/ipc_server.h"
 #include "server/ipc_server_peer_creds.h"
@@ -7060,6 +7061,122 @@ ipc_handle_weave_snap_window_rect(volatile struct ipc_client_state *ics,
 	(void)origin_y;
 	return XRT_SUCCESS;
 #endif
+}
+
+/*
+ * XR_DXR_weave v11 (#1723): the per-point snap above, looped HERE, next to the
+ * display processor, so a drag-lattice probe costs the client one round trip
+ * instead of one per point. No new DP slot: each arm loops exactly the
+ * per-point function its weave_snap_window_rect arm calls.
+ */
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+static bool
+grid_point_d3d11_service(void *userdata,
+                         int32_t origin_x,
+                         int32_t origin_y,
+                         int32_t target_x,
+                         int32_t target_y,
+                         int32_t *out_x,
+                         int32_t *out_y)
+{
+	// The D3D11 helper leaves the outputs alone on false; u_snap_grid ignores
+	// them then (a false return is the decline).
+	return comp_d3d11_service_weave_snap_window_rect((struct xrt_compositor *)userdata, origin_x, origin_y,
+	                                                 target_x, target_y, out_x, out_y);
+}
+#elif defined(COMP_MULTI_HAVE_WEAVE)
+static bool
+grid_point_comp_multi(void *userdata,
+                      int32_t origin_x,
+                      int32_t origin_y,
+                      int32_t target_x,
+                      int32_t target_y,
+                      int32_t *out_x,
+                      int32_t *out_y)
+{
+	return comp_multi_weave_snap_window_rect((struct xrt_compositor *)userdata, origin_x, origin_y, target_x,
+	                                         target_y, out_x, out_y);
+}
+#endif
+
+/*!
+ * Varlen reply: struct ipc_weave_snap_window_grid_reply {result, declined,
+ * point_count}, then — only when result is XRT_SUCCESS — point_count
+ * {int8 dx, int8 dy} pairs (u_snap_grid.h encoding) in ONE send. Every
+ * rejection is carried in reply.result over a healthy pipe; only a failed send
+ * is returned (which drops the connection, as for any varlen call).
+ */
+xrt_result_t
+ipc_handle_weave_snap_window_grid(volatile struct ipc_client_state *ics,
+                                  int32_t origin_x,
+                                  int32_t origin_y,
+                                  int32_t first_x,
+                                  int32_t first_y,
+                                  int32_t step_x,
+                                  int32_t step_y,
+                                  uint32_t count_x,
+                                  uint32_t count_y)
+{
+	IPC_TRACE_MARKER();
+	struct ipc_message_channel *imc = (struct ipc_message_channel *)&ics->imc;
+	struct ipc_weave_snap_window_grid_reply reply = XRT_STRUCT_INIT;
+	reply.result = XRT_SUCCESS;
+	reply.declined = false;
+	reply.point_count = 0;
+
+	const struct u_snap_grid grid = {
+	    .origin_x = origin_x,
+	    .origin_y = origin_y,
+	    .first_x = first_x,
+	    .first_y = first_y,
+	    .step_x = step_x,
+	    .step_y = step_y,
+	    .count_x = count_x,
+	    .count_y = count_y,
+	};
+	const char *why = NULL;
+	int8_t *dxdy = NULL;
+
+	reply.result = require_present_owner(ics, "weave_snap_window_grid");
+	if (reply.result == XRT_SUCCESS && ics->xc == NULL) {
+		reply.result = XRT_ERROR_IPC_SESSION_NOT_CREATED;
+	}
+	if (reply.result == XRT_SUCCESS && !u_snap_grid_validate(&grid, &why)) {
+		// Validated BEFORE anything is allocated or looped: the counts come
+		// off the wire.
+		// Reported as an allocation refusal (the #956 locate_spaces
+		// precedent), NOT XRT_ERROR_IPC_FAILURE: the pipe is healthy and the
+		// client must not read this as a lost connection.
+		IPC_WARN(ics->server, "weave_snap_window_grid: rejected — %s (%ux%u points)", why, count_x, count_y);
+		reply.result = XRT_ERROR_ALLOCATION;
+	}
+	if (reply.result == XRT_SUCCESS) {
+		reply.point_count = u_snap_grid_point_count(&grid);
+		dxdy = U_TYPED_ARRAY_CALLOC(int8_t, 2 * (size_t)reply.point_count);
+		if (dxdy == NULL) {
+			reply.result = XRT_ERROR_ALLOCATION;
+			reply.point_count = 0;
+		}
+	}
+	if (reply.result == XRT_SUCCESS) {
+		bool declined = true; // no snap route in this build: identity, as per point
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+		u_snap_grid_eval(&grid, grid_point_d3d11_service, (void *)ics->xc, dxdy, &declined, NULL, NULL);
+#elif defined(COMP_MULTI_HAVE_WEAVE)
+		u_snap_grid_eval(&grid, grid_point_comp_multi, (void *)ics->xc, dxdy, &declined, NULL, NULL);
+#endif
+		reply.declined = declined;
+	}
+
+	xrt_result_t xret = ipc_send(imc, &reply, sizeof(reply));
+	if (xret == XRT_SUCCESS && reply.result == XRT_SUCCESS && reply.point_count > 0) {
+		xret = ipc_send(imc, dxdy, 2 * (size_t)reply.point_count);
+	}
+	if (xret != XRT_SUCCESS) {
+		IPC_ERROR(ics->server, "weave_snap_window_grid: failed to send the reply");
+	}
+	free(dxdy);
+	return xret;
 }
 
 xrt_result_t
