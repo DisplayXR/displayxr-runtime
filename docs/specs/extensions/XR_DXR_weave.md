@@ -556,15 +556,18 @@ vendor per-point cost is a single SDK query, and 16,641 of them (plus the search
 the in-process 1.6–6 ms figure measures — so a server-side loop costs the service a few
 milliseconds per press, not seconds.
 
-**Consumers.** The per-point callback seam in displayxr-common (`SnapWindowOriginFn`) is
-unchanged. The Linux test apps install `test_apps/common/dxr_weave_snap_grid.h`, which
-recognises the lattice probe's first question, fetches that table in one grid call and
-serves the probe from it — a memo of the DP's own answers, falling back to the per-point
-call for anything it cannot answer (and for any runtime older than v11). A fresh table (every
-press) is **one** call at any output scale: the grid itself at scale 1; every s-th device
-pixel over the table at an integer scale s ≥ 2, which also covers the probe's search; every
-device pixel over the table at a fractional scale. `DXR_WEAVE_SNAP_GRID=0` forces the
-per-point path for an A/B.
+**Consumers.** displayxr-common v2.24.0 gives its Linux window helper a bulk seam next to
+the per-point `SnapWindowOriginFn`: `set_snap_grid_provider(SnapWindowGridFn, ud)`, backed by
+`DxrWeaveSnap::grid_callback` (compiled only against spec ≥ 11 headers). The helper owns the
+grid's shape — `dxr_wl_lattice::plan_grids` names exactly the grids its probe will ask — and
+builds the table with `probe_via_grid` on its worker, so the table is the per-point table by
+construction: one call at an integer output scale, one per residue class at a fractional
+one, anything uncovered per point. The Linux test apps install both providers (the grid one
+only when `grid_available()`); `weave_present_vk_linux --lattice-selftest` builds one table
+per scale through that path against a live service and checks it equals the per-point
+table. Headless against a worktree service (`sim_display`, `SIM_DISPLAY_INTERLACE_PERIOD=8`):
+100 % is 1 call / 5 ms, 200 % 1 call / 26 ms, 150 % 16 calls / 112 ms, against 16,641,
+16,641 and 159,354 per-point calls (71 ms, 75 ms, 1.85 s).
 
 ## 5d. Desktop-Linux dma-buf transport and sync_file fences (v10, #1699)
 
