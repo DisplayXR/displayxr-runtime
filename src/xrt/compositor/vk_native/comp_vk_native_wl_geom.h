@@ -110,6 +110,16 @@ struct comp_vk_native_wl_window_rect
 	int32_t frame_logical_x, frame_logical_y;
 
 	/*!
+	 * The content's top-left and its monitor's top-left, LOGICAL px in the
+	 * publisher's global layout. `left_px == u_wl_logical_to_px(
+	 * content_logical_x - mon_logical_x, scale)`: what a logical move of the
+	 * window does in device pixels at ANY scale (#1609), which is what the
+	 * drop-time snap searches over.
+	 */
+	int32_t content_logical_x, content_logical_y;
+	int32_t mon_logical_x, mon_logical_y;
+
+	/*!
 	 * An interactive grab (move / resize) is in progress on this window: the
 	 * user is still dragging it, so nothing may reposition it (#1609).
 	 * Requires publisher version 3; @ref have_moving is false against an older

@@ -60,9 +60,18 @@
 //   Method  MoveWindow(u pid, i x, i y) -> (b moved)
 //   Method  GetPlacementCapabilities() -> (u caps)            (version 6+)
 //             bit 0: drag lattice (the table methods below)
+//             bit 1: SetDragLatticeAt, an explicit drag start (version 8)
 //   Method  SetDragLattice(u pid, b extend, i cell, i minDx, i minDy,
 //                          i maxDx, i maxDy, ai dx, ai dy)
 //             -> (b accepted, i startX, i startY)
+//   Method  SetDragLatticeAt(u pid, i startX, i startY, b extend, i cell,
+//                            i minDx, i minDy, i maxDx, i maxDy, ai dx, ai dy)
+//             -> (b accepted, i startX, i startY)            (version 8)
+//             Same, with the drag start (frame top-left, logical) given by the
+//             caller: at a fractional scale a table is only valid for the
+//             start it was built from (Mutter rounds each placement to the
+//             physical pixel grid), and a table built mid-drag is built for a
+//             position the window has already left.
 //   Method  ClearDragLattice(u pid)
 //   Signal  DragLatticeNeeded(u pid, i dx, i dy)
 //   Signal  DragLatticeDone(u pid, u moves, u corrected, u misses,
@@ -493,6 +502,22 @@
       <arg type="i" direction="out" name="startX"/>
       <arg type="i" direction="out" name="startY"/>
     </method>
+    <method name="SetDragLatticeAt">
+      <arg type="u" direction="in" name="pid"/>
+      <arg type="i" direction="in" name="startX"/>
+      <arg type="i" direction="in" name="startY"/>
+      <arg type="b" direction="in" name="extend"/>
+      <arg type="i" direction="in" name="cell"/>
+      <arg type="i" direction="in" name="minDx"/>
+      <arg type="i" direction="in" name="minDy"/>
+      <arg type="i" direction="in" name="maxDx"/>
+      <arg type="i" direction="in" name="maxDy"/>
+      <arg type="ai" direction="in" name="dx"/>
+      <arg type="ai" direction="in" name="dy"/>
+      <arg type="b" direction="out" name="accepted"/>
+      <arg type="i" direction="out" name="startX"/>
+      <arg type="i" direction="out" name="startY"/>
+    </method>
     <method name="ClearDragLattice">
       <arg type="u" direction="in" name="pid"/>
     </method>
@@ -555,6 +580,7 @@
             typeof Meta.ExternalConstraint !== 'undefined' &&
             typeof Meta.Window.prototype.add_external_constraint === 'function';
         const PLACEMENT_CAP_DRAG_LATTICE = 1;
+        const PLACEMENT_CAP_EXPLICIT_START = 2;
         //! A table no grab follows stops constraining after this long.
         const LATTICE_PRE_GRAB_US = 2 * 1000 * 1000;
         //! DISPLAYXR_TEST=1 (never in production): tables audit their paints
@@ -694,8 +720,9 @@
                 t.lastUs = now;
                 if (t.asked)
                     return;
-                const cx = (t.minDx + t.maxDx) / 2, cy = (t.minDy + t.maxDy) / 2;
-                const half = Math.min(t.maxDx - t.minDx, t.maxDy - t.minDy) / 2;
+                const [pMinX, pMinY, pMaxX, pMaxY] = t.piece ?? [t.minDx, t.minDy, t.maxDx, t.maxDy];
+                const cx = (pMinX + pMaxX) / 2, cy = (pMinY + pMaxY) / 2;
+                const half = Math.min(pMaxX - pMinX, pMaxY - pMinY) / 2;
                 if (Math.max(Math.abs(dx - cx), Math.abs(dy - cy)) < half / 2)
                     return;
                 const lim = half / 2;
@@ -746,7 +773,7 @@
                 return false;
             }
 
-            set(win, pid, extend, cell, bounds, dxs, dys) {
+            set(win, pid, extend, cell, bounds, dxs, dys, explicitStart = null) {
                 // The correction path needs no Meta.ExternalConstraint (it moves
                 // the window with move_frame), so it works on any shell.
                 if (!win || dxs.length !== dys.length || cell < 1)
@@ -757,7 +784,10 @@
                 // same start. A fresh table takes the window's position NOW,
                 // before the grab moves it.
                 let startX, startY;
-                if (extend && prev) {
+                if (explicitStart) {
+                    // The caller built the table for this start (v8).
+                    [startX, startY] = explicitStart;
+                } else if (extend && prev) {
                     startX = prev.startX;
                     startY = prev.startY;
                 } else {
@@ -765,7 +795,12 @@
                     startX = r.x;
                     startY = r.y;
                 }
-                const buckets = new Map();
+                // An extension of the same drag ADDS to the table: every entry
+                // of both is phase-correct for the same start, and replacing
+                // would drop the entry the window is sitting on (the new
+                // table samples its cells from a different grid origin).
+                const merge = extend && prev && prev.startX === startX && prev.startY === startY;
+                const buckets = merge ? prev.buckets : new Map();
                 for (let i = 0; i < dxs.length; i++) {
                     const key = `${Math.floor(dxs[i] / cell)},${Math.floor(dys[i] / cell)}`;
                     let b = buckets.get(key);
@@ -773,9 +808,16 @@
                         buckets.set(key, b = []);
                     b.push(dxs[i], dys[i]);
                 }
-                const members = new Set();
+                // The newest piece's own extent: what "half-way to the edge"
+                // is measured against (the union below has uncovered corners).
+                const piece = bounds.slice();
+                const members = merge ? prev.members : new Set();
                 for (let i = 0; i < dxs.length; i++)
                     members.add(`${dxs[i]},${dys[i]}`);
+                if (merge) {
+                    bounds = [Math.min(bounds[0], prev.minDx), Math.min(bounds[1], prev.minDy),
+                        Math.max(bounds[2], prev.maxDx), Math.max(bounds[3], prev.maxDy)];
+                }
                 this._tables.set(win, {
                     pid, startX, startY, cell, buckets, members,
                     minDx: bounds[0], minDy: bounds[1], maxDx: bounds[2], maxDy: bounds[3],
@@ -788,6 +830,7 @@
                     expiresUs: GLib.get_monotonic_time() +
                         (LATTICE_TEST ? 120 * 1000 * 1000 : LATTICE_PRE_GRAB_US),
                     entries: dxs.length,
+                    piece,
                 });
                 if (LATTICE_TEST) {
                     // Test mode: audit paints from the moment the table lands,
@@ -1059,7 +1102,8 @@
             }
 
             GetPlacementCapabilities() {
-                return this._lattice.supported() ? PLACEMENT_CAP_DRAG_LATTICE : 0;
+                return this._lattice.supported()
+                    ? PLACEMENT_CAP_DRAG_LATTICE | PLACEMENT_CAP_EXPLICIT_START : 0;
             }
 
             SetDragLatticeAsync([pid, extend, cell, minDx, minDy, maxDx, maxDy, dxs, dys], invocation) {
@@ -1076,6 +1120,22 @@
                     // The drag's origin as recorded, so the caller can log and
                     // test against it without ever learning its position any
                     // other way.
+                    invocation.return_value(new GLib.Variant('(bii)', [ok, sx, sy]));
+                });
+            }
+
+            SetDragLatticeAtAsync([pid, startX, startY, extend, cell, minDx, minDy, maxDx, maxDy, dxs, dys],
+                invocation) {
+                this._senderPid(invocation.get_sender(), senderPid => {
+                    let ok = false, sx = 0, sy = 0;
+                    if (senderPid > 0 && (pid === 0 || pid === senderPid)) {
+                        const win = this._windowOfPid(senderPid);
+                        ok = this._lattice.set(win, senderPid, extend, cell,
+                            [minDx, minDy, maxDx, maxDy], dxs, dys, [startX, startY]);
+                        const start = ok ? this._lattice.startOf(win) : null;
+                        if (start)
+                            [sx, sy] = start;
+                    }
                     invocation.return_value(new GLib.Variant('(bii)', [ok, sx, sy]));
                 });
             }

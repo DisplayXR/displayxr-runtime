@@ -461,6 +461,37 @@ TEST_CASE("a fractionally-scaled monitor has none, and must not be pretended int
 	REQUIRE_FALSE(u_wl_placement_quantum(-2.0, 0.01, &q));
 }
 
+TEST_CASE("any scale: a whole-logical-pixel move lands where Mutter draws it")
+{
+	// Mutter 50 (meta-window-actor-wayland.c, surface_container_apply_transform)
+	// draws a surface at roundf((logical - monitor) * scale): halves away from
+	// zero. The drop-time snap and the drag lattice search over logical moves
+	// through exactly this mapping (#1609), so pin it at every common scale.
+	REQUIRE(u_wl_logical_to_px(7, 1.0) == 7);
+	REQUIRE(u_wl_logical_to_px(2, 1.25) == 3); // 2.5 -> 3
+	REQUIRE(u_wl_logical_to_px(-2, 1.25) == -3);
+	REQUIRE(u_wl_logical_to_px(1, 1.5) == 2); // 1.5 -> 2
+	REQUIRE(u_wl_logical_to_px(2, 1.5) == 3);
+	REQUIRE(u_wl_logical_to_px(3, 1.5) == 5); // 4.5 -> 5
+	REQUIRE(u_wl_logical_to_px(-1, 1.5) == -2);
+	REQUIRE(u_wl_logical_to_px(1, 1.6666666) == 2);
+	REQUIRE(u_wl_logical_to_px(2, 1.6666666) == 3);
+	REQUIRE(u_wl_logical_to_px(3, 1.6666666) == 5);
+	REQUIRE(u_wl_logical_to_px(2, 1.75) == 4); // 3.5 -> 4
+	REQUIRE(u_wl_logical_to_px(3, 1.75) == 5);
+	// 200 %: every move is exactly 2 px, whatever the start — the old
+	// integer lattice, which the logical search therefore reproduces.
+	for (int32_t start = -5; start <= 5; start++) {
+		for (int32_t m = -4; m <= 4; m++) {
+			REQUIRE(u_wl_logical_to_px(start + m, 2.0) - u_wl_logical_to_px(start, 2.0) == 2 * m);
+		}
+	}
+	// 150 %: a 1-logical move is 1 or 2 px depending on the start — why a
+	// table is only valid for the start it was built from.
+	REQUIRE(u_wl_logical_to_px(1, 1.5) - u_wl_logical_to_px(0, 1.5) == 2);
+	REQUIRE(u_wl_logical_to_px(2, 1.5) - u_wl_logical_to_px(1, 1.5) == 1);
+}
+
 
 /*
  *

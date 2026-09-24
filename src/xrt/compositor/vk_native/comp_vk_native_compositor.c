@@ -615,7 +615,6 @@ struct comp_vk_native_compositor
 	uint32_t wl_snap_verify_polls;          //!< polls spent waiting for it to apply
 	uint32_t wl_snap_still; //!< consecutive polls with an unchanged origin
 	uint32_t wl_snap_tries; //!< move requests made for THIS settle (cap 2)
-	bool warned_wl_snap_scale;
 	bool warned_wl_snap_grab;
 #endif
 	//! Last SPAN_2D band count logged, so the line fires on change only.
@@ -10751,39 +10750,19 @@ vk_wayland_phase_snap(struct comp_vk_native_compositor *c)
 		return;
 	}
 
-	// Reachability: integer monitor scales only (@ref u_wl_placement_quantum).
-	// 1.6667 has no lattice a window can be placed on, so refusing is the
-	// honest answer.
+	/*
+	 * Reachability at ANY scale (#1609). The compositor places windows at
+	 * integer LOGICAL positions and Mutter draws each at
+	 * round-half-away((content - monitor) * scale) device px — the same
+	 * u_wl_logical_to_px this provider already reports the origin with. So a
+	 * logical move m lands at a KNOWN device position, and the search below
+	 * runs over logical moves. At an integer scale q that is exactly the old
+	 * "multiples of q" lattice; at 1.5 or 1.6667 it is the irregular but
+	 * equally known set the old code refused.
+	 */
 	const double scale = (double)wr.scale;
-	uint32_t q = 0;
-	if (!u_wl_placement_quantum(scale, 0.01, &q)) {
-		// DXR_WL_SNAP_QUANTUM=N forces it, for exercising this path on a box
-		// whose only free output is fractionally scaled. The sibling of
-		// DXR_X11_PLACEMENT_QUANTUM, and as unsuitable for real use: the
-		// forced lattice is not the one the compositor will actually place on.
-		const char *force = getenv("DXR_WL_SNAP_QUANTUM");
-		const long forced = force != NULL ? strtol(force, NULL, 10) : 0;
-		if (forced >= 1 && forced <= 8) {
-			q = (uint32_t)forced;
-			if (!c->warned_wl_snap_scale) {
-				c->warned_wl_snap_scale = true;
-				U_LOG_W(
-				    "phase snap: monitor scale %.4f has no placement lattice, but "
-				    "DXR_WL_SNAP_QUANTUM=%u FORCES one — diagnostics only.",
-				    scale, q);
-			}
-		} else {
-			if (!c->warned_wl_snap_scale) {
-				c->warned_wl_snap_scale = true;
-				U_LOG_W(
-				    "phase snap: this monitor's scale is %.4f, not an integer — a window can only "
-				    "be placed at integer LOGICAL positions, so the reachable device positions do "
-				    "not form a lattice and no phase-correct one can be named. The window keeps the "
-				    "phase it was dropped on. (An output at 100%% or 200%% snaps.)",
-				    scale);
-			}
-			return;
-		}
+	if (!(scale > 0.0)) {
+		return;
 	}
 
 	struct xrt_display_processor_vk *vdp = (struct xrt_display_processor_vk *)c->display_processor;
@@ -10831,38 +10810,61 @@ vk_wayland_phase_snap(struct comp_vk_native_compositor *c)
 			// coordinate alone, whatever it does with the other one. Requiring
 			// both at once reports "none" for an axis the DP is happy with
 			// merely because the other axis is off its lattice.
-			U_LOG_W("snap probe at (%d, %d) px, quantum %u: DP-accepted dx offsets [%s]; dy offsets "
-			        "[%s]. Only offsets that are multiples of %u are reachable by moving the window — an "
-			        "accepted offset list with no even entry means the phase this drop needs cannot be "
-			        "reached by placing the window at all.",
-			        cur_x, cur_y, q, xs[0] != '\0' ? xs : "none", ys[0] != '\0' ? ys : "none", q);
+			U_LOG_W(
+			    "snap probe at (%d, %d) px, scale %.4f: DP-accepted dx offsets [%s]; dy offsets "
+			    "[%s]. Only the device offsets a whole-logical-pixel move produces at this scale are "
+			    "reachable by moving the window.",
+			    cur_x, cur_y, scale, xs[0] != '\0' ? xs : "none", ys[0] != '\0' ? ys : "none");
 		}
 	}
 
 	int32_t sx = cur_x, sy = cur_y;
+	int32_t mdx = 0, mdy = 0;
 	bool exact = false;
-	// Phase reference: where the move began. Reachability: where it ended —
-	// the compositor ran the drag, so the drop is not on the anchor's lattice.
-	if (!vk_snap_search_lattice(c, vdp, c->wl_snap_anchor_x, c->wl_snap_anchor_y, cur_x, cur_y, cur_x, cur_y, q,
-	                            &sx, &sy, &exact)) {
+	if (!dp_answered) {
 		return; // the DP does not snap; nothing to improve
+	}
+	{
+		// Phase reference: where the move began (the anchor). Candidates: the
+		// logical moves nearest the DP's own answer, in the same ring order
+		// the X11 search uses (49 within 3 logical px).
+		const int32_t bx = (int32_t)lround((double)(dp_x - cur_x) / scale);
+		const int32_t by = (int32_t)lround((double)(dp_y - cur_y) / scale);
+		const uint32_t n = u_x11_lattice_candidate_count(3);
+		for (uint32_t k = 0; k < n && !exact; k++) {
+			int32_t i = 0, j = 0;
+			u_x11_lattice_candidate(k, &i, &j);
+			const int32_t mx = bx + i, my = by + j;
+			const int32_t px = u_wl_logical_to_px(wr.content_logical_x + mx - wr.mon_logical_x, scale);
+			const int32_t py = u_wl_logical_to_px(wr.content_logical_y + my - wr.mon_logical_y, scale);
+			int32_t rx = px, ry = py;
+			if (xrt_display_processor_vk_snap_window_rect(vdp, c->wl_snap_anchor_x, c->wl_snap_anchor_y, px,
+			                                              py, &rx, &ry) &&
+			    rx == px && ry == py) {
+				exact = true;
+				sx = px;
+				sy = py;
+				mdx = mx;
+				mdy = my;
+			}
+		}
 	}
 	if (!exact) {
 		/*
-		 * No REACHABLE position is phase-correct. Moving the window to the
-		 * nearest reachable one would buy nothing — it is as misphased as the
-		 * drop, only somewhere else — so decline, and say what was wanted and
-		 * why it cannot be had. The runtime keeps feeding the TRUE origin, so
-		 * the weave is still phased for where the window actually is.
+		 * No REACHABLE position near the DP's answer is phase-correct. Moving
+		 * the window somewhere else just as misphased buys nothing, so
+		 * decline. The runtime keeps feeding the TRUE origin, so the weave is
+		 * still phased for where the window actually is.
 		 */
-		U_LOG_W("phase snap: NOT MOVING — no reachable position is phase-correct. The display processor "
-		        "wants (%d, %d) px, the window can only be placed on multiples of %u px from (%d, %d), and "
-		        "the nearest such point (%d, %d) is not phase-correct either. The weave keeps the phase it "
-		        "was dropped on. (Run with DXR_WL_SNAP_PROBE=1 to see which offsets the DP accepts.)",
-		        dp_x, dp_y, q, cur_x, cur_y, sx, sy);
+		U_LOG_W(
+		    "phase snap: NOT MOVING — no reachable position is phase-correct. The display processor "
+		    "wants (%d, %d) px, and no logical move within 3 px of it lands on a device position it "
+		    "accepts at scale %.4f (from (%d, %d)). The weave keeps the phase it was dropped on. (Run "
+		    "with DXR_WL_SNAP_PROBE=1 to see which offsets the DP accepts.)",
+		    dp_x, dp_y, scale, cur_x, cur_y);
 		return;
 	}
-	if (sx == cur_x && sy == cur_y) {
+	if (mdx == 0 && mdy == 0) {
 		U_LOG_I("phase snap: dropped at (%d, %d) px, already on the lattice", cur_x, cur_y);
 		return;
 	}
@@ -10871,17 +10873,15 @@ vk_wayland_phase_snap(struct comp_vk_native_compositor *c)
 	}
 	c->wl_snap_tries++;
 
-	// Device px -> the publisher's logical stage coordinates. Exact by
-	// construction: every offset the search returns is a multiple of q.
-	const int32_t mdx = (sx - cur_x) / (int32_t)q;
-	const int32_t mdy = (sy - cur_y) / (int32_t)q;
 	const bool ok =
 	    comp_vk_native_wl_geom_move_window(c->wl_geom, wr.frame_logical_x + mdx, wr.frame_logical_y + mdy);
-	U_LOG_W("phase snap: drop at (%d, %d) px, DP wants (%d, %d)%s -> reachable phase-correct (%d, %d); asking "
-	        "the compositor to move the window by (%d, %d) logical px%s",
-	        cur_x, cur_y, dp_x, dp_y, dp_answered ? "" : " (DP declined)", sx, sy, mdx, mdy,
-	        ok ? "" : " — REFUSED, the window keeps the phase it was dropped on (a drop at a screen edge is "
-	                  "clamped by the compositor; the origin feed stays truthful either way)");
+	U_LOG_W(
+	    "phase snap: drop at (%d, %d) px, DP wants (%d, %d) -> reachable phase-correct (%d, %d) at scale "
+	    "%.4f; asking the compositor to move the window by (%d, %d) logical px%s",
+	    cur_x, cur_y, dp_x, dp_y, sx, sy, scale, mdx, mdy,
+	    ok ? ""
+	       : " — REFUSED, the window keeps the phase it was dropped on (a drop at a screen edge is "
+	         "clamped by the compositor; the origin feed stays truthful either way)");
 	if (ok) {
 		// Verify the landing on the next poll rather than assume it.
 		c->wl_snap_verify_pending = true;
