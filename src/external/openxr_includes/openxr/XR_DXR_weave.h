@@ -188,7 +188,9 @@
  * _OPAQUE_FD_DXR, XrWeaveDmabufDescDXR + XrWeaveOverlayDmabufDescDXR (fd + DRM
  * fourcc + modifier + per-plane layout in), XrWeaveOutputDmabufDXR (fd-typed
  * woven output), and sync_file fences XrWeaveSubmitSyncDXR (acquire, in) /
- * XrWeaveOutputSyncDXR (release, out, every frame).
+ * XrWeaveOutputSyncDXR (release, out, every frame); 11 = bulk grid snap
+ * (#1723): xrWeaveSnapWindowGridDXR + XrWeaveSnapGridInfoDXR /
+ * XrWeaveSnapGridPointDXR — one call per drag instead of one per probed point.
  *
  * Desktop-Linux dma-buf transport (SPEC_VERSION 10, #1699). A file descriptor is
  * an int, not a pointer, and carries no dimensions, format or tiling, so v10 does
@@ -228,7 +230,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_weave 1
-#define XR_DXR_weave_SPEC_VERSION 10
+#define XR_DXR_weave_SPEC_VERSION 11
 #define XR_DXR_WEAVE_EXTENSION_NAME "XR_DXR_weave"
 
 // Reserved 1004999190..199. Final values reconcile with the Khronos registry
@@ -255,6 +257,8 @@ extern "C" {
 #define XR_TYPE_WEAVE_OUTPUT_DMABUF_DXR       ((XrStructureType)1004999243)
 #define XR_TYPE_WEAVE_SUBMIT_SYNC_DXR         ((XrStructureType)1004999244)
 #define XR_TYPE_WEAVE_OUTPUT_SYNC_DXR         ((XrStructureType)1004999245)
+// Spec v11 (#1723): bulk grid snap.
+#define XR_TYPE_WEAVE_SNAP_GRID_INFO_DXR      ((XrStructureType)1004999246)
 
 //! Upper bound on eye positions carried by XrWeaveSubmitInfoDXR (mirrors the
 //! runtime's XRT_MAX_VIEWS). Phase 1: carried but unused.
@@ -284,6 +288,18 @@ extern "C" {
 //! planes are offsets into the ONE fd; 4 is the DRM ceiling (Intel CCS modifiers
 //! use 2 for a single-plane RGB format).
 #define XR_WEAVE_DMABUF_MAX_PLANES_DXR 4
+
+//! Upper bound on points one xrWeaveSnapWindowGridDXR evaluates (spec v11), and
+//! on points along either axis. 1024 x 1024 covers a dense device-pixel grid
+//! over a whole drag-lattice table at any output scale the panel is driven at;
+//! the reply is 2 bytes per point.
+#define XR_WEAVE_SNAP_GRID_MAX_POINTS_DXR (1024u * 1024u)
+#define XR_WEAVE_SNAP_GRID_MAX_AXIS_DXR   1024u
+
+//! XrWeaveSnapGridPointDXR value (in BOTH fields) for a point whose snapped
+//! displacement does not fit int8 — never produced by a correct snap, which
+//! stays within a few pixels of its target (spec v11).
+#define XR_WEAVE_SNAP_GRID_NO_DELTA_DXR (-128)
 
 /*!
  * @brief Per-frame weave submission for one window sub-rect.
@@ -774,6 +790,44 @@ typedef struct XrWeaveOutputSyncDXR {
     int32_t            releaseFenceFd; //!< sync_file fd (caller-owned), or -1 = already complete
 } XrWeaveOutputSyncDXR;
 
+/*!
+ * @brief A grid of drag targets around one drag origin (spec v11, #1723).
+ *
+ * Input of xrWeaveSnapWindowGridDXR. Point (i, j), i < @c countX, j < @c countY,
+ * proposes the window top-left
+ *
+ *   (firstTarget.x + i * step.width, firstTarget.y + j * step.height)
+ *
+ * and is snapped from @c originRect exactly as xrWeaveSnapWindowRectDXR would
+ * snap it: same frame rules (any frame, as long as origin and targets share it;
+ * DEVICE pixels, never logical ones), only the offset is snapped.
+ *
+ * @c step components are >= 1; @c countX and @c countY are
+ * 1..XR_WEAVE_SNAP_GRID_MAX_AXIS_DXR with a product of at most
+ * XR_WEAVE_SNAP_GRID_MAX_POINTS_DXR; every target must stay within ±2^28 px.
+ */
+typedef struct XrWeaveSnapGridInfoDXR {
+    XrStructureType          type;        //!< XR_TYPE_WEAVE_SNAP_GRID_INFO_DXR
+    const void* XR_MAY_ALIAS next;
+    XrRect2Di                originRect;  //!< drag-start window rect (offset used; extent passes through)
+    XrOffset2Di              firstTarget; //!< proposed top-left of grid point (0, 0)
+    XrExtent2Di              step;        //!< grid pitch, device px, each >= 1
+    uint32_t                 countX;      //!< points along x
+    uint32_t                 countY;      //!< points along y
+} XrWeaveSnapGridInfoDXR;
+
+/*!
+ * @brief One grid point's answer (spec v11): the snapped top-left MINUS the
+ * proposed one, in device px. (0, 0) = the DP accepts the target as is.
+ *
+ * Both fields are XR_WEAVE_SNAP_GRID_NO_DELTA_DXR when the displacement does
+ * not fit int8; a caller that needs that point asks xrWeaveSnapWindowRectDXR.
+ */
+typedef struct XrWeaveSnapGridPointDXR {
+    int8_t dx;
+    int8_t dy;
+} XrWeaveSnapGridPointDXR;
+
 typedef XrResult (XRAPI_PTR *PFN_xrWeaveBindWindowDXR)(
     XrSession session, void* windowHandle);
 
@@ -788,6 +842,10 @@ typedef XrResult (XRAPI_PTR *PFN_xrWeaveSubmitDXR)(
 
 typedef XrResult (XRAPI_PTR *PFN_xrWeaveSnapWindowRectDXR)(
     XrSession session, const XrRect2Di* originRect, const XrRect2Di* targetRect, XrRect2Di* snappedRect);
+
+typedef XrResult (XRAPI_PTR *PFN_xrWeaveSnapWindowGridDXR)(
+    XrSession session, const XrWeaveSnapGridInfoDXR* gridInfo, uint32_t pointCapacityInput,
+    uint32_t* pointCountOutput, XrWeaveSnapGridPointDXR* points, XrBool32* declined);
 
 typedef XrResult (XRAPI_PTR *PFN_xrWeaveSetScreenFlatRegionsDXR)(
     XrSession session, uint32_t rectCount, const XrRect2Di* screenRects);
@@ -830,6 +888,32 @@ XRAPI_ATTR XrResult XRAPI_CALL xrWeaveSubmitDXR(
 //! in-process session.
 XRAPI_ATTR XrResult XRAPI_CALL xrWeaveSnapWindowRectDXR(
     XrSession session, const XrRect2Di* originRect, const XrRect2Di* targetRect, XrRect2Di* snappedRect);
+
+//! Snap a whole GRID of proposed window positions in one call (spec v11,
+//! #1723) — xrWeaveSnapWindowRectDXR evaluated at every point of @c gridInfo,
+//! by the runtime, next to the display processor. For a caller that needs the
+//! answer set rather than one answer: the Wayland drag lattice probes a
+//! 129 x 129 grid at every title-bar press, which per point is one service
+//! round trip each over IPC (~2.4 s measured); this is one.
+//!
+//! Standard two-call idiom: @c pointCapacityInput 0 writes the point count
+//! (countX * countY) to @c pointCountOutput and evaluates nothing; otherwise
+//! @c points must hold that many (XR_ERROR_SIZE_INSUFFICIENT if not) and
+//! receives them row-major — point (i, j) at index j * countX + i.
+//!
+//! @c declined (optional, may be NULL) is set XR_TRUE when the display
+//! processor produced no snap — no snap support, no usable viewing distance
+//! yet, not up yet: the per-point call's identity case. Every point is then
+//! (0, 0), so ignoring the flag degrades exactly like the per-point call; a
+//! caller that honours it drags unconstrained, since there is no phase to
+//! protect.
+//!
+//! GPU-free and synchronous. Available wherever xrWeaveSnapWindowRectDXR is
+//! (including an in-process desktop-Linux session); reports
+//! XR_ERROR_FEATURE_UNSUPPORTED exactly where it does.
+XRAPI_ATTR XrResult XRAPI_CALL xrWeaveSnapWindowGridDXR(
+    XrSession session, const XrWeaveSnapGridInfoDXR* gridInfo, uint32_t pointCapacityInput,
+    uint32_t* pointCountOutput, XrWeaveSnapGridPointDXR* points, XrBool32* declined);
 
 //! Latch the regions of the PANEL that must stay physically flat (spec v8,
 //! browser#88). Sticky companion to XrWeaveSubmitFlatRegionsDXR: same advisory
