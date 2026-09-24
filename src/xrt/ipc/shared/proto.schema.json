@@ -97,6 +97,12 @@
                 "properties": {
                     "type": {
                         "$ref": "#/definitions/handle"
+                    },
+                    "name": {
+                        "type": "string",
+                        "title": "Argument name stem (plural, default 'handles')",
+                        "description": "Needed when a call has both in_handles and out_handles, so the two parameter sets of the client proxy do not collide.",
+                        "pattern": "^[a-z][a-z0-9_]*s$"
                     }
                 }
             },
@@ -110,6 +116,12 @@
                 "properties": {
                     "type": {
                         "$ref": "#/definitions/handle"
+                    },
+                    "name": {
+                        "type": "string",
+                        "title": "Argument name stem (plural, default 'handles')",
+                        "description": "Needed when a call has both in_handles and out_handles, so the two parameter sets of the client proxy do not collide.",
+                        "pattern": "^[a-z][a-z0-9_]*s$"
                     }
                 }
             },

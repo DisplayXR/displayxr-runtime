@@ -640,3 +640,12 @@ endif()
 if(XRT_HAVE_VULKAN AND XRT_HAVE_D3D11)
 	target_link_libraries(tests_aux_d3d_d3d11 PRIVATE comp_util aux_vk)
 endif()
+
+# #1699 — the IPC protocol generator. weave_submit_dmabuf is the first call with
+# BOTH in_handles and out_handles; this pins the optional per-handle "name" key
+# that keeps the two parameter sets of the client proxy from colliding, and the
+# shape of the generated client/server code for that call. Pure Python, no build
+# dependency.
+add_test(NAME tests_ipc_proto COMMAND ${PYTHON_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests_ipc_proto.py
+					 ${PROJECT_SOURCE_DIR}/src/xrt/ipc/shared
+	)

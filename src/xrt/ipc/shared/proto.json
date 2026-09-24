@@ -759,6 +759,30 @@
 		"out_handles": {"type": "xrt_graphics_sync_handle_t"}
 	},
 
+	"weave_submit_dmabuf": {
+		"in": [
+			{"name": "args", "type": "struct ipc_arg_weave_submit"},
+			{"name": "dmabuf", "type": "struct ipc_arg_weave_dmabuf"}
+		],
+		"out": [
+			{"name": "have_output", "type": "bool"},
+			{"name": "width", "type": "uint32_t"},
+			{"name": "height", "type": "uint32_t"},
+			{"name": "fence_value", "type": "uint64_t"},
+			{"name": "eyes", "type": "struct xrt_eye_positions"}
+		],
+		"in_handles": {"type": "xrt_graphics_buffer_handle_t"},
+		"out_handles": {"type": "xrt_graphics_sync_handle_t", "name": "release_fences"}
+	},
+
+	"weave_get_output_dmabuf": {
+		"out": [
+			{"name": "have_output", "type": "bool"},
+			{"name": "desc", "type": "struct ipc_weave_dmabuf_output"}
+		],
+		"out_handles": {"type": "xrt_graphics_buffer_handle_t"}
+	},
+
 	"weave_set_screen_flat_regions": {
 		"in": [
 			{"name": "args", "type": "struct ipc_arg_weave_screen_flat_regions"}
