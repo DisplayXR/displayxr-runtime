@@ -76,7 +76,10 @@ FetchContent_Declare(
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
     # v2.21.0 adds the native-Wayland drag-lattice follow-ups (displayxr-common#59,
     # runtime#1697). Linux-only; nothing else changed since the previous pin.
-    GIT_TAG v2.21.0
+    # v2.22.0: an opaque window's Wayland surface is declared opaque, so the
+    # compositor can scan a fullscreen weave out directly (displayxr-common#60,
+    # #1698). Linux-only.
+    GIT_TAG v2.22.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
