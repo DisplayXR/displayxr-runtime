@@ -5,7 +5,7 @@
     "each downstream repo pins the runtime (and third-party SDKs) in its own sources.",
     "",
     "Consumed by .github/workflows/runtime-pin-bump.yml (opens repin PRs on a runtime",
-    "release, ABI-gated) and .github/workflows/pin-rot-canary.yml (checks SDK pins",
+    "release, gated per track by bump_when) and .github/workflows/pin-rot-canary.yml (checks SDK pins",
     "still resolve AND still unpack a usable SDK). Spec + rationale:",
     "docs/specs/runtime/downstream-pin-bump.md",
     "",
@@ -16,7 +16,18 @@
 
   "_schema": {
     "runtime_tag_pins.<repo>.tracks.<track>": {
-      "auto_bump": "true = repin automatically on a qualifying runtime release; false = human-owned, never touched",
+      "bump_when": [
+        "The track's repin POLICY -- data, not workflow logic. Required; no default.",
+        "  abi      -- repin when XRT_PLUGIN_API_VERSION_CURRENT changed between the pinned tag and the new tag.",
+        "  features -- repin when the FEATURE SURFACE changed in the track's feature headers: an XRT_*_HAS_*",
+        "              feature macro added/removed/redefined, a vtable (function-pointer) slot added/removed/",
+        "              re-signed, or the plug-in ABI. Superset of abi. Catches ADR-020's append-only slot +",
+        "              feature macro, which ships WITHOUT an ABI bump and which the abi gate cannot see.",
+        "  manual   -- human-owned, never touched.",
+        "Both automatic policies skip a release that would only raise the pin (and so the plug-in's runtime",
+        "floor) for no gain, and never move a pin backwards."
+      ],
+      "feature_headers": "Optional, features policy only: the runtime headers whose surface this track compiles against. Defaults to feature_surface.headers. Narrow it to what the track's build actually compiles, or a slot in an API the track never builds raises its floor for nothing.",
       "locations": "EVERY file the track's tag appears in. Written in ONE commit -- see atomicity note below.",
       "locations[].kind": "cmake_set  -> matches set(<key> \"<tag>\"   |  yaml_env -> matches <key>: <tag>"
     },
@@ -29,8 +40,8 @@
       "displayxr-leia-plugin/installer/CMakeLists.txt regex-derives MIN_RUNTIME_VERSION",
       "from DXR_RUNTIME_GIT_TAG. It is a CONSUMER of the pin, not a pin: CMake recomputes",
       "it. Never list or edit derived values -- and note this derivation is exactly why",
-      "the bump is ABI-gated, since raising the pin raises that installer's minimum",
-      "runtime floor."
+      "the automatic policies skip releases with nothing to gain, since raising the pin",
+      "raises that installer's minimum runtime floor."
     ],
     "_key_suffixes_are_safe": [
       "Tracks deliberately use SUFFIXED keys (DXR_RUNTIME_GIT_TAG vs _ANDROID vs _LINUX;",
@@ -46,19 +57,37 @@
     ]
   },
 
+  "feature_surface": {
+    "_comment": [
+      "The plug-in-facing headers the `features` policy diffs. Default set for any",
+      "bump_when=features track without its own feature_headers. MUST list every",
+      "src/xrt/include/xrt/xrt_display_processor*.h -- scripts/tests/",
+      "test_downstream_pin_bump.py fails when a new DP header is not listed here."
+    ],
+    "headers": [
+      "src/xrt/include/xrt/xrt_plugin.h",
+      "src/xrt/include/xrt/xrt_display_processor.h",
+      "src/xrt/include/xrt/xrt_display_processor_d3d11.h",
+      "src/xrt/include/xrt/xrt_display_processor_d3d12.h",
+      "src/xrt/include/xrt/xrt_display_processor_gl.h",
+      "src/xrt/include/xrt/xrt_display_processor_metal.h",
+      "src/xrt/include/xrt/xrt_display_processor_vk.h"
+    ]
+  },
+
   "runtime_tag_pins": {
     "displayxr-leia-plugin": {
       "role": "Leia SR display-processor plug-in (first vendor integration)",
       "tracks": {
         "windows": {
-          "auto_bump": true,
+          "bump_when": "abi",
           "locations": [
             { "file": "CMakeLists.txt", "kind": "cmake_set", "key": "DXR_RUNTIME_GIT_TAG" },
             { "file": ".github/workflows/build-windows.yml", "kind": "yaml_env", "key": "RUNTIME_REF" }
           ]
         },
         "android": {
-          "auto_bump": true,
+          "bump_when": "abi",
           "reason": "The runtime's Android APK BUNDLES this plug-in (ADR-038), so the two ship as one artifact and must stay ABI- and build-config-matched. Unlike the windows track, no installer derives a MIN_RUNTIME_VERSION floor from this pin, so repinning costs nothing; the ABI gate still skips releases that change no plug-in ABI.",
           "locations": [
             { "file": "CMakeLists.txt", "kind": "cmake_set", "key": "DXR_RUNTIME_GIT_TAG_ANDROID" },
@@ -66,8 +95,13 @@
           ]
         },
         "linux": {
-          "auto_bump": false,
-          "reason": "Deliberately held behind the Windows pin -- the Linux plug-in build tracks an older runtime on purpose. Human-owned; the bump job must never touch it.",
+          "bump_when": "features",
+          "reason": "The Linux plug-in guards new code on DP feature macros, and ADR-020 appends a slot + macro WITHOUT bumping the plug-in ABI -- so the abi gate is blind to exactly the change this track needs. Real case: leia-plugin#264 guards on XRT_DP_VK_HAS_TRANSPARENCY_ACTIVE, first shipped in runtime v2.21.1 at ABI 5; at the then-pin v2.18.0 that code compiled out silently and had to be repinned by hand (leia-plugin#265). Feature headers are the Vulkan-only set: the Linux build compiles the VK display processor and nothing else.",
+          "feature_headers": [
+            "src/xrt/include/xrt/xrt_plugin.h",
+            "src/xrt/include/xrt/xrt_display_processor.h",
+            "src/xrt/include/xrt/xrt_display_processor_vk.h"
+          ],
           "locations": [
             { "file": "CMakeLists.txt", "kind": "cmake_set", "key": "DXR_RUNTIME_GIT_TAG_LINUX" },
             { "file": ".github/workflows/build-linux.yml", "kind": "yaml_env", "key": "RUNTIME_REF" }
@@ -79,7 +113,7 @@
       "role": "Scaffold every new vendor plug-in repo is generated from -- stale pins here seed into all future vendor repos, so it matters more than its commit count suggests",
       "tracks": {
         "windows": {
-          "auto_bump": true,
+          "bump_when": "abi",
           "locations": [
             { "file": "CMakeLists.txt", "kind": "cmake_set", "key": "DXR_RUNTIME_GIT_TAG" },
             { "file": ".github/workflows/build-windows.yml", "kind": "yaml_env", "key": "RUNTIME_REF" }

@@ -696,8 +696,8 @@ def check_unregistered_pins(report: Report) -> None:
                     "unregistered-runtime-pin",
                     "%s defines %s = %s, but no downstream-pins.json track claims it -- "
                     "runtime-pin-bump.yml will never repin it and nothing will notice it "
-                    "going stale. Add a track (auto_bump=true), or auto_bump=false WITH a "
-                    "recorded reason if it is meant to lag. See #1247." % (f, key, val),
+                    "going stale. Add a track with bump_when=abi|features, or bump_when=manual "
+                    "WITH a recorded reason if it is meant to lag. See #1247." % (f, key, val),
                 )
 
 

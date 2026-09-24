@@ -43,10 +43,9 @@ per repo, every location a pin lives. Centralized on purpose (mirroring how
 and onboarding a new vendor repo is a manifest entry, not a new workflow in their
 repo.
 
-Each location carries the file, the key, and a `track`. **Not every location
-should auto-bump** — `displayxr-leia-plugin` deliberately holds its Linux pin
-behind its Windows pin, so a location may be marked `manual` and the bumper must
-leave it alone. Where a repo's CI asserts two locations are *equal* (leia's
+Each location carries the file, the key, and a `track`, and each track carries
+its **policy** as data — `bump_when: "abi" | "features" | "manual"` (see *Bump
+policy* below). A `manual` track is human-owned and the bumper never touches it. Where a repo's CI asserts two locations are *equal* (leia's
 self-check compares workflow `RUNTIME_REF` against CMake `DXR_RUNTIME_GIT_TAG`),
 the manifest lists both and the bumper writes them in **one commit** — updating
 one alone breaks that repo's CI.
@@ -61,30 +60,94 @@ rewrite the auto-tracked locations, push `chore/runtime-pin-<tag>`, open a PR.
 - **Branch name carries the tag** — a fixed branch name strands a stale PR and
   silently attaches the next run to it (the website editorial sync hit exactly
   this).
+- **Branch name carries the track too** (`chore/runtime-pin-<tag>-<track>`) — two
+  tracks of one repo can qualify on the same tag, and a shared branch would let the
+  second overwrite the first.
 - **Idempotent**: already at the tag → exit 0, no PR, no noise.
+- **Never backwards**: a pinned tag newer than the released one (a patch on an older
+  line) is skipped.
 - Auth: the `create-github-app-token` publish-bot App, as `versions-bump.yml` uses.
 
-### Bump policy: ABI-gated, never tag-chasing
+### Bump policy: gated, never tag-chasing
 
 **Do not bump a runtime-tag pin just because a newer tag exists.** In a vendor
 plug-in the pin is load-bearing twice over: `installer/CMakeLists.txt` *derives*
 `MIN_RUNTIME_VERSION` from `DXR_RUNTIME_GIT_TAG` by regex, so raising the pin
 raises the installer's minimum-runtime floor. Chasing every patch release would
 make a plug-in installer refuse a runtime it works perfectly well against
-(`exit 5` = "runtime below the ABI floor"), for no gain.
+(`exit 5` = "runtime below the ABI floor"), for no gain. Even where no installer
+derives a floor, a newer pin compiles the plug-in against newer headers and so
+raises the runtime it effectively needs.
 
-The gate is therefore the plug-in ABI, not the version number: compare
-`XRT_PLUGIN_API_VERSION_CURRENT` at the new tag against its value at the tag the
-downstream repo currently pins.
+What *is* worth a repin is something the plug-in can compile in. Each track names
+which signal counts, as `bump_when` in `downstream-pins.json`, so policy is data
+rather than workflow logic:
 
-| ABI at new tag vs pinned tag | Action |
-|---|---|
-| unchanged (typical patch release) | no PR — nothing to gain, floor raise is pure cost |
-| changed (a slot was appended) | open the PR — the new slot is worth pinning to |
+| `bump_when` | Repins when, between the pinned tag and the new tag… | Tracks |
+|---|---|---|
+| `abi` | `XRT_PLUGIN_API_VERSION_CURRENT` changed | leia `windows`, leia `android`, vendor-template `windows` |
+| `features` | the **feature surface** of the track's headers changed (below) | leia `linux` |
+| `manual` | never — human-owned; `reason` required | — |
 
-This is the same comparison `scripts/check_plugin_abi.py` already performs in the
-opposite direction, so the gate reuses it rather than reimplementing the notion of
-ABI compatibility.
+**`abi`** compares `XRT_PLUGIN_API_VERSION_CURRENT` at both tags — the same
+comparison `scripts/check_plugin_abi.py` performs in the opposite direction, so
+the gate reuses its resolver rather than reimplementing ABI compatibility.
+
+**`features`** exists because the ABI gate is blind to the commonest real change.
+ADR-020 extends a display-processor vtable by **appending** a slot and publishing a
+`XRT_DP_<API>_HAS_<FEATURE>` macro — at an **unchanged** ABI (it has been 5 since
+v2.16.0). A plug-in guards the new code on the macro, so at an old pin the code
+compiles out **silently**. That is exactly what happened to leia-plugin#264: it
+guards the Linux lazy-capture path on `XRT_DP_VK_HAS_TRANSPARENCY_ACTIVE`, first
+shipped in runtime v2.21.1; the Linux track sat at v2.18.0 and had to be repinned
+by hand (leia-plugin#265). The feature surface of a header set is:
+
+- every object-like `#define XRT_*_HAS_*` feature macro (added, removed, or redefined);
+- every function-pointer member of every `struct` — a vtable slot — keyed
+  `struct.member`, compared by whitespace-normalised declaration (added, removed,
+  or re-signed);
+- `XRT_PLUGIN_API_VERSION_CURRENT`, when `xrt_plugin.h` is in the set — so
+  `features` is a strict superset of `abi`.
+
+Comments are stripped first, so doc edits, reflowed declarations and new
+`static inline` helpers are **not** triggers (a header that changed only that way is
+reported as a note in the skip reason). The header set is `feature_surface.headers`
+(`xrt_plugin.h` + every `xrt_display_processor*.h`), or the track's own
+`feature_headers` — narrowed to what that track's build compiles, so a slot in an
+API it never builds cannot raise its floor. Leia's Linux build compiles only the
+Vulkan display processor, so its set is `xrt_plugin.h`, `xrt_display_processor.h`,
+`xrt_display_processor_vk.h`. `scripts/tests/test_downstream_pin_bump.py` fails if a
+new `xrt_display_processor*.h` is not in the default set.
+
+The PR a `features` bump opens writes **both** of the track's locations (CMake tag
+and CI `RUNTIME_REF`) in one commit and lists each trigger, e.g. *new feature macro
+`XRT_DP_VK_HAS_TRANSPARENCY_ACTIVE` (`xrt_display_processor_vk.h`)*.
+
+**Dry run.** `verdict` computes the decision between any two runtime tags without
+reading a downstream repo or writing anything (local tags when present, else
+raw.githubusercontent.com):
+
+```
+python3 scripts/downstream_pin_bump.py verdict --from v2.21.0 --to v2.21.1 \
+    --repo displayxr-leia-plugin --track linux      # BUMP: XRT_DP_VK_HAS_TRANSPARENCY_ACTIVE + slot
+python3 scripts/downstream_pin_bump.py verdict --from v2.20.1 --to v2.21.0 \
+    --repo displayxr-leia-plugin --track linux      # SKIP: no macro/slot/ABI change
+python3 scripts/downstream_pin_bump.py verdict --from vA --to vB --policy abi   # compare policies
+```
+
+Replaying v2.16.0 → v2.21.1 (46 release pairs): `abi` fires **zero** times;
+`features` over all DP headers fires four times (v2.16.9 background preview on
+every API; v2.16.19 `XRT_DP_VK_HAS_FRAME_DROPPED`; v2.18.0
+`XRT_DP_VK_HAS_SNAP_WINDOW_RECT`; v2.21.1 `XRT_DP_VK_HAS_TRANSPARENCY_ACTIVE`). The
+hand-set Windows (v2.16.9) and Android (v2.16.19) pins sit exactly on two of those —
+humans have been applying the feature rule by hand. Moving those tracks to
+`features` (with per-API `feature_headers`) is the natural follow-up; it is not
+done here because it changes when the Windows installer's floor moves.
+
+**Not visible to either gate:** a layout-only coupling with no macro. Leia's Linux
+floor v2.14.6 came from `vk_bundle` ABI-fingerprint fields (#1243) in
+`auxiliary/vk`, outside the DP headers, where an older ref simply fails to compile.
+That class still needs a human, or a feature macro added alongside it.
 
 **Derived values are not pins.** `installer/CMakeLists.txt` computes its floor from
 the pin; a bumper that edits it too would be writing to a value CMake overwrites.
@@ -232,5 +295,5 @@ consumer genuinely cannot run without.
 ## Invariant
 
 A pin that no job verifies is a pin that rots silently until a release train
-trips over it. Every pin in the manifest is either auto-bumped or
-canary-checked — and every consumer floor is re-derived rather than trusted.
+trips over it. Every pin in the manifest is either auto-bumped
+under a declared policy, human-owned with a recorded reason, or canary-checked — and every consumer floor is re-derived rather than trusted.
