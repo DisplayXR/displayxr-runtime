@@ -45,6 +45,13 @@ extern "C" {
  * synchronously and Android hands back an AHardwareBuffer, so neither ever
  * exports one — @c ipc_handle_weave_get_fence has no non-Windows branch at all.
  * Requiring a fence there would mean never latching.
+ *
+ * Desktop Linux (spec v10, #1699) DOES have a fence, but it is the wrong shape
+ * for this latch: a sync_file signals once, so v10 returns a FRESH release fence
+ * on every frame (XrWeaveOutputSyncDXR), riding the submit reply — it is never
+ * part of the once-per-allocation export this latch guards. Only the woven
+ * dma-buf is, so Linux answers false here like macOS and Android: a frame whose
+ * texture export succeeded latches whether or not that frame had a fence.
  */
 static inline bool
 oxr_weave_platform_exports_fence(void)
