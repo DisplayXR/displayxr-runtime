@@ -558,10 +558,11 @@ Wayland drag.
    preferred probe is `xrWeaveSnapWindowGridDXR` (XR_DXR_weave spec v11,
    #1723): the same per-point snap, looped by the runtime next to the display
    processor, the whole table in one round trip (1.4–2.7 ms for 129 × 129
-   headless). The helper's per-point `SnapWindowOriginFn` seam is unchanged;
-   the Linux test apps serve it from one grid call per table
-   (`test_apps/common/dxr_weave_snap_grid.h`), falling back to per point on a
-   pre-v11 runtime. See [XR_DXR_weave.md §5c](../extensions/XR_DXR_weave.md).
+   headless). Since displayxr-common v2.24.0 the helper sends
+   `xdg_toplevel.move` at once and builds the table on its worker from a few
+   grid calls through its grid snap provider (`set_snap_grid_provider` +
+   `DxrWeaveSnap::grid_callback`, per point on a pre-v11 runtime). See
+   [XR_DXR_weave.md §5c](../extensions/XR_DXR_weave.md).
 2. **During the compositor's drag, in the extension.** Mutter emits
    `position-changed` synchronously inside `move_resize`. The handler moves the
    window on to the nearest table entry with `move_frame` before the stage
