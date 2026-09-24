@@ -66,6 +66,14 @@
  *                      input and the presented frame. Exit code 0 = PASS.
  *                      --test-resize=WxH@N reallocates mid-run, as a window
  *                      resize or F11 does.
+ *   --lattice-selftest one Wayland drag-lattice table build per output scale
+ *                      (100 %, 200 %, 150 %) through the helper's own table
+ *                      code (dxr_wl_lattice::probe_via_grid) and the SAME
+ *                      providers the window installs (DxrWeaveSnap::callback +
+ *                      grid_callback), against the per-point build: logs the
+ *                      IPC call count and ms of each, fails unless the tables
+ *                      are identical and 100 %/200 % take <= 3 calls. Needs no
+ *                      window (pair it with --headless N).
  *
  * Needs a running displayxr-service (the run script forces XRT_FORCE_MODE=ipc):
  * a weave present-owner exists only on the service path.
@@ -74,7 +82,8 @@
 // Xlib (and, in a Wayland-capable build, wayland-client) before anything that
 // names Display / wl_surface.
 #include "dxr_linux_window.h"
-#include "dxr_weave_snap_grid.h" // #1723: the drag-lattice probe as ONE grid call
+#include "dxr_weave_snap.h"
+#include "dxr_wl_lattice.h" // --lattice-selftest: the helper's pure table build
 
 #include <X11/Xlib.h>
 #include <vulkan/vulkan.h>
@@ -197,6 +206,7 @@ struct Options
 	//! window resize / F11 does — the service must hand back a new output.
 	uint32_t resize_w = 0, resize_h = 0;
 	int resize_frame = -1;
+	bool lattice_selftest = false; //!< --lattice-selftest
 };
 
 static void
@@ -227,6 +237,8 @@ usage(const char *argv0)
 	        "service's fd count to stay flat\n"
 	        "  --test-resize=WxH@N          (headless) reallocate at frame N, "
 	        "like a window resize\n"
+	        "  --lattice-selftest           build one drag-lattice table per "
+	        "scale via the grid provider (exit 1 = FAIL)\n"
 	        "  --dump-dir=DIR               where PNGs go (default $TMPDIR, else "
 	        "/tmp)\n"
 	        "Keys: ESC quits, F11 toggles fullscreen, S toggles woven/SBS "
@@ -278,6 +290,8 @@ parse_args(int argc, char **argv, Options &o)
 		} else if (strncmp(a, "--service-pid=", 14) == 0) {
 			o.service_pid = atol(a + 14);
 		} else if (sscanf(a, "--test-resize=%ux%u@%d", &o.resize_w, &o.resize_h, &o.resize_frame) == 3) {
+		} else if (strcmp(a, "--lattice-selftest") == 0) {
+			o.lattice_selftest = true;
 		} else if (strncmp(a, "--dump-dir=", 11) == 0) {
 			o.dump_dir = a + 11;
 		} else if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) {
@@ -339,7 +353,7 @@ struct App
 
 	// ---- Window
 	DxrLinuxWindow window;
-	DxrWeaveSnapGrid weave_snap;
+	DxrWeaveSnap weave_snap;
 	WlGeometryClient wl_geom;
 	bool wl_geom_ok = false;
 
@@ -2358,7 +2372,6 @@ cleanup()
 	}
 	// Session before device: the runtime's session holds the device.
 	if (g.session != XR_NULL_HANDLE) {
-		g.weave_snap.flush_log(); // the last lattice table's IPC cost
 		xrDestroySession(g.session);
 	}
 	if (g.device != VK_NULL_HANDLE) {
@@ -2376,6 +2389,98 @@ cleanup()
 	g.wl_geom.disconnect();
 	// The window LAST: the VkSurface borrowed its connection.
 	g.window.destroy();
+}
+
+/*
+ * --lattice-selftest (#1723): one title-bar press's drag-lattice table, built
+ * exactly as displayxr-common's DxrLinuxWindow::wl_probe_lattice builds it on
+ * its worker — dxr_wl_lattice::probe_via_grid over the installed grid
+ * provider, the per-point provider for anything the grids did not answer —
+ * against the per-point build (dxr_wl_lattice::probe). The adapter below is
+ * that function's, with call counters; wl_probe_lattice itself is private.
+ */
+static bool
+lattice_selftest()
+{
+	// displayxr-common dxr_linux_window.cpp kLatticeHalf / kLatticeCell.
+	constexpr int32_t kHalf = 192, kCell = 3;
+	if (!g.weave_snap.available() || !g.weave_snap.grid_available()) {
+		LOGE("lattice selftest: xrWeaveSnapWindowRectDXR %s, xrWeaveSnapWindowGridDXR %s — nothing to test",
+		     g.weave_snap.available() ? "resolved" : "MISSING",
+		     g.weave_snap.grid_available() ? "resolved" : "MISSING");
+		return false;
+	}
+	struct Case
+	{
+		const char *name;
+		double scale;
+		int32_t rel0_x, rel0_y;
+		bool gate_calls; //!< the <= 3 calls bar applies
+	};
+	const Case cases[] = {
+	    {"100 %", 1.0, 0, 0, true},
+	    {"200 %", 2.0, 40, 25, true},
+	    {"150 %", 1.5, 37, 11, false},
+	};
+	auto ms_since = [](std::chrono::steady_clock::time_point t0) {
+		return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+	};
+	bool pass = true;
+	for (const Case &c : cases) {
+		dxr_wl_lattice::Map map;
+		map.scale = c.scale;
+		map.rel0_x = c.rel0_x;
+		map.rel0_y = c.rel0_y;
+
+		uint64_t point_calls = 0, grid_calls = 0;
+		dxr_wl_lattice::PointSnapFn point = [&point_calls](int32_t tx, int32_t ty, int32_t *ox, int32_t *oy) {
+			point_calls++;
+			return DxrWeaveSnap::callback(&g.weave_snap, 0, 0, tx, ty, ox, oy);
+		};
+		std::vector<DxrLinuxWindow::SnapGridPoint> tmp;
+		dxr_wl_lattice::GridSnapFn grid = [&grid_calls, &tmp](const dxr_wl_lattice::GridSpec &gs,
+		                                                      dxr_wl_lattice::GridPoint *out, bool *declined) {
+			const size_t n = (size_t)gs.count_x * gs.count_y;
+			tmp.assign(n, DxrLinuxWindow::SnapGridPoint{0, 0});
+			*declined = false;
+			grid_calls++;
+			if (!DxrWeaveSnap::grid_callback(&g.weave_snap, 0, 0, gs.first_x, gs.first_y, gs.step_x, gs.step_y,
+			                                 gs.count_x, gs.count_y, tmp.data(), declined)) {
+				return false;
+			}
+			for (size_t k = 0; k < n; k++) {
+				const bool none = tmp[k].dx == DxrLinuxWindow::kSnapGridNoAnswer;
+				out[k].dx = none ? dxr_wl_lattice::kGridNoAnswer : tmp[k].dx;
+				out[k].dy = none ? dxr_wl_lattice::kGridNoAnswer : tmp[k].dy;
+			}
+			return true;
+		};
+
+		auto t0 = std::chrono::steady_clock::now();
+		const dxr_wl_lattice::Probe want = dxr_wl_lattice::probe(point, map, 0, 0, kHalf, kCell);
+		const double want_ms = ms_since(t0);
+		const uint64_t want_calls = point_calls;
+
+		point_calls = 0;
+		t0 = std::chrono::steady_clock::now();
+		const dxr_wl_lattice::Probe got = dxr_wl_lattice::probe_via_grid(grid, point, map, 0, 0, kHalf, kCell);
+		const double got_ms = ms_since(t0);
+		const uint64_t ipc = grid_calls + point_calls;
+
+		const bool same = want.dxs == got.dxs && want.dys == got.dys && want.declined == got.declined;
+		const bool ok = same && !want.declined && got.grid_used && (!c.gate_calls || ipc <= 3);
+		LOGI("lattice selftest %s: per-point %llu IPC calls %.1f ms | grid provider %llu IPC call(s) (%llu grid, "
+		     "%llu points, %llu single) %.2f ms | %zu entries, %zu probed, identical=%d%s%s%s -> %s",
+		     c.name, (unsigned long long)want_calls, want_ms, (unsigned long long)ipc,
+		     (unsigned long long)grid_calls, (unsigned long long)got.grid_points,
+		     (unsigned long long)point_calls, got_ms, got.dxs.size(), got.probed, (int)same,
+		     want.declined ? ", DP DECLINED" : "", got.grid_fallback != nullptr ? " | grid fallback: " : "",
+		     got.grid_fallback != nullptr ? got.grid_fallback : "",
+		     ok ? "OK" : "FAIL");
+		pass = pass && ok;
+	}
+	LOGI("lattice selftest: %s", pass ? "PASS" : "FAIL");
+	return pass;
 }
 
 int
@@ -2447,15 +2552,19 @@ main(int argc, char **argv)
 	// Drag-time snap: the helper's drag (X11 every step, Wayland the drag
 	// lattice) asks the display processor through xrWeaveSnapWindowRectDXR —
 	// served by the SERVICE's DP here, since this session is a present-owner.
-	// The Wayland lattice probe (16,641+ points per press) is fetched as ONE
-	// xrWeaveSnapWindowGridDXR and served from that table (#1723): over IPC
-	// the per-point probe was one round trip per point, 2.3-2.5 s a press.
+	// The Wayland lattice table (16,641+ points per press) is built by the
+	// helper on its worker from a few xrWeaveSnapWindowGridDXR calls through
+	// the grid provider (#1723): over IPC the per-point probe was one round
+	// trip per point, 2.3-2.5 s a press.
 	g.weave_snap.attach(g.instance, g.session, g.opt.width, g.opt.height);
 	if (!g.headless) {
-		g.window.set_snap_provider(&DxrWeaveSnapGrid::callback, &g.weave_snap);
+		g.window.set_snap_provider(&DxrWeaveSnap::callback, &g.weave_snap);
+		if (g.weave_snap.grid_available()) {
+			g.window.set_snap_grid_provider(&DxrWeaveSnap::grid_callback, &g.weave_snap);
+		}
 		LOGI("drag snap: xrWeaveSnapWindowRectDXR %s, grid snap (v11) %s",
 		     g.weave_snap.available() ? "RESOLVED" : "unavailable",
-		     g.weave_snap.grid_available() ? "RESOLVED — one call per lattice table"
+		     g.weave_snap.grid_available() ? "RESOLVED — a few calls per lattice table, on the helper's worker"
 		                                   : "unavailable — the lattice is probed point by point");
 		if (!create_surface() || !create_swapchain()) {
 			cleanup();
@@ -2466,7 +2575,15 @@ main(int argc, char **argv)
 		return 1;
 	}
 
-	const int rc = run();
+	int rc = run();
+	// After the frames: the service's weave engine (and so its display
+	// processor) exists only once this present-owner has submitted, and a
+	// snap before that is declined.
+	const bool lattice_ok = !g.opt.lattice_selftest || lattice_selftest();
 	cleanup();
+	if (!lattice_ok) {
+		LOGE("--lattice-selftest FAILED");
+		rc = rc != 0 ? rc : 1;
+	}
 	return rc;
 }

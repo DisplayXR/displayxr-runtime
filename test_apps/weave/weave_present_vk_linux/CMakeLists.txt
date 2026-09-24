@@ -48,8 +48,9 @@ endif()
 
 # displayxr-common: displayxr::linux_window (the one Linux app window, with the
 # phase-snapped drag + the Wayland drag lattice), dxr_weave_snap.h, the shared
-# u_wayland_geom.h / u_x11_scale.h copies, stb_image_write. Same pin as the
-# cube apps.
+# u_wayland_geom.h / u_x11_scale.h copies, stb_image_write, and (v2.24.0)
+# DxrWeaveSnap::grid_callback + dxr_wl_lattice.h for --lattice-selftest. Same
+# pin as the cube apps.
 include(FetchContent)
 set(DISPLAYXR_COMMON_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 get_filename_component(_dxr_ext_includes "${OPENXR_INCLUDE_DIR}" ABSOLUTE)
@@ -58,7 +59,7 @@ set(DISPLAYXR_EXTENSIONS_INCLUDE_DIR "${_dxr_ext_includes}" CACHE PATH
 FetchContent_Declare(
     displayxr_common
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    GIT_TAG v2.22.0
+    GIT_TAG v2.24.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
@@ -79,7 +80,6 @@ target_include_directories(weave_present_vk_linux PRIVATE
     ${OPENXR_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../common
-    ${_dxr_root}/test_apps/common   # dxr_weave_snap_grid.h (#1723)
 )
 target_link_libraries(weave_present_vk_linux PRIVATE
     displayxr::linux_window
