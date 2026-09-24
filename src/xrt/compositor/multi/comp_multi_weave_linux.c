@@ -98,7 +98,7 @@
 #include "util/u_logging.h"
 #include "util/u_handles.h"
 #include "util/u_debug.h"
-#include "util/u_wayland_geom.h"
+#include "util/u_weave_span2d.h"
 
 #include "vk/vk_helpers.h"
 #include "vk/vk_dmabuf.h"
@@ -1251,10 +1251,11 @@ weave_span_2d_enabled(void)
  * (weave_feed_dp_geometry), so the bands and the weave phase never disagree.
  *
  * The bands come from u_wl_offpanel_bands (pure arithmetic, pinned by
- * tests_aux_wayland_geom) in window pixels and are mapped to the output: 1:1
- * for the batch / legacy layouts (the output IS the window client area, from
- * its top-left), scaled by output/window for the v6 N-view layout (the output
- * is one content view, the window at viewScale).
+ * tests_aux_wayland_geom) in window pixels and are mapped to the output by
+ * u_wl_offpanel_bands_to_output (u_weave_span2d.h, tests_aux_weave_span2d):
+ * 1:1 for the batch / legacy layouts (the output IS the window client area,
+ * from its top-left), scaled by output/window for the v6 N-view layout (the
+ * output is one content view, the window at viewScale).
  *
  * @return the band count; 0 = entirely on the panel (the common case), or no
  *         geometry, or turned off.
@@ -1306,7 +1307,7 @@ weave_offpanel_bands(struct multi_compositor *mc, bool nview, struct u_wl_rect_p
 	const uint32_t win_count =
 	    u_wl_offpanel_bands(ox, oy, panel_w, panel_h, mc->weave.win_w, mc->weave.win_h, win_bands);
 
-	// Window px -> output px (pure arithmetic, pinned by tests_aux_wayland_geom).
+	// Window px -> output px (pure arithmetic, pinned by tests_aux_weave_span2d).
 	bool whole = false;
 	const uint32_t n = u_wl_offpanel_bands_to_output(win_bands, win_count, mc->weave.win_w, mc->weave.win_h,
 	                                                 mc->weave.out_w, mc->weave.out_h, nview, out, &whole);
