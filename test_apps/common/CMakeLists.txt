@@ -44,7 +44,10 @@ FetchContent_Declare(
     # v2.21.0 moves this pin level with the Linux apps' own: it adds
     # displayxr::linux_window (displayxr-common#58) and its drag-lattice
     # follow-ups (#59, runtime#1697), both desktop-Linux only.
-    GIT_TAG v2.21.0
+    # v2.22.0: an opaque window's Wayland surface is declared opaque, so the
+    # compositor can scan a fullscreen weave out directly (displayxr-common#60,
+    # #1698). Linux-only.
+    GIT_TAG v2.22.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
