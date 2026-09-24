@@ -35,6 +35,18 @@
  * producer releases the image to VK_QUEUE_FAMILY_EXTERNAL in GENERAL, and
  * acquires the output from it in GENERAL.
  *
+ * --dmabuf (stage B, spec v10): inputs + overlay are exportable dma-bufs with
+ * the driver's DRM format modifier (input[1] in DRM ABGR8888 byte order, so both
+ * fourcc mappings run), handed over with XrWeaveDmabufDescDXR /
+ * XrWeaveOverlayDmabufDescDXR and a LIVE acquire sync_file (the probe's upload
+ * is not CPU-waited: the service's GPU wait is what orders its read). The two
+ * inputs carry OPPOSITE patterns and alternate, the woven output comes back as
+ * an XrWeaveOutputDmabufDXR (imported with its explicit modifier) and every
+ * frame is read back after waiting that frame's XrWeaveOutputSyncDXR release
+ * sync_file ON THE GPU, then checked against that frame's parity.
+ * --no-release-wait skips that wait: the negative control, which must FAIL.
+ * --linear forces LINEAR inputs.
+ *
  * Run (service already started with the sim display plug-in):
  *   SIM_DISPLAY_OUTPUT=anaglyph XRT_PLUGIN_SEARCH_PATH=build/_plugins \
  *     build/src/xrt/targets/service/displayxr-service &
@@ -459,11 +471,799 @@ split_exts(const std::string &s, std::vector<std::string> &storage)
 	}
 }
 
+static void
+barrier_cmd(VkCommandBuffer cmd,
+            VkImage image,
+            VkImageLayout old_l,
+            VkImageLayout new_l,
+            VkAccessFlags src_a,
+            VkAccessFlags dst_a,
+            VkPipelineStageFlags src_s,
+            VkPipelineStageFlags dst_s)
+{
+	VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+	b.srcAccessMask = src_a;
+	b.dstAccessMask = dst_a;
+	b.oldLayout = old_l;
+	b.newLayout = new_l;
+	b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	b.image = image;
+	b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+	vkCmdPipelineBarrier(cmd, src_s, dst_s, 0, 0, nullptr, 0, nullptr, 1, &b);
+}
+
+/*
+ *
+ * Stage B (--dmabuf): dma-buf inputs with DRM format modifiers, sync_file
+ * acquire / release fences, the woven output as a typed dma-buf.
+ *
+ * The probe links the OpenXR loader + Vulkan only, so the few calls R5's
+ * aux_vk helpers make are replicated here (same shapes as vk_dmabuf.c).
+ *
+ */
+
+#ifndef DRM_FORMAT_MOD_LINEAR
+#define DRM_FORMAT_MOD_LINEAR 0ULL
+#endif
+#define PROBE_FOURCC(a, b, c, d) ((uint32_t)(a) | ((uint32_t)(b) << 8) | ((uint32_t)(c) << 16) | ((uint32_t)(d) << 24))
+static const uint32_t kFourccARGB8888 = PROBE_FOURCC('A', 'R', '2', '4'); // bytes B,G,R,A = VK B8G8R8A8
+static const uint32_t kFourccABGR8888 = PROBE_FOURCC('A', 'B', '2', '4'); // bytes R,G,B,A = VK R8G8B8A8
+
+struct DmabufFns
+{
+	PFN_vkGetImageDrmFormatModifierPropertiesEXT get_modifier = nullptr;
+	PFN_vkGetMemoryFdPropertiesKHR get_fd_props = nullptr;
+	PFN_vkImportSemaphoreFdKHR import_sem_fd = nullptr;
+	PFN_vkGetSemaphoreFdKHR get_sem_fd = nullptr;
+};
+
+struct DmabufImage
+{
+	VkImage image = VK_NULL_HANDLE;
+	VkDeviceMemory memory = VK_NULL_HANDLE;
+	uint32_t w = 0, h = 0;
+	VkFormat format = VK_FORMAT_UNDEFINED;
+	uint32_t fourcc = 0;
+	uint64_t modifier = 0;
+	uint32_t offset = 0, stride = 0;
+	int fd = -1;           //!< The probe's own dma-buf fd (inputs); a dup() is handed over per submit.
+	bool owned_by_us = true; //!< false once released to VK_QUEUE_FAMILY_FOREIGN_EXT
+};
+
+static const VkImageUsageFlags kDmabufUsage =
+    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+
+//! Modifiers the device can EXPORT for @p format + kDmabufUsage (vkGetPhysicalDeviceImageFormatProperties2).
+static std::vector<uint64_t>
+exportable_modifiers(Vk &vk, VkFormat format)
+{
+	VkDrmFormatModifierPropertiesListEXT list = {VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT};
+	VkFormatProperties2 fp = {VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2};
+	fp.pNext = &list;
+	vkGetPhysicalDeviceFormatProperties2(vk.phys, format, &fp);
+	std::vector<VkDrmFormatModifierPropertiesEXT> props(list.drmFormatModifierCount);
+	list.pDrmFormatModifierProperties = props.data();
+	vkGetPhysicalDeviceFormatProperties2(vk.phys, format, &fp);
+	std::vector<uint64_t> out;
+	for (const auto &p : props) {
+		VkPhysicalDeviceImageDrmFormatModifierInfoEXT mi = {
+		    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT};
+		mi.drmFormatModifier = p.drmFormatModifier;
+		mi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+		VkPhysicalDeviceExternalImageFormatInfo ei = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO};
+		ei.pNext = &mi;
+		ei.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+		VkPhysicalDeviceImageFormatInfo2 ii = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2};
+		ii.pNext = &ei;
+		ii.format = format;
+		ii.type = VK_IMAGE_TYPE_2D;
+		ii.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+		ii.usage = kDmabufUsage;
+		VkExternalImageFormatProperties ep = {VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES};
+		VkImageFormatProperties2 ip = {VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2};
+		ip.pNext = &ep;
+		if (vkGetPhysicalDeviceImageFormatProperties2(vk.phys, &ii, &ip) != VK_SUCCESS) {
+			continue;
+		}
+		if (!(ep.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT)) {
+			continue;
+		}
+		if (p.drmFormatModifierPlaneCount != 1) {
+			continue; // the probe describes one memory plane
+		}
+		out.push_back(p.drmFormatModifier);
+	}
+	return out;
+}
+
+//! Exportable dma-buf image, driver-picked modifier (or LINEAR); exports ONE fd.
+static bool
+create_dmabuf_image(Vk &vk, const DmabufFns &fn, uint32_t w, uint32_t h, VkFormat format, uint32_t fourcc,
+                    bool force_linear, DmabufImage &out)
+{
+	std::vector<uint64_t> mods;
+	if (!force_linear) {
+		mods = exportable_modifiers(vk, format);
+	}
+	if (mods.empty()) {
+		mods.push_back(DRM_FORMAT_MOD_LINEAR);
+	}
+	VkImageDrmFormatModifierListCreateInfoEXT ml = {VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT};
+	ml.drmFormatModifierCount = (uint32_t)mods.size();
+	ml.pDrmFormatModifiers = mods.data();
+	VkExternalMemoryImageCreateInfo ext = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO};
+	ext.pNext = &ml;
+	ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+	VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+	ici.pNext = &ext;
+	ici.imageType = VK_IMAGE_TYPE_2D;
+	ici.format = format;
+	ici.extent = {w, h, 1};
+	ici.mipLevels = 1;
+	ici.arrayLayers = 1;
+	ici.samples = VK_SAMPLE_COUNT_1_BIT;
+	ici.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+	ici.usage = kDmabufUsage;
+	ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	VK_CHECK_B(vkCreateImage(vk.device, &ici, nullptr, &out.image));
+	VkMemoryRequirements req;
+	vkGetImageMemoryRequirements(vk.device, out.image, &req);
+	uint32_t type = 0;
+	if (!find_memory_type(vk, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &type)) {
+		LOG("no device-local memory type for the dma-buf");
+		return false;
+	}
+	VkMemoryDedicatedAllocateInfo ded = {VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+	ded.image = out.image;
+	VkExportMemoryAllocateInfo exp = {VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO};
+	exp.pNext = &ded;
+	exp.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+	VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+	mai.pNext = &exp;
+	mai.allocationSize = req.size;
+	mai.memoryTypeIndex = type;
+	VK_CHECK_B(vkAllocateMemory(vk.device, &mai, nullptr, &out.memory));
+	VK_CHECK_B(vkBindImageMemory(vk.device, out.image, out.memory, 0));
+
+	VkImageDrmFormatModifierPropertiesEXT mp = {VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT};
+	VK_CHECK_B(fn.get_modifier(vk.device, out.image, &mp));
+	VkImageSubresource sub = {VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT, 0, 0};
+	VkSubresourceLayout layout = {};
+	vkGetImageSubresourceLayout(vk.device, out.image, &sub, &layout);
+
+	VkMemoryGetFdInfoKHR gfi = {VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR};
+	gfi.memory = out.memory;
+	gfi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+	VK_CHECK_B(vk.get_memory_fd(vk.device, &gfi, &out.fd));
+	out.w = w;
+	out.h = h;
+	out.format = format;
+	out.fourcc = fourcc;
+	out.modifier = mp.drmFormatModifier;
+	out.offset = (uint32_t)layout.offset;
+	out.stride = (uint32_t)layout.rowPitch;
+	out.owned_by_us = true;
+	return true;
+}
+
+//! Import the service's woven dma-buf output through its descriptor (explicit modifier). Consumes d.fd on success.
+static bool
+import_dmabuf_output(Vk &vk, const DmabufFns &fn, const XrWeaveOutputDmabufDXR &d, DmabufImage &out)
+{
+	VkFormat format = d.drmFourcc == kFourccABGR8888 ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_B8G8R8A8_UNORM;
+	std::vector<VkSubresourceLayout> planes(d.planeCount);
+	for (uint32_t i = 0; i < d.planeCount; i++) {
+		planes[i] = {};
+		planes[i].offset = d.offsets[i];
+		planes[i].rowPitch = d.strides[i];
+	}
+	VkImageDrmFormatModifierExplicitCreateInfoEXT ex = {
+	    VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT};
+	ex.drmFormatModifier = d.drmModifier;
+	ex.drmFormatModifierPlaneCount = d.planeCount;
+	ex.pPlaneLayouts = planes.data();
+	VkExternalMemoryImageCreateInfo ext = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO};
+	ext.pNext = &ex;
+	ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+	VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+	ici.pNext = &ext;
+	ici.imageType = VK_IMAGE_TYPE_2D;
+	ici.format = format;
+	ici.extent = {d.width, d.height, 1};
+	ici.mipLevels = 1;
+	ici.arrayLayers = 1;
+	ici.samples = VK_SAMPLE_COUNT_1_BIT;
+	ici.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+	ici.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+	ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	VK_CHECK_B(vkCreateImage(vk.device, &ici, nullptr, &out.image));
+	VkMemoryFdPropertiesKHR fdp = {VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
+	VK_CHECK_B(fn.get_fd_props(vk.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, d.fd, &fdp));
+	VkMemoryRequirements req;
+	vkGetImageMemoryRequirements(vk.device, out.image, &req);
+	uint32_t type = 0;
+	if (!find_memory_type(vk, req.memoryTypeBits & fdp.memoryTypeBits, 0, &type)) {
+		LOG("no memory type can import the woven dma-buf");
+		return false;
+	}
+	VkMemoryDedicatedAllocateInfo ded = {VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+	ded.image = out.image;
+	VkImportMemoryFdInfoKHR imp = {VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR};
+	imp.pNext = &ded;
+	imp.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+	imp.fd = d.fd;
+	VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+	mai.pNext = &imp;
+	mai.allocationSize = req.size > d.size ? req.size : d.size;
+	mai.memoryTypeIndex = type;
+	VK_CHECK_B(vkAllocateMemory(vk.device, &mai, nullptr, &out.memory));
+	VK_CHECK_B(vkBindImageMemory(vk.device, out.image, out.memory, 0));
+	out.w = d.width;
+	out.h = d.height;
+	out.format = format;
+	out.fourcc = d.drmFourcc;
+	out.modifier = d.drmModifier;
+	return true;
+}
+
+static void
+destroy_dmabuf_image(Vk &vk, DmabufImage &img)
+{
+	vkDestroyImage(vk.device, img.image, nullptr);
+	vkFreeMemory(vk.device, img.memory, nullptr);
+	if (img.fd >= 0) {
+		close(img.fd);
+	}
+	img = DmabufImage{};
+}
+
+static bool
+create_sync_fd_semaphore(Vk &vk, bool exportable, VkSemaphore *out)
+{
+	VkExportSemaphoreCreateInfo esci = {VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO};
+	esci.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+	VkSemaphoreCreateInfo sci = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+	sci.pNext = exportable ? &esci : nullptr;
+	VK_CHECK_B(vkCreateSemaphore(vk.device, &sci, nullptr, out));
+	return true;
+}
+
+//! Per-frame recording state of the dma-buf mode: one upload cmd (signals the
+//! acquire semaphore) and one readback cmd, each with its own fence.
+struct DmabufCtx
+{
+	Vk *vk = nullptr;
+	DmabufFns fn;
+	VkCommandBuffer up_cmd = VK_NULL_HANDLE, rb_cmd = VK_NULL_HANDLE;
+	VkFence up_fence = VK_NULL_HANDLE, rb_fence = VK_NULL_HANDLE;
+	bool up_pending = false;
+	VkSemaphore acq_sem = VK_NULL_HANDLE; //!< exportable SYNC_FD, signalled by the upload
+	VkSemaphore rel_sem = VK_NULL_HANDLE; //!< the service's release sync_file is imported here
+};
+
+static void
+foreign_barrier(VkCommandBuffer cmd, uint32_t qfi, VkImage image, bool acquire, VkImageLayout old_l,
+                VkImageLayout new_l, VkAccessFlags access, VkPipelineStageFlags stage)
+{
+	VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+	b.srcAccessMask = acquire ? 0 : access;
+	b.dstAccessMask = acquire ? access : 0;
+	b.oldLayout = old_l;
+	b.newLayout = new_l;
+	b.srcQueueFamilyIndex = acquire ? VK_QUEUE_FAMILY_FOREIGN_EXT : qfi;
+	b.dstQueueFamilyIndex = acquire ? qfi : VK_QUEUE_FAMILY_FOREIGN_EXT;
+	b.image = image;
+	b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+	vkCmdPipelineBarrier(cmd, acquire ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : stage,
+	                     acquire ? stage : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+}
+
+static bool
+begin(VkCommandBuffer cmd)
+{
+	VK_CHECK_B(vkResetCommandBuffer(cmd, 0));
+	VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	VK_CHECK_B(vkBeginCommandBuffer(cmd, &bi));
+	return true;
+}
+
+/*!
+ * "Render" @p img (a staging copy — the probe's stand-in for a GPU producer)
+ * and hand it to the service: acquire from FOREIGN (after the first frame),
+ * copy, release to FOREIGN in GENERAL, signal acq_sem, and export it as the
+ * acquire sync_file — WITHOUT a CPU wait, so the service's GPU wait is what
+ * orders its read after this write. @p out_fd is the fence (-1 if @p fence is false).
+ */
+static bool
+dmabuf_upload(DmabufCtx &c, DmabufImage &img, const Buffer &staging, bool fence, int *out_fd)
+{
+	Vk &vk = *c.vk;
+	*out_fd = -1;
+	if (c.up_pending) {
+		VK_CHECK_B(vkWaitForFences(vk.device, 1, &c.up_fence, VK_TRUE, 5ULL * 1000 * 1000 * 1000));
+		VK_CHECK_B(vkResetFences(vk.device, 1, &c.up_fence));
+		c.up_pending = false;
+	}
+	if (!begin(c.up_cmd)) {
+		return false;
+	}
+	if (img.owned_by_us) {
+		barrier_cmd(c.up_cmd, img.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+		            VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+	} else {
+		foreign_barrier(c.up_cmd, vk.qfi, img.image, true, VK_IMAGE_LAYOUT_GENERAL,
+		                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+		                VK_PIPELINE_STAGE_TRANSFER_BIT);
+	}
+	VkBufferImageCopy region = {};
+	region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+	region.imageExtent = {img.w, img.h, 1};
+	vkCmdCopyBufferToImage(c.up_cmd, staging.buffer, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+	foreign_barrier(c.up_cmd, vk.qfi, img.image, false, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+	img.owned_by_us = false;
+	VK_CHECK_B(vkEndCommandBuffer(c.up_cmd));
+	VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+	si.commandBufferCount = 1;
+	si.pCommandBuffers = &c.up_cmd;
+	si.signalSemaphoreCount = fence ? 1 : 0;
+	si.pSignalSemaphores = &c.acq_sem;
+	VK_CHECK_B(vkQueueSubmit(vk.queue, 1, &si, c.up_fence));
+	c.up_pending = true;
+	if (fence) {
+		VkSemaphoreGetFdInfoKHR gi = {VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR};
+		gi.semaphore = c.acq_sem;
+		gi.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+		VK_CHECK_B(c.fn.get_sem_fd(vk.device, &gi, out_fd));
+	} else {
+		// No acquire fence on this submit: honour the v9 contract instead.
+		VK_CHECK_B(vkWaitForFences(vk.device, 1, &c.up_fence, VK_TRUE, 5ULL * 1000 * 1000 * 1000));
+		VK_CHECK_B(vkResetFences(vk.device, 1, &c.up_fence));
+		c.up_pending = false;
+	}
+	return true;
+}
+
+/*!
+ * Read the woven output back: wait the release sync_file ON THE GPU (import
+ * into rel_sem, waited by the readback submit) unless @p release_fd is -1,
+ * acquire from FOREIGN, copy, release back. @p release_fd is consumed.
+ */
+static bool
+dmabuf_readback(DmabufCtx &c, DmabufImage &img, Buffer &rb, int release_fd)
+{
+	Vk &vk = *c.vk;
+	bool wait = false;
+	if (release_fd >= 0) {
+		VkImportSemaphoreFdInfoKHR ii = {VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR};
+		ii.semaphore = c.rel_sem;
+		ii.flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT;
+		ii.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+		ii.fd = release_fd;
+		if (c.fn.import_sem_fd(vk.device, &ii) != VK_SUCCESS) {
+			close(release_fd);
+			LOG("FAIL: release sync_file import");
+			return false;
+		}
+		wait = true; // Vulkan owns release_fd now
+	}
+	if (!begin(c.rb_cmd)) {
+		return false;
+	}
+	foreign_barrier(c.rb_cmd, vk.qfi, img.image, true, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+	                VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+	VkBufferImageCopy region = {};
+	region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+	region.imageExtent = {img.w, img.h, 1};
+	vkCmdCopyImageToBuffer(c.rb_cmd, img.image, VK_IMAGE_LAYOUT_GENERAL, rb.buffer, 1, &region);
+	foreign_barrier(c.rb_cmd, vk.qfi, img.image, false, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+	                VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+	VK_CHECK_B(vkEndCommandBuffer(c.rb_cmd));
+	const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+	VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+	si.waitSemaphoreCount = wait ? 1 : 0;
+	si.pWaitSemaphores = &c.rel_sem;
+	si.pWaitDstStageMask = &stage;
+	si.commandBufferCount = 1;
+	si.pCommandBuffers = &c.rb_cmd;
+	VK_CHECK_B(vkQueueSubmit(vk.queue, 1, &si, c.rb_fence));
+	VK_CHECK_B(vkWaitForFences(vk.device, 1, &c.rb_fence, VK_TRUE, 5ULL * 1000 * 1000 * 1000));
+	VK_CHECK_B(vkResetFences(vk.device, 1, &c.rb_fence));
+	return true;
+}
+
+//! Fill a staging buffer with a window-sized squeezed-SBS input in @p fourcc byte order.
+static void
+fill_input(Buffer &b, uint32_t fourcc, bool swapped)
+{
+	std::vector<uint8_t> px((size_t)kWinW * kWinH * 4);
+	for (uint32_t y = 0; y < kWinH; y++) {
+		for (uint32_t x = 0; x < kWinW; x++) {
+			put_px(px, kWinW, (int)x, (int)y, 32, 32, 32);
+		}
+	}
+	// parity 0: A red, B cyan; parity 1: swapped — so a stale output reads as the other parity.
+	fill_sbs_rect(px, kWinW, kRectA, swapped ? 0x00 : 0xFF, swapped ? 0xFF : 0x00);
+	fill_sbs_rect(px, kWinW, kRectB, swapped ? 0xFF : 0x00, swapped ? 0x00 : 0xFF);
+	if (fourcc == kFourccABGR8888) {
+		for (size_t i = 0; i < px.size(); i += 4) {
+			std::swap(px[i + 0], px[i + 2]); // BGRA -> RGBA byte order
+		}
+	}
+	memcpy(b.map, px.data(), px.size());
+}
+
+static void
+fill_dmabuf_desc(XrWeaveDmabufDescDXR &d, const DmabufImage &img, int fd, uint64_t buffer_id)
+{
+	d.fd = fd;
+	d.width = img.w;
+	d.height = img.h;
+	d.drmFourcc = img.fourcc;
+	d.drmModifier = img.modifier;
+	d.planeCount = 1;
+	d.offsets[0] = img.offset;
+	d.strides[0] = img.stride;
+	d.bufferId = buffer_id;
+}
+
+/*!
+ * The whole --dmabuf run. Two window-sized inputs (input[0] ARGB8888 = BGRA
+ * bytes, input[1] ABGR8888 = RGBA bytes, so both fourcc mappings are exercised)
+ * carry OPPOSITE patterns; they alternate per frame, each frame is re-rendered
+ * into and handed over with a live acquire sync_file, and each frame's woven
+ * output is read back after waiting that frame's release sync_file and checked
+ * against that frame's parity. Without the release wait (--no-release-wait) a
+ * readback that runs ahead of the weave sees the previous frame's parity.
+ */
+static bool
+run_dmabuf(Vk &vk,
+           XrSession session,
+           PFN_xrWeaveSubmitDXR pfn_submit,
+           int frames,
+           long service_pid,
+           bool release_wait,
+           bool force_linear,
+           const std::string &dump_dir)
+{
+	DmabufCtx c;
+	c.vk = &vk;
+	c.fn.get_modifier = (PFN_vkGetImageDrmFormatModifierPropertiesEXT)vkGetDeviceProcAddr(
+	    vk.device, "vkGetImageDrmFormatModifierPropertiesEXT");
+	c.fn.get_fd_props = (PFN_vkGetMemoryFdPropertiesKHR)vkGetDeviceProcAddr(vk.device, "vkGetMemoryFdPropertiesKHR");
+	c.fn.import_sem_fd = (PFN_vkImportSemaphoreFdKHR)vkGetDeviceProcAddr(vk.device, "vkImportSemaphoreFdKHR");
+	c.fn.get_sem_fd = (PFN_vkGetSemaphoreFdKHR)vkGetDeviceProcAddr(vk.device, "vkGetSemaphoreFdKHR");
+	if (!c.fn.get_modifier || !c.fn.get_fd_props || !c.fn.import_sem_fd || !c.fn.get_sem_fd) {
+		LOG("FAIL: dma-buf / sync_fd entry points unavailable on the probe device");
+		return false;
+	}
+	{
+		VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+		cai.commandPool = vk.pool;
+		cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+		cai.commandBufferCount = 1;
+		vkAllocateCommandBuffers(vk.device, &cai, &c.up_cmd);
+		vkAllocateCommandBuffers(vk.device, &cai, &c.rb_cmd);
+		VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+		vkCreateFence(vk.device, &fci, nullptr, &c.up_fence);
+		vkCreateFence(vk.device, &fci, nullptr, &c.rb_fence);
+		if (!create_sync_fd_semaphore(vk, true, &c.acq_sem) || !create_sync_fd_semaphore(vk, false, &c.rel_sem)) {
+			return false;
+		}
+	}
+
+	bool pass = true;
+	DmabufImage input[2], overlay;
+	Buffer staging[2], ov_staging, rb;
+	const uint32_t fourcc[2] = {kFourccARGB8888, kFourccABGR8888};
+	const VkFormat vkfmt[2] = {VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM};
+	for (int i = 0; i < 2; i++) {
+		if (!create_dmabuf_image(vk, c.fn, kWinW, kWinH, vkfmt[i], fourcc[i], force_linear, input[i]) ||
+		    !create_buffer(vk, (VkDeviceSize)kWinW * kWinH * 4, staging[i])) {
+			LOG("FAIL: dma-buf input setup");
+			return false;
+		}
+		fill_input(staging[i], fourcc[i], /*swapped*/ i == 1);
+		LOG("input[%d]: dma-buf fd %d, fourcc %.4s, modifier 0x%016llx, stride %u", i, input[i].fd,
+		    (const char *)&input[i].fourcc, (unsigned long long)input[i].modifier, input[i].stride);
+	}
+	if (!create_dmabuf_image(vk, c.fn, kWinW, kWinH, VK_FORMAT_B8G8R8A8_UNORM, kFourccARGB8888, force_linear,
+	                         overlay) ||
+	    !create_buffer(vk, (VkDeviceSize)kWinW * kWinH * 4, ov_staging) ||
+	    !create_buffer(vk, (VkDeviceSize)kWinW * kWinH * 4, rb)) {
+		LOG("FAIL: overlay / readback setup");
+		return false;
+	}
+	{
+		std::vector<uint8_t> ov_px((size_t)kWinW * kWinH * 4, 0);
+		for (int y = kOverlayBar.offset.y; y < kOverlayBar.offset.y + kOverlayBar.extent.height; y++) {
+			for (int x = kOverlayBar.offset.x; x < kOverlayBar.offset.x + kOverlayBar.extent.width; x++) {
+				put_px(ov_px, kWinW, x, y, 230, 13, 230, 255);
+			}
+		}
+		memcpy(ov_staging.map, ov_px.data(), ov_px.size());
+		int unused = -1;
+		if (!dmabuf_upload(c, overlay, ov_staging, false, &unused)) {
+			return false;
+		}
+	}
+
+	XrRect2Di rects[2] = {kRectA, kRectB};
+	DmabufImage output;
+	uint64_t last_fv = 0;
+	int probe_fds_early = -1, svc_fds_early = -1;
+	int bad_frames = 0, neg_release = 0, extra_out_fds = 0;
+	uint64_t out_modifier = 0;
+	for (int frame = 0; frame < frames; frame++) {
+		const int k = frame & 1;
+		int acq_fd = -1;
+		if (!dmabuf_upload(c, input[k], staging[k], true, &acq_fd)) {
+			LOG("FAIL: upload frame %d", frame);
+			return false;
+		}
+
+		XrWeaveDmabufDescDXR in_desc = {(XrStructureType)XR_TYPE_WEAVE_DMABUF_DESC_DXR};
+		fill_dmabuf_desc(in_desc, input[k], dup(input[k].fd), (uint64_t)(k + 1)); // buffer-id keyed
+		XrWeaveOverlayDmabufDescDXR ov_desc = {(XrStructureType)XR_TYPE_WEAVE_OVERLAY_DMABUF_DESC_DXR};
+		fill_dmabuf_desc(*(XrWeaveDmabufDescDXR *)(void *)&ov_desc, overlay, dup(overlay.fd), 0); // inode keyed
+		ov_desc.type = (XrStructureType)XR_TYPE_WEAVE_OVERLAY_DMABUF_DESC_DXR;
+		XrWeaveSubmitSyncDXR sync = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_SYNC_DXR};
+		sync.acquireFenceFd = acq_fd;
+		XrWeaveSubmitOverlaysDXR ov = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_OVERLAYS_DXR};
+		ov.rectCount = 0;
+		XrWeaveSubmitRectsDXR batch = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_RECTS_DXR};
+		batch.rectCount = 2;
+		batch.rects = rects;
+		// chain: submit -> batch -> ov -> in_desc -> ov_desc -> sync
+		ov_desc.next = &sync;
+		in_desc.next = &ov_desc;
+		ov.next = &in_desc;
+		batch.next = &ov;
+		XrWeaveSubmitInfoDXR submit = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_INFO_DXR};
+		submit.next = &batch;
+		submit.firstChunk = XR_TRUE;
+
+		XrWeaveOutputSyncDXR out_sync = {(XrStructureType)XR_TYPE_WEAVE_OUTPUT_SYNC_DXR};
+		XrWeaveOutputDmabufDXR out_dmabuf = {(XrStructureType)XR_TYPE_WEAVE_OUTPUT_DMABUF_DXR};
+		out_dmabuf.next = &out_sync;
+		XrWeaveOutputDXR out = {(XrStructureType)XR_TYPE_WEAVE_OUTPUT_DXR};
+		out.next = &out_dmabuf;
+		XrResult r = pfn_submit(session, &submit, &out);
+		if (XR_FAILED(r)) {
+			// Not XR_SUCCESS: every fd we passed is still ours.
+			close(in_desc.fd);
+			close(ov_desc.fd);
+			close(acq_fd);
+			LOG("FAIL: xrWeaveSubmitDXR (dma-buf) frame %d -> %d", frame, (int)r);
+			return false;
+		}
+		if (out_dmabuf.fd >= 0) {
+			if (output.image != VK_NULL_HANDLE) {
+				extra_out_fds++;
+				close(out_dmabuf.fd);
+			} else {
+				LOG("frame %d: woven output dma-buf fd %d %ux%u fourcc %.4s modifier 0x%016llx planes %u "
+				    "offset %u stride %u size %llu",
+				    frame, out_dmabuf.fd, out_dmabuf.width, out_dmabuf.height,
+				    (const char *)&out_dmabuf.drmFourcc, (unsigned long long)out_dmabuf.drmModifier,
+				    out_dmabuf.planeCount, out_dmabuf.offsets[0], out_dmabuf.strides[0],
+				    (unsigned long long)out_dmabuf.size);
+				out_modifier = out_dmabuf.drmModifier;
+				if (!import_dmabuf_output(vk, c.fn, out_dmabuf, output)) {
+					close(out_dmabuf.fd);
+					LOG("FAIL: could not import the woven dma-buf through its descriptor");
+					return false;
+				}
+			}
+		}
+		if (output.image == VK_NULL_HANDLE) {
+			LOG("FAIL: frame %d: no woven dma-buf yet", frame);
+			if (out_sync.releaseFenceFd >= 0) {
+				close(out_sync.releaseFenceFd);
+			}
+			return false;
+		}
+		if (out_sync.releaseFenceFd < 0) {
+			neg_release++;
+		}
+		if (out.fenceValue <= last_fv) {
+			LOG("FAIL: fenceValue not monotonic (%llu after %llu)", (unsigned long long)out.fenceValue,
+			    (unsigned long long)last_fv);
+			pass = false;
+		}
+		last_fv = out.fenceValue;
+		if (frame == 0) {
+			LOG("frame 0: woven %ux%u, release fence fd %d, fenceValue=%llu", out.width, out.height,
+			    out_sync.releaseFenceFd, (unsigned long long)out.fenceValue);
+		}
+
+		int rel = out_sync.releaseFenceFd;
+		if (!release_wait && rel >= 0) {
+			close(rel); // negative control: read without waiting the weave
+			rel = -1;
+		}
+		if (!dmabuf_readback(c, output, rb, rel)) {
+			return false;
+		}
+		std::vector<uint8_t> px((const uint8_t *)rb.map, (const uint8_t *)rb.map + rb.size);
+		uint8_t ar, ag, ab, aa, br, bg, bb, ba, vr, vg, vb, va, gr, gg, gb, ga;
+		sample(px, kWinW, kRectA.offset.x + kRectA.extent.width / 2, kRectA.offset.y + kRectA.extent.height / 2,
+		       &ar, &ag, &ab, &aa);
+		sample(px, kWinW, kRectB.offset.x + kRectB.extent.width / 2, kRectB.offset.y + kRectB.extent.height / 2,
+		       &br, &bg, &bb, &ba);
+		sample(px, kWinW, kOverlayBar.offset.x + kOverlayBar.extent.width / 2,
+		       kOverlayBar.offset.y + kOverlayBar.extent.height / 2, &vr, &vg, &vb, &va);
+		sample(px, kWinW, 10, 10, &gr, &gg, &gb, &ga);
+		auto red = [](uint8_t r, uint8_t g, uint8_t b) { return r > 150 && g < 80 && b < 80; };
+		auto cyan = [](uint8_t r, uint8_t g, uint8_t b) { return r < 80 && g > 150 && b > 150; };
+		const bool a_ok = k == 0 ? red(ar, ag, ab) : cyan(ar, ag, ab);
+		const bool b_ok = k == 0 ? cyan(br, bg, bb) : red(br, bg, bb);
+		const bool ov_ok = vr > 150 && vb > 150 && vg < 80 && va > 200;
+		const bool gap_ok = ga < 40 && aa > 200;
+		const bool ok = a_ok && b_ok && ov_ok && gap_ok;
+		if (!ok) {
+			if (bad_frames < 5) {
+				LOG("frame %d (parity %d) WRONG: rectA (%u,%u,%u) rectB (%u,%u,%u) bar (%u,%u,%u,a=%u) "
+				    "gap a=%u",
+				    frame, k, ar, ag, ab, br, bg, bb, vr, vg, vb, va, ga);
+			}
+			bad_frames++;
+		}
+		if (frame == 0 || frame == 1) {
+			LOG("frame %d (parity %d): rectA (%u,%u,%u) rectB (%u,%u,%u) bar (%u,%u,%u,a=%u) gap a=%u -> %s",
+			    frame, k, ar, ag, ab, br, bg, bb, vr, vg, vb, va, ga, ok ? "OK" : "WRONG");
+			if (frame == 0) {
+				dump_ppm(px, kWinW, kWinH, dump_dir + "/weave_probe_linux_dmabuf_output.ppm");
+			}
+		}
+		if (frame == 10) {
+			probe_fds_early = count_fds(0);
+			svc_fds_early = service_pid > 0 ? count_fds(service_pid) : -1;
+		}
+	}
+	int probe_fds_late = count_fds(0);
+	int svc_fds_late = service_pid > 0 ? count_fds(service_pid) : -1;
+	LOG("dma-buf: %d frames, %d with a wrong pixel (release wait %s), release fd < 0 on %d frame(s), %d extra "
+	    "output fd(s); output modifier 0x%016llx",
+	    frames, bad_frames, release_wait ? "ON" : "OFF (negative control)", neg_release, extra_out_fds,
+	    (unsigned long long)out_modifier);
+	LOG("fd counts over %d frames: probe %d -> %d, service(pid %ld) %d -> %d", frames, probe_fds_early,
+	    probe_fds_late, service_pid, svc_fds_early, svc_fds_late);
+	if (probe_fds_late != probe_fds_early || svc_fds_late != svc_fds_early) {
+		LOG("FAIL: fd count grew");
+		pass = false;
+	}
+	if (neg_release > 0 || extra_out_fds > 0) {
+		LOG("FAIL: release fd missing on %d frame(s) / %d unexpected output fd(s)", neg_release, extra_out_fds);
+		pass = false;
+	}
+	if (bad_frames > 0) {
+		LOG("%s: %d/%d frames had wrong pixels", release_wait ? "FAIL" : "negative control", bad_frames, frames);
+		pass = false;
+	}
+	destroy_dmabuf_image(vk, output);
+
+	// ---- v6 N-view atlas over dma-buf (2x1 red|cyan, zero-copy) -> WHITE.
+	{
+		const uint32_t cvw = 640, cvh = 360;
+		DmabufImage nv;
+		Buffer nv_staging;
+		bool v6ok = create_dmabuf_image(vk, c.fn, 2 * cvw, cvh, VK_FORMAT_B8G8R8A8_UNORM, kFourccARGB8888,
+		                                force_linear, nv) &&
+		            create_buffer(vk, (VkDeviceSize)2 * cvw * cvh * 4, nv_staging);
+		if (v6ok) {
+			std::vector<uint8_t> nv_px((size_t)2 * cvw * cvh * 4);
+			for (uint32_t y = 0; y < cvh; y++) {
+				for (uint32_t x = 0; x < cvw; x++) {
+					put_px(nv_px, 2 * cvw, (int)x, (int)y, 0xFF, 0x00, 0x00);
+					put_px(nv_px, 2 * cvw, (int)(cvw + x), (int)y, 0x00, 0xFF, 0xFF);
+				}
+			}
+			memcpy(nv_staging.map, nv_px.data(), nv_px.size());
+		}
+		DmabufImage v6out;
+		int rel = -1;
+		for (int frame = 0; v6ok && frame < 3; frame++) {
+			int acq_fd = -1;
+			if (!dmabuf_upload(c, nv, nv_staging, true, &acq_fd)) {
+				v6ok = false;
+				break;
+			}
+			XrWeaveSubmitSyncDXR sync = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_SYNC_DXR};
+			sync.acquireFenceFd = acq_fd;
+			XrWeaveDmabufDescDXR d = {(XrStructureType)XR_TYPE_WEAVE_DMABUF_DESC_DXR};
+			fill_dmabuf_desc(d, nv, dup(nv.fd), 7);
+			d.next = &sync;
+			XrWeaveSubmitLayoutDXR lay = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_LAYOUT_DXR};
+			lay.next = &d;
+			lay.viewCount = 2;
+			lay.tileColumns = 2;
+			lay.tileRows = 1;
+			lay.contentViewWidth = cvw;
+			lay.contentViewHeight = cvh;
+			XrWeaveSubmitInfoDXR s = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_INFO_DXR};
+			s.next = &lay;
+			s.firstChunk = XR_TRUE;
+			XrWeaveOutputSyncDXR os = {(XrStructureType)XR_TYPE_WEAVE_OUTPUT_SYNC_DXR};
+			XrWeaveOutputDmabufDXR od = {(XrStructureType)XR_TYPE_WEAVE_OUTPUT_DMABUF_DXR};
+			od.next = &os;
+			XrWeaveOutputDXR o = {(XrStructureType)XR_TYPE_WEAVE_OUTPUT_DXR};
+			o.next = &od;
+			XrResult r = pfn_submit(session, &s, &o);
+			if (XR_FAILED(r)) {
+				close(d.fd);
+				close(acq_fd);
+				LOG("v6 FAIL: xrWeaveSubmitDXR (dma-buf) frame %d -> %d", frame, (int)r);
+				v6ok = false;
+				break;
+			}
+			if (od.fd >= 0) {
+				if (v6out.image == VK_NULL_HANDLE && import_dmabuf_output(vk, c.fn, od, v6out)) {
+					LOG("v6: woven output %ux%u modifier 0x%016llx", od.width, od.height,
+					    (unsigned long long)od.drmModifier);
+				} else {
+					close(od.fd);
+				}
+			}
+			if (rel >= 0) {
+				close(rel);
+			}
+			rel = os.releaseFenceFd; // wait only the last frame's
+		}
+		if (v6ok && v6out.image != VK_NULL_HANDLE && v6out.w == cvw && v6out.h == cvh) {
+			Buffer v6rb;
+			v6ok = create_buffer(vk, (VkDeviceSize)cvw * cvh * 4, v6rb) && dmabuf_readback(c, v6out, v6rb, rel);
+			rel = -1;
+			if (v6ok) {
+				std::vector<uint8_t> v6px((const uint8_t *)v6rb.map, (const uint8_t *)v6rb.map + v6rb.size);
+				dump_ppm(v6px, cvw, cvh, dump_dir + "/weave_probe_linux_dmabuf_v6_output.ppm");
+				uint8_t r, g, b, a;
+				sample(v6px, cvw, (int)cvw / 2, (int)cvh / 2, &r, &g, &b, &a);
+				v6ok = r > 150 && g > 150 && b > 150;
+				LOG("v6 centre @(%u,%u) = (%u,%u,%u) want white -> %s", cvw / 2, cvh / 2, r, g, b,
+				    v6ok ? "OK" : "WRONG");
+				destroy_buffer(vk, v6rb);
+			}
+		} else if (v6ok) {
+			LOG("v6 FAIL: no %ux%u woven dma-buf", cvw, cvh);
+			v6ok = false;
+		}
+		if (rel >= 0) {
+			close(rel);
+		}
+		LOG("v6 N-view atlas (dma-buf): %s", v6ok ? "PASS" : "FAIL");
+		pass = pass && v6ok;
+		if (v6out.image != VK_NULL_HANDLE) {
+			destroy_dmabuf_image(vk, v6out);
+		}
+		vkDeviceWaitIdle(vk.device);
+		destroy_dmabuf_image(vk, nv);
+		destroy_buffer(vk, nv_staging);
+	}
+
+	vkDeviceWaitIdle(vk.device);
+	for (int i = 0; i < 2; i++) {
+		destroy_dmabuf_image(vk, input[i]);
+		destroy_buffer(vk, staging[i]);
+	}
+	destroy_dmabuf_image(vk, overlay);
+	destroy_buffer(vk, ov_staging);
+	destroy_buffer(vk, rb);
+	vkDestroySemaphore(vk.device, c.acq_sem, nullptr);
+	vkDestroySemaphore(vk.device, c.rel_sem, nullptr);
+	vkDestroyFence(vk.device, c.up_fence, nullptr);
+	vkDestroyFence(vk.device, c.rb_fence, nullptr);
+	return pass;
+}
+
 int
 main(int argc, char **argv)
 {
 	int frames = 600;
 	long service_pid = 0;
+	bool dmabuf = false, release_wait = true, force_linear = false;
 	std::string dump_dir = "/tmp";
 	if (const char *t = getenv("TMPDIR")) {
 		dump_dir = t;
@@ -475,8 +1275,16 @@ main(int argc, char **argv)
 			service_pid = atol(argv[i] + 14);
 		} else if (strncmp(argv[i], "--dump-dir=", 11) == 0) {
 			dump_dir = argv[i] + 11;
+		} else if (strcmp(argv[i], "--dmabuf") == 0) {
+			dmabuf = true;
+		} else if (strcmp(argv[i], "--no-release-wait") == 0) {
+			release_wait = false; // negative control: must FAIL the pixel check
+		} else if (strcmp(argv[i], "--linear") == 0) {
+			force_linear = true; // LINEAR inputs instead of the driver's pick
 		} else {
-			LOG("usage: %s [--frames=N] [--service-pid=PID] [--dump-dir=DIR]", argv[0]);
+			LOG("usage: %s [--frames=N] [--service-pid=PID] [--dump-dir=DIR] [--dmabuf [--no-release-wait] "
+			    "[--linear]]",
+			    argv[0]);
 			return 2;
 		}
 	}
@@ -598,8 +1406,18 @@ main(int argc, char **argv)
 	pfn_dext(instance, system_id, len, &len, dext_str.data());
 	std::vector<std::string> dext_storage;
 	split_exts(dext_str, dext_storage);
-	// Stage A needs OPAQUE_FD export/import on the probe's device too.
-	for (const char *need : {VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME}) {
+	// Stage A needs OPAQUE_FD export/import on the probe's device too; stage B
+	// (--dmabuf) dma-buf + DRM modifiers, the foreign queue family and SYNC_FD
+	// semaphores.
+	std::vector<const char *> needs = {VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME};
+	if (dmabuf) {
+		for (const char *e : {VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
+		                      VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME, VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME,
+		                      VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME, VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME}) {
+			needs.push_back(e);
+		}
+	}
+	for (const char *need : needs) {
 		bool have = false;
 		for (const auto &e : dext_storage) {
 			have = have || e == need;
@@ -682,6 +1500,23 @@ main(int argc, char **argv)
 	bind.windowHandle = (void *)(uintptr_t)0x1;
 	XR_CHECK(pfn_bind2(session, &bind));
 	LOG("bound fake window 0x1 at (%d,%d) %ux%u", kWinOrigin.x, kWinOrigin.y, kWinW, kWinH);
+
+	if (dmabuf) {
+		bool pass = run_dmabuf(vk, session, pfn_submit, frames, service_pid, release_wait, force_linear, dump_dir);
+		xrDestroySession(session);
+		xrDestroyInstance(instance);
+		vkDestroyFence(vk.device, vk.fence, nullptr);
+		vkDestroyCommandPool(vk.device, vk.pool, nullptr);
+		vkDestroyDevice(vk.device, nullptr);
+		vkDestroyInstance(vk.instance, nullptr);
+		if (!release_wait) {
+			// The negative control is EXPECTED to fail the pixel check.
+			LOG("%s", pass ? "NEGATIVE CONTROL DID NOT FAIL (the race did not show)" : "FAIL (expected: negative control)");
+			return pass ? 0 : 1;
+		}
+		LOG("%s", pass ? "PASS" : "FAIL");
+		return pass ? 0 : 1;
+	}
 
 	// ---- Inputs: two identical window-sized squeezed-SBS images + the overlay.
 	std::vector<uint8_t> in_px((size_t)kWinW * kWinH * 4);
