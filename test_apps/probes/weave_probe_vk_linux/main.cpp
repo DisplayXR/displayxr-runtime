@@ -54,6 +54,14 @@
  * left edge, straddling its bottom edge, wholly off it and back on, and checks
  * pixels in each (batch + v4 overlay), then the v6 N-view layout straddling.
  *
+ * --flat-regions (spec v8 on desktop Linux): the caller's flat regions must
+ * come back FLAT — input-equal, the page pixels 1:1 — and everything else
+ * woven. A per-submit XrWeaveSubmitFlatRegionsDXR over a "popup" drawn into
+ * the page on top of a 3D rect; a sticky xrWeaveSetScreenFlatRegionsDXR latch
+ * (screen-absolute, one rect partly outside the window to exercise the clip);
+ * both composed; the latch cleared (all woven again); and a v6 N-view submit
+ * whose flat half comes back as the centre view.
+ *
  * Run (service already started with the sim display plug-in):
  *   SIM_DISPLAY_OUTPUT=anaglyph XRT_PLUGIN_SEARCH_PATH=build/_plugins \
  *     build/src/xrt/targets/service/displayxr-service &
@@ -1266,12 +1274,246 @@ run_span2d(Vk &vk,
 	return pass;
 }
 
+/*
+ *
+ * --flat-regions: flat regions painted flat (spec v8 on desktop Linux).
+ *
+ */
+
+//! Output pixel == input pixel (each channel within 3, both opaque).
+static bool
+flat_check_equal(const std::vector<uint8_t> &out_px,
+                 const std::vector<uint8_t> &in_px,
+                 uint32_t w,
+                 const char *what,
+                 int x,
+                 int y)
+{
+	uint8_t r, g, b, a, ir, ig, ib, ia;
+	sample(out_px, w, x, y, &r, &g, &b, &a);
+	sample(in_px, w, x, y, &ir, &ig, &ib, &ia);
+	auto near = [](uint8_t v, uint8_t want) { return (v > want ? v - want : want - v) <= 3; };
+	const bool ok = near(r, ir) && near(g, ig) && near(b, ib) && a > 200;
+	LOG("  %-34s @(%4d,%3d) = (%3u,%3u,%3u,a=%3u) want input (%3u,%3u,%3u) -> %s", what, x, y, r, g, b, a, ir, ig,
+	    ib, ok ? "OK" : "WRONG");
+	return ok;
+}
+
+static bool
+flat_check_gap(const std::vector<uint8_t> &px, uint32_t w, const char *what, int x, int y)
+{
+	uint8_t r, g, b, a;
+	sample(px, w, x, y, &r, &g, &b, &a);
+	const bool ok = a < 40;
+	LOG("  %-34s @(%4d,%3d) alpha=%u want ~0 (woven gap) -> %s", what, x, y, a, ok ? "OK" : "WRONG");
+	return ok;
+}
+
+static bool
+run_flat_regions(Vk &vk,
+                 XrSession session,
+                 PFN_xrWeaveBindWindow2DXR pfn_bind2,
+                 PFN_xrWeaveSubmitDXR pfn_submit,
+                 PFN_xrWeaveSetScreenFlatRegionsDXR pfn_set_flat,
+                 const PanelRect &panel,
+                 const std::string &dump_dir)
+{
+	// On the panel, so nothing is off-panel flat (#1654) and every flat pixel
+	// below is the flat-region paint's.
+	const int32_t ox = panel.left + 64, oy = panel.top + 48;
+	LOG("flat: window at (%d,%d) %ux%u on a %ux%u panel", ox, oy, kWinW, kWinH, panel.w, panel.h);
+	if (!span_bind(session, pfn_bind2, ox, oy, kWinW, kWinH)) {
+		return false;
+	}
+
+	// Page: grey background; rect A (left WHITE | right BLACK -> woven RED),
+	// rect B (left BLACK | right WHITE -> woven CYAN). A GREEN "popup" is drawn
+	// INTO the page over rect A's right (SBS right-eye) half — woven it would be
+	// split into an eye and interlaced, flat it must read GREEN 1:1.
+	const XrRect2Di popup = {{300, 150}, {80, 60}};
+	std::vector<uint8_t> in_px((size_t)kWinW * kWinH * 4);
+	for (uint32_t y = 0; y < kWinH; y++) {
+		for (uint32_t x = 0; x < kWinW; x++) {
+			put_px(in_px, kWinW, (int)x, (int)y, 32, 32, 32);
+		}
+	}
+	fill_sbs_rect(in_px, kWinW, kRectA, 0xFF, 0x00);
+	fill_sbs_rect(in_px, kWinW, kRectB, 0x00, 0xFF);
+	for (int y = popup.offset.y; y < popup.offset.y + popup.extent.height; y++) {
+		for (int x = popup.offset.x; x < popup.offset.x + popup.extent.width; x++) {
+			put_px(in_px, kWinW, x, y, 0x00, 0xC8, 0x00);
+		}
+	}
+	std::vector<uint8_t> ov_px((size_t)kWinW * kWinH * 4, 0);
+	for (int y = kOverlayBar.offset.y; y < kOverlayBar.offset.y + kOverlayBar.extent.height; y++) {
+		for (int x = kOverlayBar.offset.x; x < kOverlayBar.offset.x + kOverlayBar.extent.width; x++) {
+			put_px(ov_px, kWinW, x, y, 230, 13, 230, 255);
+		}
+	}
+	Image input, overlay, out_img;
+	if (!create_exported_image(vk, kWinW, kWinH, input) || !upload_and_release(vk, input, in_px) ||
+	    !create_exported_image(vk, kWinW, kWinH, overlay) || !upload_and_release(vk, overlay, ov_px)) {
+		LOG("FAIL: flat image setup");
+		return false;
+	}
+
+	XrRect2Di rects[2] = {kRectA, kRectB};
+	XrWeaveSubmitOverlaysDXR ov = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_OVERLAYS_DXR};
+	ov.overlayTexture = (void *)(intptr_t)overlay.fd;
+	XrWeaveSubmitRectsDXR batch = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_RECTS_DXR};
+	batch.next = &ov;
+	batch.rectCount = 2;
+	batch.rects = rects;
+	XrWeaveSubmitFlatRegionsDXR flat = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_FLAT_REGIONS_DXR};
+	flat.rectCount = 1;
+	flat.rects = &popup;
+	XrWeaveSubmitInfoDXR submit = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_INFO_DXR};
+	submit.firstChunk = XR_TRUE;
+	submit.inputTexture = (void *)(intptr_t)input.fd;
+
+	// Sticky latch (screen-absolute): rect B's left quarter, and a 100x100 rect
+	// centred on the window's top-left corner (clipped to its 50x50 inside).
+	const XrRect2Di sticky[2] = {
+	    {{ox + kRectB.offset.x, oy + kRectB.offset.y}, {100, kRectB.extent.height}},
+	    {{ox - 50, oy - 50}, {100, 100}},
+	};
+
+	const int pop_x = popup.offset.x + popup.extent.width / 2, pop_y = popup.offset.y + popup.extent.height / 2;
+	const int a_x = kRectA.offset.x + 40, a_y = kRectA.offset.y + kRectA.extent.height / 2;
+	const int bl_x = kRectB.offset.x + 50, b_y = kRectB.offset.y + kRectB.extent.height / 2;
+	const int br_x = kRectB.offset.x + 300;
+	const int bar_y = kOverlayBar.offset.y + kOverlayBar.extent.height / 2;
+	const uint8_t W = 255, K = 0;
+
+	struct Case
+	{
+		const char *name;
+		bool per_submit;
+		int sticky; // -1 = leave the latch, 0 = clear, 2 = latch both rects
+	} cases[] = {
+	    {"baseline", false, -1},
+	    {"per-submit", true, -1},
+	    {"sticky", false, 2},
+	    {"composed", true, -1},
+	    {"cleared", false, 0},
+	};
+	bool pass = true;
+	std::vector<uint8_t> px;
+	for (const Case &c : cases) {
+		LOG("flat case %s", c.name);
+		if (c.sticky >= 0) {
+			XrResult r = pfn_set_flat(session, (uint32_t)c.sticky, c.sticky > 0 ? sticky : nullptr);
+			if (XR_FAILED(r)) {
+				LOG("FAIL: xrWeaveSetScreenFlatRegionsDXR(%d) -> %d", c.sticky, (int)r);
+				pass = false;
+				break;
+			}
+		}
+		batch.next = &ov;
+		ov.next = c.per_submit ? &flat : nullptr;
+		submit.next = &batch;
+		if (!span_submit_readback(vk, session, pfn_submit, submit, out_img, px)) {
+			pass = false;
+			break;
+		}
+		if (out_img.w != kWinW || out_img.h != kWinH) {
+			LOG("FAIL: output %ux%u != window", out_img.w, out_img.h);
+			pass = false;
+			break;
+		}
+		dump_ppm(px, out_img.w, out_img.h, dump_dir + "/weave_probe_linux_flat_" + c.name + ".ppm");
+		const bool popup_flat = c.per_submit;
+		const bool sticky_flat = strcmp(c.name, "sticky") == 0 || strcmp(c.name, "composed") == 0;
+		bool ok = true;
+		if (popup_flat) {
+			ok &= flat_check_equal(px, in_px, kWinW, "popup (flat = page GREEN)", pop_x, pop_y);
+			ok &= flat_check_equal(px, in_px, kWinW, "popup corner (flat)", popup.offset.x + 2,
+			                       popup.offset.y + 2);
+		} else {
+			// Woven: the left eye there is rect A's white half -> R = 255,
+			// never the popup's R = 0.
+			uint8_t r, g, b, a;
+			sample(px, kWinW, pop_x, pop_y, &r, &g, &b, &a);
+			const bool woven = r > 200;
+			LOG("  %-34s @(%4d,%3d) = (%3u,%3u,%3u,a=%3u) want R>200 (woven) -> %s", "popup (woven)", pop_x,
+			    pop_y, r, g, b, a, woven ? "OK" : "WRONG");
+			ok &= woven;
+		}
+		ok &= span_check(px, kWinW, "rectA outside popup (woven RED)", a_x, a_y, W, K, K);
+		if (sticky_flat) {
+			ok &= flat_check_equal(px, in_px, kWinW, "rectB left quarter (flat = page)", bl_x, b_y);
+			ok &= flat_check_equal(px, in_px, kWinW, "clipped sticky corner (flat = grey)", 25, 25);
+		} else {
+			ok &= span_check(px, kWinW, "rectB left quarter (woven CYAN)", bl_x, b_y, K, W, W);
+			ok &= flat_check_gap(px, kWinW, "window corner", 25, 25);
+		}
+		ok &= span_check(px, kWinW, "rectB right part (woven CYAN)", br_x, b_y, K, W, W);
+		ok &= flat_check_gap(px, kWinW, "gap outside every rect", 640, 300);
+		ok &= span_check(px, kWinW, "overlay bar (MAGENTA)", 300, bar_y, 230, 13, 230);
+		LOG("flat case %s: %s", c.name, ok ? "PASS" : "FAIL");
+		pass = pass && ok;
+	}
+	destroy_image(vk, out_img);
+
+	// v6 N-view (2x1 red|cyan at 640x360 = the window at viewScale 0.5): the
+	// window's right half flagged flat comes back as the centre view (RED) at
+	// output x >= 320, the left half woven (anaglyph WHITE).
+	if (pass) {
+		const uint32_t cvw = 640, cvh = 360;
+		std::vector<uint8_t> nv_px((size_t)2 * cvw * cvh * 4);
+		for (uint32_t y = 0; y < cvh; y++) {
+			for (uint32_t x = 0; x < cvw; x++) {
+				put_px(nv_px, 2 * cvw, (int)x, (int)y, 0xFF, 0x00, 0x00);
+				put_px(nv_px, 2 * cvw, (int)(cvw + x), (int)y, 0x00, 0xFF, 0xFF);
+			}
+		}
+		Image nv_input;
+		bool ok = create_exported_image(vk, 2 * cvw, cvh, nv_input) && upload_and_release(vk, nv_input, nv_px);
+		XrWeaveSubmitLayoutDXR lay = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_LAYOUT_DXR};
+		const XrRect2Di right_half = {{(int32_t)kWinW / 2, 0}, {(int32_t)kWinW / 2, (int32_t)kWinH}};
+		XrWeaveSubmitFlatRegionsDXR v6_flat = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_FLAT_REGIONS_DXR};
+		v6_flat.rectCount = 1;
+		v6_flat.rects = &right_half;
+		lay.next = &v6_flat;
+		lay.viewCount = 2;
+		lay.tileColumns = 2;
+		lay.tileRows = 1;
+		lay.contentViewWidth = cvw;
+		lay.contentViewHeight = cvh;
+		XrWeaveSubmitInfoDXR v6 = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_INFO_DXR};
+		v6.next = &lay;
+		v6.inputTexture = (void *)(intptr_t)nv_input.fd;
+		v6.firstChunk = XR_TRUE;
+		LOG("flat case v6-right-half");
+		ok = ok && span_submit_readback(vk, session, pfn_submit, v6, out_img, px);
+		if (ok && (out_img.w != cvw || out_img.h != cvh)) {
+			LOG("FAIL: v6 output %ux%u != %ux%u", out_img.w, out_img.h, cvw, cvh);
+			ok = false;
+		}
+		if (ok) {
+			dump_ppm(px, cvw, cvh, dump_dir + "/weave_probe_linux_flat_v6.ppm");
+			ok &= span_check(px, cvw, "v6 left half (woven WHITE)", 160, 180, W, W, W);
+			ok &= span_check(px, cvw, "v6 seam, woven side", 318, 180, W, W, W);
+			ok &= span_check(px, cvw, "v6 seam, flat side (RED)", 322, 180, W, K, K);
+			ok &= span_check(px, cvw, "v6 right half (flat RED)", 480, 180, W, K, K);
+		}
+		LOG("flat case v6-right-half: %s", ok ? "PASS" : "FAIL");
+		pass = pass && ok;
+		destroy_image(vk, out_img);
+		destroy_image(vk, nv_input);
+	}
+
+	destroy_image(vk, input);
+	destroy_image(vk, overlay);
+	return pass;
+}
+
 int
 main(int argc, char **argv)
 {
 	int frames = 600;
 	long service_pid = 0;
-	bool dmabuf = false, release_wait = true, force_linear = false, span2d = false;
+	bool dmabuf = false, release_wait = true, force_linear = false, span2d = false, flat_regions = false;
 	std::string dump_dir = "/tmp";
 	if (const char *t = getenv("TMPDIR")) {
 		dump_dir = t;
@@ -1291,9 +1533,11 @@ main(int argc, char **argv)
 			force_linear = true; // LINEAR inputs instead of the driver's pick
 		} else if (strcmp(argv[i], "--span2d") == 0) {
 			span2d = true; // off-panel flat 2D (#1654 on the service path)
+		} else if (strcmp(argv[i], "--flat-regions") == 0) {
+			flat_regions = true; // spec-v8 flat regions painted flat (desktop Linux)
 		} else {
 			LOG("usage: %s [--frames=N] [--service-pid=PID] [--dump-dir=DIR] [--dmabuf [--no-release-wait] "
-			    "[--linear]] [--span2d]",
+			    "[--linear]] [--span2d] [--flat-regions]",
 			    argv[0]);
 			return 2;
 		}
@@ -1329,9 +1573,9 @@ main(int argc, char **argv)
 	}
 	// --span2d reads the panel's desktop rect (XR_DXR_display_info); only
 	// then, so the default run's instance is unchanged.
-	if (span2d) {
+	if (span2d || flat_regions) {
 		if (!has_display_info) {
-			LOG("--span2d needs XR_DXR_display_info (the panel rect)");
+			LOG("--span2d / --flat-regions need XR_DXR_display_info (the panel rect)");
 			return 1;
 		}
 		enabled.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
@@ -1353,7 +1597,7 @@ main(int argc, char **argv)
 	XR_CHECK(xrGetSystem(instance, &sgi, &system_id));
 
 	PanelRect panel;
-	if (span2d) {
+	if (span2d || flat_regions) {
 		XrDisplayDesktopPositionDXR pos = {XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR};
 		XrDisplayInfoDXR di = {XR_TYPE_DISPLAY_INFO_DXR};
 		di.next = &pos;
@@ -1542,6 +1786,24 @@ main(int argc, char **argv)
 	bind.windowHandle = (void *)(uintptr_t)0x1;
 	XR_CHECK(pfn_bind2(session, &bind));
 	LOG("bound fake window 0x1 at (%d,%d) %ux%u", kWinOrigin.x, kWinOrigin.y, kWinW, kWinH);
+
+	if (flat_regions) {
+		PFN_xrWeaveSetScreenFlatRegionsDXR pfn_set_flat = nullptr;
+		xrGetInstanceProcAddr(instance, "xrWeaveSetScreenFlatRegionsDXR", (PFN_xrVoidFunction *)&pfn_set_flat);
+		bool pass = pfn_set_flat != nullptr &&
+		            run_flat_regions(vk, session, pfn_bind2, pfn_submit, pfn_set_flat, panel, dump_dir);
+		if (pfn_set_flat == nullptr) {
+			LOG("FAIL: xrWeaveSetScreenFlatRegionsDXR did not resolve");
+		}
+		xrDestroySession(session);
+		xrDestroyInstance(instance);
+		vkDestroyFence(vk.device, vk.fence, nullptr);
+		vkDestroyCommandPool(vk.device, vk.pool, nullptr);
+		vkDestroyDevice(vk.device, nullptr);
+		vkDestroyInstance(vk.instance, nullptr);
+		LOG("flat-regions: %s", pass ? "PASS" : "FAIL");
+		return pass ? 0 : 1;
+	}
 
 	if (span2d) {
 		bool pass = run_span2d(vk, session, pfn_bind2, pfn_submit, panel, dump_dir);

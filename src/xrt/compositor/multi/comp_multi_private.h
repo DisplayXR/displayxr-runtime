@@ -869,6 +869,18 @@ struct multi_compositor
 		uint32_t last_offpanel_band_count;
 		//! @}
 
+		//! @name Flat regions (spec v8, browser#88, on desktop Linux)
+		//! The sticky screen-space latch (xrWeaveSetScreenFlatRegionsDXR),
+		//! absolute screen device px; a SET, count 0 clears. Unioned with
+		//! each submit's own flat rects and painted flat in the output.
+		//! @{
+		struct xrt_rect screen_flat_rects[8]; //!< IPC_WEAVE_SET_SCREEN_FLAT_RECTS_MAX
+		uint32_t screen_flat_rect_count;
+		//! Flat rects painted by the last submit (0 = none); the WARN fires on
+		//! a change of this count only.
+		uint32_t last_flat_count;
+		//! @}
+
 		//! @name Input + overlay import caches (keyed by buffer id / fd inode)
 		//! A received fd is a new number on every submit, so the key is the
 		//! underlying file (`fstat` st_dev/st_ino) or, in stage B, the
@@ -1305,9 +1317,10 @@ comp_multi_weave_set_window_geometry(struct xrt_compositor *xc,
 
 /*!
  * @p flat_rect_count / @p flat_rects (spec v8, browser#88) name the regions of
- * this submit that must be physically FLAT. ACCEPTED AND IGNORED here: the
- * per-region hardware wish is published through the D3D11 service's zone-wish
- * channel, which has no macOS / Android counterpart yet. Same shape as v7's
+ * this submit that must be physically FLAT. macOS / Android: ACCEPTED AND
+ * IGNORED — the per-region hardware wish is published through the D3D11
+ * service's zone-wish channel, which has no counterpart there yet. Desktop
+ * Linux: painted flat in the woven output (comp_multi_weave_linux.c). Same shape as v7's
  * Windows-only handle kinds — the parameter exists so the wire and the call
  * signature stay one thing across platforms.
  */
@@ -1399,6 +1412,18 @@ comp_multi_weave_submit_dmabuf(struct xrt_compositor *xc,
 
 bool
 comp_multi_weave_export_output_dmabuf(struct xrt_compositor *xc, struct xrt_weave_dmabuf_output_desc *out);
+
+/*!
+ * Latch the present-owner's STICKY screen-space flat regions (spec v8,
+ * xrWeaveSetScreenFlatRegionsDXR) — absolute screen device px, a SET (count 0
+ * clears). Unioned with every later submit's own flat rects, clipped to the
+ * bound window and painted flat in the woven output. Takes effect at the next
+ * submit: the service produces output pixels only when asked to.
+ */
+bool
+comp_multi_weave_set_screen_flat_regions(struct xrt_compositor *xc,
+                                         uint32_t rect_count,
+                                         const struct xrt_rect *screen_rects);
 /*! @} */
 #endif // XRT_OS_LINUX_DESKTOP
 

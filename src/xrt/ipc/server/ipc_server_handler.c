@@ -6308,8 +6308,9 @@ ipc_handle_weave_set_window_geometry(volatile struct ipc_client_state *ics,
  * XR_DXR_weave spec v8 (browser#88): latch the present-owner's STICKY
  * screen-space flat regions (xrWeaveSetScreenFlatRegionsDXR). Absolute physical
  * screen pixels, held until the next call; the service intersects them with the
- * bound window and subtracts them from every subsequent submit's hardware wish.
- * Applied immediately — if a wish is already published the service re-rasters and
+ * bound window and subtracts them from every subsequent submit's hardware wish
+ * (Windows), or paints them flat in every subsequent woven output (desktop Linux).
+ * Applied immediately on Windows — if a wish is already published the service re-rasters and
  * republishes before returning, so screen furniture goes flat without waiting for
  * the next frame.
  */
@@ -6346,9 +6347,23 @@ ipc_handle_weave_set_screen_flat_regions(volatile struct ipc_client_state *ics,
 		return XRT_ERROR_WEAVE_REFUSED;
 	}
 	return XRT_SUCCESS;
+#elif defined(COMP_MULTI_HAVE_WEAVE) && defined(XRT_OS_LINUX_DESKTOP)
+	// Desktop Linux: latched in the weave engine and painted flat from the next
+	// submit (no Linux DP has a per-region lens to wish to).
+	struct xrt_rect rects[IPC_WEAVE_SET_SCREEN_FLAT_RECTS_MAX];
+	for (uint32_t i = 0; i < args->rect_count; i++) {
+		rects[i].offset.w = args->rects[i].x; // xrt_offset fields are named w/h
+		rects[i].offset.h = args->rects[i].y;
+		rects[i].extent.w = (int)args->rects[i].w;
+		rects[i].extent.h = (int)args->rects[i].h;
+	}
+	if (!comp_multi_weave_set_screen_flat_regions(ics->xc, args->rect_count, args->rect_count > 0 ? rects : NULL)) {
+		return XRT_ERROR_WEAVE_REFUSED;
+	}
+	return XRT_SUCCESS;
 #else
-	// No per-region hardware wish channel on this platform yet (macOS / Android /
-	// Linux). Accept and drop rather than fail, so a portable caller can always
+	// No per-region hardware wish channel on this platform yet (macOS /
+	// Android). Accept and drop rather than fail, so a portable caller can always
 	// publish its flat furniture — the same accept-and-ignore contract v7's
 	// window geometry has on Windows.
 	(void)args;
@@ -6553,7 +6568,8 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	// v8 (browser#88): the flat (physically-2D) regions of this submit. The
 	// macOS / Android weave engines accept and ignore them for now — there is no
 	// per-region hardware wish channel on those platforms yet, exactly as v7's
-	// Windows-only handle kinds are accepted and ignored here.
+	// Windows-only handle kinds are accepted and ignored here. The desktop-Linux
+	// engine paints them flat in the woven output instead.
 	if (args->flat_rect_count > IPC_WEAVE_SUBMIT_FLAT_RECTS_MAX) {
 		xrt_graphics_buffer_handle_t reject = handles[0];
 		u_graphics_buffer_unref(&reject); // don't leak the retained IOSurfaceRef

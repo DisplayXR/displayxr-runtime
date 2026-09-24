@@ -47,6 +47,7 @@ set(tests
     tests_aux_tiling_row_origin
     tests_aux_wayland_geom
     tests_aux_weave_span2d
+    tests_aux_weave_flat
     tests_aux_display_mode_hold
     tests_comp_rear_budget
     tests_comp_lazy_transparency

@@ -715,6 +715,18 @@ source comments and, until this section, in no document at all.
   overlay, and a window entirely off the panel skips the weave; kill switch
   `DXR_SPAN_2D=0` (either name works on both paths), headless proof
   `weave_probe_vk_linux --span2d`.
+- **Flat regions on the weave service are painted flat, not wished (spec v8,
+  browser#88).** The caller's flat regions — each submit's
+  `XrWeaveSubmitFlatRegionsDXR` plus the sticky screen-space
+  `xrWeaveSetScreenFlatRegionsDXR` latch, unioned and clipped to the bound
+  window — come back flat in the woven output: the input page pixels 1:1 for a
+  batch submit (a popup / menu drawn over inline 3D is page content), the centre
+  view for v6. Painted after the off-panel bands and under the v4 overlay.
+  Windows instead subtracts them from a per-region hardware *wish* and leaves
+  the pixels alone; no desktop-Linux DP has a per-region lens (the Leia Linux
+  DP's `publish_local_zone_mask` collapses to one global on/off), so a wish
+  would change nothing while the region stayed interlaced. Kill switch
+  `DXR_WEAVE_FLAT_2D=0`, headless proof `weave_probe_vk_linux --flat-regions`.
 
 ### Where the detail lives
 
