@@ -74,7 +74,7 @@
 // Xlib (and, in a Wayland-capable build, wayland-client) before anything that
 // names Display / wl_surface.
 #include "dxr_linux_window.h"
-#include "dxr_weave_snap.h"
+#include "dxr_weave_snap_grid.h" // #1723: the drag-lattice probe as ONE grid call
 
 #include <X11/Xlib.h>
 #include <vulkan/vulkan.h>
@@ -339,7 +339,7 @@ struct App
 
 	// ---- Window
 	DxrLinuxWindow window;
-	DxrWeaveSnap weave_snap;
+	DxrWeaveSnapGrid weave_snap;
 	WlGeometryClient wl_geom;
 	bool wl_geom_ok = false;
 
@@ -2358,6 +2358,7 @@ cleanup()
 	}
 	// Session before device: the runtime's session holds the device.
 	if (g.session != XR_NULL_HANDLE) {
+		g.weave_snap.flush_log(); // the last lattice table's IPC cost
 		xrDestroySession(g.session);
 	}
 	if (g.device != VK_NULL_HANDLE) {
@@ -2446,10 +2447,16 @@ main(int argc, char **argv)
 	// Drag-time snap: the helper's drag (X11 every step, Wayland the drag
 	// lattice) asks the display processor through xrWeaveSnapWindowRectDXR —
 	// served by the SERVICE's DP here, since this session is a present-owner.
+	// The Wayland lattice probe (16,641+ points per press) is fetched as ONE
+	// xrWeaveSnapWindowGridDXR and served from that table (#1723): over IPC
+	// the per-point probe was one round trip per point, 2.3-2.5 s a press.
 	g.weave_snap.attach(g.instance, g.session, g.opt.width, g.opt.height);
 	if (!g.headless) {
-		g.window.set_snap_provider(&DxrWeaveSnap::callback, &g.weave_snap);
-		LOGI("drag snap: xrWeaveSnapWindowRectDXR %s", g.weave_snap.available() ? "RESOLVED" : "unavailable");
+		g.window.set_snap_provider(&DxrWeaveSnapGrid::callback, &g.weave_snap);
+		LOGI("drag snap: xrWeaveSnapWindowRectDXR %s, grid snap (v11) %s",
+		     g.weave_snap.available() ? "RESOLVED" : "unavailable",
+		     g.weave_snap.grid_available() ? "RESOLVED — one call per lattice table"
+		                                   : "unavailable — the lattice is probed point by point");
 		if (!create_surface() || !create_swapchain()) {
 			cleanup();
 			return 1;

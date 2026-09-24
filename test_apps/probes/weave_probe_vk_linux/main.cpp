@@ -64,6 +64,8 @@
 
 // The dma-buf transport calls, shared with weave/weave_present_vk_linux.
 #include "weave_dmabuf_vk.h"
+// The app-side table the Linux test apps install as their drag snap (#1723).
+#include "dxr_weave_snap_grid.h"
 
 #include <dirent.h>
 #include <time.h>
@@ -999,6 +1001,54 @@ run_dmabuf(Vk &vk,
 	return pass;
 }
 
+/*
+ * A press's drag-lattice probe as displayxr-common v2.23.0 runs it
+ * (dxr_wl_lattice::probe, integer scale s): the 129 x 129 grid at 3 logical px
+ * around the drag start, and the +-2 logical-px search when the DP's answer is
+ * not a whole logical pixel. Returns the table (logical displacements) and
+ * whether the DP declined. Replicated here so the press can be timed headless,
+ * through the same SnapWindowOriginFn the apps install.
+ */
+typedef bool (*probe_snap_fn)(void *, int32_t, int32_t, int32_t, int32_t, int32_t *, int32_t *);
+static std::vector<std::pair<int32_t, int32_t>>
+press_probe(probe_snap_fn fn, void *ud, int32_t s, bool *declined)
+{
+	std::vector<std::pair<int32_t, int32_t>> out;
+	*declined = false;
+	for (int32_t gy = -192; gy <= 192 && !*declined; gy += 3) {
+		for (int32_t gx = -192; gx <= 192; gx += 3) {
+			int32_t sx = gx * s, sy = gy * s;
+			if (!fn(ud, 0, 0, gx * s, gy * s, &sx, &sy)) {
+				*declined = true;
+				break;
+			}
+			bool found = sx % s == 0 && sy % s == 0;
+			int32_t ax = sx / s, ay = sy / s;
+			const int32_t bx = (int32_t)lround((double)sx / s), by = (int32_t)lround((double)sy / s);
+			for (int32_t ring = 0; ring <= 2 && !found; ring++) {
+				for (int32_t j = -ring; j <= ring && !found; j++) {
+					for (int32_t i = -ring; i <= ring && !found; i++) {
+						if (abs(i) != ring && abs(j) != ring) {
+							continue;
+						}
+						int32_t rx = 0, ry = 0;
+						if (fn(ud, 0, 0, (bx + i) * s, (by + j) * s, &rx, &ry) && rx == (bx + i) * s &&
+						    ry == (by + j) * s) {
+							ax = bx + i;
+							ay = by + j;
+							found = true;
+						}
+					}
+				}
+			}
+			if (found) {
+				out.emplace_back(ax, ay);
+			}
+		}
+	}
+	return out;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1226,7 +1276,9 @@ main(int argc, char **argv)
 	xrGetInstanceProcAddr(instance, "xrWeaveBindWindow2DXR", (PFN_xrVoidFunction *)&pfn_bind2);
 	xrGetInstanceProcAddr(instance, "xrWeaveSubmitDXR", (PFN_xrVoidFunction *)&pfn_submit);
 	xrGetInstanceProcAddr(instance, "xrWeaveSnapWindowRectDXR", (PFN_xrVoidFunction *)&pfn_snap);
-	if (pfn_bind2 == nullptr || pfn_submit == nullptr || pfn_snap == nullptr) {
+	PFN_xrWeaveSnapWindowGridDXR pfn_grid = nullptr; // spec v11 (#1723)
+	xrGetInstanceProcAddr(instance, "xrWeaveSnapWindowGridDXR", (PFN_xrVoidFunction *)&pfn_grid);
+	if (pfn_bind2 == nullptr || pfn_submit == nullptr || pfn_snap == nullptr || pfn_grid == nullptr) {
 		LOG("failed to resolve weave entry points");
 		return 1;
 	}
@@ -1429,6 +1481,142 @@ main(int argc, char **argv)
 		bool ok = XR_SUCCEEDED(r) && snapped.extent.width == target.extent.width;
 		LOG("snap (%d,%d) -> (%d,%d) result=%d -> %s", target.offset.x, target.offset.y, snapped.offset.x,
 		    snapped.offset.y, (int)r, ok ? "OK" : "WRONG");
+		pass = pass && ok;
+	}
+
+	// ---- Bulk grid snap (spec v11, #1723): the Wayland drag-lattice probe's
+	// grid (129 x 129 at 3 px around the drag start, origin (0, 0)) in ONE
+	// call, against the same points asked one by one. Every grid answer must
+	// equal the per-point answer — identity on sim_display's default period of
+	// 1; set SIM_DISPLAY_INTERLACE_PERIOD=8 on the SERVICE for a real lattice.
+	// Both are timed: the per-point loop is what a press cost before.
+	{
+		auto ms_since = [](const struct timespec &a) {
+			struct timespec b;
+			clock_gettime(CLOCK_MONOTONIC, &b);
+			return (double)(b.tv_sec - a.tv_sec) * 1e3 + (double)(b.tv_nsec - a.tv_nsec) / 1e6;
+		};
+		XrWeaveSnapGridInfoDXR gi = {(XrStructureType)XR_TYPE_WEAVE_SNAP_GRID_INFO_DXR};
+		gi.originRect = {{0, 0}, {(int32_t)kWinW, (int32_t)kWinH}};
+		gi.firstTarget = {-192, -192};
+		gi.step = {3, 3};
+		gi.countX = 129;
+		gi.countY = 129;
+
+		uint32_t n = 0;
+		XrResult r = pfn_grid(session, &gi, 0, &n, nullptr, nullptr);
+		bool ok = XR_SUCCEEDED(r) && n == 129u * 129u;
+		LOG("grid snap: count query -> %u points, result=%d -> %s", n, (int)r, ok ? "OK" : "WRONG");
+		pass = pass && ok;
+
+		std::vector<XrWeaveSnapGridPointDXR> pts(n);
+		XrBool32 declined = XR_TRUE;
+		struct timespec t0;
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		r = pfn_grid(session, &gi, n, &n, pts.data(), &declined);
+		const double grid_ms = ms_since(t0);
+		ok = XR_SUCCEEDED(r) && declined == XR_FALSE;
+		LOG("grid snap: 129x129 in ONE call: %.2f ms, declined=%d, result=%d -> %s", grid_ms, (int)declined,
+		    (int)r, ok ? "OK" : "WRONG");
+		pass = pass && ok;
+
+		uint32_t identity = 0, mismatch = 0;
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		for (uint32_t j = 0; j < 129; j++) {
+			for (uint32_t i = 0; i < 129; i++) {
+				XrRect2Di o = gi.originRect;
+				XrRect2Di t = o;
+				t.offset = {gi.firstTarget.x + 3 * (int32_t)i, gi.firstTarget.y + 3 * (int32_t)j};
+				XrRect2Di sn = {};
+				pfn_snap(session, &o, &t, &sn);
+				const XrWeaveSnapGridPointDXR &p = pts[j * 129 + i];
+				if (sn.offset.x - t.offset.x != p.dx || sn.offset.y - t.offset.y != p.dy) {
+					mismatch++;
+				}
+				if (p.dx == 0 && p.dy == 0) {
+					identity++;
+				}
+			}
+		}
+		const double per_point_ms = ms_since(t0);
+		ok = mismatch == 0;
+		LOG("grid snap: the same 16641 points one call each: %.1f ms (%.1fx the grid call); %u mismatch(es), "
+		    "%u identity -> %s",
+		    per_point_ms, grid_ms > 0.0 ? per_point_ms / grid_ms : 0.0, mismatch, identity, ok ? "OK" : "WRONG");
+		pass = pass && ok;
+		if (getenv("SIM_DISPLAY_INTERLACE_PERIOD") == nullptr) {
+			ok = identity == 129u * 129u;
+			LOG("grid snap: sim_display's default period of 1 is identity everywhere -> %s", ok ? "OK" : "WRONG");
+			pass = pass && ok;
+		}
+
+		// The largest grid the spec allows, in one call (a dense 1-px table).
+		XrWeaveSnapGridInfoDXR big = gi;
+		big.firstTarget = {-512, -512};
+		big.step = {1, 1};
+		big.countX = XR_WEAVE_SNAP_GRID_MAX_AXIS_DXR;
+		big.countY = XR_WEAVE_SNAP_GRID_MAX_AXIS_DXR;
+		std::vector<XrWeaveSnapGridPointDXR> bigpts(XR_WEAVE_SNAP_GRID_MAX_POINTS_DXR);
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		r = pfn_grid(session, &big, (uint32_t)bigpts.size(), &n, bigpts.data(), &declined);
+		ok = XR_SUCCEEDED(r) && n == XR_WEAVE_SNAP_GRID_MAX_POINTS_DXR;
+		LOG("grid snap: 1024x1024 (the maximum, 2 MB reply) in ONE call: %.1f ms, result=%d -> %s", ms_since(t0),
+		    (int)r, ok ? "OK" : "WRONG");
+		pass = pass && ok;
+
+		// Rejections: validated in the runtime, the session survives them.
+		XrWeaveSnapGridInfoDXR bad = gi;
+		bad.countX = XR_WEAVE_SNAP_GRID_MAX_AXIS_DXR + 1;
+		r = pfn_grid(session, &bad, 0, &n, nullptr, nullptr);
+		ok = r == XR_ERROR_VALIDATION_FAILURE;
+		bad = gi;
+		bad.step = {0, 3};
+		r = pfn_grid(session, &bad, 0, &n, nullptr, nullptr);
+		ok = ok && r == XR_ERROR_VALIDATION_FAILURE;
+		r = pfn_grid(session, &gi, 10, &n, pts.data(), &declined);
+		ok = ok && r == XR_ERROR_SIZE_INSUFFICIENT;
+		r = pfn_grid(session, &gi, (uint32_t)pts.size(), &n, pts.data(), &declined);
+		ok = ok && XR_SUCCEEDED(r);
+		LOG("grid snap: oversize axis / zero step / short buffer rejected, next call fine -> %s", ok ? "OK" : "WRONG");
+		pass = pass && ok;
+	}
+
+	// ---- A title-bar press, timed (#1723): the drag-lattice probe through
+	// the provider the Linux apps install (DxrWeaveSnapGrid: one grid call per
+	// table), against the pre-#1723 provider (every point a service round
+	// trip). DXR_PROBE_LATTICE_SCALE=N probes at integer scale N (default 1).
+	{
+		int32_t scale = 1;
+		if (const char *e = getenv("DXR_PROBE_LATTICE_SCALE")) {
+			scale = atoi(e) >= 1 && atoi(e) <= 4 ? atoi(e) : 1;
+		}
+		auto ms_since = [](const struct timespec &a) {
+			struct timespec b;
+			clock_gettime(CLOCK_MONOTONIC, &b);
+			return (double)(b.tv_sec - a.tv_sec) * 1e3 + (double)(b.tv_nsec - a.tv_nsec) / 1e6;
+		};
+		static DxrWeaveSnapGrid per_point, tabled;
+		per_point.attach_functions(session, pfn_snap, nullptr, kWinW, kWinH);
+		tabled.attach_functions(session, pfn_snap, pfn_grid, kWinW, kWinH);
+
+		bool d0 = false, d1 = false;
+		struct timespec t0;
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		const auto want = press_probe(&DxrWeaveSnapGrid::callback, &per_point, scale, &d0);
+		const double per_point_ms = ms_since(t0);
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		const auto got = press_probe(&DxrWeaveSnapGrid::callback, &tabled, scale, &d1);
+		const double tabled_ms = ms_since(t0);
+		tabled.flush_log();
+		const DxrWeaveSnapGrid::Stats a = per_point.stats(), b = tabled.stats();
+		const uint64_t ipc = b.grid_ipc + b.per_point_ipc;
+		bool ok = want == got && d0 == d1 && ipc <= 3;
+		LOG("press at scale %d: per-point provider %.1f ms, %llu IPC calls; grid provider %.2f ms, %llu IPC "
+		    "call(s) (%llu grid + %llu per point, %.2f ms in the grid call); %zu table entries, identical=%d -> "
+		    "%s",
+		    scale, per_point_ms, (unsigned long long)a.per_point_ipc, tabled_ms, (unsigned long long)ipc,
+		    (unsigned long long)b.grid_ipc, (unsigned long long)b.per_point_ipc, b.grid_ms, got.size(),
+		    (int)(want == got), ok ? "OK" : "WRONG");
 		pass = pass && ok;
 	}
 
