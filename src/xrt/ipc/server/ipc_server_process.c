@@ -674,6 +674,65 @@ emit_health_if_elapsed(struct ipc_server *s)
 static void
 sync_focus_from_compositor(struct ipc_server *s); // #962, defined below
 
+/*!
+ * "Display info unknown" = the vendor plug-in has not (yet) answered
+ * `get_display_info`: the service auto-started before the panel was identified
+ * and every canvas / Kooima input on `xsysc->info` is still at its zeroed
+ * startup value (#1718 / #1719). Same test `displayxr-cli selftest` applies.
+ */
+static bool
+display_info_unknown(const struct xrt_system_compositor_info *info)
+{
+	return !(info->display_width_m > 0.0f) || info->display_pixel_width == 0;
+}
+
+/*!
+ * #1721: while the display info is unknown, re-pull it from THIS loop at ~1 Hz
+ * instead of only on the next client connect. A client that connects inside
+ * the identification window (the plug-in still declining) and never
+ * reconnects otherwise keeps the empty `xsysc->info` for the life of the
+ * service — no `display info refreshed` line ever appears, even though the
+ * plug-in re-derived the geometry seconds later.
+ *
+ * Same callback and the same lock as the accept path (`global_state.lock` ->
+ * the callback's own `g_display_info_mutex`; the compositor-create caller takes
+ * only the inner one, so the order is unchanged). The callback's decline
+ * throttle bounds a slow plug-in's cost. Nothing is logged per tick — the
+ * callback's one-shot `display info refreshed from plug-in after startup` WARN
+ * is the success signal — and once the info is known this is a single
+ * unlocked compare per tick.
+ */
+static void
+repull_display_info_if_unknown(struct ipc_server *s)
+{
+	if (s->xsysc == NULL || s->xsysc->info.refresh_display_processors == NULL) {
+		return;
+	}
+	// Unlocked pre-check on purpose: a torn read can only cost one extra
+	// (idempotent) callback under the lock below, never skip a needed one
+	// for more than a tick.
+	if (!display_info_unknown(&s->xsysc->info)) {
+		return;
+	}
+	static uint64_t last_ns = 0;
+	const uint64_t now_ns = os_monotonic_get_ns();
+	if (last_ns != 0 && (now_ns - last_ns) < (uint64_t)U_TIME_1S_IN_NS) {
+		return;
+	}
+	last_ns = now_ns;
+
+	os_mutex_lock(&s->global_state.lock);
+	s->xsysc->info.refresh_display_processors(&s->xsysc->info);
+	os_mutex_unlock(&s->global_state.lock);
+	// Clients that connected while the info was unknown keep the
+	// init_shm snapshot of the head's mode table they were created with:
+	// ipc_client_hmd_create copies `rendering_modes[]` / `views[].display`
+	// out of shm exactly once, so rewriting the server's shm here would reach
+	// no live client. Their head geometry is still right (the plug-in updates
+	// its xrt_device in place); only the per-mode tiling snapshot is stale
+	// until they reconnect. See docs/reference/xrt_plugin_iface.md.
+}
+
 static int
 main_loop(struct ipc_server *s)
 {
@@ -712,6 +771,10 @@ main_loop(struct ipc_server *s)
 
 		// #951: per-client health snapshot, throttled.
 		emit_health_if_elapsed(s);
+
+		// #1721: ~1 Hz display-info re-pull while the plug-in has not
+		// identified the panel yet; a no-op once it has.
+		repull_display_info_if_unknown(s);
 
 #ifdef XRT_OS_ANDROID
 		// #1278: drive the visibility/weave-idle convergent pass from THIS

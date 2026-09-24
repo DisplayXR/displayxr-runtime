@@ -349,9 +349,12 @@ Power Event" right after boot, "Device resumed" when the panel wakes) and
 default display" → later "Active display changed to serial number: …").
 
 **Fix.** Self-healing on current runtimes: the service re-asks the plug-in on every client
-connect and re-applies the geometry once the panel is identified — look for
-`display info refreshed from plug-in after startup` in the service log on the first client
-after the panel woke. On older runtimes, or if that line never appears while the panel is
+connect *and* about once a second while the geometry is still unknown, and re-applies it once
+the panel is identified — look for `display info refreshed from plug-in after startup` in the
+service log within ~1 s of the plug-in's own "re-derived after late SR identification" line,
+whether or not a new client connects (#1721). Clients that connected *before* that line keep
+the per-mode tiling snapshot they were created with until they reconnect (their head geometry
+itself is already correct). On older runtimes, or if that line never appears while the panel is
 demonstrably awake, restart the service (non-elevated):
 
 ```bat
@@ -360,8 +363,9 @@ start "" "C:\Program Files\DisplayXR\Runtime\displayxr-service.exe"
 ```
 
 To reproduce deliberately: `net stop "SR Service"` (elevated), start `displayxr-service.exe`,
-`net start "SR Service"`, wait for the SR Session log to show the serial-number line, then
-connect a client and expect the `display info refreshed` WARN plus correct poses.
+`net start "SR Service"`, wait for the SR Session log to show the serial-number line, and expect
+the `display info refreshed` WARN within ~1 s of it with no client connected; a client connected
+afterwards gets correct poses and tiling.
 
 ---
 
