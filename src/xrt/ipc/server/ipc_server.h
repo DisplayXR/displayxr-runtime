@@ -185,6 +185,26 @@ struct ipc_client_state
 	//! (instance_get_shm_fd ran). A declaration arriving after this point is too
 	//! late to be honoured and is refused.
 	bool handles_sent;
+
+#ifdef XRT_OS_LINUX_DESKTOP
+	/*!
+	 * XR_DXR_weave v10 (#1699): fds this process handed to a weave reply and
+	 * must close AFTER that reply is on the wire.
+	 *
+	 * The generated server dispatch sends a handler's out handles with
+	 * ipc_send_fds, which (SCM_RIGHTS) installs a copy in the client and does
+	 * NOT close ours — and it has no post-send hook. weave_submit_dmabuf's
+	 * per-frame release sync_file and weave_get_output_dmabuf's per-call output
+	 * dup are both fresh fds the handler owns, so each would leak one fd per
+	 * call. Instead the handler parks them here, and the NEXT weave dma-buf
+	 * handler on this client (which necessarily runs after the previous reply
+	 * was sent — one client thread, strictly request/reply) closes them before
+	 * doing anything else; client teardown closes whatever is left. Count-based,
+	 * so a zeroed client state is empty (0 is a valid fd).
+	 */
+	int weave_deferred_close_fds[4];
+	uint32_t weave_deferred_close_count;
+#endif
 };
 
 enum ipc_thread_state
@@ -547,6 +567,16 @@ ipc_server_client_thread(void *_ics);
  */
 void
 ipc_server_client_destroy_session_and_compositor(volatile struct ipc_client_state *ics);
+
+#ifdef XRT_OS_LINUX_DESKTOP
+/*!
+ * Close every fd parked in ics->weave_deferred_close_fds (XR_DXR_weave v10,
+ * #1699). Called at the top of the weave dma-buf handlers and at client
+ * teardown. Only safe once the reply that carried those fds has been sent.
+ */
+void
+ipc_server_client_weave_flush_deferred_fds(volatile struct ipc_client_state *ics);
+#endif
 
 /*!
  * @defgroup ipc_server_internals Server Internals

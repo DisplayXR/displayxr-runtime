@@ -118,6 +118,12 @@ common_shutdown(volatile struct ipc_client_state *ics)
 	// If the session hasn't been stopped, destroy the compositor.
 	ipc_server_client_destroy_session_and_compositor(ics);
 
+#ifdef XRT_OS_LINUX_DESKTOP
+	// XR_DXR_weave v10 (#1699): the last weave reply's release sync_file / output
+	// dup were parked for a next call that will never come.
+	ipc_server_client_weave_flush_deferred_fds(ics);
+#endif
+
 	// Make sure undestroyed spaces are unreferenced
 	for (uint32_t i = 0; i < IPC_MAX_CLIENT_SPACES; i++) {
 		// Cast away volatile.

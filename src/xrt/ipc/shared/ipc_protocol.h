@@ -911,6 +911,84 @@ struct ipc_arg_weave_screen_flat_regions
 };
 
 /*!
+ * Max memory planes one dma-buf carries on the weave wire (spec v10, #1699).
+ * Mirrors XR_WEAVE_DMABUF_MAX_PLANES_DXR and XRT_WEAVE_DMABUF_MAX_PLANES.
+ */
+#define IPC_WEAVE_DMABUF_MAX_PLANES 4
+
+/*!
+ * One dma-buf's layout on the weave wire (spec v10, desktop Linux, #1699): the
+ * POD half of @ref xrt_weave_dmabuf_desc. The fd itself never rides in a POD —
+ * it crosses as an in_handle (SCM_RIGHTS), and this names what it is. 64 bytes.
+ *
+ * @ingroup ipc
+ */
+struct ipc_weave_dmabuf
+{
+	uint64_t drm_modifier; //!< DRM format modifier, verbatim (never DRM_FORMAT_MOD_INVALID)
+	uint64_t buffer_id;    //!< caller-chosen stable buffer identity (import-cache key); 0 = none
+	uint32_t width;
+	uint32_t height;
+	uint32_t drm_fourcc;
+	uint32_t plane_count; //!< 1..IPC_WEAVE_DMABUF_MAX_PLANES
+	uint32_t offsets[IPC_WEAVE_DMABUF_MAX_PLANES];
+	uint32_t strides[IPC_WEAVE_DMABUF_MAX_PLANES];
+};
+
+/*!
+ * XR_DXR_weave v10 (#1699): the dma-buf half of a weave_submit_dmabuf call. The
+ * other half is the unchanged @ref ipc_arg_weave_submit, so rects / overlay
+ * presence / layout / flat regions mean exactly what they mean on weave_submit.
+ *
+ * In-handle slots (all fds on desktop Linux, where xrt_graphics_buffer_handle_t
+ * and xrt_graphics_sync_handle_t are both `int`, so a sync_file may ride the
+ * buffer-typed in_handles array — a documented pun, not an accident):
+ *  - [0] the input dma-buf (always);
+ *  - [1] the overlay dma-buf, iff ipc_arg_weave_submit::have_overlay;
+ *  - [acquire_fence_slot] the acquire sync_file, iff acquire_fence_slot != 0.
+ *    Slot 0 is always the input, so 0 doubles as "no fence" and a zeroed struct
+ *    is the fence-less submit.
+ *
+ * The reply's single out handle (named release_fences in proto.json) is the
+ * per-frame release sync_file, or none when the weave completed synchronously.
+ *
+ * Why a separate call rather than growing weave_submit: weave_submit is the
+ * shipping hot path on Windows / macOS / Android. Adding out_handles to it would
+ * add a second (empty) pipe message to every Windows submit, and 136 dead bytes
+ * to every non-Linux message. This call carries both only where they mean
+ * something. Size: 4 (cmd) + 824 (ipc_arg_weave_submit) + 136 (this) + 4
+ * (handle_count) = 968 of IPC_BUF_SIZE 1024, asserted in ipc_server_handler.c.
+ *
+ * @ingroup ipc
+ */
+struct ipc_arg_weave_dmabuf
+{
+	struct ipc_weave_dmabuf input;   //!< describes in_handles[0]
+	struct ipc_weave_dmabuf overlay; //!< describes in_handles[1] when have_overlay; else zero
+	uint32_t acquire_fence_slot;     //!< in_handles index of the acquire sync_file; 0 = none
+	uint32_t _reserved;              //!< zero; keeps the struct 8-byte sized
+};
+
+/*!
+ * XR_DXR_weave v10 (#1699): the woven output's layout, replied by
+ * weave_get_output_dmabuf beside the fd (which rides as the out handle). The
+ * POD half of @ref xrt_weave_dmabuf_output_desc. 64 bytes.
+ *
+ * @ingroup ipc
+ */
+struct ipc_weave_dmabuf_output
+{
+	uint64_t drm_modifier;
+	uint64_t size; //!< total allocation size in bytes
+	uint32_t width;
+	uint32_t height;
+	uint32_t drm_fourcc;
+	uint32_t plane_count;
+	uint32_t offsets[IPC_WEAVE_DMABUF_MAX_PLANES];
+	uint32_t strides[IPC_WEAVE_DMABUF_MAX_PLANES];
+};
+
+/*!
  * Arguments for xrt_device::get_view_poses with two views.
  */
 struct ipc_info_get_view_poses_2
