@@ -56,7 +56,12 @@ endif()
 
 add_executable(weave_probe_vk_linux main.cpp)
 
-target_include_directories(weave_probe_vk_linux PRIVATE ${OPENXR_INCLUDE_DIR})
+target_include_directories(weave_probe_vk_linux PRIVATE
+    ${OPENXR_INCLUDE_DIR}
+    # weave_dmabuf_vk.h: the dma-buf transport calls, shared with
+    # weave/weave_present_vk_linux.
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../weave/common
+)
 
 target_link_libraries(weave_probe_vk_linux PRIVATE
     OpenXR::openxr_loader
