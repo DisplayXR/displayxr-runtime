@@ -203,9 +203,11 @@ static bool g_display_info_mutex_initialized = false;
 //! @ref DISPLAY_INFO_DECLINE_RETRY_NS after that. A compliant plug-in declines
 //! fast, but a pre-contract one may spend its whole SR query budget inside the
 //! call — and the callback fires twice per client (connect + compositor
-//! create), on the IPC accept path, under the server's global lock.
+//! create), on the IPC accept path, under the server's global lock, plus once
+//! a second from the IPC main loop while the info is unknown (#1721). The
+//! window matches that tick so a periodic caller is never silently halved.
 static int64_t g_display_info_last_decline_ns = 0;
-#define DISPLAY_INFO_DECLINE_RETRY_NS (2 * (int64_t)U_TIME_1S_IN_NS)
+#define DISPLAY_INFO_DECLINE_RETRY_NS ((int64_t)U_TIME_1S_IN_NS)
 
 /*!
  * `get_display_info` through the struct_size gate every caller uses; false
@@ -418,8 +420,11 @@ refresh_display_info_from_plugin(struct xrt_system_compositor_info *info, const 
  * AFTER the service started (issue #342), and display geometry the plug-in
  * could only report after startup (panel identified late). Invoked once per
  * client connect (before the IPC shared-memory snapshot of the head's mode
- * table) and once per per-client compositor create, before any DP-factory
- * read; cheap when nothing changed. See ADR-020 / `target_plugin_refresh_active`.
+ * table), once per per-client compositor create, before any DP-factory read,
+ * and at ~1 Hz from the IPC server's main loop while the display info is still
+ * unknown (#1721 — so a client that connected before identification is not
+ * the last one to ever ask); cheap when nothing changed. See ADR-020 /
+ * `target_plugin_refresh_active`.
  */
 static void
 refresh_display_processors_cb(struct xrt_system_compositor_info *info)
@@ -823,7 +828,8 @@ out:
 		} else if (plugin != NULL) {
 			U_LOG_W(
 			    "Plug-in '%s' get_display_info declined at instance create — display info stays "
-			    "unknown until a client connect re-pulls it (panel not identified yet?)",
+			    "unknown until the service re-pulls it (~1 Hz while unknown, and at every client "
+			    "connect; panel not identified yet?)",
 			    plugin->id ? plugin->id : "?");
 		}
 
