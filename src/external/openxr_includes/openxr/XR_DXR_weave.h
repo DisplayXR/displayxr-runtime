@@ -136,8 +136,9 @@
  *
  * Sync on Android is the macOS contract: the caller finishes its GPU writes
  * before submitting and the submit returns only once the woven output is
- * GPU-complete (no fence handle, fenceValue is a monotonic counter). An
- * fd-based (`sync_file`) acquire/release variant is a documented follow-up.
+ * GPU-complete (no fence handle, fenceValue is a monotonic counter). The
+ * fd-based (`sync_file`) acquire/release variant arrived in v10, for desktop
+ * Linux only (XrWeaveSubmitSyncDXR / XrWeaveOutputSyncDXR).
  *
  * Per-region hardware wish (SPEC_VERSION 8, browser#88 Phase 3 item A). Until v8
  * the weave path drove the panel's physical 3D element ALL-OR-NOTHING: a present-
@@ -182,7 +183,39 @@
  * xrWeaveExportIpcConnectionDXR + XrWeaveIpcConnectionDXR, brokering a runtime
  * IPC endpoint to a sandboxed sibling process (browser#103), plus the §4b error
  * table (a dead connection now reports XR_ERROR_INSTANCE_LOST /
- * XR_ERROR_SESSION_LOST instead of a generic XR_ERROR_RUNTIME_FAILURE).
+ * XR_ERROR_SESSION_LOST instead of a generic XR_ERROR_RUNTIME_FAILURE); 10 =
+ * desktop-Linux dma-buf transport (#1699): XR_WEAVE_HANDLE_KIND_DMABUF_DXR /
+ * _OPAQUE_FD_DXR, XrWeaveDmabufDescDXR + XrWeaveOverlayDmabufDescDXR (fd + DRM
+ * fourcc + modifier + per-plane layout in), XrWeaveOutputDmabufDXR (fd-typed
+ * woven output), and sync_file fences XrWeaveSubmitSyncDXR (acquire, in) /
+ * XrWeaveOutputSyncDXR (release, out, every frame).
+ *
+ * Desktop-Linux dma-buf transport (SPEC_VERSION 10, #1699). A file descriptor is
+ * an int, not a pointer, and carries no dimensions, format or tiling, so v10 does
+ * not squeeze it into @c inputTexture. It adds typed chains instead:
+ *
+ *  - IN. Chain an XrWeaveDmabufDescDXR onto XrWeaveSubmitInfoDXR::next (and an
+ *    XrWeaveOverlayDmabufDescDXR when an XrWeaveSubmitOverlaysDXR is chained): the
+ *    fd, DRM fourcc, DRM format modifier and per-plane offsets/strides — what a
+ *    Vulkan VK_EXT_image_drm_format_modifier import needs. @c inputTexture /
+ *    @c overlayTexture are then ignored (pass NULL).
+ *  - OUT. Chain an XrWeaveOutputDmabufDXR onto XrWeaveOutputDXR::next to receive
+ *    the woven output as a dma-buf, with the same lifetime @c weavedTexture has:
+ *    first successful submit and every reallocation, fd -1 in between.
+ *  - SYNC. XrWeaveSubmitSyncDXR carries an acquire sync_file (the runtime waits it
+ *    on the GPU before reading the input); XrWeaveOutputSyncDXR returns a release
+ *    sync_file EVERY FRAME (the caller waits it before sampling the output). The
+ *    woven dma-buf is once-per-allocation; the release fence is per-frame.
+ *
+ * FD OWNERSHIP follows the Vulkan external-handle rule: every fd the caller
+ * passes IN is the runtime's once xrWeaveSubmitDXR returns XR_SUCCESS, and stays
+ * the caller's on any other result. Every fd handed OUT is the caller's to close.
+ *
+ * All v10 structs are platform-neutral in layout (fds are int32_t, as in
+ * XrWeaveIpcConnectionDXR) but ACCEPTED ONLY ON DESKTOP LINUX: a DMABUF /
+ * OPAQUE_FD kind or an input descriptor on any other platform is
+ * XR_ERROR_VALIDATION_FAILURE. The two OUT chains are harmless everywhere — a
+ * runtime with nothing to put in them writes fd -1.
  */
 #ifndef XR_DXR_WEAVE_H
 #define XR_DXR_WEAVE_H 1
@@ -195,7 +228,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_weave 1
-#define XR_DXR_weave_SPEC_VERSION 9
+#define XR_DXR_weave_SPEC_VERSION 10
 #define XR_DXR_WEAVE_EXTENSION_NAME "XR_DXR_weave"
 
 // Reserved 1004999190..199. Final values reconcile with the Khronos registry
@@ -216,6 +249,12 @@ extern "C" {
 // Reserved 1004999240..249 — a fresh decade for spec v9+ additions, because the
 // 190..199 block above is exhausted (199 is spoken for). Same registry.
 #define XR_TYPE_WEAVE_IPC_CONNECTION_DXR ((XrStructureType)1004999240)
+// Spec v10 (#1699): desktop-Linux dma-buf transport + sync_file fences.
+#define XR_TYPE_WEAVE_DMABUF_DESC_DXR         ((XrStructureType)1004999241)
+#define XR_TYPE_WEAVE_OVERLAY_DMABUF_DESC_DXR ((XrStructureType)1004999242)
+#define XR_TYPE_WEAVE_OUTPUT_DMABUF_DXR       ((XrStructureType)1004999243)
+#define XR_TYPE_WEAVE_SUBMIT_SYNC_DXR         ((XrStructureType)1004999244)
+#define XR_TYPE_WEAVE_OUTPUT_SYNC_DXR         ((XrStructureType)1004999245)
 
 //! Upper bound on eye positions carried by XrWeaveSubmitInfoDXR (mirrors the
 //! runtime's XRT_MAX_VIEWS). Phase 1: carried but unused.
@@ -240,6 +279,11 @@ extern "C" {
 
 //! Upper bound on rects passed to xrWeaveSetScreenFlatRegionsDXR (spec v8).
 #define XR_WEAVE_SET_MAX_SCREEN_FLAT_RECTS_DXR 8
+
+//! Upper bound on memory planes one dma-buf descriptor carries (spec v10). All
+//! planes are offsets into the ONE fd; 4 is the DRM ceiling (Intel CCS modifiers
+//! use 2 for a single-plane RGB format).
+#define XR_WEAVE_DMABUF_MAX_PLANES_DXR 4
 
 /*!
  * @brief Per-frame weave submission for one window sub-rect.
@@ -290,7 +334,8 @@ typedef struct XrWeaveSubmitInfoDXR {
  * @c XR_WEAVE_HANDLE_KIND_PLATFORM_DEFAULT_DXR keeps every pre-v7 caller correct
  * byte-for-byte: the runtime resolves it to the platform's native kind (Windows:
  * NT handle, or legacy DXGI when @c inputIsDxgi / @c overlayIsDxgi is XR_TRUE;
- * macOS: IOSurface; Android: AHardwareBuffer).
+ * macOS: IOSurface; Android: AHardwareBuffer; desktop Linux: OPAQUE_FD, unless an
+ * XrWeaveDmabufDescDXR is chained, which selects DMABUF).
  */
 typedef enum XrWeaveHandleKindDXR {
     //! Resolve from the platform (+ the inputIsDxgi / overlayIsDxgi bit on Windows).
@@ -303,6 +348,16 @@ typedef enum XrWeaveHandleKindDXR {
     XR_WEAVE_HANDLE_KIND_IOSURFACE_DXR = 3,
     //! Android: AHardwareBuffer* (the buffer itself travels over the IPC socket).
     XR_WEAVE_HANDLE_KIND_AHARDWAREBUFFER_DXR = 4,
+    //! Desktop Linux (spec v10): a dma-buf described by a chained
+    //! XrWeaveDmabufDescDXR (input) / XrWeaveOverlayDmabufDescDXR (overlay); the
+    //! texture field itself is ignored. Any producer, any driver.
+    XR_WEAVE_HANDLE_KIND_DMABUF_DXR = 5,
+    //! Desktop Linux (spec v10): a Vulkan OPAQUE_FD memory export from the SAME
+    //! driver and device as the runtime, passed as (void*)(intptr_t)fd in the
+    //! texture field. Carries no format or tiling, so it only works between two
+    //! Vulkan instances that agree on both; what PLATFORM_DEFAULT resolves to on
+    //! desktop Linux (the pre-v10 behaviour there). Prefer DMABUF.
+    XR_WEAVE_HANDLE_KIND_OPAQUE_FD_DXR = 6,
     XR_WEAVE_HANDLE_KIND_MAX_ENUM_DXR = 0x7FFFFFFF
 } XrWeaveHandleKindDXR;
 
@@ -318,9 +373,10 @@ typedef enum XrWeaveHandleKindDXR {
  * Sync note (v7): Android adopts the macOS contract — the caller completes its
  * GPU writes into @c inputTexture BEFORE calling xrWeaveSubmitDXR, and the call
  * RETURNS only once the woven output is GPU-complete (XrWeaveOutputDXR::fence
- * stays NULL, @c fenceValue is a plain monotonic counter). An fd-based
- * (`sync_file`) acquire/release variant is a documented follow-up; it is a
- * latency optimisation, never a correctness requirement.
+ * stays NULL, @c fenceValue is a plain monotonic counter). The fd-based
+ * (`sync_file`) acquire/release variant is v10's XrWeaveSubmitSyncDXR /
+ * XrWeaveOutputSyncDXR, desktop Linux only; it is a latency optimisation, never a
+ * correctness requirement.
  */
 typedef struct XrWeaveSubmitHandlesDXR {
     XrStructureType          type;        //!< XR_TYPE_WEAVE_SUBMIT_HANDLES_DXR
@@ -482,6 +538,11 @@ typedef struct XrWeaveSubmitFlatRegionsDXR {
  * and the caller reuses the handles it already opened. @c width, @c height and
  * @c fenceValue are valid on every call. The caller owns the returned HANDLEs
  * and must CloseHandle() them when done.
+ *
+ * Desktop Linux (v10): chain an XrWeaveOutputDmabufDXR to receive the woven
+ * output as a typed dma-buf, and an XrWeaveOutputSyncDXR to receive a per-frame
+ * release fence; @c fence is never set there. Without the dma-buf chain an
+ * OPAQUE_FD export rides @c weavedTexture as (void*)(intptr_t)fd.
  */
 typedef struct XrWeaveOutputDXR {
     XrStructureType    type;          //!< XR_TYPE_WEAVE_OUTPUT_DXR
@@ -579,6 +640,139 @@ typedef struct XrWeaveIpcConnectionDXR {
     void*              handle; //!< Windows: connected pipe HANDLE; NULL elsewhere
     int32_t            fd;     //!< POSIX: connected socket fd; -1 on Windows
 } XrWeaveIpcConnectionDXR;
+
+/*!
+ * @brief The submit's INPUT as a dma-buf (spec v10, desktop Linux, #1699).
+ *
+ * Chain onto XrWeaveSubmitInfoDXR::next. Its presence selects the DMABUF handle
+ * kind for the input (an XrWeaveSubmitHandlesDXR, if also chained, must say
+ * DMABUF or PLATFORM_DEFAULT); XrWeaveSubmitInfoDXR::inputTexture is ignored.
+ * Every other input-layout rule (v3 batch, v6 N-view atlas) is unchanged — this
+ * says only what the pixels ARE and where they live.
+ *
+ * The values are what the producer's allocator reports (`gbm_bo_get_*`, EGL
+ * `eglExportDMABUFImageMESA`, Chromium's `gfx::NativePixmapHandle`), passed
+ * through verbatim:
+ *
+ *  - @c fd — the dma-buf (>= 0). All planes are offsets into this ONE fd.
+ *    OWNERSHIP: the runtime's once xrWeaveSubmitDXR returns XR_SUCCESS (it closes
+ *    it); still the caller's on any other result. A caller that wants to keep
+ *    the buffer passes a dup().
+ *  - @c drmFourcc — DRM_FORMAT_* code (e.g. DRM_FORMAT_ABGR8888 for RGBA8 bytes).
+ *  - @c drmModifier — DRM format modifier, verbatim. DRM_FORMAT_MOD_INVALID
+ *    (0x00ffffffffffffff, "implicit") is rejected: resolve it first (LINEAR = 0).
+ *  - @c planeCount — 1..XR_WEAVE_DMABUF_MAX_PLANES_DXR (memory planes, including
+ *    a modifier's auxiliary planes); @c offsets / @c strides beyond it are ignored.
+ *  - @c bufferId — a caller-chosen STABLE identity for the underlying buffer, 0 =
+ *    none. An fd is not an identity (every hand-off is a new number), so the
+ *    runtime keys its import cache on this when non-zero and on the fd's inode
+ *    otherwise; a producer rotating a small pool should set it, so a steady
+ *    stream re-uses imports instead of re-importing every frame. Two different
+ *    buffers must never share a non-zero id within one session.
+ */
+typedef struct XrWeaveDmabufDescDXR {
+    XrStructureType          type;        //!< XR_TYPE_WEAVE_DMABUF_DESC_DXR
+    const void* XR_MAY_ALIAS next;
+    int32_t                  fd;          //!< dma-buf fd; runtime-owned on XR_SUCCESS
+    uint32_t                 width;       //!< pixels
+    uint32_t                 height;      //!< pixels
+    uint32_t                 drmFourcc;   //!< DRM_FORMAT_* fourcc
+    uint64_t                 drmModifier; //!< DRM format modifier (never DRM_FORMAT_MOD_INVALID)
+    uint32_t                 planeCount;  //!< 1..XR_WEAVE_DMABUF_MAX_PLANES_DXR
+    uint32_t                 offsets[XR_WEAVE_DMABUF_MAX_PLANES_DXR]; //!< per-plane byte offset into @c fd
+    uint32_t                 strides[XR_WEAVE_DMABUF_MAX_PLANES_DXR]; //!< per-plane row pitch, bytes
+    uint64_t                 bufferId;    //!< stable caller identity of the buffer; 0 = none
+} XrWeaveDmabufDescDXR;
+
+/*!
+ * @brief The OVERLAY atlas as a dma-buf (spec v10, desktop Linux, #1699).
+ *
+ * Field-for-field identical to XrWeaveDmabufDescDXR; a separate structure type
+ * only because one next chain carries both and a structure type may appear in a
+ * chain once. Chain onto XrWeaveSubmitInfoDXR::next together with the
+ * XrWeaveSubmitOverlaysDXR it describes (whose @c overlayTexture is then
+ * ignored). Required when the input is a dma-buf and an overlay is submitted;
+ * rejected when the input is not a dma-buf. Same ownership rule.
+ */
+typedef struct XrWeaveOverlayDmabufDescDXR {
+    XrStructureType          type;        //!< XR_TYPE_WEAVE_OVERLAY_DMABUF_DESC_DXR
+    const void* XR_MAY_ALIAS next;
+    int32_t                  fd;
+    uint32_t                 width;
+    uint32_t                 height;
+    uint32_t                 drmFourcc;
+    uint64_t                 drmModifier;
+    uint32_t                 planeCount;
+    uint32_t                 offsets[XR_WEAVE_DMABUF_MAX_PLANES_DXR];
+    uint32_t                 strides[XR_WEAVE_DMABUF_MAX_PLANES_DXR];
+    uint64_t                 bufferId;
+} XrWeaveOverlayDmabufDescDXR;
+
+/*!
+ * @brief The woven output as a dma-buf (spec v10, desktop Linux, #1699).
+ *
+ * Chain onto XrWeaveOutputDXR::next. Same LIFETIME as @c weavedTexture: filled on
+ * the first successful xrWeaveSubmitDXR and again whenever the output is
+ * reallocated (@c width / @c height change); on every other frame @c fd is -1 and
+ * the caller keeps using the buffer it already imported. The caller OWNS a
+ * returned fd and closes it when done (after importing it, typically).
+ *
+ * @c size is the whole allocation in bytes (what a Vulkan importer passes as
+ * VkMemoryAllocateInfo::allocationSize). On a platform or path that exports no
+ * dma-buf the runtime writes @c fd = -1 and leaves the rest zero, so a portable
+ * caller may always chain it.
+ */
+typedef struct XrWeaveOutputDmabufDXR {
+    XrStructureType    type;        //!< XR_TYPE_WEAVE_OUTPUT_DMABUF_DXR
+    void* XR_MAY_ALIAS next;
+    int32_t            fd;          //!< woven dma-buf (caller-owned), or -1 on steady-state frames
+    uint32_t           width;
+    uint32_t           height;
+    uint32_t           drmFourcc;
+    uint64_t           drmModifier;
+    uint32_t           planeCount;
+    uint32_t           offsets[XR_WEAVE_DMABUF_MAX_PLANES_DXR];
+    uint32_t           strides[XR_WEAVE_DMABUF_MAX_PLANES_DXR];
+    uint64_t           size;        //!< total allocation size in bytes
+} XrWeaveOutputDmabufDXR;
+
+/*!
+ * @brief Acquire fence for a dma-buf submit (spec v10, desktop Linux, #1699).
+ *
+ * Chain onto XrWeaveSubmitInfoDXR::next alongside an XrWeaveDmabufDescDXR (it is
+ * rejected without one). @c acquireFenceFd is a sync_file that signals when the
+ * caller's GPU has finished WRITING the input (and overlay) AND finished READING
+ * the previous woven output — one fence covers both hazards. The runtime waits it
+ * on the GPU before it touches either, so the caller need not finish its GPU work
+ * before submitting. -1 = no fence: the caller has already finished (the v9
+ * contract). Ownership as XrWeaveDmabufDescDXR::fd.
+ */
+typedef struct XrWeaveSubmitSyncDXR {
+    XrStructureType          type;           //!< XR_TYPE_WEAVE_SUBMIT_SYNC_DXR
+    const void* XR_MAY_ALIAS next;
+    int32_t                  acquireFenceFd; //!< sync_file fd, or -1 = none
+} XrWeaveSubmitSyncDXR;
+
+/*!
+ * @brief Release fence for this frame's woven output (spec v10, desktop Linux).
+ *
+ * Chain onto XrWeaveOutputDXR::next. Unlike the woven dma-buf (once per
+ * allocation) this is PER FRAME: every successful xrWeaveSubmitDXR writes a fresh
+ * @c releaseFenceFd, a sync_file that signals when the woven output of THIS
+ * submit is complete. The caller owns it, waits it (GPU import or poll) before
+ * sampling the output, and closes it. -1 means the submit already completed
+ * synchronously — the output is ready now.
+ *
+ * Without this chain the runtime keeps the v9 contract for the caller: it waits
+ * the release fence itself before xrWeaveSubmitDXR returns. @c fenceValue stays a
+ * monotonic per-submit counter either way. Harmless on every platform — where
+ * there is no sync_file the runtime writes -1.
+ */
+typedef struct XrWeaveOutputSyncDXR {
+    XrStructureType    type;           //!< XR_TYPE_WEAVE_OUTPUT_SYNC_DXR
+    void* XR_MAY_ALIAS next;
+    int32_t            releaseFenceFd; //!< sync_file fd (caller-owned), or -1 = already complete
+} XrWeaveOutputSyncDXR;
 
 typedef XrResult (XRAPI_PTR *PFN_xrWeaveBindWindowDXR)(
     XrSession session, void* windowHandle);
