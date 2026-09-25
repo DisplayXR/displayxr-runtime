@@ -457,8 +457,10 @@ There is no way to skip a test from inside the CTS. Judge it.
 > painter's rules, plus the #1589/#1610 colour model on a private `_SRGB`-view
 > target); a Windows `-Graphics vulkan` hardware run of that branch passed
 > QuadOcclusion, the gradients (13/13), SourceAlphaBlending and the
-> environment-blend pair. Equirect2 on `vk_native` is a separate change, and
-> `Subimage` / `MinLayers` have not yet been judged on Vulkan. A run that
+> environment-blend pair. Equirect2 is drawn on `vk_native` since the equirect2
+> port (shared camera, sub-rect blend, `discard` outside the section, a
+> lavapipe pixel test); `Subimage` / `MinLayers` have not yet been judged on
+> Vulkan. A run that
 > produces no visible prompt is a harness gap, not a result.
 >
 > **`d3d11`** is the reference lane: 0 runtime-attributable failures on `main`
