@@ -23,6 +23,11 @@
 #
 #   * No interactive categories. Those need an operator at a 3D panel; that
 #     procedure stays Windows-side (docs/reference/cts-interactive-procedure.md).
+#     The runtime half exists (#1727): the self-created XCB window feeds keys
+#     and mouse buttons into qwerty, so xdotool can drive a prompt — but only in
+#     a tree built with `./scripts/build_linux.sh --qwerty`. The default build
+#     has no qwerty, hence no controllers and no select action at all; the
+#     QWERTY line printed below says which tree this is.
 #
 # WHAT *IS* Linux-specific:
 #
@@ -391,6 +396,8 @@ export DXR_WINDOW_FULLSCREEN="${DXR_WINDOW_FULLSCREEN:-0}"
 echo "RUNTIME:  XR_RUNTIME_JSON=$XR_RUNTIME_JSON"
 echo "PLUGINS:  XRT_PLUGIN_SEARCH_PATH=${XRT_PLUGIN_SEARCH_PATH:-(unset)} DXR_PLUGIN_EXCLUSIVE=${DXR_PLUGIN_EXCLUSIVE:-(unset)} DXR_INPUT_PROVIDERS=$DXR_INPUT_PROVIDERS"
 echo "DISPLAY:  $DISPLAY"
+QWERTY_STATE="$(sed -n 's/^XRT_BUILD_DRIVER_QWERTY:BOOL=//p' "$BUILD_DIR/CMakeCache.txt" 2>/dev/null)"
+echo "QWERTY:   ${QWERTY_STATE:-unknown} (interactive categories need ON: build_linux.sh --qwerty)"
 
 # ---- run ---------------------------------------------------------------------
 # OpenXR-CTS renamed --apiVersion -> --minApiVersion in openxr-cts-1.1.44+; the

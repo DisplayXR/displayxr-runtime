@@ -11157,6 +11157,15 @@ comp_vk_native_compositor_set_system_devices(struct xrt_compositor *xc,
 		comp_d3d11_window_set_system_devices(c->own_window, xsysd);
 	}
 #endif
+
+#ifdef XRT_OS_LINUX_DESKTOP
+	// #1727: the self-created XCB window feeds keyboard/mouse into qwerty, the
+	// way the Win32 window does. An app-owned window (xlib binding) handles
+	// its own input, as on Windows.
+	if (c->owns_window && c->xcb_window != NULL) {
+		comp_vk_native_window_xcb_set_system_devices(c->xcb_window, xsysd);
+	}
+#endif
 }
 
 void

@@ -66,6 +66,10 @@ set(tests
 if(XRT_BUILD_DRIVER_QWERTY)
 	list(APPEND tests tests_qwerty_camera_profile tests_qwerty_velocity)
 endif()
+# #1727 -- the X11 qwerty front-end's edge logic (one click = one select edge).
+if(XRT_BUILD_DRIVER_QWERTY AND XRT_HAVE_XCB AND NOT ANDROID)
+	list(APPEND tests tests_qwerty_xcb)
+endif()
 
 # #1380 -- the input-provider host iface's display-geometry cache. Needs the
 # loader itself (target_lists), so it is only registered where that target
@@ -206,6 +210,10 @@ endif()
 
 if(TARGET tests_qwerty_velocity)
 	target_link_libraries(tests_qwerty_velocity PRIVATE drv_qwerty drv_qwerty_includes aux_math)
+endif()
+
+if(TARGET tests_qwerty_xcb)
+	target_link_libraries(tests_qwerty_xcb PRIVATE drv_qwerty drv_qwerty_includes)
 endif()
 
 if(WIN32 AND XRT_HAVE_D3D11 AND XRT_FEATURE_OPENXR AND XRT_FEATURE_OPENXR_HEADLESS AND RUNTIME_TARGET)

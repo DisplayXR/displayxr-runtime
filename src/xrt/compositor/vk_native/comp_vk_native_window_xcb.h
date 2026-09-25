@@ -86,6 +86,7 @@ struct comp_vk_native_wayland_handle
 };
 
 struct comp_vk_native_window_xcb;
+struct xrt_system_devices;
 
 /*!
  * Wrap an app-provided Xlib window (XR_DXR_xlib_window_binding) into the XCB
@@ -184,6 +185,20 @@ comp_vk_native_window_xcb_create(uint32_t width,
                                  int32_t screen_top,
                                  bool transparent_background,
                                  struct comp_vk_native_window_xcb **out_win);
+
+/*!
+ * Route keyboard and mouse input from the self-owned window into the qwerty
+ * driver (#1727) — the Linux counterpart of comp_d3d11_window_set_system_devices.
+ *
+ * Input is decoded and dispatched from @ref comp_vk_native_window_xcb_pump, so
+ * it arrives at the cadence the compositor pumps the window (every frame).
+ * A no-op when the runtime is built without the qwerty driver.
+ *
+ * @param xsysd System devices whose qwerty devices receive the input; NULL
+ *              detaches (and releases anything held).
+ */
+void
+comp_vk_native_window_xcb_set_system_devices(struct comp_vk_native_window_xcb *win, struct xrt_system_devices *xsysd);
 
 /*!
  * Fill in the surface handle (connection + window) for VkSurfaceKHR creation.
