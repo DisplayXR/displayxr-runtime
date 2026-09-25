@@ -60,6 +60,7 @@ add_library(
 	oxr_views_change.c
 	oxr_views_change.h
 	oxr_weave.c
+	oxr_lift.c
 	oxr_workspace.c
 	oxr_workspace_modal_win32.c
 	oxr_workspace_file_dialog.c

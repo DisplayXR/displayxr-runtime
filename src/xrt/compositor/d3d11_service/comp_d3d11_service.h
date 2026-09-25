@@ -21,6 +21,8 @@
 #include "xrt/xrt_display_metrics.h"
 #include "xrt/xrt_handles.h"
 #include "xrt/xrt_system.h"
+#include "xrt/xrt_dp_lift.h"
+#include "xrt/xrt_lift.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -1192,6 +1194,102 @@ comp_d3d11_service_weave_snap_window_rect(struct xrt_compositor *xc,
                                           int32_t target_y,
                                           int32_t *out_x,
                                           int32_t *out_y);
+
+/*
+ * XR_DXR_lift (ADR-042) — 2D→3D conversion streams. SYSTEM-level (a stream is
+ * owned by an IPC connection, identified by @p owner, not by a session), so a
+ * headless probe can drive them without a compositor. The work runs on the
+ * service's lift thread (d3d11_lift.h); none of these waits for a conversion.
+ * Every function is a no-op / FEATURE_NOT_SUPPORTED when @p xsysc is not the
+ * D3D11 service.
+ */
+
+//! Value types: xrt_lift_result / xrt_lift_blob_info / xrt_lift_weave_rect (xrt_lift.h).
+
+//! The conversion module's caps (cached; kicks module activation on first call).
+void
+comp_d3d11_service_lift_get_caps(struct xrt_system_compositor *xsysc, struct xrt_dp_lift_caps *out);
+
+xrt_result_t
+comp_d3d11_service_lift_stream_create(struct xrt_system_compositor *xsysc,
+                                      uint64_t owner,
+                                      const struct xrt_dp_lift_stream_info *info,
+                                      uint64_t *out_id);
+
+void
+comp_d3d11_service_lift_stream_destroy(struct xrt_system_compositor *xsysc, uint64_t owner, uint64_t id);
+
+//! Destroy every stream @p owner created (IPC client teardown).
+void
+comp_d3d11_service_lift_release_owner(struct xrt_system_compositor *xsysc, uint64_t owner);
+
+/*!
+ * xrSubmitLiftFrameDXR: snapshot @p w x @p h of the caller's shared texture into
+ * the stream's latest-wins mailbox and return its frame id (0 = the module is
+ * not up yet; the frame was not taken). XRT_ERROR_WEAVE_REFUSED = transient
+ * (keyed-mutex miss), retry next frame. Takes ownership of an NT @p handle.
+ */
+xrt_result_t
+comp_d3d11_service_lift_submit(struct xrt_system_compositor *xsysc,
+                               uint64_t owner,
+                               uint64_t id,
+                               xrt_graphics_buffer_handle_t handle,
+                               bool is_dxgi,
+                               uint32_t w,
+                               uint32_t h,
+                               int64_t source_time,
+                               const struct xrt_dp_lift_params *params,
+                               const float *viewpoints,
+                               uint32_t viewpoint_floats,
+                               uint64_t *out_frame_id);
+
+//! xrAcquireLiftResultDXR. @p out_ready false = nothing newer (NOT READY).
+xrt_result_t
+comp_d3d11_service_lift_acquire(struct xrt_system_compositor *xsysc,
+                                uint64_t owner,
+                                uint64_t id,
+                                bool *out_ready,
+                                struct xrt_lift_result *out);
+
+bool
+comp_d3d11_service_lift_export_output(struct xrt_system_compositor *xsysc,
+                                      uint64_t owner,
+                                      uint64_t id,
+                                      xrt_graphics_buffer_handle_t *out_handle,
+                                      uint32_t *out_width,
+                                      uint32_t *out_height,
+                                      uint32_t *out_format);
+
+bool
+comp_d3d11_service_lift_export_fence(struct xrt_system_compositor *xsysc,
+                                     uint64_t owner,
+                                     uint64_t id,
+                                     xrt_graphics_sync_handle_t *out_handle);
+
+/*!
+ * xrAcquireLiftBlobDXR (two-call latch). On delivery @p out_bytes is a malloc'd
+ * copy the caller frees.
+ */
+xrt_result_t
+comp_d3d11_service_lift_acquire_blob(struct xrt_system_compositor *xsysc,
+                                     uint64_t owner,
+                                     uint64_t id,
+                                     uint64_t capacity,
+                                     bool *out_ready,
+                                     struct xrt_lift_blob_info *out_info,
+                                     uint8_t **out_bytes);
+
+/*!
+ * Latch the lift-flagged rects of this client's NEXT weave submit
+ * (XrWeaveSubmitLiftRectsDXR). Consumed — and cleared — by that submit. Each
+ * rect's content is snapshotted into its stream and the stream's LATEST result
+ * is woven at the rect's CURRENT position (flat until the first result).
+ */
+bool
+comp_d3d11_service_lift_set_weave_rects(struct xrt_compositor *xc,
+                                        uint64_t owner,
+                                        uint32_t count,
+                                        const struct xrt_lift_weave_rect *rects);
 
 /*! @} */
 

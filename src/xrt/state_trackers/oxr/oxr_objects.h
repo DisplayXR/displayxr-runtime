@@ -134,6 +134,7 @@ struct oxr_body_tracker_fb;
 struct oxr_xdev_list;
 struct oxr_plane_detector_ext;
 struct oxr_local_3d_zone_ext;
+struct oxr_lift_stream_dxr;
 
 #define XRT_MAX_HANDLE_CHILDREN 256
 #define OXR_MAX_BINDINGS_PER_ACTION 32
@@ -4331,6 +4332,28 @@ struct oxr_local_3d_zone_ext
 	void *comp_mask;
 };
 #endif // OXR_HAVE_DXR_local_3d_zone
+
+#ifdef OXR_HAVE_DXR_lift
+/*!
+ * One XR_DXR_lift conversion stream (ADR-042). The conversion itself lives in
+ * the service (d3d11_lift.cpp); this is the handle, the service-side id, and
+ * the export latch for the stream's result texture + fence (the weave output
+ * pattern: handed out on the first acquire and on every reallocation).
+ *
+ * Parent type/handle is @ref oxr_session
+ *
+ * @obj{XrLiftStreamDXR}
+ * @extends oxr_handle_base
+ */
+struct oxr_lift_stream_dxr
+{
+	struct oxr_handle_base handle;
+	struct oxr_session *sess;
+	uint64_t id;   //!< service-side stream id
+	uint32_t mode; //!< XRT_DP_LIFT_MODE_* (one bit)
+	bool exported; //!< the caller holds the current export texture + fence
+};
+#endif // OXR_HAVE_DXR_lift
 
 
 #ifdef OXR_HAVE_EXT_user_presence
