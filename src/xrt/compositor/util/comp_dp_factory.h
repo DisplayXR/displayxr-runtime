@@ -52,7 +52,8 @@ enum comp_dp_api
 };
 
 /*!
- * Sentinel monitor id meaning "don't care — use the primary entry". Phase 3a
+ * Sentinel monitor id meaning "don't care — use the primary entry" (the active
+ * plug-in's monitor, see @ref xrt_dp_registry_primary_entry). Phase 3a
  * call sites pass this (single display → one entry); Phase 3b passes the real
  * per-window monitor id once split-weave routing exists.
  */
@@ -114,8 +115,10 @@ comp_dp_factory_for_window(const struct xrt_system_compositor_info *info,
 		return scalar;
 	}
 
-	// Pick the entry: an exact monitor match, else the primary (entries[0]).
-	const struct xrt_dp_registry_entry *chosen_entry = &info->dp_registry.entries[0];
+	// Pick the entry: an exact monitor match, else the primary — the active
+	// plug-in's monitor, not blindly entries[0] (multi-monitor, see helper).
+	const struct xrt_dp_registry_entry *chosen_entry =
+	    xrt_dp_registry_primary_entry(&info->dp_registry, info->active_plugin_id);
 	if (monitor_id != COMP_DP_PRIMARY_MONITOR) {
 		for (uint32_t i = 0; i < info->dp_registry.entry_count; i++) {
 			if (info->dp_registry.entries[i].monitor_id == monitor_id) {

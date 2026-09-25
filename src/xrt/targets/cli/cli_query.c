@@ -634,8 +634,9 @@ dp_confidence_label(uint32_t c)
  * shell path uses the registry's primary entry — reproduced here with the same
  * `os_display_edid_enumerate` → `target_plugin_build_descriptors` →
  * `target_plugin_resolve_displays` sequence the compositor builds it from, then
- * reading entries[0] exactly as `comp_dp_factory_for_window(COMP_DP_PRIMARY_
- * MONITOR)` does. Runs after the active plug-in is known; safe headless (no
+ * picking the entry exactly as `comp_dp_factory_for_window(COMP_DP_PRIMARY_
+ * MONITOR)` does (`xrt_dp_registry_primary_entry`: the active plug-in's
+ * monitor, else entries[0]). Runs after the active plug-in is known; safe headless (no
  * service, no GPU). Off-Windows the EDID enumerator yields no monitors, so the
  * registry is empty and the service path falls back to the scalar — reported as
  * agreement, never a false mismatch.
@@ -659,9 +660,9 @@ probe_dp_selection(struct cli_query_result *r, const struct xrt_plugin_iface *ac
 	r->dp_sel_claim_count = reg.entry_count;
 
 	if (reg.entry_count > 0) {
-		// The compositor passes COMP_DP_PRIMARY_MONITOR, which selects
-		// entries[0]; mirror that exactly.
-		const struct xrt_dp_registry_entry *e = &reg.entries[0];
+		// The compositor passes COMP_DP_PRIMARY_MONITOR, which selects via
+		// xrt_dp_registry_primary_entry; mirror that exactly.
+		const struct xrt_dp_registry_entry *e = xrt_dp_registry_primary_entry(&reg, r->dp_sel_inproc_id);
 		snprintf(r->dp_sel_service_id, sizeof(r->dp_sel_service_id), "%s", e->plugin_id);
 		snprintf(r->dp_sel_service_conf, sizeof(r->dp_sel_service_conf), "%s",
 		         dp_confidence_label(e->confidence));
