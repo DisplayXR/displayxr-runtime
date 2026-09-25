@@ -132,12 +132,8 @@ u_lift_mailbox_begin_submit(struct u_lift_mailbox *mb, int32_t *out_slot);
  * PENDING, and drop any OLDER pending frame (latest wins). Returns the frame id.
  */
 uint64_t
-u_lift_mailbox_commit_submit(struct u_lift_mailbox *mb,
-                             int32_t slot,
-                             int64_t source_time,
-                             uint64_t now_ns,
-                             uint32_t width,
-                             uint32_t height);
+u_lift_mailbox_commit_submit(
+    struct u_lift_mailbox *mb, int32_t slot, int64_t source_time, uint64_t now_ns, uint32_t width, uint32_t height);
 
 //! The snapshot into @p slot failed: return it to FREE (no frame id consumed).
 void
@@ -266,11 +262,8 @@ u_lift_sched_init(struct u_lift_sched *s);
  * its round) — call again.
  */
 uint32_t
-u_lift_sched_plan(struct u_lift_sched *s,
-                  const struct u_lift_sched_entry *entries,
-                  uint32_t count,
-                  uint64_t *out_ids,
-                  uint32_t max);
+u_lift_sched_plan(
+    struct u_lift_sched *s, const struct u_lift_sched_entry *entries, uint32_t count, uint64_t *out_ids, uint32_t max);
 
 
 #ifdef __cplusplus

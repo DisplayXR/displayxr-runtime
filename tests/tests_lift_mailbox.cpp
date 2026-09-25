@@ -137,7 +137,7 @@ TEST_CASE("lift mailbox: overwriting the pending slot counts one drop", "[lift]"
 	submit(mb, 1, 10); // pending in one slot
 	int32_t conv = -1;
 	REQUIRE(u_lift_mailbox_take_pending(&mb, 11, &conv, nullptr)); // converting
-	submit(mb, 2, 20);                                              // pending in the other
+	submit(mb, 2, 20);                                             // pending in the other
 	CHECK(mb.dropped == 0);
 
 	// Both slots are busy (converting + pending): the next begin must take the

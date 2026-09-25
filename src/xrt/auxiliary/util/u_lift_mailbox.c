@@ -62,12 +62,8 @@ u_lift_mailbox_begin_submit(struct u_lift_mailbox *mb, int32_t *out_slot)
 }
 
 uint64_t
-u_lift_mailbox_commit_submit(struct u_lift_mailbox *mb,
-                             int32_t slot,
-                             int64_t source_time,
-                             uint64_t now_ns,
-                             uint32_t width,
-                             uint32_t height)
+u_lift_mailbox_commit_submit(
+    struct u_lift_mailbox *mb, int32_t slot, int64_t source_time, uint64_t now_ns, uint32_t width, uint32_t height)
 {
 	if (!slot_ok_in(slot) || mb->in_state[slot] != U_LIFT_IN_WRITING) {
 		return 0;
@@ -271,11 +267,8 @@ u_lift_sched_init(struct u_lift_sched *s)
 }
 
 uint32_t
-u_lift_sched_plan(struct u_lift_sched *s,
-                  const struct u_lift_sched_entry *entries,
-                  uint32_t count,
-                  uint64_t *out_ids,
-                  uint32_t max)
+u_lift_sched_plan(
+    struct u_lift_sched *s, const struct u_lift_sched_entry *entries, uint32_t count, uint64_t *out_ids, uint32_t max)
 {
 	uint32_t n = 0;
 	bool any = false;
