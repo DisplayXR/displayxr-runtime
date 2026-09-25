@@ -1596,12 +1596,13 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 	/*
 	 * Painter's-order state, one per tile, zeroed for this frame (#1598).
 	 *
-	 * The FIRST layer into a tile is a REPLACE whatever its flags say — a
-	 * transparent-background app sets SOURCE_ALPHA on its single projection
-	 * layer, and that blit has to write alpha verbatim or the DP's alpha
-	 * gate dies (#225). Later layers blend by their flags, and an unflagged
-	 * one is OPAQUE_COVER, not REPLACE. comp_layer_tile_blend_mode() owns
-	 * that whole rule; this backend just carries the state.
+	 * The FIRST FULL-TILE projection layer into a tile is a REPLACE whatever
+	 * its flags say — a transparent-background app sets SOURCE_ALPHA on its
+	 * single projection layer, and that blit has to write alpha verbatim or
+	 * the DP's alpha gate dies (#225). Later layers blend by their flags, and
+	 * an unflagged one is OPAQUE_COVER, not REPLACE. Sub-rect layers (quads,
+	 * zones) never take the base slot; see the per-draw split below. The
+	 * shared helpers own the rule; this backend just carries the state.
 	 */
 	struct comp_layer_tile_state tiles[XRT_MAX_VIEWS] = {0};
 
@@ -1662,6 +1663,40 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 					continue;
 				}
 			}
+			/*
+			 * THE PAINTER'S RULE (#1598), split three ways exactly as
+			 * D3D11 / D3D12 / GL / Metal split it (comp_layer_view_camera.h):
+			 *
+			 *  - a FULL-TILE projection-class layer asks the first-in-tile
+			 *    gate: the first one into the tile is REPLACE (verbatim
+			 *    RGBA, #225), later ones blend by their flags;
+			 *  - a SUB-RECT Khronos layer (quad) takes its flags via
+			 *    comp_layer_subrect_blend_mode() and can never reach
+			 *    REPLACE — it cannot establish the tile's alpha — but it
+			 *    marks the tile, so a later projection layer blends over it;
+			 *  - a 3D ZONE takes NEITHER helper: ADR-027 keeps it alpha-over
+			 *    in list order, PREMULTIPLIED unless flagged unpremultiplied,
+			 *    so an unflagged zone's texture alpha survives. It marks the
+			 *    tile too.
+			 *
+			 * Resolved HERE, before any per-draw early-out below, so the
+			 * mark is eager (D3D11/GL parity): which layer holds the base
+			 * slot stays a function of the layer LIST, not of a transient
+			 * view/descriptor failure. A back-face-culled quad (above)
+			 * never gets here, so it marks nothing — it drew nothing.
+			 */
+			enum comp_layer_blend_mode mode;
+			if (is_zone) {
+				comp_layer_tile_mark_composited(&tiles[eye]);
+				mode = (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0
+				           ? COMP_LAYER_BLEND_STRAIGHT
+				           : COMP_LAYER_BLEND_PREMULTIPLIED;
+			} else if (is_quad) {
+				mode = comp_layer_subrect_blend_mode(&tiles[eye], layer->data.flags);
+			} else {
+				mode = comp_layer_tile_blend_mode(&tiles[eye], layer->data.flags);
+			}
+
 			/*
 			 * Sample through the view in the format the APP ASKED
 			 * FOR, so the GPU DECODES an `_SRGB` source to linear
@@ -1813,20 +1848,20 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 			};
 
 			/*
-			 * THE PAINTER'S RULE (#1598), for every layer type.
-			 *
-			 * Part 1 pinned projection layers to REPLACE because the
-			 * shared vocabulary was still being finalised; it is
-			 * merged now, so they join the rule here. First layer
-			 * into this tile -> REPLACE (verbatim RGBA); later ones
-			 * -> OPAQUE_COVER / PREMULTIPLIED / STRAIGHT by their
-			 * flags. Zones reach it through the same call, so their
-			 * previous "always alpha-over" is now "alpha-over unless
-			 * they are the first thing in the tile" — which is what
-			 * a zones frame's transparent clear already implied.
+			 * XR_KHR_composition_layer_color_scale_bias, when the
+			 * layer carries it (identity otherwise). Filled BEFORE the
+			 * OPAQUE_COVER fold below, which overrides alpha.
 			 */
-			const enum comp_layer_blend_mode mode =
-			    comp_layer_tile_blend_mode(&tiles[eye], layer->data.flags);
+			if ((layer->data.flags & XRT_LAYER_COMPOSITION_COLOR_BIAS_SCALE) != 0) {
+				push.color_scale[0] = layer->data.color_scale.r;
+				push.color_scale[1] = layer->data.color_scale.g;
+				push.color_scale[2] = layer->data.color_scale.b;
+				push.color_scale[3] = layer->data.color_scale.a;
+				push.color_bias[0] = layer->data.color_bias.r;
+				push.color_bias[1] = layer->data.color_bias.g;
+				push.color_bias[2] = layer->data.color_bias.b;
+				push.color_bias[3] = layer->data.color_bias.a;
+			}
 
 			// OPAQUE_COVER's alpha-of-one is emitted by the SHADER,
 			// folded into the scale/bias it already applies: fixed-
@@ -2007,11 +2042,13 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	 * erases whatever the blits already put down. All-or-nothing per frame
 	 * is a property of the pass, not a simplification.
 	 *
-	 *  - FAST PATH — one drawable layer and no zones: the blit, verbatim.
+	 *  - FAST PATH — one drawable PROJECTION layer and no zones: the blit,
+	 *    verbatim.
 	 *    This is every shipping app, it is the perf path, and because the
 	 *    commands are literally unchanged it is also the no-regression
 	 *    proof: the atlas is byte-identical to before this change.
-	 *  - PASS — zones (which must blend), or more than one drawable layer.
+	 *  - PASS — zones (which must blend), a quad, or more than one drawable
+	 *    layer.
 	 *  - FALLBACK — the pass cannot be built (sticky `zone.failed`): the
 	 *    blit runs instead and content degrades exactly to main's behaviour
 	 *    (overlaps overwrite), which is a degradation, never a corruption.
@@ -2052,9 +2089,14 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	 * multi-layer frames and quad frames need the render pass whatever the
 	 * colour answer is. Note the hatch makes the shared predicate return
 	 * true unconditionally; without this AND, turning the hatch on would
-	 * silently take alpha-over compositing and quads away with it.
+	 * silently take alpha-over compositing and quads away with it — and a
+	 * lone QUAD is exactly that case: one drawable layer, but a blit would
+	 * stretch it over the whole tile. So the single layer must also be a
+	 * full-tile projection blit (or the frame empty) for the blit to be a
+	 * faithful rendering of it.
 	 */
-	const bool structure_allows_raw = !zones_frame && drawable <= 1;
+	const bool structure_allows_raw =
+	    !zones_frame && (drawable == 0 || (drawable == 1 && compose_frame_base_is_projection(layers)));
 
 	const bool want_pass =
 	    !(colour_allows_raw && structure_allows_raw) || debug_get_bool_option_vk_force_compose_pass();
