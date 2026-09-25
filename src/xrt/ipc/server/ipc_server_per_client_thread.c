@@ -124,6 +124,9 @@ common_shutdown(volatile struct ipc_client_state *ics)
 	ipc_server_client_weave_flush_deferred_fds(ics);
 #endif
 
+	// XR_DXR_lift (ADR-042): streams are owned by the connection, not a session.
+	ipc_server_client_lift_release(ics);
+
 	// Make sure undestroyed spaces are unreferenced
 	for (uint32_t i = 0; i < IPC_MAX_CLIENT_SPACES; i++) {
 		// Cast away volatile.

@@ -33,6 +33,8 @@ add_library(
 	d3d11_service_shaders.h
 	d3d11_capture.cpp
 	d3d11_capture.h
+	d3d11_lift.cpp
+	d3d11_lift.h
 	d3d11_icon_loader.cpp
 	d3d11_icon_loader.h
 	displayxr_logo_data.h
