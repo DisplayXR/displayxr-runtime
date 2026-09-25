@@ -189,8 +189,8 @@ struct lift_stream
 	uint32_t last_viewpoint_floats = 0;
 
 	uint32_t priority = U_LIFT_PRIORITY_NORMAL; //!< XrLiftPriorityDXR
-	bool dead = false;       //!< destroy requested; the lift thread reaps it
-	bool converting = false; //!< the lift thread is inside a conversion for it
+	bool dead = false;                          //!< destroy requested; the lift thread reaps it
+	bool converting = false;                    //!< the lift thread is inside a conversion for it
 
 	// Lift thread only.
 	uint64_t dp_id = 0;
@@ -495,8 +495,8 @@ lift_activate(d3d11_lift *l)
 	D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
 	D3D_FEATURE_LEVEL got = D3D_FEATURE_LEVEL_11_0;
 	if (SUCCEEDED(hr)) {
-		hr = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels,
-		                       2, D3D11_SDK_VERSION, &l->lift_device, &got, &l->lift_context);
+		hr = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+		                       levels, 2, D3D11_SDK_VERSION, &l->lift_device, &got, &l->lift_context);
 	}
 	rel(adapter);
 	if (SUCCEEDED(hr)) {
@@ -525,8 +525,8 @@ lift_activate(d3d11_lift *l)
 	// explicit lift-only factory when it has one (no weaver, no tracker
 	// session); else its ordinary factory with a NULL window.
 	const bool lift_only = l->lift_factory != nullptr;
-	xrt_result_t xret = (lift_only ? l->lift_factory : l->fallback_factory)(l->lift_device, l->lift_context,
-	                                                                        nullptr, &l->dp);
+	xrt_result_t xret =
+	    (lift_only ? l->lift_factory : l->fallback_factory)(l->lift_device, l->lift_context, nullptr, &l->dp);
 	U_LOG_W("[lift] lift DP %s via the plug-in's %s factory (dedicated device, NULL window)",
 	        xret == XRT_SUCCESS && l->dp != nullptr ? "created" : "REFUSED",
 	        lift_only ? "lift-only" : "ordinary (no lift-only factory)");
@@ -778,12 +778,12 @@ lift_convert_one(d3d11_lift *l, lift_stream &st, std::unique_lock<std::mutex> &l
 	uint64_t now = os_monotonic_get_ns();
 	if (now - st.last_stats_log_ns > 5ull * 1000 * 1000 * 1000) {
 		st.last_stats_log_ns = now;
-		U_LOG_I("[lift] stream %llu: submitted=%llu converted=%llu dropped=%llu failed=%llu "
-		        "latency last=%.1fms ema=%.1fms min=%.1fms max=%.1fms",
-		        (unsigned long long)st.id, (unsigned long long)st.mb.submitted,
-		        (unsigned long long)st.mb.converted, (unsigned long long)st.mb.dropped,
-		        (unsigned long long)st.mb.failed, st.mb.lat_last_ns / 1e6, st.mb.lat_ema_ns / 1e6,
-		        st.mb.lat_min_ns / 1e6, st.mb.lat_max_ns / 1e6);
+		U_LOG_I(
+		    "[lift] stream %llu: submitted=%llu converted=%llu dropped=%llu failed=%llu "
+		    "latency last=%.1fms ema=%.1fms min=%.1fms max=%.1fms",
+		    (unsigned long long)st.id, (unsigned long long)st.mb.submitted, (unsigned long long)st.mb.converted,
+		    (unsigned long long)st.mb.dropped, (unsigned long long)st.mb.failed, st.mb.lat_last_ns / 1e6,
+		    st.mb.lat_ema_ns / 1e6, st.mb.lat_min_ns / 1e6, st.mb.lat_max_ns / 1e6);
 	}
 	l->cv.notify_all();
 }
@@ -821,7 +821,8 @@ lift_thread_main(d3d11_lift *l)
 			// Frames only count as work once the module is READY (they wait,
 			// latest-wins, until then); dead streams always do (reaping).
 			return l->stop || (l->activate_requested && !l->activated) ||
-			       (l->activated && (any_dead(l) || (l->caps.state == XRT_DP_LIFT_STATE_READY && any_work(l))));
+			       (l->activated &&
+			        (any_dead(l) || (l->caps.state == XRT_DP_LIFT_STATE_READY && any_work(l))));
 		});
 		if (l->stop) {
 			break;
@@ -838,7 +839,8 @@ lift_thread_main(d3d11_lift *l)
 
 		// A module warming up: poll ≤ 1 Hz until READY.
 		uint64_t now = os_monotonic_get_ns();
-		if (l->dp != nullptr && l->caps.state != XRT_DP_LIFT_STATE_READY && now - last_poll_ns > 1000000000ull) {
+		if (l->dp != nullptr && l->caps.state != XRT_DP_LIFT_STATE_READY &&
+		    now - last_poll_ns > 1000000000ull) {
 			last_poll_ns = now;
 			lk.unlock();
 			lift_poll_caps(l);
@@ -951,9 +953,10 @@ d3d11_lift_create(ID3D11Device *svc_device,
 	// Snapshot blit resources (service device).
 	ID3DBlob *b = nullptr;
 	ID3DBlob *err = nullptr;
-	bool ok = SUCCEEDED(D3DCompile(k_snap_vs, strlen(k_snap_vs), nullptr, nullptr, nullptr, "main", "vs_5_0", 0, 0,
-	                               &b, &err)) &&
-	          SUCCEEDED(svc_device->CreateVertexShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &l->snap_vs));
+	bool ok =
+	    SUCCEEDED(D3DCompile(k_snap_vs, strlen(k_snap_vs), nullptr, nullptr, nullptr, "main", "vs_5_0", 0, 0, &b,
+	                         &err)) &&
+	    SUCCEEDED(svc_device->CreateVertexShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &l->snap_vs));
 	rel(b);
 	rel(err);
 	ok = ok &&
@@ -1379,9 +1382,11 @@ d3d11_lift_submit_handle(struct d3d11_lift *l,
 		st->imp_handle = nullptr;
 		HRESULT hr;
 		if (is_dxgi) {
-			hr = l->svc_device->OpenSharedResource(handle, __uuidof(ID3D11Texture2D), (void **)&st->imp_tex);
+			hr =
+			    l->svc_device->OpenSharedResource(handle, __uuidof(ID3D11Texture2D), (void **)&st->imp_tex);
 		} else {
-			hr = l->svc_device1->OpenSharedResource1(handle, __uuidof(ID3D11Texture2D), (void **)&st->imp_tex);
+			hr = l->svc_device1->OpenSharedResource1(handle, __uuidof(ID3D11Texture2D),
+			                                         (void **)&st->imp_tex);
 		}
 		D3D11_TEXTURE2D_DESC d = {};
 		if (SUCCEEDED(hr)) {
@@ -1496,11 +1501,8 @@ d3d11_lift_unpin(struct d3d11_lift_pin *pin)
 }
 
 xrt_result_t
-d3d11_lift_acquire_result(struct d3d11_lift *l,
-                          uint64_t owner,
-                          uint64_t id,
-                          bool *out_ready,
-                          struct d3d11_lift_result_info *out)
+d3d11_lift_acquire_result(
+    struct d3d11_lift *l, uint64_t owner, uint64_t id, bool *out_ready, struct d3d11_lift_result_info *out)
 {
 	*out_ready = false;
 	*out = d3d11_lift_result_info{};
@@ -1564,11 +1566,13 @@ d3d11_lift_acquire_result(struct d3d11_lift *l,
 			ID3D11Device5 *d5 = nullptr;
 			hr = l->svc_device->QueryInterface(__uuidof(ID3D11Device5), (void **)&d5);
 			if (SUCCEEDED(hr)) {
-				hr = d5->CreateFence(0, D3D11_FENCE_FLAG_SHARED, __uuidof(ID3D11Fence), (void **)&st->exp_fence);
+				hr = d5->CreateFence(0, D3D11_FENCE_FLAG_SHARED, __uuidof(ID3D11Fence),
+				                     (void **)&st->exp_fence);
 			}
 			rel(d5);
 			if (SUCCEEDED(hr)) {
-				hr = st->exp_fence->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &st->exp_fence_handle);
+				hr = st->exp_fence->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr,
+				                                       &st->exp_fence_handle);
 			}
 		}
 		if (FAILED(hr)) {
