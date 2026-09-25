@@ -176,6 +176,18 @@ u_lift_mailbox_publish_output(struct u_lift_mailbox *mb,
 	mb->latest = slot;
 	mb->converted++;
 
+	if (mb->last_publish_ns != 0 && now_ns > mb->last_publish_ns) {
+		uint64_t iv = now_ns - mb->last_publish_ns;
+		if (mb->interval_ema_ns == 0) {
+			mb->interval_ema_ns = iv;
+		} else if (iv >= mb->interval_ema_ns) {
+			mb->interval_ema_ns += (iv - mb->interval_ema_ns) / 8;
+		} else {
+			mb->interval_ema_ns -= (mb->interval_ema_ns - iv) / 8;
+		}
+	}
+	mb->last_publish_ns = now_ns;
+
 	uint64_t lat = now_ns >= m->submit_ns ? now_ns - m->submit_ns : 0;
 	mb->lat_last_ns = lat;
 	if (mb->converted == 1) {
@@ -244,4 +256,76 @@ bool
 u_lift_mailbox_has_result(const struct u_lift_mailbox *mb)
 {
 	return slot_ok_out(mb->latest) && mb->out_state[mb->latest] == U_LIFT_OUT_READY;
+}
+
+float
+u_lift_mailbox_rate_hz(const struct u_lift_mailbox *mb)
+{
+	return mb->interval_ema_ns > 0 ? (float)(1e9 / (double)mb->interval_ema_ns) : 0.0f;
+}
+
+void
+u_lift_sched_init(struct u_lift_sched *s)
+{
+	memset(s, 0, sizeof(*s));
+}
+
+uint32_t
+u_lift_sched_plan(struct u_lift_sched *s,
+                  const struct u_lift_sched_entry *entries,
+                  uint32_t count,
+                  uint64_t *out_ids,
+                  uint32_t max)
+{
+	uint32_t n = 0;
+	bool any = false;
+	for (uint32_t i = 0; i < count; i++) {
+		if (entries[i].pending && entries[i].priority != U_LIFT_PRIORITY_PAUSED) {
+			any = true;
+		}
+	}
+	if (!any) {
+		return 0;
+	}
+	const bool low_round = (s->round % U_LIFT_LOW_EVERY_N) == 0;
+	s->round++;
+
+	// Every HIGH stream with a new frame.
+	for (uint32_t i = 0; i < count && n < max; i++) {
+		if (entries[i].pending && entries[i].priority >= U_LIFT_PRIORITY_HIGH) {
+			out_ids[n++] = entries[i].id;
+		}
+	}
+
+	// ONE NORMAL stream, round-robin: the first after the last served, else wrap.
+	int32_t pick = -1;
+	for (uint32_t i = 0; i < count; i++) {
+		if (entries[i].pending && entries[i].priority == U_LIFT_PRIORITY_NORMAL &&
+		    entries[i].id > s->normal_rr_last) {
+			pick = (int32_t)i;
+			break;
+		}
+	}
+	if (pick < 0) {
+		for (uint32_t i = 0; i < count; i++) {
+			if (entries[i].pending && entries[i].priority == U_LIFT_PRIORITY_NORMAL) {
+				pick = (int32_t)i;
+				break;
+			}
+		}
+	}
+	if (pick >= 0 && n < max) {
+		out_ids[n++] = entries[pick].id;
+		s->normal_rr_last = entries[pick].id;
+	}
+
+	// LOW: every stream with a new frame, every Nth round.
+	if (low_round) {
+		for (uint32_t i = 0; i < count && n < max; i++) {
+			if (entries[i].pending && entries[i].priority == U_LIFT_PRIORITY_LOW) {
+				out_ids[n++] = entries[i].id;
+			}
+		}
+	}
+	return n;
 }

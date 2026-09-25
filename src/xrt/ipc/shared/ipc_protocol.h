@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "xrt/xrt_lift.h"
 #include "xrt/xrt_limits.h"
 #include "xrt/xrt_compiler.h"
 #include "xrt/xrt_compositor.h"
@@ -1035,7 +1036,7 @@ struct ipc_lift_params
 	uint32_t inpaint;
 	uint32_t view_count;       //!< 0 = module default
 	uint32_t viewpoint_count;  //!< 0 = tracked eyes; else explicit, <= IPC_LIFT_MAX_VIEWS
-	uint32_t reserved;
+	float focal_px;            //!< input focal length, input pixels; <= 0 = unknown
 	float viewpoints[3 * IPC_LIFT_MAX_VIEWS]; //!< xyz, display space, metres
 };
 
@@ -1094,6 +1095,8 @@ struct ipc_lift_weave_rect
 	float strength;
 	uint32_t inpaint;
 	uint32_t view_count;
+	float focal_px;
+	uint32_t reserved;
 };
 
 /*!

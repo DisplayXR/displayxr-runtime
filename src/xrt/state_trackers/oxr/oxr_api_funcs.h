@@ -1102,6 +1102,14 @@ oxr_xrAcquireLiftResultDXR(XrLiftStreamDXR stream, XrLiftResultDXR *result);
 //! OpenXR API function @ep{xrAcquireLiftBlobDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrAcquireLiftBlobDXR(XrLiftStreamDXR stream, XrLiftBlobDXR *blob);
+
+//! OpenXR API function @ep{xrSetLiftStreamPriorityDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetLiftStreamPriorityDXR(XrLiftStreamDXR stream, XrLiftPriorityDXR priority);
+
+//! OpenXR API function @ep{xrGetLiftStreamStatsDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetLiftStreamStatsDXR(XrLiftStreamDXR stream, XrLiftStreamStatsDXR *stats);
 #endif
 
 #ifdef OXR_HAVE_EXT_conformance_automation

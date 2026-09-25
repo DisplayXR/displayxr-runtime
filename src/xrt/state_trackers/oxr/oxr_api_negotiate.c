@@ -523,6 +523,8 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 	ENTRY_IF_EXT(xrSubmitLiftFrameDXR, DXR_lift);
 	ENTRY_IF_EXT(xrAcquireLiftResultDXR, DXR_lift);
 	ENTRY_IF_EXT(xrAcquireLiftBlobDXR, DXR_lift);
+	ENTRY_IF_EXT(xrSetLiftStreamPriorityDXR, DXR_lift);
+	ENTRY_IF_EXT(xrGetLiftStreamStatsDXR, DXR_lift);
 #endif
 
 #ifdef OXR_HAVE_DXR_workspace_file_dialog

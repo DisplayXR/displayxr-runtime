@@ -16,6 +16,7 @@
 #include "client/ipc_client_lift.h"
 #include "ipc_client_generated.h"
 
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -30,6 +31,7 @@ params_to_ipc(const struct xrt_dp_lift_params *p,
 	out->strength = p->strength;
 	out->inpaint = p->inpaint;
 	out->view_count = p->view_count;
+	out->focal_px = p->struct_size >= offsetof(struct xrt_dp_lift_params, focal_px) + sizeof(float) ? p->focal_px : 0.0f;
 	if (viewpoints != NULL && viewpoint_count > 0) {
 		uint32_t n = viewpoint_count > IPC_LIFT_MAX_VIEWS ? IPC_LIFT_MAX_VIEWS : viewpoint_count;
 		out->viewpoint_count = n;
@@ -263,6 +265,26 @@ ipc_client_lift_weave_rects(struct ipc_connection *ipc_c, uint32_t count, const 
 		args.rects[i].strength = rects[i].params.strength;
 		args.rects[i].inpaint = rects[i].params.inpaint;
 		args.rects[i].view_count = rects[i].params.view_count;
+		args.rects[i].focal_px = rects[i].params.focal_px;
 	}
 	return ipc_call_lift_weave_rects(ipc_c, &args);
+}
+
+xrt_result_t
+ipc_client_lift_set_priority(struct ipc_connection *ipc_c, uint64_t stream_id, uint32_t priority)
+{
+	if (ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_lift_stream_set_priority(ipc_c, stream_id, priority);
+}
+
+xrt_result_t
+ipc_client_lift_stats(struct ipc_connection *ipc_c, uint64_t stream_id, struct xrt_lift_stream_stats *out_stats)
+{
+	if (ipc_c == NULL || out_stats == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	U_ZERO(out_stats);
+	return ipc_call_lift_stream_stats(ipc_c, stream_id, out_stats);
 }
