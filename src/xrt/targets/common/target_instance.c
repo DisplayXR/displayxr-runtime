@@ -127,6 +127,14 @@ fill_dp_factories_from_plugin(struct xrt_system_compositor_info *info, const str
 	if (plugin->create_dp_d3d11 != NULL) {
 		info->dp_factory_d3d11 = (void *)plugin->create_dp_d3d11;
 	}
+	// ADR-042: the optional lift-only factory, appended to the iface (read only
+	// when the plug-in's struct_size covers it).
+	info->dp_factory_d3d11_lift = NULL;
+	if (plugin->struct_size >= offsetof(struct xrt_plugin_iface, create_dp_d3d11_lift) +
+	                               sizeof(plugin->create_dp_d3d11_lift) &&
+	    plugin->create_dp_d3d11_lift != NULL) {
+		info->dp_factory_d3d11_lift = (void *)plugin->create_dp_d3d11_lift;
+	}
 	if (plugin->create_dp_d3d12 != NULL) {
 		info->dp_factory_d3d12 = (void *)plugin->create_dp_d3d12;
 	}
