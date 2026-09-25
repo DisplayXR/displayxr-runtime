@@ -147,6 +147,7 @@ Integrate your 3D display hardware into DisplayXR.
 - [ADR-039](adr/ADR-039-one-fill-engine-for-every-tier.md) — One fill engine for every tier (same-adapter split)
 - [ADR-040](adr/ADR-040-rear-depth-budget.md) — Rear depth budget — the runtime owns the policy, the plug-in owns pixels, the app owns geometry
 - [ADR-041](adr/ADR-041-fixed-view-count-with-per-frame-activity.md) — Fixed view count with per-frame activity — inactive views alias, they do not disappear
+- [ADR-042](adr/ADR-042-vendor-2d3d-conversion-supersedes-default.md) — A vendor 2D→3D conversion module supersedes the open default — the runtime exposes it, weaving stays the DP's
 <!-- END ADR INDEX -->
 
 ---

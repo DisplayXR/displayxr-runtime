@@ -301,6 +301,7 @@ closed with **no message to the client**. An evicted-but-alive client (#925 S4) 
 | window-op worker | `comp_d3d11_service.cpp:1398` | `SetWindowPlacement`-family restores off the render path (#925 rank 7) | try/catch, no restart |
 | WinRT capture pool | `d3d11_capture.cpp:285-300` | `on_frame_arrived` → `CopyResource` on the **shared immediate context, outside `render_mutex`** (relies on `SetMultithreadProtected(TRUE)`, `comp_d3d11_service.cpp:14697-14705`) | partial |
 | provider threads | provider-owned (`ultraleap_provider.cpp:568` poll thread; net_input hub) | LeapC polling, #941 idle watchdog (a branch of the poll thread) | none |
+| lift (ADR-042) | `d3d11_lift.cpp` `d3d11_lift_create`, lazily on the first `XR_DXR_lift` call | the ONLY thread that touches the vendor's lift display processor: brings up a dedicated **lift device** on the service adapter (ID3D11Multithread-protected) + the plug-in's lift-only DP, then loops: priority-scheduled round (`u_lift_sched`) → take a stream's newest pending input → `lift_convert` / `lift_convert_blob` (ms to s) → copy into the output ring. Never takes `render_mutex` or `immediate_ctx_mutex`; calls back for tracked eyes with no lift lock held. Joined first in `system_destroy` | `DXR_LIFT=0` kill switch |
 
 ### 3.2 Lock order (as of #964–#966)
 
@@ -347,6 +348,15 @@ c->mutex  →  render_mutex  →  { ws_snapshot_mutex, active_compositor_mutex,
   resume path to maintain: `multi_compositor_register_client` restarts the thread
   and the presenter re-bind builds a DP on the first frame. The grace window is
   what keeps an app restart or a shell relaunch from recreating the vendor weaver.
+- **Lift (ADR-042) adds one leaf and no edge into the panel lock.** `d3d11_lift::mtx`
+  guards the stream table and every lift mailbox and is never held across a GPU
+  wait, a keyed-mutex acquire or a vendor call. Where both are taken the order is
+  `immediate_ctx_mutex → lift mtx` (a lift-flagged weave rect's snapshot, inside
+  `weave_submit`); the lift thread never takes `immediate_ctx_mutex` (it owns a
+  device of its own), and the IPC-side lift calls take `immediate_ctx_mutex` alone,
+  for one blit or one copy. Frames cross between the service device and the lift
+  device only as keyed-mutex shared textures (two input slots, two output-ring
+  slots per stream), so neither thread ever waits on the other's GPU queue.
 - Never join the render thread under `render_mutex`; never hold
   `global_state.lock` across a compositor call.
 
@@ -363,6 +373,7 @@ c->mutex  →  render_mutex  →  { ws_snapshot_mutex, active_compositor_mutex,
 | `hub->mutex` | Ultraleap provider | joint sets | poll thread + every consumer's `get_hand_tracking` |
 | `ipc_c->mutex` | per client process | the whole pipe round trip | every RPC |
 | `usys->sessions.mutex` | per system | session list; event push (unbounded malloc'd per-session list, `u_session.c:34-42`) | broadcasts |
+| `d3d11_lift::mtx` | per service (`d3d11_lift.cpp`), leaf | lift stream table, every stream's `u_lift_mailbox` (input slots, output ring, pins, stats), caps | lift thread between conversions; IPC threads for submit / acquire / stats (ns-µs, never across GPU or vendor work); `weave_submit` for lift-flagged rects (under `immediate_ctx_mutex`) |
 
 **Nesting observed:** `global_state.lock → render_mutex` at ≥ 11 handler sites
 (`ipc_server_handler.c:3735, 4079, 4110, 4204, 4370, 4429, 4475, 4696, 4792, 4968, 5106`
