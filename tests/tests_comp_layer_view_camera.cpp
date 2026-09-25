@@ -1061,6 +1061,8 @@ TEST_CASE("comp_layer_view_camera: no backend gates its draw on the return value
 	    "d3d11_service/comp_d3d11_service.cpp",
 	    // #1581: D3D12 resolves the same cameras for its quad draw.
 	    "d3d12/comp_d3d12_renderer.cpp",
+	    // #1581: vk_native too, once it learned to draw quads (#1623).
+	    "vk_native/comp_vk_native_renderer.c",
 	};
 
 	for (const char *rel : backends) {
@@ -1152,6 +1154,9 @@ TEST_CASE("comp_layer_blend_mode: no backend reimplements the blend rule (#1621)
 	    // #1581: D3D12's one allowance is the SAME Local2D / window-space
 	    // channel D3D11's is — render_window_space_layer(), ported from it.
 	    {"d3d12/comp_d3d12_renderer.cpp", 1},
+	    // #1623: vk_native's zone arm reads only the UNPREMULTIPLIED bit
+	    // (ADR-027's own rule), never the source-alpha one.
+	    {"vk_native/comp_vk_native_renderer.c", 0},
 	};
 
 	for (const auto &backend : backends) {
@@ -1562,6 +1567,8 @@ TEST_CASE("comp_layer_tile_blend_mode: asking for a mode is what spends the base
  *
  * METAL is the one quad-drawing backend still outside this guard: its #1590 leg
  * is open, and a test that fails for a known-open leg is noise, not a guard.
+ * vk_native joined with #1623, which is where it learned to draw (and cull) a
+ * quad at all.
  * D3D12 joined with #1581, which is where it learned to draw a quad at all; GL
  * joined with #1581's GL leg, which is where it learned to CULL one — before
  * that its quad pass drew back-faces, and the CTS QuadOcclusion case showed a
@@ -1574,6 +1581,7 @@ TEST_CASE("the quad-drawing paths consult the shared facing and painter's rules 
 	    "d3d11_service/comp_d3d11_service.cpp",
 	    "d3d12/comp_d3d12_renderer.cpp",
 	    "gl/comp_gl_compositor.cpp",
+	    "vk_native/comp_vk_native_renderer.c",
 	};
 
 	for (const char *rel : backends) {
@@ -1604,6 +1612,8 @@ TEST_CASE("the quad-drawing paths consult the shared facing and painter's rules 
 	    "d3d11_service/comp_d3d11_service.cpp",
 	    "d3d12/comp_d3d12_renderer.cpp",
 	    "gl/comp_gl_compositor.cpp",
+	    // #1623: one draw loop for projection, zones and quads, like D3D12/GL.
+	    "vk_native/comp_vk_native_renderer.c",
 	};
 
 	for (const char *rel : subrect_backends) {
