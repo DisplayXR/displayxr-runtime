@@ -23,6 +23,7 @@
 #include "os/os_display_scale.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_display_zones.h"
+#include "xrt/xrt_dp_lift.h"
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -109,6 +110,14 @@ enum cli_selftest_result
 	 * navigating provider.
 	 */
 	CLI_SELFTEST_BAD_RIG = 10,
+	/*!
+	 * The plug-in's 2D→3D conversion module (XR_DXR_lift, ADR-042) answered
+	 * a MALFORMED caps struct (unknown mode bits, a state out of range, a
+	 * READY module with no streams, an NVIEW module with < 2 views). ABSENCE
+	 * NEVER FAILS: no module (modes 0) — the state of every plug-in without
+	 * one, and of sim_display — passes.
+	 */
+	CLI_SELFTEST_BAD_LIFT_CAPS = 11,
 };
 
 //! Hardware adapters reported by the GPU-topology probe (#918).
@@ -267,6 +276,15 @@ struct cli_query_result
 	bool zone_caps_malformed;
 	char zone_probe_note[128];
 	struct xrt_dp_local_zone_caps zone_caps;
+
+	/* ADR-042 lift-caps probe (Windows-only: WARP D3D11 device + the plug-in's
+	 * lift-only DP factory, else its ordinary one with a NULL window, then
+	 * lift_get_caps). Same outcome contract as the zone probe: modes 0 / no
+	 * slots / no factory pass; only a malformed answer fails. */
+	bool lift_caps_probed;
+	bool lift_caps_malformed;
+	char lift_probe_note[160];
+	struct xrt_dp_lift_caps lift_caps;
 
 	/* Input-provider checks (ADR-034 / #823). Absence never fails: with
 	 * no provider registered — or the ForceQwerty override set, or the
