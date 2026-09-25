@@ -202,11 +202,8 @@ d3d11_lift_unpin(struct d3d11_lift_pin *pin);
  * Takes the service context mutex internally — call WITHOUT it held.
  */
 xrt_result_t
-d3d11_lift_acquire_result(struct d3d11_lift *lift,
-                          uint64_t owner,
-                          uint64_t id,
-                          bool *out_ready,
-                          struct d3d11_lift_result_info *out);
+d3d11_lift_acquire_result(
+    struct d3d11_lift *lift, uint64_t owner, uint64_t id, bool *out_ready, struct d3d11_lift_result_info *out);
 
 //! The export texture's NT handle (service-owned; the IPC layer duplicates it).
 bool
