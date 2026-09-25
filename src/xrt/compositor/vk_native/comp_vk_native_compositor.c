@@ -58,6 +58,7 @@
 #endif
 
 #include "math/m_api.h"
+#include "util/u_color_encoding.h"
 #include "util/u_tiling.h"
 #include "util/u_canvas.h"
 #include "util/u_capture_intent.h"
@@ -7334,19 +7335,49 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 						 */
 						const bool true_srgb =
 						    comp_vk_native_swapchain_is_true_srgb(layer->sc_array[0]);
+						/*
+						 * #1589: zero-copy also hands the display
+						 * processor bytes it is told are ENCODED. That
+						 * is only true when the app's REQUESTED format
+						 * says so: a UNORM swapchain holds LINEAR values
+						 * (ADR-021 §6), and this branch owns no pass in
+						 * which to encode them — so the frame takes the
+						 * atlas path, where the private _SRGB compose
+						 * target does the encode. Again a colour
+						 * precondition on u_tiling_can_zero_copy()'s
+						 * RESULT, not a second tiling rule (ADR-030).
+						 */
+						const bool color_needs_encode =
+						    !comp_vk_native_swapchain_is_srgb(layer->sc_array[0]) &&
+						    !u_color_legacy_unorm_encoded();
 						if (!true_srgb &&
 						    // #1628: VkViewport.y with a positive height counts
 						    // down — top-origin. (A negative-height viewport is an
 						    // app-side choice we do not use anywhere.)
 						    u_tiling_can_zero_copy(vc, rxs, rys, rws, rhs_arr, sw, sh, mode,
 						                           U_TILING_ORIGIN_TOP_LEFT)) {
-							zc_image_u64 = comp_vk_native_swapchain_get_image(layer->sc_array[0], img_idx);
-							zc_view_u64 = comp_vk_native_swapchain_get_image_view(layer->sc_array[0], img_idx);
-							if (zc_image_u64 != 0 && zc_view_u64 != 0) {
-								zero_copy = true;
-								zc_format = comp_vk_native_renderer_get_format(c->renderer);
-								zc_width = sw;
-								zc_height = sh;
+							if (color_needs_encode) {
+								static bool zc_color_warned = false;
+								if (!zc_color_warned) {
+									zc_color_warned = true;
+									U_LOG_W(
+									    "[ZC] refused: reason=color_needs_encode "
+									    "— a UNORM swapchain is scene-linear and "
+									    "owes the sRGB encode, which only the "
+									    "compose path can apply (#1589)");
+								}
+							} else {
+								zc_image_u64 = comp_vk_native_swapchain_get_image(
+								    layer->sc_array[0], img_idx);
+								zc_view_u64 = comp_vk_native_swapchain_get_image_view(
+								    layer->sc_array[0], img_idx);
+								if (zc_image_u64 != 0 && zc_view_u64 != 0) {
+									zero_copy = true;
+									zc_format = comp_vk_native_renderer_get_format(
+									    c->renderer);
+									zc_width = sw;
+									zc_height = sh;
+								}
 							}
 						}
 					}
