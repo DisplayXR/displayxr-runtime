@@ -337,7 +337,7 @@ struct cli_query_result
 	 * reads the scalar dp_factory (== the active plug-in, `plugin_id` above),
 	 * while the D3D11 service / shell path AND in-process GL read the
 	 * per-monitor DP registry's PRIMARY entry (`comp_dp_factory_for_window`
-	 * with COMP_DP_PRIMARY_MONITOR → entries[0]). On a single display they MUST
+	 * with COMP_DP_PRIMARY_MONITOR → xrt_dp_registry_primary_entry). On a single display they MUST
 	 * agree — the loader enforces it for any monitor the active plug-in claims
 	 * (#1521) — and a mismatch means standalone apps, GL apps and the shell
 	 * weave with different DPs — e.g. Leia in-process but sim_display in the

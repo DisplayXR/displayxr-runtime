@@ -2776,6 +2776,41 @@ struct xrt_dp_factory_registry
 };
 
 /*!
+ * The registry entry a "don't care which monitor" caller (the D3D11 service
+ * compositor, in-process GL — `COMP_DP_PRIMARY_MONITOR`) should weave with:
+ * the first monitor the ACTIVE plug-in won, else entries[0].
+ *
+ * entries[0] alone is the first monitor in OS enumeration order — normally
+ * the Windows primary. On a laptop driving an external 3D panel that is the
+ * built-in screen, which only sim_display claims (FALLBACK), so the service
+ * wove with sim_display while standalone apps used the vendor DP (#1521 fixed
+ * the per-monitor winner, not which monitor the sentinel picks).
+ *
+ * Returns NULL only on an empty registry. @p active_plugin_id may be NULL/"".
+ */
+static inline const struct xrt_dp_registry_entry *
+xrt_dp_registry_primary_entry(const struct xrt_dp_factory_registry *reg, const char *active_plugin_id)
+{
+	if (reg == NULL || reg->entry_count == 0) {
+		return NULL;
+	}
+	if (active_plugin_id != NULL && active_plugin_id[0] != '\0') {
+		for (uint32_t i = 0; i < reg->entry_count; i++) {
+			const char *a = reg->entries[i].plugin_id;
+			const char *b = active_plugin_id;
+			while (*a != '\0' && *a == *b) {
+				a++;
+				b++;
+			}
+			if (*a == *b) {
+				return &reg->entries[i];
+			}
+		}
+	}
+	return &reg->entries[0];
+}
+
+/*!
  * Capabilities and information about the system compositor (and its wrapped native compositor, if any),
  * and device together.
  */
