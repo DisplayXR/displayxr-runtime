@@ -45,5 +45,6 @@
 - [ADR-039](ADR-039-one-fill-engine-for-every-tier.md) — One fill engine for every tier (same-adapter split)
 - [ADR-040](ADR-040-rear-depth-budget.md) — Rear depth budget — the runtime owns the policy, the plug-in owns pixels, the app owns geometry
 - [ADR-041](ADR-041-fixed-view-count-with-per-frame-activity.md) — Fixed view count with per-frame activity — inactive views alias, they do not disappear
+- [ADR-042](ADR-042-vendor-2d3d-conversion-supersedes-default.md) — A vendor 2D→3D conversion module supersedes the open default — the runtime exposes it, weaving stays the DP's
 - [ADR-043](ADR-043-stereo-camera-source.md) — A display's stereo camera is a plug-in-provided source, owned by the service and privacy-gated by the runtime
 - [ADR-044](ADR-044-colour-contract-per-backend.md) — The colour contract, per backend and swapchain format

@@ -392,6 +392,81 @@ bool (*get_background_preview)(struct xrt_display_processor_d3d11 *xdp,
   four floats zeroed is read as the documented normal case, `0,0,1,1`.
 - **Purely additive**, so no `XRT_PLUGIN_API_VERSION_CURRENT` bump (ADR-020).
 
+## Turning 2D into 3D: the lift slots (ADR-042, `XR_DXR_lift`)
+
+A vendor may ship a **2D→3D conversion module** — monocular depth, stereo or N-view synthesis,
+photo → Gaussian splats. The runtime exposes it to apps generically as
+[`XR_DXR_lift`](../specs/extensions/XR_DXR_lift.md), and, per
+[ADR-042](../adr/ADR-042-vendor-2d3d-conversion-supersedes-default.md), a READY vendor module
+supersedes the open default a browser or the web SDK would otherwise run. The plug-in side is
+five optional slots appended to `xrt_display_processor_d3d11` and one optional factory appended
+to `xrt_plugin_iface`, all announced by `XRT_DP_D3D11_HAS_LIFT` /
+`XRT_PLUGIN_IFACE_HAS_D3D11_LIFT_FACTORY`:
+
+```c
+/* xrt_dp_lift.h */
+struct xrt_dp_lift_caps { uint32_t struct_size; uint32_t modes; /* 1 DEPTH, 2 SBS, 4 NVIEW, 8 GAUSSIANS */
+                          uint32_t max_streams; uint32_t max_views;
+                          uint32_t depth_semantics; /* 0 relative, 1 metric */
+                          uint32_t state;           /* 0 unavailable, 1 activating, 2 ready */
+                          uint64_t typical_latency_ns; char backend[32]; };
+struct xrt_dp_lift_stream_info { uint32_t struct_size; uint32_t mode; uint32_t content_hint; /* 0 video, 1 photo */
+                                 float input_scale; };
+struct xrt_dp_lift_params { uint32_t struct_size; float convergence; /* [0,1] relative depth at the glass; <0 AUTO */
+                            float strength; uint32_t inpaint; uint32_t view_count;
+                            float focal_px; /* appended: input focal length in px; <=0 unknown (GAUSSIANS) */ };
+
+/* xrt_display_processor_d3d11, slots 25..29 */
+bool (*lift_get_caps)(xdp, struct xrt_dp_lift_caps *out);
+bool (*lift_stream_create)(xdp, const struct xrt_dp_lift_stream_info *info, uint64_t *out_id);
+void (*lift_stream_destroy)(xdp, uint64_t id);
+bool (*lift_convert)(xdp, uint64_t id, void *d3d11_context, void *input_resource /* RGBA8, w x h */,
+                     uint32_t w, uint32_t h, const struct xrt_dp_lift_params *p,
+                     const float *viewpoints_xyz, uint32_t viewpoint_floats,
+                     void **out_resource /* valid until the next call on this stream */,
+                     uint32_t *out_w, uint32_t *out_h, uint32_t *out_format /* DXGI_FORMAT */);
+bool (*lift_convert_blob)(xdp, uint64_t id, void *d3d11_context, void *input_resource, uint32_t w, uint32_t h,
+                          const struct xrt_dp_lift_params *p, uint32_t *out_format /* 1 PLY_3DGS, 2 SOG */,
+                          const void **out_bytes /* valid until the next call */, size_t *out_size);
+
+/* xrt_plugin_iface, appended */
+xrt_dp_factory_d3d11_fn_t create_dp_d3d11_lift; /* a DP that serves ONLY the lift slots */
+```
+
+- **Who calls, from where.** Exactly one runtime thread — the D3D11 service's *lift thread* —
+  on exactly one DP instance per service process, created through **`create_dp_d3d11_lift`**
+  on a **dedicated device** on the service's adapter (its immediate context has
+  `ID3D11Multithread` protection on, so a module may flush / signal it from its own worker).
+  Window handle NULL, never `process_atlas`, never a mode request. **That DP must build no
+  weaver and open no tracker session.** Without the lift-only factory the runtime falls back to
+  `create_dp_d3d11` with a NULL window, and destroys the instance at once if it has no lift
+  slots — which is why a plug-in with a module should provide the explicit factory.
+- **Why not the weaving DP.** A conversion blocks for tens of milliseconds (seconds for
+  GAUSSIANS); the weaving DP is driven on the service's single shared immediate context under
+  the render lock and is recreated on presenter/focus changes. Sharing it would stall every
+  weave for the length of a conversion.
+- **Synchronous, stateless in time.** One call converts one frame. The plug-in never queues,
+  drops, timestamps or schedules: the runtime owns the latest-wins mailbox, the output ring
+  (it copies `out_resource` / `out_bytes` before the next call), fences, per-stream priority
+  (`XrLiftPriorityDXR`) and timestamps. A `false` return means "no output this frame"; the
+  runtime keeps the previous result.
+- **Viewpoints are always explicit.** For SBS/N-view the runtime passes `viewpoints_xyz` —
+  the app's EXPLICIT viewpoints, else the panel DP's predicted tracked eye pair (display space,
+  metres). Give them precedence over any tracker of your own; the lift DP has none. NULL/0 only
+  while no eyes are known.
+- **Output layout.** SBS = two views side by side; NVIEW = `view_count` views in one row, view 0
+  leftmost; DEPTH = one channel (any single-channel or RGBA format — say which in
+  `out_format`). The runtime weaves SBS/NVIEW results itself on the ordinary weave path
+  (ADR-007) — the plug-in never weaves a lift result.
+- **Caps are polled.** `lift_get_caps` at DP creation, then ≤ 1 Hz while not READY, so an
+  ACTIVATING module (licence check, model load) shows up as READY without an app restart.
+  Modes 0 / a NULL slot / an older `struct_size` all read as "no module".
+- **Knobs live in the SERVICE's environment.** A vendor module that reads env vars (backend
+  choice, gains) reads them in `displayxr-service.exe`'s process, not the app's.
+- **sim_display** fills the slots only under `SIM_DISPLAY_FAKE_LIFT=1` (shifted SBS/N-view,
+  gradient depth, a two-layer 3DGS PLY) so the whole path runs hardware-free.
+- **Purely additive**, so no `XRT_PLUGIN_API_VERSION_CURRENT` bump (ADR-020).
+
 ## Where the window may LAND: `snap_window_rect`
 
 A windowed weave takes its interlace phase from the window's absolute position on the panel.
