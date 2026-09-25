@@ -47,7 +47,8 @@ Rules:
 | 1004999250–259 | `XR_DXR_wayland_surface_binding` | 250 = `XR_TYPE_WAYLAND_SURFACE_BINDING_CREATE_INFO_DXR` (#757), 251 = `XR_TYPE_WAYLAND_SURFACE_GEOMETRY_DXR` (spec v2) — the app-declared surface size + output refresh, because a `wl_surface` has no intrinsic size and the compositor geometry service cannot bootstrap one. **250 was renumbered from 1004999210**, which collided with `XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR` — the 210–219 decade was already `XR_DXR_display_info`'s. Safe to move: SPEC_VERSION 1, no shipped app chains it |
 | 1004999260–269 | `XR_DXR_depth_budget` | 260 = `XR_TYPE_REAR_DEPTH_BUDGET_DXR`, 261 = `XR_TYPE_CONTENT_BOUNDS_DXR`, 262 = `XR_TYPE_EVENT_DATA_REAR_DEPTH_BUDGET_STATE_CHANGED_DXR`, 263 = `XR_TYPE_CONTENT_MASK_DXR` (ADR-040). Was taken without a registry row — recorded retroactively in #1486 PR 2 |
 | 1004999270–279 | `XR_DXR_lift` | 270 = `XR_TYPE_LIFT_PROPERTIES_DXR`, 271 = `XR_TYPE_LIFT_STREAM_CREATE_INFO_DXR`, 272 = `XR_TYPE_LIFT_FRAME_SUBMIT_INFO_DXR`, 273 = `XR_TYPE_LIFT_OPTIONS_DXR`, 274 = `XR_TYPE_LIFT_RESULT_DXR`, 275 = `XR_TYPE_WEAVE_SUBMIT_LIFT_RECTS_DXR`, 276 = `XR_TYPE_WEAVE_RECT_LIFT_DXR`, 277 = `XR_TYPE_LIFT_BLOB_DXR` (spec v1, ADR-042). 278 = `XR_OBJECT_TYPE_LIFT_STREAM_DXR` — an `XrObjectType`, not an `XrStructureType`. 279 = `XR_LIFT_NOT_READY_DXR` — a **success**-class `XrResult` (positive) |
-| 1004999280+ | **next free** | |
+| 1004999280–289 | `XR_DXR_lift` (continued) | 280 = `XR_TYPE_LIFT_STREAM_STATS_DXR` (spec v1). A second decade because 270–279 is full |
+| 1004999290+ | **next free** | |
 
 `XR_DXR_android_surface_binding` was implemented in #1037 and now has its own
 header and decade — see the row above for why its create-info type value sits

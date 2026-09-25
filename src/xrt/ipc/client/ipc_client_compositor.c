@@ -3105,3 +3105,17 @@ comp_ipc_client_compositor_lift_weave_rects(struct xrt_compositor *xc,
 {
 	return ipc_client_lift_weave_rects(lift_conn(xc), count, rects);
 }
+
+xrt_result_t
+comp_ipc_client_compositor_lift_set_priority(struct xrt_compositor *xc, uint64_t stream_id, uint32_t priority)
+{
+	return ipc_client_lift_set_priority(lift_conn(xc), stream_id, priority);
+}
+
+xrt_result_t
+comp_ipc_client_compositor_lift_stats(struct xrt_compositor *xc,
+                                      uint64_t stream_id,
+                                      struct xrt_lift_stream_stats *out_stats)
+{
+	return ipc_client_lift_stats(lift_conn(xc), stream_id, out_stats);
+}

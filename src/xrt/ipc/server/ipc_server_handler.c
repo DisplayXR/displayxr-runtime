@@ -8149,6 +8149,7 @@ lift_params_from_ipc(const struct ipc_lift_params *in, struct xrt_dp_lift_params
 	out->strength = in->strength;
 	out->inpaint = in->inpaint;
 	out->view_count = in->view_count > IPC_LIFT_MAX_VIEWS ? IPC_LIFT_MAX_VIEWS : in->view_count;
+	out->focal_px = in->focal_px;
 }
 #endif
 
@@ -8490,6 +8491,7 @@ ipc_handle_lift_weave_rects(volatile struct ipc_client_state *ics, const struct 
 		rects[i].params.strength = w->strength;
 		rects[i].params.inpaint = w->inpaint;
 		rects[i].params.view_count = w->view_count > IPC_LIFT_MAX_VIEWS ? IPC_LIFT_MAX_VIEWS : w->view_count;
+		rects[i].params.focal_px = w->focal_px;
 	}
 	if (!comp_d3d11_service_lift_set_weave_rects(ics->xc, lift_owner(ics), args->count, rects)) {
 		// A rect naming a stream this connection does not own (or a non-SBS/NVIEW
@@ -8500,4 +8502,46 @@ ipc_handle_lift_weave_rects(volatile struct ipc_client_state *ics, const struct 
 #else
 	return args->count == 0 ? XRT_SUCCESS : XRT_ERROR_FEATURE_NOT_SUPPORTED;
 #endif
+}
+
+xrt_result_t
+ipc_handle_lift_stream_set_priority(volatile struct ipc_client_state *ics, uint64_t stream_id, uint32_t priority)
+{
+	IPC_TRACE_MARKER();
+	xrt_result_t auth = require_lift_client(ics, "lift_stream_set_priority");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	struct xrt_system_compositor *xsysc = lift_xsysc(ics);
+	if (xsysc != NULL) {
+		return comp_d3d11_service_lift_set_priority(xsysc, lift_owner(ics), stream_id, priority);
+	}
+#else
+	(void)stream_id;
+	(void)priority;
+#endif
+	return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+}
+
+xrt_result_t
+ipc_handle_lift_stream_stats(volatile struct ipc_client_state *ics,
+                             uint64_t stream_id,
+                             struct xrt_lift_stream_stats *out_stats)
+{
+	IPC_TRACE_MARKER();
+	U_ZERO(out_stats);
+	xrt_result_t auth = require_lift_client(ics, "lift_stream_stats");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	struct xrt_system_compositor *xsysc = lift_xsysc(ics);
+	if (xsysc != NULL) {
+		return comp_d3d11_service_lift_get_stats(xsysc, lift_owner(ics), stream_id, out_stats);
+	}
+#else
+	(void)stream_id;
+#endif
+	return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 }

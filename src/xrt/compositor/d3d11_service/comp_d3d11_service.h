@@ -1279,6 +1279,20 @@ comp_d3d11_service_lift_acquire_blob(struct xrt_system_compositor *xsysc,
                                      struct xrt_lift_blob_info *out_info,
                                      uint8_t **out_bytes);
 
+//! XrLiftPriorityDXR (0 paused .. 3 high) for one stream.
+xrt_result_t
+comp_d3d11_service_lift_set_priority(struct xrt_system_compositor *xsysc,
+                                     uint64_t owner,
+                                     uint64_t id,
+                                     uint32_t priority);
+
+//! One stream's counters + effective conversion rate.
+xrt_result_t
+comp_d3d11_service_lift_get_stats(struct xrt_system_compositor *xsysc,
+                                  uint64_t owner,
+                                  uint64_t id,
+                                  struct xrt_lift_stream_stats *out);
+
 /*!
  * Latch the lift-flagged rects of this client's NEXT weave submit
  * (XrWeaveSubmitLiftRectsDXR). Consumed — and cleared — by that submit. Each
