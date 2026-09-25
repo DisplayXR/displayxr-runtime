@@ -23,6 +23,7 @@
 #include "xrt/xrt_display_color.h"
 #include "xrt/xrt_display_zones.h"
 #include "xrt/xrt_display_scanout.h"
+#include "xrt/xrt_dp_lift.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -583,6 +584,105 @@ struct xrt_display_processor_d3d11
 	 */
 	bool (*get_background_preview)(struct xrt_display_processor_d3d11 *xdp,
 	                               struct xrt_dp_background_preview *out_preview);
+
+	/*
+	 * ── 2D→3D conversion ("lift", ADR-042, XR_DXR_lift) ─────────────────────
+	 *
+	 * Five optional slots, appended together per ADR-020 and announced by ONE
+	 * define, XRT_DP_D3D11_HAS_LIFT. A plug-in with no conversion module leaves
+	 * all five NULL (or an older plug-in's struct_size stops short of them);
+	 * the runtime then reports XR_DXR_lift supportedModes = 0, state
+	 * UNAVAILABLE.
+	 *
+	 * THREADING. The runtime calls every lift slot from ONE thread — its lift
+	 * thread — on a display processor instance it created FOR lift, through
+	 * the plug-in's lift-only factory (xrt_plugin_iface::create_dp_d3d11_lift;
+	 * fallback: create_dp_d3d11 with a NULL window): a dedicated D3D11 device
+	 * on the service's adapter, @p d3d11_context its immediate context. That
+	 * instance is never asked to weave, so it must build no weaver and open no
+	 * tracker session. The context has ID3D11Multithread protection enabled,
+	 * so a module that flushes or signals it from its own worker is safe.
+	 *
+	 * SYNCHRONOUS. lift_convert / lift_convert_blob run one conversion and
+	 * return its output. Asynchrony, latest-wins dropping, timestamps and the
+	 * copy of the output into a runtime ring are RUNTIME code — the plug-in
+	 * never queues or timestamps.
+	 */
+
+	/*!
+	 * Report the module's capabilities and state (@ref xrt_dp_lift_caps). The
+	 * caller pre-sets struct_size; write only fields within it. Called at DP
+	 * creation and then ≤ 1 Hz while the state is not READY (to see
+	 * ACTIVATING → READY). Return false = no module (same as a NULL slot).
+	 */
+	bool (*lift_get_caps)(struct xrt_display_processor_d3d11 *xdp, struct xrt_dp_lift_caps *out);
+
+	/*!
+	 * Create a conversion stream; return the plug-in's own id in @p out_id.
+	 * False = refused (mode unsupported, too many streams): the runtime fails
+	 * the app's stream.
+	 */
+	bool (*lift_stream_create)(struct xrt_display_processor_d3d11 *xdp,
+	                           const struct xrt_dp_lift_stream_info *info,
+	                           uint64_t *out_id);
+
+	//! Destroy stream @p id and every resource it returned.
+	void (*lift_stream_destroy)(struct xrt_display_processor_d3d11 *xdp, uint64_t id);
+
+	/*!
+	 * Convert one frame of stream @p id (texture modes: DEPTH, SBS, NVIEW).
+	 *
+	 * @param input_resource  ID3D11Resource* on the lift device, RGBA8, exactly
+	 *                        @p w x @p h. Valid for the duration of the call.
+	 * @param p               per-frame parameters (never NULL).
+	 * @param viewpoints_xyz  @p viewpoint_floats / 3 display-space eye positions
+	 *                        (metres) to synthesize for. The runtime ALWAYS
+	 *                        passes them when it has them: the app's explicit
+	 *                        viewpoints, else the panel DP's predicted tracked
+	 *                        eyes (the pair; a module spreads N views around
+	 *                        it). A plug-in must give these precedence over any
+	 *                        tracker of its own — the lift DP has no tracker
+	 *                        session. NULL / 0 only when no eyes are known yet.
+	 * @param out_resource    ID3D11Resource* the DP owns, valid until the NEXT
+	 *                        call on this stream (the runtime copies it out
+	 *                        before then). SBS = 2 views side by side; NVIEW =
+	 *                        view_count views side by side, view 0 leftmost;
+	 *                        DEPTH = one channel.
+	 * @param out_format      DXGI_FORMAT of @p out_resource.
+	 * @return false = no output this frame (the runtime keeps the previous one).
+	 */
+	bool (*lift_convert)(struct xrt_display_processor_d3d11 *xdp,
+	                     uint64_t id,
+	                     void *d3d11_context,
+	                     void *input_resource,
+	                     uint32_t w,
+	                     uint32_t h,
+	                     const struct xrt_dp_lift_params *p,
+	                     const float *viewpoints_xyz,
+	                     uint32_t viewpoint_floats,
+	                     void **out_resource,
+	                     uint32_t *out_w,
+	                     uint32_t *out_h,
+	                     uint32_t *out_format);
+
+	/*!
+	 * Convert one photo of a GAUSSIANS stream @p id into a splat blob.
+	 *
+	 * Same threading and input contract as @ref lift_convert. Returns the blob
+	 * as bytes the DP owns, valid until the NEXT call on this stream (the
+	 * runtime copies them), in @p out_format (XRT_DP_LIFT_BLOB_*). Expected to
+	 * take seconds; the runtime calls it off every latency-sensitive thread.
+	 */
+	bool (*lift_convert_blob)(struct xrt_display_processor_d3d11 *xdp,
+	                          uint64_t id,
+	                          void *d3d11_context,
+	                          void *input_resource,
+	                          uint32_t w,
+	                          uint32_t h,
+	                          const struct xrt_dp_lift_params *p,
+	                          uint32_t *out_format,
+	                          const void **out_bytes,
+	                          size_t *out_size);
 };
 
 
@@ -658,7 +758,22 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_predicted_sca
  */
 #define XRT_DP_D3D11_HAS_PREDICTED_SCANOUT 1
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, get_background_preview) == XRT_DP_D3D11_BASE_OFF + 24 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                                == XRT_DP_D3D11_BASE_OFF + 25 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, lift_get_caps)          == XRT_DP_D3D11_BASE_OFF + 25 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, lift_stream_create)     == XRT_DP_D3D11_BASE_OFF + 26 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, lift_stream_destroy)    == XRT_DP_D3D11_BASE_OFF + 27 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, lift_convert)           == XRT_DP_D3D11_BASE_OFF + 28 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, lift_convert_blob)      == XRT_DP_D3D11_BASE_OFF + 29 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                                == XRT_DP_D3D11_BASE_OFF + 30 * sizeof(void *), XRT_DP_ABI_MSG);
+
+/*!
+ * Defined when this header carries the five lift slots (lift_get_caps,
+ * lift_stream_create, lift_stream_destroy, lift_convert, lift_convert_blob —
+ * ADR-042, XR_DXR_lift), so a plug-in built against an older runtime can
+ * #ifdef-guard its conversion module — the coupled-ABI-addition pattern used
+ * by every other appended slot. Purely additive: no
+ * XRT_PLUGIN_API_VERSION_CURRENT bump (ADR-020).
+ */
+#define XRT_DP_D3D11_HAS_LIFT 1
 
 /*!
  * Defined when this header carries the get_background_preview slot, so a
@@ -1158,6 +1273,50 @@ xrt_display_processor_d3d11_get_background_preview(struct xrt_display_processor_
 		return false;
 	}
 	return xdp->get_background_preview(xdp, out_preview);
+}
+
+/*!
+ * @copydoc xrt_display_processor_d3d11::lift_get_caps
+ *
+ * Returns false when the slot is absent (older plug-in `struct_size`), NULL, or
+ * the DP has no module — every one of those reads as "no lift": modes 0,
+ * state UNAVAILABLE. @p out is initialised here either way.
+ *
+ * @public @memberof xrt_display_processor_d3d11
+ */
+static inline bool
+xrt_display_processor_d3d11_lift_get_caps(struct xrt_display_processor_d3d11 *xdp, struct xrt_dp_lift_caps *out)
+{
+	xrt_dp_lift_caps_init(out);
+	if (!XRT_DP_HAS_SLOT(xdp, lift_get_caps) || xdp->lift_get_caps == NULL) {
+		return false;
+	}
+	if (!xdp->lift_get_caps(xdp, out)) {
+		xrt_dp_lift_caps_init(out);
+		return false;
+	}
+	out->backend[sizeof(out->backend) - 1] = '\0';
+	return true;
+}
+
+/*!
+ * True when @p xdp carries the whole texture-mode lift contract (caps + stream
+ * create/destroy + convert). A DP must provide all four or none.
+ *
+ * @public @memberof xrt_display_processor_d3d11
+ */
+static inline bool
+xrt_display_processor_d3d11_has_lift(struct xrt_display_processor_d3d11 *xdp)
+{
+	return XRT_DP_HAS_SLOT(xdp, lift_convert) && xdp->lift_get_caps != NULL && xdp->lift_stream_create != NULL &&
+	       xdp->lift_stream_destroy != NULL && xdp->lift_convert != NULL;
+}
+
+//! True when @p xdp also carries lift_convert_blob (GAUSSIANS).
+static inline bool
+xrt_display_processor_d3d11_has_lift_blob(struct xrt_display_processor_d3d11 *xdp)
+{
+	return XRT_DP_HAS_SLOT(xdp, lift_convert_blob) && xdp->lift_convert_blob != NULL;
 }
 
 #ifdef __cplusplus
