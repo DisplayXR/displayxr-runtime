@@ -96,6 +96,13 @@ ipc_client_lift_acquire_blob(struct ipc_connection *ipc_c,
                              bool *out_delivered,
                              struct xrt_lift_blob_info *out_info);
 
+//! XrLiftPriorityDXR (0 paused .. 3 high).
+xrt_result_t
+ipc_client_lift_set_priority(struct ipc_connection *ipc_c, uint64_t stream_id, uint32_t priority);
+
+xrt_result_t
+ipc_client_lift_stats(struct ipc_connection *ipc_c, uint64_t stream_id, struct xrt_lift_stream_stats *out_stats);
+
 //! Latch the lift-flagged rects of the NEXT weave_submit on this connection.
 xrt_result_t
 ipc_client_lift_weave_rects(struct ipc_connection *ipc_c, uint32_t count, const struct xrt_lift_weave_rect *rects);

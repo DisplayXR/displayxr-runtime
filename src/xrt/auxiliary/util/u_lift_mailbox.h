@@ -104,6 +104,10 @@ struct u_lift_mailbox
 	uint64_t lat_min_ns;
 	uint64_t lat_max_ns;
 	uint64_t lat_ema_ns; //!< exponential moving average, alpha = 1/8
+
+	//! publish → publish interval, for the effective conversion rate.
+	uint64_t last_publish_ns;
+	uint64_t interval_ema_ns; //!< alpha = 1/8; 0 until two results exist
 };
 
 //! Reset @p mb to "no frames, no results".
@@ -203,6 +207,70 @@ u_lift_mailbox_unpin(struct u_lift_mailbox *mb, int32_t slot);
 //! True once any result has been published (and not since aborted).
 bool
 u_lift_mailbox_has_result(const struct u_lift_mailbox *mb);
+
+//! Effective conversion rate in results per second (0 until two results).
+float
+u_lift_mailbox_rate_hz(const struct u_lift_mailbox *mb);
+
+
+/*
+ *
+ * Cross-stream scheduling (XrLiftPriorityDXR).
+ *
+ * The module converts one frame at a time, so concurrent streams share it. The
+ * lift thread asks for a PLAN each round and converts the planned streams in
+ * order:
+ *
+ *  - every HIGH stream with a pending frame;
+ *  - ONE NORMAL stream with a pending frame, round-robin;
+ *  - every LOW stream with a pending frame, only on every
+ *    U_LIFT_LOW_EVERY_N-th round;
+ *  - PAUSED streams never.
+ *
+ * A round is counted only when something (non-paused) was pending, so an idle
+ * service does not "use up" LOW rounds.
+ *
+ */
+
+enum u_lift_priority
+{
+	U_LIFT_PRIORITY_PAUSED = 0,
+	U_LIFT_PRIORITY_LOW = 1,
+	U_LIFT_PRIORITY_NORMAL = 2,
+	U_LIFT_PRIORITY_HIGH = 3,
+};
+
+//! LOW streams convert on every Nth round.
+#define U_LIFT_LOW_EVERY_N 4
+
+struct u_lift_sched
+{
+	uint64_t round;
+	uint64_t normal_rr_last; //!< id of the NORMAL stream served last
+};
+
+//! One stream as the scheduler sees it. Entries must be in ascending id order.
+struct u_lift_sched_entry
+{
+	uint64_t id;
+	uint32_t priority; //!< enum u_lift_priority
+	bool pending;
+};
+
+void
+u_lift_sched_init(struct u_lift_sched *s);
+
+/*!
+ * Plan one round: write up to @p max stream ids to convert, in order, to
+ * @p out_ids and return how many. May return 0 with a pending LOW stream (not
+ * its round) — call again.
+ */
+uint32_t
+u_lift_sched_plan(struct u_lift_sched *s,
+                  const struct u_lift_sched_entry *entries,
+                  uint32_t count,
+                  uint64_t *out_ids,
+                  uint32_t max);
 
 
 #ifdef __cplusplus
