@@ -53,9 +53,13 @@ struct CrateScene
 
 // Create pipelines, geometry, and textures (loaded from `assets`). `render_pass`
 // is the host's atlas render pass the scene pipelines are compiled against.
+// `scene_linear` specializes the fragment shaders' `uLinearize` (ADR-021 /
+// INV-4.6): true when the colour attachment encodes on write (`_SRGB`), so the
+// authored display-referred colour must be decoded before it is written.
 bool
 crate_scene_init(CrateScene &s, VkDevice device, VkPhysicalDevice phys, VkQueue queue,
-                 uint32_t queue_family, VkRenderPass render_pass, AAssetManager *assets);
+                 uint32_t queue_family, VkRenderPass render_pass, AAssetManager *assets,
+                 bool scene_linear);
 
 // Draw the textured cube. `mvp` and `model` are column-major float[16]; `model`
 // transforms normals/tangents to world space for the lighting.

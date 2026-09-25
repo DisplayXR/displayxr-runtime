@@ -136,7 +136,8 @@ load_asset_rgba(AAssetManager *am, const char *name, int *w, int *h)
 VkPipeline
 build_pipeline(VkDevice device, VkRenderPass rp, VkPipelineLayout layout, VkShaderModule vert,
                VkShaderModule frag, const VkVertexInputBindingDescription &binding,
-               const VkVertexInputAttributeDescription *attrs, uint32_t attr_count, bool line)
+               const VkVertexInputAttributeDescription *attrs, uint32_t attr_count, bool line,
+               const VkSpecializationInfo *frag_spec)
 {
 	VkPipelineShaderStageCreateInfo stages[2] = {};
 	stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -147,6 +148,7 @@ build_pipeline(VkDevice device, VkRenderPass rp, VkPipelineLayout layout, VkShad
 	stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
 	stages[1].module = frag;
 	stages[1].pName = "main";
+	stages[1].pSpecializationInfo = frag_spec;
 
 	VkPipelineVertexInputStateCreateInfo vi = {};
 	vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
@@ -458,7 +460,8 @@ upload_textures(CrateScene &s, AAssetManager *assets)
 
 bool
 crate_scene_init(CrateScene &s, VkDevice device, VkPhysicalDevice phys, VkQueue queue,
-                 uint32_t queue_family, VkRenderPass render_pass, AAssetManager *assets)
+                 uint32_t queue_family, VkRenderPass render_pass, AAssetManager *assets,
+                 bool scene_linear)
 {
 	s.device = device;
 	s.phys = phys;
@@ -539,6 +542,17 @@ crate_scene_init(CrateScene &s, VkDevice device, VkPhysicalDevice phys, VkQueue 
 		return false;
 	}
 
+	// ADR-021 / INV-4.6: `layout(constant_id = 0) const bool uLinearize` in the
+	// fragment shaders. The host decides it once (g_scene_linear in main.cpp, from
+	// the colour swapchain's format) and every pipeline bakes the same value.
+	const VkBool32 spec_linearize = scene_linear ? VK_TRUE : VK_FALSE;
+	const VkSpecializationMapEntry spec_entry = {0, 0, sizeof(VkBool32)};
+	VkSpecializationInfo frag_spec = {};
+	frag_spec.mapEntryCount = 1;
+	frag_spec.pMapEntries = &spec_entry;
+	frag_spec.dataSize = sizeof(spec_linearize);
+	frag_spec.pData = &spec_linearize;
+
 	// Cube pipeline (5 attrs: pos/color/uv/normal/tangent).
 	{
 		VkVertexInputBindingDescription binding = {};
@@ -552,7 +566,7 @@ crate_scene_init(CrateScene &s, VkDevice device, VkPhysicalDevice phys, VkQueue 
 		attrs[3] = {3, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(SceneVertex, normal)};
 		attrs[4] = {4, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(SceneVertex, tangent)};
 		s.cube_pipeline = build_pipeline(device, render_pass, s.cube_layout, cube_vert, cube_frag,
-		                                 binding, attrs, 5, /*line=*/false);
+		                                 binding, attrs, 5, /*line=*/false, &frag_spec);
 	}
 	// Grid pipeline (1 attr: pos).
 	{
@@ -562,7 +576,7 @@ crate_scene_init(CrateScene &s, VkDevice device, VkPhysicalDevice phys, VkQueue 
 		binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
 		VkVertexInputAttributeDescription attr = {0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0};
 		s.grid_pipeline = build_pipeline(device, render_pass, s.grid_layout, grid_vert, grid_frag,
-		                                 binding, &attr, 1, /*line=*/true);
+		                                 binding, &attr, 1, /*line=*/true, &frag_spec);
 	}
 
 	vkDestroyShaderModule(device, cube_vert, nullptr);

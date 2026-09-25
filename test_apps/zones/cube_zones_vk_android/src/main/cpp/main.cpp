@@ -377,6 +377,18 @@ std::atomic<float> g_eye_y{0.0f};
 std::atomic<float> g_eye_z{0.0f};
 
 VkFormat g_swapchain_format = VK_FORMAT_UNDEFINED;
+// ADR-021 / INV-4.6: do the fragment shaders emit SCENE-LINEAR? Latched with
+// the colour format in create_swapchains() (true for an `_SRGB` swapchain, whose
+// attachment encodes on write). Every pipeline bakes it as the `uLinearize`
+// specialization constant (SpecId 0) and the clear colour follows the same flag.
+bool g_scene_linear = false;
+
+//! Standard sRGB EOTF: display-referred [0,1] -> scene-linear [0,1] (ADR-021 §2).
+static float
+srgb_to_linear(float c)
+{
+	return c <= 0.04045f ? c / 12.92f : powf((c + 0.055f) / 1.055f, 2.4f);
+}
 VkCommandPool g_app_cmd_pool = VK_NULL_HANDLE;
 
 // Graphics pipeline state for the triangle renderer.
@@ -1221,10 +1233,13 @@ create_swapchains()
 		}
 	}
 
-	// Pick a swapchain format the runtime supports. Prefer 8-bit linear
-	// RGBA / BGRA — these line up with what the runtime's vk_native
-	// compositor and the DP expect. SRGB variants kicked out so we don't
-	// trip a gamma double-correction.
+	// Pick a swapchain format the runtime supports (ADR-021 / INV-4.6). Prefer
+	// an honest 8-bit `_SRGB` format: since runtime #1623, vk_native treats a
+	// UNORM swapchain as holding LINEAR values and encodes it on output, so the
+	// display-referred colour this app authors would be encoded twice (washed
+	// out) in UNORM. In `_SRGB` the colour attachment encodes on write, so the
+	// fragment shaders decode (g_scene_linear) and the stored bytes are exactly
+	// the authored ones. BGRA first keeps the runtime's preferred channel order.
 	uint32_t format_count = 0;
 	XrResult res = xrEnumerateSwapchainFormats(g_session, 0, &format_count, nullptr);
 	if (res != XR_SUCCESS || format_count == 0) {
@@ -1241,6 +1256,8 @@ create_swapchains()
 		return false;
 	}
 	const int64_t preferred[] = {
+	    VK_FORMAT_B8G8R8A8_SRGB,
+	    VK_FORMAT_R8G8B8A8_SRGB,
 	    VK_FORMAT_B8G8R8A8_UNORM,
 	    VK_FORMAT_R8G8B8A8_UNORM,
 	};
@@ -1255,11 +1272,19 @@ create_swapchains()
 		}
 	}
 	if (g_swapchain_format == VK_FORMAT_UNDEFINED) {
-		LOGE("Runtime didn't advertise a UNORM swapchain format; first supported = 0x%llx",
+		LOGE("Runtime didn't advertise an 8-bit RGBA/BGRA swapchain format; first supported = 0x%llx",
 		     (long long)formats[0]);
 		g_swapchain_format = (VkFormat)formats[0];
 	}
+	g_scene_linear = g_swapchain_format == VK_FORMAT_B8G8R8A8_SRGB ||
+	                 g_swapchain_format == VK_FORMAT_R8G8B8A8_SRGB;
 	LOGI("Chose swapchain format: 0x%x", (uint32_t)g_swapchain_format);
+	// One-off (never per frame): tells a washed-out capture apart from a
+	// mis-selected swapchain format without a rebuild.
+	LOGW("[color] colorFormat=%d sceneLinear=%s (%s)", (int)g_swapchain_format,
+	     g_scene_linear ? "yes" : "no",
+	     g_scene_linear ? "fragment shaders decode authored colour; the attachment re-encodes"
+	                    : "no _SRGB format advertised; fragment shaders write authored bytes raw");
 
 	// Atlas dims = worst case over all modes AND BOTH ORIENTATIONS (#518). The
 	// swapchain is never recreated on device rotation, so it must hold either
@@ -1579,7 +1604,7 @@ bool
 create_scene()
 {
 	return crate_scene_init(g_scene, g_vk_device, g_vk_phys_device, g_vk_queue, g_vk_queue_family,
-	                        g_render_pass, g_asset_manager);
+	                        g_render_pass, g_asset_manager, g_scene_linear);
 }
 
 // Standalone command pool for the test app's per-frame cmd buffers.
@@ -1921,6 +1946,15 @@ create_pipeline()
 	stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
 	stages[1].module = g_fs_module;
 	stages[1].pName = "main";
+	// ADR-021 / INV-4.6: bake shaders/cube.frag's `uLinearize` from g_scene_linear.
+	const VkBool32 spec_linearize = g_scene_linear ? VK_TRUE : VK_FALSE;
+	const VkSpecializationMapEntry spec_entry = {0, 0, sizeof(VkBool32)};
+	VkSpecializationInfo frag_spec = {};
+	frag_spec.mapEntryCount = 1;
+	frag_spec.pMapEntries = &spec_entry;
+	frag_spec.dataSize = sizeof(spec_linearize);
+	frag_spec.pData = &spec_linearize;
+	stages[1].pSpecializationInfo = &frag_spec;
 
 	VkPushConstantRange pc_range = {};
 	pc_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
@@ -2498,6 +2532,15 @@ record_atlas(uint32_t image_idx, const XrView *views, uint32_t view_count, uint3
 	clears[0].color.float32[1] = 0.05f;
 	clears[0].color.float32[2] = 0.25f;
 	clears[0].color.float32[3] = 1.0f;
+	// ADR-021 / INV-4.6: a clear value is taken in the attachment's OWN space,
+	// so an `_SRGB` attachment encodes it — decode the display-referred
+	// background off the same flag the pipelines were specialized with. Alpha
+	// is linear in both spaces and is never converted.
+	if (g_scene_linear) {
+		for (int i = 0; i < 3; i++) {
+			clears[0].color.float32[i] = srgb_to_linear(clears[0].color.float32[i]);
+		}
+	}
 	clears[1].depthStencil.depth = 1.0f;
 
 	VkRenderPassBeginInfo rpbi = {};
@@ -3291,7 +3334,7 @@ handle_cmd(struct android_app *app, int32_t cmd)
 				// g_hud_font.ready stays false and the HUD falls back to the
 				// legacy bitmap glyphs.
 				hud_font_init(g_hud_font, g_vk_phys_device, g_vk_device, g_vk_queue,
-				              g_vk_queue_family, g_render_pass, 48.0f);
+				              g_vk_queue_family, g_render_pass, 48.0f, g_scene_linear);
 			} else {
 				LOGW("Bring-up chain failed; see logs above.");
 			}

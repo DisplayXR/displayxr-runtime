@@ -62,7 +62,10 @@ set(DISPLAYXR_EXTENSIONS_INCLUDE_DIR "${_dxr_ext_includes}" CACHE PATH
 FetchContent_Declare(
     displayxr_common
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    GIT_TAG v2.0.0
+    # v2.24.0: color_policy.h (dxr::ChooseColorSwapchainFormat, RenderSceneLinear,
+    # DisplayReferredToSceneLinear) and vk_clear.h -- the `_SRGB` colour swapchain
+    # this app now requests after runtime #1623 (ADR-021 / INV-4.6).
+    GIT_TAG v2.24.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)

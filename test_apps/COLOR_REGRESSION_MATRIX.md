@@ -40,15 +40,24 @@ clear value is taken in the attachment's own space.
 |---|---|---|
 | every D3D11 cube app (via the shared reference renderer) | both PS variants compiled up front (`DXR_LINEARIZE`), picked per draw by `CubePixelShaderForTarget()` / `GridPixelShaderForTarget()` | `ClearRenderTargetViewDisplayReferred()` |
 | `cube_handle_vk_win`, `cube_zones_vk_win`, `cube_zones_texture_vk_win`, `cube_hosted_legacy_vk_win` | one FS module; the `uLinearize` **specialization constant** (SpecId 0) is baked at `vkCreateGraphicsPipelines` from `dxr::RenderSceneLinear()` — `InitializeVkRenderer()` runs after `CreateSwapchain()`, so the noted format is already authoritative | `VkClearColorValue` RGB decoded through `dxr::DisplayReferredToSceneLinear()`; alpha is linear in both spaces and is never converted |
+| `cube_handle_vk_linux`, `cube_zones_vk_linux`, `cube_hosted_legacy_vk_linux`, `cube_handle_vk_macos`, `cube_zones_vk_macos`, `cube_hosted_legacy_vk_macos` | same `uLinearize` specialization constant. These apps enumerate formats themselves, so they call `dxr::ChooseColorSwapchainFormat()` + `dxr::NoteColorSwapchainFormat()` directly (the `_SRGB` sibling of `formats[0]`, i.e. `B8G8R8A8_SRGB` on vk_native) before the renderer latches `dxr::RenderSceneLinear()` | as above, including the per-zone premultiplied clears; the zones apps' Local2D strip (`vkCmdClearColorImage`, nothing drawn into it) goes through `dxr::VkDisplayReferredClearColor()` keyed on the strip's own format |
+| `cube_handle_vk_android`, `cube_zones_vk_android` | no displayxr-common on Android: the app prefers `B8G8R8A8_SRGB` / `R8G8B8A8_SRGB` itself and latches `g_scene_linear` from the chosen format; every FS (`shaders/cube.frag`, the crate cube + grid, the HUD text + panel) takes the same `uLinearize` constant | background RGB decoded with the app's own sRGB EOTF off `g_scene_linear` |
 
 The VK apps log the latched decision once at init:
 `WARN [color] colorFormat=<n> sceneLinear=yes|no (...)`. That line is the
 discriminator when a capture looks washed out — it separates "the shader did not
 decode" from "the swapchain is not the format you think it is", with no rebuild.
 
-The Linux and macOS Vulkan cube apps pick their swapchain format with their own
-enumeration rather than `dxr::ChooseColorSwapchainFormat()`, so they never take
-the `_SRGB` default and are not part of this axis yet.
+The Linux, macOS and Android Vulkan cube apps used to take `formats[0]` (or
+prefer UNORM) and write display-referred bytes into a UNORM swapchain. Since
+runtime #1623 vk_native composes in linear light and honours the swapchain's
+true format, so a UNORM swapchain is read as holding **linear** values and is
+encoded on output: those apps came out washed out (`cube_hosted_legacy_vk_linux`
+atlas background `64,64,137` instead of the authored `13,13,64`). They now take
+the `_SRGB` route above. `DXR_SWAPCHAIN_ENCODING=unorm` still reproduces the old
+choice on the apps that use `dxr::ChooseColorSwapchainFormat()`, and on vk_native
+it now reproduces the washout too (the runtime encodes a UNORM swapchain; add
+`DXR_COLOR_LEGACY_UNORM_ENCODED=1` to get the pre-#1623 pass-through back).
 
 ### `cube_handle_vk_win` rows
 
