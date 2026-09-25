@@ -81,6 +81,10 @@ ShowUninstDetails show
 !include "LogicLib.nsh"
 !include "WordFunc.nsh"
 !insertmacro un.WordFind
+; Restart Manager: name the programs holding the runtime DLL (#1733).
+; __FILEDIR__, not a bare name: the INNER signing pass is compiled via
+; !makensis, so do not depend on the working directory.
+!include "${__FILEDIR__}\FilesInUse.nsh"
 
 ; Windows constants for PATH modification
 !ifndef HWND_BROADCAST
@@ -684,7 +688,24 @@ Function CloseRuntimeClients
 	; matched 0 of 10 live browser processes under SysWOW64 PowerShell while the
 	; CIM form matched all 10. WMI is bitness-agnostic, so this works whether the
 	; installer stays 32-bit or is ever built 64-bit.
-	nsExec::ExecToLog `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$ErrorActionPreference='SilentlyContinue'; $$roots=@('$INSTDIR','$1') | Where-Object { $$_ }; Get-CimInstance Win32_Process | Where-Object { $$e=$$_.ExecutablePath; $$e -and ($$roots | Where-Object { $$e.StartsWith($$_ + '\', 'OrdinalIgnoreCase') }) } | ForEach-Object { Stop-Process -Id $$_.ProcessId -Force }"`
+	;
+	; #1733: the same sweep also ends any Chromium browser's WebXR device
+	; service -- a sandboxed utility process started as
+	; `chrome.exe --type=utility --utility-sub-type=device.mojom.XRDeviceService`
+	; (Edge and other Chromium browsers use the same token). It loads the active
+	; OpenXR runtime through the loader, so it keeps DisplayXRClient.dll mapped
+	; long after the WebXR page that started it is gone. It is NOT the browser:
+	; the browser respawns it on demand, and ending it costs at most a live
+	; WebXR session, never a tab. Matched on that exact command-line token, so
+	; the user's browser windows are never touched. A live WebXR page could
+	; respawn it inside the install window; the ClientDllWritable recheck in
+	; the section still catches that.
+	;
+	; The token is split ('...mojom.' + 'XRDeviceService') and our own $$PID is
+	; excluded because THIS PowerShell's command line contains the pattern:
+	; spelled whole, the sweep matches itself, kills itself mid-pipeline and
+	; can stop before reaching the browser's process.
+	nsExec::ExecToLog `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$ErrorActionPreference='SilentlyContinue'; $$roots=@('$INSTDIR','$1') | Where-Object { $$_ }; Get-CimInstance Win32_Process | Where-Object { $$e=$$_.ExecutablePath; $$c=$$_.CommandLine; ($$e -and ($$roots | Where-Object { $$e.StartsWith($$_ + '\', 'OrdinalIgnoreCase') })) -or ($$c -and $$_.ProcessId -ne $$PID -and $$c.Contains('--utility-sub-type=device.mojom.' + 'XRDeviceService')) } | ForEach-Object { Stop-Process -Id $$_.ProcessId -Force }"`
 	Pop $0
 
 	; Process exit and image unmap are not instantaneous even after
@@ -744,7 +765,9 @@ Section "DisplayXR Runtime" SecRuntime
 	; beyond what runs from a directory we installed. The uninstall path runs
 	; cascade-uninstall first which handles their lifecycle.
 	Call CloseRuntimeClients
+	StrCpy $R3 0   ; 1 once the silent /CLOSEAPPS attempt has been made
 
+dll_check:
 	Call ClientDllWritable
 	StrCmp $R0 "1" dll_writable
 
@@ -755,18 +778,63 @@ Section "DisplayXR Runtime" SecRuntime
 	StrCmp $R0 "1" dll_writable
 
 	; A holder we do NOT own is still running: a Unity editor, a customer app,
-	; an engine plug-in. Killing arbitrary user processes is not acceptable, so
-	; fail loudly instead. Aborting HERE is what makes this recoverable -- no
-	; file is written and, crucially, no Version stamp is left behind, so the
-	; bundle sees a real failure and its next run retries the component rather
-	; than skipping it forever.
-	SetErrorLevel 2
+	; an engine plug-in, a browser. Killing arbitrary user processes is not
+	; acceptable (#1268), so NAME them (#1733) and let the user decide.
+	; Aborting is still what makes this recoverable -- no file is written and,
+	; crucially, no Version stamp is left behind, so the bundle sees a real
+	; failure and its next run retries the component rather than skipping it
+	; forever.
+	Call FilesInUseList   ; $R1 = holder lines, $R2 = count
+	${If} $R2 == 0
+		StrCpy $R1 "  - (Windows did not say which program. Close every OpenXR application, including any web browser that has shown a WebXR page.)"
+	${EndIf}
+	DetailPrint "DisplayXRClient.dll is in use by:"
+	DetailPrint "$R1"
+
+	${If} ${Silent}
+		; Unattended: never prompt (a modal would hang the bundle chain). The
+		; opt-in /CLOSEAPPS switch asks the holders to close normally -- the
+		; same request as the interactive button -- once, then re-checks.
+		${GetParameters} $R4
+		ClearErrors
+		${GetOptions} $R4 "/CLOSEAPPS" $R5
+		${IfNot} ${Errors}
+		${AndIf} $R3 == 0
+			StrCpy $R3 1
+			Call FilesInUseClose
+			Call FilesInUseEnd
+			Sleep 2000
+			Goto dll_check
+		${EndIf}
+	${Else}
+		MessageBox MB_YESNOCANCEL|MB_ICONEXCLAMATION "DisplayXR can't update while these programs are using it:$\r$\n$\r$\n$R1$\r$\n$\r$\nYes$\t= close them for me (each is asked to close normally, so unsaved work can still be saved)$\r$\nNo$\t= I closed them myself, check again$\r$\nCancel$\t= stop the installation (nothing has been changed)" IDYES dll_close IDNO dll_retry
+		Goto dll_blocked
+	dll_close:
+		Call FilesInUseClose
+		Call FilesInUseEnd
+		Sleep 2000
+		Goto dll_check
+	dll_retry:
+		Call FilesInUseEnd
+		Goto dll_check
+	${EndIf}
+
+dll_blocked:
+	Call FilesInUseEnd
+	; Exit code 6 = "a program is using the runtime", distinct from a real
+	; failure (2) so a caller can tell "close something and retry" apart from
+	; "broken". The holder list goes to the registry for the bundle to show:
+	; under /S this installer has no window of its own. It is a diagnostic
+	; value, not install state -- the Version stamp is untouched.
+	WriteRegStr HKLM "Software\DisplayXR\Runtime" "LastInstallBlockers" "$R1"
+	SetErrorLevel 6
 	DetailPrint "FATAL: DisplayXRClient.dll is in use and cannot be replaced."
-	DetailPrint "Close every OpenXR application (the DisplayXR Browser included) and run this installer again."
-	MessageBox MB_OK|MB_ICONSTOP "DisplayXR cannot update: DisplayXRClient.dll is still in use by another program.$\n$\nClose every running OpenXR application -- including the DisplayXR Browser -- then run this installer again.$\n$\nNothing has been changed." /SD IDOK
+	DetailPrint "Close the programs listed above and run this installer again."
 	Abort "DisplayXRClient.dll is in use -- installation aborted, nothing was changed."
 
 dll_writable:
+	Call FilesInUseEnd
+	DeleteRegValue HKLM "Software\DisplayXR\Runtime" "LastInstallBlockers"
 
 	; Install runtime files. The client DLL is the one file whose silent loss
 	; produces the client/service skew, so verify this specific write landed
