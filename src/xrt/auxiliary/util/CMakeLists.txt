@@ -24,6 +24,8 @@ add_library(
 	u_bg_neutrality.c
 	u_bg_neutrality.h
 	u_bitwise.c
+	u_lift_mailbox.c
+	u_lift_mailbox.h
 	u_snap_grid.c
 	u_snap_grid.h
 	u_bitwise.h
