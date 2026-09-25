@@ -28,6 +28,7 @@ set(tests
     tests_dp_weave_scope
     tests_dp_vk_snap_window_rect
     tests_weave_snap_grid
+    tests_lift_mailbox
     tests_space_overseer_rig
     tests_rig_composer
     tests_aux_x11_scale
