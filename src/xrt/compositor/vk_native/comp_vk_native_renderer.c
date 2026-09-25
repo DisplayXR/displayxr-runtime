@@ -25,6 +25,7 @@
 #include "comp_vk_native_compositor.h"
 #include "comp_vk_native_swapchain.h"
 #include "comp_vk_native_deposit.h"
+#include "comp_vk_native_equirect2.h"
 
 #include "util/comp_layer_accum.h"
 #include "util/comp_layer_view_camera.h"
@@ -46,6 +47,9 @@
 #include "shaders/zone_blit.vert.h"
 #include "shaders/zone_blit.frag.h"
 #include "shaders/zone_blit_array.frag.h"
+#include "shaders/equirect2.vert.h"
+#include "shaders/equirect2.frag.h"
+#include "shaders/equirect2_array.frag.h"
 
 //! Upper bound on zone draws (and so descriptor sets) per frame:
 //! zones (OXR_DISPLAY_ZONES_MAX_ZONES_3D = 32) × views (XRT_MAX_VIEWS = 8).
@@ -223,6 +227,13 @@ struct comp_vk_native_renderer
 		 * so the pipeline must match the SOURCE, not the layer's flags.
 		 */
 		VkPipeline pipelines[VK_COMPOSE_BLEND_COUNT][VK_COMPOSE_SAMPLER_COUNT];
+		/*!
+		 * XR_KHR_composition_layer_equirect2 (#1602): same table shape,
+		 * same layout and push-constant block, but equirect2.vert/.frag —
+		 * a per-pixel ray cast against the layer's sphere rather than a
+		 * textured rectangle.
+		 */
+		VkPipeline eq2_pipelines[VK_COMPOSE_BLEND_COUNT][VK_COMPOSE_SAMPLER_COUNT];
 		VkDescriptorPool descriptor_pool;
 
 		/*!
@@ -293,25 +304,30 @@ layers_contain_zone_3d(const struct comp_layer_accum *layers)
 /*!
  * Does the compose pass draw this layer type?
  *
- * Projection-class, 3D zones, and QUADS (#1581 — the Vulkan backend accepted
+ * Projection-class, 3D zones, QUADS (#1581 — the Vulkan backend accepted
  * `comp_layer_accum_quad` and never drew it, so every Khronos CTS interactive
- * composition prompt, label and reference image was invisible here).
- * Cylinder / equirect / cube remain accumulated and undrawn.
+ * composition prompt, label and reference image was invisible here) and
+ * EQUIRECT2 (#1602 — same defect, six blank CTS Equirect2 subtests).
+ * Cylinder / equirect1 / cube remain accumulated and undrawn.
+ *
+ * Also the fast-path census: every type listed here counts as a contributing
+ * layer, so a lone equirect2 frame is a compose case (it covers a sub-rect
+ * and owes a linear blend), never the blit.
  */
 static bool
 compose_pass_draws_layer(const struct comp_layer *layer)
 {
 	const enum xrt_layer_type t = layer->data.type;
 	return t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH || t == XRT_LAYER_ZONE_3D ||
-	       t == XRT_LAYER_QUAD;
+	       t == XRT_LAYER_QUAD || t == XRT_LAYER_EQUIRECT2;
 }
 
 /*!
  * Resolve the source a (layer, view) pair samples.
  *
  * Projection-class and zone layers carry a per-view swapchain and a per-view
- * sub-image; a QUAD carries ONE swapchain and one sub-image shown in every
- * view it is visible in. Both shapes resolve here so the transition loop and
+ * sub-image; a QUAD or an EQUIRECT2 carries ONE swapchain and one sub-image
+ * shown in every view it is visible in. Both shapes resolve here so the transition loop and
  * the draw loop cannot disagree about which image a draw touches — they must
  * agree, or an image is sampled in the wrong layout.
  */
@@ -324,6 +340,9 @@ compose_layer_source(const struct comp_layer *layer,
 	if (layer->data.type == XRT_LAYER_QUAD) {
 		*out_xsc = layer->sc_array[0];
 		*out_sub = &layer->data.quad.sub;
+	} else if (layer->data.type == XRT_LAYER_EQUIRECT2) {
+		*out_xsc = layer->sc_array[0];
+		*out_sub = &layer->data.equirect2.sub;
 	} else {
 		*out_xsc = layer->sc_array[view];
 		*out_sub = &layer->data.proj.v[view].sub;
@@ -334,15 +353,15 @@ compose_layer_source(const struct comp_layer *layer,
 /*!
  * How many views does this layer contribute to?
  *
- * A quad is a single world-placed surface: it is a candidate in EVERY tile
- * and `is_layer_view_visible_n` decides which ones. Everything else is
- * per-view content bounded by its own view_count.
+ * A quad or an equirect2 is a single world-placed surface: it is a candidate
+ * in EVERY tile and `is_layer_view_visible_n` decides which ones. Everything
+ * else is per-view content bounded by its own view_count.
  */
 static uint32_t
 compose_layer_view_count(const struct comp_layer *layer, const struct comp_vk_native_eff_layout *layout)
 {
 	uint32_t n;
-	if (layer->data.type == XRT_LAYER_QUAD) {
+	if (layer->data.type == XRT_LAYER_QUAD || layer->data.type == XRT_LAYER_EQUIRECT2) {
 		n = layout->views;
 	} else {
 		n = layer->data.view_count;
@@ -357,6 +376,74 @@ compose_layer_view_count(const struct comp_layer *layer, const struct comp_vk_na
 		n = XRT_MAX_VIEWS;
 	}
 	return n == 0 ? 1 : n;
+}
+
+/*!
+ * One view of one `XR_KHR_composition_layer_equirect2` layer (#1602): decide
+ * whether it draws, resolve its blend mode, and pack its shader constants.
+ *
+ * Ported from the D3D11 reference render_equirect2_layer(), its D3D12 port
+ * and GL's gl_render_equirect2_layer(), sharing every policy decision with
+ * them through comp_layer_view_camera.h:
+ *
+ *  - per-eye visibility from is_layer_view_visible_n(), view-count aware
+ *    (#1580). NO front-facing test: a sphere has no back face, #1590 is
+ *    normative for quads only, and culling here would drop a viewer standing
+ *    INSIDE the sphere — the ordinary 360-background case and CTS Equirect2
+ *    subtests 1-4. An invisible view marks nothing: it draws nothing;
+ *  - the blend mode through comp_layer_subrect_blend_mode(): a sphere
+ *    section paints part of the tile, so it can never be the tile's base
+ *    (#1598), but it MARKS the tile so a later projection layer blends over
+ *    it. The caller folds OPAQUE_COVER into the colour scale/bias with every
+ *    other layer's;
+ *  - the camera is this view's comp_layer_view_camera (#1580), the SAME one
+ *    the projection tile was framed by, and its FOV enters ONLY here, as the
+ *    frustum tangents.
+ *
+ * Like the other ports there is no forward MVP: the shader casts rays from
+ * the camera into the layer's MODEL space, so what is packed is the inverse
+ * model-view — with the frustum tangents folded into its 3x3, because the
+ * HLSL cbuffer's 160 bytes do not fit the pass's 128-byte push-constant block
+ * (comp_vk_native_equirect2.h; shaders/equirect2.vert reads it back).
+ *
+ * @param out_eq   16 floats for vk_compose_push::mvp.
+ * @param out_mode The shared blend mode for this draw.
+ * @return false when this view does not draw the layer.
+ */
+static bool
+compose_equirect2_view(const struct comp_layer *layer,
+                       uint32_t view,
+                       uint32_t view_count,
+                       const struct comp_layer_view_camera *cam,
+                       struct comp_layer_tile_state *tile,
+                       float out_eq[16],
+                       enum comp_layer_blend_mode *out_mode)
+{
+	const struct xrt_layer_data *data = &layer->data;
+	const struct xrt_layer_equirect2_data *eq = &data->equirect2;
+
+	if (!is_layer_view_visible_n(data, view, view_count)) {
+		return false;
+	}
+
+	// Inverse model-view: rays go FROM the camera INTO model space.
+	struct xrt_matrix_4x4 model, view_mat, mv, mv_inv;
+	const struct xrt_vec3 scale = {1.0f, 1.0f, 1.0f};
+	math_matrix_4x4_model(&eq->pose, &scale, &model);
+	math_matrix_4x4_view_from_pose(&cam->pose, &view_mat);
+	math_matrix_4x4_multiply(&view_mat, &model, &mv);
+	math_matrix_4x4_inverse(&mv, &mv_inv);
+
+	// The frustum's tangent extents, folded into the inverse model-view by
+	// the shared packer: THE ONLY place this view's FOV (angle_left,
+	// angle_down, ...) enters the draw.
+	comp_vk_native_equirect2_pack(&mv_inv, &cam->fov, eq->radius, eq->central_horizontal_angle,
+	                              eq->upper_vertical_angle, eq->lower_vertical_angle, out_eq);
+
+	// A sphere section is SUB-RECT: it marks the tile, never takes the base.
+	const enum comp_layer_blend_mode mode = comp_layer_subrect_blend_mode(tile, data->flags);
+	*out_mode = mode;
+	return true;
 }
 
 /*!
@@ -482,6 +569,10 @@ zone_draw_destroy(struct comp_vk_native_renderer *r)
 			if (r->zone.pipelines[b][sm] != VK_NULL_HANDLE) {
 				vk->vkDestroyPipeline(vk->device, r->zone.pipelines[b][sm], NULL);
 				r->zone.pipelines[b][sm] = VK_NULL_HANDLE;
+			}
+			if (r->zone.eq2_pipelines[b][sm] != VK_NULL_HANDLE) {
+				vk->vkDestroyPipeline(vk->device, r->zone.eq2_pipelines[b][sm], NULL);
+				r->zone.eq2_pipelines[b][sm] = VK_NULL_HANDLE;
 			}
 		}
 	}
@@ -1130,6 +1221,9 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
 	VkShaderModule vert = VK_NULL_HANDLE;
 	VkShaderModule frag = VK_NULL_HANDLE;
 	VkShaderModule frag_array = VK_NULL_HANDLE;
+	VkShaderModule eq2_vert = VK_NULL_HANDLE;
+	VkShaderModule eq2_frag = VK_NULL_HANDLE;
+	VkShaderModule eq2_frag_array = VK_NULL_HANDLE;
 	VkShaderModuleCreateInfo sm_ci = {
 	    .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
 	    .codeSize = sizeof(shaders_zone_blit_vert),
@@ -1146,13 +1240,28 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
 		sm_ci.pCode = shaders_zone_blit_array_frag;
 		res = vk->vkCreateShaderModule(vk->device, &sm_ci, NULL, &frag_array);
 	}
+	if (res == VK_SUCCESS) {
+		sm_ci.codeSize = sizeof(shaders_equirect2_vert);
+		sm_ci.pCode = shaders_equirect2_vert;
+		res = vk->vkCreateShaderModule(vk->device, &sm_ci, NULL, &eq2_vert);
+	}
+	if (res == VK_SUCCESS) {
+		sm_ci.codeSize = sizeof(shaders_equirect2_frag);
+		sm_ci.pCode = shaders_equirect2_frag;
+		res = vk->vkCreateShaderModule(vk->device, &sm_ci, NULL, &eq2_frag);
+	}
+	if (res == VK_SUCCESS) {
+		sm_ci.codeSize = sizeof(shaders_equirect2_array_frag);
+		sm_ci.pCode = shaders_equirect2_array_frag;
+		res = vk->vkCreateShaderModule(vk->device, &sm_ci, NULL, &eq2_frag_array);
+	}
 	if (res != VK_SUCCESS) {
 		U_LOG_E("VK zones: failed to create shader modules: %d", res);
-		if (vert != VK_NULL_HANDLE) {
-			vk->vkDestroyShaderModule(vk->device, vert, NULL);
-		}
-		if (frag != VK_NULL_HANDLE) {
-			vk->vkDestroyShaderModule(vk->device, frag, NULL);
+		VkShaderModule made[] = {vert, frag, frag_array, eq2_vert, eq2_frag, eq2_frag_array};
+		for (size_t k = 0; k < sizeof(made) / sizeof(made[0]); k++) {
+			if (made[k] != VK_NULL_HANDLE) {
+				vk->vkDestroyShaderModule(vk->device, made[k], NULL);
+			}
 		}
 		zone_draw_destroy(r);
 		r->zone.failed = true;
@@ -1164,12 +1273,19 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
 		ok = zone_create_pipeline(r, vert, frag, (enum vk_compose_blend)b,
 		                          &r->zone.pipelines[b][VK_COMPOSE_SAMPLER_2D]) &&
 		     zone_create_pipeline(r, vert, frag_array, (enum vk_compose_blend)b,
-		                          &r->zone.pipelines[b][VK_COMPOSE_SAMPLER_2D_ARRAY]);
+		                          &r->zone.pipelines[b][VK_COMPOSE_SAMPLER_2D_ARRAY]) &&
+		     zone_create_pipeline(r, eq2_vert, eq2_frag, (enum vk_compose_blend)b,
+		                          &r->zone.eq2_pipelines[b][VK_COMPOSE_SAMPLER_2D]) &&
+		     zone_create_pipeline(r, eq2_vert, eq2_frag_array, (enum vk_compose_blend)b,
+		                          &r->zone.eq2_pipelines[b][VK_COMPOSE_SAMPLER_2D_ARRAY]);
 	}
 
 	vk->vkDestroyShaderModule(vk->device, vert, NULL);
 	vk->vkDestroyShaderModule(vk->device, frag, NULL);
 	vk->vkDestroyShaderModule(vk->device, frag_array, NULL);
+	vk->vkDestroyShaderModule(vk->device, eq2_vert, NULL);
+	vk->vkDestroyShaderModule(vk->device, eq2_frag, NULL);
+	vk->vkDestroyShaderModule(vk->device, eq2_frag_array, NULL);
 
 	if (!ok) {
 		zone_draw_destroy(r);
@@ -1179,8 +1295,8 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
 
 	r->zone.failed = false;
 	r->zone.ready = true;
-	U_LOG_W("VK compose: draw path ready (%d blend modes x 2D/2D_ARRAY = %d pipelines)",
-        VK_COMPOSE_BLEND_COUNT, VK_COMPOSE_BLEND_COUNT * VK_COMPOSE_SAMPLER_COUNT);
+	U_LOG_W("VK compose: draw path ready (%d blend modes x 2D/2D_ARRAY x {blit, equirect2} = %d pipelines)",
+	        VK_COMPOSE_BLEND_COUNT, 2 * VK_COMPOSE_BLEND_COUNT * VK_COMPOSE_SAMPLER_COUNT);
 	return true;
 }
 
@@ -1614,6 +1730,7 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 		}
 		const bool is_zone = layer->data.type == XRT_LAYER_ZONE_3D;
 		const bool is_quad = layer->data.type == XRT_LAYER_QUAD;
+		const bool is_eq2 = layer->data.type == XRT_LAYER_EQUIRECT2;
 
 		const uint32_t view_count = compose_layer_view_count(layer, layout);
 
@@ -1686,7 +1803,15 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 			 * never gets here, so it marks nothing — it drew nothing.
 			 */
 			enum comp_layer_blend_mode mode;
-			if (is_zone) {
+			float eq2_constants[16];
+			if (is_eq2) {
+				// Visibility, sub-rect blend mode and the packed
+				// ray constants, all per view (#1602).
+				if (!compose_equirect2_view(layer, eye, tile_count, &cams[eye], &tiles[eye],
+				                            eq2_constants, &mode)) {
+					continue;
+				}
+			} else if (is_zone) {
 				comp_layer_tile_mark_composited(&tiles[eye]);
 				mode = (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0
 				           ? COMP_LAYER_BLEND_STRAIGHT
@@ -1751,8 +1876,8 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 			    .minDepth = 0.0f,
 			    .maxDepth = 1.0f,
 			};
-			// A QUAD is placed by its MVP, so its viewport is the
-			// whole tile box — and the SCISSOR below is then
+			// A QUAD is placed by its MVP (and an EQUIRECT2 by its
+			// rays), so its viewport is the whole tile box — and the SCISSOR below is then
 			// load-bearing rather than belt-and-braces: a projected
 			// quad's geometry can extend past the viewport rect and
 			// Vulkan viewports do not clip, so the spill would land
@@ -1886,6 +2011,8 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 				math_matrix_4x4_multiply(&view_mat, &model, &mv);
 				math_matrix_4x4_multiply(&proj_mat, &mv, &mvp);
 				memcpy(push.mvp, mvp.v, sizeof(push.mvp));
+			} else if (is_eq2) {
+				memcpy(push.mvp, eq2_constants, sizeof(push.mvp));
 			}
 
 			// The view the swapchain handed us is a 2D_ARRAY view iff
@@ -1901,7 +2028,8 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 			const enum vk_compose_blend blend = vk_compose_blend_state(mode);
 
 			vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-			                       r->zone.pipelines[blend][sampler_kind]);
+			                      is_eq2 ? r->zone.eq2_pipelines[blend][sampler_kind]
+			                             : r->zone.pipelines[blend][sampler_kind]);
 			vk->vkCmdSetViewport(cmd, 0, 1, &vp);
 			vk->vkCmdSetScissor(cmd, 0, 1, &scissor);
 			vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -1909,9 +2037,21 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 			vk->vkCmdPushConstants(cmd, r->zone.pipeline_layout,
 			                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
 			                        sizeof(push), &push);
-			// 3 = fullscreen triangle; 6 = the quad's two triangles.
+			// 3 = fullscreen triangle (projection, zone, and the
+			// equirect2 ray-cast strip); 6 = the quad's two triangles.
 			vk->vkCmdDraw(cmd, is_quad ? 6 : 3, 1, 0, 0);
 			draw_count++;
+
+			if (is_eq2) {
+				// One line per process at the first equirect2 draw —
+				// the discriminator between "the port is live" and
+				// "the frame carried no equirect2". NEVER per frame.
+				static bool first_eq2_logged = false;
+				if (!first_eq2_logged) {
+					first_eq2_logged = true;
+					U_LOG_W("#1602: vk_native drew its first equirect2 layer");
+				}
+			}
 		}
 	}
 

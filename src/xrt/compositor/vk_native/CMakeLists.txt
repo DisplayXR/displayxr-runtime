@@ -16,6 +16,9 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 		shaders/zone_blit.vert
 		shaders/zone_blit.frag
 		shaders/zone_blit_array.frag
+		shaders/equirect2.vert
+		shaders/equirect2.frag
+		shaders/equirect2_array.frag
 		shaders/alpha_probe.comp
 		)
 
@@ -28,6 +31,7 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 		comp_vk_native_compositor.h
 		comp_vk_native_deposit.cpp
 		comp_vk_native_deposit.h
+		comp_vk_native_equirect2.h
 		comp_vk_native_renderer.c
 		comp_vk_native_renderer.h
 		comp_vk_native_split.cpp
