@@ -1078,6 +1078,32 @@ XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrWeaveExportIpcConnectionDXR(XrInstance instance, XrWeaveIpcConnectionDXR *connection);
 #endif
 
+#ifdef OXR_HAVE_DXR_lift
+//! OpenXR API function @ep{xrGetLiftPropertiesDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetLiftPropertiesDXR(XrSession session, XrLiftPropertiesDXR *properties);
+
+//! OpenXR API function @ep{xrCreateLiftStreamDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrCreateLiftStreamDXR(XrSession session, const XrLiftStreamCreateInfoDXR *createInfo, XrLiftStreamDXR *stream);
+
+//! OpenXR API function @ep{xrDestroyLiftStreamDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrDestroyLiftStreamDXR(XrLiftStreamDXR stream);
+
+//! OpenXR API function @ep{xrSubmitLiftFrameDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSubmitLiftFrameDXR(XrLiftStreamDXR stream, const XrLiftFrameSubmitInfoDXR *submitInfo, uint64_t *frameId);
+
+//! OpenXR API function @ep{xrAcquireLiftResultDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrAcquireLiftResultDXR(XrLiftStreamDXR stream, XrLiftResultDXR *result);
+
+//! OpenXR API function @ep{xrAcquireLiftBlobDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrAcquireLiftBlobDXR(XrLiftStreamDXR stream, XrLiftBlobDXR *blob);
+#endif
+
 #ifdef OXR_HAVE_EXT_conformance_automation
 //! OpenXR API function @ep{xrSetInputDeviceActiveEXT}
 XRAPI_ATTR XrResult XRAPI_CALL

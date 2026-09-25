@@ -36,6 +36,8 @@
 #define OXR_XR_DEBUG_PLANEDET  (*(uint64_t *)"oxrplan\0")
 // local 3D zone mask
 #define OXR_XR_DEBUG_LOCAL3DZONE  (*(uint64_t *)"oxrl3dz\0")
+// XR_DXR_lift stream (ADR-042)
+#define OXR_XR_DEBUG_LIFTSTREAM  (*(uint64_t *)"oxrlift\0")
 // clang-format on
 
 /*!
