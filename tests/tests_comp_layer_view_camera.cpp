@@ -1827,6 +1827,73 @@ TEST_CASE("the equirect2 draw consults the shared rules on every backend that ha
 	CHECK(gl_body.find("GL_FRAMEBUFFER_SRGB") == std::string::npos);
 
 	/*
+	 * ...and the vk_native half (#1602 on Vulkan). vk_native draws every layer
+	 * type in ONE loop in draw_zones_pass(), so the per-layer decisions for an
+	 * equirect2 view live in a named helper, compose_equirect2_view(), and the
+	 * frustum enters through the shared packer in comp_vk_native_equirect2.h
+	 * (the HLSL cbuffer does not fit the 128-byte push block, so the tangents
+	 * are folded into the inverse model-view there). What the other legs pin
+	 * in one body is therefore pinned here across those three places:
+	 *
+	 *  - the helper takes visibility from is_layer_view_visible_n(), hands the
+	 *    packer THIS view's camera FOV, and resolves the blend mode through
+	 *    comp_layer_subrect_blend_mode() — and does NOT reach for the
+	 *    first-in-tile gate or the quad's back-face predicate;
+	 *  - the packer is where angle_left / angle_down become the ray basis;
+	 *  - the OPAQUE_COVER fold is the loop's single call, shared by every
+	 *    layer type the pass draws;
+	 *  - the GLSL lives in shaders/equirect2.frag (a third LANGUAGE-level
+	 *    expression beside the HLSL and GL's twin, not a copy in the C file),
+	 *    and it DISCARDS outside the section.
+	 */
+	const std::string vk = read_whole_file(std::string(DXR_COMP_SRC_DIR) + "/vk_native/comp_vk_native_renderer.c");
+	const std::string vk_view = code_only(function_body(vk, "compose_equirect2_view"));
+	INFO("vk_native has no compose_equirect2_view() — did the equirect2 draw move, or get dropped?");
+	REQUIRE_FALSE(vk_view.empty());
+
+	INFO("the vk_native equirect2 view must take per-eye visibility from is_layer_view_visible_n() (#1580)");
+	CHECK(vk_view.find("is_layer_view_visible_n(") != std::string::npos);
+	INFO(
+	    "the vk_native equirect2 view must pack its rays through comp_vk_native_equirect2_pack(), from THIS "
+	    "view's camera FOV (#1580)");
+	CHECK(vk_view.find("comp_vk_native_equirect2_pack(") != std::string::npos);
+	CHECK(vk_view.find("&cam->fov") != std::string::npos);
+	INFO("the vk_native equirect2 view must resolve its blend mode through comp_layer_subrect_blend_mode()");
+	CHECK(vk_view.find("comp_layer_subrect_blend_mode(") != std::string::npos);
+	INFO(
+	    "the vk_native equirect2 view must NOT reach comp_layer_tile_blend_mode() — a sphere section is never "
+	    "the tile's base (#1598)");
+	CHECK(vk_view.find("comp_layer_tile_blend_mode(") == std::string::npos);
+	INFO(
+	    "the vk_native equirect2 view must NOT apply comp_layer_quad_is_front_facing() — CTS Equirect2 1-4 "
+	    "stand inside the sphere");
+	CHECK(vk_view.find("comp_layer_quad_is_front_facing(") == std::string::npos);
+
+	const std::string vk_pack =
+	    read_whole_file(std::string(DXR_COMP_SRC_DIR) + "/vk_native/comp_vk_native_equirect2.h");
+	INFO("the vk_native packer must build the ray basis from the FOV's tangents");
+	CHECK(code_only(vk_pack).find("angle_left") != std::string::npos);
+	CHECK(code_only(vk_pack).find("angle_down") != std::string::npos);
+
+	const std::string vk_pass = code_only(function_body(vk, "draw_zones_pass"));
+	REQUIRE_FALSE(vk_pass.empty());
+	INFO("vk_native's compose loop must call compose_equirect2_view() and fold OPAQUE_COVER for every layer");
+	CHECK(vk_pass.find("compose_equirect2_view(") != std::string::npos);
+	CHECK(vk_pass.find("comp_layer_blend_fold_opaque_cover(") != std::string::npos);
+
+	INFO(
+	    "vk_native's renderer must not carry a C-string copy of the ray/sphere march — it is SPIR-V "
+	    "compiled from shaders/equirect2.frag");
+	CHECK(vk.find("sphere_intersect") == std::string::npos);
+	for (const char *frag : {"/vk_native/shaders/equirect2.frag", "/vk_native/shaders/equirect2_array.frag"}) {
+		const std::string glsl = code_only(read_whole_file(std::string(DXR_COMP_SRC_DIR) + frag));
+		INFO(frag << " must march the sphere and DISCARD outside the section — under the blending-off "
+		          << "state an unflagged layer gets, writing transparent black erases the tile");
+		CHECK(glsl.find("sphere_intersect(") != std::string::npos);
+		CHECK(glsl.find("discard;") != std::string::npos);
+	}
+
+	/*
 	 * A sphere SECTION is a sub-rect contributor, so a frame carrying one owes
 	 * a LINEAR blend and must not take the #1589 fast path — which would
 	 * compose it in encoded space. Both same-loop backends decide that in one
@@ -1841,6 +1908,9 @@ TEST_CASE("the equirect2 draw consults the shared rules on every backend that ha
 	} fast_path_owners[] = {
 	    {"d3d12/comp_d3d12_renderer.cpp", "renderer_frame_takes_fast_path"},
 	    {"gl/comp_gl_compositor.cpp", "gl_frame_takes_fast_path"},
+	    // vk_native counts contributors through compose_pass_draws_layer(),
+	    // which is also what routes a layer into the draw loop at all.
+	    {"vk_native/comp_vk_native_renderer.c", "compose_pass_draws_layer"},
 	};
 	for (const auto &owner : fast_path_owners) {
 		const std::string src = read_whole_file(std::string(DXR_COMP_SRC_DIR) + "/" + owner.rel);
@@ -1865,8 +1935,8 @@ TEST_CASE("the equirect2 draw consults the shared rules on every backend that ha
 	 *
 	 * GL is deliberately NOT in this list: it cannot compile HLSL, so its GLSL
 	 * twin (VS_EQUIRECT2 / FS_EQUIRECT2_*) is a second LANGUAGE rather than a
-	 * second copy, and it does name `sphere_intersect`. vk_native is a third
-	 * such expression, in shaders/layer.comp's `do_equirect2` compute squash.
+	 * second copy, and it does name `sphere_intersect`. vk_native's is SPIR-V
+	 * compiled from vk_native/shaders/equirect2.frag, pinned above.
 	 */
 	const char *const shader_consumers[] = {
 	    "d3d11/comp_d3d11_renderer.cpp",
