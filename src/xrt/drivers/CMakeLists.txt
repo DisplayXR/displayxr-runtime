@@ -101,7 +101,10 @@ endif()
 # D3D11 display processor (HLSL shaders compiled at runtime)
 if(WIN32)
 	list(APPEND SIM_DISPLAY_SOURCES
-		sim_display/sim_display_processor_d3d11.cpp)
+		sim_display/sim_display_processor_d3d11.cpp
+		# ADR-042: env-gated FAKE lift module (SIM_DISPLAY_FAKE_LIFT=1)
+		sim_display/sim_display_lift_d3d11.cpp
+		sim_display/sim_display_fake_ply.c)
 endif()
 
 # D3D12 display processor (HLSL shaders compiled at runtime into PSOs)
