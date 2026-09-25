@@ -48,6 +48,9 @@ cli_print_help(int argc, const char **argv)
 	P("           [--claims] - Also show which plug-in claims each display (loads plug-ins).\n");
 	P("  clients [--json]  - List the running service's IPC clients with their verified class\n");
 	P("                      (#960). Connects over IPC as a DIAG client; non-elevated on Windows.\n");
+	P("  lift <...>        - 2D->3D conversion module (XR_DXR_lift, ADR-042), over IPC (DIAG).\n");
+	P("                      'lift caps [--json]', 'lift probe <image|frames_dir> [--mode depth|sbs|\n");
+	P("                      nview|gaussians] [--n N]' (Windows) — writes lift_out_<i>.png/.ply.\n");
 	P("  test              - List found devices and role assignments, for prober testing.\n");
 	P("  probe             - Just probe and then exit.\n");
 
@@ -99,6 +102,9 @@ main(int argc, const char **argv)
 	}
 	if (strcmp(argv[1], "probe") == 0) {
 		return cli_cmd_probe(argc, argv);
+	}
+	if (strcmp(argv[1], "lift") == 0) {
+		return cli_cmd_lift(argc, argv);
 	}
 	return cli_print_help(argc, argv);
 }

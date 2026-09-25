@@ -158,6 +158,84 @@ probe_zone_caps_d3d11(struct cli_query_result *r, const struct xrt_plugin_iface 
 	ID3D11Device_Release(device);
 }
 
+/*!
+ * ADR-042 — headless lift-caps probe (XR_DXR_lift). Same shape as the zone
+ * probe: a WARP device, the plug-in's LIFT-ONLY factory when it has one
+ * (xrt_plugin_iface::create_dp_d3d11_lift, struct_size-gated) — else its
+ * ordinary factory with a NULL window, which is what the service falls back
+ * to — then lift_get_caps. ABSENCE NEVER FAILS (sim_display, every plug-in
+ * without a module: modes 0 passes); only a malformed answer does.
+ */
+static void
+probe_lift_caps_d3d11(struct cli_query_result *r, const struct xrt_plugin_iface *iface)
+{
+	xrt_dp_factory_d3d11_fn_t factory = iface->create_dp_d3d11;
+	const char *which = "ordinary";
+	if (iface->struct_size >= offsetof(struct xrt_plugin_iface, create_dp_d3d11_lift) +
+	                               sizeof(iface->create_dp_d3d11_lift) &&
+	    iface->create_dp_d3d11_lift != NULL) {
+		factory = iface->create_dp_d3d11_lift;
+		which = "lift-only";
+	}
+	if (factory == NULL) {
+		snprintf(r->lift_probe_note, sizeof(r->lift_probe_note), "not probed: no D3D11 DP factory (OK)");
+		return;
+	}
+
+	ID3D11Device *device = NULL;
+	ID3D11DeviceContext *context = NULL;
+	D3D_FEATURE_LEVEL fl;
+	HRESULT hr =
+	    D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_WARP, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &device, &fl, &context);
+	if (FAILED(hr) || device == NULL || context == NULL) {
+		snprintf(r->lift_probe_note, sizeof(r->lift_probe_note),
+		         "not probed: WARP D3D11 device creation failed (0x%08lx, OK)", (unsigned long)hr);
+		if (context != NULL) {
+			ID3D11DeviceContext_Release(context);
+		}
+		if (device != NULL) {
+			ID3D11Device_Release(device);
+		}
+		return;
+	}
+
+	struct xrt_display_processor_d3d11 *xdp = NULL;
+	xrt_result_t xret = factory(device, context, NULL, &xdp);
+	if (xret != XRT_SUCCESS || xdp == NULL) {
+		snprintf(r->lift_probe_note, sizeof(r->lift_probe_note),
+		         "not probed: %s D3D11 DP factory declined (xret=%d, OK)", which, (int)xret);
+		ID3D11DeviceContext_Release(context);
+		ID3D11Device_Release(device);
+		return;
+	}
+
+	struct xrt_dp_lift_caps caps;
+	bool got = xrt_display_processor_d3d11_has_lift(xdp) && xrt_display_processor_d3d11_lift_get_caps(xdp, &caps);
+	if (!got) {
+		snprintf(r->lift_probe_note, sizeof(r->lift_probe_note),
+		         "no conversion module (modes 0) via the %s factory (OK)", which);
+	} else {
+		r->lift_caps_probed = true;
+		r->lift_caps = caps;
+		const uint32_t known = XRT_DP_LIFT_MODE_DEPTH | XRT_DP_LIFT_MODE_SBS | XRT_DP_LIFT_MODE_NVIEW |
+		                       XRT_DP_LIFT_MODE_GAUSSIANS;
+		bool malformed = (caps.modes & ~known) != 0 || caps.state > XRT_DP_LIFT_STATE_READY ||
+		                 (caps.modes != 0 && caps.state == XRT_DP_LIFT_STATE_READY && caps.max_streams == 0) ||
+		                 ((caps.modes & XRT_DP_LIFT_MODE_NVIEW) != 0 && caps.max_views < 2) ||
+		                 caps.depth_semantics > XRT_DP_LIFT_DEPTH_METRIC;
+		r->lift_caps_malformed = malformed;
+		snprintf(r->lift_probe_note, sizeof(r->lift_probe_note),
+		         "%smodes=0x%x state=%u streams=%u views=%u depth=%s latency=%.1fms backend='%s' (%s factory)",
+		         malformed ? "MALFORMED caps: " : "", caps.modes, caps.state, caps.max_streams, caps.max_views,
+		         caps.depth_semantics == XRT_DP_LIFT_DEPTH_METRIC ? "metric" : "relative",
+		         (double)caps.typical_latency_ns / 1e6, caps.backend, which);
+	}
+
+	xrt_display_processor_d3d11_destroy(&xdp);
+	ID3D11DeviceContext_Release(context);
+	ID3D11Device_Release(device);
+}
+
 //! Pack a Windows LUID the way Vulkan reports deviceLUID (raw bytes, LowPart
 //! first) — the same packing @ref d3d_scanout_adapter_luid returns, so the two
 //! can be compared directly.
@@ -1459,8 +1537,15 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 	if (r->zone_caps_malformed) {
 		r->result_code = CLI_SELFTEST_BAD_ZONE_CAPS;
 	}
+	// ADR-042 — lift caps. Absence never fails; only malformed caps do.
+	probe_lift_caps_d3d11(r, iface);
+	if (r->lift_caps_malformed && r->result_code == CLI_SELFTEST_PASS) {
+		r->result_code = CLI_SELFTEST_BAD_LIFT_CAPS;
+	}
 #else
 	snprintf(r->zone_probe_note, sizeof(r->zone_probe_note), "not probed: zone-caps probe is Windows-only (OK)");
+	snprintf(r->lift_probe_note, sizeof(r->lift_probe_note),
+	         "not probed: the lift module is a D3D11-service feature (Windows-only); modes 0 (OK)");
 #endif
 
 	// #1234 / #902 — can the Vulkan loader still reach the queue-lock layer?
@@ -1885,6 +1970,9 @@ cli_query_print_info_text(const struct cli_query_result *r)
 	} else {
 		PT("%s\n", r->zone_probe_note[0] != '\0' ? r->zone_probe_note : "not evaluated");
 	}
+
+	P(" :: 2D->3D conversion module (XR_DXR_lift / ADR-042, headless D3D11 WARP probe)\n");
+	PT("%s\n", r->lift_probe_note[0] != '\0' ? r->lift_probe_note : "not evaluated");
 }
 
 cJSON *
@@ -2141,6 +2229,21 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 			cJSON_AddBoolToObject(rg, "recenter_expected", r->rig_recenter_expected);
 			cJSON_AddBoolToObject(rg, "recenter_ok", r->rig_recenter_ok);
 			cJSON_AddNumberToObject(rg, "repeat_max", (double)r->rig_repeat_max);
+		}
+	}
+
+	// ADR-042 lift-caps probe.
+	{
+		cJSON *lc = cJSON_AddObjectToObject(root, "lift_caps");
+		cJSON_AddBoolToObject(lc, "probed", r->lift_caps_probed);
+		cJSON_AddBoolToObject(lc, "malformed", r->lift_caps_malformed);
+		cJSON_AddStringToObject(lc, "note", r->lift_probe_note[0] != '\0' ? r->lift_probe_note : "not evaluated");
+		if (r->lift_caps_probed) {
+			cJSON_AddNumberToObject(lc, "modes", (double)r->lift_caps.modes);
+			cJSON_AddNumberToObject(lc, "state", (double)r->lift_caps.state);
+			cJSON_AddNumberToObject(lc, "max_streams", (double)r->lift_caps.max_streams);
+			cJSON_AddNumberToObject(lc, "max_views", (double)r->lift_caps.max_views);
+			cJSON_AddStringToObject(lc, "backend", r->lift_caps.backend);
 		}
 	}
 
@@ -2402,6 +2505,14 @@ build_checks(const struct cli_query_result *r, struct check *out)
 	c->ok = !r->zone_caps_malformed;
 	snprintf(c->detail, sizeof(c->detail), "%s",
 	         r->zone_probe_note[0] != '\0' ? r->zone_probe_note : "not evaluated");
+
+	// ADR-042 — lift-caps probe (XR_DXR_lift). ABSENCE NEVER FAILS: modes 0
+	// passes; only a present-but-malformed caps struct fails (BAD_LIFT_CAPS).
+	c = &out[n++];
+	c->name = "lift_caps";
+	c->ok = !r->lift_caps_malformed;
+	snprintf(c->detail, sizeof(c->detail), "%s",
+	         r->lift_probe_note[0] != '\0' ? r->lift_probe_note : "not evaluated");
 
 	// ADR-034 / #823 — input-provider check. ABSENCE NEVER FAILS: ok
 	// stays true with no provider registered, ForceQwerty set, every
