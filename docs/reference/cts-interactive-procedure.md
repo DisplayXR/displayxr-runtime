@@ -453,11 +453,13 @@ There is no way to skip a test from inside the CTS. Judge it.
 > its **prompt, its labels and its reference image in quad layers**, so on
 > those plug-ins the operator sees no prompt, no labels and no quad content —
 > the category is not merely failing there, it is **unjudgeable**. The
-> `vk_native` leg is draft PR #1623 (quads + colour model); a Windows
-> `-Graphics vulkan` hardware run of that branch passed QuadOcclusion, the
-> gradients (13/13), SourceAlphaBlending and the environment-blend pair, so it
-> is judgeable *on that branch*. A run that produces no visible prompt is a
-> harness gap, not a result.
+> `vk_native` leg is #1623 (quads drawn through the shared camera / cull /
+> painter's rules, plus the #1589/#1610 colour model on a private `_SRGB`-view
+> target); a Windows `-Graphics vulkan` hardware run of that branch passed
+> QuadOcclusion, the gradients (13/13), SourceAlphaBlending and the
+> environment-blend pair. Equirect2 on `vk_native` is a separate change, and
+> `Subimage` / `MinLayers` have not yet been judged on Vulkan. A run that
+> produces no visible prompt is a harness gap, not a result.
 >
 > **`d3d11`** is the reference lane: 0 runtime-attributable failures on `main`
 > since #1606 (gradients 11/11, SourceAlphaBlending, the environment-blend
