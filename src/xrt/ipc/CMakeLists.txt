@@ -68,6 +68,8 @@ add_library(
 	client/ipc_client.h
 	client/ipc_client_compositor.c
 	client/ipc_client_connection.c
+	client/ipc_client_lift.c
+	client/ipc_client_lift.h
 	client/ipc_client_device.c
 	client/ipc_client_hmd.c
 	client/ipc_client_instance.c

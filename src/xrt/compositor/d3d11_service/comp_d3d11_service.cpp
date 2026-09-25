@@ -58,6 +58,7 @@
 // compositor (PR 1/6 made it a standalone static lib for exactly this).
 #include "comp_xbridge.h"
 #include "comp_split_gate.h"
+#include "d3d11_lift.h" // XR_DXR_lift (ADR-042)
 
 #include "util/u_hud.h"
 #include "util/u_tiling.h"
@@ -758,6 +759,16 @@ struct d3d11_client_render_resources
 	HANDLE                                 weave_gen_inputs[WEAVE_OUTPUT_GEN_MAX_INPUTS];
 	//! One-shot: this client has been reported as using the legacy path (#1058).
 	bool                                   weave_legacy_warned;
+
+	//! XR_DXR_lift (ADR-042): the lift-flagged rects of this client's NEXT
+	//! weave submit (comp_d3d11_service_lift_set_weave_rects), consumed and
+	//! cleared by that submit. Same IPC thread as the submit — no lock.
+	uint32_t                               lift_rect_count;
+	uint64_t                               lift_owner;
+	struct xrt_lift_weave_rect      lift_rects[XRT_LIFT_WEAVE_RECTS_MAX];
+	//! v6 path: RTV on weave_crop_tex, so lifted views can be written into
+	//! the crop before the weave (a lift frame never takes the zero-copy path).
+	wil::com_ptr<ID3D11RenderTargetView>   weave_crop_rtv;
 
 	//! Cached import of the caller's v4 overlay atlas (browser#18), keyed by the
 	//! shared-handle value exactly like weave_input_* above. A window-sized
@@ -1673,6 +1684,12 @@ struct d3d11_service_system
 	//! session). Innermost lock, never held across a blocking wait; order is
 	//! render_mutex / c->mutex / atlas_submit_mutex → this.
 	std::mutex immediate_ctx_mutex;
+
+	//! XR_DXR_lift (ADR-042): the lift module — its own thread, device and
+	//! display processor (d3d11_lift.h). Created lazily on the first lift call
+	//! under @ref lift_create_mutex; destroyed first in system_destroy.
+	struct d3d11_lift *lift = nullptr;
+	std::mutex lift_create_mutex;
 
 	//! Count of threads currently blocked acquiring render_mutex through
 	//! render_mutex_fair_lock (every acquirer EXCEPT the capture render
@@ -6478,6 +6495,8 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 	res->weave_saw_frame_first = false;
 	res->weave_gen_count = 0;
 	res->weave_legacy_warned = false;
+	res->lift_rect_count = 0;
+	res->weave_crop_rtv.reset();
 	res->weave_overlay_handle_cached = nullptr;
 	res->weave_overlay_km.reset();
 	res->weave_overlay_srv.reset();
@@ -23830,6 +23849,189 @@ comp_d3d11_service_compositor_export_transparent_output_fence(struct xrt_composi
  * output sub-rect. The DP does all weaving (ADR-007 / ADR-019).
  */
 
+/*
+ *
+ * XR_DXR_lift (ADR-042) — lift-flagged weave rects.
+ *
+ * The weave never waits for the module: each rect's 2D content is SNAPSHOTTED
+ * into its stream's latest-wins mailbox (one blit on this context), and the
+ * stream's LATEST result — one frame (or more) behind — is woven at the rect's
+ * CURRENT position. Geometry is therefore exact and real-time; only the depth
+ * lags. Caller holds render_mutex + immediate_ctx_mutex and the input's keyed
+ * mutex (the same state the surrounding blits run under).
+ *
+ */
+
+static const struct xrt_lift_weave_rect *
+lift_binding_for_rect(const struct xrt_lift_weave_rect *rects, uint32_t count, uint32_t rect_index)
+{
+	for (uint32_t k = 0; k < count; k++) {
+		if (rects[k].rect_index == rect_index) {
+			return &rects[k];
+		}
+	}
+	return nullptr;
+}
+
+//! The stereo pair out of an N-view result: the middle two views.
+static void
+lift_pick_pair(uint32_t views, uint32_t *out_l, uint32_t *out_r)
+{
+	if (views <= 2) {
+		*out_l = 0;
+		*out_r = views == 2 ? 1 : 0;
+		return;
+	}
+	*out_l = views / 2 - 1;
+	*out_r = views / 2;
+}
+
+/*!
+ * Batch (v3) layout: rect @p rect is window-sized-input pixels holding a 2D
+ * frame. Snapshot it, then blit the stream's latest pair into the left / right
+ * tiles of the SBS scratch at the rect's position (or the 2D frame into both,
+ * FLAT, until the first result). Returns false when @p rect_index is not lifted
+ * (the caller then blits it as ordinary squeezed SBS).
+ */
+static bool
+lift_weave_rect_batch(struct d3d11_service_system *sys,
+                      struct d3d11_service_compositor *c,
+                      struct d3d11_lift *lift,
+                      uint64_t owner,
+                      const struct xrt_lift_weave_rect *bindings,
+                      uint32_t binding_count,
+                      uint32_t rect_index,
+                      ID3D11ShaderResourceView *in_srv,
+                      uint32_t in_w,
+                      uint32_t in_h,
+                      const struct xrt_rect &rect,
+                      uint32_t win_w,
+                      uint32_t win_h)
+{
+	const struct xrt_lift_weave_rect *b = lift_binding_for_rect(bindings, binding_count, rect_index);
+	if (b == nullptr) {
+		return false;
+	}
+	// Clip to the input (xrt_offset fields are named w/h).
+	int32_t x0 = rect.offset.w < 0 ? 0 : rect.offset.w;
+	int32_t y0 = rect.offset.h < 0 ? 0 : rect.offset.h;
+	int32_t x1 = rect.offset.w + rect.extent.w;
+	int32_t y1 = rect.offset.h + rect.extent.h;
+	x1 = x1 > (int32_t)in_w ? (int32_t)in_w : x1;
+	y1 = y1 > (int32_t)in_h ? (int32_t)in_h : y1;
+	if (x1 <= x0 || y1 <= y0) {
+		return true; // nothing visible to lift; nothing to weave either
+	}
+	uint64_t frame_id = 0;
+	(void)d3d11_lift_submit_srv_locked(lift, owner, b->stream_id, in_srv, in_w, in_h, (uint32_t)x0, (uint32_t)y0,
+	                                   (uint32_t)(x1 - x0), (uint32_t)(y1 - y0), (int64_t)os_monotonic_get_ns(),
+	                                   b->has_params ? &b->params : nullptr, &frame_id);
+
+	const float rx = (float)rect.offset.w, ry = (float)rect.offset.h;
+	const float rw = (float)rect.extent.w, rh = (float)rect.extent.h;
+	ID3D11RenderTargetView *rtv = c->render.weave_sbs_rtv.get();
+	const float atw = (float)(win_w * 2), ath = (float)win_h;
+
+	struct d3d11_lift_pin pin = {};
+	if (d3d11_lift_pin_latest(lift, owner, b->stream_id, &pin) && pin.view_count >= 1) {
+		uint32_t vl = 0, vr = 0;
+		lift_pick_pair(pin.view_count, &vl, &vr);
+		const float vw = (float)pin.width / (float)pin.view_count;
+		blit_to_atlas_texture(sys, &c->render, pin.srv, vw * (float)vl, 0.0f, vw, (float)pin.height,
+		                      (float)pin.width, (float)pin.height, rx, ry, rw, rh, /*is_srgb*/ false,
+		                      /*blend*/ nullptr, rtv, atw, ath);
+		blit_to_atlas_texture(sys, &c->render, pin.srv, vw * (float)vr, 0.0f, vw, (float)pin.height,
+		                      (float)pin.width, (float)pin.height, (float)win_w + rx, ry, rw, rh,
+		                      /*is_srgb*/ false, /*blend*/ nullptr, rtv, atw, ath);
+		d3d11_lift_unpin(&pin);
+	} else {
+		// No result yet: weave it FLAT — the same 2D frame in both views.
+		blit_to_atlas_texture(sys, &c->render, in_srv, rx, ry, rw, rh, (float)in_w, (float)in_h, rx, ry, rw, rh,
+		                      /*is_srgb*/ false, /*blend*/ nullptr, rtv, atw, ath);
+		blit_to_atlas_texture(sys, &c->render, in_srv, rx, ry, rw, rh, (float)in_w, (float)in_h,
+		                      (float)win_w + rx, ry, rw, rh, /*is_srgb*/ false, /*blend*/ nullptr, rtv, atw, ath);
+	}
+	return true;
+}
+
+/*!
+ * v6 N-view layout: the crop (@c weave_crop_tex) holds the caller's packed
+ * atlas. For each lifted rect: snapshot its region of TILE 0 into the stream,
+ * then overwrite that region of every tile with the matching view of the
+ * stream's latest result. Until the first result the tiles stay as the caller
+ * drew them (a caller draws the 2D frame into every tile, i.e. flat).
+ */
+static void
+lift_weave_rects_nview(struct d3d11_service_system *sys,
+                       struct d3d11_service_compositor *c,
+                       struct d3d11_lift *lift,
+                       uint64_t owner,
+                       const struct xrt_lift_weave_rect *bindings,
+                       uint32_t binding_count,
+                       const struct xrt_rect *rects,
+                       uint32_t rect_count,
+                       const struct xrt_weave_atlas_layout *layout,
+                       uint32_t win_w,
+                       uint32_t win_h)
+{
+	if (rects == nullptr || win_w == 0 || win_h == 0) {
+		return;
+	}
+	const uint32_t cvw = layout->content_view_w, cvh = layout->content_view_h;
+	const float sx = (float)cvw / (float)win_w, sy = (float)cvh / (float)win_h;
+	const uint32_t packed_w = layout->tile_columns * cvw, packed_h = layout->tile_rows * cvh;
+	ID3D11ShaderResourceView *crop_srv = c->render.weave_crop_srv.get();
+	ID3D11RenderTargetView *crop_rtv = c->render.weave_crop_rtv.get();
+
+	for (uint32_t k = 0; k < binding_count; k++) {
+		const struct xrt_lift_weave_rect *b = &bindings[k];
+		if (b->rect_index >= rect_count) {
+			continue;
+		}
+		const struct xrt_rect &r = rects[b->rect_index];
+		// Tile-0 region, clipped to tile 0.
+		float fx0 = (float)r.offset.w * sx, fy0 = (float)r.offset.h * sy;
+		float fx1 = fx0 + (float)r.extent.w * sx, fy1 = fy0 + (float)r.extent.h * sy;
+		fx0 = fx0 < 0.0f ? 0.0f : fx0;
+		fy0 = fy0 < 0.0f ? 0.0f : fy0;
+		fx1 = fx1 > (float)cvw ? (float)cvw : fx1;
+		fy1 = fy1 > (float)cvh ? (float)cvh : fy1;
+		if (fx1 - fx0 < 1.0f || fy1 - fy0 < 1.0f) {
+			continue;
+		}
+		const uint32_t x0 = (uint32_t)fx0, y0 = (uint32_t)fy0;
+		const uint32_t w = (uint32_t)(fx1 - fx0), h = (uint32_t)(fy1 - fy0);
+		uint64_t frame_id = 0;
+		(void)d3d11_lift_submit_srv_locked(lift, owner, b->stream_id, crop_srv, packed_w, packed_h, x0, y0, w, h,
+		                                   (int64_t)os_monotonic_get_ns(), b->has_params ? &b->params : nullptr,
+		                                   &frame_id);
+
+		struct d3d11_lift_pin pin = {};
+		if (!d3d11_lift_pin_latest(lift, owner, b->stream_id, &pin) || pin.view_count == 0) {
+			continue;
+		}
+		const float vw = (float)pin.width / (float)pin.view_count;
+		for (uint32_t v = 0; v < layout->view_count; v++) {
+			// Map the atlas view onto the result's views (equal counts: 1:1).
+			uint32_t src_v = v;
+			if (pin.view_count != layout->view_count) {
+				src_v = layout->view_count > 1
+				            ? (uint32_t)((float)v * (float)(pin.view_count - 1) / (float)(layout->view_count - 1) +
+				                         0.5f)
+				            : pin.view_count / 2;
+			}
+			const float dx = (float)((v % layout->tile_columns) * cvw) + (float)x0;
+			const float dy = (float)((v / layout->tile_columns) * cvh) + (float)y0;
+			blit_to_atlas_texture(sys, &c->render, pin.srv, vw * (float)src_v, 0.0f, vw, (float)pin.height,
+			                      (float)pin.width, (float)pin.height, dx, dy, (float)w, (float)h,
+			                      /*is_srgb*/ false, /*blend*/ nullptr, crop_rtv, (float)packed_w,
+			                      (float)packed_h);
+		}
+		d3d11_lift_unpin(&pin);
+	}
+}
+
+
 //! (Re)allocate the server-owned weaved-output texture + RTV (+ the persistent
 //! fence on first use) sized to @p w × @p h. Caller holds sys->render_mutex.
 static bool
@@ -24608,6 +24810,23 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		return false;
 	}
 
+	// XR_DXR_lift (ADR-042): take this submit's lift-flagged rects NOW, so every
+	// exit path below consumes them (a set is valid for exactly one submit).
+	struct xrt_lift_weave_rect lift_rects[XRT_LIFT_WEAVE_RECTS_MAX];
+	uint32_t lift_count = c->render.lift_rect_count;
+	const uint64_t lift_owner = c->render.lift_owner;
+	if (lift_count > XRT_LIFT_WEAVE_RECTS_MAX) {
+		lift_count = XRT_LIFT_WEAVE_RECTS_MAX;
+	}
+	if (lift_count > 0) {
+		memcpy(lift_rects, c->render.lift_rects, lift_count * sizeof(lift_rects[0]));
+	}
+	c->render.lift_rect_count = 0;
+	struct d3d11_lift *lift = lift_count > 0 ? sys->lift : nullptr;
+	if (lift == nullptr) {
+		lift_count = 0;
+	}
+
 	// #625: choose the display processor that performs the weave. A standalone
 	// present-owner (the WebXR / inline-3D browser bridge, the CEF host, the weave
 	// probe) gets its OWN per-client DP in init_client_render_resources — but ONLY
@@ -25035,10 +25254,15 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		// atlas to fill the ACTIVE mode's atlas exactly. With a swapchain sized
 		// at the max over all modes, only the worst-case-achieving mode
 		// qualifies, and only at fullscreen (ADR-030).
-		const bool zero_copy = (packed_w == idesc.Width && packed_h == idesc.Height);
+		//
+		// XR_DXR_lift (ADR-042): a frame with lift-flagged rects writes lifted
+		// views INTO the atlas, which must never be the caller's own texture —
+		// so it always takes the crop.
+		const bool zero_copy = (packed_w == idesc.Width && packed_h == idesc.Height) && lift_count == 0;
 		if (!zero_copy) {
 			if (!c->render.weave_crop_tex || c->render.weave_crop_w != packed_w ||
 			    c->render.weave_crop_h != packed_h || c->render.weave_crop_format != idesc.Format) {
+				c->render.weave_crop_rtv.reset();
 				c->render.weave_crop_srv.reset();
 				c->render.weave_crop_tex.reset();
 
@@ -25050,12 +25274,21 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 				cd.Format = idesc.Format;
 				cd.SampleDesc.Count = 1;
 				cd.Usage = D3D11_USAGE_DEFAULT;
-				cd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+				// RENDER_TARGET too: XR_DXR_lift writes lifted views into it.
+				cd.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
 				hr = sys->device->CreateTexture2D(&cd, nullptr, c->render.weave_crop_tex.put());
 				if (SUCCEEDED(hr)) {
 					hr = sys->device->CreateShaderResourceView(c->render.weave_crop_tex.get(),
 					                                           nullptr,
 					                                           c->render.weave_crop_srv.put());
+				}
+				if (SUCCEEDED(hr)) {
+					// Non-fatal: without it only lifted rects are skipped.
+					if (FAILED(sys->device->CreateRenderTargetView(c->render.weave_crop_tex.get(),
+					                                               nullptr,
+					                                               c->render.weave_crop_rtv.put()))) {
+						c->render.weave_crop_rtv.reset();
+					}
 				}
 				if (FAILED(hr)) {
 					U_LOG_E("#625 weave v6: crop texture %ux%u create failed: 0x%08lx", packed_w,
@@ -25083,6 +25316,14 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 			sys->context->CopySubresourceRegion(c->render.weave_crop_tex.get(), 0, 0, 0, 0, in_tex, 0,
 			                                    &box);
 			dp_srv = c->render.weave_crop_srv.get();
+
+			// XR_DXR_lift (ADR-042): lift-flagged rects — snapshot tile 0's
+			// region into each stream, then overwrite that region of EVERY
+			// tile with the stream's latest view set.
+			if (lift_count > 0 && c->render.weave_crop_rtv) {
+				lift_weave_rects_nview(sys, c, lift, lift_owner, lift_rects, lift_count, rects, rect_count,
+				                       layout, win_w, win_h);
+			}
 		}
 
 		// Keyed-mutex release must straddle the DP read, NOT precede it. On the
@@ -25275,6 +25516,14 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 			const float rx = (float)rects[i].offset.w; // xrt_offset fields are named w/h
 			const float ry = (float)rects[i].offset.h;
 			if (rw <= 0.0f || rh <= 0.0f) {
+				continue;
+			}
+			// XR_DXR_lift (ADR-042): a lift-flagged rect holds 2D, not SBS.
+			// Snapshot it into its stream and weave the stream's latest
+			// stereo pair here, at the rect's CURRENT position.
+			if (lift_count > 0 && lift_weave_rect_batch(sys, c, lift, lift_owner, lift_rects, lift_count, i,
+			                                            in_srv, idesc.Width, idesc.Height, rects[i], win_w,
+			                                            win_h)) {
 				continue;
 			}
 			// Left view: the rect's left half -> the left tile, at the
@@ -26047,11 +26296,18 @@ system_set_workspace_view_rig(struct xrt_system_compositor *xsysc, const struct 
 }
 
 static void
+svc_lift_destroy(struct d3d11_service_system *sys);
+
+static void
 system_destroy(struct xrt_system_compositor *xsysc)
 {
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
 
 	U_LOG_I("Destroying D3D11 service system compositor");
+
+	// XR_DXR_lift (ADR-042): first — the lift thread calls back into this
+	// system for eyes, and owns a DP + device of its own.
+	svc_lift_destroy(sys);
 
 	/*
 	 * #918: stop the bridge BEFORE the multi-compositor goes, and before either
@@ -30352,4 +30608,241 @@ comp_d3d11_service_poll_mcp_capture(struct xrt_system_compositor *xsysc)
 		}
 	}
 	mcp_capture_complete(&sys->mcp_capture, ok);
+}
+
+
+/*
+ *
+ * XR_DXR_lift (ADR-042) — system-level entry points. Thin: resolve the system,
+ * create the lift module on first use, forward to d3d11_lift.cpp. None of these
+ * takes render_mutex; the ones that touch the shared immediate context take
+ * immediate_ctx_mutex inside d3d11_lift for one copy / blit only.
+ *
+ */
+
+//! The lift thread's eye source: the panel DP's predicted eyes (display space).
+static bool
+svc_lift_eyes(void *ud, struct xrt_eye_positions *out)
+{
+	return comp_d3d11_service_get_predicted_eye_positions_full((struct xrt_system_compositor *)ud, out);
+}
+
+static struct d3d11_lift *
+svc_lift(struct xrt_system_compositor *xsysc)
+{
+	if (!comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return nullptr;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	if (sys == nullptr || sys->device == nullptr || sys->context == nullptr) {
+		return nullptr;
+	}
+	std::lock_guard<std::mutex> g(sys->lift_create_mutex);
+	if (sys->lift == nullptr) {
+		void *lift_factory = sys->base.info.dp_factory_d3d11_lift;
+		void *fallback = comp_dp_factory_for_window(&sys->base.info, COMP_DP_PRIMARY_MONITOR, COMP_DP_API_D3D11);
+		sys->lift = d3d11_lift_create(sys->device.get(), sys->context.get(), &sys->immediate_ctx_mutex,
+		                              lift_factory, fallback, svc_lift_eyes, (void *)xsysc);
+		U_LOG_W("[lift] lift module created (lift-only factory %s, fallback factory %s)",
+		        lift_factory != nullptr ? "present" : "absent", fallback != nullptr ? "present" : "absent");
+	}
+	return sys->lift;
+}
+
+//! Called first thing in system_destroy: joins the lift thread (which calls
+//! back into the system for eyes) before anything it uses goes away.
+static void
+svc_lift_destroy(struct d3d11_service_system *sys)
+{
+	std::lock_guard<std::mutex> g(sys->lift_create_mutex);
+	d3d11_lift_destroy(&sys->lift);
+}
+
+extern "C" void
+comp_d3d11_service_lift_get_caps(struct xrt_system_compositor *xsysc, struct xrt_dp_lift_caps *out)
+{
+	xrt_dp_lift_caps_init(out);
+	struct d3d11_lift *l = svc_lift(xsysc);
+	if (l != nullptr) {
+		d3d11_lift_get_caps(l, out);
+	}
+}
+
+extern "C" xrt_result_t
+comp_d3d11_service_lift_stream_create(struct xrt_system_compositor *xsysc,
+                                      uint64_t owner,
+                                      const struct xrt_dp_lift_stream_info *info,
+                                      uint64_t *out_id)
+{
+	struct d3d11_lift *l = svc_lift(xsysc);
+	if (l == nullptr) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	return d3d11_lift_stream_create(l, owner, info, out_id);
+}
+
+extern "C" void
+comp_d3d11_service_lift_stream_destroy(struct xrt_system_compositor *xsysc, uint64_t owner, uint64_t id)
+{
+	struct d3d11_lift *l = svc_lift(xsysc);
+	if (l != nullptr) {
+		d3d11_lift_stream_destroy(l, owner, id);
+	}
+}
+
+extern "C" void
+comp_d3d11_service_lift_release_owner(struct xrt_system_compositor *xsysc, uint64_t owner)
+{
+	if (!comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	std::lock_guard<std::mutex> g(sys->lift_create_mutex);
+	if (sys->lift != nullptr) { // never CREATE the module just to release nothing
+		d3d11_lift_release_owner(sys->lift, owner);
+	}
+}
+
+extern "C" xrt_result_t
+comp_d3d11_service_lift_submit(struct xrt_system_compositor *xsysc,
+                               uint64_t owner,
+                               uint64_t id,
+                               xrt_graphics_buffer_handle_t handle,
+                               bool is_dxgi,
+                               uint32_t w,
+                               uint32_t h,
+                               int64_t source_time,
+                               const struct xrt_dp_lift_params *params,
+                               const float *viewpoints,
+                               uint32_t viewpoint_floats,
+                               uint64_t *out_frame_id)
+{
+	struct d3d11_lift *l = svc_lift(xsysc);
+	if (l == nullptr) {
+		if (handle != nullptr && !is_dxgi) {
+			CloseHandle((HANDLE)handle);
+		}
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	return d3d11_lift_submit_handle(l, owner, id, (HANDLE)handle, is_dxgi, w, h, source_time, params, viewpoints,
+	                                viewpoint_floats, out_frame_id);
+}
+
+extern "C" xrt_result_t
+comp_d3d11_service_lift_acquire(struct xrt_system_compositor *xsysc,
+                                uint64_t owner,
+                                uint64_t id,
+                                bool *out_ready,
+                                struct xrt_lift_result *out)
+{
+	*out_ready = false;
+	memset(out, 0, sizeof(*out));
+	struct d3d11_lift *l = svc_lift(xsysc);
+	if (l == nullptr) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	struct d3d11_lift_result_info r = {};
+	xrt_result_t xret = d3d11_lift_acquire_result(l, owner, id, out_ready, &r);
+	out->frame_id = r.frame_id;
+	out->source_time = r.source_time;
+	out->fence_value = r.fence_value;
+	out->latency_ns = r.latency_ns;
+	out->width = r.width;
+	out->height = r.height;
+	out->format = r.format;
+	out->view_count = r.view_count;
+	out->output_realloc = r.output_realloc;
+	return xret;
+}
+
+extern "C" bool
+comp_d3d11_service_lift_export_output(struct xrt_system_compositor *xsysc,
+                                      uint64_t owner,
+                                      uint64_t id,
+                                      xrt_graphics_buffer_handle_t *out_handle,
+                                      uint32_t *out_width,
+                                      uint32_t *out_height,
+                                      uint32_t *out_format)
+{
+	struct d3d11_lift *l = svc_lift(xsysc);
+	HANDLE h = nullptr;
+	if (l == nullptr || !d3d11_lift_export_output(l, owner, id, &h, out_width, out_height, out_format)) {
+		return false;
+	}
+	*out_handle = (xrt_graphics_buffer_handle_t)h;
+	return true;
+}
+
+extern "C" bool
+comp_d3d11_service_lift_export_fence(struct xrt_system_compositor *xsysc,
+                                     uint64_t owner,
+                                     uint64_t id,
+                                     xrt_graphics_sync_handle_t *out_handle)
+{
+	struct d3d11_lift *l = svc_lift(xsysc);
+	HANDLE h = nullptr;
+	if (l == nullptr || !d3d11_lift_export_fence(l, owner, id, &h)) {
+		return false;
+	}
+	*out_handle = (xrt_graphics_sync_handle_t)h;
+	return true;
+}
+
+extern "C" xrt_result_t
+comp_d3d11_service_lift_acquire_blob(struct xrt_system_compositor *xsysc,
+                                     uint64_t owner,
+                                     uint64_t id,
+                                     uint64_t capacity,
+                                     bool *out_ready,
+                                     struct xrt_lift_blob_info *out_info,
+                                     uint8_t **out_bytes)
+{
+	*out_ready = false;
+	memset(out_info, 0, sizeof(*out_info));
+	*out_bytes = nullptr;
+	struct d3d11_lift *l = svc_lift(xsysc);
+	if (l == nullptr) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	struct d3d11_lift_blob_info bi = {};
+	xrt_result_t xret = d3d11_lift_acquire_blob(l, owner, id, capacity, out_ready, &bi, out_bytes);
+	out_info->frame_id = bi.frame_id;
+	out_info->source_time = bi.source_time;
+	out_info->format = bi.format;
+	out_info->byte_count = bi.byte_count;
+	return xret;
+}
+
+extern "C" bool
+comp_d3d11_service_lift_set_weave_rects(struct xrt_compositor *xc,
+                                        uint64_t owner,
+                                        uint32_t count,
+                                        const struct xrt_lift_weave_rect *rects)
+{
+	if (xc == nullptr || xc->destroy != compositor_destroy || count > XRT_LIFT_WEAVE_RECTS_MAX ||
+	    (count > 0 && rects == nullptr)) {
+		return false;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	if (c->sys == nullptr) {
+		return false;
+	}
+	if (count > 0) {
+		// Create the module HERE (outside every weave lock), never inside the
+		// submit that consumes these rects.
+		if (svc_lift(&c->sys->base) == nullptr) {
+			return false;
+		}
+		// Only this owner's live SBS / NVIEW streams can be woven.
+		for (uint32_t i = 0; i < count; i++) {
+			uint32_t mode = d3d11_lift_stream_mode(c->sys->lift, owner, rects[i].stream_id);
+			if (mode != XRT_DP_LIFT_MODE_SBS && mode != XRT_DP_LIFT_MODE_NVIEW) {
+				return false;
+			}
+		}
+		memcpy(c->render.lift_rects, rects, count * sizeof(rects[0]));
+	}
+	c->render.lift_owner = owner;
+	c->render.lift_rect_count = count;
+	return true;
 }

@@ -8089,3 +8089,415 @@ ipc_handle_device_set_brightness(volatile struct ipc_client_state *ics, uint32_t
 
 	return xrt_device_set_brightness(xdev, brightness, relative);
 }
+
+
+/*
+ *
+ * XR_DXR_lift (ADR-042) — 2D→3D conversion streams.
+ *
+ * Streams belong to the CONNECTION (ics->lift_owner), not to a session: the
+ * calls need no compositor, so `displayxr-cli lift` can drive them headless.
+ * Implemented on the Windows D3D11 service; every other service answers
+ * XRT_ERROR_FEATURE_NOT_SUPPORTED over a healthy pipe (the client reports
+ * XR_ERROR_FEATURE_UNSUPPORTED). A transient refusal (keyed-mutex miss) is
+ * XRT_ERROR_WEAVE_REFUSED, never XRT_ERROR_IPC_FAILURE — the latter would mark
+ * the caller's session lost over a perfectly healthy pipe (browser#103).
+ *
+ */
+
+//! Who may use lift: the browser (PRESENT_OWNER), ordinary apps, and the
+//! diagnostic probe (DIAG, `displayxr-cli lift`).
+static xrt_result_t
+require_lift_client(volatile struct ipc_client_state *ics, const char *what)
+{
+	uint32_t cls = ics->client_state.client_class;
+	if (cls != XRT_CLIENT_CLASS_PRESENT_OWNER && cls != XRT_CLIENT_CLASS_APP && cls != XRT_CLIENT_CLASS_DIAG) {
+		IPC_WARN(ics->server, "%s: denied — caller pid %ld is class %s (lift: PRESENT_OWNER / APP / DIAG).", what,
+		         ics->peer_pid, ipc_server_client_class_str(cls));
+		return XRT_ERROR_NOT_AUTHORIZED;
+	}
+	return XRT_SUCCESS;
+}
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+//! This connection's owner token, taken on first use from a server-wide counter.
+static uint64_t
+lift_owner(volatile struct ipc_client_state *ics)
+{
+	if (ics->lift_owner == 0) {
+		static uint64_t s_next_owner = 0;
+		os_mutex_lock(&ics->server->global_state.lock);
+		ics->lift_owner = ++s_next_owner;
+		os_mutex_unlock(&ics->server->global_state.lock);
+	}
+	return ics->lift_owner;
+}
+
+static struct xrt_system_compositor *
+lift_xsysc(volatile struct ipc_client_state *ics)
+{
+	struct xrt_system_compositor *xsysc = ics->server != NULL ? ics->server->xsysc : NULL;
+	return comp_d3d11_service_is_d3d11_service(xsysc) ? xsysc : NULL;
+}
+
+static void
+lift_params_from_ipc(const struct ipc_lift_params *in, struct xrt_dp_lift_params *out)
+{
+	U_ZERO(out);
+	out->struct_size = (uint32_t)sizeof(*out);
+	out->convergence = in->convergence;
+	out->strength = in->strength;
+	out->inpaint = in->inpaint;
+	out->view_count = in->view_count > IPC_LIFT_MAX_VIEWS ? IPC_LIFT_MAX_VIEWS : in->view_count;
+}
+#endif
+
+void
+ipc_server_client_lift_release(volatile struct ipc_client_state *ics)
+{
+	if (ics == NULL || ics->lift_owner == 0) {
+		return;
+	}
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	struct xrt_system_compositor *xsysc = lift_xsysc(ics);
+	if (xsysc != NULL) {
+		comp_d3d11_service_lift_release_owner(xsysc, ics->lift_owner);
+	}
+#endif
+	ics->lift_owner = 0;
+}
+
+xrt_result_t
+ipc_handle_lift_get_properties(volatile struct ipc_client_state *ics, struct ipc_lift_properties *out_props)
+{
+	IPC_TRACE_MARKER();
+	U_ZERO(out_props);
+	xrt_result_t auth = require_lift_client(ics, "lift_get_properties");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	struct xrt_system_compositor *xsysc = lift_xsysc(ics);
+	if (xsysc != NULL) {
+		struct xrt_dp_lift_caps caps;
+		comp_d3d11_service_lift_get_caps(xsysc, &caps);
+		out_props->modes = caps.modes;
+		out_props->max_streams = caps.max_streams;
+		out_props->max_views = caps.max_views;
+		out_props->depth_semantics = caps.depth_semantics;
+		out_props->state = caps.state;
+		out_props->typical_latency_ns = caps.typical_latency_ns;
+		memcpy(out_props->backend, caps.backend, sizeof(out_props->backend));
+		out_props->backend[sizeof(out_props->backend) - 1] = '\0';
+	}
+#endif
+	// Anything else: modes 0, UNAVAILABLE — a successful answer, not an error.
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_handle_lift_stream_create(volatile struct ipc_client_state *ics,
+                              uint32_t mode,
+                              uint32_t content_hint,
+                              float input_scale,
+                              uint64_t *out_stream_id)
+{
+	IPC_TRACE_MARKER();
+	*out_stream_id = 0;
+	xrt_result_t auth = require_lift_client(ics, "lift_stream_create");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	struct xrt_system_compositor *xsysc = lift_xsysc(ics);
+	if (xsysc != NULL) {
+		struct xrt_dp_lift_stream_info info = {0};
+		info.struct_size = (uint32_t)sizeof(info);
+		info.mode = mode;
+		info.content_hint = content_hint;
+		info.input_scale = input_scale;
+		return comp_d3d11_service_lift_stream_create(xsysc, lift_owner(ics), &info, out_stream_id);
+	}
+#else
+	(void)mode;
+	(void)content_hint;
+	(void)input_scale;
+#endif
+	return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+}
+
+xrt_result_t
+ipc_handle_lift_stream_destroy(volatile struct ipc_client_state *ics, uint64_t stream_id)
+{
+	IPC_TRACE_MARKER();
+	xrt_result_t auth = require_lift_client(ics, "lift_stream_destroy");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	struct xrt_system_compositor *xsysc = lift_xsysc(ics);
+	if (xsysc != NULL && ics->lift_owner != 0) {
+		comp_d3d11_service_lift_stream_destroy(xsysc, ics->lift_owner, stream_id);
+	}
+#else
+	(void)stream_id;
+#endif
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_handle_lift_submit_frame(volatile struct ipc_client_state *ics,
+                             const struct ipc_arg_lift_submit *args,
+                             uint64_t *out_frame_id,
+                             const xrt_graphics_buffer_handle_t *handles,
+                             uint32_t handle_count)
+{
+	IPC_TRACE_MARKER();
+	*out_frame_id = 0;
+	xrt_result_t auth = require_lift_client(ics, "lift_submit_frame");
+	if (auth != XRT_SUCCESS) {
+		weave_submit_release_handles(handles, handle_count);
+		return auth;
+	}
+	if (handle_count < 1) {
+		return XRT_ERROR_IPC_FAILURE; // malformed request: the wire is not trusted
+	}
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	xrt_graphics_buffer_handle_t in_handle = handles[0];
+	bool in_is_dxgi = false;
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
+	if ((size_t)in_handle & 1) {
+		in_handle = (HANDLE)((size_t)in_handle - 1);
+		in_is_dxgi = true;
+	}
+#endif
+	struct xrt_system_compositor *xsysc = lift_xsysc(ics);
+	if (xsysc == NULL) {
+		if (!in_is_dxgi && in_handle != NULL) {
+			CloseHandle(in_handle);
+		}
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	struct xrt_dp_lift_params params;
+	lift_params_from_ipc(&args->params, &params);
+	uint32_t vp_count = args->params.viewpoint_count > IPC_LIFT_MAX_VIEWS ? IPC_LIFT_MAX_VIEWS
+	                                                                     : args->params.viewpoint_count;
+	// The handle is the service's from here (closed or cached inside).
+	return comp_d3d11_service_lift_submit(xsysc, lift_owner(ics), args->stream_id, in_handle, in_is_dxgi,
+	                                      args->width, args->height, args->source_time,
+	                                      args->has_params ? &params : NULL, args->params.viewpoints,
+	                                      args->has_params ? 3 * vp_count : 0, out_frame_id);
+#else
+	(void)args;
+	weave_submit_release_handles(handles, handle_count);
+	return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+#endif
+}
+
+xrt_result_t
+ipc_handle_lift_acquire_result(volatile struct ipc_client_state *ics,
+                               uint64_t stream_id,
+                               bool *out_ready,
+                               struct ipc_lift_result *out_lift_result)
+{
+	IPC_TRACE_MARKER();
+	*out_ready = false;
+	U_ZERO(out_lift_result);
+	xrt_result_t auth = require_lift_client(ics, "lift_acquire_result");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	struct xrt_system_compositor *xsysc = lift_xsysc(ics);
+	if (xsysc == NULL) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	struct xrt_lift_result r;
+	xrt_result_t xret = comp_d3d11_service_lift_acquire(xsysc, lift_owner(ics), stream_id, out_ready, &r);
+	out_lift_result->frame_id = r.frame_id;
+	out_lift_result->source_time = r.source_time;
+	out_lift_result->fence_value = r.fence_value;
+	out_lift_result->latency_ns = r.latency_ns;
+	out_lift_result->width = r.width;
+	out_lift_result->height = r.height;
+	out_lift_result->format = r.format;
+	out_lift_result->view_count = r.view_count;
+	out_lift_result->output_realloc = r.output_realloc ? 1u : 0u;
+	return xret;
+#else
+	(void)stream_id;
+	return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+#endif
+}
+
+xrt_result_t
+ipc_handle_lift_get_output(volatile struct ipc_client_state *ics,
+                           uint64_t stream_id,
+                           bool *out_have_output,
+                           uint32_t *out_width,
+                           uint32_t *out_height,
+                           uint32_t *out_format,
+                           uint32_t max_handle_count,
+                           xrt_graphics_buffer_handle_t *out_handles,
+                           uint32_t *out_handle_count)
+{
+	IPC_TRACE_MARKER();
+	*out_have_output = false;
+	*out_width = 0;
+	*out_height = 0;
+	*out_format = 0;
+	*out_handle_count = 0;
+	xrt_result_t auth = require_lift_client(ics, "lift_get_output");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (max_handle_count < 1) {
+		return XRT_SUCCESS;
+	}
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	struct xrt_system_compositor *xsysc = lift_xsysc(ics);
+	xrt_graphics_buffer_handle_t h = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+	if (xsysc != NULL && comp_d3d11_service_lift_export_output(xsysc, lift_owner(ics), stream_id, &h, out_width,
+	                                                           out_height, out_format)) {
+		// Service-owned: the transport DuplicateHandle's it into the caller.
+		out_handles[0] = h;
+		*out_handle_count = 1;
+		*out_have_output = true;
+	}
+#else
+	(void)stream_id;
+	(void)out_handles;
+#endif
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_handle_lift_get_fence(volatile struct ipc_client_state *ics,
+                          uint64_t stream_id,
+                          bool *out_have_fence,
+                          uint32_t max_handle_count,
+                          xrt_graphics_sync_handle_t *out_handles,
+                          uint32_t *out_handle_count)
+{
+	IPC_TRACE_MARKER();
+	*out_have_fence = false;
+	*out_handle_count = 0;
+	xrt_result_t auth = require_lift_client(ics, "lift_get_fence");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (max_handle_count < 1) {
+		return XRT_SUCCESS;
+	}
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	struct xrt_system_compositor *xsysc = lift_xsysc(ics);
+	xrt_graphics_sync_handle_t h = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
+	if (xsysc != NULL && comp_d3d11_service_lift_export_fence(xsysc, lift_owner(ics), stream_id, &h)) {
+		out_handles[0] = h;
+		*out_handle_count = 1;
+		*out_have_fence = true;
+	}
+#else
+	(void)stream_id;
+	(void)out_handles;
+#endif
+	return XRT_SUCCESS;
+}
+
+/*!
+ * Varlen reply: struct ipc_lift_acquire_blob_reply {result, ready, frame_id,
+ * source_time, format, byte_count}, then — only when result is XRT_SUCCESS,
+ * ready, and capacity >= byte_count — byte_count bytes in ONE send. With a
+ * smaller capacity only the header goes (the blob stays latched service-side
+ * for the second call). Rejections ride in reply.result over a healthy pipe.
+ */
+xrt_result_t
+ipc_handle_lift_acquire_blob(volatile struct ipc_client_state *ics, uint64_t stream_id, uint64_t capacity)
+{
+	IPC_TRACE_MARKER();
+	struct ipc_message_channel *imc = (struct ipc_message_channel *)&ics->imc;
+	struct ipc_lift_acquire_blob_reply reply = XRT_STRUCT_INIT;
+	reply.result = require_lift_client(ics, "lift_acquire_blob");
+	uint8_t *bytes = NULL;
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (reply.result == XRT_SUCCESS) {
+		struct xrt_system_compositor *xsysc = lift_xsysc(ics);
+		if (xsysc == NULL) {
+			reply.result = XRT_ERROR_FEATURE_NOT_SUPPORTED;
+		} else {
+			uint64_t cap = capacity > IPC_LIFT_BLOB_MAX_BYTES ? IPC_LIFT_BLOB_MAX_BYTES : capacity;
+			struct xrt_lift_blob_info info;
+			bool ready = false;
+			reply.result = comp_d3d11_service_lift_acquire_blob(xsysc, lift_owner(ics), stream_id, cap, &ready,
+			                                                    &info, &bytes);
+			reply.ready = ready;
+			reply.frame_id = info.frame_id;
+			reply.source_time = info.source_time;
+			reply.format = info.format;
+			reply.byte_count = info.byte_count;
+			if (reply.result == XRT_SUCCESS && info.byte_count > IPC_LIFT_BLOB_MAX_BYTES) {
+				// Too big for one reply: report it, deliver nothing.
+				reply.result = XRT_ERROR_ALLOCATION;
+				free(bytes);
+				bytes = NULL;
+			}
+		}
+	}
+#else
+	(void)stream_id;
+	(void)capacity;
+	if (reply.result == XRT_SUCCESS) {
+		reply.result = XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+#endif
+
+	xrt_result_t xret = ipc_send(imc, &reply, sizeof(reply));
+	if (xret == XRT_SUCCESS && reply.result == XRT_SUCCESS && bytes != NULL && reply.byte_count > 0) {
+		xret = ipc_send(imc, bytes, (size_t)reply.byte_count);
+	}
+	if (xret != XRT_SUCCESS) {
+		IPC_ERROR(ics->server, "lift_acquire_blob: failed to send the reply");
+	}
+	free(bytes);
+	return xret;
+}
+
+xrt_result_t
+ipc_handle_lift_weave_rects(volatile struct ipc_client_state *ics, const struct ipc_arg_lift_weave_rects *args)
+{
+	IPC_TRACE_MARKER();
+	xrt_result_t auth = require_present_owner(ics, "lift_weave_rects");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (ics->xc == NULL) {
+		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
+	}
+	if (args->count > IPC_LIFT_WEAVE_RECTS_MAX) {
+		return XRT_ERROR_IPC_FAILURE; // untrusted wire
+	}
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	struct xrt_lift_weave_rect rects[IPC_LIFT_WEAVE_RECTS_MAX];
+	for (uint32_t i = 0; i < args->count; i++) {
+		const struct ipc_lift_weave_rect *w = &args->rects[i];
+		U_ZERO(&rects[i]);
+		rects[i].stream_id = w->stream_id;
+		rects[i].rect_index = w->rect_index;
+		rects[i].has_params = w->has_params != 0;
+		rects[i].params.struct_size = (uint32_t)sizeof(rects[i].params);
+		rects[i].params.convergence = w->convergence;
+		rects[i].params.strength = w->strength;
+		rects[i].params.inpaint = w->inpaint;
+		rects[i].params.view_count = w->view_count > IPC_LIFT_MAX_VIEWS ? IPC_LIFT_MAX_VIEWS : w->view_count;
+	}
+	if (!comp_d3d11_service_lift_set_weave_rects(ics->xc, lift_owner(ics), args->count, rects)) {
+		// A rect naming a stream this connection does not own (or a non-SBS/NVIEW
+		// one): refused, non-fatal. The submit then weaves those rects as drawn.
+		return XRT_ERROR_WEAVE_REFUSED;
+	}
+	return XRT_SUCCESS;
+#else
+	return args->count == 0 ? XRT_SUCCESS : XRT_ERROR_FEATURE_NOT_SUPPORTED;
+#endif
+}

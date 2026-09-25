@@ -205,6 +205,15 @@ struct ipc_client_state
 	int weave_deferred_close_fds[4];
 	uint32_t weave_deferred_close_count;
 #endif
+
+	/*!
+	 * XR_DXR_lift (ADR-042): this connection's lift-stream owner token, taken
+	 * from a process-wide counter on first lift use (0 = never used lift). A
+	 * token, not the ics pointer: the thread slot is reused by later
+	 * connections, and a stale stream must never resolve for them. Released —
+	 * every stream it owns destroyed — at client teardown.
+	 */
+	uint64_t lift_owner;
 };
 
 enum ipc_thread_state
@@ -577,6 +586,13 @@ ipc_server_client_destroy_session_and_compositor(volatile struct ipc_client_stat
 void
 ipc_server_client_weave_flush_deferred_fds(volatile struct ipc_client_state *ics);
 #endif
+
+/*!
+ * XR_DXR_lift (ADR-042): destroy every lift stream this client created. Called
+ * once at client teardown; a no-op for a client that never used lift.
+ */
+void
+ipc_server_client_lift_release(volatile struct ipc_client_state *ics);
 
 /*!
  * @defgroup ipc_server_internals Server Internals

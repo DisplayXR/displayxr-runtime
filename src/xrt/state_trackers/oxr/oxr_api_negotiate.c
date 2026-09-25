@@ -516,6 +516,14 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 	ENTRY_IF_EXT(xrWeaveSetScreenFlatRegionsDXR, DXR_weave);
 	ENTRY_IF_EXT(xrWeaveExportIpcConnectionDXR, DXR_weave);
 #endif
+#ifdef OXR_HAVE_DXR_lift
+	ENTRY_IF_EXT(xrGetLiftPropertiesDXR, DXR_lift);
+	ENTRY_IF_EXT(xrCreateLiftStreamDXR, DXR_lift);
+	ENTRY_IF_EXT(xrDestroyLiftStreamDXR, DXR_lift);
+	ENTRY_IF_EXT(xrSubmitLiftFrameDXR, DXR_lift);
+	ENTRY_IF_EXT(xrAcquireLiftResultDXR, DXR_lift);
+	ENTRY_IF_EXT(xrAcquireLiftBlobDXR, DXR_lift);
+#endif
 
 #ifdef OXR_HAVE_DXR_workspace_file_dialog
 	ENTRY_IF_EXT(xrRequestFilePickerDXR, DXR_workspace_file_dialog);
