@@ -133,15 +133,16 @@ count_code_lines_with(const std::string &src, const std::string &needle)
 }
 
 //! Every native compositor that composes layers into an atlas the display
-//! processor consumes, relative to the compositor source root. Metal and
-//! vk_native are deliberately absent: their #1589 legs are still open, and a
-//! test that fails for a known-open leg is noise, not a guard. Add a backend
-//! here the moment it grows a compose target.
+//! processor consumes, relative to the compositor source root. Metal is
+//! deliberately absent: its #1589 leg is still open, and a test that fails for
+//! a known-open leg is noise, not a guard. Add a backend here the moment it
+//! grows a compose target.
 const char *const kColorBackends[] = {
     "d3d11/comp_d3d11_renderer.cpp",
     "d3d11_service/comp_d3d11_service.cpp",
     "d3d12/comp_d3d12_renderer.cpp",
     "gl/comp_gl_compositor.cpp",
+    "vk_native/comp_vk_native_renderer.c",
 };
 
 /*!
@@ -166,6 +167,15 @@ const char *const kZeroCopyOwners[] = {
     "d3d12/comp_d3d12_compositor.cpp",
     "d3d11_service/comp_d3d11_service.cpp",
     "gl/comp_gl_compositor.cpp",
+    "vk_native/comp_vk_native_compositor.c",
+};
+
+//! vk_native's compose shaders live beside the renderer as GLSL compiled to
+//! SPIR-V at build time, so the no-OETF pin has to read them too.
+const char *const kVkComposeShaders[] = {
+    "vk_native/shaders/zone_blit.vert",
+    "vk_native/shaders/zone_blit.frag",
+    "vk_native/shaders/zone_blit_array.frag",
 };
 
 } // namespace
@@ -377,4 +387,65 @@ TEST_CASE("colour: the GL leg spells the same model in GL (#1589/#1610)")
 	                                                         "gl_bind_layer_source(). Another is a read that "
 	                                                         "decided its own colour space.");
 	CHECK(direct_skip == 1);
+}
+
+TEST_CASE("colour: the vk_native leg spells the same model in Vulkan (#1589/#1610)")
+{
+	/*
+	 * The same three facts as the D3D and GL legs, in Vulkan's spelling:
+	 *
+	 *   - the encode is the ATTACHMENT: the private compose target is
+	 *     attached through an `_SRGB` view of a MUTABLE_FORMAT image, and the
+	 *     escape hatch flips that one view format;
+	 *   - "does this sample decode?" is the VIEW the draw binds, so the
+	 *     honest (true-format) view must be picked in exactly one place;
+	 *   - the publish is vkCmdCopyImage between identically formatted images.
+	 *     This file legitimately calls vkCmdBlitImage elsewhere (the fast path
+	 *     and the DP crop), so "the publish is a copy" is asked of the compose
+	 *     pass's BODY, not of the file.
+	 */
+	const std::string path = std::string(DXR_COMP_SRC_DIR) + "/vk_native/comp_vk_native_renderer.c";
+	const std::string src = read_whole_file(path);
+
+	const std::string view_format = function_body(src, "zone_compose_view_format");
+	INFO("zone_compose_view_format() must exist — the attachment format is the encode, and it "
+	     "must be chosen in one place");
+	REQUIRE_FALSE(view_format.empty());
+	INFO("...and must attach through an _SRGB format (the encode on write) unless the shared "
+	     "escape hatch says otherwise");
+	CHECK(view_format.find("VK_FORMAT_B8G8R8A8_SRGB") != std::string::npos);
+	CHECK(view_format.find("u_color_legacy_unorm_encoded(") != std::string::npos);
+
+	INFO("the private compose target must be MUTABLE_FORMAT — an _SRGB view over a UNORM image "
+	     "is only legal with it");
+	CHECK(contains_in_code(src, "VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT"));
+
+	const std::string pass = function_body(src, "draw_zones_pass");
+	INFO("draw_zones_pass() must exist — it is the compose pass and owns the publish");
+	REQUIRE_FALSE(pass.empty());
+
+	INFO("...and must publish its composite with vkCmdCopyImage: identical formats, raw bytes");
+	CHECK(contains_in_code(pass, "vkCmdCopyImage("));
+
+	INFO("...and must never publish with vkCmdBlitImage, which converts between the sRGB and "
+	     "UNORM interpretations and applies the encode a second time");
+	CHECK_FALSE(contains_in_code(pass, "vkCmdBlitImage("));
+
+	// The Vulkan analogue of the D3D12 direct-call count: the true-format
+	// view IS the decoding read, so it is bound in exactly one code line.
+	const size_t true_view = count_code_lines_with(src, "comp_vk_native_swapchain_get_true_image_view(");
+	INFO("the vk_native renderer picks the true-format source view on "
+	     << true_view
+	     << " code line(s), expected 1 — the compose pass's single source-view choice. Another "
+	        "is a draw that decided its own colour space.");
+	CHECK(true_view == 1);
+
+	for (const char *rel : kVkComposeShaders) {
+		const std::string shader = read_whole_file(std::string(DXR_COMP_SRC_DIR) + "/" + rel);
+		for (const char *magic : {"1.055", "0.055", "0.0031308", "2.4)", "1.0 / 2.4", "1.0/2.4"}) {
+			INFO(rel << " contains the sRGB OETF constant \"" << magic
+			         << "\" — the `_SRGB` attachment applies that curve on write (ADR-021 §2)");
+			CHECK(shader.find(magic) == std::string::npos);
+		}
+	}
 }
