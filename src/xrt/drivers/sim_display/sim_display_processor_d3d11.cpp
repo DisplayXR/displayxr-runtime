@@ -15,6 +15,7 @@
 #include "sim_display_interface.h"
 #include "sim_display_zone_common.h"
 #include "sim_display_scanout_common.h"
+#include "sim_display_lift_d3d11.h"
 
 #include "xrt/xrt_display_processor_d3d11.h"
 #include "xrt/xrt_display_metrics.h"
@@ -241,6 +242,10 @@ struct sim_display_processor_d3d11_impl
 	ID3D11ShaderResourceView *wish_copy_srv;
 	uint32_t wish_copy_w, wish_copy_h;
 	bool wish_active; //!< wish_copy holds a live (not cleared) publish.
+
+	//! ADR-042: the FAKE lift module, only when SIM_DISPLAY_FAKE_LIFT=1 (else
+	//! NULL and the five lift slots stay NULL — sim_display ships no module).
+	struct sim_fake_lift *fake_lift;
 };
 
 static inline struct sim_display_processor_d3d11_impl *
@@ -447,6 +452,8 @@ sim_dp_d3d11_destroy(struct xrt_display_processor_d3d11 *xdp)
 	if (sdp->wish_copy != nullptr) {
 		sdp->wish_copy->Release();
 	}
+	sim_fake_lift_destroy(sdp->fake_lift);
+	sdp->fake_lift = nullptr;
 
 	free(sdp);
 }
@@ -763,6 +770,71 @@ sim_dp_d3d11_get_scanout_caps(struct xrt_display_processor_d3d11 *xdp, struct xr
 }
 
 
+/*
+ *
+ * ADR-042 lift slots — installed only with SIM_DISPLAY_FAKE_LIFT=1.
+ *
+ */
+
+static bool
+sim_dp_d3d11_lift_get_caps(struct xrt_display_processor_d3d11 *xdp, struct xrt_dp_lift_caps *out)
+{
+	return sim_fake_lift_get_caps(sim_dp_d3d11(xdp)->fake_lift, out);
+}
+
+static bool
+sim_dp_d3d11_lift_stream_create(struct xrt_display_processor_d3d11 *xdp,
+                                const struct xrt_dp_lift_stream_info *info,
+                                uint64_t *out_id)
+{
+	return sim_fake_lift_stream_create(sim_dp_d3d11(xdp)->fake_lift, info, out_id);
+}
+
+static void
+sim_dp_d3d11_lift_stream_destroy(struct xrt_display_processor_d3d11 *xdp, uint64_t id)
+{
+	sim_fake_lift_stream_destroy(sim_dp_d3d11(xdp)->fake_lift, id);
+}
+
+static bool
+sim_dp_d3d11_lift_convert(struct xrt_display_processor_d3d11 *xdp,
+                          uint64_t id,
+                          void *d3d11_context,
+                          void *input_resource,
+                          uint32_t w,
+                          uint32_t h,
+                          const struct xrt_dp_lift_params *p,
+                          const float *viewpoints_xyz,
+                          uint32_t viewpoint_floats,
+                          void **out_resource,
+                          uint32_t *out_w,
+                          uint32_t *out_h,
+                          uint32_t *out_format)
+{
+	// The fake synthesizes a constant parallax; it has no use for viewpoints.
+	(void)viewpoints_xyz;
+	(void)viewpoint_floats;
+	return sim_fake_lift_convert(sim_dp_d3d11(xdp)->fake_lift, id, d3d11_context, input_resource, w, h, p,
+	                             out_resource, out_w, out_h, out_format);
+}
+
+static bool
+sim_dp_d3d11_lift_convert_blob(struct xrt_display_processor_d3d11 *xdp,
+                               uint64_t id,
+                               void *d3d11_context,
+                               void *input_resource,
+                               uint32_t w,
+                               uint32_t h,
+                               const struct xrt_dp_lift_params *p,
+                               uint32_t *out_format,
+                               const void **out_bytes,
+                               size_t *out_size)
+{
+	(void)p;
+	return sim_fake_lift_convert_blob(sim_dp_d3d11(xdp)->fake_lift, id, d3d11_context, input_resource, w, h,
+	                                  out_format, out_bytes, out_size);
+}
+
 extern "C" xrt_result_t
 sim_display_processor_d3d11_create(enum sim_display_output_mode mode,
                                    void *d3d11_device,
@@ -885,6 +957,19 @@ sim_display_processor_d3d11_create(enum sim_display_output_mode mode,
 		U_LOG_E("sim_display D3D11: failed to create tile constant buffer");
 		sim_dp_d3d11_destroy(&sdp->base);
 		return XRT_ERROR_VULKAN;
+	}
+
+	// ADR-042: the FAKE lift module, env-gated. Without it every lift slot stays
+	// NULL (calloc) and the runtime reports XR_DXR_lift supportedModes = 0.
+	if (sim_fake_lift_enabled()) {
+		sdp->fake_lift = sim_fake_lift_create(d3d11_device);
+		if (sdp->fake_lift != nullptr) {
+			sdp->base.lift_get_caps = sim_dp_d3d11_lift_get_caps;
+			sdp->base.lift_stream_create = sim_dp_d3d11_lift_stream_create;
+			sdp->base.lift_stream_destroy = sim_dp_d3d11_lift_stream_destroy;
+			sdp->base.lift_convert = sim_dp_d3d11_lift_convert;
+			sdp->base.lift_convert_blob = sim_dp_d3d11_lift_convert_blob;
+		}
 	}
 
 	// Set the initial output mode (atomic global read by process_atlas each frame)

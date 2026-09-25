@@ -784,7 +784,41 @@ struct xrt_plugin_iface
 	 * Set to `(uint32_t)offsetof(struct vk_bundle, vkGetInstanceProcAddr)`.
 	 */
 	uint32_t vk_bundle_fn_table_offset;
+
+	/*!
+	 * Create a D3D11 display processor that serves ONLY the 2D→3D lift slots
+	 * (ADR-042, XR_DXR_lift) — the explicit "lift-only" factory.
+	 *
+	 * The runtime's D3D11 service creates exactly one lift DP per process, on
+	 * a dedicated device on the service adapter (@p d3d11_context has
+	 * ID3D11Multithread protection on), from its lift thread, and never asks
+	 * it to weave: no process_atlas, no window (@p window_handle is always
+	 * NULL), no mode requests. So the DP returned here must build NO weaver
+	 * and open NO tracker session — only what its conversion module needs —
+	 * and must fill the lift_* slots of @ref xrt_display_processor_d3d11
+	 * (XRT_DP_D3D11_HAS_LIFT). Same signature as @ref create_dp_d3d11.
+	 *
+	 * Why a separate factory rather than reusing the weaving DP: a conversion
+	 * blocks for tens of ms (seconds for GAUSSIANS), and the weaving DP is
+	 * driven on the service's one shared immediate context under the render
+	 * lock and is recreated on presenter / focus changes. Running lift on it
+	 * would stall every weave for the length of a conversion.
+	 *
+	 * Optional. NULL (or a plug-in whose `struct_size` predates this field) ⟹
+	 * the runtime falls back to @ref create_dp_d3d11 with a NULL window and, if
+	 * that DP carries no lift slots, destroys it at once. Appended per ADR-020
+	 * (append-only within a major; gated by @ref struct_size; no
+	 * XRT_PLUGIN_API_VERSION_CURRENT bump).
+	 */
+	xrt_dp_factory_d3d11_fn_t create_dp_d3d11_lift;
 };
+
+/*!
+ * Defined when @ref xrt_plugin_iface carries @ref
+ * xrt_plugin_iface::create_dp_d3d11_lift (ADR-042), so a plug-in built against
+ * an older runtime header can #ifdef-guard filling it.
+ */
+#define XRT_PLUGIN_IFACE_HAS_D3D11_LIFT_FACTORY 1
 
 
 /*

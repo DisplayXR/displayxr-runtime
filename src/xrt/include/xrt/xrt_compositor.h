@@ -3023,6 +3023,13 @@ struct xrt_system_compositor_info
 	//! Signature: xrt_dp_factory_gl_fn_t (see xrt_display_processor_gl.h).
 	void *dp_factory_gl;
 
+	//! ADR-042: the plug-in's LIFT-ONLY D3D11 display processor factory
+	//! (xrt_plugin_iface::create_dp_d3d11_lift) — a DP that serves only the
+	//! lift slots and builds no weaver. NULL = the plug-in has none; the D3D11
+	//! service then falls back to dp_factory_d3d11 with a NULL window.
+	//! Signature: xrt_dp_factory_d3d11_fn_t.
+	void *dp_factory_d3d11_lift;
+
 	/*!
 	 * Optional callback: re-derive the dp_factory_* pointers above from the
 	 * runtime's plug-in loader, and re-pull the plug-in's display info

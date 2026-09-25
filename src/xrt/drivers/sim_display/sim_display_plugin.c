@@ -254,6 +254,17 @@ static struct xrt_plugin_iface g_sim_display_iface = {
     .set_pose_source = sim_display_plugin_set_pose_source,
 
     .probe_displays = sim_display_plugin_probe_displays,
+
+    /*
+     * ADR-042 lift-only D3D11 DP. sim_display builds no weaver or tracker for
+     * any DP, so its ordinary factory is already "lift-only"-cheap; the lift
+     * slots are filled only under SIM_DISPLAY_FAKE_LIFT=1.
+     */
+#if defined(_WIN32)
+    .create_dp_d3d11_lift = sim_display_dp_factory_d3d11,
+#else
+    .create_dp_d3d11_lift = NULL,
+#endif
 };
 
 
