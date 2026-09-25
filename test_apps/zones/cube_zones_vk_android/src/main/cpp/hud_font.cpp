@@ -110,8 +110,20 @@ read_file(const char *path, long *out_size)
 
 bool
 hud_font_init(HudFont &f, VkPhysicalDevice phys, VkDevice device, VkQueue queue,
-              uint32_t queue_family, VkRenderPass rp, float pixel_height)
+              uint32_t queue_family, VkRenderPass rp, float pixel_height,
+              bool scene_linear)
 {
+	// ADR-021 / INV-4.6: `layout(constant_id = 0) const bool uLinearize` in the
+	// fragment shaders. The host decides it once (g_scene_linear in main.cpp, from
+	// the colour swapchain's format) and every pipeline bakes the same value.
+	const VkBool32 spec_linearize = scene_linear ? VK_TRUE : VK_FALSE;
+	const VkSpecializationMapEntry spec_entry = {0, 0, sizeof(VkBool32)};
+	VkSpecializationInfo frag_spec = {};
+	frag_spec.mapEntryCount = 1;
+	frag_spec.pMapEntries = &spec_entry;
+	frag_spec.dataSize = sizeof(spec_linearize);
+	frag_spec.pData = &spec_linearize;
+
 	f.device = device;
 	f.pixel_height = pixel_height;
 	f.atlas_w = 512;
@@ -344,6 +356,7 @@ hud_font_init(HudFont &f, VkPhysicalDevice phys, VkDevice device, VkQueue queue,
 	stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
 	stages[1].module = frag;
 	stages[1].pName = "main";
+	stages[1].pSpecializationInfo = &frag_spec;
 
 	VkVertexInputBindingDescription bind = {0, sizeof(TextVtx), VK_VERTEX_INPUT_RATE_VERTEX};
 	VkVertexInputAttributeDescription attrs[2] = {};
@@ -462,6 +475,7 @@ hud_font_init(HudFont &f, VkPhysicalDevice phys, VkDevice device, VkQueue queue,
 		pst[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
 		pst[1].module = pf;
 		pst[1].pName = "main";
+		pst[1].pSpecializationInfo = &frag_spec;
 		VkVertexInputBindingDescription pbind = {0, sizeof(TextVtx), VK_VERTEX_INPUT_RATE_VERTEX};
 		VkVertexInputAttributeDescription pattrs[2] = {};
 		pattrs[0] = {0, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(TextVtx, pos)};

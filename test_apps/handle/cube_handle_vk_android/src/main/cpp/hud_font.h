@@ -65,8 +65,11 @@ struct HudFont {
 // raster size (≈48 is crisp for a HUD). Returns false (and leaves ready=false)
 // if the font can't be loaded or any resource fails — the caller falls back to
 // the legacy bitmap HUD.
+// `scene_linear` specializes the fragment shaders' `uLinearize` (ADR-021 /
+// INV-4.6) — the same decision the host's other pipelines bake.
 bool hud_font_init(HudFont &f, VkPhysicalDevice phys, VkDevice device, VkQueue queue,
-                   uint32_t queue_family, VkRenderPass rp, float pixel_height);
+                   uint32_t queue_family, VkRenderPass rp, float pixel_height,
+                   bool scene_linear);
 
 // Build textured quads for `text` (supports '\n') into the mapped vertex buffer.
 //   ox, oy      — top-left of the text block, in HUD NDC (pre-vflip).

@@ -21,6 +21,7 @@
 #include "xr_session.h"
 #include "xr_window_space_hud.h"
 #include "windowspace_layers.h"
+#include "vk_clear.h"
 
 #include <string>
 #include <vector>
@@ -264,9 +265,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                     b.image = img; b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
                     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                         0, 0, nullptr, 0, nullptr, 1, &b);
-                    VkClearColorValue clear = {};
-                    clear.float32[0] = wsl::kBgR / 255.0f; clear.float32[1] = wsl::kBgG / 255.0f;
-                    clear.float32[2] = wsl::kBgB / 255.0f; clear.float32[3] = wsl::kBgA / 255.0f;
+                    // ADR-021 / INV-4.6: the projection swapchain is `_SRGB` (common's
+                    // CreateSwapchain() default) and vkCmdClearColorImage takes its value
+                    // in the image's own space, so an `_SRGB` image encodes it. The
+                    // background is authored display-referred -- convert it by the
+                    // swapchain's format (the image is what encodes). Alpha is never
+                    // converted.
+                    const float bg[4] = {wsl::kBgR / 255.0f, wsl::kBgG / 255.0f,
+                                         wsl::kBgB / 255.0f, wsl::kBgA / 255.0f};
+                    const VkClearColorValue clear =
+                        dxr::VkDisplayReferredClearColor((VkFormat)xr.swapchain.format, bg);
                     VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
                     vkCmdClearColorImage(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1, &range);
                     // TRANSFER_DST -> COLOR_ATTACHMENT_OPTIMAL (final layout the compositor expects).
