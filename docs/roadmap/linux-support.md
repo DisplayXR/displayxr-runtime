@@ -549,6 +549,21 @@ with it:
 ./scripts/run_cts.sh -g vulkan --scope full --conformance-layer
 ```
 
+**The interactive categories now have a Linux harness too** (#1727):
+`run_cts.sh --interactive composition|scenario|actions` plus the X11 driver
+`scripts/cts_drive.py` (focus-free XSendEvent input, window and atlas capture,
+the gradient/alpha/diff oracles, a one-click-one-case check, the unattended
+actions responder). Its first real-GPU run was 2026-09-25: Intel iGPU, GNOME 50
+Wayland session with the runtime's XCB window on Xwayland, dev tree built with
+`--qwerty`, `sim_display` 2d. Result: composition **16 / 0 / 11**, actions
+(`khr/simple_controller`) **14 / 0 / 11**, scenario **7 / 1 / 41**, the one
+failure being `InteractiveThrow`, which a keyboard rig cannot complete
+(rig-limited on every platform). That is the Windows d3d11 standing: 0
+runtime-attributable failures. Still not covered by a hardware run: the
+installed `.deb`/tarball runtime, direct scanout, a native-Wayland CTS window,
+and 22.04. Procedure and traps:
+`docs/reference/cts-interactive-procedure.md` § 12.
+
 Full detail, including exactly what is and is not ported from the Windows
 harness: `docs/roadmap/cts-windows-handoff.md` § *Linux arms*.
 

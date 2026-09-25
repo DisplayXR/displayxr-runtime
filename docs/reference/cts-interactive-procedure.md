@@ -26,7 +26,7 @@ end to end yet; when it is, record the outcome on #1523.
 
 ### 1.1 The box
 
-- **Windows**, a real display, and a **non-elevated** shell. Elevation is not
+- **Windows**, a real display, and a **non-elevated** shell. (Linux: §12.) Elevation is not
   merely unnecessary — the bundled Khronos loader ignores `XR_RUNTIME_JSON` in
   an elevated process (CLAUDE.md § *Running without installing*), and these runs
   need you to be sure which runtime answered.
@@ -445,7 +445,7 @@ There is no way to skip a test from inside the CTS. Judge it.
 > Counts and names below are from the pinned tag **`openxr-cts-1.1.63.0`**.
 > Re-derive them if the pin moves.
 
-> ### ⚠ This category is runnable on `d3d11`, `d3d12` and `opengl` (2026-09-23)
+> ### ⚠ This category is runnable on `d3d11`, `d3d12`, `opengl` (2026-09-23) and Linux `vulkan` (2026-09-25)
 >
 > **#1581 — quad layers are accepted but never rendered on Vulkan and
 > Vulkan2** on `main`. Those renderers filter to projection / projection-depth
@@ -459,9 +459,17 @@ There is no way to skip a test from inside the CTS. Judge it.
 > QuadOcclusion, the gradients (13/13), SourceAlphaBlending and the
 > environment-blend pair. Equirect2 is drawn on `vk_native` since the equirect2
 > port (shared camera, sub-rect blend, `discard` outside the section, a
-> lavapipe pixel test); `Subimage` / `MinLayers` have not yet been judged on
-> Vulkan. A run that
-> produces no visible prompt is a harness gap, not a result.
+> lavapipe pixel test). A run that produces no visible prompt is a harness gap,
+> not a result.
+>
+> **Linux `vulkan`** (`vk_native` on an XWayland window, real Intel GPU,
+> `sim_display` 2d, 2026-09-25, §12) matches d3d11 case for case: **16 pass /
+> 0 fail / 11 skip**. The pass list: gradients 13/13 (`match` ≤ 0.65, mid 129–131
+> on both bars), SourceAlphaBlending (columns equal within 4 after a one-row
+> sub-pixel offset), SAB-env 254/155 ×2, QuadOcclusion ×2, QuadProjectionQuad,
+> ProjectionQuadProjection, QuadPoses, EyeVisibility, Subimage, the three
+> projection-swapchain cases, MinLayers 16/16/8+8, QuadHands (culling checked
+> by turning a hand 174°), StaleSwapchain and equirect2 6/6. The same 11 skip.
 >
 > **`d3d11`** is the reference lane: 0 runtime-attributable failures on `main`
 > since #1606 (gradients 11/11, SourceAlphaBlending, the environment-blend
@@ -606,12 +614,26 @@ iterating formats. The format under test is printed on screen.
 
 ## 7. `[scenario][interactive]` — the core set
 
-**49 tests carry `[scenario][interactive]`** at the pin, and **41 of them are
-gated on extensions this runtime does not advertise** — eye gaze, hand tracking,
-plane detection, spatial anchors/markers/persistence, render models,
-`XR_FB_hand_tracking_mesh`, `XR_MSFT_controller_model`,
-`XR_EXT_view_configuration_views_change`, `XR_EXT_haptic_parametric`,
-`XR_EXT_dpad_binding`. They skip.
+**49 tests carry `[scenario][interactive]`** at the pin, and **41 of them skip**
+on this runtime: they are gated on extensions it does not advertise (eye gaze,
+hand tracking, plane detection, spatial anchors/markers/persistence, render
+models, `XR_FB_hand_tracking_mesh`, `XR_MSFT_controller_model`,
+`XR_EXT_haptic_parametric`, `XR_EXT_dpad_binding`), or they are 1.0-only
+variants below `--minApiVersion 1.1` (`XR_EXT_local_floor-local`/`-stage`,
+`XR_EXT_palm_pose`, `GripSurface-XR_KHR_maintenance1`). Measured on the Linux
+`vulkan` lane, 2026-09-25: 49 = 7 pass + 1 fail (`InteractiveThrow`, §10.8) +
+41 skip.
+
+`XR_EXT_view_configuration_views_change` **is** advertised (#1488), so its test
+runs, and older notes that list it as a skip are wrong. It has two sections with a
+**30 s** budget each. *Manual Viewport Change* asks you to "make runtime change
+recommended viewport size" and ends on **Select**; a timeout is a FAIL. On a CTS
+(legacy) session nothing you can do changes the recommended size. The compromise
+size is fixed, `oxr_views_change_size_from_window()` returns early for
+`legacy_app_tile_scaling`, and on `sim_display` V is a thumbstick click, not
+the 2D/3D toggle, because the qwerty HMD is not the head. So no
+`XrEventDataViewConfigurationViewsChangedEXT` appears, which is spec-legal:
+press Select inside the 30 s. *Simulate Varying Performance* needs no input.
 
 The usage guide asks for **one** scenario run, on **one** graphics API, not one
 per API: *"a conformance submission only requires a report showing an overall
@@ -625,16 +647,30 @@ pass on a single API."* Do it on `d3d11`.
 | `HapticInterrupt` | **Core, no guard at all.** | Haptics you cannot feel — see §7.3. |
 | `InteractiveThrow` | Core + tracking. | Move a controller and release; judge the reported motion. Needs the reported velocity — **§10.8**. |
 | `SpaceOffsets` | Core + tracking. | **Auto-passes on velocity, not on looks** — drive all six axes per **§10.8**. Menu is FAIL. |
-| `local_floor-local` | `FeatureSet{XR_VERSION_1_1}` — satisfied because `run_cts.ps1` passes `--minApiVersion 1.1`. | Confirm the local-floor space behaves as described. |
-| `XR_EXT_local_floor-local` | `FeatureSet{XR_VERSION_1_0, XR_EXT_local_floor}` — `XRT_FEATURE_OPENXR_SPACE_LOCAL_FLOOR` is **ON**. | As above, through the extension rather than 1.1 core. |
+| `local_floor-local` | `FeatureSet{XR_VERSION_1_1}` — satisfied because `run_cts.ps1` passes `--minApiVersion 1.1`. | Confirm the local-floor space behaves as described. See the note below the table. |
+| `XR_EXT_local_floor-local` | `FeatureSet{XR_VERSION_1_0, XR_EXT_local_floor}`. **Skips** under `--minApiVersion 1.1` ("Required version for test is below CLI-specified minApiVersion"). | — |
 
-That is the **six** to plan for.
+That is the **six** to plan for (five run at `--minApiVersion 1.1`), plus
+`local_floor-stage`, `GripSurface` and `XR_EXT_view_configuration_views_change`
+from §7.2 and above.
+
+> **What the local-floor slab looks like on `sim_display`.** The CTS draws a
+> 0.5 × 0.01 × 0.5 m green slab at LOCAL_FLOOR and a 0.2 m cube at LOCAL, from
+> views located in LOCAL. On this rig the eye sits at the LOCAL origin (view in
+> LOCAL ≈ (0, +0.12, 0)), and the cube surrounds the camera, so it is not seen.
+> LOCAL_FLOOR is the per-app space at root y = 0, with no stage offset
+> (`u_space_overseer.c`, the per-app local-floor branch). `sim_display`'s root
+> is display-anchored, so the "floor" renders about 0.12 m below the eye, as a
+> large green plane under the horizon, not at a physical floor. A desktop rig
+> has no physical floor to judge against. Both the d3d11 and the Linux
+> `vulkan` lanes record the test PASS, and the geometry is state-tracker code,
+> identical on every graphics API.
 
 ### 7.2 Four more that may or may not run — check, don't assume
 
 | Test | The open question |
 |---|---|
-| `local_floor-stage`, `XR_EXT_local_floor-stage` | Both additionally need `XR_REFERENCE_SPACE_TYPE_STAGE`, which this runtime enumerates only when the device supplies a **stage** semantic space (`oxr_system.c:461-463`). The sim display almost certainly does not, in which case the tests skip themselves with `"XR_REFERENCE_SPACE_TYPE_STAGE not supported"`. That skip is fine; record it. |
+| `local_floor-stage`, `XR_EXT_local_floor-stage` | Both additionally need `XR_REFERENCE_SPACE_TYPE_STAGE`. **Measured (Linux `vulkan`, 2026-09-25): STAGE is enumerated and `local_floor-stage` runs.** The overseer always creates a stage space, a null space off root when the head supplies none. Its frame is identical to `local_floor-local` outside the title; judge it the same way. `XR_EXT_local_floor-stage` skips under `--minApiVersion 1.1`. |
 | `GripSurface`, `GripSurface-XR_KHR_maintenance1` | These want `…/input/grip_surface/pose`. `grip_surface` **is** present in `src/xrt/auxiliary/bindings/bindings.json` as a virtual profile extending all five controller profiles, and since #1633 the qwerty controllers also **supply** `XRT_INPUT_GENERIC_PALM_POSE` (derived from grip by `u_grip_surface_from_grip()`), so the action space is locatable. Before that they did not, and the binding resolved to nothing — which is what `GripSurface-objective` caught. **If one of these fails, that is a defect to file against the runtime, not a judgement call.** Do not mark it FAIL-by-inspection; capture the output and open an issue. |
 
 Note that `XR_EXT_palm_pose` itself is **OFF**
@@ -1224,6 +1260,9 @@ listed here as **valid**; anything else is practice.
 | Date | Category | Graphics | DP / mode | Result | Status |
 |---|---|---|---|---|---|
 | 2026-09-19 | composition | `d3d11` | sim-display, `SIM_DISPLAY_OUTPUT=2d` | `interactive_composition_d3d11.xml` — 16 pass / 11 skip / 0 fail | **VOID — do not submit, must be redone** |
+| 2026-09-25 | composition | Linux `vulkan` | sim-display, `2d`, 100° rig | `interactive_composition_vulkan.xml` — 16 pass / 0 fail / 11 skip | practice (dev tree; §12) |
+| 2026-09-25 | scenario | Linux `vulkan` | sim-display, `2d` | `interactive_scenario_vulkan.xml` — 7 pass / 1 fail (`InteractiveThrow`, rig-limited §10.8) / 41 skip | practice (dev tree; §12) |
+| 2026-09-25 | actions `khr/simple_controller` | Linux `vulkan` | sim-display, `2d` | `interactive_actions_vulkan_khr_simple_controller.xml` — 14 pass / 0 fail / 11 skip | practice (dev tree; §12) |
 
 **Why the 2026-09-19 `d3d11` composition run is void.** It was judged before the
 operator understood the controls (§4.4/§5.1: the doc then said a modifier was
@@ -1235,6 +1274,145 @@ console log and stdout log are kept as an artefact of the defect hunt only.
 
 Redo it once **#1580** and **#1581** land, on a `conformance_cli.exe` whose DPI
 manifest has been verified with `mt.exe` (§1.3), and add a new row.
+
+## 12. Linux (`vulkan`): the X11 harness
+
+The Linux lane is `vk_native` only. It runs the same three categories at the same
+pin with the same verdict rules (§6–§10). What differs is the platform layer. On
+Linux the categories are driven by `scripts/run_cts.sh --interactive` plus a
+second process, `scripts/cts_drive.py` (primitives in `scripts/cts_x11.py`):
+ctypes over libX11 + libXtst, with no xdotool, wmctrl or ImageMagick needed and
+no root. It is the port of the Windows driver (`run_cts.ps1 -Interactive`, the
+step/next/drive scripts, `capture_dpi_aware.ps1`, `bar_profile.ps1`,
+`sab_measure.py`, `eq_diff.py`, the DBWIN actions responder).
+
+### 12.1 Build
+
+```bash
+./scripts/build_linux.sh --qwerty      # qwerty is OFF by default; without it there is no select
+./scripts/fetch_build_cts.sh           # needs git-lfs: the CTS keeps its reference images in LFS
+```
+
+`run_cts.sh --interactive` refuses a tree without qwerty. `fetch_build_cts.sh`
+pulls the LFS objects. On a box without git-lfs it fails with the fix instead
+of letting the CTS configure die on a pointer file (no root needed: extract
+the `git-lfs` .deb with `apt-get download` + `dpkg -x` and put it on `PATH`).
+
+### 12.2 Launch a category
+
+```bash
+./scripts/run_cts.sh -g vulkan --interactive composition --conformance-layer --out-dir "$OUT"
+./scripts/run_cts.sh -g vulkan --interactive scenario --conformance-layer \
+    --interaction-profile khr/simple_controller --out-dir "$OUT"
+./scripts/run_cts.sh -g vulkan --interactive actions --conformance-layer \
+    --interaction-profile khr/simple_controller \
+    --extra-cli-args --nonDisconnectableDevices --out-dir "$OUT"
+```
+
+`--interactive` sets the spec (`[<category>][interactive]`), disables the
+timeout, uses the submission names (§9) and sets these defaults, each
+overridable from the environment and each printed:
+
+| Default | Why |
+|---|---|
+| `SIM_DISPLAY_OUTPUT=2d` | the sim default is anaglyph (§2.3) |
+| `DXR_LEGACY_CAMERA_RIG` = the 100° profile | the gradient prompt quad and the raised hands fall outside the 60° rig (§6, §10.6) |
+| `DXR_QTRACE=1` | the select-edge and pose trace the driver's checks read |
+| `TMPDIR=$OUT/<stem>_capture` | a private atlas-capture trigger dir, so no other DisplayXR app on the box consumes the trigger |
+| `stdbuf -oL` on `conformance_cli` | every prompt is printed as `Interaction message: …` on stdout; redirected to a file it would be fully buffered, and the actions responder would see a 20 s prompt after it expired |
+
+It writes `$OUT/<stem>.run`, which is the only argument the driver needs.
+`--autoSkipTimeout` in `--extra-cli-args` is refused (§8.2). The runtime log is
+the CTS's stderr (`<stem>_runtime.log`). Under QTRACE it grows by per-frame
+view traces, about 40 MB for a composition pass, so the driver reads it
+incrementally.
+
+### 12.3 Drive it
+
+```bash
+D="./scripts/cts_drive.py --run $OUT/interactive_composition_vulkan.run"
+$D shot grad01                  # <stem>_shots/NNN_grad01_win.png (+ _atlas.png)
+$D bar  <window png>            # gradient pair oracle
+$D select --case "GradientFormats pair 1" --verdict PASS --note "match 0.65"
+$D help qocc                    # hold Menu, capture the description + reference, release
+$D tally
+```
+
+- **Input route: XSendEvent by default (`--route send`).** Events go straight to
+  the CTS window. No focus is needed and nothing else on the desktop is
+  touched; the XCB pump masks the send-event bit, so they decode like real
+  input. **Do not use `--route xtest` under a GNOME Wayland session.** Mutter
+  starts Xwayland with `-enable-ei-portal`, which routes every XTEST request
+  through the RemoteDesktop portal. A consent dialog opens on the desktop and
+  takes focus, and the input is held until someone answers it. xdotool is XTEST
+  underneath and hits the same dialog. `xtest` is for a bare X server or an
+  Xorg session.
+- **Which window.** The runtime's window is titled `DisplayXR`. GNOME's frame
+  window (`WM_CLASS mutter-x11-frames`) copies the title, and the driver skips
+  it. **A new session's window routinely reuses the previous one's XID**, so
+  the XID is never a case boundary. The driver counts sessions by the
+  `VK compose: draw path ready` WARN, one per `vk_native` session.
+- **One click, one case (#1700).** `select` and `fail` count the QTRACE select
+  edges (`XCB LMB DOWN edge`, `TRIGGER PRESS`) around the click and print
+  `ANOMALY` (exit 3, verdict not recorded) unless exactly one press edge
+  landed. The 2026-09-25 run shows `+1 / +1` on every one of its ~60 selects.
+  Within a session (MinLayers instruction screens) the window is legitimately
+  `UNCHANGED`.
+- **Capture.** `shot` takes the window by `XGetImage`: exactly what the runtime
+  presented, prompt quads included. On this GNOME 50 box at 166.67 % scale,
+  Xwayland runs at native pixel scale, so a 1920 × 1080 window captures
+  1920 × 1080 with no resampling. `shot` also fires the runtime's own atlas
+  capture through the per-exe trigger
+  (`$TMPDIR/displayxr_atlas_trigger.conformance_cli`), which gives the
+  pre-DP atlas (1 view in `2d`).
+- **Oracles.** `bar` finds the two gradient bands, profiles their centre rows,
+  and prints the mean/max difference, mid value and deviation from a straight
+  line in encoded values; the pass rule is mean ≤ 2 with the shape judged by
+  eye. `sab` gives per-column samples plus a red census. `diff` compares two
+  frames (equirect 5 vs 6, subcase vs subcase). `probe X,Y …` samples pixels
+  over time (StaleSwapchain: 24 samples over 6 s).
+- **Recipes.** `raise-hands` (§10.6); `space-offsets` (§10.8), which checks
+  before every step that the session is still the one it started on. The test
+  ends the instant the last criterion latches, and without that check the
+  recipe's tail lands in the next test's window under the reused XID.
+  `keys ctrl+Left:1047` holds a chord for N ms.
+
+### 12.4 Per-category notes from the first Linux run
+
+- **composition.** Same controls as §5.1. MinLayers: `select` with no `--case`
+  dismisses each instruction screen, never `help` (Menu fails). MinLayers'
+  quads show 1-px red edges; the CTS paints a red ring *inside* each cell's
+  `imageRect`, so that is by construction. QuadHands: `raise-hands`, then
+  `keys ctrl+Left:1047` turns the left hand ~174° and its quad must be culled.
+- **scenario.** Menu is never Help here. `InteractiveThrow` binds Menu alone
+  to FAIL, so exit it with `keys n:150`, not `fail`: `fail` also clicks, and the
+  click lands in the next test. `HapticInterrupt` is judged from the
+  `Haptic output … duration=2000000000` lines (§7.3). views_change: press
+  Select within its 30 s (§7). Use a pre-written sequence for this category;
+  reading source between prompts costs the 30 s.
+- **actions.** `respond` is the unattended responder. It follows the live
+  `Interaction message:` lines and answers `Press`/`Release`/`Set <path>` on
+  the named hand (CTRL = left, ALT = right). It cycles select / menu /
+  select+menu for "Use all controller inputs" and the `Used N/M` prompts,
+  re-reading the hand every chord (the family moves from left to right). For
+  the haptic confirmation it clicks only after the runtime has logged a new
+  `Haptic output` line (§8.6). That prompt names the hand as "on Left Khronos
+  Simple Controller", not as a path. Everything else ("Turn on", "Keep …
+  trackable", "Place …", "Waiting …") is answered hands-off. Its log is
+  `<stem>_responder.log`. 2026-09-25: 21 prompts answered, 4 haptic
+  confirmations (3 s and short pulse on each hand).
+
+### 12.5 Warnings seen on the Linux run (submission-relevant, §9)
+
+- `Suspicious session state transition to XR_SESSION_STATE_SYNCHRONIZED when
+  no frame(s) have been submitted` once per session (34 in composition). This
+  is the §1.5 warning; it still fires although #1580 is closed.
+- `xrSyncActions: XR_SUCCESS returned when session state is
+  XR_SESSION_STATE_READY` ×2 in `xrSyncActions / No Focus`. The runtime answers
+  from its internal state (`oxr_session_success_focused_result()`), which has
+  already reached FOCUSED before the app polled the state-change event; the
+  layer judges by the app-visible state. This is state-tracker behaviour,
+  not Vulkan-specific. Untracked as of this run.
 
 ---
 

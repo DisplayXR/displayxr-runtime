@@ -9,6 +9,9 @@
 #   ./scripts/run_cts.sh -g vulkan2 --scope smoke --xvfb --software \
 #       --quarantine-list scripts/cts_quarantine_software_tier.txt
 #   ./scripts/run_cts.sh -g vulkan --scope full            # real-GPU box, real X session
+#   ./scripts/run_cts.sh -g vulkan --interactive composition --conformance-layer
+#   ./scripts/run_cts.sh -g vulkan --interactive actions --conformance-layer \
+#       --interaction-profile khr/simple_controller --extra-cli-args --nonDisconnectableDevices
 #
 # WHAT IS *NOT* PORTED, and why — the .ps1 is ~600 lines and most of them are
 # Windows-only ceremony:
@@ -21,13 +24,15 @@
 #     script sets is PROCESS env, so there is no machine state to restore and
 #     no finally block that can leave the box mis-pointed.
 #
-#   * No interactive categories. Those need an operator at a 3D panel; that
-#     procedure stays Windows-side (docs/reference/cts-interactive-procedure.md).
-#     The runtime half exists (#1727): the self-created XCB window feeds keys
-#     and mouse buttons into qwerty, so xdotool can drive a prompt — but only in
-#     a tree built with `./scripts/build_linux.sh --qwerty`. The default build
-#     has no qwerty, hence no controllers and no select action at all; the
-#     QWERTY line printed below says which tree this is.
+#   * The interactive categories are run by --interactive, but DRIVEN by a
+#     separate process: scripts/cts_drive.py (focus, key/click injection,
+#     capture, pixel oracles, per-case log). --interactive only sets the spec,
+#     the names, the environment and the no-timeout the procedure asks for.
+#     It needs a tree built with `./scripts/build_linux.sh --qwerty` — the
+#     default build has no qwerty, hence no controllers and no select action at
+#     all; the QWERTY line printed below says which tree this is, and
+#     --interactive refuses to start without it. Procedure, traps and the
+#     Linux harness: docs/reference/cts-interactive-procedure.md § 12.
 #
 # WHAT *IS* Linux-specific:
 #
@@ -74,8 +79,10 @@ XVFB_GEOMETRY="${XVFB_GEOMETRY:-1920x1080x24}"
 OUT_DIR="${TMPDIR:-/tmp}"
 BUILD_DIR="${BUILD_DIR:-$ROOT/build}"
 INTERACTION_PROFILE=""
+INTERACTIVE=""
+EXTRA_CLI_ARGS=""
 
-usage() { sed -n '2,45p' "$0"; }
+usage() { sed -n '2,60p' "$0"; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -88,6 +95,8 @@ while [ $# -gt 0 ]; do
     --timeout)            TIMEOUT_SEC="$2"; shift 2 ;;
     --quarantine-list)    QUARANTINE_LIST="$2"; shift 2 ;;
     --interaction-profile) INTERACTION_PROFILE="$2"; shift 2 ;;
+    --interactive)        INTERACTIVE="$2"; shift 2 ;;
+    --extra-cli-args)     EXTRA_CLI_ARGS="$2"; shift 2 ;;
     --out-dir)            OUT_DIR="$2"; shift 2 ;;
     --build-dir)          BUILD_DIR="$2"; shift 2 ;;
     --xvfb-geometry)      XVFB_GEOMETRY="$2"; shift 2 ;;
@@ -108,6 +117,30 @@ done
 # m_required matches, no m_forbidden matches); a COMMA starts a SECOND filter
 # and filters are OR'd — so an exclusion appended after a comma excludes
 # nothing. Append "~name" with NO comma.
+# --interactive <category>: same contract as run_cts.ps1 -Interactive — the spec
+# is "[<category>][interactive]", the timeout is OFF (a hand- or driver-paced run
+# killed partway leaves a truncated XML that still looks like a result file), and
+# the outputs are named for the submission package.
+if [ -n "$INTERACTIVE" ]; then
+  case "$INTERACTIVE" in
+    composition|scenario|actions) : ;;
+    *) echo "ERROR: --interactive must be composition, scenario or actions (got '$INTERACTIVE')" >&2; exit 2 ;;
+  esac
+  [ -n "$TEST_SPEC" ] || TEST_SPEC="[$INTERACTIVE][interactive]"
+  TIMEOUT_SEC=0
+  if [ -z "$TAG" ]; then
+    TAG="interactive_${INTERACTIVE}_${GRAPHICS}"
+    if [ "$INTERACTIVE" = "actions" ]; then
+      if [ -z "$INTERACTION_PROFILE" ]; then
+        echo "ERROR: --interactive actions requires --interaction-profile (one result file per profile)" >&2
+        exit 2
+      fi
+      slug="${INTERACTION_PROFILE#/interaction_profiles/}"
+      TAG="${TAG}_${slug//\//_}"
+    fi
+  fi
+fi
+
 if [ -z "$TEST_SPEC" ]; then
   case "${SCOPE:-full}" in
     smoke)
@@ -122,6 +155,9 @@ fi
 
 [ -n "$TAG" ] || TAG="${GRAPHICS}_${API_VERSION}"
 STEM="cts_$TAG"
+# Interactive runs keep the submission-package names (interactive_<cat>_<gfx>…),
+# automated runs the historical cts_<tag> stem — the two never collide.
+[ -n "$INTERACTIVE" ] && STEM="$TAG"
 XML="$OUT_DIR/$STEM.xml"
 CONSOLE="$OUT_DIR/${STEM}_console.log"
 STDOUT_LOG="$OUT_DIR/${STEM}_stdout.log"
@@ -393,6 +429,39 @@ export DXR_INPUT_PROVIDERS=0
 # No window manager under Xvfb (and none needed): see the header note.
 export DXR_WINDOW_FULLSCREEN="${DXR_WINDOW_FULLSCREEN:-0}"
 
+# ---- interactive-only environment ------------------------------------------
+# Every default below is a trap the Windows lane already paid for
+# (docs/reference/cts-interactive-procedure.md); each is overridable from the
+# caller's environment, and each is printed so the run record carries it.
+CAPTURE_DIR=""
+if [ -n "$INTERACTIVE" ]; then
+  # sim_display's default output is ANAGLYPH, which destroys every colour
+  # judgement (§2.3). 2d = the first view flat and full-window.
+  export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT:-2d}"
+  # The 100-degree legacy rig: under the default 60-degree one the gradient
+  # pairs' prompt quad falls outside the frustum (§6, §10.6).
+  export DXR_LEGACY_CAMERA_RIG="${DXR_LEGACY_CAMERA_RIG:-{\"horizontalFovDeg\":100,\"convergenceDiopters\":0\}}"
+  # [QTRACE] select-edge + pose trace: the one-click-one-case oracle (#1700)
+  # and the QuadHands raise oracle (§10.6).
+  export DXR_QTRACE="${DXR_QTRACE:-1}"
+  # A PRIVATE capture dir. The vk_native atlas capture resolves its trigger
+  # directory from the CTS process's $TMPDIR (u_capture_intent.h); a private
+  # one keeps this run's triggers away from any other DisplayXR app on the box.
+  CAPTURE_DIR="$OUT_DIR/${STEM}_capture"
+  rm -rf "$CAPTURE_DIR"
+  mkdir -p "$CAPTURE_DIR"
+  export TMPDIR="$CAPTURE_DIR"
+  QWERTY_STATE="$(sed -n 's/^XRT_BUILD_DRIVER_QWERTY:BOOL=//p' "$BUILD_DIR/CMakeCache.txt" 2>/dev/null)"
+  if [ "$QWERTY_STATE" != "ON" ]; then
+    echo "ERROR: --interactive needs a qwerty tree (XRT_BUILD_DRIVER_QWERTY=${QWERTY_STATE:-unknown} in $BUILD_DIR)." >&2
+    echo "       Rebuild with ./scripts/build_linux.sh --qwerty — without it there is no controller and no select." >&2
+    exit 1
+  fi
+  echo "INTERACTIVE: $INTERACTIVE  SIM_DISPLAY_OUTPUT=$SIM_DISPLAY_OUTPUT  DXR_QTRACE=$DXR_QTRACE"
+  echo "INTERACTIVE: DXR_LEGACY_CAMERA_RIG=$DXR_LEGACY_CAMERA_RIG"
+  echo "INTERACTIVE: capture dir (CTS TMPDIR) $CAPTURE_DIR"
+fi
+
 echo "RUNTIME:  XR_RUNTIME_JSON=$XR_RUNTIME_JSON"
 echo "PLUGINS:  XRT_PLUGIN_SEARCH_PATH=${XRT_PLUGIN_SEARCH_PATH:-(unset)} DXR_PLUGIN_EXCLUSIVE=${DXR_PLUGIN_EXCLUSIVE:-(unset)} DXR_INPUT_PROVIDERS=$DXR_INPUT_PROVIDERS"
 echo "DISPLAY:  $DISPLAY"
@@ -410,22 +479,58 @@ CLI_ARGS=("$TEST_SPEC" -G "$GRAPHICS" --minApiVersion "$API_VERSION"
 # injected into globalData AFTER Options is snapshotted, so the ctsxml
 # <cts:enabledInteractionProfiles> element comes out EMPTY.
 [ -n "$INTERACTION_PROFILE" ] && CLI_ARGS+=(-I "${INTERACTION_PROFILE#/interaction_profiles/}")
+# Extra conformance_cli flags, word-split on purpose (e.g. --nonDisconnectableDevices
+# for the actions category, §8.3). Never --autoSkipTimeout (§8.2).
+if [ -n "$EXTRA_CLI_ARGS" ]; then
+  case " $EXTRA_CLI_ARGS " in
+    *" --autoSkipTimeout "*) echo "ERROR: --autoSkipTimeout auto-advances interactive tests with a WARN — refused (procedure §8.2)" >&2; exit 2 ;;
+  esac
+  # shellcheck disable=SC2206
+  CLI_ARGS+=($EXTRA_CLI_ARGS)
+fi
 
 CTS_EXE_DIR="$(dirname "$CTS_EXE")"
 echo "RUN: conformance_cli ${CLI_ARGS[*]}"
 echo "CWD: $CTS_EXE_DIR"
 
+# The interactive driver (scripts/cts_drive.py) finds this run's files through
+# one small env file next to the outputs, rather than re-deriving the names.
+if [ -n "$INTERACTIVE" ]; then
+  RUNFILE="$OUT_DIR/${STEM}.run"
+  {
+    echo "STEM=$STEM"
+    echo "CATEGORY=$INTERACTIVE"
+    echo "GRAPHICS=$GRAPHICS"
+    echo "XML=$XML"
+    echo "CONSOLE=$CONSOLE"
+    echo "STDOUT_LOG=$STDOUT_LOG"
+    echo "RUNTIME_LOG=$RUNTIME_LOG"
+    echo "CAPTURE_DIR=$CAPTURE_DIR"
+    echo "DISPLAY=$DISPLAY"
+  } > "$RUNFILE"
+  echo "RUNFILE:  $RUNFILE  (pass to scripts/cts_drive.py --run)"
+fi
+
 # CWD must be the exe's own dir: the CTS loads its data assets (brdf_lut.png,
 # *.glb, ...) relative to the working directory (#830).
+#
+# Interactive: LINE-buffer the CTS's stdout. conformance_cli prints every prompt
+# ("Interaction message: ...") through std::cout, which a file redirect makes
+# fully buffered — the actions responder (cts_drive.py respond) would see each
+# prompt only after the 20 s it had to answer it had already run out.
+RUN_PREFIX=()
+if [ -n "$INTERACTIVE" ] && command -v stdbuf >/dev/null 2>&1; then
+  RUN_PREFIX=(stdbuf -oL -eL)
+fi
 RC=0
 if [ "$TIMEOUT_SEC" -gt 0 ] 2>/dev/null && command -v timeout >/dev/null 2>&1; then
   ( cd "$CTS_EXE_DIR" && timeout --signal=TERM --kill-after=30s "${TIMEOUT_SEC}s" \
-      "$CTS_EXE" "${CLI_ARGS[@]}" >"$STDOUT_LOG" 2>"$RUNTIME_LOG" ) || RC=$?
+      "${RUN_PREFIX[@]}" "$CTS_EXE" "${CLI_ARGS[@]}" >"$STDOUT_LOG" 2>"$RUNTIME_LOG" ) || RC=$?
   if [ "$RC" = "124" ] || [ "$RC" = "137" ]; then
     echo "TIMEOUT after ${TIMEOUT_SEC}s - killed."
   fi
 else
-  ( cd "$CTS_EXE_DIR" && "$CTS_EXE" "${CLI_ARGS[@]}" >"$STDOUT_LOG" 2>"$RUNTIME_LOG" ) || RC=$?
+  ( cd "$CTS_EXE_DIR" && "${RUN_PREFIX[@]}" "$CTS_EXE" "${CLI_ARGS[@]}" >"$STDOUT_LOG" 2>"$RUNTIME_LOG" ) || RC=$?
 fi
 echo "EXITCODE: $RC"
 

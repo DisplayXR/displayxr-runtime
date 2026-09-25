@@ -70,7 +70,7 @@ done
 # required at configure time — the CTS generates sources.
 # -----------------------------------------------------------------------------
 APT_PACKAGES=(
-  build-essential cmake ninja-build pkg-config git python3
+  build-essential cmake ninja-build pkg-config git git-lfs python3
   libvulkan-dev glslang-tools
   libx11-dev libx11-xcb-dev libxcb1-dev libxcb-randr0-dev libxcb-glx0-dev
   libxrandr-dev libxxf86vm-dev libwayland-dev libxkbcommon-dev
@@ -104,6 +104,23 @@ else
   echo "=== OpenXR-CTS present; ensuring tag $CTS_TAG ==="
   git -C "$CTS_SRC" fetch --depth 1 origin "tag" "$CTS_TAG" >/dev/null 2>&1 || true
   git -C "$CTS_SRC" checkout -q "$CTS_TAG"
+fi
+
+# The CTS keeps its binary assets (reference screenshots, textures, glTF) in Git
+# LFS, and its configure step refuses a pointer file ("Found a git-lfs pointer
+# file instead of the binary file"). A clone made without git-lfs has only the
+# pointers, so fetch the objects here, and fail with the fix spelled out when
+# git-lfs is missing. It is not always in the distro base image, and a box
+# without root can use the upstream static binary on PATH.
+if command -v git-lfs >/dev/null 2>&1; then
+  echo "=== git lfs pull (CTS binary assets) ==="
+  git -C "$CTS_SRC" lfs install --local >/dev/null
+  git -C "$CTS_SRC" lfs pull
+elif git -C "$CTS_SRC" grep -q -I 'version https://git-lfs.github.com/spec/v1' -- ':(glob)**/*.png' 2>/dev/null; then
+  echo "ERROR: $CTS_SRC holds git-lfs POINTER files and git-lfs is not installed." >&2
+  echo "       Install git-lfs (apt: git-lfs, or --apt), or put the upstream binary on PATH" >&2
+  echo "       (no root: apt-get download git-lfs && dpkg -x git-lfs_*.deb DIR), then re-run." >&2
+  exit 1
 fi
 
 if [ "$CLEAN" = "ON" ]; then
