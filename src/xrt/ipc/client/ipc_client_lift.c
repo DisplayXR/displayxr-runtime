@@ -31,7 +31,8 @@ params_to_ipc(const struct xrt_dp_lift_params *p,
 	out->strength = p->strength;
 	out->inpaint = p->inpaint;
 	out->view_count = p->view_count;
-	out->focal_px = p->struct_size >= offsetof(struct xrt_dp_lift_params, focal_px) + sizeof(float) ? p->focal_px : 0.0f;
+	out->focal_px =
+	    p->struct_size >= offsetof(struct xrt_dp_lift_params, focal_px) + sizeof(float) ? p->focal_px : 0.0f;
 	if (viewpoints != NULL && viewpoint_count > 0) {
 		uint32_t n = viewpoint_count > IPC_LIFT_MAX_VIEWS ? IPC_LIFT_MAX_VIEWS : viewpoint_count;
 		out->viewpoint_count = n;
@@ -64,11 +65,8 @@ ipc_client_lift_get_properties(struct ipc_connection *ipc_c, struct xrt_dp_lift_
 }
 
 xrt_result_t
-ipc_client_lift_stream_create(struct ipc_connection *ipc_c,
-                              uint32_t mode,
-                              uint32_t content_hint,
-                              float input_scale,
-                              uint64_t *out_stream_id)
+ipc_client_lift_stream_create(
+    struct ipc_connection *ipc_c, uint32_t mode, uint32_t content_hint, float input_scale, uint64_t *out_stream_id)
 {
 	if (ipc_c == NULL || out_stream_id == NULL) {
 		return XRT_ERROR_IPC_FAILURE;

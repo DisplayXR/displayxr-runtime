@@ -13,8 +13,8 @@
 #include <string.h>
 
 static const char *const k_props[SIM_FAKE_PLY_FLOATS_PER_SPLAT] = {
-    "x",       "y",       "z",       "nx",      "ny",      "nz",    "f_dc_0", "f_dc_1", "f_dc_2",
-    "opacity", "scale_0", "scale_1", "scale_2", "rot_0",   "rot_1", "rot_2",  "rot_3",
+    "x",       "y",       "z",       "nx",      "ny",    "nz",    "f_dc_0", "f_dc_1", "f_dc_2",
+    "opacity", "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2",  "rot_3",
 };
 
 static size_t
@@ -61,8 +61,8 @@ sim_fake_ply_write(uint8_t *dst, size_t cap, const uint8_t *rgba, uint32_t w, ui
 	const float aspect = (w > 0 && h > 0) ? (float)w / (float)h : 1.0f;
 	const float sh_c0 = 0.28209479177387814f; // 3DGS: colour = 0.5 + SH_C0 * f_dc
 	for (int layer = 0; layer < 2; layer++) {
-		const float z = layer == 0 ? 0.0f : 0.5f;          // back layer sits behind
-		const float shade = layer == 0 ? 1.0f : 0.45f;     // and darker
+		const float z = layer == 0 ? 0.0f : 0.5f;      // back layer sits behind
+		const float shade = layer == 0 ? 1.0f : 0.45f; // and darker
 		const float scale = logf(layer == 0 ? 0.03f : 0.05f);
 		for (int gy = 0; gy < SIM_FAKE_PLY_GRID_Y; gy++) {
 			for (int gx = 0; gx < SIM_FAKE_PLY_GRID_X; gx++) {
@@ -80,16 +80,23 @@ sim_fake_ply_write(uint8_t *dst, size_t cap, const uint8_t *rgba, uint32_t w, ui
 					rgb[2] = (float)s[2] / 255.0f;
 				}
 				float f[SIM_FAKE_PLY_FLOATS_PER_SPLAT] = {
-				    (u - 0.5f) * aspect,          // x
-				    (0.5f - v),                   // y (up)
-				    z,                            // z
-				    0.0f, 0.0f, 0.0f,             // normal
+				    (u - 0.5f) * aspect, // x
+				    (0.5f - v),          // y (up)
+				    z,                   // z
+				    0.0f,
+				    0.0f,
+				    0.0f,                            // normal
 				    (rgb[0] * shade - 0.5f) / sh_c0, // f_dc
 				    (rgb[1] * shade - 0.5f) / sh_c0,
 				    (rgb[2] * shade - 0.5f) / sh_c0,
-				    2.0f,                         // opacity logit (~0.88)
-				    scale, scale, scale,          // log scale
-				    1.0f, 0.0f, 0.0f, 0.0f,       // rotation (w x y z), identity
+				    2.0f, // opacity logit (~0.88)
+				    scale,
+				    scale,
+				    scale, // log scale
+				    1.0f,
+				    0.0f,
+				    0.0f,
+				    0.0f, // rotation (w x y z), identity
 				};
 				for (int k = 0; k < SIM_FAKE_PLY_FLOATS_PER_SPLAT; k++) {
 					put_f32(p, f[k]);

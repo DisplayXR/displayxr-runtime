@@ -30,11 +30,8 @@ xrt_result_t
 ipc_client_lift_get_properties(struct ipc_connection *ipc_c, struct xrt_dp_lift_caps *out_caps);
 
 xrt_result_t
-ipc_client_lift_stream_create(struct ipc_connection *ipc_c,
-                              uint32_t mode,
-                              uint32_t content_hint,
-                              float input_scale,
-                              uint64_t *out_stream_id);
+ipc_client_lift_stream_create(
+    struct ipc_connection *ipc_c, uint32_t mode, uint32_t content_hint, float input_scale, uint64_t *out_stream_id);
 
 xrt_result_t
 ipc_client_lift_stream_destroy(struct ipc_connection *ipc_c, uint64_t stream_id);

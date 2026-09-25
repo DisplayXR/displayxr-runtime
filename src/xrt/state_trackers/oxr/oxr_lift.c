@@ -45,11 +45,8 @@
 xrt_result_t
 comp_ipc_client_compositor_lift_get_properties(struct xrt_compositor *xc, struct xrt_dp_lift_caps *out_caps);
 xrt_result_t
-comp_ipc_client_compositor_lift_stream_create(struct xrt_compositor *xc,
-                                              uint32_t mode,
-                                              uint32_t content_hint,
-                                              float input_scale,
-                                              uint64_t *out_stream_id);
+comp_ipc_client_compositor_lift_stream_create(
+    struct xrt_compositor *xc, uint32_t mode, uint32_t content_hint, float input_scale, uint64_t *out_stream_id);
 xrt_result_t
 comp_ipc_client_compositor_lift_stream_destroy(struct xrt_compositor *xc, uint64_t stream_id);
 xrt_result_t
@@ -165,8 +162,8 @@ static XrResult
 lift_validate_options(struct oxr_logger *log, const XrLiftOptionsDXR *o, bool weave_path)
 {
 	if (o->viewCount > XR_LIFT_MAX_VIEWS_DXR) {
-		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "XrLiftOptionsDXR::viewCount (%u) > %u", o->viewCount,
-		                 (uint32_t)XR_LIFT_MAX_VIEWS_DXR);
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "XrLiftOptionsDXR::viewCount (%u) > %u",
+		                 o->viewCount, (uint32_t)XR_LIFT_MAX_VIEWS_DXR);
 	}
 	if (o->viewpointSource != XR_LIFT_VIEWPOINT_SOURCE_TRACKED_DXR &&
 	    o->viewpointSource != XR_LIFT_VIEWPOINT_SOURCE_EXPLICIT_DXR) {
@@ -233,9 +230,9 @@ oxr_xrGetLiftPropertiesDXR(XrSession session, XrLiftPropertiesDXR *properties)
 	properties->supportedModes = (XrLiftModeFlagsDXR)caps.modes;
 	properties->maxStreams = caps.max_streams;
 	properties->maxViews = caps.max_views;
-	properties->depthSemantics =
-	    caps.depth_semantics == XRT_DP_LIFT_DEPTH_METRIC ? XR_LIFT_DEPTH_SEMANTICS_METRIC_DXR
-	                                                     : XR_LIFT_DEPTH_SEMANTICS_RELATIVE_DXR;
+	properties->depthSemantics = caps.depth_semantics == XRT_DP_LIFT_DEPTH_METRIC
+	                                 ? XR_LIFT_DEPTH_SEMANTICS_METRIC_DXR
+	                                 : XR_LIFT_DEPTH_SEMANTICS_RELATIVE_DXR;
 	properties->state = caps.state == XRT_DP_LIFT_STATE_READY        ? XR_LIFT_STATE_READY_DXR
 	                    : caps.state == XRT_DP_LIFT_STATE_ACTIVATING ? XR_LIFT_STATE_ACTIVATING_DXR
 	                                                                 : XR_LIFT_STATE_UNAVAILABLE_DXR;
@@ -261,13 +258,13 @@ oxr_xrCreateLiftStreamDXR(XrSession session, const XrLiftStreamCreateInfoDXR *cr
 	const uint32_t mode = (uint32_t)createInfo->mode;
 	if (mode != XRT_DP_LIFT_MODE_DEPTH && mode != XRT_DP_LIFT_MODE_SBS && mode != XRT_DP_LIFT_MODE_NVIEW &&
 	    mode != XRT_DP_LIFT_MODE_GAUSSIANS) {
-		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "XrLiftStreamCreateInfoDXR::mode (%d) is not one mode",
-		                 (int)createInfo->mode);
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "XrLiftStreamCreateInfoDXR::mode (%d) is not one mode", (int)createInfo->mode);
 	}
 	if (createInfo->contentHint != XR_LIFT_CONTENT_HINT_VIDEO_DXR &&
 	    createInfo->contentHint != XR_LIFT_CONTENT_HINT_PHOTO_DXR) {
-		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "XrLiftStreamCreateInfoDXR::contentHint (%d) invalid",
-		                 (int)createInfo->contentHint);
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "XrLiftStreamCreateInfoDXR::contentHint (%d) invalid", (int)createInfo->contentHint);
 	}
 	if (mode == XRT_DP_LIFT_MODE_GAUSSIANS && createInfo->contentHint != XR_LIFT_CONTENT_HINT_PHOTO_DXR) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
@@ -330,8 +327,9 @@ oxr_xrSubmitLiftFrameDXR(XrLiftStreamDXR stream, const XrLiftFrameSubmitInfoDXR 
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "XrLiftFrameSubmitInfoDXR::inputTexture is NULL");
 	}
 	if (submitInfo->extent.width <= 0 || submitInfo->extent.height <= 0) {
-		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "XrLiftFrameSubmitInfoDXR::extent (%dx%d) must be positive",
-		                 submitInfo->extent.width, submitInfo->extent.height);
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "XrLiftFrameSubmitInfoDXR::extent (%dx%d) must be positive", submitInfo->extent.width,
+		                 submitInfo->extent.height);
 	}
 
 	struct xrt_dp_lift_params params;

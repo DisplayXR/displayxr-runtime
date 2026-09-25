@@ -153,12 +153,13 @@ void
 print_caps(const struct xrt_dp_lift_caps &c, bool json)
 {
 	if (json) {
-		printf("{\"connected\": true, \"state\": \"%s\", \"modes\": %u, \"modes_str\": \"%s\", "
-		       "\"max_streams\": %u, \"max_views\": %u, \"depth_semantics\": \"%s\", "
-		       "\"typical_latency_ms\": %.2f, \"backend\": \"%s\"}\n",
-		       state_str(c.state), c.modes, modes_str(c.modes).c_str(), c.max_streams, c.max_views,
-		       c.depth_semantics == XRT_DP_LIFT_DEPTH_METRIC ? "metric" : "relative",
-		       (double)c.typical_latency_ns / 1e6, c.backend);
+		printf(
+		    "{\"connected\": true, \"state\": \"%s\", \"modes\": %u, \"modes_str\": \"%s\", "
+		    "\"max_streams\": %u, \"max_views\": %u, \"depth_semantics\": \"%s\", "
+		    "\"typical_latency_ms\": %.2f, \"backend\": \"%s\"}\n",
+		    state_str(c.state), c.modes, modes_str(c.modes).c_str(), c.max_streams, c.max_views,
+		    c.depth_semantics == XRT_DP_LIFT_DEPTH_METRIC ? "metric" : "relative",
+		    (double)c.typical_latency_ns / 1e6, c.backend);
 		return;
 	}
 	printf("XR_DXR_lift conversion module:\n");
@@ -281,8 +282,8 @@ upload(probe_gpu &g, const uint8_t *rgba, uint32_t w, uint32_t h)
 			hr = g.in_tex->QueryInterface(__uuidof(IDXGIResource1), (void **)&r1);
 		}
 		if (SUCCEEDED(hr)) {
-			hr = r1->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr,
-			                            &g.in_handle);
+			hr = r1->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+			                            nullptr, &g.in_handle);
 		}
 		rel(r1);
 		if (SUCCEEDED(hr)) {
@@ -425,9 +426,10 @@ int
 cmd_probe(int argc, const char **argv)
 {
 	if (argc < 4 || argv[3][0] == '-') {
-		printf("usage: displayxr-cli lift probe <image|frames_dir> [--mode depth|sbs|nview|gaussians] [--n N]\n"
-		       "       [--views N] [--strength F] [--convergence F] [--focal PX]\n"
-		       "       [--priority paused|low|normal|high] [--pipelined] [--fps F] [--out DIR] [--wait S]\n");
+		printf(
+		    "usage: displayxr-cli lift probe <image|frames_dir> [--mode depth|sbs|nview|gaussians] [--n N]\n"
+		    "       [--views N] [--strength F] [--convergence F] [--focal PX]\n"
+		    "       [--priority paused|low|normal|high] [--pipelined] [--fps F] [--out DIR] [--wait S]\n");
 		return 1;
 	}
 	const std::string src = argv[3];
@@ -457,7 +459,8 @@ cmd_probe(int argc, const char **argv)
 	params.convergence = (float)atof(opt_value(argc, argv, "--convergence", "-1"));
 	params.strength = (float)atof(opt_value(argc, argv, "--strength", "1"));
 	params.inpaint = 1;
-	params.view_count = (uint32_t)atoi(opt_value(argc, argv, "--views", mode == XRT_DP_LIFT_MODE_NVIEW ? "4" : "2"));
+	params.view_count =
+	    (uint32_t)atoi(opt_value(argc, argv, "--views", mode == XRT_DP_LIFT_MODE_NVIEW ? "4" : "2"));
 	params.focal_px = (float)atof(opt_value(argc, argv, "--focal", "0"));
 
 	std::vector<std::string> frames = list_frames(src);
@@ -491,8 +494,8 @@ cmd_probe(int argc, const char **argv)
 
 	uint64_t sid = 0;
 	xrt_result_t xret = ipc_client_lift_stream_create(
-	    &ipc_c, mode, mode == XRT_DP_LIFT_MODE_GAUSSIANS ? XRT_DP_LIFT_CONTENT_PHOTO : XRT_DP_LIFT_CONTENT_VIDEO, 1.0f,
-	    &sid);
+	    &ipc_c, mode, mode == XRT_DP_LIFT_MODE_GAUSSIANS ? XRT_DP_LIFT_CONTENT_PHOTO : XRT_DP_LIFT_CONTENT_VIDEO,
+	    1.0f, &sid);
 	if (xret != XRT_SUCCESS) {
 		printf("lift_stream_create failed: %d\n", (int)xret);
 		ipc_client_connection_fini(&ipc_c);
@@ -537,8 +540,8 @@ cmd_probe(int argc, const char **argv)
 		}
 		uint64_t t_submit = os_monotonic_get_ns();
 		uint64_t frame_id = 0;
-		xret = ipc_client_lift_submit(&ipc_c, sid, (xrt_graphics_buffer_handle_t)g.in_handle, false, (uint32_t)iw,
-		                              (uint32_t)ih, (int64_t)i, &params, nullptr, 0, &frame_id);
+		xret = ipc_client_lift_submit(&ipc_c, sid, (xrt_graphics_buffer_handle_t)g.in_handle, false,
+		                              (uint32_t)iw, (uint32_t)ih, (int64_t)i, &params, nullptr, 0, &frame_id);
 		if (xret != XRT_SUCCESS) {
 			printf("%6d submit refused (xrt_result=%d) — retrying next frame\n", i, (int)xret);
 			continue;
@@ -559,8 +562,8 @@ cmd_probe(int argc, const char **argv)
 				xret = ipc_client_lift_acquire_blob(&ipc_c, sid, 0, nullptr, &ready, &delivered, &bi);
 				if (xret == XRT_SUCCESS && ready) {
 					std::vector<uint8_t> bytes((size_t)bi.byte_count);
-					xret = ipc_client_lift_acquire_blob(&ipc_c, sid, bi.byte_count, bytes.data(), &ready,
-					                                    &delivered, &bi);
+					xret = ipc_client_lift_acquire_blob(&ipc_c, sid, bi.byte_count, bytes.data(),
+					                                    &ready, &delivered, &bi);
 					if (xret == XRT_SUCCESS && delivered) {
 						got = true;
 						got_id = bi.frame_id;
@@ -593,16 +596,18 @@ cmd_probe(int argc, const char **argv)
 						bool have = false;
 						xrt_graphics_buffer_handle_t th = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
 						uint32_t ow = 0, oh = 0, of = 0;
-						if (ipc_client_lift_get_output(&ipc_c, sid, &have, &ow, &oh, &of, &th) ==
-						        XRT_SUCCESS &&
+						if (ipc_client_lift_get_output(&ipc_c, sid, &have, &ow, &oh, &of,
+						                               &th) == XRT_SUCCESS &&
 						    have) {
-							g.dev1->OpenSharedResource1((HANDLE)th, __uuidof(ID3D11Texture2D),
-							                            (void **)&g.out_tex);
+							g.dev1->OpenSharedResource1(
+							    (HANDLE)th, __uuidof(ID3D11Texture2D), (void **)&g.out_tex);
 							CloseHandle((HANDLE)th);
 						}
 						xrt_graphics_sync_handle_t fh = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
-						if (ipc_client_lift_get_fence(&ipc_c, sid, &have, &fh) == XRT_SUCCESS && have) {
-							g.dev5->OpenSharedFence((HANDLE)fh, __uuidof(ID3D11Fence), (void **)&g.out_fence);
+						if (ipc_client_lift_get_fence(&ipc_c, sid, &have, &fh) == XRT_SUCCESS &&
+						    have) {
+							g.dev5->OpenSharedFence((HANDLE)fh, __uuidof(ID3D11Fence),
+							                        (void **)&g.out_fence);
 							CloseHandle((HANDLE)fh);
 						}
 					}
@@ -645,12 +650,12 @@ cmd_probe(int argc, const char **argv)
 
 	struct xrt_lift_stream_stats st = {};
 	if (ipc_client_lift_stats(&ipc_c, sid, &st) == XRT_SUCCESS) {
-		printf("stream stats: submitted=%llu converted=%llu dropped=%llu failed=%llu rate=%.1f Hz "
-		       "latency last=%.2f avg=%.2f min=%.2f max=%.2f ms\n",
-		       (unsigned long long)st.submitted, (unsigned long long)st.converted,
-		       (unsigned long long)st.dropped, (unsigned long long)st.failed, st.rate_hz,
-		       st.latency_last_ns / 1e6, st.latency_avg_ns / 1e6, st.latency_min_ns / 1e6,
-		       st.latency_max_ns / 1e6);
+		printf(
+		    "stream stats: submitted=%llu converted=%llu dropped=%llu failed=%llu rate=%.1f Hz "
+		    "latency last=%.2f avg=%.2f min=%.2f max=%.2f ms\n",
+		    (unsigned long long)st.submitted, (unsigned long long)st.converted, (unsigned long long)st.dropped,
+		    (unsigned long long)st.failed, st.rate_hz, st.latency_last_ns / 1e6, st.latency_avg_ns / 1e6,
+		    st.latency_min_ns / 1e6, st.latency_max_ns / 1e6);
 	}
 	if (!lat_ms.empty()) {
 		std::vector<double> s = lat_ms;
@@ -692,8 +697,9 @@ cli_cmd_lift(int argc, const char **argv)
 	if (argc >= 3 && strcmp(argv[2], "probe") == 0) {
 		return cmd_probe(argc, argv);
 	}
-	printf("usage: displayxr-cli lift caps [--json] [--wait S]\n"
-	       "       displayxr-cli lift probe <image|frames_dir> [--mode depth|sbs|nview|gaussians] [--n N] ...\n");
+	printf(
+	    "usage: displayxr-cli lift caps [--json] [--wait S]\n"
+	    "       displayxr-cli lift probe <image|frames_dir> [--mode depth|sbs|nview|gaussians] [--n N] ...\n");
 	return 1;
 }
 

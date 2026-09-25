@@ -159,14 +159,17 @@ sim_fake_lift_create(void *d3d11_device)
 	fl->device->AddRef();
 
 	ID3DBlob *b = nullptr;
-	bool ok = SUCCEEDED(compile(k_vs, "vs_5_0", &b)) &&
-	          SUCCEEDED(fl->device->CreateVertexShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &fl->vs));
+	bool ok =
+	    SUCCEEDED(compile(k_vs, "vs_5_0", &b)) &&
+	    SUCCEEDED(fl->device->CreateVertexShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &fl->vs));
 	safe_release(b);
-	ok = ok && SUCCEEDED(compile(k_ps_views, "ps_5_0", &b)) &&
-	     SUCCEEDED(fl->device->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &fl->ps_views));
+	ok =
+	    ok && SUCCEEDED(compile(k_ps_views, "ps_5_0", &b)) &&
+	    SUCCEEDED(fl->device->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &fl->ps_views));
 	safe_release(b);
-	ok = ok && SUCCEEDED(compile(k_ps_depth, "ps_5_0", &b)) &&
-	     SUCCEEDED(fl->device->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &fl->ps_depth));
+	ok =
+	    ok && SUCCEEDED(compile(k_ps_depth, "ps_5_0", &b)) &&
+	    SUCCEEDED(fl->device->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &fl->ps_depth));
 	safe_release(b);
 
 	if (ok) {
@@ -188,8 +191,9 @@ sim_fake_lift_create(void *d3d11_device)
 		sim_fake_lift_destroy(fl);
 		return nullptr;
 	}
-	U_LOG_W("sim_display: FAKE lift module active (SIM_DISPLAY_FAKE_LIFT) — shifted SBS/N-view, gradient "
-	        "depth, two-layer PLY; not a model");
+	U_LOG_W(
+	    "sim_display: FAKE lift module active (SIM_DISPLAY_FAKE_LIFT) — shifted SBS/N-view, gradient "
+	    "depth, two-layer PLY; not a model");
 	return fl;
 }
 
@@ -217,7 +221,8 @@ sim_fake_lift_get_caps(struct sim_fake_lift *fl, struct xrt_dp_lift_caps *out)
 	if (fl == nullptr || out == nullptr || out->struct_size < sizeof(struct xrt_dp_lift_caps)) {
 		return false;
 	}
-	out->modes = XRT_DP_LIFT_MODE_DEPTH | XRT_DP_LIFT_MODE_SBS | XRT_DP_LIFT_MODE_NVIEW | XRT_DP_LIFT_MODE_GAUSSIANS;
+	out->modes =
+	    XRT_DP_LIFT_MODE_DEPTH | XRT_DP_LIFT_MODE_SBS | XRT_DP_LIFT_MODE_NVIEW | XRT_DP_LIFT_MODE_GAUSSIANS;
 	out->max_streams = SIM_FAKE_LIFT_MAX_STREAMS;
 	out->max_views = SIM_FAKE_LIFT_MAX_VIEWS;
 	out->depth_semantics = XRT_DP_LIFT_DEPTH_RELATIVE;

@@ -330,12 +330,14 @@ typedef struct XrLiftBlobDXR {
  *
  * The caller draws the element's 2D pixels into the rect exactly as it would
  * draw any other element — on the batch (v3) layout the WHOLE rect holds the 2D
- * frame (not squeezed SBS); on the v6 N-view layout, tile 0 at the rect's
- * scaled position does. The service snapshots that region into @c stream's
- * mailbox, and weaves the stream's LATEST converted output at the rect's
- * CURRENT position — so geometry (drag, resize, scroll) is exact and real-time
- * while the conversion itself runs one frame behind. Until the stream's first
- * result exists the rect is woven FLAT (its 2D pixels in every view).
+ * frame (not squeezed SBS); on the v6 N-view layout the 2D frame goes into
+ * EVERY tile at the rect's scaled position (tile 0's copy is what gets lifted).
+ * The service snapshots that region into @c stream's mailbox, and weaves the
+ * stream's LATEST converted output at the rect's CURRENT position — so geometry
+ * (drag, resize, scroll) is exact and real-time while the conversion itself
+ * runs one frame behind. Until the stream's first result exists the rect is
+ * woven FLAT: the service writes the 2D frame into both views (v3), or leaves
+ * the caller's identical tiles as drawn (v6).
  *
  * @c stream must be an SBS or NVIEW stream of the same session.
  */
