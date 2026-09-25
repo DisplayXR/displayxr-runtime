@@ -48,6 +48,10 @@ cli_cmd_clients(int argc, const char **argv);
 int
 cli_cmd_test(int argc, const char **argv);
 
+//! `lift` — XR_DXR_lift (ADR-042): `lift caps`, `lift probe <image|dir>`.
+int
+cli_cmd_lift(int argc, const char **argv);
+
 /*!
  * True if @p flag appears anywhere in argv[2..]. Commands take raw
  * argc/argv; this is the one shared option-scan (e.g. `--json`).

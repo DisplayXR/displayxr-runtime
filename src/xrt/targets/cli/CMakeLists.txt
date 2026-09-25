@@ -42,6 +42,7 @@ add_executable(
 	cli_cmd_probe.c
 	cli_cmd_test.c
 	cli_cmd_clients.c
+	cli_cmd_lift.cpp
 	cli_common.h
 	cli_main.c
 	)
@@ -86,6 +87,13 @@ target_link_libraries(
 if(XRT_FEATURE_SERVICE AND XRT_MODULE_IPC)
 	target_link_libraries(cli PRIVATE ipc_client)
 	target_compile_definitions(cli PRIVATE CLI_HAVE_IPC)
+endif()
+
+# ADR-042: `displayxr-cli lift probe` loads / writes images (stb, header-only,
+# compiled static into cli_cmd_lift.cpp) and drives D3D11 shared textures.
+target_include_directories(cli PRIVATE ${PROJECT_SOURCE_DIR}/src/external/stb)
+if(WIN32)
+	target_link_libraries(cli PRIVATE d3d11 dxgi)
 endif()
 
 install(TARGETS cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
