@@ -479,6 +479,39 @@ Two related traps:
   with the view-cone halo means no viewer was tracked at that instant, not a
   capture fault.
 
+## Installer or bundle fails with "exited with code 6" (or a bare "code 2")
+
+**Symptom.** The runtime installer, or the bundle running it, stops with *"DisplayXR
+Runtime installer exited with code 6. Aborting bundle."* Runtime installers before
+v2.21.5 gave a bare **code 2** in the same situation. It usually happens on one machine
+while the same bundle installs fine elsewhere.
+
+**Cause.** A running program still has `DisplayXRClient.dll` loaded, and the installer
+refuses to replace it rather than leave the client and service on different builds
+(#1268). Every OpenXR application loads that DLL, including ones nobody thinks of as
+OpenXR apps. On the machine behind #1733 it was **Google Chrome's WebXR helper
+process**, which keeps the runtime loaded after the WebXR page that started it has
+closed. Unity or Unreal editors and DisplayXR demos left open do the same.
+
+The installer closes only what it owns: the service, anything running from the runtime
+folder, the DisplayXR Browser, and (from v2.21.5) any Chromium browser's WebXR helper.
+It never force-closes your other programs.
+
+**Fix.**
+- **Run interactively** (double-click the runtime installer). It names the programs
+  holding the DLL and offers to close them normally, to check again after you have
+  closed them yourself, or to cancel. Nothing is changed until the DLL is free.
+- **Silent runs** (`/S`, as the bundle does) exit with code 6 and record the program
+  names in the registry:
+  ```
+  reg query "HKLM\Software\DisplayXR\Runtime" /v LastInstallBlockers
+  ```
+  Close those programs and run the installer or bundle again. The value is cleared on
+  the next successful install.
+- **Unattended deploys** can add `/CLOSEAPPS` to a silent run. The installer then asks
+  the holders to close normally, once, and continues if they did.
+- To see the holders yourself from an admin prompt: `tasklist /m DisplayXRClient.dll`.
+
 ## Still stuck?
 
 Grab a bug-report dump and open an issue on the
