@@ -118,6 +118,15 @@ if(XRT_HAVE_VULKAN
 	# format modifiers (a CI runner's lavapipe has no DRM device).
 	list(APPEND tests tests_vk_dmabuf)
 endif()
+if(TARGET comp_vk_native
+   AND CMAKE_SYSTEM_NAME STREQUAL "Linux"
+   AND NOT ANDROID
+	)
+	# #1602 -- the vk_native equirect2 draw, rendered: the Vulkan twin of
+	# tests_comp_layer_equirect2_warp. Prefers a CPU (lavapipe) device and
+	# SKIPs when there is no Vulkan device at all.
+	list(APPEND tests tests_comp_vk_equirect2_draw)
+endif()
 if(XRT_FEATURE_OPENXR)
 	list(APPEND tests tests_input_transform)
 endif()
@@ -633,6 +642,16 @@ if(XRT_HAVE_VULKAN)
 endif()
 if(TARGET tests_vk_dmabuf)
 	target_link_libraries(tests_vk_dmabuf PRIVATE comp_util aux_vk)
+endif()
+if(TARGET tests_comp_vk_equirect2_draw)
+	# The generated SPIR-V headers (shaders/equirect2.*.h) live in
+	# comp_vk_native's binary dir; the packer header in its source dir.
+	get_target_property(_vk_native_bin comp_vk_native BINARY_DIR)
+	target_include_directories(
+		tests_comp_vk_equirect2_draw PRIVATE ${_vk_native_bin} ${PROJECT_SOURCE_DIR}/src/xrt/compositor
+		)
+	add_dependencies(tests_comp_vk_equirect2_draw comp_vk_native)
+	target_link_libraries(tests_comp_vk_equirect2_draw PRIVATE xrt-interfaces Vulkan::Vulkan)
 endif()
 
 if(XRT_FEATURE_OPENXR)

@@ -173,9 +173,8 @@ const char *const kZeroCopyOwners[] = {
 //! vk_native's compose shaders live beside the renderer as GLSL compiled to
 //! SPIR-V at build time, so the no-OETF pin has to read them too.
 const char *const kVkComposeShaders[] = {
-    "vk_native/shaders/zone_blit.vert",
-    "vk_native/shaders/zone_blit.frag",
-    "vk_native/shaders/zone_blit_array.frag",
+    "vk_native/shaders/zone_blit.vert", "vk_native/shaders/zone_blit.frag", "vk_native/shaders/zone_blit_array.frag",
+    "vk_native/shaders/equirect2.vert", "vk_native/shaders/equirect2.frag", "vk_native/shaders/equirect2_array.frag",
 };
 
 } // namespace
