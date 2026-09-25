@@ -61,6 +61,14 @@
 #   ./scripts/build_linux.sh --clean     # drop the CMake cache first — REQUIRED
 #                                        # after installing a dependency into a
 #                                        # tree that was already configured
+#   ./scripts/build_linux.sh --qwerty    # build the qwerty keyboard/mouse driver
+#                                        # (#1727): the self-created X11 window
+#                                        # then drives the qwerty HMD + hand
+#                                        # controllers. REQUIRED for the
+#                                        # interactive CTS categories (actions,
+#                                        # scenario need controllers and a select
+#                                        # click). Off by default: the shipped
+#                                        # runtime has no qwerty on Linux.
 #   ./scripts/build_linux.sh --apps      # also build the OpenXR loader + the
 #                                        # test apps: cube_hosted_legacy_vk_linux
 #                                        # (hosted, Phase 1b) and cube_handle_vk_linux
@@ -80,12 +88,14 @@ SERVICE_MODE=OFF
 RUN_TEST=ON
 BUILD_APPS=OFF
 CLEAN=OFF
+QWERTY=OFF
 for arg in "$@"; do
   case "$arg" in
     --service) SERVICE_MODE=ON ;;
     --no-test) RUN_TEST=OFF ;;
     --apps) BUILD_APPS=ON ;;
     --clean) CLEAN=ON ;;
+    --qwerty) QWERTY=ON ;;
     *) echo "Unknown arg: $arg" >&2; exit 2 ;;
   esac
 done
@@ -127,12 +137,12 @@ OPENXR_DIR="$BUILD_DIR/_openxr-$OPENXR_VERSION"
 # (NDEBUG-conditional layout) is a candidate cause of the VK-DP-factory
 # null-dispatch crash seen with a Debug .deb runtime (cube-hw finding C), and a
 # Debug runtime is the wrong (36 MB, unoptimized) release artifact regardless.
-echo "=== Configuring DisplayXR runtime (Linux, SERVICE=$SERVICE_MODE, TYPE=${CMAKE_BUILD_TYPE:-Debug}) ==="
+echo "=== Configuring DisplayXR runtime (Linux, SERVICE=$SERVICE_MODE, QWERTY=$QWERTY, TYPE=${CMAKE_BUILD_TYPE:-Debug}) ==="
 cmake -B "$BUILD_DIR" -S "$ROOT" -G Ninja \
   -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Debug}" \
   -DXRT_FEATURE_SERVICE=$SERVICE_MODE \
   -DXRT_MODULE_CLI=ON \
-  -DXRT_BUILD_DRIVER_QWERTY=OFF \
+  -DXRT_BUILD_DRIVER_QWERTY=$QWERTY \
   -DXRT_FEATURE_DEBUG_GUI=OFF \
   -DXRT_FEATURE_WINDOW_PEEK=OFF \
   -DXRT_HAVE_SDL2=OFF \

@@ -9,8 +9,15 @@
 
 #include "comp_vk_native_window_xcb.h"
 
+#include "util/u_debug.h"
 #include "util/u_misc.h"
 #include "util/u_logging.h"
+#include "os/os_threading.h"
+#include "xrt/xrt_system.h"
+
+#ifdef XRT_BUILD_DRIVER_QWERTY
+#include "qwerty_interface.h"
+#endif
 
 #include <stdlib.h>
 #include <string.h>
@@ -40,7 +47,256 @@ struct comp_vk_native_window_xcb
 
 	//! Cleared when the user closes the window (WM_DELETE_WINDOW / DestroyNotify).
 	bool valid;
+
+	//! Serialises the event pump: it runs from several compositor entry points
+	//! and owns the keymap below plus the order input reaches qwerty in.
+	struct os_mutex pump_lock;
+
+	//! Where decoded input goes (#1727); NULL = input is drained and dropped.
+	struct xrt_system_devices *xsysd;
+
+	//! Core keyboard mapping (xcb_get_keyboard_mapping), refreshed on
+	//! MappingNotify. keysyms[(keycode - min_keycode) * keysyms_per_keycode]
+	//! is the level-0 keysym of a keycode.
+	uint8_t min_keycode;
+	uint8_t keysyms_per_keycode;
+	uint32_t keysym_count;
+	uint32_t *keysyms;
+
+	//! Keycodes this window has seen go down and not yet up, for telling
+	//! autorepeat apart from a real release/press at the same timestamp.
+	uint8_t keys_down[32];
 };
+
+#ifdef XRT_BUILD_DRIVER_QWERTY
+// [QTRACE] input-path tracer, off unless DXR_QTRACE=1 (docs/reference/debug-logging.md)
+DEBUG_GET_ONCE_BOOL_OPTION(xcb_win_qtrace, "DXR_QTRACE", false)
+
+//! Input the window selects when qwerty can consume it (#1727). Only the
+//! client owning a window may select ButtonPress on it; the runtime owns this one.
+#define XCB_WINDOW_INPUT_EVENT_MASK                                                                                    \
+	(XCB_EVENT_MASK_KEY_PRESS | XCB_EVENT_MASK_KEY_RELEASE | XCB_EVENT_MASK_BUTTON_PRESS |                         \
+	 XCB_EVENT_MASK_BUTTON_RELEASE | XCB_EVENT_MASK_POINTER_MOTION | XCB_EVENT_MASK_FOCUS_CHANGE)
+#else
+#define XCB_WINDOW_INPUT_EVENT_MASK (XCB_EVENT_MASK_KEY_PRESS)
+#endif
+
+#ifdef XRT_BUILD_DRIVER_QWERTY
+/*!
+ * (Re)load the core keycode -> keysym table. Core protocol only, so no
+ * xcb-keysyms / xkbcommon dependency: the pump needs nothing but the level-0
+ * keysym of each keycode.
+ */
+static void
+load_keymap(struct comp_vk_native_window_xcb *win)
+{
+	const xcb_setup_t *setup = xcb_get_setup(win->connection);
+	const uint8_t min_kc = setup->min_keycode;
+	const uint8_t count = (uint8_t)(setup->max_keycode - setup->min_keycode + 1);
+
+	xcb_get_keyboard_mapping_reply_t *reply = xcb_get_keyboard_mapping_reply(
+	    win->connection, xcb_get_keyboard_mapping(win->connection, min_kc, count), NULL);
+	if (reply == NULL) {
+		U_LOG_W("XCB: GetKeyboardMapping failed — keyboard input to qwerty disabled");
+		return;
+	}
+	const int n = xcb_get_keyboard_mapping_keysyms_length(reply);
+	uint32_t *table = U_TYPED_ARRAY_CALLOC(uint32_t, n > 0 ? (size_t)n : 1);
+	if (n > 0) {
+		memcpy(table, xcb_get_keyboard_mapping_keysyms(reply), (size_t)n * sizeof(uint32_t));
+	}
+	free(win->keysyms);
+	win->keysyms = table;
+	win->keysym_count = (uint32_t)(n > 0 ? n : 0);
+	win->min_keycode = min_kc;
+	win->keysyms_per_keycode = reply->keysyms_per_keycode;
+	free(reply);
+}
+
+/*!
+ * Level-0 keysym of @p keycode. A letter the server lists only in upper case
+ * (a core-protocol "alphabetic pair" with NoSymbol second) is folded to lower
+ * case so the qwerty map matches on one spelling, as a Win32 virtual key does.
+ */
+static uint32_t
+keycode_to_keysym(const struct comp_vk_native_window_xcb *win, uint8_t keycode)
+{
+	if (win->keysyms == NULL || win->keysyms_per_keycode == 0 || keycode < win->min_keycode) {
+		return 0;
+	}
+	const uint32_t idx = (uint32_t)(keycode - win->min_keycode) * win->keysyms_per_keycode;
+	if (idx >= win->keysym_count) {
+		return 0;
+	}
+	uint32_t ks = win->keysyms[idx];
+	if (ks >= 0x41 && ks <= 0x5a) { // XK_A..XK_Z
+		ks += 0x20;
+	}
+	return ks;
+}
+
+//! Hand one decoded event to qwerty. Caller holds pump_lock.
+static void
+dispatch_input(struct comp_vk_native_window_xcb *win, const struct qwerty_x11_input *in)
+{
+	if (win->xsysd != NULL) {
+		qwerty_process_xcb(win->xsysd->xdevs, win->xsysd->xdev_count, in);
+	}
+}
+
+//! Release everything qwerty holds (focus loss, unmap, teardown). Caller holds pump_lock.
+static void
+dispatch_focus_out(struct comp_vk_native_window_xcb *win)
+{
+	struct qwerty_x11_input in = {0};
+	in.type = QWERTY_X11_FOCUS_OUT;
+	dispatch_input(win, &in);
+}
+
+/*!
+ * Decode an input event into qwerty. Returns false if @p event is not input.
+ * Caller holds pump_lock.
+ */
+static bool
+handle_input_event(struct comp_vk_native_window_xcb *win, xcb_generic_event_t *event)
+{
+	struct qwerty_x11_input in = {0};
+
+	switch (event->response_type & ~0x80) {
+	case XCB_KEY_PRESS:
+	case XCB_KEY_RELEASE: {
+		// xcb_key_release_event_t is a typedef of the press layout.
+		xcb_key_press_event_t *k = (xcb_key_press_event_t *)event;
+		in.type =
+		    (event->response_type & ~0x80) == XCB_KEY_PRESS ? QWERTY_X11_KEY_PRESS : QWERTY_X11_KEY_RELEASE;
+		in.keysym = keycode_to_keysym(win, k->detail);
+		in.state = k->state;
+		in.root_x = k->root_x;
+		in.root_y = k->root_y;
+		break;
+	}
+	case XCB_BUTTON_PRESS:
+	case XCB_BUTTON_RELEASE: {
+		xcb_button_press_event_t *b = (xcb_button_press_event_t *)event;
+		in.type = (event->response_type & ~0x80) == XCB_BUTTON_PRESS ? QWERTY_X11_BUTTON_PRESS
+		                                                             : QWERTY_X11_BUTTON_RELEASE;
+		in.button = b->detail;
+		in.state = b->state;
+		in.root_x = b->root_x;
+		in.root_y = b->root_y;
+		break;
+	}
+	case XCB_MOTION_NOTIFY: {
+		// Only the position is forwarded. The event's state carries button
+		// bits too, and those are exactly what must never become an edge (#1700).
+		xcb_motion_notify_event_t *m = (xcb_motion_notify_event_t *)event;
+		in.type = QWERTY_X11_MOTION;
+		in.root_x = m->root_x;
+		in.root_y = m->root_y;
+		break;
+	}
+	case XCB_FOCUS_IN: {
+		xcb_focus_in_event_t *f = (xcb_focus_in_event_t *)event;
+		if (f->detail == XCB_NOTIFY_DETAIL_INFERIOR) {
+			return true; // Focus moved between our own subwindows: no change.
+		}
+		// Live CTRL/ALT for the Win32 WM_SETFOCUS re-sync; buttons are ignored.
+		in.type = QWERTY_X11_FOCUS_IN;
+		xcb_query_pointer_reply_t *qp =
+		    xcb_query_pointer_reply(win->connection, xcb_query_pointer(win->connection, win->window), NULL);
+		if (qp != NULL) {
+			in.state = qp->mask;
+			in.root_x = qp->root_x;
+			in.root_y = qp->root_y;
+			free(qp);
+		}
+		break;
+	}
+	case XCB_FOCUS_OUT: {
+		xcb_focus_out_event_t *f = (xcb_focus_out_event_t *)event;
+		if (f->detail == XCB_NOTIFY_DETAIL_INFERIOR) {
+			return true;
+		}
+		in.type = QWERTY_X11_FOCUS_OUT;
+		break;
+	}
+	case XCB_UNMAP_NOTIFY: in.type = QWERTY_X11_FOCUS_OUT; break;
+	case XCB_MAPPING_NOTIFY: {
+		xcb_mapping_notify_event_t *mn = (xcb_mapping_notify_event_t *)event;
+		if (mn->request == XCB_MAPPING_KEYBOARD) {
+			load_keymap(win);
+		}
+		return true;
+	}
+	default: return false;
+	}
+
+	dispatch_input(win, &in);
+	return true;
+}
+
+/*!
+ * X11 key autorepeat arrives as a KeyRelease immediately followed by a KeyPress
+ * of the same keycode with the same timestamp. Delivered as-is, a held key
+ * would produce a release/press EDGE pair every repeat — a held N (Menu) or V
+ * would be clicked over and over. Win32 autorepeat never releases, so the pair
+ * is dropped to match.
+ */
+static bool
+is_autorepeat_pair(const struct comp_vk_native_window_xcb *win, xcb_generic_event_t *release, xcb_generic_event_t *next)
+{
+	if (next == NULL || (next->response_type & ~0x80) != XCB_KEY_PRESS) {
+		return false;
+	}
+	const xcb_key_release_event_t *r = (const xcb_key_release_event_t *)release;
+	const xcb_key_press_event_t *p = (const xcb_key_press_event_t *)next;
+	// Only a key that is DOWN can repeat. XTEST injectors (xdotool) stamp a
+	// genuine release and the following press of the same key with the same
+	// millisecond, and those must both be delivered.
+	const bool down = (win->keys_down[r->detail >> 3] & (1u << (r->detail & 7))) != 0;
+	return down && r->detail == p->detail && r->time == p->time;
+}
+
+//! Track key state for is_autorepeat_pair. Caller holds pump_lock.
+static void
+track_key_state(struct comp_vk_native_window_xcb *win, xcb_generic_event_t *event)
+{
+	const uint8_t type = event->response_type & ~0x80;
+	if (type == XCB_KEY_PRESS || type == XCB_KEY_RELEASE) {
+		const uint8_t kc = ((xcb_key_press_event_t *)event)->detail;
+		if (type == XCB_KEY_PRESS) {
+			win->keys_down[kc >> 3] |= (uint8_t)(1u << (kc & 7));
+		} else {
+			win->keys_down[kc >> 3] &= (uint8_t)~(1u << (kc & 7));
+		}
+	} else if (type == XCB_FOCUS_OUT || type == XCB_UNMAP_NOTIFY || type == XCB_DESTROY_NOTIFY) {
+		// No release reaches a window that lost focus; forget what was down.
+		memset(win->keys_down, 0, sizeof(win->keys_down));
+	}
+}
+
+#endif // XRT_BUILD_DRIVER_QWERTY
+
+void
+comp_vk_native_window_xcb_set_system_devices(struct comp_vk_native_window_xcb *win, struct xrt_system_devices *xsysd)
+{
+	if (win == NULL) {
+		return;
+	}
+	os_mutex_lock(&win->pump_lock);
+#ifdef XRT_BUILD_DRIVER_QWERTY
+	if (win->xsysd != NULL && win->xsysd != xsysd) {
+		dispatch_focus_out(win); // Nothing may stay held on the devices we leave.
+	}
+	win->xsysd = xsysd;
+	if (xsysd != NULL) {
+		U_LOG_I("XCB: window input routed to qwerty (keyboard, buttons, pointer motion)");
+	}
+#else
+	(void)xsysd;
+#endif
+	os_mutex_unlock(&win->pump_lock);
+}
 
 static xcb_atom_t
 intern_atom(xcb_connection_t *conn, const char *name)
@@ -184,6 +440,7 @@ comp_vk_native_window_xcb_create(uint32_t width,
 	win->width = width;
 	win->height = height;
 	win->valid = true;
+	os_mutex_init(&win->pump_lock);
 
 	win->window = xcb_generate_id(conn);
 
@@ -210,7 +467,7 @@ comp_vk_native_window_xcb_create(uint32_t width,
 		value_mask = XCB_CW_BACK_PIXEL | XCB_CW_BORDER_PIXEL | XCB_CW_EVENT_MASK | XCB_CW_COLORMAP;
 		value_list[0] = 0; // fully-transparent background fill
 		value_list[1] = 0; // border pixel (required with a non-parent colormap)
-		value_list[2] = XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_KEY_PRESS;
+		value_list[2] = XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_WINDOW_INPUT_EVENT_MASK;
 		value_list[3] = win->colormap;
 		U_LOG_I("XCB: transparent-background mode — 32-bit ARGB visual 0x%x", (unsigned)argb_visual);
 	} else {
@@ -220,7 +477,7 @@ comp_vk_native_window_xcb_create(uint32_t width,
 		}
 		value_mask = XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK;
 		value_list[0] = screen->black_pixel;
-		value_list[1] = XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_KEY_PRESS;
+		value_list[1] = XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_WINDOW_INPUT_EVENT_MASK;
 	}
 
 	// Position on the 3D display. The vendor plug-in publishes the panel's
@@ -322,6 +579,10 @@ comp_vk_native_window_xcb_create(uint32_t width,
 		}
 	}
 	xcb_flush(conn);
+
+#ifdef XRT_BUILD_DRIVER_QWERTY
+	load_keymap(win);
+#endif
 
 	if (fullscreen_monitor >= 0) {
 		// Resolve the RandR monitor name for a human-readable breadcrumb; WARN
@@ -558,9 +819,41 @@ comp_vk_native_window_xcb_pump(struct comp_vk_native_window_xcb *win)
 		return;
 	}
 
+	os_mutex_lock(&win->pump_lock);
+
 	xcb_generic_event_t *event = NULL;
-	while ((event = xcb_poll_for_event(win->connection)) != NULL) {
-		switch (event->response_type & ~0x80) {
+	xcb_generic_event_t *pending = NULL; // Read ahead by the autorepeat check.
+	for (;;) {
+		if (pending != NULL) {
+			event = pending;
+			pending = NULL;
+		} else if ((event = xcb_poll_for_event(win->connection)) == NULL) {
+			break;
+		}
+		const uint8_t type = event->response_type & ~0x80;
+
+#ifdef XRT_BUILD_DRIVER_QWERTY
+		if (type == XCB_KEY_RELEASE) {
+			pending = xcb_poll_for_event(win->connection);
+			if (is_autorepeat_pair(win, event, pending)) {
+				if (debug_get_bool_option_xcb_win_qtrace()) {
+					U_LOG_W("[QTRACE] XCB autorepeat pair dropped keycode=%u",
+					        ((xcb_key_press_event_t *)event)->detail);
+				}
+				free(event);
+				free(pending);
+				pending = NULL;
+				continue;
+			}
+		}
+		track_key_state(win, event);
+		if (handle_input_event(win, event)) {
+			free(event);
+			continue;
+		}
+#endif
+
+		switch (type) {
 		case XCB_CONFIGURE_NOTIFY: {
 			xcb_configure_notify_event_t *cfg = (xcb_configure_notify_event_t *)event;
 			if (cfg->width > 0 && cfg->height > 0) {
@@ -577,7 +870,12 @@ comp_vk_native_window_xcb_pump(struct comp_vk_native_window_xcb *win)
 			}
 			break;
 		}
-		case XCB_DESTROY_NOTIFY: win->valid = false; break;
+		case XCB_DESTROY_NOTIFY:
+			win->valid = false;
+#ifdef XRT_BUILD_DRIVER_QWERTY
+			dispatch_focus_out(win); // Nothing may stay held on a window that is gone.
+#endif
+			break;
 		default: break;
 		}
 		free(event);
@@ -586,6 +884,8 @@ comp_vk_native_window_xcb_pump(struct comp_vk_native_window_xcb *win)
 	if (xcb_connection_has_error(win->connection)) {
 		win->valid = false;
 	}
+
+	os_mutex_unlock(&win->pump_lock);
 }
 
 void
@@ -649,6 +949,16 @@ comp_vk_native_window_xcb_destroy(struct comp_vk_native_window_xcb **win_ptr)
 		return;
 	}
 	struct comp_vk_native_window_xcb *win = *win_ptr;
+
+	// The window is about to vanish mid-whatever: a button or key held now
+	// would never see its release event (#1700).
+	os_mutex_lock(&win->pump_lock);
+#ifdef XRT_BUILD_DRIVER_QWERTY
+	dispatch_focus_out(win);
+#endif
+	win->xsysd = NULL;
+	os_mutex_unlock(&win->pump_lock);
+
 	if (win->connection != NULL) {
 		if (win->window != XCB_NONE) {
 			xcb_destroy_window(win->connection, win->window);
@@ -661,6 +971,8 @@ comp_vk_native_window_xcb_destroy(struct comp_vk_native_window_xcb **win_ptr)
 		}
 		xcb_disconnect(win->connection);
 	}
+	os_mutex_destroy(&win->pump_lock);
+	free(win->keysyms);
 	free(win);
 	*win_ptr = NULL;
 }

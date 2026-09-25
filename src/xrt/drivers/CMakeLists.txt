@@ -31,6 +31,13 @@ if(XRT_BUILD_DRIVER_QWERTY)
 		list(APPEND QWERTY_SOURCES qwerty/qwerty_macos.m)
 	endif()
 
+	# On desktop Linux, add the X11 input handler for the vk_native compositor's
+	# self-created XCB window (#1727). Needs only <X11/keysym.h> (a header), which
+	# comes with the x11-xcb dependency that XRT_HAVE_XCB already requires.
+	if(XRT_HAVE_XCB AND NOT ANDROID)
+		list(APPEND QWERTY_SOURCES qwerty/qwerty_xcb.c)
+	endif()
+
 	add_library(drv_qwerty STATIC ${QWERTY_SOURCES})
 	# aux_math (PUBLIC displayxr::math_xrt) provides the canonical rig converters
 	# (dxr_view_rig_*) + dxr_view_math.h, used by the qwerty V-toggle to switch
