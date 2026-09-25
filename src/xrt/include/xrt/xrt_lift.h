@@ -59,6 +59,23 @@ struct xrt_lift_weave_rect
 	struct xrt_dp_lift_params params;
 };
 
+//! One stream's counters + effective rate (XrLiftStreamStatsDXR).
+struct xrt_lift_stream_stats
+{
+	uint32_t priority; //!< XrLiftPriorityDXR value (0 paused .. 3 high)
+	uint32_t reserved;
+	uint64_t submitted;
+	uint64_t converted;
+	uint64_t dropped;
+	uint64_t failed;
+	uint64_t latency_last_ns;
+	uint64_t latency_avg_ns;
+	uint64_t latency_min_ns;
+	uint64_t latency_max_ns;
+	float rate_hz;
+	uint32_t reserved2;
+};
+
 #ifdef __cplusplus
 }
 #endif

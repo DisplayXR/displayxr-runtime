@@ -100,6 +100,16 @@ static_assert(XR_WEAVE_SNAP_GRID_MAX_POINTS_DXR == U_SNAP_GRID_MAX_POINTS, "grid
 static_assert(XR_WEAVE_SNAP_GRID_MAX_AXIS_DXR == U_SNAP_GRID_MAX_AXIS, "grid axis bound mismatch");
 static_assert(XR_WEAVE_SNAP_GRID_NO_DELTA_DXR == U_SNAP_GRID_NO_DELTA, "grid sentinel mismatch");
 
+#ifdef OXR_HAVE_DXR_lift
+#include "xrt/xrt_lift.h"
+#include "oxr_handle.h"
+//! XR_DXR_lift (ADR-042) bridge: latch the lift-flagged rects of the next submit.
+xrt_result_t
+comp_ipc_client_compositor_lift_weave_rects(struct xrt_compositor *xc,
+                                            uint32_t count,
+                                            const struct xrt_lift_weave_rect *rects);
+#endif
+
 // Forward decls of the IPC-bridge wrappers (defined in ipc_client_compositor.c).
 struct xrt_compositor;
 
@@ -667,6 +677,72 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 			}
 			acquire_fd = sync_in->acquireFenceFd;
 		}
+	}
+#endif
+
+#ifdef OXR_HAVE_DXR_lift
+	// XR_DXR_lift (ADR-042): rects whose content is 2D and must be lifted
+	// before weaving. Sent as its own call right before the submit it belongs
+	// to (same connection, so the order is the service's order); the service
+	// consumes the set with that submit. Ignored unless XR_DXR_lift is enabled.
+	const XrWeaveSubmitLiftRectsDXR *lifts =
+	    OXR_GET_INPUT_FROM_CHAIN(submitInfo, XR_TYPE_WEAVE_SUBMIT_LIFT_RECTS_DXR, XrWeaveSubmitLiftRectsDXR);
+	if (lifts != NULL && lifts->liftCount > 0 && sess->sys->inst->extensions.DXR_lift) {
+		if (lifts->liftCount > XR_WEAVE_SUBMIT_MAX_LIFT_RECTS_DXR || lifts->lifts == NULL) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrWeaveSubmitDXR: XrWeaveSubmitLiftRectsDXR::liftCount (%u) must be 1..%u with "
+			                 "a non-NULL lifts array",
+			                 lifts->liftCount, (uint32_t)XR_WEAVE_SUBMIT_MAX_LIFT_RECTS_DXR);
+		}
+		if (rect_count == 0) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrWeaveSubmitDXR: XrWeaveSubmitLiftRectsDXR needs XrWeaveSubmitRectsDXR (the "
+			                 "lift indexes its rects)");
+		}
+		struct xrt_lift_weave_rect lr[XR_WEAVE_SUBMIT_MAX_LIFT_RECTS_DXR];
+		memset(lr, 0, sizeof(lr));
+		for (uint32_t i = 0; i < lifts->liftCount; i++) {
+			const XrWeaveRectLiftDXR *e = &lifts->lifts[i];
+			if (e->type != XR_TYPE_WEAVE_RECT_LIFT_DXR || e->rectIndex >= rect_count) {
+				return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+				                 "xrWeaveSubmitDXR: lifts[%u] has a bad type or rectIndex (%u >= %u)", i,
+				                 e->rectIndex, rect_count);
+			}
+			struct oxr_lift_stream_dxr *ls = XRT_CAST_OXR_HANDLE_TO_PTR(struct oxr_lift_stream_dxr *, e->stream);
+			if (ls == NULL || ls->handle.debug != OXR_XR_DEBUG_LIFTSTREAM ||
+			    ls->handle.state != OXR_HANDLE_STATE_LIVE || ls->sess != sess) {
+				return oxr_error(&log, XR_ERROR_HANDLE_INVALID, "xrWeaveSubmitDXR: lifts[%u].stream", i);
+			}
+			if (ls->mode != XRT_DP_LIFT_MODE_SBS && ls->mode != XRT_DP_LIFT_MODE_NVIEW) {
+				return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+				                 "xrWeaveSubmitDXR: lifts[%u].stream must be an SBS or NVIEW stream", i);
+			}
+			lr[i].stream_id = ls->id;
+			lr[i].rect_index = e->rectIndex;
+			const XrLiftOptionsDXR *o = OXR_GET_INPUT_FROM_CHAIN(e, XR_TYPE_LIFT_OPTIONS_DXR, XrLiftOptionsDXR);
+			if (o != NULL) {
+				if (o->viewpointSource == XR_LIFT_VIEWPOINT_SOURCE_EXPLICIT_DXR ||
+				    o->viewCount > XR_LIFT_MAX_VIEWS_DXR) {
+					return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+					                 "xrWeaveSubmitDXR: lifts[%u] options: TRACKED viewpoints only on the "
+					                 "weave path, viewCount <= %u",
+					                 i, (uint32_t)XR_LIFT_MAX_VIEWS_DXR);
+				}
+				lr[i].has_params = true;
+				lr[i].params.struct_size = (uint32_t)sizeof(lr[i].params);
+				lr[i].params.convergence =
+				    o->convergence < 0.0f ? -1.0f : (o->convergence > 1.0f ? 1.0f : o->convergence);
+				lr[i].params.strength = o->strength >= 0.0f ? o->strength : 1.0f;
+				lr[i].params.inpaint = o->inpaint == XR_TRUE ? 1u : 0u;
+				lr[i].params.view_count = o->viewCount;
+				lr[i].params.focal_px = o->focalPx > 0.0f ? o->focalPx : 0.0f;
+			}
+		}
+		xrt_result_t lx = comp_ipc_client_compositor_lift_weave_rects(&sess->xcn->base, lifts->liftCount, lr);
+		if (lx == XRT_ERROR_IPC_FAILURE) {
+			OXR_CHECK_XRET_MSG(&log, sess, lx, "xrWeaveSubmitDXR: lift rects failed (xrt_result=%d)", (int)lx);
+		}
+		// Any other refusal is non-fatal: the rects are then woven as drawn.
 	}
 #endif
 

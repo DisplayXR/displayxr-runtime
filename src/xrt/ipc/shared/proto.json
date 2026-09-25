@@ -902,6 +902,22 @@
 		]
 	},
 
+	"lift_stream_set_priority": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"},
+			{"name": "priority", "type": "uint32_t"}
+		]
+	},
+
+	"lift_stream_stats": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"}
+		],
+		"out": [
+			{"name": "stats", "type": "struct xrt_lift_stream_stats"}
+		]
+	},
+
 	"lift_weave_rects": {
 		"in": [
 			{"name": "args", "type": "struct ipc_arg_lift_weave_rects"}

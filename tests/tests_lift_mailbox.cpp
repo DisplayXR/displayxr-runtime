@@ -24,6 +24,13 @@
 
 #include "util/u_lift_mailbox.h"
 
+#include "sim_display_fake_ply.h"
+
+#include <algorithm>
+#include <cstring>
+#include <string>
+#include <vector>
+
 namespace {
 
 //! Submit one frame end to end on the producer side; returns its frame id.
@@ -261,4 +268,132 @@ TEST_CASE("lift mailbox: out-of-range slots from the wire are inert", "[lift]")
 	CHECK(mb.latest == -1);
 	// Committing a slot that was never begun is refused too.
 	CHECK(u_lift_mailbox_commit_submit(&mb, 0, 0, 0, 1, 1) == 0);
+}
+
+/*
+ *
+ * Cross-stream scheduling (XrLiftPriorityDXR).
+ *
+ */
+
+namespace {
+
+std::vector<uint64_t>
+plan(u_lift_sched &s, const std::vector<u_lift_sched_entry> &e)
+{
+	uint64_t out[32] = {};
+	uint32_t n = u_lift_sched_plan(&s, e.data(), (uint32_t)e.size(), out, 32);
+	return std::vector<uint64_t>(out, out + n);
+}
+
+} // namespace
+
+TEST_CASE("lift sched: HIGH every round, NORMAL round-robin one per round", "[lift][sched]")
+{
+	u_lift_sched s;
+	u_lift_sched_init(&s);
+	// A call: the active speaker HIGH, three other tiles NORMAL.
+	std::vector<u_lift_sched_entry> e = {
+	    {1, U_LIFT_PRIORITY_NORMAL, true},
+	    {2, U_LIFT_PRIORITY_HIGH, true},
+	    {3, U_LIFT_PRIORITY_NORMAL, true},
+	    {4, U_LIFT_PRIORITY_NORMAL, true},
+	};
+	CHECK(plan(s, e) == std::vector<uint64_t>{2, 1});
+	CHECK(plan(s, e) == std::vector<uint64_t>{2, 3});
+	CHECK(plan(s, e) == std::vector<uint64_t>{2, 4});
+	CHECK(plan(s, e) == std::vector<uint64_t>{2, 1}); // wraps
+}
+
+TEST_CASE("lift sched: only streams with a new frame are planned", "[lift][sched]")
+{
+	u_lift_sched s;
+	u_lift_sched_init(&s);
+	std::vector<u_lift_sched_entry> e = {
+	    {1, U_LIFT_PRIORITY_HIGH, false},
+	    {2, U_LIFT_PRIORITY_NORMAL, false},
+	    {3, U_LIFT_PRIORITY_NORMAL, true},
+	};
+	CHECK(plan(s, e) == std::vector<uint64_t>{3});
+	e[2].pending = false;
+	CHECK(plan(s, e).empty());
+	CHECK(s.round == 1); // an idle service does not advance rounds
+}
+
+TEST_CASE("lift sched: LOW every 4th round, PAUSED never", "[lift][sched]")
+{
+	u_lift_sched s;
+	u_lift_sched_init(&s);
+	std::vector<u_lift_sched_entry> e = {
+	    {1, U_LIFT_PRIORITY_NORMAL, true},
+	    {2, U_LIFT_PRIORITY_LOW, true},
+	    {3, U_LIFT_PRIORITY_PAUSED, true},
+	};
+	int low_hits = 0;
+	for (int r = 0; r < 16; r++) {
+		auto p = plan(s, e);
+		for (uint64_t id : p) {
+			CHECK(id != 3);
+			low_hits += id == 2 ? 1 : 0;
+		}
+		CHECK(std::find(p.begin(), p.end(), 1) != p.end()); // NORMAL every round
+	}
+	CHECK(low_hits == 16 / U_LIFT_LOW_EVERY_N);
+
+	// Only a PAUSED stream pending: nothing, and no round consumed.
+	std::vector<u_lift_sched_entry> paused = {{3, U_LIFT_PRIORITY_PAUSED, true}};
+	uint64_t before = s.round;
+	CHECK(plan(s, paused).empty());
+	CHECK(s.round == before);
+}
+
+TEST_CASE("lift mailbox: effective rate from publish intervals", "[lift]")
+{
+	u_lift_mailbox mb;
+	u_lift_mailbox_init(&mb);
+	CHECK(u_lift_mailbox_rate_hz(&mb) == 0.0f);
+	uint64_t t = 1000;
+	for (int i = 0; i < 20; i++) {
+		submit(mb, i, t);
+		REQUIRE(convert(mb, t + 1, t + 2));
+		t += 40 * 1000 * 1000; // 25 Hz
+	}
+	CHECK(u_lift_mailbox_rate_hz(&mb) == Catch::Approx(25.0f).epsilon(0.01));
+}
+
+TEST_CASE("sim fake lift: the splat PLY is a valid two-layer 3DGS binary PLY", "[lift][ply]")
+{
+	const uint32_t w = 64, h = 48;
+	std::vector<uint8_t> rgba(w * h * 4, 0);
+	for (uint32_t i = 0; i < w * h; i++) {
+		rgba[i * 4 + 0] = 255; // red photo
+		rgba[i * 4 + 3] = 255;
+	}
+	size_t need = sim_fake_ply_write(nullptr, 0, rgba.data(), w, h, w * 4);
+	REQUIRE(need > 0);
+	std::vector<uint8_t> ply(need);
+	CHECK(sim_fake_ply_write(ply.data(), ply.size() - 1, rgba.data(), w, h, w * 4) == need); // too small: nothing
+	CHECK(sim_fake_ply_write(ply.data(), ply.size(), rgba.data(), w, h, w * 4) == need);
+
+	std::string text(reinterpret_cast<const char *>(ply.data()), std::min<size_t>(ply.size(), 1024));
+	REQUIRE(text.rfind("ply\nformat binary_little_endian 1.0\n", 0) == 0);
+	CHECK(text.find("element vertex " + std::to_string(SIM_FAKE_PLY_SPLATS) + "\n") != std::string::npos);
+	for (const char *prop : {"property float f_dc_0\n", "property float opacity\n", "property float rot_3\n"}) {
+		CHECK(text.find(prop) != std::string::npos);
+	}
+	size_t hdr_end = text.find("end_header\n");
+	REQUIRE(hdr_end != std::string::npos);
+	hdr_end += strlen("end_header\n");
+	CHECK(ply.size() - hdr_end == (size_t)SIM_FAKE_PLY_SPLATS * SIM_FAKE_PLY_FLOATS_PER_SPLAT * 4);
+	CHECK(SIM_FAKE_PLY_SPLATS >= 200); // "a few hundred splats"
+
+	// First splat: front layer (z = 0), red dominant in its SH DC term.
+	float f[SIM_FAKE_PLY_FLOATS_PER_SPLAT];
+	memcpy(f, ply.data() + hdr_end, sizeof(f));
+	CHECK(f[2] == 0.0f);
+	CHECK(f[6] > f[7]);
+	CHECK(f[6] > f[8]);
+	// Last splat: back layer, behind the front one.
+	memcpy(f, ply.data() + ply.size() - sizeof(f), sizeof(f));
+	CHECK(f[2] > 0.0f);
 }

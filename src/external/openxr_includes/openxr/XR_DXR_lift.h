@@ -52,7 +52,8 @@
  * XR_ERROR_FEATURE_UNSUPPORTED from every entry point.
  *
  * Version history: 1 = initial (properties, streams, texture results, the
- * weave-rect lift chain, and the Gaussian-splat blob path reserved + wired).
+ * weave-rect lift chain, the Gaussian-splat blob path, per-stream priority
+ * scheduling and stream stats).
  */
 #ifndef XR_DXR_LIFT_H
 #define XR_DXR_LIFT_H 1
@@ -82,6 +83,8 @@ extern "C" {
 //! SUCCESS-class result: the acquire found no result newer than the last one
 //! it handed out. Not an error — keep presenting the previous result.
 #define XR_LIFT_NOT_READY_DXR                ((XrResult)1004999279)
+// Second decade 1004999280..289 (the first is full).
+#define XR_TYPE_LIFT_STREAM_STATS_DXR        ((XrStructureType)1004999280)
 
 //! Size of XrLiftPropertiesDXR::backend, NUL included.
 #define XR_LIFT_BACKEND_NAME_MAX_SIZE_DXR 32
@@ -149,6 +152,30 @@ typedef enum XrLiftViewpointSourceDXR {
     XR_LIFT_VIEWPOINT_SOURCE_MAX_ENUM_DXR = 0x7FFFFFFF
 } XrLiftViewpointSourceDXR;
 
+/*!
+ * How the service's lift thread schedules a stream against the others (the
+ * module converts one frame at a time — one GPU, often one serialised
+ * inference queue — so N concurrent streams share its throughput). Each
+ * scheduling ROUND converts, in order:
+ *
+ *  - every HIGH stream that has a new frame;
+ *  - ONE NORMAL stream with a new frame, round-robin across NORMAL streams;
+ *  - every LOW stream with a new frame, but only on every 4th round;
+ *  - PAUSED streams never — they keep serving their last result (the weave
+ *    keeps weaving it; an acquire keeps reporting NOT READY).
+ *
+ * Default NORMAL. A per-STREAM setting, changed rarely (e.g. when the active
+ * speaker of a call changes), so it is its own call rather than a per-frame
+ * field. Scheduling is runtime policy: the vendor module never sees it.
+ */
+typedef enum XrLiftPriorityDXR {
+    XR_LIFT_PRIORITY_PAUSED_DXR = 0,
+    XR_LIFT_PRIORITY_LOW_DXR = 1,
+    XR_LIFT_PRIORITY_NORMAL_DXR = 2,
+    XR_LIFT_PRIORITY_HIGH_DXR = 3,
+    XR_LIFT_PRIORITY_MAX_ENUM_DXR = 0x7FFFFFFF
+} XrLiftPriorityDXR;
+
 typedef enum XrLiftBlobFormatDXR {
     //! Binary little-endian PLY in the reference 3DGS layout (x y z nx ny nz
     //! f_dc_0..2 [f_rest_*] opacity scale_0..2 rot_0..3).
@@ -205,7 +232,11 @@ typedef struct XrLiftStreamCreateInfoDXR {
  * calibrated budget). @c viewCount is the number of views an NVIEW stream
  * produces (2 for SBS; ignored for DEPTH / GAUSSIANS), ≤ maxViews. With
  * EXPLICIT viewpoints, @c viewpoints holds @c viewCount display-space positions
- * (metres); on the weave path viewpoints must be TRACKED.
+ * (metres); on the weave path viewpoints must be TRACKED. @c focalPx is the
+ * submitted image's focal length in pixels of @c extent (for a photo, e.g. the
+ * fx of an estimated intrinsics); <= 0 = unknown, the module assumes its
+ * default field of view. Photo → Gaussians modules take it as input; DEPTH /
+ * SBS / NVIEW modules ignore it.
  */
 typedef struct XrLiftOptionsDXR {
     XrStructureType            type;            //!< XR_TYPE_LIFT_OPTIONS_DXR
@@ -216,6 +247,7 @@ typedef struct XrLiftOptionsDXR {
     XrLiftViewpointSourceDXR   viewpointSource;
     uint32_t                   viewCount;       //!< 1..XR_LIFT_MAX_VIEWS_DXR (NVIEW); 2 for SBS
     const XrVector3f*          viewpoints;      //!< viewCount entries when EXPLICIT, else ignored
+    float                      focalPx;         //!< input focal length in input pixels; <= 0 = unknown (GAUSSIANS)
 } XrLiftOptionsDXR;
 
 /*!
@@ -327,6 +359,25 @@ typedef struct XrWeaveSubmitLiftRectsDXR {
     const XrWeaveRectLiftDXR*  lifts;
 } XrWeaveSubmitLiftRectsDXR;
 
+/*!
+ * One stream's counters and EFFECTIVE conversion rate — what its priority
+ * actually buys it under the current load (xrGetLiftStreamStatsDXR).
+ */
+typedef struct XrLiftStreamStatsDXR {
+    XrStructureType     type;             //!< XR_TYPE_LIFT_STREAM_STATS_DXR
+    void* XR_MAY_ALIAS  next;
+    XrLiftPriorityDXR   priority;
+    uint64_t            framesSubmitted;  //!< frames the mailbox accepted
+    uint64_t            framesConverted;  //!< results published
+    uint64_t            framesDropped;    //!< superseded before conversion (latest wins)
+    uint64_t            framesFailed;     //!< conversions the module declined
+    XrDuration          latencyLast;      //!< submit → result, ns
+    XrDuration          latencyAverage;   //!< moving average, ns
+    XrDuration          latencyMin;
+    XrDuration          latencyMax;
+    float               conversionRate;   //!< results per second, moving average (0 = none yet)
+} XrLiftStreamStatsDXR;
+
 typedef XrResult (XRAPI_PTR *PFN_xrGetLiftPropertiesDXR)(
     XrSession session, XrLiftPropertiesDXR* properties);
 typedef XrResult (XRAPI_PTR *PFN_xrCreateLiftStreamDXR)(
@@ -336,6 +387,8 @@ typedef XrResult (XRAPI_PTR *PFN_xrSubmitLiftFrameDXR)(
     XrLiftStreamDXR stream, const XrLiftFrameSubmitInfoDXR* submitInfo, uint64_t* frameId);
 typedef XrResult (XRAPI_PTR *PFN_xrAcquireLiftResultDXR)(XrLiftStreamDXR stream, XrLiftResultDXR* result);
 typedef XrResult (XRAPI_PTR *PFN_xrAcquireLiftBlobDXR)(XrLiftStreamDXR stream, XrLiftBlobDXR* blob);
+typedef XrResult (XRAPI_PTR *PFN_xrSetLiftStreamPriorityDXR)(XrLiftStreamDXR stream, XrLiftPriorityDXR priority);
+typedef XrResult (XRAPI_PTR *PFN_xrGetLiftStreamStatsDXR)(XrLiftStreamDXR stream, XrLiftStreamStatsDXR* stats);
 
 #ifndef XR_NO_PROTOTYPES
 
@@ -368,6 +421,14 @@ XRAPI_ATTR XrResult XRAPI_CALL xrAcquireLiftResultDXR(XrLiftStreamDXR stream, Xr
 //! The newest finished blob (GAUSSIANS streams), two-call idiom — see
 //! XrLiftBlobDXR. XR_ERROR_VALIDATION_FAILURE on a texture-mode stream.
 XRAPI_ATTR XrResult XRAPI_CALL xrAcquireLiftBlobDXR(XrLiftStreamDXR stream, XrLiftBlobDXR* blob);
+
+//! Set the stream's scheduling priority (see XrLiftPriorityDXR). Cheap; takes
+//! effect at the lift thread's next round. Default NORMAL.
+XRAPI_ATTR XrResult XRAPI_CALL xrSetLiftStreamPriorityDXR(XrLiftStreamDXR stream, XrLiftPriorityDXR priority);
+
+//! The stream's counters and effective conversion rate. Cheap (one IPC round
+//! trip, no GPU work) — poll it at UI rates, not per frame.
+XRAPI_ATTR XrResult XRAPI_CALL xrGetLiftStreamStatsDXR(XrLiftStreamDXR stream, XrLiftStreamStatsDXR* stats);
 
 #endif /* !XR_NO_PROTOTYPES */
 

@@ -30846,3 +30846,24 @@ comp_d3d11_service_lift_set_weave_rects(struct xrt_compositor *xc,
 	c->render.lift_rect_count = count;
 	return true;
 }
+
+extern "C" xrt_result_t
+comp_d3d11_service_lift_set_priority(struct xrt_system_compositor *xsysc,
+                                     uint64_t owner,
+                                     uint64_t id,
+                                     uint32_t priority)
+{
+	struct d3d11_lift *l = svc_lift(xsysc);
+	return l != nullptr ? d3d11_lift_set_priority(l, owner, id, priority) : XRT_ERROR_FEATURE_NOT_SUPPORTED;
+}
+
+extern "C" xrt_result_t
+comp_d3d11_service_lift_get_stats(struct xrt_system_compositor *xsysc,
+                                  uint64_t owner,
+                                  uint64_t id,
+                                  struct xrt_lift_stream_stats *out)
+{
+	memset(out, 0, sizeof(*out));
+	struct d3d11_lift *l = svc_lift(xsysc);
+	return l != nullptr ? d3d11_lift_get_stats(l, owner, id, out) : XRT_ERROR_FEATURE_NOT_SUPPORTED;
+}

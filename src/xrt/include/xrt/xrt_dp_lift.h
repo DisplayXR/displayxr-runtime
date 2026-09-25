@@ -105,6 +105,9 @@ struct xrt_dp_lift_stream_info
 /*!
  * Per-frame conversion parameters (runtime-filled).
  *
+ * @c focal_px (appended) is the input image's focal length in pixels; <= 0 =
+ * unknown.
+ *
  * @c convergence is the RELATIVE depth placed at the display plane (zero
  * disparity), normalised to [0, 1] over the frame's depth range: 0 = the
  * nearest content sits on the glass (everything else behind it), 1 = the
@@ -120,6 +123,14 @@ struct xrt_dp_lift_params
 	float strength;      //!< disparity scale; 1 = the module's calibrated budget
 	uint32_t inpaint;    //!< non-zero = fill disocclusions
 	uint32_t view_count; //!< views to produce (2 for SBS, N for NVIEW; ignored otherwise)
+	/*!
+	 * Focal length of the submitted image, in PIXELS of the input (w x h) —
+	 * what a photo → Gaussians module (SHARP-class) takes as its intrinsics
+	 * input. <= 0 = unknown: the module assumes its default field of view.
+	 * Appended (read only when struct_size covers it); DEPTH / SBS / NVIEW
+	 * modules ignore it.
+	 */
+	float focal_px;
 };
 
 /*!
