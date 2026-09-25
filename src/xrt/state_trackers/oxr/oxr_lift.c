@@ -88,6 +88,13 @@ comp_ipc_client_compositor_lift_acquire_blob(struct xrt_compositor *xc,
                                              bool *out_delivered,
                                              struct xrt_lift_blob_info *out_info);
 
+xrt_result_t
+comp_ipc_client_compositor_lift_set_priority(struct xrt_compositor *xc, uint64_t stream_id, uint32_t priority);
+xrt_result_t
+comp_ipc_client_compositor_lift_stats(struct xrt_compositor *xc,
+                                      uint64_t stream_id,
+                                      struct xrt_lift_stream_stats *out_stats);
+
 // The OpenXR and DP encodings must agree (the wire carries the DP one).
 _Static_assert(XR_LIFT_MODE_DEPTH_DXR == XRT_DP_LIFT_MODE_DEPTH, "lift mode mismatch");
 _Static_assert(XR_LIFT_MODE_SBS_DXR == XRT_DP_LIFT_MODE_SBS, "lift mode mismatch");
@@ -97,6 +104,9 @@ _Static_assert(XR_LIFT_STATE_READY_DXR == XRT_DP_LIFT_STATE_READY, "lift state m
 _Static_assert(XR_LIFT_STATE_ACTIVATING_DXR == XRT_DP_LIFT_STATE_ACTIVATING, "lift state mismatch");
 _Static_assert(XR_LIFT_BLOB_FORMAT_PLY_3DGS_DXR == XRT_DP_LIFT_BLOB_PLY_3DGS, "blob format mismatch");
 _Static_assert(XR_LIFT_BLOB_FORMAT_SOG_DXR == XRT_DP_LIFT_BLOB_SOG, "blob format mismatch");
+_Static_assert(XR_LIFT_PRIORITY_PAUSED_DXR == 0 && XR_LIFT_PRIORITY_LOW_DXR == 1 && XR_LIFT_PRIORITY_NORMAL_DXR == 2 &&
+                   XR_LIFT_PRIORITY_HIGH_DXR == 3,
+               "lift priority values are the wire values (u_lift_priority)");
 _Static_assert(XR_LIFT_MAX_VIEWS_DXR == XRT_LIFT_MAX_VIEWS, "lift view bound mismatch");
 _Static_assert(XR_WEAVE_SUBMIT_MAX_LIFT_RECTS_DXR == XRT_LIFT_WEAVE_RECTS_MAX, "lift rect bound mismatch");
 _Static_assert(XR_LIFT_BACKEND_NAME_MAX_SIZE_DXR == sizeof(((struct xrt_dp_lift_caps *)0)->backend),
@@ -145,6 +155,7 @@ lift_params_from_xr(const XrLiftOptionsDXR *o, uint32_t mode, struct xrt_dp_lift
 	out->strength = o->strength >= 0.0f ? o->strength : 1.0f;
 	out->inpaint = o->inpaint == XR_TRUE ? 1u : 0u;
 	out->view_count = o->viewCount;
+	out->focal_px = o->focalPx > 0.0f ? o->focalPx : 0.0f;
 	if (out->view_count == 0) {
 		out->view_count = mode == XRT_DP_LIFT_MODE_NVIEW ? 4u : 2u;
 	}
@@ -467,6 +478,55 @@ oxr_xrAcquireLiftBlobDXR(XrLiftStreamDXR stream, XrLiftBlobDXR *blob)
 		return oxr_error(&log, XR_ERROR_SIZE_INSUFFICIENT, "xrAcquireLiftBlobDXR: capacity %u < %u",
 		                 blob->byteCapacityInput, blob->byteCountOutput);
 	}
+	return XR_SUCCESS;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetLiftStreamPriorityDXR(XrLiftStreamDXR stream, XrLiftPriorityDXR priority)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_lift_stream_dxr *st = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_LIFT_STREAM_AND_INIT_LOG(&log, stream, st, "xrSetLiftStreamPriorityDXR");
+	struct oxr_session *sess = st->sess;
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	if ((int)priority < (int)XR_LIFT_PRIORITY_PAUSED_DXR || (int)priority > (int)XR_LIFT_PRIORITY_HIGH_DXR) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "xrSetLiftStreamPriorityDXR: priority (%d) invalid",
+		                 (int)priority);
+	}
+	xrt_result_t xret = comp_ipc_client_compositor_lift_set_priority(&sess->xcn->base, st->id, (uint32_t)priority);
+	return lift_xret(&log, sess, xret, "xrSetLiftStreamPriorityDXR");
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetLiftStreamStatsDXR(XrLiftStreamDXR stream, XrLiftStreamStatsDXR *stats)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_lift_stream_dxr *st = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_LIFT_STREAM_AND_INIT_LOG(&log, stream, st, "xrGetLiftStreamStatsDXR");
+	struct oxr_session *sess = st->sess;
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, stats, XR_TYPE_LIFT_STREAM_STATS_DXR);
+
+	struct xrt_lift_stream_stats s;
+	xrt_result_t xret = comp_ipc_client_compositor_lift_stats(&sess->xcn->base, st->id, &s);
+	XrResult xr = lift_xret(&log, sess, xret, "xrGetLiftStreamStatsDXR");
+	if (xr != XR_SUCCESS) {
+		return xr;
+	}
+	stats->priority = (XrLiftPriorityDXR)s.priority;
+	stats->framesSubmitted = s.submitted;
+	stats->framesConverted = s.converted;
+	stats->framesDropped = s.dropped;
+	stats->framesFailed = s.failed;
+	stats->latencyLast = (XrDuration)s.latency_last_ns;
+	stats->latencyAverage = (XrDuration)s.latency_avg_ns;
+	stats->latencyMin = (XrDuration)s.latency_min_ns;
+	stats->latencyMax = (XrDuration)s.latency_max_ns;
+	stats->conversionRate = s.rate_hz;
 	return XR_SUCCESS;
 }
 

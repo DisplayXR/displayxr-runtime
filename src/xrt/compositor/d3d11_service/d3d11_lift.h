@@ -44,6 +44,7 @@
 #include "xrt/xrt_results.h"
 #include "xrt/xrt_dp_lift.h"
 #include "xrt/xrt_display_metrics.h"
+#include "xrt/xrt_lift.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -234,3 +235,11 @@ d3d11_lift_acquire_blob(struct d3d11_lift *lift,
                         bool *out_ready,
                         struct d3d11_lift_blob_info *info,
                         uint8_t **out_bytes);
+
+//! Set a stream's scheduling priority (XrLiftPriorityDXR: 0 paused .. 3 high).
+xrt_result_t
+d3d11_lift_set_priority(struct d3d11_lift *lift, uint64_t owner, uint64_t id, uint32_t priority);
+
+//! A stream's counters + effective conversion rate.
+xrt_result_t
+d3d11_lift_get_stats(struct d3d11_lift *lift, uint64_t owner, uint64_t id, struct xrt_lift_stream_stats *out);

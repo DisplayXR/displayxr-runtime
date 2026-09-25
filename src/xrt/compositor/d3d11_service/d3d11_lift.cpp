@@ -188,6 +188,7 @@ struct lift_stream
 	float last_viewpoints[3 * XRT_DP_LIFT_MAX_EXPLICIT_VIEWPOINTS] = {};
 	uint32_t last_viewpoint_floats = 0;
 
+	uint32_t priority = U_LIFT_PRIORITY_NORMAL; //!< XrLiftPriorityDXR
 	bool dead = false;       //!< destroy requested; the lift thread reaps it
 	bool converting = false; //!< the lift thread is inside a conversion for it
 
@@ -260,7 +261,7 @@ struct d3d11_lift
 	uint64_t next_stream_id = 0;
 	uint32_t live_streams = 0;
 	std::map<uint64_t, std::unique_ptr<lift_stream>> streams;
-	uint64_t rr_last = 0;
+	u_lift_sched sched = {}; //!< cross-stream priority scheduling (u_lift_mailbox.h)
 
 	std::thread thread;
 };
@@ -788,11 +789,22 @@ lift_convert_one(d3d11_lift *l, lift_stream &st, std::unique_lock<std::mutex> &l
 }
 
 static bool
+any_dead(d3d11_lift *l)
+{
+	for (auto &kv : l->streams) {
+		if (kv.second->dead) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool
 any_work(d3d11_lift *l)
 {
 	for (auto &kv : l->streams) {
 		const lift_stream &st = *kv.second;
-		if (st.dead || u_lift_mailbox_has_pending(&st.mb)) {
+		if (st.dead || (st.priority != U_LIFT_PRIORITY_PAUSED && u_lift_mailbox_has_pending(&st.mb))) {
 			return true;
 		}
 	}
@@ -806,9 +818,10 @@ lift_thread_main(d3d11_lift *l)
 	std::unique_lock<std::mutex> lk(l->mtx);
 	for (;;) {
 		l->cv.wait_for(lk, std::chrono::milliseconds(250), [&] {
+			// Frames only count as work once the module is READY (they wait,
+			// latest-wins, until then); dead streams always do (reaping).
 			return l->stop || (l->activate_requested && !l->activated) ||
-			       (l->caps.state == XRT_DP_LIFT_STATE_READY && any_work(l)) ||
-			       (l->activated && any_work(l));
+			       (l->activated && (any_dead(l) || (l->caps.state == XRT_DP_LIFT_STATE_READY && any_work(l))));
 		});
 		if (l->stop) {
 			break;
@@ -838,42 +851,44 @@ lift_thread_main(d3d11_lift *l)
 			continue; // frames wait (latest wins) until the module is READY
 		}
 
-		// Round robin over streams with a pending frame.
-		lift_stream *pick = nullptr;
+		// A failed stream's frames can never convert: drain them so the wait
+		// predicate does not spin on them.
 		for (auto &kv : l->streams) {
-			if (kv.first > l->rr_last && !kv.second->dead && !kv.second->dp_failed &&
-			    u_lift_mailbox_has_pending(&kv.second->mb)) {
-				pick = kv.second.get();
-				break;
+			lift_stream &st = *kv.second;
+			int32_t slot = -1;
+			while (st.dp_failed && u_lift_mailbox_take_pending(&st.mb, now, &slot, nullptr)) {
+				u_lift_mailbox_finish_input(&st.mb, slot);
+				st.mb.failed++;
 			}
 		}
-		if (pick == nullptr) {
-			for (auto &kv : l->streams) {
-				if (!kv.second->dead && !kv.second->dp_failed && u_lift_mailbox_has_pending(&kv.second->mb)) {
-					pick = kv.second.get();
-					break;
-				}
+
+		// One scheduling round (XrLiftPriorityDXR): HIGH streams with a new
+		// frame, one NORMAL round-robin, LOW every Nth round, PAUSED never.
+		std::vector<u_lift_sched_entry> entries;
+		entries.reserve(l->streams.size());
+		for (auto &kv : l->streams) { // std::map: ascending id, as the planner wants
+			const lift_stream &st = *kv.second;
+			if (st.dead || st.dp_failed) {
+				continue;
 			}
+			entries.push_back({st.id, st.priority, u_lift_mailbox_has_pending(&st.mb)});
 		}
-		if (pick == nullptr) {
-			// A failed stream's frames can never convert: drain them so the
-			// wait predicate does not spin.
-			for (auto &kv : l->streams) {
-				lift_stream &st = *kv.second;
-				int32_t slot = -1;
-				while (st.dp_failed && u_lift_mailbox_take_pending(&st.mb, now, &slot, nullptr)) {
-					u_lift_mailbox_finish_input(&st.mb, slot);
-					st.mb.failed++;
-				}
-			}
+		uint64_t plan_ids[64];
+		uint32_t n = u_lift_sched_plan(&l->sched, entries.data(), (uint32_t)entries.size(), plan_ids, 64);
+		if (n == 0) {
 			if (any_work(l)) {
-				// Only dead-but-pinned streams left: back off briefly.
+				// Only not-this-round LOW / dead-but-pinned left: back off briefly.
 				l->cv.wait_for(lk, std::chrono::milliseconds(5));
 			}
 			continue;
 		}
-		l->rr_last = pick->id;
-		lift_convert_one(l, *pick, lk);
+		for (uint32_t i = 0; i < n && !l->stop; i++) {
+			auto it = l->streams.find(plan_ids[i]); // re-look-up: unlocked between conversions
+			if (it == l->streams.end() || it->second->dead) {
+				continue;
+			}
+			lift_convert_one(l, *it->second, lk);
+		}
 	}
 
 	// Shutdown: every stream, then the DP, on this thread.
@@ -1697,5 +1712,52 @@ d3d11_lift_acquire_blob(struct d3d11_lift *l,
 		}
 		memcpy(*out_bytes, blob->data(), blob->size());
 	}
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+d3d11_lift_set_priority(struct d3d11_lift *l, uint64_t owner, uint64_t id, uint32_t priority)
+{
+	if (l == nullptr) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	if (priority > U_LIFT_PRIORITY_HIGH) {
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+	}
+	std::lock_guard<std::mutex> g(l->mtx);
+	lift_stream *st = find_live(l, owner, id);
+	if (st == nullptr) {
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE; // unknown stream: non-fatal
+	}
+	if (st->priority != priority) {
+		U_LOG_I("[lift] stream %llu priority %u -> %u", (unsigned long long)id, st->priority, priority);
+		st->priority = priority;
+		l->cv.notify_all(); // a stream un-paused may have a frame waiting
+	}
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+d3d11_lift_get_stats(struct d3d11_lift *l, uint64_t owner, uint64_t id, struct xrt_lift_stream_stats *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (l == nullptr) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	std::lock_guard<std::mutex> g(l->mtx);
+	lift_stream *st = find_live(l, owner, id);
+	if (st == nullptr) {
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+	}
+	out->priority = st->priority;
+	out->submitted = st->mb.submitted;
+	out->converted = st->mb.converted;
+	out->dropped = st->mb.dropped;
+	out->failed = st->mb.failed;
+	out->latency_last_ns = st->mb.lat_last_ns;
+	out->latency_avg_ns = st->mb.lat_ema_ns;
+	out->latency_min_ns = st->mb.lat_min_ns;
+	out->latency_max_ns = st->mb.lat_max_ns;
+	out->rate_hz = u_lift_mailbox_rate_hz(&st->mb);
 	return XRT_SUCCESS;
 }
