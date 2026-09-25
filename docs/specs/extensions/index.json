@@ -77,6 +77,11 @@
       "title": "Window Weave Service",
       "summary": "Window-bound synchronous weave for present-owners: hand the runtime a stereo texture and a window rect, get back a weaved shared texture and a fence"
     },
+    "XR_DXR_lift": {
+      "group": "rendering",
+      "title": "2D-to-3D Conversion",
+      "summary": "Asynchronous access to a vendor's 2D-to-3D conversion module (depth, stereo, N-view, or photo-to-Gaussian-splats): submit 2D frames, acquire the latest converted result, or flag a weave rect as 2D so the service lifts it before weaving"
+    },
     "XR_DXR_win32_window_binding": {
       "group": "windowing",
       "title": "Win32 Window Binding",
