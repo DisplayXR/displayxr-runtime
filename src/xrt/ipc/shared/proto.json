@@ -821,6 +821,93 @@
 		]
 	},
 
+	"lift_get_properties": {
+		"out": [
+			{"name": "props", "type": "struct ipc_lift_properties"}
+		]
+	},
+
+	"lift_stream_create": {
+		"in": [
+			{"name": "mode", "type": "uint32_t"},
+			{"name": "content_hint", "type": "uint32_t"},
+			{"name": "input_scale", "type": "float"}
+		],
+		"out": [
+			{"name": "stream_id", "type": "uint64_t"}
+		]
+	},
+
+	"lift_stream_destroy": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"}
+		]
+	},
+
+	"lift_submit_frame": {
+		"in": [
+			{"name": "args", "type": "struct ipc_arg_lift_submit"}
+		],
+		"out": [
+			{"name": "frame_id", "type": "uint64_t"}
+		],
+		"in_handles": {"type": "xrt_graphics_buffer_handle_t"}
+	},
+
+	"lift_acquire_result": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"}
+		],
+		"out": [
+			{"name": "ready", "type": "bool"},
+			{"name": "lift_result", "type": "struct ipc_lift_result"}
+		]
+	},
+
+	"lift_get_output": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"}
+		],
+		"out": [
+			{"name": "have_output", "type": "bool"},
+			{"name": "width", "type": "uint32_t"},
+			{"name": "height", "type": "uint32_t"},
+			{"name": "format", "type": "uint32_t"}
+		],
+		"out_handles": {"type": "xrt_graphics_buffer_handle_t"}
+	},
+
+	"lift_get_fence": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"}
+		],
+		"out": [
+			{"name": "have_fence", "type": "bool"}
+		],
+		"out_handles": {"type": "xrt_graphics_sync_handle_t"}
+	},
+
+	"lift_acquire_blob": {
+		"varlen": true,
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"},
+			{"name": "capacity", "type": "uint64_t"}
+		],
+		"out": [
+			{"name": "ready", "type": "bool"},
+			{"name": "frame_id", "type": "uint64_t"},
+			{"name": "source_time", "type": "int64_t"},
+			{"name": "format", "type": "uint32_t"},
+			{"name": "byte_count", "type": "uint64_t"}
+		]
+	},
+
+	"lift_weave_rects": {
+		"in": [
+			{"name": "args", "type": "struct ipc_arg_lift_weave_rects"}
+		]
+	},
+
 	"compositor_semaphore_destroy": {
 		"in": [
 			{"name": "id", "type": "uint32_t"}

@@ -29,6 +29,7 @@
 #include "shared/ipc_protocol.h"
 #include "client/ipc_client.h"
 #include "client/ipc_client_connection.h"
+#include "client/ipc_client_lift.h"
 #include "ipc_client_generated.h"
 
 // Phase 2.D: the workspace input-event bridge translates wire events into
@@ -2999,4 +3000,108 @@ ipc_client_create_system_compositor(struct ipc_connection *ipc_c,
 	*out_xcs = &c->system;
 
 	return XRT_SUCCESS;
+}
+
+
+/*
+ * XR_DXR_lift bridges (ADR-042) — thin accessors the OpenXR state tracker
+ * (oxr_lift.c) forward-declares, like the weave bridges above: extract the
+ * session's connection and forward to ipc_client_lift.c. Streams belong to the
+ * connection, so a session's streams die with its connection.
+ */
+static struct ipc_connection *
+lift_conn(struct xrt_compositor *xc)
+{
+	if (xc == NULL) {
+		return NULL;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	return icc != NULL ? icc->ipc_c : NULL;
+}
+
+xrt_result_t
+comp_ipc_client_compositor_lift_get_properties(struct xrt_compositor *xc, struct xrt_dp_lift_caps *out_caps)
+{
+	return ipc_client_lift_get_properties(lift_conn(xc), out_caps);
+}
+
+xrt_result_t
+comp_ipc_client_compositor_lift_stream_create(struct xrt_compositor *xc,
+                                              uint32_t mode,
+                                              uint32_t content_hint,
+                                              float input_scale,
+                                              uint64_t *out_stream_id)
+{
+	return ipc_client_lift_stream_create(lift_conn(xc), mode, content_hint, input_scale, out_stream_id);
+}
+
+xrt_result_t
+comp_ipc_client_compositor_lift_stream_destroy(struct xrt_compositor *xc, uint64_t stream_id)
+{
+	return ipc_client_lift_stream_destroy(lift_conn(xc), stream_id);
+}
+
+xrt_result_t
+comp_ipc_client_compositor_lift_submit(struct xrt_compositor *xc,
+                                       uint64_t stream_id,
+                                       xrt_graphics_buffer_handle_t handle,
+                                       bool is_dxgi,
+                                       uint32_t width,
+                                       uint32_t height,
+                                       int64_t source_time,
+                                       const struct xrt_dp_lift_params *params,
+                                       const float *viewpoints,
+                                       uint32_t viewpoint_count,
+                                       uint64_t *out_frame_id)
+{
+	return ipc_client_lift_submit(lift_conn(xc), stream_id, handle, is_dxgi, width, height, source_time, params,
+	                              viewpoints, viewpoint_count, out_frame_id);
+}
+
+xrt_result_t
+comp_ipc_client_compositor_lift_acquire(struct xrt_compositor *xc,
+                                        uint64_t stream_id,
+                                        bool *out_ready,
+                                        struct xrt_lift_result *out_result)
+{
+	return ipc_client_lift_acquire(lift_conn(xc), stream_id, out_ready, out_result);
+}
+
+xrt_result_t
+comp_ipc_client_compositor_lift_get_output(struct xrt_compositor *xc,
+                                           uint64_t stream_id,
+                                           bool *out_have,
+                                           xrt_graphics_buffer_handle_t *out_handle)
+{
+	return ipc_client_lift_get_output(lift_conn(xc), stream_id, out_have, NULL, NULL, NULL, out_handle);
+}
+
+xrt_result_t
+comp_ipc_client_compositor_lift_get_fence(struct xrt_compositor *xc,
+                                          uint64_t stream_id,
+                                          bool *out_have,
+                                          xrt_graphics_sync_handle_t *out_handle)
+{
+	return ipc_client_lift_get_fence(lift_conn(xc), stream_id, out_have, out_handle);
+}
+
+xrt_result_t
+comp_ipc_client_compositor_lift_acquire_blob(struct xrt_compositor *xc,
+                                             uint64_t stream_id,
+                                             uint64_t capacity,
+                                             uint8_t *out_bytes,
+                                             bool *out_ready,
+                                             bool *out_delivered,
+                                             struct xrt_lift_blob_info *out_info)
+{
+	return ipc_client_lift_acquire_blob(lift_conn(xc), stream_id, capacity, out_bytes, out_ready, out_delivered,
+	                                    out_info);
+}
+
+xrt_result_t
+comp_ipc_client_compositor_lift_weave_rects(struct xrt_compositor *xc,
+                                            uint32_t count,
+                                            const struct xrt_lift_weave_rect *rects)
+{
+	return ipc_client_lift_weave_rects(lift_conn(xc), count, rects);
 }

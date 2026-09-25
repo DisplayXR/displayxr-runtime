@@ -988,6 +988,128 @@ struct ipc_weave_dmabuf_output
 	uint32_t strides[IPC_WEAVE_DMABUF_MAX_PLANES];
 };
 
+/*
+ *
+ * XR_DXR_lift (ADR-042) — 2D→3D conversion streams over IPC.
+ *
+ * Streams are owned by the IPC CLIENT (not a session): a stream created on a
+ * connection dies with it. The lift calls need no compositor session, so a
+ * headless probe (`displayxr-cli lift`) can drive them on a raw connection.
+ *
+ */
+
+//! Max explicit viewpoints on the wire. Mirrors XR_LIFT_MAX_VIEWS_DXR.
+#define IPC_LIFT_MAX_VIEWS 8
+//! Max lifted weave rects per submit. Mirrors XR_WEAVE_SUBMIT_MAX_LIFT_RECTS_DXR.
+#define IPC_LIFT_WEAVE_RECTS_MAX 8
+//! Largest blob the service will send in one lift_acquire_blob reply.
+#define IPC_LIFT_BLOB_MAX_BYTES (256u * 1024u * 1024u)
+
+/*!
+ * The conversion module's capabilities (xrGetLiftPropertiesDXR). Field values
+ * are the DP-side encoding (xrt_dp_lift.h), which XR_DXR_lift mirrors.
+ *
+ * @ingroup ipc
+ */
+struct ipc_lift_properties
+{
+	uint32_t modes;
+	uint32_t max_streams;
+	uint32_t max_views;
+	uint32_t depth_semantics;
+	uint32_t state;
+	uint32_t reserved;
+	uint64_t typical_latency_ns;
+	char backend[32];
+};
+
+/*!
+ * Per-frame conversion parameters on the wire (XrLiftOptionsDXR).
+ *
+ * @ingroup ipc
+ */
+struct ipc_lift_params
+{
+	float convergence;         //!< < 0 = auto
+	float strength;
+	uint32_t inpaint;
+	uint32_t view_count;       //!< 0 = module default
+	uint32_t viewpoint_count;  //!< 0 = tracked eyes; else explicit, <= IPC_LIFT_MAX_VIEWS
+	uint32_t reserved;
+	float viewpoints[3 * IPC_LIFT_MAX_VIEWS]; //!< xyz, display space, metres
+};
+
+/*!
+ * lift_submit_frame arguments. The input texture rides as in_handle[0] (a
+ * D3D11 shared handle; legacy DXGI handles low-bit tagged, as weave_submit).
+ *
+ * @ingroup ipc
+ */
+struct ipc_arg_lift_submit
+{
+	uint64_t stream_id;
+	int64_t source_time; //!< caller's timestamp, echoed on the result
+	uint32_t width;      //!< region of the input to convert, from (0,0)
+	uint32_t height;
+	uint32_t has_params; //!< 0 = the stream's last / default parameters
+	uint32_t reserved;
+	struct ipc_lift_params params;
+};
+
+/*!
+ * One finished texture result (xrAcquireLiftResultDXR). The shared texture and
+ * fence travel separately (lift_get_output / lift_get_fence), only when
+ * @c output_realloc says the caller needs them (first acquire, size/format
+ * change) — the weave output pattern.
+ *
+ * @ingroup ipc
+ */
+struct ipc_lift_result
+{
+	uint64_t frame_id;
+	int64_t source_time;
+	uint64_t fence_value;
+	uint64_t latency_ns;
+	uint32_t width;
+	uint32_t height;
+	uint32_t format;         //!< DXGI_FORMAT
+	uint32_t view_count;
+	uint32_t output_realloc; //!< 1 = the export texture changed since the last acquire
+	uint32_t reserved;
+};
+
+/*!
+ * One lift-flagged weave rect. Weave-path lifts always synthesize for the
+ * tracked eyes, so no viewpoints ride here (keeps 8 rects well inside
+ * IPC_BUF_SIZE).
+ *
+ * @ingroup ipc
+ */
+struct ipc_lift_weave_rect
+{
+	uint64_t stream_id;
+	uint32_t rect_index; //!< index into the NEXT weave_submit's rects[]
+	uint32_t has_params;
+	float convergence;
+	float strength;
+	uint32_t inpaint;
+	uint32_t view_count;
+};
+
+/*!
+ * lift_weave_rects arguments: the lift-flagged rects of the weave_submit that
+ * immediately follows on the same connection (count 0 = none; the service
+ * consumes the set with that submit).
+ *
+ * @ingroup ipc
+ */
+struct ipc_arg_lift_weave_rects
+{
+	uint32_t count;
+	uint32_t reserved;
+	struct ipc_lift_weave_rect rects[IPC_LIFT_WEAVE_RECTS_MAX];
+};
+
 /*!
  * Arguments for xrt_device::get_view_poses with two views.
  */
