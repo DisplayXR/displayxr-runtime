@@ -199,6 +199,14 @@ systemctl --user unset-environment DISPLAYXR_DEBUG   # then log out/in again
   at the end of every drag that had a table. A table may now arrive
   mid-grab, and the next piece is requested ahead of the drag. Every window
   in the geometry snapshot gains `lattice_drop`. See the spec, §8.5.
+- Version 9 (PROTOTYPE, #1748), same interface: `EnableMoveSync(u pid) -> (b)`,
+  capability bit 2. During the caller's compositor moves, the window's actor
+  is shown only where the frame on screen was woven for (the runtime tags each
+  commit with a 1x1 synchronised subsurface). The window then needs no drag
+  lattice, and the snapshot gains `move_sync`. Runtime side:
+  `DXR_WL_MOVE_SYNC=1`. See the spec, §9. Measurement hook:
+  `DISPLAYXR_STAMP_AUDIT=1` in the shell's environment, with the runtime's
+  `DXR_WL_ORIGIN_STAMP=1`.
 
 Verify capture exclusion is live:
 
