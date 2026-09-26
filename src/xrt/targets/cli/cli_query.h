@@ -119,6 +119,15 @@ enum cli_selftest_result
 	 * one, and of sim_display — passes.
 	 */
 	CLI_SELFTEST_BAD_LIFT_CAPS = 11,
+
+	/*!
+	 * The active plug-in fills the stereo camera slots (ADR-043) and one of
+	 * its cameras is described out of contract: zero / odd eye extent, an
+	 * unknown native format, a non-positive frame rate, or CALIBRATED with no
+	 * (or a degenerate) calibration. ABSENCE NEVER FAILS: no slots or zero
+	 * cameras is the state of almost every box.
+	 */
+	CLI_SELFTEST_BAD_STEREO_CAMERA = 12,
 };
 
 //! Hardware adapters reported by the GPU-topology probe (#918).
@@ -283,6 +292,12 @@ struct cli_query_result
 	bool zone_caps_probed;
 	bool zone_caps_malformed;
 	char zone_probe_note[128];
+
+	/* Stereo camera slots (ADR-043, `stereo_camera_caps`). Absence never
+	 * fails; only an out-of-contract camera description does. */
+	uint32_t stereo_camera_count;
+	bool stereo_camera_malformed;
+	char stereo_camera_note[200];
 	struct xrt_dp_local_zone_caps zone_caps;
 
 	/* ADR-042 lift-caps probe (Windows-only: WARP D3D11 device + the plug-in's
