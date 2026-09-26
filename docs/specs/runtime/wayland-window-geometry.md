@@ -657,3 +657,115 @@ pixel"). At 150 % the panel dragged unconstrained, and stuttered. Now:
 
 An app against a v7 extension keeps the integer-scale-only behaviour.
 
+
+## 9. Move-synchronised re-weave (extension version 9, PROTOTYPE, #1748)
+
+Off by default. Runtime `DXR_WL_MOVE_SYNC=1`; the app builds no drag
+lattice (`DXR_WL_DRAG_LATTICE=0` today; displayxr-common can key it off the
+snapshot's `move_sync` instead).
+
+### 9.1 Idea
+
+The lattice (§8) keeps a stale weave correct by allowing only the positions
+where it stays phase-correct. Move sync inverts that: the window may sit on
+any logical pixel, and the stage never paints a frame anywhere but where it
+was woven for. mutter keeps the grab and moves the `MetaWindow` as usual, so
+the published geometry, edge tiling and workspaces all see the real position.
+Only the window's **actor** is held back: on every stage frame, in
+`before-update` (after that frame's input and commits, before layout and
+paint), the extension places it at the position the buffer it is about to
+paint was woven for.
+
+### 9.2 Binding a buffer to its woven position
+
+GJS has no per-commit identifier. `MetaWindowActor::damaged` fires inside the
+commit's apply, before the subsurface and size-hint state is synced, and
+`meta_window_actor_freeze()` cannot hold a Wayland window: freezing also
+stops mutter syncing the surface actors, both the new texture and the
+subsurface positions, until the thaw.
+
+So the runtime tags the commit itself
+(`comp_vk_native_wl_move_sync`):
+- A 1x1 clear **synchronised** subsurface of the bound surface, placed below
+  it, with an empty input region.
+- Before each present, the subsurface goes to `(x mod 256, y mod 256)` of the
+  logical content position the frame was woven for. That is the snapshot
+  `vk_get_window_metrics` used for the present origin
+  (`comp_vk_native_wl_geom_last_rect`).
+- A synchronised subsurface's position is parent state. It lands atomically
+  with the buffer the WSI commits in `vkQueuePresentKHR`.
+
+The extension reads the tag from the 1x1 actor's position. It resolves the
+tag against the positions the window had in the last second, newest first.
+
+Rules:
+- **Never backwards.** A tag older than the shown position is ignored.
+- **Stall fallback.** After 100 ms *and* 6 stage frames with no newer woven
+  frame, the actor follows the window. Those are stale frames, counted as
+  timeouts. It re-syncs on the first frame woven for a position the window
+  had within the last 60 ms.
+- **Tick at a stop.** While the actor is behind a window that has stopped,
+  the extension queues a redraw each frame. Without that, nothing schedules
+  a stage update after the pointer stops, and the frame woven for the final
+  position waited ~300 ms (until the release).
+
+### 9.3 Measured (private headless GNOME Shell 50.1)
+
+**Setup:**
+- Real title-bar move grabs through `org.gnome.Mutter.RemoteDesktop`.
+- `cube_handle_vk_linux` on sim_display, loaded exclusively
+  (`DXR_PLUGIN_EXCLUSIVE=sim-display`).
+- sim_display interlace period 5 device px as the phase model.
+- 10 drags per run, ~1,000 painted frames per run.
+
+**Stamp audit:**
+- With `DXR_WL_ORIGIN_STAMP=1`, the runtime writes a barcode of each frame's
+  present origin into the frame's top-left 352x8 px.
+- With `DISPLAYXR_STAMP_AUDIT=1`, the extension reads it back from the
+  window's texture after every stage paint and compares it with where the
+  stage painted the window.
+
+"Mismatch" means the frame is painted at a device origin other than the one
+it was woven for. Lag is the distance from where the pointer puts the content
+to where it is painted. Judder is the RMS residual of the painted position
+from constant-velocity motion. Slow = 250 device px/s, fast = 2,500 device
+px/s (at 200 %). All distances are device px.
+
+| scale | mode | mismatch (phase) | lag slow p50/p90 | lag fast p50/p90 | judder slow/fast | still paints (slow) |
+|---|---|---|---|---|---|---|
+| 200 % | table (§8) | 84 % (6.7 %) | 2 / 4 | 0 / 0 (uncovered) | 4.9 / 11.2 | 70 % |
+| 200 % | re-weave after move | 91 % (75 %) | 0 / 0 | 0 / 0 | 2.0 / 8.5 | 0 % |
+| 200 % | **move sync** | **0 % (0 %)** | 14 / 16 | 140 / 180 | 3.2 / 28 | 51 % |
+| 150 % | table (§8) | 88 % (8.6 %) | 1.5 / 4.5 | 0 / 0 (uncovered) | 3.4 / 18.8 | 72 % |
+| 150 % | re-weave after move | 92 % (76 %) | 0 / 0 | 0 / 0 | 1.5 / 9.4 | 0 % |
+| 150 % | **move sync** | **0 % (0 %)** | 9 / 12 | 90 / 120 | 2.9 / 18.2 | 51 % |
+
+**Move sync, every drag type.** The following all read 0 mismatched frames,
+with the timeout fallback never firing: straight, diagonal, reversal, start
+from rest, release mid-motion, and a 40 ms slow frame every 15 frames.
+- Direction flips on the reversal drag: 1, so no oscillation.
+- Sideways deviation on a straight drag: 0.
+- Edge tiling survives: drag to the top edge maximises, drag to the left edge
+  tiles.
+- **App frozen (SIGSTOP 670 ms mid-drag).** The fallback fires (1 timeout).
+  The window keeps following the pointer with stale frames: 28 % of that
+  drag's frames mismatch. It re-syncs with one backward hop of ≤ 108 px.
+- **A 400 ms app-thread stall** is absorbed by the runtime's repaint thread,
+  which keeps weaving at the new origin. No timeout fires.
+
+**The costs:**
+1. **Lag.** About 3.4 frames (≈ 50–56 ms) at every speed: move → published
+   geometry → next weave → FIFO-barriered commit → paint.
+2. **Cadence.** The window advances only when a frame woven for a new origin
+   lands. In this harness that is ~30 Hz for every mode: re-weave shows
+   the same 30/s of new origins, but paints stale ones at 60 Hz. So the window
+   stands still on ~half the paints.
+
+A runtime that re-weaves on every refresh during a move would lift that to
+the refresh rate. `DXR_WEAVE_REPAINT_FORCE=1` hung the app in the headless
+harness, so this is untested.
+
+**Harness artefact.** While an app keeps deriving lattice tables, each ~90 ms
+sim_display grid probe stalls its frame loop. In the table baseline this is
+10–18 % of motion time. With move sync and the lattice off, there are 0
+stalls.
