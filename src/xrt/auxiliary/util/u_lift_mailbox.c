@@ -376,3 +376,171 @@ u_lift_cap_dims(uint32_t w, uint32_t h, uint32_t cap, uint32_t *out_w, uint32_t 
 	}
 	return true;
 }
+
+
+/*
+ *
+ * Letterbox crop.
+ *
+ */
+
+bool
+u_lift_letterbox_parse(const char *value)
+{
+	return !(value != NULL && value[0] == '0' && value[1] == '\0');
+}
+
+bool
+u_lift_crop_active(const struct u_lift_crop *c)
+{
+	return c->top != 0 || c->bottom != 0 || c->left != 0 || c->right != 0;
+}
+
+//! Bar sizes (pixels) at both ends of one axis of length @p len profiled in @p n buckets.
+static void
+letterbox_axis(const float *prof, uint32_t n, uint32_t len, uint32_t *out_lo, uint32_t *out_hi)
+{
+	*out_lo = 0;
+	*out_hi = 0;
+	if (prof == NULL || n == 0 || len == 0) {
+		return;
+	}
+	uint32_t lo = 0;
+	while (lo < n && prof[lo] < U_LIFT_LETTERBOX_PICTURE_FRAC) {
+		lo++;
+	}
+	if (lo == n) {
+		return; // no picture anywhere on this axis: not a measurement of bars
+	}
+	uint32_t hi = 0;
+	while (hi < n && prof[n - 1 - hi] < U_LIFT_LETTERBOX_PICTURE_FRAC) {
+		hi++;
+	}
+	// Symmetry: a film is centred, so when one bar measures shorter because
+	// dense subtitle rows ended it early, and every extra row is only SPARSELY
+	// lit (text, not picture), the shorter bar is really as long as the other.
+	// The shorter bar must exist: content pinned to one edge is not letterbox.
+	if (lo > hi && hi > 0 && n - lo > hi) {
+		bool sparse = true;
+		for (uint32_t i = hi; i < lo && sparse; i++) {
+			sparse = prof[n - 1 - i] < U_LIFT_LETTERBOX_SPARSE_FRAC;
+		}
+		if (sparse) {
+			hi = lo;
+		}
+	} else if (hi > lo && lo > 0 && n - hi > lo) {
+		bool sparse = true;
+		for (uint32_t i = lo; i < hi && sparse; i++) {
+			sparse = prof[i] < U_LIFT_LETTERBOX_SPARSE_FRAC;
+		}
+		if (sparse) {
+			lo = hi;
+		}
+	}
+	// Bucket k starts at pixel k*len/n: the bars end where the first picture
+	// bucket starts, so no picture row is ever inside a bar.
+	uint32_t lo_px = (uint32_t)(((uint64_t)lo * len) / n);
+	uint32_t hi_px = len - (uint32_t)(((uint64_t)(n - hi) * len) / n);
+	lo_px &= ~1u; // even, so a capped / halved snapshot stays aligned
+	hi_px &= ~1u;
+	if (lo_px < U_LIFT_LETTERBOX_MIN_BAR_PX) {
+		lo_px = 0;
+	}
+	if (hi_px < U_LIFT_LETTERBOX_MIN_BAR_PX) {
+		hi_px = 0;
+	}
+	if ((float)(len - lo_px - hi_px) < U_LIFT_LETTERBOX_MIN_ACTIVE_FRAC * (float)len) {
+		return; // implausible (a mostly-dark frame): no crop from this frame
+	}
+	*out_lo = lo_px;
+	*out_hi = hi_px;
+}
+
+//! Each bar of @p a is no larger than the matching bar of @p b.
+static bool
+crop_within(const struct u_lift_crop *a, const struct u_lift_crop *b)
+{
+	return a->top <= b->top && a->bottom <= b->bottom && a->left <= b->left && a->right <= b->right;
+}
+
+static uint32_t
+min_u32(uint32_t a, uint32_t b)
+{
+	return a < b ? a : b;
+}
+
+bool
+u_lift_letterbox_update(struct u_lift_letterbox *lb,
+                        uint32_t w,
+                        uint32_t h,
+                        const float *rows,
+                        uint32_t nr,
+                        const float *cols,
+                        uint32_t nc)
+{
+	const struct u_lift_crop none = {0, 0, 0, 0};
+	bool changed = false;
+	if (lb->w != w || lb->h != h) {
+		changed = u_lift_crop_active(&lb->committed);
+		lb->w = w;
+		lb->h = h;
+		lb->committed = none;
+		lb->pending = none;
+		lb->pending_frames = 0;
+	}
+	struct u_lift_crop m = none;
+	letterbox_axis(rows, nr, h, &m.top, &m.bottom);
+	letterbox_axis(cols, nc, w, &m.left, &m.right);
+
+	// A frame with no picture on either axis (black, a fade) says nothing.
+	bool content = false;
+	for (uint32_t i = 0; i < nr && !content; i++) {
+		content = rows[i] >= U_LIFT_LETTERBOX_PICTURE_FRAC;
+	}
+	if (!content) {
+		return changed;
+	}
+
+	// Picture inside a committed bar: shrink that bar NOW.
+	struct u_lift_crop shrunk = lb->committed;
+	shrunk.top = min_u32(shrunk.top, m.top);
+	shrunk.bottom = min_u32(shrunk.bottom, m.bottom);
+	shrunk.left = min_u32(shrunk.left, m.left);
+	shrunk.right = min_u32(shrunk.right, m.right);
+	if (memcmp(&shrunk, &lb->committed, sizeof(shrunk)) != 0) {
+		lb->committed = shrunk;
+		changed = true;
+	}
+
+	// A larger bar has to settle before the crop grows into it.
+	if (crop_within(&m, &lb->committed)) {
+		lb->pending = lb->committed;
+		lb->pending_frames = 0;
+		return changed;
+	}
+	// Profiles jitter by a bucket frame to frame: "the same" within a tolerance,
+	// settling on the SMALLEST bars seen (never crop picture).
+	const uint32_t tol_v = h / 64u > 8u ? h / 64u : 8u;
+	const uint32_t tol_h = w / 64u > 8u ? w / 64u : 8u;
+#define LB_NEAR(a, b, t) ((a) > (b) ? (a) - (b) <= (t) : (b) - (a) <= (t))
+	const bool same = lb->pending_frames > 0 && LB_NEAR(m.top, lb->pending.top, tol_v) &&
+	                  LB_NEAR(m.bottom, lb->pending.bottom, tol_v) && LB_NEAR(m.left, lb->pending.left, tol_h) &&
+	                  LB_NEAR(m.right, lb->pending.right, tol_h);
+#undef LB_NEAR
+	if (same) {
+		lb->pending.top = min_u32(lb->pending.top, m.top);
+		lb->pending.bottom = min_u32(lb->pending.bottom, m.bottom);
+		lb->pending.left = min_u32(lb->pending.left, m.left);
+		lb->pending.right = min_u32(lb->pending.right, m.right);
+		lb->pending_frames++;
+	} else {
+		lb->pending = m;
+		lb->pending_frames = 1;
+	}
+	if (lb->pending_frames >= U_LIFT_LETTERBOX_SETTLE_FRAMES) {
+		lb->committed = lb->pending;
+		lb->pending_frames = 0;
+		changed = true;
+	}
+	return changed;
+}
