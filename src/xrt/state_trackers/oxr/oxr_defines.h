@@ -38,6 +38,8 @@
 #define OXR_XR_DEBUG_LOCAL3DZONE  (*(uint64_t *)"oxrl3dz\0")
 // XR_DXR_lift stream (ADR-042)
 #define OXR_XR_DEBUG_LIFTSTREAM  (*(uint64_t *)"oxrlift\0")
+// XR_DXR_stereo_camera stream (ADR-043)
+#define OXR_XR_DEBUG_STEREOCAMSTREAM  (*(uint64_t *)"oxrscam\0")
 // clang-format on
 
 /*!
