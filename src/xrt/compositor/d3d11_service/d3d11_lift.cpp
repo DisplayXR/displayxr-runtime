@@ -106,7 +106,9 @@ typed_srv_format(DXGI_FORMAT f)
 
 /*
  *
- * Snapshot blit (service device): sample a source sub-rect 1:1 into a slot.
+ * Snapshot blit (service device): sample a source sub-rect into a slot — 1:1
+ * (point) when the snapshot is uncapped, box-filtered down when the service's
+ * DXR_LIFT_MAX_INPUT_EDGE cap engages (u_lift_cap_dims).
  *
  */
 
@@ -132,10 +134,37 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 }
 )";
 
+/*
+ * Downscaling variant (capped snapshot). One destination texel covers
+ * step = src_rect.zw / dst_size.xy source texels; four bilinear taps at the
+ * quarter points of that footprint are an exact box filter up to a 4x reduction
+ * (7680 -> 1920) and a much better one than a single tap beyond it. Taps are
+ * clamped to texel centres inside the sub-rect, so nothing outside the lifted
+ * rect bleeds in at its edges.
+ */
+static const char *k_snap_ps_scaled = R"(
+cbuffer C : register(b0) { float4 src_rect; float4 src_size; float4 dst_size; };
+Texture2D src : register(t0);
+SamplerState samp : register(s0);
+float3 tap(float2 p, float2 lo, float2 hi) {
+	return src.SampleLevel(samp, clamp(p, lo, hi) / src_size.xy, 0).rgb;
+}
+float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+	float2 p = src_rect.xy + uv * src_rect.zw;
+	float2 q = 0.25 * src_rect.zw / dst_size.xy;
+	float2 lo = src_rect.xy + 0.5;
+	float2 hi = src_rect.xy + src_rect.zw - 0.5;
+	float3 c = tap(p + float2(-q.x, -q.y), lo, hi) + tap(p + float2(q.x, -q.y), lo, hi) +
+	           tap(p + float2(-q.x, q.y), lo, hi) + tap(p + float2(q.x, q.y), lo, hi);
+	return float4(c * 0.25, 1.0);
+}
+)";
+
 struct snap_cb
 {
 	float src_rect[4];
 	float src_size[4];
+	float dst_size[4]; //!< read by k_snap_ps_scaled only
 };
 
 
@@ -222,6 +251,9 @@ struct lift_stream
 
 	// Throttled INFO.
 	uint64_t last_stats_log_ns = 0;
+
+	// Snapshot cap: the last capped size WARNed about (producer thread, under mtx).
+	uint32_t cap_logged_w = 0, cap_logged_h = 0;
 };
 
 struct d3d11_lift
@@ -240,9 +272,14 @@ struct d3d11_lift
 	// Snapshot blit (service device).
 	ID3D11VertexShader *snap_vs = nullptr;
 	ID3D11PixelShader *snap_ps = nullptr;
+	ID3D11PixelShader *snap_ps_scaled = nullptr;
 	ID3D11SamplerState *snap_sampler = nullptr;
+	ID3D11SamplerState *snap_sampler_linear = nullptr;
 	ID3D11Buffer *snap_cb = nullptr;
 	bool snap_ok = false;
+	//! DXR_LIFT_MAX_INPUT_EDGE, read once at create: long-edge cap on weave-rect
+	//! snapshots (0 = off). Never applied to xrSubmitLiftFrameDXR frames.
+	uint32_t max_input_edge = U_LIFT_MAX_INPUT_EDGE_DEFAULT;
 
 	// Lift side (lift thread only, after activation).
 	ID3D11Device *lift_device = nullptr;
@@ -965,12 +1002,32 @@ d3d11_lift_create(ID3D11Device *svc_device,
 	     SUCCEEDED(svc_device->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &l->snap_ps));
 	rel(b);
 	rel(err);
+	ok = ok &&
+	     SUCCEEDED(D3DCompile(k_snap_ps_scaled, strlen(k_snap_ps_scaled), nullptr, nullptr, nullptr, "main",
+	                          "ps_5_0", 0, 0, &b, &err)) &&
+	     SUCCEEDED(
+	         svc_device->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &l->snap_ps_scaled));
+	rel(b);
+	rel(err);
 	if (ok) {
 		D3D11_SAMPLER_DESC sd = {};
 		sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT; // 1:1 snapshot: exact texels
 		sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
 		sd.MaxLOD = D3D11_FLOAT32_MAX;
 		ok = SUCCEEDED(svc_device->CreateSamplerState(&sd, &l->snap_sampler));
+		if (ok) {
+			sd.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT; // capped snapshot: box-filter taps
+			ok = SUCCEEDED(svc_device->CreateSamplerState(&sd, &l->snap_sampler_linear));
+		}
+	}
+
+	// Weave-rect snapshot cap, read once in the service process (ADR-042:
+	// the runtime owns the policy; the vendor's own input autoscaling only
+	// affects inference, not the view synthesis that dominates at 8K).
+	l->max_input_edge = u_lift_max_input_edge_parse(getenv("DXR_LIFT_MAX_INPUT_EDGE"));
+	if (l->max_input_edge != U_LIFT_MAX_INPUT_EDGE_DEFAULT) {
+		U_LOG_W("[lift] DXR_LIFT_MAX_INPUT_EDGE=%u%s", l->max_input_edge,
+		        l->max_input_edge == 0 ? " (weave-rect snapshots uncapped)" : "");
 	}
 	if (ok) {
 		D3D11_BUFFER_DESC bd = {};
@@ -1009,7 +1066,9 @@ d3d11_lift_destroy(struct d3d11_lift **lift_ptr)
 		l->thread.join();
 	}
 	rel(l->snap_cb);
+	rel(l->snap_sampler_linear);
 	rel(l->snap_sampler);
+	rel(l->snap_ps_scaled);
 	rel(l->snap_ps);
 	rel(l->snap_vs);
 	rel(l->lift_device1);
@@ -1143,8 +1202,10 @@ d3d11_lift_stream_mode(struct d3d11_lift *l, uint64_t owner, uint64_t id)
 }
 
 /*!
- * Snapshot @p src region into input slot @p slot's service texture. Caller
- * holds the service context mutex; takes the slot's keyed mutex itself.
+ * Snapshot @p src region (@p x, @p y, @p w, @p h) into the top-left
+ * @p dst_w x @p dst_h of input slot @p s's service texture — 1:1 when the dims
+ * match, box-filtered down when the snapshot cap shrank them. Caller holds the
+ * service context mutex; takes the slot's keyed mutex itself.
  */
 static bool
 snapshot_blit(d3d11_lift *l,
@@ -1155,8 +1216,11 @@ snapshot_blit(d3d11_lift *l,
               uint32_t x,
               uint32_t y,
               uint32_t w,
-              uint32_t h)
+              uint32_t h,
+              uint32_t dst_w,
+              uint32_t dst_h)
 {
+	const bool scaled = dst_w != w || dst_h != h;
 	HRESULT hr = s.svc_km->AcquireSync(0, 4);
 	if (FAILED(hr) || hr == (HRESULT)WAIT_TIMEOUT) {
 		return false;
@@ -1169,6 +1233,8 @@ snapshot_blit(d3d11_lift *l,
 	cb.src_rect[3] = (float)h;
 	cb.src_size[0] = (float)src_tw;
 	cb.src_size[1] = (float)src_th;
+	cb.dst_size[0] = (float)dst_w;
+	cb.dst_size[1] = (float)dst_h;
 	ctx->UpdateSubresource(l->snap_cb, 0, nullptr, &cb, 0, 0);
 
 	// State this sequence completely: the context is shared (immediate_ctx_mutex
@@ -1186,11 +1252,11 @@ snapshot_blit(d3d11_lift *l,
 	ctx->OMGetDepthStencilState(&prev_ds, &prev_ref);
 
 	D3D11_VIEWPORT vp = {};
-	vp.Width = (float)w;
-	vp.Height = (float)h;
+	vp.Width = (float)dst_w;
+	vp.Height = (float)dst_h;
 	vp.MaxDepth = 1.0f;
 	ctx->RSSetViewports(1, &vp);
-	D3D11_RECT sc = {0, 0, (LONG)w, (LONG)h};
+	D3D11_RECT sc = {0, 0, (LONG)dst_w, (LONG)dst_h};
 	ctx->RSSetScissorRects(1, &sc);
 	ctx->RSSetState(nullptr);
 	ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
@@ -1200,9 +1266,9 @@ snapshot_blit(d3d11_lift *l,
 	ctx->IASetInputLayout(nullptr);
 	ctx->VSSetShader(l->snap_vs, nullptr, 0);
 	ctx->GSSetShader(nullptr, nullptr, 0);
-	ctx->PSSetShader(l->snap_ps, nullptr, 0);
+	ctx->PSSetShader(scaled ? l->snap_ps_scaled : l->snap_ps, nullptr, 0);
 	ctx->PSSetConstantBuffers(0, 1, &l->snap_cb);
-	ctx->PSSetSamplers(0, 1, &l->snap_sampler);
+	ctx->PSSetSamplers(0, 1, scaled ? &l->snap_sampler_linear : &l->snap_sampler);
 	ctx->PSSetShaderResources(0, 1, &src);
 	ctx->Draw(4, 0);
 	ID3D11ShaderResourceView *null_srv = nullptr;
@@ -1236,11 +1302,17 @@ submit_locked(d3d11_lift *l,
               const xrt_dp_lift_params *params,
               const float *viewpoints,
               uint32_t viewpoint_floats,
+              uint32_t max_input_edge,
               uint64_t *out_frame_id)
 {
 	if (w == 0 || h == 0 || x + w > src_tw || y + h > src_th) {
 		return XRT_ERROR_OUTPUT_REQUEST_FAILURE; // unknown stream / bad extent: non-fatal
 	}
+	// Service policy (ADR-042): the module synthesizes at INPUT resolution and
+	// the result is stretched back into the rect anyway, so a capped snapshot
+	// costs little on the panel and a lot less in the module. 0 = uncapped.
+	uint32_t dw = w, dh = h;
+	const bool capped = u_lift_cap_dims(w, h, max_input_edge, &dw, &dh);
 	int32_t slot = -1;
 	lift_stream *st = nullptr;
 	{
@@ -1285,20 +1357,33 @@ submit_locked(d3d11_lift *l,
 		}
 		lift_in_slot &in = st->in[slot];
 		in.params = st->last_params;
+		if (capped && in.params.focal_px > 0.0f) {
+			in.params.focal_px *= (float)dw / (float)w; // focal is in INPUT pixels
+		}
 		in.viewpoint_floats = st->last_viewpoint_floats;
 		memcpy(in.viewpoints, st->last_viewpoints, sizeof(in.viewpoints));
 	}
 
 	// Allocation + blit outside mtx: this slot is WRITING, nobody else touches it.
 	lift_in_slot &in = st->in[slot];
-	bool ok = in_slot_ensure(l, in, w, h) && snapshot_blit(l, in, src, src_tw, src_th, x, y, w, h);
+	bool ok = in_slot_ensure(l, in, dw, dh) && snapshot_blit(l, in, src, src_tw, src_th, x, y, w, h, dw, dh);
 
 	std::lock_guard<std::mutex> g(l->mtx);
 	if (!ok) {
 		u_lift_mailbox_abort_submit(&st->mb, slot);
 		return XRT_ERROR_WEAVE_REFUSED;
 	}
-	*out_frame_id = u_lift_mailbox_commit_submit(&st->mb, slot, source_time, os_monotonic_get_ns(), w, h);
+	// WARN once per stream when the cap engages or its capped size changes
+	// (a rect resize), never per frame.
+	if (capped && (st->cap_logged_w != dw || st->cap_logged_h != dh)) {
+		st->cap_logged_w = dw;
+		st->cap_logged_h = dh;
+		U_LOG_W("[lift] stream %llu: snapshot %ux%u capped to %ux%u (DXR_LIFT_MAX_INPUT_EDGE=%u)",
+		        (unsigned long long)id, w, h, dw, dh, max_input_edge);
+	}
+	// The mailbox carries the REAL input dims: the lift thread copies exactly
+	// dw x dh out of the slot and hands the module that size.
+	*out_frame_id = u_lift_mailbox_commit_submit(&st->mb, slot, source_time, os_monotonic_get_ns(), dw, dh);
 	l->cv.notify_all();
 	return XRT_SUCCESS;
 }
@@ -1321,8 +1406,9 @@ d3d11_lift_submit_srv_locked(struct d3d11_lift *l,
 	if (l == nullptr || !l->snap_ok || src == nullptr || out_frame_id == nullptr) {
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
+	// Weave-rect snapshot: the service's size cap applies.
 	return submit_locked(l, owner, id, src, src_tw, src_th, x, y, w, h, source_time, params, nullptr, 0,
-	                     out_frame_id);
+	                     l->max_input_edge, out_frame_id);
 }
 
 xrt_result_t
@@ -1428,8 +1514,9 @@ d3d11_lift_submit_handle(struct d3d11_lift *l,
 	xrt_result_t xret;
 	{
 		std::lock_guard<std::mutex> ctx_lock(*l->svc_ctx_mutex);
+		// An app's explicit frame: its size is the app's choice — never capped.
 		xret = submit_locked(l, owner, id, st->imp_srv, st->imp_w, st->imp_h, 0, 0, w, h, source_time, params,
-		                     viewpoints, viewpoint_floats, out_frame_id);
+		                     viewpoints, viewpoint_floats, /*max_input_edge*/ 0, out_frame_id);
 	}
 	if (acquired) {
 		st->imp_km->ReleaseSync(0);

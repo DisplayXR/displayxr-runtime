@@ -266,6 +266,44 @@ u_lift_sched_plan(
     struct u_lift_sched *s, const struct u_lift_sched_entry *entries, uint32_t count, uint64_t *out_ids, uint32_t max);
 
 
+/*
+ *
+ * Snapshot size cap (service policy, ADR-042).
+ *
+ * A lift-flagged weave rect is snapshotted at DEVICE pixels, and the module
+ * synthesizes its views at INPUT resolution — a fullscreen player on an 8K
+ * panel is a 7680x4319 input and a 15360-wide SBS per frame. The result is
+ * stretched back into the rect's current position anyway, so the service
+ * downsamples the snapshot before the DP. An app's explicit
+ * xrSubmitLiftFrameDXR frame is NOT capped: its size is the app's choice.
+ *
+ */
+
+//! Default cap on the snapshot's long edge (DXR_LIFT_MAX_INPUT_EDGE unset).
+#define U_LIFT_MAX_INPUT_EDGE_DEFAULT 1920u
+
+//! Smallest cap honoured; lower non-zero values clamp to it.
+#define U_LIFT_MAX_INPUT_EDGE_MIN 256u
+
+/*!
+ * Parse a DXR_LIFT_MAX_INPUT_EDGE value. NULL, empty or non-numeric = the
+ * default; "0" = no cap (returns 0); 1..255 clamp to
+ * U_LIFT_MAX_INPUT_EDGE_MIN.
+ */
+uint32_t
+u_lift_max_input_edge_parse(const char *value);
+
+/*!
+ * Scale @p w x @p h so the long edge is at most @p cap, keeping the aspect.
+ * The long edge becomes @p cap rounded DOWN to even; the short edge is scaled
+ * by the same factor and rounded to the NEAREST even value, minimum 2. When
+ * @p cap is 0 or the long edge already fits, the dims pass through unchanged
+ * and the function returns false; true = the dims were reduced.
+ */
+bool
+u_lift_cap_dims(uint32_t w, uint32_t h, uint32_t cap, uint32_t *out_w, uint32_t *out_h);
+
+
 #ifdef __cplusplus
 }
 #endif
