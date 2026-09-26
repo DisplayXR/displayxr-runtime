@@ -164,6 +164,12 @@ jobs:
         # shell. No GNOME needed.
         run: ./scripts/test_gnome_extension_variant.sh
 
+      - name: Drag-lattice entry choice
+        # Unit test for LatticeChoice in lib.js (extension version 9, #1748):
+        # which phase-correct table entry a compositor drag move lands on.
+        # Plain gjs drives the shipped file; no GNOME Shell needed.
+        run: gjs scripts/test_gnome_extension_lattice.js
+
   cnsdk-pin-guard:
     runs-on: ubuntu-latest
     steps:
