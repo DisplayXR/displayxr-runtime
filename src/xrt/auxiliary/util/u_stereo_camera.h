@@ -184,6 +184,29 @@ u_stereo_camera_estimate_disparity(const uint8_t *gray,
                                    uint32_t max_disparity,
                                    float *out_disparity);
 
+/*!
+ * Two-dimensional version of @ref u_stereo_camera_estimate_disparity (R2):
+ * SSD block matching over horizontal disparity 0..@p max_disparity AND a
+ * vertical offset -@p max_dy..@p max_dy, sub-pixel on both axes. @p out_dy is
+ * the row offset of the match in the RIGHT eye (right y - left y): the
+ * vertical disparity a rectified pair must bring to ~0. Used by the
+ * rectifier's tests and `displayxr-cli camera probe --rectified`.
+ * @return false if the region (plus the dy search band) does not fit.
+ */
+bool
+u_stereo_camera_estimate_offset(const uint8_t *gray,
+                                uint32_t pitch,
+                                uint32_t eye_width,
+                                uint32_t height,
+                                uint32_t x0,
+                                uint32_t y0,
+                                uint32_t w,
+                                uint32_t h,
+                                uint32_t max_disparity,
+                                uint32_t max_dy,
+                                float *out_dx,
+                                float *out_dy);
+
 #ifdef __cplusplus
 }
 #endif

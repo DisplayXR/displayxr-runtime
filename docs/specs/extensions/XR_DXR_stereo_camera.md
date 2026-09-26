@@ -6,7 +6,7 @@
 | **Spec Version** | 1 |
 | **Extension Type** | Instance extension, service path only (an in-process instance enumerates zero cameras) |
 | **Header** | [`src/external/openxr_includes/openxr/XR_DXR_stereo_camera.h`](../../../src/external/openxr_includes/openxr/XR_DXR_stereo_camera.h) (+ its `index.json` catalog note) |
-| **Status** | **R1 implemented** (runtime, hardware-free): header, plug-in slots, service camera manager, IPC, OpenXR entry points, sim_display fake, `displayxr-cli camera`, selftest check. **Not yet:** rectification (R2), consent / indicator / foreground rule (R3 — deny-by-default hooks in place), GPU transports, state-change events, the Leia provider (L1), the browser (B1). Provisional type values `1004999290–300` (after `XR_DXR_lift`'s `1004999270–289`), pending Khronos registry |
+| **Status** | **R1 implemented** (runtime, hardware-free): header, plug-in slots, service camera manager, IPC, OpenXR entry points, sim_display fake, `displayxr-cli camera`, selftest check. **R2 implemented**: the service-side rectifier (`u_stereo_rectify`, CPU) — RECTIFIED frames + rectified calibration from any CALIBRATED source, golden-tested against OpenCV, and a distorted sim fake with ground truth. **Not yet:** consent / indicator / foreground rule (R3 — deny-by-default hooks in place), GPU transports (the rectifier has the seam), state-change events, the Leia provider (L1), the browser (B1). Provisional type values `1004999290–300` (after `XR_DXR_lift`'s `1004999270–289`), pending Khronos registry |
 | **R1 decisions** | stereo-only (names/structs kept open: `viewCount`, next chains) · camera provider = `xrt_plugin_iface` slots · service clients only (in-process enumerates zero) · raw frames never reach web pages (`RAW` refused to `PRESENT_OWNER` clients) — see [roadmap §G](../../roadmap/stereo-camera-source.md#g-open-questions--maintainer-decisions) |
 | **Decision record** | [ADR-043](../../adr/ADR-043-stereo-camera-source.md) |
 | **Plug-in contract** | appended `xrt_plugin_iface` camera slots, `XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA` (§9) |
@@ -154,12 +154,31 @@ one field box carried eleven. A plug-in that cannot resolve the active device's 
 reports the camera without `CALIBRATED`, and the service offers RAW only.
 
 **Rectification** (when not `NATIVELY_RECTIFIED`) is the service's, vendor-neutral
-(`u_stereo_rectify`, planned in `auxiliary/util`): Bouguet rectification to a **parallel** pair
+(`auxiliary/util/u_stereo_rectify.{h,c}`, R2): Bouguet rectification to a **parallel** pair
 with zero disparity at infinity, cropped to the valid region (no black corners), per-eye size
 unchanged; applied as a per-pixel remap LUT built once per (calibration, size). **No convergence
 shear is baked in.** Placing the subject at the display plane is the receiver's decision
 (a per-eye crop offset of `f_px · baseline / (2 · subjectZ)`), so the source stays a physically
 honest parallel pair.
+
+> **R2 as built.** The geometry is OpenCV's `stereoRectify(CALIB_ZERO_DISPARITY, alpha = 0)`
+> re-implemented in C (no OpenCV dependency), golden-tested against OpenCV 4.10 fixtures
+> (`tests/fixtures/`, generated offline): R1/R2 agree to 1e-12, the principal point matches the
+> converged reference to 1e-4 px (OpenCV itself stops `undistortPoints` after 5 iterations and
+> lands a fraction of a pixel off), the maps agree with `initUndistortRectifyMap` to 3e-5 px. Two
+> deliberate differences: the alpha = 0 zoom is **verified on every border pixel** of the real
+> maps and nudged up until no output pixel samples outside its raw image (OpenCV's 9-point
+> inner rectangle leaves a few black pixels on strong lenses) — at most +0.13 % focal on the
+> fixtures; and calibration given at a different size than the frames (`image_width/height` ≠ the
+> eye size) is rescaled pixel-centre-aware. Lens models: RADTAN5, RADTAN8 (rational), KB4
+> (fisheye; same Bouguet geometry). The service rectifies **once per source frame** on the camera
+> thread (outside its lock) and only while some started stream wants RECTIFIED; RAW streams read
+> the original. `xrGetStereoCameraCalibrationDXR(RECTIFIED)` returns that same geometry: both
+> eyes `fx = fy = f` with one principal point, model NONE, and `rightFromLeft` = identity
+> rotation + `(+baseline, 0, 0)` m — so frames and numbers cannot disagree. The browser
+> (`PRESENT_OWNER`) is refused a stream on a calibrated camera the rectifier rejected, instead of
+> getting the RAW-flagged fallback native clients get. CPU cost per 1280×480 frame (M1 Pro, -O2):
+> **0.94 ms GRAY8, 1.36 ms NV12, 2.25 ms BGRA8**; setup (geometry + both LUTs) 9–18 ms, once.
 
 **Eye order and mirroring.** Left half = the lens on the camera's own left (as seen from behind
 the camera, looking at the scene) = the remote viewer's left eye. Frames are **never mirrored**;
@@ -449,7 +468,17 @@ owns threads, fan-out, rectification, format conversion, transport, consent and 
 > at 0.6 m, which at the defaults (640 px per eye, 68° HFOV → fx 474.4 px, 50 mm) are **12 px and
 > 40 px** of disparity, plus an 8-digit frame counter in both halves. Knobs, read by the SERVICE:
 > `SIM_DISPLAY_FAKE_STEREO_CAMERA=1`, `_SIZE=WxH` (per eye), `_FPS=N`, `_FORMAT=gray8|nv12|bgra`,
-> `_SUSPEND_PERIOD_MS=N`. The distorted + misaligned variant below is R2's, with the rectifier.
+> `_SUSPEND_PERIOD_MS=N`.
+>
+> **R2 as built:** `SIM_DISPLAY_FAKE_STEREO_CAMERA_DISTORT=1` renders the same scene through two
+> RAW cameras with known ground truth (`sim_stereo_camera_truth_init`): different per-eye
+> intrinsics and principal points, RADTAN5 barrel lenses (k1 −0.21 / −0.17), and each camera
+> turned by half of (pitch 0.35°, yaw 0.25°, roll 0.45°) in opposite senses — 0.7° of relative
+> pitch, 0.9° of relative roll. The raw pair measures |Δy| median 2.6 px, p90 5.3 px. The
+> rotation split is symmetric (left `Sᵀ`, right `S`), which makes Bouguet recover **exactly** the
+> virtual parallel pair the scene is defined in, so the ground truth after rectification is
+> exact: rows aligned and disparity `f_rect · B / Z`. The camera then drops `NATIVELY_RECTIFIED`
+> and its calibration slot returns the truth (RADTAN5, `R = S²`, `T = −S·(50 mm, 0, 0)`).
 
 `SIM_DISPLAY_FAKE_STEREO_CAMERA=1` makes sim_display advertise one camera
 (`SHARED_WITH_EYE_TRACKING | USER_FACING | CALIBRATED | MONOCHROME`, 640×480 per eye, 30 Hz,
@@ -486,6 +515,28 @@ block disparity (left x - right x): 12 px (38/54 blocks), 40 px (16/54 blocks), 
 service stats: source 30.49 Hz, delivered 30.49 Hz, published 155, skipped 4, acquired 150, mean latency 12.417 ms
 ```
 
+R2 adds row alignment to every probe (2-D block matching of the last frame, textured 32×32
+blocks: |Δy| median / p90 / count above 1 px, and the dominant disparities converted to depth
+with the RECTIFIED calibration), `camera calib <id> --rectified` prints P1/P2 and `Z = f·B/d`,
+and `probe --rectified` insists on RECTIFIED output and exits 5 unless the median |Δy| ≤ 0.5 px.
+Against the DISTORTED fake (macOS, Debug service):
+
+```
+$ displayxr-cli camera calib 1 --rectified
+  left  eye: 640x480 fx 453.181 fy 453.181 cx 320.426 cy 239.364 model 0
+  P2 = [453.181 0 320.426 -22659.030; 0 453.181 239.364 0; 0 0 1 0]   (P2[0][3] = f * Tx, Tx = -50.000 mm)
+$ displayxr-cli camera probe --rectified --frames 150
+row alignment (RECTIFIED, 221 textured 32x32 blocks): |dy| median 0.016 px, p90 0.064 px, 9 block(s) > 1 px
+  disparity mode 1: 11.30 px (165 blocks) -> Z = f*B/d = 2.004 m
+  disparity mode 2: 37.81 px (48 blocks) -> Z = f*B/d = 0.599 m
+--rectified: PASS — rows aligned
+$ displayxr-cli camera probe --raw --format gray8
+row alignment (RAW, 221 textured 32x32 blocks): |dy| median 2.589 px, p90 5.292 px, 183 block(s) > 1 px
+```
+
+(The blocks above 1 px on the rectified pair are mismatches at the bar's occlusion edges and on
+the frame counter, which is burned in raw space.)
+
 Runs as a DIAG IPC client, non-elevated. `probe` goes through the full consent path (so its
 first run on a box raises the prompt — which is how a developer checks the prompt). `selftest`
 gains `stereo_camera_caps`: zero cameras passes; malformed properties (zero extent, CALIBRATED
@@ -504,4 +555,5 @@ camera state change and per stream start/stop with the peer executable; INFO sta
 
 | Version | Change |
 |---|---|
+| 1 (R2) | No API change. RECTIFIED output and rectified calibration now come from the service's rectifier for any CALIBRATED, non-natively-rectified source; the browser is refused a camera it cannot rectify; sim_display `_DISTORT=1` fake; `camera probe` row alignment + `--rectified` |
 | 1 | R1 implements: enumerate, calibration (RAW; RECTIFIED for natively rectified sources), streams with start/stop, latest-wins acquire over a pinned 3-slot shared-memory ring with per-stream wake handles, stream stats, plug-in slots, sim_display fake, CLI, selftest. Deferred: state-change events (structs defined, not delivered), GPU transports, rectifier (R2), consent/indicator (R3). Design scope: Enumerate + state events, calibration (raw / rectified), streams with start/stop, latest-wins acquire over a pinned 3-slot shared-memory ring with per-stream wake handles, optional GPU transports, runtime-enforced consent / foreground / indicator, plug-in iface slots, sim_display fake, CLI. |

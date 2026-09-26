@@ -1,7 +1,8 @@
 # Stereo camera source — browser integration, vendor plug-in notes, phased plan
 
-**Status:** design (2026-09-25); **R1 implemented** on `feat/stereo-camera-r1` (2026-09-26) —
-see §E; maintainer decisions for R1 in §G. Decision: [ADR-043](../adr/ADR-043-stereo-camera-source.md).
+**Status:** design (2026-09-25); **R1 implemented** on `feat/stereo-camera-r1` (2026-09-26),
+**R2 implemented** on `feat/stereo-camera-r2` (2026-09-26, stacked) — see §E; maintainer decisions
+for R1 in §G. **L1** (Leia provider) is on `displayxr-leia-plugin` `feat/stereo-camera-l1`. Decision: [ADR-043](../adr/ADR-043-stereo-camera-source.md).
 Extension: [`XR_DXR_stereo_camera`](../specs/extensions/XR_DXR_stereo_camera.md). Consumer
 driving it: the web SDK's 3D call module (`@displayxr/inline3d/call`, RFC 0002 on
 `displayxr-web` branch `feat/call-p1`, §4 *Capture*).
@@ -194,7 +195,7 @@ The implementation belongs in `displayxr-leia-plugin` (`src/drv_leia/`), per ADR
 |---|---|---|---|
 | **R0** | runtime | This design: ADR-043, spec, this page | Maintainer sign-off on the open questions below |
 | **R1** ✅ | runtime | **Implemented 2026-09-26 (see "R1 as built" below).** Header `XR_DXR_stereo_camera.h` + `index.json` note (together — the catalog lint requires both); `xrt_plugin_iface` slots + `XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA` (appended after `create_dp_d3d11_lift`, so **lands after ADR-042's PR**); platform-neutral camera manager (thread, refcount + linger, 3-slot pinned ring, per-stream wake handles, decimation, NV12/BGRA conversion); IPC + OpenXR entry points; sim_display fake; `displayxr-cli camera list/calib/probe`; selftest check | `camera probe` on the sim fake writes frames on Windows + Linux CI; ring/pinning unit tests (mirror `tests_lift_mailbox`) |
-| **R2** | runtime | `u_stereo_rectify` (Bouguet, valid-region crop, LUT remap) with golden tests against OpenCV-generated fixtures; RECTIFIED output | sim fake: row error < 0.5 px, disparity = f·B/Z within 0.5 px |
+| **R2** ✅ | runtime | **Implemented 2026-09-26 (see "R2 as built" below).** `u_stereo_rectify` (Bouguet, valid-region crop, LUT remap) with golden tests against OpenCV-generated fixtures; RECTIFIED output | sim fake: row error < 0.5 px, disparity = f·B/Z within 0.5 px — **measured 0.061 px worst block, 0.063 px worst disparity error** |
 | **R3** | runtime | Privacy: OS consent check, consent store + tray prompt, delegating-client registration, visibility/lock suspension, indicator, kill switches | Manual matrix: allow/deny/revoke, OS switch off, lock screen, background app — each blocks frames |
 | **L1** | leia-plugin (Windows) | Slots over the SR raw-camera channel per §D; calibration by active serial; keep-alive; repin runtime (feature-macro repin, `downstream-pins.json` `features` track) | On a panel box, incl. the multi-folder box: `camera probe --rectified` rows aligned; the vendor call app running at the same time still gets every frame; tracking/weave unaffected (frame-time + tracking-state logs) |
 | **B1** | browser (Windows) | §B device factory + duplicate hiding + hint + delegating registration in the installer; web SDK: prefer the hint in `camera:'auto'`, fill `hello` from it | RFC 0002 P1 call between two panel laptops sends rectified SBS from the tracker camera **while both are tracking** |
@@ -229,6 +230,40 @@ against the sim fake).
   comment: D3D11 texture ring + fence as the `XR_DXR_weave` output export; AHB / dma-buf ring +
   sync_file as the #1699 weave path), a read-only POSIX section, and a distorted/misaligned fake
   (all with R2/R3/A1).
+
+### R2 as built
+
+- **`auxiliary/util/u_stereo_rectify.{h,c}`**, no OpenCV. Three layers so a GPU path replaces only
+  the last: geometry (`u_stereo_rectify_compute`: OpenCV's `stereoRectify(CALIB_ZERO_DISPARITY,
+  alpha = 0)` in C), float maps (`u_stereo_rectify_build_map`, what a GPU backend uploads as an
+  RG32F texture), and the CPU backend (a fixed-point bilinear LUT over the whole SBS image; NV12 =
+  full-res Y LUT + half-res UV LUT). RADTAN5 / RADTAN8 / KB4. Calibration at a different size than
+  the frames is rescaled. The alpha = 0 crop is verified on every border pixel of the real maps.
+- **Service:** a per-camera `struct scam_rectifier` built at manager create from the plug-in's
+  RAW calibration (WARN line with f, principal point, baseline, zoom, build time). It runs once
+  per source frame on the camera thread with the lock released, only while a started stream wants
+  RECTIFIED; RAW streams read the original. `get_calibration(RECTIFIED)` returns the same
+  geometry (one pinhole for both eyes, pure +x baseline); `horizontalFovDeg` is the rectified one.
+  The browser is refused (`INPUT_UNSUPPORTED`) a camera the rectifier rejected rather than being
+  given the RAW-flagged fallback. INFO stats add `rectify ms/frame`.
+- **Fake:** `SIM_DISPLAY_FAKE_STEREO_CAMERA_DISTORT=1` — the raw distorted, vertically misaligned,
+  rolled pair with exact ground truth (spec §10).
+- **Tests** (`tests_stereo_rectify`, fixtures in `tests/fixtures/` from
+  `gen_stereo_rectify_fixtures.py`, OpenCV 4.10, offline): R1/R2 to 1e-12, principal point to the
+  converged reference within 1e-4 px (and OpenCV's own P1 within 0.75 px — OpenCV stops
+  `undistortPoints` at 5 iterations), maps to 3e-5 px, no black pixel, and end to end on the fake:
+  raw |Δy| median 2.9 px → rectified worst block 0.061 px; disparity 11.33 / 37.77 px ground truth
+  vs 11.31 / 37.79 measured (worst block 0.063 px off).
+- **CLI:** `camera calib --rectified` prints P1/P2 and `Z = f·B/d`; every probe reports row
+  alignment and the dominant disparities as depths; `probe --rectified` exits 5 unless rows align.
+  Against the fake: |Δy| median 0.016 px, depths read back 2.004 m and 0.599 m.
+- **Perf:** 0.94 ms GRAY8 / 1.36 ms NV12 / 2.25 ms BGRA8 per 1280×480 frame, M1 Pro, -O2, one
+  thread (3 ms GRAY8 in a Debug service). At 30 Hz that is ~3 % of one core for the Leia GRAY8
+  source; **budget: ≤ 2 ms per frame on the camera thread**, above which the rows split across
+  threads (`u_stereo_rectify_lut_apply_rows`) or the GPU backend takes over. Setup (geometry + both
+  LUTs) 9–18 ms, once per calibration; LUT memory 6 bytes per output sample (3.7 MB + 0.9 MB).
+- **Not in R2:** the GPU backend (seam in place), per-frame recalibration (`calibrationGeneration`
+  stays 0), and a rectifier for a camera whose calibration changes at runtime.
 
 ## F. Risks
 
