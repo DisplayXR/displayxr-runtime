@@ -1123,9 +1123,7 @@ oxr_xrEnumerateStereoCamerasDXR(XrInstance instance,
 
 //! OpenXR API function @ep{xrGetStereoCameraCalibrationDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrGetStereoCameraCalibrationDXR(XrInstance instance,
-                                    uint64_t cameraId,
-                                    XrStereoCameraCalibrationDXR *calibration);
+oxr_xrGetStereoCameraCalibrationDXR(XrInstance instance, uint64_t cameraId, XrStereoCameraCalibrationDXR *calibration);
 
 //! OpenXR API function @ep{xrCreateStereoCameraStreamDXR}
 XRAPI_ATTR XrResult XRAPI_CALL

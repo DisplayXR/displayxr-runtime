@@ -125,7 +125,7 @@ struct xrt_stereo_camera_stream_request
  */
 struct xrt_stereo_camera_stream_layout
 {
-	uint32_t width;  //!< full SBS
+	uint32_t width; //!< full SBS
 	uint32_t height;
 	uint32_t format;
 	uint32_t output;
