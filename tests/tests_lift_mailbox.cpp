@@ -397,3 +397,69 @@ TEST_CASE("sim fake lift: the splat PLY is a valid two-layer 3DGS binary PLY", "
 	memcpy(f, ply.data() + ply.size() - sizeof(f), sizeof(f));
 	CHECK(f[2] > 0.0f);
 }
+
+TEST_CASE("lift snapshot cap: long edge capped, aspect kept, dims even", "[lift][cap]")
+{
+	uint32_t w = 0, h = 0;
+
+	// The measured case: a fullscreen player on an 8K panel.
+	CHECK(u_lift_cap_dims(7680, 4319, 1920, &w, &h));
+	CHECK(w == 1920);
+	CHECK(h == 1080);
+
+	// Portrait: the long edge is the height.
+	CHECK(u_lift_cap_dims(2160, 3840, 1920, &w, &h));
+	CHECK(w == 1080);
+	CHECK(h == 1920);
+
+	// Square, and an odd cap rounds DOWN to even (never exceeds the cap).
+	CHECK(u_lift_cap_dims(4000, 4000, 1921, &w, &h));
+	CHECK(w == 1920);
+	CHECK(h == 1920);
+
+	// Extreme aspect: the short edge never drops below 2.
+	CHECK(u_lift_cap_dims(8000, 1, 1920, &w, &h));
+	CHECK(w == 1920);
+	CHECK(h == 2);
+
+	// Already fits, exactly at the cap, and cap 0: unchanged, not "capped".
+	CHECK_FALSE(u_lift_cap_dims(1280, 721, 1920, &w, &h));
+	CHECK(w == 1280);
+	CHECK(h == 721);
+	CHECK_FALSE(u_lift_cap_dims(1920, 1080, 1920, &w, &h));
+	CHECK(w == 1920);
+	CHECK(h == 1080);
+	CHECK_FALSE(u_lift_cap_dims(7680, 4319, 0, &w, &h));
+	CHECK(w == 7680);
+	CHECK(h == 4319);
+
+	// Every result is even and inside the cap, aspect within one even step.
+	for (uint32_t sw = 1921; sw < 8000; sw += 377) {
+		for (uint32_t sh = 3; sh < 5000; sh += 211) {
+			REQUIRE(u_lift_cap_dims(sw, sh, 1920, &w, &h) == ((sw > sh ? sw : sh) > 1920));
+			if ((sw > sh ? sw : sh) <= 1920) {
+				continue;
+			}
+			CHECK(w % 2 == 0);
+			CHECK(h % 2 == 0);
+			CHECK((w > h ? w : h) == 1920);
+			const double want = (double)(sw < sh ? sw : sh) * 1920.0 / (double)(sw > sh ? sw : sh);
+			const double got = (double)(w < h ? w : h);
+			CHECK(((got - want <= 1.0 && want - got <= 1.0) || got == 2.0));
+		}
+	}
+}
+
+TEST_CASE("lift snapshot cap: DXR_LIFT_MAX_INPUT_EDGE parsing", "[lift][cap]")
+{
+	CHECK(u_lift_max_input_edge_parse(nullptr) == U_LIFT_MAX_INPUT_EDGE_DEFAULT);
+	CHECK(u_lift_max_input_edge_parse("") == U_LIFT_MAX_INPUT_EDGE_DEFAULT);
+	CHECK(u_lift_max_input_edge_parse("abc") == U_LIFT_MAX_INPUT_EDGE_DEFAULT);
+	CHECK(u_lift_max_input_edge_parse("-5") == U_LIFT_MAX_INPUT_EDGE_DEFAULT);
+	CHECK(u_lift_max_input_edge_parse("0") == 0);
+	CHECK(u_lift_max_input_edge_parse("1") == U_LIFT_MAX_INPUT_EDGE_MIN);
+	CHECK(u_lift_max_input_edge_parse("255") == U_LIFT_MAX_INPUT_EDGE_MIN);
+	CHECK(u_lift_max_input_edge_parse("256") == 256);
+	CHECK(u_lift_max_input_edge_parse("3840") == 3840);
+	CHECK(u_lift_max_input_edge_parse("99999999999") == 0xffffu);
+}

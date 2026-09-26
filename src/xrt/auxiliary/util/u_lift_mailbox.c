@@ -322,3 +322,57 @@ u_lift_sched_plan(
 	}
 	return n;
 }
+
+
+/*
+ *
+ * Snapshot size cap.
+ *
+ */
+
+uint32_t
+u_lift_max_input_edge_parse(const char *value)
+{
+	if (value == NULL || value[0] == '\0') {
+		return U_LIFT_MAX_INPUT_EDGE_DEFAULT;
+	}
+	uint64_t v = 0;
+	for (const char *p = value; *p != '\0'; p++) {
+		if (*p < '0' || *p > '9') {
+			return U_LIFT_MAX_INPUT_EDGE_DEFAULT;
+		}
+		v = v * 10u + (uint64_t)(*p - '0');
+		if (v > 0xffffu) {
+			v = 0xffffu; // far beyond any D3D11 texture edge; saturate
+		}
+	}
+	if (v == 0) {
+		return 0;
+	}
+	return v < U_LIFT_MAX_INPUT_EDGE_MIN ? U_LIFT_MAX_INPUT_EDGE_MIN : (uint32_t)v;
+}
+
+bool
+u_lift_cap_dims(uint32_t w, uint32_t h, uint32_t cap, uint32_t *out_w, uint32_t *out_h)
+{
+	*out_w = w;
+	*out_h = h;
+	const uint32_t long_edge = w > h ? w : h;
+	if (cap == 0 || long_edge <= cap || w == 0 || h == 0) {
+		return false;
+	}
+	const uint64_t ce = (uint64_t)(cap & ~1u) < 2u ? 2u : (uint64_t)(cap & ~1u);
+	const uint64_t short_edge = w > h ? h : w;
+	// Nearest even: 2 * round(short * ce / (2 * long)).
+	uint64_t se = 2u * ((short_edge * ce + long_edge) / (2u * (uint64_t)long_edge));
+	se = se < 2u ? 2u : se;
+	se = se > ce ? ce : se;
+	if (w >= h) {
+		*out_w = (uint32_t)ce;
+		*out_h = (uint32_t)se;
+	} else {
+		*out_w = (uint32_t)se;
+		*out_h = (uint32_t)ce;
+	}
+	return true;
+}

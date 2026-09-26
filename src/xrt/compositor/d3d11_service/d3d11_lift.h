@@ -172,7 +172,9 @@ d3d11_lift_submit_handle(struct d3d11_lift *lift,
  * The weave path's submit: snapshot region (@p x, @p y, @p w, @p h) of @p src
  * (an SRV on the service device, @p src_tw x @p src_th) into the mailbox.
  * The CALLER holds the service context mutex and whatever keyed mutex guards
- * @p src.
+ * @p src. The snapshot's long edge is capped at DXR_LIFT_MAX_INPUT_EDGE
+ * (default 1920, 0 = off; u_lift_cap_dims) — the result is stretched back into
+ * the rect, so consumers must sample it, never assume result size == rect size.
  */
 xrt_result_t
 d3d11_lift_submit_srv_locked(struct d3d11_lift *lift,
