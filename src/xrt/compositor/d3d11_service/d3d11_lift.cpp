@@ -1447,17 +1447,32 @@ letterbox_step(d3d11_lift *l,
 		const float *rows = (const float *)ms.pData;
 		const float *cols = (const float *)((const uint8_t *)ms.pData + ms.RowPitch);
 		const bool changed = u_lift_letterbox_update(&st.lb, r.w, r.h, rows, r.nr, cols, r.nc);
+		// The row profile that decided it, top to bottom in 64 bands, each the
+		// band's max non-black fraction as a digit 0-9 — so a surprising crop
+		// change in the field says what was in the bars (captions, player UI).
+		char prof[65] = {0};
+		if (changed) {
+			for (uint32_t k = 0; k < 64; k++) {
+				const uint32_t b0 = k * r.nr / 64, b1 = (k + 1) * r.nr / 64 > b0 ? (k + 1) * r.nr / 64 : b0 + 1;
+				float mx = 0.0f;
+				for (uint32_t i = b0; i < b1 && i < r.nr; i++) {
+					mx = rows[i] > mx ? rows[i] : mx;
+				}
+				const int d = (int)(mx * 10.0f);
+				prof[k] = (char)('0' + (d > 9 ? 9 : (d < 0 ? 0 : d)));
+			}
+		}
 		ctx->Unmap(r.staging, 0);
 		if (changed) {
 			const u_lift_crop &c = st.lb.committed;
 			if (u_lift_crop_active(&c)) {
 				U_LOG_W("[lift] stream %llu: letterbox crop %ux%u -> active %ux%u (bars top %u bottom %u left %u "
-				        "right %u; bars woven flat)",
+				        "right %u; bars woven flat) rows[%s]",
 				        (unsigned long long)st.id, r.w, r.h, r.w - c.left - c.right, r.h - c.top - c.bottom,
-				        c.top, c.bottom, c.left, c.right);
+				        c.top, c.bottom, c.left, c.right, prof);
 			} else {
-				U_LOG_W("[lift] stream %llu: letterbox crop off (%ux%u lifted whole)", (unsigned long long)st.id,
-				        r.w, r.h);
+				U_LOG_W("[lift] stream %llu: letterbox crop off (%ux%u lifted whole) rows[%s]",
+				        (unsigned long long)st.id, r.w, r.h, prof);
 			}
 		}
 	}

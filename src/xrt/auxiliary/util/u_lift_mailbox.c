@@ -448,8 +448,6 @@ letterbox_axis(const float *prof, uint32_t n, uint32_t len, float thr, uint32_t 
 	// bucket starts, so no picture row is ever inside a bar.
 	uint32_t lo_px = (uint32_t)(((uint64_t)lo * len) / n);
 	uint32_t hi_px = len - (uint32_t)(((uint64_t)(n - hi) * len) / n);
-	lo_px &= ~1u; // even, so a capped / halved snapshot stays aligned
-	hi_px &= ~1u;
 	if (lo_px < U_LIFT_LETTERBOX_MIN_BAR_PX) {
 		lo_px = 0;
 	}
