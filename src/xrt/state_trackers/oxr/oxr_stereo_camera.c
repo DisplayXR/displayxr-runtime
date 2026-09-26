@@ -106,7 +106,8 @@ scam_xret(struct oxr_logger *log, xrt_result_t xret, const char *what)
 		return oxr_error(log, XR_ERROR_FEATURE_UNSUPPORTED, "%s: not supported by this runtime / camera", what);
 	case XRT_ERROR_CLIENT_LIMIT_REACHED:
 		return oxr_error(log, XR_ERROR_LIMIT_REACHED, "%s: too many streams on this camera", what);
-	default: return oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "%s: service refused (xrt_result=%d)", what, (int)xret);
+	default:
+		return oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "%s: service refused (xrt_result=%d)", what, (int)xret);
 	}
 }
 
@@ -159,7 +160,8 @@ oxr_xrEnumerateStereoCamerasDXR(XrInstance instance,
 		return XR_SUCCESS;
 	}
 	if (capacityInput < n) {
-		return oxr_error(&log, XR_ERROR_SIZE_INSUFFICIENT, "(capacityInput == %u) < %u cameras", capacityInput, n);
+		return oxr_error(&log, XR_ERROR_SIZE_INSUFFICIENT, "(capacityInput == %u) < %u cameras", capacityInput,
+		                 n);
 	}
 	for (uint32_t i = 0; i < n; i++) {
 		if (cameras[i].type != XR_TYPE_STEREO_CAMERA_PROPERTIES_DXR) {
@@ -361,8 +363,8 @@ oxr_xrGetStereoCameraStreamInfoDXR(XrStereoCameraStreamDXR stream, XrStereoCamer
 	info->transport = (XrStereoCameraTransportDXR)lay.transport;
 	info->maxFrameRate = lay.max_frame_rate;
 
-	XrStereoCameraStreamTransportDXR *t = OXR_GET_OUTPUT_FROM_CHAIN(info, XR_TYPE_STEREO_CAMERA_STREAM_TRANSPORT_DXR,
-	                                                                XrStereoCameraStreamTransportDXR);
+	XrStereoCameraStreamTransportDXR *t = OXR_GET_OUTPUT_FROM_CHAIN(
+	    info, XR_TYPE_STEREO_CAMERA_STREAM_TRANSPORT_DXR, XrStereoCameraStreamTransportDXR);
 	if (t != NULL) {
 		// NEW handles, now the caller's to close.
 		t->sectionHandle = (uint64_t)(uintptr_t)section;
