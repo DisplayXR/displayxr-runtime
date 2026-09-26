@@ -396,9 +396,18 @@ u_lift_crop_active(const struct u_lift_crop *c)
 	return c->top != 0 || c->bottom != 0 || c->left != 0 || c->right != 0;
 }
 
-//! Bar sizes (pixels) at both ends of one axis of length @p len profiled in @p n buckets.
+
+/*!
+ * Bar sizes (pixels) at both ends of one axis of length @p len profiled in
+ * @p n buckets. A bar is the run from an edge of buckets below @p thr.
+ *
+ * Symmetry: a film is centred, so when one bar measures shorter, the shorter
+ * one exists, and the extra band on its side is either separated from the
+ * picture by a black gap (a subtitle line, however dense) or only sparsely lit
+ * throughout, the shorter bar is really as long as the other.
+ */
 static void
-letterbox_axis(const float *prof, uint32_t n, uint32_t len, uint32_t *out_lo, uint32_t *out_hi)
+letterbox_axis(const float *prof, uint32_t n, uint32_t len, float thr, uint32_t *out_lo, uint32_t *out_hi)
 {
 	*out_lo = 0;
 	*out_hi = 0;
@@ -406,35 +415,33 @@ letterbox_axis(const float *prof, uint32_t n, uint32_t len, uint32_t *out_lo, ui
 		return;
 	}
 	uint32_t lo = 0;
-	while (lo < n && prof[lo] < U_LIFT_LETTERBOX_PICTURE_FRAC) {
+	while (lo < n && prof[lo] < thr) {
 		lo++;
 	}
 	if (lo == n) {
 		return; // no picture anywhere on this axis: not a measurement of bars
 	}
 	uint32_t hi = 0;
-	while (hi < n && prof[n - 1 - hi] < U_LIFT_LETTERBOX_PICTURE_FRAC) {
+	while (hi < n && prof[n - 1 - hi] < thr) {
 		hi++;
 	}
-	// Symmetry: a film is centred, so when one bar measures shorter because
-	// dense subtitle rows ended it early, and every extra row is only SPARSELY
-	// lit (text, not picture), the shorter bar is really as long as the other.
-	// The shorter bar must exist: content pinned to one edge is not letterbox.
-	if (lo > hi && hi > 0 && n - lo > hi) {
+	// idx(i) = the i-th bucket counted from the SHORT bar's edge.
+	for (int side = 0; side < 2; side++) {
+		uint32_t *shrt = side == 0 ? &hi : &lo;
+		const uint32_t lng = side == 0 ? lo : hi;
+		if (!(lng > *shrt && *shrt > 0 && n - lng > *shrt)) {
+			continue;
+		}
+#define LB_IDX(i) (side == 0 ? n - 1 - (i) : (i))
+		// The band is [*shrt, lng) from the short edge; lng - 1 touches the picture.
+		bool gap = prof[LB_IDX(lng - 1)] < U_LIFT_LETTERBOX_PICTURE_FRAC;
 		bool sparse = true;
-		for (uint32_t i = hi; i < lo && sparse; i++) {
-			sparse = prof[n - 1 - i] < U_LIFT_LETTERBOX_SPARSE_FRAC;
+		for (uint32_t i = *shrt; i < lng && sparse; i++) {
+			sparse = prof[LB_IDX(i)] < U_LIFT_LETTERBOX_SPARSE_FRAC;
 		}
-		if (sparse) {
-			hi = lo;
-		}
-	} else if (hi > lo && lo > 0 && n - hi > lo) {
-		bool sparse = true;
-		for (uint32_t i = lo; i < hi && sparse; i++) {
-			sparse = prof[i] < U_LIFT_LETTERBOX_SPARSE_FRAC;
-		}
-		if (sparse) {
-			lo = hi;
+#undef LB_IDX
+		if (gap || sparse) {
+			*shrt = lng;
 		}
 	}
 	// Bucket k starts at pixel k*len/n: the bars end where the first picture
@@ -469,6 +476,28 @@ min_u32(uint32_t a, uint32_t b)
 	return a < b ? a : b;
 }
 
+static bool
+near_u32(uint32_t a, uint32_t b, uint32_t tol)
+{
+	return a > b ? a - b <= tol : b - a <= tol;
+}
+
+static bool
+crop_near(const struct u_lift_crop *a, const struct u_lift_crop *b, uint32_t tol_v, uint32_t tol_h)
+{
+	return near_u32(a->top, b->top, tol_v) && near_u32(a->bottom, b->bottom, tol_v) &&
+	       near_u32(a->left, b->left, tol_h) && near_u32(a->right, b->right, tol_h);
+}
+
+static void
+crop_min_into(struct u_lift_crop *acc, const struct u_lift_crop *m)
+{
+	acc->top = min_u32(acc->top, m->top);
+	acc->bottom = min_u32(acc->bottom, m->bottom);
+	acc->left = min_u32(acc->left, m->left);
+	acc->right = min_u32(acc->right, m->right);
+}
+
 bool
 u_lift_letterbox_update(struct u_lift_letterbox *lb,
                         uint32_t w,
@@ -487,10 +516,9 @@ u_lift_letterbox_update(struct u_lift_letterbox *lb,
 		lb->committed = none;
 		lb->pending = none;
 		lb->pending_frames = 0;
+		lb->shrink = none;
+		lb->shrink_frames = 0;
 	}
-	struct u_lift_crop m = none;
-	letterbox_axis(rows, nr, h, &m.top, &m.bottom);
-	letterbox_axis(cols, nc, w, &m.left, &m.right);
 
 	// A frame with no picture on either axis (black, a fade) says nothing.
 	bool content = false;
@@ -501,46 +529,77 @@ u_lift_letterbox_update(struct u_lift_letterbox *lb,
 		return changed;
 	}
 
-	// Picture inside a committed bar: shrink that bar NOW.
-	struct u_lift_crop shrunk = lb->committed;
-	shrunk.top = min_u32(shrunk.top, m.top);
-	shrunk.bottom = min_u32(shrunk.bottom, m.bottom);
-	shrunk.left = min_u32(shrunk.left, m.left);
-	shrunk.right = min_u32(shrunk.right, m.right);
-	if (memcmp(&shrunk, &lb->committed, sizeof(shrunk)) != 0) {
-		lb->committed = shrunk;
-		changed = true;
-	}
+	// Two readings of the same profile: bars as far as the rows are truly
+	// BLACK (what the crop may grow into), and as far as no PICTURE intrudes
+	// (what the crop must shrink back to).
+	struct u_lift_crop grow = none, keep = none;
+	letterbox_axis(rows, nr, h, U_LIFT_LETTERBOX_BLACK_FRAC, &grow.top, &grow.bottom);
+	letterbox_axis(cols, nc, w, U_LIFT_LETTERBOX_BLACK_FRAC, &grow.left, &grow.right);
+	letterbox_axis(rows, nr, h, U_LIFT_LETTERBOX_PICTURE_FRAC, &keep.top, &keep.bottom);
+	letterbox_axis(cols, nc, w, U_LIFT_LETTERBOX_PICTURE_FRAC, &keep.left, &keep.right);
 
-	// A larger bar has to settle before the crop grows into it.
-	if (crop_within(&m, &lb->committed)) {
-		lb->pending = lb->committed;
-		lb->pending_frames = 0;
-		return changed;
-	}
 	// Profiles jitter by a bucket frame to frame: "the same" within a tolerance,
 	// settling on the SMALLEST bars seen (never crop picture).
 	const uint32_t tol_v = h / 64u > 8u ? h / 64u : 8u;
 	const uint32_t tol_h = w / 64u > 8u ? w / 64u : 8u;
-#define LB_NEAR(a, b, t) ((a) > (b) ? (a) - (b) <= (t) : (b) - (a) <= (t))
-	const bool same = lb->pending_frames > 0 && LB_NEAR(m.top, lb->pending.top, tol_v) &&
-	                  LB_NEAR(m.bottom, lb->pending.bottom, tol_v) && LB_NEAR(m.left, lb->pending.left, tol_h) &&
-	                  LB_NEAR(m.right, lb->pending.right, tol_h);
-#undef LB_NEAR
-	if (same) {
-		lb->pending.top = min_u32(lb->pending.top, m.top);
-		lb->pending.bottom = min_u32(lb->pending.bottom, m.bottom);
-		lb->pending.left = min_u32(lb->pending.left, m.left);
-		lb->pending.right = min_u32(lb->pending.right, m.right);
+
+	// An intrusion within the jitter tolerance is bucket rounding (the symmetry
+	// rule mirrors a bar's BUCKET count, which lands a few pixels off the other
+	// bar's pixel size), not picture: it does not shrink the crop.
+#define LB_RELAX(e, t)                                                                                               \
+	if (lb->committed.e > keep.e && lb->committed.e - keep.e <= (t)) {                                           \
+		keep.e = lb->committed.e;                                                                            \
+	}
+	LB_RELAX(top, tol_v)
+	LB_RELAX(bottom, tol_v)
+	LB_RELAX(left, tol_h)
+	LB_RELAX(right, tol_h)
+#undef LB_RELAX
+
+	// Shrink: picture inside a committed bar, held for SHRINK_FRAMES frames.
+	if (!crop_within(&lb->committed, &keep)) {
+		struct u_lift_crop target = lb->committed;
+		crop_min_into(&target, &keep);
+		if (lb->shrink_frames > 0 && crop_near(&target, &lb->shrink, tol_v, tol_h)) {
+			crop_min_into(&lb->shrink, &target);
+			lb->shrink_frames++;
+		} else {
+			lb->shrink = target;
+			lb->shrink_frames = 1;
+		}
+		if (lb->shrink_frames >= U_LIFT_LETTERBOX_SHRINK_FRAMES) {
+			lb->committed = lb->shrink;
+			lb->shrink_frames = 0;
+			lb->pending = lb->committed;
+			lb->pending_frames = 0;
+			return true;
+		}
+		return changed; // no growth while picture is intruding
+	}
+	lb->shrink_frames = 0;
+
+	// Grow: larger truly-black bars have to settle first.
+	if (crop_within(&grow, &lb->committed)) {
+		lb->pending = lb->committed;
+		lb->pending_frames = 0;
+		return changed;
+	}
+	if (lb->pending_frames > 0 && crop_near(&grow, &lb->pending, tol_v, tol_h)) {
+		crop_min_into(&lb->pending, &grow);
 		lb->pending_frames++;
 	} else {
-		lb->pending = m;
+		lb->pending = grow;
 		lb->pending_frames = 1;
 	}
 	if (lb->pending_frames >= U_LIFT_LETTERBOX_SETTLE_FRAMES) {
-		lb->committed = lb->pending;
+		// Never grow a bar beyond what the no-picture reading allows either.
+		struct u_lift_crop next = lb->pending;
+		crop_min_into(&next, &keep);
+		if (memcmp(&next, &lb->committed, sizeof(next)) != 0) {
+			lb->committed = next;
+			changed = true;
+		}
 		lb->pending_frames = 0;
-		changed = true;
 	}
 	return changed;
 }
