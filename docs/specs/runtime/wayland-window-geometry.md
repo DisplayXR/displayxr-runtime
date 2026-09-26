@@ -657,3 +657,42 @@ pixel"). At 150 % the panel dragged unconstrained, and stuttered. Now:
 
 An app against a v7 extension keeps the integer-scale-only behaviour.
 
+
+### 8.7 Drag smoothness — the dense table (#1748)
+
+A slow drag on the panel moved in visible sideways steps. That was measured in
+a private headless GNOME Shell 50.1 running the v8 extension. The drag was a
+real `xdg_toplevel.move` grab, driven by pointer injection through
+`org.gnome.Mutter.RemoteDesktop`. The table came from the helper's own probe,
+over a best-phase snap of the vendor weaver's shape. Distances are in device px.
+
+- **Correct-after-apply is not the cause.** Of ~1,000 audited frames across
+  200 % and 150 %, 0 were painted off the table. `position-changed` runs
+  synchronously inside `move_resize`, so the correction lands before the next
+  paint, as §8.2 relies on.
+- **The table was coarser than the lens.** A 3 px probe keeps one entry per
+  cell and leaves out 18 % (200 %) to 31 % (150 %) of the reachable
+  phase-correct positions. So the nearest entry was up to 6.3 px away where
+  4.5 would do. Along a straight drag, the choice of entry flips between
+  neighbours on either side of the drag line, which shows as a wiggle across
+  the drag direction.
+- **Fix (displayxr-common, dense table):** on the grid-snap path the helper
+  probes every logical px and keeps every reachable answer. The display
+  processor does no extra work at a non-unit scale: the grid calls already
+  cover every logical px. At 100 % the one call grows from 129×129 to 385×385
+  points. The table stays ~13k entries, and the wire `cell` (the extension's
+  bucket size) stays 3, so the extension is unchanged.
+
+| scale | table | correction rms / max | across-track max |
+|---|---|---|---|
+| 200 % | 3 px | 3.8 / 6.3 | 6.0 |
+| 200 % | dense | 3.1 / 4.5 | 4.0 |
+| 150 % | 3 px | 3.1 / 5.4 | 4.7 |
+| 150 % | dense | 2.5 / 4.5 | 4.5 |
+| Windows, app-owned (reference) | — | 1.9 / 2.8 | 2.0 |
+
+**What remains is reachability.** Mutter places a window at whole logical px,
+so at 200 % only every other device px in each axis can be reached. Any table
+at the same phase precision therefore sits about 1.6× coarser than the Windows
+drag. Closing that gap would mean accepting a looser phase, which is the
+display processor's decision, not the table's.
