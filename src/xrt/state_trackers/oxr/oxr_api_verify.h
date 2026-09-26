@@ -94,6 +94,8 @@ struct oxr_subaction_paths;
 	OXR_VERIFY_AND_SET_AND_INIT(log, thing, new_thing, oxr_plane_detector_ext, PLANEDET, name, new_thing->sess->sys->inst)
 #define OXR_VERIFY_LOCAL_3D_ZONE_AND_INIT_LOG(log, thing, new_thing, name) \
 	OXR_VERIFY_AND_SET_AND_INIT(log, thing, new_thing, oxr_local_3d_zone_ext, LOCAL3DZONE, name, new_thing->sess->sys->inst)
+#define OXR_VERIFY_STEREO_CAMERA_STREAM_AND_INIT_LOG(log, thing, new_thing, name) \
+	OXR_VERIFY_AND_SET_AND_INIT(log, thing, new_thing, oxr_stereo_camera_stream_dxr, STEREOCAMSTREAM, name, new_thing->inst)
 // clang-format on
 
 #define OXR_VERIFY_INSTANCE_NOT_NULL(log, arg, new_arg) OXR_VERIFY_SET(log, arg, new_arg, oxr_instance, INSTANCE);
