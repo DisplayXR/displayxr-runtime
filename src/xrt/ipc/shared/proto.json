@@ -1085,5 +1085,93 @@
 		"out": [
 			{"name": "accepted", "type": "uint32_t"}
 		]
+	},
+
+	"stereo_camera_count": {
+		"out": [
+			{"name": "count", "type": "uint32_t"}
+		]
+	},
+
+	"stereo_camera_get_properties": {
+		"in": [
+			{"name": "index", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "props", "type": "struct xrt_stereo_camera_properties"}
+		]
+	},
+
+	"stereo_camera_get_calibration": {
+		"in": [
+			{"name": "camera_id", "type": "uint64_t"},
+			{"name": "output", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "calib", "type": "struct xrt_stereo_camera_calibration"}
+		]
+	},
+
+	"stereo_camera_stream_create": {
+		"in": [
+			{"name": "req", "type": "struct xrt_stereo_camera_stream_request"}
+		],
+		"out": [
+			{"name": "stream_id", "type": "uint64_t"}
+		]
+	},
+
+	"stereo_camera_stream_destroy": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"}
+		]
+	},
+
+	"stereo_camera_stream_start": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"}
+		]
+	},
+
+	"stereo_camera_stream_stop": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"}
+		]
+	},
+
+	"stereo_camera_stream_get_section": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"}
+		],
+		"out": [
+			{"name": "layout", "type": "struct xrt_stereo_camera_stream_layout"}
+		],
+		"out_handles": {"type": "xrt_shmem_handle_t"}
+	},
+
+	"stereo_camera_stream_get_wake": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"}
+		],
+		"out_handles": {"type": "xrt_graphics_sync_handle_t"}
+	},
+
+	"stereo_camera_acquire": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"}
+		],
+		"out": [
+			{"name": "ready", "type": "bool"},
+			{"name": "frame", "type": "struct xrt_stereo_camera_frame_info"}
+		]
+	},
+
+	"stereo_camera_stream_stats": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"}
+		],
+		"out": [
+			{"name": "stats", "type": "struct xrt_stereo_camera_stream_stats"}
+		]
 	}
 }

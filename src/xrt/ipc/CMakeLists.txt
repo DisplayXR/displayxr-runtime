@@ -68,6 +68,8 @@ add_library(
 	client/ipc_client.h
 	client/ipc_client_compositor.c
 	client/ipc_client_connection.c
+	client/ipc_client_stereo_camera.c
+	client/ipc_client_stereo_camera.h
 	client/ipc_client_device.c
 	client/ipc_client_hmd.c
 	client/ipc_client_instance.c
@@ -119,6 +121,8 @@ add_library(
 	server/ipc_server_peer_creds.c
 	server/ipc_server_peer_creds.h
 	server/ipc_server_process.c
+	server/ipc_server_stereo_camera.c
+	server/ipc_server_stereo_camera.h
 	)
 target_include_directories(
 	ipc_server

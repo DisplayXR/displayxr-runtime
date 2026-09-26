@@ -134,6 +134,7 @@ struct oxr_body_tracker_fb;
 struct oxr_xdev_list;
 struct oxr_plane_detector_ext;
 struct oxr_local_3d_zone_ext;
+struct oxr_stereo_camera_stream_dxr;
 
 #define XRT_MAX_HANDLE_CHILDREN 256
 #define OXR_MAX_BINDINGS_PER_ACTION 32
@@ -4331,6 +4332,27 @@ struct oxr_local_3d_zone_ext
 	void *comp_mask;
 };
 #endif // OXR_HAVE_DXR_local_3d_zone
+
+#ifdef OXR_HAVE_DXR_stereo_camera
+/*!
+ * One XR_DXR_stereo_camera stream (ADR-043). The camera and its ring live in
+ * the service (ipc_server_stereo_camera.c); this is the handle and the
+ * service-side stream id, owned by the instance's IPC connection.
+ *
+ * Parent type/handle is @ref oxr_instance
+ *
+ * @obj{XrStereoCameraStreamDXR}
+ * @extends oxr_handle_base
+ */
+struct oxr_stereo_camera_stream_dxr
+{
+	struct oxr_handle_base handle;
+	struct oxr_instance *inst;
+	uint64_t id;        //!< service-side stream id
+	uint64_t camera_id; //!< service-side camera id
+	bool started;
+};
+#endif // OXR_HAVE_DXR_stereo_camera
 
 
 #ifdef OXR_HAVE_EXT_user_presence

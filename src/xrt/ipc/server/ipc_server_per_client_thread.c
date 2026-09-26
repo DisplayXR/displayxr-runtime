@@ -22,6 +22,7 @@ DEBUG_GET_ONCE_NUM_OPTION(test_exit_on_disconnect, "DXR_TEST_EXIT_ON_DISCONNECT"
 #include "shared/ipc_shmem.h"
 #include "shared/ipc_utils.h"
 #include "server/ipc_server.h"
+#include "server/ipc_server_stereo_camera.h"
 #include "ipc_server_generated.h"
 #include "xrt/xrt_config_have.h"
 
@@ -123,6 +124,9 @@ common_shutdown(volatile struct ipc_client_state *ics)
 	// dup were parked for a next call that will never come.
 	ipc_server_client_weave_flush_deferred_fds(ics);
 #endif
+
+	// XR_DXR_stereo_camera (ADR-043): streams are owned by the connection.
+	ipc_server_client_stereo_camera_release(ics);
 
 	// Make sure undestroyed spaces are unreferenced
 	for (uint32_t i = 0; i < IPC_MAX_CLIENT_SPACES; i++) {

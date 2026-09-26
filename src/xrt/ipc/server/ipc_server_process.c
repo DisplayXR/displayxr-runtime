@@ -34,6 +34,7 @@
 #include "shared/ipc_protocol.h"
 #include "shared/ipc_shmem.h"
 #include "server/ipc_server.h"
+#include "server/ipc_server_stereo_camera.h"
 #include "server/ipc_server_interface.h"
 #include "server/ipc_server_peer_creds.h"
 
@@ -239,6 +240,9 @@ static void
 teardown_all(struct ipc_server *s)
 {
 	u_var_remove_root(s);
+
+	// Before the instance: the camera threads call into the plug-in.
+	ipc_server_stereo_camera_destroy(&s->stereo_camera);
 
 	xrt_syscomp_destroy(&s->xsysc);
 
@@ -560,6 +564,9 @@ init_all(struct ipc_server *s, enum u_logging_level log_level)
 
 	xret = xrt_instance_create_system(s->xinst, &s->xsys, &s->xsysd, &s->xso, &s->xsysc);
 	IPC_CHK_WITH_GOTO(s, xret, "xrt_instance_create_system", error);
+
+	// XR_DXR_stereo_camera (ADR-043): the service owns every plug-in camera.
+	s->stereo_camera = ipc_server_stereo_camera_create(s->xinst);
 
 	// Always succeeds.
 	init_idevs(s);
