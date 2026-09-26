@@ -910,6 +910,22 @@ err_destroy:
  *
  */
 
+/*!
+ * xrt_instance::get_active_plugin — the plug-in that claimed the system. The
+ * service's stereo camera manager (ADR-043) reads its camera slots through it.
+ */
+static bool
+t_instance_get_active_plugin(struct xrt_instance *xinst,
+                             const struct xrt_plugin_iface **out_iface,
+                             struct xrt_plugin_instance **out_inst)
+{
+	(void)xinst;
+	const struct xrt_plugin_iface *iface = target_plugin_get_active();
+	*out_iface = iface;
+	*out_inst = iface != NULL ? target_plugin_get_active_instance() : NULL;
+	return iface != NULL;
+}
+
 #ifdef XRT_FEATURE_HYBRID_MODE
 // In hybrid mode, export as native_instance_create to avoid symbol conflict
 // with ipc_instance_create from the IPC client library
@@ -935,6 +951,7 @@ xrt_instance_create(struct xrt_instance_info *ii, struct xrt_instance **out_xins
 	tinst->base.create_system = t_instance_create_system;
 	tinst->base.get_prober = t_instance_get_prober;
 	tinst->base.destroy = t_instance_destroy;
+	tinst->base.get_active_plugin = t_instance_get_active_plugin;
 	tinst->xp = xp;
 
 	tinst->base.startup_timestamp = os_monotonic_get_ns();

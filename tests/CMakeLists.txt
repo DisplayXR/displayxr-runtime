@@ -63,6 +63,7 @@ set(tests
     tests_comp_layer_view_camera
     tests_comp_color_policy
     tests_m_matrix_projection
+    tests_stereo_camera
 	)
 if(XRT_BUILD_DRIVER_QWERTY)
 	list(APPEND tests tests_qwerty_camera_profile tests_qwerty_velocity)
@@ -692,3 +693,8 @@ endif()
 add_test(NAME tests_ipc_proto COMMAND ${PYTHON_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests_ipc_proto.py
 					 ${PROJECT_SOURCE_DIR}/src/xrt/ipc/shared
 	)
+
+# ADR-043: the sim_display FAKE stereo camera's scene is pinned host-side next to
+# the ring / conversion / disparity-probe tests (it compiles into the plug-in).
+target_sources(tests_stereo_camera PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_stereo_camera_pattern.c)
+target_include_directories(tests_stereo_camera PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display)

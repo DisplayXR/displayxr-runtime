@@ -43,6 +43,7 @@
 #include "xrt/xrt_display_processor_metal.h"
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -553,6 +554,128 @@ struct xrt_plugin_host_iface
  */
 #define XRT_PLUGIN_HOST_HAS_ANDROID_PACKAGE_VISIBILITY 1
 
+/*
+ *
+ * Stereo camera source (ADR-043, XR_DXR_stereo_camera).
+ *
+ * A display's stereo camera — usually the one its eye tracker looks through —
+ * produced by the plug-in from its own stack WITHOUT taking the device from
+ * the tracker. The runtime service owns threads, fan-out, rectification,
+ * format conversion, transport, consent and the in-use indicator; the plug-in
+ * owns reading + decoding frames and the calibration of ITS ACTIVE device.
+ * Graphics-API-neutral on purpose: a camera is a sensor, not a weaver, and it
+ * must not share a lifetime with a display processor that is recreated on
+ * presenter changes. Slots on @ref xrt_plugin_iface (appended, ADR-020).
+ *
+ */
+
+//! @ref xrt_plugin_stereo_camera_info::flags — values equal the
+//! XrStereoCameraFlagsDXR bits (static-asserted in the state tracker).
+#define XRT_PLUGIN_STEREO_CAMERA_SHARED_WITH_EYE_TRACKING (1u << 0)
+#define XRT_PLUGIN_STEREO_CAMERA_USER_FACING (1u << 1)
+#define XRT_PLUGIN_STEREO_CAMERA_CALIBRATED (1u << 2)
+#define XRT_PLUGIN_STEREO_CAMERA_NATIVELY_RECTIFIED (1u << 3)
+#define XRT_PLUGIN_STEREO_CAMERA_MONOCHROME (1u << 4)
+
+//! Pixel formats a plug-in delivers (values equal XrStereoCameraFormatDXR).
+enum xrt_plugin_stereo_camera_format
+{
+	XRT_PLUGIN_STEREO_CAMERA_FORMAT_GRAY8 = 1,
+	XRT_PLUGIN_STEREO_CAMERA_FORMAT_NV12 = 2,
+	XRT_PLUGIN_STEREO_CAMERA_FORMAT_BGRA8 = 3,
+};
+
+//! Lens models (values equal XrStereoCameraDistortionModelDXR).
+enum xrt_plugin_stereo_camera_distortion
+{
+	XRT_PLUGIN_STEREO_CAMERA_DISTORTION_NONE = 0,
+	XRT_PLUGIN_STEREO_CAMERA_DISTORTION_RADTAN5 = 1,
+	XRT_PLUGIN_STEREO_CAMERA_DISTORTION_RADTAN8 = 2,
+	XRT_PLUGIN_STEREO_CAMERA_DISTORTION_KB4 = 3,
+};
+
+//! Result of @ref xrt_plugin_iface::stereo_camera_wait_frame.
+enum xrt_plugin_stereo_camera_wait
+{
+	//! @p out holds a new frame; call stereo_camera_release_frame when done.
+	XRT_PLUGIN_STEREO_CAMERA_WAIT_OK = 0,
+	//! No frame within the timeout (source up; e.g. tracker warming up).
+	XRT_PLUGIN_STEREO_CAMERA_WAIT_TIMEOUT = 1,
+	//! The source is temporarily not delivering (tracker stopped).
+	XRT_PLUGIN_STEREO_CAMERA_WAIT_SUSPENDED = 2,
+	//! The source failed or went away; the runtime closes it.
+	XRT_PLUGIN_STEREO_CAMERA_WAIT_ERROR = 3,
+};
+
+/*!
+ * One camera, as a plug-in describes it. The runtime sets @ref struct_size to
+ * its own size before the call; the plug-in must not write past it.
+ */
+struct xrt_plugin_stereo_camera_info
+{
+	uint32_t struct_size;
+	//! Human-readable, UTF-8 ("Built-in 3D camera").
+	char display_name[128];
+	//! Stable device key (e.g. the panel serial). The SERVICE hashes it per
+	//! consumer; it is never exported to clients.
+	char device_identity[128];
+	//! The OS's id of the physical device the frames come from, or "".
+	char platform_device_hint[256];
+	//! XRT_PLUGIN_STEREO_CAMERA_* bits.
+	uint32_t flags;
+	//! Native per-eye size.
+	uint32_t eye_width;
+	uint32_t eye_height;
+	//! What the source can deliver, Hz.
+	float max_frame_rate;
+	//! @ref xrt_plugin_stereo_camera_format the plug-in decodes to.
+	uint32_t native_format;
+};
+
+/*!
+ * RAW calibration of the ACTIVE device (the one this plug-in weaves for and
+ * whose tracker it reads) — never "the first calibration on the machine".
+ */
+struct xrt_plugin_stereo_camera_calibration
+{
+	uint32_t struct_size;
+	//! Per eye, pixels.
+	uint32_t image_width;
+	uint32_t image_height;
+	//! Per eye: fx fy cx cy, pixels.
+	double k[2][4];
+	//! @ref xrt_plugin_stereo_camera_distortion.
+	uint32_t distortion_model;
+	double distortion[2][8];
+	double rotation_right_from_left[3][3];
+	double translation_right_from_left_mm[3];
+};
+
+/*!
+ * One frame handed to the runtime. Planes stay valid until
+ * stereo_camera_release_frame. Always ONE side-by-side image, left eye left.
+ */
+struct xrt_plugin_stereo_camera_frame
+{
+	//! Monotonic per open, from 1.
+	uint64_t sequence;
+	//! os_monotonic_get_ns() domain.
+	int64_t time_ns;
+	//! true = sensor/exposure time; false = arrival time in the plug-in.
+	bool time_is_exposure;
+	//! Full SBS extent (2 * eye_width x eye_height).
+	uint32_t width;
+	uint32_t height;
+	//! @ref xrt_plugin_stereo_camera_format.
+	uint32_t format;
+	const uint8_t *planes[2];
+	uint32_t pitches[2];
+};
+
+//! Opaque plug-in-owned open camera.
+struct xrt_plugin_stereo_camera;
+
+
 /*!
  * The plug-in's vtable. Filled in by the plug-in inside its
  * `xrtPluginNegotiate` implementation and handed back to the runtime via
@@ -784,7 +907,100 @@ struct xrt_plugin_iface
 	 * Set to `(uint32_t)offsetof(struct vk_bundle, vkGetInstanceProcAddr)`.
 	 */
 	uint32_t vk_bundle_fn_table_offset;
+
+	/*!
+	 * PLACEHOLDER for ADR-042's `create_dp_d3d11_lift` (XR_DXR_lift, branch
+	 * `feat/lift-ext`), which is not on `main` yet but claims THIS offset.
+	 * Holding it here keeps the stereo camera slots below at their final
+	 * offsets whichever PR merges first. When lift lands, its field replaces
+	 * this one in place (same size: one function pointer) — a mechanical
+	 * rebase, no ABI move. Never read by the runtime; plug-ins leave it NULL.
+	 */
+	void (*reserved_adr042_create_dp_d3d11_lift)(void);
+
+	/*!
+	 * @name Stereo camera source (ADR-043, XR_DXR_stereo_camera)
+	 *
+	 * Optional, all-or-nothing: the runtime uses the camera slots only when
+	 * @ref struct_size covers @ref stereo_camera_close and every one of them
+	 * is non-NULL. Appended per ADR-020 (append-only within a major; gated by
+	 * @ref struct_size; no XRT_PLUGIN_API_VERSION_CURRENT bump). Announced by
+	 * @ref XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA.
+	 *
+	 * Threading: enumerate / get_calibration are cheap and callable from any
+	 * thread. wait_frame / release_frame are called from ONE runtime-owned
+	 * camera thread per open camera. Nothing throws across this boundary.
+	 * @{
+	 */
+
+	/*!
+	 * Fill up to @p capacity entries of @p out (each with struct_size preset
+	 * by the runtime) and return the number of cameras. @p capacity 0 / NULL
+	 * @p out = count query. Stable indices for the plug-in instance's life.
+	 */
+	uint32_t (*stereo_camera_enumerate)(struct xrt_plugin_instance *inst,
+	                                    uint32_t capacity,
+	                                    struct xrt_plugin_stereo_camera_info *out);
+
+	/*!
+	 * RAW calibration of camera @p index, for the ACTIVE device. Return
+	 * XRT_ERROR_FEATURE_NOT_SUPPORTED when it cannot be resolved — the camera
+	 * must then not report XRT_PLUGIN_STEREO_CAMERA_CALIBRATED.
+	 */
+	xrt_result_t (*stereo_camera_get_calibration)(struct xrt_plugin_instance *inst,
+	                                              uint32_t index,
+	                                              struct xrt_plugin_stereo_camera_calibration *out);
+
+	/*!
+	 * Open camera @p index. Doubles as a tracker keep-alive: while any camera
+	 * is open, a SHARED_WITH_EYE_TRACKING source keeps its tracker running.
+	 * Must never open / reconfigure / re-time the device away from the tracker.
+	 */
+	xrt_result_t (*stereo_camera_open)(struct xrt_plugin_instance *inst,
+	                                   uint32_t index,
+	                                   struct xrt_plugin_stereo_camera **out_cam);
+
+	/*!
+	 * Block up to @p timeout_ns for the next frame. Returns an @ref
+	 * xrt_plugin_stereo_camera_wait. On OK the frame's planes stay valid until
+	 * @ref stereo_camera_release_frame. Must not wait on a wake object shared
+	 * with other readers of the vendor channel (poll it instead; ADR-043).
+	 */
+	uint32_t (*stereo_camera_wait_frame)(struct xrt_plugin_stereo_camera *cam,
+	                                     int64_t timeout_ns,
+	                                     struct xrt_plugin_stereo_camera_frame *out);
+
+	//! Release the frame of the last OK wait_frame.
+	void (*stereo_camera_release_frame)(struct xrt_plugin_stereo_camera *cam);
+
+	//! Close; drops the keep-alive when it was the last open camera.
+	void (*stereo_camera_close)(struct xrt_plugin_stereo_camera *cam);
+
+	/*! @} */
 };
+
+/*!
+ * Defined when @ref xrt_plugin_iface carries the stereo camera slots
+ * (ADR-043), so a plug-in built against an older runtime header can
+ * #ifdef-guard filling them.
+ */
+#define XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA 1
+
+/*!
+ * True when @p iface fills the whole stereo camera slot set (and its
+ * struct_size covers it).
+ */
+static inline bool
+xrt_plugin_iface_has_stereo_camera(const struct xrt_plugin_iface *iface)
+{
+	if (iface == NULL || iface->struct_size < offsetof(struct xrt_plugin_iface, stereo_camera_close) +
+	                                              sizeof(iface->stereo_camera_close)) {
+		return false;
+	}
+	return iface->stereo_camera_enumerate != NULL && iface->stereo_camera_get_calibration != NULL &&
+	       iface->stereo_camera_open != NULL && iface->stereo_camera_wait_frame != NULL &&
+	       iface->stereo_camera_release_frame != NULL && iface->stereo_camera_close != NULL;
+}
 
 
 /*
