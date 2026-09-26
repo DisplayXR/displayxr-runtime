@@ -595,7 +595,15 @@ u_lift_letterbox_update(struct u_lift_letterbox *lb,
 		// Never grow a bar beyond what the no-picture reading allows either.
 		struct u_lift_crop next = lb->pending;
 		crop_min_into(&next, &keep);
-		if (memcmp(&next, &lb->committed, sizeof(next)) != 0) {
+		// Deadband: once a crop is in effect, growing it by a few pixels buys
+		// nothing (the recompose's flat bars already reach into the active
+		// area) and would re-size the module's input every settle period.
+		const uint32_t db_v = h / 256u > 8u ? h / 256u : 8u;
+		const uint32_t db_h = w / 256u > 8u ? w / 256u : 8u;
+		const struct u_lift_crop *c = &lb->committed;
+		const bool worth = !u_lift_crop_active(c) || next.top > c->top + db_v || next.bottom > c->bottom + db_v ||
+		                   next.left > c->left + db_h || next.right > c->right + db_h;
+		if (worth && memcmp(&next, &lb->committed, sizeof(next)) != 0) {
 			lb->committed = next;
 			changed = true;
 		}
