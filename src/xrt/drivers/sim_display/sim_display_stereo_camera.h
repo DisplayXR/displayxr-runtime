@@ -11,11 +11,21 @@
  *   SIM_DISPLAY_FAKE_STEREO_CAMERA_FPS=N             source rate (default 30)
  *   SIM_DISPLAY_FAKE_STEREO_CAMERA_FORMAT=gray8|nv12|bgra   native format (default gray8)
  *   SIM_DISPLAY_FAKE_STEREO_CAMERA_SUSPEND_PERIOD_MS=N      square-wave SUSPENDED/AVAILABLE
+ *   SIM_DISPLAY_FAKE_STEREO_CAMERA_DISTORT=1         R2: a RAW distorted pair (see below)
  *
  * The camera: SHARED_WITH_EYE_TRACKING | USER_FACING | CALIBRATED |
  * NATIVELY_RECTIFIED (+ MONOCHROME for gray8), 68 deg horizontal FOV per eye,
  * 50 mm baseline, background at 2.0 m and a bar at 0.6 m — at 640 px per eye
  * that is fx = 474.4 px and disparities of 12 px and 40 px.
+ *
+ * With _DISTORT=1 the same scene is seen through two raw cameras with known
+ * ground truth (per-eye intrinsics, RADTAN5 barrel lenses, 0.7 deg relative
+ * pitch = ~6 px of vertical misalignment, 0.9 deg relative roll, 0.5 deg yaw;
+ * sim_stereo_camera_truth_init), the calibration slot returns that truth, and
+ * NATIVELY_RECTIFIED is dropped — so RECTIFIED output exercises the service's
+ * rectifier (u_stereo_rectify). After rectification rows align and the
+ * disparities are f_rect * B / Z (f_rect: `displayxr-cli camera calib <id>
+ * --rectified`).
  *
  * @ingroup drv_sim_display
  */
