@@ -595,6 +595,13 @@ rectifier_create(const struct scam_camera *cam)
 		return NULL;
 	}
 	r->apply = rectify_apply_cpu;
+	if (r->geo.t_rect[0] > 0.0) {
+		// Contract: SBS left half = the camera's LEFT lens, T.x < 0 (xrt_plugin.h).
+		U_LOG_W(
+		    "stereo camera %llu: calibration puts the right camera at -x (T.x > 0) — the plug-in's SBS halves "
+		    "look swapped; rectified disparities will be NEGATIVE",
+		    (unsigned long long)cam->camera_id);
+	}
 	U_LOG_W(
 	    "stereo camera %llu: rectifier ready (CPU) — f %.2f px, principal point (%.2f, %.2f), baseline %.2f mm, "
 	    "valid-region zoom x%.4f, %u/%u valid taps, built in %.1f ms",
