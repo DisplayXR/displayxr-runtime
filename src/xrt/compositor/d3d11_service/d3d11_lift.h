@@ -92,6 +92,10 @@ struct d3d11_lift_pin
 	uint32_t width;                //!< whole result (all views)
 	uint32_t height;
 	uint32_t view_count;
+	//! The part of the lifted rect this result covers (letterbox crop):
+	//! x0, y0, x1, y1 normalised to the rect as it was snapshotted. Outside it
+	//! (the bars) the caller weaves the 2D input FLAT, identical in every view.
+	float active[4];
 	bool valid;
 };
 
