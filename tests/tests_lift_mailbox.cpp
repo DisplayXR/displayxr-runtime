@@ -560,7 +560,18 @@ TEST_CASE("lift letterbox: picture in a bar un-crops at once; black frames chang
 	CHECK(lb.committed.top == before.top);
 	CHECK(lb.committed.bottom == before.bottom);
 
-	// Full-frame picture (a 16:9 ad): the crop is released on the first frame.
+	// A few frames of picture in the bars (a caption burst, a flash): the crop holds.
+	for (uint32_t f = 1; f < U_LIFT_LETTERBOX_SHRINK_FRAMES; f++) {
+		CHECK_FALSE(u_lift_letterbox_update(&lb, w, h, full.data(), nr, cols.data(), 512));
+	}
+	(void)u_lift_letterbox_update(&lb, w, h, film.data(), nr, cols.data(), 512);
+	CHECK(lb.committed.top == before.top);
+	CHECK(lb.committed.bottom == before.bottom);
+
+	// Full-frame picture that persists (a 16:9 ad): released after SHRINK_FRAMES.
+	for (uint32_t f = 1; f < U_LIFT_LETTERBOX_SHRINK_FRAMES; f++) {
+		CHECK_FALSE(u_lift_letterbox_update(&lb, w, h, full.data(), nr, cols.data(), 512));
+	}
 	CHECK(u_lift_letterbox_update(&lb, w, h, full.data(), nr, cols.data(), 512));
 	CHECK_FALSE(u_lift_crop_active(&lb.committed));
 
@@ -599,4 +610,43 @@ TEST_CASE("lift letterbox: DXR_LIFT_LETTERBOX parse", "[lift][letterbox]")
 	CHECK(u_lift_letterbox_parse(""));
 	CHECK(u_lift_letterbox_parse("1"));
 	CHECK_FALSE(u_lift_letterbox_parse("0"));
+}
+
+TEST_CASE("lift letterbox: dark picture edges never grow a bar", "[lift][letterbox]")
+{
+	// A dark scene: the outer columns are dim picture (8% lit), not black bars.
+	const uint32_t nr = 512;
+	const std::vector<float> rows(nr, 0.9f);
+	std::vector<float> cols(512, 0.9f);
+	for (uint32_t i = 0; i < 140; i++) {
+		cols[i] = 0.08f;
+		cols[511 - i] = 0.08f;
+	}
+	u_lift_letterbox lb = {};
+	for (uint32_t f = 0; f < 3 * U_LIFT_LETTERBOX_SETTLE_FRAMES; f++) {
+		CHECK_FALSE(u_lift_letterbox_update(&lb, 2562, 1440, rows.data(), nr, cols.data(), 512));
+	}
+	CHECK_FALSE(u_lift_crop_active(&lb.committed));
+}
+
+TEST_CASE("lift letterbox: flickering captions keep the bottom bar", "[lift][letterbox]")
+{
+	// YouTube-style: top bar 184 of 1440, captions come and go in the bottom bar
+	// (dense, but always with a black gap above them).
+	const uint32_t w = 2562, h = 1440, nr = 512;
+	const std::vector<float> plain = lb_rows(h, nr, 184, 1254);
+	const std::vector<float> caption = lb_rows(h, nr, 184, 1254, 0.7f, 1300, 1400);
+	const std::vector<float> cols(512, 0.9f);
+	u_lift_letterbox lb = {};
+	for (uint32_t f = 0; f < U_LIFT_LETTERBOX_SETTLE_FRAMES; f++) {
+		(void)u_lift_letterbox_update(&lb, w, h, plain.data(), nr, cols.data(), 512);
+	}
+	REQUIRE(lb.committed.bottom >= 176);
+	const u_lift_crop before = lb.committed;
+	for (int f = 0; f < 300; f++) {
+		const std::vector<float> &p = (f / 20) % 2 ? caption : plain;
+		(void)u_lift_letterbox_update(&lb, w, h, p.data(), nr, cols.data(), 512);
+		REQUIRE(lb.committed.bottom == before.bottom);
+		REQUIRE(lb.committed.top == before.top);
+	}
 }
