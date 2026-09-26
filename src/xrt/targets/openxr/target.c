@@ -35,9 +35,37 @@ U_TRACE_TARGET_SETUP(U_TRACE_WHICH_SERVICE)
 #include <stdlib.h>
 #endif
 
+#ifdef XRT_OS_LINUX_DESKTOP
+#include "util/u_file.h"
+#include <limits.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#endif
+
 // Forward declaration of native instance creation from target_instance_hybrid
 xrt_result_t
 native_instance_create(struct xrt_instance_info *ii, struct xrt_instance **out_xinst);
+
+#ifdef XRT_OS_LINUX_DESKTOP
+/*!
+ * Is there a displayxr-service listening socket to dial? (#1744)
+ *
+ * A stat, not a connect: under systemd socket activation the socket file is
+ * owned by systemd from login on, and dialling it just to ask would start the
+ * service for a client that may end up in-process anyway. A stale socket (the
+ * service died without unlinking it) passes this check; the caller falls back
+ * when the real connect then fails.
+ */
+static bool
+linux_service_socket_present(char *out_path, size_t out_path_size)
+{
+	if (u_file_get_path_in_runtime_dir(XRT_IPC_MSG_SOCK_FILENAME, out_path, out_path_size) < 0) {
+		return false;
+	}
+	struct stat st;
+	return stat(out_path, &st) == 0 && S_ISSOCK(st.st_mode);
+}
+#endif
 
 
 xrt_result_t
@@ -88,6 +116,53 @@ xrt_instance_create(struct xrt_instance_info *ii, struct xrt_instance **out_xins
 			U_LOG_I("Hybrid mode: app manifest declares com.displayxr.force_ipc — forcing IPC (Android)");
 			return ipc_instance_create(ii, out_xinst);
 		}
+	}
+#endif
+
+#ifdef XRT_OS_LINUX_DESKTOP
+	/*
+	 * Desktop-Linux present-owners (#1744).
+	 *
+	 * XR_DXR_weave lives only in the service compositor (comp_multi_weave_linux.c,
+	 * #1699); in-process every weave call returns XR_ERROR_FEATURE_UNSUPPORTED.
+	 * So a session that enables it is an IPC client by capability — the same
+	 * rule as the Android block above — with no launcher-set XRT_FORCE_MODE
+	 * required (the browser has no launcher that could set one).
+	 *
+	 * Unlike Android, the service is not guaranteed to exist: the .deb
+	 * socket-activates it per user session, but a from-source runtime, a
+	 * container or a box with the user unit disabled has none. There the
+	 * present-owner falls back to in-process — exactly the pre-#1744 behaviour,
+	 * where the app still gets an instance and learns from the weave calls that
+	 * the service path is missing — rather than failing xrCreateInstance. A
+	 * refusal FROM a service (version skew, client quota) is propagated: that
+	 * is a real answer, not an absent service.
+	 *
+	 * XRT_FORCE_MODE, when set, is authoritative either way (handled by
+	 * u_sandbox_should_use_ipc() below).
+	 */
+	const char *linux_force_mode = getenv("XRT_FORCE_MODE");
+	const bool linux_env_forced = linux_force_mode != NULL && linux_force_mode[0] != '\0';
+	if (!linux_env_forced && ii != NULL && ii->app_info.ext_weave_enabled) {
+		char sock[PATH_MAX] = "";
+		if (linux_service_socket_present(sock, sizeof(sock))) {
+			U_LOG_W("Hybrid mode: XR_DXR_weave present-owner — using IPC/service compositor (%s)", sock);
+			xrt_result_t xret = ipc_instance_create(ii, out_xinst);
+			if (xret != XRT_ERROR_IPC_FAILURE) {
+				return xret;
+			}
+			U_LOG_W(
+			    "Hybrid mode: could not reach displayxr-service at %s — falling back to the "
+			    "in-process compositor; XR_DXR_weave is unavailable in-process",
+			    sock);
+		} else {
+			U_LOG_W(
+			    "Hybrid mode: XR_DXR_weave present-owner but no displayxr-service socket (%s) — "
+			    "in-process compositor; XR_DXR_weave is unavailable in-process. Start the service "
+			    "(systemctl --user start displayxr.socket) to weave.",
+			    sock);
+		}
+		return native_instance_create(ii, out_xinst);
 	}
 #endif
 

@@ -315,8 +315,11 @@ option_with_deps(XRT_FEATURE_DEBUG_GUI "Enable debug window to be used" DEPENDS 
 # sandbox detection). Windows has shipped this since day one; ANDROID joins it
 # in the flavor merge (#1031) so a single runtime APK serves in-process apps
 # (Arch A) and IPC clients (Arch C satellites, weave present-owners, the
-# browser) without two mutually-exclusive installs.
-option_with_deps(XRT_FEATURE_HYBRID_MODE "Enable hybrid in-process/IPC mode (native compositor for normal apps, IPC for sandboxed/present-owner apps)" DEFAULT OFF DEPENDS "WIN32 OR APPLE OR ANDROID" XRT_MODULE_IPC XRT_FEATURE_OPENXR "XRT_HAVE_D3D11 OR APPLE OR ANDROID")
+# browser) without two mutually-exclusive installs. Desktop LINUX joins it for
+# the .deb (#1744): the packaged runtime keeps in-process native Vulkan for
+# ordinary apps and routes XR_DXR_weave present-owners (the browser) and
+# workspace controllers to displayxr-service, which the .deb socket-activates.
+option_with_deps(XRT_FEATURE_HYBRID_MODE "Enable hybrid in-process/IPC mode (native compositor for normal apps, IPC for sandboxed/present-owner apps)" DEFAULT OFF DEPENDS "WIN32 OR APPLE OR ANDROID OR XRT_HAVE_LINUX" XRT_MODULE_IPC XRT_FEATURE_OPENXR "XRT_HAVE_D3D11 OR APPLE OR ANDROID OR XRT_HAVE_LINUX")
 
 # Desktop-Linux XR_DXR_weave engine on the comp_multi service path (#1699, piece
 # R2): comp_multi_weave_linux.c, the counterpart of comp_multi_weave_macos.c /

@@ -56,7 +56,17 @@
 #
 # Usage:
 #   ./scripts/build_linux.sh             # in-process headless build + selftest
-#   ./scripts/build_linux.sh --service   # also build displayxr-service (IPC)
+#   ./scripts/build_linux.sh --service   # also build displayxr-service (IPC);
+#                                        # the runtime .so is then IPC-ONLY:
+#                                        # every app needs the running service
+#   ./scripts/build_linux.sh --hybrid    # the SHIPPED configuration (#1744):
+#                                        # --service + XRT_FEATURE_HYBRID_MODE,
+#                                        # one runtime .so that runs ordinary
+#                                        # apps in-process and routes
+#                                        # XR_DXR_weave present-owners (the
+#                                        # browser) + workspace controllers to
+#                                        # displayxr-service. What the .deb and
+#                                        # the tarball ship.
 #   ./scripts/build_linux.sh --no-test   # build only, skip the selftest run
 #   ./scripts/build_linux.sh --clean     # drop the CMake cache first — REQUIRED
 #                                        # after installing a dependency into a
@@ -85,6 +95,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$ROOT/build}"
 
 SERVICE_MODE=OFF
+HYBRID_MODE=OFF
 RUN_TEST=ON
 BUILD_APPS=OFF
 CLEAN=OFF
@@ -92,6 +103,7 @@ QWERTY=OFF
 for arg in "$@"; do
   case "$arg" in
     --service) SERVICE_MODE=ON ;;
+    --hybrid) SERVICE_MODE=ON; HYBRID_MODE=ON ;;
     --no-test) RUN_TEST=OFF ;;
     --apps) BUILD_APPS=ON ;;
     --clean) CLEAN=ON ;;
@@ -137,10 +149,11 @@ OPENXR_DIR="$BUILD_DIR/_openxr-$OPENXR_VERSION"
 # (NDEBUG-conditional layout) is a candidate cause of the VK-DP-factory
 # null-dispatch crash seen with a Debug .deb runtime (cube-hw finding C), and a
 # Debug runtime is the wrong (36 MB, unoptimized) release artifact regardless.
-echo "=== Configuring DisplayXR runtime (Linux, SERVICE=$SERVICE_MODE, QWERTY=$QWERTY, TYPE=${CMAKE_BUILD_TYPE:-Debug}) ==="
+echo "=== Configuring DisplayXR runtime (Linux, SERVICE=$SERVICE_MODE, HYBRID=$HYBRID_MODE, QWERTY=$QWERTY, TYPE=${CMAKE_BUILD_TYPE:-Debug}) ==="
 cmake -B "$BUILD_DIR" -S "$ROOT" -G Ninja \
   -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Debug}" \
   -DXRT_FEATURE_SERVICE=$SERVICE_MODE \
+  -DXRT_FEATURE_HYBRID_MODE=$HYBRID_MODE \
   -DXRT_MODULE_CLI=ON \
   -DXRT_BUILD_DRIVER_QWERTY=$QWERTY \
   -DXRT_FEATURE_DEBUG_GUI=OFF \
