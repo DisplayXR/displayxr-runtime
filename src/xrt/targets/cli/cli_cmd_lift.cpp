@@ -9,6 +9,8 @@
  *                            [--n N] [--views N] [--strength F] [--convergence F]
  *                            [--focal PX] [--priority paused|low|normal|high]
  *                            [--pipelined] [--fps F] [--out DIR] [--wait S]
+	 *   --no-write          skip all readback/encode (measure pure submit->acquire; PNG encode of a 4K SBS takes seconds)
+	 *   --write-every N     write only every Nth result (default 1)
  *
  * Connects to the running service over IPC as a DIAG client (lift streams are
  * owned by the connection, no session needed) — run it from a NON-elevated
@@ -437,6 +439,8 @@ cmd_probe(int argc, const char **argv)
 	const int n_frames = atoi(opt_value(argc, argv, "--n", "100"));
 	const std::string out_dir = opt_value(argc, argv, "--out", ".");
 	const bool pipelined = cli_has_flag(argc, argv, "--pipelined");
+	const bool no_write = cli_has_flag(argc, argv, "--no-write");
+	const int write_every = std::max(1, atoi(opt_value(argc, argv, "--write-every", "1")));
 	const double fps = atof(opt_value(argc, argv, "--fps", "30"));
 	const double wait_s = atof(opt_value(argc, argv, "--wait", "30"));
 	const std::string prio_s = opt_value(argc, argv, "--priority", "normal");
@@ -552,6 +556,7 @@ cmd_probe(int argc, const char **argv)
 		const uint64_t deadline = t_submit + (uint64_t)(mode == XRT_DP_LIFT_MODE_GAUSSIANS ? 30e9 : 5e9);
 		for (;;) {
 			bool got = false;
+			uint64_t t_acq = 0; // stamped when the result is acquired, BEFORE any readback/encode
 			std::string file;
 			std::string outdesc;
 			uint64_t got_id = 0;
@@ -566,16 +571,21 @@ cmd_probe(int argc, const char **argv)
 					                                    &ready, &delivered, &bi);
 					if (xret == XRT_SUCCESS && delivered) {
 						got = true;
+						t_acq = os_monotonic_get_ns();
 						got_id = bi.frame_id;
 						char name[64];
 						snprintf(name, sizeof(name), "lift_out_%d.%s", i,
 						         bi.format == XRT_DP_LIFT_BLOB_SOG ? "sog" : "ply");
 						file = out_dir + "\\" + name;
-						FILE *f = fopen(file.c_str(), "wb");
-						if (f != nullptr) {
-							fwrite(bytes.data(), 1, bytes.size(), f);
-							fclose(f);
-							written++;
+						if (!no_write && (i % write_every == 0)) {
+							FILE *f = fopen(file.c_str(), "wb");
+							if (f != nullptr) {
+								fwrite(bytes.data(), 1, bytes.size(), f);
+								fclose(f);
+								written++;
+							}
+						} else {
+							file = "(not written)";
 						}
 						char d[64];
 						snprintf(d, sizeof(d), "%llu B", (unsigned long long)bi.byte_count);
@@ -588,6 +598,7 @@ cmd_probe(int argc, const char **argv)
 				xret = ipc_client_lift_acquire(&ipc_c, sid, &ready, &r);
 				if (xret == XRT_SUCCESS && ready) {
 					got = true;
+					t_acq = os_monotonic_get_ns();
 					got_id = r.frame_id;
 					svc_lat = r.latency_ns;
 					if (r.output_realloc || g.out_tex == nullptr) {
@@ -614,7 +625,8 @@ cmd_probe(int argc, const char **argv)
 					char name[64];
 					snprintf(name, sizeof(name), "lift_out_%d.png", i);
 					file = out_dir + "\\" + name;
-					if (read_back_png(g, r.fence_value, r.width, r.height, r.format, file)) {
+					const bool want_write = !no_write && (i % write_every == 0);
+					if (want_write && read_back_png(g, r.fence_value, r.width, r.height, r.format, file)) {
 						written++;
 					} else {
 						file = "(not written)";
@@ -629,7 +641,7 @@ cmd_probe(int argc, const char **argv)
 				break;
 			}
 			if (got && (pipelined || got_id >= frame_id)) {
-				double ms = (double)(os_monotonic_get_ns() - t_submit) / 1e6;
+				double ms = (double)((t_acq ? t_acq : (uint64_t)os_monotonic_get_ns()) - t_submit) / 1e6;
 				lat_ms.push_back(ms);
 				printf("%6d %10llu %10.2fms %10.2fms %12s  %s\n", i, (unsigned long long)got_id, ms,
 				       (double)svc_lat / 1e6, outdesc.c_str(), file.c_str());
