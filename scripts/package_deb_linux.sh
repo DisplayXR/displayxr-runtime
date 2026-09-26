@@ -10,11 +10,21 @@
 # lib/ so displayxr-cli's `$ORIGIN/../lib` RUNPATH resolves exactly as it does
 # in package_linux.sh):
 #   /usr/lib/displayxr/bin/displayxr-cli
-#   /usr/lib/displayxr/lib/openxr_displayxr.so           (the in-process runtime)
+#   /usr/lib/displayxr/bin/displayxr-service             (out-of-process compositor, #1744)
+#   /usr/lib/displayxr/lib/openxr_displayxr.so           (the HYBRID runtime: in-process
+#       for ordinary apps, IPC to displayxr-service for XR_DXR_weave present-owners
+#       and workspace controllers — the Windows/macOS shape)
 #   /usr/lib/displayxr/plugins/DisplayXR-SimDisplay.so   (built-in fallback DP)
 #   /usr/lib/displayxr/plugins/200-sim-display.json      (its discovery manifest)
 #   /usr/bin/displayxr-cli -> ../lib/displayxr/bin/displayxr-cli  (PATH symlink;
 #       exec'd via the symlink, ld.so still takes $ORIGIN from the real target)
+#   /usr/bin/displayxr-service -> ../lib/displayxr/bin/displayxr-service
+#   /usr/lib/systemd/user/displayxr.socket + displayxr.service
+#       systemd USER units (scripts/linux/systemd/): the socket is enabled for
+#       every user (postinst: systemctl --global enable) and socket-activates
+#       the service on the first client that dials it, so a user who never runs
+#       a present-owner / workspace client never starts it; the service exits
+#       30 s after its last client leaves (IPC_EXIT_WHEN_IDLE).
 #   /usr/share/gnome-shell/extensions/window-geometry@displayxr.org/
 #       the GNOME Shell extension from contrib/gnome-shell/ (window geometry for
 #       windowed Wayland weaving; capture exclusion for transparency)
@@ -39,10 +49,12 @@
 #                               /usr/lib/displayxr/plugins (loader searches it
 #                               when the env is unset; target_plugin_loader.c)
 #
-# Phase 1 scope: the IN-PROCESS runtime only. displayxr-service is intentionally
-# NOT packaged — Linux out-of-process service render is not ready (#710). So the
-# build is done WITHOUT --service. The vendor (Leia SR) plug-in ships its own
-# .deb in a later phase; this package stays vendor-free (sim-display fallback).
+# Build: `build_linux.sh --hybrid` (#1744). Until then the package shipped the
+# in-process-only runtime and no service, so every XR_DXR_weave call on an
+# installed box returned XR_ERROR_FEATURE_UNSUPPORTED ("the weave service is
+# only available on the out-of-process (service) path") — the DisplayXR browser
+# could not weave. The vendor (Leia SR) plug-in ships its own .deb; this package
+# stays vendor-free (sim-display fallback).
 
 set -euo pipefail
 
@@ -88,18 +100,44 @@ else
     # from an earlier checkout would ship wrong code under a fresh `git describe`
     # version string — the silent correctness bug from the Suzhou Odyssey Track B
     # run (cube-hw finding A: 58039d4 bits shipped as 6afba6a → zero-config
-    # discovery broke). Phase 1: IN-PROCESS runtime, no service (#710).
-    echo "==> Clean build via build_linux.sh --no-test (in-process, no service)"
+    # discovery broke). --hybrid: the service + the hybrid runtime (#1744).
+    echo "==> Clean build via build_linux.sh --hybrid --no-test (hybrid runtime + displayxr-service)"
     rm -rf "$BUILD_DIR"
-    "$ROOT/scripts/build_linux.sh" --no-test
+    "$ROOT/scripts/build_linux.sh" --hybrid --no-test
 fi
 
 RUNTIME_SO="$(find_runtime)"
 CLI_BIN="$(find "$BUILD_DIR/src/xrt/targets/cli" -maxdepth 1 -name displayxr-cli -type f | head -1)"
 PLUGIN_SO="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimDisplay.so" -type f | head -1)"
+# `|| true`: no targets/service dir at all in a non-service build; the check
+# below turns that into the real error message.
+SERVICE_BIN="$(find "$BUILD_DIR/src/xrt/targets/service" -maxdepth 1 -name displayxr-service -type f 2>/dev/null | head -1 || true)"
 
 for f in "$RUNTIME_SO" "$CLI_BIN" "$PLUGIN_SO"; do
     [ -n "$f" ] || { echo "error: missing build artifact (runtime/cli/plugin)" >&2; exit 1; }
+done
+[ -n "$SERVICE_BIN" ] || {
+    echo "error: displayxr-service not built — the .deb ships it (#1744). Build with" >&2
+    echo "       scripts/build_linux.sh --hybrid (--no-build reuses whatever is in $BUILD_DIR)." >&2
+    exit 1
+}
+
+# The runtime must be the HYBRID one (#1744). An in-process-only .so has no IPC
+# client, so present-owners silently lose XR_DXR_weave; an IPC-only one (plain
+# --service) would push EVERY app through the service. The hybrid router's
+# lifecycle log line is the marker that it is compiled in. (A here-string,
+# not `echo | grep -q`: grep -q exits at the first match, the echo takes
+# SIGPIPE, and under pipefail the pipeline then reports failure.)
+RUNTIME_STRINGS="$(strings -a "$RUNTIME_SO" 2>/dev/null || true)"
+if ! grep -q 'Hybrid mode: XR_DXR_weave present-owner' <<<"$RUNTIME_STRINGS"; then
+    echo "error: $RUNTIME_SO is not the hybrid runtime (no present-owner IPC routing)." >&2
+    echo "       Build with scripts/build_linux.sh --hybrid." >&2
+    exit 1
+fi
+
+SYSTEMD_SRC="$ROOT/scripts/linux/systemd"
+for f in displayxr.socket displayxr.service.in; do
+    [ -f "$SYSTEMD_SRC/$f" ] || { echo "error: missing $SYSTEMD_SRC/$f (systemd user units)" >&2; exit 1; }
 done
 
 # The GNOME Shell extension is source, not a build artifact: ship it from the
@@ -142,13 +180,28 @@ mkdir -p "$STAGE/DEBIAN" \
          "$STAGE/usr/lib/displayxr/lib" \
          "$STAGE/usr/lib/displayxr/plugins" \
          "$STAGE/usr/share/gnome-shell/extensions/$EXT_UUID" \
+         "$STAGE/usr/lib/systemd/user" \
          "$STAGE/etc/xdg/autostart"
 
 install -m 0755 "$CLI_BIN"     "$STAGE/usr/lib/displayxr/bin/displayxr-cli"
+install -m 0755 "$SERVICE_BIN" "$STAGE/usr/lib/displayxr/bin/displayxr-service"
 install -m 0644 "$RUNTIME_SO"  "$STAGE/usr/lib/displayxr/lib/openxr_displayxr.so"
 install -m 0644 "$PLUGIN_SO"   "$STAGE/usr/lib/displayxr/plugins/DisplayXR-SimDisplay.so"
 # PATH entry — relative symlink so it stays valid regardless of install root.
 ln -s ../lib/displayxr/bin/displayxr-cli "$STAGE/usr/bin/displayxr-cli"
+ln -s ../lib/displayxr/bin/displayxr-service "$STAGE/usr/bin/displayxr-service"
+
+# --- systemd user units: socket-activated service (#1744) -------------------
+# Why socket activation (vs. an always-on user service or an XDG autostart
+# entry): the service owns a Vulkan device and the display processor, and most
+# users never run a client that needs it. With the socket it costs nothing
+# until a present-owner / workspace client dials
+# $XDG_RUNTIME_DIR/displayxr_comp_ipc, and it exits when idle. It needs no
+# terminal and no libsystemd: the service reads the LISTEN_FDS hand-off itself.
+install -m 0644 "$SYSTEMD_SRC/displayxr.socket" "$STAGE/usr/lib/systemd/user/displayxr.socket"
+sed 's|@SERVICE_BIN@|/usr/lib/displayxr/bin/displayxr-service|g' "$SYSTEMD_SRC/displayxr.service.in" \
+    >"$STAGE/usr/lib/systemd/user/displayxr.service"
+chmod 0644 "$STAGE/usr/lib/systemd/user/displayxr.service"
 
 # --- GNOME Shell extension + the per-user enable at login -------------------
 for f in $EXT_FILES; do
@@ -224,7 +277,7 @@ STABLE_SONAMES=(
     libxcb.so.1 libxcb-randr.so.0   # libxcb1, libxcb-randr0
     libXrandr.so.2                  # libxrandr2
 )
-ELF_FILES=("$RUNTIME_SO" "$CLI_BIN" "$PLUGIN_SO")
+ELF_FILES=("$RUNTIME_SO" "$CLI_BIN" "$SERVICE_BIN" "$PLUGIN_SO")
 
 command -v dpkg-shlibdeps >/dev/null 2>&1 || {
     echo "error: dpkg-shlibdeps not found — install dpkg-dev." >&2
@@ -314,10 +367,11 @@ Replaces: displayxr-window-geometry-publisher
 Installed-Size: $INSTALLED_KB
 Maintainer: The DisplayXR Project <noreply@displayxr.dev>
 Homepage: https://github.com/DisplayXR/displayxr-runtime
-Description: DisplayXR OpenXR runtime for 3D displays (in-process, sim-display)
+Description: DisplayXR OpenXR runtime for 3D displays (sim-display)
  Lightweight standalone OpenXR runtime purpose-built for 3D displays. This
- package ships the in-process runtime, the displayxr-cli diagnostic tool, and
- the vendor-neutral sim-display display processor as the built-in fallback.
+ package ships the runtime, the displayxr-service out-of-process compositor,
+ the displayxr-cli diagnostic tool, and the vendor-neutral sim-display display
+ processor as the built-in fallback.
  .
  After install the box needs no environment variables: the OpenXR ActiveRuntime
  is registered at /etc/xdg/openxr/1/active_runtime.json and the runtime's
@@ -325,8 +379,13 @@ Description: DisplayXR OpenXR runtime for 3D displays (in-process, sim-display)
  .
  A vendor display plug-in (e.g. Leia SR) installs alongside with a lower
  probe_order and claims the display automatically when present; otherwise
- sim-display drives apps. The out-of-process service is not included on Linux
- yet (see issue #710).
+ sim-display drives apps.
+ .
+ Ordinary apps run in-process. Apps that need the out-of-process path (the
+ XR_DXR_weave present-owners such as the DisplayXR browser, and workspace
+ controllers) connect to displayxr-service, which a systemd user socket
+ (displayxr.socket, enabled for every user) starts on demand; it exits when
+ its last client leaves.
  .
  It also installs the GNOME Shell extension window-geometry@displayxr.org,
  which windowed weaving under Wayland and transparent apps on a 3D panel both
@@ -345,6 +404,17 @@ CONF_DIR="/etc/xdg/openxr/1"
 ACTIVE="$CONF_DIR/active_runtime.json"
 BACKUP="$ACTIVE.pre-displayxr.bak"
 LIB="/usr/lib/displayxr/lib/openxr_displayxr.so"
+
+# Run `systemctl --user <args>` in every user manager running right now
+# (--machine=USER@ needs systemd >= 248; Ubuntu 22.04 has 249). Never fails.
+dxr_each_user_manager() {
+    command -v loginctl >/dev/null 2>&1 || return 0
+    for dxr_user in $(loginctl list-users --no-legend 2>/dev/null | awk '{print $2}'); do
+        dxr_uid="$(id -u "$dxr_user" 2>/dev/null)" || continue
+        [ -d "/run/user/$dxr_uid/systemd" ] || continue
+        timeout 10 systemctl --user --machine="$dxr_user@" "$@" >/dev/null 2>&1 || true
+    done
+}
 
 case "$1" in
 configure)
@@ -365,6 +435,19 @@ configure)
 JSON
     echo "displayxr-runtime: OpenXR ActiveRuntime -> $ACTIVE"
     echo "displayxr-runtime: verify with  displayxr-cli selftest"
+
+    # displayxr-service (#1744): enable the socket for every user (a symlink
+    # under /etc/systemd/user — works offline), then start it in the user
+    # managers already running so nobody has to log out first. Best effort
+    # throughout: a box without systemd (a container) just has no socket, and
+    # clients then stay in-process.
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --global enable displayxr.socket >/dev/null 2>&1 || true
+        dxr_each_user_manager daemon-reload
+        dxr_each_user_manager start displayxr.socket
+        echo "displayxr-runtime: displayxr-service is socket-activated per user (displayxr.socket)"
+        echo "  check with  systemctl --user status displayxr.socket"
+    fi
     # Required notice (wayland-window-geometry.md §4): until the user logs in
     # again the extension is absent and every consumer silently falls back
     # (display-scoped weaving, silhouette transparency).
@@ -407,7 +490,39 @@ esac
 exit 0
 EOF
 
-chmod 0755 "$STAGE/DEBIAN/postinst" "$STAGE/DEBIAN/postrm"
+cat > "$STAGE/DEBIAN/prerm" <<'EOF'
+#!/bin/sh
+# Before the unit files go away: stop displayxr-service in running user
+# sessions and drop the global enablement (#1744). NOT on upgrade: a live
+# service keeps serving its clients with the old binary and exits when idle,
+# and the next connect starts the new one — stopping it here would cut off a
+# running browser mid-session.
+set -e
+
+# Run `systemctl --user <args>` in every user manager running right now
+# (--machine=USER@ needs systemd >= 248; Ubuntu 22.04 has 249). Never fails.
+dxr_each_user_manager() {
+    command -v loginctl >/dev/null 2>&1 || return 0
+    for dxr_user in $(loginctl list-users --no-legend 2>/dev/null | awk '{print $2}'); do
+        dxr_uid="$(id -u "$dxr_user" 2>/dev/null)" || continue
+        [ -d "/run/user/$dxr_uid/systemd" ] || continue
+        timeout 10 systemctl --user --machine="$dxr_user@" "$@" >/dev/null 2>&1 || true
+    done
+}
+
+case "$1" in
+remove|deconfigure)
+    if command -v systemctl >/dev/null 2>&1; then
+        dxr_each_user_manager stop displayxr.socket displayxr.service
+        systemctl --global disable displayxr.socket >/dev/null 2>&1 || true
+    fi
+    ;;
+esac
+
+exit 0
+EOF
+
+chmod 0755 "$STAGE/DEBIAN/postinst" "$STAGE/DEBIAN/postrm" "$STAGE/DEBIAN/prerm"
 
 # --- build the .deb --------------------------------------------------------
 mkdir -p "$DIST_DIR"

@@ -20,10 +20,13 @@
 #     version (a glibc / libstdc++ floor above the release);
 #   * `displayxr-cli selftest` fails with NO DisplayXR env vars set: it loads
 #     the installed runtime's in-process instance + the packaged sim-display
-#     plug-in through the default discovery path — no GPU, window or display.
+#     plug-in through the default discovery path — no GPU, window or display;
+#   * displayxr-service (#1744) or its systemd user units are missing, or the
+#     installed service fails the headless smoke (scripts/smoke_service_linux.sh):
+#     detached start with no terminal, an IPC handshake, clean SIGTERM,
+#     stale-socket recovery, and socket activation + exit-when-idle.
 #
-# With the optional tarball (scripts/package_linux.sh), its ELFs — including
-# displayxr-service, which the .deb does not ship — are also checked with
+# With the optional tarball (scripts/package_linux.sh), its ELFs are also checked with
 # `ldd -r`, but only for symbol-VERSION errors (the glibc-floor class): the
 # tarball has no dependency metadata, so a library its user has not installed
 # is not a packaging defect.
@@ -84,6 +87,30 @@ echo "=== displayxr-cli selftest (env-free, sim-display) ==="
 unset XR_RUNTIME_JSON XRT_PLUGIN_SEARCH_PATH
 displayxr-cli info || fail=1
 displayxr-cli selftest || { echo "error: displayxr-cli selftest failed on $PRETTY_NAME." >&2; fail=1; }
+
+# --- displayxr-service (#1744) ----------------------------------------------
+# Shipped since the .deb stopped being in-process-only: without it an
+# XR_DXR_weave present-owner (the DisplayXR browser) cannot weave at all.
+echo "=== displayxr-service: payload + systemd user units"
+SVC=/usr/lib/displayxr/bin/displayxr-service
+UNIT_DIR=/usr/lib/systemd/user
+[ -x "$SVC" ] || { echo "error: $SVC not installed" >&2; fail=1; }
+[ "$(readlink -f /usr/bin/displayxr-service 2>/dev/null)" = "$SVC" ] ||
+    { echo "error: /usr/bin/displayxr-service does not resolve to $SVC" >&2; fail=1; }
+for u in displayxr.socket displayxr.service; do
+    [ -f "$UNIT_DIR/$u" ] || { echo "error: $UNIT_DIR/$u not installed" >&2; fail=1; }
+done
+# The unit must start the binary the package installed, on the path clients
+# dial ($XDG_RUNTIME_DIR/displayxr_comp_ipc = XRT_IPC_MSG_SOCK_FILENAME).
+grep -qx "ExecStart=$SVC" "$UNIT_DIR/displayxr.service" 2>/dev/null ||
+    { echo "error: displayxr.service ExecStart is not $SVC" >&2; fail=1; }
+grep -qx 'ListenStream=%t/displayxr_comp_ipc' "$UNIT_DIR/displayxr.socket" 2>/dev/null ||
+    { echo "error: displayxr.socket does not listen on %t/displayxr_comp_ipc" >&2; fail=1; }
+[ "$fail" = 0 ] && echo "    service + units installed"
+
+echo "=== displayxr-service: headless smoke (installed binaries, sim-display)"
+"$(dirname "$(readlink -f "$0")")/smoke_service_linux.sh" ||
+    { echo "error: displayxr-service smoke failed on $PRETTY_NAME." >&2; fail=1; }
 
 if [ -n "$TARBALL" ]; then
     echo "=== tarball ${TARBALL##*/}: glibc / libstdc++ floor ==="

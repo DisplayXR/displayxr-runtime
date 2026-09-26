@@ -5,11 +5,15 @@
 # dpkg toolchain of its own. Two stages:
 #
 #   1. BUILD  — an ubuntu:22.04 builder image (build deps cached) builds the
-#               in-process runtime and packages it via package_deb_linux.sh.
+#               hybrid runtime + displayxr-service (#1744) and packages them
+#               via package_deb_linux.sh.
 #   2. VERIFY — a PRISTINE container of EVERY supported release (22.04, 24.04,
 #               26.04) `apt-get install`s the .deb (deps resolved from that
 #               release's archive) and, with NO DisplayXR env vars set, runs
-#               `displayxr-cli info` + `selftest` (must PASS on sim-display).
+#               `displayxr-cli info` + `selftest` (must PASS on sim-display),
+#               then the headless displayxr-service smoke
+#               (scripts/smoke_service_linux.sh: detached start, IPC handshake,
+#               SIGTERM, stale socket, socket activation).
 #
 # This is the CI-adoptable gate: a green run proves an end user gets a working
 # runtime from the .deb alone — zero configuration.
