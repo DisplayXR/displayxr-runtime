@@ -131,7 +131,10 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 	float2 right_uv = float2((uv.x + col1) * tile_cols_inv, (uv.y + row1) * tile_rows_inv);
 	float4 left  = atlas_tex.Sample(samp, left_uv);
 	float4 right = atlas_tex.Sample(samp, right_uv);
-	return out_finish(float4(left.r, right.g, right.b, 1.0), uv);
+	// Carry the atlas alpha: a present-owner weave (browser weave_frame_first) draws the tiles back
+	// whole-window and relies on transparent gaps to show the page through. Forcing alpha=1 painted
+	// everything outside the 3D tiles black (runtime#1742).
+	return out_finish(float4(left.r, right.g, right.b, max(left.a, right.a)), uv);
 }
 )";
 

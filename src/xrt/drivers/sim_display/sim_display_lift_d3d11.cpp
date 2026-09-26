@@ -48,7 +48,7 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 	float lu = uv.x * view_count - v;
 	float off = (v - (view_count - 1.0) * 0.5) * shift;
 	float4 c = src.Sample(samp, float2(saturate(lu + off), uv.y));
-	return float4(c.rgb, 1.0);
+	return float4(c.rgb, c.a); // keep the source alpha (runtime#1742: transparent gaps must stay transparent)
 }
 )";
 
