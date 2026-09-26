@@ -23937,11 +23937,33 @@ lift_weave_rect_batch(struct d3d11_service_system *sys,
 		uint32_t vl = 0, vr = 0;
 		lift_pick_pair(pin.view_count, &vl, &vr);
 		const float vw = (float)pin.width / (float)pin.view_count;
+		// Letterbox: the result covers only the ACTIVE part of the rect; the
+		// bars (subtitles in them included) are the 2D input, FLAT — the same
+		// pixels at the same place in both views, i.e. on the screen plane.
+		const float ax = rx + pin.active[0] * rw, ay = ry + pin.active[1] * rh;
+		const float aw = (pin.active[2] - pin.active[0]) * rw, ah = (pin.active[3] - pin.active[1]) * rh;
+		const float bar[4][4] = {
+		    {rx, ry, rw, ay - ry},                    // top
+		    {rx, ay + ah, rw, (ry + rh) - (ay + ah)}, // bottom
+		    {rx, ay, ax - rx, ah},                    // left
+		    {ax + aw, ay, (rx + rw) - (ax + aw), ah}, // right
+		};
+		for (int k = 0; k < 4; k++) {
+			const float *s = bar[k];
+			if (s[2] < 0.5f || s[3] < 0.5f) {
+				continue;
+			}
+			for (int eye = 0; eye < 2; eye++) {
+				blit_to_atlas_texture(sys, &c->render, in_srv, s[0], s[1], s[2], s[3], (float)in_w, (float)in_h,
+				                      (float)(eye * win_w) + s[0], s[1], s[2], s[3], /*is_srgb*/ false,
+				                      /*blend*/ nullptr, rtv, atw, ath);
+			}
+		}
 		blit_to_atlas_texture(sys, &c->render, pin.srv, vw * (float)vl, 0.0f, vw, (float)pin.height,
-		                      (float)pin.width, (float)pin.height, rx, ry, rw, rh, /*is_srgb*/ false,
+		                      (float)pin.width, (float)pin.height, ax, ay, aw, ah, /*is_srgb*/ false,
 		                      /*blend*/ nullptr, rtv, atw, ath);
 		blit_to_atlas_texture(sys, &c->render, pin.srv, vw * (float)vr, 0.0f, vw, (float)pin.height,
-		                      (float)pin.width, (float)pin.height, (float)win_w + rx, ry, rw, rh,
+		                      (float)pin.width, (float)pin.height, (float)win_w + ax, ay, aw, ah,
 		                      /*is_srgb*/ false, /*blend*/ nullptr, rtv, atw, ath);
 		d3d11_lift_unpin(&pin);
 	} else {
@@ -24011,6 +24033,11 @@ lift_weave_rects_nview(struct d3d11_service_system *sys,
 			continue;
 		}
 		const float vw = (float)pin.width / (float)pin.view_count;
+		// Letterbox: the result covers only the ACTIVE part of the rect; the
+		// tiles already hold the caller's flat 2D frame in the bars.
+		const float ax = (float)x0 + pin.active[0] * (float)w, ay = (float)y0 + pin.active[1] * (float)h;
+		const float aw = (pin.active[2] - pin.active[0]) * (float)w;
+		const float ah = (pin.active[3] - pin.active[1]) * (float)h;
 		for (uint32_t v = 0; v < layout->view_count; v++) {
 			// Map the atlas view onto the result's views (equal counts: 1:1).
 			uint32_t src_v = v;
@@ -24020,10 +24047,10 @@ lift_weave_rects_nview(struct d3d11_service_system *sys,
 				                         0.5f)
 				            : pin.view_count / 2;
 			}
-			const float dx = (float)((v % layout->tile_columns) * cvw) + (float)x0;
-			const float dy = (float)((v / layout->tile_columns) * cvh) + (float)y0;
+			const float dx = (float)((v % layout->tile_columns) * cvw) + ax;
+			const float dy = (float)((v / layout->tile_columns) * cvh) + ay;
 			blit_to_atlas_texture(sys, &c->render, pin.srv, vw * (float)src_v, 0.0f, vw, (float)pin.height,
-			                      (float)pin.width, (float)pin.height, dx, dy, (float)w, (float)h,
+			                      (float)pin.width, (float)pin.height, dx, dy, aw, ah,
 			                      /*is_srgb*/ false, /*blend*/ nullptr, crop_rtv, (float)packed_w,
 			                      (float)packed_h);
 		}

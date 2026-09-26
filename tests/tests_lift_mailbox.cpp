@@ -463,3 +463,140 @@ TEST_CASE("lift snapshot cap: DXR_LIFT_MAX_INPUT_EDGE parsing", "[lift][cap]")
 	CHECK(u_lift_max_input_edge_parse("3840") == 3840);
 	CHECK(u_lift_max_input_edge_parse("99999999999") == 0xffffu);
 }
+
+// A row profile of @p nr buckets for an @p h-row rect whose picture spans
+// rows [pic0, pic1): picture buckets read 0.9, bar buckets 0 (or @p sub in the
+// subtitle band [sub0, sub1) of the bottom bar).
+static std::vector<float>
+lb_rows(uint32_t h, uint32_t nr, uint32_t pic0, uint32_t pic1, float sub = 0.0f, uint32_t sub0 = 0, uint32_t sub1 = 0)
+{
+	std::vector<float> p(nr, 0.0f);
+	for (uint32_t i = 0; i < nr; i++) {
+		const uint32_t a0 = (uint32_t)((uint64_t)i * h / nr);
+		const uint32_t a1 = (uint32_t)((uint64_t)(i + 1) * h / nr); // exclusive
+		if (a1 > pic0 && a0 < pic1) {
+			p[i] = 0.9f;
+		} else if (a1 > sub0 && a0 < sub1) {
+			p[i] = sub;
+		}
+	}
+	return p;
+}
+
+TEST_CASE("lift letterbox: 2.39:1 in 16:9 settles, then crops", "[lift][letterbox]")
+{
+	// 1920x1080 rect, 1920x803 picture centred: bars of 138 / 139 rows.
+	const uint32_t w = 1920, h = 1080, nr = 512;
+	const std::vector<float> rows = lb_rows(h, nr, 138, 941);
+	const std::vector<float> cols(512, 0.9f);
+	u_lift_letterbox lb = {};
+
+	for (uint32_t f = 1; f < U_LIFT_LETTERBOX_SETTLE_FRAMES; f++) {
+		REQUIRE_FALSE(u_lift_letterbox_update(&lb, w, h, rows.data(), nr, cols.data(), 512));
+		REQUIRE_FALSE(u_lift_crop_active(&lb.committed));
+	}
+	CHECK(u_lift_letterbox_update(&lb, w, h, rows.data(), nr, cols.data(), 512));
+	CHECK(u_lift_crop_active(&lb.committed));
+	// Never into the picture, within a bucket (~2 px) + even rounding of the bar.
+	CHECK(lb.committed.top <= 138);
+	CHECK(lb.committed.top >= 132);
+	CHECK(lb.committed.bottom <= 139);
+	CHECK(lb.committed.bottom >= 132);
+	CHECK(lb.committed.top % 2 == 0);
+	CHECK(lb.committed.left == 0);
+	CHECK(lb.committed.right == 0);
+}
+
+TEST_CASE("lift letterbox: subtitles in the bar stay in the bar", "[lift][letterbox]")
+{
+	const uint32_t w = 1920, h = 1080, nr = 512;
+	// Subtitle text in the bottom bar: ~15% of each of those rows is non-black.
+	const std::vector<float> rows = lb_rows(h, nr, 138, 941, 0.15f, 980, 1040);
+	const std::vector<float> cols(512, 0.9f);
+	u_lift_letterbox lb = {};
+	for (uint32_t f = 0; f < U_LIFT_LETTERBOX_SETTLE_FRAMES; f++) {
+		(void)u_lift_letterbox_update(&lb, w, h, rows.data(), nr, cols.data(), 512);
+	}
+	CHECK(lb.committed.bottom >= 132); // the bar runs to the picture, subtitles inside it
+
+	// DENSE subtitles (big text, ~40% of each row lit) end the bottom bar at the
+	// picture threshold; the symmetry rule extends it to match the top bar.
+	const std::vector<float> dense = lb_rows(h, nr, 138, 941, 0.4f, 980, 1040);
+	u_lift_letterbox lb2 = {};
+	for (uint32_t f = 0; f < U_LIFT_LETTERBOX_SETTLE_FRAMES; f++) {
+		(void)u_lift_letterbox_update(&lb2, w, h, dense.data(), nr, cols.data(), 512);
+	}
+	CHECK(lb2.committed.bottom >= 132);
+	CHECK(lb2.committed.top >= 132);
+
+	// But a genuinely asymmetric frame (picture reaching the bottom edge's
+	// neighbourhood, dense) is not extended: 0.9 rows are picture, not text.
+	const std::vector<float> asym = lb_rows(h, nr, 138, 1040);
+	u_lift_letterbox lb3 = {};
+	for (uint32_t f = 0; f < U_LIFT_LETTERBOX_SETTLE_FRAMES; f++) {
+		(void)u_lift_letterbox_update(&lb3, w, h, asym.data(), nr, cols.data(), 512);
+	}
+	CHECK(lb3.committed.bottom <= 40);
+}
+
+TEST_CASE("lift letterbox: picture in a bar un-crops at once; black frames change nothing", "[lift][letterbox]")
+{
+	const uint32_t w = 1920, h = 1080, nr = 512;
+	const std::vector<float> film = lb_rows(h, nr, 138, 941);
+	const std::vector<float> full(nr, 0.9f);
+	const std::vector<float> black(nr, 0.0f);
+	const std::vector<float> cols(512, 0.9f);
+	u_lift_letterbox lb = {};
+	for (uint32_t f = 0; f < U_LIFT_LETTERBOX_SETTLE_FRAMES; f++) {
+		(void)u_lift_letterbox_update(&lb, w, h, film.data(), nr, cols.data(), 512);
+	}
+	REQUIRE(u_lift_crop_active(&lb.committed));
+	const u_lift_crop before = lb.committed;
+
+	// A cut to black: no content, no change (neither shrink nor grow).
+	for (int f = 0; f < 200; f++) {
+		CHECK_FALSE(u_lift_letterbox_update(&lb, w, h, black.data(), nr, cols.data(), 512));
+	}
+	CHECK(lb.committed.top == before.top);
+	CHECK(lb.committed.bottom == before.bottom);
+
+	// Full-frame picture (a 16:9 ad): the crop is released on the first frame.
+	CHECK(u_lift_letterbox_update(&lb, w, h, full.data(), nr, cols.data(), 512));
+	CHECK_FALSE(u_lift_crop_active(&lb.committed));
+
+	// A mostly-dark frame with a thin bright strip is not a letterbox.
+	const std::vector<float> strip = lb_rows(h, nr, 500, 560);
+	for (uint32_t f = 0; f < 2 * U_LIFT_LETTERBOX_SETTLE_FRAMES; f++) {
+		CHECK_FALSE(u_lift_letterbox_update(&lb, w, h, strip.data(), nr, cols.data(), 512));
+	}
+	CHECK_FALSE(u_lift_crop_active(&lb.committed));
+}
+
+TEST_CASE("lift letterbox: a rect resize resets; pillarbox crops columns", "[lift][letterbox]")
+{
+	const uint32_t nr = 512;
+	u_lift_letterbox lb = {};
+	// 4:3 content pillarboxed in 1920x1080: columns [240, 1680) are picture.
+	const std::vector<float> rows(nr, 0.9f);
+	const std::vector<float> cols = lb_rows(1920, 512, 240, 1680);
+	for (uint32_t f = 0; f < U_LIFT_LETTERBOX_SETTLE_FRAMES; f++) {
+		(void)u_lift_letterbox_update(&lb, 1920, 1080, rows.data(), nr, cols.data(), 512);
+	}
+	CHECK(lb.committed.left <= 240);
+	CHECK(lb.committed.left >= 230);
+	CHECK(lb.committed.right <= 240);
+	CHECK(lb.committed.right >= 230);
+	CHECK(lb.committed.top == 0);
+
+	// Fullscreen: new dims, crop dropped until the new bars settle.
+	CHECK(u_lift_letterbox_update(&lb, 7680, 4320, rows.data(), nr, cols.data(), 512));
+	CHECK_FALSE(u_lift_crop_active(&lb.committed));
+}
+
+TEST_CASE("lift letterbox: DXR_LIFT_LETTERBOX parse", "[lift][letterbox]")
+{
+	CHECK(u_lift_letterbox_parse(nullptr));
+	CHECK(u_lift_letterbox_parse(""));
+	CHECK(u_lift_letterbox_parse("1"));
+	CHECK_FALSE(u_lift_letterbox_parse("0"));
+}
