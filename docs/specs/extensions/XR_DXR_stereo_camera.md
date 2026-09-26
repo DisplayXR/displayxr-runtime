@@ -3,10 +3,11 @@
 | Field | Value |
 |---|---|
 | **Extension Name** | `XR_DXR_stereo_camera` |
-| **Spec Version** | 1 (design) |
+| **Spec Version** | 1 |
 | **Extension Type** | Instance extension, service path only (an in-process instance enumerates zero cameras) |
-| **Header** | `src/external/openxr_includes/openxr/XR_DXR_stereo_camera.h` — **not written yet.** It lands with the first implementation PR, together with its `docs/specs/extensions/index.json` note (the catalog lint joins notes to headers, so neither can land alone) |
-| **Status** | **Design** — not implemented. Provisional type-value block proposed: `1004999290–299` (after `XR_DXR_lift`'s `1004999270–280`), pending Khronos registry |
+| **Header** | [`src/external/openxr_includes/openxr/XR_DXR_stereo_camera.h`](../../../src/external/openxr_includes/openxr/XR_DXR_stereo_camera.h) (+ its `index.json` catalog note) |
+| **Status** | **R1 implemented** (runtime, hardware-free): header, plug-in slots, service camera manager, IPC, OpenXR entry points, sim_display fake, `displayxr-cli camera`, selftest check. **Not yet:** rectification (R2), consent / indicator / foreground rule (R3 — deny-by-default hooks in place), GPU transports, state-change events, the Leia provider (L1), the browser (B1). Provisional type values `1004999290–300` (after `XR_DXR_lift`'s `1004999270–289`), pending Khronos registry |
+| **R1 decisions** | stereo-only (names/structs kept open: `viewCount`, next chains) · camera provider = `xrt_plugin_iface` slots · service clients only (in-process enumerates zero) · raw frames never reach web pages (`RAW` refused to `PRESENT_OWNER` clients) — see [roadmap §G](../../roadmap/stereo-camera-source.md#g-open-questions--maintainer-decisions) |
 | **Decision record** | [ADR-043](../../adr/ADR-043-stereo-camera-source.md) |
 | **Plug-in contract** | appended `xrt_plugin_iface` camera slots, `XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA` (§9) |
 | **Browser / Android integration + plan** | [roadmap/stereo-camera-source.md](../../roadmap/stereo-camera-source.md) |
@@ -60,6 +61,12 @@ if (xrAcquireStereoCameraFrameDXR(stream, &f) == XR_SUCCESS) { /* f.slot is pinn
 | Service whose plug-in has no camera slots (or `sim_display` without its fake) | count 0 |
 | Service with a camera source | one entry per camera, with its `state` (§3) |
 | `DXR_STEREO_CAMERA=0` in the **service's** environment, or the user kill switch (§7.4) | count 0 — indistinguishable from "no camera", on purpose |
+
+**R1 dev gate.** Until the consent path (§7.1, R3) exists, the service refuses every
+`xrStartStereoCameraStreamDXR` and `xrGetStereoCameraCalibrationDXR` with
+`XR_ERROR_PERMISSION_INSUFFICIENT` **unless `DXR_STEREO_CAMERA_DEV_ALLOW=1` is set in the
+service's environment** — deny by default. Enumeration works without it (it reveals no
+calibration and no serial).
 
 Instance-level, not session-level: a capture component (a browser's video-capture service) has
 no compositor session and needs none. Calls travel on the instance's IPC connection; streams
@@ -289,6 +296,15 @@ When `SHARED_WITH_EYE_TRACKING` is set:
 
 ## 7. Privacy
 
+> **R1 status.** Only the hook points exist, all deny-by-default, in
+> `src/xrt/ipc/server/ipc_server_stereo_camera.c`: `authorise_locked()` (§7.1 — R1 allows only
+> with `DXR_STEREO_CAMERA_DEV_ALLOW=1` in the service environment), `client_visible_locked()`
+> (§7.2 — always true in R1), `output_allowed()` (RAW refused to `PRESENT_OWNER`, i.e. the
+> browser, per the R1 decision), the `DXR_STEREO_CAMERA=0` kill switch (§7.4), and one WARN per
+> stream start/stop naming the peer executable in place of the indicator (§7.3). `persistentId`
+> (§7.5) is an unkeyed 128-bit hash of (device identity, peer executable) in R1; R3 keys it with a
+> persisted per-user secret.
+
 The frames bypass the OS camera stack (the tracker, not the consumer, opened the device), so OS
 camera permissions and in-use indicators do not see this consumer. The runtime therefore enforces
 the equivalent itself. All checks are made on the **OS-derived peer** of the connection
@@ -350,7 +366,17 @@ passed §7.1 for that camera. A browser must coarsen what it gives pages (roadma
 ## 9. Plug-in contract (ADR-020 append-only)
 
 Appended to `struct xrt_plugin_iface` (after `create_dp_d3d11_lift`, ADR-042), gated by
-`struct_size`, announced by `#define XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA 1`, no ABI bump. On the
+`struct_size`, announced by `#define XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA 1`, no ABI bump.
+**As implemented:** lift is not on `main` yet, so the slots follow a one-pointer placeholder,
+`reserved_adr042_create_dp_d3d11_lift`, at lift's offset; the lift PR replaces it in place.
+Either merge order yields the same offsets (`tests_stereo_camera` asserts it). The authoritative
+header is `src/xrt/include/xrt/xrt_plugin.h`; the plug-in-facing rules are in
+[`docs/reference/xrt_plugin_iface.md`](../../reference/xrt_plugin_iface.md#a-stereo-camera-the-stereo_camera_-slots-adr-043).
+Two refinements over the sketch below: `wait_frame` returns an `enum xrt_plugin_stereo_camera_wait`
+(`OK` / `TIMEOUT` / `SUSPENDED` / `ERROR`) rather than an `xrt_result_t`, so no new
+`xrt_result_t` values were needed; and the extrinsics are **OpenCV's `x_R = R·x_L + T`** (T in
+mm, `T = (−B, 0, 0)` for a right camera at +x) — the service converts them to the client's
+`rightFromLeft` pose (the right camera in the left camera's frame, metres). On the
 **plug-in iface, not a display-processor vtable**: a camera is a sensor, not a weaver; it must be
 graphics-API-neutral (Windows D3D11 service, Android Vulkan runtime) and must not share a lifetime
 with a DP that is recreated on presenter changes.
@@ -416,6 +442,15 @@ owns threads, fan-out, rectification, format conversion, transport, consent and 
 
 ## 10. sim_display fake
 
+> **R1 as built** (`drivers/sim_display/sim_display_stereo_camera{,_pattern}.c`): the pair is
+> **undistorted and aligned** and the camera reports `NATIVELY_RECTIFIED` (+ `CALIBRATED`,
+> `SHARED_WITH_EYE_TRACKING`, `USER_FACING`, and `MONOCHROME` for gray8), so the RECTIFIED output
+> path runs end to end today. The scene is a random-dot stereogram: background at 2.0 m and a bar
+> at 0.6 m, which at the defaults (640 px per eye, 68° HFOV → fx 474.4 px, 50 mm) are **12 px and
+> 40 px** of disparity, plus an 8-digit frame counter in both halves. Knobs, read by the SERVICE:
+> `SIM_DISPLAY_FAKE_STEREO_CAMERA=1`, `_SIZE=WxH` (per eye), `_FPS=N`, `_FORMAT=gray8|nv12|bgra`,
+> `_SUSPEND_PERIOD_MS=N`. The distorted + misaligned variant below is R2's, with the rectifier.
+
 `SIM_DISPLAY_FAKE_STEREO_CAMERA=1` makes sim_display advertise one camera
 (`SHARED_WITH_EYE_TRACKING | USER_FACING | CALIBRATED | MONOCHROME`, 640×480 per eye, 30 Hz,
 baseline 50 mm) producing a **synthetic SBS pattern**: a textured plane and a bar at known depths,
@@ -435,8 +470,20 @@ The whole path (enumerate → consent → start → acquire → rectify) then ru
 ```
 displayxr-cli camera list [--json]                    # properties + state of every camera
 displayxr-cli camera calib <id> [--raw|--rectified] [--json]
-displayxr-cli camera probe <id> [--raw] [--format gray8|nv12|bgra8] [--seconds S] [--out DIR]
-                                                      # writes cam_<n>.png, prints rate, drops, latency
+displayxr-cli camera probe [<id>] [--raw] [--format gray8|nv12|bgra8] [--fps F]
+                              [--frames N] [--seconds S] [--out DIR]
+                                                      # rate, index gaps, SBS layout, block
+                                                      # disparities, service stats; --out writes cam_<n>.png
+```
+
+As built in R1, e.g. against the sim fake on macOS:
+
+```
+stream 1 on camera 1: 1280x480 NV12 SBS (RECTIFIED), cap 30.0 Hz, ring 3 x 921600 B (section 2764800 B)
+received 150 frames (index 1..150, 0 source frames not delivered to this stream), 150 wakes, 0 not-ready
+measured delivery rate: 29.95 Hz over 4.98 s
+block disparity (left x - right x): 12 px (38/54 blocks), 40 px (16/54 blocks), range 12..40 px
+service stats: source 30.49 Hz, delivered 30.49 Hz, published 155, skipped 4, acquired 150, mean latency 12.417 ms
 ```
 
 Runs as a DIAG IPC client, non-elevated. `probe` goes through the full consent path (so its
@@ -457,4 +504,4 @@ camera state change and per stream start/stop with the peer executable; INFO sta
 
 | Version | Change |
 |---|---|
-| 1 (design) | Enumerate + state events, calibration (raw / rectified), streams with start/stop, latest-wins acquire over a pinned 3-slot shared-memory ring with per-stream wake handles, optional GPU transports, runtime-enforced consent / foreground / indicator, plug-in iface slots, sim_display fake, CLI. |
+| 1 | R1 implements: enumerate, calibration (RAW; RECTIFIED for natively rectified sources), streams with start/stop, latest-wins acquire over a pinned 3-slot shared-memory ring with per-stream wake handles, stream stats, plug-in slots, sim_display fake, CLI, selftest. Deferred: state-change events (structs defined, not delivered), GPU transports, rectifier (R2), consent/indicator (R3). Design scope: Enumerate + state events, calibration (raw / rectified), streams with start/stop, latest-wins acquire over a pinned 3-slot shared-memory ring with per-stream wake handles, optional GPU transports, runtime-enforced consent / foreground / indicator, plug-in iface slots, sim_display fake, CLI. |
