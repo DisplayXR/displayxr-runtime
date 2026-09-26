@@ -199,6 +199,11 @@ systemctl --user unset-environment DISPLAYXR_DEBUG   # then log out/in again
   at the end of every drag that had a table. A table may now arrive
   mid-grab, and the next piece is requested ahead of the drag. Every window
   in the geometry snapshot gains `lattice_drop`. See the spec, §8.5.
+- Version 9, no interface change: which table entry a drag move lands on.
+  Instead of the plain nearest entry, a move lands on the entry that keeps the
+  window closest to the drag line; it may lead or lag the pointer by up to
+  6 device px to do so. `DISPLAYXR_LATTICE_NEAREST=1` in the shell's
+  environment restores plain nearest, for A/B comparison. See the spec, §8.8.
 
 Verify capture exclusion is live:
 
