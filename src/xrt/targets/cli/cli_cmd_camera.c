@@ -157,21 +157,24 @@ cmd_list(struct ipc_connection *ipc_c, bool json)
 		char flags[160];
 		flags_str(p.flags, flags, sizeof(flags));
 		if (json) {
-			printf("%s{\"id\": %llu, \"name\": \"%s\", \"persistentId\": \"%s\", \"state\": \"%s\", "
-			       "\"flags\": \"%s\", \"viewCount\": %u, \"eyeWidth\": %u, \"eyeHeight\": %u, "
-			       "\"maxFrameRate\": %.2f, \"baselineMm\": %.2f, \"horizontalFovDeg\": %.2f, "
-			       "\"formats\": \"0x%llx\", \"transports\": \"0x%llx\", \"platformDeviceHint\": \"%s\"}",
-			       i ? ", " : "", (unsigned long long)p.camera_id, p.display_name, p.persistent_id,
-			       state_str(p.state), flags, p.view_count, p.eye_width, p.eye_height, p.max_frame_rate,
-			       p.baseline_mm, p.horizontal_fov_deg, (unsigned long long)p.supported_formats,
-			       (unsigned long long)p.supported_transports, p.platform_device_hint);
+			printf(
+			    "%s{\"id\": %llu, \"name\": \"%s\", \"persistentId\": \"%s\", \"state\": \"%s\", "
+			    "\"flags\": \"%s\", \"viewCount\": %u, \"eyeWidth\": %u, \"eyeHeight\": %u, "
+			    "\"maxFrameRate\": %.2f, \"baselineMm\": %.2f, \"horizontalFovDeg\": %.2f, "
+			    "\"formats\": \"0x%llx\", \"transports\": \"0x%llx\", \"platformDeviceHint\": \"%s\"}",
+			    i ? ", " : "", (unsigned long long)p.camera_id, p.display_name, p.persistent_id,
+			    state_str(p.state), flags, p.view_count, p.eye_width, p.eye_height, p.max_frame_rate,
+			    p.baseline_mm, p.horizontal_fov_deg, (unsigned long long)p.supported_formats,
+			    (unsigned long long)p.supported_transports, p.platform_device_hint);
 		} else {
-			printf("  [%llu] \"%s\"  %s\n", (unsigned long long)p.camera_id, p.display_name, state_str(p.state));
+			printf("  [%llu] \"%s\"  %s\n", (unsigned long long)p.camera_id, p.display_name,
+			       state_str(p.state));
 			printf("       persistentId %s\n", p.persistent_id);
 			printf("       flags        %s\n", flags);
 			printf("       eye          %ux%u (SBS %ux%u), %u views, up to %.1f Hz\n", p.eye_width,
 			       p.eye_height, 2 * p.eye_width, p.eye_height, p.view_count, p.max_frame_rate);
-			printf("       baseline     %.2f mm, HFOV %.2f deg per eye\n", p.baseline_mm, p.horizontal_fov_deg);
+			printf("       baseline     %.2f mm, HFOV %.2f deg per eye\n", p.baseline_mm,
+			       p.horizontal_fov_deg);
 			printf("       formats      0x%llx  transports 0x%llx  platform hint \"%s\"\n",
 			       (unsigned long long)p.supported_formats, (unsigned long long)p.supported_transports,
 			       p.platform_device_hint);
@@ -197,15 +200,17 @@ cmd_calib(struct ipc_connection *ipc_c, uint64_t id, uint32_t output, bool json)
 		printf("{\"output\": \"%s\", \"baselineMm\": %.3f, \"eyes\": [",
 		       output == XRT_STEREO_CAMERA_OUTPUT_RAW ? "RAW" : "RECTIFIED", c.baseline_mm);
 		for (int e = 0; e < 2; e++) {
-			printf("%s{\"w\": %u, \"h\": %u, \"fx\": %.3f, \"fy\": %.3f, \"cx\": %.3f, \"cy\": %.3f, "
-			       "\"model\": %u}",
-			       e ? ", " : "", c.eye[e].width, c.eye[e].height, c.eye[e].fx, c.eye[e].fy, c.eye[e].cx,
-			       c.eye[e].cy, c.eye[e].model);
+			printf(
+			    "%s{\"w\": %u, \"h\": %u, \"fx\": %.3f, \"fy\": %.3f, \"cx\": %.3f, \"cy\": %.3f, "
+			    "\"model\": %u}",
+			    e ? ", " : "", c.eye[e].width, c.eye[e].height, c.eye[e].fx, c.eye[e].fy, c.eye[e].cx,
+			    c.eye[e].cy, c.eye[e].model);
 		}
-		printf("], \"rightFromLeft\": {\"orientation\": [%.6f, %.6f, %.6f, %.6f], \"position\": [%.6f, "
-		       "%.6f, %.6f]}}\n",
-		       c.orientation[0], c.orientation[1], c.orientation[2], c.orientation[3], c.position[0],
-		       c.position[1], c.position[2]);
+		printf(
+		    "], \"rightFromLeft\": {\"orientation\": [%.6f, %.6f, %.6f, %.6f], \"position\": [%.6f, "
+		    "%.6f, %.6f]}}\n",
+		    c.orientation[0], c.orientation[1], c.orientation[2], c.orientation[3], c.position[0],
+		    c.position[1], c.position[2]);
 		return 0;
 	}
 	printf("calibration (%s), baseline %.3f mm\n", output == XRT_STEREO_CAMERA_OUTPUT_RAW ? "RAW" : "RECTIFIED",
@@ -474,28 +479,32 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 	}
 	double span = (double)(t_last - t_first) * 1e-9;
 	double rate = (got > 1 && span > 0.0) ? (got - 1) / span : 0.0;
-	printf("received %d frames (index %llu..%llu, %llu source frames not delivered to this stream), %d wakes, "
-	       "%d not-ready\n",
-	       got, (unsigned long long)first_index, (unsigned long long)last_index, (unsigned long long)gaps, wakes,
-	       not_ready);
+	printf(
+	    "received %d frames (index %llu..%llu, %llu source frames not delivered to this stream), %d wakes, "
+	    "%d not-ready\n",
+	    got, (unsigned long long)first_index, (unsigned long long)last_index, (unsigned long long)gaps, wakes,
+	    not_ready);
 	printf("measured delivery rate: %.2f Hz over %.2f s\n", rate, span);
 
 	if (got > 0) {
 		const uint8_t *slot = map.ptr + (uint64_t)last.slot * lay.slot_stride;
-		printf("last frame: index %llu, slot %u, %ux%u %s, pitch %u/%u, planes @%llu/%llu, %s time, output %s, "
-		       "calibration gen %u\n",
-		       (unsigned long long)last.frame_index, last.slot, last.width, last.height, format_str(last.format),
-		       last.row_pitch[0], last.row_pitch[1], (unsigned long long)last.plane_offset[0],
-		       (unsigned long long)last.plane_offset[1], last.time_is_exposure ? "exposure" : "arrival",
-		       last.output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED ? "RECTIFIED" : "RAW", last.calibration_generation);
+		printf(
+		    "last frame: index %llu, slot %u, %ux%u %s, pitch %u/%u, planes @%llu/%llu, %s time, output %s, "
+		    "calibration gen %u\n",
+		    (unsigned long long)last.frame_index, last.slot, last.width, last.height, format_str(last.format),
+		    last.row_pitch[0], last.row_pitch[1], (unsigned long long)last.plane_offset[0],
+		    (unsigned long long)last.plane_offset[1], last.time_is_exposure ? "exposure" : "arrival",
+		    last.output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED ? "RECTIFIED" : "RAW",
+		    last.calibration_generation);
 
 		// Luma of the last frame, for the disparity probe and a GRAY8 PNG.
 		struct u_stereo_camera_planes gl;
 		u_stereo_camera_layout(XRT_STEREO_CAMERA_FORMAT_GRAY8, last.width, last.height, &gl);
 		uint8_t *gray = calloc((size_t)gl.size, 1);
 		const uint8_t *src[2] = {slot + last.plane_offset[0], slot + last.plane_offset[1]};
-		if (gray != NULL && u_stereo_camera_convert(last.format, src, last.row_pitch, XRT_STEREO_CAMERA_FORMAT_GRAY8,
-		                                            gray, &gl, last.width, last.height)) {
+		if (gray != NULL &&
+		    u_stereo_camera_convert(last.format, src, last.row_pitch, XRT_STEREO_CAMERA_FORMAT_GRAY8, gray, &gl,
+		                            last.width, last.height)) {
 			char disp[160];
 			report_disparity(gray, gl.pitch[0], last.width / 2, last.height, disp, sizeof(disp));
 			printf("block disparity (left x - right x): %s\n", disp);
@@ -521,7 +530,8 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 							r[4 * x + 2] = t;
 						}
 					}
-					ok = stbi_write_png(path, (int)last.width, (int)last.height, 4, rgba, (int)bl.pitch[0]);
+					ok = stbi_write_png(path, (int)last.width, (int)last.height, 4, rgba,
+					                    (int)bl.pitch[0]);
 				}
 				free(rgba);
 			}
@@ -532,11 +542,12 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 
 	struct xrt_stereo_camera_stream_stats st;
 	if (ipc_client_stereo_camera_stats(ipc_c, sid, &st) == XRT_SUCCESS) {
-		printf("service stats: source %.2f Hz, delivered %.2f Hz, published %llu, skipped %llu, acquired %llu, "
-		       "mean latency %.3f ms\n",
-		       st.source_frame_rate, st.delivered_frame_rate, (unsigned long long)st.frames_published,
-		       (unsigned long long)st.frames_skipped, (unsigned long long)st.frames_acquired,
-		       (double)st.mean_latency_ns * 1e-6);
+		printf(
+		    "service stats: source %.2f Hz, delivered %.2f Hz, published %llu, skipped %llu, acquired %llu, "
+		    "mean latency %.3f ms\n",
+		    st.source_frame_rate, st.delivered_frame_rate, (unsigned long long)st.frames_published,
+		    (unsigned long long)st.frames_skipped, (unsigned long long)st.frames_acquired,
+		    (double)st.mean_latency_ns * 1e-6);
 	}
 
 	unmap_readonly(&map);
@@ -565,9 +576,10 @@ cli_cmd_camera(int argc, const char **argv)
 	} else if (strcmp(sub, "probe") == 0) {
 		ret = cmd_probe(&ipc_c, argc, argv);
 	} else {
-		printf("usage: displayxr-cli camera list [--json] | calib <id> [--raw|--rectified] [--json] |\n"
-		       "       probe [<id>] [--raw] [--format gray8|nv12|bgra8] [--fps F] [--frames N] [--seconds S] "
-		       "[--out DIR]\n");
+		printf(
+		    "usage: displayxr-cli camera list [--json] | calib <id> [--raw|--rectified] [--json] |\n"
+		    "       probe [<id>] [--raw] [--format gray8|nv12|bgra8] [--fps F] [--frames N] [--seconds S] "
+		    "[--out DIR]\n");
 		ret = 1;
 	}
 	ipc_client_connection_fini(&ipc_c);

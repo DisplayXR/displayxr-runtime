@@ -82,7 +82,8 @@ probe_stereo_camera(struct cli_query_result *r, const struct xrt_plugin_iface *i
 	r->stereo_camera_count = 0;
 	r->stereo_camera_malformed = false;
 	if (!xrt_plugin_iface_has_stereo_camera(iface)) {
-		snprintf(r->stereo_camera_note, sizeof(r->stereo_camera_note), "plug-in has no stereo camera slots (OK)");
+		snprintf(r->stereo_camera_note, sizeof(r->stereo_camera_note),
+		         "plug-in has no stereo camera slots (OK)");
 		return;
 	}
 	struct xrt_plugin_instance *inst = target_plugin_get_active_instance();
@@ -125,9 +126,9 @@ probe_stereo_camera(struct cli_query_result *r, const struct xrt_plugin_iface *i
 			return;
 		}
 	}
-	snprintf(r->stereo_camera_note, sizeof(r->stereo_camera_note), "%u camera(s); [0] \"%.60s\" %ux%u/eye @ %.1f Hz, flags 0x%x",
-	         n, infos[0].display_name, infos[0].eye_width, infos[0].eye_height, (double)infos[0].max_frame_rate,
-	         infos[0].flags);
+	snprintf(r->stereo_camera_note, sizeof(r->stereo_camera_note),
+	         "%u camera(s); [0] \"%.60s\" %ux%u/eye @ %.1f Hz, flags 0x%x", n, infos[0].display_name,
+	         infos[0].eye_width, infos[0].eye_height, (double)infos[0].max_frame_rate, infos[0].flags);
 }
 
 #ifdef XRT_OS_WINDOWS

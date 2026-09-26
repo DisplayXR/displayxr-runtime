@@ -326,9 +326,10 @@ authorise_locked(volatile struct ipc_client_state *ics, const struct scam_camera
 	if (debug_get_bool_option_stereo_camera_dev_allow()) {
 		return XRT_SUCCESS;
 	}
-	U_LOG_W("%s: refused for pid %ld — stereo camera consent is not implemented yet (R3); set "
-	        "DXR_STEREO_CAMERA_DEV_ALLOW=1 in the SERVICE environment for development.",
-	        what, ics->peer_pid);
+	U_LOG_W(
+	    "%s: refused for pid %ld — stereo camera consent is not implemented yet (R3); set "
+	    "DXR_STEREO_CAMERA_DEV_ALLOW=1 in the SERVICE environment for development.",
+	    what, ics->peer_pid);
 	return XRT_ERROR_NOT_AUTHORIZED;
 }
 
@@ -732,12 +733,13 @@ ipc_server_stereo_camera_create(struct xrt_instance *xinst)
 		info->display_name[sizeof(info->display_name) - 1] = '\0';
 		info->device_identity[sizeof(info->device_identity) - 1] = '\0';
 		info->platform_device_hint[sizeof(info->platform_device_hint) - 1] = '\0';
-		if (info->eye_width == 0 || info->eye_height == 0 || (info->eye_width & 1u) || (info->eye_height & 1u) ||
-		    info->native_format < XRT_PLUGIN_STEREO_CAMERA_FORMAT_GRAY8 ||
+		if (info->eye_width == 0 || info->eye_height == 0 || (info->eye_width & 1u) ||
+		    (info->eye_height & 1u) || info->native_format < XRT_PLUGIN_STEREO_CAMERA_FORMAT_GRAY8 ||
 		    info->native_format > XRT_PLUGIN_STEREO_CAMERA_FORMAT_BGRA8) {
-			U_LOG_W("stereo camera: plug-in camera %u has a malformed description (%ux%u, format %u) — "
-			        "skipped",
-			        i, info->eye_width, info->eye_height, info->native_format);
+			U_LOG_W(
+			    "stereo camera: plug-in camera %u has a malformed description (%ux%u, format %u) — "
+			    "skipped",
+			    i, info->eye_width, info->eye_height, info->native_format);
 			continue;
 		}
 		cam->index = i;
@@ -751,8 +753,9 @@ ipc_server_stereo_camera_create(struct xrt_instance *xinst)
 			if (iface->stereo_camera_get_calibration(inst, i, &cam->calib) == XRT_SUCCESS) {
 				cam->have_calib = true;
 			} else {
-				U_LOG_W("stereo camera: \"%s\" claims CALIBRATED but returned no calibration — RAW only",
-				        info->display_name);
+				U_LOG_W(
+				    "stereo camera: \"%s\" claims CALIBRATED but returned no calibration — RAW only",
+				    info->display_name);
 				cam->info.flags &= ~XRT_PLUGIN_STEREO_CAMERA_CALIBRATED;
 			}
 		}
@@ -1023,8 +1026,8 @@ ipc_handle_stereo_camera_stream_create(volatile struct ipc_client_state *ics,
 		os_mutex_unlock(&m->lock);
 		return XRT_ERROR_INPUT_UNSUPPORTED;
 	}
-	bool calibrated = (cam->info.flags & (XRT_PLUGIN_STEREO_CAMERA_CALIBRATED |
-	                                      XRT_PLUGIN_STEREO_CAMERA_NATIVELY_RECTIFIED)) != 0;
+	bool calibrated = (cam->info.flags &
+	                   (XRT_PLUGIN_STEREO_CAMERA_CALIBRATED | XRT_PLUGIN_STEREO_CAMERA_NATIVELY_RECTIFIED)) != 0;
 	if (req->output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED && !calibrated) {
 		os_mutex_unlock(&m->lock);
 		return XRT_ERROR_INPUT_UNSUPPORTED;
@@ -1177,8 +1180,8 @@ ipc_handle_stereo_camera_stream_get_section(volatile struct ipc_client_state *ic
 	out_layout->format = s->req.format;
 	out_layout->output = s->output;
 	out_layout->transport = s->req.transport;
-	out_layout->max_frame_rate = s->dec.period_ns > 0 ? (float)(1e9 / (double)s->dec.period_ns)
-	                                                  : m->cams[s->camera].info.max_frame_rate;
+	out_layout->max_frame_rate =
+	    s->dec.period_ns > 0 ? (float)(1e9 / (double)s->dec.period_ns) : m->cams[s->camera].info.max_frame_rate;
 	out_layout->section_size = s->section_size;
 	out_layout->slot_stride = s->slot_stride;
 	out_layout->slot_count = U_STEREO_CAMERA_RING_SLOTS;
@@ -1188,8 +1191,8 @@ ipc_handle_stereo_camera_stream_get_section(volatile struct ipc_client_state *ic
 		CloseHandle(s->sent_section_dup);
 		s->sent_section_dup = NULL;
 	}
-	if (!DuplicateHandle(GetCurrentProcess(), s->section, GetCurrentProcess(), &s->sent_section_dup,
-	                     FILE_MAP_READ, FALSE, 0)) {
+	if (!DuplicateHandle(GetCurrentProcess(), s->section, GetCurrentProcess(), &s->sent_section_dup, FILE_MAP_READ,
+	                     FALSE, 0)) {
 		os_mutex_unlock(&m->lock);
 		return XRT_ERROR_IPC_FAILURE;
 	}

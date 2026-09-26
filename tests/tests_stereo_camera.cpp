@@ -139,7 +139,7 @@ TEST_CASE("stereo camera layout", "[stereo_camera]")
 	CHECK(l.offset[1] == 1280ull * 480);
 	CHECK(l.size == 1280ull * 480 * 3 / 2);
 	REQUIRE(u_stereo_camera_layout(3, 1000, 10, &l));
-	CHECK(l.pitch[0] == 4032); // 4000 rounded up to 64
+	CHECK(l.pitch[0] == 4032);                             // 4000 rounded up to 64
 	CHECK_FALSE(u_stereo_camera_layout(2, 1281, 480, &l)); // odd NV12
 	CHECK_FALSE(u_stereo_camera_layout(9, 64, 64, &l));
 }

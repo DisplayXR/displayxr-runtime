@@ -276,7 +276,8 @@ u_stereo_camera_convert(uint32_t src_format,
 			uint8_t *o = d0 + (size_t)y * dl->pitch[0];
 			for (uint32_t x = 0; x < width; x++) {
 				// Full-range luma: a GRAY8 consumer wants intensity, not video levels.
-				o[x] = (uint8_t)((29 * s[4 * x + 0] + 150 * s[4 * x + 1] + 77 * s[4 * x + 2] + 128) >> 8);
+				o[x] =
+				    (uint8_t)((29 * s[4 * x + 0] + 150 * s[4 * x + 1] + 77 * s[4 * x + 2] + 128) >> 8);
 			}
 		}
 		return true;

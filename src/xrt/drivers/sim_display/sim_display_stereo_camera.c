@@ -48,8 +48,8 @@ struct xrt_plugin_stereo_camera
 	uint32_t gray_pitch;
 	uint8_t *converted;
 	struct u_stereo_camera_planes conv_layout;
-	int64_t t0_ns;      //!< pacing anchor (re-anchored after a pause)
-	int64_t open_ns;    //!< suspend square-wave origin (never moves)
+	int64_t t0_ns;   //!< pacing anchor (re-anchored after a pause)
+	int64_t open_ns; //!< suspend square-wave origin (never moves)
 	int64_t period_ns;
 	uint64_t seq;
 };
