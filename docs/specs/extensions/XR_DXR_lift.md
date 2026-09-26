@@ -350,3 +350,10 @@ order: runtime → extensions auto-sync → consumers.
 | Version | Change |
 |---|---|
 | 1 | Initial: properties + states, streams (DEPTH / SBS / NVIEW / GAUSSIANS), non-blocking latest-wins submit, texture acquire (weave-style handles + fence), blob acquire (two-call latch), weave-rect lift chain, per-stream priority scheduling + stats, `focalPx`. |
+
+## Probing on a Windows box — gotchas (first N0 run, 2026-09-25)
+
+- **Selecting the display processor.** `XRT_PREFERRED_PLUGIN_ID` does *not* switch the active DP when an installed vendor plug-in also probes; `DXR_PLUGIN_EXCLUSIVE=<plugin-id>` in the **service's** environment does (relaunch the service non-elevated from a `.bat` that sets it). `SIM_DISPLAY_FAKE_LIFT=1` alongside `DXR_PLUGIN_EXCLUSIVE=sim-display` exercises the whole path hardware-free (caps modes = DEPTH|SBS|NVIEW|GAUSSIANS).
+- **`displayxr-cli lift …` must run non-elevated** — an elevated prompt reports "not connected to the service" (same integrity-level rule as every other IPC client).
+- **Vendor module version gate.** The Leia plug-in logs the NeurD version it loaded and reports `UNAVAILABLE` when it is outside the supported range (needs 0.4.3+): e.g. a box with Immersity Live's NeurD 0.3.7 shows `state -> ACTIVATING` then `UNAVAILABLE` with the reason in the service log. Upgrade the NeurD runtime; the plug-in never crashes on a mismatch.
+- **Probe timing.** `lift probe` stamps submit→acquire before any readback; use `--no-write` (or `--write-every N`) for throughput runs — encoding a 4K SBS PNG takes seconds and would otherwise cap the pipelined rate.
