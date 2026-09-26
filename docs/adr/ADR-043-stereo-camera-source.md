@@ -5,7 +5,7 @@
 camera slots to `xrt_plugin_iface` under the [ADR-020](ADR-020-plugin-abi-compatibility-policy.md)
 append-at-end rule · related: [ADR-019](ADR-019-vendor-plugin-aux-boundary.md),
 [ADR-034](ADR-034-input-provider-plugins.md), [ADR-035](ADR-035-service-owned-arbitration-single-pipeline-isolated-satellites.md),
-[ADR-042](ADR-042-vendor-2d3d-conversion-supersedes-default.md) (the same shape in reverse) ·
+ADR-042 (vendor 2D→3D conversion; in flight on branch `feat/lift-ext`, not yet on `main`) (the same shape in reverse) ·
 integration + plan: [roadmap/stereo-camera-source.md](../roadmap/stereo-camera-source.md)
 
 ## Context
