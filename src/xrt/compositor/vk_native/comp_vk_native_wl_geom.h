@@ -175,6 +175,27 @@ comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g,
 bool
 comp_vk_native_wl_geom_move_window(struct comp_vk_native_wl_geom *g, int32_t frame_logical_x, int32_t frame_logical_y);
 
+/*!
+ * The rect the most recent successful @ref comp_vk_native_wl_geom_get_window_rect
+ * returned, without pumping the bus. The weave's present origin comes from that
+ * call, so this is the one snapshot the frame was woven for (#1748 prototype:
+ * the move-sync frame tag must name exactly that position, not a newer one).
+ */
+bool
+comp_vk_native_wl_geom_last_rect(struct comp_vk_native_wl_geom *g, struct comp_vk_native_wl_window_rect *out_rect);
+
+/*!
+ * #1748 prototype: ask the publisher to hold this process's window during a
+ * compositor move until a frame woven for the new position is committed
+ * (WindowPlacement1.EnableMoveSync, publisher capability bit 2). The caller
+ * must tag every commit (comp_vk_native_wl_move_sync). The registration lives
+ * as long as this provider's bus connection.
+ *
+ * @return true when the publisher accepted it.
+ */
+bool
+comp_vk_native_wl_geom_enable_move_sync(struct comp_vk_native_wl_geom *g);
+
 void
 comp_vk_native_wl_geom_destroy(struct comp_vk_native_wl_geom **g_ptr);
 

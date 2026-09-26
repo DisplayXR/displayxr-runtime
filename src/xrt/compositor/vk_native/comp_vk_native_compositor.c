@@ -127,6 +127,7 @@
 #if defined(XRT_HAVE_WAYLAND) && defined(XRT_HAVE_DBUS)
 #define DXR_HAVE_WL_GEOM
 #include "vk_native/comp_vk_native_wl_geom.h"
+#include "vk_native/comp_vk_native_wl_move_sync.h"
 // THE logical->device conversion + the 1:1 decision (#1595/#1596).
 #include "util/u_wayland_geom.h"
 #endif
@@ -460,6 +461,12 @@ struct comp_vk_native_compositor
 	//! bus is unreachable; the provider itself degrades to "no data" when the
 	//! GNOME Shell extension is absent.
 	struct comp_vk_native_wl_geom *wl_geom;
+	/*!
+	 * #1748 PROTOTYPE (DXR_WL_MOVE_SYNC=1): the per-commit frame tag that lets
+	 * the GNOME extension show each frame at the position it was woven for
+	 * during a compositor move. NULL (the default) = the lattice path.
+	 */
+	struct comp_vk_native_wl_move_sync *wl_move_sync;
 #endif
 #endif
 
@@ -614,6 +621,16 @@ struct comp_vk_native_compositor
 #endif
 	//! Last SPAN_2D band count logged, so the line fires on change only.
 	uint32_t last_offpanel_band_count;
+	/*!
+	 * #1748 measurement hook (DXR_WL_ORIGIN_STAMP=1): a host-visible buffer
+	 * holding a barcode of this frame's present origin, copied into the
+	 * top-left of the target after the weave so a compositor-side audit can
+	 * compare where a frame is painted with where it was woven for.
+	 */
+	VkBuffer stamp_buffer;
+	VkDeviceMemory stamp_memory;
+	uint8_t *stamp_map;
+	uint32_t stamp_seq;
 	//! X11 placement quantum (#1588 follow-up): measured once, on the first
 	//! snap request, by @ref vk_x11_placement_quantum. 0 = unknown, 1 = every
 	//! device pixel is addressable, >1 = window origins land only on
@@ -2868,6 +2885,118 @@ vk_hud_prepare(struct comp_vk_native_compositor *c, uint32_t target_width, uint3
  */
 
 #if defined(XRT_OS_LINUX_DESKTOP) && defined(XRT_HAVE_WAYLAND)
+/*
+ * #1748 MEASUREMENT HOOK (DXR_WL_ORIGIN_STAMP=1, off by default, Linux only).
+ *
+ * Writes a barcode of the present origin this frame was woven for into the
+ * top-left 352x8 device px of the target: 44 blocks of 8x8, white = 1. Blocks
+ * 0-3 are a 1010 marker, then origin x + 32768 (16 bits, MSB first), origin
+ * y + 32768 (16 bits), and an 8-bit frame counter. The GNOME extension's paint
+ * audit (DISPLAYXR_STAMP_AUDIT=1) reads it back from the window's texture and
+ * compares it with where the stage painted the window, per painted frame. It
+ * overwrites real content, so it is a test hook and nothing else.
+ */
+#define VK_STAMP_BLOCK 8u
+#define VK_STAMP_BLOCKS 44u
+#define VK_STAMP_W (VK_STAMP_BLOCK * VK_STAMP_BLOCKS)
+#define VK_STAMP_H VK_STAMP_BLOCK
+
+static void
+vk_debug_origin_stamp(struct comp_vk_native_compositor *c,
+                      VkCommandBuffer cmd,
+                      VkImage target_image,
+                      uint32_t target_width,
+                      uint32_t target_height,
+                      VkImageLayout target_layout)
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		const char *e = getenv("DXR_WL_ORIGIN_STAMP");
+		enabled = (e != NULL && e[0] == '1') ? 1 : 0;
+	}
+	if (enabled == 0 || cmd == VK_NULL_HANDLE || target_image == VK_NULL_HANDLE || target_width < VK_STAMP_W ||
+	    target_height < VK_STAMP_H || !c->have_last_present_origin) {
+		return;
+	}
+	struct vk_bundle *vk = &c->vk;
+	if (c->stamp_buffer == VK_NULL_HANDLE) {
+		if (!vk_buffer_init(vk, VK_STAMP_W * VK_STAMP_H * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+		                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		                    &c->stamp_buffer, &c->stamp_memory)) {
+			enabled = 0;
+			return;
+		}
+		void *map = NULL;
+		if (vk->vkMapMemory(vk->device, c->stamp_memory, 0, VK_WHOLE_SIZE, 0, &map) != VK_SUCCESS) {
+			enabled = 0;
+			return;
+		}
+		c->stamp_map = map;
+		U_LOG_W(
+		    "DXR_WL_ORIGIN_STAMP=1: stamping each frame's present origin into its top-left %ux%u px "
+		    "(#1748 measurement hook - overwrites content)",
+		    VK_STAMP_W, VK_STAMP_H);
+	}
+	uint8_t bits[VK_STAMP_BLOCKS];
+	const uint32_t ux = (uint32_t)(c->last_present_origin_x + 32768) & 0xffffu;
+	const uint32_t uy = (uint32_t)(c->last_present_origin_y + 32768) & 0xffffu;
+	const uint32_t seq = (c->stamp_seq++) & 0xffu;
+	bits[0] = 1;
+	bits[1] = 0;
+	bits[2] = 1;
+	bits[3] = 0;
+	for (uint32_t i = 0; i < 16; i++) {
+		bits[4 + i] = (uint8_t)((ux >> (15 - i)) & 1u);
+		bits[20 + i] = (uint8_t)((uy >> (15 - i)) & 1u);
+	}
+	for (uint32_t i = 0; i < 8; i++) {
+		bits[36 + i] = (uint8_t)((seq >> (7 - i)) & 1u);
+	}
+	// Same bytes in RGBA and BGRA: white (ff ff ff ff) or opaque black.
+	for (uint32_t y = 0; y < VK_STAMP_H; y++) {
+		for (uint32_t x = 0; x < VK_STAMP_W; x++) {
+			uint8_t *px = c->stamp_map + (y * VK_STAMP_W + x) * 4;
+			const uint8_t v = bits[x / VK_STAMP_BLOCK] ? 0xff : 0x00;
+			px[0] = v;
+			px[1] = v;
+			px[2] = v;
+			px[3] = 0xff;
+		}
+	}
+
+	const VkImageSubresourceRange color = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+	VkImageMemoryBarrier to_dst = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .oldLayout = target_layout,
+	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .image = target_image,
+	    .subresourceRange = color,
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0,
+	                         NULL, 1, &to_dst);
+	const VkBufferImageCopy region = {
+	    .bufferOffset = 0,
+	    .bufferRowLength = 0,
+	    .bufferImageHeight = 0,
+	    .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .imageOffset = {0, 0, 0},
+	    .imageExtent = {VK_STAMP_W, VK_STAMP_H, 1},
+	};
+	vk->vkCmdCopyBufferToImage(cmd, c->stamp_buffer, target_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+	                           &region);
+	VkImageMemoryBarrier back = to_dst;
+	back.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	back.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
+	back.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	back.newLayout = target_layout;
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0,
+	                         NULL, 1, &back);
+}
+
 /*!
  * Paint the off-panel part of the woven target with flat 2D (#1654).
  *
@@ -5910,6 +6039,9 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 				                         tgt_height,
 				                         dp_self_submits ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
 				                                         : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+				vk_debug_origin_stamp(c, cmd, (VkImage)(uintptr_t)target_image, tgt_width, tgt_height,
+				                      dp_self_submits ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+				                                      : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 			}
 #endif
 
@@ -8352,10 +8484,20 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 		comp_vk_native_window_xcb_destroy(&c->xcb_window);
 	}
 #ifdef DXR_HAVE_WL_GEOM
+	comp_vk_native_wl_move_sync_destroy(&c->wl_move_sync);
 	if (c->wl_geom != NULL) {
 		comp_vk_native_wl_geom_destroy(&c->wl_geom);
 	}
 #endif
+	if (c->stamp_buffer != VK_NULL_HANDLE) {
+		c->vk.vkDestroyBuffer(c->vk.device, c->stamp_buffer, NULL);
+		c->stamp_buffer = VK_NULL_HANDLE;
+	}
+	if (c->stamp_memory != VK_NULL_HANDLE) {
+		c->vk.vkFreeMemory(c->vk.device, c->stamp_memory, NULL);
+		c->stamp_memory = VK_NULL_HANDLE;
+		c->stamp_map = NULL;
+	}
 #ifdef DXR_HAVE_DIRECT_SCANOUT
 	// After the target (swapchain) is gone — the backend owns the surface it
 	// borrowed to it — release the display back to the X server.
@@ -9131,6 +9273,19 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		// Windowed weaving (#817): absolute window position via the
 		// compositor's geometry service. NULL / no-data → display-scoped.
 		c->wl_geom = comp_vk_native_wl_geom_create();
+		// #1748 prototype: move-synchronised re-weave. Off unless asked for.
+		{
+			const char *ms_env = getenv("DXR_WL_MOVE_SYNC");
+			if (ms_env != NULL && ms_env[0] == '1' && c->wl_geom != NULL) {
+				c->wl_move_sync = comp_vk_native_wl_move_sync_create(wl->display, wl->surface);
+				if (c->wl_move_sync != NULL && !comp_vk_native_wl_geom_enable_move_sync(c->wl_geom)) {
+					comp_vk_native_wl_move_sync_destroy(&c->wl_move_sync);
+				}
+				U_LOG_W("wl_move_sync: move-synchronised re-weave %s (#1748 prototype)",
+				        c->wl_move_sync != NULL ? "ON - no drag lattice, no drop snap"
+				                                : "requested but UNAVAILABLE - lattice path");
+			}
+		}
 #endif
 	} else
 #endif
@@ -11027,6 +11182,25 @@ vk_update_present_origin(struct comp_vk_native_compositor *c)
 	if (c->have_last_present_origin && c->target != NULL &&
 	    (ox != c->last_present_origin_x || oy != c->last_present_origin_y)) {
 		comp_vk_native_target_note_origin_motion(c->target);
+		/*
+		 * #1748 TEST HOOK, off by default: DXR_WL_TEST_STALL=N:MS sleeps MS
+		 * ms on every N-th frame whose origin moved - a slow frame (MS about
+		 * a refresh) or a stalled app (MS in the hundreds) in the middle of a
+		 * drag, without a real workload.
+		 */
+		static int stall_every = -1, stall_ms = 0;
+		static int stall_count = 0;
+		if (stall_every < 0) {
+			const char *e = getenv("DXR_WL_TEST_STALL");
+			stall_every = 0;
+			if (e != NULL && sscanf(e, "%d:%d", &stall_every, &stall_ms) != 2) {
+				stall_every = 0;
+			}
+		}
+		if (stall_every > 0 && stall_ms > 0 && ++stall_count % stall_every == 0) {
+			U_LOG_W("DXR_WL_TEST_STALL: stalling this frame %d ms (test hook)", stall_ms);
+			os_nanosleep((int64_t)stall_ms * 1000 * 1000);
+		}
 	}
 	// On-change only (a drag produces a burst, a static window logs once): the
 	// one line that lets an unattended run prove WHICH origin reached the weaver
@@ -11045,9 +11219,25 @@ vk_update_present_origin(struct comp_vk_native_compositor *c)
 	c->have_last_present_origin = true;
 
 #if defined(XRT_OS_LINUX_DESKTOP) && defined(XRT_HAVE_WAYLAND) && defined(DXR_HAVE_WL_GEOM)
-	// After the feed, never before it: the snap is about where the window will
-	// be NEXT, and this frame's weave must use where it is now (#1609).
-	vk_wayland_phase_snap(c);
+	if (c->wl_move_sync != NULL) {
+		/*
+		 * #1748 prototype: tag this frame's commit with the position it is
+		 * woven for - the snapshot vk_get_window_metrics just used, not a
+		 * newer one. The extension shows the frame there. Every frame is
+		 * then woven for where it is painted, so there is nothing to snap,
+		 * during the drag or at the drop.
+		 */
+		struct comp_vk_native_wl_window_rect wr_tag = {0};
+		if (c->use_wayland && comp_vk_native_wl_geom_last_rect(c->wl_geom, &wr_tag)) {
+			comp_vk_native_wl_move_sync_tag(c->wl_move_sync, wr_tag.content_logical_x,
+			                                wr_tag.content_logical_y);
+		}
+	} else {
+		// After the feed, never before it: the snap is about where the
+		// window will be NEXT, and this frame's weave must use where it is
+		// now (#1609).
+		vk_wayland_phase_snap(c);
+	}
 #endif
 
 #ifdef XRT_OS_LINUX_DESKTOP

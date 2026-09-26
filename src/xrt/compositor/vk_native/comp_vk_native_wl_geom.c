@@ -112,6 +112,9 @@ struct comp_vk_native_wl_geom
 	//! Last surface-vs-frame comparison logged (logical px), on change only.
 	int32_t logged_surface_w, logged_surface_h, logged_frame_w, logged_frame_h, logged_inset_y;
 	int64_t next_retry_ns;   //!< earliest monotonic time for the next blocking GetWindows retry
+	//! The last rect get_window_rect returned (#1748 prototype, see last_rect).
+	struct comp_vk_native_wl_window_rect last_rect;
+	bool have_last_rect;
 };
 
 
@@ -717,7 +720,53 @@ comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g, struct 
 			}
 		}
 	}
+	g->last_rect = *out_rect;
+	g->have_last_rect = true;
 	return true;
+}
+
+bool
+comp_vk_native_wl_geom_last_rect(struct comp_vk_native_wl_geom *g, struct comp_vk_native_wl_window_rect *out_rect)
+{
+	if (g == NULL || out_rect == NULL || !g->have_last_rect) {
+		return false;
+	}
+	*out_rect = g->last_rect;
+	return true;
+}
+
+bool
+comp_vk_native_wl_geom_enable_move_sync(struct comp_vk_native_wl_geom *g)
+{
+	if (g == NULL || g->conn == NULL) {
+		return false;
+	}
+	DBusMessage *call =
+	    dbus_message_new_method_call(WLG_BUS_NAME, WLG_PLACEMENT_PATH, WLG_PLACEMENT_IFACE, "EnableMoveSync");
+	if (call == NULL) {
+		return false;
+	}
+	dbus_uint32_t pid = 0; // 0 = the caller
+	if (!dbus_message_append_args(call, DBUS_TYPE_UINT32, &pid, DBUS_TYPE_INVALID)) {
+		dbus_message_unref(call);
+		return false;
+	}
+	DBusError err;
+	dbus_error_init(&err);
+	DBusMessage *reply = dbus_connection_send_with_reply_and_block(g->conn, call, 200, &err);
+	dbus_message_unref(call);
+	if (reply == NULL) {
+		U_LOG_W("wl_geom: EnableMoveSync failed (%s) — the publisher predates move sync (#1748)",
+		        dbus_error_is_set(&err) ? err.message : "no reply");
+		dbus_error_free(&err);
+		return false;
+	}
+	dbus_bool_t ok = FALSE;
+	if (!dbus_message_get_args(reply, NULL, DBUS_TYPE_BOOLEAN, &ok, DBUS_TYPE_INVALID)) {
+		ok = FALSE;
+	}
+	dbus_message_unref(reply);
+	return ok == TRUE;
 }
 
 bool

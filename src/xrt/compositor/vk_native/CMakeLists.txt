@@ -145,7 +145,9 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 			# Wayland path stays display-scoped, exactly as before.
 			target_sources(comp_vk_native PRIVATE
 				comp_vk_native_wl_geom.c
-				comp_vk_native_wl_geom.h)
+				comp_vk_native_wl_geom.h
+				comp_vk_native_wl_move_sync.c
+				comp_vk_native_wl_move_sync.h)
 			target_include_directories(comp_vk_native SYSTEM PRIVATE ${DBUS_INCLUDE_DIRS})
 			target_link_libraries(comp_vk_native PRIVATE ${DBUS_LIBRARIES})
 		endif()
