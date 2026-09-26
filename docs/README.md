@@ -147,6 +147,7 @@ Integrate your 3D display hardware into DisplayXR.
 - [ADR-039](adr/ADR-039-one-fill-engine-for-every-tier.md) — One fill engine for every tier (same-adapter split)
 - [ADR-040](adr/ADR-040-rear-depth-budget.md) — Rear depth budget — the runtime owns the policy, the plug-in owns pixels, the app owns geometry
 - [ADR-041](adr/ADR-041-fixed-view-count-with-per-frame-activity.md) — Fixed view count with per-frame activity — inactive views alias, they do not disappear
+- [ADR-043](adr/ADR-043-stereo-camera-source.md) — A display's stereo camera is a plug-in-provided source, owned by the service and privacy-gated by the runtime (Proposed)
 <!-- END ADR INDEX -->
 
 ---
@@ -167,6 +168,7 @@ Design docs, status trackers, and plans — some shipped, some in progress. Afte
 - **[Roadmap Overview](roadmap/overview.md)** — milestone status and project trajectory
 - [Spatial Desktop PRD](roadmap/spatial-desktop-prd.md) — product vision
 - [PR FAQ](roadmap/prfaq.md) — press-release-style framing
+- [Stereo Camera Source](roadmap/stereo-camera-source.md) — a display's (eye-tracking) stereo camera as a plug-in-provided, privacy-gated source for web calls: browser `getUserMedia` integration, Android, phased plan (design, ADR-043)
 - [Spatial Workspace Extensions Plan](roadmap/spatial-workspace-extensions-plan.md) — three-phase plan to decouple the shell from the runtime: boundary rename (Phase 1, done), policy migration behind extensions (Phase 2), repo severance (Phase 3)
 - [Workspace Extensions Header Sketch](roadmap/spatial-workspace-extensions-headers-draft.md) — `XR_DXR_spatial_workspace.h` C-level API draft (historical: the separate app-launcher extension sketched there was dropped; launcher tiles ship as `*.displayxr.json` manifests)
 - [Workspace Controller Detection](roadmap/spatial-workspace-controller-detection.md) — Phase 2.0 prep: orchestrator detects installed controller via sidecar `.controller.json` manifest
