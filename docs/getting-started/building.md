@@ -120,17 +120,49 @@ Builds the runtime, OpenXR loader, and test apps. The macOS Vulkan native compos
 
 ```bash
 ./scripts/build_linux.sh              # headless build + selftest (deps list in the script header)
-./scripts/build_linux.sh --service    # + displayxr-service / IPC
+./scripts/build_linux.sh --service    # + displayxr-service; the runtime is then IPC-ONLY
+./scripts/build_linux.sh --hybrid     # + displayxr-service, HYBRID runtime (what the packages ship)
 ./scripts/package_linux.sh            # tarball + install.sh (user-level install, #705)
 ```
 
 `package_linux.sh` emits `dist/displayxr-runtime-linux-<arch>-<ver>.tar.gz`; its
 `install.sh` registers the OpenXR ActiveRuntime (`~/.config/openxr/1/`), the
 sim-display display processor (`~/.local/share/DisplayXR/DisplayProcessors/`),
-and a systemd `--user` unit — no root. `sudo ./install.sh --system` for
-machine-wide. Every `v*` release also attaches `displayxr-runtime_<ver>_amd64.deb`
-(`scripts/package_deb_linux.sh`). Dev iteration without installing stays
-`XR_RUNTIME_JSON` + `XRT_PLUGIN_SEARCH_PATH` per `docs/roadmap/linux-support.md`.
+and the `displayxr-service` systemd user units (below) — no root.
+`sudo ./install.sh --system` for machine-wide. Every `v*` release also attaches
+`displayxr-runtime_<ver>_amd64.deb` (`scripts/package_deb_linux.sh`). Dev
+iteration without installing stays `XR_RUNTIME_JSON` + `XRT_PLUGIN_SEARCH_PATH`
+per `docs/roadmap/linux-support.md`.
+
+**What the `.deb` installs** (#781, #1744):
+
+| Path | What |
+|---|---|
+| `/usr/lib/displayxr/lib/openxr_displayxr.so` | The **hybrid** runtime: ordinary apps run in-process; `XR_DXR_weave` present-owners (the DisplayXR browser) and workspace controllers go to `displayxr-service` over IPC. |
+| `/usr/lib/displayxr/bin/displayxr-service` (+ `/usr/bin/` link) | The out-of-process compositor (the weave engine lives only here). |
+| `/usr/lib/displayxr/bin/displayxr-cli` (+ `/usr/bin/` link) | `selftest`, `info`, `clients`, … |
+| `/usr/lib/displayxr/plugins/` | sim-display fallback DP + its manifest; a vendor plug-in package adds its own. |
+| `/usr/lib/systemd/user/displayxr.{socket,service}` | The service's start mechanism (below). |
+| `/etc/xdg/openxr/1/active_runtime.json` | Written by `postinst` — the Khronos loader's ActiveRuntime. |
+| GNOME Shell extension + `/etc/xdg/autostart` entry | See below. |
+
+**How the service starts (systemd user socket activation).** `postinst` enables
+`displayxr.socket` for every user (`systemctl --global enable`) and starts it
+in the user sessions already running. The socket listens on
+`$XDG_RUNTIME_DIR/displayxr_comp_ipc`, the path clients dial; the first client
+that needs the service starts `displayxr.service`, which exits 30 s after its
+last client leaves (`IPC_EXIT_WHEN_IDLE`). A user who never runs a present-owner
+or a workspace client never starts it. Check with
+`systemctl --user status displayxr.socket displayxr.service`; logs with
+`journalctl --user -u displayxr.service`. A present-owner that finds no socket
+(the unit disabled, a container) falls back to in-process and logs
+`Hybrid mode: XR_DXR_weave present-owner but no displayxr-service socket`; its
+weave calls then return `XR_ERROR_FEATURE_UNSUPPORTED`. To run the service by
+hand instead (e.g. with a different plug-in path), stop the socket first
+(`systemctl --user stop displayxr.socket`) and start `displayxr-service` from a
+terminal or detached — it no longer needs a terminal on stdin, and SIGTERM /
+Ctrl+C stop it cleanly. The tarball's `install.sh` installs the same unit pair
+under `~/.config/systemd/user/` (`--system`: `/usr/local/lib/systemd/user/`).
 
 **Why the release artifacts are built on the oldest supported release
 (#1656).** The published `.deb` and tarball must install and run on **Ubuntu
@@ -151,9 +183,11 @@ that impossible to ship:
 - the **`DebInstall`** CI matrix installs the built `.deb` into pristine
   `ubuntu:22.04`, `24.04` and `26.04` containers without Recommends, runs
   `ldd -r` on every shipped ELF, checks every `Depends`/`Recommends`/`Suggests`
-  name exists there, and runs `displayxr-cli info` + `selftest` env-free on the
-  packaged sim-display. `DebRelease` attaches the asset to the GitHub Release
-  only after that passes. Locally: `scripts/test_deb_linux.sh` (Docker) does the
+  name exists there, runs `displayxr-cli info` + `selftest` env-free on the
+  packaged sim-display, and checks `displayxr-service` + its units and runs
+  `scripts/smoke_service_linux.sh` against it (detached start, IPC handshake,
+  SIGTERM, stale socket, socket activation + idle exit — no GPU needed).
+  `DebRelease` attaches the asset to the GitHub Release only after that passes. Locally: `scripts/test_deb_linux.sh` (Docker) does the
   same build + tri-release verify, and
   `scripts/verify_deb_install_linux.sh <deb> [tarball]` is the verifier itself.
 
