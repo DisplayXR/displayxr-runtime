@@ -793,7 +793,24 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
     if (convert_srgb > 1.5)
         return float4(oetf_out(src_rect.xyz), alpha * a_mul);
 
-    float4 color = src_tex.Sample(src_samp, input.uv);
+    // Clamp the interpolated sample position to the texel CENTRES of src_rect
+    // (half a texel inside each edge; either sign of zw). A magnifying blit
+    // otherwise pulls the bilinear footprint across the rect's edge into
+    // whatever lies beside it in the source texture -- for the batched weave
+    // (#625) that is the browser's never-cleared window input, so each eye's
+    // outermost column came back 25% ring (a dark 1-px border on every woven
+    // canvas) and each inner edge 25% other-eye. Sampling never leaves the
+    // rect the caller asked for; 1:1 blits at texel centres are unchanged,
+    // and a whole-texture rect is exactly the sampler's CLAMP behaviour.
+    float2 src_e0 = src_rect.xy;
+    float2 src_e1 = src_rect.xy + src_rect.zw;
+    float2 src_lo = min(src_e0, src_e1) + 0.5;
+    float2 src_hi = max(src_e0, src_e1) - 0.5;
+    float2 src_mid = 0.5 * (src_e0 + src_e1);
+    src_lo = min(src_lo, src_mid);
+    src_hi = max(src_hi, src_mid);
+    float2 uv = clamp(input.uv * src_size, src_lo, src_hi) / src_size;
+    float4 color = src_tex.Sample(src_samp, uv);
 
     // --- Phase 2.K Commit 8.D: HUD compose (XR_EXT_window_space_layer). ---
     // Run BEFORE the corner_alpha / feather_alpha apply at the end of this PS,
@@ -1017,7 +1034,24 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
     if (convert_srgb > 1.5)
         return float4(oetf_out(src_rect.xyz), alpha * a_mul);
 
-    float4 color = src_tex.Sample(src_samp, float3(input.uv, array_slice));
+    // Clamp the interpolated sample position to the texel CENTRES of src_rect
+    // (half a texel inside each edge; either sign of zw). A magnifying blit
+    // otherwise pulls the bilinear footprint across the rect's edge into
+    // whatever lies beside it in the source texture -- for the batched weave
+    // (#625) that is the browser's never-cleared window input, so each eye's
+    // outermost column came back 25% ring (a dark 1-px border on every woven
+    // canvas) and each inner edge 25% other-eye. Sampling never leaves the
+    // rect the caller asked for; 1:1 blits at texel centres are unchanged,
+    // and a whole-texture rect is exactly the sampler's CLAMP behaviour.
+    float2 src_e0 = src_rect.xy;
+    float2 src_e1 = src_rect.xy + src_rect.zw;
+    float2 src_lo = min(src_e0, src_e1) + 0.5;
+    float2 src_hi = max(src_e0, src_e1) - 0.5;
+    float2 src_mid = 0.5 * (src_e0 + src_e1);
+    src_lo = min(src_lo, src_mid);
+    src_hi = max(src_hi, src_mid);
+    float2 uv = clamp(input.uv * src_size, src_lo, src_hi) / src_size;
+    float4 color = src_tex.Sample(src_samp, float3(uv, array_slice));
 
     if (hud_flags.x > 0.5)
     {

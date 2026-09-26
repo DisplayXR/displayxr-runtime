@@ -188,6 +188,33 @@ struct comp_multi_weave_linux_slot
 };
 #endif
 
+/*!
+ * Rect slots of the per-eye un-squeeze staging in the Vulkan weave engines'
+ * batch path (Android / desktop Linux / macOS): one per submitted rect, so it
+ * equals IPC_WEAVE_SUBMIT_RECTS_MAX (the IPC server rejects more).
+ */
+#define COMP_MULTI_WEAVE_EYE_STAGE_SLOTS 32
+
+/*!
+ * One eye's staging image for the batch weave's 2x horizontal un-squeeze.
+ *
+ * vkCmdBlitImage with VK_FILTER_LINEAR clamps at the edge of the WHOLE source
+ * image, not at srcOffsets, so stretching a half-rect straight out of the
+ * window-sized input reads 25 % of the texel just outside it: the caller's
+ * never-cleared ring on the outer edge, the other eye at the midline. The half-
+ * rect is instead copied 1:1 into an image of EXACTLY its size and that whole
+ * image is blitted, so the edge clamp is the rect's own outermost texel centres
+ * (the Vulkan twin of the D3D11 blit shader's clamp). Cached per rect slot and
+ * eye; reallocated only when that slot's size or format changes.
+ */
+struct comp_multi_weave_eye_stage
+{
+	VkImage image; //!< TRANSFER_DST (1:1 copy in) + TRANSFER_SRC (stretch out); no view.
+	VkDeviceMemory memory;
+	uint32_t w, h;
+	VkFormat format; //!< The input's format, so the copy is a same-format box copy.
+};
+
 struct multi_compositor
 {
 	struct xrt_compositor_native base;
@@ -615,6 +642,11 @@ struct multi_compositor
 		bool sbs_first_use;
 		//! @}
 
+		//! @name Per-eye un-squeeze staging (batch path; see comp_multi_weave_eye_stage)
+		//! @{
+		struct comp_multi_weave_eye_stage eye_stage[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS][2];
+		//! @}
+
 		//! @name IOSurface-backed weaved output (exported to the caller)
 		//! @{
 		VkImage out_image;
@@ -719,6 +751,11 @@ struct multi_compositor
 		VkImageView sbs_view;
 		uint32_t sbs_w, sbs_h;
 		bool sbs_first_use;
+		//! @}
+
+		//! @name Per-eye un-squeeze staging (batch path; see comp_multi_weave_eye_stage)
+		//! @{
+		struct comp_multi_weave_eye_stage eye_stage[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS][2];
 		//! @}
 
 		//! @name AHardwareBuffer-backed weaved output (exported to the caller)
@@ -910,6 +947,11 @@ struct multi_compositor
 		VkImageView sbs_view;
 		uint32_t sbs_w, sbs_h;
 		bool sbs_first_use;
+		//! @}
+
+		//! @name Per-eye un-squeeze staging (batch path; see comp_multi_weave_eye_stage)
+		//! @{
+		struct comp_multi_weave_eye_stage eye_stage[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS][2];
 		//! @}
 
 		//! @name Exportable weaved output (handed to the caller)
