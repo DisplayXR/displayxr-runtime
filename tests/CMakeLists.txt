@@ -64,6 +64,7 @@ set(tests
     tests_comp_color_policy
     tests_m_matrix_projection
     tests_stereo_camera
+    tests_stereo_rectify
 	)
 if(XRT_BUILD_DRIVER_QWERTY)
 	list(APPEND tests tests_qwerty_camera_profile tests_qwerty_velocity)
@@ -698,3 +699,9 @@ add_test(NAME tests_ipc_proto COMMAND ${PYTHON_EXECUTABLE} ${CMAKE_CURRENT_SOURC
 # the ring / conversion / disparity-probe tests (it compiles into the plug-in).
 target_sources(tests_stereo_camera PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_stereo_camera_pattern.c)
 target_include_directories(tests_stereo_camera PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display)
+
+# ADR-043 R2: the rectifier (u_stereo_rectify) against OpenCV-generated golden
+# fixtures, and end to end on the sim_display DISTORTED fake (its scene +
+# synthetic lens live in the pattern file).
+target_sources(tests_stereo_rectify PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_stereo_camera_pattern.c)
+target_include_directories(tests_stereo_rectify PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display ${CMAKE_CURRENT_SOURCE_DIR}/fixtures)
