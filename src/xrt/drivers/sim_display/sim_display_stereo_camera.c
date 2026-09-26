@@ -48,7 +48,8 @@ struct xrt_plugin_stereo_camera
 	uint32_t gray_pitch;
 	uint8_t *converted;
 	struct u_stereo_camera_planes conv_layout;
-	int64_t t0_ns;
+	int64_t t0_ns;      //!< pacing anchor (re-anchored after a pause)
+	int64_t open_ns;    //!< suspend square-wave origin (never moves)
 	int64_t period_ns;
 	uint64_t seq;
 };
@@ -202,6 +203,7 @@ sim_display_stereo_camera_open(struct xrt_plugin_instance *inst,
 	}
 	cam->period_ns = (int64_t)(1e9 / cfg->fps);
 	cam->t0_ns = os_monotonic_get_ns();
+	cam->open_ns = cam->t0_ns;
 	U_LOG_W("sim_display: FAKE stereo camera opened (bg disparity %u px, bar disparity %u px)",
 	        cam->scene.bg_disparity, cam->scene.bar_disparity);
 	*out_cam = cam;
@@ -227,7 +229,7 @@ sim_display_stereo_camera_wait_frame(struct xrt_plugin_stereo_camera *cam,
 	int64_t now = os_monotonic_get_ns();
 
 	// SUSPEND square wave: odd half-periods are "tracker stopped".
-	if (cam->cfg.suspend_period_ns > 0 && ((now - cam->t0_ns) / cam->cfg.suspend_period_ns) % 2 == 1) {
+	if (cam->cfg.suspend_period_ns > 0 && ((now - cam->open_ns) / cam->cfg.suspend_period_ns) % 2 == 1) {
 		sleep_ns(timeout_ns < 20000000 ? timeout_ns : 20000000);
 		return XRT_PLUGIN_STEREO_CAMERA_WAIT_SUSPENDED;
 	}
