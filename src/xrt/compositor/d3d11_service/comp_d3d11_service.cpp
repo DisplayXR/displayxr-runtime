@@ -23948,24 +23948,18 @@ lift_weave_rect_batch(struct d3d11_service_system *sys,
 		blit_to_atlas_texture(sys, &c->render, pin.srv, vw * (float)vr, 0.0f, vw, (float)pin.height,
 		                      (float)pin.width, (float)pin.height, (float)win_w + ax, ay, aw, ah,
 		                      /*is_srgb*/ false, /*blend*/ nullptr, rtv, atw, ath);
-		// Bars AFTER the result, each reaching a few pixels INTO the active area:
-		// the profile resolves a bar edge to one bucket (up to ~h/512 rows of the
-		// bar left inside the active area), and the module's edge handling leaves
-		// a seam there — both get covered by flat 2D. A few picture rows at the
-		// border go flat; nobody sees that.
-		const float mv = ceilf(rh / 512.0f) + 4.0f, mh = ceilf(rw / 512.0f) + 4.0f;
-		const float t = ay - ry > 0.5f ? mv : 0.0f, b = (ry + rh) - (ay + ah) > 0.5f ? mv : 0.0f;
-		const float l = ax - rx > 0.5f ? mh : 0.0f, r = (rx + rw) - (ax + aw) > 0.5f ? mh : 0.0f;
+		// The bars: the 2D input, FLAT, tiling the rect exactly around the active
+		// area — no overlap, so the woven picture meets them pixel-exact (the
+		// profile is per row, so the active area holds no bar rows to hide).
 		const float bar[4][4] = {
-		    {rx, ry, rw, (ay - ry) + t},                    // top
-		    {rx, ay + ah - b, rw, (ry + rh) - (ay + ah) + b}, // bottom
-		    {rx, ay, (ax - rx) + l, ah},                    // left
-		    {ax + aw - r, ay, (rx + rw) - (ax + aw) + r, ah}, // right
+		    {rx, ry, rw, ay - ry},                    // top
+		    {rx, ay + ah, rw, (ry + rh) - (ay + ah)}, // bottom
+		    {rx, ay, ax - rx, ah},                    // left
+		    {ax + aw, ay, (rx + rw) - (ax + aw), ah}, // right
 		};
 		for (int k = 0; k < 4; k++) {
 			const float *s = bar[k];
-			if ((k < 2 && (k == 0 ? t : b) == 0.0f) || (k >= 2 && (k == 2 ? l : r) == 0.0f) || s[2] < 0.5f ||
-			    s[3] < 0.5f) {
+			if (s[2] < 0.5f || s[3] < 0.5f) {
 				continue; // no bar on this edge
 			}
 			for (int eye = 0; eye < 2; eye++) {

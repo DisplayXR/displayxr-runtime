@@ -326,8 +326,10 @@ u_lift_cap_dims(uint32_t w, uint32_t h, uint32_t cap, uint32_t *out_w, uint32_t 
  *
  */
 
-//! Row / column profile length cap (buckets per axis).
-#define U_LIFT_LETTERBOX_BINS_MAX 512u
+//! Row / column profile length cap (buckets per axis). One bucket per row /
+//! column up to 8K, so a bar edge is exact to the pixel and the lifted area is
+//! exactly the picture (no flat overlap needed to hide a bucket's slack).
+#define U_LIFT_LETTERBOX_BINS_MAX 8192u
 
 //! A bucket whose non-black fraction reaches this is picture intruding into a
 //! bar (the SHRINK test). Subtitle text stays below it or is caught by the
