@@ -60,6 +60,7 @@ extern "C" {
 #define IPC_MAX_CLIENT_SPACES 128
 
 struct xrt_instance;
+struct ipc_server_stereo_camera;
 struct xrt_compositor;
 struct xrt_compositor_native;
 
@@ -218,6 +219,14 @@ struct ipc_client_state
 	 * every stream it owns destroyed — at client teardown.
 	 */
 	uint64_t lift_owner;
+
+	/*!
+	 * XR_DXR_stereo_camera (ADR-043): this connection's stream-owner token,
+	 * taken from the camera manager on first stream create (0 = never used a
+	 * camera). A token, not the ics pointer: the thread slot is reused by later
+	 * connections. Every stream it owns is destroyed at client teardown.
+	 */
+	uint64_t stereo_camera_owner;
 };
 
 enum ipc_thread_state
@@ -509,6 +518,10 @@ struct ipc_server
 
 		struct os_mutex lock;
 	} global_state;
+
+	//! XR_DXR_stereo_camera (ADR-043): the camera manager (never NULL once
+	//! the server is initialised; it may expose zero cameras).
+	struct ipc_server_stereo_camera *stereo_camera;
 };
 
 
