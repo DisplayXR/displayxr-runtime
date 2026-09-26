@@ -18,7 +18,7 @@ if [ "$SYSTEM" = 1 ]; then
     OPENXR_CONF_DIR=/etc/xdg/openxr/1
     DP_ROOT=/usr/local/share/displayxr/DisplayProcessors
     EXT_ROOT=/usr/local/share/gnome-shell/extensions
-    UNIT=""
+    UNIT_DIR=/usr/local/lib/systemd/user
 else
     DATA_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}"
     CONFIG_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}"
@@ -26,14 +26,21 @@ else
     OPENXR_CONF_DIR="$CONFIG_ROOT/openxr/1"
     DP_ROOT="$DATA_ROOT/DisplayXR/DisplayProcessors"
     EXT_ROOT="$DATA_ROOT/gnome-shell/extensions"
-    UNIT="$CONFIG_ROOT/systemd/user/displayxr.service"
+    UNIT_DIR="$CONFIG_ROOT/systemd/user"
 fi
 
-if [ -n "$UNIT" ] && [ -f "$UNIT" ]; then
-    systemctl --user disable --now displayxr.service >/dev/null 2>&1 || true
-    rm -f "$UNIT"
-    systemctl --user daemon-reload 2>/dev/null || true
-    echo "==> Removed systemd --user unit"
+# displayxr-service units (#1744): the socket-activated pair, and v1's plain
+# displayxr.service if an older install left it.
+if [ -f "$UNIT_DIR/displayxr.socket" ] || [ -f "$UNIT_DIR/displayxr.service" ]; then
+    if [ "$SYSTEM" = 1 ]; then
+        systemctl --global disable displayxr.socket >/dev/null 2>&1 || true
+    else
+        systemctl --user disable --now displayxr.socket displayxr.service >/dev/null 2>&1 || true
+        rm -f "$UNIT_DIR/default.target.wants/displayxr.service" "$UNIT_DIR/sockets.target.wants/displayxr.socket"
+    fi
+    rm -f "$UNIT_DIR/displayxr.socket" "$UNIT_DIR/displayxr.service"
+    [ "$SYSTEM" = 1 ] || systemctl --user daemon-reload 2>/dev/null || true
+    echo "==> Removed displayxr-service systemd user units"
 fi
 
 # Only unset the ActiveRuntime if it is ours; restore a backup if present.

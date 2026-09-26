@@ -1,0 +1,31 @@
+# DisplayXR runtime service — the out-of-process compositor (issue #1744).
+#
+# Socket-activated by displayxr.socket; never started on its own. @SERVICE_BIN@
+# is substituted at packaging/install time.
+#
+# IPC_EXIT_WHEN_IDLE: the service holds a Vulkan device and the display
+# processor (a vendor plug-in may keep an eye tracker running), so it exits 30 s
+# after its last client disconnects and the socket starts it again on the next
+# connect. The grace period covers a client that reconnects (the browser does,
+# on a GPU-process restart).
+#
+# Display-processor discovery is the runtime's default (no env needed):
+# /usr/lib/displayxr/plugins, the XDG DisplayProcessors roots, and whatever a
+# vendor plug-in package installs there.
+
+[Unit]
+Description=DisplayXR runtime service (out-of-process compositor)
+Documentation=https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/architecture/service-architecture.md
+Requires=displayxr.socket
+After=displayxr.socket
+ConditionUser=!root
+
+[Service]
+Type=simple
+ExecStart=@SERVICE_BIN@
+Environment=IPC_EXIT_WHEN_IDLE=1 IPC_EXIT_WHEN_IDLE_DELAY_MS=30000
+Restart=on-failure
+RestartSec=2
+
+[Install]
+Also=displayxr.socket

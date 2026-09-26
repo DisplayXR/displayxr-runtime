@@ -6,7 +6,9 @@
 #     runtime + plug-in     -> $XDG_DATA_HOME/displayxr            (~/.local/share/displayxr)
 #     OpenXR ActiveRuntime  -> $XDG_CONFIG_HOME/openxr/1/active_runtime.json
 #     DP discovery manifest -> $XDG_DATA_HOME/DisplayXR/DisplayProcessors/200-sim-display.json
-#     systemd --user unit   -> $XDG_CONFIG_HOME/systemd/user/displayxr.service (if service present)
+#     systemd --user units  -> $XDG_CONFIG_HOME/systemd/user/displayxr.{socket,service}
+#                              socket enabled + started: displayxr-service is
+#                              socket-activated on first use, exits when idle (#1744)
 #     GNOME Shell extension -> $XDG_DATA_HOME/gnome-shell/extensions/window-geometry@displayxr.org
 #                              and enabled for this user (unless they disabled it)
 #
@@ -14,7 +16,8 @@
 #     runtime + plug-in     -> /usr/local/{bin,lib}
 #     OpenXR ActiveRuntime  -> /etc/xdg/openxr/1/active_runtime.json
 #     DP discovery manifest -> /usr/local/share/displayxr/DisplayProcessors/200-sim-display.json
-#     (no systemd unit in system mode, v1 — start displayxr-service per user)
+#     systemd user units    -> /usr/local/lib/systemd/user/displayxr.{socket,service}
+#                              socket enabled for every user (systemctl --global)
 #     GNOME Shell extension -> /usr/local/share/gnome-shell/extensions/window-geometry@displayxr.org
 #                              + /etc/xdg/autostart entry enabling it once per user at login
 #
@@ -24,7 +27,7 @@
 # is the only display processor.
 #
 # Flags: --system  system-wide (needs root)
-#        --no-service  skip the systemd --user unit
+#        --no-service  skip the systemd user units (displayxr-service)
 #        --no-gnome-extension  skip the GNOME Shell extension
 
 set -euo pipefail
@@ -122,29 +125,45 @@ cat > "$DP_ROOT/200-sim-display.json" <<EOF
 EOF
 echo "==> Display processor manifest: $DP_ROOT/200-sim-display.json"
 
-# --- systemd --user unit (user-level installs with the service binary) -----
-if [ "$SYSTEM" = 0 ] && [ "$NO_SERVICE" = 0 ] && [ -x "$PREFIX/bin/displayxr-service" ]; then
-    UNIT_DIR="$CONFIG_ROOT/systemd/user"
-    mkdir -p "$UNIT_DIR"
-    cat > "$UNIT_DIR/displayxr.service" <<EOF
-[Unit]
-Description=DisplayXR runtime service (out-of-process compositor)
-
-[Service]
-ExecStart=$PREFIX/bin/displayxr-service
-Restart=no
-
-[Install]
-WantedBy=default.target
-EOF
-    echo "==> systemd --user unit: $UNIT_DIR/displayxr.service"
-    # Containers / non-systemd sessions have no user bus — skip gracefully.
-    if [ -d /run/systemd/system ] && systemctl --user daemon-reload 2>/dev/null; then
-        systemctl --user enable displayxr.service >/dev/null 2>&1 || true
-        echo "    enabled (start now: systemctl --user start displayxr)"
+# --- displayxr-service: socket-activated systemd user units (#1744) --------
+# The runtime is HYBRID: ordinary apps run in-process; XR_DXR_weave
+# present-owners (the DisplayXR browser) and workspace controllers dial
+# $XDG_RUNTIME_DIR/displayxr_comp_ipc. displayxr.socket owns that path, so the
+# service starts only when such a client connects, and exits when idle.
+# (Replaces v1's always-on displayxr.service, WantedBy=default.target — which
+# also could not start at all: the service died on its /dev/null stdin.)
+UNIT_SRC="$HERE/share/systemd/user"
+if [ "$NO_SERVICE" = 0 ] && [ -x "$PREFIX/bin/displayxr-service" ] &&
+    [ -f "$UNIT_SRC/displayxr.socket" ] && [ -f "$UNIT_SRC/displayxr.service.in" ]; then
+    if [ "$SYSTEM" = 1 ]; then
+        UNIT_DIR=/usr/local/lib/systemd/user
     else
-        echo "    (no systemd user session detected — enable manually later:"
-        echo "     systemctl --user daemon-reload && systemctl --user enable displayxr)"
+        UNIT_DIR="$CONFIG_ROOT/systemd/user"
+        # v1 enabled a plain service into default.target: drop that link.
+        if [ -d /run/systemd/system ]; then
+            systemctl --user disable displayxr.service >/dev/null 2>&1 || true
+        fi
+        rm -f "$CONFIG_ROOT/systemd/user/default.target.wants/displayxr.service"
+    fi
+    mkdir -p "$UNIT_DIR"
+    cp "$UNIT_SRC/displayxr.socket" "$UNIT_DIR/displayxr.socket"
+    sed "s|@SERVICE_BIN@|$PREFIX/bin/displayxr-service|g" "$UNIT_SRC/displayxr.service.in" \
+        >"$UNIT_DIR/displayxr.service"
+    echo "==> systemd user units: $UNIT_DIR/displayxr.{socket,service}"
+    if [ "$SYSTEM" = 1 ]; then
+        if command -v systemctl >/dev/null 2>&1 && systemctl --global enable displayxr.socket >/dev/null 2>&1; then
+            echo "    socket enabled for every user from their next login"
+            echo "    (now, per user: systemctl --user daemon-reload && systemctl --user start displayxr.socket)"
+        else
+            echo "    (systemctl unavailable — enable per user: systemctl --user enable --now displayxr.socket)"
+        fi
+    # Containers / non-systemd sessions have no user manager — skip gracefully.
+    elif [ -d /run/systemd/system ] && systemctl --user daemon-reload 2>/dev/null; then
+        systemctl --user enable --now displayxr.socket >/dev/null 2>&1 || true
+        echo "    socket enabled and listening (the service starts on first use)"
+    else
+        echo "    (no systemd user session detected — enable later:"
+        echo "     systemctl --user daemon-reload && systemctl --user enable --now displayxr.socket)"
     fi
 fi
 

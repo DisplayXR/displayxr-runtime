@@ -1,0 +1,28 @@
+# DisplayXR runtime service — listening socket (issue #1744).
+#
+# Shipped by the runtime .deb in /usr/lib/systemd/user/ (enabled for every user
+# with `systemctl --global enable`) and by the tarball's install.sh in
+# ~/.config/systemd/user/. systemd owns the socket from login on; the first
+# DisplayXR client that needs the out-of-process path (an XR_DXR_weave
+# present-owner such as the DisplayXR browser, a workspace controller, or any
+# app run with XRT_FORCE_MODE=ipc) connecting to it starts displayxr.service.
+# A user who never runs one never starts the service.
+#
+# The path must equal XRT_IPC_MSG_SOCK_FILENAME (CMakeLists.txt) under
+# $XDG_RUNTIME_DIR (%t), which is where clients dial.
+
+[Unit]
+Description=DisplayXR runtime service socket
+Documentation=https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/architecture/service-architecture.md
+ConditionUser=!root
+
+[Socket]
+ListenStream=%t/displayxr_comp_ipc
+SocketMode=0600
+RemoveOnStop=true
+# NOT FlushPending: the service exits when idle (displayxr.service), and a
+# client that connects in that window must stay queued for the next start
+# rather than be refused.
+
+[Install]
+WantedBy=sockets.target

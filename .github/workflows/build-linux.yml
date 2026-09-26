@@ -19,7 +19,8 @@ name: Build Linux
 #
 # Package job (#705): build in the OLDEST supported container (ubuntu:22.04,
 # #1656), produce the tarball, install from it, and gate on selftest resolving
-# everything from the installed XDG paths.
+# everything from the installed XDG paths, plus the headless displayxr-service
+# smoke (#1744) on the installed service.
 #
 # Newest job (#1656): the "still compiles on the newest release" coverage the
 # Package job used to provide before it moved to 22.04 — build + selftest in an
@@ -27,9 +28,11 @@ name: Build Linux
 #
 # Deb job (#781 Phase 3, #1656): build the runtime .deb
 # (scripts/package_deb_linux.sh) on every PR, in an ubuntu:22.04 container so
-# the shipped binaries carry the oldest supported release's glibc floor.
-# DebInstall then installs it into pristine 22.04 / 24.04 / 26.04 containers and
-# runs it there; DebRelease attaches displayxr-runtime_<ver>_amd64.deb to a v*
+# the shipped binaries carry the oldest supported release's glibc floor. Since
+# #1744 it is the HYBRID runtime + displayxr-service + its socket-activated
+# systemd user units (the .deb used to be in-process only, so no installed box
+# could weave). DebInstall then installs it into pristine 22.04 / 24.04 / 26.04
+# containers and runs it there — selftest AND the headless service smoke; DebRelease attaches displayxr-runtime_<ver>_amd64.deb to a v*
 # GitHub Release — the asset the Linux meta-bundle (displayxr-installer)
 # fetches — only after that passes. Deb / DebInstall are not required contexts
 # themselves (DebInstall is a matrix, so its context names move when the
@@ -170,10 +173,12 @@ jobs:
           fetch-depth: 0 # git describe needs tags for the tarball version
 
       - name: Build + package
+        # --hybrid (#1744): the shipped configuration — in-process runtime for
+        # ordinary apps, IPC to displayxr-service for present-owners.
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          ./scripts/build_linux.sh --service --no-test
+          ./scripts/build_linux.sh --hybrid --no-test
           ./scripts/package_linux.sh --no-build
 
       - name: Install from tarball + selftest from installed paths
@@ -188,7 +193,16 @@ jobs:
           unset XRT_PLUGIN_SEARCH_PATH
           "$HOME/.local/share/displayxr/bin/displayxr-cli" info
           "$HOME/.local/share/displayxr/bin/displayxr-cli" selftest
+          # #1744: the installed service runs detached, answers IPC, stops on
+          # SIGTERM, recovers a stale socket, and socket-activates.
+          "$GITHUB_WORKSPACE/scripts/smoke_service_linux.sh" --bin-dir "$HOME/.local/share/displayxr/bin"
+          # install.sh wrote the socket-activated unit pair (no user manager in
+          # the container, so it is written but not enabled).
+          test -f "$HOME/.config/systemd/user/displayxr.socket"
+          grep -qx "ExecStart=$HOME/.local/share/displayxr/bin/displayxr-service" \
+            "$HOME/.config/systemd/user/displayxr.service"
           ./uninstall.sh
+          test ! -f "$HOME/.config/systemd/user/displayxr.socket"
           # Uninstall must leave no ActiveRuntime behind.
           test ! -f "$HOME/.config/openxr/1/active_runtime.json"
 
@@ -369,10 +383,13 @@ jobs:
   # supported release, without Recommends, and run it there
   # (scripts/verify_deb_install_linux.sh): apt must resolve Depends from that
   # release's archive, `ldd -r` must be clean on every shipped ELF, every
-  # Depends/Recommends/Suggests name must exist there, and `displayxr-cli
-  # selftest` must pass env-free on the packaged sim-display. The Package job's
-  # tarball (which also carries displayxr-service) is checked for the same
-  # glibc / libstdc++ floor.
+  # Depends/Recommends/Suggests name must exist there, `displayxr-cli
+  # selftest` must pass env-free on the packaged sim-display, and (#1744)
+  # displayxr-service + its systemd user units must be installed and pass
+  # scripts/smoke_service_linux.sh — detached start, IPC handshake, SIGTERM,
+  # stale socket, socket activation + exit-when-idle (no systemd in the
+  # container: the sd_listen_fds hand-off is emulated). The Package job's
+  # tarball is checked for the same glibc / libstdc++ floor.
   DebInstall:
     name: DebInstall (Ubuntu ${{ matrix.release }})
     needs: [DetectChanges, Deb, Package]
