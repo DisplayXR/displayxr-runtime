@@ -42,6 +42,7 @@ add_executable(
 	cli_cmd_probe.c
 	cli_cmd_test.c
 	cli_cmd_clients.c
+	cli_cmd_camera.c
 	cli_common.h
 	cli_main.c
 	)
@@ -87,5 +88,9 @@ if(XRT_FEATURE_SERVICE AND XRT_MODULE_IPC)
 	target_link_libraries(cli PRIVATE ipc_client)
 	target_compile_definitions(cli PRIVATE CLI_HAVE_IPC)
 endif()
+
+# ADR-043: `displayxr-cli camera probe --out` writes PNGs (stb, header-only,
+# compiled static into cli_cmd_camera.c).
+target_include_directories(cli PRIVATE ${PROJECT_SOURCE_DIR}/src/external/stb)
 
 install(TARGETS cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
