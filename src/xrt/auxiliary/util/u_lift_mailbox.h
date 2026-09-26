@@ -329,8 +329,18 @@ u_lift_cap_dims(uint32_t w, uint32_t h, uint32_t cap, uint32_t *out_w, uint32_t 
 //! Row / column profile length cap (buckets per axis).
 #define U_LIFT_LETTERBOX_BINS_MAX 512u
 
-//! A bucket whose non-black fraction reaches this is picture (ends a bar).
+//! A bucket whose non-black fraction reaches this is picture intruding into a
+//! bar (the SHRINK test). Subtitle text stays below it or is caught by the
+//! symmetry rule.
 #define U_LIFT_LETTERBOX_PICTURE_FRAC 0.25f
+
+//! A bar only GROWS into buckets at most this lit (truly black): a dark scene
+//! edge is rarely this empty, so dark stretches do not crop picture.
+#define U_LIFT_LETTERBOX_BLACK_FRAC 0.03f
+
+//! Consecutive frames picture must intrude into a bar before it shrinks — one
+//! caption frame must not un-crop; a 16:9 ad still un-crops within ~0.1 s.
+#define U_LIFT_LETTERBOX_SHRINK_FRAMES 6u
 
 /*!
  * Rows below this non-black fraction count as sparse (subtitle text, not
@@ -361,6 +371,8 @@ struct u_lift_letterbox
 	struct u_lift_crop committed; //!< the crop in effect
 	struct u_lift_crop pending;   //!< a larger crop waiting to settle
 	uint32_t pending_frames;      //!< consecutive content frames @c pending held
+	struct u_lift_crop shrink;    //!< a smaller crop (picture in a bar) waiting to hold
+	uint32_t shrink_frames;       //!< consecutive content frames @c shrink held
 };
 
 /*!

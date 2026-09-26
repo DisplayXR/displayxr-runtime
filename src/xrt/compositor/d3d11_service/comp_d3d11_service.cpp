@@ -23942,16 +23942,31 @@ lift_weave_rect_batch(struct d3d11_service_system *sys,
 		// pixels at the same place in both views, i.e. on the screen plane.
 		const float ax = rx + pin.active[0] * rw, ay = ry + pin.active[1] * rh;
 		const float aw = (pin.active[2] - pin.active[0]) * rw, ah = (pin.active[3] - pin.active[1]) * rh;
+		blit_to_atlas_texture(sys, &c->render, pin.srv, vw * (float)vl, 0.0f, vw, (float)pin.height,
+		                      (float)pin.width, (float)pin.height, ax, ay, aw, ah, /*is_srgb*/ false,
+		                      /*blend*/ nullptr, rtv, atw, ath);
+		blit_to_atlas_texture(sys, &c->render, pin.srv, vw * (float)vr, 0.0f, vw, (float)pin.height,
+		                      (float)pin.width, (float)pin.height, (float)win_w + ax, ay, aw, ah,
+		                      /*is_srgb*/ false, /*blend*/ nullptr, rtv, atw, ath);
+		// Bars AFTER the result, each reaching a few pixels INTO the active area:
+		// the profile resolves a bar edge to one bucket (up to ~h/512 rows of the
+		// bar left inside the active area), and the module's edge handling leaves
+		// a seam there — both get covered by flat 2D. A few picture rows at the
+		// border go flat; nobody sees that.
+		const float mv = ceilf(rh / 512.0f) + 4.0f, mh = ceilf(rw / 512.0f) + 4.0f;
+		const float t = ay - ry > 0.5f ? mv : 0.0f, b = (ry + rh) - (ay + ah) > 0.5f ? mv : 0.0f;
+		const float l = ax - rx > 0.5f ? mh : 0.0f, r = (rx + rw) - (ax + aw) > 0.5f ? mh : 0.0f;
 		const float bar[4][4] = {
-		    {rx, ry, rw, ay - ry},                    // top
-		    {rx, ay + ah, rw, (ry + rh) - (ay + ah)}, // bottom
-		    {rx, ay, ax - rx, ah},                    // left
-		    {ax + aw, ay, (rx + rw) - (ax + aw), ah}, // right
+		    {rx, ry, rw, (ay - ry) + t},                    // top
+		    {rx, ay + ah - b, rw, (ry + rh) - (ay + ah) + b}, // bottom
+		    {rx, ay, (ax - rx) + l, ah},                    // left
+		    {ax + aw - r, ay, (rx + rw) - (ax + aw) + r, ah}, // right
 		};
 		for (int k = 0; k < 4; k++) {
 			const float *s = bar[k];
-			if (s[2] < 0.5f || s[3] < 0.5f) {
-				continue;
+			if ((k < 2 && (k == 0 ? t : b) == 0.0f) || (k >= 2 && (k == 2 ? l : r) == 0.0f) || s[2] < 0.5f ||
+			    s[3] < 0.5f) {
+				continue; // no bar on this edge
 			}
 			for (int eye = 0; eye < 2; eye++) {
 				blit_to_atlas_texture(sys, &c->render, in_srv, s[0], s[1], s[2], s[3], (float)in_w, (float)in_h,
@@ -23959,12 +23974,6 @@ lift_weave_rect_batch(struct d3d11_service_system *sys,
 				                      /*blend*/ nullptr, rtv, atw, ath);
 			}
 		}
-		blit_to_atlas_texture(sys, &c->render, pin.srv, vw * (float)vl, 0.0f, vw, (float)pin.height,
-		                      (float)pin.width, (float)pin.height, ax, ay, aw, ah, /*is_srgb*/ false,
-		                      /*blend*/ nullptr, rtv, atw, ath);
-		blit_to_atlas_texture(sys, &c->render, pin.srv, vw * (float)vr, 0.0f, vw, (float)pin.height,
-		                      (float)pin.width, (float)pin.height, (float)win_w + ax, ay, aw, ah,
-		                      /*is_srgb*/ false, /*blend*/ nullptr, rtv, atw, ath);
 		d3d11_lift_unpin(&pin);
 	} else {
 		// No result yet: weave it FLAT — the same 2D frame in both views.
