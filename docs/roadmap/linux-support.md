@@ -16,7 +16,9 @@ the user-level tarball from `scripts/package_linux.sh` (#705/#713); the `.deb` i
 built with `libwayland-dev` + `libdbus-1-dev` like every other Linux artifact, so
 it carries the Wayland present path and the #817 window-geometry provider (only
 `libdbus-1-3` lands in its derived `Depends` — no `wl_*` symbol is referenced, so
-`--as-needed` drops `-lwayland-client`).
+`--as-needed` drops `-lwayland-client`). Since **#1744** both artifacts ship the
+**hybrid** runtime plus `displayxr-service`, socket-activated per user by a
+systemd user unit — see [Phase 4b](#phase-4b--the-service-in-the-installed-artifacts-1744).
 
 **Supported releases and what CI actually gates:** see [Supported
 releases](#supported-releases) below.
@@ -456,8 +458,11 @@ sim-display weaves anaglyph/SBS to a normal monitor. One command:
 
 It builds the runtime (`build_linux.sh --apps`), wires `XR_RUNTIME_JSON` +
 `XRT_PLUGIN_SEARCH_PATH` at that build, and delegates to the target's own run
-script. Service/IPC (Phase 2b): `./scripts/build_linux.sh --service`, start
-`displayxr-service`, run a client with `XRT_FORCE_MODE=ipc`.
+script. Service/IPC (Phase 2b): `./scripts/build_linux.sh --service` (IPC-only
+runtime: every app goes through the service), start `displayxr-service`, run a
+client with `XRT_FORCE_MODE=ipc`. `./scripts/build_linux.sh --hybrid` is the
+shipped configuration (#1744): ordinary apps in-process, present-owners and
+workspace controllers over IPC, no env var needed.
 
 ### Phase 4 — Packaging / installer (#705 — tarball MVP SHIPPED)
 
@@ -469,14 +474,72 @@ install: runtime tree → `$XDG_DATA_HOME/displayxr`, OpenXR `ActiveRuntime` →
 `$XDG_CONFIG_HOME/openxr/1/active_runtime.json`, plug-in + manifest →
 `$XDG_DATA_HOME/DisplayXR/DisplayProcessors/` (the shared discovery root — a
 vendor plug-in installer drops its own `.so` + manifest alongside, lower
-probe-order wins), and a systemd `--user` unit for `displayxr-service`
-(gracefully skipped without a user bus). `sudo ./install.sh --system` targets
-`/usr/local` + `/etc/xdg/openxr/1/` (no unit, v1). CI's `Package` job
+probe-order wins), and the socket-activated systemd user units for
+`displayxr-service` (#1744; gracefully skipped without a user manager).
+`sudo ./install.sh --system` targets `/usr/local` + `/etc/xdg/openxr/1/`, with
+the units under `/usr/local/lib/systemd/user/` enabled via `systemctl --global`. CI's `Package` job
 (`build-linux.yml`) builds in the **22.04 container** (the oldest supported
 release — #1656; the newest-toolchain coverage it used to give moved to the
 `Newest` job's 26.04 container), installs from the tarball, and gates on
 `displayxr-cli selftest` resolving everything from the installed XDG paths only.
 Remaining staged scope (#705): `.deb` → demo AppImages.
+
+### Phase 4b — the service in the installed artifacts (#1744)
+
+Until #1744 the `.deb` shipped the **in-process-only** runtime and no
+`displayxr-service`, so on an installed box every `XR_DXR_weave` call returned
+`XR_ERROR_FEATURE_UNSUPPORTED — the weave service is only available on the
+out-of-process (service) path`: the DisplayXR browser (a present-owner) could
+not weave, while the same tag built with `--service` worked on the panel. The
+tarball had the opposite problem — an IPC-only runtime from a plain `--service`
+build, and a `displayxr.service` unit that could never start (below).
+
+- **Hybrid runtime** (`build_linux.sh --hybrid` → `XRT_FEATURE_HYBRID_MODE`,
+  now allowed on Linux): one `openxr_displayxr.so` with the in-process native
+  Vulkan compositor *and* the IPC client, choosing per process at
+  `xrCreateInstance` (`targets/openxr/target.c`). Ordinary apps stay
+  in-process — the rules are Windows/macOS's (`XRT_FORCE_MODE`,
+  `DISPLAYXR_WORKSPACE_SESSION`, workspace controllers → IPC). New on desktop
+  Linux, mirroring Android: a session that enables `XR_DXR_weave` goes to the
+  service **when its socket exists**, with no env var; when it does not (a
+  from-source runtime, a container, the unit disabled) it falls back to
+  in-process, i.e. the old behaviour, instead of failing `xrCreateInstance`. A
+  service that *answers* and refuses (version skew, client quota) is propagated.
+  Both packagers refuse a runtime that lacks the router.
+- **Start mechanism: systemd user socket activation.**
+  `/usr/lib/systemd/user/displayxr.socket` listens on `%t/displayxr_comp_ipc`
+  (= `$XDG_RUNTIME_DIR/displayxr_comp_ipc`, where clients dial) and is enabled
+  for every user by `postinst` (`systemctl --global enable`, then started in the
+  user managers already running, so no re-login is needed). The first client
+  that dials it starts `displayxr.service`; it runs with `IPC_EXIT_WHEN_IDLE=1`
+  (30 s grace) and exits once its last client leaves. Chosen over an always-on
+  user service or an XDG autostart entry because the service owns a Vulkan
+  device and the display processor (a vendor plug-in may run an eye tracker):
+  with the socket, a user who never runs a present-owner never starts it, and
+  one who does gets it without a login-time cost. `prerm` stops and disables it
+  on remove — not on upgrade, where a live service keeps serving its clients
+  and the next connect after its idle exit starts the new binary.
+- **Service fixes that make it startable detached.** The Linux mainloop now
+  reads the socket-activation hand-off itself (`LISTEN_PID`/`LISTEN_FDS`, the
+  whole `sd_listen_fds(3)` protocol) — `ipc_server` no longer links libsystemd,
+  which only some build hosts had and which is not on the `.deb`'s
+  `STABLE_SONAMES`. A stdin that cannot be polled (`/dev/null` → `EPERM`,
+  closed → `EBADF`) is no longer fatal: it used to kill the service with
+  `epoll_ctl(stdin) failed` under systemd, autostart or `nohup`, which is why
+  it only ran as `sleep infinity | displayxr-service` — and why the tarball's
+  old unit could never start. SIGTERM/SIGINT now stop it cleanly (a self-pipe in
+  the epoll set) so a bound socket is unlinked, and a socket left by a service
+  that died anyway is detected with a connect probe and replaced instead of
+  blocking every later start.
+- **CI.** `DebInstall` asserts the service + units are installed and runs
+  `scripts/smoke_service_linux.sh` on all three releases: detached start with
+  stdin `</dev/null`, an IPC handshake (`displayxr-cli clients`), clean SIGTERM,
+  stale-socket recovery, and socket activation (the `sd_listen_fds` hand-off,
+  emulated with `perl-base` since the containers have no systemd) + idle exit.
+  The `Package` job runs the same smoke on the installed tarball. Neither needs
+  a GPU: the service starts without a Vulkan ICD. The pixel path
+  (`weave_probe_vk_linux --dmabuf` against the packaged tree) needs a GPU and
+  is a dev-box check, not CI.
 
 **One artifact for 22.04 / 24.04 / 26.04 (#1656).** A binary's glibc floor is
 its build host's, so both release artifacts are built in the **oldest**
