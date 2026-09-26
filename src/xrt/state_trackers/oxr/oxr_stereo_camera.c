@@ -48,14 +48,16 @@
 
 #ifdef OXR_HAVE_DXR_stereo_camera
 
-// The wire carries the xrt encodings; they equal the XR ones.
-_Static_assert(XR_STEREO_CAMERA_SHARED_WITH_EYE_TRACKING_BIT_DXR == XRT_PLUGIN_STEREO_CAMERA_SHARED_WITH_EYE_TRACKING,
-               "flag mismatch");
-_Static_assert(XR_STEREO_CAMERA_USER_FACING_BIT_DXR == XRT_PLUGIN_STEREO_CAMERA_USER_FACING, "flag mismatch");
-_Static_assert(XR_STEREO_CAMERA_CALIBRATED_BIT_DXR == XRT_PLUGIN_STEREO_CAMERA_CALIBRATED, "flag mismatch");
-_Static_assert(XR_STEREO_CAMERA_NATIVELY_RECTIFIED_BIT_DXR == XRT_PLUGIN_STEREO_CAMERA_NATIVELY_RECTIFIED,
-               "flag mismatch");
-_Static_assert(XR_STEREO_CAMERA_MONOCHROME_BIT_DXR == XRT_PLUGIN_STEREO_CAMERA_MONOCHROME, "flag mismatch");
+// The wire carries the xrt encodings; they equal the XR ones. The XR flag bits
+// are `static const XrFlags64` — not constant expressions in C (MSVC and GCC
+// reject them in _Static_assert; clang only accepts them as an extension) — so
+// the flag / format-bit mirrors are pinned against the header's literal values
+// here and cross-checked against the real constants in verify_encodings().
+_Static_assert(XRT_PLUGIN_STEREO_CAMERA_SHARED_WITH_EYE_TRACKING == 0x1, "flag mirror");
+_Static_assert(XRT_PLUGIN_STEREO_CAMERA_USER_FACING == 0x2, "flag mirror");
+_Static_assert(XRT_PLUGIN_STEREO_CAMERA_CALIBRATED == 0x4, "flag mirror");
+_Static_assert(XRT_PLUGIN_STEREO_CAMERA_NATIVELY_RECTIFIED == 0x8, "flag mirror");
+_Static_assert(XRT_PLUGIN_STEREO_CAMERA_MONOCHROME == 0x10, "flag mirror");
 _Static_assert((int)XR_STEREO_CAMERA_STATE_AVAILABLE_DXR == (int)XRT_STEREO_CAMERA_STATE_AVAILABLE, "state");
 _Static_assert((int)XR_STEREO_CAMERA_STATE_WAITING_DXR == (int)XRT_STEREO_CAMERA_STATE_WAITING, "state");
 _Static_assert((int)XR_STEREO_CAMERA_STATE_SUSPENDED_DXR == (int)XRT_STEREO_CAMERA_STATE_SUSPENDED, "state");
@@ -65,11 +67,6 @@ _Static_assert((int)XR_STEREO_CAMERA_OUTPUT_RAW_DXR == (int)XRT_STEREO_CAMERA_OU
 _Static_assert((int)XR_STEREO_CAMERA_FORMAT_GRAY8_DXR == (int)XRT_STEREO_CAMERA_FORMAT_GRAY8, "format");
 _Static_assert((int)XR_STEREO_CAMERA_FORMAT_NV12_DXR == (int)XRT_STEREO_CAMERA_FORMAT_NV12, "format");
 _Static_assert((int)XR_STEREO_CAMERA_FORMAT_BGRA8_DXR == (int)XRT_STEREO_CAMERA_FORMAT_BGRA8, "format");
-_Static_assert(XR_STEREO_CAMERA_FORMAT_NV12_BIT_DXR == XRT_STEREO_CAMERA_BIT(XRT_STEREO_CAMERA_FORMAT_NV12),
-               "format bit");
-_Static_assert(XR_STEREO_CAMERA_TRANSPORT_SHARED_MEMORY_BIT_DXR ==
-                   XRT_STEREO_CAMERA_BIT(XRT_STEREO_CAMERA_TRANSPORT_SHARED_MEMORY),
-               "transport bit");
 _Static_assert((int)XR_STEREO_CAMERA_TRANSPORT_SHARED_MEMORY_DXR == (int)XRT_STEREO_CAMERA_TRANSPORT_SHARED_MEMORY,
                "transport");
 _Static_assert(XR_STEREO_CAMERA_RING_SLOTS_DXR == XRT_STEREO_CAMERA_RING_SLOTS, "ring slots");
@@ -82,6 +79,22 @@ _Static_assert(XR_STEREO_CAMERA_DISPLAY_NAME_MAX_SIZE_DXR ==
 _Static_assert(XR_STEREO_CAMERA_PLATFORM_HINT_MAX_SIZE_DXR ==
                    sizeof(((struct xrt_stereo_camera_properties *)0)->platform_device_hint),
                "hint size");
+
+//! Runtime half of the encoding check (see the _Static_assert block above).
+static bool
+verify_encodings(void)
+{
+	return XR_STEREO_CAMERA_SHARED_WITH_EYE_TRACKING_BIT_DXR == XRT_PLUGIN_STEREO_CAMERA_SHARED_WITH_EYE_TRACKING &&
+	       XR_STEREO_CAMERA_USER_FACING_BIT_DXR == XRT_PLUGIN_STEREO_CAMERA_USER_FACING &&
+	       XR_STEREO_CAMERA_CALIBRATED_BIT_DXR == XRT_PLUGIN_STEREO_CAMERA_CALIBRATED &&
+	       XR_STEREO_CAMERA_NATIVELY_RECTIFIED_BIT_DXR == XRT_PLUGIN_STEREO_CAMERA_NATIVELY_RECTIFIED &&
+	       XR_STEREO_CAMERA_MONOCHROME_BIT_DXR == XRT_PLUGIN_STEREO_CAMERA_MONOCHROME &&
+	       XR_STEREO_CAMERA_FORMAT_GRAY8_BIT_DXR == XRT_STEREO_CAMERA_BIT(XRT_STEREO_CAMERA_FORMAT_GRAY8) &&
+	       XR_STEREO_CAMERA_FORMAT_NV12_BIT_DXR == XRT_STEREO_CAMERA_BIT(XRT_STEREO_CAMERA_FORMAT_NV12) &&
+	       XR_STEREO_CAMERA_FORMAT_BGRA8_BIT_DXR == XRT_STEREO_CAMERA_BIT(XRT_STEREO_CAMERA_FORMAT_BGRA8) &&
+	       XR_STEREO_CAMERA_TRANSPORT_SHARED_MEMORY_BIT_DXR ==
+	           XRT_STEREO_CAMERA_BIT(XRT_STEREO_CAMERA_TRANSPORT_SHARED_MEMORY);
+}
 
 static struct xrt_stereo_camera_client *
 client_of(struct oxr_instance *inst)
@@ -149,6 +162,9 @@ oxr_xrEnumerateStereoCamerasDXR(XrInstance instance,
 	struct xrt_stereo_camera_client *c = client_of(inst);
 	if (c == NULL) {
 		return XR_SUCCESS; // in-process instance: zero cameras, on purpose
+	}
+	if (!verify_encodings()) {
+		return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE, "XR_DXR_stereo_camera encoding mismatch (build bug)");
 	}
 	uint32_t n = 0;
 	xrt_result_t xret = c->count(c, &n);
