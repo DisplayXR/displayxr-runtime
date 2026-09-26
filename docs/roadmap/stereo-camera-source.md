@@ -1,6 +1,7 @@
 # Stereo camera source — browser integration, vendor plug-in notes, phased plan
 
-**Status:** design (2026-09-25). Decision: [ADR-043](../adr/ADR-043-stereo-camera-source.md).
+**Status:** design (2026-09-25); **R1 implemented** on `feat/stereo-camera-r1` (2026-09-26) —
+see §E; maintainer decisions for R1 in §G. Decision: [ADR-043](../adr/ADR-043-stereo-camera-source.md).
 Extension: [`XR_DXR_stereo_camera`](../specs/extensions/XR_DXR_stereo_camera.md). Consumer
 driving it: the web SDK's 3D call module (`@displayxr/inline3d/call`, RFC 0002 on
 `displayxr-web` branch `feat/call-p1`, §4 *Capture*).
@@ -94,32 +95,82 @@ process across milestones):
 
 ## C. Android
 
-### C.1 Runtime + plug-in
+### C.0 Field facts (NP02J / K68 tablet, measured 2026-09-26)
 
-On the tablets the front stereo pair (15 mm and 25 mm baselines on the two current models,
-parallel) belongs to the vendor's head-tracking service; the plug-in (`drv_leia_android`) talks
-to it through the vendor camera SDK (CNSDK), which today gives it **face/eye data, not images**.
+**Camera topology.** Camera2 reports six ids on the tablet: 0 and 2 are back lenses, 1 and 3 front
+lenses, and **4 = back and 5 = front are LOGICAL multi-cameras — the stereo pairs**. The logical
+ids are hidden from `getCameraIdList()` and are opened by hard-coded id. Physical lens per eye:
+front L = 3, R = 1; back L = 2, R = 0.
 
-- **If CNSDK can share frames** (an AHardwareBuffer or buffer stream of the pair the tracker
-  already captures, with the pair's calibration): the Android plug-in implements the same slots;
-  the runtime service's camera thread, rings (memfd), consent (CAMERA permission of the peer uid +
-  runtime-app consent) and visibility rule (`android_package_is_visible`) are the platform-neutral
-  code of spec §5–7. This is the target, and the **first open question to the vendor**.
-- **If it cannot yet — documented platform difference:** Android enumerates no runtime stereo
-  camera. We do **not** have the plug-in or the browser open the front cameras through Camera2
-  while tracking runs: Camera2 evicts the lower-priority client, which is the tracker, and the
-  weave would lose viewer tracking for the whole call. Pages see the tablet's ordinary cameras via
-  `getUserMedia`; the call module sends mono (lifted on the receiver).
-- Frames on this path are likely **colour and larger** (per-eye 1280×720 class), which is where
-  the optional `AHARDWAREBUFFER` transport earns its keep.
+**The browser cannot reach them** (DisplayXR/displayxr-browser-pvt#175): `enumerateDevices()`
+lists no video inputs, `getUserMedia` only opens the front single camera, and
+`facingMode: 'environment'` fails with `NotFoundError`.
+
+**How the vendor's own app gets stereo — and what CNSDK is, and is not.** The vendor app uses
+`LeiaCameraBuilder(ctx).setStereoMode(true).setFront(b).setConvergenceMode(AUTO)
+.setPreviewSurfaceView(surfaceTexture)` and receives a ready SBS image (2560×720) in a
+`SurfaceTexture`. **`LeiaCameraBuilder` is not part of CNSDK:** it is a separate, private camera
+wrapper over plain Camera2. It opens the one logical camera (5 front / 4 back) with an output per
+physical lens, and its own shader does the SBS pack and the rectification. **CNSDK supplies only
+the calibration** (per-camera rotations Rx/Ry/Rz from its display-config service, config v4.0;
+the `/sdcard/rect.js` file the vendor app also reads is absent on the unit) **and in-app face
+tracking.**
+
+**What the pair delivers.** Two separate 1280×720 NV12/YUV streams, one per lens, at exactly
+30.00 fps, hardware-synchronised (identical timestamps per pair), about 97–100 ms from exposure to
+the app. The frames arrive **raw**: not side-by-side, not rectified, not mirrored. For viewer
+left/right the front eyes need mirroring. The residual vertical misalignment is about −2 px
+(median), and the roll about 0.09°.
+
+**Exclusivity — the constraint that decides the design.** Opening the front pair (camera 5)
+**evicts the head-tracking service's camera** (it held camera 3 at 10 fps). The tracker then stays
+wedged ("Camera has been invalidated") and never reacquires it. The rear pair does not conflict.
+The vendor's answer is **in-app tracking**: the capturing process feeds a third stream (640×480,
+left lens) to CNSDK in-app mode. CNSDK's frame hand-off runs face detection **on the caller's
+thread** (~119 ms). Called on the camera thread, that dragged the pair to 24 fps, so it must run
+on a worker behind a latest-frame slot.
+
+**Windows, same week:** on two SR machines the eye tracker holds the stereo camera exclusively
+(`getUserMedia` → `NotReadableError`). The design (plug-in source, service owner) follows from
+that on both platforms.
+
+### C.1 Runtime + plug-in — design consequence
+
+On Android the provider lives **inside the runtime APK** (the vendor plug-in ships there, ADR-038).
+It is not Chromium, and it is not a separate app. Because the front pair and the tracker cannot
+coexist as two Camera2 clients:
+
+- **The runtime service is the ONE owner of the front pair, and it runs tracking in-process from
+  that same capture.** Three outputs of the logical camera: the two 1280×720 NV12 eye streams, and a
+  640×480 left-lens stream that goes to CNSDK in-app tracking on a **worker thread behind a
+  latest-frame slot**, never on the camera thread. The runtime's eye tracking on the tablet then
+  comes from this capture, and camera streams to clients are passengers on it (the Windows model,
+  reversed: there the tracker owns the device and the plug-in reads its frames).
+- **Nothing else may open the pair behind the tracker's back**: not a page, not another plug-in, not
+  an app through Camera2. Doing so evicts the capture that tracking depends on, and the display
+  loses viewer tracking for the whole call.
+- **Transport:** AHardwareBuffer per eye (NV12). A 2×1280×720 pair at 30 Hz is ≈ 83 MB/s through a
+  CPU ring, so this is where the optional `AHARDWAREBUFFER` transport (spec §5.3) becomes the
+  default. Rectification runs in the runtime (R2's `u_stereo_rectify`, fed with the CNSDK
+  rotations) or in the consumer from the calibration.
+- **Contract gaps this exposes (A1):** the R1 plug-in frame is ONE side-by-side image in CPU
+  memory. The tablet produces two per-lens hardware buffers that need mirroring. A1 either packs
+  them in the plug-in (a GPU blit into one SBS AHB, un-mirroring on the way), or appends a
+  per-eye layout to `xrt_plugin_stereo_camera_frame` (ADR-020 append-only: a layout field + per-eye
+  AHB handles). The second is preferred. The calibration slot stays as is: CNSDK's per-camera
+  rotations become `R`, and the baseline comes from the display config.
+- Consent: CAMERA permission of the peer uid + the runtime app's consent, and
+  `android_package_is_visible` for the foreground rule (spec §7), are the platform-neutral code R3
+  adds.
 
 ### C.2 Browser
 
-The browser's Android arm is in the patch series (runtime fd brokered by the browser-process Java
-via `DXR_IPC_FD`, patches 0083+). The camera lands on top of it the same way as Windows: a
-DisplayXR device factory composed in front of `VideoCaptureDeviceFactoryAndroid`, fed over the
-existing runtime connection, NV12 from the shared-memory ring. Chromium's own Android camera
-permission request covers the uid check the runtime makes.
+The browser's Android arm is in the patch series (the runtime fd is brokered by the
+browser-process Java via `DXR_IPC_FD`, patches 0083+). The camera lands on top of it the same way
+as Windows: a DisplayXR device factory composed in front of `VideoCaptureDeviceFactoryAndroid`, fed
+over the existing runtime connection (AHB transport). Chromium's own Android camera permission
+request covers the uid check the runtime makes. It fixes browser-pvt#175 for the stereo pair
+without the browser ever opening camera 5.
 
 ## D. Leia SR plug-in (Windows) — sourcing notes
 
@@ -142,16 +193,42 @@ The implementation belongs in `displayxr-leia-plugin` (`src/drv_leia/`), per ADR
 | Phase | Repo | Scope | Exit criterion |
 |---|---|---|---|
 | **R0** | runtime | This design: ADR-043, spec, this page | Maintainer sign-off on the open questions below |
-| **R1** | runtime | Header `XR_DXR_stereo_camera.h` + `index.json` note (together — the catalog lint requires both); `xrt_plugin_iface` slots + `XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA` (appended after `create_dp_d3d11_lift`, so **lands after ADR-042's PR**); platform-neutral camera manager (thread, refcount + linger, 3-slot pinned ring, per-stream wake handles, decimation, NV12/BGRA conversion); IPC + OpenXR entry points; sim_display fake; `displayxr-cli camera list/calib/probe`; selftest check | `camera probe` on the sim fake writes frames on Windows + Linux CI; ring/pinning unit tests (mirror `tests_lift_mailbox`) |
+| **R1** ✅ | runtime | **Implemented 2026-09-26 (see "R1 as built" below).** Header `XR_DXR_stereo_camera.h` + `index.json` note (together — the catalog lint requires both); `xrt_plugin_iface` slots + `XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA` (appended after `create_dp_d3d11_lift`, so **lands after ADR-042's PR**); platform-neutral camera manager (thread, refcount + linger, 3-slot pinned ring, per-stream wake handles, decimation, NV12/BGRA conversion); IPC + OpenXR entry points; sim_display fake; `displayxr-cli camera list/calib/probe`; selftest check | `camera probe` on the sim fake writes frames on Windows + Linux CI; ring/pinning unit tests (mirror `tests_lift_mailbox`) |
 | **R2** | runtime | `u_stereo_rectify` (Bouguet, valid-region crop, LUT remap) with golden tests against OpenCV-generated fixtures; RECTIFIED output | sim fake: row error < 0.5 px, disparity = f·B/Z within 0.5 px |
 | **R3** | runtime | Privacy: OS consent check, consent store + tray prompt, delegating-client registration, visibility/lock suspension, indicator, kill switches | Manual matrix: allow/deny/revoke, OS switch off, lock screen, background app — each blocks frames |
 | **L1** | leia-plugin (Windows) | Slots over the SR raw-camera channel per §D; calibration by active serial; keep-alive; repin runtime (feature-macro repin, `downstream-pins.json` `features` track) | On a panel box, incl. the multi-folder box: `camera probe --rectified` rows aligned; the vendor call app running at the same time still gets every frame; tracking/weave unaffected (frame-time + tracking-state logs) |
 | **B1** | browser (Windows) | §B device factory + duplicate hiding + hint + delegating registration in the installer; web SDK: prefer the hint in `camera:'auto'`, fill `hello` from it | RFC 0002 P1 call between two panel laptops sends rectified SBS from the tracker camera **while both are tracking** |
-| **A1** | leia-plugin (Android) + runtime | Only if CNSDK shares frames (§C.1): Android slots, memfd/AHB transport, Android consent + visibility | `camera probe` on the tablet via the runtime app |
+| **A1** | leia-plugin (Android) + runtime | §C.1: the runtime owns the front pair and runs CNSDK in-app tracking from the same capture (worker thread, latest-frame slot); per-eye AHB transport + per-eye frame layout; Android consent + visibility | `camera probe` on the tablet via the runtime app **while the weave tracks from the same capture**; pair at 30.00 fps (not 24) |
 | **B2** | browser (Android) | §C.2 | Tablet ↔ laptop 3D call, both directions stereo |
 
 R1–R3 need no hardware; L1 and B1 can proceed in parallel once R1's header exists (B1 develops
 against the sim fake).
+
+### R1 as built
+
+- **Header + catalog:** `openxr/XR_DXR_stereo_camera.h`, type values `1004999290–300` (the registry
+  holds a reserved row for lift's `270–289`); `index.json` note in the `capture` group.
+- **Plug-in slots:** six `stereo_camera_*` slots + `XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA`, after a
+  one-pointer placeholder for lift's `create_dp_d3d11_lift`. **Merge order: after the lift PR**
+  (`feat/lift-ext`); the rebase replaces the placeholder with lift's field in place. The offsets are
+  identical either way, and `tests_stereo_camera` asserts the adjacency.
+- **Service:** `ipc/server/ipc_server_stereo_camera.c`. It is platform-neutral (Windows D3D11
+  service, macOS/Linux service, Android service). One thread per open camera, open on the first
+  start, 2 s linger, per-stream 3-slot rings in shared memory, conversion + decimation, and a
+  per-stream wake (Windows: an auto-reset event, handed out SYNCHRONIZE-only; POSIX: a pipe).
+  Windows hands the section out read-only (`FILE_MAP_READ` duplicate).
+- **IPC:** 12 `stereo_camera_*` calls in `proto.json`. Streams are owned by the connection.
+- **OpenXR:** nine entry points. An in-process instance enumerates zero.
+- **sim_display fake:** `SIM_DISPLAY_FAKE_STEREO_CAMERA=1` (spec §10).
+- **CLI:** `displayxr-cli camera list | calib | probe`; `selftest` gains `stereo_camera_caps`.
+- **Privacy hooks (deny by default):** `DXR_STEREO_CAMERA_DEV_ALLOW=1` in the service environment
+  is the only way to start a stream or read calibration in R1. `DXR_STEREO_CAMERA=0` is the kill
+  switch. RAW is refused to `PRESENT_OWNER` (the browser).
+- **Deferred beyond R1:** state-change events (structs defined, not delivered — they need a
+  server→client instance-event channel), the GPU transports (designed in the manager's file
+  comment: D3D11 texture ring + fence as the `XR_DXR_weave` output export; AHB / dma-buf ring +
+  sync_file as the #1699 weave path), a read-only POSIX section, and a distorted/misaligned fake
+  (all with R2/R3/A1).
 
 ## F. Risks
 
@@ -170,10 +247,38 @@ against the sim fake).
   hunk, and the device + factory are new files, to keep rebase conflicts small.
 - **Latency/sync.** Arrival timestamps hide tracker-internal latency; A/V sync relies on WebRTC's
   own jitter handling. Fine for calls, not for measurement.
-- **ABI merge order.** The iface slots append after ADR-042's `create_dp_d3d11_lift`; merging out
-  of order would put two branches on the same offset.
+- **ABI merge order.** The iface slots append after ADR-042's `create_dp_d3d11_lift`. R1 holds
+  lift's offset with a same-size placeholder, so an out-of-order merge still yields the right
+  offsets, but the intended order is lift first and the camera PR rebased onto it.
+- **Android: the pair and the tracker cannot share Camera2.** Opening the front logical camera
+  evicts the vendor tracker, which then never reacquires (§C.0). The mitigation is architectural:
+  the runtime owns both, and tracking runs in-process from the same capture (§C.1). It adds
+  CNSDK's in-app face detection (~119 ms per hand-off) to the runtime's CPU budget on a worker.
+  **Vendor asks (CNSDK / head-tracking service):** (1) the head-tracking service must reacquire its
+  camera when another client releases it; today it stays wedged ("Camera has been invalidated")
+  until reboot. (2) Can the tracker run from the pair's own frames (the 1280×720 eye streams, or a
+  downscaled copy), so that no third stream is needed? (3) Expose the pair's calibration through a
+  documented CNSDK call, rather than the display-config service plus an absent `/sdcard/rect.js`.
 
-## G. Open questions for the maintainer
+## G. Open questions & maintainer decisions
+
+**Decided for R1 (maintainer defaults, 2026-09-26):**
+
+- **Q1 → stereo-only for now.** Names and struct shapes stay open for other camera kinds
+  (`XrStereoCameraPropertiesDXR::viewCount`, always 2 in v1, and next chains).
+- **Q2 → plug-in iface slots** behind `XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA` (ADR-020 append-only).
+  A separate camera-provider plug-in type waits for a camera vendor that is not a display vendor.
+- **Q3 → service clients only.** In-process instances enumerate zero; there is no side IPC
+  connection.
+- **Q9 → raw frames are not exposed to pages in R1.** Pages get RECTIFIED, or a RAW frame that
+  says so (`frame.output`) until R2's rectifier lands. The service refuses a RAW stream to
+  `PRESENT_OWNER` clients (the browser).
+- **Q6 is answered by the field facts (§C.0):** CNSDK has no frames to share. The pair is plain
+  Camera2 and the vendor's camera wrapper is a separate library, so on Android the runtime owns
+  the pair and runs tracking from it (§C.1). The remaining CNSDK asks are in §F.
+- Q4, Q5, Q7 and Q8 remain open (consent UX ownership, SR SDK asks, browser topology, hint shape).
+
+**Original questions:**
 
 1. **Name and scope.** `XR_DXR_stereo_camera` (stereo only, SBS output) — or a broader
    `XR_DXR_camera_source` that also carries mono tracker cameras? The design is stereo-only; a
