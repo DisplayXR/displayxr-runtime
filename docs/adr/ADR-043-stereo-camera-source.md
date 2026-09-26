@@ -2,7 +2,7 @@
 
 **Status:** Proposed (2026-09-25) · **R1 implemented** 2026-09-26 (runtime, hardware-free; maintainer
 defaults recorded in the roadmap §G: stereo-only, iface slots, service clients only, no raw frames
-to pages) · introduces
+to pages) · **R2 implemented** 2026-09-26 (the service-side rectifier, decision 2 below) · introduces
 [`XR_DXR_stereo_camera`](../specs/extensions/XR_DXR_stereo_camera.md) · appends optional
 camera slots to `xrt_plugin_iface` under the [ADR-020](ADR-020-plugin-abi-compatibility-policy.md)
 append-at-end rule · related: [ADR-019](ADR-019-vendor-plugin-aux-boundary.md),
