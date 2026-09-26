@@ -71,7 +71,67 @@ or_q(const char *s)
 	return (s != NULL && s[0] != '\0') ? s : "?";
 }
 
+/*!
+ * ADR-043 `stereo_camera_caps`: enumerate the plug-in's stereo cameras straight
+ * through the iface (this is the in-process no-comp instance — the service's
+ * camera manager is not involved) and validate each description.
+ */
+static void
+probe_stereo_camera(struct cli_query_result *r, const struct xrt_plugin_iface *iface)
+{
+	r->stereo_camera_count = 0;
+	r->stereo_camera_malformed = false;
+	if (!xrt_plugin_iface_has_stereo_camera(iface)) {
+		snprintf(r->stereo_camera_note, sizeof(r->stereo_camera_note), "plug-in has no stereo camera slots (OK)");
+		return;
+	}
+	struct xrt_plugin_instance *inst = target_plugin_get_active_instance();
+	struct xrt_plugin_stereo_camera_info infos[4];
+	memset(infos, 0, sizeof(infos));
+	for (int i = 0; i < 4; i++) {
+		infos[i].struct_size = (uint32_t)sizeof(infos[i]);
+	}
+	uint32_t n = iface->stereo_camera_enumerate(inst, 4, infos);
+	r->stereo_camera_count = n;
+	if (n == 0) {
+		snprintf(r->stereo_camera_note, sizeof(r->stereo_camera_note), "0 cameras (OK)");
+		return;
+	}
+	for (uint32_t i = 0; i < n && i < 4; i++) {
+		const struct xrt_plugin_stereo_camera_info *c = &infos[i];
+		const char *why = NULL;
+		if (c->eye_width == 0 || c->eye_height == 0 || (c->eye_width & 1u) || (c->eye_height & 1u)) {
+			why = "zero or odd eye extent";
+		} else if (c->native_format < 1 || c->native_format > 3) {
+			why = "unknown native format";
+		} else if (!(c->max_frame_rate > 0.0f)) {
+			why = "max_frame_rate <= 0";
+		} else if (c->flags & XRT_PLUGIN_STEREO_CAMERA_CALIBRATED) {
+			struct xrt_plugin_stereo_camera_calibration k;
+			memset(&k, 0, sizeof(k));
+			k.struct_size = (uint32_t)sizeof(k);
+			const double *t = k.translation_right_from_left_mm;
+			if (iface->stereo_camera_get_calibration(inst, i, &k) != XRT_SUCCESS) {
+				why = "CALIBRATED but get_calibration failed";
+			} else if (!(k.k[0][0] > 0.0) || !(k.k[1][0] > 0.0) ||
+			           !(t[0] * t[0] + t[1] * t[1] + t[2] * t[2] > 0.0)) {
+				why = "CALIBRATED with a non-positive focal length or zero baseline";
+			}
+		}
+		if (why != NULL) {
+			r->stereo_camera_malformed = true;
+			snprintf(r->stereo_camera_note, sizeof(r->stereo_camera_note), "camera %u \"%.60s\": %s", i,
+			         c->display_name, why);
+			return;
+		}
+	}
+	snprintf(r->stereo_camera_note, sizeof(r->stereo_camera_note), "%u camera(s); [0] \"%.60s\" %ux%u/eye @ %.1f Hz, flags 0x%x",
+	         n, infos[0].display_name, infos[0].eye_width, infos[0].eye_height, (double)infos[0].max_frame_rate,
+	         infos[0].flags);
+}
+
 #ifdef XRT_OS_WINDOWS
+
 /*!
  * #224 / ADR-027 P4 — headless zone-caps probe. Creates a D3D11 WARP device
  * (no GPU / display required), asks the active plug-in's D3D11 DP factory
@@ -1463,6 +1523,13 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 	snprintf(r->zone_probe_note, sizeof(r->zone_probe_note), "not probed: zone-caps probe is Windows-only (OK)");
 #endif
 
+	// ADR-043 — stereo camera slots. Absence never fails; only a camera the
+	// plug-in describes out of contract flips the verdict.
+	probe_stereo_camera(r, iface);
+	if (r->stereo_camera_malformed && r->result_code == CLI_SELFTEST_PASS) {
+		r->result_code = CLI_SELFTEST_BAD_STEREO_CAMERA;
+	}
+
 	// #1234 / #902 — can the Vulkan loader still reach the queue-lock layer?
 	// Pure reporting: never touches result_code. See the field comment in
 	// cli_query.h for why this must not be fatal.
@@ -2397,6 +2464,13 @@ build_checks(const struct cli_query_result *r, struct check *out)
 	// #224 / ADR-027 P4 — zone-caps probe. ABSENCE NEVER FAILS: ok stays
 	// true for legacy plug-ins / no factory / non-Windows; only a
 	// present-but-malformed caps struct fails (BAD_ZONE_CAPS).
+	// ADR-043 — stereo camera slots. ABSENCE NEVER FAILS.
+	c = &out[n++];
+	c->name = "stereo_camera_caps";
+	c->ok = !r->stereo_camera_malformed;
+	snprintf(c->detail, sizeof(c->detail), "%s",
+	         r->stereo_camera_note[0] != '\0' ? r->stereo_camera_note : "not evaluated");
+
 	c = &out[n++];
 	c->name = "zone_caps";
 	c->ok = !r->zone_caps_malformed;
