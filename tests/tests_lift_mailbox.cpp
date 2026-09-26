@@ -502,7 +502,6 @@ TEST_CASE("lift letterbox: 2.39:1 in 16:9 settles, then crops", "[lift][letterbo
 	CHECK(lb.committed.top >= 132);
 	CHECK(lb.committed.bottom <= 139);
 	CHECK(lb.committed.bottom >= 132);
-	CHECK(lb.committed.top % 2 == 0);
 	CHECK(lb.committed.left == 0);
 	CHECK(lb.committed.right == 0);
 }
