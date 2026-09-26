@@ -43,6 +43,7 @@ add_executable(
 	cli_cmd_test.c
 	cli_cmd_clients.c
 	cli_cmd_lift.cpp
+	cli_cmd_camera.c
 	cli_common.h
 	cli_main.c
 	)
@@ -95,5 +96,8 @@ target_include_directories(cli PRIVATE ${PROJECT_SOURCE_DIR}/src/external/stb)
 if(WIN32)
 	target_link_libraries(cli PRIVATE d3d11 dxgi)
 endif()
+# ADR-043: `displayxr-cli camera probe --out` writes PNGs (stb, header-only,
+# compiled static into cli_cmd_camera.c).
+target_include_directories(cli PRIVATE ${PROJECT_SOURCE_DIR}/src/external/stb)
 
 install(TARGETS cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

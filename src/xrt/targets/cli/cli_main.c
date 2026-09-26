@@ -51,6 +51,10 @@ cli_print_help(int argc, const char **argv)
 	P("  lift <...>        - 2D->3D conversion module (XR_DXR_lift, ADR-042), over IPC (DIAG).\n");
 	P("                      'lift caps [--json]', 'lift probe <image|frames_dir> [--mode depth|sbs|\n");
 	P("                      nview|gaussians] [--n N]' (Windows) — writes lift_out_<i>.png/.ply.\n");
+	P("  camera <...>      - Stereo camera sources (XR_DXR_stereo_camera, ADR-043), over IPC (DIAG).\n");
+	P("                      'camera list [--json]', 'camera calib <id> [--raw|--rectified]',\n");
+	P("                      'camera probe [<id>] [--raw] [--format gray8|nv12|bgra8] [--fps F]\n");
+	P("                      [--frames N] [--seconds S] [--out DIR]' — rate, layout, disparity, PNG.\n");
 	P("  test              - List found devices and role assignments, for prober testing.\n");
 	P("  probe             - Just probe and then exit.\n");
 
@@ -105,6 +109,9 @@ main(int argc, const char **argv)
 	}
 	if (strcmp(argv[1], "lift") == 0) {
 		return cli_cmd_lift(argc, argv);
+	}
+	if (strcmp(argv[1], "camera") == 0) {
+		return cli_cmd_camera(argc, argv);
 	}
 	return cli_print_help(argc, argv);
 }
