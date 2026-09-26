@@ -205,11 +205,23 @@ What the service does, inside the same `xrWeaveSubmitDXR`:
    rect anyway — so an uncapped snapshot buys little sharpness at a large conversion-rate cost.
    The module sees the capped size as the frame's input size (a `focalPx` hint is scaled with
    it). An app's own `xrSubmitLiftFrameDXR` frame is never capped: its size is the app's choice.
+
+   **Letterbox crop** (before the cap; service env `DXR_LIFT_LETTERBOX`, default on, `0` = off).
+   The service measures each rect's rows and columns (the fraction of non-black pixels per
+   bucket, a small GPU reduction read back asynchronously) and, once black bars have held for
+   ~45 frames, snapshots only the **active** area. A bar is the run from an edge below 25 %
+   non-black; a shorter bar is extended to match the opposite one when the extra rows are only
+   sparsely lit (< 60 %), so dense subtitles in a bar stay in the bar. Bars grow only after
+   settling and shrink at once when picture appears in them; frames without picture (a cut to
+   black) change nothing; a rect resize resets the crop. One WARN per stream per crop change.
+   Like the cap, never applied to an app's own `xrSubmitLiftFrameDXR` frame.
 2. **Weave the latest result at the CURRENT rect.** The stream's newest result (from an earlier
-   frame) is stretched into the rect's current position: the middle stereo pair into the SBS
-   scratch's left/right tiles (v3), or view *v* of the result into tile *v* (v6; equal view
-   counts map 1:1, otherwise proportionally). Then the ordinary single weave of the whole
-   window runs.
+   frame) is stretched into the rect's current position — into its **active** part when the
+   letterbox crop was in effect for that result; the bars (subtitles included) are then the 2D
+   frame, written identically into both views (v3), i.e. flat on the screen plane, or left as
+   the caller drew them (v6): the middle stereo pair into the SBS scratch's left/right tiles
+   (v3), or view *v* of the result into tile *v* (v6; equal view counts map 1:1, otherwise
+   proportionally). Then the ordinary single weave of the whole window runs.
 3. **Flat until the first result.** With no result yet, the rect is woven flat: the service
    writes the 2D frame into both views (v3), or leaves the caller's identical tiles as drawn (v6).
 

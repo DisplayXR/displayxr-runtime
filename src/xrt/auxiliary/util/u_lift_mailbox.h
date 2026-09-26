@@ -304,6 +304,92 @@ bool
 u_lift_cap_dims(uint32_t w, uint32_t h, uint32_t cap, uint32_t *out_w, uint32_t *out_h);
 
 
+/*
+ *
+ * Letterbox crop (service policy, ADR-042).
+ *
+ * A lift-flagged weave rect often holds a film with black bars (2.39:1 in a
+ * 16:9 player), sometimes with subtitles drawn in the bars. Converting the bars
+ * wastes module time, and the hard black edge confuses depth. The service
+ * measures, per row / column of the rect, the fraction of non-black pixels
+ * (GPU reduction, read back asynchronously), and this helper turns those
+ * profiles into a stable crop: the lifted input is the ACTIVE area only, and
+ * the bars (subtitles included) are woven flat, identical in both eyes.
+ *
+ * A bar is the run of rows (columns) from an edge whose non-black fraction
+ * stays below U_LIFT_LETTERBOX_PICTURE_FRAC — low enough that subtitle text in
+ * a bar does not end it, high enough that picture rows do. Bars GROW only after
+ * the same measurement has held for U_LIFT_LETTERBOX_SETTLE_FRAMES frames that
+ * carry content (a fade or cut to black is not a letterbox), and SHRINK at once
+ * when picture appears in them. A wrong crop in a dark scene costs little: the
+ * cropped rows are dark and are simply woven flat.
+ *
+ */
+
+//! Row / column profile length cap (buckets per axis).
+#define U_LIFT_LETTERBOX_BINS_MAX 512u
+
+//! A bucket whose non-black fraction reaches this is picture (ends a bar).
+#define U_LIFT_LETTERBOX_PICTURE_FRAC 0.25f
+
+/*!
+ * Rows below this non-black fraction count as sparse (subtitle text, not
+ * picture) when a bar is extended to match the opposite one — see
+ * u_lift_letterbox_update's symmetry rule. Dense subtitles can pass
+ * U_LIFT_LETTERBOX_PICTURE_FRAC; a picture edge row stays above this.
+ */
+#define U_LIFT_LETTERBOX_SPARSE_FRAC 0.6f
+
+//! Frames a larger bar must hold before the crop grows into it.
+#define U_LIFT_LETTERBOX_SETTLE_FRAMES 45u
+
+//! Bars below this many pixels are ignored (no crop on that edge).
+#define U_LIFT_LETTERBOX_MIN_BAR_PX 4u
+
+//! The active area must keep at least this fraction of each dimension.
+#define U_LIFT_LETTERBOX_MIN_ACTIVE_FRAC 0.3f
+
+//! Crop of a @c w x @c h rect: bar sizes in rect pixels (0 = no bar).
+struct u_lift_crop
+{
+	uint32_t top, bottom, left, right;
+};
+
+struct u_lift_letterbox
+{
+	uint32_t w, h;                //!< rect dims the state belongs to (0 = none yet)
+	struct u_lift_crop committed; //!< the crop in effect
+	struct u_lift_crop pending;   //!< a larger crop waiting to settle
+	uint32_t pending_frames;      //!< consecutive content frames @c pending held
+};
+
+/*!
+ * Parse DXR_LIFT_LETTERBOX: NULL / empty / anything but "0" = enabled.
+ */
+bool
+u_lift_letterbox_parse(const char *value);
+
+/*!
+ * Feed one measurement of a @p w x @p h rect. @p rows holds @p nr per-bucket
+ * non-black fractions top to bottom (bucket i covers rows [i*h/nr, (i+1)*h/nr)),
+ * @p cols @p nc buckets left to right; either may be NULL/0 (that axis then
+ * never crops). A change of @p w / @p h resets the state (no crop until the new
+ * bars settle). Returns true when the committed crop changed.
+ */
+bool
+u_lift_letterbox_update(struct u_lift_letterbox *lb,
+                        uint32_t w,
+                        uint32_t h,
+                        const float *rows,
+                        uint32_t nr,
+                        const float *cols,
+                        uint32_t nc);
+
+//! True when @p c crops anything.
+bool
+u_lift_crop_active(const struct u_lift_crop *c);
+
+
 #ifdef __cplusplus
 }
 #endif

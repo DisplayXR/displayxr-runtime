@@ -167,6 +167,54 @@ struct snap_cb
 	float dst_size[4]; //!< read by k_snap_ps_scaled only
 };
 
+/*
+ * Letterbox profile (DXR_LIFT_LETTERBOX). Target: R32_FLOAT,
+ * U_LIFT_LETTERBOX_BINS_MAX x 2 — row 0 = the rect's row buckets top to bottom,
+ * row 1 = its column buckets left to right. Each texel is the non-black
+ * fraction of its bucket: the max over the bucket's first, middle and last
+ * line, each line sampled at 96 points across the rect. Taking the max over
+ * the first and LAST line means a bucket holding the picture's first row is
+ * already picture, so a bar never swallows a picture row.
+ * bins = (row buckets, column buckets, -, -).
+ */
+static const char *k_lb_ps = R"(
+cbuffer C : register(b0) { float4 src_rect; float4 bins; };
+Texture2D src : register(t0);
+float line_frac(bool rows, float a, float span) {
+	float cnt = 0.0;
+	[loop] for (int k = 0; k < 96; k++) {
+		float b = floor((k + 0.5) * span / 96.0);
+		int2 p = rows ? int2(src_rect.x + b, src_rect.y + a) : int2(src_rect.x + a, src_rect.y + b);
+		float3 c = src.Load(int3(p, 0)).rgb;
+		cnt += dot(c, float3(0.2126, 0.7152, 0.0722)) > 0.07 ? 1.0 : 0.0;
+	}
+	return cnt / 96.0;
+}
+float4 main(float4 pos : SV_Position) : SV_Target {
+	uint i = (uint)pos.x;
+	bool rows = pos.y < 1.0;
+	float n = rows ? bins.x : bins.y;
+	if ((float)i >= n) {
+		return 0.0;
+	}
+	float len = rows ? src_rect.w : src_rect.z;  // along the profile
+	float span = rows ? src_rect.z : src_rect.w; // across it
+	float a0 = floor(i * len / n);
+	float a1 = max(a0, floor((i + 1) * len / n) - 1.0);
+	float am = floor((a0 + a1) * 0.5);
+	return max(line_frac(rows, a0, span), max(line_frac(rows, am, span), line_frac(rows, a1, span)));
+}
+)";
+
+struct lb_cb
+{
+	float src_rect[4];
+	float bins[4];
+};
+
+//! Staging readbacks in flight per stream (async: never stall the weave).
+#define LB_RING 3
+
 
 /*
  *
@@ -189,6 +237,9 @@ struct lift_in_slot
 	xrt_dp_lift_params params = {};
 	float viewpoints[3 * XRT_DP_LIFT_MAX_EXPLICIT_VIEWPOINTS] = {};
 	uint32_t viewpoint_floats = 0;
+	//! The part of the submitted rect this frame holds (letterbox crop):
+	//! x0, y0, x1, y1 normalised to the rect. {0,0,1,1} = the whole rect.
+	float active[4] = {0.0f, 0.0f, 1.0f, 1.0f};
 };
 
 //! One output ring slot: created on the LIFT device, opened on the SERVICE device.
@@ -203,6 +254,16 @@ struct lift_out_slot
 	uint32_t w = 0, h = 0, format = 0, view_count = 0;
 	std::shared_ptr<std::vector<uint8_t>> blob; //!< GAUSSIANS
 	uint32_t blob_format = 0;
+	float active[4] = {0.0f, 0.0f, 1.0f, 1.0f}; //!< the input's lift_in_slot::active
+};
+
+//! One letterbox profile readback (service device, producer thread only).
+struct lift_lb_readback
+{
+	ID3D11Texture2D *staging = nullptr;
+	bool pending = false;
+	uint32_t w = 0, h = 0;   //!< rect dims it measured
+	uint32_t nr = 0, nc = 0; //!< buckets used
 };
 
 struct lift_stream
@@ -254,6 +315,11 @@ struct lift_stream
 
 	// Snapshot cap: the last capped size WARNed about (producer thread, under mtx).
 	uint32_t cap_logged_w = 0, cap_logged_h = 0;
+
+	// Letterbox crop (producer thread only; the crop is read under mtx at submit).
+	u_lift_letterbox lb = {};
+	lift_lb_readback lb_rb[LB_RING];
+	uint32_t lb_next = 0; //!< next ring entry to issue into
 };
 
 struct d3d11_lift
@@ -280,6 +346,14 @@ struct d3d11_lift
 	//! DXR_LIFT_MAX_INPUT_EDGE, read once at create: long-edge cap on weave-rect
 	//! snapshots (0 = off). Never applied to xrSubmitLiftFrameDXR frames.
 	uint32_t max_input_edge = U_LIFT_MAX_INPUT_EDGE_DEFAULT;
+	//! DXR_LIFT_LETTERBOX, read once at create (default on). Weave-rect
+	//! snapshots only, like the cap.
+	bool letterbox = true;
+	ID3D11PixelShader *lb_ps = nullptr;
+	ID3D11Texture2D *lb_tex = nullptr; //!< R32F BINS_MAX x 2 profile target
+	ID3D11RenderTargetView *lb_rtv = nullptr;
+	ID3D11Buffer *lb_cbuf = nullptr;
+	bool lb_ok = false;
 
 	// Lift side (lift thread only, after activation).
 	ID3D11Device *lift_device = nullptr;
@@ -494,6 +568,10 @@ stream_release_gpu(lift_stream &st)
 	rel(st.exp_tex);
 	close_handle(st.exp_handle);
 	st.blob_latched.reset();
+	for (auto &r : st.lb_rb) {
+		rel(r.staging);
+		r.pending = false;
+	}
 }
 
 
@@ -668,6 +746,8 @@ lift_convert_one(d3d11_lift *l, lift_stream &st, std::unique_lock<std::mutex> &l
 	float vps[3 * XRT_DP_LIFT_MAX_EXPLICIT_VIEWPOINTS];
 	memcpy(vps, in.viewpoints, sizeof(vps));
 	uint32_t vp_floats = in.viewpoint_floats;
+	float active[4];
+	memcpy(active, in.active, sizeof(active));
 	const uint32_t w = meta.width, h = meta.height;
 	lk.unlock();
 
@@ -792,6 +872,7 @@ lift_convert_one(d3d11_lift *l, lift_stream &st, std::unique_lock<std::mutex> &l
 				o.lift_km->ReleaseSync(0);
 				l->lift_context->Flush();
 				o.view_count = views;
+				memcpy(o.active, active, sizeof(o.active));
 			}
 		}
 	} else if (ok && is_blob) {
@@ -1041,6 +1122,46 @@ d3d11_lift_create(ID3D11Device *svc_device,
 		U_LOG_E("[lift] snapshot pipeline init failed — lift will report UNAVAILABLE");
 	}
 
+	// Letterbox crop (optional: a failure here only disables the crop).
+	l->letterbox = u_lift_letterbox_parse(getenv("DXR_LIFT_LETTERBOX"));
+	if (l->snap_ok && l->letterbox) {
+		bool lok = SUCCEEDED(D3DCompile(k_lb_ps, strlen(k_lb_ps), nullptr, nullptr, nullptr, "main", "ps_5_0", 0,
+		                                0, &b, &err)) &&
+		           SUCCEEDED(svc_device->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr,
+		                                                   &l->lb_ps));
+		if (err != nullptr) {
+			U_LOG_E("[lift] letterbox shader: %s", (const char *)err->GetBufferPointer());
+		}
+		rel(b);
+		rel(err);
+		if (lok) {
+			D3D11_TEXTURE2D_DESC td = {};
+			td.Width = U_LIFT_LETTERBOX_BINS_MAX;
+			td.Height = 2;
+			td.MipLevels = 1;
+			td.ArraySize = 1;
+			td.Format = DXGI_FORMAT_R32_FLOAT;
+			td.SampleDesc.Count = 1;
+			td.Usage = D3D11_USAGE_DEFAULT;
+			td.BindFlags = D3D11_BIND_RENDER_TARGET;
+			lok = SUCCEEDED(svc_device->CreateTexture2D(&td, nullptr, &l->lb_tex)) &&
+			      SUCCEEDED(svc_device->CreateRenderTargetView(l->lb_tex, nullptr, &l->lb_rtv));
+		}
+		if (lok) {
+			D3D11_BUFFER_DESC bd = {};
+			bd.ByteWidth = sizeof(lb_cb);
+			bd.Usage = D3D11_USAGE_DEFAULT;
+			bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+			lok = SUCCEEDED(svc_device->CreateBuffer(&bd, nullptr, &l->lb_cbuf));
+		}
+		l->lb_ok = lok;
+		if (!lok) {
+			U_LOG_E("[lift] letterbox profile init failed — weave-rect snapshots are not cropped");
+		}
+	} else if (!l->letterbox) {
+		U_LOG_W("[lift] DXR_LIFT_LETTERBOX=0 (weave-rect snapshots never cropped to the active area)");
+	}
+
 	xrt_dp_lift_caps_init(&l->caps);
 	l->caps.state = l->snap_ok ? XRT_DP_LIFT_STATE_ACTIVATING : XRT_DP_LIFT_STATE_UNAVAILABLE;
 	if (!l->snap_ok) {
@@ -1065,6 +1186,10 @@ d3d11_lift_destroy(struct d3d11_lift **lift_ptr)
 	if (l->thread.joinable()) {
 		l->thread.join();
 	}
+	rel(l->lb_cbuf);
+	rel(l->lb_rtv);
+	rel(l->lb_tex);
+	rel(l->lb_ps);
 	rel(l->snap_cb);
 	rel(l->snap_sampler_linear);
 	rel(l->snap_sampler);
@@ -1286,6 +1411,136 @@ snapshot_blit(d3d11_lift *l,
 	return true;
 }
 
+/*!
+ * Letterbox: collect finished profile readbacks (never waits) into the stream's
+ * crop state, then measure this frame's rect into the next free readback. The
+ * crop therefore lags the picture by a few frames, which the settle hysteresis
+ * dwarfs anyway. Producer thread (service context mutex held); @p st is not
+ * reaped meanwhile (its input slot is WRITING).
+ */
+static void
+letterbox_step(d3d11_lift *l,
+               lift_stream &st,
+               ID3D11ShaderResourceView *src,
+               uint32_t x,
+               uint32_t y,
+               uint32_t w,
+               uint32_t h)
+{
+	ID3D11DeviceContext *ctx = l->svc_context;
+
+	// 1. Oldest-first collection, stop at the first still in flight.
+	for (uint32_t k = 0; k < LB_RING; k++) {
+		lift_lb_readback &r = st.lb_rb[(st.lb_next + k) % LB_RING];
+		if (!r.pending) {
+			continue;
+		}
+		D3D11_MAPPED_SUBRESOURCE ms = {};
+		HRESULT hr = ctx->Map(r.staging, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &ms);
+		if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+			break;
+		}
+		r.pending = false;
+		if (FAILED(hr)) {
+			continue;
+		}
+		const float *rows = (const float *)ms.pData;
+		const float *cols = (const float *)((const uint8_t *)ms.pData + ms.RowPitch);
+		const bool changed = u_lift_letterbox_update(&st.lb, r.w, r.h, rows, r.nr, cols, r.nc);
+		ctx->Unmap(r.staging, 0);
+		if (changed) {
+			const u_lift_crop &c = st.lb.committed;
+			if (u_lift_crop_active(&c)) {
+				U_LOG_W("[lift] stream %llu: letterbox crop %ux%u -> active %ux%u (bars top %u bottom %u left %u "
+				        "right %u; bars woven flat)",
+				        (unsigned long long)st.id, r.w, r.h, r.w - c.left - c.right, r.h - c.top - c.bottom,
+				        c.top, c.bottom, c.left, c.right);
+			} else {
+				U_LOG_W("[lift] stream %llu: letterbox crop off (%ux%u lifted whole)", (unsigned long long)st.id,
+				        r.w, r.h);
+			}
+		}
+	}
+
+	// 2. Measure this frame into the next ring entry, if it is free.
+	lift_lb_readback &r = st.lb_rb[st.lb_next];
+	if (r.pending) {
+		return; // GPU behind by LB_RING readbacks: skip a measurement, never stall
+	}
+	if (r.staging == nullptr) {
+		D3D11_TEXTURE2D_DESC td = {};
+		td.Width = U_LIFT_LETTERBOX_BINS_MAX;
+		td.Height = 2;
+		td.MipLevels = 1;
+		td.ArraySize = 1;
+		td.Format = DXGI_FORMAT_R32_FLOAT;
+		td.SampleDesc.Count = 1;
+		td.Usage = D3D11_USAGE_STAGING;
+		td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		if (FAILED(l->svc_device->CreateTexture2D(&td, nullptr, &r.staging))) {
+			return;
+		}
+	}
+	r.w = w;
+	r.h = h;
+	r.nr = h < U_LIFT_LETTERBOX_BINS_MAX ? h : U_LIFT_LETTERBOX_BINS_MAX;
+	r.nc = w < U_LIFT_LETTERBOX_BINS_MAX ? w : U_LIFT_LETTERBOX_BINS_MAX;
+
+	lb_cb cb = {};
+	cb.src_rect[0] = (float)x;
+	cb.src_rect[1] = (float)y;
+	cb.src_rect[2] = (float)w;
+	cb.src_rect[3] = (float)h;
+	cb.bins[0] = (float)r.nr;
+	cb.bins[1] = (float)r.nc;
+	ctx->UpdateSubresource(l->lb_cbuf, 0, nullptr, &cb, 0, 0);
+
+	// Same state discipline as snapshot_blit: this runs mid weave sequence.
+	ID3D11RasterizerState *prev_rs = nullptr;
+	ID3D11BlendState *prev_bs = nullptr;
+	float prev_bf[4] = {0, 0, 0, 0};
+	UINT prev_mask = 0xffffffff;
+	ID3D11DepthStencilState *prev_ds = nullptr;
+	UINT prev_ref = 0;
+	ctx->RSGetState(&prev_rs);
+	ctx->OMGetBlendState(&prev_bs, prev_bf, &prev_mask);
+	ctx->OMGetDepthStencilState(&prev_ds, &prev_ref);
+
+	D3D11_VIEWPORT vp = {};
+	vp.Width = (float)U_LIFT_LETTERBOX_BINS_MAX;
+	vp.Height = 2.0f;
+	vp.MaxDepth = 1.0f;
+	ctx->RSSetViewports(1, &vp);
+	D3D11_RECT sc = {0, 0, (LONG)U_LIFT_LETTERBOX_BINS_MAX, 2};
+	ctx->RSSetScissorRects(1, &sc);
+	ctx->RSSetState(nullptr);
+	ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+	ctx->OMSetDepthStencilState(nullptr, 0);
+	ctx->OMSetRenderTargets(1, &l->lb_rtv, nullptr);
+	ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+	ctx->IASetInputLayout(nullptr);
+	ctx->VSSetShader(l->snap_vs, nullptr, 0);
+	ctx->GSSetShader(nullptr, nullptr, 0);
+	ctx->PSSetShader(l->lb_ps, nullptr, 0);
+	ctx->PSSetConstantBuffers(0, 1, &l->lb_cbuf);
+	ctx->PSSetShaderResources(0, 1, &src);
+	ctx->Draw(4, 0);
+	ID3D11ShaderResourceView *null_srv = nullptr;
+	ctx->PSSetShaderResources(0, 1, &null_srv);
+	ID3D11RenderTargetView *null_rtv = nullptr;
+	ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
+	ctx->RSSetState(prev_rs);
+	ctx->OMSetBlendState(prev_bs, prev_bf, prev_mask);
+	ctx->OMSetDepthStencilState(prev_ds, prev_ref);
+	rel(prev_rs);
+	rel(prev_bs);
+	rel(prev_ds);
+
+	ctx->CopyResource(r.staging, l->lb_tex);
+	r.pending = true;
+	st.lb_next = (st.lb_next + 1) % LB_RING;
+}
+
 //! Producer common path. Caller holds the service context mutex.
 static xrt_result_t
 submit_locked(d3d11_lift *l,
@@ -1303,16 +1558,20 @@ submit_locked(d3d11_lift *l,
               const float *viewpoints,
               uint32_t viewpoint_floats,
               uint32_t max_input_edge,
+              bool letterbox,
               uint64_t *out_frame_id)
 {
 	if (w == 0 || h == 0 || x + w > src_tw || y + h > src_th) {
 		return XRT_ERROR_OUTPUT_REQUEST_FAILURE; // unknown stream / bad extent: non-fatal
 	}
-	// Service policy (ADR-042): the module synthesizes at INPUT resolution and
-	// the result is stretched back into the rect anyway, so a capped snapshot
-	// costs little on the panel and a lot less in the module. 0 = uncapped.
+	letterbox = letterbox && l->lb_ok;
+	// Service policy (ADR-042), in this order: letterbox crop to the active
+	// area, then the long-edge cap. The module synthesizes at INPUT resolution
+	// and the result is stretched back into the (active part of the) rect, so
+	// neither costs much on the panel and both save a lot in the module.
+	uint32_t cx = x, cy = y, cw = w, ch = h;
 	uint32_t dw = w, dh = h;
-	const bool capped = u_lift_cap_dims(w, h, max_input_edge, &dw, &dh);
+	bool capped = false;
 	int32_t slot = -1;
 	lift_stream *st = nullptr;
 	{
@@ -1321,6 +1580,16 @@ submit_locked(d3d11_lift *l,
 		if (st == nullptr) {
 			return XRT_ERROR_OUTPUT_REQUEST_FAILURE; // unknown stream / bad extent: non-fatal
 		}
+		if (letterbox && st->lb.w == w && st->lb.h == h && u_lift_crop_active(&st->lb.committed)) {
+			const u_lift_crop &c = st->lb.committed;
+			cx = x + c.left;
+			cy = y + c.top;
+			cw = w - c.left - c.right;
+			ch = h - c.top - c.bottom;
+		}
+		dw = cw;
+		dh = ch;
+		capped = u_lift_cap_dims(cw, ch, max_input_edge, &dw, &dh);
 		if (!l->activated || l->lift_device1 == nullptr) {
 			// Not up yet: there is no lift device to share the slot with. The
 			// frame is simply not taken (the caller submits again next frame).
@@ -1358,15 +1627,22 @@ submit_locked(d3d11_lift *l,
 		lift_in_slot &in = st->in[slot];
 		in.params = st->last_params;
 		if (capped && in.params.focal_px > 0.0f) {
-			in.params.focal_px *= (float)dw / (float)w; // focal is in INPUT pixels
+			in.params.focal_px *= (float)dw / (float)cw; // focal is in INPUT pixels (a crop keeps the scale)
 		}
 		in.viewpoint_floats = st->last_viewpoint_floats;
 		memcpy(in.viewpoints, st->last_viewpoints, sizeof(in.viewpoints));
+		in.active[0] = (float)(cx - x) / (float)w;
+		in.active[1] = (float)(cy - y) / (float)h;
+		in.active[2] = (float)(cx - x + cw) / (float)w;
+		in.active[3] = (float)(cy - y + ch) / (float)h;
 	}
 
 	// Allocation + blit outside mtx: this slot is WRITING, nobody else touches it.
 	lift_in_slot &in = st->in[slot];
-	bool ok = in_slot_ensure(l, in, dw, dh) && snapshot_blit(l, in, src, src_tw, src_th, x, y, w, h, dw, dh);
+	bool ok = in_slot_ensure(l, in, dw, dh) && snapshot_blit(l, in, src, src_tw, src_th, cx, cy, cw, ch, dw, dh);
+	if (ok && letterbox) {
+		letterbox_step(l, *st, src, x, y, w, h); // measures the WHOLE rect, bars included
+	}
 
 	std::lock_guard<std::mutex> g(l->mtx);
 	if (!ok) {
@@ -1379,7 +1655,7 @@ submit_locked(d3d11_lift *l,
 		st->cap_logged_w = dw;
 		st->cap_logged_h = dh;
 		U_LOG_W("[lift] stream %llu: snapshot %ux%u capped to %ux%u (DXR_LIFT_MAX_INPUT_EDGE=%u)",
-		        (unsigned long long)id, w, h, dw, dh, max_input_edge);
+		        (unsigned long long)id, cw, ch, dw, dh, max_input_edge);
 	}
 	// The mailbox carries the REAL input dims: the lift thread copies exactly
 	// dw x dh out of the slot and hands the module that size.
@@ -1408,7 +1684,7 @@ d3d11_lift_submit_srv_locked(struct d3d11_lift *l,
 	}
 	// Weave-rect snapshot: the service's size cap applies.
 	return submit_locked(l, owner, id, src, src_tw, src_th, x, y, w, h, source_time, params, nullptr, 0,
-	                     l->max_input_edge, out_frame_id);
+	                     l->max_input_edge, l->letterbox, out_frame_id);
 }
 
 xrt_result_t
@@ -1514,9 +1790,10 @@ d3d11_lift_submit_handle(struct d3d11_lift *l,
 	xrt_result_t xret;
 	{
 		std::lock_guard<std::mutex> ctx_lock(*l->svc_ctx_mutex);
-		// An app's explicit frame: its size is the app's choice — never capped.
+		// An app's explicit frame: its size and content are the app's choice —
+		// never capped, never letterbox-cropped.
 		xret = submit_locked(l, owner, id, st->imp_srv, st->imp_w, st->imp_h, 0, 0, w, h, source_time, params,
-		                     viewpoints, viewpoint_floats, /*max_input_edge*/ 0, out_frame_id);
+		                     viewpoints, viewpoint_floats, /*max_input_edge*/ 0, /*letterbox*/ false, out_frame_id);
 	}
 	if (acquired) {
 		st->imp_km->ReleaseSync(0);
@@ -1564,6 +1841,7 @@ d3d11_lift_pin_latest(struct d3d11_lift *l, uint64_t owner, uint64_t id, struct 
 	out->width = o->w;
 	out->height = o->h;
 	out->view_count = o->view_count;
+	memcpy(out->active, o->active, sizeof(out->active));
 	out->valid = true;
 	return true;
 }

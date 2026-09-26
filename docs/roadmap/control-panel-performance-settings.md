@@ -84,7 +84,7 @@ means deleting the static and reading a service-held snapshot — mechanically c
 
 `DXR_COMMIT_PACE` · `DXR_FENCE_WAIT_MS` · `DXR_EVICT_IDLE_MS` · `DXR_EVICT_ENDED_MS` ·
 `DXR_DP_GRAVEYARD_MS` · `DXR_DEVICE_REMOVED_EXIT_MS` · `DXR_HEALTH_MS` ·
-`DXR_IDLE_QUIESCE_MS` · `DXR_LIFT_MAX_INPUT_EDGE`.
+`DXR_IDLE_QUIESCE_MS` · `DXR_LIFT_MAX_INPUT_EDGE` · `DXR_LIFT_LETTERBOX`.
 
 Semantic caveat: `DXR_COMMIT_PACE` changes backpressure discipline; flipping it under a
 live client is a behaviour change mid-flight, not just a number change.
@@ -324,7 +324,7 @@ never claim a mode the runtime is not in, and "Custom" falls out for free.
 ## Appendix A — census
 
 Every `DXR_*` name read at runtime under `src/xrt`, with its read site, mechanism, default
-and tier. **95 distinct names**; the two `DXR_BG2D_*` knobs reach the environment through
+and tier. **96 distinct names**; the two `DXR_BG2D_*` knobs reach the environment through
 `bg2d_int_knob()` rather than a literal `getenv` at the listed line.
 
 Process column: **App** = the runtime DLL, loaded into the OpenXR app's process ·
@@ -387,6 +387,7 @@ library linked into both · **CLI** = `displayxr-cli.exe` (reporting only, contr
 | `DXR_APP_HWND_LATENCY` | `compositor/d3d11_service/comp_d3d11_service.cpp:263` | `getenv`, **uncached** | 2 | Svc | 1 | Frame-latency depth on the app-HWND present path. Consumed at `SetMaximumFrameLatency` |
 | `DXR_COMMIT_PACE` | `compositor/d3d11_service/comp_d3d11_service.cpp:19741` | `getenv`, `static` cached | on (1; 0/1/2) | Svc | 2 | Commit backpressure. `=0` lets a client run free; `=2` is the legacy tick-align shape |
 | `DXR_LIFT_MAX_INPUT_EDGE` | `compositor/d3d11_service/d3d11_lift.cpp` (`d3d11_lift_create`, parsed by `u_lift_max_input_edge_parse`; applied per snapshot in `submit_locked` via `u_lift_cap_dims`) | `getenv` once at lift-module create | **1920** (`0` = off; 1-255 clamp to 256) | Svc | 2 | XR_DXR_lift (ADR-042): caps the long edge of a lift-flagged weave rect's snapshot before the vendor module (aspect kept, dims even, box-filtered). The module synthesizes views at INPUT resolution and the result is stretched back into the rect, so a device-pixel snapshot only costs time: measured on an 8K Leia panel (NeurD DirectML) a fullscreen 7680x4319 player converted at 132 ms (~6.5 Hz) vs 48 ms at 1080p-class input. Never applied to an app's explicit `xrSubmitLiftFrameDXR` frame. Latched only by the create-time read — could go live. **User-facing: yes** — the natural "Convert-to-3D quality" tier (e.g. Fast 1280 / Balanced 1920 / Sharp 3840 / Native 0) |
+| `DXR_LIFT_LETTERBOX` | `compositor/d3d11_service/d3d11_lift.cpp` (`d3d11_lift_create`, parsed by `u_lift_letterbox_parse`; measured per snapshot in `letterbox_step`, decided by `u_lift_letterbox_update`, applied in `submit_locked`; recomposed in `comp_d3d11_service.cpp` `lift_weave_rect_batch` / `lift_weave_rects_nview`) | `getenv` once at lift-module create | **on** (`0` = off) | Svc | 2 | XR_DXR_lift (ADR-042): crops a lift-flagged weave rect's snapshot to its ACTIVE area when it holds black letterbox/pillarbox bars (GPU row/column non-black profile, async readback, ~45-frame settle, instant un-crop, symmetry rule so subtitles in a bar stay in it), before the `DXR_LIFT_MAX_INPUT_EDGE` cap. The bars (subtitles included) are woven FLAT, identical in both views. Measured on the 8K Leia panel: 3386x1904 rect with a 2.39:1 still + subtitle → active 3386x1422, bars |L-R| = 0.00, module input 1920x806 instead of 1920x1080. Never applied to an app's explicit `xrSubmitLiftFrameDXR` frame. **User-facing: maybe** — an on/off "Crop black bars" toggle next to the Convert-to-3D quality tier |
 | `DXR_FENCE_WAIT_MS` | `compositor/d3d11_service/comp_d3d11_service.cpp:15911` | `getenv`, `static` cached | 4 (clamped 0..16) | Svc | 2 | Budget for the workspace-sync fence wait on a client's IPC thread |
 | `DXR_CMD_QUEUE` | `compositor/d3d11_service/comp_d3d11_service.cpp:2341` | `getenv`, `static` cached | on | Svc | 1 | Command-queue submission path vs. the fair-lock path (A/B) |
 | `DXR_COMPOSE_FROM_COPY` | `compositor/d3d11_service/comp_d3d11_service.cpp:2328` | `getenv`, `static` cached | **off** ("until soaked") | Svc | 1 | Compose from a service-owned `CopyResource` instead of sampling the shared handle |
