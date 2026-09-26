@@ -330,6 +330,12 @@ struct ipc_server_mainloop
 	//! The socket filename we bound to, if any.
 	char *socket_filename;
 
+	//! Self-pipe the SIGTERM/SIGINT handler writes to; read end is in epoll (#1744).
+	int signal_pipe[2];
+
+	//! Is @ref signal_pipe open? (The struct starts zeroed, and 0 is a valid fd.)
+	bool signal_pipe_valid;
+
 	/*! @} */
 
 #define XRT_IPC_GOT_IMPL
@@ -349,6 +355,12 @@ struct ipc_server_mainloop
 
 	//! The socket filename we bound to, if any.
 	char *socket_filename;
+
+	//! Self-pipe the SIGTERM/SIGINT handler writes to; read end is in epoll (#1744).
+	int signal_pipe[2];
+
+	//! Is @ref signal_pipe open? (The struct starts zeroed, and 0 is a valid fd.)
+	bool signal_pipe_valid;
 
 	/*! @} */
 

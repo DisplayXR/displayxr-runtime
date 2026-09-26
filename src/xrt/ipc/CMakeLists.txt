@@ -145,10 +145,11 @@ if(XRT_BUILD_DRIVER_QWERTY)
 	target_compile_definitions(ipc_server PRIVATE XRT_BUILD_DRIVER_QWERTY)
 endif()
 
-if(XRT_HAVE_SYSTEMD)
-	target_include_directories(ipc_server PRIVATE ${SYSTEMD_INCLUDE_DIRS})
-	target_link_libraries(ipc_server PRIVATE ${SYSTEMD_LIBRARIES})
-endif()
+# No libsystemd link (#1744): the Linux mainloop reads the socket-activation
+# hand-off (LISTEN_PID/LISTEN_FDS, sd_listen_fds(3)'s whole protocol) itself.
+# Linking it only on hosts that happen to have libsystemd-dev made the shipped
+# service's DT_NEEDED depend on the build box, and the .deb's STABLE_SONAMES
+# gate refuses libsystemd.so.0.
 
 if(ANDROID)
 	add_library(
