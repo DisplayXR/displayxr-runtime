@@ -1,6 +1,8 @@
 # ADR-043: A display's stereo camera is a plug-in-provided source, owned by the service and privacy-gated by the runtime
 
-**Status:** Proposed (2026-09-25) — design only, nothing implemented · introduces
+**Status:** Proposed (2026-09-25) · **R1 implemented** 2026-09-26 (runtime, hardware-free; maintainer
+defaults recorded in the roadmap §G: stereo-only, iface slots, service clients only, no raw frames
+to pages) · introduces
 [`XR_DXR_stereo_camera`](../specs/extensions/XR_DXR_stereo_camera.md) · appends optional
 camera slots to `xrt_plugin_iface` under the [ADR-020](ADR-020-plugin-abi-compatibility-policy.md)
 append-at-end rule · related: [ADR-019](ADR-019-vendor-plugin-aux-boundary.md),
@@ -30,7 +32,11 @@ machines):
   correct design must key calibration by the **active** device; and the SDK's new-frame event is
   **auto-reset**, so two readers waiting on it steal each other's wake-ups.
 - 3D **tablets** carry a front stereo pair (15 mm and 25 mm baselines on two models, parallel)
-  owned by the vendor's camera/tracking service on Android.
+  owned by the vendor's camera/tracking service on Android. Measured 2026-09-26 (roadmap §C.0):
+  the pair is a hidden Camera2 **logical** camera (front 5, back 4) that delivers two raw 1280×720
+  NV12 streams at 30 fps. Opening the front one **evicts the vendor tracker, which never
+  reacquires**. The vendor camera SDK (CNSDK) supplies only calibration and in-app face tracking,
+  not frames. The DisplayXR Browser cannot see the pair at all (browser-pvt#175).
 
 Everything a correct stereo camera needs — the private frame channel, the device's calibration,
 keeping the tracker alive — is vendor knowledge. The runtime's plug-in model (ADR-019) exists
@@ -87,5 +93,7 @@ exactly so that knowledge lives in one vendor DLL and nowhere else.
   defensively until the vendor SDK formalises it (roadmap open questions).
 - **−** Frame quality is the tracker's: greyscale, 640×480, tracker-chosen rate/exposure.
 - **−** Another service thread, and a CPU copy per frame (≈ 27 MB/s at 1280×480 NV12 30 Hz).
-- **−** Android depends on the vendor camera SDK sharing frames at all (open question); until then
-  Android documents a platform difference rather than breaking isolation.
+- **−** On Android the source cannot be a passenger on the tracker: the pair and the tracker cannot
+  both hold Camera2. So the runtime (the vendor plug-in in the runtime APK, ADR-038) must own the
+  front pair and run the vendor's in-app tracking from the same capture, on a worker thread
+  (roadmap §C.1). That is more vendor code inside the runtime APK, and more CPU, than on Windows.
