@@ -650,3 +650,32 @@ TEST_CASE("lift letterbox: flickering captions keep the bottom bar", "[lift][let
 		REQUIRE(lb.committed.top == before.top);
 	}
 }
+
+TEST_CASE("lift letterbox: no creep by a few pixels once cropped", "[lift][letterbox]")
+{
+	// Measured on the panel: bars settling at 250, then 254, then 256 — each a
+	// re-crop. Once cropped, only a growth beyond the deadband re-crops.
+	const uint32_t w = 2561, h = 1440, nr = 512;
+	const std::vector<float> cols(512, 0.9f);
+	u_lift_letterbox lb = {};
+	const std::vector<float> a = lb_rows(h, nr, 252, 1188);
+	for (uint32_t f = 0; f < U_LIFT_LETTERBOX_SETTLE_FRAMES; f++) {
+		(void)u_lift_letterbox_update(&lb, w, h, a.data(), nr, cols.data(), 512);
+	}
+	REQUIRE(u_lift_crop_active(&lb.committed));
+	const u_lift_crop first = lb.committed;
+	// Bars 4 px thicker: within the deadband, no re-crop.
+	const std::vector<float> b = lb_rows(h, nr, 256, 1184);
+	for (uint32_t f = 0; f < 3 * U_LIFT_LETTERBOX_SETTLE_FRAMES; f++) {
+		CHECK_FALSE(u_lift_letterbox_update(&lb, w, h, b.data(), nr, cols.data(), 512));
+	}
+	CHECK(lb.committed.top == first.top);
+	// Bars 40 px thicker (a genuinely wider aspect): re-crops after settling.
+	const std::vector<float> c = lb_rows(h, nr, 292, 1148);
+	bool grew = false;
+	for (uint32_t f = 0; f < U_LIFT_LETTERBOX_SETTLE_FRAMES; f++) {
+		grew = u_lift_letterbox_update(&lb, w, h, c.data(), nr, cols.data(), 512) || grew;
+	}
+	CHECK(grew);
+	CHECK(lb.committed.top > first.top + 16);
+}
