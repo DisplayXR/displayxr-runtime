@@ -114,8 +114,9 @@ render_counter(uint8_t *dst, uint32_t pitch, uint32_t x_off, uint32_t eye_w, uin
 					continue;
 				}
 				for (uint32_t sy = 0; sy < COUNTER_SCALE; sy++) {
-					uint8_t *p = dst + (size_t)(COUNTER_Y + COUNTER_SCALE + r * COUNTER_SCALE + sy) * pitch +
-					             x_off + gx + c * COUNTER_SCALE;
+					uint8_t *p =
+					    dst + (size_t)(COUNTER_Y + COUNTER_SCALE + r * COUNTER_SCALE + sy) * pitch +
+					    x_off + gx + c * COUNTER_SCALE;
 					memset(p, 255, COUNTER_SCALE);
 				}
 			}
