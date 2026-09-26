@@ -197,7 +197,14 @@ What the caller draws:
 What the service does, inside the same `xrWeaveSubmitDXR`:
 
 1. **Snapshot.** The rect's region (tile 0's on v6) is blitted into the stream's mailbox —
-   exactly a `xrSubmitLiftFrameDXR`, stamped with the runtime clock.
+   exactly a `xrSubmitLiftFrameDXR`, stamped with the runtime clock — except that the service
+   **downsamples** it so its long edge is at most a cap (default **1920**, aspect kept, both
+   dims even; service env `DXR_LIFT_MAX_INPUT_EDGE`, `0` = off, smaller values clamp to 256).
+   The rect is in device pixels (a fullscreen player on an 8K panel is 7680x4319), the module
+   synthesizes its views at *input* resolution, and step 2 stretches the result back into the
+   rect anyway — so an uncapped snapshot buys little sharpness at a large conversion-rate cost.
+   The module sees the capped size as the frame's input size (a `focalPx` hint is scaled with
+   it). An app's own `xrSubmitLiftFrameDXR` frame is never capped: its size is the app's choice.
 2. **Weave the latest result at the CURRENT rect.** The stream's newest result (from an earlier
    frame) is stretched into the rect's current position: the middle stereo pair into the SBS
    scratch's left/right tiles (v3), or view *v* of the result into tile *v* (v6; equal view
