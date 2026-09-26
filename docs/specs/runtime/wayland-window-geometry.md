@@ -657,3 +657,62 @@ pixel"). At 150 % the panel dragged unconstrained, and stuttered. Now:
 
 An app against a v7 extension keeps the integer-scale-only behaviour.
 
+### 8.8 Version 9 — which entry a move lands on (#1748)
+
+Every table entry is equally phase-correct, so the only freedom left during a
+drag is which entry each move lands on. Up to version 8 that was the plain
+nearest one. Along a straight drag, nearest picks entries on either side of
+the drag line in turn, and the window wiggles sideways. A denser table
+(displayxr-common's probe at every logical px, §8.7) removes the entries it
+used to miss, but it cannot close the gap to Windows: mutter places windows at
+whole logical px, so above 100 % only some device px are reachable.
+
+Version 9 spends the remaining error where it shows least (`LatticeChoice` in
+`lib.js`):
+
+- **The drag direction** is estimated from the raw positions mutter proposes,
+  in device px, with a memory of about 8 px of travel. It is an axis, so a drag
+  that reverses along the same line keeps it, and a turn moves it.
+- **The cost** of an entry is `along² + 9 · across²`, both measured from the
+  raw position: a sideways error counts three times a lead or lag along the
+  drag.
+- **The lead or lag is capped at 6 device px.** Entries past it are not
+  eligible. If none is eligible, or until the drag has travelled 4 device px,
+  the choice is plain nearest.
+- Everything is in device px (logical × the window's monitor scale), so the
+  rule is the same at any output scale.
+- `DISPLAYXR_LATTICE_NEAREST=1` in the shell's environment restores plain
+  nearest, for A/B comparison on a panel.
+
+Nothing on the wire changes, and every landing is still a table entry.
+`scripts/test_gnome_extension_lattice.js` (gjs, in `lint.yml`) checks the
+rule directly.
+
+**Measured** in a private headless GNOME Shell 50.1, over the dense table
+(displayxr-common#65), with a real `xdg_toplevel.move` grab driven through
+`org.gnome.Mutter.RemoteDesktop` and a best-phase snap of the vendor weaver's
+shape. Distances are in device px; sideways travel is the total sideways
+motion of the window per 100 px dragged.
+
+| scale | drag | sideways rms | sideways max | sideways travel /100 px | largest sideways jump | lead/lag max |
+|---|---|---|---|---|---|---|
+| 200 % | horizontal | 2.56 → 1.64 | 4.0 → 4.0 | 73 → 31 | 8.0 → 4.0 | 4.0 → 6.0 |
+| 200 % | vertical | 2.02 → 1.46 | 4.0 → 2.0 | 45 → 22 | 6.0 → 4.0 | 4.0 → 6.0 |
+| 200 % | 20° | 2.07 → 1.50 | 4.4 → 3.8 | 52 → 31 | 6.2 → 6.2 | 4.4 → 5.6 |
+| 200 % | 45° | 1.94 → 1.77 | 4.4 → 3.8 | 34 → 35 | 5.9 → 5.9 | 4.4 → 5.6 |
+| 200 % | reversing | 2.56 → 1.62 | 4.0 → 4.0 | 73 → 32 | 8.0 → 4.0 | 4.0 → 6.0 |
+| 150 % | horizontal | 1.87 → 0.99 | 4.5 → 1.5 | 58 → 22 | 7.5 → 3.0 | 3.0 → 6.0 |
+| 150 % | vertical | 1.84 → 1.21 | 4.5 → 3.0 | 46 → 24 | 6.0 → 4.5 | 3.0 → 6.0 |
+| 150 % | 20° | 1.76 → 0.88 | 4.2 → 1.9 | 72 → 26 | 8.1 → 3.5 | 3.8 → 5.3 |
+| 150 % | 45° | 1.64 → 1.33 | 3.2 → 2.1 | 51 → 34 | 5.3 → 4.2 | 3.2 → 5.3 |
+| 150 % | reversing | 1.87 → 1.00 | 4.5 → 1.5 | 62 → 26 | 7.5 → 3.0 | 3.0 → 6.0 |
+| Windows, app-owned (model, same snap) | all four | 1.31–1.41 | 2.0–2.8 | 45–81 | 4.0–4.8 | 2.0–2.8 |
+
+Sideways rms and travel drop by a third to a half, and the largest sideways
+jump halves on straight drags. The worst single sideways offset still reaches
+4 device px at 200 % where the table has no closer entry within the cap. The
+price is the lead or lag along the drag (≤ 6 px, from ≤ 4.5) and a larger
+correction (rms 3.1 → 3.6 at 200 %, 2.5 → 3.3 at 150 %). Edge tiling (left half),
+the top-edge maximize and a drag starting from rest behave as before, and no
+frame inside the table's coverage was painted off it.
+
