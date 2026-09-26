@@ -23,6 +23,9 @@ extern "C" {
 struct xrt_prober;
 struct xrt_device;
 struct xrt_instance_android;
+struct xrt_stereo_camera_client;
+struct xrt_plugin_iface;
+struct xrt_plugin_instance;
 struct xrt_space_overseer;
 struct xrt_system;
 struct xrt_system_devices;
@@ -230,6 +233,23 @@ struct xrt_instance
 	 * @see xrt_instance_android
 	 */
 	struct xrt_instance_android *android_instance;
+
+	/*!
+	 * XR_DXR_stereo_camera (ADR-043) client aspect. Set by the IPC client
+	 * instance only; NULL for an in-process instance (which enumerates zero
+	 * cameras — the service is each camera's single owner).
+	 */
+	struct xrt_stereo_camera_client *stereo_camera;
+
+	/*!
+	 * Optional: the plug-in that claimed the system for THIS instance, for
+	 * service-side owners of plug-in-provided sources (the IPC server's
+	 * stereo camera manager, ADR-043). Set by the native instance; NULL on
+	 * the IPC client instance. Returns false when no plug-in is active.
+	 */
+	bool (*get_active_plugin)(struct xrt_instance *xinst,
+	                          const struct xrt_plugin_iface **out_iface,
+	                          struct xrt_plugin_instance **out_inst);
 };
 
 /*!

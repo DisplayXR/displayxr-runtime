@@ -75,6 +75,10 @@ set(SIM_DISPLAY_SOURCES
 	sim_display/sim_display_device.c
 	sim_display/sim_display_interface.h
 	sim_display/sim_display_zone_common.h
+	sim_display/sim_display_stereo_camera.c
+	sim_display/sim_display_stereo_camera.h
+	sim_display/sim_display_stereo_camera_pattern.c
+	sim_display/sim_display_stereo_camera_pattern.h
 	)
 
 # Vulkan display processor (anaglyph/blend shaders)
