@@ -153,6 +153,91 @@
 
     let built = null;
 
+    /*
+     * ── Which table entry a drag move lands on (extension version 9) ──
+     *
+     * Pure logic, no GI: scripts/test_gnome_extension_lattice.js loads this
+     * file under plain gjs and drives it directly.
+     *
+     * The table is every phase-correct position the compositor can reach, so
+     * each entry is equally correct; the only freedom is WHICH one a move
+     * lands on. Plain nearest (versions 6-8) treats every direction alike, so
+     * along a straight drag it picks entries on either side of the drag line
+     * in turn, and the window wiggles sideways (runtime#1748). The table
+     * cannot be made dense enough to hide that: mutter places windows at whole
+     * logical px, so above 100 % only some device px are reachable.
+     *
+     * So the choice spends the error where it shows least. The sideways
+     * error counts PERP_WEIGHT times the error along the drag, which only
+     * makes the window lead or lag the pointer a little. The lag is capped at
+     * MAX_ALONG_PX; past it, and until the drag has a direction, the choice
+     * is plain nearest. Everything is in DEVICE px (logical x monitor scale),
+     * so it behaves the same at any output scale.
+     */
+    const LatticeChoice = {
+        //! Sideways error weight relative to along-drag error (squared: 3x).
+        PERP_WEIGHT: 9,
+        //! Largest lead or lag along the drag the choice may add, device px.
+        MAX_ALONG_PX: 6,
+        //! How fast the drag direction follows a turn, device px of travel.
+        DIR_MEMORY_PX: 8,
+        //! Travel before the direction is trusted, device px (a drag from rest).
+        MIN_TRAVEL_PX: 4,
+
+        //! Per-drag state. Displacements are from the drag start, so the
+        //! first move already has a direction from (0, 0).
+        create() {
+            return {ax: 0, ay: 0, lx: 0, ly: 0};
+        },
+
+        //! Feed the raw (compositor-proposed) displacement of each move.
+        observe(st, dx, dy, scale) {
+            const mx = (dx - st.lx) * scale, my = (dy - st.ly) * scale;
+            const d = Math.hypot(mx, my);
+            if (d > 0) {
+                // The direction is an AXIS: a drag that reverses keeps it,
+                // so a step against it is folded over before it is added.
+                const sgn = mx * st.ax + my * st.ay < 0 ? -1 : 1;
+                const decay = Math.exp(-d / LatticeChoice.DIR_MEMORY_PX);
+                st.ax = st.ax * decay + sgn * mx;
+                st.ay = st.ay * decay + sgn * my;
+            }
+            st.lx = dx;
+            st.ly = dy;
+        },
+
+        /*
+         * forEach(cb) calls cb(ex, ey) for each candidate entry (logical
+         * displacements). Returns [ex, ey] or null. @p isotropic forces plain
+         * nearest (DISPLAYXR_LATTICE_NEAREST=1, for A/B comparison).
+         */
+        choose(st, forEach, dx, dy, scale, isotropic = false) {
+            const n = Math.hypot(st.ax, st.ay);
+            const aniso = !isotropic && n >= LatticeChoice.MIN_TRAVEL_PX;
+            const ux = aniso ? st.ax / n : 1, uy = aniso ? st.ay / n : 0;
+            let best = null, bestC = Infinity, near = null, nearC = Infinity;
+            forEach((ex, ey) => {
+                const cx = (ex - dx) * scale, cy = (ey - dy) * scale;
+                const d = cx * cx + cy * cy;
+                if (d < nearC) {
+                    nearC = d;
+                    near = [ex, ey];
+                }
+                if (!aniso)
+                    return;
+                const al = cx * ux + cy * uy, pe = cy * ux - cx * uy;
+                if (Math.abs(al) > LatticeChoice.MAX_ALONG_PX)
+                    return;
+                const c = al * al + LatticeChoice.PERP_WEIGHT * pe * pe;
+                if (c < bestC) {
+                    bestC = c;
+                    best = [ex, ey];
+                }
+            });
+            return best ?? near;
+        },
+    };
+
     globalThis.displayxrWindowGeometry = {
         //! gi: {Clutter, GObject, Meta, Gio, GLib} — however the caller's
         //! shell spells the import. Returns {WindowGeometryService}.
@@ -161,6 +246,8 @@
                 built = buildModule(gi);
             return built;
         },
+        //! The drag-lattice entry choice, exported for its unit test.
+        LatticeChoice,
     };
 
     function buildModule({Clutter, GObject, Meta, Gio, GLib, Graphene}) {
@@ -593,6 +680,10 @@
         //! a read-only copy — see "Drag lattice"), so it is off by default and
         //! kept only for when mutter makes the rect writable.
         const LATTICE_USE_CONSTRAINT = GLib.getenv('DISPLAYXR_LATTICE_CONSTRAINT') === '1';
+        //! DISPLAYXR_LATTICE_NEAREST=1: land each move on the plain nearest
+        //! entry, as versions 6-8 did, instead of LatticeChoice's
+        //! direction-aware pick. For A/B comparison on a panel only.
+        const LATTICE_NEAREST = GLib.getenv('DISPLAYXR_LATTICE_NEAREST') === '1';
 
         let DragLatticeConstraint = null;
         if (HAVE_EXTERNAL_CONSTRAINT) {
@@ -665,7 +756,15 @@
                 const r = win.get_frame_rect();
                 const dx = r.x - t.startX, dy = r.y - t.startY;
                 const inside = dx >= t.minDx && dx <= t.maxDx && dy >= t.minDy && dy <= t.maxDy;
-                const best = inside ? this._nearest(t, dx, dy) : null;
+                // Device px per logical px where the window is now: the
+                // choice weighs its errors in device px (LatticeChoice).
+                const mon = win.get_monitor();
+                const scale = mon >= 0 ? win.get_display().get_monitor_scale(mon) : 1;
+                LatticeChoice.observe(t.choice, dx, dy, scale);
+                const best = inside
+                    ? LatticeChoice.choose(t.choice, this._candidates(t, dx, dy), dx, dy, scale,
+                        LATTICE_NEAREST)
+                    : null;
                 if (!best) {
                     this._stats.misses++;
                     this._drag.misses++;
@@ -831,6 +930,9 @@
                         (LATTICE_TEST ? 120 * 1000 * 1000 : LATTICE_PRE_GRAB_US),
                     entries: dxs.length,
                     piece,
+                    // The drag direction survives an extension of the same
+                    // drag; a new start begins from rest.
+                    choice: merge && prev.choice ? prev.choice : LatticeChoice.create(),
                 });
                 if (LATTICE_TEST) {
                     // Test mode: audit paints from the moment the table lands,
@@ -952,24 +1054,32 @@
                 return null;
             }
 
-            _nearest(t, dx, dy) {
+            //! The entries a move to (dx, dy) may land on: the 5 x 5 buckets
+            //! around it, as a forEach for LatticeChoice.
+            _candidates(t, dx, dy) {
                 const bx = Math.floor(dx / t.cell), by = Math.floor(dy / t.cell);
-                let best = null, bestD = Infinity;
-                for (let j = -2; j <= 2; j++) {
-                    for (let i = -2; i <= 2; i++) {
-                        const b = t.buckets.get(`${bx + i},${by + j}`);
-                        if (!b)
-                            continue;
-                        for (let k = 0; k < b.length; k += 2) {
-                            const ex = b[k] - dx, ey = b[k + 1] - dy;
-                            const d = ex * ex + ey * ey;
-                            if (d < bestD) {
-                                bestD = d;
-                                best = [b[k], b[k + 1]];
-                            }
+                return cb => {
+                    for (let j = -2; j <= 2; j++) {
+                        for (let i = -2; i <= 2; i++) {
+                            const b = t.buckets.get(`${bx + i},${by + j}`);
+                            if (!b)
+                                continue;
+                            for (let k = 0; k < b.length; k += 2)
+                                cb(b[k], b[k + 1]);
                         }
                     }
-                }
+                };
+            }
+
+            _nearest(t, dx, dy) {
+                let best = null, bestD = Infinity;
+                this._candidates(t, dx, dy)((x, y) => {
+                    const d = (x - dx) * (x - dx) + (y - dy) * (y - dy);
+                    if (d < bestD) {
+                        bestD = d;
+                        best = [x, y];
+                    }
+                });
                 return best;
             }
 
