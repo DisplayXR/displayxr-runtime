@@ -33,6 +33,8 @@ add_library(
 	u_capture_dims.h
 	u_stereo_camera.c
 	u_stereo_camera.h
+	u_stereo_rectify.c
+	u_stereo_rectify.h
 	u_color_encoding.h
 	u_debug.c
 	u_debug.h

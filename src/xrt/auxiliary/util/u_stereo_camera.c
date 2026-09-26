@@ -9,6 +9,7 @@
 #include "util/u_stereo_camera.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 
@@ -391,5 +392,80 @@ u_stereo_camera_estimate_disparity(const uint8_t *gray,
 		}
 	}
 	*out_disparity = (float)best_d + sub;
+	return true;
+}
+
+bool
+u_stereo_camera_estimate_offset(const uint8_t *gray,
+                                uint32_t pitch,
+                                uint32_t eye_width,
+                                uint32_t height,
+                                uint32_t x0,
+                                uint32_t y0,
+                                uint32_t w,
+                                uint32_t h,
+                                uint32_t max_disparity,
+                                uint32_t max_dy,
+                                float *out_dx,
+                                float *out_dy)
+{
+	if (gray == NULL || out_dx == NULL || out_dy == NULL || w == 0 || h == 0 || x0 + w > eye_width ||
+	    y0 + h > height || y0 < max_dy || y0 + h + max_dy > height || max_dy > 32) {
+		return false;
+	}
+	uint32_t dmax = max_disparity < x0 ? max_disparity : x0;
+	if (dmax > 255) {
+		dmax = 255;
+	}
+	const uint32_t ny = 2 * max_dy + 1;
+	// SSD surface over (d, dy); a quadratic cost makes the parabola fit unbiased.
+	static const uint64_t k_inf = UINT64_MAX;
+	uint64_t *ssd = (uint64_t *)malloc(sizeof(uint64_t) * (dmax + 1) * ny);
+	if (ssd == NULL) {
+		return false;
+	}
+	uint64_t best = k_inf;
+	uint32_t bd = 0, by = 0;
+	for (uint32_t j = 0; j < ny; j++) {
+		int dy = (int)j - (int)max_dy;
+		for (uint32_t d = 0; d <= dmax; d++) {
+			uint64_t s = 0;
+			for (uint32_t y = y0; y < y0 + h; y++) {
+				const uint8_t *l = gray + (size_t)y * pitch + x0;
+				const uint8_t *r = gray + (size_t)((int)y + dy) * pitch + eye_width + x0 - d;
+				for (uint32_t x = 0; x < w; x++) {
+					int diff = (int)l[x] - (int)r[x];
+					s += (uint64_t)(diff * diff);
+				}
+			}
+			ssd[j * (dmax + 1) + d] = s;
+			if (s < best) {
+				best = s;
+				bd = d;
+				by = j;
+			}
+		}
+	}
+	float sx = 0.0f, sy = 0.0f;
+	if (bd > 0 && bd < dmax) {
+		double a = (double)ssd[by * (dmax + 1) + bd - 1], b = (double)ssd[by * (dmax + 1) + bd],
+		       c = (double)ssd[by * (dmax + 1) + bd + 1];
+		double den = a - 2.0 * b + c;
+		if (den > 0.0) {
+			sx = (float)(0.5 * (a - c) / den);
+		}
+	}
+	if (by > 0 && by + 1 < ny) {
+		double a = (double)ssd[(by - 1) * (dmax + 1) + bd], b = (double)ssd[by * (dmax + 1) + bd],
+		       c = (double)ssd[(by + 1) * (dmax + 1) + bd];
+		double den = a - 2.0 * b + c;
+		if (den > 0.0) {
+			sy = (float)(0.5 * (a - c) / den);
+		}
+	}
+	free(ssd);
+	*out_dx = (float)bd + sx;
+	// A left feature at row y is found at row y + dy in the right eye.
+	*out_dy = (float)((int)by - (int)max_dy) + sy;
 	return true;
 }
