@@ -13,7 +13,9 @@
  *  - SBS / NVIEW: the input, horizontally SHIFTED per view (a constant
  *    parallax, not depth-aware), views side by side.
  *  - DEPTH: a vertical gradient (R32_FLOAT, 0 at the top, 1 at the bottom).
- *  - GAUSSIANS: a tiny valid two-layer 3DGS PLY (sim_display_fake_ply.h).
+ *  - GAUSSIANS: a camera-consistent two-layer 3DGS PLY of the input photo
+ *    (OpenCV axes, front layer at 1.8 m, hidden layer at 2.6 m; see
+ *    sim_display_fake_ply.h).
  *
  * SIM_DISPLAY_FAKE_LIFT_LATENCY_MS (default 8) sleeps inside each convert so
  * the runtime's asynchrony and latest-wins dropping are observable.
@@ -75,6 +77,7 @@ sim_fake_lift_convert_blob(struct sim_fake_lift *fl,
                            void *input_resource,
                            uint32_t w,
                            uint32_t h,
+                           float focal_px, //!< the input's focal in pixels; <= 0 = default FOV
                            uint32_t *out_format,
                            const void **out_bytes,
                            size_t *out_size);

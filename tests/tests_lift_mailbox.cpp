@@ -27,6 +27,7 @@
 #include "sim_display_fake_ply.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -361,19 +362,21 @@ TEST_CASE("lift mailbox: effective rate from publish intervals", "[lift]")
 	CHECK(u_lift_mailbox_rate_hz(&mb) == Catch::Approx(25.0f).epsilon(0.01));
 }
 
-TEST_CASE("sim fake lift: the splat PLY is a valid two-layer 3DGS binary PLY", "[lift][ply]")
+TEST_CASE("sim fake lift: the splat PLY is a valid, image-aligned two-layer 3DGS binary PLY", "[lift][ply]")
 {
-	const uint32_t w = 64, h = 48;
+	const uint32_t w = 192, h = 108;
 	std::vector<uint8_t> rgba(w * h * 4, 0);
 	for (uint32_t i = 0; i < w * h; i++) {
 		rgba[i * 4 + 0] = 255; // red photo
 		rgba[i * 4 + 3] = 255;
 	}
-	size_t need = sim_fake_ply_write(nullptr, 0, rgba.data(), w, h, w * 4);
+	const float focal = 150.0f;
+	size_t need = sim_fake_ply_write(nullptr, 0, rgba.data(), w, h, w * 4, focal);
 	REQUIRE(need > 0);
 	std::vector<uint8_t> ply(need);
-	CHECK(sim_fake_ply_write(ply.data(), ply.size() - 1, rgba.data(), w, h, w * 4) == need); // too small: nothing
-	CHECK(sim_fake_ply_write(ply.data(), ply.size(), rgba.data(), w, h, w * 4) == need);
+	CHECK(sim_fake_ply_write(ply.data(), ply.size() - 1, rgba.data(), w, h, w * 4, focal) == need); // too small
+	CHECK(sim_fake_ply_write(ply.data(), ply.size(), rgba.data(), w, h, w * 4, focal) == need);
+	CHECK(need < 1024 * 1024); // "under ~1 MB"
 
 	std::string text(reinterpret_cast<const char *>(ply.data()), std::min<size_t>(ply.size(), 1024));
 	REQUIRE(text.rfind("ply\nformat binary_little_endian 1.0\n", 0) == 0);
@@ -387,15 +390,37 @@ TEST_CASE("sim fake lift: the splat PLY is a valid two-layer 3DGS binary PLY", "
 	CHECK(ply.size() - hdr_end == (size_t)SIM_FAKE_PLY_SPLATS * SIM_FAKE_PLY_FLOATS_PER_SPLAT * 4);
 	CHECK(SIM_FAKE_PLY_SPLATS >= 200); // "a few hundred splats"
 
-	// First splat: front layer (z = 0), red dominant in its SH DC term.
+	auto splat = [&](size_t i, float *f) {
+		memcpy(f, ply.data() + hdr_end + i * SIM_FAKE_PLY_FLOATS_PER_SPLAT * 4, SIM_FAKE_PLY_FLOATS_PER_SPLAT * 4);
+	};
+	// First splat: front layer, top-left cell — in FRONT of the camera (OpenCV,
+	// +z forward), at the near depth, red dominant, opaque, identity rotation.
 	float f[SIM_FAKE_PLY_FLOATS_PER_SPLAT];
-	memcpy(f, ply.data() + hdr_end, sizeof(f));
-	CHECK(f[2] == 0.0f);
+	splat(0, f);
+	CHECK(f[2] == SIM_FAKE_PLY_Z_FRONT);
+	CHECK(f[0] < 0.0f); // left of the axis
+	CHECK(f[1] < 0.0f); // above it (+y down)
 	CHECK(f[6] > f[7]);
 	CHECK(f[6] > f[8]);
-	// Last splat: back layer, behind the front one.
-	memcpy(f, ply.data() + ply.size() - sizeof(f), sizeof(f));
-	CHECK(f[2] > 0.0f);
+	CHECK(f[9] == 2.0f); // opacity logit
+	CHECK(std::exp(f[10]) == Catch::Approx(0.6f * (w / (float)SIM_FAKE_PLY_GRID_X) * f[2] / focal));
+	CHECK(text.find("comment dxr-lift-meta {\"focalPx\":150.000,\"w\":192,\"h\":108,\"pivotZ\":1.8,"
+	                "\"axes\":\"opencv\"}\n") != std::string::npos);
+	CHECK(f[13] == 1.0f);
+	// It projects back onto its own pixel: u = fx * x / z + cx.
+	CHECK(focal * f[0] / f[2] + w * 0.5f == Catch::Approx((0.5f / SIM_FAKE_PLY_GRID_X) * w).margin(0.01));
+	CHECK(focal * f[1] / f[2] + h * 0.5f == Catch::Approx((0.5f / SIM_FAKE_PLY_GRID_Y) * h).margin(0.01));
+	// Last front splat (bottom-right): right of and below the axis.
+	float g[SIM_FAKE_PLY_FLOATS_PER_SPLAT];
+	splat(SIM_FAKE_PLY_SPLATS / 2 - 1, g);
+	CHECK(g[0] > 0.0f);
+	CHECK(g[1] > 0.0f);
+	// Back (hidden) layer: the same ray, farther and darker.
+	float b[SIM_FAKE_PLY_FLOATS_PER_SPLAT];
+	splat(SIM_FAKE_PLY_SPLATS / 2, b);
+	CHECK(b[2] == SIM_FAKE_PLY_Z_BACK);
+	CHECK(b[0] / b[2] == Catch::Approx(f[0] / f[2]));
+	CHECK(b[6] < f[6]);
 }
 
 TEST_CASE("lift snapshot cap: long edge capped, aspect kept, dims even", "[lift][cap]")

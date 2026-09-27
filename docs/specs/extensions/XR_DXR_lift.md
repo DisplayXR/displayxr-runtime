@@ -337,7 +337,11 @@ Mirrors XR_DXR_weave §4b.
 
 Full slot reference: [`xrt_plugin_iface.md` § lift](../../reference/xrt_plugin_iface.md#turning-2d-into-3d-the-lift-slots-adr-042-xr_dxr_lift).
 sim_display carries an env-gated fake (`SIM_DISPLAY_FAKE_LIFT=1`; `SIM_DISPLAY_FAKE_LIFT_LATENCY_MS`,
-default 8): shifted SBS/N-view, a gradient depth, a two-layer 3DGS PLY — the whole path runs in CI
+default 8): shifted SBS/N-view, a gradient depth, and a camera-consistent 3DGS PLY of the input
+photo (OpenCV axes — camera at the origin looking +z, +y down — 2 x 96x54 splats back-projected
+with `focalPx` (default 60° horizontal FOV), front layer at 1.8 m, a darker hidden layer at 2.6 m,
+opacity logit 2.0, scale ln(0.6·(w/96)·Z/f); ~705 KB; the PLY header carries
+`comment dxr-lift-meta {"focalPx","w","h","pivotZ":1.8,"axes":"opencv"}`) — the whole path runs in CI
 without hardware.
 
 ## 12. Probe and diagnostics

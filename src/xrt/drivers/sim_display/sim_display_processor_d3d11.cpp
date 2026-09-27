@@ -833,9 +833,8 @@ sim_dp_d3d11_lift_convert_blob(struct xrt_display_processor_d3d11 *xdp,
                                const void **out_bytes,
                                size_t *out_size)
 {
-	(void)p;
 	return sim_fake_lift_convert_blob(sim_dp_d3d11(xdp)->fake_lift, id, d3d11_context, input_resource, w, h,
-	                                  out_format, out_bytes, out_size);
+	                                  p != nullptr ? p->focal_px : 0.0f, out_format, out_bytes, out_size);
 }
 
 extern "C" xrt_result_t

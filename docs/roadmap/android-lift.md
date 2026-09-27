@@ -178,6 +178,16 @@ writable path in the runtime package's external files dir — a follow-up
 (`debug.dxr.lift.dump`), not free. The lift INPUT slots are CPU-readable (`CPU_READ_OFTEN`), so
 that part of such a dump would be cheap.
 
+**The fake's splats.** GAUSSIANS on the fake return the input photo as a camera-consistent PLY
+(`sim_display_fake_ply.c`, shared with the D3D11 fake): OpenCV axes (+z forward, +y down), 2 x
+96x54 = 10,368 splats (~705 KB, < 1 ms), front layer at Z = 1.8 m, a darker hidden layer at
+2.6 m on the same rays, back-projected with the stream's `focalPx` (60° horizontal FOV when
+none). From the capture viewpoint it reads as the photo, so a black explore view is a consumer
+bug, not the fake. The PLY header carries `comment dxr-lift-meta {"focalPx":…,"w":…,"h":…,
+"pivotZ":1.8,"axes":"opencv"}`; the browser's `X-DXR-Lift-Meta` HTTP header is set by the
+browser (patch 0226), not the runtime, so `pivotZ` / `axes` reach it only if the browser forwards
+that comment or sets them itself.
+
 ## Follow-ups (not in step 1)
 
 - **Letterbox crop** on Android: port the HLSL row/column profile pass to GLSL / compute.

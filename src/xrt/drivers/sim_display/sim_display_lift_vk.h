@@ -17,8 +17,10 @@
  *  - DEPTH: a vertical gradient, RELATIVE (larger = farther): 0 at the top,
  *    255 at the bottom, in R (and G, B) of an RGBA8 buffer — AHardwareBuffer
  *    has no single-channel float format.
- *  - GAUSSIANS: the same tiny two-layer 3DGS PLY as the D3D11 fake
- *    (sim_display_fake_ply.h), front layer coloured from the photo.
+ *  - GAUSSIANS: the same PLY generator as the D3D11 fake (sim_display_fake_ply.h):
+ *    the input photo as 2 x 96x54 splats in OpenCV camera axes, front layer at
+ *    1.8 m, a darker hidden layer at 2.6 m, back-projected with the stream's
+ *    focalPx.
  *
  * The fake is deliberately CPU-only: it reads the input through
  * AHardwareBuffer_lock (the runtime allocates it CPU_READ_OFTEN precisely so a

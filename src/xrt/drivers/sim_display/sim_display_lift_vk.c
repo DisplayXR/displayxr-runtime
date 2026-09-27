@@ -345,13 +345,13 @@ fake_convert_blob(struct xrt_display_processor_vk *xdp,
                   size_t *out_size)
 {
 	(void)input_image;
-	(void)p;
 	struct fake_vk_stream *s = find_stream(sim_lift_vk_dp(xdp), id);
 	if (s == NULL || s->mode != XRT_DP_LIFT_MODE_GAUSSIANS || input_buffer == NULL || out_format == NULL ||
 	    out_bytes == NULL || out_size == NULL) {
 		return false;
 	}
-	const size_t need = sim_fake_ply_write(NULL, 0, NULL, w, h, 0);
+	const float focal = p != NULL ? p->focal_px : 0.0f; // <= 0: the generator's default FOV
+	const size_t need = sim_fake_ply_write(NULL, 0, NULL, w, h, 0, focal);
 	if (s->blob_size != need) {
 		free(s->blob);
 		s->blob = (uint8_t *)malloc(need);
@@ -362,7 +362,7 @@ fake_convert_blob(struct xrt_display_processor_vk *xdp,
 	}
 	uint32_t stride_px = 0;
 	const uint8_t *rgba = lock_read((AHardwareBuffer *)input_buffer, &stride_px);
-	sim_fake_ply_write(s->blob, s->blob_size, rgba, w, h, stride_px * 4u);
+	sim_fake_ply_write(s->blob, s->blob_size, rgba, w, h, stride_px * 4u, focal);
 	if (rgba != NULL) {
 		AHardwareBuffer_unlock((AHardwareBuffer *)input_buffer, NULL);
 	}

@@ -391,6 +391,7 @@ sim_fake_lift_convert_blob(struct sim_fake_lift *fl,
                            void *input_resource,
                            uint32_t w,
                            uint32_t h,
+                           float focal_px,
                            uint32_t *out_format,
                            const void **out_bytes,
                            size_t *out_size)
@@ -430,9 +431,9 @@ sim_fake_lift_convert_blob(struct sim_fake_lift *fl,
 		}
 	}
 
-	size_t need = sim_fake_ply_write(nullptr, 0, nullptr, w, h, 0);
+	size_t need = sim_fake_ply_write(nullptr, 0, nullptr, w, h, 0, focal_px);
 	s->blob.resize(need);
-	sim_fake_ply_write(s->blob.data(), s->blob.size(), rgba, w, h, pitch);
+	sim_fake_ply_write(s->blob.data(), s->blob.size(), rgba, w, h, pitch, focal_px);
 
 	if (mapped) {
 		ctx->Unmap(staging, 0);
