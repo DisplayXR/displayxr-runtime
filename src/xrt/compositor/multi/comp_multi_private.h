@@ -887,6 +887,7 @@ struct multi_compositor
 		struct xrt_display_processor *dp;
 
 		uint64_t window_id;   //!< Present-owner window id from bind (an XID; recorded only).
+		bool window_bound;    //!< A bind has happened (first-bind WARN; repeats are silent).
 		uint64_t fence_value; //!< Monotonic; completion is synchronous in stage A.
 
 		//! @name Explicit window geometry (spec v7 XrWeaveWindowGeometryDXR)

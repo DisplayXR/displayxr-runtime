@@ -2296,9 +2296,19 @@ comp_multi_weave_bind_window(struct xrt_compositor *xc, uint64_t window_id)
 	// Recorded only: an XID (X11) or 0 (Wayland, where a client cannot name
 	// its window to another process). The service creates no window and never
 	// derives geometry from it — that arrives through set_window_geometry.
+	const bool first = !mc->weave.window_bound;
+	const bool changed = first || mc->weave.window_id != window_id;
+	mc->weave.window_bound = true;
 	mc->weave.window_id = window_id;
 	os_mutex_unlock(&mc->weave.mutex);
-	U_LOG_W("weave(#1699): bound present-owner window id 0x%" PRIx64, window_id);
+	// A present-owner re-binds on every move — every frame of a drag under v12
+	// move sync — so this must not be a per-frame WARN: one WARN for the
+	// session's first bind, INFO when the id changes, silence on a repeat.
+	if (first) {
+		U_LOG_W("weave(#1699): bound present-owner window id 0x%" PRIx64, window_id);
+	} else if (changed) {
+		U_LOG_I("weave(#1699): present-owner window id now 0x%" PRIx64, window_id);
+	}
 	return true;
 }
 
