@@ -4,11 +4,11 @@
 |---|---|
 | **Extension Name** | `XR_DXR_lift` |
 | **Spec Version** | 1 |
-| **Extension Type** | Instance extension (service path — Windows/D3D11; advertised on every desktop platform, where a service without a module reports `supportedModes = 0`) |
+| **Extension Type** | Instance extension (service path — Windows/D3D11 and Android/Vulkan; also advertised on macOS and desktop Linux, whose services report `supportedModes = 0`) |
 | **Header** | `src/external/openxr_includes/openxr/XR_DXR_lift.h` (canonical; auto-syncs to `displayxr-extensions`) |
 | **Status** | Provisional (`1004999270–280` block, pending Khronos registry) |
 | **Decision record** | [ADR-042](../../adr/ADR-042-vendor-2d3d-conversion-supersedes-default.md) |
-| **Plug-in contract** | `src/xrt/include/xrt/xrt_dp_lift.h` + the lift slots of `xrt_display_processor_d3d11` (`XRT_DP_D3D11_HAS_LIFT`), [`xrt_plugin_iface.md` § lift](../../reference/xrt_plugin_iface.md#turning-2d-into-3d-the-lift-slots-adr-042-xr_dxr_lift) |
+| **Plug-in contract** | `src/xrt/include/xrt/xrt_dp_lift.h` + the lift slots of `xrt_display_processor_d3d11` (`XRT_DP_D3D11_HAS_LIFT`) and of `xrt_display_processor_vk` (`XRT_DP_VK_HAS_LIFT`, Android), [`xrt_plugin_iface.md` § lift](../../reference/xrt_plugin_iface.md#turning-2d-into-3d-the-lift-slots-adr-042-xr_dxr_lift) |
 
 ## 1. What it is
 
@@ -52,8 +52,8 @@ if (props.state == XR_LIFT_STATE_READY_DXR && (props.supportedModes & XR_LIFT_MO
 | Situation | `xrGetLiftPropertiesDXR` |
 |---|---|
 | In-process session (any platform) | `XR_ERROR_FEATURE_UNSUPPORTED` — lift is IPC-only, like the weave service |
-| Service without a module (macOS, Linux, Android, or a Windows plug-in without lift slots, sim_display) | `XR_SUCCESS`, `supportedModes = 0`, `UNAVAILABLE` |
-| First query on a Windows service with a module | `ACTIVATING` (the service is bringing its lift device + the plug-in's lift DP up in the background) |
+| Service without a module (macOS, desktop Linux, a Windows plug-in without lift slots, an Android plug-in without `create_dp_vk_lift`, sim_display without its fake) | `XR_SUCCESS`, `supportedModes = 0`, `UNAVAILABLE` |
+| First query on a Windows / Android service with a module | `ACTIVATING` (the service is bringing its lift device / lift thread + the plug-in's lift DP up in the background) |
 | Module loading (model weights, licence check, engine build) | `ACTIVATING` — poll ≤ 2 Hz, do not fall back permanently |
 | Module up | `READY`, `supportedModes` = the module's bits, `backend` = its name |
 | Module failed / `DXR_LIFT=0` on the service | `UNAVAILABLE` |
@@ -282,6 +282,9 @@ UI rates.
 
 ## 9. Service implementation (for reviewers)
 
+Windows below; the Android service (`comp_multi_lift_android.c`) has the same shape on Vulkan —
+see [§ Android](#android).
+
 - **One lift thread** per service (`d3d11_lift.cpp`), created on the first lift call. It owns a
   **dedicated D3D11 device** on the service adapter (`ID3D11Multithread` protection on) and the
   plug-in's **lift-only display processor** (`xrt_plugin_iface::create_dp_d3d11_lift`; fallback:
@@ -373,6 +376,7 @@ order: runtime → extensions auto-sync → consumers.
 | Version | Change |
 |---|---|
 | 1 | Initial: properties + states, streams (DEPTH / SBS / NVIEW / GAUSSIANS), non-blocking latest-wins submit, texture acquire (weave-style handles + fence), blob acquire (two-call latch), weave-rect lift chain, per-stream priority scheduling + stats, `focalPx`. |
+| 1 (Android service) | No API change. The Android service implements the extension (§ Android): `AHardwareBuffer *` handles, AHB formats, no fence. A v2 `handleKind` field — the weave's `XrWeaveSubmitHandlesDXR` shape, so a wrong-platform handle is a validation error rather than a dereference — is a follow-up. |
 
 ## Probing on a Windows box — gotchas (first N0 run, 2026-09-25)
 
@@ -380,3 +384,92 @@ order: runtime → extensions auto-sync → consumers.
 - **`displayxr-cli lift …` must run non-elevated** — an elevated prompt reports "not connected to the service" (same integrity-level rule as every other IPC client).
 - **Vendor module version gate.** The Leia plug-in logs the NeurD version it loaded and reports `UNAVAILABLE` when it is outside the supported range (needs 0.4.3+): e.g. a box with Immersity Live's NeurD 0.3.7 shows `state -> ACTIVATING` then `UNAVAILABLE` with the reason in the service log. Upgrade the NeurD runtime; the plug-in never crashes on a mismatch.
 - **Probe timing.** `lift probe` stamps submit→acquire before any readback; use `--no-write` (or `--write-every N`) for throughput runs — encoding a 4K SBS PNG takes seconds and would otherwise cap the pipelined rate.
+
+## Android
+
+The Android service implements the extension with the same semantics as Windows — latest-wins
+mailbox, priorities, `source_time` stamping, stats, weave-rect lifting — on Vulkan and
+`AHardwareBuffer` (`comp_multi_lift_android.c`, one lift module per service process, including
+each satellite slot process). Design notes, sequencing and the vendor-module plan:
+[`docs/roadmap/android-lift.md`](../../roadmap/android-lift.md).
+
+### What differs from Windows
+
+| | Windows (D3D11 service) | Android (comp_multi service) |
+|---|---|---|
+| `XrLiftFrameSubmitInfoDXR::inputTexture` | NT / DXGI shared handle, keyed mutex key 0 | `AHardwareBuffer *` (RGBA8, GPU-sampleable). The caller's GPU writes must be **complete** before the call (the weave's Android input contract; an acquire sync_file is a follow-up). `inputIsDxgi` must be `XR_FALSE`. |
+| `XrLiftResultDXR::outputTexture` | shared NT HANDLE | `AHardwareBuffer *`, handed out on the first acquire and on every reallocation; **the caller owns that reference** and `AHardwareBuffer_release()`s it |
+| `XrLiftResultDXR::format` | `DXGI_FORMAT` | `AHARDWAREBUFFER_FORMAT_*` (the sim fake returns `R8G8B8A8_UNORM`; a DEPTH result is `R8_UNORM` or a 4-channel format with depth in R — AHB has no single-channel float format) |
+| `XrLiftResultDXR::fence` | shared fence | always `NULL`: the acquire copies the result into the output buffer and waits for the GPU before its IPC reply; `fenceValue` is a plain counter. The export latch uses the weave's #1427 rule (texture alone = complete export). |
+| Weave-rect snapshot cap | 4-tap box filter | one linear `vkCmdBlitImage` (exact up to 2x, aliases a little beyond) — same 1920 default, `debug.dxr.lift.max_input_edge` / `DXR_LIFT_MAX_INPUT_EDGE` |
+| Letterbox crop | on (`DXR_LIFT_LETTERBOX`) | **off** in v1 — its profile pass is an HLSL shader; the GLSL port is a follow-up. Weave-rect snapshots take the whole rect. |
+| Lift DP | `create_dp_d3d11_lift`, fallback `create_dp_d3d11` with a NULL window | `create_dp_vk_lift` only — no fallback (the ordinary Android factory starts the vendor's whole display stack) |
+| Lift device / queue | a dedicated D3D11 device | the service's VkDevice; lift copies go to its one graphics queue under the queue lock and are CPU-waited before a slot changes hands |
+| Tracked eyes | the panel DP's predicted eyes | the eyes returned by the latest weave submit (≤ 500 ms old); none for a non-weaving session |
+
+Everything else — states, modes, the two-call blob latch, `maxStreams`, priorities, stats,
+error codes, streams owned by the IPC connection — is identical.
+
+### The plug-in side (Vulkan lift slots)
+
+`xrt_display_processor_vk` carries the five lift slots under `XRT_DP_VK_HAS_LIFT`;
+`xrt_plugin_iface::create_dp_vk_lift` (`XRT_PLUGIN_IFACE_HAS_VK_LIFT_FACTORY`) creates the
+lift-only DP. The factory runs on the service **main** thread (Looper-bearing, JNI-attached);
+every slot after that on the lift thread (JavaVM-attached). Memory contract, CPU-drained both
+ways (full text in `xrt_dp_lift.h` / `xrt_display_processor_vk.h`):
+
+- **input** — a runtime-owned RGBA8 `AHardwareBuffer`, exactly `w x h`,
+  `GPU_SAMPLED_IMAGE | GPU_COLOR_OUTPUT | CPU_READ_OFTEN` (a GPU module samples it, a CPU /
+  GLES module locks it or binds it as an EGLImage), plus the `VkImage` the runtime imported
+  from it (GENERAL). Its writes are complete when the call starts.
+- **output** — a DP-owned `AHardwareBuffer` + its `VkImage` (GENERAL), or no `VkImage` and the
+  runtime imports the buffer itself, cached by pointer. Valid until the stream's next call;
+  complete when the call returns.
+
+### Service knobs (system properties — `getenv` does not reach the Android service)
+
+| Property | Effect |
+|---|---|
+| `debug.dxr.lift 0` | kill switch → UNAVAILABLE, the lift DP is never created (env `DXR_LIFT=0` too) |
+| `debug.dxr.lift.plugin <id>` | take the lift DP from bundled plug-in `<id>` (`libdxrpNNN_<id>.so`; `sim_display` / `sim-display` both match) instead of the active one — the `DXR_PLUGIN_EXCLUSIVE` rule for the lift DP only: no fallback on a miss. The weaving DP stays the active plug-in's. |
+| `debug.dxr.lift.fake 1` | sim_display's fake lift module (also `SIM_DISPLAY_FAKE_LIFT=1` / `debug.xrt.SIM_DISPLAY_FAKE_LIFT`) |
+| `debug.dxr.lift.fake_latency_ms N` | the fake's per-convert sleep (default 8) |
+| `debug.dxr.lift.max_input_edge N` | weave-rect snapshot cap (default 1920, `0` = off) |
+
+`debug.dxr.lift.plugin` is resolved once per service process and the others when the lift
+module is created (first lift call), so set them **before** the service process starts.
+
+### Probe recipe (no browser)
+
+`displayxr-cli lift probe` does not exist on Android — a bare executable has no `Context` to
+bind the runtime service. The reference present-owner app `weave_client_vk_android` carries the
+probe instead (`debug.dxr.lift.probe weave|explicit|both`, see its README). The sim fake beside
+the real Leia weaver:
+
+```bash
+./gradlew :src:xrt:targets:openxr_android:assembleDebug -PdxrForceVendoredCjson  # -P… only on a host with brew cJSON
+./gradlew :test_apps:weave_client_vk_android:assembleDebug -PdxrForceVendoredCjson
+adb install -r -d src/xrt/targets/openxr_android/build/outputs/apk/debug/openxr_android-debug.apk
+adb install -r -d test_apps/weave/weave_client_vk_android/build/outputs/apk/debug/weave_client_vk_android-debug.apk
+
+adb shell setprop debug.dxr.lift.fake 1
+adb shell setprop debug.dxr.lift.plugin sim_display   # omit on a sim_display-only device
+adb shell setprop debug.dxr.lift.probe both           # weave | explicit | both
+adb shell setprop debug.dxr.lift.probe_frames 300
+# The props are read when the service process starts: with NO client running, restart it
+# (never force-stop the runtime under a live client), or reboot.
+adb shell am start -n com.displayxr.weave_client_vk_android/.MainActivity
+
+adb logcat -v time | grep -E 'LIFT_PROBE|\[lift\]|FAKE lift'
+```
+
+Expected, in order: `[lift] debug.dxr.lift.plugin='sim_display': the lift DP comes from …`,
+`[lift] lift module created`, `sim_display: FAKE lift module (vk/AHardwareBuffer, CPU)`,
+`[lift] module state -> READY (modes=0xf backend='sim_display-fake-vk' …)`,
+`LIFT_PROBE: properties state=READY`, `[lift] stream N created` (x2),
+`LIFT_PROBE: result buffer (re)exported: 1920x540 format=0x1 views=2 fence=0x0`, per-result
+latency lines, then every 120 frames the stream stats and, after 300 explicit frames,
+`LIFT_PROBE: SUMMARY explicit: …`. On the panel, rect 0 (the top band) turns from flat 2D into
+the fake's constant-parallax stereo once the weave stream's first result lands. Clear the
+props afterwards (`setprop … ''`).
+

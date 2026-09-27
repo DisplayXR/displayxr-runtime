@@ -144,6 +144,15 @@ humans have been applying the feature rule by hand. Moving those tracks to
 `features` (with per-API `feature_headers`) is the natural follow-up; it is not
 done here because it changes when the Windows installer's floor moves.
 
+**Expected next trigger: `XRT_DP_VK_HAS_LIFT`** (ADR-042 on Android — five lift slots
+appended to `xrt_display_processor_vk` plus `xrt_plugin_iface::create_dp_vk_lift` /
+`XRT_PLUGIN_IFACE_HAS_VK_LIFT_FACTORY`, no ABI bump). The first runtime release carrying it
+opens a `features` repin PR on the leia `linux` track (its header set includes
+`xrt_display_processor_vk.h`); that repin is harmless — nothing on Linux calls the lift slots.
+The leia `android` track is `abi`, so it will **not** move by itself: the plug-in change that
+fills the Vulkan lift slots (the Media SDK module) must repin it by hand to a tag that has the
+macro, or its code compiles out silently.
+
 **Not visible to either gate:** a layout-only coupling with no macro. Leia's Linux
 floor v2.14.6 came from `vk_bundle` ABI-fingerprint fields (#1243) in
 `auxiliary/vk`, outside the DP headers, where an older ref simply fails to compile.

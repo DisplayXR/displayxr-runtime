@@ -37,7 +37,7 @@ Three questions have to be settled together:
 
 When `xrGetLiftPropertiesDXR` reports `READY` with the needed mode bit, a consumer that also
 ships an open converter uses the runtime's. It falls back to its open default only when the
-runtime reports `UNAVAILABLE` (no module, a failed one, a non-Windows service, an in-process
+runtime reports `UNAVAILABLE` (no module, a failed one, a service without the lift path, an in-process
 session) — and treats `ACTIVATING` as "not yet", polling, never as a permanent fallback.
 
 This is the same shape as weaving: the vendor's calibrated implementation, behind the plug-in,
@@ -120,7 +120,11 @@ predicted tracked eyes, or the app's), so the lift DP needs no tracker. A module
   box the lift device is on the service's render adapter; a module that runs on another adapter
   (its own device) pays its own bridge.
 - **−** Windows/D3D11 only in v1. Other platforms advertise the extension and report
-  `supportedModes = 0`, which the consumer contract already handles.
+  `supportedModes = 0`, which the consumer contract already handles. *(Amended 2026-09-27: the
+  Android service implements it too — the same five slots on `xrt_display_processor_vk`
+  (`XRT_DP_VK_HAS_LIFT`) and a `create_dp_vk_lift` factory, AHardwareBuffer in / out,
+  CPU-drained sync; see [XR_DXR_lift § Android](../specs/extensions/XR_DXR_lift.md#android)
+  and [android-lift](../roadmap/android-lift.md). macOS and desktop Linux remain modes 0.)*
 
 ## Alternatives rejected
 

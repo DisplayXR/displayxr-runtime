@@ -464,8 +464,43 @@ xrt_dp_factory_d3d11_fn_t create_dp_d3d11_lift; /* a DP that serves ONLY the lif
 - **Knobs live in the SERVICE's environment.** A vendor module that reads env vars (backend
   choice, gains) reads them in `displayxr-service.exe`'s process, not the app's.
 - **sim_display** fills the slots only under `SIM_DISPLAY_FAKE_LIFT=1` (shifted SBS/N-view,
-  gradient depth, a two-layer 3DGS PLY) so the whole path runs hardware-free.
+  gradient depth, a two-layer 3DGS PLY) so the whole path runs hardware-free — on Android also
+  under the system property `debug.dxr.lift.fake=1`, through its Vulkan lift-only factory.
 - **Purely additive**, so no `XRT_PLUGIN_API_VERSION_CURRENT` bump (ADR-020).
+
+### The Vulkan / Android twin (`XRT_DP_VK_HAS_LIFT`)
+
+The same five slots are appended to `xrt_display_processor_vk` (after
+`set_transparency_active`), with `create_dp_vk_lift` on the iface
+(`XRT_PLUGIN_IFACE_HAS_VK_LIFT_FACTORY`). Same semantics as above; the differences are the
+memory and the threads:
+
+```c
+bool (*lift_convert)(struct xrt_display_processor_vk *xdp, uint64_t id,
+                     void *input_buffer /* AHardwareBuffer*, RGBA8, exactly w x h, CPU_READ_OFTEN */,
+                     VkImage_XDP input_image /* the runtime's import of it, GENERAL */,
+                     uint32_t w, uint32_t h, const struct xrt_dp_lift_params *p,
+                     const float *viewpoints_xyz, uint32_t viewpoint_floats,
+                     void **out_buffer /* DP-owned AHardwareBuffer */,
+                     VkImage_XDP *out_image /* its VkImage (GENERAL), or 0: the runtime imports out_buffer */,
+                     uint32_t *out_w, uint32_t *out_h, uint32_t *out_format /* AHARDWAREBUFFER_FORMAT_* */);
+xrt_dp_factory_vk_fn_t create_dp_vk_lift; /* same signature as create_dp_vk; window NULL */
+```
+
+- **Threads.** The factory runs on the Android service's **main** thread (Looper-bearing, JNI
+  attached — start Looper-bound SDK init there); every slot afterwards on the lift thread, which
+  is attached to the JavaVM (JNI into a Java module is fine).
+- **Device and queue.** The DP shares the service's `VkDevice` (the factory's `vk_bundle`, guarded
+  by the same `vk_bundle_abi_size` fingerprint). Submit to `vk_bundle::main_queue` under
+  `vk_queue_lock`, and never hold the lock across a wait.
+- **Sync, v1: CPU-drained.** The runtime's writes to the input are complete when the call starts;
+  yours to the output must be complete when it returns. No semaphores or sync fds cross the slot.
+- **No fallback** to `create_dp_vk`: without `create_dp_vk_lift` the Android service reports no
+  module (the ordinary factory would start the whole vendor display stack for nothing).
+- **Picking the lift plug-in.** `debug.dxr.lift.plugin=<id>` takes the lift DP from another
+  bundled plug-in (e.g. sim_display's fake, `debug.dxr.lift.fake=1`) while the active one keeps
+  weaving. The named plug-in is negotiated but NOT probed, so a lift-only factory must not depend
+  on probe state.
 
 ## Where the window may LAND: `snap_window_rect`
 

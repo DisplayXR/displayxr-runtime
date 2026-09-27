@@ -62,6 +62,28 @@ adb shell setprop debug.dxr.overlay 1        # vendor force-3D; remember to clea
 | `debug.dxr.weave.passthrough 1` | blit the app's own pre-weave input instead of the woven output — the A/B that separates "my present path is broken" from "the weave is broken" |
 | `debug.dxr.weave.dump 1` | one-shot PPM dump of the input + the woven output |
 
+## XR_DXR_lift probe (ADR-042)
+
+The fastest on-device proof of the Android lift path without a browser (`displayxr-cli lift`
+cannot run on Android: a bare executable has no `Context` to bind the runtime service). Off
+unless a property names a mode:
+
+| Property | Effect |
+|---|---|
+| `debug.dxr.lift.probe weave` | the top rect carries a plain **2D** frame (gradient, white bars, walking yellow block) flagged with `XrWeaveSubmitLiftRectsDXR` on an SBS stream: woven flat until the first result, then as the converted pair — at the rect's current position every frame |
+| `debug.dxr.lift.probe explicit` | a separate 960x540 CPU-painted `AHardwareBuffer` through `xrSubmitLiftFrameDXR` + `xrAcquireLiftResultDXR` every frame; logs service latency, submit→acquire latency and frames skipped between results |
+| `debug.dxr.lift.probe both` | both, two streams |
+| `debug.dxr.lift.probe_frames N` | explicit frames before the SUMMARY line (default 300) |
+
+`XR_DXR_lift` is enabled only when the probe is on. With no vendor module installed, pair it
+with the sim fake: `debug.dxr.lift.fake 1` (+ `debug.dxr.lift.plugin sim_display` on a Leia
+device, so the fake lifts while Leia weaves). Full recipe:
+[`XR_DXR_lift.md` § Android](../../../docs/specs/extensions/XR_DXR_lift.md#android).
+
+```bash
+adb logcat -v time | grep -E 'LIFT_PROBE|\[lift\]|FAKE lift'
+```
+
 ## Known simplifications
 
 - One submit per frame with two rects; the v6 `XrWeaveSubmitLayoutDXR` N-view
