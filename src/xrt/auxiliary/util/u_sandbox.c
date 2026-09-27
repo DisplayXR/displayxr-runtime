@@ -262,6 +262,21 @@ u_sandbox_is_workspace_session(void)
 	return workspace_session != NULL && strcmp(workspace_session, "1") == 0;
 }
 
+enum u_sandbox_present_owner_route
+u_sandbox_linux_present_owner_route(bool env_forced,
+                                    bool weave_enabled,
+                                    bool window_binding_enabled,
+                                    bool service_socket_present)
+{
+	if (env_forced || !weave_enabled) {
+		return U_SANDBOX_PRESENT_OWNER_NOT_APPLICABLE;
+	}
+	if (window_binding_enabled) {
+		return U_SANDBOX_PRESENT_OWNER_WINDOW_BOUND;
+	}
+	return service_socket_present ? U_SANDBOX_PRESENT_OWNER_SERVICE : U_SANDBOX_PRESENT_OWNER_NO_SERVICE;
+}
+
 bool
 u_sandbox_should_use_ipc(void)
 {

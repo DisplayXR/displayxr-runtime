@@ -88,6 +88,52 @@ bool
 u_sandbox_is_workspace_session(void);
 
 /*!
+ * Outcome of the desktop-Linux XR_DXR_weave present-owner rule (#1744).
+ *
+ * @see u_sandbox_linux_present_owner_route
+ * @ingroup aux_sandbox
+ */
+enum u_sandbox_present_owner_route
+{
+	//! Not a present-owner decision: the generic rules decide (workspace
+	//! controller, u_sandbox_should_use_ipc). XRT_FORCE_MODE set, or no weave.
+	U_SANDBOX_PRESENT_OWNER_NOT_APPLICABLE = 0,
+	//! Weave enabled, but the app binds its own window/surface: not a
+	//! present-owner. Falls through to the generic rules, like NOT_APPLICABLE.
+	U_SANDBOX_PRESENT_OWNER_WINDOW_BOUND,
+	//! A present-owner and the service socket exists: dial the service.
+	U_SANDBOX_PRESENT_OWNER_SERVICE,
+	//! A present-owner with no service socket: in-process fallback.
+	U_SANDBOX_PRESENT_OWNER_NO_SERVICE,
+};
+
+/*!
+ * The desktop-Linux present-owner routing decision (#1744), as a pure function.
+ *
+ * XR_DXR_weave's present path lives only in the service compositor, so a
+ * present-owner is routed to it by capability. A present-owner is a session
+ * that enables XR_DXR_weave AND binds no window of its own: an app that hands
+ * the runtime its own window through an XR_DXR_*_window/surface_binding
+ * extension (the Linux demos, which enable weave only for the in-process
+ * xrWeaveSnapWindowRectDXR / xrWeaveSnapWindowGridDXR) is not one, and routing
+ * it to the service turned it into a HOSTED session with no external window.
+ *
+ * XRT_FORCE_MODE, when set, is authoritative and this rule does not apply.
+ *
+ * @param env_forced             XRT_FORCE_MODE is set to a non-empty value.
+ * @param weave_enabled          the app enabled XR_DXR_weave.
+ * @param window_binding_enabled the app enabled a window/surface binding extension.
+ * @param service_socket_present the displayxr-service socket file exists.
+ *
+ * @ingroup aux_sandbox
+ */
+enum u_sandbox_present_owner_route
+u_sandbox_linux_present_owner_route(bool env_forced,
+                                    bool weave_enabled,
+                                    bool window_binding_enabled,
+                                    bool service_socket_present);
+
+/*!
  * Does a routing-property value select @p process_name?
  *
  * The grammar behind `debug.dxr.force_ipc` and `ro.dxr.force_ipc` (#1277 P2).

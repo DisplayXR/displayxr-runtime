@@ -524,6 +524,28 @@ oxr_instance_create(struct oxr_logger *log,
 	    .ext_weave_enabled = extensions->DXR_weave,
 #endif
 	};
+	// #1744: an app that binds its OWN window/surface is not a present-owner
+	// even when it enables XR_DXR_weave (the Linux demos do, only for the
+	// in-process xrWeaveSnapWindowRectDXR / ...GridDXR). The hybrid router in
+	// xrt_instance_create reads this. Enabling the extension is the signal —
+	// whether a binding struct actually reaches xrCreateSession is not known
+	// yet here. Not in app_info: that struct is the IPC wire (see the field).
+	i_info.window_binding_enabled = false;
+#ifdef OXR_HAVE_DXR_wayland_surface_binding
+	i_info.window_binding_enabled |= extensions->DXR_wayland_surface_binding;
+#endif
+#ifdef OXR_HAVE_DXR_xlib_window_binding
+	i_info.window_binding_enabled |= extensions->DXR_xlib_window_binding;
+#endif
+#ifdef OXR_HAVE_DXR_win32_window_binding
+	i_info.window_binding_enabled |= extensions->DXR_win32_window_binding;
+#endif
+#ifdef OXR_HAVE_DXR_cocoa_window_binding
+	i_info.window_binding_enabled |= extensions->DXR_cocoa_window_binding;
+#endif
+#ifdef OXR_HAVE_DXR_android_surface_binding
+	i_info.window_binding_enabled |= extensions->DXR_android_surface_binding;
+#endif
 	// #960: declare the IPC client class from the enabled extension set. The
 	// service verifies the claim (ADR-035 D1); an unverifiable claim is demoted
 	// to APP server-side, never trusted.

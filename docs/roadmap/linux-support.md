@@ -500,8 +500,17 @@ build, and a `displayxr.service` unit that could never start (below).
   `xrCreateInstance` (`targets/openxr/target.c`). Ordinary apps stay
   in-process — the rules are Windows/macOS's (`XRT_FORCE_MODE`,
   `DISPLAYXR_WORKSPACE_SESSION`, workspace controllers → IPC). New on desktop
-  Linux, mirroring Android: a session that enables `XR_DXR_weave` goes to the
-  service **when its socket exists**, with no env var; when it does not (a
+  Linux, mirroring Android: a **present-owner** — a session that enables
+  `XR_DXR_weave` **and no window/surface binding extension** — goes to the
+  service **when its socket exists**, with no env var. An app that binds its
+  own window (`XR_DXR_xlib_window_binding` / `XR_DXR_wayland_surface_binding`)
+  and enables weave only for the in-process drag phase-snap
+  (`xrWeaveSnapWindowRectDXR` / `…GridDXR` — the demos, `cube_handle_vk_linux`)
+  is not a present-owner and stays in-process; v2.21.7 routed it to the service,
+  where it became a HOSTED session whose own window never mapped. A window-bound
+  app that really wants the service sets `XRT_FORCE_MODE=ipc`. The decision is
+  `u_sandbox_linux_present_owner_route()` (`tests_aux_present_owner_route`).
+  When the socket does not exist (a
   from-source runtime, a container, the unit disabled) it falls back to
   in-process, i.e. the old behaviour, instead of failing `xrCreateInstance`. A
   service that *answers* and refuses (version skew, client quota) is propagated.

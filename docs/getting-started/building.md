@@ -138,7 +138,7 @@ per `docs/roadmap/linux-support.md`.
 
 | Path | What |
 |---|---|
-| `/usr/lib/displayxr/lib/openxr_displayxr.so` | The **hybrid** runtime: ordinary apps run in-process; `XR_DXR_weave` present-owners (the DisplayXR browser) and workspace controllers go to `displayxr-service` over IPC. |
+| `/usr/lib/displayxr/lib/openxr_displayxr.so` | The **hybrid** runtime: ordinary apps (including window-bound apps that enable `XR_DXR_weave` only for drag phase-snap) run in-process; `XR_DXR_weave` present-owners that bind no window of their own (the DisplayXR browser) and workspace controllers go to `displayxr-service` over IPC. |
 | `/usr/lib/displayxr/bin/displayxr-service` (+ `/usr/bin/` link) | The out-of-process compositor (the weave engine lives only here). |
 | `/usr/lib/displayxr/bin/displayxr-cli` (+ `/usr/bin/` link) | `selftest`, `info`, `clients`, … |
 | `/usr/lib/displayxr/plugins/` | sim-display fallback DP + its manifest; a vendor plug-in package adds its own. |

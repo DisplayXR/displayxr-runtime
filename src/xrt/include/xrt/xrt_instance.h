@@ -128,6 +128,21 @@ struct xrt_instance_info
 
 	//! Process-specific, platform-specific data.
 	struct xrt_platform_info platform_info;
+
+	/*!
+	 * Did the application enable an extension through which it hands the
+	 * runtime its OWN window or surface (XR_DXR_win32_window_binding,
+	 * XR_DXR_cocoa_window_binding, XR_DXR_xlib_window_binding,
+	 * XR_DXR_wayland_surface_binding, XR_DXR_android_surface_binding)?
+	 *
+	 * Read only by the hybrid router in xrt_instance_create: a window-bound
+	 * app is never a desktop-Linux XR_DXR_weave present-owner (#1744). It is a
+	 * client-side routing input, deliberately NOT in @ref xrt_application_info,
+	 * which is copied verbatim onto the IPC wire (ipc_client_description,
+	 * ipc_app_state) — keeping it here leaves the client<->service layout
+	 * untouched.
+	 */
+	bool window_binding_enabled;
 };
 
 /*!
