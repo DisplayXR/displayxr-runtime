@@ -8,6 +8,7 @@
  *   camera calib <id> [--raw|--rectified] [--json]
  *   camera probe [<id>] [--raw|--rectified] [--format gray8|nv12|bgra8] [--fps F]
  *                [--frames N] [--seconds S] [--out DIR]
+ *                [--max-disparity N] [--max-dy N] [--min-ncc C]
  *
  * `probe` is a real consumer: it creates and starts a stream (so it goes
  * through the service's authorisation — in R1, DXR_STEREO_CAMERA_DEV_ALLOW=1
@@ -23,7 +24,13 @@
  * horizontal disparities, each converted to a depth Z = f * B / d with the
  * RECTIFIED calibration. `--rectified` insists on RECTIFIED output and fails
  * (exit 5) if the frames came back RAW-flagged or the rows do not align
- * (median |dy| > 0.5 px). On the distorted sim fake
+ * (median |dy| > 0.5 px, or a SIGNED median dy beyond +-0.5 px: a constant
+ * vertical offset). Matching is zero-mean NCC with sub-pixel refinement; the
+ * disparity window comes from the camera's own f * B (a subject at 0.4 m),
+ * the vertical one is +-24 px, blocks under NCC 0.90 or peaking ON either
+ * bound are counted and excluded (a bound hit is a clamp, not a measurement —
+ * the first Leia SR run read "d = 64, |dy| = 10.000" that way). On the
+ * distorted sim fake
  * (SIM_DISPLAY_FAKE_STEREO_CAMERA_DISTORT=1) the depths read back 2.00 m
  * (background) and 0.60 m (bar); `--raw` shows the misalignment it fixes.
  *
@@ -431,21 +438,40 @@ cmp_float(const void *a, const void *b)
 
 struct row_alignment
 {
-	int blocks;
+	int textured;            //!< blocks that passed the texture gate and were matched
+	int blocks;              //!< ...of which accepted (NCC >= min, peak inside both windows)
+	int low_corr;            //!< rejected: peak NCC below the threshold
+	int dx_edge;             //!< rejected: peak ON the disparity bound (a clamp, not a measurement)
+	int dy_edge;             //!< rejected: peak ON the vertical bound
+	float dy_signed_median;  //!< right y - left y, px (a constant vertical offset shows here)
 	float dy_median, dy_p90; //!< |dy|, px
-	int outliers;            //!< blocks with |dy| > 1 px (mismatches: occlusion edges, flat or repeated texture)
+	int outliers;            //!< accepted blocks with |dy| > 1 px
 	int modes;
 	float mode_dx[2];
 	int mode_count[2];
 };
 
+struct row_params
+{
+	uint32_t max_d;  //!< disparity window (probe_max_disparity)
+	uint32_t max_dy; //!< vertical window, +-px
+	float min_ncc;   //!< acceptance threshold on the peak correlation
+};
+
 /*!
- * 2-D block matching (u_stereo_camera_estimate_offset) of a GRAY8 SBS frame on
- * a 32 px grid, textured blocks only (a flat wall matches anywhere): |dy|
- * statistics and the two dominant horizontal disparities (1 px clusters).
+ * 2-D NCC block matching (u_stereo_camera_match_block) of a GRAY8 SBS frame on
+ * a 32 px grid, textured blocks only (a flat wall matches anywhere): signed and
+ * |dy| statistics and the two dominant horizontal disparities (1 px clusters).
+ * Blocks below the correlation threshold or whose peak sits on either window's
+ * bound are counted and excluded — never clamped into the statistics.
  */
 static void
-measure_rows(const uint8_t *gray, uint32_t pitch, uint32_t eye_w, uint32_t h, struct row_alignment *out)
+measure_rows(const uint8_t *gray,
+             uint32_t pitch,
+             uint32_t eye_w,
+             uint32_t h,
+             const struct row_params *rp,
+             struct row_alignment *out)
 {
 	memset(out, 0, sizeof(*out));
 	enum
@@ -453,10 +479,10 @@ measure_rows(const uint8_t *gray, uint32_t pitch, uint32_t eye_w, uint32_t h, st
 		B = 32,
 		MAXB = 1024
 	};
-	static float dxs[MAXB], ady[MAXB];
+	static float dxs[MAXB], ady[MAXB], sdy[MAXB];
 	int n = 0;
-	for (uint32_t y = 48; y + B + 12 <= h && n < MAXB; y += B) {
-		for (uint32_t x = 72; x + B <= eye_w && n < MAXB; x += B) {
+	for (uint32_t y = 16; y + B + 16 <= h && out->textured < MAXB; y += B) {
+		for (uint32_t x = 16; x + B + 8 <= eye_w && out->textured < MAXB; x += B) {
 			// Texture gate: standard deviation of the left block >= 6 levels.
 			double sum = 0, sq = 0;
 			for (uint32_t j = 0; j < B; j++) {
@@ -470,12 +496,27 @@ measure_rows(const uint8_t *gray, uint32_t pitch, uint32_t eye_w, uint32_t h, st
 			if (sq / (B * B) - mean * mean < 36.0) {
 				continue;
 			}
-			float dx, dy;
-			if (!u_stereo_camera_estimate_offset(gray, pitch, eye_w, h, x, y, B, B, 64, 10, &dx, &dy)) {
+			struct u_stereo_camera_block_match m;
+			if (!u_stereo_camera_match_block(gray, pitch, eye_w, h, x, y, B, B, rp->max_d, rp->max_dy,
+			                                 &m)) {
 				continue;
 			}
-			dxs[n] = dx;
-			ady[n] = dy < 0 ? -dy : dy;
+			out->textured++;
+			if (m.ncc < rp->min_ncc) {
+				out->low_corr++;
+				continue;
+			}
+			if (m.dx_at_edge) {
+				out->dx_edge++;
+				continue;
+			}
+			if (m.dy_at_edge) {
+				out->dy_edge++;
+				continue;
+			}
+			dxs[n] = m.dx;
+			sdy[n] = m.dy;
+			ady[n] = m.dy < 0 ? -m.dy : m.dy;
 			n++;
 		}
 	}
@@ -483,6 +524,8 @@ measure_rows(const uint8_t *gray, uint32_t pitch, uint32_t eye_w, uint32_t h, st
 	if (n == 0) {
 		return;
 	}
+	qsort(sdy, (size_t)n, sizeof(float), cmp_float);
+	out->dy_signed_median = sdy[n / 2];
 	qsort(ady, (size_t)n, sizeof(float), cmp_float);
 	out->dy_median = ady[n / 2];
 	out->dy_p90 = ady[(n * 9) / 10];
@@ -525,6 +568,8 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 	float seconds = 0.0f;
 	const char *out_dir = NULL;
 	bool require_rectified = false;
+	uint32_t max_d_arg = 0; // 0 = from the camera's geometry
+	struct row_params rp = {.max_d = 0, .max_dy = 24, .min_ncc = 0.90f};
 	for (int i = 3; i < argc; i++) {
 		if (strcmp(argv[i], "--raw") == 0) {
 			output = XRT_STEREO_CAMERA_OUTPUT_RAW;
@@ -542,6 +587,12 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 			frames = atoi(argv[++i]);
 		} else if (strcmp(argv[i], "--seconds") == 0 && i + 1 < argc) {
 			seconds = (float)atof(argv[++i]);
+		} else if (strcmp(argv[i], "--max-disparity") == 0 && i + 1 < argc) {
+			max_d_arg = (uint32_t)strtoul(argv[++i], NULL, 10);
+		} else if (strcmp(argv[i], "--max-dy") == 0 && i + 1 < argc) {
+			rp.max_dy = (uint32_t)strtoul(argv[++i], NULL, 10);
+		} else if (strcmp(argv[i], "--min-ncc") == 0 && i + 1 < argc) {
+			rp.min_ncc = (float)atof(argv[++i]);
 		} else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) {
 			out_dir = argv[++i];
 		} else if (argv[i][0] != '-') {
@@ -683,13 +734,13 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 		    u_stereo_camera_convert(last.format, src, last.row_pitch, XRT_STEREO_CAMERA_FORMAT_GRAY8, gray, &gl,
 		                            last.width, last.height)) {
 			char disp[256];
-			report_disparity(gray, gl.pitch[0], last.width / 2, last.height,
-			                 probe_max_disparity(&props, last.width / 2), disp, sizeof(disp));
+			rp.max_d = max_d_arg > 0 ? max_d_arg : probe_max_disparity(&props, last.width / 2);
+			report_disparity(gray, gl.pitch[0], last.width / 2, last.height, rp.max_d, disp, sizeof(disp));
 			printf("block disparity (left x - right x): %s\n", disp);
 
 			// R2: row alignment + depth of the dominant disparities.
 			struct row_alignment ra;
-			measure_rows(gray, gl.pitch[0], last.width / 2, last.height, &ra);
+			measure_rows(gray, gl.pitch[0], last.width / 2, last.height, &rp, &ra);
 			struct xrt_stereo_camera_calibration rc;
 			double fb = 0.0; // f * B, px * m
 			if (last.output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED &&
@@ -697,16 +748,28 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 			                                             &rc) == XRT_SUCCESS) {
 				fb = rc.eye[0].fx * rc.baseline_mm / 1000.0;
 			}
-			if (ra.blocks == 0) {
-				printf("row alignment: n/a (no textured block)\n");
+			const char *out_name = last.output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED ? "RECTIFIED" : "RAW";
+			printf(
+			    "row alignment (%s): NCC 32x32 blocks, search d -8..%u px, dy +-%u px, accept NCC >= "
+			    "%.2f\n",
+			    out_name, rp.max_d, rp.max_dy, rp.min_ncc);
+			printf(
+			    "  %d textured block(s): %d accepted, %d below NCC %.2f, %d AT the disparity bound, %d AT "
+			    "the dy bound\n",
+			    ra.textured, ra.blocks, ra.low_corr, rp.min_ncc, ra.dx_edge, ra.dy_edge);
+			if (ra.dx_edge * 5 > ra.textured || ra.dy_edge * 5 > ra.textured) {
+				printf(
+				    "  WARNING: over 20%% of blocks peak ON a search bound — that is a clamp, not a "
+				    "measurement; widen it (--max-disparity N / --max-dy N)\n");
+			}
+			if (ra.blocks < 5) {
+				printf("  row alignment: n/a (fewer than 5 accepted blocks)\n");
 				rows_ok = false;
 			} else {
 				printf(
-				    "row alignment (%s, %d textured 32x32 blocks): |dy| median %.3f px, p90 %.3f px, "
-				    "%d block(s) "
-				    "> 1 px\n",
-				    last.output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED ? "RECTIFIED" : "RAW", ra.blocks,
-				    ra.dy_median, ra.dy_p90, ra.outliers);
+				    "  dy (right - left) median %+.3f px SIGNED; |dy| median %.3f px, p90 %.3f px, %d "
+				    "block(s) > 1 px\n",
+				    ra.dy_signed_median, ra.dy_median, ra.dy_p90, ra.outliers);
 				for (int k = 0; k < ra.modes; k++) {
 					if (fb > 0.0 && ra.mode_dx[k] > 0.25f) {
 						printf(
@@ -717,7 +780,9 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 						       ra.mode_dx[k], ra.mode_count[k]);
 					}
 				}
-				rows_ok = ra.dy_median <= 0.5f;
+				// A constant vertical offset fails even when |dy| scatter is small.
+				float sm = ra.dy_signed_median < 0 ? -ra.dy_signed_median : ra.dy_signed_median;
+				rows_ok = ra.dy_median <= 0.5f && sm <= 0.5f;
 			}
 		}
 		if (out_dir != NULL) {
@@ -774,7 +839,9 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 			return 5;
 		}
 		if (!rows_ok) {
-			printf("--rectified: FAIL — rows do not align (median |dy| > 0.5 px)\n");
+			printf(
+			    "--rectified: FAIL — rows do not align (median |dy| or |signed median dy| > 0.5 px, or too "
+			    "few matched blocks)\n");
 			return 5;
 		}
 		printf("--rectified: PASS — rows aligned\n");
@@ -805,7 +872,8 @@ cli_cmd_camera(int argc, const char **argv)
 		    "usage: displayxr-cli camera list [--json] | calib <id> [--raw|--rectified] [--json] |\n"
 		    "       probe [<id>] [--raw|--rectified] [--format gray8|nv12|bgra8] [--fps F] [--frames N] "
 		    "[--seconds S] "
-		    "[--out DIR]\n");
+		    "[--out DIR]\n"
+		    "             [--max-disparity N] [--max-dy N (24)] [--min-ncc C (0.90)]\n");
 		ret = 1;
 	}
 	ipc_client_connection_fini(&ipc_c);

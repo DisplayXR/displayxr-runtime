@@ -522,26 +522,56 @@ service stats: source 30.49 Hz, delivered 30.49 Hz, published 155, skipped 4, ac
 ```
 
 R2 adds row alignment to every probe (2-D block matching of the last frame, textured 32×32
-blocks: |Δy| median / p90 / count above 1 px, and the dominant disparities converted to depth
-with the RECTIFIED calibration), `camera calib <id> --rectified` prints P1/P2 and `Z = f·B/d`,
-and `probe --rectified` insists on RECTIFIED output and exits 5 unless the median |Δy| ≤ 0.5 px.
-Against the DISTORTED fake (macOS, Debug service):
+blocks: SIGNED Δy median, |Δy| median / p90 / count above 1 px, and the dominant disparities
+converted to depth with the RECTIFIED calibration), `camera calib <id> --rectified` prints P1/P2
+and `Z = f·B/d`, and `probe --rectified` insists on RECTIFIED output and exits 5 unless the median
+|Δy| ≤ 0.5 px **and** the signed median is within ±0.5 px (a constant vertical offset fails even
+when the scatter is small).
+
+**Matching (after the first SR-hardware run).** Zero-mean NCC with parabolic sub-pixel refinement
+(coarse pass on every second pixel, full-resolution refinement), blind to the two sensors'
+gain/offset differences. The disparity window is **baseline-aware**: `f·B / 0.4 m` from the
+camera's own calibration (quarter eye width uncalibrated, clamped to [64, 0.6 · eye]); the
+vertical window is ±24 px. Blocks with peak NCC < 0.90, or whose peak sits **on** either
+window's bound, are counted and excluded — a bound hit is a clamp, not a measurement. (The first
+SR run read "d = 64, |dy| = 10.000" because a face at 0.6 m on the 120 mm tracker is ~95 px and
+both fixed windows clamped.) Knobs: `--max-disparity N`, `--max-dy N`, `--min-ncc C`.
+Against the DISTORTED fake (macOS, Debug service), default 50 mm and the SR-like 120 mm:
 
 ```
 $ displayxr-cli camera calib 1 --rectified
   left  eye: 640x480 fx 453.181 fy 453.181 cx 320.426 cy 239.364 model 0
   P2 = [453.181 0 320.426 -22659.030; 0 453.181 239.364 0; 0 0 1 0]   (P2[0][3] = f * Tx, Tx = -50.000 mm)
-$ displayxr-cli camera probe --rectified --frames 150
-row alignment (RECTIFIED, 221 textured 32x32 blocks): |dy| median 0.016 px, p90 0.064 px, 9 block(s) > 1 px
-  disparity mode 1: 11.30 px (165 blocks) -> Z = f*B/d = 2.004 m
-  disparity mode 2: 37.81 px (48 blocks) -> Z = f*B/d = 0.599 m
+$ displayxr-cli camera probe --rectified --seconds 2
+row alignment (RECTIFIED): NCC 32x32 blocks, search d -8..64 px, dy +-24 px, accept NCC >= 0.90
+  266 textured block(s): 255 accepted, 11 below NCC 0.90, 0 AT the disparity bound, 0 AT the dy bound
+  dy (right - left) median +0.001 px SIGNED; |dy| median 0.016 px, p90 0.038 px, 1 block(s) > 1 px
+  disparity mode 1: 11.30 px (213 blocks) -> Z = f*B/d = 2.005 m
+  disparity mode 2: 37.81 px (40 blocks) -> Z = f*B/d = 0.599 m
 --rectified: PASS — rows aligned
-$ displayxr-cli camera probe --raw --format gray8
-row alignment (RAW, 221 textured 32x32 blocks): |dy| median 2.589 px, p90 5.292 px, 183 block(s) > 1 px
+$ displayxr-cli camera probe --raw --seconds 2
+  dy (right - left) median +0.019 px SIGNED; |dy| median 2.015 px, p90 4.026 px, 100 block(s) > 1 px
+# service with SIM_DISPLAY_FAKE_STEREO_CAMERA_BASELINE_MM=120:
+$ displayxr-cli camera probe --rectified --seconds 2
+row alignment (RECTIFIED): NCC 32x32 blocks, search d -8..136 px, dy +-24 px, accept NCC >= 0.90
+  266 textured block(s): 233 accepted, 33 below NCC 0.90, 0 AT the disparity bound, 0 AT the dy bound
+  dy (right - left) median +0.000 px SIGNED; |dy| median 0.011 px, p90 0.031 px, 1 block(s) > 1 px
+  disparity mode 1: 27.17 px (191 blocks) -> Z = f*B/d = 2.002 m
+  disparity mode 2: 90.68 px (40 blocks) -> Z = f*B/d = 0.600 m
+--rectified: PASS — rows aligned
 ```
 
 (The blocks above 1 px on the rectified pair are mismatches at the bar's occlusion edges and on
 the frame counter, which is burned in raw space.)
+
+**Open: a +1.7 px signed Δy on real SR data after rectification.** The `[vshift]` tests in
+`tests_stereo_rectify` pin what each candidate cause looks like on the 120 mm distorted fake, so
+the raw frames + calibration dumps can be matched to one: a per-eye principal-point error Δcy is
+a *constant* Δy ≈ −(f_rect/fy)·Δcy with small spread (flipped row convention, a crop taken for a
+scale, a one-eye ±0.5 px centre convention); a transposed R is a large, roll-shaped Δy (spread
+> 1 px), so a clean constant offset is *not* that; the calibration-size rescale and the plug-in's
+half swap (`R' = Rᵀ`, `T' = −RᵀT`) are exact; an identity calibration maps as a pure scale about
+(cx, cy) — no half-pixel offset.
 
 Runs as a DIAG IPC client, non-elevated. `probe` goes through the full consent path (so its
 first run on a box raises the prompt — which is how a developer checks the prompt). `selftest`
