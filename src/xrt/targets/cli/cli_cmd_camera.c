@@ -23,9 +23,10 @@
  * rectified pair must bring to ~0 (median / p90 / max |dy|) and the dominant
  * horizontal disparities, each converted to a depth Z = f * B / d with the
  * RECTIFIED calibration. `--rectified` insists on RECTIFIED output and fails
- * (exit 5) if the frames came back RAW-flagged or the rows do not align
- * (median |dy| > 0.5 px, or a SIGNED median dy beyond +-0.5 px: a constant
- * vertical offset). Matching is zero-mean NCC with sub-pixel refinement; the
+ * (exit 5) if the frames came back RAW-flagged or the rows do not align:
+ * |SIGNED median dy| > 0.5 px (a constant vertical offset), a robust spread
+ * (MAD about that median) > 1.5 px, or fewer than 20 accepted blocks. The
+ * unsigned |dy| statistics are printed but not gated (block-match noise). Matching is zero-mean NCC with sub-pixel refinement; the
  * disparity window comes from the camera's own f * B (a subject at 0.4 m),
  * the vertical one is +-24 px, blocks under NCC 0.90 or peaking ON either
  * bound are counted and excluded (a bound hit is a clamp, not a measurement —
@@ -452,7 +453,8 @@ struct row_alignment
 	int dx_edge;             //!< rejected: peak ON the disparity bound (a clamp, not a measurement)
 	int dy_edge;             //!< rejected: peak ON the vertical bound
 	float dy_signed_median;  //!< right y - left y, px (a constant vertical offset shows here)
-	float dy_median, dy_p90; //!< |dy|, px
+	float dy_median, dy_p90; //!< |dy|, px (informational: block-match noise on a face scene inflates these)
+	float dy_mad;            //!< median |dy - signed median|, px: the robust spread the gate uses
 	int outliers;            //!< accepted blocks with |dy| > 1 px
 	int modes;
 	float mode_dx[2];
@@ -537,6 +539,13 @@ measure_rows(const uint8_t *gray,
 	qsort(ady, (size_t)n, sizeof(float), cmp_float);
 	out->dy_median = ady[n / 2];
 	out->dy_p90 = ady[(n * 9) / 10];
+	// Robust spread about the signed median (MAD). ady[] is free again once its stats are read.
+	for (int i = 0; i < n; i++) {
+		float r = sdy[i] - out->dy_signed_median;
+		ady[i] = r < 0 ? -r : r;
+	}
+	qsort(ady, (size_t)n, sizeof(float), cmp_float);
+	out->dy_mad = ady[n / 2];
 	for (int i = 0; i < n; i++) {
 		out->outliers += ady[i] > 1.0f;
 	}
@@ -794,8 +803,15 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 				         ra.blocks);
 				have_rows = true;
 				// A constant vertical offset fails even when |dy| scatter is small.
+				// The gate is ROBUST: |signed median| <= 0.5 px (the rows' actual offset) with a
+				// bounded MAD spread and enough blocks. The unsigned |dy| median is NOT gated: on a
+				// face scene block-match noise alone put it at ~1.0 px while the signed median was
+				// -0.1 px (SR laptop, 2026-09-27).
 				float sm = ra.dy_signed_median < 0 ? -ra.dy_signed_median : ra.dy_signed_median;
-				rows_ok = ra.dy_median <= 0.5f && sm <= 0.5f;
+				rows_ok = sm <= 0.5f && ra.dy_mad <= 1.5f && ra.blocks >= 20;
+				printf("  row gate: |signed median| %.3f px (<= 0.5), MAD %.3f px (<= 1.5), %d blocks "
+				       "(>= 20)\n",
+				       sm, ra.dy_mad, ra.blocks);
 			}
 		}
 		if (out_dir != NULL) {
@@ -870,8 +886,8 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 		}
 		if (!rows_ok) {
 			printf(
-			    "--rectified: FAIL — rows do not align (median |dy| or |signed median dy| > 0.5 px, or too "
-			    "few matched blocks)\n");
+			    "--rectified: FAIL — rows do not align (|signed median dy| > 0.5 px, MAD > 1.5 px, or fewer "
+			    "than 20 matched blocks)\n");
 			return 5;
 		}
 		printf("--rectified: PASS — rows aligned\n");
