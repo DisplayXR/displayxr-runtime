@@ -8,6 +8,7 @@
 
 #include "util/u_stereo_camera.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -501,5 +502,175 @@ u_stereo_camera_estimate_offset(const uint8_t *gray,
 	*out_dx = (float)bd + sx;
 	// A left feature at row y is found at row y + dy in the right eye.
 	*out_dy = (float)((int)by - (int)max_dy) + sy;
+	return true;
+}
+
+
+/*
+ *
+ * NCC block matcher (R2 follow-up: baseline-aware probe).
+ *
+ */
+
+struct ncc_left
+{
+	double sum, norm; //!< sum and sqrt(n * var) of the left block's samples
+	uint32_t n;
+};
+
+static bool
+ncc_left_init(const uint8_t *gray,
+              uint32_t pitch,
+              uint32_t x0,
+              uint32_t y0,
+              uint32_t w,
+              uint32_t h,
+              uint32_t step,
+              struct ncc_left *l)
+{
+	double s = 0.0, ss = 0.0;
+	uint32_t n = 0;
+	for (uint32_t j = 0; j < h; j += step) {
+		const uint8_t *row = gray + (size_t)(y0 + j) * pitch + x0;
+		for (uint32_t i = 0; i < w; i += step) {
+			s += row[i];
+			ss += (double)row[i] * row[i];
+			n++;
+		}
+	}
+	double var_n = ss - s * s / n; // n * variance
+	l->sum = s;
+	l->n = n;
+	l->norm = var_n > 0.0 ? sqrt(var_n) : 0.0;
+	// Flat: < 1 grey level of standard deviation matches anywhere.
+	return var_n >= (double)n;
+}
+
+static double
+ncc_at(const uint8_t *gray,
+       uint32_t pitch,
+       uint32_t eye_width,
+       uint32_t x0,
+       uint32_t y0,
+       uint32_t w,
+       uint32_t h,
+       uint32_t step,
+       const struct ncc_left *l,
+       int32_t d,
+       int32_t dy)
+{
+	uint64_t cross = 0, sr = 0, srr = 0;
+	for (uint32_t j = 0; j < h; j += step) {
+		const uint8_t *lr = gray + (size_t)(y0 + j) * pitch + x0;
+		const uint8_t *rr = gray + (size_t)((int64_t)y0 + j + dy) * pitch + eye_width + (int64_t)x0 - d;
+		for (uint32_t i = 0; i < w; i += step) {
+			uint32_t r = rr[i];
+			cross += (uint64_t)lr[i] * r;
+			sr += r;
+			srr += (uint64_t)r * r;
+		}
+	}
+	double var_r = (double)srr - (double)sr * (double)sr / l->n;
+	if (var_r <= 0.0 || l->norm <= 0.0) {
+		return -1.0;
+	}
+	double num = (double)cross - l->sum * (double)sr / l->n;
+	return num / (l->norm * sqrt(var_r));
+}
+
+//! Parabola vertex offset of three samples around a MAXIMUM; 0 if not one.
+static float
+peak_offset(double a, double b, double c)
+{
+	double den = a - 2.0 * b + c;
+	if (den >= 0.0) {
+		return 0.0f;
+	}
+	double o = 0.5 * (a - c) / den;
+	return (float)(o < -0.5 ? -0.5 : (o > 0.5 ? 0.5 : o));
+}
+
+bool
+u_stereo_camera_match_block(const uint8_t *gray,
+                            uint32_t pitch,
+                            uint32_t eye_width,
+                            uint32_t height,
+                            uint32_t x0,
+                            uint32_t y0,
+                            uint32_t w,
+                            uint32_t h,
+                            uint32_t max_disparity,
+                            uint32_t max_dy,
+                            struct u_stereo_camera_block_match *out)
+{
+	if (gray == NULL || out == NULL || w < 4 || h < 4 || x0 + w > eye_width || y0 + h > height) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+	// Right block x = x0 - d must stay inside the right eye.
+	const int32_t d_hi = (int32_t)(max_disparity < x0 ? max_disparity : x0);
+	const uint32_t room_r = eye_width - (x0 + w);
+	const int32_t d_lo = -(int32_t)(room_r < 8 ? room_r : 8);
+	const int32_t dy_lo = -(int32_t)(max_dy < y0 ? max_dy : y0);
+	const uint32_t room_b = height - (y0 + h);
+	const int32_t dy_hi = (int32_t)(max_dy < room_b ? max_dy : room_b);
+	out->d_lo = d_lo;
+	out->d_hi = d_hi;
+	out->dy_lo = dy_lo;
+	out->dy_hi = dy_hi;
+
+	struct ncc_left lc, lf;
+	if (!ncc_left_init(gray, pitch, x0, y0, w, h, 2, &lc) || !ncc_left_init(gray, pitch, x0, y0, w, h, 1, &lf)) {
+		return false;
+	}
+
+	// Coarse: every integer (d, dy), every second pixel of the block.
+	double best = -2.0;
+	int32_t bd = 0, by = 0;
+	for (int32_t dy = dy_lo; dy <= dy_hi; dy++) {
+		for (int32_t d = d_lo; d <= d_hi; d++) {
+			double c = ncc_at(gray, pitch, eye_width, x0, y0, w, h, 2, &lc, d, dy);
+			if (c > best) {
+				best = c;
+				bd = d;
+				by = dy;
+			}
+		}
+	}
+
+	// Fine: full resolution, hill-climb on the 3x3 neighbourhood (a few steps at
+	// most — the coarse peak is within a pixel or two of the true one).
+	double f[3][3];
+	for (int iter = 0;; iter++) {
+		int32_t md = 0, my = 0;
+		double fb = -2.0;
+		for (int32_t j = -1; j <= 1; j++) {
+			for (int32_t i = -1; i <= 1; i++) {
+				int32_t d = bd + i, dy = by + j;
+				double c = (d < d_lo || d > d_hi || dy < dy_lo || dy > dy_hi)
+				               ? -2.0
+				               : ncc_at(gray, pitch, eye_width, x0, y0, w, h, 1, &lf, d, dy);
+				f[j + 1][i + 1] = c;
+				if (c > fb) {
+					fb = c;
+					md = i;
+					my = j;
+				}
+			}
+		}
+		if ((md == 0 && my == 0) || iter >= 8) {
+			break; // f[][] is centred on (bd, by)
+		}
+		bd += md;
+		by += my;
+	}
+
+	out->ncc = (float)f[1][1];
+	out->dx_at_edge = bd == d_hi || bd == d_lo;
+	out->dy_at_edge = by == dy_hi || by == dy_lo;
+	float sx = (bd > d_lo && bd < d_hi) ? peak_offset(f[1][0], f[1][1], f[1][2]) : 0.0f;
+	float sy = (by > dy_lo && by < dy_hi) ? peak_offset(f[0][1], f[1][1], f[2][1]) : 0.0f;
+	out->dx = (float)bd + sx;
+	out->dy = (float)by + sy;
 	return true;
 }
