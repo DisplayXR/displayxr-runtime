@@ -283,9 +283,27 @@ u_stereo_rectify_undistort_pixel(
  *
  */
 
-//! RAW pixel of eye @p e -> rectified pixel under (f, cx, cy). false = behind.
+/*
+ * The vertical correction (u_stereo_rectify_input::v_offset / v_slope): output
+ * normalized row y -> uncorrected rectified row, and back. s = -1 left, +1 right.
+ */
+static inline double
+vcorr_src(const struct u_stereo_rectify_result *r, uint32_t e, double y)
+{
+	const double s = e == 0 ? -0.5 : 0.5;
+	return y * (1.0 + s * r->v_slope) + s * r->v_offset;
+}
+
+static inline double
+vcorr_out(const struct u_stereo_rectify_result *r, uint32_t e, double y_src)
+{
+	const double s = e == 0 ? -0.5 : 0.5;
+	return (y_src - s * r->v_offset) / (1.0 + s * r->v_slope);
+}
+
+//! RAW pixel of eye @p e -> normalized OUTPUT coordinates (correction applied).
 static bool
-raw_to_rect(const struct u_stereo_rectify_result *r, uint32_t e, double u, double v, double *ou, double *ov)
+raw_to_rect_norm(const struct u_stereo_rectify_result *r, uint32_t e, double u, double v, double *ox, double *oy)
 {
 	double x, y;
 	u_stereo_rectify_undistort_pixel(&r->raw[e], u, v, &x, &y);
@@ -294,16 +312,36 @@ raw_to_rect(const struct u_stereo_rectify_result *r, uint32_t e, double u, doubl
 	if (q[2] <= 1e-12) {
 		return false;
 	}
-	*ou = r->f * q[0] / q[2] + r->cx;
-	*ov = r->f * q[1] / q[2] + r->cy;
+	*ox = q[0] / q[2];
+	*oy = vcorr_out(r, e, q[1] / q[2]);
 	return true;
+}
+
+//! RAW pixel of eye @p e -> rectified pixel under (f, cx, cy). false = behind.
+static bool
+raw_to_rect(const struct u_stereo_rectify_result *r, uint32_t e, double u, double v, double *ou, double *ov)
+{
+	double x, y;
+	if (!raw_to_rect_norm(r, e, u, v, &x, &y)) {
+		return false;
+	}
+	*ou = r->f * x + r->cx;
+	*ov = r->f * y + r->cy;
+	return true;
+}
+
+bool
+u_stereo_rectify_rect_from_raw(
+    const struct u_stereo_rectify_result *r, uint32_t eye, double u, double v, double *out_u, double *out_v)
+{
+	return eye < 2 && raw_to_rect(r, eye, u, v, out_u, out_v);
 }
 
 bool
 u_stereo_rectify_map_point(
     const struct u_stereo_rectify_result *r, uint32_t eye, double u, double v, double *out_x, double *out_y)
 {
-	double p[3] = {(u - r->cx) / r->f, (v - r->cy) / r->f, 1.0}, q[3];
+	double p[3] = {(u - r->cx) / r->f, vcorr_src(r, eye, (v - r->cy) / r->f), 1.0}, q[3];
 	mat3t_vec(M3(r->rot[eye]), p, q); // raw ray = R_e^T * rectified ray
 	if (q[2] <= 1e-12) {
 		return false;
@@ -352,6 +390,11 @@ u_stereo_rectify_compute(const struct u_stereo_rectify_input *in, struct u_stere
 	const double nx = in->width, ny = in->height;
 	out->width = in->width;
 	out->height = in->height;
+	out->v_offset = in->v_offset;
+	out->v_slope = in->v_slope;
+	if (!(fabs(in->v_offset) < 0.5) || !(fabs(in->v_slope) < 0.5)) {
+		return false; // not a small correction (or NaN)
+	}
 
 	// 0. Intrinsics at the frame size (pixel centres: u' = (u + 0.5) * s - 0.5).
 	double sx = in->calib_width ? nx / (double)in->calib_width : 1.0;
@@ -428,11 +471,11 @@ u_stereo_rectify_compute(const struct u_stereo_rectify_input *in, struct u_stere
 		double ax = 0, ay = 0;
 		for (int k = 0; k < 4; k++) {
 			double x, y;
-			u_stereo_rectify_undistort_pixel(&out->raw[e], corners[k][0], corners[k][1], &x, &y);
-			double p[3] = {x, y, 1.0}, q[3];
-			mat3_vec(M3(out->rot[e]), p, q);
-			ax += q[0] / q[2];
-			ay += q[1] / q[2];
+			if (!raw_to_rect_norm(out, e, corners[k][0], corners[k][1], &x, &y)) {
+				return false;
+			}
+			ax += x;
+			ay += y;
 		}
 		ccx[e] = (nx - 1) * 0.5 - fc * ax * 0.25;
 		ccy[e] = (ny - 1) * 0.5 - fc * ay * 0.25;
