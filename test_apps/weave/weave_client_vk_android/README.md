@@ -73,6 +73,7 @@ unless a property names a mode:
 | `debug.dxr.lift.probe weave` | the top rect carries a plain **2D** frame (gradient, white bars, walking yellow block) flagged with `XrWeaveSubmitLiftRectsDXR` on an SBS stream: woven flat until the first result, then as the converted pair — at the rect's current position every frame |
 | `debug.dxr.lift.probe explicit` | a separate 960x540 CPU-painted `AHardwareBuffer` through `xrSubmitLiftFrameDXR` + `xrAcquireLiftResultDXR` every frame; logs service latency, submit→acquire latency and frames skipped between results |
 | `debug.dxr.lift.probe both` | both, two streams |
+| `debug.dxr.lift.probe depth` | the explicit path on a DEPTH stream; the first result is `AHardwareBuffer_lock`ed on the CPU and checksummed (`LIFT_PROBE: DEPTH result CPU-locked OK … top-row mean … bottom-row mean`) — proves DEPTH results are CPU-readable |
 | `debug.dxr.lift.probe_frames N` | explicit frames before the SUMMARY line (default 300) |
 | `debug.dxr.lift.probe_fps F` | explicit submit rate (default 30). The explicit probe runs on its OWN thread — submit every 1/F s, non-blocking acquire polled every 1 ms — so its latency and rate reflect the service. (The render loop repaints the whole window on the CPU every frame and, unoptimised in a debug build, runs at ~15 Hz; tying the probe to it measured the loop, not the lift.) |
 

@@ -27,6 +27,7 @@ enum class Mode
 	Weave,
 	Explicit,
 	Both,
+	Depth, //!< the explicit path on a DEPTH stream; locks + checksums one result on the CPU
 };
 
 //! Explicit-mode input: a small 2D frame, CPU-painted.
@@ -163,16 +164,17 @@ log_stats(const char *what, XrLiftStreamDXR stream)
 }
 
 XrLiftStreamDXR
-make_stream(const char *what)
+make_stream(const char *what, XrLiftModeDXR mode = XR_LIFT_MODE_SBS_DXR)
 {
 	XrLiftStreamCreateInfoDXR ci = {};
 	ci.type = XR_TYPE_LIFT_STREAM_CREATE_INFO_DXR;
-	ci.mode = XR_LIFT_MODE_SBS_DXR;
+	ci.mode = mode;
 	ci.contentHint = XR_LIFT_CONTENT_HINT_VIDEO_DXR;
 	ci.inputScale = 1.0f;
 	XrLiftStreamDXR s = XR_NULL_HANDLE;
 	XrResult r = g_probe.create(g_probe.session, &ci, &s);
-	LOGW("LIFT_PROBE: xrCreateLiftStreamDXR(%s, SBS) -> %d", what, (int)r);
+	LOGW("LIFT_PROBE: xrCreateLiftStreamDXR(%s, %s) -> %d", what, mode == XR_LIFT_MODE_DEPTH_DXR ? "DEPTH" : "SBS",
+	     (int)r);
 	return r == XR_SUCCESS ? s : XR_NULL_HANDLE;
 }
 
@@ -223,6 +225,54 @@ explicit_submit(uint64_t frame)
 	}
 }
 
+/*!
+ * DEPTH mode: lock the result on the CPU (the runtime allocates DEPTH exports
+ * CPU_READ_OFTEN — XR_DXR_lift § Android), checksum channel R over every row
+ * using the stride from AHardwareBuffer_describe, and report the top / bottom
+ * row means (the sim fake's relative gradient: top near, bottom far). Once.
+ */
+void
+depth_checksum_once(AHardwareBuffer *ahb, int64_t format)
+{
+	static bool s_done = false;
+	if (s_done || ahb == nullptr) {
+		return;
+	}
+	s_done = true;
+	AHardwareBuffer_Desc d = {};
+	AHardwareBuffer_describe(ahb, &d);
+	void *ptr = nullptr;
+	const int ret = AHardwareBuffer_lock(ahb, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN, -1, nullptr, &ptr);
+	if (ret != 0 || ptr == nullptr) {
+		LOGE("LIFT_PROBE: DEPTH result AHardwareBuffer_lock FAILED (%d) — usage=0x%llx lacks CPU read?", ret,
+		     (unsigned long long)d.usage);
+		return;
+	}
+	const uint32_t bpp = format == AHARDWAREBUFFER_FORMAT_R8_UNORM ? 1u : 4u; // R8, else 4-channel with depth in R
+	const uint8_t *base = static_cast<const uint8_t *>(ptr);
+	uint64_t sum = 0, top = 0, bottom = 0;
+	for (uint32_t y = 0; y < d.height; ++y) {
+		const uint8_t *row = base + (size_t)y * d.stride * bpp;
+		uint64_t row_sum = 0;
+		for (uint32_t x = 0; x < d.width; ++x) {
+			row_sum += row[(size_t)x * bpp];
+		}
+		sum += row_sum;
+		if (y == 0) {
+			top = row_sum;
+		}
+		if (y + 1 == d.height) {
+			bottom = row_sum;
+		}
+	}
+	AHardwareBuffer_unlock(ahb, nullptr);
+	LOGW(
+	    "LIFT_PROBE: DEPTH result CPU-locked OK: %ux%u stride=%u format=0x%llx checksum(R)=%llu top-row "
+	    "mean=%.1f bottom-row mean=%.1f (relative depth: larger = farther)",
+	    d.width, d.height, d.stride, (unsigned long long)format, (unsigned long long)sum,
+	    (double)top / (d.width ? d.width : 1), (double)bottom / (d.width ? d.width : 1));
+}
+
 //! Non-blocking acquire: XR_LIFT_NOT_READY_DXR at once when nothing newer exists.
 void
 explicit_poll()
@@ -246,6 +296,9 @@ explicit_poll()
 			    "views=%u fence=%p",
 			    res.extent.width, res.extent.height, (unsigned long long)res.format, res.viewCount,
 			    res.fence);
+		}
+		if (p.mode == Mode::Depth) {
+			depth_checksum_once(p.out_ahb, res.format);
 		}
 		const double svc_ms = (double)res.latency / 1e6;
 		const uint64_t sent = p.submit_ns[res.frameId % kRing];
@@ -326,6 +379,8 @@ lift_probe_enabled()
 				p.mode = Mode::Explicit;
 			} else if (strcmp(v, "both") == 0) {
 				p.mode = Mode::Both;
+			} else if (strcmp(v, "depth") == 0) {
+				p.mode = Mode::Depth;
 			}
 		}
 		char n[PROP_VALUE_MAX] = {};
@@ -412,6 +467,9 @@ lift_probe_frame(uint64_t frame)
 			}
 			if (p.mode == Mode::Explicit || p.mode == Mode::Both) {
 				p.explicit_stream = make_stream("explicit");
+			}
+			if (p.mode == Mode::Depth) {
+				p.explicit_stream = make_stream("explicit", XR_LIFT_MODE_DEPTH_DXR);
 			}
 		}
 	}

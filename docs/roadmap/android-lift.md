@@ -59,6 +59,14 @@ Five slots appended to `xrt_display_processor_vk` under `XRT_DP_VK_HAS_LIFT`, pl
 | output | DP | `AHardwareBuffer` + its `VkImage` (GENERAL), or buffer only (runtime imports, cached by pointer); `AHARDWAREBUFFER_FORMAT_*`; writes complete on return | until the stream's next call |
 | blob | DP | bytes + `XRT_DP_LIFT_BLOB_*` | until the stream's next call |
 
+**Result buffers the client receives** (the per-stream export `AHardwareBuffer`): DEPTH is
+allocated `GPU_SAMPLED_IMAGE | CPU_READ_OFTEN`, so a client reads depth values on the CPU —
+`AHardwareBuffer_lock(buf, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN, -1, NULL, &ptr)`, row stride
+(in pixels) from `AHardwareBuffer_describe`, depth in R — with no Vulkan readback of its own
+(the browser's `/lift/depth`, patch 0238). SBS / NVIEW exports stay **GPU-only**: they are
+only sampled, and a CPU-read usage is not free — gralloc may pick a linear or uncached layout
+for it, costing sampling bandwidth on every weave. GAUSSIANS results are bytes already.
+
 No fallback to `create_dp_vk`: on Android the ordinary factory starts the vendor's whole display
 stack (tracker, backlight) just to learn that a module is absent.
 

@@ -170,7 +170,7 @@ fake_stream_destroy(struct xrt_display_processor_vk *xdp, uint64_t id)
 }
 
 static bool
-ensure_out(struct fake_vk_stream *s, uint32_t w, uint32_t h)
+ensure_out(struct fake_vk_stream *s, uint32_t w, uint32_t h, bool cpu_read)
 {
 	if (s->out != NULL && s->out_w == w && s->out_h == h) {
 		return true;
@@ -185,6 +185,10 @@ ensure_out(struct fake_vk_stream *s, uint32_t w, uint32_t h)
 	desc.layers = 1;
 	desc.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
 	desc.usage = AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE;
+	if (cpu_read) {
+		// DEPTH: CPU-readable like the runtime's DEPTH export (XR_DXR_lift § Android).
+		desc.usage |= AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN;
+	}
 	if (AHardwareBuffer_allocate(&desc, &s->out) != 0) {
 		U_LOG_E("sim_display fake lift (vk): output AHardwareBuffer %ux%u allocate failed", w, h);
 		s->out = NULL;
@@ -243,7 +247,7 @@ fake_convert(struct xrt_display_processor_vk *xdp,
 	const bool depth = s->mode == XRT_DP_LIFT_MODE_DEPTH;
 	const uint32_t ow = w * views;
 	const uint64_t t0 = os_monotonic_get_ns();
-	if (!ensure_out(s, ow, h)) {
+	if (!ensure_out(s, ow, h, depth)) {
 		return false;
 	}
 

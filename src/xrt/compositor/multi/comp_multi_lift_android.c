@@ -1557,13 +1557,20 @@ comp_multi_lift_acquire_result(
 	if (st->exp.image == VK_NULL_HANDLE || st->exp.w != o->img.w || st->exp.h != o->img.h ||
 	    st->exp.ahb_format != o->img.ahb_format) {
 		lift_img_destroy(l->vk, &st->exp);
-		if (!lift_img_alloc(l->vk, o->img.w, o->img.h, o->img.ahb_format, /*cpu_read*/ false, &st->exp,
-		                    "export")) {
+		// DEPTH results are CPU-readable: a client (the browser's GPU process)
+		// reads depth values on the CPU — AHardwareBuffer_lock + the stride from
+		// AHardwareBuffer_describe — without a Vulkan readback of its own.
+		// SBS / NVIEW exports stay GPU-only: they are only ever sampled, and a
+		// CPU-read usage can push gralloc to a linear / uncached layout that
+		// costs GPU sampling bandwidth on every weave.
+		const bool cpu_read = st->info.mode == XRT_DP_LIFT_MODE_DEPTH;
+		if (!lift_img_alloc(l->vk, o->img.w, o->img.h, o->img.ahb_format, cpu_read, &st->exp, "export")) {
 			xret = XRT_ERROR_WEAVE_REFUSED;
 		} else {
 			realloc = true;
-			U_LOG_W("[lift] stream %llu export AHardwareBuffer %ux%u fmt=0x%x ready",
-			        (unsigned long long)id, st->exp.w, st->exp.h, st->exp.ahb_format);
+			U_LOG_W("[lift] stream %llu export AHardwareBuffer %ux%u fmt=0x%x ready%s",
+			        (unsigned long long)id, st->exp.w, st->exp.h, st->exp.ahb_format,
+			        cpu_read ? " (CPU_READ_OFTEN: DEPTH)" : "");
 		}
 	}
 	if (xret == XRT_SUCCESS) {

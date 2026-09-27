@@ -13,6 +13,8 @@
 //             xrSubmitLiftFrameDXR + xrAcquireLiftResultDXR every frame; the
 //             probe logs per-result latency (service + caller side) and drops.
 //   both      both at once (two streams).
+//   depth     the explicit path on a DEPTH stream; the first result is locked
+//             on the CPU (AHardwareBuffer_lock) and checksummed.
 //
 // `debug.dxr.lift.probe_frames N` (default 300): after N explicit submits the
 // probe logs a SUMMARY line and stops submitting (the weave mode keeps going).
