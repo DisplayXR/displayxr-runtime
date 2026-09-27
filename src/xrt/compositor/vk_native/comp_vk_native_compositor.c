@@ -6115,9 +6115,26 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 							vk->vkDestroyFramebuffer(vk->device, target_fb,
 							                         NULL);
 						}
+						/*
+						 * The image this fill acquired is NOT presented, so
+						 * it must be handed back, or it is gone for the life
+						 * of the swapchain: a few such drops and the next
+						 * acquire blocks forever, with the app holding
+						 * c->mutex (#1748: DXR_WEAVE_REPAINT_FORCE=1 hung the
+						 * app in vkAcquireNextImageKHR within seconds). The
+						 * next frame renders into it instead. A recreate
+						 * (generation moved) drops the hold on its own.
+						 */
+						if (c->target != NULL) {
+							comp_vk_native_target_hold_unpresented(c->target, target_index);
+						}
 						*out_skip_frame = true;
 						return XRT_SUCCESS;
 					}
+					// Another frame may have acquired (and failed before
+					// presenting) while the lock was released: present THIS
+					// fill's image.
+					comp_vk_native_target_set_current_index(c->target, target_index);
 				} else {
 					vk->vkWaitForFences(vk->device, 1, fence_p, VK_TRUE, UINT64_MAX);
 					vk->vkResetFences(vk->device, 1, fence_p);
