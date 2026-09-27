@@ -204,6 +204,15 @@ systemctl --user unset-environment DISPLAYXR_DEBUG   # then log out/in again
   window closest to the drag line; it may lead or lag the pointer by up to
   6 device px to do so. `DISPLAYXR_LATTICE_NEAREST=1` in the shell's
   environment restores plain nearest, for A/B comparison. See the spec, §8.8.
+- Version 9, same interface: the **pointer drag** —
+  `BeginPointerDrag(u pid, u button) -> (b started)`, `EndPointerDrag(u pid)`,
+  capability bit 2 (value 4). The extension moves the caller's window with the
+  pointer while `button` is held, with no grab, and stops the moment the button
+  is up. It exists because mutter's own move grab (`xdg_toplevel.move`) ends
+  only on the release of button 1, so an app's right-button content drag kept
+  following the pointer after the release. The drag table applies to it as to
+  a compositor drag, and it is reported like one (`moving`,
+  `DragLatticeDone`). See the spec, §8.9.
 
 Verify capture exclusion is live:
 
