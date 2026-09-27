@@ -701,7 +701,12 @@ struct xrt_plugin_stereo_camera_info
 	//! Native per-eye size.
 	uint32_t eye_width;
 	uint32_t eye_height;
-	//! What the source can deliver, Hz.
+	/*!
+	 * What the source delivers, Hz — ONLY if the plug-in actually knows it
+	 * (a vendor-provided value, or one it measured on an earlier open). 0 =
+	 * unknown; never a placeholder guess. The service measures the real rate
+	 * over the first frames after each open and reports that to apps.
+	 */
 	float max_frame_rate;
 	//! @ref xrt_plugin_stereo_camera_format the plug-in decodes to.
 	uint32_t native_format;

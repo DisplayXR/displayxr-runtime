@@ -217,6 +217,11 @@ struct scam_camera
 	int64_t last_frame_ns;
 	int64_t retry_after_ns;
 	float source_rate;
+	//! Measured over the first frames after each open; what the descriptor
+	//! reports once known (the plug-in's enumerate-time rate is a guess, and
+	//! was 2x wrong on the Leia SR tracking camera).
+	struct u_stereo_camera_rate_meter rate_meter;
+	bool rate_logged;
 	int64_t last_stats_log_ns;
 
 	bool thread_started;
@@ -492,6 +497,14 @@ stream_allocate_locked(struct scam_stream *s, const struct scam_camera *cam)
 }
 
 
+//! The descriptor's rate: measured once known, else the plug-in's (0 = unknown).
+static float
+source_rate_hz(const struct scam_camera *cam)
+{
+	return cam->rate_meter.rate > 0.0f ? cam->rate_meter.rate : cam->info.max_frame_rate;
+}
+
+
 /*
  *
  * Camera thread.
@@ -513,6 +526,23 @@ publish_locked(struct ipc_server_stereo_camera *m,
 	}
 	cam->last_frame_ns = now;
 	set_state_locked(cam, XRT_STEREO_CAMERA_STATE_AVAILABLE);
+
+	if (u_stereo_camera_rate_meter_push(&cam->rate_meter, f->time_ns > 0 ? f->time_ns : now)) {
+		float adv = cam->info.max_frame_rate;
+		bool off = adv <= 0.0f || fabsf(cam->rate_meter.rate - adv) > 0.1f * adv;
+		if (!cam->rate_logged) {
+			cam->rate_logged = true;
+			U_LOG_W(
+			    "stereo camera %llu: measured source rate %.1f Hz over %d frames (plug-in advertised %.1f "
+			    "Hz%s)%s",
+			    (unsigned long long)cam->camera_id, cam->rate_meter.rate, U_STEREO_CAMERA_RATE_WINDOW, adv,
+			    adv > 0.0f ? "" : " = unknown",
+			    off ? " — the descriptor now reports the measured rate" : "");
+		} else {
+			U_LOG_I("stereo camera %llu: measured source rate %.1f Hz", (unsigned long long)cam->camera_id,
+			        cam->rate_meter.rate);
+		}
+	}
 
 	if (f->width != 2 * cam->info.eye_width || f->height != cam->info.eye_height) {
 		U_LOG_W("stereo camera %llu: frame %ux%u does not match the advertised %ux%u SBS — dropped",
@@ -637,6 +667,7 @@ camera_thread(void *ptr)
 			}
 			cam->src = src;
 			cam->last_frame_ns = 0;
+			u_stereo_camera_rate_meter_restart(&cam->rate_meter);
 			U_LOG_W("stereo camera %llu: source opened", (unsigned long long)cam->camera_id);
 			set_state_locked(cam, XRT_STEREO_CAMERA_STATE_WAITING);
 		}
@@ -759,9 +790,20 @@ ipc_server_stereo_camera_create(struct xrt_instance *xinst)
 				cam->info.flags &= ~XRT_PLUGIN_STEREO_CAMERA_CALIBRATED;
 			}
 		}
-		U_LOG_W("stereo camera %llu: \"%s\" %ux%u per eye @ %.1f Hz, flags 0x%x, native format %u",
-		        (unsigned long long)cam->camera_id, info->display_name, info->eye_width, info->eye_height,
-		        info->max_frame_rate, info->flags, info->native_format);
+		if (!(info->max_frame_rate >= 0.0f && info->max_frame_rate <= 1000.0f)) {
+			cam->info.max_frame_rate = 0.0f; // NaN / negative / absurd = unknown
+		}
+		char rate[48];
+		if (cam->info.max_frame_rate > 0.0f) {
+			snprintf(rate, sizeof(rate), "advertised %.1f Hz", cam->info.max_frame_rate);
+		} else {
+			snprintf(rate, sizeof(rate), "rate unknown");
+		}
+		U_LOG_W(
+		    "stereo camera %llu: \"%s\" %ux%u per eye, %s (measured on first open), flags 0x%x, native "
+		    "format %u",
+		    (unsigned long long)cam->camera_id, info->display_name, info->eye_width, info->eye_height, rate,
+		    info->flags, info->native_format);
 		m->camera_count++;
 	}
 	return m;
@@ -899,7 +941,7 @@ ipc_handle_stereo_camera_get_properties(volatile struct ipc_client_state *ics,
 	out_props->view_count = 2;
 	out_props->eye_width = cam->info.eye_width;
 	out_props->eye_height = cam->info.eye_height;
-	out_props->max_frame_rate = cam->info.max_frame_rate;
+	out_props->max_frame_rate = source_rate_hz(cam);
 	if (cam->have_calib) {
 		out_props->baseline_mm = (float)baseline_mm(&cam->calib);
 		double fx = cam->calib.k[0][0];
@@ -1115,7 +1157,7 @@ ipc_handle_stereo_camera_stream_start(volatile struct ipc_client_state *ics, uin
 		os_mutex_unlock(&m->lock);
 		return xret;
 	}
-	u_stereo_camera_decimator_init(&s->dec, s->req.max_frame_rate, cam->info.max_frame_rate);
+	u_stereo_camera_decimator_init(&s->dec, s->req.max_frame_rate, source_rate_hz(cam));
 	u_stereo_camera_ring_clear(&s->ring);
 	s->started = true;
 	cam->started_count++;
@@ -1181,7 +1223,7 @@ ipc_handle_stereo_camera_stream_get_section(volatile struct ipc_client_state *ic
 	out_layout->output = s->output;
 	out_layout->transport = s->req.transport;
 	out_layout->max_frame_rate =
-	    s->dec.period_ns > 0 ? (float)(1e9 / (double)s->dec.period_ns) : m->cams[s->camera].info.max_frame_rate;
+	    s->dec.period_ns > 0 ? (float)(1e9 / (double)s->dec.period_ns) : source_rate_hz(&m->cams[s->camera]);
 	out_layout->section_size = s->section_size;
 	out_layout->slot_stride = s->slot_stride;
 	out_layout->slot_count = U_STEREO_CAMERA_RING_SLOTS;
