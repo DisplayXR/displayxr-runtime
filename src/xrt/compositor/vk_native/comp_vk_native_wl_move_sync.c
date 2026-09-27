@@ -190,7 +190,7 @@ comp_vk_native_wl_move_sync_set_mapped(struct comp_vk_native_wl_move_sync *ms, b
 		ms->have_last = false; // re-send the position with the next tag
 	}
 	wl_surface_commit(ms->tag_surface);
-	U_LOG_I("wl_move_sync: frame tag %s", mapped ? "mapped" : "unmapped (window covers its monitor)");
+	U_LOG_I("wl_move_sync: frame tag %s", mapped ? "mapped" : "unmapped");
 }
 
 void

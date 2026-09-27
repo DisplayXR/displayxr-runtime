@@ -572,6 +572,7 @@ as `docs/specs/vendor/oem-android-platform-requirements.md` §R6.
 | `DXR_IPC_HANDLE` | `ipc/client/ipc_client_connection.c:437, 456` | unset | App | Windows analogue of the above |
 | `DXR_WL_ORIGIN_STAMP` | `compositor/vk_native/comp_vk_native_compositor.c` (`vk_debug_origin_stamp`, Linux + Wayland) | off | App | #1748 measurement hook: writes a barcode of each frame's present origin into its top-left 352x8 device px — it **overwrites content**. Read back by the extension's `DISPLAYXR_STAMP_AUDIT=1` (shell environment) in `scripts/linux/move_sync/`. Never for a real session |
 | `DXR_WL_TEST_STALL` | `compositor/vk_native/comp_vk_native_compositor.c` (`vk_update_present_origin`) | off | App | `N:MS` sleeps MS ms (under the compositor lock) on every N-th frame whose origin moved — a slow frame or a stalled app in the middle of a drag, for the move-sync harness |
+| `DXR_WL_TEST_TAG` | `compositor/vk_native/comp_vk_native_compositor.c` (`vk_wl_move_sync_test_tag_allowed`, consulted by `vk_wl_move_sync_note_weave`) | off | App | `off` never maps the move-sync frame tag (a synced process that tags no commit); `toggle:ON_MS:OFF_MS` maps it for ON_MS then unmaps it for OFF_MS, repeating — for the extension-v10 tag-gate harness (spec §9.9). Registration unchanged; test-only |
 
 ### Adjacent, out of scope but worth knowing
 

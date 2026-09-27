@@ -20,6 +20,9 @@
 # The stamp audit overwrites the top-left 352x8 px of every frame
 # (DXR_WL_ORIGIN_STAMP=1): a measurement hook, never for a real session.
 # Then: analyze.py OUTDIR, summary.py OUTDIR..., stalls.py OUTDIR...
+# Extension v10 tag gate (spec §9.9): EXTRA_APP_ENV="DXR_WL_TEST_TAG=off" (a
+# synced app that never maps its tag) or "DXR_WL_TEST_TAG=toggle:300:300",
+# then gate.py OUTDIR... (held vs plain frames, tag-lost releases).
 # Kills only the processes it started.
 set -u
 H="$(cd "$(dirname "$0")" && pwd)"

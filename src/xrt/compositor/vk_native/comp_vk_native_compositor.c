@@ -11162,6 +11162,47 @@ vk_wayland_phase_snap(struct comp_vk_native_compositor *c)
 
 #if defined(XRT_OS_LINUX_DESKTOP) && defined(XRT_HAVE_WAYLAND) && defined(DXR_HAVE_WL_GEOM)
 /*!
+ * TEST HOOK, off by default (extension v10 harness): DXR_WL_TEST_TAG
+ *   off               never map the frame tag — a move-synced process that
+ *                     tags no commit (a present-owner showing only 2D)
+ *   toggle:ON_MS:OFF_MS  map it for ON_MS, then unmap it for OFF_MS, repeating
+ *                     (a 3D element scrolling in and out of view mid-drag)
+ * The registration (EnableMoveSync) is unchanged. Never for a real session.
+ *
+ * @return whether the hook allows the tag to be mapped right now.
+ */
+static bool
+vk_wl_move_sync_test_tag_allowed(void)
+{
+	static int mode = -1; // 0 = no hook, 1 = off, 2 = toggle
+	static int64_t on_ms = 0, off_ms = 0;
+	if (mode < 0) {
+		mode = 0;
+		const char *e = getenv("DXR_WL_TEST_TAG");
+		int a = 0, b = 0;
+		if (e != NULL && strcmp(e, "off") == 0) {
+			mode = 1;
+		} else if (e != NULL && sscanf(e, "toggle:%d:%d", &a, &b) == 2 && a > 0 && b > 0) {
+			mode = 2;
+			on_ms = a;
+			off_ms = b;
+		}
+		if (mode != 0) {
+			U_LOG_W("DXR_WL_TEST_TAG=%s: the frame tag is %s (test hook)", e,
+			        mode == 1 ? "never mapped" : "toggled");
+		}
+	}
+	if (mode == 0) {
+		return true;
+	}
+	if (mode == 1) {
+		return false;
+	}
+	const int64_t t_ms = (int64_t)(os_monotonic_get_ns() / 1000000);
+	return t_ms % (on_ms + off_ms) < on_ms;
+}
+
+/*!
  * #1748 move sync, per weave: remember the position THIS weave is woven for
  * (the snapshot vk_get_window_metrics just used, not a newer one) so the
  * present can tag its commit with it, and publish whether a move is running
@@ -11192,7 +11233,7 @@ vk_wl_move_sync_note_weave(struct comp_vk_native_compositor *c)
 	// its surface single so mutter can scan it out directly.
 	const bool covers_monitor = wr.left_px == 0 && wr.top_px == 0 && wr.width_px == wr.monitor_width_px &&
 	                            wr.height_px == wr.monitor_height_px;
-	comp_vk_native_wl_move_sync_set_mapped(c->wl_move_sync, !covers_monitor);
+	comp_vk_native_wl_move_sync_set_mapped(c->wl_move_sync, !covers_monitor && vk_wl_move_sync_test_tag_allowed());
 	c->wl_ms.have_pending = true;
 	c->wl_ms.pending_x = wr.content_logical_x;
 	c->wl_ms.pending_y = wr.content_logical_y;
