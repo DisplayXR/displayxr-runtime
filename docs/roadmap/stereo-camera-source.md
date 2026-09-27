@@ -262,8 +262,32 @@ against the sim fake).
   source; **budget: ≤ 2 ms per frame on the camera thread**, above which the rows split across
   threads (`u_stereo_rectify_lut_apply_rows`) or the GPU backend takes over. Setup (geometry + both
   LUTs) 9–18 ms, once per calibration; LUT memory 6 bytes per output sample (3.7 MB + 0.9 MB).
-- **Not in R2:** the GPU backend (seam in place), per-frame recalibration (`calibrationGeneration`
-  stays 0), and a rectifier for a camera whose calibration changes at runtime.
+- **Online vertical-alignment refinement** (`auxiliary/util/u_stereo_vrefine.{h,c}` + the service
+  worker). Why: on a Leia SR laptop the rectified rows were still +1.71 px apart, and OpenCV's own
+  `stereoRectify` on the same frame and calibration gave the same +1.71 px — the stored calibration
+  is slightly off for the frames, not the rectifier. Model `dy = a + b·(y − cy)` (right − left,
+  output px); the x (roll) term measured 0.04 px / 100 px on that data and is left out. A worker
+  measures rectified frames the camera thread hands it (Shi-Tomasi patches on a 2× downscale, NCC
+  over d × dy, full-res NCC refinement ±2 px with parabolic sub-pixel; gated on NCC ≥ 0.9, d > 0,
+  unclamped peaks, real vertical curvature), fits robustly (median start, Tukey IRLS; the slope
+  only when rows spread ≥ 40 px), and when the correction moves by > 0.2 px rebuilds the maps with
+  it folded into the geometry: `v_offset = a/f`, `v_slope = b`, split symmetrically as a per-eye
+  vertical affine in normalized rectified coordinates **before** the principal point and the
+  alpha = 0 crop are computed, so P1/P2 describe the corrected frames (still one pinhole, pure +x
+  baseline) and `calibrationGeneration` bumps on the swap. Duty cycle: every 250 ms for 5 s after
+  an open or an update, then one ≥ 3-frame window every 30 s; 2.7 ms per measurement at -O2 on the
+  worker (< 0.4 ms per frame amortised at 30 Hz), 8 ms per rebuild. Safety: |a| ≤ 6 px,
+  |b| ≤ 2 px / 100 px, ≥ 50 matches over ≥ 3 frames, re-verified on every re-open, WARN on first
+  application and INFO after, `DXR_STEREO_CAMERA_REFINE=0` kill switch. Fake:
+  `SIM_DISPLAY_FAKE_STEREO_CAMERA_DY` / `_DY_SLOPE` (px, px per 100 px) inject an uncalibrated
+  misalignment. `probe` prints the state, the applied a/b and dy before → after.
+  Tests (`tests_stereo_vrefine`): the fake with the SR model (+2.6 px, −0.47 px / 100 px) converges
+  to +0.000 px (probe matcher, 338 blocks) in one rebuild; flat / uncorrelated / vertical-stripe
+  frames never apply; clamps hold. **Real SR frame** (`tests/fixtures/stereo_vrefine_sr_raw.jpg`,
+  62 KB, + the device calibration + 63 OpenCV SIFT matches as an independent reference): SIFT
+  signed dy median +1.715 px → **+0.075 px**.
+- **Not in R2:** the GPU backend (seam in place), and a rectifier for a camera whose calibration
+  changes at runtime (the refinement's reset hook is there for it).
 
 ## F. Risks
 
