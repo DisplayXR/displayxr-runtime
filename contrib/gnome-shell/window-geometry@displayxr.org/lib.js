@@ -153,6 +153,85 @@
 
     let built = null;
 
+    /*
+     * ── The pointer drag (extension version 9, placement capability 4) ──
+     *
+     * Pure logic, no GI: scripts/test_gnome_extension_pointer_drag.js loads
+     * this file under plain gjs and drives it directly.
+     *
+     * A DisplayXR app drags its window from anywhere in the content with a
+     * SECONDARY button (the left one belongs to the scene). Handing that to
+     * mutter with xdg_toplevel.move does not work: mutter accepts the request
+     * with any pressed button's serial, but its move grab ends only on the
+     * release of button 1 or of the resize button (mutter 50.1,
+     * src/compositor/meta-window-drag.c, process_pointer_event:
+     * `button == 1 || button == meta_prefs_get_mouse_button_resize ()`), so a
+     * right-button drag kept following the pointer after the release until
+     * the next click. Nothing outside mutter can end its grab (there is no
+     * introspected end_grab_op), so the app does not start one for such a
+     * button: it asks for this pointer drag instead.
+     *
+     * The extension follows the pointer itself, with NO grab: the app keeps
+     * its implicit pointer grab (it sees the release), every move goes
+     * through `move_frame` and so through the drag table's correction exactly
+     * as a compositor drag's does, and the drag ends the moment the button's
+     * bit leaves the pointer's modifier mask — however the release happened,
+     * wherever the pointer is. The mask is polled (a few ms), not taken from
+     * events: an event filter added by an extension runs after mutter's own,
+     * which consumes every event it delivers to a Wayland client.
+     */
+    const PointerDrag = {
+        //! Clutter.ModifierType.BUTTON1_MASK .. BUTTON5_MASK (1 << 8 .. 1 << 12).
+        maskFor(button) {
+            return button >= 1 && button <= 5 ? 1 << (7 + button) : 0;
+        },
+
+        /*
+         * The modifier bits that may stand for @p button. mutter 50.1 files
+         * the MIDDLE and RIGHT buttons under each other's mask: its table is
+         * indexed by the Clutter button number but written in evdev order
+         * (src/backends/native/meta-seat-impl.c, `maskmap` = {BUTTON1,
+         * BUTTON3, BUTTON2, ...}[clutter_button - 1]), so a held right button
+         * reads as BUTTON2_MASK. Measured: right held -> mods 0x200. Either
+         * bit is accepted for buttons 2 and 3; create() then watches the one
+         * that is actually set, so a mutter that fixes the table still works.
+         */
+        candidatesFor(button) {
+            if (button === 2 || button === 3)
+                return PointerDrag.maskFor(2) | PointerDrag.maskFor(3);
+            return PointerDrag.maskFor(button);
+        },
+
+        //! A drag of a window whose frame is at (fx, fy), the pointer at
+        //! (px, py) with modifier state @p mods. null: the button is not held
+        //! (already released) or has no mask (the side buttons).
+        create(button, fx, fy, px, py, mods) {
+            const mask = mods & PointerDrag.candidatesFor(button);
+            if (!mask)
+                return null;
+            return {button, mask, fx, fy, px, py, lastX: px, lastY: py, moves: 0};
+        },
+
+        /*
+         * One poll: the pointer at (x, y) with modifier state @p mods.
+         * Returns {end, move}: move = the frame position to go to (null =
+         * none), end = the button is up and the drag is over. The last
+         * position the pointer reached before the release still counts.
+         */
+        step(st, x, y, mods) {
+            let move = null;
+            if (x !== st.lastX || y !== st.lastY) {
+                st.lastX = x;
+                st.lastY = y;
+                st.moves++;
+                move = [st.fx + x - st.px, st.fy + y - st.py];
+            }
+            // Over when a watched bit is gone (both, if middle and right
+            // were both held at the start: ending early beats never ending).
+            return {end: (mods & st.mask) !== st.mask, move};
+        },
+    };
+
     globalThis.displayxrWindowGeometry = {
         //! gi: {Clutter, GObject, Meta, Gio, GLib} — however the caller's
         //! shell spells the import. Returns {WindowGeometryService}.
@@ -161,6 +240,8 @@
                 built = buildModule(gi);
             return built;
         },
+        //! The pointer drag's pure logic, exported for its unit test.
+        PointerDrag,
     };
 
     function buildModule({Clutter, GObject, Meta, Gio, GLib, Graphene}) {
@@ -521,6 +602,14 @@
     <method name="ClearDragLattice">
       <arg type="u" direction="in" name="pid"/>
     </method>
+    <method name="BeginPointerDrag">
+      <arg type="u" direction="in" name="pid"/>
+      <arg type="u" direction="in" name="button"/>
+      <arg type="b" direction="out" name="started"/>
+    </method>
+    <method name="EndPointerDrag">
+      <arg type="u" direction="in" name="pid"/>
+    </method>
 
     <signal name="DragLatticeNeeded">
       <arg type="u" name="pid"/>
@@ -581,6 +670,10 @@
             typeof Meta.Window.prototype.add_external_constraint === 'function';
         const PLACEMENT_CAP_DRAG_LATTICE = 1;
         const PLACEMENT_CAP_EXPLICIT_START = 2;
+        //! BeginPointerDrag / EndPointerDrag (version 9): see "The pointer drag".
+        const PLACEMENT_CAP_POINTER_DRAG = 4;
+        //! How often the pointer drag reads the pointer, ms.
+        const POINTER_DRAG_POLL_MS = 4;
         //! A table no grab follows stops constraining after this long.
         const LATTICE_PRE_GRAB_US = 2 * 1000 * 1000;
         //! DISPLAYXR_TEST=1 (never in production): tables audit their paints
@@ -1047,8 +1140,12 @@
         }
 
         class WindowPlacement {
-            constructor(getGrabbedWindow) {
+            constructor(getGrabbedWindow, onPointerDrag = () => {}) {
                 this._getGrabbedWindow = getGrabbedWindow;
+                //! (win) at a pointer drag's start, (null, win) at its end: the
+                //! service treats it as the grab it stands in for.
+                this._onPointerDrag = onPointerDrag;
+                this._pd = null;
                 // DISPLAYXR_DEBUG=1 in the shell's environment: per-drag lattice
                 // lines in the journal.
                 this._debug = GLib.getenv('DISPLAYXR_DEBUG') === '1';
@@ -1102,8 +1199,101 @@
             }
 
             GetPlacementCapabilities() {
-                return this._lattice.supported()
-                    ? PLACEMENT_CAP_DRAG_LATTICE | PLACEMENT_CAP_EXPLICIT_START : 0;
+                return (this._lattice.supported()
+                    ? PLACEMENT_CAP_DRAG_LATTICE | PLACEMENT_CAP_EXPLICIT_START : 0) |
+                    PLACEMENT_CAP_POINTER_DRAG;
+            }
+
+            /*
+             * The pointer drag (see "The pointer drag" at the top of this
+             * file): move the caller's window with the pointer while @p button
+             * is held. Refused when the button is already up (a quick click:
+             * the drag is over before it began), when a grab or another
+             * pointer drag is running, or for a fullscreen / unmovable window.
+             */
+            BeginPointerDragAsync([pid, button], invocation) {
+                this._senderPid(invocation.get_sender(), senderPid => {
+                    let started = false;
+                    if (senderPid > 0 && (pid === 0 || pid === senderPid))
+                        started = this._beginPointerDrag(this._windowOfPid(senderPid), senderPid, button);
+                    invocation.return_value(new GLib.Variant('(b)', [started]));
+                });
+            }
+
+            EndPointerDragAsync([pid], invocation) {
+                this._senderPid(invocation.get_sender(), senderPid => {
+                    if (this._pd && senderPid > 0 && (pid === 0 || pid === senderPid) &&
+                        this._pd.pid === senderPid)
+                        this._endPointerDrag('the app saw the release');
+                    invocation.return_value(null);
+                });
+            }
+
+            _beginPointerDrag(win, pid, button) {
+                const refuse = why => {
+                    if (this._debug)
+                        log(`displayxr: pointer drag refused pid=${pid} button=${button}: ${why}`);
+                    return false;
+                };
+                if (!win)
+                    return refuse('no window for this process');
+                if (this._pd || this._getGrabbedWindow())
+                    return refuse('a grab or another pointer drag is running');
+                if (win.is_fullscreen() || win.allows_move?.() === false)
+                    return refuse('the window cannot be moved (fullscreen?)');
+                const [x, y, mods] = global.get_pointer();
+                const f = win.get_frame_rect();
+                const st = PointerDrag.create(button, f.x, f.y, x, y, mods);
+                if (!st)
+                    return refuse(`the button is not held (mods 0x${mods.toString(16)})`);
+                const pd = {win, pid, st, timer: 0, unmanaging: 0};
+                pd.unmanaging = win.connect('unmanaging', () => this._endPointerDrag('the window went away'));
+                pd.timer = GLib.timeout_add(GLib.PRIORITY_HIGH, POINTER_DRAG_POLL_MS, () => {
+                    const [px, py, pm] = global.get_pointer();
+                    const r = PointerDrag.step(pd.st, px, py, pm);
+                    if (r.move && !pd.win.is_fullscreen())
+                        pd.win.move_frame(true, r.move[0], r.move[1]);
+                    if (r.end) {
+                        pd.timer = 0; // this source ends with the SOURCE_REMOVE below
+                        this._endPointerDrag('the button is up');
+                        return GLib.SOURCE_REMOVE;
+                    }
+                    return GLib.SOURCE_CONTINUE;
+                });
+                this._pd = pd;
+                this._onPointerDrag(win);
+                if (this._debug)
+                    log(`displayxr: pointer drag start pid=${pid} button=${button} (mask 0x${st.mask.toString(16)}) ` +
+                        `frame=(${f.x},${f.y}) pointer=(${x},${y})`);
+                return true;
+            }
+
+            //! End a running pointer drag (no-op when none runs).
+            _endPointerDrag(why) {
+                const pd = this._pd;
+                if (!pd)
+                    return;
+                this._pd = null;
+                if (pd.timer)
+                    GLib.source_remove(pd.timer);
+                if (pd.unmanaging) {
+                    try {
+                        pd.win.disconnect(pd.unmanaging);
+                    } catch (e) {
+                        // the window is already gone
+                    }
+                }
+                this._onPointerDrag(null, pd.win);
+                if (this._debug) {
+                    const f = pd.win.get_frame_rect?.();
+                    log(`displayxr: pointer drag end (${why}) pid=${pd.pid} after ${pd.st.moves} move(s)` +
+                        `${f ? `, frame (${f.x},${f.y})` : ''}`);
+                }
+            }
+
+            //! A compositor grab is starting: it owns the pointer from now on.
+            cancelPointerDrag() {
+                this._endPointerDrag('a compositor grab started');
             }
 
             SetDragLatticeAsync([pid, extend, cell, minDx, minDy, maxDx, maxDy, dxs, dys], invocation) {
@@ -1152,6 +1342,7 @@
             }
 
             destroy() {
+                this._endPointerDrag('the extension is disabled');
                 this._lattice?.destroy();
                 this._lattice = null;
                 if (this._dbus) {
@@ -1239,7 +1430,20 @@
                 // CaptureExclusion1.
                 this._captureExclusion = new CaptureExclusion(() => this._queueEmit());
                 this._grabbedWindow = null;
-                this._placement = new WindowPlacement(() => this._grabbedWindow);
+                // A pointer drag stands in for a grab (the window is `moving`,
+                // its drag table corrects every move, and it ends with a
+                // DragLatticeDone), so it is reported exactly like one.
+                this._placement = new WindowPlacement(() => this._grabbedWindow, (win, ended) => {
+                    if (win) {
+                        this._grabbedWindow = win;
+                        this._placement?.onGrabBegin(win);
+                    } else {
+                        this._placement?.onGrabEnd(ended);
+                        if (this._grabbedWindow === ended)
+                            this._grabbedWindow = null;
+                    }
+                    this._queueEmit();
+                });
                 this._nameId = Gio.DBus.session.own_name(
                     'org.displayxr.WindowGeometry',
                     Gio.BusNameOwnerFlags.NONE, null, null);
@@ -1261,6 +1465,7 @@
                 const grabWindow = args => args.find(a => a instanceof Meta.Window) ?? null;
                 this._displaySignals.push(
                     display.connect('grab-op-begin', (..._args) => {
+                        this._placement?.cancelPointerDrag();
                         this._grabbedWindow = grabWindow(_args);
                         this._placement?.onGrabBegin(this._grabbedWindow);
                         this._queueEmit();

@@ -657,3 +657,57 @@ pixel"). At 150 % the panel dragged unconstrained, and stuttered. Now:
 
 An app against a v7 extension keeps the integer-scale-only behaviour.
 
+### 8.8 Version 9 — the pointer drag (a content drag on a secondary button)
+
+DisplayXR apps drag their window from anywhere in the content with the RIGHT
+button (the left one belongs to the scene), the same gesture as on X11 and
+Windows. Handed to mutter with `xdg_toplevel.move`, that drag never ended on
+the release: mutter accepts the request with any pressed button's serial
+(`meta_wayland_pointer_get_grab_info` only asks for `button_count > 0`), but
+its move grab ends only on the release of button 1 or of the resize button
+(mutter 50.1, `src/compositor/meta-window-drag.c`, `process_pointer_event`,
+`CLUTTER_BUTTON_RELEASE`: `button == 1 || button ==
+meta_prefs_get_mouse_button_resize ()` — 2 by default). The window kept
+following the pointer until the next click, and the client never saw the
+release. Reproduced in a private headless GNOME Shell 50.1 with pointer
+injection through `org.gnome.Mutter.RemoteDesktop`: after the right button
+went up, a further 300 px of pointer motion moved the window 300 px, in 3 of 3
+drags. Nothing outside mutter can end its grab (no introspected
+`end_grab_op`; its grab is an input-only `ClutterGrab` with its own handler),
+so the app no longer starts one for such a button.
+
+Instead the extension follows the pointer itself — capability bit 2 (value 4),
+`BeginPointerDrag(u pid, u button) -> (b started)` and `EndPointerDrag(u pid)`:
+
+- **No grab.** The client keeps its implicit pointer grab, so it sees the
+  motion and the release. Every move goes through `move_frame`, and so
+  through the drag table's correction exactly as a compositor drag's does.
+  While it runs, the window is reported `moving` and a table sent for it is
+  active; it ends with `DragLatticeDone` like a grab.
+- **It ends on the button mask.** The pointer is read every 4 ms
+  (`global.get_pointer()`), and the drag is over on the first read whose
+  modifier mask lacks the button — however the release happened, wherever
+  the pointer is. Not an event filter: one added by an extension runs after
+  mutter's own, which consumes every event it delivers to a Wayland client.
+- **mutter files the middle and right buttons under each other's mask.** Its
+  table (`src/backends/native/meta-seat-impl.c`, `maskmap`) is indexed by the
+  Clutter button number but written in evdev order, so a held right button
+  reads as `BUTTON2_MASK` (measured: mods `0x200`). For buttons 2 and 3
+  either bit is accepted at the start, and the one actually set is watched.
+- **Refused** when the button is already up at the call (a quick click),
+  when a grab or another pointer drag is running, or for a fullscreen or
+  unmovable window. A compositor grab that starts during it ends it.
+- `EndPointerDrag` is the app's belt and braces (it saw the release); the
+  mask ends the drag either way.
+
+The app (displayxr-common `dxr_drag.h`) keeps `xdg_toplevel.move` for button 1,
+and for any button on a compositor that is not mutter. On mutter without this
+capability a secondary-button content drag does not move the window at all,
+with one WARN, rather than start a drag nothing can end. Same measurement with
+this version: the window followed the pointer while the button was held
+(+300,+120 for a +300,+120 drag) and stayed put after the release, in 3 of 3
+drags including a release far outside the window after a fast flick.
+
+`scripts/test_gnome_extension_pointer_drag.js` (gjs, in `lint.yml`) checks the
+pure part (`PointerDrag` in `lib.js`).
+
