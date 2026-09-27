@@ -103,6 +103,18 @@ sim_stereo_camera_distorted_init(struct sim_stereo_camera_distorted *d,
 void
 sim_stereo_camera_distorted_fini(struct sim_stereo_camera_distorted *d);
 
+/*!
+ * An UNCALIBRATED vertical misalignment on top of the distorted pair (R2
+ * refinement tests): the right eye shows the scene @p dy_px lower, plus
+ * @p slope px per px of distance from the centre row, in the virtual parallel
+ * frame — dy(v) = dy_px + slope * (v - ideal_cy). The calibration the fake
+ * reports does NOT know about it, like a real device whose stored calibration
+ * is slightly off (the Leia SR laptop: +2.6 px, -0.0047 px/px). Call once
+ * after init.
+ */
+void
+sim_stereo_camera_distorted_set_vmisalign(struct sim_stereo_camera_distorted *d, double dy_px, double slope);
+
 //! Render frame @p frame_number of the distorted pair (GRAY8 SBS).
 void
 sim_stereo_camera_render_gray_distorted(const struct sim_stereo_camera_distorted *d,

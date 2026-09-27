@@ -280,6 +280,25 @@ sim_stereo_camera_distorted_init(struct sim_stereo_camera_distorted *d,
 }
 
 void
+sim_stereo_camera_distorted_set_vmisalign(struct sim_stereo_camera_distorted *d, double dy_px, double slope)
+{
+	if (d->ideal_uv == NULL || (dy_px == 0.0 && slope == 0.0) || !(slope > -0.5 && slope < 0.5)) {
+		return;
+	}
+	// The right raw pixel that looks at virtual row v sees the scene row whose
+	// image the misalignment moved there: v = vs + dy + slope (vs - cy).
+	const uint32_t w = d->scene.eye_width, h = d->scene.eye_height;
+	const double cy = d->truth.ideal_cy;
+	float *uv = d->ideal_uv + (size_t)2 * w * h;
+	for (size_t i = 0; i < (size_t)w * h; i++) {
+		if (uv[2 * i] < -1e8f) {
+			continue;
+		}
+		uv[2 * i + 1] = (float)(cy + ((double)uv[2 * i + 1] - cy - dy_px) / (1.0 + slope));
+	}
+}
+
+void
 sim_stereo_camera_distorted_fini(struct sim_stereo_camera_distorted *d)
 {
 	free(d->ideal_uv);
