@@ -451,7 +451,8 @@ owns threads, fan-out, rectification, format conversion, transport, consent and 
 > 40 px** of disparity, plus an 8-digit frame counter in both halves. Knobs, read by the SERVICE:
 > `SIM_DISPLAY_FAKE_STEREO_CAMERA=1`, `_SIZE=WxH` (per eye), `_FPS=N`, `_FORMAT=gray8|nv12|bgra`,
 > `_SUSPEND_PERIOD_MS=N`, `_ADVERTISED_FPS=N` (what enumerate claims, default = `_FPS`; `0` = unknown —
-> exercises the service's measured-rate path). The distorted + misaligned variant below is R2's, with the rectifier.
+> exercises the service's measured-rate path), `_BASELINE_MM=N` (default 50; `120` reproduces the Leia SR
+> tracking camera: the bar at 0.6 m is ~95 px). The distorted + misaligned variant below is R2's, with the rectifier.
 
 `SIM_DISPLAY_FAKE_STEREO_CAMERA=1` makes sim_display advertise one camera
 (`SHARED_WITH_EYE_TRACKING | USER_FACING | CALIBRATED | MONOCHROME`, 640×480 per eye, 30 Hz,

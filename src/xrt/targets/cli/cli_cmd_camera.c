@@ -40,6 +40,7 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -323,23 +324,55 @@ cmp_int(const void *a, const void *b)
 	return *(const int *)a - *(const int *)b;
 }
 
+//! Nearest subject the probe expects: its disparity bounds the search.
+#define PROBE_NEAREST_M 0.4
+
+/*!
+ * Disparity search bound from the camera's own geometry: the disparity of a
+ * subject at PROBE_NEAREST_M, f * B / Z, with f from the per-eye HFOV. A fixed
+ * 64 px was fine for the 50 mm sim fake and useless on the 120 mm Leia SR
+ * tracking camera, where a face at 0.6 m is ~95 px and every block clamped at
+ * 64. Uncalibrated: a quarter of the eye width. Always within [64, 0.6 * eye].
+ */
+static uint32_t
+probe_max_disparity(const struct xrt_stereo_camera_properties *p, uint32_t eye_w)
+{
+	double d = eye_w / 4.0;
+	if (p != NULL && p->baseline_mm > 0.0f && p->horizontal_fov_deg > 1.0f && p->horizontal_fov_deg < 179.0f) {
+		double f = (eye_w / 2.0) / tan(p->horizontal_fov_deg * 0.5 * 3.14159265358979323846 / 180.0);
+		d = f * (p->baseline_mm / 1000.0) / PROBE_NEAREST_M;
+	}
+	double cap = eye_w * 0.6;
+	if (d > cap) {
+		d = cap;
+	}
+	return d < 64.0 ? 64u : (uint32_t)ceil(d);
+}
+
 //! Block-match the last frame on a 64x64 grid and print the two dominant
-//! disparities (the sim fake: background 12 px, bar 40 px).
+//! disparities (the sim fake: background 12 px, bar 40 px). Blocks whose best
+//! match sits ON the search bound are a clamp, not a measurement: counted and
+//! reported, never folded into the modes.
 static void
-report_disparity(const uint8_t *gray, uint32_t pitch, uint32_t eye_w, uint32_t h, char *out, size_t cap)
+report_disparity(const uint8_t *gray, uint32_t pitch, uint32_t eye_w, uint32_t h, uint32_t max_d, char *out, size_t cap)
 {
 	int vals[512];
-	int n = 0;
+	int n = 0, at_edge = 0;
 	for (uint32_t y = 48; y + 64 <= h && n < 512; y += 64) {
 		for (uint32_t x = 64; x + 64 <= eye_w && n < 512; x += 64) {
 			float d = 0.0f;
-			if (u_stereo_camera_estimate_disparity(gray, pitch, eye_w, h, x, y, 64, 64, 64, &d)) {
+			if (u_stereo_camera_estimate_disparity(gray, pitch, eye_w, h, x, y, 64, 64, max_d, &d)) {
+				uint32_t lim = max_d < x ? max_d : x;
+				if (d >= (float)lim - 0.5f) {
+					at_edge++;
+					continue;
+				}
 				vals[n++] = (int)(d + 0.5f);
 			}
 		}
 	}
 	if (n == 0) {
-		snprintf(out, cap, "n/a (frame too small)");
+		snprintf(out, cap, "n/a (%s)", at_edge > 0 ? "every block hit the search bound" : "frame too small");
 		return;
 	}
 	qsort(vals, (size_t)n, sizeof(int), cmp_int);
@@ -362,8 +395,11 @@ report_disparity(const uint8_t *gray, uint32_t pitch, uint32_t eye_w, uint32_t h
 		}
 		i = j;
 	}
-	snprintf(out, cap, "%d px (%d/%d blocks), %d px (%d/%d blocks), range %d..%d px", best_v[0], best_c[0], n,
-	         best_v[1], best_c[1], n, vals[0], vals[n - 1]);
+	int k = snprintf(out, cap, "%d px (%d/%d blocks), %d px (%d/%d blocks), range %d..%d px (search 0..%u)",
+	                 best_v[0], best_c[0], n, best_v[1], best_c[1], n, vals[0], vals[n - 1], max_d);
+	if (at_edge > 0 && k > 0 && (size_t)k < cap) {
+		snprintf(out + k, cap - (size_t)k, "; %d block(s) AT THE SEARCH BOUND, excluded", at_edge);
+	}
 }
 
 static int
@@ -396,15 +432,27 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 			id = strtoull(argv[i], NULL, 10);
 		}
 	}
-	if (id == 0) {
-		struct xrt_stereo_camera_properties p;
+	struct xrt_stereo_camera_properties props;
+	memset(&props, 0, sizeof(props));
+	{
 		uint32_t n = 0;
-		if (ipc_client_stereo_camera_count(ipc_c, &n) != XRT_SUCCESS || n == 0 ||
-		    ipc_client_stereo_camera_get_properties(ipc_c, 0, &p) != XRT_SUCCESS) {
+		bool found = false;
+		if (ipc_client_stereo_camera_count(ipc_c, &n) == XRT_SUCCESS) {
+			for (uint32_t i = 0; i < n && !found; i++) {
+				if (ipc_client_stereo_camera_get_properties(ipc_c, i, &props) == XRT_SUCCESS &&
+				    (id == 0 || props.camera_id == id)) {
+					found = true;
+				}
+			}
+		}
+		if (!found && id == 0) {
 			printf("camera probe: the service exposes no stereo camera.\n");
 			return 3;
 		}
-		id = p.camera_id;
+		if (!found) {
+			memset(&props, 0, sizeof(props)); // stream_create reports the bad id
+		}
+		id = found ? props.camera_id : id;
 	}
 
 	struct xrt_stereo_camera_stream_request req = {
@@ -517,8 +565,9 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 		if (gray != NULL &&
 		    u_stereo_camera_convert(last.format, src, last.row_pitch, XRT_STEREO_CAMERA_FORMAT_GRAY8, gray, &gl,
 		                            last.width, last.height)) {
-			char disp[160];
-			report_disparity(gray, gl.pitch[0], last.width / 2, last.height, disp, sizeof(disp));
+			char disp[256];
+			report_disparity(gray, gl.pitch[0], last.width / 2, last.height,
+			                 probe_max_disparity(&props, last.width / 2), disp, sizeof(disp));
 			printf("block disparity (left x - right x): %s\n", disp);
 		}
 		if (out_dir != NULL) {
