@@ -171,8 +171,14 @@ cmd_list(struct ipc_connection *ipc_c, bool json)
 			       state_str(p.state));
 			printf("       persistentId %s\n", p.persistent_id);
 			printf("       flags        %s\n", flags);
-			printf("       eye          %ux%u (SBS %ux%u), %u views, up to %.1f Hz\n", p.eye_width,
-			       p.eye_height, 2 * p.eye_width, p.eye_height, p.view_count, p.max_frame_rate);
+			char rate[64];
+			if (p.max_frame_rate > 0.0f) {
+				snprintf(rate, sizeof(rate), "%.1f Hz", p.max_frame_rate);
+			} else {
+				snprintf(rate, sizeof(rate), "rate unknown (measured once a stream runs)");
+			}
+			printf("       eye          %ux%u (SBS %ux%u), %u views, %s\n", p.eye_width, p.eye_height,
+			       2 * p.eye_width, p.eye_height, p.view_count, rate);
 			printf("       baseline     %.2f mm, HFOV %.2f deg per eye\n", p.baseline_mm,
 			       p.horizontal_fov_deg);
 			printf("       formats      0x%llx  transports 0x%llx  platform hint \"%s\"\n",
@@ -437,10 +443,16 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 		ipc_client_stereo_camera_stream_destroy(ipc_c, sid);
 		return 2;
 	}
-	printf("stream %llu on camera %llu: %ux%u %s SBS (%s), cap %.1f Hz, ring %u x %llu B (section %llu B)\n",
+	char cap[48];
+	if (lay.max_frame_rate > 0.0f) {
+		snprintf(cap, sizeof(cap), "cap %.1f Hz", lay.max_frame_rate);
+	} else {
+		snprintf(cap, sizeof(cap), "cap = source rate (not measured yet)");
+	}
+	printf("stream %llu on camera %llu: %ux%u %s SBS (%s), %s, ring %u x %llu B (section %llu B)\n",
 	       (unsigned long long)sid, (unsigned long long)id, lay.width, lay.height, format_str(lay.format),
-	       lay.output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED ? "RECTIFIED" : "RAW (flagged)", lay.max_frame_rate,
-	       lay.slot_count, (unsigned long long)lay.slot_stride, (unsigned long long)lay.section_size);
+	       lay.output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED ? "RECTIFIED" : "RAW (flagged)", cap, lay.slot_count,
+	       (unsigned long long)lay.slot_stride, (unsigned long long)lay.section_size);
 
 	int64_t t_start = os_monotonic_get_ns();
 	int64_t deadline = seconds > 0.0f ? t_start + (int64_t)(seconds * 1e9) : t_start + 60ll * 1000000000;

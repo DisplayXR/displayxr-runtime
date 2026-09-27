@@ -111,6 +111,42 @@ u_stereo_camera_decimator_accept(struct u_stereo_camera_decimator *d, int64_t t_
 
 /*
  *
+ * Source-rate meter: what the source ACTUALLY delivers, not what it advertises.
+ *
+ * A plug-in often cannot know its rate at enumerate time (the Leia SR tracking
+ * camera advertised 30 Hz and ran 58-64 Hz). The service therefore measures
+ * the first @ref U_STEREO_CAMERA_RATE_WINDOW frames after every open and
+ * reports that as the descriptor's rate; until a window completes the rate is
+ * the plug-in's own value, where 0 means "unknown".
+ *
+ */
+
+#define U_STEREO_CAMERA_RATE_WINDOW 60                    //!< intervals per measurement
+#define U_STEREO_CAMERA_RATE_GAP_NS (500ll * 1000 * 1000) //!< a longer gap restarts the window
+
+struct u_stereo_camera_rate_meter
+{
+	int64_t first_ns;
+	int64_t last_ns;
+	uint32_t intervals;
+	float rate; //!< last completed measurement, Hz; 0 = none yet
+};
+
+//! Forget the window in progress (a source re-open); keeps the last @ref rate.
+void
+u_stereo_camera_rate_meter_restart(struct u_stereo_camera_rate_meter *m);
+
+/*!
+ * Feed one frame's timestamp. A gap over @ref U_STEREO_CAMERA_RATE_GAP_NS (a
+ * suspension) restarts the window rather than diluting it.
+ * @return true exactly when this frame completed a window (@ref rate updated).
+ */
+bool
+u_stereo_camera_rate_meter_push(struct u_stereo_camera_rate_meter *m, int64_t t_ns);
+
+
+/*
+ *
  * Plane layout + conversion (GRAY8 = 1, NV12 = 2, BGRA8 = 3; the
  * xrt_stereo_camera_format values).
  *

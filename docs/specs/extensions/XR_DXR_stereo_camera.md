@@ -101,7 +101,8 @@ typedef struct XrStereoCameraPropertiesDXR {
     XrStereoCameraFlagsDXR     flags;
     XrStereoCameraStateDXR     state;
     XrExtent2Di                eyeExtent;         // native per-eye size (e.g. 640x480)
-    float                      maxFrameRate;      // what the source can deliver, Hz
+    float                      maxFrameRate;      // Hz the source delivers: MEASURED by the service after its
+                                                  // first open, else the vendor's value; 0 = not known yet
     float                      baselineMm;        // |T| of the pair; 0 if uncalibrated
     float                      horizontalFovDeg;  // per eye, rectified; 0 if uncalibrated
     XrStereoCameraFormatFlagsDXR supportedFormats;       // GRAY8 / NV12 / BGRA8 bits the service will produce
@@ -389,7 +390,7 @@ struct xrt_plugin_stereo_camera_info {
 	char platform_device_hint[256];  // OS id of the physical device read, or ""
 	uint32_t flags;                  // XRT_PLUGIN_STEREO_CAMERA_* (shared-with-tracking, user-facing, calibrated, rectified, mono)
 	uint32_t eye_width, eye_height;
-	float max_frame_rate;
+	float max_frame_rate;            // only if KNOWN (vendor value / measured earlier); 0 = unknown, never a guess
 	uint32_t native_format;          // GRAY8 / NV12 / BGRA8 — the plug-in decodes its transport (e.g. JPEG) itself
 };
 
@@ -449,7 +450,8 @@ owns threads, fan-out, rectification, format conversion, transport, consent and 
 > at 0.6 m, which at the defaults (640 px per eye, 68° HFOV → fx 474.4 px, 50 mm) are **12 px and
 > 40 px** of disparity, plus an 8-digit frame counter in both halves. Knobs, read by the SERVICE:
 > `SIM_DISPLAY_FAKE_STEREO_CAMERA=1`, `_SIZE=WxH` (per eye), `_FPS=N`, `_FORMAT=gray8|nv12|bgra`,
-> `_SUSPEND_PERIOD_MS=N`. The distorted + misaligned variant below is R2's, with the rectifier.
+> `_SUSPEND_PERIOD_MS=N`, `_ADVERTISED_FPS=N` (what enumerate claims, default = `_FPS`; `0` = unknown —
+> exercises the service's measured-rate path). The distorted + misaligned variant below is R2's, with the rectifier.
 
 `SIM_DISPLAY_FAKE_STEREO_CAMERA=1` makes sim_display advertise one camera
 (`SHARED_WITH_EYE_TRACKING | USER_FACING | CALIBRATED | MONOCHROME`, 640×480 per eye, 30 Hz,
@@ -457,6 +459,9 @@ baseline 50 mm) producing a **synthetic SBS pattern**: a textured plane and a ba
 rendered with a known synthetic calibration that includes radial distortion and a small vertical
 misalignment + roll between the eyes, plus a frame counter burned into each half. So:
 
+- the descriptor's rate is testable: with `_ADVERTISED_FPS=0` the camera lists "rate unknown" until a
+  stream has run ~60 frames, then reports the measured rate (field finding: the Leia SR tracking
+  camera was hard-coded to advertise 30 Hz and actually ran 58–64 Hz);
 - rectification is testable exactly — after `RECTIFIED`, feature rows must align (|Δy| < 0.5 px)
   and the bar's disparity must equal `fx·B/Z`;
 - `SIM_DISPLAY_FAKE_STEREO_CAMERA_SUSPEND_PERIOD_MS=N` square-waves SUSPENDED/AVAILABLE, like the

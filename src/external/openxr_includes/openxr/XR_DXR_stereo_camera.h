@@ -188,7 +188,8 @@ typedef struct XrStereoCameraPropertiesDXR {
     uint32_t viewCount;
     //! Native per-eye size (e.g. 640x480).
     XrExtent2Di eyeExtent;
-    //! What the source can deliver, Hz.
+    //! What the source delivers, Hz: measured by the runtime once the source
+    //! has run, else the vendor's value; 0 = not known yet.
     float maxFrameRate;
     //! |T| of the pair, millimetres; 0 if uncalibrated.
     float baselineMm;

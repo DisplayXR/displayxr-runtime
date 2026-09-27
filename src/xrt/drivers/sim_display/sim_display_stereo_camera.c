@@ -35,6 +35,7 @@ struct fake_config
 	bool enabled;
 	uint32_t eye_w, eye_h;
 	float fps;
+	float advertised_fps; //!< what enumerate claims; 0 = "unknown" (the service measures)
 	uint32_t format;
 	int64_t suspend_period_ns;
 };
@@ -78,6 +79,11 @@ fake_config(void)
 	const char *fps = getenv("SIM_DISPLAY_FAKE_STEREO_CAMERA_FPS");
 	if (fps != NULL && atof(fps) >= 1.0 && atof(fps) <= 240.0) {
 		cfg.fps = (float)atof(fps);
+	}
+	cfg.advertised_fps = cfg.fps;
+	const char *afps = getenv("SIM_DISPLAY_FAKE_STEREO_CAMERA_ADVERTISED_FPS");
+	if (afps != NULL && afps[0] != '\0' && atof(afps) >= 0.0 && atof(afps) <= 240.0) {
+		cfg.advertised_fps = (float)atof(afps);
 	}
 	const char *fmt = getenv("SIM_DISPLAY_FAKE_STEREO_CAMERA_FORMAT");
 	if (fmt != NULL) {
@@ -128,7 +134,7 @@ sim_display_stereo_camera_enumerate(struct xrt_plugin_instance *inst,
 		}
 		info.eye_width = cfg->eye_w;
 		info.eye_height = cfg->eye_h;
-		info.max_frame_rate = cfg->fps;
+		info.max_frame_rate = cfg->advertised_fps;
 		info.native_format = cfg->format;
 		// Never write past the runtime's struct_size (ADR-020).
 		memcpy(out, &info, sz < sizeof(info) ? sz : sizeof(info));

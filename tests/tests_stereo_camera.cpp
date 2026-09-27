@@ -127,6 +127,43 @@ TEST_CASE("stereo camera decimator", "[stereo_camera]")
 	CHECK(with_pause <= 151);
 }
 
+TEST_CASE("stereo camera rate meter measures, never trusts the advert", "[stereo_camera]")
+{
+	u_stereo_camera_rate_meter m = {};
+	CHECK(m.rate == 0.0f); // unknown until a window completes
+	// A 60 Hz source with +-2 ms arrival jitter (the SR tracker's shape).
+	int64_t t = 1000000000;
+	int completed = 0;
+	for (int i = 0; i <= U_STEREO_CAMERA_RATE_WINDOW; i++) {
+		int64_t jitter = (i % 2 == 0 ? 1 : -1) * 2000000;
+		completed +=
+		    u_stereo_camera_rate_meter_push(&m, t + (i == 0 || i == U_STEREO_CAMERA_RATE_WINDOW ? 0 : jitter))
+		        ? 1
+		        : 0;
+		t += 16666667;
+	}
+	CHECK(completed == 1);
+	CHECK(m.rate == Catch::Approx(60.0f).margin(0.05f));
+
+	// A suspension gap restarts the window instead of dragging the rate down.
+	u_stereo_camera_rate_meter g = {};
+	t = 1000000000;
+	for (int i = 0; i < 30; i++, t += 33333333) {
+		u_stereo_camera_rate_meter_push(&g, t);
+	}
+	t += 3000000000ll;
+	bool done = false;
+	for (int i = 0; i <= U_STEREO_CAMERA_RATE_WINDOW; i++, t += 33333333) {
+		done = u_stereo_camera_rate_meter_push(&g, t) || done;
+	}
+	CHECK(done);
+	CHECK(g.rate == Catch::Approx(30.0f).margin(0.05f));
+
+	// Restart (source re-opened) keeps the last measurement.
+	u_stereo_camera_rate_meter_restart(&g);
+	CHECK(g.rate == Catch::Approx(30.0f).margin(0.05f));
+}
+
 TEST_CASE("stereo camera layout", "[stereo_camera]")
 {
 	u_stereo_camera_planes l;
