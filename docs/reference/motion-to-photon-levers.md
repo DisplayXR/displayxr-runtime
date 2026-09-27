@@ -151,6 +151,29 @@ behavior.
 | `DXR_WEAVE_REPAINT_FORCE=1` | Repaint every refresh regardless of app rate. Correctness probe; it **will** cost frame rate. |
 | `_DIAG`, `_HASH`, `_NO2D`, `_DRAIN`, `_REFLATTEN`, `_APPTHREAD` | Bisect probes from the #868 investigation. Not for production. |
 
+**A fill that loses its fence-park race must hand its image back (#1748).** Since #1264 S1 a
+vk_native fill releases the compositor lock while it waits on its GPU fence, and drops its present
+if an app frame presented meanwhile. The drop used to return without presenting the swapchain image
+the fill had acquired, and Vulkan only returns an acquired image through a present, so every lost
+race leaked one image for the life of the swapchain. A few leaks and the next `vkAcquireNextImageKHR`
+blocked forever, with the app thread holding the compositor lock: this is why
+`DXR_WEAVE_REPAINT_FORCE=1` (which makes the race constant) hung a native-Wayland app within seconds.
+The dropped image is now held by the target and handed to the next acquire
+(`comp_vk_native_target_hold_unpresented`); a recreate drops the hold. Rare races under the default
+gate leaked the same way, so long sessions were exposed too.
+
+**Move fill on native Wayland (#1748, `DXR_WL_MOVE_SYNC_FILL`).** While a move-synced window is
+being dragged, the window advances on screen only when a frame woven for its new position is
+presented, so the vk repaint loop re-weaves the last atlas at the new position whenever no weave has
+chosen an origin for 7/8 of a refresh period. It bypasses the quiet gate and the phase hold (they
+keep fills out of a paced app's slots; during a drag the empty slot is the point) but never
+`app_frame_in_progress` or the submit window, and adds at most one weave per period, so the FIFO
+queue does not deepen. An app that already fills every refresh (FIFO-bound) gets nothing from it,
+and in the headless harness even a 30 Hz app was re-woven by the ordinary repaint gate often enough
+that the fill's effect stayed within run-to-run noise; the large cadence gain came from the GNOME
+extension publishing a move-synced window's geometry every frame instead of every other frame. See
+`docs/specs/runtime/wayland-window-geometry.md` §9.
+
 **Repaint weaves outside the app's frame loop, and a DP may not expect that.** A display processor
 is entitled to assume a weave cadence tied to app frames, and one that does may degrade — possibly
 silently — when repaint drives extra weaves. That is a per-vendor contract question, not a runtime

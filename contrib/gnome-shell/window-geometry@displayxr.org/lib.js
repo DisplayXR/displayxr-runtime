@@ -61,6 +61,8 @@
 //   Method  GetPlacementCapabilities() -> (u caps)            (version 6+)
 //             bit 0: drag lattice (the table methods below)
 //             bit 1: SetDragLatticeAt, an explicit drag start (version 8)
+//             bit 2: BeginPointerDrag / EndPointerDrag (version 9)
+//             bit 3: EnableMoveSync (version 9, #1748; GNOME 45+)
 //   Method  SetDragLattice(u pid, b extend, i cell, i minDx, i minDy,
 //                          i maxDx, i maxDy, ai dx, ai dy)
 //             -> (b accepted, i startX, i startY)
@@ -73,6 +75,23 @@
 //             physical pixel grid), and a table built mid-drag is built for a
 //             position the window has already left.
 //   Method  ClearDragLattice(u pid)
+//   Method  EnableMoveSync(u pid) -> (b ok)                  (version 9)
+//             (#1748) During a compositor move of the caller's
+//             window, keep its actor at the position the frame on screen was
+//             woven for, and move it on only when a frame woven for the new
+//             position has been committed. The caller tags every commit with
+//             a 1x1 synchronised subsurface at (x mod 256, y mod 256) of the
+//             logical content position it wove for. See "Move sync".
+//             Lives as long as the caller's bus connection (a caller renews
+//             it when the service reappears). A window in move sync gets no
+//             drag lattice (SetDragLattice* returns false). Applies to
+//             mutter's move grab and to the pointer drag alike. Returns false
+//             where move sync is not offered (GNOME 40-44, capability bit 3
+//             clear): the caller keeps the drag lattice.
+//   Method  BeginPointerDrag(u pid, u button) -> (b started)  (version 9)
+//   Method  EndPointerDrag(u pid)
+//             The extension moves the caller's window with the pointer while
+//             `button` is held, with no grab (see "The pointer drag").
 //   Signal  DragLatticeNeeded(u pid, i dx, i dy)
 //   Signal  DragLatticeDone(u pid, u moves, u corrected, u misses,
 //                           u maxCorrection, u tables, b landedOnTable)
@@ -115,6 +134,9 @@
 //                                           // the drag lattice and the window
 //                                           // has not moved since. A consumer
 //                                           // that snaps drops leaves it alone.
+//       "move_sync": false,                 // ext v9+: this pid is
+//                                           // in move sync (EnableMoveSync), so
+//                                           // an app builds no drag lattice.
 //       "moving": false                     // ext v3+: an interactive grab
 //                                           // (move/resize) is in progress on
 //                                           // this window. A consumer that
@@ -239,6 +261,155 @@
     };
 
     /*
+     * ── Move-sync tag decode (extension version 9) ──
+     *
+     * Pure logic, no GI, unit-tested by scripts/test_gnome_extension_lattice.js.
+     * The runtime puts a 1x1 synchronised subsurface at (x mod TAG_MOD,
+     * y mod TAG_MOD) of the LOGICAL content position a frame was woven for
+     * (comp_vk_native_wl_move_sync_encode); the tag rides the frame's commit.
+     */
+    const MoveSyncChoice = {
+        //! Must match COMP_VK_NATIVE_WL_MOVE_SYNC_TAG_MOD in the runtime.
+        TAG_MOD: 256,
+
+        //! v mod m, non-negative for any v (a window may sit at negative
+        //! stage coordinates on a multi-monitor layout).
+        mod(v, m) {
+            return ((Math.round(v) % m) + m) % m;
+        },
+
+        //! The tag as the offset of the tag surface from the main surface.
+        decode(tagX, tagY, mainX, mainY) {
+            const m = MoveSyncChoice.TAG_MOD;
+            return [MoveSyncChoice.mod(tagX - mainX, m), MoveSyncChoice.mod(tagY - mainY, m)];
+        },
+
+        //! The newest entry of @p hist ({x, y, t}, oldest first) whose
+        //! position matches @p tag, or null.
+        resolve(hist, tag) {
+            const m = MoveSyncChoice.TAG_MOD;
+            for (let i = hist.length - 1; i >= 0; i--) {
+                const h = hist[i];
+                if (MoveSyncChoice.mod(h.x, m) === tag[0] && MoveSyncChoice.mod(h.y, m) === tag[1])
+                    return h;
+            }
+            return null;
+        },
+
+        //! Positions the window had, kept this long (and at most HISTORY_MAX).
+        HISTORY_US: 1000 * 1000,
+        HISTORY_MAX: 256,
+        //! Behind the window this long AND this many stage frames with no
+        //! newer woven frame: follow the window (the app has stalled).
+        TIMEOUT_US: 100 * 1000,
+        TIMEOUT_FRAMES: 6,
+        //! After a timeout, re-sync only on a frame woven for a position the
+        //! window had this recently.
+        RESYNC_US: 60 * 1000,
+
+        //! Per-hold state: a window at buffer (x, y) whose move starts now.
+        create(x, y, now) {
+            return {
+                hist: [{x, y, t: now}],
+                shown: {x, y, t: now},
+                progressUs: now,
+                progressFrames: 0,
+                followSinceUs: 0, // > 0: timed out, following the window
+                lastHistLen: 0,
+                stats: {frames: 0, advanced: 0, timeouts: 0, untagged: 0, maxBehind: 0, backHops: 0},
+            };
+        },
+
+        //! mutter moved the window to buffer (x, y).
+        onMove(st, x, y, now) {
+            const prev = st.hist[st.hist.length - 1];
+            // The window starts moving away from a caught-up actor: the
+            // timeout counts from here, not from the last frame painted (a
+            // still window schedules no frames at all).
+            if (st.shown.x === prev.x && st.shown.y === prev.y) {
+                st.progressUs = now;
+                st.progressFrames = 0;
+            }
+            st.hist.push({x, y, t: now});
+            while (st.hist.length > 2 &&
+                (now - st.hist[0].t > MoveSyncChoice.HISTORY_US || st.hist.length > MoveSyncChoice.HISTORY_MAX))
+                st.hist.shift();
+        },
+
+        /*
+         * One stage frame, before its paint. @p tag is the decoded tag of the
+         * buffer about to be painted ([x, y]) or null. Updates st.shown — the
+         * position the actor must be painted at — and returns
+         * {woven, cur, caughtUp, needTick, timedOut}.
+         */
+        onFrame(st, tag, now) {
+            st.stats.frames++;
+            let woven = null;
+            if (tag)
+                woven = MoveSyncChoice.resolve(st.hist, tag);
+            else
+                st.stats.untagged++;
+            const cur = st.hist[st.hist.length - 1];
+            let timedOut = false;
+            if (st.followSinceUs) {
+                // Timed out: follow the window until a frame woven after the
+                // stall arrives, then show it where it belongs (one step
+                // back, counted). Only a RECENT position (the window was
+                // there in the last RESYNC_US): an app resuming from a stall
+                // first presents frames woven for where the window was when
+                // it stalled, and re-syncing on one of those hops the window
+                // far back.
+                if (woven && woven.t >= st.followSinceUs && woven.t >= cur.t - MoveSyncChoice.RESYNC_US) {
+                    st.followSinceUs = 0;
+                    if (woven.t < st.shown.t)
+                        st.stats.backHops++;
+                    st.shown = woven;
+                    st.progressUs = now;
+                    st.progressFrames = 0;
+                    st.stats.advanced++;
+                } else {
+                    st.shown = cur;
+                }
+            } else if (woven && (woven.x !== st.shown.x || woven.y !== st.shown.y)) {
+                // By POSITION, newest match: see "Move sync" in build().
+                if (woven.t < st.shown.t)
+                    st.stats.backHops++; // a revisited position (a reversal)
+                st.shown = woven;
+                st.progressUs = now;
+                st.progressFrames = 0;
+                st.stats.advanced++;
+            }
+            const caughtUp = st.shown.x === cur.x && st.shown.y === cur.y;
+            // Keep the frame clock ticking while behind a window that has
+            // STOPPED. Once the pointer stops, nothing else schedules a stage
+            // update, and without one the frame woven for the final position
+            // does not land (measured: a ~300 ms stall at every stop). Only
+            // then: ticking on every frame of a moving drag measurably stalled
+            // the app every ~0.5 s instead.
+            const needTick = !caughtUp && st.hist.length === st.lastHistLen;
+            st.lastHistLen = st.hist.length;
+            if (caughtUp) {
+                st.progressUs = now;
+                st.progressFrames = 0;
+            } else if (!st.followSinceUs) {
+                const behind = Math.max(Math.abs(cur.x - st.shown.x), Math.abs(cur.y - st.shown.y));
+                st.stats.maxBehind = Math.max(st.stats.maxBehind, behind);
+                st.progressFrames++;
+                if (now - st.progressUs > MoveSyncChoice.TIMEOUT_US &&
+                    st.progressFrames >= MoveSyncChoice.TIMEOUT_FRAMES) {
+                    // No frame for a newer position in time: never leave the
+                    // window behind the pointer.
+                    st.followSinceUs = now;
+                    st.shown = cur;
+                    st.stats.timeouts++;
+                    timedOut = true;
+                }
+            }
+            return {woven, cur, caughtUp, needTick, timedOut};
+        },
+    };
+
+    /*
      * ── The pointer drag (extension version 9, placement capability 4) ──
      *
      * Pure logic, no GI: scripts/test_gnome_extension_pointer_drag.js loads
@@ -327,11 +498,13 @@
         },
         //! The drag-lattice entry choice, exported for its unit test.
         LatticeChoice,
+        //! The move-sync tag decode, exported for its unit test.
+        MoveSyncChoice,
         //! The pointer drag's pure logic, exported for its unit test.
         PointerDrag,
     };
 
-    function buildModule({Clutter, GObject, Meta, Gio, GLib, Graphene}) {
+    function buildModule({Clutter, GObject, Meta, Gio, GLib, Graphene, Mtk, GdkPixbuf, moveSync = true}) {
         const IFACE_XML = `
 <node>
   <interface name="org.displayxr.WindowGeometry1">
@@ -689,6 +862,10 @@
     <method name="ClearDragLattice">
       <arg type="u" direction="in" name="pid"/>
     </method>
+    <method name="EnableMoveSync">
+      <arg type="u" direction="in" name="pid"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
     <method name="BeginPointerDrag">
       <arg type="u" direction="in" name="pid"/>
       <arg type="u" direction="in" name="button"/>
@@ -761,6 +938,8 @@
         const PLACEMENT_CAP_POINTER_DRAG = 4;
         //! How often the pointer drag reads the pointer, ms.
         const POINTER_DRAG_POLL_MS = 4;
+        //! EnableMoveSync (version 9): see "Move sync". GNOME 45+ only.
+        const PLACEMENT_CAP_MOVE_SYNC = 8;
         //! A table no grab follows stops constraining after this long.
         const LATTICE_PRE_GRAB_US = 2 * 1000 * 1000;
         //! DISPLAYXR_TEST=1 (never in production): tables audit their paints
@@ -1249,6 +1428,350 @@
             }
         }
 
+
+        /*
+         * ── Move sync (extension version 9, #1748) ───────────────────────
+         *
+         * The lattice above keeps a STALE weave correct by only letting the
+         * window land where the stale weave is still phase-correct. This does
+         * the opposite: the window may land anywhere, and the stage never
+         * shows a frame anywhere but where it was woven for.
+         *
+         * mutter keeps running the grab and moves the MetaWindow as usual
+         * (so edge tiling, workspaces and the published geometry the runtime
+         * weaves from all see the real position). What is held back is only
+         * the window's ACTOR: on every frame, in the stage's before-update
+         * (after this frame's input and commits, before layout and paint),
+         * this code places it at the position the buffer it is about to
+         * paint was woven for, overriding the position mutter synced on the
+         * last move.
+         *
+         * Not meta_window_actor_freeze(): freezing a Wayland window actor
+         * also stops mutter syncing the surface actors' state — the new
+         * texture AND the subsurface positions — until thaw, so a frozen
+         * actor would hide exactly the tag this relies on.
+         *
+         * Which position that is comes from the buffer's commit: the runtime
+         * places a 1x1 clear synchronised subsurface at (x mod 256, y mod 256)
+         * of the content position it wove for. A synchronised subsurface's
+         * position is applied atomically with the parent's buffer, so tag and
+         * pixels cannot disagree. The tag is resolved against the positions
+         * the window has had in the last second (newest first).
+         *
+         * Every tagged frame is shown where its tag says (MoveSyncChoice
+         * below). The tag names a POSITION, and a position is all the actor
+         * needs; which moment of the history it came from is ambiguous only
+         * when the window revisits a position (a reversal), and then either
+         * answer puts the actor on the same pixel. Commits reach mutter in
+         * the order they were presented, and each was woven for a position
+         * the window had at or after the previous one's, so this never walks
+         * back in time. An earlier rule ignored tags that resolved OLDER than
+         * the one shown; at a reversal the ambiguous match made the frames
+         * woven on the way to the turn look older, so they were painted where
+         * they were not woven for (measured: 1-2 % of a reversal's frames).
+         *
+         * A window whose app stops committing is not left behind: once the
+         * actor has been behind the window for TIMEOUT_US (100 ms) AND
+         * TIMEOUT_FRAMES stage frames (a stalled SHELL is not a stalled app)
+         * with no newer woven frame, it FOLLOWS the window (the plain
+         * compositor drag: a stale frame at the new place, counted as a
+         * timeout) until a frame woven for a position the window had in the
+         * last RESYNC_US arrives, which is shown where it belongs. The frame
+         * logic is MoveSyncChoice (pure, unit-tested); this class is its GI
+         * side.
+         *
+         * The window advances only when a frame for a new position lands, a
+         * few frames behind the pointer (the runtime re-weaves every refresh
+         * during a move; see docs/specs/runtime/wayland-window-geometry.md §9
+         * for the measurements).
+         */
+        //! After the grab ends, give the last woven frame this long to land.
+        const MOVE_SYNC_SETTLE_US = 300 * 1000;
+
+        class MoveSync {
+            constructor(debug) {
+                this._debug = debug;
+                this._clients = new Map(); // bus unique name -> {pids, watchId}
+                this._st = new Map();      // Meta.Window -> per-drag state
+                this._stageId = 0;
+                //! DISPLAYXR_STAMP_AUDIT=1: one DXRSYNC line per frame of a hold.
+                this._trace = GLib.getenv('DISPLAYXR_STAMP_AUDIT') === '1';
+            }
+
+            destroy() {
+                for (const win of [...this._st.keys()])
+                    this._release(win, 'disabled');
+                for (const c of this._clients.values())
+                    Gio.bus_unwatch_name(c.watchId);
+                this._clients.clear();
+            }
+
+            register(sender, pid) {
+                let c = this._clients.get(sender);
+                if (!c) {
+                    c = {pids: new Set(), watchId: 0};
+                    c.watchId = Gio.bus_watch_name_on_connection(Gio.DBus.session, sender,
+                        Gio.BusNameWatcherFlags.NONE, null, () => {
+                            Gio.bus_unwatch_name(c.watchId);
+                            this._clients.delete(sender);
+                        });
+                    this._clients.set(sender, c);
+                }
+                c.pids.add(pid);
+                if (this._debug)
+                    log(`displayxr: move sync enabled for pid ${pid}`);
+            }
+
+            isPidSynced(pid) {
+                for (const c of this._clients.values()) {
+                    if (c.pids.has(pid))
+                        return true;
+                }
+                return false;
+            }
+
+            isActive(win) {
+                return this._st.has(win);
+            }
+
+            onGrabBegin(win, isMove) {
+                if (!win || !isMove || !this.isPidSynced(win.get_pid()) || win.is_fullscreen())
+                    return;
+                const actor = win.get_compositor_private();
+                if (!actor)
+                    return;
+                const now = GLib.get_monotonic_time();
+                const prev = this._st.get(win);
+                if (prev) { // grabbed again while settling: same hold continues
+                    prev.grabbing = true;
+                    return;
+                }
+                const b = win.get_buffer_rect();
+                const st = Object.assign(MoveSyncChoice.create(b.x, b.y, now), {
+                    actor, grabbing: true, settleUs: 0, w: b.width, h: b.height,
+                });
+                this._st.set(win, st);
+                this._ensureStage();
+            }
+
+            onPositionChanged(win) {
+                const st = this._st.get(win);
+                if (!st)
+                    return;
+                const b = win.get_buffer_rect();
+                if (b.width !== st.w || b.height !== st.h) {
+                    // A resize (tiling, unmaximise under the pointer): not a
+                    // move any more. Let mutter place and size it normally.
+                    this._release(win, 'resized');
+                    return;
+                }
+                MoveSyncChoice.onMove(st, b.x, b.y, GLib.get_monotonic_time());
+            }
+
+            onGrabEnd(win) {
+                const st = this._st.get(win);
+                if (!st)
+                    return;
+                st.grabbing = false;
+                st.settleUs = GLib.get_monotonic_time() + MOVE_SYNC_SETTLE_US;
+                if (win.get_maximize_flags?.() || win.is_fullscreen())
+                    this._release(win, 'maximized');
+            }
+
+            forget(win) {
+                if (this._st.has(win))
+                    this._release(win, 'unmanaged');
+            }
+
+            _ensureStage() {
+                if (this._stageId)
+                    return;
+                // before-update: after mutter's own handler (which applies
+                // time-constrained commits for this frame), before layout and
+                // paint, so the position set here is the one painted.
+                this._stageId = global.stage.connect('before-update', () => this._beforeUpdate());
+            }
+
+            _dropStage() {
+                if (this._stageId && this._st.size === 0) {
+                    global.stage.disconnect(this._stageId);
+                    this._stageId = 0;
+                }
+            }
+
+            //! The tag of the buffer the window shows NOW: [x, y] or null.
+            _readTag(actor) {
+                const surfaces = [];
+                const walk = a => {
+                    for (const ch of a.get_children()) {
+                        const [w, h] = ch.get_size();
+                        if (w > 0 && h > 0)
+                            surfaces.push(ch);
+                        walk(ch);
+                    }
+                };
+                walk(actor);
+                let main = null, tag = null, best = -1;
+                for (const a of surfaces) {
+                    const [w, h] = a.get_size();
+                    if (w === 1 && h === 1) {
+                        tag = a;
+                    } else if (w * h > best) {
+                        best = w * h;
+                        main = a;
+                    }
+                }
+                if (!tag || !main || !tag.visible)
+                    return null;
+                const [tx, ty] = tag.get_position();
+                const [mx, my] = main.get_position();
+                return MoveSyncChoice.decode(tx, ty, mx, my);
+            }
+
+            _beforeUpdate() {
+                const now = GLib.get_monotonic_time();
+                for (const [win, st] of [...this._st]) {
+                    if (st.actor.is_destroyed()) {
+                        this._release(win, 'destroyed');
+                        continue;
+                    }
+                    const tag = this._readTag(st.actor);
+                    const prevShown = st.shown;
+                    const r = MoveSyncChoice.onFrame(st, tag, now);
+                    if (this._trace) {
+                        log(`DXRSYNC t=${now} tag=${tag} woven=${r.woven ? `${r.woven.x},${r.woven.y}` : 'none'} ` +
+                            `shown=${prevShown.x},${prevShown.y} cur=${r.cur.x},${r.cur.y} hist=${st.hist.length}`);
+                    }
+                    if (r.needTick)
+                        st.actor.queue_redraw();
+                    if (r.timedOut && this._debug) {
+                        log(`displayxr: move sync timeout — no frame woven for (${r.cur.x},${r.cur.y}) in ` +
+                            `${MoveSyncChoice.TIMEOUT_US / 1000} ms; following the window with stale frames`);
+                    }
+                    const caughtUp = r.caughtUp;
+                    // mutter re-synced the actor to the window on the last
+                    // move: put it back where the buffer was woven for.
+                    const [ax, ay] = st.actor.get_position();
+                    if (ax !== st.shown.x || ay !== st.shown.y)
+                        st.actor.set_position(st.shown.x, st.shown.y);
+                    if (!st.grabbing && (caughtUp || now > st.settleUs))
+                        this._release(win, caughtUp ? 'settled' : 'settle timeout');
+                }
+            }
+
+            _release(win, why) {
+                const st = this._st.get(win);
+                if (!st)
+                    return;
+                this._st.delete(win);
+                if (!st.actor.is_destroyed()) {
+                    // Hand the actor back to mutter where the window is.
+                    const b = win.get_buffer_rect();
+                    st.actor.set_position(b.x, b.y);
+                }
+                this._dropStage();
+                if (this._debug) {
+                    const d = st.stats;
+                    log(`displayxr: move sync done (${why}) — ${d.frames} frame(s), ${d.advanced} advance(s) on a ` +
+                        `woven frame, ${d.timeouts} timeout(s), ${d.backHops} back hop(s), ${d.untagged} untagged, ` +
+                        `max behind ${d.maxBehind} logical px`);
+                }
+            }
+        }
+
+        /*
+         * Stamp audit (DISPLAYXR_STAMP_AUDIT=1, measurement only, #1748): with
+         * the runtime's DXR_WL_ORIGIN_STAMP=1, every frame carries a barcode of
+         * the present origin it was woven for in its top-left 352x8 device px.
+         * After each stage paint, read it back from the grabbed window's texture
+         * and log it next to where the stage painted that window. Costs a GPU
+         * readback per paint; never on in production.
+         *
+         * DISPLAYXR_STAMP_AUDIT=2 is the light variant: no readback and no
+         * per-paint line, only paint intervals, summarised in one DXRPAINTS
+         * line per drag — so the audit's own cost cannot be what stalls.
+         */
+        const STAMP_BLOCK = 8, STAMP_BLOCKS = 44;
+        class StampAudit {
+            constructor(light) {
+                this._light = light;
+                this._path = GLib.build_filenamev([GLib.get_user_runtime_dir(), 'displayxr-stamp.png']);
+                this._paints = 0;
+                this._lastUs = 0;
+                this._gaps = [];
+            }
+
+            //! Light mode: one summary per drag.
+            flush() {
+                if (!this._light || this._paints === 0)
+                    return;
+                log(`DXRPAINTS t=${GLib.get_monotonic_time()} paints=${this._paints} ` +
+                    `gaps>60ms=[${this._gaps.join(',')}]`);
+                this._paints = 0;
+                this._lastUs = 0;
+                this._gaps = [];
+            }
+
+            sample(win, syncActive) {
+                if (this._light) {
+                    const now = GLib.get_monotonic_time();
+                    if (this._lastUs && now - this._lastUs > 60000)
+                        this._gaps.push(Math.round((now - this._lastUs) / 1000));
+                    this._lastUs = now;
+                    this._paints++;
+                    return;
+                }
+                const actor = win.get_compositor_private();
+                if (!actor || !Mtk || !GdkPixbuf)
+                    return;
+                const mon = win.get_monitor();
+                if (mon < 0)
+                    return;
+                const g = global.display.get_monitor_geometry(mon);
+                const scale = global.display.get_monitor_scale(mon);
+                const cw = Math.ceil(STAMP_BLOCK * STAMP_BLOCKS / scale) + 2;
+                const chh = Math.ceil(STAMP_BLOCK / scale) + 1;
+                const clip = new Mtk.Rectangle({x: 0, y: 0, width: cw, height: chh});
+                let woven = 'none', seq = -1;
+                try {
+                    const img = actor.get_image(clip);
+                    if (img) {
+                        img.writeToPNG(this._path);
+                        const pb = GdkPixbuf.Pixbuf.new_from_file(this._path);
+                        const px = pb.get_pixels(), rs = pb.get_rowstride(), nc = pb.get_n_channels();
+                        const k = pb.get_width() / cw; // image px per logical px
+                        const bit = i => {
+                            const x = Math.floor(((STAMP_BLOCK * i + STAMP_BLOCK / 2) / scale) * k);
+                            const y = Math.floor(((STAMP_BLOCK / 2) / scale) * k);
+                            return px[y * rs + x * nc] > 127 ? 1 : 0;
+                        };
+                        const field = (from, n) => {
+                            let v = 0;
+                            for (let i = 0; i < n; i++)
+                                v = v * 2 + bit(from + i);
+                            return v;
+                        };
+                        if (bit(0) === 1 && bit(1) === 0 && bit(2) === 1 && bit(3) === 0) {
+                            woven = `${field(4, 16) - 32768},${field(20, 16) - 32768}`;
+                            seq = field(36, 8);
+                        }
+                    }
+                } catch (e) {
+                    woven = `error:${e.message}`;
+                }
+                const [ax, ay] = actor.get_position();
+                const toPx = v => {
+                    const t = v * scale;
+                    return t >= 0 ? Math.floor(t + 0.5) : -Math.floor(-t + 0.5);
+                };
+                const [ptrX, ptrY] = global.get_pointer();
+                const b = win.get_buffer_rect();
+                log(`DXRSTAMP t=${GLib.get_monotonic_time()} pid=${win.get_pid()} ` +
+                    `paint=${toPx(ax - g.x)},${toPx(ay - g.y)} woven=${woven} seq=${seq} ` +
+                    `actor=${ax},${ay} win=${b.x},${b.y} ptr=${ptrX},${ptrY} scale=${scale} sync=${syncActive ? 1 : 0}`);
+            }
+        }
+
         class WindowPlacement {
             constructor(getGrabbedWindow, onPointerDrag = () => {}) {
                 this._getGrabbedWindow = getGrabbedWindow;
@@ -1264,22 +1787,60 @@
                     (...a) => this._emitDone(...a),
                     win => win !== null && win === this._getGrabbedWindow(),
                     this._debug);
+                // Only where the entry point offers it (GNOME 45+; the 40-44
+                // entry point passes moveSync: false — never run there).
+                this._moveSync = moveSync ? new MoveSync(this._debug) : null;
+                const audit = GLib.getenv('DISPLAYXR_STAMP_AUDIT');
+                this._stampAudit = audit === '1' || audit === '2' ? new StampAudit(audit === '2') : null;
                 this._dbus = Gio.DBusExportedObject.wrapJSObject(PLACEMENT_IFACE_XML, this);
                 this._dbus.export(Gio.DBus.session, '/org/displayxr/WindowPlacement');
             }
 
             //! Grab lifecycle, forwarded by the service (it owns the display
             //! signals).
-            onGrabBegin(win) {
+            onGrabBegin(win, isMove = true) {
                 this._lattice.onGrabBegin(win);
+                this._moveSync?.onGrabBegin(win, isMove);
             }
 
             onGrabEnd(win) {
                 this._lattice.onGrabEnd(win);
+                this._moveSync?.onGrabEnd(win);
+                this._stampAudit?.flush();
             }
 
             onWindowUnmanaged(win) {
                 this._lattice.forget(win);
+                this._moveSync?.forget(win);
+            }
+
+            onPositionChanged(win) {
+                this._moveSync?.onPositionChanged(win);
+            }
+
+            //! Stamp audit: one line per stage paint for the grabbed window and
+            //! any window still settling in move sync.
+            auditStamps(grabbed) {
+                if (!this._stampAudit)
+                    return;
+                const wins = new Set();
+                if (grabbed)
+                    wins.add(grabbed);
+                for (const w of this._moveSync?._st.keys() ?? [])
+                    wins.add(w);
+                for (const w of wins)
+                    this._stampAudit.sample(w, this._moveSync?.isActive(w) ?? false);
+            }
+
+            EnableMoveSyncAsync([pid], invocation) {
+                this._senderPid(invocation.get_sender(), senderPid => {
+                    let ok = false;
+                    if (senderPid > 0 && (pid === 0 || pid === senderPid) && this._moveSync) {
+                        this._moveSync.register(invocation.get_sender(), senderPid);
+                        ok = true;
+                    }
+                    invocation.return_value(new GLib.Variant('(b)', [ok]));
+                });
             }
 
             _emitNeeded(pid, dx, dy) {
@@ -1302,6 +1863,17 @@
                 return this._lattice?.landedOnTable(win) ?? false;
             }
 
+            //! Move sync is holding this window's actor (a move is running
+            //! or settling).
+            moveSyncHolding(win) {
+                return this._moveSync?.isActive(win) ?? false;
+            }
+
+            //! For the published snapshot: see "move_sync".
+            moveSynced(win) {
+                return this._moveSync?.isPidSynced(win.get_pid()) ?? false;
+            }
+
             //! Per-frame paint audit, forwarded by the service's stage hook.
             auditPaint() {
                 if (this._lattice?.anyGrabbing())
@@ -1311,6 +1883,7 @@
             GetPlacementCapabilities() {
                 return (this._lattice.supported()
                     ? PLACEMENT_CAP_DRAG_LATTICE | PLACEMENT_CAP_EXPLICIT_START : 0) |
+                    (this._moveSync ? PLACEMENT_CAP_MOVE_SYNC : 0) |
                     PLACEMENT_CAP_POINTER_DRAG;
             }
 
@@ -1409,7 +1982,8 @@
             SetDragLatticeAsync([pid, extend, cell, minDx, minDy, maxDx, maxDy, dxs, dys], invocation) {
                 this._senderPid(invocation.get_sender(), senderPid => {
                     let ok = false, sx = 0, sy = 0;
-                    if (senderPid > 0 && (pid === 0 || pid === senderPid)) {
+                    if (senderPid > 0 && (pid === 0 || pid === senderPid) &&
+                        !this._moveSync?.isPidSynced(senderPid)) {
                         const win = this._windowOfPid(senderPid);
                         ok = this._lattice.set(win, senderPid, extend, cell,
                             [minDx, minDy, maxDx, maxDy], dxs, dys);
@@ -1428,7 +2002,8 @@
                 invocation) {
                 this._senderPid(invocation.get_sender(), senderPid => {
                     let ok = false, sx = 0, sy = 0;
-                    if (senderPid > 0 && (pid === 0 || pid === senderPid)) {
+                    if (senderPid > 0 && (pid === 0 || pid === senderPid) &&
+                        !this._moveSync?.isPidSynced(senderPid)) {
                         const win = this._windowOfPid(senderPid);
                         ok = this._lattice.set(win, senderPid, extend, cell,
                             [minDx, minDy, maxDx, maxDy], dxs, dys, [startX, startY]);
@@ -1455,6 +2030,8 @@
                 this._endPointerDrag('the extension is disabled');
                 this._lattice?.destroy();
                 this._lattice = null;
+                this._moveSync?.destroy();
+                this._moveSync = null;
                 if (this._dbus) {
                     this._dbus.unexport();
                     this._dbus = null;
@@ -1573,11 +2150,14 @@
                 // parameter in older shells, so the window is found by type
                 // rather than by position.
                 const grabWindow = args => args.find(a => a instanceof Meta.Window) ?? null;
+                const moveOps = new Set([Meta.GrabOp.MOVING, Meta.GrabOp.KEYBOARD_MOVING,
+                    Meta.GrabOp.MOVING_UNCONSTRAINED].filter(v => v !== undefined));
+                const isMoveOp = args => args.some(a => typeof a === 'number' && moveOps.has(a));
                 this._displaySignals.push(
                     display.connect('grab-op-begin', (..._args) => {
                         this._placement?.cancelPointerDrag();
                         this._grabbedWindow = grabWindow(_args);
-                        this._placement?.onGrabBegin(this._grabbedWindow);
+                        this._placement?.onGrabBegin(this._grabbedWindow, isMoveOp(_args));
                         this._queueEmit();
                     }));
                 this._displaySignals.push(
@@ -1597,12 +2177,20 @@
                     this._auditId = global.stage.connect('after-paint',
                         () => this._placement?.auditPaint());
                 }
+                if (['1', '2'].includes(GLib.getenv('DISPLAYXR_STAMP_AUDIT'))) {
+                    this._stampAuditId = global.stage.connect('after-paint',
+                        () => this._placement?.auditStamps(this._grabbedWindow));
+                }
             }
 
             disable() {
                 if (this._auditId) {
                     global.stage.disconnect(this._auditId);
                     this._auditId = 0;
+                }
+                if (this._stampAuditId) {
+                    global.stage.disconnect(this._stampAuditId);
+                    this._stampAuditId = 0;
                 }
                 for (const [win, ids] of this._windowSignals)
                     for (const id of ids)
@@ -1636,7 +2224,20 @@
                 if (this._windowSignals.has(win))
                     return;
                 const ids = [
-                    win.connect('position-changed', () => this._queueEmit()),
+                    win.connect('position-changed', () => {
+                        this._placement?.onPositionChanged(win);
+                        // A window in move sync: publish the move NOW. The
+                        // runtime weaves each frame for the position it read
+                        // last, and a BEFORE_REDRAW later added here runs
+                        // only in the NEXT frame (the laters of this one have
+                        // already run), so a coalesced emit reached it every
+                        // other frame: the window advanced on half the paints
+                        // and lagged a frame more. Nothing is corrected after
+                        // the fact in move sync, so the raw position is the
+                        // one to weave for (the lattice path keeps the later:
+                        // there a raw position is about to be replaced).
+                        this._queueEmit(this._placement?.moveSyncHolding(win) ?? false);
+                    }),
                     win.connect('size-changed', () => this._queueEmit()),
                     win.connect('unmanaged', () => {
                         this._placement?.onWindowUnmanaged(win);
@@ -1658,7 +2259,11 @@
             // same queue is reached through the free function. Either way the
             // callback runs BEFORE_REDRAW; with neither we emit immediately,
             // which is correct but uncoalesced.
-            _queueEmit() {
+            _queueEmit(immediate = false) {
+                if (immediate && this._dbus) {
+                    this._emit();
+                    return;
+                }
                 if (this._emitQueued || !this._dbus)
                     return;
                 const laters = global.compositor?.get_laters?.();
@@ -1719,6 +2324,7 @@
                         monitor,
                         capture_excluded: this._captureExclusion?.isExcluded(win) ?? false,
                         lattice_drop: this._placement?.latticeDrop(win) ?? false,
+                        move_sync: this._placement?.moveSynced(win) ?? false,
                         moving: win === this._grabbedWindow,
                     });
                 }

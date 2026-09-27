@@ -170,6 +170,12 @@ jobs:
         # Plain gjs drives the shipped file; no GNOME Shell needed.
         run: gjs scripts/test_gnome_extension_lattice.js
 
+      - name: Move-sync frame logic
+        # Unit test for MoveSyncChoice in lib.js (extension version 9, #1748):
+        # the frame-tag decode (against the runtime's encode), which position
+        # the actor is painted at, and the stalled-app fallback. Plain gjs.
+        run: gjs scripts/test_gnome_extension_move_sync.js
+
       - name: Pointer drag ends on its button
         # Unit test for PointerDrag in lib.js (extension version 9): the
         # extension's own drag for a secondary-button content drag, which

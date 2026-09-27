@@ -178,7 +178,9 @@ systemctl --user unset-environment DISPLAYXR_DEBUG   # then log out/in again
   `/org/displayxr/WindowGeometry`, interface `org.displayxr.WindowGeometry1`.
 - `GetWindows() -> (s)`: JSON snapshot of all normal windows.
 - `WindowsChanged(s)`: same JSON, emitted (coalesced per redraw) on any
-  position/size/focus/lifetime change.
+  position/size/focus/lifetime change — except a move of a window in move
+  sync, which is emitted at once (a coalesced emit reached the runtime only
+  every other frame).
 - Version 2: object `/org/displayxr/CaptureExclusion`, interface
   `org.displayxr.CaptureExclusion1` — `Exclude(u pid) -> (u windows)` (pid 0 =
   the caller; only your own PID), `Release(u pid)`, `GetState() -> (s)`. The
@@ -204,6 +206,20 @@ systemctl --user unset-environment DISPLAYXR_DEBUG   # then log out/in again
   window closest to the drag line; it may lead or lag the pointer by up to
   6 device px to do so. `DISPLAYXR_LATTICE_NEAREST=1` in the shell's
   environment restores plain nearest, for A/B comparison. See the spec, §8.8.
+- Version 9, same interface: **move sync** (#1748) — `EnableMoveSync(u pid) -> (b)`,
+  capability bit 3 (value 8), GNOME 45+ only (the GNOME 40–44 entry point
+  answers false and leaves the bit clear). While the caller's window is moved
+  — by mutter's grab (title bar, Super+drag) or by the pointer drag below —
+  its actor is painted only where the frame on screen was woven for: the
+  runtime tags each commit with a 1x1 synchronised subsurface at the woven
+  position, and the extension places the actor there before every paint. Such
+  a window needs no drag lattice (`SetDragLattice*` refuses it), and the
+  snapshot gains `move_sync`. The DisplayXR runtime registers by default
+  whenever the extension offers it (`DXR_WL_MOVE_SYNC=0` opts out) and
+  registers again when the extension comes back after the lock screen. See
+  the spec, §9. Measurement hook: `DISPLAYXR_STAMP_AUDIT=1` in the shell's
+  environment, with the runtime's `DXR_WL_ORIGIN_STAMP=1` (which overwrites
+  pixels — never in a real session).
 - Version 9, same interface: the **pointer drag** —
   `BeginPointerDrag(u pid, u button) -> (b started)`, `EndPointerDrag(u pid)`,
   capability bit 2 (value 4). The extension moves the caller's window with the

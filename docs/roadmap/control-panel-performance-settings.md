@@ -324,7 +324,7 @@ never claim a mode the runtime is not in, and "Custom" falls out for free.
 ## Appendix A — census
 
 Every `DXR_*` name read at runtime under `src/xrt`, with its read site, mechanism, default
-and tier. **94 distinct names**; the two `DXR_BG2D_*` knobs reach the environment through
+and tier. **98 distinct names**; the two `DXR_BG2D_*` knobs reach the environment through
 `bg2d_int_knob()` rather than a literal `getenv` at the listed line.
 
 Process column: **App** = the runtime DLL, loaded into the OpenXR app's process ·
@@ -398,6 +398,13 @@ library linked into both · **CLI** = `displayxr-cli.exe` (reporting only, contr
 | `DXR_LINUX_DIRECT_SCANOUT` | `compositor/vk_native/comp_vk_native_compositor.c:5845` | `getenv` | off | App | 1 | Opt-in RandR direct-scanout present path on Linux |
 | `DXR_WINDOW_POS` | `compositor/vk_native/comp_vk_native_compositor.c:5248` | `getenv` | plug-in reported | App | 1 | `"x,y"` override for the self-owned window position (#715) |
 | `DXR_WINDOW_FULLSCREEN` | `compositor/vk_native/comp_vk_native_window_xcb.c:273` | `getenv` | on | App | 1 | `=0` opts out of EWMH fullscreen placement (Linux XCB) |
+
+### Native-Wayland window drag (#1748)
+
+| Var | Read site | Mechanism | Default | Proc | Tier | What it does |
+|---|---|---|---|---|---|---|
+| `DXR_WL_MOVE_SYNC` | `compositor/vk_native/comp_vk_native_compositor.c` (`comp_vk_native_compositor_create`, the app-provided Wayland surface branch) | `getenv` at compositor create | **on** whenever the `window-geometry@displayxr.org` extension supports it (version 9+, GNOME 45+) | App | 1 | Move-synchronised re-weave: every commit carries a 1x1 subsurface tag of the position its frame was woven for, and the extension paints each frame of a compositor drag (title bar, Super+drag, the right-button pointer drag) only there, so no frame is ever shown off its woven origin — no drag lattice, no drop snap. `0` keeps the drag-lattice path (§8 of `docs/specs/runtime/wayland-window-geometry.md`), which is also what runs with an older extension, on GNOME 40–44, on X11/XWayland, or with no extension. Spec §9 |
+| `DXR_WL_MOVE_SYNC_FILL` | `compositor/vk_native/comp_vk_native_compositor.c` (`vk_wl_move_fill_due`, consulted by the vk repaint loop) | `getenv`, `static` cached | **on** (kill switch) | App | 4 | While a move-synced window is being dragged, the repaint loop re-weaves the last atlas at the window's new position whenever no weave has chosen an origin for most of a refresh period, so the window advances on paints the app itself does not fill. Never more than one weave per period, never across the app's frame. With an app that already weaves ~50/s (FIFO-bound) it rarely fires; its effect with a 30 Hz app was within run-to-run noise in the headless harness (spec §9.5). `0` for A/B |
 
 ### GPU placement
 
@@ -563,6 +570,8 @@ as `docs/specs/vendor/oem-android-platform-requirements.md` §R6.
 | `DXR_UNDER_SUBMIT` | `state_trackers/oxr/oxr_session_frame_end.c` (`DEBUG_GET_ONCE_NUM_OPTION`, one TU; the value→enum map is the pure `oxr_under_submit_from_setting()` in `oxr_view_config_rule.h`) | `1` | App | ADR-041 staging switch for the fixed-view-count submission contract. `0` = strict: every view configuration must submit exactly the count `xrLocateViews` returned. `1` (default) = strict **plus** the deprecated `PRIMARY_STEREO` 1-view arm (an `XR_DXR_display_info` instance submitting 1 while the active rendering mode is 1-view), which is accepted and logged **once per session** with a line naming the fix — released demos submit one view in 2D mode and need the compat window. `2` = kill switch: the pre-ADR-041 rules, `PRIMARY_MULTIVIEW_DXR` under-submit included. Out-of-range values **clamp to an end** rather than falling back to the default, so a typo cannot silently land on the default. The default flips to `0` in the first runtime release after `displayxr-common` and the five `displayxr-demo-*` demos ship the alias submission — the trigger is that shipment, not a date. Not a user-facing setting: it is a compat bisect knob with no performance dimension. Unreachable from a CTS run at any value (a conformance session never enables `XR_DXR_display_info`, which the compat arm requires). Distinct from `DXR_VIEW_CONFIG_LEGACY`, which restores the pre-#1486 *reporting*. See [ADR-041](../adr/ADR-041-fixed-view-count-with-per-frame-activity.md) and [View-Configuration Model](../reference/view-configuration-model.md) |
 | `DXR_IPC_FD` | `auxiliary/util/u_sandbox.c:181`; `ipc/client/ipc_client_connection.c:211, 234` | unset | Both / App | #1056 adopts an embedder-supplied service socket. Not a setting |
 | `DXR_IPC_HANDLE` | `ipc/client/ipc_client_connection.c:437, 456` | unset | App | Windows analogue of the above |
+| `DXR_WL_ORIGIN_STAMP` | `compositor/vk_native/comp_vk_native_compositor.c` (`vk_debug_origin_stamp`, Linux + Wayland) | off | App | #1748 measurement hook: writes a barcode of each frame's present origin into its top-left 352x8 device px — it **overwrites content**. Read back by the extension's `DISPLAYXR_STAMP_AUDIT=1` (shell environment) in `scripts/linux/move_sync/`. Never for a real session |
+| `DXR_WL_TEST_STALL` | `compositor/vk_native/comp_vk_native_compositor.c` (`vk_update_present_origin`) | off | App | `N:MS` sleeps MS ms (under the compositor lock) on every N-th frame whose origin moved — a slow frame or a stalled app in the middle of a drag, for the move-sync harness |
 
 ### Adjacent, out of scope but worth knowing
 

@@ -716,6 +716,8 @@ correction (rms 3.1 → 3.6 at 200 %, 2.5 → 3.3 at 150 %). Edge tiling (left h
 the top-edge maximize and a drag starting from rest behave as before, and no
 frame inside the table's coverage was painted off it.
 
+
+
 ### 8.9 Version 9 — the pointer drag (a content drag on a secondary button)
 
 DisplayXR apps drag their window from anywhere in the content with the RIGHT
@@ -770,3 +772,180 @@ drags including a release far outside the window after a fast flick.
 `scripts/test_gnome_extension_pointer_drag.js` (gjs, in `lint.yml`) checks the
 pure part (`PointerDrag` in `lib.js`).
 
+## 9. Move-synchronised re-weave (extension version 9, #1748)
+
+**On by default** on native Wayland whenever the extension offers it
+(`EnableMoveSync`, placement capability bit 3 = value 8; GNOME 45+). The drag
+lattice (§8) is the fallback, unchanged, wherever move sync is not available:
+an extension older than version 9, the GNOME 40–44 entry point (which answers
+`false`), X11/XWayland, no extension at all, or `DXR_WL_MOVE_SYNC=0` in the
+app's environment.
+
+### 9.1 Idea
+
+The lattice keeps a stale weave correct by allowing only the positions where
+it stays phase-correct. Move sync inverts that: the window may sit on any
+logical pixel, and the stage never paints a frame anywhere but where it was
+woven for. mutter keeps its grab (or the extension its pointer drag, §8.9)
+and moves the `MetaWindow` as usual, so the published geometry, edge tiling
+and workspaces all see the real position. Only the window's **actor** is held
+back: on every stage frame, in `before-update` (after that frame's input and
+commits, before layout and paint), the extension places it at the position
+the buffer it is about to paint was woven for.
+
+Because every painted frame is woven for exactly where it is painted, the
+result is exact for any lens, not only where a stale weave happens to be
+phase-equivalent. It needs no table probe, and every logical position is
+reachable at any scale.
+
+### 9.2 Binding a buffer to its woven position
+
+GJS has no per-commit identifier. `MetaWindowActor::damaged` fires inside the
+commit's apply, before the subsurface state is synced, and
+`meta_window_actor_freeze()` cannot hold a Wayland window: freezing also stops
+mutter syncing the surface actors (the new texture and the subsurface
+positions) until the thaw.
+
+So the runtime tags the commit itself (`comp_vk_native_wl_move_sync`):
+- A 1x1 clear **synchronised** subsurface of the bound surface, placed below
+  it, with an empty input region.
+- It sits at `(x mod 256, y mod 256)` of the logical content position the
+  frame was woven for — the snapshot `vk_get_window_metrics` used for that
+  frame's present origin (`comp_vk_native_wl_geom_last_rect`), captured per
+  weave and set **immediately before that weave's present, under the
+  compositor lock**. A fill's fence-park releases the lock between its weave
+  and its present (§9.6), so the position is carried in the weave's own
+  storage, never read back from shared state.
+- A synchronised subsurface's position is parent state: it lands atomically
+  with the buffer the WSI commits in `vkQueuePresentKHR`.
+- While the window covers its whole monitor (fullscreen) the tag's pixel is
+  detached, so the window stays a single surface for direct scanout; a
+  fullscreen window is never dragged.
+
+The encoding is `comp_vk_native_wl_move_sync_encode` (pinned by
+`tests/tests_comp_wl_move_sync_tag.cpp`); the extension's decode is
+`MoveSyncChoice.decode` (pinned by `scripts/test_gnome_extension_move_sync.js`
+against a transcription of the same function).
+
+### 9.3 Placement rules (`MoveSyncChoice` in `lib.js`)
+
+The extension resolves the tag against the positions the window had in the
+last second, **newest first**, and shows the frame there:
+- **By position.** Every tagged frame is shown where its tag says. A tag names
+  a position, and which moment of the history it came from is ambiguous only
+  when the window revisits a position (a reversal) — where either answer is
+  the same pixel. Commits reach mutter in present order, each woven for a
+  position the window had at or after the previous one's. (The prototype
+  instead ignored a tag that resolved OLDER than the one shown; at a reversal
+  that painted frames woven on the way to the turn off their origin — 1.1 %
+  of a reversal's frames.)
+- **Stall fallback.** After 100 ms *and* 6 stage frames behind the window with
+  no newer woven frame, the actor follows the window, showing stale frames
+  (counted as a timeout). It re-syncs on the first frame woven for a position
+  the window had within the last 60 ms.
+- **Tick at a stop.** While the actor is behind a window that has stopped, a
+  redraw is queued each frame; otherwise nothing schedules a stage update and
+  the frame woven for the final position waited ~300 ms.
+- **Both movers.** mutter's move grab (title bar, Super+drag) and the pointer
+  drag (§8.9, a right-button content drag) start and end the same hold.
+- **Geometry every frame.** A move of a window in a hold is published
+  (`WindowsChanged`) at once. The coalescing `BEFORE_REDRAW` later, added from
+  `position-changed`, only runs in the NEXT frame — so the runtime saw a new
+  position every other frame and the window advanced on at most half the
+  paints. That, not the runtime's weave rate, was the prototype's 30 Hz
+  cadence.
+
+### 9.4 Registration and fallback
+
+- The runtime creates the tag first, then calls `EnableMoveSync(0)`.
+  `UnknownMethod` (an older extension) or `false` → the tag is destroyed and
+  the lattice path runs. No answer (no extension yet) → the request is
+  remembered.
+- The registration lives with the caller's bus connection. GNOME disables user
+  extensions while the screen shield is up, so the runtime registers again
+  whenever the service name reappears.
+- Per frame, the runtime trusts the snapshot's `move_sync` for its window: only
+  when it is set does it skip the drop-time snap (#1609). Until the extension has
+  (re)accepted, the window is a lattice window.
+- The extension refuses drag tables for a registered process, and
+  displayxr-common (the app side) reads `move_sync` from the same snapshot it
+  already fetches at the press and derives no table for that drag: each table
+  costs the frame loop ~90 ms of snap probing.
+
+### 9.5 Cadence: a weave per refresh
+
+The window advances only when a frame woven for its new position is painted.
+The runtime therefore re-weaves during a move-sync drag whenever no weave has
+chosen an origin for 7/8 of a refresh period (`vk_wl_move_fill_due`,
+`DXR_WL_MOVE_SYNC_FILL=0` to disable): the repaint loop bypasses its quiet gate
+and phase hold for that, but never `app_frame_in_progress` or the submit
+window, and adds at most one weave per period. An app that is FIFO-bound
+already weaves every slot the queue drains, so the fill rarely fires; with a
+30 Hz app the difference it made stayed within run-to-run noise in the
+harness, because the ordinary repaint gate already refills most of the gaps.
+
+### 9.6 Found on the way: the fill fence-park leaked swapchain images
+
+`DXR_WEAVE_REPAINT_FORCE=1` hung the prototype's app within seconds: the app
+thread sat in `vkAcquireNextImageKHR` (waiting on the explicit-sync release
+point) holding the compositor lock, and the repaint thread waited for that
+lock. Cause: a fill whose fence-park lost the race to an app frame returned
+without presenting the image it had acquired, and Vulkan hands an acquired
+image back only through a present, so each lost race leaked one image for the
+life of the swapchain. The target now holds such an image and hands it to the
+next acquire (`comp_vk_native_target_hold_unpresented`; a recreate drops the
+hold). With the fix, `DXR_WEAVE_REPAINT_FORCE=1` runs a full drag suite with
+no hang and 0 frames off their woven origin. The default gate hit the same
+race rarely, so long sessions were exposed too.
+
+### 9.7 Measured (private headless GNOME Shell 50.1)
+
+**Setup.** A private headless GNOME Shell 50.1 (own display and session bus),
+real drags through that instance's `org.gnome.Mutter.RemoteDesktop`:
+left-button title-bar drags (mutter's grab) and right-button content drags
+(the pointer drag). `cube_handle_vk_linux` on sim_display only
+(`DXR_PLUGIN_EXCLUSIVE=sim-display`), windowed 1600x1000 device px, its
+content drag on the right button (`DXR_CUBE_DRAG_BUTTON=3`, as the demos). The
+harness is `scripts/linux/move_sync/` (`run.sh default|lattice|reweave SCALE
+OUT DRAG...`).
+
+**Stamp audit.** With `DXR_WL_ORIGIN_STAMP=1` the runtime writes a barcode of
+each frame's present origin into its top-left 352x8 px (a measurement hook: it
+overwrites content). With `DISPLAYXR_STAMP_AUDIT=1` in the shell's environment
+the extension reads it back after every stage paint and compares it with
+where the stage painted the window. "Off-origin" = painted at a device origin
+other than the one it was woven for. Lag = pointer to painted content. "Still"
+= paints on which a moving window did not advance. Slow = 1 logical px per
+8 ms, fast = 10 logical px per 8 ms. Device px.
+
+| scale | build | off-origin | lag slow p50 | lag fast p50 | still (slow LMB / RMB) |
+|---|---|---|---|---|---|
+| 200 % | prototype (#1752) | 0 % (reversal 1.1 %) | 14 | 160 | 51 % / — |
+| 200 % | **this** | **0 %** (1,313 frames, reversal included) | 12 | 140 | 22 % / 18 % |
+| 150 % | prototype (#1752) | 0 % | 9 | 90 | 51 % / — |
+| 150 % | **this** | **0 %** (1,526 frames) | 10.5 | 90 | 22 % / 26 % |
+| 200 % | lattice (§8, `DXR_WL_MOVE_SYNC=0`) | 92 % (phase-correct by table) | 2 | — | 68 % |
+
+Every drag type at both scales reads 0 frames off their woven origin: straight
+(horizontal and a 20° diagonal), fast, reversal, start from rest, release in
+motion, and the same set as right-button pointer drags. No timeout fires.
+- **Reversal:** 0 % off-origin (the prototype: 1.1 %).
+- **Edge tiling:** a drag to the left edge tiles to the left half, to the top
+  edge maximises, at both scales; the hold ends as the window is resized.
+- **App frozen (SIGSTOP 670 ms mid-drag), both buttons:** one timeout per
+  drag; the window follows the pointer with stale frames (27–28 % of that
+  drag's frames), then re-syncs with one backward hop of ≤ 120 device px
+  (200 %) / ≤ 67 (150 %).
+- **Extension version 8** (the published one before this): `EnableMoveSync`
+  answers `UnknownMethod`, the runtime logs it once and runs the lattice path;
+  the app derives and sends tables, 0 frames painted off-table. A right-button
+  content drag does not move the window (displayxr-common's one WARN), since
+  that extension has no pointer drag either.
+
+**Lag.** About 2.9 frames at 200 % (3.4 in the prototype) and unchanged at
+150 %. It is the pipeline depth: publish → the app's next weave → a FIFO queue
+that, with a FIFO-bound app, holds up to three frames → paint. Measured levers
+(not shipped): a minimum-size swapchain (3 images instead of 4) cut it to ~2
+frames; `MAILBOX` to ~1 frame, but then nothing paces the app (it wove ~700
+frames/s). Either changes every Wayland app's presentation, not only drags, and
+needs a panel run first.
