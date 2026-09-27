@@ -126,6 +126,11 @@
       "group": "capture",
       "title": "Atlas Capture",
       "summary": "Vendor-neutral PNG snapshot of the multi-view atlas at a caller-selected compositor stage, for any app class"
+    },
+    "XR_DXR_stereo_camera": {
+      "group": "capture",
+      "title": "Stereo Camera Source",
+      "summary": "The display's own stereo camera (usually the eye tracker's) as a runtime-owned, privacy-gated source: the vendor plug-in supplies frames without taking the device from the tracker, and the service fans newest-frame side-by-side pairs out to clients over shared memory"
     }
   }
 }

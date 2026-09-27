@@ -531,6 +531,46 @@ the runtime logs one warning and runs unpaced. Either way nothing fails — the
 difference is accuracy, not correctness. Application-side guidance:
 [INV-5.9](../guides/displayxr-app-rules.md).
 
+## A stereo camera: the `stereo_camera_*` slots (ADR-043)
+
+Optional, appended per ADR-020, announced by `XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA`; the runtime
+uses them only when `struct_size` covers `stereo_camera_close` **and** all six are non-NULL
+(`xrt_plugin_iface_has_stereo_camera()`). They let a plug-in expose the display's own stereo
+camera — usually the one its eye tracker looks through — as a runtime source
+([`XR_DXR_stereo_camera`](../specs/extensions/XR_DXR_stereo_camera.md)). The service opens each
+camera once and fans frames out to every authorised client; the plug-in only produces frames.
+
+```c
+uint32_t     (*stereo_camera_enumerate)(inst, capacity, struct xrt_plugin_stereo_camera_info *out);
+xrt_result_t (*stereo_camera_get_calibration)(inst, index, struct xrt_plugin_stereo_camera_calibration *out);
+xrt_result_t (*stereo_camera_open)(inst, index, struct xrt_plugin_stereo_camera **out_cam);
+uint32_t     (*stereo_camera_wait_frame)(cam, int64_t timeout_ns, struct xrt_plugin_stereo_camera_frame *out);
+void         (*stereo_camera_release_frame)(cam);
+void         (*stereo_camera_close)(cam);
+```
+
+| Rule | Why |
+|---|---|
+| **Never take the device from the tracker.** Read the frames the tracker already publishes (shared memory, a vendor camera service); never open, reconfigure or re-time the device. | The whole point: while tracking runs the device is exclusive (Windows `NotReadableError`), and on Android opening the front pair evicts the tracker (roadmap §C) |
+| `stereo_camera_open` is a **tracker keep-alive**: while any camera is open, keep the tracker running. | Frames only exist while tracking runs |
+| `wait_frame` is called from **one runtime-owned thread per open camera**, may block up to `timeout_ns`, and returns an `enum xrt_plugin_stereo_camera_wait` (`OK` / `TIMEOUT` / `SUSPENDED` / `ERROR`). Planes stay valid until `release_frame`. | The service maps `TIMEOUT` → `WAITING` (then `SUSPENDED` after 1 s without frames), `SUSPENDED` → `SUSPENDED`, `ERROR` → close + retry in 1 s |
+| **Never wait on a wake object shared with other readers** of the vendor channel — poll it. | An auto-reset event wakes exactly one waiter: two readers steal each other's frames (ADR-043) |
+| Decode your transport (JPEG, YUY2, …) to `GRAY8`, `NV12` or `BGRA8` yourself; always deliver **one side-by-side image**, `2·eye_width × eye_height`, left eye left, unmirrored, even extents. | The runtime owns format conversion, decimation, rectification (R2) and transport; one SBS layout for every vendor |
+| Calibration is the **ACTIVE** device's — the unit you weave for — keyed by its own identity (serial). RAW, OpenCV convention: `k[eye] = fx fy cx cy`, `distortion_model` + coefficients, and `R`, `T` with **`x_R = R·x_L + T`** (T in mm; a right camera at +x of the left has `T = (−B, 0, 0)`). The runtime converts it to the client's pose-of-the-right-camera form. Return `XRT_ERROR_FEATURE_NOT_SUPPORTED` and do **not** set `CALIBRATED` if you cannot resolve it. | One test box carried eleven calibration folders; "the first one" is the wrong camera |
+| `device_identity` is private: the service hashes it per consumer (`persistentId`) and never exports it. | Fingerprinting (spec §7.5) |
+| Nothing throws across the boundary. | C ABI |
+
+Flags (`XRT_PLUGIN_STEREO_CAMERA_*`) mirror the XR bits: `SHARED_WITH_EYE_TRACKING`,
+`USER_FACING`, `CALIBRATED`, `NATIVELY_RECTIFIED`, `MONOCHROME`. The reference implementation is
+`sim_display`'s fake (`drivers/sim_display/sim_display_stereo_camera.c`, enabled with
+`SIM_DISPLAY_FAKE_STEREO_CAMERA=1` in the **service** environment).
+
+**Slot order.** The six slots follow a one-pointer placeholder,
+`reserved_adr042_create_dp_d3d11_lift`, held for ADR-042's `create_dp_d3d11_lift`, which is not on
+`main` yet but claims the offset right after `vk_bundle_fn_table_offset`. The placeholder keeps the
+camera slots at their final offsets whichever PR merges first; the lift PR replaces it in place
+(same size). `tests_stereo_camera` asserts the adjacency.
+
 ## Aux surface — separate from the iface
 
 Logging, debug-variable tracking, frame metrics, Perfetto tracing, and unique-ID generation are **not** plumbed through this iface. Plug-ins reach them by linking the runtime DLL's import library (`DisplayXRClient.lib`) and getting `__declspec(dllimport)`'d symbols. See [ADR-019](../adr/ADR-019-vendor-plugin-aux-boundary.md) for the rationale.

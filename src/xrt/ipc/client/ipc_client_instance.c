@@ -30,6 +30,7 @@
 #include "client/ipc_client.h"
 #include "client/ipc_client_interface.h"
 #include "client/ipc_client_connection.h"
+#include "client/ipc_client_stereo_camera.h"
 
 #include "ipc_client_generated.h"
 
@@ -229,6 +230,9 @@ ipc_client_instance_destroy(struct xrt_instance *xinst)
 {
 	struct ipc_client_instance *ii = ipc_client_instance(xinst);
 
+	free(ii->base.stereo_camera);
+	ii->base.stereo_camera = NULL;
+
 	// service considers us to be connected until fd is closed
 	ipc_client_connection_fini(&ii->ipc_c);
 
@@ -333,6 +337,9 @@ ipc_instance_create(const struct xrt_instance_info *i_info, struct xrt_instance 
 	ii->xdev_count = count;
 
 	ii->base.startup_timestamp = ii->ipc_c.ism->startup_timestamp;
+
+	// XR_DXR_stereo_camera (ADR-043): cameras are reached over this connection.
+	ii->base.stereo_camera = ipc_client_stereo_camera_client_create(&ii->ipc_c);
 
 	*out_xinst = &ii->base;
 

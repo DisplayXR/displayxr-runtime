@@ -34,6 +34,7 @@
 #include "xrt/xrt_results.h"
 
 #include "sim_display_interface.h"
+#include "sim_display_stereo_camera.h"
 #if defined(XRT_HAVE_VULKAN) || !defined(_WIN32)
 #include "vk/vk_helpers.h" // #1243: sizeof(struct vk_bundle) fingerprint
 #endif
@@ -254,6 +255,18 @@ static struct xrt_plugin_iface g_sim_display_iface = {
     .set_pose_source = sim_display_plugin_set_pose_source,
 
     .probe_displays = sim_display_plugin_probe_displays,
+
+    /*
+     * ADR-043 stereo camera source. The slots are always filled; the FAKE
+     * camera itself only exists under SIM_DISPLAY_FAKE_STEREO_CAMERA=1 (the
+     * enumerate slot reports zero cameras otherwise).
+     */
+    .stereo_camera_enumerate = sim_display_stereo_camera_enumerate,
+    .stereo_camera_get_calibration = sim_display_stereo_camera_get_calibration,
+    .stereo_camera_open = sim_display_stereo_camera_open,
+    .stereo_camera_wait_frame = sim_display_stereo_camera_wait_frame,
+    .stereo_camera_release_frame = sim_display_stereo_camera_release_frame,
+    .stereo_camera_close = sim_display_stereo_camera_close,
 };
 
 

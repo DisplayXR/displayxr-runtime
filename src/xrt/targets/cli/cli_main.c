@@ -48,6 +48,10 @@ cli_print_help(int argc, const char **argv)
 	P("           [--claims] - Also show which plug-in claims each display (loads plug-ins).\n");
 	P("  clients [--json]  - List the running service's IPC clients with their verified class\n");
 	P("                      (#960). Connects over IPC as a DIAG client; non-elevated on Windows.\n");
+	P("  camera <...>      - Stereo camera sources (XR_DXR_stereo_camera, ADR-043), over IPC (DIAG).\n");
+	P("                      'camera list [--json]', 'camera calib <id> [--raw|--rectified]',\n");
+	P("                      'camera probe [<id>] [--raw] [--format gray8|nv12|bgra8] [--fps F]\n");
+	P("                      [--frames N] [--seconds S] [--out DIR]' — rate, layout, disparity, PNG.\n");
 	P("  test              - List found devices and role assignments, for prober testing.\n");
 	P("  probe             - Just probe and then exit.\n");
 
@@ -99,6 +103,9 @@ main(int argc, const char **argv)
 	}
 	if (strcmp(argv[1], "probe") == 0) {
 		return cli_cmd_probe(argc, argv);
+	}
+	if (strcmp(argv[1], "camera") == 0) {
+		return cli_cmd_camera(argc, argv);
 	}
 	return cli_print_help(argc, argv);
 }

@@ -750,6 +750,25 @@
 
 
 /*
+ * XR_DXR_stereo_camera
+ *
+ * Hand-added DisplayXR extension (generate_oxr_ext_support.py knows nothing of
+ * the DisplayXR blocks — keep them when regenerating). A display's stereo
+ * camera as a plug-in-provided, service-owned source (ADR-043). Advertised on
+ * every platform: the camera manager is platform-neutral service code, and an
+ * instance with no camera (in-process, no plug-in source, kill switch) simply
+ * enumerates zero.
+ */
+#if defined(XR_DXR_stereo_camera)
+#define OXR_HAVE_DXR_stereo_camera
+#define OXR_EXTENSION_SUPPORT_DXR_stereo_camera(_) \
+    _(DXR_stereo_camera, DXR_STEREO_CAMERA)
+#else
+#define OXR_EXTENSION_SUPPORT_DXR_stereo_camera(_)
+#endif
+
+
+/*
  * XR_DXR_workspace_file_dialog
  */
 #if defined(XR_DXR_workspace_file_dialog) && defined(XR_USE_PLATFORM_WIN32)
@@ -1261,6 +1280,7 @@
     OXR_EXTENSION_SUPPORT_DXR_depth_budget(_) \
     OXR_EXTENSION_SUPPORT_DXR_display_zones(_) \
     OXR_EXTENSION_SUPPORT_DXR_weave(_) \
+    OXR_EXTENSION_SUPPORT_DXR_stereo_camera(_) \
     OXR_EXTENSION_SUPPORT_DXR_workspace_file_dialog(_) \
     OXR_EXTENSION_SUPPORT_DXR_mcp_tools(_) \
     OXR_EXTENSION_SUPPORT_BD_controller_interaction(_) \

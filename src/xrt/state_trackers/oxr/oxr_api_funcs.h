@@ -1078,6 +1078,50 @@ XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrWeaveExportIpcConnectionDXR(XrInstance instance, XrWeaveIpcConnectionDXR *connection);
 #endif
 
+#ifdef OXR_HAVE_DXR_stereo_camera
+//! OpenXR API function @ep{xrEnumerateStereoCamerasDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrEnumerateStereoCamerasDXR(XrInstance instance,
+                                XrSystemId systemId,
+                                uint32_t capacityInput,
+                                uint32_t *countOutput,
+                                XrStereoCameraPropertiesDXR *cameras);
+
+//! OpenXR API function @ep{xrGetStereoCameraCalibrationDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetStereoCameraCalibrationDXR(XrInstance instance, uint64_t cameraId, XrStereoCameraCalibrationDXR *calibration);
+
+//! OpenXR API function @ep{xrCreateStereoCameraStreamDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrCreateStereoCameraStreamDXR(XrInstance instance,
+                                  const XrStereoCameraStreamCreateInfoDXR *createInfo,
+                                  XrStereoCameraStreamDXR *stream);
+
+//! OpenXR API function @ep{xrDestroyStereoCameraStreamDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrDestroyStereoCameraStreamDXR(XrStereoCameraStreamDXR stream);
+
+//! OpenXR API function @ep{xrStartStereoCameraStreamDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrStartStereoCameraStreamDXR(XrStereoCameraStreamDXR stream);
+
+//! OpenXR API function @ep{xrStopStereoCameraStreamDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrStopStereoCameraStreamDXR(XrStereoCameraStreamDXR stream);
+
+//! OpenXR API function @ep{xrGetStereoCameraStreamInfoDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetStereoCameraStreamInfoDXR(XrStereoCameraStreamDXR stream, XrStereoCameraStreamInfoDXR *info);
+
+//! OpenXR API function @ep{xrAcquireStereoCameraFrameDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrAcquireStereoCameraFrameDXR(XrStereoCameraStreamDXR stream, XrStereoCameraFrameDXR *frame);
+
+//! OpenXR API function @ep{xrGetStereoCameraStreamStatsDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetStereoCameraStreamStatsDXR(XrStereoCameraStreamDXR stream, XrStereoCameraStreamStatsDXR *stats);
+#endif
+
 #ifdef OXR_HAVE_EXT_conformance_automation
 //! OpenXR API function @ep{xrSetInputDeviceActiveEXT}
 XRAPI_ATTR XrResult XRAPI_CALL

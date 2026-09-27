@@ -48,6 +48,10 @@ cli_cmd_clients(int argc, const char **argv);
 int
 cli_cmd_test(int argc, const char **argv);
 
+//! `camera` — XR_DXR_stereo_camera (ADR-043): `camera list|calib|probe`, over IPC (DIAG).
+int
+cli_cmd_camera(int argc, const char **argv);
+
 /*!
  * True if @p flag appears anywhere in argv[2..]. Commands take raw
  * argc/argv; this is the one shared option-scan (e.g. `--json`).
