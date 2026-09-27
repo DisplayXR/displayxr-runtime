@@ -1641,7 +1641,8 @@ weave_run_frame(struct vk_bundle *vk,
                 uint32_t *out_width,
                 uint32_t *out_height,
                 uint64_t *out_fence_value,
-                struct xrt_eye_positions *out_eyes)
+                struct xrt_eye_positions *out_eyes,
+                struct xrt_weave_woven_origin *out_origin)
 {
 	// Spec-v6 N-view atlas (#774): tiles contiguous from the top-left at
 	// (content_view_w, content_view_h); crop the packed region if the atlas
@@ -1997,6 +1998,21 @@ weave_run_frame(struct vk_bundle *vk,
 	                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
 
 	weave_feed_dp_geometry(mc);
+	// v12 (browser-pvt#180): THE origin this weave is phase-locked to — the
+	// geometry just fed to the DP, read under the engine lock that also
+	// serialises every bind. Snapshotted here, in the weave's own storage, and
+	// committed below only if the weave goes out: the same per-weave capture as
+	// the in-process compositor's comp_vk_native_wl_geom_last_rect.
+	const struct xrt_weave_woven_origin woven = {
+	    .valid = mc->weave.have_geometry,
+	    .x = mc->weave.have_geometry ? mc->weave.win_x : 0,
+	    .y = mc->weave.have_geometry ? mc->weave.win_y : 0,
+	    .logical_valid = mc->weave.have_geometry && mc->weave.win_logical.valid,
+	    .logical_x = mc->weave.win_logical.valid ? mc->weave.win_logical.x : 0,
+	    .logical_y = mc->weave.win_logical.valid ? mc->weave.win_logical.y : 0,
+	    .logical_scale = mc->weave.win_logical.valid ? mc->weave.win_logical.scale : 0.0f,
+	    .serial = 0, // assigned on success
+	};
 
 	// Off-panel 2D (#1654): the bands of the output that are not on the panel.
 	// A window entirely off the panel is one band covering the whole output,
@@ -2241,6 +2257,13 @@ weave_run_frame(struct vk_bundle *vk,
 
 	mc->weave.fence_value++;
 
+	// v12: this output now exists, woven for `woven`.
+	mc->weave.woven_origin = woven;
+	mc->weave.woven_origin.serial = ++mc->weave.woven_serial;
+	if (out_origin != NULL) {
+		*out_origin = mc->weave.woven_origin;
+	}
+
 	*out_width = mc->weave.out_w;
 	*out_height = mc->weave.out_h;
 	*out_fence_value = mc->weave.fence_value;
@@ -2273,9 +2296,19 @@ comp_multi_weave_bind_window(struct xrt_compositor *xc, uint64_t window_id)
 	// Recorded only: an XID (X11) or 0 (Wayland, where a client cannot name
 	// its window to another process). The service creates no window and never
 	// derives geometry from it — that arrives through set_window_geometry.
+	const bool first = !mc->weave.window_bound;
+	const bool changed = first || mc->weave.window_id != window_id;
+	mc->weave.window_bound = true;
 	mc->weave.window_id = window_id;
 	os_mutex_unlock(&mc->weave.mutex);
-	U_LOG_W("weave(#1699): bound present-owner window id 0x%" PRIx64, window_id);
+	// A present-owner re-binds on every move — every frame of a drag under v12
+	// move sync — so this must not be a per-frame WARN: one WARN for the
+	// session's first bind, INFO when the id changes, silence on a repeat.
+	if (first) {
+		U_LOG_W("weave(#1699): bound present-owner window id 0x%" PRIx64, window_id);
+	} else if (changed) {
+		U_LOG_I("weave(#1699): present-owner window id now 0x%" PRIx64, window_id);
+	}
 	return true;
 }
 
@@ -2287,21 +2320,41 @@ comp_multi_weave_set_window_geometry(struct xrt_compositor *xc,
                                      uint32_t client_h,
                                      int32_t display_id)
 {
+	return comp_multi_weave_set_window_geometry_logical(xc, origin_x, origin_y, client_w, client_h, display_id,
+	                                                    NULL);
+}
+
+bool
+comp_multi_weave_set_window_geometry_logical(struct xrt_compositor *xc,
+                                             int32_t origin_x,
+                                             int32_t origin_y,
+                                             uint32_t client_w,
+                                             uint32_t client_h,
+                                             int32_t display_id,
+                                             const struct xrt_weave_logical_origin *logical)
+{
 	struct multi_compositor *mc = multi_compositor(xc);
 	if (mc == NULL || mc->msc == NULL || client_w == 0 || client_h == 0) {
 		return false;
+	}
+	// v12 (browser-pvt#180): verbatim, or cleared — never derived.
+	struct xrt_weave_logical_origin lo = {0};
+	if (logical != NULL && logical->valid) {
+		lo = *logical;
 	}
 	weave_ensure_mutex(mc);
 	os_mutex_lock(&mc->weave.mutex);
 	const bool changed = !mc->weave.have_geometry || mc->weave.win_x != origin_x || mc->weave.win_y != origin_y ||
 	                     mc->weave.win_w != client_w || mc->weave.win_h != client_h ||
 	                     mc->weave.win_display_id != display_id;
+	const bool logical_first = lo.valid && !mc->weave.win_logical.valid;
 	mc->weave.have_geometry = true;
 	mc->weave.win_x = origin_x;
 	mc->weave.win_y = origin_y;
 	mc->weave.win_w = client_w;
 	mc->weave.win_h = client_h;
 	mc->weave.win_display_id = display_id;
+	mc->weave.win_logical = lo;
 	mc->weave.geometry_dirty = mc->weave.geometry_dirty || changed;
 	os_mutex_unlock(&mc->weave.mutex);
 	if (changed) {
@@ -2309,6 +2362,14 @@ comp_multi_weave_set_window_geometry(struct xrt_compositor *xc,
 		// re-publish every frame, so log only on change.
 		U_LOG_W("weave(#1699): present-owner window %d,%d %ux%u on display %d", origin_x, origin_y, client_w,
 		        client_h, display_id);
+	}
+	if (logical_first) {
+		// One-off per transition (not per move): the caller now reports its
+		// logical origin, so outputs carry a move-sync-taggable origin.
+		U_LOG_W(
+		    "weave(v12): present-owner publishes its logical origin (%d,%d) @ scale %.4f — woven outputs "
+		    "report it for move-sync tagging",
+		    lo.x, lo.y, (double)lo.scale);
 	}
 	return true;
 }
@@ -2379,7 +2440,7 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		if (!weave_run_frame(vk, mc, in, ov, rect_x, rect_y, rect_w, rect_h, rect_count, rects,
 		                     weave_frame_first, layout, flat_rect_count, flat_rects, want_dmabuf_out,
 		                     false /* no acquire sem */, false /* synchronous */, &unused_release_fd, out_width,
-		                     out_height, out_fence_value, out_eyes)) {
+		                     out_height, out_fence_value, out_eyes, NULL /* v12: dma-buf path only */)) {
 			break;
 		}
 		ok = true;
@@ -2466,10 +2527,14 @@ comp_multi_weave_submit_dmabuf(struct xrt_compositor *xc,
                                uint32_t *out_width,
                                uint32_t *out_height,
                                uint64_t *out_fence_value,
-                               struct xrt_eye_positions *out_eyes)
+                               struct xrt_eye_positions *out_eyes,
+                               struct xrt_weave_woven_origin *out_origin)
 {
 	if (out_release_fence_fd != NULL) {
 		*out_release_fence_fd = -1;
+	}
+	if (out_origin != NULL) {
+		memset(out_origin, 0, sizeof(*out_origin));
 	}
 
 	// Every fd handed in is the engine's from here (xrt_weave_dmabuf.h): the
@@ -2538,7 +2603,7 @@ comp_multi_weave_submit_dmabuf(struct xrt_compositor *xc,
 		if (!weave_run_frame(vk, mc, in_slot, ov_slot, rect_x, rect_y, rect_w, rect_h, rect_count, rects,
 		                     weave_frame_first, layout, flat_rect_count, flat_rects, want_dmabuf_out,
 		                     wait_acquire, true /* release sync_file */, &release_fd, out_width, out_height,
-		                     out_fence_value, out_eyes)) {
+		                     out_fence_value, out_eyes, out_origin)) {
 			if (wait_acquire) {
 				// The temporary payload may be unconsumed (nothing was
 				// submitted): replace acquire_sem so the next import starts

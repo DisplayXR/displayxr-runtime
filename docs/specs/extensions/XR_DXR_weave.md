@@ -3,11 +3,11 @@
 | Field | Value |
 |---|---|
 | **Extension Name** | `XR_DXR_weave` |
-| **Spec Version** | 11 |
+| **Spec Version** | 12 |
 | **Extension Type** | Instance extension (service path — Windows/D3D11, macOS/comp_multi-Vulkan #759, Android/comp_multi-Vulkan #1036, desktop Linux/comp_multi-Vulkan dma-buf #1699 when the service carries its engine; the snap and its bulk grid form also work in-process on desktop Linux, §5c / #1588 / #1723) |
 | **Header** | `src/external/openxr_includes/openxr/XR_DXR_weave.h` (canonical; auto-syncs to `displayxr-extensions`) |
-| **Status** | Provisional (`1004999190–198` type block, pending Khronos registry; `199` reserved, see §2c; v9+ additions in a fresh `1004999240–249` decade — 240 v9, 241–245 v10, 246 v11) |
-| **Design history** | `docs/roadmap/webxr-step-b-design.md` §13.6–13.9, `docs/roadmap/android-concurrent-multi-app.md` F11/§10.4, issues #625, #774, #1031/#1036, browser#88, browser#103, #1699, #1723 |
+| **Status** | Provisional (`1004999190–198` type block, pending Khronos registry; `199` reserved, see §2c; v9+ additions in a fresh `1004999240–249` decade — 240 v9, 241–245 v10, 246 v11, 247–248 v12) |
+| **Design history** | `docs/roadmap/webxr-step-b-design.md` §13.6–13.9, `docs/roadmap/android-concurrent-multi-app.md` F11/§10.4, issues #625, #774, #1031/#1036, browser#88, browser#103, #1699, #1723, browser-pvt#180 |
 
 ## 1. What it is
 
@@ -693,6 +693,89 @@ processor to wish to, the runtime instead paints the union of the submit's
 input pixels 1:1 for a batch submit, the centre view for v6 — a platform exception to §2c's
 "pixels unaffected" that `DXR_WEAVE_FLAT_2D=0` switches off.
 
+## 5e. Woven origin per output — present-owner move sync (v12, browser-pvt#180)
+
+```c
+#define XR_TYPE_WEAVE_OUTPUT_ORIGIN_DXR         ((XrStructureType)1004999247)
+#define XR_TYPE_WEAVE_WINDOW_LOGICAL_ORIGIN_DXR ((XrStructureType)1004999248)
+
+typedef struct XrWeaveWindowLogicalOriginDXR {   // IN: chain on XrWeaveBindWindowInfoDXR
+    XrStructureType          type;
+    const void* XR_MAY_ALIAS next;
+    XrOffset2Di              logicalOrigin;      // surface top-left, compositor-global LOGICAL px
+    float                    scale;              // output scale used for logical -> device px
+} XrWeaveWindowLogicalOriginDXR;
+
+typedef struct XrWeaveOutputOriginDXR {          // OUT: chain on XrWeaveOutputDXR, every frame
+    XrStructureType    type;
+    void* XR_MAY_ALIAS next;
+    XrBool32           valid;                    // a geometry was bound for this output's weave
+    XrOffset2Di        wovenOriginOnScreen;      // absolute physical px, as XrWeaveWindowGeometryDXR
+    XrBool32           logicalValid;             // that bind also carried a logical origin
+    XrOffset2Di        wovenOriginLogical;       // verbatim
+    float              logicalScale;             // verbatim
+    uint64_t           serial;                   // monotonic per woven output; 0 = not reported
+} XrWeaveOutputOriginDXR;
+```
+
+**Why.** On native Wayland a drag is *move-synchronised* (GNOME extension version 9,
+`docs/specs/runtime/wayland-window-geometry.md` §9): the extension holds the window's actor at
+the position the buffer it is about to paint was woven for. It learns that position from a tag
+on the commit — a 1×1 synchronised subsurface at `(x mod 256, y mod 256)` of the **logical**
+content origin. A window-bound runtime session tags its own commits. A present-owner commits the
+woven pixels itself, so it has to tag them itself, and until v12 nothing told it which origin a
+given output was woven for: v7 geometry only flows *in*, and a re-bind (every move) and the weave
+that consumes it are not the same moment.
+
+**Which origin.** The one the **weave** used: the geometry the runtime fed the display
+processor's phase slot (`set_present_origin`) for that weave, snapshotted inside the weave under
+the engine lock that also serialises every bind, and committed only when the weave goes out —
+the service-side counterpart of the in-process compositor's per-weave
+`comp_vk_native_wl_geom_last_rect` capture. Today the weave runs synchronously inside
+`xrWeaveSubmitDXR`, so this equals the last `xrWeaveBindWindow2DXR` that returned before the
+submit; the contract is written against weave time so an asynchronous weave keeps it.
+
+**Units.** `wovenOriginOnScreen` is the bound `windowOriginOnScreen`, echoed (absolute physical
+px, y-down). The logical origin is **not derived** by the runtime: the service knows no output
+scale (a Wayland client is never told its position — the present-owner learns it, in logical
+px, from the extension, and converts it to device px itself), and converting device px back to
+logical would be a fresh rounding, which is exactly how a 150 % output lands one pixel off
+(#1609). So the caller states its logical origin and the scale it converted with on the same
+bind (`XrWeaveWindowLogicalOriginDXR`, requires the geometry chain, scale finite and in
+(0, 64]); the runtime latches the pair with that bind's device geometry and echoes both per
+output. **No conversion is applied in either direction.** A bind without the logical chain
+clears the latch, so `logicalValid` is false until the next bind that carries one.
+
+**The tag stays out of the API.** The presenter takes `wovenOriginLogical` mod 256 itself
+(non-negative modulo, so a window above/left of the stage origin still encodes) and tags the
+commit that presents that output — only when `logicalValid`. The modulus must equal the
+runtime's `COMP_VK_NATIVE_WL_MOVE_SYNC_TAG_MOD` and the extension's `MOVE_SYNC_TAG_MOD` (256).
+
+**Serial.** Increases with every woven output of the session (first output ≥ 1); two equal
+serials are the same output. With the single reused desktop-Linux output allocation, "an output"
+is one submit's weave into it.
+
+**Where it is filled.** The desktop-Linux dma-buf submit path (`XrWeaveDmabufDescDXR`). Every
+other path of a v12 runtime writes `valid = logicalValid = XR_FALSE`, `serial = 0`; the IN chain
+is accepted everywhere and dropped outside desktop Linux. A pre-v12 runtime never touches the
+OUT struct, so a caller zero-initialises it (or gates on `extensionVersion >= 12`).
+
+**Wire (runtime-internal).** Both additions are **appended**, leaving every pre-v12 field at its
+offset: `weave_set_window_geometry` gains `logical_valid, logical_x, logical_y, logical_scale`
+after `display_id`, and `weave_submit_dmabuf`'s reply gains a trailing 40-byte
+`ipc_weave_woven_origin` after `eyes` (per frame — not on `weave_get_output_dmabuf`, which a
+client calls only when the output is (re)allocated). Each side converts field by field between
+the wire POD and `xrt_weave_woven_origin`; nothing is byte-copied across layouts. The wire has no
+per-call version negotiation: messages are fixed-size on a `SOCK_STREAM` socket, and a client
+library and service built from different trees are refused at connect by the `u_git_tag` gate
+(`XRT_ERROR_IPC_VERSION_SKEW`), so a v11 client never meets a v12 service or vice versa.
+`tests/tests_ipc_proto.py` pins the append-only order.
+
+**Verified** headless (`weave_present_vk_linux --headless N`, sim_display through the dev
+service): the app re-binds a stepped origin every 4 frames with a logical origin attached, and
+checks on every output that the reported origin equals the last bind, the logical pair is echoed
+verbatim and the serial strictly increases.
+
 ## 6. Version history
 
 | Version | Change |
@@ -708,6 +791,11 @@ input pixels 1:1 for a batch submit, the centre view for v6 — a platform excep
 | 9 | `xrWeaveExportIpcConnectionDXR` + `XrWeaveIpcConnectionDXR` — brokering a runtime IPC endpoint to a sandboxed sibling process (§4c); plus §4b, the error table making a dead connection report `XR_ERROR_INSTANCE_LOST` / `XR_ERROR_SESSION_LOST` (browser#103). |
 | 10 | Desktop-Linux dma-buf transport (§5d, #1699): `XR_WEAVE_HANDLE_KIND_DMABUF_DXR` / `_OPAQUE_FD_DXR`, `XrWeaveDmabufDescDXR` + `XrWeaveOverlayDmabufDescDXR` in, `XrWeaveOutputDmabufDXR` out, `sync_file` fences `XrWeaveSubmitSyncDXR` (acquire) / `XrWeaveOutputSyncDXR` (release, per frame). Desktop Linux becomes a full weave platform when the service carries its engine. |
 | 11 | `xrWeaveSnapWindowGridDXR` + `XrWeaveSnapGridInfoDXR` / `XrWeaveSnapGridPointDXR` — bulk grid snap: the per-point snap evaluated over a grid by the runtime, one call (one IPC round trip) instead of one per point (§5c, #1723). |
+| 12 | `XrWeaveOutputOriginDXR` (out, per frame: the origin each woven output was woven for + a serial) and `XrWeaveWindowLogicalOriginDXR` (in: the caller's logical origin + scale, echoed verbatim) — so a present-owner can tag its own Wayland commit for move-synchronised drag (§5e, browser-pvt#180). |
+
+**v12 is a bump**: two structure types a caller must be able to test for. An older runtime skips
+both chains — the logical origin is simply not latched, and the OUT struct keeps whatever the
+caller initialised it to, which is why a caller zero-initialises it.
 
 **v11 is a bump** for the same reason v10 is: a new entry point and structure type a caller
 must be able to test for. A caller gates `xrWeaveSnapWindowGridDXR` on `extensionVersion >= 11`
@@ -737,7 +825,7 @@ implicit. §4c's entry point + struct settle it: **v9**.
 | DisplayXR Browser (Chromium fork) | GPU-process sync weave | Batch (v3) when the runtime reports spec ≥ 3; per-element legacy loop otherwise |
 | CEF weave host (Step A) | Browser-process sync | Legacy |
 | DisplayXR Browser on Android | Chromium GPU process → satellite compositor (ADR-036 D3) | Batch (v3/v7) — AHardwareBuffer handles + published window geometry |
-| DisplayXR Browser on desktop Linux (planned, #1699) | Chromium GPU process (GL/EGL) → comp_multi service | v10 dma-buf + `sync_file` fences; gate on spec ≥ 10 |
+| DisplayXR Browser on desktop Linux (planned, #1699) | Chromium GPU process (GL/EGL) → comp_multi service | v10 dma-buf + `sync_file` fences; gate on spec ≥ 10. Move-synchronised Wayland drag: v12 woven origin (§5e), gate on spec ≥ 12 |
 
 When changing the header, byte-sync every consumer's vendored copy and rebuild it
 (`third_party/displayxr` in the fork) — coupled-PR order: runtime → extensions auto-sync →

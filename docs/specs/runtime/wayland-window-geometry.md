@@ -988,3 +988,28 @@ that, with a FIFO-bound app, holds up to three frames → paint. Measured levers
 frames; `MAILBOX` to ~1 frame, but then nothing paces the app (it wove ~700
 frames/s). Either changes every Wayland app's presentation, not only drags, and
 needs a panel run first.
+
+### 9.8 Present-owners tag their own commit (XR_DXR_weave v12, browser-pvt#180)
+
+Everything above keys off a window-bound `vk_native` session: the runtime owns
+the surface, so it creates the tag subsurface and sets it before its own
+present. A **present-owner** (an `XR_DXR_weave` caller on the service path —
+the DisplayXR browser) presents the woven buffer itself, through its own
+surface, so the runtime cannot tag that commit. Present-owners tag their own
+commit from the v12 origin: every `xrWeaveSubmitDXR` returns, in a chained
+`XrWeaveOutputOriginDXR`, the origin that submit's output was woven for — the
+geometry the weave fed the display processor, captured per weave under the
+engine lock, the service-side twin of `comp_vk_native_wl_geom_last_rect` in
+§9.2 — plus a per-output serial. The runtime never converts device px back to
+logical (the service knows no output scale, and a fresh rounding is how a
+150 % output lands one pixel off, #1609): the present-owner binds its logical
+content origin and scale beside its device geometry
+(`XrWeaveWindowLogicalOriginDXR`) and gets them echoed verbatim per output.
+It then places its own 1×1 synchronised subsurface at
+`(wovenOriginLogical mod 256)` — the same encoding as
+`comp_vk_native_wl_move_sync_encode`, `COMP_VK_NATIVE_WL_MOVE_SYNC_TAG_MOD` =
+the extension's `MOVE_SYNC_TAG_MOD` — and commits it with the buffer that
+carries that output. Registration (`EnableMoveSync`) and the §9.4 fallback are
+the present-owner's too; the extension authorises by caller pid, which for a
+multi-process browser is a question for its side. API and wire:
+`docs/specs/extensions/XR_DXR_weave.md` §5e.

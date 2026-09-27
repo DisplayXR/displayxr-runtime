@@ -887,6 +887,7 @@ struct multi_compositor
 		struct xrt_display_processor *dp;
 
 		uint64_t window_id;   //!< Present-owner window id from bind (an XID; recorded only).
+		bool window_bound;    //!< A bind has happened (first-bind WARN; repeats are silent).
 		uint64_t fence_value; //!< Monotonic; completion is synchronous in stage A.
 
 		//! @name Explicit window geometry (spec v7 XrWeaveWindowGeometryDXR)
@@ -900,6 +901,15 @@ struct multi_compositor
 		int32_t win_display_id;
 		bool geometry_dirty; //!< Log the change once, not per frame.
 		bool metrics_logged; //!< One-shot log of the first metrics report (#1116).
+		//! v12 (browser-pvt#180): the caller's logical origin + scale, latched
+		//! verbatim with the device geometry above by the same bind (a bind
+		//! without one clears it).
+		struct xrt_weave_logical_origin win_logical;
+		//! v12: the origin the LAST successful weave was phase-locked to —
+		//! snapshotted where the weave feeds the DP (weave_feed_dp_geometry),
+		//! committed only when the weave succeeds. Serial source below.
+		struct xrt_weave_woven_origin woven_origin;
+		uint64_t woven_serial; //!< Bumped per successful weave; first output = 1.
 		//! Off-panel state of the last submit (#1654 on the service path): the
 		//! band count, | 0x100 when the window is entirely off the panel. The
 		//! WARN fires on a change only.
@@ -1450,7 +1460,24 @@ comp_multi_weave_submit_dmabuf(struct xrt_compositor *xc,
                                uint32_t *out_width,
                                uint32_t *out_height,
                                uint64_t *out_fence_value,
-                               struct xrt_eye_positions *out_eyes);
+                               struct xrt_eye_positions *out_eyes,
+                               struct xrt_weave_woven_origin *out_origin); // v12; NULL = not wanted
+
+/*!
+ * comp_multi_weave_set_window_geometry plus the caller's LOGICAL origin + scale
+ * (spec v12, browser-pvt#180), latched as one unit under the engine lock.
+ * @p logical NULL or !valid clears the logical latch — the logical origin of the
+ * new geometry is unknown. Stored verbatim; the engine never converts between
+ * device and logical pixels.
+ */
+bool
+comp_multi_weave_set_window_geometry_logical(struct xrt_compositor *xc,
+                                             int32_t origin_x,
+                                             int32_t origin_y,
+                                             uint32_t client_w,
+                                             uint32_t client_h,
+                                             int32_t display_id,
+                                             const struct xrt_weave_logical_origin *logical);
 
 bool
 comp_multi_weave_export_output_dmabuf(struct xrt_compositor *xc, struct xrt_weave_dmabuf_output_desc *out);

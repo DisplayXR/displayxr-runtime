@@ -77,6 +77,21 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         self.assertEqual(call.out_handles.arg_name, "release_fences")
         self.assertEqual(call.out_handles.count_arg_name, "release_fence_count")
 
+    def test_weave_v12_fields_are_trailing(self):
+        # XR_DXR_weave v12 (browser-pvt#180) grew two messages. Both additions
+        # are APPENDED, so every pre-v12 field keeps its offset — the wire
+        # carries no version negotiation (the u_git_tag gate refuses a skewed
+        # pair at connect), and this keeps any future reader of an older layout
+        # from being silently misaligned.
+        sub = [a.name for a in self._call("weave_submit_dmabuf").out_args]
+        self.assertEqual(sub, ["have_output", "width", "height", "fence_value", "eyes", "origin"])
+        geo = [a.name for a in self._call("weave_set_window_geometry").in_args]
+        self.assertEqual(geo[:5], ["origin_x", "origin_y", "client_w", "client_h", "display_id"])
+        self.assertEqual(geo[5:], ["logical_valid", "logical_x", "logical_y", "logical_scale"])
+        # The once-per-allocation export is untouched: the origin is per frame.
+        out = [a.name for a in self._call("weave_get_output_dmabuf").out_args]
+        self.assertEqual(out, ["have_output", "desc"])
+
     def test_client_proxy(self):
         text = self._generate("generate_client_c", "ipc_client_generated.c")
         body = self._function_body(text, "ipc_call_weave_submit_dmabuf(")

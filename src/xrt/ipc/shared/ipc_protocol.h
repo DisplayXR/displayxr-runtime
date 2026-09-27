@@ -989,6 +989,33 @@ struct ipc_weave_dmabuf_output
 };
 
 /*!
+ * XR_DXR_weave v12 (browser-pvt#180): the origin this submit's woven output was
+ * woven for, replied by weave_submit_dmabuf as its LAST out field (after the
+ * v10 fields, whose offsets it leaves untouched). POD mirror of
+ * @ref xrt_weave_woven_origin; explicit widths, no bool, 40 bytes.
+ *
+ * Per frame, so it rides the per-frame submit reply — not weave_get_output_dmabuf,
+ * which a client calls only when the output is (re)allocated. The wire has no
+ * version negotiation: a client DLL and a service that differ are refused at
+ * connect by the u_git_tag gate (XRT_ERROR_IPC_VERSION_SKEW), so a v11 reply
+ * size never meets a v12 reader.
+ *
+ * @ingroup ipc
+ */
+struct ipc_weave_woven_origin
+{
+	uint64_t serial; //!< monotonic per woven output; 0 = none
+	int32_t x;       //!< device px, desktop-absolute (the bound geometry)
+	int32_t y;
+	int32_t logical_x; //!< the bind's logical origin, verbatim
+	int32_t logical_y;
+	float logical_scale;    //!< the bind's scale, verbatim
+	uint32_t valid;         //!< 1 = x/y valid
+	uint32_t logical_valid; //!< 1 = logical_x/y/scale valid
+	uint32_t _reserved;     //!< zero; keeps the struct 8-byte sized
+};
+
+/*!
  * Arguments for xrt_device::get_view_poses with two views.
  */
 struct ipc_info_get_view_poses_2
