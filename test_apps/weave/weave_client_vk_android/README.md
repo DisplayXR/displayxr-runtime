@@ -38,7 +38,10 @@ the service compositor, and an in-process session reports
 ## Verifying the weave without a display capture
 
 `adb screencap` returns black for this app's layer on the NP02J, so the panel
-cannot answer "is it woven?" from the host. Read the buffers back instead:
+cannot answer "is it woven?" from the host. Read the buffers back instead. The
+dump is implemented by THIS APP (it reads back its own input and the woven
+output the runtime returned, in its own process) — the runtime service and the
+vendor plug-in know nothing of `debug.dxr.weave.dump`:
 
 ```bash
 adb shell setprop debug.dxr.weave.dump 1     # dumps ONCE; set 2, 3, … for each further dump

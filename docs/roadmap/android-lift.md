@@ -163,8 +163,20 @@ in-place update; there is no release keystore on a dev box.
 **Eyeballing the fake on the panel needs a tracked face.** With no face in view the Leia SDK
 drops the weave to its 2D fallback (a single view), so the lifted rect looks flat whatever the
 lift produced. Sit at the tablet, or force the light-field on with `adb shell setprop
-debug.dxr.overlay 1` (clear it afterwards). The same applies to a `debug.dxr.weave.dump`
-capture: a uniformly single-view row there is the no-face fallback, not a lift failure.
+debug.dxr.overlay 1` (clear it afterwards). The same applies to a buffer dump: a uniformly
+single-view row there is the no-face fallback, not a lift failure.
+
+**Buffer dumps come from the PROBE APP, not the runtime.** `debug.dxr.weave.dump` is read by
+`weave_client_vk_android` (the present-owner test app) only — neither the runtime service nor
+the Leia plug-in implements it. The app reads back the pre-weave input it handed the runtime and
+the woven output the runtime returned, in its own process, and writes
+`/sdcard/Android/data/com.displayxr.weave_client_vk_android/files/weave_in.ppm` and
+`weave_out.ppm` (one dump per distinct non-zero value; `adb pull` them). There is no runtime-side
+lift/weave dump in step 1: the weave's input (caller-allocated) and output (runtime,
+GPU-only) buffers are not CPU-readable, so a service-side dump needs a Vulkan readback plus a
+writable path in the runtime package's external files dir — a follow-up
+(`debug.dxr.lift.dump`), not free. The lift INPUT slots are CPU-readable (`CPU_READ_OFTEN`), so
+that part of such a dump would be cheap.
 
 ## Follow-ups (not in step 1)
 
