@@ -69,6 +69,7 @@ set(tests
     tests_m_matrix_projection
     tests_stereo_camera
     tests_stereo_rectify
+    tests_stereo_vrefine
 	)
 if(XRT_BUILD_DRIVER_QWERTY)
 	list(APPEND tests tests_qwerty_camera_profile tests_qwerty_velocity)
@@ -716,3 +717,10 @@ target_include_directories(tests_stereo_camera PRIVATE ${PROJECT_SOURCE_DIR}/src
 # synthetic lens live in the pattern file).
 target_sources(tests_stereo_rectify PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_stereo_camera_pattern.c)
 target_include_directories(tests_stereo_rectify PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display ${CMAKE_CURRENT_SOURCE_DIR}/fixtures)
+
+# ADR-043 R2: the online vertical-alignment refinement — on the distorted fake
+# with an injected, uncalibrated offset + slope, and on one REAL raw frame from
+# a Leia SR laptop (fixtures/stereo_vrefine_sr_raw.jpg, decoded with stb_image).
+target_sources(tests_stereo_vrefine PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_stereo_camera_pattern.c)
+target_include_directories(tests_stereo_vrefine PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display ${CMAKE_CURRENT_SOURCE_DIR}/fixtures ${PROJECT_SOURCE_DIR}/src/external/stb)
+target_compile_definitions(tests_stereo_vrefine PRIVATE STEREO_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")

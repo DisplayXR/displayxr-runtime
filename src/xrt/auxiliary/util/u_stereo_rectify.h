@@ -72,6 +72,24 @@ struct u_stereo_rectify_input
 	//! OpenCV extrinsics: x_right = R * x_left + T (T in any unit, e.g. mm).
 	double R[3][3];
 	double T[3];
+	/*!
+	 * Online vertical-alignment correction (the service's refinement, see
+	 * u_stereo_vrefine.h); both 0 = none, the plain Bouguet result. The
+	 * calibration leaves the RIGHT eye's rows displaced by
+	 *   D(y) = v_offset + v_slope * y      (normalized rectified units,
+	 *                                       y = (v - cy) / f)
+	 * relative to the left eye's. The correction is split symmetrically: the
+	 * output row of eye e samples the uncorrected rectified row
+	 *   y_src = y * (1 + s_e * v_slope / 2) + s_e * v_offset / 2,
+	 * s_left = -1, s_right = +1 — a per-eye vertical affine in normalized
+	 * rectified coordinates (equivalently a per-eye rectification homography
+	 * diag(1, 1 + s_e B/2, 1) + a row shift, folded into the maps). Rows then
+	 * agree to second order (B^2, A*B ~ 1e-5). Because it is folded in BEFORE
+	 * the principal point and the alpha = 0 crop are computed, the result's f /
+	 * cx / cy / P1 / P2 describe the corrected frames: one pinhole for both
+	 * eyes and a pure +x baseline, exactly the contract of a rectified pair.
+	 */
+	double v_offset, v_slope;
 };
 
 //! The rectified geometry.
@@ -95,6 +113,8 @@ struct u_stereo_rectify_result
 	//! The valid-region zoom applied to f (alpha = 0): >= 1 when the lens and
 	//! rotations would otherwise leave black borders.
 	double crop_scale;
+	//! The vertical correction folded in (copied from the input).
+	double v_offset, v_slope;
 };
 
 /*!
@@ -114,6 +134,15 @@ u_stereo_rectify_compute(const struct u_stereo_rectify_input *in, struct u_stere
 bool
 u_stereo_rectify_map_point(
     const struct u_stereo_rectify_result *r, uint32_t eye, double u, double v, double *out_x, double *out_y);
+
+/*!
+ * The inverse of @ref u_stereo_rectify_map_point: the rectified (output) pixel
+ * of eye @p eye where the RAW pixel (@p u, @p v) lands, correction included.
+ * @return false when the ray points behind the rectified camera.
+ */
+bool
+u_stereo_rectify_rect_from_raw(
+    const struct u_stereo_rectify_result *r, uint32_t eye, double u, double v, double *out_u, double *out_v);
 
 /*!
  * Float map of eye @p eye on a grid subsampled by @p sub (1 = full
