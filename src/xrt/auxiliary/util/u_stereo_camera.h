@@ -220,6 +220,73 @@ u_stereo_camera_estimate_disparity(const uint8_t *gray,
                                    uint32_t max_disparity,
                                    float *out_disparity);
 
+/*!
+ * Two-dimensional version of @ref u_stereo_camera_estimate_disparity (R2):
+ * SSD block matching over horizontal disparity 0..@p max_disparity AND a
+ * vertical offset -@p max_dy..@p max_dy, sub-pixel on both axes. @p out_dy is
+ * the row offset of the match in the RIGHT eye (right y - left y): the
+ * vertical disparity a rectified pair must bring to ~0. Used by the
+ * rectifier's tests and `displayxr-cli camera probe --rectified`.
+ * @return false if the region (plus the dy search band) does not fit.
+ */
+bool
+u_stereo_camera_estimate_offset(const uint8_t *gray,
+                                uint32_t pitch,
+                                uint32_t eye_width,
+                                uint32_t height,
+                                uint32_t x0,
+                                uint32_t y0,
+                                uint32_t w,
+                                uint32_t h,
+                                uint32_t max_disparity,
+                                uint32_t max_dy,
+                                float *out_dx,
+                                float *out_dy);
+
+/*!
+ * One block's 2-D match, @ref u_stereo_camera_match_block.
+ *
+ * The edge flags are the point: a peak ON the search boundary is a clamp, not a
+ * measurement (the R2 probe reported "d = 64, |dy| = 10.000" on the Leia SR
+ * camera because both windows were too small). Callers must exclude and count
+ * flagged blocks, never average them in.
+ */
+struct u_stereo_camera_block_match
+{
+	float dx;             //!< left x - right x, px, sub-pixel
+	float dy;             //!< right y - left y, px, sub-pixel, SIGNED
+	float ncc;            //!< peak zero-mean normalised cross-correlation, -1..1
+	bool dx_at_edge;      //!< integer peak on the disparity window's bound
+	bool dy_at_edge;      //!< integer peak on the vertical window's bound
+	int32_t d_lo, d_hi;   //!< the disparity window actually searched (clipped by the image)
+	int32_t dy_lo, dy_hi; //!< the vertical window actually searched (clipped by the image)
+};
+
+/*!
+ * Zero-mean NCC block matching of the LEFT-eye block [x0, x0+w) x [y0, y0+h)
+ * against the right eye over disparity -8..@p max_disparity and vertical offset
+ * -@p max_dy..@p max_dy (both clipped to the image), with parabolic sub-pixel
+ * refinement on each axis. Coarse pass on every second pixel of the block,
+ * then a full-resolution pass around the coarse peak. NCC, unlike SSD, is
+ * blind to the gain/offset differences of two real sensors, and its peak value
+ * is a usable confidence: callers threshold it (the field reference used
+ * 0.93).
+ *
+ * @return false if the block does not fit or is flat (no texture to match).
+ */
+bool
+u_stereo_camera_match_block(const uint8_t *gray,
+                            uint32_t pitch,
+                            uint32_t eye_width,
+                            uint32_t height,
+                            uint32_t x0,
+                            uint32_t y0,
+                            uint32_t w,
+                            uint32_t h,
+                            uint32_t max_disparity,
+                            uint32_t max_dy,
+                            struct u_stereo_camera_block_match *out);
+
 #ifdef __cplusplus
 }
 #endif

@@ -39,6 +39,12 @@ struct fake_config
 	double baseline_mm;   //!< 50 mm default; 120 mm reproduces the Leia SR tracking camera's disparities
 	uint32_t format;
 	int64_t suspend_period_ns;
+	//! R2: raw, distorted, misaligned pair with known ground truth (not
+	//! NATIVELY_RECTIFIED; the service's rectifier does the work).
+	bool distort;
+	//! R2 refinement: an UNCALIBRATED extra vertical offset (px) + slope (px
+	//! per 100 px) of the right eye on the distorted pair.
+	double extra_dy_px, extra_dy_slope_100;
 };
 
 //! Completes the plug-in-owned opaque type.
@@ -46,6 +52,7 @@ struct xrt_plugin_stereo_camera
 {
 	struct fake_config cfg;
 	struct sim_stereo_camera_scene scene;
+	struct sim_stereo_camera_distorted distorted; //!< cfg.distort only
 	uint8_t *gray;
 	uint32_t gray_pitch;
 	uint8_t *converted;
@@ -103,10 +110,27 @@ fake_config(void)
 	if (sp != NULL && atol(sp) > 0) {
 		cfg.suspend_period_ns = (int64_t)atol(sp) * 1000000;
 	}
+	const char *dist = getenv("SIM_DISPLAY_FAKE_STEREO_CAMERA_DISTORT");
+	cfg.distort = dist != NULL && dist[0] != '\0' && dist[0] != '0';
+	const char *edy = getenv("SIM_DISPLAY_FAKE_STEREO_CAMERA_DY");
+	if (edy != NULL && fabs(atof(edy)) <= 20.0) {
+		cfg.extra_dy_px = atof(edy);
+	}
+	const char *eds = getenv("SIM_DISPLAY_FAKE_STEREO_CAMERA_DY_SLOPE");
+	if (eds != NULL && fabs(atof(eds)) <= 5.0) {
+		cfg.extra_dy_slope_100 = atof(eds);
+	}
 	if (cfg.enabled) {
-		U_LOG_W("sim_display: FAKE stereo camera ON — %ux%u per eye @ %.1f Hz, baseline %.1f mm, format %u%s",
+		U_LOG_W("sim_display: FAKE stereo camera ON — %ux%u per eye @ %.1f Hz, baseline %.1f mm, format %u%s%s",
 		        cfg.eye_w, cfg.eye_h, cfg.fps, cfg.baseline_mm, cfg.format,
-		        cfg.suspend_period_ns > 0 ? ", suspend square-wave" : "");
+		        cfg.suspend_period_ns > 0 ? ", suspend square-wave" : "",
+		        cfg.distort ? ", DISTORTED raw pair (rectified by the service)" : "");
+		if (cfg.distort && (cfg.extra_dy_px != 0.0 || cfg.extra_dy_slope_100 != 0.0)) {
+			U_LOG_W(
+			    "sim_display: FAKE stereo camera — UNCALIBRATED vertical misalignment of the right eye: "
+			    "%+.2f px %+.3f px/100 px (the service's refinement should remove it)",
+			    cfg.extra_dy_px, cfg.extra_dy_slope_100);
+		}
 	}
 	return &cfg;
 }
@@ -135,7 +159,10 @@ sim_display_stereo_camera_enumerate(struct xrt_plugin_instance *inst,
 		snprintf(info.display_name, sizeof(info.display_name), "Sim 3D camera (fake)");
 		snprintf(info.device_identity, sizeof(info.device_identity), "sim-display-fake-stereo-camera-0001");
 		info.flags = XRT_PLUGIN_STEREO_CAMERA_SHARED_WITH_EYE_TRACKING | XRT_PLUGIN_STEREO_CAMERA_USER_FACING |
-		             XRT_PLUGIN_STEREO_CAMERA_CALIBRATED | XRT_PLUGIN_STEREO_CAMERA_NATIVELY_RECTIFIED;
+		             XRT_PLUGIN_STEREO_CAMERA_CALIBRATED;
+		if (!cfg->distort) {
+			info.flags |= XRT_PLUGIN_STEREO_CAMERA_NATIVELY_RECTIFIED;
+		}
 		if (cfg->format == XRT_PLUGIN_STEREO_CAMERA_FORMAT_GRAY8) {
 			info.flags |= XRT_PLUGIN_STEREO_CAMERA_MONOCHROME;
 		}
@@ -166,6 +193,27 @@ sim_display_stereo_camera_get_calibration(struct xrt_plugin_instance *inst,
 	c.struct_size = (uint32_t)sizeof(c);
 	c.image_width = cfg->eye_w;
 	c.image_height = cfg->eye_h;
+	if (cfg->distort) {
+		// The raw pair's ground truth (sim_display_stereo_camera_pattern.h).
+		struct sim_stereo_camera_truth t;
+		sim_stereo_camera_truth_init(&t, cfg->eye_w, cfg->eye_h, fake_fx(cfg->eye_w), cfg->baseline_mm,
+		                             FAKE_BG_DEPTH_M, FAKE_BAR_DEPTH_M);
+		for (int e = 0; e < 2; e++) {
+			c.k[e][0] = t.fx[e];
+			c.k[e][1] = t.fy[e];
+			c.k[e][2] = t.cx[e];
+			c.k[e][3] = t.cy[e];
+			for (int k = 0; k < 5; k++) {
+				c.distortion[e][k] = t.dist[e][k];
+			}
+		}
+		c.distortion_model = XRT_PLUGIN_STEREO_CAMERA_DISTORTION_RADTAN5;
+		memcpy(c.rotation_right_from_left, t.R, sizeof(t.R));
+		memcpy(c.translation_right_from_left_mm, t.T_mm, sizeof(t.T_mm));
+		memcpy(out, &c, sz < sizeof(c) ? sz : sizeof(c));
+		out->struct_size = sz;
+		return XRT_SUCCESS;
+	}
 	double fx = fake_fx(cfg->eye_w);
 	for (int e = 0; e < 2; e++) {
 		c.k[e][0] = fx;
@@ -202,6 +250,16 @@ sim_display_stereo_camera_open(struct xrt_plugin_instance *inst,
 	cam->cfg = *cfg;
 	sim_stereo_camera_scene_init(&cam->scene, cfg->eye_w, cfg->eye_h, fake_fx(cfg->eye_w), cfg->baseline_mm,
 	                             FAKE_BG_DEPTH_M, FAKE_BAR_DEPTH_M);
+	if (cfg->distort &&
+	    !sim_stereo_camera_distorted_init(&cam->distorted, cfg->eye_w, cfg->eye_h, fake_fx(cfg->eye_w),
+	                                      cfg->baseline_mm, FAKE_BG_DEPTH_M, FAKE_BAR_DEPTH_M)) {
+		free(cam);
+		return XRT_ERROR_ALLOCATION;
+	}
+	if (cfg->distort) {
+		sim_stereo_camera_distorted_set_vmisalign(&cam->distorted, cfg->extra_dy_px,
+		                                          cfg->extra_dy_slope_100 / 100.0);
+	}
 	cam->gray_pitch = 2 * cfg->eye_w;
 	cam->gray = calloc((size_t)cam->gray_pitch * cfg->eye_h, 1);
 	if (cfg->format != XRT_PLUGIN_STEREO_CAMERA_FORMAT_GRAY8) {
@@ -211,14 +269,16 @@ sim_display_stereo_camera_open(struct xrt_plugin_instance *inst,
 	if (cam->gray == NULL || (cfg->format != XRT_PLUGIN_STEREO_CAMERA_FORMAT_GRAY8 && cam->converted == NULL)) {
 		free(cam->gray);
 		free(cam->converted);
+		sim_stereo_camera_distorted_fini(&cam->distorted);
 		free(cam);
 		return XRT_ERROR_ALLOCATION;
 	}
 	cam->period_ns = (int64_t)(1e9 / cfg->fps);
 	cam->t0_ns = os_monotonic_get_ns();
 	cam->open_ns = cam->t0_ns;
-	U_LOG_W("sim_display: FAKE stereo camera opened (bg disparity %u px, bar disparity %u px)",
-	        cam->scene.bg_disparity, cam->scene.bar_disparity);
+	U_LOG_W("sim_display: FAKE stereo camera opened (%s; bg disparity %.2f px, bar disparity %.2f px in the %s)",
+	        cfg->distort ? "DISTORTED raw pair" : "parallel pair", cam->scene.bg_disparity_f,
+	        cam->scene.bar_disparity_f, cfg->distort ? "virtual parallel frame" : "frame");
 	*out_cam = cam;
 	return XRT_SUCCESS;
 }
@@ -260,7 +320,11 @@ sim_display_stereo_camera_wait_frame(struct xrt_plugin_stereo_camera *cam,
 	sleep_ns(due - now);
 
 	cam->seq++;
-	sim_stereo_camera_render_gray(&cam->scene, cam->seq, cam->gray, cam->gray_pitch);
+	if (cam->cfg.distort) {
+		sim_stereo_camera_render_gray_distorted(&cam->distorted, cam->seq, cam->gray, cam->gray_pitch);
+	} else {
+		sim_stereo_camera_render_gray(&cam->scene, cam->seq, cam->gray, cam->gray_pitch);
+	}
 
 	memset(out, 0, sizeof(*out));
 	out->sequence = cam->seq;
@@ -300,5 +364,6 @@ sim_display_stereo_camera_close(struct xrt_plugin_stereo_camera *cam)
 	U_LOG_W("sim_display: FAKE stereo camera closed after %llu frames", (unsigned long long)cam->seq);
 	free(cam->gray);
 	free(cam->converted);
+	sim_stereo_camera_distorted_fini(&cam->distorted);
 	free(cam);
 }

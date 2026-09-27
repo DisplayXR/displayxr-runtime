@@ -25,6 +25,37 @@
  *  - the in-use indicator (tray badge naming consumers) is R3; R1 logs one
  *    WARN per stream start/stop naming the peer executable.
  *
+ * Rectification (R2) — when the plug-in reports CALIBRATED but not
+ * NATIVELY_RECTIFIED, the manager builds a per-camera rectifier at create time
+ * from the plug-in's RAW calibration (u_stereo_rectify: Bouguet, zero
+ * disparity at infinity, alpha = 0 crop, no convergence shear). It runs ONCE
+ * per source frame, on the camera thread, with the manager lock RELEASED, and
+ * only while at least one started stream wants RECTIFIED; every RECTIFIED
+ * stream then converts from the rectified image, RAW streams from the
+ * original. The seam is `struct scam_rectifier`: the geometry and the float
+ * maps are backend-neutral; `apply` is the backend. CPU today (fixed-point
+ * bilinear LUT: ~0.9 ms GRAY8 / ~1.4 ms NV12 per 1280x480 frame on an M1 Pro,
+ * -O2). A GPU backend uploads u_stereo_rectify_build_map() as an RG32F texture
+ * and remaps straight into the GPU transports' slots below. Rectified
+ * calibration (common f / principal point, rightFromLeft = pure +x baseline)
+ * comes from the same geometry, so frames and numbers cannot disagree.
+ *
+ * Online vertical-alignment refinement (R2) — a device's stored calibration
+ * can be slightly off for its frames (a Leia SR laptop: +1.7 px of row
+ * residual that OpenCV's own stereoRectify reproduces on the same frame). A
+ * per-camera WORKER thread measures the residual dy(y) = a + b (y - cy) on
+ * rectified frames the camera thread hands it (a copy of the luma, only when
+ * u_stereo_vrefine_due(): every 250 ms for 5 s after an open or an update,
+ * then one 3-frame window every 30 s; ~2.7 ms per measurement at -O2, i.e.
+ * < 0.4 ms per frame amortised at 30 Hz). When the fitted correction moves by
+ * more than 0.2 px it rebuilds the geometry + LUTs with the correction folded
+ * in (u_stereo_rectify_input::v_offset / v_slope; ~8 ms, on the worker) and
+ * parks them; the camera thread swaps them in between two frames under the
+ * lock and bumps calibration_generation, so the rectified calibration a
+ * consumer re-reads describes exactly the frames it gets. Clamped (|a| <= 6
+ * px, |b| <= 2 px / 100 px), gated (>= 50 matches over >= 3 frames),
+ * re-verified on every re-open, and DXR_STEREO_CAMERA_REFINE=0 turns it off.
+ *
  * Transports — R1 implements SHARED_MEMORY only. The GPU transports are
  * designed to reuse this ring's state machine unchanged, only the slot storage
  * differs:
@@ -61,9 +92,12 @@
 #include "util/u_logging.h"
 #include "util/u_misc.h"
 #include "util/u_stereo_camera.h"
+#include "util/u_stereo_rectify.h"
+#include "util/u_stereo_vrefine.h"
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifdef XRT_OS_WINDOWS
@@ -76,6 +110,7 @@
 
 DEBUG_GET_ONCE_BOOL_OPTION(stereo_camera_enabled, "DXR_STEREO_CAMERA", true)
 DEBUG_GET_ONCE_BOOL_OPTION(stereo_camera_dev_allow, "DXR_STEREO_CAMERA_DEV_ALLOW", false)
+DEBUG_GET_ONCE_BOOL_OPTION(stereo_camera_refine, "DXR_STEREO_CAMERA_REFINE", true)
 
 #define MAX_STREAMS (XRT_STEREO_CAMERA_MAX_CAMERAS * XRT_STEREO_CAMERA_MAX_STREAMS_PER_CAMERA)
 #define LINGER_NS (2000ll * 1000 * 1000)
@@ -83,6 +118,7 @@ DEBUG_GET_ONCE_BOOL_OPTION(stereo_camera_dev_allow, "DXR_STEREO_CAMERA_DEV_ALLOW
 #define SUSPEND_AFTER_NS (1000ll * 1000 * 1000)
 #define REOPEN_BACKOFF_NS (1000ll * 1000 * 1000)
 #define STATS_LOG_NS (5000ll * 1000 * 1000)
+#define REFINE_SAMPLES 512 //!< matches one measurement may return
 
 
 /*
@@ -201,6 +237,57 @@ struct scam_stream
 	uint64_t latency_count;
 };
 
+/*!
+ * The rectifier seam (R2). Geometry + maps are backend-neutral; @ref apply is
+ * the backend. Owned by one camera, used only on its camera thread.
+ */
+struct scam_rectifier
+{
+	struct u_stereo_rectify_result geo;
+	//! [0] full resolution (GRAY8, NV12 Y, BGRA8), [1] NV12 UV (half-res, 2 ch).
+	struct u_stereo_rectify_lut lut[2];
+	//! Rectified output in the SOURCE frame's format (tight layout).
+	uint8_t *buf;
+	uint64_t buf_size;
+	uint32_t buf_format;
+	struct u_stereo_camera_planes buf_layout;
+	//! Backend: rectify @p in into @p out (planes point into buf). CPU LUT today.
+	bool (*apply)(struct scam_rectifier *r,
+	              const struct xrt_plugin_stereo_camera_frame *in,
+	              struct xrt_plugin_stereo_camera_frame *out);
+	// stats
+	uint64_t ns_sum;
+	uint64_t count;
+
+	/*
+	 * Online vertical-alignment refinement. Everything below is guarded by the
+	 * manager lock except where noted; the worker never touches geo / lut.
+	 */
+	bool refine;                      //!< enabled (DXR_STEREO_CAMERA_REFINE)
+	struct u_stereo_rectify_input in; //!< the RAW calibration, rebuilt with a correction
+	struct u_stereo_vrefine ref;      //!< the controller
+	struct u_stereo_vrefine_measure_params mp;
+	struct ipc_server_stereo_camera *mgr;
+	uint64_t camera_id;
+	//! Luma of one rectified SBS frame. Written by the camera thread while
+	//! !job_pending, read by the worker while job_pending.
+	uint8_t *job_gray;
+	bool job_pending;
+	int64_t job_ns;
+	struct u_stereo_vrefine_sample *samples; //!< worker-only
+	//! A rebuilt geometry + LUTs the camera thread swaps in before its next frame.
+	bool pending_ready;
+	struct u_stereo_rectify_result pending_geo;
+	struct u_stereo_rectify_lut pending_lut[2];
+	bool quit;
+	bool worker_started;
+	struct os_thread worker;
+	struct os_cond worker_cond;
+	uint64_t measure_ns_sum;
+	uint32_t measure_count;
+	bool stable_logged;
+};
+
 struct scam_camera
 {
 	uint32_t index; //!< plug-in index
@@ -210,6 +297,9 @@ struct scam_camera
 	struct xrt_plugin_stereo_camera_calibration calib;
 	uint32_t state;
 	uint32_t calibration_generation;
+	//! R2: set when CALIBRATED and not NATIVELY_RECTIFIED and the geometry is
+	//! sane; NULL = no service-side rectification (RAW-flagged fallback).
+	struct scam_rectifier *rect;
 
 	struct xrt_plugin_stereo_camera *src; //!< owned by the camera thread
 	uint32_t started_count;
@@ -363,9 +453,9 @@ output_allowed(volatile struct ipc_client_state *ics, uint32_t output)
 static bool
 camera_can_rectify(const struct scam_camera *cam)
 {
-	// R1 has no rectifier (u_stereo_rectify is R2): only a natively rectified
-	// source yields RECTIFIED frames; a CALIBRATED one is delivered RAW-flagged.
-	return (cam->info.flags & XRT_PLUGIN_STEREO_CAMERA_NATIVELY_RECTIFIED) != 0;
+	// A natively rectified source, or a calibrated one the service rectifies
+	// (R2). A calibrated camera whose geometry was rejected stays RAW-only.
+	return (cam->info.flags & XRT_PLUGIN_STEREO_CAMERA_NATIVELY_RECTIFIED) != 0 || cam->rect != NULL;
 }
 
 static void
@@ -432,6 +522,384 @@ baseline_mm(const struct xrt_plugin_stereo_camera_calibration *c)
 {
 	const double *t = c->translation_right_from_left_mm;
 	return sqrt(t[0] * t[0] + t[1] * t[1] + t[2] * t[2]);
+}
+
+
+/*
+ *
+ * Rectifier (R2).
+ *
+ */
+
+//! CPU backend: LUT remap per plane into the rectifier's buffer.
+static bool
+rectify_apply_cpu(struct scam_rectifier *r,
+                  const struct xrt_plugin_stereo_camera_frame *in,
+                  struct xrt_plugin_stereo_camera_frame *out)
+{
+	if (in->width != 2 * r->geo.width || in->height != r->geo.height || in->planes[0] == NULL) {
+		return false;
+	}
+	if (r->buf == NULL || r->buf_format != in->format) {
+		struct u_stereo_camera_planes lay;
+		if (!u_stereo_camera_layout(in->format, in->width, in->height, &lay)) {
+			return false;
+		}
+		if (lay.size > r->buf_size) {
+			uint8_t *nb = realloc(r->buf, (size_t)lay.size);
+			if (nb == NULL) {
+				return false;
+			}
+			r->buf = nb;
+			r->buf_size = lay.size;
+		}
+		r->buf_layout = lay;
+		r->buf_format = in->format;
+	}
+	int64_t t0 = os_monotonic_get_ns();
+	const struct u_stereo_camera_planes *lay = &r->buf_layout;
+	switch (in->format) {
+	case XRT_PLUGIN_STEREO_CAMERA_FORMAT_GRAY8:
+		u_stereo_rectify_lut_apply(&r->lut[0], 1, in->planes[0], in->pitches[0], r->buf + lay->offset[0],
+		                           lay->pitch[0]);
+		break;
+	case XRT_PLUGIN_STEREO_CAMERA_FORMAT_NV12:
+		if (in->planes[1] == NULL) {
+			return false;
+		}
+		u_stereo_rectify_lut_apply(&r->lut[0], 1, in->planes[0], in->pitches[0], r->buf + lay->offset[0],
+		                           lay->pitch[0]);
+		u_stereo_rectify_lut_apply(&r->lut[1], 2, in->planes[1], in->pitches[1], r->buf + lay->offset[1],
+		                           lay->pitch[1]);
+		break;
+	case XRT_PLUGIN_STEREO_CAMERA_FORMAT_BGRA8:
+		u_stereo_rectify_lut_apply(&r->lut[0], 4, in->planes[0], in->pitches[0], r->buf + lay->offset[0],
+		                           lay->pitch[0]);
+		break;
+	default: return false;
+	}
+	r->ns_sum += (uint64_t)(os_monotonic_get_ns() - t0);
+	r->count++;
+	*out = *in;
+	out->planes[0] = r->buf + lay->offset[0];
+	out->pitches[0] = lay->pitch[0];
+	out->planes[1] = lay->plane_count > 1 ? r->buf + lay->offset[1] : NULL;
+	out->pitches[1] = lay->plane_count > 1 ? lay->pitch[1] : 0;
+	return true;
+}
+
+static void
+rectifier_destroy(struct scam_rectifier **rp)
+{
+	struct scam_rectifier *r = *rp;
+	if (r == NULL) {
+		return;
+	}
+	u_stereo_rectify_lut_fini(&r->lut[0]);
+	u_stereo_rectify_lut_fini(&r->lut[1]);
+	if (r->pending_ready) {
+		u_stereo_rectify_lut_fini(&r->pending_lut[0]);
+		u_stereo_rectify_lut_fini(&r->pending_lut[1]);
+	}
+	if (r->refine) {
+		os_cond_destroy(&r->worker_cond);
+	}
+	free(r->job_gray);
+	free(r->samples);
+	free(r->buf);
+	free(r);
+	*rp = NULL;
+}
+
+//! Stop and join the refinement worker (manager lock NOT held).
+static void
+rectifier_stop_worker(struct ipc_server_stereo_camera *m, struct scam_rectifier *r)
+{
+	if (r == NULL || !r->worker_started) {
+		return;
+	}
+	os_mutex_lock(&m->lock);
+	r->quit = true;
+	os_cond_signal(&r->worker_cond);
+	os_mutex_unlock(&m->lock);
+	os_thread_join(&r->worker);
+	os_thread_destroy(&r->worker);
+	r->worker_started = false;
+}
+
+/*!
+ * Build the rectifier from the plug-in's RAW calibration: per-eye K +
+ * distortion at image_width x image_height (rescaled to the frame's eye size
+ * when they differ), OpenCV extrinsics x_R = R x_L + T.
+ */
+static struct scam_rectifier *
+rectifier_create(const struct scam_camera *cam)
+{
+	const struct xrt_plugin_stereo_camera_calibration *c = &cam->calib;
+	struct u_stereo_rectify_input in;
+	memset(&in, 0, sizeof(in));
+	in.width = cam->info.eye_width;
+	in.height = cam->info.eye_height;
+	in.calib_width = c->image_width;
+	in.calib_height = c->image_height;
+	for (int e = 0; e < 2; e++) {
+		in.eye[e].fx = c->k[e][0];
+		in.eye[e].fy = c->k[e][1];
+		in.eye[e].cx = c->k[e][2];
+		in.eye[e].cy = c->k[e][3];
+		in.eye[e].model = c->distortion_model;
+		for (int k = 0; k < 8; k++) {
+			in.eye[e].d[k] = c->distortion[e][k];
+		}
+	}
+	memcpy(in.R, c->rotation_right_from_left, sizeof(in.R));
+	memcpy(in.T, c->translation_right_from_left_mm, sizeof(in.T));
+
+	int64_t t0 = os_monotonic_get_ns();
+	struct scam_rectifier *r = U_TYPED_CALLOC(struct scam_rectifier);
+	if (!u_stereo_rectify_compute(&in, &r->geo)) {
+		U_LOG_W(
+		    "stereo camera %llu: calibration rejected by the rectifier (degenerate or vertical pair) — "
+		    "RAW only",
+		    (unsigned long long)cam->camera_id);
+		free(r);
+		return NULL;
+	}
+	if (!u_stereo_rectify_lut_init(&r->lut[0], &r->geo, 1) || !u_stereo_rectify_lut_init(&r->lut[1], &r->geo, 2)) {
+		U_LOG_W("stereo camera %llu: rectifier LUT allocation failed — RAW only",
+		        (unsigned long long)cam->camera_id);
+		rectifier_destroy(&r);
+		return NULL;
+	}
+	r->apply = rectify_apply_cpu;
+	r->in = in;
+	r->mgr = cam->mgr;
+	r->camera_id = cam->camera_id;
+	r->refine = debug_get_bool_option_stereo_camera_refine();
+	if (r->refine) {
+		r->job_gray = malloc((size_t)2 * in.width * in.height);
+		r->samples = U_TYPED_ARRAY_CALLOC(struct u_stereo_vrefine_sample, REFINE_SAMPLES);
+		if (r->job_gray == NULL || r->samples == NULL) {
+			free(r->job_gray);
+			free(r->samples);
+			r->job_gray = NULL;
+			r->samples = NULL;
+			r->refine = false;
+		}
+	}
+	if (r->refine) {
+		os_cond_init(&r->worker_cond);
+		struct u_stereo_vrefine_config cfg;
+		u_stereo_vrefine_config_defaults(&cfg, in.height, r->geo.cy);
+		u_stereo_vrefine_init(&r->ref, &cfg);
+		// The disparity window: a subject at 0.3 m (the probe uses 0.4 m).
+		double dmax = r->geo.f * r->geo.baseline / 300.0;
+		dmax = dmax < 24.0 ? 24.0 : dmax > in.width / 2.0 ? in.width / 2.0 : dmax;
+		u_stereo_vrefine_measure_defaults(&r->mp, (uint32_t)dmax);
+	} else {
+		U_LOG_W("stereo camera %llu: vertical-alignment refinement OFF (DXR_STEREO_CAMERA_REFINE=0)",
+		        (unsigned long long)cam->camera_id);
+	}
+	if (r->geo.t_rect[0] > 0.0) {
+		// Contract: SBS left half = the camera's LEFT lens, T.x < 0 (xrt_plugin.h).
+		U_LOG_W(
+		    "stereo camera %llu: calibration puts the right camera at -x (T.x > 0) — the plug-in's SBS halves "
+		    "look swapped; rectified disparities will be NEGATIVE",
+		    (unsigned long long)cam->camera_id);
+	}
+	U_LOG_W(
+	    "stereo camera %llu: rectifier ready (CPU) — f %.2f px, principal point (%.2f, %.2f), baseline %.2f mm, "
+	    "valid-region zoom x%.4f, %u/%u valid taps, built in %.1f ms",
+	    (unsigned long long)cam->camera_id, r->geo.f, r->geo.cx, r->geo.cy, r->geo.baseline, r->geo.crop_scale,
+	    r->lut[0].valid, r->lut[0].width * r->lut[0].height, (double)(os_monotonic_get_ns() - t0) * 1e-6);
+	return r;
+}
+
+/*!
+ * The refinement worker: measures the frame the camera thread parked, feeds
+ * the controller and, when the correction moved, rebuilds geometry + LUTs off
+ * the frame path and parks them for the camera thread to swap in.
+ */
+static void *
+refine_worker(void *ptr)
+{
+	struct scam_rectifier *r = (struct scam_rectifier *)ptr;
+	struct ipc_server_stereo_camera *m = r->mgr;
+	const uint32_t w = r->in.width, h = r->in.height;
+
+	os_mutex_lock(&m->lock);
+	while (!r->quit && !m->shutting_down) {
+		if (!r->job_pending) {
+			os_cond_wait(&r->worker_cond, &m->lock);
+			continue;
+		}
+		const int64_t t_job = r->job_ns;
+		const struct u_stereo_vrefine_measure_params mp = r->mp;
+		os_mutex_unlock(&m->lock);
+
+		int64_t t0 = os_monotonic_get_ns();
+		uint32_t n = u_stereo_vrefine_measure(r->job_gray, 2 * w, w, h, &mp, r->samples, REFINE_SAMPLES);
+		int64_t t1 = os_monotonic_get_ns();
+
+		os_mutex_lock(&m->lock);
+		r->measure_ns_sum += (uint64_t)(t1 - t0);
+		r->measure_count++;
+		enum u_stereo_vrefine_result res = u_stereo_vrefine_push(&r->ref, t_job, r->samples, n);
+		if (res != U_STEREO_VREFINE_UPDATED) {
+			// One INFO when a correction is confirmed, then one per slow-cadence
+			// window (every 30 s) — never one per settling window.
+			bool settling = t_job - r->ref.phase_start_ns < r->ref.cfg.fast_phase_ns;
+			if (res == U_STEREO_VREFINE_STABLE && (!r->stable_logged || !settling)) {
+				r->stable_logged = true;
+				U_LOG_I(
+				    "stereo camera %llu: row alignment check — residual %+.2f px over %u matches, "
+				    "correction a %+.2f px b %+.3f px/100 px unchanged",
+				    (unsigned long long)r->camera_id, r->ref.last_residual_dy, r->ref.last_matches,
+				    r->ref.a, r->ref.b * 100.0);
+			}
+			r->job_pending = false;
+			continue;
+		}
+		r->stable_logged = false;
+		const double a = r->ref.a, b = r->ref.b, residual = r->ref.last_residual_dy;
+		const uint32_t matches = r->ref.last_matches, updates = r->ref.updates;
+		struct u_stereo_rectify_input in = r->in;
+		in.v_offset = a / r->geo.f; // a is in pixels of the frames currently delivered
+		in.v_slope = b;
+		os_mutex_unlock(&m->lock);
+
+		int64_t b0 = os_monotonic_get_ns();
+		struct u_stereo_rectify_result g;
+		struct u_stereo_rectify_lut lut[2];
+		memset(lut, 0, sizeof(lut));
+		bool ok = u_stereo_rectify_compute(&in, &g) && u_stereo_rectify_lut_init(&lut[0], &g, 1) &&
+		          u_stereo_rectify_lut_init(&lut[1], &g, 2);
+		double build_ms = (double)(os_monotonic_get_ns() - b0) * 1e-6;
+
+		os_mutex_lock(&m->lock);
+		if (!ok) {
+			u_stereo_rectify_lut_fini(&lut[0]);
+			u_stereo_rectify_lut_fini(&lut[1]);
+			u_stereo_vrefine_revert(&r->ref);
+			U_LOG_W(
+			    "stereo camera %llu: vertical correction a %+.2f px b %+.3f px/100 px rejected by the "
+			    "rectifier — kept the previous maps",
+			    (unsigned long long)r->camera_id, a, b * 100.0);
+		} else {
+			if (r->pending_ready) {
+				u_stereo_rectify_lut_fini(&r->pending_lut[0]);
+				u_stereo_rectify_lut_fini(&r->pending_lut[1]);
+			}
+			r->pending_geo = g;
+			r->pending_lut[0] = lut[0];
+			r->pending_lut[1] = lut[1];
+			r->pending_ready = true;
+			if (updates == 1) {
+				U_LOG_W(
+				    "stereo camera %llu: vertical-alignment refinement APPLIED — the calibration left "
+				    "the rows %+.2f px off (fit %+.2f px %+.3f px/100 px about the centre row, %u "
+				    "matches); correction a %+.2f px, b %+.3f px/100 px, maps rebuilt in %.1f ms",
+				    (unsigned long long)r->camera_id, r->ref.initial_dy, r->ref.initial_a,
+				    r->ref.initial_b * 100.0, matches, a, b * 100.0, build_ms);
+			} else {
+				U_LOG_I(
+				    "stereo camera %llu: vertical correction updated — residual %+.2f px over %u "
+				    "matches; now a %+.2f px, b %+.3f px/100 px (update %u, %.1f ms)",
+				    (unsigned long long)r->camera_id, residual, matches, a, b * 100.0, updates,
+				    build_ms);
+			}
+		}
+		r->job_pending = false;
+	}
+	os_mutex_unlock(&m->lock);
+	return NULL;
+}
+
+/*!
+ * Camera thread, lock held, before rectifying a frame: swap in maps the worker
+ * rebuilt. The old LUTs are only ever read by this thread, so they can go now.
+ */
+static void
+rectifier_swap_pending_locked(struct scam_camera *cam)
+{
+	struct scam_rectifier *r = cam->rect;
+	if (r == NULL || !r->pending_ready) {
+		return;
+	}
+	u_stereo_rectify_lut_fini(&r->lut[0]);
+	u_stereo_rectify_lut_fini(&r->lut[1]);
+	r->geo = r->pending_geo;
+	r->lut[0] = r->pending_lut[0];
+	r->lut[1] = r->pending_lut[1];
+	r->pending_ready = false;
+	// Consumers re-read the rectified calibration (f / principal point move
+	// by the alpha = 0 re-crop) on the next frame's generation change.
+	cam->calibration_generation++;
+}
+
+/*!
+ * Camera thread, lock held: should this rectified frame be measured? Starts
+ * the worker on first use.
+ */
+static bool
+rectifier_want_sample_locked(struct scam_rectifier *r, int64_t now)
+{
+	if (r == NULL || !r->refine || r->job_pending || r->pending_ready || r->quit) {
+		return false;
+	}
+	if (!u_stereo_vrefine_due(&r->ref, now)) {
+		return false;
+	}
+	if (!r->worker_started) {
+		if (os_thread_init(&r->worker) != 0 || os_thread_start(&r->worker, refine_worker, r) != 0) {
+			U_LOG_W("stereo camera %llu: refinement worker failed to start — refinement OFF",
+			        (unsigned long long)r->camera_id);
+			r->refine = false;
+			return false;
+		}
+		r->worker_started = true;
+	}
+	return true;
+}
+
+//! Camera thread, lock NOT held: copy the luma of rectified frame @p rf.
+static bool
+rectifier_copy_luma(struct scam_rectifier *r, const struct xrt_plugin_stereo_camera_frame *rf)
+{
+	const uint32_t W = 2 * r->in.width, H = r->in.height;
+	if (rf->width != W || rf->height != H || rf->planes[0] == NULL) {
+		return false;
+	}
+	for (uint32_t y = 0; y < H; y++) {
+		const uint8_t *src = rf->planes[0] + (size_t)y * rf->pitches[0];
+		uint8_t *dst = r->job_gray + (size_t)y * W;
+		if (rf->format == XRT_PLUGIN_STEREO_CAMERA_FORMAT_BGRA8) {
+			for (uint32_t x = 0; x < W; x++) {
+				const uint8_t *p = src + 4 * (size_t)x;
+				dst[x] = (uint8_t)((p[0] + 2 * p[1] + p[2] + 2) >> 2); // B + 2G + R: luma enough
+			}
+		} else {
+			memcpy(dst, src, W); // GRAY8, or NV12's Y plane
+		}
+	}
+	return true;
+}
+
+//! Does any started stream on @p cam want the service's rectified image?
+static bool
+camera_wants_rectified_locked(struct ipc_server_stereo_camera *m, const struct scam_camera *cam)
+{
+	if (cam->rect == NULL) {
+		return false;
+	}
+	for (uint32_t i = 0; i < MAX_STREAMS; i++) {
+		const struct scam_stream *s = &m->streams[i];
+		if (s->used && s->started && s->camera == cam->index &&
+		    s->output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED) {
+			return true;
+		}
+	}
+	return false;
 }
 
 
@@ -511,10 +979,15 @@ source_rate_hz(const struct scam_camera *cam)
  *
  */
 
+/*!
+ * Fan one source frame out. @p rf is the service-rectified image of @p f (NULL
+ * when the camera has no rectifier or nobody wanted it this frame).
+ */
 static void
 publish_locked(struct ipc_server_stereo_camera *m,
                struct scam_camera *cam,
                const struct xrt_plugin_stereo_camera_frame *f,
+               const struct xrt_plugin_stereo_camera_frame *rf,
                int64_t now)
 {
 	if (cam->last_frame_ns > 0) {
@@ -560,6 +1033,17 @@ publish_locked(struct ipc_server_stereo_camera *m,
 			u_stereo_camera_ring_clear(&s->ring);
 			continue;
 		}
+		// A RECTIFIED stream on a service-rectified camera takes the rectified
+		// image; if it was not produced this frame (the stream started while the
+		// camera thread was rectifying without it), skip — never RAW pixels
+		// labelled RECTIFIED.
+		const struct xrt_plugin_stereo_camera_frame *src = f;
+		if (s->output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED && cam->rect != NULL) {
+			if (rf == NULL) {
+				continue;
+			}
+			src = rf;
+		}
 		if (!u_stereo_camera_decimator_accept(&s->dec, f->time_ns)) {
 			continue;
 		}
@@ -568,8 +1052,8 @@ publish_locked(struct ipc_server_stereo_camera *m,
 			continue;
 		}
 		uint8_t *dst = s->map + (uint64_t)slot * s->slot_stride;
-		if (!u_stereo_camera_convert(f->format, f->planes, f->pitches, s->req.format, dst, &s->layout, f->width,
-		                             f->height)) {
+		if (!u_stereo_camera_convert(src->format, src->planes, src->pitches, s->req.format, dst, &s->layout,
+		                             src->width, src->height)) {
 			u_stereo_camera_ring_abort_write(&s->ring);
 			continue;
 		}
@@ -605,8 +1089,12 @@ publish_locked(struct ipc_server_stereo_camera *m,
 
 	if (now - cam->last_stats_log_ns >= STATS_LOG_NS) {
 		cam->last_stats_log_ns = now;
-		U_LOG_I("stereo camera %llu: source %.1f Hz, %u started stream(s)", (unsigned long long)cam->camera_id,
-		        cam->source_rate, cam->started_count);
+		double rect_ms = (cam->rect != NULL && cam->rect->count > 0)
+		                     ? (double)cam->rect->ns_sum / (double)cam->rect->count * 1e-6
+		                     : 0.0;
+		U_LOG_I("stereo camera %llu: source %.1f Hz, %u started stream(s), rectify %.3f ms/frame (%llu frames)",
+		        (unsigned long long)cam->camera_id, cam->source_rate, cam->started_count, rect_ms,
+		        (unsigned long long)(cam->rect != NULL ? cam->rect->count : 0));
 	}
 }
 
@@ -668,6 +1156,10 @@ camera_thread(void *ptr)
 			cam->src = src;
 			cam->last_frame_ns = 0;
 			u_stereo_camera_rate_meter_restart(&cam->rate_meter);
+			if (cam->rect != NULL && cam->rect->refine) {
+				// Keep the correction, re-verify it at the settling cadence.
+				u_stereo_vrefine_restart(&cam->rect->ref, os_monotonic_get_ns());
+			}
 			U_LOG_W("stereo camera %llu: source opened", (unsigned long long)cam->camera_id);
 			set_state_locked(cam, XRT_STEREO_CAMERA_STATE_WAITING);
 		}
@@ -681,10 +1173,31 @@ camera_thread(void *ptr)
 		now = os_monotonic_get_ns();
 
 		switch (w) {
-		case XRT_PLUGIN_STEREO_CAMERA_WAIT_OK:
-			publish_locked(m, cam, &f, now);
+		case XRT_PLUGIN_STEREO_CAMERA_WAIT_OK: {
+			// R2: rectify once per source frame, outside the lock (only this
+			// thread touches cam->rect after create), only if someone wants it.
+			struct xrt_plugin_stereo_camera_frame rf;
+			const struct xrt_plugin_stereo_camera_frame *rfp = NULL;
+			if (camera_wants_rectified_locked(m, cam)) {
+				struct scam_rectifier *rect = cam->rect;
+				rectifier_swap_pending_locked(cam);
+				bool sample = rectifier_want_sample_locked(rect, now);
+				os_mutex_unlock(&m->lock);
+				bool ok = rect->apply(rect, &f, &rf);
+				bool copied = ok && sample && rectifier_copy_luma(rect, &rf);
+				os_mutex_lock(&m->lock);
+				if (copied) {
+					rect->job_ns = f.time_ns > 0 ? f.time_ns : now;
+					rect->job_pending = true;
+					os_cond_signal(&rect->worker_cond);
+				}
+				now = os_monotonic_get_ns();
+				rfp = ok ? &rf : NULL;
+			}
+			publish_locked(m, cam, &f, rfp, now);
 			iface->stereo_camera_release_frame(src);
 			break;
+		}
 		case XRT_PLUGIN_STEREO_CAMERA_WAIT_TIMEOUT:
 			if (cam->last_frame_ns == 0) {
 				set_state_locked(cam, XRT_STEREO_CAMERA_STATE_WAITING);
@@ -790,6 +1303,9 @@ ipc_server_stereo_camera_create(struct xrt_instance *xinst)
 				cam->info.flags &= ~XRT_PLUGIN_STEREO_CAMERA_CALIBRATED;
 			}
 		}
+		if (cam->have_calib && (cam->info.flags & XRT_PLUGIN_STEREO_CAMERA_NATIVELY_RECTIFIED) == 0) {
+			cam->rect = rectifier_create(cam);
+		}
 		if (!(info->max_frame_rate >= 0.0f && info->max_frame_rate <= 1000.0f)) {
 			cam->info.max_frame_rate = 0.0f; // NaN / negative / absurd = unknown
 		}
@@ -828,6 +1344,8 @@ ipc_server_stereo_camera_destroy(struct ipc_server_stereo_camera **mgr_ptr)
 			os_thread_destroy(&m->cams[i].thread);
 		}
 		os_cond_destroy(&m->cams[i].cond);
+		rectifier_stop_worker(m, m->cams[i].rect);
+		rectifier_destroy(&m->cams[i].rect);
 	}
 	for (uint32_t i = 0; i < MAX_STREAMS; i++) {
 		if (m->streams[i].used) {
@@ -944,7 +1462,9 @@ ipc_handle_stereo_camera_get_properties(volatile struct ipc_client_state *ics,
 	out_props->max_frame_rate = source_rate_hz(cam);
 	if (cam->have_calib) {
 		out_props->baseline_mm = (float)baseline_mm(&cam->calib);
-		double fx = cam->calib.k[0][0];
+		// Spec §3: per eye, RECTIFIED (the service's rectified focal when it
+		// rectifies; the plug-in's own for a natively rectified source).
+		double fx = cam->rect != NULL ? cam->rect->geo.f : cam->calib.k[0][0];
 		if (fx > 0.0) {
 			out_props->horizontal_fov_deg =
 			    (float)(2.0 * atan(cam->info.eye_width / (2.0 * fx)) * 180.0 / 3.14159265358979323846);
@@ -988,11 +1508,37 @@ ipc_handle_stereo_camera_get_calibration(volatile struct ipc_client_state *ics,
 		xret = XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
 	if (xret == XRT_SUCCESS && output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED && !camera_can_rectify(cam)) {
-		xret = XRT_ERROR_FEATURE_NOT_SUPPORTED; // R2 computes post-rectification numbers
+		xret = XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
 	if (xret != XRT_SUCCESS) {
 		os_mutex_unlock(&m->lock);
 		return xret;
+	}
+	if (output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED && cam->rect != NULL) {
+		// R2: the numbers of the frames the service rectifies — one pinhole for
+		// both eyes (fx = fy = f, one principal point: zero disparity at
+		// infinity), no distortion, and the right camera a pure +x translation
+		// of the baseline (OpenCV P1/P2 with P2[0][3] = f * Tx, Tx = -baseline).
+		const struct u_stereo_rectify_result *g = &cam->rect->geo;
+		out_calib->output = output;
+		for (int e = 0; e < 2; e++) {
+			struct xrt_stereo_camera_intrinsics *in = &out_calib->eye[e];
+			in->width = g->width;
+			in->height = g->height;
+			in->fx = (float)g->f;
+			in->fy = (float)g->f;
+			in->cx = (float)g->cx;
+			in->cy = (float)g->cy;
+			in->model = XRT_PLUGIN_STEREO_CAMERA_DISTORTION_NONE;
+		}
+		out_calib->orientation[3] = 1.0f; // identity
+		// Right camera centre in the rectified left frame = -t_rect (mm -> m).
+		for (int i = 0; i < 3; i++) {
+			out_calib->position[i] = (float)(-g->t_rect[i] / 1000.0);
+		}
+		out_calib->baseline_mm = (float)g->baseline;
+		os_mutex_unlock(&m->lock);
+		return XRT_SUCCESS;
 	}
 	const struct xrt_plugin_stereo_camera_calibration *c = &cam->calib;
 	out_calib->output = output;
@@ -1074,6 +1620,17 @@ ipc_handle_stereo_camera_stream_create(volatile struct ipc_client_state *ics,
 		os_mutex_unlock(&m->lock);
 		return XRT_ERROR_INPUT_UNSUPPORTED;
 	}
+	// Raw frames never reach web pages: the browser gets truly rectified
+	// frames or nothing, never the RAW-flagged fallback.
+	if (req->output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED && !camera_can_rectify(cam) &&
+	    !output_allowed(ics, XRT_STEREO_CAMERA_OUTPUT_RAW)) {
+		os_mutex_unlock(&m->lock);
+		U_LOG_W(
+		    "stereo_camera_stream_create: camera %llu cannot be rectified; refused for pid %ld "
+		    "(PRESENT_OWNER: rectified only)",
+		    (unsigned long long)cam->camera_id, ics->peer_pid);
+		return XRT_ERROR_INPUT_UNSUPPORTED;
+	}
 	uint32_t per_camera = 0;
 	struct scam_stream *slot = NULL;
 	for (uint32_t i = 0; i < MAX_STREAMS; i++) {
@@ -1099,8 +1656,9 @@ ipc_handle_stereo_camera_stream_create(volatile struct ipc_client_state *ics,
 	slot->ics = ics;
 	slot->camera = cam->index;
 	slot->req = *req;
-	// R1: RECTIFIED only from a natively rectified source; a calibrated one is
-	// delivered RAW and FLAGGED (frame.output) until u_stereo_rectify lands (R2).
+	// RECTIFIED from a natively rectified source or the service's rectifier
+	// (R2); a calibrated camera whose geometry the rectifier rejected is
+	// delivered RAW and FLAGGED (frame.output) — to native clients only.
 	slot->output = (req->output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED && camera_can_rectify(cam))
 	                   ? XRT_STEREO_CAMERA_OUTPUT_RECTIFIED
 	                   : XRT_STEREO_CAMERA_OUTPUT_RAW;
@@ -1337,6 +1895,23 @@ ipc_handle_stereo_camera_stream_stats(volatile struct ipc_client_state *ics,
 	out_stats->frames_skipped = s->ring.skipped;
 	out_stats->frames_acquired = s->ring.acquired;
 	out_stats->mean_latency_ns = s->latency_count > 0 ? s->latency_sum_ns / s->latency_count : 0;
+	const struct scam_rectifier *r = m->cams[s->camera].rect;
+	if (r != NULL && s->output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED) {
+		const struct u_stereo_vrefine *ref = &r->ref;
+		out_stats->refine_state = !r->refine         ? XRT_STEREO_CAMERA_REFINE_OFF
+		                          : ref->applied     ? XRT_STEREO_CAMERA_REFINE_APPLIED
+		                          : ref->windows > 0 ? XRT_STEREO_CAMERA_REFINE_ALIGNED
+		                                             : XRT_STEREO_CAMERA_REFINE_MEASURING;
+		out_stats->refine_updates = ref->updates;
+		out_stats->refine_windows = ref->windows;
+		out_stats->refine_matches = ref->last_matches;
+		out_stats->refine_offset_px = (float)ref->a;
+		out_stats->refine_slope_per_100px = (float)(ref->b * 100.0);
+		out_stats->refine_initial_dy_px = (float)ref->initial_dy;
+		out_stats->refine_residual_dy_px = (float)ref->last_residual_dy;
+		out_stats->refine_measure_ms =
+		    r->measure_count > 0 ? (float)((double)r->measure_ns_sum / r->measure_count * 1e-6) : 0.0f;
+	}
 	os_mutex_unlock(&m->lock);
 	return XRT_SUCCESS;
 }
