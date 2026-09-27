@@ -232,6 +232,48 @@ verify_client_class(volatile struct ipc_client_state *ics, uint32_t declared, co
 	return XRT_CLIENT_CLASS_APP;
 }
 
+// PRESENT_OWNER quota counts OWNERS, not connections: one browser is several
+// processes of one executable (its GPU process weaves, the browser process binds
+// the window, and its video-capture utility reads the stereo camera through
+// XR_DXR_stereo_camera), and all of them are the one owner competing for the
+// panel. A connection from the same executable as an already-admitted
+// PRESENT_OWNER is a SIBLING and takes no new slot; otherwise the quota is
+// compared against the number of DISTINCT owner executables. A peer whose image
+// path the OS will not reveal ("") is never a sibling and counts as its own
+// owner (fails closed). Caller holds global_state.lock; the exe lookups run at
+// admission only.
+static uint32_t
+count_present_owners_locked(struct ipc_server *s, volatile struct ipc_client_state *ics, const char *ics_exe)
+{
+	static char seen[IPC_MAX_CLIENTS][512]; // under global_state.lock
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+		volatile struct ipc_client_state *o = &s->threads[i].ics;
+		if (o == ics || o->server_thread_index < 0 || !o->class_verified ||
+		    o->client_state.client_class != XRT_CLIENT_CLASS_PRESENT_OWNER) {
+			continue;
+		}
+		char exe[512];
+		exe[0] = '\0';
+		ipc_server_peer_exe_path(o->peer_pid, exe, sizeof(exe));
+		if (exe[0] != '\0' && ics_exe[0] != '\0' && strcmp(exe, ics_exe) == 0) {
+			return 0; // a sibling of an admitted owner: no new slot
+		}
+		bool dup = false;
+		for (uint32_t k = 0; k < n && exe[0] != '\0'; k++) {
+			if (strcmp(seen[k], exe) == 0) {
+				dup = true;
+				break;
+			}
+		}
+		if (!dup) {
+			snprintf(seen[n], sizeof(seen[n]), "%s", exe);
+			n++;
+		}
+	}
+	return n;
+}
+
 // Count connected clients of a class, EXCLUDING ics. Caller holds global_state.lock.
 static uint32_t
 count_class_locked(struct ipc_server *s, volatile struct ipc_client_state *ics, uint32_t client_class)
@@ -2132,7 +2174,8 @@ ipc_handle_instance_describe_client(volatile struct ipc_client_state *ics,
 
 		struct ipc_server *s = ics->server;
 		os_mutex_lock(&s->global_state.lock);
-		uint32_t in_use = count_class_locked(s, ics, verified);
+		uint32_t in_use = verified == XRT_CLIENT_CLASS_PRESENT_OWNER ? count_present_owners_locked(s, ics, exe)
+		                                                           : count_class_locked(s, ics, verified);
 		uint32_t quota = ipc_server_client_class_quota(s, verified);
 		bool refused = quota != 0 && in_use >= quota;
 		if (!refused) {
