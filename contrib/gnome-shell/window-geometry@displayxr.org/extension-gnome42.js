@@ -37,7 +37,8 @@ function init() {
 
     // No move sync before GNOME 45 (#1748): it has never run on these
     // shells, so they keep the drag lattice. EnableMoveSync answers false and
-    // capability bit 2 stays clear; the runtime then takes the lattice path.
+    // capability bits 3 and 4 (move sync, its v10 tag gate) stay clear; the
+    // runtime then takes the lattice path.
     const {WindowGeometryService} = globalThis.displayxrWindowGeometry.build(
         {Clutter, GObject, Meta, Gio, GLib, Graphene, moveSync: false});
     service = new WindowGeometryService();

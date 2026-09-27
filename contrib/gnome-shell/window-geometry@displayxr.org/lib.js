@@ -63,6 +63,8 @@
 //             bit 1: SetDragLatticeAt, an explicit drag start (version 8)
 //             bit 2: BeginPointerDrag / EndPointerDrag (version 9)
 //             bit 3: EnableMoveSync (version 9, #1748; GNOME 45+)
+//             bit 4: move sync is tag-gated (version 10): a synced window
+//                    is held only while a tag subsurface is mapped
 //   Method  SetDragLattice(u pid, b extend, i cell, i minDx, i minDy,
 //                          i maxDx, i maxDy, ai dx, ai dy)
 //             -> (b accepted, i startX, i startY)
@@ -82,6 +84,10 @@
 //             position has been committed. The caller tags every commit with
 //             a 1x1 synchronised subsurface at (x mod 256, y mod 256) of the
 //             logical content position it wove for. See "Move sync".
+//             Version 10: the window is held only while that tag is
+//             MAPPED; a commit with no tag mapped (a caller showing
+//             nothing woven) drags as a plain window, and a hold ends the
+//             frame its tag goes away (capability bit 4).
 //             Lives as long as the caller's bus connection (a caller renews
 //             it when the service reappears). A window in move sync gets no
 //             drag lattice (SetDragLattice* returns false). Applies to
@@ -307,17 +313,70 @@
         //! window had this recently.
         RESYNC_US: 60 * 1000,
 
-        //! Per-hold state: a window at buffer (x, y) whose move starts now.
-        create(x, y, now) {
+        //! Per-move state: a window at buffer (x, y) whose move starts now.
+        //! @p held: whether the actor is held from the start (a tag is
+        //! mapped, see gate()). Without it the move runs as a plain window
+        //! drag, but the position history is still kept, so a hold that
+        //! starts mid-move resolves the very next woven frame.
+        create(x, y, now, held = true) {
             return {
+                held,
                 hist: [{x, y, t: now}],
                 shown: {x, y, t: now},
                 progressUs: now,
                 progressFrames: 0,
                 followSinceUs: 0, // > 0: timed out, following the window
                 lastHistLen: 0,
-                stats: {frames: 0, advanced: 0, timeouts: 0, untagged: 0, maxBehind: 0, backHops: 0},
+                stats: {
+                    frames: 0, advanced: 0, timeouts: 0, untagged: 0, maxBehind: 0, backHops: 0,
+                    // v10: holds started (at the start or mid-move), holds
+                    // released because the tag went away.
+                    holds: held ? 1 : 0, tagLost: 0,
+                },
             };
+        },
+
+        /*
+         * The tag gate (extension version 10). A move-synced process holds
+         * its window only while a tag subsurface is MAPPED: a process that
+         * enabled move sync but shows nothing woven (a present-owner showing
+         * a 2D page) tags no commit, and must drag as a plain window rather
+         * than stall into the timeout on every drag. Call once per stage
+         * frame, before onFrame(), with the decoded tag of the buffer about
+         * to be painted ([x, y]) or null. Returns
+         *   'hold'    the hold continues: run onFrame()
+         *   'start'   a tag appeared: the hold starts now, from the window's
+         *             current position; run onFrame()
+         *   'release' the tag went away: the hold ends NOW, the actor goes
+         *             to the window (no timeout, no hop back)
+         *   'plain'   no tag, no hold: the window drags as any window
+         */
+        gate(st, tag, now) {
+            if (st.held) {
+                if (tag)
+                    return 'hold';
+                st.held = false;
+                st.followSinceUs = 0;
+                st.shown = st.hist[st.hist.length - 1];
+                st.stats.tagLost++;
+                return 'release';
+            }
+            if (!tag) {
+                st.stats.untagged++;
+                return 'plain';
+            }
+            // Start from where the window is (the actor is there: mutter has
+            // been syncing it). The history is already seeded, so this very
+            // frame's tag resolves to the position it was woven for.
+            const cur = st.hist[st.hist.length - 1];
+            st.held = true;
+            st.shown = cur;
+            st.progressUs = now;
+            st.progressFrames = 0;
+            st.followSinceUs = 0;
+            st.lastHistLen = st.hist.length;
+            st.stats.holds++;
+            return 'start';
         },
 
         //! mutter moved the window to buffer (x, y).
@@ -940,6 +999,11 @@
         const POINTER_DRAG_POLL_MS = 4;
         //! EnableMoveSync (version 9): see "Move sync". GNOME 45+ only.
         const PLACEMENT_CAP_MOVE_SYNC = 8;
+        //! Version 10: a move-synced window is held only while a tag
+        //! subsurface is mapped (see "Move sync", the tag gate), so a synced
+        //! process that shows nothing woven drags as a plain window, with no
+        //! stall. Only ever set together with PLACEMENT_CAP_MOVE_SYNC.
+        const PLACEMENT_CAP_MOVE_SYNC_TAG_GATED = 16;
         //! A table no grab follows stops constraining after this long.
         const LATTICE_PRE_GRAB_US = 2 * 1000 * 1000;
         //! DISPLAYXR_TEST=1 (never in production): tables audit their paints
@@ -1484,6 +1548,18 @@
          * few frames behind the pointer (the runtime re-weaves every refresh
          * during a move; see docs/specs/runtime/wayland-window-geometry.md §9
          * for the measurements).
+         *
+         * The tag gate (version 10). EnableMoveSync is per PROCESS, but a
+         * process may show nothing woven for long stretches (a browser on a
+         * 2D page): it tags no commit, and holding its window would stall
+         * every drag into the timeout. So a hold runs only while a tag
+         * subsurface is MAPPED: a move that starts with none drags as a plain
+         * window (the position history is still kept); a tag appearing
+         * mid-move starts the hold from the window's current position, and
+         * the kept history resolves that very frame; a tag going away ends
+         * the hold at once — the actor goes to the window, counted as a
+         * tag-lost release, no timeout. An in-process app keeps its tag
+         * mapped whenever it can be dragged, so nothing changes for it.
          */
         //! After the grab ends, give the last woven frame this long to land.
         const MOVE_SYNC_SETTLE_US = 300 * 1000;
@@ -1530,10 +1606,24 @@
                 return false;
             }
 
+            //! A move of this window is tracked (held or plain; see onGrabBegin).
             isActive(win) {
                 return this._st.has(win);
             }
 
+            //! The actor is held right now.
+            isHeld(win) {
+                return this._st.get(win)?.held ?? false;
+            }
+
+            /*
+             * A move of a synced process's window starts. It is HELD only if
+             * a tag is mapped right now (the tag gate, version 10 —
+             * MoveSyncChoice.gate): otherwise it drags as a plain window,
+             * and the per-frame gate starts the hold the moment a tag
+             * appears. Either way the move is tracked (position history,
+             * geometry published every frame) until it ends.
+             */
             onGrabBegin(win, isMove) {
                 if (!win || !isMove || !this.isPidSynced(win.get_pid()) || win.is_fullscreen())
                     return;
@@ -1547,11 +1637,16 @@
                     return;
                 }
                 const b = win.get_buffer_rect();
-                const st = Object.assign(MoveSyncChoice.create(b.x, b.y, now), {
+                const held = this._readTag(actor) !== null;
+                const st = Object.assign(MoveSyncChoice.create(b.x, b.y, now, held), {
                     actor, grabbing: true, settleUs: 0, w: b.width, h: b.height,
                 });
                 this._st.set(win, st);
                 this._ensureStage();
+                if (this._debug) {
+                    log(`displayxr: move sync pid ${win.get_pid()}: ` +
+                        `${held ? 'tag mapped, hold' : 'no tag mapped, plain drag until one appears'}`);
+                }
             }
 
             onPositionChanged(win) {
@@ -1576,6 +1671,8 @@
                 st.settleUs = GLib.get_monotonic_time() + MOVE_SYNC_SETTLE_US;
                 if (win.get_maximize_flags?.() || win.is_fullscreen())
                     this._release(win, 'maximized');
+                else if (!st.held)
+                    this._release(win, 'plain drag'); // nothing to settle
             }
 
             forget(win) {
@@ -1637,6 +1734,29 @@
                     }
                     const tag = this._readTag(st.actor);
                     const prevShown = st.shown;
+                    const gate = MoveSyncChoice.gate(st, tag, now);
+                    if (gate === 'release' || gate === 'plain') {
+                        if (gate === 'release') {
+                            // The tag went away (unmapped or hidden): what is
+                            // painted from now on is woven for nowhere in
+                            // particular. Hand the actor to the window at
+                            // once — no timeout, no hop back.
+                            st.actor.set_position(st.shown.x, st.shown.y);
+                            if (this._trace)
+                                log(`DXRSYNC t=${now} gate=release cur=${st.shown.x},${st.shown.y}`);
+                            if (this._debug) {
+                                log(`displayxr: move sync hold released (tag unmapped) at ` +
+                                    `(${st.shown.x},${st.shown.y}); plain drag until a tag appears`);
+                            }
+                        }
+                        if (!st.grabbing)
+                            this._release(win, gate === 'release' ? 'tag unmapped' : 'plain drag');
+                        continue;
+                    }
+                    if (gate === 'start' && this._debug) {
+                        log(`displayxr: move sync hold started mid-move (a tag appeared) at ` +
+                            `(${st.shown.x},${st.shown.y})`);
+                    }
                     const r = MoveSyncChoice.onFrame(st, tag, now);
                     if (this._trace) {
                         log(`DXRSYNC t=${now} tag=${tag} woven=${r.woven ? `${r.woven.x},${r.woven.y}` : 'none'} ` +
@@ -1674,7 +1794,8 @@
                     const d = st.stats;
                     log(`displayxr: move sync done (${why}) — ${d.frames} frame(s), ${d.advanced} advance(s) on a ` +
                         `woven frame, ${d.timeouts} timeout(s), ${d.backHops} back hop(s), ${d.untagged} untagged, ` +
-                        `max behind ${d.maxBehind} logical px`);
+                        `max behind ${d.maxBehind} logical px, ${d.holds} hold(s), ` +
+                        `${d.tagLost} tag-lost release(s)`);
                 }
             }
         }
@@ -1829,7 +1950,7 @@
                 for (const w of this._moveSync?._st.keys() ?? [])
                     wins.add(w);
                 for (const w of wins)
-                    this._stampAudit.sample(w, this._moveSync?.isActive(w) ?? false);
+                    this._stampAudit.sample(w, this._moveSync?.isHeld(w) ?? false);
             }
 
             EnableMoveSyncAsync([pid], invocation) {
@@ -1883,7 +2004,7 @@
             GetPlacementCapabilities() {
                 return (this._lattice.supported()
                     ? PLACEMENT_CAP_DRAG_LATTICE | PLACEMENT_CAP_EXPLICIT_START : 0) |
-                    (this._moveSync ? PLACEMENT_CAP_MOVE_SYNC : 0) |
+                    (this._moveSync ? PLACEMENT_CAP_MOVE_SYNC | PLACEMENT_CAP_MOVE_SYNC_TAG_GATED : 0) |
                     PLACEMENT_CAP_POINTER_DRAG;
             }
 

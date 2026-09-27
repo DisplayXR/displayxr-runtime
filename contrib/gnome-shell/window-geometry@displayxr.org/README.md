@@ -229,6 +229,14 @@ systemctl --user unset-environment DISPLAYXR_DEBUG   # then log out/in again
   following the pointer after the release. The drag table applies to it as to
   a compositor drag, and it is reported like one (`moving`,
   `DragLatticeDone`). See the spec, §8.9.
+- Version 10, no interface change: the move-sync hold is **tag-gated**,
+  capability bit 4 (value 16, only ever set with bit 3). `EnableMoveSync` is
+  per process, but a window is now held only while a tag subsurface is
+  *mapped*: a synced process that shows nothing woven (a browser on a 2D page)
+  drags as a plain window, with no stall; a tag appearing mid-drag starts the
+  hold then; a tag going away ends it on that frame, the actor snapping to the
+  window. An app that always keeps its tag mapped (every in-process DisplayXR
+  app) behaves exactly as with version 9. See the spec, §9.9.
 
 Verify capture exclusion is live:
 
