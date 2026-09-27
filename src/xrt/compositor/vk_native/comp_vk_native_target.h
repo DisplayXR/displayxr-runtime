@@ -162,6 +162,30 @@ void
 comp_vk_native_target_weave_mark_repaint(struct comp_vk_native_target *target, bool mode_3d);
 
 /*!
+ * Keep an ACQUIRED swapchain image that will not be presented, and hand it out
+ * again on the next @ref comp_vk_native_target_acquire.
+ *
+ * Vulkan returns an acquired image to the presentation engine only through a
+ * present. A frame that acquires and then decides not to present (a fill whose
+ * fence-park lost the race to a fresher app frame, #1748) would otherwise leak
+ * that image for the life of the swapchain; enough leaks and every later
+ * acquire blocks forever — the app hangs in vkAcquireNextImageKHR with the
+ * compositor lock held. Holding it instead costs nothing: the next frame
+ * renders into it. Dropped automatically when the image set is recreated.
+ */
+void
+comp_vk_native_target_hold_unpresented(struct comp_vk_native_target *target, uint32_t index);
+
+/*!
+ * Make @p index the image the next @ref comp_vk_native_target_present presents.
+ * For a caller that released the compositor lock between its acquire and its
+ * present (the fill fence-park), during which another frame may have acquired
+ * and presented its own image.
+ */
+void
+comp_vk_native_target_set_current_index(struct comp_vk_native_target *target, uint32_t index);
+
+/*!
  * #868: pace a repaint to the panel. Runs WITHOUT the compositor lock.
  *
  * Waits on scanout only, never on a frame-latency/acquire token: those are

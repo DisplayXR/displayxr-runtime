@@ -458,6 +458,16 @@ struct comp_vk_native_target
 	//! Current acquired image index.
 	uint32_t current_index;
 
+	/*!
+	 * An image that was ACQUIRED but never presented, held for the next
+	 * acquire (see comp_vk_native_target_hold_unpresented). Valid only for
+	 * the image set it came from: @ref held_generation must equal
+	 * @ref generation, and a recreate bumps that.
+	 */
+	bool held_valid;
+	uint32_t held_index;
+	uint32_t held_generation;
+
 	//! Semaphore signaled when image is available.
 	VkSemaphore image_available;
 
@@ -3274,6 +3284,24 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 	}
 #endif
 
+	/*
+	 * An image a dropped fill acquired but never presented (see
+	 * comp_vk_native_target_hold_unpresented) is still OURS: hand it out
+	 * again instead of asking the presentation engine for another. Its
+	 * acquire semaphore was already waited on (the dummy submit below ran
+	 * for it), so nothing is waited here. Only for the image set it came
+	 * from — a recreate bumps the generation and the old image is gone.
+	 */
+	if (target->held_valid) {
+		target->held_valid = false;
+		if (target->held_generation == target->generation && target->swapchain != VK_NULL_HANDLE &&
+		    target->held_index < target->image_count) {
+			target->current_index = target->held_index;
+			*out_index = target->current_index;
+			return XRT_SUCCESS;
+		}
+	}
+
 	// Use the semaphore for acquire, then do a dummy submit that waits on it
 	// to ensure the image is actually available before the compositor renders.
 	VkResult res = vk->vkAcquireNextImageKHR(vk->device, target->swapchain,
@@ -3791,4 +3819,28 @@ uint32_t
 comp_vk_native_target_get_generation(struct comp_vk_native_target *target)
 {
 	return target->generation;
+}
+
+void
+comp_vk_native_target_hold_unpresented(struct comp_vk_native_target *target, uint32_t index)
+{
+#ifdef XRT_OS_WINDOWS
+	if (target->dcomp_active) {
+		return; // a bridge ring slot, not a WSI image: nothing to hand back
+	}
+#endif
+	if (index >= target->image_count) {
+		return;
+	}
+	target->held_valid = true;
+	target->held_index = index;
+	target->held_generation = target->generation;
+}
+
+void
+comp_vk_native_target_set_current_index(struct comp_vk_native_target *target, uint32_t index)
+{
+	if (index < target->image_count) {
+		target->current_index = index;
+	}
 }
