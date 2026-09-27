@@ -34,6 +34,14 @@
  * (SIM_DISPLAY_FAKE_STEREO_CAMERA_DISTORT=1) the depths read back 2.00 m
  * (background) and 0.60 m (bar); `--raw` shows the misalignment it fixes.
  *
+ * The service stats line is followed by the ONLINE VERTICAL REFINEMENT state
+ * (R2): applied correction a / b, match count, and the signed dy of its first
+ * (uncorrected) window next to its latest one and this probe's own last-frame
+ * measurement. It settles in ~1 s after a stream starts, so give the probe a
+ * few seconds (the default 90 frames is ~3 s at 30 Hz). On the fake, inject a
+ * calibration error with SIM_DISPLAY_FAKE_STEREO_CAMERA_DY=2.6 and
+ * _DY_SLOPE=-0.47 (px per 100 px) next to _DISTORT=1.
+ *
  * Connects as a DIAG client, like `clients`: on Windows run it NON-elevated.
  */
 
@@ -570,6 +578,8 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 	bool require_rectified = false;
 	uint32_t max_d_arg = 0; // 0 = from the camera's geometry
 	struct row_params rp = {.max_d = 0, .max_dy = 24, .min_ncc = 0.90f};
+	char rows_txt[64] = "";
+	bool have_rows = false;
 	for (int i = 3; i < argc; i++) {
 		if (strcmp(argv[i], "--raw") == 0) {
 			output = XRT_STEREO_CAMERA_OUTPUT_RAW;
@@ -780,6 +790,9 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 						       ra.mode_dx[k], ra.mode_count[k]);
 					}
 				}
+				snprintf(rows_txt, sizeof(rows_txt), "%+.2f px (%d blocks)", ra.dy_signed_median,
+				         ra.blocks);
+				have_rows = true;
 				// A constant vertical offset fails even when |dy| scatter is small.
 				float sm = ra.dy_signed_median < 0 ? -ra.dy_signed_median : ra.dy_signed_median;
 				rows_ok = ra.dy_median <= 0.5f && sm <= 0.5f;
@@ -824,6 +837,23 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 		    st.source_frame_rate, st.delivered_frame_rate, (unsigned long long)st.frames_published,
 		    (unsigned long long)st.frames_skipped, (unsigned long long)st.frames_acquired,
 		    (double)st.mean_latency_ns * 1e-6);
+		// R2: the service's online vertical-alignment refinement.
+		static const char *const rs[] = {"n/a", "OFF (DXR_STEREO_CAMERA_REFINE=0)", "MEASURING",
+		                                 "ALIGNED (calibration within 0.2 px)", "APPLIED"};
+		if (st.refine_state != XRT_STEREO_CAMERA_REFINE_NONE &&
+		    st.refine_state <= XRT_STEREO_CAMERA_REFINE_APPLIED) {
+			printf(
+			    "vertical refinement: %s — correction a %+.2f px, b %+.3f px/100 px; %u update(s), "
+			    "%u window(s), %u matches in the latest, %.2f ms per measurement\n",
+			    rs[st.refine_state], st.refine_offset_px, st.refine_slope_per_100px, st.refine_updates,
+			    st.refine_windows, st.refine_matches, st.refine_measure_ms);
+			if (st.refine_windows > 0) {
+				printf(
+				    "vertical refinement: signed dy BEFORE (first window, uncorrected) %+.2f px -> "
+				    "latest window %+.2f px; this probe's last frame %s\n",
+				    st.refine_initial_dy_px, st.refine_residual_dy_px, have_rows ? rows_txt : "n/a");
+			}
+		}
 	}
 
 	unmap_readonly(&map);
