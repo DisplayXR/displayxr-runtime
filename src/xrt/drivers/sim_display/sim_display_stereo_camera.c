@@ -36,6 +36,7 @@ struct fake_config
 	uint32_t eye_w, eye_h;
 	float fps;
 	float advertised_fps; //!< what enumerate claims; 0 = "unknown" (the service measures)
+	double baseline_mm;   //!< 50 mm default; 120 mm reproduces the Leia SR tracking camera's disparities
 	uint32_t format;
 	int64_t suspend_period_ns;
 };
@@ -81,6 +82,11 @@ fake_config(void)
 		cfg.fps = (float)atof(fps);
 	}
 	cfg.advertised_fps = cfg.fps;
+	cfg.baseline_mm = FAKE_BASELINE_MM;
+	const char *bl = getenv("SIM_DISPLAY_FAKE_STEREO_CAMERA_BASELINE_MM");
+	if (bl != NULL && atof(bl) >= 10.0 && atof(bl) <= 300.0) {
+		cfg.baseline_mm = atof(bl);
+	}
 	const char *afps = getenv("SIM_DISPLAY_FAKE_STEREO_CAMERA_ADVERTISED_FPS");
 	if (afps != NULL && afps[0] != '\0' && atof(afps) >= 0.0 && atof(afps) <= 240.0) {
 		cfg.advertised_fps = (float)atof(afps);
@@ -98,8 +104,9 @@ fake_config(void)
 		cfg.suspend_period_ns = (int64_t)atol(sp) * 1000000;
 	}
 	if (cfg.enabled) {
-		U_LOG_W("sim_display: FAKE stereo camera ON — %ux%u per eye @ %.1f Hz, format %u%s", cfg.eye_w,
-		        cfg.eye_h, cfg.fps, cfg.format, cfg.suspend_period_ns > 0 ? ", suspend square-wave" : "");
+		U_LOG_W("sim_display: FAKE stereo camera ON — %ux%u per eye @ %.1f Hz, baseline %.1f mm, format %u%s",
+		        cfg.eye_w, cfg.eye_h, cfg.fps, cfg.baseline_mm, cfg.format,
+		        cfg.suspend_period_ns > 0 ? ", suspend square-wave" : "");
 	}
 	return &cfg;
 }
@@ -172,7 +179,7 @@ sim_display_stereo_camera_get_calibration(struct xrt_plugin_instance *inst,
 	c.rotation_right_from_left[2][2] = 1.0;
 	// OpenCV convention (x_R = R x_L + T): a right camera at +x of the left
 	// one has T = (-B, 0, 0).
-	c.translation_right_from_left_mm[0] = -FAKE_BASELINE_MM;
+	c.translation_right_from_left_mm[0] = -cfg->baseline_mm;
 	memcpy(out, &c, sz < sizeof(c) ? sz : sizeof(c));
 	out->struct_size = sz;
 	return XRT_SUCCESS;
@@ -193,7 +200,7 @@ sim_display_stereo_camera_open(struct xrt_plugin_instance *inst,
 		return XRT_ERROR_ALLOCATION;
 	}
 	cam->cfg = *cfg;
-	sim_stereo_camera_scene_init(&cam->scene, cfg->eye_w, cfg->eye_h, fake_fx(cfg->eye_w), FAKE_BASELINE_MM,
+	sim_stereo_camera_scene_init(&cam->scene, cfg->eye_w, cfg->eye_h, fake_fx(cfg->eye_w), cfg->baseline_mm,
 	                             FAKE_BG_DEPTH_M, FAKE_BAR_DEPTH_M);
 	cam->gray_pitch = 2 * cfg->eye_w;
 	cam->gray = calloc((size_t)cam->gray_pitch * cfg->eye_h, 1);
