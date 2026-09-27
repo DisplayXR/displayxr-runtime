@@ -47,6 +47,7 @@ set(tests
     tests_aux_tiling_zero_copy
     tests_aux_tiling_row_origin
     tests_aux_wayland_geom
+    tests_comp_wl_move_sync_tag
     tests_aux_weave_span2d
     tests_aux_weave_flat
     tests_aux_display_mode_hold
@@ -505,6 +506,8 @@ target_include_directories(tests_cli_dims_check PRIVATE ${PROJECT_SOURCE_DIR}/sr
 # lets its drift / staleness / mode-switch logic be tested on the host, where
 # those bugs are actually findable.
 target_include_directories(tests_comp_vblank_grid PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+# #1748 -- the move-sync tag encode is a header-only function in vk_native.
+target_include_directories(tests_comp_wl_move_sync_tag PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 # ADR-027 tier-1 dispatch (#1331). Header-only pure logic -- no compositor
 # library, no graphics API, no device -- so it needs the include path and
 # nothing else.

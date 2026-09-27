@@ -93,6 +93,9 @@ struct wlg_window
 	//! The last drag ended on the drag lattice and the window has not moved
 	//! since (publisher v7+; false when absent).
 	bool lattice_drop;
+	//! The publisher runs move sync for this window's process (v9+; false
+	//! when absent).
+	bool move_sync;
 };
 
 #define WLG_MAX_WINDOWS 64
@@ -112,6 +115,13 @@ struct comp_vk_native_wl_geom
 	//! Last surface-vs-frame comparison logged (logical px), on change only.
 	int32_t logged_surface_w, logged_surface_h, logged_frame_w, logged_frame_h, logged_inset_y;
 	int64_t next_retry_ns;   //!< earliest monotonic time for the next blocking GetWindows retry
+	//! The last rect get_window_rect returned (#1748, see last_rect).
+	struct comp_vk_native_wl_window_rect last_rect;
+	bool have_last_rect;
+	//! This process asked for move sync (#1748): ask again whenever the
+	//! publisher comes back (GNOME disables user extensions while the screen
+	//! shield is up, and a re-enabled extension has forgotten every caller).
+	bool move_sync_wanted;
 };
 
 
@@ -211,6 +221,11 @@ wlg_parse_snapshot(struct comp_vk_native_wl_geom *g, const char *json)
 		u_json_get_bool(u_json_get(win, "lattice_drop"), &lattice_drop);
 		out->lattice_drop = lattice_drop;
 
+		// Publisher v9+: move sync is live for this window's process (#1748).
+		bool move_sync = false;
+		u_json_get_bool(u_json_get(win, "move_sync"), &move_sync);
+		out->move_sync = move_sync;
+
 		// The monitor rect + scale are what make the logical payload
 		// convertible (#1596). Schema v1 has published them since #817; they
 		// were simply never read, which is why the provider could only refuse
@@ -245,6 +260,9 @@ wlg_parse_snapshot(struct comp_vk_native_wl_geom *g, const char *json)
 
 static bool
 wlg_request_snapshot(struct comp_vk_native_wl_geom *g, int timeout_ms);
+
+static enum comp_vk_native_wl_move_sync_reply
+wlg_send_enable_move_sync(struct comp_vk_native_wl_geom *g, int timeout_ms);
 
 //! Forget the cached snapshot. Callers then report "no rect" and the weave
 //! falls back to display-scoped — the honest outcome once we can no longer
@@ -329,6 +347,19 @@ wlg_pump(struct comp_vk_native_wl_geom *g)
 	// pre-invalidation, stale) until the user happened to move it again.
 	// Same bounded call the retry path already makes — the pump never blocks
 	// for anything else.
+	/*
+	 * A publisher that comes back has forgotten every move-sync caller (the
+	 * registration lives with its bus connection to US, and it was restarted).
+	 * Register again BEFORE re-snapshotting, so the snapshot already says
+	 * move_sync — until then the compositor treats the window as a lattice
+	 * window, which is correct for a publisher that does not sync it.
+	 */
+	if (g->move_sync_wanted) {
+		const enum comp_vk_native_wl_move_sync_reply r = wlg_send_enable_move_sync(g, 100);
+		U_LOG_W("wl_geom: geometry service " WLG_BUS_NAME " came back — move sync %s (#1748)",
+		        r == COMP_VK_NATIVE_WL_MOVE_SYNC_ACCEPTED ? "re-registered"
+		                                                  : "NOT re-registered; the drag lattice applies");
+	}
 	const bool ok = wlg_request_snapshot(g, 25);
 	// Whether or not that answered, don't let get_window_rect's lazy retry
 	// fire a second GetWindows in this same frame.
@@ -646,6 +677,7 @@ comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g, struct 
 	out_rect->moving = best->moving;
 	out_rect->have_moving = best->have_moving;
 	out_rect->lattice_drop = best->lattice_drop;
+	out_rect->move_sync = best->move_sync;
 
 	out_rect->left_px = win_px.x;
 	out_rect->top_px = win_px.y;
@@ -717,7 +749,72 @@ comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g, struct 
 			}
 		}
 	}
+	g->last_rect = *out_rect;
+	g->have_last_rect = true;
 	return true;
+}
+
+bool
+comp_vk_native_wl_geom_last_rect(struct comp_vk_native_wl_geom *g, struct comp_vk_native_wl_window_rect *out_rect)
+{
+	if (g == NULL || out_rect == NULL || !g->have_last_rect) {
+		return false;
+	}
+	*out_rect = g->last_rect;
+	return true;
+}
+
+static enum comp_vk_native_wl_move_sync_reply
+wlg_send_enable_move_sync(struct comp_vk_native_wl_geom *g, int timeout_ms)
+{
+	DBusMessage *call =
+	    dbus_message_new_method_call(WLG_BUS_NAME, WLG_PLACEMENT_PATH, WLG_PLACEMENT_IFACE, "EnableMoveSync");
+	if (call == NULL) {
+		return COMP_VK_NATIVE_WL_MOVE_SYNC_UNREACHABLE;
+	}
+	dbus_uint32_t pid = 0; // 0 = the caller
+	if (!dbus_message_append_args(call, DBUS_TYPE_UINT32, &pid, DBUS_TYPE_INVALID)) {
+		dbus_message_unref(call);
+		return COMP_VK_NATIVE_WL_MOVE_SYNC_UNREACHABLE;
+	}
+	DBusError err;
+	dbus_error_init(&err);
+	DBusMessage *reply = dbus_connection_send_with_reply_and_block(g->conn, call, timeout_ms, &err);
+	dbus_message_unref(call);
+	if (reply == NULL) {
+		// No such method / object / interface: a publisher older than
+		// version 9, which never will sync. Anything else (no owner yet, a
+		// timeout) may still resolve when the publisher (re)appears.
+		const bool unsupported =
+		    dbus_error_is_set(&err) && (dbus_error_has_name(&err, DBUS_ERROR_UNKNOWN_METHOD) ||
+		                                dbus_error_has_name(&err, DBUS_ERROR_UNKNOWN_OBJECT) ||
+		                                dbus_error_has_name(&err, DBUS_ERROR_UNKNOWN_INTERFACE));
+		U_LOG_W("wl_geom: EnableMoveSync: %s (%s)",
+		        unsupported ? "the window-geometry extension predates move sync (version < 9) - the drag "
+		                      "lattice applies; update the extension for move-synchronised drags"
+		                    : "no answer from the window-geometry extension yet - will register when it "
+		                      "appears",
+		        dbus_error_is_set(&err) ? err.message : "no reply");
+		dbus_error_free(&err);
+		return unsupported ? COMP_VK_NATIVE_WL_MOVE_SYNC_UNSUPPORTED : COMP_VK_NATIVE_WL_MOVE_SYNC_UNREACHABLE;
+	}
+	dbus_bool_t ok = FALSE;
+	if (!dbus_message_get_args(reply, NULL, DBUS_TYPE_BOOLEAN, &ok, DBUS_TYPE_INVALID)) {
+		ok = FALSE;
+	}
+	dbus_message_unref(reply);
+	return ok == TRUE ? COMP_VK_NATIVE_WL_MOVE_SYNC_ACCEPTED : COMP_VK_NATIVE_WL_MOVE_SYNC_UNSUPPORTED;
+}
+
+enum comp_vk_native_wl_move_sync_reply
+comp_vk_native_wl_geom_enable_move_sync(struct comp_vk_native_wl_geom *g)
+{
+	if (g == NULL || g->conn == NULL) {
+		return COMP_VK_NATIVE_WL_MOVE_SYNC_UNSUPPORTED;
+	}
+	const enum comp_vk_native_wl_move_sync_reply r = wlg_send_enable_move_sync(g, 200);
+	g->move_sync_wanted = (r != COMP_VK_NATIVE_WL_MOVE_SYNC_UNSUPPORTED);
+	return r;
 }
 
 bool

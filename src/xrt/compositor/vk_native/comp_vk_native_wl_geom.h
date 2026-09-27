@@ -136,6 +136,16 @@ struct comp_vk_native_wl_window_rect
 	 * two owners of the last 2 px is how a drop ping-pongs. False when absent.
 	 */
 	bool lattice_drop;
+
+	/*!
+	 * The publisher runs move sync for this process (publisher version 9,
+	 * after @ref comp_vk_native_wl_geom_enable_move_sync): it shows each
+	 * committed frame at the position its tag names, so nothing is snapped —
+	 * not during a drag, not at the drop. False when absent, and whenever the
+	 * publisher has not (yet, or again) accepted the registration: the
+	 * caller then runs the drag-lattice path, unchanged.
+	 */
+	bool move_sync;
 };
 
 /*!
@@ -174,6 +184,39 @@ comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g,
  */
 bool
 comp_vk_native_wl_geom_move_window(struct comp_vk_native_wl_geom *g, int32_t frame_logical_x, int32_t frame_logical_y);
+
+/*!
+ * The rect the most recent successful @ref comp_vk_native_wl_geom_get_window_rect
+ * returned, without pumping the bus. The weave's present origin comes from that
+ * call, so this is the one snapshot the frame was woven for (#1748: the
+ * move-sync frame tag must name exactly that position, not a newer one).
+ */
+bool
+comp_vk_native_wl_geom_last_rect(struct comp_vk_native_wl_geom *g, struct comp_vk_native_wl_window_rect *out_rect);
+
+//! What the publisher answered to @ref comp_vk_native_wl_geom_enable_move_sync.
+enum comp_vk_native_wl_move_sync_reply
+{
+	//! Registered: the publisher syncs this process's window moves.
+	COMP_VK_NATIVE_WL_MOVE_SYNC_ACCEPTED,
+	//! No publisher answered (not running yet, or a timeout). The request is
+	//! remembered and sent again whenever the publisher appears.
+	COMP_VK_NATIVE_WL_MOVE_SYNC_UNREACHABLE,
+	//! The publisher cannot sync (older than version 9, or it refused).
+	COMP_VK_NATIVE_WL_MOVE_SYNC_UNSUPPORTED,
+};
+
+/*!
+ * #1748: ask the publisher to hold this process's window during a compositor
+ * move until a frame woven for the new position is committed
+ * (WindowPlacement1.EnableMoveSync, publisher capability bit 2). The caller
+ * must tag every commit (comp_vk_native_wl_move_sync). The registration lives
+ * as long as this provider's bus connection; the provider renews it when the
+ * publisher restarts. Whether it is live right now is
+ * comp_vk_native_wl_window_rect::move_sync, per snapshot.
+ */
+enum comp_vk_native_wl_move_sync_reply
+comp_vk_native_wl_geom_enable_move_sync(struct comp_vk_native_wl_geom *g);
 
 void
 comp_vk_native_wl_geom_destroy(struct comp_vk_native_wl_geom **g_ptr);
