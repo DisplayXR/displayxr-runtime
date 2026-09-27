@@ -14,7 +14,7 @@ set(CMAKE_CXX_STANDARD 17)
 # Khronos OpenXR loader from the openxr_loader_for_android .aar (prefab).
 find_package(OpenXR REQUIRED CONFIG)
 
-add_library(weave_client_vk_android SHARED main.cpp)
+add_library(weave_client_vk_android SHARED main.cpp lift_probe.cpp)
 
 # DisplayXR's in-tree OpenXR headers carry the XR_DXR_* extensions the loader
 # AAR's stock headers don't ship — XR_DXR_weave above all. BEFORE the AAR's

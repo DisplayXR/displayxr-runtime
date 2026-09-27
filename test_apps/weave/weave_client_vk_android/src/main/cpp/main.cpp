@@ -58,6 +58,9 @@
 #include <openxr/XR_DXR_display_info.h>
 #include <openxr/XR_DXR_view_rig.h>
 #include <openxr/XR_DXR_weave.h>
+#include <openxr/XR_DXR_lift.h>
+
+#include "lift_probe.h" // XR_DXR_lift probe: `setprop debug.dxr.lift.probe weave|explicit|both`
 
 #define LOG_TAG "weave_client_vk_android"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -282,7 +285,12 @@ xr_create_instance()
 	    XR_DXR_WEAVE_EXTENSION_NAME,
 	    XR_DXR_DISPLAY_INFO_EXTENSION_NAME,
 	    XR_DXR_VIEW_RIG_EXTENSION_NAME,
+	    XR_DXR_LIFT_EXTENSION_NAME, // enabled only when the lift probe is on (count below)
 	};
+	uint32_t extension_count = sizeof(extensions) / sizeof(extensions[0]);
+	if (!lift_probe_enabled()) {
+		extension_count--; // a runtime without XR_DXR_lift must still start this app
+	}
 
 	XrInstanceCreateInfoAndroidKHR android_info = {};
 	android_info.type = XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR;
@@ -292,7 +300,7 @@ xr_create_instance()
 	XrInstanceCreateInfo ci = {};
 	ci.type = XR_TYPE_INSTANCE_CREATE_INFO;
 	ci.next = &android_info;
-	ci.enabledExtensionCount = sizeof(extensions) / sizeof(extensions[0]);
+	ci.enabledExtensionCount = extension_count;
 	ci.enabledExtensionNames = extensions;
 	strcpy(ci.applicationInfo.applicationName, "weave_client_vk_android");
 	ci.applicationInfo.applicationVersion = 1;
@@ -887,12 +895,46 @@ paint_rect(uint8_t *base, uint32_t stride, int32_t rx, int32_t ry, int32_t rw, i
 	}
 }
 
+/*!
+ * XR_DXR_lift probe (weave mode): a lift-flagged rect holds a plain 2D frame —
+ * the WHOLE rect, not squeezed SBS (spec v3 + XrWeaveSubmitLiftRectsDXR). A
+ * gradient with white bars and a walking block, so a conversion's per-view
+ * shift is visible (and flat, identical in both eyes, until the first result).
+ */
 void
-paint_frame(uint64_t frame, const XrRect2Di *rects, uint32_t rect_count)
+paint_rect_2d(uint8_t *base, uint32_t stride, int32_t rx, int32_t ry, int32_t rw, int32_t rh, uint64_t frame)
+{
+	if (rw <= 0 || rh <= 0) {
+		return;
+	}
+	const int32_t walk = (int32_t)((frame % 120) * (uint64_t)rw / 120);
+	for (int32_t y = 0; y < rh; ++y) {
+		for (int32_t x = 0; x < rw; ++x) {
+			uint8_t r = (uint8_t)(40 + 180 * x / rw), g = (uint8_t)(60 + 120 * y / rh), b = 160;
+			if ((x / (rw / 16 + 1)) % 2 == 0 && y > rh / 3 && y < 2 * rh / 3) {
+				r = g = b = 235;
+			}
+			if (x >= walk && x < walk + rw / 30 && y > rh / 2 - rh / 12 && y < rh / 2 + rh / 12) {
+				r = 250;
+				g = 210;
+				b = 30;
+			}
+			put_px(base, stride, (uint32_t)(rx + x), (uint32_t)(ry + y), r, g, b, 255);
+		}
+	}
+}
+
+void
+paint_frame(uint64_t frame, const XrRect2Di *rects, uint32_t rect_count, bool rect0_is_2d)
 {
 	const uint32_t stride = g_app.in_w * 4u;
 	memset(g_app.staging_ptr, 0, g_app.staging_size);
 	for (uint32_t i = 0; i < rect_count; ++i) {
+		if (i == 0 && rect0_is_2d) {
+			paint_rect_2d(g_app.staging_ptr, stride, rects[i].offset.x, rects[i].offset.y,
+			              rects[i].extent.width, rects[i].extent.height, frame);
+			continue;
+		}
 		paint_rect(g_app.staging_ptr, stride, rects[i].offset.x, rects[i].offset.y,
 		           rects[i].extent.width, rects[i].extent.height, frame);
 	}
@@ -1189,7 +1231,12 @@ render_frame()
 		rects[i].extent.height = band_h - band_h / 8;
 	}
 
-	paint_frame(g_app.frame, rects, kRectCount);
+	// XR_DXR_lift probe: properties / streams / explicit submit+acquire, and
+	// whether rect 0 is a lifted 2D rect this frame.
+	lift_probe_frame(g_app.frame);
+	const XrLiftStreamDXR lift_stream = lift_probe_weave_stream();
+
+	paint_frame(g_app.frame, rects, kRectCount, lift_stream != XR_NULL_HANDLE);
 	if (!upload_input()) {
 		return false;
 	}
@@ -1202,9 +1249,20 @@ render_frame()
 	kinds.overlayKind = XR_WEAVE_HANDLE_KIND_PLATFORM_DEFAULT_DXR;
 
 	// Spec v3 batch: window-sized input, each rect's SBS at its own position.
+	// XR_DXR_lift probe (weave mode): "rect 0 is 2D — lift it before weaving".
+	XrWeaveRectLiftDXR lift_rect = {};
+	lift_rect.type = XR_TYPE_WEAVE_RECT_LIFT_DXR;
+	lift_rect.rectIndex = 0;
+	lift_rect.stream = lift_stream;
+	XrWeaveSubmitLiftRectsDXR lifts = {};
+	lifts.type = XR_TYPE_WEAVE_SUBMIT_LIFT_RECTS_DXR;
+	lifts.next = &kinds;
+	lifts.liftCount = 1;
+	lifts.lifts = &lift_rect;
+
 	XrWeaveSubmitRectsDXR batch = {};
 	batch.type = XR_TYPE_WEAVE_SUBMIT_RECTS_DXR;
-	batch.next = &kinds;
+	batch.next = lift_stream != XR_NULL_HANDLE ? static_cast<const void *>(&lifts) : &kinds;
 	batch.rectCount = kRectCount;
 	batch.rects = rects;
 
@@ -1376,6 +1434,9 @@ render_thread(void *)
 		return nullptr;
 	}
 	g_xr_ready = true;
+	if (lift_probe_enabled()) {
+		lift_probe_init(g_app.xr_instance, g_app.xr_session);
+	}
 
 	if (!create_swapchain(window)) {
 		return nullptr;
@@ -1416,6 +1477,7 @@ render_thread(void *)
 	}
 
 	vkDeviceWaitIdle(g_app.vk_device);
+	lift_probe_shutdown();
 	destroy_output();
 	destroy_input();
 	destroy_swapchain();
