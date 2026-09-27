@@ -152,6 +152,12 @@ Going back to the release is the same in reverse (`--force-reinstall` with the r
 `DisplayXR-Runtime-Leia-*.apk`). Only CI (the `ANDROID_KEYSTORE_*` secrets) can produce an
 in-place update; there is no release keystore on a dev box.
 
+**Eyeballing the fake on the panel needs a tracked face.** With no face in view the Leia SDK
+drops the weave to its 2D fallback (a single view), so the lifted rect looks flat whatever the
+lift produced. Sit at the tablet, or force the light-field on with `adb shell setprop
+debug.dxr.overlay 1` (clear it afterwards). The same applies to a `debug.dxr.weave.dump`
+capture: a uniformly single-view row there is the no-face fallback, not a lift failure.
+
 ## Follow-ups (not in step 1)
 
 - **Letterbox crop** on Android: port the HLSL row/column profile pass to GLSL / compute.

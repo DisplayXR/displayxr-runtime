@@ -164,21 +164,40 @@ fi
 RUNTIME_APK="$1"; shift
 [ -f "$RUNTIME_APK" ] || { echo "ERROR: $RUNTIME_APK not found." >&2; exit 1; }
 
-case "$(basename "$RUNTIME_APK")" in
-    *Runtime*) ;;
-    *) echo "WARN: '$(basename "$RUNTIME_APK")' does not look like a runtime APK." >&2
-       echo "      The RUNTIME must be the first argument; apps follow it." >&2 ;;
-esac
-
-# Flag the vendor-neutral variant early. It installs and self-tests fine, it
-# simply cannot weave — which on a vendor display looks exactly like a bug.
-case "$(basename "$RUNTIME_APK")" in
-    *Runtime-Leia*) : ;;
-    *) echo
-       echo "NOTE: this looks like the VENDOR-NEUTRAL runtime APK (sim-display only)."
-       echo "      On a Leia device it will install, pass most checks and render"
-       echo "      nothing weaveable. Use DisplayXR-Runtime-Leia-*.apk there." ;;
-esac
+# Identify the APK by what it CONTAINS, not by its file name: a dev build is
+# named openxr_android-<buildtype>[-...].apk whatever it bundles. The runtime
+# carries libopenxr_displayxr.so; the Leia variant also carries the Leia
+# plug-in, libdxrp050_leia_cnsdk.so. Falls back to the file name only when
+# unzip is unavailable.
+APK_LIBS=""
+if command -v unzip >/dev/null 2>&1; then
+    APK_LIBS=$(unzip -l "$RUNTIME_APK" 2>/dev/null | awk '{print $4}' | grep '^lib/arm64-v8a/' || true)
+fi
+if [ -n "$APK_LIBS" ]; then
+    if ! grep -q '^lib/arm64-v8a/libopenxr_displayxr\.so$' <<<"$APK_LIBS"; then
+        echo "WARN: '$(basename "$RUNTIME_APK")' has no lib/arm64-v8a/libopenxr_displayxr.so — not a runtime APK." >&2
+        echo "      The RUNTIME must be the first argument; apps follow it." >&2
+    elif grep -q '^lib/arm64-v8a/libdxrp050_leia_cnsdk\.so$' <<<"$APK_LIBS"; then
+        echo "Runtime APK variant: LEIA (bundles libdxrp050_leia_cnsdk.so)."
+    else
+        # Flag the vendor-neutral variant early. It installs and self-tests fine,
+        # it simply cannot weave — which on a vendor display looks exactly like a bug.
+        echo
+        echo "NOTE: runtime APK variant: VENDOR-NEUTRAL (no libdxrp050_leia_cnsdk.so inside; sim-display only)."
+        echo "      On a Leia device it will install, pass most checks and render"
+        echo "      nothing weaveable. Use the Leia variant (DisplayXR-Runtime-Leia-*.apk) there."
+    fi
+else
+    case "$(basename "$RUNTIME_APK")" in
+        *Runtime-Leia*) echo "Runtime APK variant: LEIA (by file name; unzip unavailable)." ;;
+        *Runtime*)
+           echo
+           echo "NOTE: this looks like the VENDOR-NEUTRAL runtime APK by its name (unzip unavailable to check)."
+           echo "      On a Leia device use DisplayXR-Runtime-Leia-*.apk." ;;
+        *) echo "WARN: '$(basename "$RUNTIME_APK")' does not look like a runtime APK (unzip unavailable to check)." >&2
+           echo "      The RUNTIME must be the first argument; apps follow it." >&2 ;;
+    esac
+fi
 
 # ---- 1. runtime -------------------------------------------------------------
 # -r keeps data; -d allows a version downgrade, which a plain -r fails at
