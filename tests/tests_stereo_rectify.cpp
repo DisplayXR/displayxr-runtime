@@ -72,7 +72,10 @@ input_from(const stereo_rectify_fixture &f)
 	return in;
 }
 
-const double k_ideal_fx_640 = 320.0 / std::tan(34.0 * M_PI / 180.0);
+// Not M_PI: MSVC only defines it with _USE_MATH_DEFINES before the first <cmath>,
+// which Catch may already have included.
+constexpr double k_pi = 3.14159265358979323846;
+const double k_ideal_fx_640 = 320.0 / std::tan(34.0 * k_pi / 180.0);
 
 } // namespace
 
