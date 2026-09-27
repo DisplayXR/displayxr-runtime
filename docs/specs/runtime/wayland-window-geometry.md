@@ -811,7 +811,7 @@ drags including a release far outside the window after a fast flick.
 `scripts/test_gnome_extension_pointer_drag.js` (gjs, in `lint.yml`) checks the
 pure part (`PointerDrag` in `lib.js`).
 
-## 9. Move-synchronised re-weave (extension version 9, #1748)
+## 9. Move-synchronised re-weave (extension version 9, #1748; tag-gated in version 10)
 
 **On by default** on native Wayland whenever the extension offers it
 (`EnableMoveSync`, placement capability bit 3 = value 8; GNOME 45+). The drag
@@ -1013,3 +1013,81 @@ carries that output. Registration (`EnableMoveSync`) and the §9.4 fallback are
 the present-owner's too; the extension authorises by caller pid, which for a
 multi-process browser is a question for its side. API and wire:
 `docs/specs/extensions/XR_DXR_weave.md` §5e.
+
+### 9.9 Tag-gated hold (extension version 10)
+
+`EnableMoveSync` is per **process**, but a present-owner (§9.8) often shows
+nothing woven — a browser on a 2D page tags no commit. Under version 9 every
+drag of such a window was held with no tagged frame to resolve, so the actor
+stood still until the stall fallback (§9.3, 100 ms and 6 frames) let it
+follow: a hitch at the start of every 2D drag. Version 10 holds a synced
+window **only while a tag subsurface is mapped** (`MoveSyncChoice.gate` in
+`lib.js`, checked on every stage frame before `onFrame`):
+
+- **Move start** (mutter's grab or the pointer drag, §8.9): the hold starts
+  only if the buffer on screen carries a tag. Otherwise the window drags as a
+  plain window — the actor is wherever mutter puts it. The move is tracked
+  either way: its position history is kept and a move is published every
+  frame, as for a held one.
+- **A tag appears mid-move** (a 3D element scrolls into view): the hold
+  starts on that frame, from the window's current position. The kept history
+  resolves that very frame's tag, so it is shown where it was woven for — one
+  step back by the pipeline lag (measured below).
+- **The tag goes away mid-hold** (unmapped, or its actor hidden): the hold ends
+  on that frame — the actor is put at the window's real position, with no
+  timeout and no hop back — counted per drag as a *tag-lost release*
+  (`… N hold(s), M tag-lost release(s)` in the `DISPLAYXR_DEBUG` summary). The
+  hold starts again if a tag reappears before the move ends.
+- **Stall fallback unchanged:** a mapped tag whose frames stop coming (the app
+  is stalled) still takes the §9.3 timeout.
+- **Unchanged for an app that keeps its tag mapped** — every in-process
+  `vk_native` window does, except fullscreen, which is never dragged (§9.2).
+
+**Capability:** placement capability bit 4 (value 16),
+`PLACEMENT_CAP_MOVE_SYNC_TAG_GATED`, only ever set together with bit 3. A
+present-owner that leaves its tag unmapped while it shows nothing woven checks
+it to know that such a drag does not hitch; with bit 4 clear (a version-9
+extension) it should keep the tag mapped, or accept the hitch.
+
+**Test hook** (off by default, never in a real session):
+`DXR_WL_TEST_TAG=off` never maps the runtime's tag (a synced process that
+tags nothing); `DXR_WL_TEST_TAG=toggle:ON_MS:OFF_MS` maps it for `ON_MS`, then
+unmaps it for `OFF_MS`, repeating. The registration is unchanged.
+
+**Decoding against the parent surface: not possible from GJS on GNOME 50.**
+The tag is decoded as its offset from the largest surface actor of the window
+(§9.2). The parent surface would be the exact reference, but mutter 50
+flattens a window's surface actors into siblings under one
+`MetaSurfaceContainerActorWayland` (the tag's Clutter parent is the
+container, not its parent surface), `MetaSurfaceActorWayland` exposes no
+surface accessor or property to GObject introspection, and `Meta.WaylandSurface`
+exposes only `get_window()`. Only the sibling order hints at the parent (a
+`place_below` tag sits just before it), which a client may reorder. The
+largest-surface rule stays; a present-owner keeps its tag a subsurface of the
+surface that carries the woven content, and that surface the largest.
+
+**Measured** (the §9.7 harness, private headless GNOME Shell 50.1,
+`cube_handle_vk_linux` on sim_display only, stamp audit after every paint;
+LMB = mutter's grab, RMB = the pointer drag):
+
+| run | scale | frames | held frames off their woven origin | plain frames with the actor not at the window | holds / tag-lost / timeouts |
+|---|---|---|---|---|---|
+| always tagged (in-process, 17 drags LMB + RMB, reversals) | 200 % | 1,645 | **0** | — | 17 / 0 / 0 |
+| always tagged | 150 % | 1,698 | **0** | — | 17 / 0 / 0 |
+| never tagged (`DXR_WL_TEST_TAG=off`, 11 drags) | 200 % | 1,034 | — | **0** | 0 / 0 / 0 |
+| never tagged | 150 % | 1,058 | — | **0** | 0 / 0 / 0 |
+| never tagged, **version 9** (6 drags) | 200 % | 673 | 594 (held, then following stale) | — | 6 timeouts: every drag hitched, up to 110 logical px behind |
+| toggled 300/300 ms (8 drags) | 200 % | 992 | **0** of 495 | **0** of 497 | 37 / 34 / 0 |
+| toggled 300/300 ms | 150 % | 988 | **0** of 487 | **0** of 501 | 35 / 34 / 0 |
+
+- Always tagged, lag p50 slow / fast: 12 / 120 device px at 200 %, 9 / 90 at
+  150 %; paints where a moving window stood still: 22 % / 25 % — within the
+  §9.7 run-to-run spread.
+- Never tagged: the actor is on the window on every paint (lag 0 — a plain
+  mutter drag).
+- Toggled: a hold starting mid-move steps back by up to 60 device px at
+  200 % (45 at 150 %), and a tag-lost release steps forward to the window by
+  up to 120 (81) — each the pipeline lag at that moment, on the fastest
+  toggled drag (6 logical px per 8 ms). That is the cost of a tag toggling
+  during a drag; it never takes the timeout.
+- App frozen mid-drag with the tag mapped: one timeout per drag, as in §9.7.

@@ -171,9 +171,10 @@ jobs:
         run: gjs scripts/test_gnome_extension_lattice.js
 
       - name: Move-sync frame logic
-        # Unit test for MoveSyncChoice in lib.js (extension version 9, #1748):
-        # the frame-tag decode (against the runtime's encode), which position
-        # the actor is painted at, and the stalled-app fallback. Plain gjs.
+        # Unit test for MoveSyncChoice in lib.js (extension versions 9-10,
+        # #1748): the frame-tag decode (against the runtime's encode), which
+        # position the actor is painted at, the stalled-app fallback, and the
+        # v10 tag gate (no tag -> no hold; tag mid-drag; tag lost). Plain gjs.
         run: gjs scripts/test_gnome_extension_move_sync.js
 
       - name: Pointer drag ends on its button
