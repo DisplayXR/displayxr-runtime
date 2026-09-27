@@ -338,6 +338,9 @@ if(ANDROID)
 	# no extra link is needed beyond the NDK's libandroid, which aux_android
 	# already carries.
 	target_sources(comp_multi PRIVATE multi/comp_multi_weave_android.c)
+	# XR_DXR_lift (ADR-042): the Android lift thread + AHardwareBuffer mailbox /
+	# ring over util/u_lift_mailbox (aux_util), and the lift-only Vulkan DP.
+	target_sources(comp_multi PRIVATE multi/comp_multi_lift_android.c multi/comp_multi_lift_android.h)
 endif()
 
 if(XRT_FEATURE_COMP_MULTI_WEAVE_LINUX)

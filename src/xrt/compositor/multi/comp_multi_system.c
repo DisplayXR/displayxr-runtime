@@ -43,6 +43,7 @@
 #endif
 
 #include "multi/comp_multi_private.h"
+#include "multi/comp_multi_lift_android.h" // XR_DXR_lift (ADR-042, Android)
 #include "multi/comp_multi_interface.h"
 #include "multi/comp_multi_workspace.h"
 #include "util/comp_bg2d.h"
@@ -6323,6 +6324,12 @@ system_compositor_destroy(struct xrt_system_compositor *xsc)
 
 	// Destroy the render thread first, destroy also stops the thread.
 	os_thread_helper_destroy(&msc->oth);
+
+#ifdef XRT_OS_ANDROID
+	// XR_DXR_lift (ADR-042): join the lift thread and free its streams + DP
+	// while the Vulkan device (owned by the native compositor) is still alive.
+	comp_multi_lift_destroy(&msc->lift);
+#endif
 
 #ifdef XRT_OS_MACOS
 	// Free the shared spatial surface resources (#59) now that the render thread

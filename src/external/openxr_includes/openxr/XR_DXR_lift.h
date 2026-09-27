@@ -47,9 +47,18 @@
  * PTS, an XrTime — the runtime never interprets it) and comes back verbatim on
  * the result it produced, so a caller can pair a late result with its frame.
  *
- * Availability: out-of-process (service / IPC) sessions only, on the Windows
- * D3D11 service, exactly like XR_DXR_weave. An in-process session reports
- * XR_ERROR_FEATURE_UNSUPPORTED from every entry point.
+ * Availability: out-of-process (service / IPC) sessions only, exactly like
+ * XR_DXR_weave — the Windows D3D11 service and the Android service. An
+ * in-process session reports XR_ERROR_FEATURE_UNSUPPORTED from every entry
+ * point.
+ *
+ * Android: every texture handle below is an `AHardwareBuffer *` (RGBA8 input;
+ * the caller's GPU writes complete before the submit — no acquire fence yet),
+ * XrLiftResultDXR::format is an AHARDWAREBUFFER_FORMAT_* value, and no fence is
+ * handed out (XrLiftResultDXR::fence stays NULL): an acquire returns only after
+ * the result was copied into the output buffer. The caller owns the reference
+ * the runtime hands it and AHardwareBuffer_release()s it when done. A v2
+ * `handleKind` field (the weave's XrWeaveSubmitHandlesDXR shape) is a follow-up.
  *
  * Version history: 1 = initial (properties, streams, texture results, the
  * weave-rect lift chain, the Gaussian-splat blob path, per-stream priority
@@ -261,11 +270,13 @@ typedef struct XrLiftOptionsDXR {
  * @c inputTexture has the same handle kinds as XR_DXR_weave v3: a D3D11 NT
  * shared handle, or a legacy global DXGI handle with @c inputIsDxgi = XR_TRUE,
  * carrying an IDXGIKeyedMutex (key 0 = "caller done writing"). RGBA8 or BGRA8.
+ * Android: an `AHardwareBuffer *` (RGBA8, GPU-sampleable; @c inputIsDxgi must
+ * be XR_FALSE), complete when the call is made.
  */
 typedef struct XrLiftFrameSubmitInfoDXR {
     XrStructureType          type;         //!< XR_TYPE_LIFT_FRAME_SUBMIT_INFO_DXR
     const void* XR_MAY_ALIAS next;         //!< chain XrLiftOptionsDXR here
-    void*                    inputTexture; //!< shared texture HANDLE (keyed mutex, key 0)
+    void*                    inputTexture; //!< shared texture HANDLE (keyed mutex, key 0); Android: AHardwareBuffer*
     XrBool32                 inputIsDxgi;  //!< XR_TRUE for a legacy global DXGI handle
     XrExtent2Di              extent;       //!< region of inputTexture to convert, from (0,0)
     XrTime                   sourceTime;   //!< caller's timestamp; echoed on the result
@@ -284,7 +295,9 @@ typedef struct XrLiftFrameSubmitInfoDXR {
  *
  * Layout: DEPTH = one channel at the input's aspect; SBS = two views side by
  * side (@c viewCount 2); NVIEW = @c viewCount views side by side, view 0
- * leftmost. @c format is a DXGI_FORMAT value.
+ * leftmost. @c format is a DXGI_FORMAT value (Android: an
+ * AHARDWAREBUFFER_FORMAT_* value; @c outputTexture an AHardwareBuffer*, @c fence
+ * always NULL — the acquire completed before it returned).
  */
 typedef struct XrLiftResultDXR {
     XrStructureType    type;          //!< XR_TYPE_LIFT_RESULT_DXR
@@ -295,7 +308,7 @@ typedef struct XrLiftResultDXR {
     void*              fence;         //!< shared fence HANDLE on first acquire, else NULL
     uint64_t           fenceValue;    //!< wait the fence to this before sampling
     XrExtent2Di        extent;        //!< output texture size (all views)
-    int64_t            format;        //!< DXGI_FORMAT
+    int64_t            format;        //!< DXGI_FORMAT (Android: AHARDWAREBUFFER_FORMAT_*)
     uint32_t           viewCount;     //!< 1 (DEPTH), 2 (SBS), N (NVIEW)
     XrDuration         latency;       //!< submit → conversion finished, ns (runtime clock)
 } XrLiftResultDXR;

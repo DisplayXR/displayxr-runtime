@@ -62,6 +62,12 @@
 #include "xrt/xrt_display_metrics.h" // struct xrt_eye_positions (DP-tracked eyes; Leia M2)
 #endif
 
+#if defined(XRT_OS_ANDROID) && !defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+// XR_DXR_lift (ADR-042) on the Android service: the lift module the lift
+// handlers dispatch to when there is no D3D11 service compositor.
+#include "multi/comp_multi_lift_android.h"
+#endif
+
 #if defined(XRT_OS_MACOS)
 // macOS service input forwarding (#48): drain the generic queue fed by the
 // AppKit pump's NSEvent capture (ipc_server_macos_appkit.m).
@@ -8097,9 +8103,11 @@ ipc_handle_device_set_brightness(volatile struct ipc_client_state *ics, uint32_t
  *
  * Streams belong to the CONNECTION (ics->lift_owner), not to a session: the
  * calls need no compositor, so `displayxr-cli lift` can drive them headless.
- * Implemented on the Windows D3D11 service; every other service answers
- * XRT_ERROR_FEATURE_NOT_SUPPORTED over a healthy pipe (the client reports
- * XR_ERROR_FEATURE_UNSUPPORTED). A transient refusal (keyed-mutex miss) is
+ * Implemented on the Windows D3D11 service (d3d11_lift.cpp) and on the Android
+ * comp_multi service (comp_multi_lift_android.c — every handler below dispatches
+ * there when the D3D11 service compositor is absent); every other service
+ * answers modes 0 / XRT_ERROR_FEATURE_NOT_SUPPORTED over a healthy pipe (the
+ * client reports XR_ERROR_FEATURE_UNSUPPORTED). A transient refusal (keyed-mutex miss) is
  * XRT_ERROR_WEAVE_REFUSED, never XRT_ERROR_IPC_FAILURE — the latter would mark
  * the caller's session lost over a perfectly healthy pipe (browser#103).
  *
@@ -8119,7 +8127,7 @@ require_lift_client(volatile struct ipc_client_state *ics, const char *what)
 	return XRT_SUCCESS;
 }
 
-#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR) || defined(XRT_OS_ANDROID)
 //! This connection's owner token, taken on first use from a server-wide counter.
 static uint64_t
 lift_owner(volatile struct ipc_client_state *ics)
@@ -8131,13 +8139,6 @@ lift_owner(volatile struct ipc_client_state *ics)
 		os_mutex_unlock(&ics->server->global_state.lock);
 	}
 	return ics->lift_owner;
-}
-
-static struct xrt_system_compositor *
-lift_xsysc(volatile struct ipc_client_state *ics)
-{
-	struct xrt_system_compositor *xsysc = ics->server != NULL ? ics->server->xsysc : NULL;
-	return comp_d3d11_service_is_d3d11_service(xsysc) ? xsysc : NULL;
 }
 
 static void
@@ -8153,6 +8154,28 @@ lift_params_from_ipc(const struct ipc_lift_params *in, struct xrt_dp_lift_params
 }
 #endif
 
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+static struct xrt_system_compositor *
+lift_xsysc(volatile struct ipc_client_state *ics)
+{
+	struct xrt_system_compositor *xsysc = ics->server != NULL ? ics->server->xsysc : NULL;
+	return comp_d3d11_service_is_d3d11_service(xsysc) ? xsysc : NULL;
+}
+#elif defined(XRT_OS_ANDROID)
+/*!
+ * The Android service's lift module (comp_multi_lift_android.h), created on
+ * first use. The Android service's system compositor is always comp_multi's
+ * (null compositor + multi — comp_multi_interface.h), in the main service and
+ * in every satellite process alike: one lift module per process.
+ */
+static struct comp_multi_lift *
+lift_android(volatile struct ipc_client_state *ics)
+{
+	return comp_multi_lift_for_system(ics->server != NULL ? ics->server->xsysc : NULL);
+}
+#endif
+
+
 void
 ipc_server_client_lift_release(volatile struct ipc_client_state *ics)
 {
@@ -8164,6 +8187,10 @@ ipc_server_client_lift_release(volatile struct ipc_client_state *ics)
 	if (xsysc != NULL) {
 		comp_d3d11_service_lift_release_owner(xsysc, ics->lift_owner);
 	}
+#elif defined(XRT_OS_ANDROID)
+	// Never CREATE the module just to release nothing.
+	comp_multi_lift_release_owner(comp_multi_lift_peek_system(ics->server != NULL ? ics->server->xsysc : NULL),
+	                              ics->lift_owner);
 #endif
 	ics->lift_owner = 0;
 }
@@ -8182,6 +8209,20 @@ ipc_handle_lift_get_properties(volatile struct ipc_client_state *ics, struct ipc
 	if (xsysc != NULL) {
 		struct xrt_dp_lift_caps caps;
 		comp_d3d11_service_lift_get_caps(xsysc, &caps);
+		out_props->modes = caps.modes;
+		out_props->max_streams = caps.max_streams;
+		out_props->max_views = caps.max_views;
+		out_props->depth_semantics = caps.depth_semantics;
+		out_props->state = caps.state;
+		out_props->typical_latency_ns = caps.typical_latency_ns;
+		memcpy(out_props->backend, caps.backend, sizeof(out_props->backend));
+		out_props->backend[sizeof(out_props->backend) - 1] = '\0';
+	}
+#elif defined(XRT_OS_ANDROID)
+	struct comp_multi_lift *l = lift_android(ics);
+	if (l != NULL) {
+		struct xrt_dp_lift_caps caps;
+		comp_multi_lift_get_caps(l, &caps);
 		out_props->modes = caps.modes;
 		out_props->max_streams = caps.max_streams;
 		out_props->max_views = caps.max_views;
@@ -8219,6 +8260,16 @@ ipc_handle_lift_stream_create(volatile struct ipc_client_state *ics,
 		info.input_scale = input_scale;
 		return comp_d3d11_service_lift_stream_create(xsysc, lift_owner(ics), &info, out_stream_id);
 	}
+#elif defined(XRT_OS_ANDROID)
+	struct comp_multi_lift *l = lift_android(ics);
+	if (l != NULL) {
+		struct xrt_dp_lift_stream_info info = {0};
+		info.struct_size = (uint32_t)sizeof(info);
+		info.mode = mode;
+		info.content_hint = content_hint;
+		info.input_scale = input_scale;
+		return comp_multi_lift_stream_create(l, lift_owner(ics), &info, out_stream_id);
+	}
 #else
 	(void)mode;
 	(void)content_hint;
@@ -8239,6 +8290,10 @@ ipc_handle_lift_stream_destroy(volatile struct ipc_client_state *ics, uint64_t s
 	struct xrt_system_compositor *xsysc = lift_xsysc(ics);
 	if (xsysc != NULL && ics->lift_owner != 0) {
 		comp_d3d11_service_lift_stream_destroy(xsysc, ics->lift_owner, stream_id);
+	}
+#elif defined(XRT_OS_ANDROID)
+	if (ics->lift_owner != 0) {
+		comp_multi_lift_stream_destroy(lift_android(ics), ics->lift_owner, stream_id);
 	}
 #else
 	(void)stream_id;
@@ -8288,6 +8343,25 @@ ipc_handle_lift_submit_frame(volatile struct ipc_client_state *ics,
 	                                      args->width, args->height, args->source_time,
 	                                      args->has_params ? &params : NULL, args->params.viewpoints,
 	                                      args->has_params ? 3 * vp_count : 0, out_frame_id);
+#elif defined(XRT_OS_ANDROID)
+	// The AHardwareBuffer the socket receive produced: the lift module owns it
+	// from here (adopted into its import cache, or released).
+	struct comp_multi_lift *l = lift_android(ics);
+	if (l == NULL) {
+		weave_submit_release_handles(handles, handle_count);
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	for (uint32_t i = 1; i < handle_count; i++) {
+		xrt_graphics_buffer_handle_t extra = handles[i];
+		u_graphics_buffer_unref(&extra);
+	}
+	struct xrt_dp_lift_params params;
+	lift_params_from_ipc(&args->params, &params);
+	uint32_t vp_count =
+	    args->params.viewpoint_count > IPC_LIFT_MAX_VIEWS ? IPC_LIFT_MAX_VIEWS : args->params.viewpoint_count;
+	return comp_multi_lift_submit_ahb(l, lift_owner(ics), args->stream_id, handles[0], args->width, args->height,
+	                                  args->source_time, args->has_params ? &params : NULL, args->params.viewpoints,
+	                                  args->has_params ? 3 * vp_count : 0, out_frame_id);
 #else
 	(void)args;
 	weave_submit_release_handles(handles, handle_count);
@@ -8315,6 +8389,23 @@ ipc_handle_lift_acquire_result(volatile struct ipc_client_state *ics,
 	}
 	struct xrt_lift_result r;
 	xrt_result_t xret = comp_d3d11_service_lift_acquire(xsysc, lift_owner(ics), stream_id, out_ready, &r);
+	out_lift_result->frame_id = r.frame_id;
+	out_lift_result->source_time = r.source_time;
+	out_lift_result->fence_value = r.fence_value;
+	out_lift_result->latency_ns = r.latency_ns;
+	out_lift_result->width = r.width;
+	out_lift_result->height = r.height;
+	out_lift_result->format = r.format;
+	out_lift_result->view_count = r.view_count;
+	out_lift_result->output_realloc = r.output_realloc ? 1u : 0u;
+	return xret;
+#elif defined(XRT_OS_ANDROID)
+	struct comp_multi_lift *l = lift_android(ics);
+	if (l == NULL) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	struct xrt_lift_result r;
+	xrt_result_t xret = comp_multi_lift_acquire_result(l, lift_owner(ics), stream_id, out_ready, &r);
 	out_lift_result->frame_id = r.frame_id;
 	out_lift_result->source_time = r.source_time;
 	out_lift_result->fence_value = r.fence_value;
@@ -8365,6 +8456,15 @@ ipc_handle_lift_get_output(volatile struct ipc_client_state *ics,
 		*out_handle_count = 1;
 		*out_have_output = true;
 	}
+#elif defined(XRT_OS_ANDROID)
+	xrt_graphics_buffer_handle_t h = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+	if (comp_multi_lift_export_output(lift_android(ics), lift_owner(ics), stream_id, &h, out_width, out_height,
+	                                  out_format)) {
+		// Borrowed: the socket send only reads it; the caller gets its own reference.
+		out_handles[0] = h;
+		*out_handle_count = 1;
+		*out_have_output = true;
+	}
 #else
 	(void)stream_id;
 	(void)out_handles;
@@ -8399,6 +8499,7 @@ ipc_handle_lift_get_fence(volatile struct ipc_client_state *ics,
 		*out_have_fence = true;
 	}
 #else
+	// Android: no fence — every acquire completed on the GPU before its reply.
 	(void)stream_id;
 	(void)out_handles;
 #endif
@@ -8445,6 +8546,29 @@ ipc_handle_lift_acquire_blob(volatile struct ipc_client_state *ics, uint64_t str
 			}
 		}
 	}
+#elif defined(XRT_OS_ANDROID)
+	if (reply.result == XRT_SUCCESS) {
+		struct comp_multi_lift *l = lift_android(ics);
+		if (l == NULL) {
+			reply.result = XRT_ERROR_FEATURE_NOT_SUPPORTED;
+		} else {
+			uint64_t cap = capacity > IPC_LIFT_BLOB_MAX_BYTES ? IPC_LIFT_BLOB_MAX_BYTES : capacity;
+			struct xrt_lift_blob_info info;
+			bool ready = false;
+			reply.result =
+			    comp_multi_lift_acquire_blob(l, lift_owner(ics), stream_id, cap, &ready, &info, &bytes);
+			reply.ready = ready;
+			reply.frame_id = info.frame_id;
+			reply.source_time = info.source_time;
+			reply.format = info.format;
+			reply.byte_count = info.byte_count;
+			if (reply.result == XRT_SUCCESS && info.byte_count > IPC_LIFT_BLOB_MAX_BYTES) {
+				reply.result = XRT_ERROR_ALLOCATION;
+				free(bytes);
+				bytes = NULL;
+			}
+		}
+	}
 #else
 	(void)stream_id;
 	(void)capacity;
@@ -8478,7 +8602,7 @@ ipc_handle_lift_weave_rects(volatile struct ipc_client_state *ics, const struct 
 	if (args->count > IPC_LIFT_WEAVE_RECTS_MAX) {
 		return XRT_ERROR_IPC_FAILURE; // untrusted wire
 	}
-#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR) || defined(XRT_OS_ANDROID)
 	struct xrt_lift_weave_rect rects[IPC_LIFT_WEAVE_RECTS_MAX];
 	for (uint32_t i = 0; i < args->count; i++) {
 		const struct ipc_lift_weave_rect *w = &args->rects[i];
@@ -8493,7 +8617,12 @@ ipc_handle_lift_weave_rects(volatile struct ipc_client_state *ics, const struct 
 		rects[i].params.view_count = w->view_count > IPC_LIFT_MAX_VIEWS ? IPC_LIFT_MAX_VIEWS : w->view_count;
 		rects[i].params.focal_px = w->focal_px;
 	}
-	if (!comp_d3d11_service_lift_set_weave_rects(ics->xc, lift_owner(ics), args->count, rects)) {
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	const bool accepted = comp_d3d11_service_lift_set_weave_rects(ics->xc, lift_owner(ics), args->count, rects);
+#else
+	const bool accepted = comp_multi_lift_set_weave_rects(ics->xc, lift_owner(ics), args->count, rects);
+#endif
+	if (!accepted) {
 		// A rect naming a stream this connection does not own (or a non-SBS/NVIEW
 		// one): refused, non-fatal. The submit then weaves those rects as drawn.
 		return XRT_ERROR_WEAVE_REFUSED;
@@ -8517,6 +8646,11 @@ ipc_handle_lift_stream_set_priority(volatile struct ipc_client_state *ics, uint6
 	if (xsysc != NULL) {
 		return comp_d3d11_service_lift_set_priority(xsysc, lift_owner(ics), stream_id, priority);
 	}
+#elif defined(XRT_OS_ANDROID)
+	struct comp_multi_lift *l = lift_android(ics);
+	if (l != NULL) {
+		return comp_multi_lift_set_priority(l, lift_owner(ics), stream_id, priority);
+	}
 #else
 	(void)stream_id;
 	(void)priority;
@@ -8539,6 +8673,11 @@ ipc_handle_lift_stream_stats(volatile struct ipc_client_state *ics,
 	struct xrt_system_compositor *xsysc = lift_xsysc(ics);
 	if (xsysc != NULL) {
 		return comp_d3d11_service_lift_get_stats(xsysc, lift_owner(ics), stream_id, out_stats);
+	}
+#elif defined(XRT_OS_ANDROID)
+	struct comp_multi_lift *l = lift_android(ics);
+	if (l != NULL) {
+		return comp_multi_lift_get_stats(l, lift_owner(ics), stream_id, out_stats);
 	}
 #else
 	(void)stream_id;

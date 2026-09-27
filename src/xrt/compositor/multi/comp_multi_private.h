@@ -22,6 +22,7 @@
 #include "xrt/xrt_weave_dmabuf.h"
 #include "xrt/xrt_compositor.h"
 #include "xrt/xrt_display_processor.h"
+#include "xrt/xrt_lift.h" // XR_DXR_lift weave-rect latch (ADR-042, Android)
 
 #include "os/os_time.h"
 #include "os/os_threading.h"
@@ -46,6 +47,7 @@ struct comp_target;
 struct xrt_eye_positions;
 struct xrt_weave_atlas_layout;
 struct android_custom_surface;
+struct comp_multi_lift;
 struct xrt_window_metrics;
 struct xrt_system_devices;
 
@@ -809,6 +811,16 @@ struct multi_compositor
 		//! top/left-inset assumption documented at the computation.
 		int32_t sat_off_x, sat_off_y;
 		//! @}
+
+		//! @name XR_DXR_lift (ADR-042) — the lift-flagged rects of the NEXT submit
+		//! Latched by the lift_weave_rects IPC call (comp_multi_lift_set_weave_rects)
+		//! immediately before its weave_submit, consumed (and cleared) by that
+		//! submit. Guarded by @ref mutex.
+		//! @{
+		uint32_t lift_rect_count;
+		uint64_t lift_owner;
+		struct xrt_lift_weave_rect lift_rects[XRT_LIFT_WEAVE_RECTS_MAX];
+		//! @}
 	} weave;
 #endif
 
@@ -1178,6 +1190,14 @@ struct multi_system_compositor
 	 * converges.
 	 */
 	int android_window_valid_state;
+
+	/*!
+	 * XR_DXR_lift (ADR-042): the process's 2D→3D conversion module — its own
+	 * thread and lift-only display processor (comp_multi_lift_android.h).
+	 * Created lazily on the first lift call; destroyed in system_compositor_destroy
+	 * BEFORE the native compositor (which owns the Vulkan device).
+	 */
+	struct comp_multi_lift *lift;
 #endif
 
 #ifdef XRT_OS_MACOS
@@ -1365,6 +1385,17 @@ comp_multi_weave_android_satellite_clear(struct multi_compositor *mc);
  */
 bool
 comp_multi_weave_android_satellite_presented(struct multi_compositor *mc);
+
+/*!
+ * XR_DXR_lift (ADR-042): latch the lift-flagged rects of this client's NEXT
+ * weave submit (count 0 clears). Called by comp_multi_lift_set_weave_rects
+ * after it validated the streams; takes mc->weave.mutex.
+ */
+void
+comp_multi_weave_android_set_lift_rects(struct multi_compositor *mc,
+                                        uint64_t owner,
+                                        uint32_t count,
+                                        const struct xrt_lift_weave_rect *rects);
 #endif
 
 bool

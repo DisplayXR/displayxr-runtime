@@ -6,8 +6,9 @@
  * @author David Fattal
  * @ingroup oxr_api
  *
- * The conversion runs in the service (d3d11_lift.cpp, its own thread and
- * device); these entry points validate, forward to thin IPC-client bridges
+ * The conversion runs in the service (Windows: d3d11_lift.cpp, its own thread
+ * and device; Android: comp_multi_lift_android.c, AHardwareBuffer in / out, no
+ * fence — synchronous completion); these entry points validate, forward to thin IPC-client bridges
  * (ipc_client_compositor.c — st_oxr does not pull the ipc_client include path,
  * so the symbols resolve at link time, the oxr_weave.c pattern) and translate
  * results. IPC-only, like XR_DXR_weave: an in-process session reports
@@ -35,6 +36,8 @@
 #include "util/u_logging.h"
 
 #include "xrt/xrt_lift.h"
+
+#include "oxr_weave_latch.h" // the export-latch rule shared with XR_DXR_weave (#1427)
 
 #include <stdlib.h>
 #include <string.h>
@@ -425,7 +428,9 @@ oxr_xrAcquireLiftResultDXR(XrLiftStreamDXR stream, XrLiftResultDXR *result)
 			result->fence = (void *)(intptr_t)fh;
 		}
 		// Latch only on a complete export (the #1427 rule): a miss retries.
-		st->exported = got_tex && got_fence;
+		// Only Windows exports a fence; Android completes every acquire on the
+		// GPU before the reply, so its texture alone is the complete export.
+		st->exported = oxr_weave_should_latch_export(oxr_weave_platform_exports_fence(), got_tex, got_fence);
 	}
 	return XR_SUCCESS;
 }

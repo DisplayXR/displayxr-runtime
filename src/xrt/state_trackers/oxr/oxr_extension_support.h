@@ -754,13 +754,16 @@
  *
  * Hand-added DisplayXR extension (generate_oxr_ext_support.py knows nothing of
  * the DisplayXR blocks — keep them when regenerating). 2D→3D conversion streams
- * (ADR-042). Advertised on every desktop platform the weave service is (it is
- * an IPC-only service like XR_DXR_weave); the conversion module itself is
- * implemented by the Windows D3D11 service, and everywhere else
- * xrGetLiftPropertiesDXR honestly reports supportedModes 0 / UNAVAILABLE.
+ * (ADR-042). Advertised everywhere the weave service is (it is an IPC-only
+ * service like XR_DXR_weave; an in-process session gets
+ * XR_ERROR_FEATURE_UNSUPPORTED from every entry point). The conversion module
+ * itself is implemented by the Windows D3D11 service (d3d11_lift.cpp) and the
+ * Android comp_multi service (comp_multi_lift_android.c, AHardwareBuffer in /
+ * out); on macOS and desktop Linux xrGetLiftPropertiesDXR honestly reports
+ * supportedModes 0 / UNAVAILABLE.
  */
 #if defined(XR_DXR_lift) && (defined(XR_USE_PLATFORM_WIN32) || defined(XR_USE_PLATFORM_MACOS) ||                       \
-                             (defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)))
+                             defined(XR_USE_PLATFORM_ANDROID) || (defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)))
 #define OXR_HAVE_DXR_lift
 #define OXR_EXTENSION_SUPPORT_DXR_lift(_) \
     _(DXR_lift, DXR_LIFT)
