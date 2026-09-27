@@ -170,6 +170,13 @@ jobs:
         # Plain gjs drives the shipped file; no GNOME Shell needed.
         run: gjs scripts/test_gnome_extension_lattice.js
 
+      - name: Pointer drag ends on its button
+        # Unit test for PointerDrag in lib.js (extension version 9): the
+        # extension's own drag for a secondary-button content drag, which
+        # mutter's move grab would never end. Plain gjs drives the shipped
+        # file; no GNOME Shell needed.
+        run: gjs scripts/test_gnome_extension_pointer_drag.js
+
   cnsdk-pin-guard:
     runs-on: ubuntu-latest
     steps:
