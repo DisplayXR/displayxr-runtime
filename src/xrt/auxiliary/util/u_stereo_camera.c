@@ -91,6 +91,40 @@ u_stereo_camera_ring_clear(struct u_stereo_camera_ring *r)
 
 /*
  *
+ * Source-rate meter.
+ *
+ */
+
+void
+u_stereo_camera_rate_meter_restart(struct u_stereo_camera_rate_meter *m)
+{
+	m->first_ns = 0;
+	m->last_ns = 0;
+	m->intervals = 0;
+}
+
+bool
+u_stereo_camera_rate_meter_push(struct u_stereo_camera_rate_meter *m, int64_t t_ns)
+{
+	if (m->first_ns == 0 || t_ns <= m->last_ns || t_ns - m->last_ns > U_STEREO_CAMERA_RATE_GAP_NS) {
+		m->first_ns = t_ns;
+		m->last_ns = t_ns;
+		m->intervals = 0;
+		return false;
+	}
+	m->last_ns = t_ns;
+	if (++m->intervals < U_STEREO_CAMERA_RATE_WINDOW) {
+		return false;
+	}
+	m->rate = (float)((double)m->intervals * 1e9 / (double)(m->last_ns - m->first_ns));
+	m->first_ns = t_ns; // the next window starts here
+	m->intervals = 0;
+	return true;
+}
+
+
+/*
+ *
  * Decimator.
  *
  */
