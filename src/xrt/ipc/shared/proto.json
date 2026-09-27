@@ -725,7 +725,11 @@
 			{"name": "origin_y", "type": "int32_t"},
 			{"name": "client_w", "type": "uint32_t"},
 			{"name": "client_h", "type": "uint32_t"},
-			{"name": "display_id", "type": "int32_t"}
+			{"name": "display_id", "type": "int32_t"},
+			{"name": "logical_valid", "type": "uint32_t"},
+			{"name": "logical_x", "type": "int32_t"},
+			{"name": "logical_y", "type": "int32_t"},
+			{"name": "logical_scale", "type": "float"}
 		]
 	},
 
@@ -769,7 +773,8 @@
 			{"name": "width", "type": "uint32_t"},
 			{"name": "height", "type": "uint32_t"},
 			{"name": "fence_value", "type": "uint64_t"},
-			{"name": "eyes", "type": "struct xrt_eye_positions"}
+			{"name": "eyes", "type": "struct xrt_eye_positions"},
+			{"name": "origin", "type": "struct ipc_weave_woven_origin"}
 		],
 		"in_handles": {"type": "xrt_graphics_buffer_handle_t"},
 		"out_handles": {"type": "xrt_graphics_sync_handle_t", "name": "release_fences"}

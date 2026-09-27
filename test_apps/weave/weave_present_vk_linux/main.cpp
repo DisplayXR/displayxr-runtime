@@ -40,7 +40,12 @@
  *      the display processor phases the interlace to. X11:
  * XTranslateCoordinates. Wayland: the window-geometry@displayxr.org GNOME Shell
  * extension's GetWindows, converted with u_wayland_geom.h (logical x fractional
- *      scale, monitor-relative, plus the runtime's own panel origin).
+ *      scale, monitor-relative, plus the runtime's own panel origin). Spec
+ *      v12: where the logical origin is known (Wayland) it is bound too
+ *      (XrWeaveWindowLogicalOriginDXR), and every submit reads back the
+ *      origin its output was woven for (XrWeaveOutputOriginDXR) — what a
+ *      present-owner tags its commit with for move-synchronised drag (§9 of
+ *      docs/specs/runtime/wayland-window-geometry.md).
  *   5. DRAG. The window helper's drag goes through the display processor's
  *      snap (DxrWeaveSnap -> xrWeaveSnapWindowRectDXR): every step on X11, and
  *      on Wayland the compositor-run drag lattice (SetDragLattice). After a
@@ -62,8 +67,13 @@
  *                      presented frame == the woven output, or == the SBS input
  *                      with --sbs; woven non-black and != SBS; HUD composited;
  *                      fd counts flat; with --expect-anaglyph, woven ==
- *                      anaglyph(SBS)) and PNGs of the woven output, the SBS
- *                      input and the presented frame. Exit code 0 = PASS.
+ *                      anaglyph(SBS); spec v12: every output reports the
+ *                      origin bound at the last xrWeaveBindWindow2DXR, the
+ *                      logical origin echoed verbatim and a strictly
+ *                      increasing serial, while the fixed headless "window"
+ *                      re-binds every few frames) and PNGs of the woven
+ *                      output, the SBS input and the presented frame. Exit
+ *                      code 0 = PASS.
  *                      --test-resize=WxH@N reallocates mid-run, as a window
  *                      resize or F11 does.
  *   --lattice-selftest one Wayland drag-lattice table build per output scale
@@ -416,7 +426,23 @@ struct App
 	int32_t geom_x = 0,
 	        geom_y = 0; //!< bound client origin, desktop-absolute DEVICE px
 	uint32_t geom_w = 0, geom_h = 0;
+	//! v12: the logical origin bound with geom_x/y (Wayland; headless fakes one).
+	bool geom_have_logical = false;
+	int32_t geom_lx = 0, geom_ly = 0;
+	float geom_scale = 0.0f;
 	const char *geom_source = "none";
+
+	// ---- v12 woven-origin check (XrWeaveOutputOriginDXR), every submit
+	struct
+	{
+		uint64_t outputs = 0;     //!< submits that reported an output
+		uint64_t origin_bad = 0;  //!< device origin != the last bind
+		uint64_t logical_bad = 0; //!< logical echo != the last bind
+		uint64_t serial_bad = 0;  //!< serial not strictly increasing
+		uint64_t last_serial = 0;
+		uint64_t distinct = 0; //!< distinct woven origins seen
+		int32_t last_x = INT32_MIN, last_y = INT32_MIN;
+	} v12;
 	bool warned_no_geom = false;
 	double fps = 0.0;
 	int64_t fps_t0 = 0;
@@ -1257,13 +1283,29 @@ create_swapchain()
 
 //! This frame's client rect, desktop-absolute DEVICE px. False = unknown.
 static bool
-query_geometry(int32_t *x, int32_t *y, const char **source, WlOwnWindow *wl_out)
+query_geometry(int32_t *x,
+               int32_t *y,
+               const char **source,
+               WlOwnWindow *wl_out,
+               bool *have_logical,
+               int32_t *lx,
+               int32_t *ly,
+               float *lscale)
 {
+	*have_logical = false;
 	if (g.headless) {
-		// A fixed, deliberately non-origin spot on the panel, like the probe.
-		*x = g.panel_left + 64;
-		*y = g.panel_top + 48;
-		*source = "headless (fixed)";
+		// A deliberately non-origin spot on the panel, like the probe — stepped
+		// a few px every 4 frames so the v12 check sees the woven origin follow
+		// re-binds. The logical origin is a fake 150 % desktop's: the runtime
+		// must echo it verbatim, whatever it is.
+		const int32_t step = (int32_t)((g.frame / 4) % 8);
+		*x = g.panel_left + 64 + step * 3;
+		*y = g.panel_top + 48 + step * 2;
+		*have_logical = true;
+		*lx = 1000 + step * 2;
+		*ly = -7 + step; // negative on purpose: a window above the stage origin
+		*lscale = 1.5f;
+		*source = "headless (stepped)";
 		return true;
 	}
 #ifdef DXR_APP_HAVE_WAYLAND
@@ -1286,6 +1328,12 @@ query_geometry(int32_t *x, int32_t *y, const char **source, WlOwnWindow *wl_out)
 		                                    content.logical_h, &rel)) {
 			return false;
 		}
+		// v12: the logical content origin this device origin was derived
+		// from — the quantity a move-sync tag encodes.
+		*have_logical = true;
+		*lx = content.logical_x;
+		*ly = content.logical_y;
+		*lscale = (float)ww.mon_scale;
 		// Monitor-relative is the exact quantity; the absolute base is the
 		// runtime's own panel origin when this IS the panel (so the service's
 		// window - panel subtraction is exact), else the monitor's converted
@@ -1327,7 +1375,10 @@ update_geometry(WlOwnWindow *wl_out, bool *have_wl)
 	const char *src = "none";
 	*have_wl = false;
 	WlOwnWindow ww;
-	bool known = query_geometry(&x, &y, &src, &ww);
+	bool have_logical = false;
+	int32_t lx = 0, ly = 0;
+	float lscale = 0.0f;
+	bool known = query_geometry(&x, &y, &src, &ww, &have_logical, &lx, &ly, &lscale);
 	if (known && !g.headless && g.window.backend() == DxrWindowBackend::Wayland) {
 		*wl_out = ww;
 		*have_wl = true;
@@ -1347,14 +1398,23 @@ update_geometry(WlOwnWindow *wl_out, bool *have_wl)
 		x = g.panel_left;
 		y = g.panel_top;
 		src = "unknown (panel origin)";
+		have_logical = false;
 	}
-	if (g.have_geom && x == g.geom_x && y == g.geom_y && g.w == g.geom_w && g.h == g.geom_h) {
+	if (g.have_geom && x == g.geom_x && y == g.geom_y && g.w == g.geom_w && g.h == g.geom_h &&
+	    have_logical == g.geom_have_logical &&
+	    (!have_logical || (lx == g.geom_lx && ly == g.geom_ly && lscale == g.geom_scale))) {
 		return true;
 	}
 	XrWeaveWindowGeometryDXR geom = {XR_TYPE_WEAVE_WINDOW_GEOMETRY_DXR};
 	geom.windowOriginOnScreen = {x, y};
 	geom.clientSize = {(int32_t)g.w, (int32_t)g.h};
 	geom.displayId = -1;
+	XrWeaveWindowLogicalOriginDXR logical = {XR_TYPE_WEAVE_WINDOW_LOGICAL_ORIGIN_DXR};
+	logical.logicalOrigin = {lx, ly};
+	logical.scale = lscale;
+	if (have_logical) {
+		geom.next = &logical; // v12
+	}
 	XrWeaveBindWindowInfoDXR bind = {XR_TYPE_WEAVE_BIND_WINDOW_INFO_DXR};
 	bind.next = &geom;
 	// X11: the XID, recorded by the service for diagnostics only. Wayland: a
@@ -1376,6 +1436,10 @@ update_geometry(WlOwnWindow *wl_out, bool *have_wl)
 	g.geom_y = y;
 	g.geom_w = g.w;
 	g.geom_h = g.h;
+	g.geom_have_logical = have_logical;
+	g.geom_lx = lx;
+	g.geom_ly = ly;
+	g.geom_scale = lscale;
 	g.geom_source = src;
 	g.overlay_dirty = true;
 	g.weave_snap.set_extent(g.w, g.h);
@@ -1747,6 +1811,61 @@ render_and_release(int k, bool upload_overlay, int *acq_fd)
 }
 
 /*!
+ * Spec v12: the output this submit produced must report the origin bound at the
+ * last xrWeaveBindWindow2DXR (the weave runs inside the submit, so the bind in
+ * effect at weave time IS the last one), the logical origin echoed verbatim, and
+ * a serial that strictly increases. A present-owner would tag its commit with
+ * (wovenOriginLogical mod 256) here.
+ */
+static void
+check_woven_origin(const XrWeaveOutputOriginDXR &o)
+{
+	auto &v = g.v12;
+	v.outputs++;
+	const bool origin_ok = g.have_geom && o.valid == XR_TRUE && o.wovenOriginOnScreen.x == g.geom_x &&
+	                       o.wovenOriginOnScreen.y == g.geom_y;
+	const bool logical_ok = g.geom_have_logical
+	                            ? (o.logicalValid == XR_TRUE && o.wovenOriginLogical.x == g.geom_lx &&
+	                               o.wovenOriginLogical.y == g.geom_ly && o.logicalScale == g.geom_scale)
+	                            : o.logicalValid == XR_FALSE;
+	const bool serial_ok = o.serial > v.last_serial;
+	if (!origin_ok) {
+		v.origin_bad++;
+	}
+	if (!logical_ok) {
+		v.logical_bad++;
+	}
+	if (!serial_ok) {
+		v.serial_bad++;
+	}
+	if ((!origin_ok || !logical_ok || !serial_ok) && v.origin_bad + v.logical_bad + v.serial_bad <= 3) {
+		LOGW(
+		    "v12 woven origin MISMATCH (frame %llu): valid=%d (%d,%d) logical=%d (%d,%d)@%.3f serial %llu; "
+		    "bound "
+		    "(%d,%d) logical=%d (%d,%d)@%.3f, last serial %llu",
+		    (unsigned long long)g.frame, (int)o.valid, o.wovenOriginOnScreen.x, o.wovenOriginOnScreen.y,
+		    (int)o.logicalValid, o.wovenOriginLogical.x, o.wovenOriginLogical.y, (double)o.logicalScale,
+		    (unsigned long long)o.serial, g.geom_x, g.geom_y, (int)g.geom_have_logical, g.geom_lx, g.geom_ly,
+		    (double)g.geom_scale, (unsigned long long)v.last_serial);
+	}
+	if (o.valid == XR_TRUE && (o.wovenOriginOnScreen.x != v.last_x || o.wovenOriginOnScreen.y != v.last_y)) {
+		v.distinct++;
+		v.last_x = o.wovenOriginOnScreen.x;
+		v.last_y = o.wovenOriginOnScreen.y;
+		if (g.headless || v.distinct <= 2) {
+			// The tag a move-synchronised present-owner would attach
+			// (non-negative mod 256, §9). Logged on origin change only.
+			auto tag = [](int32_t l) { return ((l % 256) + 256) % 256; };
+			LOGI("v12 woven origin (%d,%d) logical (%d,%d)@%.3f serial %llu -> move-sync tag (%d,%d)",
+			     o.wovenOriginOnScreen.x, o.wovenOriginOnScreen.y, o.wovenOriginLogical.x,
+			     o.wovenOriginLogical.y, (double)o.logicalScale, (unsigned long long)o.serial,
+			     tag(o.wovenOriginLogical.x), tag(o.wovenOriginLogical.y));
+		}
+	}
+	v.last_serial = o.serial;
+}
+
+/*!
  * xrWeaveSubmitDXR, spec v10. Every fd passed in is the runtime's on success
  * and still ours otherwise. @p release_fd receives this frame's release fence.
  */
@@ -1782,8 +1901,10 @@ weave_submit(int k, bool with_overlay, int acq_fd, int *release_fd)
 	submit.next = &batch;
 	submit.firstChunk = XR_TRUE;
 
+	XrWeaveOutputOriginDXR out_origin = {XR_TYPE_WEAVE_OUTPUT_ORIGIN_DXR}; // v12, zeroed
 	XrWeaveOutputSyncDXR out_sync = {XR_TYPE_WEAVE_OUTPUT_SYNC_DXR};
 	out_sync.releaseFenceFd = -1;
+	out_sync.next = &out_origin;
 	XrWeaveOutputDmabufDXR out_dmabuf = {XR_TYPE_WEAVE_OUTPUT_DMABUF_DXR};
 	out_dmabuf.fd = -1;
 	out_dmabuf.next = &out_sync;
@@ -1798,6 +1919,7 @@ weave_submit(int k, bool with_overlay, int acq_fd, int *release_fd)
 		close(acq_fd);
 		return r;
 	}
+	check_woven_origin(out_origin);
 	if (out.eyeCount >= 2 && out.eyesValid) {
 		g.eyes[0] = out.eyes[0];
 		g.eyes[1] = out.eyes[1];
@@ -2340,6 +2462,12 @@ run()
 	    "%d -> %d",
 	    total, fds_early, fds_late, g.opt.service_pid, svc_early, svc_late);
 	check(fds_early == fds_late && svc_early == svc_late, "fd counts flat");
+	LOGI("v12: %llu outputs, %llu distinct woven origins, last serial %llu", (unsigned long long)g.v12.outputs,
+	     (unsigned long long)g.v12.distinct, (unsigned long long)g.v12.last_serial);
+	check(g.v12.outputs > 0 && g.v12.origin_bad == 0, "v12 woven origin == last bound origin, every output");
+	check(g.v12.outputs > 0 && g.v12.logical_bad == 0, "v12 logical origin + scale echoed verbatim");
+	check(g.v12.outputs > 0 && g.v12.serial_bad == 0, "v12 serial strictly increasing per output");
+	check(total < 8 || g.v12.distinct >= 2, "v12 woven origin followed the re-binds");
 	LOGI("%s", pass ? "PASS" : "FAIL");
 	return pass ? 0 : 1;
 }

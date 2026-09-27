@@ -20,6 +20,7 @@
 
 #include "xrt/xrt_config_os.h"
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -78,6 +79,34 @@ struct xrt_weave_dmabuf_output_desc
 	uint32_t strides[XRT_WEAVE_DMABUF_MAX_PLANES];
 	//! Total allocation size in bytes (what an OPAQUE_FD-style importer needs).
 	uint64_t size;
+};
+
+/*!
+ * XR_DXR_weave v12 (browser-pvt#180): the present-owner's own LOGICAL window
+ * origin + output scale, latched verbatim beside the device-pixel geometry of the
+ * same bind. The engine never converts between the two spaces.
+ */
+struct xrt_weave_logical_origin
+{
+	bool valid; //!< false = the bind carried no logical origin (clears the latch)
+	int32_t x, y;
+	float scale;
+};
+
+/*!
+ * XR_DXR_weave v12 (browser-pvt#180): the bound origin one woven output was
+ * woven for — the geometry the engine fed the DP's phase slot for that weave,
+ * captured inside the weave under the engine lock.
+ */
+struct xrt_weave_woven_origin
+{
+	bool valid;          //!< a device-pixel geometry was bound for this weave
+	int32_t x, y;        //!< that geometry's origin, desktop-absolute device px
+	bool logical_valid;  //!< the same bind carried a logical origin
+	int32_t logical_x;   //!< echoed verbatim
+	int32_t logical_y;   //!< echoed verbatim
+	float logical_scale; //!< echoed verbatim
+	uint64_t serial;     //!< per woven output, monotonic, >= 1; 0 = none
 };
 
 #ifdef __cplusplus

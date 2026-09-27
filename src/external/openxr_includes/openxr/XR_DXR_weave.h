@@ -190,7 +190,41 @@
  * woven output), and sync_file fences XrWeaveSubmitSyncDXR (acquire, in) /
  * XrWeaveOutputSyncDXR (release, out, every frame); 11 = bulk grid snap
  * (#1723): xrWeaveSnapWindowGridDXR + XrWeaveSnapGridInfoDXR /
- * XrWeaveSnapGridPointDXR — one call per drag instead of one per probed point.
+ * XrWeaveSnapGridPointDXR — one call per drag instead of one per probed point;
+ * 12 = woven origin per output (browser-pvt#180): XrWeaveOutputOriginDXR (out,
+ * chained on XrWeaveOutputDXR — the origin each woven output was woven for, plus
+ * a per-output serial) and XrWeaveWindowLogicalOriginDXR (in, chained on
+ * XrWeaveBindWindowInfoDXR — the caller's own LOGICAL origin + scale, echoed
+ * back verbatim), so a present-owner can tag its own Wayland commit for
+ * move-synchronised drag.
+ *
+ * Woven origin per output (SPEC_VERSION 12, browser-pvt#180). On native Wayland
+ * (GNOME extension version 9+) a drag is MOVE-SYNCHRONISED: the extension holds
+ * the window's actor at the position the buffer it is about to paint was woven
+ * for, so every painted frame is phase-correct at any logical position. It learns
+ * that position from a per-commit TAG — a 1x1 synchronised subsurface of the
+ * committed surface at (x mod 256, y mod 256) of the LOGICAL content origin the
+ * frame was woven for (docs/specs/runtime/wayland-window-geometry.md §9). A
+ * window-bound runtime session tags its own commits. A present-owner commits the
+ * woven pixels ITSELF, so it has to tag them itself — and for that it needs to
+ * know, per woven output, which bound origin the weave used, because a re-bind
+ * (every move) and the weave that consumes it are not the same moment.
+ *
+ *  - OUT. Chain an XrWeaveOutputOriginDXR onto XrWeaveOutputDXR::next. Every
+ *    successful xrWeaveSubmitDXR fills it with the origin THIS submit's weave was
+ *    phase-locked to (the bind in effect when the runtime ran the weave — see the
+ *    struct) and a serial that increases with every woven output.
+ *  - IN. Chain an XrWeaveWindowLogicalOriginDXR onto XrWeaveBindWindowInfoDXR::next
+ *    beside the v7 XrWeaveWindowGeometryDXR to give the runtime the logical
+ *    origin + output scale the caller derived its device-pixel geometry from.
+ *    The runtime never converts device pixels back to logical ones (a fresh
+ *    rounding is exactly how a 150 % output lands one pixel off); it latches the
+ *    caller's pair with the device geometry and echoes it back per output.
+ *
+ * The runtime does NOT encode the tag. The presenter takes
+ * wovenOriginLogical mod 256 itself (non-negative modulo, so a window left of /
+ * above the stage origin still encodes), which MUST equal the runtime's
+ * COMP_VK_NATIVE_WL_MOVE_SYNC_TAG_MOD and the extension's MOVE_SYNC_TAG_MOD.
  *
  * Desktop-Linux dma-buf transport (SPEC_VERSION 10, #1699). A file descriptor is
  * an int, not a pointer, and carries no dimensions, format or tiling, so v10 does
@@ -230,7 +264,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_weave 1
-#define XR_DXR_weave_SPEC_VERSION 11
+#define XR_DXR_weave_SPEC_VERSION 12
 #define XR_DXR_WEAVE_EXTENSION_NAME "XR_DXR_weave"
 
 // Reserved 1004999190..199. Final values reconcile with the Khronos registry
@@ -259,6 +293,9 @@ extern "C" {
 #define XR_TYPE_WEAVE_OUTPUT_SYNC_DXR         ((XrStructureType)1004999245)
 // Spec v11 (#1723): bulk grid snap.
 #define XR_TYPE_WEAVE_SNAP_GRID_INFO_DXR      ((XrStructureType)1004999246)
+// Spec v12 (browser-pvt#180): woven origin per output, for present-owner move sync.
+#define XR_TYPE_WEAVE_OUTPUT_ORIGIN_DXR         ((XrStructureType)1004999247)
+#define XR_TYPE_WEAVE_WINDOW_LOGICAL_ORIGIN_DXR ((XrStructureType)1004999248)
 
 //! Upper bound on eye positions carried by XrWeaveSubmitInfoDXR (mirrors the
 //! runtime's XRT_MAX_VIEWS). Phase 1: carried but unused.
@@ -827,6 +864,91 @@ typedef struct XrWeaveSnapGridPointDXR {
     int8_t dx;
     int8_t dy;
 } XrWeaveSnapGridPointDXR;
+
+/*!
+ * @brief The caller's LOGICAL window origin, beside its device-pixel geometry
+ * (spec v12, browser-pvt#180).
+ *
+ * Chain onto XrWeaveBindWindowInfoDXR::next together with an
+ * XrWeaveWindowGeometryDXR (it is XR_ERROR_VALIDATION_FAILURE without one). It
+ * states the quantity a Wayland move-sync tag encodes: the top-left of the
+ * surface the caller presents the woven output in, in the compositor's global
+ * LOGICAL layout (mutter stage px — what the window-geometry@displayxr.org GNOME
+ * extension publishes), and @c scale, the output scale the caller converted it to
+ * XrWeaveWindowGeometryDXR::windowOriginOnScreen with.
+ *
+ * The runtime stores the pair VERBATIM, latched with the device-pixel geometry of
+ * the same bind, and echoes it in XrWeaveOutputOriginDXR::wovenOriginLogical /
+ * logicalScale for every output woven under that bind. It performs no conversion
+ * in either direction. A bind WITHOUT this struct clears the latch (the logical
+ * origin of the new geometry is unknown), so XrWeaveOutputOriginDXR::logicalValid
+ * is XR_FALSE until the next bind that carries one.
+ *
+ * Accepted on every platform; only desktop Linux reports it back today (the only
+ * platform with a logical coordinate space the drag protocol uses).
+ */
+typedef struct XrWeaveWindowLogicalOriginDXR {
+    XrStructureType          type;          //!< XR_TYPE_WEAVE_WINDOW_LOGICAL_ORIGIN_DXR
+    const void* XR_MAY_ALIAS next;
+    XrOffset2Di              logicalOrigin; //!< surface top-left, compositor-global LOGICAL px (y-down)
+    float                    scale;         //!< output scale used for logical -> device px; finite, > 0
+} XrWeaveWindowLogicalOriginDXR;
+
+/*!
+ * @brief The origin one woven output was woven for (spec v12, browser-pvt#180).
+ *
+ * Chain onto XrWeaveOutputDXR::next. Unlike the woven dma-buf (once per
+ * allocation) this is PER FRAME: every successful xrWeaveSubmitDXR rewrites it
+ * for the output that submit produced — the output the caller samples after
+ * waiting that submit's release fence.
+ *
+ * WHICH ORIGIN. The one the WEAVE used: the window geometry the runtime handed
+ * the display processor's phase slot when it ran this submit's weave, captured
+ * inside the weave under the lock that serialises it against
+ * xrWeaveBindWindow2DXR — the same per-weave snapshot the in-process Wayland
+ * compositor tags its own commits from. Today the weave runs synchronously
+ * within xrWeaveSubmitDXR, so it is also the geometry of the last
+ * xrWeaveBindWindow2DXR that returned before the submit; the contract is the
+ * weave-time one, so a later runtime that weaves asynchronously keeps it.
+ *
+ *  - @c valid: XR_TRUE when a geometry (XrWeaveWindowGeometryDXR) was bound when
+ *    this output was woven. XR_FALSE = display-scoped weave, nothing to tag with;
+ *    every origin field is then 0.
+ *  - @c wovenOriginOnScreen: that geometry's windowOriginOnScreen — absolute
+ *    physical px, y-down, the same space as
+ *    XrWeaveWindowGeometryDXR::windowOriginOnScreen. Echoed, not recomputed.
+ *  - @c logicalValid: XR_TRUE when that same bind carried an
+ *    XrWeaveWindowLogicalOriginDXR. Implies @c valid.
+ *  - @c wovenOriginLogical / @c logicalScale: that struct's logicalOrigin /
+ *    scale, VERBATIM (no conversion is ever applied — see
+ *    XrWeaveWindowLogicalOriginDXR). 0 when @c logicalValid is XR_FALSE.
+ *  - @c serial: increases by at least 1 with every woven output of this session
+ *    (first output >= 1); 0 when the path reports no origin at all. Two outputs
+ *    with the same serial are the same output.
+ *
+ * THE TAG. A move-synchronised present-owner tags the commit that presents this
+ * output with (wovenOriginLogical.x mod 256, wovenOriginLogical.y mod 256),
+ * non-negative modulo — docs/specs/runtime/wayland-window-geometry.md §9. The
+ * modulus is the extension's MOVE_SYNC_TAG_MOD and the runtime's
+ * COMP_VK_NATIVE_WL_MOVE_SYNC_TAG_MOD; it is deliberately not part of this API.
+ * Tag only when @c logicalValid.
+ *
+ * Filled on the desktop-Linux dma-buf submit path (XrWeaveDmabufDescDXR). Every
+ * other path of a v12 runtime writes @c valid = @c logicalValid = XR_FALSE and
+ * @c serial = 0, so a portable caller may always chain it. A runtime older than
+ * v12 never touches the struct: zero-initialise it (or check the enabled
+ * extension's spec version) so an untouched struct reads as "not reported".
+ */
+typedef struct XrWeaveOutputOriginDXR {
+    XrStructureType    type;                //!< XR_TYPE_WEAVE_OUTPUT_ORIGIN_DXR
+    void* XR_MAY_ALIAS next;
+    XrBool32           valid;               //!< a geometry was bound for this output's weave
+    XrOffset2Di        wovenOriginOnScreen; //!< absolute physical px (y-down), as XrWeaveWindowGeometryDXR
+    XrBool32           logicalValid;        //!< the bind also carried XrWeaveWindowLogicalOriginDXR
+    XrOffset2Di        wovenOriginLogical;  //!< that bind's logicalOrigin, verbatim (logical px)
+    float              logicalScale;        //!< that bind's scale, verbatim
+    uint64_t           serial;              //!< monotonic per woven output; 0 = not reported
+} XrWeaveOutputOriginDXR;
 
 typedef XrResult (XRAPI_PTR *PFN_xrWeaveBindWindowDXR)(
     XrSession session, void* windowHandle);

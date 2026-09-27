@@ -6272,7 +6272,11 @@ ipc_handle_weave_set_window_geometry(volatile struct ipc_client_state *ics,
                                      int32_t origin_y,
                                      uint32_t client_w,
                                      uint32_t client_h,
-                                     int32_t display_id)
+                                     int32_t display_id,
+                                     uint32_t logical_valid,
+                                     int32_t logical_x,
+                                     int32_t logical_y,
+                                     float logical_scale)
 {
 	IPC_TRACE_MARKER();
 
@@ -6285,13 +6289,39 @@ ipc_handle_weave_set_window_geometry(volatile struct ipc_client_state *ics,
 		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
 	}
 
-#if defined(COMP_MULTI_HAVE_WEAVE)
+#if defined(COMP_MULTI_HAVE_WEAVE) && defined(XRT_OS_LINUX_DESKTOP)
+	// v12 (browser-pvt#180): the logical half is latched with the device half
+	// under one engine lock. The wire is not trusted: a non-positive or
+	// non-finite scale (the client validated it) is treated as "no logical".
+	struct xrt_weave_logical_origin logical = {0};
+	if (logical_valid != 0 && logical_scale > 0.0f && logical_scale <= 64.0f) {
+		logical.valid = true;
+		logical.x = logical_x;
+		logical.y = logical_y;
+		logical.scale = logical_scale;
+	}
+	if (!comp_multi_weave_set_window_geometry_logical(ics->xc, origin_x, origin_y, client_w, client_h, display_id,
+	                                                  &logical)) {
+		return XRT_ERROR_WEAVE_REFUSED;
+	}
+	return XRT_SUCCESS;
+#elif defined(COMP_MULTI_HAVE_WEAVE)
+	// macOS / Android: no logical coordinate space in the drag protocol there,
+	// so v12's logical origin is accepted and dropped.
+	(void)logical_valid;
+	(void)logical_x;
+	(void)logical_y;
+	(void)logical_scale;
 	// Engine refusal, not a dead pipe (browser#103).
 	if (!comp_multi_weave_set_window_geometry(ics->xc, origin_x, origin_y, client_w, client_h, display_id)) {
 		return XRT_ERROR_WEAVE_REFUSED;
 	}
 	return XRT_SUCCESS;
 #else
+	(void)logical_valid;
+	(void)logical_x;
+	(void)logical_y;
+	(void)logical_scale;
 	// Windows: the D3D11 service reads the client rect off the bound HWND, so an
 	// explicit publication is redundant rather than unsupported — accept and drop
 	// it, keeping the call portable for a caller that always sends it.
@@ -6817,6 +6847,11 @@ weave_unpack_dmabuf(const struct ipc_weave_dmabuf *src, int fd, struct xrt_weave
 static_assert(sizeof(struct ipc_weave_submit_dmabuf_msg) <= IPC_BUF_SIZE,
               "weave_submit_dmabuf message exceeds IPC_BUF_SIZE");
 static_assert(sizeof(struct ipc_weave_submit_msg) <= IPC_BUF_SIZE, "weave_submit message exceeds IPC_BUF_SIZE");
+// v12 (browser-pvt#180): the per-frame origin appended to the dma-buf submit
+// reply. Its layout is part of the wire; pin it.
+static_assert(sizeof(struct ipc_weave_woven_origin) == 40, "ipc_weave_woven_origin layout changed");
+static_assert(sizeof(struct ipc_weave_submit_dmabuf_reply) <= IPC_BUF_SIZE,
+              "weave_submit_dmabuf reply exceeds IPC_BUF_SIZE");
 
 xrt_result_t
 ipc_handle_weave_submit_dmabuf(volatile struct ipc_client_state *ics,
@@ -6827,6 +6862,7 @@ ipc_handle_weave_submit_dmabuf(volatile struct ipc_client_state *ics,
                                uint32_t *out_height,
                                uint64_t *out_fence_value,
                                struct xrt_eye_positions *out_eyes,
+                               struct ipc_weave_woven_origin *out_origin,
                                uint32_t max_release_fence_count,
                                xrt_graphics_sync_handle_t *out_release_fences,
                                uint32_t *out_release_fence_count,
@@ -6840,6 +6876,7 @@ ipc_handle_weave_submit_dmabuf(volatile struct ipc_client_state *ics,
 	*out_height = 0;
 	*out_fence_value = 0;
 	U_ZERO(out_eyes);
+	U_ZERO(out_origin);
 	*out_release_fence_count = 0;
 
 #ifdef XRT_OS_LINUX_DESKTOP
@@ -6918,6 +6955,7 @@ ipc_handle_weave_submit_dmabuf(volatile struct ipc_client_state *ics,
 	uint32_t w = 0, h = 0;
 	uint64_t fv = 0;
 	struct xrt_eye_positions eyes = {0};
+	struct xrt_weave_woven_origin woven = {0};
 	bool ok = comp_multi_weave_submit_dmabuf(                   //
 	    ics->xc, &in_desc,                                      //
 	    args->have_overlay ? &overlay_desc : NULL,              //
@@ -6927,8 +6965,8 @@ ipc_handle_weave_submit_dmabuf(volatile struct ipc_client_state *ics,
 	    args->weave_frame_first != 0,                           //
 	    layout.view_count > 0 ? &layout : NULL,                 //
 	    args->flat_rect_count,                                  //
-	    args->flat_rect_count > 0 ? flat_rects : NULL,           //
-	    &release_fd, &w, &h, &fv, &eyes);
+	    args->flat_rect_count > 0 ? flat_rects : NULL,          //
+	    &release_fd, &w, &h, &fv, &eyes, &woven);
 	if (!ok) {
 		// Transient engine refusal, not a dead pipe (browser#103). A refused
 		// submit owes the caller no fence; never leak one an engine returned.
@@ -6947,6 +6985,16 @@ ipc_handle_weave_submit_dmabuf(volatile struct ipc_client_state *ics,
 	*out_height = h;
 	*out_fence_value = fv;
 	*out_eyes = eyes;
+	// v12 (browser-pvt#180): the origin THIS submit's weave used, field by
+	// field onto the wire POD (never a byte copy between the two layouts).
+	out_origin->serial = woven.serial;
+	out_origin->valid = woven.valid ? 1u : 0u;
+	out_origin->x = woven.x;
+	out_origin->y = woven.y;
+	out_origin->logical_valid = (woven.valid && woven.logical_valid) ? 1u : 0u;
+	out_origin->logical_x = woven.logical_x;
+	out_origin->logical_y = woven.logical_y;
+	out_origin->logical_scale = woven.logical_scale;
 	return XRT_SUCCESS;
 #else
 	// No desktop-Linux weave engine in this build (every other platform, and

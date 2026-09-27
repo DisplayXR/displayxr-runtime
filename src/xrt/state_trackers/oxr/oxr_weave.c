@@ -118,7 +118,8 @@ comp_ipc_client_compositor_weave_set_window_geometry(struct xrt_compositor *xc,
                                                      int32_t origin_y,
                                                      uint32_t client_w,
                                                      uint32_t client_h,
-                                                     int32_t display_id);
+                                                     int32_t display_id,
+                                                     const struct xrt_weave_logical_origin *logical);
 
 xrt_result_t
 comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
@@ -184,7 +185,8 @@ comp_ipc_client_compositor_weave_submit_dmabuf(struct xrt_compositor *xc,
                                                uint32_t *out_width,
                                                uint32_t *out_height,
                                                uint64_t *out_fence_value,
-                                               struct xrt_eye_positions *out_eyes);
+                                               struct xrt_eye_positions *out_eyes,
+                                               struct xrt_weave_woven_origin *out_origin);
 
 xrt_result_t
 comp_ipc_client_compositor_weave_get_output_dmabuf(struct xrt_compositor *xc,
@@ -387,6 +389,31 @@ oxr_xrWeaveBindWindow2DXR(XrSession session, const XrWeaveBindWindowInfoDXR *bin
 	// required on Android. Forwarded to the DP's per-window phase slot.
 	const XrWeaveWindowGeometryDXR *geom =
 	    OXR_GET_INPUT_FROM_CHAIN(bindInfo, XR_TYPE_WEAVE_WINDOW_GEOMETRY_DXR, XrWeaveWindowGeometryDXR);
+	// Spec v12 (browser-pvt#180): the caller's own logical origin + scale,
+	// latched verbatim with this bind's device geometry and echoed per woven
+	// output (XrWeaveOutputOriginDXR). Meaningless without the geometry it
+	// describes.
+	const XrWeaveWindowLogicalOriginDXR *lgeom =
+	    OXR_GET_INPUT_FROM_CHAIN(bindInfo, XR_TYPE_WEAVE_WINDOW_LOGICAL_ORIGIN_DXR, XrWeaveWindowLogicalOriginDXR);
+	struct xrt_weave_logical_origin logical = {0};
+	if (lgeom != NULL) {
+		if (geom == NULL) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrWeaveBindWindow2DXR: XrWeaveWindowLogicalOriginDXR requires a chained "
+			                 "XrWeaveWindowGeometryDXR");
+		}
+		// (scale > 0) is false for NaN; the upper bound rejects +inf.
+		if (!(lgeom->scale > 0.0f) || lgeom->scale > 64.0f) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrWeaveBindWindow2DXR: XrWeaveWindowLogicalOriginDXR::scale (%f) must be "
+			                 "finite and in (0, 64]",
+			                 (double)lgeom->scale);
+		}
+		logical.valid = true;
+		logical.x = lgeom->logicalOrigin.x;
+		logical.y = lgeom->logicalOrigin.y;
+		logical.scale = lgeom->scale;
+	}
 	if (geom != NULL) {
 		if (geom->clientSize.width <= 0 || geom->clientSize.height <= 0) {
 			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
@@ -396,7 +423,7 @@ oxr_xrWeaveBindWindow2DXR(XrSession session, const XrWeaveBindWindowInfoDXR *bin
 		}
 		xret = comp_ipc_client_compositor_weave_set_window_geometry(
 		    &sess->xcn->base, geom->windowOriginOnScreen.x, geom->windowOriginOnScreen.y,
-		    (uint32_t)geom->clientSize.width, (uint32_t)geom->clientSize.height, geom->displayId);
+		    (uint32_t)geom->clientSize.width, (uint32_t)geom->clientSize.height, geom->displayId, &logical);
 		OXR_CHECK_XRET_MSG(&log, sess, xret, "xrWeaveBindWindow2DXR: geometry update failed (xrt_result=%d)",
 		                   (int)xret);
 	}
@@ -585,6 +612,11 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 	    OXR_GET_OUTPUT_FROM_CHAIN(output, XR_TYPE_WEAVE_OUTPUT_DMABUF_DXR, XrWeaveOutputDmabufDXR);
 	XrWeaveOutputSyncDXR *out_sync =
 	    OXR_GET_OUTPUT_FROM_CHAIN(output, XR_TYPE_WEAVE_OUTPUT_SYNC_DXR, XrWeaveOutputSyncDXR);
+	// Spec v12 (browser-pvt#180): portable like the two above — every path
+	// that has no origin to report writes valid = XR_FALSE, serial 0.
+	XrWeaveOutputOriginDXR *out_origin =
+	    OXR_GET_OUTPUT_FROM_CHAIN(output, XR_TYPE_WEAVE_OUTPUT_ORIGIN_DXR, XrWeaveOutputOriginDXR);
+	struct xrt_weave_woven_origin woven = {0};
 
 #ifndef XRT_OS_LINUX_DESKTOP
 	if (dmabuf_in != NULL || dmabuf_ov != NULL || sync_in != NULL) {
@@ -687,7 +719,7 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		    (uint32_t)submitInfo->rect.extent.height, rect_count, rect_count > 0 ? rects : NULL,
 		    overlay_rect_count, submitInfo->firstChunk == XR_TRUE, layout.view_count > 0 ? &layout : NULL,
 		    flat_rect_count, flat_rect_count > 0 ? flat_rects : NULL, &release_fd, &have_out, &w, &h,
-		    &fence_value, &eyes);
+		    &fence_value, &eyes, &woven);
 	} else
 #endif
 	{
@@ -733,6 +765,19 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 	}
 	if (out_sync != NULL) {
 		out_sync->releaseFenceFd = -1;
+	}
+	if (out_origin != NULL) {
+		// Echoed as the service latched it; no conversion here either.
+		const bool ov = woven.valid;
+		const bool lv = ov && woven.logical_valid;
+		out_origin->valid = ov ? XR_TRUE : XR_FALSE;
+		out_origin->wovenOriginOnScreen.x = ov ? woven.x : 0;
+		out_origin->wovenOriginOnScreen.y = ov ? woven.y : 0;
+		out_origin->logicalValid = lv ? XR_TRUE : XR_FALSE;
+		out_origin->wovenOriginLogical.x = lv ? woven.logical_x : 0;
+		out_origin->wovenOriginLogical.y = lv ? woven.logical_y : 0;
+		out_origin->logicalScale = lv ? woven.logical_scale : 0.0f;
+		out_origin->serial = woven.serial;
 	}
 
 	// Eyes flow OUT: the caller renders its NEXT pre-weave frame's off-axis

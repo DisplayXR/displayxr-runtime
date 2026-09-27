@@ -528,7 +528,8 @@ comp_ipc_client_compositor_weave_set_window_geometry(struct xrt_compositor *xc,
                                                      int32_t origin_y,
                                                      uint32_t client_w,
                                                      uint32_t client_h,
-                                                     int32_t display_id)
+                                                     int32_t display_id,
+                                                     const struct xrt_weave_logical_origin *logical)
 {
 	if (xc == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
@@ -537,7 +538,13 @@ comp_ipc_client_compositor_weave_set_window_geometry(struct xrt_compositor *xc,
 	if (icc == NULL || icc->ipc_c == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
-	return ipc_call_weave_set_window_geometry(icc->ipc_c, origin_x, origin_y, client_w, client_h, display_id);
+	// v12 (browser-pvt#180): the logical origin rides the same call, so the
+	// service latches the device + logical pair as one unit. NULL / !valid
+	// clears the service's latch.
+	const bool lv = logical != NULL && logical->valid;
+	return ipc_call_weave_set_window_geometry(icc->ipc_c, origin_x, origin_y, client_w, client_h, display_id,
+	                                          lv ? 1u : 0u, lv ? logical->x : 0, lv ? logical->y : 0,
+	                                          lv ? logical->scale : 0.0f);
 }
 
 /*!
@@ -849,8 +856,12 @@ comp_ipc_client_compositor_weave_submit_dmabuf(struct xrt_compositor *xc,
                                                uint32_t *out_width,
                                                uint32_t *out_height,
                                                uint64_t *out_fence_value,
-                                               struct xrt_eye_positions *out_eyes)
+                                               struct xrt_eye_positions *out_eyes,
+                                               struct xrt_weave_woven_origin *out_origin)
 {
+	if (out_origin != NULL) {
+		memset(out_origin, 0, sizeof(*out_origin));
+	}
 	if (xc == NULL || in == NULL || out_release_fence_fd == NULL || out_have_output == NULL ||
 	    out_width == NULL || out_height == NULL || out_fence_value == NULL || out_eyes == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
@@ -904,12 +915,13 @@ comp_ipc_client_compositor_weave_submit_dmabuf(struct xrt_compositor *xc,
 	uint32_t w = 0, h = 0;
 	uint64_t fv = 0;
 	struct xrt_eye_positions eyes = {0};
+	struct ipc_weave_woven_origin origin = {0};
 	xrt_graphics_sync_handle_t release[1] = {XRT_GRAPHICS_SYNC_HANDLE_INVALID};
 	// Generated arg order: in args, in_handles (copied, not consumed), out args,
 	// then the out handles (the reply's release sync_file, received into
 	// release[] — a new descriptor in this process, or -1).
-	xrt_result_t xret = ipc_call_weave_submit_dmabuf(icc->ipc_c, &args, &dmabuf, handles, handle_count, &have,
-	                                                 &w, &h, &fv, &eyes, release, 1);
+	xrt_result_t xret = ipc_call_weave_submit_dmabuf(icc->ipc_c, &args, &dmabuf, handles, handle_count, &have, &w,
+	                                                 &h, &fv, &eyes, &origin, release, 1);
 	if (xret != XRT_SUCCESS) {
 		// The reply carries the result; a refused submit sends no fence, but
 		// never leak one if a service did.
@@ -924,6 +936,18 @@ comp_ipc_client_compositor_weave_submit_dmabuf(struct xrt_compositor *xc,
 	*out_height = h;
 	*out_fence_value = fv;
 	*out_eyes = eyes;
+	if (out_origin != NULL) {
+		// v12 (browser-pvt#180): wire POD -> xrt, field by field (never a
+		// byte copy between the two layouts).
+		out_origin->valid = origin.valid != 0;
+		out_origin->x = origin.x;
+		out_origin->y = origin.y;
+		out_origin->logical_valid = origin.valid != 0 && origin.logical_valid != 0;
+		out_origin->logical_x = origin.logical_x;
+		out_origin->logical_y = origin.logical_y;
+		out_origin->logical_scale = origin.logical_scale;
+		out_origin->serial = origin.serial;
+	}
 	return XRT_SUCCESS;
 }
 
