@@ -37,6 +37,8 @@ add_library(
 	u_stereo_camera.h
 	u_stereo_rectify.c
 	u_stereo_rectify.h
+	u_stereo_vrefine.c
+	u_stereo_vrefine.h
 	u_color_encoding.h
 	u_debug.c
 	u_debug.h
