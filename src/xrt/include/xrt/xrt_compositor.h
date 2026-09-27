@@ -3030,6 +3030,15 @@ struct xrt_system_compositor_info
 	//! Signature: xrt_dp_factory_d3d11_fn_t.
 	void *dp_factory_d3d11_lift;
 
+	//! ADR-042 (Android): the plug-in's LIFT-ONLY Vulkan display-processor
+	//! factory (xrt_plugin_iface::create_dp_vk_lift), or NULL = no Android lift
+	//! module (there is deliberately no fallback to dp_factory_vk). Normally the
+	//! active plug-in's; `debug.dxr.lift.plugin=<id>` takes it from another
+	//! bundled plug-in instead (target_plugin_android_lift_factory_vk), so a
+	//! fake lift module can run beside the real vendor weaver.
+	//! Signature: xrt_dp_factory_vk_fn_t.
+	void *dp_factory_vk_lift;
+
 	/*!
 	 * Optional callback: re-derive the dp_factory_* pointers above from the
 	 * runtime's plug-in loader, and re-pull the plug-in's display info

@@ -6,9 +6,24 @@
  *
  * A vendor plug-in may ship a conversion module (monocular depth, stereo or
  * N-view synthesis, photo → Gaussian splats). The runtime reaches it through
- * optional appended slots on the per-API DP vtable — today only
+ * optional appended slots on the per-API DP vtable —
  * @ref xrt_display_processor_d3d11 (lift_get_caps … lift_convert_blob, guarded
- * by XRT_DP_D3D11_HAS_LIFT) — and exposes it to apps as XR_DXR_lift.
+ * by XRT_DP_D3D11_HAS_LIFT; the Windows D3D11 service) and
+ * @ref xrt_display_processor_vk (the same five slots, XRT_DP_VK_HAS_LIFT; the
+ * Android service) — and exposes it to apps as XR_DXR_lift.
+ *
+ * Memory, per API (the full text lives on each vtable):
+ *  - D3D11: input = an RGBA8 texture on the runtime's dedicated lift device,
+ *    exactly w x h; output = a DP-owned texture on that device, valid until the
+ *    stream's next call. Ordered on the one immediate context.
+ *  - Vulkan / Android: input = a runtime-owned RGBA8 AHardwareBuffer, exactly
+ *    w x h, GPU-sampleable AND CPU-readable (CPU_READ_OFTEN), plus the VkImage
+ *    the runtime imported from it on the shared service device (GENERAL
+ *    layout); output = a DP-owned AHardwareBuffer + (optionally) its VkImage,
+ *    valid until the stream's next call, format = an AHARDWAREBUFFER_FORMAT_*.
+ *    v1 sync is CPU-DRAINED both ways: the runtime's input writes are complete
+ *    when the call starts, the DP's output writes are complete when it
+ *    returns — no semaphores or sync fds cross the slot boundary.
  *
  * The split of labour (ADR-042, ADR-007):
  *  - the PLUG-IN converts, synchronously, one frame per call. It never weaves

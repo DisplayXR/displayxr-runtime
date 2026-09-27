@@ -37,6 +37,7 @@
 
 #include <stdbool.h>
 
+#include "xrt/xrt_config_os.h"
 #include "xrt/xrt_plugin.h"
 
 #include <stddef.h>
@@ -57,6 +58,25 @@ struct xrt_plugin_iface;
  */
 bool
 xrt_plugin_vk_abi_compatible(const struct xrt_plugin_iface *iface, const char *plugin_id);
+
+#ifdef XRT_OS_ANDROID
+/*!
+ * ADR-042 (Android): `debug.dxr.lift.plugin=<id>` — the LIFT-DP equivalent of
+ * `DXR_PLUGIN_EXCLUSIVE`. When the property is set, the XR_DXR_lift module's
+ * display processor comes from the named bundled plug-in (`libdxrpNNN_<id>.so`
+ * in the runtime lib dir; the filename id or the iface id both match) instead
+ * of the active one, so e.g. sim_display's fake lift module runs beside the
+ * real vendor weaver. The named plug-in is loaded and negotiated — NOT probed:
+ * a lift-only factory must not depend on probe state.
+ *
+ * @return false when the property is unset (keep the active plug-in's factory).
+ *         true when it is set; @p out_factory then holds the named plug-in's
+ *         create_dp_vk_lift, or NULL when it names nothing usable (no fallback,
+ *         by design — one WARN says why). Resolved once per process.
+ */
+bool
+target_plugin_android_lift_factory_vk(void **out_factory);
+#endif
 
 /*!
  * Vendor-neutral descriptor for one registered plug-in, as discovered

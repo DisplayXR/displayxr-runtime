@@ -60,7 +60,9 @@ size_without_slot()
 TEST_CASE("lazy_transparency: the slot is appended, not inserted")
 {
 	CHECK(size_without_slot() == sizeof(struct xrt_display_processor) + 14 * sizeof(void *));
-	CHECK(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 15 * sizeof(void *));
+	// Later appends (the ADR-042 lift slots) grow the struct past this slot;
+	// what matters here is that nothing was inserted before it.
+	CHECK(sizeof(struct xrt_display_processor_vk) >= sizeof(struct xrt_display_processor) + 15 * sizeof(void *));
 }
 
 TEST_CASE("lazy_transparency: an older plug-in is unsupported and never called")

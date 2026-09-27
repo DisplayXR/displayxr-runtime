@@ -142,6 +142,23 @@ fill_dp_factories_from_plugin(struct xrt_system_compositor_info *info, const str
 	if (plugin->create_dp_gl != NULL) {
 		info->dp_factory_gl = (void *)plugin->create_dp_gl;
 	}
+	// ADR-042 (Android): the optional Vulkan lift-only factory. struct_size-gated
+	// like every appended field, and vk_bundle-ABI-gated like create_dp_vk (it
+	// receives the same raw vk_bundle*).
+	info->dp_factory_vk_lift = NULL;
+	if (plugin->struct_size >=
+	        offsetof(struct xrt_plugin_iface, create_dp_vk_lift) + sizeof(plugin->create_dp_vk_lift) &&
+	    plugin->create_dp_vk_lift != NULL && xrt_plugin_vk_abi_compatible(plugin, plugin->id)) {
+		info->dp_factory_vk_lift = (void *)plugin->create_dp_vk_lift;
+	}
+#ifdef XRT_OS_ANDROID
+	// `debug.dxr.lift.plugin=<id>`: take the lift factory from THAT bundled
+	// plug-in instead (no fallback when it names nothing — the exclusive rule).
+	void *lift_override = NULL;
+	if (target_plugin_android_lift_factory_vk(&lift_override)) {
+		info->dp_factory_vk_lift = lift_override;
+	}
+#endif
 #ifdef __APPLE__
 	if (plugin->create_dp_metal != NULL) {
 		info->dp_factory_metal = (void *)plugin->create_dp_metal;

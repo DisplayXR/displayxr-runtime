@@ -811,6 +811,34 @@ struct xrt_plugin_iface
 	 * XRT_PLUGIN_API_VERSION_CURRENT bump).
 	 */
 	xrt_dp_factory_d3d11_fn_t create_dp_d3d11_lift;
+
+	/*!
+	 * Create a VULKAN display processor that serves ONLY the 2D→3D lift slots
+	 * (ADR-042, XR_DXR_lift) — the Vulkan / Android twin of
+	 * @ref create_dp_d3d11_lift. Same signature as @ref create_dp_vk.
+	 *
+	 * The Android service creates exactly one lift DP per process on the
+	 * service's own VkDevice (@p vk_bundle, the same raw `vk_bundle*` —
+	 * @ref vk_bundle_abi_size guards it exactly like @ref create_dp_vk),
+	 * with @p vk_cmd_pool a pool owned by its lift thread and
+	 * @p window_handle NULL. The factory runs on the service MAIN thread
+	 * (Looper-bearing, JNI-attached), every lift slot afterwards on the lift
+	 * thread. The DP returned must build NO weaver and open NO tracker
+	 * session, must set `base.struct_size` to cover the lift slots, and fill
+	 * the lift_* slots of @ref xrt_display_processor_vk (XRT_DP_VK_HAS_LIFT).
+	 * The runtime never calls its base vtable except `destroy`.
+	 *
+	 * Unlike D3D11 there is NO fallback to @ref create_dp_vk: on Android the
+	 * ordinary factory starts the vendor's whole display stack (a second
+	 * tracker / backlight client) just to discover a module is absent. A
+	 * plug-in without this factory simply has no Android lift module.
+	 *
+	 * Optional. NULL (or a plug-in whose `struct_size` predates this field) ⟹
+	 * XR_DXR_lift reports supportedModes 0. Appended per ADR-020 (append-only
+	 * within a major; gated by @ref struct_size; no
+	 * XRT_PLUGIN_API_VERSION_CURRENT bump).
+	 */
+	xrt_dp_factory_vk_fn_t create_dp_vk_lift;
 };
 
 /*!
@@ -819,6 +847,14 @@ struct xrt_plugin_iface
  * an older runtime header can #ifdef-guard filling it.
  */
 #define XRT_PLUGIN_IFACE_HAS_D3D11_LIFT_FACTORY 1
+
+/*!
+ * Defined when @ref xrt_plugin_iface carries @ref
+ * xrt_plugin_iface::create_dp_vk_lift (ADR-042, Android), so a plug-in built
+ * against an older runtime header can #ifdef-guard filling it. Pairs with
+ * XRT_DP_VK_HAS_LIFT (xrt_display_processor_vk.h).
+ */
+#define XRT_PLUGIN_IFACE_HAS_VK_LIFT_FACTORY 1
 
 
 /*

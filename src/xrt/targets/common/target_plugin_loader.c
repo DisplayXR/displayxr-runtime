@@ -1859,6 +1859,119 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
 
 /*
  *
+ * ADR-042: `debug.dxr.lift.plugin` — the lift DP from a named bundled plug-in.
+ *
+ */
+
+#include <sys/system_properties.h>
+
+static bool
+lift_ids_equal_loose(const char *a, const char *b)
+{
+	for (; *a != '\0' && *b != '\0'; a++, b++) {
+		const char ca = *a == '-' ? '_' : *a;
+		const char cb = *b == '-' ? '_' : *b;
+		if (ca != cb) {
+			return false;
+		}
+	}
+	return *a == *b;
+}
+
+bool
+target_plugin_android_lift_factory_vk(void **out_factory)
+{
+	static bool s_resolved = false;
+	static bool s_set = false;
+	static void *s_factory = NULL;
+	if (out_factory != NULL) {
+		*out_factory = NULL;
+	}
+	if (s_resolved) {
+		if (out_factory != NULL) {
+			*out_factory = s_factory;
+		}
+		return s_set;
+	}
+	s_resolved = true;
+
+	char want[PROP_VALUE_MAX] = {0};
+	if (__system_property_get("debug.dxr.lift.plugin", want) <= 0 || want[0] == '\0') {
+		return false;
+	}
+	s_set = true;
+
+	char root[PATH_MAX] = {0};
+	const char *override = getenv("XRT_PLUGIN_SEARCH_PATH");
+	if (override != NULL && *override != '\0') {
+		snprintf(root, sizeof(root), "%s", override);
+	} else if (!get_runtime_lib_dir(root, sizeof(root))) {
+		U_LOG_W("[lift] debug.dxr.lift.plugin='%s': runtime lib dir unknown — NO lift DP (no fallback).", want);
+		return true;
+	}
+	struct plugin_entry entries[MAX_PLUGIN_ENTRIES];
+	int n = enumerate_dir(root, entries, 0, MAX_PLUGIN_ENTRIES);
+	for (int i = 0; i < n; i++) {
+		// Match on the FILENAME id before loading anything (so an unrelated
+		// vendor plug-in is never dlopen'd for this); '-' and '_' are
+		// equivalent, since the iface id is "sim-display" while the file is
+		// libdxrp200_sim_display.so.
+		if (!lift_ids_equal_loose(entries[i].id, want)) {
+			continue;
+		}
+		void *handle = dlopen(entries[i].binary_path, RTLD_NOW | RTLD_LOCAL);
+		if (handle == NULL) {
+			continue;
+		}
+		xrt_plugin_negotiate_fn_t negotiate =
+		    (xrt_plugin_negotiate_fn_t)dlsym(handle, XRT_PLUGIN_ENTRYPOINT_NAME);
+		if (negotiate == NULL) {
+			continue; // handle leaked on purpose, as in try_load_one
+		}
+		struct xrt_plugin_host_iface host = {0};
+		host.struct_size = (uint32_t)sizeof(struct xrt_plugin_host_iface);
+		host.host_api_version = XRT_PLUGIN_API_VERSION_CURRENT;
+		host.get_android_vm = plugin_host_get_android_vm;
+		host.get_android_activity = plugin_host_get_android_activity;
+		host.get_android_class_host_context = plugin_host_get_android_class_host_context;
+		host.android_package_is_visible = plugin_host_android_package_is_visible;
+		struct xrt_plugin_iface *iface = NULL;
+		uint32_t plugin_version = 0;
+		if (negotiate(XRT_PLUGIN_API_VERSION_CURRENT, &host, &iface, &plugin_version) != XRT_SUCCESS ||
+		    iface == NULL || plugin_version != XRT_PLUGIN_API_VERSION_CURRENT) {
+			continue;
+		}
+		const bool has_field = iface->struct_size >= offsetof(struct xrt_plugin_iface, create_dp_vk_lift) +
+		                                                 sizeof(iface->create_dp_vk_lift);
+		if (!has_field || iface->create_dp_vk_lift == NULL) {
+			U_LOG_W(
+			    "[lift] debug.dxr.lift.plugin='%s': %s has no create_dp_vk_lift — NO lift DP (no "
+			    "fallback).",
+			    want, entries[i].binary_path);
+			return true;
+		}
+		if (!xrt_plugin_vk_abi_compatible(iface, entries[i].id)) {
+			return true; // logged by the check
+		}
+		s_factory = (void *)iface->create_dp_vk_lift;
+		if (out_factory != NULL) {
+			*out_factory = s_factory;
+		}
+		U_LOG_W(
+		    "[lift] debug.dxr.lift.plugin='%s': the lift DP comes from %s (the weaving DP stays the "
+		    "active plug-in's)",
+		    want, entries[i].binary_path);
+		return true;
+	}
+	U_LOG_W(
+	    "[lift] debug.dxr.lift.plugin='%s' matches none of the %d bundled plug-in(s) in %s — NO lift DP "
+	    "(no fallback, by design).",
+	    want, n, root);
+	return true;
+}
+
+/*
+ *
  * Public enumeration + PreferredPlugin override (Android — minimal).
  *
  * Android discovery is convention-driven (filename ProbeOrder) and the

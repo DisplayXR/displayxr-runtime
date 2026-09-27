@@ -28,6 +28,7 @@
 #pragma once
 
 #include "xrt/xrt_display_processor.h" // the embedded base + the XRT_DP_ABI_ASSERT/XRT_DP_ABI_MSG macros
+#include "xrt/xrt_dp_lift.h"           // XR_DXR_lift slot types (ADR-042)
 
 #include <stdbool.h>
 #include <stddef.h> // offsetof — used by the ABI tripwire at the end of this header
@@ -631,6 +632,119 @@ struct xrt_display_processor_vk
 	 *                opaque and the DP may idle its transparency work.
 	 */
 	void (*set_transparency_active)(struct xrt_display_processor_vk *xdp, bool active);
+
+	/*
+	 * ── 2D→3D conversion ("lift", ADR-042, XR_DXR_lift) — Vulkan / Android ──
+	 *
+	 * Five optional slots, appended together per ADR-020 and announced by ONE
+	 * define, XRT_DP_VK_HAS_LIFT — the Vulkan twins of the D3D11 lift slots
+	 * (XRT_DP_D3D11_HAS_LIFT), same semantics, Vulkan/AHardwareBuffer memory.
+	 * A plug-in with no conversion module leaves all five NULL (or an older
+	 * plug-in's `base.struct_size` stops short of them); the runtime then
+	 * reports XR_DXR_lift supportedModes = 0, state UNAVAILABLE.
+	 *
+	 * Called today only by the Android service (comp_multi_lift_android.c);
+	 * the buffer handles below are therefore `AHardwareBuffer *`. A future
+	 * desktop-Linux caller would pass its platform graphics buffer the same way.
+	 *
+	 * THREADING. The runtime calls every lift slot from ONE thread — its lift
+	 * thread (attached to the JavaVM, no Looper) — on a display processor it
+	 * created FOR lift through xrt_plugin_iface::create_dp_vk_lift (the factory
+	 * itself runs on the service MAIN thread, like every Android DP factory, so
+	 * a vendor SDK may start Looper-bound async init there). That instance is
+	 * never asked to weave: it must build no weaver and open no tracker
+	 * session. It shares the service's VkDevice (the factory's vk_bundle); a
+	 * module that submits Vulkan work uses vk_bundle::main_queue under
+	 * vk_queue_lock, exactly like the weaving DP, and must not hold the lock
+	 * across a wait.
+	 *
+	 * MEMORY CONTRACT (v1, CPU-drained — no semaphores cross this boundary):
+	 *
+	 *  - INPUT: @p input_buffer is an AHardwareBuffer the RUNTIME owns,
+	 *    AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM, exactly @p w x @p h, allocated
+	 *    GPU_SAMPLED_IMAGE | GPU_COLOR_OUTPUT | CPU_READ_OFTEN, so a GPU module
+	 *    can sample it and a CPU / GLES module can AHardwareBuffer_lock it or
+	 *    bind it as an EGLImage. @p input_image is the VkImage the runtime
+	 *    imported from it on the shared device, in VK_IMAGE_LAYOUT_GENERAL. All
+	 *    runtime writes are COMPLETE (the runtime CPU-waited its fence) when the
+	 *    call starts. Valid for the duration of the call only; read-only.
+	 *  - OUTPUT: @p out_buffer is an AHardwareBuffer the DP OWNS, and
+	 *    @p out_image the VkImage for it on the shared device (or
+	 *    VK_NULL_HANDLE: the runtime then imports @p out_buffer itself, cached
+	 *    by pointer identity — the shape a GLES / ImageReader-based module
+	 *    wants). Both stay valid until the NEXT lift_convert on the same
+	 *    stream (the runtime copies the result into its own ring before then).
+	 *    When the call returns, every write to the output is COMPLETE (the DP
+	 *    waited its own GPU / GL / CPU work) and @p out_image — if returned —
+	 *    is in VK_IMAGE_LAYOUT_GENERAL. @p out_format is the AHardwareBuffer
+	 *    format (AHARDWAREBUFFER_FORMAT_*): R8G8B8A8_UNORM, R16G16B16A16_FLOAT,
+	 *    R10G10B10A2_UNORM, R8_UNORM. AHardwareBuffer has no single-channel
+	 *    float format, so a DEPTH result is either R8_UNORM or a 4-channel
+	 *    format carrying depth in R (relative: larger = farther).
+	 *
+	 * SYNCHRONOUS. lift_convert / lift_convert_blob run one conversion and
+	 * return its output. Asynchrony, latest-wins dropping, timestamps and the
+	 * copy of the output into a runtime ring are RUNTIME code — the plug-in
+	 * never queues or timestamps.
+	 */
+
+	/*!
+	 * Report the module's capabilities and state (@ref xrt_dp_lift_caps). The
+	 * caller pre-sets struct_size; write only fields within it. Called at DP
+	 * creation and then ≤ 1 Hz while the state is not READY. Return false = no
+	 * module (same as a NULL slot).
+	 */
+	bool (*lift_get_caps)(struct xrt_display_processor_vk *xdp, struct xrt_dp_lift_caps *out);
+
+	//! Create a conversion stream; the plug-in's own id in @p out_id. False = refused.
+	bool (*lift_stream_create)(struct xrt_display_processor_vk *xdp,
+	                           const struct xrt_dp_lift_stream_info *info,
+	                           uint64_t *out_id);
+
+	//! Destroy stream @p id and every resource it returned.
+	void (*lift_stream_destroy)(struct xrt_display_processor_vk *xdp, uint64_t id);
+
+	/*!
+	 * Convert one frame of stream @p id (texture modes: DEPTH, SBS, NVIEW).
+	 * See the MEMORY CONTRACT above for @p input_buffer / @p input_image and
+	 * @p out_buffer / @p out_image / @p out_format. SBS = 2 views side by side;
+	 * NVIEW = view_count views side by side, view 0 leftmost; DEPTH = one
+	 * channel (in R). @p viewpoints_xyz: see the D3D11 twin — the runtime
+	 * always passes the tracked eyes when it has them; they take precedence
+	 * over any tracker the plug-in owns.
+	 * @return false = no output this frame (the runtime keeps the previous one).
+	 */
+	bool (*lift_convert)(struct xrt_display_processor_vk *xdp,
+	                     uint64_t id,
+	                     void *input_buffer,
+	                     VkImage_XDP input_image,
+	                     uint32_t w,
+	                     uint32_t h,
+	                     const struct xrt_dp_lift_params *p,
+	                     const float *viewpoints_xyz,
+	                     uint32_t viewpoint_floats,
+	                     void **out_buffer,
+	                     VkImage_XDP *out_image,
+	                     uint32_t *out_w,
+	                     uint32_t *out_h,
+	                     uint32_t *out_format);
+
+	/*!
+	 * Convert one photo of a GAUSSIANS stream @p id into a splat blob. Same
+	 * threading and input contract as @ref lift_convert; the bytes are the
+	 * DP's, valid until the NEXT call on this stream, in @p out_format
+	 * (XRT_DP_LIFT_BLOB_*).
+	 */
+	bool (*lift_convert_blob)(struct xrt_display_processor_vk *xdp,
+	                          uint64_t id,
+	                          void *input_buffer,
+	                          VkImage_XDP input_image,
+	                          uint32_t w,
+	                          uint32_t h,
+	                          const struct xrt_dp_lift_params *p,
+	                          uint32_t *out_format,
+	                          const void **out_bytes,
+	                          size_t *out_size);
 };
 
 /*!
@@ -741,7 +855,12 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, get_background_previ
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, get_last_frame_dropped) == sizeof(struct xrt_display_processor) + 12 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, snap_window_rect)          == sizeof(struct xrt_display_processor) + 13 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_transparency_active)   == sizeof(struct xrt_display_processor) + 14 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 15 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, lift_get_caps)             == sizeof(struct xrt_display_processor) + 15 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, lift_stream_create)        == sizeof(struct xrt_display_processor) + 16 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, lift_stream_destroy)       == sizeof(struct xrt_display_processor) + 17 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, lift_convert)              == sizeof(struct xrt_display_processor) + 18 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, lift_convert_blob)         == sizeof(struct xrt_display_processor) + 19 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 20 * sizeof(void *), XRT_DP_ABI_MSG);
 
 /*!
  * Defined when this header carries the @ref
@@ -768,6 +887,17 @@ XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_d
  * appended slot.
  */
 #define XRT_DP_VK_HAS_TRANSPARENCY_ACTIVE 1
+
+/*!
+ * Defined when this header carries the five Vulkan lift slots (lift_get_caps,
+ * lift_stream_create, lift_stream_destroy, lift_convert, lift_convert_blob —
+ * ADR-042, XR_DXR_lift on Android), so a plug-in built against an older runtime
+ * can #ifdef-guard its conversion module — the coupled-ABI-addition pattern
+ * used by every other appended slot. Purely additive: no
+ * XRT_PLUGIN_API_VERSION_CURRENT bump (ADR-020). Pairs with
+ * XRT_PLUGIN_IFACE_HAS_VK_LIFT_FACTORY (xrt_plugin.h).
+ */
+#define XRT_DP_VK_HAS_LIFT 1
 // clang-format on
 
 /*!
@@ -1199,6 +1329,62 @@ xrt_display_processor_vk_set_transparency_active(struct xrt_display_processor_vk
 	}
 	xdp->set_transparency_active(xdp, active);
 	return true;
+}
+
+/*!
+ * @copydoc xrt_display_processor_vk::lift_get_caps
+ *
+ * Returns false when the slot is absent (older plug-in `base.struct_size`),
+ * NULL, or the DP has no module — every one of those reads as "no lift":
+ * modes 0, state UNAVAILABLE. @p out is initialised here either way.
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline bool
+xrt_display_processor_vk_lift_get_caps(struct xrt_display_processor_vk *xdp, struct xrt_dp_lift_caps *out)
+{
+	xrt_dp_lift_caps_init(out);
+	if (xdp == NULL) {
+		return false;
+	}
+	const char *slot_end = (const char *)&xdp->lift_get_caps + sizeof(xdp->lift_get_caps);
+	if (slot_end > (const char *)xdp + xdp->base.struct_size || xdp->lift_get_caps == NULL) {
+		return false;
+	}
+	if (!xdp->lift_get_caps(xdp, out)) {
+		xrt_dp_lift_caps_init(out);
+		return false;
+	}
+	out->backend[sizeof(out->backend) - 1] = '\0';
+	return true;
+}
+
+/*!
+ * True when @p xdp carries the whole texture-mode lift contract (caps + stream
+ * create/destroy + convert). A DP must provide all four or none.
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline bool
+xrt_display_processor_vk_has_lift(struct xrt_display_processor_vk *xdp)
+{
+	if (xdp == NULL) {
+		return false;
+	}
+	const char *slot_end = (const char *)&xdp->lift_convert + sizeof(xdp->lift_convert);
+	return slot_end <= (const char *)xdp + xdp->base.struct_size && xdp->lift_get_caps != NULL &&
+	       xdp->lift_stream_create != NULL && xdp->lift_stream_destroy != NULL && xdp->lift_convert != NULL;
+}
+
+//! True when @p xdp also carries lift_convert_blob (GAUSSIANS).
+static inline bool
+xrt_display_processor_vk_has_lift_blob(struct xrt_display_processor_vk *xdp)
+{
+	if (xdp == NULL) {
+		return false;
+	}
+	const char *slot_end = (const char *)&xdp->lift_convert_blob + sizeof(xdp->lift_convert_blob);
+	return slot_end <= (const char *)xdp + xdp->base.struct_size && xdp->lift_convert_blob != NULL;
 }
 
 #ifdef __cplusplus
