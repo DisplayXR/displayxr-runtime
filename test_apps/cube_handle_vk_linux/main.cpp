@@ -65,6 +65,7 @@
 #include <cstring>
 #include <string>
 #include <chrono>
+#include <thread>
 #include <vector>
 
 #ifdef _WIN32
@@ -2720,6 +2721,17 @@ int main(int argc, char** argv) {
     winDesc.title = "Cube Handle VK (DisplayXR)";
     winDesc.app_id = "com.displayxr.cube_handle_vk_linux";
     winDesc.fullscreen_on_wayland = true;
+    // TEST HOOK (DXR_CUBE_DRAG_BUTTON=N, off by default): drag the window from
+    // its content with mouse button N, as the demos do with the right button —
+    // lets a headless run exercise the content drag (runtime#1748).
+    if (const char* denv = getenv("DXR_CUBE_DRAG_BUTTON")) {
+        const int b = atoi(denv);
+        if (b >= 1 && b <= 3) {
+            winDesc.wayland_drag_button = (uint32_t)b;
+            winDesc.x11_drag_button = (uint32_t)b;
+            LOG_WARN("DXR_CUBE_DRAG_BUTTON=%d: content drag on button %d (test hook)", b, b);
+        }
+    }
 
     if (xr.windowBackend == DxrWindowBackend::Wayland) {
         // A Wayland client cannot POSITION itself, so DXR_CUBE_WINDOW's offset
@@ -2870,7 +2882,34 @@ int main(int argc, char** argv) {
     // Frame timing
     auto lastTime = std::chrono::high_resolution_clock::now();
 
+    // DXR_TESTAPP_MAX_HZ — unconditional app-side frame cap, default off (same
+    // knob as the Windows test apps). Drives the app below the panel refresh
+    // so the runtime's repaint path can be measured against a slow producer.
+    int capHz = 0;
+    if (const char *capEnv = getenv("DXR_TESTAPP_MAX_HZ")) {
+        capHz = atoi(capEnv);
+        if (capHz < 0) capHz = 0;
+        if (capHz > 240) capHz = 240;
+    }
+    const std::chrono::nanoseconds capInterval(capHz > 0 ? 1000000000LL / capHz : 0);
+    std::chrono::steady_clock::time_point capNext = std::chrono::steady_clock::now();
+    if (capHz > 0) {
+        LOG_WARN("DXR_TESTAPP_MAX_HZ=%d — app frame cap active (min interval %.2f ms)", capHz,
+                 capInterval.count() / 1e6);
+    }
+
     while (g_running && !xr.exitRequested) {
+        // Frame cap (sleep only, like the Windows apps): hold the top of the
+        // loop until the minimum interval has elapsed; resync if behind.
+        if (capHz > 0) {
+            auto capNow = std::chrono::steady_clock::now();
+            if (capNext > capNow) {
+                std::this_thread::sleep_for(capNext - capNow);
+                capNow = std::chrono::steady_clock::now();
+            }
+            capNext = (capNext + capInterval > capNow) ? capNext + capInterval : capNow + capInterval;
+        }
+
         // Delta time
         auto now = std::chrono::high_resolution_clock::now();
         float deltaTime = std::chrono::duration<float>(now - lastTime).count();
