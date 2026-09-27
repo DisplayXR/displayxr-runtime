@@ -242,6 +242,7 @@ fake_convert(struct xrt_display_processor_vk *xdp,
 	}
 	const bool depth = s->mode == XRT_DP_LIFT_MODE_DEPTH;
 	const uint32_t ow = w * views;
+	const uint64_t t0 = os_monotonic_get_ns();
 	if (!ensure_out(s, ow, h)) {
 		return false;
 	}
@@ -308,6 +309,13 @@ fake_convert(struct xrt_display_processor_vk *xdp,
 	AHardwareBuffer_unlock(s->out, NULL); // synchronous: the CPU writes are done
 	if (!ok) {
 		return false;
+	}
+	// The fake's own CPU cost (locks + copies), separate from the latency sleep:
+	// what bounds its rate when fake_latency_ms is 0. First few, then every 300th.
+	static uint32_t s_timed = 0;
+	if (s_timed++ < 3 || s_timed % 300 == 0) {
+		U_LOG_I("sim_display fake lift (vk): %ux%u x%u views, CPU %.2f ms + sleep %lld ms", w, h, views,
+		        (double)(os_monotonic_get_ns() - t0) / 1e6, (long long)fake_latency_ms());
 	}
 
 	fake_sleep();

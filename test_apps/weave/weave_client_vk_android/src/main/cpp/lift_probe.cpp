@@ -9,6 +9,7 @@
 #include <android/log.h>
 #include <sys/system_properties.h>
 
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -39,6 +40,7 @@ struct Probe
 	Mode mode = Mode::Off;
 	bool mode_read = false;
 	uint64_t max_frames = 300;
+	double fps = 30.0; //!< explicit submit rate (debug.dxr.lift.probe_fps)
 
 	XrInstance instance = XR_NULL_HANDLE;
 	XrSession session = XR_NULL_HANDLE;
@@ -65,6 +67,17 @@ struct Probe
 	uint64_t last_result_frame = 0;
 	uint64_t result_gaps = 0; //!< frames skipped between consecutive results (= dropped from our view)
 	bool summary_done = false;
+
+	//! The explicit probe runs on its own thread, paced at `fps` and polling
+	//! the (non-blocking) acquire every millisecond — NOT on the render loop,
+	//! whose CPU-painted full-window pattern (unoptimised in a debug build)
+	//! paces it at ~15 Hz and puts a whole loop period between a result and
+	//! the acquire that sees it (what made run 1 read 83 ms submit->acquire
+	//! against 17 ms of service latency).
+	pthread_t thread;
+	bool thread_started = false;
+	volatile bool thread_stop = false;
+	uint64_t painted_frame = UINT64_MAX;
 };
 
 Probe g_probe;
@@ -92,6 +105,11 @@ state_name(XrLiftStateDXR s)
 void
 paint_input(uint64_t frame)
 {
+	// Full paint once; afterwards only the walking-block band changes, so the
+	// probe's own CPU cost per submit stays small (the thing measured is the
+	// service, not this painter).
+	const bool full = g_probe.painted_frame == UINT64_MAX;
+	g_probe.painted_frame = frame;
 	void *ptr = nullptr;
 	if (AHardwareBuffer_lock(g_probe.in_ahb, AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, -1, nullptr, &ptr) != 0 ||
 	    ptr == nullptr) {
@@ -101,7 +119,8 @@ paint_input(uint64_t frame)
 	AHardwareBuffer_describe(g_probe.in_ahb, &d);
 	uint8_t *base = static_cast<uint8_t *>(ptr);
 	const uint32_t walk = (uint32_t)((frame % 120) * kInW / 120);
-	for (uint32_t y = 0; y < kInH; ++y) {
+	const uint32_t y0 = full ? 0 : kInH / 2 - 30, y1 = full ? kInH : kInH / 2 + 30;
+	for (uint32_t y = y0; y < y1; ++y) {
 		uint8_t *row = base + (size_t)y * d.stride * 4u;
 		for (uint32_t x = 0; x < kInW; ++x) {
 			uint8_t r = (uint8_t)(40 + 180 * x / kInW), g = (uint8_t)(60 + 120 * y / kInH), b = 160;
@@ -158,7 +177,7 @@ make_stream(const char *what)
 }
 
 void
-explicit_frame(uint64_t frame)
+explicit_submit(uint64_t frame)
 {
 	Probe &p = g_probe;
 	if (p.explicit_stream == XR_NULL_HANDLE || p.summary_done) {
@@ -202,10 +221,19 @@ explicit_frame(uint64_t frame)
 			     submit_cost / 1e6);
 		}
 	}
+}
 
+//! Non-blocking acquire: XR_LIFT_NOT_READY_DXR at once when nothing newer exists.
+void
+explicit_poll()
+{
+	Probe &p = g_probe;
+	if (p.explicit_stream == XR_NULL_HANDLE || p.summary_done) {
+		return;
+	}
 	XrLiftResultDXR res = {};
 	res.type = XR_TYPE_LIFT_RESULT_DXR;
-	r = p.acquire(p.explicit_stream, &res);
+	XrResult r = p.acquire(p.explicit_stream, &res);
 	if (r == XR_SUCCESS) {
 		p.results++;
 		if (res.outputTexture != nullptr) {
@@ -246,16 +274,40 @@ explicit_frame(uint64_t frame)
 		p.summary_done = true;
 		const double n = p.results > 0 ? (double)p.results : 1.0;
 		LOGW(
-		    "LIFT_PROBE: SUMMARY explicit: submitted=%llu not_taken=%llu "
+		    "LIFT_PROBE: SUMMARY explicit @%.0f fps: submitted=%llu not_taken=%llu "
 		    "results=%llu "
 		    "service latency avg=%.1f max=%.1f ms, submit->acquire avg=%.1f "
 		    "max=%.1f ms, frames skipped "
 		    "between results=%llu",
-		    (unsigned long long)p.submitted, (unsigned long long)p.not_taken, (unsigned long long)p.results,
-		    p.svc_lat_sum_ms / n, p.svc_lat_max_ms, p.client_lat_sum_ms / n, p.client_lat_max_ms,
-		    (unsigned long long)p.result_gaps);
+		    p.fps, (unsigned long long)p.submitted, (unsigned long long)p.not_taken,
+		    (unsigned long long)p.results, p.svc_lat_sum_ms / n, p.svc_lat_max_ms, p.client_lat_sum_ms / n,
+		    p.client_lat_max_ms, (unsigned long long)p.result_gaps);
 		log_stats("explicit", p.explicit_stream);
 	}
+}
+
+//! The explicit probe's own loop: submit every 1/fps, poll the acquire every 1 ms in between.
+void *
+explicit_thread(void *)
+{
+	Probe &p = g_probe;
+	const uint64_t period_ns = (uint64_t)(1e9 / p.fps);
+	uint64_t next_submit = mono_ns();
+	uint64_t n = 0;
+	while (!p.thread_stop && !p.summary_done) {
+		const uint64_t now = mono_ns();
+		if (now >= next_submit) {
+			explicit_submit(n++);
+			next_submit += period_ns;
+			if (next_submit < now) {
+				next_submit = now + period_ns; // fell behind (a slow call): never burst
+			}
+		}
+		explicit_poll();
+		struct timespec ts = {0, 1000 * 1000}; // 1 ms
+		nanosleep(&ts, nullptr);
+	}
+	return nullptr;
 }
 
 } // namespace
@@ -281,9 +333,14 @@ lift_probe_enabled()
 			const long long f = atoll(n);
 			p.max_frames = f > 0 ? (uint64_t)f : p.max_frames;
 		}
+		char fps[PROP_VALUE_MAX] = {};
+		if (__system_property_get("debug.dxr.lift.probe_fps", fps) > 0 && fps[0] != '\0') {
+			const double f = atof(fps);
+			p.fps = (f >= 1.0 && f <= 240.0) ? f : p.fps;
+		}
 		if (p.mode != Mode::Off) {
-			LOGW("LIFT_PROBE: enabled, mode '%s', %llu explicit frames", v,
-			     (unsigned long long)p.max_frames);
+			LOGW("LIFT_PROBE: enabled, mode '%s', %llu explicit frames at %.0f fps", v,
+			     (unsigned long long)p.max_frames, p.fps);
 		}
 	}
 	return p.mode != Mode::Off;
@@ -359,7 +416,10 @@ lift_probe_frame(uint64_t frame)
 		}
 	}
 
-	explicit_frame(frame);
+	// The explicit stream is driven by its own paced thread (see Probe::thread).
+	if (p.explicit_stream != XR_NULL_HANDLE && !p.thread_started) {
+		p.thread_started = pthread_create(&p.thread, nullptr, explicit_thread, nullptr) == 0;
+	}
 
 	if (frame % 120 == 0) {
 		log_stats("weave", p.weave_stream);
@@ -379,6 +439,11 @@ void
 lift_probe_shutdown()
 {
 	Probe &p = g_probe;
+	if (p.thread_started) {
+		p.thread_stop = true;
+		pthread_join(p.thread, nullptr);
+		p.thread_started = false;
+	}
 	if (p.destroy != nullptr) {
 		if (p.weave_stream != XR_NULL_HANDLE) {
 			p.destroy(p.weave_stream);

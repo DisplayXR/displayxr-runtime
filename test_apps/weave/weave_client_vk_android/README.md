@@ -41,7 +41,7 @@ the service compositor, and an in-process session reports
 cannot answer "is it woven?" from the host. Read the buffers back instead:
 
 ```bash
-adb shell setprop debug.dxr.weave.dump 1     # dumps once, then clears itself
+adb shell setprop debug.dxr.weave.dump 1     # dumps ONCE; set 2, 3, … for each further dump
 adb pull /sdcard/Android/data/com.displayxr.weave_client_vk_android/files/weave_out.ppm
 ```
 
@@ -60,7 +60,7 @@ adb shell setprop debug.dxr.overlay 1        # vendor force-3D; remember to clea
 | Property | Effect |
 |---|---|
 | `debug.dxr.weave.passthrough 1` | blit the app's own pre-weave input instead of the woven output — the A/B that separates "my present path is broken" from "the weave is broken" |
-| `debug.dxr.weave.dump 1` | one-shot PPM dump of the input + the woven output |
+| `debug.dxr.weave.dump <v>` | one PPM dump of the input + the woven output per distinct non-zero value (`1`, then `2`, …). The app cannot clear the property itself (an app's `setprop` is denied), so it latches the value it last dumped for; `0` / unset never dumps |
 
 ## XR_DXR_lift probe (ADR-042)
 
@@ -74,6 +74,7 @@ unless a property names a mode:
 | `debug.dxr.lift.probe explicit` | a separate 960x540 CPU-painted `AHardwareBuffer` through `xrSubmitLiftFrameDXR` + `xrAcquireLiftResultDXR` every frame; logs service latency, submit→acquire latency and frames skipped between results |
 | `debug.dxr.lift.probe both` | both, two streams |
 | `debug.dxr.lift.probe_frames N` | explicit frames before the SUMMARY line (default 300) |
+| `debug.dxr.lift.probe_fps F` | explicit submit rate (default 30). The explicit probe runs on its OWN thread — submit every 1/F s, non-blocking acquire polled every 1 ms — so its latency and rate reflect the service. (The render loop repaints the whole window on the CPU every frame and, unoptimised in a debug build, runs at ~15 Hz; tying the probe to it measured the loop, not the lift.) |
 
 `XR_DXR_lift` is enabled only when the probe is on. With no vendor module installed, pair it
 with the sim fake: `debug.dxr.lift.fake 1` (+ `debug.dxr.lift.plugin sim_display` on a Leia

@@ -456,6 +456,7 @@ adb shell setprop debug.dxr.lift.fake 1
 adb shell setprop debug.dxr.lift.plugin sim_display   # omit on a sim_display-only device
 adb shell setprop debug.dxr.lift.probe both           # weave | explicit | both
 adb shell setprop debug.dxr.lift.probe_frames 300
+adb shell setprop debug.dxr.lift.probe_fps 30         # explicit submit rate (own thread, non-blocking acquire)
 # The props are read when the service process starts: with NO client running, restart it
 # (never force-stop the runtime under a live client), or reboot.
 adb shell am start -n com.displayxr.weave_client_vk_android/.MainActivity

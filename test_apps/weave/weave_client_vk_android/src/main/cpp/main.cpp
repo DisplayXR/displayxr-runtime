@@ -1202,11 +1202,19 @@ dump_image(VkImage image, uint32_t w, uint32_t h, const char *path)
 void
 maybe_dump()
 {
+	// One dump per distinct NON-ZERO value of the property. An app cannot clear
+	// a debug.* property (setprop from an app process is EACCES), so a "dump,
+	// then reset the prop" scheme re-dumped every frame and stalled the app.
+	// Instead the process latches the value it last dumped for: set 1, get one
+	// dump; set 2 (or any new value) for the next one; 0 / unset = never.
+	static char s_dumped_for[PROP_VALUE_MAX] = {};
 	char value[PROP_VALUE_MAX] = {};
-	if (__system_property_get("debug.dxr.weave.dump", value) <= 0 || value[0] != '1') {
+	if (__system_property_get("debug.dxr.weave.dump", value) <= 0 || value[0] == '\0' ||
+	    strcmp(value, "0") == 0 || strcmp(value, s_dumped_for) == 0) {
 		return;
 	}
-	__system_property_set("debug.dxr.weave.dump", "0");
+	snprintf(s_dumped_for, sizeof(s_dumped_for), "%s", value);
+	LOGI("WEAVE_CLIENT: debug.dxr.weave.dump=%s — dumping once", value);
 	dump_image(g_app.in_image, g_app.in_w, g_app.in_h,
 	           "/sdcard/Android/data/com.displayxr.weave_client_vk_android/files/weave_in.ppm");
 	if (g_app.out_image != VK_NULL_HANDLE) {
