@@ -282,8 +282,14 @@ max_abs_dev(const std::vector<float> &v, float ref)
  */
 template <typename ToIdeal>
 block_stats
-match_blocks(
-    const uint8_t *img, uint32_t pitch, uint32_t eye_w, uint32_t h, const sim_stereo_camera_scene &sc, ToIdeal to_ideal)
+match_blocks(const uint8_t *img,
+             uint32_t pitch,
+             uint32_t eye_w,
+             uint32_t h,
+             const sim_stereo_camera_scene &sc,
+             ToIdeal to_ideal,
+             uint32_t max_d = 64,
+             bool ncc = false)
 {
 	block_stats st;
 	const uint32_t B = 32, max_dy = 10;
@@ -305,7 +311,18 @@ match_blocks(
 				continue;
 			}
 			float dx, dy;
-			if (!u_stereo_camera_estimate_offset(img, pitch, eye_w, h, x, y, B, B, 64, max_dy, &dx, &dy)) {
+			if (ncc) {
+				// The probe's matcher: flagged / weak blocks are excluded, never clamped.
+				u_stereo_camera_block_match bm;
+				if (!u_stereo_camera_match_block(img, pitch, eye_w, h, x, y, B, B, max_d, max_dy,
+				                                 &bm) ||
+				    bm.dx_at_edge || bm.dy_at_edge || bm.ncc < 0.9f) {
+					continue;
+				}
+				dx = bm.dx;
+				dy = bm.dy;
+			} else if (!u_stereo_camera_estimate_offset(img, pitch, eye_w, h, x, y, B, B, max_d, max_dy,
+			                                            &dx, &dy)) {
 				continue;
 			}
 			(is_bar ? st.dx_bar : st.dx_bg).push_back(dx);
@@ -398,6 +415,398 @@ TEST_CASE("stereo rectify: END TO END on the distorted sim fake", "[stereo_recti
 
 	u_stereo_rectify_lut_fini(&lut);
 	sim_stereo_camera_distorted_fini(&d);
+}
+
+namespace {
+
+//! A parallel pair of the scene, the right eye shifted DOWN by @p dy_px rows
+//! (a feature at left row v is at right row v + dy) and given a gain/offset.
+std::vector<uint8_t>
+render_parallel(const sim_stereo_camera_scene &sc, double dy_px, double gain = 1.0, double offset = 0.0)
+{
+	const uint32_t W = sc.eye_width, H = sc.eye_height;
+	std::vector<uint8_t> img(2 * W * H);
+	for (uint32_t y = 0; y < H; y++) {
+		for (uint32_t x = 0; x < W; x++) {
+			img[y * 2 * W + x] = (uint8_t)std::lround(sim_stereo_camera_scene_sample(&sc, 0, x, y));
+			double v = gain * sim_stereo_camera_scene_sample(&sc, 1, x, y - dy_px) + offset;
+			img[y * 2 * W + W + x] = (uint8_t)std::lround(std::min(255.0, std::max(0.0, v)));
+		}
+	}
+	return img;
+}
+
+} // namespace
+
+TEST_CASE("probe matcher: Leia-SR-sized disparities, SIGNED dy, bound hits flagged", "[stereo_rectify][probe]")
+{
+	// 120 mm at f 474 px: the bar at 0.6 m is ~95 px (the field case: a face at
+	// 0.6 m on the SR tracking camera, which the old fixed 0..64 search clamped).
+	const uint32_t W = 640, H = 480;
+	sim_stereo_camera_scene sc;
+	sim_stereo_camera_scene_init(&sc, W, H, k_ideal_fx_640, 120.0, 2.0, 0.6);
+	REQUIRE(sc.bar_disparity_f > 90.0);
+	const double dy0 = 1.68; // the field's signed residual
+	std::vector<uint8_t> img = render_parallel(sc, dy0);
+	const uint32_t max_d = (uint32_t)std::ceil(k_ideal_fx_640 * 0.120 / 0.4); // what the probe computes
+	const uint32_t bx = 280, by = 200;                                        // inside the bar
+
+	u_stereo_camera_block_match m;
+	REQUIRE(u_stereo_camera_match_block(img.data(), 2 * W, W, H, bx, by, 32, 32, max_d, 24, &m));
+	std::printf("[probe] bar block: dx %.3f (GT %.3f), dy %+.3f (GT %+.3f), ncc %.4f, window d %d..%d dy %d..%d\n",
+	            m.dx, sc.bar_disparity_f, m.dy, dy0, m.ncc, m.d_lo, m.d_hi, m.dy_lo, m.dy_hi);
+	CHECK_FALSE(m.dx_at_edge);
+	CHECK_FALSE(m.dy_at_edge);
+	CHECK(m.ncc > 0.93f);
+	CHECK(m.dx == Catch::Approx(sc.bar_disparity_f).margin(0.25));
+	CHECK(m.dy == Catch::Approx(dy0).margin(0.15)); // SIGNED, sub-pixel
+
+	// Background block (28.5 px), same signed dy.
+	REQUIRE(u_stereo_camera_match_block(img.data(), 2 * W, W, H, 520, 40, 32, 32, max_d, 24, &m));
+	CHECK(m.dx == Catch::Approx(sc.bg_disparity_f).margin(0.25));
+	CHECK(m.dy == Catch::Approx(dy0).margin(0.15));
+
+	// The field failure, reproduced: with the old 64 px window the true match is
+	// out of reach. The block must then be REJECTED — a peak on the bound, or a
+	// correlation under the probe's 0.90 — never reported as a disparity.
+	REQUIRE(u_stereo_camera_match_block(img.data(), 2 * W, W, H, bx, by, 32, 32, 64, 24, &m));
+	std::printf("[probe] same block, 0..64 window: dx %.2f, ncc %.3f, at_edge %d\n", m.dx, m.ncc,
+	            (int)m.dx_at_edge);
+	CHECK((m.dx_at_edge || m.ncc < 0.90f));
+	// Likewise a dy window narrower than the true offset.
+	std::vector<uint8_t> img3 = render_parallel(sc, 3.0);
+	REQUIRE(u_stereo_camera_match_block(img3.data(), 2 * W, W, H, bx, by, 32, 32, max_d, 1, &m));
+	CHECK(m.dy_at_edge);
+	REQUIRE(u_stereo_camera_match_block(img3.data(), 2 * W, W, H, bx, by, 32, 32, max_d, 24, &m));
+	CHECK_FALSE(m.dy_at_edge);
+	CHECK(m.dy == Catch::Approx(3.0).margin(0.15));
+
+	// NCC is blind to a gain/offset mismatch between the two sensors.
+	std::vector<uint8_t> img_g = render_parallel(sc, dy0, 0.75, 30.0);
+	REQUIRE(u_stereo_camera_match_block(img_g.data(), 2 * W, W, H, bx, by, 32, 32, max_d, 24, &m));
+	CHECK(m.ncc > 0.93f);
+	CHECK(m.dx == Catch::Approx(sc.bar_disparity_f).margin(0.25));
+	CHECK(m.dy == Catch::Approx(dy0).margin(0.15));
+
+	// A flat block is refused, not matched anywhere.
+	std::vector<uint8_t> flat(2 * W * H, 128);
+	CHECK_FALSE(u_stereo_camera_match_block(flat.data(), 2 * W, W, H, bx, by, 32, 32, max_d, 24, &m));
+}
+
+TEST_CASE("stereo rectify: END TO END at the Leia SR baseline (120 mm)", "[stereo_rectify][probe]")
+{
+	const uint32_t W = 640, H = 480;
+	const double B_mm = 120.0;
+	sim_stereo_camera_distorted d;
+	REQUIRE(sim_stereo_camera_distorted_init(&d, W, H, k_ideal_fx_640, B_mm, 2.0, 0.6));
+	std::vector<uint8_t> raw(2 * W * H), rect(2 * W * H);
+	sim_stereo_camera_render_gray_distorted(&d, 77, raw.data(), 2 * W);
+
+	u_stereo_rectify_input in;
+	std::memset(&in, 0, sizeof(in));
+	in.width = W;
+	in.height = H;
+	for (int e = 0; e < 2; e++) {
+		in.eye[e].fx = d.truth.fx[e];
+		in.eye[e].fy = d.truth.fy[e];
+		in.eye[e].cx = d.truth.cx[e];
+		in.eye[e].cy = d.truth.cy[e];
+		in.eye[e].model = U_STEREO_RECTIFY_MODEL_RADTAN5;
+		std::memcpy(in.eye[e].d, d.truth.dist[e], sizeof(d.truth.dist[e]));
+	}
+	std::memcpy(in.R, d.truth.R, sizeof(in.R));
+	std::memcpy(in.T, d.truth.T_mm, sizeof(in.T));
+	u_stereo_rectify_result r;
+	REQUIRE(u_stereo_rectify_compute(&in, &r));
+	u_stereo_rectify_lut lut;
+	REQUIRE(u_stereo_rectify_lut_init(&lut, &r, 1));
+	u_stereo_rectify_lut_apply(&lut, 1, raw.data(), 2 * W, rect.data(), 2 * W);
+
+	const double ifx = d.truth.ideal_fx, icx = d.truth.ideal_cx, icy = d.truth.ideal_cy;
+	auto to_ideal = [&](uint32_t x, uint32_t y, double *u, double *v) {
+		*u = ifx * (x - r.cx) / r.f + icx;
+		*v = ifx * (y - r.cy) / r.f + icy;
+	};
+	const uint32_t max_d = (uint32_t)std::ceil(r.f * (B_mm / 1000.0) / 0.4);
+	block_stats st = match_blocks(rect.data(), 2 * W, W, H, d.scene, to_ideal, max_d, true);
+	REQUIRE(st.dx_bg.size() > 20);
+	REQUIRE(st.dx_bar.size() > 5);
+	const float gt_bg = (float)(r.f * (B_mm / 1000.0) / 2.0);
+	const float gt_bar = (float)(r.f * (B_mm / 1000.0) / 0.6);
+	std::vector<float> dy_all = st.dy_bg;
+	dy_all.insert(dy_all.end(), st.dy_bar.begin(), st.dy_bar.end());
+	std::printf(
+	    "[e2e 120mm] f %.3f: bar GT %.3f px measured median %.3f (%zu blocks); bg GT %.3f median %.3f; "
+	    "signed dy median %+.4f px, |dy| max %.3f\n",
+	    r.f, gt_bar, median(st.dx_bar), st.dx_bar.size(), gt_bg, median(st.dx_bg), median(dy_all),
+	    max_abs_dev(dy_all, 0.0f));
+	CHECK(gt_bar > 64.0f); // the case the old fixed window could not measure
+	CHECK(max_abs_dev(st.dx_bar, gt_bar) <= 0.5f);
+	CHECK(max_abs_dev(st.dx_bg, gt_bg) <= 0.5f);
+	CHECK(max_abs_dev(dy_all, 0.0f) <= 0.5f);
+	CHECK(std::fabs(median(dy_all)) <= 0.1f); // no constant vertical offset
+	u_stereo_rectify_lut_fini(&lut);
+	sim_stereo_camera_distorted_fini(&d);
+}
+
+/*
+ * CONSTANT VERTICAL OFFSET hypotheses (field: +1.7 px signed dy after
+ * rectification on the Leia SR laptop). Each case feeds the rectifier a
+ * calibration that differs from the truth in ONE specific way and measures the
+ * signed dy it leaves, so the field residual can be matched to a cause once the
+ * raw frames + calibration dumps arrive. The matched pair is always the
+ * distorted fake at the SR-like 120 mm baseline.
+ */
+namespace {
+
+struct vshift_rig
+{
+	sim_stereo_camera_distorted d;
+	std::vector<uint8_t> raw;
+	u_stereo_rectify_input truth_in;
+	static constexpr uint32_t W = 640, H = 480;
+
+	vshift_rig()
+	{
+		REQUIRE(sim_stereo_camera_distorted_init(&d, W, H, k_ideal_fx_640, 120.0, 2.0, 0.6));
+		raw.resize(2 * W * H);
+		sim_stereo_camera_render_gray_distorted(&d, 5, raw.data(), 2 * W);
+		std::memset(&truth_in, 0, sizeof(truth_in));
+		truth_in.width = W;
+		truth_in.height = H;
+		for (int e = 0; e < 2; e++) {
+			truth_in.eye[e].fx = d.truth.fx[e];
+			truth_in.eye[e].fy = d.truth.fy[e];
+			truth_in.eye[e].cx = d.truth.cx[e];
+			truth_in.eye[e].cy = d.truth.cy[e];
+			truth_in.eye[e].model = U_STEREO_RECTIFY_MODEL_RADTAN5;
+			std::memcpy(truth_in.eye[e].d, d.truth.dist[e], sizeof(d.truth.dist[e]));
+		}
+		std::memcpy(truth_in.R, d.truth.R, sizeof(truth_in.R));
+		std::memcpy(truth_in.T, d.truth.T_mm, sizeof(truth_in.T));
+	}
+	~vshift_rig()
+	{
+		sim_stereo_camera_distorted_fini(&d);
+	}
+
+	//! Rectify @p img with @p in; signed dy median + spread over NCC-accepted blocks.
+	void
+	measure(const u_stereo_rectify_input &in,
+	        const std::vector<uint8_t> &img,
+	        float *dy_median,
+	        float *dy_spread,
+	        float *dx_median,
+	        double *f_rect = nullptr)
+	{
+		u_stereo_rectify_result r;
+		REQUIRE(u_stereo_rectify_compute(&in, &r));
+		u_stereo_rectify_lut lut;
+		REQUIRE(u_stereo_rectify_lut_init(&lut, &r, 1));
+		std::vector<uint8_t> rect(2 * W * H);
+		u_stereo_rectify_lut_apply(&lut, 1, img.data(), 2 * W, rect.data(), 2 * W);
+		u_stereo_rectify_lut_fini(&lut);
+		std::vector<float> dys, dxs;
+		const uint32_t max_d = (uint32_t)std::ceil(r.f * 0.120 / 0.4);
+		for (uint32_t y = 40; y + 72 <= H; y += 32) {
+			for (uint32_t x = 40; x + 40 <= W; x += 32) {
+				u_stereo_camera_block_match m;
+				if (u_stereo_camera_match_block(rect.data(), 2 * W, W, H, x, y, 32, 32, max_d, 24,
+				                                &m) &&
+				    !m.dx_at_edge && !m.dy_at_edge && m.ncc >= 0.9f) {
+					dys.push_back(m.dy);
+					dxs.push_back(m.dx);
+				}
+			}
+		}
+		REQUIRE(dys.size() > 30);
+		*dy_median = median(dys);
+		std::vector<float> dev;
+		for (float v : dys) {
+			dev.push_back(std::fabs(v - *dy_median));
+		}
+		std::sort(dev.begin(), dev.end());
+		*dy_spread = dev[(dev.size() * 9) / 10]; // p90 |dy - median|
+		*dx_median = median(dxs);
+		if (f_rect != nullptr) {
+			*f_rect = r.f;
+		}
+	}
+};
+
+} // namespace
+
+TEST_CASE("vertical offset H0: the true calibration leaves no constant dy", "[stereo_rectify][vshift]")
+{
+	vshift_rig rig;
+	float med, spread, dx;
+	rig.measure(rig.truth_in, rig.raw, &med, &spread, &dx);
+	std::printf("[vshift] H0 truth: signed dy median %+.3f px, p90 spread %.3f\n", med, spread);
+	CHECK(std::fabs(med) <= 0.1f);
+}
+
+TEST_CASE("vertical offset H1: a per-eye cy error is a CONSTANT dy of (f_rect/fy) * dcy", "[stereo_rectify][vshift]")
+{
+	// Candidate field causes that all reduce to "one eye's cy is off": a flipped
+	// (bottom-up) row convention (dcy = H-1-2cy per eye), a crop instead of a
+	// scale between calibration and frame size, a +-0.5 px centre convention
+	// applied to one eye only, an integer-rounded cy on one eye.
+	vshift_rig rig;
+	for (double dcy : {0.5, 1.0, -1.5}) {
+		u_stereo_rectify_input in = rig.truth_in;
+		in.eye[1].cy += dcy; // the calibration says the RIGHT principal point is dcy lower
+		float med, spread, dx;
+		double f;
+		rig.measure(in, rig.raw, &med, &spread, &dx, &f);
+		double pred = -f / rig.d.truth.fy[1] * dcy; // first order; barrel magnification adds a few %
+		std::printf(
+		    "[vshift] H1 right cy %+.1f px: signed dy median %+.3f px (predicted %+.3f), p90 spread %.3f\n",
+		    dcy, med, pred, spread);
+		CHECK(med == Catch::Approx(pred).epsilon(0.1).margin(0.05));
+		CHECK(spread <= 0.35f); // constant across the frame: an offset, not a rotation
+	}
+}
+
+TEST_CASE("vertical offset H2: R given in the wrong direction (R^T) is a large, roll-shaped dy",
+          "[stereo_rectify][vshift]")
+{
+	// If the vendor's R were x_left = R x_right (camera-to-camera the other way)
+	// the rectifier would double the relative rotation instead of cancelling it.
+	// Signature: a dy offset ~ f * 2 * relative pitch PLUS a roll gradient (large
+	// spread) — so a pure constant +1.7 px does NOT look like this.
+	vshift_rig rig;
+	u_stereo_rectify_input in = rig.truth_in;
+	for (int i = 0; i < 3; i++) {
+		for (int j = 0; j < 3; j++) {
+			in.R[i][j] = rig.truth_in.R[j][i];
+		}
+	}
+	float med, spread, dx;
+	rig.measure(in, rig.raw, &med, &spread, &dx);
+	std::printf("[vshift] H2 R^T: signed dy median %+.3f px, p90 spread %.3f\n", med, spread);
+	CHECK((std::fabs(med) > 2.0f || spread > 1.0f));
+}
+
+TEST_CASE("vertical offset H3: calibration size vs frame size (pixel-centre rescale)", "[stereo_rectify][vshift]")
+{
+	// Intrinsics expressed at 2x the frame (u2 = 2u + 0.5) must rectify
+	// identically; the WRONG convention (u2 = 2u) shifts both eyes' cy by 0.25 px
+	// at frame scale — equal in both eyes, so it must NOT create relative dy.
+	vshift_rig rig;
+	u_stereo_rectify_input in = rig.truth_in;
+	in.calib_width = 2 * rig.W;
+	in.calib_height = 2 * rig.H;
+	for (int e = 0; e < 2; e++) {
+		in.eye[e].fx *= 2.0;
+		in.eye[e].fy *= 2.0;
+		in.eye[e].cx = (in.eye[e].cx + 0.5) * 2.0 - 0.5;
+		in.eye[e].cy = (in.eye[e].cy + 0.5) * 2.0 - 0.5;
+	}
+	float med, spread, dx, med0, spread0, dx0;
+	rig.measure(rig.truth_in, rig.raw, &med0, &spread0, &dx0);
+	rig.measure(in, rig.raw, &med, &spread, &dx);
+	CHECK(med == Catch::Approx(med0).margin(0.02));
+	CHECK(dx == Catch::Approx(dx0).margin(0.02));
+	for (int e = 0; e < 2; e++) {
+		in.eye[e].cx = rig.truth_in.eye[e].cx * 2.0; // wrong (corner) convention
+		in.eye[e].cy = rig.truth_in.eye[e].cy * 2.0;
+	}
+	rig.measure(in, rig.raw, &med, &spread, &dx);
+	std::printf("[vshift] H3 corner-convention rescale: signed dy median %+.3f px (truth %+.3f)\n", med, med0);
+	CHECK(std::fabs(med - med0) <= 0.1f); // common-mode: no relative dy
+}
+
+TEST_CASE("vertical offset H4: the plug-in's half swap + (R^T, -R^T T) is exact", "[stereo_rectify][vshift]")
+{
+	// L1 (Leia) swaps the SBS halves and re-expresses the calibration from camera
+	// 2's side: K/D swapped, R' = R^T, T' = -R^T T. Model exactly that here.
+	vshift_rig rig;
+	const uint32_t W = rig.W, H = rig.H;
+	std::vector<uint8_t> swapped(2 * W * H);
+	for (uint32_t y = 0; y < H; y++) {
+		std::memcpy(&swapped[y * 2 * W], &rig.raw[y * 2 * W + W], W);
+		std::memcpy(&swapped[y * 2 * W + W], &rig.raw[y * 2 * W], W);
+	}
+	// The vendor's own calibration of the swapped pair (camera 1 = SBS RIGHT):
+	// x_2 = R_v x_1 + T_v with camera 1 the truth's RIGHT eye.
+	u_stereo_rectify_input v = rig.truth_in;
+	v.eye[0] = rig.truth_in.eye[1];
+	v.eye[1] = rig.truth_in.eye[0];
+	double Rv[3][3], Tv[3];
+	for (int i = 0; i < 3; i++) {
+		for (int j = 0; j < 3; j++) {
+			Rv[i][j] = rig.truth_in.R[j][i];
+		}
+	}
+	for (int i = 0; i < 3; i++) {
+		Tv[i] = -(Rv[i][0] * rig.truth_in.T[0] + Rv[i][1] * rig.truth_in.T[1] + Rv[i][2] * rig.truth_in.T[2]);
+	}
+	REQUIRE(Tv[0] > 0.0); // what makes L1 decide to swap
+	// L1's leia_scam_calibration_for_runtime(swap = true):
+	u_stereo_rectify_input in = v;
+	in.eye[0] = v.eye[1];
+	in.eye[1] = v.eye[0];
+	for (int i = 0; i < 3; i++) {
+		for (int j = 0; j < 3; j++) {
+			in.R[i][j] = Rv[j][i];
+		}
+	}
+	for (int i = 0; i < 3; i++) {
+		in.T[i] = -(in.R[i][0] * Tv[0] + in.R[i][1] * Tv[1] + in.R[i][2] * Tv[2]);
+	}
+	// ...applied to the halves swapped BACK, which is what L1 delivers.
+	std::vector<uint8_t> back(2 * W * H);
+	for (uint32_t y = 0; y < H; y++) {
+		std::memcpy(&back[y * 2 * W], &swapped[y * 2 * W + W], W);
+		std::memcpy(&back[y * 2 * W + W], &swapped[y * 2 * W], W);
+	}
+	float med, spread, dx;
+	rig.measure(in, back, &med, &spread, &dx);
+	std::printf("[vshift] H4 swap round trip: signed dy median %+.3f px, dx median %.2f\n", med, dx);
+	CHECK(std::fabs(med) <= 0.1f);
+	CHECK(dx > 20.0f); // positive disparities
+	// Swapping the intrinsics but NOT the distortion (a plausible slip) is visible:
+	u_stereo_rectify_input bad = in;
+	std::memcpy(bad.eye[0].d, in.eye[1].d, sizeof(bad.eye[0].d));
+	std::memcpy(bad.eye[1].d, in.eye[0].d, sizeof(bad.eye[1].d));
+	rig.measure(bad, back, &med, &spread, &dx);
+	std::printf("[vshift] H4 distortion NOT swapped: signed dy median %+.3f px, p90 spread %.3f\n", med, spread);
+}
+
+TEST_CASE("vertical offset H5: identity calibration is an identity LUT (no half-pixel shift)",
+          "[stereo_rectify][vshift]")
+{
+	u_stereo_rectify_input in;
+	std::memset(&in, 0, sizeof(in));
+	in.width = 640;
+	in.height = 480;
+	for (int e = 0; e < 2; e++) {
+		in.eye[e].fx = in.eye[e].fy = 500.0;
+		in.eye[e].cx = 319.5;
+		in.eye[e].cy = 239.5;
+		in.eye[e].model = U_STEREO_RECTIFY_MODEL_RADTAN5;
+	}
+	in.R[0][0] = in.R[1][1] = in.R[2][2] = 1.0;
+	in.T[0] = -120.0;
+	u_stereo_rectify_result r;
+	REQUIRE(u_stereo_rectify_compute(&in, &r));
+	CHECK(r.cy == Catch::Approx(239.5).margin(1e-6));
+	// The border check may zoom a hair (x1.001 per step) even here, but the map
+	// must then be a PURE scale about (cx, cy) — identical in both eyes, with the
+	// principal row fixed: no half-pixel or rounding offset anywhere.
+	std::printf("[vshift] H5 identity: f %.4f (raw 500), crop x%.5f, cy %.4f\n", r.f, r.crop_scale, r.cy);
+	CHECK(r.crop_scale < 1.0025);
+	double worst = 0.0;
+	for (uint32_t e = 0; e < 2; e++) {
+		for (double v : {0.0, 100.0, 239.5, 479.0}) {
+			for (double u : {0.0, 320.0, 639.0}) {
+				double x, y;
+				REQUIRE(u_stereo_rectify_map_point(&r, e, u, v, &x, &y));
+				worst = std::max(worst, std::fabs((y - 239.5) - (v - 239.5) * 500.0 / r.f));
+			}
+		}
+	}
+	CHECK(worst < 1e-6);
 }
 
 TEST_CASE("stereo rectify: NV12 and BGRA8 planes agree with GRAY8", "[stereo_rectify]")

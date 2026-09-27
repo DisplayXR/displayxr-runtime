@@ -179,7 +179,7 @@ sim_display_stereo_camera_get_calibration(struct xrt_plugin_instance *inst,
 	if (cfg->distort) {
 		// The raw pair's ground truth (sim_display_stereo_camera_pattern.h).
 		struct sim_stereo_camera_truth t;
-		sim_stereo_camera_truth_init(&t, cfg->eye_w, cfg->eye_h, fake_fx(cfg->eye_w), FAKE_BASELINE_MM,
+		sim_stereo_camera_truth_init(&t, cfg->eye_w, cfg->eye_h, fake_fx(cfg->eye_w), cfg->baseline_mm,
 		                             FAKE_BG_DEPTH_M, FAKE_BAR_DEPTH_M);
 		for (int e = 0; e < 2; e++) {
 			c.k[e][0] = t.fx[e];
