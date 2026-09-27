@@ -1310,6 +1310,26 @@ vk_queue_unlock(struct vk_bundle_queue *q)
 }
 
 /*!
+ * One WARN per call site the first time a queue operation fails with
+ * VK_ERROR_INITIALIZATION_FAILED — on Adreno the signature of two threads
+ * submitting to the process's one GSL context at once (`next client ts N must
+ * be greater than current ts N`), i.e. a submit that bypassed the queue lock.
+ * Names @p caller so the log says which path lost the race.
+ */
+#define VK_WARN_QUEUE_RACE_ONCE(caller, ret)                                                                           \
+	do {                                                                                                           \
+		static bool vk_queue_race_warned_ = false;                                                             \
+		if ((ret) == VK_ERROR_INITIALIZATION_FAILED && !vk_queue_race_warned_) {                               \
+			vk_queue_race_warned_ = true;                                                                  \
+			U_LOG_W(                                                                                       \
+			    "%s: queue operation failed with VK_ERROR_INITIALIZATION_FAILED — on Adreno this is "    \
+			    "a concurrent submit on the same queue (a submitter not holding vk_queue_lock). "          \
+			    "Logged once for this call site.",                                                         \
+			    (caller));                                                                                 \
+		}                                                                                                      \
+	} while (0)
+
+/*!
  * Initialize a bundle with objects given to us by client code,
  * used by @ref client_vk_compositor in @ref comp_client.
  *

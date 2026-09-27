@@ -1922,6 +1922,7 @@ weave_satellite_present(struct vk_bundle *vk,
 	vk_queue_lock(vk->main_queue);
 	ret = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit, mc->weave.sat_fence);
 	vk_queue_unlock(vk->main_queue);
+	VK_WARN_QUEUE_RACE_ONCE("weave satellite blit", ret);
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("weave satellite(#1277): blit submit: %s", vk_result_string(ret));
 		weave_satellite_release(vk, mc);
@@ -2479,6 +2480,7 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 			vk_queue_lock(vk->main_queue);
 			VkResult pre_ret = vk->vkQueueSubmit(vk->main_queue->queue, 1, &pre_submit, VK_NULL_HANDLE);
 			vk_queue_unlock(vk->main_queue);
+			VK_WARN_QUEUE_RACE_ONCE("comp_multi_weave_submit (pre-weave batch)", pre_ret);
 			if (pre_ret != VK_SUCCESS) {
 				U_LOG_E("weave(#1036): pre-weave vkQueueSubmit failed: %s", vk_result_string(pre_ret));
 				break;
@@ -2506,6 +2508,18 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		// ONE process_atlas per submit. Legacy/batch: 2x1 SBS, per-eye dims = the
 		// window. v6: the caller's grid at content_view dims.
 		xrt_display_processor_set_target_color_view(mc->weave.dp, mc->weave.out_view);
+		// ONE queue lock for every submitter on this device. A self-submitting
+		// DP (Leia CNSDK) submits to vk_bundle::main_queue INSIDE process_atlas
+		// without taking vk_queue_lock — it does not know about it — so hold it
+		// for the call: otherwise the DP's submit races the lift thread's /
+		// another client's, and on Adreno the loser fails with
+		// VK_ERROR_INITIALIZATION_FAILED (one GSL context per process). The DP
+		// must not take the lock itself (os_mutex is not recursive); the Leia
+		// Android DP does not.
+		const bool dp_submits = xrt_display_processor_is_self_submitting(mc->weave.dp);
+		if (dp_submits) {
+			vk_queue_lock(vk->main_queue);
+		}
 		xrt_display_processor_process_atlas(mc->weave.dp, cmd,                      //
 		                                    (VkImage_XDP)dp_src_image, dp_src_view, //
 		                                    atlas_view_w, atlas_view_h,             //
@@ -2516,6 +2530,9 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		                                    mc->weave.out_w, mc->weave.out_h,       //
 		                                    (VkFormat_XDP)WEAVE_VK_FORMAT,          //
 		                                    0, 0, 0, 0);
+		if (dp_submits) {
+			vk_queue_unlock(vk->main_queue);
+		}
 
 		// v6: restore the input atlas to GENERAL so the next frame's barrier
 		// (oldLayout=GENERAL) is correct and the caller's external writes land into
@@ -2626,6 +2643,7 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		vk_queue_lock(vk->main_queue);
 		VkResult ret = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit, mc->weave.fence);
 		vk_queue_unlock(vk->main_queue);
+		VK_WARN_QUEUE_RACE_ONCE("comp_multi_weave_submit", ret);
 		if (ret != VK_SUCCESS) {
 			U_LOG_E("weave(#1036): vkQueueSubmit failed: %s", vk_result_string(ret));
 			break;

@@ -1713,7 +1713,10 @@ recreate_session_swapchain(struct multi_compositor *mc, struct vk_bundle *vk)
 	// flight holding a BufferQueue slot. Drain the whole device so destroying the
 	// old swapchain releases every buffer back to the queue — otherwise the new
 	// swapchain's first vkAcquireNextImageKHR can block forever on Android (#510).
+	// vkDeviceWaitIdle needs every queue externally synchronized: take the lock.
+	vk_queue_lock(vk->main_queue);
 	vk->vkDeviceWaitIdle(vk->device);
+	vk_queue_unlock(vk->main_queue);
 
 	uint32_t old_image_count = mc->session_render.buffer_count;
 
@@ -3522,7 +3525,17 @@ black_canvas:; // force_black (minimized) jumps here, skipping all content/view 
 			xrt_display_processor_set_target_color_view(mc->session_render.display_processor,
 			                                            ct->images[buffer_index].view);
 
-			// Call display processor with atlas input
+			// Call display processor with atlas input. Android: a self-submitting
+			// DP (Leia CNSDK) submits to main_queue inside process_atlas without
+			// vk_queue_lock, racing the weave / lift / other clients' submits on
+			// the process's one GSL context — hold the lock for the call.
+#ifdef XRT_OS_ANDROID
+			const bool dp_submits =
+			    xrt_display_processor_is_self_submitting(mc->session_render.display_processor);
+			if (dp_submits) {
+				vk_queue_lock(vk->main_queue);
+			}
+#endif
 			xrt_display_processor_process_atlas(
 			    mc->session_render.display_processor, cmd,
 			    (VkImage_XDP)mc->session_render.flip_sbs_image, // atlas image (for copy/blit)
@@ -3537,6 +3550,11 @@ black_canvas:; // force_black (minimized) jumps here, skipping all content/view 
 			    framebufferWidth, framebufferHeight,
 			    (VkFormat_XDP)framebufferFormat,
 			    canvas_x, canvas_y, canvas_w, canvas_h);
+#ifdef XRT_OS_ANDROID
+			if (dp_submits) {
+				vk_queue_unlock(vk->main_queue);
+			}
+#endif
 
 			// Composite LOCAL_2D layers (e.g. the avatar speech bubble in the
 			// top-25% 2D band, #568) into the woven target. Post-weave so they
@@ -3625,6 +3643,7 @@ submit_and_present:
 	vk_queue_lock(vk->main_queue);
 	ret = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, mc->session_render.fences[buffer_index]);
 	vk_queue_unlock(vk->main_queue);
+	VK_WARN_QUEUE_RACE_ONCE("[per-session] render submit", ret);
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("[per-session] Failed to submit per-session render: %s", vk_result_string(ret));
 		return;

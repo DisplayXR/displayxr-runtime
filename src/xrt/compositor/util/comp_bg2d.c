@@ -263,7 +263,9 @@ bg2d_sync_before_mutate(const struct comp_bg2d_state *st, struct vk_bundle *vk)
 	if (!bg2d_sync_enabled()) {
 		return;
 	}
+	vk_queue_lock(vk->main_queue);
 	vk->vkQueueWaitIdle(vk->main_queue->queue);
+	vk_queue_unlock(vk->main_queue);
 }
 
 
@@ -576,10 +578,16 @@ bg2d_build(struct comp_bg2d_state *st,
 	    .commandBufferCount = 1,
 	    .pCommandBuffers = &cmd,
 	};
+	// VkQueue is externally synchronized, and the service's weave / lift /
+	// per-session paths submit on this queue from other threads.
+	vk_queue_lock(vk->main_queue);
 	ret = vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, VK_NULL_HANDLE);
 	if (ret == VK_SUCCESS) {
 		vk->vkQueueWaitIdle(vk->main_queue->queue);
-	} else {
+	}
+	vk_queue_unlock(vk->main_queue);
+	VK_WARN_QUEUE_RACE_ONCE("comp_bg2d upload", ret);
+	if (ret != VK_SUCCESS) {
 		U_LOG_E("bg2d: upload submit failed: %s", vk_result_string(ret));
 	}
 	vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);

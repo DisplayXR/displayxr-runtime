@@ -305,6 +305,7 @@ lift_gpu_submit_wait(struct vk_bundle *vk, struct lift_gpu *g, const char *what)
 	vk_queue_lock(vk->main_queue);
 	VkResult ret = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit, g->fence);
 	vk_queue_unlock(vk->main_queue);
+	VK_WARN_QUEUE_RACE_ONCE("[lift] lift_gpu_submit_wait", ret);
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("[lift] %s: vkQueueSubmit failed: %s", what, vk_result_string(ret));
 		return false;

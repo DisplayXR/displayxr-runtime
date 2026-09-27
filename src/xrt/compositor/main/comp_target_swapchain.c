@@ -1071,7 +1071,11 @@ android_surface_teardown(struct comp_target_swapchain *cts)
 {
 	struct vk_bundle *vk = get_vk(cts);
 
+	// vkDeviceWaitIdle needs every queue externally synchronized (the weave and
+	// lift threads submit on this device's queue too).
+	vk_queue_lock(vk->main_queue);
 	vk->vkDeviceWaitIdle(vk->device);
+	vk_queue_unlock(vk->main_queue);
 
 	destroy_image_views(cts);
 
