@@ -157,6 +157,16 @@ struct xrt_stereo_camera_frame_info
 	uint32_t reserved;
 };
 
+//! State of the service's online vertical-alignment refinement (R2).
+enum xrt_stereo_camera_refine_state
+{
+	XRT_STEREO_CAMERA_REFINE_NONE = 0,      //!< not a service-rectified RECTIFIED stream
+	XRT_STEREO_CAMERA_REFINE_OFF = 1,       //!< DXR_STEREO_CAMERA_REFINE=0
+	XRT_STEREO_CAMERA_REFINE_MEASURING = 2, //!< no window fitted yet
+	XRT_STEREO_CAMERA_REFINE_ALIGNED = 3,   //!< fitted, the calibration was already within the deadband
+	XRT_STEREO_CAMERA_REFINE_APPLIED = 4,   //!< a correction is folded into the maps
+};
+
 struct xrt_stereo_camera_stream_stats
 {
 	float source_frame_rate;
@@ -165,6 +175,18 @@ struct xrt_stereo_camera_stream_stats
 	uint64_t frames_skipped;
 	uint64_t frames_acquired;
 	uint64_t mean_latency_ns;
+
+	// R2 refinement (diagnostics; the service's view of the rows).
+	uint32_t refine_state; //!< enum xrt_stereo_camera_refine_state
+	uint32_t refine_updates;
+	uint32_t refine_windows;
+	uint32_t refine_matches;      //!< inliers of the latest fitted window
+	float refine_offset_px;       //!< applied a
+	float refine_slope_per_100px; //!< applied b * 100
+	float refine_initial_dy_px;   //!< signed median dy of the first window (uncorrected)
+	float refine_residual_dy_px;  //!< signed median dy of the latest window
+	float refine_measure_ms;      //!< mean cost of one measurement (worker thread)
+	uint32_t reserved;
 };
 
 /*!
