@@ -105,8 +105,9 @@ probe_stereo_camera(struct cli_query_result *r, const struct xrt_plugin_iface *i
 			why = "zero or odd eye extent";
 		} else if (c->native_format < 1 || c->native_format > 3) {
 			why = "unknown native format";
-		} else if (!(c->max_frame_rate > 0.0f)) {
-			why = "max_frame_rate <= 0";
+		} else if (!(c->max_frame_rate >= 0.0f && c->max_frame_rate <= 1000.0f)) {
+			// 0 is legal: "unknown until measured" (the service measures it).
+			why = "max_frame_rate negative, NaN or > 1000";
 		} else if (c->flags & XRT_PLUGIN_STEREO_CAMERA_CALIBRATED) {
 			struct xrt_plugin_stereo_camera_calibration k;
 			memset(&k, 0, sizeof(k));
@@ -127,8 +128,9 @@ probe_stereo_camera(struct cli_query_result *r, const struct xrt_plugin_iface *i
 		}
 	}
 	snprintf(r->stereo_camera_note, sizeof(r->stereo_camera_note),
-	         "%u camera(s); [0] \"%.60s\" %ux%u/eye @ %.1f Hz, flags 0x%x", n, infos[0].display_name,
-	         infos[0].eye_width, infos[0].eye_height, (double)infos[0].max_frame_rate, infos[0].flags);
+	         "%u camera(s); [0] \"%.60s\" %ux%u/eye, advertised %.1f Hz (0 = unknown), flags 0x%x", n,
+	         infos[0].display_name, infos[0].eye_width, infos[0].eye_height, (double)infos[0].max_frame_rate,
+	         infos[0].flags);
 }
 
 #ifdef XRT_OS_WINDOWS
