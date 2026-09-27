@@ -102,6 +102,56 @@ AHardwareBuffers, whose latest image the plug-in returns from `lift_convert` as
 path the fake exercises). The fixed 2560x1600 output is fine: the weave stretches the result
 into the rect's current position either way.
 
+## Building and installing a dev runtime on a Leia device
+
+The fake has to run beside the REAL weave to prove "flat → 3D on the lenticular", so the dev
+runtime must be the **Leia variant** (it bundles `libdxrp050_leia_cnsdk.so` + the CNSDK Java
+glue) — the plain dev APK carries only sim_display, whose weave is a blend. Mirror of the
+`leia` leg of `.github/workflows/build-android.yml`:
+
+```bash
+# payload: the plug-in pinned in versions.json + the CNSDK release equal to the DEVICE's
+# CNSDK services (loader == plug-in == services, not a floor) — v0.10.69 on the NP02J today.
+mkdir -p _leia/_plugin _leia/_cnsdk_zip _leia/_cnsdk
+gh release download "$(python3 -c "import json;print(json.load(open('versions.json'))['leia_plugin'])")" \
+   -R DisplayXR/displayxr-leia-plugin -p 'displayxr-leia-cnsdk-*-android-arm64-v8a.tar.gz' -D _leia/_plugin
+tar -xzf _leia/_plugin/*.tar.gz -C _leia/_plugin
+gh release download v0.10.69 -R LeiaInc/CNSDK -p 'cnsdk-android-[0-9]*.zip' -D _leia/_cnsdk_zip  # needs LeiaInc read
+unzip -q _leia/_cnsdk_zip/*.zip -d _leia/_cnsdk
+JNI=src/xrt/targets/openxr_android/src/main/jniLibs/arm64-v8a          # gitignored
+mkdir -p $JNI && cp _leia/_plugin/*/arm64-v8a/libdxrp050_leia_cnsdk.so $JNI/
+
+# RELEASE build type, not debug: the plug-in is a Release build, and the #1243 vk_bundle ABI
+# guard refuses a Release plug-in's Vulkan factory in a Debug runtime (os_mutex NDEBUG fields)
+# — the session would run unwoven.
+./gradlew :src:xrt:targets:openxr_android:assembleRelease -PdxrForceVendoredCjson \
+   -PcnsdkDir=$PWD/_leia/_cnsdk/cnsdk-android-0.10.69+193.8291a2e -PcnsdkBuild=0.10.69+193.8291a2e
+rm -rf src/xrt/targets/openxr_android/src/main/jniLibs   # or later DEBUG builds bundle a refused plug-in
+
+# No release keystore off CI (it is a GitHub secret): sign with the local debug key.
+BT=~/Library/Android/sdk/build-tools/34.0.0; D=src/xrt/targets/openxr_android/build/outputs/apk/release
+$BT/zipalign -f -p 4 $D/openxr_android-release-unsigned.apk /tmp/aligned.apk
+$BT/apksigner sign --ks ~/.android/debug.keystore --ks-pass pass:android --key-pass pass:android \
+   --ks-key-alias androiddebugkey --out $D/openxr_android-release-leia-devsigned.apk /tmp/aligned.apk
+```
+
+**Known cost of a dev install: the runtime's app data and grants are reset.** The released
+runtime is signed with the org release key, so a debug-key APK cannot update it: `adb install`
+fails with `INSTALL_FAILED_UPDATE_INCOMPATIBLE` and the package must be **uninstalled** first.
+That wipes the runtime package's data and its grants — the overlay permission
+(`SYSTEM_ALERT_WINDOW`) and the launch-once broker state. Use the install script, which does
+the uninstall and restores both:
+
+```bash
+./scripts/install-android.sh --force-reinstall \
+    src/xrt/targets/openxr_android/build/outputs/apk/release/openxr_android-release-leia-devsigned.apk \
+    test_apps/weave/weave_client_vk_android/build/outputs/apk/debug/weave_client_vk_android-debug.apk
+```
+
+Going back to the release is the same in reverse (`--force-reinstall` with the released
+`DisplayXR-Runtime-Leia-*.apk`). Only CI (the `ANDROID_KEYSTORE_*` secrets) can produce an
+in-place update; there is no release keystore on a dev box.
+
 ## Follow-ups (not in step 1)
 
 - **Letterbox crop** on Android: port the HLSL row/column profile pass to GLSL / compute.

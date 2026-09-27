@@ -441,6 +441,11 @@ module is created (first lift call), so set them **before** the service process 
 
 ### Probe recipe (no browser)
 
+On a Leia device, build the **Leia variant** of the runtime (bundles the real weaver) and
+install it with `scripts/install-android.sh --force-reinstall` — see
+[android-lift § Building and installing a dev runtime](../../roadmap/android-lift.md#building-and-installing-a-dev-runtime-on-a-leia-device).
+The plain dev APK below bundles only sim_display, whose "weave" is a blend.
+
 `displayxr-cli lift probe` does not exist on Android — a bare executable has no `Context` to
 bind the runtime service. The reference present-owner app `weave_client_vk_android` carries the
 probe instead (`debug.dxr.lift.probe weave|explicit|both`, see its README). The sim fake beside
