@@ -42,6 +42,9 @@ struct fake_config
 	//! R2: raw, distorted, misaligned pair with known ground truth (not
 	//! NATIVELY_RECTIFIED; the service's rectifier does the work).
 	bool distort;
+	//! R2 refinement: an UNCALIBRATED extra vertical offset (px) + slope (px
+	//! per 100 px) of the right eye on the distorted pair.
+	double extra_dy_px, extra_dy_slope_100;
 };
 
 //! Completes the plug-in-owned opaque type.
@@ -109,11 +112,25 @@ fake_config(void)
 	}
 	const char *dist = getenv("SIM_DISPLAY_FAKE_STEREO_CAMERA_DISTORT");
 	cfg.distort = dist != NULL && dist[0] != '\0' && dist[0] != '0';
+	const char *edy = getenv("SIM_DISPLAY_FAKE_STEREO_CAMERA_DY");
+	if (edy != NULL && fabs(atof(edy)) <= 20.0) {
+		cfg.extra_dy_px = atof(edy);
+	}
+	const char *eds = getenv("SIM_DISPLAY_FAKE_STEREO_CAMERA_DY_SLOPE");
+	if (eds != NULL && fabs(atof(eds)) <= 5.0) {
+		cfg.extra_dy_slope_100 = atof(eds);
+	}
 	if (cfg.enabled) {
 		U_LOG_W("sim_display: FAKE stereo camera ON — %ux%u per eye @ %.1f Hz, baseline %.1f mm, format %u%s%s",
 		        cfg.eye_w, cfg.eye_h, cfg.fps, cfg.baseline_mm, cfg.format,
 		        cfg.suspend_period_ns > 0 ? ", suspend square-wave" : "",
 		        cfg.distort ? ", DISTORTED raw pair (rectified by the service)" : "");
+		if (cfg.distort && (cfg.extra_dy_px != 0.0 || cfg.extra_dy_slope_100 != 0.0)) {
+			U_LOG_W(
+			    "sim_display: FAKE stereo camera — UNCALIBRATED vertical misalignment of the right eye: "
+			    "%+.2f px %+.3f px/100 px (the service's refinement should remove it)",
+			    cfg.extra_dy_px, cfg.extra_dy_slope_100);
+		}
 	}
 	return &cfg;
 }
@@ -238,6 +255,10 @@ sim_display_stereo_camera_open(struct xrt_plugin_instance *inst,
 	                                      cfg->baseline_mm, FAKE_BG_DEPTH_M, FAKE_BAR_DEPTH_M)) {
 		free(cam);
 		return XRT_ERROR_ALLOCATION;
+	}
+	if (cfg->distort) {
+		sim_stereo_camera_distorted_set_vmisalign(&cam->distorted, cfg->extra_dy_px,
+		                                          cfg->extra_dy_slope_100 / 100.0);
 	}
 	cam->gray_pitch = 2 * cfg->eye_w;
 	cam->gray = calloc((size_t)cam->gray_pitch * cfg->eye_h, 1);
