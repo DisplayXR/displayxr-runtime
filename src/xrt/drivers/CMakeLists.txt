@@ -98,6 +98,16 @@ if(XRT_HAVE_VULKAN)
 		sim_display/sim_display_processor.c)
 endif()
 
+# ADR-042 (Android): the FAKE lift module behind sim_display's lift-only Vulkan
+# DP factory (create_dp_vk_lift) — CPU + AHardwareBuffer, gated at runtime by
+# SIM_DISPLAY_FAKE_LIFT / debug.dxr.lift.fake.
+if(ANDROID AND XRT_HAVE_VULKAN)
+	list(APPEND SIM_DISPLAY_SOURCES
+		sim_display/sim_display_lift_vk.c
+		sim_display/sim_display_lift_vk.h
+		sim_display/sim_display_fake_ply.c)
+endif()
+
 # D3D11 display processor (HLSL shaders compiled at runtime)
 if(WIN32)
 	list(APPEND SIM_DISPLAY_SOURCES

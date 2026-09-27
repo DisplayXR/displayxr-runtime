@@ -34,6 +34,7 @@
 #include "xrt/xrt_results.h"
 
 #include "sim_display_interface.h"
+#include "sim_display_lift_vk.h" // ADR-042: lift-only Vulkan DP (Android)
 #if defined(XRT_HAVE_VULKAN) || !defined(_WIN32)
 #include "vk/vk_helpers.h" // #1243: sizeof(struct vk_bundle) fingerprint
 #endif
@@ -264,6 +265,19 @@ static struct xrt_plugin_iface g_sim_display_iface = {
     .create_dp_d3d11_lift = sim_display_dp_factory_d3d11,
 #else
     .create_dp_d3d11_lift = NULL,
+#endif
+
+    /*
+     * ADR-042 lift-only Vulkan DP (Android): a DP that carries only the lift
+     * slots, filled by the CPU/AHardwareBuffer fake. Refuses unless
+     * SIM_DISPLAY_FAKE_LIFT=1 / debug.dxr.lift.fake=1, which the runtime reports
+     * as UNAVAILABLE. `debug.dxr.lift.plugin=sim_display` takes it even when
+     * a vendor plug-in is the active (weaving) one.
+     */
+#if defined(XRT_OS_ANDROID) && defined(XRT_HAVE_VULKAN)
+    .create_dp_vk_lift = sim_display_dp_factory_vk_lift,
+#else
+    .create_dp_vk_lift = NULL,
 #endif
 };
 
