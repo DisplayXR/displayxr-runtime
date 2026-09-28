@@ -42,7 +42,7 @@ RULES_DOC = "docs/guides/displayxr-app-rules.md"
 # Directories never linted: shared reference code, vendored headers, build output.
 EXCLUDE_DIRS = {
     "build", ".git", "third_party", "openxr_includes", "common",
-    "_package", "__pycache__", "node_modules", ".vs", "out",
+    "_package", "__pycache__", "node_modules", ".vs", "out", ".claude",
 }
 SOURCE_EXTS = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".m", ".mm"}
 # JVM sources are linted for the Android rules only (§11) — the C/C++ checks
@@ -56,7 +56,7 @@ RULES = {
     "INV-3.1": "An N-view app BEGINS XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR (when enumerated; needs XR_DXR_display_info), locates into an XRT_MAX_VIEWS (8)-wide buffer and submits the active mode's viewCount. A stereo-fixed app stays on PRIMARY_STEREO and receives exactly 2. Deriving eyeCount from the rendering mode's viewCount without the opt-in is an error: PRIMARY_STEREO reports 2 and rejects viewCount>2.",
     "INV-3.4": "A projection layer carries the LOCATED view count (what xrLocateViews returned), for every view configuration type. Render only the active mode's views, then alias the inactive tail [active, located) onto view 0's subImage keeping each view's own located pose/fov (DxrAliasInactiveViews in dxr_view_config.h: test_apps/common in-tree, displayxr-common outside). Checked per leg: every platform directory of a multi-leg app must call it itself. Submitting the ACTIVE count is under-submit and xrEndFrame now refuses it (ADR-041). A 3D zone layer is a projection layer and obeys the same rule.",
     "INV-4.3": "Per-tile render size = window/canvas x scaleXY, never display size.",
-    "INV-4.6": "Request an sRGB swapchain (and store a correctly-encoded image); don't double-encode.",
+    "INV-4.6": "Request an sRGB swapchain (and store a correctly-encoded image); don't double-encode. A UNORM swapchain is read as LINEAR and encoded by the runtime (#1589), so display-referred bytes in it wash out. Checked per leg: every platform directory must choose _SRGB first.",
     "INV-4.7": "Write every pixel of the imageRect you declare — clear partial-tile renders to (0,0,0,0) first (or shrink the rect); undefined pixels read as opaque magenta on MoltenVK and break transparent-bg.",
     "INV-4.9": "An app that enables XR_EXT_view_configuration_views_change must not call xrCreateSwapchain from its event handler — move subImage.imageRect instead (an app sized at maxImageRect* per ADR-010 never needs to reallocate).",
     "INV-5.9": "VK apps MUST use XR_KHR_vulkan_enable2 (the runtime creates the VkDevice via xrCreateVulkanDeviceKHR); an app-side vkCreateDevice = enable1, which forfeits the #868 weave-rate decoupling and the late-weave pacing.",
@@ -156,6 +156,27 @@ SRGB_TOKENS = re.compile(
     re.IGNORECASE,
 )
 CREATES_SWAPCHAIN = re.compile(r"\bxrCreateSwapchain\b")
+ENUMERATES_SWAPCHAIN_FORMATS = re.compile(r"\bxrEnumerateSwapchainFormats\b")
+# INV-4.6, the per-leg shapes of "this leg prefers UNORM" (#1589). Since the
+# format-honest colour model (D3D11 v2.21.0 ... vk_native v2.21.7) an UNORM
+# swapchain holds LINEAR values and is sRGB-encoded on the way to the panel, so
+# an app that picks UNORM and stores display-referred bytes is encoded twice —
+# washed out. Every leg used to get away with it because UNORM was a byte
+# passthrough; the one that did not get migrated (an Android leg preferring
+# {R8G8B8A8_UNORM, B8G8R8A8_UNORM} after its desktop siblings moved to _SRGB)
+# is what these catch. Only checked in files that enumerate swapchain formats.
+_UNORM8 = r"(?:VK_FORMAT|DXGI_FORMAT)_[RB]8G8[RB]8A8_UNORM\b"
+#   (a) a preference list naming only 8-bit UNORM colour formats (2+ entries):
+#       const int64_t preferred[] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM};
+UNORM_ONLY_PREFERENCE_LIST = re.compile(
+    r"\{\s*(?:\(\s*\w+\s*\)\s*)?" + _UNORM8 +
+    r"(?:\s*,\s*(?:\(\s*\w+\s*\)\s*)?" + _UNORM8 + r")+\s*,?\s*\}"
+)
+#   (b) a scan loop that STOPS at the first UNORM it meets:
+#       if (f == VK_FORMAT_B8G8R8A8_UNORM || ...) { selected = f; break; }
+UNORM_FIRST_BREAK = re.compile(
+    r"==\s*" + _UNORM8 + r"[^;{}]*\)\s*\{[^{}]*\bbreak\b"
+)
 # INV-3.1 (#1486). Two different questions, two different markers:
 #
 #   MULTIVIEW_OPT_IN  — does the app BEGIN the N-view view configuration? Only a
@@ -291,7 +312,6 @@ def scan_sources(root: Path, findings: list):
             stereo_fixed_marked = True
             stereo_fixed_legs.add(leg_of(path, root))
     is_multiview_app = any(MULTIVIEW_OPT_IN.search(t) for _, t in files)
-    any_srgb = any(SRGB_TOKENS.search(t) for _, t in files)
 
     # INV-3.1 (#1486): mode-derived view counts WITHOUT the PRIMARY_MULTIVIEW_DXR
     # opt-in. The app reads the active mode's viewCount (so it can reach 4) but
@@ -375,7 +395,6 @@ def scan_sources(root: Path, findings: list):
                 "3D zone layers are projection layers and need the same treatment, per zone.",
             ))
 
-    swapchain_loc = None
     for path, text in files:
         for regex, level, rule, msg, fix, multiview_only in SRC_PATTERNS:
             if multiview_only and not is_multiview_app:
@@ -383,10 +402,6 @@ def scan_sources(root: Path, findings: list):
             for m in regex.finditer(text):
                 line_no = text.count("\n", 0, m.start()) + 1
                 findings.append(Finding(level, rule, rel(path, root), line_no, msg, fix))
-        if swapchain_loc is None:
-            m = CREATES_SWAPCHAIN.search(text)
-            if m:
-                swapchain_loc = (rel(path, root), text.count("\n", 0, m.start()) + 1)
 
     # INV-5.9 (enforced): a VK app that creates its own VkDevice is using
     # XR_KHR_vulkan_enable (enable1). enable1 forfeits the runtime-owned VkQueue
@@ -411,14 +426,68 @@ def scan_sources(root: Path, findings: list):
             "app-side vkCreateInstance / vkCreateDevice). Reference: test_apps/handle/cube_handle_vk_win.",
         ))
 
-    # INV-4.6 advisory: creates a swapchain but no sRGB format appears anywhere.
-    if swapchain_loc and not any_srgb:
-        p, ln = swapchain_loc
+    check_color_swapchain_per_leg(files, root, findings)
+
+
+def check_color_swapchain_per_leg(files, root: Path, findings: list):
+    """INV-4.6, per leg. A multi-leg app is only as right as its worst leg: the
+    shared/single group ("") counts toward every leg, but one leg's _SRGB choice
+    does not cover another's (the Android leg of a splat demo kept preferring
+    UNORM for months after its desktop legs moved to _SRGB, and an app-wide
+    "any sRGB token anywhere" check was satisfied by the desktop legs)."""
+    fix_unorm = (
+        "Choose the first _SRGB format the runtime enumerates (fall back to UNORM only if none), "
+        "the same way on every leg — ideally through one shared helper. Store display-referred "
+        "bytes in it by a raw copy (blit into an UNORM-sibling scratch, then vkCmdCopyImage) or "
+        "render linear and let the GPU encode; linearize clear colours. Since #1589 an UNORM "
+        "swapchain is read as LINEAR and encoded by the runtime, so display-referred bytes in it "
+        "come out washed out. A/B: DXR_COLOR_LEGACY_UNORM_ENCODED=1 (Android: setprop "
+        "debug.xrt.DXR_COLOR_LEGACY_UNORM_ENCODED 1) restores the old passthrough."
+    )
+    by_leg = {}
+    for path, text in files:
+        by_leg.setdefault(leg_of(path, root), []).append((path, text))
+    shared = by_leg.get("", [])
+    shared_srgb = any(SRGB_TOKENS.search(t) for _, t in shared)
+
+    for leg, leg_files in sorted(by_leg.items()):
+        # (a)/(b): a UNORM-first choice, wherever the leg enumerates formats.
+        for path, text in leg_files:
+            if not ENUMERATES_SWAPCHAIN_FORMATS.search(text):
+                continue
+            for regex, what in (
+                (UNORM_ONLY_PREFERENCE_LIST, "a swapchain-format preference list naming only UNORM formats"),
+                (UNORM_FIRST_BREAK, "a swapchain-format scan that stops at the first UNORM format"),
+            ):
+                for m in regex.finditer(text):
+                    findings.append(Finding(
+                        WARN, "INV-4.6", rel(path, root), text.count("\n", 0, m.start()) + 1,
+                        f"UNORM-first colour swapchain choice ({what}). An UNORM swapchain is "
+                        "read as LINEAR and encoded by the runtime (#1589): display-referred "
+                        "bytes stored in it are encoded twice and look washed out.",
+                        fix_unorm,
+                    ))
+        # The leg creates a swapchain but neither it nor the shared code ever
+        # names an sRGB format.
+        if leg == "" and len(by_leg) > 1:
+            continue  # shared code alone is not a leg
+        loc = None
+        for path, text in leg_files:
+            m = CREATES_SWAPCHAIN.search(text)
+            if m:
+                loc = (rel(path, root), text.count("\n", 0, m.start()) + 1)
+                break
+        if loc is None:
+            continue
+        if any(SRGB_TOKENS.search(t) for _, t in leg_files) or shared_srgb:
+            continue
         findings.append(Finding(
-            WARN, "INV-4.6", p, ln,
-            "No sRGB swapchain format detected — INV-4.6 recommends an sRGB swapchain.",
+            WARN, "INV-4.6", loc[0], loc[1],
+            "No sRGB swapchain format detected" + (f" in the {leg}/ leg" if leg else "") +
+            " — INV-4.6 recommends an sRGB swapchain.",
             "Request an sRGB swapchain (_UNORM_SRGB / GL_SRGB8_ALPHA8 / _SRGB / MTLPixelFormat*sRGB). "
-            "A UNORM swapchain is valid ONLY if you store display-referred (already-encoded) bytes.",
+            "A UNORM swapchain is read as LINEAR and encoded by the runtime (#1589); it is valid "
+            "only if you store scene-linear values in it.",
         ))
 
 

@@ -224,3 +224,9 @@ jobs:
 
       - name: Pin-bump gate unit tests
         run: python3 scripts/tests/test_downstream_pin_bump.py
+
+      - name: App-linter INV-4.6 colour-swapchain unit tests
+        # Hermetic (synthetic app trees). Pins the per-leg _SRGB-first check that
+        # would have caught the gauss demo's Android leg preferring UNORM after
+        # #1589 made UNORM swapchains linear.
+        run: python3 scripts/tests/test_check_displayxr_app_color.py
