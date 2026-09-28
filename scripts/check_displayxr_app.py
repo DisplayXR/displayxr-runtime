@@ -449,6 +449,7 @@ def check_color_swapchain_per_leg(files, root: Path, findings: list):
         by_leg.setdefault(leg_of(path, root), []).append((path, text))
     shared = by_leg.get("", [])
     shared_srgb = any(SRGB_TOKENS.search(t) for _, t in shared)
+    app_srgb = any(SRGB_TOKENS.search(t) for _, t in files)
 
     for leg, leg_files in sorted(by_leg.items()):
         # (a)/(b): a UNORM-first choice, wherever the leg enumerates formats.
@@ -468,7 +469,10 @@ def check_color_swapchain_per_leg(files, root: Path, findings: list):
                         fix_unorm,
                     ))
         # The leg creates a swapchain but neither it nor the shared code ever
-        # names an sRGB format.
+        # names an sRGB format. Judged per leg only where the leg CHOOSES the
+        # format (enumerates it); a leg that creates swapchains in a format
+        # negotiated elsewhere (displayxr-common's session code, "reuse the
+        # main format") falls back to the app-wide test the check always had.
         if leg == "" and len(by_leg) > 1:
             continue  # shared code alone is not a leg
         loc = None
@@ -479,7 +483,11 @@ def check_color_swapchain_per_leg(files, root: Path, findings: list):
                 break
         if loc is None:
             continue
-        if any(SRGB_TOKENS.search(t) for _, t in leg_files) or shared_srgb:
+        leg_chooses = any(ENUMERATES_SWAPCHAIN_FORMATS.search(t) for _, t in leg_files)
+        if leg_chooses:
+            if any(SRGB_TOKENS.search(t) for _, t in leg_files) or shared_srgb:
+                continue
+        elif app_srgb:
             continue
         findings.append(Finding(
             WARN, "INV-4.6", loc[0], loc[1],

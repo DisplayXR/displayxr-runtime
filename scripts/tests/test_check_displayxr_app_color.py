@@ -112,6 +112,15 @@ class Inv46PerLeg(unittest.TestCase):
         self.assertEqual(got[0].path, "android/src/main/cpp/main.cpp")
         self.assertIn("android/ leg", got[0].msg)
 
+    def test_leg_reusing_a_negotiated_format_is_not_flagged(self):
+        # displayxr-demo-avatar windows/main.cpp: a zone swapchain created with
+        # `ci.format = xr->swapchain.format` (chosen by displayxr-common).
+        got = lint_tree({
+            "windows/main.cpp": "ci.format = xr->swapchain.format;\nxrCreateSwapchain(s, &ci, &sc);\n",
+            "macos/main.mm": SRGB_FIRST_BREAK,
+        })
+        self.assertEqual(got, [])
+
     def test_single_leg_app_without_srgb(self):
         got = lint_tree({"main.cpp": ENUM})
         self.assertEqual(len(got), 1)
