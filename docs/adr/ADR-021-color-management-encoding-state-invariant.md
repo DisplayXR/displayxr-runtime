@@ -5,6 +5,11 @@ source: "#409"
 ---
 # ADR-021: Color Management & the Encoding-State Invariant
 
+> **Amended by [ADR-044](ADR-044-colour-contract-per-backend.md)** — the shipped contract per
+> backend × swapchain format (what the runtime enumerates, what an app must write, what the
+> compositor and DP do, which CTS test pins each row). Read §5 "Model A" as *the atlas is
+> encoded*, not *a UNORM swapchain passes through*: since #1589 a UNORM swapchain is linear.
+
 ## Context
 
 The runtime's color handling grew ad-hoc — each compositor path adopted whatever
