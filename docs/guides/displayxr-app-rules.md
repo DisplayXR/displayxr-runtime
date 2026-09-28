@@ -480,9 +480,11 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   `eyeCount = 1`, render at full window resolution, center-eye = average of the located eyes.
   The runtime accepts `viewCount == 1` only in a 2D/non-3D mode. Ref: `main.cpp:415,632-644,707-711`.
 
-- **INV-4.6 — Color space: request an sRGB swapchain.** The display panel is sRGB, and an
-  in-process native compositor is a **byte passthrough to the panel** — it does *not* color-manage
-  a linear-format swapchain. So the encoding of the bytes you store is what reaches the display.
+- **INV-4.6 — Color space: request an sRGB swapchain.** The display panel is sRGB, and the
+  runtime reads a swapchain the way OpenXR says to: an `*_SRGB` format holds **encoded** colour and
+  reaches the panel as stored; every other format "will be treated as linear values" and is
+  **sRGB-encoded** on the way to the panel (#1589). So what you store must match the format you
+  asked for.
   - **Do this — request an sRGB swapchain format:** `..._UNORM_SRGB` (D3D11/D3D12),
     `GL_SRGB8_ALPHA8` (GL), `..._SRGB` (Vulkan), `MTLPixelFormat*sRGB` (Metal). Then you are
     correct **either way you render into it**:
@@ -499,15 +501,22 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
       scratch image of the swapchain's UNORM sibling, then `vkCmdCopyImage` into the swapchain
       (a copy never converts). This is byte-exact on any runtime;
     - clear with the linearized colour (sRGB EOTF), not the display-referred one.
-  - **A linear / UNORM swapchain (`R8G8B8A8_UNORM`, `GL_RGBA8`, …) is NOT color-managed** on the
-    in-process path: the compositor passes the bytes straight through with no linear→sRGB encode.
-    It's only correct if you write display-referred bytes into it; writing genuinely-linear values
-    and expecting the runtime to encode → **too bright**. ("Submit a linear-format swapchain and
-    the runtime color-manages it" is a future runtime follow-up, not current behavior.) **Subject to
-    change — see [#409](https://github.com/DisplayXR/displayxr-runtime/issues/409):** if the color
-    model lands on linear-compose ("Model B"), a linear-format swapchain *would* be honored as
-    linear (the runtime would encode at the DP boundary). This bullet describes current ("Model A")
-    behavior; the recommendation above (request an sRGB swapchain) stays correct either way.
+  - **A linear / UNORM swapchain (`R8G8B8A8_UNORM`, `GL_RGBA8`, …) holds LINEAR values** and the
+    runtime encodes it. Display-referred (already gamma-encoded) bytes stored in one are encoded a
+    **second** time → **washed out**: lifted blacks, desaturated colour (a splat demo's authored
+    `(229,182,127)` reaches the atlas as `(243,220,187)`). This is the #1589/#1610 format-honest
+    colour model, shipped per backend — D3D11 in v2.21.0, D3D12 v2.21.1, GL v2.21.2, **Vulkan
+    (`vk_native`, incl. Android) v2.21.7**; Metal still passes UNORM bytes through. Before those
+    releases a UNORM swapchain *was* a byte passthrough, which is why an app that picked UNORM and
+    wrote display-referred bytes looked right until it met a newer runtime — including a leg that
+    lagged its siblings (an Android leg that still preferred `{R8G8B8A8_UNORM, B8G8R8A8_UNORM}`
+    after the desktop legs had moved to `_SRGB`). **Every leg of a multi-platform app must make the
+    same `_SRGB`-first choice** — route it through one shared helper rather than a per-leg
+    preference list; `scripts/check_displayxr_app.py` flags a UNORM-first preference per leg.
+  - **A/B on a runtime:** `DXR_COLOR_LEGACY_UNORM_ENCODED=1` restores the old passthrough reading
+    of UNORM (on Android: `adb shell setprop debug.xrt.DXR_COLOR_LEGACY_UNORM_ENCODED 1`, then
+    relaunch the app). If that makes a washed-out app look right, the app is storing
+    display-referred bytes in UNORM — fix the app, the knob is a diagnostic, not a setting.
   - **Data textures (normal, AO, roughness, metalness) are ALWAYS linear — never sRGB.** Only
     albedo/color is sRGB; sample those through an `_SRGB` texture view (or decode in-shader) so
     lighting runs in linear, then write your result into the sRGB swapchain per above.
@@ -1047,7 +1056,7 @@ macOS app (no manifest → no Android findings).
 - [ ] View configuration chosen at startup: N-view app begins `PRIMARY_MULTIVIEW_DXR` (when enumerated), stereo-fixed app stays on `PRIMARY_STEREO`; `xrLocateViews` into an 8-wide buffer; **render** `eyeCount` from the active mode, not 2 (INV-3.1)
 - [ ] Projection layer **submits the LOCATED count**, with the inactive tail aliased via `DxrAliasInactiveViews()` — including every 3D zone layer (INV-3.4)
 - [ ] App swapchain sized once to worst-case atlas (INV-4.2); per-tile = window/canvas × scaleXY, never display (INV-4.3)
-- [ ] Color space: request an **sRGB swapchain** and write a correctly-encoded image (linear render + GPU sRGB-write, or display-referred bytes — not both); linear/UNORM swapchain is not color-managed; data textures always linear (INV-4.6)
+- [ ] Color space: request an **sRGB swapchain** and write a correctly-encoded image (linear render + GPU sRGB-write, or display-referred bytes — not both); a linear/UNORM swapchain is read as LINEAR and encoded by the runtime (display-referred bytes in it wash out); same `_SRGB`-first choice on every leg; data textures always linear (INV-4.6)
 - [ ] Whole declared `imageRect` is written — partial-tile renders clear the full tile to `(0,0,0,0)` first (or shrink the rect); no undefined pixels reach the atlas, esp. transparent-bg (INV-4.7)
 - [ ] (if `XR_EXT_view_configuration_views_change` is enabled) the handler re-enumerates and **moves `subImage.imageRect`** — no `xrCreateSwapchain` from the event; filters on `systemId` **and** `viewConfigurationType` (INV-4.9)
 - [ ] (texture) regions declared via display-zones — 3D zones + Local2D zones, not output-rect/surround (INV-5.1/5.3)
