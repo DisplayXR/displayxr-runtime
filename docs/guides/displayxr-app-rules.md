@@ -525,6 +525,9 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
     linear atlas — see the canonical reference). As an app author you don't depend on which path
     runs you: request an sRGB swapchain and write a correctly-encoded image, and both paths are
     correct.
+  - **The per-backend contract** (enumerated order, what each backend does with `_SRGB` vs UNORM
+    vs float, what the DP receives, which CTS test pins it, which rows are not CTS-covered):
+    [ADR-044](../adr/ADR-044-colour-contract-per-backend.md).
   - Reference: PRs [#407](https://github.com/DisplayXR/displayxr-runtime/pull/407) (GL) and
     [#408](https://github.com/DisplayXR/displayxr-runtime/pull/408) (D3D11/D3D12/Vulkan/Metal),
     which established the cross-API sRGB-passthrough contract, plus
