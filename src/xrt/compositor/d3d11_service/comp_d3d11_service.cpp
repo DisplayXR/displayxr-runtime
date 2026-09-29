@@ -17810,7 +17810,9 @@ zones_resolve_src_srv(struct d3d11_service_system *sys,
  *
  * Caller MUST hold sys->render_mutex — the shader blits run on the immediate
  * context from the commit thread and would otherwise race the capture-render
- * thread's combined-atlas pass. Source acquires are all-or-nothing: any
+ * thread's combined-atlas pass. The pass takes sys->immediate_ctx_mutex itself
+ * for the draw sequence (#939): render_mutex does not order it against another
+ * client's IPC-thread commit. Source acquires are all-or-nothing: any
  * failed acquire skips the whole pass (returns false; the tile keeps last
  * frame's composite) rather than clearing and blitting a partial set.
  *
@@ -17949,6 +17951,27 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 			}
 		}
 	}
+
+	/*
+	 * #939 / #1610: from here to the last blit is ONE state-setting sequence
+	 * on the shared immediate context — Map on the shared
+	 * blit_constant_buffer, RTV / viewport / scissor / SRV binds, draws.
+	 * render_mutex (held by the caller) serialises it against the render
+	 * thread's combine pass only; it says nothing about ANOTHER client's IPC
+	 * thread, whose projection commit holds immediate_ctx_mutex alone — and
+	 * since #1610 that commit is a DRAW (the compose blit), not a copy.
+	 * Unserialised, the two threads interleave call by call (D3D11's
+	 * multithread protection orders CALLS, not SEQUENCES) and this client's
+	 * placements draw with the other client's shader / render target /
+	 * constants: a zones app beside a projection app under the shell blinks
+	 * to the backdrop, comes out at the wrong brightness, or lands in the
+	 * other window — the 98d46018d class, between two IPC threads.
+	 *
+	 * Every source was acquired above (all-or-nothing), so nothing below
+	 * waits; the lock is dropped before the keyed-mutex releases, which never
+	 * block. Order is the documented render_mutex -> immediate_ctx_mutex.
+	 */
+	std::unique_lock<std::mutex> ctx_lock(sys->immediate_ctx_mutex);
 
 	// Transparent-slot semantics — cleared only now that every source is
 	// safely acquired. A mixed frame (a projection layer already blitted
@@ -18117,6 +18140,8 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 			local2d_count++;
 		}
 	}
+
+	ctx_lock.unlock();
 
 	// Release every cross-process mutex the pass acquired.
 	for (uint32_t a = 0; a < acquired_count; a++) {
