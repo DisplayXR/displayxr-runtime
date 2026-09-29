@@ -1537,6 +1537,15 @@ struct d3d11_service_system
 	//! every blit output to emit scene-linear (so content + chrome all reach the
 	//! DP linear). Bound once per frame; left at 0 for Model A.
 	wil::com_ptr<ID3D11Buffer> color_linearize_cb;
+	//! The IPC-thread twin: an immutable all-zero b1. Every blit a client's
+	//! commit thread issues on the shared context binds THIS, so a client's
+	//! own tile blits never see the render thread's linearize flag (b1 is
+	//! sticky across threads — with it at 1 under Model B, a zones app's
+	//! ordinary `blit_ps` decoded its content on the way INTO its atlas, and
+	//! the combine pass decoded it again: too dark whenever a second client
+	//! put the compose on Model B). The combine pass re-binds
+	//! `color_linearize_cb` inside every lock hold for the same reason.
+	wil::com_ptr<ID3D11Buffer> color_passthrough_cb;
 
 	//! Constant buffer for layer rendering
 	wil::com_ptr<ID3D11Buffer> layer_constant_buffer;
@@ -5472,6 +5481,21 @@ create_layer_resources(struct d3d11_service_system *sys)
 		U_LOG_E("Failed to create color linearize constant buffer: 0x%08lx", hr);
 		return false;
 	}
+	{
+		// The IPC-thread twin: immutable zeros (see the field doc).
+		const float zeros[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+		D3D11_BUFFER_DESC zero_desc = {};
+		zero_desc.ByteWidth = sizeof(zeros);
+		zero_desc.Usage = D3D11_USAGE_IMMUTABLE;
+		zero_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		D3D11_SUBRESOURCE_DATA zero_init = {};
+		zero_init.pSysMem = zeros;
+		hr = sys->device->CreateBuffer(&zero_desc, &zero_init, sys->color_passthrough_cb.put());
+		if (FAILED(hr)) {
+			U_LOG_E("Failed to create color passthrough constant buffer: 0x%08lx", hr);
+			return false;
+		}
+	}
 
 	// Create linear sampler
 	D3D11_SAMPLER_DESC samp_desc = {};
@@ -5831,6 +5855,15 @@ blit_to_atlas_texture(struct d3d11_service_system *sys,
 	sys->context->PSSetShader(blit_ps_for_draw, nullptr, 0);
 	sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
 	sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+	// b1 is stated EXPLICITLY, to zero: a client's blit never linearizes —
+	// the atlas stays encoded and only the render thread's combine pass
+	// decodes (ADR-021). Without this the ordinary `blit_ps` read whatever
+	// the combine pass last left at b1 (1 under Model B) and a zones /
+	// Local-2D / scaled fast-path commit decoded its content on the way into
+	// its own atlas, to be decoded again by the combine: the "model viewer
+	// goes dark when a second app opens" symptom. The compose variant ignores
+	// b1 anyway; binding it there too keeps the register's owner obvious.
+	sys->context->PSSetConstantBuffers(1, 1, sys->color_passthrough_cb.addressof());
 	sys->context->PSSetShaderResources(0, 1, &src_srv);
 	sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
 
@@ -8841,6 +8874,9 @@ service_crop_atlas_for_dp(struct d3d11_service_system *sys,
 		sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
 		sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
 		sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+		// The direct path never linearizes (handoff is always ENCODED); state
+		// b1 rather than inherit a stale value from an earlier combine pass.
+		sys->context->PSSetConstantBuffers(1, 1, sys->color_passthrough_cb.addressof());
 		sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
 		ID3D11ShaderResourceView *src_srv = res->atlas_srv.get();
 		sys->context->PSSetShaderResources(0, 1, &src_srv);
@@ -15154,6 +15190,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		// context — bound once here and relied on by every glyph draw below.
 		// See combine_ctx_lock.
 		combine_ctx_lock ctx_lock(sys);
+		sys->context->PSSetConstantBuffers(1, 1, sys->color_linearize_cb.addressof());
 		sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
 		sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
 		sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
@@ -15433,11 +15470,12 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			sys->context->Unmap(sys->color_linearize_cb.get(), 0);
 		}
 		sys->context->PSSetConstantBuffers(1, 1, sys->color_linearize_cb.addressof());
-		// #1610: b1 is safe to state once per pass because NOTHING a client's
-		// IPC thread does touches it. The compose-passthrough decision is NOT a
-		// register for exactly that reason — it is a shader variant a client
-		// selects for its own draw (blit_ps_compose), so it cannot outlive that
-		// draw and poison the rest of this pass.
+		// The VALUE is written once per pass here; the BINDING is re-stated
+		// inside every combine_ctx_lock hold below, because a client's IPC
+		// thread binds its own zero b1 (`color_passthrough_cb`) for its blits
+		// and that binding is sticky across threads. The compose-passthrough
+		// decision is a shader variant, not a register, for the same reason —
+		// see blit_to_atlas_texture.
 	}
 
 	uint32_t dp_view_w = sys->view_width;
@@ -15762,6 +15800,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				}
 			}
 			combine_ctx_lock ctx_lock(sys);
+			sys->context->PSSetConstantBuffers(1, 1, sys->color_linearize_cb.addressof());
 
 			uint32_t src_col = v % sys->tile_columns;
 			uint32_t src_row = v / sys->tile_columns;
@@ -16317,6 +16356,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 					// → SRV → Draw), so the lock belongs here and the keyed
 					// acquire above stays outside it. See combine_ctx_lock.
 					combine_ctx_lock ctx_lock(sys);
+					sys->context->PSSetConstantBuffers(1, 1, sys->color_linearize_cb.addressof());
 
 					uint32_t col3 = v3 % sys->tile_columns;
 					uint32_t row3 = v3 / sys->tile_columns;
@@ -16519,6 +16559,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			// draw below, so the lock spans the whole block. The keyed-mutex
 			// acquire above is deliberately outside it. See combine_ctx_lock.
 			combine_ctx_lock ctx_lock(sys);
+			sys->context->PSSetConstantBuffers(1, 1, sys->color_linearize_cb.addressof());
 			ID3D11RenderTargetView *ortvs[] = {mc->combined_atlas_rtv.get()};
 			sys->context->OMSetRenderTargets(1, ortvs, nullptr);
 			sys->context->OMSetBlendState(sys->blend_premul.get(), nullptr, 0xFFFFFFFF);
@@ -16735,6 +16776,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			// draw below, so the lock spans the whole block. The keyed-mutex
 			// acquire above is deliberately outside it. See combine_ctx_lock.
 			combine_ctx_lock ctx_lock(sys);
+			sys->context->PSSetConstantBuffers(1, 1, sys->color_linearize_cb.addressof());
 			ID3D11RenderTargetView *crtvs[] = {mc->combined_atlas_rtv.get()};
 			sys->context->OMSetRenderTargets(1, crtvs, nullptr);
 			sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
