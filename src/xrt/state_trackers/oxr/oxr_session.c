@@ -1850,7 +1850,8 @@ adjust_fov(const struct xrt_fov *original_fov, const struct xrt_quat *original_r
  * The policy itself lives in the compositor (u_rear_budget, fed by the DP's
  * background preview); everything here is transport: read whatever the
  * compositor last decided, convert vH to metres with the session's rig, and
- * fire ONE event per state change.
+ * fire ONE event per state change — judged once per locate, after the last
+ * writer (on IPC the service's reply overwrites the client-side pre-fill).
  */
 
 //! Pull the compositor's latest budget. False = this backend has no policy
@@ -1883,13 +1884,14 @@ oxr_session_get_rear_budget(struct oxr_session *sess, struct u_rear_budget_out *
 	return false;
 }
 
-//! Write @p out and emit the state-change event if the state moved.
+//! Write @p out. Emits NOTHING: the state-change event is fired once per
+//! locate by oxr_session_emit_rear_budget_event(), after the last writer.
 static void
-oxr_session_publish_rear_budget(struct oxr_session *sess,
-                                XrRearDepthBudgetDXR *out,
-                                float far_offset_vh,
-                                XrRearDepthBudgetStateDXR state,
-                                float cue_energy)
+oxr_session_write_rear_budget(struct oxr_session *sess,
+                              XrRearDepthBudgetDXR *out,
+                              float far_offset_vh,
+                              XrRearDepthBudgetStateDXR state,
+                              float cue_energy)
 {
 	out->farOffsetVH = far_offset_vh;
 	out->state = state;
@@ -1900,7 +1902,25 @@ oxr_session_publish_rear_budget(struct oxr_session *sess,
 	// rather than inventing a scale.
 	const float vh = sess->view_rig.virtual_display_height;
 	out->farOffsetMeters = (vh > 0.0f) ? far_offset_vh * vh : 0.0f;
+}
 
+/*!
+ * Fire the state-change event if the state @p out carries differs from the
+ * last one this session announced. ONE call per locate, after the last
+ * writer.
+ *
+ * Two writers exist: the in-process policy (or the no-policy default) written
+ * before the view math, and, on an IPC session, the service's answer, which
+ * overwrites it once the rig reply lands. Emitting from each writer fired two
+ * contradictory events per frame under a workspace controller —
+ * CLIPPED_NO_SOURCE from the client-side default, then UNRESTRICTED_WORKSPACE
+ * from the service — ~120 events/s plus a WARN line for each, on a struct
+ * whose final value never changed.
+ */
+static void
+oxr_session_emit_rear_budget_event(struct oxr_session *sess, const XrRearDepthBudgetDXR *out)
+{
+	const XrRearDepthBudgetStateDXR state = out->state;
 	if (!sess->rear_depth_budget_state_known) {
 		sess->rear_depth_budget_state_known = true;
 		sess->rear_depth_budget_state = state;
@@ -1918,26 +1938,28 @@ oxr_session_publish_rear_budget(struct oxr_session *sess,
 	oxr_event_push_XrEventDataRearDepthBudgetStateChanged(&log, sess, prev, state);
 }
 
-//! Fill the chained struct for this locate.
+//! Fill the chained struct for this locate (no event — see the emit helper).
 static void
 oxr_session_fill_rear_depth_budget(struct oxr_session *sess, XrRearDepthBudgetDXR *out)
 {
 	struct u_rear_budget_out b = {0};
 	if (oxr_session_get_rear_budget(sess, &b)) {
-		oxr_session_publish_rear_budget(sess, out, b.far_offset_vh, (XrRearDepthBudgetStateDXR)b.state,
-		                                b.cue_energy);
+		oxr_session_write_rear_budget(sess, out, b.far_offset_vh, (XrRearDepthBudgetStateDXR)b.state,
+		                              b.cue_energy);
 		return;
 	}
 
 	// No policy behind this session (yet): the zero-default rule. A
 	// transparent session clips at the ZDP - which is what its app already
 	// does today - and an opaque one was never restricted in the first place.
+	// On an IPC session this is only the pre-fill: the service's answer
+	// overwrites it once the rig reply lands, before the event is judged.
 	if (sess->transparent_background) {
-		oxr_session_publish_rear_budget(sess, out, 0.0f, XR_REAR_DEPTH_BUDGET_STATE_CLIPPED_NO_SOURCE_DXR,
-		                                0.0f);
+		oxr_session_write_rear_budget(sess, out, 0.0f, XR_REAR_DEPTH_BUDGET_STATE_CLIPPED_NO_SOURCE_DXR,
+		                              0.0f);
 	} else {
-		oxr_session_publish_rear_budget(sess, out, U_REAR_BUDGET_UNRESTRICTED_VH,
-		                                XR_REAR_DEPTH_BUDGET_STATE_UNRESTRICTED_OPAQUE_DXR, 0.0f);
+		oxr_session_write_rear_budget(sess, out, U_REAR_BUDGET_UNRESTRICTED_VH,
+		                              XR_REAR_DEPTH_BUDGET_STATE_UNRESTRICTED_OPAQUE_DXR, 0.0f);
 	}
 }
 #endif // OXR_HAVE_DXR_depth_budget
@@ -3139,11 +3161,13 @@ oxr_session_locate_views(struct oxr_logger *log,
 			// XR_DXR_depth_budget: the SERVICE runs the display processor, so
 			// the service computes the budget. Overwrite the conservative
 			// default written above - one authority per session, never a
-			// client-side second opinion.
+			// client-side second opinion. The event is judged ONCE, after
+			// this block, so the pre-fill never announces a state the
+			// service is about to overrule.
 			if (rear_budget != NULL) {
-				oxr_session_publish_rear_budget(sess, rear_budget, reply.rear_far_offset_vh,
-				                                (XrRearDepthBudgetStateDXR)reply.rear_state,
-				                                reply.rear_cue);
+				oxr_session_write_rear_budget(sess, rear_budget, reply.rear_far_offset_vh,
+				                              (XrRearDepthBudgetStateDXR)reply.rear_state,
+				                              reply.rear_cue);
 			}
 #endif
 
@@ -3206,6 +3230,14 @@ oxr_session_locate_views(struct oxr_logger *log,
 				view_raw->isTracking = XR_FALSE;
 			}
 		}
+	}
+#endif
+
+#ifdef OXR_HAVE_DXR_depth_budget
+	// XR_DXR_depth_budget: one event per locate, now that every writer (the
+	// client-side pre-fill above and, on IPC, the service's reply) is done.
+	if (rear_budget != NULL) {
+		oxr_session_emit_rear_budget_event(sess, rear_budget);
 	}
 #endif
 
