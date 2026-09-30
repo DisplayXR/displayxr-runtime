@@ -1289,6 +1289,9 @@ struct compose_copy_cache
 	wil::com_ptr<ID3D11ShaderResourceView> srv;
 	uint32_t w{0};
 	uint32_t h{0};
+	//! #1765: the SOURCE format the cache was built for. A change re-creates
+	//! it — a CopyResource across typeless families is silently dropped.
+	DXGI_FORMAT fmt{DXGI_FORMAT_UNKNOWN};
 	//! True once at least one acquire+copy succeeded (until then there is
 	//! nothing valid to sample — the caller skips the draw, matching the
 	//! HUD cache's first-frame-before-acquire behavior).
@@ -2690,6 +2693,150 @@ service_ws_cmd_drain(struct d3d11_service_system *sys)
  */
 
 /*!
+ * #1765: create a service-owned copy target for a combine-pass source of
+ * format @p src_fmt, plus the SRV the combine pass samples it through — a
+ * NON-DECODING one.
+ *
+ * The combine pass has exactly one colour decode: the blit shader's b1
+ * `srgb_to_linear` under ADR-021 Model B (none under Model A). A source whose
+ * texture is an honest `_SRGB` format (the shell's chrome swapchains are
+ * `R8G8B8A8_UNORM_SRGB`) sampled through an `_SRGB`-typed SRV is decoded a
+ * SECOND time in hardware: title bars / HUD too dark under B, and decoded once
+ * where the passthrough contract wants none under A. So for the 8-bit sRGB
+ * families the copy is TYPELESS storage (a CopyResource from the `_SRGB` source
+ * is legal — same typeless family, a pure byte move) viewed as plain UNORM.
+ * Every other format keeps its own format and default view, exactly as before.
+ */
+static HRESULT
+svc_create_decode_free_copy(struct d3d11_service_system *sys,
+                            uint32_t w,
+                            uint32_t h,
+                            DXGI_FORMAT src_fmt,
+                            wil::com_ptr<ID3D11Texture2D> &tex_out,
+                            wil::com_ptr<ID3D11ShaderResourceView> &srv_out)
+{
+	tex_out.reset();
+	srv_out.reset();
+	const DXGI_FORMAT fmt = (src_fmt == DXGI_FORMAT_UNKNOWN) ? DXGI_FORMAT_R8G8B8A8_UNORM : src_fmt;
+	const DXGI_FORMAT sample_fmt = d3d_dxgi_format_srgb_to_unorm(fmt);
+	const bool decoding_source = (sample_fmt != fmt);
+
+	D3D11_TEXTURE2D_DESC cache_desc = {};
+	cache_desc.Width = w;
+	cache_desc.Height = h;
+	cache_desc.MipLevels = 1;
+	cache_desc.ArraySize = 1;
+	cache_desc.Format = decoding_source ? d3d_dxgi_format_to_typeless_dxgi(fmt) : fmt;
+	cache_desc.SampleDesc.Count = 1;
+	cache_desc.Usage = D3D11_USAGE_DEFAULT;
+	cache_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	HRESULT hr = sys->device->CreateTexture2D(&cache_desc, nullptr, tex_out.put());
+	if (FAILED(hr)) {
+		tex_out.reset();
+		return hr;
+	}
+	if (decoding_source) {
+		D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+		srv_desc.Format = sample_fmt;
+		srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		srv_desc.Texture2D.MostDetailedMip = 0;
+		srv_desc.Texture2D.MipLevels = 1;
+		hr = sys->device->CreateShaderResourceView(tex_out.get(), &srv_desc, srv_out.put());
+	} else {
+		hr = sys->device->CreateShaderResourceView(tex_out.get(), nullptr, srv_out.put());
+	}
+	if (FAILED(hr)) {
+		srv_out.reset();
+		tex_out.reset();
+		return hr;
+	}
+	if (decoding_source) {
+		// One-off per (re)allocation — a lifecycle event, never per frame.
+		U_LOG_W(
+		    "Color (#1765) [d3d11_service]: decode-free copy %ux%u src=0x%X storage=0x%X srv=0x%X "
+		    "(same typeless family=%d)",
+		    w, h, (unsigned)fmt, (unsigned)cache_desc.Format, (unsigned)sample_fmt,
+		    (int)d3d_dxgi_format_same_typeless_family(fmt, cache_desc.Format));
+	}
+	return S_OK;
+}
+
+//! #1765: (re)create @p cache for a source described by @p src_desc — on a
+//! dimension OR format change (a CopyResource across typeless families is
+//! silently dropped). False when it could not be created.
+static bool
+compose_copy_cache_ensure(struct d3d11_service_system *sys,
+                          const D3D11_TEXTURE2D_DESC *src_desc,
+                          struct compose_copy_cache *cache)
+{
+	if (cache->tex && cache->srv && cache->w == src_desc->Width && cache->h == src_desc->Height &&
+	    cache->fmt == src_desc->Format) {
+		return true;
+	}
+	cache->valid = false;
+	cache->w = 0;
+	cache->h = 0;
+	cache->fmt = DXGI_FORMAT_UNKNOWN;
+	if (FAILED(svc_create_decode_free_copy(sys, src_desc->Width, src_desc->Height, src_desc->Format, cache->tex,
+	                                       cache->srv))) {
+		return false;
+	}
+	cache->w = src_desc->Width;
+	cache->h = src_desc->Height;
+	cache->fmt = src_desc->Format;
+	return true;
+}
+
+/*!
+ * #1765: the SRV the combine pass samples a controller swapchain image through
+ * on the LIVE path (DXR_COMPOSE_FROM_COPY off — the default).
+ *
+ * @p live_srv is the image's own per-image SRV, created with the swapchain's
+ * format. For an `_SRGB` swapchain that view decodes in hardware, and a
+ * service-created swapchain's storage is strongly typed (the NT-shared
+ * texture every client process opens and hands to its app), so no UNORM view
+ * of it can be created. Instead the image is copied — a byte move, same
+ * typeless family — into @p cache, whose SRV is UNORM, and that is sampled.
+ * The caller has already taken (or failed to take) the image's keyed mutex
+ * exactly as before, so the copy sees what the live sample would have.
+ *
+ * Non-sRGB sources (and array / mipped images the single-slice cache cannot
+ * mirror) return @p live_srv unchanged — the pre-#1765 path, byte for byte.
+ */
+static ID3D11ShaderResourceView *
+compose_decode_free_srv(struct d3d11_service_system *sys,
+                        struct d3d11_service_swapchain *sc,
+                        uint32_t img_idx,
+                        struct compose_copy_cache *cache,
+                        ID3D11ShaderResourceView *live_srv)
+{
+	if (live_srv == nullptr || sc == nullptr || img_idx >= sc->image_count || !sc->images[img_idx].texture) {
+		return live_srv;
+	}
+	D3D11_TEXTURE2D_DESC src_desc = {};
+	sc->images[img_idx].texture->GetDesc(&src_desc);
+	if (d3d_dxgi_format_srgb_to_unorm(src_desc.Format) == src_desc.Format) {
+		return live_srv; // already a non-decoding view
+	}
+	if (src_desc.ArraySize != 1 || src_desc.MipLevels != 1 || src_desc.SampleDesc.Count != 1 ||
+	    !compose_copy_cache_ensure(sys, &src_desc, cache)) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			U_LOG_W(
+			    "Color (#1765) [d3d11_service]: _SRGB source 0x%X (%ux%u array=%u mips=%u) has no "
+			    "decode-free copy — sampling its decoding view",
+			    (unsigned)src_desc.Format, src_desc.Width, src_desc.Height, src_desc.ArraySize,
+			    src_desc.MipLevels);
+		}
+		return live_srv;
+	}
+	sys->context->CopyResource(cache->tex.get(), sc->images[img_idx].texture.get());
+	cache->valid = true;
+	return cache->srv.get();
+}
+
+/*!
  * Refresh @p cache from image @p img_idx of @p sc and return the SRV to
  * sample, or NULL when nothing valid exists yet (caller skips the draw this
  * tick). Never blocks: the keyed-mutex acquire is 0-timeout; a miss (the
@@ -2714,29 +2861,11 @@ compose_copy_cache_refresh(struct d3d11_service_system *sys,
 	D3D11_TEXTURE2D_DESC src_desc = {};
 	sc->images[img_idx].texture->GetDesc(&src_desc);
 
-	// Lazy (re)create on dim change — same shape as the HUD cache.
-	if (!cache->tex || cache->w != src_desc.Width || cache->h != src_desc.Height) {
-		cache->tex.reset();
-		cache->srv.reset();
-		cache->valid = false;
-		D3D11_TEXTURE2D_DESC cache_desc = {};
-		cache_desc.Width = src_desc.Width;
-		cache_desc.Height = src_desc.Height;
-		cache_desc.MipLevels = 1;
-		cache_desc.ArraySize = 1;
-		cache_desc.Format = (src_desc.Format == DXGI_FORMAT_UNKNOWN)
-		                        ? DXGI_FORMAT_R8G8B8A8_UNORM
-		                        : src_desc.Format;
-		cache_desc.SampleDesc.Count = 1;
-		cache_desc.Usage = D3D11_USAGE_DEFAULT;
-		cache_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-		HRESULT hr = sys->device->CreateTexture2D(&cache_desc, nullptr, cache->tex.put());
-		if (FAILED(hr)) {
-			return nullptr;
-		}
-		sys->device->CreateShaderResourceView(cache->tex.get(), nullptr, cache->srv.put());
-		cache->w = src_desc.Width;
-		cache->h = src_desc.Height;
+	// Lazy (re)create on dim or format change — same shape as the HUD cache.
+	// #1765: an `_SRGB` source gets TYPELESS storage + a UNORM SRV, so the
+	// combine pass samples it without a hardware decode.
+	if (!compose_copy_cache_ensure(sys, &src_desc, cache)) {
+		return nullptr;
 	}
 
 	IDXGIKeyedMutex *km = sc->images[img_idx].keyed_mutex.get();
@@ -3243,6 +3372,7 @@ struct d3d11_multi_client_slot
 	wil::com_ptr<ID3D11ShaderResourceView> hud_cache_srv[XRT_MAX_LAYERS];
 	uint32_t hud_cache_w[XRT_MAX_LAYERS];
 	uint32_t hud_cache_h[XRT_MAX_LAYERS];
+	DXGI_FORMAT hud_cache_fmt[XRT_MAX_LAYERS]; // #1765: source format the cache was built for
 	bool hud_cache_valid[XRT_MAX_LAYERS]; // true once at least one acquire succeeded
 
 	//! #925 S5: service-owned copy of the controller's chrome swapchain for
@@ -15823,31 +15953,24 @@ multi_compositor_render(struct d3d11_service_system *sys)
 					// compose from missed AcquireSync (cube cpu-format path
 					// holds the keyed mutex 5–10 ms; a missed acquire just
 					// re-uses last tick's content).
-					if (!slot_hud->hud_cache_tex[0] ||
+					//
+					// #1765: also on a FORMAT change, and an `_SRGB` HUD
+					// swapchain gets TYPELESS storage + a UNORM SRV — the
+					// cache used to copy the swapchain's own format and
+					// view it through a decoding SRV, so the HUD was decoded
+					// in hardware and then again by b1 under Model B.
+					if (!slot_hud->hud_cache_tex[0] || !slot_hud->hud_cache_srv[0] ||
 					    slot_hud->hud_cache_w[0] != hud_tex_desc.Width ||
-					    slot_hud->hud_cache_h[0] != hud_tex_desc.Height) {
-						slot_hud->hud_cache_tex[0].reset();
-						slot_hud->hud_cache_srv[0].reset();
-						D3D11_TEXTURE2D_DESC cache_desc = {};
-						cache_desc.Width = hud_tex_desc.Width;
-						cache_desc.Height = hud_tex_desc.Height;
-						cache_desc.MipLevels = 1;
-						cache_desc.ArraySize = 1;
-						cache_desc.Format = (hud_tex_desc.Format == DXGI_FORMAT_UNKNOWN)
-						                        ? DXGI_FORMAT_R8G8B8A8_UNORM
-						                        : hud_tex_desc.Format;
-						cache_desc.SampleDesc.Count = 1;
-						cache_desc.Usage = D3D11_USAGE_DEFAULT;
-						cache_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-						HRESULT hr_c = sys->device->CreateTexture2D(
-						    &cache_desc, nullptr, slot_hud->hud_cache_tex[0].put());
+					    slot_hud->hud_cache_h[0] != hud_tex_desc.Height ||
+					    slot_hud->hud_cache_fmt[0] != hud_tex_desc.Format) {
+						slot_hud->hud_cache_valid[0] = false;
+						HRESULT hr_c = svc_create_decode_free_copy(
+						    sys, hud_tex_desc.Width, hud_tex_desc.Height, hud_tex_desc.Format,
+						    slot_hud->hud_cache_tex[0], slot_hud->hud_cache_srv[0]);
 						if (SUCCEEDED(hr_c)) {
-							sys->device->CreateShaderResourceView(
-							    slot_hud->hud_cache_tex[0].get(), nullptr,
-							    slot_hud->hud_cache_srv[0].put());
 							slot_hud->hud_cache_w[0] = hud_tex_desc.Width;
 							slot_hud->hud_cache_h[0] = hud_tex_desc.Height;
-							slot_hud->hud_cache_valid[0] = false;
+							slot_hud->hud_cache_fmt[0] = hud_tex_desc.Format;
 						}
 					}
 
@@ -16431,11 +16554,17 @@ multi_compositor_render(struct d3d11_service_system *sys)
 						// First-frame-before-acquire — skip chrome this tick.
 						continue;
 					}
-				} else if (chrome_mutex != nullptr) {
-					HRESULT hr = chrome_mutex->AcquireSync(0, 4 /* ms */);
-					if (SUCCEEDED(hr)) {
-						chrome_mutex_held = true;
+				} else {
+					if (chrome_mutex != nullptr) {
+						HRESULT hr = chrome_mutex->AcquireSync(0, 4 /* ms */);
+						if (SUCCEEDED(hr)) {
+							chrome_mutex_held = true;
+						}
 					}
+					// #1765: the shell's chrome swapchain is `_SRGB`; its own
+					// SRV would decode, then b1 would decode again under
+					// Model B. Sample a byte copy through a UNORM view.
+					chrome_srv = compose_decode_free_srv(sys, csc, 0, &cs->chrome_copy_cache, chrome_srv);
 				}
 
 				float chrome_cx = cs->chrome_pose_in_client.position.x;
@@ -16647,6 +16776,8 @@ multi_compositor_render(struct d3d11_service_system *sys)
 						overlay_mutex_held = true;
 					}
 				}
+				// #1765: never sample an `_SRGB` image through its decoding SRV.
+				overlay_srv = compose_decode_free_srv(sys, ov_sc, 0, &ov.copy_cache, overlay_srv);
 			}
 		}
 		if (overlay_srv != nullptr && sprite_w_px > 0 && sprite_h_px > 0) {
@@ -16810,6 +16941,9 @@ multi_compositor_render(struct d3d11_service_system *sys)
 						cursor_mutex_held = true;
 					}
 				}
+				// #1765: never sample an `_SRGB` image through its decoding SRV.
+				cursor_srv =
+				    compose_decode_free_srv(sys, cur_sc, 0, &sys->cursor_copy_cache, cursor_srv);
 			}
 		}
 		if (cursor_srv != nullptr && sprite_w_px > 0 && sprite_h_px > 0) {
