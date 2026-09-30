@@ -1017,6 +1017,10 @@ client_vk_swapchain_create(struct xrt_compositor *xc,
 		ret = vk_create_image_from_native(vk, &xinfo, &xscn->images[i], &sc->base.images[i], &sc->mems[i]);
 
 		if (ret != VK_SUCCESS) {
+			// #1767: release what we hold, including our reference on the native
+			// swapchain, so the service is not left with an orphaned texture for
+			// the rest of the session. destroy() skips the null images/memory.
+			client_vk_swapchain_destroy(&sc->base.base);
 			return XRT_ERROR_VULKAN;
 		}
 
