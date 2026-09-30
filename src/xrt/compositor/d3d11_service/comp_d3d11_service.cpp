@@ -8039,6 +8039,8 @@ compositor_create_swapchain(struct xrt_compositor *xc,
 		sc->base.images[i].size = (raw_size + 0xFFFFF) & ~(uint64_t)0xFFFFF;
 		sc->base.images[i].use_dedicated_allocation = false;
 		sc->base.images[i].is_dxgi_handle = false; // NT handle, use OpenSharedResource1
+		// #1767: tells a Vulkan client to import it as D3D11_TEXTURE, not OPAQUE_WIN32.
+		sc->base.images[i].is_d3d11_texture = true;
 
 		U_LOG_W("Created shared texture [%u]: handle=%p (NT handle)", i, shared_handle);
 

@@ -1130,6 +1130,22 @@ vk_create_image_from_native(struct vk_bundle *vk,
 	bool importable = false;
 	vk_csci_get_image_external_support(vk, image_format, info->bits, handle_type, &importable, NULL);
 
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
+	/*
+	 * #1767: a D3D11 texture NT handle is imported as D3D11_TEXTURE. Should a
+	 * device not report that type importable for this format/usage, keep the
+	 * pre-#1767 behaviour (OPAQUE_WIN32) rather than failing outright: it is
+	 * off-spec, but it is what every such import did before.
+	 */
+	if (!importable && handle_type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT) {
+		U_LOG_W("vk_create_image_from_native: D3D11_TEXTURE import not supported for format %d, "
+		        "falling back to OPAQUE_WIN32 (#1767)",
+		        (int)image_format);
+		handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+		vk_csci_get_image_external_support(vk, image_format, info->bits, handle_type, &importable, NULL);
+	}
+#endif
+
 	if (!importable) {
 		VK_ERROR(vk, "External memory handle is not importable");
 		return VK_ERROR_INITIALIZATION_FAILED;

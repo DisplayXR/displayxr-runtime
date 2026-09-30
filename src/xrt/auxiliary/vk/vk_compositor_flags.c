@@ -223,8 +223,15 @@ vk_csci_get_image_external_handle_type(struct vk_bundle *vk, struct xrt_image_na
 #elif defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_AHARDWAREBUFFER)
 	return VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
 #elif defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
-	return (xin && xin->is_dxgi_handle) ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT
-	                                    : VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+	if (xin && xin->is_dxgi_handle) {
+		return VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT;
+	}
+	// #1767: a D3D11 texture's NT handle is D3D11_TEXTURE, not OPAQUE_WIN32
+	// (which is for memory a Vulkan device exported).
+	if (xin && xin->is_d3d11_texture) {
+		return VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT;
+	}
+	return VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
 #else
 #error "need port"
 #endif
