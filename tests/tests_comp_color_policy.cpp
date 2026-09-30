@@ -448,3 +448,63 @@ TEST_CASE("colour: the vk_native leg spells the same model in Vulkan (#1589/#161
 		}
 	}
 }
+
+TEST_CASE("colour: the D3D11 service's passthrough draws sample raw (#1769)")
+{
+	/*
+	 * The service's per-image SRV is created in the swapchain's OWN format over
+	 * strongly typed storage, so for an `_SRGB` swapchain it DECODES on sample
+	 * and no UNORM view of that storage can be made. That is right for a draw
+	 * into the `_SRGB`-view compose target (which re-encodes on write) and
+	 * wrong for a passthrough draw into the UNORM atlas: there it leaves
+	 * linear values under a stamp that says ENCODED. A standalone probe
+	 * measured it — a stored 0x80 lands as 0x37. The zones composite shipped
+	 * exactly that for a pure-zones commit (the model viewer's full-window
+	 * zone) under a comment claiming "zones sample raw".
+	 *
+	 * So every passthrough shader draw of an app image must go through the
+	 * one helper that samples a same-family decode-free copy, and the zones
+	 * route must pick its view by where the write lands.
+	 */
+	const std::string path = std::string(DXR_COMP_SRC_DIR) + "/d3d11_service/comp_d3d11_service.cpp";
+	const std::string src = read_whole_file(path);
+
+	const std::string raw = function_body(src, "service_raw_sample_srv");
+	INFO("service_raw_sample_srv() must exist — it is the service's only raw read of an _SRGB app image");
+	REQUIRE_FALSE(raw.empty());
+	INFO("...and must build a TYPELESS copy viewed as UNORM (svc_create_decode_free_copy) and refresh "
+	     "it with a same-family CopyResource — a draw or a cross-family copy would convert the bytes");
+	CHECK(contains_in_code(raw, "svc_create_decode_free_copy("));
+	CHECK(contains_in_code(raw, "CopyResource("));
+	INFO("...and must leave a UNORM source on its own view (it is already raw)");
+	CHECK(contains_in_code(raw, "d3d_dxgi_format_srgb_to_unorm("));
+
+	const std::string resolve = function_body(src, "zones_resolve_src_srv");
+	INFO("zones_resolve_src_srv() must exist — both zones draw sites resolve their view through it");
+	REQUIRE_FALSE(resolve.empty());
+	INFO("...and must choose by where the write lands: the decoding view only when composing "
+	     "(active_write_rtv), the raw one otherwise");
+	CHECK(contains_in_code(resolve, "active_write_rtv"));
+	CHECK(contains_in_code(resolve, "service_raw_sample_srv("));
+
+	const std::string zones = function_body(src, "service_composite_zones_frame");
+	INFO("service_composite_zones_frame() must exist");
+	REQUIRE_FALSE(zones.empty());
+	INFO("the zones composite samples an app image's per-image SRV directly — on a passthrough "
+	     "commit that decodes an _SRGB source into the UNORM atlas");
+	CHECK_FALSE(contains_in_code(zones, "images[img].srv.get()"));
+	CHECK(count_code_lines_with(zones, "zones_resolve_src_srv(") == 2);
+	INFO("the zones stamp must record what the draw DID: an _SRGB format alone is not proof the atlas "
+	     "holds encoded bytes if the sample decoded (#1665)");
+	CHECK_FALSE(contains_in_code(zones, "is_srgb_format(sd.Format),"));
+	CHECK(contains_in_code(zones, "!src_decodes"));
+
+	// The projection loop's two non-composing shader branches (the oversized
+	// scale blit and #1598's later-layer blend) carried the same premise.
+	const size_t direct_proj = count_code_lines_with(src, "view_scs[eye]->images[view_img_indices[eye]].srv.get(), src_x");
+	INFO("a projection shader blit passes the per-image SRV straight to blit_to_atlas_texture "
+	     << direct_proj << " time(s), expected 0 — it must go through proj_src_srv, which is the raw "
+	        "copy whenever the commit is not composing");
+	CHECK(direct_proj == 0);
+	CHECK(count_code_lines_with(src, "sys, &c->render, proj_src_srv, src_x,") == 2);
+}

@@ -335,8 +335,26 @@ struct d3d11_service_image
 	//! The imported texture
 	wil::com_ptr<ID3D11Texture2D> texture;
 
-	//! Shader resource view for compositing
+	//! Shader resource view for compositing. Created in the texture's OWN
+	//! format, so for an `_SRGB` image it DECODES on sample (storage is
+	//! strongly typed — no UNORM view of it can be made). Right for a draw
+	//! into the `_SRGB`-view compose target, which re-encodes on write; wrong
+	//! for a passthrough draw into the UNORM atlas — see @ref raw_copy_srv.
 	wil::com_ptr<ID3D11ShaderResourceView> srv;
+
+	/*!
+	 * #1769: a NON-DECODING copy of an `_SRGB` @ref texture — TYPELESS storage
+	 * of the same family viewed as UNORM — for the passthrough shader draws
+	 * (a zones / Local-2D commit that is not composing, a scaled fast-path
+	 * projection view). Lazily built by service_raw_sample_srv() on first
+	 * use and refreshed by a same-family CopyResource per draw; never built
+	 * for a UNORM image, whose @ref srv is already raw.
+	 */
+	wil::com_ptr<ID3D11Texture2D> raw_copy_tex;
+	wil::com_ptr<ID3D11ShaderResourceView> raw_copy_srv;
+	//! The draw pass that last refreshed @ref raw_copy_tex, so the views of a
+	//! tiled source (every view reads ONE image) cost one copy, not one each.
+	uint64_t raw_copy_pass;
 
 	//! KeyedMutex for cross-process synchronization
 	wil::com_ptr<IDXGIKeyedMutex> keyed_mutex;
@@ -2713,10 +2731,18 @@ svc_create_decode_free_copy(struct d3d11_service_system *sys,
                             uint32_t h,
                             DXGI_FORMAT src_fmt,
                             wil::com_ptr<ID3D11Texture2D> &tex_out,
-                            wil::com_ptr<ID3D11ShaderResourceView> &srv_out)
+                            wil::com_ptr<ID3D11ShaderResourceView> &srv_out,
+                            // #1769: a LAYERED source (ADR-032) gets a copy
+                            // with the same slice count, viewed as a whole-
+                            // array Texture2DArray like the swapchain's own
+                            // per-image SRV. 1 keeps every #1765 caller as is.
+                            uint32_t array_size = 1)
 {
 	tex_out.reset();
 	srv_out.reset();
+	if (array_size == 0) {
+		array_size = 1;
+	}
 	const DXGI_FORMAT fmt = (src_fmt == DXGI_FORMAT_UNKNOWN) ? DXGI_FORMAT_R8G8B8A8_UNORM : src_fmt;
 	const DXGI_FORMAT sample_fmt = d3d_dxgi_format_srgb_to_unorm(fmt);
 	const bool decoding_source = (sample_fmt != fmt);
@@ -2725,7 +2751,7 @@ svc_create_decode_free_copy(struct d3d11_service_system *sys,
 	cache_desc.Width = w;
 	cache_desc.Height = h;
 	cache_desc.MipLevels = 1;
-	cache_desc.ArraySize = 1;
+	cache_desc.ArraySize = array_size;
 	cache_desc.Format = decoding_source ? d3d_dxgi_format_to_typeless_dxgi(fmt) : fmt;
 	cache_desc.SampleDesc.Count = 1;
 	cache_desc.Usage = D3D11_USAGE_DEFAULT;
@@ -2738,9 +2764,17 @@ svc_create_decode_free_copy(struct d3d11_service_system *sys,
 	if (decoding_source) {
 		D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
 		srv_desc.Format = sample_fmt;
-		srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-		srv_desc.Texture2D.MostDetailedMip = 0;
-		srv_desc.Texture2D.MipLevels = 1;
+		if (array_size > 1) {
+			srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+			srv_desc.Texture2DArray.MostDetailedMip = 0;
+			srv_desc.Texture2DArray.MipLevels = 1;
+			srv_desc.Texture2DArray.FirstArraySlice = 0;
+			srv_desc.Texture2DArray.ArraySize = array_size;
+		} else {
+			srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+			srv_desc.Texture2D.MostDetailedMip = 0;
+			srv_desc.Texture2D.MipLevels = 1;
+		}
 		hr = sys->device->CreateShaderResourceView(tex_out.get(), &srv_desc, srv_out.put());
 	} else {
 		hr = sys->device->CreateShaderResourceView(tex_out.get(), nullptr, srv_out.put());
@@ -2834,6 +2868,94 @@ compose_decode_free_srv(struct d3d11_service_system *sys,
 	sys->context->CopyResource(cache->tex.get(), sc->images[img_idx].texture.get());
 	cache->valid = true;
 	return cache->srv.get();
+}
+
+/*!
+ * #1769: the SRV a PASSTHROUGH shader draw samples swapchain image @p img_idx
+ * through — one whose sample returns the stored bytes unchanged.
+ *
+ * A passthrough draw is one into the client's UNORM atlas RTV with b1 zero: it
+ * owes no encode and applies none, so the atlas holds encoded bytes exactly
+ * when it is handed encoded bytes. The image's own @ref d3d11_service_image::srv
+ * cannot give it that for an `_SRGB` swapchain: it is typed in the swapchain's
+ * format and DECODES on sample, and the strongly typed storage refuses a UNORM
+ * view (E_INVALIDARG). So the image is copied into @ref
+ * d3d11_service_image::raw_copy_tex — TYPELESS, same family, a pure byte move
+ * — and sampled through its UNORM view, the #1765 technique. Measured with a
+ * standalone probe: a stored 0x80 lands in the atlas as 0x37 through the
+ * decoding view and 0x80 through this one.
+ *
+ * A draw into the private `_SRGB`-view compose target must NOT use this: that
+ * target re-encodes on write, so it wants the decoding view (see the
+ * projection loop's #1589/#1610 note).
+ *
+ * Caller holds the image's keyed mutex (the copy must see what the draw would
+ * have) and `immediate_ctx_mutex` (the copy is an immediate-context call in
+ * the middle of the caller's draw sequence). Never waits.
+ *
+ * @p pass identifies the caller's draw pass (service_raw_copy_pass_begin()):
+ * within one pass the image is copied once, however many views sample it.
+ *
+ * @p out_decodes is set when the returned view still decodes — an `_SRGB`
+ * image this copy cannot mirror (mipped / multisampled, or the copy could not
+ * be allocated). The caller stamps the atlas from it, so the flag says what
+ * the draw DID rather than what the format asked for (#1665).
+ */
+static ID3D11ShaderResourceView *
+service_raw_sample_srv(struct d3d11_service_system *sys,
+                       struct d3d11_service_swapchain *sc,
+                       uint32_t img_idx,
+                       uint64_t pass,
+                       bool *out_decodes)
+{
+	*out_decodes = false;
+	struct d3d11_service_image *im = &sc->images[img_idx];
+	ID3D11ShaderResourceView *live_srv = im->srv.get();
+	if (live_srv == nullptr || !im->texture) {
+		return live_srv;
+	}
+	D3D11_TEXTURE2D_DESC src_desc = {};
+	im->texture->GetDesc(&src_desc);
+	if (d3d_dxgi_format_srgb_to_unorm(src_desc.Format) == src_desc.Format) {
+		return live_srv; // UNORM / float: the image's own view is already raw
+	}
+	if (!im->raw_copy_tex || !im->raw_copy_srv) {
+		HRESULT hr = E_FAIL;
+		if (src_desc.MipLevels == 1 && src_desc.SampleDesc.Count == 1) {
+			hr = svc_create_decode_free_copy(sys, src_desc.Width, src_desc.Height, src_desc.Format,
+			                                 im->raw_copy_tex, im->raw_copy_srv, src_desc.ArraySize);
+		}
+		if (FAILED(hr)) {
+			im->raw_copy_tex.reset();
+			im->raw_copy_srv.reset();
+			static bool warned = false;
+			if (!warned) {
+				warned = true;
+				U_LOG_W(
+				    "Color (#1769) [d3d11_service]: _SRGB source 0x%X (%ux%u array=%u mips=%u samples=%u) "
+				    "has no decode-free copy (hr=0x%08lx) — a passthrough draw samples its decoding "
+				    "view and the atlas is stamped linear",
+				    (unsigned)src_desc.Format, src_desc.Width, src_desc.Height, src_desc.ArraySize,
+				    src_desc.MipLevels, src_desc.SampleDesc.Count, hr);
+			}
+			*out_decodes = true;
+			return live_srv;
+		}
+	}
+	if (im->raw_copy_pass != pass) {
+		sys->context->CopyResource(im->raw_copy_tex.get(), im->texture.get());
+		im->raw_copy_pass = pass;
+	}
+	return im->raw_copy_srv.get();
+}
+
+//! #1769: a fresh id for one draw pass's service_raw_sample_srv() calls. Never
+//! 0, so a zero-initialised image always copies on its first use.
+static uint64_t
+service_raw_copy_pass_begin(void)
+{
+	static std::atomic<uint64_t> next{0};
+	return next.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
 /*!
@@ -7655,6 +7777,8 @@ swapchain_destroy(struct xrt_swapchain *xsc)
 			sc->images[i].keyed_mutex->ReleaseSync(0);
 		}
 		sc->images[i].srv.reset();
+		sc->images[i].raw_copy_srv.reset();
+		sc->images[i].raw_copy_tex.reset();
 		sc->images[i].keyed_mutex.reset();
 		sc->images[i].texture.reset();
 
@@ -18074,32 +18198,44 @@ struct service_acquired_image_scope
 };
 
 /*!
- * Resolve the SRV to sample a zone/Local-2D source through: always the plain,
- * NON-decoding per-image SRV, in both modes.
+ * Resolve the SRV to sample a zone/Local-2D source through, matched to where
+ * this commit's writes land.
  *
- * #1591: the standalone (non-workspace) branch used to build an sRGB-typed SRV
- * over an honest `_SRGB` source so the sample auto-decoded to linear, "because
- * the DP expects linear input". Nothing re-encoded it and the handoff is
- * declared ENCODED (service_single_client_atlas_encoding), so that was the #409
- * half-conversion in a third branch — the zones twin of the projection blit.
- * Both now sample raw, byte-identically to the shell path.
+ * - **Passthrough** (the commit is not composing — every pure-zones commit
+ *   today): the write goes to the UNORM atlas RTV with b1 zero, so the sample
+ *   must return the stored bytes — service_raw_sample_srv(). The atlas then
+ *   holds the app's bytes verbatim, byte-identically to the projection fast
+ *   path's raw copy.
+ * - **Composing** (a mixed frame whose projection layer opened the private
+ *   `_SRGB`-view target, `active_write_rtv` set): the image's own
+ *   format-honest SRV — an `_SRGB` source decodes, the compose shader passes
+ *   the linear value through and the target re-encodes on write.
  *
- * @p srgb_srv_out / @p out_is_srgb_blit are retained so the (unchanged) call
- * sites keep compiling; the flag is now always false.
+ * #1591 dropped an sRGB-typed SRV the standalone branch built "because the DP
+ * expects linear input" and declared the result "sample raw". It was not: the
+ * per-image SRV it fell back to is created in the swapchain's OWN format, so
+ * for an `_SRGB` swapchain (the model viewer's zone swapchain is
+ * R8G8B8A8_UNORM_SRGB) it still decoded, and the atlas stamped ENCODED held
+ * linear values — the zones twin of the #409 half-conversion survived in both
+ * modes (#1769).
+ *
+ * @p out_decodes: the returned view decodes and nothing downstream re-encodes
+ * (an `_SRGB` image with no decode-free copy on a passthrough commit). The
+ * atlas stamp reads it.
  */
 static ID3D11ShaderResourceView *
 zones_resolve_src_srv(struct d3d11_service_system *sys,
+                      struct d3d11_service_compositor *c,
                       struct d3d11_service_swapchain *sc,
                       uint32_t img,
-                      const D3D11_TEXTURE2D_DESC *desc,
-                      wil::com_ptr<ID3D11ShaderResourceView> &srgb_srv_out,
-                      bool *out_is_srgb_blit)
+                      uint64_t raw_pass,
+                      bool *out_decodes)
 {
-	(void)sys;
-	(void)desc;
-	(void)srgb_srv_out;
-	*out_is_srgb_blit = false;
-	return sc->images[img].srv.get();
+	*out_decodes = false;
+	if (c->render.active_write_rtv != nullptr) {
+		return sc->images[img].srv.get();
+	}
+	return service_raw_sample_srv(sys, sc, img, raw_pass, out_decodes);
 }
 
 /*!
@@ -18284,6 +18420,11 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 	 */
 	std::unique_lock<std::mutex> ctx_lock(sys->immediate_ctx_mutex);
 
+	// #1769: one decode-free copy per source image for this whole pass, taken
+	// inside the lock (it is an immediate-context call) and after every
+	// acquire (it must read what the draws would have read).
+	const uint64_t raw_pass = service_raw_copy_pass_begin();
+
 	// Transparent-slot semantics — cleared only now that every source is
 	// safely acquired. A mixed frame (a projection layer already blitted
 	// this commit) skips the clear and composites the placed layers over
@@ -18340,6 +18481,10 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 				}
 				D3D11_TEXTURE2D_DESC sd = {};
 				sc->images[img].texture->GetDesc(&sd);
+				// #1769: resolved before the stamp, because what the
+				// stamp records depends on which view this draw samples.
+				bool src_decodes = false;
+				ID3D11ShaderResourceView *src_srv = zones_resolve_src_srv(sys, c, sc, img, raw_pass, &src_decodes);
 				// Mixed frames keep the projection layer's flag — it owns
 				// the bulk of the atlas bytes.
 				//
@@ -18347,15 +18492,17 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 				// projection stamp, through the same helper. A pure-zones
 				// commit never reaches the compose decision (it lives on
 				// the projection write path — the known gap), so
-				// `active_write_rtv` is null here today and the answer is
-				// the source's format, which is correct BECAUSE this write
-				// is a passthrough: zones sample raw (#1591) and the
-				// composite goes to the atlas RTV. Written this way so
-				// wiring the gap up cannot leave the flag lying.
+				// `active_write_rtv` is null here today and the write is a
+				// passthrough into the atlas RTV: the atlas holds encoded
+				// bytes exactly when the source did AND the sample was raw.
+				// #1769: it used to pass the source's format alone, while
+				// the sample decoded — an `_SRGB` zone stamped ENCODED over
+				// linear values. Written this way so wiring the gap up
+				// cannot leave the flag lying.
 				if (!src_format_recorded && !projection_rendered) {
 					src_format_recorded = true;
 					c->atlas_holds_srgb_bytes = u_color_atlas_holds_encoded(
-					    is_srgb_format(sd.Format),
+					    is_srgb_format(sd.Format) && !src_decodes,
 					    /*composed_through_srgb_target=*/c->render.active_write_rtv != nullptr,
 					    u_color_legacy_unorm_encoded());
 				}
@@ -18369,10 +18516,6 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 				bool is_layered = sd.ArraySize > 1;
 				uint32_t src_slice =
 				    static_cast<uint32_t>(layer->data.zone_3d.proj.v[v].sub.array_index);
-				wil::com_ptr<ID3D11ShaderResourceView> srgb_srv;
-				bool srgb_blit = false;
-				ID3D11ShaderResourceView *src_srv =
-				    zones_resolve_src_srv(sys, sc, img, &sd, srgb_srv, &srgb_blit);
 				uint32_t tile_x, tile_y;
 				u_tiling_view_origin(v, tc, slot_w, slot_h, &tile_x, &tile_y);
 				const struct xrt_rect *sr = &layer->data.zone_3d.proj.v[v].sub.rect;
@@ -18383,7 +18526,7 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 				    (float)tile_x + (float)zr->offset.w * scale,
 				    (float)tile_y + (float)zr->offset.h * scale,
 				    dst_w, dst_h,
-				    srgb_blit, blend,
+				    /*is_srgb=*/false, blend,
 				    /*rtv_override=*/nullptr, /*dst_tex_w=*/0.0f, /*dst_tex_h=*/0.0f,
 				    /*is_array=*/is_layered, /*array_slice=*/src_slice);
 				blits_done++;
@@ -18421,10 +18564,8 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 			bool is_layered = sd.ArraySize > 1;
 			uint32_t src_slice =
 			    static_cast<uint32_t>(layer->data.local_2d.sub.array_index);
-			wil::com_ptr<ID3D11ShaderResourceView> srgb_srv;
-			bool srgb_blit = false;
-			ID3D11ShaderResourceView *src_srv =
-			    zones_resolve_src_srv(sys, sc, img, &sd, srgb_srv, &srgb_blit);
+			bool src_decodes = false; // the stamp is the zone's; see above
+			ID3D11ShaderResourceView *src_srv = zones_resolve_src_srv(sys, c, sc, img, raw_pass, &src_decodes);
 			ID3D11BlendState *blend =
 			    (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0
 			        ? sys->blend_alpha.get()
@@ -18440,7 +18581,7 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 				    (float)tile_x + (float)lr->offset.w * scale,
 				    (float)tile_y + (float)lr->offset.h * scale,
 				    dst_w, dst_h,
-				    srgb_blit, blend,
+				    /*is_srgb=*/false, blend,
 				    /*rtv_override=*/nullptr, /*dst_tex_w=*/0.0f, /*dst_tex_h=*/0.0f,
 				    /*is_array=*/is_layered, /*array_slice=*/src_slice);
 				blits_done++;
@@ -20906,6 +21047,10 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		bool view_mutex_acquired[XRT_MAX_VIEWS] = {};
 		D3D11_TEXTURE2D_DESC view_descs[XRT_MAX_VIEWS] = {};
 		bool view_is_srgb[XRT_MAX_VIEWS] = {};
+		// #1769: a passthrough shader blit below sampled an `_SRGB` view
+		// through its decoding SRV (no decode-free copy was possible), so
+		// the atlas holds linear values whatever the format says.
+		bool view_sample_decoded = false;
 		// Phase 1 Task 1.1 — per-view zero-copy eligibility. Default true;
 		// flipped false below by anything that disqualifies the view (the
 		// view required a service-side mutex acquire, or that acquire
@@ -21659,6 +21804,9 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			}
 		}
 
+		// #1769: one decode-free copy per source image across this layer's
+		// views (a tiled layer's views all read one image).
+		const uint64_t proj_raw_pass = service_raw_copy_pass_begin();
 
 		for (uint32_t eye = 0; eye < proj_view_count; eye++) {
 			// Phase 1 Task 1.2 — mutex acquire timed out earlier;
@@ -21726,7 +21874,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			// byte-identical to the shell path.
 			//
 			// The scale shader loses its `workspace_mode` restriction with
-			// it: it is a pure resize (default, non-decoding SRV), and it
+			// it: it is a pure resize (a non-decoding sample, #1769), and it
 			// was previously reachable in non-workspace mode only as a side
 			// effect of the SRGB branch. Without it an oversized
 			// non-workspace source falls to the raw copy, which cannot
@@ -21747,15 +21895,35 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			bool composing = c->render.active_write_rtv != nullptr;
 			bool use_scale_shader = can_shader_blit && (needs_scale || composing);
 
+			// #1769: which view the shader blits below sample. Composing,
+			// the format-honest per-image SRV (above). NOT composing, the
+			// draw is a passthrough into the UNORM atlas RTV and must read
+			// the stored bytes: that per-image SRV is typed in the
+			// swapchain's own format, so for an `_SRGB` source it DECODES —
+			// the "default (non-SRGB) SRV" these branches were written
+			// against does not exist for a typed `_SRGB` image. Sample a
+			// same-family decode-free copy instead (UNORM sources keep
+			// their own, already raw, view).
+			ID3D11ShaderResourceView *proj_src_srv = view_scs[eye]->images[view_img_indices[eye]].srv.get();
+			if (can_shader_blit && !composing && (use_scale_shader || proj_blend != nullptr)) {
+				bool decodes = false;
+				proj_src_srv = service_raw_sample_srv(sys, view_scs[eye], view_img_indices[eye],
+				                                      proj_raw_pass, &decodes);
+				if (decodes) {
+					view_sample_decoded = true;
+				}
+			}
+
 			if (use_scale_shader) {
-				// Oversized client content: scale through the shader using
-				// the default (non-SRGB) SRV so sampling reads raw bytes and
-				// writes them unmodified — keeps the per-client atlas in the
-				// app's own space, matching the raw-copy path that
-				// multi_compositor_render expects. The per-image SRV is already
-				// a Texture2DArray for layered sources (ADR-032, create/import).
+				// Oversized client content (or a composing commit): scale
+				// through the shader. Not composing, `proj_src_srv` reads raw
+				// bytes and writes them unmodified — keeps the per-client
+				// atlas in the app's own space, matching the raw-copy path
+				// that multi_compositor_render expects. Both views are a
+				// Texture2DArray for layered sources (ADR-032, create/import,
+				// #1769's copy).
 				blit_to_atlas_texture(
-				    sys, &c->render, view_scs[eye]->images[view_img_indices[eye]].srv.get(), src_x,
+				    sys, &c->render, proj_src_srv, src_x,
 				    src_y, src_w, src_h, (float)view_descs[eye].Width, (float)view_descs[eye].Height,
 				    (float)tile_x, (float)tile_y, dst_w, dst_h, false,
 				    /*blend=*/proj_blend, /*rtv_override=*/nullptr,
@@ -21770,7 +21938,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				// with two or more projection layers; the first one, and
 				// every single-projection frame, still takes the copy.
 				blit_to_atlas_texture(
-				    sys, &c->render, view_scs[eye]->images[view_img_indices[eye]].srv.get(), src_x,
+				    sys, &c->render, proj_src_srv, src_x,
 				    src_y, src_w, src_h, (float)view_descs[eye].Width, (float)view_descs[eye].Height,
 				    (float)tile_x, (float)tile_y, dst_w, dst_h, false,
 				    /*blend=*/proj_blend, /*rtv_override=*/nullptr,
@@ -21852,7 +22020,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		// Eyes within a projection layer share a swapchain format in practice;
 		// pick view 0.
 		c->atlas_holds_srgb_bytes =
-		    u_color_atlas_holds_encoded(view_is_srgb[0],
+		    u_color_atlas_holds_encoded(view_is_srgb[0] && !view_sample_decoded,
 		                                /*composed_through_srgb_target=*/c->render.active_write_rtv != nullptr,
 		                                u_color_legacy_unorm_encoded());
 
