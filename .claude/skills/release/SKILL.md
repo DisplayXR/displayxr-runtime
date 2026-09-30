@@ -377,7 +377,16 @@ done
 # Download the signed installer.
 if [ "$SIGNED" = yes ]; then
   rm -rf _signed && gh run download "$SIGN_RUN" -R "$SIGN_REPO" -n signed-installer -D _signed
-  SIGNED_EXE=$(ls _signed/DisplayXRSetup-*.exe 2>/dev/null | head -1)
+  # Glob-and-test, NEVER `ls`: an `ls -F` alias (Git Bash on the Windows dev box)
+  # appends a `*` classifier to executables, so `$(ls ...)` yields
+  # `DisplayXRSetup-2.21.12.exe*`. Step 4.5.3 then (a) fails to exclude the CI
+  # asset from the delete list, because `grep -v -F "$(basename ...)"` no longer
+  # matches it, and DELETES the release's only Windows installer, and (b) fails
+  # every `gh release upload` on the bad path. Hit for real on v2.21.12: the
+  # release sat with no .exe until the file was re-found by hand. `/dxr-release`
+  # and `/installer-release` already use this form.
+  SIGNED_EXE=""
+  for f in _signed/DisplayXRSetup-*.exe; do [ -f "$f" ] && { SIGNED_EXE="$f"; break; }; done
   [ -n "$SIGNED_EXE" ] || { echo "No signed installer in the artifact — ship unsigned"; SIGNED=no; }
 fi
 ```

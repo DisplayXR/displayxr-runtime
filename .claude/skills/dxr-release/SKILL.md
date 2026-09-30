@@ -456,7 +456,9 @@ if [ "$COMPONENT" = unity ]; then
     D=$(mktemp -d)
     gh release download "$NEW_TAG" -R "$REPO" -p "$TGZ" -D "$D"       # the just-released .tgz
     mkdir -p "$D/x"; tar xzf "$D/$TGZ" -C "$D/x"
-    PKGDIR=$(ls -d "$D"/x/com.displayxr.unity-* | head -1)
+    # Glob-and-test, never `ls` (an `ls -F` alias appends `/` here and `*` on executables).
+    PKGDIR=""
+    for d in "$D"/x/com.displayxr.unity-*; do [ -d "$d" ] && { PKGDIR="$d"; break; }; done
     DLL="$PKGDIR/$DLL_REL"
     if [ ! -f "$DLL" ]; then
       echo "⚠ $DLL_REL not found in $TGZ — ships unsigned."
