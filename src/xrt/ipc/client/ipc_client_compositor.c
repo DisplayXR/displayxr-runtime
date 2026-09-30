@@ -2038,6 +2038,7 @@ swapchain_server_create(struct ipc_client_compositor *icc,
 	uint32_t image_count;
 	uint64_t size;
 	bool use_dedicated_allocation;
+	bool is_d3d11_texture;
 
 	xret = ipc_call_swapchain_create( //
 	    icc->ipc_c,                   // connection
@@ -2046,6 +2047,7 @@ swapchain_server_create(struct ipc_client_compositor *icc,
 	    &image_count,                 // out
 	    &size,                        // out
 	    &use_dedicated_allocation,    // out
+	    &is_d3d11_texture,            // out
 	    remote_handles,               // handles
 	    XRT_MAX_SWAPCHAIN_IMAGES);    // handles
 	IPC_CHK_AND_RET(icc->ipc_c, xret, "ipc_call_swapchain_create");
@@ -2065,6 +2067,7 @@ swapchain_server_create(struct ipc_client_compositor *icc,
 		ics->base.images[i].handle = remote_handles[i];
 		ics->base.images[i].size = size;
 		ics->base.images[i].use_dedicated_allocation = use_dedicated_allocation;
+		ics->base.images[i].is_d3d11_texture = is_d3d11_texture;
 	}
 
 	*out_xsc = &ics->base.base;

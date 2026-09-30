@@ -615,7 +615,8 @@
 			{"name": "id", "type": "uint32_t"},
 			{"name": "image_count", "type": "uint32_t"},
 			{"name": "size", "type": "uint64_t"},
-			{"name": "use_dedicated_allocation", "type": "bool"}
+			{"name": "use_dedicated_allocation", "type": "bool"},
+			{"name": "is_d3d11_texture", "type": "bool"}
 		],
 		"out_handles": {"type": "xrt_graphics_buffer_handle_t"}
 	},

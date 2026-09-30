@@ -2607,6 +2607,19 @@ struct xrt_image_native
 	 *   which has awkward limitations, such as "usually no depth images allowed".
 	 */
 	bool is_dxgi_handle;
+
+	/*!
+	 * Is the (non-DXGI) NT handle the shared handle of a D3D11 texture
+	 * (IDXGIResource1::CreateSharedHandle), rather than memory some Vulkan
+	 * device exported?
+	 *
+	 * Only meaningful on Windows when @ref is_dxgi_handle is false. Vulkan must
+	 * import such a handle as VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT:
+	 * importing it as OPAQUE_WIN32 (the default for NT handles) is outside the
+	 * spec and NVIDIA rejects it for some image sizes with
+	 * VK_ERROR_OUT_OF_DEVICE_MEMORY (#1767).
+	 */
+	bool is_d3d11_texture;
 };
 
 /*!
