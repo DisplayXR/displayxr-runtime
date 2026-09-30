@@ -3436,9 +3436,35 @@ struct d3d11_multi_compositor
 	wil::com_ptr<ID3D11RenderTargetView> back_buffer_rtv;
 
 	//! Combined atlas (all clients composited, input to DP).
+	//!
+	//! #1764: storage is `R8G8B8A8_TYPELESS`, so it carries TWO render-target
+	//! views and every view names its format explicitly (a typeless resource
+	//! cannot be viewed through a nullptr desc):
+	//! - @ref combined_atlas_srv / @ref combined_atlas_rtv are `R8G8B8A8_UNORM`
+	//!   — a byte-exact view. Model A writes through this RTV (b1 = 0, the blit
+	//!   shader already emits encoded bytes, so an `_SRGB` RTV would encode them
+	//!   a SECOND time), the backdrop clear always goes through it, and the DP,
+	//!   the ADR-030 crop, the split egress and the captures all read the atlas
+	//!   as the plain encoded bytes it now always holds.
+	//! - @ref combined_atlas_rtv_srgb is `R8G8B8A8_UNORM_SRGB` — the
+	//!   ENCODE-ON-WRITE view. Model B writes through it: b1 decodes each
+	//!   source to scene-linear, the ROP blends in linear, and the hardware
+	//!   re-encodes on write, so the 8-bit atlas never has to hold linear light
+	//!   (which collapsed the dark end to a handful of codes — banding).
+	//! Pick with @ref multi_combine_rtv, never by name.
 	wil::com_ptr<ID3D11Texture2D> combined_atlas;
 	wil::com_ptr<ID3D11ShaderResourceView> combined_atlas_srv;
 	wil::com_ptr<ID3D11RenderTargetView> combined_atlas_rtv;
+	wil::com_ptr<ID3D11RenderTargetView> combined_atlas_rtv_srgb;
+
+	//! #1764: this tick's combine-pass target. True = Model B with a DP that
+	//! accepts an ENCODED handoff (EITHER): draws go through the `_SRGB` RTV and
+	//! the atlas is handed off ENCODED. False = Model A (UNORM RTV, ENCODED), or
+	//! Model B against a LINEAR-only DP, which keeps the pre-#1764 behaviour
+	//! (UNORM RTV holding linear, handed off LINEAR) because such a DP must not
+	//! be handed encoded bytes. Written by the render thread only, twice per
+	//! tick: at the backdrop clear and again once `compose_linear` is known.
+	bool combine_encodes_on_write;
 
 	//! Phase 2.K: depth target sibling to combined_atlas. Used by the
 	//! multi-window content + chrome blit pass for per-pixel occlusion.
@@ -10132,6 +10158,7 @@ multi_compositor_destroy(struct d3d11_multi_compositor *mc)
 	pipeline_dp_graveyard_sweep(mc, /*force*/ true);
 
 	mc->back_buffer_rtv.reset();
+	mc->combined_atlas_rtv_srgb.reset();
 	mc->combined_atlas_rtv.reset();
 	mc->combined_atlas_srv.reset();
 	mc->combined_atlas.reset();
@@ -10356,7 +10383,10 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 		atlas_desc.Height = ca_h;
 		atlas_desc.MipLevels = 1;
 		atlas_desc.ArraySize = 1;
-		atlas_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		// #1764: TYPELESS so one allocation carries both a byte-exact UNORM
+		// view (Model A draws, the backdrop clear, every reader) and an
+		// encode-on-write `_SRGB` RTV (Model B draws). See the field comment.
+		atlas_desc.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
 		atlas_desc.SampleDesc.Count = 1;
 		atlas_desc.Usage = D3D11_USAGE_DEFAULT;
 		atlas_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
@@ -10372,8 +10402,47 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 			U_LOG_E("Multi-comp: failed to create combined atlas (hr=0x%08X)", hr);
 			return XRT_ERROR_D3D11;
 		}
-		sys->device->CreateShaderResourceView(mc->combined_atlas.get(), nullptr, mc->combined_atlas_srv.put());
-		sys->device->CreateRenderTargetView(mc->combined_atlas.get(), nullptr, mc->combined_atlas_rtv.put());
+		// #1764: every view names its format — a TYPELESS resource rejects a
+		// nullptr view desc. The UNORM SRV/RTV are load-bearing (the DP input
+		// and the Model-A / clear target); a failed `_SRGB` RTV only costs
+		// Model B its encode-on-write, so it degrades to the pre-#1764 path
+		// (UNORM RTV holding linear, LINEAR handoff) instead of failing.
+		D3D11_SHADER_RESOURCE_VIEW_DESC ca_srv_desc = {};
+		ca_srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		ca_srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		ca_srv_desc.Texture2D.MostDetailedMip = 0;
+		ca_srv_desc.Texture2D.MipLevels = 1;
+		D3D11_RENDER_TARGET_VIEW_DESC ca_rtv_desc = {};
+		ca_rtv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		ca_rtv_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+		ca_rtv_desc.Texture2D.MipSlice = 0;
+		HRESULT hr_srv =
+		    sys->device->CreateShaderResourceView(mc->combined_atlas.get(), &ca_srv_desc, mc->combined_atlas_srv.put());
+		HRESULT hr_rtv =
+		    sys->device->CreateRenderTargetView(mc->combined_atlas.get(), &ca_rtv_desc, mc->combined_atlas_rtv.put());
+		if (FAILED(hr_srv) || FAILED(hr_rtv)) {
+			U_LOG_E("Multi-comp: combined atlas UNORM views failed (srv=0x%08lX rtv=0x%08lX)", hr_srv, hr_rtv);
+			mc->combined_atlas_srv.reset();
+			mc->combined_atlas_rtv.reset();
+			mc->combined_atlas.reset();
+			return XRT_ERROR_D3D11;
+		}
+		D3D11_RENDER_TARGET_VIEW_DESC ca_rtv_srgb_desc = ca_rtv_desc;
+		ca_rtv_srgb_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+		HRESULT hr_rtv_srgb = sys->device->CreateRenderTargetView(mc->combined_atlas.get(), &ca_rtv_srgb_desc,
+		                                                          mc->combined_atlas_rtv_srgb.put());
+		if (FAILED(hr_rtv_srgb)) {
+			mc->combined_atlas_rtv_srgb.reset();
+		}
+		// One-off per (re)allocation: the line a hardware check greps to see
+		// which views the combine pass can pick from.
+		U_LOG_W(
+		    "Color (#1764) [d3d11_service]: combined atlas storage=0x%X srv=0x%X rtv=0x%X rtv_srgb=0x%X%s "
+		    "(same typeless family=%d)",
+		    (unsigned)atlas_desc.Format, (unsigned)ca_srv_desc.Format, (unsigned)ca_rtv_desc.Format,
+		    (unsigned)ca_rtv_srgb_desc.Format,
+		    mc->combined_atlas_rtv_srgb ? "" : " FAILED - Model B keeps the linear UNORM handoff",
+		    (int)d3d_dxgi_format_same_typeless_family(atlas_desc.Format, ca_rtv_srgb_desc.Format));
 		svc_split_share_source(sys, mc->combined_atlas.get(), &mc->atlas_share_handle, &mc->atlas_share_key);
 
 		// Phase 2.K: depth target sibling (D32_FLOAT). Per-eye tiles share
@@ -11254,6 +11323,36 @@ pipeline_dp_set_transparency(struct d3d11_multi_compositor *mc,
 	mc->panel_dp_client_presents = client_presents;
 	mc->panel_dp_client_presents_valid = true;
 	pipeline_dp_note_state_flip(mc, "transparency", who);
+}
+
+/*!
+ * #1764: the RTV every combine-pass DRAW into the combined atlas binds.
+ *
+ * The `_SRGB` (encode-on-write) view only when this tick composes in linear
+ * AND hands off ENCODED (@ref d3d11_multi_compositor::combine_encodes_on_write);
+ * the byte-exact UNORM view otherwise. Model A must never get the `_SRGB` view:
+ * its b1 is 0, the blit shader emits encoded bytes, and the RTV would encode
+ * them again. The backdrop clear deliberately does NOT use this — it always
+ * clears through the UNORM view with a byte value (see the clear).
+ */
+static inline ID3D11RenderTargetView *
+multi_combine_rtv(struct d3d11_multi_compositor *mc)
+{
+	if (mc->combine_encodes_on_write && mc->combined_atlas_rtv_srgb) {
+		return mc->combined_atlas_rtv_srgb.get();
+	}
+	return mc->combined_atlas_rtv.get();
+}
+
+/*!
+ * #1764: may this tick's Model-B combine encode on write? Needs the `_SRGB`
+ * view AND a DP that accepts an ENCODED handoff — a LINEAR-only DP must be
+ * handed linear, so it keeps the pre-#1764 path (UNORM RTV holding linear).
+ */
+static inline bool
+multi_combine_can_encode_on_write(const struct d3d11_multi_compositor *mc, enum xrt_dp_color_capability cap)
+{
+	return mc->combined_atlas_rtv_srgb && cap == XRT_DP_COLOR_EITHER;
 }
 
 /*!
@@ -14367,6 +14466,7 @@ pipeline_service_window_closed(struct d3d11_service_system *sys, struct d3d11_mu
 		pipeline_dp_forget_beliefs(mc); // #1319
 	}
 	mc->back_buffer_rtv.reset();
+	mc->combined_atlas_rtv_srgb.reset();
 	mc->combined_atlas_rtv.reset();
 	mc->combined_atlas_srv.reset();
 	mc->combined_atlas.reset();
@@ -15102,8 +15202,10 @@ multi_compositor_render(struct d3d11_service_system *sys)
 
 	// Clear combined atlas to dark gray background each frame.
 	{
-		// ADR-021 Model B: the backdrop clear bypasses the blit shader, so under
-		// Model B (linear atlas) it must use the LINEAR equivalent of #1a1a1a —
+		// ADR-021 Model B: the backdrop clear bypasses the blit shader, so when
+		// the atlas holds linear (Model B against a LINEAR-only DP; since #1764
+		// an EITHER DP gets an encode-on-write atlas holding ENCODED bytes, see
+		// below) it must use the LINEAR equivalent of #1a1a1a —
 		// otherwise the DP's output encode brightens it (~0.102→0.35), the
 		// "overexposed background". srgb_to_linear(0.102) ≈ 0.01034. This mirrors
 		// the compose_linear gate computed below (render_count == placed count).
@@ -15127,7 +15229,17 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		// encoding the DP receives.
 		const bool clear_linear = (cap0 == XRT_DP_COLOR_LINEAR || cap0 == XRT_DP_COLOR_EITHER) &&
 		                          placed_count > 1 && placed_srgb == placed_count;
-		const float bg = clear_linear ? 0.01034f : 0.102f; // #1a1a1a (linear vs encoded)
+		// #1764: the draws of this tick go through the `_SRGB` RTV when Model B
+		// can encode on write; re-decided below from `compose_linear` itself.
+		mc->combine_encodes_on_write = clear_linear && multi_combine_can_encode_on_write(mc, cap0);
+		// The clear ALWAYS goes through the byte-exact UNORM RTV, so the value
+		// is the byte the atlas must hold: encoded #1a1a1a whenever the atlas
+		// holds encoded bytes (Model A, and Model B encoding on write), and the
+		// linear equivalent only for a LINEAR-only DP, whose atlas still holds
+		// linear. (Not through the `_SRGB` view: whether a clear on an sRGB RTV
+		// encodes its colour is exactly the kind of rule this should not lean on.)
+		const bool atlas_holds_linear = clear_linear && !mc->combine_encodes_on_write;
+		const float bg = atlas_holds_linear ? 0.01034f : 0.102f; // #1a1a1a (linear vs encoded)
 		float bg_color[4] = {bg, bg, bg, 1.0f};
 		sys->context->ClearRenderTargetView(mc->combined_atlas_rtv.get(), bg_color);
 		// Phase 2.K: clear depth target to far (1.0) so the per-slot LESS
@@ -15196,7 +15308,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
 		sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
 		sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
-		ID3D11RenderTargetView *rtvs[] = {mc->combined_atlas_rtv.get()};
+		ID3D11RenderTargetView *rtvs[] = {multi_combine_rtv(mc)};
 		sys->context->OMSetRenderTargets(1, rtvs, nullptr);
 		sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
 		sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
@@ -15440,20 +15552,31 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	}
 	bool compose_linear = dp_accepts_linear && render_count > 1 && honest_srgb_count == render_count;
 
+	// #1764: the authoritative target choice for every draw below (the clear
+	// above made the same call from the placed set; the two agree whenever
+	// render_count == placed count). Model B + an EITHER DP composes through the
+	// `_SRGB` RTV: b1 still decodes each source, the ROP blends in linear, and
+	// the hardware re-encodes on write — so the 8-bit atlas holds ENCODED bytes
+	// and is handed off ENCODED (see pipeline_dp_set_encoding below).
+	mc->combine_encodes_on_write = compose_linear && multi_combine_can_encode_on_write(mc, dp_color_cap);
+
 	// On-change diagnostic: the compose-model decision + every gate input, so a
 	// "stuck on A" is attributable to dp_cap / layer-count / honest-sRGB.
 	{
 		static int last_key = -1;
 		const int key = (compose_linear ? 1 : 0) | ((int)dp_color_cap << 1) |
-		                (render_count << 4) | (honest_srgb_count << 8);
+		                (render_count << 4) | (honest_srgb_count << 8) |
+		                ((mc->combine_encodes_on_write ? 1 : 0) << 16);
 		if (key != last_key) {
 			last_key = key;
-			U_LOG_W("Color (ADR-021): model=%s  dp_cap=%d(%s) layers=%d honest_srgb=%d",
+			U_LOG_W("Color (ADR-021): model=%s  dp_cap=%d(%s) layers=%d honest_srgb=%d atlas=%s handoff=%s",
 			        compose_linear ? "B/linear" : "A/passthrough", (int)dp_color_cap,
 			        dp_color_cap == XRT_DP_COLOR_EITHER    ? "EITHER"
 			        : dp_color_cap == XRT_DP_COLOR_LINEAR ? "LINEAR"
 			                                              : "ENCODED",
-			        render_count, honest_srgb_count);
+			        render_count, honest_srgb_count,
+			        mc->combine_encodes_on_write ? "srgb-rtv(encode-on-write)" : "unorm-rtv",
+			        (compose_linear && !mc->combine_encodes_on_write) ? "LINEAR" : "ENCODED");
 		}
 	}
 
@@ -15531,8 +15654,12 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			//   Model B: the blit shader's b1-gated `srgb_to_linear` does the
 			//     decode on OUTPUT (uniformly for content + chrome), so we still
 			//     sample raw here and let the shader linearize. Using the sRGB
-			//     SRV too would double-decode. The atlas then holds linear bytes,
-			//     is declared LINEAR, and the DP performs the matched encode (§4).
+			//     SRV too would double-decode. The ROP blends that linear
+			//     output; since #1764 an EITHER DP's combine writes it through
+			//     the combined atlas's `_SRGB` RTV (re-encoded on write, handed
+			//     off ENCODED), and only a LINEAR-only DP still gets an atlas
+			//     holding linear bytes, declared LINEAR, with the DP performing
+			//     the matched encode (§4).
 			slot_srv = cc->render.atlas_srv.get();
 			cvw = mc->clients[s].content_view_w;
 			cvh = mc->clients[s].content_view_h;
@@ -15922,7 +16049,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				sys->context->PSSetSamplers(
 				    0, 1, sys->sampler_linear.addressof());
 				ID3D11RenderTargetView *spin_rtvs[] = {
-				    mc->combined_atlas_rtv.get()};
+				    multi_combine_rtv(mc)};
 				sys->context->OMSetRenderTargets(
 				    1, spin_rtvs, nullptr);
 				D3D11_VIEWPORT spin_vp = {};
@@ -16201,7 +16328,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				// Phase 2.K: bind DSV alongside the atlas RTV so the depth
 				// test resolves per-pixel occlusion between this window and
 				// other windows that have already rendered this frame.
-				ID3D11RenderTargetView *ca_rtvs[] = {mc->combined_atlas_rtv.get()};
+				ID3D11RenderTargetView *ca_rtvs[] = {multi_combine_rtv(mc)};
 				sys->context->OMSetRenderTargets(1, ca_rtvs, mc->combined_atlas_dsv.get());
 				D3D11_VIEWPORT vp = {};
 				vp.Width = static_cast<float>(ca_w);
@@ -16385,7 +16512,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 					sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
 					sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
 					sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
-					ID3D11RenderTargetView *cc_rtvs[] = {mc->combined_atlas_rtv.get()};
+					ID3D11RenderTargetView *cc_rtvs[] = {multi_combine_rtv(mc)};
 					sys->context->OMSetRenderTargets(1, cc_rtvs, mc->combined_atlas_dsv.get());
 					sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
 					sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
@@ -16560,7 +16687,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			// acquire above is deliberately outside it. See combine_ctx_lock.
 			combine_ctx_lock ctx_lock(sys);
 			sys->context->PSSetConstantBuffers(1, 1, sys->color_linearize_cb.addressof());
-			ID3D11RenderTargetView *ortvs[] = {mc->combined_atlas_rtv.get()};
+			ID3D11RenderTargetView *ortvs[] = {multi_combine_rtv(mc)};
 			sys->context->OMSetRenderTargets(1, ortvs, nullptr);
 			sys->context->OMSetBlendState(sys->blend_premul.get(), nullptr, 0xFFFFFFFF);
 			sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
@@ -16777,7 +16904,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			// acquire above is deliberately outside it. See combine_ctx_lock.
 			combine_ctx_lock ctx_lock(sys);
 			sys->context->PSSetConstantBuffers(1, 1, sys->color_linearize_cb.addressof());
-			ID3D11RenderTargetView *crtvs[] = {mc->combined_atlas_rtv.get()};
+			ID3D11RenderTargetView *crtvs[] = {multi_combine_rtv(mc)};
 			sys->context->OMSetRenderTargets(1, crtvs, nullptr);
 			sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
 			sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
@@ -17067,8 +17194,12 @@ multi_compositor_render(struct d3d11_service_system *sys)
 
 		// ADR-021: declare the encoding of the atlas we are sending out-of-band
 		// (append-only setter; the format arg stays the real DXGI format so
-		// older plug-ins are unaffected). LINEAR under Model B (the DP performs
-		// the matched output encode), ENCODED under Model A (passthrough).
+		// older plug-ins are unaffected). ENCODED under Model A (passthrough),
+		// and — since #1764 — ENCODED under Model B too whenever the combine
+		// encoded on write through the `_SRGB` RTV (an EITHER DP): the blend
+		// still happened in linear, the 8-bit atlas just no longer stores
+		// linear light. LINEAR only for Model B against a LINEAR-only DP, whose
+		// atlas still holds linear (the DP performs the matched output encode).
 		// #1016: same per-call ownership as the other two writers. The model
 		// decision itself is unchanged; what is new is that it is asserted
 		// through the shared tracker, and that the compose path also states
@@ -17078,8 +17209,10 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		// alpha-gate between compose ticks, and nothing flipped it back for
 		// the compose itself.
 		pipeline_dp_set_transparency(mc, compose_dp, /*client_presents*/ false, "compose");
-		pipeline_dp_set_encoding(
-		    mc, compose_dp, compose_linear ? XRT_ATLAS_ENCODING_LINEAR : XRT_ATLAS_ENCODING_ENCODED, "compose");
+		pipeline_dp_set_encoding(mc, compose_dp,
+		                         (compose_linear && !mc->combine_encodes_on_write) ? XRT_ATLAS_ENCODING_LINEAR
+		                                                                           : XRT_ATLAS_ENCODING_ENCODED,
+		                         "compose");
 		mc->weave_lat.mark_weave("workspace");
 		mc->panel_r_ns = mc->weave_lat.measured_weave_ns_fresh(); // fresh-or-0, see above
 		{
@@ -30059,6 +30192,7 @@ comp_d3d11_service_ensure_workspace_window(struct xrt_system_compositor *xsysc)
 			pipeline_dp_forget_beliefs(mc); // #1319
 		}
 		mc->back_buffer_rtv.reset();
+		mc->combined_atlas_rtv_srgb.reset();
 		mc->combined_atlas_rtv.reset();
 		mc->combined_atlas_srv.reset();
 		mc->combined_atlas.reset();
