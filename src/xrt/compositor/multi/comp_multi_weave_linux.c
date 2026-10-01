@@ -92,6 +92,7 @@
 #include "xrt/xrt_display_processor_vk.h"
 #include "xrt/xrt_display_metrics.h"
 #include "xrt/xrt_handles.h"
+#include "xrt/xrt_session.h"
 #include "xrt/xrt_weave_dmabuf.h"
 
 #include "util/u_misc.h"
@@ -981,6 +982,63 @@ weave_reset_acquire_sem(struct vk_bundle *vk, struct multi_compositor *mc)
  * in the Linux DP contract ties its creation to a thread, so the factory runs on
  * the IPC handler thread.
  */
+/*!
+ * Apply a HARDWARE 2D/3D request to the engine's own DP and, once the DP
+ * confirmed a CHANGE, tell this client's session (#961: the event follows the
+ * DP, never the bookkeeping). Call with mc->weave.mutex held and mc->weave.dp
+ * non-NULL. The vendor call is one lens-hint call (Leia: srLensDisable /
+ * srLensEnable under the plug-in's own context lock), so it is cheap enough
+ * for the IPC thread; the lock order weave.mutex -> vendor lock is the same one
+ * every submit already takes (process_atlas runs under weave.mutex).
+ *
+ * A DP without a request_display_mode slot is mode-neutral (sim_display by
+ * default): the request counts as accepted, as in the D3D11 service's
+ * dp_request_display_mode_confirmed. A DP that HAS the slot and returns false
+ * rejected it — nothing is recorded or reported, so the session never believes
+ * in a panel state the hardware did not reach.
+ */
+static bool
+weave_apply_display_mode_locked(struct multi_compositor *mc, bool want_3d, const char *why)
+{
+	struct xrt_display_processor *dp = mc->weave.dp;
+	const bool has_slot = XRT_DP_HAS_SLOT(dp, request_display_mode) && dp->request_display_mode != NULL;
+	const bool accepted = has_slot ? xrt_display_processor_request_display_mode(dp, want_3d) : true;
+	if (!accepted) {
+		U_LOG_W(
+		    "weave(#1699): the display processor REJECTED hardware %s (%s) — panel state unchanged, no "
+		    "event sent",
+		    want_3d ? "3D" : "2D", why);
+		return false;
+	}
+
+	const bool prev_3d = !mc->weave.hw_2d_confirmed;
+	mc->weave.hw_2d_confirmed = !want_3d;
+	if (prev_3d == want_3d) {
+		return true; // already there (a re-assert keeps a drifted vendor honest; nothing to report)
+	}
+
+	// One WARN per transition (a human-rate event: a tab switch, a page's mode
+	// choice), with the DP's own read-back so a hardware run can be read from
+	// the journal alone.
+	bool panel_3d = false;
+	const bool have_readback = xrt_display_processor_get_hardware_3d_state(dp, &panel_3d);
+	U_LOG_W(
+	    "weave(#1699): hardware %s -> %s (%s) on the weave engine's display processor (%s); DP reports the "
+	    "panel %s",
+	    prev_3d ? "3D" : "2D", want_3d ? "3D" : "2D", why,
+	    has_slot ? "request_display_mode accepted" : "mode-neutral DP, nothing to switch",
+	    have_readback ? (panel_3d ? "3D" : "2D") : "state unknown (no read-back)");
+
+	union xrt_session_event xse = {0};
+	xse.hardware_display_state_change.type = XRT_SESSION_EVENT_HARDWARE_DISPLAY_STATE_CHANGE;
+	xse.hardware_display_state_change.hardware_display_3d = want_3d;
+	const xrt_result_t xret = multi_compositor_push_event(mc, &xse);
+	if (xret != XRT_SUCCESS) {
+		U_LOG_W("weave(#1699): could not push the hardware-state event to the session: %d", xret);
+	}
+	return true;
+}
+
 static bool
 weave_ensure_engine(struct vk_bundle *vk, struct multi_compositor *mc)
 {
@@ -1085,6 +1143,14 @@ weave_ensure_engine(struct vk_bundle *vk, struct multi_compositor *mc)
 	    vk_dmabuf_supported(vk) ? "yes" : "NO (device lacks dma-buf / DRM modifier / foreign queue)",
 	    mc->weave.release_sem != VK_NULL_HANDLE ? "GPU (SYNC_FD semaphores)" : "none (CPU poll + synchronous)",
 	    (int)xrt_display_processor_is_self_submitting(mc->weave.dp));
+
+	// A hardware 2D request that arrived before this DP existed (the page asked
+	// for a flat panel before the first submit). 3D is the default, so only a
+	// 2D wish needs acting on — same shape as the Android session_render
+	// deferral in multi_compositor_init_session_render.
+	if (!mc->hardware_display_3d) {
+		(void)weave_apply_display_mode_locked(mc, false, "deferred request, applied at engine bring-up");
+	}
 	return true;
 }
 
@@ -2721,6 +2787,28 @@ comp_multi_weave_snap_window_rect(struct xrt_compositor *xc,
 	                                              origin_y, target_x, target_y, out_snapped_x, out_snapped_y);
 	os_mutex_unlock(&mc->weave.mutex);
 	return snapped;
+}
+
+bool
+comp_multi_weave_linux_request_display_mode(struct multi_compositor *mc, bool enable_3d)
+{
+	if (mc == NULL || mc->msc == NULL) {
+		return false;
+	}
+	weave_ensure_mutex(mc);
+	os_mutex_lock(&mc->weave.mutex);
+	// The standing wish: read again at engine bring-up if the DP is not there yet.
+	mc->hardware_display_3d = enable_3d;
+	bool ok = true;
+	if (mc->weave.dp != NULL) {
+		ok = weave_apply_display_mode_locked(mc, enable_3d, "xrRequestDisplayModeDXR");
+	} else if (!enable_3d) {
+		U_LOG_W(
+		    "weave(#1699): hardware 2D requested before the weave engine exists — recorded, applied when "
+		    "the engine comes up");
+	}
+	os_mutex_unlock(&mc->weave.mutex);
+	return ok;
 }
 
 void

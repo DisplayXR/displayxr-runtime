@@ -916,6 +916,14 @@ struct multi_compositor
 		uint32_t last_offpanel_band_count;
 		//! @}
 
+		/*!
+		 * Hardware 2D/3D as last CONFIRMED by mc->weave.dp and reported to
+		 * this client's session (comp_multi_weave_linux_request_display_mode).
+		 * Stored inverted so the zero-initialised struct means 3D, the state
+		 * every session starts in. The standing WISH is mc->hardware_display_3d.
+		 */
+		bool hw_2d_confirmed;
+
 		//! @name Flat regions (spec v8, browser#88, on desktop Linux)
 		//! The sticky screen-space latch (xrWeaveSetScreenFlatRegionsDXR),
 		//! absolute screen device px; a SET, count 0 clears. Unioned with
@@ -1493,6 +1501,28 @@ bool
 comp_multi_weave_set_screen_flat_regions(struct xrt_compositor *xc,
                                          uint32_t rect_count,
                                          const struct xrt_rect *screen_rects);
+
+/*!
+ * HARDWARE 2D/3D request (xrRequestDisplayModeDXR, #533) for a present-owner
+ * on desktop Linux — routed here by multi_compositor_request_display_mode,
+ * whose per-session-render branch a present-owner never reaches (it has no
+ * window, so session_render is never initialised). Applies the request to the
+ * weave engine's OWN display processor (mc->weave.dp — the only DP in the
+ * service process, the one holding the vendor's lens), inline on the calling
+ * (IPC) thread under mc->weave.mutex: a present-owner that asks for 2D has, by
+ * definition, stopped submitting, so a frame-gated apply would never run (the
+ * D3D11 service's #815 for the same browser#55 flow). Before the engine exists
+ * the wish is recorded and applied at engine bring-up.
+ *
+ * Emits XRT_SESSION_EVENT_HARDWARE_DISPLAY_STATE_CHANGE to this client's
+ * session only once the DP CONFIRMED a change (#961 semantics; a DP with no
+ * request_display_mode slot is mode-neutral and counts as accepted), and logs
+ * one WARN per transition with the DP's read-back panel state.
+ *
+ * @return true if the request was applied (or recorded for bring-up).
+ */
+bool
+comp_multi_weave_linux_request_display_mode(struct multi_compositor *mc, bool enable_3d);
 /*! @} */
 #endif // XRT_OS_LINUX_DESKTOP
 

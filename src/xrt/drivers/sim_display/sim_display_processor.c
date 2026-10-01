@@ -64,6 +64,21 @@ DEBUG_GET_ONCE_BOOL_OPTION(sim_display_strict_panel, "SIM_DISPLAY_STRICT_PANEL",
  */
 DEBUG_GET_ONCE_NUM_OPTION(sim_display_interlace_period, "SIM_DISPLAY_INTERLACE_PERIOD", 1)
 
+/*!
+ * Fake switchable lens (test double for the hardware 2D/3D channel).
+ *
+ * sim_display is mode-neutral by default: it has no lens, so its DP leaves the
+ * request_display_mode / get_hardware_3d_state slots NULL and the runtime
+ * treats a hardware request as "nothing to switch" (in-process compositors then
+ * fall back to the device's OUTPUT_MODE property). That keeps it honest, but it
+ * also makes a headless run blind to WHERE a hardware request lands — e.g.
+ * whether the desktop-Linux weave engine's own DP receives a present-owner's
+ * xrRequestDisplayModeDXR at all. With this option the DP fills both slots: it
+ * records the requested state, logs one WARN per transition and reports it back,
+ * like a vendor lens would. Off by default, so default behaviour is unchanged.
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(sim_display_fake_lens, "SIM_DISPLAY_FAKE_LENS", false)
+
 // SPIR-V shader headers (generated at build time by spirv_shaders())
 #include "sim_display/shaders/fullscreen.vert.h"
 #include "sim_display/shaders/anaglyph.frag.h"
@@ -145,6 +160,9 @@ struct sim_display_processor
 	uint32_t geom_last_target_w, geom_last_target_h;
 	int32_t geom_last_canvas_x, geom_last_canvas_y;
 	uint32_t geom_last_canvas_w, geom_last_canvas_h;
+
+	//! SIM_DISPLAY_FAKE_LENS — the fake lens state (true = 3D, the default).
+	bool fake_lens_3d;
 };
 
 static inline struct sim_display_processor *
@@ -686,6 +704,31 @@ sim_dp_get_predicted_eye_positions(struct xrt_display_processor *xdp, struct xrt
 	return true;
 }
 
+//! SIM_DISPLAY_FAKE_LENS: record the request (one WARN per transition).
+static bool
+sim_dp_request_display_mode(struct xrt_display_processor *xdp, bool enable_3d)
+{
+	struct sim_display_processor *sdp = sim_display_processor(xdp);
+	if (sdp->fake_lens_3d != enable_3d) {
+		U_LOG_W("sim_display: fake lens %s -> %s (request_display_mode on DP %p)",
+		        sdp->fake_lens_3d ? "3D" : "2D", enable_3d ? "3D" : "2D", (void *)xdp);
+	}
+	sdp->fake_lens_3d = enable_3d;
+	return true;
+}
+
+//! SIM_DISPLAY_FAKE_LENS: report the recorded state.
+static bool
+sim_dp_get_hardware_3d_state(struct xrt_display_processor *xdp, bool *out_is_3d)
+{
+	struct sim_display_processor *sdp = sim_display_processor(xdp);
+	if (out_is_3d == NULL) {
+		return false;
+	}
+	*out_is_3d = sdp->fake_lens_3d;
+	return true;
+}
+
 static VkRenderPass
 sim_dp_get_render_pass(struct xrt_display_processor *xdp)
 {
@@ -994,6 +1037,14 @@ sim_display_processor_create(enum sim_display_output_mode mode,
 	sdp->base_vk.base.get_local_zone_caps = sim_dp_get_local_zone_caps;                   // #224 / ADR-027
 	sdp->base_vk.base.publish_local_zone_mask = sim_dp_publish_local_zone_mask;           // #224 / ADR-027
 	sdp->base_vk.base.clear_local_zone_mask = sim_dp_clear_local_zone_mask;               // #224 / ADR-027
+
+	// Fake switchable lens: off by default (the slots stay NULL = mode-neutral).
+	sdp->fake_lens_3d = true;
+	if (debug_get_bool_option_sim_display_fake_lens()) {
+		sdp->base_vk.base.request_display_mode = sim_dp_request_display_mode;
+		sdp->base_vk.base.get_hardware_3d_state = sim_dp_get_hardware_3d_state;
+		U_LOG_W("sim_display: SIM_DISPLAY_FAKE_LENS — this DP (%p) reports a switchable lens", (void *)sdp);
+	}
 
 	// #224 / ADR-027 zone test double config (shared parser).
 	sim_zone_config_from_env(&sdp->zone_cfg, "VK");

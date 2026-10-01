@@ -76,6 +76,15 @@
  *                      code 0 = PASS.
  *                      --test-resize=WxH@N reallocates mid-run, as a window
  *                      resize or F11 does.
+ *   --test-display-mode  (headless) drive the hardware 2D/3D channel the way
+ *                      the browser's tab policy does: xrRequestDisplayModeDXR
+ *                      (2D) BEFORE the first submit (the weave engine does not
+ *                      exist yet: recorded, applied at bring-up), 3D at frame
+ *                      30, 2D at frame 50; require exactly the events
+ *                      XrEventDataHardwareDisplayStateChangedDXR 2D, 3D, 2D,
+ *                      each arriving before the next request. Pair it with a
+ *                      service started with SIM_DISPLAY_FAKE_LENS=1 so the
+ *                      weave engine's DP records + logs each request.
  *   --lattice-selftest one Wayland drag-lattice table build per output scale
  *                      (100 %, 200 %, 150 %) through the helper's own table
  *                      code (dxr_wl_lattice::probe_via_grid) and the SAME
@@ -217,6 +226,7 @@ struct Options
 	uint32_t resize_w = 0, resize_h = 0;
 	int resize_frame = -1;
 	bool lattice_selftest = false; //!< --lattice-selftest
+	bool test_display_mode = false; //!< --test-display-mode (headless)
 };
 
 static void
@@ -247,6 +257,8 @@ usage(const char *argv0)
 	        "service's fd count to stay flat\n"
 	        "  --test-resize=WxH@N          (headless) reallocate at frame N, "
 	        "like a window resize\n"
+	        "  --test-display-mode          (headless) request hardware 2D/3D/2D "
+	        "and require the matching events\n"
 	        "  --lattice-selftest           build one drag-lattice table per "
 	        "scale via the grid provider (exit 1 = FAIL)\n"
 	        "  --dump-dir=DIR               where PNGs go (default $TMPDIR, else "
@@ -302,6 +314,8 @@ parse_args(int argc, char **argv, Options &o)
 		} else if (sscanf(a, "--test-resize=%ux%u@%d", &o.resize_w, &o.resize_h, &o.resize_frame) == 3) {
 		} else if (strcmp(a, "--lattice-selftest") == 0) {
 			o.lattice_selftest = true;
+		} else if (strcmp(a, "--test-display-mode") == 0) {
+			o.test_display_mode = true;
 		} else if (strncmp(a, "--dump-dir=", 11) == 0) {
 			o.dump_dir = a + 11;
 		} else if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) {
@@ -355,6 +369,10 @@ struct App
 	PFN_xrWeaveBindWindow2DXR pfn_bind2 = nullptr;
 	PFN_xrWeaveSubmitDXR pfn_submit = nullptr;
 	PFN_xrWeaveSnapWindowRectDXR pfn_snap = nullptr;
+	PFN_xrRequestDisplayModeDXR pfn_request_display_mode = nullptr; //!< --test-display-mode
+	//! --test-display-mode: every XrEventDataHardwareDisplayStateChangedDXR, in order.
+	std::vector<bool> hw_events;
+	bool dm_order_bad = false; //!< --test-display-mode: an event missing before the next request, or a failed call
 	bool has_display_info = false;
 	int32_t panel_left = 0, panel_top = 0;
 	uint32_t panel_w = 0, panel_h = 0;
@@ -821,6 +839,10 @@ init_session()
 	xrGetInstanceProcAddr(g.instance, "xrWeaveBindWindow2DXR", (PFN_xrVoidFunction *)&g.pfn_bind2);
 	xrGetInstanceProcAddr(g.instance, "xrWeaveSubmitDXR", (PFN_xrVoidFunction *)&g.pfn_submit);
 	xrGetInstanceProcAddr(g.instance, "xrWeaveSnapWindowRectDXR", (PFN_xrVoidFunction *)&g.pfn_snap);
+	if (g.opt.test_display_mode && g.has_display_info) {
+		xrGetInstanceProcAddr(g.instance, "xrRequestDisplayModeDXR",
+		                      (PFN_xrVoidFunction *)&g.pfn_request_display_mode);
+	}
 	if (!g.pfn_bind2 || !g.pfn_submit || !g.pfn_snap) {
 		LOGE("weave entry points missing");
 		return false;
@@ -2270,6 +2292,11 @@ poll_xr_events()
 		} else if (ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
 			LOGW("instance loss pending — leaving");
 			return false;
+		} else if (ev.type == XR_TYPE_EVENT_DATA_HARDWARE_DISPLAY_STATE_CHANGED_DXR) {
+			const auto *h = (const XrEventDataHardwareDisplayStateChangedDXR *)&ev;
+			g.hw_events.push_back(h->hardwareDisplay3D == XR_TRUE);
+			LOGI("event: hardware display state -> %s (frame %llu)", h->hardwareDisplay3D ? "3D" : "2D",
+			     (unsigned long long)g.frame);
 		}
 		ev = {XR_TYPE_EVENT_DATA_BUFFER};
 	}
@@ -2314,6 +2341,28 @@ run()
 		}
 		if (!poll_xr_events()) {
 			break;
+		}
+		if (g.opt.test_display_mode && g.pfn_request_display_mode != nullptr) {
+			// The browser's tab policy: 2D before the first weave (the engine
+			// does not exist yet), 3D on an inline-3D tab, 2D again on a plain tab.
+			const int step = f == 0 ? 0 : f == 30 ? 1 : f == 50 ? 2 : -1;
+			if (step >= 0) {
+				// Every earlier request's event must already be here (the
+				// runtime answers each on the request's own IPC call, or at
+				// engine bring-up on the first submit).
+				if ((int)g.hw_events.size() != step) {
+					LOGE("display-mode test: %zu event(s) before request #%d, expected %d", g.hw_events.size(),
+					     step, step);
+					g.dm_order_bad = true;
+				}
+				const bool want_3d = step == 1;
+				const XrResult r = g.pfn_request_display_mode(
+				    g.session, want_3d ? XR_DISPLAY_MODE_3D_DXR : XR_DISPLAY_MODE_2D_DXR);
+				LOGI("frame %d: xrRequestDisplayModeDXR(%s) -> %d", f, want_3d ? "3D" : "2D", (int)r);
+				if (XR_FAILED(r)) {
+					g.dm_order_bad = true;
+				}
+			}
 		}
 
 		if (!g.headless) {
@@ -2468,6 +2517,12 @@ run()
 	check(g.v12.outputs > 0 && g.v12.logical_bad == 0, "v12 logical origin + scale echoed verbatim");
 	check(g.v12.outputs > 0 && g.v12.serial_bad == 0, "v12 serial strictly increasing per output");
 	check(total < 8 || g.v12.distinct >= 2, "v12 woven origin followed the re-binds");
+	if (g.opt.test_display_mode) {
+		const std::vector<bool> want = {false, true, false};
+		check(g.pfn_request_display_mode != nullptr && total > 55, "display-mode: xrRequestDisplayModeDXR resolved");
+		check(!g.dm_order_bad, "display-mode: each event arrived before the next request");
+		check(g.hw_events == want, "display-mode: events 2D, 3D, 2D (DP-confirmed)");
+	}
 	LOGI("%s", pass ? "PASS" : "FAIL");
 	return pass ? 0 : 1;
 }
