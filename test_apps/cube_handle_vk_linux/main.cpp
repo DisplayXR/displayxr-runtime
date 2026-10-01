@@ -8,11 +8,14 @@
  * OpenXR. Handle class: the app creates and owns its toplevel window and hands
  * it to the runtime — the Phase 3 validation vehicle for app-provided windows
  * on desktop Linux (docs/roadmap/linux-support.md, #660). Adapted from
- * cube_hosted_legacy_vk_linux; the render path (fixed 2-view SBS, no mode
- * adaptation) is unchanged — the delta is the window + binding.
- * XR_DXR_display_info is enabled (when present) solely for the INV-1.3 panel
+ * cube_hosted_legacy_vk_linux; the delta is the window + binding.
+ * XR_DXR_display_info is enabled (when present) for the INV-1.3 panel
  * desktop-position query (#715), which also moves view sizing off the
- * legacy-compromise path.
+ * legacy-compromise path, and for the display rendering-mode keys every
+ * DisplayXR app has: V cycles to the next mode, 0-8 select mode N (0 = 2D),
+ * via xrRequestDisplayRenderingModeDXR. The app is stereo (at most 2 views
+ * rendered); tile size and grid follow the ACTIVE mode, so 2D renders one
+ * full-window view and the second located view aliases it (ADR-041).
  *
  * ONE BINARY, TWO WINDOW BACKENDS, chosen at runtime (`--platform=` /
  * DXR_WINDOW_BACKEND, default auto — a capability probe, never session env):
@@ -39,6 +42,9 @@
 // wl_display / wl_surface types instead of their self-contained stand-ins.
 #include "dxr_linux_window.h"
 #include "dxr_weave_snap.h"
+
+// XK_* keysyms: DxrWindowEvent carries the X11 keysym on both backends.
+#include <X11/keysym.h>
 
 #include <vulkan/vulkan.h>
 
@@ -145,19 +151,47 @@ static uint64_t g_frameCounter = 0;
 //! plain bool*; copied back into g_running right after each pump.
 static bool g_windowRunning = true;
 
+// Rendering-mode key requests, set by OnWindowEvent and consumed by the frame
+// loop (the request is a session call, so it is issued from the loop, never
+// from inside the window pump). Same flags as displayxr-common's Windows
+// input_handler (cycleRenderingModeRequested / absoluteRenderingModeRequested).
+static bool g_cycleRenderingModeRequested = false;       // V
+static int32_t g_absoluteRenderingModeRequested = -1;    // 0-8; -1 = none
+
 /*!
- * Key handler. X11 keeps its historical behaviour to the letter — this app has
- * never bound a key there, and the window manager's close button plus SIGINT
- * are the exits. On Wayland a fullscreen surface has no close affordance at
- * all, so ESC / Q are wired up as the only way out short of a signal.
+ * Key handler, fed by pump_events() so it sees keysyms: DxrKey has no 0 or 4-8.
+ *
+ * Both backends: V cycles to the next display rendering mode, 0-8 select mode
+ * N (0 = 2D) when N is below the runtime's mode count (checked in the frame
+ * loop). Auto-repeat presses are ignored, so holding V does not spin modes.
+ *
+ * Wayland only: ESC / Q exit — a fullscreen surface has no close affordance,
+ * so they are the only way out short of a signal. X11 keeps its historical
+ * exits (the window manager's close button and SIGINT) and binds neither.
  */
-static void OnWindowKey(DxrKey key) {
-    if (g_window.backend() != DxrWindowBackend::Wayland) {
+static void OnWindowEvent(const DxrWindowEvent& ev) {
+    if (ev.type != DxrWindowEvent::Type::KeyDown || ev.repeat) {
         return;
     }
-    if (key == DxrKey::Escape || key == DxrKey::Q) {
-        LOG_INFO("Exit key — exiting");
-        g_windowRunning = false;
+    switch (ev.keysym) {
+    case XK_v:
+    case XK_V:
+        g_cycleRenderingModeRequested = true;
+        return;
+    case XK_0: case XK_1: case XK_2: case XK_3: case XK_4:
+    case XK_5: case XK_6: case XK_7: case XK_8:
+        g_absoluteRenderingModeRequested = (int32_t)(ev.keysym - XK_0);
+        return;
+    case XK_Escape:
+    case XK_q:
+    case XK_Q:
+        if (g_window.backend() == DxrWindowBackend::Wayland) {
+            LOG_INFO("Exit key — exiting");
+            g_windowRunning = false;
+        }
+        return;
+    default:
+        return;
     }
 }
 
@@ -1973,6 +2007,20 @@ struct AppXrSession {
     // resolved to. Set by InitializeOpenXR from --backend / DXR_WINDOW_BACKEND
     // + what the runtime advertises; consumed when the window is created.
     DxrWindowBackend windowBackend = DxrWindowBackend::Auto;
+
+    // ---- Display rendering modes (XR_DXR_display_info v8+/v10/v13) ----
+    // Resolved only when display_info is enabled; null = the mode keys are
+    // no-ops. The runtime owns the current mode: currentModeIndex is seeded
+    // from the enumerated isActive flag and then follows
+    // XrEventDataRenderingModeChangedDXR — the app never assumes its request
+    // landed.
+    PFN_xrRequestDisplayRenderingModeDXR pfnRequestDisplayRenderingMode = nullptr;
+    PFN_xrEnumerateDisplayRenderingModesDXR pfnEnumerateDisplayRenderingModes = nullptr;
+    static constexpr uint32_t kMaxModes = 9; // keys 0-8
+    uint32_t renderingModeCount = 0;
+    uint32_t currentModeIndex = 0;
+    bool haveCurrentMode = false;
+    XrDisplayRenderingModeInfoDXR modes[kMaxModes] = {};
 };
 
 static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend) {
@@ -2051,12 +2099,13 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
                                     : XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME);
     if (hasDisplayInfo) {
         // Enabled for the INV-1.3 panel desktop-position query below (#715).
-        // NOTE: enabling XR_DXR_display_info also switches the runtime's view
-        // sizing off the legacy-app compromise path — the app still renders a
-        // fixed 2-view SBS at whatever dimensions xrEnumerateViewConfigurationViews
-        // reports at init, and does not adapt to later mode changes.
+        // Also the rendering-mode keys (V / 0-8): mode enumeration, the request
+        // entry point and XrEventDataRenderingModeChangedDXR all live here.
+        // Enabling it switches the runtime's view sizing off the legacy-app
+        // compromise path; the render loop sizes its tiles from the ACTIVE
+        // mode's scale/tile grid, so a mode change is followed per frame.
         enabledExtensions.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
-        LOG_INFO("XR_DXR_display_info: AVAILABLE (enabled for panel position + dims)");
+        LOG_INFO("XR_DXR_display_info: AVAILABLE (enabled for panel position + dims + rendering modes)");
     }
     // XR_DXR_view_rig (#396 W7): the app chains XrDisplayRigDXR on every
     // xrLocateViews and the runtime does the window-relative Kooima (window
@@ -2097,6 +2146,15 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
 
     XR_CHECK(xrCreateInstance(&createInfo, &xr.instance));
     LOG_INFO("OpenXR instance created");
+
+    // Rendering-mode entry points (keys V / 0-8). Absent extension or function
+    // leaves them null and the keys become no-ops (logged once at session).
+    if (hasDisplayInfo) {
+        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeDXR",
+                              (PFN_xrVoidFunction*)&xr.pfnRequestDisplayRenderingMode);
+        xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesDXR",
+                              (PFN_xrVoidFunction*)&xr.pfnEnumerateDisplayRenderingModes);
+    }
 
     XrSystemGetInfo systemInfo = {XR_TYPE_SYSTEM_GET_INFO};
     systemInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
@@ -2305,6 +2363,87 @@ static bool CreateVulkanDevice(AppXrSession& xr, VkPhysicalDevice physDevice, ui
     return true;
 }
 
+//! (Re)read the runtime's rendering-mode table and the active mode. Called once
+//! after xrCreateSession; the active mode then follows the mode-changed event.
+static void EnumerateRenderingModes(AppXrSession& xr) {
+    if (xr.pfnEnumerateDisplayRenderingModes == nullptr || xr.session == XR_NULL_HANDLE) {
+        return;
+    }
+    uint32_t count = 0;
+    if (XR_FAILED(xr.pfnEnumerateDisplayRenderingModes(xr.session, 0, &count, nullptr)) || count == 0) {
+        return;
+    }
+    std::vector<XrDisplayRenderingModeInfoDXR> modes(count, {XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR});
+    if (XR_FAILED(xr.pfnEnumerateDisplayRenderingModes(xr.session, count, &count, modes.data()))) {
+        return;
+    }
+    xr.renderingModeCount = count > AppXrSession::kMaxModes ? AppXrSession::kMaxModes : count;
+    LOG_INFO("Display rendering modes (%u):", count);
+    for (uint32_t i = 0; i < xr.renderingModeCount; i++) {
+        xr.modes[i] = modes[i];
+        xr.modes[i].next = nullptr;
+        if (modes[i].isActive) {
+            xr.currentModeIndex = modes[i].modeIndex;
+            xr.haveCurrentMode = true;
+        }
+        LOG_INFO("  [%u] %s (views=%u, tiles=%ux%u, scale=%.2fx%.2f, 3D=%s%s%s)", modes[i].modeIndex,
+                 modes[i].modeName, modes[i].viewCount, modes[i].tileColumns, modes[i].tileRows,
+                 modes[i].viewScaleX, modes[i].viewScaleY, modes[i].hardwareDisplay3D ? "yes" : "no",
+                 modes[i].isActive ? ", active" : "", modes[i].isRequestable ? "" : ", locked by workspace");
+    }
+}
+
+//! The table entry for the active mode, or null before the runtime reported one.
+static const XrDisplayRenderingModeInfoDXR* ActiveRenderingMode(const AppXrSession& xr) {
+    if (!xr.haveCurrentMode) {
+        return nullptr;
+    }
+    for (uint32_t i = 0; i < xr.renderingModeCount; i++) {
+        if (xr.modes[i].modeIndex == xr.currentModeIndex) {
+            return &xr.modes[i];
+        }
+    }
+    return nullptr;
+}
+
+/*!
+ * Turn the key flags into at most one xrRequestDisplayRenderingModeDXR, on the
+ * frame-loop thread. Mirrors displayxr-common's xr_session_common.cpp: V goes to
+ * (current + 1) % count, 0-8 only when N < count. The current mode is NOT
+ * updated here — XrEventDataRenderingModeChangedDXR does that.
+ */
+static void ProcessRenderingModeKeys(AppXrSession& xr) {
+    const bool cycle = g_cycleRenderingModeRequested;
+    const int32_t absolute = g_absoluteRenderingModeRequested;
+    g_cycleRenderingModeRequested = false;
+    g_absoluteRenderingModeRequested = -1;
+    if (!cycle && absolute < 0) {
+        return;
+    }
+    if (xr.pfnRequestDisplayRenderingMode == nullptr || xr.renderingModeCount == 0 ||
+        xr.session == XR_NULL_HANDLE) {
+        return; // no-op; said so once at session creation
+    }
+    int32_t target = -1;
+    if (cycle) {
+        target = (int32_t)((xr.currentModeIndex + 1) % xr.renderingModeCount);
+    }
+    if (absolute >= 0) {
+        if ((uint32_t)absolute < xr.renderingModeCount) {
+            target = absolute;
+        } else {
+            LOG_INFO("Mode key %d ignored: the runtime has %u rendering modes", absolute,
+                     xr.renderingModeCount);
+        }
+    }
+    if (target < 0) {
+        return;
+    }
+    const XrResult r = xr.pfnRequestDisplayRenderingMode(xr.session, (uint32_t)target);
+    LOG_INFO("Rendering mode request %u -> %d (%s): %s", xr.currentModeIndex, target,
+             cycle && absolute < 0 ? "V" : "digit", XR_SUCCEEDED(r) ? "ok" : "FAILED");
+}
+
 static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDevice physDevice,
     VkDevice device, uint32_t queueFamilyIndex)
 {
@@ -2366,6 +2505,14 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
              DxrLinuxWindow::backend_name(g_window.backend()),
              g_window.required_openxr_extension(), g_window.describe().c_str());
 
+    EnumerateRenderingModes(xr);
+    if (xr.pfnRequestDisplayRenderingMode == nullptr || xr.renderingModeCount == 0) {
+        LOG_INFO("Rendering-mode keys [V] / [0-8] are no-ops: %s",
+                 xr.pfnRequestDisplayRenderingMode == nullptr
+                     ? "xrRequestDisplayRenderingModeDXR unavailable (XR_DXR_display_info absent or too old)"
+                     : "the runtime enumerated no rendering modes");
+    }
+
     return true;
 }
 
@@ -2417,9 +2564,28 @@ static bool CreateSwapchain(AppXrSession& xr) {
 
     const auto& view = xr.configViews[0];
 
-    // Legacy: use recommendedImageRectWidth * 2 (stereo SBS) since no modes are enumerated
+    // Worst case across the enumerated rendering modes (ADR-010): each mode
+    // needs cols x (display x scaleX) by rows x (display x scaleY) — the 2-view
+    // SBS mode and 2D both fit a display-sized atlas, so a mode switch never
+    // needs a new swapchain. Without a mode table (no display_info), keep the
+    // historical 2-view SBS envelope.
     uint32_t scWidth = view.recommendedImageRectWidth * 2;
     uint32_t scHeight = view.recommendedImageRectHeight;
+    if (xr.renderingModeCount > 0 && xr.displayPixelWidth > 0 && xr.displayPixelHeight > 0) {
+        for (uint32_t i = 0; i < xr.renderingModeCount; i++) {
+            const XrDisplayRenderingModeInfoDXR& m = xr.modes[i];
+            const uint32_t cols = m.tileColumns > 0 ? m.tileColumns : 1;
+            const uint32_t rows = m.tileRows > 0 ? m.tileRows : 1;
+            const float sx = m.viewScaleX > 0.0f ? m.viewScaleX : 1.0f;
+            const float sy = m.viewScaleY > 0.0f ? m.viewScaleY : 1.0f;
+            const uint32_t w = cols * (uint32_t)std::ceil(xr.displayPixelWidth * sx);
+            const uint32_t h = rows * (uint32_t)std::ceil(xr.displayPixelHeight * sy);
+            if (w > scWidth) scWidth = w;
+            if (h > scHeight) scHeight = h;
+        }
+    }
+    if (view.maxImageRectWidth > 0 && scWidth > view.maxImageRectWidth) scWidth = view.maxImageRectWidth;
+    if (view.maxImageRectHeight > 0 && scHeight > view.maxImageRectHeight) scHeight = view.maxImageRectHeight;
 
     XrSwapchainCreateInfo swapchainInfo = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
     swapchainInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
@@ -2484,7 +2650,18 @@ static bool PollEvents(AppXrSession& xr) {
         case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
             xr.exitRequested = true;
             break;
-        // Legacy app: no rendering mode events (XR_DXR_display_info not enabled)
+        case XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR: {
+            auto* modeEvent = (XrEventDataRenderingModeChangedDXR*)&event;
+            xr.currentModeIndex = modeEvent->currentModeIndex;
+            xr.haveCurrentMode = true;
+            const XrDisplayRenderingModeInfoDXR* m = ActiveRenderingMode(xr);
+            LOG_INFO("Rendering mode changed: %u -> %u (%s)", modeEvent->previousModeIndex,
+                     modeEvent->currentModeIndex, m ? m->modeName : "?");
+            break;
+        }
+        case XR_TYPE_EVENT_DATA_DISPLAY_MODE_REQUEST_DENIED_DXR:
+            LOG_INFO("Rendering mode request denied by the runtime (workspace-locked or unsupported)");
+            break;
         default:
             break;
         }
@@ -2878,6 +3055,8 @@ int main(int argc, char** argv) {
     }
 
     LOG_INFO("=== Entering main loop (Ctrl+C to exit) ===");
+    LOG_INFO("Keys: [V] Mode  [0-8] Mode N%s",
+             g_window.backend() == DxrWindowBackend::Wayland ? "  [Esc/Q] Quit" : "");
 
     // Frame timing
     auto lastTime = std::chrono::high_resolution_clock::now();
@@ -2924,10 +3103,12 @@ int main(int argc, char** argv) {
         // The runtime pumps neither window system, so the app must. On Wayland
         // this is also what answers xdg_wm_base.ping — miss it and the
         // compositor kills the client as unresponsive.
-        g_window.pump(OnWindowKey, &g_windowRunning);
+        g_window.pump_events(OnWindowEvent, &g_windowRunning);
         if (!g_windowRunning) {
             g_running = false; // one-way: never resurrect a SIGINT-cleared flag
         }
+        // V / 0-8 → xrRequestDisplayRenderingModeDXR, from the frame loop.
+        ProcessRenderingModeKeys(xr);
 
         // TEST HOOK (DXR_CUBE_TEST_RESIZE, off by default): declare a different
         // surface size once, so the runtime's Wayland resize-follow can be
@@ -3009,9 +3190,34 @@ int main(int argc, char** argv) {
                             // ADR-041: the layer carries the LOCATED count;
                             // only the active views are rendered, the tail
                             // aliases view 0 and the runtime drops it.
+                            //
+                            // Mode-following (V / 0-8): the ACTIVE rendering
+                            // mode supplies scale + tile grid. A 2D mode
+                            // (hardwareDisplay3D false) renders ONE view at
+                            // window x scale (1.0) and aliases the other; a
+                            // 3D mode renders up to 2 views (this app is
+                            // stereo) into the mode's grid. No mode table →
+                            // the init-time display_info scale, 2-view SBS.
                             const uint32_t locatedCount =
                                 (viewCount > 0) ? viewCount : 2;
+                            const XrDisplayRenderingModeInfoDXR* mode = ActiveRenderingMode(xr);
+                            float scaleX = xr.viewScaleX, scaleY = xr.viewScaleY;
+                            uint32_t tileCols = 2, tileRows = 1;
                             uint32_t eyeCount = 2;
+                            if (mode != nullptr) {
+                                if (mode->viewScaleX > 0.0f) scaleX = mode->viewScaleX;
+                                if (mode->viewScaleY > 0.0f) scaleY = mode->viewScaleY;
+                                tileCols = mode->tileColumns > 0 ? mode->tileColumns : 1;
+                                tileRows = mode->tileRows > 0 ? mode->tileRows : 1;
+                                // DXR_STEREO_FIXED_APP: hard cap at 2 — the
+                                // session stays PRIMARY_STEREO and always
+                                // submits the 2 located views (ADR-041 alias).
+                                eyeCount = (mode->hardwareDisplay3D && mode->viewCount > 1) ? 2 : 1;
+                                if (eyeCount == 1) {
+                                    tileCols = 1;
+                                    tileRows = 1;
+                                }
+                            }
                             if (eyeCount > locatedCount)
                               eyeCount = locatedCount;
                             uint32_t winW = 0, winH = 0;
@@ -3021,23 +3227,25 @@ int main(int argc, char** argv) {
                             }
                             uint32_t eyeW, eyeH;
                             if (winW > 0 && winH > 0) {
-                                eyeW = (uint32_t)(winW * xr.viewScaleX);
-                                eyeH = (uint32_t)(winH * xr.viewScaleY);
+                                eyeW = (uint32_t)(winW * scaleX);
+                                eyeH = (uint32_t)(winH * scaleY);
                             } else {
                                 eyeW = xr.viewWidth;   // fallback: recommended (fullscreen envelope)
                                 eyeH = xr.viewHeight;
                             }
-                            // Clamp to the worst-case swapchain (SBS packs 2 tiles wide).
+                            // Clamp to one tile of the worst-case swapchain.
                             if (eyeW == 0) eyeW = 1;
                             if (eyeH == 0) eyeH = 1;
-                            if (eyeW > xr.swapchain.width / eyeCount) eyeW = xr.swapchain.width / eyeCount;
-                            if (eyeH > xr.swapchain.height) eyeH = xr.swapchain.height;
+                            if (eyeW > xr.swapchain.width / tileCols) eyeW = xr.swapchain.width / tileCols;
+                            if (eyeH > xr.swapchain.height / tileRows) eyeH = xr.swapchain.height / tileRows;
 
                             EyeRenderParams eyeParams[2];
                             projectionViews.resize(locatedCount, {});
                             for (uint32_t i = 0; i < eyeCount; i++) {
-                                eyeParams[i].viewportX = i * eyeW;  // SBS: left eye at 0, right at eyeW
-                                eyeParams[i].viewportY = 0;
+                                const uint32_t tileX = i % tileCols;
+                                const uint32_t tileY = i / tileCols;
+                                eyeParams[i].viewportX = tileX * eyeW;
+                                eyeParams[i].viewportY = tileY * eyeH;
                                 eyeParams[i].width = eyeW;
                                 eyeParams[i].height = eyeH;
                                 mat4_view_from_xr_pose(eyeParams[i].viewMat, views[i].pose);
@@ -3063,7 +3271,8 @@ int main(int argc, char** argv) {
 
                                 projectionViews[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
                                 projectionViews[i].subImage.swapchain = xr.swapchain.swapchain;
-                                projectionViews[i].subImage.imageRect.offset = {(int32_t)(i * eyeW), 0};
+                                projectionViews[i].subImage.imageRect.offset = {
+                                    (int32_t)eyeParams[i].viewportX, (int32_t)eyeParams[i].viewportY};
                                 projectionViews[i].subImage.imageRect.extent = {(int32_t)eyeW, (int32_t)eyeH};
                                 projectionViews[i].subImage.imageArrayIndex = 0;
                                 projectionViews[i].pose = views[i].pose;
