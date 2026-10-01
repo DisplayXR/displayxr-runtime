@@ -118,6 +118,41 @@ jobs:
       # separate repos as plug-in DLLs (see DisplayXR/displayxr-leia-plugin
       # and docs/guides/vendor-plugin-onboarding.md).
 
+      # vcpkg binary cache (#1773). Without one, every run rebuilds every port
+      # from source and re-downloads every upstream archive, so any upstream
+      # host outage (SourceForge vs pthreads, 2026-10) is a hard CI stop.
+      # run-vcpkg@v11 defaults VCPKG_BINARY_SOURCES to `x-gha`, a backend
+      # vcpkg has removed (it only logs a warning), so nothing was cached.
+      # run-vcpkg leaves an already-set VCPKG_BINARY_SOURCES alone, so set a
+      # `files` provider here and persist it with actions/cache.
+      #
+      # vcpkg keys each package by its own ABI hash (port files, triplet,
+      # compiler, deps), so a stale entry can never be used for the wrong
+      # build. The cache key only decides what gets saved: vcpkg commit +
+      # triplet + runner image (compiler) + manifest/overlay hash. A miss
+      # falls back to the newest entry for the same vcpkg commit + triplet
+      # (restore-keys), and every package whose ABI still matches is reused.
+      - name: Configure vcpkg binary cache
+        id: vcpkg-bincache
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'vcpkg-bincache'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          Add-Content -Path $env:GITHUB_ENV -Value "VCPKG_BINARY_SOURCES=clear;files,$dir,readwrite"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "dir=$dir"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "image=$env:ImageOS-$env:ImageVersion"
+
+      - name: Restore vcpkg binary cache
+        id: vcpkg-bincache-restore
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.vcpkg-bincache.outputs.dir }}
+          key: vcpkg-bin-x64-windows-5d90b0d5-${{ steps.vcpkg-bincache.outputs.image }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'cmake/vcpkg-overlay-ports/**', 'cmake/vcpkg-overlay-triplets/**') }}
+          restore-keys: |
+            vcpkg-bin-x64-windows-5d90b0d5-
+
       - name: Restore from cache and setup vcpkg executable and data files.
         if: needs.DetectChanges.outputs.docs_only != 'true'
         uses: lukka/run-vcpkg@v11
@@ -215,6 +250,7 @@ jobs:
           Select-String -Path CMakeLists.txt -Pattern '^\s*VERSION\s+\d+\.\d+\.\d+\s*$' | Select-Object -First 1
 
       - name: Generate
+        id: generate
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           cmake -S . -B build -G "Ninja Multi-Config" `
@@ -227,6 +263,19 @@ jobs:
             -DXRT_FEATURE_HYBRID_MODE=ON `
             -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk" `
             -DBUILD_NUM="${{ github.run_number }}"
+
+      # Save right after the last vcpkg install (Generate adds the `gui`
+      # feature's ports), not at job end, so a later compile or test failure
+      # still keeps the packages. Only after a successful Generate, so a
+      # half-installed set is never stored under the exact key (an exact hit
+      # skips the save, so it would never be completed). An exact-key hit
+      # already holds everything.
+      - name: Save vcpkg binary cache
+        if: always() && steps.generate.outcome == 'success' && steps.vcpkg-bincache-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.vcpkg-bincache.outputs.dir }}
+          key: ${{ steps.vcpkg-bincache-restore.outputs.cache-primary-key }}
 
       - name: Build
         if: needs.DetectChanges.outputs.docs_only != 'true'
