@@ -516,11 +516,8 @@ jobs:
           draft: false
           prerelease: false
 
-      # NOTE: per-CI OneDrive upload removed. Build artifacts are no longer
-      # pushed to OneDrive on every run — the *bundle* meta-installer
-      # (DisplayXR/displayxr-installer, publish-bundle.yml) uploads to
-      # OneDrive on release only. Reviewers use the upload-artifact steps
-      # above; release assets attach to the GitHub Release on tag.
+      # No OneDrive upload: reviewers use the upload-artifact steps above; release
+      # assets attach to the GitHub Release on tag (the single distribution point).
 
   # All Windows test apps, built in one shot through the globbing aggregator
   # (test_apps/CMakeLists.txt discovers every <class>/<app>/CMakeLists.txt and
