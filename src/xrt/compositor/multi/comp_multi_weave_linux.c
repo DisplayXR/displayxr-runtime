@@ -95,6 +95,8 @@
 #include "xrt/xrt_session.h"
 #include "xrt/xrt_weave_dmabuf.h"
 
+#include "os/os_time.h"
+
 #include "util/u_misc.h"
 #include "util/u_logging.h"
 #include "util/u_handles.h"
@@ -996,18 +998,28 @@ weave_reset_acquire_sem(struct vk_bundle *vk, struct multi_compositor *mc)
  * dp_request_display_mode_confirmed. A DP that HAS the slot and returns false
  * rejected it — nothing is recorded or reported, so the session never believes
  * in a panel state the hardware did not reach.
+ *
+ * The event carries the REQUESTED state once the DP accepted it (#961), never
+ * a read-back: a vendor lens may switch asynchronously (Leia SR flips it via
+ * its own LENS_ON/OFF events), so get_hardware_3d_state right after the
+ * request can still report the old state. The read-back is logged as
+ * information only. The DP call is timed, because it runs on the IPC thread
+ * under weave.mutex (a slow vendor service stalls this client's submits).
  */
 static bool
 weave_apply_display_mode_locked(struct multi_compositor *mc, bool want_3d, const char *why)
 {
 	struct xrt_display_processor *dp = mc->weave.dp;
 	const bool has_slot = XRT_DP_HAS_SLOT(dp, request_display_mode) && dp->request_display_mode != NULL;
+	const int64_t t0_ns = os_monotonic_get_ns();
 	const bool accepted = has_slot ? xrt_display_processor_request_display_mode(dp, want_3d) : true;
+	const double dp_ms = (double)(os_monotonic_get_ns() - t0_ns) / 1e6;
+	const char *slow = dp_ms > 50.0 ? " (slow)" : "";
 	if (!accepted) {
 		U_LOG_W(
-		    "weave(#1699): the display processor REJECTED hardware %s (%s) — panel state unchanged, no "
-		    "event sent",
-		    want_3d ? "3D" : "2D", why);
+		    "weave(#1699): the display processor REJECTED hardware %s (%s) in %.1f ms%s — panel state "
+		    "unchanged, no event sent",
+		    want_3d ? "3D" : "2D", why, dp_ms, slow);
 		return false;
 	}
 
@@ -1018,16 +1030,18 @@ weave_apply_display_mode_locked(struct multi_compositor *mc, bool want_3d, const
 	}
 
 	// One WARN per transition (a human-rate event: a tab switch, a page's mode
-	// choice), with the DP's own read-back so a hardware run can be read from
-	// the journal alone.
+	// choice), so a hardware run can be read from the journal alone. The
+	// read-back is informational only (see above): it may lag the request.
 	bool panel_3d = false;
 	const bool have_readback = xrt_display_processor_get_hardware_3d_state(dp, &panel_3d);
 	U_LOG_W(
-	    "weave(#1699): hardware %s -> %s (%s) on the weave engine's display processor (%s); DP reports the "
-	    "panel %s",
+	    "weave(#1699): hardware %s -> %s (%s) on the weave engine's display processor (%s) in %.1f ms%s; "
+	    "DP readback: %s",
 	    prev_3d ? "3D" : "2D", want_3d ? "3D" : "2D", why,
-	    has_slot ? "request_display_mode accepted" : "mode-neutral DP, nothing to switch",
-	    have_readback ? (panel_3d ? "3D" : "2D") : "state unknown (no read-back)");
+	    has_slot ? "request_display_mode accepted" : "mode-neutral DP, nothing to switch", dp_ms, slow,
+	    have_readback ? (panel_3d ? "3D (may lag — the lens switches asynchronously)"
+	                              : "2D (may lag — the lens switches asynchronously)")
+	                  : "none (the DP has no get_hardware_3d_state)");
 
 	union xrt_session_event xse = {0};
 	xse.hardware_display_state_change.type = XRT_SESSION_EVENT_HARDWARE_DISPLAY_STATE_CHANGE;
@@ -2798,10 +2812,15 @@ comp_multi_weave_linux_request_display_mode(struct multi_compositor *mc, bool en
 	weave_ensure_mutex(mc);
 	os_mutex_lock(&mc->weave.mutex);
 	// The standing wish: read again at engine bring-up if the DP is not there yet.
+	const bool had_pending_2d = mc->weave.dp == NULL && !mc->hardware_display_3d;
 	mc->hardware_display_3d = enable_3d;
 	bool ok = true;
 	if (mc->weave.dp != NULL) {
 		ok = weave_apply_display_mode_locked(mc, enable_3d, "xrRequestDisplayModeDXR");
+	} else if (enable_3d && had_pending_2d) {
+		U_LOG_W(
+		    "weave(#1699): hardware 3D requested before the weave engine exists — the recorded 2D request is "
+		    "withdrawn, nothing to apply at bring-up");
 	} else if (!enable_3d) {
 		U_LOG_W(
 		    "weave(#1699): hardware 2D requested before the weave engine exists — recorded, applied when "

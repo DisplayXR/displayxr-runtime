@@ -1514,10 +1514,13 @@ comp_multi_weave_set_screen_flat_regions(struct xrt_compositor *xc,
  * D3D11 service's #815 for the same browser#55 flow). Before the engine exists
  * the wish is recorded and applied at engine bring-up.
  *
- * Emits XRT_SESSION_EVENT_HARDWARE_DISPLAY_STATE_CHANGE to this client's
- * session only once the DP CONFIRMED a change (#961 semantics; a DP with no
- * request_display_mode slot is mode-neutral and counts as accepted), and logs
- * one WARN per transition with the DP's read-back panel state.
+ * Emits XRT_SESSION_EVENT_HARDWARE_DISPLAY_STATE_CHANGE (carrying the
+ * REQUESTED state) to this client's session only once the DP ACCEPTED a change
+ * (#961 semantics; a DP with no request_display_mode slot is mode-neutral and
+ * counts as accepted); a request for the state already confirmed sends none.
+ * Logs one WARN per transition with the DP call's duration and, as information
+ * only, the DP's read-back (a vendor lens may switch asynchronously, so it can
+ * lag the request).
  *
  * @return true if the request was applied (or recorded for bring-up).
  */
