@@ -1050,6 +1050,21 @@ struct comp_vk_native_compositor
 	struct vk_hud_blend window_space_blend;
 	bool window_space_blend_attempted;
 	/*!
+	 * #1795: the LINEAR window-space path. The layers blend into the
+	 * renderer's private compose target through its `_SRGB` view, sampled
+	 * as their declared format, so a window-space layer obeys the same
+	 * ADR-044 contract as a projection layer. @ref window_space_blend stays
+	 * as the encoded-space fallback (legacy hatch, or no compose target).
+	 * @{
+	 */
+	struct vk_hud_blend window_space_blend_linear;
+	VkFramebuffer ws_linear_fb;
+	VkImageView ws_linear_fb_view;
+	uint32_t ws_linear_fb_w, ws_linear_fb_h;
+	bool ws_linear_failed; //!< sticky: init failed once, stay on the fallback
+	bool ws_linear_logged;
+	//! @}
+	/*!
 	 * Swapchain images destroyed since the last window-space pass (#1782).
 	 *
 	 * window_space_blend caches a view per source VkImage, and the driver
@@ -2478,14 +2493,336 @@ vk_compositor_forget_dead_window_space_images(struct comp_vk_native_compositor *
 			vk_hud_blend_forget_image(&c->window_space_blend, vk,
 			                          c->window_space_blend.cached_images[0].image);
 		}
+		while (c->window_space_blend_linear.image_count > 0) {
+			vk_hud_blend_forget_image(&c->window_space_blend_linear, vk,
+			                          c->window_space_blend_linear.cached_images[0].image);
+		}
 	} else {
 		for (uint32_t i = 0; i < c->ws_dead.count; i++) {
 			vk_hud_blend_forget_image(&c->window_space_blend, vk, c->ws_dead.images[i]);
+			vk_hud_blend_forget_image(&c->window_space_blend_linear, vk, c->ws_dead.images[i]);
 		}
 	}
 	c->ws_dead.count = 0;
 	c->ws_dead.overflow = false;
 	os_mutex_unlock(&c->ws_dead.mutex);
+}
+
+/*!
+ * Stamp every window-space layer, per tile, into @p fb (#1795: shared by the
+ * linear and the encoded-space paths). The target must be in
+ * COLOR_ATTACHMENT_OPTIMAL; it is left there. Each source is transitioned to
+ * SHADER_READ_ONLY_OPTIMAL for its draws and handed back to the app.
+ *
+ * @p honest selects the source view: true → the swapchain's declared format,
+ * for a target that blends in linear and encodes on write; false → the legacy
+ * non-decoding view, for the encoded atlas.
+ */
+static void
+vk_compositor_stamp_window_space_layers(struct comp_vk_native_compositor *c,
+                                        VkCommandBuffer cmd,
+                                        struct vk_hud_blend *blend,
+                                        VkFramebuffer fb,
+                                        bool honest,
+                                        uint32_t atlas_w,
+                                        uint32_t atlas_h,
+                                        uint32_t view_w,
+                                        uint32_t view_h,
+                                        uint32_t tile_columns,
+                                        uint32_t tile_rows)
+{
+	struct vk_bundle *vk = &c->vk;
+
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		struct comp_layer *layer = &c->layer_accum.layers[i];
+		if (layer->data.type != XRT_LAYER_WINDOW_SPACE) {
+			continue;
+		}
+		struct xrt_swapchain *xsc = layer->sc_array[0];
+		if (xsc == NULL) {
+			continue;
+		}
+
+		const struct xrt_layer_window_space_data *ws = &layer->data.window_space;
+		uint32_t sc_index = ws->sub.image_index;
+
+		// #1786: same rule as D3D11/D3D12's window-space pass —
+		// SOURCE_ALPHA_BIT clear means premultiplied bytes, set means
+		// straight. Deliberately not comp_layer_blend_mode() (#1599): see
+		// the comment in comp_d3d11_renderer.cpp's window-space draw.
+		bool ws_premultiplied = (layer->data.flags & XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT) == 0;
+
+		VkImage src_image = (VkImage)(uintptr_t)
+		    comp_vk_native_swapchain_get_image(xsc, sc_index);
+		if (src_image == VK_NULL_HANDLE) {
+			continue;
+		}
+		// #1795: honest → sample the app's bytes as their declared format
+		// (decode an _SRGB source, read UNORM as linear, keep BGRA's channel
+		// order); encoded-space → the legacy R8G8B8A8_UNORM view.
+		const VkFormat src_fmt = honest ? (VkFormat)comp_vk_native_swapchain_get_declared_format(xsc)
+		                                : VK_FORMAT_UNDEFINED;
+
+		// Source: COLOR_ATTACHMENT_OPTIMAL → SHADER_READ_ONLY_OPTIMAL.
+		VkImageMemoryBarrier src_to_sample = {
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		    .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		    .image = src_image,
+		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1,
+		                         ws->sub.array_index, 1},
+		};
+		vk->vkCmdPipelineBarrier(cmd,
+		    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		    0, 0, NULL, 0, NULL, 1, &src_to_sample);
+
+		// Per-view pass with disparity shift in tile-fraction → atlas px.
+		// Mirrors the metal/GL compositors (#413). The caller passes the
+		// frame's EFFECTIVE content grid (#542): mono content arrives as a
+		// 1×1 grid whose tile spans the full content region, so the old
+		// hardware-keyed full-region special case is just the grid math.
+		uint32_t effective_views = tile_columns * tile_rows;
+		float half_disp = ws->disparity / 2.0f;
+		for (uint32_t eye = 0; eye < effective_views; eye++) {
+			uint32_t tile_x = eye % tile_columns;
+			uint32_t tile_y = eye / tile_columns;
+
+			float tile_origin_x = (float)(tile_x * view_w);
+			float tile_origin_y = (float)(tile_y * view_h);
+			float tile_w = (float)view_w;
+			float tile_h = (float)view_h;
+
+			// Per-view horizontal disparity, graded across the view sweep
+			// (view index = baseline order, same as the projection views):
+			// first view = -half, last = +half. Degenerates to the classic
+			// -/+ pair for 2-view modes and to 0 for a single view.
+			float eye_shift = 0.0f;
+			if (effective_views > 1) {
+				float t = (float)eye / (float)(effective_views - 1);
+				eye_shift = -half_disp + ws->disparity * t;
+			}
+
+			int32_t dx = (int32_t)(tile_origin_x + (ws->x + eye_shift) * tile_w);
+			int32_t dy = (int32_t)(tile_origin_y + ws->y * tile_h);
+			int32_t dw_i = (int32_t)(ws->width * tile_w);
+			int32_t dh_i = (int32_t)(ws->height * tile_h);
+			if (dw_i <= 0 || dh_i <= 0) {
+				continue;
+			}
+
+			// One-shot per-geometry diagnostic (#413): logs the resolved
+			// per-view placement whenever the mode/layout/dims change, so a
+			// missing-HUD report can be pinned to placement vs crop without
+			// a custom build. Not per-frame (see debug-logging conventions).
+			{
+				static uint32_t logged_key = 0;
+				uint32_t key = (tile_columns << 28) ^ (tile_rows << 24) ^
+				               (effective_views << 20) ^ (view_w << 8) ^ view_h ^
+				               ((uint32_t)c->hardware_display_3d << 31);
+				if (key != logged_key && eye == 0) {
+					logged_key = key;
+					U_LOG_W("[VK native] window-space placement: 3d=%d tiles=%ux%u "
+					        "views=%u view=%ux%u atlas=%ux%u first stamp dst=(%d,%d "
+					        "%dx%d) ws=(%.3f,%.3f %.3fx%.3f disp=%.3f)",
+					        (int)c->hardware_display_3d, tile_columns, tile_rows,
+					        effective_views, view_w, view_h, atlas_w, atlas_h,
+					        dx, dy, dw_i, dh_i,
+					        ws->x, ws->y, ws->width, ws->height, ws->disparity);
+				}
+			}
+
+			vk_hud_blend_draw_no_layout_fmt(blend, vk, cmd, fb, atlas_w, atlas_h, src_image, src_fmt, dx, dy,
+			                                (uint32_t)dw_i, (uint32_t)dh_i, ws_premultiplied);
+		}
+
+		// Source back to COLOR_ATTACHMENT_OPTIMAL so the app can rerender.
+		VkImageMemoryBarrier src_back = {
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		    .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		    .image = src_image,
+		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1,
+		                         ws->sub.array_index, 1},
+		};
+		vk->vkCmdPipelineBarrier(cmd,
+		    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		    0, 0, NULL, 0, NULL, 1, &src_back);
+	}
+}
+
+//! Record one layout transition for a single-mip, single-layer colour image.
+static void
+ws_linear_barrier(struct vk_bundle *vk,
+                  VkCommandBuffer cmd,
+                  VkImage image,
+                  VkImageLayout from,
+                  VkImageLayout to,
+                  VkAccessFlags src_access,
+                  VkAccessFlags dst_access,
+                  VkPipelineStageFlags src_stage,
+                  VkPipelineStageFlags dst_stage)
+{
+	VkImageMemoryBarrier b = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = src_access,
+	    .dstAccessMask = dst_access,
+	    .oldLayout = from,
+	    .newLayout = to,
+	    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .image = image,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	vk->vkCmdPipelineBarrier(cmd, src_stage, dst_stage, 0, 0, NULL, 0, NULL, 1, &b);
+}
+
+/*!
+ * #1795 - composite the window-space layers in LINEAR light.
+ *
+ * The atlas is plain B8G8R8A8_UNORM holding encoded bytes, and it cannot be
+ * given an `_SRGB` view (the deposit atlas is an imported D3D texture). So,
+ * the same shape as the D3D11 window-space pass drawing into its compose RTV
+ * and then publishing to the atlas:
+ *
+ *  1. raw-copy the published atlas into the private compose target;
+ *  2. blend each layer onto it through the target's `_SRGB` view, sampling
+ *     the layer as its DECLARED format (an `_SRGB` source decodes, a UNORM
+ *     source is read as the linear values it holds, BGRA keeps its channel
+ *     order), so the blend happens in linear light and the view encodes
+ *     once on write;
+ *  3. raw-copy the result back into the atlas.
+ *
+ * Both copies are vkCmdCopyImage between two B8G8R8A8_UNORM images: bytes,
+ * never a conversion. The cost, two atlas copies, is paid only on frames
+ * that carry window-space layers.
+ *
+ * Returns false, recording nothing, when the path is unavailable; the caller
+ * then takes the encoded-space path, which is what every frame did before.
+ */
+static bool
+vk_compositor_render_window_space_linear(struct comp_vk_native_compositor *c,
+                                         VkCommandBuffer cmd,
+                                         VkImage atlas_image,
+                                         uint32_t atlas_w,
+                                         uint32_t atlas_h,
+                                         uint32_t view_w,
+                                         uint32_t view_h,
+                                         uint32_t tile_columns,
+                                         uint32_t tile_rows)
+{
+	struct vk_bundle *vk = &c->vk;
+
+	if (c->ws_linear_failed) {
+		return false;
+	}
+	if ((VkFormat)comp_vk_native_renderer_get_format(c->renderer) != VK_FORMAT_B8G8R8A8_UNORM) {
+		return false; // a raw copy to/from the compose target would swap channels
+	}
+	uint64_t img_u = 0;
+	uint64_t view_u = 0;
+	uint32_t cw = 0;
+	uint32_t ch = 0;
+	if (!comp_vk_native_renderer_get_linear_compose_target(c->renderer, &img_u, &view_u, &cw, &ch)) {
+		return false;
+	}
+	if (cw != atlas_w || ch != atlas_h) {
+		return false; // a resize in flight: this frame keeps the old path
+	}
+	VkImage comp_image = (VkImage)(uintptr_t)img_u;
+	VkImageView comp_view = (VkImageView)(uintptr_t)view_u;
+
+	if (!c->window_space_blend_linear.initialized) {
+		// Alpha written too, as on the encoded path (#1780).
+		if (!vk_hud_blend_init_ex(&c->window_space_blend_linear, vk, VK_FORMAT_B8G8R8A8_SRGB, true)) {
+			U_LOG_E("[VK native] linear window-space blend init failed; staying on the encoded path");
+			c->ws_linear_failed = true;
+			return false;
+		}
+	}
+	if (c->ws_linear_fb == VK_NULL_HANDLE || c->ws_linear_fb_view != comp_view || c->ws_linear_fb_w != cw ||
+	    c->ws_linear_fb_h != ch) {
+		// Safe to destroy: the previous frame's submit is waited on before
+		// this recording begins (same rule as the atlas_ws_fb ring).
+		if (c->ws_linear_fb != VK_NULL_HANDLE) {
+			vk->vkDestroyFramebuffer(vk->device, c->ws_linear_fb, NULL);
+			c->ws_linear_fb = VK_NULL_HANDLE;
+		}
+		VkFramebufferCreateInfo fb_ci = {
+		    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+		    .renderPass = c->window_space_blend_linear.render_pass,
+		    .attachmentCount = 1,
+		    .pAttachments = &comp_view,
+		    .width = cw,
+		    .height = ch,
+		    .layers = 1,
+		};
+		if (vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &c->ws_linear_fb) != VK_SUCCESS) {
+			U_LOG_E("[VK native] linear window-space framebuffer failed (%ux%u); staying on the encoded path",
+			        cw, ch);
+			c->ws_linear_fb = VK_NULL_HANDLE;
+			c->ws_linear_failed = true;
+			return false;
+		}
+		c->ws_linear_fb_view = comp_view;
+		c->ws_linear_fb_w = cw;
+		c->ws_linear_fb_h = ch;
+	}
+
+	const VkImageCopy whole = {
+	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .extent = {cw, ch, 1},
+	};
+
+	// 1. atlas -> compose target (bytes).
+	ws_linear_barrier(vk, cmd, atlas_image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+	                  VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+	                  VK_PIPELINE_STAGE_TRANSFER_BIT);
+	ws_linear_barrier(vk, cmd, comp_image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                  VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	                  VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+	                  VK_PIPELINE_STAGE_TRANSFER_BIT);
+	vk->vkCmdCopyImage(cmd, atlas_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, comp_image,
+	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &whole);
+
+	// 2. blend in linear light.
+	ws_linear_barrier(vk, cmd, comp_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+	                  VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	                  VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+	vk_compositor_stamp_window_space_layers(c, cmd, &c->window_space_blend_linear, c->ws_linear_fb,
+	                                        /*honest=*/true, atlas_w, atlas_h, view_w, view_h, tile_columns,
+	                                        tile_rows);
+
+	// 3. compose target -> atlas (bytes), atlas back to the DP's layout.
+	ws_linear_barrier(vk, cmd, comp_image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	                  VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	                  VK_PIPELINE_STAGE_TRANSFER_BIT);
+	ws_linear_barrier(vk, cmd, atlas_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
+	                  VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                  VK_PIPELINE_STAGE_TRANSFER_BIT);
+	vk->vkCmdCopyImage(cmd, comp_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, atlas_image,
+	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &whole);
+	ws_linear_barrier(vk, cmd, atlas_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+	                  VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+
+	if (!c->ws_linear_logged) {
+		c->ws_linear_logged = true;
+		U_LOG_W("[VK native] window-space layers composite in linear light, sampled as their declared "
+		        "format (#1795)");
+	}
+	return true;
 }
 
 static void
@@ -2515,6 +2852,11 @@ vk_compositor_render_window_space_into_atlas(struct comp_vk_native_compositor *c
 		}
 	}
 	if (!has_ws || tile_columns == 0 || tile_rows == 0 || view_w == 0 || view_h == 0) {
+		return;
+	}
+
+	if (vk_compositor_render_window_space_linear(c, cmd, atlas_image, atlas_w, atlas_h, view_w, view_h,
+	                                             tile_columns, tile_rows)) {
 		return;
 	}
 
@@ -2609,123 +2951,8 @@ vk_compositor_render_window_space_into_atlas(struct comp_vk_native_compositor *c
 	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 	    0, 0, NULL, 0, NULL, 1, &atlas_to_color);
 
-	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
-		struct comp_layer *layer = &c->layer_accum.layers[i];
-		if (layer->data.type != XRT_LAYER_WINDOW_SPACE) {
-			continue;
-		}
-		struct xrt_swapchain *xsc = layer->sc_array[0];
-		if (xsc == NULL) {
-			continue;
-		}
-
-		const struct xrt_layer_window_space_data *ws = &layer->data.window_space;
-		uint32_t sc_index = ws->sub.image_index;
-
-		// #1786: same rule as D3D11/D3D12's window-space pass —
-		// SOURCE_ALPHA_BIT clear means premultiplied bytes, set means
-		// straight. Deliberately not comp_layer_blend_mode() (#1599): see
-		// the comment in comp_d3d11_renderer.cpp's window-space draw.
-		bool ws_premultiplied = (layer->data.flags & XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT) == 0;
-
-		VkImage src_image = (VkImage)(uintptr_t)
-		    comp_vk_native_swapchain_get_image(xsc, sc_index);
-		if (src_image == VK_NULL_HANDLE) {
-			continue;
-		}
-
-		// Source: COLOR_ATTACHMENT_OPTIMAL → SHADER_READ_ONLY_OPTIMAL.
-		VkImageMemoryBarrier src_to_sample = {
-		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-		    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-		    .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-		    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		    .image = src_image,
-		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1,
-		                         ws->sub.array_index, 1},
-		};
-		vk->vkCmdPipelineBarrier(cmd,
-		    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-		    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-		    0, 0, NULL, 0, NULL, 1, &src_to_sample);
-
-		// Per-view pass with disparity shift in tile-fraction → atlas px.
-		// Mirrors the metal/GL compositors (#413). The caller passes the
-		// frame's EFFECTIVE content grid (#542): mono content arrives as a
-		// 1×1 grid whose tile spans the full content region, so the old
-		// hardware-keyed full-region special case is just the grid math.
-		uint32_t effective_views = tile_columns * tile_rows;
-		float half_disp = ws->disparity / 2.0f;
-		for (uint32_t eye = 0; eye < effective_views; eye++) {
-			uint32_t tile_x = eye % tile_columns;
-			uint32_t tile_y = eye / tile_columns;
-
-			float tile_origin_x = (float)(tile_x * view_w);
-			float tile_origin_y = (float)(tile_y * view_h);
-			float tile_w = (float)view_w;
-			float tile_h = (float)view_h;
-
-			// Per-view horizontal disparity, graded across the view sweep
-			// (view index = baseline order, same as the projection views):
-			// first view = -half, last = +half. Degenerates to the classic
-			// -/+ pair for 2-view modes and to 0 for a single view.
-			float eye_shift = 0.0f;
-			if (effective_views > 1) {
-				float t = (float)eye / (float)(effective_views - 1);
-				eye_shift = -half_disp + ws->disparity * t;
-			}
-
-			int32_t dx = (int32_t)(tile_origin_x + (ws->x + eye_shift) * tile_w);
-			int32_t dy = (int32_t)(tile_origin_y + ws->y * tile_h);
-			int32_t dw_i = (int32_t)(ws->width * tile_w);
-			int32_t dh_i = (int32_t)(ws->height * tile_h);
-			if (dw_i <= 0 || dh_i <= 0) {
-				continue;
-			}
-
-			// One-shot per-geometry diagnostic (#413): logs the resolved
-			// per-view placement whenever the mode/layout/dims change, so a
-			// missing-HUD report can be pinned to placement vs crop without
-			// a custom build. Not per-frame (see debug-logging conventions).
-			{
-				static uint32_t logged_key = 0;
-				uint32_t key = (tile_columns << 28) ^ (tile_rows << 24) ^
-				               (effective_views << 20) ^ (view_w << 8) ^ view_h ^
-				               ((uint32_t)c->hardware_display_3d << 31);
-				if (key != logged_key && eye == 0) {
-					logged_key = key;
-					U_LOG_W("[VK native] window-space placement: 3d=%d tiles=%ux%u "
-					        "views=%u view=%ux%u atlas=%ux%u first stamp dst=(%d,%d "
-					        "%dx%d) ws=(%.3f,%.3f %.3fx%.3f disp=%.3f)",
-					        (int)c->hardware_display_3d, tile_columns, tile_rows,
-					        effective_views, view_w, view_h, atlas_w, atlas_h,
-					        dx, dy, dw_i, dh_i,
-					        ws->x, ws->y, ws->width, ws->height, ws->disparity);
-				}
-			}
-
-			vk_hud_blend_draw_no_layout_ex(&c->window_space_blend, vk, cmd, c->atlas_ws_fb, atlas_w,
-			                               atlas_h, src_image, dx, dy, (uint32_t)dw_i, (uint32_t)dh_i,
-			                               ws_premultiplied);
-		}
-
-		// Source back to COLOR_ATTACHMENT_OPTIMAL so the app can rerender.
-		VkImageMemoryBarrier src_back = {
-		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
-		    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-		    .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-		    .image = src_image,
-		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1,
-		                         ws->sub.array_index, 1},
-		};
-		vk->vkCmdPipelineBarrier(cmd,
-		    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-		    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-		    0, 0, NULL, 0, NULL, 1, &src_back);
-	}
+	vk_compositor_stamp_window_space_layers(c, cmd, &c->window_space_blend, c->atlas_ws_fb, /*honest=*/false,
+	                                        atlas_w, atlas_h, view_w, view_h, tile_columns, tile_rows);
 
 	// Atlas: COLOR_ATTACHMENT_OPTIMAL → SHADER_READ_ONLY_OPTIMAL for DP.
 	VkImageMemoryBarrier atlas_back = {
@@ -8503,6 +8730,11 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	}
 	c->atlas_ws_fb = VK_NULL_HANDLE;
 	vk_hud_blend_fini(&c->window_space_blend, vk);
+	if (c->ws_linear_fb != VK_NULL_HANDLE) {
+		vk->vkDestroyFramebuffer(vk->device, c->ws_linear_fb, NULL);
+		c->ws_linear_fb = VK_NULL_HANDLE;
+	}
+	vk_hud_blend_fini(&c->window_space_blend_linear, vk);
 
 	// #439 Phase 3 — masked composite pipelines + scratch images. (The active
 	// zone mask is owned by the oxr handle, freed via zone_mask_destroy.)

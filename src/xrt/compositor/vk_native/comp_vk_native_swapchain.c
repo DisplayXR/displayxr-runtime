@@ -623,6 +623,15 @@ comp_vk_native_swapchain_is_srgb(struct xrt_swapchain *xsc)
 	return f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FORMAT_B8G8R8A8_SRGB;
 }
 
+int32_t
+comp_vk_native_swapchain_get_declared_format(struct xrt_swapchain *xsc)
+{
+	if (xsc == NULL) {
+		return (int32_t)VK_FORMAT_UNDEFINED;
+	}
+	return (int32_t)xrt_format_to_vk(vk_sc(xsc)->info.format);
+}
+
 uint64_t
 comp_vk_native_swapchain_get_image(struct xrt_swapchain *xsc, uint32_t index)
 {

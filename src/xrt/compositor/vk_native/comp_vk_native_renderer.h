@@ -172,6 +172,30 @@ int32_t
 comp_vk_native_renderer_get_format(struct comp_vk_native_renderer *renderer);
 
 /*!
+ * The private linear-blend compose target (#1610), for a pass that must blend
+ * in linear light after the projection pass has published the atlas (#1795:
+ * window-space layers).
+ *
+ * The image is B8G8R8A8_UNORM + MUTABLE_FORMAT, sized to the allocated atlas,
+ * usable as TRANSFER_SRC, TRANSFER_DST and COLOR_ATTACHMENT; @p out_view is
+ * its `_SRGB` view, so a render pass on it blends in linear and encodes on
+ * write, and a raw vkCmdCopyImage moves the encoded bytes to and from the
+ * atlas. Its layout on return is unspecified: the caller transitions from
+ * UNDEFINED and overwrites it.
+ *
+ * Returns false â€” keep the encoded-space path â€” under the legacy colour
+ * hatch (the view would be UNORM) or when the target cannot be created.
+ *
+ * @ingroup comp_vk_native
+ */
+bool
+comp_vk_native_renderer_get_linear_compose_target(struct comp_vk_native_renderer *renderer,
+                                                  uint64_t *out_image,
+                                                  uint64_t *out_view,
+                                                  uint32_t *out_width,
+                                                  uint32_t *out_height);
+
+/*!
  * Resize the renderer's atlas texture.
  *
  * @param renderer The renderer.

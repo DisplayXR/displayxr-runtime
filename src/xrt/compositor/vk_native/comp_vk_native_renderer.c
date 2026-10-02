@@ -1425,7 +1425,10 @@ zone_compose_target_ensure(struct comp_vk_native_renderer *r)
 	    .arrayLayers = 1,
 	    .samples = VK_SAMPLE_COUNT_1_BIT,
 	    .tiling = VK_IMAGE_TILING_OPTIMAL,
-	    .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+	    // TRANSFER_DST: the window-space pass copies the published atlas back
+	    // in to blend over it in linear light (#1795).
+	    .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+	             VK_IMAGE_USAGE_TRANSFER_DST_BIT,
 	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
 	};
 	VkResult res = vk->vkCreateImage(vk->device, &ici, NULL, &r->zone.compose_image);
@@ -2564,6 +2567,23 @@ int32_t
 comp_vk_native_renderer_get_format(struct comp_vk_native_renderer *r)
 {
 	return (int32_t)r->format;
+}
+
+bool
+comp_vk_native_renderer_get_linear_compose_target(struct comp_vk_native_renderer *r,
+                                                  uint64_t *out_image,
+                                                  uint64_t *out_view,
+                                                  uint32_t *out_width,
+                                                  uint32_t *out_height)
+{
+	if (u_color_legacy_unorm_encoded() || !zone_compose_target_ensure(r)) {
+		return false;
+	}
+	*out_image = (uint64_t)(uintptr_t)r->zone.compose_image;
+	*out_view = (uint64_t)(uintptr_t)r->zone.compose_view;
+	*out_width = r->zone.compose_w;
+	*out_height = r->zone.compose_h;
+	return true;
 }
 
 xrt_result_t
