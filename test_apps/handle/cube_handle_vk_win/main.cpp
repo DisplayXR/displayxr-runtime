@@ -374,6 +374,22 @@ static uint32_t FindMemoryTypeIdx(VkPhysicalDevice phys, uint32_t typeBits, VkMe
     return UINT32_MAX;
 }
 
+// Prefer the _SRGB format for Local2D panels when the session advertises it
+// (ADR-044 / INV-4.6): the CPU-authored bytes are display-referred, so a
+// UNORM declaration would have a format-honest compositor encode them twice.
+static int64_t PickPanelFormat(XrSession session, int64_t srgb, int64_t unorm) {
+    uint32_t n = 0;
+    xrEnumerateSwapchainFormats(session, 0, &n, nullptr);
+    std::vector<int64_t> formats(n);
+    if (n > 0) {
+        xrEnumerateSwapchainFormats(session, n, &n, formats.data());
+    }
+    for (int64_t f : formats) {
+        if (f == srgb) return f;
+    }
+    return unorm;
+}
+
 static bool CreateAndFillL2DPanel(XrSessionManager& xr, VkRenderer* renderer, VkCommandPool cmdPool,
                                   uint32_t w, uint32_t h, int variant, L2DPanel& out) {
     if (w == 0 || h == 0) {
@@ -382,7 +398,7 @@ static bool CreateAndFillL2DPanel(XrSessionManager& xr, VkRenderer* renderer, Vk
     XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
     sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
                      XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
-    sci.format = (int64_t)VK_FORMAT_B8G8R8A8_UNORM;
+    sci.format = PickPanelFormat(xr.session, (int64_t)VK_FORMAT_B8G8R8A8_SRGB, (int64_t)VK_FORMAT_B8G8R8A8_UNORM);
     sci.sampleCount = 1;
     sci.width = w;
     sci.height = h;

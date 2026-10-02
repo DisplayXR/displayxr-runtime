@@ -67,7 +67,10 @@ FetchContent_Declare(
     # v2.24.0: color_policy.h (dxr::ChooseColorSwapchainFormat, RenderSceneLinear,
     # DisplayReferredToSceneLinear) and vk_clear.h -- the `_SRGB` colour swapchain
     # this app now requests after runtime #1623 (ADR-021 / INV-4.6).
-    GIT_TAG v2.24.0
+    # v2.27.0: window-space / HUD swapchains prefer the _SRGB sibling of
+    # R8G8B8A8 (dxr::ChooseWindowSpaceSwapchainFormat; ADR-044 §7,
+    # displayxr-common#72) — a UNORM HUD of encoded bytes was encoded twice.
+    GIT_TAG v2.27.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)

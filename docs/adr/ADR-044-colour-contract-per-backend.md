@@ -140,6 +140,15 @@ The helper keys on the *target's* format. Pinning a format and calling the helpe
 
   Migrating Metal is the same three-part change D3D11 got: true-format views, a private `_SRGB` target, a raw copy. It needs its own issue and a macOS-only verification. macOS understates transfer-function errors, so judge numerically from atlas captures, not by eye.
 - **The IPC `comp_multi` paths** (macOS service, Android service flavour, the Linux headless service) have **not been audited** against §1. The shared-atlas path documents a `vkCmdBlitImage` from each client's swapchain format into one target-format atlas (`compositor/multi/comp_multi_system.c`). A blit converts through both formats, so any format-honesty there is incidental, not contracted.
+- **Local2D layers are not format-honest.** The Local2D flatten samples the app's swapchain through a *non-decoding* view and writes a UNORM scratch, on every in-process backend:
+  - D3D11 `comp_d3d11_swapchain_get_srv`, not `get_compose_srv`;
+  - D3D12 `comp_d3d12_swapchain_sample_format`;
+  - GL `gl_bind_layer_source(…, compose=false)`;
+  - vk_native `get_image_view`, not `get_true_image_view`.
+
+  **vk_native window-space layers have the same gap.** `vk_hud_blend` samples every source through a hard-coded `R8G8B8A8_UNORM` view (`auxiliary/vk/vk_hud_blend.c`) and blends into the atlas in encoded space. Measured on the model viewer's displayxr-common button bar: the atlas bytes are identical with swapchain 37 and 43, and the 55 % black fill lands at exactly 0.45 × the background's encoded value. The same hard-coded view would swap R and B for a `B8G8R8A8` window-space swapchain. D3D11, D3D12 and GL window-space *are* honest. Measured with the `windowspace_handle_*_win` probes, which draw opaque solid layers with authored byte 38: on D3D11, D3D12 and GL an `_SRGB` swapchain reads back 38 and a UNORM one reads back 108 (exactly one encode). On vk_native both read back 38.
+
+  Encoded bytes therefore pass through whether the swapchain says UNORM or `_SRGB`. Neither is washed out today, but a true-linear UNORM Local2D app renders too dark. Local2D is also flattened after the atlas, so §5's atlas capture cannot see it. App guidance does not change: submit Local2D as `_SRGB` with raw-copied bytes (displayxr-unity v2.21.0 already does). **Order matters:** apps move first. Making the flatten honest before they do would wash out every app that still declares UNORM Local2D.
 - **The displayxr-common Windows window-space HUD swapchain** stays `R8G8B8A8_UNORM` with display-referred bytes. On any format-honest backend it is encoded twice; its move to `_SRGB` is pending (displayxr-common).
 
 ## Consequences
