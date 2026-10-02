@@ -84,6 +84,25 @@ vk_hud_blend_init(struct vk_hud_blend *blend,
                    VkFormat target_fmt);
 
 /*!
+ * Like vk_hud_blend_init(), choosing whether the HUD's alpha is composited
+ * into the target too (#1780).
+ *
+ * With @p write_alpha false (vk_hud_blend_init) the target's alpha channel is
+ * left untouched. With it true the HUD is composited "over" in alpha as well
+ * (src ONE, dst ONE_MINUS_SRC_ALPHA, all channels written), so the stamped
+ * region gets at least the HUD's coverage. Use that when the target's alpha
+ * is the window's transparency (a transparent session's atlas); it matches
+ * the D3D11 window-space blend (#225).
+ *
+ * @ingroup aux_vk
+ */
+bool
+vk_hud_blend_init_ex(struct vk_hud_blend *blend,
+                     struct vk_bundle *vk,
+                     VkFormat target_fmt,
+                     bool write_alpha);
+
+/*!
  * Record alpha-blended HUD draw commands.
  *
  * Transitions: target PRESENT_SRC → COLOR_ATTACHMENT → PRESENT_SRC.

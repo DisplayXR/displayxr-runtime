@@ -110,6 +110,15 @@ vk_hud_blend_init(struct vk_hud_blend *blend,
                    struct vk_bundle *vk,
                    VkFormat target_fmt)
 {
+	return vk_hud_blend_init_ex(blend, vk, target_fmt, false);
+}
+
+bool
+vk_hud_blend_init_ex(struct vk_hud_blend *blend,
+                     struct vk_bundle *vk,
+                     VkFormat target_fmt,
+                     bool write_alpha)
+{
 	VkResult ret;
 
 	// Shader modules from embedded SPIR-V
@@ -260,9 +269,9 @@ vk_hud_blend_init(struct vk_hud_blend *blend,
 	    .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
 	VkPipelineColorBlendAttachmentState blend_att = {
 	    .blendEnable = VK_TRUE,
-	    // Don't touch the framebuffer's alpha channel — leaves whatever the
-	    // present path expects intact (some compositors treat alpha as window
-	    // transparency even with COMPOSITE_ALPHA_OPAQUE_BIT).
+	    // Default: don't touch the framebuffer's alpha channel — leaves
+	    // whatever the present path expects intact (some compositors treat
+	    // alpha as window transparency even with COMPOSITE_ALPHA_OPAQUE_BIT).
 	    .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
 	                      VK_COLOR_COMPONENT_B_BIT,
 	    .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
@@ -271,6 +280,14 @@ vk_hud_blend_init(struct vk_hud_blend *blend,
 	    .srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
 	    .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
 	    .alphaBlendOp = VK_BLEND_OP_ADD};
+	if (write_alpha) {
+		// #1780: alpha "over" as well, so a HUD over a transparent atlas
+		// region (alpha 0) is not see-through. Alpha only ever grows, so an
+		// opaque target (alpha 1) is unchanged.
+		blend_att.colorWriteMask |= VK_COLOR_COMPONENT_A_BIT;
+		blend_att.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+		blend_att.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+	}
 	VkPipelineColorBlendStateCreateInfo cb = {
 	    .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
 	    .attachmentCount = 1,
