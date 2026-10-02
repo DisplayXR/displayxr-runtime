@@ -2471,7 +2471,13 @@ vk_compositor_render_window_space_into_atlas(struct comp_vk_native_compositor *c
 	if (!c->window_space_blend.initialized && !c->window_space_blend_attempted) {
 		c->window_space_blend_attempted = true;
 		VkFormat atlas_fmt = (VkFormat)comp_vk_native_renderer_get_format(c->renderer);
-		if (!vk_hud_blend_init(&c->window_space_blend, vk, atlas_fmt)) {
+		// #1780: write alpha. The atlas alpha is the window's transparency in
+		// a transparent session, so an RGB-only stamp leaves the HUD invisible
+		// wherever no 3D content sits under it. Same blend as D3D11 (#225);
+		// an opaque atlas (alpha 1) is unchanged by it. Not keyed on the
+		// session's transparency: that can switch on mid-session (lazy
+		// transparency) and this pipeline is built once.
+		if (!vk_hud_blend_init_ex(&c->window_space_blend, vk, atlas_fmt, true)) {
 			U_LOG_E("[VK native] window-space alpha-blend init failed; "
 			        "layers will be skipped");
 		}
