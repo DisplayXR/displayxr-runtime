@@ -54,7 +54,10 @@ FetchContent_Declare(
     # table is built on the worker, from the new grid snap provider
     # (set_snap_grid_provider + DxrWeaveSnap::grid_callback, XR_DXR_weave
     # spec >= 11; displayxr-common#62/#63, runtime#1723).
-    GIT_TAG v2.24.0
+    # v2.27.0: window-space / HUD swapchains prefer the _SRGB sibling of
+    # R8G8B8A8 (dxr::ChooseWindowSpaceSwapchainFormat; ADR-044 §7,
+    # displayxr-common#72) — a UNORM HUD of encoded bytes was encoded twice.
+    GIT_TAG v2.27.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
