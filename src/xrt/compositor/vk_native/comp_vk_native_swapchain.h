@@ -89,6 +89,19 @@ bool
 comp_vk_native_swapchain_is_srgb(struct xrt_swapchain *xsc);
 
 /*!
+ * The VkFormat the app REQUESTED for this swapchain (#1795).
+ *
+ * A view in this format is always legal on the swapchain's images: either it
+ * is the image's own format, or the image is the UNORM sibling created
+ * MUTABLE_FORMAT with both siblings in its format list (#1559/#1572). Use it
+ * to sample the app's bytes as what they are.
+ *
+ * @ingroup comp_vk_native
+ */
+int32_t
+comp_vk_native_swapchain_get_declared_format(struct xrt_swapchain *xsc);
+
+/*!
  * Get the dimensions of a swapchain.
  *
  * @param xsc The swapchain.

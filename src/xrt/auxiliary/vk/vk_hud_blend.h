@@ -58,6 +58,7 @@ struct vk_hud_blend
 	//! Lookup is O(N) but N is bounded (≤ swapchain image count).
 	struct {
 		VkImage image;
+		VkFormat format; //!< View format the entry was created with (#1795).
 		VkImageView view;
 		VkDescriptorSet desc_set;
 	} cached_images[VK_HUD_BLEND_MAX_IMAGES];
@@ -164,6 +165,37 @@ vk_hud_blend_draw_no_layout_ex(struct vk_hud_blend *blend,
                                bool premultiplied);
 
 /*!
+ * vk_hud_blend_draw_no_layout_ex(), sampling the source through a view of
+ * @p src_view_fmt instead of the legacy hard-coded R8G8B8A8_UNORM (#1795).
+ *
+ * Pass the swapchain's DECLARED format to read it honestly: an `_SRGB`
+ * source then decodes to linear on sample, a UNORM source reads the linear
+ * values it holds, and a B8G8R8A8 source is no longer read with R and B
+ * swapped. Honest sampling only belongs in a target that blends in linear
+ * and encodes on write (an `_SRGB` attachment); an encoded UNORM target
+ * keeps the legacy view. VK_FORMAT_UNDEFINED selects the legacy view.
+ *
+ * The view must be legal for the image: its own creation format always is;
+ * a sibling needs VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT.
+ *
+ * @ingroup aux_vk
+ */
+void
+vk_hud_blend_draw_no_layout_fmt(struct vk_hud_blend *blend,
+                                struct vk_bundle *vk,
+                                VkCommandBuffer cmd,
+                                VkFramebuffer fb,
+                                uint32_t fb_w,
+                                uint32_t fb_h,
+                                VkImage hud_image,
+                                VkFormat src_view_fmt,
+                                int32_t dst_x,
+                                int32_t dst_y,
+                                uint32_t dst_w,
+                                uint32_t dst_h,
+                                bool premultiplied);
+
+/*!
  * Draw without managing target image layout transitions or framebuffer
  * caching. Use this when blending into a non-swapchain target (e.g. an
  * atlas image) where the caller manages layout transitions outside the
@@ -197,7 +229,7 @@ vk_hud_blend_draw_no_layout(struct vk_hud_blend *blend,
                               uint32_t dst_h);
 
 /*!
- * Drop the cached view + descriptor set for a HUD source image (#1782).
+ * Drop the cached view(s) + descriptor set(s) for a HUD source image (#1782).
  *
  * The cache is keyed by the raw VkImage handle, and drivers hand a destroyed
  * image's handle value to the next image they create. An entry that outlives
