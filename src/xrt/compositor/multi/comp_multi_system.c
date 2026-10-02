@@ -37,6 +37,7 @@
 #include "util/u_debug.h"
 #include "util/u_trace_marker.h"
 #include "util/u_distortion_mesh.h"
+#include "util/u_color_encoding.h"
 
 #ifdef XRT_OS_LINUX
 #include "util/u_linux.h"
@@ -2269,6 +2270,13 @@ session_render_hud_overlay(struct multi_compositor *mc,
  * cursor all blend RGBA over the same target format, so they reuse one
  * @ref vk_hud_blend instance (the field is named chrome_blend for historical
  * reasons; it backs all three). (#48)
+ *
+ * #1795: deliberately NOT made format-honest. The workspace registry these
+ * layers come from is only filled on macOS (ipc_server_handler.c registers
+ * chrome / cursor / overlays under XRT_OS_MACOS alone), and this per-session
+ * path is compiled out on macOS, so no controller surface reaches it today.
+ * The format-honest decoration blend lives on the macOS shared surface
+ * (shared_resolve_deco_target).
  */
 static bool
 ensure_workspace_blend(struct multi_compositor *mc, struct vk_bundle *vk)
@@ -3914,6 +3922,20 @@ shared_surface_fini(struct multi_system_compositor *msc)
 		vk_hud_blend_fini(&msc->shared_chrome_blend, vk);
 		msc->shared_chrome_blend_initialized = false;
 	}
+	// #1795 honest-decoration target: same order (framebuffer before pipelines).
+	if (vk != NULL && msc->shared_atlas_deco_fb != VK_NULL_HANDLE) {
+		vk->vkDestroyFramebuffer(vk->device, msc->shared_atlas_deco_fb, NULL);
+		msc->shared_atlas_deco_fb = VK_NULL_HANDLE;
+		msc->shared_atlas_deco_fb_view = VK_NULL_HANDLE;
+	}
+	if (vk != NULL && msc->shared_deco_blend_initialized) {
+		vk_hud_blend_fini(&msc->shared_deco_blend, vk);
+		msc->shared_deco_blend_initialized = false;
+	}
+	if (vk != NULL && msc->shared_deco_content_blend_initialized) {
+		comp_multi_content_blend_fini(&msc->shared_deco_content_blend, vk);
+		msc->shared_deco_content_blend_initialized = false;
+	}
 	// Task 9 content composite: owns its own render pass + pipeline (no fb).
 	if (vk != NULL && msc->shared_content_blend_initialized) {
 		comp_multi_content_blend_fini(&msc->shared_content_blend, vk);
@@ -3922,6 +3944,10 @@ shared_surface_fini(struct multi_system_compositor *msc)
 
 	// The one combined stereo atlas (view + image + memory).
 	if (vk != NULL && msc->shared_atlas_initialized) {
+		if (msc->shared_atlas_deco_view != VK_NULL_HANDLE)
+			vk->vkDestroyImageView(vk->device, msc->shared_atlas_deco_view, NULL);
+		msc->shared_atlas_deco_view = VK_NULL_HANDLE;
+		msc->shared_atlas_deco_format = VK_FORMAT_UNDEFINED;
 		if (msc->shared_atlas_view != VK_NULL_HANDLE)
 			vk->vkDestroyImageView(vk->device, msc->shared_atlas_view, NULL);
 		if (msc->shared_atlas_image != VK_NULL_HANDLE)
@@ -3976,6 +4002,107 @@ shared_surface_fini(struct multi_system_compositor *msc)
 	msc->shared_surface_initialized = false;
 }
 
+//! #1795: the `_SRGB` sibling of an 8-bit colour format (itself if already
+//! `_SRGB`), VK_FORMAT_UNDEFINED if it has none.
+static VkFormat
+shared_srgb_sibling(VkFormat f)
+{
+	switch (f) {
+	case VK_FORMAT_R8G8B8A8_UNORM:
+	case VK_FORMAT_R8G8B8A8_SRGB: return VK_FORMAT_R8G8B8A8_SRGB;
+	case VK_FORMAT_B8G8R8A8_UNORM:
+	case VK_FORMAT_B8G8R8A8_SRGB: return VK_FORMAT_B8G8R8A8_SRGB;
+	default: return VK_FORMAT_UNDEFINED;
+	}
+}
+
+static inline bool
+shared_format_is_srgb(VkFormat f)
+{
+	return f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FORMAT_B8G8R8A8_SRGB;
+}
+
+/*!
+ * #1795: the `_SRGB` view format the decoration pass should render the atlas
+ * through, or VK_FORMAT_UNDEFINED when the atlas needs no separate view (it is
+ * `_SRGB` already) or must stay legacy (the ADR-044 hatch, an earlier failure,
+ * a format with no `_SRGB` sibling, or a sibling that cannot be a blended
+ * colour attachment on this device).
+ */
+static VkFormat
+shared_honest_deco_format(struct multi_system_compositor *msc, struct vk_bundle *vk, VkFormat atlas_fmt)
+{
+	if (u_color_legacy_unorm_encoded() || msc->shared_deco_honest_failed || shared_format_is_srgb(atlas_fmt)) {
+		return VK_FORMAT_UNDEFINED;
+	}
+	VkFormat srgb = shared_srgb_sibling(atlas_fmt);
+	if (srgb == VK_FORMAT_UNDEFINED) {
+		return VK_FORMAT_UNDEFINED;
+	}
+	VkFormatProperties props = {0};
+	vk->vkGetPhysicalDeviceFormatProperties(vk->physical_device, srgb, &props);
+	const VkFormatFeatureFlags need =
+	    VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;
+	if ((props.optimalTilingFeatures & need) != need) {
+		return VK_FORMAT_UNDEFINED;
+	}
+	return srgb;
+}
+
+/*!
+ * #1795: create the atlas image in @p format, MUTABLE_FORMAT with
+ * {@p format, @p srgb} as its view-format list, so an `_SRGB` view of the
+ * encoded atlas is legal. Cleans up after itself on failure.
+ */
+static VkResult
+shared_create_mutable_atlas(struct vk_bundle *vk,
+                            VkExtent2D extent,
+                            VkFormat format,
+                            VkFormat srgb,
+                            VkImageUsageFlags usage,
+                            VkDeviceMemory *out_mem,
+                            VkImage *out_image)
+{
+	VkFormat view_formats[2] = {format, srgb};
+	VkImageFormatListCreateInfoKHR fmt_list = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO_KHR,
+	    .viewFormatCount = 2,
+	    .pViewFormats = view_formats,
+	};
+	VkImageCreateInfo ici = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+	    // The list is an optimisation hint; MUTABLE_FORMAT alone makes the view legal.
+	    .pNext = vk->has_KHR_image_format_list ? &fmt_list : NULL,
+	    .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
+	    .imageType = VK_IMAGE_TYPE_2D,
+	    .format = format,
+	    .extent = {extent.width, extent.height, 1},
+	    .mipLevels = 1,
+	    .arrayLayers = 1,
+	    .samples = VK_SAMPLE_COUNT_1_BIT,
+	    .tiling = VK_IMAGE_TILING_OPTIMAL,
+	    .usage = usage,
+	    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	};
+	VkImage image = VK_NULL_HANDLE;
+	VkResult ret = vk->vkCreateImage(vk->device, &ici, NULL, &image);
+	if (ret != VK_SUCCESS) {
+		return ret;
+	}
+	VkMemoryRequirements reqs = {0};
+	vk->vkGetImageMemoryRequirements(vk->device, image, &reqs);
+	VkDeviceMemory mem = VK_NULL_HANDLE;
+	ret = vk_alloc_and_bind_image_memory(vk, image, &reqs, NULL, __func__, &mem);
+	if (ret != VK_SUCCESS) {
+		vk->vkDestroyImage(vk->device, image, NULL);
+		return ret;
+	}
+	*out_mem = mem;
+	*out_image = image;
+	return VK_SUCCESS;
+}
+
 /*!
  * Ensure the one combined stereo atlas exists at (tile_columns*eye_w) × eye_h.
  */
@@ -3994,6 +4121,12 @@ shared_ensure_atlas(struct multi_system_compositor *msc,
 		return true;
 	}
 	if (msc->shared_atlas_initialized) {
+		// The #1795 deco framebuffer is rebuilt lazily, keyed on the deco view
+		// (the same pattern as shared_atlas_fb).
+		if (msc->shared_atlas_deco_view != VK_NULL_HANDLE)
+			vk->vkDestroyImageView(vk->device, msc->shared_atlas_deco_view, NULL);
+		msc->shared_atlas_deco_view = VK_NULL_HANDLE;
+		msc->shared_atlas_deco_format = VK_FORMAT_UNDEFINED;
 		if (msc->shared_atlas_view != VK_NULL_HANDLE)
 			vk->vkDestroyImageView(vk->device, msc->shared_atlas_view, NULL);
 		if (msc->shared_atlas_image != VK_NULL_HANDLE)
@@ -4004,9 +4137,29 @@ shared_ensure_atlas(struct multi_system_compositor *msc,
 	}
 
 	VkExtent2D extent = {(uint32_t)atlas_w, (uint32_t)atlas_h};
-	VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-	VkResult ret =
-	    vk_create_image_simple(vk, extent, format, usage, &msc->shared_atlas_memory, &msc->shared_atlas_image);
+	// COLOR_ATTACHMENT: the content and decoration passes render into the atlas
+	// through a framebuffer, which the usage never declared.
+	VkImageUsageFlags usage =
+	    VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+
+	// #1795: an encoded (non-`_SRGB`) atlas is created MUTABLE with its `_SRGB`
+	// sibling so the decoration pass can blend in linear through that view.
+	VkFormat deco_fmt = shared_honest_deco_format(msc, vk, format);
+	VkResult ret = VK_ERROR_INITIALIZATION_FAILED;
+	if (deco_fmt != VK_FORMAT_UNDEFINED) {
+		ret = shared_create_mutable_atlas(vk, extent, format, deco_fmt, usage, &msc->shared_atlas_memory,
+		                                  &msc->shared_atlas_image);
+		if (ret != VK_SUCCESS) {
+			U_LOG_W("[#59] #1795: mutable atlas failed (%s); decorations stay legacy (encoded-space blend)",
+			        vk_result_string(ret));
+			msc->shared_deco_honest_failed = true;
+			deco_fmt = VK_FORMAT_UNDEFINED;
+		}
+	}
+	if (ret != VK_SUCCESS) {
+		ret = vk_create_image_simple(vk, extent, format, usage, &msc->shared_atlas_memory,
+		                             &msc->shared_atlas_image);
+	}
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("[#59] failed to create combined atlas: %s", vk_result_string(ret));
 		return false;
@@ -4017,6 +4170,18 @@ shared_ensure_atlas(struct multi_system_compositor *msc,
 		U_LOG_E("[#59] failed to create combined atlas view: %s", vk_result_string(ret));
 		return false;
 	}
+	if (deco_fmt != VK_FORMAT_UNDEFINED) {
+		ret = vk_create_view(vk, msc->shared_atlas_image, VK_IMAGE_VIEW_TYPE_2D, deco_fmt, range,
+		                     &msc->shared_atlas_deco_view);
+		if (ret != VK_SUCCESS) {
+			U_LOG_W("[#59] #1795: `_SRGB` atlas view failed (%s); decorations stay legacy",
+			        vk_result_string(ret));
+			msc->shared_atlas_deco_view = VK_NULL_HANDLE;
+			msc->shared_deco_honest_failed = true;
+			deco_fmt = VK_FORMAT_UNDEFINED;
+		}
+	}
+	msc->shared_atlas_deco_format = deco_fmt;
 	msc->shared_atlas_w = atlas_w;
 	msc->shared_atlas_h = atlas_h;
 	msc->shared_eye_w = eye_w;
@@ -4281,16 +4446,131 @@ shared_ensure_content_blend(struct multi_system_compositor *msc, struct vk_bundl
 }
 
 /*!
+ * Where this frame's decorations (chrome / overlays / cursor) are drawn, and
+ * how their sources are read (#1795, ADR-044 §1).
+ */
+struct shared_deco_target
+{
+	struct vk_hud_blend *blend;               //!< Flat (axis-aligned) decorations.
+	struct comp_multi_content_blend *content; //!< Quad / stereo-SBS decorations.
+	VkFramebuffer fb;                         //!< Shared by both pipelines (render-pass compatible).
+	//! Sources are sampled as their DECLARED format and blended in linear
+	//! light into an `_SRGB` attachment. False = legacy: the flat path reads
+	//! raw bytes through R8G8B8A8_UNORM and blends in the atlas's encoded space.
+	bool honest;
+};
+
+//! #1795: one-time WARN naming the regime the decorations run under.
+static void
+shared_deco_log_once(struct multi_system_compositor *msc, const char *regime)
+{
+	if (msc->shared_deco_logged) {
+		return;
+	}
+	msc->shared_deco_logged = true;
+	U_LOG_W("[#59] #1795 workspace decorations: %s (atlas fmt=%d, deco view fmt=%d)", regime,
+	        msc->shared_atlas_format, msc->shared_atlas_deco_format);
+}
+
+/*!
+ * #1795: resolve the decoration target. Always succeeds when the legacy target
+ * (shared_chrome_blend over shared_atlas_fb) can be built; the honest target is
+ * used when the hatch is off and everything it needs exists. A failure while
+ * building the honest target is sticky and falls back to legacy for good, so
+ * there is one WARN, not one per frame.
+ */
+static bool
+shared_resolve_deco_target(struct multi_system_compositor *msc, struct vk_bundle *vk, struct shared_deco_target *out)
+{
+	if (!shared_ensure_chrome_blend(msc, vk)) {
+		return false;
+	}
+	out->blend = &msc->shared_chrome_blend;
+	// The quad pipeline is optional, as before: without it only quad / SBS
+	// decorations are skipped.
+	out->content = shared_ensure_content_blend(msc, vk) ? &msc->shared_content_blend : NULL;
+	out->fb = msc->shared_atlas_fb;
+	out->honest = false;
+
+	if (u_color_legacy_unorm_encoded()) {
+		shared_deco_log_once(msc, "LEGACY (DXR_COLOR_LEGACY_UNORM_ENCODED=1): encoded-space blend");
+		return true;
+	}
+	if (shared_format_is_srgb(msc->shared_atlas_format)) {
+		// The atlas attachment encodes on write already: sampling honestly is all.
+		shared_deco_log_once(msc, "format-honest (atlas is _SRGB)");
+		out->honest = true;
+		return true;
+	}
+	if (msc->shared_deco_honest_failed || msc->shared_atlas_deco_view == VK_NULL_HANDLE) {
+		shared_deco_log_once(msc, "LEGACY (no _SRGB view of the atlas): encoded-space blend");
+		return true;
+	}
+
+	VkFormat deco_fmt = msc->shared_atlas_deco_format;
+	if (!msc->shared_deco_blend_initialized) {
+		if (!vk_hud_blend_init(&msc->shared_deco_blend, vk, deco_fmt)) {
+			U_LOG_W("[#59] #1795: _SRGB decoration blend init failed; decorations stay legacy");
+			msc->shared_deco_honest_failed = true;
+			return true;
+		}
+		msc->shared_deco_blend_initialized = true;
+	}
+	if (!msc->shared_deco_content_blend_initialized) {
+		if (!comp_multi_content_blend_init(&msc->shared_deco_content_blend, vk, deco_fmt)) {
+			U_LOG_W("[#59] #1795: _SRGB decoration quad blend init failed; decorations stay legacy");
+			msc->shared_deco_honest_failed = true;
+			return true;
+		}
+		msc->shared_deco_content_blend_initialized = true;
+	}
+	if (msc->shared_atlas_deco_fb == VK_NULL_HANDLE ||
+	    msc->shared_atlas_deco_fb_view != msc->shared_atlas_deco_view) {
+		if (msc->shared_atlas_deco_fb != VK_NULL_HANDLE) {
+			vk->vkDestroyFramebuffer(vk->device, msc->shared_atlas_deco_fb, NULL);
+			msc->shared_atlas_deco_fb = VK_NULL_HANDLE;
+		}
+		VkFramebufferCreateInfo fb_info = {
+		    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+		    .renderPass = msc->shared_deco_blend.render_pass,
+		    .attachmentCount = 1,
+		    .pAttachments = &msc->shared_atlas_deco_view,
+		    .width = (uint32_t)msc->shared_atlas_w,
+		    .height = (uint32_t)msc->shared_atlas_h,
+		    .layers = 1,
+		};
+		if (vk->vkCreateFramebuffer(vk->device, &fb_info, NULL, &msc->shared_atlas_deco_fb) != VK_SUCCESS) {
+			U_LOG_W("[#59] #1795: _SRGB decoration framebuffer failed; decorations stay legacy");
+			msc->shared_atlas_deco_fb = VK_NULL_HANDLE;
+			msc->shared_deco_honest_failed = true;
+			return true;
+		}
+		msc->shared_atlas_deco_fb_view = msc->shared_atlas_deco_view;
+	}
+
+	shared_deco_log_once(msc, "format-honest (sources as declared, linear blend through an _SRGB atlas view)");
+	out->blend = &msc->shared_deco_blend;
+	out->content = &msc->shared_deco_content_blend;
+	out->fb = msc->shared_atlas_deco_fb;
+	out->honest = true;
+	return true;
+}
+
+/*!
  * Alpha-blend one decoration source image into the combined atlas (atlas must be
  * COLOR_ATTACHMENT_OPTIMAL on entry/exit). The dst rect is clamped to [clip_x0,
  * clip_x1) × [clip_y0, clip_y1) — the eye's tile — so a decoration can't bleed
  * into the other eye or off the atlas. The cross-process source rests in GENERAL.
+ * @p src_fmt is the source swapchain's declared format; it is read as that
+ * format when @p t is honest (#1795) and ignored on the legacy target.
  */
 static void
 shared_blend_into_atlas(struct multi_system_compositor *msc,
                         struct vk_bundle *vk,
                         VkCommandBuffer cmd,
+                        const struct shared_deco_target *t,
                         VkImage src_image,
+                        VkFormat src_fmt,
                         int dst_x,
                         int dst_y,
                         int dst_w,
@@ -4326,9 +4606,12 @@ shared_blend_into_atlas(struct multi_system_compositor *msc,
 	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
 	                         NULL, 0, NULL, 1, &to_src);
 
-	vk_hud_blend_draw_no_layout(&msc->shared_chrome_blend, vk, cmd, msc->shared_atlas_fb,
-	                            (uint32_t)msc->shared_atlas_w, (uint32_t)msc->shared_atlas_h, src_image, x0, y0,
-	                            (uint32_t)(x1 - x0), (uint32_t)(y1 - y0));
+	// #1795: VK_FORMAT_UNDEFINED keeps vk_hud_blend's legacy R8G8B8A8_UNORM view.
+	// The declared format is always a legal view (the image's own format).
+	vk_hud_blend_draw_no_layout_fmt(t->blend, vk, cmd, t->fb, (uint32_t)msc->shared_atlas_w,
+	                                (uint32_t)msc->shared_atlas_h, src_image,
+	                                t->honest ? src_fmt : VK_FORMAT_UNDEFINED, x0, y0, (uint32_t)(x1 - x0),
+	                                (uint32_t)(y1 - y0), false);
 
 	VkImageMemoryBarrier to_general = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -4363,7 +4646,10 @@ shared_composite_decorations(struct multi_system_compositor *msc,
                              float px_per_m_y,
                              uint32_t tile_columns)
 {
-	if (!shared_ensure_chrome_blend(msc, vk)) {
+	// #1795: legacy or format-honest target, resolved once per frame so every
+	// decoration blends in the same space.
+	struct shared_deco_target t;
+	if (!shared_resolve_deco_target(msc, vk, &t)) {
 		return;
 	}
 
@@ -4417,7 +4703,7 @@ shared_composite_decorations(struct multi_system_compositor *msc,
 			float ccz = e->pose_z + woff.z;
 
 			// One render pass over both eyes (barriers must wrap, not nest, the pass).
-			if (shared_ensure_content_blend(msc, vk)) {
+			if (t.content != NULL) {
 				VkImageMemoryBarrier to_read = {
 				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 				    .srcAccessMask = 0,
@@ -4430,8 +4716,7 @@ shared_composite_decorations(struct multi_system_compositor *msc,
 				vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
 				                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0,
 				                         NULL, 1, &to_read);
-				comp_multi_content_blend_begin(&msc->shared_content_blend, vk, cmd,
-				                               msc->shared_atlas_fb, (uint32_t)msc->shared_atlas_w,
+				comp_multi_content_blend_begin(t.content, vk, cmd, t.fb, (uint32_t)msc->shared_atlas_w,
 				                               (uint32_t)msc->shared_atlas_h);
 				for (uint32_t eye = 0; eye < tile_columns; eye++) {
 					uint32_t ei = (eye < eye_pos->count) ? eye : (eye_pos->count - 1);
@@ -4453,14 +4738,14 @@ shared_composite_decorations(struct multi_system_compositor *msc,
 					    .use_src_alpha = 1.0f,
 					};
 					memcpy(pcq.corners, corners, sizeof(corners));
-					comp_multi_content_blend_draw_quad(&msc->shared_content_blend, vk, cmd,
+					comp_multi_content_blend_draw_quad(t.content, vk, cmd,
 					                                   chrome_img, 0, sc->vkic.info.format,
 					                                   VK_NULL_HANDLE, VK_FORMAT_UNDEFINED, &pcq,
 					                                   tile_x0, 0, (uint32_t)eye_w, (uint32_t)eye_h,
 					                                   (uint32_t)msc->shared_atlas_w,
 					                                   (uint32_t)msc->shared_atlas_h);
 				}
-				comp_multi_content_blend_end(&msc->shared_content_blend, vk, cmd);
+				comp_multi_content_blend_end(t.content, vk, cmd);
 				VkImageMemoryBarrier to_general = {
 				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 				    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
@@ -4488,8 +4773,8 @@ shared_composite_decorations(struct multi_system_compositor *msc,
 			                            eye_pos->eyes[ei].x, eye_pos->eyes[ei].y, eye_pos->eyes[ei].z,
 			                            eye_w, eye_h, px_per_m_x, px_per_m_y, &rx, &ry, &rw, &rh);
 			int tile_x0 = (int)eye * eye_w;
-			shared_blend_into_atlas(msc, vk, cmd, chrome_img, tile_x0 + rx, ry, rw, rh, tile_x0,
-			                        tile_x0 + eye_w, 0, eye_h);
+			shared_blend_into_atlas(msc, vk, cmd, &t, chrome_img, (VkFormat)sc->vkic.info.format,
+			                        tile_x0 + rx, ry, rw, rh, tile_x0, tile_x0 + eye_w, 0, eye_h);
 		}
 	}
 
@@ -4534,7 +4819,7 @@ shared_composite_decorations(struct multi_system_compositor *msc,
 				// src_uv + use_src_alpha) as a flat (W = 1) axis-aligned quad —
 				// the chrome-pill treatment, minus the tilt. Mirror of the D3D11
 				// service stereo_sbs src-rect split (comp_d3d11_service.cpp).
-				if (!shared_ensure_content_blend(msc, vk)) {
+				if (t.content == NULL) {
 					continue;
 				}
 				VkImageMemoryBarrier ov_to_read = {
@@ -4549,8 +4834,8 @@ shared_composite_decorations(struct multi_system_compositor *msc,
 				vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
 				                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1,
 				                         &ov_to_read);
-				comp_multi_content_blend_begin(&msc->shared_content_blend, vk, cmd, msc->shared_atlas_fb,
-				                               (uint32_t)msc->shared_atlas_w, (uint32_t)msc->shared_atlas_h);
+				comp_multi_content_blend_begin(t.content, vk, cmd, t.fb, (uint32_t)msc->shared_atlas_w,
+				                               (uint32_t)msc->shared_atlas_h);
 				for (uint32_t eye = 0; eye < tile_columns; eye++) {
 					int tile_x0 = (int)eye * eye_w;
 					// Flat axis-aligned quad over the (clipped) overlay rect, in
@@ -4587,14 +4872,14 @@ shared_composite_decorations(struct multi_system_compositor *msc,
 					};
 #undef NDX
 #undef NDY
-					comp_multi_content_blend_draw_quad(&msc->shared_content_blend, vk, cmd, img, 0,
+					comp_multi_content_blend_draw_quad(t.content, vk, cmd, img, 0,
 					                                   sc->vkic.info.format, VK_NULL_HANDLE,
 					                                   VK_FORMAT_UNDEFINED, &pcq, tile_x0, 0,
 					                                   (uint32_t)eye_w, (uint32_t)eye_h,
 					                                   (uint32_t)msc->shared_atlas_w,
 					                                   (uint32_t)msc->shared_atlas_h);
 				}
-				comp_multi_content_blend_end(&msc->shared_content_blend, vk, cmd);
+				comp_multi_content_blend_end(t.content, vk, cmd);
 				VkImageMemoryBarrier ov_to_general = {
 				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 				    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
@@ -4612,8 +4897,9 @@ shared_composite_decorations(struct multi_system_compositor *msc,
 
 			for (uint32_t eye = 0; eye < tile_columns; eye++) {
 				int tile_x0 = (int)eye * eye_w;
-				shared_blend_into_atlas(msc, vk, cmd, img, tile_x0 + base_x, base_y, ow, oh,
-				                        tile_x0, tile_x0 + eye_w, 0, eye_h);
+				shared_blend_into_atlas(msc, vk, cmd, &t, img, (VkFormat)sc->vkic.info.format,
+				                        tile_x0 + base_x, base_y, ow, oh, tile_x0, tile_x0 + eye_w, 0,
+				                        eye_h);
 			}
 		}
 	}
@@ -4635,8 +4921,9 @@ shared_composite_decorations(struct multi_system_compositor *msc,
 					int dy = pyg - (int)(cur.hot_y * (float)size_px);
 					for (uint32_t eye = 0; eye < tile_columns; eye++) {
 						int tile_x0 = (int)eye * eye_w;
-						shared_blend_into_atlas(msc, vk, cmd, img, tile_x0 + dx, dy, size_px,
-						                        size_px, tile_x0, tile_x0 + eye_w, 0, eye_h);
+						shared_blend_into_atlas(msc, vk, cmd, &t, img,
+						                        (VkFormat)sc->vkic.info.format, tile_x0 + dx, dy,
+						                        size_px, size_px, tile_x0, tile_x0 + eye_w, 0, eye_h);
 					}
 				}
 			}
