@@ -176,7 +176,7 @@ override that bypasses the registry (`service_orchestrator.c:146-186`).
 |---|---|---|---|
 | 1 | `--autostart` with `start_on_login=false` → `ExitProcess(0)` (the only `ExitProcess`) | yes | `main.c:125-128` |
 | 2 | Tray **Exit** → `g_service_shutdown_requested` → mainloop returns → `WinMain` returns | yes | `service_tray_win.c` (`request_service_exit`); `ipc_server_mainloop_windows.cpp:273-277` |
-| 2a | **Restart Manager / logoff / `taskkill` without `/F`** → `WM_ENDSESSION` or `WM_CLOSE` on the hidden session-end window → the same path as #2, plus a 20 s backstop that `TerminateProcess`es if teardown has not finished (§1.5) | yes | `service_tray_win.c` (`session_wnd_proc`) |
+| 2a | **Restart Manager / logoff / `taskkill` without `/F`** → `WM_QUERYENDSESSION` with `ENDSESSION_CLOSEAPP`, `WM_ENDSESSION` or `WM_CLOSE` on the hidden session-end window → the same path as #2, plus a 20 s backstop that `TerminateProcess`es if teardown has not finished (§1.5) | yes | `service_tray_win.c` (`session_wnd_proc`) |
 | 3 | `IPC_EXIT_ON_DISCONNECT` / `IPC_EXIT_WHEN_IDLE` (both default off) | yes | `ipc_server_per_client_thread.c:166-176` |
 | 4 | pipe-layer failure → `ipc_server_handle_failure` → `running=false` | yes | `ipc_server_process.c:933-937` |
 | 5 | `init_all` failure (e.g. no DP found) | yes | `ipc_server_process.c:1075-1084` |
@@ -236,11 +236,20 @@ application so an installer can do that with the standard API and no DisplayXR-s
 - **Detectable.** `RmGetList` reports `displayxr-service.exe` as holding the file, as
   a GUI application (`RmOtherWindow`: its top-level windows are hidden) with
   `bRestartable = TRUE`.
-- **Closes cleanly without force.** A hidden top-level window on the tray thread answers
-  `WM_QUERYENDSESSION` with TRUE (no UI, no waits) and on `WM_ENDSESSION` (`wParam` TRUE) or
-  `WM_CLOSE` takes the normal tray-**Exit** path (§1.3 #2a). The tray window itself is
-  message-only (`HWND_MESSAGE`), which never receives these messages; before this window
-  existed RM could only close the service with `RmForceShutdown`.
+- **Closes cleanly.** A hidden top-level window on the tray thread answers
+  `WM_QUERYENDSESSION` with TRUE (no UI, no waits) and takes the normal tray-**Exit** path
+  (§1.3 #2a) on a Restart Manager close request — **already on the query** when it carries
+  `ENDSESSION_CLOSEAPP` — and on `WM_ENDSESSION` (`wParam` TRUE) or `WM_CLOSE`. The tray
+  window itself is message-only (`HWND_MESSAGE`), which never receives these messages.
+- **Why the query, not `WM_ENDSESSION`.** RM walks *every* top-level window of the process,
+  and a library a vendor plug-in loads can own one on a thread that never pumps messages
+  (measured: a 2D-to-3D conversion module's worker thread owns a hidden GL window). RM then
+  never completes the query round, so `WM_ENDSESSION` is never sent; with `RmForceShutdown`
+  it waits out its timeouts (~70 s), terminates the process, reports `ERROR_FAIL_SHUTDOWN`
+  and does **not** restart it. The `ENDSESSION_CLOSEAPP` query is the one signal that always
+  arrives. Exiting on it is safe here: the service has no unsaved state, and if another
+  application vetoes the shutdown the next OpenXR app starts the service again (§1.1). A
+  logoff/shutdown query (no `CLOSEAPP`) still waits for `WM_ENDSESSION`.
 - **Bounded.** If teardown has not finished 20 s after the request, the process terminates
   itself, so the files are released inside Restart Manager's 30 s force window either way.
 - **Restartable, non-elevated.** At start the service calls `RegisterApplicationRestart("--rm-restart",
@@ -261,11 +270,25 @@ application so an installer can do that with the standard API and no DisplayXR-s
 RmStartSession
 RmRegisterResources(<the files to replace>)
 RmGetList                       -> displayxr-service.exe, RmOtherWindow, restartable
-RmShutdown(0)                   -> service exits cleanly (RmForceShutdown only as a fallback)
+RmShutdown(RmForceShutdown)     -> service exits cleanly
 <replace the files>
 RmRestart                       -> service relaunched with --rm-restart
 RmEndSession
 ```
+
+**Pass `RmForceShutdown`.** Measured on hardware, RM driven from an elevated process, the
+service at medium integrity:
+
+| State of the service | `RmShutdown(0)` | `RmShutdown(RmForceShutdown)` |
+|---|---|---|
+| no vendor window in the process | success in ~0.5 s, restarted | same |
+| a vendor library's non-pumping window present | `ERROR_FAIL_SHUTDOWN` after ~0.25 s — RM gives up at once and will not restart, although the service has seen the query and exits a moment later | success in 6–11 s (RM first waits ~5 s per unresponsive window), files released, restarted |
+
+Force costs nothing when the service is responsive: it exits on the query long before RM's
+30 s kill. In both columns `RmRestart` brought the service back at **medium integrity** with
+`--rm-restart`, from an elevated caller, with no minimum uptime. An installer that has
+already called `RmShutdown(0)` and got `ERROR_FAIL_SHUTDOWN` can simply call it again with
+`RmForceShutdown`.
 
 What a close costs: every connected OpenXR app loses its session
 (`XR_ERROR_INSTANCE_LOST`, no reconnect — §1.2), and the workspace controller is
@@ -276,7 +299,8 @@ dependencies — themselves, so `RmGetList` lists them too and they are closed b
 window handling.
 
 **Installers that do not use Restart Manager** terminate `displayxr-service.exe`
-(`taskkill /IM displayxr-service.exe` asks it to close cleanly; `/F` kills it), replace the
+(`taskkill /F /IM displayxr-service.exe`; without `/F` it closes cleanly only while no vendor
+window sits above the session-end window, so it is not reliable), replace the
 files, then start it again **non-elevated** — e.g. from an elevated installer,
 `explorer.exe "<InstallPath>\displayxr-service.exe"`, with `InstallPath` read from
 `HKLM\Software\DisplayXR\Runtime`. Starting it directly from an elevated process leaves an

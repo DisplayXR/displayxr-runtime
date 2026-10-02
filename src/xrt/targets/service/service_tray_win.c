@@ -378,8 +378,23 @@ session_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
 	switch (msg) {
 	case WM_QUERYENDSESSION:
-		// Always agree; shut down only on WM_ENDSESSION (another app may veto).
-		// Must answer within RM's 5 s per-message timeout: no UI, no waits.
+		// Always agree. Must answer within RM's 5 s per-message timeout: no
+		// UI, no waits.
+		//
+		// A Restart Manager close request (ENDSESSION_CLOSEAPP: an installer
+		// needs a file we hold) is acted on HERE, not on WM_ENDSESSION. RM
+		// walks every top-level window of the process, and a vendor library
+		// loaded into it can own one on a thread that never pumps messages
+		// (hardware-verified: a 2D-to-3D conversion module's hidden GL
+		// window). RM then never gets past the query round, WM_ENDSESSION is
+		// never sent, and a forced shutdown ends in TerminateProcess with no
+		// restart. The query is the one signal that always arrives; the
+		// service has no unsaved state, and if another application vetoes
+		// the shutdown the next client simply starts the service again.
+		// A logoff/shutdown query (no CLOSEAPP) still waits for WM_ENDSESSION.
+		if (lParam & ENDSESSION_CLOSEAPP) {
+			session_end_request_exit("WM_QUERYENDSESSION", lParam);
+		}
 		return TRUE;
 
 	case WM_ENDSESSION:
