@@ -90,6 +90,13 @@
  *                      at 50 -> events 2D,3D,2D. Pair it with a service
  *                      started with SIM_DISPLAY_FAKE_LENS=1 so the weave
  *                      engine's DP records + logs each request.
+ *   --mono-in-2d       chain XrWeaveSubmitMonoIn2DDXR (spec v13) on every
+ *                      submit: while the hardware is 2D the service presents
+ *                      the centre view flat instead of the weave.
+ *   --hold-2d-at=N / --release-3d-at=M  (headless) request hardware 2D at
+ *                      frame N (and 3D at frame M) — a browser's menu hold.
+ *   --expect-mono      (headless) require woven == the SBS input's LEFT view,
+ *                      unsqueezed to full width (one view, no weave).
  *   --lattice-selftest one Wayland drag-lattice table build per output scale
  *                      (100 %, 200 %, 150 %) through the helper's own table
  *                      code (dxr_wl_lattice::probe_via_grid) and the SAME
@@ -233,6 +240,10 @@ struct Options
 	bool lattice_selftest = false; //!< --lattice-selftest
 	bool test_display_mode = false;   //!< --test-display-mode (headless)
 	bool test_display_deferred = false; //!< --test-display-mode=deferred
+	bool mono_in_2d = false;            //!< --mono-in-2d (spec v13)
+	int hold_2d_frame = -1;             //!< --hold-2d-at=N (headless)
+	int release_3d_frame = -1;          //!< --release-3d-at=M (headless)
+	bool expect_mono = false;           //!< --expect-mono (headless)
 };
 
 static void
@@ -265,6 +276,14 @@ usage(const char *argv0)
 	        "like a window resize\n"
 	        "  --test-display-mode[=stale|deferred]  (headless) request hardware "
 	        "2D/3D sequences and require the matching events\n"
+	        "  --mono-in-2d                 chain XrWeaveSubmitMonoIn2DDXR "
+	        "(v13): one flat view while hardware 2D\n"
+	        "  --hold-2d-at=N               (headless) request hardware 2D at "
+	        "frame N\n"
+	        "  --release-3d-at=M            (headless) request hardware 3D at "
+	        "frame M\n"
+	        "  --expect-mono                (headless) require woven == the "
+	        "left view, unsqueezed\n"
 	        "  --lattice-selftest           build one drag-lattice table per "
 	        "scale via the grid provider (exit 1 = FAIL)\n"
 	        "  --dump-dir=DIR               where PNGs go (default $TMPDIR, else "
@@ -325,6 +344,14 @@ parse_args(int argc, char **argv, Options &o)
 		} else if (strcmp(a, "--test-display-mode=deferred") == 0) {
 			o.test_display_mode = true;
 			o.test_display_deferred = true;
+		} else if (strcmp(a, "--mono-in-2d") == 0) {
+			o.mono_in_2d = true;
+		} else if (strncmp(a, "--hold-2d-at=", 13) == 0) {
+			o.hold_2d_frame = atoi(a + 13);
+		} else if (strncmp(a, "--release-3d-at=", 16) == 0) {
+			o.release_3d_frame = atoi(a + 16);
+		} else if (strcmp(a, "--expect-mono") == 0) {
+			o.expect_mono = true;
 		} else if (strncmp(a, "--dump-dir=", 11) == 0) {
 			o.dump_dir = a + 11;
 		} else if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) {
@@ -848,7 +875,8 @@ init_session()
 	xrGetInstanceProcAddr(g.instance, "xrWeaveBindWindow2DXR", (PFN_xrVoidFunction *)&g.pfn_bind2);
 	xrGetInstanceProcAddr(g.instance, "xrWeaveSubmitDXR", (PFN_xrVoidFunction *)&g.pfn_submit);
 	xrGetInstanceProcAddr(g.instance, "xrWeaveSnapWindowRectDXR", (PFN_xrVoidFunction *)&g.pfn_snap);
-	if (g.opt.test_display_mode && g.has_display_info) {
+	if ((g.opt.test_display_mode || g.opt.hold_2d_frame >= 0 || g.opt.release_3d_frame >= 0) &&
+	    g.has_display_info) {
 		xrGetInstanceProcAddr(g.instance, "xrRequestDisplayModeDXR",
 		                      (PFN_xrVoidFunction *)&g.pfn_request_display_mode);
 	}
@@ -1928,8 +1956,17 @@ weave_submit(int k, bool with_overlay, int acq_fd, int *release_fd)
 	} else {
 		batch.next = &in_desc;
 	}
+	// v13: one flat view while the hardware is 2D. Chained first; a runtime
+	// older than v13 skips it.
+	XrWeaveSubmitMonoIn2DDXR mono = {XR_TYPE_WEAVE_SUBMIT_MONO_IN_2D_DXR};
+	mono.monoIn2D = XR_TRUE;
 	XrWeaveSubmitInfoDXR submit = {XR_TYPE_WEAVE_SUBMIT_INFO_DXR};
-	submit.next = &batch;
+	if (g.opt.mono_in_2d) {
+		mono.next = &batch;
+		submit.next = &mono;
+	} else {
+		submit.next = &batch;
+	}
 	submit.firstChunk = XR_TRUE;
 
 	XrWeaveOutputOriginDXR out_origin = {XR_TYPE_WEAVE_OUTPUT_ORIGIN_DXR}; // v12, zeroed
@@ -2170,6 +2207,7 @@ struct Verdict
 	double diff_vs_sbs = 0.0;    //!< mean |woven - sbs| per channel: did the weave
 	                             //!< transform anything?
 	double anaglyph_err = 0.0;   //!< mean |woven - anaglyph(sbs)| per channel, outside the HUD
+	double mono_err = 0.0;       //!< mean |woven - left view of sbs, unsqueezed| per channel, outside the HUD
 	bool hud_ok = true;          //!< a HUD-box pixel reads the HUD colour (2D composited
 	                             //!< over the weave)
 	double presented_err = -1.0; //!< (headless) mean |presented - (sbs mode ? sbs : woven)|
@@ -2189,7 +2227,7 @@ analyze(const uint8_t *woven, const uint8_t *sbs, uint32_t w, uint32_t h)
 {
 	Verdict v;
 	const uint32_t ew = w / 2;
-	double luma = 0.0, diff = 0.0, aerr = 0.0;
+	double luma = 0.0, diff = 0.0, aerr = 0.0, merr = 0.0;
 	uint64_t n = 0, nb = 0, na = 0;
 	const bool hud = g.opt.hud && g.hud_w > 0;
 	for (uint32_t y = 1; y + 1 < h; y += 2) {
@@ -2209,7 +2247,10 @@ analyze(const uint8_t *woven, const uint8_t *sbs, uint32_t w, uint32_t h)
 			// sim_display anaglyph: red from the left tile, green+blue from
 			// the right, each sampled (bilinear) at u/2 — take the best of the
 			// two nearest source columns.
-			double best = 1e9;
+			// Mono (spec v13): the left view alone, unsqueezed to full width
+			// (a LINEAR stretch of the left half) — same best-of-neighbours
+			// tolerance.
+			double best = 1e9, best_mono = 1e9;
 			for (int dx = -1; dx <= 1; dx++) {
 				const int lx = std::clamp((int)(x / 2) + dx, 0, (int)ew - 1);
 				int lr, lg, lb, rr, rg, rb;
@@ -2217,8 +2258,11 @@ analyze(const uint8_t *woven, const uint8_t *sbs, uint32_t w, uint32_t h)
 				px(sbs, w, (int)ew + lx, (int)y, &rr, &rg, &rb);
 				const double e = (std::abs(wr - lr) + std::abs(wg - rg) + std::abs(wb - rb)) / 3.0;
 				best = std::min(best, e);
+				const double em = (std::abs(wr - lr) + std::abs(wg - lg) + std::abs(wb - lb)) / 3.0;
+				best_mono = std::min(best_mono, em);
 			}
 			aerr += best;
+			merr += best_mono;
 			na++;
 		}
 	}
@@ -2226,6 +2270,7 @@ analyze(const uint8_t *woven, const uint8_t *sbs, uint32_t w, uint32_t h)
 	v.nonblack = n ? (double)nb / (double)n : 0.0;
 	v.diff_vs_sbs = n ? diff / (double)n : 0.0;
 	v.anaglyph_err = na ? aerr / (double)na : 0.0;
+	v.mono_err = na ? merr / (double)na : 0.0;
 	if (hud) {
 		// A pixel inside the HUD box, below the text lines' left margin.
 		int r, gg, b;
@@ -2274,9 +2319,9 @@ dump_and_analyze(const char *tag)
 	}
 	LOGI(
 	    "%s: woven mean luma %.1f, non-black %.1f%%, mean |woven - sbs| %.1f, "
-	    "mean |woven - anaglyph(sbs)| %.1f, "
+	    "mean |woven - anaglyph(sbs)| %.1f, mean |woven - left view| %.1f, "
 	    "HUD %s",
-	    tag, v.woven_luma, v.nonblack * 100.0, v.diff_vs_sbs, v.anaglyph_err,
+	    tag, v.woven_luma, v.nonblack * 100.0, v.diff_vs_sbs, v.anaglyph_err, v.mono_err,
 	    !g.opt.hud ? "off" : (v.hud_ok ? "composited" : "MISSING"));
 	return v;
 }
@@ -2393,6 +2438,19 @@ run()
 						g.dm_order_bad = true;
 					}
 				}
+			}
+		}
+
+		if (g.headless && g.pfn_request_display_mode != nullptr &&
+		    (f == g.opt.hold_2d_frame || f == g.opt.release_3d_frame)) {
+			// A browser's menu hold: the lens off at N, back on at M.
+			const bool want_3d = (f == g.opt.release_3d_frame);
+			const XrResult r = g.pfn_request_display_mode(g.session, want_3d ? XR_DISPLAY_MODE_3D_DXR
+			                                                                 : XR_DISPLAY_MODE_2D_DXR);
+			LOGI("frame %d: hold %s -> xrRequestDisplayModeDXR(%s) -> %d", f, want_3d ? "released" : "taken",
+			     want_3d ? "3D" : "2D", (int)r);
+			if (XR_FAILED(r)) {
+				g.dm_order_bad = true;
 			}
 		}
 
@@ -2530,12 +2588,24 @@ run()
 	check(v.presented_err >= 0.0 && v.presented_err < 0.01,
 	      g.opt.sbs ? "presented frame == SBS input (--sbs)" : "presented frame == woven output");
 	check(v.nonblack > 0.5 && v.woven_luma > 10.0, "woven frame is not black");
-	check(v.diff_vs_sbs > 5.0, "woven frame differs from the SBS input (weave ran)");
+	check(v.diff_vs_sbs > 5.0, "woven frame differs from the SBS input (not the raw SBS)");
 	if (g.opt.hud) {
 		check(v.hud_ok, "HUD overlay composited over the weave");
 	}
 	if (g.opt.expect_anaglyph) {
 		check(v.anaglyph_err < 10.0, "woven == red/cyan anaglyph of the SBS input");
+		if (g.opt.mono_in_2d) {
+			// The opt-in is chained: proving the weave ran needs the output to
+			// be told apart from the mono one, not only matched to anaglyph.
+			check(v.anaglyph_err + 2.0 < v.mono_err, "woven is the anaglyph, NOT the mono view");
+		}
+	}
+	if (g.opt.expect_mono) {
+		check(v.mono_err < 10.0, "v13 mono: woven == the left view, unsqueezed");
+		check(v.mono_err + 2.0 < v.anaglyph_err, "v13 mono: woven is NOT the anaglyph (no weave)");
+	}
+	if (g.opt.hold_2d_frame >= 0 || g.opt.release_3d_frame >= 0) {
+		check(g.pfn_request_display_mode != nullptr && !g.dm_order_bad, "hold: xrRequestDisplayModeDXR resolved + succeeded");
 	}
 	LOGI(
 	    "fd counts (steady state) -> frame %d: app %d -> %d, service(pid %ld) "

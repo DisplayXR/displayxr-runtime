@@ -6645,6 +6645,10 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	uint32_t w = 0, h = 0;
 	uint64_t fv = 0;
 	struct xrt_eye_positions eyes = {0};
+#ifdef XRT_OS_LINUX_DESKTOP
+	// v13: per submit — a submit without XrWeaveSubmitMonoIn2DDXR clears it.
+	comp_multi_weave_linux_set_mono_in_2d(ics->xc, args->mono_in_2d != 0);
+#endif
 	bool ok = comp_multi_weave_submit(                          //
 	    ics->xc, handles[0],                                    //
 	    args->rect_x, args->rect_y, args->rect_w, args->rect_h, //
@@ -6959,6 +6963,8 @@ ipc_handle_weave_submit_dmabuf(volatile struct ipc_client_state *ics,
 	uint64_t fv = 0;
 	struct xrt_eye_positions eyes = {0};
 	struct xrt_weave_woven_origin woven = {0};
+	// v13: per submit — a submit without XrWeaveSubmitMonoIn2DDXR clears it.
+	comp_multi_weave_linux_set_mono_in_2d(ics->xc, args->mono_in_2d != 0);
 	bool ok = comp_multi_weave_submit_dmabuf(                   //
 	    ics->xc, &in_desc,                                      //
 	    args->have_overlay ? &overlay_desc : NULL,              //
