@@ -346,10 +346,16 @@ vk_hud_blend_init_ex(struct vk_hud_blend *blend,
 static VkDescriptorSet
 get_or_create_image_desc(struct vk_hud_blend *blend,
                           struct vk_bundle *vk,
-                          VkImage hud_image)
+                          VkImage hud_image,
+                          VkFormat view_fmt)
 {
+	// #1795: the legacy view. Encoded-space callers keep it; honest callers
+	// pass the swapchain's declared format.
+	if (view_fmt == VK_FORMAT_UNDEFINED) {
+		view_fmt = VK_FORMAT_R8G8B8A8_UNORM;
+	}
 	for (uint32_t i = 0; i < blend->image_count; i++) {
-		if (blend->cached_images[i].image == hud_image) {
+		if (blend->cached_images[i].image == hud_image && blend->cached_images[i].format == view_fmt) {
 			return blend->cached_images[i].desc_set;
 		}
 	}
@@ -363,7 +369,7 @@ get_or_create_image_desc(struct vk_hud_blend *blend,
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
 	    .image = hud_image,
 	    .viewType = VK_IMAGE_VIEW_TYPE_2D,
-	    .format = VK_FORMAT_R8G8B8A8_UNORM,
+	    .format = view_fmt,
 	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
 	};
 	VkImageView view = VK_NULL_HANDLE;
@@ -401,6 +407,7 @@ get_or_create_image_desc(struct vk_hud_blend *blend,
 	vk->vkUpdateDescriptorSets(vk->device, 1, &write, 0, NULL);
 
 	blend->cached_images[blend->image_count].image = hud_image;
+	blend->cached_images[blend->image_count].format = view_fmt;
 	blend->cached_images[blend->image_count].view = view;
 	blend->cached_images[blend->image_count].desc_set = desc_set;
 	blend->image_count++;
@@ -429,7 +436,7 @@ vk_hud_blend_draw(struct vk_hud_blend *blend,
 	(void)hud_w;
 	(void)hud_h;
 
-	VkDescriptorSet desc_set = get_or_create_image_desc(blend, vk, hud_image);
+	VkDescriptorSet desc_set = get_or_create_image_desc(blend, vk, hud_image, VK_FORMAT_UNDEFINED);
 	if (desc_set == VK_NULL_HANDLE) {
 		return;
 	}
@@ -555,12 +562,31 @@ vk_hud_blend_draw_no_layout_ex(struct vk_hud_blend *blend,
                                uint32_t dst_h,
                                bool premultiplied)
 {
+	vk_hud_blend_draw_no_layout_fmt(blend, vk, cmd, fb, fb_w, fb_h, hud_image, VK_FORMAT_UNDEFINED, dst_x, dst_y,
+	                                dst_w, dst_h, premultiplied);
+}
+
+void
+vk_hud_blend_draw_no_layout_fmt(struct vk_hud_blend *blend,
+                                struct vk_bundle *vk,
+                                VkCommandBuffer cmd,
+                                VkFramebuffer fb,
+                                uint32_t fb_w,
+                                uint32_t fb_h,
+                                VkImage hud_image,
+                                VkFormat src_view_fmt,
+                                int32_t dst_x,
+                                int32_t dst_y,
+                                uint32_t dst_w,
+                                uint32_t dst_h,
+                                bool premultiplied)
+{
 	if (!blend->initialized || hud_image == VK_NULL_HANDLE || fb == VK_NULL_HANDLE ||
 	    dst_w == 0 || dst_h == 0) {
 		return;
 	}
 
-	VkDescriptorSet desc_set = get_or_create_image_desc(blend, vk, hud_image);
+	VkDescriptorSet desc_set = get_or_create_image_desc(blend, vk, hud_image, src_view_fmt);
 	if (desc_set == VK_NULL_HANDLE) {
 		return;
 	}
@@ -594,8 +620,10 @@ vk_hud_blend_forget_image(struct vk_hud_blend *blend, struct vk_bundle *vk, VkIm
 		return;
 	}
 
-	for (uint32_t i = 0; i < blend->image_count; i++) {
+	// #1795: an image may be cached under more than one view format.
+	for (uint32_t i = 0; i < blend->image_count;) {
 		if (blend->cached_images[i].image != hud_image) {
+			i++;
 			continue;
 		}
 		vk->vkDestroyImageView(vk->device, blend->cached_images[i].view, NULL);
@@ -604,7 +632,6 @@ vk_hud_blend_forget_image(struct vk_hud_blend *blend, struct vk_bundle *vk, VkIm
 		// Order does not matter: move the last entry into the hole.
 		blend->image_count--;
 		blend->cached_images[i] = blend->cached_images[blend->image_count];
-		return;
 	}
 }
 

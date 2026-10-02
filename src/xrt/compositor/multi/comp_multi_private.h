@@ -1305,6 +1305,24 @@ struct multi_system_compositor
 	//! shared_atlas_fb (render-pass compatible with shared_chrome_blend).
 	struct comp_multi_content_blend shared_content_blend;
 	bool shared_content_blend_initialized;
+
+	//! #1795 (ADR-044 §7): format-honest decorations. The atlas holds ENCODED
+	//! bytes (the DP and the content pass see its plain view), so the chrome /
+	//! overlay / cursor pass renders through an `_SRGB` view of it instead:
+	//! sources are sampled as their DECLARED format, blend in linear light and
+	//! are encoded once on write. The atlas is created MUTABLE_FORMAT with that
+	//! sibling in its view-format list, so the view is legal and no copy is
+	//! needed. All UNDEFINED / VK_NULL_HANDLE under the legacy hatch.
+	VkFormat shared_atlas_deco_format;      //!< `_SRGB` sibling the atlas is mutable for.
+	VkImageView shared_atlas_deco_view;     //!< `_SRGB` view of the atlas (decoration target).
+	VkFramebuffer shared_atlas_deco_fb;     //!< Framebuffer over shared_atlas_deco_view.
+	VkImageView shared_atlas_deco_fb_view;  //!< The deco view the fb was built for (recreate key).
+	struct vk_hud_blend shared_deco_blend;  //!< Flat decorations into the `_SRGB` view.
+	bool shared_deco_blend_initialized;
+	struct comp_multi_content_blend shared_deco_content_blend; //!< Quad / SBS decorations, `_SRGB` view.
+	bool shared_deco_content_blend_initialized;
+	bool shared_deco_honest_failed; //!< Sticky: setup failed once, legacy decorations from then on.
+	bool shared_deco_logged;        //!< The one-time regime WARN has been emitted.
 	//! @}
 #endif
 };
