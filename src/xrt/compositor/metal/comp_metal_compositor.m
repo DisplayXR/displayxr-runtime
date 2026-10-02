@@ -4018,6 +4018,21 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				}
 			}
 
+			// #1788: window-space layers BLEND over the projection content,
+			// same rule as D3D11/D3D12, vk_native and GL (#1786/#1787):
+			// SOURCE_ALPHA_BIT clear means premultiplied bytes (colour src
+			// ONE), set means straight (colour src SOURCE_ALPHA); colour dst
+			// and the alpha "over" (ONE / ONE_MINUS_SOURCE_ALPHA) are shared,
+			// so atlas alpha survives for transparent sessions (#225/#1784).
+			// The blended projection pipelines carry exactly those factors.
+			// Deliberately NOT comp_layer_blend_mode() (#1599): see the
+			// comment in comp_d3d11_renderer.cpp's window-space draw. And
+			// never projection_pipeline — its REPLACE is for the base blit.
+			bool ws_premultiplied =
+			    (layer->data.flags & XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT) == 0;
+			id<MTLRenderPipelineState> ws_pipeline =
+			    ws_premultiplied ? c->proj_premult_pipeline : c->proj_straight_pipeline;
+
 			// Source UV sub-rect (default to full texture if not specified)
 			struct xrt_normalized_rect nr = ws->sub.norm_rect;
 			if (nr.w <= 0.0f || nr.h <= 0.0f) {
@@ -4060,7 +4075,7 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				}
 				[encoder setViewport:vp];
 
-				[encoder setRenderPipelineState:c->projection_pipeline];
+				[encoder setRenderPipelineState:ws_pipeline];
 				[encoder setDepthStencilState:c->depth_stencil_state];
 				[encoder setFragmentTexture:src_tex atIndex:0];
 				[encoder setFragmentSamplerState:c->sampler_linear atIndex:0];
