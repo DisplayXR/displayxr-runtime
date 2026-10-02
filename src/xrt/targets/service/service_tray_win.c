@@ -15,6 +15,7 @@
 #include <string.h>
 
 #include "util/u_crash_guard.h"
+#include "util/u_logging.h"
 
 #define IDI_DISPLAYXR_ICON_WHITE 101
 #define IDI_DISPLAYXR_ICON_BLACK 102
@@ -298,6 +299,107 @@ config_changed(void)
 }
 
 
+//! The service's one clean-shutdown request, from the tray thread: raise the
+//! flag the IPC mainloop polls (it returns within one 50 ms tick and WinMain
+//! tears down) and end the tray thread's message loop. Shared by the tray
+//! "Exit" item and the session-end window below.
+static void
+request_service_exit(void)
+{
+	if (s_shutdown_cb) {
+		s_shutdown_cb();
+	}
+	PostQuitMessage(0);
+}
+
+
+/*
+ *
+ * Session-end window (Restart Manager, logoff, shutdown)
+ *
+ */
+
+/*!
+ * Exit budget after a session-end / Restart Manager close request. Teardown
+ * normally finishes in well under a second, but it does not join the per-client
+ * IPC threads and calls into the vendor DP, so it is not provably bounded.
+ * Restart Manager force-terminates an application that has not exited 30 s
+ * after the request (RmShutdown docs), and an installer that did NOT pass
+ * RmForceShutdown just fails instead; stay well inside that window so the
+ * files an installer is waiting on are always released by process exit.
+ */
+#define SESSION_END_EXIT_BUDGET_MS 20000
+
+static DWORD WINAPI
+session_end_backstop_thread(LPVOID param)
+{
+	(void)param;
+	Sleep(SESSION_END_EXIT_BUDGET_MS);
+	U_LOG_W("Session-end: clean shutdown did not finish within %d ms; terminating the process.",
+	        SESSION_END_EXIT_BUDGET_MS);
+	TerminateProcess(GetCurrentProcess(), 0);
+	return 0;
+}
+
+//! A session-end request (WM_ENDSESSION or WM_CLOSE) arrived: take the normal
+//! exit path once, and arm the bounded backstop.
+static void
+session_end_request_exit(const char *what, LPARAM lParam)
+{
+	static bool requested = false;
+	if (requested) {
+		return;
+	}
+	requested = true;
+
+	U_LOG_W("%s received (lParam=0x%llx%s); shutting down cleanly (Restart Manager / session end).", what,
+	        (unsigned long long)lParam, (lParam & ENDSESSION_CLOSEAPP) ? " ENDSESSION_CLOSEAPP" : "");
+
+	HANDLE t = CreateThread(NULL, 0, session_end_backstop_thread, NULL, 0, NULL);
+	if (t != NULL) {
+		CloseHandle(t);
+	}
+
+	request_service_exit();
+}
+
+/*!
+ * Hidden top-level window. It exists only so the service is a closeable
+ * Restart Manager application: RM (and logoff/shutdown) deliver
+ * WM_QUERYENDSESSION / WM_ENDSESSION / WM_CLOSE to top-level windows, and the
+ * tray window is message-only (HWND_MESSAGE), which receives none of them.
+ * Without this window the only top-level windows are incidental ones (a GPU
+ * driver's dummy window, the IME window) whose default handling never ends the
+ * process, so only a forced shutdown (TerminateProcess) could close it. Never
+ * shown.
+ */
+static LRESULT CALLBACK
+session_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+	switch (msg) {
+	case WM_QUERYENDSESSION:
+		// Always agree; shut down only on WM_ENDSESSION (another app may veto).
+		// Must answer within RM's 5 s per-message timeout: no UI, no waits.
+		return TRUE;
+
+	case WM_ENDSESSION:
+		// wParam FALSE = the session is not ending after all (someone vetoed).
+		if (wParam) {
+			session_end_request_exit("WM_ENDSESSION", lParam);
+		}
+		return 0;
+
+	case WM_CLOSE:
+		// RM sends WM_CLOSE to an app that did not exit on WM_ENDSESSION, and
+		// `taskkill` without /F sends it too: same clean exit.
+		session_end_request_exit("WM_CLOSE", lParam);
+		return 0;
+
+	default: return DefWindowProcW(hwnd, msg, wParam, lParam);
+	}
+}
+
+
 /*
  *
  * Window procedure
@@ -368,12 +470,7 @@ tray_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			break;
 
 		// Exit
-		case IDM_EXIT:
-			if (s_shutdown_cb) {
-				s_shutdown_cb();
-			}
-			PostQuitMessage(0);
-			break;
+		case IDM_EXIT: request_service_exit(); break;
 		}
 		return 0;
 	}
@@ -420,6 +517,24 @@ tray_thread_body(LPVOID param)
 	if (!s_tray_hwnd) {
 		SetEvent(s_ready_event);
 		return 1;
+	}
+
+	// Hidden top-level session-end window on this same thread (its messages
+	// are pumped by the loop below). Best-effort: without it the service still
+	// runs, it just cannot be closed by Restart Manager except by force.
+	WNDCLASSEXW session_wcex = {0};
+	session_wcex.cbSize = sizeof(WNDCLASSEXW);
+	session_wcex.lpfnWndProc = session_wnd_proc;
+	session_wcex.hInstance = GetModuleHandleW(NULL);
+	session_wcex.lpszClassName = L"DisplayXRServiceSession";
+	RegisterClassExW(&session_wcex);
+	HWND session_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, session_wcex.lpszClassName, L"DisplayXR Service",
+	                                    WS_POPUP, 0, 0, 0, 0, NULL, NULL, GetModuleHandleW(NULL), NULL);
+	if (!session_hwnd) {
+		U_LOG_W(
+		    "Could not create the session-end window (error %lu); Restart Manager can only force-close "
+		    "the service.",
+		    GetLastError());
 	}
 
 	// Set up the tray icon

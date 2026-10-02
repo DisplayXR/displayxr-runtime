@@ -175,7 +175,8 @@ override that bypasses the registry (`service_orchestrator.c:146-186`).
 | # | Way the service ends | Logs first? | Anchor |
 |---|---|---|---|
 | 1 | `--autostart` with `start_on_login=false` → `ExitProcess(0)` (the only `ExitProcess`) | yes | `main.c:125-128` |
-| 2 | Tray **Exit** → `g_service_shutdown_requested` → mainloop returns → `WinMain` returns | yes | `service_tray_win.c:406-411`; `ipc_server_mainloop_windows.cpp:273-277` |
+| 2 | Tray **Exit** → `g_service_shutdown_requested` → mainloop returns → `WinMain` returns | yes | `service_tray_win.c` (`request_service_exit`); `ipc_server_mainloop_windows.cpp:273-277` |
+| 2a | **Restart Manager / logoff / `taskkill` without `/F`** → `WM_ENDSESSION` or `WM_CLOSE` on the hidden session-end window → the same path as #2, plus a 20 s backstop that `TerminateProcess`es if teardown has not finished (§1.5) | yes | `service_tray_win.c` (`session_wnd_proc`) |
 | 3 | `IPC_EXIT_ON_DISCONNECT` / `IPC_EXIT_WHEN_IDLE` (both default off) | yes | `ipc_server_per_client_thread.c:166-176` |
 | 4 | pipe-layer failure → `ipc_server_handle_failure` → `running=false` | yes | `ipc_server_process.c:933-937` |
 | 5 | `init_all` failure (e.g. no DP found) | yes | `ipc_server_process.c:1075-1084` |
@@ -220,6 +221,67 @@ for input providers):
 | Where else | the same builder is linked into the runtime DLL and `displayxr-cli`, so an **in-process app hosts its own DP and its own providers** — two LeapC clients on one box (`targets/openxr/CMakeLists.txt:64`) | same |
 | Dev-path guard (#943 hardening 2a) | **none** — any absolute path in the registry loads verbatim; only a registry↔DLL version-skew WARN exists (`:315-352`) | **none** |
 | Vtable lifecycle | create / process_atlas / request_display_mode / destroy … all synchronous, unguarded | `probe`, `create_devices`, `destroy` (unused), `get_presence` — **no start/stop/health**; providers own their threads (`xrt_input_plugin.h:241-355`) |
+
+### 1.5 Restart Manager — the contract for third-party installers (Windows)
+
+Because plug-in handles are kept for the process lifetime (§1.4), every DLL a vendor
+plug-in pulls in — including **a vendor plug-in's dependency** installed by some other
+product — stays mapped in `displayxr-service.exe` until the process exits. An installer
+that must replace such a file therefore has to close the service first. The service is a
+well-behaved [Restart Manager](https://learn.microsoft.com/en-us/windows/win32/rstmgr/guidelines-for-applications)
+application so an installer can do that with the standard API and no DisplayXR-specific code.
+
+**What the service guarantees**
+
+- **Detectable.** `RmGetList` reports `displayxr-service.exe` as holding the file, as
+  a GUI application (`RmOtherWindow`: its top-level windows are hidden) with
+  `bRestartable = TRUE`.
+- **Closes cleanly without force.** A hidden top-level window on the tray thread answers
+  `WM_QUERYENDSESSION` with TRUE (no UI, no waits) and on `WM_ENDSESSION` (`wParam` TRUE) or
+  `WM_CLOSE` takes the normal tray-**Exit** path (§1.3 #2a). The tray window itself is
+  message-only (`HWND_MESSAGE`), which never receives these messages; before this window
+  existed RM could only close the service with `RmForceShutdown`.
+- **Bounded.** If teardown has not finished 20 s after the request, the process terminates
+  itself, so the files are released inside Restart Manager's 30 s force window either way.
+- **Restartable, non-elevated.** At start the service calls `RegisterApplicationRestart("--rm-restart",
+  RESTART_NO_CRASH | RESTART_NO_HANG | RESTART_NO_REBOOT)` (plus `--workspace` when it was
+  started with it) — installer restarts only: crash/hang behaviour is unchanged, and a
+  reboot is left to the `HKLM\…\Run` entry. `--autostart` is deliberately not
+  registered, so the "Start on login" preference cannot turn a restart into an exit. An
+  instance started with `--rm-restart` that finds itself **elevated** (an elevated installer
+  may relaunch it in its own context) hands the launch to the desktop shell
+  (`explorer.exe "<exe>"`, non-elevated) and exits: clients at medium/low integrity must be
+  able to reach the service.
+- Logged: one WARN on registration, one on the close request, one on a `--rm-restart` start
+  (with its integrity level).
+
+**The installer's sequence**
+
+```
+RmStartSession
+RmRegisterResources(<the files to replace>)
+RmGetList                       -> displayxr-service.exe, RmOtherWindow, restartable
+RmShutdown(0)                   -> service exits cleanly (RmForceShutdown only as a fallback)
+<replace the files>
+RmRestart                       -> service relaunched with --rm-restart
+RmEndSession
+```
+
+What a close costs: every connected OpenXR app loses its session
+(`XR_ERROR_INSTANCE_LOST`, no reconnect — §1.2), and the workspace controller is
+terminated exactly as on a normal service exit (`service_orchestrator_shutdown`); after the
+restart the orchestrator applies `service.json` again (a controller in **Enable** mode is
+respawned; **Auto** waits for the hotkey). In-process OpenXR apps load the plug-in — and its
+dependencies — themselves, so `RmGetList` lists them too and they are closed by their own
+window handling.
+
+**Installers that do not use Restart Manager** terminate `displayxr-service.exe`
+(`taskkill /IM displayxr-service.exe` asks it to close cleanly; `/F` kills it), replace the
+files, then start it again **non-elevated** — e.g. from an elevated installer,
+`explorer.exe "<InstallPath>\displayxr-service.exe"`, with `InstallPath` read from
+`HKLM\Software\DisplayXR\Runtime`. Starting it directly from an elevated process leaves an
+elevated service that normal-integrity clients cannot use. If nobody restarts it, the next
+OpenXR app that needs the service launches it (§1.1), and the next logon does too.
 
 ---
 

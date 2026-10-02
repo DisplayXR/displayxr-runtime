@@ -24,6 +24,7 @@
 #include "service_orchestrator.h"
 #include "service_tray_win.h"
 #include <stdlib.h> // __argc, __argv
+#include <wchar.h>  // _snwprintf_s
 #endif
 
 #include "server/ipc_server_interface.h"
@@ -96,6 +97,107 @@ setup_dpi_awareness(void)
 	u_win_make_process_dpi_aware(NULL);
 }
 
+/*
+ * Restart Manager support. A third-party installer that must replace a DLL this
+ * process holds (a vendor plug-in's dependency, loaded for the process lifetime)
+ * finds us with RmGetList, closes us with RmShutdown (the session-end window in
+ * service_tray_win.c) and brings us back with RmRestart, which relaunches the
+ * command line registered here. See docs/architecture/service-architecture.md
+ * § Restart Manager.
+ */
+#define SERVICE_RM_RESTART_ARG "--rm-restart"
+
+//! Mandatory integrity RID of this process (0x2000 medium, 0x3000 high), 0 if unknown.
+static DWORD
+process_integrity_rid(void)
+{
+	DWORD rid = 0;
+	HANDLE tok = NULL;
+	if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
+		return 0;
+	}
+	union {
+		TOKEN_MANDATORY_LABEL tml;
+		BYTE buf[64];
+	} u;
+	DWORD len = 0;
+	if (GetTokenInformation(tok, TokenIntegrityLevel, &u, sizeof(u), &len)) {
+		PSID sid = u.tml.Label.Sid;
+		rid = *GetSidSubAuthority(sid, *GetSidSubAuthorityCount(sid) - 1);
+	}
+	CloseHandle(tok);
+	return rid;
+}
+
+static bool
+process_is_elevated(void)
+{
+	TOKEN_ELEVATION e = {0};
+	DWORD len = 0;
+	HANDLE tok = NULL;
+	if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
+		return false;
+	}
+	BOOL ok = GetTokenInformation(tok, TokenElevation, &e, sizeof(e), &len);
+	CloseHandle(tok);
+	return ok && e.TokenIsElevated != 0;
+}
+
+/*!
+ * A Restart-Manager restart is driven by an installer that is usually elevated.
+ * The service must run at the user's normal integrity (clients at medium/low
+ * integrity connect to it), so if the restarted instance came up elevated, hand
+ * the launch to the desktop shell (`explorer.exe <exe>` starts it in the
+ * shell's own, non-elevated context — the same recipe as the documented manual
+ * restart) and bow out. Returns true when the hand-off was started.
+ */
+static bool
+relaunch_unelevated_via_shell(void)
+{
+	wchar_t exe[MAX_PATH];
+	wchar_t windir[MAX_PATH];
+	DWORD n = GetModuleFileNameW(NULL, exe, ARRAYSIZE(exe));
+	UINT w = GetWindowsDirectoryW(windir, ARRAYSIZE(windir));
+	if (n == 0 || n >= ARRAYSIZE(exe) || w == 0 || w >= ARRAYSIZE(windir)) {
+		return false;
+	}
+	wchar_t cmd[2 * MAX_PATH + 32];
+	if (_snwprintf_s(cmd, ARRAYSIZE(cmd), _TRUNCATE, L"\"%ls\\explorer.exe\" \"%ls\"", windir, exe) < 0) {
+		return false;
+	}
+	STARTUPINFOW si = {0};
+	si.cb = sizeof(si);
+	PROCESS_INFORMATION pi = {0};
+	if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+		return false;
+	}
+	CloseHandle(pi.hThread);
+	CloseHandle(pi.hProcess);
+	return true;
+}
+
+//! Register the command line Restart Manager relaunches us with after an
+//! installer closed us. Not for crash/hang (WER behaviour is unchanged) and not
+//! across a reboot (the HKLM Run key already starts us at logon).
+static void
+register_for_restart(bool workspace_mode)
+{
+	// No --autostart: a restart restores a service that was running, so the
+	// start-on-login preference (which gates only logon auto-starts) must not
+	// turn it into an exit. The marker lets the restarted instance recognise
+	// itself (integrity check above).
+	const wchar_t *args = workspace_mode ? L"" SERVICE_RM_RESTART_ARG L" --workspace" : L"" SERVICE_RM_RESTART_ARG;
+	HRESULT hr = RegisterApplicationRestart(args, RESTART_NO_CRASH | RESTART_NO_HANG | RESTART_NO_REBOOT);
+	if (SUCCEEDED(hr)) {
+		U_LOG_W("Registered for Restart Manager restart (args \"%ls\").", args);
+	} else {
+		U_LOG_W(
+		    "RegisterApplicationRestart failed (hr=0x%08lx); installers can close but not restart the "
+		    "service.",
+		    (unsigned long)hr);
+	}
+}
+
 // GUI subsystem entry point (no console window).
 int WINAPI
 WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
@@ -129,11 +231,30 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 	// registration so we can tell a logon auto-start from a manual launch.
 	bool workspace_mode = false;
 	bool autostart = false;
+	bool rm_restart = false;
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--workspace") == 0) {
 			workspace_mode = true;
 		} else if (strcmp(argv[i], "--autostart") == 0) {
 			autostart = true;
+		} else if (strcmp(argv[i], SERVICE_RM_RESTART_ARG) == 0) {
+			rm_restart = true;
+		}
+	}
+
+	// Restarted by Restart Manager after an installer closed us: record the
+	// context it gave us, and never stay elevated (see relaunch_unelevated_via_shell).
+	if (rm_restart) {
+		bool elevated = process_is_elevated();
+		U_LOG_W("Started by a Restart Manager restart (integrity RID 0x%lx, elevated=%d).",
+		        (unsigned long)process_integrity_rid(), elevated ? 1 : 0);
+		if (elevated) {
+			bool handed_off = relaunch_unelevated_via_shell();
+			U_LOG_W("Restart Manager restart came up elevated; %s.",
+			        handed_off ? "relaunched non-elevated via the shell, exiting"
+			                   : "could NOT relaunch non-elevated, exiting (start the service normally)");
+			u_crash_guard_mark_orderly_exit();
+			ExitProcess(0);
 		}
 	}
 
@@ -167,7 +288,12 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 		}
 	}
 
-	// Start the system tray icon with orchestrator menu
+	// Only the singleton owner registers: Restart Manager relaunches the
+	// instance it closed, never one that bowed out above.
+	register_for_restart(workspace_mode);
+
+	// Start the system tray icon with orchestrator menu (also creates the
+	// hidden session-end window Restart Manager closes us through).
 	service_tray_init(tray_shutdown_callback, tray_config_change_callback, &cfg);
 
 	// Initialize orchestrator (registers hotkeys, spawns children per config)
