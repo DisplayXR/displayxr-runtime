@@ -237,6 +237,19 @@ systemctl --user unset-environment DISPLAYXR_DEBUG   # then log out/in again
   hold then; a tag going away ends it on that frame, the actor snapping to the
   window. An app that always keeps its tag mapped (every in-process DisplayXR
   app) behaves exactly as with version 9. See the spec, §9.9.
+- Version 11, no interface change: the snapshot says **which space its
+  coordinates are in**. mutter has two monitor layout modes. In LOGICAL
+  (fractional scaling; mutter 50's default) the stage is logical px. In PHYSICAL
+  (Ubuntu 24.04 / GNOME 46 at an integer scale, out of the box) the stage
+  *is* device px. There `monitor.scale` is 2 for a 3840x2160 monitor at 200 %,
+  and its rect is still 3840x2160. The snapshot gains a top-level
+  `layout_mode` (`"logical"` / `"physical"`) and `monitor.device_scale`, the
+  factor that converts stage px to device px (the stage view's scale: the
+  monitor scale in LOGICAL, 1 in PHYSICAL). A consumer must convert by
+  `device_scale`, never by `scale`. Both are left out when they cannot be told
+  (every monitor at scale 1, where the two modes agree). The drag-lattice
+  choice and the stamp audit weigh device px by the same factor. The schema
+  stays `version: 1`, because no field changed meaning. See the spec, §4.1.
 
 Verify capture exclusion is live:
 

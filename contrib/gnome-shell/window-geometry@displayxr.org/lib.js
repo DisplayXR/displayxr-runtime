@@ -125,6 +125,10 @@
 // JSON schema (version 1):
 // {
 //   "version": 1,
+//   "layout_mode": "logical",               // ext v11+: mutter's layout mode,
+//                                           // "logical" | "physical"; absent
+//                                           // when it cannot be told (every
+//                                           // monitor at scale 1: both agree)
 //   "windows": [
 //     {
 //       "pid": 1234,
@@ -134,7 +138,11 @@
 //       "xwayland": false,
 //       "frame":  [x, y, w, h],             // Meta.Window.get_frame_rect()
 //       "buffer": [x, y, w, h],             // Meta.Window.get_buffer_rect()
-//       "monitor": { "x": 0, "y": 0, "w": 3840, "h": 2160, "scale": 1.0 },
+//       "monitor": { "x": 0, "y": 0, "w": 3840, "h": 2160, "scale": 1.0,
+//                    "device_scale": 1.0 },  // ext v11+: device px per
+//                                           // stage px on this monitor (the
+//                                           // stage view's scale). Absent
+//                                           // when it cannot be told.
 //       "capture_excluded": false,          // ext v2+: CaptureExclusion1 active
 //       "lattice_drop": false,              // ext v7+: the last drag ended ON
 //                                           // the drag lattice and the window
@@ -152,12 +160,22 @@
 //   ]
 // }
 //
-// Coordinates are Mutter's global (stage) coordinates — logical pixels. At
-// monitor scale 1.0 (the only mode windowed weaving supports anyway) these are
-// physical desktop pixels, the same space X11's root coordinates live in. The
-// runtime anchors to "buffer" (the main surface — where its pixels land) and
-// falls back to "frame" (the window geometry, which includes a client-side
-// title bar) only when "buffer" is absent (displayxr-runtime#1654).
+// Coordinates are Mutter's global (stage) coordinates. Which space that is
+// depends on mutter's layout mode (extension version 11 says which):
+//   * LOGICAL  (fractional scaling, mutter 50's default): logical px; device
+//              px = stage px x the monitor scale.
+//   * PHYSICAL (Ubuntu 24.04 / GNOME 46 at an integer scale): the stage IS
+//              device px, and "scale" only says how big clients draw. A
+//              3840x2160 monitor at 200 % is a 3840x2160 rect with scale 2.
+// So "scale" is NOT the conversion factor; "device_scale" is. A consumer that
+// multiplies by "scale" reads that monitor as 7680x4320. Every
+// field kept its meaning ("stage coordinates", "mutter's monitor scale"), so
+// the additions are additive and the schema stays version 1; a consumer
+// without them should ask mutter (org.gnome.Mutter.DisplayConfig
+// GetCurrentState "layout-mode": 1 logical, 2 physical). The runtime anchors
+// to "buffer" (the main surface — where its pixels land) and falls back to
+// "frame" (the window geometry, which includes a client-side title bar) only
+// when "buffer" is absent (displayxr-runtime#1654).
 //
 // ── Portability rules for edits to this file ────────────────────────────────
 //
@@ -547,6 +565,46 @@
         },
     };
 
+    /*
+     * ── Which space the stage is in (extension version 11) ──
+     *
+     * Pure logic, no GI: scripts/test_gnome_extension_stage_scale.js drives it
+     * under plain gjs.
+     *
+     * mutter has two monitor layout modes. In LOGICAL the stage is logical px
+     * and each stage view (one per CRTC) is painted at its monitor's scale; in
+     * PHYSICAL the stage is device px and every view's scale is 1, whatever
+     * the monitor scale says. The layout mode itself is not introspected, but
+     * the view scales give it away: any view scale other than 1 means
+     * LOGICAL; every view at 1 while some monitor is scaled means PHYSICAL;
+     * with every monitor at 1 the two agree and nothing needs telling.
+     */
+    const StageScale = {
+        EPS: 1e-4,
+
+        //! 'logical' | 'physical' | null (cannot be told, or need not be).
+        layoutMode(viewScales, monitorScales) {
+            const off1 = v => Math.abs(v - 1) > StageScale.EPS;
+            if (!viewScales || viewScales.length === 0)
+                return null;
+            if (viewScales.some(off1))
+                return 'logical';
+            if ((monitorScales ?? []).some(off1))
+                return 'physical';
+            return null;
+        },
+
+        //! Device px per stage px on a monitor at @p monitorScale, or null
+        //! when the layout mode is not known and the monitor is scaled.
+        deviceScale(layout, monitorScale) {
+            if (layout === 'physical')
+                return 1;
+            if (layout === 'logical' || Math.abs(monitorScale - 1) <= StageScale.EPS)
+                return monitorScale;
+            return null;
+        },
+    };
+
     globalThis.displayxrWindowGeometry = {
         //! gi: {Clutter, GObject, Meta, Gio, GLib} — however the caller's
         //! shell spells the import. Returns {WindowGeometryService}.
@@ -561,9 +619,34 @@
         MoveSyncChoice,
         //! The pointer drag's pure logic, exported for its unit test.
         PointerDrag,
+        //! The stage-space resolution, exported for its unit test.
+        StageScale,
     };
 
     function buildModule({Clutter, GObject, Meta, Gio, GLib, Graphene, Mtk, GdkPixbuf, moveSync = true}) {
+        //! mutter's layout mode right now (StageScale.layoutMode over the
+        //! stage views and monitor scales). Cheap: a handful of views.
+        function currentLayoutMode() {
+            const display = global.display;
+            const monitorScales = [];
+            for (let i = 0; i < display.get_n_monitors(); i++)
+                monitorScales.push(display.get_monitor_scale(i));
+            let viewScales = null;
+            try {
+                viewScales = global.stage.peek_stage_views().map(v => v.get_scale());
+            } catch (e) {
+                viewScales = null; // a shell without the API: say nothing
+            }
+            return StageScale.layoutMode(viewScales, monitorScales);
+        }
+
+        //! Device px per stage px on monitor @p mon (falls back to the monitor
+        //! scale, the pre-version-11 assumption, when it cannot be told).
+        function deviceScaleOf(mon, layout = currentLayoutMode()) {
+            const monitorScale = global.display.get_monitor_scale(mon);
+            return StageScale.deviceScale(layout, monitorScale) ?? monitorScale;
+        }
+
         const IFACE_XML = `
 <node>
   <interface name="org.displayxr.WindowGeometry1">
@@ -1092,10 +1175,11 @@
                 const r = win.get_frame_rect();
                 const dx = r.x - t.startX, dy = r.y - t.startY;
                 const inside = dx >= t.minDx && dx <= t.maxDx && dy >= t.minDy && dy <= t.maxDy;
-                // Device px per logical px where the window is now: the
-                // choice weighs its errors in device px (LatticeChoice).
+                // Device px per stage px where the window is now: the
+                // choice weighs its errors in device px (LatticeChoice). 1 in
+                // mutter's PHYSICAL layout, whatever the monitor scale.
                 const mon = win.get_monitor();
-                const scale = mon >= 0 ? win.get_display().get_monitor_scale(mon) : 1;
+                const scale = mon >= 0 ? deviceScaleOf(mon) : 1;
                 LatticeChoice.observe(t.choice, dx, dy, scale);
                 const best = inside
                     ? LatticeChoice.choose(t.choice, this._candidates(t, dx, dy), dx, dy, scale,
@@ -1849,7 +1933,7 @@
                 if (mon < 0)
                     return;
                 const g = global.display.get_monitor_geometry(mon);
-                const scale = global.display.get_monitor_scale(mon);
+                const scale = deviceScaleOf(mon); // device px per stage px
                 const cw = Math.ceil(STAMP_BLOCK * STAMP_BLOCKS / scale) + 2;
                 const chh = Math.ceil(STAMP_BLOCK / scale) + 1;
                 const clip = new Mtk.Rectangle({x: 0, y: 0, width: cw, height: chh});
@@ -2419,6 +2503,7 @@
                 const display = global.display;
                 const focus = display.focus_window;
                 const windows = [];
+                const layout = currentLayoutMode();
                 for (const actor of global.get_window_actors()) {
                     const win = actor.meta_window;
                     if (!win || win.get_window_type() !== Meta.WindowType.NORMAL)
@@ -2429,10 +2514,13 @@
                     let monitor = null;
                     if (mon >= 0) {
                         const g = display.get_monitor_geometry(mon);
-                        monitor = {
-                            x: g.x, y: g.y, w: g.width, h: g.height,
-                            scale: display.get_monitor_scale(mon),
-                        };
+                        const scale = display.get_monitor_scale(mon);
+                        monitor = {x: g.x, y: g.y, w: g.width, h: g.height, scale};
+                        // v11: the factor a consumer converts by. Absent when
+                        // the layout mode cannot be told.
+                        const deviceScale = StageScale.deviceScale(layout, scale);
+                        if (deviceScale !== null)
+                            monitor.device_scale = deviceScale;
                     }
                     windows.push({
                         pid: win.get_pid(),
@@ -2449,7 +2537,11 @@
                         moving: win === this._grabbedWindow,
                     });
                 }
-                return JSON.stringify({version: 1, windows});
+                const snapshot = {version: 1};
+                if (layout !== null)
+                    snapshot.layout_mode = layout;
+                snapshot.windows = windows;
+                return JSON.stringify(snapshot);
             }
 
             GetWindows() {
