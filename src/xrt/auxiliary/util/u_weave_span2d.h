@@ -96,6 +96,44 @@ u_wl_offpanel_bands_to_output(const struct u_wl_rect_px *bands,
 	return n;
 }
 
+/*!
+ * Which view of the atlas the weave engine paints FLAT — the single source of
+ * every flat path on the desktop-Linux weave engine: the off-panel bands
+ * (#1654), the flat regions of a non-batch submit (v8), and mono in hardware 2D
+ * (XR_DXR_weave v13), so all three are in register with each other.
+ *
+ *  - 1 or 2 views: view 0. For a stereo pair that is the LEFT view (a batch
+ *    rect's left half). Deterministic on purpose: both eyes sit about equally
+ *    far from the display axis, so a nearest-axis rule would flip between the
+ *    two as the head moves and the flat image would jump by the disparity.
+ *  - N > 2 views with one eye offset per view (@p eye_x, metres, display-plane
+ *    x, 0 = the display's centre axis): the view whose eye is NEAREST THE
+ *    DISPLAY AXIS (smallest |x|; a tie goes to the lower index).
+ *  - N > 2 without a matching offset per view: the centre index, (N - 1) / 2.
+ *
+ * @return a view index in [0, @p view_count), or 0 when @p view_count is 0.
+ */
+static inline uint32_t
+u_weave_flat_view_index(uint32_t view_count, const float *eye_x, uint32_t eye_count)
+{
+	if (view_count <= 2) {
+		return 0;
+	}
+	if (eye_x == NULL || eye_count != view_count) {
+		return (view_count - 1) / 2;
+	}
+	uint32_t best = 0;
+	float best_abs = eye_x[0] < 0.0f ? -eye_x[0] : eye_x[0];
+	for (uint32_t i = 1; i < view_count; i++) {
+		const float a = eye_x[i] < 0.0f ? -eye_x[i] : eye_x[i];
+		if (a < best_abs) {
+			best_abs = a;
+			best = i;
+		}
+	}
+	return best;
+}
+
 #ifdef __cplusplus
 }
 #endif

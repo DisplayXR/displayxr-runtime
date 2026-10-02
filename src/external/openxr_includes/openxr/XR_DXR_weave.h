@@ -200,7 +200,8 @@
  *
  * Mono in hardware 2D (SPEC_VERSION 13). XrWeaveSubmitMonoIn2DDXR, chained on
  * XrWeaveSubmitInfoDXR: while the session's hardware state is 2D, the output is
- * the centre view, flat, instead of the weave. Desktop Linux; ignored elsewhere.
+ * one view (stereo: the left view), flat, instead of the weave. Desktop Linux;
+ * ignored elsewhere.
  *
  * Woven origin per output (SPEC_VERSION 12, browser-pvt#180). On native Wayland
  * (GNOME extension version 9+) a drag is MOVE-SYNCHRONISED: the extension holds
@@ -971,11 +972,17 @@ typedef struct XrWeaveOutputOriginDXR {
  * With @c monoIn2D XR_TRUE, and while THIS session's hardware display state is
  * 2D (the last state the runtime confirmed to it — the one its
  * XrEventDataHardwareDisplayStateChangedDXR events report), the runtime skips
- * the weave and paints the whole output with the centre view of the submitted
- * content at full output resolution, in register with the window: for a batch
- * rect its left half unsqueezed, for a v6 layout the centre tile — the source
- * the off-panel 2D bands use (§5d). Flat regions and the v4 overlay are applied
- * on top as usual. While the hardware state is 3D the struct has no effect, so a
+ * the weave and paints the whole output with ONE view of the submitted content
+ * at full output resolution, in register with the window — the same view the
+ * off-panel 2D bands use (§5d), so the two flat paths match: for a stereo pair
+ * (every batch submit, and a 2-view v6 layout) view 0, the LEFT view — a batch
+ * rect's left half, unsqueezed; for a v6 layout of more than two views, the
+ * view whose eye is nearest the display axis (smallest |x| of the per-view eye
+ * offset). Flat regions and the v4 overlay are applied on top as usual. Mono
+ * follows the runtime's display-processor-CONFIRMED hardware-2D state for this
+ * session, not the request: it starts on the first submit after the 2D state
+ * is confirmed and ends on the first submit after the confirmed state is 3D
+ * again. While the hardware state is 3D the struct has no effect, so a
  * caller can chain it for the whole of its own 2D hold without racing the
  * lens: the output is flat exactly while the runtime holds the panel 2D, and a
  * request the display processor rejected keeps the weave.
@@ -991,7 +998,7 @@ typedef struct XrWeaveOutputOriginDXR {
 typedef struct XrWeaveSubmitMonoIn2DDXR {
     XrStructureType          type;     //!< XR_TYPE_WEAVE_SUBMIT_MONO_IN_2D_DXR
     const void* XR_MAY_ALIAS next;
-    XrBool32                 monoIn2D; //!< XR_TRUE: centre view flat, no weave, while hardware is 2D
+    XrBool32                 monoIn2D; //!< XR_TRUE: one view flat, no weave, while hardware is 2D
 } XrWeaveSubmitMonoIn2DDXR;
 
 typedef XrResult (XRAPI_PTR *PFN_xrWeaveBindWindowDXR)(

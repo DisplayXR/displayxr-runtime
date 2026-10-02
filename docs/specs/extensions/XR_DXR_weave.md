@@ -681,8 +681,8 @@ duplicates rather than transfers. Engine contract: `src/xrt/include/xrt/xrt_weav
 
 **Off-panel 2D (#1654).** The part of the bound window that the published geometry puts off the
 panel comes back flat, not woven: the runtime paints each off-panel band of the output with the
-centre view of the submitted content (for a batch rect, its left half unsqueezed; for v6, the
-centre tile), in register with the window and under the v4 overlay, and skips the weave entirely
+flat view of the submitted content (§5f's table: for a stereo pair the left view — a batch rect's
+left half unsqueezed; for v6 with more views, the view nearest the display axis), in register with the window and under the v4 overlay, and skips the weave entirely
 for a window wholly off the panel — so a caller composites the output as usual and never clips it
 itself. `DXR_SPAN_2D=0` restores the fully woven output.
 
@@ -690,7 +690,7 @@ itself. `DXR_SPAN_2D=0` restores the fully woven output.
 processor to wish to, the runtime instead paints the union of the submit's
 `XrWeaveSubmitFlatRegionsDXR` rects and the latched `xrWeaveSetScreenFlatRegionsDXR` rects
 (clipped to the bound window, taking effect at the next submit) flat in the woven output — the
-input pixels 1:1 for a batch submit, the centre view for v6 — a platform exception to §2c's
+input pixels 1:1 for a batch submit, the flat view (§5f) for v6 — a platform exception to §2c's
 "pixels unaffected" that `DXR_WEAVE_FLAT_2D=0` switches off.
 
 ## 5e. Woven origin per output — present-owner move sync (v12, browser-pvt#180)
@@ -784,7 +784,7 @@ verbatim and the serial strictly increases.
 typedef struct XrWeaveSubmitMonoIn2DDXR {
     XrStructureType          type;     // XR_TYPE_WEAVE_SUBMIT_MONO_IN_2D_DXR
     const void* XR_MAY_ALIAS next;
-    XrBool32                 monoIn2D; // XR_TRUE: centre view flat, no weave, while hardware is 2D
+    XrBool32                 monoIn2D; // XR_TRUE: one view flat, no weave, while hardware is 2D
 } XrWeaveSubmitMonoIn2DDXR;
 ```
 
@@ -806,10 +806,24 @@ every other session out of it.
 **Semantics.** Chained on `XrWeaveSubmitInfoDXR`. While `monoIn2D` is `XR_TRUE` **and** this
 session's hardware display state is 2D — the state the runtime last confirmed to it, the one its
 `XrEventDataHardwareDisplayStateChangedDXR` events report — the runtime skips the weave and paints
-the whole output with the centre view of the submitted content at full output resolution, in
-register with the window: for a batch rect its left half unsqueezed, for a v6 layout the centre
-tile. That is the source the off-panel bands (§5d) use, and the path is theirs: the whole output
-becomes one band. Flat regions and the v4 overlay are applied on top as usual.
+the whole output with ONE view of the submitted content at full output resolution, in register with
+the window. The path is the off-panel bands' (§5d): the whole output becomes one band, painted from
+the same view the bands use, so the two flat paths always match. Flat regions and the v4 overlay are
+applied on top as usual.
+
+**Mono follows the runtime's display-processor-CONFIRMED hardware-2D state for this session, not
+the request.** It starts on the first submit after the display processor has accepted the 2D
+request, and it ends on the first submit after the confirmed state is 3D again — no stale flat frame
+after a release, no woven frame while held. A 2D request the display processor rejects never
+starts it.
+
+**Which view.** One rule for every flat path of the engine (`u_weave_flat_view_index`):
+
+| submitted views | flat view |
+|---|---|
+| 1 or 2 — every batch submit, and a 2-view v6 layout | **view 0, the LEFT view** (a batch rect's left half, unsqueezed). Deterministic: both eyes sit about equally far from the display axis, so a nearest-axis rule would flip between them as the head moves and the flat image would jump by the disparity. |
+| more than 2 (v6) | the view whose eye is **nearest the display axis** — smallest \|x\| of the per-view eye offset the display processor reports; a tie goes to the lower index |
+| more than 2, no per-view eye offsets | the centre index, `(N − 1) / 2` |
 
 - In hardware 3D the struct has no effect: the output is woven. A caller can therefore chain it for
   the whole of its own 2D hold without racing the lens, and a 2D request the display processor
@@ -839,7 +853,7 @@ any unknown chained struct. One `weave(v13)` WARN in the service log per edge.
 | 10 | Desktop-Linux dma-buf transport (§5d, #1699): `XR_WEAVE_HANDLE_KIND_DMABUF_DXR` / `_OPAQUE_FD_DXR`, `XrWeaveDmabufDescDXR` + `XrWeaveOverlayDmabufDescDXR` in, `XrWeaveOutputDmabufDXR` out, `sync_file` fences `XrWeaveSubmitSyncDXR` (acquire) / `XrWeaveOutputSyncDXR` (release, per frame). Desktop Linux becomes a full weave platform when the service carries its engine. |
 | 11 | `xrWeaveSnapWindowGridDXR` + `XrWeaveSnapGridInfoDXR` / `XrWeaveSnapGridPointDXR` — bulk grid snap: the per-point snap evaluated over a grid by the runtime, one call (one IPC round trip) instead of one per point (§5c, #1723). |
 | 12 | `XrWeaveOutputOriginDXR` (out, per frame: the origin each woven output was woven for + a serial) and `XrWeaveWindowLogicalOriginDXR` (in: the caller's logical origin + scale, echoed verbatim) — so a present-owner can tag its own Wayland commit for move-synchronised drag (§5e, browser-pvt#180). |
-| 13 | `XrWeaveSubmitMonoIn2DDXR` — one flat view (the centre view) instead of the weave while the session's hardware state is 2D (§5f). Desktop Linux; accepted and ignored elsewhere. |
+| 13 | `XrWeaveSubmitMonoIn2DDXR` — one flat view (stereo: the left view; N > 2: the view nearest the display axis) instead of the weave while the session's hardware state is 2D (§5f). Desktop Linux; accepted and ignored elsewhere. |
 
 **v13 is a bump**: one structure type a caller gates on `extensionVersion >= 13`. Against an
 older runtime the struct is skipped and the output stays woven, which is also what every

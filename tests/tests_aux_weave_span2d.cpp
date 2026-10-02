@@ -82,3 +82,32 @@ TEST_CASE("a window entirely off the panel maps to one whole-output band")
 	REQUIRE(u_wl_offpanel_bands_to_output(win, 0, 1280, 720, 640, 360, true, o, &whole) == 0);
 	REQUIRE_FALSE(whole);
 }
+
+TEST_CASE("the flat view: view 0 for stereo, nearest the display axis for N > 2")
+{
+	// Stereo: always view 0 (the left view), whatever the eye offsets — the
+	// choice must not flip as the head moves.
+	const float stereo_right_nearer[2] = {-0.040f, 0.010f};
+	REQUIRE(u_weave_flat_view_index(2, stereo_right_nearer, 2) == 0);
+	REQUIRE(u_weave_flat_view_index(2, NULL, 0) == 0);
+	REQUIRE(u_weave_flat_view_index(1, NULL, 0) == 0);
+	REQUIRE(u_weave_flat_view_index(0, NULL, 0) == 0);
+
+	// 2x2 quad: view order is NOT spatial order — the nearest-axis eye wins.
+	const float quad[4] = {-0.096f, 0.032f, -0.032f, 0.096f};
+	REQUIRE(u_weave_flat_view_index(4, quad, 4) == 1);                // |0.032| first at index 1 (tie -> lower)
+	const float quad_shifted[4] = {-0.120f, 0.008f, -0.056f, 0.072f}; // head moved right
+	REQUIRE(u_weave_flat_view_index(4, quad_shifted, 4) == 1);
+	const float quad_left[4] = {-0.070f, 0.058f, -0.006f, 0.122f}; // head moved left
+	REQUIRE(u_weave_flat_view_index(4, quad_left, 4) == 2);
+
+	// 8 views spread left->right, head off to the right: not the centre index.
+	const float eight[8] = {-0.10f, -0.07f, -0.04f, -0.01f, 0.02f, 0.05f, 0.08f, 0.11f};
+	REQUIRE(u_weave_flat_view_index(8, eight, 8) == 3);
+
+	// N > 2 without one offset per view: the centre index.
+	REQUIRE(u_weave_flat_view_index(4, NULL, 0) == 1);
+	REQUIRE(u_weave_flat_view_index(4, quad, 2) == 1);
+	REQUIRE(u_weave_flat_view_index(8, NULL, 0) == 3);
+	REQUIRE(u_weave_flat_view_index(3, NULL, 0) == 1);
+}

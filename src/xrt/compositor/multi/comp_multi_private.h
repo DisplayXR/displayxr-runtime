@@ -1544,7 +1544,8 @@ comp_multi_weave_linux_request_display_mode(struct multi_compositor *mc, bool en
  * submit to the engine, so the value is per submit (a submit without the chain
  * sets false). While it is set AND this session's hardware state is 2D (as last
  * confirmed by mc->weave.dp — hw_2d_confirmed), the frame skips the weave and
- * paints the whole output with the centre view of the submitted content, the
+ * paints the whole output with one view of the submitted content (stereo: the
+ * left view; N > 2: nearest the display axis, u_weave_flat_view_index), the
  * source the off-panel bands use. In 3D it has no effect.
  */
 void
