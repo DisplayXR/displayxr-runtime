@@ -2458,6 +2458,16 @@ multi_compositor_get_window_screen_rect(struct multi_compositor *mc,
 bool
 multi_compositor_request_display_mode(struct multi_compositor *mc, bool enable_3d)
 {
+#if defined(COMP_MULTI_HAVE_WEAVE) && defined(XRT_OS_LINUX_DESKTOP)
+	// Desktop-Linux XR_DXR_weave present-owner (browser#55 on Linux): it has no
+	// window, so session_render is never initialised and the gate below dropped
+	// every hardware request on the floor — the panel's lens stayed on over a
+	// 2D tab while the browser believed the request had landed. Its DP is the
+	// weave engine's own instance (mc->weave.dp), so the request goes there.
+	if (mc != NULL && !mc->session_render.initialized) {
+		return comp_multi_weave_linux_request_display_mode(mc, enable_3d);
+	}
+#endif
 	if (mc == NULL || !mc->session_render.initialized) {
 		return false;
 	}

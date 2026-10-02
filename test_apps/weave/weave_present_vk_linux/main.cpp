@@ -76,6 +76,20 @@
  *                      code 0 = PASS.
  *                      --test-resize=WxH@N reallocates mid-run, as a window
  *                      resize or F11 does.
+ *   --test-display-mode[=stale|deferred]  (headless) drive the hardware
+ *                      2D/3D channel the way the browser's tab policy does
+ *                      (xrRequestDisplayModeDXR) and require exactly the
+ *                      matching XrEventDataHardwareDisplayStateChangedDXR
+ *                      events, each batch's events present before the next.
+ *                      stale (default): 2D then 3D BEFORE the first submit
+ *                      (bring-up must NOT apply the withdrawn 2D: no event),
+ *                      2D at frame 20, the fast triple 3D,2D,3D in one frame
+ *                      at 30, a no-op 3D at 40 (no event), 2D at 50 ->
+ *                      events 2D,3D,2D,3D,2D. deferred: 2D before the first
+ *                      submit (recorded, applied at bring-up), 3D at 30, 2D
+ *                      at 50 -> events 2D,3D,2D. Pair it with a service
+ *                      started with SIM_DISPLAY_FAKE_LENS=1 so the weave
+ *                      engine's DP records + logs each request.
  *   --lattice-selftest one Wayland drag-lattice table build per output scale
  *                      (100 %, 200 %, 150 %) through the helper's own table
  *                      code (dxr_wl_lattice::probe_via_grid) and the SAME
@@ -217,6 +231,8 @@ struct Options
 	uint32_t resize_w = 0, resize_h = 0;
 	int resize_frame = -1;
 	bool lattice_selftest = false; //!< --lattice-selftest
+	bool test_display_mode = false;   //!< --test-display-mode (headless)
+	bool test_display_deferred = false; //!< --test-display-mode=deferred
 };
 
 static void
@@ -247,6 +263,8 @@ usage(const char *argv0)
 	        "service's fd count to stay flat\n"
 	        "  --test-resize=WxH@N          (headless) reallocate at frame N, "
 	        "like a window resize\n"
+	        "  --test-display-mode[=stale|deferred]  (headless) request hardware "
+	        "2D/3D sequences and require the matching events\n"
 	        "  --lattice-selftest           build one drag-lattice table per "
 	        "scale via the grid provider (exit 1 = FAIL)\n"
 	        "  --dump-dir=DIR               where PNGs go (default $TMPDIR, else "
@@ -302,6 +320,11 @@ parse_args(int argc, char **argv, Options &o)
 		} else if (sscanf(a, "--test-resize=%ux%u@%d", &o.resize_w, &o.resize_h, &o.resize_frame) == 3) {
 		} else if (strcmp(a, "--lattice-selftest") == 0) {
 			o.lattice_selftest = true;
+		} else if (strcmp(a, "--test-display-mode") == 0 || strcmp(a, "--test-display-mode=stale") == 0) {
+			o.test_display_mode = true;
+		} else if (strcmp(a, "--test-display-mode=deferred") == 0) {
+			o.test_display_mode = true;
+			o.test_display_deferred = true;
 		} else if (strncmp(a, "--dump-dir=", 11) == 0) {
 			o.dump_dir = a + 11;
 		} else if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) {
@@ -355,6 +378,10 @@ struct App
 	PFN_xrWeaveBindWindow2DXR pfn_bind2 = nullptr;
 	PFN_xrWeaveSubmitDXR pfn_submit = nullptr;
 	PFN_xrWeaveSnapWindowRectDXR pfn_snap = nullptr;
+	PFN_xrRequestDisplayModeDXR pfn_request_display_mode = nullptr; //!< --test-display-mode
+	//! --test-display-mode: every XrEventDataHardwareDisplayStateChangedDXR, in order.
+	std::vector<bool> hw_events;
+	bool dm_order_bad = false; //!< --test-display-mode: an event missing before the next request, or a failed call
 	bool has_display_info = false;
 	int32_t panel_left = 0, panel_top = 0;
 	uint32_t panel_w = 0, panel_h = 0;
@@ -821,6 +848,10 @@ init_session()
 	xrGetInstanceProcAddr(g.instance, "xrWeaveBindWindow2DXR", (PFN_xrVoidFunction *)&g.pfn_bind2);
 	xrGetInstanceProcAddr(g.instance, "xrWeaveSubmitDXR", (PFN_xrVoidFunction *)&g.pfn_submit);
 	xrGetInstanceProcAddr(g.instance, "xrWeaveSnapWindowRectDXR", (PFN_xrVoidFunction *)&g.pfn_snap);
+	if (g.opt.test_display_mode && g.has_display_info) {
+		xrGetInstanceProcAddr(g.instance, "xrRequestDisplayModeDXR",
+		                      (PFN_xrVoidFunction *)&g.pfn_request_display_mode);
+	}
 	if (!g.pfn_bind2 || !g.pfn_submit || !g.pfn_snap) {
 		LOGE("weave entry points missing");
 		return false;
@@ -2270,6 +2301,11 @@ poll_xr_events()
 		} else if (ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
 			LOGW("instance loss pending — leaving");
 			return false;
+		} else if (ev.type == XR_TYPE_EVENT_DATA_HARDWARE_DISPLAY_STATE_CHANGED_DXR) {
+			const auto *h = (const XrEventDataHardwareDisplayStateChangedDXR *)&ev;
+			g.hw_events.push_back(h->hardwareDisplay3D == XR_TRUE);
+			LOGI("event: hardware display state -> %s (frame %llu)", h->hardwareDisplay3D ? "3D" : "2D",
+			     (unsigned long long)g.frame);
 		}
 		ev = {XR_TYPE_EVENT_DATA_BUFFER};
 	}
@@ -2314,6 +2350,50 @@ run()
 		}
 		if (!poll_xr_events()) {
 			break;
+		}
+		if (g.opt.test_display_mode && g.pfn_request_display_mode != nullptr) {
+			// The browser's tab policy, as batches of requests at given frames
+			// (frame 0 runs BEFORE the first submit: the service's weave
+			// engine does not exist yet). events_before = how many events
+			// must already have arrived when the batch is issued — the
+			// runtime answers each request on its own IPC call, or at engine
+			// bring-up on the first submit.
+			struct Batch
+			{
+				int frame;
+				size_t events_before;
+				std::vector<bool> reqs; // true = 3D
+			};
+			static const std::vector<Batch> stale = {
+			    {0, 0, {false, true}},       // 2D then 3D pre-engine: bring-up applies nothing
+			    {20, 0, {false}},            // no stale event so far; 2D
+			    {30, 1, {true, false, true}}, // fast triple in one frame
+			    {40, 4, {true}},             // no-op: already 3D, no event
+			    {50, 4, {false}},
+			};
+			static const std::vector<Batch> deferred = {
+			    {0, 0, {false}}, // pre-engine 2D: applied at bring-up
+			    {30, 1, {true}},
+			    {50, 2, {false}},
+			};
+			for (const Batch &b : g.opt.test_display_deferred ? deferred : stale) {
+				if (b.frame != f) {
+					continue;
+				}
+				if (g.hw_events.size() != b.events_before) {
+					LOGE("display-mode test: %zu event(s) before the frame-%d batch, expected %zu",
+					     g.hw_events.size(), f, b.events_before);
+					g.dm_order_bad = true;
+				}
+				for (bool want_3d : b.reqs) {
+					const XrResult r = g.pfn_request_display_mode(
+					    g.session, want_3d ? XR_DISPLAY_MODE_3D_DXR : XR_DISPLAY_MODE_2D_DXR);
+					LOGI("frame %d: xrRequestDisplayModeDXR(%s) -> %d", f, want_3d ? "3D" : "2D", (int)r);
+					if (XR_FAILED(r)) {
+						g.dm_order_bad = true;
+					}
+				}
+			}
 		}
 
 		if (!g.headless) {
@@ -2468,6 +2548,15 @@ run()
 	check(g.v12.outputs > 0 && g.v12.logical_bad == 0, "v12 logical origin + scale echoed verbatim");
 	check(g.v12.outputs > 0 && g.v12.serial_bad == 0, "v12 serial strictly increasing per output");
 	check(total < 8 || g.v12.distinct >= 2, "v12 woven origin followed the re-binds");
+	if (g.opt.test_display_mode) {
+		const std::vector<bool> want = g.opt.test_display_deferred ? std::vector<bool>{false, true, false}
+		                                                           : std::vector<bool>{false, true, false, true, false};
+		check(g.pfn_request_display_mode != nullptr && total > 55, "display-mode: xrRequestDisplayModeDXR resolved");
+		check(!g.dm_order_bad, "display-mode: each batch's events arrived before the next batch");
+		check(g.hw_events == want, g.opt.test_display_deferred
+		                               ? "display-mode: events 2D, 3D, 2D (deferred 2D applied at bring-up)"
+		                               : "display-mode: events 2D,3D,2D,3D,2D (no stale 2D, triple, no-op)");
+	}
 	LOGI("%s", pass ? "PASS" : "FAIL");
 	return pass ? 0 : 1;
 }
