@@ -97,6 +97,12 @@
  *                      frame N (and 3D at frame M) — a browser's menu hold.
  *   --expect-mono      (headless) require woven == the SBS input's LEFT view,
  *                      unsqueezed to full width (one view, no weave).
+ *   --test-hold-flicker (headless, implies --mono-in-2d) open/close the 2D
+ *                      hold FAST over frames 10..49 — a 1-frame hold, a
+ *                      2-frame hold, and 2D+3D inside one frame, repeated — and
+ *                      read back EVERY frame of that window: each must be mono
+ *                      exactly when the last request before its submit was 2D
+ *                      (no woven frame while held, no stale mono after release).
  *   --lattice-selftest one Wayland drag-lattice table build per output scale
  *                      (100 %, 200 %, 150 %) through the helper's own table
  *                      code (dxr_wl_lattice::probe_via_grid) and the SAME
@@ -244,6 +250,7 @@ struct Options
 	int hold_2d_frame = -1;             //!< --hold-2d-at=N (headless)
 	int release_3d_frame = -1;          //!< --release-3d-at=M (headless)
 	bool expect_mono = false;           //!< --expect-mono (headless)
+	bool test_hold_flicker = false;     //!< --test-hold-flicker (headless)
 };
 
 static void
@@ -284,6 +291,8 @@ usage(const char *argv0)
 	        "frame M\n"
 	        "  --expect-mono                (headless) require woven == the "
 	        "left view, unsqueezed\n"
+	        "  --test-hold-flicker          (headless) fast 2D hold open/close, "
+	        "every frame checked mono/woven\n"
 	        "  --lattice-selftest           build one drag-lattice table per "
 	        "scale via the grid provider (exit 1 = FAIL)\n"
 	        "  --dump-dir=DIR               where PNGs go (default $TMPDIR, else "
@@ -352,6 +361,9 @@ parse_args(int argc, char **argv, Options &o)
 			o.release_3d_frame = atoi(a + 16);
 		} else if (strcmp(a, "--expect-mono") == 0) {
 			o.expect_mono = true;
+		} else if (strcmp(a, "--test-hold-flicker") == 0) {
+			o.test_hold_flicker = true;
+			o.mono_in_2d = true;
 		} else if (strncmp(a, "--dump-dir=", 11) == 0) {
 			o.dump_dir = a + 11;
 		} else if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) {
@@ -504,6 +516,13 @@ struct App
 	int64_t hud_t = 0;
 	bool dump_requested = false;
 	int submit_failures = 0;
+	//! --test-hold-flicker: the per-frame readback in flight, what that frame
+	//! must be, and the tallies.
+	bool flicker_pending = false;
+	bool flicker_expect_mono = false;
+	int flicker_frame = -1;
+	bool hold_2d_now = false; //!< the last hardware request this run made was 2D
+	int flicker_checked = 0, flicker_mono = 0, flicker_woven = 0, flicker_bad = 0;
 
 	// ---- Wayland drop snap (see wl_drop_snap)
 	struct
@@ -875,7 +894,8 @@ init_session()
 	xrGetInstanceProcAddr(g.instance, "xrWeaveBindWindow2DXR", (PFN_xrVoidFunction *)&g.pfn_bind2);
 	xrGetInstanceProcAddr(g.instance, "xrWeaveSubmitDXR", (PFN_xrVoidFunction *)&g.pfn_submit);
 	xrGetInstanceProcAddr(g.instance, "xrWeaveSnapWindowRectDXR", (PFN_xrVoidFunction *)&g.pfn_snap);
-	if ((g.opt.test_display_mode || g.opt.hold_2d_frame >= 0 || g.opt.release_3d_frame >= 0) &&
+	if ((g.opt.test_display_mode || g.opt.hold_2d_frame >= 0 || g.opt.release_3d_frame >= 0 ||
+	     g.opt.test_hold_flicker) &&
 	    g.has_display_info) {
 		xrGetInstanceProcAddr(g.instance, "xrRequestDisplayModeDXR",
 		                      (PFN_xrVoidFunction *)&g.pfn_request_display_mode);
@@ -2385,6 +2405,23 @@ run()
 		if (!wait_frame_fences()) {
 			return 1;
 		}
+		// --test-hold-flicker: classify the previous frame's readback.
+		if (g.flicker_pending) {
+			g.flicker_pending = false;
+			const Verdict fv = analyze(g.rb_woven.map, g.rb_sbs.map, g.w, g.h);
+			const bool is_mono = fv.mono_err + 2.0 < fv.anaglyph_err;
+			const bool is_woven = fv.anaglyph_err + 2.0 < fv.mono_err;
+			g.flicker_checked++;
+			g.flicker_mono += is_mono ? 1 : 0;
+			g.flicker_woven += is_woven ? 1 : 0;
+			const bool ok = g.flicker_expect_mono ? is_mono : is_woven;
+			if (!ok) {
+				g.flicker_bad++;
+				LOGE("hold flicker: frame %d expected %s, got %s (|w-anaglyph| %.1f, |w-left| %.1f)",
+				     g.flicker_frame, g.flicker_expect_mono ? "MONO (held 2D)" : "WOVEN (released)",
+				     is_mono ? "mono" : (is_woven ? "woven" : "neither"), fv.anaglyph_err, fv.mono_err);
+			}
+		}
 		// A frame's dump readback is complete once its fences are waited.
 		if (g.dump_requested) {
 			g.dump_requested = false;
@@ -2451,6 +2488,37 @@ run()
 			     want_3d ? "3D" : "2D", (int)r);
 			if (XR_FAILED(r)) {
 				g.dm_order_bad = true;
+			}
+			g.hold_2d_now = !want_3d;
+		}
+		if (g.headless && g.opt.test_hold_flicker && g.pfn_request_display_mode != nullptr && f >= 10 &&
+		    f < 50) {
+			// Six-frame cycle: a 1-frame hold (2D at +0, 3D at +1), a 2-frame
+			// hold (2D at +2, 3D at +4), and a hold opened and closed inside
+			// ONE frame (+5: 2D then 3D before the submit -> woven). Every
+			// request is answered inline (the DP confirms on the IPC call), so
+			// the submit right after it must already show the new state.
+			std::vector<bool> reqs; // true = 3D
+			switch ((f - 10) % 6) {
+			case 0: reqs = {false}; break;
+			case 1: reqs = {true}; break;
+			case 2: reqs = {false}; break;
+			case 4: reqs = {true}; break;
+			case 5: reqs = {false, true}; break;
+			default: break;
+			}
+			for (bool want_3d : reqs) {
+				const XrResult r = g.pfn_request_display_mode(g.session, want_3d ? XR_DISPLAY_MODE_3D_DXR
+				                                                                 : XR_DISPLAY_MODE_2D_DXR);
+				if (XR_FAILED(r)) {
+					g.dm_order_bad = true;
+				}
+				g.hold_2d_now = !want_3d;
+			}
+			if (f == 49 && g.hold_2d_now) {
+				// End released, so the final dump is woven.
+				g.pfn_request_display_mode(g.session, XR_DISPLAY_MODE_3D_DXR);
+				g.hold_2d_now = false;
 			}
 		}
 
@@ -2550,10 +2618,16 @@ run()
 		} else if (g.opt.anaglyph_check && dump_trigger_present()) {
 			dump = true;
 		}
-		if (!present(release_fd, dump)) {
+		const bool flicker_dump = g.headless && g.opt.test_hold_flicker && f >= 10 && f < 50;
+		if (!present(release_fd, dump || flicker_dump)) {
 			return 1;
 		}
 		g.dump_requested = dump;
+		if (flicker_dump) {
+			g.flicker_pending = true;
+			g.flicker_expect_mono = g.hold_2d_now;
+			g.flicker_frame = f;
+		}
 		g.frame++;
 
 		if (g.headless && f == 0) {
@@ -2603,6 +2677,14 @@ run()
 	if (g.opt.expect_mono) {
 		check(v.mono_err < 10.0, "v13 mono: woven == the left view, unsqueezed");
 		check(v.mono_err + 2.0 < v.anaglyph_err, "v13 mono: woven is NOT the anaglyph (no weave)");
+	}
+	if (g.opt.test_hold_flicker) {
+		LOGI("hold flicker: %d frames checked, %d mono, %d woven, %d wrong", g.flicker_checked, g.flicker_mono,
+		     g.flicker_woven, g.flicker_bad);
+		check(g.flicker_checked == 40, "hold flicker: every frame of 10..49 read back");
+		check(g.flicker_bad == 0, "hold flicker: no woven frame while held, no stale mono after release");
+		check(g.flicker_mono > 0 && g.flicker_woven > 0, "hold flicker: both states seen");
+		check(!g.dm_order_bad, "hold flicker: every xrRequestDisplayModeDXR succeeded");
 	}
 	if (g.opt.hold_2d_frame >= 0 || g.opt.release_3d_frame >= 0) {
 		check(g.pfn_request_display_mode != nullptr && !g.dm_order_bad, "hold: xrRequestDisplayModeDXR resolved + succeeded");

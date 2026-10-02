@@ -239,7 +239,7 @@ comp_ipc_client_compositor_get_transparent_output_fence(struct xrt_compositor *x
  *   union(flat_rects) as the per-region hardware wish. Advisory and hardware-only
  *   — 0 is byte-for-byte pre-v8.
  *   @p mono_in_2d (spec v13): while the session's hardware state is 2D, the
- *   desktop-Linux engine presents the centre view flat instead of weaving.
+ *   desktop-Linux engine presents one view (stereo: the left) flat instead of weaving.
  * @c weave_set_screen_flat_regions latches the STICKY screen-space flat regions
  *   (spec v8, absolute physical screen px, held until the next call).
  * @c weave_get_output / @c weave_get_fence fetch the persistent server-allocated

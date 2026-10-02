@@ -1533,7 +1533,7 @@ weave_flat_2d_enabled(void)
  * would stay woven — a browser popup over inline 3D shown through the
  * interlace, split into two "eyes" of page pixels. Instead the runtime paints
  * those rects flat, from the same source the pixels came from (the input page
- * for a batch submit; the centre view otherwise), exactly as the off-panel
+ * for a batch submit; the flat view otherwise), exactly as the off-panel
  * bands are painted. The window geometry is needed for the sticky latch (it
  * is screen-absolute) and for the v6 scale; without it only the per-submit
  * rects apply, 1:1 on the output.
@@ -2104,17 +2104,19 @@ weave_run_frame(struct vk_bundle *vk,
 
 	// Spec v13 (XrWeaveSubmitMonoIn2DDXR): mono while the hardware is 2D. The
 	// whole output becomes ONE flat band — exactly the "entirely off the panel"
-	// case above: no weave, the centre view painted in register with the window
-	// (batch: each rect's left half unsqueezed; v6: the centre tile) at full
-	// output resolution. Gated on the CONFIRMED hardware state, not on the
-	// caller's own request, so the content goes flat only while the lens is
-	// really dropped (a DP that rejected the 2D request keeps the weave).
+	// case above: no weave, the flat view (below: a stereo pair's LEFT view —
+	// each batch rect's left half unsqueezed; N > 2 views, the one nearest the
+	// display axis) painted in register with the window at full output
+	// resolution. Gated on the CONFIRMED hardware state, not on the caller's
+	// own request, so the content goes flat only while the lens is really
+	// dropped (a DP that rejected the 2D request keeps the weave); it ends on
+	// the first submit after the confirmed state is 3D again.
 	const bool mono = mc->weave.mono_in_2d && mc->weave.hw_2d_confirmed;
 	if (mono != mc->weave.mono_active) {
 		mc->weave.mono_active = mono;
 		U_LOG_W("weave(v13): %s",
-		        mono ? "MONO — hardware 2D and the caller asked for one view: the centre view is painted flat "
-		               "over the whole output, no weave"
+		        mono ? "MONO — hardware 2D and the caller asked for one view: the flat view (stereo: the left "
+		               "view) is painted over the whole output, no weave"
 		             : (mc->weave.mono_in_2d ? "weave resumed (the hardware is 3D again)"
 		                                     : "weave resumed (the caller no longer asks for mono)"));
 	}
@@ -2190,17 +2192,37 @@ weave_run_frame(struct vk_bundle *vk,
 		                                    0, 0, 0, 0);
 	}
 
-	// Off-panel bands -> flat 2D, from the centre tile of the atlas the DP
-	// consumed (for a stereo pair, the left eye). After the weave and BEFORE
+	// THE flat view, shared by every flat path below (off-panel bands, mono in
+	// 2D, non-batch flat regions) so they are in register with each other:
+	// view 0 for 1-2 views (a stereo pair's LEFT view), else the view whose eye
+	// is nearest the display axis (u_weave_flat_view_index). Eye offsets are
+	// read only on an N > 2 grid (one DP query, the same one the reply makes).
+	uint32_t flat_view = 0;
+	{
+		const uint32_t tiles = grid_cols * grid_rows;
+		if (tiles > 2) {
+			struct xrt_eye_positions fe = {0};
+			float fx[ARRAY_SIZE(fe.eyes)];
+			uint32_t fn = 0;
+			if (xrt_display_processor_get_predicted_eye_positions(mc->weave.dp, &fe) && fe.valid) {
+				fn = fe.count < ARRAY_SIZE(fe.eyes) ? fe.count : (uint32_t)ARRAY_SIZE(fe.eyes);
+				for (uint32_t i = 0; i < fn; i++) {
+					fx[i] = fe.eyes[i].x;
+				}
+			}
+			flat_view = u_weave_flat_view_index(tiles, fn > 0 ? fx : NULL, fn);
+		}
+	}
+
+	// Off-panel bands -> flat 2D, from the flat view of the atlas the DP
+	// consumed (for a stereo pair, the left view). After the weave and BEFORE
 	// the v4 overlay, as in-process (#1654): 2D overlays are composited over
 	// the bands too, so they stay readable on both sides of the seam. Here,
 	// while the input is still in the layout the weave sampled it in (the
 	// zero-copy v6 source IS the input).
 	if (offpanel_count > 0) {
-		const uint32_t tiles = grid_cols * grid_rows;
-		const uint32_t view_index = tiles > 0 ? (tiles - 1) / 2 : 0;
 		weave_paint_offpanel(vk, mc, cmd, offpanel, offpanel_count, dp_src_view, dp_src_w, dp_src_h,
-		                     (view_index % grid_cols) * atlas_view_w, (view_index / grid_cols) * atlas_view_h,
+		                     (flat_view % grid_cols) * atlas_view_w, (flat_view / grid_cols) * atlas_view_h,
 		                     &blend_begun);
 	}
 
@@ -2209,7 +2231,7 @@ weave_run_frame(struct vk_bundle *vk,
 	// overlay. Source: for a batch submit the input page itself, 1:1 — the
 	// flat region IS page content (a popup / menu / DOM over 3D), and the
 	// input is window-sized in register with the output; otherwise (v6 /
-	// legacy, where the input holds views, not a page) the centre view the
+	// legacy, where the input holds views, not a page) the flat view the
 	// off-panel bands use.
 	{
 		struct u_wl_rect_px flat[WEAVE_FLAT_MAX_RECTS];
@@ -2230,11 +2252,9 @@ weave_run_frame(struct vk_bundle *vk,
 				                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 				                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
 			} else {
-				const uint32_t tiles = grid_cols * grid_rows;
-				const uint32_t view_index = tiles > 0 ? (tiles - 1) / 2 : 0;
 				weave_paint_offpanel(vk, mc, cmd, flat, flat_count, dp_src_view, dp_src_w, dp_src_h,
-				                     (view_index % grid_cols) * atlas_view_w,
-				                     (view_index / grid_cols) * atlas_view_h, &blend_begun);
+				                     (flat_view % grid_cols) * atlas_view_w,
+				                     (flat_view / grid_cols) * atlas_view_h, &blend_begun);
 			}
 		}
 	}
