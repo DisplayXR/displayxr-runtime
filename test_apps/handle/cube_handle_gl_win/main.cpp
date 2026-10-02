@@ -437,6 +437,22 @@ static void UpdatePerformanceStats(PerformanceStats& stats) {
         stats.fpsAccumulator = 0.0f;
     }
 }
+// Prefer the _SRGB format for Local2D panels when the session advertises it
+// (ADR-044 / INV-4.6): the CPU-authored bytes are display-referred, so a
+// UNORM declaration would have a format-honest compositor encode them twice.
+static int64_t PickPanelFormat(XrSession session, int64_t srgb, int64_t unorm) {
+    uint32_t n = 0;
+    xrEnumerateSwapchainFormats(session, 0, &n, nullptr);
+    std::vector<int64_t> formats(n);
+    if (n > 0) {
+        xrEnumerateSwapchainFormats(session, n, &n, formats.data());
+    }
+    for (int64_t f : formats) {
+        if (f == srgb) return f;
+    }
+    return unorm;
+}
+
 
 // #439 Phase 3 — create a window-anchored Local2D panel swapchain and fill it
 // once via glTexSubImage2D (the GL context is current on the render thread).
@@ -453,7 +469,7 @@ static bool CreateAndFillL2DPanel(XrSessionManager& xr, uint32_t w, uint32_t h, 
 
     XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
     sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-    sci.format = 0x8058; // GL_RGBA8
+    sci.format = PickPanelFormat(xr.session, 0x8C43 /* GL_SRGB8_ALPHA8 */, 0x8058 /* GL_RGBA8 */);
     sci.sampleCount = 1;
     sci.width = w;
     sci.height = h;

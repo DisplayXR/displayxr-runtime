@@ -1976,6 +1976,23 @@ struct L2DPanel {
 };
 static L2DPanel g_panel1, g_panel2;
 static XrRect2Di g_panel1Rect, g_panel2Rect;
+// Prefer the _SRGB format for Local2D panels when the session advertises it
+// (ADR-044 / INV-4.6): the CPU-authored bytes are display-referred, so a
+// UNORM declaration would have a format-honest compositor encode them twice.
+static int64_t PickPanelFormat(XrSession session)
+{
+    uint32_t n = 0;
+    xrEnumerateSwapchainFormats(session, 0, &n, nullptr);
+    std::vector<int64_t> formats(n);
+    if (n > 0) {
+        xrEnumerateSwapchainFormats(session, n, &n, formats.data());
+    }
+    for (int64_t f : formats) {
+        if (f == (int64_t)MTLPixelFormatBGRA8Unorm_sRGB) return f;
+    }
+    return (int64_t)MTLPixelFormatBGRA8Unorm;
+}
+
 
 // Create a window-anchored Local2D panel swapchain and fill it once (static
 // content: acquire/fill/release once; the layer references the released
@@ -1995,7 +2012,7 @@ static bool CreateAndFillL2DPanel(AppXrSession &app, uint32_t w, uint32_t h, int
 
     XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
     sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-    sci.format = (int64_t)MTLPixelFormatBGRA8Unorm;
+    sci.format = PickPanelFormat(app.session);
     sci.sampleCount = 1;
     sci.width = w;
     sci.height = h;
