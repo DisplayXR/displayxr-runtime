@@ -893,6 +893,12 @@ struct ipc_arg_weave_submit
 	//! xrCreateInstance, so a mismatched pair never connects in the first place.
 	uint32_t flat_rect_count; //!< 0..IPC_WEAVE_SUBMIT_FLAT_RECTS_MAX (0 = no flat regions)
 	struct ipc_weave_rect flat_rects[IPC_WEAVE_SUBMIT_FLAT_RECTS_MAX]; //!< first flat_rect_count valid
+
+	//! XR_DXR_weave v13 (XrWeaveSubmitMonoIn2DDXR): 1 = while this session's
+	//! hardware state is 2D, present the centre view flat instead of the weave
+	//! (desktop-Linux engine; ignored elsewhere). Appended, same accounting as
+	//! v8: 824 + 4 = 828 B; the dma-buf call is 4 + 828 + 136 = 968 of 1024.
+	uint32_t mono_in_2d;
 };
 
 /*!

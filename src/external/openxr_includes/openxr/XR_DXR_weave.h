@@ -198,6 +198,10 @@
  * back verbatim), so a present-owner can tag its own Wayland commit for
  * move-synchronised drag.
  *
+ * Mono in hardware 2D (SPEC_VERSION 13). XrWeaveSubmitMonoIn2DDXR, chained on
+ * XrWeaveSubmitInfoDXR: while the session's hardware state is 2D, the output is
+ * the centre view, flat, instead of the weave. Desktop Linux; ignored elsewhere.
+ *
  * Woven origin per output (SPEC_VERSION 12, browser-pvt#180). On native Wayland
  * (GNOME extension version 9+) a drag is MOVE-SYNCHRONISED: the extension holds
  * the window's actor at the position the buffer it is about to paint was woven
@@ -264,7 +268,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_weave 1
-#define XR_DXR_weave_SPEC_VERSION 12
+#define XR_DXR_weave_SPEC_VERSION 13
 #define XR_DXR_WEAVE_EXTENSION_NAME "XR_DXR_weave"
 
 // Reserved 1004999190..199. Final values reconcile with the Khronos registry
@@ -296,6 +300,9 @@ extern "C" {
 // Spec v12 (browser-pvt#180): woven origin per output, for present-owner move sync.
 #define XR_TYPE_WEAVE_OUTPUT_ORIGIN_DXR         ((XrStructureType)1004999247)
 #define XR_TYPE_WEAVE_WINDOW_LOGICAL_ORIGIN_DXR ((XrStructureType)1004999248)
+// Spec v13: one flat view instead of the weave while the panel is in hardware 2D.
+// Last value of the 240..249 decade.
+#define XR_TYPE_WEAVE_SUBMIT_MONO_IN_2D_DXR     ((XrStructureType)1004999249)
 
 //! Upper bound on eye positions carried by XrWeaveSubmitInfoDXR (mirrors the
 //! runtime's XRT_MAX_VIEWS). Phase 1: carried but unused.
@@ -949,6 +956,43 @@ typedef struct XrWeaveOutputOriginDXR {
     float              logicalScale;        //!< that bind's scale, verbatim
     uint64_t           serial;              //!< monotonic per woven output; 0 = not reported
 } XrWeaveOutputOriginDXR;
+
+/*!
+ * @brief Spec v13: present ONE flat view instead of the weave while the panel is
+ *        in hardware 2D (chain on XrWeaveSubmitInfoDXR::next).
+ *
+ * xrRequestDisplayModeDXR is hardware-only (XR_DXR_display_info): a 2D request
+ * over woven content turns the lens off and keeps the weave running, so the
+ * panel shows every view interlaced through no lens — soft and doubled. Apps
+ * rely on that for transitions that fade parallax to zero. A present-owner that
+ * drops the lens for a reason of its OWN (a browser holding the panel 2D while
+ * one of its menus is open) wants the opposite: the content flat and sharp.
+ *
+ * With @c monoIn2D XR_TRUE, and while THIS session's hardware display state is
+ * 2D (the last state the runtime confirmed to it — the one its
+ * XrEventDataHardwareDisplayStateChangedDXR events report), the runtime skips
+ * the weave and paints the whole output with the centre view of the submitted
+ * content at full output resolution, in register with the window: for a batch
+ * rect its left half unsqueezed, for a v6 layout the centre tile — the source
+ * the off-panel 2D bands use (§5d). Flat regions and the v4 overlay are applied
+ * on top as usual. While the hardware state is 3D the struct has no effect, so a
+ * caller can chain it for the whole of its own 2D hold without racing the
+ * lens: the output is flat exactly while the runtime holds the panel 2D, and a
+ * request the display processor rejected keeps the weave.
+ *
+ * Per submit, no latch: omitting the struct (or @c monoIn2D XR_FALSE) is the
+ * pre-v13 behaviour. Nothing is reported to the session — no rendering-mode
+ * event, no change to the active mode or to xrLocateViews.
+ *
+ * Honoured by the desktop-Linux weave engine. Every other platform of a v13
+ * runtime accepts and ignores it (the output stays woven), as a pre-v13 runtime
+ * does with any unknown chained struct.
+ */
+typedef struct XrWeaveSubmitMonoIn2DDXR {
+    XrStructureType          type;     //!< XR_TYPE_WEAVE_SUBMIT_MONO_IN_2D_DXR
+    const void* XR_MAY_ALIAS next;
+    XrBool32                 monoIn2D; //!< XR_TRUE: centre view flat, no weave, while hardware is 2D
+} XrWeaveSubmitMonoIn2DDXR;
 
 typedef XrResult (XRAPI_PTR *PFN_xrWeaveBindWindowDXR)(
     XrSession session, void* windowHandle);

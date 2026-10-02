@@ -2099,8 +2099,30 @@ weave_run_frame(struct vk_bundle *vk,
 	// and then the weave is skipped — nothing of it would be seen.
 	struct u_wl_rect_px offpanel[4];
 	bool skip_weave = false;
-	const uint32_t offpanel_count = weave_offpanel_bands(mc, nview, offpanel, &skip_weave);
+	uint32_t offpanel_count = weave_offpanel_bands(mc, nview, offpanel, &skip_weave);
 	bool blend_begun = false;
+
+	// Spec v13 (XrWeaveSubmitMonoIn2DDXR): mono while the hardware is 2D. The
+	// whole output becomes ONE flat band — exactly the "entirely off the panel"
+	// case above: no weave, the centre view painted in register with the window
+	// (batch: each rect's left half unsqueezed; v6: the centre tile) at full
+	// output resolution. Gated on the CONFIRMED hardware state, not on the
+	// caller's own request, so the content goes flat only while the lens is
+	// really dropped (a DP that rejected the 2D request keeps the weave).
+	const bool mono = mc->weave.mono_in_2d && mc->weave.hw_2d_confirmed;
+	if (mono != mc->weave.mono_active) {
+		mc->weave.mono_active = mono;
+		U_LOG_W("weave(v13): %s",
+		        mono ? "MONO — hardware 2D and the caller asked for one view: the centre view is painted flat "
+		               "over the whole output, no weave"
+		             : (mc->weave.mono_in_2d ? "weave resumed (the hardware is 3D again)"
+		                                     : "weave resumed (the caller no longer asks for mono)"));
+	}
+	if (mono) {
+		offpanel[0] = (struct u_wl_rect_px){0, 0, (int32_t)mc->weave.out_w, (int32_t)mc->weave.out_h};
+		offpanel_count = 1;
+		skip_weave = true;
+	}
 
 	// SELF-SUBMITTING DP ORDERING (Android #1036's one-frame trail fix): a
 	// DP that submits its own batch during process_atlas would otherwise
@@ -2828,6 +2850,19 @@ comp_multi_weave_linux_request_display_mode(struct multi_compositor *mc, bool en
 	}
 	os_mutex_unlock(&mc->weave.mutex);
 	return ok;
+}
+
+void
+comp_multi_weave_linux_set_mono_in_2d(struct xrt_compositor *xc, bool mono_in_2d)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (mc == NULL || mc->msc == NULL) {
+		return;
+	}
+	weave_ensure_mutex(mc);
+	os_mutex_lock(&mc->weave.mutex);
+	mc->weave.mono_in_2d = mono_in_2d;
+	os_mutex_unlock(&mc->weave.mutex);
 }
 
 void

@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | **Extension Name** | `XR_DXR_weave` |
-| **Spec Version** | 12 |
+| **Spec Version** | 13 |
 | **Extension Type** | Instance extension (service path — Windows/D3D11, macOS/comp_multi-Vulkan #759, Android/comp_multi-Vulkan #1036, desktop Linux/comp_multi-Vulkan dma-buf #1699 when the service carries its engine; the snap and its bulk grid form also work in-process on desktop Linux, §5c / #1588 / #1723) |
 | **Header** | `src/external/openxr_includes/openxr/XR_DXR_weave.h` (canonical; auto-syncs to `displayxr-extensions`) |
 | **Status** | Provisional (`1004999190–198` type block, pending Khronos registry; `199` reserved, see §2c; v9+ additions in a fresh `1004999240–249` decade — 240 v9, 241–245 v10, 246 v11, 247–248 v12) |
@@ -776,6 +776,53 @@ service): the app re-binds a stepped origin every 4 frames with a logical origin
 checks on every output that the reported origin equals the last bind, the logical pair is echoed
 verbatim and the serial strictly increases.
 
+## 5f. One flat view while the panel is in hardware 2D (v13)
+
+```c
+#define XR_TYPE_WEAVE_SUBMIT_MONO_IN_2D_DXR ((XrStructureType)1004999249)
+
+typedef struct XrWeaveSubmitMonoIn2DDXR {
+    XrStructureType          type;     // XR_TYPE_WEAVE_SUBMIT_MONO_IN_2D_DXR
+    const void* XR_MAY_ALIAS next;
+    XrBool32                 monoIn2D; // XR_TRUE: centre view flat, no weave, while hardware is 2D
+} XrWeaveSubmitMonoIn2DDXR;
+```
+
+**Why.** `xrRequestDisplayModeDXR` is hardware-only (`XR_DXR_display_info`): 2D over woven
+content turns the lens off and keeps the weave, so every view shows interlaced through no lens,
+soft and doubled. Apps build fade-to-flat transitions on exactly that, so it stays the default.
+A present-owner that drops the lens for its OWN reason — the browser holding the panel 2D while
+one of its menus is open over an inline-3D page — wants the content flat and sharp instead, as if
+a 2D rendering mode were active, without the page being told anything.
+
+**Why not a 2D rendering mode.** `xrRequestDisplayRenderingModeDXR` is the page's channel and is
+display-global: on Windows the service broadcasts `XrEventDataRenderingModeChangedDXR` to every
+session and re-forces a 3D mode for a weave client that keeps submitting; on desktop Linux the
+content mode a present-owner pushes is recorded and read by nothing in the weave engine, and its
+seed at `xrBeginSession` is whatever mode the head device holds. Neither weave engine reads the
+content mode at all. A per-submit flag scoped to the weave keeps the page's mode, the events and
+every other session out of it.
+
+**Semantics.** Chained on `XrWeaveSubmitInfoDXR`. While `monoIn2D` is `XR_TRUE` **and** this
+session's hardware display state is 2D — the state the runtime last confirmed to it, the one its
+`XrEventDataHardwareDisplayStateChangedDXR` events report — the runtime skips the weave and paints
+the whole output with the centre view of the submitted content at full output resolution, in
+register with the window: for a batch rect its left half unsqueezed, for a v6 layout the centre
+tile. That is the source the off-panel bands (§5d) use, and the path is theirs: the whole output
+becomes one band. Flat regions and the v4 overlay are applied on top as usual.
+
+- In hardware 3D the struct has no effect: the output is woven. A caller can therefore chain it for
+  the whole of its own 2D hold without racing the lens, and a 2D request the display processor
+  rejected keeps the weave.
+- Per submit, no latch. Omitting the struct, or `monoIn2D = XR_FALSE`, is the pre-v13 behaviour.
+- Nothing is reported to the session: no event, no change to the active rendering mode, to
+  `xrLocateViews`, or to the hardware state.
+
+**Platforms.** The desktop-Linux weave engine implements it (`comp_multi_weave_linux.c`,
+`weave_run_frame`; the IPC submit carries it as `ipc_arg_weave_submit::mono_in_2d`). Windows,
+macOS and Android accept and ignore it — the output stays woven — as a pre-v13 runtime does with
+any unknown chained struct. One `weave(v13)` WARN in the service log per edge.
+
 ## 6. Version history
 
 | Version | Change |
@@ -792,6 +839,11 @@ verbatim and the serial strictly increases.
 | 10 | Desktop-Linux dma-buf transport (§5d, #1699): `XR_WEAVE_HANDLE_KIND_DMABUF_DXR` / `_OPAQUE_FD_DXR`, `XrWeaveDmabufDescDXR` + `XrWeaveOverlayDmabufDescDXR` in, `XrWeaveOutputDmabufDXR` out, `sync_file` fences `XrWeaveSubmitSyncDXR` (acquire) / `XrWeaveOutputSyncDXR` (release, per frame). Desktop Linux becomes a full weave platform when the service carries its engine. |
 | 11 | `xrWeaveSnapWindowGridDXR` + `XrWeaveSnapGridInfoDXR` / `XrWeaveSnapGridPointDXR` — bulk grid snap: the per-point snap evaluated over a grid by the runtime, one call (one IPC round trip) instead of one per point (§5c, #1723). |
 | 12 | `XrWeaveOutputOriginDXR` (out, per frame: the origin each woven output was woven for + a serial) and `XrWeaveWindowLogicalOriginDXR` (in: the caller's logical origin + scale, echoed verbatim) — so a present-owner can tag its own Wayland commit for move-synchronised drag (§5e, browser-pvt#180). |
+| 13 | `XrWeaveSubmitMonoIn2DDXR` — one flat view (the centre view) instead of the weave while the session's hardware state is 2D (§5f). Desktop Linux; accepted and ignored elsewhere. |
+
+**v13 is a bump**: one structure type a caller gates on `extensionVersion >= 13`. Against an
+older runtime the struct is skipped and the output stays woven, which is also what every
+non-Linux v13 runtime does — so the gate decides only whether the caller can expect the flat view.
 
 **v12 is a bump**: two structure types a caller must be able to test for. An older runtime skips
 both chains — the logical origin is simply not latched, and the OUT struct keeps whatever the

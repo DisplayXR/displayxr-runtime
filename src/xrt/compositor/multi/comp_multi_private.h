@@ -924,6 +924,17 @@ struct multi_compositor
 		 */
 		bool hw_2d_confirmed;
 
+		/*!
+		 * Spec v13 (XrWeaveSubmitMonoIn2DDXR): the caller asked, on the submit
+		 * being processed, for one flat view instead of the weave while
+		 * hw_2d_confirmed. Set by comp_multi_weave_linux_set_mono_in_2d right
+		 * before each submit (per submit, never sticky); @c mono_active is the
+		 * state the last submit actually rendered, so the WARN fires on an edge
+		 * only.
+		 */
+		bool mono_in_2d;
+		bool mono_active;
+
 		//! @name Flat regions (spec v8, browser#88, on desktop Linux)
 		//! The sticky screen-space latch (xrWeaveSetScreenFlatRegionsDXR),
 		//! absolute screen device px; a SET, count 0 clears. Unioned with
@@ -1526,6 +1537,18 @@ comp_multi_weave_set_screen_flat_regions(struct xrt_compositor *xc,
  */
 bool
 comp_multi_weave_linux_request_display_mode(struct multi_compositor *mc, bool enable_3d);
+
+/*!
+ * Spec v13 (XrWeaveSubmitMonoIn2DDXR): what the NEXT submit asked for. The IPC
+ * handler calls this with the submit's own flag immediately before handing the
+ * submit to the engine, so the value is per submit (a submit without the chain
+ * sets false). While it is set AND this session's hardware state is 2D (as last
+ * confirmed by mc->weave.dp — hw_2d_confirmed), the frame skips the weave and
+ * paints the whole output with the centre view of the submitted content, the
+ * source the off-panel bands use. In 3D it has no effect.
+ */
+void
+comp_multi_weave_linux_set_mono_in_2d(struct xrt_compositor *xc, bool mono_in_2d);
 /*! @} */
 #endif // XRT_OS_LINUX_DESKTOP
 

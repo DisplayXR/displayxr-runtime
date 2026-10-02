@@ -941,7 +941,9 @@ XrResult xrRequestDisplayModeDXR(
   changes. Requesting `XR_DISPLAY_MODE_2D_DXR` over an active 3D mode therefore shows the
   *woven* atlas flat (blurry); an application fading its parallax to zero converges back
   to a sharp image — the building block for app-authored 2D↔3D transitions such as the
-  MANUAL eye-tracking loss flow.
+  MANUAL eye-tracking loss flow. (A weave present-owner that wants the content flat instead —
+  one view, sharp — opts in per submit with `XrWeaveSubmitMonoIn2DDXR`, `XR_DXR_weave` v13 §5f;
+  this function's own semantics do not change.)
 - **Lifetime of the override.** The override holds until the next
   `xrRequestDisplayRenderingModeDXR` call, whose mode's default hardware state then
   applies (re-requesting the current mode index restores its default).
