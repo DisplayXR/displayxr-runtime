@@ -42,6 +42,9 @@ struct comp_vk_native_swapchain
 	//! Vulkan bundle (borrowed from compositor).
 	struct vk_bundle *vk;
 
+	//! Owning compositor: told about the images before they are destroyed (#1782).
+	struct comp_vk_native_compositor *c;
+
 	//! VkImages.
 	VkImage images[MAX_SWAPCHAIN_IMAGES];
 
@@ -238,6 +241,12 @@ vk_swapchain_destroy(struct xrt_swapchain *xsc)
 	struct comp_vk_native_swapchain *sc = vk_sc(xsc);
 	struct vk_bundle *vk = sc->vk;
 
+	// #1782: the compositor's HUD cache is keyed by VkImage, and the driver
+	// hands these handle values to the next images it creates.
+	if (sc->c != NULL) {
+		comp_vk_native_compositor_swapchain_images_destroyed(sc->c, sc->images, sc->image_count);
+	}
+
 	for (uint32_t i = 0; i < sc->image_count; i++) {
 		if (sc->true_views[i] != VK_NULL_HANDLE) {
 			vk->vkDestroyImageView(vk->device, sc->true_views[i], NULL);
@@ -289,6 +298,7 @@ comp_vk_native_swapchain_create(struct comp_vk_native_compositor *c,
 	}
 
 	sc->vk = vk;
+	sc->c = c;
 	sc->info = *info;
 	sc->image_count = image_count;
 	comp_swapchain_ring_init(&sc->ring, image_count);

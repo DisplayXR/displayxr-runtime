@@ -327,6 +327,18 @@ struct vk_bundle *
 comp_vk_native_compositor_get_vk(struct comp_vk_native_compositor *c);
 
 /*!
+ * A swapchain is about to destroy these images (#1782).
+ *
+ * Caches keyed by VkImage must drop them before a new image can reuse the
+ * handle value; the compositor forgets them at the start of its next
+ * window-space pass. Callable from any thread.
+ */
+void
+comp_vk_native_compositor_swapchain_images_destroyed(struct comp_vk_native_compositor *c,
+                                                     const VkImage *images,
+                                                     uint32_t count);
+
+/*!
  * Get the queue family index from a VK native compositor (for sub-modules).
  *
  * @ingroup comp_vk_native

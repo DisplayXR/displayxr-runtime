@@ -195,6 +195,8 @@ vk_hud_blend_init_ex(struct vk_hud_blend *blend,
 	};
 	VkDescriptorPoolCreateInfo dp_ci = {
 	    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+	    // Individual frees: vk_hud_blend_forget_image() returns a set (#1782).
+	    .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
 	    .maxSets = VK_HUD_BLEND_MAX_IMAGES,
 	    .poolSizeCount = 1,
 	    .pPoolSizes = &pool_size,
@@ -555,6 +557,27 @@ vk_hud_blend_draw_no_layout(struct vk_hud_blend *blend,
 	vk->vkCmdDraw(cmd, 3, 1, 0, 0);
 
 	vk->vkCmdEndRenderPass(cmd);
+}
+
+void
+vk_hud_blend_forget_image(struct vk_hud_blend *blend, struct vk_bundle *vk, VkImage hud_image)
+{
+	if (!blend->initialized || hud_image == VK_NULL_HANDLE) {
+		return;
+	}
+
+	for (uint32_t i = 0; i < blend->image_count; i++) {
+		if (blend->cached_images[i].image != hud_image) {
+			continue;
+		}
+		vk->vkDestroyImageView(vk->device, blend->cached_images[i].view, NULL);
+		vk->vkFreeDescriptorSets(vk->device, blend->desc_pool, 1, &blend->cached_images[i].desc_set);
+
+		// Order does not matter: move the last entry into the hole.
+		blend->image_count--;
+		blend->cached_images[i] = blend->cached_images[blend->image_count];
+		return;
+	}
 }
 
 void

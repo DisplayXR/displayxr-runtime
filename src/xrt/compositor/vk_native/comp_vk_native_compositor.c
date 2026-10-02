@@ -1049,6 +1049,26 @@ struct comp_vk_native_compositor
 	//! HUD per-eye disparity / parallax (#210).
 	struct vk_hud_blend window_space_blend;
 	bool window_space_blend_attempted;
+	/*!
+	 * Swapchain images destroyed since the last window-space pass (#1782).
+	 *
+	 * window_space_blend caches a view per source VkImage, and the driver
+	 * reuses a destroyed image's handle for the next image it creates: an app
+	 * that resizes a HUD (destroy + create its swapchain) then gets the old
+	 * entry back, and the pass samples freed memory (VK_ERROR_DEVICE_LOST).
+	 * Swapchain destroy queues the images here and the pass forgets them
+	 * before it looks anything up. A leaf lock of its own: destroy runs on
+	 * the app thread, the pass can run on the weave thread, and c->mutex may
+	 * be held by a wedged weave thread (#1394).
+	 */
+	struct
+	{
+		struct os_mutex mutex;
+		VkImage images[VK_HUD_BLEND_MAX_IMAGES];
+		uint32_t count;
+		//! More images died than fit: forget the whole cache instead.
+		bool overflow;
+	} ws_dead;
 	//! Cached framebuffer for atlas window-space pass (one per atlas view).
 	/*!
 	 * Framebuffer for the window-space-into-atlas pass, keyed by the atlas
@@ -2443,6 +2463,31 @@ vk_compositor_layer_zone_3d(struct xrt_compositor *xc,
  * @param tile_columns  Atlas tile columns.
  * @param tile_rows     Atlas tile rows.
  */
+/*!
+ * Drop window_space_blend's cache entries for swapchain images destroyed since
+ * the last call (#1782). See comp_vk_native_compositor::ws_dead.
+ */
+static void
+vk_compositor_forget_dead_window_space_images(struct comp_vk_native_compositor *c)
+{
+	struct vk_bundle *vk = &c->vk;
+
+	os_mutex_lock(&c->ws_dead.mutex);
+	if (c->ws_dead.overflow) {
+		while (c->window_space_blend.image_count > 0) {
+			vk_hud_blend_forget_image(&c->window_space_blend, vk,
+			                          c->window_space_blend.cached_images[0].image);
+		}
+	} else {
+		for (uint32_t i = 0; i < c->ws_dead.count; i++) {
+			vk_hud_blend_forget_image(&c->window_space_blend, vk, c->ws_dead.images[i]);
+		}
+	}
+	c->ws_dead.count = 0;
+	c->ws_dead.overflow = false;
+	os_mutex_unlock(&c->ws_dead.mutex);
+}
+
 static void
 vk_compositor_render_window_space_into_atlas(struct comp_vk_native_compositor *c,
                                                VkCommandBuffer cmd,
@@ -2456,6 +2501,11 @@ vk_compositor_render_window_space_into_atlas(struct comp_vk_native_compositor *c
                                                uint32_t tile_rows)
 {
 	struct vk_bundle *vk = &c->vk;
+
+	// #1782: before any lookup can hit a reused handle. Safe to free here for
+	// the same reason the framebuffer eviction below is: the previous frame's
+	// submit is waited on before this recording begins.
+	vk_compositor_forget_dead_window_space_images(c);
 
 	bool has_ws = false;
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
@@ -8601,6 +8651,7 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	os_mutex_destroy(&c->mutex);
 	os_cond_destroy(&c->weave_hand.cond);
 	os_mutex_destroy(&c->weave_hand.mutex);
+	os_mutex_destroy(&c->ws_dead.mutex);
 
 	// XR_DXR_depth_budget: the runner owns a mutex.
 	comp_rear_budget_fini(&c->rear_budget);
@@ -9161,6 +9212,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	// #1394: the hand-off handshake runs on its own leaf lock — see weave_hand.mutex.
 	os_mutex_init(&c->weave_hand.mutex);
 	os_cond_init(&c->weave_hand.cond);
+	os_mutex_init(&c->ws_dead.mutex); // #1782
 	os_thread_helper_init(&c->repaint_thread);
 
 	// XR_DXR_depth_budget: the policy exists from the first frame so that a
@@ -12052,6 +12104,25 @@ struct vk_bundle *
 comp_vk_native_compositor_get_vk(struct comp_vk_native_compositor *c)
 {
 	return &c->vk;
+}
+
+void
+comp_vk_native_compositor_swapchain_images_destroyed(struct comp_vk_native_compositor *c,
+                                                     const VkImage *images,
+                                                     uint32_t count)
+{
+	os_mutex_lock(&c->ws_dead.mutex);
+	for (uint32_t i = 0; i < count; i++) {
+		if (images[i] == VK_NULL_HANDLE) {
+			continue;
+		}
+		if (c->ws_dead.count >= ARRAY_SIZE(c->ws_dead.images)) {
+			c->ws_dead.overflow = true;
+			break;
+		}
+		c->ws_dead.images[c->ws_dead.count++] = images[i];
+	}
+	os_mutex_unlock(&c->ws_dead.mutex);
 }
 
 uint32_t
