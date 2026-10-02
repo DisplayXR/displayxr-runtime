@@ -184,6 +184,13 @@ jobs:
         # file; no GNOME Shell needed.
         run: gjs scripts/test_gnome_extension_pointer_drag.js
 
+      - name: Stage space follows mutter's layout mode
+        # Unit test for StageScale in lib.js (extension version 11): the
+        # snapshot's layout_mode + monitor.device_scale, read from the stage
+        # view scales. In mutter's PHYSICAL layout the stage is device px and
+        # the monitor scale must not be applied. Plain gjs.
+        run: gjs scripts/test_gnome_extension_stage_scale.js
+
   cnsdk-pin-guard:
     runs-on: ubuntu-latest
     steps:

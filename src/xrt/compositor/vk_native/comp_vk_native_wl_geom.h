@@ -24,6 +24,15 @@
  * fractionally-scaled desktop produced no present origin at all rather than a
  * converted one.
  *
+ * "Logical" is Mutter's STAGE coordinates, and the stage is logical px only in
+ * Mutter's LOGICAL layout mode. In its PHYSICAL mode (Ubuntu 24.04 / GNOME 46
+ * at an integer scale) the stage already is device px, and the monitor scale
+ * must not be applied: it read a 3840x2160 panel at 200 % as 7680x4320. The
+ * factor is therefore resolved per window (u_wl_stage_to_device_scale): the
+ * publisher's `monitor.device_scale`, else its `layout_mode`, else Mutter's own
+ * `layout-mode` (DisplayConfig.GetCurrentState, for a publisher older than
+ * extension version 11), else the monitor scale.
+ *
  * Degradation: extension absent / bus unreachable / no matching window / the
  * window is on no monitor → comp_vk_native_wl_geom_get_window_rect returns
  * false and the compositor stays display-scoped, exactly the pre-#817 Wayland
@@ -84,7 +93,9 @@ struct comp_vk_native_wl_window_rect
 	//! at all — the check that would have caught the 2026-09-20 session, where
 	//! the surface fullscreened on the laptop and wove anyway.
 	uint32_t monitor_width_px, monitor_height_px;
-	//! The factor applied. 1.0 means the wire values were already device px.
+	//! The factor applied: device px per STAGE px (the `*_logical` fields
+	//! below). The monitor scale in Mutter's LOGICAL layout mode, 1.0 in its
+	//! PHYSICAL mode — where the wire values already are device px.
 	float scale;
 	//! The committed SURFACE's size in DEVICE px (the compositor's buffer rect
 	//! for the window), or 0 when the publisher does not report it. Differs

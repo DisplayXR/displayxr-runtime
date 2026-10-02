@@ -105,6 +105,18 @@ GNOME Shell (Mutter)                        DisplayXR runtime process
   v1; before #1596 the consumer simply never read four of them. Mutter omits
   the `monitor` object only for a window on no monitor.
 
+  **`scale` is the factor only in Mutter's LOGICAL layout mode** (extension
+  version 11, §4.1). "Logical" above means Mutter's *stage* coordinates, and
+  in Mutter's PHYSICAL layout mode the stage is device px: a 3840x2160
+  monitor at 200 % is published as `{w: 3840, h: 2160, scale: 2}`. Version 11
+  therefore adds a top-level `layout_mode` (`"logical"` / `"physical"`) and
+  `monitor.device_scale`, the device-px-per-stage-px factor (the scale of the
+  stage view painting the monitor). The consumer converts by `device_scale`,
+  then by `layout_mode`, then, for an older publisher, by asking Mutter
+  (`org.gnome.Mutter.DisplayConfig.GetCurrentState` → `layout-mode`: 1
+  logical, 2 physical). It falls back to `scale` only when none of those
+  answers (`u_wl_stage_to_device_scale`).
+
 - **Consumer** — `comp_vk_native_wl_geom` (`src/xrt/compositor/vk_native/`,
   built when `XRT_HAVE_WAYLAND && XRT_HAVE_DBUS`, libdbus-1). Private
   session-bus connection; one blocking `GetWindows` at create (200 ms cap),
@@ -124,6 +136,7 @@ GNOME Shell (Mutter)                        DisplayXR runtime process
 | Extension not installed/enabled | Snapshot empty; bounded retry every 5 s; display-scoped until it appears |
 | No window matches our PID | `get_window_metrics` invalid; display-scoped |
 | Monitor scale ≠ 1.0 | **Converted**, not refused (#1596): the rect is multiplied to device pixels using `monitor` + its fractional `scale`, one INFO naming both spaces. Weaving proceeds with a real phase |
+| Mutter in its PHYSICAL layout mode (stage = device px; Ubuntu 24.04 / GNOME 46 at an integer scale) | Factor 1, not the monitor scale (§4.1). One WARN naming the source (`device_scale`, `layout_mode`, or Mutter's own `layout-mode` for a publisher older than version 11). Before this, a 3840x2160 panel at 200 % read as 7680x4320, so the window was "not on the panel" and presented flat 2D |
 | Payload carries no `monitor` object | Rect **refused**, one WARN; display-scoped. Without it there is no scale to apply and no way to name the space the rect is in. Mutter omits it only for a window on no monitor |
 | The window's monitor is not the 3D panel | Rect **refused**, one WARN; display-scoped — *and* the weave itself degrades to flat 2D (#1595), because a surface on another output cannot be 1:1 with this panel by any phase |
 | The presented buffer ≠ the window's device extent | Geometry is still valid and still served; the **weave** degrades to flat 2D (#1595), one `NOT_1TO1:` WARN, and the present-origin feed is suppressed so no stale phase stays latched |
@@ -261,6 +274,52 @@ this clause requires a bump for.
 Consumers refuse a payload whose `version` exceeds what they understand
 (`WLG_SCHEMA_VERSION_MAX`) and fall back to display-scoped rather than weave at
 a silently wrong phase; a payload with no `version` is treated as v1.
+
+### 4.1 Worked example: Mutter's layout mode (extension version 11)
+
+The clause above says the wire is LOGICAL. That was true only on the desktops
+it had been measured on. The wire is Mutter's **stage** coordinates, and Mutter
+has two layout modes:
+
+| `layout-mode` | when | stage space | 3840x2160 monitor at 200 % |
+|---|---|---|---|
+| 1 LOGICAL | fractional scaling enabled; mutter 50's default | logical px | rect 1920x1080, scale 2, stage view scale 2 |
+| 2 PHYSICAL | Ubuntu 24.04 / GNOME 46 at an integer scale, out of the box | device px | rect 3840x2160, scale 2, stage view scale 1 |
+
+(Measured on a headless mutter 50.1, switching only `gdctl set --layout-mode`.)
+In PHYSICAL the monitor scale says how big clients draw. It is not a
+coordinate factor, so a consumer that multiplied by it read the panel as a
+7680x4320 output. The window was then never "on the panel": `NOT_1TO1`, flat
+2D, lens off.
+
+Version 11 fixes this **additively**. No field changes meaning: `frame`,
+`buffer` and `monitor.{x,y,w,h}` remain stage coordinates, and `scale` remains
+`get_monitor_scale()`. What is new is two fields that name the stage's space:
+
+- top-level `layout_mode`: `"logical"` / `"physical"`, left out when it
+  cannot be told. With every monitor at scale 1 the two modes agree.
+- `monitor.device_scale`: device px per stage px. This is the scale of the
+  stage view painting the monitor (`Clutter.StageView.get_scale()`), so it is
+  the factor in either mode.
+
+Mutter does not introspect its layout mode. The view scales give it away:
+any view scale other than 1 means LOGICAL, and every view at 1 while some
+monitor is scaled means PHYSICAL (`StageScale` in `lib.js`, pinned by
+`scripts/test_gnome_extension_stage_scale.js`). The schema stays `version: 1`.
+Bumping it would make every shipped consumer refuse a payload that is still
+correct for it on every LOGICAL desktop. A consumer without the new fields
+asks Mutter for `layout-mode` instead, as the runtime does for a publisher
+older than version 11 (`wlg_query_mutter_layout_mode`). That case is not
+hypothetical: after a package upgrade, the running shell keeps the old
+extension until the user logs out.
+
+Everything else in the extension already worked in stage coordinates, so it
+follows the mode with no change: `MoveWindow`, the pointer drag, and the
+move-sync history. The move-sync tag is read from subsurface actor positions,
+and those are in *surface* units in both modes. Measured in PHYSICAL at
+200 %: the tag actor sits at `(x mod 256, y mod 256)` of the buffer's stage
+position, exactly as the runtime set it. The drag-lattice choice and the stamp
+audit weigh device px, and now use `device_scale`.
 
 **No reverse dependency.** The extension must remain pure GNOME Shell JS with
 no import from, or runtime dependency on, DisplayXR or any vendor stack — that
