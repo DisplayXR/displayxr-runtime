@@ -45,7 +45,8 @@ extern "C" {
 struct vk_hud_blend
 {
 	VkRenderPass render_pass;
-	VkPipeline pipeline;
+	VkPipeline pipeline;        //!< Straight-alpha colour blend (src SRC_ALPHA).
+	VkPipeline pipeline_premul; //!< Premultiplied colour blend (src ONE), #1786.
 	VkPipelineLayout pipe_layout;
 	VkDescriptorSetLayout desc_layout;
 	VkDescriptorPool desc_pool;
@@ -137,6 +138,30 @@ vk_hud_blend_draw(struct vk_hud_blend *blend,
                    int32_t dst_y,
                    uint32_t dst_w,
                    uint32_t dst_h);
+
+/*!
+ * vk_hud_blend_draw_no_layout(), choosing the colour blend per draw (#1786).
+ *
+ * @p premultiplied false is the straight-alpha blend every other draw uses
+ * (colour src SRC_ALPHA, dst ONE_MINUS_SRC_ALPHA). True treats the source as
+ * premultiplied (colour src ONE, dst ONE_MINUS_SRC_ALPHA). The alpha blend is
+ * whatever the blend was initialized with, in both cases.
+ *
+ * @ingroup aux_vk
+ */
+void
+vk_hud_blend_draw_no_layout_ex(struct vk_hud_blend *blend,
+                               struct vk_bundle *vk,
+                               VkCommandBuffer cmd,
+                               VkFramebuffer fb,
+                               uint32_t fb_w,
+                               uint32_t fb_h,
+                               VkImage hud_image,
+                               int32_t dst_x,
+                               int32_t dst_y,
+                               uint32_t dst_w,
+                               uint32_t dst_h,
+                               bool premultiplied);
 
 /*!
  * Draw without managing target image layout transitions or framebuffer

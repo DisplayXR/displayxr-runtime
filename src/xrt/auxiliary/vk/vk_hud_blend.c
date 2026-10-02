@@ -324,6 +324,16 @@ vk_hud_blend_init_ex(struct vk_hud_blend *blend,
 		return false;
 	}
 
+	// #1786: premultiplied variant, same state but colour src ONE. Picked per
+	// draw by vk_hud_blend_draw_no_layout_ex(); everything else uses the
+	// straight pipeline above.
+	blend_att.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+	ret = vk->vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 1, &pipe_ci, NULL, &blend->pipeline_premul);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("[HUD blend] Failed to create premultiplied pipeline: %d", ret);
+		return false;
+	}
+
 	blend->initialized = true;
 	return true;
 }
@@ -528,6 +538,23 @@ vk_hud_blend_draw_no_layout(struct vk_hud_blend *blend,
                               uint32_t dst_w,
                               uint32_t dst_h)
 {
+	vk_hud_blend_draw_no_layout_ex(blend, vk, cmd, fb, fb_w, fb_h, hud_image, dst_x, dst_y, dst_w, dst_h, false);
+}
+
+void
+vk_hud_blend_draw_no_layout_ex(struct vk_hud_blend *blend,
+                               struct vk_bundle *vk,
+                               VkCommandBuffer cmd,
+                               VkFramebuffer fb,
+                               uint32_t fb_w,
+                               uint32_t fb_h,
+                               VkImage hud_image,
+                               int32_t dst_x,
+                               int32_t dst_y,
+                               uint32_t dst_w,
+                               uint32_t dst_h,
+                               bool premultiplied)
+{
 	if (!blend->initialized || hud_image == VK_NULL_HANDLE || fb == VK_NULL_HANDLE ||
 	    dst_w == 0 || dst_h == 0) {
 		return;
@@ -551,7 +578,8 @@ vk_hud_blend_draw_no_layout(struct vk_hud_blend *blend,
 	VkRect2D scissor = {{dst_x, dst_y}, {dst_w, dst_h}};
 	vk->vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-	vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, blend->pipeline);
+	vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+	                      premultiplied ? blend->pipeline_premul : blend->pipeline);
 	vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, blend->pipe_layout, 0, 1,
 	                             &desc_set, 0, NULL);
 	vk->vkCmdDraw(cmd, 3, 1, 0, 0);
@@ -597,6 +625,9 @@ vk_hud_blend_fini(struct vk_hud_blend *blend, struct vk_bundle *vk)
 
 	if (blend->pipeline != VK_NULL_HANDLE) {
 		vk->vkDestroyPipeline(vk->device, blend->pipeline, NULL);
+	}
+	if (blend->pipeline_premul != VK_NULL_HANDLE) {
+		vk->vkDestroyPipeline(vk->device, blend->pipeline_premul, NULL);
 	}
 	if (blend->render_pass != VK_NULL_HANDLE) {
 		vk->vkDestroyRenderPass(vk->device, blend->render_pass, NULL);

@@ -2622,6 +2622,12 @@ vk_compositor_render_window_space_into_atlas(struct comp_vk_native_compositor *c
 		const struct xrt_layer_window_space_data *ws = &layer->data.window_space;
 		uint32_t sc_index = ws->sub.image_index;
 
+		// #1786: same rule as D3D11/D3D12's window-space pass —
+		// SOURCE_ALPHA_BIT clear means premultiplied bytes, set means
+		// straight. Deliberately not comp_layer_blend_mode() (#1599): see
+		// the comment in comp_d3d11_renderer.cpp's window-space draw.
+		bool ws_premultiplied = (layer->data.flags & XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT) == 0;
+
 		VkImage src_image = (VkImage)(uintptr_t)
 		    comp_vk_native_swapchain_get_image(xsc, sc_index);
 		if (src_image == VK_NULL_HANDLE) {
@@ -2699,9 +2705,9 @@ vk_compositor_render_window_space_into_atlas(struct comp_vk_native_compositor *c
 				}
 			}
 
-			vk_hud_blend_draw_no_layout(&c->window_space_blend, vk, cmd,
-			    c->atlas_ws_fb, atlas_w, atlas_h,
-			    src_image, dx, dy, (uint32_t)dw_i, (uint32_t)dh_i);
+			vk_hud_blend_draw_no_layout_ex(&c->window_space_blend, vk, cmd, c->atlas_ws_fb, atlas_w,
+			                               atlas_h, src_image, dx, dy, (uint32_t)dw_i, (uint32_t)dh_i,
+			                               ws_premultiplied);
 		}
 
 		// Source back to COLOR_ATTACHMENT_OPTIMAL so the app can rerender.

@@ -6244,7 +6244,11 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 
 		glUseProgram(c->program_window_space);
 		glEnable(GL_BLEND);
-		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+		// #1786: same rule as D3D11/D3D12/vk_native's window-space pass —
+		// SOURCE_ALPHA_BIT clear means premultiplied bytes, set means
+		// straight. Deliberately not comp_layer_blend_mode() (#1599).
+		bool ws_premultiplied = (layer->data.flags & XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT) == 0;
+		glBlendFunc(ws_premultiplied ? GL_ONE : GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
 		GLint loc_ws_rect = glGetUniformLocation(c->program_window_space, "u_rect");
 		GLint loc_ws_tex = glGetUniformLocation(c->program_window_space, "u_texture");
