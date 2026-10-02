@@ -13,7 +13,8 @@
  * the source image (HUD swapchain image), its dimensions, and the
  * destination rect on the swapchain. Image views and descriptor sets
  * are cached by VkImage so an OpenXR swapchain with rotating per-frame
- * images doesn't pay setup cost beyond first sight of each image.
+ * images doesn't pay setup cost beyond first sight of each image. A
+ * destroyed source image must be removed with vk_hud_blend_forget_image().
  *
  * @author David Fattal
  * @ingroup aux_vk
@@ -28,7 +29,8 @@ extern "C" {
 #endif
 
 // Each window-space layer is its own OpenXR swapchain, and swapchains rotate
-// through ~3 images; the image cache is keyed by VkImage and never evicts. So
+// through ~3 images; the image cache is keyed by VkImage and only evicts what
+// vk_hud_blend_forget_image() is told about. So
 // the bound must cover (max concurrent window-space layers) × (images/swapchain),
 // not just the 1-2 layers an undersized cache happened to allow. 64 ≈ 21 layers ×
 // 3 images — generous headroom for realistic per-depth-plane 2D UI (see issue #389
@@ -168,6 +170,24 @@ vk_hud_blend_draw_no_layout(struct vk_hud_blend *blend,
                               int32_t dst_y,
                               uint32_t dst_w,
                               uint32_t dst_h);
+
+/*!
+ * Drop the cached view + descriptor set for a HUD source image (#1782).
+ *
+ * The cache is keyed by the raw VkImage handle, and drivers hand a destroyed
+ * image's handle value to the next image they create. An entry that outlives
+ * its image is then returned for an unrelated image, and the draw samples a
+ * view of freed memory (on NVIDIA: VK_ERROR_DEVICE_LOST, Xid 109). Whoever
+ * destroys a HUD source image must forget it here before the next draw that
+ * could see the reused handle.
+ *
+ * The caller must ensure no submitted command buffer still uses the entry.
+ * No-op if @p hud_image is not cached.
+ *
+ * @ingroup aux_vk
+ */
+void
+vk_hud_blend_forget_image(struct vk_hud_blend *blend, struct vk_bundle *vk, VkImage hud_image);
 
 /*!
  * Destroy HUD blend resources.
