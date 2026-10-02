@@ -1138,7 +1138,9 @@ TEST_CASE("comp_layer_blend_mode: no backend reimplements the blend rule (#1621)
 	    // channel D3D11's is (its own premul/straight decision, deliberately
 	    // not comp_layer_blend_mode() -- see comp_d3d11_renderer.cpp).
 	    {"gl/comp_gl_compositor.cpp", 1},
-	    {"metal/comp_metal_compositor.m", 0},
+	    // #1788: Metal's one allowance is the same Local2D / window-space
+	    // channel as D3D11/D3D12/GL (#1581, #1786).
+	    {"metal/comp_metal_compositor.m", 1},
 	    // The Local2D / window-space channel, above.
 	    {"d3d11/comp_d3d11_renderer.cpp", 1},
 	    /*
