@@ -507,6 +507,11 @@ struct comp_d3d12_renderer
 	ID3D12RootSignature *flatten_root_signature;
 	ID3D12PipelineState *flatten_pso_premul;   // SrcBlend = ONE
 	ID3D12PipelineState *flatten_pso_straight; // SrcBlend = SRC_ALPHA
+	//! #1795 / ADR-044: the same two blends into the scratch's `_SRGB` RTV
+	//! (a D3D12 PSO bakes its RTV format), so the flatten blends in LINEAR
+	//! and the render target applies the OETF once, on write.
+	ID3D12PipelineState *flatten_pso_premul_srgb;
+	ID3D12PipelineState *flatten_pso_straight_srgb;
 	//! Shader-visible SRV heap for flatten source images — one slot per layer
 	//! draw (D3D12 consumes descriptors at GPU-execute time, so concurrent
 	//! draws in one cmd-list each need their own slot). Written fresh / frame.
@@ -2617,8 +2622,9 @@ comp_d3d12_renderer_create(struct comp_d3d12_compositor *c,
 	}
 
 	// Flatten PSOs: shared masked_composite VS + local2d_flatten PS. The
-	// scratch is always R8G8B8A8_UNORM (the masked composite is channel-
-	// agnostic), so one RTV format covers both blend variants.
+	// scratch is R8G8B8A8 (the masked composite is channel-agnostic); #1795
+	// gives each blend variant a UNORM-RTV PSO (legacy hatch) and an
+	// `_SRGB`-RTV PSO (the honest path: linear blend, encode on write).
 	ID3DBlob *flat_vs_blob = nullptr;
 	ID3DBlob *flat_ps_blob = nullptr;
 	hr = compile_shader(masked_composite_vs_source, "VSMain", "vs_5_0", &flat_vs_blob);
@@ -2662,10 +2668,21 @@ comp_d3d12_renderer_create(struct comp_d3d12_compositor *c,
 	hr = device->CreateGraphicsPipelineState(&flat_pso_desc, __uuidof(ID3D12PipelineState),
 	                                          reinterpret_cast<void **>(&r->flatten_pso_straight));
 	if (SUCCEEDED(hr)) {
+		flat_pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+		hr = device->CreateGraphicsPipelineState(&flat_pso_desc, __uuidof(ID3D12PipelineState),
+		                                          reinterpret_cast<void **>(&r->flatten_pso_straight_srgb));
+	}
+	if (SUCCEEDED(hr)) {
 		// Premultiplied "over": SrcBlend = ONE (the default for Local2D).
 		flat_pso_desc.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;
+		flat_pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
 		hr = device->CreateGraphicsPipelineState(&flat_pso_desc, __uuidof(ID3D12PipelineState),
 		                                          reinterpret_cast<void **>(&r->flatten_pso_premul));
+	}
+	if (SUCCEEDED(hr)) {
+		flat_pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+		hr = device->CreateGraphicsPipelineState(&flat_pso_desc, __uuidof(ID3D12PipelineState),
+		                                          reinterpret_cast<void **>(&r->flatten_pso_premul_srgb));
 	}
 	flat_vs_blob->Release();
 	flat_ps_blob->Release();
@@ -2716,6 +2733,12 @@ comp_d3d12_renderer_destroy(struct comp_d3d12_renderer **renderer_ptr)
 	}
 	if (r->flatten_pso_straight != nullptr) {
 		r->flatten_pso_straight->Release();
+	}
+	if (r->flatten_pso_premul_srgb != nullptr) {
+		r->flatten_pso_premul_srgb->Release();
+	}
+	if (r->flatten_pso_straight_srgb != nullptr) {
+		r->flatten_pso_straight_srgb->Release();
 	}
 	if (r->flatten_root_signature != nullptr) {
 		r->flatten_root_signature->Release();
@@ -3728,8 +3751,10 @@ comp_d3d12_renderer_composite_2d_masked(struct comp_d3d12_renderer *renderer,
 
 	// Write the 3 SRVs fresh into the dedicated shader-visible heap
 	// (t0 = 2D source scratch, t1 = authored mask staged copy, t2 = weave
-	// snapshot scratch). Formats come from each resource — the scratches are
-	// runtime-created with concrete formats, the mask is R8_UNORM.
+	// snapshot scratch). Formats come from each resource — the mask is
+	// R8_UNORM. #1795: the Local2D scratch is TYPELESS (its flatten writes an
+	// `_SRGB` RTV) and a view cannot be typeless, so it resolves to the UNORM
+	// member: the composite still reads the ENCODED bytes, unchanged.
 	ID3D12Resource *srcs[3] = {
 	    static_cast<ID3D12Resource *>(twod_resource),
 	    static_cast<ID3D12Resource *>(mask_resource),
@@ -3739,7 +3764,7 @@ comp_d3d12_renderer_composite_2d_masked(struct comp_d3d12_renderer *renderer,
 	for (int i = 0; i < 3; i++) {
 		D3D12_RESOURCE_DESC rd = srcs[i]->GetDesc();
 		D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
-		srv_desc.Format = rd.Format;
+		srv_desc.Format = d3d_dxgi_typeless_to_typed_dxgi(rd.Format);
 		srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 		srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 		srv_desc.Texture2D.MipLevels = 1;
@@ -3819,7 +3844,8 @@ comp_d3d12_renderer_flatten_local_2d(struct comp_d3d12_renderer *renderer,
                                      float src_y,
                                      float src_w,
                                      float src_h,
-                                     bool unpremultiplied)
+                                     bool unpremultiplied,
+                                     bool linear_target)
 {
 	if (renderer == nullptr || cmd_list_ptr == nullptr || scratch_rtv_handle == 0 || src_resource == nullptr) {
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
@@ -3834,8 +3860,7 @@ comp_d3d12_renderer_flatten_local_2d(struct comp_d3d12_renderer *renderer,
 	auto *cmd_list = static_cast<ID3D12GraphicsCommandList *>(cmd_list_ptr);
 	auto *src = static_cast<ID3D12Resource *>(src_resource);
 
-	// Source image → sampleable. Sample app color swapchains as their UNORM
-	// sibling (no implicit sRGB decode — the DP wants display-referred bytes).
+	// Source image → sampleable (the view is chosen below, by TARGET).
 	D3D12_RESOURCE_BARRIER src_barrier = {};
 	src_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 	src_barrier.Transition.pResource = src;
@@ -3846,7 +3871,14 @@ comp_d3d12_renderer_flatten_local_2d(struct comp_d3d12_renderer *renderer,
 
 	D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
 	// #1503: TYPELESS resource -> resolve the view format from the app's request.
-	srv_desc.Format = comp_d3d12_swapchain_sample_format(src);
+	// #1795: the view follows the TARGET (a D3D12 CPU RTV handle cannot be
+	// asked its format, so the caller says). Into an `_SRGB` RTV (the honest
+	// path) sample the layer as its declared format — an `_SRGB` source
+	// decodes, a UNORM source is read as the linear values it holds — so the
+	// blend is linear and the RTV encodes once. Into a UNORM RTV (legacy
+	// hatch) keep the non-decoding view: bytes pass through as before.
+	srv_desc.Format =
+	    linear_target ? comp_d3d12_swapchain_compose_format(src) : comp_d3d12_swapchain_sample_format(src);
 	srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 	srv_desc.Texture2D.MipLevels = 1;
 	srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -3856,7 +3888,14 @@ comp_d3d12_renderer_flatten_local_2d(struct comp_d3d12_renderer *renderer,
 
 	cmd_list->SetDescriptorHeaps(1, &renderer->flatten_srv_heap);
 	cmd_list->SetGraphicsRootSignature(renderer->flatten_root_signature);
-	cmd_list->SetPipelineState(unpremultiplied ? renderer->flatten_pso_straight : renderer->flatten_pso_premul);
+	// The PSO's baked RTV format must match the RTV it draws into.
+	if (linear_target) {
+		cmd_list->SetPipelineState(unpremultiplied ? renderer->flatten_pso_straight_srgb
+		                                           : renderer->flatten_pso_premul_srgb);
+	} else {
+		cmd_list->SetPipelineState(unpremultiplied ? renderer->flatten_pso_straight
+		                                           : renderer->flatten_pso_premul);
+	}
 
 	D3D12_CPU_DESCRIPTOR_HANDLE rtv = {};
 	rtv.ptr = static_cast<SIZE_T>(scratch_rtv_handle);
