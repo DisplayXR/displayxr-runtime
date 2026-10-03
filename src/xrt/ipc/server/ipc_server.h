@@ -158,6 +158,10 @@ struct ipc_client_state
 
 	int server_thread_index;
 
+	//! Set as the client thread's last act (after common_shutdown), so
+	//! the server can wait for it without blocking its main thread (#1815).
+	bool thread_done;
+
 	xrt_shmem_handle_t ism_handle;
 
 	//! #954: OS-derived peer identity, set once at accept. peer_pid is the

@@ -235,6 +235,64 @@ print_linux_end_user_started_information(enum u_logging_level log_level)
 	U_LOG_IFL_I(log_level, "%s", sink.buffer);
 }
 
+/*!
+ * Wait for every per-client thread to finish before teardown_all() destroys
+ * what they use.
+ *
+ * Once main_loop() returns (s->running is false), a client thread can still be
+ * between polls. Its loop exits within one 500 ms poll timeout and then runs
+ * common_shutdown(), which takes global_state.lock and destroys its session
+ * and compositor. Tearing those down first aborted the macOS service on
+ * SIGTERM (os_mutex_lock asserting on the destroyed lock, #1815).
+ *
+ * The wait keeps this (main) thread's run loop turning: on macOS a client's
+ * compositor teardown dispatch_sync()s window work onto the main queue, so a
+ * bare join here would deadlock. Bounded: a thread still busy at the deadline
+ * is left unjoined, with a WARN, rather than hanging the exit.
+ *
+ * POSIX only: both POSIX client loops (kqueue / epoll) poll with a timeout and
+ * re-check s->running. The Windows loop blocks in ReadFile.
+ */
+static void
+join_client_threads(struct ipc_server *s)
+{
+#ifndef XRT_OS_WINDOWS
+	const int64_t deadline = os_monotonic_get_ns() + (int64_t)5 * U_TIME_1S_IN_NS;
+	for (;;) {
+		bool pending = false;
+		for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+			if (s->threads[i].state != IPC_THREAD_READY && !s->threads[i].ics.thread_done) {
+				pending = true;
+			}
+		}
+		if (!pending || os_monotonic_get_ns() > deadline) {
+			break;
+		}
+#if defined(XRT_OS_MACOS)
+		CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, false);
+#else
+		os_nanosleep(U_TIME_1MS_IN_NS * 10);
+#endif
+	}
+
+	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+		struct ipc_thread *it = &s->threads[i];
+		if (it->state == IPC_THREAD_READY) {
+			continue;
+		}
+		if (!it->ics.thread_done) {
+			U_LOG_W("#1815: client thread %u still busy at shutdown; not joined", i);
+			continue;
+		}
+		os_thread_join(&it->thread);
+		os_thread_destroy(&it->thread);
+		it->state = IPC_THREAD_READY;
+	}
+#else
+	(void)s;
+#endif
+}
+
 static void
 teardown_all(struct ipc_server *s)
 {
@@ -1780,6 +1838,9 @@ ipc_server_main(int argc, char **argv, const struct ipc_server_main_info *ismi)
 	// Stop the UI before tearing everything down.
 	u_debug_gui_stop(&s->debug_gui);
 
+	// Client threads use the lock and the compositor teardown_all() destroys.
+	join_client_threads(s);
+
 	// Done after UI stopped.
 	teardown_all(s);
 	free(s);
@@ -1821,6 +1882,7 @@ ipc_server_main_android(struct ipc_server **ps, void (*startup_complete_callback
 
 	ret = main_loop(s);
 
+	join_client_threads(s);
 	teardown_all(s);
 	free(s);
 

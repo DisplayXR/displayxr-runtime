@@ -1192,6 +1192,10 @@ struct multi_system_compositor
 	//! Render loop thread.
 	struct os_thread_helper oth;
 
+	//! Set by the render thread as its last act (#1815): lets a macOS main-thread
+	//! destroy wait while still servicing the render thread's dispatch_sync()s.
+	volatile bool render_thread_done;
+
 	struct
 	{
 		/*!
