@@ -1317,7 +1317,6 @@ Section "Uninstall"
 	Delete "$INSTDIR\VkLayer_DXR_queue_lock.dll"
 	Delete "$INSTDIR\VkLayer_DXR_queue_lock.json"
 
-	DeleteRegKey HKLM "Software\DisplayXR\DisplayProcessors"
 	; -----------------------------------------------------------------
 
 	; (Service was already killed + Run key cleaned at the top of the
