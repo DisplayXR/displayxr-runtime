@@ -58,6 +58,10 @@ DisplayXR shell, …):
      plug-in returns its own `xrt_plugin_iface *` and the API version
      it speaks. Version mismatch → `XRT_ERROR_PROBER_NOT_SUPPORTED`,
      skip.
+   - If the iface carries `get_platform_state` (§4.1), call it and record
+     the plug-in's platform state + hint against the entry — **before**
+     `probe()`, so a plug-in about to decline can still say why. The state
+     is advisory: it never stops the loader from calling `probe()`.
    - Call `iface->probe(&inst)`. `XRT_ERROR_PROBER_NOT_SUPPORTED` is a
      clean "no matching device" decline (logged at INFO); any other
      `XRT_ERROR_*` is a hard failure (logged at WARN). Either way, the
@@ -444,6 +448,62 @@ vendor-neutral) and the Leia plug-in's entry point in
 (`src/drv_leia/`, ADR-019) — reference plug-in implementations. Each
 delegates to per-API DP factories and device-creation functions in its own
 tree; the entry-point TU is short (~150 lines).
+
+### 4.1 Loadable without the platform; `probe()` is cheap; report platform state (ADR-045)
+
+A registered plug-in is a fact, not a decision: the runtime may enumerate
+it on a machine where the vendor platform it drives is missing, not yet
+running, or has no display attached — and the order in which the user
+installs the runtime, the plug-in and the vendor platform is arbitrary.
+Every plug-in therefore MUST:
+
+1. **Load without its platform.** `LoadLibraryExW` / `dlopen` of the plug-in
+   binary must succeed when the vendor platform runtime is not installed.
+   Resolve vendor libraries lazily (delay-load / `dlopen` by a path the
+   plug-in derives itself) rather than as static imports the OS loader
+   must satisfy — and never rely on the host process's `PATH`, which in the
+   long-lived service is frozen at logon.
+2. **Keep `probe()` and `get_platform_state()` within ~100 ms**, and never
+   block on the vendor platform becoming ready. Both run on the
+   `xrCreateInstance` hot path and on every re-probe (§4.2). Presence
+   checks only — a registry value, a named kernel object, an EDID table
+   lookup. A readiness wait belongs in `create_device` / the DP factory
+   (or a background thread the plug-in owns), not in `probe()`.
+3. **Report its platform state** through the optional
+   `xrt_plugin_iface::get_platform_state` slot (`XRT_PLUGIN_HAS_PLATFORM_STATE`,
+   appended per ADR-020 at unchanged ABI):
+
+   | `xrt_plugin_platform_state` | Meaning |
+   |---|---|
+   | `UNKNOWN` (0) | Not reported (slot absent, older plug-in, call returned false). Runtime behaves as before. |
+   | `READY` | Platform installed, running, display attached. |
+   | `PLATFORM_ABSENT` | The vendor platform runtime is not installed. |
+   | `PLATFORM_NOT_RUNNING` | Installed, its service/daemon is not running. |
+   | `NO_DISPLAY` | Platform up, none of its displays attached. |
+   | `INCOMPATIBLE` | Platform present but unusable (version, OS, GPU, …). |
+
+   plus `hint` — a short (≤ 127 bytes UTF-8) vendor-written sentence the
+   runtime shows verbatim and never parses ("install the … runtime",
+   "connect the display"), and `flags`. `XRT_PLUGIN_PLATFORM_FLAG_FALLBACK`
+   marks a plug-in that claims any system (the in-tree sim-display); vendor
+   plug-ins MUST NOT set it.
+
+   Call sequence: **load → negotiate → `get_platform_state` → `probe`**.
+   The slot takes no instance, is thread-safe, and may also be called at any
+   time after selection (diagnostics poll it while the plug-in is active).
+
+### 4.2 Re-probe and the no-live-swap rule
+
+The long-lived service re-evaluates selection on world events — display
+topology change, device-node change, a change under the
+`DisplayProcessors` registry key, and a slow timer while the active plug-in
+is the fallback — debounced to at most one refresh per second. A refresh
+adopts a better (lower `ProbeOrder`) plug-in **only while the active one
+carries `XRT_PLUGIN_PLATFORM_FLAG_FALLBACK`** (or, for a plug-in that does
+not report state, has id `sim-display`). An active vendor plug-in that
+reports `NO_DISPLAY` is kept: the runtime surfaces the state (tray,
+`displayxr-cli info` / `selftest`) and the DP passes pixels through
+unwoven. In-process apps do not re-probe on world events.
 
 ---
 
