@@ -372,6 +372,21 @@ TEST_CASE("colour: the GL leg spells the same model in GL (#1589/#1610)")
 		CHECK(publish.find(forbidden) == std::string::npos);
 	}
 
+	// #1795: the Local2D flatten's linear-blend target reaches its GL_RGBA8
+	// scratch the same way — and for the same reason — as the compose target
+	// reaches the atlas.
+	const std::string l2d_publish = function_body(src, "gl_publish_local2d_linear");
+	INFO("gl_publish_local2d_linear() must exist — the Local2D flatten's publish is one named step");
+	REQUIRE_FALSE(l2d_publish.empty());
+	INFO("...and must publish with glCopyImageSubData(): the scratch must receive the encoded "
+	     "bytes the GL_SRGB8_ALPHA8 flatten target wrote, verbatim");
+	CHECK(l2d_publish.find("glCopyImageSubData(") != std::string::npos);
+	for (const char *forbidden : {"glDrawArrays", "glDrawElements", "glBlitFramebuffer"}) {
+		INFO("gl_publish_local2d_linear() calls " << forbidden
+		                                          << " — the publish must be a raw same-class copy");
+		CHECK(l2d_publish.find(forbidden) == std::string::npos);
+	}
+
 	INFO("the GL compositor must pick its source read through ONE helper, so a new bind site "
 	     "cannot quietly keep the non-decoding read while the target encodes");
 	CHECK(contains_in_code(src, "gl_bind_layer_source("));
