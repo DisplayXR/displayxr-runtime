@@ -197,3 +197,18 @@ TEST_CASE("DXR_COLOR_LEGACY_UNORM_ENCODED is OFF by default")
 	// `legacy_hatch` argument above is for.)
 	CHECK_FALSE(u_color_legacy_unorm_encoded());
 }
+
+TEST_CASE("u_color_srgb_decode — inverse of the encode, for CPU-side constants")
+{
+	CHECK(u_color_srgb_decode(0.0f) == 0.0f);
+	CHECK(u_color_srgb_decode(1.0f) == 1.0f);
+	// 188/255 is the encode of linear 0.5.
+	CHECK(u_color_srgb_decode(188.0f / 255.0f) == Catch::Approx(0.5f).margin(0.005f));
+
+	// Every 8-bit display-referred value survives decode → encode, so a
+	// decoded constant drawn through an `_SRGB` target lands on its byte.
+	for (int b = 0; b <= 255; b++) {
+		INFO("byte " << b);
+		CHECK(u_color_srgb_encode_u8(u_color_srgb_decode((float)b / 255.0f)) == b);
+	}
+}
