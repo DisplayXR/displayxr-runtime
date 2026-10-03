@@ -12907,6 +12907,146 @@ vk_flatten_one_local2d_layer(struct comp_vk_native_compositor *c,
 	}
 }
 
+#ifdef XRT_OS_WINDOWS
+/*!
+ * #1795 / ADR-044 §7 — the HONEST flatten under the weave-on-scanout split.
+ *
+ * A bridge plane is an imported typed-UNORM D3D11 texture, so it has no `_SRGB`
+ * view to render through. Instead the selected Local2D layers flatten into the
+ * private MUTABLE scratch through its `_SRGB` view — exactly the non-split
+ * flatten — and the region is then vkCmdCopyImage'd into the plane. That copy is
+ * a raw texel copy between two B8G8R8A8 images (never a blit, which would
+ * convert), so the plane carries the same ENCODED bytes the scratch's UNORM view
+ * reads, and the output-device lerp is unchanged.
+ *
+ * It records into the caller's plane command buffer, so it lands inside the
+ * plane-write window the direct flatten used (same timeline signal/wait, same
+ * keyed-mutex timing-only ordering, #1274), and like the direct flatten it only
+ * runs on an app frame (#868/#875).
+ *
+ * Pre: @p plane's image has just been CLEARED and is in TRANSFER_DST_OPTIMAL.
+ * Post (returns true): the region has been copied in and the plane is still in
+ * TRANSFER_DST_OPTIMAL — the caller makes it SHADER_READ. Returns false having
+ * recorded nothing when the honest path is unavailable (legacy hatch, no `_SRGB`
+ * pipelines, a plane format the raw copy cannot serve, or no mutable scratch);
+ * the caller then flattens straight into the plane as before.
+ *
+ * @param under  true = the 2D-under layers (backdrop plane, backdrop_scratch);
+ *               false = the over-layers (Local2D plane, local2d_scratch).
+ */
+static bool
+vk_split_flatten_via_scratch(struct comp_vk_native_compositor *c,
+                             VkCommandBuffer cmd,
+                             const struct comp_vk_deposit_plane *plane,
+                             bool under,
+                             int32_t proj_idx,
+                             uint32_t region_w,
+                             uint32_t region_h)
+{
+	struct vk_bundle *vk = &c->vk;
+	if (!c->local2d_srgb_flatten_ready || plane == NULL || region_w == 0 || region_h == 0) {
+		return false;
+	}
+	// The scratch is B8G8R8A8: a raw copy is only the identity into the same
+	// texel layout and channel order.
+	if (plane->format != VK_FORMAT_B8G8R8A8_UNORM && plane->format != VK_FORMAT_B8G8R8A8_SRGB) {
+		static bool fmt_logged = false;
+		if (!fmt_logged) {
+			fmt_logged = true;
+			U_LOG_W("VK split: plane format %d is not B8G8R8A8 — Local2D flattens byte-passthrough (#1795)",
+			        (int)plane->format);
+		}
+		return false;
+	}
+
+	VkImage *s_img = under ? &c->backdrop_scratch : &c->local2d_scratch;
+	VkDeviceMemory *s_mem = under ? &c->backdrop_scratch_mem : &c->local2d_scratch_mem;
+	VkImageView *s_view = under ? &c->backdrop_scratch_view : &c->local2d_scratch_view;
+	VkImageView *s_srgb = under ? &c->backdrop_scratch_srgb_view : &c->local2d_scratch_srgb_view;
+	VkFramebuffer *s_fb = under ? &c->backdrop_scratch_fb : &c->local2d_scratch_fb;
+	uint32_t *s_w = under ? &c->backdrop_scratch_w : &c->local2d_scratch_w;
+	uint32_t *s_h = under ? &c->backdrop_scratch_h : &c->local2d_scratch_h;
+	if (*s_img != VK_NULL_HANDLE && (*s_w != region_w || *s_h != region_h) && vk->vkQueueWaitIdle != NULL) {
+		// On-change only (a region resize): the plane pass runs on a ring of
+		// in-flight command buffers, so the old scratch may still be read by
+		// a previous frame's copy when vk_ensure_flatten_rt frees it.
+		vk->vkQueueWaitIdle(vk->main_queue->queue);
+	}
+	if (!vk_ensure_flatten_rt(c, s_img, s_mem, s_view, s_srgb, s_fb, s_w, s_h, region_w, region_h,
+	                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+	                              VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+	                          under ? "backdrop scratch (split)" : "local2d scratch (split)") ||
+	    *s_srgb == VK_NULL_HANDLE) {
+		return false;
+	}
+
+	static bool logged = false;
+	if (!logged) {
+		logged = true;
+		U_LOG_W(
+		    "VK split: Local2D flattens in linear light into the private _SRGB scratch, raw-copied "
+		    "into the bridge plane (format %d) (#1795)",
+		    (int)plane->format);
+	}
+
+	// Scratch: clear transparent → COLOR_ATTACHMENT, flatten, → TRANSFER_SRC.
+	// The source scope covers the previous frame's copy-out and flatten of this
+	// single-buffered scratch (WAR), in case a plane pass is still in flight.
+	vk_cmd_image_barrier_locked(vk, cmd, *s_img, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+	                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                            VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	                            VK_PIPELINE_STAGE_TRANSFER_BIT, k_color_sub);
+	VkClearColorValue transparent = {.float32 = {0.0f, 0.0f, 0.0f, 0.0f}};
+	vk->vkCmdClearColorImage(cmd, *s_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &transparent, 1, &k_color_sub);
+	vk_cmd_image_barrier_locked(vk, cmd, *s_img, VK_ACCESS_TRANSFER_WRITE_BIT,
+	                            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	                            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	                            k_color_sub);
+
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		struct comp_layer *layer = &c->layer_accum.layers[i];
+		if (layer->data.type != XRT_LAYER_LOCAL_2D) {
+			continue;
+		}
+		// Exactly the direct plane flattens' selections: the backdrop takes
+		// every Local2D layer before the projection (vk_flatten_backdrop_2d);
+		// the overlay skips those unless it is a zones frame, which has no
+		// under/over split (vk_split_flatten_local2d).
+		const bool before_proj = proj_idx >= 0 && (int32_t)i < proj_idx;
+		const bool take = under ? before_proj : !(!c->zones_frame && before_proj);
+		if (!take) {
+			continue;
+		}
+		vk_flatten_one_local2d_layer(c, cmd, *s_fb, true, layer, region_w, region_h);
+	}
+
+	vk_cmd_image_barrier_locked(vk, cmd, *s_img, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+	                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                            k_color_sub);
+
+	// Plane: order the copy after the caller's whole-surface clear (WAW, same
+	// layout), then copy the region top-left — the layout the bridge and the
+	// output-device composite assume (#464).
+	const VkImage plane_img = (VkImage)(uintptr_t)plane->image;
+	vk_cmd_image_barrier_locked(vk, cmd, plane_img, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+	                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, k_color_sub);
+	VkImageCopy region = {
+	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .srcOffset = {0, 0, 0},
+	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .dstOffset = {0, 0, 0},
+	    .extent = {region_w < plane->width ? region_w : plane->width,
+	               region_h < plane->height ? region_h : plane->height, 1},
+	};
+	vk->vkCmdCopyImage(cmd, *s_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, plane_img,
+	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+	return true;
+}
+#endif
+
 // #491 part 3 — flatten the frame's 2D-UNDER Local2D layers (those BEFORE the
 // projection in xrEndFrame list order) into backdrop_scratch (premultiplied),
 // PRE-weave, and return its view + dims so the caller can hand it to the DP via
@@ -12982,7 +13122,8 @@ vk_flatten_backdrop_2d(struct comp_vk_native_compositor *c,
 	VkFramebuffer bd_fb;
 	VkImageView bd_view;
 	// #1795: only the private scratch can be `_SRGB`-viewed; the bridge plane is
-	// a typed-UNORM D3D11 texture, so it keeps the byte-passthrough flatten.
+	// a typed-UNORM D3D11 texture, so a DIRECT plane flatten is byte-passthrough
+	// (the honest plane route is vk_split_flatten_via_scratch, below).
 	bool bd_srgb = false;
 #ifdef XRT_OS_WINDOWS
 	if (plane != NULL) {
@@ -13002,7 +13143,7 @@ vk_flatten_backdrop_2d(struct comp_vk_native_compositor *c,
 		                          &c->backdrop_scratch_srgb_view, &c->backdrop_scratch_fb,
 		                          &c->backdrop_scratch_w, &c->backdrop_scratch_h, region_w, region_h,
 		                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-		                              VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+		                              VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
 		                          "backdrop scratch")) {
 			return VK_NULL_HANDLE;
 		}
@@ -13022,25 +13163,41 @@ vk_flatten_backdrop_2d(struct comp_vk_native_compositor *c,
 	                            VK_PIPELINE_STAGE_TRANSFER_BIT, k_color_sub);
 	VkClearColorValue transparent = {.float32 = {0.0f, 0.0f, 0.0f, 0.0f}};
 	vk->vkCmdClearColorImage(cmd, bd_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &transparent, 1, &k_color_sub);
-	vk_cmd_image_barrier_locked(vk, cmd, bd_image, VK_ACCESS_TRANSFER_WRITE_BIT,
-	                            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-	                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-	                            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-	                            k_color_sub);
 
-	// Flatten ONLY the under-layers (before the projection) into the backdrop.
-	for (int32_t i = 0; i < proj_idx; i++) {
-		struct comp_layer *layer = &c->layer_accum.layers[i];
-		if (layer->data.type != XRT_LAYER_LOCAL_2D) {
-			continue;
-		}
-		vk_flatten_one_local2d_layer(c, cmd, bd_fb, bd_srgb, layer, region_w, region_h);
+	// #1795: under the split, the honest route flattens into the private
+	// `_SRGB` scratch and raw-copies the region into the (cleared) plane.
+	bool via_scratch = false;
+#ifdef XRT_OS_WINDOWS
+	if (plane != NULL) {
+		via_scratch = vk_split_flatten_via_scratch(c, cmd, plane, /*under=*/true, proj_idx, region_w, region_h);
 	}
+#endif
+	if (via_scratch) {
+		vk_cmd_image_barrier_locked(vk, cmd, bd_image, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+		                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
+	} else {
+		vk_cmd_image_barrier_locked(vk, cmd, bd_image, VK_ACCESS_TRANSFER_WRITE_BIT,
+		                            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, k_color_sub);
 
-	vk_cmd_image_barrier_locked(vk, cmd, bd_image, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-	                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-	                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-	                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
+		// Flatten ONLY the under-layers (before the projection) into the backdrop.
+		for (int32_t i = 0; i < proj_idx; i++) {
+			struct comp_layer *layer = &c->layer_accum.layers[i];
+			if (layer->data.type != XRT_LAYER_LOCAL_2D) {
+				continue;
+			}
+			vk_flatten_one_local2d_layer(c, cmd, bd_fb, bd_srgb, layer, region_w, region_h);
+		}
+
+		vk_cmd_image_barrier_locked(
+		    vk, cmd, bd_image, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+		    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
+	}
 
 	static bool logged = false;
 	if (!logged) {
@@ -13462,6 +13619,17 @@ vk_split_flatten_local2d(struct comp_vk_native_compositor *c,
 	                            VK_PIPELINE_STAGE_TRANSFER_BIT, k_color_sub);
 	VkClearColorValue transparent = {.float32 = {0.0f, 0.0f, 0.0f, 0.0f}};
 	vk->vkCmdClearColorImage(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &transparent, 1, &k_color_sub);
+
+	// #1795 / ADR-044 §7: the honest route flattens into the private `_SRGB`
+	// scratch and raw-copies the region into the (just cleared) plane.
+	if (vk_split_flatten_via_scratch(c, cmd, plane, /*under=*/false, proj_idx, region_w, region_h)) {
+		vk_cmd_image_barrier_locked(vk, cmd, img, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+		                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
+		return true;
+	}
+
 	vk_cmd_image_barrier_locked(vk, cmd, img, VK_ACCESS_TRANSFER_WRITE_BIT,
 	                            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 	                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -13479,8 +13647,8 @@ vk_split_flatten_local2d(struct comp_vk_native_compositor *c,
 		if (!c->zones_frame && proj_idx >= 0 && (int32_t)i < proj_idx) {
 			continue;
 		}
-		// #1795: the plane is a typed-UNORM D3D11 texture (no `_SRGB` view),
-		// so the split keeps the byte-passthrough flatten.
+		// #1795: legacy route — the plane is a typed-UNORM D3D11 texture
+		// (no `_SRGB` view), so a direct flatten is byte-passthrough.
 		vk_flatten_one_local2d_layer(c, cmd, c->plane_l2d_fb, false, layer, region_w, region_h);
 	}
 
@@ -14019,7 +14187,7 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 	                          &c->local2d_scratch_srgb_view, &c->local2d_scratch_fb, &c->local2d_scratch_w,
 	                          &c->local2d_scratch_h, region_w, region_h,
 	                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-	                              VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+	                              VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
 	                          "local2d scratch")) {
 		return false;
 	}

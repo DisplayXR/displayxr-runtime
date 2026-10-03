@@ -367,6 +367,7 @@ struct comp_vk_deposit_plane
 	uint64_t view;       //!< `VkImageView` over @ref image.
 	uint32_t width;      //!< Allocated extent — the PANEL for the 2D planes.
 	uint32_t height;
+	VkFormat format; //!< #1795: the plane image's VkFormat (gates the scratch → plane raw copy).
 	/*!
 	 * Bumped on every REALLOCATION, never on a content change. This is what
 	 * `comp_xbridge_bind_plane`'s @p generation wants: a change re-opens the

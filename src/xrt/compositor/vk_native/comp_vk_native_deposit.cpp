@@ -1089,6 +1089,7 @@ comp_vk_deposit_plane_get(struct comp_vk_deposit *dep, uint32_t plane, struct co
 	out->view = (uint64_t)(uintptr_t)p->view;
 	out->width = p->width;
 	out->height = p->height;
+	out->format = p->format;
 	out->generation = p->generation;
 	return true;
 }
