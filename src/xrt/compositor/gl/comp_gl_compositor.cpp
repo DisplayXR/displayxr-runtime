@@ -1002,6 +1002,18 @@ struct comp_gl_compositor
 	//! composites `backdrop over captured-desktop` under the 3D weave. Own FBO.
 	GLuint backdrop_scratch_tex, backdrop_scratch_fbo;
 	uint32_t backdrop_scratch_w, backdrop_scratch_h;
+	//! #1795 / ADR-044 §7 — the private GL_SRGB8_ALPHA8 flatten target both
+	//! Local2D flattens (over and 2D-under) draw into, with
+	//! GL_FRAMEBUFFER_SRGB on, so overlapping layers blend in LINEAR and are
+	//! encoded once on write; the result is then COPIED verbatim into
+	//! local2d_scratch / backdrop_scratch, which stay GL_RGBA8 holding ENCODED
+	//! bytes for every reader. The Local2D twin of compose_texture. 0 under the
+	//! legacy hatch or when the stack cannot copy (then the flatten writes the
+	//! scratch directly, as before #1795). `local2d_linear_broken` latches a
+	//! target that would not come out framebuffer-complete.
+	GLuint local2d_linear_tex, local2d_linear_fbo;
+	uint32_t local2d_linear_w, local2d_linear_h;
+	bool local2d_linear_broken;
 	uint32_t implicit_mask_w, implicit_mask_h;
 	uint32_t implicit_rect_count;
 	struct xrt_rect implicit_rects[XRT_MAX_LAYERS];
@@ -3748,13 +3760,157 @@ gl_update_zone_feather_mask(struct comp_gl_compositor *c,
 	return c->feather_mask_tex;
 }
 
+/*!
+ * #1795 / ADR-044 §7 — build (or rebuild) the private linear-blend target the
+ * Local2D flattens draw into, at @p w x @p h.
+ *
+ * The Local2D twin of gl_ensure_compose_target(), and the same three pieces:
+ * a GL_SRGB8_ALPHA8 attachment, GL_FRAMEBUFFER_SRGB on for the flatten draws
+ * (so the fixed-function blender works in LINEAR and the OETF is applied
+ * exactly once, on write, by the hardware — never shader arithmetic), and a
+ * verbatim glCopyImageSubData into the GL_RGBA8 scratch afterwards
+ * (gl_publish_local2d_linear). The scratches therefore keep holding ENCODED
+ * bytes, so neither reader — the post-weave masked composite (and its #885
+ * diag dump) nor the display processor's set_background_2d — changes.
+ *
+ * Returns false when the flatten must write the scratch directly, exactly as
+ * before #1795: the legacy colour hatch (the one switch — checked first, as
+ * gl_frame_takes_fast_path does), no glCopyImageSubData (GL < 4.3 / Apple
+ * 4.1: a draw into the scratch would re-encode), or an attachment that did not
+ * come out framebuffer-complete (latched, logged once).
+ *
+ * Deliberately NOT gated on GL_EXT_texture_sRGB_decode, for the same reason
+ * gl_frame_takes_fast_path() is gated the other way: this path only ever
+ * samples with decode ON (the GL default), which every stack can do. It is the
+ * legacy non-decoding read that needs the extension; without it an `_SRGB`
+ * source is decoded regardless, and only this path re-encodes it.
+ */
+static bool
+gl_ensure_local2d_linear_target(struct comp_gl_compositor *c, uint32_t w, uint32_t h)
+{
+	if (c->legacy_color || c->local2d_linear_broken || w == 0 || h == 0) {
+		return false;
+	}
+	if (glCopyImageSubData == NULL) {
+		static bool warned_no_copy = false;
+		if (!warned_no_copy) {
+			warned_no_copy = true;
+			U_LOG_W("Color (#1795) [gl]: glCopyImageSubData did not resolve (GL 4.3 / ARB_copy_image) — "
+			        "Local2D flatten blends in encoded space, as before #1795");
+		}
+		return false;
+	}
+	if (c->local2d_linear_tex != 0 && c->local2d_linear_w == w && c->local2d_linear_h == h) {
+		return true;
+	}
+
+	if (c->local2d_linear_tex != 0) {
+		glDeleteTextures(1, &c->local2d_linear_tex);
+		c->local2d_linear_tex = 0;
+	}
+	if (c->local2d_linear_fbo == 0) {
+		glGenFramebuffers(1, &c->local2d_linear_fbo);
+	}
+	glGenTextures(1, &c->local2d_linear_tex);
+	glBindTexture(GL_TEXTURE_2D, c->local2d_linear_tex);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_SRGB8_ALPHA8, (GLsizei)w, (GLsizei)h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glBindTexture(GL_TEXTURE_2D, 0);
+
+	GLuint prev_fbo = 0;
+	glGetIntegerv(GL_FRAMEBUFFER_BINDING, (GLint *)&prev_fbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, c->local2d_linear_fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, c->local2d_linear_tex, 0);
+	const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+	glBindFramebuffer(GL_FRAMEBUFFER, prev_fbo);
+	if (status != GL_FRAMEBUFFER_COMPLETE) {
+		U_LOG_W("Color (#1795) [gl]: Local2D flatten target %ux%u is not framebuffer-complete (0x%x) — "
+		        "blending in encoded space, as before #1795",
+		        w, h, (unsigned)status);
+		glDeleteTextures(1, &c->local2d_linear_tex);
+		c->local2d_linear_tex = 0;
+		c->local2d_linear_broken = true;
+		return false;
+	}
+
+	c->local2d_linear_w = w;
+	c->local2d_linear_h = h;
+	// One-off per (re)allocation — a lifecycle event, never per frame.
+	U_LOG_W("Color (#1795) [gl]: Local2D flatten target %ux%u storage=GL_SRGB8_ALPHA8 -> scratch=GL_RGBA8 "
+	        "(linear blend, encoded once on write, published by glCopyImageSubData)",
+	        w, h);
+	return true;
+}
+
+/*!
+ * #1795 — bind the FBO a Local2D flatten draws into, and set the write-side
+ * conversion to match. @p linear true: the private GL_SRGB8_ALPHA8 target with
+ * GL_FRAMEBUFFER_SRGB on (the previous enable is returned in @p prev_srgb for
+ * gl_local2d_flatten_end). @p linear false: the scratch itself, as before.
+ */
+static void
+gl_local2d_flatten_begin(struct comp_gl_compositor *c, GLuint scratch_fbo, bool linear, GLboolean *prev_srgb)
+{
+	*prev_srgb = glIsEnabled(GL_FRAMEBUFFER_SRGB);
+	if (!linear) {
+		glBindFramebuffer(GL_FRAMEBUFFER, scratch_fbo);
+		return;
+	}
+	glBindFramebuffer(GL_FRAMEBUFFER, c->local2d_linear_fbo);
+	// The PASS owns this enable, not a draw (#1610): on for the clear + every
+	// layer of this flatten, restored by gl_local2d_flatten_end.
+	glEnable(GL_FRAMEBUFFER_SRGB);
+}
+
+/*!
+ * #1795 — publish the linear-blend flatten into its scratch.
+ *
+ * `glCopyImageSubData`, deliberately, for the reason gl_publish_compose_to_atlas
+ * spells out: GL_SRGB8_ALPHA8 and GL_RGBA8 are the same 32-bit RGBA class, so
+ * this moves the ENCODED bytes the sRGB attachment just wrote without touching
+ * them. A draw or a glBlitFramebuffer would risk re-applying the transfer
+ * function. Do not "optimise" it into a draw.
+ */
+static void
+gl_publish_local2d_linear(struct comp_gl_compositor *c, GLuint scratch_tex, uint32_t w, uint32_t h)
+{
+	glCopyImageSubData(c->local2d_linear_tex, GL_TEXTURE_2D, 0, 0, 0, 0, //
+	                   scratch_tex, GL_TEXTURE_2D, 0, 0, 0, 0,           //
+	                   (GLsizei)w, (GLsizei)h, 1);
+}
+
+//! #1795 — the other half of gl_local2d_flatten_begin: restore the write-side
+//! conversion, then publish the linear-blend flatten into @p scratch_tex.
+static void
+gl_local2d_flatten_end(
+    struct comp_gl_compositor *c, bool linear, GLboolean prev_srgb, GLuint scratch_tex, uint32_t w, uint32_t h)
+{
+	if (!linear) {
+		return;
+	}
+	if (!prev_srgb) {
+		glDisable(GL_FRAMEBUFFER_SRGB);
+	}
+	gl_publish_local2d_linear(c, scratch_tex, w, h);
+}
+
 // #439 Phase 3 — draw one Local2D layer into the currently-bound flatten FBO
 // (premultiplied or straight "over"). Assumes program_window_space is bound and
 // the loc_* uniforms fetched by the caller. Dest rect clips to the window region;
-// Y is flipped for the bottom-left GL framebuffer.
+// Y is flipped for the bottom-left GL framebuffer. @p linear: the bound FBO is
+// the #1795 GL_SRGB8_ALPHA8 flatten target with GL_FRAMEBUFFER_SRGB on.
 static void
-gl_flatten_one_local2d_layer(struct comp_gl_compositor *c, struct comp_layer *layer, uint32_t region_w,
-                             uint32_t region_h, GLint loc_rect, GLint loc_tex, GLint loc_src)
+gl_flatten_one_local2d_layer(struct comp_gl_compositor *c,
+                             struct comp_layer *layer,
+                             uint32_t region_w,
+                             uint32_t region_h,
+                             GLint loc_rect,
+                             GLint loc_tex,
+                             GLint loc_src,
+                             bool linear)
 {
 	struct xrt_swapchain *sc = layer->sc_array[0];
 	if (sc == NULL) {
@@ -3815,14 +3971,16 @@ gl_flatten_one_local2d_layer(struct comp_gl_compositor *c, struct comp_layer *la
 	}
 
 	glActiveTexture(GL_TEXTURE0);
-	// #1589: DELIBERATELY the non-decoding read, never this frame's
-	// compose_active. The Local2D flatten is not part of the atlas pass — it
-	// hands the app's bytes on into local2d_scratch, which the POST-weave
-	// composite mixes with the DP's already-encoded output, so encoded is the
-	// space that scratch lives in. Same deliberate exception the D3D12 leg
-	// carries (its flatten is the one direct comp_d3d12_swapchain_sample_format
-	// call left in the renderer).
-	gl_bind_layer_source(GL_TEXTURE_2D, src_tex, /*compose=*/false);
+	// #1795: the read follows the flatten's TARGET, never this frame's
+	// compose_active (the flatten is not part of the atlas pass). Into the
+	// GL_SRGB8_ALPHA8 flatten target (the honest path) sample the layer as
+	// its declared format — an `_SRGB` source decodes, a GL_RGBA8 source is
+	// read as the linear values it holds — so the blend is linear and the
+	// target encodes once. Into the GL_RGBA8 scratch (legacy hatch / no
+	// copy) keep the non-decoding read: the app's bytes pass through as
+	// before. Either way the scratch ends up ENCODED, the space the POST-weave
+	// composite mixes with the DP's output.
+	gl_bind_layer_source(GL_TEXTURE_2D, src_tex, /*compose=*/linear);
 	glUniform1i(loc_tex, 0);
 	glUniform4f(loc_rect, nx, ny, nw, nh);
 	glUniform4f(loc_src, src_x, src_y, src_w, src_h);
@@ -3836,7 +3994,10 @@ gl_flatten_one_local2d_layer(struct comp_gl_compositor *c, struct comp_layer *la
 static void
 gl_flatten_local_2d_layers(struct comp_gl_compositor *c, uint32_t region_w, uint32_t region_h, int32_t proj_idx)
 {
-	glBindFramebuffer(GL_FRAMEBUFFER, c->local2d_scratch_fbo);
+	// #1795: blend in linear through the private sRGB target, publish encoded.
+	const bool linear = gl_ensure_local2d_linear_target(c, region_w, region_h);
+	GLboolean prev_srgb = GL_FALSE;
+	gl_local2d_flatten_begin(c, c->local2d_scratch_fbo, linear, &prev_srgb);
 	glViewport(0, 0, region_w, region_h);
 	glDisable(GL_SCISSOR_TEST);
 	glClearColor(0.0f, 0.0f, 0.0f, 0.0f); // transparent → desktop where uncovered (final.a=0)
@@ -3857,11 +4018,12 @@ gl_flatten_local_2d_layers(struct comp_gl_compositor *c, uint32_t region_w, uint
 		if (proj_idx >= 0 && (int32_t)i < proj_idx) {
 			continue;
 		}
-		gl_flatten_one_local2d_layer(c, layer, region_w, region_h, loc_rect, loc_tex, loc_src);
+		gl_flatten_one_local2d_layer(c, layer, region_w, region_h, loc_rect, loc_tex, loc_src, linear);
 	}
 
 	glDisable(GL_BLEND);
 	glBindTexture(GL_TEXTURE_2D, 0);
+	gl_local2d_flatten_end(c, linear, prev_srgb, c->local2d_scratch_tex, region_w, region_h);
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
@@ -3918,7 +4080,10 @@ gl_flatten_backdrop_2d(struct comp_gl_compositor *c, uint32_t dst_w, uint32_t ds
 		return 0;
 	}
 
-	glBindFramebuffer(GL_FRAMEBUFFER, c->backdrop_scratch_fbo);
+	// #1795: same contract as the over-flatten — linear blend, encoded bytes.
+	const bool linear = gl_ensure_local2d_linear_target(c, region_w, region_h);
+	GLboolean prev_srgb = GL_FALSE;
+	gl_local2d_flatten_begin(c, c->backdrop_scratch_fbo, linear, &prev_srgb);
 	glViewport(0, 0, region_w, region_h);
 	glDisable(GL_SCISSOR_TEST);
 	glClearColor(0.0f, 0.0f, 0.0f, 0.0f); // transparent where no under-layer covers
@@ -3935,11 +4100,12 @@ gl_flatten_backdrop_2d(struct comp_gl_compositor *c, uint32_t dst_w, uint32_t ds
 		if (layer->data.type != XRT_LAYER_LOCAL_2D) {
 			continue;
 		}
-		gl_flatten_one_local2d_layer(c, layer, region_w, region_h, loc_rect, loc_tex, loc_src);
+		gl_flatten_one_local2d_layer(c, layer, region_w, region_h, loc_rect, loc_tex, loc_src, linear);
 	}
 
 	glDisable(GL_BLEND);
 	glBindTexture(GL_TEXTURE_2D, 0);
+	gl_local2d_flatten_end(c, linear, prev_srgb, c->backdrop_scratch_tex, region_w, region_h);
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
 	static bool logged = false;
@@ -5510,8 +5676,9 @@ gl_frame_takes_fast_path(struct comp_gl_compositor *c)
 			break;
 		default:
 			// Local2D is composited POST-weave, not into the atlas, so
-			// it is not this decision's business (and keeps its own
-			// passthrough read — see gl_flatten_one_local2d_layer).
+			// it is not this decision's business (it owns its own
+			// linear-blend target, #1795 — see
+			// gl_ensure_local2d_linear_target).
 			// Cylinder / equirect1 / cube are accepted by the
 			// compositor, warned about, and never drawn on this backend
 			// (#1544). A type that starts drawing into the atlas here
@@ -6712,6 +6879,9 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 	// #491 part 3 — 2D-under backdrop scratch.
 	if (c->backdrop_scratch_tex) glDeleteTextures(1, &c->backdrop_scratch_tex);
 	if (c->backdrop_scratch_fbo) glDeleteFramebuffers(1, &c->backdrop_scratch_fbo);
+	// #1795 — private linear-blend Local2D flatten target.
+	if (c->local2d_linear_tex) glDeleteTextures(1, &c->local2d_linear_tex);
+	if (c->local2d_linear_fbo) glDeleteFramebuffers(1, &c->local2d_linear_fbo);
 
 #ifdef XRT_OS_WINDOWS
 	// Clean up D3D11 shared-texture present resources (readback bridge; no interop).
