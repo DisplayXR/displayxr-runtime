@@ -566,9 +566,34 @@ PaintPageOverlay(uint32_t w, uint32_t h, int32_t hx, int32_t hy, int32_t hw, int
 	const float period = lineH * 40.0f;
 	float off = scroll - floorf(scroll / period) * period;
 	for (float y = -off; y < (float)h; y += lineH) {
-		D2D1_RECT_F lr = D2D1::RectF((float)w * 0.04f, y, (float)w * 0.96f, y + lineH);
+		D2D1_RECT_F lr = D2D1::RectF((float)w * 0.24f, y, (float)w * 0.79f, y + lineH);
 		DrawStr(kLine, g_dwBody.Get(), lr, ink.Get());
 	}
+
+	// Hardest case: LIGHT text on a dark panel (left column), scrolled with the page.
+	ComPtr<ID2D1SolidColorBrush> dark, lightInk, rule;
+	g_d2dCtx->CreateSolidColorBrush(D2D1::ColorF(0.10f, 0.10f, 0.12f, 1.0f), &dark);
+	g_d2dCtx->CreateSolidColorBrush(D2D1::ColorF(0.95f, 0.95f, 0.92f, 1.0f), &lightInk);
+	g_d2dCtx->CreateSolidColorBrush(D2D1::ColorF(0.25f, 0.25f, 0.25f, 1.0f), &rule);
+	const D2D1_RECT_F darkCol = D2D1::RectF(0.0f, 0.0f, (float)w * 0.22f, (float)h);
+	g_d2dCtx->FillRectangle(darkCol, dark.Get());
+	static const wchar_t *kLight = L"Light on dark: 1 l I | i j ; . , the hardest case";
+	for (float y = -off; y < (float)h; y += lineH) {
+		DrawStr(kLight, g_dwBody.Get(), D2D1::RectF((float)w * 0.01f, y, darkCol.right, y + lineH), lightInk.Get());
+	}
+
+	// Horizontal rules (1, 2 and 3 px, as underlines / borders) on the right
+	// column: they must read as even grey, with no coloured dots, through the lens.
+	g_d2dCtx->SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+	g_d2dCtx->FillRectangle(D2D1::RectF((float)w * 0.80f, 0.0f, (float)w, (float)h),
+	                        pillInk.Get()); // white field behind the rules
+	int k = 0;
+	for (float y = lineH * 0.5f - off; y < (float)h; y += lineH * 0.75f, k++) {
+		const float t = (float)(1 + (k % 3)); // 1, 2, 3 px
+		const float yy = floorf(y);
+		g_d2dCtx->FillRectangle(D2D1::RectF((float)w * 0.81f, yy, (float)w * 0.99f, yy + t), rule.Get());
+	}
+	g_d2dCtx->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 
 	// Semi-transparent pill straddling the hole's top edge (2D over 3D AND over page).
 	D2D1_ROUNDED_RECT pr = {D2D1::RectF((float)hx + hw * 0.30f, (float)hy - lineH, (float)hx + hw * 0.70f,
