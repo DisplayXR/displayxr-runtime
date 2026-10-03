@@ -25816,6 +25816,119 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	}
 	int64_t t_post_acquire_ns = os_monotonic_get_ns();
 
+	/*
+	 * v4 overlay atlas (browser#18) — imported and acquired BEFORE the weave
+	 * (ADR-027 Amendment, "2D under the lens").
+	 *
+	 * Flat 2D composited after the weave as plain pixels aliases through the
+	 * lens: each eye samples a different panel column of it. A display
+	 * processor that owns the lens phase can filter the layer per subpixel, but
+	 * only INSIDE the weave — so the overlay is handed to it via set_overlay_2d
+	 * immediately before process_atlas, and key 0 is held until the weave has
+	 * sampled it. When the DP declines (returns false) the post-weave runtime
+	 * blit below composites it exactly as before. Cached by handle like the
+	 * SBS input.
+	 *
+	 * An overlay that cannot be read this frame (import failed, or the 4 ms
+	 * acquire missed — #925 S1: held under render_mutex) REFUSES the submit,
+	 * like a missed input acquire, and does so here: before the output clear,
+	 * so the previous woven frame survives intact. A caller treats an accepted
+	 * submit that chained an overlay as "the runtime composited it" and stands
+	 * its own paint down; under a whole-page overlay (tiles as alpha-0 holes) a
+	 * frame accepted WITHOUT it would show no page at all for a frame. Refused,
+	 * the caller keeps presenting its last frame and retries.
+	 */
+	struct weave_overlay_hold
+	{
+		IDXGIKeyedMutex *km = nullptr;
+		void
+		release()
+		{
+			if (km != nullptr) {
+				km->ReleaseSync(0);
+				km = nullptr;
+			}
+		}
+		~weave_overlay_hold()
+		{
+			release();
+		}
+	} ov_hold;
+	ID3D11ShaderResourceView *ov_srv = nullptr;
+	uint32_t ov_w = 0;
+	uint32_t ov_h = 0;
+	HANDLE ov = (HANDLE)overlay_handle;
+	if (ov != nullptr && ov != INVALID_HANDLE_VALUE) {
+		if (c->render.weave_overlay_handle_cached != ov ||
+		    c->render.weave_overlay_cached_is_dxgi != overlay_is_dxgi || !c->render.weave_overlay_tex ||
+		    !c->render.weave_overlay_srv) {
+			c->render.weave_overlay_handle_cached = nullptr;
+			c->render.weave_overlay_km.reset();
+			c->render.weave_overlay_srv.reset();
+			c->render.weave_overlay_tex.reset();
+
+			if (overlay_is_dxgi) {
+				hr = sys->device->OpenSharedResource(ov, IID_PPV_ARGS(c->render.weave_overlay_tex.put()));
+			} else {
+				hr = sys->device->OpenSharedResource1(ov, IID_PPV_ARGS(c->render.weave_overlay_tex.put()));
+			}
+			if (SUCCEEDED(hr) && c->render.weave_overlay_tex) {
+				D3D11_TEXTURE2D_DESC odesc = {};
+				c->render.weave_overlay_tex->GetDesc(&odesc);
+				D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+				sd.Format = odesc.Format;
+				sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+				sd.Texture2D.MipLevels = 1;
+				hr = sys->device->CreateShaderResourceView(c->render.weave_overlay_tex.get(), &sd,
+				                                           c->render.weave_overlay_srv.put());
+				if (SUCCEEDED(hr)) {
+					(void)c->render.weave_overlay_tex->QueryInterface(
+					    IID_PPV_ARGS(c->render.weave_overlay_km.put()));
+					c->render.weave_overlay_handle_cached = ov;
+					c->render.weave_overlay_cached_is_dxgi = overlay_is_dxgi;
+					U_LOG_W("#625 weave v4: overlay import cached (handle=%p %s, %ux%u)", ov,
+					        overlay_is_dxgi ? "DXGI" : "NT", odesc.Width, odesc.Height);
+				} else {
+					c->render.weave_overlay_srv.reset();
+					c->render.weave_overlay_tex.reset();
+				}
+			} else {
+				U_LOG_E("#625 weave v4: overlay OpenSharedResource(%s) failed: 0x%08lx",
+				        overlay_is_dxgi ? "DXGI" : "NT", hr);
+				c->render.weave_overlay_tex.reset();
+			}
+		}
+
+		bool ov_ok = false;
+		if (c->render.weave_overlay_srv) {
+			D3D11_TEXTURE2D_DESC odesc = {};
+			c->render.weave_overlay_tex->GetDesc(&odesc);
+			IDXGIKeyedMutex *ov_km = c->render.weave_overlay_km.get();
+			ov_ok = (ov_km == nullptr);
+			if (ov_km != nullptr) {
+				HRESULT ah = ov_km->AcquireSync(0, 4);
+				if (SUCCEEDED(ah) && ah != static_cast<HRESULT>(WAIT_TIMEOUT)) {
+					ov_hold.km = ov_km;
+					ov_ok = true;
+				} else {
+					U_LOG_W("#625 weave v4: overlay AcquireSync failed/timed out: 0x%08lx — submit refused",
+					        ah);
+				}
+			}
+			if (ov_ok) {
+				ov_srv = c->render.weave_overlay_srv.get();
+				ov_w = odesc.Width;
+				ov_h = odesc.Height;
+			}
+		}
+		if (!ov_ok) {
+			if (acquired && in_km) {
+				in_km->ReleaseSync(0);
+			}
+			return false;
+		}
+	}
+
 	ID3D11RenderTargetView *rtvs[] = {c->render.weave_output_rtv.get()};
 	const bool nview = (layout != nullptr && layout->view_count > 0);
 
@@ -25887,100 +26000,6 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		sys->context->ClearRenderTargetView(c->render.weave_output_rtv.get(), out_transparent);
 	}
 
-	/*
-	 * v4 overlay atlas (browser#18) — imported and acquired BEFORE the weave
-	 * (ADR-027 Amendment, "2D under the lens").
-	 *
-	 * Flat 2D composited after the weave as plain pixels aliases through the
-	 * lens: each eye samples a different panel column of it. A display
-	 * processor that owns the lens phase can filter the layer per subpixel, but
-	 * only INSIDE the weave — so the overlay is handed to it via set_overlay_2d
-	 * immediately before process_atlas, and key 0 is held until the weave has
-	 * sampled it. When the DP declines (returns false) the post-weave runtime
-	 * blit below composites it exactly as before. Cached by handle like the
-	 * SBS input. A missed 4 ms acquire composes this frame without the overlay
-	 * (#925 S1: held under render_mutex; skip-and-retry beats a global stall).
-	 */
-	struct weave_overlay_hold
-	{
-		IDXGIKeyedMutex *km = nullptr;
-		void
-		release()
-		{
-			if (km != nullptr) {
-				km->ReleaseSync(0);
-				km = nullptr;
-			}
-		}
-		~weave_overlay_hold()
-		{
-			release();
-		}
-	} ov_hold;
-	ID3D11ShaderResourceView *ov_srv = nullptr;
-	uint32_t ov_w = 0;
-	uint32_t ov_h = 0;
-	HANDLE ov = (HANDLE)overlay_handle;
-	if (ov != nullptr && ov != INVALID_HANDLE_VALUE) {
-		if (c->render.weave_overlay_handle_cached != ov ||
-		    c->render.weave_overlay_cached_is_dxgi != overlay_is_dxgi || !c->render.weave_overlay_tex ||
-		    !c->render.weave_overlay_srv) {
-			c->render.weave_overlay_handle_cached = nullptr;
-			c->render.weave_overlay_km.reset();
-			c->render.weave_overlay_srv.reset();
-			c->render.weave_overlay_tex.reset();
-
-			if (overlay_is_dxgi) {
-				hr = sys->device->OpenSharedResource(ov, IID_PPV_ARGS(c->render.weave_overlay_tex.put()));
-			} else {
-				hr = sys->device->OpenSharedResource1(ov, IID_PPV_ARGS(c->render.weave_overlay_tex.put()));
-			}
-			if (SUCCEEDED(hr) && c->render.weave_overlay_tex) {
-				D3D11_TEXTURE2D_DESC odesc = {};
-				c->render.weave_overlay_tex->GetDesc(&odesc);
-				D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
-				sd.Format = odesc.Format;
-				sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-				sd.Texture2D.MipLevels = 1;
-				hr = sys->device->CreateShaderResourceView(c->render.weave_overlay_tex.get(), &sd,
-				                                           c->render.weave_overlay_srv.put());
-				if (SUCCEEDED(hr)) {
-					(void)c->render.weave_overlay_tex->QueryInterface(
-					    IID_PPV_ARGS(c->render.weave_overlay_km.put()));
-					c->render.weave_overlay_handle_cached = ov;
-					c->render.weave_overlay_cached_is_dxgi = overlay_is_dxgi;
-					U_LOG_W("#625 weave v4: overlay import cached (handle=%p %s, %ux%u)", ov,
-					        overlay_is_dxgi ? "DXGI" : "NT", odesc.Width, odesc.Height);
-				} else {
-					c->render.weave_overlay_srv.reset();
-					c->render.weave_overlay_tex.reset();
-				}
-			} else {
-				U_LOG_E("#625 weave v4: overlay OpenSharedResource(%s) failed: 0x%08lx",
-				        overlay_is_dxgi ? "DXGI" : "NT", hr);
-				c->render.weave_overlay_tex.reset();
-			}
-		}
-
-		if (c->render.weave_overlay_srv && c->render.weave_output_rtv) {
-			D3D11_TEXTURE2D_DESC odesc = {};
-			c->render.weave_overlay_tex->GetDesc(&odesc);
-			IDXGIKeyedMutex *ov_km = c->render.weave_overlay_km.get();
-			bool ov_ok = (ov_km == nullptr);
-			if (ov_km != nullptr) {
-				HRESULT ah = ov_km->AcquireSync(0, 4);
-				if (SUCCEEDED(ah) && ah != static_cast<HRESULT>(WAIT_TIMEOUT)) {
-					ov_hold.km = ov_km;
-					ov_ok = true;
-				}
-			}
-			if (ov_ok) {
-				ov_srv = c->render.weave_overlay_srv.get();
-				ov_w = odesc.Width;
-				ov_h = odesc.Height;
-			}
-		}
-	}
 	// Hand the overlay to the DP for the next process_atlas. Only on the
 	// full-window-canvas paths (v6, batch): the layer is window-sized and the
 	// DP composites it over the whole weave target, which the legacy
