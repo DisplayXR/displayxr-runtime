@@ -441,6 +441,9 @@ static void UpdatePerformanceStats(PerformanceStats& stats) {
 // (ADR-044 / INV-4.6): the CPU-authored bytes are display-referred, so a
 // UNORM declaration would have a format-honest compositor encode them twice.
 static int64_t PickPanelFormat(XrSession session, int64_t srgb, int64_t unorm) {
+    // A/B knob, same switch as displayxr-common's swapchains (#1795).
+    const char* enc = getenv("DXR_SWAPCHAIN_ENCODING");
+    if (enc != nullptr && strcmp(enc, "unorm") == 0) return unorm;
     uint32_t n = 0;
     xrEnumerateSwapchainFormats(session, 0, &n, nullptr);
     std::vector<int64_t> formats(n);
