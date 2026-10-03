@@ -508,3 +508,23 @@ TEST_CASE("colour: the D3D11 service's passthrough draws sample raw (#1769)")
 	CHECK(direct_proj == 0);
 	CHECK(count_code_lines_with(src, "sys, &c->render, proj_src_srv, src_x,") == 2);
 }
+
+TEST_CASE("colour: the macOS shared-surface content pass draws into the encoding target")
+{
+	/*
+	 * comp_multi samples each client's content as its DECLARED format, so an
+	 * `_SRGB` client arrives decoded. Drawing that into the encoded atlas
+	 * through its plain UNORM framebuffer stored linear values raw: every
+	 * `_SRGB` app one decode too dark (measured: lum 61 vs 131). The pass must
+	 * take the same resolved target as the decorations (#1795), whose
+	 * framebuffer is the atlas's `_SRGB` view unless the legacy hatch is on.
+	 */
+	const std::string path = std::string(DXR_COMP_SRC_DIR) + "/multi/comp_multi_system.c";
+	const std::string src = read_whole_file(path);
+
+	INFO("the content pass must resolve its target through shared_resolve_deco_target()");
+	CHECK(contains_in_code(src, "shared_resolve_deco_target(msc, vk, &content_target)"));
+
+	INFO("no pass may begin on the bare UNORM atlas framebuffer with the UNORM content pipeline");
+	CHECK_FALSE(contains_in_code(src, "comp_multi_content_blend_begin(&msc->shared_content_blend"));
+}

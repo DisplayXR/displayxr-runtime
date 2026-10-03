@@ -5235,7 +5235,16 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 	// corners + feathered edges. ONE render pass over the whole atlas so overlapping
 	// windows blend in painter (far→near, already-sorted) submission order; every
 	// content source image must therefore be SHADER_READ before the pass begins.
-	if (shared_ensure_content_blend(msc, vk)) {
+	//
+	// ADR-044 §1: the content pass draws into the same target as the decorations
+	// (#1795). Sources are sampled as their DECLARED format, so the target must
+	// encode on write: through the atlas's `_SRGB` view (or an `_SRGB` atlas).
+	// Rendering into the encoded atlas through its UNORM view stored the decoded
+	// (linear) values of an `_SRGB` client raw, one decode too dark. Under the
+	// legacy hatch the target is the UNORM atlas view, as before.
+	struct shared_deco_target content_target = {0};
+	if (shared_resolve_deco_target(msc, vk, &content_target) && content_target.content != NULL) {
+		struct comp_multi_content_blend *content_blend = content_target.content;
 		// Corner radius matches the shell focus ring (fh*0.045) so the content
 		// corners are concentric with it; feather is ~2 px of the window height,
 		// capped at the radius (Windows caps so feather_band = feather/ry ≤ 1).
@@ -5313,8 +5322,8 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 			                         uniq_n, pre);
 		}
 
-		comp_multi_content_blend_begin(&msc->shared_content_blend, vk, cmd, msc->shared_atlas_fb,
-		                               (uint32_t)msc->shared_atlas_w, (uint32_t)msc->shared_atlas_h);
+		comp_multi_content_blend_begin(content_blend, vk, cmd, content_target.fb, (uint32_t)msc->shared_atlas_w,
+		                               (uint32_t)msc->shared_atlas_h);
 		// Per client (far→near), per eye: project the window rect, clip it to the
 		// eye tile, remap the source sub-rect, and draw with rounded-rect coverage.
 		// M2: a placed window projects its center pose through each eye onto the
@@ -5351,6 +5360,14 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 					glow_color[1] = st.focus_glow_color[1];
 					glow_color[2] = st.focus_glow_color[2];
 					glow_color[3] = st.focus_glow_color[3];
+					// The style colour is display-referred. An encoding target
+					// would encode it again, so hand the shader its linear value
+					// (a constant, like a clear colour; ADR-044 §2).
+					if (content_target.honest) {
+						for (int k = 0; k < 3; k++) {
+							glow_color[k] = u_color_srgb_decode(glow_color[k]);
+						}
+					}
 					if (st.edge_feather_meters > 0.0f && e->win_h_m > 0.0f) {
 						float sf = st.edge_feather_meters / e->win_h_m;
 						if (sf > edge_feather) {
@@ -5458,8 +5475,8 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 					memcpy(pcq.corners, corners, sizeof(corners));
 					SHARED_SET_HUD_PC(pcq);
 					comp_multi_content_blend_draw_quad(
-					    &msc->shared_content_blend, vk, cmd, im, ai, fmt, hud_img, hud_fmt, &pcq,
-					    tile_x0_e, 0, (uint32_t)eye_w, (uint32_t)eye_h, (uint32_t)msc->shared_atlas_w,
+					    content_blend, vk, cmd, im, ai, fmt, hud_img, hud_fmt, &pcq, tile_x0_e, 0,
+					    (uint32_t)eye_w, (uint32_t)eye_h, (uint32_t)msc->shared_atlas_w,
 					    (uint32_t)msc->shared_atlas_h);
 					continue;
 				}
@@ -5515,13 +5532,13 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 				    .glow_color = {glow_color[0], glow_color[1], glow_color[2], glow_color[3]},
 				};
 				SHARED_SET_HUD_PC(pc);
-				comp_multi_content_blend_draw(&msc->shared_content_blend, vk, cmd, im, ai, fmt,
-				                              hud_img, hud_fmt, &pc, (int32_t)cdx0, (int32_t)cdy0,
+				comp_multi_content_blend_draw(content_blend, vk, cmd, im, ai, fmt, hud_img, hud_fmt,
+				                              &pc, (int32_t)cdx0, (int32_t)cdy0,
 				                              (uint32_t)(cdx1 - cdx0), (uint32_t)(cdy1 - cdy0));
 			}
 #undef SHARED_SET_HUD_PC
 		}
-		comp_multi_content_blend_end(&msc->shared_content_blend, vk, cmd);
+		comp_multi_content_blend_end(content_blend, vk, cmd);
 
 		// Restore the cross-process sources to GENERAL (their rest layout).
 		if (uniq_n > 0) {

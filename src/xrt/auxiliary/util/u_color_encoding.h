@@ -70,6 +70,28 @@ u_color_srgb_encode(float linear)
 }
 
 /*!
+ * Inverse of u_color_srgb_encode (display-referred → linear), IEC 61966-2-1.
+ *
+ * For CPU-side CONSTANTS only (a display-referred colour handed to a shader
+ * whose target encodes on write, like a clear colour). Never shader arithmetic
+ * on sampled pixels: decoding is a property of the `_SRGB` view.
+ */
+static inline float
+u_color_srgb_decode(float encoded)
+{
+	if (encoded <= 0.0f) {
+		return 0.0f;
+	}
+	if (encoded >= 1.0f) {
+		return 1.0f;
+	}
+	if (encoded <= 0.04045f) {
+		return encoded / 12.92f;
+	}
+	return powf((encoded + 0.055f) / 1.055f, 2.4f);
+}
+
+/*!
  * The 8-bit atlas byte a linear value must land on: `0.0 → 0`, `0.2 → 124`,
  * `0.5 → 188`, `1.0 → 255`. These four are the #1589 acceptance numbers.
  */
