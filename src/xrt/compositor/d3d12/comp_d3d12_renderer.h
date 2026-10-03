@@ -338,12 +338,16 @@ comp_d3d12_renderer_composite_2d_masked(struct comp_d3d12_renderer *renderer,
  *
  * @param renderer The renderer.
  * @param cmd_list Open D3D12 command list (void* = ID3D12GraphicsCommandList*).
- * @param scratch_rtv_handle CPU RTV handle of the Local2D scratch (R8G8B8A8_UNORM).
+ * @param scratch_rtv_handle CPU RTV handle of the Local2D scratch (R8G8B8A8_UNORM,
+ *        or R8G8B8A8_UNORM_SRGB on a TYPELESS scratch — see @p linear_target).
  * @param src_resource The layer's swapchain image (ID3D12Resource*).
  * @param slot_index Unique flatten-heap SRV slot for this draw (< XRT_MAX_LAYERS).
  * @param dst_x,dst_y,dst_w,dst_h Clipped dest sub-rect (viewport) in pixels.
  * @param src_x,src_y,src_w,src_h Source rect (normalized; src_h < 0 => flip_y).
  * @param unpremultiplied True for straight-alpha layers (XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT).
+ * @param linear_target #1795: true when @p scratch_rtv_handle is an `_SRGB` RTV — the source is
+ *        then sampled format-honestly (an `_SRGB` layer decodes) and the blend runs in linear;
+ *        false (legacy hatch, UNORM RTV) samples the non-decoding view.
  *
  * @ingroup comp_d3d12
  */
@@ -361,7 +365,8 @@ comp_d3d12_renderer_flatten_local_2d(struct comp_d3d12_renderer *renderer,
                                      float src_y,
                                      float src_w,
                                      float src_h,
-                                     bool unpremultiplied);
+                                     bool unpremultiplied,
+                                     bool linear_target);
 
 /*!
  * Resize the renderer's atlas texture to match a new view size.

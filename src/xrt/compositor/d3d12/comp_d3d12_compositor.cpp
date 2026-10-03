@@ -584,8 +584,14 @@ struct comp_d3d12_compositor
 	uint32_t zone_wish_rect_count;
 
 	/*!
-	 * Flattened Local2D layers (the `twod` source). R8G8B8A8_UNORM render
-	 * target — dedicated. Lazily (re)allocated window-sized.
+	 * Flattened Local2D layers (the `twod` source). R8G8B8A8 render target —
+	 * dedicated. Lazily (re)allocated window-sized.
+	 *
+	 * #1795 / ADR-044: allocated R8G8B8A8_TYPELESS with an `_SRGB` RTV, so the
+	 * flatten blends in LINEAR and the render target encodes once, on write;
+	 * every reader (the composite's SRV, the bridge / deposit plane copy)
+	 * still sees the ENCODED bytes through the UNORM member. Under the legacy
+	 * colour hatch it stays concrete UNORM with a UNORM RTV, as before.
 	 *
 	 * #918 D12-4: under the split this is a BRIDGE PLANE SOURCE and is allocated
 	 * at the PANEL instead — once, and then never resized, which is what keeps it
@@ -7372,13 +7378,51 @@ d3d12_zone_cmd_execute(struct comp_d3d12_compositor *c)
 	gpu_wait_idle_app(c);
 }
 
+// #1795 / ADR-044: do the Local2D flattens (over and 2D-under) blend in linear
+// through an `_SRGB` RTV? Off only under the legacy colour hatch.
+static inline bool
+d3d12_local2d_honest(void)
+{
+	return !u_color_legacy_unorm_encoded();
+}
+
+// #1795: the resource format of a Local2D / backdrop flatten scratch. An `_SRGB`
+// RTV over UNORM-read bytes needs a TYPELESS resource (D3D12 cannot view a
+// concrete format as another family member); the legacy hatch keeps UNORM.
+static inline DXGI_FORMAT
+d3d12_local2d_scratch_format(void)
+{
+	return d3d12_local2d_honest() ? DXGI_FORMAT_R8G8B8A8_TYPELESS : DXGI_FORMAT_R8G8B8A8_UNORM;
+}
+
+// #1795: the RTV the flatten writes through — the `_SRGB` member when the
+// scratch is TYPELESS (linear blend, encode on write), otherwise UNORM.
+static inline DXGI_FORMAT
+d3d12_local2d_rtv_format(DXGI_FORMAT scratch_fmt)
+{
+	return scratch_fmt == DXGI_FORMAT_R8G8B8A8_TYPELESS ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+	                                                    : DXGI_FORMAT_R8G8B8A8_UNORM;
+}
+
+// #1795: does this flatten scratch's RTV encode on write? Read from the TARGET
+// itself (its resource format decides its RTV), exactly as the D3D11 leg asks
+// its RTV — so the flatten's source view can never disagree with its target.
+static inline bool
+d3d12_local2d_scratch_is_linear(ID3D12Resource *scratch)
+{
+	return scratch != nullptr && scratch->GetDesc().Format == DXGI_FORMAT_R8G8B8A8_TYPELESS;
+}
+
 // #439 Phase 3 — (re)allocate the dedicated Local2D flatten scratch
-// (R8G8B8A8_UNORM, ALLOW_RENDER_TARGET, steady COMMON) + its RTV heap.
+// (R8G8B8A8_TYPELESS + `_SRGB` RTV per #1795, or R8G8B8A8_UNORM under the
+// legacy hatch; ALLOW_RENDER_TARGET, steady COMMON) + its RTV heap.
 // Returns false on allocation failure.
 static bool
 d3d12_ensure_local2d_scratch(struct comp_d3d12_compositor *c, uint32_t w, uint32_t h)
 {
-	if (c->local2d_scratch != nullptr && c->local2d_scratch_w == w && c->local2d_scratch_h == h) {
+	const DXGI_FORMAT tex_fmt = d3d12_local2d_scratch_format();
+	if (c->local2d_scratch != nullptr && c->local2d_scratch_w == w && c->local2d_scratch_h == h &&
+	    c->local2d_scratch->GetDesc().Format == tex_fmt) {
 		return true;
 	}
 	if (c->local2d_scratch != nullptr) {
@@ -7394,15 +7438,18 @@ d3d12_ensure_local2d_scratch(struct comp_d3d12_compositor *c, uint32_t w, uint32
 	desc.Height = h;
 	desc.DepthOrArraySize = 1;
 	desc.MipLevels = 1;
-	desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	desc.Format = tex_fmt;
 	desc.SampleDesc.Count = 1;
 	desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
 
 	D3D12_HEAP_PROPERTIES heap = {};
 	heap.Type = D3D12_HEAP_TYPE_DEFAULT;
 
+	// The optimized clear names the format the clear is ISSUED through (the
+	// RTV); a TYPELESS resource cannot carry one of its own.
+	const DXGI_FORMAT rtv_fmt = d3d12_local2d_rtv_format(tex_fmt);
 	D3D12_CLEAR_VALUE clear = {};
-	clear.Format = DXGI_FORMAT_R8G8B8A8_UNORM; // transparent (flatten clears to 0,0,0,0)
+	clear.Format = rtv_fmt; // transparent (flatten clears to 0,0,0,0)
 
 	HRESULT hr = c->device->CreateCommittedResource(
 	    &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, &clear, IID_PPV_ARGS(&c->local2d_scratch));
@@ -7425,7 +7472,10 @@ d3d12_ensure_local2d_scratch(struct comp_d3d12_compositor *c, uint32_t w, uint32
 			return false;
 		}
 	}
-	c->device->CreateRenderTargetView(c->local2d_scratch, nullptr,
+	D3D12_RENDER_TARGET_VIEW_DESC rtv_view = {};
+	rtv_view.Format = rtv_fmt;
+	rtv_view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+	c->device->CreateRenderTargetView(c->local2d_scratch, &rtv_view,
 	                                  c->local2d_scratch_rtv_heap->GetCPUDescriptorHandleForHeapStart());
 	c->local2d_scratch_w = w;
 	c->local2d_scratch_h = h;
@@ -8092,6 +8142,9 @@ static bool
 d3d12_flatten_local_2d_layers(struct comp_d3d12_compositor *c, uint32_t region_w, uint32_t region_h, int32_t proj_idx)
 {
 	D3D12_CPU_DESCRIPTOR_HANDLE rtv = c->local2d_scratch_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+	// #1795: the source view follows the TARGET — `_SRGB` RTV ⟹ sample each
+	// layer as declared and blend in linear; UNORM RTV (legacy) ⟹ passthrough.
+	const bool linear_target = d3d12_local2d_scratch_is_linear(c->local2d_scratch);
 
 	// Scratch COMMON → RENDER_TARGET, clear transparent. Where a pixel is M=0
 	// (2D) but no layer covers it, twod stays (0,0,0,0) → final.a → 0 → the
@@ -8176,7 +8229,7 @@ d3d12_flatten_local_2d_layers(struct comp_d3d12_compositor *c, uint32_t region_w
 		// which share flatten_srv_heap within the one deferred cmd list).
 		comp_d3d12_renderer_flatten_local_2d(c->renderer, c->cmd_list, rtv.ptr, src_res, i, x0, y0,
 		                                     (uint32_t)(x1 - x0), (uint32_t)(y1 - y0), src_x, src_y, src_w,
-		                                     src_h, unpremult);
+		                                     src_h, unpremult, linear_target);
 	}
 
 	// Scratch → sampleable for the masked composite.
@@ -8192,10 +8245,16 @@ d3d12_flatten_local_2d_layers(struct comp_d3d12_compositor *c, uint32_t region_w
 
 // #491 part 3 — ensure the 2D-under backdrop scratch (clone of
 // d3d12_ensure_local2d_scratch; separate so a model switch can't dangle it).
+//
+// #1795: same contract as the over-flatten — TYPELESS + `_SRGB` RTV (legacy
+// hatch: UNORM), ENCODED bytes for every reader (the DP's own R8G8B8A8_UNORM
+// SRV, the bridge / deposit BACKDROP plane copy).
 static bool
 d3d12_ensure_backdrop_scratch(struct comp_d3d12_compositor *c, uint32_t w, uint32_t h)
 {
-	if (c->backdrop_scratch != nullptr && c->backdrop_scratch_w == w && c->backdrop_scratch_h == h) {
+	const DXGI_FORMAT tex_fmt = d3d12_local2d_scratch_format();
+	if (c->backdrop_scratch != nullptr && c->backdrop_scratch_w == w && c->backdrop_scratch_h == h &&
+	    c->backdrop_scratch->GetDesc().Format == tex_fmt) {
 		return true;
 	}
 	if (c->backdrop_scratch != nullptr) {
@@ -8211,15 +8270,16 @@ d3d12_ensure_backdrop_scratch(struct comp_d3d12_compositor *c, uint32_t w, uint3
 	desc.Height = h;
 	desc.DepthOrArraySize = 1;
 	desc.MipLevels = 1;
-	desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	desc.Format = tex_fmt;
 	desc.SampleDesc.Count = 1;
 	desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
 
 	D3D12_HEAP_PROPERTIES heap = {};
 	heap.Type = D3D12_HEAP_TYPE_DEFAULT;
 
+	const DXGI_FORMAT rtv_fmt = d3d12_local2d_rtv_format(tex_fmt);
 	D3D12_CLEAR_VALUE clear = {};
-	clear.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	clear.Format = rtv_fmt;
 
 	HRESULT hr = c->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
 	                                                D3D12_RESOURCE_STATE_COMMON, &clear,
@@ -8243,7 +8303,10 @@ d3d12_ensure_backdrop_scratch(struct comp_d3d12_compositor *c, uint32_t w, uint3
 			return false;
 		}
 	}
-	c->device->CreateRenderTargetView(c->backdrop_scratch, nullptr,
+	D3D12_RENDER_TARGET_VIEW_DESC rtv_view = {};
+	rtv_view.Format = rtv_fmt;
+	rtv_view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+	c->device->CreateRenderTargetView(c->backdrop_scratch, &rtv_view,
 	                                  c->backdrop_scratch_rtv_heap->GetCPUDescriptorHandleForHeapStart());
 	c->backdrop_scratch_w = w;
 	c->backdrop_scratch_h = h;
@@ -8323,6 +8386,8 @@ d3d12_flatten_backdrop_2d(struct comp_d3d12_compositor *c, uint32_t dst_w, uint3
 	}
 
 	D3D12_CPU_DESCRIPTOR_HANDLE rtv = c->backdrop_scratch_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+	// #1795: same target-chosen source view as the over-flatten.
+	const bool linear_target = d3d12_local2d_scratch_is_linear(c->backdrop_scratch);
 
 	D3D12_RESOURCE_BARRIER to_rt = {};
 	to_rt.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -8385,7 +8450,7 @@ d3d12_flatten_backdrop_2d(struct comp_d3d12_compositor *c, uint32_t dst_w, uint3
 		bool unpremult = (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0;
 		comp_d3d12_renderer_flatten_local_2d(c->renderer, c->cmd_list, rtv.ptr, src_res, i, x0, y0,
 		                                     (uint32_t)(x1 - x0), (uint32_t)(y1 - y0), src_x, src_y, src_w,
-		                                     src_h, unpremult);
+		                                     src_h, unpremult, linear_target);
 	}
 
 	D3D12_RESOURCE_BARRIER to_psr = {};
@@ -9018,6 +9083,8 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 			uint64_t hash = 0;
 			d3d12_local2d_digest(c, zones_frame ? -1 : proj_idx, /*over=*/true, region_w, region_h, &box,
 			                     &hash);
+			// #1795: the chain stays UNORM (ENCODED bytes); a TYPELESS scratch
+			// into its own family's concrete chain is accepted (#1663).
 			const bool twod_bound = comp_xbridge_bind_plane_resource(
 			    c->xbridge, COMP_XBRIDGE_PLANE_LOCAL2D, c->local2d_scratch, c->local2d_scratch_gen,
 			    (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM, c->split_panel_w, c->split_panel_h);
