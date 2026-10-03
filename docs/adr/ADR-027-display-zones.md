@@ -60,6 +60,13 @@ issues: [439, 396]
 >   service's full-window weave paths (v3 batch, v6); the legacy single-rect path keeps the
 >   blit. Other APIs and the in-process compositors' Local2D-over path follow the same slot
 >   shape when needed. 2D-*under*-3D (`set_background_2d`) is unchanged.
+> - Browser use (decided 2026-10): the layer is the **whole flat page** with the woven tiles
+>   as alpha-0 holes, not only the 2D lifted over tiles — the aliasing users saw was page text
+>   around the canvas. While any tile exists the browser submits every frame; a submit whose
+>   overlay cannot be read is refused before the woven output is touched, so the caller holds
+>   its previous frame and text never flips filtered↔unfiltered. Zero tiles ⟹ no submit
+>   (nothing 3D, lens off). **Out of scope:** popups, menus and other separate OS windows —
+>   they never enter the page's layer and stay unfiltered.
 
 ## Context
 
