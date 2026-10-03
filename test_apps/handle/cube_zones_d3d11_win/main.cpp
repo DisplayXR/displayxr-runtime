@@ -466,6 +466,9 @@ struct RenderState {
 // advertises one (INV-4.6); the CPU-authored bytes are display-referred, so
 // declaring them _SRGB keeps the compositor's decode→encode round-trip honest.
 static int64_t PickStripFormat(XrSessionManager& xr) {
+    // A/B knob, same switch as displayxr-common's swapchains (#1795).
+    const char* enc = getenv("DXR_SWAPCHAIN_ENCODING");
+    if (enc != nullptr && strcmp(enc, "unorm") == 0) return (int64_t)DXGI_FORMAT_B8G8R8A8_UNORM;
     uint32_t n = 0;
     xrEnumerateSwapchainFormats(xr.session, 0, &n, nullptr);
     std::vector<int64_t> formats(n);
