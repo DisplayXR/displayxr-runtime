@@ -169,7 +169,10 @@ When the user uninstalls the runtime via Add/Remove Programs:
    (silent uninstall) **before** removing any runtime files.
 3. Each chained workspace app uninstaller removes only the files and
    registry keys it owns — never the runtime's.
-4. The runtime then proceeds with its own cleanup.
+4. The runtime then deletes the `WorkspaceControllers` key **only if it is
+   empty** (`DeleteRegKey /ifempty`): a controller whose uninstaller failed
+   keeps its files and Add/Remove Programs entry, so it keeps its
+   registration too (#1803). It then proceeds with its own cleanup.
 
 This pattern mirrors how OS package managers handle dependent
 products. It is the workspace app's responsibility to:

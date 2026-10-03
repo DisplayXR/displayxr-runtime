@@ -64,7 +64,7 @@ The runtime installer ships several DLLs in `C:\Program Files\DisplayXR\Runtime\
 - `pthreadVC3.dll`
 - `cjson.dll`
 
-If your plug-in dynamically imports any of these, they resolve through standard exe-directory DLL search from `$RuntimeInstall\` (your plug-in's installer drops `DisplayXR-<You>.dll` into `$RuntimeInstall\Plugins\<your-id>\`, two directory levels into the same install tree).
+If your plug-in dynamically imports any of these, they resolve from the runtime directory, **not** from your own: your plug-in lives in a **sibling** directory (`C:\Program Files\DisplayXR\Plugins\<YourVendor>\`, next to `C:\Program Files\DisplayXR\Runtime\`, not inside it). The loader uses `LoadLibraryExW(..., LOAD_WITH_ALTERED_SEARCH_PATH)`, which searches your plug-in's directory first and then the standard order: modules the host already loaded (`DisplayXRClient.dll` always is, with whatever it imports from the runtime directory), the host executable's directory (only the service lives in the runtime directory), then `PATH`. The runtime installer does **not** add its directory to `PATH`, so an in-process app host finds only what is already loaded. Do not rely on `PATH` for your own vendor dependencies either: a long-lived service keeps the `PATH` it started with, so a directory added by a later install is invisible to it until it restarts. Resolve them by full path instead (e.g. `/DELAYLOAD` + a delay-load hook).
 
 **Do NOT re-ship these DLLs in your plug-in installer** — bundling duplicates risks version skew across the install tree. The runtime owns their lifecycle.
 
@@ -126,7 +126,7 @@ Your installer writes these values under `HKLM\Software\DisplayXR\DisplayProcess
 | `Vendor` | `REG_SZ` | Your company name |
 | `Version` | `REG_SZ` | Plug-in version (e.g. `1.0.0`) |
 | `ProbeOrder` | `REG_DWORD` | Discovery priority — see below |
-| `UninstallString` | `REG_SZ` | Quoted full path to your `Uninstall.exe`; the runtime's cascade-uninstaller invokes this with `/S` when the runtime is uninstalled |
+| `UninstallString` | `REG_SZ` | Optional, informational: quoted full path to your `Uninstall.exe`. The runtime never runs it — your plug-in is removed only by its own uninstaller (Add/Remove Programs) |
 
 `<your-id>` is a short kebab-case identifier matching `iface->id` (the string the plug-in returns from `xrtPluginNegotiate`). The Leia plug-in uses `leia-sr`; sim-display uses `sim-display`.
 
@@ -165,49 +165,50 @@ Within a range, pick a value **distinct from every plug-in or provider you expec
 
 ## 5. Installer contract
 
-The vendor plug-in installer is independent of the runtime installer — it has its own version cadence, its own release flow, its own NSIS script (Windows) or `.pkg` builder (macOS).
+The vendor plug-in installer is independent of the runtime installer — it has its own version cadence, its own release flow, its own NSIS script (Windows) or `.pkg` builder (macOS). **Nothing may depend on the order in which the runtime, your plug-in and your vendor platform software are installed or uninstalled** (epic [#1803](https://github.com/DisplayXR/displayxr-runtime/issues/1803)).
 
-### Hard prereq: the runtime must already be installed
+### Your plug-in owns its registration
 
-Your installer's first action should be:
+The `HKLM\Software\DisplayXR\DisplayProcessors\<your-id>` subkey is the runtime's public contract, and it is **yours**: your installer writes it, your uninstaller deletes it, and nobody else touches it.
 
-```nsis
-ReadRegStr $0 HKLM "Software\DisplayXR\Runtime" "InstallPath"
-${If} $0 == ""
-    MessageBox MB_OK|MB_ICONSTOP "DisplayXR Runtime is required. Install it first from https://github.com/DisplayXR/displayxr-runtime/releases then retry."
-    Abort
-${EndIf}
-```
+- **The runtime never removes it.** The runtime installer writes and deletes only its own `sim-display` subkey; it never runs your uninstaller, never deletes your subkey, and never deletes files outside its own directory. Uninstalling the runtime leaves your plug-in installed and registered; reinstalling the runtime picks it up again without reinstalling the plug-in.
+- **You may be installed before the runtime.** Your subkey can pre-exist the runtime; the runtime adopts any registered plug-in it finds. Your installer must therefore **not** require the runtime: install your files, write your subkey (`SetRegView 64` first — the `DisplayProcessors` key may not exist yet; `WriteRegStr` creates it), and finish. Your plug-in is simply not loaded until a runtime is present, because only the runtime loads it.
+- **Version floor only when a runtime is present.** If you need a minimum runtime version, check it only when `HKLM\Software\DisplayXR\Runtime` has an `InstallPath`; with no runtime, install anyway.
+- **Do not require your vendor platform software either.** A plug-in must load without it and decline (or report its state) cleanly, so that the platform software can be installed before or after you.
 
-This prevents "I installed the plug-in but nothing happens" support tickets — without the runtime, `DisplayXRClient.dll` doesn't exist and your plug-in's import fails at load time.
+### Stopping and starting the service
+
+`displayxr-service.exe` maps every registered plug-in DLL, so your installer and uninstaller must release it before replacing or deleting your files — and must never leave it running elevated:
+
+- Release your files with **Windows Restart Manager** (`RmStartSession` / `RmRegisterResources` on your DLLs / `RmGetList` / `RmShutdown(RmForceShutdown)` / `RmRestart`). The service registers for restart and exits on the close query. This is generic Windows; no DisplayXR-specific code.
+- If you must start the service yourself (Restart Manager found nothing to restart and a runtime is present), start it **through `explorer.exe`** (`Exec 'explorer.exe "<runtime InstallPath>\displayxr-service.exe"'`), never with a plain `Exec` from your elevated installer: an elevated service cannot be reached by normal-integrity apps.
+- If no runtime is installed, start nothing.
 
 ### Install dir convention
 
-`$RuntimeInstall\Plugins\<YourVendorId>\` — e.g. `C:\Program Files\DisplayXR\Plugins\LeiaSR\`.
+`C:\Program Files\DisplayXR\Plugins\<YourVendor>\` (NSIS: `$PROGRAMFILES64\DisplayXR\Plugins\<YourVendor>`) — a **sibling** of the runtime's `C:\Program Files\DisplayXR\Runtime\`, not a subdirectory of it. The runtime uninstaller only ever removes `C:\Program Files\DisplayXR` non-recursively and only when it is empty, so your directory survives it.
 
 Drop the following into that directory:
 - Your plug-in DLL (`DisplayXR-<YourVendor>.dll`)
-- Any vendor SDK runtime DLLs you license to redistribute (e.g. the Leia plug-in bundles `SimulatedRealityVulkanBeta.dll` because it's not in the SR Platform install set; everything else comes from the SR Platform installer separately)
+- Any vendor SDK runtime DLLs you license to redistribute and that your platform software does not install
 - An `Uninstall.exe` (NSIS generates this automatically)
 
-Do **not** drop anything into `$RuntimeInstall\` (the parent). That's runtime-owned.
+Do **not** drop anything into `C:\Program Files\DisplayXR\Runtime\`. That's runtime-owned and is deleted with the runtime.
 
-### `UninstallString` for cascade-uninstall
+### Uninstall
 
-The runtime's uninstaller has a **cascade-uninstall** pass: it walks `HKLM\Software\DisplayXR\DisplayProcessors\*`, reads each entry's `UninstallString`, and runs it silently before uninstalling its own files. This is how the runtime cleans up vendor plug-ins when the user uninstalls the runtime.
+Your uninstaller is run by the user (Add/Remove Programs) or by a bundle — never by the runtime. It must:
 
-Your installer **must** register `UninstallString` correctly:
+- Honor `/S` (silent mode) and never show a modal under it (`MessageBox ... /SD <default>`).
+- Work with or without the runtime installed.
+- Release your DLL (Restart Manager, as above) instead of leaving it mapped, then delete your files.
+- Delete your own `<your-id>` subkey; leave every other subkey, and the runtime's files, alone.
 
-```nsis
-WriteRegStr HKLM "Software\DisplayXR\DisplayProcessors\<your-id>" \
-    "UninstallString" "$\"$INSTDIR\Uninstall.exe$\""
-```
-
-The quoted form (with embedded double-quotes) is the convention the runtime's cascade-uninstaller expects.
+`UninstallString` under your subkey is optional and informational (it mirrors your Add/Remove Programs entry); the runtime does not execute it.
 
 ### Reference installer
 
-[`displayxr-leia-plugin/installer/DisplayXRLeiaSRInstaller.nsi`](https://github.com/DisplayXR/displayxr-leia-plugin/blob/main/installer/DisplayXRLeiaSRInstaller.nsi) is the canonical reference. Lift it wholesale; rename `LeiaSR` → your vendor name, change the registry `<id>`, and you're 90% there.
+[`displayxr-vendor-template`](https://github.com/DisplayXR/displayxr-vendor-template)'s `installer/` is the starting point. The full worked integration linked at the top of this guide is being brought in line with this contract under [#1803](https://github.com/DisplayXR/displayxr-runtime/issues/1803); where the two differ, this section wins.
 
 ## 6. Vendor-specific concerns
 
@@ -215,7 +216,7 @@ The quoted form (with embedded double-quotes) is the convention the runtime's ca
 
 If your vendor SDK's license allows redistribution, bundle the runtime DLLs in your installer. The end-user's experience is one installer click.
 
-If it doesn't, document the SDK as a hard prereq in your installer's pre-install check (similar to how the Leia plug-in's installer requires its vendor SDK platform installer to be run first, separately).
+If it doesn't, the user installs your vendor platform software separately — **before or after** your plug-in, in either order. Do not make it an installer prerequisite: your plug-in must load without it (resolve its DLLs lazily, e.g. `/DELAYLOAD` + a delay-load hook that finds them by full path from the platform's own registry entry) and decline cleanly until it is present.
 
 ### Eye-tracking mode
 

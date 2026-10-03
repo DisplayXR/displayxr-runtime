@@ -112,8 +112,7 @@ kebab-case ASCII. Example layout:
 ```
 HKLM\Software\DisplayXR\DisplayProcessors
 ├── sim-display           (ProbeOrder=200, ships in runtime installer)
-├── leia-sr               (ProbeOrder=50,  ships in DisplayXR-LeiaSR-Setup)
-└── future-vendor-name    (ProbeOrder=50,  ships in its own installer)
+└── <vendor-id>           (ProbeOrder=50,  ships in the vendor's own plug-in installer)
 ```
 
 **Subkey values:**
@@ -124,7 +123,7 @@ HKLM\Software\DisplayXR\DisplayProcessors
 | `DisplayName`     | `REG_SZ`    | yes      | Human-readable name; logged at probe attempt and at successful negotiate.                                                                |
 | `Vendor`          | `REG_SZ`    | no       | Publisher name (e.g. `"Leia Inc."`). Logged at probe attempt.                                                                            |
 | `Version`         | `REG_SZ`    | no       | Free-form vendor version string. Logged at successful negotiate.                                                                         |
-| `UninstallString` | `REG_SZ`    | see §5   | Required for vendor plug-ins shipped by their own installer (powers the runtime's cascade-uninstall). Sim-display omits this — see §5.  |
+| `UninstallString` | `REG_SZ`    | no       | Optional, informational (mirrors the plug-in's Add/Remove Programs entry). The runtime never executes it — see §5.                       |
 | `ProbeOrder`      | `REG_DWORD` | no       | Lower runs first. Missing defaults to 100. Vendors should use 50; sim-display uses 200 so it's always the fallback.                      |
 
 **ProbeOrder convention:**
@@ -136,30 +135,37 @@ HKLM\Software\DisplayXR\DisplayProcessors
 | `100` | Default when `ProbeOrder` is missing. Use only if you genuinely don't care.          |
 | `200` | The sim-display fallback. No real-hardware plug-in should use this or higher.        |
 
-**Sample install (PowerShell):**
+**Sample install (PowerShell)** — `acme-panel` is a placeholder vendor id.
+Vendor plug-ins install into a **sibling** of the runtime directory,
+`C:\Program Files\DisplayXR\Plugins\<Vendor>\`, never inside
+`C:\Program Files\DisplayXR\Runtime\`:
 
 ```powershell
-$key = "HKLM:\Software\DisplayXR\DisplayProcessors\leia-sr"
-New-Item -Path $key -Force | Out-Null
-New-ItemProperty -Path $key -Name "Binary"          -Value "C:\Program Files\LeiaSR\Plugin\DisplayXR-LeiaSR.dll" -PropertyType String -Force
-New-ItemProperty -Path $key -Name "DisplayName"     -Value "DisplayXR Leia SR"     -PropertyType String -Force
-New-ItemProperty -Path $key -Name "Vendor"          -Value "Leia Inc."             -PropertyType String -Force
-New-ItemProperty -Path $key -Name "Version"         -Value "1.35.0.2011"           -PropertyType String -Force
-New-ItemProperty -Path $key -Name "UninstallString" -Value "`"C:\Program Files\LeiaSR\Plugin\Uninstall.exe`"" -PropertyType String -Force
-New-ItemProperty -Path $key -Name "ProbeOrder"      -Value 50                      -PropertyType DWord  -Force
+$dir = "C:\Program Files\DisplayXR\Plugins\Acme"
+$key = "HKLM:\Software\DisplayXR\DisplayProcessors\acme-panel"
+New-Item -Path $key -Force | Out-Null   # also creates DisplayProcessors if no runtime is installed yet
+New-ItemProperty -Path $key -Name "Binary"          -Value "$dir\DisplayXR-Acme.dll"  -PropertyType String -Force
+New-ItemProperty -Path $key -Name "DisplayName"     -Value "DisplayXR Acme Panel"     -PropertyType String -Force
+New-ItemProperty -Path $key -Name "Vendor"          -Value "Acme Displays"            -PropertyType String -Force
+New-ItemProperty -Path $key -Name "Version"         -Value "1.0.0"                    -PropertyType String -Force
+New-ItemProperty -Path $key -Name "UninstallString" -Value "`"$dir\Uninstall.exe`""   -PropertyType String -Force
+New-ItemProperty -Path $key -Name "ProbeOrder"      -Value 50                         -PropertyType DWord  -Force
 ```
 
-**Sample install (NSIS):**
+**Sample install (NSIS)** (`InstallDir "$PROGRAMFILES64\DisplayXR\Plugins\Acme"`):
 
 ```nsi
 SetRegView 64
-WriteRegStr   HKLM "Software\DisplayXR\DisplayProcessors\leia-sr" "Binary"          "$INSTDIR\DisplayXR-LeiaSR.dll"
-WriteRegStr   HKLM "Software\DisplayXR\DisplayProcessors\leia-sr" "DisplayName"     "DisplayXR Leia SR"
-WriteRegStr   HKLM "Software\DisplayXR\DisplayProcessors\leia-sr" "Vendor"          "Leia Inc."
-WriteRegStr   HKLM "Software\DisplayXR\DisplayProcessors\leia-sr" "Version"         "${VERSION}"
-WriteRegStr   HKLM "Software\DisplayXR\DisplayProcessors\leia-sr" "UninstallString" "$\"$INSTDIR\Uninstall.exe$\""
-WriteRegDWORD HKLM "Software\DisplayXR\DisplayProcessors\leia-sr" "ProbeOrder"      50
+WriteRegStr   HKLM "Software\DisplayXR\DisplayProcessors\acme-panel" "Binary"          "$INSTDIR\DisplayXR-Acme.dll"
+WriteRegStr   HKLM "Software\DisplayXR\DisplayProcessors\acme-panel" "DisplayName"     "DisplayXR Acme Panel"
+WriteRegStr   HKLM "Software\DisplayXR\DisplayProcessors\acme-panel" "Vendor"          "Acme Displays"
+WriteRegStr   HKLM "Software\DisplayXR\DisplayProcessors\acme-panel" "Version"         "${VERSION}"
+WriteRegStr   HKLM "Software\DisplayXR\DisplayProcessors\acme-panel" "UninstallString" "$\"$INSTDIR\Uninstall.exe$\""
+WriteRegDWORD HKLM "Software\DisplayXR\DisplayProcessors\acme-panel" "ProbeOrder"      50
 ```
+
+The registration may be written before the runtime is installed; the
+runtime adopts it when present (§5).
 
 The runtime installer's reference implementation (sim-display, no
 `UninstallString`) lives in
@@ -296,7 +302,7 @@ Fields mirror the Windows registry schema:
 | `plugin.version`      | `Version`          | no       | Free-form version string.                                                             |
 | `plugin.binary_path`  | `Binary`           | yes      | Absolute path to the `.so` / `.dylib`. Spaces allowed.                                |
 | `plugin.probe_order`  | `ProbeOrder`       | no       | Default 100. Sim-display=200, vendors=50.                                             |
-| `plugin.uninstall_command` | `UninstallString` | see §5 | Command-line invocation for cascade-uninstall. Required for vendor plug-ins.          |
+| `plugin.uninstall_command` | `UninstallString` | no     | Informational only; the runtime never runs it (§5).                                   |
 
 Discovery roots are searched in priority order — the per-user root
 above first, then the packaged system roots below. Per-user entries with
@@ -390,9 +396,9 @@ app does not bundle. The runtime package is derived from the same
   metadata convention on `<service>`/`<receiver>` tags in
   `AndroidManifest.xml`. Open question for when a second Android
   vendor materializes.
-- Cascade-uninstall (§5): each plug-in `.so` shipped in the runtime
+- Separate uninstall (§5): each plug-in `.so` shipped in the runtime
   APK is uninstalled by the OS as part of the APK uninstall. Vendor
-  APK plug-ins (v2) will need a separate uninstall hook design.
+  APK plug-ins (v2) are uninstalled by the OS with their own APK.
 
 ### 3.3 `PreferredPlugin` override (POSIX)
 
@@ -447,45 +453,71 @@ tree; the entry-point TU is short (~150 lines).
 
 ---
 
-## 5. Cascade-uninstall
+## 5. Registration lifetime (no cascade-uninstall)
 
-The runtime installer enumerates `HKLM\Software\DisplayXR\DisplayProcessors\*`
-on uninstall and runs each subkey's `UninstallString /S` before
-touching the runtime's own files. This lets vendor plug-in installers
-clean up their files + registry entries while their dependency on
-`DisplayXRClient.dll` is still on disk.
+A registration under `HKLM\Software\DisplayXR\DisplayProcessors\<id>` is
+owned by the installer that wrote it, for its whole lifetime. Nothing may
+depend on the order in which the runtime and a plug-in are installed or
+uninstalled (epic #1803).
 
-**Two-pass design** (see
-`installer/DisplayXRInstaller.nsi` for the implementation):
+**The runtime never removes a vendor registration.** Its uninstaller
+(`installer/DisplayXRInstaller.nsi`, Section "Uninstall"):
 
-1. **Collect pass:** enumerate subkeys, read `UninstallString`, append
-   non-empty values to a pipe-delimited buffer. Done up-front because
-   each chained uninstaller deletes its own subkey, which would shift
-   `EnumRegKey` indices if iterated in-place.
-2. **Run pass:** walk the pipe-delimited list, `nsExec::ExecToLog
-   '"$R7" /S'` for each entry.
+1. deletes only its own `sim-display` subkey;
+2. deletes the root `PreferredPlugin` value only when it names
+   `sim-display` or a plug-in that is no longer registered (a pin to a
+   still-registered vendor plug-in is the user's choice and survives);
+3. deletes the `DisplayProcessors` key itself only if it is then empty
+   (`DeleteRegKey /ifempty`);
+4. never runs a plug-in's `UninstallString`, never deletes files outside
+   its own install directory, and removes the shared
+   `C:\Program Files\DisplayXR` parent only non-recursively, so vendor
+   plug-in directories (`C:\Program Files\DisplayXR\Plugins\<Vendor>`)
+   survive.
 
-After the cascade, the runtime uninstaller `DeleteRegKey
-HKLM\Software\DisplayXR\DisplayProcessors` to drop sim-display's subkey
-(no `UninstallString`, runtime owns its lifecycle) plus any orphans
-whose vendor uninstallers failed.
+Vendor plug-ins are separate products with their own Add/Remove Programs
+entries; the runtime uninstaller says so in its log. (Earlier runtimes
+ran every registered `UninstallString /S` and then deleted the whole key.
+A plug-in whose uninstaller failed was left installed, with its files and
+Add/Remove Programs entry, but **unregistered** — invisible to the
+runtime, and version-skipped by a later bundle. That cascade is gone.)
 
-**Vendor uninstaller contract:**
+**A plug-in may be installed before the runtime.** Its subkey can
+pre-exist the runtime, and the runtime installer adopts it: install,
+repair and upgrade write only the `sim-display` subkey and never rewrite
+or delete another one. A runtime uninstall followed by a reinstall
+therefore picks a vendor plug-in up again without reinstalling it.
 
-- Honor `/S` (silent mode). The runtime invokes you silently; a
-  GUI-only uninstaller blocks the runtime's uninstall flow.
-- Delete your own `<id>` subkey under
-  `HKLM\Software\DisplayXR\DisplayProcessors`. The runtime drops the
-  parent key after the cascade, but the runtime might be uninstalled
-  AFTER your vendor uninstaller in some flows; clean up after yourself.
-- Delete your plug-in DLL + supporting files.
-- Don't touch the runtime's files — your dependency on
-  `DisplayXRClient.dll` is still load-bearing for other vendor plug-ins
-  registered alongside yours.
+**Vendor installer / uninstaller contract:**
 
-POSIX equivalent: `uninstall_command` is invoked as `sh -c
-"<command>"`. Same contract: silent, idempotent, cleans up your own
-manifest + binary, leaves the runtime alone.
+- Honor `/S` (silent mode) and never show a modal under it (NSIS:
+  `MessageBox ... /SD <default>`).
+- Do not require the runtime. Install your files and write your own
+  `<id>` subkey (64-bit view) whether or not a runtime is present; if you
+  enforce a minimum runtime version, do it only when a runtime is
+  installed.
+- Release your DLL from a running `displayxr-service.exe` with Windows
+  Restart Manager (`RmGetList` / `RmShutdown(RmForceShutdown)` /
+  `RmRestart`), not by killing it; if you start the service yourself,
+  start it through `explorer.exe`, never elevated (an elevated service
+  cannot be reached by normal-integrity apps).
+- On uninstall, delete your own `<id>` subkey and your own files, with or
+  without the runtime present. Don't touch the runtime's files or any
+  other subkey.
+- `UninstallString` is optional and informational; the runtime does not
+  execute it.
+
+Workspace controllers are different: they require the runtime, so the
+runtime uninstaller still cascades into each registered controller's
+`UninstallString` (see
+[workspace-controller-registration.md](workspace-controller-registration.md)),
+but it too deletes the `WorkspaceControllers` key only if it is empty
+afterwards, so a controller whose uninstaller failed keeps its
+registration.
+
+POSIX: `uninstall_command` in a JSON manifest is likewise informational —
+no runtime packaging step runs it. A plug-in package removes its own
+manifest + binary and leaves the runtime alone.
 
 ---
 
@@ -606,4 +638,5 @@ the corresponding POSIX log directory.
   fallback plug-in.
 - [`displayxr-leia-plugin`](https://github.com/DisplayXR/displayxr-leia-plugin) (`src/drv_leia/`) — reference vendor plug-in (ships from its own repo, ADR-019).
 - `installer/DisplayXRInstaller.nsi` — reference installer flow
-  (sim-display registration + cascade uninstall).
+  (sim-display registration; uninstall removes only its own
+  registration — §5).
