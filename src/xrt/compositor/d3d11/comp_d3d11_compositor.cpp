@@ -5902,6 +5902,14 @@ d3d11_sync_zone_mask_to_dp(struct comp_d3d11_compositor *c)
 // on every REALLOCATION so the bridge knows to re-open. Under the split these
 // are allocated at the PANEL extent exactly once, so the generation moves during
 // warmup and never again.
+// #1795 / ADR-044: do the Local2D flattens (over and 2D-under) blend in linear
+// through an `_SRGB` view? Off only under the legacy colour hatch.
+static inline bool
+d3d11_local2d_honest(void)
+{
+	return !u_color_legacy_unorm_encoded();
+}
+
 static bool
 d3d11_ensure_rt_srv_scratch(ID3D11Device *device,
                             ID3D11Texture2D **tex,
@@ -5912,13 +5920,19 @@ d3d11_ensure_rt_srv_scratch(ID3D11Device *device,
                             DXGI_FORMAT fmt,
                             const char *what,
                             HANDLE *share = nullptr,
-                            uint64_t *gen = nullptr)
+                            uint64_t *gen = nullptr,
+                            DXGI_FORMAT rtv_fmt = DXGI_FORMAT_UNKNOWN)
 {
+	// #1795: an RTV in a different member of the family (the `_SRGB` sibling,
+	// so a pass blends in linear and encodes on write) needs a TYPELESS
+	// texture; the SRV stays @p fmt, so every reader sees the same bytes.
+	const bool split_views = rtv_fmt != DXGI_FORMAT_UNKNOWN && rtv_fmt != fmt;
+	const DXGI_FORMAT tex_fmt = split_views ? d3d_dxgi_format_to_typeless_dxgi(fmt) : fmt;
 	bool need_alloc = *tex == nullptr || *rtv == nullptr;
 	if (!need_alloc) {
 		D3D11_TEXTURE2D_DESC cur;
 		(*tex)->GetDesc(&cur);
-		need_alloc = (cur.Width != w || cur.Height != h || cur.Format != fmt);
+		need_alloc = (cur.Width != w || cur.Height != h || cur.Format != tex_fmt);
 	}
 	if (!need_alloc) {
 		return true;
@@ -5944,7 +5958,7 @@ d3d11_ensure_rt_srv_scratch(ID3D11Device *device,
 	td.Height = h;
 	td.MipLevels = 1;
 	td.ArraySize = 1;
-	td.Format = fmt;
+	td.Format = tex_fmt;
 	td.SampleDesc.Count = 1;
 	td.Usage = D3D11_USAGE_DEFAULT;
 	td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
@@ -5975,14 +5989,21 @@ d3d11_ensure_rt_srv_scratch(ID3D11Device *device,
 			(*gen)++;
 		}
 	}
-	hr = device->CreateShaderResourceView(*tex, nullptr, srv);
+	D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+	sd.Format = fmt;
+	sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+	sd.Texture2D.MipLevels = 1;
+	hr = device->CreateShaderResourceView(*tex, &sd, srv);
 	if (FAILED(hr) || *srv == nullptr) {
 		U_LOG_W("%s: RT scratch SRV failed: 0x%08x", what, hr);
 		(*tex)->Release();
 		*tex = nullptr;
 		return false;
 	}
-	hr = device->CreateRenderTargetView(*tex, nullptr, rtv);
+	D3D11_RENDER_TARGET_VIEW_DESC rd = {};
+	rd.Format = split_views ? rtv_fmt : fmt;
+	rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+	hr = device->CreateRenderTargetView(*tex, &rd, rtv);
 	if (FAILED(hr) || *rtv == nullptr) {
 		U_LOG_W("%s: RT scratch RTV failed: 0x%08x", what, hr);
 		(*srv)->Release();
@@ -6591,10 +6612,16 @@ d3d11_flatten_one_local2d_layer(struct comp_d3d11_compositor *c,
 		return;
 	}
 	uint32_t img_idx = layer->data.local_2d.sub.image_index;
-	// sRGB-passthrough: get_srv returns the swapchain's UNORM sibling SRV
-	// (no auto-decode), the same SRV the projection draws sample.
-	ID3D11ShaderResourceView *src_srv =
-	    static_cast<ID3D11ShaderResourceView *>(comp_d3d11_swapchain_get_srv(sc, img_idx));
+	// #1795: the view follows the TARGET. Into an `_SRGB` RTV (the honest
+	// path) sample the layer as its declared format â€” an `_SRGB` source
+	// decodes, a UNORM source is read as the linear values it holds â€” so the
+	// blend is linear and the RTV encodes once. Into a UNORM RTV (legacy
+	// hatch) keep the non-decoding view: bytes pass through as before.
+	D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
+	rtv->GetDesc(&rtv_desc);
+	const bool linear_target = d3d_dxgi_format_is_srgb(rtv_desc.Format);
+	ID3D11ShaderResourceView *src_srv = static_cast<ID3D11ShaderResourceView *>(
+	    linear_target ? comp_d3d11_swapchain_get_compose_srv(sc, img_idx) : comp_d3d11_swapchain_get_srv(sc, img_idx));
 	if (src_srv == nullptr) {
 		return; // swapchain not SAMPLED — nothing to flatten
 	}
@@ -6941,10 +6968,13 @@ d3d11_flatten_backdrop_2d(struct comp_d3d11_compositor *c, uint32_t dst_w, uint3
 	const bool split = c->split_active;
 	const uint32_t alloc_w = split ? c->split_panel_w : region_w;
 	const uint32_t alloc_h = split ? c->split_panel_h : region_h;
+	// #1795: same contract as the over-flatten â€” `_SRGB` RTV, encoded bytes.
 	if (!d3d11_ensure_rt_srv_scratch(c->device, &c->backdrop_scratch, &c->backdrop_scratch_srv,
 	                                 &c->backdrop_scratch_rtv, alloc_w, alloc_h, DXGI_FORMAT_R8G8B8A8_UNORM,
 	                                 "backdrop scratch", split ? &c->backdrop_scratch_share : nullptr,
-	                                 split ? &c->backdrop_scratch_gen : nullptr)) {
+	                                 split ? &c->backdrop_scratch_gen : nullptr,
+	                                 d3d11_local2d_honest() ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+	                                                        : DXGI_FORMAT_UNKNOWN)) {
 		return nullptr;
 	}
 
@@ -7245,11 +7275,17 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 			 */
 			const uint32_t alloc_w = c->split_active ? c->split_panel_w : region_w;
 			const uint32_t alloc_h = c->split_active ? c->split_panel_h : region_h;
+			// #1795: the flatten writes through the `_SRGB` sibling, so the
+			// Local2D layers blend in linear and are encoded once on write;
+			// the scratch still holds ENCODED bytes for every reader (weave
+			// snapshot lerp, bridge plane). The legacy hatch keeps UNORM.
+			const DXGI_FORMAT l2d_rtv_fmt =
+			    d3d11_local2d_honest() ? d3d_dxgi_format_srgb_rtv(unorm_fmt) : DXGI_FORMAT_UNKNOWN;
 			if (!d3d11_ensure_rt_srv_scratch(c->device, &c->local2d_scratch, &c->local2d_scratch_srv,
 			                                 &c->local2d_scratch_rtv, alloc_w, alloc_h, unorm_fmt,
 			                                 "local2d scratch",
 			                                 c->split_active ? &c->local2d_scratch_share : nullptr,
-			                                 c->split_active ? &c->local2d_scratch_gen : nullptr)) {
+			                                 c->split_active ? &c->local2d_scratch_gen : nullptr, l2d_rtv_fmt)) {
 				c->repaint.composite_bail = 4;
 				return false;
 			}
