@@ -75,6 +75,14 @@ struct vk_local2d_composite
 	VkPipeline flatten_premul_pipe;   //!< One / OneMinusSrcAlpha.
 	VkPipeline flatten_unpremul_pipe; //!< SrcAlpha / OneMinusSrcAlpha.
 
+	//! #1795 / ADR-044 §7 — OPTIONAL linear-light flatten (see
+	//! vk_local2d_composite_init_srgb_flatten). VK_NULL_HANDLE until a caller
+	//! opts in; the scratch_fmt flatten above is untouched either way.
+	VkFormat flatten_srgb_fmt;
+	VkRenderPass flatten_srgb_rp;          //!< flatten_srgb_fmt, LOAD_OP_LOAD.
+	VkPipeline flatten_srgb_premul_pipe;   //!< One / OneMinusSrcAlpha.
+	VkPipeline flatten_srgb_unpremul_pipe; //!< SrcAlpha / OneMinusSrcAlpha.
+
 	VkDescriptorPool desc_pool; //!< Reset each frame by begin_frame.
 
 	bool initialized;
@@ -95,6 +103,23 @@ vk_local2d_composite_init(struct vk_local2d_composite *lc,
                           struct vk_bundle *vk,
                           VkFormat target_fmt,
                           VkFormat scratch_fmt);
+
+/*!
+ * #1795 / ADR-044 §7 — opt in to a second flatten render pass + pipeline pair
+ * whose attachment format is the `_SRGB` sibling @p srgb_fmt of the scratch.
+ *
+ * Drawn through vk_local2d_composite_flatten_draw_srgb into an `_SRGB` view of
+ * a MUTABLE scratch, the blend runs in linear light and the attachment encodes
+ * once on write — the encode is a property of the render target, never shader
+ * arithmetic. The scratch's UNORM view still reads ENCODED bytes, so every
+ * downstream reader is unchanged. Callers that never call this keep exactly
+ * the scratch_fmt flatten they had. Call after vk_local2d_composite_init.
+ *
+ * @return true when the `_SRGB` flatten is usable.
+ * @ingroup aux_vk
+ */
+bool
+vk_local2d_composite_init_srgb_flatten(struct vk_local2d_composite *lc, struct vk_bundle *vk, VkFormat srgb_fmt);
 
 /*!
  * Reset the per-frame descriptor pool. Call once before the frame's flatten /
@@ -205,6 +230,32 @@ vk_local2d_composite_flatten_draw(struct vk_local2d_composite *lc,
                                   float src_w,
                                   float src_h,
                                   bool unpremultiplied);
+
+/*!
+ * #1795 — vk_local2d_composite_flatten_draw into an `_SRGB` attachment: same
+ * contract, but @p scratch_fb must be built over `flatten_srgb_rp` with an
+ * `_SRGB` view, and @p src_view should be the layer's FORMAT-HONEST view (an
+ * `_SRGB` source decodes on sample, a UNORM source is read as the linear values
+ * it holds). No-op unless vk_local2d_composite_init_srgb_flatten succeeded.
+ * @ingroup aux_vk
+ */
+void
+vk_local2d_composite_flatten_draw_srgb(struct vk_local2d_composite *lc,
+                                       struct vk_bundle *vk,
+                                       VkCommandBuffer cmd,
+                                       VkFramebuffer scratch_fb,
+                                       uint32_t fb_w,
+                                       uint32_t fb_h,
+                                       VkImageView src_view,
+                                       int32_t dst_x,
+                                       int32_t dst_y,
+                                       uint32_t dst_w,
+                                       uint32_t dst_h,
+                                       float src_x,
+                                       float src_y,
+                                       float src_w,
+                                       float src_h,
+                                       bool unpremultiplied);
 
 /*!
  * Masked composite into the target. Samples @p twod_view / @p mask_view /

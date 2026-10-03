@@ -1134,6 +1134,8 @@ struct comp_vk_native_compositor
 	//! B8G8R8A8_UNORM for both the target and the scratch — see the init).
 	struct vk_local2d_composite local2d;
 	bool local2d_initialized;
+	//! #1795 — local2d's `_SRGB` (B8G8R8A8_SRGB) flatten pipelines exist.
+	bool local2d_srgb_flatten_ready;
 
 	//! twod flatten scratch (B8G8R8A8_UNORM, COLOR_ATTACHMENT|SAMPLED). The
 	//! frame's OVER Local2D layers (after the projection in list order) are
@@ -1144,6 +1146,12 @@ struct comp_vk_native_compositor
 	VkImageView local2d_scratch_view;
 	VkFramebuffer local2d_scratch_fb;
 	uint32_t local2d_scratch_w, local2d_scratch_h;
+	//! #1795 / ADR-044 §7 — the flatten's `_SRGB` view of local2d_scratch
+	//! (MUTABLE, {UNORM,_SRGB}). Non-NULL ⟺ local2d_scratch_fb is built over it
+	//! and local2d.flatten_srgb_rp, so the layers blend in linear light and the
+	//! attachment encodes once; local2d_scratch_view (UNORM) still reads the
+	//! ENCODED bytes every downstream reader expects. NULL = legacy hatch.
+	VkImageView local2d_scratch_srgb_view;
 
 	//! #491 part 3 — 2D-under backdrop scratch (same fmt/usage as
 	//! local2d_scratch). The frame's UNDER Local2D layers (before the projection
@@ -1156,6 +1164,8 @@ struct comp_vk_native_compositor
 	VkImageView backdrop_scratch_view;
 	VkFramebuffer backdrop_scratch_fb;
 	uint32_t backdrop_scratch_w, backdrop_scratch_h;
+	//! #1795 — same contract as local2d_scratch_srgb_view.
+	VkImageView backdrop_scratch_srgb_view;
 
 	//! Weave snapshot scratch (target format, TRANSFER_DST|SAMPLED). The DP
 	//! wrote the woven 3D into the target (RT≠SRV), so the lerp reads this
@@ -10396,6 +10406,17 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	                                                   VK_FORMAT_B8G8R8A8_UNORM);
 	if (!c->local2d_initialized) {
 		U_LOG_W("VK Local2D composite init failed — 2D-over-3D masking disabled this session");
+	} else if (!u_color_legacy_unorm_encoded()) {
+		// #1795 / ADR-044 §7 — the Local2D flattens blend in linear light:
+		// a second flatten pipeline pair whose attachment is the scratch's
+		// `_SRGB` sibling. The scratch's own format (and every reader of it)
+		// is unchanged. The legacy hatch never creates it.
+		c->local2d_srgb_flatten_ready =
+		    vk_local2d_composite_init_srgb_flatten(&c->local2d, &c->vk, VK_FORMAT_B8G8R8A8_SRGB);
+		if (!c->local2d_srgb_flatten_ready) {
+			U_LOG_W(
+			    "VK Local2D: _SRGB flatten unavailable — Local2D layers flatten byte-passthrough (#1795)");
+		}
 	}
 
 	// Populate supported swapchain formats (Vulkan formats)
@@ -12548,6 +12569,149 @@ vk_destroy_rt(struct comp_vk_native_compositor *c,
 	}
 }
 
+//! #1795 — vk_destroy_rt plus the flatten scratch's `_SRGB` view, in
+//! dependency order (framebuffer, then views, then the image).
+static void
+vk_destroy_flatten_rt(struct comp_vk_native_compositor *c,
+                      VkImage *img,
+                      VkDeviceMemory *mem,
+                      VkImageView *view,
+                      VkImageView *srgb_view,
+                      VkFramebuffer *fb)
+{
+	struct vk_bundle *vk = &c->vk;
+	if (fb != NULL && *fb != VK_NULL_HANDLE) {
+		vk->vkDestroyFramebuffer(vk->device, *fb, NULL);
+		*fb = VK_NULL_HANDLE;
+	}
+	if (*srgb_view != VK_NULL_HANDLE) {
+		vk->vkDestroyImageView(vk->device, *srgb_view, NULL);
+		*srgb_view = VK_NULL_HANDLE;
+	}
+	vk_destroy_rt(c, img, mem, view, fb);
+}
+
+/*!
+ * #1795 / ADR-044 §7 — create/reuse a Local2D FLATTEN scratch (B8G8R8A8).
+ *
+ * Honest path (local2d_srgb_flatten_ready, i.e. not the legacy hatch): the image
+ * is B8G8R8A8_UNORM + MUTABLE_FORMAT with a {UNORM, _SRGB} format list — the
+ * shape of the renderer's private compose target (#1799). @p view is its UNORM
+ * view, so every reader (the masked composite, the DP backdrop, the #73 dumps)
+ * still sees ENCODED bytes; @p srgb_view is the `_SRGB` view the flatten
+ * renders through, and @p fb is built over it and local2d.flatten_srgb_rp. The
+ * attachment does the encode — no blit, no shader arithmetic.
+ *
+ * Legacy hatch (or if the mutable image cannot be made): exactly the old
+ * vk_ensure_rt scratch, UNORM fb over local2d.flatten_rp, @p srgb_view NULL.
+ * The caller reads `*srgb_view != VK_NULL_HANDLE` as "this target is _SRGB".
+ */
+static bool
+vk_ensure_flatten_rt(struct comp_vk_native_compositor *c,
+                     VkImage *img,
+                     VkDeviceMemory *mem,
+                     VkImageView *view,
+                     VkImageView *srgb_view,
+                     VkFramebuffer *fb,
+                     uint32_t *cw,
+                     uint32_t *ch,
+                     uint32_t w,
+                     uint32_t h,
+                     VkImageUsageFlags usage,
+                     const char *what)
+{
+	struct vk_bundle *vk = &c->vk;
+	const bool honest = c->local2d_srgb_flatten_ready;
+
+	if (*img != VK_NULL_HANDLE && *cw == w && *ch == h && (*srgb_view != VK_NULL_HANDLE) == honest) {
+		return true;
+	}
+	// Any reallocation (dims, or the target kind flipping) starts from nothing:
+	// a same-dims UNORM image left behind would let vk_ensure_rt early-out
+	// with no fb.
+	vk_destroy_flatten_rt(c, img, mem, view, srgb_view, fb);
+	*cw = 0;
+	*ch = 0;
+
+	if (honest) {
+		VkFormat list[2] = {VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_SRGB};
+		VkImageFormatListCreateInfo fmt_list = {
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
+		    .viewFormatCount = 2,
+		    .pViewFormats = list,
+		};
+		VkImageCreateInfo ici = {
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+		    .pNext = &fmt_list,
+		    .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
+		    .imageType = VK_IMAGE_TYPE_2D,
+		    .format = VK_FORMAT_B8G8R8A8_UNORM,
+		    .extent = {w, h, 1},
+		    .mipLevels = 1,
+		    .arrayLayers = 1,
+		    .samples = VK_SAMPLE_COUNT_1_BIT,
+		    .tiling = VK_IMAGE_TILING_OPTIMAL,
+		    .usage = usage,
+		    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+		    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+		};
+		bool ok = vk->vkCreateImage(vk->device, &ici, NULL, img) == VK_SUCCESS;
+		if (!ok) {
+			*img = VK_NULL_HANDLE;
+		} else {
+			VkMemoryRequirements mr;
+			vk->vkGetImageMemoryRequirements(vk->device, *img, &mr);
+			uint32_t type_id = 0;
+			ok = vk_get_memory_type(vk, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &type_id);
+			if (ok) {
+				VkMemoryAllocateInfo mai = {
+				    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+				    .allocationSize = mr.size,
+				    .memoryTypeIndex = type_id,
+				};
+				ok = vk->vkAllocateMemory(vk->device, &mai, NULL, mem) == VK_SUCCESS;
+				if (!ok) {
+					*mem = VK_NULL_HANDLE;
+				}
+				ok = ok && vk->vkBindImageMemory(vk->device, *img, *mem, 0) == VK_SUCCESS;
+			}
+		}
+		ok = ok && vk_create_view(vk, *img, VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_B8G8R8A8_UNORM, k_color_sub,
+		                          view) == VK_SUCCESS;
+		ok = ok && vk_create_view(vk, *img, VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_B8G8R8A8_SRGB, k_color_sub,
+		                          srgb_view) == VK_SUCCESS;
+		if (ok && fb != NULL) {
+			VkFramebufferCreateInfo fb_ci = {
+			    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+			    .renderPass = c->local2d.flatten_srgb_rp,
+			    .attachmentCount = 1,
+			    .pAttachments = srgb_view,
+			    .width = w,
+			    .height = h,
+			    .layers = 1,
+			};
+			ok = vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, fb) == VK_SUCCESS;
+		}
+		if (ok) {
+			*cw = w;
+			*ch = h;
+			return true;
+		}
+
+		// Fall back to the legacy scratch for the rest of the session rather
+		// than lose the 2D: the flatten pipelines are fine, the image is not.
+		U_LOG_W(
+		    "[local2d] %s: MUTABLE {UNORM,_SRGB} %ux%u scratch failed — Local2D flattens "
+		    "byte-passthrough from here (#1795)",
+		    what, w, h);
+		vk_destroy_flatten_rt(c, img, mem, view, srgb_view, fb);
+		c->local2d_srgb_flatten_ready = false;
+	}
+
+	return vk_ensure_rt(c, img, mem, view, fb, cw, ch, w, h, VK_FORMAT_B8G8R8A8_UNORM, usage, c->local2d.flatten_rp,
+	                    what);
+}
+
 #ifdef XRT_OS_WINDOWS
 /*!
  * VK-1b (#1178) — (re)build the flatten framebuffer over a bridge PLANE's image.
@@ -12665,10 +12829,20 @@ vk_local2d_begin_frame_once(struct comp_vk_native_compositor *c)
 // region. Shared by the pre-weave backdrop flatten (#491 part 3, under-layers)
 // and the post-weave overlay flatten (#439 Phase 3, over-layers) so the source
 // geometry / flip / unpremult handling stays identical between the two.
+//
+// #1795 / ADR-044 §7: @p srgb_target says @p target_fb is an `_SRGB` view built
+// over local2d.flatten_srgb_rp (vk_ensure_flatten_rt's honest scratch). The
+// SOURCE VIEW FOLLOWS THE TARGET, as on D3D11 (9d8b073d5): into an `_SRGB`
+// attachment sample the layer as its declared format — an `_SRGB` swapchain
+// decodes on sample, a UNORM one is read as the linear values it holds — so
+// the blend is linear and the attachment encodes once. Into a UNORM attachment
+// (legacy hatch, or a bridge plane) keep the non-decoding view: bytes pass
+// through exactly as before.
 static void
 vk_flatten_one_local2d_layer(struct comp_vk_native_compositor *c,
                              VkCommandBuffer cmd,
                              VkFramebuffer target_fb,
+                             bool srgb_target,
                              struct comp_layer *layer,
                              uint32_t region_w,
                              uint32_t region_h)
@@ -12679,10 +12853,9 @@ vk_flatten_one_local2d_layer(struct comp_vk_native_compositor *c,
 		return;
 	}
 	uint32_t img_idx = layer->data.local_2d.sub.image_index;
-	// sRGB-passthrough: sample the layer's own view (the projection path
-	// samples the same). UNORM-sibling decode is a follow-up if a layer
-	// ever uses an _SRGB swapchain.
-	VkImageView src_view = (VkImageView)(uintptr_t)comp_vk_native_swapchain_get_image_view(sc, img_idx);
+	VkImageView src_view =
+	    (VkImageView)(uintptr_t)(srgb_target ? comp_vk_native_swapchain_get_true_image_view(sc, img_idx)
+	                                         : comp_vk_native_swapchain_get_image_view(sc, img_idx));
 	if (src_view == VK_NULL_HANDLE) {
 		return;
 	}
@@ -12723,9 +12896,15 @@ vk_flatten_one_local2d_layer(struct comp_vk_native_compositor *c,
 	}
 	bool unpremult = (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0;
 
-	vk_local2d_composite_flatten_draw(&c->local2d, vk, cmd, target_fb, region_w, region_h, src_view, x0, y0,
-	                                  (uint32_t)(x1 - x0), (uint32_t)(y1 - y0), src_x, src_y, src_w, src_h,
-	                                  unpremult);
+	if (srgb_target) {
+		vk_local2d_composite_flatten_draw_srgb(&c->local2d, vk, cmd, target_fb, region_w, region_h, src_view,
+		                                       x0, y0, (uint32_t)(x1 - x0), (uint32_t)(y1 - y0), src_x, src_y,
+		                                       src_w, src_h, unpremult);
+	} else {
+		vk_local2d_composite_flatten_draw(&c->local2d, vk, cmd, target_fb, region_w, region_h, src_view, x0, y0,
+		                                  (uint32_t)(x1 - x0), (uint32_t)(y1 - y0), src_x, src_y, src_w, src_h,
+		                                  unpremult);
+	}
 }
 
 // #491 part 3 — flatten the frame's 2D-UNDER Local2D layers (those BEFORE the
@@ -12786,8 +12965,6 @@ vk_flatten_backdrop_2d(struct comp_vk_native_compositor *c,
 		return VK_NULL_HANDLE;
 	}
 
-	const VkFormat scratch_fmt = VK_FORMAT_B8G8R8A8_UNORM;
-
 	/*
 	 * VK-1b (#1178) — WHERE THIS FLATTENS.
 	 *
@@ -12804,6 +12981,9 @@ vk_flatten_backdrop_2d(struct comp_vk_native_compositor *c,
 	VkImage bd_image;
 	VkFramebuffer bd_fb;
 	VkImageView bd_view;
+	// #1795: only the private scratch can be `_SRGB`-viewed; the bridge plane is
+	// a typed-UNORM D3D11 texture, so it keeps the byte-passthrough flatten.
+	bool bd_srgb = false;
 #ifdef XRT_OS_WINDOWS
 	if (plane != NULL) {
 		bd_image = (VkImage)(uintptr_t)plane->image;
@@ -12816,17 +12996,20 @@ vk_flatten_backdrop_2d(struct comp_vk_native_compositor *c,
 	} else
 #endif
 	{
-		if (!vk_ensure_rt(c, &c->backdrop_scratch, &c->backdrop_scratch_mem, &c->backdrop_scratch_view,
-		                  &c->backdrop_scratch_fb, &c->backdrop_scratch_w, &c->backdrop_scratch_h, region_w,
-		                  region_h, scratch_fmt,
-		                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-		                      VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-		                  c->local2d.flatten_rp, "backdrop scratch")) {
+		// #1795: same contract as the over-flatten — `_SRGB` attachment,
+		// encoded bytes through backdrop_scratch_view for the DP.
+		if (!vk_ensure_flatten_rt(c, &c->backdrop_scratch, &c->backdrop_scratch_mem, &c->backdrop_scratch_view,
+		                          &c->backdrop_scratch_srgb_view, &c->backdrop_scratch_fb,
+		                          &c->backdrop_scratch_w, &c->backdrop_scratch_h, region_w, region_h,
+		                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+		                              VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+		                          "backdrop scratch")) {
 			return VK_NULL_HANDLE;
 		}
 		bd_image = c->backdrop_scratch;
 		bd_view = c->backdrop_scratch_view;
 		bd_fb = c->backdrop_scratch_fb;
+		bd_srgb = c->backdrop_scratch_srgb_view != VK_NULL_HANDLE;
 	}
 
 	vk_local2d_begin_frame_once(c);
@@ -12851,7 +13034,7 @@ vk_flatten_backdrop_2d(struct comp_vk_native_compositor *c,
 		if (layer->data.type != XRT_LAYER_LOCAL_2D) {
 			continue;
 		}
-		vk_flatten_one_local2d_layer(c, cmd, bd_fb, layer, region_w, region_h);
+		vk_flatten_one_local2d_layer(c, cmd, bd_fb, bd_srgb, layer, region_w, region_h);
 	}
 
 	vk_cmd_image_barrier_locked(vk, cmd, bd_image, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
@@ -13296,7 +13479,9 @@ vk_split_flatten_local2d(struct comp_vk_native_compositor *c,
 		if (!c->zones_frame && proj_idx >= 0 && (int32_t)i < proj_idx) {
 			continue;
 		}
-		vk_flatten_one_local2d_layer(c, cmd, c->plane_l2d_fb, layer, region_w, region_h);
+		// #1795: the plane is a typed-UNORM D3D11 texture (no `_SRGB` view),
+		// so the split keeps the byte-passthrough flatten.
+		vk_flatten_one_local2d_layer(c, cmd, c->plane_l2d_fb, false, layer, region_w, region_h);
 	}
 
 	vk_cmd_image_barrier_locked(vk, cmd, img, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
@@ -13826,12 +14011,16 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 	}
 
 	// Resolve the `twod` source: flatten the Local2D layers into local2d_scratch.
-	if (!vk_ensure_rt(c, &c->local2d_scratch, &c->local2d_scratch_mem, &c->local2d_scratch_view,
-	                  &c->local2d_scratch_fb, &c->local2d_scratch_w, &c->local2d_scratch_h, region_w,
-	                  region_h, scratch_fmt,
-	                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-	                      VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-	                  c->local2d.flatten_rp, "local2d scratch")) {
+	// #1795 / ADR-044 §7: the flatten writes through the scratch's `_SRGB`
+	// view, so the layers blend in linear light and are encoded once on write;
+	// local2d_scratch_view (UNORM) still holds ENCODED bytes for the lerp
+	// against the raw weave snapshot. The legacy hatch keeps the UNORM scratch.
+	if (!vk_ensure_flatten_rt(c, &c->local2d_scratch, &c->local2d_scratch_mem, &c->local2d_scratch_view,
+	                          &c->local2d_scratch_srgb_view, &c->local2d_scratch_fb, &c->local2d_scratch_w,
+	                          &c->local2d_scratch_h, region_w, region_h,
+	                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+	                              VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+	                          "local2d scratch")) {
 		return false;
 	}
 	// Weave snapshot scratch (the lerp reads a copy; dst is RT≠SRV).
@@ -13887,7 +14076,9 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 			if (!zones_frame && proj_idx >= 0 && (int32_t)i < proj_idx) {
 				continue;
 			}
-			vk_flatten_one_local2d_layer(c, cmd, c->local2d_scratch_fb, layer, region_w, region_h);
+			vk_flatten_one_local2d_layer(c, cmd, c->local2d_scratch_fb,
+			                             c->local2d_scratch_srgb_view != VK_NULL_HANDLE, layer, region_w,
+			                             region_h);
 		}
 		vk_cmd_image_barrier_locked(vk, cmd, c->local2d_scratch, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 		                            VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -14448,10 +14639,10 @@ vk_release_local2d_state(struct comp_vk_native_compositor *c)
 		c->composite_target_fb = VK_NULL_HANDLE;
 		c->composite_target_fb_view = VK_NULL_HANDLE;
 	}
-	vk_destroy_rt(c, &c->local2d_scratch, &c->local2d_scratch_mem, &c->local2d_scratch_view,
-	              &c->local2d_scratch_fb);
-	vk_destroy_rt(c, &c->backdrop_scratch, &c->backdrop_scratch_mem, &c->backdrop_scratch_view,
-	              &c->backdrop_scratch_fb);
+	vk_destroy_flatten_rt(c, &c->local2d_scratch, &c->local2d_scratch_mem, &c->local2d_scratch_view,
+	                      &c->local2d_scratch_srgb_view, &c->local2d_scratch_fb);
+	vk_destroy_flatten_rt(c, &c->backdrop_scratch, &c->backdrop_scratch_mem, &c->backdrop_scratch_view,
+	                      &c->backdrop_scratch_srgb_view, &c->backdrop_scratch_fb);
 	vk_destroy_rt(c, &c->weave_scratch, &c->weave_scratch_mem, &c->weave_scratch_view, NULL);
 	vk_destroy_rt(c, &c->implicit_mask_tex, &c->implicit_mask_mem, &c->implicit_mask_view,
 	              &c->implicit_mask_fb);

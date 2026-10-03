@@ -350,6 +350,56 @@ vk_local2d_composite_init(struct vk_local2d_composite *lc,
 	return true;
 }
 
+bool
+vk_local2d_composite_init_srgb_flatten(struct vk_local2d_composite *lc, struct vk_bundle *vk, VkFormat srgb_fmt)
+{
+	if (!lc->initialized) {
+		return false;
+	}
+	if (lc->flatten_srgb_premul_pipe != VK_NULL_HANDLE && lc->flatten_srgb_fmt == srgb_fmt) {
+		return true;
+	}
+
+	// Same blend states as the scratch_fmt flatten — only the attachment format
+	// (and so the render pass the pipelines are compatible with) differs.
+	VkPipelineColorBlendAttachmentState premul_blend = {
+	    .blendEnable = VK_TRUE,
+	    .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
+	                      VK_COLOR_COMPONENT_A_BIT,
+	    .srcColorBlendFactor = VK_BLEND_FACTOR_ONE,
+	    .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+	    .colorBlendOp = VK_BLEND_OP_ADD,
+	    .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+	    .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+	    .alphaBlendOp = VK_BLEND_OP_ADD,
+	};
+	VkPipelineColorBlendAttachmentState unpremul_blend = premul_blend;
+	unpremul_blend.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+
+	if (make_render_pass(vk, srgb_fmt, VK_ATTACHMENT_LOAD_OP_LOAD, &lc->flatten_srgb_rp) != VK_SUCCESS ||
+	    make_pipeline(vk, lc->vert_mod, lc->flatten_frag_mod, lc->flatten_layout, lc->flatten_srgb_rp,
+	                  &premul_blend, &lc->flatten_srgb_premul_pipe) != VK_SUCCESS ||
+	    make_pipeline(vk, lc->vert_mod, lc->flatten_frag_mod, lc->flatten_layout, lc->flatten_srgb_rp,
+	                  &unpremul_blend, &lc->flatten_srgb_unpremul_pipe) != VK_SUCCESS) {
+		U_LOG_E("[local2d] _SRGB flatten (format %d) creation failed", (int)srgb_fmt);
+		if (lc->flatten_srgb_premul_pipe != VK_NULL_HANDLE) {
+			vk->vkDestroyPipeline(vk->device, lc->flatten_srgb_premul_pipe, NULL);
+			lc->flatten_srgb_premul_pipe = VK_NULL_HANDLE;
+		}
+		if (lc->flatten_srgb_unpremul_pipe != VK_NULL_HANDLE) {
+			vk->vkDestroyPipeline(vk->device, lc->flatten_srgb_unpremul_pipe, NULL);
+			lc->flatten_srgb_unpremul_pipe = VK_NULL_HANDLE;
+		}
+		if (lc->flatten_srgb_rp != VK_NULL_HANDLE) {
+			vk->vkDestroyRenderPass(vk->device, lc->flatten_srgb_rp, NULL);
+			lc->flatten_srgb_rp = VK_NULL_HANDLE;
+		}
+		return false;
+	}
+	lc->flatten_srgb_fmt = srgb_fmt;
+	return true;
+}
+
 void
 vk_local2d_composite_begin_frame(struct vk_local2d_composite *lc, struct vk_bundle *vk)
 {
@@ -663,6 +713,66 @@ vk_local2d_composite_raster_mask_zones(struct vk_local2d_composite *lc,
 	vk->vkCmdEndRenderPass(cmd);
 }
 
+// The flatten draw, parameterised on the render pass + pipeline pair so the
+// scratch_fmt flatten and the #1795 `_SRGB` flatten share one body.
+static void
+flatten_draw_impl(struct vk_local2d_composite *lc,
+                  struct vk_bundle *vk,
+                  VkCommandBuffer cmd,
+                  VkRenderPass rp,
+                  VkPipeline premul_pipe,
+                  VkPipeline unpremul_pipe,
+                  VkFramebuffer scratch_fb,
+                  uint32_t fb_w,
+                  uint32_t fb_h,
+                  VkImageView src_view,
+                  int32_t dst_x,
+                  int32_t dst_y,
+                  uint32_t dst_w,
+                  uint32_t dst_h,
+                  float src_x,
+                  float src_y,
+                  float src_w,
+                  float src_h,
+                  bool unpremultiplied)
+{
+	if (!lc->initialized || rp == VK_NULL_HANDLE || premul_pipe == VK_NULL_HANDLE ||
+	    unpremul_pipe == VK_NULL_HANDLE || scratch_fb == VK_NULL_HANDLE || src_view == VK_NULL_HANDLE ||
+	    dst_w == 0 || dst_h == 0) {
+		return;
+	}
+
+	VkDescriptorSet set = alloc_image_set(lc, vk, lc->flatten_dsl, lc->sampler_linear, &src_view, 1);
+	if (set == VK_NULL_HANDLE) {
+		return;
+	}
+
+	VkRenderPassBeginInfo rp_bi = {
+	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+	    .renderPass = rp,
+	    .framebuffer = scratch_fb,
+	    .renderArea = {{0, 0}, {fb_w, fb_h}},
+	};
+	vk->vkCmdBeginRenderPass(cmd, &rp_bi, VK_SUBPASS_CONTENTS_INLINE);
+
+	// Viewport restricts output to the clipped dest sub-rect; uv [0,1] over it
+	// maps through src_rect into the source layer.
+	VkViewport vp = {(float)dst_x, (float)dst_y, (float)dst_w, (float)dst_h, 0.0f, 1.0f};
+	vk->vkCmdSetViewport(cmd, 0, 1, &vp);
+	VkRect2D scissor = {{dst_x, dst_y}, {dst_w, dst_h}};
+	vk->vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+	vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, unpremultiplied ? unpremul_pipe : premul_pipe);
+	vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, lc->flatten_layout, 0, 1, &set, 0,
+	                            NULL);
+
+	struct flatten_push pc = {.src_rect = {src_x, src_y, src_w, src_h}};
+	vk->vkCmdPushConstants(cmd, lc->flatten_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+
+	vk->vkCmdDraw(cmd, 3, 1, 0, 0);
+	vk->vkCmdEndRenderPass(cmd);
+}
+
 void
 vk_local2d_composite_flatten_draw(struct vk_local2d_composite *lc,
                                   struct vk_bundle *vk,
@@ -681,41 +791,32 @@ vk_local2d_composite_flatten_draw(struct vk_local2d_composite *lc,
                                   float src_h,
                                   bool unpremultiplied)
 {
-	if (!lc->initialized || scratch_fb == VK_NULL_HANDLE || src_view == VK_NULL_HANDLE || dst_w == 0 ||
-	    dst_h == 0) {
-		return;
-	}
+	flatten_draw_impl(lc, vk, cmd, lc->flatten_rp, lc->flatten_premul_pipe, lc->flatten_unpremul_pipe, scratch_fb,
+	                  fb_w, fb_h, src_view, dst_x, dst_y, dst_w, dst_h, src_x, src_y, src_w, src_h,
+	                  unpremultiplied);
+}
 
-	VkDescriptorSet set = alloc_image_set(lc, vk, lc->flatten_dsl, lc->sampler_linear, &src_view, 1);
-	if (set == VK_NULL_HANDLE) {
-		return;
-	}
-
-	VkRenderPassBeginInfo rp_bi = {
-	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-	    .renderPass = lc->flatten_rp,
-	    .framebuffer = scratch_fb,
-	    .renderArea = {{0, 0}, {fb_w, fb_h}},
-	};
-	vk->vkCmdBeginRenderPass(cmd, &rp_bi, VK_SUBPASS_CONTENTS_INLINE);
-
-	// Viewport restricts output to the clipped dest sub-rect; uv [0,1] over it
-	// maps through src_rect into the source layer.
-	VkViewport vp = {(float)dst_x, (float)dst_y, (float)dst_w, (float)dst_h, 0.0f, 1.0f};
-	vk->vkCmdSetViewport(cmd, 0, 1, &vp);
-	VkRect2D scissor = {{dst_x, dst_y}, {dst_w, dst_h}};
-	vk->vkCmdSetScissor(cmd, 0, 1, &scissor);
-
-	vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-	                      unpremultiplied ? lc->flatten_unpremul_pipe : lc->flatten_premul_pipe);
-	vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, lc->flatten_layout, 0, 1, &set, 0,
-	                            NULL);
-
-	struct flatten_push pc = {.src_rect = {src_x, src_y, src_w, src_h}};
-	vk->vkCmdPushConstants(cmd, lc->flatten_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
-
-	vk->vkCmdDraw(cmd, 3, 1, 0, 0);
-	vk->vkCmdEndRenderPass(cmd);
+void
+vk_local2d_composite_flatten_draw_srgb(struct vk_local2d_composite *lc,
+                                       struct vk_bundle *vk,
+                                       VkCommandBuffer cmd,
+                                       VkFramebuffer scratch_fb,
+                                       uint32_t fb_w,
+                                       uint32_t fb_h,
+                                       VkImageView src_view,
+                                       int32_t dst_x,
+                                       int32_t dst_y,
+                                       uint32_t dst_w,
+                                       uint32_t dst_h,
+                                       float src_x,
+                                       float src_y,
+                                       float src_w,
+                                       float src_h,
+                                       bool unpremultiplied)
+{
+	flatten_draw_impl(lc, vk, cmd, lc->flatten_srgb_rp, lc->flatten_srgb_premul_pipe,
+	                  lc->flatten_srgb_unpremul_pipe, scratch_fb, fb_w, fb_h, src_view, dst_x, dst_y, dst_w, dst_h,
+	                  src_x, src_y, src_w, src_h, unpremultiplied);
 }
 
 void
@@ -839,6 +940,8 @@ vk_local2d_composite_fini(struct vk_local2d_composite *lc, struct vk_bundle *vk)
 	DESTROY(vkDestroyPipeline, lc->composite_pipe);
 	DESTROY(vkDestroyPipeline, lc->flatten_premul_pipe);
 	DESTROY(vkDestroyPipeline, lc->flatten_unpremul_pipe);
+	DESTROY(vkDestroyPipeline, lc->flatten_srgb_premul_pipe);
+	DESTROY(vkDestroyPipeline, lc->flatten_srgb_unpremul_pipe);
 	DESTROY(vkDestroyPipelineLayout, lc->composite_layout);
 	DESTROY(vkDestroyPipelineLayout, lc->flatten_layout);
 	DESTROY(vkDestroyDescriptorSetLayout, lc->composite_dsl);
@@ -846,6 +949,7 @@ vk_local2d_composite_fini(struct vk_local2d_composite *lc, struct vk_bundle *vk)
 	DESTROY(vkDestroyDescriptorPool, lc->desc_pool);
 	DESTROY(vkDestroyRenderPass, lc->composite_rp);
 	DESTROY(vkDestroyRenderPass, lc->flatten_rp);
+	DESTROY(vkDestroyRenderPass, lc->flatten_srgb_rp);
 	DESTROY(vkDestroyRenderPass, lc->mask_rp);
 	DESTROY(vkDestroySampler, lc->sampler_point);
 	DESTROY(vkDestroySampler, lc->sampler_linear);
