@@ -503,6 +503,28 @@ comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
                                  struct ipc_capture_result *out_result);
 
 /*!
+ * #1810: @ref comp_d3d11_service_capture_frame for ONE client's compositor.
+ *
+ * With @p xc non-NULL, @c IPC_CAPTURE_FLAG_PROJECTION_ONLY reads THAT client's
+ * per-client atlas (its content-sized DP-input crop, else its full atlas) instead
+ * of whichever compositor last rendered (`sys->active_compositor`), so a
+ * standalone IPC app capturing itself gets its own pixels even with other clients
+ * running. NULL @p xc is exactly @ref comp_d3d11_service_capture_frame.
+ *
+ * @p xc must stay alive for the call: pass the CALLING client's own compositor
+ * from its own IPC thread (compositor teardown runs on that same thread), or a
+ * compositor the caller otherwise holds under render_mutex.
+ *
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_capture_frame_for_client(struct xrt_system_compositor *xsysc,
+                                            struct xrt_compositor *xc,
+                                            const char *path_prefix,
+                                            uint32_t flags,
+                                            struct ipc_capture_result *out_result);
+
+/*!
  * Service a pending MCP capture_frame request. Delegates to
  * comp_d3d11_service_capture_frame for the atlas, then writes
  * {base}_windows.json with per-slot bbox metadata.

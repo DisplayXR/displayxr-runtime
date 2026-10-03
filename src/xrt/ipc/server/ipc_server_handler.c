@@ -5214,8 +5214,34 @@ ipc_handle_workspace_capture_frame(volatile struct ipc_client_state *_ics,
 	memcpy(prefix, request->path_prefix, sizeof(prefix));
 	prefix[sizeof(prefix) - 1] = '\0';
 
-	bool ok = comp_d3d11_service_capture_frame(s->xsysc, prefix, request->flags,
-	                                           out_capture_result);
+	// #1810: flags == 0 means "runtime picks" — that is what the shell's MCP
+	// capture_frame sends (`req.flags = 0`), and comp_d3d11_service_capture_frame
+	// rejects a zero stage mask outright, so every shell capture came back
+	// {"ok":false} with nothing written and nothing logged. Default the STAGE
+	// bits only, keeping any modifier bit (RAW_ALPHA) the caller set.
+	uint32_t flags = request->flags;
+	if ((flags & (IPC_CAPTURE_FLAG_ATLAS | IPC_CAPTURE_FLAG_PROJECTION_ONLY)) == 0) {
+		flags |= IPC_CAPTURE_FLAG_ALL;
+	}
+
+	// #1810: an APP (allowed only outside workspace mode, above) captures its
+	// OWN per-client atlas, not whichever client rendered last. ics->xc is this
+	// thread's own compositor, and its teardown runs on this same thread, so it
+	// outlives the call. CONTROLLER/DIAG keep the historical source.
+	struct xrt_compositor *self_xc = NULL;
+	{
+		uint32_t cls = _ics->client_state.client_class;
+		bool privileged = cls == XRT_CLIENT_CLASS_CONTROLLER || cls == XRT_CLIENT_CLASS_DIAG;
+		if (!privileged) {
+			self_xc = (struct xrt_compositor *)_ics->xc;
+		}
+	}
+
+	bool ok = comp_d3d11_service_capture_frame_for_client(s->xsysc, self_xc, prefix, flags, out_capture_result);
+	if (!ok) {
+		IPC_WARN(s, "workspace_capture_frame: nothing written for pid %ld (prefix=%s flags=0x%x)",
+		         _ics->peer_pid, prefix, flags);
+	}
 	return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
 #else
 	(void)s;

@@ -19683,6 +19683,41 @@ pipeline_client_texture_weave(struct d3d11_service_system *sys, struct d3d11_ser
 	// unbounded, and this thread must never hold `render_mutex` across it (#925).
 	svc_ensure_client_weave_dp(sys, c);
 
+	// #1810: %TEMP%\workspace_screenshot_trigger for a CLIENT_TEXTURE presenter.
+	// The render thread's direct-path poll sits past the PRESENTER_SELF /
+	// CLIENT_TEXTURE early return in pipeline_default_policy_render, and this
+	// client's weave never reaches multi_compositor_render's compose poll, so the
+	// trigger was dead here — no PNG and no log. Stat it BEFORE taking
+	// render_mutex (4 Hz, the #925 audit rank 5 budget); consume it under the lock
+	// only once a frame was actually woven below.
+	bool ss_armed = false;
+	struct ss_paths
+	{
+		char trigger[MAX_PATH];
+		char prefix[MAX_PATH];
+	};
+	// Every CLIENT_TEXTURE client's IPC thread runs this: a magic static, not
+	// the render thread's lazily-filled char arrays.
+	static const ss_paths s_ss = [] {
+		ss_paths p = {};
+		const char *tmp = getenv("TEMP");
+		if (!tmp) {
+			tmp = "C:\\Temp";
+		}
+		snprintf(p.trigger, sizeof(p.trigger), "%s\\workspace_screenshot_trigger", tmp);
+		snprintf(p.prefix, sizeof(p.prefix), "%s\\workspace_screenshot", tmp);
+		return p;
+	}();
+	{
+		static std::atomic<int64_t> ss_last_poll_ns{0};
+		const int64_t ss_now_ns = (int64_t)os_monotonic_get_ns();
+		int64_t ss_prev_ns = ss_last_poll_ns.load(std::memory_order_relaxed);
+		if (ss_now_ns - ss_prev_ns >= 250LL * 1000000LL &&
+		    ss_last_poll_ns.compare_exchange_strong(ss_prev_ns, ss_now_ns)) {
+			ss_armed = GetFileAttributesA(s_ss.trigger) != INVALID_FILE_ATTRIBUTES;
+		}
+	}
+
 	render_mutex_fair_lock lock(sys);
 
 	// Re-check under the lock: focus can move between the load and here. #1208: we
@@ -19806,6 +19841,21 @@ pipeline_client_texture_weave(struct d3d11_service_system *sys, struct d3d11_ser
 			    "fence held at %llu, its window keeps its last frame",
 			    c->slot_app_name, (unsigned long long)c->render.transparent_output_value);
 		}
+	}
+
+	// #1810: the screenshot trigger, armed above. Same two files as the render
+	// thread's sites: (1) workspace_screenshot.png = the woven frame this client
+	// is about to present (the scratch the DP wrote, on sys->device — this
+	// presenter kind is split-ineligible), (2) workspace_screenshot_atlas_*.png =
+	// THIS client's pre-weave atlas. Left on disk when nothing was woven, so the
+	// next woven frame takes it rather than writing nothing. Blocking Map —
+	// debug only, explicit trigger only, on this client's own IPC thread.
+	if (ss_armed && wove && DeleteFileA(s_ss.trigger)) {
+		dxr_diag_dump_tex(sys, c->render.transparent_weave_scratch.get(), "workspace_screenshot",
+		                  /*from_out*/ false);
+		struct ipc_capture_result dummy = {};
+		comp_d3d11_service_capture_frame_for_client(&sys->base, &c->base.base, s_ss.prefix,
+		                                            IPC_CAPTURE_FLAG_PROJECTION_ONLY, &dummy);
 	}
 
 	// ADR-029: signal the service->client fence. The client polls it with
@@ -27607,6 +27657,16 @@ comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
                                  uint32_t flags,
                                  struct ipc_capture_result *out_result)
 {
+	return comp_d3d11_service_capture_frame_for_client(xsysc, /*xc=*/nullptr, path_prefix, flags, out_result);
+}
+
+bool
+comp_d3d11_service_capture_frame_for_client(struct xrt_system_compositor *xsysc,
+                                            struct xrt_compositor *xc,
+                                            const char *path_prefix,
+                                            uint32_t flags,
+                                            struct ipc_capture_result *out_result)
+{
 	if (xsysc == nullptr || path_prefix == nullptr || out_result == nullptr || flags == 0) {
 		return false;
 	}
@@ -27644,7 +27704,10 @@ comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
 	uint32_t dp_content_h = 0;
 	if (flags & IPC_CAPTURE_FLAG_PROJECTION_ONLY) {
 		std::lock_guard<std::mutex> alock(sys->active_compositor_mutex);
-		struct d3d11_service_compositor *ac = sys->active_compositor;
+		// #1810: a named client captures ITSELF; NULL keeps the historical
+		// "whichever compositor rendered last" source (debug trigger, controller).
+		struct d3d11_service_compositor *ac =
+		    xc != nullptr ? d3d11_service_compositor_from_xrt(xc) : sys->active_compositor;
 		if (ac != nullptr) {
 			// Prefer the content-sized crop atlas — the actual DP input, tightly
 			// packed to (tile_columns·view_w)×(tile_rows·view_h) — so the PNG
@@ -27756,8 +27819,10 @@ comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
 		// PNG doesn't render fully transparent/black (issue #425).
 		// DXR_ATLAS_CAPTURE_RAW_ALPHA=1 opts out: the atlas's true alpha is the
 		// only way to test compose-under / opaque-cover alpha (see
-		// u_image_capture_raw_alpha()).
-		if (!u_image_capture_raw_alpha()) {
+		// u_image_capture_raw_alpha()). #1810: an IPC client's own
+		// DXR_ATLAS_CAPTURE_RAW_ALPHA arrives as IPC_CAPTURE_FLAG_RAW_ALPHA,
+		// because this process reads the SERVICE's environment, not the client's.
+		if (!u_image_capture_raw_alpha() && (flags & IPC_CAPTURE_FLAG_RAW_ALPHA) == 0) {
 			u_image_force_opaque_rgba8(buf.data(), used_w, used_h, (size_t)used_w * 4u);
 		}
 		// Encode the atlas geometry into the suffix so consumers don't re-derive
@@ -27790,7 +27855,7 @@ comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
 	out_result->display_height_m = sys->base.info.display_height_m;
 
 	struct xrt_vec3 le = {0, 0, 0}, re = {0, 0, 0};
-	if (comp_d3d11_service_get_predicted_eye_positions(xsysc, &le, &re)) {
+	if (comp_d3d11_service_get_predicted_eye_positions_for_client(xsysc, xc, &le, &re)) {
 		out_result->eye_left_m[0] = le.x;
 		out_result->eye_left_m[1] = le.y;
 		out_result->eye_left_m[2] = le.z;
@@ -27799,8 +27864,8 @@ comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
 		out_result->eye_right_m[2] = re.z;
 	}
 
-	U_LOG_W("capture_frame: prefix=%s flags=0x%x written=0x%x used=%ux%u (atlas=%ux%u) eye=%ux%u",
-	        path_prefix, flags, views_written, used_w, used_h, atlas_w, atlas_h, eye_w, eye_h);
+	U_LOG_W("capture_frame: prefix=%s flags=0x%x written=0x%x used=%ux%u (atlas=%ux%u) eye=%ux%u client=%p",
+	        path_prefix, flags, views_written, used_w, used_h, atlas_w, atlas_h, eye_w, eye_h, (void *)xc);
 
 	return views_written != 0;
 }

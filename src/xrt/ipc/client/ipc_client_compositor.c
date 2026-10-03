@@ -25,6 +25,13 @@
 #include "util/u_trace_marker.h"
 #include "util/u_limited_unique_id.h"
 #include "util/u_snap_grid.h"
+#include "util/u_logging.h"
+
+#ifdef XRT_OS_WINDOWS
+#include "util/u_capture_intent.h"
+#include "util/u_image_capture.h"
+#include <displayxr_mcp/mcp_capture.h>
+#endif
 
 #include "shared/ipc_protocol.h"
 #include "client/ipc_client.h"
@@ -106,6 +113,17 @@ struct ipc_client_compositor
 	//! clients leave it at 0, which the service treats as a "no fence"
 	//! sentinel and the legacy KeyedMutex path stays in effect.
 	uint64_t workspace_sync_fence_value;
+
+#ifdef XRT_OS_WINDOWS
+	//! #1810: MCP capture_frame request box — the same hand-off the in-process
+	//! compositors install, serviced at the end of layer_commit by asking the
+	//! SERVICE for this client's per-client atlas (see ipc_client_capture_poll).
+	struct mcp_capture_request mcp_capture;
+	//! #1810: per-commit capture intent (MCP request or %TEMP% trigger file).
+	struct u_capture_intent capture_intent;
+	//! True while @ref mcp_capture is installed as the process's handler.
+	bool mcp_capture_installed;
+#endif
 
 #ifdef IPC_USE_LOOPBACK_IMAGE_ALLOCATOR
 	//! To test image allocator.
@@ -2555,6 +2573,88 @@ ipc_compositor_layer_zone_3d(struct xrt_compositor *xc,
 	return XRT_SUCCESS;
 }
 
+#ifdef XRT_OS_WINDOWS
+/*!
+ * #1810 — service a capture request for an IPC client.
+ *
+ * The in-process compositors read their own atlas back; an IPC client owns no
+ * atlas, so before this the MCP @c capture_frame tool answered "not wired" and
+ * the per-exe trigger file sat on disk forever. Both now ask the SERVICE for this
+ * client's per-client atlas — the pre-weave, content-sized buffer its display
+ * processor consumes, encoded bytes as stored (ADR-044 §5), alpha forced opaque
+ * unless DXR_ATLAS_CAPTURE_RAW_ALPHA=1 here — over the existing
+ * workspace_capture_frame call (the xrCaptureAtlasDXR IPC branch), then move the
+ * file to the exact path the in-process compositors would have written, so every
+ * recipe keeps its filename.
+ *
+ * Both MCP modes map to the service's PROJECTION_ONLY stage: that is the only
+ * per-client buffer the service has, and it is everything this client sends the
+ * DP (Local2D / window-space included on the standalone path). Under a
+ * workspace an app may not capture (#960) and this reports failure.
+ *
+ * Runs on the app's thread right after the commit's layer-sync call returned,
+ * once per commit — the same cadence as the in-process u_capture_intent_poll.
+ * The service call is bounded (copy + Map under render_mutex, on an explicit
+ * request only); nothing here waits on another process otherwise.
+ */
+static void
+ipc_client_capture_poll(struct ipc_client_compositor *icc)
+{
+	if (!icc->mcp_capture_installed) {
+		return;
+	}
+
+	u_capture_intent_poll(&icc->capture_intent, &icc->mcp_capture);
+	if (!icc->capture_intent.pending) {
+		return;
+	}
+
+	const char *path = icc->capture_intent.path;
+	bool ok = false;
+
+	// Prefix = the target path minus ".png"; the service appends
+	// "_atlas_<views>_<cols>x<rows>.png" and we rename it onto the target.
+	struct ipc_capture_request req = {0};
+	size_t plen = strlen(path);
+	if (plen > 4 && _stricmp(path + plen - 4, ".png") == 0) {
+		plen -= 4;
+	}
+	if (plen > 0 && plen < sizeof(req.path_prefix)) {
+		memcpy(req.path_prefix, path, plen);
+		req.path_prefix[plen] = '\0';
+		req.flags = IPC_CAPTURE_FLAG_PROJECTION_ONLY |
+		            (u_image_capture_raw_alpha() ? IPC_CAPTURE_FLAG_RAW_ALPHA : 0u);
+
+		struct ipc_capture_result result = {0};
+		xrt_result_t xret = ipc_call_workspace_capture_frame(icc->ipc_c, &req, &result);
+		if (xret == XRT_SUCCESS && (result.views_written & IPC_CAPTURE_FLAG_PROJECTION_ONLY) != 0) {
+			uint32_t cols = result.tile_columns > 0 ? result.tile_columns : 1;
+			uint32_t rows = result.tile_rows > 0 ? result.tile_rows : 1;
+			char written[IPC_CAPTURE_PATH_MAX + 48];
+			snprintf(written, sizeof(written), "%s_atlas_%u_%ux%u.png", req.path_prefix, cols * rows,
+			         cols, rows);
+			ok = MoveFileExA(written, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED) != 0;
+			if (ok) {
+				U_LOG_W("[capture] IPC client atlas -> %s (%ux%u, grid %ux%u, mode=%u, raw_alpha=%d)", path,
+				        result.atlas_width, result.atlas_height, cols, rows, icc->capture_intent.mode,
+				        (int)((req.flags & IPC_CAPTURE_FLAG_RAW_ALPHA) != 0));
+			} else {
+				U_LOG_W("[capture] IPC client atlas: service wrote %s but the move to %s failed (%lu)",
+				        written, path, (unsigned long)GetLastError());
+			}
+		} else {
+			U_LOG_W("[capture] IPC client atlas: service wrote nothing for %s (xret=%d views_written=0x%x) "
+			        "-- an app cannot capture under a workspace controller (#960); see the service log",
+			        path, (int)xret, result.views_written);
+		}
+	} else {
+		U_LOG_W("[capture] IPC client atlas: path too long for the capture request: %s", path);
+	}
+
+	u_capture_intent_complete(&icc->capture_intent, &icc->mcp_capture, ok);
+}
+#endif
+
 static xrt_result_t
 ipc_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -2591,6 +2691,10 @@ ipc_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_
 		u_graphics_sync_unref(&sync_handle);
 	}
 
+#ifdef XRT_OS_WINDOWS
+	ipc_client_capture_poll(icc); // #1810
+#endif
+
 	return xret;
 }
 
@@ -2625,6 +2729,10 @@ ipc_compositor_layer_commit_with_semaphore(struct xrt_compositor *xc,
 
 	// Reset.
 	icc->layers.layer_count = 0;
+
+#ifdef XRT_OS_WINDOWS
+	ipc_client_capture_poll(icc); // #1810
+#endif
 
 	return xret;
 }
@@ -2701,6 +2809,15 @@ ipc_compositor_destroy(struct xrt_compositor *xc)
 
 	os_precise_sleeper_deinit(&icc->sleeper);
 
+#ifdef XRT_OS_WINDOWS
+	// #1810: drop the MCP capture hand-off before its storage can be reused.
+	if (icc->mcp_capture_installed) {
+		mcp_capture_uninstall();
+		mcp_capture_fini(&icc->mcp_capture);
+		icc->mcp_capture_installed = false;
+	}
+#endif
+
 	icc->compositor_created = false;
 }
 
@@ -2742,6 +2859,16 @@ ipc_compositor_init(struct ipc_client_compositor *icc, struct xrt_compositor_nat
 
 	// Using in wait frame.
 	os_precise_sleeper_init(&icc->sleeper);
+
+#ifdef XRT_OS_WINDOWS
+	// #1810: wire the per-app MCP capture_frame tool + the %TEMP% atlas trigger
+	// files for this IPC session, exactly as the in-process compositors do at
+	// create. Windows-only: only the D3D11 service answers the capture call.
+	memset(&icc->capture_intent, 0, sizeof(icc->capture_intent));
+	mcp_capture_init(&icc->mcp_capture);
+	mcp_capture_install(&icc->mcp_capture);
+	icc->mcp_capture_installed = true;
+#endif
 
 	// Fetch info from the compositor, among it the format format list.
 	get_info(&(icc->base.base), &icc->base.base.info);

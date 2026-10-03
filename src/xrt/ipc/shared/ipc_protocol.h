@@ -566,6 +566,13 @@ struct ipc_workspace_input_event_batch
 // readback lands in a follow-up (Phase 2b); until then the service writes nothing
 // for this bit and the caller sees it absent from views_written.
 #define IPC_CAPTURE_FLAG_PROJECTION_ONLY (1u << 1)
+// #1810: request-only MODIFIER, never a stage and never reported back in
+// views_written. Asks the service to write the atlas's TRUE alpha instead of
+// forcing it opaque — the client's DXR_ATLAS_CAPTURE_RAW_ALPHA, carried over the
+// wire because the service reads its OWN environment, not the client's. A service
+// that predates the bit ignores it (it only tests the two stage bits), so an old
+// service + new client degrades to "service env decides", exactly as before.
+#define IPC_CAPTURE_FLAG_RAW_ALPHA (1u << 2)
 #define IPC_CAPTURE_FLAG_ALL (IPC_CAPTURE_FLAG_ATLAS)
 
 #define IPC_CAPTURE_PATH_MAX 256
