@@ -533,6 +533,10 @@ struct d3d11_client_render_resources
 	 */
 	bool compose_mirrors_atlas;
 
+	//! #1795: last pure-zones compose decision logged for this client
+	//! (0 = none yet, 1 = passthrough, 2 = composing) — on-change WARN only.
+	uint8_t zones_compose_logged;
+
 	//! Standalone atlas-clear bookkeeping. The per-commit clear-to-black is
 	//! only safe when every slot is guaranteed to be re-blitted this frame —
 	//! and it is NOT: the fence / KeyedMutex paths deliberately skip a view's
@@ -15814,8 +15818,9 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	// format here instead kept two such clients on Model A, blending them in
 	// encoded space and passing the encoded bytes on as linear. The gate itself
 	// is deliberately NOT widened to "any two clients": an atlas that genuinely
-	// holds linear bytes still exists (a pure-zones UNORM commit, and every
-	// client under DXR_COLOR_LEGACY_UNORM_ENCODED=1), and Model B would
+	// holds linear bytes still exists (every UNORM client under
+	// DXR_COLOR_LEGACY_UNORM_ENCODED=1 — a pure-zones UNORM commit composes
+	// since #1795), and Model B would
 	// double-decode it.
 	int honest_srgb_count = 0;
 	for (int ri = 0; ri < render_count; ri++) {
@@ -18220,15 +18225,16 @@ struct service_acquired_image_scope
  * Resolve the SRV to sample a zone/Local-2D source through, matched to where
  * this commit's writes land.
  *
- * - **Passthrough** (the commit is not composing — every pure-zones commit
- *   today): the write goes to the UNORM atlas RTV with b1 zero, so the sample
- *   must return the stored bytes — service_raw_sample_srv(). The atlas then
- *   holds the app's bytes verbatim, byte-identically to the projection fast
- *   path's raw copy.
- * - **Composing** (a mixed frame whose projection layer opened the private
- *   `_SRGB`-view target, `active_write_rtv` set): the image's own
- *   format-honest SRV — an `_SRGB` source decodes, the compose shader passes
- *   the linear value through and the target re-encodes on write.
+ * - **Passthrough** (the commit is not composing — a pure-zones commit whose
+ *   every source is `_SRGB`, or any under the legacy hatch): the write goes to
+ *   the UNORM atlas RTV with b1 zero, so the sample must return the stored
+ *   bytes — service_raw_sample_srv(). The atlas then holds the app's bytes
+ *   verbatim, byte-identically to the projection fast path's raw copy.
+ * - **Composing** (`active_write_rtv` set: a mixed frame whose projection
+ *   layer opened the private `_SRGB`-view target, or — #1795 — a pure-zones
+ *   commit with a non-`_SRGB` source): the image's own format-honest SRV — an
+ *   `_SRGB` source decodes, a UNORM one reads linear, the compose shader
+ *   passes the linear value through and the target encodes on write.
  *
  * #1591 dropped an sRGB-typed SRV the standalone branch built "because the DP
  * expects linear input" and declared the result "sample raw". It was not: the
@@ -18377,6 +18383,11 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 	struct service_acquired_image acquired[XRT_MAX_LAYERS * XRT_MAX_VIEWS];
 	uint32_t acquired_count = 0;
 
+	// #1795 (ADR-044 §7): is every source this pass samples DECLARED `_SRGB`?
+	// Walked over exactly the set the draws below read (same skips), so the
+	// compose decision and the draws cannot disagree on what was sampled.
+	bool all_sources_srgb = true;
+
 	// Acquire EVERY source image up front, all-or-nothing: the composite
 	// clears the tile before blitting, so a per-view skip would flash that
 	// placement black for a frame (visible blink). Skipping the whole pass
@@ -18415,6 +18426,11 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 				}
 				return false;
 			}
+			if (all_sources_srgb && sc->images[img].texture) {
+				D3D11_TEXTURE2D_DESC fd = {};
+				sc->images[img].texture->GetDesc(&fd);
+				all_sources_srgb = is_srgb_format(fd.Format);
+			}
 		}
 	}
 
@@ -18443,6 +18459,61 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 	// inside the lock (it is an immediate-context call) and after every
 	// acquire (it must read what the draws would have read).
 	const uint64_t raw_pass = service_raw_copy_pass_begin();
+
+	/*
+	 * #1795 (ADR-044 §7) — does this PURE-zones commit compose?
+	 *
+	 * A mixed frame already decided on its projection write path (zones /
+	 * Local-2D count as an extra painter there, so it composes unless the
+	 * legacy hatch is on) and `projection_rendered` says so; that decision is
+	 * left alone. A pure-zones commit never reached it, so every one was a
+	 * passthrough and a UNORM source's declared format was ignored: its stored
+	 * bytes landed in the encoded atlas raw.
+	 *
+	 * It composes only when a source OWES the encode — some source is not
+	 * `_SRGB`, and the hatch is off. Every-`_SRGB` (the shipping population)
+	 * stays the passthrough it was: same draws, same raw copies, same atlas
+	 * bytes, no compose target touched. This is a narrower rule than
+	 * u_color_compose_fast_path() states for sub-rect layers (it would compose
+	 * any zones frame, to blend in linear); the all-`_SRGB` passthrough is kept
+	 * byte-identical on purpose, and its edge blends stay encoded-space as
+	 * before.
+	 *
+	 * Same target, seed rule and bookkeeping as the projection decision. The
+	 * publish is the projection path's whole-atlas branch (`compose_publish_full`
+	 * stays at its default for a commit with no projection layer). The seed is
+	 * under the immediate_ctx_mutex this pass already holds — the projection
+	 * path takes exactly that lock for it — and adds no wait.
+	 */
+	if (!projection_rendered) {
+		c->render.active_write_rtv = nullptr;
+		if (!all_sources_srgb && !u_color_legacy_unorm_encoded()) {
+			ID3D11RenderTargetView *compose = client_ensure_compose_target(sys, &c->render);
+			if (compose != nullptr) {
+				// A pure-zones commit always publishes the whole atlas, so the
+				// projection rule's `compose_publish_full` term is always true.
+				if (!c->render.compose_was_active || !c->render.compose_mirrors_atlas) {
+					sys->context->CopyResource(c->render.compose_texture.get(),
+					                           c->render.atlas_texture.get());
+					c->render.compose_mirrors_atlas = true;
+				}
+				c->render.active_write_rtv = compose;
+			}
+		}
+		// Recorded on EVERY pure-zones commit that paints, passthrough ones
+		// included: a passthrough writes the atlas behind the private target's
+		// back, so the next composing commit must re-seed.
+		c->render.compose_was_active = c->render.active_write_rtv != nullptr;
+		// Per client and on change only (two zones clients under the shell can
+		// disagree, and a shared latch would then log every frame).
+		const uint8_t zones_state = c->render.active_write_rtv != nullptr ? 2u : 1u;
+		if (c->render.zones_compose_logged != zones_state) {
+			c->render.zones_compose_logged = zones_state;
+			U_LOG_W("Color (#1795) [d3d11_service]: client %p pure-zones commit %s (all_sources_srgb=%d legacy=%d)",
+			        (void *)c, zones_state == 2u ? "COMPOSES through the _SRGB-view target" : "passes through",
+			        all_sources_srgb ? 1 : 0, u_color_legacy_unorm_encoded() ? 1 : 0);
+		}
+	}
 
 	// Transparent-slot semantics — cleared only now that every source is
 	// safely acquired. A mixed frame (a projection layer already blitted
@@ -18508,12 +18579,10 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 				// the bulk of the atlas bytes.
 				//
 				// #1665: the same "what the runtime DID" rule as the
-				// projection stamp, through the same helper. A pure-zones
-				// commit never reaches the compose decision (it lives on
-				// the projection write path — the known gap), so
-				// `active_write_rtv` is null here today and the write is a
-				// passthrough into the atlas RTV: the atlas holds encoded
-				// bytes exactly when the source did AND the sample was raw.
+				// projection stamp, through the same helper. #1795: a
+				// pure-zones commit decides above; passthrough, the atlas
+				// holds encoded bytes exactly when the source did AND the
+				// sample was raw, composing it holds them regardless.
 				// #1769: it used to pass the source's format alone, while
 				// the sample decoded — an `_SRGB` zone stamped ENCODED over
 				// linear values. Written this way so wiring the gap up
@@ -18610,6 +18679,16 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 			}
 			local2d_count++;
 		}
+	}
+
+	// #1795: a composing pure-zones commit wrote through the `_SRGB`-view
+	// target, so the atlas holds ENCODED bytes whatever the sources were. The
+	// zone stamp above already says so when a zone painted; a Local-2D-only
+	// commit has no zone to stamp from, and composing is the one case where
+	// the answer needs no source at all.
+	if (!src_format_recorded && !projection_rendered && c->render.active_write_rtv != nullptr) {
+		c->atlas_holds_srgb_bytes = u_color_atlas_holds_encoded(
+		    /*source_is_srgb=*/false, /*composed_through_srgb_target=*/true, u_color_legacy_unorm_encoded());
 	}
 
 	ctx_lock.unlock();
