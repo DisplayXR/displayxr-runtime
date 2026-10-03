@@ -683,6 +683,54 @@ struct xrt_display_processor_d3d11
 	                          uint32_t *out_format,
 	                          const void **out_bytes,
 	                          size_t *out_size);
+
+	/*!
+	 * Hand the DP this frame's window-sized 2D OVERLAY layer, to composite
+	 * OVER the woven 3D inside the weave of the very next @ref process_atlas
+	 * (ADR-027 Amendment — 2D under the lens).
+	 *
+	 * The layer is flat 2D content that sits in front of (or around) the
+	 * woven 3D: page text, labels, chrome. Composited after the weave as
+	 * plain pixels, every eye samples a different panel column of it through
+	 * the lens, so it aliases. A DP that owns the lens phase can filter it per
+	 * subpixel first; that is why this layer goes to the DP and not to a
+	 * runtime blit.
+	 *
+	 * Layer contract: target-sized (the same pixel space as process_atlas's
+	 * target), PREMULTIPLIED alpha, RGBA8 / BGRA8 UNORM, alpha = where 2D
+	 * covers the output. @p encoding declares its colour state; v1 producers
+	 * send @ref XRT_ATLAS_ENCODING_ENCODED only, and the DP composites in
+	 * that encoded space (premul "over" onto the encoded woven result, the
+	 * same arithmetic as the runtime's fallback blit).
+	 *
+	 * Stateless, per frame: the runtime calls this before EVERY process_atlas
+	 * on a path that has an overlay — with @p overlay_srv NULL when this frame
+	 * has none (including a missed keyed-mutex acquire). The SRV is on the
+	 * same device as process_atlas, valid until that process_atlas returns;
+	 * the DP must not use it after.
+	 *
+	 * @return true  = the DP will composite the layer in the next weave; the
+	 *                 runtime does nothing more with it.
+	 *         false = not composited (unsupported now — e.g. the vendor
+	 *                 runtime lacks the capability — or NULL passed); the
+	 *                 runtime falls back to compositing it post-weave itself.
+	 *
+	 * Optional — absent slot or NULL ⟹ runtime fallback blit (today's
+	 * behaviour). Appended per ADR-020 (append-only within a major).
+	 *
+	 * @param xdp            Pointer to self.
+	 * @param d3d11_context  D3D11 immediate context (ID3D11DeviceContext*).
+	 * @param overlay_srv    ID3D11ShaderResourceView* of the layer, or NULL.
+	 * @param width          Layer width in pixels.
+	 * @param height         Layer height in pixels.
+	 * @param encoding       Colour state of the layer (v1: ENCODED).
+	 */
+	bool (*set_overlay_2d)(struct xrt_display_processor_d3d11 *xdp,
+	                       void *d3d11_context,
+	                       void *overlay_srv,
+	                       uint32_t width,
+	                       uint32_t height,
+	                       enum xrt_atlas_encoding encoding);
 };
 
 
@@ -763,7 +811,8 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, lift_stream_creat
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, lift_stream_destroy)    == XRT_DP_D3D11_BASE_OFF + 27 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, lift_convert)           == XRT_DP_D3D11_BASE_OFF + 28 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, lift_convert_blob)      == XRT_DP_D3D11_BASE_OFF + 29 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                                == XRT_DP_D3D11_BASE_OFF + 30 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_overlay_2d)         == XRT_DP_D3D11_BASE_OFF + 30 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                                == XRT_DP_D3D11_BASE_OFF + 31 * sizeof(void *), XRT_DP_ABI_MSG);
 
 /*!
  * Defined when this header carries the five lift slots (lift_get_caps,
@@ -801,6 +850,14 @@ XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                    
  * coupled-ABI-addition pattern (see XRT_DP_VK_HAS_PRESENT_ORIGIN).
  */
 #define XRT_DP_D3D11_HAS_BACKEND_STATE 1
+
+/*!
+ * Defined when this header carries the set_overlay_2d slot (ADR-027
+ * Amendment — 2D under the lens), so a plug-in built against an older runtime
+ * can #ifdef-guard its implementation. Purely additive: no
+ * XRT_PLUGIN_API_VERSION_CURRENT bump (ADR-020).
+ */
+#define XRT_DP_D3D11_HAS_OVERLAY_2D 1
 
 // clang-format on
 
@@ -1310,6 +1367,28 @@ xrt_display_processor_d3d11_has_lift(struct xrt_display_processor_d3d11 *xdp)
 {
 	return XRT_DP_HAS_SLOT(xdp, lift_convert) && xdp->lift_get_caps != NULL && xdp->lift_stream_create != NULL &&
 	       xdp->lift_stream_destroy != NULL && xdp->lift_convert != NULL;
+}
+
+/*!
+ * @copydoc xrt_display_processor_d3d11::set_overlay_2d
+ *
+ * Helper for calling through the function pointer: false (⟹ the caller
+ * blits the layer itself) when the slot is absent or NULL.
+ *
+ * @public @memberof xrt_display_processor_d3d11
+ */
+static inline bool
+xrt_display_processor_d3d11_set_overlay_2d(struct xrt_display_processor_d3d11 *xdp,
+                                           void *d3d11_context,
+                                           void *overlay_srv,
+                                           uint32_t width,
+                                           uint32_t height,
+                                           enum xrt_atlas_encoding encoding)
+{
+	if (!XRT_DP_HAS_SLOT(xdp, set_overlay_2d) || xdp->set_overlay_2d == NULL) {
+		return false;
+	}
+	return xdp->set_overlay_2d(xdp, d3d11_context, overlay_srv, width, height, encoding);
 }
 
 //! True when @p xdp also carries lift_convert_blob (GAUSSIANS).

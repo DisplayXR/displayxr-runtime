@@ -39,6 +39,28 @@ issues: [439, 396]
 > exactly as it did before). Contract: `docs/specs/extensions/XR_DXR_weave.md` §2c; runtime PR
 > for browser#88 Phase 3 item A.
 
+> **Amendment — 2D under the lens (2026-10).** "Local2D composites post-weave (over 3D)"
+> (Composition rules) assumed post-weave 2D is clean. It is not on a panel whose lens is on
+> where the 2D sits (every whole-panel lens, and any switchable panel where 2D overlaps a 3D
+> zone): composited as plain pixels after the interlace, each eye samples a different panel
+> column of the 2D, so text and labels alias per eye. Only the weaver knows the per-subpixel
+> lens phase needed to band-limit it (a lens-period box filter sampled at the lenslet centre),
+> and sending the same 2D to both views beforehand does not help (measured: L/R difference
+> unchanged). So the over-layer may now be **composited by the DP inside the weave**:
+> - New appended D3D11 DP slot `set_overlay_2d(ctx, srv|NULL, w, h, encoding)` +
+>   `XRT_DP_D3D11_HAS_OVERLAY_2D` (ADR-020, no ABI major). Stateless per frame, called before
+>   every `process_atlas` that carries an overlay; `true` = the DP composites it in that weave,
+>   `false` / absent = the runtime keeps compositing it post-weave exactly as before. So a
+>   vendor without the capability is unchanged, and no app-facing version gate is needed.
+> - Layer contract: target-sized, premultiplied, RGBA8/BGRA8 UNORM, **encoded** sRGB, alpha
+>   = 2D coverage; the DP composites premul-"over" in that encoded space onto the encoded
+>   woven result (the same arithmetic as the runtime blit and the browser — linear-light
+>   compositing visibly changed semi-transparent 2D and was rejected on the panel).
+> - First producer: the `XR_DXR_weave` v4 overlay (`XrWeaveSubmitOverlaysDXR`) on the D3D11
+>   service's full-window weave paths (v3 batch, v6); the legacy single-rect path keeps the
+>   blit. Other APIs and the in-process compositors' Local2D-over path follow the same slot
+>   shape when needed. 2D-*under*-3D (`set_background_2d`) is unchanged.
+
 ## Context
 
 The current composition model couples three concerns into one object chain:
@@ -230,7 +252,9 @@ once the fixed-atlas assembly made a larger number nearly free.
   alpha), and overlapping zones with different rigs read as coexisting
   translucent holograms (each internally consistent; the combination is the
   app's aesthetic call, not an error).
-- **Local2D composites post-weave (over 3D) in v1**, as today. 2D-under-3D
+- **Local2D composites post-weave (over 3D) in v1**, as today (see the *2D under the lens*
+  amendment at the top: a DP that can band-limit 2D under its lens may now take the
+  over-layer inside the weave). 2D-under-3D
   (a Local2D layer beneath a zone's weave) is reserved — it matches the open
   #491 tail and does not gate this design. The #491 2D-under backdrop channel
   (`set_background_2d`) is unchanged and sufficient when that lands: the DP's

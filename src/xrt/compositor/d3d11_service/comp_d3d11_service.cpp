@@ -803,6 +803,10 @@ struct d3d11_client_render_resources
 	wil::com_ptr<ID3D11Texture2D>          weave_overlay_tex;
 	wil::com_ptr<ID3D11ShaderResourceView> weave_overlay_srv;
 	wil::com_ptr<IDXGIKeyedMutex>          weave_overlay_km;
+	//! Last overlay route logged (ADR-027 Amendment): true = the DP took it
+	//! into the weave via set_overlay_2d, false = the runtime's post-weave blit.
+	bool                                   weave_overlay_in_dp;
+	bool                                   weave_overlay_route_logged;
 
 	//! Deferred auto-3D for no-zones standalone clients (#140 / no-zones-2D).
 	//! A non-workspace IPC handle app with no zone mask never triggers a 3D
@@ -25883,6 +25887,116 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		sys->context->ClearRenderTargetView(c->render.weave_output_rtv.get(), out_transparent);
 	}
 
+	/*
+	 * v4 overlay atlas (browser#18) — imported and acquired BEFORE the weave
+	 * (ADR-027 Amendment, "2D under the lens").
+	 *
+	 * Flat 2D composited after the weave as plain pixels aliases through the
+	 * lens: each eye samples a different panel column of it. A display
+	 * processor that owns the lens phase can filter the layer per subpixel, but
+	 * only INSIDE the weave — so the overlay is handed to it via set_overlay_2d
+	 * immediately before process_atlas, and key 0 is held until the weave has
+	 * sampled it. When the DP declines (returns false) the post-weave runtime
+	 * blit below composites it exactly as before. Cached by handle like the
+	 * SBS input. A missed 4 ms acquire composes this frame without the overlay
+	 * (#925 S1: held under render_mutex; skip-and-retry beats a global stall).
+	 */
+	struct weave_overlay_hold
+	{
+		IDXGIKeyedMutex *km = nullptr;
+		void
+		release()
+		{
+			if (km != nullptr) {
+				km->ReleaseSync(0);
+				km = nullptr;
+			}
+		}
+		~weave_overlay_hold()
+		{
+			release();
+		}
+	} ov_hold;
+	ID3D11ShaderResourceView *ov_srv = nullptr;
+	uint32_t ov_w = 0;
+	uint32_t ov_h = 0;
+	HANDLE ov = (HANDLE)overlay_handle;
+	if (ov != nullptr && ov != INVALID_HANDLE_VALUE) {
+		if (c->render.weave_overlay_handle_cached != ov ||
+		    c->render.weave_overlay_cached_is_dxgi != overlay_is_dxgi || !c->render.weave_overlay_tex ||
+		    !c->render.weave_overlay_srv) {
+			c->render.weave_overlay_handle_cached = nullptr;
+			c->render.weave_overlay_km.reset();
+			c->render.weave_overlay_srv.reset();
+			c->render.weave_overlay_tex.reset();
+
+			if (overlay_is_dxgi) {
+				hr = sys->device->OpenSharedResource(ov, IID_PPV_ARGS(c->render.weave_overlay_tex.put()));
+			} else {
+				hr = sys->device->OpenSharedResource1(ov, IID_PPV_ARGS(c->render.weave_overlay_tex.put()));
+			}
+			if (SUCCEEDED(hr) && c->render.weave_overlay_tex) {
+				D3D11_TEXTURE2D_DESC odesc = {};
+				c->render.weave_overlay_tex->GetDesc(&odesc);
+				D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+				sd.Format = odesc.Format;
+				sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+				sd.Texture2D.MipLevels = 1;
+				hr = sys->device->CreateShaderResourceView(c->render.weave_overlay_tex.get(), &sd,
+				                                           c->render.weave_overlay_srv.put());
+				if (SUCCEEDED(hr)) {
+					(void)c->render.weave_overlay_tex->QueryInterface(
+					    IID_PPV_ARGS(c->render.weave_overlay_km.put()));
+					c->render.weave_overlay_handle_cached = ov;
+					c->render.weave_overlay_cached_is_dxgi = overlay_is_dxgi;
+					U_LOG_W("#625 weave v4: overlay import cached (handle=%p %s, %ux%u)", ov,
+					        overlay_is_dxgi ? "DXGI" : "NT", odesc.Width, odesc.Height);
+				} else {
+					c->render.weave_overlay_srv.reset();
+					c->render.weave_overlay_tex.reset();
+				}
+			} else {
+				U_LOG_E("#625 weave v4: overlay OpenSharedResource(%s) failed: 0x%08lx",
+				        overlay_is_dxgi ? "DXGI" : "NT", hr);
+				c->render.weave_overlay_tex.reset();
+			}
+		}
+
+		if (c->render.weave_overlay_srv && c->render.weave_output_rtv) {
+			D3D11_TEXTURE2D_DESC odesc = {};
+			c->render.weave_overlay_tex->GetDesc(&odesc);
+			IDXGIKeyedMutex *ov_km = c->render.weave_overlay_km.get();
+			bool ov_ok = (ov_km == nullptr);
+			if (ov_km != nullptr) {
+				HRESULT ah = ov_km->AcquireSync(0, 4);
+				if (SUCCEEDED(ah) && ah != static_cast<HRESULT>(WAIT_TIMEOUT)) {
+					ov_hold.km = ov_km;
+					ov_ok = true;
+				}
+			}
+			if (ov_ok) {
+				ov_srv = c->render.weave_overlay_srv.get();
+				ov_w = odesc.Width;
+				ov_h = odesc.Height;
+			}
+		}
+	}
+	// Hand the overlay to the DP for the next process_atlas. Only on the
+	// full-window-canvas paths (v6, batch): the layer is window-sized and the
+	// DP composites it over the whole weave target, which the legacy
+	// single-rect path (canvas = one element) does not cover — that path keeps
+	// the post-weave blit. A layer that is not exactly window-sized (a resize
+	// in flight) also stays on the blit, which scales. Called on every weave,
+	// with NULL when there is no overlay this frame (stateless contract).
+	bool ov_in_dp = false;
+	auto hand_overlay_to_dp = [&]() {
+		const bool fits = (ov_srv != nullptr && ov_w == win_w && ov_h == win_h);
+		ov_in_dp = xrt_display_processor_d3d11_set_overlay_2d(dp, sys->context.get(), fits ? ov_srv : nullptr,
+		                                                      fits ? ov_w : 0, fits ? ov_h : 0,
+		                                                      XRT_ATLAS_ENCODING_ENCODED) &&
+		           fits;
+	};
+
 	if (nview) {
 		// Spec-v6 N-view atlas (#774): the caller already packed the atlas the
 		// way every other DisplayXR app does — tiles contiguous from the
@@ -26015,6 +26129,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		sys->context->RSSetViewports(1, &weave_vp);
 		D3D11_RECT weave_scissor = {0, 0, (LONG)win_w, (LONG)win_h};
 		sys->context->RSSetScissorRects(1, &weave_scissor);
+		hand_overlay_to_dp();
 		xrt_display_processor_d3d11_process_atlas(dp, sys->context.get(), dp_srv,
 		                                          /*view_w*/ cvw, /*view_h*/ cvh,
 		                                          layout->tile_columns, layout->tile_rows,
@@ -26222,6 +26337,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		sys->context->RSSetViewports(1, &weave_vp);
 		D3D11_RECT weave_scissor = {0, 0, (LONG)win_w, (LONG)win_h};
 		sys->context->RSSetScissorRects(1, &weave_scissor);
+		hand_overlay_to_dp();
 		xrt_display_processor_d3d11_process_atlas(dp, sys->context.get(), c->render.weave_sbs_srv.get(),
 		                                          /*view_w*/ win_w, /*view_h*/ win_h,
 		                                          /*tile_columns*/ 2, /*tile_rows*/ 1,
@@ -26243,85 +26359,30 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		}
 	}
 
-	// v4 overlay atlas (browser#18): composite the caller's window-sized
-	// premultiplied-alpha 2D atlas OVER the woven output (premul "over":
-	// out = overlay + (1 - overlay.a)*out), so crisp 2D lands on top of the
-	// interlaced 3D at screen depth. The overlay is NOT woven — it is drawn
-	// after process_atlas onto the same output RTV. Reuses the runtime's blit
-	// pipeline + premul blend; no DP call. Cached by handle like the SBS input.
-	HANDLE ov = (HANDLE)overlay_handle;
-	if (ov != nullptr && ov != INVALID_HANDLE_VALUE) {
-		if (c->render.weave_overlay_handle_cached != ov ||
-		    c->render.weave_overlay_cached_is_dxgi != overlay_is_dxgi || !c->render.weave_overlay_tex ||
-		    !c->render.weave_overlay_srv) {
-			c->render.weave_overlay_handle_cached = nullptr;
-			c->render.weave_overlay_km.reset();
-			c->render.weave_overlay_srv.reset();
-			c->render.weave_overlay_tex.reset();
-
-			if (overlay_is_dxgi) {
-				hr = sys->device->OpenSharedResource(ov, IID_PPV_ARGS(c->render.weave_overlay_tex.put()));
-			} else {
-				hr = sys->device->OpenSharedResource1(ov, IID_PPV_ARGS(c->render.weave_overlay_tex.put()));
-			}
-			if (SUCCEEDED(hr) && c->render.weave_overlay_tex) {
-				D3D11_TEXTURE2D_DESC odesc = {};
-				c->render.weave_overlay_tex->GetDesc(&odesc);
-				D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
-				sd.Format = odesc.Format;
-				sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-				sd.Texture2D.MipLevels = 1;
-				hr = sys->device->CreateShaderResourceView(c->render.weave_overlay_tex.get(), &sd,
-				                                           c->render.weave_overlay_srv.put());
-				if (SUCCEEDED(hr)) {
-					(void)c->render.weave_overlay_tex->QueryInterface(
-					    IID_PPV_ARGS(c->render.weave_overlay_km.put()));
-					c->render.weave_overlay_handle_cached = ov;
-					c->render.weave_overlay_cached_is_dxgi = overlay_is_dxgi;
-					U_LOG_W("#625 weave v4: overlay import cached (handle=%p %s, %ux%u)", ov,
-					        overlay_is_dxgi ? "DXGI" : "NT", odesc.Width, odesc.Height);
-				} else {
-					c->render.weave_overlay_srv.reset();
-					c->render.weave_overlay_tex.reset();
-				}
-			} else {
-				U_LOG_E("#625 weave v4: overlay OpenSharedResource(%s) failed: 0x%08lx",
-				        overlay_is_dxgi ? "DXGI" : "NT", hr);
-				c->render.weave_overlay_tex.reset();
-			}
-		}
-
-		if (c->render.weave_overlay_srv && c->render.weave_output_rtv) {
-			D3D11_TEXTURE2D_DESC odesc = {};
-			c->render.weave_overlay_tex->GetDesc(&odesc);
-			IDXGIKeyedMutex *ov_km = c->render.weave_overlay_km.get();
-			bool ov_acquired = false;
-			if (ov_km) {
-				// #925 S1: 4 ms, same rationale as the input acquire above
-				// (held under render_mutex; skip-and-retry beats a 1 s
-				// global stall). Miss = this frame composes without the
-				// overlay, which the next frame corrects.
-				HRESULT ah = ov_km->AcquireSync(0, 4);
-				if (SUCCEEDED(ah) && ah != static_cast<HRESULT>(WAIT_TIMEOUT)) {
-					ov_acquired = true;
-				}
-			}
-			if (!ov_km || ov_acquired) {
-				// One full-window premultiplied "over" blit: the atlas is
-				// transparent (alpha 0) everywhere except the 2D regions, so a
-				// single whole-window composite is correct regardless of
-				// overlay_rect_count (a future scope hint, not a correctness input).
-				blit_to_atlas_texture(sys, &c->render, c->render.weave_overlay_srv.get(),
-				                      0.0f, 0.0f, (float)odesc.Width, (float)odesc.Height,
-				                      (float)odesc.Width, (float)odesc.Height, 0.0f, 0.0f,
-				                      (float)win_w, (float)win_h, /*is_srgb*/ false,
-				                      sys->blend_premul.get(), c->render.weave_output_rtv.get(),
-				                      (float)win_w, (float)win_h);
-			}
-			if (ov_acquired && ov_km) {
-				ov_km->ReleaseSync(0);
-			}
-		}
+	// v4 overlay atlas (browser#18), FALLBACK leg: composite the caller's
+	// window-sized premultiplied-alpha 2D atlas OVER the woven output (premul
+	// "over": out = overlay + (1 - overlay.a)*out) with the runtime's own blit,
+	// whenever the display processor did not take it into the weave above
+	// (ADR-027 Amendment — no slot, a vendor runtime without the capability, a
+	// size mismatch, or the legacy single-rect path). The atlas is transparent
+	// (alpha 0) everywhere except the 2D regions, so a single whole-window
+	// composite is correct regardless of overlay_rect_count (a future scope
+	// hint, not a correctness input).
+	if (ov_srv != nullptr && !ov_in_dp) {
+		blit_to_atlas_texture(sys, &c->render, ov_srv, 0.0f, 0.0f, (float)ov_w, (float)ov_h, (float)ov_w,
+		                      (float)ov_h, 0.0f, 0.0f, (float)win_w, (float)win_h, /*is_srgb*/ false,
+		                      sys->blend_premul.get(), c->render.weave_output_rtv.get(), (float)win_w,
+		                      (float)win_h);
+	}
+	ov_hold.release();
+	// Route log: first overlay frame and every change only (never per frame).
+	if (ov_srv != nullptr &&
+	    (!c->render.weave_overlay_route_logged || ov_in_dp != c->render.weave_overlay_in_dp)) {
+		c->render.weave_overlay_route_logged = true;
+		c->render.weave_overlay_in_dp = ov_in_dp;
+		U_LOG_W("weave v4 overlay %ux%u (win %ux%u): composited by the %s — ADR-027 Amendment", ov_w, ov_h,
+		        win_w, win_h,
+		        ov_in_dp ? "DISPLAY PROCESSOR inside the weave" : "runtime post-weave blit (fallback)");
 	}
 
 	int64_t t_post_weave_ns = os_monotonic_get_ns();
