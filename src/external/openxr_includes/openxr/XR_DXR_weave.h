@@ -198,6 +198,12 @@
  * back verbatim), so a present-owner can tag its own Wayland commit for
  * move-synchronised drag.
  *
+ * Overlay unchanged (SPEC_VERSION 14). XrWeaveSubmitOverlayUnchangedDXR, chained
+ * on XrWeaveSubmitInfoDXR next to an XrWeaveSubmitOverlaysDXR: the caller declares
+ * that this submit's overlay atlas holds exactly the pixels of the previous
+ * accepted submit's, so derived work (a display processor's lens prefilter of
+ * the 2D layer) may be reused instead of recomputed. Advisory, per submit.
+ *
  * Mono in hardware 2D (SPEC_VERSION 13). XrWeaveSubmitMonoIn2DDXR, chained on
  * XrWeaveSubmitInfoDXR: while the session's hardware state is 2D, the output is
  * one view (stereo: the left view), flat, instead of the weave. Desktop Linux;
@@ -269,7 +275,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_weave 1
-#define XR_DXR_weave_SPEC_VERSION 13
+#define XR_DXR_weave_SPEC_VERSION 14
 #define XR_DXR_WEAVE_EXTENSION_NAME "XR_DXR_weave"
 
 // Reserved 1004999190..199. Final values reconcile with the Khronos registry
@@ -304,6 +310,10 @@ extern "C" {
 // Spec v13: one flat view instead of the weave while the panel is in hardware 2D.
 // Last value of the 240..249 decade.
 #define XR_TYPE_WEAVE_SUBMIT_MONO_IN_2D_DXR     ((XrStructureType)1004999249)
+
+// Reserved 1004999290..299 — the third weave decade (240..249 is full). Same registry.
+// Spec v14 (ADR-027 Amendment): the overlay atlas is unchanged since the last submit.
+#define XR_TYPE_WEAVE_SUBMIT_OVERLAY_UNCHANGED_DXR ((XrStructureType)1004999290)
 
 //! Upper bound on eye positions carried by XrWeaveSubmitInfoDXR (mirrors the
 //! runtime's XRT_MAX_VIEWS). Phase 1: carried but unused.
@@ -1000,6 +1010,33 @@ typedef struct XrWeaveSubmitMonoIn2DDXR {
     const void* XR_MAY_ALIAS next;
     XrBool32                 monoIn2D; //!< XR_TRUE: one view flat, no weave, while hardware is 2D
 } XrWeaveSubmitMonoIn2DDXR;
+
+/*!
+ * @brief The v4 overlay atlas is UNCHANGED since the previous submit (spec v14).
+ *
+ * Chain onto XrWeaveSubmitInfoDXR::next, in the same submit as an
+ * XrWeaveSubmitOverlaysDXR. @c overlayUnchanged XR_TRUE declares that the overlay
+ * texture holds exactly the pixels it held for the previous ACCEPTED submit that
+ * chained it — same texture, same size, no writes since. The runtime may then
+ * reuse work derived from it: a display processor that band-limits the 2D layer
+ * for its lens (ADR-027 Amendment) skips re-filtering a static page, which is
+ * what makes a whole-page overlay affordable on integrated GPUs.
+ *
+ * Advisory, per submit, no latch: omitting the struct, or XR_FALSE, means
+ * "may have changed" — always correct, only slower. Declaring XR_TRUE for an
+ * atlas that DID change may show the previous 2D content for that frame; a
+ * runtime still re-derives on its own when the texture or its size changes, or
+ * when the viewer moves enough to matter. Content-only: the overlay is composited
+ * every frame either way.
+ *
+ * A pre-v14 runtime ignores the struct (unknown chained struct), which is the
+ * "may have changed" behaviour. No version gate is needed to send it.
+ */
+typedef struct XrWeaveSubmitOverlayUnchangedDXR {
+    XrStructureType          type;             //!< XR_TYPE_WEAVE_SUBMIT_OVERLAY_UNCHANGED_DXR
+    const void* XR_MAY_ALIAS next;
+    XrBool32                 overlayUnchanged; //!< XR_TRUE: same overlay pixels as the previous accepted submit
+} XrWeaveSubmitOverlayUnchangedDXR;
 
 typedef XrResult (XRAPI_PTR *PFN_xrWeaveBindWindowDXR)(
     XrSession session, void* windowHandle);

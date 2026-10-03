@@ -1266,6 +1266,7 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 		// v4: keep the overlay atlas sized to the window client area so the DP
 		// composites the 2D badge 1:1 over the woven output.
 		bool haveOverlay = (g_overlayMode != OVERLAY_NONE) && EnsureOverlayTexture((uint32_t)cw, (uint32_t)ch);
+		bool overlayUnchanged = false; // v14: static page after its first paint
 		if (haveOverlay && pageMode) {
 			// Static page: paint once per (re)size. page-anim: every frame, scrolled.
 			static uint32_t s_paintedW = 0, s_paintedH = 0;
@@ -1275,6 +1276,8 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 				haveOverlay = PaintPageOverlay((uint32_t)cw, (uint32_t)ch, rx, ry, (int32_t)rw, (int32_t)rh, scroll);
 				s_paintedW = (uint32_t)cw;
 				s_paintedH = (uint32_t)ch;
+			} else {
+				overlayUnchanged = true;
 			}
 			g_pageFrame++;
 		}
@@ -1330,6 +1333,14 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 			ov.rects = nullptr;
 			*tail = &ov;
 			tail = &ov.next;
+		}
+		// v14: declare the overlay unchanged (static page) so a DP can reuse its
+		// lens prefilter of it. Advisory; a pre-v14 runtime ignores the struct.
+		XrWeaveSubmitOverlayUnchangedDXR ovu = {XR_TYPE_WEAVE_SUBMIT_OVERLAY_UNCHANGED_DXR};
+		if (haveOverlay && overlayUnchanged) {
+			ovu.overlayUnchanged = XR_TRUE;
+			*tail = &ovu;
+			tail = &ovu.next;
 		}
 
 		// v8 (browser#88): declare the FLAT band. wish = union(rects) - union(flat),

@@ -6569,6 +6569,8 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	uint32_t w = 0, h = 0;
 	uint64_t fv = 0;
 	struct xrt_eye_positions eyes = {0};
+	// v14: per submit — a submit without XrWeaveSubmitOverlayUnchangedDXR clears it.
+	comp_d3d11_service_weave_set_overlay_unchanged(ics->xc, args->overlay_unchanged != 0);
 	bool ok = comp_d3d11_service_weave_submit(                  //
 	    ics->xc, in_handle, in_is_dxgi,                         //
 	    args->rect_x, args->rect_y, args->rect_w, args->rect_h, //

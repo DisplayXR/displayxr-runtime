@@ -906,6 +906,13 @@ struct ipc_arg_weave_submit
 	//! (desktop-Linux engine; ignored elsewhere). Appended, same accounting as
 	//! v8: 824 + 4 = 828 B; the dma-buf call is 4 + 828 + 136 = 968 of 1024.
 	uint32_t mono_in_2d;
+
+	//! XR_DXR_weave v14 (XrWeaveSubmitOverlayUnchangedDXR): 1 = this submit's
+	//! overlay atlas holds exactly the previous accepted submit's pixels, so the
+	//! DP may reuse derived work (its lens prefilter of the 2D layer, ADR-027
+	//! Amendment). Advisory; 0 = may have changed (pre-v14 behaviour). Appended:
+	//! 828 + 4 = 832 B; the dma-buf call is 4 + 832 + 136 = 972 of 1024.
+	uint32_t overlay_unchanged;
 };
 
 /*!
