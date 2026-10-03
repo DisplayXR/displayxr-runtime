@@ -4,7 +4,7 @@
  * @file
  * @brief  `displayxr-cli lift` — XR_DXR_lift (ADR-042) caps + the N0 probe.
  *
- *   displayxr-cli lift caps [--json] [--wait S]
+ *   displayxr-cli lift caps [--json] [--wait S] [--timeout S]
  *   displayxr-cli lift probe <image|frames_dir> [--mode depth|sbs|nview|gaussians]
  *                            [--n N] [--views N] [--strength F] [--convergence F]
  *                            [--focal PX] [--priority paused|low|normal|high]
@@ -46,7 +46,12 @@
 #include "client/ipc_client_lift.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifdef XRT_OS_WINDOWS
@@ -174,19 +179,115 @@ print_caps(const struct xrt_dp_lift_caps &c, bool json)
 	printf("  typical latency:  %.2f ms\n", (double)c.typical_latency_ns / 1e6);
 }
 
+/*!
+ * Hard client-side deadline for `lift caps` (#1812). Every step of the query —
+ * the pipe connect, the handshake, each lift_get_properties round trip — is a
+ * blocking IPC call, so a wedged or unresponsive service would otherwise hold
+ * the cli forever. When the deadline passes this prints what it was waiting on
+ * and terminates the process (an IPC call blocked in ReadFile cannot be
+ * cancelled from another thread portably).
+ */
+class caps_watchdog
+{
+public:
+	enum phase
+	{
+		PHASE_CONNECT = 0,
+		PHASE_QUERY = 1,
+	};
+
+	caps_watchdog(double timeout_s, bool json) : timeout_s_(timeout_s), json_(json)
+	{
+		thread_ = std::thread([this] { run(); });
+	}
+
+	~caps_watchdog()
+	{
+		{
+			std::lock_guard<std::mutex> g(m_);
+			done_ = true;
+		}
+		cv_.notify_all();
+		if (thread_.joinable()) {
+			thread_.join();
+		}
+	}
+
+	void
+	set_phase(phase p)
+	{
+		phase_.store((int)p);
+	}
+
+private:
+	void
+	run()
+	{
+		std::unique_lock<std::mutex> lk(m_);
+		auto ms = std::chrono::milliseconds((long long)(timeout_s_ * 1000.0));
+		if (cv_.wait_for(lk, ms, [this] { return done_; })) {
+			return;
+		}
+		const bool connecting = phase_.load() == PHASE_CONNECT;
+		if (json_) {
+			printf("{\"connected\": %s, \"state\": \"TIMEOUT\", \"timeout_s\": %.1f}\n",
+			       connecting ? "false" : "true", timeout_s_);
+		} else {
+			const char *what = connecting ? "stuck connecting" : "connected, the query never returned";
+			printf("displayxr-cli lift caps: no answer from displayxr-service within %.1f s (%s).\n",
+			       timeout_s_, what);
+			printf("  The service may be busy or wedged; the '[lift]' lines in its log say which.\n");
+			printf("  --timeout S raises the limit.\n");
+		}
+		fflush(stdout);
+		std::_Exit(4);
+	}
+
+	double timeout_s_;
+	bool json_;
+	std::atomic<int> phase_{PHASE_CONNECT};
+	std::mutex m_;
+	std::condition_variable cv_;
+	bool done_ = false;
+	std::thread thread_;
+};
+
 int
 cmd_caps(int argc, const char **argv)
 {
 	bool json = cli_has_flag(argc, argv, "--json");
-	double wait_s = atof(opt_value(argc, argv, "--wait", "10"));
+	// --wait: how long to keep polling while the module reports ACTIVATING.
+	// --timeout: hard bound on the whole command, whatever the service does.
+	double wait_s = atof(opt_value(argc, argv, "--wait", "8"));
+	if (wait_s < 0.0) {
+		wait_s = 0.0;
+	}
+	double timeout_s = atof(opt_value(argc, argv, "--timeout", "0"));
+	if (timeout_s <= 0.0) {
+		timeout_s = std::max(10.0, wait_s + 2.0);
+	}
+
+	const uint64_t t0 = os_monotonic_get_ns();
+	caps_watchdog wd(timeout_s, json);
 	struct ipc_connection ipc_c = {};
 	if (!connect(&ipc_c)) {
 		return 2;
 	}
+	wd.set_phase(caps_watchdog::PHASE_QUERY);
+	// The ACTIVATING poll must end (and print its answer) before the hard
+	// deadline: whatever the connect took comes out of the poll budget, with
+	// 1.5 s kept for the last round trip.
+	const double elapsed_s = (double)(os_monotonic_get_ns() - t0) / 1e9;
+	const double poll_s = std::max(0.0, std::min(wait_s, timeout_s - elapsed_s - 1.5));
 	struct xrt_dp_lift_caps caps;
-	bool ok = wait_caps(&ipc_c, wait_s, &caps, !json);
+	bool ok = wait_caps(&ipc_c, poll_s, &caps, !json);
 	if (ok) {
 		print_caps(caps, json);
+		if (!json && caps.state == XRT_DP_LIFT_STATE_ACTIVATING) {
+			printf("  (still ACTIVATING after %.0f s: the module is loading, or stuck loading; the\n",
+			       (double)(os_monotonic_get_ns() - t0) / 1e9);
+			printf("   service log says which. Re-run, or pass --wait S to poll longer.)\n");
+		}
 	}
 	ipc_client_connection_fini(&ipc_c);
 	return ok ? 0 : 2;
@@ -710,7 +811,7 @@ cli_cmd_lift(int argc, const char **argv)
 		return cmd_probe(argc, argv);
 	}
 	printf(
-	    "usage: displayxr-cli lift caps [--json] [--wait S]\n"
+	    "usage: displayxr-cli lift caps [--json] [--wait S] [--timeout S]\n"
 	    "       displayxr-cli lift probe <image|frames_dir> [--mode depth|sbs|nview|gaussians] [--n N] ...\n");
 	return 1;
 }
