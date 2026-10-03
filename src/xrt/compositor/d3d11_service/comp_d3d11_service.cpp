@@ -808,6 +808,25 @@ struct d3d11_client_render_resources
 	bool                                   weave_overlay_in_dp;
 	bool                                   weave_overlay_route_logged;
 
+	//! DXR_WEAVE_GPU_TIMING=1 diagnostic (ADR-027 Amendment perf A/B): a ring of
+	//! disjoint + 3 timestamp queries per weave_submit — T0 before the ingest
+	//! copies, T1 after process_atlas (ingest + weave, incl. any in-weave 2D
+	//! compose), T2 after the post-weave overlay blit. Read back non-blocking,
+	//! frames late; averaged and logged every 5 s. Created lazily, only when
+	//! the env var is set.
+	static constexpr uint32_t kWeaveGpuRing = 4;
+	wil::com_ptr<ID3D11Query>              weave_gpu_disjoint[kWeaveGpuRing];
+	wil::com_ptr<ID3D11Query>              weave_gpu_ts[kWeaveGpuRing][3];
+	bool                                   weave_gpu_pending[kWeaveGpuRing];
+	bool                                   weave_gpu_dp_overlay[kWeaveGpuRing];
+	uint32_t                               weave_gpu_head;
+	double                                 weave_gpu_sum_weave_ms;
+	double                                 weave_gpu_sum_blit_ms;
+	double                                 weave_gpu_max_weave_ms;
+	uint32_t                               weave_gpu_n;
+	uint32_t                               weave_gpu_n_dp_overlay;
+	int64_t                                weave_gpu_last_log_ns;
+
 	//! Deferred auto-3D for no-zones standalone clients (#140 / no-zones-2D).
 	//! A non-workspace IPC handle app with no zone mask never triggers a 3D
 	//! request (the per-client DP is created mode-neutral to dodge the #140
@@ -25419,7 +25438,141 @@ dxr_diag_dump_tex(struct d3d11_service_system *sys, ID3D11Texture2D *tex, const 
  *    present-owner weaves into its own handback texture but does not get to
  *    move the panel.
  */
-extern "C" bool
+extern "C" /*
+ * DXR_WEAVE_GPU_TIMING=1 — GPU time of the present-owner weave (ADR-027
+ * Amendment perf A/B: iGPU vs dGPU, compose on/off). Diagnostic only; env read
+ * once. Non-blocking: a query set still in flight when its ring slot comes
+ * round again is dropped, never waited on (this runs under render_mutex).
+ */
+static bool
+weave_gpu_timing_enabled(void)
+{
+	static int s_on = -1;
+	if (s_on < 0) {
+		const char *v = getenv("DXR_WEAVE_GPU_TIMING");
+		s_on = (v != nullptr && v[0] == '1') ? 1 : 0;
+		if (s_on == 1) {
+			U_LOG_W("DXR_WEAVE_GPU_TIMING=1: logging present-owner weave GPU time every 5 s");
+		}
+	}
+	return s_on == 1;
+}
+
+static void
+weave_gpu_timing_collect(struct d3d11_service_system *sys, struct d3d11_client_render_resources *r, uint32_t slot)
+{
+	if (!r->weave_gpu_pending[slot]) {
+		return;
+	}
+	D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj = {};
+	UINT64 t[3] = {};
+	ID3D11DeviceContext *ctx = sys->context.get();
+	if (ctx->GetData(r->weave_gpu_disjoint[slot].get(), &dj, sizeof(dj), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) {
+		return; // still in flight — keep it pending
+	}
+	for (int i = 0; i < 3; i++) {
+		if (ctx->GetData(r->weave_gpu_ts[slot][i].get(), &t[i], sizeof(t[i]), D3D11_ASYNC_GETDATA_DONOTFLUSH) !=
+		    S_OK) {
+			return;
+		}
+	}
+	r->weave_gpu_pending[slot] = false;
+	if (dj.Disjoint || dj.Frequency == 0) {
+		return;
+	}
+	const double to_ms = 1000.0 / (double)dj.Frequency;
+	const double weave_ms = (double)(t[1] - t[0]) * to_ms;
+	const double blit_ms = (double)(t[2] - t[1]) * to_ms;
+	r->weave_gpu_sum_weave_ms += weave_ms;
+	r->weave_gpu_sum_blit_ms += blit_ms;
+	if (weave_ms > r->weave_gpu_max_weave_ms) {
+		r->weave_gpu_max_weave_ms = weave_ms;
+	}
+	r->weave_gpu_n++;
+	if (r->weave_gpu_dp_overlay[slot]) {
+		r->weave_gpu_n_dp_overlay++;
+	}
+}
+
+//! Returns the ring slot to stamp this submit into, or UINT32_MAX when off.
+static uint32_t
+weave_gpu_timing_begin(struct d3d11_service_system *sys, struct d3d11_client_render_resources *r)
+{
+	if (!weave_gpu_timing_enabled()) {
+		return UINT32_MAX;
+	}
+	for (uint32_t i = 0; i < d3d11_client_render_resources::kWeaveGpuRing; i++) {
+		weave_gpu_timing_collect(sys, r, i);
+	}
+	const uint32_t slot = r->weave_gpu_head;
+	r->weave_gpu_head = (slot + 1) % d3d11_client_render_resources::kWeaveGpuRing;
+	if (!r->weave_gpu_disjoint[slot]) {
+		D3D11_QUERY_DESC qd = {D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
+		if (FAILED(sys->device->CreateQuery(&qd, r->weave_gpu_disjoint[slot].put()))) {
+			return UINT32_MAX;
+		}
+		qd.Query = D3D11_QUERY_TIMESTAMP;
+		for (int i = 0; i < 3; i++) {
+			if (FAILED(sys->device->CreateQuery(&qd, r->weave_gpu_ts[slot][i].put()))) {
+				r->weave_gpu_disjoint[slot].reset();
+				return UINT32_MAX;
+			}
+		}
+	}
+	r->weave_gpu_pending[slot] = false; // a slot still in flight is dropped, not waited on
+	sys->context->Begin(r->weave_gpu_disjoint[slot].get());
+	sys->context->End(r->weave_gpu_ts[slot][0].get());
+	return slot;
+}
+
+static void
+weave_gpu_timing_stamp(struct d3d11_service_system *sys, struct d3d11_client_render_resources *r, uint32_t slot, int i)
+{
+	if (slot != UINT32_MAX) {
+		sys->context->End(r->weave_gpu_ts[slot][i].get());
+	}
+}
+
+static void
+weave_gpu_timing_end(struct d3d11_service_system *sys,
+                     struct d3d11_client_render_resources *r,
+                     uint32_t slot,
+                     bool dp_overlay,
+                     uint32_t win_w,
+                     uint32_t win_h)
+{
+	if (slot == UINT32_MAX) {
+		return;
+	}
+	sys->context->End(r->weave_gpu_ts[slot][2].get());
+	sys->context->End(r->weave_gpu_disjoint[slot].get());
+	r->weave_gpu_pending[slot] = true;
+	r->weave_gpu_dp_overlay[slot] = dp_overlay;
+
+	const int64_t now = (int64_t)os_monotonic_get_ns();
+	if (r->weave_gpu_n > 0 && now - r->weave_gpu_last_log_ns >= 5LL * 1000 * 1000 * 1000) {
+		r->weave_gpu_last_log_ns = now;
+		DXGI_ADAPTER_DESC ad = {};
+		wil::com_ptr<IDXGIDevice> dxgi_dev;
+		wil::com_ptr<IDXGIAdapter> adapter;
+		if (SUCCEEDED(sys->device->QueryInterface(IID_PPV_ARGS(dxgi_dev.put()))) &&
+		    SUCCEEDED(dxgi_dev->GetAdapter(adapter.put()))) {
+			adapter->GetDesc(&ad);
+		}
+		U_LOG_W("weave GPU time [%ls] %ux%u: ingest+weave avg %.3f ms (max %.3f), post-weave overlay blit "
+		        "avg %.3f ms, n=%u (%u with the 2D layer composited in the weave)",
+		        ad.Description, win_w, win_h, r->weave_gpu_sum_weave_ms / r->weave_gpu_n,
+		        r->weave_gpu_max_weave_ms, r->weave_gpu_sum_blit_ms / r->weave_gpu_n, r->weave_gpu_n,
+		        r->weave_gpu_n_dp_overlay);
+		r->weave_gpu_sum_weave_ms = 0.0;
+		r->weave_gpu_sum_blit_ms = 0.0;
+		r->weave_gpu_max_weave_ms = 0.0;
+		r->weave_gpu_n = 0;
+		r->weave_gpu_n_dp_overlay = 0;
+	}
+}
+
+bool
 comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
                                xrt_graphics_buffer_handle_t in_handle,
                                bool in_is_dxgi,
@@ -26016,6 +26169,8 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		           fits;
 	};
 
+	const uint32_t gpu_slot = weave_gpu_timing_begin(sys, &c->render);
+
 	if (nview) {
 		// Spec-v6 N-view atlas (#774): the caller already packed the atlas the
 		// way every other DisplayXR app does — tiles contiguous from the
@@ -26378,6 +26533,8 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		}
 	}
 
+	weave_gpu_timing_stamp(sys, &c->render, gpu_slot, 1);
+
 	// v4 overlay atlas (browser#18), FALLBACK leg: composite the caller's
 	// window-sized premultiplied-alpha 2D atlas OVER the woven output (premul
 	// "over": out = overlay + (1 - overlay.a)*out) with the runtime's own blit,
@@ -26394,6 +26551,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		                      (float)win_h);
 	}
 	ov_hold.release();
+	weave_gpu_timing_end(sys, &c->render, gpu_slot, ov_in_dp, win_w, win_h);
 	// Route log: first overlay frame and every change only (never per frame).
 	if (ov_srv != nullptr &&
 	    (!c->render.weave_overlay_route_logged || ov_in_dp != c->render.weave_overlay_in_dp)) {
