@@ -38,7 +38,40 @@ struct ipc_server_main_info
 
 	//! When true, service runs in workspace mode with a shared multi-compositor window.
 	bool workspace_mode;
+
+	//! ADR-045: when true, the server ends its main loop (with
+	//! @ref ipc_server_restart_requested set) once a refresh has adopted a
+	//! better display plug-in under a head device the previous one created
+	//! and no client is connected, so the host can start a fresh instance
+	//! built on the new plug-in end to end. Only the standalone service sets
+	//! it; it must also know how to start that successor.
+	bool allow_adoption_restart;
 };
+
+/*!
+ * ADR-045 R-c: ask the server to re-evaluate display-processor selection
+ * (`refresh_display_processors`) because the world changed — display
+ * topology, device nodes, or the plug-in registration root. Cheap and
+ * non-blocking: it only flags a request for the server's re-probe worker,
+ * which debounces bursts (>= 1 s) and runs the refresh off the caller's
+ * thread, so it is safe from a window procedure or a registry waiter. A no-op
+ * before the server has started or after it stopped. @p reason must be a
+ * string literal (logged, not copied).
+ *
+ * @ingroup ipc_server
+ */
+void
+ipc_server_request_display_reprobe(const char *reason);
+
+/*!
+ * True after @ref ipc_server_main returned because of an adoption restart
+ * (see @ref ipc_server_main_info::allow_adoption_restart): the host should
+ * start a successor instance.
+ *
+ * @ingroup ipc_server
+ */
+bool
+ipc_server_restart_requested(void);
 
 /*!
  * Main entrypoint to the compositor process.

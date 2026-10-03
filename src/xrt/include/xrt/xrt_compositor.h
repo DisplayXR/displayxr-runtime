@@ -3078,6 +3078,17 @@ struct xrt_system_compositor_info
 	//! dp_factory_* came from; "" if none. Lets comp_dp_factory_for_window name
 	//! both plug-ins when the registry and scalar diverge (#1521).
 	char active_plugin_id[64];
+
+	//! ADR-045: the active plug-in is a FALLBACK (XRT_PLUGIN_PLATFORM_FLAG_FALLBACK).
+	//! A long-lived service keeps re-probing on a slow timer only while this is set.
+	bool active_plugin_is_fallback;
+
+	//! ADR-045: a refresh adopted a better plug-in AFTER the system's head device
+	//! was created by the previous one. The weaving DP and display info follow
+	//! the new plug-in at once, but the head device (mode table, eye tracking)
+	//! cannot be swapped under live sessions, so a complete adoption needs a new
+	//! system: the service restarts itself once no client is connected.
+	bool head_device_stale;
 };
 
 struct xrt_system_compositor;

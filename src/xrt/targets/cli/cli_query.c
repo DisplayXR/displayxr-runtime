@@ -1296,6 +1296,144 @@ probe_vk_queue_lock_layer(struct cli_query_result *r)
 }
 #endif
 
+/*!
+ * ADR-045: snapshot every registered plug-in's load outcome + platform state.
+ * Registered entries come from the discovery root (so a plug-in the loader
+ * never had to try still shows, as NOT_ATTEMPTED); the loader's records add
+ * what each attempt found. On Android, where enumeration is a stub, the
+ * loader's records alone are the list.
+ */
+static void
+fill_plugin_states(struct cli_query_result *r)
+{
+	struct target_plugin_desc descs[16];
+	struct target_plugin_status st[16];
+	int nd = target_plugin_enumerate(descs, 16);
+	int ns = target_plugin_get_status(st, 16);
+	int n = 0;
+
+	for (int i = 0; i < nd && n < 16; i++) {
+		struct target_plugin_status *o = &r->plugin_states[n++];
+		bool found = false;
+		for (int j = 0; j < ns; j++) {
+			if (strcmp(st[j].id, descs[i].id) == 0) {
+				*o = st[j];
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			memset(o, 0, sizeof(*o));
+			snprintf(o->id, sizeof(o->id), "%s", descs[i].id);
+			o->result = TARGET_PLUGIN_RESULT_NOT_ATTEMPTED;
+			o->fallback = strcmp(descs[i].id, "sim-display") == 0;
+		}
+		// The registration is the authority for name / version / order.
+		snprintf(o->display_name, sizeof(o->display_name), "%s", descs[i].display_name);
+		snprintf(o->version, sizeof(o->version), "%s", descs[i].version);
+		o->probe_order = descs[i].probe_order;
+	}
+	for (int j = 0; j < ns && n < 16; j++) {
+		bool listed = false;
+		for (int i = 0; i < nd; i++) {
+			if (strcmp(st[j].id, descs[i].id) == 0) {
+				listed = true;
+				break;
+			}
+		}
+		if (!listed) {
+			r->plugin_states[n++] = st[j];
+		}
+	}
+	// Insertion sort by ProbeOrder (n <= 16).
+	for (int i = 1; i < n; i++) {
+		struct target_plugin_status tmp = r->plugin_states[i];
+		int k = i - 1;
+		while (k >= 0 && r->plugin_states[k].probe_order > tmp.probe_order) {
+			r->plugin_states[k + 1] = r->plugin_states[k];
+			k--;
+		}
+		r->plugin_states[k + 1] = tmp;
+	}
+	r->plugin_state_count = n;
+}
+
+//! Find the ADR-045 record for @p id in @p r, or NULL.
+static const struct target_plugin_status *
+find_plugin_state(const struct cli_query_result *r, const char *id)
+{
+	for (int i = 0; i < r->plugin_state_count; i++) {
+		if (strcmp(r->plugin_states[i].id, id) == 0) {
+			return &r->plugin_states[i];
+		}
+	}
+	return NULL;
+}
+
+/*!
+ * One human line per registered plug-in, e.g.
+ *   vendor plug-in 'Example 3D Display' 2.8.3 — PLATFORM_ABSENT: install the ... (DECLINED; id=..., ProbeOrder=50)
+ * Name and version are the registration's own; nothing vendor-specific here.
+ */
+static void
+format_plugin_state_line(const struct target_plugin_status *p, char *out, size_t cap)
+{
+	const char *name = p->display_name[0] != '\0' ? p->display_name : p->id;
+	char state[192];
+	if (p->platform_state == XRT_PLUGIN_PLATFORM_STATE_UNKNOWN) {
+		snprintf(state, sizeof(state), "UNKNOWN (platform state not reported)");
+	} else {
+		snprintf(state, sizeof(state), "%s%s%s", target_plugin_platform_state_str(p->platform_state),
+		         p->hint[0] != '\0' ? ": " : "", p->hint);
+	}
+	char detail[224];
+	int used = snprintf(detail, sizeof(detail), "%s", target_plugin_load_result_str(p->result));
+	if (used > 0 && (size_t)used < sizeof(detail) && p->reason[0] != '\0') {
+		used += snprintf(detail + used, sizeof(detail) - (size_t)used, ", %s", p->reason);
+	} else if (used > 0 && (size_t)used < sizeof(detail) && p->os_error != 0) {
+		used += snprintf(detail + used, sizeof(detail) - (size_t)used, ", err=%u", (unsigned)p->os_error);
+	}
+	snprintf(out, cap, "%s plug-in '%s'%s%s — %s (%s; id=%s, ProbeOrder=%u)", p->fallback ? "fallback" : "vendor",
+	         name, p->version[0] != '\0' ? " " : "", p->version, state, detail, p->id, (unsigned)p->probe_order);
+}
+
+static void
+print_plugin_states_text(const struct cli_query_result *r)
+{
+	// P()/PT() are defined further down; spelled out here.
+	printf(" :: Registered display plug-ins (ADR-045 platform state)\n");
+	if (r->plugin_state_count == 0) {
+		printf("\tnone registered\n");
+		return;
+	}
+	for (int i = 0; i < r->plugin_state_count; i++) {
+		char line[640];
+		format_plugin_state_line(&r->plugin_states[i], line, sizeof(line));
+		printf("\t%s\n", line);
+	}
+}
+
+static void
+add_plugin_states_json(cJSON *root, const struct cli_query_result *r)
+{
+	cJSON *arr = cJSON_AddArrayToObject(root, "plugins");
+	for (int i = 0; i < r->plugin_state_count; i++) {
+		const struct target_plugin_status *p = &r->plugin_states[i];
+		cJSON *o = cJSON_CreateObject();
+		cJSON_AddStringToObject(o, "id", p->id);
+		cJSON_AddStringToObject(o, "display_name", p->display_name);
+		cJSON_AddStringToObject(o, "version", p->version);
+		cJSON_AddNumberToObject(o, "probe_order", (double)p->probe_order);
+		cJSON_AddBoolToObject(o, "fallback", p->fallback);
+		cJSON_AddStringToObject(o, "load_result", target_plugin_load_result_str(p->result));
+		cJSON_AddStringToObject(o, "platform_state", target_plugin_platform_state_str(p->platform_state));
+		cJSON_AddStringToObject(o, "hint", p->hint);
+		cJSON_AddStringToObject(o, "reason", p->reason);
+		cJSON_AddNumberToObject(o, "os_error", (double)p->os_error);
+		cJSON_AddItemToArray(arr, o);
+	}
+}
+
 void
 cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const struct xrt_instance_info *ii)
 {
@@ -1336,6 +1474,8 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 	r->instance_ok = true;
 
 	xrt_result_t xret = xrt_instance_create_system(h->xi, &h->xsys, &h->xsysd, &h->xso, NULL);
+	// ADR-045: discovery has run (or failed) by now either way.
+	fill_plugin_states(r);
 	if (xret != XRT_SUCCESS || h->xsysd == NULL) {
 		r->result_code = CLI_SELFTEST_INIT_FAIL;
 		return;
@@ -1396,10 +1536,19 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 		         "no better-ranked plug-in failed to load (active ProbeOrder=%u, %d declined their probe)",
 		         (unsigned)disc.active_probe_order, disc.declined_count);
 	} else {
+		// ADR-045: add what the rejected plug-in said about its platform
+		// (UNKNOWN when it never got far enough to be asked).
+		const struct target_plugin_status *rp = find_plugin_state(r, disc.best_rejected_id);
+		char pstate[160] = "";
+		if (rp != NULL) {
+			snprintf(pstate, sizeof(pstate), " [platform %s%s%s]",
+			         target_plugin_platform_state_str(rp->platform_state), rp->hint[0] != '\0' ? ": " : "",
+			         rp->hint);
+		}
 		snprintf(r->vendor_dp_note, sizeof(r->vendor_dp_note),
-		         "'%s' (ProbeOrder=%u) out-ranks the active plug-in but was rejected: %s — the runtime "
+		         "'%s' (ProbeOrder=%u) out-ranks the active plug-in but was rejected: %s%s — the runtime "
 		         "fell back to '%s'",
-		         disc.best_rejected_id, (unsigned)disc.best_rejected_order, disc.best_rejected_reason,
+		         disc.best_rejected_id, (unsigned)disc.best_rejected_order, disc.best_rejected_reason, pstate,
 		         iface->id ? iface->id : "?");
 	}
 
@@ -1771,6 +1920,8 @@ cli_query_print_info_text(const struct cli_query_result *r)
 
 	print_x11_scale_text(r);
 
+	print_plugin_states_text(r);
+
 	P(" :: Display processor\n");
 	if (!r->head_ok) {
 		PT("No display processor discovered.\n");
@@ -2018,6 +2169,8 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 			cJSON_AddNullToObject(ar, "value");
 		}
 	}
+
+	add_plugin_states_json(root, r);
 
 	if (r->plugin_ok) {
 		cJSON *pl = cJSON_AddObjectToObject(root, "plugin");
@@ -2592,6 +2745,9 @@ cli_query_print_selftest_text(const struct cli_query_result *r)
 		P("%s: %s — %s\n", checks[i].ok ? "PASS" : "FAIL", checks[i].name, checks[i].detail);
 	}
 
+	// ADR-045: informational — never changes the verdict or the exit code.
+	print_plugin_states_text(r);
+
 	if (r->result_code == CLI_SELFTEST_PASS) {
 		P(" :: SELF-TEST PASSED\n");
 	} else {
@@ -2616,6 +2772,7 @@ cli_query_selftest_to_cjson(const struct cli_query_result *r)
 	}
 
 	cJSON_AddStringToObject(root, "dpi_awareness", r->dpi_awareness);
+	add_plugin_states_json(root, r);
 	cJSON_AddStringToObject(root, "verdict", r->result_code == CLI_SELFTEST_PASS ? "PASS" : "FAIL");
 	cJSON_AddNumberToObject(root, "result_code", (double)r->result_code);
 

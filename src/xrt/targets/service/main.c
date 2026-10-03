@@ -198,6 +198,59 @@ register_for_restart(bool workspace_mode)
 	}
 }
 
+/*
+ * ADR-045 complete adoption. When a re-probe adopts a better display plug-in
+ * under a head device the fallback created, the IPC server ends its main loop
+ * once no client is connected (ipc_server_restart_requested) and this host
+ * starts a successor that waits for this process to exit, then builds its
+ * whole system on the new plug-in. A successor never restarts itself again
+ * for the same reason (no restart loop if a plug-in flaps between probes).
+ */
+#define SERVICE_ADOPTION_RESTART_ARG "--adoption-restart-after-pid"
+
+//! Start the successor instance (same exe, same integrity: this process's own
+//! token, so a medium-integrity service stays medium). Returns true on success.
+static bool
+start_adoption_successor(bool workspace_mode)
+{
+	wchar_t exe[MAX_PATH];
+	DWORD n = GetModuleFileNameW(NULL, exe, ARRAYSIZE(exe));
+	if (n == 0 || n >= ARRAYSIZE(exe)) {
+		return false;
+	}
+	wchar_t cmd[MAX_PATH + 96];
+	if (_snwprintf_s(cmd, ARRAYSIZE(cmd), _TRUNCATE,
+	                 L"\"%ls\" "
+	                 L"" SERVICE_ADOPTION_RESTART_ARG L" %lu%ls",
+	                 exe, (unsigned long)GetCurrentProcessId(), workspace_mode ? L" --workspace" : L"") < 0) {
+		return false;
+	}
+	STARTUPINFOW si = {0};
+	si.cb = sizeof(si);
+	PROCESS_INFORMATION pi = {0};
+	if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+		return false;
+	}
+	CloseHandle(pi.hThread);
+	CloseHandle(pi.hProcess);
+	return true;
+}
+
+//! Successor side: wait (bounded) for the predecessor to exit so the
+//! singleton mutex and the IPC pipe are free.
+static void
+wait_for_predecessor(unsigned long pid)
+{
+	HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, (DWORD)pid);
+	if (h == NULL) {
+		return; // already gone
+	}
+	DWORD w = WaitForSingleObject(h, 30000);
+	CloseHandle(h);
+	U_LOG_W("Adoption restart: predecessor pid %lu %s.", pid,
+	        w == WAIT_OBJECT_0 ? "exited" : "did not exit within 30 s; continuing");
+}
+
 // GUI subsystem entry point (no console window).
 int WINAPI
 WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
@@ -232,6 +285,7 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 	bool workspace_mode = false;
 	bool autostart = false;
 	bool rm_restart = false;
+	unsigned long adoption_predecessor_pid = 0;
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--workspace") == 0) {
 			workspace_mode = true;
@@ -239,7 +293,16 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 			autostart = true;
 		} else if (strcmp(argv[i], SERVICE_RM_RESTART_ARG) == 0) {
 			rm_restart = true;
+		} else if (strcmp(argv[i], SERVICE_ADOPTION_RESTART_ARG) == 0 && i + 1 < argc) {
+			adoption_predecessor_pid = strtoul(argv[++i], NULL, 10);
 		}
+	}
+
+	// ADR-045: started by our own predecessor to complete a plug-in adoption.
+	if (adoption_predecessor_pid != 0) {
+		U_LOG_W("Started to complete a display plug-in adoption (predecessor pid %lu).",
+		        adoption_predecessor_pid);
+		wait_for_predecessor(adoption_predecessor_pid);
 	}
 
 	// Restarted by Restart Manager after an installer closed us: record the
@@ -323,6 +386,9 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 	            .open = U_DEBUG_GUI_OPEN_AUTO,
 	        },
 	    .workspace_mode = workspace_mode,
+	    // ADR-045: restart once to complete an adoption — but never from an
+	    // instance that is itself such a restart (bounded, no loop).
+	    .allow_adoption_restart = adoption_predecessor_pid == 0,
 	};
 
 	// MCP server moved out of the runtime in 2026-05 — workspace
@@ -333,6 +399,14 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 	struct service_main_args sma = {argc, argv, &ismi, 0};
 	u_crash_guard_run("service-main", service_main_body, &sma);
 	int ret = sma.ret;
+
+	// ADR-045: the IPC server ended its loop to complete a plug-in adoption.
+	// The successor waits for this process to exit before it starts.
+	if (ipc_server_restart_requested()) {
+		bool started = start_adoption_successor(workspace_mode);
+		U_LOG_W("Adoption restart: %s.", started ? "successor started; this instance exits"
+		                                         : "could NOT start a successor (start the service manually)");
+	}
 
 	u_metrics_close();
 

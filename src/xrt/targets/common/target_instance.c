@@ -116,6 +116,8 @@ fill_dp_factories_from_plugin(struct xrt_system_compositor_info *info, const str
 	if (plugin->id != NULL) {
 		snprintf(info->active_plugin_id, sizeof(info->active_plugin_id), "%s", plugin->id);
 	}
+	// ADR-045: drives the service's slow fallback re-probe timer.
+	info->active_plugin_is_fallback = target_plugin_iface_is_fallback(plugin);
 	// #1243/#1244: this is the path Android takes, and it was NOT covered by the
 	// original guard — a config-skewed plug-in reached the compositor here and
 	// faulted inside the Adreno driver instead of being refused. Same check as
@@ -464,6 +466,21 @@ refresh_display_processors_cb(struct xrt_system_compositor_info *info)
 	const struct xrt_plugin_iface *before = target_plugin_get_active();
 	const struct xrt_plugin_iface *plugin = target_plugin_refresh_active();
 	const bool swapped = plugin != before;
+	if (swapped && before != NULL && !info->head_device_stale) {
+		// ADR-045 complete adoption: the weaving DP and display info switch
+		// below, but the head device the system was built on (its rendering
+		// modes, eye tracking, pose binding) belongs to the previous plug-in
+		// and is referenced by the system compositor and every client's
+		// shared-memory snapshot — it cannot be replaced under them. Flag it;
+		// the service restarts once it is idle so the next client gets a
+		// system built on the new plug-in end to end.
+		info->head_device_stale = true;
+		U_LOG_W(
+		    "plug-in adoption: '%s' -> '%s' — weaving DP and display info follow now; the head device (modes, "
+		    "eye tracking) is still the previous plug-in's until the service restarts (when no client is "
+		    "connected).",
+		    before->id ? before->id : "?", plugin->id ? plugin->id : "?");
+	}
 	fill_dp_factories_from_plugin(info, plugin);
 	const enum display_info_refresh_result refreshed = refresh_display_info_from_plugin(info, plugin);
 	// #1721/#1722: while the panel is still unidentified this runs once a

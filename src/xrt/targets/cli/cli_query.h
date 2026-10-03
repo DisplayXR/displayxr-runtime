@@ -19,6 +19,7 @@
 #include "cli_dims_check.h"
 
 #include "xrt/xrt_plugin.h"
+#include "target_plugin_loader.h" // ADR-045 per-plug-in status
 #include "os/os_display_desktop.h"
 #include "os/os_display_scale.h"
 #include "xrt/xrt_device.h"
@@ -195,6 +196,13 @@ struct cli_query_result
 	 * i.e. the runtime fell back. Absence of such a candidate is fine. */
 	bool vendor_dp_ok;
 	char vendor_dp_note[256];
+
+	/* ADR-045 — every registered plug-in with its load outcome and the
+	 * platform state + hint it reports (UNKNOWN for a plug-in that predates
+	 * the get_platform_state slot). Sorted by ProbeOrder. Valid once the
+	 * instance was created; count 0 otherwise. */
+	int plugin_state_count;
+	struct target_plugin_status plugin_states[16];
 
 	/* Head/display device description (valid iff head_ok). */
 	char head_str[256];

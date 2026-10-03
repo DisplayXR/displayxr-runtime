@@ -187,6 +187,88 @@ void
 target_plugin_get_discovery_summary(struct target_plugin_discovery_summary *out);
 
 /*!
+ * Outcome of the loader's most recent attempt at one registered plug-in
+ * (ADR-045). Recorded per entry so diagnostics can say WHY a plug-in is not
+ * the active one without re-loading anything.
+ */
+enum target_plugin_load_result
+{
+	TARGET_PLUGIN_RESULT_NOT_ATTEMPTED = 0,  //!< a better-ranked plug-in won first
+	TARGET_PLUGIN_RESULT_ACTIVE,             //!< the active plug-in
+	TARGET_PLUGIN_RESULT_CLAIMED,            //!< probe succeeded; loaded, not the active one
+	TARGET_PLUGIN_RESULT_DECLINED,           //!< loaded, probe declined (not my hardware / platform)
+	TARGET_PLUGIN_RESULT_BINARY_MISSING,     //!< registered Binary does not exist (orphan entry)
+	TARGET_PLUGIN_RESULT_DEPENDENCY_MISSING, //!< binary exists, a library it imports does not
+	TARGET_PLUGIN_RESULT_LOAD_FAILED,        //!< any other load failure
+	TARGET_PLUGIN_RESULT_PATH_REFUSED,       //!< dev/build-tree path refused (#952)
+	TARGET_PLUGIN_RESULT_NO_ENTRY_POINT,     //!< no xrtPluginNegotiate export
+	TARGET_PLUGIN_RESULT_NEGOTIATE_FAILED,   //!< negotiate returned an error
+	TARGET_PLUGIN_RESULT_ABI_MISMATCH,       //!< ADR-020 rule 3 reject
+	TARGET_PLUGIN_RESULT_PROBE_FAILED,       //!< probe returned a hard error
+};
+
+/*!
+ * Per-registered-plug-in record kept by the loader (ADR-045): the last load
+ * outcome plus the platform state the plug-in reported through
+ * `xrt_plugin_iface::get_platform_state` at that attempt. All strings UTF-8.
+ */
+struct target_plugin_status
+{
+	char id[64];
+	char display_name[128]; //!< discovery-root DisplayName (never hardcoded)
+	char version[64];       //!< discovery-root Version
+	uint32_t probe_order;
+	enum target_plugin_load_result result;
+	//! OS error of a failed load (Win32 error code), 0 if none.
+	uint32_t os_error;
+	//! @ref xrt_plugin_platform_state; UNKNOWN when not reported.
+	uint32_t platform_state;
+	//! `XRT_PLUGIN_PLATFORM_FLAG_*`.
+	uint32_t platform_flags;
+	//! Vendor-written hint, shown verbatim.
+	char hint[XRT_PLUGIN_PLATFORM_HINT_MAX];
+	//! Loader-written detail for a failure (ABI text, dlerror, ...); "" if none.
+	char reason[160];
+	//! A FALLBACK plug-in (same rule as @ref target_plugin_iface_is_fallback).
+	bool fallback;
+};
+
+/*!
+ * Copy the loader's per-plug-in records (one per registered plug-in it has
+ * seen this process, in first-seen order) into @p out; returns the count.
+ * The active plug-in's platform state is re-queried live (the slot is cheap
+ * and thread-safe by contract), so a vendor plug-in that later reports
+ * NO_DISPLAY shows it. Safe from any thread; never loads anything.
+ */
+int
+target_plugin_get_status(struct target_plugin_status *out, int max);
+
+//! Short stable name for a @ref target_plugin_load_result ("ACTIVE", ...).
+const char *
+target_plugin_load_result_str(enum target_plugin_load_result r);
+
+//! Short stable name for an @ref xrt_plugin_platform_state ("READY", ...).
+const char *
+target_plugin_platform_state_str(uint32_t state);
+
+/*!
+ * Live platform state of the active plug-in (`get_platform_state`, struct_size
+ * gated). Returns false (and fills UNKNOWN) when none is active or it does not
+ * report one. Thread-safe.
+ */
+bool
+target_plugin_query_active_platform_state(struct xrt_plugin_platform_status *out);
+
+/*!
+ * Is @p iface a FALLBACK plug-in (ADR-045 D3)? True when it reports
+ * `XRT_PLUGIN_PLATFORM_FLAG_FALLBACK`; for a plug-in that does not report
+ * platform state, true only for the runtime's own simulation plug-in id
+ * (`sim-display`) — never decided by a vendor id.
+ */
+bool
+target_plugin_iface_is_fallback(const struct xrt_plugin_iface *iface);
+
+/*!
  * Returns the @ref xrt_plugin_instance handle returned by the active
  * plug-in's `iface->probe()`, or NULL if no plug-in is active or the
  * plug-in's probe yielded a NULL instance (the v1 sim_display and
@@ -203,6 +285,11 @@ target_plugin_get_active_instance(void);
  * (lower ProbeOrder) plug-in than the currently active one is now
  * registered (or no plug-in was active before), swap it in and return
  * its iface. Otherwise returns the unchanged current iface.
+ *
+ * No live swap (ADR-045 D3): when the active plug-in is NOT a fallback
+ * (@ref target_plugin_iface_is_fallback), this returns it unchanged without
+ * re-probing anything — a vendor plug-in that loses its display reports
+ * NO_DISPLAY and stays selected.
  *
  * Concretely: addresses issue #342 — the service starts mid-install
  * with only `sim-display` registered (ProbeOrder 200) and bakes its
