@@ -195,6 +195,22 @@ sim_display_plugin_probe_displays(struct xrt_plugin_instance *inst,
  *
  */
 
+/*!
+ * ADR-045 platform state. sim_display has no platform to be missing: it is
+ * always READY, and it is the FALLBACK plug-in — the runtime adopts a vendor
+ * plug-in on re-probe only while this one is active.
+ */
+static bool
+sim_display_plugin_get_platform_state(struct xrt_plugin_platform_status *out_status)
+{
+	if (out_status == NULL || out_status->struct_size < offsetof(struct xrt_plugin_platform_status, hint)) {
+		return false;
+	}
+	out_status->state = XRT_PLUGIN_PLATFORM_STATE_READY;
+	out_status->flags = XRT_PLUGIN_PLATFORM_FLAG_FALLBACK;
+	return true;
+}
+
 static struct xrt_plugin_iface g_sim_display_iface = {
     .struct_size = sizeof(struct xrt_plugin_iface),
     .reserved_0 = 0,
@@ -265,6 +281,8 @@ static struct xrt_plugin_iface g_sim_display_iface = {
 #else
     .create_dp_d3d11_lift = NULL,
 #endif
+
+    .get_platform_state = sim_display_plugin_get_platform_state,
 };
 
 

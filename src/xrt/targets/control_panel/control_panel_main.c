@@ -232,6 +232,13 @@ struct panel_state
 	bool have_plugin;
 	char pl_id[64], pl_name[128], pl_vendor[64], pl_ver[64];
 	char device[256];
+	// ADR-045: every registered plug-in's platform state (from `info --json`).
+	int n_pstates;
+	struct
+	{
+		char line[400];
+		bool degraded; // a non-READY state the user can act on
+	} pstates[8];
 	bool have_display;
 	double w_m, h_m;
 	int px, py;
@@ -372,6 +379,30 @@ refresh_info(struct panel_state *s)
 	}
 
 	cpy_str(s->device, sizeof(s->device), root, "device");
+
+	// ADR-045: per-plug-in platform state + vendor hint, shown verbatim.
+	s->n_pstates = 0;
+	const cJSON *pls = cJSON_GetObjectItemCaseSensitive(root, "plugins");
+	const cJSON *pe = NULL;
+	cJSON_ArrayForEach(pe, pls)
+	{
+		if (s->n_pstates >= 8) {
+			break;
+		}
+		char name[128], ver[64], st[32], hint[160], lr[32];
+		cpy_str(name, sizeof(name), pe, "display_name");
+		if (name[0] == '\0') {
+			cpy_str(name, sizeof(name), pe, "id");
+		}
+		cpy_str(ver, sizeof(ver), pe, "version");
+		cpy_str(st, sizeof(st), pe, "platform_state");
+		cpy_str(hint, sizeof(hint), pe, "hint");
+		cpy_str(lr, sizeof(lr), pe, "load_result");
+		snprintf(s->pstates[s->n_pstates].line, sizeof(s->pstates[0].line), "%s %s - %s%s%s  [%s]", name, ver,
+		         st, hint[0] != '\0' ? ": " : "", hint, lr);
+		s->pstates[s->n_pstates].degraded = strcmp(st, "READY") != 0 && strcmp(st, "UNKNOWN") != 0;
+		s->n_pstates++;
+	}
 
 	const cJSON *d = cJSON_GetObjectItemCaseSensitive(root, "display");
 	if (cJSON_IsObject(d)) {
@@ -844,6 +875,16 @@ draw_panel(struct panel_state *s)
 		igText("Version : %s", s->pl_ver[0] ? s->pl_ver : "?");
 		igTextColored(COL_GREEN, "ABI v%d (loader-verified match)", s->rt_abi);
 		igText("Device  : %s", s->device);
+	}
+	if (s->n_pstates > 0) {
+		igText("Registered plug-ins (platform state):");
+		for (int i = 0; i < s->n_pstates; i++) {
+			if (s->pstates[i].degraded) {
+				igTextColored(COL_AMBER, "  %s", s->pstates[i].line);
+			} else {
+				igText("  %s", s->pstates[i].line);
+			}
+		}
 	}
 
 	// ---- Display ----

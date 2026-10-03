@@ -733,6 +733,213 @@ repull_display_info_if_unknown(struct ipc_server *s)
 	// until they reconnect. See docs/reference/xrt_plugin_iface.md.
 }
 
+#ifndef XRT_OS_ANDROID
+/*
+ *
+ * ADR-045 R-c: world-event display re-probe + adoption restart.
+ *
+ * Selection used to be re-evaluated only on CLIENT events (connect,
+ * compositor create, the #1721 1 Hz pull while the display info is unknown).
+ * A display plugged in, a vendor platform coming up, or a plug-in registered
+ * while no client happened to connect went unnoticed until the next app
+ * launch. The service host now reports world events through
+ * ipc_server_request_display_reprobe(); a small worker debounces them and runs
+ * the same refresh callback the client paths use, plus a slow timer while the
+ * fallback plug-in is active (its platform may come up without any event we
+ * can see). The refresh itself never swaps away from a non-fallback plug-in
+ * (target_plugin_refresh_active, "no live swap").
+ *
+ * The worker deliberately does NOT take global_state.lock: a plug-in that
+ * predates the ~100 ms probe rule can block inside probe() for many seconds,
+ * and the main loop takes that lock every tick. The refresh callback guards
+ * its own state (loader + display-info mutexes), exactly as on the
+ * compositor-create path, which also calls it without the global lock.
+ *
+ */
+
+//! Bursts of world events (a dock connecting fires several DEVNODES_CHANGED +
+//! DISPLAYCHANGE) collapse into one refresh this long after the last of them.
+#define REPROBE_DEBOUNCE_NS ((uint64_t)U_TIME_1S_IN_NS)
+//! Slow re-probe cadence while the fallback plug-in is the active one.
+#define REPROBE_FALLBACK_PERIOD_NS ((uint64_t)10 * U_TIME_1S_IN_NS)
+//! An adoption restart waits for this much continuous idleness, so a client
+//! that is just reconnecting is not raced.
+#define ADOPTION_RESTART_IDLE_NS ((uint64_t)2 * U_TIME_1S_IN_NS)
+
+static struct os_mutex g_reprobe_mutex;
+static struct os_cond g_reprobe_cond;
+static struct os_thread g_reprobe_thread;
+static volatile bool g_reprobe_active = false; //!< worker accepting requests
+static bool g_reprobe_stop = false;            //!< guarded by g_reprobe_mutex
+static bool g_reprobe_pending = false;         //!< guarded by g_reprobe_mutex
+static const char *g_reprobe_reason = NULL;    //!< guarded by g_reprobe_mutex
+static uint64_t g_reprobe_last_request_ns = 0; //!< guarded by g_reprobe_mutex
+
+static bool g_allow_adoption_restart = false;
+static volatile bool g_restart_requested = false;
+
+void
+ipc_server_request_display_reprobe(const char *reason)
+{
+	if (!g_reprobe_active) {
+		return;
+	}
+	os_mutex_lock(&g_reprobe_mutex);
+	g_reprobe_pending = true;
+	g_reprobe_reason = reason;
+	g_reprobe_last_request_ns = os_monotonic_get_ns();
+	os_cond_signal(&g_reprobe_cond);
+	os_mutex_unlock(&g_reprobe_mutex);
+}
+
+bool
+ipc_server_restart_requested(void)
+{
+	return g_restart_requested;
+}
+
+static void
+reprobe_run(struct ipc_server *s, const char *reason)
+{
+	if (s->xsysc == NULL || s->xsysc->info.refresh_display_processors == NULL) {
+		return;
+	}
+	U_LOG_I("display re-probe (%s): re-evaluating display-processor selection.", reason != NULL ? reason : "?");
+	const bool was_fallback = s->xsysc->info.active_plugin_is_fallback;
+	s->xsysc->info.refresh_display_processors(&s->xsysc->info);
+	if (was_fallback && !s->xsysc->info.active_plugin_is_fallback) {
+		U_LOG_W("display re-probe (%s): adopted plug-in '%s' (was the fallback).",
+		        reason != NULL ? reason : "?", s->xsysc->info.active_plugin_id);
+	}
+}
+
+static void *
+reprobe_thread_func(void *ptr)
+{
+	struct ipc_server *s = (struct ipc_server *)ptr;
+	uint64_t last_fallback_ns = os_monotonic_get_ns();
+
+	os_mutex_lock(&g_reprobe_mutex);
+	while (!g_reprobe_stop) {
+		const uint64_t now = os_monotonic_get_ns();
+		const char *reason = NULL;
+
+		if (g_reprobe_pending) {
+			const uint64_t since = now - g_reprobe_last_request_ns;
+			if (since < REPROBE_DEBOUNCE_NS) {
+				// Still inside a burst: wait for it to settle.
+				os_cond_wait_timeout_ns(&g_reprobe_cond, &g_reprobe_mutex, REPROBE_DEBOUNCE_NS - since);
+				continue;
+			}
+			reason = g_reprobe_reason;
+			g_reprobe_pending = false;
+		} else if (s->xsysc != NULL && s->xsysc->info.active_plugin_is_fallback &&
+		           now - last_fallback_ns >= REPROBE_FALLBACK_PERIOD_NS) {
+			reason = "fallback timer";
+		}
+
+		if (reason == NULL) {
+			os_cond_wait_timeout_ns(&g_reprobe_cond, &g_reprobe_mutex, U_TIME_1S_IN_NS);
+			continue;
+		}
+
+		os_mutex_unlock(&g_reprobe_mutex);
+		reprobe_run(s, reason);
+		last_fallback_ns = os_monotonic_get_ns();
+		os_mutex_lock(&g_reprobe_mutex);
+	}
+	os_mutex_unlock(&g_reprobe_mutex);
+	return NULL;
+}
+
+static void
+reprobe_start(struct ipc_server *s)
+{
+	if (os_mutex_init(&g_reprobe_mutex) != 0) {
+		return;
+	}
+	if (os_cond_init(&g_reprobe_cond) != 0) {
+		os_mutex_destroy(&g_reprobe_mutex);
+		return;
+	}
+	g_reprobe_stop = false;
+	if (os_thread_init(&g_reprobe_thread) != 0 ||
+	    os_thread_start(&g_reprobe_thread, reprobe_thread_func, (void *)s) != 0) {
+		U_LOG_W(
+		    "display re-probe worker could not start; only client events will re-probe display "
+		    "selection.");
+		return;
+	}
+	os_thread_name(&g_reprobe_thread, "dxr-reprobe");
+	g_reprobe_active = true;
+}
+
+static void
+reprobe_stop(void)
+{
+	if (!g_reprobe_active) {
+		return;
+	}
+	g_reprobe_active = false;
+	os_mutex_lock(&g_reprobe_mutex);
+	g_reprobe_stop = true;
+	os_cond_signal(&g_reprobe_cond);
+	os_mutex_unlock(&g_reprobe_mutex);
+	// Bounded by one in-flight refresh. The mutex/cond are intentionally not
+	// destroyed: a world-event source on another thread may still be between
+	// its g_reprobe_active check and the lock, and the process exits next.
+	os_thread_join(&g_reprobe_thread);
+	os_thread_destroy(&g_reprobe_thread);
+}
+
+/*!
+ * Main-loop half of a complete adoption (ADR-045): a refresh adopted a better
+ * plug-in, but the system's head device still belongs to the previous one.
+ * Once no client has been connected for ADOPTION_RESTART_IDLE_NS, end the
+ * main loop and let the host start a successor whose system is built on the
+ * new plug-in. Clients connected meanwhile keep running on the weaving DP and
+ * display info that already switched; they pick up the complete system when
+ * they reconnect after the restart.
+ */
+static void
+maybe_request_adoption_restart(struct ipc_server *s)
+{
+	if (s->xsysc == NULL || !s->xsysc->info.head_device_stale || g_restart_requested) {
+		return;
+	}
+	static uint64_t idle_since_ns = 0;
+	static bool warned_disallowed = false;
+	if (!g_allow_adoption_restart) {
+		if (!warned_disallowed) {
+			warned_disallowed = true;
+			U_LOG_W(
+			    "plug-in adoption is partial (head device from the previous plug-in) and this instance "
+			    "will not restart itself for it; restart the service for a complete adoption.");
+		}
+		return;
+	}
+	os_mutex_lock(&s->global_state.lock);
+	const uint32_t clients = s->global_state.connected_client_count;
+	os_mutex_unlock(&s->global_state.lock);
+	const uint64_t now = os_monotonic_get_ns();
+	if (clients != 0) {
+		idle_since_ns = 0;
+		return;
+	}
+	if (idle_since_ns == 0) {
+		idle_since_ns = now;
+		return;
+	}
+	if (now - idle_since_ns < ADOPTION_RESTART_IDLE_NS) {
+		return;
+	}
+	U_LOG_W("plug-in adoption: no client connected — restarting the service so the head device follows '%s'.",
+	        s->xsysc->info.active_plugin_id);
+	g_restart_requested = true;
+	s->running = false;
+}
+#endif // !XRT_OS_ANDROID
+
 static int
 main_loop(struct ipc_server *s)
 {
@@ -775,6 +982,11 @@ main_loop(struct ipc_server *s)
 		// #1721: ~1 Hz display-info re-pull while the plug-in has not
 		// identified the panel yet; a no-op once it has.
 		repull_display_info_if_unknown(s);
+
+#ifndef XRT_OS_ANDROID
+		// ADR-045: complete a partial plug-in adoption by restarting when idle.
+		maybe_request_adoption_restart(s);
+#endif
 
 #ifdef XRT_OS_ANDROID
 		// #1278: drive the visibility/weave-idle convergent pass from THIS
@@ -1556,8 +1768,14 @@ ipc_server_main(int argc, char **argv, const struct ipc_server_main_info *ismi)
 	// Print a very clear service started message.
 	print_linux_end_user_started_information(log_level);
 #endif
+	// ADR-045 R-c: world-event re-probe worker (the service host feeds it).
+	g_allow_adoption_restart = ismi->allow_adoption_restart;
+	reprobe_start(s);
+
 	// Main loop.
 	ret = main_loop(s);
+
+	reprobe_stop();
 
 	// Stop the UI before tearing everything down.
 	u_debug_gui_stop(&s->debug_gui);

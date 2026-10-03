@@ -11,11 +11,16 @@
 #include "service_workspace_registry.h"
 
 #include <windows.h>
+#include <dbt.h>
 #include <shellapi.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "util/u_crash_guard.h"
 #include "util/u_logging.h"
+
+#include "server/ipc_server_interface.h" // ADR-045: ipc_server_request_display_reprobe
+#include "target_plugin_loader.h"        // ADR-045: per-plug-in platform state for the tooltip
 
 #define IDI_DISPLAYXR_ICON_WHITE 101
 #define IDI_DISPLAYXR_ICON_BLACK 102
@@ -28,6 +33,10 @@
 #define IDM_START_ON_LOGIN  1030
 #define IDM_CONTROL_PANEL   1002
 #define IDM_EXIT            1001
+
+// ADR-045: tooltip refresh of the display-processor status line.
+#define TRAY_STATUS_TIMER_ID 1
+#define TRAY_STATUS_PERIOD_MS 5000
 
 // Workspace published-action IDs. Range matches
 // WORKSPACE_REGISTRY_MAX_ACTIONS (16) with a small margin for growth.
@@ -48,6 +57,10 @@ static NOTIFYICONDATAW s_nid;
 static service_tray_shutdown_cb s_shutdown_cb = NULL;
 static service_tray_config_change_cb s_config_cb = NULL;
 static struct service_config s_config;
+
+// ADR-045 R-c: registry waiter on the plug-in registration root.
+static HANDLE s_reg_watch_thread = NULL;
+static HANDLE s_reg_watch_stop = NULL;
 
 
 /*
@@ -315,6 +328,179 @@ request_service_exit(void)
 
 /*
  *
+ * Display-processor status (ADR-045 R-e)
+ *
+ */
+
+/*!
+ * One line for the tray tooltip: which display processor is active, plus a
+ * degraded reason when it is the fallback (why the better-ranked plug-in is
+ * not active, in that plug-in's own words) or when the active plug-in reports
+ * NO_DISPLAY. Names come from the plug-in registration (DisplayName); nothing
+ * vendor-specific is known here. Never triggers discovery: it reads the
+ * loader's records, which the IPC server's instance filled in.
+ */
+static void
+build_status_line(char *out, size_t cap)
+{
+	struct target_plugin_status st[16];
+	int n = target_plugin_get_status(st, 16);
+	const struct target_plugin_status *active = NULL;
+	const struct target_plugin_status *best_other = NULL;
+	for (int i = 0; i < n; i++) {
+		if (st[i].result == TARGET_PLUGIN_RESULT_ACTIVE) {
+			active = &st[i];
+		} else if (!st[i].fallback && st[i].result != TARGET_PLUGIN_RESULT_NOT_ATTEMPTED &&
+		           (best_other == NULL || st[i].probe_order < best_other->probe_order)) {
+			best_other = &st[i];
+		}
+	}
+
+	if (active == NULL) {
+		snprintf(out, cap, "%s", n == 0 ? "Display: starting" : "Display: no display processor");
+		return;
+	}
+	const char *name = active->display_name[0] != '\0' ? active->display_name : active->id;
+
+	if (active->fallback) {
+		if (best_other == NULL) {
+			snprintf(out, cap, "Display: %s (no 3D display plug-in)", name);
+			return;
+		}
+		const char *other = best_other->display_name[0] != '\0' ? best_other->display_name : best_other->id;
+		if (best_other->platform_state != XRT_PLUGIN_PLATFORM_STATE_UNKNOWN) {
+			snprintf(out, cap, "Display: %s. %s: %s%s%s", name, other,
+			         target_plugin_platform_state_str(best_other->platform_state),
+			         best_other->hint[0] != '\0' ? " - " : "", best_other->hint);
+		} else {
+			snprintf(out, cap, "Display: %s. %s: %s", name, other,
+			         target_plugin_load_result_str(best_other->result));
+		}
+		return;
+	}
+
+	if (active->platform_state == XRT_PLUGIN_PLATFORM_STATE_NO_DISPLAY) {
+		snprintf(out, cap, "Display: %s: NO_DISPLAY%s%s", name, active->hint[0] != '\0' ? " - " : "",
+		         active->hint);
+		return;
+	}
+	snprintf(out, cap, "Display: %s", name);
+}
+
+static void
+update_status_tooltip(void)
+{
+	char line[192];
+	build_status_line(line, sizeof(line));
+
+	wchar_t wline[192];
+	if (MultiByteToWideChar(CP_UTF8, 0, line, -1, wline, ARRAYSIZE(wline)) == 0) {
+		wline[0] = L'\0';
+	}
+	wchar_t tip[ARRAYSIZE(s_nid.szTip)];
+	_snwprintf_s(tip, ARRAYSIZE(tip), _TRUNCATE, L"DisplayXR Service\n%ls", wline);
+	if (wcscmp(tip, s_nid.szTip) == 0) {
+		return;
+	}
+	wcscpy_s(s_nid.szTip, ARRAYSIZE(s_nid.szTip), tip);
+	s_nid.uFlags = NIF_TIP;
+	Shell_NotifyIconW(NIM_MODIFY, &s_nid);
+	s_nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
+}
+
+
+/*
+ *
+ * World-event sources for the display re-probe (ADR-045 R-c)
+ *
+ */
+
+/*!
+ * Watch HKLM\Software\DisplayXR\DisplayProcessors (subtree) so a plug-in
+ * registered, removed or re-registered while the service runs is re-probed at
+ * once instead of on the next client connect. The root may not exist yet (no
+ * plug-in ever installed): wait on HKLM\Software\DisplayXR instead until it
+ * does. Requests go through ipc_server_request_display_reprobe, which only
+ * flags the IPC server's debounced worker, so nothing here blocks on a probe.
+ */
+static DWORD WINAPI
+reg_watch_thread_body(LPVOID param)
+{
+	(void)param;
+	HANDLE ev = CreateEventW(NULL, FALSE, FALSE, NULL);
+	if (ev == NULL) {
+		return 1;
+	}
+	for (;;) {
+		bool watching_root = true;
+		HKEY key = NULL;
+		if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software\\DisplayXR\\DisplayProcessors", 0,
+		                  KEY_NOTIFY | KEY_WOW64_64KEY, &key) != ERROR_SUCCESS) {
+			watching_root = false;
+			if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software\\DisplayXR", 0, KEY_NOTIFY | KEY_WOW64_64KEY,
+			                  &key) != ERROR_SUCCESS) {
+				key = NULL;
+			}
+		}
+
+		DWORD w;
+		if (key != NULL && RegNotifyChangeKeyValue(key, TRUE,
+		                                           REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET |
+		                                               REG_NOTIFY_THREAD_AGNOSTIC,
+		                                           ev, TRUE) == ERROR_SUCCESS) {
+			HANDLE hs[2] = {s_reg_watch_stop, ev};
+			w = WaitForMultipleObjects(2, hs, FALSE, INFINITE);
+		} else {
+			// Nothing to watch yet (or the API failed): poll slowly.
+			w = WaitForSingleObject(s_reg_watch_stop, 10000);
+		}
+		if (key != NULL) {
+			RegCloseKey(key);
+		}
+		if (w == WAIT_OBJECT_0) {
+			break; // stop
+		}
+		if (w == WAIT_OBJECT_0 + 1 && watching_root) {
+			ipc_server_request_display_reprobe("plug-in registration changed");
+		}
+	}
+	CloseHandle(ev);
+	return 0;
+}
+
+static void
+reg_watch_start(void)
+{
+	s_reg_watch_stop = CreateEventW(NULL, TRUE, FALSE, NULL);
+	if (s_reg_watch_stop == NULL) {
+		return;
+	}
+	s_reg_watch_thread = CreateThread(NULL, 0, reg_watch_thread_body, NULL, 0, NULL);
+	if (s_reg_watch_thread == NULL) {
+		U_LOG_W("Could not start the plug-in registration watcher (error %lu).", GetLastError());
+	}
+}
+
+static void
+reg_watch_stop(void)
+{
+	if (s_reg_watch_stop != NULL) {
+		SetEvent(s_reg_watch_stop);
+	}
+	if (s_reg_watch_thread != NULL) {
+		WaitForSingleObject(s_reg_watch_thread, 2000);
+		CloseHandle(s_reg_watch_thread);
+		s_reg_watch_thread = NULL;
+	}
+	if (s_reg_watch_stop != NULL) {
+		CloseHandle(s_reg_watch_stop);
+		s_reg_watch_stop = NULL;
+	}
+}
+
+
+/*
+ *
  * Session-end window (Restart Manager, logoff, shutdown)
  *
  */
@@ -410,6 +596,18 @@ session_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		session_end_request_exit("WM_CLOSE", lParam);
 		return 0;
 
+	// ADR-045 R-c: world events re-evaluate display-processor selection. Both
+	// are broadcast only to TOP-LEVEL windows, which is why they land here and
+	// not on the message-only tray window. The request only flags the IPC
+	// server's debounced worker; the refresh never runs on this thread.
+	case WM_DISPLAYCHANGE: ipc_server_request_display_reprobe("display change"); return 0;
+
+	case WM_DEVICECHANGE:
+		if (wParam == DBT_DEVNODES_CHANGED) {
+			ipc_server_request_display_reprobe("device change");
+		}
+		return TRUE;
+
 	default: return DefWindowProcW(hwnd, msg, wParam, lParam);
 	}
 }
@@ -490,6 +688,12 @@ tray_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		return 0;
 	}
 
+	case WM_TIMER:
+		if (wParam == TRAY_STATUS_TIMER_ID) {
+			update_status_tooltip();
+		}
+		return 0;
+
 	case WM_SETTINGCHANGE:
 		// Windows theme changed — swap tray icon to match
 		s_nid.hIcon = load_theme_icon();
@@ -497,6 +701,7 @@ tray_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		return 0;
 
 	case WM_DESTROY:
+		KillTimer(hwnd, TRAY_STATUS_TIMER_ID);
 		Shell_NotifyIconW(NIM_DELETE, &s_nid);
 		PostQuitMessage(0);
 		return 0;
@@ -566,6 +771,10 @@ tray_thread_body(LPVOID param)
 
 	Shell_NotifyIconW(NIM_ADD, &s_nid);
 
+	// ADR-045 R-e: keep the tooltip's display-processor line current (cheap:
+	// reads the loader's records + one platform-state query).
+	SetTimer(s_tray_hwnd, TRAY_STATUS_TIMER_ID, TRAY_STATUS_PERIOD_MS, NULL);
+
 	// Signal that we're ready
 	SetEvent(s_ready_event);
 
@@ -632,12 +841,17 @@ service_tray_init(service_tray_shutdown_cb shutdown_cb,
 	CloseHandle(s_ready_event);
 	s_ready_event = NULL;
 
+	// ADR-045 R-c: plug-in registration changes re-probe selection.
+	reg_watch_start();
+
 	return s_tray_hwnd != NULL;
 }
 
 void
 service_tray_cleanup(void)
 {
+	reg_watch_stop();
+
 	if (s_tray_hwnd) {
 		// Tell the tray thread to exit
 		PostMessageW(s_tray_hwnd, WM_DESTROY, 0, 0);

@@ -246,6 +246,81 @@ struct xrt_display_claim
 	char serial[64];
 };
 
+/*!
+ * Generic state of the vendor platform a plug-in drives (ADR-045), reported
+ * through `xrt_plugin_iface::get_platform_state`. Vendor-neutral by design:
+ * the runtime acts only on these values and shows the plug-in's hint string
+ * verbatim; it never learns what the platform is.
+ *
+ * Values are stable ABI (appended only).
+ */
+enum xrt_plugin_platform_state
+{
+	//! Not reported: slot absent (older plug-in), call returned false, or a
+	//! value this runtime does not know. Treated as "carry on as before".
+	XRT_PLUGIN_PLATFORM_STATE_UNKNOWN = 0,
+	//! Platform installed, running, and its display is attached.
+	XRT_PLUGIN_PLATFORM_STATE_READY = 1,
+	//! The vendor platform runtime is not installed on this machine.
+	XRT_PLUGIN_PLATFORM_STATE_PLATFORM_ABSENT = 2,
+	//! Installed, but its service/daemon is not running (yet).
+	XRT_PLUGIN_PLATFORM_STATE_PLATFORM_NOT_RUNNING = 3,
+	//! Platform present and running, but none of its displays is attached.
+	XRT_PLUGIN_PLATFORM_STATE_NO_DISPLAY = 4,
+	//! Platform present but unusable by this plug-in (version too old/new,
+	//! unsupported OS or GPU, ...). The hint says what.
+	XRT_PLUGIN_PLATFORM_STATE_INCOMPATIBLE = 5,
+};
+
+/*!
+ * Bits for @ref xrt_plugin_platform_status::flags.
+ * @{
+ */
+/*!
+ * This plug-in is a FALLBACK (e.g. the vendor-neutral simulation display):
+ * it claims any system so the runtime always has a display processor. The
+ * runtime adopts a better plug-in on re-probe only while the active one
+ * carries this bit — the "no live swap" rule (ADR-045 D3). Vendor plug-ins
+ * MUST NOT set it.
+ */
+#define XRT_PLUGIN_PLATFORM_FLAG_FALLBACK (1u << 0)
+/*! @} */
+
+/*! Size of @ref xrt_plugin_platform_status::hint, including the NUL. */
+#define XRT_PLUGIN_PLATFORM_HINT_MAX 128
+
+/*!
+ * Out-param of `xrt_plugin_iface::get_platform_state`. The runtime sets
+ * @ref struct_size and zero-fills the rest before the call; the plug-in
+ * MUST NOT write past `struct_size`. Grows by consuming @ref reserved
+ * (append-only; no ABI bump).
+ */
+struct xrt_plugin_platform_status
+{
+	/*! `sizeof(struct xrt_plugin_platform_status)` as the RUNTIME knows it. */
+	uint32_t struct_size;
+
+	/*! @ref xrt_plugin_platform_state value. */
+	uint32_t state;
+
+	/*! Bitmask of `XRT_PLUGIN_PLATFORM_FLAG_*`. */
+	uint32_t flags;
+
+	/*! Reserved for alignment. Must be 0. */
+	uint32_t reserved_0;
+
+	/*!
+	 * Short, user-facing, vendor-written hint, UTF-8, NUL-terminated,
+	 * truncated to fit — e.g. what to install or plug in. Empty when there
+	 * is nothing to say (typically READY). Shown verbatim by the runtime's
+	 * diagnostics (cli, tray); never parsed.
+	 */
+	char hint[XRT_PLUGIN_PLATFORM_HINT_MAX];
+
+	/*! Reserved for future fields. Plug-ins MUST leave these 0. */
+	uint64_t reserved[8];
+};
+
 
 /*
  *
@@ -811,6 +886,45 @@ struct xrt_plugin_iface
 	 * XRT_PLUGIN_API_VERSION_CURRENT bump).
 	 */
 	xrt_dp_factory_d3d11_fn_t create_dp_d3d11_lift;
+
+	/*!
+	 * Report the plug-in's generic platform state (ADR-045): whether the
+	 * vendor platform it drives is installed, running, and has its display
+	 * attached — plus a short vendor-written hint for the user.
+	 *
+	 * **Callable before `probe()` succeeds, and without an instance.** The
+	 * loader calls it right after a successful negotiation and before
+	 * `probe()`, so a plug-in that is about to decline can still say why;
+	 * it calls it again on every re-probe, and the runtime's diagnostics
+	 * (`displayxr-cli`, the service tray) call it at any time afterwards,
+	 * including while the plug-in is the active one. The answer is
+	 * therefore about the plug-in's process-wide view of its platform, not
+	 * about one instance.
+	 *
+	 * Contract:
+	 *   - Cheap and non-blocking: presence checks only (a registry value, a
+	 *     named object, an EDID table lookup). MUST return within the same
+	 *     ~100 ms budget as `probe()` and MUST NOT wait for the vendor
+	 *     platform to become ready. Thread-safe: may be called from any
+	 *     thread, concurrently with the plug-in's other entry points.
+	 *   - The runtime sets `out_status->struct_size` to its own
+	 *     `sizeof(struct xrt_plugin_platform_status)` and zero-fills the
+	 *     rest before the call; the plug-in MUST NOT write past that offset.
+	 *   - Returns `true` if `out_status` was filled. `false` (or a NULL
+	 *     slot, or a plug-in whose `struct_size` predates this field) means
+	 *     "not reported": the runtime records
+	 *     @ref XRT_PLUGIN_PLATFORM_STATE_UNKNOWN and carries on exactly as
+	 *     before — the state is advisory and never gates loading.
+	 *
+	 * The runtime never interprets the hint; it only displays it. It does
+	 * interpret the state and @ref XRT_PLUGIN_PLATFORM_FLAG_FALLBACK, and
+	 * only generically (selection never re-routes away from an active
+	 * non-fallback plug-in — "no live swap", ADR-045).
+	 *
+	 * Optional. Appended per ADR-020 (append-only within a major; gated by
+	 * @ref struct_size; no XRT_PLUGIN_API_VERSION_CURRENT bump).
+	 */
+	bool (*get_platform_state)(struct xrt_plugin_platform_status *out_status);
 };
 
 /*!
@@ -819,6 +933,15 @@ struct xrt_plugin_iface
  * an older runtime header can #ifdef-guard filling it.
  */
 #define XRT_PLUGIN_IFACE_HAS_D3D11_LIFT_FACTORY 1
+
+/*!
+ * Defined when @ref xrt_plugin_iface carries @ref
+ * xrt_plugin_iface::get_platform_state and this header defines
+ * @ref xrt_plugin_platform_state / @ref xrt_plugin_platform_status (ADR-045),
+ * so a plug-in built against an older runtime header can #ifdef-guard
+ * implementing it.
+ */
+#define XRT_PLUGIN_HAS_PLATFORM_STATE 1
 
 
 /*

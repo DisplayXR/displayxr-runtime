@@ -270,6 +270,293 @@ target_plugin_get_discovery_summary(struct target_plugin_discovery_summary *out)
 	snprintf(out->best_rejected_reason, sizeof(out->best_rejected_reason), "%s", g_best_rejected_reason);
 }
 
+/*
+ *
+ * Per-plug-in status records + platform state (ADR-045).
+ *
+ */
+
+#define TARGET_PLUGIN_MAX_STATUS 16
+
+/*!
+ * One record per registered plug-in the loader has attempted (or skipped)
+ * this process, keyed by id. Written by every load attempt — first discovery,
+ * each refresh, the display-claim collection — and read by diagnostics
+ * (`displayxr-cli`, the service tray) from other threads, so it has its own
+ * small mutex rather than @ref g_refresh_mutex (a refresh can hold that one
+ * for as long as a slow plug-in probe takes).
+ */
+static struct target_plugin_status g_status[TARGET_PLUGIN_MAX_STATUS];
+static int g_status_count = 0;
+//! Per record: a load of this id has been attempted at least once (the #434
+//! breadcrumb and the #461 skew check WARN only on the first attempt).
+static bool g_status_attempted[TARGET_PLUGIN_MAX_STATUS];
+static struct os_mutex g_status_mutex;
+static int g_status_mutex_initialized = 0;
+
+static void
+status_lock(void)
+{
+	if (g_status_mutex_initialized) {
+		os_mutex_lock(&g_status_mutex);
+	}
+}
+
+static void
+status_unlock(void)
+{
+	if (g_status_mutex_initialized) {
+		os_mutex_unlock(&g_status_mutex);
+	}
+}
+
+//! Find or add the record for @p id. Caller holds the status lock. -1 if full.
+static int
+status_find_or_add_locked(const char *id)
+{
+	for (int i = 0; i < g_status_count; i++) {
+		if (strcmp(g_status[i].id, id) == 0) {
+			return i;
+		}
+	}
+	if (g_status_count >= TARGET_PLUGIN_MAX_STATUS) {
+		return -1;
+	}
+	int i = g_status_count++;
+	memset(&g_status[i], 0, sizeof(g_status[i]));
+	g_status_attempted[i] = false;
+	snprintf(g_status[i].id, sizeof(g_status[i].id), "%s", id);
+	return i;
+}
+
+/*!
+ * Start an attempt at one registered plug-in: refresh its identity fields from
+ * the discovery root. Returns true if this is the FIRST attempt at this id in
+ * this process (callers keep their one-shot WARNs to that attempt).
+ */
+static bool
+status_begin(const char *id, const char *display_name, const char *version, uint32_t probe_order)
+{
+	bool first = true;
+	status_lock();
+	int i = status_find_or_add_locked(id != NULL ? id : "?");
+	if (i >= 0) {
+		struct target_plugin_status *s = &g_status[i];
+		snprintf(s->display_name, sizeof(s->display_name), "%s", display_name != NULL ? display_name : "");
+		snprintf(s->version, sizeof(s->version), "%s", version != NULL ? version : "");
+		s->probe_order = probe_order;
+		first = !g_status_attempted[i];
+		g_status_attempted[i] = true;
+	}
+	status_unlock();
+	return first;
+}
+
+/*!
+ * Record the outcome of an attempt. Returns true when it DIFFERS from the
+ * previous outcome recorded for this id (or is the first), so a caller can log
+ * a repeated failure at INFO instead of WARN: the service re-probes on world
+ * events and on a slow timer while the fallback is active, and a vendor
+ * plug-in whose platform is absent must cost one WARN per process, not one per
+ * retry.
+ */
+static bool
+status_finish(const char *id, enum target_plugin_load_result result, uint32_t os_error, const char *reason)
+{
+	bool changed = true;
+	status_lock();
+	int i = status_find_or_add_locked(id != NULL ? id : "?");
+	if (i >= 0) {
+		struct target_plugin_status *s = &g_status[i];
+		changed = !(s->result == result && s->os_error == os_error);
+		s->result = result;
+		s->os_error = os_error;
+		snprintf(s->reason, sizeof(s->reason), "%s", reason != NULL ? reason : "");
+		if (result == TARGET_PLUGIN_RESULT_BINARY_MISSING ||
+		    result == TARGET_PLUGIN_RESULT_DEPENDENCY_MISSING || result == TARGET_PLUGIN_RESULT_LOAD_FAILED ||
+		    result == TARGET_PLUGIN_RESULT_PATH_REFUSED || result == TARGET_PLUGIN_RESULT_NO_ENTRY_POINT ||
+		    result == TARGET_PLUGIN_RESULT_NEGOTIATE_FAILED || result == TARGET_PLUGIN_RESULT_ABI_MISMATCH) {
+			// Never got far enough to ask: a stale state from an
+			// earlier attempt would be a lie.
+			s->platform_state = XRT_PLUGIN_PLATFORM_STATE_UNKNOWN;
+			s->platform_flags = 0;
+			s->hint[0] = '\0';
+		}
+	}
+	status_unlock();
+	return changed;
+}
+
+//! Mark @p id as the active plug-in; any previously ACTIVE record becomes CLAIMED.
+static void
+status_set_active(const char *id)
+{
+	status_lock();
+	for (int i = 0; i < g_status_count; i++) {
+		if (g_status[i].result == TARGET_PLUGIN_RESULT_ACTIVE) {
+			g_status[i].result = TARGET_PLUGIN_RESULT_CLAIMED;
+		}
+	}
+	int i = status_find_or_add_locked(id != NULL ? id : "?");
+	if (i >= 0) {
+		g_status[i].result = TARGET_PLUGIN_RESULT_ACTIVE;
+	}
+	status_unlock();
+}
+
+/*!
+ * Ask @p iface for its platform state through the struct_size-gated optional
+ * slot. Always fills @p out (UNKNOWN when not reported).
+ */
+static bool
+query_platform_state(const struct xrt_plugin_iface *iface, struct xrt_plugin_platform_status *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->struct_size = (uint32_t)sizeof(*out);
+	if (iface == NULL ||
+	    iface->struct_size <
+	        offsetof(struct xrt_plugin_iface, get_platform_state) + sizeof(iface->get_platform_state) ||
+	    iface->get_platform_state == NULL) {
+		return false;
+	}
+	if (!iface->get_platform_state(out)) {
+		memset(out, 0, sizeof(*out));
+		out->struct_size = (uint32_t)sizeof(*out);
+		return false;
+	}
+	out->hint[sizeof(out->hint) - 1] = '\0';
+	if (out->state > XRT_PLUGIN_PLATFORM_STATE_INCOMPATIBLE) {
+		out->state = XRT_PLUGIN_PLATFORM_STATE_UNKNOWN;
+	}
+	return true;
+}
+
+/*!
+ * Load-path hook, called after negotiate + the ABI gate and BEFORE probe():
+ * record what the plug-in says about its platform, so a plug-in that is about
+ * to decline can still say why. Logs only on a change of state.
+ */
+static void
+status_record_platform_state(const char *id, const struct xrt_plugin_iface *iface)
+{
+	struct xrt_plugin_platform_status ps;
+	bool reported = query_platform_state(iface, &ps);
+	bool changed = false;
+	status_lock();
+	int i = status_find_or_add_locked(id != NULL ? id : "?");
+	if (i >= 0) {
+		struct target_plugin_status *s = &g_status[i];
+		changed = s->platform_state != ps.state || strcmp(s->hint, ps.hint) != 0;
+		s->platform_state = ps.state;
+		s->platform_flags = ps.flags;
+		snprintf(s->hint, sizeof(s->hint), "%s", ps.hint);
+	}
+	status_unlock();
+	if (reported && changed) {
+		U_LOG_W("plugin loader:   %s: platform state %s%s%s", id != NULL ? id : "?",
+		        target_plugin_platform_state_str(ps.state), ps.hint[0] != '\0' ? " — " : "", ps.hint);
+	}
+}
+
+const char *
+target_plugin_load_result_str(enum target_plugin_load_result r)
+{
+	switch (r) {
+	case TARGET_PLUGIN_RESULT_NOT_ATTEMPTED: return "NOT_ATTEMPTED";
+	case TARGET_PLUGIN_RESULT_ACTIVE: return "ACTIVE";
+	case TARGET_PLUGIN_RESULT_CLAIMED: return "LOADED";
+	case TARGET_PLUGIN_RESULT_DECLINED: return "DECLINED";
+	case TARGET_PLUGIN_RESULT_BINARY_MISSING: return "BINARY_MISSING";
+	case TARGET_PLUGIN_RESULT_DEPENDENCY_MISSING: return "DEPENDENCY_MISSING";
+	case TARGET_PLUGIN_RESULT_LOAD_FAILED: return "LOAD_FAILED";
+	case TARGET_PLUGIN_RESULT_PATH_REFUSED: return "PATH_REFUSED";
+	case TARGET_PLUGIN_RESULT_NO_ENTRY_POINT: return "NO_ENTRY_POINT";
+	case TARGET_PLUGIN_RESULT_NEGOTIATE_FAILED: return "NEGOTIATE_FAILED";
+	case TARGET_PLUGIN_RESULT_ABI_MISMATCH: return "ABI_MISMATCH";
+	case TARGET_PLUGIN_RESULT_PROBE_FAILED: return "PROBE_FAILED";
+	}
+	return "?";
+}
+
+const char *
+target_plugin_platform_state_str(uint32_t state)
+{
+	switch (state) {
+	case XRT_PLUGIN_PLATFORM_STATE_UNKNOWN: return "UNKNOWN";
+	case XRT_PLUGIN_PLATFORM_STATE_READY: return "READY";
+	case XRT_PLUGIN_PLATFORM_STATE_PLATFORM_ABSENT: return "PLATFORM_ABSENT";
+	case XRT_PLUGIN_PLATFORM_STATE_PLATFORM_NOT_RUNNING: return "PLATFORM_NOT_RUNNING";
+	case XRT_PLUGIN_PLATFORM_STATE_NO_DISPLAY: return "NO_DISPLAY";
+	case XRT_PLUGIN_PLATFORM_STATE_INCOMPATIBLE: return "INCOMPATIBLE";
+	default: return "UNKNOWN";
+	}
+}
+
+bool
+target_plugin_iface_is_fallback(const struct xrt_plugin_iface *iface)
+{
+	if (iface == NULL) {
+		return false;
+	}
+	struct xrt_plugin_platform_status ps;
+	if (query_platform_state(iface, &ps)) {
+		return (ps.flags & XRT_PLUGIN_PLATFORM_FLAG_FALLBACK) != 0;
+	}
+	// A plug-in too old to report state: only the runtime's OWN simulation
+	// plug-in is a fallback. Never a vendor id.
+	return iface->id != NULL && strcmp(iface->id, "sim-display") == 0;
+}
+
+bool
+target_plugin_query_active_platform_state(struct xrt_plugin_platform_status *out)
+{
+	if (out == NULL) {
+		return false;
+	}
+	return query_platform_state(g_active_iface, out);
+}
+
+int
+target_plugin_get_status(struct target_plugin_status *out, int max)
+{
+	if (out == NULL || max <= 0) {
+		return 0;
+	}
+	const struct xrt_plugin_iface *active = g_active_iface;
+	struct xrt_plugin_platform_status live;
+	bool live_ok = query_platform_state(active, &live);
+
+	status_lock();
+	int n = g_status_count < max ? g_status_count : max;
+	for (int i = 0; i < n; i++) {
+		out[i] = g_status[i];
+		if (live_ok && out[i].result == TARGET_PLUGIN_RESULT_ACTIVE && active != NULL && active->id != NULL &&
+		    strcmp(active->id, out[i].id) == 0) {
+			out[i].platform_state = live.state;
+			out[i].platform_flags = live.flags;
+			snprintf(out[i].hint, sizeof(out[i].hint), "%s", live.hint);
+		}
+		out[i].fallback = (out[i].platform_flags & XRT_PLUGIN_PLATFORM_FLAG_FALLBACK) != 0 ||
+		                  (out[i].platform_state == XRT_PLUGIN_PLATFORM_STATE_UNKNOWN &&
+		                   strcmp(out[i].id, "sim-display") == 0);
+	}
+	status_unlock();
+	return n;
+}
+
+/*!
+ * Log a load-path line at WARN the first time an outcome is seen for a
+ * plug-in, at INFO when it merely repeats (re-probes, ADR-045).
+ */
+#define PLUGIN_LOG_OUTCOME(changed, ...)                                                                               \
+	do {                                                                                                           \
+		if (changed) {                                                                                         \
+			U_LOG_W(__VA_ARGS__);                                                                          \
+		} else {                                                                                               \
+			U_LOG_I(__VA_ARGS__);                                                                          \
+		}                                                                                                      \
+	} while (false)
+
 /*!
  * Max plug-in sources consulted when building the per-display registry
  * (issue #69 / ADR-015). One per registered plug-in — a handful in practice.
@@ -578,9 +865,34 @@ load_and_probe_one(const struct plugin_entry *e,
 		*out_version = 0;
 	}
 
+	// Per-attempt reject context, consumed by plugin_note_reject. Reset here
+	// so an attempt from the display-claim collection (which never consumes
+	// it) cannot leak a stale reason / "declined" mark into discovery.
+	g_last_reject_reason[0] = '\0';
+	g_last_reject_declined = false;
+
+	const bool first_attempt = status_begin(e->id, e->display_name, e->version, e->probe_order);
+
+	// ADR-045: an orphan registration (Binary deleted, key left behind) is a
+	// fact to skip, not an error to repeat — one WARN per process.
+	if (GetFileAttributesW(e->binary_path) == INVALID_FILE_ATTRIBUTES) {
+		DWORD gle = GetLastError();
+		if (gle == ERROR_FILE_NOT_FOUND || gle == ERROR_PATH_NOT_FOUND) {
+			bool changed = status_finish(e->id, TARGET_PLUGIN_RESULT_BINARY_MISSING, (uint32_t)gle, NULL);
+			PLUGIN_LOG_OUTCOME(changed,
+			                   "plugin loader:   %s: registered Binary '%ls' does not exist — skipping "
+			                   "(orphan registration).",
+			                   e->id, e->binary_path);
+			snprintf(g_last_reject_reason, sizeof(g_last_reject_reason),
+			         "registered Binary does not exist (orphan registration)");
+			return NULL;
+		}
+	}
+
 	// #952: refuse a build-tree/worktree DLL path (the #943 footgun) unless
 	// DXR_ALLOW_DEV_PLUGIN_PATHS is set; warn on other non-install paths.
 	if (target_plugin_path_check(e->binary_path, e->id, "plugin") == TARGET_PLUGIN_PATH_REFUSED) {
+		status_finish(e->id, TARGET_PLUGIN_RESULT_PATH_REFUSED, 0, "dev/build-tree path refused (#952)");
 		return NULL;
 	}
 
@@ -591,18 +903,35 @@ load_and_probe_one(const struct plugin_entry *e,
 
 	// One-shot breadcrumb: a host-side crash during the load below (DLL
 	// notification callbacks run host code) leaves this as the last line
-	// in the per-app log, naming the in-flight binary (issue #434).
-	U_LOG_W("plugin loader:   %s: loading plug-in binary %ls", e->id, e->binary_path);
+	// in the per-app log, naming the in-flight binary (issue #434). WARN on
+	// the first attempt per process; re-probes (ADR-045) log it at INFO.
+	PLUGIN_LOG_OUTCOME(first_attempt, "plugin loader:   %s: loading plug-in binary %ls", e->id, e->binary_path);
 
 	// #461: warn if the registry-declared version doesn't match the DLL on
 	// disk (an installer skipped a locked file). Diagnostic only — the ABI
 	// negotiation below remains the actual compatibility gate.
-	check_registry_dll_version_skew(e);
+	if (first_attempt) {
+		check_registry_dll_version_skew(e);
+	}
 
 	HMODULE dll = LoadLibraryExW(e->binary_path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
 	if (dll == NULL) {
-		U_LOG_W("plugin loader:   %s: LoadLibrary(%ls) failed (err=%lu).", e->id, e->binary_path,
-		        GetLastError());
+		DWORD gle = GetLastError();
+		// The binary exists (checked above), so ERROR_MOD_NOT_FOUND means a
+		// library IT imports is missing — typically the vendor platform the
+		// plug-in should resolve lazily (ADR-045 rule 1).
+		const bool dep = gle == ERROR_MOD_NOT_FOUND;
+		bool changed = status_finish(
+		    e->id, dep ? TARGET_PLUGIN_RESULT_DEPENDENCY_MISSING : TARGET_PLUGIN_RESULT_LOAD_FAILED,
+		    (uint32_t)gle, NULL);
+		PLUGIN_LOG_OUTCOME(changed, "plugin loader:   %s: LoadLibrary(%ls) failed (err=%lu)%s.", e->id,
+		                   e->binary_path, gle,
+		                   dep ? " — a library the plug-in imports is missing (vendor platform not installed, "
+		                         "or not resolvable from this process)"
+		                       : "");
+		snprintf(g_last_reject_reason, sizeof(g_last_reject_reason), "%s (err=%lu)",
+		         dep ? "dependency missing: a library the plug-in imports was not found" : "LoadLibrary failed",
+		         gle);
 		return NULL;
 	}
 
@@ -611,6 +940,7 @@ load_and_probe_one(const struct plugin_entry *e,
 	if (negotiate == NULL) {
 		U_LOG_W("plugin loader:   %s: missing entry point '%s' — skipping.", e->id,
 		        XRT_PLUGIN_ENTRYPOINT_NAME);
+		status_finish(e->id, TARGET_PLUGIN_RESULT_NO_ENTRY_POINT, 0, NULL);
 		FreeLibrary(dll);
 		return NULL;
 	}
@@ -638,6 +968,7 @@ load_and_probe_one(const struct plugin_entry *e,
 	if (xret != XRT_SUCCESS || iface == NULL) {
 		U_LOG_W("plugin loader:   %s: negotiate returned %d (iface=%p) — skipping.", e->id,
 		        (int)xret, (void *)iface);
+		status_finish(e->id, TARGET_PLUGIN_RESULT_NEGOTIATE_FAILED, 0, NULL);
 		FreeLibrary(dll);
 		return NULL;
 	}
@@ -656,14 +987,19 @@ load_and_probe_one(const struct plugin_entry *e,
 		snprintf(g_last_reject_reason, sizeof(g_last_reject_reason),
 		         "ABI mismatch: plug-in reports v%u, runtime expects v%u (rebuild it)", plugin_version,
 		         (unsigned)XRT_PLUGIN_API_VERSION_CURRENT);
+		status_finish(e->id, TARGET_PLUGIN_RESULT_ABI_MISMATCH, 0, g_last_reject_reason);
 		FreeLibrary(dll);
 		return NULL;
 	}
+
+	// ADR-045: ask BEFORE probe(), so a plug-in about to decline can say why.
+	status_record_platform_state(e->id, iface);
 
 	if (iface->probe != NULL) {
 		xret = iface->probe(out_inst);
 		if (xret == XRT_ERROR_PROBER_NOT_SUPPORTED) {
 			U_LOG_I("plugin loader:   %s: probe declined (no matching device).", e->id);
+			status_finish(e->id, TARGET_PLUGIN_RESULT_DECLINED, 0, NULL);
 			/* #1212: a plug-in that LOADED and then said "not my
 			 * hardware" is behaving correctly on a box without that
 			 * panel. Only a failed LOAD is a misconfiguration, so
@@ -674,7 +1010,9 @@ load_and_probe_one(const struct plugin_entry *e,
 			return NULL;
 		}
 		if (xret != XRT_SUCCESS) {
-			U_LOG_W("plugin loader:   %s: probe returned %d — skipping.", e->id, (int)xret);
+			bool changed = status_finish(e->id, TARGET_PLUGIN_RESULT_PROBE_FAILED, (uint32_t)xret, NULL);
+			PLUGIN_LOG_OUTCOME(changed, "plugin loader:   %s: probe returned %d — skipping.", e->id,
+			                   (int)xret);
 			FreeLibrary(dll);
 			return NULL;
 		}
@@ -683,6 +1021,7 @@ load_and_probe_one(const struct plugin_entry *e,
 	if (out_version != NULL) {
 		*out_version = plugin_version;
 	}
+	status_finish(e->id, TARGET_PLUGIN_RESULT_CLAIMED, 0, NULL);
 	return iface;
 }
 
@@ -706,6 +1045,7 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 	    iface->id ? iface->id : e->id, iface->display_name ? iface->display_name : e->display_name,
 	    iface->vendor ? iface->vendor : e->vendor, e->version, plugin_version, e->probe_order,
 	    e->binary_path);
+	status_set_active(e->id);
 
 	return iface;
 }
@@ -1680,12 +2020,23 @@ static const struct xrt_plugin_iface *
 try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst)
 {
 	*out_inst = NULL;
+	g_last_reject_reason[0] = '\0';
+	g_last_reject_declined = false;
+	(void)status_begin(e->id, NULL, NULL, e->probe_order);
 
 	/* RTLD_LOCAL keeps the plug-in's symbols private; aux symbols
 	 * resolve via the runtime .so already in the namespace. */
 	void *handle = dlopen(e->binary_path, RTLD_NOW | RTLD_LOCAL);
 	if (handle == NULL) {
-		U_LOG_W("plugin loader:   %s: dlopen(%s) failed: %s.", e->id, e->binary_path, dlerror());
+		const char *dl_err = dlerror();
+		struct stat st;
+		const bool missing = stat(e->binary_path, &st) != 0;
+		bool changed = status_finish(
+		    e->id, missing ? TARGET_PLUGIN_RESULT_BINARY_MISSING : TARGET_PLUGIN_RESULT_LOAD_FAILED, 0, dl_err);
+		PLUGIN_LOG_OUTCOME(changed, "plugin loader:   %s: dlopen(%s) failed: %s.", e->id, e->binary_path,
+		                   dl_err != NULL ? dl_err : "?");
+		snprintf(g_last_reject_reason, sizeof(g_last_reject_reason), "%s",
+		         missing ? "registered binary does not exist (orphan registration)" : "dlopen failed");
 		return NULL;
 	}
 
@@ -1696,6 +2047,7 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 	if (negotiate == NULL || err != NULL) {
 		U_LOG_W("plugin loader:   %s: missing entry point '%s' (%s) — skipping.", e->id,
 		        XRT_PLUGIN_ENTRYPOINT_NAME, err ? err : "null");
+		status_finish(e->id, TARGET_PLUGIN_RESULT_NO_ENTRY_POINT, 0, NULL);
 		dlclose(handle);
 		return NULL;
 	}
@@ -1723,6 +2075,7 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 	if (xret != XRT_SUCCESS || iface == NULL) {
 		U_LOG_W("plugin loader:   %s: negotiate returned %d (iface=%p) — skipping.", e->id, (int)xret,
 		        (void *)iface);
+		status_finish(e->id, TARGET_PLUGIN_RESULT_NEGOTIATE_FAILED, 0, NULL);
 		dlclose(handle);
 		return NULL;
 	}
@@ -1741,9 +2094,13 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 		snprintf(g_last_reject_reason, sizeof(g_last_reject_reason),
 		         "ABI mismatch: plug-in reports v%u, runtime expects v%u (rebuild it)", plugin_version,
 		         (unsigned)XRT_PLUGIN_API_VERSION_CURRENT);
+		status_finish(e->id, TARGET_PLUGIN_RESULT_ABI_MISMATCH, 0, g_last_reject_reason);
 		dlclose(handle);
 		return NULL;
 	}
+
+	// ADR-045: ask BEFORE probe(), so a plug-in about to decline can say why.
+	status_record_platform_state(e->id, iface);
 
 	if (iface->probe != NULL) {
 		xret = iface->probe(out_inst);
@@ -1755,11 +2112,14 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 			 * mark this so the vendor_dp self-test does not fail a
 			 * dev box that merely has a vendor plug-in registered. */
 			g_last_reject_declined = true;
+			status_finish(e->id, TARGET_PLUGIN_RESULT_DECLINED, 0, NULL);
 			dlclose(handle);
 			return NULL;
 		}
 		if (xret != XRT_SUCCESS) {
-			U_LOG_W("plugin loader:   %s: probe returned %d — skipping.", e->id, (int)xret);
+			bool changed = status_finish(e->id, TARGET_PLUGIN_RESULT_PROBE_FAILED, (uint32_t)xret, NULL);
+			PLUGIN_LOG_OUTCOME(changed, "plugin loader:   %s: probe returned %d — skipping.", e->id,
+			                   (int)xret);
 			dlclose(handle);
 			return NULL;
 		}
@@ -1771,6 +2131,8 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 	    iface->id ? iface->id : e->id, iface->display_name ? iface->display_name : "",
 	    iface->vendor ? iface->vendor : "", iface->version ? iface->version : "", plugin_version, e->probe_order,
 	    e->binary_path);
+
+	status_set_active(e->id);
 
 	/* dlopen handle intentionally leaked: the iface's function pointers
 	 * remain reachable into the .so for the process's lifetime. */
@@ -2240,13 +2602,24 @@ static const struct xrt_plugin_iface *
 try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst)
 {
 	*out_inst = NULL;
+	g_last_reject_reason[0] = '\0';
+	g_last_reject_declined = false;
+	(void)status_begin(e->id, e->display_name, e->version, e->probe_order);
 
 	/* RTLD_LOCAL keeps the plug-in's symbols private; aux symbols
 	 * resolve via the dependent runtime dylib that ld already linked
 	 * into our process. */
 	void *handle = dlopen(e->binary_path, RTLD_NOW | RTLD_LOCAL);
 	if (handle == NULL) {
-		U_LOG_W("plugin loader:   %s: dlopen(%s) failed: %s.", e->id, e->binary_path, dlerror());
+		const char *dl_err = dlerror();
+		struct stat st;
+		const bool missing = stat(e->binary_path, &st) != 0;
+		bool changed = status_finish(
+		    e->id, missing ? TARGET_PLUGIN_RESULT_BINARY_MISSING : TARGET_PLUGIN_RESULT_LOAD_FAILED, 0, dl_err);
+		PLUGIN_LOG_OUTCOME(changed, "plugin loader:   %s: dlopen(%s) failed: %s.", e->id, e->binary_path,
+		                   dl_err != NULL ? dl_err : "?");
+		snprintf(g_last_reject_reason, sizeof(g_last_reject_reason), "%s",
+		         missing ? "registered binary does not exist (orphan registration)" : "dlopen failed");
 		return NULL;
 	}
 
@@ -2257,6 +2630,7 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 	if (negotiate == NULL || err != NULL) {
 		U_LOG_W("plugin loader:   %s: missing entry point '%s' (%s) — skipping.", e->id,
 		        XRT_PLUGIN_ENTRYPOINT_NAME, err ? err : "null");
+		status_finish(e->id, TARGET_PLUGIN_RESULT_NO_ENTRY_POINT, 0, NULL);
 		dlclose(handle);
 		return NULL;
 	}
@@ -2284,6 +2658,7 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 	if (xret != XRT_SUCCESS || iface == NULL) {
 		U_LOG_W("plugin loader:   %s: negotiate returned %d (iface=%p) — skipping.", e->id, (int)xret,
 		        (void *)iface);
+		status_finish(e->id, TARGET_PLUGIN_RESULT_NEGOTIATE_FAILED, 0, NULL);
 		dlclose(handle);
 		return NULL;
 	}
@@ -2302,9 +2677,13 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 		snprintf(g_last_reject_reason, sizeof(g_last_reject_reason),
 		         "ABI mismatch: plug-in reports v%u, runtime expects v%u (rebuild it)", plugin_version,
 		         (unsigned)XRT_PLUGIN_API_VERSION_CURRENT);
+		status_finish(e->id, TARGET_PLUGIN_RESULT_ABI_MISMATCH, 0, g_last_reject_reason);
 		dlclose(handle);
 		return NULL;
 	}
+
+	// ADR-045: ask BEFORE probe(), so a plug-in about to decline can say why.
+	status_record_platform_state(e->id, iface);
 
 	if (iface->probe != NULL) {
 		xret = iface->probe(out_inst);
@@ -2316,11 +2695,14 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 			 * mark this so the vendor_dp self-test does not fail a
 			 * dev box that merely has a vendor plug-in registered. */
 			g_last_reject_declined = true;
+			status_finish(e->id, TARGET_PLUGIN_RESULT_DECLINED, 0, NULL);
 			dlclose(handle);
 			return NULL;
 		}
 		if (xret != XRT_SUCCESS) {
-			U_LOG_W("plugin loader:   %s: probe returned %d — skipping.", e->id, (int)xret);
+			bool changed = status_finish(e->id, TARGET_PLUGIN_RESULT_PROBE_FAILED, (uint32_t)xret, NULL);
+			PLUGIN_LOG_OUTCOME(changed, "plugin loader:   %s: probe returned %d — skipping.", e->id,
+			                   (int)xret);
 			dlclose(handle);
 			return NULL;
 		}
@@ -2331,6 +2713,8 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 	    "plugin_api=%u probe_order=%u path=%s",
 	    iface->id ? iface->id : e->id, iface->display_name ? iface->display_name : e->display_name,
 	    iface->vendor ? iface->vendor : e->vendor, e->version, plugin_version, e->probe_order, e->binary_path);
+
+	status_set_active(e->id);
 
 	/* dlopen handle intentionally leaked: the iface's function pointers
 	 * remain reachable into the dylib for the process's lifetime. */
@@ -2581,6 +2965,10 @@ target_plugin_get_active(void)
 			U_LOG_W("plugin loader: os_mutex_init failed — refresh path will skip locking.");
 		}
 	}
+	// ADR-045 status records are read from diagnostics threads (service tray).
+	if (!g_status_mutex_initialized && os_mutex_init(&g_status_mutex) == 0) {
+		g_status_mutex_initialized = 1;
+	}
 
 	g_active_iface = discover_active_plugin(&g_active_instance, 0xFFFFFFFFu /* try all */);
 	return g_active_iface;
@@ -2615,6 +3003,15 @@ target_plugin_refresh_active(void)
 	// set, never auto-adopt.
 	char preferred[64];
 	if (target_plugin_get_preferred(preferred, sizeof(preferred))) {
+		return g_active_iface;
+	}
+
+	// ADR-045 D3 — no live swap. Re-selection exists to get OFF the fallback
+	// (a vendor plug-in registered, or its platform came up, after this
+	// process selected the fallback). A non-fallback active plug-in is kept
+	// even when it reports NO_DISPLAY: diagnostics surface that state and its
+	// DP passes pixels through, and nothing is re-probed here.
+	if (g_active_iface != NULL && !target_plugin_iface_is_fallback(g_active_iface)) {
 		return g_active_iface;
 	}
 

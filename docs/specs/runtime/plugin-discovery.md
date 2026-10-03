@@ -58,6 +58,10 @@ DisplayXR shell, …):
      plug-in returns its own `xrt_plugin_iface *` and the API version
      it speaks. Version mismatch → `XRT_ERROR_PROBER_NOT_SUPPORTED`,
      skip.
+   - If the iface carries `get_platform_state` (§4.1), call it and record
+     the plug-in's platform state + hint against the entry — **before**
+     `probe()`, so a plug-in about to decline can still say why. The state
+     is advisory: it never stops the loader from calling `probe()`.
    - Call `iface->probe(&inst)`. `XRT_ERROR_PROBER_NOT_SUPPORTED` is a
      clean "no matching device" decline (logged at INFO); any other
      `XRT_ERROR_*` is a hard failure (logged at WARN). Either way, the
@@ -445,6 +449,73 @@ vendor-neutral) and the Leia plug-in's entry point in
 delegates to per-API DP factories and device-creation functions in its own
 tree; the entry-point TU is short (~150 lines).
 
+### 4.1 Loadable without the platform; `probe()` is cheap; report platform state (ADR-045)
+
+A registered plug-in is a fact, not a decision: the runtime may enumerate
+it on a machine where the vendor platform it drives is missing, not yet
+running, or has no display attached — and the order in which the user
+installs the runtime, the plug-in and the vendor platform is arbitrary.
+Every plug-in therefore MUST:
+
+1. **Load without its platform.** `LoadLibraryExW` / `dlopen` of the plug-in
+   binary must succeed when the vendor platform runtime is not installed.
+   Resolve vendor libraries lazily (delay-load / `dlopen` by a path the
+   plug-in derives itself) rather than as static imports the OS loader
+   must satisfy — and never rely on the host process's `PATH`, which in the
+   long-lived service is frozen at logon.
+2. **Keep `probe()` and `get_platform_state()` within ~100 ms**, and never
+   block on the vendor platform becoming ready. Both run on the
+   `xrCreateInstance` hot path and on every re-probe (§4.2). Presence
+   checks only — a registry value, a named kernel object, an EDID table
+   lookup. A readiness wait belongs in `create_device` / the DP factory
+   (or a background thread the plug-in owns), not in `probe()`.
+3. **Report its platform state** through the optional
+   `xrt_plugin_iface::get_platform_state` slot (`XRT_PLUGIN_HAS_PLATFORM_STATE`,
+   appended per ADR-020 at unchanged ABI):
+
+   | `xrt_plugin_platform_state` | Meaning |
+   |---|---|
+   | `UNKNOWN` (0) | Not reported (slot absent, older plug-in, call returned false). Runtime behaves as before. |
+   | `READY` | Platform installed, running, display attached. |
+   | `PLATFORM_ABSENT` | The vendor platform runtime is not installed. |
+   | `PLATFORM_NOT_RUNNING` | Installed, its service/daemon is not running. |
+   | `NO_DISPLAY` | Platform up, none of its displays attached. |
+   | `INCOMPATIBLE` | Platform present but unusable (version, OS, GPU, …). |
+
+   plus `hint` — a short (≤ 127 bytes UTF-8) vendor-written sentence the
+   runtime shows verbatim and never parses ("install the … runtime",
+   "connect the display"), and `flags`. `XRT_PLUGIN_PLATFORM_FLAG_FALLBACK`
+   marks a plug-in that claims any system (the in-tree sim-display); vendor
+   plug-ins MUST NOT set it.
+
+   Call sequence: **load → negotiate → `get_platform_state` → `probe`**.
+   The slot takes no instance, is thread-safe, and may also be called at any
+   time after selection (diagnostics poll it while the plug-in is active).
+
+### 4.2 Re-probe and the no-live-swap rule
+
+The long-lived service re-evaluates selection on world events — display
+topology change, device-node change, a change under the
+`DisplayProcessors` registry key, and a slow timer while the active plug-in
+is the fallback — debounced to at most one refresh per second. A refresh
+adopts a better (lower `ProbeOrder`) plug-in **only while the active one
+carries `XRT_PLUGIN_PLATFORM_FLAG_FALLBACK`** (or, for a plug-in that does
+not report state, has id `sim-display`). An active vendor plug-in that
+reports `NO_DISPLAY` is kept: the runtime surfaces the state (tray,
+`displayxr-cli info` / `selftest`) and the DP passes pixels through
+unwoven. In-process apps do not re-probe on world events.
+
+**Adoption is complete via a restart when idle.** On adoption the weaving DP
+and display info follow the new plug-in at once, but the head device (mode
+table, eye tracking) was created by the fallback and is held by the system
+compositor and every client's shared-memory snapshot, so it cannot be swapped
+live. The system marks it stale (`xrt_system_compositor_info::head_device_stale`);
+once no IPC client has been connected for 2 s the Windows service ends its main
+loop and starts a successor (`--adoption-restart-after-pid <pid>`), which waits
+for the old process to exit and builds its system on the new plug-in. A
+successor never restarts itself for adoption again (no loop on a flapping
+probe).
+
 ---
 
 ## 5. Cascade-uninstall
@@ -576,13 +647,21 @@ The runtime emits these one-shot lines at instance creation, all at
 | `plugin loader: <N> registered plug-in(s); attempting in ProbeOrder ascending.`                                      | INFO — entry count after enumeration. Suppressed at default WARN level.                                   |
 | `plugin loader:   [i/N] <id> (ProbeOrder=<order>, <path>)`                                                            | INFO — per-entry attempt trace. Suppressed at default WARN level.                                         |
 | `plugin loader:   <id>: probe declined (no matching device).`                                                         | INFO — clean decline from probe (`XRT_ERROR_PROBER_NOT_SUPPORTED`). Suppressed at default WARN level.     |
-| `plugin loader:   <id>: LoadLibrary(<path>) failed (err=<n>).`                                                       | WARN — DLL load failure. Surfaces in default log.                                                         |
+| `plugin loader:   <id>: LoadLibrary(<path>) failed (err=<n>).`                                                       | WARN — DLL load failure. `err=126` with the binary present adds "a library the plug-in imports is missing" (`DEPENDENCY_MISSING`). |
+| `plugin loader:   <id>: registered Binary '<path>' does not exist — skipping (orphan registration).`                  | WARN — `BINARY_MISSING` (ADR-045).                                                                        |
+| `plugin loader:   <id>: platform state <STATE>[ — <hint>]`                                                           | WARN on change — what `get_platform_state` reported, before `probe()` (ADR-045).                          |
+| `plug-in adoption: '<old>' -> '<new>' — weaving DP and display info follow now; …`                                   | WARN — a refresh adopted a better plug-in under the fallback's head device (service).                     |
+| `plug-in adoption: no client connected — restarting the service so the head device follows '<id>'.`                 | WARN — the adoption restart (Windows service).                                                            |
+
 | `plugin loader:   <id>: missing entry point 'xrtPluginNegotiate' — skipping.`                                        | WARN — DLL has no negotiate symbol. Plug-in DLL is structurally invalid.                                  |
 | `plugin loader:   <id>: negotiate returned <code> (iface=<ptr>) — skipping.`                                         | WARN — negotiate failure. Usually version mismatch.                                                       |
 | `plugin loader:   <id>: probe returned <code> — skipping.`                                                            | WARN — probe failure other than the clean `XRT_ERROR_PROBER_NOT_SUPPORTED` decline.                       |
 | `plugin loader: active plug-in: id=<id> name='<name>' vendor='<vendor>' version='<version>' plugin_api=<v> probe_order=<n> path=<path>` | WARN — the winning plug-in. Authoritative line for "which DP shipped this session."                       |
 | `plugin loader: no registered plug-in claimed the system — falling back to static drivers.`                          | WARN — every entry failed / declined. **The message is stale**: the static-link fallback was removed in #287 (see §7), so nothing loads and instance creation fails.  |
 | `plugin loader: registry root HKLM\Software\DisplayXR\DisplayProcessors absent (rc=<n>) — no plug-ins to try.`       | INFO — no plug-ins registered. Same stale "static" wording as above; there is no fallback. Suppressed at default WARN.  |
+
+Load failures, the `loading plug-in binary` breadcrumb, and the #461 skew check WARN on the **first**
+attempt per plug-in per process (or when the outcome changes); repeats from re-probes log at INFO.
 
 Vendor support flows checking "is the plug-in actually loading"
 should look for the `active plug-in:` line in
