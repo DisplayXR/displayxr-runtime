@@ -6721,6 +6721,10 @@ render_equirect2_layer(struct d3d11_service_system *sys,
  *
  */
 
+//! Defined with the weave submit path below (NT handles are closed by the cache).
+static void
+weave_close_cached(HANDLE h, bool is_dxgi);
+
 /*!
  * Clean up per-client render resources.
  */
@@ -6827,6 +6831,7 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 	res->weave_sbs_srv.reset();
 	res->weave_sbs_rtv.reset();
 	res->weave_sbs_tex.reset();
+	weave_close_cached(res->weave_input_handle_cached, res->weave_input_cached_is_dxgi);
 	res->weave_input_handle_cached = nullptr;
 	res->weave_input_km.reset();
 	res->weave_input_srv.reset();
@@ -6838,6 +6843,7 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 	res->weave_legacy_warned = false;
 	res->lift_rect_count = 0;
 	res->weave_crop_rtv.reset();
+	weave_close_cached(res->weave_overlay_handle_cached, res->weave_overlay_cached_is_dxgi);
 	res->weave_overlay_handle_cached = nullptr;
 	res->weave_overlay_km.reset();
 	res->weave_overlay_srv.reset();
@@ -25452,6 +25458,49 @@ dxr_diag_dump_tex(struct d3d11_service_system *sys, ID3D11Texture2D *tex, const 
  *    move the panel.
  */
 extern "C" /*
+ * Weave import caches: a legacy DXGI shared handle is a stable global value, but
+ * an NT handle reaches the service DUPLICATED per submit — a new value every
+ * frame for the same texture. Keying the cache on the value re-opened the texture
+ * and made a new SRV every frame (and leaked the duplicate), which also defeats
+ * any DP-side reuse keyed on the SRV (the SR cached 2D prefilter). So NT handles
+ * are compared as kernel objects, exactly like d3d11_lift.cpp's import cache:
+ * on a match the per-frame duplicate is closed and the cached import kept; on a
+ * miss the new handle is adopted and the previous cached one closed.
+ */
+static bool
+weave_same_kernel_object(HANDLE a, HANDLE b)
+{
+	typedef BOOL(WINAPI * pfn_t)(HANDLE, HANDLE);
+	static pfn_t fn = []() -> pfn_t {
+		HMODULE m = GetModuleHandleA("kernelbase.dll");
+		return m != nullptr ? (pfn_t)(void *)GetProcAddress(m, "CompareObjectHandles") : nullptr;
+	}();
+	if (fn == nullptr || a == nullptr || b == nullptr) {
+		return false;
+	}
+	return fn(a, b) != FALSE;
+}
+
+//! True when @p h names the texture already imported as @p cached (see above).
+static bool
+weave_import_matches(HANDLE cached, bool cached_is_dxgi, HANDLE h, bool is_dxgi)
+{
+	if (cached == nullptr || cached_is_dxgi != is_dxgi) {
+		return false;
+	}
+	return cached == h || (!is_dxgi && weave_same_kernel_object(cached, h));
+}
+
+//! Close a handle the cache owned (NT only; a legacy DXGI handle is not ours).
+static void
+weave_close_cached(HANDLE h, bool is_dxgi)
+{
+	if (h != nullptr && h != INVALID_HANDLE_VALUE && !is_dxgi) {
+		CloseHandle(h);
+	}
+}
+
+/*
  * DXR_WEAVE_GPU_TIMING=1 — GPU time of the present-owner weave (ADR-027
  * Amendment perf A/B: iGPU vs dGPU, compose on/off). Diagnostic only; env read
  * once. Non-blocking: a query set still in flight when its ring slot comes
@@ -25880,12 +25929,19 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	}
 
 	// Import the caller's pre-weave SBS input texture (NT or legacy DXGI
-	// handle) — cached by handle value: the caller reuses ONE shared input
-	// across frames, so open + SRV happen only when the handle changes
-	// (input re-created on resize), not per submit.
+	// handle) — cached by TEXTURE identity (see weave_import_matches): the
+	// caller reuses ONE shared input across frames, so open + SRV happen only
+	// when the texture changes (input re-created on resize), not per submit.
 	HRESULT hr;
-	if (c->render.weave_input_handle_cached != in || c->render.weave_input_cached_is_dxgi != in_is_dxgi ||
-	    !c->render.weave_input_tex || !c->render.weave_input_srv) {
+	if (c->render.weave_input_tex && c->render.weave_input_srv &&
+	    weave_import_matches(c->render.weave_input_handle_cached, c->render.weave_input_cached_is_dxgi, in,
+	                         in_is_dxgi)) {
+		if (in != c->render.weave_input_handle_cached) {
+			weave_close_cached(in, in_is_dxgi); // this submit's duplicate of the cached texture
+		}
+		in = c->render.weave_input_handle_cached; // stable identity for #1058's frame boundary
+	} else {
+		weave_close_cached(c->render.weave_input_handle_cached, c->render.weave_input_cached_is_dxgi);
 		c->render.weave_input_handle_cached = nullptr;
 		c->render.weave_input_km.reset();
 		c->render.weave_input_srv.reset();
@@ -26029,9 +26085,16 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	uint32_t ov_h = 0;
 	HANDLE ov = (HANDLE)overlay_handle;
 	if (ov != nullptr && ov != INVALID_HANDLE_VALUE) {
-		if (c->render.weave_overlay_handle_cached != ov ||
-		    c->render.weave_overlay_cached_is_dxgi != overlay_is_dxgi || !c->render.weave_overlay_tex ||
-		    !c->render.weave_overlay_srv) {
+		// Same texture-identity cache as the input: a STABLE SRV across frames is
+		// what lets the DP reuse its prefilter of an unchanged layer (v14).
+		if (c->render.weave_overlay_tex && c->render.weave_overlay_srv &&
+		    weave_import_matches(c->render.weave_overlay_handle_cached, c->render.weave_overlay_cached_is_dxgi,
+		                         ov, overlay_is_dxgi)) {
+			if (ov != c->render.weave_overlay_handle_cached) {
+				weave_close_cached(ov, overlay_is_dxgi);
+			}
+		} else {
+			weave_close_cached(c->render.weave_overlay_handle_cached, c->render.weave_overlay_cached_is_dxgi);
 			c->render.weave_overlay_handle_cached = nullptr;
 			c->render.weave_overlay_km.reset();
 			c->render.weave_overlay_srv.reset();
