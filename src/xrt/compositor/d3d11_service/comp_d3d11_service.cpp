@@ -807,6 +807,9 @@ struct d3d11_client_render_resources
 	//! into the weave via set_overlay_2d, false = the runtime's post-weave blit.
 	bool                                   weave_overlay_in_dp;
 	bool                                   weave_overlay_route_logged;
+	//! XR_DXR_weave v14: the next submit's overlay is unchanged (set by
+	//! comp_d3d11_service_weave_set_overlay_unchanged, consumed by the submit).
+	bool                                   weave_overlay_unchanged_next;
 
 	//! DXR_WEAVE_GPU_TIMING=1 diagnostic (ADR-027 Amendment perf A/B): a ring of
 	//! disjoint + 3 timestamp queries per weave_submit — T0 before the ingest
@@ -25201,7 +25204,17 @@ service_weave_publish_wish(struct d3d11_service_system *sys,
  * rendering-mode request drain uses (store the state, then apply it under the
  * lock; nothing here waits on the vendor beyond one publish).
  */
-extern "C" bool
+extern "C" void
+comp_d3d11_service_weave_set_overlay_unchanged(struct xrt_compositor *xc, bool overlay_unchanged)
+{
+	if (xc == nullptr || xc->destroy != compositor_destroy) {
+		return;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	c->render.weave_overlay_unchanged_next = overlay_unchanged;
+}
+
+bool
 comp_d3d11_service_weave_set_screen_flat_regions(struct xrt_compositor *xc,
                                                  uint32_t rect_count,
                                                  const struct xrt_rect *screen_rects)
@@ -25625,6 +25638,10 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		return false;
 	}
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	// XR_DXR_weave v14: consumed FIRST, so no exit path below can leave a stale
+	// "unchanged" for the next submit (per submit, no latch).
+	const bool ov_unchanged = c->render.weave_overlay_unchanged_next;
+	c->render.weave_overlay_unchanged_next = false;
 	struct d3d11_service_system *sys = c->sys;
 	if (sys == nullptr) {
 		return false;
@@ -26165,7 +26182,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		const bool fits = (ov_srv != nullptr && ov_w == win_w && ov_h == win_h);
 		ov_in_dp = xrt_display_processor_d3d11_set_overlay_2d(dp, sys->context.get(), fits ? ov_srv : nullptr,
 		                                                      fits ? ov_w : 0, fits ? ov_h : 0,
-		                                                      XRT_ATLAS_ENCODING_ENCODED) &&
+		                                                      XRT_ATLAS_ENCODING_ENCODED, fits && ov_unchanged) &&
 		           fits;
 	};
 

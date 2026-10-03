@@ -1182,6 +1182,17 @@ comp_d3d11_service_weave_set_screen_flat_regions(struct xrt_compositor *xc,
                                                  const struct xrt_rect *screen_rects);
 
 /*!
+ * XR_DXR_weave v14 (XrWeaveSubmitOverlayUnchangedDXR): what the NEXT
+ * @ref comp_d3d11_service_weave_submit declares about its overlay atlas — true =
+ * same pixels as the previous accepted submit's, so the display processor may
+ * reuse its lens prefilter of the 2D layer (ADR-027 Amendment). Per submit: the
+ * submit consumes and clears it. Same per-submit setter pattern as the desktop-
+ * Linux engine's v13 comp_multi_weave_linux_set_mono_in_2d.
+ */
+void
+comp_d3d11_service_weave_set_overlay_unchanged(struct xrt_compositor *xc, bool overlay_unchanged);
+
+/*!
  * Export the persistent server-allocated weaved-output texture handle (+ dims)
  * for the caller to import once and present each frame. Returns false until the
  * first successful @ref comp_d3d11_service_weave_submit has allocated it.

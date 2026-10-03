@@ -724,13 +724,18 @@ struct xrt_display_processor_d3d11
 	 * @param width          Layer width in pixels.
 	 * @param height         Layer height in pixels.
 	 * @param encoding       Colour state of the layer (v1: ENCODED).
+	 * @param layer_unchanged The caller declared the layer's pixels identical to
+	 *                       the previous call's (XR_DXR_weave v14): a DP that
+	 *                       caches a lens prefilter of the layer may reuse it.
+	 *                       Advisory — false is always correct, only slower.
 	 */
 	bool (*set_overlay_2d)(struct xrt_display_processor_d3d11 *xdp,
 	                       void *d3d11_context,
 	                       void *overlay_srv,
 	                       uint32_t width,
 	                       uint32_t height,
-	                       enum xrt_atlas_encoding encoding);
+	                       enum xrt_atlas_encoding encoding,
+	                       bool layer_unchanged);
 };
 
 
@@ -1383,12 +1388,13 @@ xrt_display_processor_d3d11_set_overlay_2d(struct xrt_display_processor_d3d11 *x
                                            void *overlay_srv,
                                            uint32_t width,
                                            uint32_t height,
-                                           enum xrt_atlas_encoding encoding)
+                                           enum xrt_atlas_encoding encoding,
+                                           bool layer_unchanged)
 {
 	if (!XRT_DP_HAS_SLOT(xdp, set_overlay_2d) || xdp->set_overlay_2d == NULL) {
 		return false;
 	}
-	return xdp->set_overlay_2d(xdp, d3d11_context, overlay_srv, width, height, encoding);
+	return xdp->set_overlay_2d(xdp, d3d11_context, overlay_srv, width, height, encoding, layer_unchanged);
 }
 
 //! True when @p xdp also carries lift_convert_blob (GAUSSIANS).

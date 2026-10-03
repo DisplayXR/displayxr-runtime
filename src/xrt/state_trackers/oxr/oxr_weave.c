@@ -150,6 +150,7 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         uint32_t flat_rect_count,
                                         const struct xrt_rect *flat_rects,
                                         bool mono_in_2d,
+                                        bool overlay_unchanged,
                                         bool *out_have_output,
                                         uint32_t *out_width,
                                         uint32_t *out_height,
@@ -192,6 +193,7 @@ comp_ipc_client_compositor_weave_submit_dmabuf(struct xrt_compositor *xc,
                                                uint32_t flat_rect_count,
                                                const struct xrt_rect *flat_rects,
                                                bool mono_in_2d,
+                                               bool overlay_unchanged,
                                                int *out_release_fence_fd,
                                                bool *out_have_output,
                                                uint32_t *out_width,
@@ -575,6 +577,13 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 	    OXR_GET_INPUT_FROM_CHAIN(submitInfo, XR_TYPE_WEAVE_SUBMIT_MONO_IN_2D_DXR, XrWeaveSubmitMonoIn2DDXR);
 	const bool mono_in_2d = mono != NULL && mono->monoIn2D == XR_TRUE;
 
+	// Spec v14: a chained XrWeaveSubmitOverlayUnchangedDXR declares the overlay
+	// atlas unchanged since the previous submit (advisory; the IPC client drops
+	// it when this submit carries no overlay).
+	const XrWeaveSubmitOverlayUnchangedDXR *ovu = OXR_GET_INPUT_FROM_CHAIN(
+	    submitInfo, XR_TYPE_WEAVE_SUBMIT_OVERLAY_UNCHANGED_DXR, XrWeaveSubmitOverlayUnchangedDXR);
+	const bool overlay_unchanged = ovu != NULL && ovu->overlayUnchanged == XR_TRUE;
+
 	// Spec v6 (#774): a chained XrWeaveSubmitLayoutDXR declares that the input
 	// is a worst-case-sized N-view atlas (tiles packed contiguously from the
 	// top-left at contentViewWidth/Height) instead of per-rect squeezed SBS.
@@ -804,7 +813,7 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		    submitInfo->rect.offset.x, submitInfo->rect.offset.y, (uint32_t)submitInfo->rect.extent.width,
 		    (uint32_t)submitInfo->rect.extent.height, rect_count, rect_count > 0 ? rects : NULL,
 		    overlay_rect_count, submitInfo->firstChunk == XR_TRUE, layout.view_count > 0 ? &layout : NULL,
-		    flat_rect_count, flat_rect_count > 0 ? flat_rects : NULL, mono_in_2d, &release_fd, &have_out, &w,
+		    flat_rect_count, flat_rect_count > 0 ? flat_rects : NULL, mono_in_2d, overlay_unchanged, &release_fd, &have_out, &w,
 		    &h, &fence_value, &eyes, &woven);
 	} else
 #endif
@@ -816,7 +825,7 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		    rect_count > 0 ? rects : NULL, overlay_handle, overlay_is_dxgi, overlay_rect_count,
 		    overlay_rect_count > 0 ? overlay_rects : NULL, submitInfo->firstChunk == XR_TRUE,
 		    layout.view_count > 0 ? &layout : NULL, flat_rect_count, flat_rect_count > 0 ? flat_rects : NULL,
-		    mono_in_2d, &have_out, &w, &h, &fence_value, &eyes);
+		    mono_in_2d, overlay_unchanged, &have_out, &w, &h, &fence_value, &eyes);
 	}
 	if (xret == XRT_ERROR_FEATURE_NOT_SUPPORTED) {
 		// The service has no weave engine for this platform (desktop Linux

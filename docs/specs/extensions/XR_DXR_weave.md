@@ -205,7 +205,35 @@ composite, before the fence signal) and withdrawn on teardown. On a path whose w
 publishes no wish, or against a DP without the slot, the flat lists are simply inert — which
 the advisory contract makes conformant.
 
-## 3. Why batch (the scaling wall)
+## 2d. Overlay unchanged (v14, ADR-027 Amendment)
+
+Since the ADR-027 Amendment a display processor may composite the v4 overlay **inside** the
+weave and band-limit it for its lens, so flat 2D under an active lens stops aliasing per eye.
+That filter is per-pixel work over the whole layer; for a page that has not changed it is the
+same result every frame. `XrWeaveSubmitOverlayUnchangedDXR` (chained next to
+`XrWeaveSubmitOverlaysDXR`) lets the caller say so:
+
+```c
+#define XR_TYPE_WEAVE_SUBMIT_OVERLAY_UNCHANGED_DXR ((XrStructureType)1004999290)
+
+typedef struct XrWeaveSubmitOverlayUnchangedDXR {
+    XrStructureType          type;             // XR_TYPE_WEAVE_SUBMIT_OVERLAY_UNCHANGED_DXR
+    const void*              next;
+    XrBool32                 overlayUnchanged; // same overlay pixels as the previous accepted submit
+} XrWeaveSubmitOverlayUnchangedDXR;
+```
+
+- **Advisory, per submit, no latch.** Omitted or `XR_FALSE` = "may have changed": always
+  correct, only slower. The runtime consumes it with the submit it rides on.
+- **Lying costs one frame.** `XR_TRUE` for an atlas that did change may show the previous 2D
+  for that frame. The DP still re-derives on its own when the texture or its size changes or
+  the viewer moves enough to matter.
+- **Content-only.** The overlay is composited every frame either way; this only gates
+  re-deriving work from it.
+- D3D11 service path today (`set_overlay_2d(..., layer_unchanged)`); the Vulkan weave engines
+  accept and ignore it until their DP slot exists.
+
+
 
 Each submit carries a fixed cost independent of the rect area: the runtime IPC round-trip,
 `OpenSharedResource` on the input, the keyed-mutex acquire/release, and the fence signal —
@@ -854,6 +882,10 @@ any unknown chained struct. One `weave(v13)` WARN in the service log per edge.
 | 11 | `xrWeaveSnapWindowGridDXR` + `XrWeaveSnapGridInfoDXR` / `XrWeaveSnapGridPointDXR` — bulk grid snap: the per-point snap evaluated over a grid by the runtime, one call (one IPC round trip) instead of one per point (§5c, #1723). |
 | 12 | `XrWeaveOutputOriginDXR` (out, per frame: the origin each woven output was woven for + a serial) and `XrWeaveWindowLogicalOriginDXR` (in: the caller's logical origin + scale, echoed verbatim) — so a present-owner can tag its own Wayland commit for move-synchronised drag (§5e, browser-pvt#180). |
 | 13 | `XrWeaveSubmitMonoIn2DDXR` — one flat view (stereo: the left view; N > 2: the view nearest the display axis) instead of the weave while the session's hardware state is 2D (§5f). Desktop Linux; accepted and ignored elsewhere. |
+| 14 | `XrWeaveSubmitOverlayUnchangedDXR` — the v4 overlay atlas holds the previous accepted submit's pixels, so a DP may reuse its lens prefilter of the 2D layer (ADR-027 Amendment; §2d). |
+
+**v14 needs no gate**: a pre-v14 runtime skips the unknown struct, which is the "may have
+changed" behaviour, so a caller can always send it.
 
 **v13 is a bump**: one structure type a caller gates on `extensionVersion >= 13`. Against an
 older runtime the struct is skipped and the output stays woven, which is also what every
