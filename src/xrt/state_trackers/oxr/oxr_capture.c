@@ -36,6 +36,7 @@
 #include "util/u_logging.h"
 #include "util/u_trace_marker.h"
 #include "util/u_capture_dims.h"
+#include "util/u_image_capture.h"
 
 #include "os/os_time.h"
 
@@ -206,13 +207,16 @@ capture_ipc(struct oxr_logger *log,
 	uint32_t want_flag = (info->stage == XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_DXR)
 	                         ? IPC_CAPTURE_FLAG_PROJECTION_ONLY
 	                         : IPC_CAPTURE_FLAG_ATLAS;
+	// #1810: the service reads its OWN environment, so this client's
+	// DXR_ATLAS_CAPTURE_RAW_ALPHA travels as a request modifier bit.
+	uint32_t req_flags = want_flag | (u_image_capture_raw_alpha() ? IPC_CAPTURE_FLAG_RAW_ALPHA : 0u);
 
 	uint64_t ts_ns = 0;
 	uint32_t aw = 0, ah = 0, ew = 0, eh = 0, vw = 0, tc = 0, tr = 0;
 	float dw_m = 0.0f, dh_m = 0.0f;
 	float eye_l[3] = {0}, eye_r[3] = {0};
 	xrt_result_t xret = comp_ipc_client_compositor_workspace_capture_frame(
-	    &sess->xcn->base, info->pathPrefix, want_flag, &ts_ns, &aw, &ah, &ew, &eh, &vw, &tc, &tr, &dw_m,
+	    &sess->xcn->base, info->pathPrefix, req_flags, &ts_ns, &aw, &ah, &ew, &eh, &vw, &tc, &tr, &dw_m,
 	    &dh_m, eye_l, eye_r);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(log, XR_ERROR_RUNTIME_FAILURE,
