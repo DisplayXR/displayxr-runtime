@@ -560,7 +560,7 @@ PaintPageOverlay(uint32_t w, uint32_t h, int32_t hx, int32_t hy, int32_t hw, int
 	g_d2dCtx->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.45f), &labelBg);
 
 	static const wchar_t *kLine =
-	    L"The quick brown fox jumps over the lazy dog 0123456789 — thin strokes, serifs and dots "
+	    L"The quick brown fox jumps over the lazy dog 0123456789 \u2014 thin strokes, serifs and dots "
 	    L"alias through a lens unless the weaver band-limits them for each eye. ";
 	const float lineH = (float)h / 36.0f;
 	const float period = lineH * 40.0f;
@@ -614,7 +614,7 @@ PaintPageOverlay(uint32_t w, uint32_t h, int32_t hx, int32_t hy, int32_t hw, int
 	D2D1_RECT_F lb = D2D1::RectF((float)hx + hw * 0.05f, (float)hy + hh - lineH * 2.4f, (float)hx + hw * 0.60f,
 	                             (float)hy + hh - lineH * 0.6f);
 	g_d2dCtx->FillRectangle(lb, labelBg.Get());
-	static const wchar_t *kLabel = L"Label over 3D — should read flat and crisp";
+	static const wchar_t *kLabel = L"Label over 3D \u2014 should read flat and crisp";
 	DrawStr(kLabel, g_dwLabel.Get(),
 	        D2D1::RectF(lb.left + lineH * 0.5f, lb.top + lineH * 0.2f, lb.right, lb.bottom),
 	        pillInk.Get());
