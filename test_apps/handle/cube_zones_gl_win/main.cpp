@@ -489,6 +489,9 @@ static void UpdatePerformanceStats(PerformanceStats& stats) {
 // declaring them _SRGB keeps the compositor's decode→encode round-trip honest.
 // GL codes: GL_SRGB8_ALPHA8=0x8C43, GL_RGBA8=0x8058.
 static int64_t PickStripFormat(XrSessionManager& xr) {
+    // A/B knob, same switch as displayxr-common's swapchains (#1795).
+    const char* enc = getenv("DXR_SWAPCHAIN_ENCODING");
+    if (enc != nullptr && strcmp(enc, "unorm") == 0) return (int64_t)0x8058;
     uint32_t n = 0;
     xrEnumerateSwapchainFormats(xr.session, 0, &n, nullptr);
     std::vector<int64_t> formats(n);
