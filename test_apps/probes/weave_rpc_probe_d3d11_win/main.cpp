@@ -86,6 +86,8 @@
 #include <d3d11_4.h>
 #include <dxgi1_3.h>
 #include <dcomp.h>
+#include <d2d1_1.h>
+#include <dwrite.h>
 #include <wrl/client.h>
 
 #include <cstdint>
@@ -98,12 +100,35 @@
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "dcomp.lib")
+#pragma comment(lib, "d2d1.lib")
+#pragma comment(lib, "dwrite.lib")
 
 using Microsoft::WRL::ComPtr;
 
 // ---- Layout constants -------------------------------------------------------
-static const uint32_t kWinW = 1280;
+static const uint32_t kWinW = 1280; //!< default; --size=WxH overrides (g_winW/H)
 static const uint32_t kWinH = 720;
+static uint32_t g_winW = kWinW;
+static uint32_t g_winH = kWinH;
+
+// ---- 2D-under-the-lens test layer (ADR-027 Amendment) ------------------------
+// --overlay=bar (default, the original magenta bar) | none | page | page-anim.
+// `page` paints a whole-window flat PAGE as the v4 overlay — white background,
+// body text (DirectWrite, GRAYSCALE AA, as the weaver requires), a semi-
+// transparent pill, a label over the 3D — with an alpha-0 HOLE where the woven
+// element shows through: the shape the browser sends for "whole page as
+// overlay". `page-anim` repaints it every frame with the text scrolling, the
+// worst case for any per-layer-update cost. Page modes default the weave rect
+// to the centred HALF of the window (not 640x360) unless --rect is given.
+enum OverlayMode
+{
+	OVERLAY_BAR = 0,
+	OVERLAY_NONE,
+	OVERLAY_PAGE,
+	OVERLAY_PAGE_ANIM,
+};
+static OverlayMode g_overlayMode = OVERLAY_BAR;
+static uint32_t g_pageFrame = 0;
 static const uint32_t kRectW = 640; //!< weaved sub-rect (per-view = kRectW)
 static const uint32_t kRectH = 360;
 
@@ -174,6 +199,7 @@ static ComPtr<ID3D11RenderTargetView> g_overlayRtv;
 static ComPtr<IDXGIKeyedMutex> g_overlayMutex;
 static HANDLE g_overlayHandle = nullptr; //!< NT handle chained on XrWeaveSubmitOverlaysDXR
 static uint32_t g_overlayW = 0, g_overlayH = 0;
+static ComPtr<ID2D1Bitmap1> g_d2dTarget; //!< D2D view of the overlay (page modes)
 
 // Weaved output handback (opened from the runtime's exported handles).
 static ComPtr<ID3D11Texture2D> g_weavedTex;
@@ -211,7 +237,7 @@ CreateAppWindow(HINSTANCE hInst)
 	wc.lpszClassName = L"DXRWeaveRpcProbe";
 	RegisterClassExW(&wc);
 
-	RECT r = {0, 0, (LONG)kWinW, (LONG)kWinH};
+	RECT r = {0, 0, (LONG)g_winW, (LONG)g_winH};
 	AdjustWindowRectEx(&r, WS_OVERLAPPEDWINDOW, FALSE, WS_EX_NOREDIRECTIONBITMAP);
 	// WS_EX_NOREDIRECTIONBITMAP: required for a DComp-presented (alpha) window.
 	g_hwnd = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP, wc.lpszClassName, L"DisplayXR Weave RPC Probe (#625)",
@@ -390,7 +416,10 @@ EnsureOverlayTexture(uint32_t w, uint32_t h)
 	td.Height = h;
 	td.MipLevels = 1;
 	td.ArraySize = 1;
-	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; // premultiplied alpha
+	// Premultiplied alpha. Page modes use BGRA (what Direct2D and the browser
+	// produce); the original bar keeps RGBA.
+	const bool page = (g_overlayMode == OVERLAY_PAGE || g_overlayMode == OVERLAY_PAGE_ANIM);
+	td.Format = page ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
 	td.SampleDesc.Count = 1;
 	td.Usage = D3D11_USAGE_DEFAULT;
 	td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
@@ -415,6 +444,15 @@ EnsureOverlayTexture(uint32_t w, uint32_t h)
 		return false;
 	}
 
+	if (page) {
+		g_d2dTarget.Reset(); // re-bound to the new texture by PaintPageOverlay
+		g_overlayW = w;
+		g_overlayH = h;
+		LOG_INFO("v4 overlay atlas ready (%ux%u, NT handle=%p) — whole-window PAGE (%s)", w, h, g_overlayHandle,
+		         g_overlayMode == OVERLAY_PAGE_ANIM ? "repainted + scrolled every frame" : "static");
+		return true;
+	}
+
 	// Paint once: transparent everywhere, one opaque magenta bar near the top.
 	if (g_overlayMutex->AcquireSync(0, 1000) != S_OK) {
 		LOG_ERROR("overlay AcquireSync failed");
@@ -431,6 +469,139 @@ EnsureOverlayTexture(uint32_t w, uint32_t h)
 	g_overlayW = w;
 	g_overlayH = h;
 	LOG_INFO("v4 overlay atlas ready (%ux%u, NT handle=%p) — magenta 2D bar", w, h, g_overlayHandle);
+	return true;
+}
+
+// ---- Whole-window PAGE overlay (Direct2D/DirectWrite on the shared texture) ---
+static ComPtr<ID2D1Factory1> g_d2dFactory;
+static ComPtr<ID2D1Device> g_d2dDevice;
+static ComPtr<ID2D1DeviceContext> g_d2dCtx;
+static ComPtr<IDWriteFactory> g_dwFactory;
+static ComPtr<IDWriteTextFormat> g_dwBody;
+static ComPtr<IDWriteTextFormat> g_dwLabel;
+
+static bool
+EnsureD2D()
+{
+	if (g_d2dCtx) {
+		return true;
+	}
+	if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory1), nullptr,
+	                             reinterpret_cast<void **>(g_d2dFactory.GetAddressOf())))) {
+		LOG_ERROR("D2D1CreateFactory failed");
+		return false;
+	}
+	ComPtr<IDXGIDevice> dxgiDev;
+	if (FAILED(g_device.As(&dxgiDev)) || FAILED(g_d2dFactory->CreateDevice(dxgiDev.Get(), &g_d2dDevice)) ||
+	    FAILED(g_d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &g_d2dCtx))) {
+		LOG_ERROR("Direct2D device on the session D3D11 device failed (needs BGRA support)");
+		return false;
+	}
+	if (FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+	                               reinterpret_cast<IUnknown **>(g_dwFactory.GetAddressOf())))) {
+		LOG_ERROR("DWriteCreateFactory failed");
+		return false;
+	}
+	// Grayscale AA: the weaver contract (ClearType's per-channel coverage cannot
+	// be expressed in one alpha, and the lens rearranges the subpixels anyway).
+	g_d2dCtx->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+	return true;
+}
+
+//! Text through an IDWriteTextLayout + DrawTextLayout (sidesteps the winuser.h
+//! DrawText -> DrawTextW macro, which renames ID2D1RenderTarget::DrawText).
+static void
+DrawStr(const wchar_t *str, IDWriteTextFormat *fmt, const D2D1_RECT_F &r, ID2D1Brush *brush)
+{
+	ComPtr<IDWriteTextLayout> layout;
+	if (SUCCEEDED(g_dwFactory->CreateTextLayout(str, (UINT32)wcslen(str), fmt, r.right - r.left, r.bottom - r.top,
+	                                             &layout))) {
+		g_d2dCtx->DrawTextLayout(D2D1::Point2F(r.left, r.top), layout.Get(), brush);
+	}
+}
+
+//! Paint the page into the shared overlay (producer side of the keyed mutex).
+//! Hole = the woven element's window rect, left alpha 0 so the 3D shows through.
+static bool
+PaintPageOverlay(uint32_t w, uint32_t h, int32_t hx, int32_t hy, int32_t hw, int32_t hh, float scroll)
+{
+	if (!EnsureD2D()) {
+		return false;
+	}
+	if (!g_d2dTarget) {
+		ComPtr<IDXGISurface> surf;
+		D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(
+		    D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+		    D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+		if (FAILED(g_overlayTex.As(&surf)) || FAILED(g_d2dCtx->CreateBitmapFromDxgiSurface(surf.Get(), &bp,
+		                                                                                     &g_d2dTarget))) {
+			LOG_ERROR("CreateBitmapFromDxgiSurface on the overlay failed");
+			return false;
+		}
+		const float bodyPx = (float)h / 54.0f; // ~40 px at 2160, ~13 px at 720
+		g_dwBody.Reset();
+		g_dwLabel.Reset();
+		g_dwFactory->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+		                              DWRITE_FONT_STRETCH_NORMAL, bodyPx, L"en-us", &g_dwBody);
+		g_dwFactory->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
+		                              DWRITE_FONT_STRETCH_NORMAL, bodyPx * 1.2f, L"en-us", &g_dwLabel);
+	}
+	if (g_overlayMutex->AcquireSync(0, 1000) != S_OK) {
+		return false;
+	}
+	g_d2dCtx->SetTarget(g_d2dTarget.Get());
+	g_d2dCtx->BeginDraw();
+	g_d2dCtx->Clear(D2D1::ColorF(0.98f, 0.98f, 0.97f, 1.0f)); // opaque page
+
+	ComPtr<ID2D1SolidColorBrush> ink, pill, pillInk, labelBg;
+	g_d2dCtx->CreateSolidColorBrush(D2D1::ColorF(0.08f, 0.08f, 0.10f, 1.0f), &ink);
+	g_d2dCtx->CreateSolidColorBrush(D2D1::ColorF(0.10f, 0.35f, 0.90f, 0.55f), &pill); // semi-transparent
+	g_d2dCtx->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f), &pillInk);
+	g_d2dCtx->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.45f), &labelBg);
+
+	static const wchar_t *kLine =
+	    L"The quick brown fox jumps over the lazy dog 0123456789 — thin strokes, serifs and dots "
+	    L"alias through a lens unless the weaver band-limits them for each eye. ";
+	const float lineH = (float)h / 36.0f;
+	const float period = lineH * 40.0f;
+	float off = scroll - floorf(scroll / period) * period;
+	for (float y = -off; y < (float)h; y += lineH) {
+		D2D1_RECT_F lr = D2D1::RectF((float)w * 0.04f, y, (float)w * 0.96f, y + lineH);
+		DrawStr(kLine, g_dwBody.Get(), lr, ink.Get());
+	}
+
+	// Semi-transparent pill straddling the hole's top edge (2D over 3D AND over page).
+	D2D1_ROUNDED_RECT pr = {D2D1::RectF((float)hx + hw * 0.30f, (float)hy - lineH, (float)hx + hw * 0.70f,
+	                                    (float)hy + lineH),
+	                        lineH, lineH};
+	// The HOLE: alpha 0 where the woven element shows through. Clear honours the clip.
+	g_d2dCtx->PushAxisAlignedClip(D2D1::RectF((float)hx, (float)hy, (float)(hx + hw), (float)(hy + hh)),
+	                              D2D1_ANTIALIAS_MODE_ALIASED);
+	g_d2dCtx->Clear(D2D1::ColorF(0, 0, 0, 0));
+	g_d2dCtx->PopAxisAlignedClip();
+	g_d2dCtx->FillRoundedRectangle(pr, pill.Get());
+	static const wchar_t *kPill = L"translucent pill";
+	DrawStr(kPill, g_dwBody.Get(),
+	        D2D1::RectF(pr.rect.left + lineH, pr.rect.top + lineH * 0.4f, pr.rect.right, pr.rect.bottom),
+	        pillInk.Get());
+
+	// A label OVER the 3D (inside the hole), on a translucent plate.
+	D2D1_RECT_F lb = D2D1::RectF((float)hx + hw * 0.05f, (float)hy + hh - lineH * 2.4f, (float)hx + hw * 0.60f,
+	                             (float)hy + hh - lineH * 0.6f);
+	g_d2dCtx->FillRectangle(lb, labelBg.Get());
+	static const wchar_t *kLabel = L"Label over 3D — should read flat and crisp";
+	DrawStr(kLabel, g_dwLabel.Get(),
+	        D2D1::RectF(lb.left + lineH * 0.5f, lb.top + lineH * 0.2f, lb.right, lb.bottom),
+	        pillInk.Get());
+
+	HRESULT hr = g_d2dCtx->EndDraw();
+	g_d2dCtx->SetTarget(nullptr);
+	g_context->Flush();
+	g_overlayMutex->ReleaseSync(0);
+	if (FAILED(hr)) {
+		LOG_ERROR("D2D EndDraw failed: 0x%08lx", hr);
+		return false;
+	}
 	return true;
 }
 
@@ -811,6 +982,27 @@ ParseOptions(PWSTR cmdLineW)
 				ApplyFlatBand(tok + 12);
 			} else if (_strnicmp(tok, "--screen-flat=", 14) == 0) {
 				ApplyScreenFlat(tok + 14);
+			} else if (_strnicmp(tok, "--overlay=", 10) == 0) {
+				const char *v = tok + 10;
+				if (_stricmp(v, "none") == 0) {
+					g_overlayMode = OVERLAY_NONE;
+				} else if (_stricmp(v, "page") == 0) {
+					g_overlayMode = OVERLAY_PAGE;
+				} else if (_stricmp(v, "page-anim") == 0) {
+					g_overlayMode = OVERLAY_PAGE_ANIM;
+				} else if (_stricmp(v, "bar") == 0) {
+					g_overlayMode = OVERLAY_BAR;
+				} else {
+					LOG_ERROR("--overlay: bad value '%s' (want bar|none|page|page-anim) — ignored", v);
+				}
+			} else if (_strnicmp(tok, "--size=", 7) == 0) {
+				unsigned sw = 0, sh = 0;
+				if (sscanf_s(tok + 7, "%ux%u", &sw, &sh) == 2 && sw >= 64 && sh >= 64 && sw <= 8192 && sh <= 8192) {
+					g_winW = sw;
+					g_winH = sh;
+				} else {
+					LOG_ERROR("--size: bad value '%s' (want WxH) — ignored", tok + 7);
+				}
 			} else if (_strnicmp(tok, "--rect=", 7) != 0) {
 				LOG_INFO("unrecognized argument '%s' — ignored", tok);
 			}
@@ -868,7 +1060,8 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 		LOG_INFO("  v6 grid=%ux%u views=%u scale=%.3fx%.3f atlas=%s", g_v6Cols, g_v6Rows,
 		         g_v6Cols * g_v6Rows, g_v6ScaleX, g_v6ScaleY, g_v6Exact ? "exact (zero-copy)" : "oversized (crop)");
 	}
-	LOG_INFO("Weave rect: %s", g_fullRect ? "FULL client area" : "centred 640x360 element");
+	LOG_INFO("Weave rect: %s", g_fullRect ? "FULL client area" : "centred element");
+	LOG_INFO("Window %ux%u, overlay mode %d (0=bar 1=none 2=page 3=page-anim)", g_winW, g_winH, (int)g_overlayMode);
 	if (g_flatBandPct == 0) {
 		LOG_INFO("v8 per-submit flat regions: OFF (no chain — byte-for-byte pre-v8)");
 	} else if (g_flatBandPct >= 100) {
@@ -898,7 +1091,7 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 	if (!CreateDeviceOnAdapter(luid)) {
 		return 1;
 	}
-	if (!CreateCompositionSwapChain(kWinW, kWinH)) {
+	if (!CreateCompositionSwapChain(g_winW, g_winH)) {
 		return 1;
 	}
 	// SBS input is (re)created window-sized in the frame loop via EnsureSbsTexture.
@@ -1001,8 +1194,11 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 		RECT rc = {};
 		GetClientRect(g_hwnd, &rc);
 		int32_t cw = rc.right - rc.left, ch = rc.bottom - rc.top;
-		uint32_t rw = g_fullRect ? (uint32_t)cw : (uint32_t)min((int32_t)kRectW, cw);
-		uint32_t rh = g_fullRect ? (uint32_t)ch : (uint32_t)min((int32_t)kRectH, ch);
+		const bool pageMode = (g_overlayMode == OVERLAY_PAGE || g_overlayMode == OVERLAY_PAGE_ANIM);
+		uint32_t rw = g_fullRect ? (uint32_t)cw
+		                         : (pageMode && !g_rectOverride ? (uint32_t)cw / 2 : (uint32_t)min((int32_t)kRectW, cw));
+		uint32_t rh = g_fullRect ? (uint32_t)ch
+		                         : (pageMode && !g_rectOverride ? (uint32_t)ch / 2 : (uint32_t)min((int32_t)kRectH, ch));
 		int32_t rx = (cw - (int32_t)rw) / 2;
 		int32_t ry = (ch - (int32_t)rh) / 2;
 
@@ -1044,7 +1240,19 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 
 		// v4: keep the overlay atlas sized to the window client area so the DP
 		// composites the 2D badge 1:1 over the woven output.
-		bool haveOverlay = EnsureOverlayTexture((uint32_t)cw, (uint32_t)ch);
+		bool haveOverlay = (g_overlayMode != OVERLAY_NONE) && EnsureOverlayTexture((uint32_t)cw, (uint32_t)ch);
+		if (haveOverlay && pageMode) {
+			// Static page: paint once per (re)size. page-anim: every frame, scrolled.
+			static uint32_t s_paintedW = 0, s_paintedH = 0;
+			const bool fresh = (s_paintedW != (uint32_t)cw || s_paintedH != (uint32_t)ch);
+			if (g_overlayMode == OVERLAY_PAGE_ANIM || fresh) {
+				const float scroll = (g_overlayMode == OVERLAY_PAGE_ANIM) ? (float)g_pageFrame * 2.0f : 0.0f;
+				haveOverlay = PaintPageOverlay((uint32_t)cw, (uint32_t)ch, rx, ry, (int32_t)rw, (int32_t)rh, scroll);
+				s_paintedW = (uint32_t)cw;
+				s_paintedH = (uint32_t)ch;
+			}
+			g_pageFrame++;
+		}
 
 		XrWeaveSubmitInfoDXR in = {XR_TYPE_WEAVE_SUBMIT_INFO_DXR};
 		in.inputTexture = (void *)g_sbsHandle;
