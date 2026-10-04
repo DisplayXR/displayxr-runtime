@@ -80,7 +80,16 @@
       "role": "Leia SR display-processor plug-in (first vendor integration)",
       "tracks": {
         "windows": {
-          "bump_when": "abi",
+          "bump_when": "features",
+          "reason": "The Windows plug-in guards new code on DP feature macros (XRT_DP_D3D11_HAS_*, XRT_DP_D3D12_HAS_*, ...), and ADR-020 appends a slot + macro WITHOUT bumping the plug-in ABI -- so the abi gate is blind to the change this track needs. Real case: runtime v2.25.2 appended set_overlay_2d (XRT_DP_D3D11_HAS_OVERLAY_2D, #1814) at ABI 5; at the then-pin v2.24.0 the plug-in's SR weaver 2D-compose forward compiled out and was repinned by hand (leia-plugin#295) -- the Linux track's #264 story again. Feature headers are every DP variant the Windows build compiles (D3D11, D3D12, GL, VK). Still gated, not tag-chasing: the installer's MIN_RUNTIME_VERSION follows this pin, so it moves only when the plug-in-facing feature surface did.",
+          "feature_headers": [
+            "src/xrt/include/xrt/xrt_plugin.h",
+            "src/xrt/include/xrt/xrt_display_processor.h",
+            "src/xrt/include/xrt/xrt_display_processor_d3d11.h",
+            "src/xrt/include/xrt/xrt_display_processor_d3d12.h",
+            "src/xrt/include/xrt/xrt_display_processor_gl.h",
+            "src/xrt/include/xrt/xrt_display_processor_vk.h"
+          ],
           "locations": [
             { "file": "CMakeLists.txt", "kind": "cmake_set", "key": "DXR_RUNTIME_GIT_TAG" },
             { "file": ".github/workflows/build-windows.yml", "kind": "yaml_env", "key": "RUNTIME_REF" }
