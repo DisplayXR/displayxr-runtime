@@ -44,13 +44,21 @@
  * Privacy: frames bypass the OS camera stack, so the runtime gates them itself
  * (consent, foreground rule, in-use indicator, kill switch — spec §7).
  * xrStartStereoCameraStreamDXR and xrGetStereoCameraCalibrationDXR return
- * XR_ERROR_PERMISSION_INSUFFICIENT when refused.
+ * XR_ERROR_STEREO_CAMERA_CONSENT_REFUSED_DXR when the user / the stored
+ * decision refused, XR_ERROR_STEREO_CAMERA_DISABLED_DXR when sharing is off,
+ * XR_ERROR_PERMISSION_INSUFFICIENT when the OS camera privacy switch is off,
+ * XR_ERROR_STEREO_CAMERA_BUSY_DXR when the source cannot be opened.
  *
  * Spec: docs/specs/extensions/XR_DXR_stereo_camera.md.
  *
  * Version history: 1 = initial (enumerate + state, calibration raw/rectified,
  * streams with start/stop, latest-wins acquire over a pinned 3-slot shared-
- * memory ring with per-stream wake handles, stream stats).
+ * memory ring with per-stream wake handles, stream stats). 2 (R3) = consent
+ * and privacy as built: XrStereoCameraClientInfoDXR (camera-only client
+ * class), distinct refusal results (CONSENT_REFUSED / DISABLED / BUSY /
+ * STREAM_ENDED), the state-changed and cameras-changed events are now
+ * delivered, XrEventDataStereoCameraStreamEndedDXR, persistentId keyed with
+ * a per-user secret. Everything appended; nothing renumbered.
  */
 #ifndef XR_DXR_STEREO_CAMERA_H
 #define XR_DXR_STEREO_CAMERA_H 1
@@ -63,7 +71,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_stereo_camera 1
-#define XR_DXR_stereo_camera_SPEC_VERSION 1
+#define XR_DXR_stereo_camera_SPEC_VERSION 2
 #define XR_DXR_STEREO_CAMERA_EXTENSION_NAME "XR_DXR_stereo_camera"
 
 // Reserved 1004999300..319 (relocated from 290..309 on the post-lift rebase: 290 was taken by XR_DXR_weave v14). Allocation registry: README.md in this directory.
@@ -81,6 +89,25 @@ extern "C" {
 //! SUCCESS-class result: no frame newer than the last one this stream acquired.
 //! Not an error — keep showing the previous frame.
 #define XR_STEREO_CAMERA_FRAME_NOT_READY_DXR                ((XrResult)1004999310)
+// Spec v2 (R3) — appended, never renumbered.
+//! Chain on XrInstanceCreateInfo to declare a camera-only client (spec §2a).
+#define XR_TYPE_STEREO_CAMERA_CLIENT_INFO_DXR               ((XrStructureType)1004999311)
+//! ERROR: the user (or the stored per-app decision) refused this executable the
+//! 3D camera (spec §7.1). Retryable after consent; a browser maps it to
+//! NotAllowedError. Distinct from XR_ERROR_PERMISSION_INSUFFICIENT, which is
+//! the OS camera privacy switch.
+#define XR_ERROR_STEREO_CAMERA_CONSENT_REFUSED_DXR          ((XrResult)-1004999312)
+//! ERROR: camera sharing is off — the user's "Share the 3D camera with apps"
+//! toggle or the DXR_STEREO_CAMERA=0 kill switch (spec §7.4).
+#define XR_ERROR_STEREO_CAMERA_DISABLED_DXR                 ((XrResult)-1004999313)
+//! ERROR: the source cannot be opened right now (the plug-in reported the
+//! device unavailable); a browser maps it to NotReadableError. Retry later.
+#define XR_ERROR_STEREO_CAMERA_BUSY_DXR                     ((XrResult)-1004999314)
+//! A stream the SERVICE ended (user kill switch, revocation, source removed).
+#define XR_TYPE_EVENT_DATA_STEREO_CAMERA_STREAM_ENDED_DXR   ((XrStructureType)1004999315)
+//! ERROR: this stream was ended by the service (see the STREAM_ENDED event);
+//! destroy it and create a new one.
+#define XR_ERROR_STEREO_CAMERA_STREAM_ENDED_DXR             ((XrResult)-1004999316)
 
 //! Size of XrStereoCameraPropertiesDXR::persistentId, NUL included.
 #define XR_STEREO_CAMERA_PERSISTENT_ID_MAX_SIZE_DXR 64
@@ -309,6 +336,51 @@ typedef struct XrEventDataStereoCamerasChangedDXR {
     XrStructureType type;
     const void* XR_MAY_ALIAS next;
 } XrEventDataStereoCamerasChangedDXR;
+
+/*
+ * Spec v2 (R3): client declaration, service-ended streams.
+ */
+
+typedef XrFlags64 XrStereoCameraClientFlagsDXR;
+//! This instance is a CAMERA-ONLY consumer: it will never create a session, and
+//! it is not a panel owner even if its executable also runs an XR_DXR_weave
+//! present-owner (a browser's video-capture utility process). The service
+//! admits it as the CAMERA_CONSUMER client class, outside the present-owner
+//! quota. A hybrid runtime routes such an instance to the service (an
+//! in-process instance has no cameras).
+static const XrStereoCameraClientFlagsDXR XR_STEREO_CAMERA_CLIENT_CONSUMER_ONLY_BIT_DXR = 0x00000001;
+
+/*!
+ * Chain on XrInstanceCreateInfo (the extension must be in enabledExtensionNames).
+ */
+typedef struct XrStereoCameraClientInfoDXR {
+    XrStructureType type;
+    const void* XR_MAY_ALIAS next;
+    XrStereoCameraClientFlagsDXR flags;
+} XrStereoCameraClientInfoDXR;
+
+typedef enum XrStereoCameraStreamEndReasonDXR {
+    //! The user stopped camera sharing from the runtime's tray / menu bar.
+    XR_STEREO_CAMERA_STREAM_END_REASON_USER_STOPPED_DXR = 1,
+    //! Camera sharing was switched off (user toggle or kill switch).
+    XR_STEREO_CAMERA_STREAM_END_REASON_DISABLED_DXR = 2,
+    //! The camera is gone (plug-in removed it / the service is shutting it down).
+    XR_STEREO_CAMERA_STREAM_END_REASON_SOURCE_LOST_DXR = 3,
+    XR_STEREO_CAMERA_STREAM_END_REASON_MAX_ENUM_DXR = 0x7FFFFFFF
+} XrStereoCameraStreamEndReasonDXR;
+
+/*!
+ * The service ended @c stream (it is now stopped for good: acquire returns
+ * XR_ERROR_STEREO_CAMERA_STREAM_ENDED_DXR). A consumer surfaces this as its
+ * track ending, then destroys the handle; a new stream may be created and
+ * started again later (subject to §7).
+ */
+typedef struct XrEventDataStereoCameraStreamEndedDXR {
+    XrStructureType type;
+    const void* XR_MAY_ALIAS next;
+    XrStereoCameraStreamDXR stream;
+    XrStereoCameraStreamEndReasonDXR reason;
+} XrEventDataStereoCameraStreamEndedDXR;
 
 typedef XrResult (XRAPI_PTR *PFN_xrEnumerateStereoCamerasDXR)(
     XrInstance instance, XrSystemId systemId, uint32_t capacityInput, uint32_t* countOutput,

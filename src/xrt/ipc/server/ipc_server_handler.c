@@ -20,6 +20,7 @@
 
 #include "server/ipc_server.h"
 #include "server/ipc_server_peer_creds.h"
+#include "util/u_client_class.h"
 #include "ipc_server_generated.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_results.h"
@@ -151,6 +152,7 @@ ipc_server_client_class_str(uint32_t client_class)
 	case XRT_CLIENT_CLASS_RELAY: return "RELAY";
 	case XRT_CLIENT_CLASS_PROVIDER_HOST: return "PROVIDER_HOST";
 	case XRT_CLIENT_CLASS_DIAG: return "DIAG";
+	case XRT_CLIENT_CLASS_CAMERA_CONSUMER: return "CAMERA_CONSUMER";
 	default: return "?";
 	}
 }
@@ -164,6 +166,7 @@ ipc_server_client_class_quota(const struct ipc_server *s, uint32_t client_class)
 	case XRT_CLIENT_CLASS_PRESENT_OWNER: return 2;
 	case XRT_CLIENT_CLASS_DIAG: return 4;
 	case XRT_CLIENT_CLASS_PROVIDER_HOST: return 2;
+	case XRT_CLIENT_CLASS_CAMERA_CONSUMER: return 4;
 	case XRT_CLIENT_CLASS_APP:
 	default:
 		// APP gets the rest of the admitted cap minus the reserved controller slot.
@@ -190,8 +193,11 @@ verify_client_class(volatile struct ipc_client_state *ics, uint32_t declared, co
 	case XRT_CLIENT_CLASS_APP: return XRT_CLIENT_CLASS_APP;
 	case XRT_CLIENT_CLASS_RELAY:
 	case XRT_CLIENT_CLASS_PRESENT_OWNER:
+	case XRT_CLIENT_CLASS_CAMERA_CONSUMER:
 		// Verified by use: a RELAY may never create a compositor (session_create
-		// refuses), only a PRESENT_OWNER may call the weave_* handlers.
+		// refuses), only a PRESENT_OWNER may call the weave_* handlers, and a
+		// CAMERA_CONSUMER may never create a session at all (ADR-043 R3) — the
+		// class buys camera calls and nothing else, so there is nothing to spoof.
 		return declared;
 	case XRT_CLIENT_CLASS_CONTROLLER: {
 		unsigned long orch = get_orchestrator_workspace_pid();
@@ -234,44 +240,33 @@ verify_client_class(volatile struct ipc_client_state *ics, uint32_t declared, co
 
 // PRESENT_OWNER quota counts OWNERS, not connections: one browser is several
 // processes of one executable (its GPU process weaves, the browser process binds
-// the window, and its video-capture utility reads the stereo camera through
-// XR_DXR_stereo_camera), and all of them are the one owner competing for the
-// panel. A connection from the same executable as an already-admitted
-// PRESENT_OWNER is a SIBLING and takes no new slot; otherwise the quota is
-// compared against the number of DISTINCT owner executables. A peer whose image
-// path the OS will not reveal ("") is never a sibling and counts as its own
-// owner (fails closed). Caller holds global_state.lock; the exe lookups run at
-// admission only.
+// the window), and all of them are the one owner competing for the panel. A
+// connection from the same executable as an already-admitted PRESENT_OWNER is a
+// SIBLING and takes no new slot; otherwise the quota is compared against the
+// number of DISTINCT owner executables. A peer whose image path the OS will not
+// reveal ("") is never a sibling and counts as its own owner (fails closed). The
+// browser's video-capture utility declares CAMERA_CONSUMER (ADR-043 R3) and is
+// not in this count at all — the rule itself is the pure
+// u_client_class_present_owner_count() so it can be tested host-side. Caller
+// holds global_state.lock; the exe lookups run at admission only.
 static uint32_t
 count_present_owners_locked(struct ipc_server *s, volatile struct ipc_client_state *ics, const char *ics_exe)
 {
-	static char seen[IPC_MAX_CLIENTS][512]; // under global_state.lock
+	static char exes[IPC_MAX_CLIENTS][512]; // under global_state.lock
+	struct u_client_class_peer peers[IPC_MAX_CLIENTS];
 	uint32_t n = 0;
 	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
 		volatile struct ipc_client_state *o = &s->threads[i].ics;
-		if (o == ics || o->server_thread_index < 0 || !o->class_verified ||
-		    o->client_state.client_class != XRT_CLIENT_CLASS_PRESENT_OWNER) {
+		if (o == ics || o->server_thread_index < 0 || !o->class_verified) {
 			continue;
 		}
-		char exe[512];
-		exe[0] = '\0';
-		ipc_server_peer_exe_path(o->peer_pid, exe, sizeof(exe));
-		if (exe[0] != '\0' && ics_exe[0] != '\0' && strcmp(exe, ics_exe) == 0) {
-			return 0; // a sibling of an admitted owner: no new slot
-		}
-		bool dup = false;
-		for (uint32_t k = 0; k < n && exe[0] != '\0'; k++) {
-			if (strcmp(seen[k], exe) == 0) {
-				dup = true;
-				break;
-			}
-		}
-		if (!dup) {
-			snprintf(seen[n], sizeof(seen[n]), "%s", exe);
-			n++;
-		}
+		exes[n][0] = '\0';
+		ipc_server_peer_exe_path(o->peer_pid, exes[n], sizeof(exes[n]));
+		peers[n].client_class = o->client_state.client_class;
+		peers[n].exe = exes[n];
+		n++;
 	}
-	return n;
+	return u_client_class_present_owner_count(peers, n, ics_exe);
 }
 
 // Count connected clients of a class, EXCLUDING ics. Caller holds global_state.lock.
@@ -2290,6 +2285,15 @@ ipc_handle_session_create(volatile struct ipc_client_state *ics,
 		if (cls == XRT_CLIENT_CLASS_RELAY && create_native_compositor) {
 			IPC_WARN(ics->server,
 			         "session_create: denied — RELAY client pid %ld asked for a native compositor (#960).",
+			         ics->peer_pid);
+			return XRT_ERROR_NOT_AUTHORIZED;
+		}
+		if (cls == XRT_CLIENT_CLASS_CAMERA_CONSUMER) {
+			// ADR-043 R3: a camera consumer has no session by contract — that is
+			// what keeps it out of the panel quota.
+			IPC_WARN(ics->server,
+			         "session_create: denied — CAMERA_CONSUMER client pid %ld may only use the stereo "
+			         "camera entry points (ADR-043 R3).",
 			         ics->peer_pid);
 			return XRT_ERROR_NOT_AUTHORIZED;
 		}

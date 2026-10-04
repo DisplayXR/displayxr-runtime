@@ -81,7 +81,16 @@ enum xrt_client_class
 	XRT_CLIENT_CLASS_RELAY = 3,         //!< headless relay (XR_MND_headless + display_info; the WebXR bridge)
 	XRT_CLIENT_CLASS_PROVIDER_HOST = 4, //!< service-spawned input-provider host (Phase 4; reserved)
 	XRT_CLIENT_CLASS_DIAG = 5,          //!< read-only diagnostics (displayxr-cli clients, bridge introspection)
-	XRT_CLIENT_CLASS_COUNT = 6,
+	/*!
+	 * XR_DXR_stereo_camera consumer with no compositor session (ADR-043 R3):
+	 * a browser's video-capture utility process, `displayxr-cli camera`. It
+	 * may only use the camera entry points — never a session — and it is
+	 * NOT a panel owner, so it never counts toward the PRESENT_OWNER quota
+	 * even when its executable is the browser's. Declared explicitly
+	 * (XrStereoCameraClientInfoDXR on xrInstanceCreateInfo); verified by use.
+	 */
+	XRT_CLIENT_CLASS_CAMERA_CONSUMER = 6,
+	XRT_CLIENT_CLASS_COUNT = 7,
 };
 
 /*!
