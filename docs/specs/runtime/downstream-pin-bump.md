@@ -85,8 +85,8 @@ rather than workflow logic:
 
 | `bump_when` | Repins when, between the pinned tag and the new tag… | Tracks |
 |---|---|---|
-| `abi` | `XRT_PLUGIN_API_VERSION_CURRENT` changed | leia `windows`, leia `android`, vendor-template `windows` |
-| `features` | the **feature surface** of the track's headers changed (below) | leia `linux` |
+| `abi` | `XRT_PLUGIN_API_VERSION_CURRENT` changed | leia `android`, vendor-template `windows` |
+| `features` | the **feature surface** of the track's headers changed (below) | leia `linux`, leia `windows` (since v2.25.2: an appended D3D11 slot compiled out at the old pin, leia-plugin#295) |
 | `manual` | never — human-owned; `reason` required | — |
 
 **`abi`** compares `XRT_PLUGIN_API_VERSION_CURRENT` at both tags — the same
