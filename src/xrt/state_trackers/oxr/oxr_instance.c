@@ -561,6 +561,19 @@ oxr_instance_create(struct oxr_logger *log,
 	else if (i_info.app_info.ext_weave_enabled) {
 		i_info.app_info.declared_client_class = XRT_CLIENT_CLASS_PRESENT_OWNER;
 	}
+#ifdef OXR_HAVE_DXR_stereo_camera
+	// ADR-043 R3: a camera-only consumer says so explicitly (a browser's
+	// video-capture utility process, `displayxr-cli camera`). It outranks the
+	// weave-derived PRESENT_OWNER claim: such a process never presents, so it
+	// must not take a panel-owner slot. The service refuses it any session.
+	if (extensions->DXR_stereo_camera) {
+		const XrStereoCameraClientInfoDXR *ci = OXR_GET_INPUT_FROM_CHAIN(
+		    createInfo, XR_TYPE_STEREO_CAMERA_CLIENT_INFO_DXR, XrStereoCameraClientInfoDXR);
+		if (ci != NULL && (ci->flags & XR_STEREO_CAMERA_CLIENT_CONSUMER_ONLY_BIT_DXR) != 0) {
+			i_info.app_info.declared_client_class = XRT_CLIENT_CLASS_CAMERA_CONSUMER;
+		}
+	}
+#endif
 	// #964 Phase A: is this process part of a workspace session? The workspace
 	// controller sets DISPLAYXR_WORKSPACE_SESSION=1 for the apps it launches
 	// (so does the service orchestrator's spawn), and ONLY those clients are

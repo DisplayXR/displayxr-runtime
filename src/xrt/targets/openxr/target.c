@@ -200,6 +200,14 @@ xrt_instance_create(struct xrt_instance_info *ii, struct xrt_instance **out_xins
 		return ipc_instance_create(ii, out_xinst);
 	}
 
+	// ADR-043 R3: a declared camera-only consumer has no use for an in-process
+	// instance (it enumerates zero cameras — the service is each camera's
+	// single owner), so it always goes to the service.
+	if (ii != NULL && ii->app_info.declared_client_class == XRT_CLIENT_CLASS_CAMERA_CONSUMER) {
+		U_LOG_W("Hybrid mode: stereo-camera consumer instance — forcing IPC");
+		return ipc_instance_create(ii, out_xinst);
+	}
+
 	// Check if we should use IPC mode
 	if (u_sandbox_should_use_ipc()) {
 		// One line per instance create (lifecycle, never per frame): WARN so the
