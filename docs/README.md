@@ -60,6 +60,7 @@ Contribute to the DisplayXR runtime — compositors, state tracker, auxiliary co
 - **[comp_multi One Pipeline (macOS/Linux/Android)](architecture/comp-multi-one-pipeline.md)** — #967 design note: bounded waits, shared-surface port to Android, issue split
 - **[In-Process vs Service](architecture/in-process-vs-service.md)** — compositor deployment modes
 - **[Implementing an Extension](guides/implementing-extension.md)** — how to add OpenXR extensions
+- **[Stereo camera consent](guides/stereo-camera-consent.md)** — what gates `XR_DXR_stereo_camera` frames (consent prompt, delegating browsers, foreground rule, kill switches) and how an app or browser declares itself
 
 ### Internal Specs (`specs/runtime/`)
 

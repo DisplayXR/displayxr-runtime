@@ -1,8 +1,8 @@
 # Stereo camera source — browser integration, vendor plug-in notes, phased plan
 
 **Status:** design (2026-09-25); **R1 implemented** on `feat/stereo-camera-r1` (2026-09-26),
-**R2 implemented** on `feat/stereo-camera-r2` (2026-09-26, stacked) — see §E; maintainer decisions
-for R1 in §G. **L1** (Leia provider) is on `displayxr-leia-plugin` `feat/stereo-camera-l1`. Decision: [ADR-043](../adr/ADR-043-stereo-camera-source.md).
+**R2 implemented** on `feat/stereo-camera-r2` (2026-09-26, stacked), **R3 implemented** on
+`feat/stereo-camera-r3` (2026-10-03, stacked) — see §E; maintainer decisions for R1 in §G. **L1** (Leia provider) is on `displayxr-leia-plugin` `feat/stereo-camera-l1`. Decision: [ADR-043](../adr/ADR-043-stereo-camera-source.md).
 Extension: [`XR_DXR_stereo_camera`](../specs/extensions/XR_DXR_stereo_camera.md). Consumer
 driving it: the web SDK's 3D call module (`@displayxr/inline3d/call`, RFC 0002 on
 `displayxr-web` branch `feat/call-p1`, §4 *Capture*).
@@ -196,7 +196,7 @@ The implementation belongs in `displayxr-leia-plugin` (`src/drv_leia/`), per ADR
 | **R0** | runtime | This design: ADR-043, spec, this page | Maintainer sign-off on the open questions below |
 | **R1** ✅ | runtime | **Implemented 2026-09-26 (see "R1 as built" below).** Header `XR_DXR_stereo_camera.h` + `index.json` note (together — the catalog lint requires both); `xrt_plugin_iface` slots + `XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA` (appended after `create_dp_d3d11_lift`, so **lands after ADR-042's PR**); platform-neutral camera manager (thread, refcount + linger, 3-slot pinned ring, per-stream wake handles, decimation, NV12/BGRA conversion); IPC + OpenXR entry points; sim_display fake; `displayxr-cli camera list/calib/probe`; selftest check | `camera probe` on the sim fake writes frames on Windows + Linux CI; ring/pinning unit tests (mirror `tests_lift_mailbox`) |
 | **R2** ✅ | runtime | **Implemented 2026-09-26 (see "R2 as built" below).** `u_stereo_rectify` (Bouguet, valid-region crop, LUT remap) with golden tests against OpenCV-generated fixtures; RECTIFIED output | sim fake: row error < 0.5 px, disparity = f·B/Z within 0.5 px — **measured 0.061 px worst block, 0.063 px worst disparity error** |
-| **R3** | runtime | Privacy: OS consent check, consent store + tray prompt, delegating-client registration, visibility/lock suspension, indicator, kill switches | Manual matrix: allow/deny/revoke, OS switch off, lock screen, background app — each blocks frames |
+| **R3** ✅ | runtime | **Implemented 2026-10-03 (see "R3 as built" below).** Privacy: OS consent check, consent store + tray prompt, delegating-client registration, visibility/lock suspension, indicator, kill switches, camera-only client class, distinct refusal results, events delivered, keyed `persistentId`, read-only consumer section | Policy matrix unit-tested with fakes; sim-fake end to end on macOS: refused without consent → allowed after `camera allow --self` / `camera trust` → suspended on a (fake) lock → ended by the kill switch. **Windows tray + WTS path and the manual panel matrix (allow/deny/revoke, OS switch off, real lock screen, background app) still need the Windows box** |
 | **L1** | leia-plugin (Windows) | Slots over the SR raw-camera channel per §D; calibration by active serial; keep-alive; repin runtime (feature-macro repin, `downstream-pins.json` `features` track) | On a panel box, incl. the multi-folder box: `camera probe --rectified` rows aligned; the vendor call app running at the same time still gets every frame; tracking/weave unaffected (frame-time + tracking-state logs) |
 | **B1** | browser (Windows) | §B device factory + duplicate hiding + hint + delegating registration in the installer; web SDK: prefer the hint in `camera:'auto'`, fill `hello` from it | RFC 0002 P1 call between two panel laptops sends rectified SBS from the tracker camera **while both are tracking** |
 | **A1** | leia-plugin (Android) + runtime | §C.1: the runtime owns the front pair and runs CNSDK in-app tracking from the same capture (worker thread, latest-frame slot); per-eye AHB transport + per-eye frame layout; Android consent + visibility | `camera probe` on the tablet via the runtime app **while the weave tracks from the same capture**; pair at 30.00 fps (not 24) |
@@ -288,6 +288,68 @@ against the sim fake).
   signed dy median +1.715 px → **+0.075 px**.
 - **Not in R2:** the GPU backend (seam in place), and a rectifier for a camera whose calibration
   changes at runtime (the refinement's reset hook is there for it).
+
+### R3 as built
+
+Spec §7 is the normative text; the developer-facing walkthrough is
+[`docs/guides/stereo-camera-consent.md`](../guides/stereo-camera-consent.md). What landed, and
+where:
+
+- **Camera-only client class.** `XRT_CLIENT_CLASS_CAMERA_CONSUMER` (value 6), declared with
+  `XrStereoCameraClientInfoDXR` + `CONSUMER_ONLY_BIT` on `XrInstanceCreateInfo` (spec §2a).
+  Verified by use (it can only call camera handlers; `session_create` refuses it), quota 4,
+  **never counted toward the PRESENT_OWNER quota** — the owner-counting rule is now the pure
+  `u_client_class_present_owner_count()` (`auxiliary/util/u_client_class.c`), tested host-side.
+  A hybrid runtime always routes a declared consumer to the service. `displayxr-cli camera
+  list|calib|probe` connect as this class; the control subcommands as `DIAG`.
+  **B1 migration:** the browser's video-capture utility must chain the struct instead of
+  enabling `XR_DXR_weave` to be classed as the browser (the weave-derived PRESENT_OWNER claim
+  is outranked by the declaration anyway); its other processes keep the sibling rule.
+- **Consent policy + store** (`u_camera_consent.{h,c}`, `u_camera_consent_store.c`): the eight-
+  step decision tree of spec §7.1 over two injected vtables (store, environment), the real store
+  (Windows registry under `HKCU\Software\DisplayXR\CameraConsent`, POSIX
+  `camera_consent.json` mode 0600 in the user config dir, plus the installer-written delegating
+  lists), the Windows `ConsentStore\webcam` read, and the keyed `persistentId`
+  (HMAC-SHA-256 over a 32-byte per-user secret the store generates once; a compact
+  `u_sha256.c` pinned by FIPS / RFC 4231 vectors). `DXR_STEREO_CAMERA_DEV_ALLOW=1` stays as the
+  documented dev override (one WARN; sharing-off still beats it); `DXR_STEREO_CAMERA=0` the kill
+  switch; `DXR_STEREO_CAMERA_PROMPT=0` turns the prompt off (headless / CI: an app with no
+  stored or delegated consent is refused).
+- **Service** (`ipc_server_stereo_camera.c`): consent evaluated at stream start and calibration
+  read with the manager lock released and one evaluation at a time (the prompt blocks the
+  client thread ≤ 60 s); distinct xrt results (`XRT_ERROR_STEREO_CAMERA_CONSENT_REFUSED` /
+  `_DISABLED` / `_BUSY` / `_STREAM_ENDED`, −45…−48) mapped 1:1 to the new `XrResult`s; the
+  foreground rule per published frame (250 ms cache; APP / PRESENT_OWNER need a visible
+  top-level window of the peer pid — `EnumWindows` on Windows, `NSRunningApplication` on macOS,
+  always visible on Linux; delegating / CAMERA_CONSUMER / DIAG exempt); session-lock
+  suspension (`ipc_server_stereo_camera_set_session_locked`, fed by WTS on Windows and
+  `screenIsLocked` + `sessionDidResignActive` on macOS; `camera fake-lock` for tests);
+  per-connection event queues drained by `stereo_camera_poll_event`; `stop_all`, `set_sharing`
+  and `get_status` for the UI; the read-only consumer section on every platform
+  (`ipc_shmem_create_with_readonly`: FILE_MAP_READ duplicate / O_RDONLY re-open before unlink /
+  `ASharedMemory_setProt(PROT_READ)`).
+- **OpenXR:** `scam_xret` maps the four new results; `xrPollEvent` drains the camera events
+  into the instance queue (`oxr_stereo_camera_poll_events`), mapping a service stream id back
+  to the app's handle for `XrEventDataStereoCameraStreamEndedDXR`.
+- **UI:** Windows tray — icon badge (red dot), tooltip + menu line "3D camera in use by <app>",
+  one balloon per transition, "Stop camera sharing", the "Share the 3D camera with apps"
+  checkmark, the consent dialog (top-most, Allow / Allow once / Deny) on the tray thread, WTS
+  session-change registration + `SM_REMOTESESSION`. macOS menu bar — the same five pieces as
+  an `NSStatusItem` badge, menu lines and a floating `NSPanel` (not a modal: a modal would park
+  the service's run loop) driven from the main-thread pump.
+- **CLI:** `camera consent | allow | deny | revoke | trust | untrust (<exe>|--self)` edit the
+  store locally; `camera status | stop-all | sharing on|off | fake-lock on|off` over IPC;
+  `probe` prints every event with its time since start and exits 4 / 6 / 7 / 8 for consent
+  refused / sharing off / busy / ended by the service.
+- **Tests:** `tests_camera_consent` (policy decisions for every rule with fake store +
+  environment; Allow-once bound to the pid; prompt timeout / unavailable retried; keyed id
+  stable per key and unlinkable across keys, consumers and devices; SHA-256 / HMAC vectors;
+  the PRESENT_OWNER owner count with a CAMERA_CONSUMER sibling). End to end on the macOS sim
+  fake, see the guide.
+- **Not in R3:** Android consent (A1); a signer check on the delegating entry (the registered
+  path is trusted as the installer wrote it); the macOS OS-camera (TCC) switch — not readable
+  for a consumer the OS cannot see; the Windows tray + WTS + dialog code is written to the API
+  but has only been compile-reasoned on macOS: it needs the Windows box.
 
 ## F. Risks
 
