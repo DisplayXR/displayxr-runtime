@@ -151,6 +151,7 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         const struct xrt_rect *flat_rects,
                                         bool mono_in_2d,
                                         bool overlay_unchanged,
+                                        float overlay_filter_strength,
                                         bool *out_have_output,
                                         uint32_t *out_width,
                                         uint32_t *out_height,
@@ -194,6 +195,7 @@ comp_ipc_client_compositor_weave_submit_dmabuf(struct xrt_compositor *xc,
                                                const struct xrt_rect *flat_rects,
                                                bool mono_in_2d,
                                                bool overlay_unchanged,
+                                               float overlay_filter_strength,
                                                int *out_release_fence_fd,
                                                bool *out_have_output,
                                                uint32_t *out_width,
@@ -584,6 +586,22 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 	    submitInfo, XR_TYPE_WEAVE_SUBMIT_OVERLAY_UNCHANGED_DXR, XrWeaveSubmitOverlayUnchangedDXR);
 	const bool overlay_unchanged = ovu != NULL && ovu->overlayUnchanged == XR_TRUE;
 
+	// Spec v15: a chained XrWeaveSubmitOverlayFilterDXR sets the lens-filter
+	// strength for the overlay; absent = the display processor's default (-1 on
+	// the wire). (x >= 0 && x <= 1) is false for NaN.
+	float overlay_filter_strength = -1.0f;
+	const XrWeaveSubmitOverlayFilterDXR *ovf = OXR_GET_INPUT_FROM_CHAIN(
+	    submitInfo, XR_TYPE_WEAVE_SUBMIT_OVERLAY_FILTER_DXR, XrWeaveSubmitOverlayFilterDXR);
+	if (ovf != NULL) {
+		if (!(ovf->filterStrength >= 0.0f && ovf->filterStrength <= 1.0f)) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrWeaveSubmitDXR: XrWeaveSubmitOverlayFilterDXR::filterStrength (%f) must be "
+			                 "in [0, 1]",
+			                 (double)ovf->filterStrength);
+		}
+		overlay_filter_strength = ovf->filterStrength;
+	}
+
 	// Spec v6 (#774): a chained XrWeaveSubmitLayoutDXR declares that the input
 	// is a worst-case-sized N-view atlas (tiles packed contiguously from the
 	// top-left at contentViewWidth/Height) instead of per-rect squeezed SBS.
@@ -813,7 +831,7 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		    submitInfo->rect.offset.x, submitInfo->rect.offset.y, (uint32_t)submitInfo->rect.extent.width,
 		    (uint32_t)submitInfo->rect.extent.height, rect_count, rect_count > 0 ? rects : NULL,
 		    overlay_rect_count, submitInfo->firstChunk == XR_TRUE, layout.view_count > 0 ? &layout : NULL,
-		    flat_rect_count, flat_rect_count > 0 ? flat_rects : NULL, mono_in_2d, overlay_unchanged, &release_fd, &have_out, &w,
+		    flat_rect_count, flat_rect_count > 0 ? flat_rects : NULL, mono_in_2d, overlay_unchanged, overlay_filter_strength, &release_fd, &have_out, &w,
 		    &h, &fence_value, &eyes, &woven);
 	} else
 #endif
@@ -825,7 +843,7 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		    rect_count > 0 ? rects : NULL, overlay_handle, overlay_is_dxgi, overlay_rect_count,
 		    overlay_rect_count > 0 ? overlay_rects : NULL, submitInfo->firstChunk == XR_TRUE,
 		    layout.view_count > 0 ? &layout : NULL, flat_rect_count, flat_rect_count > 0 ? flat_rects : NULL,
-		    mono_in_2d, overlay_unchanged, &have_out, &w, &h, &fence_value, &eyes);
+		    mono_in_2d, overlay_unchanged, overlay_filter_strength, &have_out, &w, &h, &fence_value, &eyes);
 	}
 	if (xret == XRT_ERROR_FEATURE_NOT_SUPPORTED) {
 		// The service has no weave engine for this platform (desktop Linux

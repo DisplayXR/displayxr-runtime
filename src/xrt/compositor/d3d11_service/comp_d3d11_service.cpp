@@ -810,6 +810,9 @@ struct d3d11_client_render_resources
 	//! XR_DXR_weave v14: the next submit's overlay is unchanged (set by
 	//! comp_d3d11_service_weave_set_overlay_unchanged, consumed by the submit).
 	bool                                   weave_overlay_unchanged_next;
+	//! XR_DXR_weave v15: the next submit's overlay lens-filter strength [0,1];
+	//! negative = the DP's default. Consumed (reset to -1) by the submit.
+	float                                  weave_overlay_filter_strength_next;
 
 	//! DXR_WEAVE_GPU_TIMING=1 diagnostic (ADR-027 Amendment perf A/B): a ring of
 	//! disjoint + 3 timestamp queries per weave_submit — T0 before the ingest
@@ -25220,6 +25223,17 @@ comp_d3d11_service_weave_set_overlay_unchanged(struct xrt_compositor *xc, bool o
 	c->render.weave_overlay_unchanged_next = overlay_unchanged;
 }
 
+void
+comp_d3d11_service_weave_set_overlay_filter_strength(struct xrt_compositor *xc, float strength)
+{
+	if (xc == nullptr || xc->destroy != compositor_destroy) {
+		return;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	// The wire is untrusted: anything outside [0,1] (incl. NaN) means "default".
+	c->render.weave_overlay_filter_strength_next = (strength >= 0.0f && strength <= 1.0f) ? strength : -1.0f;
+}
+
 bool
 comp_d3d11_service_weave_set_screen_flat_regions(struct xrt_compositor *xc,
                                                  uint32_t rect_count,
@@ -25691,6 +25705,8 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	// "unchanged" for the next submit (per submit, no latch).
 	const bool ov_unchanged = c->render.weave_overlay_unchanged_next;
 	c->render.weave_overlay_unchanged_next = false;
+	const float ov_filter_strength = c->render.weave_overlay_filter_strength_next;
+	c->render.weave_overlay_filter_strength_next = -1.0f;
 	struct d3d11_service_system *sys = c->sys;
 	if (sys == nullptr) {
 		return false;
@@ -26243,6 +26259,10 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	bool ov_in_dp = false;
 	auto hand_overlay_to_dp = [&]() {
 		const bool fits = (ov_srv != nullptr && ov_w == win_w && ov_h == win_h);
+		if (fits) {
+			// v15: per frame, before the layer itself (the slot is stateless).
+			xrt_display_processor_d3d11_set_overlay_2d_filter_strength(dp, ov_filter_strength);
+		}
 		ov_in_dp = xrt_display_processor_d3d11_set_overlay_2d(dp, sys->context.get(), fits ? ov_srv : nullptr,
 		                                                      fits ? ov_w : 0, fits ? ov_h : 0,
 		                                                      XRT_ATLAS_ENCODING_ENCODED, fits && ov_unchanged) &&

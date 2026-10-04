@@ -587,7 +587,8 @@ weave_pack_submit_args(struct ipc_arg_weave_submit *args,
                        uint32_t flat_rect_count,
                        const struct xrt_rect *flat_rects,
                        bool mono_in_2d,
-                       bool overlay_unchanged)
+                       bool overlay_unchanged,
+                       float overlay_filter_strength)
 {
 	U_ZERO(args);
 	args->rect_x = rect_x;
@@ -650,6 +651,10 @@ weave_pack_submit_args(struct ipc_arg_weave_submit *args,
 	// reuse its lens prefilter of it. Only meaningful with an overlay; 0 (a
 	// pre-v14 caller) is "may have changed", the old behaviour.
 	args->overlay_unchanged = (have_overlay && overlay_unchanged) ? 1u : 0u;
+
+	// v15: the caller's lens-filter strength for the overlay; negative = not set
+	// (the DP's own default). Only meaningful with an overlay.
+	args->overlay_filter_strength = have_overlay ? overlay_filter_strength : -1.0f;
 }
 
 xrt_result_t
@@ -672,6 +677,7 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         const struct xrt_rect *flat_rects,
                                         bool mono_in_2d,
                                         bool overlay_unchanged,
+                                        float overlay_filter_strength,
                                         bool *out_have_output,
                                         uint32_t *out_width,
                                         uint32_t *out_height,
@@ -706,7 +712,7 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
 	const bool have_overlay = (overlay_handle != XRT_GRAPHICS_BUFFER_HANDLE_INVALID);
 	weave_pack_submit_args(&args, rect_x, rect_y, rect_w, rect_h, rect_count, rects, have_overlay,
 	                       overlay_rect_count, overlay_rects, weave_frame_first, layout, flat_rect_count,
-	                       flat_rects, mono_in_2d, overlay_unchanged);
+	                       flat_rects, mono_in_2d, overlay_unchanged, overlay_filter_strength);
 
 	xrt_graphics_buffer_handle_t handles[2] = {in_handle, overlay_handle};
 	uint32_t handle_count = have_overlay ? 2u : 1u;
@@ -886,6 +892,7 @@ comp_ipc_client_compositor_weave_submit_dmabuf(struct xrt_compositor *xc,
                                                const struct xrt_rect *flat_rects,
                                                bool mono_in_2d,
                                                bool overlay_unchanged,
+                                               float overlay_filter_strength,
                                                int *out_release_fence_fd,
                                                bool *out_have_output,
                                                uint32_t *out_width,
@@ -928,7 +935,7 @@ comp_ipc_client_compositor_weave_submit_dmabuf(struct xrt_compositor *xc,
 	struct ipc_arg_weave_submit args;
 	weave_pack_submit_args(&args, rect_x, rect_y, rect_w, rect_h, rect_count, rects, overlay != NULL,
 	                       overlay_rect_count, NULL, weave_frame_first, layout, flat_rect_count, flat_rects,
-	                       mono_in_2d, overlay_unchanged);
+	                       mono_in_2d, overlay_unchanged, overlay_filter_strength);
 
 	struct ipc_arg_weave_dmabuf dmabuf = {0};
 	weave_pack_dmabuf(&dmabuf.input, in);

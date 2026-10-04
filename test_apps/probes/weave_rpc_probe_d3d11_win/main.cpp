@@ -128,6 +128,9 @@ enum OverlayMode
 	OVERLAY_PAGE_ANIM,
 };
 static OverlayMode g_overlayMode = OVERLAY_BAR;
+//! --filter-strength=X (XR_DXR_weave v15): chain XrWeaveSubmitOverlayFilterDXR with
+//! this lens-filter strength on every overlay submit; negative = omit (DP default).
+static float g_filterStrength = -1.0f;
 static uint32_t g_pageFrame = 0;
 static const uint32_t kRectW = 640; //!< weaved sub-rect (per-view = kRectW)
 static const uint32_t kRectH = 360;
@@ -1020,6 +1023,8 @@ ParseOptions(PWSTR cmdLineW)
 				} else {
 					LOG_ERROR("--overlay: bad value '%s' (want bar|none|page|page-anim) — ignored", v);
 				}
+			} else if (_strnicmp(tok, "--filter-strength=", 18) == 0) {
+				g_filterStrength = (float)atof(tok + 18);
 			} else if (_strnicmp(tok, "--size=", 7) == 0) {
 				unsigned sw = 0, sh = 0;
 				if (sscanf_s(tok + 7, "%ux%u", &sw, &sh) == 2 && sw >= 64 && sh >= 64 && sw <= 8192 && sh <= 8192) {
@@ -1336,6 +1341,13 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 		}
 		// v14: declare the overlay unchanged (static page) so a DP can reuse its
 		// lens prefilter of it. Advisory; a pre-v14 runtime ignores the struct.
+		// v15: an explicit lens-filter strength for the overlay (omitted = DP default).
+		XrWeaveSubmitOverlayFilterDXR ovf = {XR_TYPE_WEAVE_SUBMIT_OVERLAY_FILTER_DXR};
+		if (haveOverlay && g_filterStrength >= 0.0f) {
+			ovf.filterStrength = g_filterStrength;
+			*tail = &ovf;
+			tail = &ovf.next;
+		}
 		XrWeaveSubmitOverlayUnchangedDXR ovu = {XR_TYPE_WEAVE_SUBMIT_OVERLAY_UNCHANGED_DXR};
 		if (haveOverlay && overlayUnchanged) {
 			ovu.overlayUnchanged = XR_TRUE;
