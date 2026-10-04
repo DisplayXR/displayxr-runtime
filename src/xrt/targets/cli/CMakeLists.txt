@@ -92,12 +92,11 @@ endif()
 
 # ADR-042: `displayxr-cli lift probe` loads / writes images (stb, header-only,
 # compiled static into cli_cmd_lift.cpp) and drives D3D11 shared textures.
+# ADR-043: `displayxr-cli camera probe --out` writes PNGs with the same stb
+# (compiled static into cli_cmd_camera.c).
 target_include_directories(cli PRIVATE ${PROJECT_SOURCE_DIR}/src/external/stb)
 if(WIN32)
 	target_link_libraries(cli PRIVATE d3d11 dxgi)
 endif()
-# ADR-043: `displayxr-cli camera probe --out` writes PNGs (stb, header-only,
-# compiled static into cli_cmd_camera.c).
-target_include_directories(cli PRIVATE ${PROJECT_SOURCE_DIR}/src/external/stb)
 
 install(TARGETS cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

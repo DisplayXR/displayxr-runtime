@@ -640,11 +640,12 @@ Flags (`XRT_PLUGIN_STEREO_CAMERA_*`) mirror the XR bits: `SHARED_WITH_EYE_TRACKI
 `sim_display`'s fake (`drivers/sim_display/sim_display_stereo_camera.c`, enabled with
 `SIM_DISPLAY_FAKE_STEREO_CAMERA=1` in the **service** environment).
 
-**Slot order.** The six slots follow a one-pointer placeholder,
-`reserved_adr042_create_dp_d3d11_lift`, held for ADR-042's `create_dp_d3d11_lift`, which is not on
-`main` yet but claims the offset right after `vk_bundle_fn_table_offset`. The placeholder keeps the
-camera slots at their final offsets whichever PR merges first; the lift PR replaces it in place
-(same size). `tests_stereo_camera` asserts the adjacency.
+**Slot order.** The six slots are the LAST members of the iface, appended (ADR-020) after
+everything that was on `main` before them: `… vk_bundle_fn_table_offset` → `create_dp_d3d11_lift`
+(ADR-042) → `get_platform_state` (ADR-045) → `stereo_camera_enumerate … stereo_camera_close`.
+`tests_stereo_camera` pins that order (lift right after the vk fingerprint, platform-state right
+after lift, the camera block right after platform-state and ending the struct), so a reorder or a
+slot squeezed in between fails on the host, not on a vendor box.
 
 ## Aux surface — separate from the iface
 
