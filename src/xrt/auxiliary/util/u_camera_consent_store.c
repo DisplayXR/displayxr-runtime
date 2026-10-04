@@ -1,0 +1,750 @@
+// Copyright 2026, The DisplayXR Project
+// SPDX-License-Identifier: BSL-1.0
+/*!
+ * @file
+ * @brief  The real stereo camera consent store (ADR-043 R3, spec §7.1).
+ *
+ * Windows — registry, per user:
+ *   HKCU\Software\DisplayXR\CameraConsent
+ *     Sharing      REG_DWORD   1 (default) / 0 — the user's sharing toggle
+ *     Secret       REG_BINARY  32 bytes, generated once — keys persistentId
+ *     Apps\        REG_DWORD   value NAME = full executable path, data 1 = Allow, 2 = Deny
+ *     Delegating\  REG_SZ      value name = any id, data = executable path (user-level list,
+ *                              `displayxr-cli camera trust`)
+ *   HKLM\Software\DisplayXR\CameraConsent\Delegating   same shape, written by installers
+ *   The OS camera privacy switch is read from CapabilityAccessManager\ConsentStore\webcam
+ *   (HKLM global policy, HKCU global, NonPackaged = desktop apps, and the per-app entry
+ *   whose key name is the path with '\' replaced by '#').
+ *
+ * POSIX — JSON, mode 0600, in the user config dir ($XDG_CONFIG_HOME/displayxr or
+ * ~/.config/monado, like every other runtime file): camera_consent.json
+ *   {"sharing": true, "secret": "<64 hex>", "apps": {"<exe>": "allow"|"deny"},
+ *    "delegating": ["<exe>", ...]}
+ * plus the system delegating list an installer may write:
+ *   Linux  /etc/displayxr/camera-delegating.json
+ *   macOS  /Library/Application Support/DisplayXR/camera-delegating.json
+ *   {"delegating": ["<exe>", ...]}
+ *
+ * Paths compare the way the OS does: Windows case-insensitively with either
+ * separator, POSIX byte-exact.
+ *
+ * @ingroup aux_util
+ */
+
+#include "util/u_camera_consent.h"
+#include "util/u_logging.h"
+
+#include "xrt/xrt_config_os.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifdef XRT_OS_WINDOWS
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <bcrypt.h>
+#else
+#include "util/u_file.h"
+#include "util/u_json.h"
+#include <cjson/cJSON.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
+
+/*
+ *
+ * Shared helpers.
+ *
+ */
+
+static char
+norm_ch(char c)
+{
+#ifdef XRT_OS_WINDOWS
+	if (c == '/') {
+		return '\\';
+	}
+	if (c >= 'A' && c <= 'Z') {
+		return (char)(c - 'A' + 'a');
+	}
+#endif
+	return c;
+}
+
+static bool
+path_equal(const char *a, const char *b)
+{
+	if (a == NULL || b == NULL || a[0] == '\0' || b[0] == '\0') {
+		return false;
+	}
+	while (*a != '\0' && *b != '\0') {
+		if (norm_ch(*a) != norm_ch(*b)) {
+			return false;
+		}
+		a++;
+		b++;
+	}
+	return *a == '\0' && *b == '\0';
+}
+
+static void
+fill_random(uint8_t *out, size_t n)
+{
+#ifdef XRT_OS_WINDOWS
+	if (BCryptGenRandom(NULL, out, (ULONG)n, BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0) {
+		return;
+	}
+#else
+	int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+	if (fd >= 0) {
+		size_t got = 0;
+		while (got < n) {
+			ssize_t r = read(fd, out + got, n - got);
+			if (r <= 0) {
+				break;
+			}
+			got += (size_t)r;
+		}
+		close(fd);
+		if (got == n) {
+			return;
+		}
+	}
+#endif
+	// Last resort: still unpredictable enough to key an id for one install.
+	uint64_t x = (uint64_t)(uintptr_t)out ^ 0x9e3779b97f4a7c15ull;
+	for (size_t i = 0; i < n; i++) {
+		x ^= x << 13;
+		x ^= x >> 7;
+		x ^= x << 17;
+		out[i] = (uint8_t)(x ^ (uint64_t)rand());
+	}
+}
+
+
+#ifdef XRT_OS_WINDOWS
+
+/*
+ *
+ * Windows: registry.
+ *
+ */
+
+#define CONSENT_KEY "Software\\DisplayXR\\CameraConsent"
+#define CAM_CONSENT_STORE_WEBCAM "Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\webcam"
+
+static bool
+reg_read_dword(HKEY root, const char *sub, const char *name, DWORD *out)
+{
+	HKEY k;
+	if (RegOpenKeyExA(root, sub, 0, KEY_READ, &k) != ERROR_SUCCESS) {
+		return false;
+	}
+	DWORD type = 0, data = 0, size = sizeof(data);
+	LSTATUS rc = RegQueryValueExA(k, name, NULL, &type, (LPBYTE)&data, &size);
+	RegCloseKey(k);
+	if (rc != ERROR_SUCCESS || type != REG_DWORD) {
+		return false;
+	}
+	*out = data;
+	return true;
+}
+
+static bool
+reg_read_string(HKEY root, const char *sub, const char *name, char *out, size_t cap)
+{
+	HKEY k;
+	if (RegOpenKeyExA(root, sub, 0, KEY_READ, &k) != ERROR_SUCCESS) {
+		return false;
+	}
+	DWORD type = 0, size = (DWORD)cap;
+	LSTATUS rc = RegQueryValueExA(k, name, NULL, &type, (LPBYTE)out, &size);
+	RegCloseKey(k);
+	if (rc != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ)) {
+		return false;
+	}
+	out[cap - 1] = '\0';
+	return true;
+}
+
+static bool
+reg_write_dword(HKEY root, const char *sub, const char *name, DWORD v)
+{
+	HKEY k;
+	if (RegCreateKeyExA(root, sub, 0, NULL, 0, KEY_WRITE, NULL, &k, NULL) != ERROR_SUCCESS) {
+		return false;
+	}
+	LSTATUS rc = RegSetValueExA(k, name, 0, REG_DWORD, (const BYTE *)&v, sizeof(v));
+	RegCloseKey(k);
+	return rc == ERROR_SUCCESS;
+}
+
+static bool
+reg_delete_value(HKEY root, const char *sub, const char *name)
+{
+	HKEY k;
+	if (RegOpenKeyExA(root, sub, 0, KEY_WRITE, &k) != ERROR_SUCCESS) {
+		return true; // nothing to delete
+	}
+	LSTATUS rc = RegDeleteValueA(k, name);
+	RegCloseKey(k);
+	return rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND;
+}
+
+static bool
+win_get(void *ctx, const char *exe, enum u_camera_consent_stored *out)
+{
+	(void)ctx;
+	*out = U_CAMERA_CONSENT_STORED_NONE;
+	DWORD v = 0;
+	if (!reg_read_dword(HKEY_CURRENT_USER, CONSENT_KEY "\\Apps", exe, &v)) {
+		return false;
+	}
+	*out = v == 1 ? U_CAMERA_CONSENT_STORED_ALLOW : v == 2 ? U_CAMERA_CONSENT_STORED_DENY : U_CAMERA_CONSENT_STORED_NONE;
+	return true;
+}
+
+static bool
+win_set(void *ctx, const char *exe, enum u_camera_consent_stored value)
+{
+	(void)ctx;
+	if (value == U_CAMERA_CONSENT_STORED_NONE) {
+		return reg_delete_value(HKEY_CURRENT_USER, CONSENT_KEY "\\Apps", exe);
+	}
+	return reg_write_dword(HKEY_CURRENT_USER, CONSENT_KEY "\\Apps", exe,
+	                       value == U_CAMERA_CONSENT_STORED_ALLOW ? 1u : 2u);
+}
+
+//! Walk the values of a Delegating key: each value's DATA is an executable path.
+static bool
+win_delegating_has(HKEY root, const char *exe, char *match_name, size_t match_cap)
+{
+	HKEY k;
+	if (RegOpenKeyExA(root, CONSENT_KEY "\\Delegating", 0, KEY_READ, &k) != ERROR_SUCCESS) {
+		return false;
+	}
+	bool found = false;
+	for (DWORD i = 0; !found; i++) {
+		char name[256];
+		char data[1024];
+		DWORD name_len = sizeof(name), type = 0, data_len = sizeof(data);
+		LSTATUS rc = RegEnumValueA(k, i, name, &name_len, NULL, &type, (LPBYTE)data, &data_len);
+		if (rc != ERROR_SUCCESS) {
+			break;
+		}
+		if (type != REG_SZ && type != REG_EXPAND_SZ) {
+			continue;
+		}
+		data[sizeof(data) - 1] = '\0';
+		if (path_equal(data, exe)) {
+			found = true;
+			if (match_name != NULL) {
+				snprintf(match_name, match_cap, "%s", name);
+			}
+		}
+	}
+	RegCloseKey(k);
+	return found;
+}
+
+static bool
+win_is_delegating(void *ctx, const char *exe)
+{
+	(void)ctx;
+	return win_delegating_has(HKEY_LOCAL_MACHINE, exe, NULL, 0) || win_delegating_has(HKEY_CURRENT_USER, exe, NULL, 0);
+}
+
+static bool
+win_sharing_enabled(void *ctx)
+{
+	(void)ctx;
+	DWORD v = 1;
+	if (reg_read_dword(HKEY_CURRENT_USER, CONSENT_KEY, "Sharing", &v)) {
+		return v != 0;
+	}
+	return true;
+}
+
+static bool
+win_set_sharing_enabled(void *ctx, bool enabled)
+{
+	(void)ctx;
+	return reg_write_dword(HKEY_CURRENT_USER, CONSENT_KEY, "Sharing", enabled ? 1u : 0u);
+}
+
+static bool
+win_get_secret(void *ctx, uint8_t out[U_CAMERA_CONSENT_SECRET_SIZE])
+{
+	(void)ctx;
+	HKEY k;
+	if (RegCreateKeyExA(HKEY_CURRENT_USER, CONSENT_KEY, 0, NULL, 0, KEY_READ | KEY_WRITE, NULL, &k, NULL) !=
+	    ERROR_SUCCESS) {
+		return false;
+	}
+	DWORD type = 0, size = U_CAMERA_CONSENT_SECRET_SIZE;
+	LSTATUS rc = RegQueryValueExA(k, "Secret", NULL, &type, out, &size);
+	if (rc == ERROR_SUCCESS && type == REG_BINARY && size == U_CAMERA_CONSENT_SECRET_SIZE) {
+		RegCloseKey(k);
+		return true;
+	}
+	fill_random(out, U_CAMERA_CONSENT_SECRET_SIZE);
+	rc = RegSetValueExA(k, "Secret", 0, REG_BINARY, out, U_CAMERA_CONSENT_SECRET_SIZE);
+	RegCloseKey(k);
+	return rc == ERROR_SUCCESS;
+}
+
+static const struct u_camera_consent_store_ops win_ops = {
+    .get = win_get,
+    .set = win_set,
+    .is_delegating = win_is_delegating,
+    .sharing_enabled = win_sharing_enabled,
+    .set_sharing_enabled = win_set_sharing_enabled,
+    .get_secret = win_get_secret,
+};
+
+const struct u_camera_consent_store_ops *
+u_camera_consent_store_default(void)
+{
+	return &win_ops;
+}
+
+bool
+u_camera_consent_store_set_delegating(const char *exe, bool delegating)
+{
+	char name[256];
+	bool present = win_delegating_has(HKEY_CURRENT_USER, exe, name, sizeof(name));
+	if (!delegating) {
+		return !present || reg_delete_value(HKEY_CURRENT_USER, CONSENT_KEY "\\Delegating", name);
+	}
+	if (present) {
+		return true;
+	}
+	// Value name: the executable's base name (unique enough; data is what matters).
+	const char *base = exe;
+	for (const char *p = exe; *p != '\0'; p++) {
+		if (*p == '\\' || *p == '/') {
+			base = p + 1;
+		}
+	}
+	HKEY k;
+	if (RegCreateKeyExA(HKEY_CURRENT_USER, CONSENT_KEY "\\Delegating", 0, NULL, 0, KEY_WRITE, NULL, &k, NULL) !=
+	    ERROR_SUCCESS) {
+		return false;
+	}
+	LSTATUS rc = RegSetValueExA(k, base, 0, REG_SZ, (const BYTE *)exe, (DWORD)strlen(exe) + 1);
+	RegCloseKey(k);
+	return rc == ERROR_SUCCESS;
+}
+
+static void
+win_list_delegating(HKEY root, const char *origin, void (*cb)(void *, char, const char *, const char *), void *ctx)
+{
+	HKEY k;
+	if (RegOpenKeyExA(root, CONSENT_KEY "\\Delegating", 0, KEY_READ, &k) != ERROR_SUCCESS) {
+		return;
+	}
+	for (DWORD i = 0;; i++) {
+		char name[256];
+		char data[1024];
+		DWORD name_len = sizeof(name), type = 0, data_len = sizeof(data);
+		if (RegEnumValueA(k, i, name, &name_len, NULL, &type, (LPBYTE)data, &data_len) != ERROR_SUCCESS) {
+			break;
+		}
+		if (type == REG_SZ || type == REG_EXPAND_SZ) {
+			data[sizeof(data) - 1] = '\0';
+			cb(ctx, 'd', data, origin);
+		}
+	}
+	RegCloseKey(k);
+}
+
+void
+u_camera_consent_store_list(void (*cb)(void *ctx, char kind, const char *exe, const char *value), void *ctx)
+{
+	cb(ctx, 's', "", win_sharing_enabled(NULL) ? "on" : "off");
+	HKEY k;
+	if (RegOpenKeyExA(HKEY_CURRENT_USER, CONSENT_KEY "\\Apps", 0, KEY_READ, &k) == ERROR_SUCCESS) {
+		for (DWORD i = 0;; i++) {
+			char name[1024];
+			DWORD name_len = sizeof(name), type = 0, v = 0, v_len = sizeof(v);
+			if (RegEnumValueA(k, i, name, &name_len, NULL, &type, (LPBYTE)&v, &v_len) != ERROR_SUCCESS) {
+				break;
+			}
+			if (type == REG_DWORD) {
+				cb(ctx, 'a', name, v == 1 ? "allow" : v == 2 ? "deny" : "?");
+			}
+		}
+		RegCloseKey(k);
+	}
+	win_list_delegating(HKEY_LOCAL_MACHINE, "system", cb, ctx);
+	win_list_delegating(HKEY_CURRENT_USER, "user", cb, ctx);
+}
+
+bool
+u_camera_consent_store_path(char *out, size_t cap)
+{
+	snprintf(out, cap, "HKCU\\%s", CONSENT_KEY);
+	return true;
+}
+
+//! "Deny" in a ConsentStore Value means off; anything else (Allow, absent) is on.
+static bool
+consent_store_value_denies(HKEY root, const char *sub)
+{
+	char v[32];
+	return reg_read_string(root, sub, "Value", v, sizeof(v)) && _stricmp(v, "Deny") == 0;
+}
+
+bool
+u_camera_consent_os_camera_allowed(const char *exe)
+{
+	// Global (policy, then user), then the desktop-app class, then this app.
+	if (consent_store_value_denies(HKEY_LOCAL_MACHINE, CAM_CONSENT_STORE_WEBCAM) ||
+	    consent_store_value_denies(HKEY_CURRENT_USER, CAM_CONSENT_STORE_WEBCAM) ||
+	    consent_store_value_denies(HKEY_CURRENT_USER, CAM_CONSENT_STORE_WEBCAM "\\NonPackaged")) {
+		return false;
+	}
+	if (exe == NULL || exe[0] == '\0') {
+		return true;
+	}
+	char sub[1600];
+	int n = snprintf(sub, sizeof(sub), "%s\\NonPackaged\\", CAM_CONSENT_STORE_WEBCAM);
+	for (const char *p = exe; *p != '\0' && n < (int)sizeof(sub) - 1; p++) {
+		sub[n++] = (*p == '\\' || *p == '/') ? '#' : *p;
+	}
+	sub[n] = '\0';
+	return !consent_store_value_denies(HKEY_CURRENT_USER, sub);
+}
+
+#else // POSIX
+
+/*
+ *
+ * POSIX: JSON file.
+ *
+ */
+
+#define CONSENT_FILE "camera_consent.json"
+#ifdef XRT_OS_MACOS
+#define SYSTEM_DELEGATING_FILE "/Library/Application Support/DisplayXR/camera-delegating.json"
+#else
+#define SYSTEM_DELEGATING_FILE "/etc/displayxr/camera-delegating.json"
+#endif
+
+static bool
+user_path(char *out, size_t cap)
+{
+	int n = u_file_get_path_in_config_dir(CONSENT_FILE, out, cap);
+	return n > 0 && (size_t)n < cap;
+}
+
+//! Parse the user file; NULL = absent / unreadable. An empty object otherwise.
+static cJSON *
+load_user(bool create)
+{
+	char path[1024];
+	if (!user_path(path, sizeof(path))) {
+		return NULL;
+	}
+	size_t size = 0;
+	char *content = u_file_read_content_from_path(path, &size);
+	cJSON *root = NULL;
+	if (content != NULL) {
+		root = cJSON_Parse(content);
+		free(content);
+	}
+	if (root == NULL && create) {
+		root = cJSON_CreateObject();
+	}
+	return root;
+}
+
+static bool
+save_user(cJSON *root)
+{
+	// u_file_open_file_in_config_dir creates the directory; we then clamp the
+	// mode — the file holds the id-keying secret.
+	FILE *f = u_file_open_file_in_config_dir(CONSENT_FILE, "w");
+	if (f == NULL) {
+		return false;
+	}
+	char *text = cJSON_Print(root);
+	bool ok = text != NULL && fputs(text, f) >= 0;
+	free(text);
+	fclose(f);
+	char path[1024];
+	if (user_path(path, sizeof(path))) {
+		(void)chmod(path, S_IRUSR | S_IWUSR);
+	}
+	return ok;
+}
+
+static bool
+posix_get(void *ctx, const char *exe, enum u_camera_consent_stored *out)
+{
+	(void)ctx;
+	*out = U_CAMERA_CONSENT_STORED_NONE;
+	cJSON *root = load_user(false);
+	if (root == NULL) {
+		return false;
+	}
+	bool found = false;
+	cJSON *apps = cJSON_GetObjectItem(root, "apps");
+	cJSON *it = NULL;
+	cJSON_ArrayForEach(it, apps)
+	{
+		if (it->string != NULL && cJSON_IsString(it) && path_equal(it->string, exe)) {
+			found = true;
+			*out = strcmp(it->valuestring, "allow") == 0  ? U_CAMERA_CONSENT_STORED_ALLOW
+			       : strcmp(it->valuestring, "deny") == 0 ? U_CAMERA_CONSENT_STORED_DENY
+			                                              : U_CAMERA_CONSENT_STORED_NONE;
+			break;
+		}
+	}
+	cJSON_Delete(root);
+	return found;
+}
+
+static bool
+posix_set(void *ctx, const char *exe, enum u_camera_consent_stored value)
+{
+	(void)ctx;
+	cJSON *root = load_user(true);
+	if (root == NULL) {
+		return false;
+	}
+	cJSON *apps = cJSON_GetObjectItem(root, "apps");
+	if (apps == NULL || !cJSON_IsObject(apps)) {
+		cJSON_DeleteItemFromObject(root, "apps");
+		apps = cJSON_AddObjectToObject(root, "apps");
+	}
+	cJSON_DeleteItemFromObject(apps, exe);
+	if (value != U_CAMERA_CONSENT_STORED_NONE) {
+		cJSON_AddStringToObject(apps, exe, value == U_CAMERA_CONSENT_STORED_ALLOW ? "allow" : "deny");
+	}
+	bool ok = save_user(root);
+	cJSON_Delete(root);
+	return ok;
+}
+
+static bool
+delegating_array_has(const cJSON *arr, const char *exe)
+{
+	const cJSON *it = NULL;
+	cJSON_ArrayForEach(it, arr)
+	{
+		if (cJSON_IsString(it) && path_equal(it->valuestring, exe)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static cJSON *
+load_system(void)
+{
+	size_t size = 0;
+	char *content = u_file_read_content_from_path(SYSTEM_DELEGATING_FILE, &size);
+	if (content == NULL) {
+		return NULL;
+	}
+	cJSON *root = cJSON_Parse(content);
+	free(content);
+	return root;
+}
+
+static bool
+posix_is_delegating(void *ctx, const char *exe)
+{
+	(void)ctx;
+	bool yes = false;
+	cJSON *sys = load_system();
+	if (sys != NULL) {
+		yes = delegating_array_has(cJSON_GetObjectItem(sys, "delegating"), exe);
+		cJSON_Delete(sys);
+	}
+	if (!yes) {
+		cJSON *user = load_user(false);
+		if (user != NULL) {
+			yes = delegating_array_has(cJSON_GetObjectItem(user, "delegating"), exe);
+			cJSON_Delete(user);
+		}
+	}
+	return yes;
+}
+
+static bool
+posix_sharing_enabled(void *ctx)
+{
+	(void)ctx;
+	bool on = true;
+	cJSON *root = load_user(false);
+	if (root != NULL) {
+		cJSON *s = cJSON_GetObjectItem(root, "sharing");
+		if (cJSON_IsBool(s)) {
+			on = cJSON_IsTrue(s);
+		}
+		cJSON_Delete(root);
+	}
+	return on;
+}
+
+static bool
+posix_set_sharing_enabled(void *ctx, bool enabled)
+{
+	(void)ctx;
+	cJSON *root = load_user(true);
+	if (root == NULL) {
+		return false;
+	}
+	cJSON_DeleteItemFromObject(root, "sharing");
+	cJSON_AddBoolToObject(root, "sharing", enabled);
+	bool ok = save_user(root);
+	cJSON_Delete(root);
+	return ok;
+}
+
+static int
+hexval(char c)
+{
+	if (c >= '0' && c <= '9') {
+		return c - '0';
+	}
+	if (c >= 'a' && c <= 'f') {
+		return c - 'a' + 10;
+	}
+	if (c >= 'A' && c <= 'F') {
+		return c - 'A' + 10;
+	}
+	return -1;
+}
+
+static bool
+posix_get_secret(void *ctx, uint8_t out[U_CAMERA_CONSENT_SECRET_SIZE])
+{
+	(void)ctx;
+	cJSON *root = load_user(true);
+	if (root == NULL) {
+		return false;
+	}
+	cJSON *s = cJSON_GetObjectItem(root, "secret");
+	if (cJSON_IsString(s) && strlen(s->valuestring) == 2 * U_CAMERA_CONSENT_SECRET_SIZE) {
+		bool ok = true;
+		for (int i = 0; i < U_CAMERA_CONSENT_SECRET_SIZE && ok; i++) {
+			int hi = hexval(s->valuestring[2 * i]), lo = hexval(s->valuestring[2 * i + 1]);
+			ok = hi >= 0 && lo >= 0;
+			out[i] = (uint8_t)((hi << 4) | lo);
+		}
+		if (ok) {
+			cJSON_Delete(root);
+			return true;
+		}
+	}
+	fill_random(out, U_CAMERA_CONSENT_SECRET_SIZE);
+	char hex[2 * U_CAMERA_CONSENT_SECRET_SIZE + 1];
+	for (int i = 0; i < U_CAMERA_CONSENT_SECRET_SIZE; i++) {
+		snprintf(hex + 2 * i, 3, "%02x", out[i]);
+	}
+	cJSON_DeleteItemFromObject(root, "secret");
+	cJSON_AddStringToObject(root, "secret", hex);
+	bool ok = save_user(root);
+	cJSON_Delete(root);
+	return ok;
+}
+
+static const struct u_camera_consent_store_ops posix_ops = {
+    .get = posix_get,
+    .set = posix_set,
+    .is_delegating = posix_is_delegating,
+    .sharing_enabled = posix_sharing_enabled,
+    .set_sharing_enabled = posix_set_sharing_enabled,
+    .get_secret = posix_get_secret,
+};
+
+const struct u_camera_consent_store_ops *
+u_camera_consent_store_default(void)
+{
+	return &posix_ops;
+}
+
+bool
+u_camera_consent_store_set_delegating(const char *exe, bool delegating)
+{
+	cJSON *root = load_user(true);
+	if (root == NULL) {
+		return false;
+	}
+	cJSON *arr = cJSON_GetObjectItem(root, "delegating");
+	if (arr == NULL || !cJSON_IsArray(arr)) {
+		cJSON_DeleteItemFromObject(root, "delegating");
+		arr = cJSON_AddArrayToObject(root, "delegating");
+	}
+	// Remove any existing entry, then re-add when requested.
+	for (int i = cJSON_GetArraySize(arr) - 1; i >= 0; i--) {
+		cJSON *it = cJSON_GetArrayItem(arr, i);
+		if (cJSON_IsString(it) && path_equal(it->valuestring, exe)) {
+			cJSON_DeleteItemFromArray(arr, i);
+		}
+	}
+	if (delegating) {
+		cJSON_AddItemToArray(arr, cJSON_CreateString(exe));
+	}
+	bool ok = save_user(root);
+	cJSON_Delete(root);
+	return ok;
+}
+
+void
+u_camera_consent_store_list(void (*cb)(void *ctx, char kind, const char *exe, const char *value), void *ctx)
+{
+	cb(ctx, 's', "", posix_sharing_enabled(NULL) ? "on" : "off");
+	cJSON *user = load_user(false);
+	if (user != NULL) {
+		cJSON *it = NULL;
+		cJSON_ArrayForEach(it, cJSON_GetObjectItem(user, "apps"))
+		{
+			if (it->string != NULL && cJSON_IsString(it)) {
+				cb(ctx, 'a', it->string, it->valuestring);
+			}
+		}
+		cJSON_ArrayForEach(it, cJSON_GetObjectItem(user, "delegating"))
+		{
+			if (cJSON_IsString(it)) {
+				cb(ctx, 'd', it->valuestring, "user");
+			}
+		}
+		cJSON_Delete(user);
+	}
+	cJSON *sys = load_system();
+	if (sys != NULL) {
+		cJSON *it = NULL;
+		cJSON_ArrayForEach(it, cJSON_GetObjectItem(sys, "delegating"))
+		{
+			if (cJSON_IsString(it)) {
+				cb(ctx, 'd', it->valuestring, "system");
+			}
+		}
+		cJSON_Delete(sys);
+	}
+}
+
+bool
+u_camera_consent_store_path(char *out, size_t cap)
+{
+	return user_path(out, cap);
+}
+
+bool
+u_camera_consent_os_camera_allowed(const char *exe)
+{
+	(void)exe;
+	return true; // the OS switch (macOS TCC) does not see this consumer: nothing to read
+}
+
+#endif

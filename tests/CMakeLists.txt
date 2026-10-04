@@ -68,6 +68,7 @@ set(tests
     tests_comp_color_policy
     tests_m_matrix_projection
     tests_stereo_camera
+    tests_camera_consent
     tests_stereo_rectify
     tests_stereo_vrefine
 	)
