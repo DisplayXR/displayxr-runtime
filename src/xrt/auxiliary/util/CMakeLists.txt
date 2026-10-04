@@ -33,6 +33,13 @@ add_library(
 	u_builders.h
 	u_capture_dims.c
 	u_capture_dims.h
+	u_camera_consent.c
+	u_camera_consent.h
+	u_camera_consent_store.c
+	u_client_class.c
+	u_client_class.h
+	u_sha256.c
+	u_sha256.h
 	u_stereo_camera.c
 	u_stereo_camera.h
 	u_stereo_rectify.c
@@ -170,7 +177,8 @@ if(WIN32)
 	target_sources(aux_util PRIVATE u_windows.c u_windows.h)
 	# shell32 needed for SHGetFolderPathA in u_file_logging.c
 	# advapi32 needed for ACL/security APIs (AppContainer write access) in u_file_logging.c
-	target_link_libraries(aux_util PRIVATE shell32 advapi32)
+	# bcrypt: BCryptGenRandom seeds the stereo camera persistentId secret (u_camera_consent_store.c)
+	target_link_libraries(aux_util PRIVATE shell32 advapi32 bcrypt)
 endif()
 
 # WIL is lacking official support on MINGW.
