@@ -76,6 +76,8 @@
 
 #ifdef XRT_OS_MACOS
 #include "main/comp_window_macos.h" // per-session NSWindow reposition/resize (#59)
+#include <CoreFoundation/CoreFoundation.h>
+#include <pthread.h>
 #endif
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
@@ -6495,7 +6497,10 @@ multi_main_loop(struct multi_system_compositor *msc)
 static void *
 thread_func(void *ptr)
 {
-	return (void *)(intptr_t)multi_main_loop((struct multi_system_compositor *)ptr);
+	struct multi_system_compositor *msc = (struct multi_system_compositor *)ptr;
+	int ret = multi_main_loop(msc);
+	msc->render_thread_done = true; // #1815
+	return (void *)(intptr_t)ret;
 }
 
 
@@ -6624,6 +6629,35 @@ static void
 system_compositor_destroy(struct xrt_system_compositor *xsc)
 {
 	struct multi_system_compositor *msc = multi_system_compositor(xsc);
+
+#ifdef XRT_OS_MACOS
+	/*
+	 * #1815: the render thread dispatch_sync()s window work onto the main
+	 * queue (comp_window_macos), so a main-thread join (os_thread_helper_destroy
+	 * below) deadlocks whenever a frame is in flight: the service hung on
+	 * SIGTERM in teardown_all. Stop it here and keep the main run loop turning
+	 * until it has exited, then join. Bounded, so a wedged frame cannot hang
+	 * the exit forever.
+	 */
+	if (pthread_main_np() != 0) {
+		os_thread_helper_lock(&msc->oth);
+		bool was_running = msc->oth.running;
+		msc->oth.running = false;
+		os_thread_helper_signal_locked(&msc->oth);
+		os_thread_helper_unlock(&msc->oth);
+		if (was_running) {
+			const int64_t deadline = os_monotonic_get_ns() + (int64_t)5 * U_TIME_1S_IN_NS;
+			while (!msc->render_thread_done && os_monotonic_get_ns() < deadline) {
+				CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, false);
+			}
+			if (msc->render_thread_done) {
+				pthread_join(msc->oth.thread, NULL);
+			} else {
+				U_LOG_W("#1815: render thread still busy at destroy; not joined");
+			}
+		}
+	}
+#endif
 
 	// Destroy the render thread first, destroy also stops the thread.
 	os_thread_helper_destroy(&msc->oth);

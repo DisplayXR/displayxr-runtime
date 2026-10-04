@@ -644,6 +644,9 @@ client_thread_body(void *_ics)
 
 	client_loop(ics);
 
+	// #1815: the server's shutdown waits on this before joining.
+	ics->thread_done = true;
+
 	return NULL;
 }
 
