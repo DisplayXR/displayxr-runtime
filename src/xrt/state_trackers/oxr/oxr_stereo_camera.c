@@ -14,8 +14,12 @@
  *
  * Error contract:
  *  - dead pipe (XRT_ERROR_IPC_FAILURE)        -> XR_ERROR_INSTANCE_LOST
- *  - refused by consent (XRT_ERROR_NOT_AUTHORIZED) -> XR_ERROR_PERMISSION_INSUFFICIENT
- *    (retryable: the stream stays created)
+ *  - OS camera switch / class (XRT_ERROR_NOT_AUTHORIZED) -> XR_ERROR_PERMISSION_INSUFFICIENT
+ *  - user / stored consent refused            -> XR_ERROR_STEREO_CAMERA_CONSENT_REFUSED_DXR
+ *    (retryable: the stream stays created; a browser maps it to NotAllowedError)
+ *  - sharing off (toggle / kill switch)       -> XR_ERROR_STEREO_CAMERA_DISABLED_DXR
+ *  - source cannot be opened right now        -> XR_ERROR_STEREO_CAMERA_BUSY_DXR
+ *  - the service ended this stream            -> XR_ERROR_STEREO_CAMERA_STREAM_ENDED_DXR
  *  - no such camera / bad format / output      -> XR_ERROR_VALIDATION_FAILURE
  *  - transport or output the runtime lacks     -> XR_ERROR_FEATURE_UNSUPPORTED
  *  - 8 streams on the camera already           -> XR_ERROR_LIMIT_REACHED
@@ -116,7 +120,25 @@ scam_xret(struct oxr_logger *log, xrt_result_t xret, const char *what)
 		return oxr_error(log, XR_ERROR_INSTANCE_LOST, "%s: the runtime service connection is gone", what);
 	case XRT_ERROR_NOT_AUTHORIZED:
 		return oxr_error(log, XR_ERROR_PERMISSION_INSUFFICIENT,
-		                 "%s: the runtime refused camera access (consent; see XR_DXR_stereo_camera §7)", what);
+		                 "%s: the runtime refused camera access (OS camera privacy switch, or this client class "
+		                 "may not use the camera; see XR_DXR_stereo_camera §7)",
+		                 what);
+	case XRT_ERROR_STEREO_CAMERA_CONSENT_REFUSED:
+		return oxr_error(log, XR_ERROR_STEREO_CAMERA_CONSENT_REFUSED_DXR,
+		                 "%s: the user (or the stored decision) refused this app the 3D camera; retry after "
+		                 "consent (XR_DXR_stereo_camera §7.1)",
+		                 what);
+	case XRT_ERROR_STEREO_CAMERA_DISABLED:
+		return oxr_error(log, XR_ERROR_STEREO_CAMERA_DISABLED_DXR,
+		                 "%s: 3D camera sharing is switched off (XR_DXR_stereo_camera §7.4)", what);
+	case XRT_ERROR_STEREO_CAMERA_BUSY:
+		return oxr_error(log, XR_ERROR_STEREO_CAMERA_BUSY_DXR,
+		                 "%s: the camera source cannot be opened right now; retry later", what);
+	case XRT_ERROR_STEREO_CAMERA_STREAM_ENDED:
+		return oxr_error(log, XR_ERROR_STEREO_CAMERA_STREAM_ENDED_DXR,
+		                 "%s: the service ended this stream (user stop / sharing off / source lost); destroy it "
+		                 "and create a new one",
+		                 what);
 	case XRT_ERROR_INPUT_UNSUPPORTED:
 		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "%s: unknown camera/stream or unsupported request",
 		                 what);
@@ -468,6 +490,69 @@ oxr_xrGetStereoCameraStreamStatsDXR(XrStereoCameraStreamDXR stream, XrStereoCame
 	stats->framesSkipped = st.frames_skipped;
 	stats->framesAcquired = st.frames_acquired;
 	stats->meanLatencyNs = st.mean_latency_ns;
+	return XR_SUCCESS;
+}
+
+
+/*
+ *
+ * R3: events. The service queues them per connection; xrPollEvent drains
+ * them here into the instance's event queue, mapping a service stream id
+ * back to the handle the app holds.
+ *
+ */
+
+static struct oxr_stereo_camera_stream_dxr *
+stream_by_service_id(struct oxr_instance *inst, uint64_t id)
+{
+	struct oxr_stereo_camera_stream_dxr *found = NULL;
+	os_mutex_lock(&inst->handle.children_mutex);
+	for (uint32_t i = 0; i < XRT_MAX_HANDLE_CHILDREN; i++) {
+		struct oxr_handle_base *hb = inst->handle.children[i];
+		if (hb != NULL && hb->debug == OXR_XR_DEBUG_STEREOCAMSTREAM) {
+			struct oxr_stereo_camera_stream_dxr *s = (struct oxr_stereo_camera_stream_dxr *)hb;
+			if (s->id == id) {
+				found = s;
+				break;
+			}
+		}
+	}
+	os_mutex_unlock(&inst->handle.children_mutex);
+	return found;
+}
+
+XrResult
+oxr_stereo_camera_poll_events(struct oxr_logger *log, struct oxr_instance *inst)
+{
+	struct xrt_stereo_camera_client *c = client_of(inst);
+	if (c == NULL || c->poll_event == NULL) {
+		return XR_SUCCESS;
+	}
+	for (int i = 0; i < 32; i++) {
+		bool has = false;
+		struct xrt_stereo_camera_event ev;
+		if (c->poll_event(c, &has, &ev) != XRT_SUCCESS || !has) {
+			return XR_SUCCESS; // a dead pipe surfaces on the next real call
+		}
+		switch (ev.kind) {
+		case XRT_STEREO_CAMERA_EVENT_CAMERA_STATE:
+			oxr_event_push_XrEventDataStereoCameraStateChanged(log, inst, ev.camera_id,
+			                                                   (XrStereoCameraStateDXR)ev.value);
+			break;
+		case XRT_STEREO_CAMERA_EVENT_STREAM_ENDED: {
+			struct oxr_stereo_camera_stream_dxr *s = stream_by_service_id(inst, ev.stream_id);
+			if (s != NULL) {
+				s->started = false;
+				oxr_event_push_XrEventDataStereoCameraStreamEnded(
+				    log, inst, XRT_CAST_PTR_TO_OXR_HANDLE(XrStereoCameraStreamDXR, s),
+				    (XrStereoCameraStreamEndReasonDXR)ev.value);
+			}
+			break;
+		}
+		case XRT_STEREO_CAMERA_EVENT_CAMERAS_CHANGED: oxr_event_push_XrEventDataStereoCamerasChanged(log, inst); break;
+		default: break;
+		}
+	}
 	return XR_SUCCESS;
 }
 

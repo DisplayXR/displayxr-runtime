@@ -362,12 +362,123 @@ install_toggle_hotkey(void)
 // service GRACEFULLY ("Quit" → raise SIGTERM → the kqueue EVFILT_SIGNAL path →
 // service_orchestrator_shutdown, which reaps the controller — no orphan).
 // Complements the global Ctrl+Space hotkey with a no-TCC, always-visible control.
+/*
+ *
+ * XR_DXR_stereo_camera R3 (ADR-043 §7): the menu-bar indicator ("3D camera in
+ * use by <app>", red dot on the icon), the user kill switch ("Stop camera
+ * sharing"), the persistent "Share the 3D camera with apps" toggle, the consent
+ * prompt (a floating panel with Allow / Allow once / Deny — NOT a modal alert,
+ * which would park this run loop and with it every IPC accept for up to a
+ * minute), the screen-lock / fast-user-switch suspension, and the foreground
+ * rule's visibility query. The prompt is requested from an IPC client thread
+ * (camera_prompt_fn blocks it on a condition); the main-thread pump shows the
+ * panel and the button actions answer it.
+ *
+ */
+
+#include "server/ipc_server_stereo_camera.h"
+#include <errno.h>
+#include <pthread.h>
+#include <stdio.h>
+
+struct cam_prompt_req
+{
+	char exe[512];
+	char app[128];
+	long pid;
+	enum u_camera_consent_prompt_answer answer;
+	bool answered;
+	bool shown;
+};
+
+static pthread_mutex_t s_cam_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t s_cam_cond = PTHREAD_COND_INITIALIZER;
+static struct cam_prompt_req *s_cam_prompt = NULL; //!< the one pending request (consent_lock serialises)
+static NSPanel *s_cam_panel = nil;                 //!< main thread only
+static volatile bool s_cam_dirty = true;           //!< indicator needs a refresh
+static NSImage *s_logo_image = nil;
+static NSImage *s_logo_inuse_image = nil;
+
+bool
+ipc_server_macos_pid_app_visible(long pid)
+{
+	@autoreleasepool {
+		NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier:(pid_t)pid];
+		if (app == nil || app.terminated) {
+			return false; // not a GUI app the user can see
+		}
+		return !app.hidden && app.activationPolicy != NSApplicationActivationPolicyProhibited;
+	}
+}
+
+//! IPC client thread: ask, block until answered / timeout.
+static enum u_camera_consent_prompt_answer
+camera_prompt_fn(void *ctx, const char *exe, const char *app_name, long pid, uint32_t timeout_ms)
+{
+	(void)ctx;
+	struct cam_prompt_req req;
+	memset(&req, 0, sizeof(req));
+	snprintf(req.exe, sizeof(req.exe), "%s", exe != NULL ? exe : "");
+	snprintf(req.app, sizeof(req.app), "%s", app_name != NULL && app_name[0] ? app_name : "An app");
+	req.pid = pid;
+
+	struct timespec deadline;
+	clock_gettime(CLOCK_REALTIME, &deadline);
+	deadline.tv_sec += timeout_ms / 1000;
+	deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+	if (deadline.tv_nsec >= 1000000000L) {
+		deadline.tv_sec += 1;
+		deadline.tv_nsec -= 1000000000L;
+	}
+	pthread_mutex_lock(&s_cam_mutex);
+	s_cam_prompt = &req;
+	s_cam_dirty = true;
+	while (!req.answered) {
+		if (pthread_cond_timedwait(&s_cam_cond, &s_cam_mutex, &deadline) == ETIMEDOUT) {
+			break;
+		}
+	}
+	enum u_camera_consent_prompt_answer a = req.answered ? req.answer : U_CAMERA_CONSENT_PROMPT_TIMEOUT;
+	s_cam_prompt = NULL; // the panel (if up) closes on the next pump; buttons see NULL
+	s_cam_dirty = true;
+	pthread_mutex_unlock(&s_cam_mutex);
+	return a;
+}
+
+static void
+camera_indicator_changed(void *ctx)
+{
+	(void)ctx;
+	s_cam_dirty = true;
+}
+
+//! Main thread: a button answered (NULL request = already timed out).
+static void
+camera_prompt_answer(enum u_camera_consent_prompt_answer a)
+{
+	pthread_mutex_lock(&s_cam_mutex);
+	if (s_cam_prompt != NULL && !s_cam_prompt->answered) {
+		s_cam_prompt->answer = a;
+		s_cam_prompt->answered = true;
+		pthread_cond_broadcast(&s_cam_cond);
+	}
+	pthread_mutex_unlock(&s_cam_mutex);
+	if (s_cam_panel != nil) {
+		[s_cam_panel orderOut:nil];
+		[s_cam_panel release];
+		s_cam_panel = nil;
+	}
+}
+
 @interface DXRStatusTarget : NSObject <NSMenuDelegate>
 {
 @public
 	struct ipc_server *server;
 	NSMenuItem *statusLine; // owned by the menu
 	NSMenuItem *openItem;   // owned by the menu
+	NSMenuItem *cameraLine; // "3D camera: …"
+	NSMenuItem *cameraStop; // "Stop camera sharing"
+	NSMenuItem *cameraShare; // "Share the 3D camera with apps" (checkmark)
 }
 @end
 
@@ -399,6 +510,46 @@ install_toggle_hotkey(void)
 		statusLine.title = @"Workspace: stopped";
 		[openItem setEnabled:YES];
 	}
+	struct ipc_server_stereo_camera_status st;
+	if (!ipc_server_stereo_camera_get_status(&st) || st.camera_count == 0) {
+		cameraLine.title = st.sharing_enabled ? @"3D camera: none" : @"3D camera: sharing off";
+		[cameraStop setEnabled:NO];
+	} else if (st.started_streams > 0) {
+		cameraLine.title = [NSString stringWithFormat:@"3D camera in use by %s%s", st.consumers,
+		                                              st.locked ? " (suspended: screen locked)" : ""];
+		[cameraStop setEnabled:YES];
+	} else {
+		cameraLine.title = st.sharing_enabled ? @"3D camera: not in use" : @"3D camera: sharing off";
+		[cameraStop setEnabled:NO];
+	}
+	cameraShare.state = st.sharing_enabled ? NSControlStateValueOn : NSControlStateValueOff;
+}
+- (void)stopCameraSharing:(id)sender
+{
+	(void)sender;
+	ipc_server_stereo_camera_stop_all("menu bar: Stop camera sharing");
+}
+- (void)toggleCameraSharing:(id)sender
+{
+	(void)sender;
+	struct ipc_server_stereo_camera_status st;
+	bool on = ipc_server_stereo_camera_get_status(&st) ? st.sharing_enabled : true;
+	ipc_server_stereo_camera_set_sharing(!on, "menu bar: Share the 3D camera with apps");
+}
+- (void)consentAllow:(id)sender
+{
+	(void)sender;
+	camera_prompt_answer(U_CAMERA_CONSENT_PROMPT_ALLOW);
+}
+- (void)consentAllowOnce:(id)sender
+{
+	(void)sender;
+	camera_prompt_answer(U_CAMERA_CONSENT_PROMPT_ALLOW_ONCE);
+}
+- (void)consentDeny:(id)sender
+{
+	(void)sender;
+	camera_prompt_answer(U_CAMERA_CONSENT_PROMPT_DENY);
 }
 @end
 
@@ -406,6 +557,108 @@ install_toggle_hotkey(void)
 // reference, so s_status_target must keep the target alive.
 static DXRStatusTarget *s_status_target = nil;
 static NSStatusItem *s_status_item = nil;
+
+//! Main thread: show the pending consent prompt as a floating panel.
+static void
+camera_prompt_show(DXRStatusTarget *target, const struct cam_prompt_req *req)
+{
+	const char *base = req->exe;
+	for (const char *p = req->exe; *p != '\0'; p++) {
+		if (*p == '/') {
+			base = p + 1;
+		}
+	}
+	NSRect frame = NSMakeRect(0, 0, 440, 150);
+	NSPanel *panel = [[NSPanel alloc] initWithContentRect:frame
+	                                            styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskUtilityWindow)
+	                                              backing:NSBackingStoreBuffered
+	                                                defer:NO];
+	panel.title = @"DisplayXR";
+	panel.level = NSFloatingWindowLevel;
+	panel.releasedWhenClosed = NO;
+	[panel setHidesOnDeactivate:NO];
+	NSView *v = panel.contentView;
+
+	NSTextField *title = [NSTextField labelWithString:[NSString stringWithFormat:@"\u201c%s\u201d wants to use the 3D camera", req->app]];
+	title.font = [NSFont boldSystemFontOfSize:13];
+	title.frame = NSMakeRect(20, 108, 400, 22);
+	[v addSubview:title];
+	NSTextField *body = [NSTextField wrappingLabelWithString:[NSString stringWithFormat:@"%s (pid %ld) will receive frames from the display\u2019s stereo camera. You can stop it at any time from the DisplayXR menu.", base[0] ? base : "The app", req->pid]];
+	body.font = [NSFont systemFontOfSize:11];
+	body.frame = NSMakeRect(20, 58, 400, 44);
+	[v addSubview:body];
+
+	NSButton *deny = [NSButton buttonWithTitle:@"Deny" target:target action:@selector(consentDeny:)];
+	deny.frame = NSMakeRect(20, 14, 100, 32);
+	[v addSubview:deny];
+	NSButton *once = [NSButton buttonWithTitle:@"Allow once" target:target action:@selector(consentAllowOnce:)];
+	once.frame = NSMakeRect(210, 14, 110, 32);
+	[v addSubview:once];
+	NSButton *allow = [NSButton buttonWithTitle:@"Allow" target:target action:@selector(consentAllow:)];
+	allow.frame = NSMakeRect(326, 14, 100, 32);
+	allow.keyEquivalent = @"\r";
+	[v addSubview:allow];
+
+	[panel center];
+	[NSApp activateIgnoringOtherApps:YES];
+	[panel makeKeyAndOrderFront:nil];
+	s_cam_panel = panel;
+	U_LOG_W("stereo camera: consent prompt shown for %s (pid %ld)", req->exe, req->pid);
+}
+
+//! A copy of the logo with a red "recording" dot bottom-right.
+static NSImage *
+make_inuse_image(NSImage *logo)
+{
+	NSSize sz = logo.size;
+	NSImage *img = [[NSImage alloc] initWithSize:sz];
+	[img lockFocus];
+	[logo drawInRect:NSMakeRect(0, 0, sz.width, sz.height)
+	        fromRect:NSZeroRect
+	       operation:NSCompositingOperationSourceOver
+	        fraction:1.0];
+	CGFloat d = sz.height * 0.45;
+	NSBezierPath *dot = [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(sz.width - d, 0, d, d)];
+	[[NSColor systemRedColor] setFill];
+	[dot fill];
+	[img unlockFocus];
+	img.template = NO; // keep the red; the base stays a template
+	return img;
+}
+
+//! Main thread, every pump tick: prompt panel + indicator image.
+static void
+camera_pump(void)
+{
+	pthread_mutex_lock(&s_cam_mutex);
+	struct cam_prompt_req *req = s_cam_prompt;
+	bool show = req != NULL && !req->shown;
+	if (show) {
+		req->shown = true;
+	}
+	bool close = req == NULL && s_cam_panel != nil;
+	pthread_mutex_unlock(&s_cam_mutex);
+	if (show) {
+		camera_prompt_show(s_status_target, req);
+	}
+	if (close) {
+		[s_cam_panel orderOut:nil];
+		[s_cam_panel release];
+		s_cam_panel = nil;
+	}
+	if (!s_cam_dirty) {
+		return;
+	}
+	s_cam_dirty = false;
+	struct ipc_server_stereo_camera_status st;
+	bool in_use = ipc_server_stereo_camera_get_status(&st) && st.started_streams > 0;
+	if (s_status_item != nil && s_logo_image != nil) {
+		s_status_item.button.image = in_use && s_logo_inuse_image != nil ? s_logo_inuse_image : s_logo_image;
+		s_status_item.button.toolTip =
+		    in_use ? [NSString stringWithFormat:@"3D camera in use by %s", st.consumers] : @"DisplayXR Service";
+	}
+}
+
 
 // Build the menu-bar status item + menu. Main thread; called once.
 static void
@@ -440,6 +693,8 @@ install_status_item(struct ipc_server *s)
 		logo.size = NSMakeSize(w, h);
 		s_status_item.button.image = logo;
 		s_status_item.button.imagePosition = NSImageOnly;
+		s_logo_image = [logo retain];
+		s_logo_inuse_image = make_inuse_image(logo); // camera in-use badge (ADR-043 §7.3)
 	} else {
 		// Fallback if the embedded image fails to decode for any reason.
 		s_status_item.button.title = @"DisplayXR";
@@ -462,6 +717,48 @@ install_status_item(struct ipc_server *s)
 	open.target = s_status_target;
 	[menu addItem:open];
 	s_status_target->openItem = open;
+
+	[menu addItem:[NSMenuItem separatorItem]];
+
+	// XR_DXR_stereo_camera R3: indicator + user kill switch + sharing toggle.
+	NSMenuItem *camLine = [[[NSMenuItem alloc] initWithTitle:@"3D camera: not in use" action:nil keyEquivalent:@""] autorelease];
+	[camLine setEnabled:NO];
+	[menu addItem:camLine];
+	s_status_target->cameraLine = camLine;
+	NSMenuItem *camStop = [[[NSMenuItem alloc] initWithTitle:@"Stop camera sharing"
+	                                                  action:@selector(stopCameraSharing:)
+	                                           keyEquivalent:@""] autorelease];
+	camStop.target = s_status_target;
+	[camStop setEnabled:NO];
+	[menu addItem:camStop];
+	s_status_target->cameraStop = camStop;
+	NSMenuItem *camShare = [[[NSMenuItem alloc] initWithTitle:@"Share the 3D camera with apps"
+	                                                   action:@selector(toggleCameraSharing:)
+	                                            keyEquivalent:@""] autorelease];
+	camShare.target = s_status_target;
+	[menu addItem:camShare];
+	s_status_target->cameraShare = camShare;
+	ipc_server_stereo_camera_set_prompt_provider(camera_prompt_fn, NULL);
+	ipc_server_stereo_camera_set_indicator_provider(camera_indicator_changed, NULL);
+	// Screen lock / fast user switch suspend every stream (spec §7.2).
+	NSDistributedNotificationCenter *dnc = [NSDistributedNotificationCenter defaultCenter];
+	[dnc addObserverForName:@"com.apple.screenIsLocked" object:nil queue:nil usingBlock:^(NSNotification *n) {
+		(void)n;
+		ipc_server_stereo_camera_set_session_locked(true, "com.apple.screenIsLocked");
+	}];
+	[dnc addObserverForName:@"com.apple.screenIsUnlocked" object:nil queue:nil usingBlock:^(NSNotification *n) {
+		(void)n;
+		ipc_server_stereo_camera_set_session_locked(false, "com.apple.screenIsUnlocked");
+	}];
+	NSNotificationCenter *wnc = [[NSWorkspace sharedWorkspace] notificationCenter];
+	[wnc addObserverForName:NSWorkspaceSessionDidResignActiveNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
+		(void)n;
+		ipc_server_stereo_camera_set_session_locked(true, "session resigned active (user switch)");
+	}];
+	[wnc addObserverForName:NSWorkspaceSessionDidBecomeActiveNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
+		(void)n;
+		ipc_server_stereo_camera_set_session_locked(false, "session became active");
+	}];
 
 	[menu addItem:[NSMenuItem separatorItem]];
 
@@ -502,6 +799,9 @@ ipc_server_macos_pump_main_thread(struct ipc_server *s)
 			install_status_item(s);
 			inited = true;
 		}
+
+		// XR_DXR_stereo_camera R3: consent panel + in-use indicator.
+		camera_pump();
 
 		// Service the global toggle hotkey (set by the Carbon handler). Done here,
 		// holding the ipc_server, so spawn/SIGTERM can read workspace_controller_pid.

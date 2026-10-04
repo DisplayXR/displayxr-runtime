@@ -81,6 +81,24 @@ ipc_shmem_unmap(void **map_ptr, size_t size);
 void
 ipc_shmem_destroy(xrt_shmem_handle_t *handle_ptr, void **map_ptr, size_t size);
 
+/*!
+ * Like @ref ipc_shmem_create, plus a READ-ONLY handle to the same memory in
+ * @p out_ro, for a consumer that must be able to map but never write (the
+ * stereo camera frame rings, ADR-043 R3). Windows: a FILE_MAP_READ duplicate;
+ * Linux / macOS: the section re-opened O_RDONLY before its name is unlinked;
+ * Android: a dup with ASharedMemory_setProt(PROT_READ). Close it with
+ * @ref ipc_shmem_close_handle.
+ */
+xrt_result_t
+ipc_shmem_create_with_readonly(size_t size,
+                               xrt_shmem_handle_t *out_handle,
+                               void **out_map,
+                               xrt_shmem_handle_t *out_ro);
+
+//! Close a bare handle (no mapping), e.g. the read-only one above. NULL/invalid-safe.
+void
+ipc_shmem_close_handle(xrt_shmem_handle_t *handle_ptr);
+
 #ifdef __cplusplus
 }
 #endif

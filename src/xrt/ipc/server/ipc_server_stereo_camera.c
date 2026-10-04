@@ -11,19 +11,45 @@
  * 1280x480 NV12 copy is well under a millisecond, and it keeps an acquire from
  * ever observing a half-written slot. Only the camera thread closes a source.
  *
- * Privacy (spec §7) — R1 ships the HOOK POINTS, deny-by-default:
- *  - authorise_locked(): every start and every calibration read. Allowed in R1
- *    only with DXR_STEREO_CAMERA_DEV_ALLOW=1 in the SERVICE environment;
- *    otherwise XRT_ERROR_NOT_AUTHORIZED (XR_ERROR_PERMISSION_INSUFFICIENT).
- *    R3 replaces the env check with OS consent + the DisplayXR consent store +
- *    delegating-client registration.
- *  - client_visible_locked(): the foreground rule, evaluated per published
- *    frame. R1 always true; R3 wires session visibility / OS lock.
- *  - output_allowed(): RAW is refused to PRESENT_OWNER clients (the browser,
- *    which exposes cameras to web pages) — maintainer decision for R1.
- *  - DXR_STEREO_CAMERA=0: kill switch, zero cameras enumerated.
- *  - the in-use indicator (tray badge naming consumers) is R3; R1 logs one
- *    WARN per stream start/stop naming the peer executable.
+ * Privacy (spec §7) — R3, as built. The plug-in never sees any of it:
+ *  - consent_evaluate(): every stream start and every calibration read runs
+ *    the u_camera_consent policy (aux util, unit-tested with fakes) against
+ *    the OS-derived peer executable: sharing off (DXR_STEREO_CAMERA=0 or the
+ *    user's tray toggle) -> DISABLED; DXR_STEREO_CAMERA_DEV_ALLOW=1 -> allowed
+ *    (one WARN); registered consent-DELEGATING client (the browser, by
+ *    installer / `displayxr-cli camera trust`) -> allowed, its own prompt is
+ *    the consent; OS camera privacy switch -> PERMISSION_INSUFFICIENT; the
+ *    stored per-app Allow/Deny; else the tray prompt ("<app> wants to use the
+ *    3D camera — Allow / Allow once / Deny"), which the host installs with
+ *    ipc_server_stereo_camera_set_prompt_provider(). The prompt BLOCKS the
+ *    calling client thread (manager lock released, one prompt at a time) for
+ *    up to 60 s; unanswered = refused, retryable. Each verdict has its own
+ *    result: CONSENT_REFUSED / DISABLED / BUSY / STREAM_ENDED, so a browser
+ *    can map consent to NotAllowedError and the rest to NotReadableError.
+ *  - client_visible_locked(): the foreground rule, per published frame, cached
+ *    250 ms per stream. It applies to window-bearing classes (APP,
+ *    PRESENT_OWNER): the peer pid must own a visible top-level window
+ *    (Windows EnumWindows; macOS NSRunningApplication not hidden; Linux: no
+ *    display connection in the service, always visible). A delegating client
+ *    follows its own rule; CAMERA_CONSUMER / DIAG have no window by contract
+ *    and are exempt (they got explicit consent instead). Every stream is
+ *    suspended while the OS session is locked (ipc_server_stereo_camera_
+ *    set_session_locked from the platform notification: WTS session change on
+ *    Windows, screenIsLocked / sessionDidResignActive on macOS).
+ *  - output_allowed(): RAW is refused to PRESENT_OWNER and to any delegating
+ *    client (both expose cameras to third-party content).
+ *  - events: XrEventDataStereoCameraStateChangedDXR (effective state: SUSPENDED
+ *    while locked or sharing is off) and XrEventDataStereoCameraStreamEndedDXR
+ *    are queued per connection (16 deep, oldest dropped) and drained by the
+ *    client from xrPollEvent through stereo_camera_poll_event.
+ *  - indicator + user kill switch: ipc_server_stereo_camera_get_status() feeds
+ *    the tray / menu-bar item ("3D camera in use by <app>"); "Stop camera
+ *    sharing" = ipc_server_stereo_camera_stop_all() ends every started stream
+ *    (STREAM_ENDED event, acquire -> STREAM_ENDED); the persistent "Share the
+ *    3D camera with apps" toggle = ipc_server_stereo_camera_set_sharing()
+ *    (off: zero cameras enumerated, DISABLED on start).
+ *  - persistentId is HMAC-SHA-256(per-user secret, device | consumer) — the
+ *    secret lives in the consent store (§7.5).
  *
  * Rectification (R2) — when the plug-in reports CALIBRATED but not
  * NATIVELY_RECTIFIED, the manager builds a per-camera rectifier at create time
@@ -81,6 +107,9 @@
 #include "server/ipc_server_peer_creds.h"
 #include "server/ipc_server_stereo_camera.h"
 #include "ipc_server_generated.h"
+#ifdef XRT_OS_MACOS
+#include "server/ipc_server_macos_appkit.h"
+#endif
 
 #include "xrt/xrt_plugin.h"
 #include "xrt/xrt_stereo_camera.h"
@@ -90,6 +119,7 @@
 #include "shared/ipc_shmem.h"
 #include "util/u_debug.h"
 #include "util/u_logging.h"
+#include "util/u_camera_consent.h"
 #include "util/u_misc.h"
 #include "util/u_stereo_camera.h"
 #include "util/u_stereo_rectify.h"
@@ -110,6 +140,7 @@
 
 DEBUG_GET_ONCE_BOOL_OPTION(stereo_camera_enabled, "DXR_STEREO_CAMERA", true)
 DEBUG_GET_ONCE_BOOL_OPTION(stereo_camera_dev_allow, "DXR_STEREO_CAMERA_DEV_ALLOW", false)
+DEBUG_GET_ONCE_BOOL_OPTION(stereo_camera_prompt, "DXR_STEREO_CAMERA_PROMPT", true)
 DEBUG_GET_ONCE_BOOL_OPTION(stereo_camera_refine, "DXR_STEREO_CAMERA_REFINE", true)
 
 #define MAX_STREAMS (XRT_STEREO_CAMERA_MAX_CAMERAS * XRT_STEREO_CAMERA_MAX_STREAMS_PER_CAMERA)
@@ -119,6 +150,9 @@ DEBUG_GET_ONCE_BOOL_OPTION(stereo_camera_refine, "DXR_STEREO_CAMERA_REFINE", tru
 #define REOPEN_BACKOFF_NS (1000ll * 1000 * 1000)
 #define STATS_LOG_NS (5000ll * 1000 * 1000)
 #define REFINE_SAMPLES 512 //!< matches one measurement may return
+#define VISIBILITY_TTL_NS (250ll * 1000 * 1000) //!< foreground-rule cache per stream
+#define PROMPT_TIMEOUT_MS 60000u                //!< an unanswered consent prompt = refused
+#define EVQ_CAP 16                              //!< queued events per connection
 
 
 /*
@@ -209,6 +243,19 @@ struct scam_stream
 	uint32_t output; //!< what frames actually are (RAW when rectification is unavailable)
 	char consumer[260];
 
+	// R3 privacy facts, settled at create from the OS-derived peer.
+	char exe[512];         //!< verified peer executable ("" = unknown)
+	long peer_pid;         //!< the pid the foreground rule looks at
+	uint32_t client_class; //!< verified class of the creating connection
+	bool delegating;       //!< registered consent-delegating client
+	int64_t vis_checked_ns;
+	bool visible;
+	uint32_t consent_why; //!< enum u_camera_consent_why of the start that allowed it
+	//! The SERVICE ended this stream (user stop / sharing off / source lost):
+	//! stays until destroy; acquire and start report STREAM_ENDED.
+	bool ended;
+	uint32_t end_reason; //!< enum xrt_stereo_camera_end_reason
+
 	bool started;
 	bool allocated;
 	uint32_t width, height;
@@ -216,6 +263,9 @@ struct scam_stream
 	uint64_t slot_stride;
 	uint64_t section_size;
 	xrt_shmem_handle_t section;
+	//! READ-ONLY handle to the same memory — what every consumer receives
+	//! (R3, spec §5.3): a client can map the ring but never write it.
+	xrt_shmem_handle_t section_ro;
 	uint8_t *map;
 	struct scam_wake wake;
 	struct u_stereo_camera_ring ring;
@@ -223,10 +273,9 @@ struct scam_stream
 	struct xrt_stereo_camera_frame_info slot_info[U_STEREO_CAMERA_RING_SLOTS];
 
 #ifdef XRT_OS_WINDOWS
-	//! Restricted duplicates handed to the last get_section / get_wake reply.
-	//! The generated dispatch duplicates them into the peer AFTER the handler
-	//! returns, so they are closed on the next call / stream destroy.
-	HANDLE sent_section_dup;
+	//! SYNCHRONIZE-only duplicate handed to the last get_wake reply. The
+	//! generated dispatch duplicates it into the peer AFTER the handler
+	//! returns, so it is closed on the next call / stream destroy.
 	HANDLE sent_wake_dup;
 #endif
 
@@ -320,6 +369,15 @@ struct scam_camera
 	struct ipc_server_stereo_camera *mgr;
 };
 
+//! Per-connection event queue (R3), keyed by the connection's owner token.
+struct scam_evq
+{
+	uint64_t owner;
+	struct xrt_stereo_camera_event ev[EVQ_CAP];
+	uint32_t head;
+	uint32_t count;
+};
+
 struct ipc_server_stereo_camera
 {
 	struct os_mutex lock;
@@ -331,7 +389,25 @@ struct ipc_server_stereo_camera
 	struct scam_stream streams[MAX_STREAMS];
 	uint64_t next_stream_id;
 	uint64_t next_owner;
+
+	// R3 privacy.
+	struct u_camera_consent consent;
+	//! Serialises consent evaluations (one prompt at a time); never held
+	//! together with @ref lock.
+	struct os_mutex consent_lock;
+	bool sharing_enabled; //!< cached user toggle (the store is the truth)
+	bool locked;          //!< OS session locked / switched away
+	struct scam_evq evq[IPC_MAX_CLIENTS];
 };
+
+//! The one manager of this process, for the service's UI (tray / menu bar).
+static struct ipc_server_stereo_camera *g_mgr = NULL;
+//! UI providers. Process-wide, not per manager: the tray registers them before
+//! ipc_server_main() has created the manager.
+static ipc_server_stereo_camera_prompt_fn g_prompt_fn = NULL;
+static void *g_prompt_ctx = NULL;
+static ipc_server_stereo_camera_indicator_fn g_indicator_fn = NULL;
+static void *g_indicator_ctx = NULL;
 
 
 /*
@@ -398,56 +474,268 @@ static xrt_result_t
 require_camera_client(volatile struct ipc_client_state *ics, const char *what)
 {
 	uint32_t cls = ics->client_state.client_class;
-	if (cls != XRT_CLIENT_CLASS_APP && cls != XRT_CLIENT_CLASS_PRESENT_OWNER && cls != XRT_CLIENT_CLASS_DIAG) {
-		U_LOG_W("%s: denied — pid %ld is class %s (stereo camera: APP / PRESENT_OWNER / DIAG).", what,
-		        ics->peer_pid, ipc_server_client_class_str(cls));
+	if (cls != XRT_CLIENT_CLASS_APP && cls != XRT_CLIENT_CLASS_PRESENT_OWNER && cls != XRT_CLIENT_CLASS_DIAG &&
+	    cls != XRT_CLIENT_CLASS_CAMERA_CONSUMER) {
+		U_LOG_W("%s: denied — pid %ld is class %s (stereo camera: APP / PRESENT_OWNER / CAMERA_CONSUMER / DIAG).",
+		        what, ics->peer_pid, ipc_server_client_class_str(cls));
 		return XRT_ERROR_NOT_AUTHORIZED;
 	}
 	return XRT_SUCCESS;
 }
 
+//! The control ops are for the service's own UI and the diagnostic CLI.
+static xrt_result_t
+require_diag_client(volatile struct ipc_client_state *ics, const char *what)
+{
+	if (ics->client_state.client_class != XRT_CLIENT_CLASS_DIAG) {
+		U_LOG_W("%s: denied — pid %ld is class %s, not DIAG.", what, ics->peer_pid,
+		        ipc_server_client_class_str(ics->client_state.client_class));
+		return XRT_ERROR_NOT_AUTHORIZED;
+	}
+	return XRT_SUCCESS;
+}
+
+/*
+ *
+ * R3 privacy: consent, foreground rule, events.
+ *
+ */
+
+//! The service's view of the OS camera switch (u_camera_consent_store.c).
+static bool
+env_os_camera_allowed(void *ctx, const char *exe)
+{
+	(void)ctx;
+	return u_camera_consent_os_camera_allowed(exe);
+}
+
+//! The tray prompt, if the host installed one.
+static enum u_camera_consent_prompt_answer
+env_prompt(void *ctx, const char *exe, const char *app_name, long pid, uint32_t timeout_ms)
+{
+	(void)ctx;
+	ipc_server_stereo_camera_prompt_fn fn = g_prompt_fn;
+	if (fn == NULL) {
+		return U_CAMERA_CONSENT_PROMPT_UNAVAILABLE;
+	}
+	return fn(g_prompt_ctx, exe, app_name, pid, timeout_ms);
+}
+
+static const struct u_camera_consent_env_ops env_ops = {
+    .os_camera_allowed = env_os_camera_allowed,
+    .prompt = env_prompt,
+};
+
+static xrt_result_t
+verdict_to_xret(enum u_camera_consent_verdict v)
+{
+	switch (v) {
+	case U_CAMERA_CONSENT_ALLOWED: return XRT_SUCCESS;
+	case U_CAMERA_CONSENT_DISABLED: return XRT_ERROR_STEREO_CAMERA_DISABLED;
+	case U_CAMERA_CONSENT_OS_DENIED: return XRT_ERROR_NOT_AUTHORIZED;
+	case U_CAMERA_CONSENT_REFUSED:
+	default: return XRT_ERROR_STEREO_CAMERA_CONSENT_REFUSED;
+	}
+}
+
 /*!
- * Spec §7.1 authorisation HOOK. R1: deny by default; the dev override is the
- * only way in. R3 replaces the body: OS camera consent of the OS-derived peer
- * (Windows CapabilityAccessManager ConsentStore\webcam, Android CAMERA of the
- * peer uid), then the DisplayXR per-executable consent (HKCU allow list / tray
- * prompt; a registered consent-delegating browser passes per executable and
- * prompts per origin itself).
+ * Spec §7.1: the authorisation point for a stream start and a calibration
+ * read. Manager lock NOT held (the prompt may block for up to a minute);
+ * evaluations are serialised on consent_lock so two apps never race two
+ * dialogs. One WARN per decision names the peer and the rule.
  */
 static xrt_result_t
-authorise_locked(volatile struct ipc_client_state *ics, const struct scam_camera *cam, const char *what)
+consent_evaluate(struct ipc_server_stereo_camera *m,
+                 volatile struct ipc_client_state *ics,
+                 const char *exe,
+                 const char *what,
+                 struct u_camera_consent_decision *out)
 {
-	(void)cam;
-	if (debug_get_bool_option_stereo_camera_dev_allow()) {
-		return XRT_SUCCESS;
+	char app_name[XRT_MAX_APPLICATION_NAME_SIZE];
+	snprintf(app_name, sizeof(app_name), "%s", (const char *)ics->client_state.info.application_name);
+	os_mutex_lock(&m->consent_lock);
+	u_camera_consent_evaluate(&m->consent, exe, app_name, ics->peer_pid, out);
+	os_mutex_unlock(&m->consent_lock);
+	xrt_result_t xret = verdict_to_xret(out->verdict);
+	if (xret == XRT_SUCCESS) {
+		U_LOG_W("%s: ALLOWED for %s (pid %ld, \"%s\") — %s", what, exe[0] ? exe : "?", ics->peer_pid, app_name,
+		        u_camera_consent_why_str(out->why));
+	} else {
+		U_LOG_W("%s: REFUSED for %s (pid %ld, \"%s\") — %s", what, exe[0] ? exe : "?", ics->peer_pid, app_name,
+		        u_camera_consent_why_str(out->why));
 	}
-	U_LOG_W(
-	    "%s: refused for pid %ld — stereo camera consent is not implemented yet (R3); set "
-	    "DXR_STEREO_CAMERA_DEV_ALLOW=1 in the SERVICE environment for development.",
-	    what, ics->peer_pid);
-	return XRT_ERROR_NOT_AUTHORIZED;
+	return xret;
+}
+
+//! Is @p exe a registered consent-delegating client (cheap store read)?
+static bool
+exe_is_delegating(struct ipc_server_stereo_camera *m, const char *exe)
+{
+	const struct u_camera_consent_store_ops *st = m->consent.store;
+	return exe[0] != '\0' && st != NULL && st->is_delegating != NULL && st->is_delegating(m->consent.store_ctx, exe);
+}
+
+//! Does @p pid own a visible top-level window right now (platform query)?
+#ifdef XRT_OS_WINDOWS
+struct vis_probe
+{
+	DWORD pid;
+	bool visible;
+};
+
+static BOOL CALLBACK
+vis_enum_cb(HWND hwnd, LPARAM lp)
+{
+	struct vis_probe *vp = (struct vis_probe *)lp;
+	DWORD pid = 0;
+	GetWindowThreadProcessId(hwnd, &pid);
+	if (pid == vp->pid && IsWindowVisible(hwnd) && !IsIconic(hwnd)) {
+		vp->visible = true;
+		return FALSE;
+	}
+	return TRUE;
+}
+#endif
+
+static bool
+pid_has_visible_window(long pid)
+{
+#if defined(XRT_OS_WINDOWS)
+	struct vis_probe vp = {.pid = (DWORD)pid, .visible = false};
+	EnumWindows(vis_enum_cb, (LPARAM)&vp);
+	return vp.visible;
+#elif defined(XRT_OS_MACOS)
+	return ipc_server_macos_pid_app_visible(pid);
+#else
+	(void)pid;
+	return true; // no display connection in the service: the OS lock is the only gate
+#endif
 }
 
 /*!
- * Spec §7.2 foreground-rule HOOK, evaluated per published frame. R1: always
- * visible. R3: an app's session must be VISIBLE/FOCUSED; a delegating client
- * follows its own rule; every stream is suspended while the OS session is
- * locked / switched away (Android: android_package_is_visible of the peer).
+ * Spec §7.2 foreground rule, evaluated per published frame with a 250 ms
+ * cache. Window-bearing classes must own a visible top-level window; a
+ * delegating client follows its own rule; CAMERA_CONSUMER / DIAG have no
+ * window by contract and are exempt. The OS-lock gate is separate (publish
+ * checks m->locked first).
  */
 static bool
-client_visible_locked(volatile struct ipc_client_state *ics)
+client_visible_locked(struct scam_stream *s, int64_t now)
 {
-	(void)ics;
-	return true;
+	if (s->delegating || s->client_class == XRT_CLIENT_CLASS_CAMERA_CONSUMER ||
+	    s->client_class == XRT_CLIENT_CLASS_DIAG || s->peer_pid <= 0) {
+		return true;
+	}
+	if (s->vis_checked_ns != 0 && now - s->vis_checked_ns < VISIBILITY_TTL_NS) {
+		return s->visible;
+	}
+	bool v = pid_has_visible_window(s->peer_pid);
+	if (s->vis_checked_ns != 0 && v != s->visible) {
+		U_LOG_W("stereo camera: stream %llu (%s) %s — foreground rule", (unsigned long long)s->id, s->consumer,
+		        v ? "visible again, frames resume" : "has no visible window, frames suspended");
+	}
+	s->vis_checked_ns = now;
+	s->visible = v;
+	return v;
 }
 
-//! Maintainer decision (R1): raw frames never reach web pages — the browser
-//! (PRESENT_OWNER) gets RECTIFIED only; native clients may ask for RAW.
+//! RAW frames never reach third-party content: refused to PRESENT_OWNER and
+//! to every consent-delegating client (a browser exposes cameras to pages).
 static bool
-output_allowed(volatile struct ipc_client_state *ics, uint32_t output)
+output_allowed(volatile struct ipc_client_state *ics, bool delegating, uint32_t output)
 {
 	return output != XRT_STEREO_CAMERA_OUTPUT_RAW ||
-	       ics->client_state.client_class != XRT_CLIENT_CLASS_PRESENT_OWNER;
+	       (ics->client_state.client_class != XRT_CLIENT_CLASS_PRESENT_OWNER && !delegating);
+}
+
+//! The state a client is told: SUSPENDED while the session is locked or sharing is off.
+static uint32_t
+effective_state_locked(const struct ipc_server_stereo_camera *m, const struct scam_camera *cam)
+{
+	if (m->locked || !m->sharing_enabled) {
+		return XRT_STEREO_CAMERA_STATE_SUSPENDED;
+	}
+	return cam->state;
+}
+
+static struct scam_evq *
+evq_for_owner_locked(struct ipc_server_stereo_camera *m, uint64_t owner, bool create)
+{
+	struct scam_evq *free_slot = NULL;
+	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+		if (m->evq[i].owner == owner) {
+			return &m->evq[i];
+		}
+		if (m->evq[i].owner == 0 && free_slot == NULL) {
+			free_slot = &m->evq[i];
+		}
+	}
+	if (!create || free_slot == NULL) {
+		return NULL;
+	}
+	memset(free_slot, 0, sizeof(*free_slot));
+	free_slot->owner = owner;
+	return free_slot;
+}
+
+static void
+evq_push_locked(struct ipc_server_stereo_camera *m, uint64_t owner, const struct xrt_stereo_camera_event *ev)
+{
+	struct scam_evq *q = evq_for_owner_locked(m, owner, true);
+	if (q == NULL) {
+		return;
+	}
+	if (q->count == EVQ_CAP) {
+		q->head = (q->head + 1) % EVQ_CAP; // drop the oldest
+		q->count--;
+	}
+	q->ev[(q->head + q->count) % EVQ_CAP] = *ev;
+	q->count++;
+}
+
+//! Queue a CAMERA_STATE event (effective state) to every connection with a stream on @p cam.
+static void
+notify_camera_state_locked(struct ipc_server_stereo_camera *m, const struct scam_camera *cam)
+{
+	struct xrt_stereo_camera_event ev = {
+	    .kind = XRT_STEREO_CAMERA_EVENT_CAMERA_STATE,
+	    .value = effective_state_locked(m, cam),
+	    .camera_id = cam->camera_id,
+	};
+	uint64_t done[MAX_STREAMS];
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < MAX_STREAMS; i++) {
+		const struct scam_stream *s = &m->streams[i];
+		if (!s->used || s->camera != cam->index) {
+			continue;
+		}
+		bool dup = false;
+		for (uint32_t k = 0; k < n; k++) {
+			dup |= done[k] == s->owner;
+		}
+		if (!dup) {
+			done[n++] = s->owner;
+			evq_push_locked(m, s->owner, &ev);
+		}
+	}
+}
+
+static void
+notify_all_cameras_locked(struct ipc_server_stereo_camera *m)
+{
+	for (uint32_t i = 0; i < m->camera_count; i++) {
+		notify_camera_state_locked(m, &m->cams[i]);
+	}
+}
+
+static void
+indicator_changed(struct ipc_server_stereo_camera *m)
+{
+	(void)m;
+	ipc_server_stereo_camera_indicator_fn fn = g_indicator_fn;
+	if (fn != NULL) {
+		fn(g_indicator_ctx);
+	}
 }
 
 static bool
@@ -477,8 +765,7 @@ set_state_locked(struct scam_camera *cam, uint32_t state)
 			}
 		}
 	}
-	// TODO(R1 follow-up): queue XrEventDataStereoCameraStateChangedDXR to the
-	// owning connections (needs a server->client instance-event channel).
+	notify_camera_state_locked(cam->mgr, cam);
 }
 
 static void
@@ -917,12 +1204,9 @@ stream_free_storage(struct scam_stream *s)
 		ipc_shmem_destroy(&s->section, &map, (size_t)s->section_size);
 		s->map = NULL;
 	}
+	ipc_shmem_close_handle(&s->section_ro);
 	wake_destroy(&s->wake);
 #ifdef XRT_OS_WINDOWS
-	if (s->sent_section_dup != NULL) {
-		CloseHandle(s->sent_section_dup);
-		s->sent_section_dup = NULL;
-	}
 	if (s->sent_wake_dup != NULL) {
 		CloseHandle(s->sent_wake_dup);
 		s->sent_wake_dup = NULL;
@@ -946,15 +1230,13 @@ stream_allocate_locked(struct scam_stream *s, const struct scam_camera *cam)
 	s->section_size = s->slot_stride * U_STEREO_CAMERA_RING_SLOTS;
 	void *map = NULL;
 	s->section = XRT_SHMEM_HANDLE_INVALID;
-	xrt_result_t xret = ipc_shmem_create((size_t)s->section_size, &s->section, &map);
+	s->section_ro = XRT_SHMEM_HANDLE_INVALID;
+	xrt_result_t xret = ipc_shmem_create_with_readonly((size_t)s->section_size, &s->section, &map, &s->section_ro);
 	if (xret != XRT_SUCCESS) {
 		return xret;
 	}
 	s->map = map;
 	memset(s->map, 0, (size_t)s->section_size);
-	// TODO(R3): hand POSIX consumers a read-only fd (Linux: reopen
-	// /proc/self/fd/N O_RDONLY; macOS: shm_open the name O_RDONLY before unlink;
-	// Android: an ASharedMemory with PROT_READ set via ASharedMemory_setProt).
 	if (!wake_create(&s->wake)) {
 		stream_free_storage(s);
 		return XRT_ERROR_ALLOCATION;
@@ -1029,7 +1311,10 @@ publish_locked(struct ipc_server_stereo_camera *m,
 		if (!s->used || !s->started || !s->allocated || s->camera != cam->index) {
 			continue;
 		}
-		if (!client_visible_locked(s->ics)) {
+		// Spec §7.2: nothing while the OS session is locked / switched away,
+		// and nothing to a window-bearing client with no visible window. The
+		// pinned slot is cleared so the last image does not linger.
+		if (m->locked || !m->sharing_enabled || !client_visible_locked(s, now)) {
 			u_stereo_camera_ring_clear(&s->ring);
 			continue;
 		}
@@ -1244,13 +1529,32 @@ ipc_server_stereo_camera_create(struct xrt_instance *xinst)
 {
 	struct ipc_server_stereo_camera *m = U_TYPED_CALLOC(struct ipc_server_stereo_camera);
 	os_mutex_init(&m->lock);
+	os_mutex_init(&m->consent_lock);
 	for (uint32_t i = 0; i < MAX_STREAMS; i++) {
 		m->streams[i].section = XRT_SHMEM_HANDLE_INVALID;
+		m->streams[i].section_ro = XRT_SHMEM_HANDLE_INVALID;
 	}
+
+	// R3: the consent policy over the real store; the prompt arrives later
+	// from the host (tray / menu bar) through set_prompt_provider.
+	u_camera_consent_init(&m->consent, u_camera_consent_store_default(), NULL, &env_ops, m);
+	m->consent.kill_switch = !debug_get_bool_option_stereo_camera_enabled();
+	m->consent.dev_override = debug_get_bool_option_stereo_camera_dev_allow();
+	m->consent.prompt_enabled = debug_get_bool_option_stereo_camera_prompt();
+	m->consent.prompt_timeout_ms = PROMPT_TIMEOUT_MS;
+	m->sharing_enabled = u_camera_consent_sharing_enabled(&m->consent);
+	g_mgr = m;
 
 	if (!debug_get_bool_option_stereo_camera_enabled()) {
 		U_LOG_W("stereo camera: disabled by DXR_STEREO_CAMERA=0 (kill switch) — zero cameras");
 		return m;
+	}
+	if (!m->sharing_enabled) {
+		U_LOG_W("stereo camera: camera sharing is OFF (user toggle) — zero cameras until it is switched on");
+	}
+	if (!m->consent.prompt_enabled) {
+		U_LOG_W("stereo camera: consent prompt disabled (DXR_STEREO_CAMERA_PROMPT=0) — an app without a stored "
+		        "or delegated consent is refused");
 	}
 	const struct xrt_plugin_iface *iface = NULL;
 	struct xrt_plugin_instance *inst = NULL;
@@ -1352,6 +1656,10 @@ ipc_server_stereo_camera_destroy(struct ipc_server_stereo_camera **mgr_ptr)
 			stream_free_storage(&m->streams[i]);
 		}
 	}
+	if (g_mgr == m) {
+		g_mgr = NULL;
+	}
+	os_mutex_destroy(&m->consent_lock);
 	os_mutex_destroy(&m->lock);
 	free(m);
 	*mgr_ptr = NULL;
@@ -1375,6 +1683,26 @@ stream_stop_locked(struct scam_stream *s, struct scam_camera *cam)
 	        (unsigned long long)cam->camera_id, (unsigned long long)s->id, s->consumer, cam->started_count);
 }
 
+//! The SERVICE ends a started stream: stopped for good, the owner is told.
+static void
+stream_end_locked(struct ipc_server_stereo_camera *m, struct scam_stream *s, uint32_t reason)
+{
+	if (!s->used || s->ended) {
+		return;
+	}
+	stream_stop_locked(s, &m->cams[s->camera]);
+	s->ended = true;
+	s->end_reason = reason;
+	struct xrt_stereo_camera_event ev = {
+	    .kind = XRT_STEREO_CAMERA_EVENT_STREAM_ENDED,
+	    .value = reason,
+	    .camera_id = m->cams[s->camera].camera_id,
+	    .stream_id = s->id,
+	};
+	evq_push_locked(m, s->owner, &ev);
+	wake_signal(&s->wake); // a consumer blocked on the wake handle re-polls and sees ENDED
+}
+
 static void
 stream_destroy_locked(struct ipc_server_stereo_camera *m, struct scam_stream *s)
 {
@@ -1382,6 +1710,7 @@ stream_destroy_locked(struct ipc_server_stereo_camera *m, struct scam_stream *s)
 	stream_free_storage(s);
 	memset(s, 0, sizeof(*s));
 	s->section = XRT_SHMEM_HANDLE_INVALID;
+	s->section_ro = XRT_SHMEM_HANDLE_INVALID;
 #ifndef XRT_OS_WINDOWS
 	s->wake.fds[0] = s->wake.fds[1] = -1;
 #endif
@@ -1401,8 +1730,13 @@ ipc_server_client_stereo_camera_release(volatile struct ipc_client_state *ics)
 			stream_destroy_locked(m, s);
 		}
 	}
+	struct scam_evq *q = evq_for_owner_locked(m, ics->stereo_camera_owner, false);
+	if (q != NULL) {
+		memset(q, 0, sizeof(*q));
+	}
 	os_mutex_unlock(&m->lock);
 	ics->stereo_camera_owner = 0;
+	indicator_changed(m);
 }
 
 
@@ -1421,7 +1755,8 @@ ipc_handle_stereo_camera_count(volatile struct ipc_client_state *ics, uint32_t *
 		return XRT_SUCCESS; // zero cameras, indistinguishable from "none" on purpose
 	}
 	os_mutex_lock(&m->lock);
-	*out_count = m->camera_count;
+	// Spec §2 / §7.4: sharing off = zero cameras, indistinguishable from none.
+	*out_count = m->sharing_enabled ? m->camera_count : 0;
 	os_mutex_unlock(&m->lock);
 	return XRT_SUCCESS;
 }
@@ -1450,12 +1785,14 @@ ipc_handle_stereo_camera_get_properties(volatile struct ipc_client_state *ics,
 	}
 	const struct scam_camera *cam = &m->cams[index];
 	out_props->camera_id = cam->camera_id;
-	u_stereo_camera_persistent_id(cam->info.device_identity, exe, out_props->persistent_id);
+	// Spec §7.5: keyed with the per-user secret — a page cannot derive the
+	// device from the id, and two installs never share one.
+	u_camera_consent_persistent_id(&m->consent, cam->info.device_identity, exe, out_props->persistent_id);
 	snprintf(out_props->display_name, sizeof(out_props->display_name), "%s", cam->info.display_name);
 	snprintf(out_props->platform_device_hint, sizeof(out_props->platform_device_hint), "%s",
 	         cam->info.platform_device_hint);
 	out_props->flags = cam->info.flags;
-	out_props->state = cam->state;
+	out_props->state = effective_state_locked(m, cam);
 	out_props->view_count = 2;
 	out_props->eye_width = cam->info.eye_width;
 	out_props->eye_height = cam->info.eye_height;
@@ -1493,15 +1830,31 @@ ipc_handle_stereo_camera_get_calibration(volatile struct ipc_client_state *ics,
 	if (m == NULL) {
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
+	if (output != XRT_STEREO_CAMERA_OUTPUT_RAW && output != XRT_STEREO_CAMERA_OUTPUT_RECTIFIED) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	char exe[512] = {0};
+	ipc_server_peer_exe_path(ics->peer_pid, exe, sizeof(exe));
 	os_mutex_lock(&m->lock);
-	struct scam_camera *cam = camera_by_id_locked(m, camera_id);
-	if (cam == NULL || (output != XRT_STEREO_CAMERA_OUTPUT_RAW && output != XRT_STEREO_CAMERA_OUTPUT_RECTIFIED)) {
-		os_mutex_unlock(&m->lock);
+	bool known = camera_by_id_locked(m, camera_id) != NULL && m->sharing_enabled;
+	os_mutex_unlock(&m->lock);
+	if (!known) {
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
 	// Spec §7.5: calibration identifies the device — only after §7.1 passes.
-	xrt_result_t xret = authorise_locked(ics, cam, "stereo_camera_get_calibration");
-	if (xret == XRT_SUCCESS && !output_allowed(ics, output)) {
+	// Evaluated with the manager lock released (it may prompt).
+	struct u_camera_consent_decision dec;
+	xrt_result_t xret = consent_evaluate(m, ics, exe, "stereo_camera_get_calibration", &dec);
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	os_mutex_lock(&m->lock);
+	struct scam_camera *cam = camera_by_id_locked(m, camera_id);
+	if (cam == NULL) {
+		os_mutex_unlock(&m->lock);
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	if (!output_allowed(ics, dec.delegating, output)) {
 		xret = XRT_ERROR_NOT_AUTHORIZED;
 	}
 	if (xret == XRT_SUCCESS && !cam->have_calib) {
@@ -1600,19 +1953,20 @@ ipc_handle_stereo_camera_stream_create(volatile struct ipc_client_state *ics,
 	    (req->output != XRT_STEREO_CAMERA_OUTPUT_RAW && req->output != XRT_STEREO_CAMERA_OUTPUT_RECTIFIED)) {
 		return XRT_ERROR_INPUT_UNSUPPORTED;
 	}
-	if (!output_allowed(ics, req->output)) {
-		U_LOG_W("stereo_camera_stream_create: RAW refused for pid %ld (PRESENT_OWNER: rectified only)",
-		        ics->peer_pid);
+	char exe[512] = {0};
+	ipc_server_peer_exe_path(ics->peer_pid, exe, sizeof(exe));
+	const bool delegating = exe_is_delegating(m, exe);
+	if (!output_allowed(ics, delegating, req->output)) {
+		U_LOG_W("stereo_camera_stream_create: RAW refused for pid %ld (%s: rectified only)", ics->peer_pid,
+		        delegating ? "consent-delegating client" : "PRESENT_OWNER");
 		return XRT_ERROR_NOT_AUTHORIZED;
 	}
-	char exe[260] = {0};
-	ipc_server_peer_exe_path(ics->peer_pid, exe, sizeof(exe));
 
 	os_mutex_lock(&m->lock);
-	struct scam_camera *cam = camera_by_id_locked(m, req->camera_id);
+	struct scam_camera *cam = m->sharing_enabled ? camera_by_id_locked(m, req->camera_id) : NULL;
 	if (cam == NULL) {
 		os_mutex_unlock(&m->lock);
-		return XRT_ERROR_INPUT_UNSUPPORTED;
+		return m->sharing_enabled ? XRT_ERROR_INPUT_UNSUPPORTED : XRT_ERROR_STEREO_CAMERA_DISABLED;
 	}
 	bool calibrated = (cam->info.flags &
 	                   (XRT_PLUGIN_STEREO_CAMERA_CALIBRATED | XRT_PLUGIN_STEREO_CAMERA_NATIVELY_RECTIFIED)) != 0;
@@ -1623,7 +1977,7 @@ ipc_handle_stereo_camera_stream_create(volatile struct ipc_client_state *ics,
 	// Raw frames never reach web pages: the browser gets truly rectified
 	// frames or nothing, never the RAW-flagged fallback.
 	if (req->output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED && !camera_can_rectify(cam) &&
-	    !output_allowed(ics, XRT_STEREO_CAMERA_OUTPUT_RAW)) {
+	    !output_allowed(ics, delegating, XRT_STEREO_CAMERA_OUTPUT_RAW)) {
 		os_mutex_unlock(&m->lock);
 		U_LOG_W(
 		    "stereo_camera_stream_create: camera %llu cannot be rectified; refused for pid %ld "
@@ -1647,6 +2001,7 @@ ipc_handle_stereo_camera_stream_create(volatile struct ipc_client_state *ics,
 	}
 	memset(slot, 0, sizeof(*slot));
 	slot->section = XRT_SHMEM_HANDLE_INVALID;
+	slot->section_ro = XRT_SHMEM_HANDLE_INVALID;
 #ifndef XRT_OS_WINDOWS
 	slot->wake.fds[0] = slot->wake.fds[1] = -1;
 #endif
@@ -1663,6 +2018,10 @@ ipc_handle_stereo_camera_stream_create(volatile struct ipc_client_state *ics,
 	                   ? XRT_STEREO_CAMERA_OUTPUT_RECTIFIED
 	                   : XRT_STEREO_CAMERA_OUTPUT_RAW;
 	snprintf(slot->consumer, sizeof(slot->consumer), "%s (pid %ld)", exe[0] ? exe : "?", ics->peer_pid);
+	snprintf(slot->exe, sizeof(slot->exe), "%s", exe);
+	slot->peer_pid = ics->peer_pid;
+	slot->client_class = ics->client_state.client_class;
+	slot->delegating = delegating;
 	*out_stream_id = slot->id;
 	os_mutex_unlock(&m->lock);
 	return XRT_SUCCESS;
@@ -1681,6 +2040,7 @@ ipc_handle_stereo_camera_stream_destroy(volatile struct ipc_client_state *ics, u
 		stream_destroy_locked(m, s);
 	}
 	os_mutex_unlock(&m->lock);
+	indicator_changed(m);
 	return XRT_SUCCESS;
 }
 
@@ -1695,28 +2055,72 @@ ipc_handle_stereo_camera_stream_start(volatile struct ipc_client_state *ics, uin
 	if (m == NULL) {
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
+	// Pass 1 (locked): find the stream, copy what consent needs.
+	char exe[512];
 	os_mutex_lock(&m->lock);
 	struct scam_stream *s = stream_by_id_locked(m, ics, stream_id);
 	if (s == NULL) {
 		os_mutex_unlock(&m->lock);
 		return XRT_ERROR_INPUT_UNSUPPORTED;
 	}
+	if (s->ended) {
+		os_mutex_unlock(&m->lock);
+		return XRT_ERROR_STEREO_CAMERA_STREAM_ENDED;
+	}
 	if (s->started) {
 		os_mutex_unlock(&m->lock);
 		return XRT_SUCCESS;
 	}
-	struct scam_camera *cam = &m->cams[s->camera];
-	// Spec §7.1: start is THE authorisation point.
-	xrt_result_t xret = authorise_locked(ics, cam, "stereo_camera_stream_start");
-	if (xret == XRT_SUCCESS) {
-		xret = stream_allocate_locked(s, cam);
+	snprintf(exe, sizeof(exe), "%s", s->exe);
+	os_mutex_unlock(&m->lock);
+
+	// Spec §7.1: start is THE authorisation point. Lock released — the tray
+	// prompt may block for up to a minute.
+	struct u_camera_consent_decision dec;
+	xrt_result_t xret = consent_evaluate(m, ics, exe, "stereo_camera_stream_start", &dec);
+	if (xret != XRT_SUCCESS) {
+		return xret;
 	}
+
+	// Pass 2 (locked): the stream may have gone away while we asked.
+	os_mutex_lock(&m->lock);
+	s = stream_by_id_locked(m, ics, stream_id);
+	if (s == NULL) {
+		os_mutex_unlock(&m->lock);
+		return XRT_ERROR_INPUT_UNSUPPORTED;
+	}
+	if (s->ended) {
+		os_mutex_unlock(&m->lock);
+		return XRT_ERROR_STEREO_CAMERA_STREAM_ENDED;
+	}
+	if (s->started) {
+		os_mutex_unlock(&m->lock);
+		return XRT_SUCCESS;
+	}
+	if (!m->sharing_enabled) {
+		os_mutex_unlock(&m->lock);
+		return XRT_ERROR_STEREO_CAMERA_DISABLED;
+	}
+	struct scam_camera *cam = &m->cams[s->camera];
+	// BUSY: the plug-in could not open the source and its retry is still
+	// pending — distinct from "refused", so a browser maps it to NotReadableError.
+	if (cam->state == XRT_STEREO_CAMERA_STATE_UNAVAILABLE && cam->src == NULL &&
+	    os_monotonic_get_ns() < cam->retry_after_ns) {
+		os_mutex_unlock(&m->lock);
+		U_LOG_W("stereo camera %llu: stream %llu start refused — source unavailable (BUSY), retry later",
+		        (unsigned long long)cam->camera_id, (unsigned long long)s->id);
+		return XRT_ERROR_STEREO_CAMERA_BUSY;
+	}
+	s->delegating = dec.delegating || s->delegating;
+	s->consent_why = (uint32_t)dec.why;
+	xret = stream_allocate_locked(s, cam);
 	if (xret != XRT_SUCCESS) {
 		os_mutex_unlock(&m->lock);
 		return xret;
 	}
 	u_stereo_camera_decimator_init(&s->dec, s->req.max_frame_rate, source_rate_hz(cam));
 	u_stereo_camera_ring_clear(&s->ring);
+	s->vis_checked_ns = 0;
 	s->started = true;
 	cam->started_count++;
 	if (!cam->thread_started) {
@@ -1730,12 +2134,12 @@ ipc_handle_stereo_camera_stream_start(volatile struct ipc_client_state *ics, uin
 		cam->thread_started = true;
 	}
 	os_cond_signal(&cam->cond);
-	// TODO(R3): runtime-owned in-use indicator naming s->consumer.
-	U_LOG_W("stereo camera %llu: stream %llu started by %s — output %s, format %u, max %.1f Hz; %u started",
+	U_LOG_W("stereo camera %llu: stream %llu started by %s — output %s, format %u, max %.1f Hz; %u started%s",
 	        (unsigned long long)cam->camera_id, (unsigned long long)s->id, s->consumer,
 	        s->output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED ? "RECTIFIED" : "RAW", s->req.format,
-	        s->req.max_frame_rate, cam->started_count);
+	        s->req.max_frame_rate, cam->started_count, m->locked ? " (session locked: suspended)" : "");
 	os_mutex_unlock(&m->lock);
+	indicator_changed(m); // the tray shows "3D camera in use by <app>"
 	return XRT_SUCCESS;
 }
 
@@ -1752,6 +2156,7 @@ ipc_handle_stereo_camera_stream_stop(volatile struct ipc_client_state *ics, uint
 		stream_stop_locked(s, &m->cams[s->camera]);
 	}
 	os_mutex_unlock(&m->lock);
+	indicator_changed(m);
 	return XRT_SUCCESS;
 }
 
@@ -1785,21 +2190,10 @@ ipc_handle_stereo_camera_stream_get_section(volatile struct ipc_client_state *ic
 	out_layout->section_size = s->section_size;
 	out_layout->slot_stride = s->slot_stride;
 	out_layout->slot_count = U_STEREO_CAMERA_RING_SLOTS;
-#ifdef XRT_OS_WINDOWS
-	// A READ-ONLY duplicate: the consumer can map it but never write the ring.
-	if (s->sent_section_dup != NULL) {
-		CloseHandle(s->sent_section_dup);
-		s->sent_section_dup = NULL;
-	}
-	if (!DuplicateHandle(GetCurrentProcess(), s->section, GetCurrentProcess(), &s->sent_section_dup, FILE_MAP_READ,
-	                     FALSE, 0)) {
-		os_mutex_unlock(&m->lock);
-		return XRT_ERROR_IPC_FAILURE;
-	}
-	out_handles[0] = s->sent_section_dup;
-#else
-	out_handles[0] = s->section; // SCM_RIGHTS installs a copy; ours stays open
-#endif
+	// The READ-ONLY handle (FILE_MAP_READ duplicate on Windows, an O_RDONLY
+	// shm fd / PROT_READ ashmem on POSIX): the consumer can map the ring but
+	// never write it. The dispatch duplicates it into the peer; ours stays open.
+	out_handles[0] = s->section_ro;
 	*out_handle_count = 1;
 	ics->handles_sent = true; // browser#103 RC-1
 	os_mutex_unlock(&m->lock);
@@ -1863,6 +2257,10 @@ ipc_handle_stereo_camera_acquire(volatile struct ipc_client_state *ics,
 		os_mutex_unlock(&m->lock);
 		return XRT_ERROR_INPUT_UNSUPPORTED;
 	}
+	if (s->ended) {
+		os_mutex_unlock(&m->lock);
+		return XRT_ERROR_STEREO_CAMERA_STREAM_ENDED;
+	}
 	int32_t slot = -1;
 	uint64_t seq = 0;
 	if (s->started && s->allocated && u_stereo_camera_ring_acquire(&s->ring, &slot, &seq)) {
@@ -1914,4 +2312,234 @@ ipc_handle_stereo_camera_stream_stats(volatile struct ipc_client_state *ics,
 	}
 	os_mutex_unlock(&m->lock);
 	return XRT_SUCCESS;
+}
+
+
+/*
+ *
+ * R3: events, control, and the service-UI entry points.
+ *
+ */
+
+xrt_result_t
+ipc_handle_stereo_camera_poll_event(volatile struct ipc_client_state *ics,
+                                    bool *out_has,
+                                    struct xrt_stereo_camera_event *out_event)
+{
+	*out_has = false;
+	U_ZERO(out_event);
+	struct ipc_server_stereo_camera *m = mgr_of(ics);
+	if (m == NULL || ics->stereo_camera_owner == 0) {
+		return XRT_SUCCESS; // never used a camera: nothing can be queued
+	}
+	os_mutex_lock(&m->lock);
+	struct scam_evq *q = evq_for_owner_locked(m, ics->stereo_camera_owner, false);
+	if (q != NULL && q->count > 0) {
+		*out_event = q->ev[q->head];
+		q->head = (q->head + 1) % EVQ_CAP;
+		q->count--;
+		*out_has = true;
+	}
+	os_mutex_unlock(&m->lock);
+	return XRT_SUCCESS;
+}
+
+//! End every started stream (lock held). Returns how many were ended.
+static uint32_t
+stop_all_locked(struct ipc_server_stereo_camera *m, uint32_t reason)
+{
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < MAX_STREAMS; i++) {
+		struct scam_stream *s = &m->streams[i];
+		if (s->used && s->started) {
+			stream_end_locked(m, s, reason);
+			n++;
+		}
+	}
+	return n;
+}
+
+static uint32_t
+status_bits_locked(const struct ipc_server_stereo_camera *m)
+{
+	uint32_t started = 0;
+	for (uint32_t i = 0; i < MAX_STREAMS; i++) {
+		started += m->streams[i].used && m->streams[i].started ? 1u : 0u;
+	}
+	return (m->sharing_enabled ? 1u : 0u) | (m->locked ? 2u : 0u) | ((started & 0xffu) << 8);
+}
+
+xrt_result_t
+ipc_handle_stereo_camera_control(volatile struct ipc_client_state *ics, uint32_t op, uint32_t arg, uint32_t *out_value)
+{
+	*out_value = 0;
+	struct ipc_server_stereo_camera *m = mgr_of(ics);
+	xrt_result_t auth = require_diag_client(ics, "stereo_camera_control");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (m == NULL) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	char who[64];
+	snprintf(who, sizeof(who), "diag client pid %ld", ics->peer_pid);
+	switch (op) {
+	case XRT_STEREO_CAMERA_CONTROL_STOP_ALL: *out_value = ipc_server_stereo_camera_stop_all(who); return XRT_SUCCESS;
+	case XRT_STEREO_CAMERA_CONTROL_SET_SHARING:
+		return ipc_server_stereo_camera_set_sharing(arg != 0, who) ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
+	case XRT_STEREO_CAMERA_CONTROL_SET_LOCKED:
+		ipc_server_stereo_camera_set_session_locked(arg != 0, who);
+		return XRT_SUCCESS;
+	case XRT_STEREO_CAMERA_CONTROL_STATUS:
+		os_mutex_lock(&m->lock);
+		*out_value = status_bits_locked(m);
+		os_mutex_unlock(&m->lock);
+		return XRT_SUCCESS;
+	default: return XRT_ERROR_INPUT_UNSUPPORTED;
+	}
+}
+
+void
+ipc_server_stereo_camera_set_prompt_provider(ipc_server_stereo_camera_prompt_fn fn, void *ctx)
+{
+	g_prompt_ctx = ctx;
+	g_prompt_fn = fn;
+}
+
+void
+ipc_server_stereo_camera_set_indicator_provider(ipc_server_stereo_camera_indicator_fn fn, void *ctx)
+{
+	g_indicator_ctx = ctx;
+	g_indicator_fn = fn;
+}
+
+bool
+ipc_server_stereo_camera_get_status(struct ipc_server_stereo_camera_status *out)
+{
+	memset(out, 0, sizeof(*out));
+	struct ipc_server_stereo_camera *m = g_mgr;
+	if (m == NULL) {
+		return false;
+	}
+	os_mutex_lock(&m->lock);
+	out->camera_count = m->camera_count;
+	out->sharing_enabled = m->sharing_enabled;
+	out->locked = m->locked;
+	size_t n = 0;
+	for (uint32_t i = 0; i < MAX_STREAMS; i++) {
+		const struct scam_stream *s = &m->streams[i];
+		if (!s->used || !s->started) {
+			continue;
+		}
+		out->started_streams++;
+		// Base name of the executable, de-duplicated, comma separated.
+		const char *base = s->exe;
+		for (const char *p = s->exe; *p != '\0'; p++) {
+			if (*p == '\\' || *p == '/') {
+				base = p + 1;
+			}
+		}
+		if (base[0] == '\0') {
+			base = "unknown app";
+		}
+		if (strstr(out->consumers, base) == NULL && n < sizeof(out->consumers) - 1) {
+			n += (size_t)snprintf(out->consumers + n, sizeof(out->consumers) - n, "%s%s", n ? ", " : "", base);
+			if (n >= sizeof(out->consumers)) {
+				n = sizeof(out->consumers) - 1;
+			}
+		}
+	}
+	os_mutex_unlock(&m->lock);
+	return true;
+}
+
+uint32_t
+ipc_server_stereo_camera_stop_all(const char *why)
+{
+	struct ipc_server_stereo_camera *m = g_mgr;
+	if (m == NULL) {
+		return 0;
+	}
+	os_mutex_lock(&m->lock);
+	uint32_t n = stop_all_locked(m, XRT_STEREO_CAMERA_END_USER_STOPPED);
+	os_mutex_unlock(&m->lock);
+	os_mutex_lock(&m->consent_lock);
+	u_camera_consent_forget_once(&m->consent); // "Allow once" grants die with the stop
+	os_mutex_unlock(&m->consent_lock);
+	U_LOG_W("stereo camera: STOP camera sharing (%s) — %u stream(s) ended", why != NULL ? why : "?", n);
+	indicator_changed(m);
+	return n;
+}
+
+bool
+ipc_server_stereo_camera_set_sharing(bool enabled, const char *why)
+{
+	struct ipc_server_stereo_camera *m = g_mgr;
+	if (m == NULL) {
+		return false;
+	}
+	const struct u_camera_consent_store_ops *st = m->consent.store;
+	bool persisted = st != NULL && st->set_sharing_enabled != NULL && st->set_sharing_enabled(m->consent.store_ctx, enabled);
+	if (!persisted) {
+		U_LOG_W("stereo camera: could not persist the sharing toggle (%s) — applied for this run only",
+		        enabled ? "on" : "off");
+	}
+	os_mutex_lock(&m->lock);
+	bool changed = m->sharing_enabled != enabled;
+	m->sharing_enabled = enabled;
+	if (changed) {
+		if (!enabled) {
+			(void)stop_all_locked(m, XRT_STEREO_CAMERA_END_DISABLED);
+		}
+		notify_all_cameras_locked(m);
+	}
+	os_mutex_unlock(&m->lock);
+	if (changed) {
+		U_LOG_W("stereo camera: sharing switched %s (%s)%s", enabled ? "ON" : "OFF", why != NULL ? why : "?",
+		        enabled ? "" : " — every started stream ended, zero cameras enumerated");
+		indicator_changed(m);
+	}
+	return true;
+}
+
+void
+ipc_server_stereo_camera_set_session_locked(bool locked, const char *why)
+{
+	struct ipc_server_stereo_camera *m = g_mgr;
+	if (m == NULL) {
+		return;
+	}
+	os_mutex_lock(&m->lock);
+	bool changed = m->locked != locked;
+	m->locked = locked;
+	if (changed) {
+		if (locked) {
+			// Spec §7.2: the last image must not linger on a locked desktop.
+			for (uint32_t i = 0; i < MAX_STREAMS; i++) {
+				if (m->streams[i].used) {
+					u_stereo_camera_ring_clear(&m->streams[i].ring);
+				}
+			}
+		}
+		notify_all_cameras_locked(m);
+	}
+	os_mutex_unlock(&m->lock);
+	if (changed) {
+		U_LOG_W("stereo camera: OS session %s (%s) — streams %s", locked ? "LOCKED" : "unlocked",
+		        why != NULL ? why : "?", locked ? "suspended" : "resume");
+		indicator_changed(m);
+	}
+}
+
+bool
+ipc_server_stereo_camera_is_session_locked(void)
+{
+	struct ipc_server_stereo_camera *m = g_mgr;
+	if (m == NULL) {
+		return false;
+	}
+	os_mutex_lock(&m->lock);
+	bool l = m->locked;
+	os_mutex_unlock(&m->lock);
+	return l;
 }

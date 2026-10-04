@@ -326,4 +326,33 @@ typedef enum xrt_result
 	 * tell "too early" from "never".
 	 */
 	XRT_ERROR_INPUT_HOST_GEOMETRY_NOT_READY = -44,
+
+	/*!
+	 * XR_DXR_stereo_camera (ADR-043 R3): the user, or the stored per-app
+	 * decision, refused this executable the camera. Retryable after consent.
+	 * Maps to XR_ERROR_STEREO_CAMERA_CONSENT_REFUSED_DXR; distinct from
+	 * @ref XRT_ERROR_NOT_AUTHORIZED, which stays the OS-switch / class refusal
+	 * (XR_ERROR_PERMISSION_INSUFFICIENT).
+	 */
+	XRT_ERROR_STEREO_CAMERA_CONSENT_REFUSED = -45,
+
+	/*!
+	 * XR_DXR_stereo_camera: camera sharing is switched off (user toggle or
+	 * kill switch). Maps to XR_ERROR_STEREO_CAMERA_DISABLED_DXR.
+	 */
+	XRT_ERROR_STEREO_CAMERA_DISABLED = -46,
+
+	/*!
+	 * XR_DXR_stereo_camera: the source cannot be opened right now (the
+	 * plug-in reported it unavailable and the retry is pending). Maps to
+	 * XR_ERROR_STEREO_CAMERA_BUSY_DXR.
+	 */
+	XRT_ERROR_STEREO_CAMERA_BUSY = -47,
+
+	/*!
+	 * XR_DXR_stereo_camera: the service ended this stream (user stop,
+	 * sharing off, source lost); destroy and recreate it. Maps to
+	 * XR_ERROR_STEREO_CAMERA_STREAM_ENDED_DXR.
+	 */
+	XRT_ERROR_STEREO_CAMERA_STREAM_ENDED = -48,
 } xrt_result_t;
