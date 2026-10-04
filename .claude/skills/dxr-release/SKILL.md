@@ -102,24 +102,40 @@ Four consequences for this skill:
   artifact now carries a provenance stamp the publish asserts against the tag, and an
   unstamped artifact chosen by recency is refused precisely because nothing ties it to
   the tag.
-- **THE UPDATE FEED IS NOT UPDATED BY THIS FLOW — a green release is NOT a shipped
-  release.** `feed/feed.json` in the **public** repo is published to
-  `https://updates.displayxr.org`, and that URL is compiled into every browser already
-  installed. Only the older `pipeline.yml` promote path writes it;
-  `publish-browser-releases.yml` does not. So a release cut through this skill is
-  invisible to every existing user until the feed moves. This is not hypothetical: as of
-  2026-09-04 the feed still advertises `0.1.23` (last commit 2026-08-28) while `0.1.24`,
-  `0.1.25` and `0.1.26` have all shipped. **Do not report a browser release as complete
-  on the strength of the GitHub release alone** — check the feed and say plainly if it is
-  stale:
+- **THE UPDATE FEED IS PART OF THE PUBLISH LANE — but a green release is still not a
+  shipped one until you have seen the live feed.** `feed/feed.json` in the **public** repo
+  is served at `https://updates.displayxr.org/feed.json`, the URL every installed browser's
+  start-page banner reads, so a release the feed does not name is offered to nobody. Since
+  browser-pvt#229, `publish-browser-releases.yml`'s LAST step ("Publish the update feed",
+  `scripts/publish-feed.sh`) moves every platform the release carries (.exe → `latest` +
+  `platforms.windows`, .apk → `platforms.android`, .deb → `platforms.linux`) and fails the
+  run unless the live endpoint serves the new version — on a direct tag from this skill
+  exactly as on a `promote.yml` release. (Before #229 only `promote.yml` wrote it, and
+  1.0.9 through 1.2.2 — all tagged through this skill — had to be fed by hand. If the tagged
+  commit predates #229 there is no `scripts/publish-feed.sh` in it and that old rule still
+  applies.) It never
+  moves a platform backwards, so re-publishing an old tag leaves the feed alone.
+  Still **check the live feed before reporting** — it is the one thing users see:
   ```bash
-  FEED=$(curl -s https://updates.displayxr.org/feed.json | jq -r '.latest.version')
   # Strip whatever prefix the tag carries ($TAG_PREFIX is `v`; historical browser
   # tags were `preview-`) — the feed's `version` is bare X.Y.Z either way.
   REL_VER="${NEW_TAG#preview-}"; REL_VER="${REL_VER#v}"
-  echo "update feed advertises $FEED; this release is $REL_VER"
-  [ "$FEED" = "$REL_VER" ] || echo "FEED IS STALE — existing installs will NOT be offered this release."
+  curl -fsS https://updates.displayxr.org/feed.json \
+    | jq -r '"latest(win) \(.latest.version)", (.platforms // {} | to_entries[] | "\(.key) \(.value.version)")' \
+    | while read -r P FV; do
+        [ "$FV" = "$REL_VER" ] && echo "feed $P: $FV" || echo "feed $P: $FV — STALE (this release is $REL_VER)"
+      done
   ```
+  A platform the release has no asset for legitimately stays on its old version. If the
+  feed step failed (Pages slow, token), the release and the pin are already out — re-run
+  the publish with `gh workflow run publish-browser-releases.yml -R "$REPO" --ref main
+  -f tag="$NEW_TAG"` (it redoes the whole lane — re-signs, re-uploads with `--clobber`,
+  re-dispatches the pin bump — all idempotent, then moves the feed), or
+  preview it locally with `DRY_RUN=1 V=$REL_VER CHROMIUM=<pin> bash scripts/publish-feed.sh`
+  in a browser-pvt checkout. **Security flag:** a direct tag has no pipeline release plan,
+  so the feed says `security: false` (routine blue banner). For a security release cut
+  this way, publish with `-f security=true` on that dispatch so installs get the red
+  urgent banner.
 - **Signing moves INTO the publish workflow, so Phase 3.5 is skipped — do not
   "fix" this by adding browser to the Phase 3.5 dispatch.** The browser is signed;
   it is just signed one step earlier than every other component. Its Windows
@@ -912,8 +928,10 @@ rm -rf "$WORK"
 
 **browser — the report must state the update-feed status.** "Published successfully" is
 false-in-effect for the browser if the feed did not move: the GitHub release exists and
-no existing install will ever be offered it. Include the feed line from the "Browser is
-special" check above, and if it is stale say so in the summary rather than in a footnote.
+no existing install will ever be offered it. The publish lane now moves and live-checks
+the feed itself (browser-pvt#229), but include the per-platform feed lines from the
+"Browser is special" check above anyway, and if any is stale say so in the summary rather
+than in a footnote.
 
 ```
 Release $NEW_TAG published successfully!
