@@ -20,7 +20,10 @@
 #include "util/u_logging.h"
 
 #include "server/ipc_server_interface.h" // ADR-045: ipc_server_request_display_reprobe
+#include "server/ipc_server_stereo_camera.h" // ADR-043 R3: camera indicator, prompt, kill switch, lock
 #include "target_plugin_loader.h"        // ADR-045: per-plug-in platform state for the tooltip
+
+#include <wtsapi32.h> // WTSRegisterSessionNotification (lock-screen suspension)
 
 #define IDI_DISPLAYXR_ICON_WHITE 101
 #define IDI_DISPLAYXR_ICON_BLACK 102
@@ -33,6 +36,12 @@
 #define IDM_START_ON_LOGIN  1030
 #define IDM_CONTROL_PANEL   1002
 #define IDM_EXIT            1001
+// ADR-043 R3: stereo camera indicator / kill switch / sharing toggle
+#define IDM_CAMERA_STOP     1060
+#define IDM_CAMERA_SHARING  1061
+#define WM_CAMERA_PROMPT        (WM_APP + 2) //!< lParam = struct cam_prompt_req * (show)
+#define WM_CAMERA_PROMPT_CLOSE  (WM_APP + 3) //!< lParam = struct cam_prompt_req * (close, SendMessage)
+#define WM_CAMERA_INDICATOR     (WM_APP + 4) //!< refresh icon + tooltip now
 
 // ADR-045: tooltip refresh of the display-processor status line.
 #define TRAY_STATUS_TIMER_ID 1
@@ -61,6 +70,20 @@ static struct service_config s_config;
 // ADR-045 R-c: registry waiter on the plug-in registration root.
 static HANDLE s_reg_watch_thread = NULL;
 static HANDLE s_reg_watch_stop = NULL;
+
+// ADR-043 R3: camera in-use icon (base icon + red dot) and the pending prompt.
+static HICON s_icon_base = NULL;
+static HICON s_icon_inuse = NULL;
+static bool s_camera_in_use = false;
+
+struct cam_prompt_req
+{
+	wchar_t title[256];
+	wchar_t body[512];
+	HANDLE done; //!< signalled by a button / close
+	volatile LONG answer; //!< enum u_camera_consent_prompt_answer
+	HWND dlg;    //!< tray thread only
+};
 
 
 /*
@@ -287,6 +310,27 @@ show_context_menu(HWND hwnd)
 		AppendMenuW(menu, MF_POPUP, (UINT_PTR)workspace_sub, name_wide);
 	}
 
+	// ADR-043 R3: camera indicator line, kill switch, sharing toggle.
+	{
+		struct ipc_server_stereo_camera_status cst;
+		bool have = ipc_server_stereo_camera_get_status(&cst);
+		wchar_t line[256];
+		if (!have || cst.camera_count == 0) {
+			wcscpy_s(line, ARRAYSIZE(line), (have && !cst.sharing_enabled) ? L"3D camera: sharing off" : L"3D camera: none");
+		} else if (cst.started_streams > 0) {
+			wchar_t who[128];
+			MultiByteToWideChar(CP_UTF8, 0, cst.consumers, -1, who, ARRAYSIZE(who));
+			_snwprintf_s(line, ARRAYSIZE(line), _TRUNCATE, L"3D camera in use by %ls", who);
+		} else {
+			wcscpy_s(line, ARRAYSIZE(line), cst.sharing_enabled ? L"3D camera: not in use" : L"3D camera: sharing off");
+		}
+		AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+		AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, line);
+		AppendMenuW(menu, MF_STRING | ((have && cst.started_streams > 0) ? MF_ENABLED : MF_GRAYED), IDM_CAMERA_STOP,
+		            L"Stop camera sharing");
+		AppendMenuW(menu, MF_STRING | ((!have || cst.sharing_enabled) ? MF_CHECKED : MF_UNCHECKED), IDM_CAMERA_SHARING,
+		            L"Share the 3D camera with apps");
+	}
 	AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
 	AppendMenuW(menu, MF_STRING | (s_config.start_on_login ? MF_CHECKED : MF_UNCHECKED),
 	            IDM_START_ON_LOGIN, L"Start on Windows login");
@@ -340,6 +384,255 @@ request_service_exit(void)
  * vendor-specific is known here. Never triggers discovery: it reads the
  * loader's records, which the IPC server's instance filled in.
  */
+/*
+ *
+ * ADR-043 R3: camera in-use badge, prompt dialog, indicator refresh.
+ *
+ */
+
+//! @p base with a red "recording" dot bottom-right (32bpp DIB, alpha kept).
+static HICON
+make_badged_icon(HICON base)
+{
+	ICONINFO ii;
+	if (base == NULL || !GetIconInfo(base, &ii)) {
+		return NULL;
+	}
+	BITMAP bm;
+	HICON out = NULL;
+	if (ii.hbmColor != NULL && GetObject(ii.hbmColor, sizeof(bm), &bm) != 0 && bm.bmWidth > 0 && bm.bmHeight > 0) {
+		const int w = bm.bmWidth, h = bm.bmHeight;
+		BITMAPINFO bi;
+		ZeroMemory(&bi, sizeof(bi));
+		bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+		bi.bmiHeader.biWidth = w;
+		bi.bmiHeader.biHeight = -h; // top-down
+		bi.bmiHeader.biPlanes = 1;
+		bi.bmiHeader.biBitCount = 32;
+		bi.bmiHeader.biCompression = BI_RGB;
+		HDC dc = GetDC(NULL);
+		uint32_t *px = NULL;
+		HBITMAP color = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void **)&px, NULL, 0);
+		if (color != NULL && px != NULL) {
+			// Copy the icon's colour bits (with alpha) into the DIB.
+			HDC src = CreateCompatibleDC(dc);
+			HGDIOBJ old = SelectObject(src, ii.hbmColor);
+			GetDIBits(src, ii.hbmColor, 0, (UINT)h, px, &bi, DIB_RGB_COLORS);
+			SelectObject(src, old);
+			DeleteDC(src);
+			// Red dot, radius ~ 28 % of the icon, bottom-right, opaque.
+			const double r = w * 0.28, cx = w - r - 0.5, cy = h - r - 0.5;
+			for (int y = 0; y < h; y++) {
+				for (int x = 0; x < w; x++) {
+					double dx = x - cx, dy = y - cy;
+					if (dx * dx + dy * dy <= r * r) {
+						px[y * w + x] = 0xFFE03030u; // A R G B (BGRA in memory)
+					}
+				}
+			}
+			ICONINFO ni = ii;
+			ni.fIcon = TRUE;
+			ni.hbmColor = color;
+			out = CreateIconIndirect(&ni);
+			DeleteObject(color);
+		}
+		ReleaseDC(NULL, dc);
+	}
+	if (ii.hbmColor != NULL) {
+		DeleteObject(ii.hbmColor);
+	}
+	if (ii.hbmMask != NULL) {
+		DeleteObject(ii.hbmMask);
+	}
+	return out;
+}
+
+//! Tray thread: re-read the camera status; swap icon + tooltip when it changed.
+static void
+update_camera_indicator(void)
+{
+	struct ipc_server_stereo_camera_status st;
+	bool in_use = ipc_server_stereo_camera_get_status(&st) && st.started_streams > 0;
+	if (in_use == s_camera_in_use) {
+		return;
+	}
+	s_camera_in_use = in_use;
+	if (s_icon_inuse == NULL && s_icon_base != NULL) {
+		s_icon_inuse = make_badged_icon(s_icon_base);
+	}
+	s_nid.hIcon = in_use && s_icon_inuse != NULL ? s_icon_inuse : s_icon_base;
+	s_nid.uFlags = NIF_ICON;
+	Shell_NotifyIconW(NIM_MODIFY, &s_nid);
+	s_nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
+	if (in_use) {
+		// One balloon per transition: the user learns WHO started reading the camera.
+		wchar_t who[256];
+		MultiByteToWideChar(CP_UTF8, 0, st.consumers, -1, who, ARRAYSIZE(who));
+		NOTIFYICONDATAW n = s_nid;
+		n.uFlags = NIF_INFO;
+		n.dwInfoFlags = NIIF_INFO | NIIF_RESPECT_QUIET_TIME;
+		wcscpy_s(n.szInfoTitle, ARRAYSIZE(n.szInfoTitle), L"3D camera in use");
+		_snwprintf_s(n.szInfo, ARRAYSIZE(n.szInfo), _TRUNCATE, L"%ls is receiving frames from the 3D camera.", who);
+		Shell_NotifyIconW(NIM_MODIFY, &n);
+	}
+}
+
+//! Any thread (the manager's indicator provider): refresh on the tray thread.
+static void
+camera_indicator_changed(void *ctx)
+{
+	(void)ctx;
+	if (s_tray_hwnd != NULL) {
+		PostMessageW(s_tray_hwnd, WM_CAMERA_INDICATOR, 0, 0);
+	}
+}
+
+#define CAM_BTN_ALLOW 1
+#define CAM_BTN_ONCE 2
+#define CAM_BTN_DENY 3
+
+static LRESULT CALLBACK
+cam_prompt_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+	struct cam_prompt_req *req = (struct cam_prompt_req *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+	switch (msg) {
+	case WM_COMMAND: {
+		if (req == NULL) {
+			return 0;
+		}
+		LONG a = -1;
+		switch (LOWORD(wParam)) {
+		case CAM_BTN_ALLOW: a = U_CAMERA_CONSENT_PROMPT_ALLOW; break;
+		case CAM_BTN_ONCE: a = U_CAMERA_CONSENT_PROMPT_ALLOW_ONCE; break;
+		case CAM_BTN_DENY: a = U_CAMERA_CONSENT_PROMPT_DENY; break;
+		default: return 0;
+		}
+		InterlockedExchange(&req->answer, a);
+		SetEvent(req->done);
+		DestroyWindow(hwnd);
+		return 0;
+	}
+	case WM_CLOSE:
+		// Dismissed without an answer: refused now, asked again next time.
+		if (req != NULL) {
+			InterlockedExchange(&req->answer, U_CAMERA_CONSENT_PROMPT_TIMEOUT);
+			SetEvent(req->done);
+		}
+		DestroyWindow(hwnd);
+		return 0;
+	case WM_DESTROY:
+		if (req != NULL) {
+			req->dlg = NULL;
+		}
+		return 0;
+	case WM_CTLCOLORSTATIC: return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
+	default: return DefWindowProcW(hwnd, msg, wParam, lParam);
+	}
+}
+
+//! Tray thread: show the consent dialog ("<app> wants to use the 3D camera").
+static void
+cam_prompt_show(struct cam_prompt_req *req)
+{
+	static bool registered = false;
+	HINSTANCE hi = GetModuleHandleW(NULL);
+	if (!registered) {
+		WNDCLASSEXW wc = {0};
+		wc.cbSize = sizeof(wc);
+		wc.lpfnWndProc = cam_prompt_wnd_proc;
+		wc.hInstance = hi;
+		wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+		wc.hbrBackground = GetSysColorBrush(COLOR_WINDOW);
+		wc.lpszClassName = L"DisplayXRCameraConsent";
+		wc.hIcon = s_icon_base;
+		RegisterClassExW(&wc);
+		registered = true;
+	}
+	UINT dpi = GetDpiForSystem();
+#define DP(v) MulDiv((v), (int)dpi, 96)
+	int w = DP(460), h = DP(190);
+	RECT wa;
+	SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+	int x = wa.left + ((wa.right - wa.left) - w) / 2;
+	int y = wa.top + ((wa.bottom - wa.top) - h) / 2;
+	HWND dlg = CreateWindowExW(WS_EX_TOPMOST | WS_EX_DLGMODALFRAME, L"DisplayXRCameraConsent", L"DisplayXR",
+	                           WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, x, y, w, h, NULL, NULL, hi, NULL);
+	if (dlg == NULL) {
+		InterlockedExchange(&req->answer, U_CAMERA_CONSENT_PROMPT_UNAVAILABLE);
+		SetEvent(req->done);
+		return;
+	}
+	SetWindowLongPtrW(dlg, GWLP_USERDATA, (LONG_PTR)req);
+	HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+	NONCLIENTMETRICSW ncm = {sizeof(ncm)};
+	HFONT ui_font = NULL;
+	if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0)) {
+		ui_font = CreateFontIndirectW(&ncm.lfMessageFont);
+		font = ui_font != NULL ? ui_font : font;
+	}
+	HWND t = CreateWindowExW(0, L"STATIC", req->title, WS_CHILD | WS_VISIBLE, DP(16), DP(14), DP(420), DP(22), dlg,
+	                         NULL, hi, NULL);
+	HWND b = CreateWindowExW(0, L"STATIC", req->body, WS_CHILD | WS_VISIBLE, DP(16), DP(42), DP(420), DP(56), dlg,
+	                         NULL, hi, NULL);
+	HWND deny = CreateWindowExW(0, L"BUTTON", L"Deny", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, DP(16),
+	                            DP(108), DP(110), DP(30), dlg, (HMENU)(INT_PTR)CAM_BTN_DENY, hi, NULL);
+	HWND once = CreateWindowExW(0, L"BUTTON", L"Allow once", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+	                            DP(206), DP(108), DP(110), DP(30), dlg, (HMENU)(INT_PTR)CAM_BTN_ONCE, hi, NULL);
+	HWND allow = CreateWindowExW(0, L"BUTTON", L"Allow", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+	                             DP(326), DP(108), DP(110), DP(30), dlg, (HMENU)(INT_PTR)CAM_BTN_ALLOW, hi, NULL);
+	HWND ctls[] = {t, b, deny, once, allow};
+	for (size_t i = 0; i < ARRAYSIZE(ctls); i++) {
+		SendMessageW(ctls[i], WM_SETFONT, (WPARAM)font, TRUE);
+	}
+#undef DP
+	req->dlg = dlg;
+	ShowWindow(dlg, SW_SHOWNORMAL);
+	SetForegroundWindow(dlg);
+	SetFocus(allow);
+}
+
+/*!
+ * The manager's prompt provider (IPC client thread): hand the request to the
+ * tray thread, wait for the answer or the timeout, then close the dialog
+ * synchronously (SendMessage runs on the tray thread) before @p req dies.
+ */
+static enum u_camera_consent_prompt_answer
+tray_camera_prompt(void *ctx, const char *exe, const char *app_name, long pid, uint32_t timeout_ms)
+{
+	(void)ctx;
+	if (s_tray_hwnd == NULL) {
+		return U_CAMERA_CONSENT_PROMPT_UNAVAILABLE;
+	}
+	struct cam_prompt_req req;
+	ZeroMemory(&req, sizeof(req));
+	req.answer = U_CAMERA_CONSENT_PROMPT_TIMEOUT;
+	const char *base = exe != NULL ? exe : "";
+	for (const char *p = base; *p != '\0'; p++) {
+		if (*p == '\\' || *p == '/') {
+			base = p + 1;
+		}
+	}
+	wchar_t wapp[128], wbase[256];
+	MultiByteToWideChar(CP_UTF8, 0, app_name != NULL && app_name[0] ? app_name : "An app", -1, wapp, ARRAYSIZE(wapp));
+	MultiByteToWideChar(CP_UTF8, 0, base[0] ? base : "the app", -1, wbase, ARRAYSIZE(wbase));
+	_snwprintf_s(req.title, ARRAYSIZE(req.title), _TRUNCATE, L"\u201c%ls\u201d wants to use the 3D camera", wapp);
+	_snwprintf_s(req.body, ARRAYSIZE(req.body), _TRUNCATE,
+	             L"%ls (pid %ld) will receive frames from the display\u2019s stereo camera. You can stop it at any "
+	             L"time from the DisplayXR tray menu.",
+	             wbase, pid);
+	req.done = CreateEventW(NULL, TRUE, FALSE, NULL);
+	if (req.done == NULL) {
+		return U_CAMERA_CONSENT_PROMPT_UNAVAILABLE;
+	}
+	PostMessageW(s_tray_hwnd, WM_CAMERA_PROMPT, 0, (LPARAM)&req);
+	WaitForSingleObject(req.done, timeout_ms);
+	// Close (or no-op) on the tray thread; returns only once the dialog no
+	// longer references req.
+	SendMessageW(s_tray_hwnd, WM_CAMERA_PROMPT_CLOSE, 0, (LPARAM)&req);
+	CloseHandle(req.done);
+	return (enum u_camera_consent_prompt_answer)InterlockedCompareExchange(&req.answer, 0, 0);
+}
+
 static void
 build_status_line(char *out, size_t cap)
 {
@@ -397,8 +690,17 @@ update_status_tooltip(void)
 	if (MultiByteToWideChar(CP_UTF8, 0, line, -1, wline, ARRAYSIZE(wline)) == 0) {
 		wline[0] = L'\0';
 	}
+	// ADR-043 R3 §7.3: the camera line names the consumers while any stream runs.
+	wchar_t wcam[128] = L"";
+	struct ipc_server_stereo_camera_status cst;
+	if (ipc_server_stereo_camera_get_status(&cst) && cst.started_streams > 0) {
+		wchar_t who[96];
+		MultiByteToWideChar(CP_UTF8, 0, cst.consumers, -1, who, ARRAYSIZE(who));
+		_snwprintf_s(wcam, ARRAYSIZE(wcam), _TRUNCATE, L"\n3D camera in use by %ls%ls", who,
+		             cst.locked ? L" (suspended: locked)" : L"");
+	}
 	wchar_t tip[ARRAYSIZE(s_nid.szTip)];
-	_snwprintf_s(tip, ARRAYSIZE(tip), _TRUNCATE, L"DisplayXR Service\n%ls", wline);
+	_snwprintf_s(tip, ARRAYSIZE(tip), _TRUNCATE, L"DisplayXR Service\n%ls%ls", wline, wcam);
 	if (wcscmp(tip, s_nid.szTip) == 0) {
 		return;
 	}
@@ -608,6 +910,24 @@ session_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		}
 		return TRUE;
 
+	// ADR-043 R3 §7.2: a locked / disconnected / switched-away session gets no
+	// camera frames. Registered with WTSRegisterSessionNotification below.
+	case WM_WTSSESSION_CHANGE:
+		switch (wParam) {
+		case WTS_SESSION_LOCK: ipc_server_stereo_camera_set_session_locked(true, "WTS_SESSION_LOCK"); break;
+		case WTS_CONSOLE_DISCONNECT:
+			ipc_server_stereo_camera_set_session_locked(true, "WTS_CONSOLE_DISCONNECT");
+			break;
+		case WTS_REMOTE_DISCONNECT:
+			ipc_server_stereo_camera_set_session_locked(true, "WTS_REMOTE_DISCONNECT");
+			break;
+		case WTS_SESSION_UNLOCK: ipc_server_stereo_camera_set_session_locked(false, "WTS_SESSION_UNLOCK"); break;
+		case WTS_CONSOLE_CONNECT: ipc_server_stereo_camera_set_session_locked(false, "WTS_CONSOLE_CONNECT"); break;
+		case WTS_REMOTE_CONNECT: ipc_server_stereo_camera_set_session_locked(false, "WTS_REMOTE_CONNECT"); break;
+		default: break;
+		}
+		return 0;
+
 	default: return DefWindowProcW(hwnd, msg, wParam, lParam);
 	}
 }
@@ -682,22 +1002,57 @@ tray_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			config_changed();
 			break;
 
+		// ADR-043 R3: the user kill switch and the persistent sharing toggle.
+		case IDM_CAMERA_STOP: ipc_server_stereo_camera_stop_all("tray: Stop camera sharing"); break;
+		case IDM_CAMERA_SHARING: {
+			struct ipc_server_stereo_camera_status cst;
+			bool on = ipc_server_stereo_camera_get_status(&cst) ? cst.sharing_enabled : true;
+			ipc_server_stereo_camera_set_sharing(!on, "tray: Share the 3D camera with apps");
+			break;
+		}
+
 		// Exit
 		case IDM_EXIT: request_service_exit(); break;
 		}
 		return 0;
 	}
 
+	case WM_CAMERA_PROMPT: cam_prompt_show((struct cam_prompt_req *)lParam); return 0;
+
+	case WM_CAMERA_PROMPT_CLOSE: {
+		struct cam_prompt_req *req = (struct cam_prompt_req *)lParam;
+		if (req != NULL && req->dlg != NULL) {
+			HWND d = req->dlg;
+			SetWindowLongPtrW(d, GWLP_USERDATA, 0);
+			req->dlg = NULL;
+			DestroyWindow(d);
+		}
+		return 0;
+	}
+
+	case WM_CAMERA_INDICATOR:
+		update_camera_indicator();
+		update_status_tooltip();
+		return 0;
+
 	case WM_TIMER:
 		if (wParam == TRAY_STATUS_TIMER_ID) {
+			update_camera_indicator();
 			update_status_tooltip();
 		}
 		return 0;
 
 	case WM_SETTINGCHANGE:
-		// Windows theme changed — swap tray icon to match
-		s_nid.hIcon = load_theme_icon();
+		// Windows theme changed — swap tray icon to match (and rebuild the badge)
+		s_icon_base = load_theme_icon();
+		if (s_icon_inuse != NULL) {
+			DestroyIcon(s_icon_inuse);
+			s_icon_inuse = NULL;
+		}
+		s_camera_in_use = !s_camera_in_use; // force the swap below to re-pick
+		s_nid.hIcon = s_icon_base;
 		Shell_NotifyIconW(NIM_MODIFY, &s_nid);
+		update_camera_indicator();
 		return 0;
 
 	case WM_DESTROY:
@@ -755,6 +1110,13 @@ tray_thread_body(LPVOID param)
 		    "Could not create the session-end window (error %lu); Restart Manager can only force-close "
 		    "the service.",
 		    GetLastError());
+	} else if (!WTSRegisterSessionNotification(session_hwnd, NOTIFY_FOR_THIS_SESSION)) {
+		U_LOG_W("WTSRegisterSessionNotification failed (error %lu): the 3D camera will not suspend on lock",
+		        GetLastError());
+	}
+	// A remote (RDP) session has no local user in front of the camera.
+	if (GetSystemMetrics(SM_REMOTESESSION) != 0) {
+		ipc_server_stereo_camera_set_session_locked(true, "SM_REMOTESESSION at start");
 	}
 
 	// Set up the tray icon
@@ -767,7 +1129,8 @@ tray_thread_body(LPVOID param)
 	wcscpy_s(s_nid.szTip, ARRAYSIZE(s_nid.szTip), L"DisplayXR Service");
 
 	// Load theme-appropriate icon (black for light taskbar, white for dark)
-	s_nid.hIcon = load_theme_icon();
+	s_icon_base = load_theme_icon();
+	s_nid.hIcon = s_icon_base;
 
 	Shell_NotifyIconW(NIM_ADD, &s_nid);
 
@@ -843,6 +1206,14 @@ service_tray_init(service_tray_shutdown_cb shutdown_cb,
 
 	// ADR-045 R-c: plug-in registration changes re-probe selection.
 	reg_watch_start();
+
+	// ADR-043 R3: the stereo camera's consent prompt + in-use indicator live on
+	// this tray. Registered before ipc_server_main creates the camera manager
+	// (process-wide providers, not per manager).
+	if (s_tray_hwnd != NULL) {
+		ipc_server_stereo_camera_set_prompt_provider(tray_camera_prompt, NULL);
+		ipc_server_stereo_camera_set_indicator_provider(camera_indicator_changed, NULL);
+	}
 
 	return s_tray_hwnd != NULL;
 }

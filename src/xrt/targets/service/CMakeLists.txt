@@ -48,7 +48,8 @@ if(WIN32)
 		service_tray_win.h
 		service_resources.rc
 	)
-	target_link_libraries(displayxr-service PRIVATE shell32 ws2_32)
+	# wtsapi32: WTSRegisterSessionNotification — the stereo camera's lock-screen suspension (ADR-043 R3)
+	target_link_libraries(displayxr-service PRIVATE shell32 ws2_32 wtsapi32)
 
 	# #1201 — embed the shared per-monitor-v2 DPI manifest. The service already
 	# called SetProcessDpiAwarenessContext at the top of WinMain (now
