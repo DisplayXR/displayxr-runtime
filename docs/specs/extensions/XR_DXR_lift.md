@@ -340,7 +340,7 @@ without hardware.
 ## 12. Probe and diagnostics
 
 ```
-displayxr-cli lift caps [--json] [--wait S]
+displayxr-cli lift caps [--json] [--wait S] [--timeout S]
 displayxr-cli lift probe <image|frames_dir> [--mode depth|sbs|nview|gaussians] [--n N]
                          [--views N] [--strength F] [--convergence F] [--focal PX]
                          [--priority paused|low|normal|high] [--pipelined] [--fps F] [--out DIR]
@@ -352,7 +352,12 @@ browser does, reads each result back through the export texture + fence and writ
 `lift_out_<i>.png` (depth normalised to 8-bit grey) or `lift_out_<i>.ply`. It prints per frame
 the submit → acquire latency seen by the caller and the service's own latency, and at the end
 the stream stats and a latency summary. `--pipelined` submits at `--fps` without waiting, to
-measure throughput and drops. `displayxr-cli selftest` includes a `lift_caps` check (headless
+measure throughput and drops. `lift caps` polls through ACTIVATING for `--wait` seconds
+(default 8) and is hard-bounded by `--timeout` (default `max(10, wait + 2)` s): a service that
+never answers — wedged, or not accepting connections — prints `TIMEOUT` and exits 4 instead of
+blocking (#1812). The service answers caps from its last-known snapshot and never waits on the
+module, so a module stuck loading reads ACTIVATING, not a hang; the service logs one WARN
+(`[lift] module still ACTIVATING ...`) when that lasts past 30 s. `displayxr-cli selftest` includes a `lift_caps` check (headless
 WARP + the lift-only factory): modes 0 passes; only malformed caps fail
 (`CLI_SELFTEST_BAD_LIFT_CAPS`, exit 11).
 

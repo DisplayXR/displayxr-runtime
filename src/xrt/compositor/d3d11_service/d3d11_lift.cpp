@@ -369,6 +369,14 @@ struct d3d11_lift
 	bool activated = false;
 	xrt_dp_lift_caps caps = {};
 	uint32_t logged_state = 0xffffffffu;
+	//! #1812: when the current ACTIVATING stretch began (0 = not activating /
+	//! nobody asked yet), and whether its one-shot stall WARN was emitted.
+	uint64_t activating_since_ns = 0;
+	bool activating_warned = false;
+	//! The vendor call the lift thread is inside right now (nullptr = none),
+	//! so the stall WARN can say whether the thread itself is blocked there.
+	const char *vendor_call = nullptr;
+	uint64_t vendor_call_since_ns = 0;
 	uint64_t next_stream_id = 0;
 	uint32_t live_streams = 0;
 	std::map<uint64_t, std::unique_ptr<lift_stream>> streams;
@@ -388,6 +396,64 @@ caps_set_state(d3d11_lift *l, uint32_t state, const char *why)
 		        state_str(state), l->caps.modes, l->caps.backend, l->caps.max_streams, l->caps.max_views,
 		        why != nullptr ? " — " : "", why != nullptr ? why : "");
 	}
+	if (state != XRT_DP_LIFT_STATE_ACTIVATING) {
+		l->activating_since_ns = 0;
+		l->activating_warned = false;
+	} else if (l->activating_since_ns == 0 && l->activate_requested) {
+		l->activating_since_ns = os_monotonic_get_ns();
+	}
+}
+
+//! How long the module may stay ACTIVATING after first being asked for before
+//! the one-shot stall WARN (#1812). A healthy module warms up in seconds.
+static const uint64_t k_activating_warn_ns = 30ull * 1000 * 1000 * 1000;
+
+/*!
+ * One-shot WARN when the module has been ACTIVATING for longer than
+ * k_activating_warn_ns since someone first asked for it (#1812: a vendor
+ * conversion runtime whose files were half-removed under the running service).
+ * Callers keep getting the ACTIVATING snapshot without waiting — this only
+ * makes the stall visible. Caller holds mtx; called from the lift thread and
+ * from every caps query, so it fires even while the lift thread itself is
+ * blocked inside a vendor call.
+ */
+static void
+lift_check_activating_stall(d3d11_lift *l, uint64_t now)
+{
+	if (l->caps.state != XRT_DP_LIFT_STATE_ACTIVATING || !l->activate_requested) {
+		return;
+	}
+	if (l->activating_since_ns == 0) {
+		l->activating_since_ns = now;
+		return;
+	}
+	if (l->activating_warned || now - l->activating_since_ns < k_activating_warn_ns) {
+		return;
+	}
+	l->activating_warned = true;
+	if (l->vendor_call != nullptr) {
+		U_LOG_W(
+		    "[lift] module still ACTIVATING after %.0f s; the lift thread is blocked in the plug-in's %s "
+		    "(for %.0f s). Caps queries keep answering ACTIVATING, streams wait. Usual cause: a broken or "
+		    "half-removed vendor conversion runtime install. Repair it, then restart the service.",
+		    (double)(now - l->activating_since_ns) / 1e9, l->vendor_call,
+		    (double)(now - l->vendor_call_since_ns) / 1e9);
+	} else {
+		U_LOG_W(
+		    "[lift] module still ACTIVATING after %.0f s; the plug-in keeps reporting ACTIVATING (its module "
+		    "load has not finished). Caps queries keep answering ACTIVATING, streams wait. Usual cause: a "
+		    "broken or half-removed vendor conversion runtime install.",
+		    (double)(now - l->activating_since_ns) / 1e9);
+	}
+}
+
+//! Mark the lift thread as inside / out of a (possibly blocking) vendor call.
+static void
+lift_vendor_call(d3d11_lift *l, const char *what)
+{
+	std::lock_guard<std::mutex> g(l->mtx);
+	l->vendor_call = what;
+	l->vendor_call_since_ns = what != nullptr ? os_monotonic_get_ns() : 0;
 }
 
 
@@ -640,15 +706,19 @@ lift_activate(d3d11_lift *l)
 	// explicit lift-only factory when it has one (no weaver, no tracker
 	// session); else its ordinary factory with a NULL window.
 	const bool lift_only = l->lift_factory != nullptr;
+	lift_vendor_call(l, "display-processor factory");
 	xrt_result_t xret =
 	    (lift_only ? l->lift_factory : l->fallback_factory)(l->lift_device, l->lift_context, nullptr, &l->dp);
+	lift_vendor_call(l, nullptr);
 	U_LOG_W("[lift] lift DP %s via the plug-in's %s factory (dedicated device, NULL window)",
 	        xret == XRT_SUCCESS && l->dp != nullptr ? "created" : "REFUSED",
 	        lift_only ? "lift-only" : "ordinary (no lift-only factory)");
 	xrt_dp_lift_caps caps;
 	bool have = false;
 	if (xret == XRT_SUCCESS && l->dp != nullptr && xrt_display_processor_d3d11_has_lift(l->dp)) {
+		lift_vendor_call(l, "lift_get_caps");
 		have = xrt_display_processor_d3d11_lift_get_caps(l->dp, &caps);
+		lift_vendor_call(l, nullptr);
 	} else {
 		xrt_dp_lift_caps_init(&caps);
 	}
@@ -685,8 +755,10 @@ lift_poll_caps(d3d11_lift *l)
 		return;
 	}
 	xrt_dp_lift_caps caps;
+	lift_vendor_call(l, "lift_get_caps");
 	bool have = xrt_display_processor_d3d11_lift_get_caps(l->dp, &caps);
 	std::lock_guard<std::mutex> g(l->mtx);
+	l->vendor_call = nullptr;
 	if (!have) {
 		caps_set_state(l, XRT_DP_LIFT_STATE_UNAVAILABLE, "module stopped answering");
 		return;
@@ -957,6 +1029,7 @@ lift_thread_main(d3d11_lift *l)
 
 		// A module warming up: poll ≤ 1 Hz until READY.
 		uint64_t now = os_monotonic_get_ns();
+		lift_check_activating_stall(l, now);
 		if (l->dp != nullptr && l->caps.state != XRT_DP_LIFT_STATE_READY &&
 		    now - last_poll_ns > 1000000000ull) {
 			last_poll_ns = now;
@@ -1216,13 +1289,16 @@ d3d11_lift_get_caps(struct d3d11_lift *l, struct xrt_dp_lift_caps *out)
 	}
 	bool kick = false;
 	{
+		// Never waits on the lift thread or the module (#1812): the
+		// last-known snapshot, whatever state activation is in.
 		std::lock_guard<std::mutex> g(l->mtx);
-		*out = l->caps;
-		out->struct_size = (uint32_t)sizeof(*out);
 		if (!l->activate_requested) {
 			l->activate_requested = true;
 			kick = true;
 		}
+		lift_check_activating_stall(l, os_monotonic_get_ns());
+		*out = l->caps;
+		out->struct_size = (uint32_t)sizeof(*out);
 	}
 	if (kick) {
 		l->cv.notify_all();
