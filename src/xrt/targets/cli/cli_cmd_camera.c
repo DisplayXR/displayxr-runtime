@@ -10,9 +10,22 @@
  *                [--frames N] [--seconds S] [--out DIR]
  *                [--max-disparity N] [--max-dy N] [--min-ncc C]
  *
- * `probe` is a real consumer: it creates and starts a stream (so it goes
- * through the service's authorisation — in R1, DXR_STEREO_CAMERA_DEV_ALLOW=1
- * on the SERVICE), maps the ring READ-ONLY, waits on the per-stream wake
+ * R3 consent / privacy (ADR-043 §7) — the store is edited LOCALLY (no service
+ * needed), the control ops go over IPC as a DIAG client:
+ *   camera consent                               list the store (apps, delegating, sharing)
+ *   camera allow|deny|revoke <exe>|--self        stored per-app decision
+ *   camera trust|untrust <exe>|--self            user-level consent-DELEGATING list
+ *   camera status                                sharing / locked / started streams (IPC)
+ *   camera stop-all                              the user kill switch (IPC)
+ *   camera sharing on|off                        the persistent sharing toggle (IPC)
+ *   camera fake-lock on|off                      simulate the OS session lock (IPC, diagnostics)
+ *
+ * `list` / `calib` / `probe` connect as the CAMERA_CONSUMER class (ADR-043 R3)
+ * — the same class a browser's video-capture utility declares — so the CLI
+ * exercises exactly the consumer path: it is prompted / refused / allowed like
+ * any app. `probe` is a real consumer: it creates and starts a stream (so it
+ * goes through the service's consent decision: a refusal prints the distinct
+ * result and exits 4 / 6 / 7), maps the ring READ-ONLY, waits on the per-stream wake
  * handle, acquires, and reports the measured delivery rate, frame-index gaps,
  * the SBS layout, block-matched disparities of the last frame (the sim fake's
  * scene is 12 px background / 40 px bar), and the service's stream stats.
@@ -51,6 +64,7 @@
 #ifdef CLI_HAVE_IPC
 
 #include "xrt/xrt_instance.h"
+#include "util/u_camera_consent.h"
 #include "xrt/xrt_plugin.h"
 #include "xrt/xrt_results.h"
 #include "xrt/xrt_stereo_camera.h"
@@ -77,6 +91,9 @@
 #include <poll.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#endif
+#ifdef XRT_OS_MACOS
+#include <mach-o/dyld.h>
 #endif
 
 static const char *
@@ -130,7 +147,15 @@ result_hint(xrt_result_t x)
 {
 	switch (x) {
 	case XRT_ERROR_NOT_AUTHORIZED:
-		return " = NOT_AUTHORIZED (R1: set DXR_STEREO_CAMERA_DEV_ALLOW=1 in the SERVICE environment)";
+		return " = NOT_AUTHORIZED (OS camera privacy switch off, RAW to a delegating client, or wrong client class)";
+	case XRT_ERROR_STEREO_CAMERA_CONSENT_REFUSED:
+		return " = CONSENT_REFUSED (no consent for this executable: the prompt was refused / unavailable, or a "
+		       "stored Deny; `displayxr-cli camera allow --self` or `camera trust --self` grants it)";
+	case XRT_ERROR_STEREO_CAMERA_DISABLED:
+		return " = DISABLED (camera sharing is off: tray toggle or DXR_STEREO_CAMERA=0)";
+	case XRT_ERROR_STEREO_CAMERA_BUSY: return " = BUSY (the source cannot be opened right now; retry)";
+	case XRT_ERROR_STEREO_CAMERA_STREAM_ENDED:
+		return " = STREAM_ENDED (the service ended this stream: user stop / sharing off)";
 	case XRT_ERROR_FEATURE_NOT_SUPPORTED: return " = FEATURE_NOT_SUPPORTED";
 	case XRT_ERROR_INPUT_UNSUPPORTED: return " = INPUT_UNSUPPORTED (bad id / format / output)";
 	case XRT_ERROR_CLIENT_LIMIT_REACHED: return " = LIMIT_REACHED (8 streams per camera)";
@@ -139,12 +164,24 @@ result_hint(xrt_result_t x)
 	}
 }
 
+//! Exit code for a refused start, so a script can tell the refusals apart.
+static int
+refusal_exit_code(xrt_result_t x)
+{
+	switch (x) {
+	case XRT_ERROR_STEREO_CAMERA_CONSENT_REFUSED: return 4;
+	case XRT_ERROR_STEREO_CAMERA_DISABLED: return 6;
+	case XRT_ERROR_STEREO_CAMERA_BUSY: return 7;
+	default: return 2;
+	}
+}
+
 static bool
-cam_connect(struct ipc_connection *ipc_c)
+cam_connect(struct ipc_connection *ipc_c, uint32_t client_class)
 {
 	struct xrt_instance_info ii = {0};
 	snprintf(ii.app_info.application_name, sizeof(ii.app_info.application_name), "%s", "displayxr-cli");
-	ii.app_info.declared_client_class = XRT_CLIENT_CLASS_DIAG;
+	ii.app_info.declared_client_class = client_class;
 	xrt_result_t xret = ipc_client_connection_init(ipc_c, U_LOGGING_ERROR, &ii);
 	if (xret != XRT_SUCCESS) {
 		printf("displayxr-cli camera: not connected to the service (xrt_result=%d).\n", (int)xret);
@@ -227,7 +264,7 @@ cmd_calib(struct ipc_connection *ipc_c, uint64_t id, uint32_t output, bool json)
 	if (xret != XRT_SUCCESS) {
 		printf("stereo_camera_get_calibration(%llu) failed: %d%s\n", (unsigned long long)id, (int)xret,
 		       result_hint(xret));
-		return 2;
+		return refusal_exit_code(xret);
 	}
 	if (json) {
 		printf("{\"output\": \"%s\", \"baselineMm\": %.3f, \"eyes\": [",
@@ -658,7 +695,7 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 	if (xret != XRT_SUCCESS) {
 		printf("stream start failed: %d%s\n", (int)xret, result_hint(xret));
 		ipc_client_stereo_camera_stream_destroy(ipc_c, sid);
-		return 2;
+		return refusal_exit_code(xret);
 	}
 	struct xrt_stereo_camera_stream_layout lay;
 	xrt_shmem_handle_t section;
@@ -692,18 +729,52 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 	int64_t deadline = seconds > 0.0f ? t_start + (int64_t)(seconds * 1e9) : t_start + 60ll * 1000000000;
 	int got = 0, wakes = 0, not_ready = 0;
 	bool rows_ok = true;
+	bool ended = false;
+	int events = 0;
 	uint64_t first_index = 0, last_index = 0, gaps = 0;
 	int64_t t_first = 0, t_last = 0;
 	struct xrt_stereo_camera_frame_info last;
 	memset(&last, 0, sizeof(last));
-	while ((seconds > 0.0f || got < frames) && os_monotonic_get_ns() < deadline) {
-		if (!wait_wake(wake, 1000)) {
+	while ((seconds > 0.0f || got < frames) && os_monotonic_get_ns() < deadline && !ended) {
+		// R3: the service's events (state changes, a stream it ended) are
+		// polled like xrPollEvent would; printed with the time since start.
+		for (;;) {
+			bool has = false;
+			struct xrt_stereo_camera_event ev;
+			if (ipc_client_stereo_camera_poll_event(ipc_c, &has, &ev) != XRT_SUCCESS || !has) {
+				break;
+			}
+			events++;
+			double t = (double)(os_monotonic_get_ns() - t_start) * 1e-9;
+			if (ev.kind == XRT_STEREO_CAMERA_EVENT_CAMERA_STATE) {
+				printf("[%6.2f s] event: camera %llu state -> %s\n", t, (unsigned long long)ev.camera_id,
+				       state_str(ev.value));
+			} else if (ev.kind == XRT_STEREO_CAMERA_EVENT_STREAM_ENDED) {
+				printf("[%6.2f s] event: stream %llu ENDED by the service (reason %u = %s)\n", t,
+				       (unsigned long long)ev.stream_id, ev.value,
+				       ev.value == XRT_STEREO_CAMERA_END_USER_STOPPED ? "USER_STOPPED"
+				       : ev.value == XRT_STEREO_CAMERA_END_DISABLED  ? "DISABLED"
+				                                                     : "SOURCE_LOST");
+				ended = ended || ev.stream_id == sid;
+			} else {
+				printf("[%6.2f s] event: cameras changed\n", t);
+			}
+		}
+		if (ended) {
+			break;
+		}
+		if (!wait_wake(wake, 250)) {
 			continue;
 		}
 		wakes++;
 		bool ready = false;
 		struct xrt_stereo_camera_frame_info fi;
 		xret = ipc_client_stereo_camera_acquire(ipc_c, sid, &ready, &fi);
+		if (xret == XRT_ERROR_STEREO_CAMERA_STREAM_ENDED) {
+			printf("acquire: %d%s\n", (int)xret, result_hint(xret));
+			ended = true;
+			continue; // drain the ENDED event on the next pass
+		}
 		if (xret != XRT_SUCCESS) {
 			printf("acquire failed: %d%s\n", (int)xret, result_hint(xret));
 			break;
@@ -724,13 +795,35 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 		last = fi;
 		got++;
 	}
+	// One last drain: a stream the service ended queued its STREAM_ENDED event
+	// behind the acquire that reported it.
+	for (;;) {
+		bool has = false;
+		struct xrt_stereo_camera_event ev;
+		if (ipc_client_stereo_camera_poll_event(ipc_c, &has, &ev) != XRT_SUCCESS || !has) {
+			break;
+		}
+		events++;
+		double t = (double)(os_monotonic_get_ns() - t_start) * 1e-9;
+		if (ev.kind == XRT_STEREO_CAMERA_EVENT_STREAM_ENDED) {
+			printf("[%6.2f s] event: stream %llu ENDED by the service (reason %u = %s)\n", t,
+			       (unsigned long long)ev.stream_id, ev.value,
+			       ev.value == XRT_STEREO_CAMERA_END_USER_STOPPED ? "USER_STOPPED"
+			       : ev.value == XRT_STEREO_CAMERA_END_DISABLED  ? "DISABLED"
+			                                                     : "SOURCE_LOST");
+			ended = ended || ev.stream_id == sid;
+		} else if (ev.kind == XRT_STEREO_CAMERA_EVENT_CAMERA_STATE) {
+			printf("[%6.2f s] event: camera %llu state -> %s\n", t, (unsigned long long)ev.camera_id,
+			       state_str(ev.value));
+		}
+	}
 	double span = (double)(t_last - t_first) * 1e-9;
 	double rate = (got > 1 && span > 0.0) ? (got - 1) / span : 0.0;
 	printf(
 	    "received %d frames (index %llu..%llu, %llu source frames not delivered to this stream), %d wakes, "
-	    "%d not-ready\n",
+	    "%d not-ready, %d event(s)%s\n",
 	    got, (unsigned long long)first_index, (unsigned long long)last_index, (unsigned long long)gaps, wakes,
-	    not_ready);
+	    not_ready, events, ended ? " — STREAM ENDED BY THE SERVICE" : "");
 	printf("measured delivery rate: %.2f Hz over %.2f s\n", rate, span);
 
 	if (got > 0) {
@@ -876,8 +969,11 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 	close_wake(wake);
 	ipc_client_stereo_camera_stream_stop(ipc_c, sid);
 	ipc_client_stereo_camera_stream_destroy(ipc_c, sid);
+	if (ended) {
+		return 8; // the service ended the stream (user stop / sharing off)
+	}
 	if (got == 0) {
-		return 4;
+		return 9;
 	}
 	if (require_rectified) {
 		if (last.output != XRT_STEREO_CAMERA_OUTPUT_RECTIFIED) {
@@ -895,13 +991,214 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 	return 0;
 }
 
+
+/*
+ *
+ * R3: consent store (local) and control ops (IPC, DIAG).
+ *
+ */
+
+//! Absolute path of this executable — what the service sees as the peer.
+static bool
+self_exe_path(char *out, size_t cap)
+{
+	out[0] = '\0';
+#if defined(XRT_OS_WINDOWS)
+	wchar_t w[1024];
+	DWORD n = GetModuleFileNameW(NULL, w, (DWORD)(sizeof(w) / sizeof(w[0])));
+	if (n == 0) {
+		return false;
+	}
+	int m = WideCharToMultiByte(CP_UTF8, 0, w, (int)n, out, (int)cap - 1, NULL, NULL);
+	if (m <= 0) {
+		return false;
+	}
+	out[m] = '\0';
+	return true;
+#elif defined(XRT_OS_MACOS)
+	char tmp[1024];
+	uint32_t sz = sizeof(tmp);
+	if (_NSGetExecutablePath(tmp, &sz) != 0) {
+		return false;
+	}
+	// proc_pidpath (what the service uses) returns the resolved path.
+	return realpath(tmp, out) != NULL || snprintf(out, cap, "%s", tmp) > 0;
+#else
+	ssize_t n = readlink("/proc/self/exe", out, cap - 1);
+	if (n <= 0) {
+		return false;
+	}
+	out[n] = '\0';
+	return true;
+#endif
+}
+
+//! "<exe>" or "--self" -> the path to act on.
+static bool
+resolve_exe_arg(int argc, const char **argv, int idx, char *out, size_t cap)
+{
+	if (idx >= argc) {
+		return false;
+	}
+	if (strcmp(argv[idx], "--self") == 0) {
+		return self_exe_path(out, cap);
+	}
+	snprintf(out, cap, "%s", argv[idx]);
+	return out[0] != '\0';
+}
+
+static void
+consent_list_cb(void *ctx, char kind, const char *exe, const char *value)
+{
+	(void)ctx;
+	switch (kind) {
+	case 's': printf("  sharing:      %s\n", value); break;
+	case 'a': printf("  app %-6s    %s\n", value, exe); break;
+	case 'd': printf("  delegating    %s  (%s list)\n", exe, value); break;
+	default: break;
+	}
+}
+
+static int
+cmd_consent(void)
+{
+	char path[1024];
+	if (u_camera_consent_store_path(path, sizeof(path))) {
+		printf("stereo camera consent store: %s\n", path);
+	}
+	u_camera_consent_store_list(consent_list_cb, NULL);
+	char self[1024];
+	if (self_exe_path(self, sizeof(self))) {
+		printf("  (this CLI: %s)\n", self);
+	}
+	return 0;
+}
+
+static int
+cmd_store(const char *op, int argc, const char **argv)
+{
+	char exe[1024];
+	if (!resolve_exe_arg(argc, argv, 3, exe, sizeof(exe))) {
+		printf("usage: displayxr-cli camera %s <exe>|--self\n", op);
+		return 1;
+	}
+	const struct u_camera_consent_store_ops *st = u_camera_consent_store_default();
+	bool ok;
+	if (strcmp(op, "allow") == 0) {
+		ok = st->set(NULL, exe, U_CAMERA_CONSENT_STORED_ALLOW);
+	} else if (strcmp(op, "deny") == 0) {
+		ok = st->set(NULL, exe, U_CAMERA_CONSENT_STORED_DENY);
+	} else if (strcmp(op, "revoke") == 0) {
+		ok = st->set(NULL, exe, U_CAMERA_CONSENT_STORED_NONE);
+	} else if (strcmp(op, "trust") == 0) {
+		ok = u_camera_consent_store_set_delegating(exe, true);
+	} else { // untrust
+		ok = u_camera_consent_store_set_delegating(exe, false);
+	}
+	printf("%s %s: %s\n", op, exe, ok ? "ok (takes effect on the next stream start)" : "FAILED to write the store");
+	return ok ? 0 : 2;
+}
+
+static int
+cmd_control(uint32_t op, uint32_t arg, const char *what)
+{
+	struct ipc_connection ipc_c = {0};
+	if (!cam_connect(&ipc_c, XRT_CLIENT_CLASS_DIAG)) {
+		return 2;
+	}
+	uint32_t value = 0;
+	xrt_result_t xret = ipc_client_stereo_camera_control(&ipc_c, op, arg, &value);
+	if (xret != XRT_SUCCESS) {
+		printf("%s failed: %d%s\n", what, (int)xret, result_hint(xret));
+	} else if (op == XRT_STEREO_CAMERA_CONTROL_STATUS) {
+		printf("stereo camera: sharing %s, session %s, %u started stream(s)\n", (value & 1u) ? "on" : "OFF",
+		       (value & 2u) ? "LOCKED" : "unlocked", (value >> 8) & 0xffu);
+	} else if (op == XRT_STEREO_CAMERA_CONTROL_STOP_ALL) {
+		printf("%s: %u stream(s) ended\n", what, value);
+	} else {
+		printf("%s: ok\n", what);
+	}
+	ipc_client_connection_fini(&ipc_c);
+	return xret == XRT_SUCCESS ? 0 : 2;
+}
+
+static bool
+on_off_arg(int argc, const char **argv, int idx, uint32_t *out)
+{
+	if (idx >= argc) {
+		return false;
+	}
+	if (strcmp(argv[idx], "on") == 0 || strcmp(argv[idx], "1") == 0) {
+		*out = 1;
+		return true;
+	}
+	if (strcmp(argv[idx], "off") == 0 || strcmp(argv[idx], "0") == 0) {
+		*out = 0;
+		return true;
+	}
+	return false;
+}
+
+static void
+usage(void)
+{
+	printf(
+	    "usage: displayxr-cli camera list [--json] | calib <id> [--raw|--rectified] [--json] |\n"
+	    "       probe [<id>] [--raw|--rectified] [--format gray8|nv12|bgra8] [--fps F] [--frames N] "
+	    "[--seconds S] "
+	    "[--out DIR]\n"
+	    "             [--max-disparity N] [--max-dy N (24)] [--min-ncc C (0.90)]\n"
+	    "       consent                      list the consent store\n"
+	    "       allow|deny|revoke <exe>|--self   stored per-app decision (local)\n"
+	    "       trust|untrust <exe>|--self       user-level consent-delegating list (local)\n"
+	    "       status | stop-all | sharing on|off | fake-lock on|off   (over IPC, DIAG)\n"
+	    "exit codes: 4 consent refused, 6 sharing off, 7 busy, 8 ended by the service, 5 rows misaligned\n");
+}
+
 int
 cli_cmd_camera(int argc, const char **argv)
 {
 	const char *sub = argc >= 3 ? argv[2] : "list";
 	bool json = cli_has_flag(argc, argv, "--json");
+
+	// Local store edits: no service needed.
+	if (strcmp(sub, "consent") == 0) {
+		return cmd_consent();
+	}
+	if (strcmp(sub, "allow") == 0 || strcmp(sub, "deny") == 0 || strcmp(sub, "revoke") == 0 ||
+	    strcmp(sub, "trust") == 0 || strcmp(sub, "untrust") == 0) {
+		return cmd_store(sub, argc, argv);
+	}
+	// Control ops: DIAG class over IPC.
+	uint32_t onoff = 0;
+	if (strcmp(sub, "status") == 0) {
+		return cmd_control(XRT_STEREO_CAMERA_CONTROL_STATUS, 0, "status");
+	}
+	if (strcmp(sub, "stop-all") == 0) {
+		return cmd_control(XRT_STEREO_CAMERA_CONTROL_STOP_ALL, 0, "stop-all");
+	}
+	if (strcmp(sub, "sharing") == 0) {
+		if (!on_off_arg(argc, argv, 3, &onoff)) {
+			usage();
+			return 1;
+		}
+		return cmd_control(XRT_STEREO_CAMERA_CONTROL_SET_SHARING, onoff, onoff ? "sharing on" : "sharing off");
+	}
+	if (strcmp(sub, "fake-lock") == 0) {
+		if (!on_off_arg(argc, argv, 3, &onoff)) {
+			usage();
+			return 1;
+		}
+		return cmd_control(XRT_STEREO_CAMERA_CONTROL_SET_LOCKED, onoff, onoff ? "fake-lock on" : "fake-lock off");
+	}
+	if (strcmp(sub, "list") != 0 && strcmp(sub, "calib") != 0 && strcmp(sub, "probe") != 0) {
+		usage();
+		return 1;
+	}
+
+	// The consumer path: the same class a browser's capture utility declares.
 	struct ipc_connection ipc_c = {0};
-	if (!cam_connect(&ipc_c)) {
+	if (!cam_connect(&ipc_c, XRT_CLIENT_CLASS_CAMERA_CONSUMER)) {
 		return 2;
 	}
 	int ret;
@@ -914,12 +1211,7 @@ cli_cmd_camera(int argc, const char **argv)
 	} else if (strcmp(sub, "probe") == 0) {
 		ret = cmd_probe(&ipc_c, argc, argv);
 	} else {
-		printf(
-		    "usage: displayxr-cli camera list [--json] | calib <id> [--raw|--rectified] [--json] |\n"
-		    "       probe [<id>] [--raw|--rectified] [--format gray8|nv12|bgra8] [--fps F] [--frames N] "
-		    "[--seconds S] "
-		    "[--out DIR]\n"
-		    "             [--max-disparity N] [--max-dy N (24)] [--min-ncc C (0.90)]\n");
+		usage();
 		ret = 1;
 	}
 	ipc_client_connection_fini(&ipc_c);
