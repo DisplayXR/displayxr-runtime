@@ -242,7 +242,23 @@ if [ "$SIGNED" = yes ]; then
   EXE=$(gh release view "$TAG" -R DisplayXR/displayxr-installer --json assets \
          --jq '.assets[].name | select(startswith("DisplayXRBundle-") and endswith(".exe"))')
   [ -n "$EXE" ] || { echo "No DisplayXRBundle-*.exe on $TAG — cannot sign"; exit 1; }
-  gh release download "$TAG" -R DisplayXR/displayxr-installer -p "$EXE" -D "$D/in"
+  # PROVE the download is whole before signing it. On a slow link `gh release download`
+  # can stop early and still leave a file behind; signing and re-uploading that file then
+  # REPLACES a good release asset with a truncated installer. (Bundle v2.5.8, 2026-10-03:
+  # 26.77 of 63.95 MB was signed and shipped, and the live .exe was broken for ~20 min.)
+  ORIG=$(gh release view "$TAG" -R DisplayXR/displayxr-installer --json assets \
+          --jq ".assets[] | select(.name==\"$EXE\") | .size")
+  for i in 1 2 3 4; do
+    rm -rf "$D/in"
+    gh release download "$TAG" -R DisplayXR/displayxr-installer -p "$EXE" -D "$D/in" && \
+      HAVE=$(stat -f%z "$D/in/$EXE" 2>/dev/null || stat -c%s "$D/in/$EXE")
+    [ -n "$ORIG" ] && [ "$HAVE" = "$ORIG" ] && break
+    echo "download attempt $i: got ${HAVE:-nothing}, release asset is $ORIG bytes — retrying"; HAVE=""; sleep $((i*15))
+  done
+  [ -n "$HAVE" ] && [ "$HAVE" = "$ORIG" ] || { echo "ERROR: could not download the whole $EXE ($HAVE vs $ORIG) — NOT signing; the release keeps its CI asset."; SIGNED=no; }
+fi
+
+if [ "$SIGNED" = yes ]; then
 
   # Zip the finished .exe and hand it to the provider's folder-sign workflow.
   # portable zip: git-bash on Windows has no `zip` — fall back to PowerShell.
@@ -277,6 +293,11 @@ if [ "$SIGNED" = yes ]; then
     # the suffixed path fails the upload guard, and the UNSIGNED CI bundle silently stays
     # published (bit v2.0.15 for real). Test the path / use find instead.
     SIGNED_EXE="$D/signed/$EXE"; [ -f "$SIGNED_EXE" ] || SIGNED_EXE=$(find "$D/out" -type f -name "$EXE" 2>/dev/null | head -1)
+    # A signature only ADDS bytes. A "signed" file no bigger than the original means the
+    # wrong or truncated input went through the signer — never upload it over the release.
+    if [ -n "$SIGNED_EXE" ] && [ "$(stat -f%z "$SIGNED_EXE" 2>/dev/null || stat -c%s "$SIGNED_EXE")" -le "$ORIG" ]; then
+      echo "ERROR: signed $EXE is not larger than the original ($ORIG bytes) — not uploading."; SIGNED_EXE=""
+    fi
     if [ -n "$SIGNED_EXE" ]; then
       # `--clobber` DELETES the CI asset first, then uploads. On a flaky link the delete
       # succeeds and the 60 MB upload dies (TLS timeout) — the release is then .exe-LESS
