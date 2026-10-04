@@ -1193,6 +1193,15 @@ void
 comp_d3d11_service_weave_set_overlay_unchanged(struct xrt_compositor *xc, bool overlay_unchanged);
 
 /*!
+ * XR_DXR_weave v15 (XrWeaveSubmitOverlayFilterDXR): the lens-filter strength
+ * the NEXT @ref comp_d3d11_service_weave_submit asks for its overlay, [0,1];
+ * negative = the display processor's own default. Per submit: consumed and
+ * reset by the submit, same pattern as the v14 setter above.
+ */
+void
+comp_d3d11_service_weave_set_overlay_filter_strength(struct xrt_compositor *xc, float strength);
+
+/*!
  * Export the persistent server-allocated weaved-output texture handle (+ dims)
  * for the caller to import once and present each frame. Returns false until the
  * first successful @ref comp_d3d11_service_weave_submit has allocated it.

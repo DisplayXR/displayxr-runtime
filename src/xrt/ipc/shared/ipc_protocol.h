@@ -913,6 +913,11 @@ struct ipc_arg_weave_submit
 	//! Amendment). Advisory; 0 = may have changed (pre-v14 behaviour). Appended:
 	//! 828 + 4 = 832 B; the dma-buf call is 4 + 832 + 136 = 972 of 1024.
 	uint32_t overlay_unchanged;
+
+	//! XR_DXR_weave v15 (XrWeaveSubmitOverlayFilterDXR): the caller's lens-filter
+	//! strength for the overlay, [0,1]; NEGATIVE = not set (the DP's own default).
+	//! Appended: 832 + 4 = 836 B; the dma-buf call is 4 + 836 + 136 = 976 of 1024.
+	float overlay_filter_strength;
 };
 
 /*!

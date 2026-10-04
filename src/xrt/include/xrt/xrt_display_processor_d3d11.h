@@ -736,6 +736,26 @@ struct xrt_display_processor_d3d11
 	                       uint32_t height,
 	                       enum xrt_atlas_encoding encoding,
 	                       bool layer_unchanged);
+
+	/*!
+	 * Lens-filter strength for the 2D over-layer of the NEXT @ref process_atlas
+	 * (XR_DXR_weave v15, ADR-027 Amendment). A DP that band-limits the layer
+	 * for its lens trades aliasing against softness; @p strength picks the
+	 * point: 0 = no lens filtering, 1 = the DP's full filter. NEGATIVE = the
+	 * DP's own default (a vendor-tuned value; the caller did not set one).
+	 *
+	 * Stateless, per frame: called right before @ref set_overlay_2d whenever an
+	 * overlay goes to the DP, so a DP that keeps the value sticky must take it
+	 * from here every frame. Separate from set_overlay_2d because that slot
+	 * shipped (v2.25.2) and its signature is frozen (ADR-020).
+	 *
+	 * Optional — absent slot or NULL ⟹ the DP's default is used. Appended per
+	 * ADR-020 (append-only within a major).
+	 *
+	 * @param xdp       Pointer to self.
+	 * @param strength  [0,1], or negative for the DP's default.
+	 */
+	void (*set_overlay_2d_filter_strength)(struct xrt_display_processor_d3d11 *xdp, float strength);
 };
 
 
@@ -817,7 +837,8 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, lift_stream_destr
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, lift_convert)           == XRT_DP_D3D11_BASE_OFF + 28 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, lift_convert_blob)      == XRT_DP_D3D11_BASE_OFF + 29 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_overlay_2d)         == XRT_DP_D3D11_BASE_OFF + 30 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                                == XRT_DP_D3D11_BASE_OFF + 31 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_overlay_2d_filter_strength) == XRT_DP_D3D11_BASE_OFF + 31 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                                == XRT_DP_D3D11_BASE_OFF + 32 * sizeof(void *), XRT_DP_ABI_MSG);
 
 /*!
  * Defined when this header carries the five lift slots (lift_get_caps,
@@ -863,6 +884,13 @@ XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                    
  * XRT_PLUGIN_API_VERSION_CURRENT bump (ADR-020).
  */
 #define XRT_DP_D3D11_HAS_OVERLAY_2D 1
+
+/*!
+ * Defined when this header carries the set_overlay_2d_filter_strength slot
+ * (XR_DXR_weave v15), so a plug-in built against an older runtime can
+ * #ifdef-guard its implementation. Purely additive (ADR-020).
+ */
+#define XRT_DP_D3D11_HAS_OVERLAY_2D_FILTER_STRENGTH 1
 
 // clang-format on
 
@@ -1395,6 +1423,23 @@ xrt_display_processor_d3d11_set_overlay_2d(struct xrt_display_processor_d3d11 *x
 		return false;
 	}
 	return xdp->set_overlay_2d(xdp, d3d11_context, overlay_srv, width, height, encoding, layer_unchanged);
+}
+
+/*!
+ * @copydoc xrt_display_processor_d3d11::set_overlay_2d_filter_strength
+ *
+ * Helper for calling through the function pointer; a no-op (the DP's default
+ * applies) when the slot is absent or NULL.
+ *
+ * @public @memberof xrt_display_processor_d3d11
+ */
+static inline void
+xrt_display_processor_d3d11_set_overlay_2d_filter_strength(struct xrt_display_processor_d3d11 *xdp, float strength)
+{
+	if (!XRT_DP_HAS_SLOT(xdp, set_overlay_2d_filter_strength) || xdp->set_overlay_2d_filter_strength == NULL) {
+		return;
+	}
+	xdp->set_overlay_2d_filter_strength(xdp, strength);
 }
 
 //! True when @p xdp also carries lift_convert_blob (GAUSSIANS).

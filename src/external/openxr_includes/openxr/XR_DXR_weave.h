@@ -198,6 +198,12 @@
  * back verbatim), so a present-owner can tag its own Wayland commit for
  * move-synchronised drag.
  *
+ * Overlay filter strength (SPEC_VERSION 15). XrWeaveSubmitOverlayFilterDXR, chained
+ * next to an XrWeaveSubmitOverlaysDXR: how strongly a display processor that
+ * band-limits the 2D layer for its lens filters it, 0..1 (0 = no lens filtering,
+ * 1 = the full lens cell). Absent = the display processor's own default, which
+ * is what a caller that does not know better should use.
+ *
  * Overlay unchanged (SPEC_VERSION 14). XrWeaveSubmitOverlayUnchangedDXR, chained
  * on XrWeaveSubmitInfoDXR next to an XrWeaveSubmitOverlaysDXR: the caller declares
  * that this submit's overlay atlas holds exactly the pixels of the previous
@@ -275,7 +281,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_weave 1
-#define XR_DXR_weave_SPEC_VERSION 14
+#define XR_DXR_weave_SPEC_VERSION 15
 #define XR_DXR_WEAVE_EXTENSION_NAME "XR_DXR_weave"
 
 // Reserved 1004999190..199. Final values reconcile with the Khronos registry
@@ -314,6 +320,8 @@ extern "C" {
 // Reserved 1004999290..299 — the third weave decade (240..249 is full). Same registry.
 // Spec v14 (ADR-027 Amendment): the overlay atlas is unchanged since the last submit.
 #define XR_TYPE_WEAVE_SUBMIT_OVERLAY_UNCHANGED_DXR ((XrStructureType)1004999290)
+// Spec v15 (ADR-027 Amendment): the caller's lens-filter strength for the 2D layer.
+#define XR_TYPE_WEAVE_SUBMIT_OVERLAY_FILTER_DXR    ((XrStructureType)1004999291)
 
 //! Upper bound on eye positions carried by XrWeaveSubmitInfoDXR (mirrors the
 //! runtime's XRT_MAX_VIEWS). Phase 1: carried but unused.
@@ -1037,6 +1045,33 @@ typedef struct XrWeaveSubmitOverlayUnchangedDXR {
     const void* XR_MAY_ALIAS next;
     XrBool32                 overlayUnchanged; //!< XR_TRUE: same overlay pixels as the previous accepted submit
 } XrWeaveSubmitOverlayUnchangedDXR;
+
+/*!
+ * @brief Lens-filter strength for the v4 overlay atlas (spec v15).
+ *
+ * Chain onto XrWeaveSubmitInfoDXR::next, in the same submit as an
+ * XrWeaveSubmitOverlaysDXR. A display processor that band-limits the 2D layer
+ * for its lens (ADR-027 Amendment) trades aliasing against softness; this sets
+ * where on that curve THIS submit sits:
+ *
+ *   0.0 — no lens filtering (the layer is composited as-is: sharpest, aliases)
+ *   1.0 — the display processor's full anti-aliasing filter (softest)
+ *
+ * Omitting the struct selects the DISPLAY PROCESSOR's default, a vendor-tuned
+ * value chosen by eye on its panel (Leia SR ships 0.6). That is the right choice
+ * for a caller that does not know its content better; set it only to tune for
+ * known content (text/UI wants more filtering, photos/video can take less).
+ *
+ * Per submit, no latch. @c filterStrength outside [0,1] or NaN is
+ * XR_ERROR_VALIDATION_FAILURE. A display processor without a strength control
+ * ignores it, as does a pre-v15 runtime (unknown chained struct) — both behave
+ * as the default, so no version gate is needed to send it.
+ */
+typedef struct XrWeaveSubmitOverlayFilterDXR {
+    XrStructureType          type;           //!< XR_TYPE_WEAVE_SUBMIT_OVERLAY_FILTER_DXR
+    const void* XR_MAY_ALIAS next;
+    float                    filterStrength; //!< 0 = no lens filtering .. 1 = full; omit = DP default
+} XrWeaveSubmitOverlayFilterDXR;
 
 typedef XrResult (XRAPI_PTR *PFN_xrWeaveBindWindowDXR)(
     XrSession session, void* windowHandle);

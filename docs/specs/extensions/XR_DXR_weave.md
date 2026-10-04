@@ -233,6 +233,28 @@ typedef struct XrWeaveSubmitOverlayUnchangedDXR {
 - D3D11 service path today (`set_overlay_2d(..., layer_unchanged)`); the Vulkan weave engines
   accept and ignore it until their DP slot exists.
 
+### Filter strength (v15)
+
+The lens filter trades aliasing against softness, and the best point depends on the content
+(text and UI want more filtering, photos and video less). `XrWeaveSubmitOverlayFilterDXR`
+(1004999291), chained next to the overlay, sets it per submit:
+
+```c
+typedef struct XrWeaveSubmitOverlayFilterDXR {
+    XrStructureType          type;           // XR_TYPE_WEAVE_SUBMIT_OVERLAY_FILTER_DXR
+    const void*              next;
+    float                    filterStrength; // 0 = no lens filtering .. 1 = the DP's full filter
+} XrWeaveSubmitOverlayFilterDXR;
+```
+
+- **Omit it unless you know your content.** Omitted = the display processor's own default, a
+  vendor value tuned by eye on its panel (Leia SR: 0.6). The runtime passes "not set", never a
+  number of its own.
+- `filterStrength` outside [0,1] or NaN is `XR_ERROR_VALIDATION_FAILURE`.
+- Per submit, no latch. Carried to the DP by the appended D3D11 slot
+  `set_overlay_2d_filter_strength` (negative = default), called before `set_overlay_2d` each
+  frame the layer goes to the DP.
+
 
 
 Each submit carries a fixed cost independent of the rect area: the runtime IPC round-trip,
@@ -882,7 +904,11 @@ any unknown chained struct. One `weave(v13)` WARN in the service log per edge.
 | 11 | `xrWeaveSnapWindowGridDXR` + `XrWeaveSnapGridInfoDXR` / `XrWeaveSnapGridPointDXR` — bulk grid snap: the per-point snap evaluated over a grid by the runtime, one call (one IPC round trip) instead of one per point (§5c, #1723). |
 | 12 | `XrWeaveOutputOriginDXR` (out, per frame: the origin each woven output was woven for + a serial) and `XrWeaveWindowLogicalOriginDXR` (in: the caller's logical origin + scale, echoed verbatim) — so a present-owner can tag its own Wayland commit for move-synchronised drag (§5e, browser-pvt#180). |
 | 13 | `XrWeaveSubmitMonoIn2DDXR` — one flat view (stereo: the left view; N > 2: the view nearest the display axis) instead of the weave while the session's hardware state is 2D (§5f). Desktop Linux; accepted and ignored elsewhere. |
+| 15 | `XrWeaveSubmitOverlayFilterDXR` — the caller's lens-filter strength for the 2D overlay, 0..1; omitted = the DP's own default (§2d). |
 | 14 | `XrWeaveSubmitOverlayUnchangedDXR` — the v4 overlay atlas holds the previous accepted submit's pixels, so a DP may reuse its lens prefilter of the 2D layer (ADR-027 Amendment; §2d). |
+
+**v15 needs no gate either**: omitting the struct, or a runtime/DP that predates it, means
+the display processor's default strength.
 
 **v14 needs no gate**: a pre-v14 runtime skips the unknown struct, which is the "may have
 changed" behaviour, so a caller can always send it.
