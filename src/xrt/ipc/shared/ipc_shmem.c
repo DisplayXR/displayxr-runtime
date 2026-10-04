@@ -13,6 +13,8 @@
 
 #include "shared/ipc_shmem.h"
 
+#include <stdio.h>
+
 #if defined(XRT_OS_UNIX)
 #include <sys/mman.h>
 #include <unistd.h>
@@ -49,6 +51,29 @@ ipc_shmem_create(size_t size, xrt_shmem_handle_t *out_handle, void **out_map)
 	return XRT_SUCCESS;
 }
 
+xrt_result_t
+ipc_shmem_create_with_readonly(size_t size,
+                               xrt_shmem_handle_t *out_handle,
+                               void **out_map,
+                               xrt_shmem_handle_t *out_ro)
+{
+	*out_ro = -1;
+	xrt_result_t result = ipc_shmem_create(size, out_handle, out_map);
+	if (result != XRT_SUCCESS) {
+		return result;
+	}
+	int ro = dup(*out_handle);
+	if (ro < 0 || ASharedMemory_setProt(ro, PROT_READ) != 0) {
+		if (ro >= 0) {
+			close(ro);
+		}
+		ipc_shmem_destroy(out_handle, out_map, size);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	*out_ro = ro;
+	return XRT_SUCCESS;
+}
+
 #elif defined(XRT_OS_UNIX)
 
 #define MONADO_SHMEM_NAME "/displayxr_shm"
@@ -75,6 +100,46 @@ ipc_shmem_create(size_t size, xrt_shmem_handle_t *out_handle, void **out_map)
 	// Don't need the name entry anymore, we can share the FD.
 	shm_unlink(MONADO_SHMEM_NAME);
 	*out_handle = fd;
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_shmem_create_with_readonly(size_t size,
+                               xrt_shmem_handle_t *out_handle,
+                               void **out_map,
+                               xrt_shmem_handle_t *out_ro)
+{
+	*out_handle = -1;
+	*out_ro = -1;
+	// A unique name per call: the read-only fd must be opened by name before
+	// the name is unlinked, and two threads may be here at once.
+	static int counter = 0;
+	char name[48];
+	int id = __sync_fetch_and_add(&counter, 1);
+	snprintf(name, sizeof(name), "/dxr_shm_%d_%d", (int)getpid(), id);
+	int fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, S_IRUSR | S_IWUSR);
+	if (fd < 0) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	if (ftruncate(fd, (off_t)size) < 0) {
+		close(fd);
+		shm_unlink(name);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	int ro = shm_open(name, O_RDONLY, 0);
+	shm_unlink(name);
+	if (ro < 0) {
+		close(fd);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	xrt_result_t result = ipc_shmem_map(fd, size, out_map);
+	if (result != XRT_SUCCESS) {
+		close(fd);
+		close(ro);
+		return result;
+	}
+	*out_handle = fd;
+	*out_ro = ro;
 	return XRT_SUCCESS;
 }
 
@@ -136,6 +201,26 @@ ipc_shmem_create(size_t size, xrt_shmem_handle_t *out_handle, void **out_map)
 	return XRT_SUCCESS;
 }
 
+xrt_result_t
+ipc_shmem_create_with_readonly(size_t size,
+                               xrt_shmem_handle_t *out_handle,
+                               void **out_map,
+                               xrt_shmem_handle_t *out_ro)
+{
+	*out_ro = NULL;
+	xrt_result_t result = ipc_shmem_create(size, out_handle, out_map);
+	if (result != XRT_SUCCESS) {
+		return result;
+	}
+	HANDLE ro = NULL;
+	if (!DuplicateHandle(GetCurrentProcess(), *out_handle, GetCurrentProcess(), &ro, FILE_MAP_READ, FALSE, 0)) {
+		ipc_shmem_destroy(out_handle, out_map, size);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	*out_ro = ro;
+	return XRT_SUCCESS;
+}
+
 #else
 #error "OS not yet supported"
 #endif
@@ -156,6 +241,16 @@ ipc_shmem_destroy(xrt_shmem_handle_t *handle_ptr, void **map_ptr, size_t size)
 		return;
 	}
 	close(handle);
+	*handle_ptr = -1;
+}
+
+void
+ipc_shmem_close_handle(xrt_shmem_handle_t *handle_ptr)
+{
+	if (handle_ptr == NULL || *handle_ptr < 0) {
+		return;
+	}
+	close(*handle_ptr);
 	*handle_ptr = -1;
 }
 
@@ -196,6 +291,16 @@ ipc_shmem_destroy(xrt_shmem_handle_t *handle_ptr, void **map_ptr, size_t size)
 	}
 	xrt_shmem_handle_t handle = *handle_ptr;
 	CloseHandle(handle);
+	*handle_ptr = NULL;
+}
+
+void
+ipc_shmem_close_handle(xrt_shmem_handle_t *handle_ptr)
+{
+	if (handle_ptr == NULL || *handle_ptr == NULL) {
+		return;
+	}
+	CloseHandle(*handle_ptr);
 	*handle_ptr = NULL;
 }
 

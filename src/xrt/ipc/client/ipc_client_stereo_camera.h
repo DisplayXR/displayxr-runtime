@@ -78,6 +78,14 @@ ipc_client_stereo_camera_stats(struct ipc_connection *ipc_c,
  * The @ref xrt_stereo_camera_client aspect over @p ipc_c (which must outlive
  * it). Caller frees with free().
  */
+xrt_result_t
+ipc_client_stereo_camera_poll_event(struct ipc_connection *ipc_c,
+                                    bool *out_has,
+                                    struct xrt_stereo_camera_event *out_event);
+
+xrt_result_t
+ipc_client_stereo_camera_control(struct ipc_connection *ipc_c, uint32_t op, uint32_t arg, uint32_t *out_value);
+
 struct xrt_stereo_camera_client *
 ipc_client_stereo_camera_client_create(struct ipc_connection *ipc_c);
 

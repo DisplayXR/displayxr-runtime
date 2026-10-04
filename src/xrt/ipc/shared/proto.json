@@ -1282,5 +1282,22 @@
 		"out": [
 			{"name": "stats", "type": "struct xrt_stereo_camera_stream_stats"}
 		]
+	},
+
+	"stereo_camera_poll_event": {
+		"out": [
+			{"name": "has", "type": "bool"},
+			{"name": "event", "type": "struct xrt_stereo_camera_event"}
+		]
+	},
+
+	"stereo_camera_control": {
+		"in": [
+			{"name": "op", "type": "uint32_t"},
+			{"name": "arg", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "value", "type": "uint32_t"}
+		]
 	}
 }

@@ -4375,6 +4375,25 @@ struct oxr_stereo_camera_stream_dxr
 	uint64_t camera_id; //!< service-side camera id
 	bool started;
 };
+
+//! R3: drain the service's queued camera events into the instance queue (xrPollEvent).
+XrResult
+oxr_stereo_camera_poll_events(struct oxr_logger *log, struct oxr_instance *inst);
+
+XrResult
+oxr_event_push_XrEventDataStereoCameraStateChanged(struct oxr_logger *log,
+                                                   struct oxr_instance *inst,
+                                                   uint64_t cameraId,
+                                                   XrStereoCameraStateDXR state);
+
+XrResult
+oxr_event_push_XrEventDataStereoCameraStreamEnded(struct oxr_logger *log,
+                                                  struct oxr_instance *inst,
+                                                  XrStereoCameraStreamDXR stream,
+                                                  XrStereoCameraStreamEndReasonDXR reason);
+
+XrResult
+oxr_event_push_XrEventDataStereoCamerasChanged(struct oxr_logger *log, struct oxr_instance *inst);
 #endif // OXR_HAVE_DXR_stereo_camera
 
 

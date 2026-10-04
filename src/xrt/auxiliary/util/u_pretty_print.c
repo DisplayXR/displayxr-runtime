@@ -195,6 +195,10 @@ u_pp_xrt_result(struct u_pp_delegate dg, xrt_result_t xret)
 	case XRT_ERROR_WEAVE_REFUSED:                        DG("XRT_ERROR_WEAVE_REFUSED"); return;
 	case XRT_ERROR_IPC_VERSION_SKEW:                     DG("XRT_ERROR_IPC_VERSION_SKEW"); return;
 	case XRT_ERROR_INPUT_HOST_GEOMETRY_NOT_READY:        DG("XRT_ERROR_INPUT_HOST_GEOMETRY_NOT_READY"); return;
+	case XRT_ERROR_STEREO_CAMERA_CONSENT_REFUSED:        DG("XRT_ERROR_STEREO_CAMERA_CONSENT_REFUSED"); return;
+	case XRT_ERROR_STEREO_CAMERA_DISABLED:               DG("XRT_ERROR_STEREO_CAMERA_DISABLED"); return;
+	case XRT_ERROR_STEREO_CAMERA_BUSY:                   DG("XRT_ERROR_STEREO_CAMERA_BUSY"); return;
+	case XRT_ERROR_STEREO_CAMERA_STREAM_ENDED:           DG("XRT_ERROR_STEREO_CAMERA_STREAM_ENDED"); return;
 	case XRT_ERROR_NO_IMAGE_AVAILABLE:                   DG("XRT_ERROR_NO_IMAGE_AVAILABLE"); return;
 	case XRT_ERROR_VULKAN:                               DG("XRT_ERROR_VULKAN"); return;
 	case XRT_ERROR_OPENGL:                               DG("XRT_ERROR_OPENGL"); return;

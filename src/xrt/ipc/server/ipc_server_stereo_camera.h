@@ -21,6 +21,10 @@
 #pragma once
 
 #include "xrt/xrt_instance.h"
+#include "util/u_camera_consent.h"
+
+#include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -44,6 +48,61 @@ ipc_server_stereo_camera_destroy(struct ipc_server_stereo_camera **mgr_ptr);
 //! Destroy every stream @p ics created. Called once at client teardown.
 void
 ipc_server_client_stereo_camera_release(volatile struct ipc_client_state *ics);
+
+
+/*
+ *
+ * R3: what the service's UI (tray / menu-bar status item) and platform hooks
+ * use. All of these address the process's one manager and are safe from any
+ * thread; they take the manager lock themselves.
+ *
+ */
+
+/*!
+ * The consent prompt ("<app> wants to use the 3D camera — Allow / Allow once /
+ * Deny"). Called on an IPC client thread with no manager lock held; it must
+ * BLOCK until the user answers or @p timeout_ms elapses, and return the
+ * u_camera_consent_prompt_answer value (UNAVAILABLE when there is no UI).
+ */
+typedef enum u_camera_consent_prompt_answer (*ipc_server_stereo_camera_prompt_fn)(
+    void *ctx, const char *exe, const char *app_name, long pid, uint32_t timeout_ms);
+
+void
+ipc_server_stereo_camera_set_prompt_provider(ipc_server_stereo_camera_prompt_fn fn, void *ctx);
+
+//! Called (no lock held) whenever the in-use state may have changed.
+typedef void (*ipc_server_stereo_camera_indicator_fn)(void *ctx);
+
+void
+ipc_server_stereo_camera_set_indicator_provider(ipc_server_stereo_camera_indicator_fn fn, void *ctx);
+
+struct ipc_server_stereo_camera_status
+{
+	uint32_t camera_count;
+	uint32_t started_streams; //!< > 0 = "3D camera in use"
+	bool sharing_enabled;     //!< the user's persistent toggle
+	bool locked;              //!< OS session locked: every stream suspended
+	char consumers[256];      //!< "browser.exe, call-app.exe" (base names, de-duplicated)
+};
+
+//! false = no manager (service still starting).
+bool
+ipc_server_stereo_camera_get_status(struct ipc_server_stereo_camera_status *out);
+
+//! The user's "Stop camera sharing": ends every started stream now. Returns the count.
+uint32_t
+ipc_server_stereo_camera_stop_all(const char *why);
+
+//! The persistent "Share the 3D camera with apps" toggle (off ends every stream).
+bool
+ipc_server_stereo_camera_set_sharing(bool enabled, const char *why);
+
+//! Platform hook: the OS session is locked / switched away (true) or back (false).
+void
+ipc_server_stereo_camera_set_session_locked(bool locked, const char *why);
+
+bool
+ipc_server_stereo_camera_is_session_locked(void);
 
 #ifdef __cplusplus
 }

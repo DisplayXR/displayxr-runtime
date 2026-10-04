@@ -189,6 +189,48 @@ struct xrt_stereo_camera_stream_stats
 	uint32_t reserved;
 };
 
+//! What a delivered event is (R3).
+enum xrt_stereo_camera_event_kind
+{
+	XRT_STEREO_CAMERA_EVENT_CAMERA_STATE = 1,    //!< XrEventDataStereoCameraStateChangedDXR
+	XRT_STEREO_CAMERA_EVENT_STREAM_ENDED = 2,    //!< XrEventDataStereoCameraStreamEndedDXR
+	XRT_STEREO_CAMERA_EVENT_CAMERAS_CHANGED = 3, //!< XrEventDataStereoCamerasChangedDXR
+};
+
+//! Why the service ended a stream (= XrStereoCameraStreamEndReasonDXR).
+enum xrt_stereo_camera_end_reason
+{
+	XRT_STEREO_CAMERA_END_USER_STOPPED = 1,
+	XRT_STEREO_CAMERA_END_DISABLED = 2,
+	XRT_STEREO_CAMERA_END_SOURCE_LOST = 3,
+};
+
+/*!
+ * One queued event for a connection (R3). The service queues them per
+ * connection; the client drains them from xrPollEvent.
+ */
+struct xrt_stereo_camera_event
+{
+	uint32_t kind;  //!< enum xrt_stereo_camera_event_kind
+	uint32_t value; //!< CAMERA_STATE: the state; STREAM_ENDED: the reason
+	uint64_t camera_id;
+	uint64_t stream_id; //!< STREAM_ENDED only
+};
+
+//! `stereo_camera_control` ops (DIAG clients and the service's own UI only).
+enum xrt_stereo_camera_control_op
+{
+	//! End every started stream now (the tray's "Stop camera sharing").
+	XRT_STEREO_CAMERA_CONTROL_STOP_ALL = 1,
+	//! arg 0/1: the persistent "Share the 3D camera with apps" toggle.
+	XRT_STEREO_CAMERA_CONTROL_SET_SHARING = 2,
+	//! arg 0/1: simulate the OS session lock (diagnostics only; the real
+	//! lock comes from the platform notification).
+	XRT_STEREO_CAMERA_CONTROL_SET_LOCKED = 3,
+	//! out = bit 0 sharing on, bit 1 locked, bits 8..15 started streams.
+	XRT_STEREO_CAMERA_CONTROL_STATUS = 4,
+};
+
 /*!
  * Client aspect of an @ref xrt_instance: set by the IPC client instance only
  * (the camera's single owner is the service); NULL for an in-process instance,
@@ -225,6 +267,12 @@ struct xrt_stereo_camera_client
 	xrt_result_t (*stats)(struct xrt_stereo_camera_client *c,
 	                      uint64_t stream_id,
 	                      struct xrt_stereo_camera_stream_stats *out_stats);
+	//! R3: pop one queued event; @p out_has false = none pending.
+	xrt_result_t (*poll_event)(struct xrt_stereo_camera_client *c,
+	                           bool *out_has,
+	                           struct xrt_stereo_camera_event *out_event);
+	//! R3: enum xrt_stereo_camera_control_op (DIAG clients only).
+	xrt_result_t (*control)(struct xrt_stereo_camera_client *c, uint32_t op, uint32_t arg, uint32_t *out_value);
 };
 
 #ifdef __cplusplus

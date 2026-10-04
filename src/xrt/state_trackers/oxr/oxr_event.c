@@ -836,6 +836,79 @@ oxr_event_push_XrEventDataMCPToolCall(struct oxr_logger *log,
 }
 #endif // OXR_HAVE_DXR_mcp_tools
 
+#ifdef OXR_HAVE_DXR_stereo_camera
+XrResult
+oxr_event_push_XrEventDataStereoCameraStateChanged(struct oxr_logger *log,
+                                                   struct oxr_instance *inst,
+                                                   uint64_t cameraId,
+                                                   XrStereoCameraStateDXR state)
+{
+	XrEventDataStereoCameraStateChangedDXR *changed;
+	struct oxr_event *event = NULL;
+
+	ALLOC(log, inst, &event, &changed);
+
+	changed->type = XR_TYPE_EVENT_DATA_STEREO_CAMERA_STATE_CHANGED_DXR;
+	changed->next = NULL;
+	changed->cameraId = cameraId;
+	changed->state = state;
+	event->result = XR_SUCCESS;
+
+	U_LOG_I("OXR EVENT: Stereo camera %llu state -> %d", (unsigned long long)cameraId, (int)state);
+
+	lock(inst);
+	push(inst, event);
+	unlock(inst);
+
+	return XR_SUCCESS;
+}
+
+XrResult
+oxr_event_push_XrEventDataStereoCameraStreamEnded(struct oxr_logger *log,
+                                                  struct oxr_instance *inst,
+                                                  XrStereoCameraStreamDXR stream,
+                                                  XrStereoCameraStreamEndReasonDXR reason)
+{
+	XrEventDataStereoCameraStreamEndedDXR *ended;
+	struct oxr_event *event = NULL;
+
+	ALLOC(log, inst, &event, &ended);
+
+	ended->type = XR_TYPE_EVENT_DATA_STEREO_CAMERA_STREAM_ENDED_DXR;
+	ended->next = NULL;
+	ended->stream = stream;
+	ended->reason = reason;
+	event->result = XR_SUCCESS;
+
+	U_LOG_W("OXR EVENT: Stereo camera stream ended by the service (reason %d)", (int)reason);
+
+	lock(inst);
+	push(inst, event);
+	unlock(inst);
+
+	return XR_SUCCESS;
+}
+
+XrResult
+oxr_event_push_XrEventDataStereoCamerasChanged(struct oxr_logger *log, struct oxr_instance *inst)
+{
+	XrEventDataStereoCamerasChangedDXR *changed;
+	struct oxr_event *event = NULL;
+
+	ALLOC(log, inst, &event, &changed);
+
+	changed->type = XR_TYPE_EVENT_DATA_STEREO_CAMERAS_CHANGED_DXR;
+	changed->next = NULL;
+	event->result = XR_SUCCESS;
+
+	lock(inst);
+	push(inst, event);
+	unlock(inst);
+
+	return XR_SUCCESS;
+}
+#endif // OXR_HAVE_DXR_stereo_camera
+
 XrResult
 oxr_event_remove_session_events(struct oxr_logger *log, struct oxr_session *sess)
 {
@@ -900,6 +973,17 @@ oxr_poll_event(struct oxr_logger *log, struct oxr_instance *inst, XrEventDataBuf
 		}
 	}
 	os_mutex_unlock(&inst->sessions_mutex);
+
+#ifdef OXR_HAVE_DXR_stereo_camera
+	// ADR-043 R3: instance-level camera events (no session needed) ride the
+	// same queue; the service queued them per connection.
+	if (inst->extensions.DXR_stereo_camera) {
+		ret = oxr_stereo_camera_poll_events(log, inst);
+		if (ret != XR_SUCCESS) {
+			return ret;
+		}
+	}
+#endif
 
 	lock(inst);
 	struct oxr_event *event = pop(inst);
