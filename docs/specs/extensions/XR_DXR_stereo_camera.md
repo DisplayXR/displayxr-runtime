@@ -62,15 +62,31 @@ if (xrAcquireStereoCameraFrameDXR(stream, &f) == XR_SUCCESS) { /* f.slot is pinn
 | Service with a camera source | one entry per camera, with its `state` (§3) |
 | `DXR_STEREO_CAMERA=0` in the **service's** environment, or the user kill switch (§7.4) | count 0 — indistinguishable from "no camera", on purpose |
 
-**R1 dev gate.** Until the consent path (§7.1, R3) exists, the service refuses every
-`xrStartStereoCameraStreamDXR` and `xrGetStereoCameraCalibrationDXR` with
-`XR_ERROR_PERMISSION_INSUFFICIENT` **unless `DXR_STEREO_CAMERA_DEV_ALLOW=1` is set in the
-service's environment** — deny by default. Enumeration works without it (it reveals no
-calibration and no serial).
-
 Instance-level, not session-level: a capture component (a browser's video-capture service) has
 no compositor session and needs none. Calls travel on the instance's IPC connection; streams
 belong to that connection and die with it.
+
+### 2a. Declaring a camera-only client (spec v2, R3)
+
+A process that will only ever read a camera — a browser's video-capture utility, `displayxr-cli
+camera` — chains `XrStereoCameraClientInfoDXR` with
+`XR_STEREO_CAMERA_CLIENT_CONSUMER_ONLY_BIT_DXR` on `XrInstanceCreateInfo`:
+
+```c
+XrStereoCameraClientInfoDXR ci = {XR_TYPE_STEREO_CAMERA_CLIENT_INFO_DXR, NULL,
+                                  XR_STEREO_CAMERA_CLIENT_CONSUMER_ONLY_BIT_DXR};
+XrInstanceCreateInfo ii = {XR_TYPE_INSTANCE_CREATE_INFO, &ci, ...};   // enabledExtensionNames includes XR_DXR_stereo_camera
+```
+
+The service admits such an instance as the **`CAMERA_CONSUMER` client class** (quota 4): it may
+call only the camera entry points — `xrCreateSession` is refused with
+`XR_ERROR_PERMISSION_INSUFFICIENT` — and it is **not a panel owner**, so it never counts toward
+the `PRESENT_OWNER` quota even when its executable is the browser's (the quota counts distinct
+owner *executables*; a camera-only sibling of an admitted owner is simply not in the count). The
+declaration outranks the `XR_DXR_weave`-derived present-owner claim: a capture utility that
+enables both is still a camera consumer. A hybrid runtime always routes a declared consumer to
+the service (an in-process instance has no cameras). Without the declaration the instance is
+classed as before (APP, or PRESENT_OWNER when it enables `XR_DXR_weave`).
 
 ## 3. Enumerating cameras
 
@@ -316,14 +332,12 @@ When `SHARED_WITH_EYE_TRACKING` is set:
 
 ## 7. Privacy
 
-> **R1 status.** Only the hook points exist, all deny-by-default, in
-> `src/xrt/ipc/server/ipc_server_stereo_camera.c`: `authorise_locked()` (§7.1 — R1 allows only
-> with `DXR_STEREO_CAMERA_DEV_ALLOW=1` in the service environment), `client_visible_locked()`
-> (§7.2 — always true in R1), `output_allowed()` (RAW refused to `PRESENT_OWNER`, i.e. the
-> browser, per the R1 decision), the `DXR_STEREO_CAMERA=0` kill switch (§7.4), and one WARN per
-> stream start/stop naming the peer executable in place of the indicator (§7.3). `persistentId`
-> (§7.5) is an unkeyed 128-bit hash of (device identity, peer executable) in R1; R3 keys it with a
-> persisted per-user secret.
+> **R3 status: as built** (`src/xrt/ipc/server/ipc_server_stereo_camera.c`, policy in
+> `src/xrt/auxiliary/util/u_camera_consent.{h,c}` + the platform store
+> `u_camera_consent_store.c`, UI in `targets/service/service_tray_win.c` and
+> `ipc/server/ipc_server_macos_appkit.m`). Developer guide:
+> [`docs/guides/stereo-camera-consent.md`](../../guides/stereo-camera-consent.md). The vendor
+> plug-in never sees any of this.
 
 The frames bypass the OS camera stack (the tracker, not the consumer, opened the device), so OS
 camera permissions and in-use indicators do not see this consumer. The runtime therefore enforces
@@ -332,44 +346,88 @@ the equivalent itself. All checks are made on the **OS-derived peer** of the con
 [service-architecture §4.1a](../../architecture/service-architecture.md#41a-declared-peer-identity-for-a-brokered-connection-browser103-rc-1)),
 never on client-asserted fields.
 
-### 7.1 Authorisation (at `xrStartStereoCameraStreamDXR`)
+### 7.1 Authorisation (at `xrStartStereoCameraStreamDXR` and `xrGetStereoCameraCalibrationDXR`)
 
-| Check | Windows | Android |
+The decision tree, first hit wins, evaluated with the manager lock released and one evaluation
+at a time (so two apps never race two prompts):
+
+| # | Check | Outcome |
 |---|---|---|
-| OS camera privacy | the peer executable's webcam consent in `CapabilityAccessManager\ConsentStore\webcam` (global + per-app desktop entry) must not be Deny | the peer uid must hold `android.permission.CAMERA` (granted, not just declared) |
-| DisplayXR consent | the peer executable (path + Authenticode signer) is in the user's allow list (`HKCU\Software\DisplayXR\StereoCamera\Consent`), else the service raises a first-use prompt from its tray ("*App* wants to use the 3D camera — Allow / Deny"); a Deny is remembered | the runtime app's consent activity, first use per package |
-| Consent-delegating clients | a registered browser that shows its own per-origin permission prompt and in-use indicator (roadmap §B) is marked **delegating** at install time; the runtime's check is then per executable, the browser's per origin | same, per package |
+| 1 | Sharing off: `DXR_STEREO_CAMERA=0` in the service environment, or the user's **"Share the 3D camera with apps"** toggle (tray / menu bar, persisted in the store) | `XR_ERROR_STEREO_CAMERA_DISABLED_DXR` (and zero cameras enumerated) |
+| 2 | `DXR_STEREO_CAMERA_DEV_ALLOW=1` in the service environment — development override, one WARN per service run; **never** on a user's machine | allowed |
+| 3 | The peer executable could not be verified (`""`) | `XR_ERROR_STEREO_CAMERA_CONSENT_REFUSED_DXR` |
+| 4 | The executable is a registered **consent-delegating** client (a browser that shows its own per-origin prompt + in-use indicator): machine list written by its installer (`HKLM\Software\DisplayXR\CameraConsent\Delegating`, `/etc/displayxr/camera-delegating.json`, `/Library/Application Support/DisplayXR/camera-delegating.json`) or the user list (`displayxr-cli camera trust <exe>`) | allowed, no prompt, no store entry; never RAW (§7.5) |
+| 5 | The OS camera privacy switch denies this executable (Windows `CapabilityAccessManager\ConsentStore\webcam`: machine policy, user global, desktop-app class, per-app entry; no equivalent is readable on macOS / Linux) | `XR_ERROR_PERMISSION_INSUFFICIENT` |
+| 6 | The stored per-app decision (`HKCU\Software\DisplayXR\CameraConsent\Apps\<path>`, `camera_consent.json` `apps`) | Allow → allowed; Deny → `CONSENT_REFUSED` |
+| 7 | "Allow once" already granted to this same process (executable + pid) | allowed |
+| 8 | The **tray prompt**: *"<app> wants to use the 3D camera — Allow / Allow once / Deny"* (Windows: a top-most dialog from the tray thread; macOS: a floating panel from the menu-bar item — never a modal that would park the service's run loop). **Allow** and **Deny** are written to the store; **Allow once** is remembered for the process. The call blocks for up to 60 s; unanswered / dismissed, or no prompt available (`DXR_STEREO_CAMERA_PROMPT=0`, headless Linux service) | `CONSENT_REFUSED` — retryable, asked again next time |
 
-Failure is `XR_ERROR_PERMISSION_INSUFFICIENT`; the stream stays created and may be started again
-(e.g. after the user allows it).
+A refused stream stays created and may be started again (e.g. after `displayxr-cli camera allow`).
+The policy is pure (two injected vtables) and unit-tested with fakes in `tests_camera_consent`.
+
+**Android** (A1, not built): CAMERA permission of the peer uid + the runtime app's consent
+activity per package; `android_package_is_visible` for §7.2.
 
 ### 7.2 Foreground rule
 
-Frames are published to a stream only while its client is **visible**: for an OpenXR app, a
-session in `VISIBLE` or `FOCUSED`; on Android, the peer package visible to the user (the plug-in
-host's `android_package_is_visible`). Otherwise the stream is `SUSPENDED` for that client — it
-receives no new frames, and its pinned slot is cleared on suspension so the last image does not
-linger. A **delegating** client (the browser's capture component) has no session; its visibility
-rule is the browser's own (a capturing tab keeps its indicator; closing it stops the track), and
-the runtime additionally suspends every stream while the OS session is locked or switched away.
+Frames are published to a stream only while its client is **visible**, checked per published
+frame with a 250 ms cache:
+
+- **Window-bearing classes (APP, PRESENT_OWNER):** the verified peer pid must own a visible,
+  non-minimised top-level window (Windows `EnumWindows`; macOS `NSRunningApplication` not hidden
+  and not activation-prohibited; desktop Linux has no display connection in the service and is
+  always visible — the OS lock below is the gate there). Otherwise the stream is `SUSPENDED` for
+  that client: no new frames, pinned slot cleared so the last image does not linger.
+- **Delegating clients** follow their own visibility rule (a capturing tab keeps its indicator;
+  closing it stops the track). **`CAMERA_CONSUMER` and `DIAG`** have no window by contract and
+  are exempt — they were granted explicit consent instead.
+- **Session lock:** every stream is suspended while the OS session is locked or switched away
+  (Windows `WM_WTSSESSION_CHANGE` lock / console or remote disconnect, plus `SM_REMOTESESSION` at
+  start; macOS `com.apple.screenIsLocked` and `NSWorkspaceSessionDidResignActive`), and resumes on
+  unlock. Enumerated and event-reported state is `SUSPENDED` meanwhile (§7.6).
 
 ### 7.3 Indicator
 
-While any stream is started, the service shows an in-use indicator (Windows tray badge + tooltip
-naming the consumer executables; Android an ongoing notification from the runtime app), in
-addition to whatever the consumer shows. The indicator is owned by the runtime because the camera
-LED, if any, is lit by tracking and says nothing about who is receiving frames.
+While any stream is started, the service shows an in-use indicator: Windows tray icon with a red
+dot, tooltip and menu line *"3D camera in use by <app>"* (executable base names), one balloon on
+the transition; macOS menu-bar icon with a red dot, tooltip and menu line. The indicator is owned
+by the runtime because the camera LED, if any, is lit by tracking and says nothing about who is
+receiving frames.
 
 ### 7.4 Kill switches
 
-User: a tray / runtime-app toggle "Share the 3D camera with apps" (off ⇒ zero cameras
-enumerated). Admin/dev: `DXR_STEREO_CAMERA=0` in the service environment.
+- **User, immediate:** tray / menu-bar **"Stop camera sharing"** ends every started stream now
+  (each gets `XrEventDataStereoCameraStreamEndedDXR` with `USER_STOPPED`; acquire and start on it
+  return `XR_ERROR_STEREO_CAMERA_STREAM_ENDED_DXR`; "Allow once" grants are forgotten). The app
+  may create and start a new stream, which goes through §7.1 again.
+- **User, persistent:** **"Share the 3D camera with apps"** (checkmark) — off ⇒ zero cameras
+  enumerated, every stream ended with `DISABLED`, start refused with
+  `XR_ERROR_STEREO_CAMERA_DISABLED_DXR`. Stored with the consent.
+- **Admin / dev:** `DXR_STEREO_CAMERA=0` in the service environment (zero cameras).
+- `displayxr-cli camera stop-all | sharing on|off` drive the same two switches over IPC.
 
 ### 7.5 Fingerprinting
 
-Calibration and serials identify a device uniquely. `persistentId` is a keyed hash of (device
-identity, peer executable), never the serial; calibration is returned only to a client that has
-passed §7.1 for that camera. A browser must coarsen what it gives pages (roadmap §B.3).
+Calibration and serials identify a device uniquely. `persistentId` is
+**HMAC-SHA-256(secret, device identity ‖ consumer executable)** rendered as `dxrcam-` + 32 hex
+chars, where the secret is 32 random bytes generated once per user and kept in the consent
+store (`Secret` / `"secret"`). The same device gives every executable a different id, the same
+executable a different id on every install, and nothing about the serial is derivable from it.
+Calibration is returned only to a client that has passed §7.1 for that camera; RAW output is
+refused to `PRESENT_OWNER` and to every delegating client (both expose cameras to third-party
+content). A browser must still coarsen what it gives pages (roadmap §B.3).
+
+### 7.6 Events
+
+The service queues, per connection (16 deep, oldest dropped), and the client drains from
+`xrPollEvent` (no session needed):
+
+- `XrEventDataStereoCameraStateChangedDXR` — the camera's **effective** state to every connection
+  with a stream on it: the source state, or `SUSPENDED` while the session is locked / sharing is
+  off.
+- `XrEventDataStereoCameraStreamEndedDXR` — a stream the service ended (§7.4), with the handle
+  and the reason.
+- `XrEventDataStereoCamerasChangedDXR` — reserved (the camera set is fixed for a service run).
 
 ## 8. Errors
 
@@ -377,7 +435,11 @@ passed §7.1 for that camera. A browser must coarsen what it gives pages (roadma
 |---|---|
 | `XR_STEREO_CAMERA_FRAME_NOT_READY_DXR` (success) | no frame newer than the last acquired |
 | `XR_ERROR_VALIDATION_FAILURE` | struct out of contract (unknown camera, format/transport not in the supported bits, RECTIFIED on an uncalibrated camera) |
-| `XR_ERROR_PERMISSION_INSUFFICIENT` | §7.1 refused; retryable after consent |
+| `XR_ERROR_PERMISSION_INSUFFICIENT` | the OS camera privacy switch denies the app (§7.1 step 5); RAW asked by a browser / delegating client; a client class that may not use cameras (or `xrCreateSession` from a `CAMERA_CONSUMER`) |
+| `XR_ERROR_STEREO_CAMERA_CONSENT_REFUSED_DXR` | §7.1: the user / the stored decision refused, the prompt was unanswered or unavailable; retryable after consent. A browser maps it to `NotAllowedError` |
+| `XR_ERROR_STEREO_CAMERA_DISABLED_DXR` | §7.4: sharing is off (user toggle or `DXR_STEREO_CAMERA=0`) |
+| `XR_ERROR_STEREO_CAMERA_BUSY_DXR` | the plug-in could not open the source and its retry is pending; retry later. A browser maps it to `NotReadableError` |
+| `XR_ERROR_STEREO_CAMERA_STREAM_ENDED_DXR` | start / acquire on a stream the service ended (§7.4); destroy it and create a new one |
 | `XR_ERROR_FEATURE_UNSUPPORTED` | GPU transport requested on a platform without it |
 | `XR_ERROR_LIMIT_REACHED` | more than 8 streams per camera service-wide |
 | `XR_ERROR_RUNTIME_FAILURE` | transient service refusal on a healthy pipe; retry |
@@ -591,5 +653,6 @@ camera state change and per stream start/stop with the peer executable; INFO sta
 
 | Version | Change |
 |---|---|
+| 2 (R3) | Consent and privacy as built (§7): `XrStereoCameraClientInfoDXR` + `XR_STEREO_CAMERA_CLIENT_CONSUMER_ONLY_BIT_DXR` (the `CAMERA_CONSUMER` class, §2a); distinct results `XR_ERROR_STEREO_CAMERA_CONSENT_REFUSED_DXR` / `_DISABLED_DXR` / `_BUSY_DXR` / `_STREAM_ENDED_DXR`; `XrEventDataStereoCameraStreamEndedDXR`; the state-changed event is now delivered; `persistentId` keyed with a per-user secret; read-only consumer section on every platform; `DXR_STEREO_CAMERA_DEV_ALLOW` becomes a documented dev override, `DXR_STEREO_CAMERA_PROMPT=0` disables the prompt. Everything appended at `1004999311–316`; nothing renumbered |
 | 1 (R2) | No API change. RECTIFIED output and rectified calibration now come from the service's rectifier for any CALIBRATED, non-natively-rectified source; the browser is refused a camera it cannot rectify; sim_display `_DISTORT=1` fake; `camera probe` row alignment + `--rectified` |
 | 1 | R1 implements: enumerate, calibration (RAW; RECTIFIED for natively rectified sources), streams with start/stop, latest-wins acquire over a pinned 3-slot shared-memory ring with per-stream wake handles, stream stats, plug-in slots, sim_display fake, CLI, selftest. Deferred: state-change events (structs defined, not delivered), GPU transports, rectifier (R2), consent/indicator (R3). Design scope: Enumerate + state events, calibration (raw / rectified), streams with start/stop, latest-wins acquire over a pinned 3-slot shared-memory ring with per-stream wake handles, optional GPU transports, runtime-enforced consent / foreground / indicator, plug-in iface slots, sim_display fake, CLI. |

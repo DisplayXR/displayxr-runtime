@@ -97,3 +97,33 @@ exactly so that knowledge lives in one vendor DLL and nowhere else.
   both hold Camera2. So the runtime (the vendor plug-in in the runtime APK, ADR-038) must own the
   front pair and run the vendor's in-app tracking from the same capture, on a worker thread
   (roadmap §C.1). That is more vendor code inside the runtime APK, and more CPU, than on Windows.
+
+## Amendment 1 (2026-10-03, R3 as built) — what changed from the decision text
+
+- **A camera-only client class.** The decision assumed the browser's capture component would
+  be classed as the browser (PRESENT_OWNER, by enabling `XR_DXR_weave`). In the field the
+  video-capture *utility* process is a separate OS process with no window and no weave, and
+  classing it PRESENT_OWNER spent a panel-owner slot. R3 adds `CAMERA_CONSUMER`, declared
+  explicitly (`XrStereoCameraClientInfoDXR`), session-less by contract and outside the
+  present-owner quota. Consent is still keyed by the verified executable, so the browser's
+  installer registration (delegating) covers the utility too.
+- **Distinct refusal results instead of one `PERMISSION_INSUFFICIENT`.** A browser must map
+  "the user said no" to `NotAllowedError` and "the device cannot be read" to
+  `NotReadableError`; one code could not carry both. `PERMISSION_INSUFFICIENT` now means the OS
+  camera switch (or a class that may not use cameras); consent, sharing-off, busy and
+  service-ended each have their own `XrResult`.
+- **The foreground rule is window visibility of the peer pid, not session state.** The spec
+  said "a session in VISIBLE / FOCUSED"; a camera consumer may have no session at all, and the
+  service already has the peer pid. Window-bearing classes need a visible top-level window;
+  delegating, camera-consumer and diagnostic clients are exempt (they were granted explicit
+  consent). The OS-lock suspension is unconditional.
+- **The prompt blocks the caller (≤ 60 s) rather than returning "pending".** A capture
+  device's `AllocateAndStart` wants a final answer, and the stream handle stays valid either
+  way; an unanswered prompt is a refusal the app may retry. Unanswered is never persisted.
+- **Two user kill switches, not one.** "Stop camera sharing" ends every started stream now
+  (apps see `STREAM_ENDED`); "Share the 3D camera with apps" is the persistent toggle the
+  decision described (zero cameras enumerated).
+- **The dev override stayed** (`DXR_STEREO_CAMERA_DEV_ALLOW=1`) as a documented, loud
+  development switch below the sharing-off checks — the R1 text had it as a stand-in to be
+  deleted.
+
