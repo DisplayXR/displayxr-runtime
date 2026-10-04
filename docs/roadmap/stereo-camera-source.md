@@ -206,12 +206,12 @@ against the sim fake).
 
 ### R1 as built
 
-- **Header + catalog:** `openxr/XR_DXR_stereo_camera.h`, type values `1004999290–300` (the registry
-  holds a reserved row for lift's `270–289`); `index.json` note in the `capture` group.
-- **Plug-in slots:** six `stereo_camera_*` slots + `XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA`, after a
-  one-pointer placeholder for lift's `create_dp_d3d11_lift`. **Merge order: after the lift PR**
-  (`feat/lift-ext`); the rebase replaces the placeholder with lift's field in place. The offsets are
-  identical either way, and `tests_stereo_camera` asserts the adjacency.
+- **Header + catalog:** `openxr/XR_DXR_stereo_camera.h`, type values `1004999300–310` (relocated
+  from `290–300` on the rebase onto post-lift `main`: `290` had been taken by `XR_DXR_weave` v14;
+  lift holds `270–289`); `index.json` note in the `capture` group.
+- **Plug-in slots:** six `stereo_camera_*` slots + `XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA`, appended
+  after lift's `create_dp_d3d11_lift` (ADR-042, merged in v2.22.0) and ADR-045's
+  `get_platform_state` — the last members of the iface. `tests_stereo_camera` pins the order.
 - **Service:** `ipc/server/ipc_server_stereo_camera.c`. It is platform-neutral (Windows D3D11
   service, macOS/Linux service, Android service). One thread per open camera, open on the first
   start, 2 s linger, per-stream 3-slot rings in shared memory, conversion + decimation, and a
@@ -247,9 +247,9 @@ against the sim fake).
   hunk, and the device + factory are new files, to keep rebase conflicts small.
 - **Latency/sync.** Arrival timestamps hide tracker-internal latency; A/V sync relies on WebRTC's
   own jitter handling. Fine for calls, not for measurement.
-- **ABI merge order.** The iface slots append after ADR-042's `create_dp_d3d11_lift`. R1 holds
-  lift's offset with a same-size placeholder, so an out-of-order merge still yields the right
-  offsets, but the intended order is lift first and the camera PR rebased onto it.
+- **ABI merge order.** Lift (ADR-042) merged first (v2.22.0), then ADR-045's `get_platform_state`;
+  the camera slots were rebased to append after both. R1 originally held lift's offset with a
+  same-size placeholder so either order would have been ABI-safe; the placeholder is gone.
 - **Android: the pair and the tracker cannot share Camera2.** Opening the front logical camera
   evicts the vendor tracker, which then never reacquires (§C.0). The mitigation is architectural:
   the runtime owns both, and tracking runs in-process from the same capture (§C.1). It adds

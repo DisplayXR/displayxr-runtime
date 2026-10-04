@@ -6,7 +6,7 @@
 | **Spec Version** | 1 |
 | **Extension Type** | Instance extension, service path only (an in-process instance enumerates zero cameras) |
 | **Header** | [`src/external/openxr_includes/openxr/XR_DXR_stereo_camera.h`](../../../src/external/openxr_includes/openxr/XR_DXR_stereo_camera.h) (+ its `index.json` catalog note) |
-| **Status** | **R1 implemented** (runtime, hardware-free): header, plug-in slots, service camera manager, IPC, OpenXR entry points, sim_display fake, `displayxr-cli camera`, selftest check. **Not yet:** rectification (R2), consent / indicator / foreground rule (R3 — deny-by-default hooks in place), GPU transports, state-change events, the Leia provider (L1), the browser (B1). Provisional type values `1004999290–300` (after `XR_DXR_lift`'s `1004999270–289`), pending Khronos registry |
+| **Status** | **R1 implemented** (runtime, hardware-free): header, plug-in slots, service camera manager, IPC, OpenXR entry points, sim_display fake, `displayxr-cli camera`, selftest check. **Not yet:** rectification (R2), consent / indicator / foreground rule (R3 — deny-by-default hooks in place), GPU transports, state-change events, the Leia provider (L1), the browser (B1). Provisional type values `1004999300–310` (relocated from `290–300` when `XR_DXR_weave` v14 took `290`; `XR_DXR_lift` holds `270–289`), pending Khronos registry |
 | **R1 decisions** | stereo-only (names/structs kept open: `viewCount`, next chains) · camera provider = `xrt_plugin_iface` slots · service clients only (in-process enumerates zero) · raw frames never reach web pages (`RAW` refused to `PRESENT_OWNER` clients) — see [roadmap §G](../../roadmap/stereo-camera-source.md#g-open-questions--maintainer-decisions) |
 | **Decision record** | [ADR-043](../../adr/ADR-043-stereo-camera-source.md) |
 | **Plug-in contract** | appended `xrt_plugin_iface` camera slots, `XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA` (§9) |
@@ -368,9 +368,9 @@ passed §7.1 for that camera. A browser must coarsen what it gives pages (roadma
 
 Appended to `struct xrt_plugin_iface` (after `create_dp_d3d11_lift`, ADR-042), gated by
 `struct_size`, announced by `#define XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA 1`, no ABI bump.
-**As implemented:** lift is not on `main` yet, so the slots follow a one-pointer placeholder,
-`reserved_adr042_create_dp_d3d11_lift`, at lift's offset; the lift PR replaces it in place.
-Either merge order yields the same offsets (`tests_stereo_camera` asserts it). The authoritative
+**As implemented:** the six slots are the last members of the iface, after `create_dp_d3d11_lift`
+(ADR-042) and `get_platform_state` (ADR-045), both of which were on `main` first;
+`tests_stereo_camera` pins the order. The authoritative
 header is `src/xrt/include/xrt/xrt_plugin.h`; the plug-in-facing rules are in
 [`docs/reference/xrt_plugin_iface.md`](../../reference/xrt_plugin_iface.md#a-stereo-camera-the-stereo_camera_-slots-adr-043).
 Two refinements over the sketch below: `wait_frame` returns an `enum xrt_plugin_stereo_camera_wait`

@@ -14,8 +14,9 @@
  *  - the sim_display FAKE scene: the disparity probe measures exactly the
  *    disparities the scene was built with, and the frame counter differs
  *    between frames;
- *  - the plug-in iface: the camera slots sit right after the ADR-042 lift
- *    slot (or its placeholder), so the two branches cannot share an offset.
+ *  - the plug-in iface: the camera slots are appended after the ADR-042 lift
+ *    slot and the ADR-045 platform-state slot (ADR-020 append-only), and end
+ *    the struct.
  */
 
 #include "catch_amalgamated.hpp"
