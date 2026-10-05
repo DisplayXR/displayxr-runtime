@@ -34,11 +34,17 @@ touch the same fields: the skill edits authored TSX (`lib/data/roadmap.ts`,
 `app/architecture/page.tsx`, `app/extensions/page.tsx`, `lib/data/devices.ts`,
 `app/contribute/page.tsx`) and **never** the `lib/data/generated/*.json` files.
 
-### Site IA note (persona-led, since the 2026-06 overhaul)
-The site is organized around three audiences. Two facts matter for editorial
+### Site IA note (hub-led, since the 2026-10 overhaul)
+The header is five one-click hubs: About · Browser · Developers · Contribute ·
+Display Vendors, plus Download and Docs ↗. `/browser` is the DisplayXR Browser's
+product page (`/web` and `/webxr` 308 there); the homepage tells the project story
+and carries only one browser teaser band. Copy follows the website CLAUDE.md positioning rules: "spatial
+display(s)" is the canonical term; DisplayXR *extends* OpenXR, never "replaces" it,
+and is never called "conformant" (it *runs* the Khronos conformance suite);
+"glasses-free" is never a scope claim. Two facts matter for editorial
 sync: (1) the **repo map and a headline-ADR list live on `app/contribute/page.tsx`**
 — the repo map renders `ecosystemRepos` from `lib/data/ecosystem.ts`, so adding a
-repo there surfaces it on both the homepage `EcosystemMap` *and* `/contribute`
+repo there surfaces it on both `/about`'s `EcosystemMap` *and* `/contribute`
 automatically; the ADR list is a short hand-curated array. (2) The device /
 compatibility tables and the version dashboard now render on **one merged
 `/platform-support` page** (old `/compatibility` + `/status` 308-redirect there) —
@@ -207,7 +213,7 @@ should move to "Done". Judgment call — surface the candidates.
 
 ### 2.6 New releases → the "What's New" feed
 
-The homepage ticker and `/news` both render `lib/data/news.ts` (authored). The
+The homepage proof strip (latest 3 via `getBannerNews()`) and `/news` both render `lib/data/news.ts` (authored). The
 generator writes every recent release to `generated/news-candidates.json` with
 the bullet lines it found under a *Highlights / Features / What's New / Added*
 heading — so a candidate carrying `featureLines` is one that *claims* new
@@ -275,7 +281,7 @@ structure. Concrete mapping:
 | Gap | File | What to write |
 |---|---|---|
 | User-facing new ADR | `app/architecture/page.tsx` (product-level) and/or the headline-ADR array in `app/contribute/page.tsx` (contributor-facing) | A sentence/paragraph summarizing the decision in product terms (NOT the ADR's internal rationale). Most ADRs are internal — skip them; a genuinely notable one belongs on /architecture, a contributor-relevant one in the /contribute headline list. |
-| New featured repo | `lib/data/ecosystem.ts` (+ `lib/constants.ts` `REPO_URLS`) | An `EcosystemRepo` entry: name, repo, one-sentence description, `category`, optional `status`. Surfaces automatically on the homepage `EcosystemMap` **and** `/contribute`'s repo map — no page edit needed. |
+| New featured repo | `lib/data/ecosystem.ts` (+ `lib/constants.ts` `REPO_URLS`) | An `EcosystemRepo` entry: name, repo, one-sentence description, `category`, optional `status`. Surfaces automatically on `/about`'s `EcosystemMap` **and** `/contribute`'s repo map — no page edit needed. |
 | New extension | `app/extensions/page.tsx` | An `Extension` entry: `name`, human `title`, 1–2 sentence `description` derived from the header comment, `status`, `group`. |
 | New device | `lib/data/devices.ts` | A `Device` entry — only when the user supplies the hardware (not auto-discoverable). |
 | Closed milestone | `lib/data/roadmap.ts` | Move the matching item to the `done` phase, or add a `done` entry; trim the corresponding `now`/`next` item. |
