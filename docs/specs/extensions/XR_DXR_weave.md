@@ -707,6 +707,18 @@ caller's on any other result — including `XR_ERROR_RUNTIME_FAILURE` (a refused
 `XR_ERROR_INSTANCE_LOST`. A caller that wants to keep a buffer passes a `dup()`. Every fd handed
 **out** (`XrWeaveOutputDmabufDXR::fd`, `releaseFenceFd`) is the caller's to close.
 
+**An overlay that cannot be imported refuses the submit (v16).** When an overlay is chained
+(`XrWeaveOverlayDmabufDescDXR`, or a stage-A `OPAQUE_FD` overlay) and the service cannot import
+it, the submit fails with `XR_ERROR_RUNTIME_FAILURE` **before the woven output is touched**: the
+previous accepted submit's output is left exactly as it was, and the fds stay the caller's (the
+rule above). This is the D3D11 service's rule (an overlay it cannot open or acquire refuses the
+submit before the output is cleared), and it is what lets a caller read "accepted with the overlay
+chained" as "the overlay was composited". A caller that hands the whole of its 2D over as the
+overlay (a browser's whole-page overlay) relies on it: it can then HOLD its last composed frame on
+a refused submit instead of presenting a frame whose 2D is missing. Desktop-Linux runtimes before
+v16 dropped the unreadable overlay and wove anyway, so such a caller gates on
+`extensionVersion >= 16`.
+
 **The import cache.** An fd is not an identity: every hand-off is a new number. The service
 keys its input import cache on `bufferId` when non-zero and on the fd's `(st_dev, st_ino)`
 otherwise, so a producer rotating a small pool re-uses imports instead of re-importing each
@@ -907,7 +919,12 @@ any unknown chained struct. One `weave(v13)` WARN in the service log per edge.
 | 12 | `XrWeaveOutputOriginDXR` (out, per frame: the origin each woven output was woven for + a serial) and `XrWeaveWindowLogicalOriginDXR` (in: the caller's logical origin + scale, echoed verbatim) — so a present-owner can tag its own Wayland commit for move-synchronised drag (§5e, browser-pvt#180). |
 | 13 | `XrWeaveSubmitMonoIn2DDXR` — one flat view (stereo: the left view; N > 2: the view nearest the display axis) instead of the weave while the session's hardware state is 2D (§5f). Desktop Linux; accepted and ignored elsewhere. |
 | 15 | `XrWeaveSubmitOverlayFilterDXR` — the caller's lens-filter strength for the 2D overlay, 0..1; omitted = the DP's own default (§2d). |
+| 16 | No new structure: on desktop Linux a submit whose chained overlay the engine cannot import is **refused before the woven output is touched** (§5d), as the D3D11 service always did; before v16 the Linux engine dropped the overlay and wove anyway. A desktop-Linux caller that hands its whole 2D over as the overlay gates on `extensionVersion >= 16`. The macOS and Android engines still drop an unreadable overlay. |
 | 14 | `XrWeaveSubmitOverlayUnchangedDXR` — the v4 overlay atlas holds the previous accepted submit's pixels, so a DP may reuse its lens prefilter of the 2D layer (ADR-027 Amendment; §2d). |
+
+**v16 is a gate for one kind of caller**: one whose overlay IS its 2D (a whole-page overlay)
+must not send it to an older desktop-Linux runtime, which would weave without it and return
+success. A caller whose overlay is decoration over content it presents anyway needs no gate.
 
 **v15 needs no gate either**: omitting the struct, or a runtime/DP that predates it, means
 the display processor's default strength.

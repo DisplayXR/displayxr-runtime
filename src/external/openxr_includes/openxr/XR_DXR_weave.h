@@ -198,6 +198,15 @@
  * back verbatim), so a present-owner can tag its own Wayland commit for
  * move-synchronised drag.
  *
+ * An unreadable overlay refuses the submit on desktop Linux (SPEC_VERSION 16).
+ * No new structure: from v16 the desktop-Linux engine, like the D3D11 service
+ * always did, refuses a submit whose chained v4 overlay it cannot import
+ * (XR_ERROR_RUNTIME_FAILURE) BEFORE the woven output is touched, so there
+ * "accepted with an overlay chained" means "the overlay was composited". Before
+ * v16 it dropped the overlay and wove anyway. A desktop-Linux caller that hands
+ * the whole of its 2D over as the overlay gates on extensionVersion >= 16. The
+ * macOS and Android engines still drop an unreadable overlay.
+ *
  * Overlay filter strength (SPEC_VERSION 15). XrWeaveSubmitOverlayFilterDXR, chained
  * next to an XrWeaveSubmitOverlaysDXR: how strongly a display processor that
  * band-limits the 2D layer for its lens filters it, 0..1 (0 = no lens filtering,
@@ -281,7 +290,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_weave 1
-#define XR_DXR_weave_SPEC_VERSION 15
+#define XR_DXR_weave_SPEC_VERSION 16
 #define XR_DXR_WEAVE_EXTENSION_NAME "XR_DXR_weave"
 
 // Reserved 1004999190..199. Final values reconcile with the Khronos registry
