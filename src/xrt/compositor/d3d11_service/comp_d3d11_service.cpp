@@ -398,6 +398,12 @@ struct d3d11_service_swapchain
 //! (harmless) output clear mid-frame instead of an unbounded trail.
 #define WEAVE_OUTPUT_GEN_MAX_INPUTS 32
 
+//! P1 perf: bound on the batch-weave SBS scratch's dirty-region list (two
+//! regions — left + right tile — per blitted rect, accumulated over a frame's
+//! submits). 4 full 32-rect chunks; overflowing it only costs the next
+//! frame-first a whole-scratch clear (the pre-P1 behaviour).
+#define WEAVE_SBS_DIRTY_MAX 256
+
 /*!
  * XR_DXR_weave v8 (browser#88): capacity of the merged FLAT rect list — the
  * per-submit list (XrWeaveSubmitFlatRegionsDXR) plus the sticky screen-space
@@ -731,6 +737,15 @@ struct d3d11_client_render_resources
 	wil::com_ptr<ID3D11ShaderResourceView> weave_sbs_srv;
 	uint32_t                               weave_sbs_w; //!< one view's width (== win_w)
 	uint32_t                               weave_sbs_h;
+	//! P1 perf: dirty-region bookkeeping that replaces the per-frame WHOLE
+	//! scratch clear. Invariant while `weave_sbs_clean_valid`: every scratch
+	//! pixel outside `weave_sbs_dirty[]` is (0,0,0,0). A frame-first submit then
+	//! clears only the regions the previous frame wrote that this submit will
+	//! not overwrite identically, instead of all (2*win_w) x win_h pixels. All
+	//! zero (memset) is the safe state: not valid -> one whole clear.
+	bool                                   weave_sbs_clean_valid;
+	uint32_t                               weave_sbs_dirty_count;
+	D3D11_RECT                             weave_sbs_dirty[WEAVE_SBS_DIRTY_MAX];
 
 	//! Spec-v6 N-view crop staging (#774). When the caller's worst-case-sized
 	//! atlas is LARGER than the active mode's atlas, the packed region (tiles
@@ -823,7 +838,7 @@ struct d3d11_client_render_resources
 	//! every 5 s. Queries are created lazily, only when the env var is set; the
 	//! all-zero state is the valid initial state.
 	static constexpr uint32_t kWeaveGpuRing = 8;
-	static constexpr uint32_t kWeaveTs = 6;
+	static constexpr uint32_t kWeaveTs = 7;
 	struct weave_timing_stat
 	{
 		double sum;
@@ -836,7 +851,7 @@ struct d3d11_client_render_resources
 	uint8_t                                weave_gpu_path[kWeaveGpuRing];  //!< WEAVE_PATH_*
 	uint8_t                                weave_gpu_route[kWeaveGpuRing]; //!< WEAVE_OV_*
 	uint32_t                               weave_gpu_head;
-	weave_timing_stat                      weave_gpu_stage[7];   //!< ms, by WEAVE_GPU_*
+	weave_timing_stat                      weave_gpu_stage[9];   //!< ms, by WEAVE_GPU_*
 	uint32_t                               weave_gpu_n;          //!< frames read back
 	uint32_t                               weave_gpu_n_disjoint; //!< frames discarded (disjoint)
 	weave_timing_stat                      weave_cpu_stage[5];   //!< ms, by WEAVE_CPU_*
@@ -845,6 +860,8 @@ struct d3d11_client_render_resources
 	uint32_t                               weave_cpu_path_n[4];  //!< accepted submits by WEAVE_PATH_*
 	uint32_t                               weave_cpu_route_n[3]; //!< accepted submits by WEAVE_OV_*
 	uint32_t                               weave_cpu_ov_unchanged; //!< overlay declared unchanged (v14)
+	uint32_t                               weave_sbs_clear_n[3]; //!< batch frame-first clears: whole / partial / none
+	double                                 weave_sbs_cleared_mpx; //!< Mpx cleared by those, summed
 	int64_t                                weave_gpu_last_log_ns;
 
 	//! Deferred auto-3D for no-zones standalone clients (#140 / no-zones-2D).
@@ -6848,6 +6865,8 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 	res->weave_sbs_srv.reset();
 	res->weave_sbs_rtv.reset();
 	res->weave_sbs_tex.reset();
+	res->weave_sbs_clean_valid = false;
+	res->weave_sbs_dirty_count = 0;
 	weave_close_cached(res->weave_input_handle_cached, res->weave_input_cached_is_dxgi);
 	res->weave_input_handle_cached = nullptr;
 	res->weave_input_km.reset();
@@ -25556,6 +25575,9 @@ enum weave_timing_ts
 	WEAVE_TS_POST_WEAVE,
 	WEAVE_TS_POST_FALLBACK,
 	WEAVE_TS_END,
+	//! Batch only: after the SBS scratch clear, before its blits (stamped as a
+	//! placeholder at CLEARED on every path so the set always completes).
+	WEAVE_TS_SBS_CLEARED,
 	WEAVE_TS_COUNT,
 };
 enum weave_timing_gpu_stage
@@ -25567,6 +25589,8 @@ enum weave_timing_gpu_stage
 	WEAVE_GPU_FALLBACK,       //!< frames whose overlay took the runtime blit only
 	WEAVE_GPU_EPILOGUE,       //!< wish publish + diag, before the fence signal
 	WEAVE_GPU_TOTAL,          //!< BEGIN..END
+	WEAVE_GPU_SBS_CLEAR,      //!< batch path only: the scratch clear part of WEAVE_GPU_SBS
+	WEAVE_GPU_SBS_BLIT,       //!< batch path only: the per-rect blits part of WEAVE_GPU_SBS
 	WEAVE_GPU_STAGE_COUNT,
 };
 enum weave_timing_cpu_stage
@@ -25668,6 +25692,10 @@ weave_gpu_timing_collect(struct d3d11_service_system *sys, struct d3d11_client_r
 		                      span(WEAVE_TS_CLEARED, WEAVE_TS_PRE_WEAVE));
 	} else if (path == WEAVE_PATH_BATCH) {
 		weave_timing_stat_add(r->weave_gpu_stage[WEAVE_GPU_SBS], span(WEAVE_TS_CLEARED, WEAVE_TS_PRE_WEAVE));
+		weave_timing_stat_add(r->weave_gpu_stage[WEAVE_GPU_SBS_CLEAR],
+		                      span(WEAVE_TS_CLEARED, WEAVE_TS_SBS_CLEARED));
+		weave_timing_stat_add(r->weave_gpu_stage[WEAVE_GPU_SBS_BLIT],
+		                      span(WEAVE_TS_SBS_CLEARED, WEAVE_TS_PRE_WEAVE));
 	}
 	weave_timing_stat_add(r->weave_gpu_stage[WEAVE_GPU_WEAVE], span(WEAVE_TS_PRE_WEAVE, WEAVE_TS_POST_WEAVE));
 	if (route == WEAVE_OV_FALLBACK) {
@@ -25809,7 +25837,8 @@ weave_timing_account(struct d3d11_service_system *sys,
 	    "render_mutex %.3f/%.3f ctx_mutex %.3f/%.3f in_acquire %.3f/%.3f ov_acquire %.3f/%.3f | "
 	    "GPU ms avg/max n=%u disjoint=%u: clear1058 %.3f/%.3f (n=%u) input_copy %.3f/%.3f (n=%u) "
 	    "sbs_clear_blit %.3f/%.3f (n=%u) weave %.3f/%.3f fallback_blit %.3f/%.3f (n=%u) "
-	    "epilogue %.3f/%.3f total %.3f/%.3f",
+	    "epilogue %.3f/%.3f total %.3f/%.3f | sbs split: clear %.3f/%.3f blit %.3f/%.3f (n=%u) "
+	    "frame-first clears whole=%u partial=%u none=%u cleared %.2f Mpx/clear",
 	    ad.Description, win_w, win_h, (double)window_ns / 1e9, r->weave_cpu_n, r->weave_cpu_refused,
 	    r->weave_cpu_path_n[WEAVE_PATH_V6_ZERO_COPY], r->weave_cpu_path_n[WEAVE_PATH_V6_CROP],
 	    r->weave_cpu_path_n[WEAVE_PATH_BATCH], r->weave_cpu_path_n[WEAVE_PATH_LEGACY],
@@ -25825,7 +25854,14 @@ weave_timing_account(struct d3d11_service_system *sys,
 	    gs[WEAVE_GPU_SBS].n, weave_timing_stat_avg(gs[WEAVE_GPU_WEAVE]), gs[WEAVE_GPU_WEAVE].max,
 	    weave_timing_stat_avg(gs[WEAVE_GPU_FALLBACK]), gs[WEAVE_GPU_FALLBACK].max, gs[WEAVE_GPU_FALLBACK].n,
 	    weave_timing_stat_avg(gs[WEAVE_GPU_EPILOGUE]), gs[WEAVE_GPU_EPILOGUE].max,
-	    weave_timing_stat_avg(gs[WEAVE_GPU_TOTAL]), gs[WEAVE_GPU_TOTAL].max);
+	    weave_timing_stat_avg(gs[WEAVE_GPU_TOTAL]), gs[WEAVE_GPU_TOTAL].max,
+	    weave_timing_stat_avg(gs[WEAVE_GPU_SBS_CLEAR]), gs[WEAVE_GPU_SBS_CLEAR].max,
+	    weave_timing_stat_avg(gs[WEAVE_GPU_SBS_BLIT]), gs[WEAVE_GPU_SBS_BLIT].max, gs[WEAVE_GPU_SBS_BLIT].n,
+	    r->weave_sbs_clear_n[0], r->weave_sbs_clear_n[1], r->weave_sbs_clear_n[2],
+	    (r->weave_sbs_clear_n[0] + r->weave_sbs_clear_n[1] + r->weave_sbs_clear_n[2]) > 0
+	        ? r->weave_sbs_cleared_mpx /
+	              (double)(r->weave_sbs_clear_n[0] + r->weave_sbs_clear_n[1] + r->weave_sbs_clear_n[2])
+	        : 0.0);
 
 	memset(r->weave_gpu_stage, 0, sizeof(r->weave_gpu_stage));
 	memset(r->weave_cpu_stage, 0, sizeof(r->weave_cpu_stage));
@@ -25836,6 +25872,130 @@ weave_timing_account(struct d3d11_service_system *sys,
 	r->weave_cpu_n = 0;
 	r->weave_cpu_refused = 0;
 	r->weave_cpu_ov_unchanged = 0;
+	memset(r->weave_sbs_clear_n, 0, sizeof(r->weave_sbs_clear_n));
+	r->weave_sbs_cleared_mpx = 0.0;
+}
+
+/*!
+ * P1 perf — batch-weave SBS scratch: clear only what is stale.
+ *
+ * The scratch is (2*win_w) x win_h (3840x2040 window: 7680x2040, 62.7 MB of
+ * RGBA8) and used to be cleared WHOLE on every frame-first submit, although
+ * only the regions the previous frame blitted can hold anything but (0,0,0,0)
+ * — everything else was cleared last frame and nothing wrote it since. So we
+ * keep the list of regions blitted since the last frame-first clear and, on
+ * the next one, clear just those that this submit will not overwrite with an
+ * identical opaque blit. A static page (same rects every frame) clears
+ * nothing; a scrolling one clears last frame's tile footprints. The woven
+ * input is bit-identical to the whole-clear version: gaps are (0,0,0,0) either
+ * way and every rect is blitted after the clear, in the same order.
+ *
+ * Not an ADR-030 matter: nothing here changes what the DP is handed (the same
+ * window-sized 2x1 scratch at the same dims) — only how much of the scratch is
+ * rewritten to produce it. DXR_WEAVE_SBS_FULL_CLEAR=1 restores the whole clear
+ * (A/B, rollback).
+ */
+static bool
+weave_sbs_force_full_clear(void)
+{
+	static int s_on = -1;
+	if (s_on < 0) {
+		const char *v = getenv("DXR_WEAVE_SBS_FULL_CLEAR");
+		s_on = (v != nullptr && v[0] == '1') ? 1 : 0;
+		if (s_on == 1) {
+			U_LOG_W("DXR_WEAVE_SBS_FULL_CLEAR=1: batch weave clears its whole SBS scratch every frame");
+		}
+	}
+	return s_on == 1;
+}
+
+//! The scratch region a blit to (x, y, w, h) writes, clipped to the scratch.
+//! Clipped to the SCRATCH, not to a tile: a rect that crosses the window edge
+//! writes into the neighbouring tile and that write must be tracked too.
+static bool
+weave_sbs_region(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t sbs_w, uint32_t sbs_h, D3D11_RECT *out)
+{
+	int64_t l = x < 0 ? 0 : x;
+	int64_t t = y < 0 ? 0 : y;
+	int64_t r = (int64_t)x + (int64_t)w;
+	int64_t b = (int64_t)y + (int64_t)h;
+	r = r > (int64_t)sbs_w ? (int64_t)sbs_w : r;
+	b = b > (int64_t)sbs_h ? (int64_t)sbs_h : b;
+	if (r <= l || b <= t) {
+		return false;
+	}
+	*out = {(LONG)l, (LONG)t, (LONG)r, (LONG)b};
+	return true;
+}
+
+//! Record a written region; an overflow drops the invariant (next frame-first
+//! clears the whole scratch).
+static void
+weave_sbs_mark_dirty(struct d3d11_client_render_resources *r, const D3D11_RECT &d)
+{
+	if (r->weave_sbs_dirty_count >= WEAVE_SBS_DIRTY_MAX) {
+		r->weave_sbs_clean_valid = false;
+		return;
+	}
+	r->weave_sbs_dirty[r->weave_sbs_dirty_count++] = d;
+}
+
+/*!
+ * The frame-first clear. @p cur / @p cur_count are the regions this submit's
+ * NON-lifted rects will overwrite with an opaque blit (exactly what the blit
+ * loop then draws — a lifted rect never suppresses a clear: it may write only
+ * part of its rect). Afterwards the dirty list is empty and the invariant
+ * holds; the blits that follow re-populate the list.
+ */
+static void
+weave_sbs_frame_first_clear(struct d3d11_service_system *sys,
+                            struct d3d11_client_render_resources *r,
+                            const D3D11_RECT *cur,
+                            uint32_t cur_count,
+                            uint32_t sbs_w,
+                            uint32_t sbs_h)
+{
+	static const float k_transparent[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+	const double total_px = (double)sbs_w * (double)sbs_h;
+	bool whole = !r->weave_sbs_clean_valid || weave_sbs_force_full_clear();
+	D3D11_RECT clr[WEAVE_SBS_DIRTY_MAX];
+	uint32_t clr_n = 0;
+	double clr_px = 0.0;
+	if (!whole) {
+		for (uint32_t i = 0; i < r->weave_sbs_dirty_count; i++) {
+			const D3D11_RECT &d = r->weave_sbs_dirty[i];
+			bool overwritten = false;
+			for (uint32_t k = 0; k < cur_count; k++) {
+				if (cur[k].left == d.left && cur[k].top == d.top && cur[k].right == d.right &&
+				    cur[k].bottom == d.bottom) {
+					overwritten = true;
+					break;
+				}
+			}
+			if (!overwritten) {
+				clr[clr_n++] = d;
+				clr_px += (double)(d.right - d.left) * (double)(d.bottom - d.top);
+			}
+		}
+		// Past half the scratch a whole clear is no more work (and is a
+		// metadata-only fast clear on most GPUs).
+		if (clr_px * 2.0 > total_px) {
+			whole = true;
+		}
+	}
+	if (whole) {
+		sys->context->ClearRenderTargetView(r->weave_sbs_rtv.get(), k_transparent);
+		r->weave_sbs_clear_n[0]++;
+		r->weave_sbs_cleared_mpx += total_px / 1e6;
+	} else if (clr_n > 0) {
+		sys->context->ClearView(r->weave_sbs_rtv.get(), k_transparent, clr, clr_n);
+		r->weave_sbs_clear_n[1]++;
+		r->weave_sbs_cleared_mpx += clr_px / 1e6;
+	} else {
+		r->weave_sbs_clear_n[2]++;
+	}
+	r->weave_sbs_dirty_count = 0;
+	r->weave_sbs_clean_valid = true;
 }
 
 bool
@@ -26468,6 +26628,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		sys->context->ClearRenderTargetView(c->render.weave_output_rtv.get(), out_transparent);
 	}
 	gpu_frame.stamp(WEAVE_TS_CLEARED);
+	gpu_frame.stamp(WEAVE_TS_SBS_CLEARED); // batch re-stamps it after its scratch clear
 
 	// Hand the overlay to the DP for the next process_atlas. Only on the
 	// full-window-canvas paths (v6, batch): the layer is window-sized and the
@@ -26748,6 +26909,9 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 			}
 			c->render.weave_sbs_w = win_w;
 			c->render.weave_sbs_h = win_h;
+			// New texture: contents undefined -> the next frame-first clears it whole.
+			c->render.weave_sbs_clean_valid = false;
+			c->render.weave_sbs_dirty_count = 0;
 			U_LOG_W("#625 weave batch: SBS atlas ready %ux%u (one weave per frame)", win_w * 2, win_h);
 		}
 
@@ -26767,10 +26931,36 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		// their own tiles and never read the gaps, so they skip it and keep the
 		// accumulate-across-submits behavior (a >MAX-rect frame clears on its
 		// first submit only; later submits blit into the same atlas).
+		//
+		// P1 perf: the clear is now SCOPED (weave_sbs_frame_first_clear) — only
+		// the regions written since the last frame-first that this submit will
+		// not overwrite identically. Same resulting scratch, a fraction of the
+		// writes; see the helper's comment for the invariant.
+		const uint32_t sbs_w = win_w * 2;
 		if (weave_frame_first && c->render.weave_sbs_rtv) {
-			const float sbs_transparent[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-			sys->context->ClearRenderTargetView(c->render.weave_sbs_rtv.get(), sbs_transparent);
+			// What this submit's ordinary (non-lifted) blits will overwrite —
+			// the same eligibility test as the blit loop below.
+			D3D11_RECT cur[2 * IPC_WEAVE_SUBMIT_RECTS_MAX];
+			uint32_t cur_n = 0;
+			for (uint32_t i = 0; i < rect_count && cur_n + 2 <= ARRAY_SIZE(cur); i++) {
+				if (rects[i].extent.w <= 0 || rects[i].extent.h <= 0) {
+					continue;
+				}
+				if (lift_count > 0 && lift_binding_for_rect(lift_rects, lift_count, i) != nullptr) {
+					continue;
+				}
+				const int32_t rx = rects[i].offset.w, ry = rects[i].offset.h;
+				const int32_t rw = rects[i].extent.w, rh = rects[i].extent.h;
+				if (weave_sbs_region(rx, ry, rw, rh, sbs_w, win_h, &cur[cur_n])) {
+					cur_n++;
+				}
+				if (weave_sbs_region((int32_t)win_w + rx, ry, rw, rh, sbs_w, win_h, &cur[cur_n])) {
+					cur_n++;
+				}
+			}
+			weave_sbs_frame_first_clear(sys, &c->render, cur, cur_n, sbs_w, win_h);
 		}
+		gpu_frame.stamp(WEAVE_TS_SBS_CLEARED);
 
 		if (dxr_diag_dump) {
 			U_LOG_W("#73 diag: submit n=%u input=%ux%u win=%ux%u first=%d", rect_count, idesc.Width,
@@ -26791,6 +26981,20 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 			const float ry = (float)rects[i].offset.h;
 			if (rw <= 0.0f || rh <= 0.0f) {
 				continue;
+			}
+			// P1: whatever happens to this rect below (ordinary blit or a lift
+			// write, which stays inside the rect), it is written at most within
+			// these two regions — track them for the next frame-first clear.
+			{
+				D3D11_RECT d;
+				const int32_t irx = rects[i].offset.w, iry = rects[i].offset.h;
+				const int32_t irw = rects[i].extent.w, irh = rects[i].extent.h;
+				if (weave_sbs_region(irx, iry, irw, irh, sbs_w, win_h, &d)) {
+					weave_sbs_mark_dirty(&c->render, d);
+				}
+				if (weave_sbs_region((int32_t)win_w + irx, iry, irw, irh, sbs_w, win_h, &d)) {
+					weave_sbs_mark_dirty(&c->render, d);
+				}
 			}
 			// XR_DXR_lift (ADR-042): a lift-flagged rect holds 2D, not SBS.
 			// Snapshot it into its stream and weave the stream's latest
