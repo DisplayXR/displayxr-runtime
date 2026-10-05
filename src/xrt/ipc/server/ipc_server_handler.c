@@ -6678,6 +6678,8 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 #ifdef XRT_OS_LINUX_DESKTOP
 	// v13: per submit — a submit without XrWeaveSubmitMonoIn2DDXR clears it.
 	comp_multi_weave_linux_set_mono_in_2d(ics->xc, args->mono_in_2d != 0);
+	// v14/v15: per submit, read only when the DP composites the overlay.
+	comp_multi_weave_linux_set_overlay_hints(ics->xc, args->overlay_unchanged != 0, args->overlay_filter_strength);
 #endif
 	bool ok = comp_multi_weave_submit(                          //
 	    ics->xc, handles[0],                                    //
@@ -6995,6 +6997,8 @@ ipc_handle_weave_submit_dmabuf(volatile struct ipc_client_state *ics,
 	struct xrt_weave_woven_origin woven = {0};
 	// v13: per submit — a submit without XrWeaveSubmitMonoIn2DDXR clears it.
 	comp_multi_weave_linux_set_mono_in_2d(ics->xc, args->mono_in_2d != 0);
+	// v14/v15: per submit, read only when the DP composites the overlay.
+	comp_multi_weave_linux_set_overlay_hints(ics->xc, args->overlay_unchanged != 0, args->overlay_filter_strength);
 	bool ok = comp_multi_weave_submit_dmabuf(                   //
 	    ics->xc, &in_desc,                                      //
 	    args->have_overlay ? &overlay_desc : NULL,              //

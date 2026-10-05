@@ -59,7 +59,13 @@ issues: [439, 396]
 > - First producer: the `XR_DXR_weave` v4 overlay (`XrWeaveSubmitOverlaysDXR`) on the D3D11
 >   service's full-window weave paths (v3 batch, v6); the legacy single-rect path keeps the
 >   blit. Other APIs and the in-process compositors' Local2D-over path follow the same slot
->   shape when needed. 2D-*under*-3D (`set_background_2d`) is unchanged.
+>   shape when needed. **Vulkan (2026-10):** the appended VK-variant slot
+>   `xrt_display_processor_vk::set_overlay_2d` (+ `set_overlay_2d_filter_strength`,
+>   `XRT_DP_VK_HAS_OVERLAY_2D[_FILTER_STRENGTH]`) carries the same contract with a
+>   `VkImageView` + `VkFormat`; the layer must be target-sized and in
+>   `SHADER_READ_ONLY_OPTIMAL` when process_atlas' command buffer executes. First producer: the
+>   desktop-Linux weave engine (`comp_multi_weave_linux.c`); off-panel bands and flat regions
+>   painted after the weave get the layer redrawn over them, so 2D stays readable across a seam. 2D-*under*-3D (`set_background_2d`) is unchanged.
 > - Browser use (decided 2026-10): the layer is the **whole flat page** with the woven tiles
 >   as alpha-0 holes, not only the 2D lifted over tiles — the aliasing users saw was page text
 >   around the canvas. While any tile exists the browser submits every frame; a submit whose

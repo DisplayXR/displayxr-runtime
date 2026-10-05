@@ -631,6 +631,83 @@ struct xrt_display_processor_vk
 	 *                opaque and the DP may idle its transparency work.
 	 */
 	void (*set_transparency_active)(struct xrt_display_processor_vk *xdp, bool active);
+
+	/*!
+	 * The runtime's 2D over-layer for the NEXT @ref xrt_display_processor::process_atlas
+	 * (ADR-027 Amendment, "2D under the lens") — the Vulkan twin of
+	 * @ref xrt_display_processor_d3d11::set_overlay_2d.
+	 *
+	 * 2D composited as plain pixels AFTER the weave aliases per eye wherever the
+	 * lens is on; only the DP knows the per-subpixel lens phase needed to
+	 * band-limit it. Returning true says the DP composites @p overlay_view
+	 * (premultiplied "over", in encoded space, onto the encoded woven result)
+	 * inside that process_atlas, and the runtime then does NOT composite the
+	 * layer itself. Returning false (or an absent slot) keeps the runtime's
+	 * post-weave composite exactly as before, so a DP without the capability is
+	 * unchanged.
+	 *
+	 * ## Contract
+	 *
+	 * - **Stateless, per frame.** Called before every process_atlas that carries
+	 *   an overlay, with the layer for THAT call only; a process_atlas not
+	 *   preceded by a call has no layer. The DP consumes and clears it in
+	 *   process_atlas (also on an early return), so it can never leak into a
+	 *   later weave.
+	 * - **Layer:** a 2D image view of exactly the process_atlas TARGET size
+	 *   (@p width x @p height = target_width x target_height; texel (0,0) is
+	 *   the target's top-left), RGBA8 or BGRA8 (`_UNORM`, or the `_SRGB` view of
+	 *   one), premultiplied alpha, values encoded sRGB as they would be written
+	 *   to an 8-bit swapchain (@p encoding = XRT_ATLAS_ENCODING_ENCODED; a DP
+	 *   returns false for anything else), alpha = 2D coverage.
+	 * - **Synchronisation:** the image is in
+	 *   `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`, owned by the queue family of
+	 *   process_atlas' command buffer, with its writes made visible to
+	 *   fragment-shader reads, by the time that command buffer executes, and
+	 *   stays alive until it has completed. The DP reads it only; it never
+	 *   transitions or releases it.
+	 * - The process_atlas target-layout contract is unchanged (a
+	 *   command-recording DP still returns the target in PRESENT_SRC_KHR).
+	 *
+	 * Optional — absent slot (older plug-in `struct_size`) or NULL ⟹ the
+	 * runtime composites the layer post-weave. Appended after
+	 * @ref set_transparency_active per ADR-020 (append-only within a major).
+	 *
+	 * @param xdp             Pointer to self.
+	 * @param overlay_view    VkImageView of the layer (never VK_NULL_HANDLE).
+	 * @param format          VkFormat of @p overlay_view.
+	 * @param width           Layer width in pixels.
+	 * @param height          Layer height in pixels.
+	 * @param encoding        Colour state of the layer (v1: ENCODED).
+	 * @param layer_unchanged The caller declared the layer's pixels identical to
+	 *                        the previous call's (XR_DXR_weave v14): a DP that
+	 *                        caches a lens prefilter of the layer may reuse it.
+	 *                        Advisory — false is always correct, only slower.
+	 * @return true when the DP composites the layer in the next process_atlas.
+	 */
+	bool (*set_overlay_2d)(struct xrt_display_processor_vk *xdp,
+	                       VkImageView overlay_view,
+	                       VkFormat_XDP format,
+	                       uint32_t width,
+	                       uint32_t height,
+	                       enum xrt_atlas_encoding encoding,
+	                       bool layer_unchanged);
+
+	/*!
+	 * Lens-filter strength for the 2D over-layer of the NEXT process_atlas
+	 * (XR_DXR_weave v15) — the Vulkan twin of
+	 * @ref xrt_display_processor_d3d11::set_overlay_2d_filter_strength.
+	 * 0 = no lens filtering, 1 = the DP's full filter, NEGATIVE = the DP's own
+	 * default. Called right before @ref set_overlay_2d whenever an overlay goes
+	 * to the DP, so a DP that keeps the value sticky must take it from here
+	 * every frame.
+	 *
+	 * Optional — absent slot or NULL ⟹ the DP's default is used. Appended per
+	 * ADR-020.
+	 *
+	 * @param xdp       Pointer to self.
+	 * @param strength  [0,1], or negative for the DP's default.
+	 */
+	void (*set_overlay_2d_filter_strength)(struct xrt_display_processor_vk *xdp, float strength);
 };
 
 /*!
@@ -741,7 +818,9 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, get_background_previ
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, get_last_frame_dropped) == sizeof(struct xrt_display_processor) + 12 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, snap_window_rect)          == sizeof(struct xrt_display_processor) + 13 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_transparency_active)   == sizeof(struct xrt_display_processor) + 14 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 15 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_overlay_2d)            == sizeof(struct xrt_display_processor) + 15 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_overlay_2d_filter_strength) == sizeof(struct xrt_display_processor) + 16 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 17 * sizeof(void *), XRT_DP_ABI_MSG);
 
 /*!
  * Defined when this header carries the @ref
@@ -768,6 +847,21 @@ XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_d
  * appended slot.
  */
 #define XRT_DP_VK_HAS_TRANSPARENCY_ACTIVE 1
+
+/*!
+ * Defined when this header carries the @ref
+ * xrt_display_processor_vk::set_overlay_2d slot (ADR-027 Amendment, "2D under
+ * the lens" on Vulkan), so a plug-in built against an older runtime can
+ * #ifdef-guard its implementation. Purely additive (ADR-020).
+ */
+#define XRT_DP_VK_HAS_OVERLAY_2D 1
+
+/*!
+ * Defined when this header carries the @ref
+ * xrt_display_processor_vk::set_overlay_2d_filter_strength slot
+ * (XR_DXR_weave v15). Purely additive (ADR-020).
+ */
+#define XRT_DP_VK_HAS_OVERLAY_2D_FILTER_STRENGTH 1
 // clang-format on
 
 /*!
@@ -1199,6 +1293,68 @@ xrt_display_processor_vk_set_transparency_active(struct xrt_display_processor_vk
 	}
 	xdp->set_transparency_active(xdp, active);
 	return true;
+}
+
+/*!
+ * Does this DP carry @ref xrt_display_processor_vk::set_overlay_2d (its
+ * `base.struct_size` covers the slot and the pointer is set)? Lets a caller
+ * skip preparing the layer for a DP that could never take it.
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline bool
+xrt_display_processor_vk_supports_overlay_2d(struct xrt_display_processor_vk *xdp)
+{
+	if (xdp == NULL) {
+		return false;
+	}
+	const char *slot_end = (const char *)&xdp->set_overlay_2d + sizeof(xdp->set_overlay_2d);
+	return slot_end <= (const char *)xdp + xdp->base.struct_size && xdp->set_overlay_2d != NULL;
+}
+
+/*!
+ * @copydoc xrt_display_processor_vk::set_overlay_2d
+ *
+ * Returns false if not supported (the plug-in's `base.struct_size` doesn't cover
+ * the slot, or the pointer is NULL) — the caller then composites the layer
+ * post-weave itself, as before.
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline bool
+xrt_display_processor_vk_set_overlay_2d(struct xrt_display_processor_vk *xdp,
+                                        VkImageView overlay_view,
+                                        VkFormat_XDP format,
+                                        uint32_t width,
+                                        uint32_t height,
+                                        enum xrt_atlas_encoding encoding,
+                                        bool layer_unchanged)
+{
+	if (!xrt_display_processor_vk_supports_overlay_2d(xdp)) {
+		return false;
+	}
+	return xdp->set_overlay_2d(xdp, overlay_view, format, width, height, encoding, layer_unchanged);
+}
+
+/*!
+ * @copydoc xrt_display_processor_vk::set_overlay_2d_filter_strength
+ *
+ * No-op if not supported (the DP's default strength applies).
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline void
+xrt_display_processor_vk_set_overlay_2d_filter_strength(struct xrt_display_processor_vk *xdp, float strength)
+{
+	if (xdp == NULL) {
+		return;
+	}
+	const char *slot_end =
+	    (const char *)&xdp->set_overlay_2d_filter_strength + sizeof(xdp->set_overlay_2d_filter_strength);
+	if (slot_end > (const char *)xdp + xdp->base.struct_size || xdp->set_overlay_2d_filter_strength == NULL) {
+		return;
+	}
+	xdp->set_overlay_2d_filter_strength(xdp, strength);
 }
 
 #ifdef __cplusplus

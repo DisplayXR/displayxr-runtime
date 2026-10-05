@@ -230,8 +230,10 @@ typedef struct XrWeaveSubmitOverlayUnchangedDXR {
   the viewer moves enough to matter.
 - **Content-only.** The overlay is composited every frame either way; this only gates
   re-deriving work from it.
-- D3D11 service path today (`set_overlay_2d(..., layer_unchanged)`); the Vulkan weave engines
-  accept and ignore it until their DP slot exists.
+- D3D11 service path (`set_overlay_2d(..., layer_unchanged)`) and the desktop-Linux Vulkan
+  weave engine (the appended VK DP slot `xrt_display_processor_vk::set_overlay_2d`, same
+  argument); the macOS / Android Vulkan weave engines accept and ignore it until they call that
+  slot.
 
 ### Filter strength (v15)
 
@@ -251,9 +253,9 @@ typedef struct XrWeaveSubmitOverlayFilterDXR {
   vendor value tuned by eye on its panel (Leia SR: 0.6). The runtime passes "not set", never a
   number of its own.
 - `filterStrength` outside [0,1] or NaN is `XR_ERROR_VALIDATION_FAILURE`.
-- Per submit, no latch. Carried to the DP by the appended D3D11 slot
-  `set_overlay_2d_filter_strength` (negative = default), called before `set_overlay_2d` each
-  frame the layer goes to the DP.
+- Per submit, no latch. Carried to the DP by the appended slot
+  `set_overlay_2d_filter_strength` (D3D11, and the VK variant on desktop Linux; negative =
+  default), called before `set_overlay_2d` each frame the layer goes to the DP.
 
 
 

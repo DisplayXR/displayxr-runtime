@@ -935,6 +935,20 @@ struct multi_compositor
 		bool mono_in_2d;
 		bool mono_active;
 
+		/*!
+		 * @name 2D under the lens (ADR-027 Amendment, XR_DXR_weave v14/v15)
+		 * Per-submit overlay hints, set by comp_multi_weave_linux_set_overlay_hints
+		 * right before each submit (never sticky), forwarded to the DP with the
+		 * overlay when its set_overlay_2d slot takes it. @c overlay_in_dp is the
+		 * last verdict (DP composites vs runtime post-weave blend) so the WARN
+		 * fires on a change only.
+		 * @{
+		 */
+		bool overlay_unchanged;
+		float overlay_filter_strength;
+		uint8_t overlay_in_dp; //!< 0 = no overlay seen yet, 1 = runtime blend, 2 = DP composites
+		//! @}
+
 		//! @name Flat regions (spec v8, browser#88, on desktop Linux)
 		//! The sticky screen-space latch (xrWeaveSetScreenFlatRegionsDXR),
 		//! absolute screen device px; a SET, count 0 clears. Unioned with
@@ -1572,6 +1586,17 @@ comp_multi_weave_linux_request_display_mode(struct multi_compositor *mc, bool en
  */
 void
 comp_multi_weave_linux_set_mono_in_2d(struct xrt_compositor *xc, bool mono_in_2d);
+
+/*!
+ * XR_DXR_weave v14/v15 overlay hints of the NEXT submit (same per-submit shape
+ * as comp_multi_weave_linux_set_mono_in_2d): @p overlay_unchanged = the overlay
+ * holds the previous accepted submit's pixels; @p filter_strength = the app's
+ * lens-filter strength, [0,1], negative = the DP's default. Used only when the
+ * DP composites the overlay inside the weave (set_overlay_2d, ADR-027
+ * Amendment); the runtime's own post-weave blend ignores both.
+ */
+void
+comp_multi_weave_linux_set_overlay_hints(struct xrt_compositor *xc, bool overlay_unchanged, float filter_strength);
 /*! @} */
 #endif // XRT_OS_LINUX_DESKTOP
 
