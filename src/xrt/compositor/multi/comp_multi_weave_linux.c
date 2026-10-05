@@ -457,6 +457,28 @@ weave_slot_release(struct vk_bundle *vk, struct comp_multi_weave_linux_slot *slo
 	U_ZERO(slot);
 }
 
+/*!
+ * A submit chained an overlay that could not be imported: it is REFUSED, and
+ * the caller (holding the weave mutex, before anything is recorded) breaks out
+ * of its submit with the woven output exactly as the previous accepted submit
+ * left it. Parity with the D3D11 service, which refuses a submit whose
+ * overlay it cannot open or acquire before it clears the output. A caller that
+ * hands the whole of its 2D over as the overlay (a browser's whole-page
+ * overlay) reads "accepted" as "composited", so an accepted submit that
+ * silently dropped the overlay would show a frame with its 2D missing.
+ *
+ * Logged on the first refusal and then 1 in 300: the import helper already
+ * names the cause (fourcc / modifier / import error) once per slot.
+ */
+static void
+weave_overlay_refused(struct multi_compositor *mc)
+{
+	const uint32_t n = mc->weave.overlay_refusals++;
+	if (n == 0 || (n % 300) == 0) {
+		U_LOG_W("weave: overlay import failed — submit REFUSED, woven output untouched (refusals=%u)", n + 1);
+	}
+}
+
 static void
 weave_slots_release_all(struct vk_bundle *vk, struct comp_multi_weave_linux_slot *slots)
 {
@@ -2619,12 +2641,21 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		}
 
 		// v4 overlay: window-sized premul atlas, same import cache shape. A
-		// failed overlay import only drops the overlay (as on macOS / Android).
+		// chained overlay that cannot be imported REFUSES the submit, before
+		// the woven output is touched (the D3D11 service's rule, see
+		// weave_overlay_refused): the caller then still holds the last
+		// composed frame and decides itself whether to hold it or to paint its
+		// 2D on its own. Dropping the overlay and weaving anyway would hand
+		// back a "successful" frame with the caller's 2D missing.
 		struct comp_multi_weave_linux_slot *ov = NULL;
 		if (ov_fd >= 0) {
 			uint32_t ov_w = mc->weave.have_geometry ? mc->weave.win_w : in_w;
 			uint32_t ov_h = mc->weave.have_geometry ? mc->weave.win_h : in_h;
 			ov = weave_cache_acquire(vk, mc, mc->weave.ov_slots, ov_fd, NULL, ov_w, ov_h, "overlay");
+			if (ov == NULL) {
+				weave_overlay_refused(mc);
+				break;
+			}
 		}
 
 		const bool want_dmabuf_out = weave_want_dmabuf_output(vk, mc, false);
@@ -2779,6 +2810,13 @@ comp_multi_weave_submit_dmabuf(struct xrt_compositor *xc,
 		if (ov_fd >= 0) {
 			ov_slot = weave_cache_acquire(vk, mc, mc->weave.ov_slots, ov_fd, overlay, overlay->width,
 			                              overlay->height, "overlay");
+			if (ov_slot == NULL) {
+				// Refused before the acquire fence is taken and before the
+				// woven output is touched (weave_overlay_refused). The fence
+				// closes in the epilogue below.
+				weave_overlay_refused(mc);
+				break;
+			}
 		}
 
 		// Last step before recording: the acquire fence (consumed here on

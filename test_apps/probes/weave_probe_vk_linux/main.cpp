@@ -82,6 +82,7 @@
 #include "weave_dmabuf_vk.h"
 
 #include <dirent.h>
+#include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -900,6 +901,93 @@ run_dmabuf(Vk &vk,
 		LOG("%s: %d/%d frames had wrong pixels", release_wait ? "FAIL" : "negative control", bad_frames, frames);
 		pass = false;
 	}
+	// ---- An overlay the service cannot import REFUSES the submit, and the
+	// woven output is left exactly as the previous accepted submit left it
+	// (the D3D11 service's rule; XR_DXR_weave.md §5d). A memfd is a valid fd
+	// that is no dma-buf, so its import fails in the service and nowhere
+	// earlier. The input carries the parity the NEXT frame would have, so an
+	// engine that dropped the overlay and wove anyway shows up as a flipped
+	// rect in the readback, not only as a success code.
+	{
+		const int last_k = (frames - 1) & 1;
+		const int k = frames & 1;
+		int acq_fd = -1;
+		bool refuse_ok = dmabuf_upload(c, input[k], staging[k], true, &acq_fd);
+		const int bogus = refuse_ok ? memfd_create("dxr-not-a-dmabuf", MFD_CLOEXEC) : -1;
+		if (bogus >= 0 && ftruncate(bogus, (off_t)overlay.stride * overlay.h) != 0) {
+			refuse_ok = false;
+		}
+		if (refuse_ok && bogus >= 0) {
+			XrWeaveDmabufDescDXR in_desc = {(XrStructureType)XR_TYPE_WEAVE_DMABUF_DESC_DXR};
+			weave_fill_dmabuf_desc(in_desc, input[k], dup(input[k].fd), (uint64_t)(k + 1));
+			XrWeaveOverlayDmabufDescDXR ov_desc = {(XrStructureType)XR_TYPE_WEAVE_OVERLAY_DMABUF_DESC_DXR};
+			weave_fill_overlay_desc(ov_desc, overlay, dup(bogus), 0);
+			XrWeaveSubmitSyncDXR sync = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_SYNC_DXR};
+			sync.acquireFenceFd = acq_fd;
+			XrWeaveSubmitOverlaysDXR ov = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_OVERLAYS_DXR};
+			XrWeaveSubmitRectsDXR batch = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_RECTS_DXR};
+			batch.rectCount = 2;
+			batch.rects = rects;
+			ov_desc.next = &sync;
+			in_desc.next = &ov_desc;
+			ov.next = &in_desc;
+			batch.next = &ov;
+			XrWeaveSubmitInfoDXR submit = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_INFO_DXR};
+			submit.next = &batch;
+			submit.firstChunk = XR_TRUE;
+			XrWeaveOutputSyncDXR out_sync = {(XrStructureType)XR_TYPE_WEAVE_OUTPUT_SYNC_DXR};
+			XrWeaveOutputDmabufDXR out_dmabuf = {(XrStructureType)XR_TYPE_WEAVE_OUTPUT_DMABUF_DXR};
+			out_dmabuf.next = &out_sync;
+			XrWeaveOutputDXR out = {(XrStructureType)XR_TYPE_WEAVE_OUTPUT_DXR};
+			out.next = &out_dmabuf;
+			const XrResult r = pfn_submit(session, &submit, &out);
+			if (XR_SUCCEEDED(r)) {
+				// The runtime owns what we passed; close only what it handed back.
+				if (out_dmabuf.fd >= 0) {
+					close(out_dmabuf.fd);
+				}
+				int rel = out_sync.releaseFenceFd;
+				if (!dmabuf_readback(c, output, rb, rel)) {
+					return false;
+				}
+				LOG("FAIL: a submit whose overlay cannot be imported was ACCEPTED (the overlay was dropped "
+				    "and the frame woven anyway)");
+				pass = false;
+			} else {
+				close(in_desc.fd);
+				close(ov_desc.fd);
+				close(acq_fd);
+				// No release fence: nothing was submitted. The output must still be
+				// the last accepted frame's (parity last_k).
+				if (!dmabuf_readback(c, output, rb, -1)) {
+					return false;
+				}
+				std::vector<uint8_t> px((const uint8_t *)rb.map, (const uint8_t *)rb.map + rb.size);
+				uint8_t ar, ag, ab, aa;
+				sample(px, kWinW, kRectA.offset.x + kRectA.extent.width / 2,
+				       kRectA.offset.y + kRectA.extent.height / 2, &ar, &ag, &ab, &aa);
+				const bool red_a = ar > 150 && ag < 80 && ab < 80;
+				const bool cyan_a = ar < 80 && ag > 150 && ab > 150;
+				const bool untouched = last_k == 0 ? red_a : cyan_a;
+				LOG("unreadable overlay: submit refused (%d); woven output %s (rectA %u,%u,%u, last parity %d)",
+				    (int)r, untouched ? "UNTOUCHED" : "CHANGED", ar, ag, ab, last_k);
+				if (!untouched) {
+					LOG("FAIL: the refused submit touched the woven output");
+					pass = false;
+				}
+			}
+		} else {
+			if (acq_fd >= 0) {
+				close(acq_fd);
+			}
+			LOG("FAIL: unreadable-overlay case setup");
+			pass = false;
+		}
+		if (bogus >= 0) {
+			close(bogus);
+		}
+	}
+
 	weave_destroy_dmabuf_image(vk.device, output);
 
 	// ---- v6 N-view atlas over dma-buf (2x1 red|cyan, zero-copy) -> WHITE.

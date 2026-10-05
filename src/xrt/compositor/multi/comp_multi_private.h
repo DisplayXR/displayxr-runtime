@@ -1051,6 +1051,9 @@ struct multi_compositor
 		bool release_fallback_warned;   //!< One-shot: release export failed, back to synchronous.
 		bool out_kind_warned;           //!< One-shot: output kind switched on a client request.
 		                                //! @}
+		//! Submits refused because their chained overlay could not be
+		//! imported (weave_overlay_refused; throttles its log line).
+		uint32_t overlay_refusals;
 	} weave;
 #endif
 };
