@@ -2126,6 +2126,43 @@ weave_run_frame(struct vk_bundle *vk,
 		skip_weave = true;
 	}
 
+	// 2D under the lens (ADR-027 Amendment): offer the v4 overlay to the DP so
+	// it composites the layer INSIDE the weave and band-limits it for the lens,
+	// instead of the post-weave blend below (which aliases per eye wherever the
+	// lens is on). Only when this frame weaves and the layer is exactly the
+	// output (= the process_atlas target) size — the slot's contract. The layer
+	// is taken from the producer and put in SHADER_READ_ONLY here, BEFORE the
+	// self-submitting split below, so it is ready when the DP's reads execute
+	// whichever command buffer they land in. A DP that declines (no slot, no SR
+	// compose, transparency, 2D content, ...) leaves the post-weave blend to do
+	// exactly what it did before; the layer is then already acquired.
+	struct xrt_display_processor_vk *dp_vk = (struct xrt_display_processor_vk *)mc->weave.dp;
+	bool ov_acquired = false; // ov taken from the producer and in SHADER_READ_ONLY_OPTIMAL
+	bool ov_in_dp = false;    // the DP composites ov in this frame's process_atlas
+	if (ov != NULL && !skip_weave && ov->w == mc->weave.out_w && ov->h == mc->weave.out_h &&
+	    xrt_display_processor_vk_supports_overlay_2d(dp_vk)) {
+		weave_acquire_slot(vk, cmd, ov, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+		weave_layout_barrier(vk, cmd, ov->image, VK_IMAGE_LAYOUT_GENERAL,
+		                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, VK_ACCESS_SHADER_READ_BIT,
+		                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+		ov->first_use = false;
+		ov_acquired = true;
+		// v15 strength first: the D3D11 order, and a DP may key its weave on both.
+		xrt_display_processor_vk_set_overlay_2d_filter_strength(dp_vk, mc->weave.overlay_filter_strength);
+		ov_in_dp =
+		    xrt_display_processor_vk_set_overlay_2d(dp_vk, ov->view, (VkFormat_XDP)ov->format, ov->w, ov->h,
+		                                            XRT_ATLAS_ENCODING_ENCODED, mc->weave.overlay_unchanged);
+	}
+	if (ov != NULL) {
+		const uint8_t verdict = ov_in_dp ? 2u : 1u;
+		if (verdict != mc->weave.overlay_in_dp) {
+			mc->weave.overlay_in_dp = verdict;
+			U_LOG_W("weave: 2D overlay (%ux%u) %s", ov->w, ov->h,
+			        ov_in_dp ? "composited by the display processor INSIDE the weave (2D under the lens)"
+			                 : "blended post-weave by the runtime (the DP did not take it this frame)");
+		}
+	}
+
 	// SELF-SUBMITTING DP ORDERING (Android #1036's one-frame trail fix): a
 	// DP that submits its own batch during process_atlas would otherwise
 	// execute BEFORE this frame's blits (still unsubmitted in cmd). Flush
@@ -2233,9 +2270,9 @@ weave_run_frame(struct vk_bundle *vk,
 	// input is window-sized in register with the output; otherwise (v6 /
 	// legacy, where the input holds views, not a page) the flat view the
 	// off-panel bands use.
+	struct u_wl_rect_px flat[WEAVE_FLAT_MAX_RECTS];
+	const uint32_t flat_count = weave_flat_rects(mc, nview, flat_rect_count, flat_rects, flat);
 	{
-		struct u_wl_rect_px flat[WEAVE_FLAT_MAX_RECTS];
-		const uint32_t flat_count = weave_flat_rects(mc, nview, flat_rect_count, flat_rects, flat);
 		if (flat_count > 0) {
 			const bool page_source = !nview && rect_count > 0;
 			if (page_source) {
@@ -2269,16 +2306,34 @@ weave_run_frame(struct vk_bundle *vk,
 
 	// v4 overlay atlas (browser#18): composite the caller's window-sized
 	// premultiplied 2D atlas OVER the woven output — not woven, drawn after
-	// process_atlas onto the same attachment.
+	// process_atlas onto the same attachment. When the DP already composited it
+	// inside the weave (ov_in_dp), only the off-panel bands and flat regions
+	// painted over the weave above need it again: those were cleared and
+	// re-painted flat, so the layer is redrawn there (and only there), keeping
+	// 2D readable on both sides of a seam exactly as before.
 	if (ov != NULL) {
-		if (weave_blend_begin(vk, mc, &blend_begun)) {
-			weave_acquire_slot(vk, cmd, ov, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-			                   VK_ACCESS_SHADER_READ_BIT);
-			weave_layout_barrier(vk, cmd, ov->image, VK_IMAGE_LAYOUT_GENERAL,
-			                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, VK_ACCESS_SHADER_READ_BIT,
-			                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-			                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-			ov->first_use = false;
+		struct u_wl_rect_px redo[ARRAY_SIZE(offpanel) + WEAVE_FLAT_MAX_RECTS];
+		uint32_t redo_count = 0;
+		if (ov_in_dp) {
+			for (uint32_t i = 0; i < offpanel_count && redo_count < ARRAY_SIZE(redo); i++) {
+				redo[redo_count++] = offpanel[i];
+			}
+			for (uint32_t i = 0; i < flat_count && redo_count < ARRAY_SIZE(redo); i++) {
+				redo[redo_count++] = flat[i];
+			}
+		}
+		const bool draw = ov_in_dp ? redo_count > 0 : true;
+		if (draw && weave_blend_begin(vk, mc, &blend_begun)) {
+			if (!ov_acquired) {
+				weave_acquire_slot(vk, cmd, ov, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+				                   VK_ACCESS_SHADER_READ_BIT);
+				weave_layout_barrier(vk, cmd, ov->image, VK_IMAGE_LAYOUT_GENERAL,
+				                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0,
+				                     VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+				                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+				ov->first_use = false;
+				ov_acquired = true;
+			}
 
 			weave_layout_barrier(vk, cmd, mc->weave.out_image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 			                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -2287,14 +2342,29 @@ weave_run_frame(struct vk_bundle *vk,
 			                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 			                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
 
-			vk_local2d_composite_flatten_draw(&mc->weave.overlay_blend, vk, cmd, mc->weave.out_fb,
-			                                  mc->weave.out_w, mc->weave.out_h,
-			                                  ov->view, //
-			                                  0, 0, mc->weave.out_w,
-			                                  mc->weave.out_h,        // dst = full window
-			                                  0.0f, 0.0f, 1.0f, 1.0f, // src = whole atlas
-			                                  /*unpremultiplied*/ false);
-
+			if (!ov_in_dp) {
+				vk_local2d_composite_flatten_draw(&mc->weave.overlay_blend, vk, cmd, mc->weave.out_fb,
+				                                  mc->weave.out_w, mc->weave.out_h,
+				                                  ov->view, //
+				                                  0, 0, mc->weave.out_w,
+				                                  mc->weave.out_h,        // dst = full window
+				                                  0.0f, 0.0f, 1.0f, 1.0f, // src = whole atlas
+				                                  /*unpremultiplied*/ false);
+			} else {
+				// The layer is output-sized (checked before it went to the DP),
+				// so each rect samples it 1:1 at its own position.
+				for (uint32_t i = 0; i < redo_count; i++) {
+					const struct u_wl_rect_px r = redo[i];
+					vk_local2d_composite_flatten_draw(
+					    &mc->weave.overlay_blend, vk, cmd, mc->weave.out_fb, mc->weave.out_w,
+					    mc->weave.out_h, ov->view, r.x, r.y, (uint32_t)r.w, (uint32_t)r.h,
+					    (float)r.x / (float)ov->w, (float)r.y / (float)ov->h,
+					    (float)r.w / (float)ov->w, (float)r.h / (float)ov->h,
+					    /*unpremultiplied*/ false);
+				}
+			}
+		}
+		if (ov_acquired) {
 			weave_layout_barrier(vk, cmd, ov->image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 			                     VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT, 0,
 			                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
@@ -2882,6 +2952,22 @@ comp_multi_weave_linux_set_mono_in_2d(struct xrt_compositor *xc, bool mono_in_2d
 	weave_ensure_mutex(mc);
 	os_mutex_lock(&mc->weave.mutex);
 	mc->weave.mono_in_2d = mono_in_2d;
+	os_mutex_unlock(&mc->weave.mutex);
+}
+
+void
+comp_multi_weave_linux_set_overlay_hints(struct xrt_compositor *xc, bool overlay_unchanged, float filter_strength)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (mc == NULL || mc->msc == NULL) {
+		return;
+	}
+	weave_ensure_mutex(mc);
+	os_mutex_lock(&mc->weave.mutex);
+	mc->weave.overlay_unchanged = overlay_unchanged;
+	// Out of range (incl. NaN) = not set by the app: the DP's own default.
+	mc->weave.overlay_filter_strength =
+	    (filter_strength >= 0.0f && filter_strength <= 1.0f) ? filter_strength : -1.0f;
 	os_mutex_unlock(&mc->weave.mutex);
 }
 
