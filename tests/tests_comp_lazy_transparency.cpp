@@ -60,7 +60,9 @@ size_without_slot()
 TEST_CASE("lazy_transparency: the slot is appended, not inserted")
 {
 	CHECK(size_without_slot() == sizeof(struct xrt_display_processor) + 14 * sizeof(void *));
-	CHECK(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 15 * sizeof(void *));
+	// Later appends (set_overlay_2d, ADR-027 Amendment) follow it directly.
+	CHECK(offsetof(struct xrt_display_processor_vk, set_overlay_2d) ==
+	      sizeof(struct xrt_display_processor) + 15 * sizeof(void *));
 }
 
 TEST_CASE("lazy_transparency: an older plug-in is unsupported and never called")

@@ -54,6 +54,7 @@ set(tests
     tests_aux_display_mode_hold
     tests_comp_rear_budget
     tests_comp_lazy_transparency
+    tests_comp_overlay_2d_vk
     tests_oxr_weave_latch
     tests_oxr_layer_space
     tests_oxr_view_config_rule
