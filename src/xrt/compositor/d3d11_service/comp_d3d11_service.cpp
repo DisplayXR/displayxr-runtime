@@ -814,23 +814,37 @@ struct d3d11_client_render_resources
 	//! negative = the DP's default. Consumed (reset to -1) by the submit.
 	float                                  weave_overlay_filter_strength_next;
 
-	//! DXR_WEAVE_GPU_TIMING=1 diagnostic (ADR-027 Amendment perf A/B): a ring of
-	//! disjoint + 3 timestamp queries per weave_submit — T0 before the ingest
-	//! copies, T1 after process_atlas (ingest + weave, incl. any in-weave 2D
-	//! compose), T2 after the post-weave overlay blit. Read back non-blocking,
-	//! frames late; averaged and logged every 5 s. Created lazily, only when
-	//! the env var is set.
-	static constexpr uint32_t kWeaveGpuRing = 4;
+	//! DXR_WEAVE_GPU_TIMING=1 diagnostic (ADR-027 Amendment perf A/B; "2D under
+	//! the lens" P0 instrumentation). Per weave_submit: a disjoint + kWeaveTs
+	//! timestamp queries bracketing each GPU stage (WEAVE_TS_*), read back
+	//! non-blocking frames late (a slot still in flight when the ring wraps is
+	//! dropped, never waited on), plus CPU wall times of the lock / keyed-mutex
+	//! waits and of the whole synchronous submit. Aggregated and logged once
+	//! every 5 s. Queries are created lazily, only when the env var is set; the
+	//! all-zero state is the valid initial state.
+	static constexpr uint32_t kWeaveGpuRing = 8;
+	static constexpr uint32_t kWeaveTs = 6;
+	struct weave_timing_stat
+	{
+		double sum;
+		double max;
+		uint32_t n;
+	};
 	wil::com_ptr<ID3D11Query>              weave_gpu_disjoint[kWeaveGpuRing];
-	wil::com_ptr<ID3D11Query>              weave_gpu_ts[kWeaveGpuRing][3];
+	wil::com_ptr<ID3D11Query>              weave_gpu_ts[kWeaveGpuRing][kWeaveTs];
 	bool                                   weave_gpu_pending[kWeaveGpuRing];
-	bool                                   weave_gpu_dp_overlay[kWeaveGpuRing];
+	uint8_t                                weave_gpu_path[kWeaveGpuRing];  //!< WEAVE_PATH_*
+	uint8_t                                weave_gpu_route[kWeaveGpuRing]; //!< WEAVE_OV_*
 	uint32_t                               weave_gpu_head;
-	double                                 weave_gpu_sum_weave_ms;
-	double                                 weave_gpu_sum_blit_ms;
-	double                                 weave_gpu_max_weave_ms;
-	uint32_t                               weave_gpu_n;
-	uint32_t                               weave_gpu_n_dp_overlay;
+	weave_timing_stat                      weave_gpu_stage[7];   //!< ms, by WEAVE_GPU_*
+	uint32_t                               weave_gpu_n;          //!< frames read back
+	uint32_t                               weave_gpu_n_disjoint; //!< frames discarded (disjoint)
+	weave_timing_stat                      weave_cpu_stage[5];   //!< ms, by WEAVE_CPU_*
+	uint32_t                               weave_cpu_n;          //!< accepted submits
+	uint32_t                               weave_cpu_refused;    //!< refused after render_mutex
+	uint32_t                               weave_cpu_path_n[4];  //!< accepted submits by WEAVE_PATH_*
+	uint32_t                               weave_cpu_route_n[3]; //!< accepted submits by WEAVE_OV_*
+	uint32_t                               weave_cpu_ov_unchanged; //!< overlay declared unchanged (v14)
 	int64_t                                weave_gpu_last_log_ns;
 
 	//! Deferred auto-3D for no-zones standalone clients (#140 / no-zones-2D).
@@ -25515,11 +25529,79 @@ weave_close_cached(HANDLE h, bool is_dxgi)
 }
 
 /*
- * DXR_WEAVE_GPU_TIMING=1 — GPU time of the present-owner weave (ADR-027
- * Amendment perf A/B: iGPU vs dGPU, compose on/off). Diagnostic only; env read
- * once. Non-blocking: a query set still in flight when its ring slot comes
- * round again is dropped, never waited on (this runs under render_mutex).
+ * DXR_WEAVE_GPU_TIMING=1 — per-stage cost of the present-owner weave (ADR-027
+ * Amendment perf A/B: iGPU vs dGPU, compose on/off; "2D under the lens" P0
+ * instrumentation). Diagnostic only, off by default; env read once.
+ *
+ * GPU: six timestamps per submit bracket the stages —
+ *   BEGIN | #1058 output clear | CLEARED | ingest (v6 crop copy + lift, or the
+ *   batch SBS scratch clear + per-rect blits; nothing on v6 zero-copy / legacy)
+ *   | PRE_WEAVE | set_overlay_2d + process_atlas (the DP's weave, incl. any
+ *   in-weave 2D compose and its alpha gate) | POST_WEAVE | runtime post-weave
+ *   overlay blit (fallback) | POST_FALLBACK | wish publish + diag epilogue | END
+ * Non-blocking: a query set still in flight when its ring slot comes round
+ * again is dropped, never waited on (this runs under render_mutex).
+ *
+ * CPU: wall time of the render_mutex and immediate_ctx_mutex waits, the input
+ * and overlay keyed-mutex acquires, and the whole synchronous submit (entry to
+ * return, incl. the fence signal + flush).
+ *
+ * One WARN line per client every 5 s (never per frame).
  */
+enum weave_timing_ts
+{
+	WEAVE_TS_BEGIN = 0,
+	WEAVE_TS_CLEARED,
+	WEAVE_TS_PRE_WEAVE,
+	WEAVE_TS_POST_WEAVE,
+	WEAVE_TS_POST_FALLBACK,
+	WEAVE_TS_END,
+	WEAVE_TS_COUNT,
+};
+enum weave_timing_gpu_stage
+{
+	WEAVE_GPU_CLEAR_1058 = 0, //!< frames that cleared the output only
+	WEAVE_GPU_INPUT_COPY,     //!< v6 crop path only (copy + lift)
+	WEAVE_GPU_SBS,            //!< batch path only (scratch clear + blits)
+	WEAVE_GPU_WEAVE,          //!< set_overlay_2d + process_atlas
+	WEAVE_GPU_FALLBACK,       //!< frames whose overlay took the runtime blit only
+	WEAVE_GPU_EPILOGUE,       //!< wish publish + diag, before the fence signal
+	WEAVE_GPU_TOTAL,          //!< BEGIN..END
+	WEAVE_GPU_STAGE_COUNT,
+};
+enum weave_timing_cpu_stage
+{
+	WEAVE_CPU_RENDER_MUTEX = 0,
+	WEAVE_CPU_CTX_MUTEX,
+	WEAVE_CPU_IN_ACQUIRE,
+	WEAVE_CPU_OV_ACQUIRE, //!< submits that carried an overlay only
+	WEAVE_CPU_SUBMIT,
+	WEAVE_CPU_STAGE_COUNT,
+};
+enum weave_timing_path
+{
+	WEAVE_PATH_V6_ZERO_COPY = 0,
+	WEAVE_PATH_V6_CROP,
+	WEAVE_PATH_BATCH,
+	WEAVE_PATH_LEGACY,
+	WEAVE_PATH_COUNT,
+};
+enum weave_timing_route
+{
+	WEAVE_OV_NONE = 0, //!< no overlay this submit
+	WEAVE_OV_DP,       //!< the DP composited it inside the weave
+	WEAVE_OV_FALLBACK, //!< the runtime's post-weave blit composited it
+	WEAVE_OV_COUNT,
+};
+static_assert(WEAVE_TS_COUNT == d3d11_client_render_resources::kWeaveTs, "timestamp count");
+static_assert(WEAVE_GPU_STAGE_COUNT == ARRAY_SIZE(d3d11_client_render_resources::weave_gpu_stage), "gpu stages");
+static_assert(WEAVE_CPU_STAGE_COUNT == ARRAY_SIZE(d3d11_client_render_resources::weave_cpu_stage), "cpu stages");
+static_assert(WEAVE_PATH_COUNT == ARRAY_SIZE(d3d11_client_render_resources::weave_cpu_path_n), "paths");
+static_assert(WEAVE_OV_COUNT == ARRAY_SIZE(d3d11_client_render_resources::weave_cpu_route_n), "routes");
+
+//! weave_gpu_route[] packs the route in bits 0-1 and "output cleared" in bit 2.
+#define WEAVE_GPU_FLAG_CLEARED 0x4u
+
 static bool
 weave_gpu_timing_enabled(void)
 {
@@ -25528,10 +25610,27 @@ weave_gpu_timing_enabled(void)
 		const char *v = getenv("DXR_WEAVE_GPU_TIMING");
 		s_on = (v != nullptr && v[0] == '1') ? 1 : 0;
 		if (s_on == 1) {
-			U_LOG_W("DXR_WEAVE_GPU_TIMING=1: logging present-owner weave GPU time every 5 s");
+			U_LOG_W(
+			    "DXR_WEAVE_GPU_TIMING=1: logging present-owner weave stage timing (GPU + CPU) every 5 s");
 		}
 	}
 	return s_on == 1;
+}
+
+static void
+weave_timing_stat_add(d3d11_client_render_resources::weave_timing_stat &s, double v)
+{
+	s.sum += v;
+	if (v > s.max) {
+		s.max = v;
+	}
+	s.n++;
+}
+
+static double
+weave_timing_stat_avg(const d3d11_client_render_resources::weave_timing_stat &s)
+{
+	return s.n > 0 ? s.sum / (double)s.n : 0.0;
 }
 
 static void
@@ -25541,12 +25640,12 @@ weave_gpu_timing_collect(struct d3d11_service_system *sys, struct d3d11_client_r
 		return;
 	}
 	D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj = {};
-	UINT64 t[3] = {};
+	UINT64 t[WEAVE_TS_COUNT] = {};
 	ID3D11DeviceContext *ctx = sys->context.get();
 	if (ctx->GetData(r->weave_gpu_disjoint[slot].get(), &dj, sizeof(dj), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) {
 		return; // still in flight — keep it pending
 	}
-	for (int i = 0; i < 3; i++) {
+	for (int i = 0; i < WEAVE_TS_COUNT; i++) {
 		if (ctx->GetData(r->weave_gpu_ts[slot][i].get(), &t[i], sizeof(t[i]), D3D11_ASYNC_GETDATA_DONOTFLUSH) !=
 		    S_OK) {
 			return;
@@ -25554,98 +25653,189 @@ weave_gpu_timing_collect(struct d3d11_service_system *sys, struct d3d11_client_r
 	}
 	r->weave_gpu_pending[slot] = false;
 	if (dj.Disjoint || dj.Frequency == 0) {
+		r->weave_gpu_n_disjoint++;
 		return;
 	}
 	const double to_ms = 1000.0 / (double)dj.Frequency;
-	const double weave_ms = (double)(t[1] - t[0]) * to_ms;
-	const double blit_ms = (double)(t[2] - t[1]) * to_ms;
-	r->weave_gpu_sum_weave_ms += weave_ms;
-	r->weave_gpu_sum_blit_ms += blit_ms;
-	if (weave_ms > r->weave_gpu_max_weave_ms) {
-		r->weave_gpu_max_weave_ms = weave_ms;
+	auto span = [&](int a, int b) { return t[b] >= t[a] ? (double)(t[b] - t[a]) * to_ms : 0.0; };
+	const uint8_t path = r->weave_gpu_path[slot];
+	const uint8_t route = r->weave_gpu_route[slot] & 0x3u;
+	if ((r->weave_gpu_route[slot] & WEAVE_GPU_FLAG_CLEARED) != 0) {
+		weave_timing_stat_add(r->weave_gpu_stage[WEAVE_GPU_CLEAR_1058], span(WEAVE_TS_BEGIN, WEAVE_TS_CLEARED));
 	}
+	if (path == WEAVE_PATH_V6_CROP) {
+		weave_timing_stat_add(r->weave_gpu_stage[WEAVE_GPU_INPUT_COPY],
+		                      span(WEAVE_TS_CLEARED, WEAVE_TS_PRE_WEAVE));
+	} else if (path == WEAVE_PATH_BATCH) {
+		weave_timing_stat_add(r->weave_gpu_stage[WEAVE_GPU_SBS], span(WEAVE_TS_CLEARED, WEAVE_TS_PRE_WEAVE));
+	}
+	weave_timing_stat_add(r->weave_gpu_stage[WEAVE_GPU_WEAVE], span(WEAVE_TS_PRE_WEAVE, WEAVE_TS_POST_WEAVE));
+	if (route == WEAVE_OV_FALLBACK) {
+		weave_timing_stat_add(r->weave_gpu_stage[WEAVE_GPU_FALLBACK],
+		                      span(WEAVE_TS_POST_WEAVE, WEAVE_TS_POST_FALLBACK));
+	}
+	weave_timing_stat_add(r->weave_gpu_stage[WEAVE_GPU_EPILOGUE], span(WEAVE_TS_POST_FALLBACK, WEAVE_TS_END));
+	weave_timing_stat_add(r->weave_gpu_stage[WEAVE_GPU_TOTAL], span(WEAVE_TS_BEGIN, WEAVE_TS_END));
 	r->weave_gpu_n++;
-	if (r->weave_gpu_dp_overlay[slot]) {
-		r->weave_gpu_n_dp_overlay++;
-	}
 }
 
-//! Returns the ring slot to stamp this submit into, or UINT32_MAX when off.
-static uint32_t
-weave_gpu_timing_begin(struct d3d11_service_system *sys, struct d3d11_client_render_resources *r)
+/*!
+ * One submit's GPU timestamp set. RAII: a submit that bails out after begin()
+ * closes the disjoint query and discards the set (never read back). Declare it
+ * AFTER the immediate_ctx_mutex guard so every End() runs under that lock.
+ */
+struct weave_gpu_frame
 {
-	if (!weave_gpu_timing_enabled()) {
-		return UINT32_MAX;
-	}
-	for (uint32_t i = 0; i < d3d11_client_render_resources::kWeaveGpuRing; i++) {
-		weave_gpu_timing_collect(sys, r, i);
-	}
-	const uint32_t slot = r->weave_gpu_head;
-	r->weave_gpu_head = (slot + 1) % d3d11_client_render_resources::kWeaveGpuRing;
-	if (!r->weave_gpu_disjoint[slot]) {
-		D3D11_QUERY_DESC qd = {D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
-		if (FAILED(sys->device->CreateQuery(&qd, r->weave_gpu_disjoint[slot].put()))) {
-			return UINT32_MAX;
+	struct d3d11_service_system *sys = nullptr;
+	struct d3d11_client_render_resources *r = nullptr;
+	uint32_t slot = UINT32_MAX;
+	bool ended = false;
+
+	void
+	begin(struct d3d11_service_system *s, struct d3d11_client_render_resources *res)
+	{
+		if (!weave_gpu_timing_enabled()) {
+			return;
 		}
-		qd.Query = D3D11_QUERY_TIMESTAMP;
-		for (int i = 0; i < 3; i++) {
-			if (FAILED(sys->device->CreateQuery(&qd, r->weave_gpu_ts[slot][i].put()))) {
-				r->weave_gpu_disjoint[slot].reset();
-				return UINT32_MAX;
+		sys = s;
+		r = res;
+		for (uint32_t i = 0; i < d3d11_client_render_resources::kWeaveGpuRing; i++) {
+			weave_gpu_timing_collect(sys, r, i);
+		}
+		const uint32_t sl = r->weave_gpu_head;
+		r->weave_gpu_head = (sl + 1) % d3d11_client_render_resources::kWeaveGpuRing;
+		if (!r->weave_gpu_disjoint[sl]) {
+			D3D11_QUERY_DESC qd = {D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
+			if (FAILED(sys->device->CreateQuery(&qd, r->weave_gpu_disjoint[sl].put()))) {
+				return;
+			}
+			qd.Query = D3D11_QUERY_TIMESTAMP;
+			for (uint32_t i = 0; i < WEAVE_TS_COUNT; i++) {
+				if (FAILED(sys->device->CreateQuery(&qd, r->weave_gpu_ts[sl][i].put()))) {
+					r->weave_gpu_disjoint[sl].reset();
+					return;
+				}
 			}
 		}
+		r->weave_gpu_pending[sl] = false; // a slot still in flight is dropped, not waited on
+		sys->context->Begin(r->weave_gpu_disjoint[sl].get());
+		sys->context->End(r->weave_gpu_ts[sl][WEAVE_TS_BEGIN].get());
+		slot = sl;
 	}
-	r->weave_gpu_pending[slot] = false; // a slot still in flight is dropped, not waited on
-	sys->context->Begin(r->weave_gpu_disjoint[slot].get());
-	sys->context->End(r->weave_gpu_ts[slot][0].get());
-	return slot;
-}
 
-static void
-weave_gpu_timing_stamp(struct d3d11_service_system *sys, struct d3d11_client_render_resources *r, uint32_t slot, int i)
-{
-	if (slot != UINT32_MAX) {
-		sys->context->End(r->weave_gpu_ts[slot][i].get());
+	void
+	stamp(int i)
+	{
+		if (slot != UINT32_MAX && !ended) {
+			sys->context->End(r->weave_gpu_ts[slot][i].get());
+		}
 	}
-}
 
+	void
+	end(uint8_t path, uint8_t route, bool cleared)
+	{
+		if (slot == UINT32_MAX || ended) {
+			return;
+		}
+		sys->context->End(r->weave_gpu_ts[slot][WEAVE_TS_END].get());
+		sys->context->End(r->weave_gpu_disjoint[slot].get());
+		r->weave_gpu_pending[slot] = true;
+		r->weave_gpu_path[slot] = path;
+		r->weave_gpu_route[slot] = (uint8_t)(route | (cleared ? WEAVE_GPU_FLAG_CLEARED : 0u));
+		ended = true;
+	}
+
+	~weave_gpu_frame()
+	{
+		if (slot != UINT32_MAX && !ended) {
+			sys->context->End(r->weave_gpu_disjoint[slot].get()); // discarded: stays not-pending
+		}
+	}
+};
+
+/*!
+ * Fold one ACCEPTED submit's CPU times + route into the window, and log the
+ * window once every 5 s. @p cpu_ms is indexed by WEAVE_CPU_*; a negative
+ * entry is "not applicable this submit" (no overlay -> no ov_acquire).
+ */
 static void
-weave_gpu_timing_end(struct d3d11_service_system *sys,
+weave_timing_account(struct d3d11_service_system *sys,
                      struct d3d11_client_render_resources *r,
-                     uint32_t slot,
-                     bool dp_overlay,
+                     const double cpu_ms[WEAVE_CPU_STAGE_COUNT],
+                     uint8_t path,
+                     uint8_t route,
+                     bool ov_unchanged,
                      uint32_t win_w,
                      uint32_t win_h)
 {
-	if (slot == UINT32_MAX) {
+	if (!weave_gpu_timing_enabled()) {
 		return;
 	}
-	sys->context->End(r->weave_gpu_ts[slot][2].get());
-	sys->context->End(r->weave_gpu_disjoint[slot].get());
-	r->weave_gpu_pending[slot] = true;
-	r->weave_gpu_dp_overlay[slot] = dp_overlay;
+	for (int i = 0; i < WEAVE_CPU_STAGE_COUNT; i++) {
+		if (cpu_ms[i] >= 0.0) {
+			weave_timing_stat_add(r->weave_cpu_stage[i], cpu_ms[i]);
+		}
+	}
+	r->weave_cpu_n++;
+	r->weave_cpu_path_n[path]++;
+	r->weave_cpu_route_n[route]++;
+	if (route != WEAVE_OV_NONE && ov_unchanged) {
+		r->weave_cpu_ov_unchanged++;
+	}
 
 	const int64_t now = (int64_t)os_monotonic_get_ns();
-	if (r->weave_gpu_n > 0 && now - r->weave_gpu_last_log_ns >= 5LL * 1000 * 1000 * 1000) {
-		r->weave_gpu_last_log_ns = now;
-		DXGI_ADAPTER_DESC ad = {};
-		wil::com_ptr<IDXGIDevice> dxgi_dev;
-		wil::com_ptr<IDXGIAdapter> adapter;
-		if (SUCCEEDED(sys->device->QueryInterface(IID_PPV_ARGS(dxgi_dev.put()))) &&
-		    SUCCEEDED(dxgi_dev->GetAdapter(adapter.put()))) {
-			adapter->GetDesc(&ad);
-		}
-		U_LOG_W("weave GPU time [%ls] %ux%u: ingest+weave avg %.3f ms (max %.3f), post-weave overlay blit "
-		        "avg %.3f ms, n=%u (%u with the 2D layer composited in the weave)",
-		        ad.Description, win_w, win_h, r->weave_gpu_sum_weave_ms / r->weave_gpu_n,
-		        r->weave_gpu_max_weave_ms, r->weave_gpu_sum_blit_ms / r->weave_gpu_n, r->weave_gpu_n,
-		        r->weave_gpu_n_dp_overlay);
-		r->weave_gpu_sum_weave_ms = 0.0;
-		r->weave_gpu_sum_blit_ms = 0.0;
-		r->weave_gpu_max_weave_ms = 0.0;
-		r->weave_gpu_n = 0;
-		r->weave_gpu_n_dp_overlay = 0;
+	if (r->weave_gpu_last_log_ns == 0) {
+		r->weave_gpu_last_log_ns = now; // open the first window
+		return;
 	}
+	const int64_t window_ns = now - r->weave_gpu_last_log_ns;
+	if (window_ns < 5LL * 1000 * 1000 * 1000) {
+		return;
+	}
+	r->weave_gpu_last_log_ns = now;
+
+	DXGI_ADAPTER_DESC ad = {};
+	wil::com_ptr<IDXGIDevice> dxgi_dev;
+	wil::com_ptr<IDXGIAdapter> adapter;
+	if (SUCCEEDED(sys->device->QueryInterface(IID_PPV_ARGS(dxgi_dev.put()))) &&
+	    SUCCEEDED(dxgi_dev->GetAdapter(adapter.put()))) {
+		adapter->GetDesc(&ad);
+	}
+	const auto &cs = r->weave_cpu_stage;
+	const auto &gs = r->weave_gpu_stage;
+	U_LOG_W(
+	    "weave timing [%ls] %ux%u %.1fs: submits=%u refused=%u paths(v6zc=%u v6crop=%u batch=%u legacy=%u) "
+	    "overlay(dp=%u fallback=%u none=%u unchanged=%u) | CPU ms avg/max: submit %.3f/%.3f "
+	    "render_mutex %.3f/%.3f ctx_mutex %.3f/%.3f in_acquire %.3f/%.3f ov_acquire %.3f/%.3f | "
+	    "GPU ms avg/max n=%u disjoint=%u: clear1058 %.3f/%.3f (n=%u) input_copy %.3f/%.3f (n=%u) "
+	    "sbs_clear_blit %.3f/%.3f (n=%u) weave %.3f/%.3f fallback_blit %.3f/%.3f (n=%u) "
+	    "epilogue %.3f/%.3f total %.3f/%.3f",
+	    ad.Description, win_w, win_h, (double)window_ns / 1e9, r->weave_cpu_n, r->weave_cpu_refused,
+	    r->weave_cpu_path_n[WEAVE_PATH_V6_ZERO_COPY], r->weave_cpu_path_n[WEAVE_PATH_V6_CROP],
+	    r->weave_cpu_path_n[WEAVE_PATH_BATCH], r->weave_cpu_path_n[WEAVE_PATH_LEGACY],
+	    r->weave_cpu_route_n[WEAVE_OV_DP], r->weave_cpu_route_n[WEAVE_OV_FALLBACK],
+	    r->weave_cpu_route_n[WEAVE_OV_NONE], r->weave_cpu_ov_unchanged, weave_timing_stat_avg(cs[WEAVE_CPU_SUBMIT]),
+	    cs[WEAVE_CPU_SUBMIT].max, weave_timing_stat_avg(cs[WEAVE_CPU_RENDER_MUTEX]), cs[WEAVE_CPU_RENDER_MUTEX].max,
+	    weave_timing_stat_avg(cs[WEAVE_CPU_CTX_MUTEX]), cs[WEAVE_CPU_CTX_MUTEX].max,
+	    weave_timing_stat_avg(cs[WEAVE_CPU_IN_ACQUIRE]), cs[WEAVE_CPU_IN_ACQUIRE].max,
+	    weave_timing_stat_avg(cs[WEAVE_CPU_OV_ACQUIRE]), cs[WEAVE_CPU_OV_ACQUIRE].max, r->weave_gpu_n,
+	    r->weave_gpu_n_disjoint, weave_timing_stat_avg(gs[WEAVE_GPU_CLEAR_1058]), gs[WEAVE_GPU_CLEAR_1058].max,
+	    gs[WEAVE_GPU_CLEAR_1058].n, weave_timing_stat_avg(gs[WEAVE_GPU_INPUT_COPY]), gs[WEAVE_GPU_INPUT_COPY].max,
+	    gs[WEAVE_GPU_INPUT_COPY].n, weave_timing_stat_avg(gs[WEAVE_GPU_SBS]), gs[WEAVE_GPU_SBS].max,
+	    gs[WEAVE_GPU_SBS].n, weave_timing_stat_avg(gs[WEAVE_GPU_WEAVE]), gs[WEAVE_GPU_WEAVE].max,
+	    weave_timing_stat_avg(gs[WEAVE_GPU_FALLBACK]), gs[WEAVE_GPU_FALLBACK].max, gs[WEAVE_GPU_FALLBACK].n,
+	    weave_timing_stat_avg(gs[WEAVE_GPU_EPILOGUE]), gs[WEAVE_GPU_EPILOGUE].max,
+	    weave_timing_stat_avg(gs[WEAVE_GPU_TOTAL]), gs[WEAVE_GPU_TOTAL].max);
+
+	memset(r->weave_gpu_stage, 0, sizeof(r->weave_gpu_stage));
+	memset(r->weave_cpu_stage, 0, sizeof(r->weave_cpu_stage));
+	memset(r->weave_cpu_path_n, 0, sizeof(r->weave_cpu_path_n));
+	memset(r->weave_cpu_route_n, 0, sizeof(r->weave_cpu_route_n));
+	r->weave_gpu_n = 0;
+	r->weave_gpu_n_disjoint = 0;
+	r->weave_cpu_n = 0;
+	r->weave_cpu_refused = 0;
+	r->weave_cpu_ov_unchanged = 0;
 }
 
 bool
@@ -25671,6 +25861,8 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
                                uint64_t *out_fence_value,
                                struct xrt_eye_positions *out_eyes)
 {
+	// DXR_WEAVE_GPU_TIMING: CPU wall time of the whole synchronous submit.
+	const int64_t t_entry_ns = (int64_t)os_monotonic_get_ns();
 	// v4 Phase 1 composites the whole premul atlas; per-rect scoping is a future hint.
 	(void)overlay_rect_count;
 	(void)overlay_rects;
@@ -25782,7 +25974,22 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	// between the read and the lock, and the weave then called through a freed
 	// vtable — the `weave_submit -> process_atlas -> 0x0` crash. The graveyard
 	// makes that survivable; resolving under the lock makes it impossible.
+	const int64_t t_pre_render_lock_ns = (int64_t)os_monotonic_get_ns();
 	render_mutex_fair_lock lock(sys);
+	const int64_t t_post_render_lock_ns = (int64_t)os_monotonic_get_ns();
+	// DXR_WEAVE_GPU_TIMING: counts a submit that returns false from here on
+	// (under render_mutex, which guards the per-client timing state).
+	struct weave_refused_counter
+	{
+		struct d3d11_client_render_resources *r;
+		bool accepted;
+		~weave_refused_counter()
+		{
+			if (!accepted && weave_gpu_timing_enabled()) {
+				r->weave_cpu_refused++;
+			}
+		}
+	} refused_counter{&c->render, false};
 
 	// #964 (D-4): on the pipeline path there is exactly ONE display processor
 	// per panel and the present-owner drives it like everyone else — never a
@@ -25938,7 +26145,14 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	// the shared immediate context (input blits, the vendor weave, its
 	// post-weave alpha gate, the epilogue). Another client's lock-free commit
 	// blits must not interleave — see immediate_ctx_mutex.
+	const int64_t t_pre_ctx_lock_ns = (int64_t)os_monotonic_get_ns();
 	std::lock_guard<std::mutex> ctx_lock(sys->immediate_ctx_mutex);
+	const int64_t t_post_ctx_lock_ns = (int64_t)os_monotonic_get_ns();
+	// DXR_WEAVE_GPU_TIMING GPU stage stamps; AFTER ctx_lock so its RAII close
+	// on an early return still runs under the immediate-context lock.
+	weave_gpu_frame gpu_frame;
+	uint8_t timing_path = WEAVE_PATH_LEGACY;
+	double ov_acquire_ms = -1.0; // < 0: no overlay this submit
 
 	if (!weave_ensure_output(c, win_w, win_h)) {
 		return false;
@@ -26154,8 +26368,11 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 			c->render.weave_overlay_tex->GetDesc(&odesc);
 			IDXGIKeyedMutex *ov_km = c->render.weave_overlay_km.get();
 			ov_ok = (ov_km == nullptr);
+			ov_acquire_ms = 0.0; // no keyed mutex: nothing to wait on
 			if (ov_km != nullptr) {
+				const int64_t t_ov_acq_ns = (int64_t)os_monotonic_get_ns();
 				HRESULT ah = ov_km->AcquireSync(0, 4);
+				ov_acquire_ms = (double)((int64_t)os_monotonic_get_ns() - t_ov_acq_ns) / 1e6;
 				if (SUCCEEDED(ah) && ah != static_cast<HRESULT>(WAIT_TIMEOUT)) {
 					ov_hold.km = ov_km;
 					ov_ok = true;
@@ -26244,10 +26461,13 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		}
 		c->render.weave_gen_inputs[c->render.weave_gen_count++] = in;
 	}
-	if (clear_output && c->render.weave_output_rtv) {
+	gpu_frame.begin(sys, &c->render);
+	const bool output_cleared = clear_output && c->render.weave_output_rtv;
+	if (output_cleared) {
 		const float out_transparent[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 		sys->context->ClearRenderTargetView(c->render.weave_output_rtv.get(), out_transparent);
 	}
+	gpu_frame.stamp(WEAVE_TS_CLEARED);
 
 	// Hand the overlay to the DP for the next process_atlas. Only on the
 	// full-window-canvas paths (v6, batch): the layer is window-sized and the
@@ -26268,8 +26488,6 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		                                                      XRT_ATLAS_ENCODING_ENCODED, fits && ov_unchanged) &&
 		           fits;
 	};
-
-	const uint32_t gpu_slot = weave_gpu_timing_begin(sys, &c->render);
 
 	if (nview) {
 		// Spec-v6 N-view atlas (#774): the caller already packed the atlas the
@@ -26310,6 +26528,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		// views INTO the atlas, which must never be the caller's own texture —
 		// so it always takes the crop.
 		const bool zero_copy = (packed_w == idesc.Width && packed_h == idesc.Height) && lift_count == 0;
+		timing_path = zero_copy ? WEAVE_PATH_V6_ZERO_COPY : WEAVE_PATH_V6_CROP;
 		if (!zero_copy) {
 			if (!c->render.weave_crop_tex || c->render.weave_crop_w != packed_w ||
 			    c->render.weave_crop_h != packed_h || c->render.weave_crop_format != idesc.Format) {
@@ -26403,6 +26622,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		sys->context->RSSetViewports(1, &weave_vp);
 		D3D11_RECT weave_scissor = {0, 0, (LONG)win_w, (LONG)win_h};
 		sys->context->RSSetScissorRects(1, &weave_scissor);
+		gpu_frame.stamp(WEAVE_TS_PRE_WEAVE);
 		hand_overlay_to_dp();
 		xrt_display_processor_d3d11_process_atlas(dp, sys->context.get(), dp_srv,
 		                                          /*view_w*/ cvw, /*view_h*/ cvh,
@@ -26469,6 +26689,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		sys->context->RSSetViewports(1, &weave_vp);
 		D3D11_RECT weave_scissor = {0, 0, (LONG)win_w, (LONG)win_h};
 		sys->context->RSSetScissorRects(1, &weave_scissor);
+		gpu_frame.stamp(WEAVE_TS_PRE_WEAVE);
 		xrt_display_processor_d3d11_process_atlas(dp, sys->context.get(), in_srv,
 		                                          view_w, view_h, /*tile_columns*/ 2, /*tile_rows*/ 1,
 		                                          DXGI_FORMAT_R8G8B8A8_UNORM, win_w, win_h, rect_x, rect_y,
@@ -26479,6 +26700,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 			in_km->ReleaseSync(0);
 		}
 	} else {
+		timing_path = WEAVE_PATH_BATCH;
 		// Spec-v3 batch: the input is window-sized with each rect's SBS
 		// content at that rect's own window position. The SR weaver's design
 		// contract is ONE weave() per frame — per-rect weave calls at N× the
@@ -26611,6 +26833,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		sys->context->RSSetViewports(1, &weave_vp);
 		D3D11_RECT weave_scissor = {0, 0, (LONG)win_w, (LONG)win_h};
 		sys->context->RSSetScissorRects(1, &weave_scissor);
+		gpu_frame.stamp(WEAVE_TS_PRE_WEAVE);
 		hand_overlay_to_dp();
 		xrt_display_processor_d3d11_process_atlas(dp, sys->context.get(), c->render.weave_sbs_srv.get(),
 		                                          /*view_w*/ win_w, /*view_h*/ win_h,
@@ -26633,7 +26856,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		}
 	}
 
-	weave_gpu_timing_stamp(sys, &c->render, gpu_slot, 1);
+	gpu_frame.stamp(WEAVE_TS_POST_WEAVE);
 
 	// v4 overlay atlas (browser#18), FALLBACK leg: composite the caller's
 	// window-sized premultiplied-alpha 2D atlas OVER the woven output (premul
@@ -26651,7 +26874,8 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		                      (float)win_h);
 	}
 	ov_hold.release();
-	weave_gpu_timing_end(sys, &c->render, gpu_slot, ov_in_dp, win_w, win_h);
+	gpu_frame.stamp(WEAVE_TS_POST_FALLBACK);
+	const uint8_t timing_route = ov_srv == nullptr ? WEAVE_OV_NONE : (ov_in_dp ? WEAVE_OV_DP : WEAVE_OV_FALLBACK);
 	// Route log: first overlay frame and every change only (never per frame).
 	if (ov_srv != nullptr &&
 	    (!c->render.weave_overlay_route_logged || ov_in_dp != c->render.weave_overlay_in_dp)) {
@@ -26703,6 +26927,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 
 	// Signal the fence and flush so the GPU work + signal are submitted (there is
 	// no Present to flush this standalone path), then the caller's Wait completes.
+	gpu_frame.end(timing_path, timing_route, output_cleared);
 	c->render.weave_fence_value++;
 	sys->context->Signal(c->render.weave_fence.get(), c->render.weave_fence_value);
 	sys->context->Flush();
@@ -26756,6 +26981,19 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 			        (double)(t_post_weave_ns - t_post_acquire_ns) / 1e6,
 			        (double)(t_end_ns - t_post_weave_ns) / 1e6);
 		}
+	}
+
+	// DXR_WEAVE_GPU_TIMING (no-op when off): fold this accepted submit in;
+	// logs once per 5 s.
+	refused_counter.accepted = true;
+	{
+		double cpu_ms[WEAVE_CPU_STAGE_COUNT];
+		cpu_ms[WEAVE_CPU_RENDER_MUTEX] = (double)(t_post_render_lock_ns - t_pre_render_lock_ns) / 1e6;
+		cpu_ms[WEAVE_CPU_CTX_MUTEX] = (double)(t_post_ctx_lock_ns - t_pre_ctx_lock_ns) / 1e6;
+		cpu_ms[WEAVE_CPU_IN_ACQUIRE] = (double)(t_post_acquire_ns - t_pre_acquire_ns) / 1e6;
+		cpu_ms[WEAVE_CPU_OV_ACQUIRE] = ov_acquire_ms;
+		cpu_ms[WEAVE_CPU_SUBMIT] = (double)((int64_t)os_monotonic_get_ns() - t_entry_ns) / 1e6;
+		weave_timing_account(sys, &c->render, cpu_ms, timing_path, timing_route, ov_unchanged, win_w, win_h);
 	}
 	return true;
 }
