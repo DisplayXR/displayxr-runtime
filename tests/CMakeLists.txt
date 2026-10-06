@@ -32,6 +32,7 @@ set(tests
     tests_space_overseer_rig
     tests_rig_composer
     tests_aux_x11_scale
+    tests_aux_display_desktop_select
     tests_cli_dims_check
     tests_comp_vblank_grid
     tests_comp_zone_tier1

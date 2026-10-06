@@ -56,7 +56,8 @@ struct os_display_scale_report
 	//! it assumes nothing about the arrangement and is never used to decide.
 	uint32_t native_sum_w;
 
-	//! True when `/sys/class/drm` yielded at least one connected connector.
+	//! True when at least one output's device mode is known (Mutter
+	//! DisplayConfig or `/sys/class/drm`; see os_display_connector_linux.h).
 	bool drm_available;
 };
 

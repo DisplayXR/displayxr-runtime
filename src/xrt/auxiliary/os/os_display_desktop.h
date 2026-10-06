@@ -31,6 +31,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -45,6 +46,20 @@ extern "C" {
  * (a macOS display UUID is 37 bytes).
  */
 #define OS_DISPLAY_DEVICE_NAME_SIZE 128
+
+/*!
+ * Where a monitor's device mode (@ref os_display_desktop_info::native_width)
+ * came from.
+ */
+enum os_display_native_source
+{
+	OS_DISPLAY_NATIVE_SOURCE_NONE = 0,
+	//! The compositor's own current mode (Mutter DisplayConfig).
+	OS_DISPLAY_NATIVE_SOURCE_COMPOSITOR,
+	//! The kernel's mode list (DRM sysfs): the X11 size when it is one of
+	//! the modes, else the preferred one.
+	OS_DISPLAY_NATIVE_SOURCE_DRM,
+};
 
 /*!
  * Desktop geometry and identity of one monitor.
@@ -117,6 +132,32 @@ struct os_display_desktop_info
 	uint32_t physical_width_mm;
 	uint32_t physical_height_mm;
 	/*! @} */
+
+	/*!
+	 * @name The DEVICE mode behind this monitor, and its compositor scale (#1831)
+	 *
+	 * @ref width / @ref height are in the space the OS places windows in. On
+	 * X11 under XWayland that is NOT the hardware: Mutter scales the X screen
+	 * by one global integer (the ceiling of the largest monitor scale), so a
+	 * 3840x2160 output at 150 % is a 5120x2880 X11 rect. These fields carry
+	 * what the connector is really running, keyed by the connector name, so
+	 * the panel can be identified by its hardware mode at any scale, and so
+	 * "is an X11 window on this output 1:1?" becomes a comparison instead of
+	 * a guess.
+	 *
+	 * Desktop Linux only (Mutter DisplayConfig, else DRM sysfs). 0 = unknown,
+	 * which every consumer must treat as "keep current behaviour".
+	 * @{
+	 */
+	uint32_t native_width;
+	uint32_t native_height;
+
+	//! The compositor's scale for this output (e.g. 1.5). 0 = unknown.
+	double scale;
+
+	//! Where @ref native_width / @ref native_height came from.
+	enum os_display_native_source native_source;
+	/*! @} */
 };
 
 /*!
@@ -149,6 +190,14 @@ enum os_display_desktop_rule
 	//! Nothing matched — the monitor at the desktop origin. A placeable rect,
 	//! not evidence that we found the panel.
 	OS_DISPLAY_DESKTOP_RULE_PRIMARY_FALLBACK,
+
+	//! No position, but exactly one monitor's CONNECTOR is running the
+	//! panel's native mode (@ref os_display_desktop_info::native_width), ties
+	//! broken on physical size (#1831). Identity by hardware mode, so it
+	//! holds at any desktop scale — but it says nothing about whether the
+	//! window-placement space is 1:1 there; @ref
+	//! os_display_desktop_info::width says that.
+	OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE,
 };
 
 /*!
@@ -219,11 +268,14 @@ os_display_desktop_enumerate(struct os_display_desktop_info *out_infos, uint32_t
  *
  * 1. @ref OS_DISPLAY_DESKTOP_RULE_ORIGIN — the hint carries a non-(0,0)
  *    position. Trust it; this is the Windows path and it is unchanged.
- * 2. @ref OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH — exactly one enumerated
- *    monitor's size equals the panel's native pixel size. Several: pick the
- *    one whose EDID physical size is closest to the panel's, else the
- *    non-primary one, and report the ambiguity.
- * 3. @ref OS_DISPLAY_DESKTOP_RULE_PRIMARY_FALLBACK — today's behaviour.
+ * 2. @ref OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE — a monitor's connector is
+ *    running the panel's native mode (desktop Linux; #1831). Scale-proof.
+ * 3. @ref OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH — a monitor whose device mode is
+ *    unknown has a rect equal to the panel's native pixel size.
+ *    For both size rules, several candidates: pick the one whose EDID
+ *    physical size is closest to the panel's, else the non-primary one, and
+ *    report the ambiguity.
+ * 4. @ref OS_DISPLAY_DESKTOP_RULE_PRIMARY_FALLBACK — today's behaviour.
  *
  * There is deliberately NO physical-size-only rule. A monitor that matches the
  * panel in millimetres but not in pixels is not 1:1, so it can never be
@@ -244,8 +296,45 @@ os_display_desktop_info_for_panel(const struct os_display_panel_hint *hint,
                                   struct os_display_panel_match *out_match);
 
 /*!
- * Short human-readable name of a selection rule ("origin", "size match",
- * "physical-size match", "primary fallback"), for logs and `displayxr-cli
+ * The policy half of @ref os_display_desktop_info_for_panel: the size rules
+ * over an already-enumerated monitor list, with no I/O. Exposed so the rules
+ * can be pinned by host tests.
+ *
+ * Runs the connector-mode rule, then the X11-size rule; never the origin or
+ * primary rules, which need a point lookup.
+ *
+ * @return the index of the picked monitor in @p mons, or -1 when no size rule
+ *         fired (the caller then falls back). @p out_match receives the rule,
+ *         candidate count and @p count as the monitor count.
+ */
+int32_t
+os_display_desktop_select_by_size(const struct os_display_desktop_info *mons,
+                                  uint32_t count,
+                                  const struct os_display_panel_hint *hint,
+                                  struct os_display_panel_match *out_match);
+
+/*!
+ * Is a window placed in this monitor's coordinate space presented to the
+ * hardware 1:1? Tri-state, never a guess (#1831):
+ *
+ * - 1: the rect equals the device mode — the space is device pixels.
+ * - 0: both are known and differ — the compositor resamples whatever is
+ *   drawn there (X11 under XWayland on an output whose scale is not the X
+ *   screen's global scale).
+ * - -1: the device mode is unknown.
+ */
+static inline int
+os_display_desktop_info_is_1to1(const struct os_display_desktop_info *m)
+{
+	if (m == NULL || m->native_width == 0 || m->native_height == 0 || m->width == 0 || m->height == 0) {
+		return -1;
+	}
+	return (m->width == m->native_width && m->height == m->native_height) ? 1 : 0;
+}
+
+/*!
+ * Short human-readable name of a selection rule ("origin", "connector match",
+ * "size match", "primary fallback"), for logs and `displayxr-cli
  * info`. Never NULL.
  */
 const char *

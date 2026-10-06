@@ -69,7 +69,10 @@ configurations are detected (RandR vs DRM on every output) and reported by
 `displayxr-cli info` → *X11 coordinate space*. Under a quantum the runtime snaps on the
 reachable lattice: coarser drag steps, phase kept. When X11 pixels are not panel pixels
 at all, the snap is refused. The app helper checks every landing and says so when the
-display drops its snaps. Weaving itself is never stopped for this. Full mechanism, the
+display drops its snaps. A placement quantum never stops weaving; a *resample* does —
+when the panel's X11 rect is not its device mode (its scale is not the X screen's), every
+X11 window there is downsampled by the compositor and presents 2D (#1831; the panel is
+identified by its connector's mode, so it is still found). Full mechanism, the
 solver's blind spot, and the assessment of what a truly scale-proof design would take
 (a fixed-origin surface, i.e. the shell's compose model):
 [linux-display-scaling.md](../reference/linux-display-scaling.md).
@@ -735,11 +738,13 @@ source comments and, until this section, in no document at all.
   destination extent to compare against and behaves exactly as it did before
   the gate existed. The Wayland present-origin feed is gated on the same flag,
   so a degraded session cannot leave a stale phase latched on the DP.
-  Deliberately **Wayland-only**: X11's only available signal is
-  `display_desktop_rect_is_panel`, which is false on every dev box by
-  construction (sim_display declares a 1920x1080 panel that no real desktop
-  rect matches), so gating the weave on it would put every X11 sim session into
-  flat 2D.
+  The X11 arm (#1831, `vk_x11_update_not_1to1()`) does not use
+  `display_desktop_rect_is_panel` (false on every dev box by construction). It
+  acts only on positive evidence: the resolver identified the panel by its
+  connector's device mode (Mutter DisplayConfig, else DRM sysfs), and the
+  panel's X11 rect differs from that mode, so XWayland resamples every X11
+  window there. One `NOT_1TO1 (X11):` WARN, evaluated once per session; an
+  integer-scale panel logs `X11 1:1 gate: ... weaving as before`.
 - **Fullscreen-on-panel is the validated shape.** A Wayland surface has no
   intrinsic size and no XCB geometry to poll, so the app declares its buffer
   size (`XrWaylandSurfaceGeometryDXR` / `xrSetWaylandSurfaceGeometryDXR`, spec

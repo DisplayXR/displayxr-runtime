@@ -687,6 +687,9 @@ struct comp_vk_native_compositor
 	struct u_display_mode_hold display_mode_hold;
 	//! One-shot: said once that the 1:1 gate has nothing to measure.
 	bool warned_1to1_unknown;
+	//! #1831: the X11 arm of the 1:1 gate has been evaluated (once — its
+	//! inputs are the static desktop resolution in sys_info).
+	bool x11_1to1_evaluated;
 #endif
 
 #ifdef XRT_OS_ANDROID
@@ -4593,6 +4596,9 @@ static bool
 vk_dp_request_display_mode(struct comp_vk_native_compositor *c, bool enable_3d);
 
 #ifdef XRT_OS_LINUX_DESKTOP
+static void
+vk_linux_apply_not_1to1(struct comp_vk_native_compositor *c, bool not_1to1);
+
 /*!
  * Refuse rather than resample, desktop-Linux edition (#1595).
  *
@@ -4619,17 +4625,14 @@ vk_dp_request_display_mode(struct comp_vk_native_compositor *c, bool enable_3d);
  * `on_pause`/`on_resume` pair to release the session's lens preference
  * (#1039), and @ref vk_compute_effective_layout collapsing the frame to tile 0.
  *
- * ## Scope: the Wayland arm only, and why
+ * ## Scope: this is the Wayland arm
  *
- * X11 is deliberately NOT gated here. The only signal available there is
- * `display_desktop_rect_is_panel`, and that flag is false on every dev box by
- * construction — sim_display declares a 1920x1080 panel no real desktop rect
- * matches — so gating the weave on it would put every X11 sim session into
- * flat 2D. It already gates the weave PHASE
- * (@ref vk_x11_present_origin_is_panel_native), which is the part it can
- * honestly speak to. Wayland is where the measurement exists: the geometry
- * service publishes the surface's monitor and its scale, so the destination
- * extent is a number rather than an inference.
+ * Wayland's measurement is per surface: the geometry service publishes the
+ * surface's monitor and its scale, so the destination extent is a number
+ * rather than an inference. X11's is per session — the panel's X11 rect
+ * against its connector's device mode — and lives in
+ * @ref vk_x11_update_not_1to1 (#1831), which shares the degrade itself
+ * (@ref vk_linux_apply_not_1to1).
  *
  * ## Never degrade on ignorance
  *
@@ -4712,7 +4715,6 @@ vk_linux_update_surface_not_1to1(struct comp_vk_native_compositor *c)
 	if (not_1to1 == c->linux_surface_not_1to1) {
 		return;
 	}
-	c->linux_surface_not_1to1 = not_1to1;
 
 	// ONE line per transition. A silent 2D fallback is its own debugging trap,
 	// so the line names both extents AND which of the two reasons fired.
@@ -4733,6 +4735,25 @@ vk_linux_update_surface_not_1to1(struct comp_vk_native_compositor *c)
 		    buf_px_w, buf_px_h, panel_px_w, panel_px_h, c->display_mode_hold.wanted_3d ? "3D" : "2D");
 	}
 
+	vk_linux_apply_not_1to1(c, not_1to1);
+#else
+	(void)c;
+#endif
+}
+
+/*!
+ * Enter or leave the refuse-rather-than-resample state (#1595). The caller has
+ * already logged the transition and why; this is the degrade itself, shared by
+ * the Wayland and X11 arms.
+ */
+static void
+vk_linux_apply_not_1to1(struct comp_vk_native_compositor *c, bool not_1to1)
+{
+	if (not_1to1 == c->linux_surface_not_1to1) {
+		return;
+	}
+	c->linux_surface_not_1to1 = not_1to1;
+
 	// Same degrade the Android arm performs: ask the panel for hardware 2D and
 	// release this session's lens preference, because the Leia DP only ever
 	// re-asserts the lens from inside a weave and with the weave gone nothing
@@ -4750,9 +4771,103 @@ vk_linux_update_surface_not_1to1(struct comp_vk_native_compositor *c)
 	} else {
 		xrt_display_processor_on_resume(c->display_processor);
 	}
-#else
-	(void)c;
+}
+
+/*!
+ * The X11 arm of refuse-rather-than-resample (#1831).
+ *
+ * ## The rule
+ *
+ * An X11 window's pixels reach the panel 1:1 only if the panel's rect in the X
+ * root IS its device mode. Under XWayland that is a property of the session,
+ * not of the window: Mutter gives the whole X screen one integer scale `G`
+ * (the ceiling of the largest monitor scale) and composites each X11 surface
+ * onto an output at `scale / G`. So on a 3840x2160 panel at 150 % the X11 rect
+ * is 5120x2880 and every X11 window there is drawn at 2x and downsampled by
+ * 0.75 with a linear filter; at 200 % the rect is 3840x2160 and the factor is
+ * exactly 1. A weave survives the second and is destroyed by the first.
+ *
+ * No window-level property changes that (Mutter applies the effective scale
+ * to every Xwayland surface, and rootless Xwayland's own fractional-scale
+ * support is rootful-only). The one exception is a fullscreen client that sets
+ * a RandR-emulated mode of the panel's device size, which Xwayland maps through
+ * a viewport at exactly 1:1 — the runtime does not drive that today, so it is
+ * not what this function sees.
+ *
+ * ## Why it can speak now when the old X11 note said it could not
+ *
+ * The old reason for leaving X11 ungated was that the only signal,
+ * `display_desktop_rect_is_panel`, is false on every dev box by construction
+ * (sim_display's declared panel matches no desktop rect). This gate does not
+ * use that flag. It acts only on positive evidence: the resolver identified the
+ * panel by its CONNECTOR's device mode (so that monitor really is the panel),
+ * that device mode is known, and the X11 rect differs from it. A box where
+ * nothing matches, or where the device mode is unknown, keeps today's
+ * behaviour exactly — never degrade on ignorance. An integer-scale session
+ * (rect == device mode) is 1:1 and keeps weaving exactly as before.
+ *
+ * Evaluated once: its inputs are the desktop resolution taken at system
+ * creation, which is static for the life of the compositor on X11.
+ */
+static void
+vk_x11_update_not_1to1(struct comp_vk_native_compositor *c)
+{
+	// Not evaluated until the system info has arrived; then exactly once.
+	if (c->x11_1to1_evaluated || !c->sys_info_set) {
+		return;
+	}
+	c->x11_1to1_evaluated = true;
+#ifdef DXR_HAVE_DIRECT_SCANOUT
+	// A leased connector is scanned out by us, not composited: no resample.
+	if (c->direct_window != NULL) {
+		return;
+	}
 #endif
+
+	uint32_t panel_px_w = 0, panel_px_h = 0;
+	{
+		int32_t ignored_left = 0, ignored_top = 0;
+		if (!(vk_dp_has_any(c) &&
+		      vk_dp_display_pixel_info(c, &panel_px_w, &panel_px_h, &ignored_left, &ignored_top) &&
+		      panel_px_w > 0 && panel_px_h > 0)) {
+			panel_px_w = c->sys_info.display_pixel_width;
+			panel_px_h = c->sys_info.display_pixel_height;
+		}
+	}
+
+	const struct xrt_system_compositor_info *si = &c->sys_info;
+	const uint32_t dev_w = si->display_desktop_native_width;
+	const uint32_t dev_h = si->display_desktop_native_height;
+	const uint32_t x11_w = si->display_desktop_width;
+	const uint32_t x11_h = si->display_desktop_height;
+
+	// Positive evidence only. The resolved monitor must BE the panel by its
+	// hardware mode, and that mode must be known.
+	const bool panel_identified = panel_px_w > 0 && panel_px_h > 0 && dev_w == panel_px_w && dev_h == panel_px_h;
+	if (!panel_identified || x11_w == 0 || x11_h == 0) {
+		return;
+	}
+	if (x11_w == dev_w && x11_h == dev_h) {
+		U_LOG_I(
+		    "X11 1:1 gate: the panel '%s' is %ux%u in the X root = its %ux%u device mode — X11 pixels "
+		    "are device pixels there, weaving as before. (#1831)",
+		    si->display_device_name, x11_w, x11_h, dev_w, dev_h);
+		return;
+	}
+
+	char scale_str[48] = "";
+	if (si->display_desktop_scale > 0.0f) {
+		(void)snprintf(scale_str, sizeof(scale_str), " at %.0f%% scale",
+		               (double)si->display_desktop_scale * 100.0);
+	}
+	U_LOG_W(
+	    "NOT_1TO1 (X11): presenting 2D (no weave) — this X11 window is on the 3D panel '%s' (%ux%u device "
+	    "px%s), which the X server exposes as %ux%u: the display server resamples X11 windows there by "
+	    "%.4f, and a resampled weave is a uniform double image. X11 apps cannot be presented 1:1 on an "
+	    "output whose scale differs from the X screen's integer scale; run the app natively on Wayland "
+	    "to get 3D at this scale. (#1831)",
+	    si->display_device_name, dev_w, dev_h, scale_str, x11_w, x11_h, (double)dev_w / (double)x11_w);
+	vk_linux_apply_not_1to1(c, true);
 }
 #endif // XRT_OS_LINUX_DESKTOP
 
@@ -7760,6 +7875,13 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 	// Cheap (a non-blocking D-Bus pump the metrics path already performs) and
 	// only acts on a transition.
 	vk_linux_update_surface_not_1to1(c);
+#ifdef XRT_HAVE_WAYLAND
+	if (!c->use_wayland)
+#endif
+	{
+		// #1831: the X11 arm. One-shot after its first evaluation.
+		vk_x11_update_not_1to1(c);
+	}
 #endif
 
 	// Per-frame effective CONTENT layout (#542): tile grid/dims from the
@@ -11819,11 +11941,11 @@ vk_update_present_origin(struct comp_vk_native_compositor *c)
 #else
 	const bool origin_from_x11 = true;
 #endif
+	if (c->linux_surface_not_1to1) {
+		return; // degraded to 2D (either arm); there is no phase to anchor
+	}
 	if (origin_from_x11 && !vk_x11_present_origin_is_panel_native(c)) {
 		return; // display-scoped weaving; the DP's origin stays (0,0)
-	}
-	if (!origin_from_x11 && c->linux_surface_not_1to1) {
-		return; // degraded to 2D; there is no phase to anchor
 	}
 #endif
 
@@ -12076,7 +12198,8 @@ vk_x11_placement_quantum(struct comp_vk_native_compositor *c)
 		U_LOG_W(
 		    "X11 placement quantum: unknown (%s) — drag snapping unchanged. "
 		    "`displayxr-cli info` shows the per-output evidence.",
-		    rep.drm_available ? "no consistent global scale" : "no DRM connector modes in sysfs");
+		    rep.drm_available ? "no consistent global scale"
+		                      : "no connector device modes (Mutter DisplayConfig / DRM sysfs)");
 		return 0;
 	}
 	c->x11_quantum = rep.verdict.quantum;

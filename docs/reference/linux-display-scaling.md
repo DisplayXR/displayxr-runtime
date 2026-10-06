@@ -32,7 +32,7 @@ Acer SpatialLabs DS1 3840x2160.
 | laptop | DS1 | X11 sees DS1 | X11 sees laptop | X root | N | result |
 |---|---|---|---|---|---|---|
 | 166% | 200% | 3840x2160 (= native) | 3456x2160 | 7296x2160 | 2 | **every size check passes; 0% of odd targets reached; stutters** |
-| 166% | 100% | 7680x4320 | 3456x2160 | 11136x4320 | 2 | the panel is not found by size; phase feed and snap refused |
+| 166% | 100% | 7680x4320 | 3456x2160 | 11136x4320 | 2 | found by its connector's mode; X11 windows there are resampled, so they present 2D (#1831) |
 | 100% | 100% | 3840x2160 | 2880x1800 | 6720x2160 | 1 | ~50% odd reached, 92% of snaps landed exactly; correct by eye |
 
 The first row is the dangerous one. The panel's own numbers are perfect, so any check
@@ -46,18 +46,49 @@ which is why the solver checks every output. Either display alone at >100% would
 | Where | What |
 |---|---|
 | `util/u_x11_scale.h` (header-only, host-tested) | The solver. For every output it compares the X11 size with the DRM mode. `N` is the smallest integer where each derived scale `native·N/X11` is ≥ 1 and `max(ceil(scale)) == N`. It also provides the reachable-lattice enumeration and the landing probe. |
-| `os/os_display_scale_linux.c` | Joins RandR monitors (`os_display_desktop_enumerate`) to `/sys/class/drm/card*-*/modes` (no libdrm, no device open) and runs the solver. |
+| `os/os_display_connector_linux.c` | Every RandR monitor enumeration carries the **device mode** of its connector, joined by connector name: Mutter's current mode and scale (`org.gnome.Mutter.DisplayConfig.GetCurrentState`, libdbus dlopen'd), else `/sys/class/drm/card*-*/modes` (no libdrm, no device open). |
+| `os/os_display_scale_linux.c` | Feeds each monitor's X11 size and device mode to the solver. |
+| `os/os_display_desktop_select.c` (host-tested) | **Panel identification (#1831).** The panel is the monitor whose connector *runs the panel's native mode* — at any scale — before the old "X11 rect equals the native size" rule, which only runs for monitors whose device mode is unknown. Logged as `[rule: connector match]`. |
+| `vk_x11_update_not_1to1` (X11 1:1 gate, #1831) | When the identified panel's X11 rect is not its device mode, every X11 window there is resampled by `device / X11` (0.75 at 150 %), so the compositor presents 2D with one `NOT_1TO1 (X11):` WARN, through the same degrade as #1595's Wayland arm. An integer-scale session (rect == device mode) logs `X11 1:1 gate: ... weaving as before`. Unknown device mode never degrades. |
 | `comp_vk_native_compositor_snap_window_rect` (X11 drags) | **Units gate:** if the panel's X11 rect is not its native size, X11 px are not panel px, so the snap is refused. This matches the existing present-origin refusal. **Quantum > 1:** the snap is searched on the reachable lattice `origin + N·Z²`, offering candidates to the DP and keeping the first one it snaps to a reachable point. The DP still owns all lens math (ADR-019). |
 | displayxr-common `common/linux/dxr_linux_window.cpp` | **Landing check.** Before each drag move, it reads back where the previous move actually landed. If the moves persistently miss (≥6 moves, at least half diverging, inferred stride > 1), it logs one `drag: placement NOT honoured` WARN that names the stride and the likely cause. This catches causes the geometry cannot see. |
 | `displayxr-cli info` → *X11 coordinate space* | The verdict, the quantum, each output's X11 size, DRM mode and derived scale, the X root compared with native width, and a one-line *drag snap* capability: yes / PARTIAL / NO / unknown. |
 | `displayxr-cli selftest` → `x11_placement` | **Informational, never fails.** A scaled output is a user setting, not a broken install. The detail line carries `WARNING:` when quantised. |
 
-**Weaving is never stopped over this.** A quantised placement does not make a static or
-fullscreen window wrong: the window sits at *some* origin, and the runtime feeds the
-weaver that true origin, so the weave is correctly phased. What a quantum breaks is
-*honouring an arbitrary snap target during a drag*. So that is the only thing this code
-changes. #1595's refuse-into-2D answers a different fault: a buffer that reaches glass
-resampled can never be correct, at any position.
+**A quantum never stops weaving; a resample does.** A quantised placement does not make
+a static or fullscreen window wrong: the window sits at *some* origin, and the runtime
+feeds the weaver that true origin, so the weave is correctly phased. What a quantum breaks
+is *honouring an arbitrary snap target during a drag*, and that is all the snap code
+changes. Refuse-into-2D answers a different fault: a buffer that reaches glass resampled
+can never be correct, at any position. On X11 that fault is a property of the session,
+not the window — the panel's X11 rect differs from its device mode whenever the panel's
+scale is not `N` (150 % with `N = 2`, or 100 % next to a 166 % laptop) — and #1831 gates
+it.
+
+### Is there a 1:1 path for an X11 window on a fractionally-scaled output? (#1831)
+
+Read from mutter 50.1 and Xwayland 24.1.10 source: **not for an ordinary window.**
+
+- Mutter applies one effective scale to every Xwayland surface
+  (`meta_xwayland_get_effective_scale`: `ceil` of the highest monitor scale, or the
+  rounded `xwayland-scaling-factor` setting). No window property changes it.
+  `_XWAYLAND_ALLOW_COMMITS` only gates commits for frame sync and is writable only by
+  the window manager.
+- In mutter 50, `scale-monitor-framebuffer` and `xwayland-native-scaling` are no longer
+  experimental flags (it warns *Unknown experimental feature* for both); the behaviour
+  is always on.
+- Rootless Xwayland never uses `wp_fractional_scale_v1` (rootful only), so an X11
+  window on a 150 % output is drawn at 2x and composited at 0.75 with a linear filter.
+- **The one exception:** a *fullscreen* client that switches its own RandR mode to an
+  emulated mode of the panel's device size (3840x2160 out of the 5120x2880 X output).
+  Xwayland then maps the window through a `wp_viewport` whose destination is exactly the
+  output's device size, mutter paints it with nearest filtering, and it may be scanned
+  out directly — 1:1. The runtime does not drive that path today, and the 2D gate reads
+  the session-wide RandR state, not a client's emulated mode, so an app taking that path
+  would currently still be gated.
+
+So the supported way to get 3D on a fractionally-scaled panel is a native-Wayland app;
+X11 apps get honest 2D there and weave at any scale where the panel's scale equals `N`.
 
 `DXR_X11_PLACEMENT_QUANTUM=<n>` forces the quantum. It is meant for testing, and for the
 blind spot below.

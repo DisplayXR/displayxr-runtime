@@ -58,6 +58,9 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
 	# which only exists from CMake 3.25 and would silently evaluate FALSE here
 	# (this project requires 3.22), dropping us to the stub with no diagnostic.
 	target_sources(aux_os PRIVATE os_display_desktop_x11.c)
+	# The device mode + compositor scale behind each X11 monitor, by connector
+	# name: Mutter DisplayConfig (libdbus dlopen'd) else DRM sysfs (#1831).
+	target_sources(aux_os PRIVATE os_display_connector_linux.h os_display_connector_linux.c)
 	# X11 global-scale / placement-quantum detection: RandR rects joined to the
 	# DRM connector modes read from sysfs (no libdrm). See os_display_scale.h.
 	target_sources(aux_os PRIVATE os_display_scale_linux.c)
