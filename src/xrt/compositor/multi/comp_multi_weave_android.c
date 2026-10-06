@@ -1439,6 +1439,22 @@ comp_multi_weave_android_satellite_clear(struct multi_compositor *mc)
 	U_LOG_W("weave satellite(#1277): overlay CLEARED on weave-idle (stale-frame guard)");
 }
 
+void
+comp_multi_weave_android_set_overlay_hints(struct xrt_compositor *xc, bool overlay_unchanged, float filter_strength)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (mc == NULL || mc->msc == NULL) {
+		return;
+	}
+	weave_ensure_mutex(mc);
+	os_mutex_lock(&mc->weave.mutex);
+	mc->weave.overlay_unchanged = overlay_unchanged;
+	// Out of range (incl. NaN) = not set by the app: the DP's own default.
+	mc->weave.overlay_filter_strength =
+	    (filter_strength >= 0.0f && filter_strength <= 1.0f) ? filter_strength : -1.0f;
+	os_mutex_unlock(&mc->weave.mutex);
+}
+
 bool
 comp_multi_weave_android_satellite_presented(struct multi_compositor *mc)
 {
@@ -2329,6 +2345,52 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		// completion contract for the whole frame.
 		// Kill-switch: debug.xrt.DXR_ANDROID_WEAVE_SPLIT=0 restores the old
 		// single-submission behaviour.
+		// 2D under the lens (ADR-027 Amendment): offer the v4 overlay to the DP so
+		// it composites the layer INSIDE the weave and band-limits it for the lens,
+		// instead of the post-weave blend below (which aliases per eye wherever the
+		// lens is on). Only when the layer is exactly the process_atlas target size
+		// (the slot's contract; the satellite physical-rect and v6 N-view targets
+		// are not window-sized). The layer is put in SHADER_READ_ONLY here, BEFORE
+		// the self-submit split, so it is ready when a self-submitting DP (CNSDK)
+		// samples it during process_atlas. A DP that declines leaves the post-weave
+		// blend to do exactly what it did before. Per submit (#1835): the import
+		// is cached by AHB pointer, so a submit that chains no overlay must not
+		// hand the DP the last one.
+		struct xrt_display_processor_vk *dp_vk = (struct xrt_display_processor_vk *)mc->weave.dp;
+		bool ov_in_dp = false;
+		if (mc->weave.overlay_image != VK_NULL_HANDLE && mc->weave.overlay_this_submit &&
+		    mc->weave.overlay_w == mc->weave.out_w &&
+		    mc->weave.overlay_h == mc->weave.out_h && xrt_display_processor_vk_supports_overlay_2d(dp_vk)) {
+			VkImageMemoryBarrier ov_to_read = {
+			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+			    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+			    .oldLayout = mc->weave.overlay_first_use ? VK_IMAGE_LAYOUT_UNDEFINED
+			                                             : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			    .image = mc->weave.overlay_image,
+			    .subresourceRange = range,
+			};
+			mc->weave.overlay_first_use = false;
+			vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+			                         0, 0, NULL, 0, NULL, 1, &ov_to_read);
+			// v15 strength first: the D3D11 / Linux order.
+			xrt_display_processor_vk_set_overlay_2d_filter_strength(dp_vk, mc->weave.overlay_filter_strength);
+			ov_in_dp = xrt_display_processor_vk_set_overlay_2d(
+			    dp_vk, mc->weave.overlay_view, (VkFormat_XDP)WEAVE_VK_FORMAT, mc->weave.overlay_w,
+			    mc->weave.overlay_h, XRT_ATLAS_ENCODING_ENCODED, mc->weave.overlay_unchanged);
+		}
+		if (mc->weave.overlay_image != VK_NULL_HANDLE && mc->weave.overlay_this_submit) {
+			const uint8_t verdict = ov_in_dp ? 2u : 1u;
+			if (verdict != mc->weave.overlay_in_dp) {
+				mc->weave.overlay_in_dp = verdict;
+				U_LOG_W("weave(#1036) v4: 2D overlay %ux%u (target %ux%u) -> %s", mc->weave.overlay_w,
+				        mc->weave.overlay_h, mc->weave.out_w, mc->weave.out_h,
+				        ov_in_dp ? "composited by the DP inside the weave (2D under the lens)"
+				                 : "runtime post-weave premul-over blend");
+			}
+		}
+
 		bool weave_split = weave_split_enabled() && xrt_display_processor_is_self_submitting(mc->weave.dp);
 		if (weave_split) {
 			if (vk->vkEndCommandBuffer(cmd) != VK_SUCCESS) {
@@ -2406,7 +2468,7 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		// blend, so crisp 2D lands on top of the interlaced 3D at screen depth.
 		// The overlay is NOT woven — it is drawn after process_atlas onto the same
 		// output attachment.
-		if (mc->weave.overlay_image != VK_NULL_HANDLE && mc->weave.overlay_this_submit) {
+		if (mc->weave.overlay_image != VK_NULL_HANDLE && mc->weave.overlay_this_submit && !ov_in_dp) {
 			bool blend_ready = mc->weave.overlay_blend_initialized;
 			if (!blend_ready) {
 				blend_ready = vk_local2d_composite_init(&mc->weave.overlay_blend, vk, WEAVE_VK_FORMAT,

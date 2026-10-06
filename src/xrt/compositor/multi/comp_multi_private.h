@@ -804,6 +804,20 @@ struct multi_compositor
 		uint32_t overlay_refusals;
 		//! @}
 
+		/*!
+		 * @name 2D under the lens (ADR-027 Amendment, XR_DXR_weave v14/v15)
+		 * Android twin of the desktop-Linux fields: per-submit overlay hints set by
+		 * comp_multi_weave_android_set_overlay_hints right before each submit
+		 * (never sticky), forwarded to the DP with the overlay when its
+		 * set_overlay_2d slot takes it. @c overlay_in_dp is the last verdict so the
+		 * WARN fires on a change only.
+		 * @{
+		 */
+		bool overlay_unchanged;
+		float overlay_filter_strength;
+		uint8_t overlay_in_dp; //!< 0 = no overlay seen yet, 1 = runtime blend, 2 = DP composites
+		//! @}
+
 		//! @name Arch-C weave satellite (#1277 P0) — service-presented weave
 		//! `debug.dxr.weave_satellite=1`: the woven output is blitted onto a
 		//! SERVICE-owned full-panel overlay surface (the #558 machinery) and
@@ -1500,6 +1514,14 @@ comp_multi_weave_android_satellite_clear(struct multi_compositor *mc);
  */
 bool
 comp_multi_weave_android_satellite_presented(struct multi_compositor *mc);
+
+/*!
+ * XR_DXR_weave v14/v15 overlay hints for the NEXT comp_multi_weave_submit only
+ * (Android twin of comp_multi_weave_linux_set_overlay_hints). @p filter_strength
+ * outside [0, 1] (incl. NaN) means "not set by the app": the DP's own default.
+ */
+void
+comp_multi_weave_android_set_overlay_hints(struct xrt_compositor *xc, bool overlay_unchanged, float filter_strength);
 #endif
 
 bool
