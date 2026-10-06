@@ -85,9 +85,12 @@ process across milestones):
   signer) as a **consent-delegating** client of the runtime (spec §7.1), so the runtime does not
   prompt a second time per page. An unsigned/dev build is not delegating: the runtime prompts once
   for it from the tray.
-- **OS camera privacy:** if Windows camera access is off globally or for desktop apps, the runtime
-  refuses (`PERMISSION_INSUFFICIENT`) and the device reports an error — the same outcome a normal
-  webcam would give, so users are not surprised by a camera that ignores the OS switch.
+- **OS camera privacy:** if Windows camera access is off globally, for desktop apps or for the
+  browser, the runtime refuses (`PERMISSION_INSUFFICIENT`) **even though the browser is
+  delegating** and the device reports an error — the same outcome a normal webcam would give, so
+  users are not surprised by a camera that ignores the OS switch. Likewise a Deny the user stored
+  for the browser's executable, and the runtime's sharing switch, refuse it. Delegation only
+  removes the runtime's own prompt (spec §7.1 states the order).
 - **Runtime indicator** (tray badge naming `chrome.exe`) in addition to Chromium's; runtime kill
   switch hides the device entirely.
 - **Fingerprinting:** `device_id` is Chromium's per-origin hash of `dxr-stereo:<persistentId>`
@@ -305,8 +308,10 @@ where:
   **B1 migration:** the browser's video-capture utility must chain the struct instead of
   enabling `XR_DXR_weave` to be classed as the browser (the weave-derived PRESENT_OWNER claim
   is outranked by the declaration anyway); its other processes keep the sibling rule.
-- **Consent policy + store** (`u_camera_consent.{h,c}`, `u_camera_consent_store.c`): the eight-
-  step decision tree of spec §7.1 over two injected vtables (store, environment), the real store
+- **Consent policy + store** (`u_camera_consent.{h,c}`, `u_camera_consent_store.c`): the
+  decision tree of spec §7.1 (since the follow-up to PR #1819: kill switches, then the OS camera
+  switch, then a stored Deny refuse **before** delegation allows — as built in #1819 a delegating
+  client was allowed ahead of both) over two injected vtables (store, environment), the real store
   (Windows registry under `HKCU\Software\DisplayXR\CameraConsent`, POSIX
   `camera_consent.json` mode 0600 in the user config dir, plus the installer-written delegating
   lists), the Windows `ConsentStore\webcam` read, and the keyed `persistentId`

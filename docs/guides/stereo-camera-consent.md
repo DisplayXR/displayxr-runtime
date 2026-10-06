@@ -36,7 +36,9 @@ XrInstanceCreateInfo ci = {XR_TYPE_INSTANCE_CREATE_INFO, &consumer, /* … XR_DX
 
 The service looks at the **OS-derived executable path** of your process (never anything you
 send) and walks this list; the first hit decides. The same check runs for
-`xrGetStereoCameraCalibrationDXR` (calibration identifies the device).
+`xrGetStereoCameraCalibrationDXR` (calibration identifies the device). The normative statement
+is the table in [spec §7.1](../specs/extensions/XR_DXR_stereo_camera.md#71-authorisation-at-xrstartstereocamerastreamdxr-and-xrgetstereocameracalibrationdxr);
+this is the same order in developer terms.
 
 1. **Sharing off** — the user's tray / menu-bar toggle *"Share the 3D camera with apps"*, or
    `DXR_STEREO_CAMERA=0` in the service's environment → `XR_ERROR_STEREO_CAMERA_DISABLED_DXR`.
@@ -44,13 +46,18 @@ send) and walks this list; the first hit decides. The same check runs for
 2. `DXR_STEREO_CAMERA_DEV_ALLOW=1` in the **service's** environment → allowed. A development
    override; the service logs one WARN per run. Never on a user's machine.
 3. Your executable path could not be verified → `XR_ERROR_STEREO_CAMERA_CONSENT_REFUSED_DXR`.
-4. You are a **registered delegating client** → allowed, no prompt, nothing stored.
-5. **Windows:** the OS camera privacy switch denies you (Settings → Privacy → Camera: globally,
-   for desktop apps, or for your app) → `XR_ERROR_PERMISSION_INSUFFICIENT`.
-6. A **stored decision** for your executable (the user answered before, or an admin pre-seeded
-   it) → allowed, or `CONSENT_REFUSED`.
-7. The user chose **Allow once** earlier for this very process → allowed.
-8. The **prompt**: the service's tray (Windows) / menu-bar item (macOS) shows
+4. **Windows:** the OS camera privacy switch denies you (Settings → Privacy → Camera: globally,
+   for desktop apps, or for your app) → `XR_ERROR_PERMISSION_INSUFFICIENT`. This applies to
+   delegating clients too: the service opens the camera, so the OS never sees you as its user and
+   only the runtime can honour the switch.
+5. A stored **Deny** for your executable (the user answered Deny before, or ran
+   `displayxr-cli camera deny`) → `CONSENT_REFUSED`, even if you are a registered delegating
+   client.
+6. You are a **registered delegating client** → allowed, no prompt, nothing stored.
+7. A stored **Allow** for your executable (the user answered before, or an admin pre-seeded it)
+   → allowed.
+8. The user chose **Allow once** earlier for this very process → allowed.
+9. The **prompt**: the service's tray (Windows) / menu-bar item (macOS) shows
 
    > **"<your application name>" wants to use the 3D camera**
    > *your-app.exe (pid 1234) will receive frames from the display's stereo camera. You can stop
@@ -99,6 +106,11 @@ should not ask a second time per page. Register the browser's **executable path*
   `{"delegating": ["/full/path/to/browser", …]}`.
 - **Per user / development:** `displayxr-cli camera trust <exe>` (or `--self`), which writes the
   user-level list (`HKCU\…\CameraConsent\Delegating`, `~/.config/…/camera_consent.json`).
+  If the user had stored a Deny for that executable, `trust` clears it and says so; an
+  installer's registration never does — a user's Deny beats it.
+
+Registration means **no runtime prompt and no stored decision needed** — nothing more. Sharing
+off, the OS camera switch and a stored Deny still refuse you, each with its own result (§2).
 
 Obligations that come with it: prompt the user yourself before opening a stream, show your own
 in-use indicator, stop the stream when your page stops capturing, and never expose raw

@@ -15,20 +15,28 @@
  *  - @ref u_camera_consent_env_ops — what only the service process knows: the
  *    OS camera privacy switch for a given executable and the tray prompt.
  *
- * Decision order at every start / calibration read (first hit wins):
+ * Decision order at every start / calibration read (first hit wins). This is
+ * the one statement of it in code; spec §7.1 is the normative one:
  *   1. sharing off (DXR_STEREO_CAMERA=0 kill switch, or the user's "Share the
  *      3D camera with apps" toggle)                            -> DISABLED
  *   2. DXR_STEREO_CAMERA_DEV_ALLOW=1 (dev override, logged once) -> ALLOWED
  *   3. no verifiable peer executable                           -> REFUSED
- *   4. registered consent-delegating client (the browser)       -> ALLOWED
+ *   4. OS camera privacy denies this executable                -> OS_DENIED
+ *   5. stored per-app Deny                                     -> REFUSED
+ *   6. registered consent-delegating client (a browser)         -> ALLOWED
  *      (its own per-origin prompt + indicator is the consent)
- *   5. OS camera privacy denies this executable                -> OS_DENIED
- *   6. stored per-app decision (Allow / Deny)                  -> as stored
- *   7. "Allow once" granted earlier to this same process       -> ALLOWED
- *   8. tray prompt ("<app> wants to use the 3D camera —
+ *   7. stored per-app Allow                                    -> ALLOWED
+ *   8. "Allow once" granted earlier to this same process       -> ALLOWED
+ *   9. tray prompt ("<app> wants to use the 3D camera —
  *      Allow / Allow once / Deny"): Allow + Deny are written to the store,
  *      Allow once is remembered for the process; no prompt available
  *      (headless, DXR_STEREO_CAMERA_PROMPT=0) or unanswered in time -> REFUSED
+ *
+ * Delegation (step 6) means exactly "no runtime prompt and no stored per-app
+ * decision needed". It never outranks a refusal: the kill switches, the OS
+ * switch and a stored Deny apply to a delegating client like to any other.
+ * The OS switch matters most for it: the service, not the client, opens the
+ * camera, so the OS never sees the consumer and nothing else enforces it.
  *
  * The keyed persistentId (§7.5) also lives here: HMAC-SHA-256 under a 32-byte
  * secret the store generates once per user, so a page cannot derive the
@@ -106,7 +114,9 @@ struct u_camera_consent_decision
 	enum u_camera_consent_why why;
 	//! The executable is a registered consent-delegating client: it shows its
 	//! own prompt + indicator, follows its own visibility rule, and is never
-	//! given RAW frames (it exposes cameras to third-party content).
+	//! given RAW frames (it exposes cameras to third-party content). Set from
+	//! step 3 on whatever the verdict (it is a fact about the executable);
+	//! the dev override (step 2) and a missing identity leave it false.
 	bool delegating;
 };
 
@@ -216,6 +226,55 @@ u_camera_consent_persistent_id(struct u_camera_consent *c,
 void
 u_camera_consent_persistent_id_keyed(
     const uint8_t *key, size_t key_len, const char *device_identity, const char *consumer_exe, char out[64]);
+
+
+/*
+ *
+ * Pure helpers the platform store is built on (unit-tested on every OS).
+ *
+ */
+
+/*!
+ * Do two executable paths name the same file the way the store compares them?
+ * @p windows_rules: ASCII case-insensitive, either slash a separator (Windows); else
+ * byte-exact (POSIX). Non-ASCII bytes always compare exactly — a UTF-8 path
+ * that differs only in non-ASCII letter case does NOT match (fails closed for
+ * a delegating entry; the Windows Apps lookup uses the registry's own
+ * case-insensitive value-name match instead). Empty or NULL never matches.
+ */
+bool
+u_camera_consent_path_equal(const char *a, const char *b, bool windows_rules);
+
+//! One step of a list enumerator (see @ref u_camera_consent_list_find).
+enum u_camera_consent_enum_result
+{
+	U_CAMERA_CONSENT_ENUM_ENTRY = 0, //!< name + path were written (NUL-terminated UTF-8)
+	U_CAMERA_CONSENT_ENUM_SKIP = 1,  //!< this index is unusable (oversized, wrong type, not
+	                                 //!< convertible): ignore it and go on with the next
+	U_CAMERA_CONSENT_ENUM_END = 2,   //!< no entry at this index or after it (or the list
+	                                 //!< cannot be read any further)
+};
+
+/*!
+ * Read entry @p index of a delegating list: @p name is the entry's id (the
+ * registry value name; "" where the list has none), @p path its executable.
+ */
+typedef enum u_camera_consent_enum_result (*u_camera_consent_enum_fn)(
+    void *ctx, uint32_t index, char *name, size_t name_cap, char *path, size_t path_cap);
+
+//! Upper bound on the indices @ref u_camera_consent_list_find visits.
+#define U_CAMERA_CONSENT_LIST_MAX 4096
+
+/*!
+ * Walk a delegating list for @p exe. An unusable entry (SKIP) is passed over,
+ * never ends the scan — one oversized value an installer wrote must not hide
+ * every entry after it. On a match, the entry's name is copied to
+ * @p match_name (if non-NULL). Stops at END or after U_CAMERA_CONSENT_LIST_MAX
+ * indices.
+ */
+bool
+u_camera_consent_list_find(
+    u_camera_consent_enum_fn fn, void *ctx, const char *exe, bool windows_rules, char *match_name, size_t match_cap);
 
 
 /*

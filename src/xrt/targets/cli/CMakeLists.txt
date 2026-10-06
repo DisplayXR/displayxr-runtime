@@ -96,7 +96,8 @@ endif()
 # (compiled static into cli_cmd_camera.c).
 target_include_directories(cli PRIVATE ${PROJECT_SOURCE_DIR}/src/external/stb)
 if(WIN32)
-	target_link_libraries(cli PRIVATE d3d11 dxgi)
+	# shell32: CommandLineToArgvW (camera allow|deny|trust <exe> reads the path as UTF-16)
+	target_link_libraries(cli PRIVATE d3d11 dxgi shell32)
 endif()
 
 install(TARGETS cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

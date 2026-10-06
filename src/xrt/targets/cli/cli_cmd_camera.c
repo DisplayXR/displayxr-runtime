@@ -15,6 +15,10 @@
  *   camera consent                               list the store (apps, delegating, sharing)
  *   camera allow|deny|revoke <exe>|--self        stored per-app decision
  *   camera trust|untrust <exe>|--self            user-level consent-DELEGATING list
+ *                                                (trust clears a stored Deny for <exe>, which
+ *                                                would otherwise keep refusing it — spec §7.1)
+ *   <exe> is stored as the service will see the peer: made absolute / resolved
+ *   (and, on Windows, read from the UTF-16 command line, not the ANSI argv).
  *   camera status                                sharing / locked / started streams (IPC)
  *   camera stop-all                              the user kill switch (IPC)
  *   camera sharing on|off                        the persistent sharing toggle (IPC)
@@ -87,6 +91,7 @@
 
 #ifdef XRT_OS_WINDOWS
 #include <windows.h>
+#include <shellapi.h> // CommandLineToArgvW
 #else
 #include <poll.h>
 #include <sys/mman.h>
@@ -1070,7 +1075,33 @@ resolve_exe_arg(int argc, const char **argv, int idx, char *out, size_t cap)
 	if (strcmp(argv[idx], "--self") == 0) {
 		return self_exe_path(out, cap);
 	}
-	snprintf(out, cap, "%s", argv[idx]);
+	// Store the path the way the service will see the peer (full, OS-derived),
+	// or a Deny typed with '/' or a relative path would never match it.
+#if defined(XRT_OS_WINDOWS)
+	// argv is in the ANSI code page; the store is keyed by UTF-8. Re-read the
+	// argument as UTF-16 from the command line, then make it absolute.
+	int wargc = 0;
+	wchar_t **wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+	bool ok = false;
+	if (wargv != NULL && wargc == argc) {
+		wchar_t full[2048];
+		DWORD n = GetFullPathNameW(wargv[idx], (DWORD)(sizeof(full) / sizeof(full[0])), full, NULL);
+		const wchar_t *src = (n > 0 && n < sizeof(full) / sizeof(full[0])) ? full : wargv[idx];
+		int m = WideCharToMultiByte(CP_UTF8, 0, src, -1, out, (int)cap, NULL, NULL);
+		ok = m > 1;
+	}
+	if (wargv != NULL) {
+		LocalFree(wargv);
+	}
+	if (!ok) {
+		snprintf(out, cap, "%s", argv[idx]);
+	}
+#else
+	// The service reads proc_pidpath / /proc/<pid>/exe: the resolved path.
+	char *resolved = realpath(argv[idx], NULL); // malloc'd: never overruns a PATH_MAX buffer
+	snprintf(out, cap, "%s", resolved != NULL ? resolved : argv[idx]);
+	free(resolved);
+#endif
 	return out[0] != '\0';
 }
 
@@ -1118,11 +1149,30 @@ cmd_store(const char *op, int argc, const char **argv)
 	} else if (strcmp(op, "revoke") == 0) {
 		ok = st->set(NULL, exe, U_CAMERA_CONSENT_STORED_NONE);
 	} else if (strcmp(op, "trust") == 0) {
+		// A stored Deny outranks delegation (spec §7.1), so trusting over it
+		// would "succeed" and change nothing. `trust` is the user's newer,
+		// explicit word on this executable — like `allow` replacing a Deny —
+		// so it clears the Deny first and says so. (An installer's machine-
+		// wide registration never does: there the user's Deny keeps winning.)
+		enum u_camera_consent_stored prev = U_CAMERA_CONSENT_STORED_NONE;
+		if (st->get(NULL, exe, &prev) && prev == U_CAMERA_CONSENT_STORED_DENY) {
+			if (!st->set(NULL, exe, U_CAMERA_CONSENT_STORED_NONE)) {
+				printf(
+				    "trust %s: FAILED to clear the stored Deny (which would keep refusing it); nothing "
+				    "changed\n",
+				    exe);
+				return 2;
+			}
+			printf("trust %s: cleared the stored Deny for it\n", exe);
+		}
 		ok = u_camera_consent_store_set_delegating(exe, true);
 	} else { // untrust
 		ok = u_camera_consent_store_set_delegating(exe, false);
 	}
 	printf("%s %s: %s\n", op, exe, ok ? "ok (takes effect on the next stream start)" : "FAILED to write the store");
+	if (ok && strcmp(op, "deny") == 0 && st->is_delegating(NULL, exe)) {
+		printf("  note: %s is also a registered consent-delegating client; the stored Deny wins\n", exe);
+	}
 	return ok ? 0 : 2;
 }
 
@@ -1177,7 +1227,8 @@ usage(void)
 	    "             [--max-disparity N] [--max-dy N (24)] [--min-ncc C (0.90)]\n"
 	    "       consent                      list the consent store\n"
 	    "       allow|deny|revoke <exe>|--self   stored per-app decision (local)\n"
-	    "       trust|untrust <exe>|--self       user-level consent-delegating list (local)\n"
+	    "       trust|untrust <exe>|--self       user-level consent-delegating list (local; trust clears a stored "
+	    "Deny)\n"
 	    "       status | stop-all | sharing on|off | fake-lock on|off   (over IPC, DIAG)\n"
 	    "exit codes: 4 consent refused, 6 sharing off, 7 busy, 8 ended by the service, 5 rows misaligned\n");
 }

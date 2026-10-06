@@ -15,6 +15,7 @@
 #include "util/u_sha256.h"
 #include "xrt/xrt_instance.h"
 
+#include <cstdio>
 #include <cstring>
 #include <map>
 #include <set>
@@ -184,17 +185,105 @@ TEST_CASE("camera consent: no verifiable executable is refused, never prompted",
 	CHECK(r.env.prompts == 0);
 }
 
+// Spec §7.1: delegation means "no runtime prompt and no stored decision needed"
+// — nothing more. Every refusal that applies to any app applies to it first.
 TEST_CASE("camera consent: a delegating client passes without a prompt or a store entry", "[camera_consent]")
 {
 	rig r;
 	r.store.delegating.insert("/opt/browser/browser");
-	r.store.apps["/opt/browser/browser"] = U_CAMERA_CONSENT_STORED_DENY; // ignored: it is delegating
-	r.env.os_allowed = false;                                           // checked after delegation
+	r.env.answer = U_CAMERA_CONSENT_PROMPT_DENY; // would refuse if it were asked
 	auto d = r.eval("/opt/browser/browser");
 	CHECK(d.verdict == U_CAMERA_CONSENT_ALLOWED);
 	CHECK(d.why == U_CAMERA_CONSENT_WHY_DELEGATING);
 	CHECK(d.delegating);
 	CHECK(r.env.prompts == 0);
+	CHECK(r.store.sets == 0);
+	CHECK(r.store.apps.empty());
+}
+
+TEST_CASE("camera consent: a delegating client is refused by the OS camera switch", "[camera_consent]")
+{
+	rig r;
+	r.store.delegating.insert("/opt/browser/browser");
+	r.env.os_allowed = false;
+	SECTION("nothing stored")
+	{
+		auto d = r.eval("/opt/browser/browser");
+		CHECK(d.verdict == U_CAMERA_CONSENT_OS_DENIED);
+		CHECK(d.why == U_CAMERA_CONSENT_WHY_OS_DENIED);
+		CHECK(d.delegating); // still reported: it is a fact about the executable
+	}
+	SECTION("even with a stored Allow")
+	{
+		r.store.apps["/opt/browser/browser"] = U_CAMERA_CONSENT_STORED_ALLOW;
+		auto d = r.eval("/opt/browser/browser");
+		CHECK(d.verdict == U_CAMERA_CONSENT_OS_DENIED);
+		CHECK(d.why == U_CAMERA_CONSENT_WHY_OS_DENIED);
+	}
+	CHECK(r.env.prompts == 0);
+	CHECK(r.store.sets == 0);
+}
+
+TEST_CASE("camera consent: a stored Deny beats a delegating registration", "[camera_consent]")
+{
+	rig r;
+	r.store.delegating.insert("/opt/browser/browser");
+	r.store.apps["/opt/browser/browser"] = U_CAMERA_CONSENT_STORED_DENY;
+	r.env.answer = U_CAMERA_CONSENT_PROMPT_ALLOW;
+	auto d = r.eval("/opt/browser/browser");
+	CHECK(d.verdict == U_CAMERA_CONSENT_REFUSED);
+	CHECK(d.why == U_CAMERA_CONSENT_WHY_STORED_DENY);
+	CHECK(d.delegating);
+	CHECK(r.env.prompts == 0);
+	CHECK(r.store.sets == 0);
+	// The OS switch, when also off, is the reported reason (it is checked first).
+	r.env.os_allowed = false;
+	d = r.eval("/opt/browser/browser");
+	CHECK(d.verdict == U_CAMERA_CONSENT_OS_DENIED);
+}
+
+TEST_CASE("camera consent: sharing off disables a delegating client", "[camera_consent]")
+{
+	rig r;
+	r.store.delegating.insert("/opt/browser/browser");
+	SECTION("user toggle")
+	{
+		r.store.sharing = false;
+		auto d = r.eval("/opt/browser/browser");
+		CHECK(d.verdict == U_CAMERA_CONSENT_DISABLED);
+		CHECK(d.why == U_CAMERA_CONSENT_WHY_SHARING_OFF);
+	}
+	SECTION("DXR_STEREO_CAMERA=0")
+	{
+		r.c.kill_switch = true;
+		auto d = r.eval("/opt/browser/browser");
+		CHECK(d.verdict == U_CAMERA_CONSENT_DISABLED);
+		CHECK(d.why == U_CAMERA_CONSENT_WHY_KILL_SWITCH);
+	}
+	CHECK(r.env.prompts == 0);
+}
+
+TEST_CASE("camera consent: a stored Allow on a delegating client reports delegation", "[camera_consent]")
+{
+	rig r;
+	r.store.delegating.insert("/opt/browser/browser");
+	r.store.apps["/opt/browser/browser"] = U_CAMERA_CONSENT_STORED_ALLOW;
+	auto d = r.eval("/opt/browser/browser");
+	CHECK(d.verdict == U_CAMERA_CONSENT_ALLOWED);
+	CHECK(d.why == U_CAMERA_CONSENT_WHY_DELEGATING);
+	CHECK(d.delegating);
+}
+
+TEST_CASE("camera consent: an unregistered executable next to a delegating one takes the ordinary path",
+          "[camera_consent]")
+{
+	rig r;
+	r.store.delegating.insert("/opt/browser/browser");
+	auto d = r.eval("/apps/caller"); // not registered: the ordinary path
+	CHECK(d.verdict == U_CAMERA_CONSENT_REFUSED);
+	CHECK(d.why == U_CAMERA_CONSENT_WHY_PROMPT_UNAVAILABLE);
+	CHECK(!d.delegating);
+	CHECK(r.env.prompts == 1);
 }
 
 TEST_CASE("camera consent: the OS camera switch refuses before the store", "[camera_consent]")
@@ -317,6 +406,100 @@ TEST_CASE("camera consent: no store and no env still decides safely", "[camera_c
 	u_camera_consent_persistent_id(&c, "serial-1", "/apps/caller", id); // per-process key
 	CHECK(strncmp(id, "dxrcam-", 7) == 0);
 	CHECK(strlen(id) == 7 + 32);
+}
+
+TEST_CASE("consent store: path comparison rules", "[camera_consent][consent_store]")
+{
+	// Windows rules: ASCII case-insensitive, either separator.
+	CHECK(u_camera_consent_path_equal("C:\\Program Files\\B\\b.exe", "c:/program files/b/B.EXE", true));
+	CHECK(!u_camera_consent_path_equal("C:\\B\\b.exe", "C:\\B\\b.exe2", true));
+	CHECK(!u_camera_consent_path_equal("C:\\B\\b.exe", "C:\\B\\b.ex", true));
+	// UTF-8 paths match byte for byte — the wide-API reader hands UTF-8 over.
+	const char *u8 = "C:\\Users\\Jos\xc3\xa9\\\xe6\xb5\x8f\xe8\xa7\x88\xe5\x99\xa8\\b.exe";
+	CHECK(u_camera_consent_path_equal(u8, u8, true));
+	CHECK(u_camera_consent_path_equal(u8, u8, false));
+	// What the ANSI API used to hand back for that path (code-page bytes) does not.
+	CHECK(!u_camera_consent_path_equal("C:\\Users\\Jos\xe9\\???\\b.exe", u8, true));
+	// Non-ASCII case is not folded (fails closed): E-acute vs e-acute.
+	CHECK(!u_camera_consent_path_equal("/x/\xc3\x89", "/x/\xc3\xa9", true));
+	// POSIX rules: byte-exact.
+	CHECK(u_camera_consent_path_equal("/opt/b/browser", "/opt/b/browser", false));
+	CHECK(!u_camera_consent_path_equal("/opt/b/Browser", "/opt/b/browser", false));
+	CHECK(!u_camera_consent_path_equal("/opt/b\\browser", "/opt/b/browser", false));
+	// Empty / NULL never match.
+	CHECK(!u_camera_consent_path_equal("", "", true));
+	CHECK(!u_camera_consent_path_equal(nullptr, "/a", false));
+}
+
+namespace {
+
+struct fake_entry
+{
+	u_camera_consent_enum_result r;
+	std::string name, path;
+};
+
+struct fake_list
+{
+	std::vector<fake_entry> entries;
+	uint32_t calls = 0;
+	bool never_ends = false;
+};
+
+u_camera_consent_enum_result
+fl_enum(void *ctx, uint32_t index, char *name, size_t name_cap, char *path, size_t path_cap)
+{
+	auto *l = (fake_list *)ctx;
+	l->calls++;
+	if (index >= l->entries.size()) {
+		return l->never_ends ? U_CAMERA_CONSENT_ENUM_SKIP : U_CAMERA_CONSENT_ENUM_END;
+	}
+	const fake_entry &e = l->entries[index];
+	if (e.r == U_CAMERA_CONSENT_ENUM_ENTRY) {
+		snprintf(name, name_cap, "%s", e.name.c_str());
+		snprintf(path, path_cap, "%s", e.path.c_str());
+	}
+	return e.r;
+}
+
+} // namespace
+
+TEST_CASE("consent store: an oversized or malformed entry is skipped, not the end of the list",
+          "[camera_consent][consent_store]")
+{
+	fake_list l;
+	l.entries = {
+	    {U_CAMERA_CONSENT_ENUM_ENTRY, "other", "C:\\Other\\other.exe"},
+	    {U_CAMERA_CONSENT_ENUM_SKIP, "", ""}, // an installer's 5 KB value
+	    {U_CAMERA_CONSENT_ENUM_SKIP, "", ""}, // a REG_DWORD where a path belongs
+	    {U_CAMERA_CONSENT_ENUM_ENTRY, "browser.exe", "C:\\Program Files\\B\\browser.exe"},
+	};
+	char name[64] = "unchanged";
+	CHECK(u_camera_consent_list_find(fl_enum, &l, "c:/program files/b/browser.exe", true, name, sizeof(name)));
+	CHECK(std::string(name) == "browser.exe");
+
+	SECTION("no match walks everything once and stops at END")
+	{
+		l.calls = 0;
+		CHECK(!u_camera_consent_list_find(fl_enum, &l, "C:\\Nope\\x.exe", true, nullptr, 0));
+		CHECK(l.calls == 5); // 4 entries + the END
+	}
+	SECTION("END ends the scan even if a match would follow")
+	{
+		l.entries[1].r = U_CAMERA_CONSENT_ENUM_END;
+		CHECK(!u_camera_consent_list_find(fl_enum, &l, "C:\\Program Files\\B\\browser.exe", true, nullptr, 0));
+	}
+	SECTION("an enumerator that never ends is bounded")
+	{
+		l.never_ends = true;
+		l.calls = 0;
+		CHECK(!u_camera_consent_list_find(fl_enum, &l, "C:\\Nope\\x.exe", true, nullptr, 0));
+		CHECK(l.calls == U_CAMERA_CONSENT_LIST_MAX);
+	}
+	SECTION("no identity never matches")
+	{
+		CHECK(!u_camera_consent_list_find(fl_enum, &l, "", true, nullptr, 0));
+	}
 }
 
 TEST_CASE("sha256 / hmac vectors", "[camera_consent]")
