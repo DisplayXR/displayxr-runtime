@@ -120,6 +120,44 @@ clients; `persistentId` is already a per-executable keyed hash, coarsen the rest
 An unsigned / development build that is not registered is simply a camera-only client: the
 runtime prompts for it once (Allow is remembered for that path).
 
+### Writing the registration from an installer
+
+The runtime ships no allow-list: **each delegating application's own installer writes its entry
+on install and removes it on uninstall.** The runtime's installer never writes or deletes these
+entries. Rules, all of which follow from how the runtime checks the entry:
+
+1. **Register the executable the runtime sees.** The runtime identifies a client by the OS-derived
+   image path of the process that opens the stream (Windows `QueryFullProcessImageNameW`, Linux
+   `/proc/<pid>/exe`, macOS `proc_pidpath`) — never by anything the client sends. In a
+   multi-process browser that is the process that calls `xrStartStereoCameraStreamDXR` (typically
+   a video-capture utility process), whose image is usually the browser's main executable.
+2. **Trust is by full path only** — no signature or hash check in this version. So register only a
+   path inside a directory that only an administrator / root can write (Windows `%ProgramFiles%`;
+   a root-owned prefix such as `/usr` or `/opt/<vendor>` on Linux). An entry pointing into a
+   user-writable directory lets any unelevated process drop an executable there and inherit the
+   trust. If the user installs to such a location, register nothing; the runtime then asks once.
+   Note that macOS `/Applications` is writable by any admin-group user without elevation.
+3. **Protect the entry itself.** `HKLM\Software` is admin-only by default; the POSIX system file
+   must be root-owned and not group/world-writable (mode `0644`) — the runtime does not check its
+   ownership.
+4. **Windows specifics.** Write the **64-bit registry view** (a 32-bit installer such as NSIS needs
+   `SetRegView 64`; otherwise the value lands under `WOW6432Node`, which the runtime never reads).
+   The value **name** is free: use your product name, so it is unique to you and identifies the
+   entry to an admin. Keep the name under 256 characters and the path under 1024 bytes and in
+   ASCII — the current reader enumerates with the ANSI registry API and fixed buffers.
+5. **POSIX specifics.** The JSON file is shared by every installer: read it, add your path to
+   `delegating` if absent, write it back atomically; never rewrite other entries.
+6. **Uninstall removes only what you wrote** — your value (Windows) or your path (POSIX), and only
+   while it still holds the path you registered. Delete the `Delegating` / `CameraConsent` key or
+   the JSON file only if nothing else is left in it.
+7. **No restart needed.** The service reads the entry at every stream start and calibration read,
+   so a registration or removal takes effect on the next one.
+8. **Know what you are asking for.** A delegating client is evaluated at §7.1 step 4, before the
+   Windows camera privacy switch (step 5) and before a stored decision (step 6): a user's earlier
+   runtime *Deny* for that executable no longer applies, and `displayxr-cli camera untrust` only
+   edits the user list, not yours. The user's remaining runtime controls are *"Share the 3D camera
+   with apps"* and *"Stop camera sharing"*. Register only software that really prompts per origin.
+
 ## 5. What the user can do to you at any time
 
 - **"Stop camera sharing"** (tray / menu bar): every started stream ends. You receive
