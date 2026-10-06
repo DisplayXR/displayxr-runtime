@@ -192,6 +192,29 @@ cam_connect(struct ipc_connection *ipc_c, uint32_t client_class)
 }
 
 
+/*!
+ * True when the service reports camera sharing OFF. While sharing is off the service enumerates
+ * no camera at all, so "this machine has no stereo camera" and "sharing is off" look identical
+ * from the enumeration; only the status control tells them apart, and that control is DIAG-only,
+ * hence a second, short-lived connection.
+ */
+static bool
+cam_sharing_is_off(void)
+{
+	struct ipc_connection diag = {0};
+	struct xrt_instance_info ii = {0};
+	snprintf(ii.app_info.application_name, sizeof(ii.app_info.application_name), "%s", "displayxr-cli");
+	ii.app_info.declared_client_class = XRT_CLIENT_CLASS_DIAG;
+	if (ipc_client_connection_init(&diag, U_LOGGING_ERROR, &ii) != XRT_SUCCESS) {
+		return false; // cannot tell: report what the enumeration said
+	}
+	uint32_t value = 0;
+	xrt_result_t xret = ipc_client_stereo_camera_control(&diag, XRT_STEREO_CAMERA_CONTROL_STATUS, 0, &value);
+	ipc_client_connection_fini(&diag);
+	return xret == XRT_SUCCESS && (value & 1u) == 0;
+}
+
+
 /*
  *
  * list / calib.
@@ -669,6 +692,10 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 			}
 		}
 		if (!found && id == 0) {
+			if (cam_sharing_is_off()) {
+				printf("camera probe: refused%s\n", result_hint(XRT_ERROR_STEREO_CAMERA_DISABLED));
+				return refusal_exit_code(XRT_ERROR_STEREO_CAMERA_DISABLED); // 6, as documented
+			}
 			printf("camera probe: the service exposes no stereo camera.\n");
 			return 3;
 		}

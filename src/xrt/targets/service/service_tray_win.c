@@ -541,7 +541,8 @@ cam_prompt_show(struct cam_prompt_req *req)
 		wc.cbSize = sizeof(wc);
 		wc.lpfnWndProc = cam_prompt_wnd_proc;
 		wc.hInstance = hi;
-		wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+		// IDC_ARROW is the ANSI-typed MAKEINTRESOURCE in this non-UNICODE build (MSVC C4133 with the W call).
+		wc.hCursor = LoadCursorW(NULL, MAKEINTRESOURCEW(32512)); // IDC_ARROW
 		wc.hbrBackground = GetSysColorBrush(COLOR_WINDOW);
 		wc.lpszClassName = L"DisplayXRCameraConsent";
 		wc.hIcon = s_icon_base;
