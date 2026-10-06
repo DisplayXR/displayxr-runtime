@@ -1955,7 +1955,7 @@ print_x11_scale_text(const struct cli_query_result *r)
 	printf("\n");
 	PT("drag snap:    %s\n", x11_snap_capability(r));
 	PT("X root:       %ux%u X11 px (native width of matched outputs: %u px)%s\n", s->root_w, s->root_h,
-	   s->native_sum_w, s->drm_available ? "" : " [no DRM modes in /sys/class/drm]");
+	   s->native_sum_w, s->drm_available ? "" : " [no device modes: no Mutter DisplayConfig, no /sys/class/drm]");
 	for (uint32_t i = 0; i < s->output_count; i++) {
 		const struct u_x11_output_sizes *o = &s->outputs[i];
 		if (o->native_w > 0) {
@@ -2040,13 +2040,16 @@ cli_query_print_info_text(const struct cli_query_result *r)
 	// they differ — a bug report needs the plug-in's raw answer too.
 	{
 		const bool overridden =
-		    r->desktop_info_ok && r->desktop_info_is_panel &&
-		    r->desktop_match.rule == OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH &&
+		    r->desktop_info_ok &&
+		    ((r->desktop_info_is_panel && r->desktop_match.rule == OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH) ||
+		     r->desktop_match.rule == OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE) &&
 		    (r->desktop_info.left != i->display_screen_left || r->desktop_info.top != i->display_screen_top);
 		if (overridden) {
-			PT("screen pos:   (%d, %d)  [runtime override by size match; plug-in reported "
+			PT("screen pos:   (%d, %d)  [runtime override by %s; plug-in reported "
 			   "(%d, %d)]\n",
-			   r->desktop_info.left, r->desktop_info.top, i->display_screen_left, i->display_screen_top);
+			   r->desktop_info.left, r->desktop_info.top,
+			   os_display_desktop_rule_str(r->desktop_match.rule), i->display_screen_left,
+			   i->display_screen_top);
 		} else {
 			PT("screen pos:   (%d, %d)\n", i->display_screen_left, i->display_screen_top);
 		}
@@ -2062,7 +2065,21 @@ cli_query_print_info_text(const struct cli_query_result *r)
 	   r->desktop_info.device_name[0] != 0 ? r->desktop_info.device_name : "?",
 	   r->desktop_info.is_primary ? " [primary]" : "", os_display_desktop_rule_str(r->desktop_match.rule),
 	   r->desktop_info_is_panel ? "panel-confirmed" : "not panel-confirmed");
-	if (r->desktop_match.rule == OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH && r->desktop_match.candidate_count > 1) {
+	if (r->desktop_info.native_width > 0 && r->desktop_info.native_height > 0) {
+		const int one_to_one = os_display_desktop_info_is_1to1(&r->desktop_info);
+		PT("              connector mode %ux%u", r->desktop_info.native_width, r->desktop_info.native_height);
+		if (r->desktop_info.scale > 0.0) {
+			printf(" at %.0f%%", r->desktop_info.scale * 100.0);
+		}
+		printf(" (%s) - %s\n",
+		       r->desktop_info.native_source == OS_DISPLAY_NATIVE_SOURCE_COMPOSITOR ? "compositor" : "DRM",
+		       one_to_one == 1 ? "the rect is device pixels (X11 windows land 1:1)"
+		                       : "the rect is NOT device pixels: X11 windows there are resampled, so they "
+		                         "present 2D (#1831)");
+	}
+	if ((r->desktop_match.rule == OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH ||
+	     r->desktop_match.rule == OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE) &&
+	    r->desktop_match.candidate_count > 1) {
 		PT("              ** AMBIGUOUS: %u of %u monitors match the panel size; tie broken on physical "
 		   "size / non-primary\n",
 		   r->desktop_match.candidate_count, r->desktop_match.monitor_count);

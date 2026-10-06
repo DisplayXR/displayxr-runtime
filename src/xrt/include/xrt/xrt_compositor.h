@@ -2996,6 +2996,22 @@ struct xrt_system_compositor_info
 	//! Windows: the GDI name, e.g. `\\.\DISPLAY1`. Empty when unknown.
 	char display_device_name[128];
 
+	/*!
+	 * The DEVICE mode the panel monitor's connector is running, and the
+	 * compositor's scale for it (desktop Linux; #1831). 0 = unknown.
+	 *
+	 * @ref display_desktop_width / @ref display_desktop_height are in the
+	 * space windows are placed in, which under XWayland is the scaled X
+	 * screen: a 3840x2160 panel at 150 % reads 5120x2880 there. When these
+	 * are known and differ from the desktop rect, an X11 window on the panel
+	 * is resampled by the display server on its way to the glass, so it can
+	 * never carry a correct weave — see the X11 arm of the compositor's 1:1
+	 * gate.
+	 */
+	uint32_t display_desktop_native_width;
+	uint32_t display_desktop_native_height;
+	float display_desktop_scale;
+
 	/*! @} */
 
 	//! Workspace mode: multi-compositor with shared window for all clients.

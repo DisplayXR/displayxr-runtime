@@ -33,7 +33,19 @@
  * both are per-monitor facts the OS also knows (RandR reports each monitor's
  * rect and its EDID mm). The rule order is in @ref
  * os_display_desktop_info_for_panel: a reported position beats everything, then
- * a unique PIXEL-size match, then the primary fallback.
+ * the monitor whose CONNECTOR runs the panel's native mode, then a unique
+ * PIXEL-size match in the placement space, then the primary fallback.
+ *
+ * ## Why the connector's mode comes before the placement-space size (#1831)
+ *
+ * The placement space is not the hardware on a scaled X11 desktop. Under
+ * XWayland, Mutter scales the whole X screen by one integer, the ceiling of the
+ * largest monitor scale, so a 3840x2160 panel at 150 % is a 5120x2880 RandR
+ * rect: the size rule misses it and the primary fallback silently weaves for
+ * the laptop. Worse, a different monitor's scaled rect can read exactly the
+ * panel's size and win. The connector's device mode (Mutter DisplayConfig,
+ * else DRM sysfs, joined by connector name) is the same number the plug-in
+ * reports, at any scale.
  *
  * Physical size is a tie-breaker only, never a rule of its own. Matching on
  * millimetres alone would place windows on a monitor whose pixel size differs
@@ -112,11 +124,86 @@ os_display_desktop_rule_str(enum os_display_desktop_rule rule)
 {
 	switch (rule) {
 	case OS_DISPLAY_DESKTOP_RULE_ORIGIN: return "origin";
+	case OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE: return "connector match";
 	case OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH: return "size match";
 	case OS_DISPLAY_DESKTOP_RULE_PRIMARY_FALLBACK: return "primary fallback";
 	case OS_DISPLAY_DESKTOP_RULE_UNRESOLVED:
 	default: return "unresolved";
 	}
+}
+
+int32_t
+os_display_desktop_select_by_size(const struct os_display_desktop_info *mons,
+                                  uint32_t count,
+                                  const struct os_display_panel_hint *hint,
+                                  struct os_display_panel_match *out_match)
+{
+	struct os_display_panel_match match = {0};
+	match.rule = OS_DISPLAY_DESKTOP_RULE_UNRESOLVED;
+	match.monitor_count = count;
+	if (out_match != NULL) {
+		*out_match = match;
+	}
+
+	if (mons == NULL || count == 0 || hint == NULL || hint->pixel_width == 0 || hint->pixel_height == 0) {
+		return -1;
+	}
+	if (count > OS_DISPLAY_DESKTOP_MAX_MONITORS) {
+		count = OS_DISPLAY_DESKTOP_MAX_MONITORS;
+	}
+
+	// Metres -> mm, rounded. 0 stays 0 ("unknown").
+	const uint32_t panel_w_mm = hint->width_m > 0.0f ? (uint32_t)(hint->width_m * 1000.0f + 0.5f) : 0;
+	const uint32_t panel_h_mm = hint->height_m > 0.0f ? (uint32_t)(hint->height_m * 1000.0f + 0.5f) : 0;
+
+	uint32_t cand[OS_DISPLAY_DESKTOP_MAX_MONITORS];
+	uint32_t cand_count = 0;
+
+	// Rule 2 (#1831): the connector is RUNNING the panel's native mode. The
+	// device mode is the one number that means the same thing on both sides
+	// at every desktop scale — the plug-in reports hardware pixels, and so
+	// does the connector — where the X11 rect of a fractionally-scaled output
+	// is device x ceil(scale) / scale and matches nothing.
+	for (uint32_t i = 0; i < count; i++) {
+		if (mons[i].native_width == hint->pixel_width && mons[i].native_height == hint->pixel_height) {
+			cand[cand_count++] = i;
+		}
+	}
+	enum os_display_desktop_rule rule = OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE;
+
+	// Rule 3: the monitor's rect in the placement space IS the panel's
+	// native resolution — the only evidence on platforms with no device
+	// mode. Compared in the caller's DPI space, the space a plug-in reports
+	// in (see the field docs on os_display_desktop_info). A monitor whose
+	// device mode IS known and is something else is not the panel, however
+	// its rect happens to read: under XWayland a 2880x1800 laptop at 125 %
+	// with the X screen at 2x reads 4608x2880, and a different laptop could
+	// read exactly a panel's 3840x2160.
+	if (cand_count == 0) {
+		rule = OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH;
+		for (uint32_t i = 0; i < count; i++) {
+			const bool native_known = mons[i].native_width > 0 && mons[i].native_height > 0;
+			if (native_known) {
+				continue;
+			}
+			if (mons[i].width_in_caller_dpi == hint->pixel_width &&
+			    mons[i].height_in_caller_dpi == hint->pixel_height) {
+				cand[cand_count++] = i;
+			}
+		}
+	}
+
+	if (cand_count == 0) {
+		return -1;
+	}
+
+	const uint32_t pick = cand_count == 1 ? cand[0] : disambiguate(mons, cand, cand_count, panel_w_mm, panel_h_mm);
+	match.rule = rule;
+	match.candidate_count = cand_count;
+	if (out_match != NULL) {
+		*out_match = match;
+	}
+	return (int32_t)pick;
 }
 
 bool
@@ -157,36 +244,16 @@ os_display_desktop_info_for_panel(const struct os_display_panel_hint *hint,
 
 	struct os_display_desktop_info mons[OS_DISPLAY_DESKTOP_MAX_MONITORS];
 	uint32_t count = os_display_desktop_enumerate(mons, OS_DISPLAY_DESKTOP_MAX_MONITORS);
-	match.monitor_count = count;
 
-	// Metres -> mm, rounded. 0 stays 0 ("unknown").
-	uint32_t panel_w_mm = h.width_m > 0.0f ? (uint32_t)(h.width_m * 1000.0f + 0.5f) : 0;
-	uint32_t panel_h_mm = h.height_m > 0.0f ? (uint32_t)(h.height_m * 1000.0f + 0.5f) : 0;
-
-	if (count > 0 && h.pixel_width > 0 && h.pixel_height > 0) {
-		// Rule 2: the monitor's mode IS the panel's native resolution.
-		// Compared in the caller's DPI space, the space a plug-in reports
-		// in — see the field docs on os_display_desktop_info.
-		uint32_t cand[OS_DISPLAY_DESKTOP_MAX_MONITORS];
-		uint32_t cand_count = 0;
-		for (uint32_t i = 0; i < count; i++) {
-			if (mons[i].width_in_caller_dpi == h.pixel_width &&
-			    mons[i].height_in_caller_dpi == h.pixel_height) {
-				cand[cand_count++] = i;
-			}
+	// Rules 2 and 3: the panel's hardware mode, then its size in the
+	// placement space.
+	int32_t pick = os_display_desktop_select_by_size(mons, count, &h, &match);
+	if (pick >= 0) {
+		*out_info = mons[pick];
+		if (out_match != NULL) {
+			*out_match = match;
 		}
-
-		if (cand_count > 0) {
-			uint32_t pick =
-			    cand_count == 1 ? cand[0] : disambiguate(mons, cand, cand_count, panel_w_mm, panel_h_mm);
-			*out_info = mons[pick];
-			match.rule = OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH;
-			match.candidate_count = cand_count;
-			if (out_match != NULL) {
-				*out_match = match;
-			}
-			return true;
-		}
+		return true;
 	}
 
 	// No rule between here and the fallback. A monitor matching only in
@@ -195,7 +262,7 @@ os_display_desktop_info_for_panel(const struct os_display_panel_hint *hint,
 	// and physical size alone does not identify a panel well enough to move a
 	// window on (see the file comment for the measurement that settled this).
 
-	// Rule 3: the monitor at the desktop origin — i.e. exactly what this
+	// Rule 4: the monitor at the desktop origin — i.e. exactly what this
 	// resolver did before any of the above existed, which is what keeps the
 	// Windows path (no enumeration, so it arrives straight here whenever the
 	// plug-in reported no position) bit-for-bit unchanged.

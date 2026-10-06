@@ -46,6 +46,7 @@
  */
 
 #include "os_display_desktop.h"
+#include "os_display_connector_linux.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -212,8 +213,10 @@ query_monitors(struct os_display_desktop_info *out_infos, uint32_t max_infos)
 				o->height = (uint32_t)m->height;
 				o->is_primary = m->primary != 0;
 
-				// X11 root coordinates are device pixels with no scaling
-				// layer, so the plug-in reads the same space we do.
+				// The plug-in has no DPI virtualisation to undo here, so
+				// it reads the same space we do. NOTE this is NOT device
+				// pixels under XWayland at a non-unit scale — the
+				// connector's device mode is native_width/height.
 				o->width_in_caller_dpi = o->width;
 				o->height_in_caller_dpi = o->height;
 
@@ -243,6 +246,11 @@ query_monitors(struct os_display_desktop_info *out_infos, uint32_t max_infos)
 	}
 
 	x11_fns_unload(&f);
+
+	// The device mode behind each X11 rect (#1831): under XWayland the rect
+	// is in the scaled X screen, and the panel can only be recognised — and
+	// a 1:1 presentation only be judged — by what the connector runs.
+	os_display_connector_annotate(out_infos, written);
 
 	return written;
 }

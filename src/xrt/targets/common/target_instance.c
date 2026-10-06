@@ -650,6 +650,9 @@ fill_display_desktop_info(struct xrt_system_compositor_info *info)
 	info->display_desktop_width = desktop.width;
 	info->display_desktop_height = desktop.height;
 	info->display_is_primary = desktop.is_primary;
+	info->display_desktop_native_width = desktop.native_width;
+	info->display_desktop_native_height = desktop.native_height;
+	info->display_desktop_scale = (float)desktop.scale;
 
 	(void)snprintf(info->display_device_name, sizeof(info->display_device_name), "%s", desktop.device_name);
 
@@ -681,18 +684,26 @@ fill_display_desktop_info(struct xrt_system_compositor_info *info)
 	//
 	// Never on the primary fallback: there the rect origin IS the desktop
 	// origin, so the assignment would be a no-op dressed as a decision.
+	//
+	// The connector rule (#1831) earns the same authority with or without a
+	// 1:1 rect: it identified the panel by the mode its connector is running,
+	// so the rect's origin IS the panel's origin in the placement space even
+	// when that space is scaled — and an app that cannot weave there still
+	// belongs on the panel, not on the laptop.
 	const bool origin_from_plugin = match.rule == OS_DISPLAY_DESKTOP_RULE_ORIGIN;
 	const bool origin_from_size_match =
-	    match.rule == OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH && info->display_desktop_rect_is_panel;
+	    (match.rule == OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH && info->display_desktop_rect_is_panel) ||
+	    match.rule == OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE;
 
 	if (origin_from_size_match &&
 	    (desktop.left != info->display_screen_left || desktop.top != info->display_screen_top)) {
 		U_LOG_W(
 		    "Plug-in reported panel origin (%d, %d); the desktop resolver found the panel at "
-		    "(%d, %d) on '%s' by size — using that. Window placement and the weave present "
+		    "(%d, %d) on '%s' by %s — using that. Window placement and the weave present "
 		    "origin both follow the resolver.",
 		    (int)info->display_screen_left, (int)info->display_screen_top, (int)desktop.left, (int)desktop.top,
-		    desktop.device_name[0] != '\0' ? desktop.device_name : "?");
+		    desktop.device_name[0] != '\0' ? desktop.device_name : "?",
+		    match.rule == OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE ? "its connector's mode" : "size");
 	}
 
 	if (origin_from_plugin || origin_from_size_match) {
@@ -700,17 +711,37 @@ fill_display_desktop_info(struct xrt_system_compositor_info *info)
 		info->display_screen_top = desktop.top;
 	}
 
-	U_LOG_W("XR_DXR_display_info panel rect: %ux%u at (%d, %d) on '%s'%s [rule: %s]%s", desktop.width,
+	// The device mode behind the rect, when the platform knows it — the one
+	// number that tells "this rect is the panel, scaled" from "this rect is
+	// some other monitor".
+	char device_mode[96] = "";
+	if (desktop.native_width > 0 && desktop.native_height > 0) {
+		char scale_str[32] = "";
+		if (desktop.scale > 0.0) {
+			(void)snprintf(scale_str, sizeof(scale_str), " at %.0f%%", desktop.scale * 100.0);
+		}
+		(void)snprintf(device_mode, sizeof(device_mode), "; connector mode %ux%u%s (%s)", desktop.native_width,
+		               desktop.native_height, scale_str,
+		               desktop.native_source == OS_DISPLAY_NATIVE_SOURCE_COMPOSITOR ? "compositor" : "DRM");
+	}
+
+	const int one_to_one = os_display_desktop_info_is_1to1(&desktop);
+	U_LOG_W("XR_DXR_display_info panel rect: %ux%u at (%d, %d) on '%s'%s [rule: %s]%s%s", desktop.width,
 	        desktop.height, (int)desktop.left, (int)desktop.top,
 	        desktop.device_name[0] != '\0' ? desktop.device_name : "?", desktop.is_primary ? ", primary" : "",
-	        os_display_desktop_rule_str(match.rule),
-	        info->display_desktop_rect_is_panel ? "" : " (size != panel native — not panel-confirmed)");
+	        os_display_desktop_rule_str(match.rule), device_mode,
+	        info->display_desktop_rect_is_panel ? ""
+	        : (match.rule == OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE && one_to_one == 0)
+	            ? " (panel identified; its X11 rect is not device pixels — X11 windows there are resampled)"
+	            : " (size != panel native — not panel-confirmed)");
 
 	// Two monitors matched the panel's pixel size, so the pick was a
 	// tie-break (closest physical size, else the non-primary one) rather than
 	// a deduction. Say so once, at init: it is the one case where the rect
 	// above could be the wrong monitor while still looking confident.
-	if (match.rule == OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH && match.candidate_count > 1) {
+	if ((match.rule == OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH ||
+	     match.rule == OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE) &&
+	    match.candidate_count > 1) {
 		U_LOG_W(
 		    "Panel selection was AMBIGUOUS: %u of %u monitors are %ux%u — picked '%s'. "
 		    "A plug-in that reports its panel origin would settle this.",
