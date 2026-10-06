@@ -75,7 +75,7 @@
     "XR_DXR_weave": {
       "group": "rendering",
       "title": "Window Weave Service",
-      "summary": "Window-bound synchronous weave for present-owners: hand the runtime a stereo texture and a window rect, get back a weaved shared texture and a fence"
+      "summary": "Window-bound synchronous weave for present-owners: hand the runtime a stereo texture and a window rect, get back a weaved shared texture and a fence, or (v17) have the runtime present the frame on a composition surface you show"
     },
     "XR_DXR_lift": {
       "group": "rendering",

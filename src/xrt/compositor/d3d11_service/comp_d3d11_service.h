@@ -1202,6 +1202,25 @@ void
 comp_d3d11_service_weave_set_overlay_filter_strength(struct xrt_compositor *xc, float strength);
 
 /*!
+ * XR_DXR_weave v17 (XrWeaveSubmitPresentSurfaceDXR): the DirectComposition
+ * surface handle (from the caller's DCompositionCreateSurfaceHandle) the NEXT
+ * @ref comp_d3d11_service_weave_submit presents the woven frame on, through a
+ * swap chain the service keeps on it. THIS process's handle (the IPC handler
+ * pulled it from the caller); ownership passes to the compositor, which adopts
+ * it or closes it on every path. NULL = no surface. Per submit, like v14/v15.
+ */
+void
+comp_d3d11_service_weave_set_present_surface(struct xrt_compositor *xc, HANDLE surface);
+
+/*!
+ * XR_DXR_weave v17: whether the last accepted @ref comp_d3d11_service_weave_submit
+ * presented on the caller's surface (false = it wove into the service's own woven
+ * texture, or there was no surface). Read once, right after the submit.
+ */
+bool
+comp_d3d11_service_weave_take_presented(struct xrt_compositor *xc);
+
+/*!
  * Export the persistent server-allocated weaved-output texture handle (+ dims)
  * for the caller to import once and present each frame. Returns false until the
  * first successful @ref comp_d3d11_service_weave_submit has allocated it.

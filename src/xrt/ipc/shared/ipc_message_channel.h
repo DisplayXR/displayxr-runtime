@@ -169,6 +169,26 @@ xrt_result_t
 ipc_send_handles(
     struct ipc_message_channel *imc, const void *data, size_t size, const HANDLE *handles, uint32_t handle_count);
 
+/*!
+ * PULL a handle out of the peer process: DuplicateHandle(peer, @p remote, self).
+ *
+ * The opposite direction to @ref ipc_send_handles, which the SENDER performs and
+ * which therefore needs the sender to OpenProcess(PROCESS_DUP_HANDLE) the
+ * receiver. A low-integrity sandboxed client (a browser GPU process) cannot open
+ * the medium-integrity service that way, but the service can open it, provided
+ * the client's process DACL grants the user PROCESS_DUP_HANDLE (the DisplayXR
+ * Browser does, pre-sandbox, for the woven-output handback). Server end only:
+ * the peer is the declared process (browser#103) or the pipe's client.
+ *
+ * @param imc Message channel whose peer owns @p remote
+ * @param remote Handle value valid in the peer process
+ * @param[out] out_local A new handle in this process the caller must close
+ *
+ * @public @memberof ipc_message_channel
+ */
+xrt_result_t
+ipc_pull_handle_from_peer(struct ipc_message_channel *imc, HANDLE remote, HANDLE *out_local);
+
 #endif // XRT_OS_UNIX
 /*!
  * @}

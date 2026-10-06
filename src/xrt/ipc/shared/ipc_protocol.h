@@ -918,6 +918,17 @@ struct ipc_arg_weave_submit
 	//! strength for the overlay, [0,1]; NEGATIVE = not set (the DP's own default).
 	//! Appended: 832 + 4 = 836 B; the dma-buf call is 4 + 836 + 136 = 976 of 1024.
 	float overlay_filter_strength;
+
+	//! XR_DXR_weave v17 (XrWeaveSubmitPresentSurfaceDXR): the DirectComposition
+	//! surface handle (DCompositionCreateSurfaceHandle) the service presents the
+	//! woven frame on. A VALUE in the CALLER's process and deliberately NOT an
+	//! in_handle: in_handles are pushed (the sender DuplicateHandle's into the
+	//! peer), which a low-integrity sandboxed sender cannot do to the service.
+	//! The service PULLS it (ipc_pull_handle_from_peer). 0 = none / pre-v17.
+	//! Appended: 836 + 4 (explicit padding) = 840, + 8 = 848 B; the dma-buf call
+	//! is 8 + 848 + 136 = 992 of 1024 (static_assert'ed in ipc_server_handler.c).
+	uint32_t present_reserved;       //!< 0; keeps the handle explicitly 8-aligned
+	uint64_t present_surface_handle; //!< caller-process composition surface NT handle value
 };
 
 /*!

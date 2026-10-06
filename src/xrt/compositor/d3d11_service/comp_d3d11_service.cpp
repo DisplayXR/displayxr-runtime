@@ -814,6 +814,28 @@ struct d3d11_client_render_resources
 	//! negative = the DP's default. Consumed (reset to -1) by the submit.
 	float                                  weave_overlay_filter_strength_next;
 
+	//! XR_DXR_weave v17 (XrWeaveSubmitPresentSurfaceDXR): the next submit's
+	//! composition surface (an owned handle the IPC handler pulled from the
+	//! caller), consumed by the submit on every path.
+	HANDLE                                 weave_present_surface_next;
+	//! The last ACCEPTED submit was presented on the surface (read by the IPC
+	//! handler right after the submit, as XrWeavePresentStatusDXR).
+	bool                                   weave_presented;
+	//! The swap chain the service presents on, made on the caller's surface
+	//! (CreateSwapChainForCompositionSurfaceHandle) and kept across frames:
+	//! recreated when the surface changes, resized with the window.
+	HANDLE                                 weave_present_surface_cached; //!< owned; identity key
+	wil::com_ptr<IDXGISwapChain2>          weave_present_sc;
+	wil::com_ptr<ID3D11Texture2D>          weave_present_back;
+	wil::com_ptr<ID3D11RenderTargetView>   weave_present_rtv;
+	HANDLE                                 weave_present_waitable;
+	bool                                   weave_present_token_held;
+	bool                                   weave_present_create_failed;
+	uint32_t                               weave_present_w;
+	uint32_t                               weave_present_h;
+	//! Last decline reason logged (WEAVE_PRESENT_*): logged on change only.
+	int                                    weave_present_last_reason;
+
 	//! DXR_WEAVE_GPU_TIMING=1 diagnostic (ADR-027 Amendment perf A/B; "2D under
 	//! the lens" P0 instrumentation). Per weave_submit: a disjoint + kWeaveTs
 	//! timestamp queries bracketing each GPU stage (WEAVE_TS_*), read back
@@ -845,6 +867,11 @@ struct d3d11_client_render_resources
 	uint32_t                               weave_cpu_path_n[4];  //!< accepted submits by WEAVE_PATH_*
 	uint32_t                               weave_cpu_route_n[3]; //!< accepted submits by WEAVE_OV_*
 	uint32_t                               weave_cpu_ov_unchanged; //!< overlay declared unchanged (v14)
+	uint32_t                               weave_cpu_present_n;        //!< v17: presented on the caller's surface
+	uint32_t                               weave_cpu_present_declined; //!< v17: surface offered, not presented
+	weave_timing_stat                      weave_cpu_present_wait;     //!< v17: frame-latency token wait, ms
+	weave_timing_stat                      weave_cpu_present_call;     //!< v17: Present() CPU, ms
+	weave_timing_stat                      weave_cpu_present_queue;    //!< v17: presents not yet on screen
 	int64_t                                weave_gpu_last_log_ns;
 
 	//! Deferred auto-3D for no-zones standalone clients (#140 / no-zones-2D).
@@ -6742,6 +6769,10 @@ render_equirect2_layer(struct d3d11_service_system *sys,
 static void
 weave_close_cached(HANDLE h, bool is_dxgi);
 
+//! Defined with the weave submit path below (v17 present surface).
+static void
+weave_present_reset(struct d3d11_client_render_resources *res);
+
 /*!
  * Clean up per-client render resources.
  */
@@ -6865,6 +6896,8 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 	res->weave_overlay_km.reset();
 	res->weave_overlay_srv.reset();
 	res->weave_overlay_tex.reset();
+	// v17: the swap chain on the caller's composition surface + its handles.
+	weave_present_reset(res);
 
 	// #964: the APP_HWND presenter's frame-latency waitable (owned handle).
 	if (res->frame_latency_waitable != nullptr) {
@@ -25529,6 +25562,257 @@ weave_close_cached(HANDLE h, bool is_dxgi)
 }
 
 /*
+ * XR_DXR_weave v17 — the runtime PRESENTS the woven frame on the caller's
+ * DirectComposition surface (XrWeaveSubmitPresentSurfaceDXR).
+ *
+ * A present-owner whose v4 overlay is its whole 2D page gets back, in the woven
+ * output, its COMPLETE frame — and then copies all of it over its own back
+ * buffer every frame (~2 x 31 MB at 4K) before it presents. With a present
+ * surface the caller instead shows a visual whose content is a composition
+ * surface handle it made (DCompositionCreateSurfaceHandle); the service puts a
+ * flip-model swap chain on that handle, weaves straight into its back buffer and
+ * presents. The caller draws nothing back.
+ *
+ * The contract kept below (see XR_DXR_weave.h):
+ *  - PRESENTED = every pixel of the back buffer written (first-chunk clear,
+ *    full-window weave, overlay composite), then Present. So only a
+ *    full-window-canvas submit (batch or v6) that clears (firstChunk) takes it.
+ *  - DECLINED = this submit weaves into weave_output_texture exactly as without
+ *    the struct and reports presented=false; the caller copies back and hides its
+ *    visual in the same commit. Never a refusal.
+ *  - PACING. Maximum frame latency 1, frame-latency waitable. The token is
+ *    waited for at most 4 ms under render_mutex (#924: never block on a jammed
+ *    flip chain); no token = decline. A token taken by a submit that then does
+ *    not present is KEPT for the next one (the waitable is a semaphore; dropping
+ *    it would leave the chain one token short forever).
+ */
+enum weave_present_reason
+{
+	WEAVE_PRESENT_NONE = 0,      //!< no surface offered
+	WEAVE_PRESENT_PRESENTED,     //!< woven into the swap chain on the caller's surface
+	WEAVE_PRESENT_NOT_ELIGIBLE,  //!< legacy single-rect path, or not the frame's first (clearing) chunk
+	WEAVE_PRESENT_CREATE_FAILED, //!< CreateSwapChainForCompositionSurfaceHandle / buffers failed
+	WEAVE_PRESENT_NO_TOKEN,      //!< the frame-latency waitable did not signal within 4 ms
+};
+
+static const char *
+weave_present_reason_str(int r)
+{
+	switch (r) {
+	case WEAVE_PRESENT_NONE: return "no surface";
+	case WEAVE_PRESENT_PRESENTED: return "PRESENTED on the caller's composition surface";
+	case WEAVE_PRESENT_NOT_ELIGIBLE: return "declined: legacy single-rect path or not the clearing first chunk";
+	case WEAVE_PRESENT_CREATE_FAILED: return "declined: swap chain on the composition surface could not be made";
+	case WEAVE_PRESENT_NO_TOKEN: return "declined: no frame-latency token within 4 ms";
+	default: return "?";
+	}
+}
+
+static void
+weave_present_release_chain(struct d3d11_client_render_resources *res)
+{
+	res->weave_present_rtv.reset();
+	res->weave_present_back.reset();
+	res->weave_present_sc.reset();
+	if (res->weave_present_waitable != nullptr) {
+		CloseHandle(res->weave_present_waitable);
+		res->weave_present_waitable = nullptr;
+	}
+	res->weave_present_token_held = false;
+	res->weave_present_w = 0;
+	res->weave_present_h = 0;
+}
+
+static void
+weave_present_reset(struct d3d11_client_render_resources *res)
+{
+	weave_present_release_chain(res);
+	if (res->weave_present_surface_cached != nullptr) {
+		CloseHandle(res->weave_present_surface_cached);
+		res->weave_present_surface_cached = nullptr;
+	}
+	if (res->weave_present_surface_next != nullptr) {
+		CloseHandle(res->weave_present_surface_next);
+		res->weave_present_surface_next = nullptr;
+	}
+	res->weave_present_create_failed = false;
+	res->weave_presented = false;
+	res->weave_present_last_reason = WEAVE_PRESENT_NONE;
+}
+
+static constexpr UINT kWeavePresentFlags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+
+//! (Re)create the swap chain on @p surface (owned by the cache from here).
+static bool
+weave_present_create(struct d3d11_service_system *sys,
+                     struct d3d11_client_render_resources *r,
+                     HANDLE surface,
+                     uint32_t w,
+                     uint32_t h)
+{
+	weave_present_release_chain(r);
+	wil::com_ptr<IDXGIDevice> dxgi_dev;
+	wil::com_ptr<IDXGIAdapter> adapter;
+	wil::com_ptr<IDXGIFactoryMedia> media;
+	HRESULT hr = sys->device->QueryInterface(IID_PPV_ARGS(dxgi_dev.put()));
+	if (SUCCEEDED(hr)) {
+		hr = dxgi_dev->GetAdapter(adapter.put());
+	}
+	if (SUCCEEDED(hr)) {
+		hr = adapter->GetParent(IID_PPV_ARGS(media.put()));
+	}
+	DXGI_SWAP_CHAIN_DESC1 sd = {};
+	sd.Width = w;
+	sd.Height = h;
+	sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM; // the same encoded bytes weave_output holds
+	sd.SampleDesc.Count = 1;
+	sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+	sd.BufferCount = 2;
+	sd.Scaling = DXGI_SCALING_STRETCH;
+	sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+	sd.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+	sd.Flags = kWeavePresentFlags;
+	wil::com_ptr<IDXGISwapChain1> sc1;
+	if (SUCCEEDED(hr)) {
+		hr = media->CreateSwapChainForCompositionSurfaceHandle(sys->device.get(), surface, &sd, nullptr,
+		                                                       sc1.put());
+	}
+	if (SUCCEEDED(hr)) {
+		hr = sc1->QueryInterface(IID_PPV_ARGS(r->weave_present_sc.put()));
+	}
+	if (SUCCEEDED(hr)) {
+		hr = r->weave_present_sc->SetMaximumFrameLatency(1);
+	}
+	if (SUCCEEDED(hr)) {
+		r->weave_present_waitable = r->weave_present_sc->GetFrameLatencyWaitableObject();
+		if (r->weave_present_waitable == nullptr) {
+			hr = E_FAIL;
+		}
+	}
+	if (SUCCEEDED(hr)) {
+		hr = r->weave_present_sc->GetBuffer(0, IID_PPV_ARGS(r->weave_present_back.put()));
+	}
+	if (SUCCEEDED(hr)) {
+		hr = sys->device->CreateRenderTargetView(r->weave_present_back.get(), nullptr,
+		                                         r->weave_present_rtv.put());
+	}
+	if (FAILED(hr)) {
+		U_LOG_W("weave v17: swap chain on the composition surface %ux%u failed: 0x%08lx", w, h, hr);
+		weave_present_release_chain(r);
+		return false;
+	}
+	r->weave_present_w = w;
+	r->weave_present_h = h;
+	U_LOG_W("weave v17: presenting on the caller's composition surface (%ux%u, flip-sequential x2, max latency 1)",
+	        w, h);
+	return true;
+}
+
+/*!
+ * Resolve this submit's present surface. Takes ownership of @p h on every path.
+ * On WEAVE_PRESENT_PRESENTED a frame-latency token is held and the back buffer's
+ * RTV is r->weave_present_rtv. Caller holds render_mutex + immediate_ctx_mutex.
+ */
+static int
+weave_present_prepare(struct d3d11_service_system *sys,
+                      struct d3d11_client_render_resources *r,
+                      HANDLE h,
+                      bool eligible,
+                      uint32_t win_w,
+                      uint32_t win_h,
+                      double *out_wait_ms)
+{
+	*out_wait_ms = -1.0;
+	const bool same = r->weave_present_surface_cached != nullptr &&
+	                  (r->weave_present_surface_cached == h ||
+	                   weave_same_kernel_object(r->weave_present_surface_cached, h));
+	if (same) {
+		if (h != r->weave_present_surface_cached) {
+			CloseHandle(h); // this submit's duplicate of the cached surface
+		}
+	} else {
+		weave_present_release_chain(r);
+		if (r->weave_present_surface_cached != nullptr) {
+			CloseHandle(r->weave_present_surface_cached);
+		}
+		r->weave_present_surface_cached = h; // adopted
+		r->weave_present_create_failed = false;
+	}
+	if (!eligible) {
+		return WEAVE_PRESENT_NOT_ELIGIBLE;
+	}
+	if (r->weave_present_create_failed) {
+		return WEAVE_PRESENT_CREATE_FAILED; // this surface failed once; not retried per frame
+	}
+	if (!r->weave_present_sc) {
+		if (!weave_present_create(sys, r, r->weave_present_surface_cached, win_w, win_h)) {
+			r->weave_present_create_failed = true;
+			return WEAVE_PRESENT_CREATE_FAILED;
+		}
+	} else if (r->weave_present_w != win_w || r->weave_present_h != win_h) {
+		// Resize: every buffer reference must go first. A held token survives.
+		r->weave_present_rtv.reset();
+		r->weave_present_back.reset();
+		HRESULT hr = r->weave_present_sc->ResizeBuffers(0, win_w, win_h, DXGI_FORMAT_UNKNOWN, kWeavePresentFlags);
+		if (SUCCEEDED(hr)) {
+			hr = r->weave_present_sc->GetBuffer(0, IID_PPV_ARGS(r->weave_present_back.put()));
+		}
+		if (SUCCEEDED(hr)) {
+			hr = sys->device->CreateRenderTargetView(r->weave_present_back.get(), nullptr,
+			                                         r->weave_present_rtv.put());
+		}
+		if (FAILED(hr)) {
+			U_LOG_W("weave v17: present swap chain resize to %ux%u failed: 0x%08lx", win_w, win_h, hr);
+			weave_present_release_chain(r);
+			r->weave_present_create_failed = true;
+			return WEAVE_PRESENT_CREATE_FAILED;
+		}
+		r->weave_present_w = win_w;
+		r->weave_present_h = win_h;
+	}
+	if (!r->weave_present_token_held) {
+		const int64_t t0 = (int64_t)os_monotonic_get_ns();
+		const DWORD wr = WaitForSingleObjectEx(r->weave_present_waitable, 4, FALSE);
+		*out_wait_ms = (double)((int64_t)os_monotonic_get_ns() - t0) / 1e6;
+		if (wr != WAIT_OBJECT_0) {
+			return WEAVE_PRESENT_NO_TOKEN;
+		}
+		r->weave_present_token_held = true;
+	} else {
+		*out_wait_ms = 0.0;
+	}
+	return WEAVE_PRESENT_PRESENTED;
+}
+
+extern "C" void
+comp_d3d11_service_weave_set_present_surface(struct xrt_compositor *xc, HANDLE surface)
+{
+	if (xc == nullptr || xc->destroy != compositor_destroy) {
+		if (surface != nullptr) {
+			CloseHandle(surface);
+		}
+		return;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	if (c->render.weave_present_surface_next != nullptr) {
+		CloseHandle(c->render.weave_present_surface_next); // never consumed: do not leak it
+	}
+	c->render.weave_present_surface_next = surface;
+}
+
+extern "C" bool
+comp_d3d11_service_weave_take_presented(struct xrt_compositor *xc)
+{
+	if (xc == nullptr || xc->destroy != compositor_destroy) {
+		return false;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	const bool p = c->render.weave_presented;
+	c->render.weave_presented = false;
+	return p;
+}
+
+/*
  * DXR_WEAVE_GPU_TIMING=1 — per-stage cost of the present-owner weave (ADR-027
  * Amendment perf A/B: iGPU vs dGPU, compose on/off; "2D under the lens" P0
  * instrumentation). Diagnostic only, off by default; env read once.
@@ -25765,11 +26049,30 @@ weave_timing_account(struct d3d11_service_system *sys,
                      uint8_t path,
                      uint8_t route,
                      bool ov_unchanged,
+                     int present_reason,
+                     double present_wait_ms,
+                     double present_call_ms,
+                     double present_queue,
                      uint32_t win_w,
                      uint32_t win_h)
 {
 	if (!weave_gpu_timing_enabled()) {
 		return;
+	}
+	// v17: presented on the caller's surface vs declined (offered, not used).
+	if (present_reason == WEAVE_PRESENT_PRESENTED) {
+		r->weave_cpu_present_n++;
+	} else if (present_reason != WEAVE_PRESENT_NONE) {
+		r->weave_cpu_present_declined++;
+	}
+	if (present_wait_ms >= 0.0) {
+		weave_timing_stat_add(r->weave_cpu_present_wait, present_wait_ms);
+	}
+	if (present_call_ms >= 0.0) {
+		weave_timing_stat_add(r->weave_cpu_present_call, present_call_ms);
+	}
+	if (present_queue >= 0.0) {
+		weave_timing_stat_add(r->weave_cpu_present_queue, present_queue);
 	}
 	for (int i = 0; i < WEAVE_CPU_STAGE_COUNT; i++) {
 		if (cpu_ms[i] >= 0.0) {
@@ -25805,7 +26108,8 @@ weave_timing_account(struct d3d11_service_system *sys,
 	const auto &gs = r->weave_gpu_stage;
 	U_LOG_W(
 	    "weave timing [%ls] %ux%u %.1fs: submits=%u refused=%u paths(v6zc=%u v6crop=%u batch=%u legacy=%u) "
-	    "overlay(dp=%u fallback=%u none=%u unchanged=%u) | CPU ms avg/max: submit %.3f/%.3f "
+	    "overlay(dp=%u fallback=%u none=%u unchanged=%u) present(n=%u declined=%u token_wait %.3f/%.3f "
+	    "call %.3f/%.3f queue %.2f/%.0f) | CPU ms avg/max: submit %.3f/%.3f "
 	    "render_mutex %.3f/%.3f ctx_mutex %.3f/%.3f in_acquire %.3f/%.3f ov_acquire %.3f/%.3f | "
 	    "GPU ms avg/max n=%u disjoint=%u: clear1058 %.3f/%.3f (n=%u) input_copy %.3f/%.3f (n=%u) "
 	    "sbs_clear_blit %.3f/%.3f (n=%u) weave %.3f/%.3f fallback_blit %.3f/%.3f (n=%u) "
@@ -25814,8 +26118,11 @@ weave_timing_account(struct d3d11_service_system *sys,
 	    r->weave_cpu_path_n[WEAVE_PATH_V6_ZERO_COPY], r->weave_cpu_path_n[WEAVE_PATH_V6_CROP],
 	    r->weave_cpu_path_n[WEAVE_PATH_BATCH], r->weave_cpu_path_n[WEAVE_PATH_LEGACY],
 	    r->weave_cpu_route_n[WEAVE_OV_DP], r->weave_cpu_route_n[WEAVE_OV_FALLBACK],
-	    r->weave_cpu_route_n[WEAVE_OV_NONE], r->weave_cpu_ov_unchanged, weave_timing_stat_avg(cs[WEAVE_CPU_SUBMIT]),
-	    cs[WEAVE_CPU_SUBMIT].max, weave_timing_stat_avg(cs[WEAVE_CPU_RENDER_MUTEX]), cs[WEAVE_CPU_RENDER_MUTEX].max,
+	    r->weave_cpu_route_n[WEAVE_OV_NONE], r->weave_cpu_ov_unchanged, r->weave_cpu_present_n,
+	    r->weave_cpu_present_declined, weave_timing_stat_avg(r->weave_cpu_present_wait),
+	    r->weave_cpu_present_wait.max, weave_timing_stat_avg(r->weave_cpu_present_call),
+	    r->weave_cpu_present_call.max, weave_timing_stat_avg(r->weave_cpu_present_queue),
+	    r->weave_cpu_present_queue.max, weave_timing_stat_avg(cs[WEAVE_CPU_SUBMIT]), cs[WEAVE_CPU_SUBMIT].max, weave_timing_stat_avg(cs[WEAVE_CPU_RENDER_MUTEX]), cs[WEAVE_CPU_RENDER_MUTEX].max,
 	    weave_timing_stat_avg(cs[WEAVE_CPU_CTX_MUTEX]), cs[WEAVE_CPU_CTX_MUTEX].max,
 	    weave_timing_stat_avg(cs[WEAVE_CPU_IN_ACQUIRE]), cs[WEAVE_CPU_IN_ACQUIRE].max,
 	    weave_timing_stat_avg(cs[WEAVE_CPU_OV_ACQUIRE]), cs[WEAVE_CPU_OV_ACQUIRE].max, r->weave_gpu_n,
@@ -25836,6 +26143,11 @@ weave_timing_account(struct d3d11_service_system *sys,
 	r->weave_cpu_n = 0;
 	r->weave_cpu_refused = 0;
 	r->weave_cpu_ov_unchanged = 0;
+	r->weave_cpu_present_n = 0;
+	r->weave_cpu_present_declined = 0;
+	memset(&r->weave_cpu_present_wait, 0, sizeof(r->weave_cpu_present_wait));
+	memset(&r->weave_cpu_present_call, 0, sizeof(r->weave_cpu_present_call));
+	memset(&r->weave_cpu_present_queue, 0, sizeof(r->weave_cpu_present_queue));
 }
 
 bool
@@ -25899,6 +26211,21 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	c->render.weave_overlay_unchanged_next = false;
 	const float ov_filter_strength = c->render.weave_overlay_filter_strength_next;
 	c->render.weave_overlay_filter_strength_next = -1.0f;
+	// XR_DXR_weave v17: the present surface, consumed here for the same reason.
+	// Owned: weave_present_prepare adopts or closes it; any exit before it
+	// closes it through present_owned.
+	struct weave_present_owned
+	{
+		HANDLE h = nullptr;
+		~weave_present_owned()
+		{
+			if (h != nullptr) {
+				CloseHandle(h);
+			}
+		}
+	} present_owned;
+	present_owned.h = std::exchange(c->render.weave_present_surface_next, nullptr);
+	c->render.weave_presented = false;
 	struct d3d11_service_system *sys = c->sys;
 	if (sys == nullptr) {
 		return false;
@@ -26395,8 +26722,36 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		}
 	}
 
-	ID3D11RenderTargetView *rtvs[] = {c->render.weave_output_rtv.get()};
 	const bool nview = (layout != nullptr && layout->view_count > 0);
+
+	/*
+	 * XR_DXR_weave v17: weave straight into the back buffer of the swap chain on
+	 * the caller's composition surface, and present it, when the caller offered
+	 * one and a frame-latency token is available (weave_present_prepare).
+	 * Resolved here — after both keyed-mutex acquires, which can still refuse
+	 * the whole submit, and before anything is written — so a refused submit
+	 * presents nothing and a declined one is exactly the old path.
+	 */
+	ID3D11RenderTargetView *out_rtv = c->render.weave_output_rtv.get();
+	ID3D11Texture2D *out_tex = c->render.weave_output_texture.get();
+	int present_reason = WEAVE_PRESENT_NONE;
+	double present_wait_ms = -1.0;
+	if (present_owned.h != nullptr) {
+		const bool present_eligible = (nview || rect_count > 0) && weave_frame_first;
+		present_reason = weave_present_prepare(sys, &c->render, std::exchange(present_owned.h, nullptr),
+		                                       present_eligible, win_w, win_h, &present_wait_ms);
+		if (present_reason == WEAVE_PRESENT_PRESENTED) {
+			out_rtv = c->render.weave_present_rtv.get();
+			out_tex = c->render.weave_present_back.get();
+		}
+		if (present_reason != c->render.weave_present_last_reason) {
+			U_LOG_W("weave v17: present surface %s (win %ux%u)", weave_present_reason_str(present_reason), win_w,
+			        win_h);
+			c->render.weave_present_last_reason = present_reason;
+		}
+	}
+	const bool present_this = (present_reason == WEAVE_PRESENT_PRESENTED);
+	ID3D11RenderTargetView *rtvs[] = {out_rtv};
 
 	/*
 	 * #1058: clear the woven OUTPUT on the frame's FIRST submit.
@@ -26462,10 +26817,12 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		c->render.weave_gen_inputs[c->render.weave_gen_count++] = in;
 	}
 	gpu_frame.begin(sys, &c->render);
-	const bool output_cleared = clear_output && c->render.weave_output_rtv;
+	// v17: the present back buffer is cleared too (it is only taken on a
+	// clearing submit, so "every pixel written" holds).
+	const bool output_cleared = clear_output && out_rtv != nullptr;
 	if (output_cleared) {
 		const float out_transparent[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-		sys->context->ClearRenderTargetView(c->render.weave_output_rtv.get(), out_transparent);
+		sys->context->ClearRenderTargetView(out_rtv, out_transparent);
 	}
 	gpu_frame.stamp(WEAVE_TS_CLEARED);
 
@@ -26870,8 +27227,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	if (ov_srv != nullptr && !ov_in_dp) {
 		blit_to_atlas_texture(sys, &c->render, ov_srv, 0.0f, 0.0f, (float)ov_w, (float)ov_h, (float)ov_w,
 		                      (float)ov_h, 0.0f, 0.0f, (float)win_w, (float)win_h, /*is_srgb*/ false,
-		                      sys->blend_premul.get(), c->render.weave_output_rtv.get(), (float)win_w,
-		                      (float)win_h);
+		                      sys->blend_premul.get(), out_rtv, (float)win_w, (float)win_h);
 	}
 	ov_hold.release();
 	gpu_frame.stamp(WEAVE_TS_POST_FALLBACK);
@@ -26922,12 +27278,39 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	// were both dumped above, so a fault visible only here is the DP's weave or
 	// its transparency reconstruction, not the geometry either side of it.
 	if (dxr_diag_dump) {
-		dxr_diag_dump_tex(sys, c->render.weave_output_texture.get(), "dxr73_weave_output");
+		dxr_diag_dump_tex(sys, out_tex, present_this ? "dxr73_weave_output_presented" : "dxr73_weave_output");
 	}
 
 	// Signal the fence and flush so the GPU work + signal are submitted (there is
 	// no Present to flush this standalone path), then the caller's Wait completes.
 	gpu_frame.end(timing_path, timing_route, output_cleared);
+	// v17: present the frame on the caller's surface. The token taken above
+	// guarantees a free buffer, so this does not block on the flip chain (#924).
+	// A failed Present refuses the submit: weave_output was not written, so
+	// "accepted, not presented" would hand the caller a stale woven texture.
+	double present_call_ms = -1.0;
+	double present_queue = -1.0;
+	if (present_this) {
+		const int64_t t_p0 = (int64_t)os_monotonic_get_ns();
+		const HRESULT phr = c->render.weave_present_sc->Present(1, 0);
+		present_call_ms = (double)((int64_t)os_monotonic_get_ns() - t_p0) / 1e6;
+		c->render.weave_present_token_held = false; // consumed by this present
+		if (FAILED(phr)) {
+			U_LOG_W("weave v17: Present on the composition surface failed: 0x%08lx — submit refused", phr);
+			weave_present_release_chain(&c->render);
+			c->render.weave_present_create_failed = true;
+			return false;
+		}
+		// Presents queued but not yet on screen, when DXGI can say (composition
+		// chains may report the statistics as unavailable: then -1, not logged).
+		DXGI_FRAME_STATISTICS st = {};
+		UINT last = 0;
+		if (SUCCEEDED(c->render.weave_present_sc->GetFrameStatistics(&st)) &&
+		    SUCCEEDED(c->render.weave_present_sc->GetLastPresentCount(&last)) && last >= st.PresentCount) {
+			present_queue = (double)(last - st.PresentCount);
+		}
+	}
+	c->render.weave_presented = present_this;
 	c->render.weave_fence_value++;
 	sys->context->Signal(c->render.weave_fence.get(), c->render.weave_fence_value);
 	sys->context->Flush();
@@ -26993,7 +27376,8 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		cpu_ms[WEAVE_CPU_IN_ACQUIRE] = (double)(t_post_acquire_ns - t_pre_acquire_ns) / 1e6;
 		cpu_ms[WEAVE_CPU_OV_ACQUIRE] = ov_acquire_ms;
 		cpu_ms[WEAVE_CPU_SUBMIT] = (double)((int64_t)os_monotonic_get_ns() - t_entry_ns) / 1e6;
-		weave_timing_account(sys, &c->render, cpu_ms, timing_path, timing_route, ov_unchanged, win_w, win_h);
+		weave_timing_account(sys, &c->render, cpu_ms, timing_path, timing_route, ov_unchanged, present_reason,
+		                     present_wait_ms, present_call_ms, present_queue, win_w, win_h);
 	}
 	return true;
 }

@@ -198,6 +198,14 @@
  * back verbatim), so a present-owner can tag its own Wayland commit for
  * move-synchronised drag.
  *
+ * Runtime presents (SPEC_VERSION 17). XrWeaveSubmitPresentSurfaceDXR, chained on
+ * XrWeaveSubmitInfoDXR: the caller hands a DirectComposition surface handle it
+ * shows as a visual above its root, and the runtime presents the woven frame on
+ * it through a swap chain of its own, so the caller draws nothing back.
+ * XrWeavePresentStatusDXR, chained on XrWeaveOutputDXR, says per submit whether
+ * it did. Windows (D3D11 service) only; every other platform, and a pre-v17
+ * runtime, presents nothing and reports XR_FALSE.
+ *
  * An unreadable overlay refuses the submit on desktop Linux (SPEC_VERSION 16).
  * No new structure: from v16 the desktop-Linux engine, like the D3D11 service
  * always did, refuses a submit whose chained v4 overlay it cannot import
@@ -290,7 +298,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_weave 1
-#define XR_DXR_weave_SPEC_VERSION 16
+#define XR_DXR_weave_SPEC_VERSION 17
 #define XR_DXR_WEAVE_EXTENSION_NAME "XR_DXR_weave"
 
 // Reserved 1004999190..199. Final values reconcile with the Khronos registry
@@ -331,6 +339,9 @@ extern "C" {
 #define XR_TYPE_WEAVE_SUBMIT_OVERLAY_UNCHANGED_DXR ((XrStructureType)1004999290)
 // Spec v15 (ADR-027 Amendment): the caller's lens-filter strength for the 2D layer.
 #define XR_TYPE_WEAVE_SUBMIT_OVERLAY_FILTER_DXR    ((XrStructureType)1004999291)
+// Spec v17: the runtime presents the woven frame on a caller-owned composition surface.
+#define XR_TYPE_WEAVE_SUBMIT_PRESENT_SURFACE_DXR   ((XrStructureType)1004999292)
+#define XR_TYPE_WEAVE_PRESENT_STATUS_DXR           ((XrStructureType)1004999293)
 
 //! Upper bound on eye positions carried by XrWeaveSubmitInfoDXR (mirrors the
 //! runtime's XRT_MAX_VIEWS). Phase 1: carried but unused.
@@ -1081,6 +1092,67 @@ typedef struct XrWeaveSubmitOverlayFilterDXR {
     const void* XR_MAY_ALIAS next;
     float                    filterStrength; //!< 0 = no lens filtering .. 1 = full; omit = DP default
 } XrWeaveSubmitOverlayFilterDXR;
+
+/*!
+ * @brief The runtime PRESENTS the woven frame itself, into a composition
+ * surface the caller owns (spec v17).
+ *
+ * Chain onto XrWeaveSubmitInfoDXR::next. A present-owner whose v4 overlay is its
+ * whole 2D page gets its COMPLETE frame back in the woven output and otherwise
+ * copies all of it over its own back buffer every frame (a full-window read and
+ * write) before presenting. With this struct the runtime presents the frame
+ * itself, through a flip-model swap chain it creates on a DirectComposition
+ * surface HANDLE the caller made (DCompositionCreateSurfaceHandle) and shows as a
+ * visual of its own (IDCompositionDesktopDevice::CreateSurfaceFromHandle, set as
+ * the content of a visual above its root). The caller draws nothing back.
+ *
+ * THE HANDLE. @c compositionSurface is the NT handle from
+ * DCompositionCreateSurfaceHandle, valid IN THE CALLER'S PROCESS. The runtime
+ * duplicates it from the caller (a sandboxed caller needs no OpenProcess on the
+ * runtime); the caller keeps ownership. Pass the same surface every frame: the
+ * runtime keeps its swap chain on it and resizes it to the bound window's client
+ * size. A different surface replaces the swap chain.
+ *
+ * ELIGIBLE SUBMITS. Only a submit whose woven canvas is the whole window (the
+ * batch layout, XrWeaveSubmitRectsDXR, or the v6 layout) and that clears it
+ * (XrWeaveSubmitInfoDXR::firstChunk = XR_TRUE). A frame of several submits
+ * (more than XR_WEAVE_SUBMIT_MAX_RECTS_DXR rects) is not presented.
+ *
+ * PACING. The swap chain is frame-latency-waitable with a maximum latency of
+ * one frame. The runtime waits for its token for at most 4 ms (never longer: a
+ * jammed flip chain must not stall the service, #924) and DECLINES the present
+ * when it does not come.
+ *
+ * STATUS. Chain XrWeavePresentStatusDXR on XrWeaveOutputDXR and read
+ * @c presented. XR_TRUE = this submit's frame was presented on the surface (and
+ * the runtime's own woven texture was NOT written): show the visual and draw
+ * nothing back. XR_FALSE on a successful submit = declined (no token in time, an
+ * ineligible submit, the surface could not be opened, a platform or runtime
+ * without it): the frame is in the woven texture exactly as without the struct;
+ * hide the visual in the same composition commit that presents your copy-back.
+ * A FAILED submit presents nothing and leaves the surface showing the last
+ * frame the runtime presented, which a caller can keep visible as a hold.
+ *
+ * Gate on extensionVersion >= 17, and zero-initialise the status struct: an
+ * older runtime skips both and leaves @c presented as the caller set it.
+ */
+typedef struct XrWeaveSubmitPresentSurfaceDXR {
+    XrStructureType          type;               //!< XR_TYPE_WEAVE_SUBMIT_PRESENT_SURFACE_DXR
+    const void* XR_MAY_ALIAS next;
+    void*                    compositionSurface; //!< DCompositionCreateSurfaceHandle NT handle, caller's process
+} XrWeaveSubmitPresentSurfaceDXR;
+
+/*!
+ * @brief Whether a submit was presented on the caller's surface (spec v17, OUT).
+ *
+ * Chain onto XrWeaveOutputDXR::next next to an XrWeaveSubmitPresentSurfaceDXR.
+ * Written on every successful submit (XR_FALSE when nothing was presented).
+ */
+typedef struct XrWeavePresentStatusDXR {
+    XrStructureType          type;      //!< XR_TYPE_WEAVE_PRESENT_STATUS_DXR
+    void* XR_MAY_ALIAS       next;
+    XrBool32                 presented; //!< XR_TRUE: this submit's frame was presented on the surface
+} XrWeavePresentStatusDXR;
 
 typedef XrResult (XRAPI_PTR *PFN_xrWeaveBindWindowDXR)(
     XrSession session, void* windowHandle);

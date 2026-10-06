@@ -209,6 +209,22 @@ static ComPtr<ID3D11Texture2D> g_weavedTex;
 static ComPtr<ID3D11Fence> g_weaveFence;
 static uint32_t g_weavedW = 0, g_weavedH = 0;
 
+// ---- XR_DXR_weave v17: the runtime presents (--present) -----------------------
+// The probe makes a DirectComposition surface HANDLE (DCompositionCreateSurfaceHandle),
+// shows it as a child visual ABOVE its own swap-chain visual, and hands the handle
+// to the runtime every submit (XrWeaveSubmitPresentSurfaceDXR). The runtime puts a
+// swap chain on it and presents the woven frame itself. When the status says
+// presented, the probe copies nothing and keeps the child visual in the tree; when
+// declined, it removes the child in the same Commit that presents its own copy of
+// the woven texture — exactly the browser's show/hide rule. The handle stays the
+// probe's (the runtime duplicates it).
+static bool g_present = false;
+static HANDLE g_presentSurfaceHandle = nullptr;
+static ComPtr<IUnknown> g_presentSurface;
+static ComPtr<IDCompositionVisual> g_presentVisual;
+static bool g_presentVisualShown = false;
+static uint32_t g_presentedN = 0, g_presentDeclinedN = 0;
+
 // ---- Win32 window -----------------------------------------------------------
 static LRESULT CALLBACK
 WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -330,6 +346,33 @@ CreateCompositionSwapChain(uint32_t w, uint32_t h)
 	}
 	g_dcompVisual->SetContent(g_swapChain.Get());
 	g_dcompTarget->SetRoot(g_dcompVisual.Get());
+	// v17 --present: the runtime-presented surface, as a child visual above
+	// the probe's own swap chain (shown only on frames the runtime presented).
+	if (g_present && !g_presentVisual) {
+		typedef HRESULT(WINAPI * PFN_CreateSurfaceHandle)(DWORD, SECURITY_ATTRIBUTES *, HANDLE *);
+		HMODULE dcomp = GetModuleHandleW(L"dcomp.dll");
+		auto create_handle =
+		    dcomp ? (PFN_CreateSurfaceHandle)(void *)GetProcAddress(dcomp, "DCompositionCreateSurfaceHandle")
+		          : nullptr;
+		HRESULT phr = create_handle ? create_handle(COMPOSITIONOBJECT_ALL_ACCESS, nullptr, &g_presentSurfaceHandle)
+		                            : E_NOINTERFACE;
+		if (SUCCEEDED(phr)) {
+			phr = g_dcompDevice->CreateSurfaceFromHandle(g_presentSurfaceHandle, &g_presentSurface);
+		}
+		if (SUCCEEDED(phr)) {
+			phr = g_dcompDevice->CreateVisual(&g_presentVisual);
+		}
+		if (SUCCEEDED(phr)) {
+			phr = g_presentVisual->SetContent(g_presentSurface.Get());
+		}
+		if (FAILED(phr)) {
+			LOG_ERROR("--present: composition surface handle / visual failed: 0x%08lx — present off", phr);
+			g_present = false;
+		} else {
+			LOG_INFO("--present: composition surface handle %p ready (child visual above the swap chain)",
+			         g_presentSurfaceHandle);
+		}
+	}
 	g_dcompDevice->Commit();
 	return true;
 }
@@ -1025,6 +1068,9 @@ ParseOptions(PWSTR cmdLineW)
 				}
 			} else if (_strnicmp(tok, "--filter-strength=", 18) == 0) {
 				g_filterStrength = (float)atof(tok + 18);
+			} else if (_stricmp(tok, "--present") == 0) {
+				g_present = true; // XR_DXR_weave v17
+				LOG_INFO("--present: the runtime presents on a probe-owned composition surface (XR_DXR_weave v17)");
 			} else if (_strnicmp(tok, "--size=", 7) == 0) {
 				unsigned sw = 0, sh = 0;
 				if (sscanf_s(tok + 7, "%ux%u", &sw, &sh) == 2 && sw >= 64 && sh >= 64 && sw <= 8192 && sh <= 8192) {
@@ -1376,7 +1422,20 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 			tail = &flat.next;
 		}
 
+		// v17: hand the runtime the composition surface to present on.
+		XrWeaveSubmitPresentSurfaceDXR psurf = {XR_TYPE_WEAVE_SUBMIT_PRESENT_SURFACE_DXR};
+		XrWeavePresentStatusDXR pstatus = {XR_TYPE_WEAVE_PRESENT_STATUS_DXR};
+		const bool offerPresent = g_present && g_presentSurfaceHandle != nullptr;
+		if (offerPresent) {
+			psurf.compositionSurface = (void *)g_presentSurfaceHandle;
+			*tail = &psurf;
+			tail = &psurf.next;
+		}
+
 		XrWeaveOutputDXR out = {XR_TYPE_WEAVE_OUTPUT_DXR};
+		if (offerPresent) {
+			out.next = &pstatus;
+		}
 
 		LARGE_INTEGER t0, t1;
 		QueryPerformanceCounter(&t0);
@@ -1384,9 +1443,19 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 		QueryPerformanceCounter(&t1);
 
 		if (XR_FAILED(sr)) {
+			// A refused submit presents nothing: a shown present visual keeps the
+			// runtime's last frame on screen (a free hold).
 			LogXrResult("xrWeaveSubmitDXR", sr);
 			Sleep(100);
 			continue;
+		}
+		const bool presentedThis = offerPresent && pstatus.presented == XR_TRUE;
+		if (offerPresent) {
+			presentedThis ? g_presentedN++ : g_presentDeclinedN++;
+			if ((frame % 120) == 0) {
+				LOG_INFO("v17 present: %u presented, %u declined (this frame: %s)", g_presentedN,
+				         g_presentDeclinedN, presentedThis ? "PRESENTED by the runtime" : "declined -> copy-back");
+			}
 		}
 
 		double ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
@@ -1429,7 +1498,21 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 		if (g_weaveFence) {
 			g_context->Wait(g_weaveFence.Get(), out.fenceValue);
 		}
-		if (g_weavedTex && g_swapChain) {
+		// v17: show the runtime's visual iff it presented this frame, in the
+		// same Commit as the probe's own present below.
+		if (g_presentVisual && presentedThis != g_presentVisualShown) {
+			if (presentedThis) {
+				g_dcompVisual->AddVisual(g_presentVisual.Get(), TRUE, nullptr);
+			} else {
+				g_dcompVisual->RemoveVisual(g_presentVisual.Get());
+			}
+			g_presentVisualShown = presentedThis;
+		}
+		if (presentedThis) {
+			if (g_dcompDevice) {
+				g_dcompDevice->Commit();
+			}
+		} else if (g_weavedTex && g_swapChain) {
 			ComPtr<ID3D11Texture2D> back;
 			if (SUCCEEDED(g_swapChain->GetBuffer(0, IID_PPV_ARGS(&back)))) {
 				g_context->CopyResource(back.Get(), g_weavedTex.Get());

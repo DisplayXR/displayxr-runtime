@@ -215,6 +215,33 @@ ipc_send_handles(
 }
 
 
+xrt_result_t
+ipc_pull_handle_from_peer(struct ipc_message_channel *imc, HANDLE remote, HANDLE *out_local)
+{
+	if (out_local == nullptr) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	*out_local = nullptr;
+	if (remote == nullptr || remote == INVALID_HANDLE_VALUE) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	HANDLE peer = open_target_process_dup_handle(imc);
+	if (peer == nullptr) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	HANDLE local = nullptr;
+	const BOOL ok = DuplicateHandle(peer, remote, GetCurrentProcess(), &local, 0, FALSE, DUPLICATE_SAME_ACCESS);
+	const DWORD err = ok ? 0 : GetLastError();
+	CloseHandle(peer);
+	if (!ok) {
+		IPC_ERROR(imc, "DuplicateHandle(pull %p from peer) failed: %d %s", remote, err, ipc_winerror(err));
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	*out_local = local;
+	return XRT_SUCCESS;
+}
+
+
 /*
  *
  * Typed handle functions.

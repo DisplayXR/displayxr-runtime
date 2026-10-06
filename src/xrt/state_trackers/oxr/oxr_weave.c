@@ -152,6 +152,8 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         bool mono_in_2d,
                                         bool overlay_unchanged,
                                         float overlay_filter_strength,
+                                        uint64_t present_surface,
+                                        bool *out_presented,
                                         bool *out_have_output,
                                         uint32_t *out_width,
                                         uint32_t *out_height,
@@ -602,6 +604,26 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		overlay_filter_strength = ovf->filterStrength;
 	}
 
+	// Spec v17: the runtime presents the woven frame on the caller's
+	// composition surface. Only the Windows D3D11 service does; everywhere else
+	// nothing is presented and the status reports XR_FALSE, which the spec makes
+	// conformant (the caller draws the woven texture back, as without it).
+	uint64_t present_surface = 0;
+	const XrWeaveSubmitPresentSurfaceDXR *psurf = OXR_GET_INPUT_FROM_CHAIN(
+	    submitInfo, XR_TYPE_WEAVE_SUBMIT_PRESENT_SURFACE_DXR, XrWeaveSubmitPresentSurfaceDXR);
+	if (psurf != NULL) {
+		if (psurf->compositionSurface == NULL) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrWeaveSubmitDXR: XrWeaveSubmitPresentSurfaceDXR::compositionSurface must not be NULL");
+		}
+#if defined(XR_USE_PLATFORM_WIN32)
+		present_surface = (uint64_t)(uintptr_t)psurf->compositionSurface;
+#endif
+	}
+	XrWeavePresentStatusDXR *out_present_status =
+	    OXR_GET_OUTPUT_FROM_CHAIN(output, XR_TYPE_WEAVE_PRESENT_STATUS_DXR, XrWeavePresentStatusDXR);
+	bool presented = false;
+
 	// Spec v6 (#774): a chained XrWeaveSubmitLayoutDXR declares that the input
 	// is a worst-case-sized N-view atlas (tiles packed contiguously from the
 	// top-left at contentViewWidth/Height) instead of per-rect squeezed SBS.
@@ -843,7 +865,8 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		    rect_count > 0 ? rects : NULL, overlay_handle, overlay_is_dxgi, overlay_rect_count,
 		    overlay_rect_count > 0 ? overlay_rects : NULL, submitInfo->firstChunk == XR_TRUE,
 		    layout.view_count > 0 ? &layout : NULL, flat_rect_count, flat_rect_count > 0 ? flat_rects : NULL,
-		    mono_in_2d, overlay_unchanged, overlay_filter_strength, &have_out, &w, &h, &fence_value, &eyes);
+		    mono_in_2d, overlay_unchanged, overlay_filter_strength,
+		    present_surface, &presented, &have_out, &w, &h, &fence_value, &eyes);
 	}
 	if (xret == XRT_ERROR_FEATURE_NOT_SUPPORTED) {
 		// The service has no weave engine for this platform (desktop Linux
@@ -878,6 +901,9 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 	}
 	if (out_sync != NULL) {
 		out_sync->releaseFenceFd = -1;
+	}
+	if (out_present_status != NULL) {
+		out_present_status->presented = presented ? XR_TRUE : XR_FALSE;
 	}
 	if (out_origin != NULL) {
 		// Echoed as the service latched it; no conversion here either.

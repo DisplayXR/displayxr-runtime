@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | **Extension Name** | `XR_DXR_weave` |
-| **Spec Version** | 13 |
+| **Spec Version** | 17 |
 | **Extension Type** | Instance extension (service path — Windows/D3D11, macOS/comp_multi-Vulkan #759, Android/comp_multi-Vulkan #1036, desktop Linux/comp_multi-Vulkan dma-buf #1699 when the service carries its engine; the snap and its bulk grid form also work in-process on desktop Linux, §5c / #1588 / #1723) |
 | **Header** | `src/external/openxr_includes/openxr/XR_DXR_weave.h` (canonical; auto-syncs to `displayxr-extensions`) |
 | **Status** | Provisional (`1004999190–198` type block, pending Khronos registry; `199` reserved, see §2c; v9+ additions in a fresh `1004999240–249` decade — 240 v9, 241–245 v10, 246 v11, 247–248 v12) |
@@ -265,6 +265,103 @@ Each submit carries a fixed cost independent of the rect area: the runtime IPC r
 that N× on the caller's present thread, capping a page at ~8-12 visible woven elements. The
 DP weave itself is bounded by window pixels (all sub-rects accumulate into the one
 window-sized output), so ONE submit carrying N rects makes 50 visible tiles cost ≈ 1.
+
+## 2e. The runtime presents (v17)
+
+A present-owner whose v4 overlay is its whole 2D page (§2d, "whole-page overlay") gets back, in
+the woven output, its **complete** frame. Before v17 it copied that frame over its own back buffer
+and presented: a full-window read and write per frame (about 2 × 31 MB at 3840×2040), on top of the
+runtime's own write of the woven texture. With `XrWeaveSubmitPresentSurfaceDXR` the runtime
+presents the frame itself, on a DirectComposition surface the caller shows as a visual of its own.
+
+```c
+#define XR_TYPE_WEAVE_SUBMIT_PRESENT_SURFACE_DXR ((XrStructureType)1004999292)
+#define XR_TYPE_WEAVE_PRESENT_STATUS_DXR         ((XrStructureType)1004999293)
+
+typedef struct XrWeaveSubmitPresentSurfaceDXR {   // chained on XrWeaveSubmitInfoDXR
+    XrStructureType          type;
+    const void*              next;
+    void*                    compositionSurface;  // DCompositionCreateSurfaceHandle NT handle, CALLER's process
+} XrWeaveSubmitPresentSurfaceDXR;
+
+typedef struct XrWeavePresentStatusDXR {          // chained on XrWeaveOutputDXR
+    XrStructureType          type;
+    void*                    next;
+    XrBool32                 presented;           // XR_TRUE: this submit's frame was presented on the surface
+} XrWeavePresentStatusDXR;
+```
+
+**The caller's side.** The caller sets up the surface once:
+
+1. Create a surface handle with `DCompositionCreateSurfaceHandle(COMPOSITIONOBJECT_ALL_ACCESS, …)`.
+2. Make a composition surface from it (`IDCompositionDevice::CreateSurfaceFromHandle`).
+3. Set that surface as the content of a visual **above** its root.
+4. Pass the same handle on every eligible submit.
+
+Each frame, the visual is shown only when `presented` is `XR_TRUE`. The show/hide happens in the
+**same** composition commit that presents the caller's own root for that frame:
+- **presented:** the visual is shown, and the root content under it no longer matters;
+- **declined:** the visual is hidden, and the root carries the copy-back of the woven texture, as
+  before v17.
+
+This is the same producer/consumer split Chromium uses for Media Foundation video overlays, with
+the roles of the two processes swapped.
+
+**Handles are pulled, not pushed.** The handle is valid in the caller's process.
+- A sandboxed, low-integrity caller (Chromium's GPU process) cannot `OpenProcess` the service, so
+  the service duplicates the handle *from* the caller.
+- That needs the caller's process DACL to grant the user `PROCESS_DUP_HANDLE`, which the browser's
+  GPU process already grants pre-sandbox.
+- The caller keeps ownership.
+
+**The service's side.**
+- `IDXGIFactoryMedia::CreateSwapChainForCompositionSurfaceHandle` on the service's render device:
+  R8G8B8A8_UNORM (the same encoded bytes the woven texture would hold), premultiplied alpha,
+  flip-sequential, two buffers, `FRAME_LATENCY_WAITABLE_OBJECT`, maximum frame latency 1.
+- The swap chain is kept across frames. It is recreated when the surface changes (kernel-object
+  identity) and resized with the bound window's client area.
+- The weave renders straight into its back buffer and the service presents it with `Present(1, 0)`.
+
+**Every pixel is written.** A surface is used only on a submit whose woven canvas is the whole
+window (batch or v6 layout) **and** that clears it (`firstChunk = XR_TRUE`). A frame of more than
+`XR_WEAVE_SUBMIT_MAX_RECTS_DXR` rects is several submits and is never presented.
+
+**Pacing (#924).**
+- The service waits for the frame-latency token for at most **4 ms**, under `render_mutex`, the
+  budget every other weave acquire uses. No token means the present is declined.
+- Holding the token is what keeps `Present` from blocking on a jammed flip chain.
+- If a submit takes the token and is then refused before presenting, the token is **kept** for the
+  next submit. The waitable is a semaphore, and dropping a token would leave the chain one present
+  short forever.
+
+**Declined, refused, failed.**
+- **Declined:** a successful submit that did not present (ineligible, no token, the swap chain
+  could not be made) weaves into the woven texture exactly as if the struct were absent, and
+  reports `presented = XR_FALSE`.
+- **Refused:** a *refused* submit (`XR_ERROR_RUNTIME_FAILURE`, §4b) presents nothing. The surface
+  keeps showing the last presented frame, so a caller whose visual is shown can treat a refusal as a
+  free **hold**.
+- **Failed present:** a `Present` that fails refuses the submit, and the swap chain is dropped until
+  the surface changes.
+- A presented submit does not write the woven texture. The woven texture therefore holds the last
+  frame that was **not** presented.
+
+**Gate.** `extensionVersion >= 17`, with the status struct zero-initialised. An older runtime
+skips both and never presents.
+
+**Instrumentation.**
+- With `DXR_WEAVE_GPU_TIMING=1` the service's 5 s `weave timing` line gains
+  `present(n= declined= token_wait avg/max call avg/max queue avg/max)`: the token wait, the
+  `Present` CPU time, and presents queued but not yet on screen (from `GetFrameStatistics`, when
+  the composition chain reports it).
+- The decline reason (`weave v17: present surface …`) logs on change only.
+- The `%TEMP%\dxr_weave_dump_trigger` dump is named `dxr73_weave_output_presented` for a presented
+  frame.
+
+**Browser-free check.** `weave_rpc_probe_d3d11_win --present` does exactly the caller's part with
+its own window and logs presented/declined every 120 frames. Its own `weave_probe_trigger` dump
+reads the woven texture, which a presented frame does not write, so use the service's dump trigger
+to see a presented frame.
 
 ## 4. Service semantics (implementation notes)
 
@@ -921,6 +1018,12 @@ any unknown chained struct. One `weave(v13)` WARN in the service log per edge.
 | 15 | `XrWeaveSubmitOverlayFilterDXR` — the caller's lens-filter strength for the 2D overlay, 0..1; omitted = the DP's own default (§2d). |
 | 16 | No new structure: on desktop Linux a submit whose chained overlay the engine cannot import is **refused before the woven output is touched** (§5d), as the D3D11 service always did; before v16 the Linux engine dropped the overlay and wove anyway. A desktop-Linux caller that hands its whole 2D over as the overlay gates on `extensionVersion >= 16`. The macOS and Android engines still drop an unreadable overlay. |
 | 14 | `XrWeaveSubmitOverlayUnchangedDXR` — the v4 overlay atlas holds the previous accepted submit's pixels, so a DP may reuse its lens prefilter of the 2D layer (ADR-027 Amendment; §2d). |
+| 17 | `XrWeaveSubmitPresentSurfaceDXR` + `XrWeavePresentStatusDXR` — the runtime presents the woven frame itself, through a swap chain on a DirectComposition surface handle the caller owns and shows as a visual; the handle is pulled from the caller; frame-latency token waited at most 4 ms; declined = the old woven texture (§2e). Windows D3D11 service; elsewhere never presented. |
+
+**v17 is a bump**: two structure types a caller must test for (gate on
+`extensionVersion >= 17`). An older runtime skips both; a caller that zero-initialised the status
+reads `presented = XR_FALSE`, keeps its visual hidden and copies the woven texture back, which is
+the declined path anyway.
 
 **v16 is a gate for one kind of caller**: one whose overlay IS its 2D (a whole-page overlay)
 must not send it to an older desktop-Linux runtime, which would weave without it and return
@@ -965,7 +1068,7 @@ implicit. §4c's entry point + struct settle it: **v9**.
 
 | Consumer | Path | Layout used |
 |---|---|---|
-| DisplayXR Browser (Chromium fork) | GPU-process sync weave | Batch (v3) when the runtime reports spec ≥ 3; per-element legacy loop otherwise |
+| DisplayXR Browser (Chromium fork) | GPU-process sync weave | Batch (v3) when the runtime reports spec ≥ 3; per-element legacy loop otherwise. Whole-page overlay frames are presented by the runtime on a composition surface the browser shows above its root, when the runtime reports spec ≥ 17 (§2e) |
 | CEF weave host (Step A) | Browser-process sync | Legacy |
 | DisplayXR Browser on Android | Chromium GPU process → satellite compositor (ADR-036 D3) | Batch (v3/v7) — AHardwareBuffer handles + published window geometry |
 | DisplayXR Browser on desktop Linux (planned, #1699) | Chromium GPU process (GL/EGL) → comp_multi service | v10 dma-buf + `sync_file` fences; gate on spec ≥ 10. Move-synchronised Wayland drag: v12 woven origin (§5e), gate on spec ≥ 12 |

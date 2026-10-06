@@ -6466,12 +6466,14 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
                         uint32_t *out_height,
                         uint64_t *out_fence_value,
                         struct xrt_eye_positions *out_eyes,
+                        bool *out_presented,
                         const xrt_graphics_buffer_handle_t *handles,
                         uint32_t handle_count)
 {
 	IPC_TRACE_MARKER();
 
 	*out_have_output = false;
+	*out_presented = false;
 	xrt_result_t auth = require_present_owner(ics, "weave_submit");
 	if (auth != XRT_SUCCESS) {
 		weave_submit_release_handles(handles, handle_count);
@@ -6573,6 +6575,20 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	comp_d3d11_service_weave_set_overlay_unchanged(ics->xc, args->overlay_unchanged != 0);
 	// v15: per submit — negative = not set by the app, the DP's own default applies.
 	comp_d3d11_service_weave_set_overlay_filter_strength(ics->xc, args->overlay_filter_strength);
+	// v17: the composition surface to present on, per submit (consumed by the
+	// submit below on every path). A value in the CALLER's process, pulled
+	// here; a pull that fails leaves no surface and the submit weaves into the
+	// service's own woven texture (presented = false), which is the spec's
+	// decline. The service owns (and closes) what it is handed.
+	{
+		HANDLE surface = NULL;
+		if (args->present_surface_handle != 0 &&
+		    ipc_pull_handle_from_peer((struct ipc_message_channel *)&ics->imc,
+		                              (HANDLE)(uintptr_t)args->present_surface_handle, &surface) != XRT_SUCCESS) {
+			surface = NULL;
+		}
+		comp_d3d11_service_weave_set_present_surface(ics->xc, surface);
+	}
 	bool ok = comp_d3d11_service_weave_submit(                  //
 	    ics->xc, in_handle, in_is_dxgi,                         //
 	    args->rect_x, args->rect_y, args->rect_w, args->rect_h, //
@@ -6597,6 +6613,7 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	*out_height = h;
 	*out_fence_value = fv;
 	*out_eyes = eyes;
+	*out_presented = comp_d3d11_service_weave_take_presented(ics->xc);
 	return XRT_SUCCESS;
 #elif defined(COMP_MULTI_HAVE_WEAVE)
 	// handles[0] is the retained IOSurfaceRef (macOS) / acquired AHardwareBuffer

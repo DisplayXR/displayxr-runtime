@@ -678,12 +678,17 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         bool mono_in_2d,
                                         bool overlay_unchanged,
                                         float overlay_filter_strength,
+                                        uint64_t present_surface,
+                                        bool *out_presented,
                                         bool *out_have_output,
                                         uint32_t *out_width,
                                         uint32_t *out_height,
                                         uint64_t *out_fence_value,
                                         struct xrt_eye_positions *out_eyes)
 {
+	if (out_presented != NULL) {
+		*out_presented = false;
+	}
 	if (xc == NULL || out_have_output == NULL || out_width == NULL || out_height == NULL ||
 	    out_fence_value == NULL || out_eyes == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
@@ -714,6 +719,12 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
 	                       overlay_rect_count, overlay_rects, weave_frame_first, layout, flat_rect_count,
 	                       flat_rects, mono_in_2d, overlay_unchanged, overlay_filter_strength);
 
+	// v17: the composition surface the service presents on. A VALUE in this
+	// process, carried in the args and pulled by the service (see
+	// ipc_arg_weave_submit), never an in_handle: pushing would need OpenProcess
+	// on the service, which a sandboxed low-integrity caller does not have.
+	args.present_surface_handle = present_surface;
+
 	xrt_graphics_buffer_handle_t handles[2] = {in_handle, overlay_handle};
 	uint32_t handle_count = have_overlay ? 2u : 1u;
 #if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
@@ -736,10 +747,14 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
 	struct xrt_eye_positions eyes = {0};
 	// Generated arg order: in args, then in_handles (handles, count), then out
 	// args. This copies the handles, it does not consume them.
+	bool presented = false;
 	xrt_result_t xret =
-	    ipc_call_weave_submit(icc->ipc_c, &args, handles, handle_count, &have, &w, &h, &fv, &eyes);
+	    ipc_call_weave_submit(icc->ipc_c, &args, handles, handle_count, &have, &w, &h, &fv, &eyes, &presented);
 	if (xret != XRT_SUCCESS) {
 		return xret;
+	}
+	if (out_presented != NULL) {
+		*out_presented = presented;
 	}
 	*out_have_output = have;
 	*out_width = w;
