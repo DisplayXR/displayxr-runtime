@@ -756,6 +756,16 @@ desktop-Linux runtime it keeps a mismatched overlay off the wire itself.
 With v14, a frame whose overlay was ignored also resets "unchanged": the first overlay the display
 processor is offered after one is passed as changed, whatever the caller declared, since the
 display processor's cached layer predates the ignored frames.
+**Android: the overlay is per submit, and an unreadable one refuses (v18).** The Android engine
+caches an overlay import by buffer identity (the caller re-sends the same `AHardwareBuffer` every
+frame), and before v18 that cache was also a *standing* overlay: once imported, it was
+composited on every later submit, including one that chained no overlay. From v17 an overlay is
+composited only on a submit that chains one (the cache is kept, so re-sending the same buffer
+costs no re-import), and a chained overlay that cannot be imported refuses the submit with
+`XR_ERROR_RUNTIME_FAILURE` before the woven output is touched — the v16 rule above. A caller
+whose overlay is its whole 2D (browser-pvt#226 on Android) switches the overlay off while its page
+scrolls, so on a pre-v18 Android runtime it would see its last page composited over a page that
+had moved; such a caller gates on `extensionVersion >= 18`.
 
 **The import cache.** An fd is not an identity: every hand-off is a new number. The service
 keys its input import cache on `bufferId` when non-zero and on the fd's `(st_dev, st_ino)`
@@ -964,6 +974,9 @@ any unknown chained struct. One `weave(v13)` WARN in the service log per edge.
 **v17 is a gate for the same caller as v16**: one whose overlay IS its 2D must not rely on a
 mismatched overlay being dropped by an older desktop-Linux runtime, which composites it stretched;
 it keeps such an overlay off the wire there instead.
+| 18 | No new structure: on Android an overlay is **per submit** (composited only on a submit that chains one; before v18 the last imported overlay was composited on every later submit) and a chained overlay the engine cannot import **refuses the submit before the woven output is touched** — the v16 rule. An Android caller that hands its whole 2D over as the overlay gates on `extensionVersion >= 18`. The macOS engine still drops an unreadable overlay. |
+
+**v18 is the same gate on Android**, for the same kind of caller.
 
 **v16 is a gate for one kind of caller**: one whose overlay IS its 2D (a whole-page overlay)
 must not send it to an older desktop-Linux runtime, which would weave without it and return

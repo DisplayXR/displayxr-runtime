@@ -1828,6 +1828,24 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		}
 
 		// v4 overlay: same, into the SEPARATE overlay cache.
+		//
+		// XR_DXR_weave v18 (browser-pvt#226), two rules the desktop-Linux engine
+		// has had since v16 and the D3D11 service always had:
+		//  1. PER SUBMIT. The cache is keyed by buffer identity because the
+		//     caller re-sends the same AHardwareBuffer every frame, but a cached
+		//     import is NOT a standing overlay: a submit that chains none is woven
+		//     with none. Before v18 the last imported overlay was composited on
+		//     every later submit, so a caller that stops sending one (the
+		//     browser's whole-page overlay switches itself off while the page
+		//     scrolls) got its last page composited over a page that had moved.
+		//  2. REFUSE, don't drop. A chained overlay that cannot be imported
+		//     refuses the submit HERE, before anything is recorded, so the woven
+		//     output is left exactly as the previous accepted submit left it. A
+		//     caller that hands its whole 2D over as the overlay reads "accepted
+		//     with the overlay chained" as "composited" and presents the woven
+		//     output as the frame; before v18 that frame would have had its 2D
+		//     missing.
+		mc->weave.overlay_this_submit = overlay != XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
 		if (overlay != XRT_GRAPHICS_BUFFER_HANDLE_INVALID &&
 		    (mc->weave.overlay_image == VK_NULL_HANDLE || mc->weave.overlay_ahb != (void *)overlay)) {
 			weave_release_overlay(vk, mc);
@@ -1840,6 +1858,14 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 				overlay = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
 				U_LOG_W("weave(#1036) v4: overlay import cached (%ux%u)", mc->weave.overlay_w,
 				        mc->weave.overlay_h);
+			} else {
+				const uint32_t n = mc->weave.overlay_refusals++;
+				if (n == 0 || (n % 300) == 0) {
+					U_LOG_W("weave(#1036) v18: overlay import failed — submit REFUSED, woven output "
+					        "untouched (refusals=%u)",
+					        n + 1);
+				}
+				break;
 			}
 		}
 
@@ -2380,7 +2406,7 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		// blend, so crisp 2D lands on top of the interlaced 3D at screen depth.
 		// The overlay is NOT woven — it is drawn after process_atlas onto the same
 		// output attachment.
-		if (mc->weave.overlay_image != VK_NULL_HANDLE) {
+		if (mc->weave.overlay_image != VK_NULL_HANDLE && mc->weave.overlay_this_submit) {
 			bool blend_ready = mc->weave.overlay_blend_initialized;
 			if (!blend_ready) {
 				blend_ready = vk_local2d_composite_init(&mc->weave.overlay_blend, vk, WEAVE_VK_FORMAT,

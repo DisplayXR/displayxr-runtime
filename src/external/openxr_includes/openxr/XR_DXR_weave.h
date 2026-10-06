@@ -220,6 +220,15 @@
  * overlay IS its 2D gates on extensionVersion >= 17 before relying on it, and
  * otherwise keeps a mismatched overlay off the wire itself.
  *
+ * Android: an overlay is per submit, and an unreadable one refuses (SPEC_VERSION
+ * 18). No new structure: from v18 the Android engine applies the v16 rule too
+ * (a chained overlay it cannot import refuses the submit, XR_ERROR_RUNTIME_FAILURE,
+ * before the woven output is touched) and composites an overlay only on a submit
+ * that chains one. Before v18 it composited the last overlay it had imported on
+ * every later submit, chained or not. An Android caller that hands the whole of
+ * its 2D over as the overlay gates on extensionVersion >= 18. The macOS engine
+ * still drops an unreadable overlay.
+ *
  * Overlay filter strength (SPEC_VERSION 15). XrWeaveSubmitOverlayFilterDXR, chained
  * next to an XrWeaveSubmitOverlaysDXR: how strongly a display processor that
  * band-limits the 2D layer for its lens filters it, 0..1 (0 = no lens filtering,
@@ -303,7 +312,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_weave 1
-#define XR_DXR_weave_SPEC_VERSION 17
+#define XR_DXR_weave_SPEC_VERSION 18
 #define XR_DXR_WEAVE_EXTENSION_NAME "XR_DXR_weave"
 
 // Reserved 1004999190..199. Final values reconcile with the Khronos registry

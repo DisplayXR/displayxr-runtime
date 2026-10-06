@@ -793,6 +793,15 @@ struct multi_compositor
 		bool overlay_first_use;
 		struct vk_local2d_composite overlay_blend;
 		bool overlay_blend_initialized;
+		/*!
+		 * XR_DXR_weave v18: THIS submit chained an overlay. The import above is
+		 * a cache (an AHardwareBuffer is re-sent every frame and matched by
+		 * pointer), so @c overlay_image outlives the submit that brought it; the
+		 * overlay is composited only when the current submit carries one.
+		 */
+		bool overlay_this_submit;
+		//! Submits refused because their chained overlay could not be imported.
+		uint32_t overlay_refusals;
 		//! @}
 
 		//! @name Arch-C weave satellite (#1277 P0) — service-presented weave
