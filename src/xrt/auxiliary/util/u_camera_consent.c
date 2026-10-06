@@ -164,35 +164,43 @@ u_camera_consent_evaluate(struct u_camera_consent *c,
 		decide(out, U_CAMERA_CONSENT_REFUSED, U_CAMERA_CONSENT_WHY_NO_IDENTITY);
 		return;
 	}
-	// 4. a registered delegating client prompts per origin itself.
-	if (st != NULL && st->is_delegating != NULL && st->is_delegating(sc, exe)) {
-		out->delegating = true;
-		decide(out, U_CAMERA_CONSENT_ALLOWED, U_CAMERA_CONSENT_WHY_DELEGATING);
-		return;
-	}
-	// 5. the OS switch: a camera that ignores it would surprise the user.
+	// A fact about the executable, reported whatever the verdict (the service
+	// keys the RAW refusal on it). It only DECIDES at step 6.
+	out->delegating = st != NULL && st->is_delegating != NULL && st->is_delegating(sc, exe);
+	// 4. the OS switch, for every client, delegating ones included: the service
+	//    opens the camera, not the client, so the OS never sees this consumer
+	//    and nobody else will enforce the user's switch for it.
 	if (c->env != NULL && c->env->os_camera_allowed != NULL && !c->env->os_camera_allowed(c->env_ctx, exe)) {
 		decide(out, U_CAMERA_CONSENT_OS_DENIED, U_CAMERA_CONSENT_WHY_OS_DENIED);
 		return;
 	}
-	// 6. the stored decision.
+	// 5. a stored Deny is the user's explicit "no" for this executable and
+	//    beats any registration (an installer's included).
 	enum u_camera_consent_stored stored = U_CAMERA_CONSENT_STORED_NONE;
-	if (st != NULL && st->get != NULL && st->get(sc, exe, &stored)) {
-		if (stored == U_CAMERA_CONSENT_STORED_ALLOW) {
-			decide(out, U_CAMERA_CONSENT_ALLOWED, U_CAMERA_CONSENT_WHY_STORED_ALLOW);
-			return;
-		}
-		if (stored == U_CAMERA_CONSENT_STORED_DENY) {
-			decide(out, U_CAMERA_CONSENT_REFUSED, U_CAMERA_CONSENT_WHY_STORED_DENY);
-			return;
-		}
+	if (st == NULL || st->get == NULL || !st->get(sc, exe, &stored)) {
+		stored = U_CAMERA_CONSENT_STORED_NONE;
 	}
-	// 7. "Allow once" already given to this process.
+	if (stored == U_CAMERA_CONSENT_STORED_DENY) {
+		decide(out, U_CAMERA_CONSENT_REFUSED, U_CAMERA_CONSENT_WHY_STORED_DENY);
+		return;
+	}
+	// 6. a registered delegating client prompts per origin itself: no runtime
+	//    prompt and no stored decision needed — and nothing more than that.
+	if (out->delegating) {
+		decide(out, U_CAMERA_CONSENT_ALLOWED, U_CAMERA_CONSENT_WHY_DELEGATING);
+		return;
+	}
+	// 7. a stored Allow.
+	if (stored == U_CAMERA_CONSENT_STORED_ALLOW) {
+		decide(out, U_CAMERA_CONSENT_ALLOWED, U_CAMERA_CONSENT_WHY_STORED_ALLOW);
+		return;
+	}
+	// 8. "Allow once" already given to this process.
 	if (once_find(c, exe, pid)) {
 		decide(out, U_CAMERA_CONSENT_ALLOWED, U_CAMERA_CONSENT_WHY_ALLOW_ONCE);
 		return;
 	}
-	// 8. ask.
+	// 9. ask.
 	if (!c->prompt_enabled || c->env == NULL || c->env->prompt == NULL) {
 		decide(out, U_CAMERA_CONSENT_REFUSED, U_CAMERA_CONSENT_WHY_PROMPT_UNAVAILABLE);
 		return;
@@ -222,6 +230,74 @@ u_camera_consent_evaluate(struct u_camera_consent *c,
 	case U_CAMERA_CONSENT_PROMPT_UNAVAILABLE:
 	default: decide(out, U_CAMERA_CONSENT_REFUSED, U_CAMERA_CONSENT_WHY_PROMPT_UNAVAILABLE); return;
 	}
+}
+
+
+/*
+ *
+ * Pure store helpers.
+ *
+ */
+
+static char
+path_norm_ch(char c, bool windows_rules)
+{
+	if (windows_rules) {
+		if (c == '/') {
+			return '\\';
+		}
+		if (c >= 'A' && c <= 'Z') {
+			return (char)(c - 'A' + 'a');
+		}
+	}
+	return c;
+}
+
+bool
+u_camera_consent_path_equal(const char *a, const char *b, bool windows_rules)
+{
+	if (a == NULL || b == NULL || a[0] == '\0' || b[0] == '\0') {
+		return false;
+	}
+	while (*a != '\0' && *b != '\0') {
+		if (path_norm_ch(*a, windows_rules) != path_norm_ch(*b, windows_rules)) {
+			return false;
+		}
+		a++;
+		b++;
+	}
+	return *a == '\0' && *b == '\0';
+}
+
+bool
+u_camera_consent_list_find(
+    u_camera_consent_enum_fn fn, void *ctx, const char *exe, bool windows_rules, char *match_name, size_t match_cap)
+{
+	if (fn == NULL || !exe_known(exe)) {
+		return false;
+	}
+	char name[1024];
+	char path[4096];
+	for (uint32_t i = 0; i < U_CAMERA_CONSENT_LIST_MAX; i++) {
+		name[0] = '\0';
+		path[0] = '\0';
+		enum u_camera_consent_enum_result r = fn(ctx, i, name, sizeof(name), path, sizeof(path));
+		if (r == U_CAMERA_CONSENT_ENUM_END) {
+			return false;
+		}
+		if (r != U_CAMERA_CONSENT_ENUM_ENTRY) {
+			continue; // one bad entry never hides the ones after it
+		}
+		name[sizeof(name) - 1] = '\0';
+		path[sizeof(path) - 1] = '\0';
+		if (u_camera_consent_path_equal(path, exe, windows_rules)) {
+			if (match_name != NULL && match_cap > 0) {
+				snprintf(match_name, match_cap, "%s", name);
+			}
+			return true;
+		}
+	}
+	return false;
 }
 
 

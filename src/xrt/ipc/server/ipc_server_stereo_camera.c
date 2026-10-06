@@ -14,12 +14,14 @@
  * Privacy (spec §7) — R3, as built. The plug-in never sees any of it:
  *  - consent_evaluate(): every stream start and every calibration read runs
  *    the u_camera_consent policy (aux util, unit-tested with fakes) against
- *    the OS-derived peer executable: sharing off (DXR_STEREO_CAMERA=0 or the
+ *    the OS-derived peer executable, in the order of spec §7.1 (stated once
+ *    there and in u_camera_consent.h): sharing off (DXR_STEREO_CAMERA=0 or the
  *    user's tray toggle) -> DISABLED; DXR_STEREO_CAMERA_DEV_ALLOW=1 -> allowed
- *    (one WARN); registered consent-DELEGATING client (the browser, by
- *    installer / `displayxr-cli camera trust`) -> allowed, its own prompt is
- *    the consent; OS camera privacy switch -> PERMISSION_INSUFFICIENT; the
- *    stored per-app Allow/Deny; else the tray prompt ("<app> wants to use the
+ *    (one WARN); OS camera privacy switch -> PERMISSION_INSUFFICIENT and a
+ *    stored Deny -> CONSENT_REFUSED, both for EVERY client; only then a
+ *    registered consent-DELEGATING client (the browser, by installer /
+ *    `displayxr-cli camera trust`) -> allowed, its own prompt is the consent;
+ *    a stored Allow; else the tray prompt ("<app> wants to use the
  *    3D camera — Allow / Allow once / Deny"), which the host installs with
  *    ipc_server_stereo_camera_set_prompt_provider(). The prompt BLOCKS the
  *    calling client thread (manager lock released, one prompt at a time) for

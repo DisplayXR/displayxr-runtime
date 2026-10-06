@@ -25,8 +25,11 @@
  *   macOS  /Library/Application Support/DisplayXR/camera-delegating.json
  *   {"delegating": ["<exe>", ...]}
  *
- * Paths compare the way the OS does: Windows case-insensitively with either
- * separator, POSIX byte-exact.
+ * Paths compare with u_camera_consent_path_equal(): Windows ASCII-case-
+ * insensitively with either separator, POSIX byte-exact. On Windows every
+ * registry access uses the wide API (paths are UTF-8 in the runtime, UTF-16 in
+ * the registry), and an oversized or malformed value is skipped, never ends a
+ * list scan (u_camera_consent_list_find()).
  *
  * @ingroup aux_util
  */
@@ -62,36 +65,6 @@
  * Shared helpers.
  *
  */
-
-static char
-norm_ch(char c)
-{
-#ifdef XRT_OS_WINDOWS
-	if (c == '/') {
-		return '\\';
-	}
-	if (c >= 'A' && c <= 'Z') {
-		return (char)(c - 'A' + 'a');
-	}
-#endif
-	return c;
-}
-
-static bool
-path_equal(const char *a, const char *b)
-{
-	if (a == NULL || b == NULL || a[0] == '\0' || b[0] == '\0') {
-		return false;
-	}
-	while (*a != '\0' && *b != '\0') {
-		if (norm_ch(*a) != norm_ch(*b)) {
-			return false;
-		}
-		a++;
-		b++;
-	}
-	return *a == '\0' && *b == '\0';
-}
 
 static void
 fill_random(uint8_t *out, size_t n)
@@ -132,69 +105,220 @@ fill_random(uint8_t *out, size_t n)
 
 /*
  *
- * Windows: registry.
+ * Windows: registry. Every access goes through the WIDE API: the executable
+ * paths the service compares are UTF-8 (QueryFullProcessImageNameW ->
+ * CP_UTF8), and an installer writes UTF-16. The ANSI API would convert through
+ * the process code page and a non-ASCII path could never match.
  *
  */
 
-#define CONSENT_KEY "Software\\DisplayXR\\CameraConsent"
-#define CAM_CONSENT_STORE_WEBCAM "Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\webcam"
+#define CONSENT_KEY L"Software\\DisplayXR\\CameraConsent"
+#define CAM_CONSENT_STORE_WEBCAM                                                                                       \
+	L"Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\webcam"
+
+//! UTF-8 -> freshly allocated UTF-16 (free()); NULL on failure.
+static wchar_t *
+u8_to_w(const char *s)
+{
+	if (s == NULL) {
+		return NULL;
+	}
+	int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s, -1, NULL, 0);
+	if (n <= 0) {
+		return NULL;
+	}
+	wchar_t *w = (wchar_t *)malloc((size_t)n * sizeof(wchar_t));
+	if (w != NULL && MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s, -1, w, n) != n) {
+		free(w);
+		w = NULL;
+	}
+	return w;
+}
+
+//! UTF-16 (@p wlen chars, need not be terminated) -> UTF-8 in @p out; false if it does not fit.
+static bool
+w_to_u8(const wchar_t *w, int wlen, char *out, size_t cap)
+{
+	if (cap == 0) {
+		return false;
+	}
+	out[0] = '\0';
+	if (wlen == 0) {
+		return true;
+	}
+	int n = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, w, wlen, out, (int)cap - 1, NULL, NULL);
+	if (n <= 0) {
+		out[0] = '\0';
+		return false;
+	}
+	out[n] = '\0';
+	return true;
+}
 
 static bool
-reg_read_dword(HKEY root, const char *sub, const char *name, DWORD *out)
+reg_read_dword(HKEY root, const wchar_t *sub, const wchar_t *name, DWORD *out)
 {
 	HKEY k;
-	if (RegOpenKeyExA(root, sub, 0, KEY_READ, &k) != ERROR_SUCCESS) {
+	if (RegOpenKeyExW(root, sub, 0, KEY_READ, &k) != ERROR_SUCCESS) {
 		return false;
 	}
 	DWORD type = 0, data = 0, size = sizeof(data);
-	LSTATUS rc = RegQueryValueExA(k, name, NULL, &type, (LPBYTE)&data, &size);
+	LSTATUS rc = RegQueryValueExW(k, name, NULL, &type, (LPBYTE)&data, &size);
 	RegCloseKey(k);
-	if (rc != ERROR_SUCCESS || type != REG_DWORD) {
+	if (rc != ERROR_SUCCESS || type != REG_DWORD || size != sizeof(data)) {
 		return false;
 	}
 	*out = data;
 	return true;
 }
 
+//! A short REG_SZ value (ConsentStore "Value"); false if absent, not a string, or too long.
 static bool
-reg_read_string(HKEY root, const char *sub, const char *name, char *out, size_t cap)
+reg_read_string_w(HKEY root, const wchar_t *sub, const wchar_t *name, wchar_t *out, DWORD cap_chars)
 {
 	HKEY k;
-	if (RegOpenKeyExA(root, sub, 0, KEY_READ, &k) != ERROR_SUCCESS) {
+	if (RegOpenKeyExW(root, sub, 0, KEY_READ, &k) != ERROR_SUCCESS) {
 		return false;
 	}
-	DWORD type = 0, size = (DWORD)cap;
-	LSTATUS rc = RegQueryValueExA(k, name, NULL, &type, (LPBYTE)out, &size);
+	DWORD type = 0, size = (cap_chars - 1) * (DWORD)sizeof(wchar_t);
+	LSTATUS rc = RegQueryValueExW(k, name, NULL, &type, (LPBYTE)out, &size);
 	RegCloseKey(k);
 	if (rc != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ)) {
 		return false;
 	}
-	out[cap - 1] = '\0';
+	out[size / sizeof(wchar_t)] = L'\0';
 	return true;
 }
 
 static bool
-reg_write_dword(HKEY root, const char *sub, const char *name, DWORD v)
+reg_write_dword(HKEY root, const wchar_t *sub, const wchar_t *name, DWORD v)
 {
 	HKEY k;
-	if (RegCreateKeyExA(root, sub, 0, NULL, 0, KEY_WRITE, NULL, &k, NULL) != ERROR_SUCCESS) {
+	if (RegCreateKeyExW(root, sub, 0, NULL, 0, KEY_WRITE, NULL, &k, NULL) != ERROR_SUCCESS) {
 		return false;
 	}
-	LSTATUS rc = RegSetValueExA(k, name, 0, REG_DWORD, (const BYTE *)&v, sizeof(v));
+	LSTATUS rc = RegSetValueExW(k, name, 0, REG_DWORD, (const BYTE *)&v, sizeof(v));
 	RegCloseKey(k);
 	return rc == ERROR_SUCCESS;
 }
 
 static bool
-reg_delete_value(HKEY root, const char *sub, const char *name)
+reg_delete_value(HKEY root, const wchar_t *sub, const wchar_t *name)
 {
 	HKEY k;
-	if (RegOpenKeyExA(root, sub, 0, KEY_WRITE, &k) != ERROR_SUCCESS) {
+	if (RegOpenKeyExW(root, sub, 0, KEY_WRITE, &k) != ERROR_SUCCESS) {
 		return true; // nothing to delete
 	}
-	LSTATUS rc = RegDeleteValueA(k, name);
+	LSTATUS rc = RegDeleteValueW(k, name);
 	RegCloseKey(k);
 	return rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND;
+}
+
+/*!
+ * An open key's values, enumerated with buffers sized from RegQueryInfoKeyW so
+ * a legitimately long value fits; whatever still does not (the key grew under
+ * us) is reported as SKIP for that index, never as the end of the list.
+ */
+struct reg_enum
+{
+	HKEY key;
+	wchar_t *name; //!< name_cap chars
+	DWORD name_cap;
+	BYTE *data; //!< data_cap bytes (even), +4 so any REG_SZ can be terminated
+	DWORD data_cap;
+};
+
+static bool
+reg_enum_open(struct reg_enum *e, HKEY root, const wchar_t *sub)
+{
+	memset(e, 0, sizeof(*e));
+	if (RegOpenKeyExW(root, sub, 0, KEY_READ, &e->key) != ERROR_SUCCESS) {
+		return false;
+	}
+	DWORD max_name = 0, max_data = 0;
+	if (RegQueryInfoKeyW(e->key, NULL, NULL, NULL, NULL, NULL, NULL, NULL, &max_name, &max_data, NULL, NULL) !=
+	    ERROR_SUCCESS) {
+		max_name = 1024;
+		max_data = 4096;
+	}
+	e->name_cap = max_name + 1;
+	e->data_cap = (max_data + 1u) & ~1u;
+	e->name = (wchar_t *)malloc((size_t)e->name_cap * sizeof(wchar_t));
+	e->data = (BYTE *)malloc((size_t)e->data_cap + 4);
+	if (e->name == NULL || e->data == NULL) {
+		free(e->name);
+		free(e->data);
+		RegCloseKey(e->key);
+		memset(e, 0, sizeof(*e));
+		return false;
+	}
+	return true;
+}
+
+static void
+reg_enum_close(struct reg_enum *e)
+{
+	if (e->key != NULL) {
+		RegCloseKey(e->key);
+	}
+	free(e->name);
+	free(e->data);
+	memset(e, 0, sizeof(*e));
+}
+
+/*!
+ * Value @p i: on ENTRY, e->name is terminated, *type and *data_len are set and
+ * e->data has zero bytes after data_len (a REG_SZ is always terminated, even an
+ * odd-length or unterminated one an installer wrote).
+ */
+static enum u_camera_consent_enum_result
+reg_enum_at(struct reg_enum *e, DWORD i, DWORD *type, DWORD *data_len)
+{
+	DWORD name_len = e->name_cap, dlen = e->data_cap;
+	LSTATUS rc = RegEnumValueW(e->key, i, e->name, &name_len, NULL, type, e->data, &dlen);
+	if (rc == ERROR_MORE_DATA) {
+		return U_CAMERA_CONSENT_ENUM_SKIP; // oversized: ignore this one, not the rest
+	}
+	if (rc != ERROR_SUCCESS) {
+		return U_CAMERA_CONSENT_ENUM_END; // ERROR_NO_MORE_ITEMS, or the key is gone
+	}
+	e->name[name_len < e->name_cap ? name_len : e->name_cap - 1] = L'\0';
+	memset(e->data + dlen, 0, 4);
+	*data_len = dlen;
+	return U_CAMERA_CONSENT_ENUM_ENTRY;
+}
+
+//! u_camera_consent_enum_fn over a Delegating key: value DATA = executable path.
+static enum u_camera_consent_enum_result
+reg_delegating_enum_fn(void *ctx, uint32_t index, char *name, size_t name_cap, char *path, size_t path_cap)
+{
+	struct reg_enum *e = (struct reg_enum *)ctx;
+	DWORD type = 0, dlen = 0;
+	enum u_camera_consent_enum_result r = reg_enum_at(e, (DWORD)index, &type, &dlen);
+	if (r != U_CAMERA_CONSENT_ENUM_ENTRY) {
+		return r;
+	}
+	if (type != REG_SZ && type != REG_EXPAND_SZ) {
+		return U_CAMERA_CONSENT_ENUM_SKIP;
+	}
+	const wchar_t *wd = (const wchar_t *)e->data;
+	if (!w_to_u8(wd, (int)wcslen(wd), path, path_cap) || !w_to_u8(e->name, (int)wcslen(e->name), name, name_cap)) {
+		return U_CAMERA_CONSENT_ENUM_SKIP; // does not fit / not valid UTF-16
+	}
+	return U_CAMERA_CONSENT_ENUM_ENTRY;
+}
+
+//! Walk a Delegating key: each value's DATA is an executable path.
+static bool
+win_delegating_has(HKEY root, const char *exe, char *match_name, size_t match_cap)
+{
+	struct reg_enum e;
+	if (!reg_enum_open(&e, root, CONSENT_KEY L"\\Delegating")) {
+		return false;
+	}
+	bool found = u_camera_consent_list_find(reg_delegating_enum_fn, &e, exe, true, match_name, match_cap);
+	reg_enum_close(&e);
+	return found;
 }
 
 static bool
@@ -202,8 +326,14 @@ win_get(void *ctx, const char *exe, enum u_camera_consent_stored *out)
 {
 	(void)ctx;
 	*out = U_CAMERA_CONSENT_STORED_NONE;
+	wchar_t *wexe = u8_to_w(exe);
+	if (wexe == NULL) {
+		return false;
+	}
 	DWORD v = 0;
-	if (!reg_read_dword(HKEY_CURRENT_USER, CONSENT_KEY "\\Apps", exe, &v)) {
+	bool ok = reg_read_dword(HKEY_CURRENT_USER, CONSENT_KEY L"\\Apps", wexe, &v);
+	free(wexe);
+	if (!ok) {
 		return false;
 	}
 	*out = v == 1 ? U_CAMERA_CONSENT_STORED_ALLOW : v == 2 ? U_CAMERA_CONSENT_STORED_DENY : U_CAMERA_CONSENT_STORED_NONE;
@@ -214,43 +344,19 @@ static bool
 win_set(void *ctx, const char *exe, enum u_camera_consent_stored value)
 {
 	(void)ctx;
-	if (value == U_CAMERA_CONSENT_STORED_NONE) {
-		return reg_delete_value(HKEY_CURRENT_USER, CONSENT_KEY "\\Apps", exe);
-	}
-	return reg_write_dword(HKEY_CURRENT_USER, CONSENT_KEY "\\Apps", exe,
-	                       value == U_CAMERA_CONSENT_STORED_ALLOW ? 1u : 2u);
-}
-
-//! Walk the values of a Delegating key: each value's DATA is an executable path.
-static bool
-win_delegating_has(HKEY root, const char *exe, char *match_name, size_t match_cap)
-{
-	HKEY k;
-	if (RegOpenKeyExA(root, CONSENT_KEY "\\Delegating", 0, KEY_READ, &k) != ERROR_SUCCESS) {
+	wchar_t *wexe = u8_to_w(exe);
+	if (wexe == NULL) {
 		return false;
 	}
-	bool found = false;
-	for (DWORD i = 0; !found; i++) {
-		char name[256];
-		char data[1024];
-		DWORD name_len = sizeof(name), type = 0, data_len = sizeof(data);
-		LSTATUS rc = RegEnumValueA(k, i, name, &name_len, NULL, &type, (LPBYTE)data, &data_len);
-		if (rc != ERROR_SUCCESS) {
-			break;
-		}
-		if (type != REG_SZ && type != REG_EXPAND_SZ) {
-			continue;
-		}
-		data[sizeof(data) - 1] = '\0';
-		if (path_equal(data, exe)) {
-			found = true;
-			if (match_name != NULL) {
-				snprintf(match_name, match_cap, "%s", name);
-			}
-		}
+	bool ok;
+	if (value == U_CAMERA_CONSENT_STORED_NONE) {
+		ok = reg_delete_value(HKEY_CURRENT_USER, CONSENT_KEY L"\\Apps", wexe);
+	} else {
+		ok = reg_write_dword(HKEY_CURRENT_USER, CONSENT_KEY L"\\Apps", wexe,
+		                     value == U_CAMERA_CONSENT_STORED_ALLOW ? 1u : 2u);
 	}
-	RegCloseKey(k);
-	return found;
+	free(wexe);
+	return ok;
 }
 
 static bool
@@ -265,7 +371,7 @@ win_sharing_enabled(void *ctx)
 {
 	(void)ctx;
 	DWORD v = 1;
-	if (reg_read_dword(HKEY_CURRENT_USER, CONSENT_KEY, "Sharing", &v)) {
+	if (reg_read_dword(HKEY_CURRENT_USER, CONSENT_KEY, L"Sharing", &v)) {
 		return v != 0;
 	}
 	return true;
@@ -275,7 +381,7 @@ static bool
 win_set_sharing_enabled(void *ctx, bool enabled)
 {
 	(void)ctx;
-	return reg_write_dword(HKEY_CURRENT_USER, CONSENT_KEY, "Sharing", enabled ? 1u : 0u);
+	return reg_write_dword(HKEY_CURRENT_USER, CONSENT_KEY, L"Sharing", enabled ? 1u : 0u);
 }
 
 static bool
@@ -283,18 +389,18 @@ win_get_secret(void *ctx, uint8_t out[U_CAMERA_CONSENT_SECRET_SIZE])
 {
 	(void)ctx;
 	HKEY k;
-	if (RegCreateKeyExA(HKEY_CURRENT_USER, CONSENT_KEY, 0, NULL, 0, KEY_READ | KEY_WRITE, NULL, &k, NULL) !=
+	if (RegCreateKeyExW(HKEY_CURRENT_USER, CONSENT_KEY, 0, NULL, 0, KEY_READ | KEY_WRITE, NULL, &k, NULL) !=
 	    ERROR_SUCCESS) {
 		return false;
 	}
 	DWORD type = 0, size = U_CAMERA_CONSENT_SECRET_SIZE;
-	LSTATUS rc = RegQueryValueExA(k, "Secret", NULL, &type, out, &size);
+	LSTATUS rc = RegQueryValueExW(k, L"Secret", NULL, &type, out, &size);
 	if (rc == ERROR_SUCCESS && type == REG_BINARY && size == U_CAMERA_CONSENT_SECRET_SIZE) {
 		RegCloseKey(k);
 		return true;
 	}
 	fill_random(out, U_CAMERA_CONSENT_SECRET_SIZE);
-	rc = RegSetValueExA(k, "Secret", 0, REG_BINARY, out, U_CAMERA_CONSENT_SECRET_SIZE);
+	rc = RegSetValueExW(k, L"Secret", 0, REG_BINARY, out, U_CAMERA_CONSENT_SECRET_SIZE);
 	RegCloseKey(k);
 	return rc == ERROR_SUCCESS;
 }
@@ -317,70 +423,87 @@ u_camera_consent_store_default(void)
 bool
 u_camera_consent_store_set_delegating(const char *exe, bool delegating)
 {
-	char name[256];
+	char name[1024];
 	bool present = win_delegating_has(HKEY_CURRENT_USER, exe, name, sizeof(name));
 	if (!delegating) {
-		return !present || reg_delete_value(HKEY_CURRENT_USER, CONSENT_KEY "\\Delegating", name);
+		if (!present) {
+			return true;
+		}
+		wchar_t *wname = u8_to_w(name);
+		bool ok = wname != NULL && reg_delete_value(HKEY_CURRENT_USER, CONSENT_KEY L"\\Delegating", wname);
+		free(wname);
+		return ok;
 	}
 	if (present) {
 		return true;
 	}
+	wchar_t *wexe = u8_to_w(exe);
+	if (wexe == NULL) {
+		return false;
+	}
 	// Value name: the executable's base name (unique enough; data is what matters).
-	const char *base = exe;
-	for (const char *p = exe; *p != '\0'; p++) {
-		if (*p == '\\' || *p == '/') {
+	const wchar_t *base = wexe;
+	for (const wchar_t *p = wexe; *p != L'\0'; p++) {
+		if (*p == L'\\' || *p == L'/') {
 			base = p + 1;
 		}
 	}
 	HKEY k;
-	if (RegCreateKeyExA(HKEY_CURRENT_USER, CONSENT_KEY "\\Delegating", 0, NULL, 0, KEY_WRITE, NULL, &k, NULL) !=
+	bool ok = false;
+	if (RegCreateKeyExW(HKEY_CURRENT_USER, CONSENT_KEY L"\\Delegating", 0, NULL, 0, KEY_WRITE, NULL, &k, NULL) ==
 	    ERROR_SUCCESS) {
-		return false;
+		DWORD bytes = (DWORD)((wcslen(wexe) + 1) * sizeof(wchar_t));
+		ok = RegSetValueExW(k, base, 0, REG_SZ, (const BYTE *)wexe, bytes) == ERROR_SUCCESS;
+		RegCloseKey(k);
 	}
-	LSTATUS rc = RegSetValueExA(k, base, 0, REG_SZ, (const BYTE *)exe, (DWORD)strlen(exe) + 1);
-	RegCloseKey(k);
-	return rc == ERROR_SUCCESS;
+	free(wexe);
+	return ok;
 }
 
 static void
 win_list_delegating(HKEY root, const char *origin, void (*cb)(void *, char, const char *, const char *), void *ctx)
 {
-	HKEY k;
-	if (RegOpenKeyExA(root, CONSENT_KEY "\\Delegating", 0, KEY_READ, &k) != ERROR_SUCCESS) {
+	struct reg_enum e;
+	if (!reg_enum_open(&e, root, CONSENT_KEY L"\\Delegating")) {
 		return;
 	}
-	for (DWORD i = 0;; i++) {
-		char name[256];
-		char data[1024];
-		DWORD name_len = sizeof(name), type = 0, data_len = sizeof(data);
-		if (RegEnumValueA(k, i, name, &name_len, NULL, &type, (LPBYTE)data, &data_len) != ERROR_SUCCESS) {
+	char name[1024];
+	char path[4096];
+	for (uint32_t i = 0; i < U_CAMERA_CONSENT_LIST_MAX; i++) {
+		enum u_camera_consent_enum_result r =
+		    reg_delegating_enum_fn(&e, i, name, sizeof(name), path, sizeof(path));
+		if (r == U_CAMERA_CONSENT_ENUM_END) {
 			break;
 		}
-		if (type == REG_SZ || type == REG_EXPAND_SZ) {
-			data[sizeof(data) - 1] = '\0';
-			cb(ctx, 'd', data, origin);
+		if (r == U_CAMERA_CONSENT_ENUM_ENTRY) {
+			cb(ctx, 'd', path, origin);
 		}
 	}
-	RegCloseKey(k);
+	reg_enum_close(&e);
 }
 
 void
 u_camera_consent_store_list(void (*cb)(void *ctx, char kind, const char *exe, const char *value), void *ctx)
 {
 	cb(ctx, 's', "", win_sharing_enabled(NULL) ? "on" : "off");
-	HKEY k;
-	if (RegOpenKeyExA(HKEY_CURRENT_USER, CONSENT_KEY "\\Apps", 0, KEY_READ, &k) == ERROR_SUCCESS) {
-		for (DWORD i = 0;; i++) {
-			char name[1024];
-			DWORD name_len = sizeof(name), type = 0, v = 0, v_len = sizeof(v);
-			if (RegEnumValueA(k, i, name, &name_len, NULL, &type, (LPBYTE)&v, &v_len) != ERROR_SUCCESS) {
+	struct reg_enum e;
+	if (reg_enum_open(&e, HKEY_CURRENT_USER, CONSENT_KEY L"\\Apps")) {
+		char exe[4096];
+		for (DWORD i = 0; i < U_CAMERA_CONSENT_LIST_MAX; i++) {
+			DWORD type = 0, dlen = 0;
+			enum u_camera_consent_enum_result r = reg_enum_at(&e, i, &type, &dlen);
+			if (r == U_CAMERA_CONSENT_ENUM_END) {
 				break;
 			}
-			if (type == REG_DWORD) {
-				cb(ctx, 'a', name, v == 1 ? "allow" : v == 2 ? "deny" : "?");
+			if (r != U_CAMERA_CONSENT_ENUM_ENTRY || type != REG_DWORD || dlen != sizeof(DWORD) ||
+			    !w_to_u8(e.name, (int)wcslen(e.name), exe, sizeof(exe))) {
+				continue;
 			}
+			DWORD v;
+			memcpy(&v, e.data, sizeof(v));
+			cb(ctx, 'a', exe, v == 1 ? "allow" : v == 2 ? "deny" : "?");
 		}
-		RegCloseKey(k);
+		reg_enum_close(&e);
 	}
 	win_list_delegating(HKEY_LOCAL_MACHINE, "system", cb, ctx);
 	win_list_delegating(HKEY_CURRENT_USER, "user", cb, ctx);
@@ -389,16 +512,17 @@ u_camera_consent_store_list(void (*cb)(void *ctx, char kind, const char *exe, co
 bool
 u_camera_consent_store_path(char *out, size_t cap)
 {
-	snprintf(out, cap, "HKCU\\%s", CONSENT_KEY);
+	snprintf(out, cap, "HKCU\\Software\\DisplayXR\\CameraConsent");
 	return true;
 }
 
 //! "Deny" in a ConsentStore Value means off; anything else (Allow, absent) is on.
 static bool
-consent_store_value_denies(HKEY root, const char *sub)
+consent_store_value_denies(HKEY root, const wchar_t *sub)
 {
-	char v[32];
-	return reg_read_string(root, sub, "Value", v, sizeof(v)) && _stricmp(v, "Deny") == 0;
+	wchar_t v[32];
+	return reg_read_string_w(root, sub, L"Value", v, (DWORD)(sizeof(v) / sizeof(v[0]))) &&
+	       _wcsicmp(v, L"Deny") == 0;
 }
 
 bool
@@ -407,19 +531,31 @@ u_camera_consent_os_camera_allowed(const char *exe)
 	// Global (policy, then user), then the desktop-app class, then this app.
 	if (consent_store_value_denies(HKEY_LOCAL_MACHINE, CAM_CONSENT_STORE_WEBCAM) ||
 	    consent_store_value_denies(HKEY_CURRENT_USER, CAM_CONSENT_STORE_WEBCAM) ||
-	    consent_store_value_denies(HKEY_CURRENT_USER, CAM_CONSENT_STORE_WEBCAM "\\NonPackaged")) {
+	    consent_store_value_denies(HKEY_CURRENT_USER, CAM_CONSENT_STORE_WEBCAM L"\\NonPackaged")) {
 		return false;
 	}
 	if (exe == NULL || exe[0] == '\0') {
 		return true;
 	}
-	char sub[1600];
-	int n = snprintf(sub, sizeof(sub), "%s\\NonPackaged\\", CAM_CONSENT_STORE_WEBCAM);
-	for (const char *p = exe; *p != '\0' && n < (int)sizeof(sub) - 1; p++) {
-		sub[n++] = (*p == '\\' || *p == '/') ? '#' : *p;
+	wchar_t *wexe = u8_to_w(exe);
+	if (wexe == NULL) {
+		return true; // not a path the OS could have stored an entry under
 	}
-	sub[n] = '\0';
-	return !consent_store_value_denies(HKEY_CURRENT_USER, sub);
+	static const wchar_t prefix[] = CAM_CONSENT_STORE_WEBCAM L"\\NonPackaged\\";
+	size_t plen = wcslen(prefix), elen = wcslen(wexe);
+	wchar_t *sub = (wchar_t *)malloc((plen + elen + 1) * sizeof(wchar_t));
+	bool denied = false;
+	if (sub != NULL) {
+		memcpy(sub, prefix, plen * sizeof(wchar_t));
+		for (size_t i = 0; i < elen; i++) {
+			sub[plen + i] = (wexe[i] == L'\\' || wexe[i] == L'/') ? L'#' : wexe[i];
+		}
+		sub[plen + elen] = L'\0';
+		denied = consent_store_value_denies(HKEY_CURRENT_USER, sub);
+		free(sub);
+	}
+	free(wexe);
+	return !denied;
 }
 
 #else // POSIX
@@ -431,6 +567,14 @@ u_camera_consent_os_camera_allowed(const char *exe)
  */
 
 #define CONSENT_FILE "camera_consent.json"
+
+//! POSIX paths compare byte-exact.
+static bool
+path_equal(const char *a, const char *b)
+{
+	return u_camera_consent_path_equal(a, b, false);
+}
+
 #ifdef XRT_OS_MACOS
 #define SYSTEM_DELEGATING_FILE "/Library/Application Support/DisplayXR/camera-delegating.json"
 #else

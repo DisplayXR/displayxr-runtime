@@ -127,3 +127,19 @@ exactly so that knowledge lives in one vendor DLL and nowhere else.
   development switch below the sharing-off checks — the R1 text had it as a stand-in to be
   deleted.
 
+## Amendment 2 (2026-10-06) — delegation never outranks a refusal
+
+As built in R3 (PR #1819) a registered consent-delegating client was allowed at the fourth step,
+**before** the OS camera privacy switch and before a Deny the user had stored for that executable
+— so once an installer registered a browser, it would get the camera with the OS switch off and
+a stored Deny silently ignored. That contradicted §B.3 of the roadmap and the pre-R3 spec, where
+OS consent applied to every consumer and delegation replaced only the DisplayXR prompt. No rationale
+for the order was recorded, and the plausible one ("the browser enforces the OS switch itself")
+does not hold: the service, not the browser, opens the camera, so the OS never sees the browser as
+a camera user.
+
+The order is now: sharing off / `DXR_STEREO_CAMERA=0` → (dev override) → no identity → **OS
+camera switch** → **stored Deny** → delegating client → stored Allow → Allow once → prompt
+(spec §7.1 is normative). Delegation means exactly "no runtime prompt and no stored per-app
+decision needed". `displayxr-cli camera trust` over a stored Deny clears it and says so (the
+user's newer explicit word); an installer's registration never touches the user's store.

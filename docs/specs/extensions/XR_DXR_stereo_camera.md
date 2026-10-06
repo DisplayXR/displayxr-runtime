@@ -356,11 +356,27 @@ at a time (so two apps never race two prompts):
 | 1 | Sharing off: `DXR_STEREO_CAMERA=0` in the service environment, or the user's **"Share the 3D camera with apps"** toggle (tray / menu bar, persisted in the store) | `XR_ERROR_STEREO_CAMERA_DISABLED_DXR` (and zero cameras enumerated) |
 | 2 | `DXR_STEREO_CAMERA_DEV_ALLOW=1` in the service environment — development override, one WARN per service run; **never** on a user's machine | allowed |
 | 3 | The peer executable could not be verified (`""`) | `XR_ERROR_STEREO_CAMERA_CONSENT_REFUSED_DXR` |
-| 4 | The executable is a registered **consent-delegating** client (a browser that shows its own per-origin prompt + in-use indicator): machine list written by its installer (`HKLM\Software\DisplayXR\CameraConsent\Delegating`, `/etc/displayxr/camera-delegating.json`, `/Library/Application Support/DisplayXR/camera-delegating.json`) or the user list (`displayxr-cli camera trust <exe>`) | allowed, no prompt, no store entry; never RAW (§7.5) |
-| 5 | The OS camera privacy switch denies this executable (Windows `CapabilityAccessManager\ConsentStore\webcam`: machine policy, user global, desktop-app class, per-app entry; no equivalent is readable on macOS / Linux) | `XR_ERROR_PERMISSION_INSUFFICIENT` |
-| 6 | The stored per-app decision (`HKCU\Software\DisplayXR\CameraConsent\Apps\<path>`, `camera_consent.json` `apps`) | Allow → allowed; Deny → `CONSENT_REFUSED` |
-| 7 | "Allow once" already granted to this same process (executable + pid) | allowed |
-| 8 | The **tray prompt**: *"<app> wants to use the 3D camera — Allow / Allow once / Deny"* (Windows: a top-most dialog from the tray thread; macOS: a floating panel from the menu-bar item — never a modal that would park the service's run loop). **Allow** and **Deny** are written to the store; **Allow once** is remembered for the process. The call blocks for up to 60 s; unanswered / dismissed, or no prompt available (`DXR_STEREO_CAMERA_PROMPT=0`, headless Linux service) | `CONSENT_REFUSED` — retryable, asked again next time |
+| 4 | The OS camera privacy switch denies this executable (Windows `CapabilityAccessManager\ConsentStore\webcam`: machine policy, user global, desktop-app class, per-app entry; no equivalent is readable on macOS / Linux) — **for every client, delegating ones included** | `XR_ERROR_PERMISSION_INSUFFICIENT` |
+| 5 | A stored per-app **Deny** (`HKCU\Software\DisplayXR\CameraConsent\Apps\<path>` = 2, `camera_consent.json` `apps`) — it beats a delegating registration, an installer's included | `CONSENT_REFUSED` |
+| 6 | The executable is a registered **consent-delegating** client (a browser that shows its own per-origin prompt + in-use indicator): machine list written by its installer (`HKLM\Software\DisplayXR\CameraConsent\Delegating`, `/etc/displayxr/camera-delegating.json`, `/Library/Application Support/DisplayXR/camera-delegating.json`) or the user list (`displayxr-cli camera trust <exe>`) | allowed, no prompt, no store entry; never RAW (§7.5) |
+| 7 | A stored per-app **Allow** | allowed |
+| 8 | "Allow once" already granted to this same process (executable + pid) | allowed |
+| 9 | The **tray prompt**: *"<app> wants to use the 3D camera — Allow / Allow once / Deny"* (Windows: a top-most dialog from the tray thread; macOS: a floating panel from the menu-bar item — never a modal that would park the service's run loop). **Allow** and **Deny** are written to the store; **Allow once** is remembered for the process. The call blocks for up to 60 s; unanswered / dismissed, or no prompt available (`DXR_STEREO_CAMERA_PROMPT=0`, headless Linux service) | `CONSENT_REFUSED` — retryable, asked again next time |
+
+**Delegation means exactly "no runtime prompt and no stored per-app decision needed" — nothing
+more.** It never outranks a refusal: the kill switches (row 1), the OS switch (row 4) and a stored
+Deny (row 5) apply to a delegating client exactly as to any other app. The OS switch matters most
+for it: the service, not the client, opens the camera, so the OS never sees the browser as a
+camera user and nothing else would enforce the user's switch. Each refusal keeps its own result
+(`DISABLED` / `PERMISSION_INSUFFICIENT` / `CONSENT_REFUSED`), so a browser can map them (§8).
+
+`displayxr-cli camera trust <exe>` over a stored Deny for the same executable **clears the Deny**
+and says so — `trust` is the user's newer, explicit word on that executable, as `allow` replacing
+a Deny is. An installer's machine-wide registration never touches the user's store: there the
+Deny keeps winning. `camera deny` on a delegating executable notes that the Deny wins.
+
+This table is the one statement of the order; `u_camera_consent.h`, the developer guide and the
+roadmap refer to it.
 
 A refused stream stays created and may be started again (e.g. after `displayxr-cli camera allow`).
 The policy is pure (two injected vtables) and unit-tested with fakes in `tests_camera_consent`.
@@ -435,7 +451,7 @@ The service queues, per connection (16 deep, oldest dropped), and the client dra
 |---|---|
 | `XR_STEREO_CAMERA_FRAME_NOT_READY_DXR` (success) | no frame newer than the last acquired |
 | `XR_ERROR_VALIDATION_FAILURE` | struct out of contract (unknown camera, format/transport not in the supported bits, RECTIFIED on an uncalibrated camera) |
-| `XR_ERROR_PERMISSION_INSUFFICIENT` | the OS camera privacy switch denies the app (§7.1 step 5); RAW asked by a browser / delegating client; a client class that may not use cameras (or `xrCreateSession` from a `CAMERA_CONSUMER`) |
+| `XR_ERROR_PERMISSION_INSUFFICIENT` | the OS camera privacy switch denies the app (§7.1 row 4, delegating clients included); RAW asked by a browser / delegating client; a client class that may not use cameras (or `xrCreateSession` from a `CAMERA_CONSUMER`) |
 | `XR_ERROR_STEREO_CAMERA_CONSENT_REFUSED_DXR` | §7.1: the user / the stored decision refused, the prompt was unanswered or unavailable; retryable after consent. A browser maps it to `NotAllowedError` |
 | `XR_ERROR_STEREO_CAMERA_DISABLED_DXR` | §7.4: sharing is off (user toggle or `DXR_STEREO_CAMERA=0`) |
 | `XR_ERROR_STEREO_CAMERA_BUSY_DXR` | the plug-in could not open the source and its retry is pending; retry later. A browser maps it to `NotReadableError` |
