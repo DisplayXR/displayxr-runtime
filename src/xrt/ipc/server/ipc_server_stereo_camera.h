@@ -70,6 +70,18 @@ typedef enum u_camera_consent_prompt_answer (*ipc_server_stereo_camera_prompt_fn
 void
 ipc_server_stereo_camera_set_prompt_provider(ipc_server_stereo_camera_prompt_fn fn, void *ctx);
 
+/*!
+ * A notice for the user, no answer expected (Windows: a tray balloon). Raised
+ * the first time in a service run that a USER-level consent-delegation entry
+ * allows an executable (spec §7.1.1) — @p exe is the executable, @p app_name
+ * the client's declared name. Called on an IPC client thread with the consent
+ * serialisation held: must NOT block (copy the strings, post, return).
+ */
+typedef void (*ipc_server_stereo_camera_notice_fn)(void *ctx, const char *exe, const char *app_name);
+
+void
+ipc_server_stereo_camera_set_notice_provider(ipc_server_stereo_camera_notice_fn fn, void *ctx);
+
 //! Called (no lock held) whenever the in-use state may have changed.
 typedef void (*ipc_server_stereo_camera_indicator_fn)(void *ctx);
 

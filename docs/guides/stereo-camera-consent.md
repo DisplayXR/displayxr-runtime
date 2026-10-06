@@ -53,7 +53,11 @@ this is the same order in developer terms.
 5. A stored **Deny** for your executable (the user answered Deny before, or ran
    `displayxr-cli camera deny`) → `CONSENT_REFUSED`, even if you are a registered delegating
    client.
-6. You are a **registered delegating client** → allowed, no prompt, nothing stored.
+6. You are a **registered delegating client** → allowed, no prompt, nothing stored. Skipped —
+   you go on to 7–9 like any other app — when your instance set
+   `XR_STEREO_CAMERA_CLIENT_DECLINE_DELEGATION_BIT_DXR` (spec v3, §4), or when your entry is not
+   trusted: your executable is in a **user-writable** location and the entry does not record a
+   signer that your valid Authenticode signature matches (§4, spec §7.1.1).
 7. A stored **Allow** for your executable (the user answered before, or an admin pre-seeded it)
    → allowed.
 8. The user chose **Allow once** earlier for this very process → allowed.
@@ -86,7 +90,9 @@ If you are a window-bearing client (an ordinary app, or a present-owner), frames
 only while your process **owns a visible, non-minimised top-level window** (checked every
 250 ms). Otherwise your stream is `SUSPENDED`: no new frames, and the frame you had pinned is
 cleared so nothing lingers. Camera-only and delegating clients are exempt — the browser's own
-tab rule applies to its pages.
+tab rule applies to its pages. (Delegating means the stream was allowed *by* delegation: a
+registered client that declined delegation, or whose entry is not trusted, is an ordinary app
+here too.)
 
 Every stream, of every client, is suspended while the **OS session is locked or switched away**
 (Windows lock / disconnect, macOS screen lock / fast user switch) and resumes afterwards. You
@@ -104,13 +110,35 @@ should not ask a second time per page. Register the browser's **executable path*
   Linux `/etc/displayxr/camera-delegating.json`; macOS
   `/Library/Application Support/DisplayXR/camera-delegating.json` — both
   `{"delegating": ["/full/path/to/browser", …]}`.
-- **Per user / development:** `displayxr-cli camera trust <exe>` (or `--self`), which writes the
-  user-level list (`HKCU\…\CameraConsent\Delegating`, `~/.config/…/camera_consent.json`).
-  If the user had stored a Deny for that executable, `trust` clears it and says so; an
-  installer's registration never does — a user's Deny beats it.
+- **Per user / development:** `displayxr-cli camera trust <exe> [--signer "<CN>"]` (or
+  `--self`), which writes the user-level list (`HKCU\…\CameraConsent\Delegating`,
+  `~/.config/…/camera_consent.json`). If the user had stored a Deny for that executable, `trust`
+  clears it and says so; an installer's registration never does — a user's Deny beats it.
+  The **first** time a user-level entry lets an executable in (per service run), the service
+  logs a WARN and Windows shows a tray balloon (*"3D camera: per-user trust used"*), so a
+  per-user registration is never silent. Machine-level (installer) entries are.
 
 Registration means **no runtime prompt and no stored decision needed** — nothing more. Sharing
 off, the OS camera switch and a stored Deny still refuse you, each with its own result (§2).
+
+**User-writable install locations need a signer (spec v3, Windows).** If your executable is
+*not* under `%ProgramFiles%`, `%ProgramFiles(x86)%` or `%SystemRoot%` — a per-user install in
+`%LOCALAPPDATA%`, a dev tree — any process of the user could drop a different binary at that
+path, so the path alone is not trusted. The entry must also record the **signer CN** of your
+Authenticode certificate, as a sibling `REG_SZ` named `<valueName>.signer` in the same
+`Delegating` key, and your executable must carry a valid signature by exactly that signer
+(`WinVerifyTrust`, no revocation / network fetch; CN compared ASCII-case-insensitively). No
+signer recorded, unsigned, or signed by someone else → the entry is ignored for that start (one
+WARN per run says which) and you are prompted like any app. `displayxr-cli camera signer <exe>`
+prints what the runtime sees (path class + signer CN). On macOS / Linux delegation is
+path-only for now.
+
+**Declining delegation (spec v3).** When your browser runs with its own permission prompt
+bypassed — automation, a test harness, an auto-grant switch — it must not let the runtime take
+that missing prompt as consent. Chain `XrStereoCameraClientInfoDXR` with
+`XR_STEREO_CAMERA_CLIENT_DECLINE_DELEGATION_BIT_DXR` (alongside `CONSUMER_ONLY`) for that
+instance: the runtime then requires a stored decision or its own prompt (§2 steps 7–9). Try it
+without a browser: `displayxr-cli camera probe --decline-delegation`.
 
 Obligations that come with it: prompt the user yourself before opening a stream, show your own
 in-use indicator, stop the stream when your page stops capturing, and never expose raw
@@ -131,20 +159,22 @@ entries. Rules, all of which follow from how the runtime checks the entry:
    `/proc/<pid>/exe`, macOS `proc_pidpath`) — never by anything the client sends. In a
    multi-process browser that is the process that calls `xrStartStereoCameraStreamDXR` (typically
    a video-capture utility process), whose image is usually the browser's main executable.
-2. **Trust is by full path only** — no signature or hash check in this version. So register only a
-   path inside a directory that only an administrator / root can write (Windows `%ProgramFiles%`;
-   a root-owned prefix such as `/usr` or `/opt/<vendor>` on Linux). An entry pointing into a
-   user-writable directory lets any unelevated process drop an executable there and inherit the
-   trust. If the user installs to such a location, register nothing; the runtime then asks once.
-   Note that macOS `/Applications` is writable by any admin-group user without elevation.
+2. **Prefer an admin-protected path.** Under `%ProgramFiles%`, `%ProgramFiles(x86)%` or
+   `%SystemRoot%` the full path alone is trusted. **Anywhere else** (Windows) also write the
+   `<valueName>.signer` `REG_SZ` with your Authenticode signer CN — without it the runtime
+   ignores the entry (spec §7.1.1). Do this even for a path the rule counts as protected if your
+   installer loosens that directory's ACL. On Linux / macOS trust is still by full path only, so
+   register only a root-owned prefix such as `/usr` or `/opt/<vendor>`; if the user installs to a
+   user-writable location there, register nothing and the runtime asks once. Note that macOS
+   `/Applications` is writable by any admin-group user without elevation.
 3. **Protect the entry itself.** `HKLM\Software` is admin-only by default; the POSIX system file
    must be root-owned and not group/world-writable (mode `0644`) — the runtime does not check its
    ownership.
 4. **Windows specifics.** Write the **64-bit registry view** (a 32-bit installer such as NSIS needs
    `SetRegView 64`; otherwise the value lands under `WOW6432Node`, which the runtime never reads).
    The value **name** is free: use your product name, so it is unique to you and identifies the
-   entry to an admin. Keep the name under 256 characters and the path under 1024 bytes and in
-   ASCII — the current reader enumerates with the ANSI registry API and fixed buffers.
+   entry to an admin. Do not end it in `.signer` — that suffix names an entry's signer
+   companion, never an entry. Keep the signer CN under 256 characters.
 5. **POSIX specifics.** The JSON file is shared by every installer: read it, add your path to
    `delegating` if absent, write it back atomically; never rewrite other entries.
 6. **Uninstall removes only what you wrote** — your value (Windows) or your path (POSIX), and only
@@ -152,11 +182,14 @@ entries. Rules, all of which follow from how the runtime checks the entry:
    the JSON file only if nothing else is left in it.
 7. **No restart needed.** The service reads the entry at every stream start and calibration read,
    so a registration or removal takes effect on the next one.
-8. **Know what you are asking for.** A delegating client is evaluated at §7.1 step 4, before the
-   Windows camera privacy switch (step 5) and before a stored decision (step 6): a user's earlier
-   runtime *Deny* for that executable no longer applies, and `displayxr-cli camera untrust` only
-   edits the user list, not yours. The user's remaining runtime controls are *"Share the 3D camera
-   with apps"* and *"Stop camera sharing"*. Register only software that really prompts per origin.
+8. **Know what you are asking for.** A delegating client is evaluated at §7.1 step 6, *after*
+   the OS camera privacy switch (step 4) and a stored Deny (step 5), which keep refusing it, but
+   before a stored Allow or the prompt: the runtime never asks the user about that executable
+   again, and `displayxr-cli camera untrust` only edits the user list, not yours. The user's
+   remaining runtime controls are a Deny, *"Share the 3D camera with apps"* and *"Stop camera
+   sharing"*. Register only software that really prompts per origin — and make it set
+   `DECLINE_DELEGATION` whenever that prompt is bypassed.
+9. **Uninstall removes the signer too** — the `<valueName>.signer` companion with its entry.
 
 ## 5. What the user can do to you at any time
 
@@ -187,6 +220,9 @@ displayxr-cli camera fake-lock off
 displayxr-cli camera stop-all               # a running probe prints "ENDED … USER_STOPPED", exits 8
 displayxr-cli camera sharing off            # zero cameras; start -> DISABLED (exit 6)
 displayxr-cli camera consent                # what is stored, and this CLI's own path
+displayxr-cli camera signer --self          # path class + Authenticode signer (exit 3: unsigned)
+displayxr-cli camera trust --self --signer "Your Corp"   # user-level entry with a signer
+displayxr-cli camera probe --decline-delegation          # as a browser in automation mode
 ```
 
 `DXR_STEREO_CAMERA_DEV_ALLOW=1` on the service skips consent for everything (loud WARN) — use

@@ -10,7 +10,12 @@
  *     Secret       REG_BINARY  32 bytes, generated once — keys persistentId
  *     Apps\        REG_DWORD   value NAME = full executable path, data 1 = Allow, 2 = Deny
  *     Delegating\  REG_SZ      value name = any id, data = executable path (user-level list,
- *                              `displayxr-cli camera trust`)
+ *                              `displayxr-cli camera trust [--signer CN]`)
+ *                  REG_SZ      value name = "<id>.signer", data = the signer CN the entry
+ *                              requires (optional; spec §7.1.1 — only consulted when the
+ *                              executable's path is user-writable, i.e. not under
+ *                              %ProgramFiles%, %ProgramFiles(x86)% or %SystemRoot%).
+ *                              Never itself an entry, whatever its data.
  *   HKLM\Software\DisplayXR\CameraConsent\Delegating   same shape, written by installers
  *   The OS camera privacy switch is read from CapabilityAccessManager\ConsentStore\webcam
  *   (HKLM global policy, HKCU global, NonPackaged = desktop apps, and the per-app entry
@@ -24,6 +29,9 @@
  *   Linux  /etc/displayxr/camera-delegating.json
  *   macOS  /Library/Application Support/DisplayXR/camera-delegating.json
  *   {"delegating": ["<exe>", ...]}
+ * POSIX delegation is PATH-ONLY for now: no signer is recorded and
+ * u_camera_consent_path_user_writable() answers false (no code-signature
+ * check exists here yet — a follow-up for macOS codesign / Linux).
  *
  * Paths compare with u_camera_consent_path_equal(): Windows ASCII-case-
  * insensitively with either separator, POSIX byte-exact. On Windows every
@@ -49,6 +57,11 @@
 #endif
 #include <windows.h>
 #include <bcrypt.h>
+#include <knownfolders.h>
+#include <shlobj.h>
+#include <softpub.h>
+#include <wincrypt.h>
+#include <wintrust.h>
 #else
 #include "util/u_file.h"
 #include "util/u_json.h"
@@ -288,6 +301,43 @@ reg_enum_at(struct reg_enum *e, DWORD i, DWORD *type, DWORD *data_len)
 	return U_CAMERA_CONSENT_ENUM_ENTRY;
 }
 
+#define SIGNER_SUFFIX L".signer"
+
+//! Is @p name an entry's "<id>.signer" companion value (case-insensitive suffix)?
+static bool
+is_signer_value_name(const wchar_t *name)
+{
+	size_t n = wcslen(name), s = wcslen(SIGNER_SUFFIX);
+	return n > s && _wcsicmp(name + (n - s), SIGNER_SUFFIX) == 0;
+}
+
+/*!
+ * Read the "<id>.signer" REG_SZ next to delegating entry @p id_u8 under
+ * @p root's Delegating key into @p out (UTF-8); "" when absent / unusable.
+ */
+static void
+read_entry_signer(HKEY root, const char *id_u8, char *out, size_t cap)
+{
+	out[0] = '\0';
+	wchar_t *wid = u8_to_w(id_u8);
+	if (wid == NULL) {
+		return;
+	}
+	size_t n = wcslen(wid) + wcslen(SIGNER_SUFFIX) + 1;
+	wchar_t *vname = (wchar_t *)malloc(n * sizeof(wchar_t));
+	if (vname != NULL) {
+		_snwprintf_s(vname, n, _TRUNCATE, L"%ls%ls", wid, SIGNER_SUFFIX);
+		wchar_t w[U_CAMERA_CONSENT_SIGNER_MAX];
+		if (reg_read_string_w(root, CONSENT_KEY L"\\Delegating", vname, w, (DWORD)(sizeof(w) / sizeof(w[0])))) {
+			if (!w_to_u8(w, (int)wcslen(w), out, cap)) {
+				out[0] = '\0';
+			}
+		}
+		free(vname);
+	}
+	free(wid);
+}
+
 //! u_camera_consent_enum_fn over a Delegating key: value DATA = executable path.
 static enum u_camera_consent_enum_result
 reg_delegating_enum_fn(void *ctx, uint32_t index, char *name, size_t name_cap, char *path, size_t path_cap)
@@ -300,6 +350,9 @@ reg_delegating_enum_fn(void *ctx, uint32_t index, char *name, size_t name_cap, c
 	}
 	if (type != REG_SZ && type != REG_EXPAND_SZ) {
 		return U_CAMERA_CONSENT_ENUM_SKIP;
+	}
+	if (is_signer_value_name(e->name)) {
+		return U_CAMERA_CONSENT_ENUM_SKIP; // an entry's signer, not an entry
 	}
 	const wchar_t *wd = (const wchar_t *)e->data;
 	if (!w_to_u8(wd, (int)wcslen(wd), path, path_cap) || !w_to_u8(e->name, (int)wcslen(e->name), name, name_cap)) {
@@ -360,10 +413,27 @@ win_set(void *ctx, const char *exe, enum u_camera_consent_stored value)
 }
 
 static bool
-win_is_delegating(void *ctx, const char *exe)
+win_get_delegation(void *ctx, const char *exe, struct u_camera_consent_delegation *out)
 {
 	(void)ctx;
-	return win_delegating_has(HKEY_LOCAL_MACHINE, exe, NULL, 0) || win_delegating_has(HKEY_CURRENT_USER, exe, NULL, 0);
+	memset(out, 0, sizeof(*out));
+	static const struct
+	{
+		HKEY root;
+		enum u_camera_consent_delegation_scope scope;
+	} lists[2] = {
+	    {HKEY_LOCAL_MACHINE, U_CAMERA_CONSENT_DELEGATION_SYSTEM}, // the installer's list wins
+	    {HKEY_CURRENT_USER, U_CAMERA_CONSENT_DELEGATION_USER},
+	};
+	for (int i = 0; i < 2; i++) {
+		char id[1024];
+		if (win_delegating_has(lists[i].root, exe, id, sizeof(id))) {
+			out->scope = lists[i].scope;
+			read_entry_signer(lists[i].root, id, out->signer, sizeof(out->signer));
+			return true;
+		}
+	}
+	return false;
 }
 
 static bool
@@ -408,7 +478,7 @@ win_get_secret(void *ctx, uint8_t out[U_CAMERA_CONSENT_SECRET_SIZE])
 static const struct u_camera_consent_store_ops win_ops = {
     .get = win_get,
     .set = win_set,
-    .is_delegating = win_is_delegating,
+    .get_delegation = win_get_delegation,
     .sharing_enabled = win_sharing_enabled,
     .set_sharing_enabled = win_set_sharing_enabled,
     .get_secret = win_get_secret,
@@ -420,43 +490,82 @@ u_camera_consent_store_default(void)
 	return &win_ops;
 }
 
+//! Set (non-empty @p signer_u8) or delete the "<id>.signer" companion of entry @p id (open key @p k).
+static bool
+write_entry_signer(HKEY k, const wchar_t *id, const char *signer_u8)
+{
+	size_t n = wcslen(id) + wcslen(SIGNER_SUFFIX) + 1;
+	wchar_t *vname = (wchar_t *)malloc(n * sizeof(wchar_t));
+	if (vname == NULL) {
+		return false;
+	}
+	_snwprintf_s(vname, n, _TRUNCATE, L"%ls%ls", id, SIGNER_SUFFIX);
+	bool ok;
+	if (signer_u8 == NULL || signer_u8[0] == '\0') {
+		LSTATUS rc = RegDeleteValueW(k, vname);
+		ok = rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND;
+	} else {
+		wchar_t *ws = u8_to_w(signer_u8);
+		ok = ws != NULL && RegSetValueExW(k, vname, 0, REG_SZ, (const BYTE *)ws,
+		                                  (DWORD)((wcslen(ws) + 1) * sizeof(wchar_t))) == ERROR_SUCCESS;
+		free(ws);
+	}
+	free(vname);
+	return ok;
+}
+
 bool
-u_camera_consent_store_set_delegating(const char *exe, bool delegating)
+u_camera_consent_store_set_delegating(const char *exe, bool delegating, const char *signer)
 {
 	char name[1024];
 	bool present = win_delegating_has(HKEY_CURRENT_USER, exe, name, sizeof(name));
-	if (!delegating) {
-		if (!present) {
-			return true;
-		}
-		wchar_t *wname = u8_to_w(name);
-		bool ok = wname != NULL && reg_delete_value(HKEY_CURRENT_USER, CONSENT_KEY L"\\Delegating", wname);
-		free(wname);
-		return ok;
-	}
+	wchar_t *wid = NULL;
 	if (present) {
-		return true;
-	}
-	wchar_t *wexe = u8_to_w(exe);
-	if (wexe == NULL) {
-		return false;
-	}
-	// Value name: the executable's base name (unique enough; data is what matters).
-	const wchar_t *base = wexe;
-	for (const wchar_t *p = wexe; *p != L'\0'; p++) {
-		if (*p == L'\\' || *p == L'/') {
-			base = p + 1;
+		wid = u8_to_w(name);
+		if (wid == NULL) {
+			return false;
+		}
+	} else if (!delegating) {
+		return true; // nothing to remove
+	} else {
+		// New entry. Value name: the executable's base name (unique enough; data is what matters).
+		wchar_t *wexe = u8_to_w(exe);
+		if (wexe == NULL) {
+			return false;
+		}
+		const wchar_t *base = wexe;
+		for (const wchar_t *p = wexe; *p != L'\0'; p++) {
+			if (*p == L'\\' || *p == L'/') {
+				base = p + 1;
+			}
+		}
+		wid = _wcsdup(base);
+		free(wexe);
+		if (wid == NULL) {
+			return false;
 		}
 	}
 	HKEY k;
 	bool ok = false;
-	if (RegCreateKeyExW(HKEY_CURRENT_USER, CONSENT_KEY L"\\Delegating", 0, NULL, 0, KEY_WRITE, NULL, &k, NULL) ==
-	    ERROR_SUCCESS) {
-		DWORD bytes = (DWORD)((wcslen(wexe) + 1) * sizeof(wchar_t));
-		ok = RegSetValueExW(k, base, 0, REG_SZ, (const BYTE *)wexe, bytes) == ERROR_SUCCESS;
+	if (RegCreateKeyExW(HKEY_CURRENT_USER, CONSENT_KEY L"\\Delegating", 0, NULL, 0, KEY_READ | KEY_WRITE, NULL, &k,
+	                    NULL) == ERROR_SUCCESS) {
+		if (!delegating) {
+			LSTATUS rc = RegDeleteValueW(k, wid);
+			ok = (rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND) && write_entry_signer(k, wid, NULL);
+		} else {
+			ok = true;
+			if (!present) {
+				wchar_t *wexe = u8_to_w(exe);
+				ok = wexe != NULL &&
+				     RegSetValueExW(k, wid, 0, REG_SZ, (const BYTE *)wexe,
+				                    (DWORD)((wcslen(wexe) + 1) * sizeof(wchar_t))) == ERROR_SUCCESS;
+				free(wexe);
+			}
+			ok = ok && write_entry_signer(k, wid, signer);
+		}
 		RegCloseKey(k);
 	}
-	free(wexe);
+	free(wid);
 	return ok;
 }
 
@@ -476,7 +585,15 @@ win_list_delegating(HKEY root, const char *origin, void (*cb)(void *, char, cons
 			break;
 		}
 		if (r == U_CAMERA_CONSENT_ENUM_ENTRY) {
-			cb(ctx, 'd', path, origin);
+			char signer[U_CAMERA_CONSENT_SIGNER_MAX];
+			read_entry_signer(root, name, signer, sizeof(signer));
+			char value[U_CAMERA_CONSENT_SIGNER_MAX + 64];
+			if (signer[0] != '\0') {
+				snprintf(value, sizeof(value), "%s, signer \"%s\"", origin, signer);
+			} else {
+				snprintf(value, sizeof(value), "%s, no signer", origin);
+			}
+			cb(ctx, 'd', path, value);
 		}
 	}
 	reg_enum_close(&e);
@@ -556,6 +673,91 @@ u_camera_consent_os_camera_allowed(const char *exe)
 	}
 	free(wexe);
 	return !denied;
+}
+
+//! A known folder as UTF-8 into @p out; false if unavailable.
+static bool
+known_folder_u8(REFKNOWNFOLDERID id, char *out, size_t cap)
+{
+	PWSTR w = NULL;
+	bool ok = false;
+	if (SUCCEEDED(SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, NULL, &w)) && w != NULL) {
+		ok = w_to_u8(w, (int)wcslen(w), out, cap) && out[0] != '\0';
+	}
+	CoTaskMemFree(w);
+	return ok;
+}
+
+bool
+u_camera_consent_path_user_writable(const char *exe)
+{
+	if (exe == NULL || exe[0] == '\0') {
+		return true;
+	}
+	// Admin-protected roots (spec §7.1.1). Known caveat, documented there: a
+	// few subfolders of %SystemRoot% (Temp, Tasks, ...) and any install dir
+	// whose ACL an installer loosened are writable all the same; the path
+	// rule is the cheap 99% gate, the signer check covers everything else.
+	static const KNOWNFOLDERID *const roots[] = {&FOLDERID_ProgramFiles, &FOLDERID_ProgramFilesX86,
+	                                             &FOLDERID_Windows};
+	for (size_t i = 0; i < sizeof(roots) / sizeof(roots[0]); i++) {
+		char dir[1024];
+		if (known_folder_u8(roots[i], dir, sizeof(dir)) && u_camera_consent_path_is_under(exe, dir, true)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool
+u_camera_consent_exe_signer(const char *exe, char *out, size_t cap)
+{
+	if (cap > 0) {
+		out[0] = '\0';
+	}
+	if (exe == NULL || exe[0] == '\0' || cap == 0) {
+		return false;
+	}
+	wchar_t *wexe = u8_to_w(exe);
+	if (wexe == NULL) {
+		return false;
+	}
+	WINTRUST_FILE_INFO fi;
+	memset(&fi, 0, sizeof(fi));
+	fi.cbStruct = sizeof(fi);
+	fi.pcwszFilePath = wexe;
+
+	WINTRUST_DATA wd;
+	memset(&wd, 0, sizeof(wd));
+	wd.cbStruct = sizeof(wd);
+	wd.dwUIChoice = WTD_UI_NONE;
+	wd.fdwRevocationChecks = WTD_REVOKE_NONE;
+	wd.dwUnionChoice = WTD_CHOICE_FILE;
+	wd.pFile = &fi;
+	wd.dwStateAction = WTD_STATEACTION_VERIFY;
+	// Never touch the network: the service must not stall a stream start on a
+	// CRL / AIA fetch. Revocation is not checked (WTD_REVOKE_NONE) and any URL
+	// retrieval is cache-only.
+	wd.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL | WTD_REVOCATION_CHECK_NONE;
+
+	GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+	LONG st = WinVerifyTrust((HWND)INVALID_HANDLE_VALUE, &action, &wd);
+	bool ok = false;
+	if (st == ERROR_SUCCESS) {
+		CRYPT_PROVIDER_DATA *pd = WTHelperProvDataFromStateData(wd.hWVTStateData);
+		CRYPT_PROVIDER_SGNR *sg = pd != NULL ? WTHelperGetProvSignerFromChain(pd, 0, FALSE, 0) : NULL;
+		CRYPT_PROVIDER_CERT *pc = sg != NULL ? WTHelperGetProvCertFromChain(sg, 0) : NULL;
+		if (pc != NULL && pc->pCert != NULL) {
+			wchar_t cn[U_CAMERA_CONSENT_SIGNER_MAX];
+			DWORD n = CertGetNameStringW(pc->pCert, CERT_NAME_ATTR_TYPE, 0, (void *)szOID_COMMON_NAME, cn,
+			                             (DWORD)(sizeof(cn) / sizeof(cn[0])));
+			ok = n > 1 && w_to_u8(cn, (int)wcslen(cn), out, cap) && out[0] != '\0';
+		}
+	}
+	wd.dwStateAction = WTD_STATEACTION_CLOSE;
+	WinVerifyTrust((HWND)INVALID_HANDLE_VALUE, &action, &wd);
+	free(wexe);
+	return ok;
 }
 
 #else // POSIX
@@ -703,24 +905,29 @@ load_system(void)
 	return root;
 }
 
+//! Path-only (no signer is recorded on POSIX yet): the system list wins over the user's.
 static bool
-posix_is_delegating(void *ctx, const char *exe)
+posix_get_delegation(void *ctx, const char *exe, struct u_camera_consent_delegation *out)
 {
 	(void)ctx;
-	bool yes = false;
+	memset(out, 0, sizeof(*out));
 	cJSON *sys = load_system();
 	if (sys != NULL) {
-		yes = delegating_array_has(cJSON_GetObjectItem(sys, "delegating"), exe);
+		if (delegating_array_has(cJSON_GetObjectItem(sys, "delegating"), exe)) {
+			out->scope = U_CAMERA_CONSENT_DELEGATION_SYSTEM;
+		}
 		cJSON_Delete(sys);
 	}
-	if (!yes) {
+	if (out->scope == U_CAMERA_CONSENT_DELEGATION_NONE) {
 		cJSON *user = load_user(false);
 		if (user != NULL) {
-			yes = delegating_array_has(cJSON_GetObjectItem(user, "delegating"), exe);
+			if (delegating_array_has(cJSON_GetObjectItem(user, "delegating"), exe)) {
+				out->scope = U_CAMERA_CONSENT_DELEGATION_USER;
+			}
 			cJSON_Delete(user);
 		}
 	}
-	return yes;
+	return out->scope != U_CAMERA_CONSENT_DELEGATION_NONE;
 }
 
 static bool
@@ -805,7 +1012,7 @@ posix_get_secret(void *ctx, uint8_t out[U_CAMERA_CONSENT_SECRET_SIZE])
 static const struct u_camera_consent_store_ops posix_ops = {
     .get = posix_get,
     .set = posix_set,
-    .is_delegating = posix_is_delegating,
+    .get_delegation = posix_get_delegation,
     .sharing_enabled = posix_sharing_enabled,
     .set_sharing_enabled = posix_set_sharing_enabled,
     .get_secret = posix_get_secret,
@@ -818,8 +1025,9 @@ u_camera_consent_store_default(void)
 }
 
 bool
-u_camera_consent_store_set_delegating(const char *exe, bool delegating)
+u_camera_consent_store_set_delegating(const char *exe, bool delegating, const char *signer)
 {
+	(void)signer; // POSIX delegation is path-only for now (see the file comment)
 	cJSON *root = load_user(true);
 	if (root == NULL) {
 		return false;
@@ -889,6 +1097,26 @@ u_camera_consent_os_camera_allowed(const char *exe)
 {
 	(void)exe;
 	return true; // the OS switch (macOS TCC) does not see this consumer: nothing to read
+}
+
+bool
+u_camera_consent_path_user_writable(const char *exe)
+{
+	// Path-only delegation on POSIX for now: no code-signature check exists
+	// here yet (macOS SecStaticCode / Linux: follow-up), so a "user-writable"
+	// answer could only ever refuse. Documented in spec §7.1.1.
+	(void)exe;
+	return false;
+}
+
+bool
+u_camera_consent_exe_signer(const char *exe, char *out, size_t cap)
+{
+	(void)exe;
+	if (cap > 0) {
+		out[0] = '\0';
+	}
+	return false;
 }
 
 #endif

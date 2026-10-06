@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | **Extension Name** | `XR_DXR_stereo_camera` |
-| **Spec Version** | 1 |
+| **Spec Version** | 3 |
 | **Extension Type** | Instance extension, service path only (an in-process instance enumerates zero cameras) |
 | **Header** | [`src/external/openxr_includes/openxr/XR_DXR_stereo_camera.h`](../../../src/external/openxr_includes/openxr/XR_DXR_stereo_camera.h) (+ its `index.json` catalog note) |
 | **Status** | **R1 implemented** (runtime, hardware-free): header, plug-in slots, service camera manager, IPC, OpenXR entry points, sim_display fake, `displayxr-cli camera`, selftest check. **R2 implemented**: the service-side rectifier (`u_stereo_rectify`, CPU) — RECTIFIED frames + rectified calibration from any CALIBRATED source, golden-tested against OpenCV, and a distorted sim fake with ground truth. **Not yet:** consent / indicator / foreground rule (R3 — deny-by-default hooks in place), GPU transports (the rectifier has the seam), state-change events, the Leia provider (L1), the browser (B1). Provisional type values `1004999300–310` (relocated from `290–300` when `XR_DXR_weave` v14 took `290`; `XR_DXR_lift` holds `270–289`), pending Khronos registry |
@@ -87,6 +87,14 @@ declaration outranks the `XR_DXR_weave`-derived present-owner claim: a capture u
 enables both is still a camera consumer. A hybrid runtime always routes a declared consumer to
 the service (an in-process instance has no cameras). Without the declaration the instance is
 classed as before (APP, or PRESENT_OWNER when it enables `XR_DXR_weave`).
+
+**Declining delegation (spec v3).** A registered consent-delegating client (§7.1 row 6) that is
+running with its own permission prompt bypassed — automation, a test harness, an auto-grant
+switch such as a browser's `--use-fake-ui-for-media-stream` — sets
+`XR_STEREO_CAMERA_CLIENT_DECLINE_DELEGATION_BIT_DXR` in the same `flags`. For that instance the
+runtime skips row 6: the executable needs a stored decision or the runtime's own prompt, like any
+other app (§7.1). The bit only ever restricts, so it needs no verification; it combines freely
+with `CONSUMER_ONLY`. Unknown bits are ignored.
 
 ## 3. Enumerating cameras
 
@@ -358,7 +366,7 @@ at a time (so two apps never race two prompts):
 | 3 | The peer executable could not be verified (`""`) | `XR_ERROR_STEREO_CAMERA_CONSENT_REFUSED_DXR` |
 | 4 | The OS camera privacy switch denies this executable (Windows `CapabilityAccessManager\ConsentStore\webcam`: machine policy, user global, desktop-app class, per-app entry; no equivalent is readable on macOS / Linux) — **for every client, delegating ones included** | `XR_ERROR_PERMISSION_INSUFFICIENT` |
 | 5 | A stored per-app **Deny** (`HKCU\Software\DisplayXR\CameraConsent\Apps\<path>` = 2, `camera_consent.json` `apps`) — it beats a delegating registration, an installer's included | `CONSENT_REFUSED` |
-| 6 | The executable is a registered **consent-delegating** client (a browser that shows its own per-origin prompt + in-use indicator): machine list written by its installer (`HKLM\Software\DisplayXR\CameraConsent\Delegating`, `/etc/displayxr/camera-delegating.json`, `/Library/Application Support/DisplayXR/camera-delegating.json`) or the user list (`displayxr-cli camera trust <exe>`) | allowed, no prompt, no store entry; never RAW (§7.5) |
+| 6 | The executable is a registered **consent-delegating** client (a browser that shows its own per-origin prompt + in-use indicator): machine list written by its installer (`HKLM\Software\DisplayXR\CameraConsent\Delegating`, `/etc/displayxr/camera-delegating.json`, `/Library/Application Support/DisplayXR/camera-delegating.json`) or the user list (`displayxr-cli camera trust <exe>`) — **unless** the client set `XR_STEREO_CAMERA_CLIENT_DECLINE_DELEGATION_BIT_DXR` (§2a), or the entry is not trusted (§7.1.1). A skipped row 6 falls through to rows 7–9 exactly as for an unregistered app | allowed, no prompt, no store entry; never RAW (§7.5) |
 | 7 | A stored per-app **Allow** | allowed |
 | 8 | "Allow once" already granted to this same process (executable + pid) | allowed |
 | 9 | The **tray prompt**: *"<app> wants to use the 3D camera — Allow / Allow once / Deny"* (Windows: a top-most dialog from the tray thread; macOS: a floating panel from the menu-bar item — never a modal that would park the service's run loop). **Allow** and **Deny** are written to the store; **Allow once** is remembered for the process. The call blocks for up to 60 s; unanswered / dismissed, or no prompt available (`DXR_STEREO_CAMERA_PROMPT=0`, headless Linux service) | `CONSENT_REFUSED` — retryable, asked again next time |
@@ -378,6 +386,47 @@ Deny keeps winning. `camera deny` on a delegating executable notes that the Deny
 This table is the one statement of the order; `u_camera_consent.h`, the developer guide and the
 roadmap refer to it.
 
+#### 7.1.1 Trusting a delegating entry (spec v3)
+
+An entry names an executable by full path, and a path is only an identity where nobody but an
+administrator can put a different file there.
+
+- **Admin-protected path** — on Windows the OS-derived executable path is under
+  `%ProgramFiles%`, `%ProgramFiles(x86)%` or `%SystemRoot%` (`SHGetKnownFolderPath`
+  `FOLDERID_ProgramFiles` / `_ProgramFilesX86` / `_Windows`; ASCII-case-insensitive, at a
+  separator boundary, no `..` component): the path alone is trusted, as before.
+- **User-writable path** — anywhere else (a per-user install under `%LOCALAPPDATA%`, a dev
+  tree, Downloads): the entry must also record the **required signer**, and the executable must
+  carry a **valid Authenticode signature** whose leaf signer's subject CN equals it
+  (ASCII-case-insensitive, surrounding spaces ignored). Verification is `WinVerifyTrust`
+  (`WINTRUST_ACTION_GENERIC_VERIFY_V2`, no UI, `WTD_REVOKE_NONE`, `WTD_CACHE_ONLY_URL_RETRIEVAL`
+  — it never blocks a stream start on the network). The signer is stored as a sibling `REG_SZ`
+  in the same `Delegating` key, named `<valueName>.signer` (`displayxr-cli camera trust <exe>
+  --signer "<CN>"` writes it; an installer registering a per-user install writes it next to
+  its entry). A `*.signer` value is never itself an entry.
+- An entry that fails — no signer recorded, no valid signature, or another signer — is **not
+  applied**: row 6 is skipped exactly as if the executable were not registered (stored decision
+  / prompt), with one WARN per executable per service run naming the reason. The executable
+  stays *registered* for the RAW refusal (§7.5): an untrusted entry never widens anything.
+- **POSIX:** delegation is path-only for now — no signer is recorded and no code-signature check
+  exists yet (macOS `SecStaticCode` / Linux are a follow-up).
+- Known limit of the path rule: a few folders under `%SystemRoot%` (e.g. `Temp`, `Tasks`) and an
+  install directory whose ACL an installer loosened are writable all the same. The path rule is
+  the cheap gate for the common case; an installer that registers such a path should record a
+  signer anyway.
+
+**User-level entries are announced.** An entry in the *user* list (`HKCU`, the user JSON —
+written by `displayxr-cli camera trust` or by anything else running as the user) is honoured,
+but the first time it actually allows a given executable in a service run the service logs a
+WARN and raises a notice (Windows: a tray balloon, *"3D camera: per-user trust used"*; macOS:
+the WARN only, for now), once per executable per service run, so a silent self-registration
+cannot go unnoticed. A machine-level (installer, `HKLM` / system JSON) entry is silent. When the
+same path is in both lists the machine-level entry is the one evaluated.
+
+**Foreground rule.** Only a stream whose start was allowed *by* row 6 follows its client's own
+visibility rule (§7.2); a registered client that declined delegation, or whose entry was not
+trusted, is an ordinary window-bearing app there too.
+
 A refused stream stays created and may be started again (e.g. after `displayxr-cli camera allow`).
 The policy is pure (two injected vtables) and unit-tested with fakes in `tests_camera_consent`.
 
@@ -395,7 +444,7 @@ frame with a 250 ms cache:
   always visible — the OS lock below is the gate there). Otherwise the stream is `SUSPENDED` for
   that client: no new frames, pinned slot cleared so the last image does not linger.
 - **Delegating clients** follow their own visibility rule (a capturing tab keeps its indicator;
-  closing it stops the track). **`CAMERA_CONSUMER` and `DIAG`** have no window by contract and
+  closing it stops the track) — only when the stream's start was allowed by delegation (§7.1.1). **`CAMERA_CONSUMER` and `DIAG`** have no window by contract and
   are exempt — they were granted explicit consent instead.
 - **Session lock:** every stream is suspended while the OS session is locked or switched away
   (Windows `WM_WTSSESSION_CHANGE` lock / console or remote disconnect, plus `SM_REMOTESESSION` at
@@ -452,7 +501,7 @@ The service queues, per connection (16 deep, oldest dropped), and the client dra
 | `XR_STEREO_CAMERA_FRAME_NOT_READY_DXR` (success) | no frame newer than the last acquired |
 | `XR_ERROR_VALIDATION_FAILURE` | struct out of contract (unknown camera, format/transport not in the supported bits, RECTIFIED on an uncalibrated camera) |
 | `XR_ERROR_PERMISSION_INSUFFICIENT` | the OS camera privacy switch denies the app (§7.1 row 4, delegating clients included); RAW asked by a browser / delegating client; a client class that may not use cameras (or `xrCreateSession` from a `CAMERA_CONSUMER`) |
-| `XR_ERROR_STEREO_CAMERA_CONSENT_REFUSED_DXR` | §7.1: the user / the stored decision refused, the prompt was unanswered or unavailable; retryable after consent. A browser maps it to `NotAllowedError` |
+| `XR_ERROR_STEREO_CAMERA_CONSENT_REFUSED_DXR` | §7.1: the user / the stored decision refused, the prompt was unanswered or unavailable; retryable after consent. A browser maps it to `NotAllowedError`. A registered delegating client gets it too when its delegation was skipped — it declined (`DECLINE_DELEGATION_BIT`, §2a) or its entry is untrusted (§7.1.1) — and no stored Allow / prompt answer allowed it |
 | `XR_ERROR_STEREO_CAMERA_DISABLED_DXR` | §7.4: sharing is off (user toggle or `DXR_STEREO_CAMERA=0`) |
 | `XR_ERROR_STEREO_CAMERA_BUSY_DXR` | the plug-in could not open the source and its retry is pending; retry later. A browser maps it to `NotReadableError` |
 | `XR_ERROR_STEREO_CAMERA_STREAM_ENDED_DXR` | start / acquire on a stream the service ended (§7.4); destroy it and create a new one |
@@ -669,6 +718,7 @@ camera state change and per stream start/stop with the peer executable; INFO sta
 
 | Version | Change |
 |---|---|
+| 3 | Delegation hardening: `XR_STEREO_CAMERA_CLIENT_DECLINE_DELEGATION_BIT_DXR` (`0x2`) — a delegating client opts out of row 6 for one instance (§2a); a delegating entry for a user-writable executable path is applied only with a recorded signer its valid Authenticode signature matches (`<valueName>.signer`, Windows; POSIX path-only) and a user-level entry's first use per executable per service run is announced (§7.1.1). Appended; nothing renumbered |
 | 2 (R3) | Consent and privacy as built (§7): `XrStereoCameraClientInfoDXR` + `XR_STEREO_CAMERA_CLIENT_CONSUMER_ONLY_BIT_DXR` (the `CAMERA_CONSUMER` class, §2a); distinct results `XR_ERROR_STEREO_CAMERA_CONSENT_REFUSED_DXR` / `_DISABLED_DXR` / `_BUSY_DXR` / `_STREAM_ENDED_DXR`; `XrEventDataStereoCameraStreamEndedDXR`; the state-changed event is now delivered; `persistentId` keyed with a per-user secret; read-only consumer section on every platform; `DXR_STEREO_CAMERA_DEV_ALLOW` becomes a documented dev override, `DXR_STEREO_CAMERA_PROMPT=0` disables the prompt. Everything appended at `1004999311–316`; nothing renumbered |
 | 1 (R2) | No API change. RECTIFIED output and rectified calibration now come from the service's rectifier for any CALIBRATED, non-natively-rectified source; the browser is refused a camera it cannot rectify; sim_display `_DISTORT=1` fake; `camera probe` row alignment + `--rectified` |
 | 1 | R1 implements: enumerate, calibration (RAW; RECTIFIED for natively rectified sources), streams with start/stop, latest-wins acquire over a pinned 3-slot shared-memory ring with per-stream wake handles, stream stats, plug-in slots, sim_display fake, CLI, selftest. Deferred: state-change events (structs defined, not delivered), GPU transports, rectifier (R2), consent/indicator (R3). Design scope: Enumerate + state events, calibration (raw / rectified), streams with start/stop, latest-wins acquire over a pinned 3-slot shared-memory ring with per-stream wake handles, optional GPU transports, runtime-enforced consent / foreground / indicator, plug-in iface slots, sim_display fake, CLI. |

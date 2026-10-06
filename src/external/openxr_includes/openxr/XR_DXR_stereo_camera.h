@@ -58,7 +58,10 @@
  * class), distinct refusal results (CONSENT_REFUSED / DISABLED / BUSY /
  * STREAM_ENDED), the state-changed and cameras-changed events are now
  * delivered, XrEventDataStereoCameraStreamEndedDXR, persistentId keyed with
- * a per-user secret. Everything appended; nothing renumbered.
+ * a per-user secret. Everything appended; nothing renumbered. 3 =
+ * XR_STEREO_CAMERA_CLIENT_DECLINE_DELEGATION_BIT_DXR (a consent-delegating
+ * client opts out of delegation for one instance); delegating entries for a
+ * user-writable executable path require a matching code signer (spec §7.1.1).
  */
 #ifndef XR_DXR_STEREO_CAMERA_H
 #define XR_DXR_STEREO_CAMERA_H 1
@@ -71,7 +74,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_stereo_camera 1
-#define XR_DXR_stereo_camera_SPEC_VERSION 2
+#define XR_DXR_stereo_camera_SPEC_VERSION 3
 #define XR_DXR_STEREO_CAMERA_EXTENSION_NAME "XR_DXR_stereo_camera"
 
 // Reserved 1004999300..319 (relocated from 290..309 on the post-lift rebase: 290 was taken by XR_DXR_weave v14). Allocation registry: README.md in this directory.
@@ -349,6 +352,10 @@ typedef XrFlags64 XrStereoCameraClientFlagsDXR;
 //! quota. A hybrid runtime routes such an instance to the service (an
 //! in-process instance has no cameras).
 static const XrStereoCameraClientFlagsDXR XR_STEREO_CAMERA_CLIENT_CONSUMER_ONLY_BIT_DXR = 0x00000001;
+//! The client asks the runtime NOT to treat it as a consent-delegating client for this
+//! instance (e.g. it runs with automation / auto-grant switches that bypass its own
+//! permission prompt). The runtime then requires a stored decision or its own prompt.
+static const XrStereoCameraClientFlagsDXR XR_STEREO_CAMERA_CLIENT_DECLINE_DELEGATION_BIT_DXR = 0x00000002;
 
 /*!
  * Chain on XrInstanceCreateInfo (the extension must be in enabledExtensionNames).

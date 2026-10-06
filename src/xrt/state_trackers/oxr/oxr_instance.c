@@ -572,6 +572,12 @@ oxr_instance_create(struct oxr_logger *log,
 		if (ci != NULL && (ci->flags & XR_STEREO_CAMERA_CLIENT_CONSUMER_ONLY_BIT_DXR) != 0) {
 			i_info.app_info.declared_client_class = XRT_CLIENT_CLASS_CAMERA_CONSUMER;
 		}
+		// Spec v3: the flags travel to the service as declared (same bit
+		// values as XRT_STEREO_CAMERA_CLIENT_*); it acts on
+		// DECLINE_DELEGATION_BIT and ignores bits it does not know.
+		if (ci != NULL) {
+			i_info.app_info.stereo_camera_client_flags = (uint64_t)ci->flags;
+		}
 	}
 #endif
 	// #964 Phase A: is this process part of a workspace session? The workspace

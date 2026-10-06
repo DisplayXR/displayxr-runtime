@@ -126,6 +126,11 @@ struct xrt_application_info
 	//! (u_sandbox_is_workspace_session); the server just records the claim —
 	//! it is a scoping hint, not a privilege, so there is nothing to verify.
 	bool workspace_session;
+	//! ADR-043: XrStereoCameraClientInfoDXR::flags as the app chained them
+	//! (XRT_STEREO_CAMERA_CLIENT_* in xrt_stereo_camera.h, same bit values).
+	//! Only ever RESTRICTS what the service grants (DECLINE_DELEGATION), so the
+	//! claim needs no verification. Unknown bits are ignored.
+	uint64_t stereo_camera_client_flags;
 };
 
 /*!

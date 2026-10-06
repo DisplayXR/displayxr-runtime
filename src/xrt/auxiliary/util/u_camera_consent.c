@@ -81,6 +81,89 @@ u_camera_consent_why_str(enum u_camera_consent_why why)
 	}
 }
 
+const char *
+u_camera_consent_delegation_skip_str(enum u_camera_consent_delegation_skip skip)
+{
+	switch (skip) {
+	case U_CAMERA_CONSENT_DELEGATION_APPLIES: return "";
+	case U_CAMERA_CONSENT_DELEGATION_DECLINED: return "the client declined delegation (DECLINE_DELEGATION)";
+	case U_CAMERA_CONSENT_DELEGATION_NO_SIGNER:
+		return "user-writable path and the delegating entry records no signer";
+	case U_CAMERA_CONSENT_DELEGATION_NOT_SIGNED:
+		return "user-writable path and the executable has no valid code signature";
+	case U_CAMERA_CONSENT_DELEGATION_SIGNER_MISMATCH:
+		return "user-writable path and the executable is signed by someone other than the entry's signer";
+	default: return "?";
+	}
+}
+
+static bool
+get_delegation(const struct u_camera_consent_store_ops *st,
+               void *sc,
+               const char *exe,
+               struct u_camera_consent_delegation *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (st == NULL || st->get_delegation == NULL || !st->get_delegation(sc, exe, out)) {
+		memset(out, 0, sizeof(*out));
+		return false;
+	}
+	out->signer[sizeof(out->signer) - 1] = '\0';
+	return out->scope != U_CAMERA_CONSENT_DELEGATION_NONE;
+}
+
+bool
+u_camera_consent_is_registered_delegating(const struct u_camera_consent_store_ops *store,
+                                          void *store_ctx,
+                                          const char *exe)
+{
+	struct u_camera_consent_delegation d;
+	return exe_known(exe) && get_delegation(store, store_ctx, exe, &d);
+}
+
+//! A small "seen this executable in this run" set; the oldest entry is overwritten.
+static bool
+seen_check_and_add(char (*set)[U_CAMERA_CONSENT_EXE_MAX], uint32_t *count, const char *exe)
+{
+	uint32_t n = *count < U_CAMERA_CONSENT_SEEN_MAX ? *count : U_CAMERA_CONSENT_SEEN_MAX;
+	for (uint32_t i = 0; i < n; i++) {
+		if (strncmp(set[i], exe, U_CAMERA_CONSENT_EXE_MAX - 1) == 0) {
+			return true;
+		}
+	}
+	snprintf(set[*count % U_CAMERA_CONSENT_SEEN_MAX], U_CAMERA_CONSENT_EXE_MAX, "%s", exe);
+	(*count)++;
+	return false;
+}
+
+/*!
+ * Step 6's trust check for a registered entry (spec §7.1.1). Admin-protected
+ * path: the path is the identity. User-writable path: the entry must name a
+ * signer and the executable must be validly signed by exactly that signer.
+ */
+static enum u_camera_consent_delegation_skip
+delegation_trust(struct u_camera_consent *c, const char *exe, const struct u_camera_consent_delegation *d)
+{
+	const struct u_camera_consent_env_ops *env = c->env;
+	// NULL = assume user-writable: fail closed.
+	bool user_writable = env == NULL || env->path_user_writable == NULL || env->path_user_writable(c->env_ctx, exe);
+	if (!user_writable) {
+		return U_CAMERA_CONSENT_DELEGATION_APPLIES;
+	}
+	if (d->signer[0] == '\0') {
+		return U_CAMERA_CONSENT_DELEGATION_NO_SIGNER;
+	}
+	char actual[U_CAMERA_CONSENT_SIGNER_MAX] = {0};
+	if (env == NULL || env->exe_signer == NULL || !env->exe_signer(c->env_ctx, exe, actual, sizeof(actual))) {
+		return U_CAMERA_CONSENT_DELEGATION_NOT_SIGNED;
+	}
+	actual[sizeof(actual) - 1] = '\0';
+	if (!u_camera_consent_signer_equal(actual, d->signer)) {
+		return U_CAMERA_CONSENT_DELEGATION_SIGNER_MISMATCH;
+	}
+	return U_CAMERA_CONSENT_DELEGATION_APPLIES;
+}
+
 bool
 u_camera_consent_sharing_enabled(struct u_camera_consent *c)
 {
@@ -133,6 +216,7 @@ u_camera_consent_evaluate(struct u_camera_consent *c,
                           const char *exe,
                           const char *app_name,
                           long pid,
+                          uint32_t flags,
                           struct u_camera_consent_decision *out)
 {
 	memset(out, 0, sizeof(*out));
@@ -166,7 +250,9 @@ u_camera_consent_evaluate(struct u_camera_consent *c,
 	}
 	// A fact about the executable, reported whatever the verdict (the service
 	// keys the RAW refusal on it). It only DECIDES at step 6.
-	out->delegating = st != NULL && st->is_delegating != NULL && st->is_delegating(sc, exe);
+	struct u_camera_consent_delegation reg;
+	out->delegating = get_delegation(st, sc, exe, &reg);
+	out->delegation_scope = reg.scope;
 	// 4. the OS switch, for every client, delegating ones included: the service
 	//    opens the camera, not the client, so the OS never sees this consumer
 	//    and nobody else will enforce the user's switch for it.
@@ -186,9 +272,38 @@ u_camera_consent_evaluate(struct u_camera_consent *c,
 	}
 	// 6. a registered delegating client prompts per origin itself: no runtime
 	//    prompt and no stored decision needed — and nothing more than that.
+	//    Not when the client declined it for this instance (it runs with its
+	//    own prompt bypassed), and not when the entry cannot be trusted (a
+	//    user-writable path without a matching signature, §7.1.1): then the
+	//    executable is an ordinary app from here on.
 	if (out->delegating) {
-		decide(out, U_CAMERA_CONSENT_ALLOWED, U_CAMERA_CONSENT_WHY_DELEGATING);
-		return;
+		enum u_camera_consent_delegation_skip skip = (flags & U_CAMERA_CONSENT_FLAG_DECLINE_DELEGATION) != 0
+		                                                 ? U_CAMERA_CONSENT_DELEGATION_DECLINED
+		                                                 : delegation_trust(c, exe, &reg);
+		out->delegation_skip = skip;
+		if (skip == U_CAMERA_CONSENT_DELEGATION_APPLIES) {
+			if (reg.scope == U_CAMERA_CONSENT_DELEGATION_USER &&
+			    !seen_check_and_add(c->user_noticed, &c->user_noticed_count, exe)) {
+				U_LOG_W("stereo camera consent: %s allowed by a USER-level delegation entry (not an "
+				        "installer's); `displayxr-cli camera untrust` removes it",
+				        exe);
+				if (c->env != NULL && c->env->user_delegation_notice != NULL) {
+					c->env->user_delegation_notice(c->env_ctx, exe, app_name);
+				}
+			}
+			out->delegated = true;
+			decide(out, U_CAMERA_CONSENT_ALLOWED, U_CAMERA_CONSENT_WHY_DELEGATING);
+			return;
+		}
+		if (skip != U_CAMERA_CONSENT_DELEGATION_DECLINED &&
+		    !seen_check_and_add(c->untrusted_warned, &c->untrusted_warned_count, exe)) {
+			U_LOG_W(
+			    "stereo camera consent: the %s delegating entry for %s is NOT applied — %s%s%s; it is "
+			    "treated as an ordinary app (stored decision / prompt)",
+			    reg.scope == U_CAMERA_CONSENT_DELEGATION_SYSTEM ? "machine-level" : "user-level", exe,
+			    u_camera_consent_delegation_skip_str(skip), reg.signer[0] ? ", entry signer: " : "",
+			    reg.signer);
+		}
 	}
 	// 7. a stored Allow.
 	if (stored == U_CAMERA_CONSENT_STORED_ALLOW) {
@@ -267,6 +382,74 @@ u_camera_consent_path_equal(const char *a, const char *b, bool windows_rules)
 		b++;
 	}
 	return *a == '\0' && *b == '\0';
+}
+
+bool
+u_camera_consent_path_is_under(const char *path, const char *dir, bool windows_rules)
+{
+	if (path == NULL || dir == NULL || path[0] == '\0' || dir[0] == '\0') {
+		return false;
+	}
+	// Any ".." component could climb back out of @p dir.
+	for (const char *p = path; *p != '\0'; p++) {
+		bool at_start = p == path || p[-1] == '/' || (windows_rules && p[-1] == '\\');
+		if (at_start && p[0] == '.' && p[1] == '.' &&
+		    (p[2] == '\0' || p[2] == '/' || (windows_rules && p[2] == '\\'))) {
+			return false;
+		}
+	}
+	size_t dlen = strlen(dir);
+	// Drop trailing separators from dir.
+	while (dlen > 0 && (dir[dlen - 1] == '/' || (windows_rules && dir[dlen - 1] == '\\'))) {
+		dlen--;
+	}
+	if (dlen == 0) {
+		return false;
+	}
+	for (size_t i = 0; i < dlen; i++) {
+		if (path[i] == '\0' || path_norm_ch(path[i], windows_rules) != path_norm_ch(dir[i], windows_rules)) {
+			return false;
+		}
+	}
+	// A separator boundary, and something after it: "C:\Program FilesX\a" is not under "C:\Program Files".
+	char sep = path_norm_ch(path[dlen], windows_rules);
+	return (sep == '/' || (windows_rules && sep == '\\')) && path[dlen + 1] != '\0';
+}
+
+static char
+ascii_lower(char c)
+{
+	return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+}
+
+bool
+u_camera_consent_signer_equal(const char *a, const char *b)
+{
+	if (a == NULL || b == NULL) {
+		return false;
+	}
+	while (*a == ' ') {
+		a++;
+	}
+	while (*b == ' ') {
+		b++;
+	}
+	size_t la = strlen(a), lb = strlen(b);
+	while (la > 0 && a[la - 1] == ' ') {
+		la--;
+	}
+	while (lb > 0 && b[lb - 1] == ' ') {
+		lb--;
+	}
+	if (la == 0 || la != lb) {
+		return false;
+	}
+	for (size_t i = 0; i < la; i++) {
+		if (ascii_lower(a[i]) != ascii_lower(b[i])) {
+			return false;
+		}
+	}
+	return true;
 }
 
 bool
