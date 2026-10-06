@@ -207,6 +207,19 @@
  * the whole of its 2D over as the overlay gates on extensionVersion >= 16. The
  * macOS and Android engines still drop an unreadable overlay.
  *
+ * A stale-size overlay is ignored on desktop Linux (SPEC_VERSION 17). No new
+ * structure: an overlay is window-sized by definition, and one whose size is
+ * not this submit's window size (a producer that has not reallocated it after
+ * a resize yet) is treated as ABSENT for that submit — the content is woven,
+ * the submit is ACCEPTED, and nothing of the overlay is composited. It is not
+ * refused (refusing through every resize would hold frames), and it is no
+ * longer stretched over the output (before v17 the runtime's post-weave blend
+ * composited a smaller overlay as if it were window-sized: a black margin and
+ * misplaced 2D). This qualifies v16: "accepted with an overlay chained" means
+ * "composited" only for an overlay of the window's size. A caller whose
+ * overlay IS its 2D gates on extensionVersion >= 17 before relying on it, and
+ * otherwise keeps a mismatched overlay off the wire itself.
+ *
  * Overlay filter strength (SPEC_VERSION 15). XrWeaveSubmitOverlayFilterDXR, chained
  * next to an XrWeaveSubmitOverlaysDXR: how strongly a display processor that
  * band-limits the 2D layer for its lens filters it, 0..1 (0 = no lens filtering,
@@ -290,7 +303,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_weave 1
-#define XR_DXR_weave_SPEC_VERSION 16
+#define XR_DXR_weave_SPEC_VERSION 17
 #define XR_DXR_WEAVE_EXTENSION_NAME "XR_DXR_weave"
 
 // Reserved 1004999190..199. Final values reconcile with the Khronos registry
