@@ -80,7 +80,7 @@ For full control, install each component directly from its release page. Order: 
 
 On Linux, every `v*` release attaches `displayxr-runtime_<ver>_amd64.deb` (`apt install ./displayxr-runtime_*_amd64.deb`); the user-level, no-root tarball (`scripts/package_linux.sh` → `dist/*.tar.gz` with `install.sh`) is the alternative. Both are built on Ubuntu 22.04 and CI-verified to install on 22.04, 24.04 and 26.04.
 
-The website's [Get Started](https://displayxr.org/getting-started) page walks through the manual flow end-to-end with verification steps.
+The website's [native quickstart](https://displayxr.org/developers/native) walks through the manual flow per platform, from install to a running app.
 
 ### Build from source
 
