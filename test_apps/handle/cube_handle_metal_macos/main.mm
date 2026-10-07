@@ -896,7 +896,9 @@ static void EnsureDepthTexture(MetalRenderer &r, uint32_t w, uint32_t h)
 // FOOTPRINT (rays from the outer eyes through a ring of points around the
 // hotspot) and hands the nearest hit to xrLocateViews. The runtime returns
 // where to draw the cursor sprite; the app draws it last, depth test off, and
-// hides the OS cursor while it does. Opt out with DISPLAYXR_CURSOR_DEPTH=0.
+// hides the OS cursor while it does. Opt out with DISPLAYXR_CURSOR_DEPTH=0;
+// pick the anchor mode with DISPLAYXR_CURSOR_DEPTH_ANCHOR=hybrid|screen|world
+// (unset = the runtime default, HYBRID).
 // ============================================================================
 
 static const float kCubeSize = 0.06f;
@@ -1647,6 +1649,12 @@ struct AppXrSession {
     // submits depth (XR_KHR_composition_layer_depth) and lets the runtime
     // find the nearest content under the cursor, instead of the hit test.
     bool cursorDepthFromLayer = false;
+    // XR_DXR_cursor_depth v3: DISPLAYXR_CURSOR_DEPTH_ANCHOR=hybrid|screen|world
+    // chains XrCursorDepthOptionsDXR with that anchor mode. Unset: the struct
+    // is not chained, and the runtime defaults to HYBRID.
+    bool cursorDepthChainOptions = false;
+    XrCursorDepthAnchorModeDXR cursorDepthAnchor =
+        XR_CURSOR_DEPTH_ANCHOR_MODE_HYBRID_DXR;
     SwapchainInfo depthSwapchain = {};
     XrViewConfigurationType viewConfigType;
     std::vector<XrViewConfigurationView> configViews;
@@ -1803,6 +1811,40 @@ static bool InitializeOpenXR(AppXrSession &app)
         }
         LOG_INFO("XR_DXR_cursor_depth source: %s",
                  app.cursorDepthFromLayer ? "SUBMITTED DEPTH (runtime reads it)" : "app hit test");
+
+        // Opt-in (spec v3): pick the anchor mode explicitly.
+        const char *anchor = getenv("DISPLAYXR_CURSOR_DEPTH_ANCHOR");
+        if (anchor != nullptr && anchor[0] != '\0') {
+            bool known = true;
+            if (strcmp(anchor, "hybrid") == 0) {
+                app.cursorDepthAnchor = XR_CURSOR_DEPTH_ANCHOR_MODE_HYBRID_DXR;
+            } else if (strcmp(anchor, "screen") == 0) {
+                app.cursorDepthAnchor = XR_CURSOR_DEPTH_ANCHOR_MODE_SCREEN_DXR;
+            } else if (strcmp(anchor, "world") == 0) {
+                app.cursorDepthAnchor = XR_CURSOR_DEPTH_ANCHOR_MODE_WORLD_DXR;
+            } else {
+                known = false;
+                LOG_WARN("DISPLAYXR_CURSOR_DEPTH_ANCHOR=%s: expected "
+                         "hybrid|screen|world - not chaining options",
+                         anchor);
+            }
+            if (known && app.cursorDepthSpecVersion < 3) {
+                LOG_WARN("DISPLAYXR_CURSOR_DEPTH_ANCHOR needs "
+                         "XR_DXR_cursor_depth v3 (have v%u) - ignored",
+                         app.cursorDepthSpecVersion);
+            } else if (known) {
+                app.cursorDepthChainOptions = true;
+            }
+        }
+        LOG_INFO(
+            "XR_DXR_cursor_depth anchor: %s",
+            !app.cursorDepthChainOptions
+                ? "runtime default (options not chained)"
+            : app.cursorDepthAnchor == XR_CURSOR_DEPTH_ANCHOR_MODE_SCREEN_DXR
+                ? "SCREEN"
+            : app.cursorDepthAnchor == XR_CURSOR_DEPTH_ANCHOR_MODE_WORLD_DXR
+                ? "WORLD"
+                : "HYBRID");
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -3043,6 +3085,11 @@ int main(int argc, char **argv)
         // Spec v2 (ADR-046 3a): "find the nearest point in the depth I submit".
         XrCursorDepthSourceDXR cursorSource = {XR_TYPE_CURSOR_DEPTH_SOURCE_DXR};
         cursorSource.source = XR_CURSOR_DEPTH_SOURCE_SUBMITTED_DEPTH_DXR;
+        // Spec v3: anchor mode (margin left at the runtime default).
+        XrCursorDepthOptionsDXR cursorOptions = {
+            XR_TYPE_CURSOR_DEPTH_OPTIONS_DXR};
+        cursorOptions.anchorMode = app.cursorDepthAnchor;
+        cursorOptions.margin = 0.0f;
         bool cursorInCanvas = false;
         if (app.hasCursorDepthExt && g_window != nil && g_metalView != nil) {
             NSPoint pw = [g_window mouseLocationOutsideOfEventStream];
@@ -3082,13 +3129,18 @@ int main(int argc, char **argv)
                                 : XR_FALSE;
                         cursorHint.nearestPoint = hit;
                     }
-                    // Chain: locateInfo -> hint [-> source] -> (rig struct).
+                    // Chain: locateInfo -> hint [-> options] [-> source] ->
+                    // (rig struct).
+                    const void *hintTail = locateInfo.next;
                     if (app.cursorDepthFromLayer) {
-                        cursorSource.next = locateInfo.next;
-                        cursorHint.next = &cursorSource;
-                    } else {
-                        cursorHint.next = locateInfo.next;
+                        cursorSource.next = hintTail;
+                        hintTail = &cursorSource;
                     }
+                    if (app.cursorDepthChainOptions) {
+                        cursorOptions.next = hintTail;
+                        hintTail = &cursorOptions;
+                    }
+                    cursorHint.next = hintTail;
                     locateInfo.next = &cursorHint;
                 }
             }
