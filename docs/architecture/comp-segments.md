@@ -1,6 +1,7 @@
 # Window segments: one window, one DP per screen
 
-*How the compositor weaves a window that spans several screens (multi-screen M2).
+*How the compositor weaves a window that spans several screens (multi-screen M2), and
+how each screen gets its own views (M3).
 Companion to ADR-047 (`docs/adr/ADR-047-multi-screen-segments-and-per-screen-views.md`, lands with PR #1849)
 decision D2 and the multi-screen plan (`docs/roadmap/multi-screen.md`, lands with PR #1849).
 Code: `src/xrt/compositor/util/comp_segments.{h,c}` (backend-agnostic math and
@@ -35,10 +36,12 @@ half-open, so a window flush to a seam belongs to exactly one screen.
 
 - The **primary screen** is the system-default screen, the one the session's own
   DP (`comp_vk_native_compositor::display_processor`) was made for. Its segment is
-  woven by that DP, which also keeps owning everything view-related: eye positions,
-  window metrics, Kooima. M2 renders **one view pair** for the whole window; per-segment
-  views are M3.
-- Every **other screen** gets a segment DP from that screen's registry factory:
+  woven by that DP. Its eyes feed that segment's views (M3, below).
+- Every **other screen** gets a segment DP from that screen's registry entry —
+  **whichever plug-in won that screen** (M3 lifted M2's one-vendor rule: the entry carries
+  the owning plug-in's iface + instance, kept resident by the loader as a claim source,
+  M0): its ABI-checked factory
+  `xrt_plugin_iface::create_dp_vk_for_screen` with an `xrt_screen_binding`
   `xrt_plugin_iface::create_dp_vk_for_screen` with an `xrt_screen_binding`
   (monitor id, desktop rect, native px, mm, serial) — only that slot: a plug-in
   without it gets a flat 2D view on its other screens, never a plain `create_dp_vk`
@@ -46,7 +49,8 @@ half-open, so a window flush to a seam belongs to exactly one screen.
   created against the #868 runtime-owned queue, like the primary.
   It is windowless (NULL window): its phase is `set_present_origin`, fed per frame,
   ADR-033. A plug-in's DP made for a screen describes that screen
-  (`get_display_dimensions` / `get_display_pixel_info`).
+  (`get_display_dimensions` / `get_display_pixel_info`). Every segment DP follows the
+  session's 2D/3D mode (`request_display_mode`, on creation and on every change).
 - A window entirely on the primary screen — the common case — never leaves the
   single-DP path: `comp_segments_table_is_split()` is false and the frame is
   byte-for-byte what shipped before.
@@ -139,20 +143,54 @@ or destroy is one WARN.
   are desktop-absolute, the same space as the registry's RandR rects. Native Wayland
   stays primary-only — the geometry payload does not describe the other monitors
   (`docs/specs/runtime/wayland-window-geometry.md` §5).
-- **One vendor**: all screens must belong to the primary screen's plug-in. A
-  mixed layout (a Leia DS1 next to a sim_display laptop panel) keeps the single-DP
-  path; mixing vendors is M4.
+- **Mixed vendors** (M3): a Leia DS1 next to a sim_display laptop panel is
+  segmented like any other layout; each segment DP comes from its own screen's plug-in
+  and the table logs one INFO line naming the vendors. A plug-in whose VK factory was
+  refused at load (vk_bundle ABI, #1243) gets no segment DP: that segment is flat 2D.
 - Not segmented: zero-copy frames, a self-submitting DP or one without a render
   pass, a session pinned with `XrSessionDisplayBindingDXR`, the shared-texture path.
 - `DXR_SEGMENTS=0` turns it off.
 - Capture: with the window split, the post-compose atlas capture also writes each
   segment's DP input as `<stem>.seg<i>.png`.
 
-## What M3 adds
+## Per-segment views (M3)
 
-Per-segment **views**: `xrLocateViews` returns a view pair per segment (eyes from
-that segment's DP, Kooima from the segment rect relative to its own screen),
-`XrViewDisplayBindingsDXR` tells the app which views belong to which segment, and the
-compositor routes each segment's tiles to its DP instead of cropping one shared
-pair. The segment table, the lifecycle and the per-segment DPs here are what it
-builds on.
+Under `PRIMARY_MULTIVIEW_DXR` each segment gets its **own** views instead of a crop of
+one shared set (contract: `docs/reference/view-configuration-model.md` § *Per-segment
+views*; API: `XrViewDisplayBindingsDXR` in `XR_DXR_display_info` v22).
+
+1. **Publish.** Each weave that takes the split path publishes its table as
+   `xrt_segment_metrics` (`comp_vk_native_compositor_get_segment_metrics`): per segment
+   the screen id, rect in window and screen px, the screen's desktop rect, physical
+   size and nominal viewer, and whether it is woven. Eyes are predicted at query time
+   — the primary from the session DP, the others from their segment DPs
+   (`comp_vk_native_segments_get_eyes`, guarded against the weave destroying them).
+   Nothing is published while the session is collapsed to flat 2D (#1595/#1831), for
+   zero-copy frames or when the window is on the primary screen only.
+2. **Locate.** `oxr_session_locate_views` locates one view set per segment and records
+   which views went where (`xrt_segment_view_routing`); `xrEndFrame` hands it to the
+   compositor (`comp_vk_native_compositor_set_view_routing`) with the frame.
+3. **Route — one atlas, per-segment tile ranges, as a mosaic.** The atlas layout does
+   not change: `cols × rows` tiles of `canvas × scale`, so `u_tiling` and the
+   worst-case sizing stay honest and a single-segment frame is byte-for-byte the old
+   one. What changes is what a tile holds: local view `j` of segment `k` is placed at
+   segment `k`'s rect inside tile `j` (`comp_vk_native_eff_layout::route`, both the
+   blit and the compose paths). The rect comes from `comp_segments_tile_rect`, the
+   mapping the crop (step 2 of *The frame*) reads with, so cropping segment `k` out of
+   every tile yields exactly its own views — the M2 split path runs unchanged and each
+   DP weaves its own frustum. A routed frame never zero-copies (the mosaic is built by
+   the renderer, not by the app). Chosen over per-segment sub-atlases because it keeps
+   one atlas, one crop path, one capture path.
+4. **Capture.** `displayxr_atlas.seg<i>.png` is each segment's DP input, i.e. that
+   segment's own views.
+
+What stays one view set (cropped per segment, as in M2): `PRIMARY_STEREO`/`MONO`
+sessions (framed from the screen holding most of the window), camera-rig and
+zone-scoped locates, a window covering more than `XRT_MAX_SEGMENTS` (2) screens. A
+frame whose routing no longer matches (the mode changed between the locate and the
+commit) is drawn unrouted for that frame. Under per-segment views, canvas that lies on
+no screen is not covered by any view set and stays black (M2 painted it from the shared
+set). Quads and equirect layers are drawn with the first segment's camera in each tile.
+
+**IPC.** In-process only: the service never segments, so a service session always sees
+an empty table, one view set and no bindings (its own segmentation is M6).
