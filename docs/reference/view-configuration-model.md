@@ -513,6 +513,20 @@ and declares two modes, 2D (1 view) and LeiaSR (2 views). So
 `PRIMARY_MULTIVIEW_DXR` is future-proofing plus sim-display CI conformance — it
 is not preserving a shipping N-view product today.
 
+## Session display binding (`XR_DXR_display_info` v22)
+
+An app can pin its session to one display by chaining `XrSessionDisplayBindingDXR`
+(a `displayId` from `xrEnumerateDisplaysDXR`) on `XrSessionCreateInfo`. It does **not**
+change anything on this page: both view configurations report the same view counts and
+the same recommended sizes whatever the binding, because `xrEnumerateViewConfigurationViews`
+is a system query (it runs before any session exists) and swapchains stay sized for the
+system's worst case (ADR-010). What the binding changes, in v22, is the session's
+display-scoped Kooima inputs — a session bound to a non-default display takes that
+display's physical size and nominal viewer — while the system default display's DP still
+weaves it. Per-view display bindings, where views are assigned to displays, arrive in
+multi-screen M3 (ADR-047); until then binding to the system default (or not binding) is
+exactly today's behaviour.
+
 ## History — what the deviation was
 
 Before this change the runtime modelled **one** view configuration per system

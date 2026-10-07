@@ -260,6 +260,47 @@ a disagreeing value does not survive the first mode switch anyway.
 
 **Called again after startup — keep it cheap.** A long-lived service can start before the vendor backend has identified the panel (an unattended reboot with the panel asleep; even a healthy boot needs a few seconds after the vendor platform service is up). The runtime therefore calls `get_display_info` not only at instance create but again on every client connect / per-client compositor create (`xrt_system_compositor_info::refresh_display_processors`), and — while the answer is still unknown — about once a second from the service's main loop (#1721), so identification is picked up even when no client connects afterwards; it re-applies the answer whenever the reported geometry (physical size, pixel size, nominal viewer, screen origin) differs from what it last applied — logging one `display info refreshed from plug-in after startup` WARN. IPC clients that connected *before* the first real answer keep the startup snapshot of the head's mode table (`rendering_modes[]` tiling, per-view pixel dims) they were created with — the client copies it out of shared memory once at device create — until they reconnect; their head poses/geometry are already right because you update your own `xrt_device` in place. The contract for the repeat calls: return `false` **fast** while the panel is still unknown (no blocking retry — spend any startup budget once, in `create_device`), and `true` with the real numbers once it is; keep your own head `xrt_device` (views, FOV, `hmd->views[].display`) correct in place, because the runtime re-derives only its own tiling / atlas / `xsysc->info` from the struct. Return values must be stable between calls for the same panel so the refresh stays a no-op.
 
+### `get_display_info_for_monitor` (multi-screen M1)
+
+```c
+bool (*get_display_info_for_monitor)(struct xrt_plugin_instance *inst,
+                                     const struct xrt_display_descriptor *display,
+                                     const struct xrt_display_physical *physical,
+                                     struct xrt_plugin_display_info *out_info);
+```
+
+The per-monitor twin of `get_display_info`: describe ONE monitor your plug-in won in the
+per-monitor registry (your `probe_displays` claim beat everyone else's). Same out struct,
+same field meanings — physical size, nominal viewer (display-centred, metres), native
+pixels, recommended view scale (`0` = let the runtime decide), desktop origin, eye-tracking
+modes supported/default — but keyed by the monitor, with no head device. It feeds
+`XR_DXR_display_info` v22 `xrEnumerateDisplaysDXR` (`docs/specs/extensions/XR_DXR_display_info.md`)
+and `displayxr-cli info`'s `:: Displays` block.
+
+- `display` is the descriptor `probe_displays` saw for the monitor. `physical` carries what the
+  descriptor does not — EDID millimetres and the connector's device mode — and may be NULL;
+  its fields are 0 when unknown. Clamp reads to `physical->struct_size`.
+- The runtime sets `out_info->struct_size` and zero-fills the rest; never write past it.
+- Cheap, non-blocking, any thread: it runs on every `xrEnumerateDisplaysDXR` and in diagnostics.
+- Return `false` for a monitor you cannot describe.
+
+**Which monitor gets which source.** The system-default monitor (the one the scalar
+`get_display_info` describes, i.e. `XrSystemProperties`) always reports the system info, so
+the two can never disagree — this slot is asked only about your *other* monitors. With the
+slot absent (NULL, or a `struct_size` that predates it) those monitors get runtime defaults
+from EDID: physical size from the millimetres, view scale 1, no eye tracking, nominal viewer
+centred at the distance that matches the system panel's vertical FOV.
+
+**ABI.** Appended after `stereo_camera_close` per ADR-020 (append-only, `struct_size`-gated,
+no `XRT_PLUGIN_API_VERSION_CURRENT` bump). Guard an implementation with
+`#ifdef XRT_PLUGIN_IFACE_HAS_DISPLAY_INFO_FOR_MONITOR` to keep building against older
+headers. `xrt_display_physical` is a separate struct passed by pointer **on purpose**:
+`probe_displays` receives descriptors as an array, so appending to `xrt_display_descriptor`
+would change the array stride under every existing plug-in — a layout break, not a free
+append. Reference implementation: `sim_display_plugin.c` (EDID mm, else its
+`SIM_DISPLAY_WIDTH_M/HEIGHT_M` defaults; its usual nominal viewer; `SIM_DISPLAY_FAKE_TRACKING`
+semantics unchanged).
+
 ### `set_pose_source`
 
 ```c
@@ -642,7 +683,8 @@ Flags (`XRT_PLUGIN_STEREO_CAMERA_*`) mirror the XR bits: `SHARED_WITH_EYE_TRACKI
 
 **Slot order.** The six slots are the LAST members of the iface, appended (ADR-020) after
 everything that was on `main` before them: `… vk_bundle_fn_table_offset` → `create_dp_d3d11_lift`
-(ADR-042) → `get_platform_state` (ADR-045) → `stereo_camera_enumerate … stereo_camera_close`.
+(ADR-042) → `get_platform_state` (ADR-045) → `stereo_camera_enumerate … stereo_camera_close`
+→ `get_display_info_for_monitor` (multi-screen M1, now the last member).
 `tests_stereo_camera` pins that order (lift right after the vk fingerprint, platform-state right
 after lift, the camera block right after platform-state and ending the struct), so a reorder or a
 slot squeezed in between fails on the host, not on a vendor box.
