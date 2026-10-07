@@ -178,7 +178,16 @@ build_dp_registry(struct xrt_system_compositor_info *info)
 
 	struct xrt_display_descriptor descs[XRT_DP_REGISTRY_MAX_ENTRIES];
 	uint32_t dn = target_plugin_build_descriptors(&edid, descs, XRT_DP_REGISTRY_MAX_ENTRIES);
-	target_plugin_resolve_displays(descs, dn, &info->dp_registry);
+
+	// Resolve into a local and publish it in one copy: the resolver zeroes its
+	// output before it takes the loader's lock, so resolving in place would
+	// expose an empty / half-built registry to a concurrent reader. Callers
+	// hold g_display_info_mutex (lock order: g_display_info_mutex, then the
+	// loader's g_refresh_mutex inside the resolver), which is what
+	// t_instance_enumerate_displays reads under (multi-screen M1).
+	struct xrt_dp_factory_registry reg;
+	target_plugin_resolve_displays(descs, dn, &reg);
+	info->dp_registry = reg;
 }
 
 static void
@@ -402,17 +411,18 @@ enum display_info_refresh_result
  * changed — the plug-in contract is "false fast while the panel is unknown,
  * true with real numbers once identified" (see docs/reference/xrt_plugin_iface.md).
  *
+ * Caller holds @ref g_display_info_mutex.
+ *
  * @return @ref DISPLAY_INFO_REFRESH_APPLIED if `info` was re-applied and the
  *         caller should re-resolve the desktop rect; see the enum for the rest.
  */
 static enum display_info_refresh_result
 refresh_display_info_from_plugin(struct xrt_system_compositor_info *info, const struct xrt_plugin_iface *plugin)
 {
+	// Caller holds g_display_info_mutex (refresh_display_processors_cb).
 	if (info == NULL || plugin == NULL || !g_display_info_mutex_initialized) {
 		return g_display_info_applied_valid ? DISPLAY_INFO_REFRESH_UNCHANGED : DISPLAY_INFO_REFRESH_UNKNOWN;
 	}
-
-	os_mutex_lock(&g_display_info_mutex);
 
 	bool applied = false;
 	struct xrt_device *head = g_display_info_head;
@@ -453,7 +463,6 @@ refresh_display_info_from_plugin(struct xrt_system_compositor_info *info, const 
 		result = DISPLAY_INFO_REFRESH_UNCHANGED;
 	}
 
-	os_mutex_unlock(&g_display_info_mutex);
 	return result;
 }
 
@@ -494,6 +503,17 @@ refresh_display_processors_cb(struct xrt_system_compositor_info *info)
 		    before->id ? before->id : "?", plugin->id ? plugin->id : "?");
 	}
 	fill_dp_factories_from_plugin(info, plugin);
+
+	// One critical section for the display info, the per-monitor registry
+	// and the desktop rect: t_instance_enumerate_displays (multi-screen M1)
+	// reads all three under this mutex, and two client connects run this
+	// callback concurrently. Lock order: g_display_info_mutex, then the
+	// loader's g_refresh_mutex (taken inside build_dp_registry's resolver and
+	// target_plugin_note_active_panel) — never the reverse.
+	const bool locked = g_display_info_mutex_initialized;
+	if (locked) {
+		os_mutex_lock(&g_display_info_mutex);
+	}
 	const enum display_info_refresh_result refreshed = refresh_display_info_from_plugin(info, plugin);
 	// #1721/#1722: while the panel is still unidentified this runs once a
 	// second from the IPC main loop, and a registry rebuild is not free — it
@@ -503,6 +523,9 @@ refresh_display_processors_cb(struct xrt_system_compositor_info *info)
 	// against; the registry from instance create still stands. Known geometry
 	// (client connect / compositor create, #342) keeps rebuilding as before.
 	if (!swapped && refreshed == DISPLAY_INFO_REFRESH_UNKNOWN) {
+		if (locked) {
+			os_mutex_unlock(&g_display_info_mutex);
+		}
 		return;
 	}
 	// Rebuild the per-monitor registry too — refresh_active invalidates the
@@ -513,6 +536,9 @@ refresh_display_processors_cb(struct xrt_system_compositor_info *info)
 	// same order as instance create: apply, registry, then the desktop rect.
 	if (refreshed == DISPLAY_INFO_REFRESH_APPLIED) {
 		fill_display_desktop_info(info);
+	}
+	if (locked) {
+		os_mutex_unlock(&g_display_info_mutex);
 	}
 }
 
@@ -914,7 +940,6 @@ out:
 		}
 		g_display_info_head = head;
 		g_display_info_applied_valid = false;
-		g_screens_info = &xsysc->info;
 		xsysc->info.refresh_display_processors = refresh_display_processors_cb;
 
 		// Vendor-neutral display-info population through the plug-in
@@ -951,6 +976,16 @@ out:
 		// sim_display expressing no preference — resolves to the primary
 		// monitor, which is the right answer for both readings.
 		fill_display_desktop_info(&xsysc->info);
+
+		// Publish the system to xrt_instance::enumerate_displays only now that
+		// its display info, registry and desktop rect are all built.
+		if (g_display_info_mutex_initialized) {
+			os_mutex_lock(&g_display_info_mutex);
+		}
+		g_screens_info = &xsysc->info;
+		if (g_display_info_mutex_initialized) {
+			os_mutex_unlock(&g_display_info_mutex);
+		}
 
 		// All display-info + DP factories are sourced from the plug-in
 		// iface above (ADR-019 / #256 / #263). The runtime DLL no longer
@@ -999,8 +1034,11 @@ t_instance_get_active_plugin(struct xrt_instance *xinst,
  * xrt_instance::enumerate_displays (multi-screen M1) — the screen list of the
  * system this instance created, built from its per-monitor registry and the
  * display info applied to it. The service answers `system_enumerate_displays`
- * through this too. Serialised with the refresh callback, which rewrites
- * both on a client connect.
+ * through this too. Reads under g_display_info_mutex, the lock
+ * refresh_display_processors_cb holds across its whole rewrite (display info,
+ * then the registry — resolved into a local and published in one copy — then
+ * the desktop rect), so a reader never sees an empty or half-built registry
+ * while another client's connect refreshes it.
  */
 static xrt_result_t
 t_instance_enumerate_displays(struct xrt_instance *xinst, struct xrt_screen_list *out_list)
@@ -1010,19 +1048,19 @@ t_instance_enumerate_displays(struct xrt_instance *xinst, struct xrt_screen_list
 		return XRT_ERROR_ALLOCATION;
 	}
 	memset(out_list, 0, sizeof(*out_list));
-	if (g_screens_info == NULL) {
+	if (!g_display_info_mutex_initialized) {
 		return XRT_SUCCESS; // no system (or no compositor) yet: no screens
 	}
 
-	if (g_display_info_mutex_initialized) {
-		os_mutex_lock(&g_display_info_mutex);
+	os_mutex_lock(&g_display_info_mutex);
+	if (g_screens_info == NULL) {
+		os_mutex_unlock(&g_display_info_mutex);
+		return XRT_SUCCESS;
 	}
 	struct target_screens_system sys;
 	target_screens_system_from_info(g_screens_info, &sys);
 	target_screens_build(&g_screens_info->dp_registry, g_screens_info->active_plugin_id, &sys, out_list);
-	if (g_display_info_mutex_initialized) {
-		os_mutex_unlock(&g_display_info_mutex);
-	}
+	os_mutex_unlock(&g_display_info_mutex);
 	return XRT_SUCCESS;
 }
 
