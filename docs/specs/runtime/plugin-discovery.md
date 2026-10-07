@@ -531,7 +531,41 @@ monitor …  3840x2160 @ (3456,0)   ACR 0001  344x193 mm  output=HDMI-1  → lei
 
 On Linux nothing in the compositors reads the registry yet. The Vulkan
 compositor uses the scalar `dp_factory_*`, so this milestone changes no
-weaving. macOS and Android still enumerate no monitors.
+weaving. macOS and Android still enumerate no monitors. (Since multi-screen M2/M3
+the Vulkan compositor does read it for a window spanning screens: each segment's DP
+comes from that screen's registry entry, mixed vendors included —
+`docs/architecture/comp-segments.md`.)
+
+**The winner per monitor**, in order (`target_screen_pick`,
+`src/xrt/targets/common/target_screen_pin.{h,c}`, unit-tested by
+`tests/tests_target_screen_pin.cpp`):
+
+1. a **per-screen pin** (`DXR_SCREEN_PLUGIN`, below) whose plug-in claims the monitor;
+2. the **PreferredPlugin** override (#791, §2.1/§3.3), if that plug-in claims it;
+3. the **active** plug-in, if it claims it (#1521);
+4. the highest **confidence**, ties to the lower ProbeOrder.
+
+**`DXR_SCREEN_PLUGIN` — pin one monitor to a plug-in** (multi-screen M4, #793 phase 3).
+`DXR_SCREEN_PLUGIN=<match>=<plugin-id>[,<match>=<plugin-id>…]`, where `<match>` is
+the monitor's RandR output name (`HDMI-1`), its DRM connector (`HDMI-A-1`) — both
+case-insensitive — or its monitor id in hex (`0x886e4475353b22b9`, `0x` optional).
+For that monitor only, the pin outranks rules 2–4; every other monitor resolves
+exactly as before. The global PreferredPlugin pin makes sim-display win every
+monitor it claims — on `ds1-linux` that includes the DS1, which sim claims at
+FALLBACK while leia-sr claims it VERIFIED — so a sim-display session with the DS1
+still woven by leia-sr is:
+
+```
+XRT_PREFERRED_PLUGIN_ID=sim-display DXR_SCREEN_PLUGIN=HDMI-1=leia-sr <app>
+```
+
+Logging: one INFO line per applied pin (`… → 'leia-sr' by DXR_SCREEN_PLUGIN`); a
+WARN when a pin names a plug-in with no claim on that monitor (the pin is ignored
+there), when the pinned plug-in offers no display-processor factory for it, when an
+entry names no known monitor, and for malformed entries. Read at every registry
+resolve (session/system create), like the other loader env overrides. The pinned
+plug-in must be loaded as a claim source, so `DXR_PLUGIN_EXCLUSIVE` naming another
+plug-in defeats it.
 
 ---
 

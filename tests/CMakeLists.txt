@@ -63,6 +63,7 @@ set(tests
     tests_oxr_layer_space
     tests_oxr_view_config_rule
     tests_oxr_segment_views
+    tests_target_screen_pin
     tests_oxr_legacy_mode_rule
     tests_oxr_mode_fillable_rule
     tests_oxr_tracking_properties_rule
@@ -604,6 +605,11 @@ target_link_libraries(tests_comp_segments PRIVATE xrt-interfaces aux_util)
 target_sources(tests_oxr_segment_views PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr/oxr_segment_views.c)
 target_include_directories(tests_oxr_segment_views PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr)
 target_link_libraries(tests_oxr_segment_views PRIVATE xrt-interfaces aux_math)
+
+# Multi-screen M4 — DXR_SCREEN_PLUGIN (per-screen plug-in pin) and the per-monitor
+# winner rule of the DP registry, pure functions of target_screen_pin.c.
+target_sources(tests_target_screen_pin PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/common/target_screen_pin.c)
+target_include_directories(tests_target_screen_pin PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/common)
 
 if(XRT_BUILD_DRIVER_HANDTRACKING)
 	target_link_libraries(

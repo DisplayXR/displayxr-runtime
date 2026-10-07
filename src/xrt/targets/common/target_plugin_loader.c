@@ -21,6 +21,7 @@
  */
 
 #include "target_plugin_loader.h"
+#include "target_screen_pin.h"
 #include "xrt/xrt_config_have.h"
 
 #ifdef XRT_HAVE_VULKAN
@@ -3835,111 +3836,110 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 	char preferred_id[64] = {0};
 	bool have_preferred = target_plugin_get_preferred(preferred_id, sizeof(preferred_id));
 
-	// Resolve per monitor: highest confidence wins; ties → lower ProbeOrder.
-	// Sources are already in ascending ProbeOrder, so a strict `>` keeps the
-	// first (lowest-order) source at any given confidence.
+	/*
+	 * Multi-screen M4 (#793 phase 3): DXR_SCREEN_PLUGIN pins ONE monitor to a
+	 * plug-in, outranking the global rules below for that monitor only. Read
+	 * per resolve (it is a test/bring-up knob, and resolve is rare).
+	 */
+	struct target_screen_pins pins;
+	uint32_t pins_malformed = 0;
+	target_screen_pin_parse(getenv("DXR_SCREEN_PLUGIN"), &pins, &pins_malformed);
+	bool pin_used[TARGET_SCREEN_PIN_MAX] = {false};
+	if (pins_malformed > 0) {
+		U_LOG_W("plugin loader: DXR_SCREEN_PLUGIN has %u malformed entr%s (expected "
+		        "<output|connector|monitor-id-hex>=<plugin-id>[,...]) — ignored",
+		        pins_malformed, pins_malformed == 1 ? "y" : "ies");
+	}
+
+	/*
+	 * The winner per monitor (target_screen_pick, unit-tested): a per-screen
+	 * pin, then PreferredPlugin (#791), then the active plug-in (#1521), then
+	 * highest confidence with ties to the lower ProbeOrder (sources are in
+	 * ascending ProbeOrder).
+	 */
 	for (uint32_t d = 0; d < dn; d++) {
 		const struct xrt_display_descriptor *desc = &descriptors[d];
 		const struct plugin_display_source *best_src = NULL;
 		const struct xrt_display_claim *best_claim = NULL;
 
-		// Preferred-plugin override (#791): if the pinned source claims this
-		// monitor, it wins regardless of confidence / ProbeOrder.
-		if (have_preferred) {
-			for (int s = 0; s < g_display_source_count && best_claim == NULL; s++) {
-				const struct xrt_plugin_iface *sif = g_display_sources[s].iface;
-				const char *sid = (sif != NULL && sif->id != NULL) ? sif->id : NULL;
-				if (sid == NULL || strcmp(sid, preferred_id) != 0) {
+		// Every source's claim on this monitor, in source order.
+		struct target_screen_candidate cands[TARGET_PLUGIN_MAX_SOURCES];
+		const struct plugin_display_source *cand_src[TARGET_PLUGIN_MAX_SOURCES];
+		const struct xrt_display_claim *cand_claim[TARGET_PLUGIN_MAX_SOURCES];
+		uint32_t nc = 0;
+		for (int s = 0; s < g_display_source_count && nc < TARGET_PLUGIN_MAX_SOURCES; s++) {
+			for (uint32_t c = 0; c < src_claim_count[s]; c++) {
+				if (src_claims[s][c].monitor_id != desc->monitor_id) {
 					continue;
 				}
-				for (uint32_t c = 0; c < src_claim_count[s]; c++) {
-					if (src_claims[s][c].monitor_id == desc->monitor_id) {
-						best_src = &g_display_sources[s];
-						best_claim = &src_claims[s][c];
-						break;
-					}
-				}
-			}
-			if (best_claim != NULL) {
-				U_LOG_W("plugin loader: monitor 0x%016llx → PreferredPlugin override '%s' "
-				        "(forced over EDID confidence)",
-				        (unsigned long long)desc->monitor_id, preferred_id);
+				const struct xrt_plugin_iface *sif = g_display_sources[s].iface;
+				cands[nc].plugin_id = (sif != NULL && sif->id != NULL) ? sif->id : "";
+				cands[nc].confidence = (uint32_t)src_claims[s][c].confidence;
+				cands[nc].is_active = g_active_iface != NULL && sif == g_active_iface;
+				cand_src[nc] = &g_display_sources[s];
+				cand_claim[nc] = &src_claims[s][c];
+				nc++;
+				break; // one claim per source per monitor
 			}
 		}
 
-		// #1521: the ACTIVE plug-in wins any monitor it claims. ProbeOrder
-		// forcing (`scripts\run_cts.ps1 -Plugin <id>`, `register_dev_plugin.bat`)
-		// steers only discover_active_plugin, and the scalar `dp_factory_*` follow
-		// that active plug-in — so without this the registry could name a DIFFERENT
-		// vendor and the registry-routed APIs (in-process GL, the D3D11 service
-		// compositor; both via comp_dp_factory_for_window) would weave with a
-		// different DP than the scalar-routed ones (in-process D3D11/D3D12/VK/Metal).
-		// That is exactly the sim-forced-active-but-Leia-wins-on-EDID-confidence
-		// case. On a normal box this is a no-op: the active plug-in IS the lowest-
-		// ProbeOrder vendor, which is also the confidence winner on the monitors it
-		// claims. A vendor does not claim monitors that are not its own, so those
-		// still fall through to confidence below — sim's FALLBACK backstop and the
-		// Phase 3b multi-vendor intent are preserved. PreferredPlugin (#791) is
-		// resolved first and still outranks this.
-		if (best_claim == NULL) {
-			// What confidence alone would pick: highest confidence wins; ties →
-			// lower ProbeOrder. Sources are already in ascending ProbeOrder, so a
-			// strict `>` keeps the first (lowest-order) source at any confidence.
-			const struct plugin_display_source *conf_src = NULL;
-			const struct xrt_display_claim *conf_claim = NULL;
-			for (int s = 0; s < g_display_source_count; s++) {
-				for (uint32_t c = 0; c < src_claim_count[s]; c++) {
-					const struct xrt_display_claim *cl = &src_claims[s][c];
-					if (cl->monitor_id != desc->monitor_id) {
-						continue;
-					}
-					if (conf_claim == NULL || cl->confidence > conf_claim->confidence) {
-						conf_claim = cl;
-						conf_src = &g_display_sources[s];
-					}
-				}
+		// This monitor's names, for the pin match (the side table is
+		// guarded by g_refresh_mutex, which this function holds).
+		const char *out_name = "";
+		const char *conn_name = "";
+		for (uint32_t i = 0; i < g_monitor_side_count; i++) {
+			if (g_monitor_side[i].monitor_id == desc->monitor_id) {
+				out_name = g_monitor_side[i].mon.output_name;
+				conn_name = g_monitor_side[i].mon.connector;
+				break;
 			}
+		}
+		const int pin_idx = target_screen_pin_find(&pins, desc->monitor_id, out_name, conn_name);
+		const char *pin_plugin = pin_idx >= 0 ? pins.pin[pin_idx].plugin_id : NULL;
+		if (pin_idx >= 0) {
+			pin_used[pin_idx] = true;
+		}
 
-			// The active plug-in's own claim for this monitor, if it has one.
-			const struct plugin_display_source *act_src = NULL;
-			const struct xrt_display_claim *act_claim = NULL;
-			if (g_active_iface != NULL) {
-				for (int s = 0; s < g_display_source_count && act_claim == NULL; s++) {
-					if (g_display_sources[s].iface != g_active_iface) {
-						continue;
-					}
-					for (uint32_t c = 0; c < src_claim_count[s]; c++) {
-						if (src_claims[s][c].monitor_id == desc->monitor_id) {
-							act_src = &g_display_sources[s];
-							act_claim = &src_claims[s][c];
-							break;
-						}
-					}
-				}
-			}
+		enum target_screen_pick_reason reason = TARGET_SCREEN_PICK_NONE;
+		bool pin_unclaimed = false;
+		const int pick =
+		    target_screen_pick(cands, nc, pin_plugin, have_preferred ? preferred_id : NULL, &reason, &pin_unclaimed);
+		if (pin_unclaimed) {
+			U_LOG_W("plugin loader: DXR_SCREEN_PLUGIN pins monitor 0x%016llx ('%s'/'%s') to '%s', which has no "
+			        "claim on it — the pin is ignored for this monitor",
+			        (unsigned long long)desc->monitor_id, out_name, conn_name, pin_plugin);
+		}
+		if (pick >= 0) {
+			best_src = cand_src[pick];
+			best_claim = cand_claim[pick];
+		}
 
-			if (act_claim != NULL) {
-				best_src = act_src;
-				best_claim = act_claim;
-				// One-off per monitor, and only when the override actually
-				// changes the outcome.
-				if (conf_claim != NULL && conf_claim != act_claim) {
-					const struct xrt_plugin_iface *aif = act_src->iface;
-					const struct xrt_plugin_iface *cif = conf_src->iface;
-					const char *aid = (aif != NULL && aif->id != NULL) ? aif->id : "?";
-					const char *cid = (cif != NULL && cif->id != NULL) ? cif->id : "?";
-					U_LOG_W(
-					    "plugin loader: monitor 0x%016llx → ACTIVE plug-in '%s' "
-					    "(confidence=%u, ProbeOrder=%u) forced over '%s' (confidence=%u) — "
-					    "the weaving DP follows the active plug-in so registry-routed APIs "
-					    "(GL, service D3D11) match the scalar-routed ones (#1521)",
-					    (unsigned long long)desc->monitor_id, aid, (unsigned)act_claim->confidence,
-					    act_src->probe_order, cid, (unsigned)conf_claim->confidence);
-				}
-			} else {
-				best_src = conf_src;
-				best_claim = conf_claim;
+		// What confidence alone would pick, for the override logs.
+		int conf_pick = -1;
+		for (uint32_t i = 0; i < nc; i++) {
+			if (conf_pick < 0 || cands[i].confidence > cands[conf_pick].confidence) {
+				conf_pick = (int)i;
 			}
+		}
+
+		if (reason == TARGET_SCREEN_PICK_PIN) {
+			U_LOG_I("plugin loader: monitor 0x%016llx ('%s'/'%s') → '%s' by DXR_SCREEN_PLUGIN (confidence=%u; "
+			        "outranks PreferredPlugin and the active plug-in for this monitor)",
+			        (unsigned long long)desc->monitor_id, out_name, conn_name, cands[pick].plugin_id,
+			        cands[pick].confidence);
+		} else if (reason == TARGET_SCREEN_PICK_PREFERRED) {
+			U_LOG_W("plugin loader: monitor 0x%016llx → PreferredPlugin override '%s' "
+			        "(forced over EDID confidence)",
+			        (unsigned long long)desc->monitor_id, preferred_id);
+		} else if (reason == TARGET_SCREEN_PICK_ACTIVE && conf_pick >= 0 && conf_pick != pick) {
+			// One-off per monitor, and only when the override changes the outcome.
+			U_LOG_W(
+			    "plugin loader: monitor 0x%016llx → ACTIVE plug-in '%s' "
+			    "(confidence=%u, ProbeOrder=%u) forced over '%s' (confidence=%u) — "
+			    "the weaving DP follows the active plug-in so registry-routed APIs "
+			    "(GL, service D3D11) match the scalar-routed ones (#1521)",
+			    (unsigned long long)desc->monitor_id, cands[pick].plugin_id, cands[pick].confidence,
+			    cand_src[pick]->probe_order, cands[conf_pick].plugin_id, cands[conf_pick].confidence);
 		}
 		if (best_claim == NULL) {
 			continue; // no plug-in claimed this monitor
@@ -3948,6 +3948,20 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 		fill_registry_entry(e, desc, best_src, best_claim);
 		U_LOG_I("plugin loader: monitor 0x%016llx → plug-in '%s' (confidence=%u)",
 		        (unsigned long long)e->monitor_id, e->plugin_id, e->confidence);
+		if (reason == TARGET_SCREEN_PICK_PIN && e->dp_factory_vk == NULL && e->dp_factory_gl == NULL &&
+		    e->dp_factory_d3d11 == NULL && e->dp_factory_d3d12 == NULL && e->dp_factory_metal == NULL) {
+			U_LOG_W("plugin loader: DXR_SCREEN_PLUGIN pinned monitor 0x%016llx to '%s', but it offers no "
+			        "display-processor factory for it — that screen will not be woven",
+			        (unsigned long long)e->monitor_id, e->plugin_id);
+		}
+	}
+
+	for (uint32_t i = 0; i < pins.count; i++) {
+		if (!pin_used[i]) {
+			U_LOG_W("plugin loader: DXR_SCREEN_PLUGIN entry '%s=%s' names no known monitor (match an output "
+			        "or connector name, e.g. HDMI-1 / HDMI-A-1, or a monitor id in hex)",
+			        pins.pin[i].match, pins.pin[i].plugin_id);
+		}
 	}
 
 	if (g_refresh_mutex_initialized) {
