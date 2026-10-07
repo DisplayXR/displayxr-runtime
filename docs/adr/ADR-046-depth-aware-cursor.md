@@ -276,55 +276,58 @@ existing struct grows). With f the display normal away from the viewer and e = d
 |---|---|---|---|
 | SCREEN (v1/v2) | E + t·(S − E) | exact, always | none: reads as at the glass |
 | WORLD | S − f·(1 − t)·e | ~1–2 mm off for an off-axis viewer, always | correct |
-| **HYBRID (default)** | moving: SCREEN, and store the foot F = C + f·(1 − t)·e; still: F − f·(1 − t)·e | exact while moving | correct while still |
+| **HYBRID (default)** | moving: SCREEN, and store the line of sight (E₀, S₀, D₀ = e); still: E₀ + s·(S₀ − E₀), s = 1 − (1 − t)·e / D₀ | exact while moving, and on the click point while still unless the head moves | correct while still |
 
 "Moving" means `cursorUV` changed by more than 1e-4 since the last moving placement. HYBRID
 re-anchors on the first hinted locate and whenever the time filter re-primes; the anchor lives
-beside the filter in the session and is touched only by a hinted locate, so §0 holds. On the
-frame the pointer stops, the still placement equals the last moving one exactly (unit-tested), so
-there is no jump.
+beside the filter in the session and is touched only by a hinted locate, so §0 holds.
+
+**The anchor is the line of sight at the last pointer move, not a point.** While the pointer is
+still, C is the point on the anchor-time line E₀ → S₀ whose distance in front of the glass,
+(1 − s)·D₀, equals the current depth (1 − t)·e. Three properties follow, all unit-tested:
+
+- **Continuity:** on the frame the pointer stops, the geometry is the anchor's, so s = t and C is
+  the last moving placement exactly. No jump.
+- **Parallax:** a lateral head move at fixed t leaves e, and so s and C, unchanged. The sprite is
+  world-fixed and parallaxes like content at its depth.
+- **No drift from depth changes:** when the content under a still pointer changes depth, C slides
+  along the anchor-time line, so from the eye that aimed it, it stays on the click point.
+
+An earlier draft of the rule stored the line's *foot* on the glass and lifted C from it along the
+display normal. The headless captures below exposed the flaw: a depth change under a still
+pointer then moved the sprite off the click point by about |Δd| × the viewer's lateral offset
+(27 px for sim_display's viewer, 0.10 m above the canvas centre, when the scripted pointer
+anchored at d = 0 on frame 1 and the cursor then rose to the cube). The web SDK takes the same
+line-of-sight rule (inline3d 1.37.1).
 
 **Why HYBRID beats both pure modes.** While the pointer moves, the user is aiming, and the eye
 tracks the cursor, not the head; there SCREEN's exact aim is what matters and a parallax deficit
 over a few frames is invisible. While it is still, the user is looking at the scene, often moving
 their head to see around it, and the cursor must parallax like the content it rests on; there
-WORLD's behaviour is right. The cost is drift of the drawn sprite from the click point, and it
-accrues **only while the pointer is still**. It has two terms, both derived from
-C = F − f·(1 − t)·e:
-
-- **head motion:** the image moves on the glass by |d| × the head's lateral displacement. For
-  content near the glass (d ≈ −0.005 with the new margin), 20 cm of head motion moves it about
-  1 mm;
-- **depth change under a still pointer:** if the filtered disparity moves from d₀ (when the
-  anchor was stored) to d, the image moves by about |d − d₀| × the viewer's lateral offset from
-  the pointer's canvas point. The sprite rises along the display normal, not along the line of
-  sight.
-
-The next mouse movement re-aims it exactly. Hit testing is unchanged: the click is always at the
-pointer's canvas point.
-
-The second term shows up in the headless evidence below. A scripted pointer never moves, so the
-anchor is stored on the first frame, before the app's hit test has a view to cast from (d₀ = 0).
-The cursor then rises to the cube with the pointer still, and sim_display's nominal viewer sits
-0.10 m above the canvas centre. So HYBRID's sprite there lands where WORLD's does, about 27 px
-below the click point, while SCREEN's stays on it. In interactive use the pointer reaches content
-by moving, so the anchor is stored at the content's depth, and the term is only what the content
-itself does under a still pointer.
+WORLD's behaviour is right. The only cost is that the drawn sprite drifts from the click point as
+the **head** moves while the pointer is still: its image on the glass moves by about |d| × the
+head's lateral displacement. For content near the glass (d ≈ −0.005 with the new margin), 20 cm of
+head motion moves it about 1 mm. The next mouse movement re-aims it exactly. Hit testing is
+unchanged: the click is always at the pointer's canvas point.
 
 **Evidence** (macOS, sim_display SBS, `cube_handle_metal_macos`, `DISPLAYXR_CURSOR_DEPTH_UV=0.5,0.5`,
 atlas 1512×1646, two tiles of 1512×823 stacked; disparity = cursor x in the right-eye tile minus
-the left-eye tile; the cube's nearest edge under the cursor is about −15 px):
+the left-eye tile; the cube's nearest edge under the cursor is about −15 px). The scripted pointer
+never moves, so HYBRID anchors on frame 1 at d = 0 and the cursor then rises to the cube with the
+pointer still: the depth-change case.
 
 | `DISPLAYXR_CURSOR_DEPTH_ANCHOR` | Target d | Cursor disparity | Cursor y in tile (pointer at 411) |
 |---|---|---|---|
-| unset (options not chained → HYBRID) | −0.041 | −15.4 px | 436 |
-| `hybrid` | −0.040 | −16.6 px | 438 |
+| unset (options not chained → HYBRID) | −0.040 | −16.6 px | 411 |
+| `hybrid` | −0.040 | −16.6 px | 411 |
 | `screen` | −0.040 | −16.6 px | 411 |
-| `world` | −0.040 | −16.7 px | 438 |
+| `world` | −0.040 | −16.6 px | 438 |
+| *foot-anchored draft of HYBRID* | *−0.040* | *−16.6 px* | *438* |
 | *before v3: 0.03 margin, SCREEN (§5)* | *−0.066* | *−23.4 px* | — |
 
-All four sit just in front of the cube's edge, about 7 px nearer it than with the old margin.
-In every capture the midpoint of the two cursor images is at the requested u (0.4995).
+All sit just in front of the cube's edge, about 7 px nearer it than with the old margin. HYBRID
+stays on the click point like SCREEN; WORLD sits 27 px below it for this off-axis viewer. In every
+capture the midpoint of the two cursor images is at the requested u (0.4995).
 
 **A deliberate default change.** An app that doesn't chain the options struct gets HYBRID and
 the 0.005 margin, which is different from v2. It is tester-driven, both changes go the same way
@@ -350,12 +353,13 @@ implements the identical rule with the same numbers.
   mouse is a 2D screen-space device and its click target must not drift. Testing on a real
   head-tracked panel showed the price: a sprite with disparity but no motion parallax conflicts
   with everything around it that does parallax, and reads as at the glass. The default is now
-  HYBRID: screen-anchored while the pointer moves (exact aim), world-fixed while it is still
-  (correct parallax, unit-tested: the sprite does not move in locate space as the head moves).
-  The click target never drifts, because hit testing stays at the pointer's canvas point; only
-  the drawn sprite drifts, and only until the mouse next moves: by |d| × head displacement
-  (about 1 mm for 20 cm of head motion over content near the glass), plus |Δd| × the viewer's
-  lateral offset when the content's depth changes under a still pointer (§7). SCREEN and WORLD remain
+  HYBRID: screen-anchored while the pointer moves (exact aim), and anchored to that line of
+  sight while it is still (correct parallax, unit-tested: the sprite does not move in locate
+  space as the head moves laterally).
+  The click target never drifts, because hit testing stays at the pointer's canvas point. Only
+  the drawn sprite drifts, by |d| × head displacement (about 1 mm for 20 cm of head motion over
+  content near the glass), and only until the mouse next moves. A depth change under a still
+  pointer does not drift it: the anchor is the line of sight, not a point (§7). SCREEN and WORLD remain
   available through `XrCursorDepthOptionsDXR`.
 - An app-drawn cursor shows the app's frame latency, not the hardware cursor's. Phase 2's late
   cursor read narrows that but cannot remove it. This is inherent to any cursor that has
