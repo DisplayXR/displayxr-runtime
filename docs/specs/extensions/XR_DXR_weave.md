@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | **Extension Name** | `XR_DXR_weave` |
-| **Spec Version** | 13 |
+| **Spec Version** | 17 |
 | **Extension Type** | Instance extension (service path — Windows/D3D11, macOS/comp_multi-Vulkan #759, Android/comp_multi-Vulkan #1036, desktop Linux/comp_multi-Vulkan dma-buf #1699 when the service carries its engine; the snap and its bulk grid form also work in-process on desktop Linux, §5c / #1588 / #1723) |
 | **Header** | `src/external/openxr_includes/openxr/XR_DXR_weave.h` (canonical; auto-syncs to `displayxr-extensions`) |
 | **Status** | Provisional (`1004999190–198` type block, pending Khronos registry; `199` reserved, see §2c; v9+ additions in a fresh `1004999240–249` decade — 240 v9, 241–245 v10, 246 v11, 247–248 v12) |
@@ -719,6 +719,44 @@ a refused submit instead of presenting a frame whose 2D is missing. Desktop-Linu
 v16 dropped the unreadable overlay and wove anyway, so such a caller gates on
 `extensionVersion >= 16`.
 
+**An overlay whose size is not the window's is ignored for that submit (v17).** The overlay is
+window-sized by definition. In a resize race a producer keeps handing its old overlay buffer — the
+OLD window's size — for a frame or more after the window (and so the input and the woven output)
+changed size. From v17 the desktop-Linux engine treats such an overlay as **absent for that
+submit**: the content is woven as if no overlay were chained (no display-processor offer, no
+post-weave blend, no redraw over off-panel bands or flat regions), and the submit is
+**accepted** — refusing it would hold the caller's frames through every resize. Refusal stays
+reserved for an overlay that cannot be imported at all (v16). Before v17 the runtime's own
+post-weave blend composited a smaller overlay as if it were window-sized (stretched over the whole
+output: misplaced 2D and a black margin); the display processor never took it, since its slot
+requires the exact output size. The window size is the submit's input size for a batch submit
+(`XrWeaveSubmitRectsDXR`), and the bound geometry's client size otherwise (for a legacy single
+rect without geometry, the rect's offset + extent; a v6 N-view submit without geometry has no
+reference and is not checked). One WARN in the service log when the overlay goes stale
+(`weave: stale overlay WxH vs output WxH — ignored until it matches`) and one when it matches again.
+
+How the engine knows the overlay's size:
+
+- **dma-buf** (`XrWeaveOverlayDmabufDescDXR`): the declared `width` × `height`. A mismatched
+  overlay is not imported at all.
+- **Stage A `OPAQUE_FD`**: nothing on the wire carries a size — `XrWeaveSubmitOverlaysDXR` has no
+  extent and an fd has none — so the import size is *inferred* from the window, which is exactly
+  what a stale buffer breaks. Adding a size to the IPC message would not help: the app-facing
+  stage-A call has no field to fill it from. The engine recovers the size instead: an fd whose
+  inode it has already imported is that import's size (the import cache keeps the allocation alive,
+  and an allocation never changes size), and an fd it has never seen whose allocation is smaller
+  than `width × height × 4` bytes cannot be window-sized in any tiling. A never-seen stage-A buffer
+  that is *larger* than the window is not detectable; a caller that needs that case covered uses
+  the dma-buf transport, whose descriptor declares the size.
+
+A caller whose overlay IS its 2D reads an accepted submit with a mismatched overlay as "woven
+without the 2D" from v17 on (it knows both sizes, so it knows when that happens); against an older
+desktop-Linux runtime it keeps a mismatched overlay off the wire itself.
+
+With v14, a frame whose overlay was ignored also resets "unchanged": the first overlay the display
+processor is offered after one is passed as changed, whatever the caller declared, since the
+display processor's cached layer predates the ignored frames.
+
 **The import cache.** An fd is not an identity: every hand-off is a new number. The service
 keys its input import cache on `bufferId` when non-zero and on the fd's `(st_dev, st_ino)`
 otherwise, so a producer rotating a small pool re-uses imports instead of re-importing each
@@ -921,6 +959,11 @@ any unknown chained struct. One `weave(v13)` WARN in the service log per edge.
 | 15 | `XrWeaveSubmitOverlayFilterDXR` — the caller's lens-filter strength for the 2D overlay, 0..1; omitted = the DP's own default (§2d). |
 | 16 | No new structure: on desktop Linux a submit whose chained overlay the engine cannot import is **refused before the woven output is touched** (§5d), as the D3D11 service always did; before v16 the Linux engine dropped the overlay and wove anyway. A desktop-Linux caller that hands its whole 2D over as the overlay gates on `extensionVersion >= 16`. The macOS and Android engines still drop an unreadable overlay. |
 | 14 | `XrWeaveSubmitOverlayUnchangedDXR` — the v4 overlay atlas holds the previous accepted submit's pixels, so a DP may reuse its lens prefilter of the 2D layer (ADR-027 Amendment; §2d). |
+| 17 | No new structure: on desktop Linux an overlay whose size is not the submit's window size (a stale buffer in a resize race) is **ignored for that submit** — woven without it, accepted, not refused (§5d); before v17 the runtime's post-weave blend stretched it over the output. Qualifies v16: "accepted with an overlay chained" means "composited" for a window-sized overlay. |
+
+**v17 is a gate for the same caller as v16**: one whose overlay IS its 2D must not rely on a
+mismatched overlay being dropped by an older desktop-Linux runtime, which composites it stretched;
+it keeps such an overlay off the wire there instead.
 
 **v16 is a gate for one kind of caller**: one whose overlay IS its 2D (a whole-page overlay)
 must not send it to an older desktop-Linux runtime, which would weave without it and return

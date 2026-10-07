@@ -1054,6 +1054,22 @@ struct multi_compositor
 		//! Submits refused because their chained overlay could not be
 		//! imported (weave_overlay_refused; throttles its log line).
 		uint32_t overlay_refusals;
+
+		/*!
+		 * @name Stale overlay (resize race)
+		 * A chained overlay whose real / declared size is not the window
+		 * size of the submit it rides (the producer has not reallocated it
+		 * after a resize yet) is IGNORED for that frame — not refused, not
+		 * blended — see weave_overlay_gate. @c overlay_stale is the current
+		 * state so the WARN fires once per transition; @c overlay_force_changed
+		 * makes the next overlay offered to the DP carry layer_unchanged =
+		 * false, since the DP's cached layer predates the ignored frames.
+		 * @{
+		 */
+		bool overlay_stale;
+		bool overlay_force_changed;
+		uint32_t overlay_stale_frames; //!< Frames ignored in the current stale run.
+		                               //! @}
 	} weave;
 #endif
 };

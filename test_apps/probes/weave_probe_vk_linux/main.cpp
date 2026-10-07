@@ -28,6 +28,11 @@
  *      --service-pid) of the service must stay flat.
  *   6. Spec-v6 N-view atlas (2x1 red|cyan, zero-copy) -> WHITE.
  *
+ * Both the stage-A run and --dmabuf also run the resize race (spec v17): an
+ * overlay whose size is not the window's must be ignored for its frames —
+ * accepted, woven, nothing of it composited — and the window-sized overlay
+ * composited again right after (stale_check).
+ *
  * Stage-A image contract (both sides, identical creation parameters — a
  * requirement of a dedicated OPAQUE_FD import): VK_FORMAT_B8G8R8A8_UNORM, 2D,
  * 1 mip, 1 layer, TILING_OPTIMAL, usage COLOR_ATTACHMENT | SAMPLED |
@@ -672,6 +677,58 @@ fill_input(Buffer &b, uint32_t fourcc, bool swapped)
 	memcpy(b.map, px.data(), px.size());
 }
 
+/*
+ * Resize race: a STALE v4 overlay (the producer has not reallocated it after a
+ * window resize, so it is the OLD window's size) must be IGNORED for the frame
+ * — the content woven as if no overlay were chained — not refused, and not
+ * stretched over the output (the runtime's post-weave blend did that: a black
+ * margin and misplaced 2D). The stale overlay is opaque GREEN everywhere, so
+ * any composite of it shows up as green at every probe point; the window-sized
+ * overlay is the magenta bar, which must come back once the overlay matches.
+ */
+static const uint32_t kStaleW = 960;
+static const uint32_t kStaleH = 540;
+
+//! Opaque green over the whole @p w x @p h buffer (BGRA, premul == straight).
+static std::vector<uint8_t>
+stale_overlay_pixels(uint32_t w, uint32_t h)
+{
+	std::vector<uint8_t> px((size_t)w * h * 4);
+	for (uint32_t y = 0; y < h; y++) {
+		for (uint32_t x = 0; x < w; x++) {
+			put_px(px, w, (int)x, (int)y, 0, 230, 0, 255);
+		}
+	}
+	return px;
+}
+
+/*!
+ * One readback of the resize-race case: rect A woven (@p a_red: red, else
+ * cyan), no green anywhere sampled, the gap transparent, and the bar magenta
+ * iff @p want_bar (else transparent: nothing composited there).
+ */
+static bool
+stale_check(const std::vector<uint8_t> &px, uint32_t w, bool a_red, bool want_bar, const char *what)
+{
+	uint8_t ar, ag, ab, aa, vr, vg, vb, va, gr, gg, gb, ga;
+	sample(px, w, kRectA.offset.x + kRectA.extent.width / 2, kRectA.offset.y + kRectA.extent.height / 2, &ar, &ag,
+	       &ab, &aa);
+	sample(px, w, kOverlayBar.offset.x + kOverlayBar.extent.width / 2,
+	       kOverlayBar.offset.y + kOverlayBar.extent.height / 2, &vr, &vg, &vb, &va);
+	sample(px, w, 10, 10, &gr, &gg, &gb, &ga);
+	auto green = [](uint8_t r, uint8_t g, uint8_t b) { return g > 150 && r < 80 && b < 80; };
+	const bool a_ok = a_red ? (ar > 150 && ag < 80 && ab < 80) : (ar < 80 && ag > 150 && ab > 150);
+	const bool no_green = !green(ar, ag, ab) && !green(vr, vg, vb) && !green(gr, gg, gb);
+	const bool bar_magenta = vr > 150 && vb > 150 && vg < 80 && va > 200;
+	const bool bar_ok = want_bar ? bar_magenta : (!bar_magenta && va < 40);
+	const bool gap_ok = ga < 40;
+	const bool ok = a_ok && no_green && bar_ok && gap_ok;
+	LOG("stale overlay: %s: rectA (%u,%u,%u) bar (%u,%u,%u,a=%u) gap (%u,%u,%u,a=%u) want %s, bar %s -> %s", what,
+	    ar, ag, ab, vr, vg, vb, va, gr, gg, gb, ga, a_red ? "red" : "cyan", want_bar ? "MAGENTA" : "absent",
+	    ok ? "OK" : "WRONG");
+	return ok;
+}
+
 /*!
  * The whole --dmabuf run. Two window-sized inputs (input[0] ARGB8888 = BGRA
  * bytes, input[1] ABGR8888 = RGBA bytes, so both fourcc mappings are exercised)
@@ -985,6 +1042,97 @@ run_dmabuf(Vk &vk,
 		}
 		if (bogus >= 0) {
 			close(bogus);
+		}
+	}
+
+	// ---- Resize race: a STALE overlay (declared 960x540 under a 1280x720
+	// window) is ignored for its frames — accepted, woven, nothing of it
+	// composited — and the window-sized overlay that follows (declared
+	// "unchanged", v14: the runtime must not pass that on after ignored
+	// frames) is composited again. See stale_check.
+	{
+		DmabufImage stale;
+		Buffer stale_staging;
+		bool sok = weave_create_dmabuf_image(c.dev, kStaleW, kStaleH, VK_FORMAT_B8G8R8A8_UNORM,
+		                                     kWeaveFourccARGB8888, force_linear, stale) &&
+		           create_buffer(vk, (VkDeviceSize)kStaleW * kStaleH * 4, stale_staging);
+		int unused = -1;
+		if (sok) {
+			const std::vector<uint8_t> spx = stale_overlay_pixels(kStaleW, kStaleH);
+			memcpy(stale_staging.map, spx.data(), spx.size());
+			sok = dmabuf_upload(c, stale, stale_staging, false, &unused);
+		}
+		// step 0, 1: stale (two frames: one WARN, not one per frame); step 2: matching again.
+		for (int step = 0; sok && step < 3; step++) {
+			const bool use_stale = step < 2;
+			const int k = (frames + 1 + step) & 1;
+			int acq_fd = -1;
+			if (!dmabuf_upload(c, input[k], staging[k], true, &acq_fd)) {
+				sok = false;
+				break;
+			}
+			DmabufImage &ovimg = use_stale ? stale : overlay;
+			XrWeaveDmabufDescDXR in_desc = {(XrStructureType)XR_TYPE_WEAVE_DMABUF_DESC_DXR};
+			weave_fill_dmabuf_desc(in_desc, input[k], dup(input[k].fd), (uint64_t)(k + 1));
+			XrWeaveOverlayDmabufDescDXR ov_desc = {(XrStructureType)XR_TYPE_WEAVE_OVERLAY_DMABUF_DESC_DXR};
+			weave_fill_overlay_desc(ov_desc, ovimg, dup(ovimg.fd), 0);
+			XrWeaveSubmitSyncDXR sync = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_SYNC_DXR};
+			sync.acquireFenceFd = acq_fd;
+			XrWeaveSubmitOverlayUnchangedDXR unch = {
+			    (XrStructureType)XR_TYPE_WEAVE_SUBMIT_OVERLAY_UNCHANGED_DXR};
+			unch.overlayUnchanged = XR_TRUE;
+			XrWeaveSubmitOverlaysDXR ov = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_OVERLAYS_DXR};
+			XrWeaveSubmitRectsDXR batch = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_RECTS_DXR};
+			batch.rectCount = 2;
+			batch.rects = rects;
+			ov_desc.next = &sync;
+			in_desc.next = &ov_desc;
+			unch.next = &in_desc;
+			ov.next = &unch;
+			batch.next = &ov;
+			XrWeaveSubmitInfoDXR submit = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_INFO_DXR};
+			submit.next = &batch;
+			submit.firstChunk = XR_TRUE;
+			XrWeaveOutputSyncDXR out_sync = {(XrStructureType)XR_TYPE_WEAVE_OUTPUT_SYNC_DXR};
+			XrWeaveOutputDmabufDXR out_dmabuf = {(XrStructureType)XR_TYPE_WEAVE_OUTPUT_DMABUF_DXR};
+			out_dmabuf.next = &out_sync;
+			XrWeaveOutputDXR out = {(XrStructureType)XR_TYPE_WEAVE_OUTPUT_DXR};
+			out.next = &out_dmabuf;
+			const XrResult r = pfn_submit(session, &submit, &out);
+			if (XR_FAILED(r)) {
+				close(in_desc.fd);
+				close(ov_desc.fd);
+				close(acq_fd);
+				LOG("FAIL: stale overlay: step %d (%s overlay %ux%u) REFUSED (%d) — a size mismatch must "
+				    "not refuse the submit",
+				    step, use_stale ? "stale" : "matching", ovimg.w, ovimg.h, (int)r);
+				sok = false;
+				break;
+			}
+			if (out_dmabuf.fd >= 0) {
+				close(out_dmabuf.fd); // same window size: not expected, harmless
+			}
+			if (!dmabuf_readback(c, output, rb, out_sync.releaseFenceFd)) {
+				sok = false;
+				break;
+			}
+			std::vector<uint8_t> px((const uint8_t *)rb.map, (const uint8_t *)rb.map + rb.size);
+			char what[96];
+			snprintf(what, sizeof(what), "dma-buf step %d, %s overlay %ux%u", step,
+			         use_stale ? "STALE" : "matching", ovimg.w, ovimg.h);
+			sok = stale_check(px, kWinW, k == 0, !use_stale, what);
+			if (step == 0) {
+				dump_ppm(px, kWinW, kWinH, dump_dir + "/weave_probe_linux_dmabuf_stale_overlay.ppm");
+			}
+		}
+		LOG("stale overlay (dma-buf): %s", sok ? "PASS" : "FAIL");
+		pass = pass && sok;
+		vkDeviceWaitIdle(vk.device);
+		if (stale.image != VK_NULL_HANDLE) {
+			weave_destroy_dmabuf_image(vk.device, stale);
+		}
+		if (stale_staging.buffer != VK_NULL_HANDLE) {
+			destroy_buffer(vk, stale_staging);
 		}
 	}
 
@@ -2079,6 +2227,123 @@ main(int argc, char **argv)
 		ok = (a > 200);
 		LOG("v5 firstChunk tile @(%d,%d) alpha=%u want ~255 -> %s", tx, ty, a, ok ? "OK" : "WRONG");
 		pass = pass && ok;
+	}
+
+	// ---- Resize race on stage A (see stale_check). The plain-handle wire
+	// carries no overlay size, so the service recovers it two ways, and both
+	// are exercised: (1) an fd it has never seen whose allocation is too small
+	// for the window (a 960x540 overlay under the 1280x720 window), (2) an fd
+	// it has already imported at another size (the 1280x720 overlay after the
+	// window grew to 1600x900 — an allocation never changes size). Each must
+	// be ignored (accepted, woven, nothing of it composited) and the matching
+	// overlay composited again right after.
+	{
+		const uint32_t big_w = 1600, big_h = 900;
+		Image stale, big_in, big_ov, cur_out;
+		bool sok = create_exported_image(vk, kStaleW, kStaleH, stale) &&
+		           upload_and_release(vk, stale, stale_overlay_pixels(kStaleW, kStaleH));
+		if (sok) {
+			std::vector<uint8_t> bpx((size_t)big_w * big_h * 4);
+			for (uint32_t y = 0; y < big_h; y++) {
+				for (uint32_t x = 0; x < big_w; x++) {
+					put_px(bpx, big_w, (int)x, (int)y, 32, 32, 32);
+				}
+			}
+			fill_sbs_rect(bpx, big_w, kRectA, 0xFF, 0x00);
+			fill_sbs_rect(bpx, big_w, kRectB, 0x00, 0xFF);
+			std::vector<uint8_t> bov((size_t)big_w * big_h * 4, 0);
+			for (int y = kOverlayBar.offset.y; y < kOverlayBar.offset.y + kOverlayBar.extent.height; y++) {
+				for (int x = kOverlayBar.offset.x; x < kOverlayBar.offset.x + kOverlayBar.extent.width;
+				     x++) {
+					put_px(bov, big_w, x, y, 230, 13, 230, 255);
+				}
+			}
+			sok = create_exported_image(vk, big_w, big_h, big_in) && upload_and_release(vk, big_in, bpx) &&
+			      create_exported_image(vk, big_w, big_h, big_ov) && upload_and_release(vk, big_ov, bov);
+		}
+		// The probe's current import of the woven output (1280x720).
+		cur_out = output;
+		output = Image{};
+		struct Step
+		{
+			const char *what;
+			uint32_t win_w, win_h; //!< bound geometry (and so the inferred input) for this step
+			Image *in;
+			Image *ov;
+			bool want_bar;
+		} steps[] = {
+		    {"stage A, never-seen 960x540 overlay under 1280x720 (allocation too small)", kWinW, kWinH,
+		     &input[0], &stale, false},
+		    {"stage A, matching 1280x720 overlay again", kWinW, kWinH, &input[0], &overlay, true},
+		    {"stage A, cached 1280x720 overlay under 1600x900 (known size)", big_w, big_h, &big_in, &overlay,
+		     false},
+		    {"stage A, matching 1600x900 overlay", big_w, big_h, &big_in, &big_ov, true},
+		    {"stage A, back to 1280x720 with the 1280x720 overlay", kWinW, kWinH, &input[0], &overlay, true},
+		};
+		uint32_t bound_w = kWinW, bound_h = kWinH;
+		for (const Step &s : steps) {
+			if (!sok) {
+				break;
+			}
+			if (s.win_w != bound_w || s.win_h != bound_h) {
+				if (!span_bind(session, pfn_bind2, kWinOrigin.x, kWinOrigin.y, s.win_w, s.win_h)) {
+					sok = false;
+					break;
+				}
+				bound_w = s.win_w;
+				bound_h = s.win_h;
+			}
+			XrWeaveSubmitOverlaysDXR sov = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_OVERLAYS_DXR};
+			sov.overlayTexture = (void *)(intptr_t)s.ov->fd;
+			XrWeaveSubmitRectsDXR sb = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_RECTS_DXR};
+			sb.next = &sov;
+			sb.rectCount = 2;
+			sb.rects = rects;
+			XrWeaveSubmitInfoDXR ss = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_INFO_DXR};
+			ss.next = &sb;
+			ss.firstChunk = XR_TRUE;
+			ss.inputTexture = (void *)(intptr_t)s.in->fd;
+			XrWeaveOutputDXR so = {(XrStructureType)XR_TYPE_WEAVE_OUTPUT_DXR};
+			const XrResult r = pfn_submit(session, &ss, &so);
+			if (XR_FAILED(r)) {
+				LOG("FAIL: stale overlay: %s: submit REFUSED (%d) — a size mismatch must not refuse", s.what,
+				    (int)r);
+				sok = false;
+				break;
+			}
+			if (so.weavedTexture != nullptr) {
+				// The output reallocated (the window size changed): re-import it.
+				destroy_image(vk, cur_out);
+				if (!import_output_image(vk, (int)(intptr_t)so.weavedTexture, so.width, so.height, cur_out)) {
+					close((int)(intptr_t)so.weavedTexture);
+					LOG("FAIL: stale overlay: re-import of the %ux%u output", so.width, so.height);
+					sok = false;
+					break;
+				}
+			}
+			if (cur_out.w != s.win_w || cur_out.h != s.win_h) {
+				LOG("FAIL: stale overlay: output %ux%u, want %ux%u", cur_out.w, cur_out.h, s.win_w, s.win_h);
+				sok = false;
+				break;
+			}
+			std::vector<uint8_t> spx;
+			sok = readback(vk, cur_out, spx) && stale_check(spx, cur_out.w, true, s.want_bar, s.what);
+		}
+		if (bound_w != kWinW || bound_h != kWinH) {
+			sok = span_bind(session, pfn_bind2, kWinOrigin.x, kWinOrigin.y, kWinW, kWinH) && sok;
+		}
+		LOG("stale overlay (stage A): %s", sok ? "PASS" : "FAIL");
+		pass = pass && sok;
+		output = cur_out;
+		if (stale.image != VK_NULL_HANDLE) {
+			destroy_image(vk, stale);
+		}
+		if (big_in.image != VK_NULL_HANDLE) {
+			destroy_image(vk, big_in);
+		}
+		if (big_ov.image != VK_NULL_HANDLE) {
+			destroy_image(vk, big_ov);
+		}
 	}
 	destroy_image(vk, output);
 

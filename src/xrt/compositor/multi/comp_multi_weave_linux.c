@@ -479,6 +479,156 @@ weave_overlay_refused(struct multi_compositor *mc)
 	}
 }
 
+/*!
+ * The size a v4 overlay must have for this submit: the WINDOW the caller
+ * presents, which the overlay is defined to cover 1:1 (XR_DXR_weave v4,
+ * "window-sized premultiplied").
+ *
+ *  - batch (rect_count > 0): the input, whose extent IS the window client
+ *    (and the woven output's) — @p in_w x @p in_h.
+ *  - legacy single rect: the bound geometry's client size, else the rect's
+ *    offset + extent (stage A infers the input the same way).
+ *  - v6 N-view: the bound geometry's client size. The output is one content
+ *    view there (window x the mode's view scale), so it is not a reference;
+ *    without geometry there is none and the overlay is not checked.
+ *
+ * Returns false when there is no reference.
+ */
+static bool
+weave_overlay_expected_dims(const struct multi_compositor *mc,
+                            const struct xrt_weave_atlas_layout *layout,
+                            uint32_t rect_count,
+                            uint32_t in_w,
+                            uint32_t in_h,
+                            int32_t rect_x,
+                            int32_t rect_y,
+                            uint32_t rect_w,
+                            uint32_t rect_h,
+                            uint32_t *out_w,
+                            uint32_t *out_h)
+{
+	*out_w = 0;
+	*out_h = 0;
+	if (layout == NULL || layout->view_count == 0) {
+		if (rect_count > 0) {
+			*out_w = in_w;
+			*out_h = in_h;
+		} else if (mc->weave.have_geometry) {
+			*out_w = mc->weave.win_w;
+			*out_h = mc->weave.win_h;
+		} else if (rect_x >= 0 && rect_y >= 0) {
+			*out_w = (uint32_t)rect_x + rect_w;
+			*out_h = (uint32_t)rect_y + rect_h;
+		}
+	} else if (mc->weave.have_geometry) {
+		*out_w = mc->weave.win_w;
+		*out_h = mc->weave.win_h;
+	}
+	return *out_w != 0 && *out_h != 0;
+}
+
+/*!
+ * Resize race: decide whether this submit's overlay is used. A producer that
+ * resized its window keeps handing its old overlay buffer until it has
+ * reallocated it; that buffer is the OLD window's size. Composited as if it
+ * were window-sized it leaves a black margin and misplaced 2D (the runtime's
+ * post-weave blend stretches it; the DP never sees it, its slot requires the
+ * exact output size), and imported at the window's size it reads the wrong
+ * memory layout. So a mismatched overlay is treated as ABSENT for the frame:
+ * no DP offer, no post-weave blend, no off-panel / flat-region redraw — the
+ * content is woven as if no overlay had been chained. The submit is NOT
+ * refused (that would hold frames through every resize = stutter); refusal
+ * stays reserved for an overlay that cannot be imported at all (#1825).
+ *
+ * @p stale: the caller's size test failed. @p ov_w / @p ov_h: the overlay's
+ * real size, 0 x 0 when only its allocation is known (@p ov_bytes, stage A).
+ * One WARN on entering the stale state and one on leaving it. Returns true
+ * when the overlay is used.
+ */
+static bool
+weave_overlay_gate(struct multi_compositor *mc,
+                   bool stale,
+                   uint32_t ov_w,
+                   uint32_t ov_h,
+                   uint64_t ov_bytes,
+                   uint32_t exp_w,
+                   uint32_t exp_h)
+{
+	if (stale) {
+		if (!mc->weave.overlay_stale) {
+			mc->weave.overlay_stale = true;
+			mc->weave.overlay_stale_frames = 0;
+			if (ov_w != 0 && ov_h != 0) {
+				U_LOG_W("weave: stale overlay %ux%u vs output %ux%u — ignored until it matches", ov_w,
+				        ov_h, exp_w, exp_h);
+			} else {
+				U_LOG_W("weave: stale overlay (allocation %" PRIu64
+				        " B, smaller than any %ux%u image) vs output %ux%u — ignored until it matches",
+				        ov_bytes, exp_w, exp_h, exp_w, exp_h);
+			}
+		}
+		mc->weave.overlay_stale_frames++;
+		// The DP's cached layer (v14) predates the ignored frames.
+		mc->weave.overlay_force_changed = true;
+		return false;
+	}
+	if (mc->weave.overlay_stale) {
+		mc->weave.overlay_stale = false;
+		U_LOG_W("weave: overlay %ux%u matches the output again — composited (%u frame(s) ignored)", exp_w,
+		        exp_h, mc->weave.overlay_stale_frames);
+	}
+	return true;
+}
+
+/*!
+ * Stage A: the real size of an OPAQUE_FD overlay. The plain-handle transport
+ * carries no dimensions (the app-facing XrWeaveSubmitOverlaysDXR has none,
+ * the fd has none), so its import size is INFERRED from the bound window —
+ * which is exactly what goes wrong in a resize race. Two facts recover it:
+ *
+ *  - Identity: stage-A slots are keyed by the fd's inode, and our cached
+ *    import keeps the allocation alive, so an inode already cached at W1 x H1
+ *    IS a W1 x H1 buffer — an allocation never changes size. Exact, for every
+ *    buffer the engine has seen.
+ *  - Allocation size (unseen buffer): an fd smaller than @p exp_w x @p exp_h
+ *    x 4 bytes cannot hold a window-sized BGRA8 image in any tiling.
+ *
+ * Returns true and @p out_w / @p out_h (0 x 0 = size unknown, only too
+ * small: @p out_bytes) when the overlay is known NOT to be window-sized.
+ */
+static bool
+weave_stage_a_overlay_stale(const struct comp_multi_weave_linux_slot *slots,
+                            int fd,
+                            uint32_t exp_w,
+                            uint32_t exp_h,
+                            uint32_t *out_w,
+                            uint32_t *out_h,
+                            uint64_t *out_bytes)
+{
+	*out_w = 0;
+	*out_h = 0;
+	*out_bytes = 0;
+	struct stat st;
+	if (fstat(fd, &st) != 0) {
+		return false; // the import reports it
+	}
+	for (uint32_t i = 0; i < COMP_MULTI_WEAVE_LINUX_SLOTS; i++) {
+		const struct comp_multi_weave_linux_slot *s = &slots[i];
+		if (s->used && s->buffer_id == 0 && s->dev == (uint64_t)st.st_dev && s->ino == (uint64_t)st.st_ino) {
+			*out_w = s->w;
+			*out_h = s->h;
+			return s->w != exp_w || s->h != exp_h;
+		}
+	}
+	const off_t end = lseek(fd, 0, SEEK_END);
+	if (end <= 0) {
+		return false; // cannot be sized: the import decides
+	}
+	(void)lseek(fd, 0, SEEK_SET); // the offset is shared with the producer
+	*out_bytes = (uint64_t)end;
+	return (uint64_t)end < (uint64_t)exp_w * exp_h * 4u;
+}
+
 static void
 weave_slots_release_all(struct vk_bundle *vk, struct comp_multi_weave_linux_slot *slots)
 {
@@ -2171,9 +2321,14 @@ weave_run_frame(struct vk_bundle *vk,
 		ov_acquired = true;
 		// v15 strength first: the D3D11 order, and a DP may key its weave on both.
 		xrt_display_processor_vk_set_overlay_2d_filter_strength(dp_vk, mc->weave.overlay_filter_strength);
-		ov_in_dp =
-		    xrt_display_processor_vk_set_overlay_2d(dp_vk, ov->view, (VkFormat_XDP)ov->format, ov->w, ov->h,
-		                                            XRT_ATLAS_ENCODING_ENCODED, mc->weave.overlay_unchanged);
+		// v14 "unchanged" is the caller's claim against ITS previous submit.
+		// After a stale overlay was ignored (weave_overlay_gate) the DP's
+		// cached layer is older than that, so the first offer after it says
+		// "changed" whatever the caller claimed.
+		const bool unchanged = mc->weave.overlay_unchanged && !mc->weave.overlay_force_changed;
+		mc->weave.overlay_force_changed = false;
+		ov_in_dp = xrt_display_processor_vk_set_overlay_2d(dp_vk, ov->view, (VkFormat_XDP)ov->format, ov->w,
+		                                                   ov->h, XRT_ATLAS_ENCODING_ENCODED, unchanged);
 	}
 	if (ov != NULL) {
 		const uint8_t verdict = ov_in_dp ? 2u : 1u;
@@ -2647,8 +2802,23 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		// composed frame and decides itself whether to hold it or to paint its
 		// 2D on its own. Dropping the overlay and weaving anyway would hand
 		// back a "successful" frame with the caller's 2D missing.
+		//
+		// Resize race: an overlay known not to be window-sized is ignored
+		// for this frame, not imported at the window's size and not refused
+		// (weave_overlay_gate; weave_stage_a_overlay_stale says how its real
+		// size is known without a size on the wire).
 		struct comp_multi_weave_linux_slot *ov = NULL;
-		if (ov_fd >= 0) {
+		bool use_ov = ov_fd >= 0;
+		uint32_t exp_w = 0, exp_h = 0;
+		if (use_ov && weave_overlay_expected_dims(mc, layout, rect_count, in_w, in_h, rect_x, rect_y, rect_w,
+		                                          rect_h, &exp_w, &exp_h)) {
+			uint32_t real_w = 0, real_h = 0;
+			uint64_t real_bytes = 0;
+			const bool stale = weave_stage_a_overlay_stale(mc->weave.ov_slots, ov_fd, exp_w, exp_h, &real_w,
+			                                               &real_h, &real_bytes);
+			use_ov = weave_overlay_gate(mc, stale, real_w, real_h, real_bytes, exp_w, exp_h);
+		}
+		if (use_ov) {
 			uint32_t ov_w = mc->weave.have_geometry ? mc->weave.win_w : in_w;
 			uint32_t ov_h = mc->weave.have_geometry ? mc->weave.win_h : in_h;
 			ov = weave_cache_acquire(vk, mc, mc->weave.ov_slots, ov_fd, NULL, ov_w, ov_h, "overlay");
@@ -2806,8 +2976,18 @@ comp_multi_weave_submit_dmabuf(struct xrt_compositor *xc,
 		if (in_slot == NULL) {
 			break;
 		}
+		// Resize race: an overlay whose declared size is not the window's is
+		// ignored for this frame — not imported, not refused
+		// (weave_overlay_gate). Its fd still closes in the epilogue.
 		struct comp_multi_weave_linux_slot *ov_slot = NULL;
-		if (ov_fd >= 0) {
+		bool use_ov = ov_fd >= 0;
+		uint32_t exp_w = 0, exp_h = 0;
+		if (use_ov && weave_overlay_expected_dims(mc, layout, rect_count, in->width, in->height, rect_x, rect_y,
+		                                          rect_w, rect_h, &exp_w, &exp_h)) {
+			const bool stale = overlay->width != exp_w || overlay->height != exp_h;
+			use_ov = weave_overlay_gate(mc, stale, overlay->width, overlay->height, 0, exp_w, exp_h);
+		}
+		if (use_ov) {
 			ov_slot = weave_cache_acquire(vk, mc, mc->weave.ov_slots, ov_fd, overlay, overlay->width,
 			                              overlay->height, "overlay");
 			if (ov_slot == NULL) {
