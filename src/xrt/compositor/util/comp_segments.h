@@ -221,6 +221,27 @@ comp_segments_uncovered(const struct comp_segment_table *t,
                         uint32_t cap);
 
 /*!
+ * A segment's rect in VIEW-TILE pixels: the atlas holds the canvas at view
+ * resolution, so a segment (window px) maps into every tile at this rect.
+ * Edges are rounded independently, so two segments sharing a seam share the
+ * tile column too: no gap, no overlap. The ONE mapping both the per-segment
+ * crop (M2) and the per-segment view routing (M3) use, so a segment's views
+ * are always placed exactly where its crop reads them.
+ *
+ * @param seg     The segment, window px.
+ * @param canvas  The canvas the atlas holds, window px.
+ * @param tile_w/tile_h  One view tile, px.
+ * @param[out] out The rect inside a tile.
+ * @return false when the segment is outside the canvas or thinner than a tile pixel.
+ */
+bool
+comp_segments_tile_rect(const struct comp_seg_rect *seg,
+                        const struct comp_seg_rect *canvas,
+                        uint32_t tile_w,
+                        uint32_t tile_h,
+                        struct comp_seg_rect *out);
+
+/*!
  * Equal geometry and screens (used to log a table change once).
  */
 bool

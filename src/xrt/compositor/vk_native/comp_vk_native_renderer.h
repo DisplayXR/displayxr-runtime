@@ -10,6 +10,7 @@
 #pragma once
 
 #include "xrt/xrt_defines.h"
+#include "xrt/xrt_display_metrics.h"
 #include "xrt/xrt_results.h"
 
 #include <stdint.h>
@@ -41,6 +42,24 @@ struct comp_vk_native_eff_layout
 	uint32_t rows;   //!< atlas tile rows
 	uint32_t tile_w; //!< per-tile width in pixels
 	uint32_t tile_h; //!< per-tile height in pixels
+
+	/*!
+	 * Multi-screen M3: per-segment views. 0 = one view set fills every tile
+	 * (the only case before M3). Otherwise the projection layer carries one
+	 * view set per window segment and each tile is a MOSAIC: local view j of
+	 * segment k is placed at that segment's rect inside tile j, so cropping
+	 * a segment's rect out of every tile (comp_vk_native_segments) yields
+	 * exactly that segment's own views. Quads, equirects and zones are not
+	 * routed.
+	 */
+	uint32_t route_count;
+	struct
+	{
+		uint32_t first_view; //!< first layer view of the segment
+		uint32_t view_count; //!< its views (== @ref views)
+		int32_t x, y;        //!< the segment's rect inside a tile, tile px
+		uint32_t w, h;
+	} route[XRT_MAX_SEGMENTS];
 };
 
 /*!

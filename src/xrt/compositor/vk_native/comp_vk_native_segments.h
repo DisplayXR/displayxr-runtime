@@ -30,6 +30,7 @@
 
 #include "xrt/xrt_compiler.h"
 #include "xrt/xrt_compositor.h"
+#include "xrt/xrt_display_metrics.h"
 #include "xrt/xrt_display_processor.h"
 #include "xrt/xrt_screen.h"
 #include "xrt/xrt_vulkan_includes.h"
@@ -181,6 +182,44 @@ comp_vk_native_segments_get_capture(const struct comp_vk_native_segments *segs,
                                     uint32_t *out_h,
                                     uint64_t *out_screen_id,
                                     bool *out_woven);
+
+/*!
+ * The session-wide hardware 2D/3D mode. Every segment DP follows it: sent to
+ * each live DP on a change and to every newly created one (the primary DP
+ * gets it from the compositor's own request path). Weave thread.
+ */
+void
+comp_vk_native_segments_set_display_mode(struct comp_vk_native_segments *segs, bool enable_3d);
+
+/*!
+ * Multi-screen M3: the last update's segment table as per-segment view
+ * metrics (geometry, each screen's physical size + nominal viewer, whether it
+ * is woven). Eyes are NOT filled — they are predicted per query
+ * (@ref comp_vk_native_segments_get_eyes).
+ *
+ * @param window_desktop  The window rect the table was computed for.
+ * @param canvas          The canvas it was cut from, window px.
+ * @param primary_has_dp  The session's primary DP exists.
+ * @return false when the last update did not split the window, or split it
+ *         into more than XRT_MAX_SEGMENTS segments (one view set then).
+ */
+bool
+comp_vk_native_segments_get_metrics(const struct comp_vk_native_segments *segs,
+                                    const struct comp_seg_rect *window_desktop,
+                                    const struct comp_seg_rect *canvas,
+                                    bool primary_has_dp,
+                                    struct xrt_segment_metrics *out);
+
+/*!
+ * Multi-screen M3: the predicted eyes of screen @p screen_id's segment DP, in
+ * that screen's display space. Thread-safe against the weave creating or
+ * destroying segment DPs. False when the screen has no segment DP (the
+ * primary's eyes come from the session's own DP).
+ */
+bool
+comp_vk_native_segments_get_eyes(struct comp_vk_native_segments *segs,
+                                 uint64_t screen_id,
+                                 struct xrt_eye_positions *out);
 
 #ifdef __cplusplus
 }

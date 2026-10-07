@@ -351,6 +351,70 @@ compose_layer_source(const struct comp_layer *layer,
 }
 
 /*!
+ * Multi-screen M3: does this layer's view set go through the per-segment
+ * routing (see comp_vk_native_eff_layout::route)? Only projection-class
+ * layers carry one view set per segment.
+ */
+static bool
+layer_is_routed(const struct comp_layer *layer, const struct comp_vk_native_eff_layout *layout)
+{
+	return layout->route_count > 0 &&
+	       (layer->data.type == XRT_LAYER_PROJECTION || layer->data.type == XRT_LAYER_PROJECTION_DEPTH);
+}
+
+//! Views a routed layer contributes: the end of the last segment's range.
+static uint32_t
+routed_view_count(const struct comp_layer *layer, const struct comp_vk_native_eff_layout *layout)
+{
+	uint32_t n = 0;
+	for (uint32_t k = 0; k < layout->route_count && k < XRT_MAX_SEGMENTS; k++) {
+		const uint32_t end = layout->route[k].first_view + layout->route[k].view_count;
+		if (end > n) {
+			n = end;
+		}
+	}
+	if (n > layer->data.view_count) {
+		n = layer->data.view_count;
+	}
+	return n > XRT_MAX_VIEWS ? XRT_MAX_VIEWS : n;
+}
+
+/*!
+ * Where a routed layer view goes: segment k's local view j lands in tile j, at
+ * the segment's rect inside that tile (the mosaic). False = the view belongs to
+ * no segment (the aliased tail) or to a tile the layout does not have.
+ */
+static bool
+route_eye(const struct comp_vk_native_eff_layout *layout,
+          uint32_t eye,
+          uint32_t *out_tile,
+          int32_t *x0,
+          int32_t *y0,
+          int32_t *x1,
+          int32_t *y1)
+{
+	for (uint32_t k = 0; k < layout->route_count && k < XRT_MAX_SEGMENTS; k++) {
+		const uint32_t first = layout->route[k].first_view;
+		if (eye < first || eye >= first + layout->route[k].view_count) {
+			continue;
+		}
+		const uint32_t j = eye - first;
+		if (j >= layout->views || layout->cols == 0) {
+			return false;
+		}
+		const int32_t bx = (int32_t)((j % layout->cols) * layout->tile_w);
+		const int32_t by = (int32_t)((j / layout->cols) * layout->tile_h);
+		*out_tile = j;
+		*x0 = bx + layout->route[k].x;
+		*y0 = by + layout->route[k].y;
+		*x1 = *x0 + (int32_t)layout->route[k].w;
+		*y1 = *y0 + (int32_t)layout->route[k].h;
+		return layout->route[k].w > 0 && layout->route[k].h > 0;
+	}
+	return false;
+}
+
+/*!
  * How many views does this layer contribute to?
  *
  * A quad or an equirect2 is a single world-placed surface: it is a candidate
@@ -363,6 +427,9 @@ compose_layer_view_count(const struct comp_layer *layer, const struct comp_vk_na
 	uint32_t n;
 	if (layer->data.type == XRT_LAYER_QUAD || layer->data.type == XRT_LAYER_EQUIRECT2) {
 		n = layout->views;
+	} else if (layer_is_routed(layer, layout)) {
+		// Multi-screen M3: one view set per segment, all of them drawn.
+		n = routed_view_count(layer, layout);
 	} else {
 		n = layer->data.view_count;
 		if (n > layout->views) {
@@ -1734,6 +1801,13 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 		const bool is_zone = layer->data.type == XRT_LAYER_ZONE_3D;
 		const bool is_quad = layer->data.type == XRT_LAYER_QUAD;
 		const bool is_eq2 = layer->data.type == XRT_LAYER_EQUIRECT2;
+		const bool routed = layer_is_routed(layer, layout);
+		// Multi-screen M3: a routed layer draws one view per SEGMENT into
+		// each tile. The segments are disjoint, so every one of them is the
+		// layer's first write into its part of the tile: the blend mode is
+		// decided once per tile and shared by the layer's segments.
+		bool route_mode_set[XRT_MAX_VIEWS] = {false};
+		enum comp_layer_blend_mode route_mode[XRT_MAX_VIEWS];
 
 		const uint32_t view_count = compose_layer_view_count(layer, layout);
 
@@ -1756,6 +1830,11 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 			}
 			if (!compose_layer_source(layer, eye, &xsc, &sub)) {
 				continue;
+			}
+			uint32_t route_tile = 0;
+			int32_t rx0 = 0, ry0 = 0, rx1 = 0, ry1 = 0;
+			if (routed && !route_eye(layout, eye, &route_tile, &rx0, &ry0, &rx1, &ry1)) {
+				continue; // the aliased tail: no segment owns it
 			}
 			if (is_quad) {
 				// Eye visibility, N-view aware: the parity rule
@@ -1821,6 +1900,13 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 				           : COMP_LAYER_BLEND_PREMULTIPLIED;
 			} else if (is_quad) {
 				mode = comp_layer_subrect_blend_mode(&tiles[eye], layer->data.flags);
+			} else if (routed) {
+				if (!route_mode_set[route_tile]) {
+					route_mode[route_tile] =
+					    comp_layer_tile_blend_mode(&tiles[route_tile], layer->data.flags);
+					route_mode_set[route_tile] = true;
+				}
+				mode = route_mode[route_tile];
 			} else {
 				mode = comp_layer_tile_blend_mode(&tiles[eye], layer->data.flags);
 			}
@@ -1851,7 +1937,14 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 			// Tile-place by the effective grid (#542); mono content
 			// spans the full content region.
 			float dx0, dy0, dx1, dy1;
-			if (layout->views == 1 || view_count == 1) {
+			if (routed) {
+				// Multi-screen M3: the segment's rect inside its tile. The
+				// scissor below clamps to this same box.
+				dx0 = (float)rx0;
+				dy0 = (float)ry0;
+				dx1 = (float)rx1;
+				dy1 = (float)ry1;
+			} else if (layout->views == 1 || view_count == 1) {
 				dx0 = 0.0f;
 				dy0 = 0.0f;
 				dx1 = (float)(layout->cols * layout->tile_w);
@@ -2314,6 +2407,12 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 		uint32_t view_count = layer->data.view_count;
 		if (view_count > layout->views) view_count = layout->views;
 		if (view_count == 0) view_count = 1;
+		// Multi-screen M3: one view set per segment, each into its rect of
+		// every tile (the mosaic, comp_vk_native_eff_layout::route).
+		const bool routed = !is_zone && layer_is_routed(layer, layout);
+		if (routed) {
+			view_count = routed_view_count(layer, layout);
+		}
 
 		static bool blit_logged = false;
 		if (!blit_logged) {
@@ -2326,6 +2425,11 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 		}
 
 		for (uint32_t eye = 0; eye < view_count; eye++) {
+			uint32_t route_tile = 0;
+			int32_t rx0 = 0, ry0 = 0, rx1 = 0, ry1 = 0;
+			if (routed && !route_eye(layout, eye, &route_tile, &rx0, &ry0, &rx1, &ry1)) {
+				continue; // the aliased tail: no segment owns it
+			}
 			struct xrt_swapchain *xsc = layer->sc_array[eye];
 			if (xsc == NULL) {
 				if (!blit_logged) U_LOG_W("Atlas blit: eye %u swapchain NULL", eye);
@@ -2354,7 +2458,12 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 			int32_t sy1 = sy0 + (int32_t)src_rect->extent.h;
 
 			int32_t dx0, dy0, dx1, dy1;
-			if (layout->views == 1 || view_count == 1) {
+			if (routed) {
+				dx0 = rx0;
+				dy0 = ry0;
+				dx1 = rx1;
+				dy1 = ry1;
+			} else if (layout->views == 1 || view_count == 1) {
 				// Mono content: stretch across the full content region
 				dx0 = 0;
 				dy0 = 0;
