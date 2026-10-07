@@ -83,9 +83,11 @@ Facts that drive the design. Anchors are `file:line` on `main`.
   X11 size differs from scan-out (XWayland + fractional scaling, i.e. this box). Plug-in fix:
   pass `window = 0` always, since the origin is supplied per frame (ADR-033). With that one
   line, R2 is met on Linux on every window system.
-- Windows (`src/drv_leia/`): SR context per DP, HWND into `srCreateDisplay`/weaver,
-  `probe_displays` implemented but `serial` empty; no NULL-HWND handling; no
-  `srWeaverSetPresentOrigin` call.
+- Windows (`src/drv_leia/`): SR context per DP, HWND into `srCreateDisplay`/weaver;
+  no NULL-HWND handling; no `srWeaverSetPresentOrigin` call. `probe_displays` joins the
+  runtime's monitor list with `srEnumerateDisplays` (leia-plugin#314, 2026-10-07): per-monitor
+  FPC confidence + serial + opaque `displayId` kept in a plug-in-private binding table; older SR
+  runtimes fall back to the frozen EDID table (every table-known panel VERIFIED, serial empty).
 
 **SR SDK / SRService (facts from the LeiaSR session, Linux `ST-5525-linux-support-jul7`, Windows q3 line)**
 - One SR instance sees exactly **one** SR display: `IDisplayManager::getPrimaryActiveSRDisplay()`
@@ -200,7 +202,7 @@ multiview + display_info v22. An app may also pin itself to one display
 
 | M | Deliverable | Runtime work | Plug-in / SR work | Gate / demo |
 |---|---|---|---|---|
-| **M0** Screen registry on Linux | `displayxr-cli displays` lists eDP-1→sim-display, HDMI-1→leia-sr with geometry + serial | Replace the Linux EDID stub with RandR/Wayland enumeration (`os_display_desktop_enumerate` already exists; XWayland path per #251/#1579: match by size+mm); load every manifest plug-in and collect claims on POSIX; registry becomes the screen registry (adds mm, viewer, et caps); `XRT_PREFERRED_PLUGIN_ID` becomes per-screen | leia-linux: `probe_displays` (match every connector, keep connector id); `serial` = FPC serial from the service's `active` device (one panel) until SR-P1 enumeration lands; EDID serial bytes 0x0C-0x0F as the Acer tie-breaker | CLI output on this box; Control Panel #793 phase 1 reads the same table |
+| **M0** Screen registry on Linux | `displayxr-cli displays` lists eDP-1→sim-display, HDMI-1→leia-sr with geometry + serial | Replace the Linux EDID stub with RandR/Wayland enumeration (`os_display_desktop_enumerate` already exists; XWayland path per #251/#1579: match by size+mm); load every manifest plug-in and collect claims on POSIX; registry becomes the screen registry (adds mm, viewer, et caps); `XRT_PREFERRED_PLUGIN_ID` becomes per-screen | leia-linux: `probe_displays` (match every connector, keep connector id); `serial` = FPC serial from the service's `active` device (one panel) until SR-P1 enumeration lands; EDID serial bytes 0x0C-0x0F as the Acer tie-breaker. **Done on both arms:** Linux leia-plugin#311 (runtime #1850), Windows leia-plugin#314 — on the two-panel `win` rig the AL claims VERIFIED with its FPC serial and the DS1 EDID until SR's D1 pairing lands | CLI output on this box; Control Panel #793 phase 1 reads the same table |
 | **M1** Per-screen info API | `XR_DXR_display_info` v22: `xrEnumerateDisplaysDXR`, per-display DISPLAY space, session display binding; `cube_handle_vk_linux` prints both screens | oxr: back `XrDisplayInfoDXR` from registry entry; IPC: new `system_get_display_list` message instead of growing the by-value struct | none | header + `index.json` note + CTS-style selftest check |
 | **M2** Segments, one vendor | A `cube_handle_vk_linux` window dragged across eDP↔DS1 is **anaglyph on both**, each half with its own canvas and origin, no 2D band | `comp_segments` helper (shared across backends): segment table from window metrics × registry, per-segment DP lifecycle with hysteresis, per-segment `set_present_origin`, per-segment `process_atlas` with `canvas = segment`, composite; sim_display gets per-instance state + `set_present_origin`; DP factory ABI gains a `screen binding` arg (ABI bump, ADR-020 append rule) | none | atlas capture shows two canvases; eyeball on panel |
 | **M3** Per-segment views | Same window: `xrLocateViews` returns 4 views, each half rendered from its own frustum | oxr: per-segment Kooima + eyes from the segment DP; `XrViewDisplayBindingsDXR`; `activeViewCount`; tile routing by segment; legacy stereo = majority segment + 2D blit | none | cube renders the correct perspective on each half; `check_displayxr_app.py` rule for v22 |
