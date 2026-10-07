@@ -301,6 +301,53 @@ append. Reference implementation: `sim_display_plugin.c` (EDID mm, else its
 `SIM_DISPLAY_WIDTH_M/HEIGHT_M` defaults; its usual nominal viewer; `SIM_DISPLAY_FAKE_TRACKING`
 semantics unchanged).
 
+### `create_dp_vk_for_screen` (multi-screen M2)
+
+```c
+xrt_result_t (*create_dp_vk_for_screen)(struct xrt_plugin_instance *inst,
+                                        void *vk_bundle,
+                                        void *vk_cmd_pool,
+                                        void *window_handle,
+                                        int32_t target_format,
+                                        const struct xrt_screen_binding *binding,
+                                        struct xrt_display_processor **out_xdp);
+```
+
+Make a Vulkan DP for ONE screen your plug-in won. A window that spans screens is woven per
+**segment** (canvas ∩ screen, [`comp-segments.md`](../architecture/comp-segments.md)); the
+session's own DP keeps the system-default screen's segment and this slot makes the DP for each
+other screen. Same contract as `create_dp_vk`, plus:
+
+- `binding` names the screen: monitor id, desktop rect, native (device-mode) pixels, EDID mm,
+  desktop scale, your claim's serial, a vendor display id (0 until SR-P1/P2 supply one), the
+  output name. Clamp reads to `binding->struct_size`. Answer `get_display_dimensions` /
+  `get_display_pixel_info` for THAT screen, with the screen origin = the binding's desktop
+  origin.
+- `window_handle` is NULL on desktop Linux: a segment DP is windowless, its phase comes from
+  `set_present_origin` (ADR-033) — the window's origin relative to THIS screen, to which you add
+  the canvas offset.
+- Each `process_atlas` hands you `canvas = the segment` (a sub-rect of the target) and an atlas
+  that holds exactly that segment's views (the runtime crops per segment — crop before the DP is
+  the law). **Confine render area, viewport AND scissor to the canvas** (a windowless weaver's
+  default scissor is its panel rect — multi-screen plan risk 7), and **do not assume you are the
+  first writer** to the target this frame: the target arrives in `COLOR_ATTACHMENT_OPTIMAL`
+  holding other segments' pixels; leave it in `PRESENT_SRC_KHR` like any VK DP.
+- Several instances coexist in one process, one per screen.
+
+NULL (or an older `struct_size`) → the runtime falls back to `create_dp_vk` for that screen.
+Appended after `get_display_info_for_monitor` per ADR-020 (`struct_size`-gated, no
+`XRT_PLUGIN_API_VERSION_CURRENT` bump; ABI stays 5); guard with
+`#ifdef XRT_PLUGIN_IFACE_HAS_CREATE_DP_FOR_SCREEN`. M2 only segments a window whose screens all
+belong to the ACTIVE plug-in; mixed vendors are M4. Reference implementation:
+`sim_display_dp_factory_vk_for_screen` (`drivers/sim_display/sim_display_processor.c`).
+
+**The 1:1 capability.** Report through the existing `get_scanout_caps` slot whether your output
+survives a display-server resample: `XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE` in
+`xrt_dp_scanout_caps::flags` (carved from the former `reserved[0]`, so an older plug-in reads
+as "needs 1:1"). A lenticular weave leaves it clear; the runtime then paints flat 2D on a
+segment whose screen is resampled, and the #1595 / #1831 session gates degrade as before.
+sim_display sets it for every output but INTERLACED.
+
 ### `set_pose_source`
 
 ```c
@@ -684,7 +731,8 @@ Flags (`XRT_PLUGIN_STEREO_CAMERA_*`) mirror the XR bits: `SHARED_WITH_EYE_TRACKI
 **Slot order.** The six slots are the LAST members of the iface, appended (ADR-020) after
 everything that was on `main` before them: `… vk_bundle_fn_table_offset` → `create_dp_d3d11_lift`
 (ADR-042) → `get_platform_state` (ADR-045) → `stereo_camera_enumerate … stereo_camera_close`
-→ `get_display_info_for_monitor` (multi-screen M1, now the last member).
+→ `get_display_info_for_monitor` (multi-screen M1) → `create_dp_vk_for_screen` (multi-screen M2,
+now the last member).
 `tests_stereo_camera` pins that order (lift right after the vk fingerprint, platform-state right
 after lift, the camera block right after platform-state and ending the struct), so a reorder or a
 slot squeezed in between fails on the host, not on a vendor box.
