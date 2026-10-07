@@ -630,7 +630,7 @@ struct comp_vk_native_compositor
 
 	//! Last canvas / view / submitted-tile sizes logged by the handle-app
 	//! VIEW_DIMS line in layer_commit — logged on change only, never per frame.
-	uint32_t view_dims_logged[6];
+	uint32_t view_dims_logged[7];
 
 #ifdef XRT_OS_LINUX_DESKTOP
 	//! One-shot guard for the X11 present-origin refusal WARN (see
@@ -5052,12 +5052,28 @@ vk_log_view_dims_on_change(struct comp_vk_native_compositor *c,
 			break;
 		}
 	}
-	const uint32_t now[6] = {
-	    c->settings.preferred.width, c->settings.preferred.height, view_w, view_h, sub_w, sub_h};
+	// Multi-screen M3: under per-segment views each view covers only its
+	// segment's part of a tile (the mosaic), so a submission narrower than the
+	// tile is the layout, not an upscale.
+	uint32_t segments = 0;
+#ifdef XRT_OS_LINUX_DESKTOP
+	os_mutex_lock(&c->seg_pub_mutex);
+	segments = c->seg_route.count;
+	os_mutex_unlock(&c->seg_pub_mutex);
+#endif
+	const uint32_t now[7] = {
+	    c->settings.preferred.width, c->settings.preferred.height, view_w, view_h, sub_w, sub_h, segments};
 	if (memcmp(now, c->view_dims_logged, sizeof(now)) == 0) {
 		return;
 	}
 	memcpy(c->view_dims_logged, now, sizeof(now));
+	if (segments > 0) {
+		U_LOG_W("VIEW_DIMS: canvas %ux%u x mode scale %.3fx%.3f -> tile %ux%u; mosaic: %u segment(s), view 0 "
+		        "submits %ux%u into its segment of the tile (per-segment views, not an upscale)",
+		        now[0], now[1], (double)mode->view_scale_x, (double)mode->view_scale_y, view_w, view_h,
+		        segments, sub_w, sub_h);
+		return;
+	}
 	const bool upscaled = sub_w > 0 && sub_h > 0 && (sub_w < view_w || sub_h < view_h);
 	U_LOG_W("VIEW_DIMS: canvas %ux%u x mode scale %.3fx%.3f -> tile %ux%u; app submits %ux%u per view%s", now[0],
 	        now[1], (double)mode->view_scale_x, (double)mode->view_scale_y, view_w, view_h, sub_w, sub_h,
