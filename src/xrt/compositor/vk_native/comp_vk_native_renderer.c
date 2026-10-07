@@ -352,14 +352,18 @@ compose_layer_source(const struct comp_layer *layer,
 
 /*!
  * Multi-screen M3: does this layer's view set go through the per-segment
- * routing (see comp_vk_native_eff_layout::route)? Only projection-class
- * layers carry one view set per segment.
+ * routing (see comp_vk_native_eff_layout::route)? Projection-class layers
+ * carry one view set per segment; quads and equirect2 layers are drawn once per
+ * segment too, each with THAT segment's view camera, confined to its rect —
+ * one camera across the whole mosaic tile would mis-place them on every
+ * segment but the first. Zones are never routed.
  */
 static bool
 layer_is_routed(const struct comp_layer *layer, const struct comp_vk_native_eff_layout *layout)
 {
-	return layout->route_count > 0 &&
-	       (layer->data.type == XRT_LAYER_PROJECTION || layer->data.type == XRT_LAYER_PROJECTION_DEPTH);
+	const enum xrt_layer_type t = layer->data.type;
+	return layout->route_count > 0 && (t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH ||
+	                                   t == XRT_LAYER_QUAD || t == XRT_LAYER_EQUIRECT2);
 }
 
 //! Views a routed layer contributes: the end of the last segment's range.
@@ -373,7 +377,10 @@ routed_view_count(const struct comp_layer *layer, const struct comp_vk_native_ef
 			n = end;
 		}
 	}
-	if (n > layer->data.view_count) {
+	// A projection layer is bounded by what it submitted; a quad / equirect2
+	// has one sub-image shown in every routed view.
+	const bool per_view = layer->data.type == XRT_LAYER_PROJECTION || layer->data.type == XRT_LAYER_PROJECTION_DEPTH;
+	if (per_view && n > layer->data.view_count) {
 		n = layer->data.view_count;
 	}
 	return n > XRT_MAX_VIEWS ? XRT_MAX_VIEWS : n;
@@ -425,11 +432,11 @@ static uint32_t
 compose_layer_view_count(const struct comp_layer *layer, const struct comp_vk_native_eff_layout *layout)
 {
 	uint32_t n;
-	if (layer->data.type == XRT_LAYER_QUAD || layer->data.type == XRT_LAYER_EQUIRECT2) {
-		n = layout->views;
-	} else if (layer_is_routed(layer, layout)) {
-		// Multi-screen M3: one view set per segment, all of them drawn.
+	if (layer_is_routed(layer, layout)) {
+		// Multi-screen M3: one draw per routed view (per segment).
 		n = routed_view_count(layer, layout);
+	} else if (layer->data.type == XRT_LAYER_QUAD || layer->data.type == XRT_LAYER_EQUIRECT2) {
+		n = layout->views;
 	} else {
 		n = layer->data.view_count;
 		if (n > layout->views) {
@@ -1775,7 +1782,16 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 	 */
 	struct comp_layer_view_camera cams[XRT_MAX_VIEWS];
 	const uint32_t tile_count = layout->views > XRT_MAX_VIEWS ? XRT_MAX_VIEWS : layout->views;
-	for (uint32_t v = 0; v < tile_count; v++) {
+	// Multi-screen M3: under routing a quad is drawn per routed view, with
+	// that view's camera — so resolve every routed view's camera.
+	uint32_t cam_count = tile_count;
+	for (uint32_t k = 0; k < layout->route_count && k < XRT_MAX_SEGMENTS; k++) {
+		const uint32_t end = layout->route[k].first_view + layout->route[k].view_count;
+		if (end > cam_count) {
+			cam_count = end > XRT_MAX_VIEWS ? XRT_MAX_VIEWS : end;
+		}
+	}
+	for (uint32_t v = 0; v < cam_count; v++) {
 		(void)comp_layer_view_camera_select(layers, v, NULL, 0.0f, 0.0f, &cams[v]);
 	}
 
@@ -1840,7 +1856,7 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 				// Eye visibility, N-view aware: the parity rule
 				// is right for 2 views and meaningless for a 2x2
 				// quad mode, where the halves overlap by one.
-				if (!is_layer_view_visible_n(&layer->data, eye, tile_count)) {
+				if (!is_layer_view_visible_n(&layer->data, routed ? route_tile : eye, tile_count)) {
 					continue;
 				}
 				/*
@@ -1889,7 +1905,8 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 			if (is_eq2) {
 				// Visibility, sub-rect blend mode and the packed
 				// ray constants, all per view (#1602).
-				if (!compose_equirect2_view(layer, eye, tile_count, &cams[eye], &tiles[eye],
+				if (!compose_equirect2_view(layer, routed ? route_tile : eye, tile_count, &cams[eye],
+				                            &tiles[routed ? route_tile : eye],
 				                            eq2_constants, &mode)) {
 					continue;
 				}
@@ -1899,7 +1916,7 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 				           ? COMP_LAYER_BLEND_STRAIGHT
 				           : COMP_LAYER_BLEND_PREMULTIPLIED;
 			} else if (is_quad) {
-				mode = comp_layer_subrect_blend_mode(&tiles[eye], layer->data.flags);
+				mode = comp_layer_subrect_blend_mode(&tiles[routed ? route_tile : eye], layer->data.flags);
 			} else if (routed) {
 				if (!route_mode_set[route_tile]) {
 					route_mode[route_tile] =
