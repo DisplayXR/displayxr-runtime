@@ -1,6 +1,6 @@
 # ADR-046: Depth-aware cursor — opt-in only; the app knows the depth, the runtime places the cursor
 
-**Status:** Proposed (2026-10-06) · Phase 1 implemented · Phase 3a implemented (Metal) · spec:
+**Status:** Proposed (2026-10-06) · Phase 1 implemented · Phase 3a implemented (Metal) · spec v3 anchor modes (2026-10-07) · spec:
 [XR_DXR_cursor_depth.md](../specs/extensions/XR_DXR_cursor_depth.md) · sibling of
 [ADR-040](ADR-040-rear-depth-budget.md) (the same cue conflict, at the cursor instead of the desktop)
 
@@ -94,8 +94,9 @@ everything from the views that call has just produced:
 - **E**, the cyclopean eye, is the midpoint of that pair.
 - A point's depth is **t**: its distance in front of E along the display normal, divided by S's
   distance. So t = 1 on the canvas, and t < 1 in front of it.
-- The sprite goes at **C = E + t·(S − E)**, with height scaled by t. Because C stays on the
-  cyclopean ray, the cursor never slides sideways as it rises.
+- The sprite's height is scaled by t, so its apparent size is constant. Where it goes
+  laterally is the anchor mode (§7). The default, HYBRID, puts it at **C = E + t·(S − E)**
+  while the pointer moves: on the cyclopean ray, so it never slides sideways as it rises.
 
 Because only located views are used, the result is correct for:
 
@@ -120,7 +121,7 @@ The eye compares disparities, so the margin, clamp and slew rates are expressed 
 
 | Parameter | Default | Why |
 |---|---|---|
-| margin in front of content | 0.03 | about 2 mm crossed on screen at 65 mm IPD: reads as in front without looking detached |
+| margin in front of content | 0.005 (was 0.03 before spec v3) | a tester on a real head-tracked panel found 0.003–0.005 rests the cursor on the content (~1.5 mm in front of it), while 0.03 floated it a visibly detached 1–2 cm off it. Apps can override it (`XrCursorDepthOptionsDXR::margin`) |
 | clamp | [−0.6, +0.6] | t ≥ 0.625: never more than about 3/8 of the way to the eye |
 | rise time constant | 30 ms | never lag behind content that comes forward, or the violation is visible |
 | sink time constant | 250 ms | no flicker when the footprint crosses an edge |
@@ -152,7 +153,7 @@ checks, `DISPLAYXR_CURSOR_DEPTH_UV=u,v` scripts the cursor position. Atlas captu
 
 | Cursor UV | Over | Cursor disparity between views | Meaning |
 |---|---|---|---|
-| 0.5, 0.5 | the cube | −23.4 px; the cube's nearest edge there is about −15 px | in front of the cube |
+| 0.5, 0.5 | the cube | −23.4 px with the original 0.03 margin; the cube's nearest edge there is about −15 px (for spec v3's 0.005 margin, see §7) | in front of the cube |
 | 0.5, 0.65 | the floor grid, which the app doesn't report as content | 0 px | on the display plane |
 | 0.1, 0.1 | empty space | 0 px | on the display plane |
 
@@ -258,6 +259,47 @@ slightly nearer cube edge. A run without the request, in hint mode and with
 `DISPLAYXR_CURSOR_DEPTH=0`, logs none of the Phase 3a one-time WARNs. A run with the request logs
 each of them exactly once.
 
+### 7. Spec v3: anchor modes, and why HYBRID is the default
+
+**What the tester saw.** On a real head-tracked panel, the v1/v2 cursor read as "at the glass"
+even when its disparity put it on the content. The cause is a cue conflict of its own. The sprite
+sat on the cyclopean ray through the pointer's canvas point (§2), so each eye's image of it on the
+glass was S ∓ (baseline/2)·d whatever the head did. That is disparity with **no motion parallax**.
+On a head-tracked display everything else parallaxes as the head moves, so a cursor that doesn't
+reads as lying on the one surface that also doesn't: the glass. A world-fixed cursor read
+correctly, but sat a millimetre or two beside the click point.
+
+**The modes** (`XrCursorDepthOptionsDXR::anchorMode`, a new struct chained on the hint; no
+existing struct grows). With f the display normal away from the viewer and e = dot(S − E, f):
+
+| Mode | Sprite centre C | Aim | Parallax |
+|---|---|---|---|
+| SCREEN (v1/v2) | E + t·(S − E) | exact, always | none: reads as at the glass |
+| WORLD | S − f·(1 − t)·e | ~1–2 mm off for an off-axis viewer, always | correct |
+| **HYBRID (default)** | moving: SCREEN, and store the foot F = C + f·(1 − t)·e; still: F − f·(1 − t)·e | exact while moving | correct while still |
+
+"Moving" means `cursorUV` changed by more than 1e-4 since the last moving placement. HYBRID
+re-anchors on the first hinted locate and whenever the time filter re-primes; the anchor lives
+beside the filter in the session and is touched only by a hinted locate, so §0 holds. On the
+frame the pointer stops, the still placement equals the last moving one exactly (unit-tested), so
+there is no jump.
+
+**Why HYBRID beats both pure modes.** While the pointer moves, the user is aiming, and the eye
+tracks the cursor, not the head; there SCREEN's exact aim is what matters and a parallax deficit
+over a few frames is invisible. While it is still, the user is looking at the scene, often moving
+their head to see around it, and the cursor must parallax like the content it rests on; there
+WORLD's behaviour is right. The cost is drift from the click point, and it accrues **only while
+the pointer is still**: the image of a world-fixed C moves on the glass by |d| × the head's
+lateral displacement, so for content near the glass (d ≈ −0.005 with the new margin) 20 cm of
+head motion moves it about 1 mm. The next mouse movement re-aims it exactly. Hit testing is
+unchanged: the click is always at the pointer's canvas point.
+
+**A deliberate default change.** An app that doesn't chain the options struct gets HYBRID and
+the 0.005 margin, which is different from v2. It is tester-driven, both changes go the same way
+(the cursor reads as on the content), and an app that wants the old placement chains
+`XR_CURSOR_DEPTH_ANCHOR_MODE_SCREEN_DXR` with `margin = 0.03`. The web SDK's depth cursor
+implements the identical rule with the same numbers.
+
 ## Consequences
 
 - An app that already raycasts or reads depth gets a correct, consistent cursor for one struct
@@ -270,14 +312,18 @@ each of them exactly once.
   that to the edge itself. Phase 3a as built does not remove this lag. It reads frame N's
   submitted depth, but the result reaches the placement one or two frames later, because waiting
   on the GPU would stall the pipeline (§6). So it has the same lag, and the same mitigation.
-- **Head motion and look-around.** The sprite sits on the cyclopean ray through the cursor's
-  canvas point. So each eye sees it on the glass at S ∓ (baseline/2)·d, which doesn't depend on
-  where the head is (unit-tested across three head poses). The cursor's image on the panel
-  therefore cannot swim with tracking motion or jitter. Only the content under the line of sight
-  changes as the user looks around, and the hit test is redone every frame. This is deliberate
-  SCREEN anchoring, not world anchoring. A mouse is a 2D screen-space device, so the cursor slides
-  over a surface under head motion instead of sticking to it. If it stuck to the surface, the
-  click target would drift on the glass as the head moved.
+- **Head motion and look-around (revised in spec v3, §7).** v1/v2 anchored the sprite to the
+  screen: on the cyclopean ray, so each eye saw it on the glass at S ∓ (baseline/2)·d whatever
+  the head did (still unit-tested, now as the SCREEN-mode property). The reasoning was that a
+  mouse is a 2D screen-space device and its click target must not drift. Testing on a real
+  head-tracked panel showed the price: a sprite with disparity but no motion parallax conflicts
+  with everything around it that does parallax, and reads as at the glass. The default is now
+  HYBRID: screen-anchored while the pointer moves (exact aim), world-fixed while it is still
+  (correct parallax, unit-tested: the sprite does not move in locate space as the head moves).
+  The click target never drifts, because hit testing stays at the pointer's canvas point; only
+  the drawn sprite drifts, by |d| × head displacement, and only until the mouse next moves. That
+  is about 1 mm for 20 cm of head motion over content near the glass. SCREEN and WORLD remain
+  available through `XrCursorDepthOptionsDXR`.
 - An app-drawn cursor shows the app's frame latency, not the hardware cursor's. Phase 2's late
   cursor read narrows that but cannot remove it. This is inherent to any cursor that has
   disparity.
