@@ -157,6 +157,87 @@ comp_segments_decide(bool have_dp, bool dp_tolerates_resample, enum comp_seg_1to
 	return COMP_SEG_RENDER_WEAVE;
 }
 
+static void
+sort_i32(int32_t *v, uint32_t n)
+{
+	for (uint32_t i = 1; i < n; i++) {
+		int32_t k = v[i];
+		uint32_t j = i;
+		while (j > 0 && v[j - 1] > k) {
+			v[j] = v[j - 1];
+			j--;
+		}
+		v[j] = k;
+	}
+}
+
+uint32_t
+comp_segments_uncovered(const struct comp_segment_table *t,
+                        const struct comp_seg_rect *canvas,
+                        struct comp_seg_rect *out,
+                        uint32_t cap)
+{
+	if (canvas == NULL || out == NULL || cap == 0 || canvas->w == 0 || canvas->h == 0) {
+		return 0;
+	}
+	const int32_t cx0 = canvas->x, cy0 = canvas->y;
+	const int32_t cx1 = canvas->x + (int32_t)canvas->w, cy1 = canvas->y + (int32_t)canvas->h;
+	const uint32_t n = t != NULL ? t->count : 0;
+
+	// Row bands at every segment's top/bottom edge.
+	int32_t ys[2 * COMP_SEGMENTS_MAX + 2];
+	uint32_t yn = 0;
+	ys[yn++] = cy0;
+	ys[yn++] = cy1;
+	for (uint32_t i = 0; i < n; i++) {
+		const struct comp_seg_rect *r = &t->seg[i].window_rect;
+		if (r->y > cy0 && r->y < cy1) {
+			ys[yn++] = r->y;
+		}
+		const int32_t b = r->y + (int32_t)r->h;
+		if (b > cy0 && b < cy1) {
+			ys[yn++] = b;
+		}
+	}
+	sort_i32(ys, yn);
+
+	uint32_t count = 0;
+	for (uint32_t b = 0; b + 1 < yn; b++) {
+		const int32_t y0 = ys[b], y1 = ys[b + 1];
+		if (y1 <= y0) {
+			continue;
+		}
+		// Segments spanning this band, as sorted x intervals.
+		int32_t xs0[COMP_SEGMENTS_MAX], xs1[COMP_SEGMENTS_MAX];
+		uint32_t xn = 0;
+		for (uint32_t i = 0; i < n; i++) {
+			const struct comp_seg_rect *r = &t->seg[i].window_rect;
+			if (r->w == 0 || r->h == 0 || r->y > y0 || r->y + (int32_t)r->h < y1) {
+				continue;
+			}
+			uint32_t j = xn++;
+			while (j > 0 && xs0[j - 1] > r->x) {
+				xs0[j] = xs0[j - 1];
+				xs1[j] = xs1[j - 1];
+				j--;
+			}
+			xs0[j] = r->x;
+			xs1[j] = r->x + (int32_t)r->w;
+		}
+		int32_t x = cx0;
+		for (uint32_t i = 0; i <= xn; i++) {
+			const int32_t gap_end = i < xn ? (xs0[i] < cx1 ? xs0[i] : cx1) : cx1;
+			if (gap_end > x && count < cap) {
+				out[count++] = (struct comp_seg_rect){x, y0, (uint32_t)(gap_end - x), (uint32_t)(y1 - y0)};
+			}
+			if (i < xn && xs1[i] > x) {
+				x = xs1[i];
+			}
+		}
+	}
+	return count;
+}
+
 bool
 comp_segments_table_equal(const struct comp_segment_table *a, const struct comp_segment_table *b)
 {
