@@ -714,9 +714,16 @@ typedef struct XrDisplayDXR {
     XrStructureType                  type;       //!< Must be XR_TYPE_DISPLAY_DXR
     void* XR_MAY_ALIAS               next;
     /*!
-     * Opaque, non-zero identifier of this display, stable for the life of the
-     * instance (and, in practice, across processes on the same boot: it is
-     * derived from the monitor's EDID identity and connector). Pass it to
+     * Opaque, non-zero identifier of this display. Where the platform names
+     * the connector (desktop Linux) it is derived from the monitor's EDID
+     * identity + connector only: it survives the user rearranging monitors
+     * and is the same in every process, and changes only when a different
+     * panel is plugged into that port, the panel moves port, or the kernel
+     * renumbers the GPU (the connector key includes its card, e.g.
+     * "card1-HDMI-A-1"). Where it does
+     * not (Windows today) it also covers the desktop position, so a
+     * rearrangement yields new ids. Either way, re-enumerate after a topology
+     * change and treat an id that is no longer listed as gone. Pass it to
      * XrDisplaySpaceCreateInfoDXR and XrSessionDisplayBindingDXR.
      */
     uint64_t                         displayId;
@@ -742,8 +749,8 @@ typedef struct XrDisplayDXR {
 /*!
  * @brief Enumerate the system's displays (v22). Standard two-call idiom.
  *
- * The list is snapshotted when the call is made; ids are stable for the
- * instance. Order: the SYSTEM_DEFAULT display first, then the rest in the
+ * The list is snapshotted when the call is made (see XrDisplayDXR::displayId
+ * for how long an id lasts). Order: the SYSTEM_DEFAULT display first, then the rest in the
  * runtime's monitor-enumeration order.
  *
  * @param instance          A valid XrInstance with XR_DXR_display_info enabled.

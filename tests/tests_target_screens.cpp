@@ -242,3 +242,51 @@ TEST_CASE("empty registry: one synthesized system screen, or nothing when the sy
 	target_screens_build(&empty, "vendor", &f.sys, &list);
 	CHECK(list.count == 0);
 }
+
+TEST_CASE("monitor id: survives a rearrangement where the connector is known, separates identical panels")
+{
+	os_display_edid_list edid{};
+	edid.count = 2;
+	for (int i = 0; i < 2; i++) {
+		os_display_edid_monitor &m = edid.monitors[i];
+		m.manufacturer_id = 0x0472;
+		m.product_id = 0x0001;
+		m.serial_number = 0x322EF05E;
+		m.pixel_width = 3840;
+		m.pixel_height = 2160;
+		m.screen_left = i * 3840;
+		std::snprintf(m.connector, sizeof(m.connector), "%s", i == 0 ? "card1-HDMI-A-1" : "card1-DP-1");
+	}
+	xrt_display_descriptor a[2]{};
+	REQUIRE(target_plugin_build_descriptors(&edid, a, 2) == 2);
+	CHECK(a[0].monitor_id != a[1].monitor_id); // identical panels, different ports
+
+	// The user swaps the two monitors' desktop positions.
+	edid.monitors[0].screen_left = 3840;
+	edid.monitors[1].screen_left = 0;
+	xrt_display_descriptor b[2]{};
+	REQUIRE(target_plugin_build_descriptors(&edid, b, 2) == 2);
+	CHECK(b[0].monitor_id == a[0].monitor_id);
+	CHECK(b[1].monitor_id == a[1].monitor_id);
+
+	// A different panel on the same port is a different display.
+	edid.monitors[0].serial_number = 0x1;
+	xrt_display_descriptor c[2]{};
+	REQUIRE(target_plugin_build_descriptors(&edid, c, 2) == 2);
+	CHECK(c[0].monitor_id != a[0].monitor_id);
+
+	// Same connector name on a second GPU: the card prefix keeps them apart.
+	edid.monitors[0].serial_number = edid.monitors[1].serial_number;
+	std::snprintf(edid.monitors[0].connector, sizeof(edid.monitors[0].connector), "%s", "card0-DP-1");
+	xrt_display_descriptor e[2]{};
+	REQUIRE(target_plugin_build_descriptors(&edid, e, 2) == 2);
+	CHECK(e[0].monitor_id != e[1].monitor_id);
+
+	// No connector name (Windows): position still separates identical panels.
+	edid.monitors[0].connector[0] = '\0';
+	edid.monitors[1].connector[0] = '\0';
+	edid.monitors[0].serial_number = edid.monitors[1].serial_number;
+	xrt_display_descriptor d[2]{};
+	REQUIRE(target_plugin_build_descriptors(&edid, d, 2) == 2);
+	CHECK(d[0].monitor_id != d[1].monitor_id);
+}

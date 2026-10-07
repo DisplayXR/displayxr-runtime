@@ -3162,32 +3162,52 @@ target_plugin_refresh_active(void)
  */
 
 /*!
- * Stable-for-this-boot monitor id. FNV-1a-64 over the EDID identity fields
- * that survive a mode/refresh change — manufacturer, product, and screen
- * position (so two identical-model panels at different positions differ).
- * Excludes pixel dims/refresh/HMONITOR (transient). Known limitation:
- * repositioning a monitor changes its id within a boot — acceptable for
- * Phase 1; EDID device-instance-path keying is the Phase 2/3 hardening.
+ * Monitor id (also the `displayId` of `XR_DXR_display_info` v22). FNV-1a-64.
+ *
+ * Where the platform names the connector (desktop Linux: the DRM connector
+ * WITH its card prefix, e.g. "card1-HDMI-A-1", else the RandR output name) the
+ * id hashes the EDID identity
+ * — manufacturer, product, serial — plus that connector, and NOT the desktop
+ * position: the connector is unique per machine, so the id survives the user
+ * rearranging monitors and the service rebuilding its registry on the next
+ * client connect, and still separates two identical panels (different ports).
+ * It changes only when a different panel is plugged into that port, the
+ * panel moves to another port, or the kernel renumbers the card (a GPU added
+ * or removed, a different driver probe order across boots) (multi-screen M1).
+ *
+ * With no connector name (Windows today) the id stays what it has always
+ * been — manufacturer + product + screen position, position being the only
+ * thing that separates two identical panels there — so Windows ids are
+ * unchanged, and a rearrangement there does change them (documented in
+ * XR_DXR_display_info v22).
  */
 static uint64_t
-monitor_id_from_edid(uint16_t mfr, uint16_t product, int32_t left, int32_t top, const char *platform_key)
+monitor_id_from_edid(
+    uint16_t mfr, uint16_t product, uint32_t serial, int32_t left, int32_t top, const char *platform_key)
 {
 	uint64_t h = 1469598103934665603ULL; /* FNV-1a-64 offset basis */
 	const uint64_t prime = 1099511628211ULL;
+	const bool have_key = platform_key != NULL && platform_key[0] != '\0';
 	uint8_t bytes[12];
+	size_t n = 0;
 	memcpy(&bytes[0], &mfr, sizeof(mfr));
 	memcpy(&bytes[2], &product, sizeof(product));
-	memcpy(&bytes[4], &left, sizeof(left));
-	memcpy(&bytes[8], &top, sizeof(top));
-	for (size_t i = 0; i < sizeof(bytes); i++) {
+	if (have_key) {
+		memcpy(&bytes[4], &serial, sizeof(serial));
+		n = 8;
+	} else {
+		memcpy(&bytes[4], &left, sizeof(left));
+		memcpy(&bytes[8], &top, sizeof(top));
+		n = 12;
+	}
+	for (size_t i = 0; i < n; i++) {
 		h ^= (uint64_t)bytes[i];
 		h *= prime;
 	}
-	// The platform's connector key (desktop Linux: "card1-HDMI-A-1"), when there is
-	// one. Empty on Windows, so ids there are unchanged. It separates two
-	// identical panels that share a position — every DRM-only record (no X
-	// server) sits at (0, 0).
-	for (const char *c = platform_key; c != NULL && *c != '\0'; c++) {
+	// The connector key exactly as the platform records it — on desktop
+	// Linux with its DRM card prefix ("card1-HDMI-A-1"), so two GPUs that both
+	// expose an "HDMI-A-1" still yield different ids.
+	for (const char *c = platform_key; have_key && *c != '\0'; c++) {
 		h ^= (uint64_t)(uint8_t)*c;
 		h *= prime;
 	}
@@ -3301,8 +3321,9 @@ target_plugin_build_descriptors(const struct os_display_edid_list *list,
 		struct xrt_display_descriptor *d = &out[i];
 		memset(d, 0, sizeof(*d));
 		d->struct_size = (uint32_t)sizeof(*d);
-		d->monitor_id = monitor_id_from_edid(m->manufacturer_id, m->product_id, m->screen_left, m->screen_top,
-		                                     m->connector[0] != '\0' ? m->connector : m->output_name);
+		d->monitor_id =
+		    monitor_id_from_edid(m->manufacturer_id, m->product_id, m->serial_number, m->screen_left,
+		                         m->screen_top, m->connector[0] != '\0' ? m->connector : m->output_name);
 		d->edid_manufacturer = m->manufacturer_id;
 		d->edid_product = m->product_id;
 		d->pixel_width = m->pixel_width;
