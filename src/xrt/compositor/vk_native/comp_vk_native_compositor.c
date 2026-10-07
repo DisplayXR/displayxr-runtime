@@ -5410,7 +5410,13 @@ vk_route_effective_layout(struct comp_vk_native_compositor *c, uint32_t layer_vi
 	    (uint32_t)(r.canvas.extent.h > 0 ? r.canvas.extent.h : 0),
 	};
 	for (uint32_t k = 0; k < r.count; k++) {
-		if (r.view_count[k] != L->views || r.first_view[k] + r.view_count[k] > layer_view_count) {
+		// The route is what the locate handed out. Across a 2D<->3D toggle
+		// the mode (tile count) can change between that locate and this
+		// commit: route the views the tiles can hold (min of the two) rather
+		// than dropping the routing for the frame — unrouted, segment 0's
+		// views would stretch over the whole window.
+		const uint32_t n = r.view_count[k] < L->views ? r.view_count[k] : L->views;
+		if (n == 0 || r.first_view[k] + n > layer_view_count) {
 			return;
 		}
 		const struct comp_seg_rect seg = {
@@ -5424,7 +5430,7 @@ vk_route_effective_layout(struct comp_vk_native_compositor *c, uint32_t layer_vi
 			return;
 		}
 		L->route[k].first_view = r.first_view[k];
-		L->route[k].view_count = r.view_count[k];
+		L->route[k].view_count = n;
 		L->route[k].x = tr.x;
 		L->route[k].y = tr.y;
 		L->route[k].w = tr.w;
