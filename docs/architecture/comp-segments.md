@@ -89,6 +89,17 @@ in `COLOR_ATTACHMENT_OPTIMAL` with the clear confined to the render area). A DP
 built before M2 may still clear its whole target, which is why the primary runs
 first.
 
+**sim_display behaviour change for every caller, on purpose.** sim's viewport and
+scissor now follow the canvas for the unbound (primary) DP too — the split path
+needs it, and it is what the `process_atlas` contract always said. It is identical
+to before whenever the canvas is the whole target (every single-screen in-process
+frame); it differs when the canvas is smaller — the one-or-two-frame window-shrink
+transient before the swapchain is recreated, the shared-texture path, and a
+`comp_multi` zone canvas — where sim used to stretch the canvas-sized atlas across
+the whole target. The interlace phase does NOT change for the unbound DP: it stays
+`canvas_offset_x`; only a screen-bound segment DP takes its phase from
+`set_present_origin`.
+
 ## The 1:1 policy
 
 A lenticular weave is a ~1-pixel-period pattern: if the display server resamples
