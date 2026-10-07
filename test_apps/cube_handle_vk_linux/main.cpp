@@ -2189,6 +2189,42 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
         }
     }
 
+    // XR_DXR_display_info v22 (multi-screen M1): every display the runtime
+    // knows, one line each. Informational only — the app still renders to the
+    // system-default display reported above. Absent on runtimes older than
+    // v22 (the proc lookup then fails and nothing is logged).
+    if (hasDisplayInfo) {
+        PFN_xrEnumerateDisplaysDXR pfnEnumerateDisplays = nullptr;
+        if (XR_SUCCEEDED(xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplaysDXR",
+                                               (PFN_xrVoidFunction*)&pfnEnumerateDisplays)) &&
+            pfnEnumerateDisplays != nullptr) {
+            uint32_t displayCount = 0;
+            if (XR_SUCCEEDED(pfnEnumerateDisplays(xr.instance, xr.systemId, 0, &displayCount, nullptr))) {
+                std::vector<XrDisplayDXR> displays(displayCount, XrDisplayDXR{XR_TYPE_DISPLAY_DXR});
+                if (displayCount > 0 &&
+                    XR_SUCCEEDED(pfnEnumerateDisplays(xr.instance, xr.systemId, displayCount, &displayCount,
+                                                      displays.data()))) {
+                    for (uint32_t i = 0; i < displayCount; i++) {
+                        const XrDisplayDXR& d = displays[i];
+                        LOG_INFO("Display %u: id=0x%016llx '%s' plug-in='%s'%s%s%s %dx%d @ (%d,%d), "
+                                 "%.4f x %.4f m, %ux%u px, nominal z %.3f m, scale %.3fx%.3f, eye modes 0x%llx",
+                                 i, (unsigned long long)d.displayId, d.deviceName, d.vendorPluginId,
+                                 (d.flags & XR_DISPLAY_SYSTEM_DEFAULT_BIT_DXR) ? " [system default]" : "",
+                                 (d.flags & XR_DISPLAY_PRIMARY_BIT_DXR) ? " [primary]" : "",
+                                 (d.flags & XR_DISPLAY_TRACKED_BIT_DXR) ? " [tracked]" : "",
+                                 d.desktopRect.extent.width, d.desktopRect.extent.height,
+                                 d.desktopRect.offset.x, d.desktopRect.offset.y,
+                                 d.info.displaySizeMeters.width, d.info.displaySizeMeters.height,
+                                 d.info.displayPixelWidth, d.info.displayPixelHeight,
+                                 d.info.nominalViewerPositionInDisplaySpace.z,
+                                 d.info.recommendedViewScaleX, d.info.recommendedViewScaleY,
+                                 (unsigned long long)d.eyeTracking.supportedModes);
+                    }
+                }
+            }
+        }
+    }
+
     uint32_t viewCount = 0;
     XR_CHECK(xrEnumerateViewConfigurationViews(xr.instance, xr.systemId, xr.viewConfigType, 0, &viewCount, nullptr));
     xr.configViews.resize(viewCount, {XR_TYPE_VIEW_CONFIGURATION_VIEW});
