@@ -25,6 +25,8 @@ struct xrt_display_processor_d3d12;
 struct xrt_display_processor_metal;
 struct xrt_display_processor_gl;
 struct vk_bundle;
+struct xrt_plugin_instance;
+struct xrt_screen_binding;
 
 /*!
  * @defgroup drv_sim_display Simulation 3D Display Driver
@@ -371,6 +373,24 @@ sim_display_dp_factory_vk(void *vk_bundle,
                           void *window_handle,
                           int32_t target_format,
                           struct xrt_display_processor **out_xdp);
+
+/*!
+ * Per-screen twin of @ref sim_display_dp_factory_vk (multi-screen M2) —
+ * `xrt_plugin_iface::create_dp_vk_for_screen`. The DP describes the bound
+ * screen (its EDID size, native pixels, desktop origin), confines its output to
+ * the canvas it is handed, and preserves the target outside it, so several of
+ * these can weave one window's segments into one surface.
+ *
+ * @ingroup drv_sim_display
+ */
+xrt_result_t
+sim_display_dp_factory_vk_for_screen(struct xrt_plugin_instance *inst,
+                                     void *vk_bundle,
+                                     void *vk_cmd_pool,
+                                     void *window_handle,
+                                     int32_t target_format,
+                                     const struct xrt_screen_binding *binding,
+                                     struct xrt_display_processor **out_xdp);
 
 /*!
  * Create a simulation Metal display processor.

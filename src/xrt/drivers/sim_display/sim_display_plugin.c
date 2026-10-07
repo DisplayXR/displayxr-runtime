@@ -364,6 +364,13 @@ static struct xrt_plugin_iface g_sim_display_iface = {
 
     /* Multi-screen M1: per-monitor display info for every monitor sim wins. */
     .get_display_info_for_monitor = sim_display_plugin_get_display_info_for_monitor,
+
+    /* Multi-screen M2: one VK DP per screen a spanning window covers. */
+#if defined(XRT_HAVE_VULKAN) || !defined(_WIN32)
+    .create_dp_vk_for_screen = sim_display_dp_factory_vk_for_screen,
+#else
+    .create_dp_vk_for_screen = NULL,
+#endif
 };
 
 
