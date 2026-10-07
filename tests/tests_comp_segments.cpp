@@ -422,3 +422,32 @@ TEST_CASE("comp_segments: deferred release")
 	CHECK_FALSE(comp_segments_retire_push(&r, 0, 999));
 	CHECK_FALSE(comp_segments_retire_push(nullptr, 0, 1));
 }
+
+TEST_CASE("tile rects: adjacent segments share the seam column (M3 routing == M2 crop)", "[comp_segments]")
+{
+	// A 1600x900 canvas into an 800x900 tile (anaglyph 0.5x1 scale), split
+	// at an odd column so the scaled seam is fractional.
+	const comp_seg_rect canvas = {0, 0, 1600, 900};
+	const comp_seg_rect left = {0, 0, 801, 900};
+	const comp_seg_rect right = {801, 0, 799, 900};
+	comp_seg_rect a, b;
+	REQUIRE(comp_segments_tile_rect(&left, &canvas, 800, 900, &a));
+	REQUIRE(comp_segments_tile_rect(&right, &canvas, 800, 900, &b));
+	CHECK(a.x == 0);
+	CHECK(a.x + (int32_t)a.w == b.x); // no gap, no overlap
+	CHECK(b.x + (int32_t)b.w == 800);
+	CHECK(a.h == 900);
+
+	// Canvas offset inside the window.
+	const comp_seg_rect canvas2 = {100, 50, 1600, 900};
+	const comp_seg_rect seg2 = {100, 50, 800, 900};
+	REQUIRE(comp_segments_tile_rect(&seg2, &canvas2, 800, 900, &a));
+	CHECK(a.x == 0);
+	CHECK(a.w == 400);
+
+	// Outside the canvas / degenerate.
+	const comp_seg_rect outside = {0, 0, 50, 900};
+	CHECK_FALSE(comp_segments_tile_rect(&outside, &canvas2, 800, 900, &a));
+	const comp_seg_rect zero = {0, 0, 0, 0};
+	CHECK_FALSE(comp_segments_tile_rect(&left, &zero, 800, 900, &a));
+}

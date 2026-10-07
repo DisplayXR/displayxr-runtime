@@ -15,6 +15,8 @@
 
 #include "vk/vk_helpers.h"
 
+#include "os/os_threading.h"
+
 #include "util/u_logging.h"
 #include "util/u_misc.h"
 
@@ -70,6 +72,8 @@ struct seg_screen_state
 	//! re-declared on change, like the primary's (#1484, #573).
 	int encoding_latched;
 	int transparent_latched;
+	//! The session-wide 2D/3D mode last sent to this DP (-1 = never).
+	int mode_sent;
 
 	/*!
 	 * One DP input image PER FRAME CLASS. The repaint ("fill") parks on its
@@ -105,6 +109,8 @@ struct comp_vk_native_segments
 	uint32_t screen_count;
 	struct comp_segments_screen screens[COMP_SEGMENTS_MAX_SCREENS];
 	struct xrt_screen_binding bindings[COMP_SEGMENTS_MAX_SCREENS];
+	//! Display info per screen (physical size, nominal viewer) — M3 views.
+	struct xrt_screen_info info[COMP_SEGMENTS_MAX_SCREENS];
 	//! Owning plug-in iface / instance per screen (registry).
 	const struct xrt_plugin_iface *iface[COMP_SEGMENTS_MAX_SCREENS];
 	struct xrt_plugin_instance *inst[COMP_SEGMENTS_MAX_SCREENS];
@@ -115,6 +121,9 @@ struct comp_vk_native_segments
 	struct comp_segment_table logged_table;
 	bool have_logged_table;
 	bool logged_split;
+
+	//! The session-wide hardware 2D/3D mode every segment DP follows (-1 = not set yet).
+	int display_mode;
 
 	struct seg_capture cap[COMP_SEGMENTS_MAX];
 	uint32_t cap_count;
@@ -129,6 +138,14 @@ struct comp_vk_native_segments
 
 	//! Rendering-mode index the segment DPs' tolerance was last read at.
 	uint32_t mode_index;
+
+	/*!
+	 * Guards every seg_screen_state::dp pointer swap against
+	 * @ref comp_vk_native_segments_get_eyes, which the state tracker calls
+	 * from the app thread (xrLocateViews) while the weave may create or
+	 * destroy segment DPs.
+	 */
+	struct os_mutex dp_mutex;
 };
 
 
@@ -319,8 +336,13 @@ dp_release(struct comp_vk_native_segments *segs, uint32_t i)
 	if (st->dp != NULL) {
 		U_LOG_I("segments: retiring the segment DP for screen 0x%016llx ('%s')",
 		        (unsigned long long)segs->screens[i].id, segs->bindings[i].device_name);
-		release_deferred(segs, SEG_RETIRE_DP, (uint64_t)(uintptr_t)st->dp);
+		// The app thread reads st->dp for eyes (M3): swap under the lock,
+		// release (deferred past any in-flight fill) after it.
+		os_mutex_lock(&segs->dp_mutex);
+		struct xrt_display_processor *dp = st->dp;
 		st->dp = NULL;
+		os_mutex_unlock(&segs->dp_mutex);
+		release_deferred(segs, SEG_RETIRE_DP, (uint64_t)(uintptr_t)dp);
 	}
 	st->configured = false;
 	st->encoding_latched = -1;
@@ -329,6 +351,7 @@ dp_release(struct comp_vk_native_segments *segs, uint32_t i)
 	for (uint32_t k = 0; k < SEG_CLASS_COUNT; k++) {
 		crop_retire(segs, &st->crop[k]);
 	}
+	st->mode_sent = -1;
 }
 
 /*!
@@ -351,7 +374,8 @@ dp_create(struct comp_vk_native_segments *segs, uint32_t i, int32_t target_forma
 	xrt_result_t xret = XRT_ERROR_DEVICE_CREATION_FAILED;
 	const char *how = "none";
 
-	if (xrt_plugin_iface_has_create_dp_vk_for_screen(iface)) {
+	struct xrt_display_processor *dp = NULL;
+	if (segs->screens[i].has_dp_factory && xrt_plugin_iface_has_create_dp_vk_for_screen(iface)) {
 		how = "create_dp_vk_for_screen";
 		/*
 		 * #868: same queue swap as vk_make_dp_vk — a vendor DP captures
@@ -364,13 +388,13 @@ dp_create(struct comp_vk_native_segments *segs, uint32_t i, int32_t target_forma
 			segs->vk->main_queue->queue = segs->dp_queue;
 		}
 		xret = iface->create_dp_vk_for_screen(segs->inst[i], segs->vk, (void *)(uintptr_t)segs->cmd_pool, NULL,
-		                                      target_format, &segs->bindings[i], &st->dp);
+		                                      target_format, &segs->bindings[i], &dp);
 		segs->vk->main_queue->queue = saved;
 	}
 
-	if (xret != XRT_SUCCESS || st->dp == NULL || st->dp->process_atlas == NULL) {
-		if (st->dp != NULL) {
-			xrt_display_processor_destroy(&st->dp);
+	if (xret != XRT_SUCCESS || dp == NULL || dp->process_atlas == NULL) {
+		if (dp != NULL) {
+			xrt_display_processor_destroy(&dp);
 		}
 		U_LOG_W("segments: could not create a DP for screen 0x%016llx ('%s', plug-in '%s') via %s (%d) — "
 		        "that segment stays flat 2D",
@@ -378,6 +402,9 @@ dp_create(struct comp_vk_native_segments *segs, uint32_t i, int32_t target_forma
 		        segs->screens[i].plugin_id, how, (int)xret);
 		return false;
 	}
+	os_mutex_lock(&segs->dp_mutex);
+	st->dp = dp;
+	os_mutex_unlock(&segs->dp_mutex);
 	st->tolerates_resample = xrt_display_processor_vk_tolerates_resample((struct xrt_display_processor_vk *)st->dp);
 	st->configured = false;
 	st->encoding_latched = -1;
@@ -389,17 +416,10 @@ dp_create(struct comp_vk_native_segments *segs, uint32_t i, int32_t target_forma
 	return true;
 }
 
-static int32_t
-scale_round(int64_t v, int64_t num, int64_t den)
-{
-	// round(v * num / den), v/num/den >= 0
-	return den > 0 ? (int32_t)((v * num + den / 2) / den) : 0;
-}
-
 /*!
- * A segment's rect in VIEW-TILE pixels (the atlas holds the canvas at view
- * resolution). Edges are rounded independently, so two segments sharing a
- * seam share the tile column too: no gap, no overlap.
+ * A segment's rect in VIEW-TILE pixels — comp_segments_tile_rect, the one
+ * mapping the M3 view routing shares (so a segment's views land exactly where
+ * this crop reads them).
  */
 static bool
 segment_tile_rect(const struct comp_seg_rect *wr,
@@ -411,31 +431,14 @@ segment_tile_rect(const struct comp_seg_rect *wr,
                   uint32_t *w,
                   uint32_t *h)
 {
-	if (canvas->w == 0 || canvas->h == 0) {
+	struct comp_seg_rect r;
+	if (!comp_segments_tile_rect(wr, canvas, view_w, view_h, &r)) {
 		return false;
 	}
-	const int64_t rx = (int64_t)wr->x - canvas->x;
-	const int64_t ry = (int64_t)wr->y - canvas->y;
-	if (rx < 0 || ry < 0) {
-		return false;
-	}
-	const int32_t ax = scale_round(rx, view_w, canvas->w);
-	const int32_t ay = scale_round(ry, view_h, canvas->h);
-	int32_t bx = scale_round(rx + wr->w, view_w, canvas->w);
-	int32_t by = scale_round(ry + wr->h, view_h, canvas->h);
-	if (bx > (int32_t)view_w) {
-		bx = (int32_t)view_w;
-	}
-	if (by > (int32_t)view_h) {
-		by = (int32_t)view_h;
-	}
-	if (ax < 0 || ay < 0 || bx <= ax || by <= ay) {
-		return false;
-	}
-	*x0 = ax;
-	*y0 = ay;
-	*w = (uint32_t)(bx - ax);
-	*h = (uint32_t)(by - ay);
+	*x0 = r.x;
+	*y0 = r.y;
+	*w = r.w;
+	*h = r.h;
 	return true;
 }
 
@@ -481,7 +484,15 @@ comp_vk_native_segments_create(struct vk_bundle *vk, VkCommandPool cmd_pool, VkQ
 	segs->vk = vk;
 	segs->cmd_pool = cmd_pool;
 	segs->dp_queue = dp_queue;
+	segs->display_mode = -1;
+	for (uint32_t i = 0; i < COMP_SEGMENTS_MAX_SCREENS; i++) {
+		segs->st[i].mode_sent = -1;
+	}
 	comp_segments_lifecycle_init(&segs->lc, 0, 0);
+	if (os_mutex_init(&segs->dp_mutex) != 0) {
+		free(segs);
+		return NULL;
+	}
 	return segs;
 }
 
@@ -499,6 +510,7 @@ comp_vk_native_segments_destroy(struct comp_vk_native_segments **segs_ptr)
 	segs->release_safe = true;
 	retire_drain(segs, true);
 	segs->release_safe = false;
+	os_mutex_destroy(&segs->dp_mutex);
 	free(segs);
 	*segs_ptr = NULL;
 }
@@ -558,6 +570,7 @@ comp_vk_native_segments_set_screens(struct comp_vk_native_segments *segs,
 
 	uint32_t n = 0;
 	bool mixed = false;
+	char vendors[256] = {0};
 	for (uint32_t i = 0; i < list->count && i < XRT_SCREEN_LIST_MAX && n < COMP_SEGMENTS_MAX_SCREENS; i++) {
 		const struct xrt_screen *s = &list->screens[i];
 		if (s->desktop_width == 0 || s->desktop_height == 0) {
@@ -586,18 +599,30 @@ comp_vk_native_segments_set_screens(struct comp_vk_native_segments *segs,
 		segs->iface[n] = NULL;
 		segs->inst[n] = NULL;
 		if (e != NULL && !cs->is_primary) {
-			const bool same_vendor = strcmp(e->plugin_id, primary_entry->plugin_id) == 0;
-			if (!same_vendor) {
+			/*
+			 * Multi-screen M3 (closes the M4 runtime gap): a segment's DP
+			 * comes from ITS screen's registry entry, whichever plug-in
+			 * that is — the active one or a claim source the loader keeps
+			 * resident (M0). `dp_factory_vk` is only set when the plug-in
+			 * passed the vk_bundle ABI check (#1243), so it gates the
+			 * per-screen slot too: a plug-in whose VK factory was refused
+			 * gets no segment DP (that segment is flat 2D).
+			 */
+			if (strcmp(e->plugin_id, primary_entry->plugin_id) != 0) {
 				mixed = true;
-			} else {
-				segs->iface[n] = (const struct xrt_plugin_iface *)e->owning_iface;
-				segs->inst[n] = (struct xrt_plugin_instance *)e->owning_instance;
-				// The per-screen slot, and only it (see dp_create). The
-				// registry's VK factory being set is what says the claim
-				// covers Vulkan and the vk_bundle ABI matched (#1243).
-				cs->has_dp_factory = e->dp_factory_vk != NULL &&
-				                     xrt_plugin_iface_has_create_dp_vk_for_screen(segs->iface[n]);
+				if (strstr(vendors, e->plugin_id) == NULL) {
+					size_t used = strlen(vendors);
+					snprintf(vendors + used, sizeof(vendors) - used, "%s%s", used > 0 ? ", " : "",
+					         e->plugin_id);
+				}
 			}
+			segs->iface[n] = (const struct xrt_plugin_iface *)e->owning_iface;
+			segs->inst[n] = (struct xrt_plugin_instance *)e->owning_instance;
+			// The per-screen slot, and only it (see dp_create). The
+			// registry's VK factory being set is what says the claim
+			// covers Vulkan and the vk_bundle ABI matched (#1243).
+			cs->has_dp_factory =
+			    e->dp_factory_vk != NULL && xrt_plugin_iface_has_create_dp_vk_for_screen(segs->iface[n]);
 		}
 
 		struct xrt_screen_binding *b = &segs->bindings[n];
@@ -617,20 +642,18 @@ comp_vk_native_segments_set_screens(struct comp_vk_native_segments *segs,
 		if (e != NULL) {
 			snprintf(b->serial, sizeof(b->serial), "%s", e->serial);
 		}
+		segs->info[n] = s->info;
 		n++;
 	}
 	segs->screen_count = n;
 
 	if (mixed) {
-		// One-off session setup line. Mixed vendors (a Leia panel next to a
-		// sim_display laptop panel) are multi-screen M4: the vendor DP's
-		// behaviour on a sub-rect canvas next to another vendor's segment is
-		// not established yet, so the window keeps the shipped single-DP
-		// path rather than risk a broken weave on the 3D panel.
-		U_LOG_W("segments: the screens belong to different plug-ins (primary '%s') — mixed-vendor segments are "
-		        "multi-screen M4; a window spanning screens keeps the single-DP path",
-		        primary_entry->plugin_id);
-		return;
+		// One-off session setup line: each screen is woven by its own
+		// plug-in's DP (a Leia panel next to a sim_display laptop panel).
+		U_LOG_I(
+		    "segments: mixed-vendor screen table — primary '%s', other screens by '%s'; each segment DP "
+		    "comes from its own screen's plug-in",
+		    primary_entry->plugin_id, vendors);
 	}
 	segs->enabled = n >= 2;
 	if (segs->enabled) {
@@ -993,4 +1016,113 @@ comp_vk_native_segments_get_capture(const struct comp_vk_native_segments *segs,
 	*out_screen_id = segs->screens[c->screen_index].id;
 	*out_woven = c->woven;
 	return true;
+}
+
+
+/*
+ *
+ * Multi-screen M3: per-segment views.
+ *
+ */
+
+bool
+comp_vk_native_segments_get_metrics(const struct comp_vk_native_segments *segs,
+                                    const struct comp_seg_rect *window_desktop,
+                                    const struct comp_seg_rect *canvas,
+                                    bool primary_has_dp,
+                                    struct xrt_segment_metrics *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (segs == NULL || !segs->enabled || !segs->logged_split || window_desktop == NULL || canvas == NULL) {
+		return false;
+	}
+	const struct comp_segment_table *t = &segs->table;
+	if (t->count == 0 || t->count > XRT_MAX_SEGMENTS) {
+		// More screens than view sets: the window keeps one view set (M2).
+		return false;
+	}
+	for (uint32_t k = 0; k < t->count; k++) {
+		const struct comp_segment *g = &t->seg[k];
+		if (g->screen_index >= segs->screen_count) {
+			return false;
+		}
+		const uint32_t i = g->screen_index;
+		const struct seg_screen_state *st = &segs->st[i];
+		struct xrt_segment_metric *m = &out->seg[k];
+		m->screen_id = g->screen_id;
+		m->window_rect = (struct xrt_rect){{g->window_rect.x, g->window_rect.y},
+		                                   {(int)g->window_rect.w, (int)g->window_rect.h}};
+		m->screen_rect = (struct xrt_rect){{g->screen_rect.x, g->screen_rect.y},
+		                                   {(int)g->screen_rect.w, (int)g->screen_rect.h}};
+		m->screen_desktop_left = segs->screens[i].desktop.x;
+		m->screen_desktop_top = segs->screens[i].desktop.y;
+		m->screen_desktop_width = segs->screens[i].desktop.w;
+		m->screen_desktop_height = segs->screens[i].desktop.h;
+		m->screen_width_m = segs->info[i].width_m;
+		m->screen_height_m = segs->info[i].height_m;
+		m->nominal_viewer_x_m = segs->info[i].nominal_viewer_x_m;
+		m->nominal_viewer_y_m = segs->info[i].nominal_viewer_y_m;
+		m->nominal_viewer_z_m = segs->info[i].nominal_viewer_z_m;
+		m->is_primary = g->is_primary;
+		if (g->is_primary) {
+			m->has_dp = primary_has_dp;
+			m->tolerates_resample = false; // the primary keeps the session-level gates
+			m->woven = primary_has_dp;
+		} else {
+			m->has_dp = st->dp != NULL;
+			m->tolerates_resample = st->tolerates_resample;
+			m->woven = comp_segments_decide(m->has_dp, st->tolerates_resample, g->screen_1to1) ==
+			           COMP_SEG_RENDER_WEAVE;
+		}
+	}
+	out->count = t->count;
+	out->canvas = (struct xrt_rect){{canvas->x, canvas->y}, {(int)canvas->w, (int)canvas->h}};
+	out->window_screen_left = window_desktop->x;
+	out->window_screen_top = window_desktop->y;
+	out->window_pixel_width = window_desktop->w;
+	out->window_pixel_height = window_desktop->h;
+	return true;
+}
+
+bool
+comp_vk_native_segments_get_eyes(struct comp_vk_native_segments *segs,
+                                 uint64_t screen_id,
+                                 struct xrt_eye_positions *out)
+{
+	if (segs == NULL || out == NULL) {
+		return false;
+	}
+	const int i = screen_index_of(segs, screen_id);
+	if (i < 0) {
+		return false;
+	}
+	bool ok = false;
+	os_mutex_lock(&segs->dp_mutex);
+	if (segs->st[i].dp != NULL) {
+		ok = xrt_display_processor_get_predicted_eye_positions(segs->st[i].dp, out) && out->valid;
+	}
+	os_mutex_unlock(&segs->dp_mutex);
+	return ok;
+}
+
+void
+comp_vk_native_segments_set_display_mode(struct comp_vk_native_segments *segs, bool enable_3d)
+{
+	if (segs == NULL) {
+		return;
+	}
+	const int want = enable_3d ? 1 : 0;
+	segs->display_mode = want;
+	for (uint32_t i = 0; i < segs->screen_count; i++) {
+		struct seg_screen_state *st = &segs->st[i];
+		if (st->dp == NULL || st->mode_sent == want) {
+			continue;
+		}
+		st->mode_sent = want;
+		// A lifecycle event per DP (create, or a session 2D/3D switch).
+		const bool ok = xrt_display_processor_request_display_mode(st->dp, enable_3d);
+		U_LOG_I("segments: screen 0x%016llx ('%s') DP follows the session mode: %s -> %d",
+		        (unsigned long long)segs->screens[i].id, segs->bindings[i].device_name, enable_3d ? "3D" : "2D",
+		        (int)ok);
+	}
 }

@@ -511,3 +511,44 @@ comp_segments_retire_take(struct comp_segments_retire *r,
 	r->count -= n;
 	return n;
 }
+static int32_t
+seg_scale_round(int64_t v, int64_t num, int64_t den)
+{
+	// round(v * num / den), v/num/den >= 0
+	return den > 0 ? (int32_t)((v * num + den / 2) / den) : 0;
+}
+
+bool
+comp_segments_tile_rect(const struct comp_seg_rect *seg,
+                        const struct comp_seg_rect *canvas,
+                        uint32_t tile_w,
+                        uint32_t tile_h,
+                        struct comp_seg_rect *out)
+{
+	if (seg == NULL || canvas == NULL || out == NULL || canvas->w == 0 || canvas->h == 0) {
+		return false;
+	}
+	const int64_t rx = (int64_t)seg->x - canvas->x;
+	const int64_t ry = (int64_t)seg->y - canvas->y;
+	if (rx < 0 || ry < 0) {
+		return false;
+	}
+	const int32_t ax = seg_scale_round(rx, tile_w, canvas->w);
+	const int32_t ay = seg_scale_round(ry, tile_h, canvas->h);
+	int32_t bx = seg_scale_round(rx + seg->w, tile_w, canvas->w);
+	int32_t by = seg_scale_round(ry + seg->h, tile_h, canvas->h);
+	if (bx > (int32_t)tile_w) {
+		bx = (int32_t)tile_w;
+	}
+	if (by > (int32_t)tile_h) {
+		by = (int32_t)tile_h;
+	}
+	if (ax < 0 || ay < 0 || bx <= ax || by <= ay) {
+		return false;
+	}
+	out->x = ax;
+	out->y = ay;
+	out->w = (uint32_t)(bx - ax);
+	out->h = (uint32_t)(by - ay);
+	return true;
+}

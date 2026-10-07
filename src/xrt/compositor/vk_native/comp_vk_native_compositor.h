@@ -127,6 +127,34 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
                                               struct xrt_window_metrics *out_metrics);
 
 /*!
+ * Multi-screen M3 (ADR-047 D3): the window's segment table for per-segment
+ * views — each segment's geometry, its screen's physical size and nominal
+ * viewer, whether it is woven, and that screen's DP eyes (predicted now).
+ *
+ * Non-zero `count` only while the compositor weaves the window per screen
+ * (desktop Linux, X11/XWayland, see docs/architecture/comp-segments.md);
+ * everything else — a window on the primary screen only, one screen,
+ * segmentation off — returns false, and the caller keeps one view set.
+ * Thread-safe against the weave.
+ *
+ * @ingroup comp_vk_native
+ */
+bool
+comp_vk_native_compositor_get_segment_metrics(struct xrt_compositor *xc, struct xrt_segment_metrics *out);
+
+/*!
+ * Multi-screen M3: which views of the frame about to be committed belong to
+ * which segment (what the app's last xrLocateViews handed out). The renderer
+ * places each segment's views at that segment's rect in every tile, so the
+ * per-segment crop hands each segment DP its OWN views. `count` 0 = one view
+ * set for the whole window. Call before xrt_comp_layer_begin.
+ *
+ * @ingroup comp_vk_native
+ */
+void
+comp_vk_native_compositor_set_view_routing(struct xrt_compositor *xc, const struct xrt_segment_view_routing *routing);
+
+/*!
  * XR_DXR_depth_budget: whether this session asked for the rear depth budget.
  *
  * Latched exactly like the transparency flag, and for the same reason: the

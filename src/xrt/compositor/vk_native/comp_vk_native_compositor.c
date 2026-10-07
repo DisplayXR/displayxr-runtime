@@ -726,6 +726,20 @@ struct comp_vk_native_compositor
 	//! set_screens() handed over a new list; the manager is rebuilt on the
 	//! next weave with no fill in flight.
 	bool seg_rebuild;
+
+	/*!
+	 * Multi-screen M3: per-segment views. @ref seg_pub is the segment table
+	 * the weave last took (count 0 = not split) — what xrLocateViews
+	 * frames each segment's views from; @ref seg_route is which of the
+	 * committed frame's views belong to which segment (set by the state
+	 * tracker at xrEndFrame). Both cross threads (app thread vs weave), so
+	 * they — and the @ref segments pointer when it is created or destroyed —
+	 * are guarded by this leaf lock.
+	 */
+	struct os_mutex seg_pub_mutex;
+	struct xrt_segment_metrics seg_pub;
+	struct xrt_segment_view_routing seg_route;
+	struct comp_vk_native_eff_layout seg_route_logged;
 #endif
 
 #ifdef XRT_OS_ANDROID
@@ -5051,9 +5065,17 @@ vk_log_view_dims_on_change(struct comp_vk_native_compositor *c,
 }
 #endif
 
+#ifdef XRT_OS_LINUX_DESKTOP
+static void
+vk_route_effective_layout(struct comp_vk_native_compositor *c, uint32_t layer_view_count);
+#endif
+
 static void
 vk_compute_effective_layout(struct comp_vk_native_compositor *c)
 {
+	// Multi-screen M3: no per-segment routing unless set at the end below.
+	c->eff_layout.route_count = 0;
+
 	uint32_t mode_cols = 1, mode_rows = 1;
 	uint32_t view_w = 0, view_h = 0;
 	comp_vk_native_renderer_get_tile_layout(c->renderer, &mode_cols, &mode_rows);
@@ -5099,11 +5121,15 @@ vk_compute_effective_layout(struct comp_vk_native_compositor *c)
 #endif
 
 	uint32_t views = mode_tiles;
+	uint32_t proj_layer_views = 0; // M3: the projection layer's full view count (0 = none)
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		if (c->layer_accum.layers[i].data.type == XRT_LAYER_PROJECTION ||
 		    c->layer_accum.layers[i].data.type == XRT_LAYER_PROJECTION_DEPTH ||
 		    c->layer_accum.layers[i].data.type == XRT_LAYER_ZONE_3D) {
 			views = c->layer_accum.layers[i].data.view_count;
+			if (c->layer_accum.layers[i].data.type != XRT_LAYER_ZONE_3D) {
+				proj_layer_views = views;
+			}
 			break;
 		}
 	}
@@ -5129,6 +5155,13 @@ vk_compute_effective_layout(struct comp_vk_native_compositor *c)
 		c->eff_layout.tile_w = view_w;
 		c->eff_layout.tile_h = view_h;
 	}
+#ifdef XRT_OS_LINUX_DESKTOP
+	if (proj_layer_views > 0) {
+		vk_route_effective_layout(c, proj_layer_views);
+	}
+#else
+	(void)proj_layer_views;
+#endif
 }
 
 /*!
@@ -5231,11 +5264,11 @@ vk_dp_canvas_rect(struct comp_vk_native_compositor *c)
  * - no screens handed over, one screen, a pinned session, mixed vendors.
  */
 static bool
-vk_segments_frame_update(struct comp_vk_native_compositor *c,
-                         const struct xrt_rect *dp_canvas,
-                         bool zero_copy,
-                         bool dp_self_submits,
-                         VkRenderPass dp_render_pass)
+vk_segments_frame_update_split(struct comp_vk_native_compositor *c,
+                               const struct xrt_rect *dp_canvas,
+                               bool zero_copy,
+                               bool dp_self_submits,
+                               VkRenderPass dp_render_pass)
 {
 	if (c->seg_screens == NULL || c->display_processor == NULL || c->cmd_pool == VK_NULL_HANDLE ||
 	    !c->have_seg_window) {
@@ -5249,19 +5282,25 @@ vk_segments_frame_update(struct comp_vk_native_compositor *c,
 	// A new screen list (set_screens) rebuilds the manager — but never under
 	// a parked fill, whose command buffer may still use its DPs and images.
 	if (c->seg_rebuild && !c->fill_parked) {
+		os_mutex_lock(&c->seg_pub_mutex); // the app thread reads c->segments (M3)
 		comp_vk_native_segments_destroy(&c->segments);
+		memset(&c->seg_pub, 0, sizeof(c->seg_pub));
+		os_mutex_unlock(&c->seg_pub_mutex);
 		c->seg_rebuild = false;
 	}
 	if (c->segments != NULL && c->seg_rebuild) {
 		return false; // old manager, new list: sit this frame out
 	}
 	if (c->segments == NULL) {
-		c->segments = comp_vk_native_segments_create(&c->vk, c->cmd_pool, c->repaint_queue);
-		if (c->segments == NULL) {
+		struct comp_vk_native_segments *segs =
+		    comp_vk_native_segments_create(&c->vk, c->cmd_pool, c->repaint_queue);
+		if (segs == NULL) {
 			return false;
 		}
-		comp_vk_native_segments_set_screens(c->segments, c->seg_screens, &c->sys_info,
-		                                    c->seg_pinned_display_id);
+		comp_vk_native_segments_set_screens(segs, c->seg_screens, &c->sys_info, c->seg_pinned_display_id);
+		os_mutex_lock(&c->seg_pub_mutex);
+		c->segments = segs;
+		os_mutex_unlock(&c->seg_pub_mutex);
 	}
 	if (!comp_vk_native_segments_enabled(c->segments) || zero_copy || dp_self_submits ||
 	    dp_render_pass == VK_NULL_HANDLE) {
@@ -5273,11 +5312,123 @@ vk_segments_frame_update(struct comp_vk_native_compositor *c,
 	    (uint32_t)(dp_canvas->extent.w > 0 ? dp_canvas->extent.w : 0),
 	    (uint32_t)(dp_canvas->extent.h > 0 ? dp_canvas->extent.h : 0),
 	};
-	return comp_vk_native_segments_update(c->segments, &c->seg_window, &canvas,
-	                                      (int32_t)VK_FORMAT_B8G8R8A8_UNORM, !c->fill_parked,
-	                                      (c->xdev != NULL && c->xdev->hmd != NULL)
-	                                          ? c->xdev->hmd->active_rendering_mode_index
-	                                          : 0);
+	const bool split = comp_vk_native_segments_update(
+	    c->segments, &c->seg_window, &canvas, (int32_t)VK_FORMAT_B8G8R8A8_UNORM, !c->fill_parked,
+	    (c->xdev != NULL && c->xdev->hmd != NULL) ? c->xdev->hmd->active_rendering_mode_index : 0);
+	// Every segment DP follows the session's 2D/3D mode, like the primary
+	// (a DP created by the update above gets it here, before it weaves).
+	comp_vk_native_segments_set_display_mode(c->segments, c->hardware_display_3d);
+	return split;
+}
+
+static bool
+vk_segments_frame_update(struct comp_vk_native_compositor *c,
+                         const struct xrt_rect *dp_canvas,
+                         bool zero_copy,
+                         bool dp_self_submits,
+                         VkRenderPass dp_render_pass)
+{
+	const bool split = vk_segments_frame_update_split(c, dp_canvas, zero_copy, dp_self_submits, dp_render_pass);
+
+	/*
+	 * Multi-screen M3: publish the table this weave took, for the next
+	 * xrLocateViews to frame per-segment views from. Nothing is published
+	 * (count 0 = one view set) unless the window really is woven per
+	 * segment — and not while the session is collapsed to flat 2D for a
+	 * resampled surface (#1595/#1831), whose single tile cannot hold a
+	 * per-segment mosaic.
+	 */
+	struct xrt_segment_metrics m;
+	memset(&m, 0, sizeof(m));
+	if (split && !c->linux_surface_not_1to1) {
+		const struct comp_seg_rect canvas = {
+		    dp_canvas->offset.w,
+		    dp_canvas->offset.h,
+		    (uint32_t)(dp_canvas->extent.w > 0 ? dp_canvas->extent.w : 0),
+		    (uint32_t)(dp_canvas->extent.h > 0 ? dp_canvas->extent.h : 0),
+		};
+		(void)comp_vk_native_segments_get_metrics(c->segments, &c->seg_window, &canvas,
+		                                          c->display_processor != NULL, &m);
+	}
+	os_mutex_lock(&c->seg_pub_mutex);
+	m.generation = c->seg_pub.generation;
+	struct xrt_segment_metrics prev = c->seg_pub;
+	prev.generation = m.generation;
+	if (memcmp(&prev, &m, sizeof(m)) != 0) {
+		m.generation++;
+	}
+	c->seg_pub = m;
+	os_mutex_unlock(&c->seg_pub_mutex);
+	return split;
+}
+
+/*!
+ * Multi-screen M3: turn the committed frame's per-segment view routing into
+ * the renderer's mosaic (comp_vk_native_eff_layout::route). Each segment's
+ * rect inside a tile comes from comp_segments_tile_rect — the mapping the
+ * per-segment crop reads with — so a segment DP's cropped input is exactly
+ * that segment's own views.
+ *
+ * Anything inconsistent (the mode changed between the locate and this commit
+ * so a segment's view count no longer equals the tile count, a short
+ * submission, a degenerate rect) routes nothing: the frame then shows its
+ * first view set across the window for that one frame.
+ */
+static void
+vk_route_effective_layout(struct comp_vk_native_compositor *c, uint32_t layer_view_count)
+{
+	struct xrt_segment_view_routing r;
+	os_mutex_lock(&c->seg_pub_mutex);
+	r = c->seg_route;
+	os_mutex_unlock(&c->seg_pub_mutex);
+
+	struct comp_vk_native_eff_layout *L = &c->eff_layout;
+	L->route_count = 0;
+	if (r.count == 0 || r.count > XRT_MAX_SEGMENTS || L->views == 0 || L->tile_w == 0 || L->tile_h == 0) {
+		return;
+	}
+	const struct comp_seg_rect canvas = {
+	    r.canvas.offset.w,
+	    r.canvas.offset.h,
+	    (uint32_t)(r.canvas.extent.w > 0 ? r.canvas.extent.w : 0),
+	    (uint32_t)(r.canvas.extent.h > 0 ? r.canvas.extent.h : 0),
+	};
+	for (uint32_t k = 0; k < r.count; k++) {
+		if (r.view_count[k] != L->views || r.first_view[k] + r.view_count[k] > layer_view_count) {
+			return;
+		}
+		const struct comp_seg_rect seg = {
+		    r.rect[k].offset.w,
+		    r.rect[k].offset.h,
+		    (uint32_t)(r.rect[k].extent.w > 0 ? r.rect[k].extent.w : 0),
+		    (uint32_t)(r.rect[k].extent.h > 0 ? r.rect[k].extent.h : 0),
+		};
+		struct comp_seg_rect tr;
+		if (!comp_segments_tile_rect(&seg, &canvas, L->tile_w, L->tile_h, &tr)) {
+			return;
+		}
+		L->route[k].first_view = r.first_view[k];
+		L->route[k].view_count = r.view_count[k];
+		L->route[k].x = tr.x;
+		L->route[k].y = tr.y;
+		L->route[k].w = tr.w;
+		L->route[k].h = tr.h;
+	}
+	L->route_count = r.count;
+
+	// One INFO line per routing change (a move, a resize, a mode switch).
+	if (memcmp(L->route, c->seg_route_logged.route, sizeof(L->route)) != 0 ||
+	    L->route_count != c->seg_route_logged.route_count || L->tile_w != c->seg_route_logged.tile_w ||
+	    L->tile_h != c->seg_route_logged.tile_h) {
+		c->seg_route_logged = *L;
+		U_LOG_I(
+		    "segments: per-segment views routed — %u segment(s) x %u view(s), tile %ux%u; [0] views %u.. "
+		    "at %d,%d %ux%u; [1] views %u.. at %d,%d %ux%u",
+		    L->route_count, L->views, L->tile_w, L->tile_h, L->route[0].first_view, L->route[0].x,
+		    L->route[0].y, L->route[0].w, L->route[0].h, L->route_count > 1 ? L->route[1].first_view : 0,
+		    L->route_count > 1 ? L->route[1].x : 0, L->route_count > 1 ? L->route[1].y : 0,
+		    L->route_count > 1 ? L->route[1].w : 0, L->route_count > 1 ? L->route[1].h : 0);
+	}
 }
 #endif
 
@@ -8308,6 +8459,18 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 	}
 #endif
 
+#ifdef XRT_OS_LINUX_DESKTOP
+	/*
+	 * Multi-screen M3: a frame carrying one view set per segment is a mosaic
+	 * the renderer builds in the atlas; the app's swapchain is not it. Same
+	 * shape as the guards above: a fact applied to the RESULT of
+	 * `u_tiling_can_zero_copy()` (ADR-030), never a second gate inside it.
+	 */
+	if (c->eff_layout.route_count > 0) {
+		zero_copy = false;
+	}
+#endif
+
 	// Record the frame's effective capture source = exactly what the DP will
 	// receive (renderer atlas, or the zero-copy app swapchain). The atlas
 	// capture reads this so it shows the DP's input regardless of render mode
@@ -9211,7 +9374,10 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	}
 #ifdef XRT_OS_LINUX_DESKTOP
 	// Multi-screen M2: the segment DPs go first (they share the DP pool).
+	os_mutex_lock(&c->seg_pub_mutex);
 	comp_vk_native_segments_destroy(&c->segments);
+	memset(&c->seg_pub, 0, sizeof(c->seg_pub));
+	os_mutex_unlock(&c->seg_pub_mutex);
 	free(c->seg_screens);
 	c->seg_screens = NULL;
 #endif
@@ -9292,6 +9458,9 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	os_cond_destroy(&c->weave_hand.cond);
 	os_mutex_destroy(&c->weave_hand.mutex);
 	os_mutex_destroy(&c->ws_dead.mutex);
+#ifdef XRT_OS_LINUX_DESKTOP
+	os_mutex_destroy(&c->seg_pub_mutex);
+#endif
 
 	// XR_DXR_depth_budget: the runner owns a mutex.
 	comp_rear_budget_fini(&c->rear_budget);
@@ -9859,6 +10028,9 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	os_mutex_init(&c->weave_hand.mutex);
 	os_cond_init(&c->weave_hand.cond);
 	os_mutex_init(&c->ws_dead.mutex); // #1782
+#ifdef XRT_OS_LINUX_DESKTOP
+	os_mutex_init(&c->seg_pub_mutex); // multi-screen M3
+#endif
 	os_thread_helper_init(&c->repaint_thread);
 
 	// XR_DXR_depth_budget: the policy exists from the first frame so that a
@@ -12351,6 +12523,56 @@ comp_vk_native_compositor_set_system_devices(struct xrt_compositor *xc,
 #endif
 }
 
+bool
+comp_vk_native_compositor_get_segment_metrics(struct xrt_compositor *xc, struct xrt_segment_metrics *out)
+{
+	if (out == NULL) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+#ifdef XRT_OS_LINUX_DESKTOP
+	if (xc == NULL) {
+		return false;
+	}
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	os_mutex_lock(&c->seg_pub_mutex);
+	*out = c->seg_pub;
+	// The eyes are predicted NOW, per segment: the primary from the
+	// session's own DP, every other screen from its segment DP (guarded
+	// against the weave destroying it).
+	for (uint32_t k = 0; k < out->count && k < XRT_MAX_SEGMENTS; k++) {
+		struct xrt_segment_metric *s = &out->seg[k];
+		if (s->is_primary) {
+			s->have_eyes = vk_dp_predicted_eyes(c, &s->eyes) && s->eyes.valid;
+		} else {
+			s->have_eyes = comp_vk_native_segments_get_eyes(c->segments, s->screen_id, &s->eyes);
+		}
+	}
+	os_mutex_unlock(&c->seg_pub_mutex);
+	return out->count > 0;
+#else
+	(void)xc;
+	return false;
+#endif
+}
+
+void
+comp_vk_native_compositor_set_view_routing(struct xrt_compositor *xc, const struct xrt_segment_view_routing *routing)
+{
+#ifdef XRT_OS_LINUX_DESKTOP
+	if (xc == NULL || routing == NULL) {
+		return;
+	}
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	os_mutex_lock(&c->seg_pub_mutex);
+	c->seg_route = *routing;
+	os_mutex_unlock(&c->seg_pub_mutex);
+#else
+	(void)xc;
+	(void)routing;
+#endif
+}
+
 void
 comp_vk_native_compositor_set_screens(struct xrt_compositor *xc,
                                       const struct xrt_screen_list *list,
@@ -12376,6 +12598,10 @@ comp_vk_native_compositor_set_screens(struct xrt_compositor *xc,
 	// The segment manager is rebuilt on the next weave with no fill in flight
 	// (destroying it here could free DPs a parked fill is still executing).
 	c->seg_rebuild = true;
+	// ...and nothing may frame views from the old table meanwhile.
+	os_mutex_lock(&c->seg_pub_mutex);
+	memset(&c->seg_pub, 0, sizeof(c->seg_pub));
+	os_mutex_unlock(&c->seg_pub_mutex);
 	free(c->seg_screens);
 	c->seg_screens = copy;
 	c->seg_pinned_display_id = pinned_display_id;
