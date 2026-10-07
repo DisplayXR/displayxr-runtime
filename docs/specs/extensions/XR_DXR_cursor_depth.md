@@ -3,8 +3,8 @@
 | Property | Value |
 |----------|-------|
 | Extension Name | `XR_DXR_cursor_depth` |
-| Spec Version | 1 |
-| Type Values | `XR_TYPE_CURSOR_DEPTH_HINT_DXR` (1004999320) · `XR_TYPE_CURSOR_DEPTH_PLACEMENT_DXR` (1004999321) |
+| Spec Version | 2 |
+| Type Values | `XR_TYPE_CURSOR_DEPTH_HINT_DXR` (1004999320) · `XR_TYPE_CURSOR_DEPTH_PLACEMENT_DXR` (1004999321) · `XR_TYPE_CURSOR_DEPTH_SOURCE_DXR` (1004999322, v2) |
 | Author | The DisplayXR Project |
 | Platform | All. Works on every graphics API, in-process and over IPC; solved in the state tracker. |
 | Decision record | [ADR-046](../../adr/ADR-046-depth-aware-cursor.md) |
@@ -28,6 +28,12 @@ Enabling the extension costs nothing. The runtime does cursor work only on an `x
 call that chains an `XrCursorDepthHintDXR`, and it never touches the OS cursor. Later spec
 versions keep this rule: any runtime GPU cost (drawing, measuring) will be a separate struct that
 the app explicitly chains.
+
+Spec v2's depth-layer source (§2.3) is the first such struct. Its GPU cost (one copy of a
+cursor-sized patch of depth) is paid **only on frames whose hint chains
+`XrCursorDepthSourceDXR` with `XR_CURSOR_DEPTH_SOURCE_SUBMITTED_DEPTH_DXR`**. Every other app,
+including one that submits depth for other reasons, gets no extra copy, readback, fence,
+allocation or dispatch. Its `xrEndFrame` pays a single bool test.
 
 ## 2. Structures
 
@@ -61,6 +67,51 @@ sprite: the violation returns at every silhouette.
 | `height` | Sprite height in locate-space units, scaled with depth so the apparent size is constant. |
 | `disparity` | The filtered disparity, in eye-baseline units: 0 is the display plane and < 0 is in front. Diagnostic only. |
 | `targetDisparity` | The unfiltered target: the content disparity minus the margin, then clamped. Diagnostic only. |
+
+### 2.3 `XrCursorDepthSourceDXR` (input, spec v2)
+
+Chained on `XrCursorDepthHintDXR::next`.
+
+| Field | Meaning |
+|---|---|
+| `source` | `XR_CURSOR_DEPTH_SOURCE_APP_POINT_DXR` (0): v1 behaviour; the same as not chaining the struct. `XR_CURSOR_DEPTH_SOURCE_SUBMITTED_DEPTH_DXR` (1): the runtime finds the nearest content itself, in the depth the app submits with its projection layer. |
+
+With `SUBMITTED_DEPTH`:
+
+- The hint's `hasContent` and `nearestPoint` are **ignored**. `cursorUV` still places the
+  cursor, and `cursorHeight` still sizes the sprite and the footprint the runtime searches (the
+  sprite plus 50%, as §2.1 recommends).
+- The request covers **one frame**. Chain the struct on every frame's hint for as long as you
+  want the service.
+- The answer is asynchronous. At that frame's `xrEndFrame`, the compositor copies a cursor-sized
+  patch (at most 64×64 texels) of depth from the **outermost two views** of the first projection
+  layer that carries depth, without any GPU wait. The read reaches the placement one or two frames
+  later. The time filter absorbs that, as it does a v1 hint from last frame's readback.
+
+**Requirements.** Each of these, when missing, reports "no content": the cursor settles onto the
+display plane, and the runtime logs a one-time warning. None is ever an error.
+
+1. `XR_KHR_composition_layer_depth` is enabled, and every view of the projection layer chains an
+   `XrCompositionLayerDepthInfoKHR`. Zone-3D layers have no depth variant, so they don't qualify.
+   The runtime advertises `XR_KHR_composition_layer_depth` only when it is built with
+   `XRT_FEATURE_OPENXR_LAYER_DEPTH=ON`, which is OFF by default (see ADR-046 §6). Check for the
+   extension before relying on this source.
+2. The projection layer's `space` is the **same `XrSpace`** as `XrViewLocateInfo::space`. The
+   runtime rebuilds the point from the layer's own view poses and fovs. It does not convert
+   between two app spaces.
+3. The session's compositor can read submitted depth. Today that is the in-process **Metal**
+   compositor. The Vulkan, D3D11, D3D12 and GL compositors, and the IPC/service path, report no
+   content until they are wired.
+
+**Depth conventions.** The runtime turns a depth value into a distance as follows:
+
+- 1/z is linear in the window depth. It is `1/nearZ` at `minDepth` and `1/farZ` at `maxDepth`.
+  That covers D3D, Vulkan and Metal [0,1] clip depth, and GL [−1,1] NDC under the default depth
+  range.
+- Reversed Z is supported. A layer marks it by giving a `nearZ` greater than its `farZ`.
+- An infinite `farZ`, or for reversed Z an infinite `nearZ`, is supported.
+- The far end of the mapping is the cleared background. It counts as no content.
+- The nearest texel in the footprint wins, across both outer views.
 
 ## 3. Runtime behaviour
 
@@ -126,3 +177,4 @@ For splats, use the renderer's alpha-weighted expected depth, not a raycast.
 | Version | Change |
 |---|---|
 | 1 | Initial: app hint in, placement out, app draws (ADR-046 Phase 1). |
+| 2 | `XrCursorDepthSourceDXR` (1004999322): opt-in depth-layer source. The runtime reads the nearest content from the depth submitted with the projection layer (ADR-046 Phase 3a). Metal compositor first. |
