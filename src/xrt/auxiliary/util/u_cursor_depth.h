@@ -150,6 +150,160 @@ u_cursor_depth_place(const struct u_cursor_depth_geometry *g,
                      struct xrt_vec3 *out_position,
                      float *out_height);
 
+
+/*
+ *
+ * Phase 3a: the depth-layer source (XR_DXR_cursor_depth spec v2).
+ *
+ * The app submits depth with its projection layer (XR_KHR_composition_layer_
+ * depth) and asks the runtime to find the nearest content under the cursor in
+ * it. The compositor copies a cursor-sized patch of the two outermost views'
+ * depth and reduces it to the nearest texel (u_cursor_depth_reduce_patch);
+ * the state tracker turns that texel into a point in the layer's space
+ * (u_cursor_depth_point_from_depth_sample) and feeds it to the v1 placement.
+ *
+ * ZERO COST UNLESS REQUESTED (ADR-046 section 0). A compositor reads nothing,
+ * allocates nothing and copies nothing unless the request it was handed
+ * passes u_cursor_depth_patch_should_sample(): a zero-initialised request -
+ * which is what every session that never chained XrCursorDepthSourceDXR has -
+ * never does.
+ *
+ */
+
+//! Most views a patch request covers (the outermost pair).
+#define U_CURSOR_DEPTH_PATCH_VIEWS 2
+
+/*!
+ * Largest patch side, in texels. A ~1.5x-sprite footprint is ~50 texels on a
+ * 4K panel's tile; clamping it smaller would shrink the footprint and let a
+ * nearer edge beside the hotspot cut through the sprite again. 2 views x 64 x
+ * 64 x 4 bytes = 32 KB per read, the most a request can ever copy.
+ */
+#define U_CURSOR_DEPTH_PATCH_MAX_DIM 64
+
+/*!
+ * What the state tracker asks a compositor to read at the next commit.
+ *
+ * Zero-initialised means "not requested".
+ */
+struct u_cursor_depth_patch_request
+{
+	//! True only for a commit whose frame chained the request.
+	bool requested;
+	//! Echoed in the result so the state tracker can match its frame records.
+	uint64_t tag;
+	//! Cursor hotspot, canvas-normalised (origin top-left, v down).
+	float u, v;
+	//! Footprint half-size, canvas-normalised, per axis (> 0).
+	float radius_u, radius_v;
+	//! Reversed-Z layer (nearZ > farZ): the nearest texel is the LARGEST value.
+	bool nearest_is_max;
+	//! Projection-layer view indices to read (the outermost active pair).
+	uint32_t view_index[U_CURSOR_DEPTH_PATCH_VIEWS];
+};
+
+/*!
+ * One view's answer: the nearest texel of the patch.
+ */
+struct u_cursor_depth_patch_sample
+{
+	bool valid;
+	//! Texel centre, normalised to the view's depth sub-image (origin top-left).
+	float su, sv;
+	//! The raw window depth stored in that texel.
+	float raw_depth;
+};
+
+/*!
+ * What the compositor hands back, asynchronously (one or more frames later).
+ */
+struct u_cursor_depth_patch_result
+{
+	bool valid;
+	uint64_t tag;
+	struct u_cursor_depth_patch_sample view[U_CURSOR_DEPTH_PATCH_VIEWS];
+};
+
+/*!
+ * The XrCompositionLayerDepthInfoKHR range values of one view.
+ */
+struct u_cursor_depth_layer_depth
+{
+	float min_depth; //!< window depth at distance near_z
+	float max_depth; //!< window depth at distance far_z
+	float near_z;    //!< distance of min_depth (may exceed far_z: reversed Z; may be +inf)
+	float far_z;     //!< distance of max_depth (may be +inf)
+};
+
+/*!
+ * The compositor-side gate. False for a zero-initialised (never requested)
+ * request, and for one whose cursor is off the canvas or whose footprint is
+ * degenerate - the compositor must then do no work at all.
+ */
+bool
+u_cursor_depth_patch_should_sample(const struct u_cursor_depth_patch_request *req);
+
+/*!
+ * The texel rectangle to copy for one view: the footprint around (u, v)
+ * mapped into the sub-image rect, clamped to it and to
+ * U_CURSOR_DEPTH_PATCH_MAX_DIM per side.
+ *
+ * @return false if the rectangle is empty.
+ */
+bool
+u_cursor_depth_patch_rect(const struct u_cursor_depth_patch_request *req,
+                          int32_t sub_x,
+                          int32_t sub_y,
+                          int32_t sub_w,
+                          int32_t sub_h,
+                          int32_t *out_x,
+                          int32_t *out_y,
+                          int32_t *out_w,
+                          int32_t *out_h);
+
+/*!
+ * Reduce a copied patch of float depth texels to the nearest one. NaN and
+ * infinite texels are skipped.
+ *
+ * @param row_stride  texels between the starts of two rows (>= w)
+ * @return false if no texel was usable.
+ */
+bool
+u_cursor_depth_reduce_patch(const float *texels,
+                            int32_t w,
+                            int32_t h,
+                            int32_t row_stride,
+                            bool nearest_is_max,
+                            int32_t *out_x,
+                            int32_t *out_y,
+                            float *out_raw);
+
+/*!
+ * Window depth -> distance along the view's -Z axis, for the hyperbolic
+ * mapping every perspective projection writes: 1/z is linear in the window
+ * depth, 1/near_z at min_depth and 1/far_z at max_depth. Covers ordinary Z,
+ * reversed Z (near_z > far_z) and an infinite far (or, reversed, near) plane.
+ *
+ * @return false for the far end of the mapping itself (a cleared depth
+ *         buffer: background, not content), values outside
+ *         [min_depth, max_depth], and degenerate ranges.
+ */
+bool
+u_cursor_depth_linear_depth(const struct u_cursor_depth_layer_depth *d, float raw_depth, float *out_z);
+
+/*!
+ * A depth texel -> the 3D point it shows, in the space of @p view's pose.
+ * (su, sv) are normalised to the view's sub-image (origin top-left, v down),
+ * which every Kooima frustum maps linearly onto its fov tangents.
+ */
+bool
+u_cursor_depth_point_from_depth_sample(const struct u_cursor_depth_view *view,
+                                       const struct u_cursor_depth_layer_depth *d,
+                                       float su,
+                                       float sv,
+                                       float raw_depth,
+                                       struct xrt_vec3 *out_point);
+
 #ifdef __cplusplus
 }
 #endif
