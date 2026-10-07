@@ -388,6 +388,32 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
                                struct xrt_dp_factory_registry *out_registry);
 
 struct xrt_plugin_display_info;
+struct os_display_edid_monitor;
+struct os_display_panel_hint;
+
+/*!
+ * Which descriptor a plug-in WITHOUT `probe_displays` gets its synthesized
+ * back-compat claim on. Pure — the policy behind the loader's synthesized
+ * claim, exposed so it can be pinned by tests.
+ *
+ * The primary monitor (flags bit 0), else descriptor 0. Off-Windows, when
+ * @p panel describes the plug-in's panel (non-zero pixel size), the monitor
+ * that panel matches instead, by the ADR-033 rules: a non-(0,0) origin inside
+ * a monitor whose own origin is known, then the connector's device mode, then
+ * the pixel size, ties broken on physical size. The loader passes the ACTIVE
+ * plug-in's noted panel (@ref target_plugin_note_active_panel) and nothing
+ * for any other plug-in. Windows always gets the primary.
+ *
+ * @param monitors Per-descriptor enumeration records (mm, device mode,
+ *                 origin_unknown), aligned with @p descs; NULL, or NULL
+ *                 entries, for "not known".
+ * @param panel    The plug-in's panel; NULL = not known.
+ */
+uint32_t
+target_plugin_backcompat_claim_index(const struct xrt_display_descriptor *descs,
+                                     uint32_t n,
+                                     const struct os_display_edid_monitor *const *monitors,
+                                     const struct os_display_panel_hint *panel);
 
 /*!
  * Record what the ACTIVE plug-in reported about its panel

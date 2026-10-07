@@ -88,6 +88,12 @@ endif()
 if(TARGET target_lists)
 	list(APPEND tests tests_input_host_geometry)
 endif()
+# Multi-screen M0 (#69) -- where a plug-in without probe_displays gets its
+# synthesized display claim (its panel's monitor, not the primary). Pure
+# policy in the loader, so it needs target_lists like the test above.
+if(TARGET target_lists)
+	list(APPEND tests tests_target_backcompat_claim)
+endif()
 if(XRT_HAVE_D3D11)
 	list(APPEND tests tests_aux_d3d_d3d11 tests_aux_d3d_render_adapter tests_comp_client_d3d11
 	     tests_comp_xbridge_plane_policy tests_comp_split_gate tests_comp_eye_dp_policy
@@ -317,6 +323,9 @@ target_compile_definitions(
 
 if(TARGET tests_input_host_geometry)
 	target_link_libraries(tests_input_host_geometry PRIVATE target_lists xrt-interfaces)
+endif()
+if(TARGET tests_target_backcompat_claim)
+	target_link_libraries(tests_target_backcompat_claim PRIVATE target_lists xrt-interfaces aux_os)
 endif()
 
 # #1380 rig composer -- the head device's pose source. Compiled straight into
