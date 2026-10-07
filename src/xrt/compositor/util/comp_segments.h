@@ -203,6 +203,23 @@ comp_segments_table_is_split(const struct comp_segment_table *t, uint32_t canvas
 enum comp_seg_render
 comp_segments_decide(bool have_dp, bool dp_tolerates_resample, enum comp_seg_1to1 screen_1to1);
 
+//! Max rectangles @ref comp_segments_uncovered emits.
+#define COMP_SEGMENTS_MAX_UNCOVERED 32
+
+/*!
+ * The parts of @p canvas (window px) that no segment covers — canvas on a
+ * monitor no plug-in claimed, or off every screen. The compositor paints them
+ * flat 2D, the same as a segment it cannot weave (#1654's off-panel rule).
+ * Disjoint rectangles, row bands top to bottom, left to right within a band.
+ *
+ * @return the number written (excess dropped at @p cap).
+ */
+uint32_t
+comp_segments_uncovered(const struct comp_segment_table *t,
+                        const struct comp_seg_rect *canvas,
+                        struct comp_seg_rect *out,
+                        uint32_t cap);
+
 /*!
  * Equal geometry and screens (used to log a table change once).
  */

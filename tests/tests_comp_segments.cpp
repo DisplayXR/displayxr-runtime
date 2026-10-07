@@ -158,6 +158,70 @@ TEST_CASE("comp_segments: table")
 	}
 }
 
+TEST_CASE("comp_segments: uncovered canvas")
+{
+	comp_seg_rect out[COMP_SEGMENTS_MAX_UNCOVERED];
+	comp_seg_rect canvas{0, 0, 1280, 720};
+
+	SECTION("fully covered -> nothing")
+	{
+		comp_segment_table t{};
+		t.count = 2;
+		t.seg[0].window_rect = {0, 0, 456, 720};
+		t.seg[1].window_rect = {456, 0, 824, 720};
+		CHECK(comp_segments_uncovered(&t, &canvas, out, COMP_SEGMENTS_MAX_UNCOVERED) == 0);
+	}
+
+	SECTION("no segments -> the whole canvas")
+	{
+		comp_segment_table t{};
+		REQUIRE(comp_segments_uncovered(&t, &canvas, out, COMP_SEGMENTS_MAX_UNCOVERED) == 1);
+		CHECK(out[0].x == 0);
+		CHECK(out[0].w == 1280);
+		CHECK(out[0].h == 720);
+	}
+
+	SECTION("a window hanging below a short screen")
+	{
+		// left screen covers the full height, right screen only the top 500 px
+		comp_segment_table t{};
+		t.count = 2;
+		t.seg[0].window_rect = {0, 0, 456, 720};
+		t.seg[1].window_rect = {456, 0, 824, 500};
+		REQUIRE(comp_segments_uncovered(&t, &canvas, out, COMP_SEGMENTS_MAX_UNCOVERED) == 1);
+		CHECK(out[0].x == 456);
+		CHECK(out[0].y == 500);
+		CHECK(out[0].w == 824);
+		CHECK(out[0].h == 220);
+	}
+
+	SECTION("a gap between two screens")
+	{
+		comp_segment_table t{};
+		t.count = 2;
+		t.seg[0].window_rect = {0, 0, 400, 720};
+		t.seg[1].window_rect = {500, 0, 780, 720};
+		REQUIRE(comp_segments_uncovered(&t, &canvas, out, COMP_SEGMENTS_MAX_UNCOVERED) == 1);
+		CHECK(out[0].x == 400);
+		CHECK(out[0].w == 100);
+		CHECK(out[0].h == 720);
+	}
+
+	SECTION("area is conserved")
+	{
+		comp_segment_table t{};
+		t.count = 2;
+		t.seg[0].window_rect = {100, 50, 300, 200};
+		t.seg[1].window_rect = {600, 300, 400, 400};
+		const uint32_t n = comp_segments_uncovered(&t, &canvas, out, COMP_SEGMENTS_MAX_UNCOVERED);
+		uint64_t area = 0;
+		for (uint32_t i = 0; i < n; i++) {
+			area += (uint64_t)out[i].w * out[i].h;
+		}
+		CHECK(area == 1280ull * 720 - 300ull * 200 - 400ull * 400);
+	}
+}
+
 TEST_CASE("comp_segments: 1:1 policy")
 {
 	// No DP at all: always flat 2D.
