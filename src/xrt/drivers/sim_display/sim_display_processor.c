@@ -16,10 +16,12 @@
 
 #include "sim_display_interface.h"
 #include "sim_display_zone_common.h"
+#include "sim_display_scanout_common.h"
 
 #include "xrt/xrt_display_processor.h"
 #include "xrt/xrt_display_processor_vk.h" // the snap_window_rect slot (#1588 / #1609)
 #include "xrt/xrt_display_metrics.h"
+#include "xrt/xrt_plugin.h" // xrt_screen_binding (multi-screen M2)
 
 #include "vk/vk_helpers.h"
 #include "util/u_debug.h"
@@ -163,6 +165,37 @@ struct sim_display_processor
 
 	//! SIM_DISPLAY_FAKE_LENS — the fake lens state (true = 3D, the default).
 	bool fake_lens_3d;
+
+	/*!
+	 * Multi-screen M2: per-instance screen. Set when the DP was created for a
+	 * screen (`create_dp_vk_for_screen`); then the DP describes THAT screen
+	 * (`get_display_dimensions` / `get_display_pixel_info`) instead of the
+	 * process-wide panel, and it is a SEGMENT DP — it must not assume it is
+	 * the first writer to the target, so a sub-rect canvas preserves the
+	 * pixels outside it (@ref render_pass_preserve).
+	 */
+	bool screen_bound;
+	uint64_t screen_monitor_id;
+	float screen_w_m, screen_h_m;
+	uint32_t screen_px_w, screen_px_h;
+	int32_t screen_left, screen_top;
+
+	//! Sub-rect render pass for a segment DP: initialLayout
+	//! COLOR_ATTACHMENT_OPTIMAL (the compositor's contract before every
+	//! process_atlas) and a clear confined to the render area, so the rest
+	//! of the target — other segments — survives. Compatible with
+	//! @ref render_pass, so the same pipelines and framebuffers serve both.
+	VkRenderPass render_pass_preserve;
+
+	//! set_present_origin (runtime#757 / ADR-033): the window's origin on
+	//! this DP's screen. The interlaced output's phase input; every other
+	//! mode is position-preserving and ignores it.
+	bool have_present_origin;
+	int32_t present_origin_x, present_origin_y;
+
+	//! get_scanout_caps: last flags reported (log on change only).
+	bool caps_reported;
+	uint32_t caps_last_flags;
 };
 
 static inline struct sim_display_processor *
@@ -247,7 +280,14 @@ sim_dp_process_atlas(struct xrt_display_processor *xdp,
 		if (changed) {
 			float panel_w_m = 0.0f, panel_h_m = 0.0f;
 			uint32_t panel_px_w = 0, panel_px_h = 0;
-			sim_display_get_panel_metrics(&panel_w_m, &panel_h_m, &panel_px_w, &panel_px_h);
+			if (sdp->screen_bound) {
+				panel_w_m = sdp->screen_w_m;
+				panel_h_m = sdp->screen_h_m;
+				panel_px_w = sdp->screen_px_w;
+				panel_px_h = sdp->screen_px_h;
+			} else {
+				sim_display_get_panel_metrics(&panel_w_m, &panel_h_m, &panel_px_w, &panel_px_h);
+			}
 
 			const bool fills_panel = panel_px_w == target_width && panel_px_h == target_height;
 			const bool at_origin = canvas_offset_x == 0 && canvas_offset_y == 0;
@@ -267,10 +307,10 @@ sim_dp_process_atlas(struct xrt_display_processor *xdp,
 			        canvas_offset_x, canvas_offset_y, canvas_width, canvas_height,
 			        at_origin ? " (panel origin)" : " (displaced — phase-critical for a real weaver)",
 			        view_width, view_height, tile_columns, tile_rows,
-			        phase_visible ? "SIM_DISPLAY_OUTPUT=interlaced USES the offset as the "
-			                        "interlace phase, so a phase error is visible in the output."
-			                      : "This mode ignores the offset (sim_display has no "
-			                        "set_present_origin slot), so phase errors are INVISIBLE in "
+			        phase_visible ? "SIM_DISPLAY_OUTPUT=interlaced USES the present origin (else the "
+			                        "offset) as the interlace phase, so a phase error is visible in the "
+			                        "output."
+			                      : "This mode ignores the phase, so phase errors are INVISIBLE in "
 			                        "what it draws — run SIM_DISPLAY_OUTPUT=interlaced to see them.");
 
 			sdp->geom_reported = true;
@@ -317,18 +357,58 @@ sim_dp_process_atlas(struct xrt_display_processor *xdp,
 
 	vk->vkUpdateDescriptorSets(vk->device, 1, &write, 0, NULL);
 
+	/*
+	 * The canvas: where in the target this DP writes (multi-screen M2 — a
+	 * window split across screens hands each screen's DP its own segment,
+	 * and the atlas it is handed holds exactly that segment's views). A zero
+	 * size is the ABI's "fills the full target" sentinel. Clamped to the
+	 * target: a canvas outside it is not a rect any weaver can honour.
+	 */
+	int32_t cx = canvas_offset_x, cy = canvas_offset_y;
+	uint32_t cw = canvas_width, ch = canvas_height;
+	if (cw == 0 || ch == 0) {
+		cx = 0;
+		cy = 0;
+		cw = target_width;
+		ch = target_height;
+	}
+	if (cx < 0) {
+		cw = (uint32_t)((int64_t)cw + cx > 0 ? (int64_t)cw + cx : 0);
+		cx = 0;
+	}
+	if (cy < 0) {
+		ch = (uint32_t)((int64_t)ch + cy > 0 ? (int64_t)ch + cy : 0);
+		cy = 0;
+	}
+	if ((uint32_t)cx >= target_width || (uint32_t)cy >= target_height || cw == 0 || ch == 0) {
+		return; // nothing of the canvas is in the target
+	}
+	if ((uint32_t)cx + cw > target_width) {
+		cw = target_width - (uint32_t)cx;
+	}
+	if ((uint32_t)cy + ch > target_height) {
+		ch = target_height - (uint32_t)cy;
+	}
+	const bool full_target = cx == 0 && cy == 0 && cw == target_width && ch == target_height;
+
 	// Begin render pass. Clear to alpha=0 when a transparent background was
 	// requested so any region the weave doesn't fully overwrite stays
 	// see-through instead of opaque black (issue #392).
+	//
+	// A full-target canvas is exactly the pre-M2 pass. A sub-rect canvas
+	// always confines the draw (viewport + scissor) to the canvas; a SEGMENT
+	// DP additionally confines the clear and the layout contract to it, so
+	// the segments a sibling DP already wove survive.
+	const bool preserve = !full_target && sdp->screen_bound && sdp->render_pass_preserve != VK_NULL_HANDLE;
 	VkClearValue clear_value = {.color = {{0.0f, 0.0f, 0.0f, sdp->transparent_bg ? 0.0f : 1.0f}}};
 	VkRenderPassBeginInfo rp_begin = {
 	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-	    .renderPass = sdp->render_pass,
+	    .renderPass = preserve ? sdp->render_pass_preserve : sdp->render_pass,
 	    .framebuffer = target_fb,
 	    .renderArea =
 	        {
-	            .offset = {0, 0},
-	            .extent = {target_width, target_height},
+	            .offset = {preserve ? cx : 0, preserve ? cy : 0},
+	            .extent = {preserve ? cw : target_width, preserve ? ch : target_height},
 	        },
 	    .clearValueCount = 1,
 	    .pClearValues = &clear_value,
@@ -347,28 +427,35 @@ sim_dp_process_atlas(struct xrt_display_processor *xdp,
 	    .inv_tile_rows = 1.0f / (float)tile_rows,
 	    .tile_columns = (float)tile_columns,
 	    .tile_rows = (float)tile_rows,
-	    // #817: the interlace phase is the target's panel-relative X origin.
-	    .phase_px = (float)canvas_offset_x,
+	    // #817: the interlace phase. The panel column of a fragment is
+	    // gl_FragCoord.x (target px, so it already includes the canvas
+	    // offset) + the target's origin on the panel. With a present origin
+	    // (ADR-033) that origin is known exactly; without one, the pre-M2
+	    // proxy (the canvas offset) stands, byte-for-byte.
+	    .phase_px = sdp->have_present_origin ? (float)sdp->present_origin_x : (float)canvas_offset_x,
 	    .period_px = (float)sdp->interlace_period_px,
 	};
 	vk->vkCmdPushConstants(cmd_buffer, sdp->pipeline_layout,
 	                        VK_SHADER_STAGE_FRAGMENT_BIT, 0,
 	                        sizeof(pc), &pc);
 
-	// Set dynamic viewport and scissor
+	// Set dynamic viewport and scissor — BOTH to the canvas (multi-screen
+	// plan risk 7: a viewport alone lets a fullscreen triangle's clip
+	// guard band bleed, a scissor alone squeezes nothing). A full-target
+	// canvas is the pre-M2 state exactly.
 	VkViewport viewport = {
-	    .x = 0.0f,
-	    .y = 0.0f,
-	    .width = (float)target_width,
-	    .height = (float)target_height,
+	    .x = (float)cx,
+	    .y = (float)cy,
+	    .width = (float)cw,
+	    .height = (float)ch,
 	    .minDepth = 0.0f,
 	    .maxDepth = 1.0f,
 	};
 	vk->vkCmdSetViewport(cmd_buffer, 0, 1, &viewport);
 
 	VkRect2D scissor = {
-	    .offset = {0, 0},
-	    .extent = {target_width, target_height},
+	    .offset = {cx, cy},
+	    .extent = {cw, ch},
 	};
 	vk->vkCmdSetScissor(cmd_buffer, 0, 1, &scissor);
 
@@ -441,6 +528,23 @@ create_pipeline_resources(struct sim_display_processor *sdp, int32_t target_form
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("sim_display: Failed to create render pass: %d", ret);
 		return false;
+	}
+
+	// Multi-screen M2: the segment variant. Starts from the layout the
+	// compositor guarantees before every process_atlas instead of UNDEFINED
+	// (which would let the driver discard what sibling segment DPs wrote);
+	// the clear is confined to the render area. Same attachment format and
+	// sample count => render-pass compatible with the one above.
+	if (sdp->screen_bound) {
+		VkAttachmentDescription keep = color_attachment;
+		keep.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+		VkRenderPassCreateInfo keep_info = rp_info;
+		keep_info.pAttachments = &keep;
+		ret = vk->vkCreateRenderPass(vk->device, &keep_info, NULL, &sdp->render_pass_preserve);
+		if (ret != VK_SUCCESS) {
+			U_LOG_E("sim_display: Failed to create the segment render pass: %d", ret);
+			return false;
+		}
 	}
 
 	// 2. Create descriptor set layout (1 combined image sampler for atlas)
@@ -674,8 +778,106 @@ create_pipeline_resources(struct sim_display_processor *sdp, int32_t target_form
 }
 
 
-// #856: panel geometry -> compositor computes window-scoped Kooima.
-SIM_ZONE_DEFINE_PANEL_METRIC_FNS(sim_dp, xrt_display_processor)
+/*
+ * #856: panel geometry -> compositor computes window-scoped Kooima.
+ *
+ * Multi-screen M2: a DP created for a screen answers for THAT screen — its
+ * EDID size, its native pixels and its desktop origin. An unbound DP (the
+ * session's primary, from the plain factory) answers exactly as before, from
+ * the process-wide panel at the desktop origin.
+ */
+static bool
+sim_dp_get_display_dimensions(struct xrt_display_processor *xdp, float *out_width_m, float *out_height_m)
+{
+	struct sim_display_processor *sdp = sim_display_processor(xdp);
+	if (out_width_m == NULL || out_height_m == NULL) {
+		return false;
+	}
+	if (sdp->screen_bound) {
+		*out_width_m = sdp->screen_w_m;
+		*out_height_m = sdp->screen_h_m;
+	} else {
+		sim_display_get_panel_metrics(out_width_m, out_height_m, NULL, NULL);
+	}
+	return (*out_width_m > 0.0f && *out_height_m > 0.0f);
+}
+
+static bool
+sim_dp_get_display_pixel_info(struct xrt_display_processor *xdp,
+                              uint32_t *out_pixel_width,
+                              uint32_t *out_pixel_height,
+                              int32_t *out_screen_left,
+                              int32_t *out_screen_top)
+{
+	struct sim_display_processor *sdp = sim_display_processor(xdp);
+	if (out_pixel_width == NULL || out_pixel_height == NULL) {
+		return false;
+	}
+	int32_t left = 0, top = 0; // unbound: sim models a single panel at the desktop origin
+	if (sdp->screen_bound) {
+		*out_pixel_width = sdp->screen_px_w;
+		*out_pixel_height = sdp->screen_px_h;
+		left = sdp->screen_left;
+		top = sdp->screen_top;
+	} else {
+		sim_display_get_panel_metrics(NULL, NULL, out_pixel_width, out_pixel_height);
+	}
+	if (out_screen_left != NULL) {
+		*out_screen_left = left;
+	}
+	if (out_screen_top != NULL) {
+		*out_screen_top = top;
+	}
+	return (*out_pixel_width > 0 && *out_pixel_height > 0);
+}
+
+/*!
+ * set_present_origin (runtime#757 / ADR-033): the window's client-area origin
+ * on this DP's screen. Sticky. Only the interlaced output consumes it (as its
+ * phase); every other mode draws the same pixels wherever the window is.
+ */
+static void
+sim_dp_set_present_origin(struct xrt_display_processor_vk *xdp, int32_t panel_x, int32_t panel_y)
+{
+	struct sim_display_processor *sdp = (struct sim_display_processor *)xdp;
+	sdp->have_present_origin = true;
+	sdp->present_origin_x = panel_x;
+	sdp->present_origin_y = panel_y;
+}
+
+/*!
+ * get_scanout_caps: the weave scope (SIM_DISPLAY_WEAVE_SCOPE, canvas by
+ * default) and, for multi-screen M2's per-segment 1:1 gate, whether the
+ * output survives a display-server resample. Every sim output does except
+ * INTERLACED, whose 1-pixel period is exactly what a resample destroys.
+ * Read from the CURRENT output mode on every call (the 1/2/3 keys can change
+ * it), so the runtime re-queries when it re-evaluates a segment. Logs on
+ * change only.
+ */
+static bool
+sim_dp_get_scanout_caps(struct xrt_display_processor_vk *xdp, struct xrt_dp_scanout_caps *out_caps)
+{
+	struct sim_display_processor *sdp = (struct sim_display_processor *)xdp;
+	if (out_caps == NULL || out_caps->struct_size < XRT_DP_SCANOUT_CAPS_SIZE_V1) {
+		return false;
+	}
+	const enum xrt_dp_weave_scope scope = sim_scanout_scope_from_env();
+	const bool interlaced = sim_display_get_output_mode() == SIM_DISPLAY_OUTPUT_INTERLACED;
+	const uint32_t flags = interlaced ? 0u : XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE;
+	out_caps->weave_scope = (uint32_t)scope;
+	out_caps->flags = flags;
+	for (size_t i = 0; i < sizeof(out_caps->reserved) / sizeof(out_caps->reserved[0]); i++) {
+		out_caps->reserved[i] = 0;
+	}
+	if (!sdp->caps_reported || sdp->caps_last_flags != flags) {
+		sdp->caps_reported = true;
+		sdp->caps_last_flags = flags;
+		U_LOG_I("sim_display VK DP %p: weave scope '%s', %s", (void *)sdp, xrt_dp_weave_scope_name(scope),
+		        interlaced ? "INTERLACED needs 1:1 pixels (a resample destroys the pattern)"
+		                   : "output survives a display-server resample");
+	}
+	return true;
+}
 
 static bool
 sim_dp_get_predicted_eye_positions(struct xrt_display_processor *xdp, struct xrt_eye_positions *out)
@@ -763,6 +965,9 @@ sim_dp_destroy(struct xrt_display_processor *xdp)
 		}
 		if (sdp->render_pass != VK_NULL_HANDLE) {
 			vk->vkDestroyRenderPass(vk->device, sdp->render_pass, NULL);
+		}
+		if (sdp->render_pass_preserve != VK_NULL_HANDLE) {
+			vk->vkDestroyRenderPass(vk->device, sdp->render_pass_preserve, NULL);
 		}
 	}
 
@@ -1001,11 +1206,47 @@ sim_dp_clear_local_zone_mask(struct xrt_display_processor *xdp)
  *
  */
 
-xrt_result_t
-sim_display_processor_create(enum sim_display_output_mode mode,
-                             struct vk_bundle *vk,
-                             int32_t target_format,
-                             struct xrt_display_processor **out_xdp)
+/*!
+ * Seed the per-instance screen from a binding (multi-screen M2). Physical size
+ * from the EDID mm, else the process-wide panel's (the SIM_DISPLAY_* env /
+ * default); pixels from the device mode, else the desktop size; origin = the
+ * screen's desktop origin.
+ */
+static void
+sim_dp_bind_screen(struct sim_display_processor *sdp, const struct xrt_screen_binding *b)
+{
+	if (b == NULL || b->struct_size < offsetof(struct xrt_screen_binding, desktop_scale)) {
+		return;
+	}
+	float def_w_m = 0.0f, def_h_m = 0.0f;
+	uint32_t def_px_w = 0, def_px_h = 0;
+	sim_display_get_panel_metrics(&def_w_m, &def_h_m, &def_px_w, &def_px_h);
+
+	sdp->screen_bound = true;
+	sdp->screen_monitor_id = b->monitor_id;
+	sdp->screen_left = b->desktop_left;
+	sdp->screen_top = b->desktop_top;
+	sdp->screen_px_w = b->native_pixel_width != 0 ? b->native_pixel_width : b->desktop_width;
+	sdp->screen_px_h = b->native_pixel_height != 0 ? b->native_pixel_height : b->desktop_height;
+	if (sdp->screen_px_w == 0 || sdp->screen_px_h == 0) {
+		sdp->screen_px_w = def_px_w;
+		sdp->screen_px_h = def_px_h;
+	}
+	if (b->physical_width_mm != 0 && b->physical_height_mm != 0) {
+		sdp->screen_w_m = (float)b->physical_width_mm / 1000.0f;
+		sdp->screen_h_m = (float)b->physical_height_mm / 1000.0f;
+	} else {
+		sdp->screen_w_m = def_w_m;
+		sdp->screen_h_m = def_h_m;
+	}
+}
+
+static xrt_result_t
+sim_display_processor_create_impl(enum sim_display_output_mode mode,
+                                  struct vk_bundle *vk,
+                                  int32_t target_format,
+                                  const struct xrt_screen_binding *binding,
+                                  struct xrt_display_processor **out_xdp)
 {
 	if (out_xdp == NULL) {
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
@@ -1015,6 +1256,7 @@ sim_display_processor_create(enum sim_display_output_mode mode,
 	if (sdp == NULL) {
 		return XRT_ERROR_ALLOCATION;
 	}
+	sim_dp_bind_screen(sdp, binding);
 
 	// ADR-020 rule 1: advertise the vtable size so the runtime knows which
 	// slots this plug-in actually built (calloc already zeroed reserved_0).
@@ -1025,6 +1267,8 @@ sim_display_processor_create(enum sim_display_output_mode mode,
 	sdp->base_vk.base.struct_size = (uint32_t)sizeof(struct xrt_display_processor_vk);
 	sdp->base_vk.snap_window_rect = sim_dp_snap_window_rect; // #1588 / #1609
 	sdp->base_vk.set_transparency_active = sim_dp_set_transparency_active; // lazy transparency
+	sdp->base_vk.set_present_origin = sim_dp_set_present_origin;           // ADR-033 / multi-screen M2
+	sdp->base_vk.get_scanout_caps = sim_dp_get_scanout_caps;               // multi-screen M2 1:1 gate
 	sdp->base_vk.base.destroy = sim_dp_destroy;
 	sdp->base_vk.base.get_render_pass = sim_dp_get_render_pass;
 	sdp->base_vk.base.get_predicted_eye_positions = sim_dp_get_predicted_eye_positions;
@@ -1077,7 +1321,10 @@ sim_display_processor_create(enum sim_display_output_mode mode,
 		return XRT_ERROR_VULKAN;
 	}
 
-	// Set the initial output mode (atomic global read by process_atlas each frame)
+	// Set the initial output mode (atomic global read by process_atlas each
+	// frame). The output mode is SESSION state — one atlas, one rendering
+	// mode, switched by the 1/2/3 keys — so a segment DP follows it rather
+	// than carrying its own (multi-screen M2).
 	sim_display_set_output_mode(mode);
 
 	U_LOG_W("Created sim display processor (all %d pipelines), initial mode: %s", SIM_DP_PIPELINE_COUNT,
@@ -1088,8 +1335,23 @@ sim_display_processor_create(enum sim_display_output_mode mode,
 	        mode == SIM_DISPLAY_OUTPUT_INTERLACED      ? "Interlaced" :
 	        mode == SIM_DISPLAY_OUTPUT_PASSTHROUGH     ? "Passthrough" : "Blend");
 
+	if (sdp->screen_bound) {
+		U_LOG_W("sim_display: segment DP %p for screen 0x%016llx — %ux%u px, %.3f x %.3f m, desktop origin (%d, %d)",
+		        (void *)sdp, (unsigned long long)sdp->screen_monitor_id, sdp->screen_px_w, sdp->screen_px_h,
+		        (double)sdp->screen_w_m, (double)sdp->screen_h_m, sdp->screen_left, sdp->screen_top);
+	}
+
 	*out_xdp = &sdp->base_vk.base;
 	return XRT_SUCCESS;
+}
+
+xrt_result_t
+sim_display_processor_create(enum sim_display_output_mode mode,
+                             struct vk_bundle *vk,
+                             int32_t target_format,
+                             struct xrt_display_processor **out_xdp)
+{
+	return sim_display_processor_create_impl(mode, vk, target_format, NULL, out_xdp);
 }
 
 
@@ -1113,4 +1375,25 @@ sim_display_dp_factory_vk(void *vk_bundle_ptr,
 	enum sim_display_output_mode mode = sim_display_get_output_mode();
 
 	return sim_display_processor_create(mode, vk, target_format, out_xdp);
+}
+
+xrt_result_t
+sim_display_dp_factory_vk_for_screen(struct xrt_plugin_instance *inst,
+                                     void *vk_bundle_ptr,
+                                     void *vk_cmd_pool,
+                                     void *window_handle,
+                                     int32_t target_format,
+                                     const struct xrt_screen_binding *binding,
+                                     struct xrt_display_processor **out_xdp)
+{
+	(void)inst;
+	(void)vk_cmd_pool;
+	(void)window_handle;
+	if (binding == NULL) {
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+	struct vk_bundle *vk = (struct vk_bundle *)vk_bundle_ptr;
+	// The CURRENT session mode: creating a segment DP must not reset what the
+	// user switched to (create() republishes the mode it is given).
+	return sim_display_processor_create_impl(sim_display_get_output_mode(), vk, target_format, binding, out_xdp);
 }
