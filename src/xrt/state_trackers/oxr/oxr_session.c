@@ -5624,6 +5624,24 @@ oxr_session_create(struct oxr_logger *log,
 	}
 #endif
 
+#if defined(XRT_HAVE_VK_NATIVE_COMPOSITOR) && defined(XRT_OS_LINUX_DESKTOP)
+	// Multi-screen M2: the in-process Vulkan compositor weaves a window that
+	// spans screens per segment, each with its own screen's DP; it needs the
+	// screen list (and stays single-DP for a session pinned to one display).
+	if (sess->is_vk_native_compositor && sess->xcn != NULL) {
+		struct xrt_screen_list *screens = U_TYPED_CALLOC(struct xrt_screen_list);
+		if (screens != NULL) {
+			oxr_system_get_screens(sys, screens);
+			uint64_t pinned = 0;
+#ifdef OXR_HAVE_DXR_display_info
+			pinned = bound_display_id;
+#endif
+			comp_vk_native_compositor_set_screens(&sess->xcn->base, screens, pinned);
+			free(screens);
+		}
+	}
+#endif
+
 #ifdef OXR_HAVE_DXR_depth_budget
 	// XR_DXR_depth_budget: the create-info chain is gone by locate time, and
 	// the rear-depth DEFAULT is a function of transparency, so remember it.
