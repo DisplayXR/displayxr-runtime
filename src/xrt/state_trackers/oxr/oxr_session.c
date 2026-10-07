@@ -2484,6 +2484,49 @@ oxr_session_fill_cursor_depth(struct oxr_session *sess,
  * there too, so `eye - canvas centre` is the eye relative to the segment as it
  * sits on its own screen (that screen's Kooima).
  */
+//! What a per-segment locate reports back to the wrapper (#1502).
+struct oxr_locate_segment_out
+{
+	//! Every segment's locate could measure the VIEW centroid (AND).
+	bool measurable;
+	//! VIEW's pose in the locate's base space (the same for every segment).
+	struct xrt_space_relation T_base_head;
+};
+
+/*!
+ * #1502: publish the VIEW-space offset that makes `xrLocateSpace(VIEW, base)`
+ * equal the centroid of @p views[0, count) — the ACTIVE views.
+ */
+static void
+locate_publish_view_offset(struct oxr_session *sess,
+                           const XrView *views,
+                           uint32_t count,
+                           const struct xrt_space_relation *T_base_head)
+{
+	if (count == 0) {
+		return;
+	}
+	struct xrt_vec3 centroid = {0.0f, 0.0f, 0.0f};
+	for (uint32_t i = 0; i < count; i++) {
+		centroid.x += views[i].pose.position.x;
+		centroid.y += views[i].pose.position.y;
+		centroid.z += views[i].pose.position.z;
+	}
+	const float inv = 1.0f / (float)count;
+	centroid.x *= inv;
+	centroid.y *= inv;
+	centroid.z *= inv;
+
+	struct xrt_vec3 delta = {centroid.x - T_base_head->pose.position.x, centroid.y - T_base_head->pose.position.y,
+	                         centroid.z - T_base_head->pose.position.z};
+	struct xrt_quat inv_head;
+	math_quat_invert(&T_base_head->pose.orientation, &inv_head);
+
+	struct xrt_pose view_offset = XRT_POSE_IDENTITY;
+	math_quat_rotate_vec3(&inv_head, &delta, &view_offset.position);
+	oxr_session_set_view_space_offset(sess, &view_offset);
+}
+
 struct oxr_locate_segment
 {
 	//! The canvas: this segment (or, for a stereo session, the whole window).
@@ -2507,9 +2550,12 @@ struct oxr_locate_segment
 	float vdh_scale;
 	//! Views this call locates (the per-segment count); 0 = the session's.
 	uint32_t view_count;
-	//! Publish session-level side effects (#1502 VIEW offset, #441 tracking
-	//! edge): only the majority segment's call does.
+	//! Publish session-level side effects (#441 tracking edge): only the
+	//! majority segment's call does.
 	bool side_effects;
+	//! Filled by each call for the #1502 VIEW offset, which the wrapper
+	//! publishes once over ALL segments' active views. NULL = not wanted.
+	struct oxr_locate_segment_out *out;
 };
 
 static XrResult
@@ -3947,10 +3993,14 @@ locate_views_one(struct oxr_logger *log,
 	 * Amendment 2), so the difference goes into a VIEW-space offset exactly as
 	 * ADR-024 Amendment 1 foresaw, and xrLocateSpace applies it on both legs.
 	 *
-	 * MEASURED, not re-derived: the centroid is taken from the poses just
-	 * written into views[] (including the inactive-view duplication above,
-	 * which is what an app - and the CTS - averages), and VIEW's own pose in
-	 * the same base is T_base_head. So the offset is whatever makes
+	 * MEASURED, not re-derived: the centroid is taken from the ACTIVE poses
+	 * just written into views[] — not the inactive tail, which only aliases
+	 * view 0 and would drag the centroid toward it now that a multiview
+	 * session can report more views than it renders (multi-screen M3) — and
+	 * VIEW's own pose in the same base is T_base_head. With one segment this
+	 * is (L+R)/2 exactly as before; with several, the per-segment wrapper
+	 * publishes it over every segment's active views
+	 * (locate_publish_view_offset). So the offset is whatever makes
 	 * `xrLocateSpace(VIEW, base) == centroid` true, for free, in every base.
 	 * It is base-independent by the #1370 invariant, which is why publishing it
 	 * from a locate in ANY base is sound - including a locate in VIEW itself,
@@ -3968,30 +4018,21 @@ locate_views_one(struct oxr_logger *log,
 	{
 		const enum xrt_space_relation_flags need =
 		    XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_VALID_BIT;
-		const bool measurable = (seg == NULL || seg->side_effects) && !rig_active && active_view_count > 0 &&
-		                        reported_view_count > 0 && base_space_view_count >= active_view_count &&
+		const bool measurable = !rig_active && active_view_count > 0 && reported_view_count > 0 &&
+		                        base_space_view_count >= active_view_count &&
 		                        (T_base_head.relation_flags & need) == need;
-		if (measurable) {
-			struct xrt_vec3 centroid = {0.0f, 0.0f, 0.0f};
-			for (uint32_t i = 0; i < reported_view_count; i++) {
-				centroid.x += views[i].pose.position.x;
-				centroid.y += views[i].pose.position.y;
-				centroid.z += views[i].pose.position.z;
+		if (seg != NULL) {
+			// One segment's locate: report, the wrapper publishes over
+			// every segment's active views.
+			if (seg->out != NULL) {
+				seg->out->measurable = seg->out->measurable && measurable;
+				seg->out->T_base_head = T_base_head;
 			}
-			const float inv = 1.0f / (float)reported_view_count;
-			centroid.x *= inv;
-			centroid.y *= inv;
-			centroid.z *= inv;
-
-			struct xrt_vec3 delta = {centroid.x - T_base_head.pose.position.x,
-			                         centroid.y - T_base_head.pose.position.y,
-			                         centroid.z - T_base_head.pose.position.z};
-			struct xrt_quat inv_head;
-			math_quat_invert(&T_base_head.pose.orientation, &inv_head);
-
-			struct xrt_pose view_offset = XRT_POSE_IDENTITY;
-			math_quat_rotate_vec3(&inv_head, &delta, &view_offset.position);
-			oxr_session_set_view_space_offset(sess, &view_offset);
+		} else if (measurable) {
+			locate_publish_view_offset(sess, views,
+			                           active_view_count < reported_view_count ? active_view_count
+			                                                                   : reported_view_count,
+			                           &T_base_head);
 		}
 	}
 
@@ -4294,8 +4335,19 @@ oxr_session_locate_views(struct oxr_logger *log,
 				o.have_eyes = true;
 			}
 			o.side_effects = true;
+			struct oxr_locate_segment_out so = {.measurable = true};
+			o.out = &so;
 			ret = locate_views_one(log, sess, viewLocateInfo, viewState, viewCapacityInput, viewCountOutput,
 			                       views, o.wm.valid ? &o : NULL);
+			if (ret == XR_SUCCESS && viewCapacityInput > 0 && o.wm.valid && so.measurable) {
+				// #1502 over the ACTIVE views of this one set.
+				uint32_t n = sess->view_config_view_count != 0 ? sess->view_config_view_count : 2;
+				if (xdev->hmd->active_rendering_mode_index < xdev->rendering_mode_count &&
+				    xdev->rendering_modes[xdev->hmd->active_rendering_mode_index].view_count < n) {
+					n = xdev->rendering_modes[xdev->hmd->active_rendering_mode_index].view_count;
+				}
+				locate_publish_view_offset(sess, views, n, &so.T_base_head);
+			}
 		}
 		if (viewCapacityInput > 0 && ret == XR_SUCCESS) {
 			// One view set: no bindings. The frame's routing record is
@@ -4367,6 +4419,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 	// side effects; the others locate into a bare XrViewState.
 	XrViewStateFlags flags = 0;
 	bool first_flags = true;
+	struct oxr_locate_segment_out seg_out = {.measurable = true};
 	for (uint32_t pass = 0; pass < 2; pass++) {
 		for (uint32_t k = 0; k < m.count; k++) {
 			if ((k == mj) != (pass == 1)) {
@@ -4376,6 +4429,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 			locate_segment_override(&m, &l, k, &o);
 			o.view_count = cnt[k];
 			o.side_effects = (k == mj);
+			o.out = &seg_out;
 
 			XrView tmp[XRT_MAX_VIEWS];
 			for (uint32_t v = 0; v < XRT_MAX_VIEWS; v++) {
@@ -4397,6 +4451,11 @@ oxr_session_locate_views(struct oxr_logger *log,
 		}
 	}
 	viewState->viewStateFlags = flags;
+
+	// #1502: VIEW is the centroid of every segment's ACTIVE views.
+	if (seg_out.measurable) {
+		locate_publish_view_offset(sess, views, total, &seg_out.T_base_head);
+	}
 
 	// The inactive tail aliases view 0, exactly as the single path does (ADR-041).
 	for (uint32_t i = total; i < reported; i++) {

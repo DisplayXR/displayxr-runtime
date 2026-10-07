@@ -269,6 +269,8 @@ struct Runtime
 	XrSpace view = XR_NULL_HANDLE;
 	bool have_view_rig = false;
 	bool have_display_info = false;
+	//! XrViewActivityStateDXR::activeViewCount of the last views() call (0 = not reported).
+	uint32_t last_active = 0;
 
 	//! #1486: the view configuration this session was begun with. Every locate
 	//! below names it, because a session locates in exactly one configuration.
@@ -335,6 +337,11 @@ struct Runtime
 			*raw = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
 			vs.next = raw;
 		}
+		XrViewActivityStateDXR act = {XR_TYPE_VIEW_ACTIVITY_STATE_DXR};
+		if (have_display_info) {
+			act.next = const_cast<void *>(vs.next);
+			vs.next = &act;
+		}
 
 		uint32_t count = 0;
 		REQUIRE(XR_SUCCEEDED(pfnLocateViews(session, &li, &vs, 0, &count, nullptr)));
@@ -343,6 +350,7 @@ struct Runtime
 		REQUIRE(XR_SUCCEEDED(pfnLocateViews(session, &li, &vs, count, &count, out.data())));
 		const XrViewStateFlags need = XR_VIEW_STATE_POSITION_VALID_BIT | XR_VIEW_STATE_ORIENTATION_VALID_BIT;
 		REQUIRE((vs.viewStateFlags & need) == need);
+		last_active = have_display_info ? act.activeViewCount : 0;
 		return out;
 	}
 
@@ -916,13 +924,14 @@ TEST_CASE("VIEW is the centroid of the located views (#1502)", "[oxr][view_space
 }
 
 /*
- * #1502 + #1486: the centroid is over the REPORTED array, not the eye set.
+ * #1502 + #1486 + multi-screen M3: the centroid is over the ACTIVE views.
  *
- * Under PRIMARY_MULTIVIEW_DXR the session reports the device max (4 on
- * sim_display) while the active rendering mode may be narrower; xrLocateViews
- * fills the surplus slots by duplicating view 0. An app - and the CTS, which
- * loops over every enumerated view configuration - averages what it was handed,
- * so VIEW must be the mean of THAT array, duplicates included.
+ * Under PRIMARY_MULTIVIEW_DXR the session reports the device max (times the
+ * view-set capacity, M3) while the active rendering mode may be narrower;
+ * xrLocateViews fills the surplus slots by duplicating view 0. Those aliases
+ * carry no content and would drag the centroid toward view 0 (more so now that
+ * the tail can be 3x the active set), so VIEW is the mean of the ACTIVE views
+ * — (L+R)/2 for a stereo mode, exactly as a PRIMARY_STEREO session gets.
  *
  * This arm only has teeth where the device max exceeds the active mode's view
  * count; on a box whose sim-display tops out at 2 (Quad not enabled) it is the
@@ -961,8 +970,11 @@ TEST_CASE("VIEW tracks the reported view array under MULTIVIEW (#1502)", "[oxr][
 	}
 
 	const XrPosef T_local_view = rt.locate(rt.view, rt.local, t);
-	const XrVector3f c = rt.centroid(v);
-	INFO("VIEW in LOCAL: " << pstr(T_local_view));
+	REQUIRE(rt.last_active > 0);
+	REQUIRE(rt.last_active <= v.size());
+	const std::vector<XrView> active(v.begin(), v.begin() + rt.last_active);
+	const XrVector3f c = rt.centroid(active);
+	INFO("VIEW in LOCAL: " << pstr(T_local_view) << ", active views " << rt.last_active);
 	INFO("centroid = (" << c.x << "," << c.y << "," << c.z << ")");
 	CHECK(vdist(c, T_local_view.position) < kPosTolM);
 
