@@ -99,15 +99,30 @@ constexpr float kPosTolM = 0.001f;    // 1 mm
  * Multi-screen M3: PRIMARY_MULTIVIEW_DXR reports one view set per window
  * segment the system can ever weave — the device max on a box that cannot split
  * a window (one DP-backed screen, a service session, non-Linux), the device max
- * x 2 (capped at XRT_MAX_VIEWS = 8) on desktop Linux with two DP-backed screens.
- * Which one this test box is depends on its monitors, so both are accepted.
+ * x 2 on desktop Linux with two DP-backed screens.
+ *
+ * EXACT everywhere: this binary runs with DXR_SEGMENTS=0 (set below, before any
+ * instance exists), which keeps the pre-M3 count on every platform. Deriving
+ * the Linux x2 from the box instead is not exact — a screen counts only when its
+ * plug-in's VK factory passed the vk_bundle ABI check (#1243), which an
+ * installed plug-in next to a dev runtime does not, and xrEnumerateDisplaysDXR
+ * cannot see that. The x2 arithmetic itself is pinned by tests_oxr_segment_views.
  */
 bool
 is_multiview_count(size_t n, uint32_t device_max)
 {
-	const uint32_t two = device_max * 2 > 8 ? 8 : device_max * 2;
-	return n == device_max || n == two;
+	return n == device_max;
 }
+
+[[maybe_unused]] const bool kSegmentsOff = [] {
+	// Before main(): the runtime reads it at every system fill-in.
+#ifdef _WIN32
+	_putenv_s("DXR_SEGMENTS", "0");
+#else
+	setenv("DXR_SEGMENTS", "0", 1);
+#endif
+	return true;
+}();
 constexpr float kAngTolDeg = 0.1f;    // 0.1 degree
 
 /*!

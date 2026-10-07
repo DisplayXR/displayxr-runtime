@@ -179,7 +179,11 @@ oxr_system_fill_in(
 		uint32_t with_factory = 0;
 		bool can_segment = false;
 #ifdef XRT_OS_LINUX_DESKTOP
-		if (sys->xsysc != NULL && !sys->xsysc->info.is_service_mode) {
+		// DXR_SEGMENTS=0 (the segmentation kill switch) also keeps the
+		// pre-M3 count: no window is ever split.
+		const char *segs_env = getenv("DXR_SEGMENTS");
+		const bool segments_off = segs_env != NULL && segs_env[0] == '0';
+		if (sys->xsysc != NULL && !sys->xsysc->info.is_service_mode && !segments_off) {
 			can_segment = true;
 			const struct xrt_dp_factory_registry *reg = &sys->xsysc->info.dp_registry;
 			for (uint32_t e = 0; e < reg->entry_count && e < XRT_DP_REGISTRY_MAX_ENTRIES; e++) {
