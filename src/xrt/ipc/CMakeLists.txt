@@ -135,6 +135,8 @@ target_include_directories(
 	PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../compositor  # For d3d11_service headers
 	)
 target_link_libraries(ipc_server PRIVATE aux_util aux_util_process aux_util_debug_gui ipc_shared aux_math)
+# ADR-043 Amendment 4: the UVC side-by-side stereo camera source's capture backend.
+target_link_libraries(ipc_server PRIVATE aux_os_uvc)
 
 # Link the D3D11 service compositor — the IPC handlers call its
 # vendor-agnostic helpers for predicted eye positions, per-client window

@@ -74,6 +74,19 @@ enum xrt_stereo_camera_transport
 #define XRT_STEREO_CAMERA_BIT(v) (1ull << (uint32_t)(v))
 
 /*!
+ * Where a camera's frames come from (diagnostics only: `displayxr-cli camera
+ * list`; not exposed through the OpenXR API, which is source-neutral).
+ */
+enum xrt_stereo_camera_source
+{
+	//! The active display plug-in's stereo_camera_* slots (ADR-043).
+	XRT_STEREO_CAMERA_SOURCE_PLUGIN = 0,
+	//! The service's own vendor-neutral UVC side-by-side source (ADR-043
+	//! Amendment 4): an opted-in plain stereo webcam.
+	XRT_STEREO_CAMERA_SOURCE_UVC = 1,
+};
+
+/*!
  * One enumerated camera (XrStereoCameraPropertiesDXR).
  */
 struct xrt_stereo_camera_properties
@@ -90,7 +103,7 @@ struct xrt_stereo_camera_properties
 	float max_frame_rate;
 	float baseline_mm;
 	float horizontal_fov_deg;
-	uint32_t reserved;
+	uint32_t source;               //!< enum xrt_stereo_camera_source (was reserved; same wire size)
 	uint64_t supported_formats;    //!< XRT_STEREO_CAMERA_BIT(format)
 	uint64_t supported_transports; //!< XRT_STEREO_CAMERA_BIT(transport)
 };

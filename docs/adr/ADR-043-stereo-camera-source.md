@@ -2,7 +2,8 @@
 
 **Status:** Proposed (2026-09-25) · **R1 implemented** 2026-09-26 (runtime, hardware-free; maintainer
 defaults recorded in the roadmap §G: stereo-only, iface slots, service clients only, no raw frames
-to pages) · **R2 implemented** 2026-09-26 (the service-side rectifier, decision 2 below) · introduces
+to pages) · **R2 implemented** 2026-09-26 (the service-side rectifier, decision 2 below) · **Amendment 4**
+2026-10-07 (a vendor-neutral UVC side-by-side source owned by the service) · introduces
 [`XR_DXR_stereo_camera`](../specs/extensions/XR_DXR_stereo_camera.md) · appends optional
 camera slots to `xrt_plugin_iface` under the [ADR-020](ADR-020-plugin-abi-compatibility-policy.md)
 append-at-end rule · related: [ADR-019](ADR-019-vendor-plugin-aux-boundary.md),
@@ -170,3 +171,71 @@ Three changes close that (spec §2a, §7.1, §7.1.1 are normative):
 A skipped delegation (declined or untrusted) also drops the foreground-rule exemption — the
 client is an ordinary window-bearing app for that stream — but never the RAW refusal, which keys
 on registration alone, so an untrusted entry can only ever narrow what a client gets.
+
+## Amendment 4 (2026-10-07) — a vendor-neutral source for plain UVC side-by-side stereo webcams
+
+Decision 1 made the display plug-in the only camera source, and Alternative A left "plain USB
+stereo cameras that no plug-in claims" to `getUserMedia`. That leaves a gap the plug-in model
+cannot fill: an external stereo webcam that outputs one side-by-side image over ordinary UVC
+works with **any** display, belongs to **no** display vendor, and a page reading it through
+`getUserMedia` gets raw, unaligned pairs with no calibration, no consent of ours and no
+`XR_DXR_stereo_camera` path for native apps. Nothing about reading it is vendor knowledge: the
+device is a standard UVC camera; the only device-specific facts are its SBS layout and eye order.
+
+**Decision.** The service gains its **own** camera source, next to the plug-in's:
+
+1. **Runtime-owned, vendor-neutral capture code** (`auxiliary/util/u_stereo_uvc.{h,c}` for
+   config, matching, the SBS split and the nominal model — pure, tested on every OS;
+   `auxiliary/os/os_uvc_capture*.{h,c,cpp}` for the OS call: Media Foundation on Windows, a
+   V4L2 stub on Linux to follow). It has exactly the six-operation shape of the plug-in camera
+   slots, and the camera manager dispatches on a per-camera source tag in one place; consent,
+   `CAMERA_CONSUMER` rules, the foreground rule, the in-use indicator, linger, rings,
+   rectification and refinement are one code path for both sources. No vendor names, no SDK.
+2. **Opt-in per device, never automatic.** Nothing is claimed without the user's per-user
+   `stereo-cameras.json` (`%LOCALAPPDATA%\DisplayXR\`, `$XDG_CONFIG_HOME/displayxr/`;
+   `DXR_STEREO_CAMERA_UVC_CONFIG` overrides the path, `DXR_STEREO_CAMERA_UVC=0` turns the source
+   off). An entry matches by USB VID:PID and/or a friendly-name substring and states layout
+   (`sbs-full` | `sbs-half`), eye order, capture mode, per-eye output size, nominal baseline and
+   HFOV, optionally a calibration file. A **name-only** entry that matches more than one present
+   device claims nothing. The built-in allowlist is **empty**: no device is listed without a
+   public spec of its SBS layout.
+3. **A plug-in's camera is never claimed.** Plug-in cameras are enumerated first; a device whose
+   OS id or USB VID:PID equals a plug-in camera's `platform_device_hint` is skipped — the
+   display's tracker camera stays the plug-in's and its eye tracker's.
+4. **Uncalibrated is the normal case, and it is reported honestly.** Without a calibration file
+   the camera has no `CALIBRATED` flag; the service models it as an ideal parallel pinhole pair
+   (fx = fy from the configured HFOV, centred principal point, no distortion, R = I,
+   T = (−baseline, 0, 0)). RAW calibration is refused (`FEATURE_NOT_SUPPORTED`): a nominal model
+   is not a measurement of the device. RECTIFIED is offered anyway — it is a **pass-through**
+   (frames as delivered, described by the nominal pinhole, no remap, no zoom) until the online
+   vertical refinement (R2) has measured the rows and folded a correction in, from which point
+   the ordinary corrected LUT path runs. `baselineMm` / `horizontalFovDeg` are reported only
+   when the user configured them (0 = unknown, as before). A calibration file (OpenCV `K1 D1 K2
+   D2 R T`, YAML or JSON) makes the camera `CALIBRATED` and the R2 rectifier does the rest.
+5. **The device is open only while a stream is started** (plus the 2 s linger), exactly like a
+   plug-in source; there is no tracker to keep alive. Enumeration never activates a device.
+
+**What changes for consumers.** Nothing in the API (spec version unchanged): one rule is relaxed
+— RECTIFIED no longer requires `CALIBRATED | NATIVELY_RECTIFIED`, it requires a camera the
+service can rectify, which now includes a nominal-model UVC pair. A consumer that gates
+RECTIFIED on `CALIBRATED` simply does not ask for it. The browser's capture component sees an
+ordinary camera with a rectified output and a `platformDeviceHint` naming the physical webcam, so
+it can hide the raw duplicate the OS also exposes. `displayxr-cli camera list` tags each camera
+`plugin` or `uvc`; `camera uvc-devices [--modes]` shows the config and which present device it
+claims (modes only for claimed devices, never started).
+
+**Alternatives.** *A V4L2/MF virtual camera that re-publishes rectified frames* — rejected for the
+reason Alternative B was: a driver install with no consent model of ours. *Letting each display
+plug-in carry webcam support* — rejected: a webcam is not a display's, and every vendor would
+duplicate the same capture code (ADR-019 isolates vendor code; this is the opposite case). *A
+camera-provider plug-in type* (Alternative E) remains the right home for a **camera vendor's**
+proprietary device (custom transport, factory calibration channel); a standards-compliant UVC
+SBS webcam needs no vendor code, so it lives in the runtime.
+
+**Consequences.** **+** Any display + any SBS UVC stereo webcam, no plug-in, same privacy model.
+**+** The fake backend (`"fake"` in the config) runs the whole manager hardware-free
+(`tests_stereo_camera_manager`). **−** A decoded-MJPEG CPU cost the plug-in path does not have
+(the reader's decoder MFT; 4K60 MJPEG is heavy in software — the config can pick a smaller mode),
+plus one CPU split/resample per frame. **−** Linux has no backend yet (V4L2 is a TODO). **−** A
+loose `match` could claim the wrong webcam; the ambiguity rule and `uvc-devices` mitigate, the
+config is still the user's statement of which device is a stereo pair.

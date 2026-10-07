@@ -94,6 +94,25 @@ if(APPLE)
 endif()
 
 ####
+# UVC capture backend of the vendor-neutral stereo camera source (ADR-043
+# Amendment 4, util/u_stereo_uvc.h). Its own library so the capture DLL
+# imports (Media Foundation) land only in the processes that capture — the
+# service and displayxr-cli — never in the runtime library apps load.
+#
+
+add_library(aux_os_uvc STATIC os_uvc_capture.h)
+target_link_libraries(aux_os_uvc PUBLIC aux-includes aux_os aux_util)
+if(WIN32)
+	target_sources(aux_os_uvc PRIVATE os_uvc_capture_mf.cpp)
+	# mf: MFEnumDeviceSources / MFCreateDeviceSource; mfplat: MFStartup, media
+	# types; mfreadwrite: the source reader; mfuuid: the MF GUIDs.
+	target_link_libraries(aux_os_uvc PRIVATE mf mfplat mfreadwrite mfuuid ole32)
+else()
+	# Desktop Linux: V4L2 is a TODO (see the file); everything else has none.
+	target_sources(aux_os_uvc PRIVATE os_uvc_capture_stubs.c)
+endif()
+
+####
 # BLE library
 #
 
