@@ -122,6 +122,99 @@ struct xrt_window_metrics
 	bool valid; //!< True if all metrics are valid
 };
 
+/*!
+ * Max window segments that get their own views (multi-screen M3, ADR-047 D3).
+ *
+ * A `PRIMARY_MULTIVIEW_DXR` session advertises `device max views x
+ * XRT_MAX_SEGMENTS` views (capped at XRT_MAX_VIEWS), so a window spanning up to
+ * this many screens can carry one view set per screen. The plan's eventual cap
+ * is 4; 2 covers every two-monitor layout and keeps the 8-view sim quad mode
+ * inside XRT_MAX_VIEWS. A window covering more screens keeps one view set for
+ * the whole window (the M2 crop path).
+ *
+ * @ingroup xrt_iface
+ */
+#define XRT_MAX_SEGMENTS 2
+
+/*!
+ * One window segment — the part of a window's canvas on one screen — as the
+ * view math needs it (multi-screen M3). Produced by an in-process compositor
+ * that segments its window (Vulkan native, desktop Linux).
+ *
+ * @ingroup xrt_iface
+ */
+struct xrt_segment_metric
+{
+	uint64_t screen_id; //!< The screen (registry monitor id; `XrDisplayDXR::displayId`)
+
+	struct xrt_rect window_rect; //!< The segment in WINDOW pixels (client area, top-left origin)
+	struct xrt_rect screen_rect; //!< The segment in its SCREEN's pixels (relative to the screen's desktop origin)
+
+	int32_t screen_desktop_left; //!< The screen's desktop rect (the space window positions are read in)
+	int32_t screen_desktop_top;
+	uint32_t screen_desktop_width;
+	uint32_t screen_desktop_height;
+	float screen_width_m; //!< The screen's physical size, metres (0 = unknown)
+	float screen_height_m;
+	float nominal_viewer_x_m; //!< The screen's nominal viewer, screen-centre relative, metres
+	float nominal_viewer_y_m;
+	float nominal_viewer_z_m;
+
+	bool is_primary;         //!< On the screen the session's own DP weaves
+	bool has_dp;             //!< A display processor exists for the screen right now
+	bool tolerates_resample; //!< That DP's output survives a resample (`XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE`)
+	bool woven;              //!< The compositor weaves it in 3D (else a flat 2D copy)
+
+	//! The screen DP's predicted eyes, in THAT screen's display space (filled per query).
+	struct xrt_eye_positions eyes;
+	bool have_eyes; //!< @ref eyes is valid (the DP reported them)
+};
+
+/*!
+ * The segment table of a window, for per-segment views (multi-screen M3).
+ *
+ * @ref count is 0 when the window is not segmented (on the primary screen only,
+ * no window yet, segmentation off, an IPC/service session): the caller then
+ * keeps the single view set. When non-zero, the compositor weaves the window
+ * per screen and every segment is listed, left to right.
+ *
+ * @ingroup xrt_iface
+ */
+struct xrt_segment_metrics
+{
+	uint32_t count;
+	struct xrt_segment_metric seg[XRT_MAX_SEGMENTS];
+
+	struct xrt_rect canvas;     //!< The canvas the table was cut from, window px
+	int32_t window_screen_left; //!< The window's client-area origin, desktop coordinates
+	int32_t window_screen_top;
+	uint32_t window_pixel_width;
+	uint32_t window_pixel_height;
+
+	//! Bumped whenever the table's geometry changes (a move, a resize, a screen change).
+	uint64_t generation;
+};
+
+/*!
+ * Where each segment's views go, handed from the state tracker to the
+ * compositor with the frame they were located for (multi-screen M3).
+ *
+ * Views `[first_view[i], first_view[i] + view_count[i])` of the projection
+ * layer belong to segment @ref rect[i] (window px). @ref count 0 = the frame
+ * carries one view set for the whole window (nothing to route).
+ *
+ * @ingroup xrt_iface
+ */
+struct xrt_segment_view_routing
+{
+	uint32_t count;
+	uint64_t screen_id[XRT_MAX_SEGMENTS];
+	struct xrt_rect rect[XRT_MAX_SEGMENTS];
+	uint32_t first_view[XRT_MAX_SEGMENTS];
+	uint32_t view_count[XRT_MAX_SEGMENTS];
+	struct xrt_rect canvas; //!< The canvas the rects are relative to, window px
+};
+
 #ifdef __cplusplus
 }
 #endif
