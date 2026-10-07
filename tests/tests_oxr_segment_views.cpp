@@ -280,3 +280,59 @@ TEST_CASE("views are contiguous per segment and the tail aliases view 0", "[oxr]
 	CHECK(oxr_segment_views_alias_source(4, 4) == 0);
 	CHECK(oxr_segment_views_alias_source(7, 4) == 0);
 }
+
+TEST_CASE("a segment takes its DP's eyes tracked or not, like the single-screen path", "[oxr][segment_views]")
+{
+	// Untracked but valid (sim_display): accepted — not replaced by the
+	// registry nominal viewer, so the primary panel's views do not jump when
+	// the window crosses the seam.
+	CHECK(oxr_segment_views_accept_eyes(true, true, 4));
+	CHECK(oxr_segment_views_accept_eyes(true, true, 2));
+	CHECK_FALSE(oxr_segment_views_accept_eyes(false, true, 2));
+	CHECK_FALSE(oxr_segment_views_accept_eyes(true, false, 2));
+	CHECK_FALSE(oxr_segment_views_accept_eyes(true, true, 0));
+}
+
+TEST_CASE("Quad mode on two segments: every view gets a real frustum", "[oxr][segment_views]")
+{
+	// The nominal branch must fill one eye per active view: a 4-view mode
+	// with only 2 eyes left views 2..3 with zero FOVs on every segment.
+	xrt_eye_position eyes[XRT_MAX_VIEWS];
+	REQUIRE(oxr_segment_views_nominal_eyes(0.063f, 0.6f, 2, 0.0f, 0.0f, eyes) == 2);
+	CHECK(eyes[0].x == Catch::Approx(-0.0315f));
+	CHECK(eyes[1].x == Catch::Approx(0.0315f));
+	REQUIRE(oxr_segment_views_nominal_eyes(0.063f, 0.6f, 1, 0.0f, 0.0f, eyes) == 2); // mono: the pair, centred later
+
+	const xrt_segment_metrics m = two_screen_table();
+	oxr_segment_layout l;
+	REQUIRE(oxr_segment_views_layout(&m, &l));
+	uint32_t first[XRT_MAX_SEGMENTS] = {};
+	uint32_t count[XRT_MAX_SEGMENTS] = {};
+	REQUIRE(oxr_segment_views_assign(2, 4, 8, first, count) == 8);
+
+	for (uint32_t i = 0; i < 2; i++) {
+		float dx = 0, dy = 0;
+		oxr_segment_views_own_to_ref(&l, i, &dx, &dy);
+		xrt_window_metrics wm;
+		oxr_segment_views_window_metrics(&m, &l, i, &wm);
+		const uint32_t n =
+		    oxr_segment_views_nominal_eyes(0.063f, m.seg[i].nominal_viewer_z_m, count[i], dx, dy, eyes);
+		REQUIRE(n == 4);
+		xrt_vec3 raw[4];
+		for (uint32_t e = 0; e < 4; e++) {
+			raw[e] = {eyes[e].x - wm.window_center_offset_x_m, eyes[e].y - wm.window_center_offset_y_m,
+			          eyes[e].z};
+		}
+		const dxr_screen scr = {wm.window_width_m, wm.window_height_m};
+		dxr_display3d_tunables dt = dxr_display3d_default_tunables();
+		dt.virtual_display_height = wm.window_height_m;
+		const xrt_vec3 nominal = {0.0f, 0.0f, m.seg[i].nominal_viewer_z_m};
+		dxr_xrt_view out[4];
+		dxr_xrt_display3d_compute_views(raw, 4, &nominal, &scr, &dt, nullptr, out);
+		for (uint32_t e = 0; e < 4; e++) {
+			INFO("segment " << i << " view " << e);
+			CHECK(out[e].fov.angle_right - out[e].fov.angle_left > 0.05f);
+			CHECK(out[e].fov.angle_up - out[e].fov.angle_down > 0.05f);
+		}
+	}
+}

@@ -185,6 +185,43 @@ oxr_segment_views_assign(uint32_t segment_count,
                          uint32_t out_count[XRT_MAX_SEGMENTS]);
 
 /*!
+ * Does a screen's DP eye set count? Exactly the single-screen rule: any VALID
+ * set with at least one eye, tracked or not (an untracked DP still reports its
+ * nominal-viewer eyes — sim_display does, N of them for a Quad mode). Only a
+ * screen with no DP eyes at all falls back to its registry nominal viewer.
+ */
+static inline bool
+oxr_segment_views_accept_eyes(bool have_eyes, bool valid, uint32_t count)
+{
+	return have_eyes && valid && count > 0;
+}
+
+/*!
+ * The untracked eye set: one eye per active view (at least 2), in front of the
+ * screen centre at @p z, translated by (@p dx, @p dy) into the caller's frame.
+ * The pair is (-ipd/2, +ipd/2); views past 2 repeat it column by column (even
+ * views left, odd views right), so a 4-view mode gets a valid frustum for every
+ * view instead of zero FOVs. Two views = exactly the pre-M3 nominal pair.
+ *
+ * @return the number of eyes written (<= XRT_MAX_VIEWS).
+ */
+static inline uint32_t
+oxr_segment_views_nominal_eyes(
+    float ipd, float z, uint32_t active_view_count, float dx, float dy, struct xrt_eye_position *out)
+{
+	uint32_t n = active_view_count < 2 ? 2 : active_view_count;
+	if (n > XRT_MAX_VIEWS) {
+		n = XRT_MAX_VIEWS;
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		out[i].x = ((i % 2) == 0 ? -ipd / 2.0f : ipd / 2.0f) + dx;
+		out[i].y = dy;
+		out[i].z = z;
+	}
+	return n;
+}
+
+/*!
  * Which located view view @p i carries: itself while active, view 0 for the
  * inactive tail `[active_view_count, reported)` — the ADR-041 alias, the same
  * with one view set or one per segment.
