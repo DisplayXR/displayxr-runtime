@@ -11,7 +11,7 @@
  * processor of ITS screen, a pre-cropped atlas holding exactly that segment's
  * views, `canvas = segment rect`, and its own present origin; the results are
  * composited into the one presented surface. A segment with no DP for its
- * screen, or whose DP needs 1:1 pixels on a resampled screen, gets a flat 2D
+ * screen (a plug-in without `create_dp_vk_for_screen`), or whose DP needs 1:1 pixels on a resampled screen, gets a flat 2D
  * blit of one view instead.
  *
  * The session's primary DP (`comp_vk_native_compositor::display_processor`)
@@ -49,9 +49,11 @@ struct comp_vk_native_segments;
  *
  * @param vk          The compositor's bundle (borrowed; outlives this object).
  * @param cmd_pool    Pool handed to segment DP factories (borrowed).
+ * @param dp_queue    #868 runtime-owned queue the DPs must capture at creation
+ *                    (VK_NULL_HANDLE = none).
  */
 struct comp_vk_native_segments *
-comp_vk_native_segments_create(struct vk_bundle *vk, VkCommandPool cmd_pool);
+comp_vk_native_segments_create(struct vk_bundle *vk, VkCommandPool cmd_pool, VkQueue dp_queue);
 
 /*!
  * Tear down every segment DP and image. The caller guarantees no submitted

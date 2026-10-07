@@ -1259,7 +1259,10 @@ struct xrt_plugin_iface
 	 *   - Several instances may coexist in one process, one per screen.
 	 *
 	 * Optional. NULL (or a plug-in whose `struct_size` predates this field)
-	 * ⟹ the runtime falls back to @ref create_dp_vk for that screen.
+	 * ⟹ the plug-in's screens other than the session's primary one get a
+	 * flat 2D view, never a @ref create_dp_vk DP: that DP describes the
+	 * plug-in's one panel and is not bound by the canvas / not-first-writer
+	 * contract above, so it could wipe the segment woven before it.
 	 * Appended per ADR-020 (append-only within a major; gated by
 	 * @ref struct_size; no XRT_PLUGIN_API_VERSION_CURRENT bump) after
 	 * @ref get_display_info_for_monitor. Announced by
