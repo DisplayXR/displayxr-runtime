@@ -189,11 +189,13 @@ typedef struct XrCursorDepthSourceDXR {
 typedef enum XrCursorDepthAnchorModeDXR {
     /*!
      * The default. While the pointer moves: SCREEN placement (exact aim).
-     * While it is still: world-fixed at the lateral position of the last
-     * moving placement, at the current depth - so head motion parallaxes the
-     * cursor exactly like content at that depth. Continuous where the pointer
-     * stops. The drift from the click point accrues only while the pointer is
-     * still, and is ~mm for content near the glass.
+     * While it is still: on the line of sight of the last pointer move
+     * (anchor-time eye -> canvas point), at the current depth - so lateral
+     * head motion leaves it world-fixed and it parallaxes exactly like
+     * content at that depth, while a depth change slides it along that line
+     * and keeps it on the click point. Continuous where the pointer stops.
+     * Drift from the click point comes only from head motion while the
+     * pointer is still, and is ~mm for content near the glass.
      */
     XR_CURSOR_DEPTH_ANCHOR_MODE_HYBRID_DXR = 0,
     /*!

@@ -246,20 +246,27 @@ u_cursor_depth_place_anchored(const struct u_cursor_depth_geometry *g,
 	}
 
 	// HYBRID.
-	const bool moved = !anchor->has_anchor || reprimed ||
-	                   fabsf(u - anchor->last_u) > U_CURSOR_DEPTH_ANCHOR_MOVE_EPS ||
-	                   fabsf(v - anchor->last_v) > U_CURSOR_DEPTH_ANCHOR_MOVE_EPS || !isfinite(anchor->foot.x);
+	const bool moved =
+	    !anchor->has_anchor || reprimed || fabsf(u - anchor->last_u) > U_CURSOR_DEPTH_ANCHOR_MOVE_EPS ||
+	    fabsf(v - anchor->last_v) > U_CURSOR_DEPTH_ANCHOR_MOVE_EPS || !(anchor->eye_to_canvas > 0.0f);
 	if (moved) {
-		// Screen placement (already in *out_position); remember its foot on the glass.
-		anchor->foot = v3_add_scaled(*out_position, g->forward, lift);
+		// Screen placement (already in *out_position); remember this line of sight.
+		anchor->eye = g->eye;
+		anchor->canvas_point = g->canvas_point;
+		anchor->eye_to_canvas = g->eye_to_canvas;
 		anchor->last_u = u;
 		anchor->last_v = v;
 		anchor->last_ns = now_ns;
 		anchor->has_anchor = true;
 		return;
 	}
-	// Pointer still: world-fixed laterally at F, at the CURRENT depth.
-	*out_position = v3_add_scaled(anchor->foot, g->forward, -lift);
+	// Pointer still: the point on the anchor-time line of sight E0 -> S0 whose
+	// distance in front of the glass is the CURRENT depth, lift. Same geometry
+	// gives s = t (continuous at the stop); a lateral head move leaves s and so
+	// C unchanged (world-fixed, parallax like content); a depth change slides C
+	// along that line, so from E0 it stays on S0 (the click point).
+	const float s = 1.0f - lift / anchor->eye_to_canvas;
+	*out_position = v3_add_scaled(anchor->eye, v3_sub(anchor->canvas_point, anchor->eye), s);
 }
 
 

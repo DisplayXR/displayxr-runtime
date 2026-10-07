@@ -369,8 +369,10 @@ TEST_CASE("cursor_depth: HYBRID - pointer moving = SCREEN placement (on the cycl
 		require_near(c, cs, 1e-6f);
 		CHECK(h == hs);
 		CHECK(anchor.has_anchor);
-		// The stored foot F = C + f (1 - t) e is on the canvas plane.
-		CHECK(anchor.foot.z == Catch::Approx(0.0f).margin(2e-5));
+		// The stored anchor is this locate's line of sight.
+		require_near(anchor.eye, hg.g.eye, 1e-6f);
+		require_near(anchor.canvas_point, hg.g.canvas_point, 1e-6f);
+		CHECK(anchor.eye_to_canvas == hg.g.eye_to_canvas);
 	}
 }
 
@@ -409,15 +411,14 @@ TEST_CASE("cursor_depth: HYBRID - pointer still, head moves = world-fixed (paral
 		CHECK(on_glass(hg.el, cs).x == Catch::Approx(img0.x).margin(1e-5));
 	}
 
-	// Head moves toward the glass: the same disparity is a shallower depth, but the
-	// sprite keeps its lateral (world) position.
+	// Head moves toward the glass: the same disparity is a shallower depth. The
+	// sprite slides along the anchor-time line of sight to that depth.
 	now += 16 * MS;
 	const HeadGeom hz = head({0.0f, 0.0f, 0.45f}, u, v);
 	xrt_vec3 cz{};
 	u_cursor_depth_place_anchored(&hz.g, d, 0.03f, U_CURSOR_DEPTH_ANCHOR_HYBRID, &anchor, u, v, false, now, &cz,
 	                              &hgt);
-	CHECK(cz.x == Catch::Approx(c0.x).margin(1e-5));
-	CHECK(cz.y == Catch::Approx(c0.y).margin(1e-5));
+	require_near(on_glass(h0.g.eye, cz), h0.g.canvas_point, 5e-5f);
 	float dz = 0.0f;
 	REQUIRE(u_cursor_depth_point_disparity(&hz.g, &cz, &dz));
 	CHECK(dz == Catch::Approx(d).margin(2e-4));
@@ -458,16 +459,62 @@ TEST_CASE("cursor_depth: HYBRID - continuous on the frame the pointer stops")
 	require_near(c_noise, c_moving, 1e-6f);
 	CHECK(anchor.last_ns == 32 * MS);
 
-	// Still, but the content under it changes depth: the sprite keeps its lateral
-	// position and moves only along the normal to the new depth.
-	xrt_vec3 c_deeper{};
+	// Still, but the content under it changes depth (same head): the sprite slides
+	// along the line of sight, i.e. it equals the SCREEN placement at the new depth.
+	xrt_vec3 c_deeper{}, c_deeper_screen{};
+	float hs = 0.0f;
 	u_cursor_depth_place_anchored(&hg.g, -0.1f, 0.03f, U_CURSOR_DEPTH_ANCHOR_HYBRID, &anchor, 0.62f, 0.33f, false,
 	                              80 * MS, &c_deeper, &hgt);
-	CHECK(c_deeper.x == Catch::Approx(c_moving.x).margin(1e-6));
-	CHECK(c_deeper.y == Catch::Approx(c_moving.y).margin(1e-6));
+	u_cursor_depth_place(&hg.g, -0.1f, 0.03f, &c_deeper_screen, &hs);
+	require_near(c_deeper, c_deeper_screen, 1e-5f);
 	float dd = 0.0f;
 	REQUIRE(u_cursor_depth_point_disparity(&hg.g, &c_deeper, &dd));
 	CHECK(dd == Catch::Approx(-0.1f).margin(1e-5));
+}
+
+TEST_CASE("cursor_depth: HYBRID - content appears under a still pointer: stays on the click point, WORLD does not")
+{
+	// The case that motivated anchoring the LINE OF SIGHT rather than its foot: the
+	// anchor is stored with the cursor on the glass (d0 = 0, e.g. before the first
+	// hit test), then the content under the still pointer pops out. A viewer well
+	// off-axis (eye 0.10 m above and 0.08 m left of the pointer's canvas point).
+	const float u = 0.75f, v = 0.5f;
+	const HeadGeom hg = head({0.0f, 0.1f, 0.6f}, u, v);
+	u_cursor_depth_anchor anchor{};
+	xrt_vec3 c{};
+	float hgt = 0.0f;
+	u_cursor_depth_place_anchored(&hg.g, 0.0f, 0.03f, U_CURSOR_DEPTH_ANCHOR_HYBRID, &anchor, u, v, false, 16 * MS,
+	                              &c, &hgt);
+	require_near(c, hg.g.canvas_point, 1e-5f);
+
+	uint64_t now = 16 * MS;
+	const float ds[] = {-0.02f, -0.1f, -0.3f, 0.2f};
+	for (float d : ds) {
+		now += 16 * MS;
+		u_cursor_depth_place_anchored(&hg.g, d, 0.03f, U_CURSOR_DEPTH_ANCHOR_HYBRID, &anchor, u, v, false, now,
+		                              &c, &hgt);
+		// On the E0 -> S0 line: seen from E0 it projects onto S0, the click point...
+		require_near(on_glass(anchor.eye, c), anchor.canvas_point, 5e-5f);
+		// ... at the requested depth.
+		float back = 0.0f;
+		REQUIRE(u_cursor_depth_point_disparity(&hg.g, &c, &back));
+		CHECK(back == Catch::Approx(d).margin(1e-4));
+
+		// WORLD rises along the normal instead: off the click point for this viewer.
+		xrt_vec3 cw{};
+		u_cursor_depth_place_anchored(&hg.g, d, 0.03f, U_CURSOR_DEPTH_ANCHOR_WORLD, nullptr, u, v, false, now,
+		                              &cw, &hgt);
+		const xrt_vec3 pw = on_glass(hg.g.eye, cw);
+		CHECK(std::fabs(pw.y - hg.g.canvas_point.y) + std::fabs(pw.x - hg.g.canvas_point.x) > 1e-3f);
+	}
+
+	// And after the head moves laterally, the sprite is still world-fixed at fixed t.
+	xrt_vec3 c_before = c;
+	const HeadGeom moved_head = head({0.12f, 0.1f, 0.6f}, u, v);
+	xrt_vec3 c_after{};
+	u_cursor_depth_place_anchored(&moved_head.g, 0.2f, 0.03f, U_CURSOR_DEPTH_ANCHOR_HYBRID, &anchor, u, v, false,
+	                              now + 16 * MS, &c_after, &hgt);
+	require_near(c_after, c_before, 1e-5f);
 }
 
 TEST_CASE("cursor_depth: WORLD - in front of the canvas point along the normal, at the requested disparity")
