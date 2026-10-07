@@ -480,10 +480,24 @@ manifest plug-in on POSIX as a claim source (`collect_display_sources_platform`,
 the twin of the Windows one): same roots and order as discovery,
 `DXR_PLUGIN_EXCLUSIVE` honoured, the active plug-in reused rather than loaded
 twice. The other plug-ins are claim sources only. No device is created from
-them, and active-plug-in selection is unchanged. One consequence carries over
-from Windows: with `XRT_PREFERRED_PLUGIN_ID=sim-display`, an installed vendor
-plug-in is now loaded and probed for its claims. Use `DXR_PLUGIN_EXCLUSIVE` to
-keep it out of the process (§2.2).
+them, and active-plug-in selection is unchanged.
+
+Unlike Windows, POSIX loads the others **only when they could matter**. The
+active plug-in wins every monitor it claims (#1521), and only a different
+pinned plug-in outranks it. So when the active plug-in claims every monitor
+and no other plug-in is preferred, the source set is the active plug-in alone,
+and nothing else is `dlopen`ed or probed. That covers
+`XRT_PREFERRED_PLUGIN_ID=sim-display` (sim-display claims every monitor), so
+pinning sim-display does not load the Leia plug-in or touch the SR service.
+The check is repeated on every resolve.
+
+Plug-in instances loaded only as claim sources are released with the
+`xrt_instance` (`target_plugin_release_claim_sources`, from
+`t_instance_destroy`): `destroy()` is called on each, the source cache is
+dropped, and the next resolve re-collects. The `dlopen` handles stay loaded,
+as for every plug-in. Windows is unchanged and keeps its claim sources for
+the process lifetime. `DXR_PLUGIN_EXCLUSIVE` (§2.2) still keeps every other
+plug-in out of the process entirely.
 
 **Back-compat claim for a plug-in without `probe_displays`.** Such a plug-in
 gets one synthesized `EDID`-confidence claim. On Windows that claim stays on

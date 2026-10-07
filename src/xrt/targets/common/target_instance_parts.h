@@ -10,6 +10,7 @@
 #pragma once
 
 #include "target_lists.h"
+#include "target_plugin_loader.h"
 
 #include "xrt/xrt_prober.h"
 #include "xrt/xrt_instance.h"
@@ -84,6 +85,10 @@ t_instance_destroy(struct xrt_instance *xinst)
 	struct t_instance *tinst = t_instance(xinst);
 
 	xrt_prober_destroy(&tinst->xp);
+
+	// Plug-ins loaded only to collect per-monitor display claims (multi-screen
+	// M0) are released with the instance; the active plug-in stays.
+	target_plugin_release_claim_sources();
 
 #ifdef XRT_OS_ANDROID
 	android_instance_base_cleanup(&tinst->android, xinst);
