@@ -471,9 +471,16 @@ headless) every connected, enabled connector becomes a DRM-only record flagged
 
 The plug-in-facing `xrt_display_descriptor` is unchanged (no ABI change). The
 connector name, mm and device mode stay runtime-side (`os_display_edid_monitor`
-plus a loader side table keyed by `monitor_id`). The `monitor_id` hash adds the
-connector name (with its card prefix) where the platform has one, so DRM-only
-records at (0, 0) stay distinct. Windows ids are unchanged.
+plus a loader side table keyed by `monitor_id`). Where the platform names the
+connector, the `monitor_id` hash is EDID manufacturer + product + serial + the
+connector name **with its card prefix** (`card1-HDMI-A-1`), with no desktop
+position (multi-screen M1): the connector is unique per machine, so the id
+survives a monitor rearrangement — it is the `displayId` apps hold via
+`xrEnumerateDisplaysDXR` — DRM-only records at (0, 0) stay distinct, and two GPUs
+that both expose an `HDMI-A-1` do not collide. The id changes when a different
+panel is plugged into the port, the panel moves port, or the kernel renumbers
+the card (GPU added/removed, probe order across boots). Windows ids (no
+connector name) are unchanged: manufacturer + product + position.
 
 **Claims from every plug-in.** `target_plugin_resolve_displays` now loads every
 manifest plug-in on POSIX as a claim source (`collect_display_sources_platform`,
