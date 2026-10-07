@@ -16,18 +16,31 @@
  * sysfs has the EDID blob and the connector name, but no desktop position. So
  * each RandR monitor is tied to one DRM connector, in this order:
  *
+ * 0. **randr-edid** — the X server publishes the output's own `EDID` property
+ *    (native X does; XWayland does not). That IS the monitor's identity; the
+ *    DRM connector is then the one unused, enabled connector carrying the same
+ *    EDID (vendor, product, serial), when exactly one does — or, among several
+ *    identical ones, the one whose name agrees.
  * 1. **name** — the RandR output name equals the DRM connector name once the
- *    kernel's subtype letter is dropped ("HDMI-A-1" -> "HDMI-1"). This is the
- *    normal case on X11 and on Mutter's XWayland.
- * 2. **mm** — exactly one unused connector whose EDID physical size is within
- *    @ref OS_DISPLAY_EDID_JOIN_MM_TOLERANCE of RandR's mm.
- * 3. **mode** — exactly one unused connector that has the monitor's pixel size
- *    (device mode when known, else the RandR rect) among its modes.
+ *    card prefix and the kernel's subtype letter are dropped
+ *    ("card1-HDMI-A-1" -> "HDMI-1"), AND the connector agrees on something
+ *    physical: its mode list holds the monitor's device mode, or its EDID size
+ *    is within tolerance of RandR's mm. A bare name is not enough: the NVIDIA
+ *    X driver numbers outputs from 0 (DP-0, DP-1) while nvidia-drm numbers
+ *    connectors from 1, and two GPUs can each have an HDMI-A-1.
+ * 2. **mm** — exactly one unused, enabled connector whose EDID physical size
+ *    is within @ref OS_DISPLAY_EDID_JOIN_MM_TOLERANCE of RandR's mm.
+ * 3. **mode** — exactly one unused, enabled connector that has the monitor's
+ *    device mode among its modes.
+ *
+ * "Device mode" is the compositor's current mode when Mutter reported it,
+ * else the RandR rect — never the DRM-derived mode, which itself came from a
+ * name match and would make rule 1 circular.
  *
  * A RandR monitor nothing joins is still listed, with no EDID identity. With
  * no RandR monitors at all (no X server: pure Wayland, or headless) every
  * connected, enabled connector becomes a DRM-only record whose desktop origin
- * is unknown.
+ * is unknown, in connector-name order so the order is stable across boots.
  */
 
 #pragma once
@@ -93,7 +106,7 @@ os_display_edid_parsed_mm(const struct os_display_edid_parsed *p, uint32_t *out_
  */
 struct os_display_drm_connector
 {
-	char name[32]; //!< Kernel name without the card prefix, e.g. "HDMI-A-1".
+	char name[32]; //!< Kernel name WITH the card prefix, e.g. "card1-HDMI-A-1".
 	bool enabled;  //!< `enabled` reads "enabled" (or the file is absent).
 	bool has_edid; //!< `edid` parsed.
 	struct os_display_edid_parsed edid;
@@ -104,7 +117,8 @@ struct os_display_drm_connector
 
 /*!
  * Read every CONNECTED connector under @p root (normally `/sys/class/drm`;
- * a directory of `card<N>-<name>/{status,enabled,edid,modes}` in tests).
+ * a directory of `card<N>-<name>/{status,enabled,edid,modes}` in tests),
+ * sorted by name so the order does not depend on readdir.
  *
  * @return the number written to @p out.
  */
@@ -112,9 +126,21 @@ uint32_t
 os_display_drm_read_connectors(const char *root, struct os_display_drm_connector *out, uint32_t max);
 
 /*!
+ * What the X server itself says a RandR monitor is: the parsed `EDID` output
+ * property, when it publishes one.
+ */
+struct os_display_randr_identity
+{
+	bool valid;
+	struct os_display_edid_parsed edid;
+};
+
+/*!
  * The join described in the file comment. Pure: no I/O, no logging.
  *
  * @param randr      RandR monitors (may be NULL when @p randr_count is 0).
+ * @param randr_id   Per-RandR-monitor EDID from the X server, aligned with
+ *                   @p randr; NULL when none was read.
  * @param drm        Connected DRM connectors.
  * @param[out] out   One record per RandR monitor, or per enabled connector
  *                   when there is no RandR monitor.
@@ -122,11 +148,35 @@ os_display_drm_read_connectors(const char *root, struct os_display_drm_connector
  */
 uint32_t
 os_display_edid_linux_join(const struct os_display_desktop_info *randr,
+                           const struct os_display_randr_identity *randr_id,
                            uint32_t randr_count,
                            const struct os_display_drm_connector *drm,
                            uint32_t drm_count,
                            struct os_display_edid_monitor *out,
                            uint32_t max);
+
+//! Largest EDID blob kept from the X server (base block + one extension).
+#define OS_DISPLAY_RANDR_EDID_MAX 256
+
+/*!
+ * One monitor's `EDID` output property as the X server publishes it.
+ */
+struct os_display_randr_edid
+{
+	char name[64]; //!< RandR monitor name, as in os_display_desktop_info::device_name.
+	uint8_t edid[OS_DISPLAY_RANDR_EDID_MAX];
+	uint32_t len; //!< 0 = the server publishes no EDID for this monitor.
+};
+
+/*!
+ * Read the `EDID` property of each RandR monitor's first output
+ * (implemented in os_display_desktop_x11.c, Xrandr dlopen'd). Native X
+ * servers publish it; XWayland does not, and then every entry has len 0.
+ *
+ * @return the number of monitors written, 0 without an X server.
+ */
+uint32_t
+os_display_x11_read_monitor_edids(struct os_display_randr_edid *out, uint32_t max);
 
 #ifdef __cplusplus
 }

@@ -47,6 +47,7 @@
 
 #include "os_display_desktop.h"
 #include "os_display_connector_linux.h"
+#include "os_display_edid_linux.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -88,6 +89,23 @@ struct x11_fns
 
 	struct os_xrr_monitor_info *(*XRRGetMonitors)(os_x_display *, os_x_window, int, int *);
 	void (*XRRFreeMonitors)(struct os_xrr_monitor_info *);
+
+	// Optional: only the EDID reader uses these, and a missing one just means
+	// "no EDID from the X server".
+	os_x_atom (*XInternAtom)(os_x_display *, const char *, int);
+	int (*XRRGetOutputProperty)(os_x_display *,
+	                            unsigned long,
+	                            os_x_atom,
+	                            long,
+	                            long,
+	                            int,
+	                            int,
+	                            os_x_atom,
+	                            os_x_atom *,
+	                            int *,
+	                            unsigned long *,
+	                            unsigned long *,
+	                            unsigned char **);
 };
 
 static bool
@@ -125,6 +143,9 @@ x11_fns_load(struct x11_fns *f)
 	LOAD(lib_xrandr, XRRFreeMonitors, "XRRFreeMonitors");
 
 #undef LOAD
+
+	*(void **)(&f->XInternAtom) = dlsym(f->lib_x11, "XInternAtom");
+	*(void **)(&f->XRRGetOutputProperty) = dlsym(f->lib_xrandr, "XRRGetOutputProperty");
 
 	return true;
 
@@ -252,6 +273,69 @@ query_monitors(struct os_display_desktop_info *out_infos, uint32_t max_infos)
 	// a 1:1 presentation only be judged — by what the connector runs.
 	os_display_connector_annotate(out_infos, written);
 
+	return written;
+}
+
+uint32_t
+os_display_x11_read_monitor_edids(struct os_display_randr_edid *out, uint32_t max)
+{
+	if (out == NULL || max == 0) {
+		return 0;
+	}
+	memset(out, 0, sizeof(*out) * max);
+
+	struct x11_fns f;
+	if (!x11_fns_load(&f)) {
+		return 0;
+	}
+	uint32_t written = 0;
+	os_x_display *dpy = (f.XInternAtom != NULL && f.XRRGetOutputProperty != NULL) ? f.XOpenDisplay(NULL) : NULL;
+	if (dpy != NULL) {
+		// only_if_exists: a server that never published an EDID property
+		// has no such atom, and creating one would be a side effect.
+		const os_x_atom edid_atom = f.XInternAtom(dpy, "EDID", 1);
+		int count = 0;
+		struct os_xrr_monitor_info *mons =
+		    edid_atom != 0 ? f.XRRGetMonitors(dpy, f.XDefaultRootWindow(dpy), 1, &count) : NULL;
+		for (int i = 0; mons != NULL && i < count && written < max; i++) {
+			const struct os_xrr_monitor_info *m = &mons[i];
+			if (m->width <= 0 || m->height <= 0) {
+				continue; // same filter as query_monitors, so names line up
+			}
+			struct os_display_randr_edid *o = &out[written++];
+			char *name = f.XGetAtomName(dpy, m->name);
+			if (name != NULL) {
+				(void)snprintf(o->name, sizeof(o->name), "%s", name);
+				f.XFree(name);
+			}
+			if (m->noutput < 1 || m->outputs == NULL) {
+				continue;
+			}
+			const unsigned long output = ((const unsigned long *)m->outputs)[0];
+			os_x_atom actual_type = 0;
+			int actual_format = 0;
+			unsigned long nitems = 0, bytes_after = 0;
+			unsigned char *prop = NULL;
+			// Length is in 32-bit units: 64 = 256 bytes.
+			if (f.XRRGetOutputProperty(dpy, output, edid_atom, 0, OS_DISPLAY_RANDR_EDID_MAX / 4, 0, 0,
+			                           0 /* AnyPropertyType */, &actual_type, &actual_format, &nitems,
+			                           &bytes_after, &prop) == 0 /* Success */
+			    && prop != NULL && actual_format == 8 && nitems >= 128) {
+				const uint32_t n =
+				    nitems > OS_DISPLAY_RANDR_EDID_MAX ? OS_DISPLAY_RANDR_EDID_MAX : (uint32_t)nitems;
+				memcpy(o->edid, prop, n);
+				o->len = n;
+			}
+			if (prop != NULL) {
+				f.XFree(prop);
+			}
+		}
+		if (mons != NULL) {
+			f.XRRFreeMonitors(mons);
+		}
+		f.XCloseDisplay(dpy);
+	}
+	x11_fns_unload(&f);
 	return written;
 }
 

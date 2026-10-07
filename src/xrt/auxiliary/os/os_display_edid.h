@@ -49,11 +49,12 @@ enum os_edid_diag_error
  */
 enum os_display_edid_join
 {
-	OS_EDID_JOIN_NONE = 0,     //!< No EDID source tied to this monitor.
-	OS_EDID_JOIN_NAME = 1,     //!< RandR output name == normalised DRM connector name.
-	OS_EDID_JOIN_MM = 2,       //!< Unique match on physical size (mm, with tolerance).
-	OS_EDID_JOIN_MODE = 3,     //!< Unique match on pixel mode.
-	OS_EDID_JOIN_DRM_ONLY = 4, //!< No placement source (no X server): DRM record alone.
+	OS_EDID_JOIN_NONE = 0,       //!< No EDID source tied to this monitor.
+	OS_EDID_JOIN_NAME = 1,       //!< RandR output name == normalised DRM connector name.
+	OS_EDID_JOIN_MM = 2,         //!< Unique match on physical size (mm, with tolerance).
+	OS_EDID_JOIN_MODE = 3,       //!< Unique match on pixel mode.
+	OS_EDID_JOIN_DRM_ONLY = 4,   //!< No placement source (no X server): DRM record alone.
+	OS_EDID_JOIN_RANDR_EDID = 5, //!< The X server's own EDID output property.
 };
 
 /*!
@@ -84,7 +85,7 @@ struct os_display_edid_monitor
 	uint32_t physical_height_mm;    //!< As above, bytes 22 x 10.
 	uint32_t native_width;          //!< The connector's device mode (may differ from pixel_width
 	uint32_t native_height;         //!< under a scaled X screen); 0 = unknown.
-	char connector[32];             //!< DRM connector, e.g. "HDMI-A-1"; "" = unknown.
+	char connector[32];             //!< DRM connector, e.g. "card1-HDMI-A-1"; "" = unknown.
 	char output_name[32];           //!< RandR output name, e.g. "HDMI-1"; "" = none.
 	bool origin_unknown;            //!< screen_left/top are NOT a desktop position (DRM-only record).
 	enum os_display_edid_join join; //!< How the EDID was tied to the placement record.
@@ -151,6 +152,7 @@ os_display_edid_join_str(enum os_display_edid_join join)
 	case OS_EDID_JOIN_MM: return "mm";
 	case OS_EDID_JOIN_MODE: return "mode";
 	case OS_EDID_JOIN_DRM_ONLY: return "drm-only";
+	case OS_EDID_JOIN_RANDR_EDID: return "randr-edid";
 	case OS_EDID_JOIN_NONE:
 	default: return "none";
 	}
