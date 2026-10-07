@@ -29,6 +29,11 @@ target_sources(aux_os PRIVATE os_display_edid.h)
 if(WIN32)
 	target_sources(aux_os PRIVATE os_display_edid_win32.c)
 	target_link_libraries(aux_os PRIVATE setupapi)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+	# Desktop Linux (multi-screen M0): RandR monitors joined to DRM sysfs
+	# connectors. Needs os_display_desktop_x11.c + os_display_connector_linux.c,
+	# added below under the same condition.
+	target_sources(aux_os PRIVATE os_display_edid_linux.h os_display_edid_linux.c)
 else()
 	target_sources(aux_os PRIVATE os_display_edid_stubs.c)
 endif()
