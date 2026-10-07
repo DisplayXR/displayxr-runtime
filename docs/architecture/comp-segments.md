@@ -1,8 +1,8 @@
 # Window segments: one window, one DP per screen
 
 *How the compositor weaves a window that spans several screens (multi-screen M2).
-Companion to [ADR-047](../adr/ADR-047-multi-screen-segments-and-per-screen-views.md)
-decision D2 and the [multi-screen plan](../roadmap/multi-screen.md).
+Companion to ADR-047 (`docs/adr/ADR-047-multi-screen-segments-and-per-screen-views.md`, lands with PR #1849)
+decision D2 and the multi-screen plan (`docs/roadmap/multi-screen.md`, lands with PR #1849).
 Code: `src/xrt/compositor/util/comp_segments.{h,c}` (backend-agnostic math and
 policy, unit-tested by `tests/tests_comp_segments.cpp`) and
 `src/xrt/compositor/vk_native/comp_vk_native_segments.{h,c}` (the Vulkan
