@@ -168,6 +168,14 @@ the same v. So the cursor rises along the line of sight and doesn't drift sidewa
 - The hint is a frame old. A cursor moving fast across a depth edge can show a single frame
   where the cursor sits behind the nearer content. The footprint dilation and the fast rise keep
   that to the edge itself. Phase 3 measures the current frame, so it doesn't have this lag.
+- **Head motion and look-around.** The sprite sits on the cyclopean ray through the cursor's
+  canvas point. So each eye sees it on the glass at S ∓ (baseline/2)·d, which doesn't depend on
+  where the head is (unit-tested across three head poses). The cursor's image on the panel
+  therefore cannot swim with tracking motion or jitter. Only the content under the line of sight
+  changes as the user looks around, and the hit test is redone every frame. This is deliberate
+  SCREEN anchoring, not world anchoring. A mouse is a 2D screen-space device, so the cursor slides
+  over a surface under head motion instead of sticking to it. If it stuck to the surface, the
+  click target would drift on the glass as the head moved.
 - An app-drawn cursor shows the app's frame latency, not the hardware cursor's. Phase 2's late
   cursor read narrows that but cannot remove it. This is inherent to any cursor that has
   disparity.

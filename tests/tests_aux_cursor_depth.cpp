@@ -265,3 +265,40 @@ TEST_CASE("cursor_depth: a long gap or a clock going backwards re-primes")
 	CHECK(u_cursor_depth_filter_step(&f, &t, 0.1f, 2000 * MS) == 0.1f);
 	CHECK(u_cursor_depth_filter_step(&f, &t, -0.2f, 1500 * MS) == -0.2f);
 }
+
+TEST_CASE("cursor_depth: head motion does not move the cursor on the glass (screen-anchored, jitter-free)")
+{
+	// Project the placed sprite back onto the canvas (z = 0) from each eye. For a fixed cursor
+	// UV and disparity, those two screen points must not depend on where the head is: the
+	// sprite sits on the cyclopean ray, so each eye sees it at S -/+ (baseline/2)*d — tracking
+	// motion or jitter cannot make it swim, only the content under it can change its depth.
+	auto on_glass = [](xrt_vec3 eye, xrt_vec3 p) {
+		const float k = eye.z / (eye.z - p.z);
+		return xrt_vec3{eye.x + (p.x - eye.x) * k, eye.y + (p.y - eye.y) * k, 0.0f};
+	};
+	const float d = -0.4f;
+	xrt_vec3 ref_l{}, ref_r{};
+	const xrt_vec3 heads[] = {{0.0f, 0.0f, 0.6f}, {0.12f, -0.05f, 0.5f}, {-0.2f, 0.08f, 0.75f}};
+	for (int i = 0; i < 3; i++) {
+		const xrt_vec3 h = heads[i];
+		const xrt_vec3 el{h.x - 0.032f, h.y, h.z}, er{h.x + 0.032f, h.y, h.z};
+		const auto a = kooima(el);
+		const auto b = kooima(er);
+		u_cursor_depth_geometry g{};
+		REQUIRE(u_cursor_depth_geometry_solve(&a, &b, 0.3f, 0.4f, &g));
+		xrt_vec3 c{};
+		float hgt = 0.0f;
+		u_cursor_depth_place(&g, d, 0.03f, &c, &hgt);
+		const xrt_vec3 sl = on_glass(el, c), sr = on_glass(er, c);
+		// On-screen disparity is baseline * d, whatever the head pose.
+		CHECK(sr.x - sl.x == Catch::Approx(0.064f * d).margin(1e-5));
+		CHECK(sr.y == Catch::Approx(sl.y).margin(1e-5));
+		if (i == 0) {
+			ref_l = sl;
+			ref_r = sr;
+		} else {
+			require_near(sl, ref_l, 1e-5f);
+			require_near(sr, ref_r, 1e-5f);
+		}
+	}
+}
