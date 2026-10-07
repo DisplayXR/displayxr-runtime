@@ -541,7 +541,22 @@ window — every platform but desktop Linux, and any service session. So a singl
 box, Windows, macOS and Android advertise exactly the pre-M3 count (existing multiview
 apps and the CTS see no change); `ds1-linux` (eDP + DS1) advertises `device max × 2`.
 `XRT_MAX_SEGMENTS` = 2 lives in `xrt_display_metrics.h`. The locate never hands out more
-view sets than the capacity. The rules:
+view sets than the capacity.
+
+**Intended on multi-monitor desktop Linux:** "DP-backed" counts every registry screen
+with a VK DP factory, **including sim-display's FALLBACK claim** on an ordinary monitor —
+a plain monitor next to the 3D panel is a legitimate segment host (it gets its own views
+and a flat or anaglyph weave). So a DS1 plus a plain HDMI monitor advertises `device max
+× 2` even if the window never leaves the panel. That costs nothing at render time (the
+tail is aliased, ADR-041) and apps already size swapchains for the worst case (ADR-010).
+`DXR_SEGMENTS=0` turns it off with segmentation.
+
+**VIEW space (#1502):** VIEW is the centroid of the **active** views only — never the
+aliased tail, which would drag it toward view 0 now that the tail can be longer than the
+active set. Unsplit, that is `(L+R)/2` exactly as before; split, it is the centroid of
+every segment's active views.
+
+The rules:
 
 - **One segment (the common case):** byte-for-byte the pre-M3 locate — the active
   mode's views first, the whole tail (now longer) aliased onto view 0. The swapchain
