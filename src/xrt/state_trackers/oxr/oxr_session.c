@@ -2403,6 +2403,22 @@ oxr_session_fill_cursor_depth(struct oxr_session *sess,
 	struct u_cursor_depth_tuning tuning;
 	u_cursor_depth_tuning_defaults(&tuning);
 
+	// Spec v3: optional anchor mode + margin, read only behind the hint.
+	// Absent = HYBRID + the default margin.
+	enum u_cursor_depth_anchor_mode anchor_mode = U_CURSOR_DEPTH_ANCHOR_HYBRID;
+	const XrCursorDepthOptionsDXR *options =
+	    OXR_GET_INPUT_FROM_CHAIN(hint, XR_TYPE_CURSOR_DEPTH_OPTIONS_DXR, XrCursorDepthOptionsDXR);
+	if (options != NULL) {
+		if (options->anchorMode == XR_CURSOR_DEPTH_ANCHOR_MODE_SCREEN_DXR) {
+			anchor_mode = U_CURSOR_DEPTH_ANCHOR_SCREEN;
+		} else if (options->anchorMode == XR_CURSOR_DEPTH_ANCHOR_MODE_WORLD_DXR) {
+			anchor_mode = U_CURSOR_DEPTH_ANCHOR_WORLD;
+		}
+		if (options->margin > 0.0f && isfinite(options->margin)) {
+			tuning.margin = options->margin;
+		}
+	}
+
 	float content = 0.0f;
 	bool has_content;
 	// Spec v2: the source struct is looked up ONLY here, behind the hint -
@@ -2417,12 +2433,17 @@ oxr_session_fill_cursor_depth(struct oxr_session *sess,
 		has_content = hint->hasContent && u_cursor_depth_point_disparity(&g, &nearest, &content);
 	}
 	const float target = u_cursor_depth_target(&tuning, has_content, content);
-	const float disparity = u_cursor_depth_filter_step(&sess->cursor_depth_filter, &tuning, target,
-	                                                   (uint64_t)viewLocateInfo->displayTime);
+	const uint64_t now_ns = (uint64_t)viewLocateInfo->displayTime;
+	const bool reprimed = u_cursor_depth_filter_will_prime(&sess->cursor_depth_filter, &tuning, now_ns);
+	if (reprimed) {
+		sess->cursor_depth_anchor.has_anchor = false;
+	}
+	const float disparity = u_cursor_depth_filter_step(&sess->cursor_depth_filter, &tuning, target, now_ns);
 
 	struct xrt_vec3 position;
 	float height;
-	u_cursor_depth_place(&g, disparity, hint->cursorHeight, &position, &height);
+	u_cursor_depth_place_anchored(&g, disparity, hint->cursorHeight, anchor_mode, &sess->cursor_depth_anchor,
+	                              hint->cursorUV.x, hint->cursorUV.y, reprimed, now_ns, &position, &height);
 
 	out->isActive = XR_TRUE;
 	out->pose.orientation = (XrQuaternionf){g.orientation.x, g.orientation.y, g.orientation.z, g.orientation.w};

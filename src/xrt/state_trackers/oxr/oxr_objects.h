@@ -2980,6 +2980,10 @@ struct oxr_session
 	//! only by a locate that chains an XrCursorDepthHintDXR - a session that
 	//! never sends a hint never steps it.
 	struct u_cursor_depth_filter cursor_depth_filter;
+	//! XR_DXR_cursor_depth v3: HYBRID anchor state, beside the filter and
+	//! under the same rule (only a hinted locate touches it). Dropped
+	//! whenever the filter re-primes.
+	struct u_cursor_depth_anchor cursor_depth_anchor;
 
 	/*!
 	 * XR_DXR_cursor_depth v2, depth-layer source (ADR-046 Phase 3a).
