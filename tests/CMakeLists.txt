@@ -88,6 +88,8 @@ endif()
 # exists; everything it drives is the exact function pointer providers get.
 if(TARGET target_lists)
 	list(APPEND tests tests_input_host_geometry)
+	# Multi-screen M1 -- target_screens_build: registry -> per-screen list.
+	list(APPEND tests tests_target_screens)
 endif()
 # Multi-screen M0 (#69) -- where a plug-in without probe_displays gets its
 # synthesized display claim (its panel's monitor, not the primary). Pure
@@ -326,6 +328,10 @@ target_compile_definitions(
 target_compile_definitions(
 	tests_comp_color_policy PRIVATE "DXR_COMP_SRC_DIR=\"${PROJECT_SOURCE_DIR}/src/xrt/compositor\""
 	)
+
+if(TARGET tests_target_screens)
+	target_link_libraries(tests_target_screens PRIVATE target_lists xrt-interfaces aux_os)
+endif()
 
 if(TARGET tests_input_host_geometry)
 	target_link_libraries(tests_input_host_geometry PRIVATE target_lists xrt-interfaces)
