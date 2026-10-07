@@ -601,6 +601,12 @@ struct comp_vk_native_compositor
 	//! Display refresh rate in Hz.
 	float display_refresh_rate;
 
+	//! #1264 S1: a repaint ("fill") is parked in vkWaitForFences with
+	//! c->mutex RELEASED, its command buffer still executing. Set and cleared
+	//! under c->mutex. Anything that frees an object a weave references must
+	//! check it (multi-screen M2: the segment manager defers its releases).
+	bool fill_parked;
+
 	//! Last present origin handed to the DP (panel-relative px) — an origin
 	//! change means the window is being dragged; the target clamps its queue
 	//! shallow for the duration so the weave phase stays snapped (#912).
@@ -712,6 +718,9 @@ struct comp_vk_native_compositor
 	uint64_t seg_pinned_display_id;
 	struct comp_seg_rect seg_window;
 	bool have_seg_window;
+	//! set_screens() handed over a new list; the manager is rebuilt on the
+	//! next weave with no fill in flight.
+	bool seg_rebuild;
 #endif
 
 #ifdef XRT_OS_ANDROID
@@ -5188,6 +5197,15 @@ vk_segments_frame_update(struct comp_vk_native_compositor *c,
 		return false;
 	}
 #endif
+	// A new screen list (set_screens) rebuilds the manager — but never under
+	// a parked fill, whose command buffer may still use its DPs and images.
+	if (c->seg_rebuild && !c->fill_parked) {
+		comp_vk_native_segments_destroy(&c->segments);
+		c->seg_rebuild = false;
+	}
+	if (c->segments != NULL && c->seg_rebuild) {
+		return false; // old manager, new list: sit this frame out
+	}
 	if (c->segments == NULL) {
 		c->segments = comp_vk_native_segments_create(&c->vk, c->cmd_pool, c->repaint_queue);
 		if (c->segments == NULL) {
@@ -5207,7 +5225,7 @@ vk_segments_frame_update(struct comp_vk_native_compositor *c,
 	    (uint32_t)(dp_canvas->extent.h > 0 ? dp_canvas->extent.h : 0),
 	};
 	return comp_vk_native_segments_update(c->segments, &c->seg_window, &canvas,
-	                                      (int32_t)VK_FORMAT_B8G8R8A8_UNORM);
+	                                      (int32_t)VK_FORMAT_B8G8R8A8_UNORM, !c->fill_parked);
 }
 #endif
 
@@ -6403,6 +6421,7 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 #ifdef XRT_OS_LINUX_DESKTOP
 				struct comp_vk_native_segments_frame sf = {
 				    .cmd = cmd,
+				    .is_repaint = is_repaint,
 				    .src_image = (VkImage)(uintptr_t)src_image_u64,
 				    .src_format = (VkFormat)view_format,
 				    .view_width = view_width,
@@ -6846,10 +6865,12 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 					const uint32_t gen_park =
 					    comp_vk_native_target_get_generation(c->target);
 					const uint64_t serial_park = c->present_serial;
+					c->fill_parked = true;
 					os_mutex_unlock(&c->mutex);
 					vk->vkWaitForFences(vk->device, 1, fence_p, VK_TRUE, UINT64_MAX);
 					vk->vkResetFences(vk->device, 1, fence_p);
 					os_mutex_lock(&c->mutex);
+					c->fill_parked = false;
 					// GPU is done — the command buffer is free regardless of
 					// what the validation below decides.
 					vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
@@ -12274,8 +12295,9 @@ comp_vk_native_compositor_set_screens(struct xrt_compositor *xc,
 		return;
 	}
 	os_mutex_lock(&c->mutex);
-	// The segment manager is (re)built lazily on the next weave from this list.
-	comp_vk_native_segments_destroy(&c->segments);
+	// The segment manager is rebuilt on the next weave with no fill in flight
+	// (destroying it here could free DPs a parked fill is still executing).
+	c->seg_rebuild = true;
 	free(c->seg_screens);
 	c->seg_screens = copy;
 	c->seg_pinned_display_id = pinned_display_id;

@@ -56,8 +56,9 @@ struct comp_vk_native_segments *
 comp_vk_native_segments_create(struct vk_bundle *vk, VkCommandPool cmd_pool, VkQueue dp_queue);
 
 /*!
- * Tear down every segment DP and image. The caller guarantees no submitted
- * work still references them (the compositor waits each frame's fence).
+ * Tear down every segment DP and image (including everything still on the
+ * retire list). The caller guarantees no submitted work still references them:
+ * the repaint thread is stopped and every fence waited.
  */
 void
 comp_vk_native_segments_destroy(struct comp_vk_native_segments **segs_ptr);
@@ -92,6 +93,10 @@ comp_vk_native_segments_enabled(const struct comp_vk_native_segments *segs);
  * @param window_desktop  The window's client area in desktop coordinates.
  * @param canvas          The canvas in window px (`vk_dp_canvas_rect`).
  * @param target_format   Swapchain format, for segment DP creation.
+ * @param release_safe    No repaint ("fill") is parked with its command buffer
+ *                        in flight (#1264 S1 fence-park). Only then are retired
+ *                        DPs / images handed back to Vulkan; otherwise they
+ *                        wait on the retire list.
  * @return true when this frame must take the split path
  *         (@ref comp_vk_native_segments_record); false = the single-DP path.
  */
@@ -99,7 +104,8 @@ bool
 comp_vk_native_segments_update(struct comp_vk_native_segments *segs,
                                const struct comp_seg_rect *window_desktop,
                                const struct comp_seg_rect *canvas,
-                               int32_t target_format);
+                               int32_t target_format,
+                               bool release_safe);
 
 /*!
  * Everything the split path needs about this frame.
@@ -107,6 +113,11 @@ comp_vk_native_segments_update(struct comp_vk_native_segments *segs,
 struct comp_vk_native_segments_frame
 {
 	VkCommandBuffer cmd;
+
+	//! A repaint replay (#868) rather than an app frame: selects the frame
+	//! class's own DP input images, so an app frame never writes what an
+	//! in-flight fill reads.
+	bool is_repaint;
 
 	//! The DP's input this frame (atlas cropped to content), SHADER_READ_ONLY_OPTIMAL.
 	VkImage src_image;

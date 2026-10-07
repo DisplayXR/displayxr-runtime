@@ -448,3 +448,45 @@ comp_segments_lifecycle_drain(struct comp_segments_lifecycle *lc, struct comp_se
 		memset(s, 0, sizeof(*s));
 	}
 }
+
+
+/*
+ *
+ * Deferred release.
+ *
+ */
+
+bool
+comp_segments_retire_push(struct comp_segments_retire *r, uint32_t kind, uint64_t item)
+{
+	if (r == NULL || r->count >= COMP_SEGMENTS_RETIRE_MAX) {
+		return false;
+	}
+	r->kinds[r->count] = kind;
+	r->items[r->count] = item;
+	r->count++;
+	return true;
+}
+
+uint32_t
+comp_segments_retire_take(struct comp_segments_retire *r,
+                          bool safe,
+                          uint32_t *out_kinds,
+                          uint64_t *out_items,
+                          uint32_t cap)
+{
+	if (r == NULL || !safe || out_kinds == NULL || out_items == NULL || cap == 0) {
+		return 0;
+	}
+	const uint32_t n = r->count < cap ? r->count : cap;
+	for (uint32_t i = 0; i < n; i++) {
+		out_kinds[i] = r->kinds[i];
+		out_items[i] = r->items[i];
+	}
+	for (uint32_t i = n; i < r->count; i++) {
+		r->kinds[i - n] = r->kinds[i];
+		r->items[i - n] = r->items[i];
+	}
+	r->count -= n;
+	return n;
+}

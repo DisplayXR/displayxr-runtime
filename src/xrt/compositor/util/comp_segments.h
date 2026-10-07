@@ -329,6 +329,53 @@ comp_segments_lifecycle_is_live(const struct comp_segments_lifecycle *lc, uint64
 void
 comp_segments_lifecycle_drain(struct comp_segments_lifecycle *lc, struct comp_segments_actions *out);
 
+
+
+/*
+ *
+ * Deferred release.
+ *
+ */
+
+//! Capacity of a @ref comp_segments_retire list.
+#define COMP_SEGMENTS_RETIRE_MAX 64
+
+/*!
+ * Objects a segment no longer needs, held until no submitted work can still
+ * reference them. The in-process Vulkan compositor's repaint ("fill") parks on
+ * its fence with the compositor lock RELEASED (#1264 S1), so the app thread can
+ * run a metric update — and want to destroy a segment DP or an input image —
+ * while that fill's command buffer is still executing on the GPU. Releases go
+ * here instead and are handed back only when the caller says it is safe.
+ *
+ * Items are opaque 64-bit handles with a caller-defined kind.
+ */
+struct comp_segments_retire
+{
+	uint32_t count;
+	uint32_t kinds[COMP_SEGMENTS_RETIRE_MAX];
+	uint64_t items[COMP_SEGMENTS_RETIRE_MAX];
+};
+
+/*!
+ * Queue @p item. False when the list is full (the caller must then either
+ * release now, if that is safe, or keep the object).
+ */
+bool
+comp_segments_retire_push(struct comp_segments_retire *r, uint32_t kind, uint64_t item);
+
+/*!
+ * Hand back everything queued, oldest first, and empty the list — but only when
+ * @p safe; otherwise nothing moves and 0 is returned. At most @p cap items are
+ * returned per call (the rest stay queued).
+ */
+uint32_t
+comp_segments_retire_take(struct comp_segments_retire *r,
+                          bool safe,
+                          uint32_t *out_kinds,
+                          uint64_t *out_items,
+                          uint32_t cap);
+
 #ifdef __cplusplus
 }
 #endif

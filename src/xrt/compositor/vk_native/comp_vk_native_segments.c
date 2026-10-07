@@ -18,6 +18,7 @@
 #include "util/u_logging.h"
 #include "util/u_misc.h"
 
+#include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +30,34 @@
  *
  */
 
+//! One cropped DP input image.
+struct seg_crop
+{
+	VkImage image;
+	VkDeviceMemory memory;
+	VkImageView view;
+	uint32_t w;
+	uint32_t h;
+	VkFormat format;
+};
+
+//! Which frame class records into a crop image (see seg_screen_state::crop).
+enum seg_frame_class
+{
+	SEG_CLASS_APP = 0,
+	SEG_CLASS_REPAINT = 1,
+	SEG_CLASS_COUNT = 2,
+};
+
+//! What a retired handle is (comp_segments_retire kinds).
+enum seg_retire_kind
+{
+	SEG_RETIRE_DP = 1,
+	SEG_RETIRE_VIEW = 2,
+	SEG_RETIRE_IMAGE = 3,
+	SEG_RETIRE_MEMORY = 4,
+};
+
 //! Per-screen state: the screen's segment DP (NULL for the primary screen,
 //! whose DP the session owns) and the cropped DP input for its segment.
 struct seg_screen_state
@@ -38,12 +67,16 @@ struct seg_screen_state
 	//! The per-session one-time DP setup (encoding, transparency) is done.
 	bool configured;
 
-	VkImage crop_image;
-	VkDeviceMemory crop_memory;
-	VkImageView crop_view;
-	uint32_t crop_w;
-	uint32_t crop_h;
-	VkFormat crop_format;
+	/*!
+	 * One DP input image PER FRAME CLASS. The repaint ("fill") parks on its
+	 * fence with the compositor lock released (#1264 S1), so an app frame can
+	 * record while the fill's command buffer is still executing: sharing one
+	 * image would let the app's copy overwrite what the in-flight fill samples
+	 * (and a resize would destroy it). Each class only ever touches its own,
+	 * and each class waits its own previous submission before recording, so a
+	 * class may recreate its own image immediately.
+	 */
+	struct seg_crop crop[SEG_CLASS_COUNT];
 };
 
 //! What the last split frame did with one segment (atlas capture).
@@ -81,6 +114,14 @@ struct comp_vk_native_segments
 
 	struct seg_capture cap[COMP_SEGMENTS_MAX];
 	uint32_t cap_count;
+
+	//! Releases that must wait until no fill is in flight (see
+	//! comp_segments_retire). Drained by update() when the caller says it is
+	//! safe, and by destroy.
+	struct comp_segments_retire retire;
+	//! True only inside an update() the caller declared release-safe, and in
+	//! destroy — the debug assert in release_now() checks it.
+	bool release_safe;
 };
 
 
@@ -101,23 +142,90 @@ screen_index_of(const struct comp_vk_native_segments *segs, uint64_t id)
 	return -1;
 }
 
+/*!
+ * Destroy one handle NOW. Only legal when no submitted work can reference it:
+ * a fill parked with the lock released may still be executing a command buffer
+ * that does.
+ */
 static void
-crop_release(struct vk_bundle *vk, struct seg_screen_state *st)
+release_now(struct comp_vk_native_segments *segs, uint32_t kind, uint64_t item)
 {
-	if (st->crop_view != VK_NULL_HANDLE) {
-		vk->vkDestroyImageView(vk->device, st->crop_view, NULL);
-		st->crop_view = VK_NULL_HANDLE;
+	assert(segs->release_safe && "segments: release while a fill may be in flight");
+	struct vk_bundle *vk = segs->vk;
+	switch (kind) {
+	case SEG_RETIRE_DP: {
+		struct xrt_display_processor *dp = (struct xrt_display_processor *)(uintptr_t)item;
+		xrt_display_processor_destroy(&dp);
+		break;
 	}
-	if (st->crop_image != VK_NULL_HANDLE) {
-		vk->vkDestroyImage(vk->device, st->crop_image, NULL);
-		st->crop_image = VK_NULL_HANDLE;
+	case SEG_RETIRE_VIEW: vk->vkDestroyImageView(vk->device, (VkImageView)(uintptr_t)item, NULL); break;
+	case SEG_RETIRE_IMAGE: vk->vkDestroyImage(vk->device, (VkImage)(uintptr_t)item, NULL); break;
+	case SEG_RETIRE_MEMORY: vk->vkFreeMemory(vk->device, (VkDeviceMemory)(uintptr_t)item, NULL); break;
+	default: break;
 	}
-	if (st->crop_memory != VK_NULL_HANDLE) {
-		vk->vkFreeMemory(vk->device, st->crop_memory, NULL);
-		st->crop_memory = VK_NULL_HANDLE;
+}
+
+/*!
+ * Release @p item, deferred onto the retire list. A full list (a pathological
+ * pile-up while a fill stays parked) leaks the handle with one WARN rather than
+ * free something the GPU may still read.
+ */
+static void
+release_deferred(struct comp_vk_native_segments *segs, uint32_t kind, uint64_t item)
+{
+	if (item == 0) {
+		return;
 	}
-	st->crop_w = 0;
-	st->crop_h = 0;
+	if (!comp_segments_retire_push(&segs->retire, kind, item)) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			U_LOG_W("segments: retire list full — leaking a released object rather than freeing it under "
+			        "an in-flight fill");
+		}
+	}
+}
+
+//! Hand everything retired back to Vulkan, if @p safe.
+static void
+retire_drain(struct comp_vk_native_segments *segs, bool safe)
+{
+	uint32_t kinds[COMP_SEGMENTS_RETIRE_MAX];
+	uint64_t items[COMP_SEGMENTS_RETIRE_MAX];
+	const uint32_t n = comp_segments_retire_take(&segs->retire, safe, kinds, items, COMP_SEGMENTS_RETIRE_MAX);
+	for (uint32_t i = 0; i < n; i++) {
+		release_now(segs, kinds[i], items[i]);
+	}
+}
+
+//! Retire a crop image (deferred: another frame class may still read it).
+static void
+crop_retire(struct comp_vk_native_segments *segs, struct seg_crop *c)
+{
+	release_deferred(segs, SEG_RETIRE_VIEW, (uint64_t)(uintptr_t)c->view);
+	release_deferred(segs, SEG_RETIRE_IMAGE, (uint64_t)(uintptr_t)c->image);
+	release_deferred(segs, SEG_RETIRE_MEMORY, (uint64_t)(uintptr_t)c->memory);
+	memset(c, 0, sizeof(*c));
+}
+
+/*!
+ * Destroy a crop image immediately. Only for the recording class's OWN image:
+ * that class waited its previous submission before this frame, and no other
+ * class ever touches it.
+ */
+static void
+crop_destroy_own(struct vk_bundle *vk, struct seg_crop *c)
+{
+	if (c->view != VK_NULL_HANDLE) {
+		vk->vkDestroyImageView(vk->device, c->view, NULL);
+	}
+	if (c->image != VK_NULL_HANDLE) {
+		vk->vkDestroyImage(vk->device, c->image, NULL);
+	}
+	if (c->memory != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, c->memory, NULL);
+	}
+	memset(c, 0, sizeof(*c));
 }
 
 /*!
@@ -126,12 +234,12 @@ crop_release(struct vk_bundle *vk, struct seg_screen_state *st)
  * segment's tile grid (the same reason the single-DP path crops, ADR-030).
  */
 static bool
-crop_ensure(struct vk_bundle *vk, struct seg_screen_state *st, uint32_t w, uint32_t h, VkFormat format)
+crop_ensure(struct vk_bundle *vk, struct seg_crop *c, uint32_t w, uint32_t h, VkFormat format)
 {
-	if (st->crop_image != VK_NULL_HANDLE && st->crop_w == w && st->crop_h == h && st->crop_format == format) {
+	if (c->image != VK_NULL_HANDLE && c->w == w && c->h == h && c->format == format) {
 		return true;
 	}
-	crop_release(vk, st);
+	crop_destroy_own(vk, c);
 
 	VkImageCreateInfo ici = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -148,13 +256,13 @@ crop_ensure(struct vk_bundle *vk, struct seg_screen_state *st, uint32_t w, uint3
 	    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
 	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
 	};
-	if (vk->vkCreateImage(vk->device, &ici, NULL, &st->crop_image) != VK_SUCCESS) {
-		st->crop_image = VK_NULL_HANDLE;
+	if (vk->vkCreateImage(vk->device, &ici, NULL, &c->image) != VK_SUCCESS) {
+		c->image = VK_NULL_HANDLE;
 		return false;
 	}
 
 	VkMemoryRequirements req;
-	vk->vkGetImageMemoryRequirements(vk->device, st->crop_image, &req);
+	vk->vkGetImageMemoryRequirements(vk->device, c->image, &req);
 	VkPhysicalDeviceMemoryProperties props;
 	vk->vkGetPhysicalDeviceMemoryProperties(vk->physical_device, &props);
 	uint32_t type = UINT32_MAX;
@@ -166,7 +274,7 @@ crop_ensure(struct vk_bundle *vk, struct seg_screen_state *st, uint32_t w, uint3
 		}
 	}
 	if (type == UINT32_MAX) {
-		crop_release(vk, st);
+		crop_destroy_own(vk, c);
 		return false;
 	}
 	VkMemoryAllocateInfo mai = {
@@ -174,26 +282,26 @@ crop_ensure(struct vk_bundle *vk, struct seg_screen_state *st, uint32_t w, uint3
 	    .allocationSize = req.size,
 	    .memoryTypeIndex = type,
 	};
-	if (vk->vkAllocateMemory(vk->device, &mai, NULL, &st->crop_memory) != VK_SUCCESS ||
-	    vk->vkBindImageMemory(vk->device, st->crop_image, st->crop_memory, 0) != VK_SUCCESS) {
-		crop_release(vk, st);
+	if (vk->vkAllocateMemory(vk->device, &mai, NULL, &c->memory) != VK_SUCCESS ||
+	    vk->vkBindImageMemory(vk->device, c->image, c->memory, 0) != VK_SUCCESS) {
+		crop_destroy_own(vk, c);
 		return false;
 	}
 
 	VkImageViewCreateInfo vci = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-	    .image = st->crop_image,
+	    .image = c->image,
 	    .viewType = VK_IMAGE_VIEW_TYPE_2D,
 	    .format = format,
 	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
 	};
-	if (vk->vkCreateImageView(vk->device, &vci, NULL, &st->crop_view) != VK_SUCCESS) {
-		crop_release(vk, st);
+	if (vk->vkCreateImageView(vk->device, &vci, NULL, &c->view) != VK_SUCCESS) {
+		crop_destroy_own(vk, c);
 		return false;
 	}
-	st->crop_w = w;
-	st->crop_h = h;
-	st->crop_format = format;
+	c->w = w;
+	c->h = h;
+	c->format = format;
 	return true;
 }
 
@@ -202,13 +310,16 @@ dp_release(struct comp_vk_native_segments *segs, uint32_t i)
 {
 	struct seg_screen_state *st = &segs->st[i];
 	if (st->dp != NULL) {
-		U_LOG_I("segments: destroying the segment DP for screen 0x%016llx ('%s')",
+		U_LOG_I("segments: retiring the segment DP for screen 0x%016llx ('%s')",
 		        (unsigned long long)segs->screens[i].id, segs->bindings[i].device_name);
-		xrt_display_processor_destroy(&st->dp);
+		release_deferred(segs, SEG_RETIRE_DP, (uint64_t)(uintptr_t)st->dp);
+		st->dp = NULL;
 	}
 	st->configured = false;
 	st->tolerates_resample = false;
-	crop_release(segs->vk, st);
+	for (uint32_t k = 0; k < SEG_CLASS_COUNT; k++) {
+		crop_retire(segs, &st->crop[k]);
+	}
 }
 
 /*!
@@ -373,6 +484,10 @@ comp_vk_native_segments_destroy(struct comp_vk_native_segments **segs_ptr)
 	for (uint32_t i = 0; i < COMP_SEGMENTS_MAX_SCREENS; i++) {
 		dp_release(segs, i);
 	}
+	// The caller guarantees nothing in flight (see the header).
+	segs->release_safe = true;
+	retire_drain(segs, true);
+	segs->release_safe = false;
 	free(segs);
 	*segs_ptr = NULL;
 }
@@ -524,9 +639,17 @@ bool
 comp_vk_native_segments_update(struct comp_vk_native_segments *segs,
                                const struct comp_seg_rect *window_desktop,
                                const struct comp_seg_rect *canvas,
-                               int32_t target_format)
+                               int32_t target_format,
+                               bool release_safe)
 {
-	if (segs == NULL || !segs->enabled || window_desktop == NULL) {
+	if (segs == NULL) {
+		return false;
+	}
+	// Retired DPs / images go back to Vulkan only when no fill is in flight.
+	segs->release_safe = release_safe;
+	retire_drain(segs, release_safe);
+	segs->release_safe = false;
+	if (!segs->enabled || window_desktop == NULL) {
 		return false;
 	}
 
@@ -591,6 +714,7 @@ comp_vk_native_segments_record(struct comp_vk_native_segments *segs,
 	struct vk_bundle *vk = segs->vk;
 	VkCommandBuffer cmd = f->cmd;
 	const struct comp_segment_table *t = &segs->table;
+	const uint32_t cls = f->is_repaint ? SEG_CLASS_REPAINT : SEG_CLASS_APP;
 
 	/*
 	 * 1. Decide each segment: which DP (if any) and whether it may weave.
@@ -656,11 +780,12 @@ comp_vk_native_segments_record(struct comp_vk_native_segments *segs,
 		struct seg_screen_state *st = st_of[k];
 		const uint32_t cw = tw[k] * f->tile_columns;
 		const uint32_t ch = th[k] * f->tile_rows;
-		if (!crop_ensure(vk, st, cw, ch, f->src_format)) {
+		struct seg_crop *crop = &st->crop[cls];
+		if (!crop_ensure(vk, crop, cw, ch, f->src_format)) {
 			weave[k] = false; // no input image: flat 2D instead
 			continue;
 		}
-		image_barrier(vk, cmd, st->crop_image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+		image_barrier(vk, cmd, crop->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
 		              VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
 		              VK_PIPELINE_STAGE_TRANSFER_BIT);
 		VkImageCopy regions[XRT_MAX_VIEWS];
@@ -677,9 +802,9 @@ comp_vk_native_segments_record(struct comp_vk_native_segments *segs,
 				};
 			}
 		}
-		vk->vkCmdCopyImage(cmd, f->src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, st->crop_image,
+		vk->vkCmdCopyImage(cmd, f->src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, crop->image,
 		                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, rc, regions);
-		image_barrier(vk, cmd, st->crop_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		image_barrier(vk, cmd, crop->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 		              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
 		              VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
 		              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
@@ -730,7 +855,7 @@ comp_vk_native_segments_record(struct comp_vk_native_segments *segs,
 				xrt_display_processor_set_target_color_view(dp, f->target_view);
 			}
 			xrt_display_processor_process_atlas(
-			    dp, cmd, (VkImage_XDP)st->crop_image, st->crop_view, tw[k], th[k], f->tile_columns,
+			    dp, cmd, (VkImage_XDP)st->crop[cls].image, st->crop[cls].view, tw[k], th[k], f->tile_columns,
 			    f->tile_rows, (VkFormat_XDP)f->src_format, f->target_fb, (VkImage_XDP)f->target_image,
 			    f->target_width, f->target_height, (VkFormat_XDP)f->target_format, g->window_rect.x,
 			    g->window_rect.y, g->window_rect.w, g->window_rect.h);
@@ -826,7 +951,8 @@ comp_vk_native_segments_get_capture(const struct comp_vk_native_segments *segs,
 		return false;
 	}
 	const struct seg_screen_state *st = &segs->st[c->screen_index];
-	*out_image = c->woven ? st->crop_image : VK_NULL_HANDLE;
+	// The capture fires on app frames: the app class's image.
+	*out_image = c->woven ? st->crop[SEG_CLASS_APP].image : VK_NULL_HANDLE;
 	*out_w = c->w;
 	*out_h = c->h;
 	*out_screen_id = segs->screens[c->screen_index].id;
