@@ -270,6 +270,11 @@ Slot and tag reservations (97/98, Win 106/107, tags 22/23/24/25) were approved b
 8. Who owns per-screen eye-tracking **mode** requests (`xrRequestEyeTrackingModeDXR`) when
    screens differ — proposal: the request carries an optional displayId; no id = all.
 
+**Decided 2026-10-07 (David):** an untracked screen renders from its **own nominal viewer**; the
+tracked screen's eyes are never translated onto it, because the relative pose between an untracked
+and a tracked screen is not knowable (no shared frame, ADR-047). The visible seam discontinuity in
+that configuration is accepted; it disappears when every screen is tracked.
+
 ## 7. Issue mapping
 
 - #69 becomes the epic for M0–M6; #546 (ADR-015 3b) is **re-scoped** to M2 (segments) and
