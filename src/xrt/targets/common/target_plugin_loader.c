@@ -3846,9 +3846,10 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 	target_screen_pin_parse(getenv("DXR_SCREEN_PLUGIN"), &pins, &pins_malformed);
 	bool pin_used[TARGET_SCREEN_PIN_MAX] = {false};
 	if (pins_malformed > 0) {
-		U_LOG_W("plugin loader: DXR_SCREEN_PLUGIN has %u malformed entr%s (expected "
-		        "<output|connector|monitor-id-hex>=<plugin-id>[,...]) — ignored",
-		        pins_malformed, pins_malformed == 1 ? "y" : "ies");
+		U_LOG_W(
+		    "plugin loader: DXR_SCREEN_PLUGIN has %u malformed entr%s (expected "
+		    "<output|connector|monitor-id-hex>=<plugin-id>[,...]) — ignored",
+		    pins_malformed, pins_malformed == 1 ? "y" : "ies");
 	}
 
 	/*
@@ -3902,12 +3903,13 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 
 		enum target_screen_pick_reason reason = TARGET_SCREEN_PICK_NONE;
 		bool pin_unclaimed = false;
-		const int pick =
-		    target_screen_pick(cands, nc, pin_plugin, have_preferred ? preferred_id : NULL, &reason, &pin_unclaimed);
+		const int pick = target_screen_pick(cands, nc, pin_plugin, have_preferred ? preferred_id : NULL,
+		                                    &reason, &pin_unclaimed);
 		if (pin_unclaimed) {
-			U_LOG_W("plugin loader: DXR_SCREEN_PLUGIN pins monitor 0x%016llx ('%s'/'%s') to '%s', which has no "
-			        "claim on it — the pin is ignored for this monitor",
-			        (unsigned long long)desc->monitor_id, out_name, conn_name, pin_plugin);
+			U_LOG_W(
+			    "plugin loader: DXR_SCREEN_PLUGIN pins monitor 0x%016llx ('%s'/'%s') to '%s', which has no "
+			    "claim on it — the pin is ignored for this monitor",
+			    (unsigned long long)desc->monitor_id, out_name, conn_name, pin_plugin);
 		}
 		if (pick >= 0) {
 			best_src = cand_src[pick];
@@ -3923,14 +3925,16 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 		}
 
 		if (reason == TARGET_SCREEN_PICK_PIN) {
-			U_LOG_I("plugin loader: monitor 0x%016llx ('%s'/'%s') → '%s' by DXR_SCREEN_PLUGIN (confidence=%u; "
-			        "outranks PreferredPlugin and the active plug-in for this monitor)",
-			        (unsigned long long)desc->monitor_id, out_name, conn_name, cands[pick].plugin_id,
-			        cands[pick].confidence);
+			U_LOG_I(
+			    "plugin loader: monitor 0x%016llx ('%s'/'%s') → '%s' by DXR_SCREEN_PLUGIN (confidence=%u; "
+			    "outranks PreferredPlugin and the active plug-in for this monitor)",
+			    (unsigned long long)desc->monitor_id, out_name, conn_name, cands[pick].plugin_id,
+			    cands[pick].confidence);
 		} else if (reason == TARGET_SCREEN_PICK_PREFERRED) {
-			U_LOG_W("plugin loader: monitor 0x%016llx → PreferredPlugin override '%s' "
-			        "(forced over EDID confidence)",
-			        (unsigned long long)desc->monitor_id, preferred_id);
+			U_LOG_W(
+			    "plugin loader: monitor 0x%016llx → PreferredPlugin override '%s' "
+			    "(forced over EDID confidence)",
+			    (unsigned long long)desc->monitor_id, preferred_id);
 		} else if (reason == TARGET_SCREEN_PICK_ACTIVE && conf_pick >= 0 && conf_pick != pick) {
 			// One-off per monitor, and only when the override changes the outcome.
 			U_LOG_W(
@@ -3950,17 +3954,19 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 		        (unsigned long long)e->monitor_id, e->plugin_id, e->confidence);
 		if (reason == TARGET_SCREEN_PICK_PIN && e->dp_factory_vk == NULL && e->dp_factory_gl == NULL &&
 		    e->dp_factory_d3d11 == NULL && e->dp_factory_d3d12 == NULL && e->dp_factory_metal == NULL) {
-			U_LOG_W("plugin loader: DXR_SCREEN_PLUGIN pinned monitor 0x%016llx to '%s', but it offers no "
-			        "display-processor factory for it — that screen will not be woven",
-			        (unsigned long long)e->monitor_id, e->plugin_id);
+			U_LOG_W(
+			    "plugin loader: DXR_SCREEN_PLUGIN pinned monitor 0x%016llx to '%s', but it offers no "
+			    "display-processor factory for it — that screen will not be woven",
+			    (unsigned long long)e->monitor_id, e->plugin_id);
 		}
 	}
 
 	for (uint32_t i = 0; i < pins.count; i++) {
 		if (!pin_used[i]) {
-			U_LOG_W("plugin loader: DXR_SCREEN_PLUGIN entry '%s=%s' names no known monitor (match an output "
-			        "or connector name, e.g. HDMI-1 / HDMI-A-1, or a monitor id in hex)",
-			        pins.pin[i].match, pins.pin[i].plugin_id);
+			U_LOG_W(
+			    "plugin loader: DXR_SCREEN_PLUGIN entry '%s=%s' names no known monitor (match an output "
+			    "or connector name, e.g. HDMI-1 / HDMI-A-1, or a monitor id in hex)",
+			    pins.pin[i].match, pins.pin[i].plugin_id);
 		}
 	}
 

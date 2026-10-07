@@ -379,7 +379,8 @@ routed_view_count(const struct comp_layer *layer, const struct comp_vk_native_ef
 	}
 	// A projection layer is bounded by what it submitted; a quad / equirect2
 	// has one sub-image shown in every routed view.
-	const bool per_view = layer->data.type == XRT_LAYER_PROJECTION || layer->data.type == XRT_LAYER_PROJECTION_DEPTH;
+	const bool per_view =
+	    layer->data.type == XRT_LAYER_PROJECTION || layer->data.type == XRT_LAYER_PROJECTION_DEPTH;
 	if (per_view && n > layer->data.view_count) {
 		n = layer->data.view_count;
 	}
@@ -1906,8 +1907,7 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 				// Visibility, sub-rect blend mode and the packed
 				// ray constants, all per view (#1602).
 				if (!compose_equirect2_view(layer, routed ? route_tile : eye, tile_count, &cams[eye],
-				                            &tiles[routed ? route_tile : eye],
-				                            eq2_constants, &mode)) {
+				                            &tiles[routed ? route_tile : eye], eq2_constants, &mode)) {
 					continue;
 				}
 			} else if (is_zone) {
@@ -1916,7 +1916,8 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 				           ? COMP_LAYER_BLEND_STRAIGHT
 				           : COMP_LAYER_BLEND_PREMULTIPLIED;
 			} else if (is_quad) {
-				mode = comp_layer_subrect_blend_mode(&tiles[routed ? route_tile : eye], layer->data.flags);
+				mode =
+				    comp_layer_subrect_blend_mode(&tiles[routed ? route_tile : eye], layer->data.flags);
 			} else if (routed) {
 				if (!route_mode_set[route_tile]) {
 					route_mode[route_tile] =

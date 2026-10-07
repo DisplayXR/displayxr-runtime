@@ -115,7 +115,7 @@ is_multiview_count(size_t n, uint32_t device_max)
 }
 
 [[maybe_unused]] const bool kSegmentsOff = [] {
-	// Before main(): the runtime reads it at every system fill-in.
+// Before main(): the runtime reads it at every system fill-in.
 #ifdef _WIN32
 	_putenv_s("DXR_SEGMENTS", "0");
 #else
@@ -1033,7 +1033,8 @@ TEST_CASE("XR_DXR_display_info advertises PRIMARY_MULTIVIEW_DXR (#1486)", "[oxr]
 	{
 		// PRIMARY_STEREO means exactly 2, whatever the device can drive.
 		CHECK(rt.config_view_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) == 2);
-		CHECK(is_multiview_count(rt.config_view_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR), device_max));
+		CHECK(is_multiview_count(rt.config_view_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR),
+		                         device_max));
 		// A valid core type the system does NOT advertise is still refused.
 		CHECK(rt.config_view_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MONO) == 0);
 	}
