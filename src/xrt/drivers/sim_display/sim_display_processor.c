@@ -908,8 +908,8 @@ sim_dp_get_predicted_eye_positions(struct xrt_display_processor *xdp, struct xrt
 	float half_ipd = sdp->ipd_m / 2.0f;
 	// A segment DP (multi-screen) reports one eye per view of the atlas it
 	// weaves; the session DP keeps the process-wide sim view count.
-	uint32_t vc = sdp->screen_bound ? (sdp->last_atlas_views > 0 ? sdp->last_atlas_views : 2)
-	                                : sim_display_get_view_count();
+	uint32_t vc =
+	    sdp->screen_bound ? (sdp->last_atlas_views > 0 ? sdp->last_atlas_views : 2) : sim_display_get_view_count();
 
 	if (vc == 1) {
 		out->eyes[0] = (struct xrt_eye_position){sdp->nominal_x_m, sdp->nominal_y_m, sdp->nominal_z_m};

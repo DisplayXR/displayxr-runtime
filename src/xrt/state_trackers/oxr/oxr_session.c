@@ -2864,15 +2864,17 @@ locate_views_one(struct oxr_logger *log,
 		got_eye_positions = seg->have_eyes;
 		if (should_log) {
 			if (seg->have_eyes && seg->eyes.count >= 2) {
-				U_LOG_I("Segment 0x%016llx eyes from its DP (%u, tracking=%d): [0]=(%.4f,%.4f,%.4f) "
-				        "[1]=(%.4f,%.4f,%.4f) (reference frame)",
-				        (unsigned long long)seg->screen_id, seg->eyes.count, (int)seg->eyes.is_tracking,
-				        seg->eyes.eyes[0].x, seg->eyes.eyes[0].y, seg->eyes.eyes[0].z, seg->eyes.eyes[1].x,
-				        seg->eyes.eyes[1].y, seg->eyes.eyes[1].z);
+				U_LOG_I(
+				    "Segment 0x%016llx eyes from its DP (%u, tracking=%d): [0]=(%.4f,%.4f,%.4f) "
+				    "[1]=(%.4f,%.4f,%.4f) (reference frame)",
+				    (unsigned long long)seg->screen_id, seg->eyes.count, (int)seg->eyes.is_tracking,
+				    seg->eyes.eyes[0].x, seg->eyes.eyes[0].y, seg->eyes.eyes[0].z, seg->eyes.eyes[1].x,
+				    seg->eyes.eyes[1].y, seg->eyes.eyes[1].z);
 			} else {
-				U_LOG_I("Segment 0x%016llx eyes: its screen's nominal viewer (no DP eye set covering "
-				        "its views)",
-				        (unsigned long long)seg->screen_id);
+				U_LOG_I(
+				    "Segment 0x%016llx eyes: its screen's nominal viewer (no DP eye set covering "
+				    "its views)",
+				    (unsigned long long)seg->screen_id);
 			}
 		}
 	} else {
@@ -3203,10 +3205,11 @@ locate_views_one(struct oxr_logger *log,
 						snprintf(seg_tag, sizeof(seg_tag), " [segment 0x%016llx]",
 						         (unsigned long long)seg->screen_id);
 					}
-					U_LOG_I("Window-relative Kooima%s: screen=%.4fx%.4fm, "
-					        "eye_offset=(%.4f,%.4f,%.4f)m, rotated=%d",
-					        seg_tag, screen_width_m, screen_height_m, eye_offset_x, eye_offset_y,
-					        eye_offset_z, win_has_orientation);
+					U_LOG_I(
+					    "Window-relative Kooima%s: screen=%.4fx%.4fm, "
+					    "eye_offset=(%.4f,%.4f,%.4f)m, rotated=%d",
+					    seg_tag, screen_width_m, screen_height_m, eye_offset_x, eye_offset_y,
+					    eye_offset_z, win_has_orientation);
 				}
 			} else if (oxr_session_get_display_dimensions(sess, &screen_width_m, &screen_height_m) &&
 			           screen_width_m > 0.0f && screen_height_m > 0.0f) {

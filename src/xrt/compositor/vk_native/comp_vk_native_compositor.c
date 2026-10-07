@@ -5068,10 +5068,11 @@ vk_log_view_dims_on_change(struct comp_vk_native_compositor *c,
 	}
 	memcpy(c->view_dims_logged, now, sizeof(now));
 	if (segments > 0) {
-		U_LOG_W("VIEW_DIMS: canvas %ux%u x mode scale %.3fx%.3f -> tile %ux%u; mosaic: %u segment(s), view 0 "
-		        "submits %ux%u into its segment of the tile (per-segment views, not an upscale)",
-		        now[0], now[1], (double)mode->view_scale_x, (double)mode->view_scale_y, view_w, view_h,
-		        segments, sub_w, sub_h);
+		U_LOG_W(
+		    "VIEW_DIMS: canvas %ux%u x mode scale %.3fx%.3f -> tile %ux%u; mosaic: %u segment(s), view 0 "
+		    "submits %ux%u into its segment of the tile (per-segment views, not an upscale)",
+		    now[0], now[1], (double)mode->view_scale_x, (double)mode->view_scale_y, view_w, view_h, segments,
+		    sub_w, sub_h);
 		return;
 	}
 	const bool upscaled = sub_w > 0 && sub_h > 0 && (sub_w < view_w || sub_h < view_h);

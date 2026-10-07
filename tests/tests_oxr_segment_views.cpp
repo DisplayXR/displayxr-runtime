@@ -301,7 +301,8 @@ TEST_CASE("Quad mode on two segments: every view gets a real frustum", "[oxr][se
 	REQUIRE(oxr_segment_views_nominal_eyes(0.063f, 0.6f, 2, 0.0f, 0.0f, eyes) == 2);
 	CHECK(eyes[0].x == Catch::Approx(-0.0315f));
 	CHECK(eyes[1].x == Catch::Approx(0.0315f));
-	REQUIRE(oxr_segment_views_nominal_eyes(0.063f, 0.6f, 1, 0.0f, 0.0f, eyes) == 2); // mono: the pair, centred later
+	REQUIRE(oxr_segment_views_nominal_eyes(0.063f, 0.6f, 1, 0.0f, 0.0f, eyes) ==
+	        2); // mono: the pair, centred later
 
 	const xrt_segment_metrics m = two_screen_table();
 	oxr_segment_layout l;
@@ -452,8 +453,7 @@ TEST_CASE("mixed vendors: each segment uses its OWN pitch and its OWN DP eye pai
 	CHECK(e1.eyes[0].x == Catch::Approx(-0.032f + dx));
 	CHECK(e1.eyes[0].y == Catch::Approx(dy));
 	// Relative to its own canvas the pair straddles the eye offset by +-32 mm.
-	CHECK((e1.eyes[0].x - wm1.window_center_offset_x_m) + 0.032f ==
-	      Catch::Approx(-l.seg[1].own_cx).margin(1e-5));
+	CHECK((e1.eyes[0].x - wm1.window_center_offset_x_m) + 0.032f == Catch::Approx(-l.seg[1].own_cx).margin(1e-5));
 
 	// A DP that under-reports for the segment's views (one eye for a 2-view
 	// mode: every view from the SAME eye, an anaglyph that looks flat) is not

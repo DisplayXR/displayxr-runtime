@@ -235,8 +235,7 @@ static inline bool
 oxr_segment_views_segment_eyes(
     const struct xrt_segment_metric *s, float dx, float dy, uint32_t views_needed, struct xrt_eye_positions *out)
 {
-	if (s == NULL || out == NULL ||
-	    !oxr_segment_views_accept_eyes(s->have_eyes, s->eyes.valid, s->eyes.count) ||
+	if (s == NULL || out == NULL || !oxr_segment_views_accept_eyes(s->have_eyes, s->eyes.valid, s->eyes.count) ||
 	    s->eyes.count < (views_needed > 0 ? views_needed : 1)) {
 		return false;
 	}
