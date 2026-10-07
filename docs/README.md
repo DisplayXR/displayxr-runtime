@@ -153,6 +153,7 @@ Integrate your 3D display hardware into DisplayXR.
 - [ADR-044](adr/ADR-044-colour-contract-per-backend.md) — The colour contract, per backend and swapchain format
 - [ADR-045](adr/ADR-045-plugins-always-loadable-and-report-platform-state.md) — Plug-ins are always loadable and report their platform state
 - [ADR-046](adr/ADR-046-depth-aware-cursor.md) — Depth-aware cursor — opt-in only; the app knows the depth, the runtime places the cursor
+- [ADR-046](adr/ADR-046-multi-screen-segments-and-per-screen-views.md) — Multi-screen — segments and per-screen views
 <!-- END ADR INDEX -->
 
 ---
