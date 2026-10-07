@@ -64,8 +64,12 @@ struct seg_screen_state
 {
 	struct xrt_display_processor *dp;
 	bool tolerates_resample;
-	//! The per-session one-time DP setup (encoding, transparency) is done.
+	//! The one-time DP setup (no 2D-under backdrop) is done.
 	bool configured;
+	//! Last atlas encoding / transparency declared to @ref dp (-1 = never),
+	//! re-declared on change, like the primary's (#1484, #573).
+	int encoding_latched;
+	int transparent_latched;
 
 	/*!
 	 * One DP input image PER FRAME CLASS. The repaint ("fill") parks on its
@@ -319,6 +323,8 @@ dp_release(struct comp_vk_native_segments *segs, uint32_t i)
 		st->dp = NULL;
 	}
 	st->configured = false;
+	st->encoding_latched = -1;
+	st->transparent_latched = -1;
 	st->tolerates_resample = false;
 	for (uint32_t k = 0; k < SEG_CLASS_COUNT; k++) {
 		crop_retire(segs, &st->crop[k]);
@@ -374,6 +380,8 @@ dp_create(struct comp_vk_native_segments *segs, uint32_t i, int32_t target_forma
 	}
 	st->tolerates_resample = xrt_display_processor_vk_tolerates_resample((struct xrt_display_processor_vk *)st->dp);
 	st->configured = false;
+	st->encoding_latched = -1;
+	st->transparent_latched = -1;
 	// Lifecycle event (hysteresis-gated), not per frame.
 	U_LOG_W("segments: created a segment DP for screen 0x%016llx ('%s', plug-in '%s') via %s — %s",
 	        (unsigned long long)segs->screens[i].id, segs->bindings[i].device_name, segs->screens[i].plugin_id,
@@ -856,10 +864,21 @@ comp_vk_native_segments_record(struct comp_vk_native_segments *segs,
 				struct xrt_display_processor_vk *vdp = (struct xrt_display_processor_vk *)dp;
 				if (!st->configured) {
 					st->configured = true;
-					xrt_display_processor_set_atlas_encoding(dp, XRT_ATLAS_ENCODING_ENCODED);
+					xrt_display_processor_set_background_2d(dp, VK_NULL_HANDLE, 0, 0);
+				}
+				// Same declarations the primary gets, on change only: the
+				// atlas encoding (DXR_VK_ATLAS_ENCODING honoured by the
+				// caller; -1 = do not declare) and the session's
+				// transparency, which can toggle mid-session.
+				if (f->atlas_encoding >= 0 && st->encoding_latched != f->atlas_encoding) {
+					st->encoding_latched = f->atlas_encoding;
+					xrt_display_processor_set_atlas_encoding(dp,
+					                                         (enum xrt_atlas_encoding)f->atlas_encoding);
+				}
+				if (st->transparent_latched != (int)f->transparent_background) {
+					st->transparent_latched = (int)f->transparent_background;
 					xrt_display_processor_vk_set_transparent_background(vdp, f->transparent_background,
 					                                                    false);
-					xrt_display_processor_set_background_2d(dp, VK_NULL_HANDLE, 0, 0);
 				}
 				// Phase only where window px ARE device px; a resampled
 				// screen's origin is in the wrong units (and only a

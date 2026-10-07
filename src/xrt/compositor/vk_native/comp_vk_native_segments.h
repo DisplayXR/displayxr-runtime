@@ -141,8 +141,13 @@ struct comp_vk_native_segments_frame
 	//! The canvas the atlas holds, window px (whole-canvas view dims above).
 	struct comp_seg_rect canvas;
 
-	//! Clear colour alpha for the target outside every segment.
+	//! Clear colour alpha for the target outside every segment; also
+	//! re-declared to segment DPs when it changes.
 	bool transparent_background;
+
+	//! The atlas encoding to declare to segment DPs (`enum
+	//! xrt_atlas_encoding`), or -1 to declare nothing (DXR_VK_ATLAS_ENCODING=off).
+	int atlas_encoding;
 
 	//! The session's primary DP (weaves the primary screen's segment). The
 	//! caller has already fed it this frame's present origin, background,
