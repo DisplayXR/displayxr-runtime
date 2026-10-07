@@ -32,7 +32,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_display_info 1
-#define XR_DXR_display_info_SPEC_VERSION 21
+#define XR_DXR_display_info_SPEC_VERSION 22
 #define XR_DXR_DISPLAY_INFO_EXTENSION_NAME "XR_DXR_display_info"
 
 // Reuse the type value from the deleted XR_EXT_dynamic_render_resolution
@@ -661,6 +661,172 @@ typedef struct XrViewActivityStateDXR {
     void* XR_MAY_ALIAS        next;
     uint32_t                  activeViewCount; //!< Views [0, activeViewCount) are live; the rest are inactive aliases
 } XrViewActivityStateDXR;
+
+// ---- v22: Per-display enumeration, display spaces, session display binding (multi-screen M1) ----
+
+// Type values 1004999214-1004999216 (display_info's 210-219 decade, see
+// README.md). 1004999217 is RESERVED for XrViewDisplayBindingsDXR (per-view
+// display binding chained on XrViewState, multi-screen M3); 218-219 are free.
+#define XR_TYPE_DISPLAY_DXR                       ((XrStructureType)1004999214)
+#define XR_TYPE_DISPLAY_SPACE_CREATE_INFO_DXR     ((XrStructureType)1004999215)
+#define XR_TYPE_SESSION_DISPLAY_BINDING_DXR       ((XrStructureType)1004999216)
+
+//! Size of XrDisplayDXR::vendorPluginId, in bytes, including the NUL.
+#define XR_MAX_DISPLAY_VENDOR_PLUGIN_ID_SIZE_DXR 64
+//! Size of XrDisplayDXR::deviceName, in bytes, including the NUL.
+#define XR_MAX_DISPLAY_NAME_SIZE_DXR 64
+
+/*!
+ * @brief Per-display flags reported in XrDisplayDXR::flags (v22).
+ */
+typedef XrFlags64 XrDisplayFlagsDXR;
+//! The OS desktop's primary monitor.
+static const XrDisplayFlagsDXR XR_DISPLAY_PRIMARY_BIT_DXR = 0x00000001;
+//! The display has live eye tracking (eyeTracking.supportedModes != 0).
+static const XrDisplayFlagsDXR XR_DISPLAY_TRACKED_BIT_DXR = 0x00000002;
+/*!
+ * The SYSTEM DEFAULT display: the one whose information XrDisplayInfoDXR,
+ * XrDisplayDesktopInfoDXR and XrEyeTrackingModeCapabilitiesDXR on
+ * XrSystemProperties report. Exactly one enumerated display carries it.
+ */
+static const XrDisplayFlagsDXR XR_DISPLAY_SYSTEM_DEFAULT_BIT_DXR = 0x00000004;
+
+/*!
+ * @brief One physical display (monitor) the runtime knows about, returned by
+ * xrEnumerateDisplaysDXR (v22).
+ *
+ * The list contains every connected monitor the runtime identified — the 3D
+ * panel(s) a vendor display processor claims AND ordinary monitors served by
+ * the vendor-neutral fallback — so an app can tell which screen is 3D
+ * (TRACKED, a vendor plug-in id) and place itself accordingly.
+ *
+ * @ref info is EMBEDDED BY VALUE (its `type`/`next` are written as
+ * XR_TYPE_DISPLAY_INFO_DXR / NULL by the runtime; the app need not initialise
+ * them), so the struct is one fixed-size record per display. For the
+ * SYSTEM_DEFAULT display, @ref info and @ref eyeTracking carry exactly what
+ * XrSystemProperties reports.
+ *
+ * Coordinate contract for @ref desktopRect: identical to
+ * XrDisplayDesktopInfoDXR::desktopRect (the space the OS places windows in;
+ * Linux/X11: root-window coordinates). An all-zero extent means unknown.
+ */
+typedef struct XrDisplayDXR {
+    XrStructureType                  type;       //!< Must be XR_TYPE_DISPLAY_DXR
+    void* XR_MAY_ALIAS               next;
+    /*!
+     * Opaque, non-zero identifier of this display, stable for the life of the
+     * instance (and, in practice, across processes on the same boot: it is
+     * derived from the monitor's EDID identity and connector). Pass it to
+     * XrDisplaySpaceCreateInfoDXR and XrSessionDisplayBindingDXR.
+     */
+    uint64_t                         displayId;
+    //! Physical size, nominal viewer, recommended view scale and native pixels of THIS display.
+    XrDisplayInfoDXR                 info;
+    //! The monitor's current desktop rect (offset = signed top-left, extent = current mode).
+    XrRect2Di                        desktopRect;
+    //! The connector's device (native) mode; 0 = unknown.
+    uint32_t                         nativePixelWidth;
+    uint32_t                         nativePixelHeight;
+    //! The desktop compositor's scale for this output (e.g. 1.5); 0 = unknown.
+    float                            desktopScale;
+    //! Eye-tracking capabilities of THIS display (`type`/`next` written by the runtime).
+    XrEyeTrackingModeCapabilitiesDXR eyeTracking;
+    //! Bitmask of XR_DISPLAY_*_BIT_DXR.
+    XrDisplayFlagsDXR                flags;
+    //! Discovery id of the vendor plug-in that drives this display (e.g. "leia-sr", "sim-display"), NUL-terminated.
+    char                             vendorPluginId[XR_MAX_DISPLAY_VENDOR_PLUGIN_ID_SIZE_DXR];
+    //! OS output name (Linux/X11: RandR output, e.g. "HDMI-1"; Windows: GDI name), NUL-terminated; "" = unknown.
+    char                             deviceName[XR_MAX_DISPLAY_NAME_SIZE_DXR];
+} XrDisplayDXR;
+
+/*!
+ * @brief Enumerate the system's displays (v22). Standard two-call idiom.
+ *
+ * The list is snapshotted when the call is made; ids are stable for the
+ * instance. Order: the SYSTEM_DEFAULT display first, then the rest in the
+ * runtime's monitor-enumeration order.
+ *
+ * @param instance          A valid XrInstance with XR_DXR_display_info enabled.
+ * @param systemId          The XrSystemId from xrGetSystem.
+ * @param displayCapacityInput Capacity of @p displays, or 0 to query the count.
+ * @param displayCountOutput   Receives the number of displays (or the required capacity).
+ * @param displays          Array of XrDisplayDXR with `type` set to XR_TYPE_DISPLAY_DXR; may be NULL when capacity is 0.
+ * @return XR_SUCCESS, XR_ERROR_SIZE_INSUFFICIENT, XR_ERROR_SYSTEM_INVALID, XR_ERROR_VALIDATION_FAILURE.
+ */
+typedef XrResult (XRAPI_PTR *PFN_xrEnumerateDisplaysDXR)(
+    XrInstance                                  instance,
+    XrSystemId                                  systemId,
+    uint32_t                                    displayCapacityInput,
+    uint32_t*                                   displayCountOutput,
+    XrDisplayDXR*                               displays);
+
+/*!
+ * @brief Create info for a DISPLAY space (v22).
+ *
+ * A DISPLAY space is a reference-space-like XrSpace whose origin is the
+ * centre of @ref displayId's visible area: +X right, +Y up, +Z toward the
+ * viewer (the display space of docs/architecture/kooima-projection.md), with
+ * @ref poseInDisplaySpace applied on top exactly like
+ * XrReferenceSpaceCreateInfo::poseInReferenceSpace.
+ *
+ * Spec v22 limit: every DISPLAY space resolves to the session's single
+ * display plane — the same pose XrViewDisplayRawDXR::displayPlanePose
+ * reports — whichever display it names. Per-display poses (and therefore
+ * meaningful relationships BETWEEN two displays' spaces) arrive with
+ * per-screen DISPLAY poses in a later revision; there is no shared room frame.
+ */
+typedef struct XrDisplaySpaceCreateInfoDXR {
+    XrStructureType             type;       //!< Must be XR_TYPE_DISPLAY_SPACE_CREATE_INFO_DXR
+    const void* XR_MAY_ALIAS    next;
+    uint64_t                    displayId;  //!< An id from xrEnumerateDisplaysDXR
+    XrPosef                     poseInDisplaySpace;
+} XrDisplaySpaceCreateInfoDXR;
+
+/*!
+ * @brief Create a DISPLAY space (v22).
+ * @return XR_SUCCESS, XR_ERROR_VALIDATION_FAILURE (unknown displayId),
+ *         XR_ERROR_POSE_INVALID, XR_ERROR_SESSION_LOST, ...
+ */
+typedef XrResult (XRAPI_PTR *PFN_xrCreateDisplaySpaceDXR)(
+    XrSession                                   session,
+    const XrDisplaySpaceCreateInfoDXR*          createInfo,
+    XrSpace*                                    space);
+
+/*!
+ * @brief Pin a session to one display (v22). Chained on XrSessionCreateInfo.
+ *
+ * @ref displayId 0 means "runtime decides" (identical to not chaining the
+ * struct). Any other value must be an id from xrEnumerateDisplaysDXR, or
+ * xrCreateSession fails with XR_ERROR_VALIDATION_FAILURE.
+ *
+ * Spec v22 effect: the bound display's physical size and nominal viewer
+ * become the session's untracked-Kooima inputs (the display-scoped projection
+ * an app gets before window metrics are known). Which display processor
+ * weaves the session is unchanged — honouring the binding in the compositor
+ * arrives with multi-display segmentation; XrSystemProperties keeps reporting
+ * the SYSTEM_DEFAULT display.
+ *
+ * @extends XrSessionCreateInfo
+ */
+typedef struct XrSessionDisplayBindingDXR {
+    XrStructureType             type;       //!< Must be XR_TYPE_SESSION_DISPLAY_BINDING_DXR
+    const void* XR_MAY_ALIAS    next;
+    uint64_t                    displayId;  //!< 0 = runtime decides
+} XrSessionDisplayBindingDXR;
+
+#ifndef XR_NO_PROTOTYPES
+XRAPI_ATTR XrResult XRAPI_CALL xrEnumerateDisplaysDXR(
+    XrInstance                                  instance,
+    XrSystemId                                  systemId,
+    uint32_t                                    displayCapacityInput,
+    uint32_t*                                   displayCountOutput,
+    XrDisplayDXR*                               displays);
+
+XRAPI_ATTR XrResult XRAPI_CALL xrCreateDisplaySpaceDXR(
+    XrSession                                   session,
+    const XrDisplaySpaceCreateInfoDXR*          createInfo,
+    XrSpace*                                    space);
+#endif
 
 #ifdef __cplusplus
 }

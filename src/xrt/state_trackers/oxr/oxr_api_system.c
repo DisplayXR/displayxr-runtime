@@ -104,6 +104,27 @@ oxr_xrGetSystemProperties(XrInstance instance, XrSystemId systemId, XrSystemProp
 	return ret;
 }
 
+#ifdef OXR_HAVE_DXR_display_info
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrEnumerateDisplaysDXR(XrInstance instance,
+                           XrSystemId systemId,
+                           uint32_t displayCapacityInput,
+                           uint32_t *displayCountOutput,
+                           XrDisplayDXR *displays)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_instance *inst;
+	struct oxr_logger log;
+	OXR_VERIFY_INSTANCE_AND_INIT_LOG(&log, instance, inst, "xrEnumerateDisplaysDXR");
+	OXR_VERIFY_EXTENSION(&log, inst, DXR_display_info);
+	OXR_VERIFY_SYSTEM_AND_GET(&log, inst, systemId, sys);
+	OXR_VERIFY_ARG_NOT_NULL(&log, displayCountOutput);
+
+	return oxr_system_enumerate_displays(&log, sys, displayCapacityInput, displayCountOutput, displays);
+}
+#endif // OXR_HAVE_DXR_display_info
+
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrEnumerateViewConfigurations(XrInstance instance,
                                   XrSystemId systemId,
