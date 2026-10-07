@@ -1139,6 +1139,96 @@ projLayer.viewCount = located;
 `test_apps/common/dxr_view_config.h` carries `DxrAliasInactiveViews()`, a header-only
 implementation of that tail loop, and every in-tree test app uses it.
 
+### Per-display enumeration, DISPLAY spaces and session display binding (v22)
+
+Multi-screen milestone M1 (plan: `docs/roadmap/multi-screen.md`, ADR-047 — PR #1849). A system
+can drive more than one monitor — on a laptop with an external 3D panel the runtime
+already knows both (the per-monitor registry, ADR-015), but until v22 an app could
+only see the one `XrDisplayInfoDXR` describes. v22 adds three things, all
+append-only: no existing struct, value or behaviour changes.
+
+```c
+#define XR_TYPE_DISPLAY_DXR                    ((XrStructureType)1004999214)
+#define XR_TYPE_DISPLAY_SPACE_CREATE_INFO_DXR  ((XrStructureType)1004999215)
+#define XR_TYPE_SESSION_DISPLAY_BINDING_DXR    ((XrStructureType)1004999216)
+// 1004999217 is RESERVED for XrViewDisplayBindingsDXR (per-view display binding, M3).
+
+typedef XrFlags64 XrDisplayFlagsDXR;
+XR_DISPLAY_PRIMARY_BIT_DXR        = 0x1  // the OS desktop's primary monitor
+XR_DISPLAY_TRACKED_BIT_DXR        = 0x2  // eyeTracking.supportedModes != 0
+XR_DISPLAY_SYSTEM_DEFAULT_BIT_DXR = 0x4  // the display XrSystemProperties describes
+
+typedef struct XrDisplayDXR {
+    XrStructureType                  type;            // XR_TYPE_DISPLAY_DXR
+    void* XR_MAY_ALIAS               next;
+    uint64_t                         displayId;       // opaque, non-zero
+    XrDisplayInfoDXR                 info;            // embedded by value
+    XrRect2Di                        desktopRect;     // same contract as XrDisplayDesktopInfoDXR
+    uint32_t                         nativePixelWidth, nativePixelHeight;
+    float                            desktopScale;    // compositor scale, 0 = unknown
+    XrEyeTrackingModeCapabilitiesDXR eyeTracking;     // embedded by value
+    XrDisplayFlagsDXR                flags;
+    char                             vendorPluginId[64];
+    char                             deviceName[64];
+} XrDisplayDXR;
+
+XrResult xrEnumerateDisplaysDXR(XrInstance, XrSystemId, uint32_t capacityInput,
+                                uint32_t* countOutput, XrDisplayDXR* displays);
+
+typedef struct XrDisplaySpaceCreateInfoDXR {
+    XrStructureType type; const void* next;
+    uint64_t        displayId;
+    XrPosef         poseInDisplaySpace;
+} XrDisplaySpaceCreateInfoDXR;
+
+XrResult xrCreateDisplaySpaceDXR(XrSession, const XrDisplaySpaceCreateInfoDXR*, XrSpace*);
+
+typedef struct XrSessionDisplayBindingDXR {   // chained on XrSessionCreateInfo
+    XrStructureType type; const void* next;
+    uint64_t        displayId;                // 0 = runtime decides
+} XrSessionDisplayBindingDXR;
+```
+
+**Enumeration.** `xrEnumerateDisplaysDXR` uses the standard two-call idiom and lists
+every monitor the runtime identified — the 3D panel(s) a vendor plug-in claims and the
+ordinary monitors the vendor-neutral fallback serves — one `XrDisplayDXR` each. The
+SYSTEM_DEFAULT display comes first; exactly one entry carries the bit, and its `info`
+and `eyeTracking` are exactly what `XrDisplayInfoDXR` / `XrEyeTrackingModeCapabilitiesDXR`
+on `XrSystemProperties` report (active-mode view scale included). `XrSystemProperties`
+keeps that meaning: v22 does not change which display it describes. `displayId` is
+derived from the monitor's EDID identity and connector, so it is stable for the
+instance and, in practice, across processes on the same boot; an app must still treat
+it as opaque. Each display's `info` comes from, in order: the system info (for the
+system default); the owning vendor plug-in's per-monitor answer
+(`get_display_info_for_monitor`, `docs/reference/xrt_plugin_iface.md`); otherwise
+runtime defaults from EDID — physical size from the EDID millimetres, native pixels
+from the connector's mode, view scale 1, no eye tracking, and a nominal viewer centred
+at the distance that gives the display the same vertical FOV as the system default's
+nominal viewer. The list is identical in-process and over IPC (the service answers a
+dedicated message).
+
+**DISPLAY spaces.** `xrCreateDisplaySpaceDXR` creates a reference-space-like `XrSpace`
+for one display: origin at the display's centre, +X right, +Y up, +Z toward the viewer
+(the display space of `docs/architecture/kooima-projection.md`), with
+`poseInDisplaySpace` applied like `poseInReferenceSpace`. An unknown `displayId` fails
+with `XR_ERROR_VALIDATION_FAILURE`. **v22 limit:** every DISPLAY space resolves to the
+session's single display plane — the pose `XrViewDisplayRawDXR::displayPlanePose`
+reports (the head device's pose for a runtime-window session; the head's tracking
+origin for an app-window session) — whichever display it names. Spatial relationships
+*between* displays arrive with per-screen DISPLAY poses in M3; there is no shared room
+frame.
+
+**Session display binding.** Chaining `XrSessionDisplayBindingDXR` with a non-zero
+`displayId` pins the session to that display (an unknown id fails `xrCreateSession`
+with `XR_ERROR_VALIDATION_FAILURE`; `0` is the same as not chaining it). **v22 effect:**
+when the bound display is not the system default and its physical size is known, its
+physical size and nominal viewer become the session's display-scoped Kooima inputs
+(the projection used before window metrics are known); binding to the system default
+changes nothing. Swapchain sizing stays the system's worst case (ADR-010) and the
+display processor that weaves the session is still the system default's — honouring
+the binding in the compositor (segments, per-view display bindings) is M2/M3.
+`XrSystemProperties` is not affected by a session's binding.
+
 ### Example Code: Querying Display Mode Support and Requesting 2D
 
 > ⚠️ **These inline examples predate the multiview model and the v13 header — read with care.**
@@ -1903,15 +1993,20 @@ this capability, and if so, how?
 
 ### Open Issues
 
-**OPEN 1: Multi-display scenarios.**
+**OPEN 1: Multi-display scenarios — PARTIALLY RESOLVED in v22.**
 
-The current design assumes a single tracked 3D display per system. Multi-display scenarios
-(e.g., multiple tracked monitors in a workstation) would require:
-- A way to enumerate multiple displays per system.
-- Per-display `XrDisplayInfoDXR` queries.
-- Possibly per-display DISPLAY spaces.
+Up to v21 the extension assumed a single tracked 3D display per system. v22 (multi-screen
+M1, ADR-047) adds what an app needs to *see* every display: `xrEnumerateDisplaysDXR`
+(per-display `XrDisplayInfoDXR`, desktop rect, eye-tracking capabilities, vendor
+plug-in id, PRIMARY / TRACKED / SYSTEM_DEFAULT flags), per-display DISPLAY spaces
+(`xrCreateDisplaySpaceDXR`) and a session display binding (`XrSessionDisplayBindingDXR`).
+See *Per-display enumeration, DISPLAY spaces and session display binding (v22)*.
 
-This is out of scope for the initial extension but should be considered in future revisions.
+Still open, and planned in `docs/roadmap/multi-screen.md`: a window that spans two
+displays woven per segment (M2), per-view display bindings on `XrViewState` and
+per-display DISPLAY poses — i.e. meaningful relationships between two displays' spaces
+(M3, `1004999217` reserved), and a second tracked panel with its own tracker (M5).
+There is deliberately no shared room frame between displays.
 
 ---
 
@@ -2381,7 +2476,8 @@ the property) silently ignore the call — graceful degradation.
 | 17 | 2026-08-16 | David Fattal | **Panel lease** (ADR-035 D2, #961): added `XrEventDataDisplayModeRequestDeniedDXR` (`1004999014`, additive) + `XrDisplayModeDenialReasonDXR` + `XR_DISPLAY_MODE_INDEX_NONE_DXR`. Requests from non-lease-holders are denied with a reason event, never queued; `XrEventDataHardwareDisplayStateChangedDXR` fires only after the display processor confirmed; a mode-change event whose transition does not land is reverted by a second event (#761); service-mode sessions apply nothing locally. |
 | 18 | 2026-09-01 | David Fattal | Added `XrDisplayDesktopInfoDXR` (`1004999211`, new chained struct — additive, no ABI change to existing structs): the panel monitor's **full desktop rect** plus a **stable device name** (`\\.\DISPLAY1`), superseding the origin-only `XrDisplayDesktopPositionDXR`, so a client can place its window on the 3D panel and re-resolve the monitor after a topology change (#1301, unblocking displayxr-unity#266). Adds `isPrimary` and `isPanelConfirmed`. The rect is resolved under a pinned per-monitor-v2 DPI context so it is physical even when the host process is DPI-unaware. |
 | 19 | 2026-09-17 | David Fattal | **N-view view configuration** (#1486 option B / #80): added `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR` (`1004999212`) — the extension now extends the core `XrViewConfigurationType` enum. `xrEnumerateViewConfigurations` returns a list: a conformant 2-view `PRIMARY_STEREO` plus, when this extension is enabled, the DXR type reporting the device's max view count across modes. `xrEndFrame` rejects `viewCount > 2` under `PRIMARY_STEREO` and names the DXR type as the opt-in. Additive: no struct, wire or ABI change. Also carries the earlier RAW-mode wording clarification (#1370): eye positions are **relative to the display plane**, not "regardless of the reference space" — `XrViewDisplayRawDXR::displayPlanePose` reports that plane in the locate space, and render-ready views (legacy and rig-chained) honour `XrViewLocateInfo::space` on both legs. |
-| 20 | 2026-09-18 | David Fattal | **The mode floor** (#1499, follow-up to #1486): added `XR_DISPLAY_MODE_DENIAL_REASON_VIEW_CONFIG_CANNOT_FILL_DXR` (`6`) to `XrDisplayModeDenialReasonDXR`. A session never runs in, or requests, a rendering mode whose `viewCount` exceeds what its primary view configuration reports: `xrBeginSession` moves the display to a fillable mode before the first frame (announced with `XrEventDataRenderingModeChangedDXR`) and `xrRequestDisplayRenderingModeDXR` denies such a request with the new reason, locally, before it reaches the panel-lease holder. A `PRIMARY_MULTIVIEW_DXR` session is never floored or denied; a device that pins its mode and service mode both outrank the floor, and the runtime logs rather than silently clamps. **Enumerant only** — no struct, wire or ABI change. **Current header version (`XR_DXR_display_info_SPEC_VERSION == 20`).** |
+| 20 | 2026-09-18 | David Fattal | **The mode floor** (#1499, follow-up to #1486): added `XR_DISPLAY_MODE_DENIAL_REASON_VIEW_CONFIG_CANNOT_FILL_DXR` (`6`) to `XrDisplayModeDenialReasonDXR`. A session never runs in, or requests, a rendering mode whose `viewCount` exceeds what its primary view configuration reports: `xrBeginSession` moves the display to a fillable mode before the first frame (announced with `XrEventDataRenderingModeChangedDXR`) and `xrRequestDisplayRenderingModeDXR` denies such a request with the new reason, locally, before it reaches the panel-lease holder. A `PRIMARY_MULTIVIEW_DXR` session is never floored or denied; a device that pins its mode and service mode both outrank the floor, and the runtime logs rather than silently clamps. **Enumerant only** — no struct, wire or ABI change. |
+| 22 | 2026-10-07 | David Fattal | **Per-display enumeration** (multi-screen M1, ADR-047): added `XrDisplayDXR` (`1004999214`) + `xrEnumerateDisplaysDXR`, `XrDisplaySpaceCreateInfoDXR` (`1004999215`) + `xrCreateDisplaySpaceDXR`, `XrSessionDisplayBindingDXR` (`1004999216`, chained on `XrSessionCreateInfo`), `XrDisplayFlagsDXR`; `1004999217` reserved for `XrViewDisplayBindingsDXR` (M3). Append-only: `XrSystemProperties` keeps describing the system-default display. v22 limits: every DISPLAY space is the session's single display plane; a binding to a non-default display changes the session's display-scoped Kooima inputs only, not which DP weaves. **Current header version (`XR_DXR_display_info_SPEC_VERSION == 22`).** |
 
 > The `XR_DXR_display_info_SPEC_VERSION` define in the header is the authoritative current
 > revision. Earlier revision numbers in this table reflect the proposal's editing history and do
