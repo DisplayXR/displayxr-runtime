@@ -65,7 +65,7 @@ later phase:
 4. Any phase that costs the runtime GPU time gets its own explicitly chained request struct, and
    costs nothing until that struct is chained:
    - drawing the sprite (Phase 2);
-   - measuring disparity from the atlas (Phase 3).
+   - reading the submitted depth layer (Phase 3a), or measuring disparity from the atlas (Phase 3b).
 
    Even when chained, that cost is bounded to a cursor-sized patch and to frames where the
    cursor is over a 3D canvas.
@@ -136,9 +136,10 @@ display plane gives d > 0, and the cursor settles onto it. A second locate in th
 |---|---|---|
 | **1 (this ADR, implemented)** | `XR_DXR_cursor_depth` v1: app hint in, placement out, app draws. Pure placement module `u_cursor_depth` with tests; state-tracker fill in `xrLocateViews`. Works in-process and over IPC, on every graphics API. | A few dozen flops per locate |
 | 2 | **Runtime-drawn cursor** (`XrCursorDepthDrawRequestDXR`): the compositor draws the sprite into the atlas before the display processor, reading the OS cursor position at the last moment before compositing. For apps that would rather not draw. | One quad per view |
-| 3 | **Runtime-measured depth** (`XrCursorDepthMeasureRequestDXR`): for apps that have no depth (stereo photos and video, legacy content). The compositor block-matches a cursor-sized patch between the outermost views of the submitted atlas. The measured disparity feeds the same filter. It fails safe, falling back to d = 0 on textureless or ambiguous patches. | One tiny compute dispatch |
+| 3a | **Depth-layer source** (`XR_KHR_composition_layer_depth`): for apps that already submit depth with their projection layer, as engines commonly can. The app opts in with one request flag and sends no hint. The compositor reads a cursor-sized patch of the submitted depth (nearest value in the footprint) and converts it to disparity through that layer's `nearZ`/`farZ`. Depth is exact, and the app needs no hit-test code. The state tracker already accepts the struct; whether any compositor reads it today is unchecked. | One small GPU readback of a patch |
+| 3b | **Runtime-measured depth** (`XrCursorDepthMeasureRequestDXR`): for apps that have no depth (stereo photos and video, legacy content). The compositor block-matches a cursor-sized patch between the outermost views of the submitted atlas. The measured disparity feeds the same filter. It fails safe, falling back to d = 0 on textureless or ambiguous patches. | One tiny compute dispatch |
 | 4 | **Shell / IPC**: an opted-in client's placement is shared with the service, so the workspace controller's cursor rises onto window content, not just window surfaces. Clients that didn't opt in keep today's window-plane behaviour. | none extra |
-| 5 | **Web**: the inline3d SDK ports the same placement function. The SDK owns its views, so it needs no runtime round-trip. It gets the hint from depth readback or splat expected depth, and draws the sprite with `cursor: none` over the canvas. It is opt-in per viewer (`cursor: 'depth'`). The browser can later offer the lift depth map for converted video. | none in the runtime |
+| 5 | **Web** (*started: displayxr-web `DepthCursor` + `./cursor-depth`*): the inline3d SDK ports the same placement function. The SDK owns its views, so it needs no runtime round-trip. It gets the hint from depth readback or splat expected depth, and draws the sprite with `cursor: none` over the canvas. It is opt-in per viewer (`cursor: 'depth'`). The browser can later offer the lift depth map for converted video. | none in the runtime |
 
 ### 5. Reference adoption and evidence
 
@@ -167,7 +168,7 @@ the same v. So the cursor rises along the line of sight and doesn't drift sidewa
   against the C unit tests' expected values.
 - The hint is a frame old. A cursor moving fast across a depth edge can show a single frame
   where the cursor sits behind the nearer content. The footprint dilation and the fast rise keep
-  that to the edge itself. Phase 3 measures the current frame, so it doesn't have this lag.
+  that to the edge itself. Phases 3a and 3b read the current frame, so they don't have this lag.
 - **Head motion and look-around.** The sprite sits on the cyclopean ray through the cursor's
   canvas point. So each eye sees it on the glass at S ∓ (baseline/2)·d, which doesn't depend on
   where the head is (unit-tested across three head poses). The cursor's image on the panel
@@ -184,7 +185,7 @@ the same v. So the cursor rises along the line of sight and doesn't drift sidewa
 
 - **Runtime raycasting.** The runtime has no scene, so this is impossible.
 - **Always-on atlas measurement.** It would serve every app with no cooperation, but it charges
-  every app for a service most don't use, which violates §0. It is kept as the opt-in Phase 3.
+  every app for a service most don't use, which violates §0. It is kept as the opt-in Phase 3b.
 - **Each app does it all.** It works, and is what the demos do today. But the policy diverges
   between apps, and the math is subtle to get rig-agnostic. §2 is easy to get wrong for
   camera-rig apps.
