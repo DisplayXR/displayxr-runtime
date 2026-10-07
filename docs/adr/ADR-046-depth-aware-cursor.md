@@ -288,11 +288,43 @@ there is no jump.
 tracks the cursor, not the head; there SCREEN's exact aim is what matters and a parallax deficit
 over a few frames is invisible. While it is still, the user is looking at the scene, often moving
 their head to see around it, and the cursor must parallax like the content it rests on; there
-WORLD's behaviour is right. The cost is drift from the click point, and it accrues **only while
-the pointer is still**: the image of a world-fixed C moves on the glass by |d| × the head's
-lateral displacement, so for content near the glass (d ≈ −0.005 with the new margin) 20 cm of
-head motion moves it about 1 mm. The next mouse movement re-aims it exactly. Hit testing is
-unchanged: the click is always at the pointer's canvas point.
+WORLD's behaviour is right. The cost is drift of the drawn sprite from the click point, and it
+accrues **only while the pointer is still**. It has two terms, both derived from
+C = F − f·(1 − t)·e:
+
+- **head motion:** the image moves on the glass by |d| × the head's lateral displacement. For
+  content near the glass (d ≈ −0.005 with the new margin), 20 cm of head motion moves it about
+  1 mm;
+- **depth change under a still pointer:** if the filtered disparity moves from d₀ (when the
+  anchor was stored) to d, the image moves by about |d − d₀| × the viewer's lateral offset from
+  the pointer's canvas point. The sprite rises along the display normal, not along the line of
+  sight.
+
+The next mouse movement re-aims it exactly. Hit testing is unchanged: the click is always at the
+pointer's canvas point.
+
+The second term shows up in the headless evidence below. A scripted pointer never moves, so the
+anchor is stored on the first frame, before the app's hit test has a view to cast from (d₀ = 0).
+The cursor then rises to the cube with the pointer still, and sim_display's nominal viewer sits
+0.10 m above the canvas centre. So HYBRID's sprite there lands where WORLD's does, about 27 px
+below the click point, while SCREEN's stays on it. In interactive use the pointer reaches content
+by moving, so the anchor is stored at the content's depth, and the term is only what the content
+itself does under a still pointer.
+
+**Evidence** (macOS, sim_display SBS, `cube_handle_metal_macos`, `DISPLAYXR_CURSOR_DEPTH_UV=0.5,0.5`,
+atlas 1512×1646, two tiles of 1512×823 stacked; disparity = cursor x in the right-eye tile minus
+the left-eye tile; the cube's nearest edge under the cursor is about −15 px):
+
+| `DISPLAYXR_CURSOR_DEPTH_ANCHOR` | Target d | Cursor disparity | Cursor y in tile (pointer at 411) |
+|---|---|---|---|
+| unset (options not chained → HYBRID) | −0.041 | −15.4 px | 436 |
+| `hybrid` | −0.040 | −16.6 px | 438 |
+| `screen` | −0.040 | −16.6 px | 411 |
+| `world` | −0.040 | −16.7 px | 438 |
+| *before v3: 0.03 margin, SCREEN (§5)* | *−0.066* | *−23.4 px* | — |
+
+All four sit just in front of the cube's edge, about 7 px nearer it than with the old margin.
+In every capture the midpoint of the two cursor images is at the requested u (0.4995).
 
 **A deliberate default change.** An app that doesn't chain the options struct gets HYBRID and
 the 0.005 margin, which is different from v2. It is tester-driven, both changes go the same way
@@ -321,8 +353,9 @@ implements the identical rule with the same numbers.
   HYBRID: screen-anchored while the pointer moves (exact aim), world-fixed while it is still
   (correct parallax, unit-tested: the sprite does not move in locate space as the head moves).
   The click target never drifts, because hit testing stays at the pointer's canvas point; only
-  the drawn sprite drifts, by |d| × head displacement, and only until the mouse next moves. That
-  is about 1 mm for 20 cm of head motion over content near the glass. SCREEN and WORLD remain
+  the drawn sprite drifts, and only until the mouse next moves: by |d| × head displacement
+  (about 1 mm for 20 cm of head motion over content near the glass), plus |Δd| × the viewer's
+  lateral offset when the content's depth changes under a still pointer (§7). SCREEN and WORLD remain
   available through `XrCursorDepthOptionsDXR`.
 - An app-drawn cursor shows the app's frame latency, not the hardware cursor's. Phase 2's late
   cursor read narrows that but cannot remove it. This is inherent to any cursor that has
