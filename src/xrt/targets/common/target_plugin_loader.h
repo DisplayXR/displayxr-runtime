@@ -345,9 +345,12 @@ struct os_display_edid_list;
  * Map an enumerated EDID monitor list (`os_display_edid_enumerate`) into the
  * vendor-neutral @ref xrt_display_descriptor array handed to
  * `probe_displays()`. Assigns each monitor a stable-for-this-boot
- * `monitor_id` (hashed from EDID manufacturer/product + screen position),
+ * `monitor_id` (hashed from EDID manufacturer/product + screen position, plus
+ * the DRM connector / RandR output name where the platform has one),
  * converts `refresh_hz`→`refresh_mhz`, and maps `is_primary`→`flags` bit 0.
- * Writes up to @p max descriptors and returns the count.
+ * Writes up to @p max descriptors and returns the count. Also keeps the full
+ * monitor records (connector, mm, device mode) in a runtime-private side
+ * table keyed by monitor id; the descriptor struct (plug-in ABI) is unchanged.
  *
  * Issue #69 / ADR-015.
  */
@@ -362,7 +365,8 @@ target_plugin_build_descriptors(const struct os_display_edid_list *list,
  * its `probe_displays()` claims — or, for a plug-in without `probe_displays`
  * whose binary `probe()` succeeded, synthesizes a single
  * @ref XRT_DISPLAY_CLAIM_EDID claim on the primary monitor (single-display
- * back-compat) — then resolves per monitor (highest confidence wins; ties by
+ * back-compat; off-Windows the ACTIVE plug-in's lands on its panel's monitor
+ * once @ref target_plugin_note_active_panel has run) — then resolves per monitor (highest confidence wins; ties by
  * ascending ProbeOrder) into @p out_registry. A monitor no plug-in claims
  * gets no entry.
  *
@@ -372,14 +376,31 @@ target_plugin_build_descriptors(const struct os_display_edid_list *list,
  * for the process lifetime (rebuilt when @ref target_plugin_refresh_active
  * swaps in a better plug-in). Mutex-guarded like the refresh path.
  *
- * Off-Windows the EDID enumerator yields no monitors, so a 0-length
- * descriptor list resolves to an empty registry (`entry_count == 0`),
- * signalling callers to use the scalar `dp_factory_*` fields.
+ * Windows and desktop Linux enumerate monitors (Linux: RandR joined to DRM
+ * sysfs, multi-screen M0) and load every registered plug-in as a claim
+ * source; macOS and Android yield no monitors, so a 0-length descriptor list
+ * resolves to an empty registry (`entry_count == 0`), signalling callers to
+ * use the scalar `dp_factory_*` fields.
  */
 void
 target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
                                uint32_t descriptor_count,
                                struct xrt_dp_factory_registry *out_registry);
+
+struct xrt_plugin_display_info;
+
+/*!
+ * Record what the ACTIVE plug-in reported about its panel
+ * (`get_display_info`: pixel size, physical size, desktop origin). Called
+ * wherever the runtime pulls that info (the builder at system create, and the
+ * display-info apply path on refresh). Off-Windows it steers the active
+ * plug-in's back-compat display claim — the one synthesized when it has no
+ * `probe_displays` — onto the monitor that matches the panel by the ADR-033
+ * rules, instead of the primary monitor. No effect on Windows, and none on a
+ * plug-in that implements `probe_displays`.
+ */
+void
+target_plugin_note_active_panel(const struct xrt_plugin_display_info *pdi);
 
 #ifdef __cplusplus
 }

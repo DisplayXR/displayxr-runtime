@@ -778,9 +778,9 @@ dp_confidence_label(uint32_t c)
  * picking the entry exactly as `comp_dp_factory_for_window(COMP_DP_PRIMARY_
  * MONITOR)` does (`xrt_dp_registry_primary_entry`: the active plug-in's
  * monitor, else entries[0]). Runs after the active plug-in is known; safe headless (no
- * service, no GPU). Off-Windows the EDID enumerator yields no monitors, so the
- * registry is empty and the service path falls back to the scalar — reported as
- * agreement, never a false mismatch.
+ * service, no GPU). On macOS/Android the EDID enumerator yields no monitors, so
+ * the registry is empty and the service path falls back to the scalar — reported
+ * as agreement, never a false mismatch.
  */
 static void
 probe_dp_selection(struct cli_query_result *r, const struct xrt_plugin_iface *active)

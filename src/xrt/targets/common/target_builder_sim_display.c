@@ -138,6 +138,10 @@ sim_display_open_system_impl(struct xrt_builder *xb,
 		struct xrt_plugin_display_info pdi = {0};
 		pdi.struct_size = (uint32_t)sizeof(pdi);
 		if (plugin->get_display_info(target_plugin_get_active_instance(), head, &pdi)) {
+			// The per-monitor registry places this plug-in's back-compat
+			// display claim on its panel's monitor (multi-screen M0).
+			target_plugin_note_active_panel(&pdi);
+
 			screen_height_m = pdi.display_height_m;
 			nominal_z_m = pdi.nominal_viewer_z_m;
 
