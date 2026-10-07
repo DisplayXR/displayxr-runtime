@@ -73,7 +73,8 @@ struct connector_mode
 {
 	char name[64]; // normalised
 	uint32_t w, h;
-	double scale; // 0 = unknown
+	double scale;         // 0 = unknown
+	uint32_t refresh_mhz; // current mode's refresh, 0 = unknown
 };
 
 // Local declarations of the libdbus ABI used here (stable since dbus 1.0).
@@ -297,6 +298,7 @@ query_mutter(struct connector_mode *out, uint32_t max)
 			if (read_spec_connector(&f, &mon, &connector) && connector != NULL) {
 				f.message_iter_next(&mon); // past the spec, to the modes array
 				uint32_t cw = 0, ch = 0;
+				double crefresh = 0.0;
 				if (f.message_iter_get_arg_type(&mon) == OS_DBUS_TYPE_ARRAY) {
 					os_dbus_iter modes;
 					f.message_iter_recurse(&mon, &modes);
@@ -315,6 +317,7 @@ query_mutter(struct connector_mode *out, uint32_t max)
 							if (dict_bool(&f, &m, "is-current") && w > 0 && h > 0) {
 								cw = (uint32_t)w;
 								ch = (uint32_t)h;
+								crefresh = refresh;
 							}
 						}
 						f.message_iter_next(&modes);
@@ -326,6 +329,7 @@ query_mutter(struct connector_mode *out, uint32_t max)
 					os_display_connector_normalise(connector, c->name, sizeof(c->name));
 					c->w = cw;
 					c->h = ch;
+					c->refresh_mhz = crefresh > 0.0 ? (uint32_t)(crefresh * 1000.0 + 0.5) : 0u;
 				}
 			}
 			f.message_iter_next(&mons);
@@ -493,6 +497,7 @@ os_display_connector_annotate(struct os_display_desktop_info *mons, uint32_t cou
 			m->native_width = mc->w;
 			m->native_height = mc->h;
 			m->scale = mc->scale;
+			m->native_refresh_mhz = mc->refresh_mhz;
 			m->native_source = OS_DISPLAY_NATIVE_SOURCE_COMPOSITOR;
 			continue;
 		}

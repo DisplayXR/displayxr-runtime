@@ -506,6 +506,12 @@ os_display_edid_linux_join(const struct os_display_desktop_info *randr,
 		if (randr_id != NULL && randr_id[i].valid) {
 			apply_edid(m, &randr_id[i].edid);
 		}
+		// The compositor's current mode carries its refresh (Mutter
+		// DisplayConfig); it beats the EDID's preferred timing, which is
+		// only a guess at the mode in use and absent on many eDP panels.
+		if (r->native_refresh_mhz > 0) {
+			m->refresh_hz = (r->native_refresh_mhz + 500u) / 1000u;
+		}
 	}
 	return rn;
 }
