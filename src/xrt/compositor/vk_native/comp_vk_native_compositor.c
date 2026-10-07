@@ -18,6 +18,7 @@
 #include "comp_vk_native_target.h"
 #include "comp_vk_native_renderer.h"
 #include "comp_vk_native_alpha_probe.h"
+#include "comp_vk_native_segments.h"
 
 #include "util/comp_swapchain_ring.h"
 #include "util/comp_zone_tier1.h"
@@ -27,6 +28,7 @@
 // -> publish -> dump). Only the typed get_background_preview call stays here.
 #include "util/comp_rear_budget.h"
 #include "util/comp_lazy_transparency.h"
+#include "util/comp_segments.h"
 #ifdef XRT_OS_WINDOWS
 #include "util/comp_display_refresh_win.h"
 #endif
@@ -511,6 +513,12 @@ struct comp_vk_native_compositor
 	//! Generic Vulkan display processor (vendor-agnostic weaving).
 	struct xrt_display_processor *display_processor;
 
+	//! The DP's output survives a display-server resample
+	//! (XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE), read once at DP creation —
+	//! the scanout caps slot is a setup-time query, never a per-frame one.
+	//! Relaxes the #1595 / #1831 refuse-rather-than-resample gates (M2).
+	bool dp_tolerates_resample;
+
 	/*!
 	 * #1484 — the atlas encoding last DECLARED to `display_processor` via base
 	 * slot 14, as an `int` so `-1` can mean "unknown / never declared". The
@@ -690,6 +698,20 @@ struct comp_vk_native_compositor
 	//! #1831: the X11 arm of the 1:1 gate has been evaluated (once — its
 	//! inputs are the static desktop resolution in sys_info).
 	bool x11_1to1_evaluated;
+
+	/*!
+	 * Multi-screen M2 (ADR-047 D2): per-screen segment DPs for a window that
+	 * spans screens. @ref segments is created lazily, on the first weave
+	 * after @ref comp_vk_native_compositor_set_screens, once the DP command
+	 * pool exists. The window's desktop rect is cached by
+	 * @ref vk_update_present_origin from the same metrics read the present
+	 * origin uses, so segmentation costs no window-system round trip.
+	 */
+	struct comp_vk_native_segments *segments;
+	struct xrt_screen_list *seg_screens; //!< heap copy; NULL = never set
+	uint64_t seg_pinned_display_id;
+	struct comp_seg_rect seg_window;
+	bool have_seg_window;
 #endif
 
 #ifdef XRT_OS_ANDROID
@@ -4357,6 +4379,37 @@ vk_native_dispatch_capture(struct comp_vk_native_compositor *c, uint32_t mode_fi
 		U_LOG_W("Atlas capture failed (mode=%u path=%s)",
 		        c->capture_intent.mode, c->capture_intent.path);
 	}
+#ifdef XRT_OS_LINUX_DESKTOP
+	// Multi-screen M2: with the window split across screens, also write each
+	// segment's own DP input — `<stem>.seg<i>.png` — so a capture shows the
+	// per-screen canvases, not only the whole-window atlas they were cut from.
+	if (ok && mode_filter == MCP_CAPTURE_MODE_POST_COMPOSE && c->segments != NULL) {
+		const char *path = c->capture_intent.path;
+		const char *dot = strrchr(path, '.');
+		const size_t stem = dot != NULL ? (size_t)(dot - path) : strlen(path);
+		for (uint32_t i = 0; i < COMP_SEGMENTS_MAX; i++) {
+			VkImage img = VK_NULL_HANDLE;
+			uint32_t w = 0, h = 0;
+			uint64_t screen_id = 0;
+			bool woven = false;
+			if (!comp_vk_native_segments_get_capture(c->segments, i, &img, &w, &h, &screen_id, &woven)) {
+				break;
+			}
+			if (!woven || img == VK_NULL_HANDLE) {
+				U_LOG_W("Atlas capture: segment %u (screen 0x%016llx) is flat 2D this frame — no DP input",
+				        i, (unsigned long long)screen_id);
+				continue;
+			}
+			char seg_path[MCP_CAPTURE_PATH_MAX + 16];
+			snprintf(seg_path, sizeof(seg_path), "%.*s.seg%u.png", (int)stem, path, i);
+			const bool seg_ok = vk_native_dump_image_to_png(
+			    c, img, w, h, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
+			    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, false, seg_path);
+			U_LOG_W("Atlas capture: segment %u (screen 0x%016llx) DP input %ux%u -> %s%s", i,
+			        (unsigned long long)screen_id, w, h, seg_path, seg_ok ? "" : " FAILED");
+		}
+	}
+#endif
 	u_capture_intent_complete(&c->capture_intent, &c->mcp_capture, ok);
 }
 
@@ -4710,7 +4763,11 @@ vk_linux_update_surface_not_1to1(struct comp_vk_native_compositor *c)
 	//      scale 1, i.e. a surface twice the output. A surface INSIDE the frame
 	//      (a title bar above it) is fine. Unknown never degrades.
 	const bool fits_surface = wr.surface_within_frame;
-	const bool not_1to1 = !on_panel || !fits_window || !fits_surface;
+	// Multi-screen M2: (b) and (c) are resamples; a DP whose output survives
+	// one (XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE) is not degraded by them.
+	// (a) stays: off the panel, native Wayland has no segment to weave into.
+	const bool tolerant = c->display_processor != NULL && c->dp_tolerates_resample;
+	const bool not_1to1 = !on_panel || (!tolerant && (!fits_window || !fits_surface));
 
 	if (not_1to1 == c->linux_surface_not_1to1) {
 		return;
@@ -4816,6 +4873,11 @@ vk_x11_update_not_1to1(struct comp_vk_native_compositor *c)
 	if (c->x11_1to1_evaluated || !c->sys_info_set) {
 		return;
 	}
+	// Multi-screen M2: the verdict depends on the DP's resample tolerance, so
+	// wait for a DP this compositor will create (it is made lazily).
+	if (c->display_processor == NULL && c->dp_factory_available) {
+		return;
+	}
 	c->x11_1to1_evaluated = true;
 #ifdef DXR_HAVE_DIRECT_SCANOUT
 	// A leased connector is scanned out by us, not composited: no resample.
@@ -4852,6 +4914,21 @@ vk_x11_update_not_1to1(struct comp_vk_native_compositor *c)
 		    "X11 1:1 gate: the panel '%s' is %ux%u in the X root = its %ux%u device mode — X11 pixels "
 		    "are device pixels there, weaving as before. (#1831)",
 		    si->display_device_name, x11_w, x11_h, dev_w, dev_h);
+		return;
+	}
+
+	/*
+	 * Multi-screen M2: the gate protects a weave that a resample destroys.
+	 * A DP whose output survives one (sim_display anaglyph/SBS/blend —
+	 * XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE) keeps weaving: there is no
+	 * interlace to lose, and degrading it would hide the very 3D a scaled
+	 * dev box can show. Every other DP — every lenticular weave — degrades as
+	 * before (an absent or silent caps slot reads as "needs 1:1").
+	 */
+	if (c->display_processor != NULL && c->dp_tolerates_resample) {
+		U_LOG_W("X11 1:1 gate: the panel '%s' is resampled (%ux%u in the X root, %ux%u device px), but this "
+		        "display processor's output tolerates a resample — weaving anyway. (#1831, multi-screen M2)",
+		        si->display_device_name, x11_w, x11_h, dev_w, dev_h);
 		return;
 	}
 
@@ -5077,6 +5154,62 @@ vk_dp_canvas_rect(struct comp_vk_native_compositor *c)
 	}
 	return r;
 }
+
+#ifdef XRT_OS_LINUX_DESKTOP
+/*!
+ * Multi-screen M2: does THIS weave take the per-screen segment path?
+ *
+ * Runs the segment manager's metric update (segment table + DP lifecycle)
+ * and answers true only when the window covers a screen other than the
+ * primary one. Everything that cannot be segmented today answers false and
+ * keeps the shipped single-DP path, byte for byte:
+ *
+ * - native Wayland: the geometry service reports a rect relative to the
+ *   window's own monitor, in that monitor's device px — not a desktop rect
+ *   (docs/specs/runtime/wayland-window-geometry.md, M2 follow-up);
+ * - zero-copy (no compositor-owned atlas to crop per segment);
+ * - a self-submitting DP or one with no render pass (the split path records
+ *   every segment DP into our command buffer, sharing our framebuffer);
+ * - no screens handed over, one screen, a pinned session, mixed vendors.
+ */
+static bool
+vk_segments_frame_update(struct comp_vk_native_compositor *c,
+                         const struct xrt_rect *dp_canvas,
+                         bool zero_copy,
+                         bool dp_self_submits,
+                         VkRenderPass dp_render_pass)
+{
+	if (c->seg_screens == NULL || c->display_processor == NULL || c->cmd_pool == VK_NULL_HANDLE ||
+	    !c->have_seg_window) {
+		return false;
+	}
+#ifdef XRT_HAVE_WAYLAND
+	if (c->use_wayland) {
+		return false;
+	}
+#endif
+	if (c->segments == NULL) {
+		c->segments = comp_vk_native_segments_create(&c->vk, c->cmd_pool);
+		if (c->segments == NULL) {
+			return false;
+		}
+		comp_vk_native_segments_set_screens(c->segments, c->seg_screens, &c->sys_info,
+		                                    c->seg_pinned_display_id);
+	}
+	if (!comp_vk_native_segments_enabled(c->segments) || zero_copy || dp_self_submits ||
+	    dp_render_pass == VK_NULL_HANDLE) {
+		return false;
+	}
+	struct comp_seg_rect canvas = {
+	    dp_canvas->offset.w,
+	    dp_canvas->offset.h,
+	    (uint32_t)(dp_canvas->extent.w > 0 ? dp_canvas->extent.w : 0),
+	    (uint32_t)(dp_canvas->extent.h > 0 ? dp_canvas->extent.h : 0),
+	};
+	return comp_vk_native_segments_update(c->segments, &c->seg_window, &canvas,
+	                                      (int32_t)VK_FORMAT_B8G8R8A8_UNORM);
+}
+#endif
 
 /*!
  * #1484 — `DXR_VK_ATLAS_ENCODING`: diagnostic override for the ADR-021 atlas-
@@ -6256,13 +6389,49 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 			// precede process_atlas; no-op on no change.
 			vk_dp_assert_atlas_encoding(c, c->display_processor, vk_native_atlas_encoding(c));
 
-			xrt_display_processor_process_atlas(
-			    c->display_processor, dp_self_submits ? VK_NULL_HANDLE : cmd,
-			    (VkImage_XDP)(uintptr_t)src_image_u64, (VkImageView)(uintptr_t)src_view_u64, view_width,
-			    view_height, tc, tr, (VkFormat_XDP)view_format, target_fb,
-			    (VkImage_XDP)(uintptr_t)target_image, tgt_width, tgt_height,
-			    (VkFormat_XDP)comp_vk_native_target_get_format(c->target), dp_canvas.offset.w,
-			    dp_canvas.offset.h, (uint32_t)dp_canvas.extent.w, (uint32_t)dp_canvas.extent.h);
+#ifdef XRT_OS_LINUX_DESKTOP
+			// Multi-screen M2: a window spanning screens is woven per
+			// segment, each by its own screen's DP. A window on the primary
+			// screen only never takes this branch (byte-for-byte the single-
+			// DP call below).
+			const bool seg_split =
+			    vk_segments_frame_update(c, &dp_canvas, zero_copy, dp_self_submits, dp_render_pass);
+#else
+			const bool seg_split = false;
+#endif
+			if (seg_split) {
+#ifdef XRT_OS_LINUX_DESKTOP
+				struct comp_vk_native_segments_frame sf = {
+				    .cmd = cmd,
+				    .src_image = (VkImage)(uintptr_t)src_image_u64,
+				    .src_format = (VkFormat)view_format,
+				    .view_width = view_width,
+				    .view_height = view_height,
+				    .tile_columns = tc,
+				    .tile_rows = tr,
+				    .target_fb = target_fb,
+				    .target_image = (VkImage)(uintptr_t)target_image,
+				    .target_view = (VkImageView)(uintptr_t)target_view,
+				    .target_width = tgt_width,
+				    .target_height = tgt_height,
+				    .target_format = (VkFormat)comp_vk_native_target_get_format(c->target),
+				    .canvas = {dp_canvas.offset.w, dp_canvas.offset.h,
+				               (uint32_t)(dp_canvas.extent.w > 0 ? dp_canvas.extent.w : (int)tgt_width),
+				               (uint32_t)(dp_canvas.extent.h > 0 ? dp_canvas.extent.h : (int)tgt_height)},
+				    .transparent_background = c->transparent_background,
+				    .primary_dp = c->display_processor,
+				};
+				(void)comp_vk_native_segments_record(c->segments, &sf);
+#endif
+			} else {
+				xrt_display_processor_process_atlas(
+				    c->display_processor, dp_self_submits ? VK_NULL_HANDLE : cmd,
+				    (VkImage_XDP)(uintptr_t)src_image_u64, (VkImageView)(uintptr_t)src_view_u64, view_width,
+				    view_height, tc, tr, (VkFormat_XDP)view_format, target_fb,
+				    (VkImage_XDP)(uintptr_t)target_image, tgt_width, tgt_height,
+				    (VkFormat_XDP)comp_vk_native_target_get_format(c->target), dp_canvas.offset.w,
+				    dp_canvas.offset.h, (uint32_t)dp_canvas.extent.w, (uint32_t)dp_canvas.extent.h);
+			}
 
 			/*
 			 * #1394 — the DP is allowed to say "that frame did not happen".
@@ -8945,6 +9114,12 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 		xrt_display_processor_clear_local_zone_mask(c->display_processor);
 		c->zone_published = false;
 	}
+#ifdef XRT_OS_LINUX_DESKTOP
+	// Multi-screen M2: the segment DPs go first (they share the DP pool).
+	comp_vk_native_segments_destroy(&c->segments);
+	free(c->seg_screens);
+	c->seg_screens = NULL;
+#endif
 	xrt_display_processor_destroy(&c->display_processor);
 
 	// Destroy shared texture resources
@@ -9269,6 +9444,8 @@ vk_make_dp_vk(struct comp_vk_native_compositor *c,
 			(void)u_weave_scope_report(xrt_display_processor_vk_get_weave_scope(
 			                               (struct xrt_display_processor_vk *)c->display_processor),
 			                           "VK", /* panel_scoped */ false);
+			c->dp_tolerates_resample = xrt_display_processor_vk_tolerates_resample(
+			    (struct xrt_display_processor_vk *)c->display_processor);
 		}
 	} else {
 		U_LOG_W("No VK display processor factory provided");
@@ -11837,6 +12014,16 @@ vk_update_present_origin(struct comp_vk_native_compositor *c)
 		c->last_window_px_w = m.window_pixel_width;
 		c->last_window_px_h = m.window_pixel_height;
 		c->have_last_window_size = true;
+#ifdef XRT_OS_LINUX_DESKTOP
+		// Multi-screen M2: the window's desktop rect, for the segment table.
+		// X11 root coordinates are desktop-absolute — the same space the
+		// screen registry's RandR rects are in.
+		c->seg_window.x = m.window_screen_left;
+		c->seg_window.y = m.window_screen_top;
+		c->seg_window.w = m.window_pixel_width;
+		c->seg_window.h = m.window_pixel_height;
+		c->have_seg_window = true;
+#endif
 	}
 
 	/*
@@ -12062,6 +12249,41 @@ comp_vk_native_compositor_set_system_devices(struct xrt_compositor *xc,
 	if (c->owns_window && c->xcb_window != NULL) {
 		comp_vk_native_window_xcb_set_system_devices(c->xcb_window, xsysd);
 	}
+#endif
+}
+
+void
+comp_vk_native_compositor_set_screens(struct xrt_compositor *xc,
+                                      const struct xrt_screen_list *list,
+                                      uint64_t pinned_display_id)
+{
+#ifdef XRT_OS_LINUX_DESKTOP
+	if (xc == NULL || list == NULL) {
+		return;
+	}
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	struct xrt_screen_list *copy = U_TYPED_CALLOC(struct xrt_screen_list);
+	if (copy == NULL) {
+		return;
+	}
+	*copy = *list;
+
+	// #1394: never block the app thread on a wedged weave.
+	if (vk_weave_blocked(c)) {
+		free(copy);
+		return;
+	}
+	os_mutex_lock(&c->mutex);
+	// The segment manager is (re)built lazily on the next weave from this list.
+	comp_vk_native_segments_destroy(&c->segments);
+	free(c->seg_screens);
+	c->seg_screens = copy;
+	c->seg_pinned_display_id = pinned_display_id;
+	os_mutex_unlock(&c->mutex);
+#else
+	(void)xc;
+	(void)list;
+	(void)pinned_display_id;
 #endif
 }
 

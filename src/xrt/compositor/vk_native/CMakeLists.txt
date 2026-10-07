@@ -34,6 +34,8 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 		comp_vk_native_equirect2.h
 		comp_vk_native_renderer.c
 		comp_vk_native_renderer.h
+		comp_vk_native_segments.c
+		comp_vk_native_segments.h
 		comp_vk_native_split.cpp
 		comp_vk_native_split.h
 		comp_vk_native_swapchain.c
