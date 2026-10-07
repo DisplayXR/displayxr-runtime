@@ -97,6 +97,8 @@ comp_vk_native_segments_enabled(const struct comp_vk_native_segments *segs);
  *                        in flight (#1264 S1 fence-park). Only then are retired
  *                        DPs / images handed back to Vulkan; otherwise they
  *                        wait on the retire list.
+ * @param mode_index      The head's active rendering-mode index; a change
+ *                        re-reads each segment DP's resample tolerance.
  * @return true when this frame must take the split path
  *         (@ref comp_vk_native_segments_record); false = the single-DP path.
  */
@@ -105,7 +107,8 @@ comp_vk_native_segments_update(struct comp_vk_native_segments *segs,
                                const struct comp_seg_rect *window_desktop,
                                const struct comp_seg_rect *canvas,
                                int32_t target_format,
-                               bool release_safe);
+                               bool release_safe,
+                               uint32_t mode_index);
 
 /*!
  * Everything the split path needs about this frame.

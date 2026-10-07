@@ -514,10 +514,15 @@ struct comp_vk_native_compositor
 	struct xrt_display_processor *display_processor;
 
 	//! The DP's output survives a display-server resample
-	//! (XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE), read once at DP creation —
-	//! the scanout caps slot is a setup-time query, never a per-frame one.
+	//! (XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE). Read at DP creation and again
+	//! whenever the head's rendering mode changes (sim_display's answer
+	//! follows its output mode: INTERLACED needs 1:1) — never per frame.
 	//! Relaxes the #1595 / #1831 refuse-rather-than-resample gates (M2).
 	bool dp_tolerates_resample;
+	//! The rendering-mode index @ref dp_tolerates_resample was last read at.
+	uint32_t dp_caps_mode_index;
+	//! vk_make_dp_vk called the factory (whether or not it succeeded).
+	bool dp_create_attempted;
 
 	/*!
 	 * #1484 — the atlas encoding last DECLARED to `display_processor` via base
@@ -4875,6 +4880,37 @@ vk_linux_apply_not_1to1(struct comp_vk_native_compositor *c, bool not_1to1)
  * Evaluated once: its inputs are the desktop resolution taken at system
  * creation, which is static for the life of the compositor on X11.
  */
+/*!
+ * Multi-screen M2 review: re-read the DP's resample tolerance when the head's
+ * rendering mode changes. sim_display's answer follows its output mode (the
+ * 1/2/3 keys / V): switching to INTERLACED on a scaled desktop must degrade
+ * (#1595 / #1831 — a resampled interlace is a double image), switching back to
+ * anaglyph must weave again. A change re-arms the X11 gate's one-shot; the
+ * Wayland arm reads the flag on every evaluation. One vtable call per MODE
+ * CHANGE, never per frame.
+ */
+static void
+vk_dp_refresh_resample_caps(struct comp_vk_native_compositor *c)
+{
+	if (c->display_processor == NULL || c->xdev == NULL || c->xdev->hmd == NULL) {
+		return;
+	}
+	const uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
+	if (idx == c->dp_caps_mode_index) {
+		return;
+	}
+	c->dp_caps_mode_index = idx;
+	const bool tol =
+	    xrt_display_processor_vk_tolerates_resample((struct xrt_display_processor_vk *)c->display_processor);
+	if (tol == c->dp_tolerates_resample) {
+		return;
+	}
+	U_LOG_I("1:1 gate: rendering mode %u — the display processor's output %s a resample now; re-evaluating",
+	        idx, tol ? "tolerates" : "does NOT tolerate");
+	c->dp_tolerates_resample = tol;
+	c->x11_1to1_evaluated = false;
+}
+
 static void
 vk_x11_update_not_1to1(struct comp_vk_native_compositor *c)
 {
@@ -4883,10 +4919,13 @@ vk_x11_update_not_1to1(struct comp_vk_native_compositor *c)
 		return;
 	}
 	// Multi-screen M2: the verdict depends on the DP's resample tolerance, so
-	// wait for a DP this compositor will create (it is made lazily).
-	if (c->display_processor == NULL && c->dp_factory_available) {
+	// wait until this compositor has tried to create its DP (it is made
+	// lazily); a failed create evaluates with "needs 1:1".
+	if (c->display_processor == NULL && c->dp_factory_available && !c->dp_create_attempted) {
 		return;
 	}
+	// One-shot per tolerance: vk_dp_refresh_resample_caps re-arms it when a
+	// mode switch changes the DP's answer.
 	c->x11_1to1_evaluated = true;
 #ifdef DXR_HAVE_DIRECT_SCANOUT
 	// A leased connector is scanned out by us, not composited: no resample.
@@ -4936,9 +4975,14 @@ vk_x11_update_not_1to1(struct comp_vk_native_compositor *c)
 	 */
 	if (c->display_processor != NULL && c->dp_tolerates_resample) {
 		U_LOG_W("X11 1:1 gate: the panel '%s' is resampled (%ux%u in the X root, %ux%u device px), but this "
-		        "display processor's output tolerates a resample — weaving anyway. (#1831, multi-screen M2)",
-		        si->display_device_name, x11_w, x11_h, dev_w, dev_h);
+		        "display processor's output tolerates a resample — weaving%s. (#1831, multi-screen M2)",
+		        si->display_device_name, x11_w, x11_h, dev_w, dev_h,
+		        c->linux_surface_not_1to1 ? " again (the mode switched to one that does)" : " anyway");
+		vk_linux_apply_not_1to1(c, false);
 		return;
+	}
+	if (c->linux_surface_not_1to1) {
+		return; // already presenting 2D for this reason
 	}
 
 	char scale_str[48] = "";
@@ -5225,7 +5269,10 @@ vk_segments_frame_update(struct comp_vk_native_compositor *c,
 	    (uint32_t)(dp_canvas->extent.h > 0 ? dp_canvas->extent.h : 0),
 	};
 	return comp_vk_native_segments_update(c->segments, &c->seg_window, &canvas,
-	                                      (int32_t)VK_FORMAT_B8G8R8A8_UNORM, !c->fill_parked);
+	                                      (int32_t)VK_FORMAT_B8G8R8A8_UNORM, !c->fill_parked,
+	                                      (c->xdev != NULL && c->xdev->hmd != NULL)
+	                                          ? c->xdev->hmd->active_rendering_mode_index
+	                                          : 0);
 }
 #endif
 
@@ -8064,6 +8111,7 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 	// decides whether this frame weaves at all, so it must precede the layout.
 	// Cheap (a non-blocking D-Bus pump the metrics path already performs) and
 	// only acts on a transition.
+	vk_dp_refresh_resample_caps(c);
 	vk_linux_update_surface_not_1to1(c);
 #ifdef XRT_HAVE_WAYLAND
 	if (!c->use_wayland)
@@ -9449,6 +9497,7 @@ vk_make_dp_vk(struct comp_vk_native_compositor *c,
 			    "(app queue %p stays the app frame's)",
 			    (void *)c->repaint_queue, (void *)saved_main_queue);
 		}
+		c->dp_create_attempted = true;
 		xrt_result_t dp_ret = factory(&c->vk, (void *)(uintptr_t)c->cmd_pool, dp_window_handle,
 		                              (int32_t)VK_FORMAT_B8G8R8A8_UNORM, &c->display_processor);
 		c->vk.main_queue->queue = saved_main_queue;
@@ -9467,6 +9516,9 @@ vk_make_dp_vk(struct comp_vk_native_compositor *c,
 			                           "VK", /* panel_scoped */ false);
 			c->dp_tolerates_resample = xrt_display_processor_vk_tolerates_resample(
 			    (struct xrt_display_processor_vk *)c->display_processor);
+			c->dp_caps_mode_index = (c->xdev != NULL && c->xdev->hmd != NULL)
+			                            ? c->xdev->hmd->active_rendering_mode_index
+			                            : UINT32_MAX;
 		}
 	} else {
 		U_LOG_W("No VK display processor factory provided");
