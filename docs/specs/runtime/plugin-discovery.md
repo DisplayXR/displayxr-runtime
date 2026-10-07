@@ -420,6 +420,82 @@ fall through on miss/failure, sticky for the process" semantics:
 Android exposes only the env-var read (the writable override and `dp list`
 are not shipped there in v1; see Non-goals above).
 
+### 3.4 Desktop Linux: monitor enumeration and display claims (multi-screen M0)
+
+The per-monitor registry (§1.1, #69 / ADR-015) is populated on desktop Linux
+as on Windows. Two pieces make that possible.
+
+**Monitor enumeration** (`os_display_edid_enumerate`,
+`src/xrt/auxiliary/os/os_display_edid_linux.c`). No single source is a monitor
+record: RandR knows where each monitor sits on the desktop and which one is
+primary, but XWayland publishes no EDID property; DRM sysfs
+(`/sys/class/drm/card*-*/{status,enabled,edid,modes}`) has the EDID and the
+connector name but no desktop position. The enumerator takes the RandR
+monitors from `os_display_desktop_enumerate` and ties each one to a connected
+DRM connector, first rule that fires:
+
+1. **name** — RandR output name equals the connector name with the kernel's
+   subtype letter dropped (`HDMI-A-1` → `HDMI-1`). The normal case on X11 and
+   on Mutter's XWayland.
+2. **mm** — exactly one unused connector whose EDID physical size is within
+   10 mm of RandR's (EDID stores cm in the base block and mm in the detailed
+   timing; 340 vs 344 mm is the same panel).
+3. **mode** — exactly one unused connector with the monitor's pixel size
+   (device mode when known, else the RandR rect) among its modes.
+
+Ambiguity is never guessed: a monitor no rule ties uniquely is listed with
+its placement and no EDID identity. A connector is used at most once. From
+the EDID the enumerator reads the manufacturer and product id (bytes 8–11),
+the serial (12–15), the size in cm (21/22) and the first detailed timing's
+pixels, mm and refresh. With **no reachable X server** (pure Wayland,
+headless) every connected, enabled connector becomes a DRM-only record flagged
+`origin_unknown` at (0, 0). The join method per monitor is logged once at INFO
+(`plugin loader: monitor N … join=name|mm|mode|drm-only|none`), and
+`displayxr-cli displays` prints it.
+
+The plug-in-facing `xrt_display_descriptor` is unchanged (no ABI change). The
+connector name, mm and device mode stay runtime-side (`os_display_edid_monitor`
+plus a loader side table keyed by `monitor_id`). The `monitor_id` hash adds the
+connector name where the platform has one, so DRM-only records at (0, 0) stay
+distinct. Windows ids are unchanged.
+
+**Claims from every plug-in.** `target_plugin_resolve_displays` now loads every
+manifest plug-in on POSIX as a claim source (`collect_display_sources_platform`,
+the twin of the Windows one): same roots and order as discovery,
+`DXR_PLUGIN_EXCLUSIVE` honoured, the active plug-in reused rather than loaded
+twice. The other plug-ins are claim sources only. No device is created from
+them, and active-plug-in selection is unchanged. One consequence carries over
+from Windows: with `XRT_PREFERRED_PLUGIN_ID=sim-display`, an installed vendor
+plug-in is now loaded and probed for its claims. Use `DXR_PLUGIN_EXCLUSIVE` to
+keep it out of the process (§2.2).
+
+**Back-compat claim for a plug-in without `probe_displays`.** Such a plug-in
+gets one synthesized `EDID`-confidence claim. On Windows that claim stays on
+the primary monitor. Off-Windows, the **active** plug-in's claim goes to the
+monitor its panel matches once the runtime has read `get_display_info`
+(`target_plugin_note_active_panel`, called by the builder at system create and
+on every display-info apply). The matching uses the ADR-033 resolver's rules:
+the plug-in's origin when non-zero, then the connector's device mode, then the
+pixel size, with ties broken on physical size. Without this, a laptop with the
+3D panel on an external connector would route the laptop screen (the primary)
+to the vendor DP and the panel to the fallback, because the active plug-in
+wins every monitor it claims (#1521). A plug-in that implements
+`probe_displays` never reaches the synthesized path, so its own claims always
+decide. `displayxr-cli displays --claims` brings the system up headlessly
+first, so it reports the same placement the runtime uses.
+
+Example from a laptop (eDP-1, primary) with an Acer DS1 on HDMI, with
+`leia-sr` active and no `probe_displays` in the plug-in yet:
+
+```
+monitor …  3456x2160 @ (0,0)      SDC 423F  300x190 mm  output=eDP-1   → sim-display  FALLBACK
+monitor …  3840x2160 @ (3456,0)   ACR 0001  344x193 mm  output=HDMI-1  → leia-sr      EDID
+```
+
+On Linux nothing in the compositors reads the registry yet. The Vulkan
+compositor uses the scalar `dp_factory_*`, so this milestone changes no
+weaving. macOS and Android still enumerate no monitors.
+
 ---
 
 ## 4. Plug-in DLL contract
