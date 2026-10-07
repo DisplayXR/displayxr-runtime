@@ -52,9 +52,24 @@ void
 target_screens_system_from_info(const struct xrt_system_compositor_info *info, struct target_screens_system *out);
 
 /*!
+ * Which registry entry is the system-default screen: the one whose desktop
+ * rect contains the origin the runtime resolved for the system panel (#1301,
+ * `sys->desktop_left/top`), preferring an entry the active plug-in won; when
+ * none contains it (or no rect was resolved), `xrt_dp_registry_primary_entry`.
+ * @p out_matches_sys (may be NULL) is true only in the first case — the only
+ * case in which the system's resolved rect / device name / primary flag may
+ * be copied onto that entry. NULL on an empty registry.
+ */
+const struct xrt_dp_registry_entry *
+target_screens_pick_default(const struct xrt_dp_factory_registry *reg,
+                            const char *active_plugin_id,
+                            const struct target_screens_system *sys,
+                            bool *out_matches_sys);
+
+/*!
  * Build the screen list: one @ref xrt_screen per registry entry, the
- * system-default one (`xrt_dp_registry_primary_entry(reg, active_plugin_id)`)
- * first and flagged SYSTEM_DEFAULT, each screen's info resolved by
+ * system-default one (@ref target_screens_pick_default) first and flagged
+ * SYSTEM_DEFAULT, each screen's info resolved by
  * `u_screen_info_resolve` (system info / the owning plug-in's
  * `get_display_info_for_monitor` / EDID-derived). An empty registry yields
  * one synthesized screen (@ref XRT_SCREEN_ID_SYNTHETIC_DEFAULT) from @p sys,
