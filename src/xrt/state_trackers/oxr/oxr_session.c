@@ -381,6 +381,15 @@ oxr_session_get_display_dimensions(struct oxr_session *sess, float *out_width_m,
 		return false;
 	}
 
+	// XrSessionDisplayBindingDXR (multi-screen M1): a session pinned to a
+	// non-default display uses THAT display's physical size, ahead of the
+	// compositor's (whose DP describes the system default panel).
+	if (sess->bound_display_overrides) {
+		*out_width_m = sess->bound_display_info.width_m;
+		*out_height_m = sess->bound_display_info.height_m;
+		return true;
+	}
+
 #ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
 	// D3D11 native compositor path (has its own display dimension query)
 	if (sess->xcn != NULL && sess->is_d3d11_native_compositor) {
@@ -430,6 +439,32 @@ oxr_session_get_display_dimensions(struct oxr_session *sess, float *out_width_m,
 	*out_width_m = info->display_width_m;
 	*out_height_m = info->display_height_m;
 	return true;
+}
+
+/*!
+ * The nominal viewer's height and distance for the session's untracked Kooima
+ * (display space): the system panel's, or — for a session pinned to another
+ * display with XrSessionDisplayBindingDXR (multi-screen M1) — that display's.
+ * Either out-param may be NULL.
+ */
+static void
+oxr_session_get_nominal_viewer(struct oxr_session *sess, float *out_y_m, float *out_z_m)
+{
+	float y = 0.0f;
+	float z = 0.0f;
+	if (sess->bound_display_overrides) {
+		y = sess->bound_display_info.nominal_viewer_y_m;
+		z = sess->bound_display_info.nominal_viewer_z_m;
+	} else if (sess->sys->xsysc != NULL) {
+		y = sess->sys->xsysc->info.nominal_viewer_y_m;
+		z = sess->sys->xsysc->info.nominal_viewer_z_m;
+	}
+	if (out_y_m != NULL) {
+		*out_y_m = y;
+	}
+	if (out_z_m != NULL) {
+		*out_z_m = z;
+	}
 }
 
 /*!
@@ -2861,11 +2896,12 @@ oxr_session_locate_views(struct oxr_logger *log,
 			}
 			have_eye_positions = true;
 		} else {
-			// Nominal viewer from system compositor info (sim_display, etc.)
-			const struct xrt_system_compositor_info *sinfo = &sess->sys->xsysc->info;
-			U_LOG_I("Kooima: nominal_y=%.3f nominal_z=%.3f",
-			        sinfo->nominal_viewer_y_m, sinfo->nominal_viewer_z_m);
-			if (sinfo->nominal_viewer_z_m > 0.0f) {
+			// Nominal viewer from system compositor info (sim_display, etc.),
+			// or from the bound display (XrSessionDisplayBindingDXR, M1).
+			float nominal_z_m = 0.0f;
+			oxr_session_get_nominal_viewer(sess, NULL, &nominal_z_m);
+			U_LOG_I("Kooima: nominal_z=%.3f", nominal_z_m);
+			if (nominal_z_m > 0.0f) {
 				float ipd_m = sess->ipd_meters;
 				eye_count = 2;
 				// Untracked → the eye sits at the REFERENCE: directly in front
@@ -2877,8 +2913,8 @@ oxr_session_locate_views(struct oxr_logger *log,
 				// reproduce, so the camera/display rigs would disagree.
 				// nominal_y belongs only to the parallax / zero-parallax pivot
 				// (the `nominal` vector below), never to the eye position.
-				adj_eyes[0] = (struct xrt_eye_position){-ipd_m / 2.0f, 0.0f, sinfo->nominal_viewer_z_m};
-				adj_eyes[1] = (struct xrt_eye_position){ipd_m / 2.0f, 0.0f, sinfo->nominal_viewer_z_m};
+				adj_eyes[0] = (struct xrt_eye_position){-ipd_m / 2.0f, 0.0f, nominal_z_m};
+				adj_eyes[1] = (struct xrt_eye_position){ipd_m / 2.0f, 0.0f, nominal_z_m};
 				have_eye_positions = true;
 				if (should_log) {
 					U_LOG_I("Nominal eyes: [0]=(%.4f,%.4f,%.4f) [1]=(%.4f,%.4f,%.4f), IPD=%.1fmm",
@@ -3079,8 +3115,8 @@ oxr_session_locate_views(struct oxr_logger *log,
 
 				if (screen_width_m > 0.0f && screen_height_m > 0.0f) {
 				// Nominal viewer for view math (parallax lerp target)
-				const struct xrt_system_compositor_info *si = &sess->sys->xsysc->info;
-				struct xrt_vec3 nominal = {0, si->nominal_viewer_y_m, si->nominal_viewer_z_m};
+				struct xrt_vec3 nominal = {0, 0, 0};
+				oxr_session_get_nominal_viewer(sess, &nominal.y, &nominal.z);
 				struct xrt_vec3 raw_eyes[XRT_MAX_VIEWS];
 
 				// The DP owns multi-view eye fill: it must report one eye
@@ -5446,6 +5482,29 @@ oxr_session_create(struct oxr_logger *log,
 	}
 #endif
 
+#ifdef OXR_HAVE_DXR_display_info
+	// XrSessionDisplayBindingDXR (spec v22, multi-screen M1): validate before
+	// anything is created so a bad id fails cleanly. 0 = runtime decides.
+	uint64_t bound_display_id = 0;
+	struct xrt_screen bound_display;
+	memset(&bound_display, 0, sizeof(bound_display));
+	const XrSessionDisplayBindingDXR *display_binding =
+	    OXR_GET_INPUT_FROM_CHAIN(createInfo, XR_TYPE_SESSION_DISPLAY_BINDING_DXR, XrSessionDisplayBindingDXR);
+	if (display_binding != NULL && sys->inst->extensions.DXR_display_info && display_binding->displayId != 0) {
+		struct xrt_screen_list screens;
+		oxr_system_get_screens(sys, &screens);
+		const struct xrt_screen *found = xrt_screen_list_find(&screens, display_binding->displayId);
+		if (found == NULL) {
+			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+			                 "(XrSessionDisplayBindingDXR::displayId == 0x%016llx) is not a display "
+			                 "xrEnumerateDisplaysDXR reports",
+			                 (unsigned long long)display_binding->displayId);
+		}
+		bound_display_id = display_binding->displayId;
+		bound_display = *found;
+	}
+#endif
+
 	/* Try allocating and populating. */
 	XrResult ret = oxr_session_create_impl(log, sys, createInfo, &xsi, &sess);
 	if (ret != XR_SUCCESS) {
@@ -5538,6 +5597,32 @@ oxr_session_create(struct oxr_logger *log,
 	}
 #endif
 	sess->is_bridge_relay = xsi.is_bridge_relay;
+
+#ifdef OXR_HAVE_DXR_display_info
+	if (bound_display_id != 0) {
+		sess->bound_display_id = bound_display_id;
+		const bool is_default = (bound_display.flags & XRT_SCREEN_FLAG_SYSTEM_DEFAULT) != 0;
+		// Bound to the system default = today's behaviour exactly. Bound
+		// elsewhere: that display's size and nominal viewer drive the
+		// session's display-scoped Kooima (M1); the DP that weaves is
+		// unchanged until multi-display segmentation (M2/M3).
+		sess->bound_display_overrides =
+		    !is_default && bound_display.info.width_m > 0.0f && bound_display.info.height_m > 0.0f;
+		sess->bound_display_info = bound_display.info;
+		U_LOG_W(
+		    "xrCreateSession: XrSessionDisplayBindingDXR -> display 0x%016llx ('%s', plug-in '%s', %.4f x %.4f "
+		    "m, "
+		    "nominal z %.3f m)%s",
+		    (unsigned long long)bound_display_id, bound_display.device_name, bound_display.plugin_id,
+		    bound_display.info.width_m, bound_display.info.height_m, bound_display.info.nominal_viewer_z_m,
+		    is_default ? " — the system default display, nothing changes"
+		    : sess->bound_display_overrides
+		        ? " — its size + nominal viewer back this session's display-scoped Kooima; weaving still "
+		          "follows the system default display (multi-screen M1)"
+		        : " — its physical size is unknown, so the session keeps the system default display's "
+		          "Kooima inputs");
+	}
+#endif
 
 #ifdef OXR_HAVE_DXR_depth_budget
 	// XR_DXR_depth_budget: the create-info chain is gone by locate time, and

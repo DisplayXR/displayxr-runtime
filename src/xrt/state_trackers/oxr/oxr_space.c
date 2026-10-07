@@ -335,6 +335,81 @@ oxr_space_xdev_pose_create(struct oxr_logger *log,
 	return XR_SUCCESS;
 }
 
+#ifdef OXR_HAVE_DXR_display_info
+XrResult
+oxr_space_display_create(struct oxr_logger *log,
+                         struct oxr_session *sess,
+                         const XrDisplaySpaceCreateInfoDXR *createInfo,
+                         struct oxr_space **out_space)
+{
+	struct xrt_screen_list screens;
+	oxr_system_get_screens(sess->sys, &screens);
+	if (createInfo->displayId == 0 || xrt_screen_list_find(&screens, createInfo->displayId) == NULL) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+		                 "(createInfo->displayId == 0x%016llx) is not a display xrEnumerateDisplaysDXR reports",
+		                 (unsigned long long)createInfo->displayId);
+	}
+
+	struct xrt_pose pose;
+	memcpy(&pose, &createInfo->poseInDisplaySpace, sizeof(pose));
+	if (!math_pose_validate(&pose)) {
+		return oxr_error(log, XR_ERROR_POSE_INVALID, "(createInfo->poseInDisplaySpace)");
+	}
+
+	struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
+	if (head == NULL) {
+		return oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "No head device for the display plane");
+	}
+
+	/*
+	 * Spec v22: every DISPLAY space is the session's single display plane —
+	 * where oxr_session_locate_views puts it (and XrViewDisplayRawDXR::
+	 * displayPlanePose reports it):
+	 *
+	 *  - runtime-window sessions: the head device's pose (on a 3D display
+	 *    the head device IS the display; the qwerty rig moves it). That is a
+	 *    pose space on the head's GENERIC_HEAD_POSE.
+	 *  - external-window and bridge-relay sessions: the identity of the
+	 *    head's tracking-origin space (the app owns its camera). That is an
+	 *    offset space from the root by the tracking-origin offset.
+	 *
+	 * Either way the overseer locates it, in-process and over IPC. An app
+	 * driving XR_DXR_view_rig owns the plane pose itself and does not need
+	 * this space. Per-display poses arrive in multi-screen M3.
+	 */
+	struct xrt_space *xspace = NULL;
+	xrt_result_t xret;
+	if (!sess->has_external_window && !sess->is_bridge_relay) {
+		xret = xrt_space_overseer_create_pose_space(sess->sys->xso, head, XRT_INPUT_GENERIC_HEAD_POSE, &xspace);
+		OXR_CHECK_XRET(log, sess, xret, xrt_space_overseer_create_pose_space);
+	} else {
+		struct xrt_pose origin_offset = XRT_POSE_IDENTITY;
+		if (head->tracking_origin != NULL) {
+			xret = xrt_space_overseer_get_tracking_origin_offset(sess->sys->xso, head->tracking_origin,
+			                                                     &origin_offset);
+			if (xret != XRT_SUCCESS) {
+				origin_offset = (struct xrt_pose)XRT_POSE_IDENTITY;
+			}
+		}
+		xret = xrt_space_overseer_create_offset_space(sess->sys->xso, sess->sys->xso->semantic.root,
+		                                              &origin_offset, &xspace);
+		OXR_CHECK_XRET(log, sess, xret, xrt_space_overseer_create_offset_space);
+	}
+
+	struct oxr_space *spc = NULL;
+	OXR_ALLOCATE_HANDLE_OR_RETURN(log, spc, OXR_XR_DEBUG_SPACE, oxr_space_destroy, &sess->handle);
+	spc->sess = sess;
+	spc->pose = pose;
+	spc->space_type = OXR_SPACE_TYPE_XDEV_POSE;
+	xrt_space_reference(&spc->xdev_pose.xs, xspace);
+	xrt_space_reference(&xspace, NULL);
+
+	*out_space = spc;
+
+	return XR_SUCCESS;
+}
+#endif // OXR_HAVE_DXR_display_info
+
 
 /*
  *

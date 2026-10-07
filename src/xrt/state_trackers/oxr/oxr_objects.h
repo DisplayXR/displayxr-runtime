@@ -18,6 +18,7 @@
 #include "xrt/xrt_tracking.h"
 #include "xrt/xrt_compositor.h"
 #include "xrt/xrt_display_metrics.h"
+#include "xrt/xrt_screen.h"
 #include "xrt/xrt_vulkan_includes.h"
 #include "xrt/xrt_openxr_includes.h"
 #include "xrt/xrt_config_os.h"
@@ -1211,6 +1212,20 @@ oxr_space_xdev_pose_create(struct oxr_logger *log,
                            const struct xrt_pose *pose,
                            struct oxr_space **out_space);
 
+#ifdef OXR_HAVE_DXR_display_info
+/*!
+ * XR_DXR_display_info v22: a DISPLAY space for one enumerated display. In v22
+ * every display space resolves to the session's single display plane (the
+ * pose XrViewDisplayRawDXR::displayPlanePose reports); per-display poses
+ * arrive with per-screen DISPLAY poses (multi-screen M3).
+ */
+XrResult
+oxr_space_display_create(struct oxr_logger *log,
+                         struct oxr_session *sess,
+                         const XrDisplaySpaceCreateInfoDXR *createInfo,
+                         struct oxr_space **out_space);
+#endif
+
 XrResult
 oxr_space_locate(
     struct oxr_logger *log, struct oxr_space *spc, struct oxr_space *baseSpc, XrTime time, XrSpaceLocation *location);
@@ -1342,6 +1357,25 @@ oxr_system_get_by_id(struct oxr_logger *log,
 
 XrResult
 oxr_system_get_properties(struct oxr_logger *log, struct oxr_system *sys, XrSystemProperties *properties);
+
+/*!
+ * Multi-screen M1: the system's screens (`xrt_instance::enumerate_displays`,
+ * in-process or over IPC). Never empty while the system has display info: an
+ * instance that cannot enumerate yields one screen synthesized from
+ * `xsysc->info`, flagged SYSTEM_DEFAULT.
+ */
+void
+oxr_system_get_screens(struct oxr_system *sys, struct xrt_screen_list *out_list);
+
+#ifdef OXR_HAVE_DXR_display_info
+//! xrEnumerateDisplaysDXR (XR_DXR_display_info v22).
+XrResult
+oxr_system_enumerate_displays(struct oxr_logger *log,
+                              struct oxr_system *sys,
+                              uint32_t displayCapacityInput,
+                              uint32_t *displayCountOutput,
+                              XrDisplayDXR *displays);
+#endif
 
 /*!
  * #1486: is @p type one of the primary view configurations this system
@@ -2792,6 +2826,21 @@ struct oxr_session
 
 	//! True if session was created with an external window handle (XR_DXR_win32_window_binding).
 	bool has_external_window;
+
+	/*!
+	 * XrSessionDisplayBindingDXR (XR_DXR_display_info v22, multi-screen M1):
+	 * the display the app pinned the session to; 0 = runtime decides.
+	 */
+	uint64_t bound_display_id;
+
+	/*!
+	 * True when the session is bound to a display OTHER than the system
+	 * default and that display's size is known: @ref bound_display_info then
+	 * backs the session's display-scoped Kooima inputs (physical size,
+	 * nominal viewer). Which DP weaves is unchanged in M1.
+	 */
+	bool bound_display_overrides;
+	struct xrt_screen_info bound_display_info;
 
 #ifdef XRT_OS_ANDROID
 	//! The last ANativeWindow this session published into `android_globals`

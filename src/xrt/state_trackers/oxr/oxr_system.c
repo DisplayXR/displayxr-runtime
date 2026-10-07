@@ -15,6 +15,8 @@
 #include <assert.h>
 
 #include "xrt/xrt_device.h"
+#include "xrt/xrt_instance.h"
+#include "xrt/xrt_screen.h"
 #include "util/u_debug.h"
 #include "util/u_verify.h"
 
@@ -1005,6 +1007,158 @@ oxr_system_get_properties(struct oxr_logger *log, struct oxr_system *sys, XrSyst
 
 	return XR_SUCCESS;
 }
+
+/*
+ *
+ * Multi-screen M1: per-display enumeration (XR_DXR_display_info v22).
+ *
+ */
+
+void
+oxr_system_get_screens(struct oxr_system *sys, struct xrt_screen_list *out_list)
+{
+	memset(out_list, 0, sizeof(*out_list));
+
+	struct xrt_instance *xinst = (sys != NULL && sys->inst != NULL) ? sys->inst->xinst : NULL;
+	if (xrt_instance_enumerate_displays(xinst, out_list) != XRT_SUCCESS) {
+		memset(out_list, 0, sizeof(*out_list));
+	}
+	if (out_list->count > 0 || sys == NULL || sys->xsysc == NULL) {
+		return;
+	}
+
+	// The instance could not enumerate (or knows no monitor): the system's
+	// own display is still a display. Synthesize it from the system info so
+	// the list always carries exactly one SYSTEM_DEFAULT entry.
+	const struct xrt_system_compositor_info *info = &sys->xsysc->info;
+	if (!(info->display_width_m > 0.0f) || !(info->display_height_m > 0.0f)) {
+		return;
+	}
+	struct xrt_screen *scr = &out_list->screens[0];
+	scr->id = XRT_SCREEN_ID_SYNTHETIC_DEFAULT;
+	scr->flags = XRT_SCREEN_FLAG_SYSTEM_DEFAULT;
+	if (info->display_is_primary) {
+		scr->flags |= XRT_SCREEN_FLAG_PRIMARY;
+	}
+	if (info->supported_eye_tracking_modes != 0) {
+		scr->flags |= XRT_SCREEN_FLAG_TRACKED;
+	}
+	scr->desktop_left = info->display_screen_left;
+	scr->desktop_top = info->display_screen_top;
+	scr->desktop_width = info->display_desktop_width;
+	scr->desktop_height = info->display_desktop_height;
+	scr->native_width = info->display_desktop_native_width;
+	scr->native_height = info->display_desktop_native_height;
+	scr->desktop_scale = info->display_desktop_scale;
+	(void)snprintf(scr->plugin_id, sizeof(scr->plugin_id), "%s", info->active_plugin_id);
+	(void)snprintf(scr->device_name, sizeof(scr->device_name), "%.*s", (int)(sizeof(scr->device_name) - 1),
+	               info->display_device_name);
+	scr->info.width_m = info->display_width_m;
+	scr->info.height_m = info->display_height_m;
+	scr->info.nominal_viewer_x_m = info->nominal_viewer_x_m;
+	scr->info.nominal_viewer_y_m = info->nominal_viewer_y_m;
+	scr->info.nominal_viewer_z_m = info->nominal_viewer_z_m;
+	scr->info.recommended_view_scale_x = info->recommended_view_scale_x;
+	scr->info.recommended_view_scale_y = info->recommended_view_scale_y;
+	scr->info.pixel_width = info->display_pixel_width;
+	scr->info.pixel_height = info->display_pixel_height;
+	scr->info.supported_eye_tracking_modes = info->supported_eye_tracking_modes;
+	scr->info.default_eye_tracking_mode = info->default_eye_tracking_mode;
+	scr->info.source = XRT_SCREEN_INFO_SOURCE_SYSTEM;
+	out_list->count = 1;
+}
+
+#ifdef OXR_HAVE_DXR_display_info
+static void
+fill_display_dxr(struct oxr_system *sys, const struct xrt_screen *scr, XrDisplayDXR *d)
+{
+	const struct xrt_screen_info *si = &scr->info;
+
+	d->type = XR_TYPE_DISPLAY_DXR;
+	// d->next is the app's; nothing is chained on XrDisplayDXR in v22.
+	d->displayId = scr->id;
+
+	d->info.type = XR_TYPE_DISPLAY_INFO_DXR;
+	d->info.next = NULL;
+	d->info.displaySizeMeters.width = si->width_m;
+	d->info.displaySizeMeters.height = si->height_m;
+	d->info.nominalViewerPositionInDisplaySpace.x = si->nominal_viewer_x_m;
+	d->info.nominalViewerPositionInDisplaySpace.y = si->nominal_viewer_y_m;
+	d->info.nominalViewerPositionInDisplaySpace.z = si->nominal_viewer_z_m;
+	float scale_x = si->recommended_view_scale_x;
+	float scale_y = si->recommended_view_scale_y;
+	if ((scr->flags & XRT_SCREEN_FLAG_SYSTEM_DEFAULT) != 0) {
+		// Exactly what XrDisplayInfoDXR on XrSystemProperties reports: the
+		// ACTIVE mode's per-view scale at query time (see
+		// oxr_system_get_properties).
+		xrt_device_get_active_mode_view_scale(GET_XDEV_BY_ROLE(sys, head), &scale_x, &scale_y);
+	}
+	d->info.recommendedViewScaleX = scale_x;
+	d->info.recommendedViewScaleY = scale_y;
+	d->info.displayPixelWidth = si->pixel_width;
+	d->info.displayPixelHeight = si->pixel_height;
+
+	d->desktopRect.offset.x = scr->desktop_left;
+	d->desktopRect.offset.y = scr->desktop_top;
+	d->desktopRect.extent.width = (int32_t)scr->desktop_width;
+	d->desktopRect.extent.height = (int32_t)scr->desktop_height;
+	d->nativePixelWidth = scr->native_width;
+	d->nativePixelHeight = scr->native_height;
+	d->desktopScale = scr->desktop_scale;
+
+	d->eyeTracking.type = XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_DXR;
+	d->eyeTracking.next = NULL;
+	d->eyeTracking.supportedModes = (XrEyeTrackingModeCapabilityFlagsDXR)si->supported_eye_tracking_modes;
+	d->eyeTracking.defaultMode = (XrEyeTrackingModeDXR)si->default_eye_tracking_mode;
+
+	d->flags = 0;
+	if ((scr->flags & XRT_SCREEN_FLAG_PRIMARY) != 0) {
+		d->flags |= XR_DISPLAY_PRIMARY_BIT_DXR;
+	}
+	if ((scr->flags & XRT_SCREEN_FLAG_TRACKED) != 0) {
+		d->flags |= XR_DISPLAY_TRACKED_BIT_DXR;
+	}
+	if ((scr->flags & XRT_SCREEN_FLAG_SYSTEM_DEFAULT) != 0) {
+		d->flags |= XR_DISPLAY_SYSTEM_DEFAULT_BIT_DXR;
+	}
+
+	(void)snprintf(d->vendorPluginId, sizeof(d->vendorPluginId), "%s", scr->plugin_id);
+	(void)snprintf(d->deviceName, sizeof(d->deviceName), "%s", scr->device_name);
+}
+
+XrResult
+oxr_system_enumerate_displays(struct oxr_logger *log,
+                              struct oxr_system *sys,
+                              uint32_t displayCapacityInput,
+                              uint32_t *displayCountOutput,
+                              XrDisplayDXR *displays)
+{
+	struct xrt_screen_list list;
+	oxr_system_get_screens(sys, &list);
+
+	*displayCountOutput = list.count;
+	if (displayCapacityInput == 0) {
+		return XR_SUCCESS;
+	}
+	if (displays == NULL) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "(displays == NULL) with displayCapacityInput > 0");
+	}
+	if (displayCapacityInput < list.count) {
+		return oxr_error(log, XR_ERROR_SIZE_INSUFFICIENT, "(displayCapacityInput == %u) < %u",
+		                 displayCapacityInput, list.count);
+	}
+	for (uint32_t i = 0; i < list.count; i++) {
+		if (displays[i].type != XR_TYPE_DISPLAY_DXR) {
+			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "(displays[%u].type != XR_TYPE_DISPLAY_DXR)",
+			                 i);
+		}
+	}
+	for (uint32_t i = 0; i < list.count; i++) {
+		fill_display_dxr(sys, &list.screens[i], &displays[i]);
+	}
+	return XR_SUCCESS;
+}
+#endif // OXR_HAVE_DXR_display_info
 
 bool
 oxr_system_lookup_view_config(const struct oxr_system *sys, XrViewConfigurationType type, uint32_t *out_view_count)

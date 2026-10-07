@@ -231,6 +231,33 @@ oxr_xrCreateReferenceSpace(XrSession session, const XrReferenceSpaceCreateInfo *
 	return oxr_session_success_result(sess);
 }
 
+#ifdef OXR_HAVE_DXR_display_info
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrCreateDisplaySpaceDXR(XrSession session, const XrDisplaySpaceCreateInfoDXR *createInfo, XrSpace *out_space)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess;
+	struct oxr_space *spc = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrCreateDisplaySpaceDXR");
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_display_info);
+	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, createInfo, XR_TYPE_DISPLAY_SPACE_CREATE_INFO_DXR);
+	OXR_VERIFY_ARG_NOT_NULL(&log, out_space);
+	OXR_VERIFY_POSE(&log, createInfo->poseInDisplaySpace);
+
+	XrResult ret = oxr_space_display_create(&log, sess, createInfo, &spc);
+	if (ret != XR_SUCCESS) {
+		return ret;
+	}
+
+	*out_space = oxr_space_to_openxr(spc);
+
+	return oxr_session_success_result(sess);
+}
+#endif // OXR_HAVE_DXR_display_info
+
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrLocateSpace(XrSpace space, XrSpace baseSpace, XrTime time, XrSpaceLocation *location)
 {

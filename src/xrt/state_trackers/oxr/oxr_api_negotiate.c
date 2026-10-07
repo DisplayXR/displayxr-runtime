@@ -437,6 +437,8 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 	ENTRY_IF_EXT(xrRequestEyeTrackingModeDXR, DXR_display_info);
 	ENTRY_IF_EXT(xrRequestDisplayRenderingModeDXR, DXR_display_info);
 	ENTRY_IF_EXT(xrEnumerateDisplayRenderingModesDXR, DXR_display_info);
+	ENTRY_IF_EXT(xrEnumerateDisplaysDXR, DXR_display_info);
+	ENTRY_IF_EXT(xrCreateDisplaySpaceDXR, DXR_display_info);
 #endif
 
 #ifdef OXR_HAVE_DXR_view_rig

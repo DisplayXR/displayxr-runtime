@@ -790,6 +790,16 @@ oxr_xrEnumerateDisplayRenderingModesDXR(XrSession session,
                                         uint32_t modeCapacityInput,
                                         uint32_t *modeCountOutput,
                                         XrDisplayRenderingModeInfoDXR *modes);
+//! OpenXR API function @ep{xrEnumerateDisplaysDXR} (spec v22, multi-screen M1)
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrEnumerateDisplaysDXR(XrInstance instance,
+                           XrSystemId systemId,
+                           uint32_t displayCapacityInput,
+                           uint32_t *displayCountOutput,
+                           XrDisplayDXR *displays);
+//! OpenXR API function @ep{xrCreateDisplaySpaceDXR} (spec v22, multi-screen M1)
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrCreateDisplaySpaceDXR(XrSession session, const XrDisplaySpaceCreateInfoDXR *createInfo, XrSpace *space);
 //! OpenXR API function @ep{xrSetWorkspaceViewRigDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSetWorkspaceViewRigDXR(XrSession session, const void *rig);
