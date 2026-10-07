@@ -80,6 +80,7 @@
 #include "oxr_chain.h"
 #include "oxr_api_verify.h"
 #include "oxr_pretty_print.h"
+#include "oxr_segment_views.h"
 #include "oxr_conversions.h"
 #include "oxr_xret.h"
 #include "oxr_legacy_mode_rule.h" // #1510/#1499 mode floor
@@ -1168,8 +1169,12 @@ oxr_session_begin(struct oxr_logger *log, struct oxr_session *sess, const XrSess
 			 * is untouched by construction.
 			 */
 			if (!legacy_session && oxr_session_mode_floor_enabled()) {
-				const uint32_t max_submit =
-				    sess->view_config_view_count != 0 ? sess->view_config_view_count : 2;
+				// Multi-screen M3: a multiview session reports one view set
+				// per segment; what fills a mode is ONE segment's share.
+				const uint32_t max_submit = oxr_segment_views_per_segment_capacity(
+				    sess->view_config_view_count != 0 ? sess->view_config_view_count : 2,
+				    sess->view_config_type == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR,
+				    head->hmd->view_count);
 
 				// The two carve-outs, shared verbatim with the denial in
 				// oxr_xrRequestDisplayRenderingModeDXR so they cannot diverge.
@@ -2468,14 +2473,51 @@ oxr_session_fill_cursor_depth(struct oxr_session *sess,
 }
 #endif // OXR_HAVE_DXR_cursor_depth
 
-XrResult
-oxr_session_locate_views(struct oxr_logger *log,
-                         struct oxr_session *sess,
-                         const XrViewLocateInfo *viewLocateInfo,
-                         XrViewState *viewState,
-                         uint32_t viewCapacityInput,
-                         uint32_t *viewCountOutput,
-                         XrView *views)
+/*!
+ * Multi-screen M3: what one segment's locate uses instead of the session's own
+ * DP + window (ADR-047 D3). NULL everywhere below = the single-screen path,
+ * byte for byte.
+ *
+ * Everything is expressed in the REFERENCE frame — the display space of the
+ * screen holding most of the window (oxr_segment_views_layout): the eyes are
+ * already translated into it, and @ref wm puts the segment's canvas centre
+ * there too, so `eye - canvas centre` is the eye relative to the segment as it
+ * sits on its own screen (that screen's Kooima).
+ */
+struct oxr_locate_segment
+{
+	//! The canvas: this segment (or, for a stereo session, the whole window).
+	struct xrt_window_metrics wm;
+	//! The screen DP's eyes, reference frame. have_eyes false = nominal viewer.
+	struct xrt_eye_positions eyes;
+	bool have_eyes;
+	//! The screen's nominal viewer (its own display space).
+	float nominal_y_m;
+	float nominal_z_m;
+	//! Own-screen -> reference-frame translation (applied to the nominal eyes).
+	float eye_dx;
+	float eye_dy;
+	//! This canvas centre minus the whole window's centre, reference metres:
+	//! a window-centred display rig puts the WINDOW at its pose, so each
+	//! segment's virtual canvas is offset by m2v times this.
+	float rig_dx;
+	float rig_dy;
+	//! Views this call locates (the per-segment count); 0 = the session's.
+	uint32_t view_count;
+	//! Publish session-level side effects (#1502 VIEW offset, #441 tracking
+	//! edge): only the majority segment's call does.
+	bool side_effects;
+};
+
+static XrResult
+locate_views_one(struct oxr_logger *log,
+                 struct oxr_session *sess,
+                 const XrViewLocateInfo *viewLocateInfo,
+                 XrViewState *viewState,
+                 uint32_t viewCapacityInput,
+                 uint32_t *viewCountOutput,
+                 XrView *views,
+                 const struct oxr_locate_segment *seg)
 {
 	struct oxr_sink_logger slog = {0};
 	bool print = sess->sys->inst->debug_views;
@@ -2497,11 +2539,30 @@ oxr_session_locate_views(struct oxr_logger *log,
 	 */
 	uint32_t view_count = xdev->hmd->view_count;
 	uint32_t reported_view_count = sess->view_config_view_count;
-	if (reported_view_count == 0 || reported_view_count > view_count) {
-		// Defensive: a session begun before the field was seeded, or a view
-		// config claiming more views than the device has.
-		reported_view_count = view_count;
+	// Multi-screen M3: PRIMARY_MULTIVIEW_DXR legitimately reports MORE views
+	// than the device has — one set per window segment
+	// (oxr_segment_views_multiview_count). Every other type is bounded by the
+	// device.
+	uint32_t reported_cap = view_count;
+#ifdef OXR_HAVE_DXR_display_info
+	if (sess->view_config_type == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR) {
+		reported_cap = oxr_segment_views_multiview_count(view_count);
 	}
+#endif
+	if (reported_view_count == 0) {
+		// Defensive: a session begun before the field was seeded.
+		reported_view_count = view_count;
+	} else if (reported_view_count > reported_cap) {
+		// Defensive: a view config claiming more views than it may.
+		reported_view_count = reported_cap;
+	}
+	if (seg != NULL && seg->view_count != 0 && seg->view_count <= view_count) {
+		// One segment's locate: exactly that segment's view set.
+		reported_view_count = seg->view_count;
+	}
+	// The views the device math below fills: never more than the device has.
+	// Views past it are the multiview tail and are aliased further down.
+	const uint32_t located_view_count = reported_view_count < view_count ? reported_view_count : view_count;
 
 	// Active rendering mode's view count — controls mono vs 3D eye assignment.
 	// view_count is the max across all modes, but active_view_count reflects
@@ -2738,7 +2799,13 @@ oxr_session_locate_views(struct oxr_logger *log,
 	// checks xmcc != NULL before casting to multi_compositor, so IPC proxies
 	// are handled safely (returns false). In IPC mode, the server handles
 	// eye tracking via ipc_try_get_sr_view_poses.
-	bool got_eye_positions = oxr_session_get_predicted_eye_positions(sess, &eye_pos);
+	bool got_eye_positions = false;
+	if (seg != NULL) {
+		eye_pos = seg->eyes;
+		got_eye_positions = seg->have_eyes;
+	} else {
+		got_eye_positions = oxr_session_get_predicted_eye_positions(sess, &eye_pos);
+	}
 
 	// One-shot diagnostic: log stereo gate values for first frames
 	{
@@ -2900,6 +2967,9 @@ oxr_session_locate_views(struct oxr_logger *log,
 			// or from the bound display (XrSessionDisplayBindingDXR, M1).
 			float nominal_z_m = 0.0f;
 			oxr_session_get_nominal_viewer(sess, NULL, &nominal_z_m);
+			if (seg != NULL) {
+				nominal_z_m = seg->nominal_z_m;
+			}
 			U_LOG_I("Kooima: nominal_z=%.3f", nominal_z_m);
 			if (nominal_z_m > 0.0f) {
 				float ipd_m = sess->ipd_meters;
@@ -2915,6 +2985,14 @@ oxr_session_locate_views(struct oxr_logger *log,
 				// (the `nominal` vector below), never to the eye position.
 				adj_eyes[0] = (struct xrt_eye_position){-ipd_m / 2.0f, 0.0f, nominal_z_m};
 				adj_eyes[1] = (struct xrt_eye_position){ipd_m / 2.0f, 0.0f, nominal_z_m};
+				if (seg != NULL) {
+					// In front of THIS segment's screen, carried into
+					// the reference frame.
+					for (uint32_t ei = 0; ei < 2; ei++) {
+						adj_eyes[ei].x += seg->eye_dx;
+						adj_eyes[ei].y += seg->eye_dy;
+					}
+				}
 				have_eye_positions = true;
 				if (should_log) {
 					U_LOG_I("Nominal eyes: [0]=(%.4f,%.4f,%.4f) [1]=(%.4f,%.4f,%.4f), IPD=%.1fmm",
@@ -3002,7 +3080,16 @@ oxr_session_locate_views(struct oxr_logger *log,
 			bool win_has_orientation = false;
 
 			struct xrt_window_metrics wm = {0};
-			bool have_wm = oxr_session_get_window_metrics(sess, &wm);
+			bool have_wm = false;
+			if (seg != NULL) {
+				// Multi-screen M3: the segment (or, stereo, the whole window
+				// framed from the majority screen) instead of the session
+				// DP's window metrics.
+				wm = seg->wm;
+				have_wm = wm.valid;
+			} else {
+				have_wm = oxr_session_get_window_metrics(sess, &wm);
+			}
 
 #ifdef OXR_HAVE_DXR_display_zones
 			// Zone-scoped locate: rebase the window metrics to the
@@ -3117,6 +3204,10 @@ oxr_session_locate_views(struct oxr_logger *log,
 				// Nominal viewer for view math (parallax lerp target)
 				struct xrt_vec3 nominal = {0, 0, 0};
 				oxr_session_get_nominal_viewer(sess, &nominal.y, &nominal.z);
+				if (seg != NULL) {
+					nominal.y = seg->nominal_y_m;
+					nominal.z = seg->nominal_z_m;
+				}
 				struct xrt_vec3 raw_eyes[XRT_MAX_VIEWS];
 
 				// The DP owns multi-view eye fill: it must report one eye
@@ -3197,6 +3288,21 @@ oxr_session_locate_views(struct oxr_logger *log,
 						dt.virtual_display_height = active_rig->virtual_display_height;
 					} else {
 						dt.virtual_display_height = screen_height_m; // identity m2v
+					}
+
+					// Multi-screen M3: a display rig centres the WINDOW on
+					// its pose; this segment's canvas sits m2v x its offset
+					// from the window centre (ref frame -> rig frame).
+					if (seg != NULL && (seg->rig_dx != 0.0f || seg->rig_dy != 0.0f) &&
+					    screen_height_m > 0.0f) {
+						const float m2v = dt.virtual_display_height / screen_height_m;
+						const struct xrt_vec3 off = {seg->rig_dx * m2v, seg->rig_dy * m2v,
+						                             0.0f};
+						struct xrt_vec3 off_rot;
+						math_quat_rotate_vec3(&display_pose.orientation, &off, &off_rot);
+						display_pose.position.x += off_rot.x;
+						display_pose.position.y += off_rot.y;
+						display_pose.position.z += off_rot.z;
 					}
 
 					struct dxr_xrt_view disp_views[XRT_MAX_VIEWS];
@@ -3535,7 +3641,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 
 
 	if (print) {
-		for (uint32_t i = 0; i < reported_view_count; i++) {
+		for (uint32_t i = 0; i < located_view_count; i++) {
 			char tmp[32];
 			snprintf(tmp, 32, "xdev.view[%i]", i);
 			oxr_pp_fov_indented_as_object(&slog, &fovs[i], tmp);
@@ -3552,8 +3658,10 @@ oxr_session_locate_views(struct oxr_logger *log,
 	uint32_t base_space_view_count = 0;
 
 	// #1486: bounded by what the app's view configuration reports, not by the
-	// device max — views[] is only reported_view_count long.
-	for (uint32_t i = 0; i < reported_view_count; i++) {
+	// device max — views[] is only reported_view_count long. Multi-screen M3:
+	// and by the device, whose math filled only that many; the multiview tail
+	// past it is aliased below with the other inactive views.
+	for (uint32_t i = 0; i < located_view_count; i++) {
 		/*
 		 * Pose
 		 */
@@ -3856,8 +3964,8 @@ oxr_session_locate_views(struct oxr_logger *log,
 	{
 		const enum xrt_space_relation_flags need =
 		    XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_VALID_BIT;
-		const bool measurable = !rig_active && active_view_count > 0 && reported_view_count > 0 &&
-		                        base_space_view_count >= active_view_count &&
+		const bool measurable = (seg == NULL || seg->side_effects) && !rig_active && active_view_count > 0 &&
+		                        reported_view_count > 0 && base_space_view_count >= active_view_count &&
 		                        (T_base_head.relation_flags & need) == need;
 		if (measurable) {
 			struct xrt_vec3 centroid = {0.0f, 0.0f, 0.0f};
@@ -3945,12 +4053,14 @@ oxr_session_locate_views(struct oxr_logger *log,
 		// sample yet": the first locate establishes the baseline
 		// without firing (apps read the initial state from
 		// XrViewEyeTrackingStateDXR).
-		if (sess->last_is_tracking >= 0 && (sess->last_is_tracking != 0) != is_tracking) {
-			oxr_event_push_XrEventDataEyeTrackingStateChanged(
-			    log, sess, is_tracking ? XR_TRUE : XR_FALSE,
-			    (XrEyeTrackingModeDXR)sess->eye_tracking_mode);
+		if (seg == NULL || seg->side_effects) {
+			if (sess->last_is_tracking >= 0 && (sess->last_is_tracking != 0) != is_tracking) {
+				oxr_event_push_XrEventDataEyeTrackingStateChanged(
+				    log, sess, is_tracking ? XR_TRUE : XR_FALSE,
+				    (XrEyeTrackingModeDXR)sess->eye_tracking_mode);
+			}
+			sess->last_is_tracking = is_tracking ? 1 : 0;
 		}
-		sess->last_is_tracking = is_tracking ? 1 : 0;
 	}
 #endif // OXR_HAVE_DXR_display_info
 
@@ -3960,6 +4070,346 @@ oxr_session_locate_views(struct oxr_logger *log,
 		oxr_slog_cancel(&slog);
 	}
 
+	return oxr_session_success_result(sess);
+}
+
+
+/*
+ *
+ * Multi-screen M3 (ADR-047 D3): per-segment views.
+ *
+ */
+
+//! The compositor's segment table, when this session's compositor segments its
+//! window (in-process Vulkan, desktop Linux). Everything else — the other
+//! native compositors, IPC/service sessions (the service never segments) —
+//! answers false and keeps one view set.
+static bool
+locate_get_segment_metrics(struct oxr_session *sess, struct xrt_segment_metrics *out)
+{
+	memset(out, 0, sizeof(*out));
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+	if (sess->xcn != NULL && sess->is_vk_native_compositor) {
+		return comp_vk_native_compositor_get_segment_metrics(&sess->xcn->base, out) && out->count > 0;
+	}
+#else
+	(void)sess;
+#endif
+	return false;
+}
+
+/*!
+ * Can this locate be split per segment? Per-segment views are a display-centric
+ * notion: each segment is a canvas the eye looks through. A camera-centric
+ * locate (a chained XrCameraRigDXR, or the qwerty camera synthesis of a
+ * runtime-window session) frames a fixed-FOV camera on the whole window and has
+ * no per-canvas meaning, and a zone-scoped locate already names its own canvas;
+ * both keep one view set (the compositor then crops it per segment, as in M2).
+ */
+static bool
+locate_can_split(struct oxr_session *sess, const XrViewLocateInfo *info)
+{
+#ifdef OXR_HAVE_DXR_display_zones
+	if (sess->sys->inst->extensions.DXR_display_zones &&
+	    OXR_GET_INPUT_FROM_CHAIN(info, XR_TYPE_DISPLAY_ZONE_DXR, XrDisplayZoneDXR) != NULL) {
+		return false;
+	}
+#endif
+#ifdef OXR_HAVE_DXR_view_rig
+	if (sess->sys->inst->extensions.DXR_view_rig) {
+		if (OXR_GET_INPUT_FROM_CHAIN(info, XR_TYPE_CAMERA_RIG_DXR, XrCameraRigDXR) != NULL) {
+			return false;
+		}
+		if (OXR_GET_INPUT_FROM_CHAIN(info, XR_TYPE_DISPLAY_RIG_DXR, XrDisplayRigDXR) != NULL) {
+			return true;
+		}
+	}
+#else
+	(void)info;
+#endif
+#ifdef XRT_BUILD_DRIVER_QWERTY
+	if (!sess->has_external_window) {
+		struct qwerty_view_state vs = {0};
+		if (qwerty_get_view_state(sess->sys->xsysd->xdevs, sess->sys->xsysd->xdev_count, &vs) &&
+		    vs.camera_mode) {
+			return false;
+		}
+	}
+#endif
+	return true;
+}
+
+//! Segment @p i of @p m as a locate override (see struct oxr_locate_segment).
+static void
+locate_segment_override(const struct xrt_segment_metrics *m,
+                        const struct oxr_segment_layout *l,
+                        uint32_t i,
+                        struct oxr_locate_segment *o)
+{
+	memset(o, 0, sizeof(*o));
+	const struct xrt_segment_metric *s = &m->seg[i];
+	oxr_segment_views_window_metrics(m, l, i, &o->wm);
+
+	float dx = 0.0f, dy = 0.0f;
+	oxr_segment_views_own_to_ref(l, i, &dx, &dy);
+	o->eye_dx = dx;
+	o->eye_dy = dy;
+	o->nominal_y_m = s->nominal_viewer_y_m;
+	o->nominal_z_m = s->nominal_viewer_z_m;
+
+	// The screen's DP eyes when it is tracking a viewer; otherwise the
+	// screen's nominal viewer (the locate's untracked branch).
+	if (s->have_eyes && s->eyes.valid && s->eyes.is_tracking && s->eyes.count > 0) {
+		o->eyes = s->eyes;
+		for (uint32_t e = 0; e < o->eyes.count && e < XRT_MAX_VIEWS; e++) {
+			o->eyes.eyes[e].x += dx;
+			o->eyes.eyes[e].y += dy;
+		}
+		o->have_eyes = true;
+	}
+
+	o->rig_dx = l->seg[i].ref_cx - l->window_ref_cx;
+	o->rig_dy = l->seg[i].ref_cy - l->window_ref_cy;
+}
+
+static void
+locate_fill_bindings(struct oxr_session *sess, XrViewState *viewState, const struct xrt_segment_view_routing *r)
+{
+#ifdef OXR_HAVE_DXR_display_info
+	if (!sess->sys->inst->extensions.DXR_display_info) {
+		return;
+	}
+	XrViewDisplayBindingsDXR *vb =
+	    OXR_GET_OUTPUT_FROM_CHAIN(viewState, XR_TYPE_VIEW_DISPLAY_BINDINGS_DXR, XrViewDisplayBindingsDXR);
+	if (vb == NULL) {
+		return;
+	}
+	vb->bindingCountOutput = r->count;
+	if (vb->bindingCapacityInput < r->count || vb->bindings == NULL) {
+		return; // count query, or too small: the count only (the views are still located)
+	}
+	for (uint32_t k = 0; k < r->count; k++) {
+		XrViewDisplayBindingDXR *b = &vb->bindings[k];
+		b->displayId = r->screen_id[k];
+		b->segmentRect =
+		    (XrRect2Di){{r->rect[k].offset.w, r->rect[k].offset.h}, {r->rect[k].extent.w, r->rect[k].extent.h}};
+		b->firstView = r->first_view[k];
+		b->viewCount = r->view_count[k];
+	}
+#else
+	(void)sess;
+	(void)viewState;
+	(void)r;
+#endif
+}
+
+//! One INFO line per change of the per-segment view layout (never per frame).
+static void
+locate_log_route_change(struct oxr_session *sess)
+{
+	if (memcmp(&sess->seg_route, &sess->seg_route_logged, sizeof(sess->seg_route)) == 0) {
+		return;
+	}
+	sess->seg_route_logged = sess->seg_route;
+	const struct xrt_segment_view_routing *r = &sess->seg_route;
+	if (r->count == 0) {
+		U_LOG_I("per-segment views: off — one view set for the whole window");
+		return;
+	}
+	char buf[512];
+	int n = 0;
+	for (uint32_t k = 0; k < r->count && n >= 0 && (size_t)n < sizeof(buf); k++) {
+		n += snprintf(buf + n, sizeof(buf) - (size_t)n,
+		              "%s[%u] display 0x%016llx views %u..%u canvas %d,%d %dx%d", k > 0 ? "; " : "", k,
+		              (unsigned long long)r->screen_id[k], r->first_view[k],
+		              r->first_view[k] + r->view_count[k] - 1, r->rect[k].offset.w, r->rect[k].offset.h,
+		              r->rect[k].extent.w, r->rect[k].extent.h);
+	}
+	U_LOG_I("per-segment views: %u segment(s): %s", r->count, buf);
+}
+
+XrResult
+oxr_session_locate_views(struct oxr_logger *log,
+                         struct oxr_session *sess,
+                         const XrViewLocateInfo *viewLocateInfo,
+                         XrViewState *viewState,
+                         uint32_t viewCapacityInput,
+                         uint32_t *viewCountOutput,
+                         XrView *views)
+{
+	struct xrt_segment_metrics m;
+	struct xrt_device *xdev = GET_XDEV_BY_ROLE(sess->sys, head);
+	if (xdev == NULL || xdev->hmd == NULL || !locate_get_segment_metrics(sess, &m)) {
+		// The window is on one screen (or nothing segments it): the
+		// single-screen path, byte for byte.
+		XrResult ret = locate_views_one(log, sess, viewLocateInfo, viewState, viewCapacityInput,
+		                                viewCountOutput, views, NULL);
+		if (viewCapacityInput > 0 && ret == XR_SUCCESS) {
+			sess->seg_route.count = 0;
+			locate_fill_bindings(sess, viewState, &sess->seg_route);
+			locate_log_route_change(sess);
+		}
+		return ret;
+	}
+
+	const uint32_t mj = oxr_segment_views_majority(&m);
+	bool is_multiview = false;
+#ifdef OXR_HAVE_DXR_display_info
+	is_multiview = sess->view_config_type == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR;
+#endif
+
+	/*
+	 * PRIMARY_STEREO (and MONO): the app submits a fixed view set, so the
+	 * window keeps ONE — framed from the screen holding most of the window
+	 * (its eyes, the window relative to it). The compositor crops that set
+	 * per segment, each woven by its own screen's DP or flat 2D (M2). When
+	 * the majority is the primary screen this IS the single-screen path.
+	 */
+	if (!is_multiview || !locate_can_split(sess, viewLocateInfo)) {
+		XrResult ret;
+		if (m.seg[mj].is_primary) {
+			ret = locate_views_one(log, sess, viewLocateInfo, viewState, viewCapacityInput, viewCountOutput,
+			                       views, NULL);
+		} else {
+			struct oxr_locate_segment o;
+			memset(&o, 0, sizeof(o));
+			oxr_segment_views_whole_window_metrics(&m, mj, &o.wm);
+			const struct xrt_segment_metric *s = &m.seg[mj];
+			o.nominal_y_m = s->nominal_viewer_y_m;
+			o.nominal_z_m = s->nominal_viewer_z_m;
+			if (s->have_eyes && s->eyes.valid && s->eyes.is_tracking && s->eyes.count > 0) {
+				o.eyes = s->eyes;
+				o.have_eyes = true;
+			}
+			o.side_effects = true;
+			ret = locate_views_one(log, sess, viewLocateInfo, viewState, viewCapacityInput, viewCountOutput,
+			                       views, o.wm.valid ? &o : NULL);
+		}
+		if (viewCapacityInput > 0 && ret == XR_SUCCESS) {
+			sess->seg_route.count = 0;
+			locate_fill_bindings(sess, viewState, &sess->seg_route);
+			locate_log_route_change(sess);
+		}
+		return ret;
+	}
+
+	/*
+	 * PRIMARY_MULTIVIEW_DXR: one view set per segment, contiguous, in table
+	 * order (left to right). Per segment: that screen's eyes, Kooima with the
+	 * segment (relative to its own screen) as the canvas, the active mode's
+	 * view count (the mode is session-wide in M3).
+	 */
+	const uint32_t dev_views = xdev->hmd->view_count;
+	uint32_t active = dev_views;
+	if (xdev->hmd->active_rendering_mode_index < xdev->rendering_mode_count) {
+		active = xdev->rendering_modes[xdev->hmd->active_rendering_mode_index].view_count;
+	}
+	if (active == 0 || active > dev_views) {
+		active = dev_views;
+	}
+	uint32_t reported = sess->view_config_view_count != 0 ? sess->view_config_view_count : dev_views;
+	const uint32_t reported_cap = oxr_segment_views_multiview_count(dev_views);
+	if (reported > reported_cap) {
+		reported = reported_cap;
+	}
+
+	struct oxr_segment_layout l;
+	uint32_t first[XRT_MAX_SEGMENTS] = {0};
+	uint32_t cnt[XRT_MAX_SEGMENTS] = {0};
+	uint32_t total = 0;
+	if (m.count <= XRT_MAX_SEGMENTS && oxr_segment_views_layout(&m, &l)) {
+		total = oxr_segment_views_assign(m.count, active, reported, first, cnt);
+	}
+	if (total == 0) {
+		// More segments than view sets, or a screen of unknown size: one
+		// view set for the whole window (the M2 crop path).
+		XrResult ret = locate_views_one(log, sess, viewLocateInfo, viewState, viewCapacityInput,
+		                                viewCountOutput, views, NULL);
+		if (viewCapacityInput > 0 && ret == XR_SUCCESS) {
+			sess->seg_route.count = 0;
+			locate_fill_bindings(sess, viewState, &sess->seg_route);
+			locate_log_route_change(sess);
+		}
+		return ret;
+	}
+
+	// Two-call handling: the same count the single path reports.
+	if (viewCountOutput != NULL) {
+		*viewCountOutput = reported;
+	}
+	if (viewCapacityInput == 0) {
+		return oxr_session_success_result(sess);
+	}
+	if (viewCapacityInput < reported) {
+		return oxr_error(log, XR_ERROR_SIZE_INSUFFICIENT, "(viewCapacityInput == %u) need %u",
+		                 viewCapacityInput, reported);
+	}
+
+	// Majority last: its locate is the one that writes the app's chained
+	// outputs (raw block, depth budget, tracking state) and the session-level
+	// side effects; the others locate into a bare XrViewState.
+	XrViewStateFlags flags = 0;
+	bool first_flags = true;
+	for (uint32_t pass = 0; pass < 2; pass++) {
+		for (uint32_t k = 0; k < m.count; k++) {
+			if ((k == mj) != (pass == 1)) {
+				continue;
+			}
+			struct oxr_locate_segment o;
+			locate_segment_override(&m, &l, k, &o);
+			o.view_count = cnt[k];
+			o.side_effects = (k == mj);
+
+			XrView tmp[XRT_MAX_VIEWS];
+			for (uint32_t v = 0; v < XRT_MAX_VIEWS; v++) {
+				tmp[v] = (XrView){.type = XR_TYPE_VIEW, .next = NULL};
+			}
+			XrViewState bare = {.type = XR_TYPE_VIEW_STATE, .next = NULL};
+			XrViewState *vs = (k == mj) ? viewState : &bare;
+			uint32_t n = 0;
+			XrResult ret = locate_views_one(log, sess, viewLocateInfo, vs, XRT_MAX_VIEWS, &n, tmp, &o);
+			if (ret != XR_SUCCESS) {
+				return ret;
+			}
+			for (uint32_t v = 0; v < cnt[k] && first[k] + v < reported; v++) {
+				views[first[k] + v].pose = tmp[v].pose;
+				views[first[k] + v].fov = tmp[v].fov;
+			}
+			flags = first_flags ? vs->viewStateFlags : (flags & vs->viewStateFlags);
+			first_flags = false;
+		}
+	}
+	viewState->viewStateFlags = flags;
+
+	// The inactive tail aliases view 0, exactly as the single path does (ADR-041).
+	for (uint32_t i = total; i < reported; i++) {
+		const uint32_t src = oxr_segment_views_alias_source(i, total);
+		views[i].pose = views[src].pose;
+		views[i].fov = views[src].fov;
+	}
+
+#ifdef OXR_HAVE_DXR_display_info
+	if (sess->sys->inst->extensions.DXR_display_info) {
+		XrViewActivityStateDXR *act =
+		    OXR_GET_OUTPUT_FROM_CHAIN(viewState, XR_TYPE_VIEW_ACTIVITY_STATE_DXR, XrViewActivityStateDXR);
+		if (act != NULL) {
+			act->activeViewCount = total; // the sum over segments
+		}
+	}
+#endif
+
+	struct xrt_segment_view_routing *r = &sess->seg_route;
+	memset(r, 0, sizeof(*r));
+	r->count = m.count;
+	r->canvas = m.canvas;
+	for (uint32_t k = 0; k < m.count; k++) {
+		r->screen_id[k] = m.seg[k].screen_id;
+		r->rect[k] = m.seg[k].window_rect;
+		r->first_view[k] = first[k];
+		r->view_count[k] = cnt[k];
+	}
+	locate_fill_bindings(sess, viewState, r);
+	locate_log_route_change(sess);
 	return oxr_session_success_result(sess);
 }
 
@@ -4088,6 +4538,12 @@ oxr_session_frame_view_cameras(struct oxr_logger *log,
 		views[i] = (XrView){.type = XR_TYPE_VIEW, .next = NULL};
 	}
 
+	// Multi-screen M3: the per-segment view routing the app's own locate
+	// recorded is what this frame's projection layer was rendered against;
+	// this internal locate (which chains nothing) must not replace it.
+	const struct xrt_segment_view_routing route = sess->seg_route;
+	const struct xrt_segment_view_routing route_logged = sess->seg_route_logged;
+
 	uint32_t count = 0;
 	XrResult ret = oxr_session_locate_views(log, sess, &info, &view_state, XRT_MAX_VIEWS, &count, views);
 
@@ -4096,6 +4552,8 @@ oxr_session_frame_view_cameras(struct oxr_logger *log,
 	// app's published value is what handle_space() will read for this frame's
 	// VIEW layers, so the camera must read the same one.
 	oxr_session_set_view_space_offset(sess, &view_offset);
+	sess->seg_route = route;
+	sess->seg_route_logged = route_logged;
 
 	if (ret != XR_SUCCESS) {
 		return ret;

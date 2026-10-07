@@ -62,6 +62,7 @@ set(tests
     tests_oxr_weave_latch
     tests_oxr_layer_space
     tests_oxr_view_config_rule
+    tests_oxr_segment_views
     tests_oxr_legacy_mode_rule
     tests_oxr_mode_fillable_rule
     tests_oxr_tracking_properties_rule
@@ -596,6 +597,13 @@ target_link_libraries(tests_comp_rear_budget PRIVATE xrt-interfaces aux_os xrt-e
 target_sources(tests_comp_segments PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/comp_segments.c)
 target_include_directories(tests_comp_segments PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 target_link_libraries(tests_comp_segments PRIVATE xrt-interfaces aux_util)
+
+# Multi-screen M3 — per-segment views: the pure geometry oxr_session_locate_views
+# composes (oxr_segment_views.c) plus the shared Kooima core it feeds (aux_math
+# carries displayxr-common), so two screens' frusta are asserted end to end.
+target_sources(tests_oxr_segment_views PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr/oxr_segment_views.c)
+target_include_directories(tests_oxr_segment_views PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr)
+target_link_libraries(tests_oxr_segment_views PRIVATE xrt-interfaces aux_math)
 
 if(XRT_BUILD_DRIVER_HANDTRACKING)
 	target_link_libraries(
