@@ -2313,6 +2313,10 @@ struct oxr_system
 	//! Multi-screen M3: the largest of @ref view_config_view_counts — how many
 	//! entries of @ref views (and the #1488 shadow) are filled.
 	uint32_t view_config_max_count;
+	//! Multi-screen M3: view sets a PRIMARY_MULTIVIEW_DXR session can carry
+	//! (oxr_segment_views_set_capacity), computed once at fill-in. 1 = never
+	//! split (every platform but desktop Linux with 2+ DP-backed screens).
+	uint32_t multiview_set_capacity;
 
 	/*!
 	 * #1486: DXR_VIEW_CONFIG_LEGACY=1, latched at @ref oxr_system_fill_in.

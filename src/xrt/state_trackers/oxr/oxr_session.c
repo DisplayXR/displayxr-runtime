@@ -2546,7 +2546,7 @@ locate_views_one(struct oxr_logger *log,
 	uint32_t reported_cap = view_count;
 #ifdef OXR_HAVE_DXR_display_info
 	if (sess->view_config_type == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR) {
-		reported_cap = oxr_segment_views_multiview_count(view_count);
+		reported_cap = oxr_segment_views_multiview_count(view_count, sess->sys->multiview_set_capacity);
 	}
 #endif
 	if (reported_view_count == 0) {
@@ -4308,7 +4308,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 		active = dev_views;
 	}
 	uint32_t reported = sess->view_config_view_count != 0 ? sess->view_config_view_count : dev_views;
-	const uint32_t reported_cap = oxr_segment_views_multiview_count(dev_views);
+	const uint32_t reported_cap = oxr_segment_views_multiview_count(dev_views, sess->sys->multiview_set_capacity);
 	if (reported > reported_cap) {
 		reported = reported_cap;
 	}
@@ -4317,7 +4317,10 @@ oxr_session_locate_views(struct oxr_logger *log,
 	uint32_t first[XRT_MAX_SEGMENTS] = {0};
 	uint32_t cnt[XRT_MAX_SEGMENTS] = {0};
 	uint32_t total = 0;
-	if (m.count <= XRT_MAX_SEGMENTS && oxr_segment_views_layout(&m, &l)) {
+	// The system's set capacity is the contract the app sized for: never
+	// hand out more view sets than it advertised.
+	if (m.count <= XRT_MAX_SEGMENTS && m.count <= sess->sys->multiview_set_capacity &&
+	    oxr_segment_views_layout(&m, &l)) {
 		total = oxr_segment_views_assign(m.count, active, reported, first, cnt);
 	}
 	if (total == 0) {

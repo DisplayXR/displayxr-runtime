@@ -418,8 +418,8 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   live this frame — prefer it to deriving the number from the rendering mode.
   Under `PRIMARY_MULTIVIEW_DXR` it can be LARGER than the mode's view count: a window
   spanning two displays gets one view set per display (multi-screen M3, `XR_DXR_display_info`
-  v22), so `activeViewCount` is the sum and the reported count is the device max times
-  `XRT_MAX_SEGMENTS`. An app that renders `[0, activeViewCount)`, each view into its own
+  v22), so `activeViewCount` is the sum and, on a system that can split a window (desktop
+  Linux with two DP-backed screens), the reported count is the device max times 2. An app that renders `[0, activeViewCount)`, each view into its own
   subImage, is correct without knowing why. To render each display's views at that
   display's resolution, chain `XrViewDisplayBindingsDXR` beside `XrViewActivityStateDXR`:
   each binding names a display, its `segmentRect` (window px) and its contiguous view

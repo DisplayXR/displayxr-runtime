@@ -35,17 +35,39 @@ extern "C" {
 #endif
 
 /*!
- * The view count `PRIMARY_MULTIVIEW_DXR` reports: the device max per segment,
- * times @ref XRT_MAX_SEGMENTS, capped at @ref XRT_MAX_VIEWS. A session with one
- * segment locates exactly what it did before and aliases the larger tail.
+ * How many view sets this system can ever need: @ref XRT_MAX_SEGMENTS, but no
+ * more than the screens a window could actually be woven on — the DP registry
+ * entries that carry a display-processor factory — and only where a compositor
+ * segments windows at all (@p can_segment: the in-process Vulkan compositor on
+ * desktop Linux, never a service session). Never below 1.
  */
 static inline uint32_t
-oxr_segment_views_multiview_count(uint32_t device_max_views)
+oxr_segment_views_set_capacity(uint32_t screens_with_dp_factory, bool can_segment)
+{
+	if (!can_segment || screens_with_dp_factory < 2) {
+		return 1;
+	}
+	return screens_with_dp_factory < XRT_MAX_SEGMENTS ? screens_with_dp_factory : XRT_MAX_SEGMENTS;
+}
+
+/*!
+ * The view count `PRIMARY_MULTIVIEW_DXR` reports: the device max per view set,
+ * times the system's set capacity (@ref oxr_segment_views_set_capacity), capped
+ * at @ref XRT_MAX_VIEWS. On a system that can never split a window (one screen
+ * with a DP, or no segmenting compositor) this is the device max — exactly the
+ * pre-M3 count. A session with one segment locates what it did before and
+ * aliases any larger tail.
+ */
+static inline uint32_t
+oxr_segment_views_multiview_count(uint32_t device_max_views, uint32_t set_capacity)
 {
 	if (device_max_views == 0) {
 		return 0;
 	}
-	uint32_t n = device_max_views * XRT_MAX_SEGMENTS;
+	if (set_capacity == 0) {
+		set_capacity = 1;
+	}
+	uint32_t n = device_max_views * set_capacity;
 	return n > XRT_MAX_VIEWS ? XRT_MAX_VIEWS : n;
 }
 

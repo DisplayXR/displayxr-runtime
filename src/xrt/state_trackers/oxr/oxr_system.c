@@ -168,6 +168,34 @@ oxr_system_fill_in(
 	 * extension enabled, not only on devices whose max exceeds 2 - so an app
 	 * can select it uniformly and get 2 views where 2 is all there is.
 	 */
+	/*
+	 * Multi-screen M3: advertise one view set per segment only where a
+	 * window can ever be split — the in-process Vulkan compositor on desktop
+	 * Linux, with at least two registry screens that have a DP factory. A
+	 * single-screen box, a service session and every other platform keep the
+	 * pre-M3 count, so existing multiview apps and the CTS see no change.
+	 */
+	{
+		uint32_t with_factory = 0;
+		bool can_segment = false;
+#ifdef XRT_OS_LINUX_DESKTOP
+		if (sys->xsysc != NULL && !sys->xsysc->info.is_service_mode) {
+			can_segment = true;
+			const struct xrt_dp_factory_registry *reg = &sys->xsysc->info.dp_registry;
+			for (uint32_t e = 0; e < reg->entry_count && e < XRT_DP_REGISTRY_MAX_ENTRIES; e++) {
+				if (reg->entries[e].dp_factory_vk != NULL) {
+					with_factory++;
+				}
+			}
+		}
+#endif
+		sys->multiview_set_capacity = oxr_segment_views_set_capacity(with_factory, can_segment);
+		if (sys->multiview_set_capacity > 1) {
+			U_LOG_I("multi-screen: %u DP-backed screens — PRIMARY_MULTIVIEW_DXR carries up to %u view sets",
+			        with_factory, sys->multiview_set_capacity);
+		}
+	}
+
 	sys->view_config_legacy = debug_get_bool_option_view_config_legacy();
 	if (sys->view_config_legacy) {
 		sys->view_config_count = 1;
@@ -193,7 +221,8 @@ oxr_system_fill_in(
 			// Multi-screen M3 (ADR-047 D3): one view set per window
 			// segment. A window on one screen locates exactly what it did
 			// before and aliases the larger tail (ADR-041).
-			sys->view_config_view_counts[1] = oxr_segment_views_multiview_count(view_count);
+			sys->view_config_view_counts[1] =
+			    oxr_segment_views_multiview_count(view_count, sys->multiview_set_capacity);
 			sys->view_config_count = 2;
 		}
 #endif

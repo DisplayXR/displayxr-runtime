@@ -75,7 +75,7 @@ must handle it needs an explicit `case`.
 
 | | `PRIMARY_MONO` | `PRIMARY_STEREO` | `PRIMARY_MULTIVIEW_DXR` |
 |---|---|---|---|
-| `xrEnumerateViewConfigurationViews` count | 1 | **2** | device **max across modes × `XRT_MAX_SEGMENTS`**, capped at 8 (8 on sim-display, 4 on Leia) — multi-screen M3, see *Per-segment views* below |
+| `xrEnumerateViewConfigurationViews` count | 1 | **2** | device **max across modes** (4 on sim-display, 2 on Leia), **× the system's view-set capacity** — 1 everywhere except desktop Linux with 2+ DP-backed screens, where it is 2 (capped at 8) — multi-screen M3, see *Per-segment views* below |
 | `xrLocateViews` `*viewCountOutput` | 1 | **2** | same count |
 | `xrLocateViews` capacity required | 1 | 2 | that count (size to `XRT_MAX_VIEWS` = 8) |
 | `xrEndFrame` projection `viewCount` accepted | 1 | **exactly 2** — the located count. An `XR_DXR_display_info` app may still submit 1 while a **1-view mode is in play** — the mode active now **or** the one latched at this frame's `xrBeginFrame` (#1528): **deprecated** (ADR-041), accepted, logged once per session | **exactly the located count** (the device max). ADR-041 removed the old "any rendering mode's `viewCount`". The same deprecated 1-view arm as `PRIMARY_STEREO` applies at the default (#1612): 1 view while a 1-view mode is in play, accepted, logged once per session — nothing wider |
@@ -533,8 +533,15 @@ exactly today's behaviour.
 
 A window that spans two displays is woven per segment (`docs/architecture/comp-segments.md`).
 From M3 a `PRIMARY_MULTIVIEW_DXR` session carries one view set per segment, which is why
-the type reports `device max × XRT_MAX_SEGMENTS` (`XRT_MAX_SEGMENTS` = 2, in
-`xrt_display_metrics.h`; `oxr_segment_views_multiview_count`). The rules:
+the type reports `device max × capacity`, capped at `XRT_MAX_VIEWS` (8)
+(`oxr_segment_views_multiview_count`). The **view-set capacity** is computed once in
+`oxr_system_fill_in` (`oxr_segment_views_set_capacity`): `min(XRT_MAX_SEGMENTS,
+DP-registry screens with a VK DP factory)`, and 1 wherever no compositor can segment a
+window — every platform but desktop Linux, and any service session. So a single-screen
+box, Windows, macOS and Android advertise exactly the pre-M3 count (existing multiview
+apps and the CTS see no change); `ds1-linux` (eDP + DS1) advertises `device max × 2`.
+`XRT_MAX_SEGMENTS` = 2 lives in `xrt_display_metrics.h`. The locate never hands out more
+view sets than the capacity. The rules:
 
 - **One segment (the common case):** byte-for-byte the pre-M3 locate — the active
   mode's views first, the whole tail (now longer) aliased onto view 0. The swapchain

@@ -70,14 +70,32 @@ two_screen_table()
 
 } // namespace
 
-TEST_CASE("PRIMARY_MULTIVIEW_DXR reports one view set per segment", "[oxr][segment_views]")
+TEST_CASE("view-set capacity: only where a window can ever be split", "[oxr][segment_views]")
 {
-	CHECK(oxr_segment_views_multiview_count(0) == 0);
-	CHECK(oxr_segment_views_multiview_count(1) == 1 * XRT_MAX_SEGMENTS);
-	CHECK(oxr_segment_views_multiview_count(2) == 4); // Leia
-	CHECK(oxr_segment_views_multiview_count(4) == 8); // sim_display quad
+	// No segmenting compositor (Windows/macOS/Android, a service session): 1.
+	CHECK(oxr_segment_views_set_capacity(0, false) == 1);
+	CHECK(oxr_segment_views_set_capacity(3, false) == 1);
+	// One DP-backed screen (or none): 1 — the pre-M3 count.
+	CHECK(oxr_segment_views_set_capacity(0, true) == 1);
+	CHECK(oxr_segment_views_set_capacity(1, true) == 1);
+	// Two or more: up to XRT_MAX_SEGMENTS.
+	CHECK(oxr_segment_views_set_capacity(2, true) == 2);
+	CHECK(oxr_segment_views_set_capacity(5, true) == XRT_MAX_SEGMENTS);
+}
+
+TEST_CASE("PRIMARY_MULTIVIEW_DXR reports one view set per possible segment", "[oxr][segment_views]")
+{
+	// Capacity 1: exactly the pre-M3 count (the device max).
+	CHECK(oxr_segment_views_multiview_count(0, 1) == 0);
+	CHECK(oxr_segment_views_multiview_count(2, 1) == 2);
+	CHECK(oxr_segment_views_multiview_count(4, 1) == 4);
+	CHECK(oxr_segment_views_multiview_count(4, 0) == 4); // 0 treated as 1
+	// Capacity 2 (ds1-linux): device max x 2.
+	CHECK(oxr_segment_views_multiview_count(1, 2) == 2);
+	CHECK(oxr_segment_views_multiview_count(2, 2) == 4); // Leia
+	CHECK(oxr_segment_views_multiview_count(4, 2) == 8); // sim_display quad
 	// Capped at XRT_MAX_VIEWS: a device that already fills it gets no second set.
-	CHECK(oxr_segment_views_multiview_count(XRT_MAX_VIEWS) == XRT_MAX_VIEWS);
+	CHECK(oxr_segment_views_multiview_count(XRT_MAX_VIEWS, 2) == XRT_MAX_VIEWS);
 }
 
 TEST_CASE("the #1499 mode floor asks one segment's share", "[oxr][segment_views]")
