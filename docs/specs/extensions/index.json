@@ -72,6 +72,11 @@
       "title": "Rear Depth Budget",
       "summary": "Advisory limit on how far behind the display plane a transparent app may render, chained on XrViewState at xrLocateViews"
     },
+    "XR_DXR_cursor_depth": {
+      "group": "rendering",
+      "title": "Depth-Aware Cursor",
+      "summary": "Opt-in: the app reports the nearest content under the cursor at xrLocateViews and gets back a pose and size for a cursor sprite just in front of it, so the pointer never sits behind 3D content"
+    },
     "XR_DXR_weave": {
       "group": "rendering",
       "title": "Window Weave Service",
