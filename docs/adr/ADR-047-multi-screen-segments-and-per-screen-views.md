@@ -4,7 +4,7 @@ date: 2026-10-07
 source: "docs/roadmap/multi-screen.md, #69"
 supersedes: "ADR-015 §3–§4 (per-compositor multi-DP over ONE atlas, split-weave at the display boundary)"
 ---
-# ADR-046: Multi-screen — segments and per-screen views
+# ADR-047: Multi-screen — segments and per-screen views
 
 ## Context
 

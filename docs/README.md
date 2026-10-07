@@ -153,7 +153,7 @@ Integrate your 3D display hardware into DisplayXR.
 - [ADR-044](adr/ADR-044-colour-contract-per-backend.md) — The colour contract, per backend and swapchain format
 - [ADR-045](adr/ADR-045-plugins-always-loadable-and-report-platform-state.md) — Plug-ins are always loadable and report their platform state
 - [ADR-046](adr/ADR-046-depth-aware-cursor.md) — Depth-aware cursor — opt-in only; the app knows the depth, the runtime places the cursor
-- [ADR-046](adr/ADR-046-multi-screen-segments-and-per-screen-views.md) — Multi-screen — segments and per-screen views
+- [ADR-047](adr/ADR-047-multi-screen-segments-and-per-screen-views.md) — Multi-screen — segments and per-screen views
 <!-- END ADR INDEX -->
 
 ---
@@ -185,6 +185,7 @@ Design docs, status trackers, and plans — some shipped, some in progress. Afte
 - [Display Zones](roadmap/display-zones.md) — N 3D zones + 2D zones + wish mask: avatar migration + phased plan (ADR-027)
 - [Android Transparency — Compose-Under-Background](roadmap/android-transparency-compose-under.md) — why Android weaves-then-gates instead of compositing a captured background under the views, the Android capture landscape, and the T0/T1/T2 plan (#1031)
 - [Display Spatial Model](roadmap/display-spatial-model.md) — displays in the spatial graph (#46)
+- [Multi-screen plan](roadmap/multi-screen.md) — N screens, one DP each, segments + per-screen views; joint runtime × LeiaSR milestones (#69)
 - [Multi-Display Single Machine](roadmap/multi-display-single-machine.md) — multiple displays, one machine (#69)
 - [Multi-Display Networked](roadmap/multi-display-networked.md) — displays across the network (#70)
 - [XR_VIEW_CONFIGURATION_PRIMARY_MULTIVIEW](roadmap/XR_VIEW_CONFIGURATION_PRIMARY_MULTIVIEW.md) — Khronos multiview proposal (#80)
