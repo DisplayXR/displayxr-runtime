@@ -14,6 +14,7 @@
 #include <dbt.h>
 #include <shellapi.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "util/u_crash_guard.h"
@@ -42,6 +43,7 @@
 #define WM_CAMERA_PROMPT        (WM_APP + 2) //!< lParam = struct cam_prompt_req * (show)
 #define WM_CAMERA_PROMPT_CLOSE  (WM_APP + 3) //!< lParam = struct cam_prompt_req * (close, SendMessage)
 #define WM_CAMERA_INDICATOR     (WM_APP + 4) //!< refresh icon + tooltip now
+#define WM_CAMERA_NOTICE (WM_APP + 5)        //!< lParam = struct cam_notice * (heap; the tray frees it)
 
 // ADR-045: tooltip refresh of the display-processor status line.
 #define TRAY_STATUS_TIMER_ID 1
@@ -485,6 +487,65 @@ camera_indicator_changed(void *ctx)
 	if (s_tray_hwnd != NULL) {
 		PostMessageW(s_tray_hwnd, WM_CAMERA_INDICATOR, 0, 0);
 	}
+}
+
+//! A balloon to show on the tray thread (WM_CAMERA_NOTICE).
+struct cam_notice
+{
+	wchar_t title[64];
+	wchar_t body[256];
+};
+
+/*!
+ * The manager's notice provider (IPC client thread, consent serialisation
+ * held): spec §7.1.1 — a USER-level consent-delegation entry allowed @p exe
+ * for the first time in this service run. Never blocks: format, post, return.
+ */
+static void
+tray_camera_notice(void *ctx, const char *exe, const char *app_name)
+{
+	(void)ctx;
+	if (s_tray_hwnd == NULL) {
+		return;
+	}
+	struct cam_notice *n = (struct cam_notice *)calloc(1, sizeof(*n));
+	if (n == NULL) {
+		return;
+	}
+	const char *base = exe != NULL ? exe : "";
+	for (const char *p = base; *p != '\0'; p++) {
+		if (*p == '\\' || *p == '/') {
+			base = p + 1;
+		}
+	}
+	wchar_t wapp[128], wbase[128];
+	MultiByteToWideChar(CP_UTF8, 0, app_name != NULL && app_name[0] ? app_name : "An app", -1, wapp,
+	                    ARRAYSIZE(wapp));
+	MultiByteToWideChar(CP_UTF8, 0, base[0] ? base : "?", -1, wbase, ARRAYSIZE(wbase));
+	wcscpy_s(n->title, ARRAYSIZE(n->title), L"3D camera: per-user trust used");
+	_snwprintf_s(n->body, ARRAYSIZE(n->body), _TRUNCATE,
+	             L"“%ls” (%ls) got the 3D camera without a DisplayXR prompt, because a per-user setting "
+	             L"trusts it to ask you itself. Remove: displayxr-cli camera untrust.",
+	             wapp, wbase);
+	if (!PostMessageW(s_tray_hwnd, WM_CAMERA_NOTICE, 0, (LPARAM)n)) {
+		free(n);
+	}
+}
+
+//! Tray thread: show (and free) a notice balloon.
+static void
+show_camera_notice(struct cam_notice *cn)
+{
+	if (cn == NULL) {
+		return;
+	}
+	NOTIFYICONDATAW n = s_nid;
+	n.uFlags = NIF_INFO;
+	n.dwInfoFlags = NIIF_WARNING;
+	wcscpy_s(n.szInfoTitle, ARRAYSIZE(n.szInfoTitle), cn->title);
+	wcscpy_s(n.szInfo, ARRAYSIZE(n.szInfo), cn->body);
+	Shell_NotifyIconW(NIM_MODIFY, &n);
+	free(cn);
 }
 
 #define CAM_BTN_ALLOW 1
@@ -1031,6 +1092,8 @@ tray_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		return 0;
 	}
 
+	case WM_CAMERA_NOTICE: show_camera_notice((struct cam_notice *)lParam); return 0;
+
 	case WM_CAMERA_INDICATOR:
 		update_camera_indicator();
 		update_status_tooltip();
@@ -1214,6 +1277,7 @@ service_tray_init(service_tray_shutdown_cb shutdown_cb,
 	if (s_tray_hwnd != NULL) {
 		ipc_server_stereo_camera_set_prompt_provider(tray_camera_prompt, NULL);
 		ipc_server_stereo_camera_set_indicator_provider(camera_indicator_changed, NULL);
+		ipc_server_stereo_camera_set_notice_provider(tray_camera_notice, NULL);
 	}
 
 	return s_tray_hwnd != NULL;

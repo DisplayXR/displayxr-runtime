@@ -20,7 +20,10 @@
  *    (one WARN); OS camera privacy switch -> PERMISSION_INSUFFICIENT and a
  *    stored Deny -> CONSENT_REFUSED, both for EVERY client; only then a
  *    registered consent-DELEGATING client (the browser, by installer /
- *    `displayxr-cli camera trust`) -> allowed, its own prompt is the consent;
+ *    `displayxr-cli camera trust`) -> allowed, its own prompt is the consent
+ *    (not when the client set DECLINE_DELEGATION, nor for an entry whose
+ *    user-writable executable lacks a matching Authenticode signer; a
+ *    USER-level entry raises the notice provider once per exe per run);
  *    a stored Allow; else the tray prompt ("<app> wants to use the
  *    3D camera — Allow / Allow once / Deny"), which the host installs with
  *    ipc_server_stereo_camera_set_prompt_provider(). The prompt BLOCKS the
@@ -249,7 +252,10 @@ struct scam_stream
 	char exe[512];         //!< verified peer executable ("" = unknown)
 	long peer_pid;         //!< the pid the foreground rule looks at
 	uint32_t client_class; //!< verified class of the creating connection
-	bool delegating;       //!< registered consent-delegating client
+	bool delegating;       //!< registered consent-delegating client (RAW refusal keys on it)
+	//! Its start was allowed BY delegation (trusted, not declined): only such
+	//! a stream follows its client's own visibility rule (§7.1.1, §7.2).
+	bool delegated;
 	int64_t vis_checked_ns;
 	bool visible;
 	uint32_t consent_why; //!< enum u_camera_consent_why of the start that allowed it
@@ -410,6 +416,8 @@ static ipc_server_stereo_camera_prompt_fn g_prompt_fn = NULL;
 static void *g_prompt_ctx = NULL;
 static ipc_server_stereo_camera_indicator_fn g_indicator_fn = NULL;
 static void *g_indicator_ctx = NULL;
+static ipc_server_stereo_camera_notice_fn g_notice_fn = NULL;
+static void *g_notice_ctx = NULL;
 
 
 /*
@@ -523,9 +531,39 @@ env_prompt(void *ctx, const char *exe, const char *app_name, long pid, uint32_t 
 	return fn(g_prompt_ctx, exe, app_name, pid, timeout_ms);
 }
 
+//! §7.1.1: may a non-admin process replace this executable? (POSIX: no — path-only for now.)
+static bool
+env_path_user_writable(void *ctx, const char *exe)
+{
+	(void)ctx;
+	return u_camera_consent_path_user_writable(exe);
+}
+
+//! §7.1.1: the executable's valid code signer (Windows Authenticode; none on POSIX).
+static bool
+env_exe_signer(void *ctx, const char *exe, char *out, size_t cap)
+{
+	(void)ctx;
+	return u_camera_consent_exe_signer(exe, out, cap);
+}
+
+//! §7.1.1: first use of a USER-level delegation — the host's notice (tray balloon), if any.
+static void
+env_user_delegation_notice(void *ctx, const char *exe, const char *app_name)
+{
+	(void)ctx;
+	ipc_server_stereo_camera_notice_fn fn = g_notice_fn;
+	if (fn != NULL) {
+		fn(g_notice_ctx, exe, app_name);
+	}
+}
+
 static const struct u_camera_consent_env_ops env_ops = {
     .os_camera_allowed = env_os_camera_allowed,
     .prompt = env_prompt,
+    .path_user_writable = env_path_user_writable,
+    .exe_signer = env_exe_signer,
+    .user_delegation_notice = env_user_delegation_notice,
 };
 
 static xrt_result_t
@@ -555,17 +593,21 @@ consent_evaluate(struct ipc_server_stereo_camera *m,
 {
 	char app_name[XRT_MAX_APPLICATION_NAME_SIZE];
 	snprintf(app_name, sizeof(app_name), "%s", (const char *)ics->client_state.info.application_name);
+	// Spec v3: XR_STEREO_CAMERA_CLIENT_DECLINE_DELEGATION_BIT_DXR, as declared
+	// at xrCreateInstance (it only ever restricts, so the claim is taken as is).
+	uint32_t flags = 0;
+	if ((ics->client_state.info.stereo_camera_client_flags & XRT_STEREO_CAMERA_CLIENT_DECLINE_DELEGATION) != 0) {
+		flags |= U_CAMERA_CONSENT_FLAG_DECLINE_DELEGATION;
+	}
 	os_mutex_lock(&m->consent_lock);
-	u_camera_consent_evaluate(&m->consent, exe, app_name, ics->peer_pid, out);
+	u_camera_consent_evaluate(&m->consent, exe, app_name, ics->peer_pid, flags, out);
 	os_mutex_unlock(&m->consent_lock);
 	xrt_result_t xret = verdict_to_xret(out->verdict);
-	if (xret == XRT_SUCCESS) {
-		U_LOG_W("%s: ALLOWED for %s (pid %ld, \"%s\") — %s", what, exe[0] ? exe : "?", ics->peer_pid, app_name,
-		        u_camera_consent_why_str(out->why));
-	} else {
-		U_LOG_W("%s: REFUSED for %s (pid %ld, \"%s\") — %s", what, exe[0] ? exe : "?", ics->peer_pid, app_name,
-		        u_camera_consent_why_str(out->why));
-	}
+	// When a registered entry was not applied, say why (declined / untrusted).
+	const char *skip = u_camera_consent_delegation_skip_str(out->delegation_skip);
+	U_LOG_W("%s: %s for %s (pid %ld, \"%s\") — %s%s%s%s", what, xret == XRT_SUCCESS ? "ALLOWED" : "REFUSED",
+	        exe[0] ? exe : "?", ics->peer_pid, app_name, u_camera_consent_why_str(out->why),
+	        skip[0] ? " (delegation not applied: " : "", skip, skip[0] ? ")" : "");
 	return xret;
 }
 
@@ -573,8 +615,7 @@ consent_evaluate(struct ipc_server_stereo_camera *m,
 static bool
 exe_is_delegating(struct ipc_server_stereo_camera *m, const char *exe)
 {
-	const struct u_camera_consent_store_ops *st = m->consent.store;
-	return exe[0] != '\0' && st != NULL && st->is_delegating != NULL && st->is_delegating(m->consent.store_ctx, exe);
+	return u_camera_consent_is_registered_delegating(m->consent.store, m->consent.store_ctx, exe);
 }
 
 //! Does @p pid own a visible top-level window right now (platform query)?
@@ -617,14 +658,15 @@ pid_has_visible_window(long pid)
 /*!
  * Spec §7.2 foreground rule, evaluated per published frame with a 250 ms
  * cache. Window-bearing classes must own a visible top-level window; a
- * delegating client follows its own rule; CAMERA_CONSUMER / DIAG have no
- * window by contract and are exempt. The OS-lock gate is separate (publish
- * checks m->locked first).
+ * client allowed BY delegation follows its own rule (a registered client
+ * that declined delegation, or whose entry was not trusted, is an ordinary
+ * app here too); CAMERA_CONSUMER / DIAG have no window by contract and are
+ * exempt. The OS-lock gate is separate (publish checks m->locked first).
  */
 static bool
 client_visible_locked(struct scam_stream *s, int64_t now)
 {
-	if (s->delegating || s->client_class == XRT_CLIENT_CLASS_CAMERA_CONSUMER ||
+	if (s->delegated || s->client_class == XRT_CLIENT_CLASS_CAMERA_CONSUMER ||
 	    s->client_class == XRT_CLIENT_CLASS_DIAG || s->peer_pid <= 0) {
 		return true;
 	}
@@ -2114,6 +2156,7 @@ ipc_handle_stereo_camera_stream_start(volatile struct ipc_client_state *ics, uin
 		return XRT_ERROR_STEREO_CAMERA_BUSY;
 	}
 	s->delegating = dec.delegating || s->delegating;
+	s->delegated = dec.delegated;
 	s->consent_why = (uint32_t)dec.why;
 	xret = stream_allocate_locked(s, cam);
 	if (xret != XRT_SUCCESS) {
@@ -2413,6 +2456,13 @@ ipc_server_stereo_camera_set_indicator_provider(ipc_server_stereo_camera_indicat
 {
 	g_indicator_ctx = ctx;
 	g_indicator_fn = fn;
+}
+
+void
+ipc_server_stereo_camera_set_notice_provider(ipc_server_stereo_camera_notice_fn fn, void *ctx)
+{
+	g_notice_ctx = ctx;
+	g_notice_fn = fn;
 }
 
 bool

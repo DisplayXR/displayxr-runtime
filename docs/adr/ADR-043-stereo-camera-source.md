@@ -143,3 +143,30 @@ camera switch** → **stored Deny** → delegating client → stored Allow → A
 (spec §7.1 is normative). Delegation means exactly "no runtime prompt and no stored per-app
 decision needed". `displayxr-cli camera trust` over a stored Deny clears it and says so (the
 user's newer explicit word); an installer's registration never touches the user's store.
+
+## Amendment 3 (2026-10-06, spec v3) — delegation hardening
+
+Delegation trusted a path, any path, and could not be turned off by the client that held it.
+Three changes close that (spec §2a, §7.1, §7.1.1 are normative):
+
+- **A user-writable executable path needs a signer.** A path is only an identity where nobody
+  but an administrator can put a different file there. On Windows an entry whose executable is
+  not under `%ProgramFiles%`, `%ProgramFiles(x86)%` or `%SystemRoot%` is applied only when it
+  records a signer CN (`<valueName>.signer`) and the executable carries a valid Authenticode
+  signature by exactly that signer (`WinVerifyTrust`, never touching the network). Otherwise the
+  entry is skipped as if absent — stored decision / prompt — with one WARN per executable per
+  run. Admin-protected paths keep path-only trust. POSIX stays path-only for now (no signature
+  check exists there yet; recorded as a known gap).
+- **Per-user delegation is announced.** A user-level entry (`HKCU` / the user JSON) can be
+  written by anything running as the user. It is still honoured — it is how a developer or a
+  per-user install registers — but its first use per executable per service run raises a WARN
+  and a tray balloon. Installer (machine-level) entries stay silent.
+- **A client can decline delegation.** `XR_STEREO_CAMERA_CLIENT_DECLINE_DELEGATION_BIT_DXR` on
+  `XrStereoCameraClientInfoDXR`: a browser running with its own prompt bypassed (automation,
+  auto-grant switches) must not let the runtime take that missing prompt as consent. The bit
+  only restricts, so the claim is not verified; the runtime then requires a stored decision or
+  its own prompt.
+
+A skipped delegation (declined or untrusted) also drops the foreground-rule exemption — the
+client is an ordinary window-bearing app for that stream — but never the RAW refusal, which keys
+on registration alone, so an untrusted entry can only ever narrow what a client gets.

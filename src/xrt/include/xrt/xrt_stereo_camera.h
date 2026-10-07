@@ -61,6 +61,15 @@ enum xrt_stereo_camera_transport
 	XRT_STEREO_CAMERA_TRANSPORT_AHARDWAREBUFFER = 3,
 };
 
+/*!
+ * xrt_application_info::stereo_camera_client_flags — the same bit values as
+ * XrStereoCameraClientFlagsDXR.
+ */
+//! XR_STEREO_CAMERA_CLIENT_CONSUMER_ONLY_BIT_DXR (mapped to the client class, not read from here).
+#define XRT_STEREO_CAMERA_CLIENT_CONSUMER_ONLY (1ull << 0)
+//! XR_STEREO_CAMERA_CLIENT_DECLINE_DELEGATION_BIT_DXR: skip consent delegation for this instance.
+#define XRT_STEREO_CAMERA_CLIENT_DECLINE_DELEGATION (1ull << 1)
+
 //! Format / transport sets are one bit per enum value: (1 << value).
 #define XRT_STEREO_CAMERA_BIT(v) (1ull << (uint32_t)(v))
 

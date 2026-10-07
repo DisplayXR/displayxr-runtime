@@ -178,7 +178,9 @@ if(WIN32)
 	# shell32 needed for SHGetFolderPathA in u_file_logging.c
 	# advapi32 needed for ACL/security APIs (AppContainer write access) in u_file_logging.c
 	# bcrypt: BCryptGenRandom seeds the stereo camera persistentId secret (u_camera_consent_store.c)
-	target_link_libraries(aux_util PRIVATE shell32 advapi32 bcrypt)
+	# wintrust + crypt32: Authenticode signer check for user-writable consent-delegating
+	# entries; ole32 (CoTaskMemFree) + uuid (FOLDERID_*): SHGetKnownFolderPath (u_camera_consent_store.c)
+	target_link_libraries(aux_util PRIVATE shell32 advapi32 bcrypt wintrust crypt32 ole32 uuid)
 endif()
 
 # WIL is lacking official support on MINGW.

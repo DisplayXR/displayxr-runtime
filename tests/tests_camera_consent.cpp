@@ -24,10 +24,29 @@
 
 namespace {
 
+struct fake_entry_info
+{
+	u_camera_consent_delegation_scope scope = U_CAMERA_CONSENT_DELEGATION_SYSTEM;
+	std::string signer;
+};
+
+//! insert(exe) registers a SYSTEM-level, signer-less entry (the installer's case).
+struct fake_delegating_list
+{
+	std::map<std::string, fake_entry_info> m;
+	void
+	insert(const std::string &exe,
+	       u_camera_consent_delegation_scope scope = U_CAMERA_CONSENT_DELEGATION_SYSTEM,
+	       const std::string &signer = "")
+	{
+		m[exe] = fake_entry_info{scope, signer};
+	}
+};
+
 struct fake_store
 {
 	std::map<std::string, u_camera_consent_stored> apps;
-	std::set<std::string> delegating;
+	fake_delegating_list delegating;
 	bool sharing = true;
 	bool have_secret = true;
 	uint8_t secret[32] = {1, 2, 3};
@@ -62,9 +81,16 @@ fs_set(void *ctx, const char *exe, u_camera_consent_stored v)
 	return true;
 }
 bool
-fs_is_delegating(void *ctx, const char *exe)
+fs_get_delegation(void *ctx, const char *exe, u_camera_consent_delegation *out)
 {
-	return ((fake_store *)ctx)->delegating.count(exe) > 0;
+	auto &m = ((fake_store *)ctx)->delegating.m;
+	auto it = m.find(exe);
+	if (it == m.end()) {
+		return false;
+	}
+	out->scope = it->second.scope;
+	snprintf(out->signer, sizeof(out->signer), "%s", it->second.signer.c_str());
+	return true;
 }
 bool
 fs_sharing(void *ctx)
@@ -88,8 +114,8 @@ fs_secret(void *ctx, uint8_t out[32])
 	return true;
 }
 
-const u_camera_consent_store_ops fake_store_ops = {fs_get, fs_set, fs_is_delegating, fs_sharing, fs_set_sharing,
-                                                   fs_secret};
+const u_camera_consent_store_ops fake_store_ops = {fs_get,     fs_set,         fs_get_delegation,
+                                                   fs_sharing, fs_set_sharing, fs_secret};
 
 struct fake_env
 {
@@ -98,6 +124,12 @@ struct fake_env
 	int prompts = 0;
 	std::string last_exe;
 	long last_pid = 0;
+	//! Executables whose path a non-admin process could replace (default: none).
+	std::set<std::string> user_writable;
+	//! Validly signed executables -> their signer CN.
+	std::map<std::string, std::string> signers;
+	int signer_queries = 0;
+	std::vector<std::string> notices;
 };
 
 bool
@@ -118,7 +150,31 @@ fe_prompt(void *ctx, const char *exe, const char *app, long pid, uint32_t timeou
 	return e->answer;
 }
 
-const u_camera_consent_env_ops fake_env_ops = {fe_os, fe_prompt};
+bool
+fe_user_writable(void *ctx, const char *exe)
+{
+	return ((fake_env *)ctx)->user_writable.count(exe) > 0;
+}
+bool
+fe_signer(void *ctx, const char *exe, char *out, size_t cap)
+{
+	auto *e = (fake_env *)ctx;
+	e->signer_queries++;
+	auto it = e->signers.find(exe);
+	if (it == e->signers.end()) {
+		return false;
+	}
+	snprintf(out, cap, "%s", it->second.c_str());
+	return true;
+}
+void
+fe_notice(void *ctx, const char *exe, const char *app)
+{
+	(void)app;
+	((fake_env *)ctx)->notices.push_back(exe);
+}
+
+const u_camera_consent_env_ops fake_env_ops = {fe_os, fe_prompt, fe_user_writable, fe_signer, fe_notice};
 
 struct rig
 {
@@ -129,10 +185,11 @@ struct rig
 	{
 		u_camera_consent_init(&c, &fake_store_ops, &store, &fake_env_ops, &env);
 	}
-	u_camera_consent_decision eval(const char *exe = "/apps/caller", long pid = 100)
+	u_camera_consent_decision
+	eval(const char *exe = "/apps/caller", long pid = 100, uint32_t flags = 0)
 	{
 		u_camera_consent_decision d;
-		u_camera_consent_evaluate(&c, exe, "Caller", pid, &d);
+		u_camera_consent_evaluate(&c, exe, "Caller", pid, flags, &d);
 		return d;
 	}
 };
@@ -196,9 +253,255 @@ TEST_CASE("camera consent: a delegating client passes without a prompt or a stor
 	CHECK(d.verdict == U_CAMERA_CONSENT_ALLOWED);
 	CHECK(d.why == U_CAMERA_CONSENT_WHY_DELEGATING);
 	CHECK(d.delegating);
+	CHECK(d.delegated);
+	CHECK(d.delegation_scope == U_CAMERA_CONSENT_DELEGATION_SYSTEM);
 	CHECK(r.env.prompts == 0);
 	CHECK(r.store.sets == 0);
 	CHECK(r.store.apps.empty());
+	CHECK(r.env.notices.empty()); // a machine-level (installer) entry is silent
+}
+
+/*
+ * Spec v3: XR_STEREO_CAMERA_CLIENT_DECLINE_DELEGATION_BIT_DXR. The client says
+ * "do not take my own prompt as consent this time" — the delegation step is
+ * skipped and the executable is an ordinary app: stored Allow, Allow once,
+ * the runtime prompt. Every refusal still applies first.
+ */
+TEST_CASE("camera consent: DECLINE_DELEGATION skips the delegation step", "[camera_consent][decline]")
+{
+	const char *b = "/opt/browser/browser";
+	const uint32_t decline = U_CAMERA_CONSENT_FLAG_DECLINE_DELEGATION;
+	rig r;
+	r.store.delegating.insert(b);
+	SECTION("nothing stored: the runtime prompt decides")
+	{
+		r.env.answer = U_CAMERA_CONSENT_PROMPT_DENY;
+		auto d = r.eval(b, 100, decline);
+		CHECK(d.verdict == U_CAMERA_CONSENT_REFUSED);
+		CHECK(d.why == U_CAMERA_CONSENT_WHY_PROMPT_DENY);
+		CHECK(r.env.prompts == 1);
+		CHECK(d.delegating); // still REGISTERED: the RAW refusal keeps applying
+		CHECK(!d.delegated); // but not allowed by delegation
+		CHECK(d.delegation_skip == U_CAMERA_CONSENT_DELEGATION_DECLINED);
+		// The prompt's Deny is now stored, and it wins the next time too —
+		// with or without the flag.
+		d = r.eval(b, 100, 0);
+		CHECK(d.why == U_CAMERA_CONSENT_WHY_STORED_DENY);
+	}
+	SECTION("prompt unavailable: refused")
+	{
+		auto d = r.eval(b, 100, decline);
+		CHECK(d.verdict == U_CAMERA_CONSENT_REFUSED);
+		CHECK(d.why == U_CAMERA_CONSENT_WHY_PROMPT_UNAVAILABLE);
+	}
+	SECTION("a stored Allow allows")
+	{
+		r.store.apps[b] = U_CAMERA_CONSENT_STORED_ALLOW;
+		auto d = r.eval(b, 100, decline);
+		CHECK(d.verdict == U_CAMERA_CONSENT_ALLOWED);
+		CHECK(d.why == U_CAMERA_CONSENT_WHY_STORED_ALLOW);
+		CHECK(!d.delegated);
+		CHECK(r.env.prompts == 0);
+	}
+	SECTION("Allow once allows the same process again")
+	{
+		r.env.answer = U_CAMERA_CONSENT_PROMPT_ALLOW_ONCE;
+		auto d = r.eval(b, 7, decline);
+		CHECK(d.why == U_CAMERA_CONSENT_WHY_PROMPT_ALLOW_ONCE);
+		d = r.eval(b, 7, decline);
+		CHECK(d.why == U_CAMERA_CONSENT_WHY_ALLOW_ONCE);
+		CHECK(r.env.prompts == 1);
+	}
+	SECTION("a stored Deny still wins")
+	{
+		r.store.apps[b] = U_CAMERA_CONSENT_STORED_DENY;
+		r.env.answer = U_CAMERA_CONSENT_PROMPT_ALLOW;
+		auto d = r.eval(b, 100, decline);
+		CHECK(d.verdict == U_CAMERA_CONSENT_REFUSED);
+		CHECK(d.why == U_CAMERA_CONSENT_WHY_STORED_DENY);
+		CHECK(r.env.prompts == 0);
+	}
+	SECTION("without the flag the same executable is delegated")
+	{
+		auto d = r.eval(b, 100, 0);
+		CHECK(d.why == U_CAMERA_CONSENT_WHY_DELEGATING);
+		CHECK(d.delegated);
+	}
+	SECTION("unknown flag bits are ignored")
+	{
+		auto d = r.eval(b, 100, 0xfffffffeu);
+		CHECK(d.why == U_CAMERA_CONSENT_WHY_DELEGATING);
+	}
+	SECTION("an unregistered executable is unaffected by the flag")
+	{
+		r.env.answer = U_CAMERA_CONSENT_PROMPT_ALLOW;
+		auto d = r.eval("/apps/caller", 100, decline);
+		CHECK(d.why == U_CAMERA_CONSENT_WHY_PROMPT_ALLOW);
+		CHECK(d.delegation_skip == U_CAMERA_CONSENT_DELEGATION_APPLIES);
+	}
+}
+
+/*
+ * Spec §7.1.1: a delegating entry whose executable sits in a user-writable
+ * location is trusted only with a recorded signer that the executable's valid
+ * signature matches. Otherwise step 6 is skipped exactly as if not delegating.
+ */
+TEST_CASE("camera consent: user-writable delegating entries need a matching signer", "[camera_consent][signer]")
+{
+	const char *b = "C:\\Users\\u\\AppData\\Local\\Browser\\browser.exe";
+	rig r;
+	r.env.user_writable.insert(b);
+	r.env.answer = U_CAMERA_CONSENT_PROMPT_UNAVAILABLE;
+	SECTION("no signer recorded: not delegated, falls through to the prompt")
+	{
+		r.store.delegating.insert(b, U_CAMERA_CONSENT_DELEGATION_USER);
+		r.env.signers[b] = "Browser Corp"; // validly signed, but the entry names nobody
+		auto d = r.eval(b);
+		CHECK(d.verdict == U_CAMERA_CONSENT_REFUSED);
+		CHECK(d.why == U_CAMERA_CONSENT_WHY_PROMPT_UNAVAILABLE);
+		CHECK(r.env.prompts == 1);
+		CHECK(d.delegating);
+		CHECK(!d.delegated);
+		CHECK(d.delegation_skip == U_CAMERA_CONSENT_DELEGATION_NO_SIGNER);
+		CHECK(r.env.notices.empty());
+		// The WARN is once per executable per run.
+		CHECK(r.c.untrusted_warned_count == 1);
+		r.eval(b);
+		CHECK(r.c.untrusted_warned_count == 1);
+	}
+	SECTION("no signer recorded, a stored Allow still allows (as for any app)")
+	{
+		r.store.delegating.insert(b, U_CAMERA_CONSENT_DELEGATION_USER);
+		r.store.apps[b] = U_CAMERA_CONSENT_STORED_ALLOW;
+		auto d = r.eval(b);
+		CHECK(d.verdict == U_CAMERA_CONSENT_ALLOWED);
+		CHECK(d.why == U_CAMERA_CONSENT_WHY_STORED_ALLOW);
+		CHECK(!d.delegated);
+	}
+	SECTION("matching signer: delegated")
+	{
+		r.store.delegating.insert(b, U_CAMERA_CONSENT_DELEGATION_SYSTEM, "Browser Corp");
+		r.env.signers[b] = "browser corp "; // case / surrounding spaces do not matter
+		auto d = r.eval(b);
+		CHECK(d.verdict == U_CAMERA_CONSENT_ALLOWED);
+		CHECK(d.why == U_CAMERA_CONSENT_WHY_DELEGATING);
+		CHECK(d.delegated);
+		CHECK(r.env.prompts == 0);
+		CHECK(r.env.signer_queries == 1);
+	}
+	SECTION("not validly signed: not delegated")
+	{
+		r.store.delegating.insert(b, U_CAMERA_CONSENT_DELEGATION_SYSTEM, "Browser Corp");
+		auto d = r.eval(b);
+		CHECK(d.why == U_CAMERA_CONSENT_WHY_PROMPT_UNAVAILABLE);
+		CHECK(!d.delegated);
+		CHECK(d.delegation_skip == U_CAMERA_CONSENT_DELEGATION_NOT_SIGNED);
+	}
+	SECTION("signed by someone else: not delegated")
+	{
+		r.store.delegating.insert(b, U_CAMERA_CONSENT_DELEGATION_SYSTEM, "Browser Corp");
+		r.env.signers[b] = "Browser Corp Evil";
+		auto d = r.eval(b);
+		CHECK(d.why == U_CAMERA_CONSENT_WHY_PROMPT_UNAVAILABLE);
+		CHECK(!d.delegated);
+		CHECK(d.delegation_skip == U_CAMERA_CONSENT_DELEGATION_SIGNER_MISMATCH);
+	}
+	SECTION("a stored Deny still decides before the signer is even looked at")
+	{
+		r.store.delegating.insert(b, U_CAMERA_CONSENT_DELEGATION_SYSTEM, "Browser Corp");
+		r.env.signers[b] = "Browser Corp";
+		r.store.apps[b] = U_CAMERA_CONSENT_STORED_DENY;
+		auto d = r.eval(b);
+		CHECK(d.why == U_CAMERA_CONSENT_WHY_STORED_DENY);
+		CHECK(r.env.signer_queries == 0);
+	}
+}
+
+TEST_CASE("camera consent: an admin-protected delegating entry is trusted by path alone", "[camera_consent][signer]")
+{
+	const char *b = "C:\\Program Files\\Browser\\browser.exe";
+	rig r; // r.env.user_writable is empty: every path is admin-protected
+	r.store.delegating.insert(b, U_CAMERA_CONSENT_DELEGATION_SYSTEM, ""); // no signer, unsigned
+	auto d = r.eval(b);
+	CHECK(d.verdict == U_CAMERA_CONSENT_ALLOWED);
+	CHECK(d.why == U_CAMERA_CONSENT_WHY_DELEGATING);
+	CHECK(d.delegated);
+	CHECK(r.env.signer_queries == 0);
+	SECTION("a recorded signer is not consulted there either")
+	{
+		r.store.delegating.insert(b, U_CAMERA_CONSENT_DELEGATION_SYSTEM, "Somebody Else");
+		d = r.eval(b);
+		CHECK(d.why == U_CAMERA_CONSENT_WHY_DELEGATING);
+		CHECK(r.env.signer_queries == 0);
+	}
+}
+
+TEST_CASE("camera consent: a host that cannot classify paths fails closed", "[camera_consent][signer]")
+{
+	// No path_user_writable / exe_signer: every path counts as user-writable
+	// and nothing can be verified -> a delegating entry is never applied.
+	fake_store store;
+	store.delegating.insert("/opt/browser/browser");
+	fake_env env;
+	const u_camera_consent_env_ops minimal = {fe_os, fe_prompt, nullptr, nullptr, nullptr};
+	u_camera_consent c;
+	u_camera_consent_init(&c, &fake_store_ops, &store, &minimal, &env);
+	u_camera_consent_decision d;
+	u_camera_consent_evaluate(&c, "/opt/browser/browser", "B", 1, 0, &d);
+	CHECK(d.why == U_CAMERA_CONSENT_WHY_PROMPT_UNAVAILABLE);
+	CHECK(d.delegation_skip == U_CAMERA_CONSENT_DELEGATION_NO_SIGNER);
+	store.delegating.insert("/opt/browser/browser", U_CAMERA_CONSENT_DELEGATION_SYSTEM, "Browser Corp");
+	u_camera_consent_evaluate(&c, "/opt/browser/browser", "B", 1, 0, &d);
+	CHECK(d.delegation_skip == U_CAMERA_CONSENT_DELEGATION_NOT_SIGNED);
+	CHECK(!d.delegated);
+}
+
+/*
+ * Spec §7.1.1: a USER-level entry is honoured, but its first use per
+ * executable per service run is announced (WARN + the host's notice).
+ */
+TEST_CASE("camera consent: user-level delegation raises a first-use notice", "[camera_consent][notice]")
+{
+	const char *b = "/opt/browser/browser";
+	const char *b2 = "/opt/other/other";
+	rig r;
+	r.store.delegating.insert(b, U_CAMERA_CONSENT_DELEGATION_USER);
+	auto d = r.eval(b);
+	CHECK(d.why == U_CAMERA_CONSENT_WHY_DELEGATING);
+	CHECK(d.delegation_scope == U_CAMERA_CONSENT_DELEGATION_USER);
+	REQUIRE(r.env.notices.size() == 1);
+	CHECK(r.env.notices[0] == b);
+	// Once per executable per run: a second start, or another pid, is silent.
+	r.eval(b, 100);
+	r.eval(b, 200);
+	CHECK(r.env.notices.size() == 1);
+	// Another user-delegated executable gets its own.
+	r.store.delegating.insert(b2, U_CAMERA_CONSENT_DELEGATION_USER);
+	r.eval(b2);
+	CHECK(r.env.notices.size() == 2);
+	SECTION("no notice when the delegation did not apply")
+	{
+		r.store.delegating.insert("/opt/third", U_CAMERA_CONSENT_DELEGATION_USER);
+		r.store.apps["/opt/third"] = U_CAMERA_CONSENT_STORED_DENY;
+		r.eval("/opt/third");                                              // stored Deny decides
+		r.eval("/opt/third", 1, U_CAMERA_CONSENT_FLAG_DECLINE_DELEGATION); // declined
+		CHECK(r.env.notices.size() == 2);
+	}
+	SECTION("no notice for a system-level entry")
+	{
+		r.store.delegating.insert("/opt/sys", U_CAMERA_CONSENT_DELEGATION_SYSTEM);
+		CHECK(r.eval("/opt/sys").why == U_CAMERA_CONSENT_WHY_DELEGATING);
+		CHECK(r.env.notices.size() == 2);
+	}
+	SECTION("the seen-set is bounded and never overflows")
+	{
+		for (int i = 0; i < 3 * U_CAMERA_CONSENT_SEEN_MAX; i++) {
+			std::string e = "/opt/many/" + std::to_string(i);
+			r.store.delegating.insert(e, U_CAMERA_CONSENT_DELEGATION_USER);
+			r.eval(e.c_str());
+		}
+		CHECK(r.env.notices.size() == 2 + 3 * U_CAMERA_CONSENT_SEEN_MAX);
+	}
 }
 
 TEST_CASE("camera consent: a delegating client is refused by the OS camera switch", "[camera_consent]")
@@ -398,7 +701,7 @@ TEST_CASE("camera consent: no store and no env still decides safely", "[camera_c
 	u_camera_consent c;
 	u_camera_consent_init(&c, nullptr, nullptr, nullptr, nullptr);
 	u_camera_consent_decision d;
-	u_camera_consent_evaluate(&c, "/apps/caller", "Caller", 1, &d);
+	u_camera_consent_evaluate(&c, "/apps/caller", "Caller", 1, 0, &d);
 	CHECK(d.verdict == U_CAMERA_CONSENT_REFUSED);
 	CHECK(d.why == U_CAMERA_CONSENT_WHY_PROMPT_UNAVAILABLE);
 	CHECK(u_camera_consent_sharing_enabled(&c));
@@ -429,6 +732,48 @@ TEST_CASE("consent store: path comparison rules", "[camera_consent][consent_stor
 	// Empty / NULL never match.
 	CHECK(!u_camera_consent_path_equal("", "", true));
 	CHECK(!u_camera_consent_path_equal(nullptr, "/a", false));
+}
+
+TEST_CASE("consent store: admin-protected folder test", "[camera_consent][consent_store]")
+{
+	const char *pf = "C:\\Program Files";
+	CHECK(u_camera_consent_path_is_under("C:\\Program Files\\B\\b.exe", pf, true));
+	CHECK(u_camera_consent_path_is_under("c:/program files/b/b.exe", "C:\\Program Files\\", true));
+	// Not a separator boundary.
+	CHECK(!u_camera_consent_path_is_under("C:\\Program FilesX\\b.exe", pf, true));
+	CHECK(!u_camera_consent_path_is_under("C:\\Program Files (x86)\\b.exe", pf, true));
+	CHECK(u_camera_consent_path_is_under("C:\\Program Files (x86)\\b.exe", "C:\\Program Files (x86)", true));
+	// The folder itself is not "inside" it.
+	CHECK(!u_camera_consent_path_is_under("C:\\Program Files", pf, true));
+	CHECK(!u_camera_consent_path_is_under("C:\\Program Files\\", pf, true));
+	// ".." climbs out.
+	CHECK(!u_camera_consent_path_is_under("C:\\Program Files\\..\\Users\\u\\b.exe", pf, true));
+	CHECK(!u_camera_consent_path_is_under("C:\\Program Files\\B\\..", pf, true));
+	CHECK(u_camera_consent_path_is_under("C:\\Program Files\\B\\..b.exe", pf, true)); // a name, not ".."
+	// Elsewhere.
+	CHECK(!u_camera_consent_path_is_under("C:\\Users\\u\\AppData\\Local\\B\\b.exe", pf, true));
+	CHECK(!u_camera_consent_path_is_under("D:\\Program Files\\b.exe", pf, true));
+	// POSIX rules are byte-exact.
+	CHECK(u_camera_consent_path_is_under("/usr/bin/x", "/usr", false));
+	CHECK(!u_camera_consent_path_is_under("/USR/bin/x", "/usr", false));
+	CHECK(!u_camera_consent_path_is_under("/usr\\bin", "/usr", false));
+	// Empty / NULL.
+	CHECK(!u_camera_consent_path_is_under("", pf, true));
+	CHECK(!u_camera_consent_path_is_under("C:\\x", "", true));
+	CHECK(!u_camera_consent_path_is_under(nullptr, pf, true));
+	CHECK(!u_camera_consent_path_is_under("C:\\x", "\\\\", true)); // only separators
+}
+
+TEST_CASE("consent store: signer name comparison", "[camera_consent][consent_store]")
+{
+	CHECK(u_camera_consent_signer_equal("Browser Corp", "Browser Corp"));
+	CHECK(u_camera_consent_signer_equal("Browser Corp", "  browser CORP "));
+	CHECK(!u_camera_consent_signer_equal("Browser Corp", "Browser Corp Evil"));
+	CHECK(!u_camera_consent_signer_equal("Browser Corp", "Browser  Corp"));
+	CHECK(!u_camera_consent_signer_equal("\xc3\x89 Corp", "\xc3\xa9 Corp")); // non-ASCII not folded
+	CHECK(!u_camera_consent_signer_equal("", ""));
+	CHECK(!u_camera_consent_signer_equal("   ", "   "));
+	CHECK(!u_camera_consent_signer_equal(nullptr, "x"));
 }
 
 namespace {

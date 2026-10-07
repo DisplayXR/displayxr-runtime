@@ -15,8 +15,13 @@
  *   camera consent                               list the store (apps, delegating, sharing)
  *   camera allow|deny|revoke <exe>|--self        stored per-app decision
  *   camera trust|untrust <exe>|--self            user-level consent-DELEGATING list
- *                                                (trust clears a stored Deny for <exe>, which
- *                                                would otherwise keep refusing it — spec §7.1)
+ *          [--signer "<CN>"]                     (trust clears a stored Deny for <exe>, which
+ *                                                would otherwise keep refusing it — spec §7.1;
+ *                                                --signer records the Authenticode signer CN a
+ *                                                user-writable <exe> must carry — §7.1.1)
+ *   camera signer <exe>|--self                   what §7.1.1 sees: path class + valid signer
+ *   list / calib / probe ... --decline-delegation declare XR_STEREO_CAMERA_CLIENT_DECLINE_
+ *                                                DELEGATION_BIT_DXR (spec v3) for this connection
  *   <exe> is stored as the service will see the peer: made absolute / resolved
  *   (and, on Windows, read from the UTF-16 command line, not the ANSI argv).
  *   camera status                                sharing / locked / started streams (IPC)
@@ -43,12 +48,10 @@
  * (exit 5) if the frames came back RAW-flagged or the rows do not align:
  * |SIGNED median dy| > 0.5 px (a constant vertical offset), a robust spread
  * (MAD about that median) > 1.5 px, or fewer than 20 accepted blocks. The
- * unsigned |dy| statistics are printed but not gated (block-match noise). Matching is zero-mean NCC with sub-pixel refinement; the
- * disparity window comes from the camera's own f * B (a subject at 0.4 m),
- * the vertical one is +-24 px, blocks under NCC 0.90 or peaking ON either
- * bound are counted and excluded (a bound hit is a clamp, not a measurement —
- * the first Leia SR run read "d = 64, |dy| = 10.000" that way). On the
- * distorted sim fake
+ * unsigned |dy| statistics are printed but not gated (block-match noise). Matching is zero-mean NCC with sub-pixel
+ * refinement; the disparity window comes from the camera's own f * B (a subject at 0.4 m), the vertical one is +-24 px,
+ * blocks under NCC 0.90 or peaking ON either bound are counted and excluded (a bound hit is a clamp, not a measurement
+ * — the first Leia SR run read "d = 64, |dy| = 10.000" that way). On the distorted sim fake
  * (SIM_DISPLAY_FAKE_STEREO_CAMERA_DISTORT=1) the depths read back 2.00 m
  * (background) and 0.60 m (bar); `--raw` shows the misalignment it fixes.
  *
@@ -181,12 +184,14 @@ refusal_exit_code(xrt_result_t x)
 	}
 }
 
+//! @p client_flags: XRT_STEREO_CAMERA_CLIENT_* (what XrStereoCameraClientInfoDXR::flags carries).
 static bool
-cam_connect(struct ipc_connection *ipc_c, uint32_t client_class)
+cam_connect(struct ipc_connection *ipc_c, uint32_t client_class, uint64_t client_flags)
 {
 	struct xrt_instance_info ii = {0};
 	snprintf(ii.app_info.application_name, sizeof(ii.app_info.application_name), "%s", "displayxr-cli");
 	ii.app_info.declared_client_class = client_class;
+	ii.app_info.stereo_camera_client_flags = client_flags;
 	xrt_result_t xret = ipc_client_connection_init(ipc_c, U_LOGGING_ERROR, &ii);
 	if (xret != XRT_SUCCESS) {
 		printf("displayxr-cli camera: not connected to the service (xrt_result=%d).\n", (int)xret);
@@ -1065,6 +1070,43 @@ self_exe_path(char *out, size_t cap)
 #endif
 }
 
+//! Index of @p flag in argv (from 3, after "camera <sub>"), or -1.
+static int
+cli_flag_index(int argc, const char **argv, const char *flag)
+{
+	for (int i = 3; i < argc; i++) {
+		if (strcmp(argv[i], flag) == 0) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+//! argv[@p idx] as UTF-8 (Windows: re-read from the UTF-16 command line, argv is ANSI).
+static bool
+arg_utf8(int argc, const char **argv, int idx, char *out, size_t cap)
+{
+	if (idx < 0 || idx >= argc || cap == 0) {
+		return false;
+	}
+#if defined(XRT_OS_WINDOWS)
+	int wargc = 0;
+	wchar_t **wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+	bool ok = false;
+	if (wargv != NULL && wargc == argc) {
+		ok = WideCharToMultiByte(CP_UTF8, 0, wargv[idx], -1, out, (int)cap, NULL, NULL) > 1;
+	}
+	if (wargv != NULL) {
+		LocalFree(wargv);
+	}
+	if (ok) {
+		return true;
+	}
+#endif
+	snprintf(out, cap, "%s", argv[idx]);
+	return out[0] != '\0';
+}
+
 //! "<exe>" or "--self" -> the path to act on.
 static bool
 resolve_exe_arg(int argc, const char **argv, int idx, char *out, size_t cap)
@@ -1165,22 +1207,70 @@ cmd_store(const char *op, int argc, const char **argv)
 			}
 			printf("trust %s: cleared the stored Deny for it\n", exe);
 		}
-		ok = u_camera_consent_store_set_delegating(exe, true);
+		// Spec §7.1.1: an executable outside the admin-protected folders is only
+		// delegated when it is Authenticode-signed by the signer recorded here.
+		char signer[U_CAMERA_CONSENT_SIGNER_MAX] = {0};
+		int si = cli_flag_index(argc, argv, "--signer");
+		if (si > 0 && !arg_utf8(argc, argv, si + 1, signer, sizeof(signer))) {
+			printf("usage: displayxr-cli camera trust <exe>|--self [--signer \"<CN>\"]\n");
+			return 1;
+		}
+		ok = u_camera_consent_store_set_delegating(exe, true, signer);
+		if (ok && u_camera_consent_path_user_writable(exe)) {
+			char actual[U_CAMERA_CONSENT_SIGNER_MAX];
+			bool is_signed = u_camera_consent_exe_signer(exe, actual, sizeof(actual));
+			if (signer[0] == '\0') {
+				printf(
+				    "  note: %s is in a user-writable location: without --signer \"<CN>\" this entry "
+				    "is NOT "
+				    "applied (the app is prompted like any other)%s%s%s\n",
+				    exe, is_signed ? "; it is signed by \"" : "", is_signed ? actual : "",
+				    is_signed ? "\"" : "");
+			} else if (!is_signed) {
+				printf("  note: %s has no valid code signature: this entry is NOT applied\n", exe);
+			} else if (!u_camera_consent_signer_equal(actual, signer)) {
+				printf("  note: %s is signed by \"%s\", not \"%s\": this entry is NOT applied\n", exe,
+				       actual, signer);
+			}
+		}
 	} else { // untrust
-		ok = u_camera_consent_store_set_delegating(exe, false);
+		ok = u_camera_consent_store_set_delegating(exe, false, NULL);
 	}
 	printf("%s %s: %s\n", op, exe, ok ? "ok (takes effect on the next stream start)" : "FAILED to write the store");
-	if (ok && strcmp(op, "deny") == 0 && st->is_delegating(NULL, exe)) {
+	if (ok && strcmp(op, "deny") == 0 && u_camera_consent_is_registered_delegating(st, NULL, exe)) {
 		printf("  note: %s is also a registered consent-delegating client; the stored Deny wins\n", exe);
 	}
 	return ok ? 0 : 2;
+}
+
+/*!
+ * `camera signer <exe>|--self`: what §7.1.1 sees for an executable — is its
+ * path user-writable, and its valid Authenticode signer (if any). Exit 0 when
+ * validly signed, 3 when not (so a script can tell).
+ */
+static int
+cmd_signer(int argc, const char **argv)
+{
+	char exe[1024];
+	if (!resolve_exe_arg(argc, argv, 3, exe, sizeof(exe))) {
+		printf("usage: displayxr-cli camera signer <exe>|--self\n");
+		return 1;
+	}
+	char cn[U_CAMERA_CONSENT_SIGNER_MAX];
+	bool is_signed = u_camera_consent_exe_signer(exe, cn, sizeof(cn));
+	bool uw = u_camera_consent_path_user_writable(exe);
+	printf("%s\n  path:      %s\n  signature: %s%s%s\n", exe,
+	       uw ? "USER-WRITABLE (a delegating entry needs a matching signer)"
+	          : "admin-protected (a delegating entry is trusted by path)",
+	       is_signed ? "valid, signer \"" : "none / not valid", is_signed ? cn : "", is_signed ? "\"" : "");
+	return is_signed ? 0 : 3;
 }
 
 static int
 cmd_control(uint32_t op, uint32_t arg, const char *what)
 {
 	struct ipc_connection ipc_c = {0};
-	if (!cam_connect(&ipc_c, XRT_CLIENT_CLASS_DIAG)) {
+	if (!cam_connect(&ipc_c, XRT_CLIENT_CLASS_DIAG, 0)) {
 		return 2;
 	}
 	uint32_t value = 0;
@@ -1225,10 +1315,14 @@ usage(void)
 	    "[--seconds S] "
 	    "[--out DIR]\n"
 	    "             [--max-disparity N] [--max-dy N (24)] [--min-ncc C (0.90)]\n"
+	    "       list|calib|probe ... --decline-delegation   declare DECLINE_DELEGATION (spec v3)\n"
 	    "       consent                      list the consent store\n"
 	    "       allow|deny|revoke <exe>|--self   stored per-app decision (local)\n"
-	    "       trust|untrust <exe>|--self       user-level consent-delegating list (local; trust clears a stored "
-	    "Deny)\n"
+	    "       trust <exe>|--self [--signer \"<CN>\"] | untrust <exe>|--self\n"
+	    "                                    user-level consent-delegating list (local; trust clears a stored "
+	    "Deny;\n"
+	    "                                    a user-writable <exe> needs --signer, spec 7.1.1)\n"
+	    "       signer <exe>|--self          path class + Authenticode signer (exit 3 = not validly signed)\n"
 	    "       status | stop-all | sharing on|off | fake-lock on|off   (over IPC, DIAG)\n"
 	    "exit codes: 4 consent refused, 6 sharing off, 7 busy, 8 ended by the service, 5 rows misaligned\n");
 }
@@ -1246,6 +1340,9 @@ cli_cmd_camera(int argc, const char **argv)
 	if (strcmp(sub, "allow") == 0 || strcmp(sub, "deny") == 0 || strcmp(sub, "revoke") == 0 ||
 	    strcmp(sub, "trust") == 0 || strcmp(sub, "untrust") == 0) {
 		return cmd_store(sub, argc, argv);
+	}
+	if (strcmp(sub, "signer") == 0) {
+		return cmd_signer(argc, argv);
 	}
 	// Control ops: DIAG class over IPC.
 	uint32_t onoff = 0;
@@ -1276,7 +1373,13 @@ cli_cmd_camera(int argc, const char **argv)
 
 	// The consumer path: the same class a browser's capture utility declares.
 	struct ipc_connection ipc_c = {0};
-	if (!cam_connect(&ipc_c, XRT_CLIENT_CLASS_CAMERA_CONSUMER)) {
+	// --decline-delegation: XR_STEREO_CAMERA_CLIENT_DECLINE_DELEGATION_BIT_DXR, as a
+	// browser running with its own permission prompt bypassed declares it (spec v3).
+	uint64_t client_flags = XRT_STEREO_CAMERA_CLIENT_CONSUMER_ONLY;
+	if (cli_has_flag(argc, argv, "--decline-delegation")) {
+		client_flags |= XRT_STEREO_CAMERA_CLIENT_DECLINE_DELEGATION;
+	}
+	if (!cam_connect(&ipc_c, XRT_CLIENT_CLASS_CAMERA_CONSUMER, client_flags)) {
 		return 2;
 	}
 	int ret;
