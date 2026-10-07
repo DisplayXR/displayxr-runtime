@@ -152,6 +152,7 @@ Integrate your 3D display hardware into DisplayXR.
 - [ADR-043](adr/ADR-043-stereo-camera-source.md) — A display's stereo camera is a plug-in-provided source, owned by the service and privacy-gated by the runtime
 - [ADR-044](adr/ADR-044-colour-contract-per-backend.md) — The colour contract, per backend and swapchain format
 - [ADR-045](adr/ADR-045-plugins-always-loadable-and-report-platform-state.md) — Plug-ins are always loadable and report their platform state
+- [ADR-046](adr/ADR-046-depth-aware-cursor.md) — Depth-aware cursor — opt-in only; the app knows the depth, the runtime places the cursor
 <!-- END ADR INDEX -->
 
 ---
