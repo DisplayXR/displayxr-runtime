@@ -336,3 +336,28 @@ TEST_CASE("Quad mode on two segments: every view gets a real frustum", "[oxr][se
 		}
 	}
 }
+
+TEST_CASE("the frame's routing survives a later non-splitting locate", "[oxr][segment_views]")
+{
+	xrt_segment_view_routing frame;
+	std::memset(&frame, 0, sizeof(frame));
+
+	// The projection locate split the views...
+	xrt_segment_view_routing split;
+	std::memset(&split, 0, sizeof(split));
+	split.count = 2;
+	split.first_view[1] = 2;
+	split.view_count[0] = split.view_count[1] = 2;
+	oxr_segment_views_route_record(&frame, &split);
+
+	// ...then a zone-scoped / camera-rig locate keeps one view set: it does
+	// not record anything, so xrEndFrame still routes per segment.
+	xrt_segment_view_routing out;
+	oxr_segment_views_route_take(&frame, &out);
+	CHECK(out.count == 2);
+	CHECK(out.first_view[1] == 2);
+
+	// The record is per frame: the next frame starts empty.
+	oxr_segment_views_route_take(&frame, &out);
+	CHECK(out.count == 0);
+}

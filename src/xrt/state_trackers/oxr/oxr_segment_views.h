@@ -29,6 +29,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -219,6 +220,26 @@ oxr_segment_views_nominal_eyes(
 		out[i].z = z;
 	}
 	return n;
+}
+
+/*!
+ * The per-frame routing record (xrLocateViews -> xrEndFrame). Only a locate
+ * that SPLIT the views records; every other locate in the frame (a zone-scoped
+ * or camera-rig locate, a locate that kept one view set) leaves the record as
+ * it is, so it cannot erase the routing of the projection the app rendered per
+ * segment. xrEndFrame takes the record and resets it for the next frame.
+ */
+static inline void
+oxr_segment_views_route_record(struct xrt_segment_view_routing *frame, const struct xrt_segment_view_routing *r)
+{
+	*frame = *r;
+}
+
+static inline void
+oxr_segment_views_route_take(struct xrt_segment_view_routing *frame, struct xrt_segment_view_routing *out)
+{
+	*out = *frame;
+	memset(frame, 0, sizeof(*frame));
 }
 
 /*!
