@@ -6727,6 +6727,10 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	comp_multi_weave_linux_set_mono_in_2d(ics->xc, args->mono_in_2d != 0);
 	// v14/v15: per submit, read only when the DP composites the overlay.
 	comp_multi_weave_linux_set_overlay_hints(ics->xc, args->overlay_unchanged != 0, args->overlay_filter_strength);
+#elif defined(XRT_OS_ANDROID)
+	// v14/v15: same per-submit hints for the Android weave (2D under the lens).
+	comp_multi_weave_android_set_overlay_hints(ics->xc, args->overlay_unchanged != 0,
+	                                           args->overlay_filter_strength);
 #endif
 	bool ok = comp_multi_weave_submit(                          //
 	    ics->xc, handles[0],                                    //
