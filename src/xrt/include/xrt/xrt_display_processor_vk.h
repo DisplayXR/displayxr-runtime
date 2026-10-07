@@ -1158,6 +1158,25 @@ xrt_display_processor_vk_get_weave_scope(struct xrt_display_processor_vk *xdp)
 }
 
 /*!
+ * Does the DP's output survive a display-server resample
+ * (@ref XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE)? Every "didn't answer" case —
+ * absent slot, NULL, false return — is false: the conservative reading, under
+ * which the runtime's 1:1 gates behave exactly as they did before the flag.
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline bool
+xrt_display_processor_vk_tolerates_resample(struct xrt_display_processor_vk *xdp)
+{
+	struct xrt_dp_scanout_caps caps;
+	xrt_dp_scanout_caps_init(&caps);
+	if (!xrt_display_processor_vk_get_scanout_caps(xdp, &caps)) {
+		return false;
+	}
+	return (caps.flags & XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE) != 0;
+}
+
+/*!
  * @copydoc xrt_display_processor_vk::get_background_preview
  *
  * Returns false when the slot is absent (older plug-in `struct_size`), NULL,

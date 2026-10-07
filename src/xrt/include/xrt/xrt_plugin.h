@@ -235,6 +235,60 @@ struct xrt_display_physical
 };
 
 /*!
+ * The screen a display processor is created for (multi-screen M2, ADR-047
+ * D2): which monitor, where it sits on the desktop, and its physical facts.
+ * Handed by pointer to `xrt_plugin_iface::create_dp_vk_for_screen` so the DP
+ * can describe THAT screen (its own panel size, pixel size and desktop
+ * origin) instead of the plug-in's one process-wide panel.
+ *
+ * The runtime sets `struct_size` to its own `sizeof`; a plug-in MUST NOT
+ * read past it. Grows by appending (never passed as an array).
+ */
+struct xrt_screen_binding
+{
+	/*! `sizeof(struct xrt_screen_binding)` at the runtime's compile time. */
+	uint32_t struct_size;
+
+	/*! Reserved for alignment. Must be 0. */
+	uint32_t reserved_0;
+
+	/*! Registry monitor id (`xrt_display_descriptor::monitor_id`). */
+	uint64_t monitor_id;
+
+	/*! The monitor's desktop rect, in the space the OS places windows in
+	 *  (X11: the root window). */
+	int32_t desktop_left;
+	int32_t desktop_top;
+	uint32_t desktop_width;
+	uint32_t desktop_height;
+
+	/*! The connector's device (native) mode; 0 = unknown. Equal to the
+	 *  desktop size exactly when window pixels reach the panel unresampled. */
+	uint32_t native_pixel_width;
+	uint32_t native_pixel_height;
+
+	/*! EDID physical size, millimetres; 0 = unknown. */
+	uint32_t physical_width_mm;
+	uint32_t physical_height_mm;
+
+	/*! Desktop compositor scale for this output; 0 = unknown. */
+	float desktop_scale;
+
+	/*! Reserved for alignment. Must be 0. */
+	uint32_t reserved_1;
+
+	/*! Vendor display identity for the plug-in's own SDK (e.g. the LeiaSR
+	 *  `displayId` of SR-P1/P2); 0 = none. Opaque to the runtime. */
+	uint64_t display_id;
+
+	/*! Vendor serial from the winning claim ("" = n/a). */
+	char serial[64];
+
+	/*! OS output name (X11: RandR output, else the DRM connector); "" = unknown. */
+	char device_name[64];
+};
+
+/*!
  * How sure a plug-in is that a monitor is its hardware. The runtime
  * resolves competing claims for the same monitor by highest confidence
  * (ties broken by registration ProbeOrder).
@@ -1182,6 +1236,42 @@ struct xrt_plugin_iface
 	                                     const struct xrt_display_descriptor *display,
 	                                     const struct xrt_display_physical *physical,
 	                                     struct xrt_plugin_display_info *out_info);
+
+	/*!
+	 * Create a Vulkan display processor for ONE screen this plug-in won in
+	 * the per-monitor registry (multi-screen M2, ADR-047 D2: a window that
+	 * spans several screens is woven per segment by each screen's own DP).
+	 *
+	 * Same contract as @ref create_dp_vk (`xrt_dp_factory_vk_fn_t`), plus:
+	 *   - @p inst is this plug-in's instance (NULL for a plug-in without
+	 *     instance state).
+	 *   - @p binding names the screen (monitor id, desktop rect, native px,
+	 *     mm, serial, vendor display id); never NULL. The DP should answer
+	 *     `get_display_dimensions` / `get_display_pixel_info` for THAT screen,
+	 *     with `out_screen_left/top` = the binding's desktop origin.
+	 *   - @p window_handle is NULL on desktop Linux: a segment DP is
+	 *     windowless and gets its phase from `set_present_origin` (ADR-033).
+	 *   - The compositor calls it with a canvas that is the segment (a
+	 *     sub-rect of the target) and a pre-cropped atlas holding exactly that
+	 *     segment's views; the DP MUST confine its output — render area,
+	 *     viewport AND scissor — to the canvas (multi-screen plan risk 7), and
+	 *     must not assume it is the first writer to the target this frame.
+	 *   - Several instances may coexist in one process, one per screen.
+	 *
+	 * Optional. NULL (or a plug-in whose `struct_size` predates this field)
+	 * ⟹ the runtime falls back to @ref create_dp_vk for that screen.
+	 * Appended per ADR-020 (append-only within a major; gated by
+	 * @ref struct_size; no XRT_PLUGIN_API_VERSION_CURRENT bump) after
+	 * @ref get_display_info_for_monitor. Announced by
+	 * @ref XRT_PLUGIN_IFACE_HAS_CREATE_DP_FOR_SCREEN.
+	 */
+	xrt_result_t (*create_dp_vk_for_screen)(struct xrt_plugin_instance *inst,
+	                                        void *vk_bundle,
+	                                        void *vk_cmd_pool,
+	                                        void *window_handle,
+	                                        int32_t target_format,
+	                                        const struct xrt_screen_binding *binding,
+	                                        struct xrt_display_processor **out_xdp);
 };
 
 /*!
@@ -1227,6 +1317,27 @@ xrt_plugin_iface_has_display_info_for_monitor(const struct xrt_plugin_iface *ifa
 	       iface->struct_size >= offsetof(struct xrt_plugin_iface, get_display_info_for_monitor) +
 	                                 sizeof(iface->get_display_info_for_monitor) &&
 	       iface->get_display_info_for_monitor != NULL;
+}
+
+/*!
+ * Defined when @ref xrt_plugin_iface carries @ref
+ * xrt_plugin_iface::create_dp_vk_for_screen and this header defines @ref
+ * xrt_screen_binding (multi-screen M2), so a plug-in built against an older
+ * runtime header can #ifdef-guard implementing it.
+ */
+#define XRT_PLUGIN_IFACE_HAS_CREATE_DP_FOR_SCREEN 1
+
+/*!
+ * True when @p iface implements @ref xrt_plugin_iface::create_dp_vk_for_screen
+ * (and its struct_size covers the slot).
+ */
+static inline bool
+xrt_plugin_iface_has_create_dp_vk_for_screen(const struct xrt_plugin_iface *iface)
+{
+	return iface != NULL &&
+	       iface->struct_size >= offsetof(struct xrt_plugin_iface, create_dp_vk_for_screen) +
+	                                 sizeof(iface->create_dp_vk_for_screen) &&
+	       iface->create_dp_vk_for_screen != NULL;
 }
 
 /*!
