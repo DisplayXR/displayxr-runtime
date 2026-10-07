@@ -1101,6 +1101,17 @@ oxr_session_frame_begin(struct oxr_logger *log, struct oxr_session *sess);
 XrResult
 oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const XrFrameEndInfo *frameEndInfo);
 
+#ifdef OXR_HAVE_DXR_cursor_depth
+/*!
+ * XR_DXR_cursor_depth v2 (ADR-046 Phase 3a): hand a depth-patch read request
+ * to the session's native compositor, for its next commit.
+ *
+ * @return false if this session's compositor cannot read submitted depth.
+ */
+bool
+oxr_session_cursor_depth_hand_request(struct oxr_session *sess, const struct u_cursor_depth_patch_request *req);
+#endif
+
 XrResult
 oxr_session_hand_joints(struct oxr_logger *log,
                         struct oxr_hand_tracker *hand_tracker,
@@ -2969,6 +2980,40 @@ struct oxr_session
 	//! only by a locate that chains an XrCursorDepthHintDXR - a session that
 	//! never sends a hint never steps it.
 	struct u_cursor_depth_filter cursor_depth_filter;
+
+	/*!
+	 * XR_DXR_cursor_depth v2, depth-layer source (ADR-046 Phase 3a).
+	 *
+	 * ZERO COST UNLESS REQUESTED: everything here stays zero, and xrEndFrame
+	 * pays one bool test (@ref armed), unless a locate chained
+	 * XrCursorDepthSourceDXR(SUBMITTED_DEPTH) on its hint. The compositor is
+	 * only ever handed a request on a frame that was armed.
+	 */
+	struct
+	{
+		//! Set by a locate that requested the source, cleared by the next xrEndFrame.
+		bool armed;
+		//! Cursor + footprint (canvas-normalised) from that locate.
+		float u, v, radius_u, radius_v;
+		//! Active view count of that locate: the outermost pair is [0] and [n-1].
+		uint32_t active_view_count;
+		//! Tag of the next request; 0 is never used, so a zeroed result never matches.
+		uint64_t next_tag;
+		//! What each in-flight request read, by tag % 8: the layer's own
+		//! space, poses, fovs and depth ranges (the compositor's poses are in
+		//! the runtime's space, not the app's, so they are not used).
+		struct
+		{
+			uint64_t tag;
+			XrSpace space;
+			struct u_cursor_depth_view view[U_CURSOR_DEPTH_PATCH_VIEWS];
+			struct u_cursor_depth_layer_depth depth[U_CURSOR_DEPTH_PATCH_VIEWS];
+		} frames[8];
+		bool announced;        //!< one-shot WARN on first activation
+		bool warned_no_reader; //!< one-shot WARN: compositor cannot read depth
+		bool warned_space;     //!< one-shot WARN: layer space != locate space
+		bool warned_no_layer;  //!< one-shot WARN: armed frame had no depth layer
+	} cursor_depth_source;
 #endif
 
 #ifdef OXR_HAVE_DXR_display_zones

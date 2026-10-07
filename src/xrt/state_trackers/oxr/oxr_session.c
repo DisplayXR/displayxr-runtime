@@ -2229,6 +2229,133 @@ oxr_session_set_view_space_offset(struct oxr_session *sess, const struct xrt_pos
 }
 
 #ifdef OXR_HAVE_DXR_cursor_depth
+/*
+ * XR_DXR_cursor_depth v2 - the depth-layer source (ADR-046 Phase 3a).
+ *
+ * Dispatch to whichever native compositor can read a patch of the submitted
+ * depth. Reached only from a frame that requested the source (see
+ * oxr_session_frame_end.c), so a compositor never sees a request otherwise.
+ */
+bool
+oxr_session_cursor_depth_hand_request(struct oxr_session *sess, const struct u_cursor_depth_patch_request *req)
+{
+	if (sess->xcn == NULL) {
+		return false;
+	}
+#ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
+	if (sess->is_metal_native_compositor) {
+		comp_metal_compositor_set_cursor_depth_request(&sess->xcn->base, req);
+		return true;
+	}
+#endif
+	// TODO(ADR-046 3a): vk_native, D3D11, D3D12, GL and the IPC/service path
+	// do not read the patch yet. The placement then falls back to "no content"
+	// (cursor on the display plane) - never an error.
+	(void)req;
+	return false;
+}
+
+static bool
+oxr_session_cursor_depth_get_result(struct oxr_session *sess, struct u_cursor_depth_patch_result *out)
+{
+	if (sess->xcn == NULL) {
+		return false;
+	}
+#ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
+	if (sess->is_metal_native_compositor) {
+		return comp_metal_compositor_get_cursor_depth_result(&sess->xcn->base, out);
+	}
+#endif
+	(void)out;
+	return false;
+}
+
+/*!
+ * The nearest content under the cursor, from the depth the app submitted with
+ * its projection layer: arm the next xrEndFrame's patch read, and use the
+ * newest read that has come back (one or two frames old).
+ *
+ * @return true and the content's disparity, or false for "no content".
+ */
+static bool
+oxr_session_cursor_depth_from_layer(struct oxr_session *sess,
+                                    const XrViewLocateInfo *viewLocateInfo,
+                                    const XrCursorDepthHintDXR *hint,
+                                    const struct u_cursor_depth_view *a,
+                                    const struct u_cursor_depth_geometry *g,
+                                    uint32_t active_view_count,
+                                    float *out_disparity)
+{
+	if (!sess->cursor_depth_source.announced) {
+		sess->cursor_depth_source.announced = true;
+		U_LOG_W(
+		    "XR_DXR_cursor_depth: depth-layer source requested - reading a cursor-sized patch of the "
+		    "submitted depth from now on (ADR-046 3a, one-time notice)");
+	}
+
+	// Footprint = the sprite plus 50%, as the v1 app guidance says. The canvas
+	// aspect comes from the fov tangents: every Kooima view frames the canvas.
+	float height = hint->cursorHeight;
+	if (!(height > 0.0f) || !isfinite(height)) {
+		height = U_CURSOR_DEPTH_DEFAULT_HEIGHT;
+	}
+	const float tw = tanf(a->fov.angle_right) - tanf(a->fov.angle_left);
+	const float th = tanf(a->fov.angle_up) - tanf(a->fov.angle_down);
+	const float radius_v = 0.75f * height;
+	sess->cursor_depth_source.armed = true;
+	sess->cursor_depth_source.u = hint->cursorUV.x;
+	sess->cursor_depth_source.v = hint->cursorUV.y;
+	sess->cursor_depth_source.radius_v = radius_v;
+	sess->cursor_depth_source.radius_u = (tw > 0.0f && th > 0.0f) ? radius_v * th / tw : radius_v;
+	sess->cursor_depth_source.active_view_count = active_view_count;
+
+	struct u_cursor_depth_patch_result res;
+	if (!oxr_session_cursor_depth_get_result(sess, &res) || !res.valid) {
+		return false;
+	}
+	// A result older than its record slot's lifetime is stale (the cursor has
+	// stopped being read, or the compositor stopped answering).
+	const uint64_t newest = sess->cursor_depth_source.next_tag;
+	if (res.tag == 0 || res.tag > newest || newest - res.tag >= ARRAY_SIZE(sess->cursor_depth_source.frames)) {
+		return false;
+	}
+	const uint32_t slot = (uint32_t)(res.tag % ARRAY_SIZE(sess->cursor_depth_source.frames));
+	if (sess->cursor_depth_source.frames[slot].tag != res.tag) {
+		return false;
+	}
+	if (sess->cursor_depth_source.frames[slot].space != viewLocateInfo->space) {
+		// v2 requires the projection layer in the locate space: the point is
+		// reconstructed from the layer's own poses, and converting between two
+		// app spaces is not worth a per-frame space locate for a cursor.
+		if (!sess->cursor_depth_source.warned_space) {
+			sess->cursor_depth_source.warned_space = true;
+			U_LOG_W(
+			    "XR_DXR_cursor_depth: the depth layer's space is not the locate space - the "
+			    "depth-layer source needs them to be the same XrSpace (one-time warning)");
+		}
+		return false;
+	}
+
+	bool found = false;
+	for (uint32_t i = 0; i < U_CURSOR_DEPTH_PATCH_VIEWS; i++) {
+		const struct u_cursor_depth_patch_sample *s = &res.view[i];
+		struct xrt_vec3 p;
+		float d;
+		if (!s->valid ||
+		    !u_cursor_depth_point_from_depth_sample(&sess->cursor_depth_source.frames[slot].view[i],
+		                                            &sess->cursor_depth_source.frames[slot].depth[i], s->su,
+		                                            s->sv, s->raw_depth, &p) ||
+		    !u_cursor_depth_point_disparity(g, &p, &d)) {
+			continue;
+		}
+		if (!found || d < *out_disparity) {
+			found = true;
+			*out_disparity = d;
+		}
+	}
+	return found;
+}
+
 /*!
  * XR_DXR_cursor_depth (ADR-046): place the depth-aware cursor for this locate.
  *
@@ -2277,8 +2404,18 @@ oxr_session_fill_cursor_depth(struct oxr_session *sess,
 	u_cursor_depth_tuning_defaults(&tuning);
 
 	float content = 0.0f;
-	const struct xrt_vec3 nearest = {hint->nearestPoint.x, hint->nearestPoint.y, hint->nearestPoint.z};
-	const bool has_content = hint->hasContent && u_cursor_depth_point_disparity(&g, &nearest, &content);
+	bool has_content;
+	// Spec v2: the source struct is looked up ONLY here, behind the hint -
+	// a session that never chains it never reaches the depth-layer path.
+	const XrCursorDepthSourceDXR *source =
+	    OXR_GET_INPUT_FROM_CHAIN(hint, XR_TYPE_CURSOR_DEPTH_SOURCE_DXR, XrCursorDepthSourceDXR);
+	if (source != NULL && source->source == XR_CURSOR_DEPTH_SOURCE_SUBMITTED_DEPTH_DXR) {
+		has_content = oxr_session_cursor_depth_from_layer(sess, viewLocateInfo, hint, &a, &g, active_view_count,
+		                                                  &content);
+	} else {
+		const struct xrt_vec3 nearest = {hint->nearestPoint.x, hint->nearestPoint.y, hint->nearestPoint.z};
+		has_content = hint->hasContent && u_cursor_depth_point_disparity(&g, &nearest, &content);
+	}
 	const float target = u_cursor_depth_target(&tuning, has_content, content);
 	const float disparity = u_cursor_depth_filter_step(&sess->cursor_depth_filter, &tuning, target,
 	                                                   (uint64_t)viewLocateInfo->displayTime);
