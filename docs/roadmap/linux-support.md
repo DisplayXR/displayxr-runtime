@@ -807,6 +807,24 @@ source comments and, until this section, in no document at all.
   overlay, and a window entirely off the panel skips the weave; kill switch
   `DXR_SPAN_2D=0` (either name works on both paths), headless proof
   `weave_probe_vk_linux --span2d`.
+  **Multi-screen M2 (X11/XWayland, in-process Vulkan) replaces the band with a
+  real segment wherever the other monitor has a display processor.** A window
+  spanning screens is split into segments (`canvas ∩ screen`,
+  `util/comp_segments.h`); each segment is woven by its own screen's DP
+  (created from that screen's registry factory, `create_dp_vk_for_screen`)
+  with `canvas = segment`, a pre-cropped atlas and its own present origin, and
+  composited into the one surface (`comp_vk_native_segments.c`). Only a
+  segment with no DP (a monitor no plug-in claimed, a mixed-vendor layout —
+  that is M4) or whose DP needs 1:1 pixels on a resampled screen keeps the flat
+  2D view. sim_display's anaglyph tolerates a resample, so with
+  `DXR_PLUGIN_EXCLUSIVE=sim-display` a window across eDP-1 and the DS1 is
+  anaglyph on both halves. The window entirely on the primary screen is the
+  shipped single-DP path, unchanged. Native Wayland keeps the band until the
+  geometry service publishes every monitor
+  (`docs/specs/runtime/wayland-window-geometry.md` §5); the X11 1:1 gate
+  (#1831) and the Wayland resample reasons of #1595 no longer degrade a DP
+  that declares `XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE`. Kill switch
+  `DXR_SEGMENTS=0`. Design: `docs/architecture/comp-segments.md`.
 - **Flat regions on the weave service are painted flat, not wished (spec v8,
   browser#88).** The caller's flat regions — each submit's
   `XrWeaveSubmitFlatRegionsDXR` plus the sticky screen-space

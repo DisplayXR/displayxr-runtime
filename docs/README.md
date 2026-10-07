@@ -39,6 +39,7 @@ Build apps for 3D displays using the OpenXR standard.
 - [XR_DXR_depth_budget](specs/extensions/XR_DXR_depth_budget.md) — rear depth budget: how far behind the display plane a transparent app may render (ADR-040)
 - [XR_EXT_view_configuration_views_change](specs/extensions/XR_EXT_view_configuration_views_change.md) — **Khronos** extension: adoption note for the live-`recommendedImageRect*` doorbell (move `subImage.imageRect`, never reallocate; kill switches; the two bespoke zone events it soft-deprecates)
 - [Kooima Projection](architecture/kooima-projection.md) — N-view Kooima math and projection pipelines
+- [Window Segments](architecture/comp-segments.md) — a window spanning screens, woven per screen by each screen's own DP (multi-screen M2)
 
 ---
 

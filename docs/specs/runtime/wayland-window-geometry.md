@@ -366,6 +366,40 @@ is what lets any package ship it and any runtime consume it.
 - Mutter emits geometry transactionally with its own redraw, so tracking
   during interactive drags is expected to be at least as good as the X11
   per-frame poll; validate visually (phase lock while dragging).
+- **Multi-screen segments need every monitor, not just the window's own
+  (multi-screen M2 follow-up, ADR-047 D2).** M2 weaves a window that spans
+  screens per segment — `canvas ∩ screen`, each by that screen's display
+  processor with its own present origin — on X11/XWayland, where root
+  coordinates are desktop-absolute and RandR gives every monitor's rect in the
+  same space (`docs/architecture/comp-segments.md`). Native Wayland stays on
+  the primary-segment-only behaviour (#1654 bands), because this payload cannot
+  place the second segment:
+  - `monitor` describes only the window's OWN monitor. The rect of the part of
+    the window that lands on another monitor, in THAT monitor's device px,
+    needs that monitor's stage rect and its own `device_scale` — a
+    mixed-scale layout (this box: 1.6667 laptop + 2.0 DS1) makes a single
+    factor wrong for one of the two.
+  - The runtime's screen registry is keyed by connector / RandR output name,
+    and the payload names no connector, so even the window's own monitor is
+    matched only by its device size today (`wr.monitor_width_px ==
+    panel_px_w`), which is ambiguous for two identical panels.
+
+  **Required extension change** (not installed on any dev box; the runtime
+  keeps refusing until a publisher announces it): add a top-level
+  `monitors: [{connector, x, y, w, h, scale, device_scale}]` array — every
+  monitor in stage coordinates, `connector` = the DRM connector / Mutter
+  monitor connector (`Meta.MonitorManager` → `get_monitor_for_connector`,
+  e.g. `"HDMI-1"`, which is what the registry's `device_name` holds) — plus
+  `monitor.connector` on each window. Additive, so the schema stays
+  `version: 1` and an older consumer ignores it; bump the extension version
+  so `org.displayxr.WindowGeometry1` capability probing can tell. The consumer
+  then intersects the window's `buffer` rect with each monitor in stage
+  coordinates, converts each piece to that monitor's device px with that
+  monitor's `device_scale`, and hands `comp_segments` a segment table in
+  which every rect is already per screen. Note that Mutter paints a straddling
+  surface at ONE buffer scale (the window's main monitor's), so the part on
+  the other monitor is resampled: the per-segment 1:1 policy applies (a
+  resample-tolerant DP weaves it, a lenticular weave gets flat 2D).
 
 ## 6. Capture exclusion — `org.displayxr.CaptureExclusion1` (extension version 2)
 
