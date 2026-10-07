@@ -2973,7 +2973,6 @@ locate_views_one(struct oxr_logger *log,
 			U_LOG_I("Kooima: nominal_z=%.3f", nominal_z_m);
 			if (nominal_z_m > 0.0f) {
 				float ipd_m = sess->ipd_meters;
-				eye_count = 2;
 				// Untracked → the eye sits at the REFERENCE: directly in front
 				// of the display centre at the nominal distance, i.e. (0,0,Nz).
 				// nominal_y must NOT leak into the eye: an eye lateral offset
@@ -2983,16 +2982,13 @@ locate_views_one(struct oxr_logger *log,
 				// reproduce, so the camera/display rigs would disagree.
 				// nominal_y belongs only to the parallax / zero-parallax pivot
 				// (the `nominal` vector below), never to the eye position.
-				adj_eyes[0] = (struct xrt_eye_position){-ipd_m / 2.0f, 0.0f, nominal_z_m};
-				adj_eyes[1] = (struct xrt_eye_position){ipd_m / 2.0f, 0.0f, nominal_z_m};
-				if (seg != NULL) {
-					// In front of THIS segment's screen, carried into
-					// the reference frame.
-					for (uint32_t ei = 0; ei < 2; ei++) {
-						adj_eyes[ei].x += seg->eye_dx;
-						adj_eyes[ei].y += seg->eye_dy;
-					}
-				}
+				// One eye per active view (a 2-view mode: exactly the
+				// pair this always was), so an N-view mode never leaves
+				// views with zero FOVs. For a segment: in front of THAT
+				// screen, carried into the reference frame.
+				eye_count = oxr_segment_views_nominal_eyes(ipd_m, nominal_z_m, active_view_count,
+				                                           seg != NULL ? seg->eye_dx : 0.0f,
+				                                           seg != NULL ? seg->eye_dy : 0.0f, adj_eyes);
 				have_eye_positions = true;
 				if (should_log) {
 					U_LOG_I("Nominal eyes: [0]=(%.4f,%.4f,%.4f) [1]=(%.4f,%.4f,%.4f), IPD=%.1fmm",
@@ -4157,9 +4153,9 @@ locate_segment_override(const struct xrt_segment_metrics *m,
 	o->nominal_y_m = s->nominal_viewer_y_m;
 	o->nominal_z_m = s->nominal_viewer_z_m;
 
-	// The screen's DP eyes when it is tracking a viewer; otherwise the
-	// screen's nominal viewer (the locate's untracked branch).
-	if (s->have_eyes && s->eyes.valid && s->eyes.is_tracking && s->eyes.count > 0) {
+	// The screen's DP eyes whenever it reports a valid set (tracked or not,
+	// exactly like the single-screen path); else the screen's nominal viewer.
+	if (oxr_segment_views_accept_eyes(s->have_eyes, s->eyes.valid, s->eyes.count)) {
 		o->eyes = s->eyes;
 		for (uint32_t e = 0; e < o->eyes.count && e < XRT_MAX_VIEWS; e++) {
 			o->eyes.eyes[e].x += dx;
@@ -4277,7 +4273,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 			const struct xrt_segment_metric *s = &m.seg[mj];
 			o.nominal_y_m = s->nominal_viewer_y_m;
 			o.nominal_z_m = s->nominal_viewer_z_m;
-			if (s->have_eyes && s->eyes.valid && s->eyes.is_tracking && s->eyes.count > 0) {
+			if (oxr_segment_views_accept_eyes(s->have_eyes, s->eyes.valid, s->eyes.count)) {
 				o.eyes = s->eyes;
 				o.have_eyes = true;
 			}
