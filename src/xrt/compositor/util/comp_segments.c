@@ -74,25 +74,46 @@ comp_segments_compute(const struct comp_seg_rect *window_desktop,
 	    .bottom = window_desktop->y + cv.y + (int32_t)cv.h,
 	};
 
+	/*
+	 * Mirrored outputs (two screens with the SAME desktop rect) would yield
+	 * two overlapping segments for one region. Keep one per rect: the primary
+	 * if it is among them, else the first listed. map[] takes a slice's
+	 * monitor index back to the caller's screen index.
+	 */
 	struct u_md_rect monitors[COMP_SEGMENTS_MAX_SCREENS];
+	uint32_t map[COMP_SEGMENTS_MAX_SCREENS];
+	uint32_t mon_count = 0;
 	for (uint32_t i = 0; i < screen_count; i++) {
 		const struct comp_seg_rect *d = &screens[i].desktop;
-		monitors[i].left = d->x;
-		monitors[i].top = d->y;
-		monitors[i].right = d->x + (int32_t)d->w;
-		monitors[i].bottom = d->y + (int32_t)d->h;
+		const struct u_md_rect r = {d->x, d->y, d->x + (int32_t)d->w, d->y + (int32_t)d->h};
+		uint32_t dup = UINT32_MAX;
+		for (uint32_t j = 0; j < mon_count; j++) {
+			if (monitors[j].left == r.left && monitors[j].top == r.top && monitors[j].right == r.right &&
+			    monitors[j].bottom == r.bottom) {
+				dup = j;
+				break;
+			}
+		}
+		if (dup == UINT32_MAX) {
+			monitors[mon_count] = r;
+			map[mon_count] = i;
+			mon_count++;
+		} else if (screens[i].is_primary && !screens[map[dup]].is_primary) {
+			map[dup] = i; // the primary wins a mirror
+		}
 	}
 
 	struct u_md_slice slices[U_MD_MAX_SLICES];
-	const uint32_t n = u_multi_display_compute_slices(canvas_desktop, monitors, screen_count, slices,
+	const uint32_t n = u_multi_display_compute_slices(canvas_desktop, monitors, mon_count, slices,
 	                                                  U_MD_MAX_SLICES < COMP_SEGMENTS_MAX ? U_MD_MAX_SLICES
 	                                                                                     : COMP_SEGMENTS_MAX);
 
 	for (uint32_t i = 0; i < n; i++) {
 		const struct u_md_slice *s = &slices[i];
-		const struct comp_segments_screen *scr = &screens[s->monitor_index];
+		const uint32_t si = map[s->monitor_index];
+		const struct comp_segments_screen *scr = &screens[si];
 		struct comp_segment *g = &out->seg[out->count++];
-		g->screen_index = (uint32_t)s->monitor_index;
+		g->screen_index = si;
 		g->screen_id = scr->id;
 		g->is_primary = scr->is_primary;
 		g->has_dp_factory = scr->has_dp_factory;

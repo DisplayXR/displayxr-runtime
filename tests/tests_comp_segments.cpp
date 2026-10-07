@@ -130,6 +130,21 @@ TEST_CASE("comp_segments: table")
 		CHECK_FALSE(comp_segments_table_is_split(&t, 100, 100));
 	}
 
+	SECTION("mirrored outputs give one segment per region, the primary winning")
+	{
+		comp_segments_screen m[3] = {
+		    screen(0x77, 3456, 0, 3840, 2160, 3840, 2160, false), // mirror of the DS1, listed first
+		    scr[0],
+		    scr[1],
+		};
+		comp_seg_rect win{3000, 200, 1280, 720};
+		REQUIRE(comp_segments_compute(&win, nullptr, m, 3, &t) == 2);
+		CHECK(t.seg[0].screen_id == EDP);
+		CHECK(t.seg[1].screen_id == DS1);
+		CHECK(t.seg[1].is_primary);
+		CHECK(t.seg[1].screen_index == 2);
+	}
+
 	SECTION("degenerate inputs")
 	{
 		comp_seg_rect win{0, 0, 0, 0};

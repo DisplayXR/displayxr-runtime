@@ -4399,7 +4399,12 @@ vk_native_dispatch_capture(struct comp_vk_native_compositor *c, uint32_t mode_fi
 	// per-screen canvases, not only the whole-window atlas they were cut from.
 	if (ok && mode_filter == MCP_CAPTURE_MODE_POST_COMPOSE && c->segments != NULL) {
 		const char *path = c->capture_intent.path;
+		// The extension's dot only — not one in a directory name.
 		const char *dot = strrchr(path, '.');
+		const char *slash = strrchr(path, '/');
+		if (dot != NULL && slash != NULL && dot < slash) {
+			dot = NULL;
+		}
 		const size_t stem = dot != NULL ? (size_t)(dot - path) : strlen(path);
 		for (uint32_t i = 0; i < COMP_SEGMENTS_MAX; i++) {
 			VkImage img = VK_NULL_HANDLE;
@@ -4418,7 +4423,7 @@ vk_native_dispatch_capture(struct comp_vk_native_compositor *c, uint32_t mode_fi
 			snprintf(seg_path, sizeof(seg_path), "%.*s.seg%u.png", (int)stem, path, i);
 			const bool seg_ok = vk_native_dump_image_to_png(
 			    c, img, w, h, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
-			    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, false, seg_path);
+			    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, u_image_capture_raw_alpha(), seg_path);
 			U_LOG_W("Atlas capture: segment %u (screen 0x%016llx) DP input %ux%u -> %s%s", i,
 			        (unsigned long long)screen_id, w, h, seg_path, seg_ok ? "" : " FAILED");
 		}
@@ -5353,6 +5358,26 @@ vk_native_atlas_encoding(const struct comp_vk_native_compositor *c)
 	(void)c;
 	return XRT_ATLAS_ENCODING_ENCODED;
 }
+
+#ifdef XRT_OS_LINUX_DESKTOP
+/*!
+ * Multi-screen M2: the encoding segment DPs are told — exactly what
+ * @ref vk_dp_assert_atlas_encoding tells the primary, DXR_VK_ATLAS_ENCODING
+ * included; -1 when the override says never to call the slot.
+ */
+static int
+vk_segments_atlas_encoding(struct comp_vk_native_compositor *c)
+{
+	const int over = dxr_vk_atlas_encoding_override();
+	if (over == DXR_VK_ATLAS_ENCODING_DISABLED) {
+		return -1;
+	}
+	if (over != DXR_VK_ATLAS_ENCODING_NO_OVERRIDE) {
+		return over;
+	}
+	return (int)vk_native_atlas_encoding(c);
+}
+#endif
 
 /*!
  * #1484 — assert @p dp's atlas encoding, the way the D3D11 service's
@@ -6485,6 +6510,7 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 				               (uint32_t)(dp_canvas.extent.w > 0 ? dp_canvas.extent.w : (int)tgt_width),
 				               (uint32_t)(dp_canvas.extent.h > 0 ? dp_canvas.extent.h : (int)tgt_height)},
 				    .transparent_background = c->transparent_background,
+				    .atlas_encoding = vk_segments_atlas_encoding(c),
 				    .primary_dp = c->display_processor,
 				};
 				(void)comp_vk_native_segments_record(c->segments, &sf);
