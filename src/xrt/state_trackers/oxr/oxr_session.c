@@ -2548,6 +2548,8 @@ struct oxr_locate_segment
 	//! A display rig's virtual display height factor for this canvas (its
 	//! share of the window's height, oxr_segment_views_vdh_scale); 0 = 1.
 	float vdh_scale;
+	//! The screen this canvas is on (logs only).
+	uint64_t screen_id;
 	//! Views this call locates (the per-segment count); 0 = the session's.
 	uint32_t view_count;
 	//! Publish session-level side effects (#441 tracking edge): only the
@@ -2673,7 +2675,15 @@ locate_views_one(struct oxr_logger *log,
 
 	// Throttled logging for display/Kooima diagnostics
 	static int log_counter = 0;
-	bool should_log = (++log_counter % 120) == 1; // Log every ~2 seconds at 60fps
+	// Log every ~2 seconds at 60fps. Multi-screen M3: one locate runs once
+	// per segment (the majority last), so only the majority call advances
+	// the counter and every segment logs on the SAME locate.
+	bool should_log;
+	if (seg != NULL && !seg->side_effects) {
+		should_log = ((log_counter + 1) % 120) == 1;
+	} else {
+		should_log = (++log_counter % 120) == 1;
+	}
 
 	// The display-plane / camera pose the view math composes the eyes on, in
 	// the head device's TRACKING-ORIGIN space. Declared here so it is
@@ -2852,6 +2862,19 @@ locate_views_one(struct oxr_logger *log,
 	if (seg != NULL) {
 		eye_pos = seg->eyes;
 		got_eye_positions = seg->have_eyes;
+		if (should_log) {
+			if (seg->have_eyes && seg->eyes.count >= 2) {
+				U_LOG_I("Segment 0x%016llx eyes from its DP (%u, tracking=%d): [0]=(%.4f,%.4f,%.4f) "
+				        "[1]=(%.4f,%.4f,%.4f) (reference frame)",
+				        (unsigned long long)seg->screen_id, seg->eyes.count, (int)seg->eyes.is_tracking,
+				        seg->eyes.eyes[0].x, seg->eyes.eyes[0].y, seg->eyes.eyes[0].z, seg->eyes.eyes[1].x,
+				        seg->eyes.eyes[1].y, seg->eyes.eyes[1].z);
+			} else {
+				U_LOG_I("Segment 0x%016llx eyes: its screen's nominal viewer (no DP eye set covering "
+				        "its views)",
+				        (unsigned long long)seg->screen_id);
+			}
+		}
 	} else {
 		got_eye_positions = oxr_session_get_predicted_eye_positions(sess, &eye_pos);
 	}
@@ -3175,11 +3198,15 @@ locate_views_one(struct oxr_logger *log,
 				                       fabsf(win_orient.w - 1.0f) > 0.0001f);
 
 				if (should_log) {
-					U_LOG_I("Window-relative Kooima: screen=%.4fx%.4fm, "
+					char seg_tag[40] = "";
+					if (seg != NULL) {
+						snprintf(seg_tag, sizeof(seg_tag), " [segment 0x%016llx]",
+						         (unsigned long long)seg->screen_id);
+					}
+					U_LOG_I("Window-relative Kooima%s: screen=%.4fx%.4fm, "
 					        "eye_offset=(%.4f,%.4f,%.4f)m, rotated=%d",
-					        screen_width_m, screen_height_m,
-					        eye_offset_x, eye_offset_y, eye_offset_z,
-					        win_has_orientation);
+					        seg_tag, screen_width_m, screen_height_m, eye_offset_x, eye_offset_y,
+					        eye_offset_z, win_has_orientation);
 				}
 			} else if (oxr_session_get_display_dimensions(sess, &screen_width_m, &screen_height_m) &&
 			           screen_width_m > 0.0f && screen_height_m > 0.0f) {
@@ -4189,6 +4216,7 @@ static void
 locate_segment_override(const struct xrt_segment_metrics *m,
                         const struct oxr_segment_layout *l,
                         uint32_t i,
+                        uint32_t views_needed,
                         struct oxr_locate_segment *o)
 {
 	memset(o, 0, sizeof(*o));
@@ -4202,16 +4230,11 @@ locate_segment_override(const struct xrt_segment_metrics *m,
 	o->nominal_y_m = s->nominal_viewer_y_m;
 	o->nominal_z_m = s->nominal_viewer_z_m;
 
-	// The screen's DP eyes whenever it reports a valid set (tracked or not,
-	// exactly like the single-screen path); else the screen's nominal viewer.
-	if (oxr_segment_views_accept_eyes(s->have_eyes, s->eyes.valid, s->eyes.count)) {
-		o->eyes = s->eyes;
-		for (uint32_t e = 0; e < o->eyes.count && e < XRT_MAX_VIEWS; e++) {
-			o->eyes.eyes[e].x += dx;
-			o->eyes.eyes[e].y += dy;
-		}
-		o->have_eyes = true;
-	}
+	// The screen's DP eyes whenever it reports a valid set covering the
+	// segment's views (tracked or not, exactly like the single-screen path);
+	// else the screen's nominal viewer.
+	o->have_eyes = oxr_segment_views_segment_eyes(s, dx, dy, views_needed, &o->eyes);
+	o->screen_id = s->screen_id;
 
 	o->rig_dx = l->seg[i].ref_cx - l->window_ref_cx;
 	o->rig_dy = l->seg[i].ref_cy - l->window_ref_cy;
@@ -4330,10 +4353,8 @@ oxr_session_locate_views(struct oxr_logger *log,
 			const struct xrt_segment_metric *s = &m.seg[mj];
 			o.nominal_y_m = s->nominal_viewer_y_m;
 			o.nominal_z_m = s->nominal_viewer_z_m;
-			if (oxr_segment_views_accept_eyes(s->have_eyes, s->eyes.valid, s->eyes.count)) {
-				o.eyes = s->eyes;
-				o.have_eyes = true;
-			}
+			o.have_eyes = oxr_segment_views_segment_eyes(s, 0.0f, 0.0f, 2, &o.eyes);
+			o.screen_id = s->screen_id;
 			o.side_effects = true;
 			struct oxr_locate_segment_out so = {.measurable = true};
 			o.out = &so;
@@ -4426,7 +4447,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 				continue;
 			}
 			struct oxr_locate_segment o;
-			locate_segment_override(&m, &l, k, &o);
+			locate_segment_override(&m, &l, k, cnt[k], &o);
 			o.view_count = cnt[k];
 			o.side_effects = (k == mj);
 			o.out = &seg_out;

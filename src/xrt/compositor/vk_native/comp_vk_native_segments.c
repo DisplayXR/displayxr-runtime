@@ -1121,8 +1121,8 @@ comp_vk_native_segments_set_display_mode(struct comp_vk_native_segments *segs, b
 		st->mode_sent = want;
 		// A lifecycle event per DP (create, or a session 2D/3D switch).
 		const bool ok = xrt_display_processor_request_display_mode(st->dp, enable_3d);
-		U_LOG_I("segments: screen 0x%016llx ('%s') DP follows the session mode: %s -> %d",
+		U_LOG_I("segments: screen 0x%016llx ('%s') DP follows the session mode: %s%s",
 		        (unsigned long long)segs->screens[i].id, segs->bindings[i].device_name, enable_3d ? "3D" : "2D",
-		        (int)ok);
+		        ok ? "" : " (this DP has no 2D/3D switch — nothing to do)");
 	}
 }
