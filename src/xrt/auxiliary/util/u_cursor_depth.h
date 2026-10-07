@@ -21,9 +21,21 @@
  *    (on-screen disparity = baseline * d): 0 on the canvas, < 0 in front.
  *    Disparity, not distance, is what the eye compares, so margins, clamps
  *    and slew rates are expressed there;
- *  - the sprite goes at C = E + t (S - E) — on the cyclopean ray, so it never
- *    slides sideways as it rises — with height scaled by t so its apparent
- *    size is constant.
+ *  - the sprite's height is scaled by t so its apparent size is constant;
+ *  - WHERE laterally it goes is the anchor mode (spec v3):
+ *      SCREEN  C = E + t (S - E): on the cyclopean ray. Its image on the glass
+ *              ignores head motion - disparity but no motion parallax, which
+ *              on a head-tracked display reads as "at the glass".
+ *      WORLD   C = S - f (1 - t) e: straight in front of the pointer's canvas
+ *              point along the normal (e = eye-to-canvas). Parallaxes like
+ *              content, but sits ~mm off the click point off-axis.
+ *      HYBRID  (default) SCREEN while the pointer moves - exact aim - storing
+ *              that locate's line of sight (E0, S0, e0). While the pointer is
+ *              still: C = E0 + s (S0 - E0), s = 1 - (1 - t) e / e0 - the point
+ *              on the anchor-time line at the current depth in front of the
+ *              glass. Continuous at the stop; a lateral head move keeps C
+ *              world-fixed (parallax); a depth change slides C along the
+ *              anchor-time line, so it stays on the click point.
  *
  * Pure C: time is a parameter, never read here.
  *
@@ -96,6 +108,41 @@ struct u_cursor_depth_filter
 	uint64_t last_ns;
 };
 
+/*!
+ * Where the sprite goes laterally (XR_DXR_cursor_depth spec v3). The values
+ * equal the XrCursorDepthAnchorModeDXR ones.
+ */
+enum u_cursor_depth_anchor_mode
+{
+	//! SCREEN while the pointer moves, world-fixed while it is still. Default.
+	U_CURSOR_DEPTH_ANCHOR_HYBRID = 0,
+	//! On the cyclopean ray through the pointer's canvas point (spec v1/v2).
+	U_CURSOR_DEPTH_ANCHOR_SCREEN = 1,
+	//! In front of the pointer's canvas point along the display normal.
+	U_CURSOR_DEPTH_ANCHOR_WORLD = 2,
+};
+
+/*!
+ * HYBRID anchor state. Zero-initialise; reset whenever the filter re-primes.
+ */
+struct u_cursor_depth_anchor
+{
+	bool has_anchor;
+	//! E0: the cyclopean eye of the last moving placement.
+	struct xrt_vec3 eye;
+	//! S0: the canvas point under the pointer at the last moving placement.
+	struct xrt_vec3 canvas_point;
+	//! e0: E0's distance to the canvas along the normal then (> 0).
+	float eye_to_canvas;
+	//! Pointer UV of that placement.
+	float last_u, last_v;
+	//! Time of that placement.
+	uint64_t last_ns;
+};
+
+//! Pointer UV change beyond which HYBRID treats the pointer as moving.
+#define U_CURSOR_DEPTH_ANCHOR_MOVE_EPS 1e-4f
+
 void
 u_cursor_depth_tuning_defaults(struct u_cursor_depth_tuning *t);
 
@@ -129,6 +176,16 @@ float
 u_cursor_depth_target(const struct u_cursor_depth_tuning *t, bool has_content, float content_disparity);
 
 /*!
+ * True if the next u_cursor_depth_filter_step() at @p now_ns will re-prime
+ * (snap) rather than smooth: first step, clock going backwards, or a gap
+ * longer than t->stale_s. HYBRID drops its anchor on exactly these steps.
+ */
+bool
+u_cursor_depth_filter_will_prime(const struct u_cursor_depth_filter *f,
+                                 const struct u_cursor_depth_tuning *t,
+                                 uint64_t now_ns);
+
+/*!
  * Advance the filter toward @p target and return the new disparity. Calls with
  * a time not after the previous one do not advance it (a second locate in the
  * same frame is idempotent).
@@ -141,7 +198,7 @@ u_cursor_depth_filter_step(struct u_cursor_depth_filter *f,
 
 /*!
  * Where to draw a sprite at @p disparity, and how tall, for a requested height
- * of @p height_fraction of the canvas.
+ * of @p height_fraction of the canvas. SCREEN anchoring (on the cyclopean ray).
  */
 void
 u_cursor_depth_place(const struct u_cursor_depth_geometry *g,
@@ -149,6 +206,29 @@ u_cursor_depth_place(const struct u_cursor_depth_geometry *g,
                      float height_fraction,
                      struct xrt_vec3 *out_position,
                      float *out_height);
+
+/*!
+ * u_cursor_depth_place() with an anchor mode (spec v3).
+ *
+ * @param anchor     HYBRID state; may be NULL for SCREEN and WORLD (untouched).
+ * @param u, v       the pointer UV this placement is for.
+ * @param reprimed   the filter re-primed on this step (HYBRID re-anchors).
+ * @param now_ns     the step's time (recorded in the anchor).
+ *
+ * Height is the same in every mode. An unknown mode behaves as HYBRID.
+ */
+void
+u_cursor_depth_place_anchored(const struct u_cursor_depth_geometry *g,
+                              float disparity,
+                              float height_fraction,
+                              enum u_cursor_depth_anchor_mode mode,
+                              struct u_cursor_depth_anchor *anchor,
+                              float u,
+                              float v,
+                              bool reprimed,
+                              uint64_t now_ns,
+                              struct xrt_vec3 *out_position,
+                              float *out_height);
 
 
 /*

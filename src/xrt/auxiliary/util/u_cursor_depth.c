@@ -66,9 +66,11 @@ view_ray(const struct u_cursor_depth_view *view, float u, float v)
 void
 u_cursor_depth_tuning_defaults(struct u_cursor_depth_tuning *t)
 {
-	// 3% of the baseline is ~2 mm of crossed on-screen disparity for a 65 mm
-	// IPD: enough to read as "in front", small enough not to look detached.
-	t->margin = 0.03f;
+	// 0.5% of the baseline: on a real head-tracked panel the tester found
+	// 0.003-0.005 rests the cursor on the content (~1.5 mm in front of it at
+	// typical viewing distances), while the old 0.03 floated it a visibly
+	// detached ~1-2 cm off it (spec v3).
+	t->margin = 0.005f;
 	// d = -0.6 is t = 0.625: the cursor may come ~3/8 of the way to the eye.
 	t->min_disparity = -0.6f;
 	t->max_disparity = 0.6f;
@@ -165,13 +167,21 @@ u_cursor_depth_target(const struct u_cursor_depth_tuning *t, bool has_content, f
 	return d;
 }
 
+bool
+u_cursor_depth_filter_will_prime(const struct u_cursor_depth_filter *f,
+                                 const struct u_cursor_depth_tuning *t,
+                                 uint64_t now_ns)
+{
+	return !f->primed || now_ns < f->last_ns || (double)(now_ns - f->last_ns) * 1e-9 > (double)t->stale_s;
+}
+
 float
 u_cursor_depth_filter_step(struct u_cursor_depth_filter *f,
                            const struct u_cursor_depth_tuning *t,
                            float target,
                            uint64_t now_ns)
 {
-	if (!f->primed || now_ns < f->last_ns || (double)(now_ns - f->last_ns) * 1e-9 > (double)t->stale_s) {
+	if (u_cursor_depth_filter_will_prime(f, t, now_ns)) {
 		f->primed = true;
 		f->disparity = target;
 		f->last_ns = now_ns;
@@ -203,6 +213,60 @@ u_cursor_depth_place(const struct u_cursor_depth_geometry *g,
 	}
 	*out_position = v3_add_scaled(g->eye, v3_sub(g->canvas_point, g->eye), t);
 	*out_height = height_fraction * g->canvas_height * t;
+}
+
+void
+u_cursor_depth_place_anchored(const struct u_cursor_depth_geometry *g,
+                              float disparity,
+                              float height_fraction,
+                              enum u_cursor_depth_anchor_mode mode,
+                              struct u_cursor_depth_anchor *anchor,
+                              float u,
+                              float v,
+                              bool reprimed,
+                              uint64_t now_ns,
+                              struct xrt_vec3 *out_position,
+                              float *out_height)
+{
+	// SCREEN placement and the height, shared by every mode.
+	u_cursor_depth_place(g, disparity, height_fraction, out_position, out_height);
+	if (mode == U_CURSOR_DEPTH_ANCHOR_SCREEN) {
+		return;
+	}
+
+	const float t = 1.0f / (1.0f - disparity);
+	// How far C sits in front of the canvas plane, along the normal.
+	const float lift = (1.0f - t) * g->eye_to_canvas;
+
+	if (mode == U_CURSOR_DEPTH_ANCHOR_WORLD || anchor == NULL) {
+		if (mode == U_CURSOR_DEPTH_ANCHOR_WORLD) {
+			*out_position = v3_add_scaled(g->canvas_point, g->forward, -lift);
+		}
+		return; // HYBRID without state degrades to SCREEN
+	}
+
+	// HYBRID.
+	const bool moved =
+	    !anchor->has_anchor || reprimed || fabsf(u - anchor->last_u) > U_CURSOR_DEPTH_ANCHOR_MOVE_EPS ||
+	    fabsf(v - anchor->last_v) > U_CURSOR_DEPTH_ANCHOR_MOVE_EPS || !(anchor->eye_to_canvas > 0.0f);
+	if (moved) {
+		// Screen placement (already in *out_position); remember this line of sight.
+		anchor->eye = g->eye;
+		anchor->canvas_point = g->canvas_point;
+		anchor->eye_to_canvas = g->eye_to_canvas;
+		anchor->last_u = u;
+		anchor->last_v = v;
+		anchor->last_ns = now_ns;
+		anchor->has_anchor = true;
+		return;
+	}
+	// Pointer still: the point on the anchor-time line of sight E0 -> S0 whose
+	// distance in front of the glass is the CURRENT depth, lift. Same geometry
+	// gives s = t (continuous at the stop); a lateral head move leaves s and so
+	// C unchanged (world-fixed, parallax like content); a depth change slides C
+	// along that line, so from E0 it stays on S0 (the click point).
+	const float s = 1.0f - lift / anchor->eye_to_canvas;
+	*out_position = v3_add_scaled(anchor->eye, v3_sub(anchor->canvas_point, anchor->eye), s);
 }
 
 

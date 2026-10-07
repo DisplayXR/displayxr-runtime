@@ -3,8 +3,8 @@
 | Property | Value |
 |----------|-------|
 | Extension Name | `XR_DXR_cursor_depth` |
-| Spec Version | 2 |
-| Type Values | `XR_TYPE_CURSOR_DEPTH_HINT_DXR` (1004999320) · `XR_TYPE_CURSOR_DEPTH_PLACEMENT_DXR` (1004999321) · `XR_TYPE_CURSOR_DEPTH_SOURCE_DXR` (1004999322, v2) |
+| Spec Version | 3 |
+| Type Values | `XR_TYPE_CURSOR_DEPTH_HINT_DXR` (1004999320) · `XR_TYPE_CURSOR_DEPTH_PLACEMENT_DXR` (1004999321) · `XR_TYPE_CURSOR_DEPTH_SOURCE_DXR` (1004999322, v2) · `XR_TYPE_CURSOR_DEPTH_OPTIONS_DXR` (1004999323, v3) |
 | Author | The DisplayXR Project |
 | Platform | All. Works on every graphics API, in-process and over IPC; solved in the state tracker. |
 | Decision record | [ADR-046](../../adr/ADR-046-depth-aware-cursor.md) |
@@ -63,7 +63,7 @@ sprite: the violation returns at every silhouette.
 | Field | Meaning |
 |---|---|
 | `isActive` | `XR_FALSE` means draw nothing and show the OS cursor. This happens when no hint was chained, fewer than two views are active (2D), the cursor is off the canvas, or the view geometry is degenerate. |
-| `pose` | The sprite centre and orientation in the locate space. The orientation is the display plane's: draw the quad in its local XY plane, facing +Z. The position lies on the line from the viewer through the cursor's point on the canvas, so the cursor never slides sideways as its depth changes. |
+| `pose` | The sprite centre and orientation in the locate space. The orientation is the display plane's: draw the quad in its local XY plane, facing +Z. The position follows the anchor mode (§2.4). With the default (HYBRID) it lies on the line from the viewer through the cursor's point on the canvas while the pointer moves, and stays fixed in the locate space while the pointer is still. |
 | `height` | Sprite height in locate-space units, scaled with depth so the apparent size is constant. |
 | `disparity` | The filtered disparity, in eye-baseline units: 0 is the display plane and < 0 is in front. Diagnostic only. |
 | `targetDisparity` | The unfiltered target: the content disparity minus the margin, then clamped. Diagnostic only. |
@@ -113,13 +113,44 @@ display plane, and the runtime logs a one-time warning. None is ever an error.
 - The far end of the mapping is the cleared background. It counts as no content.
 - The nearest texel in the footprint wins, across both outer views.
 
+### 2.4 `XrCursorDepthOptionsDXR` (input, spec v3)
+
+Chained on `XrCursorDepthHintDXR::next`, in any order with `XrCursorDepthSourceDXR`. Optional:
+**absent means HYBRID anchoring and the default margin.** It is read only behind the hint, so it
+costs nothing on its own.
+
+| Field | Meaning |
+|---|---|
+| `anchorMode` | Where the sprite goes laterally as the viewer's head moves. `XR_CURSOR_DEPTH_ANCHOR_MODE_HYBRID_DXR` (0, the default), `_SCREEN_DXR` (1), `_WORLD_DXR` (2). An unknown value behaves as HYBRID. |
+| `margin` | How far in front of the content the cursor floats, as a disparity in eye-baseline units. ≤ 0 or non-finite selects the runtime default, 0.005. |
+
+**Anchor modes.** E is the cyclopean eye, S the canvas point under the pointer, f the unit display
+normal pointing away from the viewer, e = dot(S − E, f), d the filtered disparity and
+t = 1/(1 − d). The sprite's centre C is:
+
+| Mode | C | On a head-tracked display |
+|---|---|---|
+| `SCREEN` | E + t·(S − E): on the cyclopean ray | The image on the glass ignores head motion. The cursor has disparity but **no motion parallax**, so while everything else parallaxes it reads as "at the glass". The v1/v2 behaviour. |
+| `WORLD` | S − f·(1 − t)·e: straight in front of S along the normal | Parallaxes like content at its depth. Off-axis, it sits a millimetre or two beside the click point even while the pointer moves. |
+| `HYBRID` | While the pointer **moves**: the SCREEN position, and the runtime stores that locate's line of sight: E₀ = E, S₀ = S, D₀ = e. While the pointer is **still**: C = E₀ + s·(S₀ − E₀) with s = 1 − (1 − t)·e / D₀, the point on the anchor-time line whose distance in front of the glass equals the current depth (1 − t)·e. | Exact aim while moving. While still: world-fixed under lateral head motion (correct parallax, s unchanged); a depth change slides C along the anchor-time line, so it stays on the click point for a viewer who hasn't moved; continuous on the frame the pointer stops (s = t). The only drift from the click point is from head motion while the pointer is still: about \|d\| × the head's lateral displacement, so 1 mm for 20 cm at d = −0.005 (content at the glass). |
+
+"Moves" means `cursorUV` changed by more than 1e-4 in u or v since the last moving placement.
+HYBRID also re-anchors (takes the SCREEN position) on the first hinted locate and whenever the
+time filter re-primes (a gap > 0.5 s, or time going backwards). The height
+(`cursorHeight` × canvas height × t) and the orientation are the same in every mode. Hit testing
+is unchanged: the click stays at the pointer's canvas point; the anchor mode only changes where
+the sprite is drawn.
+
+The same rule, with the same numbers, is implemented by the web SDK's depth cursor.
+
 ## 3. Runtime behaviour
 
 The canvas point under the cursor is triangulated from the outermost pair of **located views**.
 Every policy number is applied in disparity d = 1 − 1/t, where t is depth relative to the canvas
 along the display normal measured from the cyclopean eye:
 
-- margin: 0.03 baseline in front of the content;
+- margin: 0.005 baseline in front of the content (overridable with `XrCursorDepthOptionsDXR::margin`);
+- lateral anchor: HYBRID unless `XrCursorDepthOptionsDXR` selects another mode (§2.4);
 - clamp: d ∈ [−0.6, 0.6];
 - rising toward the viewer: 30 ms time constant;
 - sinking away: 250 ms time constant;
@@ -144,6 +175,12 @@ XrViewLocateInfo locate = {XR_TYPE_VIEW_LOCATE_INFO, &hint};
 locate.viewConfigurationType = viewConfig;
 locate.displayTime = frameState.predictedDisplayTime;
 locate.space = appSpace;
+
+// Optional (v3): keep the v1/v2 screen-anchored placement instead of HYBRID.
+// XrCursorDepthOptionsDXR opts = {XR_TYPE_CURSOR_DEPTH_OPTIONS_DXR};
+// opts.anchorMode = XR_CURSOR_DEPTH_ANCHOR_MODE_SCREEN_DXR;
+// opts.margin = 0.0f;                             // runtime default
+// hint.next = &opts;
 
 XrCursorDepthPlacementDXR cursor = {XR_TYPE_CURSOR_DEPTH_PLACEMENT_DXR};
 XrViewState viewState = {XR_TYPE_VIEW_STATE, &cursor};
@@ -178,3 +215,4 @@ For splats, use the renderer's alpha-weighted expected depth, not a raycast.
 |---|---|
 | 1 | Initial: app hint in, placement out, app draws (ADR-046 Phase 1). |
 | 2 | `XrCursorDepthSourceDXR` (1004999322): opt-in depth-layer source. The runtime reads the nearest content from the depth submitted with the projection layer (ADR-046 Phase 3a). Metal compositor first. |
+| 3 | `XrCursorDepthOptionsDXR` (1004999323): anchor mode (HYBRID / SCREEN / WORLD) and margin. HYBRID anchors the line of sight at the last pointer move (§2.4). **Defaults change, deliberately:** the default anchor is now HYBRID (was effectively SCREEN), and the default margin is 0.005 (was 0.03). Both follow testing on a real head-tracked panel: the screen-anchored cursor had disparity but no motion parallax and read as "at the glass", and 0.03 floated it a visibly detached 1–2 cm off the content, where 0.003–0.005 rests on it. An app that wants the v2 placement chains the options struct with `XR_CURSOR_DEPTH_ANCHOR_MODE_SCREEN_DXR` and `margin = 0.03`. |

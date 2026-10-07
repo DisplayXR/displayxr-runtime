@@ -81,6 +81,14 @@ require_near(xrt_vec3 a, xrt_vec3 b, float eps = 1e-4f)
 	CHECK(a.z == Catch::Approx(b.z).margin(eps));
 }
 
+xrt_vec3
+on_glass(xrt_vec3 eye, xrt_vec3 p)
+{
+	// Where the line from eye through p crosses the canvas plane z = 0.
+	const float k = eye.z / (eye.z - p.z);
+	return xrt_vec3{eye.x + (p.x - eye.x) * k, eye.y + (p.y - eye.y) * k, 0.0f};
+}
+
 } // namespace
 
 TEST_CASE("cursor_depth: the canvas point under the cursor is where the view rays meet")
@@ -266,19 +274,18 @@ TEST_CASE("cursor_depth: a long gap or a clock going backwards re-primes")
 	CHECK(u_cursor_depth_filter_step(&f, &t, -0.2f, 1500 * MS) == -0.2f);
 }
 
-TEST_CASE("cursor_depth: head motion does not move the cursor on the glass (screen-anchored, jitter-free)")
+TEST_CASE("cursor_depth: SCREEN anchor - head motion does not move the cursor on the glass")
 {
-	// Project the placed sprite back onto the canvas (z = 0) from each eye. For a fixed cursor
-	// UV and disparity, those two screen points must not depend on where the head is: the
-	// sprite sits on the cyclopean ray, so each eye sees it at S -/+ (baseline/2)*d — tracking
-	// motion or jitter cannot make it swim, only the content under it can change its depth.
-	auto on_glass = [](xrt_vec3 eye, xrt_vec3 p) {
-		const float k = eye.z / (eye.z - p.z);
-		return xrt_vec3{eye.x + (p.x - eye.x) * k, eye.y + (p.y - eye.y) * k, 0.0f};
-	};
+	// The SCREEN-mode property (spec v1/v2 behaviour: u_cursor_depth_place and
+	// U_CURSOR_DEPTH_ANCHOR_SCREEN). Project the placed sprite back onto the canvas (z = 0)
+	// from each eye. For a fixed cursor UV and disparity, those two screen points do not
+	// depend on where the head is: the sprite sits on the cyclopean ray, so each eye sees it
+	// at S -/+ (baseline/2)*d. That is exactly why it has NO motion parallax - the conflict
+	// HYBRID (the default since spec v3) resolves while the pointer is still.
 	const float d = -0.4f;
 	xrt_vec3 ref_l{}, ref_r{};
 	const xrt_vec3 heads[] = {{0.0f, 0.0f, 0.6f}, {0.12f, -0.05f, 0.5f}, {-0.2f, 0.08f, 0.75f}};
+	u_cursor_depth_anchor anchor{};
 	for (int i = 0; i < 3; i++) {
 		const xrt_vec3 h = heads[i];
 		const xrt_vec3 el{h.x - 0.032f, h.y, h.z}, er{h.x + 0.032f, h.y, h.z};
@@ -286,9 +293,15 @@ TEST_CASE("cursor_depth: head motion does not move the cursor on the glass (scre
 		const auto b = kooima(er);
 		u_cursor_depth_geometry g{};
 		REQUIRE(u_cursor_depth_geometry_solve(&a, &b, 0.3f, 0.4f, &g));
-		xrt_vec3 c{};
-		float hgt = 0.0f;
+		xrt_vec3 c{}, c2{};
+		float hgt = 0.0f, hgt2 = 0.0f;
 		u_cursor_depth_place(&g, d, 0.03f, &c, &hgt);
+		// The anchored entry point in SCREEN mode is the same placement, and ignores the anchor.
+		u_cursor_depth_place_anchored(&g, d, 0.03f, U_CURSOR_DEPTH_ANCHOR_SCREEN, &anchor, 0.3f, 0.4f, false,
+		                              (uint64_t)(i + 1) * 16 * MS, &c2, &hgt2);
+		require_near(c2, c, 1e-6f);
+		CHECK(hgt2 == hgt);
+		CHECK_FALSE(anchor.has_anchor);
 		const xrt_vec3 sl = on_glass(el, c), sr = on_glass(er, c);
 		// On-screen disparity is baseline * d, whatever the head pose.
 		CHECK(sr.x - sl.x == Catch::Approx(0.064f * d).margin(1e-5));
@@ -301,6 +314,266 @@ TEST_CASE("cursor_depth: head motion does not move the cursor on the glass (scre
 			require_near(sr, ref_r, 1e-5f);
 		}
 	}
+}
+
+
+/*
+ *
+ * Spec v3: anchor modes.
+ *
+ */
+
+namespace {
+
+struct HeadGeom
+{
+	xrt_vec3 el, er;
+	u_cursor_depth_geometry g;
+};
+
+HeadGeom
+head(xrt_vec3 h, float u, float v)
+{
+	HeadGeom r{};
+	r.el = {h.x - 0.032f, h.y, h.z};
+	r.er = {h.x + 0.032f, h.y, h.z};
+	const auto a = kooima(r.el);
+	const auto b = kooima(r.er);
+	REQUIRE(u_cursor_depth_geometry_solve(&a, &b, u, v, &r.g));
+	return r;
+}
+
+} // namespace
+
+TEST_CASE("cursor_depth: margin default is 0.005 (spec v3)")
+{
+	// A tester on a real head-tracked panel: 0.003-0.005 rests on the content,
+	// 0.03 floated the cursor a detached ~1-2 cm off it.
+	CHECK(tuning().margin == Catch::Approx(0.005f));
+}
+
+TEST_CASE("cursor_depth: HYBRID - pointer moving = SCREEN placement (on the cyclopean ray)")
+{
+	const float d = -0.4f;
+	u_cursor_depth_anchor anchor{};
+	const float uvs[][2] = {{0.3f, 0.4f}, {0.31f, 0.4f}, {0.31f, 0.45f}, {0.7f, 0.2f}};
+	const xrt_vec3 heads[] = {
+	    {0.0f, 0.0f, 0.6f}, {0.12f, -0.05f, 0.5f}, {-0.2f, 0.08f, 0.75f}, {0.05f, 0.0f, 0.6f}};
+	for (int i = 0; i < 4; i++) {
+		const HeadGeom hg = head(heads[i], uvs[i][0], uvs[i][1]);
+		xrt_vec3 c{}, cs{};
+		float h = 0.0f, hs = 0.0f;
+		u_cursor_depth_place_anchored(&hg.g, d, 0.03f, U_CURSOR_DEPTH_ANCHOR_HYBRID, &anchor, uvs[i][0],
+		                              uvs[i][1], false, (uint64_t)(i + 1) * 16 * MS, &c, &h);
+		u_cursor_depth_place(&hg.g, d, 0.03f, &cs, &hs);
+		require_near(c, cs, 1e-6f);
+		CHECK(h == hs);
+		CHECK(anchor.has_anchor);
+		// The stored anchor is this locate's line of sight.
+		require_near(anchor.eye, hg.g.eye, 1e-6f);
+		require_near(anchor.canvas_point, hg.g.canvas_point, 1e-6f);
+		CHECK(anchor.eye_to_canvas == hg.g.eye_to_canvas);
+	}
+}
+
+TEST_CASE("cursor_depth: HYBRID - pointer still, head moves = world-fixed (parallaxes like content)")
+{
+	const float d = -0.4f;
+	const float u = 0.3f, v = 0.4f;
+	u_cursor_depth_anchor anchor{};
+
+	// Frame 1: the pointer arrives (moving) with the head off-axis.
+	const HeadGeom h0 = head({0.1f, 0.03f, 0.6f}, u, v);
+	xrt_vec3 c0{};
+	float hgt = 0.0f;
+	u_cursor_depth_place_anchored(&h0.g, d, 0.03f, U_CURSOR_DEPTH_ANCHOR_HYBRID, &anchor, u, v, false, 16 * MS, &c0,
+	                              &hgt);
+	const xrt_vec3 img0 = on_glass(h0.el, c0);
+
+	// Then the pointer is still and the head moves laterally (same distance):
+	// the sprite stays put in locate space.
+	const xrt_vec3 lateral[] = {{-0.1f, 0.0f, 0.6f}, {0.2f, -0.06f, 0.6f}, {0.0f, 0.0f, 0.6f}};
+	uint64_t now = 16 * MS;
+	for (const auto &hp : lateral) {
+		now += 16 * MS;
+		const HeadGeom hg = head(hp, u, v);
+		xrt_vec3 c{};
+		u_cursor_depth_place_anchored(&hg.g, d, 0.03f, U_CURSOR_DEPTH_ANCHOR_HYBRID, &anchor, u, v, false, now,
+		                              &c, &hgt);
+		require_near(c, c0, 1e-5f);
+
+		// ... so its image on the glass moves with the head like content at that depth,
+		// while a SCREEN-anchored sprite's image would not move at all.
+		xrt_vec3 cs{};
+		float hs = 0.0f;
+		u_cursor_depth_place(&hg.g, d, 0.03f, &cs, &hs);
+		CHECK(std::fabs(on_glass(hg.el, c).x - img0.x) > 1e-3f);
+		CHECK(on_glass(hg.el, cs).x == Catch::Approx(img0.x).margin(1e-5));
+	}
+
+	// Head moves toward the glass: the same disparity is a shallower depth. The
+	// sprite slides along the anchor-time line of sight to that depth.
+	now += 16 * MS;
+	const HeadGeom hz = head({0.0f, 0.0f, 0.45f}, u, v);
+	xrt_vec3 cz{};
+	u_cursor_depth_place_anchored(&hz.g, d, 0.03f, U_CURSOR_DEPTH_ANCHOR_HYBRID, &anchor, u, v, false, now, &cz,
+	                              &hgt);
+	require_near(on_glass(h0.g.eye, cz), h0.g.canvas_point, 5e-5f);
+	float dz = 0.0f;
+	REQUIRE(u_cursor_depth_point_disparity(&hz.g, &cz, &dz));
+	CHECK(dz == Catch::Approx(d).margin(2e-4));
+
+	// A re-prime (stale gap) re-anchors: back on the cyclopean ray.
+	const HeadGeom hr = head({-0.15f, 0.0f, 0.6f}, u, v);
+	xrt_vec3 cr{}, cs{};
+	float hs = 0.0f;
+	u_cursor_depth_place_anchored(&hr.g, d, 0.03f, U_CURSOR_DEPTH_ANCHOR_HYBRID, &anchor, u, v, true,
+	                              now + 2000 * MS, &cr, &hgt);
+	u_cursor_depth_place(&hr.g, d, 0.03f, &cs, &hs);
+	require_near(cr, cs, 1e-6f);
+	CHECK(std::fabs(cr.x - c0.x) > 1e-3f);
+}
+
+TEST_CASE("cursor_depth: HYBRID - continuous on the frame the pointer stops")
+{
+	u_cursor_depth_anchor anchor{};
+	const HeadGeom prev = head({0.12f, -0.04f, 0.55f}, 0.6f, 0.33f);
+	const HeadGeom hg = head({0.12f, -0.04f, 0.55f}, 0.62f, 0.33f);
+	float hgt = 0.0f;
+
+	// Moving: a frame at another UV, then the final moving frame.
+	xrt_vec3 c_prev{}, c_moving{}, c_still{};
+	u_cursor_depth_place_anchored(&prev.g, -0.25f, 0.03f, U_CURSOR_DEPTH_ANCHOR_HYBRID, &anchor, 0.6f, 0.33f, false,
+	                              16 * MS, &c_prev, &hgt);
+	u_cursor_depth_place_anchored(&hg.g, -0.3f, 0.03f, U_CURSOR_DEPTH_ANCHOR_HYBRID, &anchor, 0.62f, 0.33f, false,
+	                              32 * MS, &c_moving, &hgt);
+	// Stop frame: same UV, same t, same head.
+	u_cursor_depth_place_anchored(&hg.g, -0.3f, 0.03f, U_CURSOR_DEPTH_ANCHOR_HYBRID, &anchor, 0.62f, 0.33f, false,
+	                              48 * MS, &c_still, &hgt);
+	require_near(c_still, c_moving, 1e-6f);
+
+	// A UV change below the move threshold is "still" too (no re-anchor on noise).
+	xrt_vec3 c_noise{};
+	u_cursor_depth_place_anchored(&hg.g, -0.3f, 0.03f, U_CURSOR_DEPTH_ANCHOR_HYBRID, &anchor, 0.62f + 5e-5f, 0.33f,
+	                              false, 64 * MS, &c_noise, &hgt);
+	require_near(c_noise, c_moving, 1e-6f);
+	CHECK(anchor.last_ns == 32 * MS);
+
+	// Still, but the content under it changes depth (same head): the sprite slides
+	// along the line of sight, i.e. it equals the SCREEN placement at the new depth.
+	xrt_vec3 c_deeper{}, c_deeper_screen{};
+	float hs = 0.0f;
+	u_cursor_depth_place_anchored(&hg.g, -0.1f, 0.03f, U_CURSOR_DEPTH_ANCHOR_HYBRID, &anchor, 0.62f, 0.33f, false,
+	                              80 * MS, &c_deeper, &hgt);
+	u_cursor_depth_place(&hg.g, -0.1f, 0.03f, &c_deeper_screen, &hs);
+	require_near(c_deeper, c_deeper_screen, 1e-5f);
+	float dd = 0.0f;
+	REQUIRE(u_cursor_depth_point_disparity(&hg.g, &c_deeper, &dd));
+	CHECK(dd == Catch::Approx(-0.1f).margin(1e-5));
+}
+
+TEST_CASE("cursor_depth: HYBRID - content appears under a still pointer: stays on the click point, WORLD does not")
+{
+	// The case that motivated anchoring the LINE OF SIGHT rather than its foot: the
+	// anchor is stored with the cursor on the glass (d0 = 0, e.g. before the first
+	// hit test), then the content under the still pointer pops out. A viewer well
+	// off-axis (eye 0.10 m above and 0.08 m left of the pointer's canvas point).
+	const float u = 0.75f, v = 0.5f;
+	const HeadGeom hg = head({0.0f, 0.1f, 0.6f}, u, v);
+	u_cursor_depth_anchor anchor{};
+	xrt_vec3 c{};
+	float hgt = 0.0f;
+	u_cursor_depth_place_anchored(&hg.g, 0.0f, 0.03f, U_CURSOR_DEPTH_ANCHOR_HYBRID, &anchor, u, v, false, 16 * MS,
+	                              &c, &hgt);
+	require_near(c, hg.g.canvas_point, 1e-5f);
+
+	uint64_t now = 16 * MS;
+	const float ds[] = {-0.02f, -0.1f, -0.3f, 0.2f};
+	for (float d : ds) {
+		now += 16 * MS;
+		u_cursor_depth_place_anchored(&hg.g, d, 0.03f, U_CURSOR_DEPTH_ANCHOR_HYBRID, &anchor, u, v, false, now,
+		                              &c, &hgt);
+		// On the E0 -> S0 line: seen from E0 it projects onto S0, the click point...
+		require_near(on_glass(anchor.eye, c), anchor.canvas_point, 5e-5f);
+		// ... at the requested depth.
+		float back = 0.0f;
+		REQUIRE(u_cursor_depth_point_disparity(&hg.g, &c, &back));
+		CHECK(back == Catch::Approx(d).margin(1e-4));
+
+		// WORLD rises along the normal instead: off the click point for this viewer.
+		xrt_vec3 cw{};
+		u_cursor_depth_place_anchored(&hg.g, d, 0.03f, U_CURSOR_DEPTH_ANCHOR_WORLD, nullptr, u, v, false, now,
+		                              &cw, &hgt);
+		const xrt_vec3 pw = on_glass(hg.g.eye, cw);
+		CHECK(std::fabs(pw.y - hg.g.canvas_point.y) + std::fabs(pw.x - hg.g.canvas_point.x) > 1e-3f);
+	}
+
+	// And after the head moves laterally, the sprite is still world-fixed at fixed t.
+	xrt_vec3 c_before = c;
+	const HeadGeom moved_head = head({0.12f, 0.1f, 0.6f}, u, v);
+	xrt_vec3 c_after{};
+	u_cursor_depth_place_anchored(&moved_head.g, 0.2f, 0.03f, U_CURSOR_DEPTH_ANCHOR_HYBRID, &anchor, u, v, false,
+	                              now + 16 * MS, &c_after, &hgt);
+	require_near(c_after, c_before, 1e-5f);
+}
+
+TEST_CASE("cursor_depth: WORLD - in front of the canvas point along the normal, at the requested disparity")
+{
+	const float d = -0.37f;
+	const float t = 1.0f / (1.0f - d);
+
+	// On-axis: E centred on S.
+	{
+		const HeadGeom hg = head({0.0f, 0.0f, 0.6f}, 0.5f, 0.5f);
+		xrt_vec3 c{}, cs{};
+		float h = 0.0f, hs = 0.0f;
+		u_cursor_depth_place_anchored(&hg.g, d, 0.03f, U_CURSOR_DEPTH_ANCHOR_WORLD, nullptr, 0.5f, 0.5f, false,
+		                              16 * MS, &c, &h);
+		const float lift = (1.0f - t) * hg.g.eye_to_canvas;
+		require_near(c,
+		             {hg.g.canvas_point.x - hg.g.forward.x * lift, hg.g.canvas_point.y - hg.g.forward.y * lift,
+		              hg.g.canvas_point.z - hg.g.forward.z * lift},
+		             1e-6f);
+		CHECK(c.z > 0.0f); // in front of the glass (toward the viewer)
+		float back = 0.0f;
+		REQUIRE(u_cursor_depth_point_disparity(&hg.g, &c, &back));
+		CHECK(back == Catch::Approx(d).margin(1e-5));
+		// On-axis, WORLD and SCREEN coincide; the height is the same in every mode.
+		u_cursor_depth_place(&hg.g, d, 0.03f, &cs, &hs);
+		require_near(c, cs, 1e-6f);
+		CHECK(h == hs);
+	}
+
+	// Off-axis: straight in front of S (same x, y), not on the line of sight.
+	{
+		const HeadGeom hg = head({0.15f, 0.05f, 0.6f}, 0.2f, 0.7f);
+		xrt_vec3 c{}, cs{};
+		float h = 0.0f, hs = 0.0f;
+		u_cursor_depth_anchor untouched{};
+		u_cursor_depth_place_anchored(&hg.g, d, 0.03f, U_CURSOR_DEPTH_ANCHOR_WORLD, &untouched, 0.2f, 0.7f,
+		                              false, 16 * MS, &c, &h);
+		CHECK_FALSE(untouched.has_anchor);
+		CHECK(c.x == Catch::Approx(hg.g.canvas_point.x).margin(1e-6));
+		CHECK(c.y == Catch::Approx(hg.g.canvas_point.y).margin(1e-6));
+		CHECK(c.z == Catch::Approx((1.0f - t) * hg.g.eye_to_canvas).margin(1e-6));
+		float back = 0.0f;
+		REQUIRE(u_cursor_depth_point_disparity(&hg.g, &c, &back));
+		CHECK(back == Catch::Approx(d).margin(1e-5));
+		u_cursor_depth_place(&hg.g, d, 0.03f, &cs, &hs);
+		CHECK(std::fabs(cs.x - c.x) > 1e-3f);
+	}
+}
+
+TEST_CASE("cursor_depth: filter_will_prime predicts exactly the steps that snap")
+{
+	const auto t = tuning();
+	u_cursor_depth_filter f{};
+	CHECK(u_cursor_depth_filter_will_prime(&f, &t, 1000 * MS));
+	u_cursor_depth_filter_step(&f, &t, -0.3f, 1000 * MS);
+	CHECK_FALSE(u_cursor_depth_filter_will_prime(&f, &t, 1016 * MS));
+	CHECK_FALSE(u_cursor_depth_filter_will_prime(&f, &t, 1000 * MS)); // same frame
+	CHECK(u_cursor_depth_filter_will_prime(&f, &t, 999 * MS));        // clock backwards
+	CHECK(u_cursor_depth_filter_will_prime(&f, &t, 2000 * MS));       // stale gap
 }
 
 
