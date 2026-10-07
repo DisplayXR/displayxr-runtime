@@ -3340,33 +3340,21 @@ monitor_side_find(uint64_t monitor_id)
 #endif
 
 /*!
- * Off-Windows: which descriptor is the ACTIVE plug-in's panel, by the same
- * ADR-033 rules the desktop-rect resolver uses (origin, then connector mode,
- * then pixel size; ties on physical size). Windows keeps the primary-monitor
- * back-compat claim exactly as before.
- *
- * Why it exists: a 3D panel is a SECOND monitor on essentially every real
- * deployment, so "the primary" lands the vendor's back-compat claim on the
- * laptop screen — and the active plug-in wins every monitor it claims (#1521),
- * so the registry would route the laptop screen to the vendor DP and the
- * panel to the fallback. Caller holds @ref g_refresh_mutex.
+ * Off-Windows: which descriptor is the panel described by @p hint, by the
+ * same ADR-033 rules the desktop-rect resolver uses (origin, then connector
+ * mode, then pixel size; ties on physical size). Pure.
  */
+#ifndef XRT_OS_WINDOWS
 static bool
-pick_active_panel_monitor(const struct xrt_display_descriptor *descs, uint32_t n, uint32_t *out_pick)
+panel_monitor_index(const struct xrt_display_descriptor *descs,
+                    uint32_t n,
+                    const struct os_display_edid_monitor *const *monitors,
+                    const struct os_display_panel_hint *hint,
+                    uint32_t *out_pick)
 {
-#ifdef XRT_OS_WINDOWS
-	(void)descs;
-	(void)n;
-	(void)out_pick;
-	return false;
-#else
-	if (!g_active_panel_valid || n == 0) {
-		return false;
-	}
 	if (n > XRT_DP_REGISTRY_MAX_ENTRIES) {
 		n = XRT_DP_REGISTRY_MAX_ENTRIES;
 	}
-	const struct os_display_panel_hint *hint = &g_active_panel_hint;
 
 	struct os_display_desktop_info mons[XRT_DP_REGISTRY_MAX_ENTRIES];
 	memset(mons, 0, sizeof(mons));
@@ -3381,7 +3369,7 @@ pick_active_panel_monitor(const struct xrt_display_descriptor *descs, uint32_t n
 		m->height_in_caller_dpi = m->height;
 		m->is_primary = (descs[i].flags & 1u) != 0;
 		origin_known[i] = true;
-		const struct os_display_edid_monitor *side = monitor_side_find(descs[i].monitor_id);
+		const struct os_display_edid_monitor *side = monitors != NULL ? monitors[i] : NULL;
 		if (side != NULL) {
 			m->physical_width_mm = side->physical_width_mm;
 			m->physical_height_mm = side->physical_height_mm;
@@ -3415,18 +3403,52 @@ pick_active_panel_monitor(const struct xrt_display_descriptor *descs, uint32_t n
 		return true;
 	}
 	return false;
+}
 #endif
+
+uint32_t
+target_plugin_backcompat_claim_index(const struct xrt_display_descriptor *descs,
+                                     uint32_t n,
+                                     const struct os_display_edid_monitor *const *monitors,
+                                     const struct os_display_panel_hint *panel)
+{
+	if (descs == NULL || n == 0) {
+		return 0;
+	}
+	uint32_t pick = 0;
+	for (uint32_t i = 0; i < n; i++) {
+		if (descs[i].flags & 1u) {
+			pick = i;
+			break;
+		}
+	}
+#ifndef XRT_OS_WINDOWS
+	uint32_t at_panel = 0;
+	if (panel != NULL && panel->pixel_width > 0 && panel->pixel_height > 0 &&
+	    panel_monitor_index(descs, n, monitors, panel, &at_panel)) {
+		pick = at_panel;
+	}
+#else
+	(void)monitors;
+	(void)panel;
+#endif
+	return pick;
 }
 
 /*!
  * Synthesize the back-compat claim for a loaded plug-in that has no
  * `probe_displays` but whose binary `probe()` succeeded: one
- * @ref XRT_DISPLAY_CLAIM_EDID claim on the primary monitor (or the first
- * descriptor if none is flagged primary) — except off-Windows for the ACTIVE
- * plug-in once its panel is known, where it lands on that panel's monitor
- * (@ref pick_active_panel_monitor). `supported_apis` is set to all
- * bits — the actual factory set is masked against the plug-in's non-NULL
- * factory pointers at fill time.
+ * @ref XRT_DISPLAY_CLAIM_EDID claim on the monitor
+ * @ref target_plugin_backcompat_claim_index picks — the primary monitor, or,
+ * off-Windows for the ACTIVE plug-in once its panel is known, that panel's
+ * monitor. `supported_apis` is set to all bits — the actual factory set is
+ * masked against the plug-in's non-NULL factory pointers at fill time.
+ *
+ * Why the panel and not the primary: a 3D panel is a SECOND monitor on
+ * essentially every real deployment, so "the primary" lands the vendor's
+ * claim on the laptop screen — and the active plug-in wins every monitor it
+ * claims (#1521), so the registry would route the laptop screen to the vendor
+ * DP and the panel to the fallback. Caller holds @ref g_refresh_mutex.
  */
 static uint32_t
 synth_primary_edid_claim(const struct xrt_display_descriptor *descs,
@@ -3438,27 +3460,32 @@ synth_primary_edid_claim(const struct xrt_display_descriptor *descs,
 	if (n == 0 || max == 0) {
 		return 0;
 	}
-	uint32_t pick = 0;
-	for (uint32_t i = 0; i < n; i++) {
-		if (descs[i].flags & 1u) {
-			pick = i;
-			break;
-		}
+	if (n > XRT_DP_REGISTRY_MAX_ENTRIES) {
+		n = XRT_DP_REGISTRY_MAX_ENTRIES;
 	}
-	// Off-Windows, the ACTIVE plug-in's back-compat claim follows its panel
-	// rather than the primary monitor (multi-screen M0). A plug-in that ships
-	// `probe_displays` never reaches here, so its own claims always win.
-	uint32_t panel = 0;
-	if (iface != NULL && iface == g_active_iface && pick_active_panel_monitor(descs, n, &panel)) {
-		if (panel != pick) {
-			U_LOG_I(
-			    "plugin loader: '%s' has no probe_displays — back-compat claim placed on its panel "
-			    "(monitor 0x%016llx, %ux%u at (%d,%d)) instead of the primary monitor",
-			    iface->id != NULL ? iface->id : "?", (unsigned long long)descs[panel].monitor_id,
-			    descs[panel].pixel_width, descs[panel].pixel_height, (int)descs[panel].screen_left,
-			    (int)descs[panel].screen_top);
+	const bool is_active = iface != NULL && iface == g_active_iface;
+	const uint32_t primary = target_plugin_backcompat_claim_index(descs, n, NULL, NULL);
+	uint32_t pick = primary;
+#ifndef XRT_OS_WINDOWS
+	// A plug-in that ships `probe_displays` never reaches here, so its own
+	// claims always win; only the ACTIVE plug-in's panel is known.
+	if (is_active && g_active_panel_valid) {
+		const struct os_display_edid_monitor *side[XRT_DP_REGISTRY_MAX_ENTRIES];
+		for (uint32_t i = 0; i < n; i++) {
+			side[i] = monitor_side_find(descs[i].monitor_id);
 		}
-		pick = panel;
+		pick = target_plugin_backcompat_claim_index(descs, n, side, &g_active_panel_hint);
+	}
+#else
+	(void)is_active;
+#endif
+	if (pick != primary) {
+		U_LOG_I(
+		    "plugin loader: '%s' has no probe_displays — back-compat claim placed on its panel "
+		    "(monitor 0x%016llx, %ux%u at (%d,%d)) instead of the primary monitor",
+		    iface->id != NULL ? iface->id : "?", (unsigned long long)descs[pick].monitor_id,
+		    descs[pick].pixel_width, descs[pick].pixel_height, (int)descs[pick].screen_left,
+		    (int)descs[pick].screen_top);
 	}
 	out[0].monitor_id = descs[pick].monitor_id;
 	out[0].confidence = (uint32_t)XRT_DISPLAY_CLAIM_EDID;
