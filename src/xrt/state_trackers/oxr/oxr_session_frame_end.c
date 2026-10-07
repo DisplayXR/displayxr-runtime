@@ -3139,6 +3139,15 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 		}
 	}
 
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+	// Multi-screen M3: which views of this frame belong to which window
+	// segment — what the app's last xrLocateViews handed out. The compositor
+	// routes each segment's tiles to that segment's display processor.
+	if (sess->is_vk_native_compositor && sess->xcn != NULL) {
+		comp_vk_native_compositor_set_view_routing(&sess->xcn->base, &sess->seg_route);
+	}
+#endif
+
 	xrt_result_t xret;
 	xret = xrt_comp_layer_begin(xc, &data);
 	OXR_CHECK_XRET(log, sess, xret, xrt_comp_layer_begin);
@@ -3365,9 +3374,9 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 			// backlog-free, so flipping the switch back on cannot
 			// produce a burst.
 			struct oxr_views_change_stats vc_stats = {0};
-			if (oxr_views_change_update(&sess->sys->views_change, sess->sys->views, sess->sys->view_count,
-			                            view_w, view_h, os_monotonic_get_ns(), want_ext_views_change,
-			                            &vc_stats) &&
+			if (oxr_views_change_update(&sess->sys->views_change, sess->sys->views,
+			                            sess->sys->view_config_max_count, view_w, view_h,
+			                            os_monotonic_get_ns(), want_ext_views_change, &vc_stats) &&
 			    debug_get_bool_option_views_change_event()) {
 				oxr_event_push_XrEventDataViewConfigurationViewsChangedEXT(
 				    // #1486: the type the SESSION began (the system advertises two).

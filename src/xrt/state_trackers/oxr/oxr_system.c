@@ -23,6 +23,7 @@
 #include "oxr_objects.h"
 #include "oxr_logger.h"
 #include "oxr_two_call.h"
+#include "oxr_segment_views.h"
 #include "oxr_chain.h"
 #include "oxr_api_verify.h"
 #include "oxr_conversions.h"
@@ -189,10 +190,19 @@ oxr_system_fill_in(
 #ifdef OXR_HAVE_DXR_display_info
 		if (inst->extensions.DXR_display_info) {
 			sys->view_config_types[1] = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR;
-			sys->view_config_view_counts[1] = view_count;
+			// Multi-screen M3 (ADR-047 D3): one view set per window
+			// segment. A window on one screen locates exactly what it did
+			// before and aliases the larger tail (ADR-041).
+			sys->view_config_view_counts[1] = oxr_segment_views_multiview_count(view_count);
 			sys->view_config_count = 2;
 		}
 #endif
+	}
+	sys->view_config_max_count = view_count > XRT_MAX_VIEWS ? XRT_MAX_VIEWS : view_count;
+	for (uint32_t t = 0; t < sys->view_config_count; t++) {
+		if (sys->view_config_view_counts[t] > sys->view_config_max_count) {
+			sys->view_config_max_count = sys->view_config_view_counts[t];
+		}
 	}
 	U_LOG_D("sys->view_config_types[0] = %d (%u views), count = %u", sys->view_config_types[0],
 	        sys->view_config_view_counts[0], sys->view_config_count);
@@ -361,9 +371,13 @@ oxr_system_fill_in(
 	}
 #endif // OXR_HAVE_DXR_display_info
 
-	for (uint32_t i = 0; i < view_count; ++i) {
-		uint32_t w_max = info->views[i].max.width_pixels;
-		uint32_t h_max = info->views[i].max.height_pixels;
+	// Multi-screen M3: PRIMARY_MULTIVIEW_DXR reports more views than the
+	// device has (one set per segment). Every view is the same worst-case
+	// (full canvas x scale) envelope, so the extra entries copy the device's.
+	for (uint32_t i = 0; i < sys->view_config_max_count; ++i) {
+		const uint32_t di = i < view_count ? i : 0;
+		uint32_t w_max = info->views[di].max.width_pixels;
+		uint32_t h_max = info->views[di].max.height_pixels;
 
 		uint32_t w, h;
 		if (view_scale_x > 0.0f && view_scale_y > 0.0f &&
@@ -380,8 +394,8 @@ oxr_system_fill_in(
 			}
 		} else {
 			// Legacy: no display processor, use compositor recommended directly
-			w = (uint32_t)(info->views[i].recommended.width_pixels * scale);
-			h = (uint32_t)(info->views[i].recommended.height_pixels * scale);
+			w = (uint32_t)(info->views[di].recommended.width_pixels * scale);
+			h = (uint32_t)(info->views[di].recommended.height_pixels * scale);
 		}
 
 		w = imin(w, w_max);
@@ -401,8 +415,8 @@ oxr_system_fill_in(
 		sys->views[i].maxImageRectWidth = w_max;
 		sys->views[i].recommendedImageRectHeight = h;
 		sys->views[i].maxImageRectHeight = h_max;
-		sys->views[i].recommendedSwapchainSampleCount = info->views[i].recommended.sample_count;
-		sys->views[i].maxSwapchainSampleCount = info->views[i].max.sample_count;
+		sys->views[i].recommendedSwapchainSampleCount = info->views[di].recommended.sample_count;
+		sys->views[i].maxSwapchainSampleCount = info->views[di].max.sample_count;
 
 		// Store actual recommended dims for legacy apps (first view = per-eye size)
 		if (i == 0 && info->legacy_app_tile_scaling) {
@@ -416,7 +430,7 @@ oxr_system_fill_in(
 	// #1488: seed the live-view shadow from the snapshot we just computed.
 	// Leaves views_change.valid false, so xrEnumerateViewConfigurationViews
 	// keeps answering from sys->views until a real change lands.
-	oxr_views_change_seed(&sys->views_change, sys->views, sys->view_count);
+	oxr_views_change_seed(&sys->views_change, sys->views, sys->view_config_max_count);
 
 
 	/*

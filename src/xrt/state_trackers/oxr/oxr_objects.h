@@ -2302,13 +2302,17 @@ struct oxr_system
 	 *
 	 * @ref view_config_view_counts is the count each TYPE reports
 	 * (PRIMARY_MONO 1, PRIMARY_STEREO always 2, PRIMARY_MULTIVIEW_DXR the
-	 * device max across rendering modes). It is NOT @ref view_count: that
-	 * one stays the DEVICE max and keeps sizing every internal array, the
-	 * IPC mirror and @ref views.
+	 * device max across rendering modes times XRT_MAX_SEGMENTS — one view set
+	 * per window segment, multi-screen M3). It is NOT @ref view_count: that
+	 * one stays the DEVICE max and keeps sizing every device-facing call and
+	 * the IPC mirror.
 	 */
 	uint32_t view_config_count;                   //!< 1 or 2.
 	XrViewConfigurationType view_config_types[2]; //!< Advertised types.
 	uint32_t view_config_view_counts[2];          //!< Views reported per type.
+	//! Multi-screen M3: the largest of @ref view_config_view_counts — how many
+	//! entries of @ref views (and the #1488 shadow) are filled.
+	uint32_t view_config_max_count;
 
 	/*!
 	 * #1486: DXR_VIEW_CONFIG_LEGACY=1, latched at @ref oxr_system_fill_in.
@@ -2841,6 +2845,16 @@ struct oxr_session
 	 */
 	bool bound_display_overrides;
 	struct xrt_screen_info bound_display_info;
+
+	/*!
+	 * Multi-screen M3 (ADR-047 D3): which views of the app's last
+	 * xrLocateViews belong to which window segment. count 0 = one view set
+	 * for the whole window. Handed to the compositor with the next frame
+	 * (xrEndFrame), whose projection layer carries those views.
+	 */
+	struct xrt_segment_view_routing seg_route;
+	//! Last per-segment view layout logged (one INFO line per change).
+	struct xrt_segment_view_routing seg_route_logged;
 
 #ifdef XRT_OS_ANDROID
 	//! The last ANativeWindow this session published into `android_globals`

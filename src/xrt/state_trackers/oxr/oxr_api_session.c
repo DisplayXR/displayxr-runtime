@@ -21,6 +21,7 @@
 #include "util/u_debug.h"
 #include "util/u_trace_marker.h"
 
+#include "oxr_segment_views.h"
 #include "oxr_frame_sync.h"
 #include "oxr_objects.h"
 #include "oxr_logger.h"
@@ -1577,7 +1578,11 @@ oxr_xrRequestDisplayRenderingModeDXR(XrSession session, uint32_t modeIndex)
 		// Same fallback as the floor: a session that somehow has no view
 		// count yet is a 2-view session, NOT a session that can fill nothing
 		// (passing 0 to oxr_mode_fillable_by would deny every mode).
-		const uint32_t max_submit = sess->view_config_view_count != 0 ? sess->view_config_view_count : 2;
+		// Multi-screen M3: a multiview session reports one view set per
+		// window segment; what fills a mode is ONE segment's share.
+		const uint32_t max_submit = oxr_segment_views_per_segment_capacity(
+		    sess->view_config_view_count != 0 ? sess->view_config_view_count : 2,
+		    sess->view_config_type == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR, head->hmd->view_count);
 
 		if (!oxr_mode_fillable_by(&head->rendering_modes[modeIndex], max_submit)) {
 			U_LOG_W(

@@ -49,6 +49,7 @@ add_library(
 	oxr_plugin_stub.c
 	oxr_pretty_print.c
 	oxr_pretty_print.h
+	oxr_segment_views.c
 	oxr_session.c
 	oxr_session_window_binding.h
 	oxr_session_frame_end.c
