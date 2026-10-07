@@ -219,6 +219,36 @@ oxr_segment_views_accept_eyes(bool have_eyes, bool valid, uint32_t count)
 }
 
 /*!
+ * Segment @p s's own DP eyes, carried into the reference frame by (@p dx, @p dy).
+ *
+ * Used when the screen's DP reported a valid set (tracked or not, like the
+ * single-screen path) with at least @p views_needed eyes — one per view the
+ * segment carries. A DP that under-reports (a sim_display DP made for a
+ * screen while another vendor is active once reported 1 eye: every view of
+ * that segment then came from the SAME eye and an anaglyph looked flat) is
+ * not used; the caller falls back to that screen's nominal viewer, which
+ * fills every view.
+ *
+ * @return true when @p out holds the segment's DP eyes.
+ */
+static inline bool
+oxr_segment_views_segment_eyes(
+    const struct xrt_segment_metric *s, float dx, float dy, uint32_t views_needed, struct xrt_eye_positions *out)
+{
+	if (s == NULL || out == NULL ||
+	    !oxr_segment_views_accept_eyes(s->have_eyes, s->eyes.valid, s->eyes.count) ||
+	    s->eyes.count < (views_needed > 0 ? views_needed : 1)) {
+		return false;
+	}
+	*out = s->eyes;
+	for (uint32_t e = 0; e < out->count && e < XRT_MAX_VIEWS; e++) {
+		out->eyes[e].x += dx;
+		out->eyes[e].y += dy;
+	}
+	return true;
+}
+
+/*!
  * The untracked eye set: one eye per active view (at least 2), in front of the
  * screen centre at @p z, translated by (@p dx, @p dy) into the caller's frame.
  * The pair is (-ipd/2, +ipd/2); views past 2 repeat it column by column (even

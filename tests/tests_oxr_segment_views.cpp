@@ -414,3 +414,52 @@ TEST_CASE("a display rig gets ONE m2v across segments", "[oxr][segment_views]")
 		CHECK(l.seg[0].ref_cy - l.seg[0].h_m * 0.5f == Catch::Approx(l.seg[1].ref_cy + l.seg[1].h_m * 0.5f));
 	}
 }
+
+TEST_CASE("mixed vendors: each segment uses its OWN pitch and its OWN DP eye pair", "[oxr][segment_views]")
+{
+	// Segment 0 on screen A (the Leia-like primary, its DP's no-face default:
+	// both eyes at one point); segment 1 on screen B (a sim_display segment
+	// DP: an eye pair +-32 mm), at a different pixel pitch.
+	xrt_segment_metrics m = two_screen_table();
+	m.seg[0].have_eyes = true;
+	m.seg[0].eyes.valid = true;
+	m.seg[0].eyes.count = 2;
+	m.seg[0].eyes.eyes[0] = {0.0f, 0.10f, 0.60f};
+	m.seg[0].eyes.eyes[1] = {0.0f, 0.10f, 0.60f};
+	m.seg[1].have_eyes = true;
+	m.seg[1].eyes.valid = true;
+	m.seg[1].eyes.count = 2;
+	m.seg[1].eyes.eyes[0] = {-0.032f, 0.0f, 0.60f};
+	m.seg[1].eyes.eyes[1] = {0.032f, 0.0f, 0.60f};
+
+	oxr_segment_layout l;
+	REQUIRE(oxr_segment_views_layout(&m, &l));
+
+	// Its own pitch: B's segment is 480 px x 0.60/2560 m, not A's pitch.
+	xrt_window_metrics wm0, wm1;
+	oxr_segment_views_window_metrics(&m, &l, 0, &wm0);
+	oxr_segment_views_window_metrics(&m, &l, 1, &wm1);
+	CHECK(wm0.window_width_m == Catch::Approx(320.0f * 0.344f / 1920.0f));
+	CHECK(wm1.window_width_m == Catch::Approx(480.0f * 0.60f / 2560.0f));
+	CHECK(wm1.display_width_m == Catch::Approx(0.60f));
+
+	// Its own eye pair, carried into the reference frame — never segment 0's.
+	float dx = 0, dy = 0;
+	oxr_segment_views_own_to_ref(&l, 1, &dx, &dy);
+	xrt_eye_positions e1;
+	REQUIRE(oxr_segment_views_segment_eyes(&m.seg[1], dx, dy, 2, &e1));
+	CHECK(e1.eyes[1].x - e1.eyes[0].x == Catch::Approx(0.064f));
+	CHECK(e1.eyes[0].x == Catch::Approx(-0.032f + dx));
+	CHECK(e1.eyes[0].y == Catch::Approx(dy));
+	// Relative to its own canvas the pair straddles the eye offset by +-32 mm.
+	CHECK((e1.eyes[0].x - wm1.window_center_offset_x_m) + 0.032f ==
+	      Catch::Approx(-l.seg[1].own_cx).margin(1e-5));
+
+	// A DP that under-reports for the segment's views (one eye for a 2-view
+	// mode: every view from the SAME eye, an anaglyph that looks flat) is not
+	// used; the nominal viewer (a real pair) takes over.
+	xrt_segment_metric under = m.seg[1];
+	under.eyes.count = 1;
+	CHECK_FALSE(oxr_segment_views_segment_eyes(&under, dx, dy, 2, &e1));
+	CHECK(oxr_segment_views_segment_eyes(&under, dx, dy, 1, &e1)); // a 1-view mode is covered
+}

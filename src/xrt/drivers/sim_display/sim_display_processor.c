@@ -175,6 +175,12 @@ struct sim_display_processor
 	 * pixels outside it (@ref render_pass_preserve).
 	 */
 	bool screen_bound;
+	//! Views of the last atlas this segment DP wove (tile_columns x
+	//! tile_rows; 2 before the first). A segment DP's eye count follows THIS,
+	//! not the process-wide sim view count, which only the sim head device
+	//! sets — absent when another vendor's plug-in is active (mixed-vendor
+	//! segments), where it stays 1 and every view came from one eye.
+	uint32_t last_atlas_views;
 	uint64_t screen_monitor_id;
 	float screen_w_m, screen_h_m;
 	uint32_t screen_px_w, screen_px_h;
@@ -265,6 +271,9 @@ sim_dp_process_atlas(struct xrt_display_processor *xdp,
 	(void)atlas_image; // sim_display uses atlas_view via shader sampling
 	(void)target_image; // sim_display uses target_fb via render pass
 	struct sim_display_processor *sdp = sim_display_processor(xdp);
+	if (sdp->screen_bound && tile_columns * tile_rows > 0) {
+		sdp->last_atlas_views = tile_columns * tile_rows;
+	}
 
 	// #817: report the weave geometry against the declared panel. Diagnostic
 	// only — it never changes what is rendered.
@@ -897,7 +906,10 @@ sim_dp_get_predicted_eye_positions(struct xrt_display_processor *xdp, struct xrt
 {
 	struct sim_display_processor *sdp = sim_display_processor(xdp);
 	float half_ipd = sdp->ipd_m / 2.0f;
-	uint32_t vc = sim_display_get_view_count();
+	// A segment DP (multi-screen) reports one eye per view of the atlas it
+	// weaves; the session DP keeps the process-wide sim view count.
+	uint32_t vc = sdp->screen_bound ? (sdp->last_atlas_views > 0 ? sdp->last_atlas_views : 2)
+	                                : sim_display_get_view_count();
 
 	if (vc == 1) {
 		out->eyes[0] = (struct xrt_eye_position){sdp->nominal_x_m, sdp->nominal_y_m, sdp->nominal_z_m};
@@ -1236,6 +1248,7 @@ sim_dp_bind_screen(struct sim_display_processor *sdp, const struct xrt_screen_bi
 	sim_display_get_panel_metrics(&def_w_m, &def_h_m, &def_px_w, &def_px_h);
 
 	sdp->screen_bound = true;
+	sdp->last_atlas_views = 2;
 	sdp->screen_monitor_id = b->monitor_id;
 	sdp->screen_left = b->desktop_left;
 	sdp->screen_top = b->desktop_top;
