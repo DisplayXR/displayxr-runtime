@@ -12,6 +12,7 @@
 #include "xrt/xrt_space.h"
 #include "xrt/xrt_system.h"
 #include "xrt/xrt_compositor.h"
+#include "xrt/xrt_screen.h"
 #include "xrt/xrt_config_build.h"
 #include "xrt/xrt_config_os.h"
 
@@ -42,6 +43,7 @@
 // longer link-includes any vendor drv_* code (ADR-019 / #256 / #263).
 
 #include "target_plugin_loader.h"
+#include "target_screens.h"
 
 #include "target_instance_parts.h"
 
@@ -204,6 +206,10 @@ fill_display_desktop_info(struct xrt_system_compositor_info *info);
 
 //! The head device the display info describes; NULL until a system exists.
 static struct xrt_device *g_display_info_head = NULL;
+//! The system compositor info the per-monitor registry and the display info
+//! live in — what `xrt_instance::enumerate_displays` builds the screen list
+//! from (multi-screen M1). NULL until a system with a compositor exists.
+static const struct xrt_system_compositor_info *g_screens_info = NULL;
 //! The plug-in display info that was last APPLIED to `xsysc->info` — what the
 //! refresh compares against, so it is idempotent regardless of what
 //! `fill_display_desktop_info` later overrides on the info struct itself.
@@ -908,6 +914,7 @@ out:
 		}
 		g_display_info_head = head;
 		g_display_info_applied_valid = false;
+		g_screens_info = &xsysc->info;
 		xsysc->info.refresh_display_processors = refresh_display_processors_cb;
 
 		// Vendor-neutral display-info population through the plug-in
@@ -988,6 +995,37 @@ t_instance_get_active_plugin(struct xrt_instance *xinst,
 	return iface != NULL;
 }
 
+/*!
+ * xrt_instance::enumerate_displays (multi-screen M1) — the screen list of the
+ * system this instance created, built from its per-monitor registry and the
+ * display info applied to it. The service answers `system_enumerate_displays`
+ * through this too. Serialised with the refresh callback, which rewrites
+ * both on a client connect.
+ */
+static xrt_result_t
+t_instance_enumerate_displays(struct xrt_instance *xinst, struct xrt_screen_list *out_list)
+{
+	(void)xinst;
+	if (out_list == NULL) {
+		return XRT_ERROR_ALLOCATION;
+	}
+	memset(out_list, 0, sizeof(*out_list));
+	if (g_screens_info == NULL) {
+		return XRT_SUCCESS; // no system (or no compositor) yet: no screens
+	}
+
+	if (g_display_info_mutex_initialized) {
+		os_mutex_lock(&g_display_info_mutex);
+	}
+	struct target_screens_system sys;
+	target_screens_system_from_info(g_screens_info, &sys);
+	target_screens_build(&g_screens_info->dp_registry, g_screens_info->active_plugin_id, &sys, out_list);
+	if (g_display_info_mutex_initialized) {
+		os_mutex_unlock(&g_display_info_mutex);
+	}
+	return XRT_SUCCESS;
+}
+
 #ifdef XRT_FEATURE_HYBRID_MODE
 // In hybrid mode, export as native_instance_create to avoid symbol conflict
 // with ipc_instance_create from the IPC client library
@@ -1014,6 +1052,7 @@ xrt_instance_create(struct xrt_instance_info *ii, struct xrt_instance **out_xins
 	tinst->base.get_prober = t_instance_get_prober;
 	tinst->base.destroy = t_instance_destroy;
 	tinst->base.get_active_plugin = t_instance_get_active_plugin;
+	tinst->base.enumerate_displays = t_instance_enumerate_displays;
 	tinst->xp = xp;
 
 	tinst->base.startup_timestamp = os_monotonic_get_ns();

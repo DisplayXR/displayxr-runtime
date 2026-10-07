@@ -13,6 +13,7 @@ add_library(
 			    target_input_arbiter.c target_input_arbiter.h
 			    target_input_plugin_loader.c target_input_plugin_loader.h
 			    target_plugin_loader.c target_plugin_loader.h
+			    target_screens.c target_screens.h
 			    target_plugin_preload_sanitize.c target_plugin_preload_sanitize.h
 			    target_plugin_path_guard.c target_plugin_path_guard.h
 			    target_rig_composer.c target_rig_composer.h

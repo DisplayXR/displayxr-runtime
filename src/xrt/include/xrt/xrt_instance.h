@@ -26,6 +26,7 @@ struct xrt_instance_android;
 struct xrt_stereo_camera_client;
 struct xrt_plugin_iface;
 struct xrt_plugin_instance;
+struct xrt_screen_list;
 struct xrt_space_overseer;
 struct xrt_system;
 struct xrt_system_devices;
@@ -279,7 +280,36 @@ struct xrt_instance
 	bool (*get_active_plugin)(struct xrt_instance *xinst,
 	                          const struct xrt_plugin_iface **out_iface,
 	                          struct xrt_plugin_instance **out_inst);
+
+	/*!
+	 * Optional (multi-screen M1, `XR_DXR_display_info` v22): the system's
+	 * screens — one per monitor in the per-monitor DP registry, the
+	 * system-default one first — with each screen's display info. The native
+	 * instance builds it from the registry of the system it created; the IPC
+	 * client instance asks the service (`system_enumerate_displays`), so both
+	 * paths return the same list. Call after `create_system`; an empty list
+	 * (count 0) is a valid answer. NULL on instances that cannot answer
+	 * (the no-compositor instance).
+	 */
+	xrt_result_t (*enumerate_displays)(struct xrt_instance *xinst, struct xrt_screen_list *out_list);
 };
+
+/*!
+ * @copydoc xrt_instance::enumerate_displays
+ *
+ * Returns XRT_ERROR_FEATURE_NOT_SUPPORTED when the instance has no
+ * implementation.
+ *
+ * @public @memberof xrt_instance
+ */
+static inline xrt_result_t
+xrt_instance_enumerate_displays(struct xrt_instance *xinst, struct xrt_screen_list *out_list)
+{
+	if (xinst == NULL || xinst->enumerate_displays == NULL) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	return xinst->enumerate_displays(xinst, out_list);
+}
 
 /*!
  * @copydoc xrt_instance::create_system
