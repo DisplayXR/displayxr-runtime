@@ -1,5 +1,5 @@
 ---
-status: Active — joint DisplayXR × LeiaSR plan, approved 2026-10-07 (ADR-046)
+status: Active — joint DisplayXR × LeiaSR plan, approved 2026-10-07 (ADR-047)
 owner: David Fattal
 updated: 2026-10-07
 issues: [69, 546, 793, 715, 46]

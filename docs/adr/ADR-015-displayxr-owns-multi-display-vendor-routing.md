@@ -1,12 +1,12 @@
 ---
-status: Accepted (§3–§4 superseded by ADR-046; §7 narrowed to Windows drag snapping)
+status: Accepted (§3–§4 superseded by ADR-047; §7 narrowed to Windows drag snapping)
 date: 2026-04-02
 source: "#69"
 ---
 # ADR-015: DisplayXR Owns Multi-Display Vendor Routing
 
 > **2026-10-07:** §3–§4 (one atlas split at the display boundary) are superseded by
-> [ADR-046](ADR-046-multi-screen-segments-and-per-screen-views.md): a spanning window is
+> [ADR-047](ADR-047-multi-screen-segments-and-per-screen-views.md): a spanning window is
 > split into per-screen *segments*, each rendered from its own views. §7's HWND rule now
 > covers Windows drag snapping only. Plan: `docs/roadmap/multi-screen.md`.
 

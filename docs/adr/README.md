@@ -50,4 +50,4 @@
 - [ADR-044](ADR-044-colour-contract-per-backend.md) — The colour contract, per backend and swapchain format
 - [ADR-045](ADR-045-plugins-always-loadable-and-report-platform-state.md) — Plug-ins are always loadable and report their platform state
 - [ADR-046](ADR-046-depth-aware-cursor.md) — Depth-aware cursor — opt-in only; the app knows the depth, the runtime places the cursor
-- [ADR-046](ADR-046-multi-screen-segments-and-per-screen-views.md) — Multi-screen — segments and per-screen views
+- [ADR-047](ADR-047-multi-screen-segments-and-per-screen-views.md) — Multi-screen — segments and per-screen views
