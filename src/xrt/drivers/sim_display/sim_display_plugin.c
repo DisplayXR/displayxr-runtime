@@ -145,6 +145,71 @@ sim_display_plugin_get_display_info(struct xrt_plugin_instance *inst,
 }
 
 
+/*!
+ * Multi-screen M1: describe ONE monitor sim_display won (FALLBACK claim) —
+ * the per-monitor twin of @ref sim_display_plugin_get_display_info. Physical
+ * size from the monitor's EDID mm (the env/default size when EDID has none),
+ * pixels from the connector's device mode (else the desktop mode), sim's
+ * usual nominal viewer, and the same eye-tracking advertisement as the head
+ * (none, or MANUAL under SIM_DISPLAY_FAKE_TRACKING=1).
+ */
+static bool
+sim_display_plugin_get_display_info_for_monitor(struct xrt_plugin_instance *inst,
+                                                const struct xrt_display_descriptor *display,
+                                                const struct xrt_display_physical *physical,
+                                                struct xrt_plugin_display_info *out_info)
+{
+	(void)inst;
+	if (display == NULL || out_info == NULL ||
+	    out_info->struct_size <
+	        offsetof(struct xrt_plugin_display_info, supported_eye_tracking_modes) + 2 * sizeof(uint32_t)) {
+		return false;
+	}
+
+	float w_m = 0.0f, h_m = 0.0f, ny = 0.0f, nz = 0.0f;
+	sim_display_get_default_viewer(&w_m, &h_m, &ny, &nz);
+
+	uint32_t mm_w = 0, mm_h = 0, px_w = 0, px_h = 0;
+	if (physical != NULL &&
+	    physical->struct_size >= offsetof(struct xrt_display_physical, native_pixel_height) + sizeof(uint32_t)) {
+		mm_w = physical->physical_width_mm;
+		mm_h = physical->physical_height_mm;
+		px_w = physical->native_pixel_width;
+		px_h = physical->native_pixel_height;
+	}
+	if (mm_w > 0 && mm_h > 0) {
+		w_m = (float)mm_w / 1000.0f;
+		h_m = (float)mm_h / 1000.0f;
+	}
+	if (px_w == 0 || px_h == 0) {
+		px_w = display->pixel_width;
+		px_h = display->pixel_height;
+	}
+
+	out_info->display_width_m = w_m;
+	out_info->display_height_m = h_m;
+	out_info->nominal_viewer_x_m = 0.0f;
+	out_info->nominal_viewer_y_m = ny;
+	out_info->nominal_viewer_z_m = nz;
+	out_info->display_pixel_width = px_w;
+	out_info->display_pixel_height = px_h;
+	out_info->recommended_view_scale_x = 0.0f; // runtime derives
+	out_info->recommended_view_scale_y = 0.0f;
+	out_info->display_screen_left = display->screen_left;
+	out_info->display_screen_top = display->screen_top;
+	if (sim_display_fake_tracking_enabled()) {
+		out_info->supported_eye_tracking_modes = 2u; /* MANUAL_BIT */
+		out_info->default_eye_tracking_mode = 1u;    /* MANUAL */
+	} else {
+		out_info->supported_eye_tracking_modes = 0u;
+		out_info->default_eye_tracking_mode = 0u;
+	}
+	if (out_info->struct_size >= offsetof(struct xrt_plugin_display_info, refresh_mhz) + sizeof(uint32_t)) {
+		out_info->refresh_mhz = display->refresh_mhz;
+	}
+	return true;
+}
+
 static uint32_t
 sim_display_plugin_probe_displays(struct xrt_plugin_instance *inst,
                                   const struct xrt_display_descriptor *displays,
@@ -224,13 +289,13 @@ static struct xrt_plugin_iface g_sim_display_iface = {
     .probe = sim_display_plugin_probe,
     .create_device = sim_display_plugin_create_device,
 
-    /*
-     * Per-graphics-API DP factories. sim_display ships factories for
-     * every API the platform supports; the runtime picks one at session
-     * creation based on the app's graphics binding. Each function
-     * pointer is the existing factory from sim_display_interface.h —
-     * the signatures already match the xrt_dp_factory_*_fn_t typedefs.
-     */
+/*
+ * Per-graphics-API DP factories. sim_display ships factories for
+ * every API the platform supports; the runtime picks one at session
+ * creation based on the app's graphics binding. Each function
+ * pointer is the existing factory from sim_display_interface.h —
+ * the signatures already match the xrt_dp_factory_*_fn_t typedefs.
+ */
 #if defined(XRT_HAVE_VULKAN) || !defined(_WIN32)
     .create_dp_vk = sim_display_dp_factory_vk,
     /* #1243: vk_bundle ABI fingerprint (size + table offset) — see xrt_plugin_iface. */
@@ -296,6 +361,9 @@ static struct xrt_plugin_iface g_sim_display_iface = {
     .stereo_camera_wait_frame = sim_display_stereo_camera_wait_frame,
     .stereo_camera_release_frame = sim_display_stereo_camera_release_frame,
     .stereo_camera_close = sim_display_stereo_camera_close,
+
+    /* Multi-screen M1: per-monitor display info for every monitor sim wins. */
+    .get_display_info_for_monitor = sim_display_plugin_get_display_info_for_monitor,
 };
 
 

@@ -928,3 +928,25 @@ sim_display_hmd_create(void)
 
 	return &hmd->base;
 }
+
+
+/*
+ *
+ * Per-monitor defaults (multi-screen M1).
+ *
+ */
+
+void
+sim_display_get_default_viewer(float *out_w_m, float *out_h_m, float *out_nominal_y_m, float *out_nominal_z_m)
+{
+	// The same env-configurable defaults sim_display_hmd_create() starts from,
+	// and the same 10 cm eye height it gives its static pose.
+	if (out_w_m != NULL)
+		*out_w_m = debug_get_float_option_sim_display_width_m();
+	if (out_h_m != NULL)
+		*out_h_m = debug_get_float_option_sim_display_height_m();
+	if (out_nominal_y_m != NULL)
+		*out_nominal_y_m = 0.1f;
+	if (out_nominal_z_m != NULL)
+		*out_nominal_z_m = debug_get_float_option_sim_display_nominal_z_m();
+}

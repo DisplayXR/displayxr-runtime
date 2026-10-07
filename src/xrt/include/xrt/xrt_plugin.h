@@ -158,8 +158,14 @@ struct xrt_plugin_display_info
  *
  * Forward-compat: the runtime sets `struct_size` to its own
  * `sizeof(struct xrt_display_descriptor)` before the call; plug-ins MUST
- * NOT read past that offset. Field additions append at the end with no
- * API version bump.
+ * NOT read past that offset.
+ *
+ * **Growth caveat (multi-screen M1):** `probe_displays` receives these as an
+ * ARRAY, and a plug-in indexes it with its own compile-time `sizeof`, so
+ * appending a field changes the array stride under every existing plug-in —
+ * that is a layout break (an XRT_PLUGIN_API_VERSION_CURRENT bump), not the
+ * free append `struct_size` suggests. New per-monitor facts go in a separate
+ * struct passed by pointer instead (see @ref xrt_display_physical).
  */
 struct xrt_display_descriptor
 {
@@ -198,6 +204,34 @@ struct xrt_display_descriptor
 
 	/*! Bit 0 = primary monitor. Other bits reserved (must be 0). */
 	uint32_t flags;
+};
+
+/*!
+ * Physical facts about one monitor that @ref xrt_display_descriptor does not
+ * carry (multi-screen M1), handed by pointer — never as an array — to
+ * `xrt_plugin_iface::get_display_info_for_monitor`, so it can grow by
+ * appending under `struct_size` with no ABI bump.
+ *
+ * The runtime sets `struct_size` to its own `sizeof`; a plug-in MUST NOT
+ * read past it.
+ */
+struct xrt_display_physical
+{
+	/*! `sizeof(struct xrt_display_physical)` at the runtime's compile time. */
+	uint32_t struct_size;
+
+	/*! Reserved for alignment. Must be 0. */
+	uint32_t reserved_0;
+
+	/*! Physical size from EDID (detailed timing, else the basic block),
+	 *  millimetres; 0 = unknown. */
+	uint32_t physical_width_mm;
+	uint32_t physical_height_mm;
+
+	/*! The connector's device (native) mode; may differ from the
+	 *  descriptor's pixel size under a scaled desktop. 0 = unknown. */
+	uint32_t native_pixel_width;
+	uint32_t native_pixel_height;
 };
 
 /*!
@@ -1114,6 +1148,40 @@ struct xrt_plugin_iface
 	void (*stereo_camera_close)(struct xrt_plugin_stereo_camera *cam);
 
 	/*! @} */
+
+	/*!
+	 * Report the display info of ONE monitor this plug-in won in the
+	 * per-monitor registry (multi-screen M1, `XR_DXR_display_info` v22
+	 * `xrEnumerateDisplaysDXR`). Same out struct and the same field meanings
+	 * as @ref get_display_info, but keyed by the monitor instead of the head
+	 * device: physical size, nominal viewer (display-centred, metres), native
+	 * pixels, recommended view scale (0 = let the runtime derive), desktop
+	 * origin, eye-tracking modes supported/default for THAT monitor.
+	 *
+	 * Contract:
+	 *   - @p display is the descriptor the runtime built for this monitor
+	 *     (the one `probe_displays` saw). @p physical carries what the
+	 *     descriptor does not (EDID millimetres, the connector's device
+	 *     mode); it may be NULL, and its fields are 0 when unknown.
+	 *   - The runtime sets `out_info->struct_size` and zero-fills the rest;
+	 *     the plug-in MUST NOT write past `struct_size`.
+	 *   - Cheap and non-blocking (it runs on `xrEnumerateDisplaysDXR` and in
+	 *     diagnostics), callable from any thread, with @p inst NULL for a
+	 *     plug-in that has no instance state.
+	 *   - Return false for a monitor the plug-in cannot describe; the runtime
+	 *     then derives defaults from EDID (no eye tracking, view scale 1).
+	 *
+	 * Optional. NULL (or a plug-in whose `struct_size` predates this field)
+	 * ⟹ the runtime uses @ref get_display_info for the active plug-in's
+	 * panel and EDID-derived defaults for every other monitor. Appended per
+	 * ADR-020 (append-only within a major; gated by @ref struct_size; no
+	 * XRT_PLUGIN_API_VERSION_CURRENT bump) AFTER the stereo camera block.
+	 * Announced by @ref XRT_PLUGIN_IFACE_HAS_DISPLAY_INFO_FOR_MONITOR.
+	 */
+	bool (*get_display_info_for_monitor)(struct xrt_plugin_instance *inst,
+	                                     const struct xrt_display_descriptor *display,
+	                                     const struct xrt_display_physical *physical,
+	                                     struct xrt_plugin_display_info *out_info);
 };
 
 /*!
@@ -1138,6 +1206,28 @@ struct xrt_plugin_iface
  * #ifdef-guard filling them.
  */
 #define XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA 1
+
+/*!
+ * Defined when @ref xrt_plugin_iface carries @ref
+ * xrt_plugin_iface::get_display_info_for_monitor and this header defines
+ * @ref xrt_display_physical (multi-screen M1), so a plug-in built against an older runtime header can
+ * #ifdef-guard implementing it.
+ */
+#define XRT_PLUGIN_IFACE_HAS_DISPLAY_INFO_FOR_MONITOR 1
+
+/*!
+ * True when @p iface implements @ref
+ * xrt_plugin_iface::get_display_info_for_monitor (and its struct_size covers
+ * the slot).
+ */
+static inline bool
+xrt_plugin_iface_has_display_info_for_monitor(const struct xrt_plugin_iface *iface)
+{
+	return iface != NULL &&
+	       iface->struct_size >= offsetof(struct xrt_plugin_iface, get_display_info_for_monitor) +
+	                                 sizeof(iface->get_display_info_for_monitor) &&
+	       iface->get_display_info_for_monitor != NULL;
+}
 
 /*!
  * True when @p iface fills the whole stereo camera slot set (and its
