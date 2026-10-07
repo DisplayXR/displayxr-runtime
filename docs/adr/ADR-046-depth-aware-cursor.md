@@ -1,6 +1,6 @@
 # ADR-046: Depth-aware cursor — opt-in only; the app knows the depth, the runtime places the cursor
 
-**Status:** Proposed (2026-10-06) · Phase 1 implemented · spec:
+**Status:** Proposed (2026-10-06) · Phase 1 implemented · Phase 3a implemented (Metal) · spec:
 [XR_DXR_cursor_depth.md](../specs/extensions/XR_DXR_cursor_depth.md) · sibling of
 [ADR-040](ADR-040-rear-depth-budget.md) (the same cue conflict, at the cursor instead of the desktop)
 
@@ -136,7 +136,7 @@ display plane gives d > 0, and the cursor settles onto it. A second locate in th
 |---|---|---|
 | **1 (this ADR, implemented)** | `XR_DXR_cursor_depth` v1: app hint in, placement out, app draws. Pure placement module `u_cursor_depth` with tests; state-tracker fill in `xrLocateViews`. Works in-process and over IPC, on every graphics API. | A few dozen flops per locate |
 | 2 | **Runtime-drawn cursor** (`XrCursorDepthDrawRequestDXR`): the compositor draws the sprite into the atlas before the display processor, reading the OS cursor position at the last moment before compositing. For apps that would rather not draw. | One quad per view |
-| 3a | **Depth-layer source** (`XR_KHR_composition_layer_depth`): for apps that already submit depth with their projection layer, as engines commonly can. The app opts in with one request flag and sends no hint. The compositor reads a cursor-sized patch of the submitted depth (nearest value in the footprint) and converts it to disparity through that layer's `nearZ`/`farZ`. Depth is exact, and the app needs no hit-test code. The state tracker already accepts the struct; whether any compositor reads it today is unchecked. | One small GPU readback of a patch |
+| 3a (*implemented, Metal; spec v2*) | **Depth-layer source** (`XrCursorDepthSourceDXR`, `XR_KHR_composition_layer_depth`): for apps that already submit depth with their projection layer, as engines commonly can. The app chains one struct on the hint and sends no point. The compositor copies a cursor-sized patch (at most 64×64) of the two outermost views' submitted depth, never waiting on the GPU. The state tracker turns the nearest texel into a point through that layer's own view and `nearZ`/`farZ`, and feeds it to the v1 placement. Depth is exact, and the app needs no hit-test code. See §6. | One ≤ 32 KB blit per requested frame, plus a CPU min over ≤ 8 K floats |
 | 3b | **Runtime-measured depth** (`XrCursorDepthMeasureRequestDXR`): for apps that have no depth (stereo photos and video, legacy content). The compositor block-matches a cursor-sized patch between the outermost views of the submitted atlas. The measured disparity feeds the same filter. It fails safe, falling back to d = 0 on textureless or ambiguous patches. | One tiny compute dispatch |
 | 4 | **Shell / IPC**: an opted-in client's placement is shared with the service, so the workspace controller's cursor rises onto window content, not just window surfaces. Clients that didn't opt in keep today's window-plane behaviour. | none extra |
 | 5 | **Web** (*started: displayxr-web `DepthCursor` + `./cursor-depth`*): the inline3d SDK ports the same placement function. The SDK owns its views, so it needs no runtime round-trip. It gets the hint from depth readback or splat expected depth, and draws the sprite with `cursor: none` over the canvas. It is opt-in per viewer (`cursor: 'depth'`). The browser can later offer the lift depth map for converted video. | none in the runtime |
@@ -159,6 +159,105 @@ checks, `DISPLAYXR_CURSOR_DEPTH_UV=u,v` scripts the cursor position. Atlas captu
 In every capture, the midpoint of the two cursor images sat at the requested u, and both sat at
 the same v. So the cursor rises along the line of sight and doesn't drift sideways.
 
+### 6. Phase 3a as built: the depth-layer source
+
+**The request.** Spec v2 adds `XrCursorDepthSourceDXR`, chained on the hint, with
+`source = XR_CURSOR_DEPTH_SOURCE_SUBMITTED_DEPTH_DXR`. The struct is new; no existing struct
+grows. The request covers one frame, so the app chains it every frame for as long as it wants
+the service.
+
+**Zero cost when not requested, in code as well as in principle.** Each stage is gated:
+
+| Stage | Gate | Cost for an app that didn't ask |
+|---|---|---|
+| `xrLocateViews` | extension enabled → hint chained → source struct chained | nothing; the source struct is looked up only behind the hint |
+| `xrEndFrame` | `sess->cursor_depth_source.armed`, set only by such a locate | one bool test, and only inside the depth-layer submit path |
+| Metal `layer_commit` | `req.requested \|\| in_flight` | two field tests; no buffer, no command buffer, no copy |
+| compositor gate | `u_cursor_depth_patch_should_sample()` | unit-tested: a zero-initialised request returns false |
+
+The readback buffers (three 32 KB shared buffers) are allocated on the first real request, never
+before. A command buffer is created only once a copy has been encoded. An app that submits depth
+for its own reasons, but doesn't request the source, gets no extra work. Its depth swapchains
+were already referenced by the layer accumulator, and Phase 3a adds no reference.
+
+**Who does what.**
+
+1. At the armed frame's `xrEndFrame`, the state tracker records the outermost two views (0 and
+   active − 1) of the first projection layer that carries depth. It records them from the
+   layer **as the app submitted it**: the layer's `XrSpace`, each view's pose and fov, and each
+   view's `minDepth`/`maxDepth`/`nearZ`/`farZ`. It keys the record by a tag and hands the
+   compositor a one-frame request: the tag, the cursor UV, the footprint, the two view indices,
+   and whether Z is reversed.
+2. At commit, the Metal compositor copies each view's footprint rectangle out of the depth
+   sub-image into a shared buffer, on its own command buffer, and commits it. On a later commit
+   it checks that command buffer's `status`. It never calls `waitUntilCompleted`, and when all
+   three slots are busy it skips the frame. Once the copy is done, it reduces each patch to its
+   nearest texel on the CPU (at most 8 K floats) and publishes the tag, the texel's position
+   within the sub-image, and the raw depth.
+3. At the next locate, the state tracker:
+   - looks up the record by tag;
+   - unprojects each view's texel through that view's recorded pose and fov;
+   - keeps the nearer of the two in disparity;
+   - passes it to the v1 placement as if the app had sent it.
+
+**Why the point is rebuilt in the state tracker, not in the compositor.** The poses the
+compositor holds have already been through `handle_space`, so they are in the runtime's
+tracking space, not the app's. The view poses the app submitted with the layer are in the
+layer's own space. That is the locate space whenever the two `XrSpace` handles are equal.
+v2 **requires** them to be equal. A layer in a different space gives "no content" and a one-time
+WARN. Converting between two app spaces would cost a space locate per frame for a cursor.
+
+**Depth conventions** are handled by one pure function, `u_cursor_depth_linear_depth()`. It uses
+the fact that 1/z is linear in window depth for every perspective projection:
+
+- D3D, Vulkan and Metal [0,1] clip depth, and GL [−1,1] NDC under the default depth range, all
+  produce the same window-depth curve.
+- Reversed Z (`nearZ > farZ`) and an infinite plane (1/∞ = 0) need no special case.
+- The far end of the mapping, where a cleared buffer sits, counts as no content.
+
+**Footprint.** The footprint is the sprite plus 50% (radius 0.75 × `cursorHeight` canvas
+heights), the same rule the v1 guidance gives apps. Both outer views are searched at the
+cursor's canvas UV, and the nearest texel across both wins. The patch is capped at 64×64 rather
+than the 32×32 first suggested. A footprint of that size on a 4K panel's tile is about 50 texels
+across, so a 32 cap would shrink the footprint and bring back the cut-through at edges that §1
+exists to prevent.
+
+**Bug found on the way.** `comp_layer_accum_projection_depth()` stored depth swapchains at
+`[i + view_count]`, but both getters read `[XRT_MAX_VIEWS + i]`. So every depth lookup returned
+NULL. Nothing in DisplayXR read submitted depth before, so it was latent. The fix is in the
+same PR.
+
+**Metal depth swapchains.** A `Depth32Float` swapchain now takes the private, no-IOSurface path.
+A depth format can't be IOSurface-backed, or use shared storage, on macOS. This affects only
+apps that create a depth swapchain.
+
+**Build-flag caveat (needs a decision).** `XRT_FEATURE_OPENXR_LAYER_DEPTH` defaults **OFF**
+(top-level `CMakeLists.txt`, because of CTS concerns about multi-view depth swapchains). So a
+default build does not advertise `XR_KHR_composition_layer_depth`, and Phase 3a stays dormant.
+The reference app then logs why and keeps its hit test. Turning the flag on is a separate,
+CTS-visible decision, deliberately not made here. The evidence below comes from a build with
+`-DXRT_FEATURE_OPENXR_LAYER_DEPTH=ON`.
+
+**Compositors.** Metal reads the patch. vk_native, D3D11, D3D12, GL and the IPC/service path have
+compile-safe stubs: `oxr_session_cursor_depth_hand_request()` returns false. They report no
+content (cursor on the display plane) with a one-time WARN. Wiring vk_native is the next step,
+and it can be tested on macOS through MoltenVK.
+
+**Evidence** (macOS, sim_display SBS, `cube_handle_metal_macos`, atlas captures 1512×1646, cursor
+x offset between the two stacked tiles):
+
+| Cursor UV | App hit test (v1) | Depth-layer source (v2) |
+|---|---|---|
+| 0.5, 0.5 (over the cube) | 22.6 px, target d = −0.066 | 24.6 px, target d = −0.081 |
+| 0.1, 0.1 (empty space) | 0 px | 0 px |
+
+The depth-layer source places the cursor about 2 px further forward. That is expected, because
+it searches every texel of the footprint box, while the app's hit test casts 9 rays (the centre
+and a ring of 8). The box's corners reach √2 times further than the ring, so the box finds a
+slightly nearer cube edge. A run without the request, in hint mode and with
+`DISPLAYXR_CURSOR_DEPTH=0`, logs none of the Phase 3a one-time WARNs. A run with the request logs
+each of them exactly once.
+
 ## Consequences
 
 - An app that already raycasts or reads depth gets a correct, consistent cursor for one struct
@@ -168,7 +267,9 @@ the same v. So the cursor rises along the line of sight and doesn't drift sidewa
   against the C unit tests' expected values.
 - The hint is a frame old. A cursor moving fast across a depth edge can show a single frame
   where the cursor sits behind the nearer content. The footprint dilation and the fast rise keep
-  that to the edge itself. Phases 3a and 3b read the current frame, so they don't have this lag.
+  that to the edge itself. Phase 3a as built does not remove this lag. It reads frame N's
+  submitted depth, but the result reaches the placement one or two frames later, because waiting
+  on the GPU would stall the pipeline (§6). So it has the same lag, and the same mitigation.
 - **Head motion and look-around.** The sprite sits on the cyclopean ray through the cursor's
   canvas point. So each eye sees it on the glass at S ∓ (baseline/2)·d, which doesn't depend on
   where the head is (unit-tested across three head poses). The cursor's image on the panel
