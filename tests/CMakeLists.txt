@@ -56,6 +56,7 @@ set(tests
     tests_aux_weave_flat
     tests_aux_display_mode_hold
     tests_comp_rear_budget
+    tests_comp_segments
     tests_comp_lazy_transparency
     tests_comp_overlay_2d_vk
     tests_oxr_weave_latch
@@ -588,6 +589,13 @@ target_sources(
 	)
 target_include_directories(tests_comp_rear_budget PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 target_link_libraries(tests_comp_rear_budget PRIVATE xrt-interfaces aux_os xrt-external-stb)
+
+# Multi-screen M2: the segment table, the per-segment 1:1 policy and the DP
+# lifecycle hysteresis. Pure math -- compiled into the unit like
+# tests_comp_rear_budget instead of linking the Vulkan-gated comp_util.
+target_sources(tests_comp_segments PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/comp_segments.c)
+target_include_directories(tests_comp_segments PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+target_link_libraries(tests_comp_segments PRIVATE xrt-interfaces aux_util)
 
 if(XRT_BUILD_DRIVER_HANDTRACKING)
 	target_link_libraries(

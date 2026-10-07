@@ -189,6 +189,8 @@ if(XRT_HAVE_VULKAN)
 		util/comp_render_helpers.h
 		util/comp_scratch.c
 		util/comp_scratch.h
+		util/comp_segments.c
+		util/comp_segments.h
 		util/comp_semaphore.h
 		util/comp_semaphore.c
 		util/comp_swapchain.h
