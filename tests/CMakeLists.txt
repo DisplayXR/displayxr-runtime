@@ -132,6 +132,12 @@ if(XRT_HAVE_VULKAN
 	# format modifiers (a CI runner's lavapipe has no DRM device).
 	list(APPEND tests tests_vk_dmabuf)
 endif()
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+	# Multi-screen M0 (#69) -- the desktop-Linux EDID enumeration: EDID
+	# parser, DRM sysfs reader (against a temp-dir fixture) and the
+	# RandR <-> DRM join. Hardware-free.
+	list(APPEND tests tests_aux_display_edid_linux)
+endif()
 if(TARGET comp_vk_native
    AND CMAKE_SYSTEM_NAME STREQUAL "Linux"
    AND NOT ANDROID
