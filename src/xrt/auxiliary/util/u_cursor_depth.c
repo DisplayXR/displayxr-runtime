@@ -204,3 +204,165 @@ u_cursor_depth_place(const struct u_cursor_depth_geometry *g,
 	*out_position = v3_add_scaled(g->eye, v3_sub(g->canvas_point, g->eye), t);
 	*out_height = height_fraction * g->canvas_height * t;
 }
+
+
+/*
+ *
+ * Phase 3a: the depth-layer source.
+ *
+ */
+
+bool
+u_cursor_depth_patch_should_sample(const struct u_cursor_depth_patch_request *req)
+{
+	if (req == NULL || !req->requested) {
+		return false;
+	}
+	if (!(req->u >= 0.0f && req->u <= 1.0f && req->v >= 0.0f && req->v <= 1.0f)) {
+		return false; // also rejects NaN
+	}
+	return req->radius_u > 0.0f && req->radius_v > 0.0f && isfinite(req->radius_u) && isfinite(req->radius_v);
+}
+
+bool
+u_cursor_depth_patch_rect(const struct u_cursor_depth_patch_request *req,
+                          int32_t sub_x,
+                          int32_t sub_y,
+                          int32_t sub_w,
+                          int32_t sub_h,
+                          int32_t *out_x,
+                          int32_t *out_y,
+                          int32_t *out_w,
+                          int32_t *out_h)
+{
+	if (sub_w <= 0 || sub_h <= 0) {
+		return false;
+	}
+	const float half = (float)U_CURSOR_DEPTH_PATCH_MAX_DIM * 0.5f;
+	float rx = req->radius_u * (float)sub_w;
+	float ry = req->radius_v * (float)sub_h;
+	rx = rx > half ? half : rx;
+	ry = ry > half ? half : ry;
+	const float cx = (float)sub_x + req->u * (float)sub_w;
+	const float cy = (float)sub_y + req->v * (float)sub_h;
+	int32_t x0 = (int32_t)floorf(cx - rx);
+	int32_t y0 = (int32_t)floorf(cy - ry);
+	int32_t x1 = (int32_t)ceilf(cx + rx);
+	int32_t y1 = (int32_t)ceilf(cy + ry);
+	x0 = x0 < sub_x ? sub_x : x0;
+	y0 = y0 < sub_y ? sub_y : y0;
+	x1 = x1 > sub_x + sub_w ? sub_x + sub_w : x1;
+	y1 = y1 > sub_y + sub_h ? sub_y + sub_h : y1;
+	x1 = x1 - x0 > U_CURSOR_DEPTH_PATCH_MAX_DIM ? x0 + U_CURSOR_DEPTH_PATCH_MAX_DIM : x1;
+	y1 = y1 - y0 > U_CURSOR_DEPTH_PATCH_MAX_DIM ? y0 + U_CURSOR_DEPTH_PATCH_MAX_DIM : y1;
+	if (x1 <= x0 || y1 <= y0) {
+		return false;
+	}
+	*out_x = x0;
+	*out_y = y0;
+	*out_w = x1 - x0;
+	*out_h = y1 - y0;
+	return true;
+}
+
+bool
+u_cursor_depth_reduce_patch(const float *texels,
+                            int32_t w,
+                            int32_t h,
+                            int32_t row_stride,
+                            bool nearest_is_max,
+                            int32_t *out_x,
+                            int32_t *out_y,
+                            float *out_raw)
+{
+	if (texels == NULL || w <= 0 || h <= 0 || row_stride < w) {
+		return false;
+	}
+	bool found = false;
+	float best = 0.0f;
+	for (int32_t y = 0; y < h; y++) {
+		const float *row = texels + (size_t)y * (size_t)row_stride;
+		for (int32_t x = 0; x < w; x++) {
+			const float d = row[x];
+			if (!isfinite(d)) {
+				continue;
+			}
+			if (!found || (nearest_is_max ? d > best : d < best)) {
+				found = true;
+				best = d;
+				*out_x = x;
+				*out_y = y;
+			}
+		}
+	}
+	if (found) {
+		*out_raw = best;
+	}
+	return found;
+}
+
+bool
+u_cursor_depth_linear_depth(const struct u_cursor_depth_layer_depth *d, float raw_depth, float *out_z)
+{
+	const float range = d->max_depth - d->min_depth;
+	if (!(range > 0.0f) || !isfinite(range) || !isfinite(raw_depth) || !(d->near_z > 0.0f) || !(d->far_z > 0.0f) ||
+	    d->near_z == d->far_z) {
+		return false; // the > 0 tests also reject NaN
+	}
+	// s = 0 at the near_z end, 1 at the far_z end. A hair of slack absorbs
+	// float noise at either end without accepting garbage.
+	float s = (raw_depth - d->min_depth) / range;
+	if (s < -1e-4f || s > 1.0f + 1e-4f) {
+		return false;
+	}
+	s = s < 0.0f ? 0.0f : (s > 1.0f ? 1.0f : s);
+
+	// The plane at the FAR end of the mapping is where a cleared depth buffer
+	// sits: background, not content. Ordinary Z (near_z < far_z) clears to
+	// s = 1, reversed Z (near_z > far_z) to s = 0.
+	const bool reversed = d->near_z > d->far_z;
+	const float eps = 1e-6f;
+	if ((!reversed && s >= 1.0f - eps) || (reversed && s <= eps)) {
+		return false;
+	}
+
+	// 1/z is linear in window depth for every perspective projection: D3D,
+	// Vulkan and Metal [0,1] clip depth and GL [-1,1] NDC (with the default
+	// glDepthRange) all land on the same window-depth hyperbola. An infinite
+	// plane contributes 1/inf = 0.
+	const double inv_n = isinf(d->near_z) ? 0.0 : 1.0 / (double)d->near_z;
+	const double inv_f = isinf(d->far_z) ? 0.0 : 1.0 / (double)d->far_z;
+	const double inv_z = inv_n + (double)s * (inv_f - inv_n);
+	if (!(inv_z > 0.0)) {
+		return false;
+	}
+	const double z = 1.0 / inv_z;
+	if (!isfinite(z)) {
+		return false;
+	}
+	*out_z = (float)z;
+	return true;
+}
+
+bool
+u_cursor_depth_point_from_depth_sample(const struct u_cursor_depth_view *view,
+                                       const struct u_cursor_depth_layer_depth *d,
+                                       float su,
+                                       float sv,
+                                       float raw_depth,
+                                       struct xrt_vec3 *out_point)
+{
+	float z;
+	if (!isfinite(su) || !isfinite(sv) || !u_cursor_depth_linear_depth(d, raw_depth, &z)) {
+		return false;
+	}
+	// view_ray() is built in tangent space with z = -1 before rotation, so
+	// scaling it by the view-space distance z lands exactly on the point.
+	const struct xrt_vec3 dir = view_ray(view, su, sv);
+	const struct xrt_vec3 p = v3_add_scaled(view->pose.position, dir, z);
+	if (!v3_finite(p)) {
+		return false;
+	}
+	*out_point = p;
+	return true;
+}
