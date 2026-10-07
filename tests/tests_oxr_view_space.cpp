@@ -97,14 +97,16 @@ constexpr float kPosTolM = 0.001f;    // 1 mm
 
 /*!
  * Multi-screen M3: PRIMARY_MULTIVIEW_DXR reports one view set per window
- * segment — the device max x XRT_MAX_SEGMENTS (2), capped at XRT_MAX_VIEWS (8).
- * A window on one display locates its active views first and aliases the rest.
+ * segment the system can ever weave — the device max on a box that cannot split
+ * a window (one DP-backed screen, a service session, non-Linux), the device max
+ * x 2 (capped at XRT_MAX_VIEWS = 8) on desktop Linux with two DP-backed screens.
+ * Which one this test box is depends on its monitors, so both are accepted.
  */
-uint32_t
-multiview_count(uint32_t device_max)
+bool
+is_multiview_count(size_t n, uint32_t device_max)
 {
-	const uint32_t n = device_max * 2;
-	return n > 8 ? 8 : n;
+	const uint32_t two = device_max * 2 > 8 ? 8 : device_max * 2;
+	return n == device_max || n == two;
 }
 constexpr float kAngTolDeg = 0.1f;    // 0.1 degree
 
@@ -955,7 +957,7 @@ TEST_CASE("VIEW tracks the reported view array under MULTIVIEW (#1502)", "[oxr][
 	const uint32_t device_max = rt.device_max_view_count();
 	INFO("reported views = " << v.size() << ", device max = " << device_max);
 	if (device_max != 0) {
-		CHECK(v.size() == multiview_count(device_max));
+		CHECK(is_multiview_count(v.size(), device_max));
 	}
 
 	const XrPosef T_local_view = rt.locate(rt.view, rt.local, t);
@@ -1004,7 +1006,7 @@ TEST_CASE("XR_DXR_display_info advertises PRIMARY_MULTIVIEW_DXR (#1486)", "[oxr]
 	{
 		// PRIMARY_STEREO means exactly 2, whatever the device can drive.
 		CHECK(rt.config_view_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) == 2);
-		CHECK(rt.config_view_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR) == multiview_count(device_max));
+		CHECK(is_multiview_count(rt.config_view_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR), device_max));
 		// A valid core type the system does NOT advertise is still refused.
 		CHECK(rt.config_view_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MONO) == 0);
 	}
@@ -1015,7 +1017,7 @@ TEST_CASE("XR_DXR_display_info advertises PRIMARY_MULTIVIEW_DXR (#1486)", "[oxr]
 
 		uint32_t n = 0;
 		CHECK(rt.locate_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR, t, &n) == XR_SUCCESS);
-		CHECK(n == multiview_count(device_max));
+		CHECK(is_multiview_count(n, device_max));
 
 		// Same session, the OTHER advertised configuration: valid enum, wrong
 		// session - UNSUPPORTED, not VALIDATION_FAILURE.
@@ -1024,7 +1026,7 @@ TEST_CASE("XR_DXR_display_info advertises PRIMARY_MULTIVIEW_DXR (#1486)", "[oxr]
 
 		// And the full locate really writes that many views.
 		std::vector<XrView> v = rt.views(rt.local, t, nullptr, nullptr);
-		CHECK(v.size() == multiview_count(device_max));
+		CHECK(is_multiview_count(v.size(), device_max));
 	}
 
 	tear_down(rt);

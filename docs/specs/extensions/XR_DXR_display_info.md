@@ -1263,10 +1263,13 @@ typedef struct XrViewDisplayBindingsDXR {   // chained on XrViewState at xrLocat
 } XrViewDisplayBindingsDXR;
 ```
 
-**The view count.** `PRIMARY_MULTIVIEW_DXR` now reports `device max views ×
-XRT_MAX_SEGMENTS` (capped at 8; `XRT_MAX_SEGMENTS` is 2 today — the plan's eventual cap is
-4): 4 on a 2-view Leia system, 8 on the 4-view sim_display. The count is fixed for the
-session (ADR-041). A window on one display locates exactly what it did before — the
+**The view count.** `PRIMARY_MULTIVIEW_DXR` reports `device max views × the system's
+view-set capacity` (capped at 8). The capacity is `min(XRT_MAX_SEGMENTS, screens with a
+display processor)` where a window can be woven per segment at all (desktop Linux,
+in-process), else 1 — so a single-screen system and every other platform report exactly
+the pre-M3 count; a Linux box with a DS1 next to its laptop panel reports 4 (Leia) or 8
+(sim_display). `XRT_MAX_SEGMENTS` is 2 today (the plan's eventual cap is 4). The count is
+fixed for the session (ADR-041). A window on one display locates exactly what it did before — the
 active mode's views first, the larger tail aliased onto view 0 — so the only visible
 change for such an app is the bigger count. Per-view recommended image sizes stay the
 worst case (full canvas × scale). `PRIMARY_STEREO` stays exactly 2.

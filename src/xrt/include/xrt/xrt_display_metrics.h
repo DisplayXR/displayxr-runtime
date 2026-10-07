@@ -126,8 +126,9 @@ struct xrt_window_metrics
  * Max window segments that get their own views (multi-screen M3, ADR-047 D3).
  *
  * A `PRIMARY_MULTIVIEW_DXR` session advertises `device max views x
- * XRT_MAX_SEGMENTS` views (capped at XRT_MAX_VIEWS), so a window spanning up to
- * this many screens can carry one view set per screen. The plan's eventual cap
+ * min(XRT_MAX_SEGMENTS, DP-backed screens)` views (capped at XRT_MAX_VIEWS) on a
+ * system that can segment windows, so a window spanning up to this many screens
+ * can carry one view set per screen; elsewhere the pre-M3 device max. The plan's eventual cap
  * is 4; 2 covers every two-monitor layout and keeps the 8-view sim quad mode
  * inside XRT_MAX_VIEWS. A window covering more screens keeps one view set for
  * the whole window (the M2 crop path).
