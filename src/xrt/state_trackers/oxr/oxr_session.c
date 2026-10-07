@@ -2502,6 +2502,9 @@ struct oxr_locate_segment
 	//! segment's virtual canvas is offset by m2v times this.
 	float rig_dx;
 	float rig_dy;
+	//! A display rig's virtual display height factor for this canvas (its
+	//! share of the window's height, oxr_segment_views_vdh_scale); 0 = 1.
+	float vdh_scale;
 	//! Views this call locates (the per-segment count); 0 = the session's.
 	uint32_t view_count;
 	//! Publish session-level side effects (#1502 VIEW offset, #441 tracking
@@ -3282,6 +3285,11 @@ locate_views_one(struct oxr_logger *log,
 						dt.parallax_factor = active_rig->parallax_factor;
 						dt.perspective_factor = active_rig->perspective_factor;
 						dt.virtual_display_height = active_rig->virtual_display_height;
+						// Multi-screen M3: the rig sizes the WINDOW; this
+						// canvas is its share of it (one m2v for all segments).
+						if (seg != NULL && seg->vdh_scale > 0.0f) {
+							dt.virtual_display_height *= seg->vdh_scale;
+						}
 					} else {
 						dt.virtual_display_height = screen_height_m; // identity m2v
 					}
@@ -4166,6 +4174,7 @@ locate_segment_override(const struct xrt_segment_metrics *m,
 
 	o->rig_dx = l->seg[i].ref_cx - l->window_ref_cx;
 	o->rig_dy = l->seg[i].ref_cy - l->window_ref_cy;
+	o->vdh_scale = oxr_segment_views_vdh_scale(l, i);
 }
 
 static void

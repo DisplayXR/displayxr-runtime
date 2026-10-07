@@ -120,6 +120,10 @@ struct oxr_segment_layout
 	//! whole window's centre sits, so a window-centred rig (XR_DXR_view_rig's
 	//! display rig) can be offset per segment.
 	float window_ref_cx, window_ref_cy;
+	//! Size of that union, reference metres: the whole window's extent. A
+	//! display rig maps the WINDOW's height to its virtual display height, so
+	//! each segment gets that height scaled by its share (one m2v for all).
+	float window_ref_w, window_ref_h;
 };
 
 /*!
@@ -159,6 +163,23 @@ oxr_segment_views_window_metrics(const struct xrt_segment_metrics *m,
  */
 void
 oxr_segment_views_whole_window_metrics(const struct xrt_segment_metrics *m, uint32_t i, struct xrt_window_metrics *out);
+
+/*!
+ * The factor a window-centred display rig's virtual display height takes for
+ * segment @p i: its height over the whole window's (`h_seg / union_h`), so
+ * `m2v = vH * factor / h_seg = vH / union_h` is the SAME for every segment —
+ * stacked screens are not magnified 2x per half, and side-by-side panels of
+ * different pitch meet at the seam without a gap or an overlap. 1 when the
+ * union is unknown.
+ */
+static inline float
+oxr_segment_views_vdh_scale(const struct oxr_segment_layout *l, uint32_t i)
+{
+	if (l == NULL || i >= l->count || l->window_ref_h <= 0.0f) {
+		return 1.0f;
+	}
+	return l->seg[i].h_m / l->window_ref_h;
+}
 
 /*!
  * The translation that carries a point in segment @p i's own display space into
