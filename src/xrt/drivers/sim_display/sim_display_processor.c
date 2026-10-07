@@ -399,6 +399,15 @@ sim_dp_process_atlas(struct xrt_display_processor *xdp,
 	// always confines the draw (viewport + scissor) to the canvas; a SEGMENT
 	// DP additionally confines the clear and the layout contract to it, so
 	// the segments a sibling DP already wove survive.
+	//
+	// Confining the draw is deliberate for EVERY caller, bound or not: it is
+	// the DP contract (process_atlas: the canvas is the region the DP
+	// writes; comp_multi passes its zone-3D rect so "the DP confines the
+	// weave to it"), and the split path needs it from the unbound primary.
+	// It differs from pre-M2 only when the canvas is smaller than the
+	// target — the window-shrink transient before the swapchain catches up,
+	// the shared-texture path, a comp_multi zone canvas — where the old pass
+	// stretched a canvas-sized atlas over the whole target.
 	const bool preserve = !full_target && sdp->screen_bound && sdp->render_pass_preserve != VK_NULL_HANDLE;
 	VkClearValue clear_value = {.color = {{0.0f, 0.0f, 0.0f, sdp->transparent_bg ? 0.0f : 1.0f}}};
 	VkRenderPassBeginInfo rp_begin = {
@@ -429,10 +438,14 @@ sim_dp_process_atlas(struct xrt_display_processor *xdp,
 	    .tile_rows = (float)tile_rows,
 	    // #817: the interlace phase. The panel column of a fragment is
 	    // gl_FragCoord.x (target px, so it already includes the canvas
-	    // offset) + the target's origin on the panel. With a present origin
-	    // (ADR-033) that origin is known exactly; without one, the pre-M2
-	    // proxy (the canvas offset) stands, byte-for-byte.
-	    .phase_px = sdp->have_present_origin ? (float)sdp->present_origin_x : (float)canvas_offset_x,
+	    // offset) + the target's origin on the panel. A SEGMENT DP (bound to
+	    // a screen, multi-screen M2) knows that origin exactly from
+	    // set_present_origin. The unbound DP — every pre-M2 caller — keeps
+	    // the pre-M2 proxy (the canvas offset) byte-for-byte, whatever origin
+	    // it was fed: it reports its panel at (0,0), so an origin relative to
+	    // a panel elsewhere would put the phase on the wrong lattice.
+	    .phase_px = (sdp->screen_bound && sdp->have_present_origin) ? (float)sdp->present_origin_x
+	                                                                : (float)canvas_offset_x,
 	    .period_px = (float)sdp->interlace_period_px,
 	};
 	vk->vkCmdPushConstants(cmd_buffer, sdp->pipeline_layout,
