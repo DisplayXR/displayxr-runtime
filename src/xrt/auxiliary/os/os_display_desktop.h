@@ -157,6 +157,10 @@ struct os_display_desktop_info
 
 	//! Where @ref native_width / @ref native_height came from.
 	enum os_display_native_source native_source;
+
+	//! Refresh of that device mode in milli-Hz, when the source reports it
+	//! (Mutter DisplayConfig does; DRM sysfs does not). 0 = unknown.
+	uint32_t native_refresh_mhz;
 	/*! @} */
 };
 

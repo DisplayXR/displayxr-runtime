@@ -203,7 +203,7 @@ TEST_CASE("join: RandR output names tie to DRM connectors by name")
 	CHECK(std::string(out[0].connector) == "card1-eDP-1");
 	CHECK(out[0].physical_width_mm == 300);
 	CHECK(out[0].native_width == 2880);
-	CHECK(out[0].refresh_hz == 0); // no detailed timing to read it from
+	CHECK(out[0].refresh_hz == 0); // no detailed timing, no compositor refresh
 
 	CHECK(out[1].join == OS_EDID_JOIN_NAME);
 	CHECK(out[1].manufacturer_id == ACR_RAW);
@@ -218,6 +218,21 @@ TEST_CASE("join: RandR output names tie to DRM connectors by name")
 	CHECK(out[1].refresh_hz == 60);
 	CHECK_FALSE(out[1].is_primary);
 	CHECK_FALSE(out[1].origin_unknown);
+}
+
+TEST_CASE("join: refresh comes from the compositor's current mode when it reports one")
+{
+	os_display_desktop_info randr[2];
+	box_randr(randr);
+	randr[0].native_refresh_mhz = 120000; // eDP: no detailed timing in its EDID
+	randr[1].native_refresh_mhz = 59940;  // beats the DTD's 60 Hz guess
+	os_display_drm_connector drm[2];
+	box_drm(drm);
+
+	os_display_edid_monitor out[2] = {};
+	REQUIRE(os_display_edid_linux_join(randr, nullptr, 2, drm, 2, out, 2) == 2);
+	CHECK(out[0].refresh_hz == 120);
+	CHECK(out[1].refresh_hz == 60);
 }
 
 TEST_CASE("join: unrelated output names fall back to physical size")
