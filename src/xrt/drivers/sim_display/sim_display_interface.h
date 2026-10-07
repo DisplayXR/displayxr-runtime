@@ -196,6 +196,18 @@ void
 sim_display_get_panel_metrics(float *out_w_m, float *out_h_m, uint32_t *out_px_w, uint32_t *out_px_h);
 
 /*!
+ * The simulated panel's DEFAULT geometry — physical size (SIM_DISPLAY_WIDTH_M /
+ * SIM_DISPLAY_HEIGHT_M), nominal eye height and viewing distance
+ * (SIM_DISPLAY_NOMINAL_Z_M) — without a device. Used to describe a monitor
+ * whose EDID gives no physical size (multi-screen M1,
+ * get_display_info_for_monitor). Any out-param may be NULL.
+ *
+ * @ingroup drv_sim_display
+ */
+void
+sim_display_get_default_viewer(float *out_w_m, float *out_h_m, float *out_nominal_y_m, float *out_nominal_z_m);
+
+/*!
  * Create a simulated 3D display HMD device.
  *
  * Display properties are configurable via environment variables:

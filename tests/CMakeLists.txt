@@ -48,6 +48,7 @@ set(tests
     tests_aux_mini_window_tell
     tests_aux_zone_canvas
     tests_aux_tiling_zero_copy
+    tests_aux_screen_info
     tests_aux_tiling_row_origin
     tests_aux_wayland_geom
     tests_comp_wl_move_sync_tag
@@ -260,6 +261,11 @@ endif()
 # ADR-030/ADR-041 -- u_tiling_can_zero_copy(), the sole zero-copy gate. Header
 # arithmetic only; it reads xrt_rendering_mode, hence xrt-interfaces.
 target_link_libraries(tests_aux_tiling_zero_copy PRIVATE xrt-interfaces)
+
+# Multi-screen M1 -- per-screen display-info derivation (u_screen_info.h):
+# system-default / plug-in per-monitor slot / EDID-derived rules. Header only;
+# it reads the plug-in ABI structs, hence xrt-interfaces.
+target_link_libraries(tests_aux_screen_info PRIVATE xrt-interfaces)
 
 # #1625 -- the atlas tile ROW ORIGIN: view 0 is the top-left tile as displayed,
 # on every backend. The GL-vs-everyone-else disagreement was two lines of
