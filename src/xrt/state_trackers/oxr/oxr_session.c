@@ -4201,13 +4201,12 @@ locate_fill_bindings(struct oxr_session *sess, XrViewState *viewState, const str
 
 //! One INFO line per change of the per-segment view layout (never per frame).
 static void
-locate_log_route_change(struct oxr_session *sess)
+locate_log_route_change(struct oxr_session *sess, const struct xrt_segment_view_routing *r)
 {
-	if (memcmp(&sess->seg_route, &sess->seg_route_logged, sizeof(sess->seg_route)) == 0) {
+	if (memcmp(r, &sess->seg_route_logged, sizeof(*r)) == 0) {
 		return;
 	}
-	sess->seg_route_logged = sess->seg_route;
-	const struct xrt_segment_view_routing *r = &sess->seg_route;
+	sess->seg_route_logged = *r;
 	if (r->count == 0) {
 		U_LOG_I("per-segment views: off — one view set for the whole window");
 		return;
@@ -4222,6 +4221,13 @@ locate_log_route_change(struct oxr_session *sess)
 		              r->rect[k].extent.w, r->rect[k].extent.h);
 	}
 	U_LOG_I("per-segment views: %u segment(s): %s", r->count, buf);
+}
+
+void
+oxr_session_take_segment_view_routing(struct oxr_session *sess, struct xrt_segment_view_routing *out)
+{
+	oxr_segment_views_route_take(&sess->seg_route, out);
+	locate_log_route_change(sess, out);
 }
 
 XrResult
@@ -4241,9 +4247,10 @@ oxr_session_locate_views(struct oxr_logger *log,
 		XrResult ret = locate_views_one(log, sess, viewLocateInfo, viewState, viewCapacityInput,
 		                                viewCountOutput, views, NULL);
 		if (viewCapacityInput > 0 && ret == XR_SUCCESS) {
-			sess->seg_route.count = 0;
-			locate_fill_bindings(sess, viewState, &sess->seg_route);
-			locate_log_route_change(sess);
+			// One view set: no bindings. The frame's routing record is
+			// NOT touched — only a splitting locate writes it.
+			const struct xrt_segment_view_routing none = {0};
+			locate_fill_bindings(sess, viewState, &none);
 		}
 		return ret;
 	}
@@ -4282,9 +4289,10 @@ oxr_session_locate_views(struct oxr_logger *log,
 			                       views, o.wm.valid ? &o : NULL);
 		}
 		if (viewCapacityInput > 0 && ret == XR_SUCCESS) {
-			sess->seg_route.count = 0;
-			locate_fill_bindings(sess, viewState, &sess->seg_route);
-			locate_log_route_change(sess);
+			// One view set: no bindings. The frame's routing record is
+			// NOT touched — only a splitting locate writes it.
+			const struct xrt_segment_view_routing none = {0};
+			locate_fill_bindings(sess, viewState, &none);
 		}
 		return ret;
 	}
@@ -4325,9 +4333,10 @@ oxr_session_locate_views(struct oxr_logger *log,
 		XrResult ret = locate_views_one(log, sess, viewLocateInfo, viewState, viewCapacityInput,
 		                                viewCountOutput, views, NULL);
 		if (viewCapacityInput > 0 && ret == XR_SUCCESS) {
-			sess->seg_route.count = 0;
-			locate_fill_bindings(sess, viewState, &sess->seg_route);
-			locate_log_route_change(sess);
+			// One view set: no bindings. The frame's routing record is
+			// NOT touched — only a splitting locate writes it.
+			const struct xrt_segment_view_routing none = {0};
+			locate_fill_bindings(sess, viewState, &none);
 		}
 		return ret;
 	}
@@ -4397,18 +4406,18 @@ oxr_session_locate_views(struct oxr_logger *log,
 	}
 #endif
 
-	struct xrt_segment_view_routing *r = &sess->seg_route;
-	memset(r, 0, sizeof(*r));
-	r->count = m.count;
-	r->canvas = m.canvas;
+	struct xrt_segment_view_routing route;
+	memset(&route, 0, sizeof(route));
+	route.count = m.count;
+	route.canvas = m.canvas;
 	for (uint32_t k = 0; k < m.count; k++) {
-		r->screen_id[k] = m.seg[k].screen_id;
-		r->rect[k] = m.seg[k].window_rect;
-		r->first_view[k] = first[k];
-		r->view_count[k] = cnt[k];
+		route.screen_id[k] = m.seg[k].screen_id;
+		route.rect[k] = m.seg[k].window_rect;
+		route.first_view[k] = first[k];
+		route.view_count[k] = cnt[k];
 	}
-	locate_fill_bindings(sess, viewState, r);
-	locate_log_route_change(sess);
+	oxr_segment_views_route_record(&sess->seg_route, &route);
+	locate_fill_bindings(sess, viewState, &route);
 	return oxr_session_success_result(sess);
 }
 

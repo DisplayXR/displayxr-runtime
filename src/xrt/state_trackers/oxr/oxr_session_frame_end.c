@@ -3144,7 +3144,9 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 	// segment — what the app's last xrLocateViews handed out. The compositor
 	// routes each segment's tiles to that segment's display processor.
 	if (sess->is_vk_native_compositor && sess->xcn != NULL) {
-		comp_vk_native_compositor_set_view_routing(&sess->xcn->base, &sess->seg_route);
+		struct xrt_segment_view_routing route;
+		oxr_session_take_segment_view_routing(sess, &route);
+		comp_vk_native_compositor_set_view_routing(&sess->xcn->base, &route);
 	}
 #endif
 

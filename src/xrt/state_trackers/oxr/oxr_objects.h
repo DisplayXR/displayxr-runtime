@@ -1024,6 +1024,14 @@ oxr_session_set_workspace_view_rig(struct oxr_logger *log, struct oxr_session *s
 XRT_CHECK_RESULT XrResult
 oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess);
 
+/*!
+ * Multi-screen M3: take this frame's per-segment view routing (what the last
+ * SPLITTING xrLocateViews of the frame handed out; count 0 when none split)
+ * and reset the record for the next frame. Called once per xrEndFrame.
+ */
+void
+oxr_session_take_segment_view_routing(struct oxr_session *sess, struct xrt_segment_view_routing *out);
+
 XrResult
 oxr_session_locate_views(struct oxr_logger *log,
                          struct oxr_session *sess,
