@@ -18,6 +18,7 @@
 #include "xrt/xrt_defines.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_display_metrics.h"
+#include "util/u_cursor_depth.h"
 
 // Forward declarations
 struct xrt_system_devices;
@@ -238,6 +239,24 @@ comp_metal_compositor_set_sys_info(struct xrt_compositor *xc,
  */
 void
 comp_metal_compositor_set_source_gl(struct xrt_compositor *xc);
+
+/*!
+ * XR_DXR_cursor_depth v2 (ADR-046 Phase 3a): read a cursor-sized patch of the
+ * submitted depth at the NEXT layer_commit only. Called by the state tracker
+ * only on a frame whose locate chained XrCursorDepthSourceDXR; a compositor
+ * never handed a request does no cursor work at all.
+ */
+void
+comp_metal_compositor_set_cursor_depth_request(struct xrt_compositor *xc,
+                                               const struct u_cursor_depth_patch_request *req);
+
+/*!
+ * The newest finished depth-patch read (asynchronous: one or more frames old).
+ *
+ * @return out->valid.
+ */
+bool
+comp_metal_compositor_get_cursor_depth_result(struct xrt_compositor *xc, struct u_cursor_depth_patch_result *out);
 
 /*!
  * Get the MTLTexture (as void*) for a given swapchain image index.

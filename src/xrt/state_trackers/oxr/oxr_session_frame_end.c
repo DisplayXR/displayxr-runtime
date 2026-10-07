@@ -1895,6 +1895,70 @@ submit_quad_layer(struct oxr_session *sess,
 	return XR_SUCCESS;
 }
 
+#if defined(OXR_HAVE_DXR_cursor_depth) && defined(OXR_HAVE_KHR_composition_layer_depth)
+/*!
+ * XR_DXR_cursor_depth v2 (ADR-046 Phase 3a): this frame's locate asked for
+ * the depth-layer source, and this projection layer carries depth - record
+ * what the patch read will need to be turned back into a point, and hand the
+ * compositor its one-frame request.
+ *
+ * Only ever called on an ARMED frame (the caller's single bool test), so a
+ * session that never chained XrCursorDepthSourceDXR never gets here.
+ */
+static void
+cursor_depth_record_layer(struct oxr_session *sess, const XrCompositionLayerProjection *proj)
+{
+	sess->cursor_depth_source.armed = false; // first depth layer of the frame only
+
+	uint32_t n = sess->cursor_depth_source.active_view_count;
+	if (n > proj->viewCount) {
+		n = proj->viewCount;
+	}
+	if (n < 2) {
+		return; // 2D: nothing to read, the placement is inactive anyway
+	}
+
+	struct u_cursor_depth_patch_request req = {0};
+	req.requested = true;
+	req.tag = ++sess->cursor_depth_source.next_tag;
+	req.u = sess->cursor_depth_source.u;
+	req.v = sess->cursor_depth_source.v;
+	req.radius_u = sess->cursor_depth_source.radius_u;
+	req.radius_v = sess->cursor_depth_source.radius_v;
+	req.view_index[0] = 0;
+	req.view_index[1] = n - 1;
+	if (!u_cursor_depth_patch_should_sample(&req)) {
+		return;
+	}
+
+	const uint32_t slot = (uint32_t)(req.tag % ARRAY_SIZE(sess->cursor_depth_source.frames));
+	sess->cursor_depth_source.frames[slot].tag = req.tag;
+	sess->cursor_depth_source.frames[slot].space = proj->space;
+	for (uint32_t i = 0; i < U_CURSOR_DEPTH_PATCH_VIEWS; i++) {
+		const XrCompositionLayerProjectionView *pv = &proj->views[req.view_index[i]];
+		const XrCompositionLayerDepthInfoKHR *d = OXR_GET_INPUT_FROM_CHAIN(
+		    pv, XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR, XrCompositionLayerDepthInfoKHR);
+		// XrPosef/XrFovf are layout-identical to xrt_pose/xrt_fov.
+		sess->cursor_depth_source.frames[slot].view[i].pose = *(const struct xrt_pose *)&pv->pose;
+		sess->cursor_depth_source.frames[slot].view[i].fov = *(const struct xrt_fov *)&pv->fov;
+		sess->cursor_depth_source.frames[slot].depth[i] =
+		    (struct u_cursor_depth_layer_depth){d->minDepth, d->maxDepth, d->nearZ, d->farZ};
+		// Reversed Z flips which end is nearest. Mixed conventions across the
+		// two views would be odd; the first view's decides.
+		if (i == 0) {
+			req.nearest_is_max = d->nearZ > d->farZ;
+		}
+	}
+
+	if (!oxr_session_cursor_depth_hand_request(sess, &req) && !sess->cursor_depth_source.warned_no_reader) {
+		sess->cursor_depth_source.warned_no_reader = true;
+		U_LOG_W(
+		    "XR_DXR_cursor_depth: this compositor cannot read submitted depth yet - the depth-layer "
+		    "source reports no content (cursor on the display plane) (one-time warning)");
+	}
+}
+#endif
+
 static XrResult
 submit_projection_layer(struct oxr_session *sess,
                         struct xrt_compositor *xc,
@@ -1979,6 +2043,13 @@ submit_projection_layer(struct oxr_session *sess,
 #ifdef OXR_HAVE_KHR_composition_layer_depth
 		fill_in_depth_test(sess, (XrCompositionLayerBaseHeader *)proj, &data);
 		data.type = XRT_LAYER_PROJECTION_DEPTH;
+#ifdef OXR_HAVE_DXR_cursor_depth
+		// ADR-046 Phase 3a. ZERO COST UNLESS REQUESTED: one bool test, true
+		// only on a frame whose locate chained XrCursorDepthSourceDXR.
+		if (sess->cursor_depth_source.armed) {
+			cursor_depth_record_layer(sess, proj);
+		}
+#endif
 		xrt_result_t xret = xrt_comp_layer_projection_depth( //
 		    xc,                                              // compositor
 		    head,                                            // xdev
@@ -3130,6 +3201,21 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 
 	xret = xrt_comp_layer_commit(xc, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
 	OXR_CHECK_XRET(log, sess, xret, xrt_comp_layer_commit);
+
+#ifdef OXR_HAVE_DXR_cursor_depth
+	// ADR-046 Phase 3a: a request covers one frame. Still armed here means no
+	// projection layer carried depth (or XR_KHR_composition_layer_depth is
+	// not available), so nothing was read.
+	if (sess->cursor_depth_source.armed) {
+		sess->cursor_depth_source.armed = false;
+		if (!sess->cursor_depth_source.warned_no_layer) {
+			sess->cursor_depth_source.warned_no_layer = true;
+			U_LOG_W(
+			    "XR_DXR_cursor_depth: depth-layer source requested, but no projection layer carries "
+			    "XrCompositionLayerDepthInfoKHR - reporting no content (one-time warning)");
+		}
+	}
+#endif
 
 #if defined(OXR_HAVE_DXR_local_3d_zone) || defined(OXR_HAVE_EXT_view_configuration_views_change)
 	// #439 Phase 3 Q4 — view-size renegotiation poll. The just-committed

@@ -412,6 +412,38 @@ struct comp_metal_compositor
 
 	//! Per-frame capture intent. See u_capture_intent.h.
 	struct u_capture_intent capture_intent;
+
+	/*!
+	 * XR_DXR_cursor_depth v2, depth-layer source (ADR-046 Phase 3a).
+	 *
+	 * ZERO COST UNLESS REQUESTED: all zero/nil for a session that never
+	 * chained XrCursorDepthSourceDXR. layer_commit tests `req.requested` and
+	 * `in_flight` and does nothing else; the readback buffers are allocated
+	 * on the first real request only.
+	 */
+	struct
+	{
+		//! One-frame request from the state tracker, consumed by the next commit.
+		struct u_cursor_depth_patch_request req;
+		//! Shared readback buffers (2 views x 64 x 64 floats) and the command
+		//! buffer that fills each; polled for completion, never waited on.
+		id<MTLBuffer> buf[3];
+		id<MTLCommandBuffer> cb[3];
+		struct
+		{
+			uint64_t tag;
+			bool nearest_is_max;
+			bool has[U_CURSOR_DEPTH_PATCH_VIEWS];
+			int32_t x[U_CURSOR_DEPTH_PATCH_VIEWS], y[U_CURSOR_DEPTH_PATCH_VIEWS];
+			int32_t w[U_CURSOR_DEPTH_PATCH_VIEWS], h[U_CURSOR_DEPTH_PATCH_VIEWS];
+			struct xrt_rect sub[U_CURSOR_DEPTH_PATCH_VIEWS];
+		} meta[3];
+		uint32_t next_slot;
+		uint32_t in_flight;
+		bool announced;
+		//! Newest finished read; guarded by `mutex` (locate may be on another thread).
+		struct u_cursor_depth_patch_result result;
+	} cursor_depth;
 };
 
 /*
@@ -1436,6 +1468,11 @@ metal_compositor_create_swapchain(struct xrt_compositor *xc,
 	// IOSurface and allocate a plain array texture — the Metal native app gets
 	// the id<MTLTexture> directly via comp_metal_swapchain_get_texture().
 	const bool layered = info->array_size > 1;
+	// Depth swapchains (XR_KHR_composition_layer_depth): a depth format can
+	// neither be IOSurface-backed nor use shared storage on macOS, so it takes
+	// the GPU-private, no-IOSurface path the layered branch below uses. The
+	// compositor only ever reads one through a blit (ADR-046 3a cursor patch).
+	const bool is_depth = format == MTLPixelFormatDepth32Float;
 
 	for (uint32_t i = 0; i < msc->image_count; i++) {
 		MTLTextureDescriptor *desc = [MTLTextureDescriptor
@@ -1450,6 +1487,24 @@ metal_compositor_create_swapchain(struct xrt_compositor *xc,
 		desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
 		             MTLTextureUsagePixelFormatView;
 		desc.storageMode = MTLStorageModeShared;
+
+		if (is_depth) {
+			desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+			desc.storageMode = MTLStorageModePrivate;
+			if (layered) {
+				desc.textureType = MTLTextureType2DArray;
+				desc.arrayLength = info->array_size;
+			}
+			msc->iosurfaces[i] = NULL;
+			msc->images[i] = [c->device newTextureWithDescriptor:desc];
+			if (msc->images[i] == nil) {
+				U_LOG_E("Failed to create depth swapchain image %u", i);
+				metal_swapchain_destroy(&msc->base.base);
+				return XRT_ERROR_ALLOCATION;
+			}
+			msc->base.images[i].handle = (xrt_graphics_buffer_handle_t)0;
+			continue;
+		}
 
 		if (layered) {
 			desc.textureType = MTLTextureType2DArray;
@@ -3144,6 +3199,209 @@ metal_quad_pipeline_for(struct comp_metal_compositor *c, enum comp_layer_blend_m
 	}
 }
 
+/*
+ *
+ * XR_DXR_cursor_depth v2 - depth-layer source (ADR-046 Phase 3a)
+ *
+ * A requested frame copies a cursor-sized patch (<= 64x64) of the two
+ * outermost views' submitted depth into a small shared buffer on its own
+ * command buffer. A later commit sees that command buffer completed (a status
+ * poll, never a wait), reduces the patch to its nearest texel on the CPU and
+ * publishes it. Nothing here runs unless the state tracker handed a request.
+ *
+ */
+
+#define METAL_CURSOR_DEPTH_SLOT_BYTES                                                                                  \
+	((NSUInteger)U_CURSOR_DEPTH_PATCH_VIEWS * U_CURSOR_DEPTH_PATCH_MAX_DIM * U_CURSOR_DEPTH_PATCH_MAX_DIM *          \
+	 sizeof(float))
+
+//! Harvest every finished read; publish the newest. Never blocks on the GPU.
+static void
+metal_cursor_depth_harvest(struct comp_metal_compositor *c)
+{
+	for (uint32_t s = 0; s < ARRAY_SIZE(c->cursor_depth.cb); s++) {
+		id<MTLCommandBuffer> cb = c->cursor_depth.cb[s];
+		if (cb == nil) {
+			continue;
+		}
+		const MTLCommandBufferStatus st = cb.status;
+		if (st != MTLCommandBufferStatusCompleted && st != MTLCommandBufferStatusError) {
+			continue; // still in flight: look again next commit
+		}
+		[cb release];
+		c->cursor_depth.cb[s] = nil;
+		c->cursor_depth.in_flight--;
+		if (st != MTLCommandBufferStatusCompleted) {
+			continue;
+		}
+
+		struct u_cursor_depth_patch_result res = {0};
+		res.tag = c->cursor_depth.meta[s].tag;
+		const float *base = (const float *)c->cursor_depth.buf[s].contents;
+		for (uint32_t i = 0; i < U_CURSOR_DEPTH_PATCH_VIEWS; i++) {
+			if (!c->cursor_depth.meta[s].has[i]) {
+				continue;
+			}
+			const int32_t w = c->cursor_depth.meta[s].w[i];
+			const int32_t h = c->cursor_depth.meta[s].h[i];
+			const float *texels = base + (size_t)i * U_CURSOR_DEPTH_PATCH_MAX_DIM * U_CURSOR_DEPTH_PATCH_MAX_DIM;
+			int32_t px, py;
+			float raw;
+			if (!u_cursor_depth_reduce_patch(texels, w, h, w, c->cursor_depth.meta[s].nearest_is_max, &px, &py,
+			                                 &raw)) {
+				continue;
+			}
+			const struct xrt_rect *sub = &c->cursor_depth.meta[s].sub[i];
+			res.view[i].valid = true;
+			res.view[i].su = ((float)(c->cursor_depth.meta[s].x[i] + px) + 0.5f - (float)sub->offset.w) /
+			                 (float)sub->extent.w;
+			res.view[i].sv = ((float)(c->cursor_depth.meta[s].y[i] + py) + 0.5f - (float)sub->offset.h) /
+			                 (float)sub->extent.h;
+			if (c->source_is_gl) {
+				res.view[i].sv = 1.0f - res.view[i].sv; // GL content is bottom-up
+			}
+			res.view[i].raw_depth = raw;
+			res.valid = true;
+		}
+
+		os_mutex_lock(&c->mutex);
+		if (res.tag > c->cursor_depth.result.tag) {
+			c->cursor_depth.result = res;
+		}
+		os_mutex_unlock(&c->mutex);
+	}
+}
+
+//! Encode this frame's patch copies, if a slot is free. Never waits for one.
+static void
+metal_cursor_depth_sample(struct comp_metal_compositor *c, const struct u_cursor_depth_patch_request *req)
+{
+	struct comp_layer *layer = NULL;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		if (c->layer_accum.layers[i].data.type == XRT_LAYER_PROJECTION_DEPTH) {
+			layer = &c->layer_accum.layers[i];
+			break;
+		}
+	}
+	if (layer == NULL) {
+		return;
+	}
+
+	const uint32_t s = c->cursor_depth.next_slot;
+	if (c->cursor_depth.cb[s] != nil) {
+		return; // the GPU is three reads behind: skip a frame rather than stall
+	}
+	c->cursor_depth.next_slot = (s + 1) % ARRAY_SIZE(c->cursor_depth.cb);
+
+	if (c->cursor_depth.buf[s] == nil) {
+		// First real request: the only allocation this feature ever makes.
+		c->cursor_depth.buf[s] = [c->device newBufferWithLength:METAL_CURSOR_DEPTH_SLOT_BYTES
+		                                                options:MTLResourceStorageModeShared];
+		if (c->cursor_depth.buf[s] == nil) {
+			return;
+		}
+	}
+
+	// Created only once there is a copy to encode: an uncommitted command
+	// buffer would hold one of the queue's (app-owned, 64-deep) slots forever.
+	id<MTLCommandBuffer> cb = nil;
+	id<MTLBlitCommandEncoder> blit = nil;
+
+	c->cursor_depth.meta[s].tag = req->tag;
+	c->cursor_depth.meta[s].nearest_is_max = req->nearest_is_max;
+	bool any = false;
+	for (uint32_t i = 0; i < U_CURSOR_DEPTH_PATCH_VIEWS; i++) {
+		c->cursor_depth.meta[s].has[i] = false;
+		const uint32_t vi = req->view_index[i];
+		if (vi >= layer->data.view_count) {
+			continue;
+		}
+		struct xrt_swapchain *d_xsc = comp_layer_get_depth_swapchain(layer, vi);
+		if (d_xsc == NULL) {
+			continue;
+		}
+		const struct xrt_sub_image *sub = &layer->data.depth.d[vi].sub;
+		struct comp_metal_swapchain *msc = metal_swapchain(d_xsc);
+		if (sub->image_index >= msc->image_count || msc->images[sub->image_index] == nil) {
+			continue;
+		}
+		id<MTLTexture> tex = msc->images[sub->image_index];
+		if (tex.pixelFormat != MTLPixelFormatDepth32Float) {
+			continue; // the only depth format this compositor advertises
+		}
+		int32_t x, y, w, h;
+		// GL content is stored bottom-up: find the patch in storage rows
+		// (the harvest flips the found texel back to top-down).
+		struct u_cursor_depth_patch_request stored = *req;
+		if (c->source_is_gl) {
+			stored.v = 1.0f - stored.v;
+		}
+		if (!u_cursor_depth_patch_rect(&stored, sub->rect.offset.w, sub->rect.offset.h, sub->rect.extent.w,
+		                               sub->rect.extent.h, &x, &y, &w, &h)) {
+			continue;
+		}
+		if (x < 0 || y < 0 || (NSUInteger)(x + w) > tex.width || (NSUInteger)(y + h) > tex.height) {
+			continue;
+		}
+		if (blit == nil) {
+			cb = [c->command_queue commandBuffer];
+			blit = cb != nil ? [cb blitCommandEncoder] : nil;
+			if (blit == nil) {
+				return;
+			}
+		}
+		[blit copyFromTexture:tex
+		                 sourceSlice:(tex.textureType == MTLTextureType2DArray) ? sub->array_index : 0
+		                 sourceLevel:0
+		                sourceOrigin:MTLOriginMake((NSUInteger)x, (NSUInteger)y, 0)
+		                  sourceSize:MTLSizeMake((NSUInteger)w, (NSUInteger)h, 1)
+		                    toBuffer:c->cursor_depth.buf[s]
+		           destinationOffset:(NSUInteger)i * U_CURSOR_DEPTH_PATCH_MAX_DIM *
+		                             U_CURSOR_DEPTH_PATCH_MAX_DIM * sizeof(float)
+		      destinationBytesPerRow:(NSUInteger)w * sizeof(float)
+		    destinationBytesPerImage:(NSUInteger)w * (NSUInteger)h * sizeof(float)];
+		c->cursor_depth.meta[s].has[i] = true;
+		c->cursor_depth.meta[s].x[i] = x;
+		c->cursor_depth.meta[s].y[i] = y;
+		c->cursor_depth.meta[s].w[i] = w;
+		c->cursor_depth.meta[s].h[i] = h;
+		c->cursor_depth.meta[s].sub[i] = sub->rect;
+		any = true;
+	}
+	if (!any) {
+		return; // nothing encoded, no command buffer was created
+	}
+	[blit endEncoding];
+	[cb commit];
+	c->cursor_depth.cb[s] = [cb retain];
+	c->cursor_depth.in_flight++;
+
+	if (!c->cursor_depth.announced) {
+		c->cursor_depth.announced = true;
+		U_LOG_W("cursor_depth: Metal compositor reading a %ux%u-max depth patch per view for the cursor "
+		        "(ADR-046 3a, first request)",
+		        (unsigned)U_CURSOR_DEPTH_PATCH_MAX_DIM, (unsigned)U_CURSOR_DEPTH_PATCH_MAX_DIM);
+	}
+}
+
+void
+comp_metal_compositor_set_cursor_depth_request(struct xrt_compositor *xc,
+                                               const struct u_cursor_depth_patch_request *req)
+{
+	struct comp_metal_compositor *c = metal_comp(xc);
+	c->cursor_depth.req = *req;
+}
+
+bool
+comp_metal_compositor_get_cursor_depth_result(struct xrt_compositor *xc, struct u_cursor_depth_patch_result *out)
+{
+	struct comp_metal_compositor *c = metal_comp(xc);
+	os_mutex_lock(&c->mutex);
+	*out = c->cursor_depth.result;
+	os_mutex_unlock(&c->mutex);
+	return out->valid;
+}
+
 static xrt_result_t
 metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -3153,6 +3411,18 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// projection-done boundary (PROJECTION_ONLY, once cmd-buf split
 	// lands) or end of frame (POST_COMPOSE).
 	u_capture_intent_poll(&c->capture_intent, &c->mcp_capture);
+
+	// XR_DXR_cursor_depth v2 (ADR-046 3a). ZERO COST UNLESS REQUESTED: two
+	// field tests, both false for every session that never chained
+	// XrCursorDepthSourceDXR - no copy, no buffer, no command buffer. The
+	// request covers this commit only and is consumed here.
+	if (c->cursor_depth.req.requested || c->cursor_depth.in_flight > 0) {
+		metal_cursor_depth_harvest(c);
+		if (u_cursor_depth_patch_should_sample(&c->cursor_depth.req)) {
+			metal_cursor_depth_sample(c, &c->cursor_depth.req);
+		}
+		c->cursor_depth.req.requested = false;
+	}
 
 	// Frame timing for HUD
 	uint64_t now_ns = os_monotonic_get_ns();
@@ -4477,6 +4747,14 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	// 6. Release Metal resources (MRR — explicit release)
 	[c->atlas_texture release];
 	c->atlas_texture = nil;
+	// XR_DXR_cursor_depth 3a readback slots (nil unless ever requested); the
+	// GPU drain above has already retired their command buffers.
+	for (uint32_t s = 0; s < ARRAY_SIZE(c->cursor_depth.buf); s++) {
+		[c->cursor_depth.cb[s] release];
+		c->cursor_depth.cb[s] = nil;
+		[c->cursor_depth.buf[s] release];
+		c->cursor_depth.buf[s] = nil;
+	}
 	[c->depth_texture release];
 	c->depth_texture = nil;
 	[c->projection_pipeline release];
