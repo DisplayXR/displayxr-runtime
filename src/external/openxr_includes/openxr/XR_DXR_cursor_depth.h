@@ -42,6 +42,12 @@
  * (drawing the cursor, measuring disparity from the atlas) will be a separate,
  * explicitly requested struct.
  *
+ * Spec v2 adds the first such struct, @ref XrCursorDepthSourceDXR: an app that
+ * already submits depth with its projection layer (XR_KHR_composition_layer_depth)
+ * chains it on the hint with XR_CURSOR_DEPTH_SOURCE_SUBMITTED_DEPTH_DXR and
+ * sends no nearest point; the runtime reads a cursor-sized patch of that depth
+ * itself (ADR-046 Phase 3a).
+ *
  * One call, one space. The hint is chained on XrViewLocateInfo::next and the
  * result on XrViewState::next of the SAME xrLocateViews call, and both are in
  * XrViewLocateInfo::space. The hint normally comes from the previous frame's
@@ -64,13 +70,15 @@ extern "C" {
 #endif
 
 #define XR_DXR_cursor_depth 1
-#define XR_DXR_cursor_depth_SPEC_VERSION 1
+#define XR_DXR_cursor_depth_SPEC_VERSION 2
 #define XR_DXR_CURSOR_DEPTH_EXTENSION_NAME "XR_DXR_cursor_depth"
 
 // Reserved 1004999320-329 (next free decade after stereo_camera's 310-319).
 // Final values reconcile with the Khronos registry before spec freeze.
 #define XR_TYPE_CURSOR_DEPTH_HINT_DXR ((XrStructureType)1004999320)
 #define XR_TYPE_CURSOR_DEPTH_PLACEMENT_DXR ((XrStructureType)1004999321)
+//! Spec v2 (ADR-046 Phase 3a).
+#define XR_TYPE_CURSOR_DEPTH_SOURCE_DXR ((XrStructureType)1004999322)
 
 // ---- Input: app chains this on XrViewLocateInfo::next; runtime reads it. ----
 
@@ -111,6 +119,53 @@ typedef struct XrCursorDepthHintDXR {
      */
     float cursorHeight;
 } XrCursorDepthHintDXR;
+
+// ---- Spec v2: where the nearest point comes from (ADR-046 Phase 3a). ----
+
+/*!
+ * @brief Who supplies the nearest content point under the cursor.
+ */
+typedef enum XrCursorDepthSourceKindDXR {
+    /*!
+     * v1 behaviour: the app supplies XrCursorDepthHintDXR::hasContent and
+     * ::nearestPoint itself. Same as not chaining XrCursorDepthSourceDXR.
+     */
+    XR_CURSOR_DEPTH_SOURCE_APP_POINT_DXR = 0,
+    /*!
+     * The runtime finds the nearest point itself, from the depth the app
+     * already submits with its projection layer (XR_KHR_composition_layer_depth,
+     * an XrCompositionLayerDepthInfoKHR on every XrCompositionLayerProjectionView).
+     * The hint's hasContent and nearestPoint are then IGNORED; cursorUV and
+     * cursorHeight still apply (the height sizes the footprint the runtime
+     * searches).
+     *
+     * Requirements: XR_KHR_composition_layer_depth enabled, and the projection
+     * layer's space the SAME XrSpace as XrViewLocateInfo::space. When either
+     * fails, or the compositor cannot read depth, the placement behaves as if
+     * hasContent were XR_FALSE (cursor on the display plane) - never an error.
+     *
+     * The answer is asynchronous: the depth read at frame N's xrEndFrame
+     * (a cursor-sized patch, copied without any GPU wait) reaches the
+     * placement one or two frames later.
+     */
+    XR_CURSOR_DEPTH_SOURCE_SUBMITTED_DEPTH_DXR = 1,
+    XR_CURSOR_DEPTH_SOURCE_KIND_MAX_ENUM_DXR = 0x7FFFFFFF
+} XrCursorDepthSourceKindDXR;
+
+/*!
+ * @brief Optional, chained on XrCursorDepthHintDXR::next (spec v2).
+ *
+ * Chaining it with XR_CURSOR_DEPTH_SOURCE_SUBMITTED_DEPTH_DXR IS the request
+ * for the runtime's depth read, and the request covers THIS frame only: chain
+ * it on every frame's hint for as long as you want the service. A frame
+ * without it costs the runtime nothing (ADR-046 section 0) - no GPU copy, no
+ * readback, no allocation.
+ */
+typedef struct XrCursorDepthSourceDXR {
+    XrStructureType            type;   //!< Must be XR_TYPE_CURSOR_DEPTH_SOURCE_DXR
+    const void* XR_MAY_ALIAS   next;
+    XrCursorDepthSourceKindDXR source;
+} XrCursorDepthSourceDXR;
 
 // ---- Result: app chains this on XrViewState::next; runtime fills it. ----
 

@@ -302,3 +302,237 @@ TEST_CASE("cursor_depth: head motion does not move the cursor on the glass (scre
 		}
 	}
 }
+
+
+/*
+ *
+ * Phase 3a: the depth-layer source (spec v2).
+ *
+ */
+
+namespace {
+
+// Window depth an ordinary [0,1]-clip-depth perspective projection (D3D,
+// Vulkan, Metal) writes for a point at view distance z.
+float
+window_depth_01(float n, float f, float z)
+{
+	return f / (f - n) * (1.0f - n / z);
+}
+
+// The same, through a GL [-1,1] NDC projection and the default glDepthRange.
+float
+window_depth_gl(float n, float f, float z)
+{
+	const float ndc = (f + n) / (f - n) - 2.0f * f * n / ((f - n) * z);
+	return 0.5f * ndc + 0.5f;
+}
+
+// Project a locate-space point into a view: sub-image coords (origin top-left)
+// and the view-space distance along -Z.
+void
+project(const u_cursor_depth_view &v, xrt_vec3 p, float &su, float &sv, float &z)
+{
+	const xrt_quat inv = {-v.pose.orientation.x, -v.pose.orientation.y, -v.pose.orientation.z,
+	                      v.pose.orientation.w};
+	const xrt_vec3 l = rotate(inv, {p.x - v.pose.position.x, p.y - v.pose.position.y, p.z - v.pose.position.z});
+	z = -l.z;
+	const float tx = l.x / z, ty = l.y / z;
+	const float tl = std::tan(v.fov.angle_left), tr = std::tan(v.fov.angle_right);
+	const float tu = std::tan(v.fov.angle_up), td = std::tan(v.fov.angle_down);
+	su = (tx - tl) / (tr - tl);
+	sv = (tu - ty) / (tu - td);
+}
+
+u_cursor_depth_patch_request
+live_request()
+{
+	u_cursor_depth_patch_request r{};
+	r.requested = true;
+	r.u = 0.5f;
+	r.v = 0.5f;
+	r.radius_u = 0.02f;
+	r.radius_v = 0.03f;
+	return r;
+}
+
+} // namespace
+
+TEST_CASE("cursor_depth source: a session that never asked does no compositor work (zero-cost gate)")
+{
+	// Every session's request starts zero-initialised; only a frame that
+	// chained XrCursorDepthSourceDXR(SUBMITTED_DEPTH) sets `requested`.
+	const u_cursor_depth_patch_request never{};
+	CHECK_FALSE(u_cursor_depth_patch_should_sample(&never));
+	CHECK_FALSE(u_cursor_depth_patch_should_sample(nullptr));
+
+	u_cursor_depth_patch_request r = live_request();
+	CHECK(u_cursor_depth_patch_should_sample(&r));
+
+	r.requested = false; // a later frame without the request
+	CHECK_FALSE(u_cursor_depth_patch_should_sample(&r));
+
+	r = live_request();
+	r.u = 1.2f; // cursor off the canvas
+	CHECK_FALSE(u_cursor_depth_patch_should_sample(&r));
+	r = live_request();
+	r.v = std::nanf("");
+	CHECK_FALSE(u_cursor_depth_patch_should_sample(&r));
+	r = live_request();
+	r.radius_u = 0.0f; // degenerate footprint
+	CHECK_FALSE(u_cursor_depth_patch_should_sample(&r));
+}
+
+TEST_CASE("cursor_depth source: the patch is the footprint in the sub-image, clamped and capped")
+{
+	u_cursor_depth_patch_request r = live_request();
+	int32_t x, y, w, h;
+	// 756 x 822 tile at (756, 0): centre (1134, 411), half-size (15.12, 24.66).
+	REQUIRE(u_cursor_depth_patch_rect(&r, 756, 0, 756, 822, &x, &y, &w, &h));
+	CHECK(x == 1118);
+	CHECK(y == 386);
+	CHECK(x + w == 1150);
+	CHECK(y + h == 436);
+
+	// Cursor in the corner: clamped to the sub-image, never outside it.
+	r.u = 0.0f;
+	r.v = 1.0f;
+	REQUIRE(u_cursor_depth_patch_rect(&r, 756, 0, 756, 822, &x, &y, &w, &h));
+	CHECK(x == 756);
+	CHECK(y + h == 822);
+	CHECK(w > 0);
+	CHECK(h > 0);
+
+	// A huge footprint on a big tile is capped to the max patch side.
+	r = live_request();
+	r.radius_u = r.radius_v = 0.5f;
+	REQUIRE(u_cursor_depth_patch_rect(&r, 0, 0, 3840, 2160, &x, &y, &w, &h));
+	CHECK(w <= U_CURSOR_DEPTH_PATCH_MAX_DIM);
+	CHECK(h <= U_CURSOR_DEPTH_PATCH_MAX_DIM);
+
+	CHECK_FALSE(u_cursor_depth_patch_rect(&r, 0, 0, 0, 100, &x, &y, &w, &h));
+}
+
+TEST_CASE("cursor_depth source: the patch reduces to its nearest texel, either Z convention")
+{
+	// 3 x 2 patch inside rows of stride 4 (the 4th column is padding).
+	const float nan = std::nanf("");
+	const float texels[] = {0.9f, 0.7f, nan,   -5.0f, //
+	                        0.8f, 0.6f, 0.95f, -5.0f};
+	int32_t x = -1, y = -1;
+	float raw = 0.0f;
+	REQUIRE(u_cursor_depth_reduce_patch(texels, 3, 2, 4, false, &x, &y, &raw));
+	CHECK(raw == 0.6f); // the padding's -5 is outside the patch
+	CHECK(x == 1);
+	CHECK(y == 1);
+	REQUIRE(u_cursor_depth_reduce_patch(texels, 3, 2, 4, true, &x, &y, &raw));
+	CHECK(raw == 0.95f);
+	CHECK(x == 2);
+	CHECK(y == 1);
+
+	const float all_nan[] = {nan, nan};
+	CHECK_FALSE(u_cursor_depth_reduce_patch(all_nan, 2, 1, 2, false, &x, &y, &raw));
+	CHECK_FALSE(u_cursor_depth_reduce_patch(texels, 3, 2, 2, false, &x, &y, &raw)); // stride < w
+}
+
+TEST_CASE("cursor_depth source: window depth -> distance, ordinary / GL / reversed / infinite / remapped")
+{
+	const float n = 0.1f, f = 100.0f;
+	float z = 0.0f;
+	for (float zt : {0.15f, 0.5f, 0.65f, 3.0f, 40.0f}) {
+		INFO("z = " << zt);
+		const u_cursor_depth_layer_depth ord{0.0f, 1.0f, n, f};
+		REQUIRE(u_cursor_depth_linear_depth(&ord, window_depth_01(n, f, zt), &z));
+		CHECK(z == Catch::Approx(zt).epsilon(1e-3));
+
+		// GL [-1,1] NDC lands on the same window hyperbola.
+		REQUIRE(u_cursor_depth_linear_depth(&ord, window_depth_gl(n, f, zt), &z));
+		CHECK(z == Catch::Approx(zt).epsilon(1e-3));
+
+		// Reversed Z: nearZ > farZ - minDepth holds the far plane.
+		const u_cursor_depth_layer_depth rev{0.0f, 1.0f, f, n};
+		REQUIRE(u_cursor_depth_linear_depth(&rev, 1.0f - window_depth_01(n, f, zt), &z));
+		CHECK(z == Catch::Approx(zt).epsilon(1e-3));
+
+		// Infinite far plane: w = 1 - n/z.
+		const u_cursor_depth_layer_depth inf{0.0f, 1.0f, n, INFINITY};
+		REQUIRE(u_cursor_depth_linear_depth(&inf, 1.0f - n / zt, &z));
+		CHECK(z == Catch::Approx(zt).epsilon(1e-3));
+
+		// Reversed + infinite: w = n/z.
+		const u_cursor_depth_layer_depth rinf{0.0f, 1.0f, INFINITY, n};
+		REQUIRE(u_cursor_depth_linear_depth(&rinf, n / zt, &z));
+		CHECK(z == Catch::Approx(zt).epsilon(1e-3));
+
+		// minDepth/maxDepth remap: the swapchain holds [0.2, 0.8].
+		const u_cursor_depth_layer_depth sub{0.2f, 0.8f, n, f};
+		REQUIRE(u_cursor_depth_linear_depth(&sub, 0.2f + 0.6f * window_depth_01(n, f, zt), &z));
+		CHECK(z == Catch::Approx(zt).epsilon(1e-3));
+	}
+
+	// The cleared background is not content, in either convention.
+	const u_cursor_depth_layer_depth ord{0.0f, 1.0f, n, f};
+	const u_cursor_depth_layer_depth rev{0.0f, 1.0f, f, n};
+	CHECK_FALSE(u_cursor_depth_linear_depth(&ord, 1.0f, &z));
+	CHECK_FALSE(u_cursor_depth_linear_depth(&rev, 0.0f, &z));
+	const u_cursor_depth_layer_depth inf{0.0f, 1.0f, n, INFINITY};
+	CHECK_FALSE(u_cursor_depth_linear_depth(&inf, 1.0f, &z));
+
+	// Out of range and degenerate ranges never produce a distance.
+	CHECK_FALSE(u_cursor_depth_linear_depth(&ord, 1.5f, &z));
+	CHECK_FALSE(u_cursor_depth_linear_depth(&ord, -0.5f, &z));
+	CHECK_FALSE(u_cursor_depth_linear_depth(&ord, std::nanf(""), &z));
+	const u_cursor_depth_layer_depth flat{0.5f, 0.5f, n, f};
+	CHECK_FALSE(u_cursor_depth_linear_depth(&flat, 0.5f, &z));
+	const u_cursor_depth_layer_depth same{0.0f, 1.0f, n, n};
+	CHECK_FALSE(u_cursor_depth_linear_depth(&same, 0.5f, &z));
+	const u_cursor_depth_layer_depth neg{0.0f, 1.0f, -n, f};
+	CHECK_FALSE(u_cursor_depth_linear_depth(&neg, 0.5f, &z));
+}
+
+TEST_CASE("cursor_depth source: a depth texel unprojects to the point it shows, in any rig")
+{
+	Xform x;
+	x.q = {0.0f, std::sin(0.3f), 0.0f, std::cos(0.3f)}; // yaw 0.6 rad
+	x.t = {1.0f, -2.0f, 0.5f};
+	x.s = 3.0f;
+	for (const Xform &xf : {Xform{}, x}) {
+		const u_cursor_depth_view v = kooima({-0.032f, 0.01f, 0.5f}, xf);
+		const float n = 0.01f * xf.s, f = 100.0f * xf.s;
+		for (xrt_vec3 local :
+		     {xrt_vec3{0.0f, 0.0f, 0.05f}, xrt_vec3{0.05f, -0.03f, 0.1f}, xrt_vec3{-0.1f, 0.06f, -0.08f}}) {
+			const xrt_vec3 p = apply(xf, local);
+			float su, sv, z;
+			project(v, p, su, sv, z);
+			xrt_vec3 got{};
+			const u_cursor_depth_layer_depth d{0.0f, 1.0f, n, f};
+			REQUIRE(u_cursor_depth_point_from_depth_sample(&v, &d, su, sv, window_depth_01(n, f, z), &got));
+			require_near(got, p, 2e-4f * xf.s);
+		}
+	}
+}
+
+TEST_CASE("cursor_depth source: the depth-layer point gives the same disparity as the app's own point")
+{
+	// The whole point of Phase 3a: feeding the unprojected nearest texel into
+	// the v1 path places the cursor exactly where the app's hit test would.
+	const u_cursor_depth_view a = kooima({-0.032f, 0.0f, 0.5f});
+	const u_cursor_depth_view b = kooima({0.032f, 0.0f, 0.5f});
+	u_cursor_depth_geometry g{};
+	REQUIRE(u_cursor_depth_geometry_solve(&a, &b, 0.5f, 0.5f, &g));
+
+	const xrt_vec3 p{0.0f, 0.0f, 0.06f}; // 6 cm in front of the canvas
+	float d_app = 0.0f;
+	REQUIRE(u_cursor_depth_point_disparity(&g, &p, &d_app));
+
+	for (const u_cursor_depth_view *v : {&a, &b}) {
+		float su, sv, z;
+		project(*v, p, su, sv, z);
+		const u_cursor_depth_layer_depth d{0.0f, 1.0f, 0.01f, 100.0f};
+		xrt_vec3 q{};
+		REQUIRE(u_cursor_depth_point_from_depth_sample(v, &d, su, sv, window_depth_01(0.01f, 100.0f, z), &q));
+		float d_layer = 0.0f;
+		REQUIRE(u_cursor_depth_point_disparity(&g, &q, &d_layer));
+		CHECK(d_layer == Catch::Approx(d_app).margin(1e-4));
+	}
+}
