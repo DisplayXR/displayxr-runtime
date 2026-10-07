@@ -28,6 +28,13 @@
  *   camera stop-all                              the user kill switch (IPC)
  *   camera sharing on|off                        the persistent sharing toggle (IPC)
  *   camera fake-lock on|off                      simulate the OS session lock (IPC, diagnostics)
+ *   camera uvc-devices [--modes]                 ADR-043 Amendment 4, LOCAL: the UVC stereo webcam
+ *                                                config (stereo-cameras.json) + the capture devices
+ *                                                present, each marked with the entry claiming it;
+ *                                                --modes lists the modes of CLAIMED devices only
+ *
+ * `list` prints each camera's source: "plugin" (the display plug-in's slots) or
+ * "uvc" (the service's own side-by-side webcam source; Amendment 4).
  *
  * `list` / `calib` / `probe` connect as the CAMERA_CONSUMER class (ADR-043 R3)
  * — the same class a browser's video-capture utility declares — so the CLI
@@ -78,6 +85,8 @@
 #include "os/os_time.h"
 #include "util/u_logging.h"
 #include "util/u_stereo_camera.h"
+#include "util/u_stereo_uvc.h"
+#include "os/os_uvc_capture.h"
 
 #include "client/ipc_client_connection.h"
 #include "client/ipc_client.h"
@@ -253,19 +262,32 @@ cmd_list(struct ipc_connection *ipc_c, bool json)
 		}
 		char flags[160];
 		flags_str(p.flags, flags, sizeof(flags));
+		// Amendment 4: which source the service reads it from ("plugin" / "uvc").
+		const char *source = p.source == XRT_STEREO_CAMERA_SOURCE_UVC ? "uvc" : "plugin";
+		// A device id (Windows symbolic link) carries backslashes: JSON-escape them.
+		char hint[2 * sizeof(p.platform_device_hint)];
+		size_t hn = 0;
+		for (const char *c = p.platform_device_hint; *c != '\0' && hn + 2 < sizeof(hint); c++) {
+			if (*c == '\\' || *c == '"') {
+				hint[hn++] = '\\';
+			}
+			hint[hn++] = *c;
+		}
+		hint[hn] = '\0';
 		if (json) {
 			printf(
-			    "%s{\"id\": %llu, \"name\": \"%s\", \"persistentId\": \"%s\", \"state\": \"%s\", "
+			    "%s{\"id\": %llu, \"name\": \"%s\", \"source\": \"%s\", \"persistentId\": \"%s\", "
+			    "\"state\": \"%s\", "
 			    "\"flags\": \"%s\", \"viewCount\": %u, \"eyeWidth\": %u, \"eyeHeight\": %u, "
 			    "\"maxFrameRate\": %.2f, \"baselineMm\": %.2f, \"horizontalFovDeg\": %.2f, "
 			    "\"formats\": \"0x%llx\", \"transports\": \"0x%llx\", \"platformDeviceHint\": \"%s\"}",
-			    i ? ", " : "", (unsigned long long)p.camera_id, p.display_name, p.persistent_id,
+			    i ? ", " : "", (unsigned long long)p.camera_id, p.display_name, source, p.persistent_id,
 			    state_str(p.state), flags, p.view_count, p.eye_width, p.eye_height, p.max_frame_rate,
 			    p.baseline_mm, p.horizontal_fov_deg, (unsigned long long)p.supported_formats,
-			    (unsigned long long)p.supported_transports, p.platform_device_hint);
+			    (unsigned long long)p.supported_transports, hint);
 		} else {
-			printf("  [%llu] \"%s\"  %s\n", (unsigned long long)p.camera_id, p.display_name,
-			       state_str(p.state));
+			printf("  [%llu] \"%s\"  %s  (source: %s)\n", (unsigned long long)p.camera_id, p.display_name,
+			       state_str(p.state), source);
 			printf("       persistentId %s\n", p.persistent_id);
 			printf("       flags        %s\n", flags);
 			char rate[64];
@@ -276,8 +298,16 @@ cmd_list(struct ipc_connection *ipc_c, bool json)
 			}
 			printf("       eye          %ux%u (SBS %ux%u), %u views, %s\n", p.eye_width, p.eye_height,
 			       2 * p.eye_width, p.eye_height, p.view_count, rate);
-			printf("       baseline     %.2f mm, HFOV %.2f deg per eye\n", p.baseline_mm,
-			       p.horizontal_fov_deg);
+			if (p.source == XRT_STEREO_CAMERA_SOURCE_UVC &&
+			    (p.flags & XRT_PLUGIN_STEREO_CAMERA_CALIBRATED) == 0) {
+				printf(
+				    "       baseline     %.2f mm, HFOV %.2f deg per eye (NOMINAL, from the config; "
+				    "0 = not configured)\n",
+				    p.baseline_mm, p.horizontal_fov_deg);
+			} else {
+				printf("       baseline     %.2f mm, HFOV %.2f deg per eye\n", p.baseline_mm,
+				       p.horizontal_fov_deg);
+			}
 			printf("       formats      0x%llx  transports 0x%llx  platform hint \"%s\"\n",
 			       (unsigned long long)p.supported_formats, (unsigned long long)p.supported_transports,
 			       p.platform_device_hint);
@@ -1306,6 +1336,129 @@ on_off_arg(int argc, const char **argv, int idx, uint32_t *out)
 	return false;
 }
 
+/*
+ *
+ * uvc-devices (ADR-043 Amendment 4): local, no service.
+ *
+ */
+
+static const char *
+uvc_layout_str(uint32_t l)
+{
+	return l == U_STEREO_UVC_LAYOUT_SBS_HALF ? "sbs-half" : "sbs-full";
+}
+
+/*!
+ * `camera uvc-devices [--modes]`: the UVC stereo camera config as the service
+ * would read it (path, parse result, entries) and the capture devices present,
+ * each marked with the entry that would claim it. Enumeration activates no
+ * device. --modes lists the capture modes of the MATCHED devices only (that
+ * instantiates the device object, never starts it): an unmatched device — the
+ * display's own tracker camera, say — is never touched.
+ */
+static int
+cmd_uvc_devices(int argc, const char **argv)
+{
+	bool modes = cli_has_flag(argc, argv, "--modes");
+	struct u_stereo_uvc_config cfg;
+	char path[1024], err[256] = {0};
+	enum u_stereo_uvc_config_load_result r = u_stereo_uvc_config_load(&cfg, path, sizeof(path), err, sizeof(err));
+	printf("UVC stereo camera config: %s\n", path[0] ? path : "(no per-user config directory)");
+	switch (r) {
+	case U_STEREO_UVC_CONFIG_OK:
+		printf("  OK — %u entr%s%s\n", cfg.count, cfg.count == 1 ? "y" : "ies",
+		       cfg.fake ? ", FAKE synthetic device (replaces real capture)" : "");
+		break;
+	case U_STEREO_UVC_CONFIG_INVALID: printf("  INVALID — %s (the service claims nothing)\n", err); break;
+	default: printf("  none — %s (the service claims nothing; this is the default)\n", err); break;
+	}
+	for (uint32_t e = 0; e < cfg.count; e++) {
+		const struct u_stereo_uvc_entry *en = &cfg.entries[e];
+		char mode[48] = "auto", eye[32] = "auto";
+		if (en->mode_width > 0) {
+			snprintf(mode, sizeof(mode), "%ux%u@%.1f", en->mode_width, en->mode_height, en->mode_fps);
+		}
+		if (en->eye_width > 0) {
+			snprintf(eye, sizeof(eye), "%ux%u", en->eye_width, en->eye_height);
+		}
+		printf("  entry %u: match \"%s\"", e, en->name_contains);
+		if (en->match_vid_pid) {
+			printf(" vid_pid %04x:%04x", en->vid, en->pid);
+		}
+		printf(", layout %s, eyes %s, mode %s, eye_size %s, baseline %.1f mm, hfov %.1f deg%s%s\n",
+		       uvc_layout_str(en->layout), en->swap_eyes ? "rl" : "lr", mode, eye, en->baseline_mm,
+		       en->hfov_deg, en->calibration[0] ? ", calibration " : " (nominal model)", en->calibration);
+	}
+
+	struct u_stereo_uvc_backend backend;
+	if (cfg.fake) {
+		u_stereo_uvc_fake_backend_init(&backend, &cfg.fake_params);
+	} else if (!os_uvc_capture_backend(&backend)) {
+		printf("capture backend: none on this platform (Linux V4L2 is a TODO)\n");
+		return 0;
+	}
+	struct u_stereo_uvc_device devs[U_STEREO_UVC_MAX_DEVICES];
+	memset(devs, 0, sizeof(devs));
+	uint32_t n = backend.enumerate(backend.ctx, devs, U_STEREO_UVC_MAX_DEVICES);
+	n = n > U_STEREO_UVC_MAX_DEVICES ? U_STEREO_UVC_MAX_DEVICES : n;
+	printf("capture backend: %s, %u device(s)\n", backend.name, n);
+	// The service's own rule (u_stereo_uvc_assign), minus the plug-in exclusion
+	// the CLI cannot see without the service.
+	int32_t assigned[U_STEREO_UVC_MAX_ENTRIES];
+	u_stereo_uvc_assign(&cfg, devs, n, NULL, assigned);
+	for (uint32_t e = 0; e < cfg.count; e++) {
+		if (assigned[e] == U_STEREO_UVC_ASSIGN_AMBIGUOUS) {
+			printf(
+			    "  entry %u: AMBIGUOUS — \"%s\" matches several devices; the service claims none for it "
+			    "(make \"match\" more specific or add \"vid_pid\")\n",
+			    e, cfg.entries[e].name_contains);
+		} else if (assigned[e] < 0) {
+			printf("  entry %u: matches no device present\n", e);
+		}
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		struct u_stereo_uvc_device *d = &devs[i];
+		int32_t entry = -1;
+		for (uint32_t e = 0; e < cfg.count; e++) {
+			if (assigned[e] == (int32_t)i) {
+				entry = (int32_t)e;
+			}
+		}
+		char vp[16] = "none";
+		if (d->has_vid_pid) {
+			snprintf(vp, sizeof(vp), "%04x:%04x", d->vid, d->pid);
+		}
+		printf("  [%u] \"%s\"  VID:PID %s  %s\n", i, d->name, vp,
+		       entry >= 0 ? "<- CLAIMED by the config" : "(not claimed: never touched)");
+		printf("       id %s\n", d->id);
+		if (entry >= 0) {
+			const struct u_stereo_uvc_entry *en = &cfg.entries[entry];
+			printf("       entry %d; the service skips it if a display plug-in reports it as its camera\n",
+			       entry);
+			if (modes && backend.list_modes != NULL) {
+				struct u_stereo_uvc_mode ms[U_STEREO_UVC_MAX_MODES];
+				uint32_t nm = backend.list_modes(backend.ctx, d->id, ms, U_STEREO_UVC_MAX_MODES);
+				printf("       %u mode(s) (NV12 / YUY2 / MJPEG):\n", nm);
+				for (uint32_t k = 0; k < nm; k++) {
+					uint32_t ew = 0, eh = 0;
+					bool ok = u_stereo_uvc_eye_size(en->layout, ms[k].width, ms[k].height,
+					                                en->eye_width, en->eye_height, &ew, &eh);
+					printf("         %ux%u@%.2f", ms[k].width, ms[k].height, ms[k].fps);
+					if (ok) {
+						printf("  -> %s %ux%u per eye (SBS %ux%u)", uvc_layout_str(en->layout),
+						       ew, eh, 2 * ew, eh);
+					}
+					printf("\n");
+				}
+			}
+		}
+	}
+	if (!modes && cfg.count > 0) {
+		printf("(add --modes to list the capture modes of the claimed device(s); the device is not started)\n");
+	}
+	return 0;
+}
+
 static void
 usage(void)
 {
@@ -1323,6 +1476,8 @@ usage(void)
 	    "Deny;\n"
 	    "                                    a user-writable <exe> needs --signer, spec 7.1.1)\n"
 	    "       signer <exe>|--self          path class + Authenticode signer (exit 3 = not validly signed)\n"
+	    "       uvc-devices [--modes]        UVC stereo webcam config + capture devices (local; --modes:\n"
+	    "                                    capture modes of the CLAIMED devices only, never started)\n"
 	    "       status | stop-all | sharing on|off | fake-lock on|off   (over IPC, DIAG)\n"
 	    "exit codes: 4 consent refused, 6 sharing off, 7 busy, 8 ended by the service, 5 rows misaligned\n");
 }
@@ -1343,6 +1498,9 @@ cli_cmd_camera(int argc, const char **argv)
 	}
 	if (strcmp(sub, "signer") == 0) {
 		return cmd_signer(argc, argv);
+	}
+	if (strcmp(sub, "uvc-devices") == 0) {
+		return cmd_uvc_devices(argc, argv);
 	}
 	// Control ops: DIAG class over IPC.
 	uint32_t onoff = 0;

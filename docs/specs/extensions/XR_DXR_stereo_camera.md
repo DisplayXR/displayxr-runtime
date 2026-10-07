@@ -6,10 +6,11 @@
 | **Spec Version** | 3 |
 | **Extension Type** | Instance extension, service path only (an in-process instance enumerates zero cameras) |
 | **Header** | [`src/external/openxr_includes/openxr/XR_DXR_stereo_camera.h`](../../../src/external/openxr_includes/openxr/XR_DXR_stereo_camera.h) (+ its `index.json` catalog note) |
-| **Status** | **R1 implemented** (runtime, hardware-free): header, plug-in slots, service camera manager, IPC, OpenXR entry points, sim_display fake, `displayxr-cli camera`, selftest check. **R2 implemented**: the service-side rectifier (`u_stereo_rectify`, CPU) — RECTIFIED frames + rectified calibration from any CALIBRATED source, golden-tested against OpenCV, and a distorted sim fake with ground truth. **Not yet:** consent / indicator / foreground rule (R3 — deny-by-default hooks in place), GPU transports (the rectifier has the seam), state-change events, the Leia provider (L1), the browser (B1). Provisional type values `1004999300–310` (relocated from `290–300` when `XR_DXR_weave` v14 took `290`; `XR_DXR_lift` holds `270–289`), pending Khronos registry |
+| **Status** | **R1 implemented** (runtime, hardware-free): header, plug-in slots, service camera manager, IPC, OpenXR entry points, sim_display fake, `displayxr-cli camera`, selftest check. **R2 implemented**: the service-side rectifier (`u_stereo_rectify`, CPU) — RECTIFIED frames + rectified calibration from any CALIBRATED source, golden-tested against OpenCV, and a distorted sim fake with ground truth. **Not yet:** consent / indicator / foreground rule (R3 — deny-by-default hooks in place), GPU transports (the rectifier has the seam), state-change events, the Leia provider (L1), the browser (B1). **Amendment 4 implemented** (2026-10-07): a vendor-neutral, service-owned source for plain UVC side-by-side stereo webcams (§9a) — Windows Media Foundation, Linux V4L2 to follow. Provisional type values `1004999300–310` (relocated from `290–300` when `XR_DXR_weave` v14 took `290`; `XR_DXR_lift` holds `270–289`), pending Khronos registry |
 | **R1 decisions** | stereo-only (names/structs kept open: `viewCount`, next chains) · camera provider = `xrt_plugin_iface` slots · service clients only (in-process enumerates zero) · raw frames never reach web pages (`RAW` refused to `PRESENT_OWNER` clients) — see [roadmap §G](../../roadmap/stereo-camera-source.md#g-open-questions--maintainer-decisions) |
 | **Decision record** | [ADR-043](../../adr/ADR-043-stereo-camera-source.md) |
 | **Plug-in contract** | appended `xrt_plugin_iface` camera slots, `XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA` (§9) |
+| **Second source** | the service's own UVC side-by-side webcam source, opt-in per device (§9a, ADR-043 Amendment 4) |
 | **Browser / Android integration + plan** | [roadmap/stereo-camera-source.md](../../roadmap/stereo-camera-source.md) |
 
 ## 1. What it is
@@ -60,6 +61,7 @@ if (xrAcquireStereoCameraFrameDXR(stream, &f) == XR_SUCCESS) { /* f.slot is pinn
 | In-process instance (any platform) | `xrEnumerateStereoCamerasDXR` → `XR_SUCCESS`, count 0. The single owner of a camera is the service; an in-process runtime opening it too would recreate the exclusive-device fight this extension exists to end |
 | Service whose plug-in has no camera slots (or `sim_display` without its fake) | count 0 |
 | Service with a camera source | one entry per camera, with its `state` (§3) |
+| Service with an opted-in UVC side-by-side webcam (`stereo-cameras.json`, §9a) | one more entry per claimed webcam, after the plug-in's; no plug-in needed |
 | `DXR_STEREO_CAMERA=0` in the **service's** environment, or the user kill switch (§7.4) | count 0 — indistinguishable from "no camera", on purpose |
 
 Instance-level, not session-level: a capture component (a browser's video-capture service) has
@@ -127,8 +129,9 @@ typedef struct XrStereoCameraPropertiesDXR {
     XrExtent2Di                eyeExtent;         // native per-eye size (e.g. 640x480)
     float                      maxFrameRate;      // Hz the source delivers: MEASURED by the service after its
                                                   // first open, else the vendor's value; 0 = not known yet
-    float                      baselineMm;        // |T| of the pair; 0 if uncalibrated
-    float                      horizontalFovDeg;  // per eye, rectified; 0 if uncalibrated
+    float                      baselineMm;        // |T| of the pair; 0 if uncalibrated (a §9a UVC camera: the
+                                                  // CONFIGURED nominal value, else 0)
+    float                      horizontalFovDeg;  // per eye, rectified; 0 if uncalibrated (§9a: as baselineMm)
     XrStereoCameraFormatFlagsDXR supportedFormats;       // GRAY8 / NV12 / BGRA8 bits the service will produce
     XrStereoCameraTransportFlagsDXR supportedTransports; // SHARED_MEMORY always; GPU transports optional (§5.3)
 } XrStereoCameraPropertiesDXR;
@@ -178,6 +181,14 @@ device's own identity (serial). It never picks "the first calibration folder" on
 one field box carried eleven. A plug-in that cannot resolve the active device's calibration
 reports the camera without `CALIBRATED`, and the service offers RAW only.
 
+**An uncalibrated UVC webcam (§9a)** is the one exception to "RAW only": the service models it
+as an ideal parallel pinhole pair from its configured HFOV and baseline. It is reported without
+`CALIBRATED`; `xrGetStereoCameraCalibrationDXR(RAW)` fails (`XR_ERROR_FEATURE_UNSUPPORTED`: a
+nominal model is not a measurement of the device); RECTIFIED is offered and returns the numbers
+of the frames actually delivered — the nominal pinhole while they are passed through, the
+corrected geometry once the online refinement has aligned the rows (the frame's
+`calibrationGeneration` moves then).
+
 **Rectification** (when not `NATIVELY_RECTIFIED`) is the service's, vendor-neutral
 (`auxiliary/util/u_stereo_rectify.{h,c}`, R2): Bouguet rectification to a **parallel** pair
 with zero disparity at infinity, cropped to the valid region (no black corners), per-eye size
@@ -225,7 +236,8 @@ typedef enum XrStereoCameraTransportDXR {
 typedef struct XrStereoCameraStreamCreateInfoDXR {
     XrStructureType type; const void* XR_MAY_ALIAS next;
     uint64_t cameraId;
-    XrStereoCameraOutputDXR output;         // RECTIFIED needs CALIBRATED or NATIVELY_RECTIFIED
+    XrStereoCameraOutputDXR output;         // RECTIFIED needs CALIBRATED or NATIVELY_RECTIFIED, or a
+                                            // nominal-model UVC camera the service aligns (§9a)
     XrStereoCameraFormatDXR format;         // a MONOCHROME source in NV12 = luma + neutral chroma
     XrStereoCameraTransportDXR transport;
     float maxFrameRate;                     // ≤ 0 = the source's rate; the service decimates, never interpolates
@@ -499,7 +511,7 @@ The service queues, per connection (16 deep, oldest dropped), and the client dra
 | Result | When |
 |---|---|
 | `XR_STEREO_CAMERA_FRAME_NOT_READY_DXR` (success) | no frame newer than the last acquired |
-| `XR_ERROR_VALIDATION_FAILURE` | struct out of contract (unknown camera, format/transport not in the supported bits, RECTIFIED on an uncalibrated camera) |
+| `XR_ERROR_VALIDATION_FAILURE` | struct out of contract (unknown camera, format/transport not in the supported bits, RECTIFIED on a camera the service cannot rectify) |
 | `XR_ERROR_PERMISSION_INSUFFICIENT` | the OS camera privacy switch denies the app (§7.1 row 4, delegating clients included); RAW asked by a browser / delegating client; a client class that may not use cameras (or `xrCreateSession` from a `CAMERA_CONSUMER`) |
 | `XR_ERROR_STEREO_CAMERA_CONSENT_REFUSED_DXR` | §7.1: the user / the stored decision refused, the prompt was unanswered or unavailable; retryable after consent. A browser maps it to `NotAllowedError`. A registered delegating client gets it too when its delegation was skipped — it declined (`DECLINE_DELEGATION_BIT`, §2a) or its entry is untrusted (§7.1.1) — and no stored Allow / prompt answer allowed it |
 | `XR_ERROR_STEREO_CAMERA_DISABLED_DXR` | §7.4: sharing is off (user toggle or `DXR_STEREO_CAMERA=0`) |
@@ -587,6 +599,98 @@ owns threads, fan-out, rectification, format conversion, transport, consent and 
 | authorisation, foreground rule, indicator, kill switch | calibration of **its active device**, by device identity |
 | events, stats, CLI | tracker keep-alive while open; shedding camera before tracking |
 
+## 9a. Service-owned UVC side-by-side source (ADR-043 Amendment 4)
+
+A plain stereo webcam that sends **one side-by-side image** over standard UVC belongs to no
+display vendor, so it gets no plug-in: the **service** reads it with its own vendor-neutral
+capture code and exposes it like any other camera — same entry points, same consent path and
+`CAMERA_CONSUMER` rules, same foreground rule, indicator, kill switches, linger, rings and
+rectifier. Code: `auxiliary/util/u_stereo_uvc.{h,c}` (config, matching, SBS split, nominal
+model, calibration files, the fake backend — pure, tested on every OS by `tests_stereo_uvc`),
+`auxiliary/os/os_uvc_capture*.{h,c,cpp}` (the OS call), and the `src_*` dispatch in
+`ipc_server_stereo_camera.c` (the only place the manager tells the two sources apart).
+
+**Opt-in only.** With no config the source enumerates nothing and touches no device. The SERVICE
+reads, once at start:
+
+| Where | |
+|---|---|
+| Windows | `%LOCALAPPDATA%\DisplayXR\stereo-cameras.json` |
+| Linux / macOS | `$XDG_CONFIG_HOME/displayxr/stereo-cameras.json`, else `~/.config/displayxr/stereo-cameras.json` |
+| override | `DXR_STEREO_CAMERA_UVC_CONFIG=<path>` in the service's environment; `DXR_STEREO_CAMERA_UVC=0` turns the source off |
+
+```jsonc
+{"uvc": [{
+   "match": "Eyes",             // friendly-name substring, case-insensitive  } at least one;
+   "vid_pid": "2bdf:0281",      // USB VID:PID, hex                           } both = both must hold
+   "name": "Stereo webcam",     // display name ("" = the device's own)
+   "layout": "sbs-half",        // "sbs-full": each half one full-res eye; "sbs-half": each half an eye squeezed 2:1
+   "eyes": "lr",                // "lr" = the device's left lens in the left half; "rl" = swapped
+   "mode": "3840x2160@60",      // capture mode; omitted = the largest, then fastest, the device lists
+   "eye_size": "1280x720",      // per-eye output; omitted = see "Frames"
+   "baseline_mm": 60,           // nominal lens separation (omitted: 60 internally, reported 0)
+   "hfov_deg": 90,              // nominal per-eye horizontal FOV (omitted: 70 internally, reported 0)
+   "calibration": "C:/cal/eyes.yaml"   // optional OpenCV-style calibration (below)
+}]}
+```
+
+(The file itself is strict JSON — no comments.) Up to 4 entries; any malformed value fails the
+whole file (logged, nothing claimed): a typo must never claim a different camera. **No built-in
+allowlist** ships: a device is listed only with a public spec of its SBS layout, and none was
+available.
+
+**Which device.** Entries are resolved in order, one device each: the first present device that
+matches and is not already claimed. A **name-only** entry matching several devices claims none
+(a vendor prefix shared by a display's tracking camera and the webcam must not pick one by
+enumeration order). **A device a display plug-in reports as its camera is never claimed**: plug-in
+cameras are enumerated first, and a device whose OS id, or whose USB VID:PID, equals a plug-in
+camera's `platformDeviceHint` (e.g. `"04f2:b70c"`) is skipped.
+
+**Frames.** The backend delivers decoded NV12 or YUY2 (Windows: an async `IMFSourceReader` with
+advanced video processing, so MJPEG is decoded by the system's MJPEG decoder MFT; the reader
+keeps only the newest sample). The source splits each frame into an NV12 SBS image of two
+square-pixel eyes, LEFT lens left: SBS_FULL eyes are `(W/2) × H`, SBS_HALF eyes `(W/2) × (H/2)`
+(a 2:1-squeezed half carries that much information; the vertical 2:1 is an exact two-row
+average), both capped at 1280 px wide with the aspect kept, unless `eye_size` says otherwise
+(integer box pre-reduction + bilinear). Timestamps are arrival time (`captureTimeIsExposure`
+FALSE). Flags: `USER_FACING`, plus `CALIBRATED` with a calibration file; never
+`SHARED_WITH_EYE_TRACKING`. `platformDeviceHint` = the OS device id (Windows: the MF symbolic
+link), so a capture stack can hide the raw webcam it also sees. The device is opened on the first
+started stream and closed after the 2 s linger; an open that fails (another app holds it) makes
+the camera `UNAVAILABLE`, and a start meanwhile gets `XR_ERROR_STEREO_CAMERA_BUSY_DXR`.
+
+**Calibration.** None (the usual case): the nominal model of §4 — fx = fy =
+`(eyeWidth/2) / tan(hfov/2)`, principal point `((w−1)/2, (h−1)/2)`, no distortion, R = I,
+T = (−baseline, 0, 0) mm. RECTIFIED frames are the delivered frames unchanged (no remap, no
+zoom) until the online vertical refinement (§4, R2) — which runs on them exactly as on a
+calibrated camera — folds a correction in; from then on they go through the corrected LUT and
+the rectified calibration describes that geometry. A `calibration` file makes the camera
+`CALIBRATED`: OpenCV FileStorage YAML (`K1: !!opencv-matrix ... data: [...]`) or JSON, keys
+`K1`/`M1`, `D1`, `K2`/`M2`, `D2`, `R` (3×3 or a rotation vector), `T` (mm; |T| < 1 is taken as
+metres), optional `image_width` / `image_height` (default: the raw per-eye size `mode/2 × mode`,
+i.e. the squeezed half for SBS_HALF — an anisotropic K is fine), optional
+`distortion_model: fisheye` for 4-coefficient KB4; 4–5 coefficients are RADTAN5, 8 RADTAN8. A
+file that cannot be read or parsed is logged and the nominal model is used.
+
+**Backends.** Windows: Media Foundation (`mf`, `mfplat`, `mfreadwrite`, `mfuuid`, linked only into
+the service and `displayxr-cli`, via `aux_os_uvc`). Linux: V4L2 is a TODO
+(`os_uvc_capture_stubs.c` records the plan); other platforms: none. A config with `"fake": true`
+(or `{"disparity": 0.04, "dy": 0.005, "pixel": "nv12"|"yuy2", "fps": 30}`, fractions of the eye
+width / height) REPLACES real capture with a synthetic device ("DisplayXR synthetic SBS camera",
+id `dxr-fake-uvc`) that renders a known disparity and a known right-eye vertical offset in any
+layout — the hardware-free path through the whole manager (`tests_stereo_camera_manager`, and
+`camera probe --rectified` against a service on any OS).
+
+**Diagnostics.** `displayxr-cli camera list` tags each camera `(source: plugin|uvc)` (`"source"` in
+`--json`; the wire carries it in the former `reserved` word of the properties — the OpenXR struct
+is unchanged). `displayxr-cli camera uvc-devices [--modes]` runs locally (no service): the config
+path and parse result, every capture device present with its VID:PID and OS id, which entry
+claims it, ambiguous entries, and with `--modes` the capture modes of the CLAIMED devices only and
+the per-eye output each would give (the device object is created to read its media types, never
+started). Service log: one WARN per claimed device (`stereo camera (uvc): CLAIMED ...`), the
+nominal-model line (`NOMINAL model (uncalibrated) — RECTIFIED = the frames as delivered ...`),
+then the usual per-camera, per-stream and refinement lines.
+
 ## 10. sim_display fake
 
 > **R1 as built** (`drivers/sim_display/sim_display_stereo_camera{,_pattern}.c`): the pair is
@@ -630,7 +734,8 @@ The whole path (enumerate → consent → start → acquire → rectify) then ru
 ## 11. Probe and diagnostics
 
 ```
-displayxr-cli camera list [--json]                    # properties + state of every camera
+displayxr-cli camera list [--json]                    # properties + state + source (plugin|uvc) of every camera
+displayxr-cli camera uvc-devices [--modes]            # §9a: UVC webcam config + devices (local, no service)
 displayxr-cli camera calib <id> [--raw|--rectified] [--json]
 displayxr-cli camera probe [<id>] [--raw] [--format gray8|nv12|bgra8] [--fps F]
                               [--frames N] [--seconds S] [--out DIR]
@@ -718,6 +823,7 @@ camera state change and per stream start/stop with the peer executable; INFO sta
 
 | Version | Change |
 |---|---|
+| 3 (Amendment 4) | No API change. The service's own vendor-neutral UVC side-by-side source (§9a): opt-in per device by `stereo-cameras.json`, never a plug-in's camera; an uncalibrated pair is reported without `CALIBRATED`, its RAW calibration is refused, its RECTIFIED output is a pass-through aligned by the online refinement — so RECTIFIED now requires a camera the service can rectify rather than `CALIBRATED \| NATIVELY_RECTIFIED`. `displayxr-cli camera list` shows the source; new `camera uvc-devices` |
 | 3 | Delegation hardening: `XR_STEREO_CAMERA_CLIENT_DECLINE_DELEGATION_BIT_DXR` (`0x2`) — a delegating client opts out of row 6 for one instance (§2a); a delegating entry for a user-writable executable path is applied only with a recorded signer its valid Authenticode signature matches (`<valueName>.signer`, Windows; POSIX path-only) and a user-level entry's first use per executable per service run is announced (§7.1.1). Appended; nothing renumbered |
 | 2 (R3) | Consent and privacy as built (§7): `XrStereoCameraClientInfoDXR` + `XR_STEREO_CAMERA_CLIENT_CONSUMER_ONLY_BIT_DXR` (the `CAMERA_CONSUMER` class, §2a); distinct results `XR_ERROR_STEREO_CAMERA_CONSENT_REFUSED_DXR` / `_DISABLED_DXR` / `_BUSY_DXR` / `_STREAM_ENDED_DXR`; `XrEventDataStereoCameraStreamEndedDXR`; the state-changed event is now delivered; `persistentId` keyed with a per-user secret; read-only consumer section on every platform; `DXR_STEREO_CAMERA_DEV_ALLOW` becomes a documented dev override, `DXR_STEREO_CAMERA_PROMPT=0` disables the prompt. Everything appended at `1004999311–316`; nothing renumbered |
 | 1 (R2) | No API change. RECTIFIED output and rectified calibration now come from the service's rectifier for any CALIBRATED, non-natively-rectified source; the browser is refused a camera it cannot rectify; sim_display `_DISTORT=1` fake; `camera probe` row alignment + `--rectified` |

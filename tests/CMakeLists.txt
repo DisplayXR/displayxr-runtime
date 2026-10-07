@@ -81,6 +81,7 @@ set(tests
     tests_camera_consent
     tests_stereo_rectify
     tests_stereo_vrefine
+    tests_stereo_uvc
 	)
 if(XRT_BUILD_DRIVER_QWERTY)
 	list(APPEND tests tests_qwerty_camera_profile tests_qwerty_velocity)
@@ -808,3 +809,25 @@ target_include_directories(tests_stereo_rectify PRIVATE ${PROJECT_SOURCE_DIR}/sr
 target_sources(tests_stereo_vrefine PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_stereo_camera_pattern.c)
 target_include_directories(tests_stereo_vrefine PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display ${CMAKE_CURRENT_SOURCE_DIR}/fixtures ${PROJECT_SOURCE_DIR}/src/external/stb)
 target_compile_definitions(tests_stereo_vrefine PRIVATE STEREO_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
+
+# ADR-043 Amendment 4: the service's REAL camera manager end to end, driven
+# through its IPC handlers with the UVC source on its fake backend (no device,
+# no Media Foundation, no service process). Compiles the manager straight in
+# rather than linking ipc_server, whose handler file pulls in every compositor;
+# the glue stubs the two symbols it would have taken from there.
+if(TARGET ipc_server)
+	add_executable(
+		tests_stereo_camera_manager
+		tests_stereo_camera_manager.cpp tests_stereo_camera_manager_glue.c tests_stereo_camera_manager_glue.h
+		${PROJECT_SOURCE_DIR}/src/xrt/ipc/server/ipc_server_stereo_camera.c
+		${PROJECT_SOURCE_DIR}/src/xrt/ipc/server/ipc_server_peer_creds.c
+		)
+	target_link_libraries(
+		tests_stereo_camera_manager PRIVATE xrt-external-catch2 xrt-interfaces aux_util aux_os aux_os_uvc ipc_shared
+		)
+	# ipc_server_generated.h (handler prototypes) is generated with ipc_server.
+	add_dependencies(tests_stereo_camera_manager ipc_server)
+	add_test(NAME tests_stereo_camera_manager COMMAND tests_stereo_camera_manager --success
+							 --allow-running-no-tests
+		)
+endif()

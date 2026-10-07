@@ -87,6 +87,21 @@
  * px, |b| <= 2 px / 100 px), gated (>= 50 matches over >= 3 frames),
  * re-verified on every re-open, and DXR_STEREO_CAMERA_REFINE=0 turns it off.
  *
+ * Sources (Amendment 4) — a camera comes from the active plug-in's
+ * stereo_camera_* slots or from the service's own vendor-neutral UVC
+ * side-by-side source (util/u_stereo_uvc.h over os/os_uvc_capture.h: Media
+ * Foundation on Windows, a V4L2 TODO elsewhere), opted in per device by the
+ * user's stereo-cameras.json. Both have the same six-operation shape; the
+ * src_* dispatch is the only place that tells them apart, so consent, the
+ * foreground rule, the indicator, linger, rates, rings and rectification are
+ * one code path. Plug-in cameras are enumerated first and their
+ * platform_device_hints are never claimed by the UVC source. An uncalibrated
+ * UVC pair gets a NOMINAL model (pinhole from its configured HFOV + baseline,
+ * parallel, undistorted): the camera reports no CALIBRATED, RAW calibration is
+ * FEATURE_NOT_SUPPORTED, and RECTIFIED is a PASS-THROUGH (no remap, nominal
+ * numbers) until the online refinement below folds a vertical correction in —
+ * from then on the ordinary LUT path with the corrected geometry.
+ *
  * Transports — R1 implements SHARED_MEMORY only. The GPU transports are
  * designed to reuse this ring's state machine unchanged, only the slot storage
  * differs:
@@ -128,7 +143,9 @@
 #include "util/u_misc.h"
 #include "util/u_stereo_camera.h"
 #include "util/u_stereo_rectify.h"
+#include "util/u_stereo_uvc.h"
 #include "util/u_stereo_vrefine.h"
+#include "os/os_uvc_capture.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -317,6 +334,15 @@ struct scam_rectifier
 	bool (*apply)(struct scam_rectifier *r,
 	              const struct xrt_plugin_stereo_camera_frame *in,
 	              struct xrt_plugin_stereo_camera_frame *out);
+	/*!
+	 * Amendment 4: the camera's model is a NOMINAL parallel pinhole pair (an
+	 * uncalibrated UVC stereo webcam) and no vertical correction has been
+	 * folded in yet — the rectified frames ARE the source frames (no remap,
+	 * no zoom), described by the nominal intrinsics below. The first applied
+	 * refinement swaps in real maps and clears it.
+	 */
+	bool passthrough;
+	double pass_f, pass_cx, pass_cy;
 	// stats
 	uint64_t ns_sum;
 	uint64_t count;
@@ -352,10 +378,17 @@ struct scam_rectifier
 
 struct scam_camera
 {
-	uint32_t index; //!< plug-in index
+	uint32_t index; //!< position in mgr->cams (streams key on it)
+	//! enum xrt_stereo_camera_source: the plug-in's slots or the service's UVC source.
+	uint32_t source;
+	uint32_t source_index; //!< the camera's index inside its source
 	uint64_t camera_id;
 	struct xrt_plugin_stereo_camera_info info;
 	bool have_calib;
+	//! Amendment 4: @ref calib is a NOMINAL model (an uncalibrated UVC pair):
+	//! it drives the rectifier, but is never handed out as RAW calibration.
+	bool calib_nominal;
+	bool baseline_known, hfov_known; //!< nominal model: did the user configure them
 	struct xrt_plugin_stereo_camera_calibration calib;
 	uint32_t state;
 	uint32_t calibration_generation;
@@ -363,7 +396,9 @@ struct scam_camera
 	//! sane; NULL = no service-side rectification (RAW-flagged fallback).
 	struct scam_rectifier *rect;
 
-	struct xrt_plugin_stereo_camera *src; //!< owned by the camera thread
+	//! Owned by the camera thread: a struct xrt_plugin_stereo_camera (PLUGIN)
+	//! or a struct u_stereo_uvc_stream (UVC); see the src_* dispatch below.
+	void *src;
 	uint32_t started_count;
 	int64_t linger_deadline_ns;
 	int64_t last_frame_ns;
@@ -397,6 +432,8 @@ struct ipc_server_stereo_camera
 	bool shutting_down;
 	const struct xrt_plugin_iface *iface;
 	struct xrt_plugin_instance *inst;
+	//! Amendment 4: the service's own UVC side-by-side source (NULL = none configured).
+	struct u_stereo_uvc *uvc;
 	uint32_t camera_count;
 	struct scam_camera cams[XRT_STEREO_CAMERA_MAX_CAMERAS];
 	struct scam_stream streams[MAX_STREAMS];
@@ -863,6 +900,70 @@ baseline_mm(const struct xrt_plugin_stereo_camera_calibration *c)
 
 /*
  *
+ * Source dispatch (Amendment 4): a camera is the plug-in's (its stereo_camera_*
+ * slots) or the service's own UVC source (u_stereo_uvc). Both have the same
+ * six-operation shape; everything above and below this block is shared.
+ *
+ */
+
+static const char *
+source_str(uint32_t source)
+{
+	return source == XRT_STEREO_CAMERA_SOURCE_UVC ? "uvc" : "plug-in";
+}
+
+static xrt_result_t
+src_open(struct ipc_server_stereo_camera *m, const struct scam_camera *cam, void **out)
+{
+	*out = NULL;
+	if (cam->source == XRT_STEREO_CAMERA_SOURCE_UVC) {
+		struct u_stereo_uvc_stream *s = NULL;
+		xrt_result_t xret = u_stereo_uvc_open(m->uvc, cam->source_index, &s);
+		*out = s;
+		return xret;
+	}
+	struct xrt_plugin_stereo_camera *pc = NULL;
+	xrt_result_t xret = m->iface->stereo_camera_open(m->inst, cam->source_index, &pc);
+	*out = pc;
+	return xret;
+}
+
+static uint32_t
+src_wait_frame(struct ipc_server_stereo_camera *m,
+               const struct scam_camera *cam,
+               void *src,
+               int64_t timeout_ns,
+               struct xrt_plugin_stereo_camera_frame *out)
+{
+	if (cam->source == XRT_STEREO_CAMERA_SOURCE_UVC) {
+		return u_stereo_uvc_wait_frame((struct u_stereo_uvc_stream *)src, timeout_ns, out);
+	}
+	return m->iface->stereo_camera_wait_frame((struct xrt_plugin_stereo_camera *)src, timeout_ns, out);
+}
+
+static void
+src_release_frame(struct ipc_server_stereo_camera *m, const struct scam_camera *cam, void *src)
+{
+	if (cam->source == XRT_STEREO_CAMERA_SOURCE_UVC) {
+		u_stereo_uvc_release_frame((struct u_stereo_uvc_stream *)src);
+		return;
+	}
+	m->iface->stereo_camera_release_frame((struct xrt_plugin_stereo_camera *)src);
+}
+
+static void
+src_close(struct ipc_server_stereo_camera *m, const struct scam_camera *cam, void *src)
+{
+	if (cam->source == XRT_STEREO_CAMERA_SOURCE_UVC) {
+		u_stereo_uvc_close((struct u_stereo_uvc_stream *)src);
+		return;
+	}
+	m->iface->stereo_camera_close((struct xrt_plugin_stereo_camera *)src);
+}
+
+
+/*
+ *
  * Rectifier (R2).
  *
  */
@@ -922,6 +1023,69 @@ rectify_apply_cpu(struct scam_rectifier *r,
 	out->planes[1] = lay->plane_count > 1 ? r->buf + lay->offset[1] : NULL;
 	out->pitches[1] = lay->plane_count > 1 ? lay->pitch[1] : 0;
 	return true;
+}
+
+//! Pass-through backend (Amendment 4): the nominal parallel pair needs no remap.
+static bool
+rectify_apply_passthrough(struct scam_rectifier *r,
+                          const struct xrt_plugin_stereo_camera_frame *in,
+                          struct xrt_plugin_stereo_camera_frame *out)
+{
+	if (in->width != 2 * r->geo.width || in->height != r->geo.height || in->planes[0] == NULL) {
+		return false;
+	}
+	*out = *in;
+	return true;
+}
+
+/*!
+ * Is @p c an exactly parallel, undistorted pair with one pinhole for both
+ * eyes at the frame size — i.e. are the frames already rectified, so that
+ * the nominal intrinsics describe them with no remap? (A nominal model is
+ * built that way; a real calibration practically never is.)
+ */
+static bool
+calibration_is_parallel_pinhole(const struct xrt_plugin_stereo_camera_calibration *c, uint32_t w, uint32_t h)
+{
+	if (c->distortion_model != XRT_PLUGIN_STEREO_CAMERA_DISTORTION_NONE || c->image_width != w ||
+	    c->image_height != h) {
+		return false;
+	}
+	for (int i = 0; i < 4; i++) {
+		if (c->k[0][i] != c->k[1][i]) {
+			return false;
+		}
+	}
+	if (c->k[0][0] != c->k[0][1]) {
+		return false;
+	}
+	for (int i = 0; i < 3; i++) {
+		for (int j = 0; j < 3; j++) {
+			if (c->rotation_right_from_left[i][j] != (i == j ? 1.0 : 0.0)) {
+				return false;
+			}
+		}
+	}
+	const double *t = c->translation_right_from_left_mm;
+	return t[0] < 0.0 && t[1] == 0.0 && t[2] == 0.0;
+}
+
+/*!
+ * The rectified intrinsics clients are told: the pass-through's nominal ones,
+ * else the rectifier's geometry.
+ */
+static void
+rectified_intrinsics(const struct scam_rectifier *r, double *f, double *cx, double *cy)
+{
+	if (r->passthrough) {
+		*f = r->pass_f;
+		*cx = r->pass_cx;
+		*cy = r->pass_cy;
+	} else {
+		*f = r->geo.f;
+		*cx = r->geo.cx;
+		*cy = r->geo.cy;
+	}
 }
 
 static void
@@ -1008,6 +1172,17 @@ rectifier_create(const struct scam_camera *cam)
 		return NULL;
 	}
 	r->apply = rectify_apply_cpu;
+	if (cam->calib_nominal && calibration_is_parallel_pinhole(c, in.width, in.height)) {
+		// Amendment 4: an uncalibrated pair modelled as an ideal parallel rig.
+		// Bouguet of that is the identity up to the alpha = 0 border zoom, so
+		// deliver the frames untouched (no remap, no zoom) with the nominal
+		// numbers; the refinement below aligns the rows from the frames.
+		r->passthrough = true;
+		r->pass_f = c->k[0][0];
+		r->pass_cx = c->k[0][2];
+		r->pass_cy = c->k[0][3];
+		r->apply = rectify_apply_passthrough;
+	}
 	r->in = in;
 	r->mgr = cam->mgr;
 	r->camera_id = cam->camera_id;
@@ -1042,6 +1217,15 @@ rectifier_create(const struct scam_camera *cam)
 		    "stereo camera %llu: calibration puts the right camera at -x (T.x > 0) — the plug-in's SBS halves "
 		    "look swapped; rectified disparities will be NEGATIVE",
 		    (unsigned long long)cam->camera_id);
+	}
+	if (r->passthrough) {
+		U_LOG_W(
+		    "stereo camera %llu: NOMINAL model (uncalibrated) — RECTIFIED = the frames as delivered "
+		    "(f %.2f px, principal point (%.2f, %.2f), nominal baseline %.2f mm) until the online "
+		    "refinement aligns the rows%s",
+		    (unsigned long long)cam->camera_id, r->pass_f, r->pass_cx, r->pass_cy, r->geo.baseline,
+		    r->refine ? "" : " (refinement OFF: rows are as the device delivers them)");
+		return r;
 	}
 	U_LOG_W(
 	    "stereo camera %llu: rectifier ready (CPU) — f %.2f px, principal point (%.2f, %.2f), baseline %.2f mm, "
@@ -1168,6 +1352,9 @@ rectifier_swap_pending_locked(struct scam_camera *cam)
 	r->lut[0] = r->pending_lut[0];
 	r->lut[1] = r->pending_lut[1];
 	r->pending_ready = false;
+	// A folded-in correction needs real maps: a nominal pass-through ends here.
+	r->passthrough = false;
+	r->apply = rectify_apply_cpu;
 	// Consumers re-read the rectified calibration (f / principal point move
 	// by the alpha = 0 re-crop) on the next frame's generation change.
 	cam->calibration_generation++;
@@ -1437,7 +1624,6 @@ camera_thread(void *ptr)
 {
 	struct scam_camera *cam = (struct scam_camera *)ptr;
 	struct ipc_server_stereo_camera *m = cam->mgr;
-	const struct xrt_plugin_iface *iface = m->iface;
 
 	os_mutex_lock(&m->lock);
 	while (!m->shutting_down) {
@@ -1447,10 +1633,10 @@ camera_thread(void *ptr)
 		// stream starts (or the manager shuts down).
 		if (cam->started_count == 0 && (cam->src == NULL || now >= cam->linger_deadline_ns)) {
 			if (cam->src != NULL) {
-				struct xrt_plugin_stereo_camera *src = cam->src;
+				void *src = cam->src;
 				cam->src = NULL;
 				os_mutex_unlock(&m->lock);
-				iface->stereo_camera_close(src);
+				src_close(m, cam, src);
 				os_mutex_lock(&m->lock);
 				U_LOG_W("stereo camera %llu: source closed (no started stream for %lld ms)",
 				        (unsigned long long)cam->camera_id, (long long)(LINGER_NS / 1000000));
@@ -1470,20 +1656,20 @@ camera_thread(void *ptr)
 				os_cond_wait_timeout_ns(&cam->cond, &m->lock, (uint64_t)(cam->retry_after_ns - now));
 				continue;
 			}
-			struct xrt_plugin_stereo_camera *src = NULL;
+			void *src = NULL;
 			os_mutex_unlock(&m->lock);
-			xrt_result_t xret = iface->stereo_camera_open(m->inst, cam->index, &src);
+			xrt_result_t xret = src_open(m, cam, &src);
 			os_mutex_lock(&m->lock);
 			if (xret != XRT_SUCCESS || src == NULL) {
-				U_LOG_W("stereo camera %llu: plug-in open failed (%d); retrying in 1 s",
-				        (unsigned long long)cam->camera_id, (int)xret);
+				U_LOG_W("stereo camera %llu: %s source open failed (%d); retrying in 1 s",
+				        (unsigned long long)cam->camera_id, source_str(cam->source), (int)xret);
 				set_state_locked(cam, XRT_STEREO_CAMERA_STATE_UNAVAILABLE);
 				cam->retry_after_ns = os_monotonic_get_ns() + REOPEN_BACKOFF_NS;
 				continue;
 			}
 			if (m->shutting_down) {
 				os_mutex_unlock(&m->lock);
-				iface->stereo_camera_close(src);
+				src_close(m, cam, src);
 				os_mutex_lock(&m->lock);
 				break;
 			}
@@ -1498,11 +1684,11 @@ camera_thread(void *ptr)
 			set_state_locked(cam, XRT_STEREO_CAMERA_STATE_WAITING);
 		}
 
-		struct xrt_plugin_stereo_camera *src = cam->src;
+		void *src = cam->src;
 		struct xrt_plugin_stereo_camera_frame f;
 		memset(&f, 0, sizeof(f));
 		os_mutex_unlock(&m->lock);
-		uint32_t w = iface->stereo_camera_wait_frame(src, WAIT_TIMEOUT_NS, &f);
+		uint32_t w = src_wait_frame(m, cam, src, WAIT_TIMEOUT_NS, &f);
 		os_mutex_lock(&m->lock);
 		now = os_monotonic_get_ns();
 
@@ -1529,7 +1715,7 @@ camera_thread(void *ptr)
 				rfp = ok ? &rf : NULL;
 			}
 			publish_locked(m, cam, &f, rfp, now);
-			iface->stereo_camera_release_frame(src);
+			src_release_frame(m, cam, src);
 			break;
 		}
 		case XRT_PLUGIN_STEREO_CAMERA_WAIT_TIMEOUT:
@@ -1544,22 +1730,22 @@ camera_thread(void *ptr)
 			cam->last_frame_ns = 0;
 			break;
 		default:
-			U_LOG_W("stereo camera %llu: plug-in reported a source error; closing, retry in 1 s",
-			        (unsigned long long)cam->camera_id);
+			U_LOG_W("stereo camera %llu: %s source reported an error; closing, retry in 1 s",
+			        (unsigned long long)cam->camera_id, source_str(cam->source));
 			set_state_locked(cam, XRT_STEREO_CAMERA_STATE_UNAVAILABLE);
 			cam->src = NULL;
 			os_mutex_unlock(&m->lock);
-			iface->stereo_camera_close(src);
+			src_close(m, cam, src);
 			os_mutex_lock(&m->lock);
 			cam->retry_after_ns = os_monotonic_get_ns() + REOPEN_BACKOFF_NS;
 			break;
 		}
 	}
 	if (cam->src != NULL) {
-		struct xrt_plugin_stereo_camera *src = cam->src;
+		void *src = cam->src;
 		cam->src = NULL;
 		os_mutex_unlock(&m->lock);
-		iface->stereo_camera_close(src);
+		src_close(m, cam, src);
 		os_mutex_lock(&m->lock);
 	}
 	os_mutex_unlock(&m->lock);
@@ -1573,8 +1759,189 @@ camera_thread(void *ptr)
  *
  */
 
+/*!
+ * Validate + register one camera description @p info from @p source at its
+ * source index @p source_index. Manager lock not needed (create time).
+ */
+static struct scam_camera *
+add_camera(struct ipc_server_stereo_camera *m,
+           uint32_t source,
+           uint32_t source_index,
+           struct xrt_plugin_stereo_camera_info *info)
+{
+	if (m->camera_count >= XRT_STEREO_CAMERA_MAX_CAMERAS) {
+		U_LOG_W("stereo camera: more than %d cameras — \"%s\" (%s) skipped", XRT_STEREO_CAMERA_MAX_CAMERAS,
+		        info->display_name, source_str(source));
+		return NULL;
+	}
+	info->display_name[sizeof(info->display_name) - 1] = '\0';
+	info->device_identity[sizeof(info->device_identity) - 1] = '\0';
+	info->platform_device_hint[sizeof(info->platform_device_hint) - 1] = '\0';
+	if (info->eye_width == 0 || info->eye_height == 0 || (info->eye_width & 1u) || (info->eye_height & 1u) ||
+	    info->native_format < XRT_PLUGIN_STEREO_CAMERA_FORMAT_GRAY8 ||
+	    info->native_format > XRT_PLUGIN_STEREO_CAMERA_FORMAT_BGRA8) {
+		U_LOG_W("stereo camera: %s camera %u has a malformed description (%ux%u, format %u) — skipped",
+		        source_str(source), source_index, info->eye_width, info->eye_height, info->native_format);
+		return NULL;
+	}
+	struct scam_camera *cam = &m->cams[m->camera_count];
+	cam->index = m->camera_count;
+	cam->source = source;
+	cam->source_index = source_index;
+	cam->camera_id = (uint64_t)m->camera_count + 1; // never reused in this service lifetime
+	cam->info = *info;
+	cam->mgr = m;
+	cam->state = XRT_STEREO_CAMERA_STATE_AVAILABLE;
+	os_cond_init(&cam->cond);
+	m->camera_count++;
+	return cam;
+}
+
+//! Shared tail of camera registration: rectifier, rate sanity, the WARN line.
+static void
+finish_camera(struct scam_camera *cam)
+{
+	if (cam->have_calib && (cam->info.flags & XRT_PLUGIN_STEREO_CAMERA_NATIVELY_RECTIFIED) == 0) {
+		cam->rect = rectifier_create(cam);
+	}
+	if (!(cam->info.max_frame_rate >= 0.0f && cam->info.max_frame_rate <= 1000.0f)) {
+		cam->info.max_frame_rate = 0.0f; // NaN / negative / absurd = unknown
+	}
+	char rate[48];
+	if (cam->info.max_frame_rate > 0.0f) {
+		snprintf(rate, sizeof(rate), "advertised %.1f Hz", cam->info.max_frame_rate);
+	} else {
+		snprintf(rate, sizeof(rate), "rate unknown");
+	}
+	U_LOG_W(
+	    "stereo camera %llu: \"%s\" (%s source) %ux%u per eye, %s (measured on first open), flags 0x%x, native "
+	    "format %u%s",
+	    (unsigned long long)cam->camera_id, cam->info.display_name, source_str(cam->source), cam->info.eye_width,
+	    cam->info.eye_height, rate, cam->info.flags, cam->info.native_format,
+	    cam->calib_nominal ? ", NOMINAL model (uncalibrated)" : "");
+}
+
+static void
+add_plugin_cameras(struct ipc_server_stereo_camera *m, struct xrt_instance *xinst)
+{
+	const struct xrt_plugin_iface *iface = NULL;
+	struct xrt_plugin_instance *inst = NULL;
+	if (xinst == NULL || xinst->get_active_plugin == NULL || !xinst->get_active_plugin(xinst, &iface, &inst) ||
+	    !xrt_plugin_iface_has_stereo_camera(iface)) {
+		U_LOG_I("stereo camera: the active plug-in provides no camera source");
+		return;
+	}
+	m->iface = iface;
+	m->inst = inst;
+
+	struct xrt_plugin_stereo_camera_info infos[XRT_STEREO_CAMERA_MAX_CAMERAS];
+	memset(infos, 0, sizeof(infos));
+	for (uint32_t i = 0; i < XRT_STEREO_CAMERA_MAX_CAMERAS; i++) {
+		infos[i].struct_size = (uint32_t)sizeof(infos[i]);
+	}
+	uint32_t n = iface->stereo_camera_enumerate(inst, XRT_STEREO_CAMERA_MAX_CAMERAS, infos);
+	if (n > XRT_STEREO_CAMERA_MAX_CAMERAS) {
+		n = XRT_STEREO_CAMERA_MAX_CAMERAS;
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		struct scam_camera *cam = add_camera(m, XRT_STEREO_CAMERA_SOURCE_PLUGIN, i, &infos[i]);
+		if (cam == NULL) {
+			continue;
+		}
+		if (cam->info.flags & XRT_PLUGIN_STEREO_CAMERA_CALIBRATED) {
+			cam->calib.struct_size = (uint32_t)sizeof(cam->calib);
+			if (iface->stereo_camera_get_calibration(inst, i, &cam->calib) == XRT_SUCCESS) {
+				cam->have_calib = true;
+			} else {
+				U_LOG_W(
+				    "stereo camera: \"%s\" claims CALIBRATED but returned no calibration — RAW only",
+				    cam->info.display_name);
+				cam->info.flags &= ~XRT_PLUGIN_STEREO_CAMERA_CALIBRATED;
+			}
+		}
+		finish_camera(cam);
+	}
+}
+
+/*!
+ * Amendment 4: the service's own UVC side-by-side source. Opt-in only — with
+ * no config (stereo-cameras.json / DXR_STEREO_CAMERA_UVC_CONFIG) nothing is
+ * enumerated and no device is touched. Never claims a device a plug-in camera
+ * names as its platform_device_hint (the tracker camera is the plug-in's).
+ */
+static void
+add_uvc_cameras(struct ipc_server_stereo_camera *m, const struct ipc_server_stereo_camera_options *opts)
+{
+	struct u_stereo_uvc_config cfg;
+	if (opts != NULL && opts->uvc_config != NULL) {
+		cfg = *opts->uvc_config;
+	} else {
+		char path[1024], err[256];
+		enum u_stereo_uvc_config_load_result r =
+		    u_stereo_uvc_config_load(&cfg, path, sizeof(path), err, sizeof(err));
+		if (r == U_STEREO_UVC_CONFIG_INVALID) {
+			U_LOG_W("stereo camera (uvc): config \"%s\" is INVALID (%s) — no UVC camera", path, err);
+			return;
+		}
+		if (r != U_STEREO_UVC_CONFIG_OK) {
+			U_LOG_I("stereo camera (uvc): no UVC stereo camera configured (%s: %s)", path[0] ? path : "-",
+			        err);
+			return;
+		}
+		U_LOG_W("stereo camera (uvc): config \"%s\": %u entr%s%s", path, cfg.count,
+		        cfg.count == 1 ? "y" : "ies",
+		        cfg.fake ? ", FAKE synthetic device (no real camera is considered)" : "");
+	}
+	if (cfg.count == 0) {
+		return;
+	}
+	const char *hints[XRT_STEREO_CAMERA_MAX_CAMERAS];
+	uint32_t nh = 0;
+	for (uint32_t i = 0; i < m->camera_count; i++) {
+		if (m->cams[i].info.platform_device_hint[0] != '\0') {
+			hints[nh++] = m->cams[i].info.platform_device_hint;
+		}
+	}
+	struct u_stereo_uvc_backend os_backend;
+	const struct u_stereo_uvc_backend *backend = NULL;
+	if (opts != NULL && opts->uvc_backend != NULL) {
+		backend = opts->uvc_backend;
+	} else if (os_uvc_capture_backend(&os_backend)) {
+		backend = &os_backend;
+	}
+	m->uvc = u_stereo_uvc_create(&cfg, backend, hints, nh);
+
+	struct xrt_plugin_stereo_camera_info infos[XRT_STEREO_CAMERA_MAX_CAMERAS];
+	memset(infos, 0, sizeof(infos));
+	for (uint32_t i = 0; i < XRT_STEREO_CAMERA_MAX_CAMERAS; i++) {
+		infos[i].struct_size = (uint32_t)sizeof(infos[i]);
+	}
+	uint32_t n = u_stereo_uvc_enumerate(m->uvc, XRT_STEREO_CAMERA_MAX_CAMERAS, infos);
+	n = n > XRT_STEREO_CAMERA_MAX_CAMERAS ? XRT_STEREO_CAMERA_MAX_CAMERAS : n;
+	for (uint32_t i = 0; i < n; i++) {
+		struct scam_camera *cam = add_camera(m, XRT_STEREO_CAMERA_SOURCE_UVC, i, &infos[i]);
+		if (cam == NULL) {
+			continue;
+		}
+		cam->calib.struct_size = (uint32_t)sizeof(cam->calib);
+		bool nominal = true;
+		if (u_stereo_uvc_get_calibration(m->uvc, i, &cam->calib, &nominal, &cam->baseline_known,
+		                                 &cam->hfov_known) == XRT_SUCCESS) {
+			cam->have_calib = true;
+			cam->calib_nominal = nominal;
+		}
+		finish_camera(cam);
+	}
+}
+
 struct ipc_server_stereo_camera *
 ipc_server_stereo_camera_create(struct xrt_instance *xinst)
+{
+	return ipc_server_stereo_camera_create_ex(xinst, NULL);
+}
+
+struct ipc_server_stereo_camera *
+ipc_server_stereo_camera_create_ex(struct xrt_instance *xinst, const struct ipc_server_stereo_camera_options *opts)
 {
 	struct ipc_server_stereo_camera *m = U_TYPED_CALLOC(struct ipc_server_stereo_camera);
 	os_mutex_init(&m->lock);
@@ -1586,7 +1953,19 @@ ipc_server_stereo_camera_create(struct xrt_instance *xinst)
 
 	// R3: the consent policy over the real store; the prompt arrives later
 	// from the host (tray / menu bar) through set_prompt_provider.
-	u_camera_consent_init(&m->consent, u_camera_consent_store_default(), NULL, &env_ops, m);
+	const struct u_camera_consent_store_ops *store = u_camera_consent_store_default();
+	void *store_ctx = NULL;
+	const struct u_camera_consent_env_ops *env = &env_ops;
+	void *env_ctx = m;
+	if (opts != NULL && opts->consent_store != NULL) {
+		store = opts->consent_store;
+		store_ctx = opts->consent_store_ctx;
+	}
+	if (opts != NULL && opts->consent_env != NULL) {
+		env = opts->consent_env;
+		env_ctx = opts->consent_env_ctx;
+	}
+	u_camera_consent_init(&m->consent, store, store_ctx, env, env_ctx);
 	m->consent.kill_switch = !debug_get_bool_option_stereo_camera_enabled();
 	m->consent.dev_override = debug_get_bool_option_stereo_camera_dev_allow();
 	m->consent.prompt_enabled = debug_get_bool_option_stereo_camera_prompt();
@@ -1616,79 +1995,14 @@ ipc_server_stereo_camera_create(struct xrt_instance *xinst)
 		U_LOG_W("stereo camera: camera sharing is OFF (user toggle) — zero cameras until it is switched on");
 	}
 	if (!m->consent.prompt_enabled) {
-		U_LOG_W("stereo camera: consent prompt disabled (DXR_STEREO_CAMERA_PROMPT=0) — an app without a stored "
-		        "or delegated consent is refused");
-	}
-	const struct xrt_plugin_iface *iface = NULL;
-	struct xrt_plugin_instance *inst = NULL;
-	if (xinst == NULL || xinst->get_active_plugin == NULL || !xinst->get_active_plugin(xinst, &iface, &inst) ||
-	    !xrt_plugin_iface_has_stereo_camera(iface)) {
-		U_LOG_I("stereo camera: the active plug-in provides no camera source");
-		return m;
-	}
-	m->iface = iface;
-	m->inst = inst;
-
-	struct xrt_plugin_stereo_camera_info infos[XRT_STEREO_CAMERA_MAX_CAMERAS];
-	memset(infos, 0, sizeof(infos));
-	for (uint32_t i = 0; i < XRT_STEREO_CAMERA_MAX_CAMERAS; i++) {
-		infos[i].struct_size = (uint32_t)sizeof(infos[i]);
-	}
-	uint32_t n = iface->stereo_camera_enumerate(inst, XRT_STEREO_CAMERA_MAX_CAMERAS, infos);
-	if (n > XRT_STEREO_CAMERA_MAX_CAMERAS) {
-		n = XRT_STEREO_CAMERA_MAX_CAMERAS;
-	}
-	for (uint32_t i = 0; i < n; i++) {
-		struct scam_camera *cam = &m->cams[m->camera_count];
-		struct xrt_plugin_stereo_camera_info *info = &infos[i];
-		info->display_name[sizeof(info->display_name) - 1] = '\0';
-		info->device_identity[sizeof(info->device_identity) - 1] = '\0';
-		info->platform_device_hint[sizeof(info->platform_device_hint) - 1] = '\0';
-		if (info->eye_width == 0 || info->eye_height == 0 || (info->eye_width & 1u) ||
-		    (info->eye_height & 1u) || info->native_format < XRT_PLUGIN_STEREO_CAMERA_FORMAT_GRAY8 ||
-		    info->native_format > XRT_PLUGIN_STEREO_CAMERA_FORMAT_BGRA8) {
-			U_LOG_W(
-			    "stereo camera: plug-in camera %u has a malformed description (%ux%u, format %u) — "
-			    "skipped",
-			    i, info->eye_width, info->eye_height, info->native_format);
-			continue;
-		}
-		cam->index = i;
-		cam->camera_id = (uint64_t)m->camera_count + 1; // never reused in this service lifetime
-		cam->info = *info;
-		cam->mgr = m;
-		cam->state = XRT_STEREO_CAMERA_STATE_AVAILABLE;
-		os_cond_init(&cam->cond);
-		if (info->flags & XRT_PLUGIN_STEREO_CAMERA_CALIBRATED) {
-			cam->calib.struct_size = (uint32_t)sizeof(cam->calib);
-			if (iface->stereo_camera_get_calibration(inst, i, &cam->calib) == XRT_SUCCESS) {
-				cam->have_calib = true;
-			} else {
-				U_LOG_W(
-				    "stereo camera: \"%s\" claims CALIBRATED but returned no calibration — RAW only",
-				    info->display_name);
-				cam->info.flags &= ~XRT_PLUGIN_STEREO_CAMERA_CALIBRATED;
-			}
-		}
-		if (cam->have_calib && (cam->info.flags & XRT_PLUGIN_STEREO_CAMERA_NATIVELY_RECTIFIED) == 0) {
-			cam->rect = rectifier_create(cam);
-		}
-		if (!(info->max_frame_rate >= 0.0f && info->max_frame_rate <= 1000.0f)) {
-			cam->info.max_frame_rate = 0.0f; // NaN / negative / absurd = unknown
-		}
-		char rate[48];
-		if (cam->info.max_frame_rate > 0.0f) {
-			snprintf(rate, sizeof(rate), "advertised %.1f Hz", cam->info.max_frame_rate);
-		} else {
-			snprintf(rate, sizeof(rate), "rate unknown");
-		}
 		U_LOG_W(
-		    "stereo camera %llu: \"%s\" %ux%u per eye, %s (measured on first open), flags 0x%x, native "
-		    "format %u",
-		    (unsigned long long)cam->camera_id, info->display_name, info->eye_width, info->eye_height, rate,
-		    info->flags, info->native_format);
-		m->camera_count++;
+		    "stereo camera: consent prompt disabled (DXR_STEREO_CAMERA_PROMPT=0) — an app without a stored "
+		    "or delegated consent is refused");
 	}
+	// Plug-in cameras first: their platform_device_hints keep the UVC source
+	// off the devices they own.
+	add_plugin_cameras(m, xinst);
+	add_uvc_cameras(m, opts);
 	return m;
 }
 
@@ -1719,6 +2033,8 @@ ipc_server_stereo_camera_destroy(struct ipc_server_stereo_camera **mgr_ptr)
 			stream_free_storage(&m->streams[i]);
 		}
 	}
+	// Every camera thread has closed its source above: the UVC source can go.
+	u_stereo_uvc_destroy(&m->uvc);
 	if (g_mgr == m) {
 		g_mgr = NULL;
 	}
@@ -1860,12 +2176,20 @@ ipc_handle_stereo_camera_get_properties(volatile struct ipc_client_state *ics,
 	out_props->eye_width = cam->info.eye_width;
 	out_props->eye_height = cam->info.eye_height;
 	out_props->max_frame_rate = source_rate_hz(cam);
+	out_props->source = cam->source;
 	if (cam->have_calib) {
-		out_props->baseline_mm = (float)baseline_mm(&cam->calib);
 		// Spec §3: per eye, RECTIFIED (the service's rectified focal when it
 		// rectifies; the plug-in's own for a natively rectified source).
-		double fx = cam->rect != NULL ? cam->rect->geo.f : cam->calib.k[0][0];
-		if (fx > 0.0) {
+		double fx = cam->calib.k[0][0], cx = 0.0, cy = 0.0;
+		if (cam->rect != NULL) {
+			rectified_intrinsics(cam->rect, &fx, &cx, &cy);
+		}
+		// Amendment 4: a NOMINAL model reports only what the user configured;
+		// a default it fell back to is not a fact about the device (0 = unknown).
+		if (!cam->calib_nominal || cam->baseline_known) {
+			out_props->baseline_mm = (float)baseline_mm(&cam->calib);
+		}
+		if (fx > 0.0 && (!cam->calib_nominal || cam->hfov_known)) {
 			out_props->horizontal_fov_deg =
 			    (float)(2.0 * atan(cam->info.eye_width / (2.0 * fx)) * 180.0 / 3.14159265358979323846);
 		}
@@ -1923,6 +2247,11 @@ ipc_handle_stereo_camera_get_calibration(volatile struct ipc_client_state *ics,
 	if (xret == XRT_SUCCESS && !cam->have_calib) {
 		xret = XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
+	// Amendment 4: a nominal model is not a RAW calibration of the device —
+	// only the rectified numbers (which describe the frames delivered) are given.
+	if (xret == XRT_SUCCESS && cam->calib_nominal && output == XRT_STEREO_CAMERA_OUTPUT_RAW) {
+		xret = XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
 	if (xret == XRT_SUCCESS && output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED && !camera_can_rectify(cam)) {
 		xret = XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
@@ -1936,15 +2265,17 @@ ipc_handle_stereo_camera_get_calibration(volatile struct ipc_client_state *ics,
 		// infinity), no distortion, and the right camera a pure +x translation
 		// of the baseline (OpenCV P1/P2 with P2[0][3] = f * Tx, Tx = -baseline).
 		const struct u_stereo_rectify_result *g = &cam->rect->geo;
+		double f = 0.0, cx = 0.0, cy = 0.0;
+		rectified_intrinsics(cam->rect, &f, &cx, &cy); // a nominal pass-through: no zoom
 		out_calib->output = output;
 		for (int e = 0; e < 2; e++) {
 			struct xrt_stereo_camera_intrinsics *in = &out_calib->eye[e];
 			in->width = g->width;
 			in->height = g->height;
-			in->fx = (float)g->f;
-			in->fy = (float)g->f;
-			in->cx = (float)g->cx;
-			in->cy = (float)g->cy;
+			in->fx = (float)f;
+			in->fy = (float)f;
+			in->cx = (float)cx;
+			in->cy = (float)cy;
 			in->model = XRT_PLUGIN_STEREO_CAMERA_DISTORTION_NONE;
 		}
 		out_calib->orientation[3] = 1.0f; // identity
@@ -2031,8 +2362,12 @@ ipc_handle_stereo_camera_stream_create(volatile struct ipc_client_state *ics,
 		os_mutex_unlock(&m->lock);
 		return m->sharing_enabled ? XRT_ERROR_INPUT_UNSUPPORTED : XRT_ERROR_STEREO_CAMERA_DISABLED;
 	}
+	// RECTIFIED needs a calibration (CALIBRATED / NATIVELY_RECTIFIED) — or,
+	// Amendment 4, a nominal model the service rectifies (an uncalibrated UVC
+	// pair: frames as delivered + the online row alignment).
 	bool calibrated = (cam->info.flags &
-	                   (XRT_PLUGIN_STEREO_CAMERA_CALIBRATED | XRT_PLUGIN_STEREO_CAMERA_NATIVELY_RECTIFIED)) != 0;
+	                   (XRT_PLUGIN_STEREO_CAMERA_CALIBRATED | XRT_PLUGIN_STEREO_CAMERA_NATIVELY_RECTIFIED)) != 0 ||
+	                  (cam->calib_nominal && cam->rect != NULL);
 	if (req->output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED && !calibrated) {
 		os_mutex_unlock(&m->lock);
 		return XRT_ERROR_INPUT_UNSUPPORTED;

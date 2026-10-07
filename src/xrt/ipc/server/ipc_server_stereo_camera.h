@@ -4,9 +4,10 @@
  * @file
  * @brief  XR_DXR_stereo_camera (ADR-043): the service's camera manager.
  *
- * The service is the single owner of each plug-in-provided stereo camera: one
- * runtime-owned thread per open camera pulls frames from the plug-in's
- * wait_frame slot, and fans each frame out to every started, authorised stream
+ * The service is the single owner of each stereo camera — plug-in-provided, or
+ * (Amendment 4) an opted-in plain UVC side-by-side webcam read by the service's
+ * own vendor-neutral source: one runtime-owned thread per open camera pulls
+ * frames from the source's wait_frame, and fans each frame out to every started, authorised stream
  * — per stream a 3-slot latest-wins shared-memory ring (u_stereo_camera_ring),
  * format conversion, decimation, and a per-stream wake handle. The source is
  * opened on the first start and closed a linger (2 s) after the last stop.
@@ -22,6 +23,7 @@
 
 #include "xrt/xrt_instance.h"
 #include "util/u_camera_consent.h"
+#include "util/u_stereo_uvc.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -35,11 +37,35 @@ struct ipc_client_state;
 
 /*!
  * Create the manager over the active plug-in of @p xinst (the service's native
- * instance). Always returns a manager; with no plug-in, no camera slots, or the
- * kill switch (DXR_STEREO_CAMERA=0) it simply exposes zero cameras.
+ * instance) plus the service's own UVC side-by-side source (ADR-043 Amendment
+ * 4; opt-in by the per-user stereo-cameras.json, util/u_stereo_uvc.h). Always
+ * returns a manager; with no camera source or the kill switch
+ * (DXR_STEREO_CAMERA=0) it simply exposes zero cameras.
  */
 struct ipc_server_stereo_camera *
 ipc_server_stereo_camera_create(struct xrt_instance *xinst);
+
+/*!
+ * What @ref ipc_server_stereo_camera_create_ex may replace — the seams a test
+ * drives the whole manager through (tests_stereo_camera_manager). Every NULL
+ * field means "the service's real one".
+ */
+struct ipc_server_stereo_camera_options
+{
+	//! Consent store (default: the per-user store, u_camera_consent_store_default()).
+	const struct u_camera_consent_store_ops *consent_store;
+	void *consent_store_ctx;
+	//! Consent environment (default: OS camera switch, tray prompt, signer checks).
+	const struct u_camera_consent_env_ops *consent_env;
+	void *consent_env_ctx;
+	//! UVC source config (default: u_stereo_uvc_config_load()).
+	const struct u_stereo_uvc_config *uvc_config;
+	//! UVC capture backend (default: os_uvc_capture_backend()).
+	const struct u_stereo_uvc_backend *uvc_backend;
+};
+
+struct ipc_server_stereo_camera *
+ipc_server_stereo_camera_create_ex(struct xrt_instance *xinst, const struct ipc_server_stereo_camera_options *opts);
 
 //! Stop every camera thread, close every source, free every stream.
 void
