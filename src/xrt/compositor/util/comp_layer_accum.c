@@ -90,7 +90,12 @@ comp_layer_accum_projection_depth(struct comp_layer_accum *cla,
 	U_ZERO_ARRAY(layer->sc_array);
 	for (uint32_t i = 0; i < data->view_count; ++i) {
 		layer->sc_array[i] = xsc[i];
-		layer->sc_array[i + data->view_count] = d_xsc[i];
+		// Depth goes in the upper half at a FIXED offset, where
+		// comp_layer_get_depth_swapchain() and the inline getter in
+		// comp_layer_accum.h read it. Storing at [i + view_count] made every
+		// getter return NULL whenever view_count < XRT_MAX_VIEWS (ADR-046 3a
+		// is the first DisplayXR reader and found it).
+		layer->sc_array[XRT_MAX_VIEWS + i] = d_xsc[i];
 	}
 	layer->data = *data;
 
