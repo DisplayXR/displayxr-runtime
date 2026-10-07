@@ -29,9 +29,13 @@
  *      WORLD   C = S - f (1 - t) e: straight in front of the pointer's canvas
  *              point along the normal (e = eye-to-canvas). Parallaxes like
  *              content, but sits ~mm off the click point off-axis.
- *      HYBRID  (default) SCREEN while the pointer moves - exact aim - and
- *              world-fixed at the foot F of the last moving placement while
- *              it is still: C = F - f (1 - t) e. Continuous at the stop.
+ *      HYBRID  (default) SCREEN while the pointer moves - exact aim - storing
+ *              that locate's line of sight (E0, S0, e0). While the pointer is
+ *              still: C = E0 + s (S0 - E0), s = 1 - (1 - t) e / e0 - the point
+ *              on the anchor-time line at the current depth in front of the
+ *              glass. Continuous at the stop; a lateral head move keeps C
+ *              world-fixed (parallax); a depth change slides C along the
+ *              anchor-time line, so it stays on the click point.
  *
  * Pure C: time is a parameter, never read here.
  *
@@ -124,8 +128,12 @@ enum u_cursor_depth_anchor_mode
 struct u_cursor_depth_anchor
 {
 	bool has_anchor;
-	//! F: the foot on the canvas plane (along the normal) of the last moving placement.
-	struct xrt_vec3 foot;
+	//! E0: the cyclopean eye of the last moving placement.
+	struct xrt_vec3 eye;
+	//! S0: the canvas point under the pointer at the last moving placement.
+	struct xrt_vec3 canvas_point;
+	//! e0: E0's distance to the canvas along the normal then (> 0).
+	float eye_to_canvas;
 	//! Pointer UV of that placement.
 	float last_u, last_v;
 	//! Time of that placement.
