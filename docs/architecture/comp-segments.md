@@ -190,7 +190,9 @@ zone-scoped locates, a window covering more than `XRT_MAX_SEGMENTS` (2) screens.
 frame whose routing no longer matches (the mode changed between the locate and the
 commit) is drawn unrouted for that frame. Under per-segment views, canvas that lies on
 no screen is not covered by any view set and stays black (M2 painted it from the shared
-set). Quads and equirect layers are drawn with the first segment's camera in each tile.
+set). Quads and equirect2 layers are drawn once per segment in each tile, with that
+segment's view camera, viewport and scissor confined to the segment's rect (the compose
+pass; the blit fallback draws no quads at all).
 
 **IPC.** In-process only: the service never segments, so a service session always sees
 an empty table, one view set and no bindings (its own segmentation is M6).
