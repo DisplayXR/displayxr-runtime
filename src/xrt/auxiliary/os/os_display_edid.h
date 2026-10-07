@@ -9,6 +9,13 @@
  * Windows: reads EDID from the registry via SetupAPI, correlates with
  * EnumDisplayMonitors for HMONITOR handles and screen coordinates.
  *
+ * Desktop Linux: joins the RandR monitors (`os_display_desktop_enumerate`:
+ * placement rect, primary flag) to the DRM connectors in sysfs
+ * (`/sys/class/drm/card*-*`: EDID blob, status), see
+ * `os_display_edid_linux.h` for the join rules. With no reachable X server
+ * (pure Wayland) the records come from DRM alone and carry
+ * @ref os_display_edid_monitor::origin_unknown.
+ *
  * Other platforms: stubs that return zero results.
  */
 
@@ -37,6 +44,19 @@ enum os_edid_diag_error
 };
 
 /*!
+ * How a monitor's placement record was tied to its EDID (desktop Linux; the
+ * other platforms leave @ref OS_EDID_JOIN_NONE).
+ */
+enum os_display_edid_join
+{
+	OS_EDID_JOIN_NONE = 0,     //!< No EDID source tied to this monitor.
+	OS_EDID_JOIN_NAME = 1,     //!< RandR output name == normalised DRM connector name.
+	OS_EDID_JOIN_MM = 2,       //!< Unique match on physical size (mm, with tolerance).
+	OS_EDID_JOIN_MODE = 3,     //!< Unique match on pixel mode.
+	OS_EDID_JOIN_DRM_ONLY = 4, //!< No placement source (no X server): DRM record alone.
+};
+
+/*!
  * EDID-derived identity for a connected monitor.
  */
 struct os_display_edid_monitor
@@ -50,6 +70,26 @@ struct os_display_edid_monitor
 	uint32_t refresh_hz;      //!< Current refresh rate in Hz
 	bool is_primary;          //!< True if this is the primary monitor
 	void *hmonitor;           //!< HMONITOR on Windows, NULL elsewhere
+
+	/*!
+	 * @name Runtime-private extras (desktop Linux today; zero elsewhere)
+	 *
+	 * Not plug-in ABI: @ref xrt_display_descriptor is built from the fields
+	 * above and is unchanged. These feed `displayxr-cli displays`, the
+	 * monitor id, and the runtime's own panel matching.
+	 * @{
+	 */
+	uint32_t serial_number;         //!< EDID bytes 12-15 (little-endian); 0 = none.
+	uint32_t physical_width_mm;     //!< Detailed-timing mm, else bytes 21 x 10, else RandR; 0 = unknown.
+	uint32_t physical_height_mm;    //!< As above, bytes 22 x 10.
+	uint32_t native_width;          //!< The connector's device mode (may differ from pixel_width
+	uint32_t native_height;         //!< under a scaled X screen); 0 = unknown.
+	char connector[32];             //!< DRM connector, e.g. "HDMI-A-1"; "" = unknown.
+	char output_name[32];           //!< RandR output name, e.g. "HDMI-1"; "" = none.
+	bool origin_unknown;            //!< screen_left/top are NOT a desktop position (DRM-only record).
+	enum os_display_edid_join join; //!< How the EDID was tied to the placement record.
+
+	/*! @} */
 };
 
 /*!
@@ -75,6 +115,7 @@ struct os_display_edid_list
  *
  * On Windows, uses SetupAPI to read EDID from the registry and
  * correlates with EnumDisplayMonitors for HMONITOR handles.
+ * On desktop Linux, joins RandR monitors to DRM sysfs connectors.
  * On other platforms, sets count to 0.
  *
  * @param[out] out_list  Receives the enumerated monitors.
@@ -97,6 +138,23 @@ const struct os_display_edid_monitor *
 os_display_edid_find_in_table(const struct os_display_edid_list *list,
                               const uint16_t table[][2],
                               uint32_t table_len);
+
+/*!
+ * Short name of a join method ("name", "mm", "mode", "drm-only", "none"), for
+ * logs and `displayxr-cli displays`. Never NULL.
+ */
+static inline const char *
+os_display_edid_join_str(enum os_display_edid_join join)
+{
+	switch (join) {
+	case OS_EDID_JOIN_NAME: return "name";
+	case OS_EDID_JOIN_MM: return "mm";
+	case OS_EDID_JOIN_MODE: return "mode";
+	case OS_EDID_JOIN_DRM_ONLY: return "drm-only";
+	case OS_EDID_JOIN_NONE:
+	default: return "none";
+	}
+}
 
 #ifdef __cplusplus
 }
