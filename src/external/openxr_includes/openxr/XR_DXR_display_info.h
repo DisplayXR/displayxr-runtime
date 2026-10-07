@@ -864,13 +864,17 @@ typedef struct XrViewDisplayBindingDXR {
  * is the sum. The inactive tail aliases the last active view, exactly as in
  * the single-display case.
  *
- * bindingCountOutput is 1 for a window on one display (the whole canvas,
- * views [0, activeViewCount)) and 0 when the runtime cannot attribute views to
- * a display (no window yet, an IPC/service session, a session that began
- * XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO: a stereo session keeps its two
- * views on the display holding most of the window, and the other display shows
- * a flat 2D copy). An app that never chains this struct still renders
- * correctly: render every active view, each into its subImage.
+ * bindingCountOutput is the number of per-display view sets of this locate —
+ * one per display segment while the views are located per display (2 for a
+ * window spanning two displays; 1 for a window lying wholly on a display other
+ * than the system default) — and 0 whenever the views are ONE set for the
+ * whole window: a window on the system-default display only, no window yet, an
+ * IPC/service session, a camera-rig or zone-scoped locate, or a session that
+ * began XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO (a stereo session keeps its
+ * two views, framed from the display holding most of the window, and each other
+ * display shows its crop of them or a flat 2D copy). An app that never chains
+ * this struct still renders correctly: render every active view, each into its
+ * subImage.
  *
  * View poses of every display are expressed in ONE frame: the display holding
  * most of the window. Each other display's segment is placed beside it the way
