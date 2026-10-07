@@ -664,12 +664,14 @@ typedef struct XrViewActivityStateDXR {
 
 // ---- v22: Per-display enumeration, display spaces, session display binding (multi-screen M1) ----
 
-// Type values 1004999214-1004999216 (display_info's 210-219 decade, see
-// README.md). 1004999217 is RESERVED for XrViewDisplayBindingsDXR (per-view
-// display binding chained on XrViewState, multi-screen M3); 218-219 are free.
+// Type values 1004999214-1004999217 (display_info's 210-219 decade, see
+// README.md): 214-216 per-display enumeration (multi-screen M1), 217 the
+// per-view display bindings chained on XrViewState (multi-screen M3);
+// 218-219 are free.
 #define XR_TYPE_DISPLAY_DXR                       ((XrStructureType)1004999214)
 #define XR_TYPE_DISPLAY_SPACE_CREATE_INFO_DXR     ((XrStructureType)1004999215)
 #define XR_TYPE_SESSION_DISPLAY_BINDING_DXR       ((XrStructureType)1004999216)
+#define XR_TYPE_VIEW_DISPLAY_BINDINGS_DXR         ((XrStructureType)1004999217)
 
 //! Size of XrDisplayDXR::vendorPluginId, in bytes, including the NUL.
 #define XR_MAX_DISPLAY_VENDOR_PLUGIN_ID_SIZE_DXR 64
@@ -820,6 +822,70 @@ typedef struct XrSessionDisplayBindingDXR {
     const void* XR_MAY_ALIAS    next;
     uint64_t                    displayId;  //!< 0 = runtime decides
 } XrSessionDisplayBindingDXR;
+
+/*!
+ * @brief Which views of a locate belong to which display (v22, multi-screen M3).
+ *
+ * One entry of XrViewDisplayBindingsDXR::bindings: the contiguous view range
+ * [firstView, firstView + viewCount) was located for the part of the window
+ * that lands on display @ref displayId — the window SEGMENT @ref segmentRect.
+ */
+typedef struct XrViewDisplayBindingDXR {
+    //! The display these views are for (an id from xrEnumerateDisplaysDXR).
+    uint64_t    displayId;
+    /*!
+     * The segment: the part of the window's canvas on that display, in WINDOW
+     * pixels (the client area, origin top-left). Render these views into a
+     * tile of `segmentRect.extent * the active mode's view scale`; the
+     * runtime places that tile at the segment's position in each view tile.
+     */
+    XrRect2Di   segmentRect;
+    //! First view of the range (index into the XrView array xrLocateViews filled).
+    uint32_t    firstView;
+    //! Number of views in the range (the active rendering mode's view count).
+    uint32_t    viewCount;
+} XrViewDisplayBindingDXR;
+
+/*!
+ * @brief Per-view display bindings of a locate (v22, multi-screen M3).
+ *
+ * Chained to XrViewState in xrLocateViews; standard two-call idiom on the
+ * binding array (`bindingCapacityInput == 0` returns the count in
+ * `bindingCountOutput` and writes nothing else; a capacity smaller than the
+ * count writes the count and no bindings — xrLocateViews itself still
+ * succeeds, the views are always located).
+ *
+ * A window that spans displays is woven per display. Under
+ * XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR each 3D display the window
+ * covers then gets its OWN views: the active rendering mode's view count per
+ * display, located from that display's eyes with that display's segment as
+ * the Kooima canvas, laid out CONTIGUOUSLY per display in the order of this
+ * array (left to right on the desktop). XrViewActivityStateDXR::activeViewCount
+ * is the sum. The inactive tail aliases the last active view, exactly as in
+ * the single-display case.
+ *
+ * bindingCountOutput is 1 for a window on one display (the whole canvas,
+ * views [0, activeViewCount)) and 0 when the runtime cannot attribute views to
+ * a display (no window yet, an IPC/service session, a session that began
+ * XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO: a stereo session keeps its two
+ * views on the display holding most of the window, and the other display shows
+ * a flat 2D copy). An app that never chains this struct still renders
+ * correctly: render every active view, each into its subImage.
+ *
+ * View poses of every display are expressed in ONE frame: the display holding
+ * most of the window. Each other display's segment is placed beside it the way
+ * the window's pixels continue across the seam, so a scene spanning the seam
+ * stays continuous.
+ *
+ * @extends XrViewState
+ */
+typedef struct XrViewDisplayBindingsDXR {
+    XrStructureType             type;                 //!< Must be XR_TYPE_VIEW_DISPLAY_BINDINGS_DXR
+    void* XR_MAY_ALIAS          next;
+    uint32_t                    bindingCapacityInput; //!< Capacity of @ref bindings, or 0 to query the count
+    uint32_t                    bindingCountOutput;   //!< Number of bindings (or the required capacity)
+    XrViewDisplayBindingDXR*    bindings;             //!< Array of bindingCapacityInput entries; may be NULL when the capacity is 0
+} XrViewDisplayBindingsDXR;
 
 #ifndef XR_NO_PROTOTYPES
 XRAPI_ATTR XrResult XRAPI_CALL xrEnumerateDisplaysDXR(

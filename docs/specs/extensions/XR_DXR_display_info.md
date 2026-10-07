@@ -1151,7 +1151,7 @@ append-only: no existing struct, value or behaviour changes.
 #define XR_TYPE_DISPLAY_DXR                    ((XrStructureType)1004999214)
 #define XR_TYPE_DISPLAY_SPACE_CREATE_INFO_DXR  ((XrStructureType)1004999215)
 #define XR_TYPE_SESSION_DISPLAY_BINDING_DXR    ((XrStructureType)1004999216)
-// 1004999217 is RESERVED for XrViewDisplayBindingsDXR (per-view display binding, M3).
+#define XR_TYPE_VIEW_DISPLAY_BINDINGS_DXR      ((XrStructureType)1004999217) // M3, below
 
 typedef XrFlags64 XrDisplayFlagsDXR;
 XR_DISPLAY_PRIMARY_BIT_DXR        = 0x1  // the OS desktop's primary monitor
@@ -1234,6 +1234,81 @@ changes nothing. Swapchain sizing stays the system's worst case (ADR-010) and th
 display processor that weaves the session is still the system default's — honouring
 the binding in the compositor (segments, per-view display bindings) is M2/M3.
 `XrSystemProperties` is not affected by a session's binding.
+
+#### Per-segment views and view display bindings (v22, multi-screen M3)
+
+A window that spans two displays is woven per **segment** — the part of its canvas on
+each display, each by that display's own display processor (see
+`docs/architecture/comp-segments.md`). From M3 a session that began
+`XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR` also gets **one view set per segment**,
+each rendered from that display's own frustum. Decision D3 of ADR-047: no new view
+configuration type — per-display views ride the existing multiview surface.
+
+```c
+#define XR_TYPE_VIEW_DISPLAY_BINDINGS_DXR ((XrStructureType)1004999217)
+
+typedef struct XrViewDisplayBindingDXR {
+    uint64_t    displayId;   // an id from xrEnumerateDisplaysDXR
+    XrRect2Di   segmentRect; // the segment, WINDOW px (client area, top-left origin)
+    uint32_t    firstView;   // first view of the range
+    uint32_t    viewCount;   // the active rendering mode's view count
+} XrViewDisplayBindingDXR;
+
+typedef struct XrViewDisplayBindingsDXR {   // chained on XrViewState at xrLocateViews
+    XrStructureType             type;       // XR_TYPE_VIEW_DISPLAY_BINDINGS_DXR
+    void* XR_MAY_ALIAS          next;
+    uint32_t                    bindingCapacityInput;
+    uint32_t                    bindingCountOutput;
+    XrViewDisplayBindingDXR*    bindings;
+} XrViewDisplayBindingsDXR;
+```
+
+**The view count.** `PRIMARY_MULTIVIEW_DXR` now reports `device max views ×
+XRT_MAX_SEGMENTS` (capped at 8; `XRT_MAX_SEGMENTS` is 2 today — the plan's eventual cap is
+4): 4 on a 2-view Leia system, 8 on the 4-view sim_display. The count is fixed for the
+session (ADR-041). A window on one display locates exactly what it did before — the
+active mode's views first, the larger tail aliased onto view 0 — so the only visible
+change for such an app is the bigger count. Per-view recommended image sizes stay the
+worst case (full canvas × scale). `PRIMARY_STEREO` stays exactly 2.
+
+**Per-segment views.** When the window is woven per segment, `xrLocateViews` locates,
+for each segment in left-to-right order, the active mode's view count from:
+
+- **that display's eyes** — its display processor's predicted eyes when it is tracking a
+  viewer, else that display's nominal viewer;
+- **Kooima with the segment as the canvas** — the segment relative to its own display, in
+  that display's metres.
+
+The view sets are **contiguous**; `XrViewActivityStateDXR::activeViewCount` is the
+**sum**, and the inactive tail aliases view 0 as always. Every view pose is expressed in
+ONE frame — the display space of the display holding most of the window. The other
+display's segment is placed beside it the way the window's pixels continue across the
+seam (each panel's own pixel pitch on its side of the seam), so a scene that crosses the
+seam stays continuous: a display rig (`XrDisplayRigDXR`) still centres the whole window
+on its pose. A window entirely on a non-default display is the one-segment case: its
+views come from that display.
+
+`XrViewDisplayBindingsDXR` says which views are which: one binding per segment
+(`displayId`, `segmentRect`, `firstView`, `viewCount`). Standard two-call idiom on the
+binding array; it is written only on the call that returns views. `bindingCountOutput`
+is 0 whenever the views are one set for the whole window. Render local view `j` of a
+binding into a tile of `segmentRect.extent × the mode's view scale`, at the segment's
+position inside view tile `j` — the runtime composes exactly that mosaic, so an app that
+ignores the bindings and renders each active view at full-window size is still correct,
+just at a higher cost.
+
+**When the views stay one set** (and the compositor crops it per segment, as in M2):
+a `PRIMARY_STEREO` or `PRIMARY_MONO` session — whose two views are framed from the
+display holding most of the window (its eyes, the window relative to it), the other
+display showing its own crop of them or a flat 2D copy; a camera-centric locate
+(`XrCameraRigDXR`, or the qwerty camera rig of a runtime-window session), which frames a
+fixed-FOV camera on the whole window; a zone-scoped locate (`XrDisplayZoneDXR`); a window
+covering more displays than `XRT_MAX_SEGMENTS`; a display of unknown physical size.
+
+**Scope (M3).** In-process Vulkan sessions on desktop Linux (X11/XWayland), the only
+compositor that segments today. IPC/service sessions never segment: their tables are
+always one set, `bindingCountOutput` 0. The rendering mode is session-wide, so every
+segment carries the same view count.
 
 ### Example Code: Querying Display Mode Support and Requesting 2D
 
@@ -2008,10 +2083,11 @@ plug-in id, PRIMARY / TRACKED / SYSTEM_DEFAULT flags), per-display DISPLAY space
 (`xrCreateDisplaySpaceDXR`) and a session display binding (`XrSessionDisplayBindingDXR`).
 See *Per-display enumeration, DISPLAY spaces and session display binding (v22)*.
 
-Still open, and planned in `docs/roadmap/multi-screen.md`: a window that spans two
-displays woven per segment (M2), per-view display bindings on `XrViewState` and
-per-display DISPLAY poses — i.e. meaningful relationships between two displays' spaces
-(M3, `1004999217` reserved), and a second tracked panel with its own tracker (M5).
+Since M3 the same version also carries per-segment views and `XrViewDisplayBindingsDXR`
+(`1004999217`) — see *Per-segment views and view display bindings*. Still open, and
+planned in `docs/roadmap/multi-screen.md`: per-display DISPLAY poses — i.e. meaningful
+relationships between two displays' spaces — and a second tracked panel with its own
+tracker (M5).
 There is deliberately no shared room frame between displays.
 
 ---
@@ -2484,7 +2560,7 @@ the property) silently ignore the call — graceful degradation.
 | 19 | 2026-09-17 | David Fattal | **N-view view configuration** (#1486 option B / #80): added `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR` (`1004999212`) — the extension now extends the core `XrViewConfigurationType` enum. `xrEnumerateViewConfigurations` returns a list: a conformant 2-view `PRIMARY_STEREO` plus, when this extension is enabled, the DXR type reporting the device's max view count across modes. `xrEndFrame` rejects `viewCount > 2` under `PRIMARY_STEREO` and names the DXR type as the opt-in. Additive: no struct, wire or ABI change. Also carries the earlier RAW-mode wording clarification (#1370): eye positions are **relative to the display plane**, not "regardless of the reference space" — `XrViewDisplayRawDXR::displayPlanePose` reports that plane in the locate space, and render-ready views (legacy and rig-chained) honour `XrViewLocateInfo::space` on both legs. |
 | 20 | 2026-09-18 | David Fattal | **The mode floor** (#1499, follow-up to #1486): added `XR_DISPLAY_MODE_DENIAL_REASON_VIEW_CONFIG_CANNOT_FILL_DXR` (`6`) to `XrDisplayModeDenialReasonDXR`. A session never runs in, or requests, a rendering mode whose `viewCount` exceeds what its primary view configuration reports: `xrBeginSession` moves the display to a fillable mode before the first frame (announced with `XrEventDataRenderingModeChangedDXR`) and `xrRequestDisplayRenderingModeDXR` denies such a request with the new reason, locally, before it reaches the panel-lease holder. A `PRIMARY_MULTIVIEW_DXR` session is never floored or denied; a device that pins its mode and service mode both outrank the floor, and the runtime logs rather than silently clamps. **Enumerant only** — no struct, wire or ABI change. |
 | 21 | 2026-09-18 | David Fattal | **Fixed view count, per-frame activity** (ADR-041 Model E, #1528 / #1486): added `XrViewActivityStateDXR` (`1004999213`, chained on `XrViewState` at `xrLocateViews`). The located view count is fixed for the session (2 under `PRIMARY_STEREO`, the device maximum under `PRIMARY_MULTIVIEW_DXR`); `activeViewCount` says how many carry the active mode's views, the inactive tail is located at view 0's pose and ignored. `xrEndFrame`'s `viewCount` must equal the located count — an app rendering only the active views aliases the tail onto view 0's subimage. The pre-v21 1-view 2D submission stays accepted (deprecated, `DXR_UNDER_SUBMIT`). Additive: new chained struct only. |
-| 22 | 2026-10-07 | David Fattal | **Per-display enumeration** (multi-screen M1, ADR-047): added `XrDisplayDXR` (`1004999214`) + `xrEnumerateDisplaysDXR`, `XrDisplaySpaceCreateInfoDXR` (`1004999215`) + `xrCreateDisplaySpaceDXR`, `XrSessionDisplayBindingDXR` (`1004999216`, chained on `XrSessionCreateInfo`), `XrDisplayFlagsDXR`; `1004999217` reserved for `XrViewDisplayBindingsDXR` (M3). Append-only: `XrSystemProperties` keeps describing the system-default display. v22 limits: every DISPLAY space is the session's single display plane; a binding to a non-default display changes the session's display-scoped Kooima inputs only, not which DP weaves. **Current header version (`XR_DXR_display_info_SPEC_VERSION == 22`).** |
+| 22 | 2026-10-07 | David Fattal | **Per-display enumeration** (multi-screen M1, ADR-047): added `XrDisplayDXR` (`1004999214`) + `xrEnumerateDisplaysDXR`, `XrDisplaySpaceCreateInfoDXR` (`1004999215`) + `xrCreateDisplaySpaceDXR`, `XrSessionDisplayBindingDXR` (`1004999216`, chained on `XrSessionCreateInfo`), `XrDisplayFlagsDXR`; multi-screen M3 (same version, append-only) adds `XrViewDisplayBindingsDXR` (`1004999217`, chained on `XrViewState`), per-segment views for `PRIMARY_MULTIVIEW_DXR` sessions and a reported multiview count of device max × the system's view-set capacity (1, or 2 on desktop Linux with two DP-backed screens). Append-only: `XrSystemProperties` keeps describing the system-default display. v22 limits: every DISPLAY space is the session's single display plane; a binding to a non-default display changes the session's display-scoped Kooima inputs only, not which DP weaves. **Current header version (`XR_DXR_display_info_SPEC_VERSION == 22`).** |
 
 > The `XR_DXR_display_info_SPEC_VERSION` define in the header is the authoritative current
 > revision. Earlier revision numbers in this table reflect the proposal's editing history and do
