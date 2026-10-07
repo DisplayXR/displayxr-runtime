@@ -358,7 +358,10 @@ sets are expressed in one frame — the display space of the display holding mos
 window — with the other segment placed beside it the way the window's pixels continue
 across the seam, so a display rig still centres the whole window on its pose and each
 segment's virtual canvas is offset from it by `m2v ×` that segment's offset from the
-window centre. Geometry: `src/xrt/state_trackers/oxr/oxr_segment_views.{h,c}`; contract:
+window centre. The rig's `virtualDisplayHeight` sizes the WHOLE window: each segment
+gets it scaled by its share of the window's height (`h_seg / union_h`), so `m2v` is one
+value for every segment — stacked screens are not magnified per half, and panels of
+different pitch meet at the seam. Geometry: `src/xrt/state_trackers/oxr/oxr_segment_views.{h,c}`; contract:
 `docs/reference/view-configuration-model.md` § *Per-segment views*.
 
 ### Where the adjustment lives

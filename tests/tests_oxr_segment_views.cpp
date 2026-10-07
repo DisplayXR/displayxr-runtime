@@ -361,3 +361,56 @@ TEST_CASE("the frame's routing survives a later non-splitting locate", "[oxr][se
 	oxr_segment_views_route_take(&frame, &out);
 	CHECK(out.count == 0);
 }
+
+TEST_CASE("a display rig gets ONE m2v across segments", "[oxr][segment_views]")
+{
+	const float V = 0.24f; // XrDisplayRigDXR::virtualDisplayHeight
+
+	// Side by side, different pitch (the two-screen table): m2v_k = V *
+	// scale_k / h_k must be equal, so the seam has no gap and no overlap.
+	{
+		const xrt_segment_metrics m = two_screen_table();
+		oxr_segment_layout l;
+		REQUIRE(oxr_segment_views_layout(&m, &l));
+		const float m2v0 = V * oxr_segment_views_vdh_scale(&l, 0) / l.seg[0].h_m;
+		const float m2v1 = V * oxr_segment_views_vdh_scale(&l, 1) / l.seg[1].h_m;
+		CHECK(m2v0 == Catch::Approx(m2v1));
+		CHECK(m2v0 == Catch::Approx(V / l.window_ref_h));
+		// Seam continuity in VIRTUAL units with that shared m2v.
+		const float a_right = m2v0 * (l.seg[0].ref_cx + l.seg[0].w_m * 0.5f - l.window_ref_cx);
+		const float b_left = m2v1 * (l.seg[1].ref_cx - l.seg[1].w_m * 0.5f - l.window_ref_cx);
+		CHECK(a_right == Catch::Approx(b_left).margin(1e-6));
+	}
+
+	// Stacked vertically, same panel: each half is half the window, not a
+	// full virtual display (which magnified each half 2x).
+	{
+		xrt_segment_metrics m;
+		std::memset(&m, 0, sizeof(m));
+		m.count = 2;
+		m.window_screen_left = 100;
+		m.window_screen_top = 980;
+		m.window_pixel_width = 800;
+		m.window_pixel_height = 200;
+		for (uint32_t i = 0; i < 2; i++) {
+			xrt_segment_metric &s = m.seg[i];
+			s.screen_id = 1 + i;
+			s.window_rect = {{0, (int)(i * 100)}, {800, 100}};
+			s.screen_rect = {{100, i == 0 ? 980 : 0}, {800, 100}};
+			s.screen_desktop_left = 0;
+			s.screen_desktop_top = (int32_t)(i * 1080);
+			s.screen_desktop_width = 1920;
+			s.screen_desktop_height = 1080;
+			s.screen_width_m = 0.344f;
+			s.screen_height_m = 0.1935f;
+			s.nominal_viewer_z_m = 0.6f;
+		}
+		m.seg[0].is_primary = true;
+		oxr_segment_layout l;
+		REQUIRE(oxr_segment_views_layout(&m, &l));
+		CHECK(oxr_segment_views_vdh_scale(&l, 0) == Catch::Approx(0.5f));
+		CHECK(oxr_segment_views_vdh_scale(&l, 1) == Catch::Approx(0.5f));
+		// Bottom of the top segment meets the top of the bottom one.
+		CHECK(l.seg[0].ref_cy - l.seg[0].h_m * 0.5f == Catch::Approx(l.seg[1].ref_cy + l.seg[1].h_m * 0.5f));
+	}
+}

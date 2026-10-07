@@ -135,6 +135,8 @@ oxr_segment_views_layout(const struct xrt_segment_metrics *m, struct oxr_segment
 	out->majority = mj;
 	out->window_ref_cx = (x0 + x1) * 0.5f;
 	out->window_ref_cy = (y0 + y1) * 0.5f;
+	out->window_ref_w = x1 - x0;
+	out->window_ref_h = y1 - y0;
 	return true;
 }
 
