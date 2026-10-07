@@ -71,7 +71,9 @@ this is the same order in developer terms.
    **Allow** and **Deny** are remembered for your executable; **Allow once** lasts for this
    process. Your `xrStartStereoCameraStreamDXR` call **blocks** while the dialog is up (up to
    60 s). Unanswered, dismissed, or no prompt available (`DXR_STEREO_CAMERA_PROMPT=0`, a headless
-   Linux service) → `CONSENT_REFUSED`, nothing stored — you may try again later.
+   Linux service) → `CONSENT_REFUSED`, nothing stored — you may try again later. When the
+   prompt times out the dialog closes, and a click that still lands after that is dropped,
+   never stored (#1842).
 
 A refused stream is not destroyed: call start again after the user has allowed you. Map the
 results like this in a browser:

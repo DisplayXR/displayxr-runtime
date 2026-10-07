@@ -386,15 +386,23 @@ struct cam_prompt_req
 	char exe[512];
 	char app[128];
 	long pid;
-	enum u_camera_consent_prompt_answer answer;
-	bool answered;
+	uint64_t gen; //!< the hand-off generation the panel answers
 	bool shown;
 };
 
+/*
+ * #1842: s_cam_mutex guards the hand-off and s_cam_prompt. Whoever moves the
+ * request out of PENDING first wins (a button, or camera_prompt_fn giving up);
+ * an answer after that is dropped, never returned to the policy, never stored.
+ * The panel remembers the generation it was shown for, so a panel still on
+ * screen from an older request can never answer a newer one.
+ */
 static pthread_mutex_t s_cam_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t s_cam_cond = PTHREAD_COND_INITIALIZER;
-static struct cam_prompt_req *s_cam_prompt = NULL; //!< the one pending request (consent_lock serialises)
+static struct u_camera_consent_handoff s_cam_handoff;  //!< under s_cam_mutex
+static struct cam_prompt_req *s_cam_prompt = NULL; //!< under s_cam_mutex: the request waiting (consent_lock serialises)
 static NSPanel *s_cam_panel = nil;                 //!< main thread only
+static uint64_t s_cam_panel_gen = 0;               //!< main thread only: the request s_cam_panel answers
 static volatile bool s_cam_dirty = true;           //!< indicator needs a refresh
 static NSImage *s_logo_image = nil;
 static NSImage *s_logo_inuse_image = nil;
@@ -431,17 +439,28 @@ camera_prompt_fn(void *ctx, const char *exe, const char *app_name, long pid, uin
 		deadline.tv_nsec -= 1000000000L;
 	}
 	pthread_mutex_lock(&s_cam_mutex);
+	uint64_t gen = u_camera_consent_handoff_begin(&s_cam_handoff);
+	req.gen = gen;
 	s_cam_prompt = &req;
 	s_cam_dirty = true;
-	while (!req.answered) {
+	while (u_camera_consent_handoff_is_pending(&s_cam_handoff, gen)) {
 		if (pthread_cond_timedwait(&s_cam_cond, &s_cam_mutex, &deadline) == ETIMEDOUT) {
 			break;
 		}
 	}
-	enum u_camera_consent_prompt_answer a = req.answered ? req.answer : U_CAMERA_CONSENT_PROMPT_TIMEOUT;
-	s_cam_prompt = NULL; // the panel (if up) closes on the next pump; buttons see NULL
+	// Settle: PENDING -> TIMED_OUT here unless a button got there first; from
+	// now on a click on this request's panel is dropped.
+	enum u_camera_consent_prompt_answer a = u_camera_consent_handoff_finish(&s_cam_handoff, gen);
+	if (s_cam_prompt == &req) {
+		s_cam_prompt = NULL; // the panel (if up) closes on the next pump
+	}
 	s_cam_dirty = true;
 	pthread_mutex_unlock(&s_cam_mutex);
+	if (a == U_CAMERA_CONSENT_PROMPT_TIMEOUT) {
+		U_LOG_W("stereo camera: consent prompt #%llu ended unanswered after %u ms — closing it; a later click is "
+		        "dropped",
+		        (unsigned long long)gen, timeout_ms);
+	}
 	return a;
 }
 
@@ -452,22 +471,34 @@ camera_indicator_changed(void *ctx)
 	s_cam_dirty = true;
 }
 
-//! Main thread: a button answered (NULL request = already timed out).
+//! Main thread: close the consent panel, if any.
 static void
-camera_prompt_answer(enum u_camera_consent_prompt_answer a)
+camera_panel_close(void)
 {
-	pthread_mutex_lock(&s_cam_mutex);
-	if (s_cam_prompt != NULL && !s_cam_prompt->answered) {
-		s_cam_prompt->answer = a;
-		s_cam_prompt->answered = true;
-		pthread_cond_broadcast(&s_cam_cond);
-	}
-	pthread_mutex_unlock(&s_cam_mutex);
 	if (s_cam_panel != nil) {
 		[s_cam_panel orderOut:nil];
 		[s_cam_panel release];
 		s_cam_panel = nil;
 	}
+	s_cam_panel_gen = 0;
+}
+
+//! Main thread: a button answered the panel's request — first transition wins.
+static void
+camera_prompt_answer(enum u_camera_consent_prompt_answer a)
+{
+	uint64_t gen = s_cam_panel_gen;
+	pthread_mutex_lock(&s_cam_mutex);
+	enum u_camera_consent_handoff_result r = u_camera_consent_handoff_answer(&s_cam_handoff, gen, a);
+	if (r == U_CAMERA_CONSENT_HANDOFF_ACCEPTED) {
+		pthread_cond_broadcast(&s_cam_cond);
+	}
+	pthread_mutex_unlock(&s_cam_mutex);
+	if (r != U_CAMERA_CONSENT_HANDOFF_ACCEPTED) {
+		U_LOG_W("stereo camera: consent answer %d DROPPED, not stored — %s (prompt #%llu)", (int)a,
+		        u_camera_consent_handoff_result_str(r), (unsigned long long)gen);
+	}
+	camera_panel_close();
 }
 
 @interface DXRStatusTarget : NSObject <NSMenuDelegate>
@@ -630,21 +661,26 @@ make_inuse_image(NSImage *logo)
 static void
 camera_pump(void)
 {
+	// Copy the request under the lock: the requester may give up (and its
+	// stack frame die) the moment the lock is released.
+	struct cam_prompt_req copy;
+	memset(&copy, 0, sizeof(copy));
 	pthread_mutex_lock(&s_cam_mutex);
 	struct cam_prompt_req *req = s_cam_prompt;
 	bool show = req != NULL && !req->shown;
 	if (show) {
 		req->shown = true;
+		copy = *req;
 	}
-	bool close = req == NULL && s_cam_panel != nil;
+	// The panel on screen must belong to the request still pending, else close it.
+	bool close = s_cam_panel != nil && !u_camera_consent_handoff_is_pending(&s_cam_handoff, s_cam_panel_gen);
 	pthread_mutex_unlock(&s_cam_mutex);
-	if (show) {
-		camera_prompt_show(s_status_target, req);
+	if (close || (show && s_cam_panel != nil)) {
+		camera_panel_close();
 	}
-	if (close) {
-		[s_cam_panel orderOut:nil];
-		[s_cam_panel release];
-		s_cam_panel = nil;
+	if (show) {
+		camera_prompt_show(s_status_target, &copy);
+		s_cam_panel_gen = copy.gen;
 	}
 	if (!s_cam_dirty) {
 		return;

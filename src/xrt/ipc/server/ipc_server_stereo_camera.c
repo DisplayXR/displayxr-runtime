@@ -147,6 +147,9 @@ DEBUG_GET_ONCE_BOOL_OPTION(stereo_camera_enabled, "DXR_STEREO_CAMERA", true)
 DEBUG_GET_ONCE_BOOL_OPTION(stereo_camera_dev_allow, "DXR_STEREO_CAMERA_DEV_ALLOW", false)
 DEBUG_GET_ONCE_BOOL_OPTION(stereo_camera_prompt, "DXR_STEREO_CAMERA_PROMPT", true)
 DEBUG_GET_ONCE_BOOL_OPTION(stereo_camera_refine, "DXR_STEREO_CAMERA_REFINE", true)
+// DEV ONLY (#1842 hardware repro): shorten / lengthen the consent prompt's
+// timeout. Read once at service start; 0 / unset = PROMPT_TIMEOUT_MS.
+DEBUG_GET_ONCE_NUM_OPTION(stereo_camera_prompt_timeout_ms, "DXR_STEREO_CAMERA_PROMPT_TIMEOUT_MS", 0)
 
 #define MAX_STREAMS (XRT_STEREO_CAMERA_MAX_CAMERAS * XRT_STEREO_CAMERA_MAX_STREAMS_PER_CAMERA)
 #define LINGER_NS (2000ll * 1000 * 1000)
@@ -157,6 +160,8 @@ DEBUG_GET_ONCE_BOOL_OPTION(stereo_camera_refine, "DXR_STEREO_CAMERA_REFINE", tru
 #define REFINE_SAMPLES 512 //!< matches one measurement may return
 #define VISIBILITY_TTL_NS (250ll * 1000 * 1000) //!< foreground-rule cache per stream
 #define PROMPT_TIMEOUT_MS 60000u                //!< an unanswered consent prompt = refused
+#define PROMPT_TIMEOUT_MIN_MS 1000u             //!< DXR_STEREO_CAMERA_PROMPT_TIMEOUT_MS clamp (dev only)
+#define PROMPT_TIMEOUT_MAX_MS 600000u
 #define EVQ_CAP 16                              //!< queued events per connection
 
 
@@ -1586,6 +1591,20 @@ ipc_server_stereo_camera_create(struct xrt_instance *xinst)
 	m->consent.dev_override = debug_get_bool_option_stereo_camera_dev_allow();
 	m->consent.prompt_enabled = debug_get_bool_option_stereo_camera_prompt();
 	m->consent.prompt_timeout_ms = PROMPT_TIMEOUT_MS;
+	long dev_timeout = debug_get_num_option_stereo_camera_prompt_timeout_ms();
+	if (dev_timeout > 0) {
+		// Clamped so a typo can neither make the prompt unanswerable nor
+		// park a client thread for hours.
+		uint32_t t = dev_timeout > (long)PROMPT_TIMEOUT_MAX_MS ? PROMPT_TIMEOUT_MAX_MS : (uint32_t)dev_timeout;
+		if (t < PROMPT_TIMEOUT_MIN_MS) {
+			t = PROMPT_TIMEOUT_MIN_MS;
+		}
+		m->consent.prompt_timeout_ms = t;
+		U_LOG_W(
+		    "stereo camera: consent prompt timeout %u ms (DXR_STEREO_CAMERA_PROMPT_TIMEOUT_MS — development "
+		    "override; default %u ms)",
+		    t, PROMPT_TIMEOUT_MS);
+	}
 	m->sharing_enabled = u_camera_consent_sharing_enabled(&m->consent);
 	g_mgr = m;
 

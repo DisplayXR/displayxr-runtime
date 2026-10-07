@@ -337,6 +337,84 @@ u_camera_consent_persistent_id_keyed(
 
 /*
  *
+ * The prompt hand-off (#1842): the request / answer state machine between the
+ * thread that waits for an answer (the IPC client thread inside the prompt
+ * provider) and the UI thread whose buttons answer (tray / menu bar).
+ *
+ * Every request gets a fresh generation and starts PENDING. Exactly one
+ * transition out of PENDING happens per generation and whoever makes it first
+ * wins: a button (u_camera_consent_handoff_answer -> ANSWERED) or the
+ * requester giving up (u_camera_consent_handoff_finish -> TIMED_OUT). Only an
+ * ANSWERED request's answer ever reaches the policy — and with it the store —
+ * so a click that lands after the requester gave up (the dialog was still on
+ * screen, or its close message was still queued) is DROPPED, never persisted.
+ * A dialog left over from an older request carries an older generation and can
+ * never answer a newer one.
+ *
+ * Not thread-safe by itself: the caller serialises every call with the one
+ * lock the UI thread and the waiting thread share. Pure (no OS calls) so it is
+ * unit-tested on every OS.
+ *
+ */
+
+enum u_camera_consent_handoff_state
+{
+	U_CAMERA_CONSENT_HANDOFF_IDLE = 0,  //!< no request yet
+	U_CAMERA_CONSENT_HANDOFF_PENDING,   //!< shown (or about to be), waiting for an answer
+	U_CAMERA_CONSENT_HANDOFF_ANSWERED,  //!< a button answered first
+	U_CAMERA_CONSENT_HANDOFF_TIMED_OUT, //!< the requester gave up first
+};
+
+//! What became of an answer offered with @ref u_camera_consent_handoff_answer.
+enum u_camera_consent_handoff_result
+{
+	U_CAMERA_CONSENT_HANDOFF_ACCEPTED = 0,   //!< it is THE answer: wake the requester
+	U_CAMERA_CONSENT_HANDOFF_DROPPED_LATE,   //!< the requester already gave up on this request
+	U_CAMERA_CONSENT_HANDOFF_DROPPED_DOUBLE, //!< this request was already answered (first wins)
+	U_CAMERA_CONSENT_HANDOFF_DROPPED_STALE,  //!< a different (newer) request is current
+};
+
+struct u_camera_consent_handoff
+{
+	uint64_t generation; //!< of the current / last request; 0 = none yet
+	enum u_camera_consent_handoff_state state;
+	enum u_camera_consent_prompt_answer answer; //!< valid in ANSWERED
+	uint32_t dropped;                           //!< answers dropped so far (diagnostics)
+};
+
+//! A new request: returns its generation (never 0) and makes it PENDING.
+uint64_t
+u_camera_consent_handoff_begin(struct u_camera_consent_handoff *h);
+
+/*!
+ * The UI offers @p answer for request @p generation. ACCEPTED only when that
+ * request is the current one and still PENDING (it becomes ANSWERED);
+ * otherwise nothing changes and the reason is returned.
+ */
+enum u_camera_consent_handoff_result
+u_camera_consent_handoff_answer(struct u_camera_consent_handoff *h,
+                                uint64_t generation,
+                                enum u_camera_consent_prompt_answer answer);
+
+/*!
+ * The requester stops waiting on @p generation (answered, timed out, or
+ * failed). Still PENDING -> TIMED_OUT and returns U_CAMERA_CONSENT_PROMPT_TIMEOUT;
+ * ANSWERED -> returns the answer. From here on nothing can answer it.
+ */
+enum u_camera_consent_prompt_answer
+u_camera_consent_handoff_finish(struct u_camera_consent_handoff *h, uint64_t generation);
+
+//! Is @p generation the current request, still waiting for an answer?
+bool
+u_camera_consent_handoff_is_pending(const struct u_camera_consent_handoff *h, uint64_t generation);
+
+//! Human-readable @ref u_camera_consent_handoff_result (for the drop WARN).
+const char *
+u_camera_consent_handoff_result_str(enum u_camera_consent_handoff_result r);
+
+
+/*
+ *
  * Pure helpers the platform store is built on (unit-tested on every OS).
  *
  */

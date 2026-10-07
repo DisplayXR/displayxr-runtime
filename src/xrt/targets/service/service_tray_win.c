@@ -40,8 +40,8 @@
 // ADR-043 R3: stereo camera indicator / kill switch / sharing toggle
 #define IDM_CAMERA_STOP     1060
 #define IDM_CAMERA_SHARING  1061
-#define WM_CAMERA_PROMPT        (WM_APP + 2) //!< lParam = struct cam_prompt_req * (show)
-#define WM_CAMERA_PROMPT_CLOSE  (WM_APP + 3) //!< lParam = struct cam_prompt_req * (close, SendMessage)
+#define WM_CAMERA_PROMPT (WM_APP + 2)       //!< lParam = struct cam_prompt_req * (heap; the tray owns it)
+#define WM_CAMERA_PROMPT_CLOSE (WM_APP + 3) //!< wParam = request generation (close its dialog)
 #define WM_CAMERA_INDICATOR     (WM_APP + 4) //!< refresh icon + tooltip now
 #define WM_CAMERA_NOTICE (WM_APP + 5)        //!< lParam = struct cam_notice * (heap; the tray frees it)
 
@@ -78,14 +78,30 @@ static HICON s_icon_base = NULL;
 static HICON s_icon_inuse = NULL;
 static bool s_camera_in_use = false;
 
+/*!
+ * One consent prompt's dialog text. Heap-allocated by the requester and handed
+ * to the tray thread with WM_CAMERA_PROMPT, which owns it from then on (the
+ * dialog frees it on WM_NCDESTROY) — the requester never touches it again, so
+ * a dialog can outlive the request without pointing at a dead stack frame.
+ */
 struct cam_prompt_req
 {
 	wchar_t title[256];
 	wchar_t body[512];
-	HANDLE done; //!< signalled by a button / close
-	volatile LONG answer; //!< enum u_camera_consent_prompt_answer
-	HWND dlg;    //!< tray thread only
+	uint64_t gen; //!< the hand-off generation this dialog answers
+	HFONT font;   //!< the dialog's font (deleted with it), may be NULL
 };
+
+/*
+ * #1842: the request / answer hand-off. s_cam_lock guards s_cam_handoff and
+ * s_cam_done; the IPC thread waiting in tray_camera_prompt and the tray thread
+ * whose buttons answer both take it. Whoever moves the request out of PENDING
+ * first wins; an answer after the requester gave up is dropped, never stored.
+ */
+static SRWLOCK s_cam_lock = SRWLOCK_INIT;
+static struct u_camera_consent_handoff s_cam_handoff; //!< under s_cam_lock
+static HANDLE s_cam_done = NULL;                      //!< under s_cam_lock: wakes the current requester
+static HWND s_cam_dlg = NULL;                         //!< tray thread only: the dialog on screen
 
 
 /*
@@ -552,6 +568,38 @@ show_camera_notice(struct cam_notice *cn)
 #define CAM_BTN_ONCE 2
 #define CAM_BTN_DENY 3
 
+static const char *
+cam_answer_str(enum u_camera_consent_prompt_answer a)
+{
+	switch (a) {
+	case U_CAMERA_CONSENT_PROMPT_ALLOW: return "Allow";
+	case U_CAMERA_CONSENT_PROMPT_ALLOW_ONCE: return "Allow once";
+	case U_CAMERA_CONSENT_PROMPT_DENY: return "Deny";
+	case U_CAMERA_CONSENT_PROMPT_TIMEOUT: return "dismissed";
+	default: return "unavailable";
+	}
+}
+
+/*!
+ * Tray thread: offer @p a as the answer to request @p gen. Only the first
+ * transition out of PENDING counts; a late / double / stale answer is dropped
+ * (never reaches the policy, so never the store) with one WARN.
+ */
+static void
+cam_prompt_offer(uint64_t gen, enum u_camera_consent_prompt_answer a)
+{
+	AcquireSRWLockExclusive(&s_cam_lock);
+	enum u_camera_consent_handoff_result r = u_camera_consent_handoff_answer(&s_cam_handoff, gen, a);
+	if (r == U_CAMERA_CONSENT_HANDOFF_ACCEPTED && s_cam_done != NULL) {
+		SetEvent(s_cam_done);
+	}
+	ReleaseSRWLockExclusive(&s_cam_lock);
+	if (r != U_CAMERA_CONSENT_HANDOFF_ACCEPTED && a != U_CAMERA_CONSENT_PROMPT_TIMEOUT) {
+		U_LOG_W("stereo camera: consent answer \"%s\" DROPPED, not stored — %s (prompt #%llu)",
+		        cam_answer_str(a), u_camera_consent_handoff_result_str(r), (unsigned long long)gen);
+	}
+}
+
 static LRESULT CALLBACK
 cam_prompt_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -561,40 +609,77 @@ cam_prompt_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		if (req == NULL) {
 			return 0;
 		}
-		LONG a = -1;
+		enum u_camera_consent_prompt_answer a;
 		switch (LOWORD(wParam)) {
 		case CAM_BTN_ALLOW: a = U_CAMERA_CONSENT_PROMPT_ALLOW; break;
 		case CAM_BTN_ONCE: a = U_CAMERA_CONSENT_PROMPT_ALLOW_ONCE; break;
 		case CAM_BTN_DENY: a = U_CAMERA_CONSENT_PROMPT_DENY; break;
 		default: return 0;
 		}
-		InterlockedExchange(&req->answer, a);
-		SetEvent(req->done);
+		cam_prompt_offer(req->gen, a);
 		DestroyWindow(hwnd);
 		return 0;
 	}
 	case WM_CLOSE:
 		// Dismissed without an answer: refused now, asked again next time.
 		if (req != NULL) {
-			InterlockedExchange(&req->answer, U_CAMERA_CONSENT_PROMPT_TIMEOUT);
-			SetEvent(req->done);
+			cam_prompt_offer(req->gen, U_CAMERA_CONSENT_PROMPT_TIMEOUT);
 		}
 		DestroyWindow(hwnd);
 		return 0;
-	case WM_DESTROY:
-		if (req != NULL) {
-			req->dlg = NULL;
+	case WM_NCDESTROY:
+		// The dialog owns its request: free it with the window.
+		SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+		if (s_cam_dlg == hwnd) {
+			s_cam_dlg = NULL;
 		}
-		return 0;
+		if (req != NULL) {
+			if (req->font != NULL) {
+				DeleteObject(req->font);
+			}
+			free(req);
+		}
+		return DefWindowProcW(hwnd, msg, wParam, lParam);
 	case WM_CTLCOLORSTATIC: return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
 	default: return DefWindowProcW(hwnd, msg, wParam, lParam);
 	}
 }
 
-//! Tray thread: show the consent dialog ("<app> wants to use the 3D camera").
+//! Tray thread: close the dialog on screen if it belongs to request @p gen or an older one.
+static void
+cam_prompt_close(uint64_t gen)
+{
+	if (s_cam_dlg == NULL) {
+		return;
+	}
+	struct cam_prompt_req *req = (struct cam_prompt_req *)GetWindowLongPtrW(s_cam_dlg, GWLP_USERDATA);
+	if (req == NULL || req->gen <= gen) {
+		DestroyWindow(s_cam_dlg); // WM_NCDESTROY frees req and clears s_cam_dlg
+	}
+}
+
+/*!
+ * Tray thread: show the consent dialog ("<app> wants to use the 3D camera").
+ * Takes ownership of @p req (heap).
+ */
 static void
 cam_prompt_show(struct cam_prompt_req *req)
 {
+	// The requester may have given up while this message sat in the queue
+	// (a busy tray thread): never show a prompt nobody is waiting for.
+	AcquireSRWLockShared(&s_cam_lock);
+	bool pending = u_camera_consent_handoff_is_pending(&s_cam_handoff, req->gen);
+	ReleaseSRWLockShared(&s_cam_lock);
+	if (!pending) {
+		U_LOG_W("stereo camera: consent prompt #%llu not shown — its request already ended",
+		        (unsigned long long)req->gen);
+		free(req);
+		return;
+	}
+	// A leftover dialog belongs to an older request: it must not stay up
+	// looking like this one (its answer would be dropped anyway).
+	cam_prompt_close(req->gen);
+
 	static bool registered = false;
 	HINSTANCE hi = GetModuleHandleW(NULL);
 	if (!registered) {
@@ -620,8 +705,8 @@ cam_prompt_show(struct cam_prompt_req *req)
 	HWND dlg = CreateWindowExW(WS_EX_TOPMOST | WS_EX_DLGMODALFRAME, L"DisplayXRCameraConsent", L"DisplayXR",
 	                           WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, x, y, w, h, NULL, NULL, hi, NULL);
 	if (dlg == NULL) {
-		InterlockedExchange(&req->answer, U_CAMERA_CONSENT_PROMPT_UNAVAILABLE);
-		SetEvent(req->done);
+		cam_prompt_offer(req->gen, U_CAMERA_CONSENT_PROMPT_UNAVAILABLE);
+		free(req);
 		return;
 	}
 	SetWindowLongPtrW(dlg, GWLP_USERDATA, (LONG_PTR)req);
@@ -632,6 +717,7 @@ cam_prompt_show(struct cam_prompt_req *req)
 		ui_font = CreateFontIndirectW(&ncm.lfMessageFont);
 		font = ui_font != NULL ? ui_font : font;
 	}
+	req->font = ui_font; // deleted with the dialog (WM_NCDESTROY)
 	HWND t = CreateWindowExW(0, L"STATIC", req->title, WS_CHILD | WS_VISIBLE, DP(16), DP(14), DP(420), DP(22), dlg,
 	                         NULL, hi, NULL);
 	HWND b = CreateWindowExW(0, L"STATIC", req->body, WS_CHILD | WS_VISIBLE, DP(16), DP(42), DP(420), DP(56), dlg,
@@ -647,7 +733,7 @@ cam_prompt_show(struct cam_prompt_req *req)
 		SendMessageW(ctls[i], WM_SETFONT, (WPARAM)font, TRUE);
 	}
 #undef DP
-	req->dlg = dlg;
+	s_cam_dlg = dlg;
 	ShowWindow(dlg, SW_SHOWNORMAL);
 	SetForegroundWindow(dlg);
 	SetFocus(allow);
@@ -655,8 +741,13 @@ cam_prompt_show(struct cam_prompt_req *req)
 
 /*!
  * The manager's prompt provider (IPC client thread): hand the request to the
- * tray thread, wait for the answer or the timeout, then close the dialog
- * synchronously (SendMessage runs on the tray thread) before @p req dies.
+ * tray thread, wait for the answer or the timeout, then settle the hand-off
+ * under s_cam_lock (#1842): from that point no click can answer this request
+ * any more — a late one is dropped by cam_prompt_offer, never returned to the
+ * policy, so never stored — and ask the tray thread to close the dialog.
+ * Nothing here waits on the tray thread (PostMessage only), and the tray owns
+ * the request text, so a busy tray thread can delay the dialog but never make
+ * it touch freed memory or answer a different request.
  */
 static enum u_camera_consent_prompt_answer
 tray_camera_prompt(void *ctx, const char *exe, const char *app_name, long pid, uint32_t timeout_ms)
@@ -665,9 +756,10 @@ tray_camera_prompt(void *ctx, const char *exe, const char *app_name, long pid, u
 	if (s_tray_hwnd == NULL) {
 		return U_CAMERA_CONSENT_PROMPT_UNAVAILABLE;
 	}
-	struct cam_prompt_req req;
-	ZeroMemory(&req, sizeof(req));
-	req.answer = U_CAMERA_CONSENT_PROMPT_TIMEOUT;
+	struct cam_prompt_req *req = (struct cam_prompt_req *)calloc(1, sizeof(*req));
+	if (req == NULL) {
+		return U_CAMERA_CONSENT_PROMPT_UNAVAILABLE;
+	}
 	const char *base = exe != NULL ? exe : "";
 	for (const char *p = base; *p != '\0'; p++) {
 		if (*p == '\\' || *p == '/') {
@@ -677,22 +769,50 @@ tray_camera_prompt(void *ctx, const char *exe, const char *app_name, long pid, u
 	wchar_t wapp[128], wbase[256];
 	MultiByteToWideChar(CP_UTF8, 0, app_name != NULL && app_name[0] ? app_name : "An app", -1, wapp, ARRAYSIZE(wapp));
 	MultiByteToWideChar(CP_UTF8, 0, base[0] ? base : "the app", -1, wbase, ARRAYSIZE(wbase));
-	_snwprintf_s(req.title, ARRAYSIZE(req.title), _TRUNCATE, L"\u201c%ls\u201d wants to use the 3D camera", wapp);
-	_snwprintf_s(req.body, ARRAYSIZE(req.body), _TRUNCATE,
+	_snwprintf_s(req->title, ARRAYSIZE(req->title), _TRUNCATE, L"\u201c%ls\u201d wants to use the 3D camera", wapp);
+	_snwprintf_s(req->body, ARRAYSIZE(req->body), _TRUNCATE,
 	             L"%ls (pid %ld) will receive frames from the display\u2019s stereo camera. You can stop it at any "
 	             L"time from the DisplayXR tray menu.",
 	             wbase, pid);
-	req.done = CreateEventW(NULL, TRUE, FALSE, NULL);
-	if (req.done == NULL) {
+	HANDLE done = CreateEventW(NULL, TRUE, FALSE, NULL);
+	if (done == NULL) {
+		free(req);
 		return U_CAMERA_CONSENT_PROMPT_UNAVAILABLE;
 	}
-	PostMessageW(s_tray_hwnd, WM_CAMERA_PROMPT, 0, (LPARAM)&req);
-	WaitForSingleObject(req.done, timeout_ms);
-	// Close (or no-op) on the tray thread; returns only once the dialog no
-	// longer references req.
-	SendMessageW(s_tray_hwnd, WM_CAMERA_PROMPT_CLOSE, 0, (LPARAM)&req);
-	CloseHandle(req.done);
-	return (enum u_camera_consent_prompt_answer)InterlockedCompareExchange(&req.answer, 0, 0);
+
+	AcquireSRWLockExclusive(&s_cam_lock);
+	uint64_t gen = u_camera_consent_handoff_begin(&s_cam_handoff);
+	s_cam_done = done;
+	ReleaseSRWLockExclusive(&s_cam_lock);
+	req->gen = gen;
+
+	bool posted = PostMessageW(s_tray_hwnd, WM_CAMERA_PROMPT, 0, (LPARAM)req) != 0;
+	if (!posted) {
+		free(req); // the tray never got it
+	} else {
+		WaitForSingleObject(done, timeout_ms);
+	}
+
+	// Settle: PENDING -> TIMED_OUT here, unless a button got there first.
+	AcquireSRWLockExclusive(&s_cam_lock);
+	enum u_camera_consent_prompt_answer a = u_camera_consent_handoff_finish(&s_cam_handoff, gen);
+	s_cam_done = NULL;
+	ReleaseSRWLockExclusive(&s_cam_lock);
+	CloseHandle(done);
+
+	if (!posted) {
+		return U_CAMERA_CONSENT_PROMPT_UNAVAILABLE;
+	}
+	if (a == U_CAMERA_CONSENT_PROMPT_TIMEOUT) {
+		U_LOG_W(
+		    "stereo camera: consent prompt #%llu ended without an answer (%u ms timeout or dismissed); "
+		    "closing it, a later click is dropped",
+		    (unsigned long long)gen, timeout_ms);
+	}
+	// Close (or no-op) on the tray thread. Posted after WM_CAMERA_PROMPT, so
+	// it is handled after the dialog was (or was not) shown.
+	PostMessageW(s_tray_hwnd, WM_CAMERA_PROMPT_CLOSE, (WPARAM)gen, 0);
+	return a;
 }
 
 static void
@@ -1081,16 +1201,7 @@ tray_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
 	case WM_CAMERA_PROMPT: cam_prompt_show((struct cam_prompt_req *)lParam); return 0;
 
-	case WM_CAMERA_PROMPT_CLOSE: {
-		struct cam_prompt_req *req = (struct cam_prompt_req *)lParam;
-		if (req != NULL && req->dlg != NULL) {
-			HWND d = req->dlg;
-			SetWindowLongPtrW(d, GWLP_USERDATA, 0);
-			req->dlg = NULL;
-			DestroyWindow(d);
-		}
-		return 0;
-	}
+	case WM_CAMERA_PROMPT_CLOSE: cam_prompt_close((uint64_t)wParam); return 0;
 
 	case WM_CAMERA_NOTICE: show_camera_notice((struct cam_notice *)lParam); return 0;
 
