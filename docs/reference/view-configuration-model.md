@@ -75,9 +75,9 @@ must handle it needs an explicit `case`.
 
 | | `PRIMARY_MONO` | `PRIMARY_STEREO` | `PRIMARY_MULTIVIEW_DXR` |
 |---|---|---|---|
-| `xrEnumerateViewConfigurationViews` count | 1 | **2** | device **max across modes** (4 on sim-display, 2 on Leia) |
-| `xrLocateViews` `*viewCountOutput` | 1 | **2** | same max |
-| `xrLocateViews` capacity required | 1 | 2 | max (size to `XRT_MAX_VIEWS` = 8) |
+| `xrEnumerateViewConfigurationViews` count | 1 | **2** | device **max across modes × `XRT_MAX_SEGMENTS`**, capped at 8 (8 on sim-display, 4 on Leia) — multi-screen M3, see *Per-segment views* below |
+| `xrLocateViews` `*viewCountOutput` | 1 | **2** | same count |
+| `xrLocateViews` capacity required | 1 | 2 | that count (size to `XRT_MAX_VIEWS` = 8) |
 | `xrEndFrame` projection `viewCount` accepted | 1 | **exactly 2** — the located count. An `XR_DXR_display_info` app may still submit 1 while a **1-view mode is in play** — the mode active now **or** the one latched at this frame's `xrBeginFrame` (#1528): **deprecated** (ADR-041), accepted, logged once per session | **exactly the located count** (the device max). ADR-041 removed the old "any rendering mode's `viewCount`". The same deprecated 1-view arm as `PRIMARY_STEREO` applies at the default (#1612): 1 view while a 1-view mode is in play, accepted, logged once per session — nothing wider |
 | Fixed for the instance lifetime? | yes | yes | yes |
 
@@ -340,7 +340,9 @@ sample. The clamp, the 1 Hz throttle and the doorbell all follow from there.
 
 ### What is deliberately NOT floored
 
-- **`PRIMARY_MULTIVIEW_DXR` sessions.** `max_views` is the device max, so the
+- **`PRIMARY_MULTIVIEW_DXR` sessions.** `max_views` is one segment's share of the
+  reported count (`oxr_segment_views_per_segment_capacity`) — the device max, exactly
+  as before multi-screen M3 doubled the reported count — so the
   pick returns the active index for every mode: no floor, no denial, no warning.
   An app that wants the device's full width says so, and gets it. This is the
   invariant the whole change is built around — #1499 must not take back what
@@ -526,6 +528,36 @@ display's physical size and nominal viewer — while the system default display'
 weaves it. Per-view display bindings, where views are assigned to displays, arrive in
 multi-screen M3 (ADR-047); until then binding to the system default (or not binding) is
 exactly today's behaviour.
+
+## Per-segment views (multi-screen M3)
+
+A window that spans two displays is woven per segment (`docs/architecture/comp-segments.md`).
+From M3 a `PRIMARY_MULTIVIEW_DXR` session carries one view set per segment, which is why
+the type reports `device max × XRT_MAX_SEGMENTS` (`XRT_MAX_SEGMENTS` = 2, in
+`xrt_display_metrics.h`; `oxr_segment_views_multiview_count`). The rules:
+
+- **One segment (the common case):** byte-for-byte the pre-M3 locate — the active
+  mode's views first, the whole tail (now longer) aliased onto view 0. The swapchain
+  worst case and the compositor's atlas are unchanged: tiles are per *active* view of a
+  set, and every set has the mode's count, so the atlas is still `cols × rows` tiles of
+  `canvas × scale`. Per-view recommended sizes are the same worst-case envelope for every
+  index (`oxr_system_fill_in` copies the device's entry into the extra slots).
+- **Two segments:** views `[0, n)` are the left segment's, `[n, 2n)` the right one's
+  (`n` = the active mode's view count; the mode is session-wide), each from its display's
+  eyes with the segment as the Kooima canvas; `XrViewActivityStateDXR::activeViewCount`
+  = `2n`; `XrViewDisplayBindingsDXR` names the ranges. The compositor builds a mosaic
+  atlas (each set at its segment's rect inside every tile) and crops each segment's own
+  views for its DP.
+- **`PRIMARY_STEREO` (and `PRIMARY_MONO`) never split:** 2 views, framed from the display
+  holding most of the window — its eyes, the window relative to it. When that is the
+  primary display this is exactly the single-display locate; the other display gets its
+  crop of the same two views (or flat 2D), as shipped in M2.
+- **xrEndFrame:** a multiview projection layer still carries the full located count
+  (ADR-041); views past `activeViewCount` are ignored.
+
+Implementation: `oxr_session_locate_views` (the per-segment wrapper) over
+`locate_views_one` (the pre-M3 body with a per-segment override), geometry in
+`oxr_segment_views.{h,c}` (unit tests: `tests/tests_oxr_segment_views.cpp`).
 
 ## History — what the deviation was
 

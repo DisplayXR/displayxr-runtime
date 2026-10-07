@@ -348,6 +348,19 @@ The `m2v` factor (`virtual_display_height / screen_height_m`) naturally
 grows as the window shrinks, producing correct perspective scaling.  No
 artificial `vs` viewport-scale multiplication is needed.
 
+### Per-segment canvas (multi-screen M3)
+
+A window spanning two displays gets one view set per **segment** (the part of the window
+on each display). Each set is window-relative Kooima with the **segment** as the canvas:
+the segment's size in its own display's metres, the eye that display's (tracked, or its
+nominal viewer) taken relative to the segment's centre as it sits on that display. The
+sets are expressed in one frame — the display space of the display holding most of the
+window — with the other segment placed beside it the way the window's pixels continue
+across the seam, so a display rig still centres the whole window on its pose and each
+segment's virtual canvas is offset from it by `m2v ×` that segment's offset from the
+window centre. Geometry: `src/xrt/state_trackers/oxr/oxr_segment_views.{h,c}`; contract:
+`docs/reference/view-configuration-model.md` § *Per-segment views*.
+
 ### Where the adjustment lives
 
 | Path | Location |
