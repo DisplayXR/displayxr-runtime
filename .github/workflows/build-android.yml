@@ -175,7 +175,14 @@ jobs:
       #
       # NOT credited: 0.10.69 also carries two foreground-status fixes that CNSDK reports as
       # untested on any device. Nothing observed after this bump should be attributed to them.
-      CNSDK_TAG: v0.10.69
+      #
+      # 0.10.75: "2D under the lens" (LeiaInc/CNSDK#746). The Vulkan interlacer composites the
+      # caller's 2D layer INSIDE the weave and band-limits it for the lens, with a cached
+      # two-pass prefilter reused while the layer is unchanged (XR_DXR_weave v14) - the DP
+      # half of the Android whole-page overlay (runtime #1835 v18 + #1845, browser-pvt#242).
+      # Moved in lockstep with leia_plugin v2.12.0 (the first plug-in release built against
+      # 0.10.75, set_overlay_2d on Android) and versions.json cnsdk_services.
+      CNSDK_TAG: v0.10.75
 
     steps:
 
