@@ -122,6 +122,9 @@ struct comp_vk_native_segments
 	//! True only inside an update() the caller declared release-safe, and in
 	//! destroy — the debug assert in release_now() checks it.
 	bool release_safe;
+
+	//! Rendering-mode index the segment DPs' tolerance was last read at.
+	uint32_t mode_index;
 };
 
 
@@ -640,7 +643,8 @@ comp_vk_native_segments_update(struct comp_vk_native_segments *segs,
                                const struct comp_seg_rect *window_desktop,
                                const struct comp_seg_rect *canvas,
                                int32_t target_format,
-                               bool release_safe)
+                               bool release_safe,
+                               uint32_t mode_index)
 {
 	if (segs == NULL) {
 		return false;
@@ -673,6 +677,18 @@ comp_vk_native_segments_update(struct comp_vk_native_segments *segs,
 	const uint32_t cw = canvas != NULL && canvas->w > 0 ? canvas->w : window_desktop->w;
 	const uint32_t ch = canvas != NULL && canvas->h > 0 ? canvas->h : window_desktop->h;
 	const bool split = comp_segments_table_is_split(&segs->table, cw, ch);
+
+	// A DP's resample tolerance can follow the rendering mode (sim_display:
+	// INTERLACED needs 1:1). Re-ask on a mode change — never per frame.
+	if (mode_index != segs->mode_index) {
+		segs->mode_index = mode_index;
+		for (uint32_t i = 0; i < segs->screen_count; i++) {
+			if (segs->st[i].dp != NULL) {
+				segs->st[i].tolerates_resample = xrt_display_processor_vk_tolerates_resample(
+				    (struct xrt_display_processor_vk *)segs->st[i].dp);
+			}
+		}
+	}
 
 	// One INFO line per table change while split, and one on leaving it —
 	// a drag produces a burst, a still window logs once. Never WARN.
