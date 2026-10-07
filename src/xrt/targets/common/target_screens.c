@@ -85,6 +85,7 @@ finish_flags(struct xrt_screen *s, bool is_primary, bool is_default)
 static void
 build_from_entry(const struct xrt_dp_registry_entry *e,
                  bool is_default,
+                 bool use_sys_placement,
                  const struct target_screens_system *sys,
                  const struct os_display_desktop_info *desk,
                  uint32_t desk_count,
@@ -133,9 +134,10 @@ build_from_entry(const struct xrt_dp_registry_entry *e,
 	u_screen_info_resolve(&in, &s->info);
 
 	// The system-default screen's placement is the one the runtime resolved
-	// for the panel (#1301) — what XrDisplayDesktopInfoDXR reports — when
-	// that resolution succeeded.
-	if (is_default && sys != NULL && sys->desktop_width > 0 && sys->desktop_height > 0) {
+	// for the panel (#1301) — what XrDisplayDesktopInfoDXR reports — but only
+	// when that resolution landed on THIS monitor (use_sys_placement), so a
+	// screen never carries one monitor's id and another monitor's rect.
+	if (is_default && use_sys_placement) {
 		s->desktop_left = sys->desktop_left;
 		s->desktop_top = sys->desktop_top;
 		s->desktop_width = sys->desktop_width;
@@ -154,6 +156,54 @@ build_from_entry(const struct xrt_dp_registry_entry *e,
 	}
 
 	finish_flags(s, is_primary, is_default);
+}
+
+const struct xrt_dp_registry_entry *
+target_screens_pick_default(const struct xrt_dp_factory_registry *reg,
+                            const char *active_plugin_id,
+                            const struct target_screens_system *sys,
+                            bool *out_matches_sys)
+{
+	if (out_matches_sys != NULL) {
+		*out_matches_sys = false;
+	}
+	if (reg == NULL || reg->entry_count == 0) {
+		return NULL;
+	}
+
+	// The monitor the #1301 resolver placed the system panel on: the entry
+	// whose desktop rect contains the resolved origin. Prefer one the active
+	// plug-in won (two entries never overlap on a sane desktop, but a
+	// DRM-only record sits at (0,0) next to a real one).
+	if (sys != NULL && sys->desktop_width > 0 && sys->desktop_height > 0) {
+		const struct xrt_dp_registry_entry *hit = NULL;
+		for (uint32_t i = 0; i < reg->entry_count; i++) {
+			const struct xrt_dp_registry_entry *e = &reg->entries[i];
+			const int64_t l = e->screen_left;
+			const int64_t t = e->screen_top;
+			if (sys->desktop_left >= l && sys->desktop_left < l + (int64_t)e->pixel_width &&
+			    sys->desktop_top >= t && sys->desktop_top < t + (int64_t)e->pixel_height) {
+				const bool active = active_plugin_id != NULL && active_plugin_id[0] != '\0' &&
+				                    strcmp(e->plugin_id, active_plugin_id) == 0;
+				if (hit == NULL || active) {
+					hit = e;
+				}
+				if (active) {
+					break;
+				}
+			}
+		}
+		if (hit != NULL) {
+			if (out_matches_sys != NULL) {
+				*out_matches_sys = true;
+			}
+			return hit;
+		}
+	}
+
+	// Nothing contains it (or nothing was resolved): the registry's own
+	// "don't care which monitor" pick, without the system's placement.
+	return xrt_dp_registry_primary_entry(reg, active_plugin_id);
 }
 
 void
@@ -193,18 +243,19 @@ target_screens_build(const struct xrt_dp_factory_registry *reg,
 	memset(desk, 0, sizeof(desk));
 	const uint32_t desk_count = os_display_desktop_enumerate(desk, OS_DISPLAY_DESKTOP_MAX_MONITORS);
 
-	const struct xrt_dp_registry_entry *def = xrt_dp_registry_primary_entry(reg, active_plugin_id);
+	bool def_matches_sys = false;
+	const struct xrt_dp_registry_entry *def = target_screens_pick_default(reg, active_plugin_id, sys, &def_matches_sys);
 
 	uint32_t n = 0;
 	if (def != NULL) {
-		build_from_entry(def, true, sys, desk, desk_count, &out->screens[n++]);
+		build_from_entry(def, true, def_matches_sys, sys, desk, desk_count, &out->screens[n++]);
 	}
 	for (uint32_t i = 0; i < reg->entry_count && n < XRT_SCREEN_LIST_MAX; i++) {
 		const struct xrt_dp_registry_entry *e = &reg->entries[i];
 		if (e == def) {
 			continue;
 		}
-		build_from_entry(e, false, sys, desk, desk_count, &out->screens[n++]);
+		build_from_entry(e, false, false, sys, desk, desk_count, &out->screens[n++]);
 	}
 	out->count = n;
 }
