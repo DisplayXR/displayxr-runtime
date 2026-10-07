@@ -402,6 +402,18 @@ struct xrt_plugin_display_info;
 void
 target_plugin_note_active_panel(const struct xrt_plugin_display_info *pdi);
 
+/*!
+ * Release the plug-in instances that were loaded ONLY as display-claim sources
+ * (not the active plug-in), and drop the cached source set so the next
+ * resolve re-collects. Called at xrt_instance teardown, after the system (and
+ * with it the registry that referenced those sources) is gone.
+ *
+ * macOS/Linux only. Windows has always kept its claim sources for the process
+ * lifetime and is unchanged here; Android has no claim-only sources.
+ */
+void
+target_plugin_release_claim_sources(void);
+
 #ifdef __cplusplus
 }
 #endif

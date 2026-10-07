@@ -589,6 +589,15 @@ struct plugin_display_source
 static struct plugin_display_source g_display_sources[TARGET_PLUGIN_MAX_SOURCES];
 static int g_display_source_count = -1;
 
+/*!
+ * POSIX: the cached source set is ONLY the active plug-in, because it claimed
+ * every monitor of the last resolve, so no other plug-in could have changed
+ * the outcome (see @ref ensure_display_sources). Re-checked on every resolve,
+ * since a later descriptor set may hold a monitor it does not claim. Guarded
+ * by @ref g_refresh_mutex.
+ */
+static bool g_display_sources_active_only = false;
+
 
 /*
  *
@@ -3134,6 +3143,7 @@ target_plugin_refresh_active(void)
 		// Invalidate the display-claim source cache so the next
 		// target_plugin_resolve_displays rebuilds it against the new winner.
 		g_display_source_count = -1;
+		g_display_sources_active_only = false;
 	}
 
 	const struct xrt_plugin_iface *result = g_active_iface;
@@ -3601,16 +3611,81 @@ fill_registry_entry(struct xrt_dp_registry_entry *e,
 	e->owning_instance = src->inst;
 }
 
+#if !defined(XRT_OS_WINDOWS) && !defined(XRT_OS_ANDROID)
+/*!
+ * POSIX: does the active plug-in, on its own, already decide every monitor?
+ * True when it claims every descriptor and no OTHER plug-in is pinned as
+ * preferred. The active plug-in wins every monitor it claims (#1521), and a
+ * preferred plug-in is the only thing that outranks it — so when both hold,
+ * loading and probing every other installed plug-in cannot change a single
+ * registry entry. It would only dlopen them, run their vendor probes (Leia's
+ * reaches the SR service and the shared panel), and keep their instances.
+ * Typical cases: `XRT_PREFERRED_PLUGIN_ID=sim-display`, or sim-display active
+ * because no vendor plug-in is installed.
+ */
+static bool
+active_plugin_decides_every_monitor(const struct xrt_display_descriptor *descs, uint32_t n)
+{
+	if (g_active_iface == NULL || descs == NULL || n == 0) {
+		return false;
+	}
+	char preferred[64] = {0};
+	if (target_plugin_get_preferred(preferred, sizeof(preferred)) &&
+	    (g_active_iface->id == NULL || strcmp(preferred, g_active_iface->id) != 0)) {
+		return false; // a different plug-in is pinned: it may outrank the active one
+	}
+	const struct plugin_display_source active = {
+	    .iface = g_active_iface,
+	    .inst = g_active_instance,
+	    .probe_order = g_active_probe_order,
+	};
+	struct xrt_display_claim claims[XRT_DP_REGISTRY_MAX_ENTRIES];
+	const uint32_t cn = query_source_claims(&active, descs, n, claims, XRT_DP_REGISTRY_MAX_ENTRIES);
+	for (uint32_t d = 0; d < n; d++) {
+		bool claimed = false;
+		for (uint32_t c = 0; c < cn && !claimed; c++) {
+			claimed = claims[c].monitor_id == descs[d].monitor_id;
+		}
+		if (!claimed) {
+			return false;
+		}
+	}
+	return true;
+}
+#endif
+
 /*!
  * Build the cached display-claim source set if not already collected. Caller
  * holds @ref g_refresh_mutex and has loaded the active plug-in.
+ *
+ * POSIX only loads the other plug-ins when they could matter: if the active
+ * plug-in decides every monitor in @p descs on its own
+ * (@ref active_plugin_decides_every_monitor) the set is just the active
+ * plug-in, and that answer is re-checked on the next resolve.
  */
 static void
-ensure_display_sources(void)
+ensure_display_sources(const struct xrt_display_descriptor *descs, uint32_t n)
 {
+#if !defined(XRT_OS_WINDOWS) && !defined(XRT_OS_ANDROID)
+	if (g_display_source_count >= 0 && !g_display_sources_active_only) {
+		return;
+	}
+	if (active_plugin_decides_every_monitor(descs, n)) {
+		g_display_sources[0].iface = g_active_iface;
+		g_display_sources[0].inst = g_active_instance;
+		g_display_sources[0].probe_order = g_active_probe_order;
+		g_display_source_count = 1;
+		g_display_sources_active_only = true;
+		return;
+	}
+	g_display_sources_active_only = false;
+#else
+	(void)descs;
+	(void)n;
 	if (g_display_source_count >= 0) {
 		return;
 	}
+#endif
 	g_display_source_count = 0;
 #if !defined(XRT_OS_ANDROID)
 	// Windows (registry) and macOS/Linux (manifests): every registered
@@ -3652,12 +3727,12 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 		os_mutex_lock(&g_refresh_mutex);
 	}
 
-	ensure_display_sources();
-
 	uint32_t dn = descriptor_count;
 	if (dn > XRT_DP_REGISTRY_MAX_ENTRIES) {
 		dn = XRT_DP_REGISTRY_MAX_ENTRIES;
 	}
+
+	ensure_display_sources(descriptors, dn);
 
 	// Query every source once for the full descriptor set.
 	static struct xrt_display_claim src_claims[TARGET_PLUGIN_MAX_SOURCES][XRT_DP_REGISTRY_MAX_ENTRIES];
@@ -3800,4 +3875,38 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 	if (g_refresh_mutex_initialized) {
 		os_mutex_unlock(&g_refresh_mutex);
 	}
+}
+
+void
+target_plugin_release_claim_sources(void)
+{
+#if !defined(XRT_OS_WINDOWS) && !defined(XRT_OS_ANDROID)
+	if (g_refresh_mutex_initialized) {
+		os_mutex_lock(&g_refresh_mutex);
+	}
+	for (int s = 0; s < g_display_source_count; s++) {
+		struct plugin_display_source *src = &g_display_sources[s];
+		// The active plug-in's instance belongs to discovery and outlives
+		// any one xrt_instance; only the claim-only instances are ours.
+		// destroy() pairs with the probe() that made the instance, even when
+		// probe() handed back NULL (a plug-in with process-global state).
+		if (src->iface == NULL || src->iface == g_active_iface) {
+			continue;
+		}
+		if (src->iface->destroy != NULL) {
+			U_LOG_I("plugin loader: releasing display-claim source id=%s",
+			        src->iface->id != NULL ? src->iface->id : "?");
+			src->iface->destroy(src->inst);
+		}
+		src->inst = NULL;
+	}
+	// The next resolve re-collects (and re-probes) from scratch. The dlopen
+	// handles stay loaded, as everywhere else in this loader: a re-collection
+	// just takes another reference.
+	g_display_source_count = -1;
+	g_display_sources_active_only = false;
+	if (g_refresh_mutex_initialized) {
+		os_mutex_unlock(&g_refresh_mutex);
+	}
+#endif
 }
