@@ -94,6 +94,10 @@ TEST_CASE("winner rule: pin > PreferredPlugin > active > confidence", "[target][
 	CHECK(why == TARGET_SCREEN_PICK_PIN);
 	CHECK_FALSE(unclaimed);
 
+	// The pin's plug-in id is matched case-insensitively (typed by hand).
+	CHECK(target_screen_pick(hdmi, 2, "LEIA-SR", "sim-display", &why, &unclaimed) == 1);
+	CHECK(why == TARGET_SCREEN_PICK_PIN);
+
 	// ...and the active one.
 	CHECK(target_screen_pick(hdmi, 2, "leia-sr", nullptr, &why, &unclaimed) == 1);
 	CHECK(why == TARGET_SCREEN_PICK_PIN);

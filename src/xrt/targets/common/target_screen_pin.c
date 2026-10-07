@@ -142,13 +142,16 @@ target_screen_pin_find(const struct target_screen_pins *pins,
 }
 
 static int
-first_with_id(const struct target_screen_candidate *c, uint32_t n, const char *id)
+first_with_id(const struct target_screen_candidate *c, uint32_t n, const char *id, bool ignore_case)
 {
 	if (id == NULL || id[0] == '\0') {
 		return -1;
 	}
 	for (uint32_t i = 0; i < n; i++) {
-		if (c[i].plugin_id != NULL && strcmp(c[i].plugin_id, id) == 0) {
+		if (c[i].plugin_id == NULL) {
+			continue;
+		}
+		if (ignore_case ? name_eq(c[i].plugin_id, id) : strcmp(c[i].plugin_id, id) == 0) {
 			return (int)i;
 		}
 	}
@@ -169,7 +172,9 @@ target_screen_pick(const struct target_screen_candidate *cands,
 
 	if (cands != NULL && count > 0) {
 		if (pin_plugin != NULL && pin_plugin[0] != '\0') {
-			pick = first_with_id(cands, count, pin_plugin);
+			// A pin is typed by hand: its plug-in id matches
+			// case-insensitively, like its monitor name.
+			pick = first_with_id(cands, count, pin_plugin, true);
 			if (pick >= 0) {
 				reason = TARGET_SCREEN_PICK_PIN;
 			} else {
@@ -177,7 +182,7 @@ target_screen_pick(const struct target_screen_candidate *cands,
 			}
 		}
 		if (pick < 0) {
-			pick = first_with_id(cands, count, preferred);
+			pick = first_with_id(cands, count, preferred, false);
 			if (pick >= 0) {
 				reason = TARGET_SCREEN_PICK_PREFERRED;
 			}
