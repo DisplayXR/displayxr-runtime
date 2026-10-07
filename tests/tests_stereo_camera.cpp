@@ -312,7 +312,11 @@ TEST_CASE("plug-in iface: camera slots are appended after lift and platform-stat
 	      offsetof(xrt_plugin_iface, vk_bundle_fn_table_offset) + sizeof(uint32_t));
 	CHECK(offsetof(xrt_plugin_iface, get_platform_state) == lift_end);
 	CHECK(offsetof(xrt_plugin_iface, stereo_camera_enumerate) == platform_state_end);
-	CHECK(offsetof(xrt_plugin_iface, stereo_camera_close) + sizeof(void *) == sizeof(xrt_plugin_iface));
+	// Multi-screen M1 appended get_display_info_for_monitor right after the
+	// camera block; it now ends the struct.
+	CHECK(offsetof(xrt_plugin_iface, get_display_info_for_monitor) ==
+	      offsetof(xrt_plugin_iface, stereo_camera_close) + sizeof(void *));
+	CHECK(offsetof(xrt_plugin_iface, get_display_info_for_monitor) + sizeof(void *) == sizeof(xrt_plugin_iface));
 
 	xrt_plugin_iface iface{};
 	iface.struct_size = (uint32_t)offsetof(xrt_plugin_iface, stereo_camera_enumerate);
