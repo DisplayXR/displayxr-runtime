@@ -38,6 +38,7 @@
 
 #include "os/os_threading.h"
 #include "os/os_display_edid.h"
+#include "os/os_display_desktop.h"
 #include "util/u_logging.h"
 
 #include <errno.h>
@@ -2598,10 +2599,21 @@ user_manifest_dir(char *out, size_t cap)
 #endif
 }
 
+/*!
+ * Load + negotiate + ABI-check + probe one manifest plug-in. The POSIX twin of
+ * the Windows @ref load_and_probe_one: no "active plug-in" line and no
+ * status_set_active, so it serves both the single-winner discovery
+ * (@ref try_load_one) and the load-all display-claim collection (#69,
+ * multi-screen M0). Successful loads leak the dlopen handle so the iface's
+ * function pointers stay callable for the process lifetime.
+ */
 static const struct xrt_plugin_iface *
-try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst)
+load_and_probe_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst, uint32_t *out_version)
 {
 	*out_inst = NULL;
+	if (out_version != NULL) {
+		*out_version = 0;
+	}
 	g_last_reject_reason[0] = '\0';
 	g_last_reject_declined = false;
 	(void)status_begin(e->id, e->display_name, e->version, e->probe_order);
@@ -2708,6 +2720,30 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 		}
 	}
 
+	if (out_version != NULL) {
+		*out_version = plugin_version;
+	}
+	status_finish(e->id, TARGET_PLUGIN_RESULT_CLAIMED, 0, NULL);
+
+	/* dlopen handle intentionally leaked: the iface's function pointers
+	 * remain reachable into the dylib for the process's lifetime. */
+	return iface;
+}
+
+/*!
+ * Try one manifest plug-in as the single active winner: @ref
+ * load_and_probe_one plus the canonical "active plug-in:" line (parsed by
+ * diagnostics) and the ACTIVE status.
+ */
+static const struct xrt_plugin_iface *
+try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst)
+{
+	uint32_t plugin_version = 0;
+	const struct xrt_plugin_iface *iface = load_and_probe_one(e, out_inst, &plugin_version);
+	if (iface == NULL) {
+		return NULL;
+	}
+
 	U_LOG_W(
 	    "plugin loader: active plug-in: id=%s name='%s' vendor='%s' version='%s' "
 	    "plugin_api=%u probe_order=%u path=%s",
@@ -2715,9 +2751,6 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 	    iface->vendor ? iface->vendor : e->vendor, e->version, plugin_version, e->probe_order, e->binary_path);
 
 	status_set_active(e->id);
-
-	/* dlopen handle intentionally leaked: the iface's function pointers
-	 * remain reachable into the dylib for the process's lifetime. */
 	return iface;
 }
 
@@ -2815,6 +2848,72 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
 		U_LOG_W("plugin loader: no registered plug-in claimed the system — falling back to static drivers.");
 	}
 	return NULL;
+}
+
+/*!
+ * Load EVERY manifest plug-in and return them as display-claim sources for the
+ * per-monitor registry — the POSIX twin of the Windows function of the same
+ * name (#69 / ADR-015, multi-screen M0). Same manifest roots and order as
+ * @ref discover_active_plugin; `DXR_PLUGIN_EXCLUSIVE` keeps every other
+ * plug-in out of the process exactly as it does for discovery. The active
+ * plug-in is reused, never loaded twice. The others are claim sources only:
+ * nothing creates a device from them, and they never become active here.
+ * Returns the source count in ascending ProbeOrder.
+ *
+ * Caller holds @ref g_refresh_mutex and has loaded the active plug-in.
+ */
+static int
+collect_display_sources_platform(struct plugin_display_source *out, int max)
+{
+	char roots[8][PATH_MAX];
+	int n_roots = target_plugin_build_discovery_roots(roots, (int)(sizeof(roots) / sizeof(roots[0])));
+	struct plugin_entry entries[MAX_PLUGIN_ENTRIES];
+	int n = 0;
+	for (int r = 0; r < n_roots; r++) {
+		n = enumerate_dir(roots[r], entries, n, MAX_PLUGIN_ENTRIES);
+	}
+	qsort(entries, (size_t)n, sizeof(entries[0]), compare_by_filename);
+
+	const char *active_id = (g_active_iface != NULL && g_active_iface->id != NULL) ? g_active_iface->id : NULL;
+	bool active_seen = false;
+
+	int count = 0;
+	for (int i = 0; i < n && count < max; i++) {
+		if (plugin_id_excluded(entries[i].id)) {
+			continue;
+		}
+		if (active_id != NULL && strcmp(entries[i].id, active_id) == 0) {
+			out[count].iface = g_active_iface;
+			out[count].inst = g_active_instance;
+			out[count].probe_order = g_active_probe_order;
+			count++;
+			active_seen = true;
+			continue;
+		}
+
+		uint32_t ver = 0;
+		struct xrt_plugin_instance *inst = NULL;
+		const struct xrt_plugin_iface *iface = load_and_probe_one(&entries[i], &inst, &ver);
+		if (iface == NULL) {
+			continue; // declined / failed -> contributes no claims
+		}
+		U_LOG_I("plugin loader: display-claim source id=%s (ProbeOrder=%u)", entries[i].id,
+		        entries[i].probe_order);
+		out[count].iface = iface;
+		out[count].inst = inst;
+		out[count].probe_order = entries[i].probe_order;
+		count++;
+	}
+
+	// An active plug-in that no manifest names any more (removed after it
+	// loaded) is still the one devices come from: keep it as a source.
+	if (!active_seen && g_active_iface != NULL && count < max) {
+		out[count].iface = g_active_iface;
+		out[count].inst = g_active_instance;
+		out[count].probe_order = g_active_probe_order;
+		count++;
+	}
+	return count;
 }
 
 /*
@@ -3061,7 +3160,7 @@ target_plugin_refresh_active(void)
  * Phase 1; EDID device-instance-path keying is the Phase 2/3 hardening.
  */
 static uint64_t
-monitor_id_from_edid(uint16_t mfr, uint16_t product, int32_t left, int32_t top)
+monitor_id_from_edid(uint16_t mfr, uint16_t product, int32_t left, int32_t top, const char *platform_key)
 {
 	uint64_t h = 1469598103934665603ULL; /* FNV-1a-64 offset basis */
 	const uint64_t prime = 1099511628211ULL;
@@ -3074,7 +3173,103 @@ monitor_id_from_edid(uint16_t mfr, uint16_t product, int32_t left, int32_t top)
 		h ^= (uint64_t)bytes[i];
 		h *= prime;
 	}
+	// The platform's connector key (desktop Linux: "HDMI-A-1"), when there is
+	// one. Empty on Windows, so ids there are unchanged. It separates two
+	// identical panels that share a position — every DRM-only record (no X
+	// server) sits at (0, 0).
+	for (const char *c = platform_key; c != NULL && *c != '\0'; c++) {
+		h ^= (uint64_t)(uint8_t)*c;
+		h *= prime;
+	}
 	return h;
+}
+
+/*!
+ * Runtime-private side table: the full @ref os_display_edid_monitor behind
+ * each descriptor the last @ref target_plugin_build_descriptors produced, keyed
+ * by monitor id. The descriptor is plug-in ABI and stays as it is; this is
+ * where the connector name, mm and device mode live for the runtime's own
+ * use (the back-compat claim below). Guarded by @ref g_refresh_mutex.
+ */
+static struct
+{
+	uint64_t monitor_id;
+	struct os_display_edid_monitor mon;
+} g_monitor_side[XRT_DP_REGISTRY_MAX_ENTRIES];
+static uint32_t g_monitor_side_count = 0;
+
+/*!
+ * What the ACTIVE plug-in said about its panel (`get_display_info`), noted by
+ * @ref target_plugin_note_active_panel. Steers the active plug-in's
+ * back-compat claim off-Windows. Guarded by @ref g_refresh_mutex.
+ */
+static struct os_display_panel_hint g_active_panel_hint;
+static bool g_active_panel_valid = false;
+
+void
+target_plugin_note_active_panel(const struct xrt_plugin_display_info *pdi)
+{
+	if (pdi == NULL) {
+		return;
+	}
+	if (g_refresh_mutex_initialized) {
+		os_mutex_lock(&g_refresh_mutex);
+	}
+	g_active_panel_hint.screen_left = pdi->display_screen_left;
+	g_active_panel_hint.screen_top = pdi->display_screen_top;
+	g_active_panel_hint.pixel_width = pdi->display_pixel_width;
+	g_active_panel_hint.pixel_height = pdi->display_pixel_height;
+	g_active_panel_hint.width_m = pdi->display_width_m;
+	g_active_panel_hint.height_m = pdi->display_height_m;
+	g_active_panel_valid = pdi->display_pixel_width > 0 && pdi->display_pixel_height > 0;
+	if (g_refresh_mutex_initialized) {
+		os_mutex_unlock(&g_refresh_mutex);
+	}
+}
+
+/*!
+ * Log how each monitor was identified (desktop Linux: which RandR <-> DRM
+ * join rule fired), at INFO and only when the set changes, so a service that
+ * re-enumerates on every client connect logs it once. Silent when no record
+ * carries platform identity (Windows), whose enumerator has its own logs.
+ */
+static void
+log_monitor_join_once(const struct os_display_edid_list *list)
+{
+	static uint64_t s_last = 0;
+	uint64_t h = 1469598103934665603ULL;
+	bool any = false;
+	for (uint32_t i = 0; i < list->count; i++) {
+		const struct os_display_edid_monitor *m = &list->monitors[i];
+		any = any || m->join != OS_EDID_JOIN_NONE || m->output_name[0] != '\0';
+		const uint64_t parts[] = {m->manufacturer_id,
+		                          m->product_id,
+		                          m->serial_number,
+		                          (uint64_t)(uint32_t)m->screen_left,
+		                          (uint64_t)(uint32_t)m->screen_top,
+		                          m->pixel_width,
+		                          (uint64_t)m->join};
+		for (size_t k = 0; k < sizeof(parts) / sizeof(parts[0]); k++) {
+			h ^= parts[k];
+			h *= 1099511628211ULL;
+		}
+	}
+	h ^= list->count;
+	if (!any || h == s_last) {
+		return;
+	}
+	s_last = h;
+
+	for (uint32_t i = 0; i < list->count; i++) {
+		const struct os_display_edid_monitor *m = &list->monitors[i];
+		U_LOG_I(
+		    "plugin loader: monitor %u output='%s' connector='%s' join=%s mfr=0x%04x product=0x%04x "
+		    "serial=0x%08x %ux%u%s at (%d,%d)%s %ux%u mm",
+		    i, m->output_name, m->connector, os_display_edid_join_str(m->join), m->manufacturer_id,
+		    m->product_id, m->serial_number, m->pixel_width, m->pixel_height, m->is_primary ? " primary" : "",
+		    (int)m->screen_left, (int)m->screen_top, m->origin_unknown ? " (origin unknown)" : "",
+		    m->physical_width_mm, m->physical_height_mm);
+	}
 }
 
 uint32_t
@@ -3085,6 +3280,7 @@ target_plugin_build_descriptors(const struct os_display_edid_list *list,
 	if (list == NULL || out == NULL || max == 0) {
 		return 0;
 	}
+	log_monitor_join_once(list);
 	uint32_t n = list->count;
 	if (n > max) {
 		n = max;
@@ -3094,7 +3290,8 @@ target_plugin_build_descriptors(const struct os_display_edid_list *list,
 		struct xrt_display_descriptor *d = &out[i];
 		memset(d, 0, sizeof(*d));
 		d->struct_size = (uint32_t)sizeof(*d);
-		d->monitor_id = monitor_id_from_edid(m->manufacturer_id, m->product_id, m->screen_left, m->screen_top);
+		d->monitor_id = monitor_id_from_edid(m->manufacturer_id, m->product_id, m->screen_left, m->screen_top,
+		                                     m->connector[0] != '\0' ? m->connector : m->output_name);
 		d->edid_manufacturer = m->manufacturer_id;
 		d->edid_product = m->product_id;
 		d->pixel_width = m->pixel_width;
@@ -3104,14 +3301,120 @@ target_plugin_build_descriptors(const struct os_display_edid_list *list,
 		d->screen_top = m->screen_top;
 		d->flags = m->is_primary ? 1u : 0u;
 	}
+
+	if (g_refresh_mutex_initialized) {
+		os_mutex_lock(&g_refresh_mutex);
+	}
+	g_monitor_side_count = n < XRT_DP_REGISTRY_MAX_ENTRIES ? n : XRT_DP_REGISTRY_MAX_ENTRIES;
+	for (uint32_t i = 0; i < g_monitor_side_count; i++) {
+		g_monitor_side[i].monitor_id = out[i].monitor_id;
+		g_monitor_side[i].mon = list->monitors[i];
+	}
+	if (g_refresh_mutex_initialized) {
+		os_mutex_unlock(&g_refresh_mutex);
+	}
 	return n;
+}
+
+#ifndef XRT_OS_WINDOWS
+static const struct os_display_edid_monitor *
+monitor_side_find(uint64_t monitor_id)
+{
+	for (uint32_t i = 0; i < g_monitor_side_count; i++) {
+		if (g_monitor_side[i].monitor_id == monitor_id) {
+			return &g_monitor_side[i].mon;
+		}
+	}
+	return NULL;
+}
+#endif
+
+/*!
+ * Off-Windows: which descriptor is the ACTIVE plug-in's panel, by the same
+ * ADR-033 rules the desktop-rect resolver uses (origin, then connector mode,
+ * then pixel size; ties on physical size). Windows keeps the primary-monitor
+ * back-compat claim exactly as before.
+ *
+ * Why it exists: a 3D panel is a SECOND monitor on essentially every real
+ * deployment, so "the primary" lands the vendor's back-compat claim on the
+ * laptop screen — and the active plug-in wins every monitor it claims (#1521),
+ * so the registry would route the laptop screen to the vendor DP and the
+ * panel to the fallback. Caller holds @ref g_refresh_mutex.
+ */
+static bool
+pick_active_panel_monitor(const struct xrt_display_descriptor *descs, uint32_t n, uint32_t *out_pick)
+{
+#ifdef XRT_OS_WINDOWS
+	(void)descs;
+	(void)n;
+	(void)out_pick;
+	return false;
+#else
+	if (!g_active_panel_valid || n == 0) {
+		return false;
+	}
+	if (n > XRT_DP_REGISTRY_MAX_ENTRIES) {
+		n = XRT_DP_REGISTRY_MAX_ENTRIES;
+	}
+	const struct os_display_panel_hint *hint = &g_active_panel_hint;
+
+	struct os_display_desktop_info mons[XRT_DP_REGISTRY_MAX_ENTRIES];
+	memset(mons, 0, sizeof(mons));
+	bool origin_known[XRT_DP_REGISTRY_MAX_ENTRIES];
+	for (uint32_t i = 0; i < n; i++) {
+		struct os_display_desktop_info *m = &mons[i];
+		m->left = descs[i].screen_left;
+		m->top = descs[i].screen_top;
+		m->width = descs[i].pixel_width;
+		m->height = descs[i].pixel_height;
+		m->width_in_caller_dpi = m->width;
+		m->height_in_caller_dpi = m->height;
+		m->is_primary = (descs[i].flags & 1u) != 0;
+		origin_known[i] = true;
+		const struct os_display_edid_monitor *side = monitor_side_find(descs[i].monitor_id);
+		if (side != NULL) {
+			m->physical_width_mm = side->physical_width_mm;
+			m->physical_height_mm = side->physical_height_mm;
+			m->native_width = side->native_width;
+			m->native_height = side->native_height;
+			(void)snprintf(m->device_name, sizeof(m->device_name), "%s",
+			               side->output_name[0] != '\0' ? side->output_name : side->connector);
+			origin_known[i] = !side->origin_unknown;
+		}
+	}
+
+	// Rule 1: the plug-in placed its panel. Trust a non-(0,0) origin that
+	// falls inside a monitor whose own origin is a real desktop position.
+	if (hint->screen_left != 0 || hint->screen_top != 0) {
+		for (uint32_t i = 0; i < n; i++) {
+			const struct os_display_desktop_info *m = &mons[i];
+			if (origin_known[i] && hint->screen_left >= m->left &&
+			    hint->screen_left < m->left + (int64_t)m->width && hint->screen_top >= m->top &&
+			    hint->screen_top < m->top + (int64_t)m->height) {
+				*out_pick = i;
+				return true;
+			}
+		}
+	}
+
+	// Rules 2/3: connector mode, then pixel size.
+	struct os_display_panel_match match = {0};
+	const int32_t idx = os_display_desktop_select_by_size(mons, n, hint, &match);
+	if (idx >= 0) {
+		*out_pick = (uint32_t)idx;
+		return true;
+	}
+	return false;
+#endif
 }
 
 /*!
  * Synthesize the back-compat claim for a loaded plug-in that has no
  * `probe_displays` but whose binary `probe()` succeeded: one
  * @ref XRT_DISPLAY_CLAIM_EDID claim on the primary monitor (or the first
- * descriptor if none is flagged primary). `supported_apis` is set to all
+ * descriptor if none is flagged primary) — except off-Windows for the ACTIVE
+ * plug-in once its panel is known, where it lands on that panel's monitor
+ * (@ref pick_active_panel_monitor). `supported_apis` is set to all
  * bits — the actual factory set is masked against the plug-in's non-NULL
  * factory pointers at fill time.
  */
@@ -3119,7 +3422,8 @@ static uint32_t
 synth_primary_edid_claim(const struct xrt_display_descriptor *descs,
                          uint32_t n,
                          struct xrt_display_claim *out,
-                         uint32_t max)
+                         uint32_t max,
+                         const struct xrt_plugin_iface *iface)
 {
 	if (n == 0 || max == 0) {
 		return 0;
@@ -3130,6 +3434,21 @@ synth_primary_edid_claim(const struct xrt_display_descriptor *descs,
 			pick = i;
 			break;
 		}
+	}
+	// Off-Windows, the ACTIVE plug-in's back-compat claim follows its panel
+	// rather than the primary monitor (multi-screen M0). A plug-in that ships
+	// `probe_displays` never reaches here, so its own claims always win.
+	uint32_t panel = 0;
+	if (iface != NULL && iface == g_active_iface && pick_active_panel_monitor(descs, n, &panel)) {
+		if (panel != pick) {
+			U_LOG_I(
+			    "plugin loader: '%s' has no probe_displays — back-compat claim placed on its panel "
+			    "(monitor 0x%016llx, %ux%u at (%d,%d)) instead of the primary monitor",
+			    iface->id != NULL ? iface->id : "?", (unsigned long long)descs[panel].monitor_id,
+			    descs[panel].pixel_width, descs[panel].pixel_height, (int)descs[panel].screen_left,
+			    (int)descs[panel].screen_top);
+		}
+		pick = panel;
 	}
 	out[0].monitor_id = descs[pick].monitor_id;
 	out[0].confidence = (uint32_t)XRT_DISPLAY_CLAIM_EDID;
@@ -3158,7 +3477,7 @@ query_source_claims(const struct plugin_display_source *src,
 	    iface->probe_displays != NULL) {
 		return iface->probe_displays(src->inst, descs, n, out, max);
 	}
-	return synth_primary_edid_claim(descs, n, out, max);
+	return synth_primary_edid_claim(descs, n, out, max, iface);
 }
 
 /*!
@@ -3293,11 +3612,15 @@ ensure_display_sources(void)
 		return;
 	}
 	g_display_source_count = 0;
-#ifdef XRT_OS_WINDOWS
+#if !defined(XRT_OS_ANDROID)
+	// Windows (registry) and macOS/Linux (manifests): every registered
+	// plug-in is a claim source, so the fallback and a vendor plug-in both
+	// contribute. macOS has no EDID enumerator yet, so resolution is a no-op
+	// there before this is ever reached.
 	g_display_source_count = collect_display_sources_platform(g_display_sources, TARGET_PLUGIN_MAX_SOURCES);
 #else
-	// Off-Windows the EDID enumerator yields no monitors, so resolution is
-	// a no-op regardless; the single active plug-in suffices as the lone
+	// Android: one plug-in ships inside the runtime APK (ADR-038) and the
+	// EDID enumerator yields no monitors; the active plug-in is the lone
 	// source for any caller that supplies its own descriptors.
 	if (g_active_iface != NULL) {
 		g_display_sources[0].iface = g_active_iface;

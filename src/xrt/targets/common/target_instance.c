@@ -160,8 +160,10 @@ fill_dp_factories_from_plugin(struct xrt_system_compositor_info *info, const str
  * service compositor) via `comp_dp_factory_for_window`. They agree because the
  * loader now ENFORCES it (#1521): the active plug-in wins any monitor it claims,
  * so the primary-monitor winner is the active plug-in whenever it claims that
- * monitor — it is no longer merely assumed from EDID confidence. No-op (empty
- * registry) off-Windows, where the EDID enumerator returns no monitors.
+ * monitor — it is no longer merely assumed from EDID confidence. Populated on
+ * Windows and desktop Linux (RandR joined to DRM sysfs, multi-screen M0); a
+ * no-op (empty registry) on macOS and Android, where the EDID enumerator
+ * returns no monitors.
  */
 static void
 build_dp_registry(struct xrt_system_compositor_info *info)
@@ -271,6 +273,10 @@ apply_plugin_display_info(struct xrt_system_compositor_info *info,
                           const struct xrt_plugin_iface *plugin,
                           const struct xrt_plugin_display_info *pdi)
 {
+	// Steers the active plug-in's back-compat display claim onto its panel's
+	// monitor when build_dp_registry runs next (multi-screen M0).
+	target_plugin_note_active_panel(pdi);
+
 	info->display_width_m = pdi->display_width_m;
 	info->display_height_m = pdi->display_height_m;
 	info->nominal_viewer_x_m = pdi->nominal_viewer_x_m;
