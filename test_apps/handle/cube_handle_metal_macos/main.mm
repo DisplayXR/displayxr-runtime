@@ -1011,10 +1011,15 @@ static void DrawCursorSprite(MetalRenderer &r, id<MTLRenderCommandEncoder> enc, 
     [enc setDepthStencilState:r.depthState];
 }
 
+// depthTarget: nil renders into the app's private depth texture (the
+// default). Non-nil is the XR_KHR_composition_layer_depth swapchain image the
+// app submits (DISPLAYXR_CURSOR_DEPTH_SOURCE=layer), so its depth is STORED.
 static void RenderScene(MetalRenderer &r, id<MTLTexture> target,
-                         const EyeRenderParams *eyes, int eyeCount)
+                         const EyeRenderParams *eyes, int eyeCount,
+                         id<MTLTexture> depthTarget = nil)
 {
-    EnsureDepthTexture(r, (uint32_t)target.width, (uint32_t)target.height);
+    if (depthTarget == nil)
+        EnsureDepthTexture(r, (uint32_t)target.width, (uint32_t)target.height);
 
     MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
     rpd.colorAttachments[0].texture = target;
@@ -1030,9 +1035,9 @@ static void RenderScene(MetalRenderer &r, id<MTLTexture> target,
     rpd.colorAttachments[0].clearColor = transparent_bg
         ? MTLClearColorMake(0.0, 0.0, 0.0, 0.0)
         : MTLClearColorMake(0.05, 0.05, 0.08, 1.0);
-    rpd.depthAttachment.texture = r.depthTexture;
+    rpd.depthAttachment.texture = depthTarget != nil ? depthTarget : r.depthTexture;
     rpd.depthAttachment.loadAction = MTLLoadActionClear;
-    rpd.depthAttachment.storeAction = MTLStoreActionDontCare;
+    rpd.depthAttachment.storeAction = depthTarget != nil ? MTLStoreActionStore : MTLStoreActionDontCare;
     rpd.depthAttachment.clearDepth = 1.0;
 
     id<MTLCommandBuffer> cmdBuf = [r.commandQueue commandBuffer];
@@ -1638,6 +1643,11 @@ struct AppXrSession {
     XrSpace localSpace;
     XrSpace viewSpace;
     SwapchainInfo swapchain;
+    // XR_DXR_cursor_depth v2 (ADR-046 3a): DISPLAYXR_CURSOR_DEPTH_SOURCE=layer
+    // submits depth (XR_KHR_composition_layer_depth) and lets the runtime
+    // find the nearest content under the cursor, instead of the hit test.
+    bool cursorDepthFromLayer = false;
+    SwapchainInfo depthSwapchain = {};
     XrViewConfigurationType viewConfigType;
     std::vector<XrViewConfigurationView> configViews;
     XrSessionState sessionState;
@@ -1663,6 +1673,8 @@ struct AppXrSession {
     bool hasAtlasCaptureExt = false;
     bool hasViewRigExt = false;  // XR_DXR_view_rig (#396 W7)
     bool hasCursorDepthExt = false; // XR_DXR_cursor_depth (ADR-046)
+    uint32_t cursorDepthSpecVersion = 0;
+    bool hasLayerDepthExt = false;  // XR_KHR_composition_layer_depth
     PFN_xrCaptureAtlasDXR pfnCaptureAtlasEXT = nullptr;
 
     // XR_DXR_local_3d_zone (#439 Phase 3, cases 2/3/4)
@@ -1727,8 +1739,12 @@ static bool InitializeOpenXR(AppXrSession &app)
             g_hasMcpToolsExt = true;
         if (strcmp(e.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0)
             app.hasViewRigExt = true;
-        if (strcmp(e.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0)
+        if (strcmp(e.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0) {
             app.hasCursorDepthExt = true;
+            app.cursorDepthSpecVersion = e.extensionVersion;
+        }
+        if (strcmp(e.extensionName, XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME) == 0)
+            app.hasLayerDepthExt = true;
     }
 
     if (!hasMetalEnable) {
@@ -1771,6 +1787,23 @@ static bool InitializeOpenXR(AppXrSession &app)
         }
     }
     LOG_INFO("XR_DXR_cursor_depth: %s", app.hasCursorDepthExt ? "ENABLED" : "off");
+    if (app.hasCursorDepthExt) {
+        // Opt-in (ADR-046 3a): submit depth and let the runtime find the
+        // nearest point. Needs spec v2 + XR_KHR_composition_layer_depth.
+        const char *src = getenv("DISPLAYXR_CURSOR_DEPTH_SOURCE");
+        if (src != nullptr && strcmp(src, "layer") == 0) {
+            if (app.cursorDepthSpecVersion >= 2 && app.hasLayerDepthExt) {
+                app.cursorDepthFromLayer = true;
+                enabledExts.push_back(XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME);
+            } else {
+                LOG_WARN("DISPLAYXR_CURSOR_DEPTH_SOURCE=layer needs XR_DXR_cursor_depth v2 (have v%u) and "
+                         "XR_KHR_composition_layer_depth (%s) - keeping the app hit test",
+                         app.cursorDepthSpecVersion, app.hasLayerDepthExt ? "present" : "absent");
+            }
+        }
+        LOG_INFO("XR_DXR_cursor_depth source: %s",
+                 app.cursorDepthFromLayer ? "SUBMITTED DEPTH (runtime reads it)" : "app hit test");
+    }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
     strncpy(createInfo.applicationInfo.applicationName, "MetalCubeExtOpenXR",
@@ -2108,6 +2141,32 @@ static bool CreateSwapchain(AppXrSession &app)
     }
 
     LOG_INFO("Swapchain created: %ux%u, %u images", w, h, imageCount);
+
+    // XR_DXR_cursor_depth 3a: a matching depth swapchain the app renders its
+    // depth into and submits via XrCompositionLayerDepthInfoKHR.
+    if (app.cursorDepthFromLayer) {
+        XrSwapchainCreateInfo dci = sci;
+        dci.usageFlags = XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        dci.format = (int64_t)MTLPixelFormatDepth32Float;
+        if (XR_FAILED(xrCreateSwapchain(app.session, &dci, &app.depthSwapchain.swapchain))) {
+            LOG_WARN("Depth swapchain creation failed - falling back to the app hit test");
+            app.cursorDepthFromLayer = false;
+            return true;
+        }
+        uint32_t dCount = 0;
+        XR_CHECK(xrEnumerateSwapchainImages(app.depthSwapchain.swapchain, 0, &dCount, nullptr));
+        std::vector<XrSwapchainImageMetalKHR> dImages(dCount, {XR_TYPE_SWAPCHAIN_IMAGE_METAL_KHR});
+        XR_CHECK(xrEnumerateSwapchainImages(app.depthSwapchain.swapchain, dCount, &dCount,
+                                             (XrSwapchainImageBaseHeader *)dImages.data()));
+        app.depthSwapchain.format = dci.format;
+        app.depthSwapchain.width = w;
+        app.depthSwapchain.height = h;
+        app.depthSwapchain.imageCount = dCount;
+        app.depthSwapchain.images.resize(dCount);
+        for (uint32_t i = 0; i < dCount; i++)
+            app.depthSwapchain.images[i] = (__bridge id<MTLTexture>)dImages[i].texture;
+        LOG_INFO("Depth swapchain created: %ux%u, %u images (XR_DXR_cursor_depth source = layer)", w, h, dCount);
+    }
     return true;
 }
 
@@ -2981,6 +3040,9 @@ int main(int argc, char **argv)
         static uint32_t prevActive = 0;
         XrCursorDepthHintDXR cursorHint = {XR_TYPE_CURSOR_DEPTH_HINT_DXR};
         XrCursorDepthPlacementDXR cursorPlacement = {XR_TYPE_CURSOR_DEPTH_PLACEMENT_DXR};
+        // Spec v2 (ADR-046 3a): "find the nearest point in the depth I submit".
+        XrCursorDepthSourceDXR cursorSource = {XR_TYPE_CURSOR_DEPTH_SOURCE_DXR};
+        cursorSource.source = XR_CURSOR_DEPTH_SOURCE_SUBMITTED_DEPTH_DXR;
         bool cursorInCanvas = false;
         if (app.hasCursorDepthExt && g_window != nil && g_metalView != nil) {
             NSPoint pw = [g_window mouseLocationOutsideOfEventStream];
@@ -3006,14 +3068,27 @@ int main(int argc, char **argv)
                 if (cursorInCanvas) {
                     cursorHint.cursorUV = {u, v};
                     cursorHint.cursorHeight = kCursorHeight;
-                    XrVector3f hit = {0.0f, 0.0f, 0.0f};
-                    cursorHint.hasContent =
-                        CursorFootprintHit(prevViews, prevActive, u, v, (float)(b.size.width / b.size.height),
-                                           renderer.cubeRotation, hit)
-                            ? XR_TRUE
-                            : XR_FALSE;
-                    cursorHint.nearestPoint = hit;
-                    cursorHint.next = locateInfo.next;
+                    if (app.cursorDepthFromLayer) {
+                        // No hit test at all: the runtime reads the depth
+                        // this app submits with its projection layer.
+                        cursorHint.hasContent = XR_FALSE;
+                        cursorHint.nearestPoint = {0.0f, 0.0f, 0.0f};
+                    } else {
+                        XrVector3f hit = {0.0f, 0.0f, 0.0f};
+                        cursorHint.hasContent =
+                            CursorFootprintHit(prevViews, prevActive, u, v, (float)(b.size.width / b.size.height),
+                                               renderer.cubeRotation, hit)
+                                ? XR_TRUE
+                                : XR_FALSE;
+                        cursorHint.nearestPoint = hit;
+                    }
+                    // Chain: locateInfo -> hint [-> source] -> (rig struct).
+                    if (app.cursorDepthFromLayer) {
+                        cursorSource.next = locateInfo.next;
+                        cursorHint.next = &cursorSource;
+                    } else {
+                        cursorHint.next = locateInfo.next;
+                    }
                     locateInfo.next = &cursorHint;
                 }
             }
@@ -3043,7 +3118,9 @@ int main(int argc, char **argv)
                 osCursorHidden = g_cursorDraw.active;
             }
             static int cursorLogged = 0;
-            if (g_cursorDraw.active && cursorHint.hasContent && cursorLogged < 3) {
+            const bool cursorHasContent =
+                app.cursorDepthFromLayer ? cursorPlacement.targetDisparity != 0.0f : cursorHint.hasContent == XR_TRUE;
+            if (g_cursorDraw.active && cursorHasContent && cursorLogged < 3) {
                 cursorLogged++;
                 LOG_INFO("cursor_depth: uv=(%.3f,%.3f) target=%.3f disparity=%.3f h=%.4f pos=(%.3f,%.3f,%.3f)",
                          cursorHint.cursorUV.x, cursorHint.cursorUV.y, cursorPlacement.targetDisparity,
@@ -3091,6 +3168,16 @@ int main(int argc, char **argv)
         waitImgInfo.timeout = XR_INFINITE_DURATION;
         xrWaitSwapchainImage(app.swapchain.swapchain, &waitImgInfo);
 
+        // XR_DXR_cursor_depth 3a: the depth image submitted with the layer.
+        id<MTLTexture> depthTarget = nil;
+        if (app.cursorDepthFromLayer) {
+            uint32_t depthIndex = 0;
+            if (XR_SUCCEEDED(xrAcquireSwapchainImage(app.depthSwapchain.swapchain, &acqInfo, &depthIndex))) {
+                xrWaitSwapchainImage(app.depthSwapchain.swapchain, &waitImgInfo);
+                depthTarget = app.depthSwapchain.images[depthIndex];
+            }
+        }
+
         bool rendered = false;
         bool display3D = (app.currentModeIndex < app.renderingModeCount)
             ? app.renderingModeDisplay3D[app.currentModeIndex] : true;
@@ -3112,6 +3199,7 @@ int main(int argc, char **argv)
 
         // Dynamic arrays for N-view rendering
         std::vector<XrCompositionLayerProjectionView> projViews(locatedCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+        std::vector<XrCompositionLayerDepthInfoKHR> depthInfos(locatedCount, {XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR});
 
         // Render
         if (frameState.shouldRender && viewCount >= 1) {
@@ -3203,6 +3291,15 @@ int main(int argc, char **argv)
                 projViews[eye].subImage.imageArrayIndex = 0;
                 projViews[eye].pose = views[eye < (int)viewCount ? eye : 0].pose;
                 projViews[eye].fov = submitFov;
+
+                // Same rect in the depth swapchain, and the clip planes this
+                // eye's projection used (mat4_from_xr_fov: [0,1], near -> 0).
+                depthInfos[eye].subImage = projViews[eye].subImage;
+                depthInfos[eye].subImage.swapchain = app.depthSwapchain.swapchain;
+                depthInfos[eye].minDepth = 0.0f;
+                depthInfos[eye].maxDepth = 1.0f;
+                depthInfos[eye].nearZ = nearZ;
+                depthInfos[eye].farZ = farZ;
             }
 
             // ADR-041: fill the inactive tail [eyeCount, locatedCount). Each
@@ -3210,7 +3307,17 @@ int main(int argc, char **argv)
             // view 0's, and the runtime discards those pixels.
             DxrAliasInactiveViews(projViews.data(), views.data(), locatedCount, (uint32_t)eyeCount);
 
-            RenderScene(renderer, app.swapchain.images[imageIndex], eyeParams.data(), eyeCount);
+            // XR_KHR_composition_layer_depth is all-or-nothing per layer: the
+            // aliased inactive tail carries view 0's depth like its colour.
+            if (depthTarget != nil) {
+                for (uint32_t i = 0; i < locatedCount; i++) {
+                    if (i >= (uint32_t)eyeCount) depthInfos[i] = depthInfos[0];
+                    depthInfos[i].next = nullptr;
+                    projViews[i].next = &depthInfos[i];
+                }
+            }
+
+            RenderScene(renderer, app.swapchain.images[imageIndex], eyeParams.data(), eyeCount, depthTarget);
 
             // 'I' key: snapshot the multi-view atlas via the runtime-owned
             // XR_DXR_atlas_capture (W6 of #396) — the runtime does the readback
@@ -3250,6 +3357,9 @@ int main(int argc, char **argv)
         // Release swapchain image
         XrSwapchainImageReleaseInfo relInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
         xrReleaseSwapchainImage(app.swapchain.swapchain, &relInfo);
+        if (depthTarget != nil) {
+            xrReleaseSwapchainImage(app.depthSwapchain.swapchain, &relInfo);
+        }
 
         // Render the HUD into the window-space layer swapchain (when visible).
         bool hudSubmitted = false;
