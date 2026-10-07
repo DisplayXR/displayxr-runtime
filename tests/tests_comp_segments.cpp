@@ -375,3 +375,35 @@ TEST_CASE("comp_segments: lifecycle hysteresis")
 		CHECK_FALSE(comp_segments_lifecycle_is_live(&lc, EDP));
 	}
 }
+
+TEST_CASE("comp_segments: deferred release")
+{
+	comp_segments_retire r{};
+	uint32_t kinds[4];
+	uint64_t items[4];
+
+	REQUIRE(comp_segments_retire_push(&r, 1, 0xA));
+	REQUIRE(comp_segments_retire_push(&r, 2, 0xB));
+	REQUIRE(comp_segments_retire_push(&r, 3, 0xC));
+
+	// A fill is in flight: nothing is handed back, nothing is lost.
+	CHECK(comp_segments_retire_take(&r, false, kinds, items, 4) == 0);
+	CHECK(r.count == 3);
+
+	// Safe: oldest first, capped, the rest stays queued.
+	REQUIRE(comp_segments_retire_take(&r, true, kinds, items, 2) == 2);
+	CHECK(kinds[0] == 1);
+	CHECK(items[0] == 0xA);
+	CHECK(items[1] == 0xB);
+	CHECK(r.count == 1);
+	REQUIRE(comp_segments_retire_take(&r, true, kinds, items, 4) == 1);
+	CHECK(items[0] == 0xC);
+	CHECK(r.count == 0);
+
+	// Full list refuses instead of overwriting.
+	for (uint32_t i = 0; i < COMP_SEGMENTS_RETIRE_MAX; i++) {
+		REQUIRE(comp_segments_retire_push(&r, 0, i));
+	}
+	CHECK_FALSE(comp_segments_retire_push(&r, 0, 999));
+	CHECK_FALSE(comp_segments_retire_push(nullptr, 0, 1));
+}
