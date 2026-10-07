@@ -320,6 +320,12 @@
 		]
 	},
 
+	"system_enumerate_displays": {
+		"out": [
+			{"name": "list", "type": "struct xrt_screen_list"}
+		]
+	},
+
 	"session_create": {
 		"in": [
 			{"name": "xsi", "type": "struct xrt_session_info"},

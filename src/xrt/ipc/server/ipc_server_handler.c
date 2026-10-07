@@ -2242,6 +2242,26 @@ ipc_handle_system_compositor_get_info(volatile struct ipc_client_state *ics,
 	return XRT_SUCCESS;
 }
 
+/*!
+ * Multi-screen M1 (`XR_DXR_display_info` v22): the service's screen list, so an
+ * IPC client's `xrEnumerateDisplaysDXR` returns exactly what an in-process app
+ * would. A separate message on purpose — `xrt_system_compositor_info` crosses
+ * the wire by value and is not grown for this.
+ */
+xrt_result_t
+ipc_handle_system_enumerate_displays(volatile struct ipc_client_state *ics, struct xrt_screen_list *out_list)
+{
+	IPC_TRACE_MARKER();
+
+	xrt_result_t xret = xrt_instance_enumerate_displays(ics->server->xinst, out_list);
+	if (xret == XRT_ERROR_FEATURE_NOT_SUPPORTED) {
+		// An instance that cannot enumerate has no screens to report.
+		memset(out_list, 0, sizeof(*out_list));
+		return XRT_SUCCESS;
+	}
+	return xret;
+}
+
 xrt_result_t
 ipc_handle_session_create(volatile struct ipc_client_state *ics,
                           const struct xrt_session_info *xsi,

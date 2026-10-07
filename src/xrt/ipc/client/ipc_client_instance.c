@@ -217,6 +217,19 @@ err_destroy:
 	return xret;
 }
 
+/*!
+ * xrt_instance::enumerate_displays (multi-screen M1): the service's screen
+ * list, so `xrEnumerateDisplaysDXR` under IPC matches the in-process answer.
+ */
+static xrt_result_t
+ipc_client_instance_enumerate_displays(struct xrt_instance *xinst, struct xrt_screen_list *out_list)
+{
+	struct ipc_client_instance *ii = ipc_client_instance(xinst);
+
+	xrt_result_t xret = ipc_call_system_enumerate_displays(&ii->ipc_c, out_list);
+	IPC_CHK_ALWAYS_RET(&ii->ipc_c, xret, "ipc_call_system_enumerate_displays");
+}
+
 static xrt_result_t
 ipc_client_instance_get_prober(struct xrt_instance *xinst, struct xrt_prober **out_xp)
 {
@@ -276,6 +289,7 @@ ipc_instance_create(const struct xrt_instance_info *i_info, struct xrt_instance 
 	ii->base.create_system = ipc_client_instance_create_system;
 	ii->base.get_prober = ipc_client_instance_get_prober;
 	ii->base.destroy = ipc_client_instance_destroy;
+	ii->base.enumerate_displays = ipc_client_instance_enumerate_displays;
 
 #ifdef XRT_OS_WINDOWS
 	timeBeginPeriod(1);

@@ -3205,6 +3205,7 @@ static struct
 {
 	uint64_t monitor_id;
 	struct os_display_edid_monitor mon;
+	struct xrt_display_descriptor desc;
 } g_monitor_side[XRT_DP_REGISTRY_MAX_ENTRIES];
 static uint32_t g_monitor_side_count = 0;
 
@@ -3319,11 +3320,40 @@ target_plugin_build_descriptors(const struct os_display_edid_list *list,
 	for (uint32_t i = 0; i < g_monitor_side_count; i++) {
 		g_monitor_side[i].monitor_id = out[i].monitor_id;
 		g_monitor_side[i].mon = list->monitors[i];
+		g_monitor_side[i].desc = out[i];
 	}
 	if (g_refresh_mutex_initialized) {
 		os_mutex_unlock(&g_refresh_mutex);
 	}
 	return n;
+}
+
+bool
+target_plugin_get_monitor_record(uint64_t monitor_id,
+                                 struct xrt_display_descriptor *out_desc,
+                                 struct os_display_edid_monitor *out_mon)
+{
+	bool found = false;
+	if (g_refresh_mutex_initialized) {
+		os_mutex_lock(&g_refresh_mutex);
+	}
+	for (uint32_t i = 0; i < g_monitor_side_count; i++) {
+		if (g_monitor_side[i].monitor_id != monitor_id) {
+			continue;
+		}
+		if (out_desc != NULL) {
+			*out_desc = g_monitor_side[i].desc;
+		}
+		if (out_mon != NULL) {
+			*out_mon = g_monitor_side[i].mon;
+		}
+		found = true;
+		break;
+	}
+	if (g_refresh_mutex_initialized) {
+		os_mutex_unlock(&g_refresh_mutex);
+	}
+	return found;
 }
 
 #ifndef XRT_OS_WINDOWS

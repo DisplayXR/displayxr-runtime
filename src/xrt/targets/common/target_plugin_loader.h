@@ -340,6 +340,7 @@ target_plugin_build_discovery_roots(char roots[][PATH_MAX], int max_roots);
  * os/os_display_edid.h; the .c includes those, the header stays lean. */
 struct xrt_dp_factory_registry;
 struct os_display_edid_list;
+struct os_display_edid_monitor;
 
 /*!
  * Map an enumerated EDID monitor list (`os_display_edid_enumerate`) into the
@@ -386,6 +387,19 @@ void
 target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
                                uint32_t descriptor_count,
                                struct xrt_dp_factory_registry *out_registry);
+
+/*!
+ * The runtime-private record behind a monitor id from the last
+ * @ref target_plugin_build_descriptors: the descriptor the plug-ins saw and
+ * the full EDID/placement record (mm, connector, output name, device mode).
+ * Either out-param may be NULL. False when the id is unknown (or the
+ * platform enumerates no monitors). Multi-screen M1: feeds the per-screen
+ * info that `xrEnumerateDisplaysDXR` reports.
+ */
+bool
+target_plugin_get_monitor_record(uint64_t monitor_id,
+                                 struct xrt_display_descriptor *out_desc,
+                                 struct os_display_edid_monitor *out_mon);
 
 struct xrt_plugin_display_info;
 struct os_display_edid_monitor;
