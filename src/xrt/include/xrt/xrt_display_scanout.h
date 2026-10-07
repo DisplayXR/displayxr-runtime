@@ -112,9 +112,31 @@ struct xrt_dp_scanout_caps
 	//! @ref XRT_DP_WEAVE_SCOPE_CANVAS (see @ref xrt_dp_weave_scope_clamp).
 	uint32_t weave_scope;
 
+	//! `XRT_DP_SCANOUT_FLAG_*` (multi-screen M2). Carved out of the former
+	//! `reserved[0]`: same size and offsets, and a plug-in built before the
+	//! field existed wrote 0 here — which is the conservative default (the
+	//! weave needs 1:1 pixels), so nothing changes for it.
+	uint32_t flags;
+
 	//! Reserved for future scanout capabilities. Plug-ins MUST write 0.
-	uint32_t reserved[6];
+	uint32_t reserved[5];
 };
+
+/*!
+ * @ref xrt_dp_scanout_caps::flags: the DP's output survives the display
+ * server resampling the window (a fractionally scaled desktop, an X11 window
+ * under XWayland at a non-integer scale). True for outputs that are not
+ * pixel-period patterns — anaglyph, side-by-side, blend, passthrough. False
+ * (the default, bit clear) for a lenticular weave or any 1-pixel-period
+ * interlace, which a resample turns into a uniform double image.
+ *
+ * The runtime's refuse-rather-than-resample gates (#1595 Wayland, #1831 X11,
+ * and the per-segment gate of multi-screen M2) degrade a session or a segment
+ * to flat 2D only when the DP does NOT set this bit.
+ *
+ * @ingroup xrt_iface
+ */
+#define XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE (1u << 0)
 
 /*!
  * Size of the V1 caps shape. Plug-ins accept any caller `struct_size >= ` this

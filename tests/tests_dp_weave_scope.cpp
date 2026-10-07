@@ -66,9 +66,19 @@ TEST_CASE("dp_weave_scope: caps init stamps the caller's size")
 
 	CHECK(caps.struct_size == sizeof(struct xrt_dp_scanout_caps));
 	CHECK(caps.weave_scope == XRT_DP_WEAVE_SCOPE_CANVAS);
+	CHECK(caps.flags == 0); // conservative default: the weave needs 1:1
 	for (size_t i = 0; i < sizeof(caps.reserved) / sizeof(caps.reserved[0]); i++) {
 		CHECK(caps.reserved[i] == 0);
 	}
+}
+
+TEST_CASE("dp_weave_scope: flags were carved out of reserved[0] (multi-screen M2)")
+{
+	// A plug-in built before `flags` wrote 0 into reserved[0] at this offset,
+	// which reads as "needs 1:1" — the behaviour it always had.
+	CHECK(offsetof(struct xrt_dp_scanout_caps, flags) == 8);
+	CHECK(offsetof(struct xrt_dp_scanout_caps, reserved) == 12);
+	CHECK(sizeof(struct xrt_dp_scanout_caps) == XRT_DP_SCANOUT_CAPS_SIZE_V1);
 }
 
 TEST_CASE("dp_weave_scope: V1 size constant matches the struct")
