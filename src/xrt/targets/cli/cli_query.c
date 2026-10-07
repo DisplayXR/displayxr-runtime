@@ -30,11 +30,13 @@
 #include "os/os_time.h" // #1380 rig-role sampling window
 #include "util/u_git_tag.h"
 #include "util/u_setting.h" // #1252 settings chain (env > per-user > machine)
+#include "util/u_screen_info.h" // multi-screen M1 per-screen info
 #ifdef XRT_OS_WINDOWS
 #include "util/u_windows.h" // #1201 DPI awareness reporting
 #endif
 
 #include "target_plugin_loader.h"
+#include "target_screens.h"
 #include "target_input_plugin_loader.h"
 #include "target_builder_input_provider.h"
 #include "target_input_arbiter.h"
@@ -782,6 +784,10 @@ dp_confidence_label(uint32_t c)
  * the registry is empty and the service path falls back to the scalar — reported
  * as agreement, never a false mismatch.
  */
+//! The registry @ref probe_dp_selection resolved — reused for the per-screen
+//! list so the plug-ins' probe_displays run once per CLI invocation.
+static struct xrt_dp_factory_registry g_cli_dp_registry;
+
 static void
 probe_dp_selection(struct cli_query_result *r, const struct xrt_plugin_iface *active)
 {
@@ -799,6 +805,7 @@ probe_dp_selection(struct cli_query_result *r, const struct xrt_plugin_iface *ac
 	struct xrt_dp_factory_registry reg = {0};
 	target_plugin_resolve_displays(descs, dn, &reg);
 	r->dp_sel_claim_count = reg.entry_count;
+	g_cli_dp_registry = reg;
 
 	if (reg.entry_count > 0) {
 		// The compositor passes COMP_DP_PRIMARY_MONITOR, which selects via
@@ -1669,6 +1676,45 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 	                           r->desktop_info.width_in_caller_dpi == info.display_pixel_width &&
 	                           r->desktop_info.height_in_caller_dpi == info.display_pixel_height;
 
+	// Multi-screen M1 — the per-screen list xrEnumerateDisplaysDXR reports. The
+	// system-default screen gets the active plug-in's panel info, with the
+	// view-scale baseline derived from the mode table exactly as
+	// apply_plugin_display_info does when the plug-in leaves it 0.
+	{
+		struct target_screens_system sys;
+		memset(&sys, 0, sizeof(sys));
+		u_screen_info_from_plugin(&info, XRT_SCREEN_INFO_SOURCE_SYSTEM, &sys.info);
+		if (!(sys.info.recommended_view_scale_x > 0.0f) || !(sys.info.recommended_view_scale_y > 0.0f)) {
+			float min_x = 1.0f, min_y = 1.0f;
+			for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {
+				const struct xrt_rendering_mode *rm = &head->rendering_modes[mi];
+				if (rm->view_scale_x > 0.0f && rm->view_scale_x < min_x) {
+					min_x = rm->view_scale_x;
+				}
+				if (rm->view_scale_y > 0.0f && rm->view_scale_y < min_y) {
+					min_y = rm->view_scale_y;
+				}
+			}
+			sys.info.recommended_view_scale_x = min_x;
+			sys.info.recommended_view_scale_y = min_y;
+		}
+		sys.info_valid = info.display_width_m > 0.0f && info.display_height_m > 0.0f;
+		if (r->desktop_info_ok) {
+			sys.desktop_left = r->desktop_info.left;
+			sys.desktop_top = r->desktop_info.top;
+			sys.desktop_width = r->desktop_info.width;
+			sys.desktop_height = r->desktop_info.height;
+			sys.native_width = r->desktop_info.native_width;
+			sys.native_height = r->desktop_info.native_height;
+			sys.desktop_scale = (float)r->desktop_info.scale;
+			sys.is_primary = r->desktop_info.is_primary;
+			snprintf(sys.device_name, sizeof(sys.device_name), "%.*s", (int)(sizeof(sys.device_name) - 1),
+			         r->desktop_info.device_name);
+		}
+		target_screens_build(&g_cli_dp_registry, iface->id, &sys, &r->screens);
+		r->screens_probed = true;
+	}
+
 	// #1252 — the allow-listed performance settings, resolved through the same
 	// chain the runtime uses. Platform-independent, and deliberately BEFORE the
 	// GPU probe so it is reported even where that probe does not run.
@@ -2118,6 +2164,39 @@ cli_query_print_info_text(const struct cli_query_result *r)
 		}
 	}
 
+	P(" :: Displays (XR_DXR_display_info v22 — what xrEnumerateDisplaysDXR reports)\n");
+	if (!r->screens_probed) {
+		PT("not evaluated\n");
+	} else if (r->screens.count == 0) {
+		PT("none (no monitor enumerated and no display info)\n");
+	} else {
+		for (uint32_t i = 0; i < r->screens.count; i++) {
+			const struct xrt_screen *sc = &r->screens.screens[i];
+			const struct xrt_screen_info *si = &sc->info;
+			char et[64];
+			PT("[%u] 0x%016llx '%s' plug-in='%s'%s%s%s\n", i, (unsigned long long)sc->id,
+			   or_q(sc->device_name), or_q(sc->plugin_id),
+			   (sc->flags & XRT_SCREEN_FLAG_SYSTEM_DEFAULT) ? " SYSTEM_DEFAULT" : "",
+			   (sc->flags & XRT_SCREEN_FLAG_PRIMARY) ? " PRIMARY" : "",
+			   (sc->flags & XRT_SCREEN_FLAG_TRACKED) ? " TRACKED" : "");
+			PT("    desktop %ux%u @ (%d,%d)  native %ux%u  scale %.2f  edid %ux%u mm\n", sc->desktop_width,
+			   sc->desktop_height, (int)sc->desktop_left, (int)sc->desktop_top, sc->native_width,
+			   sc->native_height, (double)sc->desktop_scale, sc->physical_width_mm, sc->physical_height_mm);
+			PT("    info[%s]: %.4f x %.4f m  %ux%u px  nominal=(%.3f, %.3f, %.3f) m  view scale %.3f x "
+			   "%.3f  "
+			   "eye tracking %s%s%s%s\n",
+			   u_screen_info_source_str(si->source), (double)si->width_m, (double)si->height_m,
+			   si->pixel_width, si->pixel_height, (double)si->nominal_viewer_x_m,
+			   (double)si->nominal_viewer_y_m, (double)si->nominal_viewer_z_m,
+			   (double)si->recommended_view_scale_x, (double)si->recommended_view_scale_y,
+			   eye_modes_label(si->supported_eye_tracking_modes, et, sizeof(et)),
+			   si->supported_eye_tracking_modes != 0 ? " (default " : "",
+			   si->supported_eye_tracking_modes != 0 ? eye_default_label(si->default_eye_tracking_mode)
+			                                         : "",
+			   si->supported_eye_tracking_modes != 0 ? ")" : "");
+		}
+	}
+
 	P(" :: GPU topology (#918 — does the weave cross adapters to reach the panel?)\n");
 	if (!r->gpu_probed) {
 		PT("%s\n", r->gpu_verdict[0] != '\0' ? r->gpu_verdict : "not evaluated");
@@ -2369,6 +2448,45 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 		cJSON_AddStringToObject(ds, "service_confidence", r->dp_sel_service_conf);
 		cJSON_AddNumberToObject(ds, "monitor_count", (double)r->dp_sel_monitor_count);
 		cJSON_AddNumberToObject(ds, "claim_count", (double)r->dp_sel_claim_count);
+	}
+
+	// Multi-screen M1 — the per-screen list (xrEnumerateDisplaysDXR).
+	{
+		cJSON *arr = cJSON_AddArrayToObject(root, "displays");
+		for (uint32_t i = 0; r->screens_probed && i < r->screens.count; i++) {
+			const struct xrt_screen *sc = &r->screens.screens[i];
+			const struct xrt_screen_info *si = &sc->info;
+			cJSON *d = cJSON_CreateObject();
+			char idbuf[32];
+			snprintf(idbuf, sizeof(idbuf), "0x%016llx", (unsigned long long)sc->id);
+			cJSON_AddStringToObject(d, "id", idbuf);
+			cJSON_AddStringToObject(d, "device_name", sc->device_name);
+			cJSON_AddStringToObject(d, "plugin_id", sc->plugin_id);
+			cJSON_AddBoolToObject(d, "system_default", (sc->flags & XRT_SCREEN_FLAG_SYSTEM_DEFAULT) != 0);
+			cJSON_AddBoolToObject(d, "primary", (sc->flags & XRT_SCREEN_FLAG_PRIMARY) != 0);
+			cJSON_AddBoolToObject(d, "tracked", (sc->flags & XRT_SCREEN_FLAG_TRACKED) != 0);
+			cJSON_AddNumberToObject(d, "desktop_left", (double)sc->desktop_left);
+			cJSON_AddNumberToObject(d, "desktop_top", (double)sc->desktop_top);
+			cJSON_AddNumberToObject(d, "desktop_width", (double)sc->desktop_width);
+			cJSON_AddNumberToObject(d, "desktop_height", (double)sc->desktop_height);
+			cJSON_AddNumberToObject(d, "native_width", (double)sc->native_width);
+			cJSON_AddNumberToObject(d, "native_height", (double)sc->native_height);
+			cJSON_AddNumberToObject(d, "desktop_scale", (double)sc->desktop_scale);
+			cJSON_AddStringToObject(d, "info_source", u_screen_info_source_str(si->source));
+			cJSON_AddNumberToObject(d, "width_m", (double)si->width_m);
+			cJSON_AddNumberToObject(d, "height_m", (double)si->height_m);
+			cJSON_AddNumberToObject(d, "pixel_width", (double)si->pixel_width);
+			cJSON_AddNumberToObject(d, "pixel_height", (double)si->pixel_height);
+			cJSON_AddNumberToObject(d, "nominal_viewer_x_m", (double)si->nominal_viewer_x_m);
+			cJSON_AddNumberToObject(d, "nominal_viewer_y_m", (double)si->nominal_viewer_y_m);
+			cJSON_AddNumberToObject(d, "nominal_viewer_z_m", (double)si->nominal_viewer_z_m);
+			cJSON_AddNumberToObject(d, "recommended_view_scale_x", (double)si->recommended_view_scale_x);
+			cJSON_AddNumberToObject(d, "recommended_view_scale_y", (double)si->recommended_view_scale_y);
+			cJSON_AddNumberToObject(d, "supported_eye_tracking_modes",
+			                        (double)si->supported_eye_tracking_modes);
+			cJSON_AddNumberToObject(d, "default_eye_tracking_mode", (double)si->default_eye_tracking_mode);
+			cJSON_AddItemToArray(arr, d);
+		}
 	}
 
 	// #1234 / #902 - VK late-weave repaint reachability (informational).

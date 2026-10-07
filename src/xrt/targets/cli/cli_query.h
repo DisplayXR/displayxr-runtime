@@ -25,6 +25,7 @@
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_display_zones.h"
 #include "xrt/xrt_dp_lift.h"
+#include "xrt/xrt_screen.h"
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -394,6 +395,14 @@ struct cli_query_result
 	char dp_sel_inproc_id[64];     //!< in-process path plug-in id (mirrors plugin_id).
 	char dp_sel_service_id[64];    //!< service path plug-in id (registry primary; == in-proc on empty registry).
 	char dp_sel_service_conf[24];  //!< service claim confidence label (FALLBACK/EDID/VERIFIED/scalar-fallback).
+
+	/* Multi-screen M1 — the per-screen list `xrEnumerateDisplaysDXR` reports,
+	 * built from the same registry + display info the runtime uses
+	 * (target_screens_build), so M1 is verifiable without a window.
+	 * screens_probed — the list was built (the active plug-in described its
+	 * panel; an empty registry still yields the synthesized default). */
+	bool screens_probed;
+	struct xrt_screen_list screens;
 
 	/* #918 GPU topology — does this box pay a cross-adapter present to get
 	 * the woven frame onto the panel? Windows-only: `gpu_probed` stays false
