@@ -30,6 +30,7 @@
 #include <cstring>
 #include <string>
 #include <chrono>
+#include <utility>
 #include <vector>
 
 #include <unistd.h>
@@ -48,6 +49,7 @@
 #include <openxr/XR_DXR_atlas_capture.h>
 #include <openxr/XR_DXR_mcp_tools.h>
 #include <openxr/XR_DXR_view_rig.h>
+#include <openxr/XR_DXR_cursor_depth.h>
 #include "dxr_view_config.h" // #1486 PRIMARY_MULTIVIEW_DXR opt-in
 
 // ============================================================================
@@ -645,6 +647,7 @@ struct MetalRenderer {
     id<MTLRenderPipelineState> cubePipeline;
     id<MTLRenderPipelineState> gridPipeline;
     id<MTLDepthStencilState>   depthState;
+    id<MTLDepthStencilState>   noDepthState; // XR_DXR_cursor_depth sprite: drawn last, never occluded
 
     id<MTLBuffer>              cubeVertexBuffer;
     id<MTLBuffer>              cubeIndexBuffer;
@@ -808,6 +811,9 @@ static bool InitRenderer(MetalRenderer &r)
         desc.depthCompareFunction = MTLCompareFunctionLess;
         desc.depthWriteEnabled = YES;
         r.depthState = [r.device newDepthStencilStateWithDescriptor:desc];
+        desc.depthCompareFunction = MTLCompareFunctionAlways;
+        desc.depthWriteEnabled = NO;
+        r.noDepthState = [r.device newDepthStencilStateWithDescriptor:desc];
     }
 
     // Sampler
@@ -883,6 +889,128 @@ static void EnsureDepthTexture(MetalRenderer &r, uint32_t w, uint32_t h)
 // Render scene into swapchain image
 // ============================================================================
 
+// ============================================================================
+// XR_DXR_cursor_depth (ADR-046) — reference adoption.
+//
+// The app owns the depth: each frame it hit-tests the cube under the cursor
+// FOOTPRINT (rays from the outer eyes through a ring of points around the
+// hotspot) and hands the nearest hit to xrLocateViews. The runtime returns
+// where to draw the cursor sprite; the app draws it last, depth test off, and
+// hides the OS cursor while it does. Opt out with DISPLAYXR_CURSOR_DEPTH=0.
+// ============================================================================
+
+static const float kCubeSize = 0.06f;
+static const float kCursorHeight = 0.04f; // fraction of canvas height
+
+struct CursorDepthDraw {
+    bool active = false;
+    XrPosef pose = {{0, 0, 0, 1}, {0, 0, 0}};
+    float height = 0.0f;
+};
+static CursorDepthDraw g_cursorDraw;
+
+// Slab test against the cube as RenderScene places it: centred at
+// (0, size/2, 0), edge `size`, rotated `rot` about +Y (mat4_rotation_y).
+static bool RayHitCube(const XrVector3f &o, const XrVector3f &d, float rot, float &tOut)
+{
+    const float c = cosf(rot), s = sinf(rot), h = kCubeSize * 0.5f;
+    // local = R^T (world - centre); R's columns are (c,0,-s), (0,1,0), (s,0,c).
+    const float ox = o.x, oy = o.y - h, oz = o.z;
+    const float lo[3] = {c * ox - s * oz, oy, s * ox + c * oz};
+    const float ld[3] = {c * d.x - s * d.z, d.y, s * d.x + c * d.z};
+    float t0 = 0.0f, t1 = 1e30f;
+    for (int i = 0; i < 3; i++) {
+        if (fabsf(ld[i]) < 1e-9f) {
+            if (lo[i] < -h || lo[i] > h) return false;
+            continue;
+        }
+        float ta = (-h - lo[i]) / ld[i], tb = (h - lo[i]) / ld[i];
+        if (ta > tb) std::swap(ta, tb);
+        if (ta > t0) t0 = ta;
+        if (tb < t1) t1 = tb;
+        if (t0 > t1) return false;
+    }
+    tOut = t0;
+    return true;
+}
+
+// Ray from a located view through canvas point (u, v): Kooima frusta all
+// frame the canvas, so (u, v) maps linearly onto the fov tangents.
+static XrVector3f ViewRayDir(const XrView &view, float u, float v)
+{
+    const float tl = tanf(view.fov.angleLeft), tr = tanf(view.fov.angleRight);
+    const float tu = tanf(view.fov.angleUp), td = tanf(view.fov.angleDown);
+    float dx, dy, dz;
+    quat_rotate_vec3(view.pose.orientation, tl + u * (tr - tl), tu - v * (tu - td), -1.0f, &dx, &dy, &dz);
+    return {dx, dy, dz};
+}
+
+// Nearest cube point (to the viewer) under the cursor footprint, using the
+// outer views of the previous locate. Footprint = the sprite plus 50%.
+static bool CursorFootprintHit(const std::vector<XrView> &views, uint32_t active, float u, float v,
+                               float canvasAspect, float rot, XrVector3f &nearest)
+{
+    if (active < 2 || views.size() < active) return false;
+    const XrView *outer[2] = {&views[0], &views[active - 1]};
+    float fx, fy, fz;
+    quat_rotate_vec3(views[0].pose.orientation, 0.0f, 0.0f, -1.0f, &fx, &fy, &fz);
+    const float r = 0.75f * kCursorHeight; // footprint radius, in canvas heights
+    bool found = false;
+    float best = 1e30f;
+    for (int k = -1; k < 8; k++) {
+        float su = u, sv = v;
+        if (k >= 0) {
+            const float a = (float)k * 0.78539816f;
+            su += r * cosf(a) / canvasAspect;
+            sv += r * sinf(a);
+        }
+        for (const XrView *view : outer) {
+            const XrVector3f d = ViewRayDir(*view, su, sv);
+            float t;
+            if (!RayHitCube(view->pose.position, d, rot, t)) continue;
+            const XrVector3f p = {view->pose.position.x + d.x * t, view->pose.position.y + d.y * t,
+                                  view->pose.position.z + d.z * t};
+            const float depth = p.x * fx + p.y * fy + p.z * fz; // smaller = nearer the viewer
+            if (depth < best) {
+                best = depth;
+                nearest = p;
+                found = true;
+            }
+        }
+    }
+    return found;
+}
+
+static void DrawCursorSprite(MetalRenderer &r, id<MTLRenderCommandEncoder> enc, const float vp_mat[16])
+{
+    // Crosshair + small square, in the sprite's XY plane, unit = sprite height.
+    static const GridVertex lines[] = {
+        {{-0.5f, 0.0f, 0.0f}}, {{-0.15f, 0.0f, 0.0f}}, {{0.15f, 0.0f, 0.0f}}, {{0.5f, 0.0f, 0.0f}},
+        {{0.0f, -0.5f, 0.0f}}, {{0.0f, -0.15f, 0.0f}}, {{0.0f, 0.15f, 0.0f}}, {{0.0f, 0.5f, 0.0f}},
+        {{-0.15f, -0.15f, 0.0f}}, {{0.15f, -0.15f, 0.0f}}, {{0.15f, -0.15f, 0.0f}}, {{0.15f, 0.15f, 0.0f}},
+        {{0.15f, 0.15f, 0.0f}}, {{-0.15f, 0.15f, 0.0f}}, {{-0.15f, 0.15f, 0.0f}}, {{-0.15f, -0.15f, 0.0f}},
+    };
+    float poseMat[16], scale[16], model[16];
+    mat4_model_from_xr_pose(poseMat, g_cursorDraw.pose);
+    mat4_scaling(scale, g_cursorDraw.height);
+    mat4_multiply(model, poseMat, scale);
+
+    GridUniforms uniforms;
+    mat4_multiply(uniforms.mvp, vp_mat, model);
+    uniforms.color[0] = 1.0f;
+    uniforms.color[1] = 0.85f;
+    uniforms.color[2] = 0.1f;
+    uniforms.color[3] = 1.0f;
+
+    [enc setDepthStencilState:r.noDepthState];
+    [enc setRenderPipelineState:r.gridPipeline];
+    [enc setVertexBytes:lines length:sizeof(lines) atIndex:0];
+    [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+    [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+    [enc drawPrimitives:MTLPrimitiveTypeLine vertexStart:0 vertexCount:sizeof(lines) / sizeof(lines[0])];
+    [enc setDepthStencilState:r.depthState];
+}
+
 static void RenderScene(MetalRenderer &r, id<MTLTexture> target,
                          const EyeRenderParams *eyes, int eyeCount)
 {
@@ -930,7 +1058,7 @@ static void RenderScene(MetalRenderer &r, id<MTLTexture> target,
 
         // --- Draw cube ---
         {
-            const float cubeSize = 0.06f;
+            const float cubeSize = kCubeSize;
             const float cubeHeight = cubeSize / 2.0f;
             float model[16], rotation[16], translation[16], scale[16], tmp[16];
             mat4_scaling(scale, cubeSize);
@@ -1010,6 +1138,11 @@ static void RenderScene(MetalRenderer &r, id<MTLTexture> target,
             [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:1];
 
             [enc drawPrimitives:MTLPrimitiveTypeLine vertexStart:0 vertexCount:r.gridVertexCount];
+        }
+
+        // --- Depth-aware cursor (XR_DXR_cursor_depth): last, never occluded ---
+        if (g_cursorDraw.active) {
+            DrawCursorSprite(r, enc, vp_mat);
         }
     }
 
@@ -1529,6 +1662,7 @@ struct AppXrSession {
     // XR_DXR_atlas_capture (W6 of #396): runtime-owned 'I'-key atlas capture.
     bool hasAtlasCaptureExt = false;
     bool hasViewRigExt = false;  // XR_DXR_view_rig (#396 W7)
+    bool hasCursorDepthExt = false; // XR_DXR_cursor_depth (ADR-046)
     PFN_xrCaptureAtlasDXR pfnCaptureAtlasEXT = nullptr;
 
     // XR_DXR_local_3d_zone (#439 Phase 3, cases 2/3/4)
@@ -1593,6 +1727,8 @@ static bool InitializeOpenXR(AppXrSession &app)
             g_hasMcpToolsExt = true;
         if (strcmp(e.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0)
             app.hasViewRigExt = true;
+        if (strcmp(e.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0)
+            app.hasCursorDepthExt = true;
     }
 
     if (!hasMetalEnable) {
@@ -1626,6 +1762,15 @@ static bool InitializeOpenXR(AppXrSession &app)
     if (app.hasViewRigExt) {
         enabledExts.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
     }
+    if (app.hasCursorDepthExt) {
+        const char *opt = getenv("DISPLAYXR_CURSOR_DEPTH");
+        if (opt != nullptr && strcmp(opt, "0") == 0) {
+            app.hasCursorDepthExt = false; // opted out: the runtime does no cursor work
+        } else {
+            enabledExts.push_back(XR_DXR_CURSOR_DEPTH_EXTENSION_NAME);
+        }
+    }
+    LOG_INFO("XR_DXR_cursor_depth: %s", app.hasCursorDepthExt ? "ENABLED" : "off");
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
     strncpy(createInfo.applicationInfo.applicationName, "MetalCubeExtOpenXR",
@@ -2829,8 +2974,83 @@ int main(int argc, char **argv)
             viewState.next = &viewRigRaw;
         }
 
+        // XR_DXR_cursor_depth (ADR-046): hint from the previous locate's views
+        // (the hit test needs rays, the rays need views - one frame late, which
+        // the runtime's filter absorbs).
+        static std::vector<XrView> prevViews;
+        static uint32_t prevActive = 0;
+        XrCursorDepthHintDXR cursorHint = {XR_TYPE_CURSOR_DEPTH_HINT_DXR};
+        XrCursorDepthPlacementDXR cursorPlacement = {XR_TYPE_CURSOR_DEPTH_PLACEMENT_DXR};
+        bool cursorInCanvas = false;
+        if (app.hasCursorDepthExt && g_window != nil && g_metalView != nil) {
+            NSPoint pw = [g_window mouseLocationOutsideOfEventStream];
+            NSPoint pv = [g_metalView convertPoint:pw fromView:nil];
+            NSRect b = [g_metalView bounds];
+            if (b.size.width > 0 && b.size.height > 0) {
+                float u = (float)(pv.x / b.size.width);
+                float v = [g_metalView isFlipped] ? (float)(pv.y / b.size.height)
+                                                        : (float)(1.0 - pv.y / b.size.height);
+                // Scripted cursor for headless verification: DISPLAYXR_CURSOR_DEPTH_UV=u,v
+                static float fixedU = -1.0f, fixedV = -1.0f;
+                static bool fixedParsed = false;
+                if (!fixedParsed) {
+                    fixedParsed = true;
+                    const char *fx = getenv("DISPLAYXR_CURSOR_DEPTH_UV");
+                    if (fx == nullptr || sscanf(fx, "%f,%f", &fixedU, &fixedV) != 2) fixedU = fixedV = -1.0f;
+                }
+                if (fixedU >= 0.0f) {
+                    u = fixedU;
+                    v = fixedV;
+                }
+                cursorInCanvas = u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f;
+                if (cursorInCanvas) {
+                    cursorHint.cursorUV = {u, v};
+                    cursorHint.cursorHeight = kCursorHeight;
+                    XrVector3f hit = {0.0f, 0.0f, 0.0f};
+                    cursorHint.hasContent =
+                        CursorFootprintHit(prevViews, prevActive, u, v, (float)(b.size.width / b.size.height),
+                                           renderer.cubeRotation, hit)
+                            ? XR_TRUE
+                            : XR_FALSE;
+                    cursorHint.nearestPoint = hit;
+                    cursorHint.next = locateInfo.next;
+                    locateInfo.next = &cursorHint;
+                }
+            }
+            cursorPlacement.next = viewState.next;
+            viewState.next = &cursorPlacement;
+        }
+
         uint32_t viewCount = 0;
         xrLocateViews(app.session, &locateInfo, &viewState, (uint32_t)views.size(), &viewCount, views.data());
+
+        if (app.hasCursorDepthExt) {
+            prevViews.assign(views.begin(), views.begin() + viewCount);
+            const bool d3 = (app.currentModeIndex < app.renderingModeCount)
+                ? app.renderingModeDisplay3D[app.currentModeIndex] : true;
+            const uint32_t mvc = (app.currentModeIndex < app.renderingModeCount)
+                ? app.renderingModeViewCounts[app.currentModeIndex] : 2;
+            prevActive = d3 ? (mvc < viewCount ? mvc : viewCount) : 1;
+
+            g_cursorDraw.active = cursorPlacement.isActive == XR_TRUE;
+            g_cursorDraw.pose = cursorPlacement.pose;
+            g_cursorDraw.height = cursorPlacement.height;
+            // The app owns its window's OS cursor: hidden exactly while the
+            // depth cursor replaces it.
+            static bool osCursorHidden = false;
+            if (g_cursorDraw.active != osCursorHidden) {
+                if (g_cursorDraw.active) [NSCursor hide]; else [NSCursor unhide];
+                osCursorHidden = g_cursorDraw.active;
+            }
+            static int cursorLogged = 0;
+            if (g_cursorDraw.active && cursorHint.hasContent && cursorLogged < 3) {
+                cursorLogged++;
+                LOG_INFO("cursor_depth: uv=(%.3f,%.3f) target=%.3f disparity=%.3f h=%.4f pos=(%.3f,%.3f,%.3f)",
+                         cursorHint.cursorUV.x, cursorHint.cursorUV.y, cursorPlacement.targetDisparity,
+                         cursorPlacement.disparity, cursorPlacement.height, cursorPlacement.pose.position.x,
+                         cursorPlacement.pose.position.y, cursorPlacement.pose.position.z);
+            }
+        }
 
         // Capture the runtime's resolved CANVAS size (the window client area in
         // meters) — the physical_height_m the Kooima/rig math runs on, which the
