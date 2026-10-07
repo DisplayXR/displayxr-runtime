@@ -40,7 +40,10 @@ half-open, so a window flush to a seam belongs to exactly one screen.
   views are M3.
 - Every **other screen** gets a segment DP from that screen's registry factory:
   `xrt_plugin_iface::create_dp_vk_for_screen` with an `xrt_screen_binding`
-  (monitor id, desktop rect, native px, mm, serial), else the plain `create_dp_vk`.
+  (monitor id, desktop rect, native px, mm, serial) — only that slot: a plug-in
+  without it gets a flat 2D view on its other screens, never a plain `create_dp_vk`
+  DP (which would describe the wrong panel and may clear the whole target). It is
+  created against the #868 runtime-owned queue, like the primary.
   It is windowless (NULL window): its phase is `set_present_origin`, fed per frame,
   ADR-033. A plug-in's DP made for a screen describes that screen
   (`get_display_dimensions` / `get_display_pixel_info`).

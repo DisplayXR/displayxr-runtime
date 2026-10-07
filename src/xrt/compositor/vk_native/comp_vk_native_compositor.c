@@ -5189,7 +5189,7 @@ vk_segments_frame_update(struct comp_vk_native_compositor *c,
 	}
 #endif
 	if (c->segments == NULL) {
-		c->segments = comp_vk_native_segments_create(&c->vk, c->cmd_pool);
+		c->segments = comp_vk_native_segments_create(&c->vk, c->cmd_pool, c->repaint_queue);
 		if (c->segments == NULL) {
 			return false;
 		}

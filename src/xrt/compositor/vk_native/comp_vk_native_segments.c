@@ -59,16 +59,18 @@ struct comp_vk_native_segments
 {
 	struct vk_bundle *vk;
 	VkCommandPool cmd_pool;
+	//! #868: the runtime-owned queue a DP must capture at creation (see
+	//! vk_make_dp_vk); VK_NULL_HANDLE = none, the DP sees the app's queue.
+	VkQueue dp_queue;
 
 	bool enabled;
 
 	uint32_t screen_count;
 	struct comp_segments_screen screens[COMP_SEGMENTS_MAX_SCREENS];
 	struct xrt_screen_binding bindings[COMP_SEGMENTS_MAX_SCREENS];
-	//! Owning plug-in iface / instance / plain factory per screen (registry).
+	//! Owning plug-in iface / instance per screen (registry).
 	const struct xrt_plugin_iface *iface[COMP_SEGMENTS_MAX_SCREENS];
 	struct xrt_plugin_instance *inst[COMP_SEGMENTS_MAX_SCREENS];
-	xrt_dp_factory_vk_fn_t factory[COMP_SEGMENTS_MAX_SCREENS];
 	struct seg_screen_state st[COMP_SEGMENTS_MAX_SCREENS];
 
 	struct comp_segments_lifecycle lc;
@@ -210,9 +212,16 @@ dp_release(struct comp_vk_native_segments *segs, uint32_t i)
 }
 
 /*!
- * Create screen @p i's segment DP: the plug-in's per-screen factory when it
- * has one, else its plain factory. Windowless (NULL window) on purpose: a
- * segment DP's phase comes from set_present_origin (ADR-033).
+ * Create screen @p i's segment DP through the plug-in's per-screen factory.
+ * Windowless (NULL window) on purpose: a segment DP's phase comes from
+ * set_present_origin (ADR-033).
+ *
+ * There is deliberately NO fallback to the plain `create_dp_vk`: that DP would
+ * describe the plug-in's process-wide panel instead of this screen, and
+ * nothing promises it honours a sub-rect canvas or leaves the rest of the
+ * target alone — it could clear the primary's segment after the primary wove.
+ * A plug-in without the slot gets flat 2D on its other screens
+ * (has_dp_factory is false, so this is never reached for it).
  */
 static bool
 dp_create(struct comp_vk_native_segments *segs, uint32_t i, int32_t target_format)
@@ -224,11 +233,19 @@ dp_create(struct comp_vk_native_segments *segs, uint32_t i, int32_t target_forma
 
 	if (xrt_plugin_iface_has_create_dp_vk_for_screen(iface)) {
 		how = "create_dp_vk_for_screen";
+		/*
+		 * #868: same queue swap as vk_make_dp_vk — a vendor DP captures
+		 * vk->main_queue once, at creation, for its internal submits, and the
+		 * weave also runs on the repaint thread; the runtime-owned queue keeps
+		 * those submits off the app's queue. Restored immediately.
+		 */
+		VkQueue saved = segs->vk->main_queue->queue;
+		if (segs->dp_queue != VK_NULL_HANDLE) {
+			segs->vk->main_queue->queue = segs->dp_queue;
+		}
 		xret = iface->create_dp_vk_for_screen(segs->inst[i], segs->vk, (void *)(uintptr_t)segs->cmd_pool, NULL,
 		                                      target_format, &segs->bindings[i], &st->dp);
-	} else if (segs->factory[i] != NULL) {
-		how = "create_dp_vk (no per-screen slot)";
-		xret = segs->factory[i](segs->vk, (void *)(uintptr_t)segs->cmd_pool, NULL, target_format, &st->dp);
+		segs->vk->main_queue->queue = saved;
 	}
 
 	if (xret != XRT_SUCCESS || st->dp == NULL || st->dp->process_atlas == NULL) {
@@ -333,7 +350,7 @@ image_barrier(struct vk_bundle *vk,
  */
 
 struct comp_vk_native_segments *
-comp_vk_native_segments_create(struct vk_bundle *vk, VkCommandPool cmd_pool)
+comp_vk_native_segments_create(struct vk_bundle *vk, VkCommandPool cmd_pool, VkQueue dp_queue)
 {
 	struct comp_vk_native_segments *segs = U_TYPED_CALLOC(struct comp_vk_native_segments);
 	if (segs == NULL) {
@@ -341,6 +358,7 @@ comp_vk_native_segments_create(struct vk_bundle *vk, VkCommandPool cmd_pool)
 	}
 	segs->vk = vk;
 	segs->cmd_pool = cmd_pool;
+	segs->dp_queue = dp_queue;
 	comp_segments_lifecycle_init(&segs->lc, 0, 0);
 	return segs;
 }
@@ -441,7 +459,6 @@ comp_vk_native_segments_set_screens(struct comp_vk_native_segments *segs,
 
 		segs->iface[n] = NULL;
 		segs->inst[n] = NULL;
-		segs->factory[n] = NULL;
 		if (e != NULL && !cs->is_primary) {
 			const bool same_vendor = strcmp(e->plugin_id, primary_entry->plugin_id) == 0;
 			if (!same_vendor) {
@@ -449,8 +466,10 @@ comp_vk_native_segments_set_screens(struct comp_vk_native_segments *segs,
 			} else {
 				segs->iface[n] = (const struct xrt_plugin_iface *)e->owning_iface;
 				segs->inst[n] = (struct xrt_plugin_instance *)e->owning_instance;
-				segs->factory[n] = (xrt_dp_factory_vk_fn_t)(uintptr_t)e->dp_factory_vk;
-				cs->has_dp_factory = segs->factory[n] != NULL ||
+				// The per-screen slot, and only it (see dp_create). The
+				// registry's VK factory being set is what says the claim
+				// covers Vulkan and the vk_bundle ABI matched (#1243).
+				cs->has_dp_factory = e->dp_factory_vk != NULL &&
 				                     xrt_plugin_iface_has_create_dp_vk_for_screen(segs->iface[n]);
 			}
 		}

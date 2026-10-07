@@ -334,7 +334,10 @@ other screen. Same contract as `create_dp_vk`, plus:
   holding other segments' pixels; leave it in `PRESENT_SRC_KHR` like any VK DP.
 - Several instances coexist in one process, one per screen.
 
-NULL (or an older `struct_size`) → the runtime falls back to `create_dp_vk` for that screen.
+NULL (or an older `struct_size`) → your screens other than the session's primary one get a
+flat 2D view. There is deliberately no fallback to `create_dp_vk`: that DP describes your one
+panel, not the screen, and nothing binds it to the canvas / not-first-writer contract above, so
+it could clear the segment the primary DP just wove.
 Appended after `get_display_info_for_monitor` per ADR-020 (`struct_size`-gated, no
 `XRT_PLUGIN_API_VERSION_CURRENT` bump; ABI stays 5); guard with
 `#ifdef XRT_PLUGIN_IFACE_HAS_CREATE_DP_FOR_SCREEN`. M2 only segments a window whose screens all
