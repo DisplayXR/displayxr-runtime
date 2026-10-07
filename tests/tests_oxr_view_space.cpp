@@ -94,6 +94,18 @@
 namespace {
 
 constexpr float kPosTolM = 0.001f;    // 1 mm
+
+/*!
+ * Multi-screen M3: PRIMARY_MULTIVIEW_DXR reports one view set per window
+ * segment — the device max x XRT_MAX_SEGMENTS (2), capped at XRT_MAX_VIEWS (8).
+ * A window on one display locates its active views first and aliases the rest.
+ */
+uint32_t
+multiview_count(uint32_t device_max)
+{
+	const uint32_t n = device_max * 2;
+	return n > 8 ? 8 : n;
+}
 constexpr float kAngTolDeg = 0.1f;    // 0.1 degree
 
 /*!
@@ -943,7 +955,7 @@ TEST_CASE("VIEW tracks the reported view array under MULTIVIEW (#1502)", "[oxr][
 	const uint32_t device_max = rt.device_max_view_count();
 	INFO("reported views = " << v.size() << ", device max = " << device_max);
 	if (device_max != 0) {
-		CHECK(v.size() == device_max);
+		CHECK(v.size() == multiview_count(device_max));
 	}
 
 	const XrPosef T_local_view = rt.locate(rt.view, rt.local, t);
@@ -992,7 +1004,7 @@ TEST_CASE("XR_DXR_display_info advertises PRIMARY_MULTIVIEW_DXR (#1486)", "[oxr]
 	{
 		// PRIMARY_STEREO means exactly 2, whatever the device can drive.
 		CHECK(rt.config_view_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) == 2);
-		CHECK(rt.config_view_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR) == device_max);
+		CHECK(rt.config_view_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR) == multiview_count(device_max));
 		// A valid core type the system does NOT advertise is still refused.
 		CHECK(rt.config_view_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MONO) == 0);
 	}
@@ -1003,7 +1015,7 @@ TEST_CASE("XR_DXR_display_info advertises PRIMARY_MULTIVIEW_DXR (#1486)", "[oxr]
 
 		uint32_t n = 0;
 		CHECK(rt.locate_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR, t, &n) == XR_SUCCESS);
-		CHECK(n == device_max);
+		CHECK(n == multiview_count(device_max));
 
 		// Same session, the OTHER advertised configuration: valid enum, wrong
 		// session - UNSUPPORTED, not VALIDATION_FAILURE.
@@ -1012,7 +1024,7 @@ TEST_CASE("XR_DXR_display_info advertises PRIMARY_MULTIVIEW_DXR (#1486)", "[oxr]
 
 		// And the full locate really writes that many views.
 		std::vector<XrView> v = rt.views(rt.local, t, nullptr, nullptr);
-		CHECK(v.size() == device_max);
+		CHECK(v.size() == multiview_count(device_max));
 	}
 
 	tear_down(rt);
