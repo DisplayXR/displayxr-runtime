@@ -416,6 +416,16 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   `dxr_view_config.h` (`displayxr::rules`) rather than pasting a copy.
   `activity.activeViewCount` is the runtime's own answer for how many views are
   live this frame — prefer it to deriving the number from the rendering mode.
+  Under `PRIMARY_MULTIVIEW_DXR` it can be LARGER than the mode's view count: a window
+  spanning two displays gets one view set per display (multi-screen M3, `XR_DXR_display_info`
+  v22), so `activeViewCount` is the sum and the reported count is the device max times
+  `XRT_MAX_SEGMENTS`. An app that renders `[0, activeViewCount)`, each view into its own
+  subImage, is correct without knowing why. To render each display's views at that
+  display's resolution, chain `XrViewDisplayBindingsDXR` beside `XrViewActivityStateDXR`:
+  each binding names a display, its `segmentRect` (window px) and its contiguous view
+  range; render local view `j` of a binding into tile `j` at the segment's position
+  (`cube_handle_vk_linux` does exactly this). INV-3.1 and INV-3.4 already lint the rest
+  (begin multiview, submit the located count, alias the tail), so there is no separate rule.
 
   **Every leg of a multi-platform app needs its own call.** `check_displayxr_app.py` checks
   INV-3.4 per top-level platform directory (`windows/`, `macos/`, `linux/`, `android/`, …):

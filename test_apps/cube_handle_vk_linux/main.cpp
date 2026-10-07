@@ -1963,6 +1963,9 @@ struct AppXrSession {
 
     XrViewConfigurationType viewConfigType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
     std::vector<XrViewConfigurationView> configViews;
+    // PRIMARY_MULTIVIEW_DXR begun: render every ACTIVE view (activeViewCount),
+    // one view set per display when the window spans displays (multi-screen M3).
+    bool isMultiview = false;
 
     XrSessionState sessionState = XR_SESSION_STATE_UNKNOWN;
     bool sessionRunning = false;
@@ -2223,6 +2226,20 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
                 }
             }
         }
+    }
+
+    // Multi-screen M3: begin PRIMARY_MULTIVIEW_DXR when the runtime offers it,
+    // so a window spanning two displays gets each display's own views
+    // (XrViewDisplayBindingsDXR). DXR_STEREO_FIXED_APP=1 keeps the legacy
+    // 2-view PRIMARY_STEREO session (the runtime then frames those two views
+    // from the display holding most of the window).
+    {
+        const char* fixedStereo = getenv("DXR_STEREO_FIXED_APP");
+        if (fixedStereo == nullptr || fixedStereo[0] != '1') {
+            xr.viewConfigType = DxrSelectViewConfigType(xr.instance, xr.systemId);
+        }
+        xr.isMultiview = xr.viewConfigType == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR;
+        LOG_INFO("View configuration: %s", DxrViewConfigTypeName(xr.viewConfigType));
     }
 
     uint32_t viewCount = 0;
@@ -3177,6 +3194,16 @@ int main(int argc, char** argv) {
                     locateInfo.space = xr.localSpace;
 
                     XrViewState viewState = {XR_TYPE_VIEW_STATE};
+                    // ADR-041 + multi-screen M3: how many located views are
+                    // live (the sum over displays when the window spans
+                    // displays), and which of them belong to which display.
+                    XrViewActivityStateDXR activity = {XR_TYPE_VIEW_ACTIVITY_STATE_DXR};
+                    XrViewDisplayBindingDXR bindingStorage[4] = {};
+                    XrViewDisplayBindingsDXR bindings = {XR_TYPE_VIEW_DISPLAY_BINDINGS_DXR};
+                    bindings.bindingCapacityInput = 4;
+                    bindings.bindings = bindingStorage;
+                    activity.next = &bindings;
+                    viewState.next = &activity;
                     // Query view count
                     xrLocateViews(xr.session, &locateInfo, &viewState, 0, &viewCount, nullptr);
                     if (viewCount == 0) viewCount = 2; // fallback
@@ -3239,23 +3266,28 @@ int main(int argc, char** argv) {
                             const XrDisplayRenderingModeInfoDXR* mode = ActiveRenderingMode(xr);
                             float scaleX = xr.viewScaleX, scaleY = xr.viewScaleY;
                             uint32_t tileCols = 2, tileRows = 1;
-                            uint32_t eyeCount = 2;
+                            // Views per view SET (one set per display the
+                            // window covers). A stereo session caps at 2 and
+                            // the tail aliases (ADR-041); a multiview session
+                            // renders every view of the active mode.
+                            uint32_t perSet = 2;
                             if (mode != nullptr) {
                                 if (mode->viewScaleX > 0.0f) scaleX = mode->viewScaleX;
                                 if (mode->viewScaleY > 0.0f) scaleY = mode->viewScaleY;
                                 tileCols = mode->tileColumns > 0 ? mode->tileColumns : 1;
                                 tileRows = mode->tileRows > 0 ? mode->tileRows : 1;
-                                // DXR_STEREO_FIXED_APP: hard cap at 2 — the
-                                // session stays PRIMARY_STEREO and always
-                                // submits the 2 located views (ADR-041 alias).
-                                eyeCount = (mode->hardwareDisplay3D && mode->viewCount > 1) ? 2 : 1;
-                                if (eyeCount == 1) {
+                                if (!(mode->hardwareDisplay3D && mode->viewCount > 1)) {
+                                    perSet = 1;
+                                } else {
+                                    perSet = xr.isMultiview ? mode->viewCount : 2;
+                                }
+                                if (perSet == 1) {
                                     tileCols = 1;
                                     tileRows = 1;
                                 }
                             }
-                            if (eyeCount > locatedCount)
-                              eyeCount = locatedCount;
+                            if (perSet > tileCols * tileRows) perSet = tileCols * tileRows;
+
                             uint32_t winW = 0, winH = 0;
                             if (!g_window.current_size(&winW, &winH)) {
                                 winW = 0;
@@ -3275,45 +3307,123 @@ int main(int argc, char** argv) {
                             if (eyeW > xr.swapchain.width / tileCols) eyeW = xr.swapchain.width / tileCols;
                             if (eyeH > xr.swapchain.height / tileRows) eyeH = xr.swapchain.height / tileRows;
 
-                            EyeRenderParams eyeParams[2];
-                            projectionViews.resize(locatedCount, {});
-                            for (uint32_t i = 0; i < eyeCount; i++) {
-                                const uint32_t tileX = i % tileCols;
-                                const uint32_t tileY = i / tileCols;
-                                eyeParams[i].viewportX = tileX * eyeW;
-                                eyeParams[i].viewportY = tileY * eyeH;
-                                eyeParams[i].width = eyeW;
-                                eyeParams[i].height = eyeH;
-                                mat4_view_from_xr_pose(eyeParams[i].viewMat, views[i].pose);
-                                // Clip policy stays app-side (fov is clip-independent).
-                                // Display rig: ZDP-anchored near/far so depth precision
-                                // brackets the convergence plane — near = ez - vH,
-                                // far = ez + 1000·vH, ez = rig-local eye Z (= pose Z at
-                                // identity rig). Matches cube_handle_vk_win.
-                                float nearZ = 0.01f, farZ = 100.0f;
-                                if (useDisplayRig) {
-                                    float ez = views[i].pose.position.z;
-                                    nearZ = (ez - kVirtualDisplayHeight > 0.001f)
-                                                ? (ez - kVirtualDisplayHeight) : 0.001f;
-                                    farZ = ez + 1000.0f * kVirtualDisplayHeight;
+                            /*
+                             * View sets. Without display bindings: one set,
+                             * the whole window, views [0, active). With them
+                             * (multi-screen M3, a window spanning displays):
+                             * one set per display, each rendered into ITS
+                             * segment's part of every tile — the same mosaic
+                             * the runtime composes, so each tile still holds
+                             * the whole window at view resolution.
+                             */
+                            struct ViewSet {
+                                uint32_t first, count;
+                                int32_t x, y;
+                                uint32_t w, h; // window px
+                            };
+                            ViewSet sets[4];
+                            uint32_t setCount = 0;
+                            const uint32_t nb = bindings.bindingCountOutput;
+                            if (xr.isMultiview && nb > 0 && nb <= 4 && winW > 0 && winH > 0) {
+                                for (uint32_t b = 0; b < nb; b++) {
+                                    const XrViewDisplayBindingDXR& vb = bindingStorage[b];
+                                    sets[setCount++] = {vb.firstView, vb.viewCount, vb.segmentRect.offset.x,
+                                                        vb.segmentRect.offset.y,
+                                                        (uint32_t)vb.segmentRect.extent.width,
+                                                        (uint32_t)vb.segmentRect.extent.height};
                                 }
-                                mat4_from_xr_fov(eyeParams[i].projMat, views[i].fov, nearZ, farZ);
-                                // mat4_from_xr_fov emits GL [-1,1] clip-depth; Vulkan
-                                // clips [0,1], so remap or the cube is near-clipped
-                                // whenever the ZDP near sits close to the content
-                                // (invisible windowed). displayxr-common shared fn,
-                                // exactly like cube_handle_vk_win.
-                                convert_projection_gl_to_zero_to_one(eyeParams[i].projMat);
-
-                                projectionViews[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
-                                projectionViews[i].subImage.swapchain = xr.swapchain.swapchain;
-                                projectionViews[i].subImage.imageRect.offset = {
-                                    (int32_t)eyeParams[i].viewportX, (int32_t)eyeParams[i].viewportY};
-                                projectionViews[i].subImage.imageRect.extent = {(int32_t)eyeW, (int32_t)eyeH};
-                                projectionViews[i].subImage.imageArrayIndex = 0;
-                                projectionViews[i].pose = views[i].pose;
-                                projectionViews[i].fov = views[i].fov;
+                            } else {
+                                uint32_t active = perSet;
+                                // A multiview session takes the runtime's
+                                // count; a stereo-capped one keeps its cap.
+                                if (xr.isMultiview && activity.activeViewCount > 0 &&
+                                    activity.activeViewCount < active) {
+                                    active = activity.activeViewCount;
+                                }
+                                sets[setCount++] = {0, active, 0, 0, winW, winH};
                             }
+
+                            // Log the bindings when they change (one line, never per frame).
+                            {
+                                static std::string lastBindings;
+                                std::string now = "activeViewCount=" + std::to_string(activity.activeViewCount);
+                                for (uint32_t b = 0; b < nb && b < 4; b++) {
+                                    char line[192];
+                                    snprintf(line, sizeof(line),
+                                             "; display 0x%016llx views %u..%u segment %d,%d %dx%d",
+                                             (unsigned long long)bindingStorage[b].displayId,
+                                             bindingStorage[b].firstView,
+                                             bindingStorage[b].firstView + bindingStorage[b].viewCount - 1,
+                                             bindingStorage[b].segmentRect.offset.x,
+                                             bindingStorage[b].segmentRect.offset.y,
+                                             bindingStorage[b].segmentRect.extent.width,
+                                             bindingStorage[b].segmentRect.extent.height);
+                                    now += line;
+                                }
+                                if (nb == 0) now += "; no display bindings (one view set)";
+                                if (now != lastBindings) {
+                                    lastBindings = now;
+                                    LOG_INFO("Views: %s", now.c_str());
+                                }
+                            }
+
+                            const float fx = winW > 0 ? (float)eyeW / (float)winW : 1.0f;
+                            const float fy = winH > 0 ? (float)eyeH / (float)winH : 1.0f;
+                            EyeRenderParams eyeParams[8];
+                            uint32_t eyeCount = 0; // views rendered = [0, eyeCount)
+                            projectionViews.resize(locatedCount, {});
+                            for (uint32_t si = 0; si < setCount; si++) {
+                                const ViewSet& vs = sets[si];
+                                // Edges rounded independently: two segments
+                                // that share a seam share the tile column.
+                                const int32_t x0 = (int32_t)std::lround(vs.x * fx);
+                                const int32_t y0 = (int32_t)std::lround(vs.y * fy);
+                                const int32_t x1 = (int32_t)std::lround((vs.x + (int32_t)vs.w) * fx);
+                                const int32_t y1 = (int32_t)std::lround((vs.y + (int32_t)vs.h) * fy);
+                                const uint32_t sw = x1 > x0 ? (uint32_t)(x1 - x0) : 1;
+                                const uint32_t sh = y1 > y0 ? (uint32_t)(y1 - y0) : 1;
+                                for (uint32_t j = 0; j < vs.count && j < tileCols * tileRows; j++) {
+                                    const uint32_t i = vs.first + j;
+                                    if (i >= locatedCount || i >= 8) break;
+                                    const uint32_t tileX = j % tileCols;
+                                    const uint32_t tileY = j / tileCols;
+                                    eyeParams[i].viewportX = tileX * eyeW + (uint32_t)x0;
+                                    eyeParams[i].viewportY = tileY * eyeH + (uint32_t)y0;
+                                    eyeParams[i].width = sw;
+                                    eyeParams[i].height = sh;
+                                    mat4_view_from_xr_pose(eyeParams[i].viewMat, views[i].pose);
+                                    // Clip policy stays app-side (fov is clip-independent).
+                                    // Display rig: ZDP-anchored near/far so depth precision
+                                    // brackets the convergence plane — near = ez - vH,
+                                    // far = ez + 1000·vH, ez = rig-local eye Z (= pose Z at
+                                    // identity rig). Matches cube_handle_vk_win.
+                                    float nearZ = 0.01f, farZ = 100.0f;
+                                    if (useDisplayRig) {
+                                        float ez = views[i].pose.position.z;
+                                        nearZ = (ez - kVirtualDisplayHeight > 0.001f)
+                                                    ? (ez - kVirtualDisplayHeight) : 0.001f;
+                                        farZ = ez + 1000.0f * kVirtualDisplayHeight;
+                                    }
+                                    mat4_from_xr_fov(eyeParams[i].projMat, views[i].fov, nearZ, farZ);
+                                    // mat4_from_xr_fov emits GL [-1,1] clip-depth; Vulkan
+                                    // clips [0,1], so remap or the cube is near-clipped
+                                    // whenever the ZDP near sits close to the content
+                                    // (invisible windowed). displayxr-common shared fn,
+                                    // exactly like cube_handle_vk_win.
+                                    convert_projection_gl_to_zero_to_one(eyeParams[i].projMat);
+
+                                    projectionViews[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
+                                    projectionViews[i].subImage.swapchain = xr.swapchain.swapchain;
+                                    projectionViews[i].subImage.imageRect.offset = {
+                                        (int32_t)eyeParams[i].viewportX, (int32_t)eyeParams[i].viewportY};
+                                    projectionViews[i].subImage.imageRect.extent = {(int32_t)sw, (int32_t)sh};
+                                    projectionViews[i].subImage.imageArrayIndex = 0;
+                                    projectionViews[i].pose = views[i].pose;
+                                    projectionViews[i].fov = views[i].fov;
+                                    if (i + 1 > eyeCount) eyeCount = i + 1;
+                                }
+                            }
+                            if (eyeCount == 0) eyeCount = 1; // never leave view 0 unwritten
 
                             // ADR-041: fill the inactive tail — own located
                             // pose/fov, view 0's subimage.
