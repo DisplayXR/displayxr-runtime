@@ -17,6 +17,7 @@
 #include "os_display_connector_linux.h"
 
 #include <dirent.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -123,6 +124,13 @@ read_first_line(const char *path, char *buf, size_t size)
 	return ok;
 }
 
+static int
+compare_connector_name(const void *a, const void *b)
+{
+	return strcmp(((const struct os_display_drm_connector *)a)->name,
+	              ((const struct os_display_drm_connector *)b)->name);
+}
+
 uint32_t
 os_display_drm_read_connectors(const char *root, struct os_display_drm_connector *out, uint32_t max)
 {
@@ -155,7 +163,8 @@ os_display_drm_read_connectors(const char *root, struct os_display_drm_connector
 
 		struct os_display_drm_connector *c = &out[count];
 		memset(c, 0, sizeof(*c));
-		(void)snprintf(c->name, sizeof(c->name), "%s", dash + 1);
+		// Keep the card prefix: two GPUs can each have an HDMI-A-1.
+		(void)snprintf(c->name, sizeof(c->name), "%.31s", e->d_name);
 
 		// Absent on old kernels: treat as enabled, the status said connected.
 		(void)snprintf(path, sizeof(path), "%s/%s/enabled", root, e->d_name);
@@ -187,6 +196,10 @@ os_display_drm_read_connectors(const char *root, struct os_display_drm_connector
 		count++;
 	}
 	closedir(dir);
+
+	// readdir order is filesystem order; DRM-only records and the
+	// first-candidate tie-breaks must not depend on it.
+	qsort(out, count, sizeof(out[0]), compare_connector_name);
 	return count;
 }
 
@@ -232,21 +245,68 @@ drm_has_mode(const struct os_display_drm_connector *c, uint32_t w, uint32_t h)
 	return false;
 }
 
+//! The connector name the way RandR spells it: no card prefix, no subtype
+//! letter ("card1-HDMI-A-1" -> "HDMI-1").
+static void
+drm_name_for_randr(const struct os_display_drm_connector *c, char *out, size_t size)
+{
+	const char *n = c->name;
+	if (strncmp(n, "card", 4) == 0) {
+		const char *dash = strchr(n, '-');
+		if (dash != NULL) {
+			n = dash + 1;
+		}
+	}
+	os_display_connector_normalise(n, out, size);
+}
+
+/*!
+ * The monitor's device mode, from a source that is independent of the DRM
+ * name match: the compositor's current mode, else the RandR rect. The
+ * DRM-derived native mode is NOT used — it was itself found by connector
+ * name, so checking a name match against it would be circular.
+ */
+static void
+randr_device_mode(const struct os_display_desktop_info *r, uint32_t *w, uint32_t *h)
+{
+	if (r->native_source == OS_DISPLAY_NATIVE_SOURCE_COMPOSITOR && r->native_width > 0 && r->native_height > 0) {
+		*w = r->native_width;
+		*h = r->native_height;
+	} else {
+		*w = r->width;
+		*h = r->height;
+	}
+}
+
+static bool
+edid_same_identity(const struct os_display_edid_parsed *a, const struct os_display_edid_parsed *b)
+{
+	return a->manufacturer_id == b->manufacturer_id && a->product_id == b->product_id &&
+	       a->serial_number == b->serial_number;
+}
+
+//! Copy an EDID's identity (ids, serial, mm) onto a record.
+static void
+apply_edid(struct os_display_edid_monitor *m, const struct os_display_edid_parsed *e)
+{
+	m->manufacturer_id = e->manufacturer_id;
+	m->product_id = e->product_id;
+	m->serial_number = e->serial_number;
+	uint32_t w_mm = 0, h_mm = 0;
+	os_display_edid_parsed_mm(e, &w_mm, &h_mm);
+	if (w_mm > 0 && h_mm > 0) {
+		m->physical_width_mm = w_mm;
+		m->physical_height_mm = h_mm;
+	}
+}
+
 //! Copy a connector's identity (EDID, mm, connector name) onto a record.
 static void
 apply_drm(struct os_display_edid_monitor *m, const struct os_display_drm_connector *c)
 {
 	(void)snprintf(m->connector, sizeof(m->connector), "%s", c->name);
 	if (c->has_edid) {
-		m->manufacturer_id = c->edid.manufacturer_id;
-		m->product_id = c->edid.product_id;
-		m->serial_number = c->edid.serial_number;
-		uint32_t w_mm = 0, h_mm = 0;
-		os_display_edid_parsed_mm(&c->edid, &w_mm, &h_mm);
-		if (w_mm > 0 && h_mm > 0) {
-			m->physical_width_mm = w_mm;
-			m->physical_height_mm = h_mm;
-		}
+		apply_edid(m, &c->edid);
 	}
 	if (m->native_width == 0 && c->mode_count > 0) {
 		// The kernel lists the preferred mode first; the RandR rect when it
@@ -268,6 +328,7 @@ apply_drm(struct os_display_edid_monitor *m, const struct os_display_drm_connect
 
 uint32_t
 os_display_edid_linux_join(const struct os_display_desktop_info *randr,
+                           const struct os_display_randr_identity *randr_id,
                            uint32_t randr_count,
                            const struct os_display_drm_connector *drm,
                            uint32_t drm_count,
@@ -307,29 +368,69 @@ os_display_edid_linux_join(const struct os_display_desktop_info *randr,
 		return n;
 	}
 
-	const uint32_t n = randr_count < max ? randr_count : max;
+	uint32_t rn = randr_count < max ? randr_count : max;
+	if (rn > OS_DISPLAY_DESKTOP_MAX_MONITORS) {
+		rn = OS_DISPLAY_DESKTOP_MAX_MONITORS;
+	}
 	bool used[OS_DISPLAY_DRM_MAX_CONNECTORS] = {0};
-	int32_t pick[OS_DISPLAY_EDID_MAX_MONITORS > OS_DISPLAY_DESKTOP_MAX_MONITORS ? OS_DISPLAY_EDID_MAX_MONITORS
-	                                                                            : OS_DISPLAY_DESKTOP_MAX_MONITORS];
-	enum os_display_edid_join how[sizeof(pick) / sizeof(pick[0])];
-	const uint32_t cap = (uint32_t)(sizeof(pick) / sizeof(pick[0]));
-	const uint32_t rn = n < cap ? n : cap;
+	int32_t pick[OS_DISPLAY_DESKTOP_MAX_MONITORS];
+	enum os_display_edid_join how[OS_DISPLAY_DESKTOP_MAX_MONITORS];
 	for (uint32_t i = 0; i < rn; i++) {
 		pick[i] = -1;
 		how[i] = OS_EDID_JOIN_NONE;
 	}
 
-	// Pass 1: names.
+	char rname[OS_DISPLAY_DESKTOP_MAX_MONITORS][64];
 	for (uint32_t i = 0; i < rn; i++) {
-		char rname[64];
-		os_display_connector_normalise(randr[i].device_name, rname, sizeof(rname));
-		if (rname[0] == '\0') {
+		os_display_connector_normalise(randr[i].device_name, rname[i], sizeof(rname[i]));
+	}
+
+	// Pass 0: the X server's own EDID. The identity is settled; find the
+	// connector carrying the same EDID, by name among several identical ones.
+	for (uint32_t i = 0; i < rn; i++) {
+		if (randr_id == NULL || !randr_id[i].valid) {
 			continue;
 		}
+		how[i] = OS_EDID_JOIN_RANDR_EDID;
+		int32_t found = -1;
+		uint32_t hits = 0;
+		int32_t by_name = -1;
+		for (uint32_t j = 0; j < drm_count; j++) {
+			if (used[j] || !drm[j].enabled || !drm[j].has_edid ||
+			    !edid_same_identity(&drm[j].edid, &randr_id[i].edid)) {
+				continue;
+			}
+			found = (int32_t)j;
+			hits++;
+			char dname[64];
+			drm_name_for_randr(&drm[j], dname, sizeof(dname));
+			if (rname[i][0] != '\0' && strcmp(rname[i], dname) == 0) {
+				by_name = (int32_t)j;
+			}
+		}
+		const int32_t take = hits == 1 ? found : by_name;
+		if (take >= 0) {
+			pick[i] = take;
+			used[take] = true;
+		}
+	}
+
+	// Pass 1: names, confirmed by the device mode or the physical size.
+	for (uint32_t i = 0; i < rn; i++) {
+		if (how[i] != OS_EDID_JOIN_NONE || rname[i][0] == '\0') {
+			continue;
+		}
+		uint32_t w = 0, h = 0;
+		randr_device_mode(&randr[i], &w, &h);
 		for (uint32_t j = 0; j < drm_count; j++) {
 			char dname[64];
-			os_display_connector_normalise(drm[j].name, dname, sizeof(dname));
-			if (!used[j] && strcmp(rname, dname) == 0) {
+			drm_name_for_randr(&drm[j], dname, sizeof(dname));
+			if (used[j] || strcmp(rname[i], dname) != 0) {
+				continue;
+			}
+			if (drm_has_mode(&drm[j], w, h) ||
+			    drm_matches_mm(&drm[j], randr[i].physical_width_mm, randr[i].physical_height_mm)) {
+				// Same name on two cards: the one that agrees physically.
 				pick[i] = (int32_t)j;
 				how[i] = OS_EDID_JOIN_NAME;
 				used[j] = true;
@@ -338,15 +439,16 @@ os_display_edid_linux_join(const struct os_display_desktop_info *randr,
 		}
 	}
 
-	// Pass 2: physical size, only when exactly one unused connector fits.
+	// Pass 2: physical size, only when exactly one unused enabled connector fits.
 	for (uint32_t i = 0; i < rn; i++) {
-		if (pick[i] >= 0 || randr[i].physical_width_mm == 0 || randr[i].physical_height_mm == 0) {
+		if (how[i] != OS_EDID_JOIN_NONE || randr[i].physical_width_mm == 0 ||
+		    randr[i].physical_height_mm == 0) {
 			continue;
 		}
 		int32_t found = -1;
 		uint32_t hits = 0;
 		for (uint32_t j = 0; j < drm_count; j++) {
-			if (!used[j] &&
+			if (!used[j] && drm[j].enabled &&
 			    drm_matches_mm(&drm[j], randr[i].physical_width_mm, randr[i].physical_height_mm)) {
 				found = (int32_t)j;
 				hits++;
@@ -359,17 +461,17 @@ os_display_edid_linux_join(const struct os_display_desktop_info *randr,
 		}
 	}
 
-	// Pass 3: pixel mode (device mode when known, else the RandR rect).
+	// Pass 3: device mode, only when exactly one unused enabled connector has it.
 	for (uint32_t i = 0; i < rn; i++) {
-		if (pick[i] >= 0) {
+		if (how[i] != OS_EDID_JOIN_NONE) {
 			continue;
 		}
-		const uint32_t w = randr[i].native_width > 0 ? randr[i].native_width : randr[i].width;
-		const uint32_t h = randr[i].native_height > 0 ? randr[i].native_height : randr[i].height;
+		uint32_t w = 0, h = 0;
+		randr_device_mode(&randr[i], &w, &h);
 		int32_t found = -1;
 		uint32_t hits = 0;
 		for (uint32_t j = 0; j < drm_count; j++) {
-			if (!used[j] && drm_has_mode(&drm[j], w, h)) {
+			if (!used[j] && drm[j].enabled && drm_has_mode(&drm[j], w, h)) {
 				found = (int32_t)j;
 				hits++;
 			}
@@ -399,6 +501,11 @@ os_display_edid_linux_join(const struct os_display_desktop_info *randr,
 		if (pick[i] >= 0) {
 			apply_drm(m, &drm[pick[i]]);
 		}
+		// The X server's EDID wins over the connector's: it is this
+		// output's by construction, the connector's only by the join.
+		if (randr_id != NULL && randr_id[i].valid) {
+			apply_edid(m, &randr_id[i].edid);
+		}
 	}
 	return rn;
 }
@@ -421,6 +528,25 @@ os_display_edid_enumerate(struct os_display_edid_list *out_list)
 	struct os_display_desktop_info randr[OS_DISPLAY_DESKTOP_MAX_MONITORS];
 	const uint32_t rn = os_display_desktop_enumerate(randr, OS_DISPLAY_DESKTOP_MAX_MONITORS);
 
+	// The X server's own EDID per monitor, when it publishes one (native X).
+	struct os_display_randr_identity randr_id[OS_DISPLAY_DESKTOP_MAX_MONITORS];
+	memset(randr_id, 0, sizeof(randr_id));
+	bool have_randr_id = false;
+	if (rn > 0) {
+		struct os_display_randr_edid blobs[OS_DISPLAY_DESKTOP_MAX_MONITORS];
+		const uint32_t bn = os_display_x11_read_monitor_edids(blobs, OS_DISPLAY_DESKTOP_MAX_MONITORS);
+		for (uint32_t i = 0; i < rn; i++) {
+			for (uint32_t k = 0; k < bn; k++) {
+				if (blobs[k].len > 0 && strcmp(blobs[k].name, randr[i].device_name) == 0) {
+					randr_id[i].valid =
+					    os_display_edid_parse(blobs[k].edid, blobs[k].len, &randr_id[i].edid);
+					have_randr_id = have_randr_id || randr_id[i].valid;
+					break;
+				}
+			}
+		}
+	}
+
 	struct os_display_drm_connector drm[OS_DISPLAY_DRM_MAX_CONNECTORS];
 	const uint32_t dn = os_display_drm_read_connectors(DRM_SYSFS_ROOT, drm, OS_DISPLAY_DRM_MAX_CONNECTORS);
 
@@ -430,14 +556,14 @@ os_display_edid_enumerate(struct os_display_edid_list *out_list)
 		}
 	}
 
-	out_list->count = os_display_edid_linux_join(rn > 0 ? randr : NULL, rn, drm, dn, out_list->monitors,
-	                                             OS_DISPLAY_EDID_MAX_MONITORS);
+	out_list->count = os_display_edid_linux_join(rn > 0 ? randr : NULL, have_randr_id ? randr_id : NULL, rn, drm,
+	                                             dn, out_list->monitors, OS_DISPLAY_EDID_MAX_MONITORS);
 
 	// diag_gdi_count is "monitors the placement source saw" — RandR here.
 	out_list->diag_gdi_count = rn;
 	if (out_list->count == 0) {
 		out_list->diag_error = OS_EDID_DIAG_NO_GDI_MONITORS;
-	} else if (out_list->diag_edid_read_count == 0) {
+	} else if (out_list->diag_edid_read_count == 0 && !have_randr_id) {
 		out_list->diag_error = OS_EDID_DIAG_NO_EDID_DATA;
 	}
 

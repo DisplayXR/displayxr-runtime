@@ -434,30 +434,46 @@ connector name but no desktop position. The enumerator takes the RandR
 monitors from `os_display_desktop_enumerate` and ties each one to a connected
 DRM connector, first rule that fires:
 
-1. **name** — RandR output name equals the connector name with the kernel's
-   subtype letter dropped (`HDMI-A-1` → `HDMI-1`). The normal case on X11 and
-   on Mutter's XWayland.
-2. **mm** — exactly one unused connector whose EDID physical size is within
-   10 mm of RandR's (EDID stores cm in the base block and mm in the detailed
-   timing; 340 vs 344 mm is the same panel).
-3. **mode** — exactly one unused connector with the monitor's pixel size
-   (device mode when known, else the RandR rect) among its modes.
+0. **randr-edid** — the X server publishes the output's own `EDID` property
+   (native X does; XWayland does not). That is the monitor's identity. The
+   connector is the one enabled connector carrying the same EDID (vendor,
+   product, serial), or, among several identical ones, the one whose name
+   agrees.
+1. **name** — RandR output name equals the connector name with the card prefix
+   and the kernel's subtype letter dropped (`card1-HDMI-A-1` → `HDMI-1`), and
+   the connector agrees physically: its modes hold the monitor's device mode,
+   or its EDID size is within 10 mm of RandR's. A bare name is not enough: the
+   NVIDIA X driver numbers outputs from 0 (`DP-0`) while nvidia-drm numbers
+   connectors from 1, and two GPUs can each have an `HDMI-A-1`. This is the
+   normal case on Mutter's XWayland.
+2. **mm** — exactly one unused, enabled connector whose EDID physical size is
+   within 10 mm of RandR's (EDID stores cm in the base block and mm in the
+   detailed timing; 340 vs 344 mm is the same panel).
+3. **mode** — exactly one unused, enabled connector with the monitor's device
+   mode among its modes.
+
+"Device mode" is the compositor's current mode when Mutter reports it, else
+the RandR rect. It is never the DRM-derived mode, which was itself found by
+connector name.
 
 Ambiguity is never guessed: a monitor no rule ties uniquely is listed with
-its placement and no EDID identity. A connector is used at most once. From
+its placement and no EDID identity. A connector is used at most once, and a
+connected-but-disabled connector never joins by mm or mode. The record keeps
+the card prefix (`card1-HDMI-A-1`). Connectors are read in name order, so
+DRM-only records come out in the same order on every boot. From
 the EDID the enumerator reads the manufacturer and product id (bytes 8–11),
 the serial (12–15), the size in cm (21/22) and the first detailed timing's
 pixels, mm and refresh. With **no reachable X server** (pure Wayland,
 headless) every connected, enabled connector becomes a DRM-only record flagged
 `origin_unknown` at (0, 0). The join method per monitor is logged once at INFO
-(`plugin loader: monitor N … join=name|mm|mode|drm-only|none`), and
+(`plugin loader: monitor N … join=randr-edid|name|mm|mode|drm-only|none`), and
 `displayxr-cli displays` prints it.
 
 The plug-in-facing `xrt_display_descriptor` is unchanged (no ABI change). The
 connector name, mm and device mode stay runtime-side (`os_display_edid_monitor`
 plus a loader side table keyed by `monitor_id`). The `monitor_id` hash adds the
-connector name where the platform has one, so DRM-only records at (0, 0) stay
-distinct. Windows ids are unchanged.
+connector name (with its card prefix) where the platform has one, so DRM-only
+records at (0, 0) stay distinct. Windows ids are unchanged.
 
 **Claims from every plug-in.** `target_plugin_resolve_displays` now loads every
 manifest plug-in on POSIX as a claim source (`collect_display_sources_platform`,

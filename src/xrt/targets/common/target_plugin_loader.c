@@ -3173,7 +3173,7 @@ monitor_id_from_edid(uint16_t mfr, uint16_t product, int32_t left, int32_t top, 
 		h ^= (uint64_t)bytes[i];
 		h *= prime;
 	}
-	// The platform's connector key (desktop Linux: "HDMI-A-1"), when there is
+	// The platform's connector key (desktop Linux: "card1-HDMI-A-1"), when there is
 	// one. Empty on Windows, so ids there are unchanged. It separates two
 	// identical panels that share a position — every DRM-only record (no X
 	// server) sits at (0, 0).

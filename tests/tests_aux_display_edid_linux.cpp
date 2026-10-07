@@ -104,17 +104,19 @@ box_randr(os_display_desktop_info out[2], const char *n0 = "eDP-1", const char *
 	out[0] = randr_mon(n0, 0, 3456, 2160, 300, 190, true);
 	out[0].native_width = 2880;
 	out[0].native_height = 1800;
+	out[0].native_source = OS_DISPLAY_NATIVE_SOURCE_COMPOSITOR;
 	out[1] = randr_mon(n1, 3456, 3840, 2160, 340, 190, false);
 	out[1].native_width = 3840;
 	out[1].native_height = 2160;
+	out[1].native_source = OS_DISPLAY_NATIVE_SOURCE_COMPOSITOR;
 }
 
 void
 box_drm(os_display_drm_connector out[2])
 {
 	const std::vector<uint8_t> edp = edp_no_serial_edid();
-	out[0] = drm_conn("eDP-1", edp.data(), edp.size(), 2880, 1800);
-	out[1] = drm_conn("HDMI-A-1", DS1_EDID, sizeof(DS1_EDID), 3840, 2160);
+	out[0] = drm_conn("card1-eDP-1", edp.data(), edp.size(), 2880, 1800);
+	out[1] = drm_conn("card1-HDMI-A-1", DS1_EDID, sizeof(DS1_EDID), 3840, 2160);
 }
 
 } // namespace
@@ -192,13 +194,13 @@ TEST_CASE("join: RandR output names tie to DRM connectors by name")
 	box_drm(drm);
 
 	os_display_edid_monitor out[4] = {};
-	REQUIRE(os_display_edid_linux_join(randr, 2, drm, 2, out, 4) == 2);
+	REQUIRE(os_display_edid_linux_join(randr, nullptr, 2, drm, 2, out, 4) == 2);
 
 	CHECK(out[0].join == OS_EDID_JOIN_NAME);
 	CHECK(out[0].manufacturer_id == SDC_RAW);
 	CHECK(out[0].serial_number == 0);
 	CHECK(out[0].is_primary);
-	CHECK(std::string(out[0].connector) == "eDP-1");
+	CHECK(std::string(out[0].connector) == "card1-eDP-1");
 	CHECK(out[0].physical_width_mm == 300);
 	CHECK(out[0].native_width == 2880);
 	CHECK(out[0].refresh_hz == 0); // no detailed timing to read it from
@@ -207,7 +209,7 @@ TEST_CASE("join: RandR output names tie to DRM connectors by name")
 	CHECK(out[1].manufacturer_id == ACR_RAW);
 	CHECK(out[1].product_id == 0x0001);
 	CHECK(out[1].serial_number == 0x322EF05Eu);
-	CHECK(std::string(out[1].connector) == "HDMI-A-1");
+	CHECK(std::string(out[1].connector) == "card1-HDMI-A-1");
 	CHECK(std::string(out[1].output_name) == "HDMI-1");
 	CHECK(out[1].screen_left == 3456);
 	CHECK(out[1].pixel_width == 3840);
@@ -226,7 +228,7 @@ TEST_CASE("join: unrelated output names fall back to physical size")
 	box_drm(drm);
 
 	os_display_edid_monitor out[2] = {};
-	REQUIRE(os_display_edid_linux_join(randr, 2, drm, 2, out, 2) == 2);
+	REQUIRE(os_display_edid_linux_join(randr, nullptr, 2, drm, 2, out, 2) == 2);
 	CHECK(out[0].join == OS_EDID_JOIN_MM);
 	CHECK(out[0].manufacturer_id == SDC_RAW);
 	CHECK(out[1].join == OS_EDID_JOIN_MM); // RandR 340x190 vs DTD 344x193: within tolerance
@@ -245,7 +247,7 @@ TEST_CASE("join: no names and no mm fall back to the pixel mode")
 	box_drm(drm);
 
 	os_display_edid_monitor out[2] = {};
-	REQUIRE(os_display_edid_linux_join(randr, 2, drm, 2, out, 2) == 2);
+	REQUIRE(os_display_edid_linux_join(randr, nullptr, 2, drm, 2, out, 2) == 2);
 	CHECK(out[0].join == OS_EDID_JOIN_MODE); // device mode 2880x1800
 	CHECK(out[0].manufacturer_id == SDC_RAW);
 	CHECK(out[1].join == OS_EDID_JOIN_MODE);
@@ -259,12 +261,12 @@ TEST_CASE("join: two identical panels with no name match stay unjoined, never gu
 	    randr_mon("XWAYLAND1", 3840, 3840, 2160, 340, 190, false),
 	};
 	os_display_drm_connector drm[2] = {
-	    drm_conn("HDMI-A-1", DS1_EDID, sizeof(DS1_EDID), 3840, 2160),
-	    drm_conn("HDMI-A-2", DS1_EDID, sizeof(DS1_EDID), 3840, 2160),
+	    drm_conn("card1-HDMI-A-1", DS1_EDID, sizeof(DS1_EDID), 3840, 2160),
+	    drm_conn("card1-HDMI-A-2", DS1_EDID, sizeof(DS1_EDID), 3840, 2160),
 	};
 
 	os_display_edid_monitor out[2] = {};
-	REQUIRE(os_display_edid_linux_join(randr, 2, drm, 2, out, 2) == 2);
+	REQUIRE(os_display_edid_linux_join(randr, nullptr, 2, drm, 2, out, 2) == 2);
 	CHECK(out[0].join == OS_EDID_JOIN_NONE);
 	CHECK(out[0].manufacturer_id == 0);
 	CHECK(out[1].join == OS_EDID_JOIN_NONE);
@@ -279,10 +281,10 @@ TEST_CASE("join: a connector is used at most once")
 	    randr_mon("HDMI-1", 0, 3840, 2160, 340, 190, true),
 	    randr_mon("XWAYLAND1", 3840, 3840, 2160, 340, 190, false),
 	};
-	os_display_drm_connector drm[1] = {drm_conn("HDMI-A-1", DS1_EDID, sizeof(DS1_EDID), 3840, 2160)};
+	os_display_drm_connector drm[1] = {drm_conn("card1-HDMI-A-1", DS1_EDID, sizeof(DS1_EDID), 3840, 2160)};
 
 	os_display_edid_monitor out[2] = {};
-	REQUIRE(os_display_edid_linux_join(randr, 2, drm, 1, out, 2) == 2);
+	REQUIRE(os_display_edid_linux_join(randr, nullptr, 2, drm, 1, out, 2) == 2);
 	CHECK(out[0].join == OS_EDID_JOIN_NAME);
 	CHECK(out[1].join == OS_EDID_JOIN_NONE);
 }
@@ -291,10 +293,10 @@ TEST_CASE("join: no X server gives DRM-only records with an unknown origin")
 {
 	os_display_drm_connector drm[3];
 	box_drm(drm);
-	drm[2] = drm_conn("DP-1", DS1_EDID, sizeof(DS1_EDID), 1920, 1080, /*enabled=*/false);
+	drm[2] = drm_conn("card1-DP-1", DS1_EDID, sizeof(DS1_EDID), 1920, 1080, /*enabled=*/false);
 
 	os_display_edid_monitor out[4] = {};
-	REQUIRE(os_display_edid_linux_join(nullptr, 0, drm, 3, out, 4) == 2); // disabled DP-1 skipped
+	REQUIRE(os_display_edid_linux_join(nullptr, nullptr, 0, drm, 3, out, 4) == 2); // disabled DP-1 skipped
 	for (int i = 0; i < 2; i++) {
 		CHECK(out[i].join == OS_EDID_JOIN_DRM_ONLY);
 		CHECK(out[i].origin_unknown);
@@ -305,7 +307,116 @@ TEST_CASE("join: no X server gives DRM-only records with an unknown origin")
 	CHECK(out[1].manufacturer_id == ACR_RAW);
 	CHECK(out[1].pixel_width == 3840);
 	CHECK(out[1].native_width == 3840);
-	CHECK(std::string(out[1].connector) == "HDMI-A-1");
+	CHECK(std::string(out[1].connector) == "card1-HDMI-A-1");
+}
+
+TEST_CASE("join: NVIDIA's off-by-one output names do not tie to the wrong connector")
+{
+	// The NVIDIA X driver names outputs from 0, nvidia-drm from 1. RandR DP-1
+	// is really the panel on card0-DP-2; card0-DP-1 is a different monitor.
+	const std::vector<uint8_t> edp = edp_no_serial_edid();
+	os_display_desktop_info randr[2] = {
+	    randr_mon("DP-0", 0, 2880, 1800, 300, 190, true),
+	    randr_mon("DP-1", 2880, 3840, 2160, 340, 190, false),
+	};
+	os_display_drm_connector drm[2] = {
+	    drm_conn("card0-DP-1", edp.data(), edp.size(), 2880, 1800),
+	    drm_conn("card0-DP-2", DS1_EDID, sizeof(DS1_EDID), 3840, 2160),
+	};
+
+	os_display_edid_monitor out[2] = {};
+	REQUIRE(os_display_edid_linux_join(randr, nullptr, 2, drm, 2, out, 2) == 2);
+	// RandR DP-1 must NOT take card0-DP-1 (wrong mode, wrong mm): it falls
+	// through to the mm rule and finds the DS1 on card0-DP-2.
+	CHECK(out[1].manufacturer_id == ACR_RAW);
+	CHECK(std::string(out[1].connector) == "card0-DP-2");
+	CHECK(out[1].join == OS_EDID_JOIN_MM);
+	CHECK(out[0].manufacturer_id == SDC_RAW);
+	CHECK(std::string(out[0].connector) == "card0-DP-1");
+}
+
+TEST_CASE("join: the same connector name on two cards picks the one that agrees physically")
+{
+	const std::vector<uint8_t> edp = edp_no_serial_edid();
+	os_display_desktop_info randr[1] = {randr_mon("HDMI-1", 0, 3840, 2160, 340, 190, true)};
+	os_display_drm_connector drm[2] = {
+	    drm_conn("card0-HDMI-A-1", edp.data(), edp.size(), 2880, 1800),
+	    drm_conn("card1-HDMI-A-1", DS1_EDID, sizeof(DS1_EDID), 3840, 2160),
+	};
+
+	os_display_edid_monitor out[1] = {};
+	REQUIRE(os_display_edid_linux_join(randr, nullptr, 1, drm, 2, out, 1) == 1);
+	CHECK(out[0].join == OS_EDID_JOIN_NAME);
+	CHECK(std::string(out[0].connector) == "card1-HDMI-A-1");
+	CHECK(out[0].manufacturer_id == ACR_RAW);
+}
+
+TEST_CASE("join: a connected but disabled connector never joins by mm or mode")
+{
+	os_display_desktop_info randr[1] = {randr_mon("XWAYLAND0", 0, 3840, 2160, 340, 190, true)};
+	os_display_drm_connector drm[2] = {
+	    drm_conn("card1-DP-1", DS1_EDID, sizeof(DS1_EDID), 3840, 2160, /*enabled=*/false),
+	    drm_conn("card1-HDMI-A-1", DS1_EDID, sizeof(DS1_EDID), 3840, 2160),
+	};
+
+	os_display_edid_monitor out[1] = {};
+	REQUIRE(os_display_edid_linux_join(randr, nullptr, 1, drm, 2, out, 1) == 1);
+	// Two identical EDIDs, but only one is lit: unambiguous.
+	CHECK(out[0].join == OS_EDID_JOIN_MM);
+	CHECK(std::string(out[0].connector) == "card1-HDMI-A-1");
+
+	// With the enabled one gone, the disabled one is still not used.
+	REQUIRE(os_display_edid_linux_join(randr, nullptr, 1, drm, 1, out, 1) == 1);
+	CHECK(out[0].join == OS_EDID_JOIN_NONE);
+	CHECK(out[0].connector[0] == '\0');
+}
+
+TEST_CASE("join: the X server's own EDID property is the identity when published")
+{
+	// Native X: names that tie nothing ("default") and no mm, but the server
+	// publishes each output's EDID.
+	const std::vector<uint8_t> edp = edp_no_serial_edid();
+	os_display_desktop_info randr[2] = {
+	    randr_mon("default0", 0, 2880, 1800, 0, 0, true),
+	    randr_mon("default1", 2880, 3840, 2160, 0, 0, false),
+	};
+	os_display_randr_identity ids[2] = {};
+	REQUIRE(os_display_edid_parse(edp.data(), edp.size(), &ids[0].edid));
+	ids[0].valid = true;
+	REQUIRE(os_display_edid_parse(DS1_EDID, sizeof(DS1_EDID), &ids[1].edid));
+	ids[1].valid = true;
+	os_display_drm_connector drm[2] = {
+	    drm_conn("card0-DP-1", DS1_EDID, sizeof(DS1_EDID), 3840, 2160),
+	    drm_conn("card0-eDP-1", edp.data(), edp.size(), 2880, 1800),
+	};
+
+	os_display_edid_monitor out[2] = {};
+	REQUIRE(os_display_edid_linux_join(randr, ids, 2, drm, 2, out, 2) == 2);
+	CHECK(out[0].join == OS_EDID_JOIN_RANDR_EDID);
+	CHECK(out[0].manufacturer_id == SDC_RAW);
+	CHECK(std::string(out[0].connector) == "card0-eDP-1");
+	CHECK(out[1].join == OS_EDID_JOIN_RANDR_EDID);
+	CHECK(out[1].serial_number == 0x322EF05Eu);
+	CHECK(std::string(out[1].connector) == "card0-DP-1");
+	CHECK(out[1].physical_width_mm == 344);
+}
+
+TEST_CASE("join: X server EDID with two identical connectors uses the name to choose")
+{
+	os_display_desktop_info randr[1] = {randr_mon("HDMI-2", 0, 3840, 2160, 340, 190, true)};
+	os_display_randr_identity ids[1] = {};
+	REQUIRE(os_display_edid_parse(DS1_EDID, sizeof(DS1_EDID), &ids[0].edid));
+	ids[0].valid = true;
+	os_display_drm_connector drm[2] = {
+	    drm_conn("card1-HDMI-A-1", DS1_EDID, sizeof(DS1_EDID), 3840, 2160),
+	    drm_conn("card1-HDMI-A-2", DS1_EDID, sizeof(DS1_EDID), 3840, 2160),
+	};
+
+	os_display_edid_monitor out[1] = {};
+	REQUIRE(os_display_edid_linux_join(randr, ids, 1, drm, 2, out, 1) == 1);
+	CHECK(out[0].join == OS_EDID_JOIN_RANDR_EDID);
+	CHECK(std::string(out[0].connector) == "card1-HDMI-A-2");
+	CHECK(out[0].manufacturer_id == ACR_RAW);
 }
 
 namespace {
@@ -363,16 +474,17 @@ TEST_CASE("sysfs: reads connected connectors, their EDID, enabled state and mode
 	const uint32_t n = os_display_drm_read_connectors(root.c_str(), c, 8);
 	REQUIRE(n == 2);
 
-	const os_display_drm_connector *h = std::strcmp(c[0].name, "HDMI-A-1") == 0 ? &c[0] : &c[1];
-	const os_display_drm_connector *l = h == &c[0] ? &c[1] : &c[0];
-	CHECK(std::string(h->name) == "HDMI-A-1");
+	// Sorted by name, card prefix kept: "card1-HDMI-A-1" < "card1-eDP-1".
+	const os_display_drm_connector *h = &c[0];
+	const os_display_drm_connector *l = &c[1];
+	CHECK(std::string(h->name) == "card1-HDMI-A-1");
 	CHECK(h->enabled);
 	CHECK(h->has_edid);
 	CHECK(h->edid.serial_number == 0x322EF05Eu);
 	REQUIRE(h->mode_count == 3);
 	CHECK(h->mode_w[0] == 3840);
 	CHECK(h->mode_h[2] == 1080);
-	CHECK(std::string(l->name) == "eDP-1");
+	CHECK(std::string(l->name) == "card1-eDP-1");
 	CHECK_FALSE(l->enabled);
 	CHECK(l->has_edid);
 
