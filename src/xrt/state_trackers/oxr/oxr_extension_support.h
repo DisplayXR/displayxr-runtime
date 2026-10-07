@@ -703,6 +703,21 @@
 
 
 /*
+ * XR_DXR_cursor_depth
+ *
+ * Hand-added DisplayXR extension (ADR-046). No entry points: a next-chain
+ * input on XrViewLocateInfo and a next-chain output on XrViewState.
+ */
+#if defined(XR_DXR_cursor_depth)
+#define OXR_HAVE_DXR_cursor_depth
+#define OXR_EXTENSION_SUPPORT_DXR_cursor_depth(_) \
+    _(DXR_cursor_depth, DXR_CURSOR_DEPTH)
+#else
+#define OXR_EXTENSION_SUPPORT_DXR_cursor_depth(_)
+#endif
+
+
+/*
  * XR_DXR_display_zones
  *
  * Hand-added DisplayXR extension (generate_oxr_ext_support.py knows nothing
@@ -1297,6 +1312,7 @@
     OXR_EXTENSION_SUPPORT_DXR_local_3d_zone(_) \
     OXR_EXTENSION_SUPPORT_DXR_view_rig(_) \
     OXR_EXTENSION_SUPPORT_DXR_depth_budget(_) \
+    OXR_EXTENSION_SUPPORT_DXR_cursor_depth(_) \
     OXR_EXTENSION_SUPPORT_DXR_display_zones(_) \
     OXR_EXTENSION_SUPPORT_DXR_weave(_) \
     OXR_EXTENSION_SUPPORT_DXR_lift(_) \

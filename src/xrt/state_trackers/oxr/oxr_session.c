@@ -2228,6 +2228,74 @@ oxr_session_set_view_space_offset(struct oxr_session *sess, const struct xrt_pos
 	os_mutex_unlock(&sess->view_space_offset_lock);
 }
 
+#ifdef OXR_HAVE_DXR_cursor_depth
+/*!
+ * XR_DXR_cursor_depth (ADR-046): place the depth-aware cursor for this locate.
+ *
+ * Runs only when the app chained BOTH the hint (the per-frame request) and the
+ * placement output - the extension's zero-cost-unless-asked rule. Solved from
+ * the views this locate just produced (outermost active pair), so it is
+ * correct for every rig, scale, zone and view count >= 2 without reaching into
+ * the rig math above.
+ */
+static void
+oxr_session_fill_cursor_depth(struct oxr_session *sess,
+                              const XrViewLocateInfo *viewLocateInfo,
+                              XrViewState *viewState,
+                              const XrView *views,
+                              uint32_t active_view_count)
+{
+	XrCursorDepthPlacementDXR *out =
+	    OXR_GET_OUTPUT_FROM_CHAIN(viewState, XR_TYPE_CURSOR_DEPTH_PLACEMENT_DXR, XrCursorDepthPlacementDXR);
+	if (out == NULL) {
+		return;
+	}
+	out->isActive = XR_FALSE;
+	out->pose = (XrPosef){{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+	out->height = 0.0f;
+	out->disparity = 0.0f;
+	out->targetDisparity = 0.0f;
+
+	const XrCursorDepthHintDXR *hint =
+	    OXR_GET_INPUT_FROM_CHAIN(viewLocateInfo, XR_TYPE_CURSOR_DEPTH_HINT_DXR, XrCursorDepthHintDXR);
+	if (hint == NULL || active_view_count < 2) {
+		return;
+	}
+
+	// XrPosef/XrFovf are layout-identical to xrt_pose/xrt_fov.
+	const XrView *first = &views[0];
+	const XrView *last = &views[active_view_count - 1];
+	struct u_cursor_depth_view a = {*(const struct xrt_pose *)&first->pose, *(const struct xrt_fov *)&first->fov};
+	struct u_cursor_depth_view b = {*(const struct xrt_pose *)&last->pose, *(const struct xrt_fov *)&last->fov};
+
+	struct u_cursor_depth_geometry g;
+	if (!u_cursor_depth_geometry_solve(&a, &b, hint->cursorUV.x, hint->cursorUV.y, &g)) {
+		return;
+	}
+
+	struct u_cursor_depth_tuning tuning;
+	u_cursor_depth_tuning_defaults(&tuning);
+
+	float content = 0.0f;
+	const struct xrt_vec3 nearest = {hint->nearestPoint.x, hint->nearestPoint.y, hint->nearestPoint.z};
+	const bool has_content = hint->hasContent && u_cursor_depth_point_disparity(&g, &nearest, &content);
+	const float target = u_cursor_depth_target(&tuning, has_content, content);
+	const float disparity = u_cursor_depth_filter_step(&sess->cursor_depth_filter, &tuning, target,
+	                                                   (uint64_t)viewLocateInfo->displayTime);
+
+	struct xrt_vec3 position;
+	float height;
+	u_cursor_depth_place(&g, disparity, hint->cursorHeight, &position, &height);
+
+	out->isActive = XR_TRUE;
+	out->pose.orientation = (XrQuaternionf){g.orientation.x, g.orientation.y, g.orientation.z, g.orientation.w};
+	out->pose.position = (XrVector3f){position.x, position.y, position.z};
+	out->height = height;
+	out->disparity = disparity;
+	out->targetDisparity = target;
+}
+#endif // OXR_HAVE_DXR_cursor_depth
+
 XrResult
 oxr_session_locate_views(struct oxr_logger *log,
                          struct oxr_session *sess,
@@ -3575,6 +3643,14 @@ oxr_session_locate_views(struct oxr_logger *log,
 		if (act != NULL) {
 			act->activeViewCount = active_view_count;
 		}
+	}
+#endif
+
+#ifdef OXR_HAVE_DXR_cursor_depth
+	// XR_DXR_cursor_depth (ADR-046): runtime gate, then the helper's own
+	// hint gate - no hint chained, no cursor work.
+	if (sess->sys->inst->extensions.DXR_cursor_depth) {
+		oxr_session_fill_cursor_depth(sess, viewLocateInfo, viewState, views, active_view_count);
 	}
 #endif
 

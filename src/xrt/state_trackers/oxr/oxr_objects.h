@@ -29,6 +29,7 @@
 #include "util/u_hashset.h"
 #include "util/u_hashmap.h"
 #include "util/u_device.h"
+#include "util/u_cursor_depth.h"
 
 #include "oxr_extension_support.h"
 #include "oxr_subaction.h"
@@ -2961,6 +2962,13 @@ struct oxr_session
 		size_t cap[2];
 		uint32_t next; //!< Buffer the next copy goes into.
 	} content_mask;
+#endif
+
+#ifdef OXR_HAVE_DXR_cursor_depth
+	//! XR_DXR_cursor_depth (ADR-046): the cursor's disparity filter. Touched
+	//! only by a locate that chains an XrCursorDepthHintDXR - a session that
+	//! never sends a hint never steps it.
+	struct u_cursor_depth_filter cursor_depth_filter;
 #endif
 
 #ifdef OXR_HAVE_DXR_display_zones

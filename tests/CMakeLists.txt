@@ -40,6 +40,7 @@ set(tests
     tests_aux_bg_neutrality
     tests_aux_color_encoding
     tests_aux_grip_surface
+    tests_aux_cursor_depth
     tests_aux_rear_budget
     tests_aux_route_policy
     tests_aux_present_owner_route
