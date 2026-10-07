@@ -149,7 +149,7 @@ or destroy is one WARN.
   refused at load (vk_bundle ABI, #1243) gets no segment DP: that segment is flat 2D.
 - Not segmented: zero-copy frames, a self-submitting DP or one without a render
   pass, a session pinned with `XrSessionDisplayBindingDXR`, the shared-texture path.
-- `DXR_SEGMENTS=0` turns it off.
+- `DXR_SEGMENTS=0` turns it off (and keeps `PRIMARY_MULTIVIEW_DXR` at the pre-M3 view count).
 - Capture: with the window split, the post-compose atlas capture also writes each
   segment's DP input as `<stem>.seg<i>.png`.
 
