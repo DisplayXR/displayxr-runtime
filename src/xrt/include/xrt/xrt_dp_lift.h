@@ -8,7 +8,8 @@
  * N-view synthesis, photo → Gaussian splats). The runtime reaches it through
  * optional appended slots on the per-API DP vtable — today only
  * @ref xrt_display_processor_d3d11 (lift_get_caps … lift_convert_blob, guarded
- * by XRT_DP_D3D11_HAS_LIFT) — and exposes it to apps as XR_DXR_lift.
+ * by XRT_DP_D3D11_HAS_LIFT; plus lift_get_depth, guarded by
+ * XRT_DP_D3D11_HAS_LIFT_DEPTH) — and exposes it to apps as XR_DXR_lift.
  *
  * The split of labour (ADR-042, ADR-007):
  *  - the PLUG-IN converts, synchronously, one frame per call. It never weaves
@@ -88,7 +89,36 @@ struct xrt_dp_lift_caps
 	uint32_t state;              //!< 0 unavailable, 1 activating, 2 ready
 	uint64_t typical_latency_ns; //!< submit→result as the module expects it; 0 = unknown
 	char backend[32];            //!< NUL-terminated module name (informational)
+
+	/*
+	 * ── Auxiliary depth (ADR-048 Addendum A, XRT_DP_LIFT_HAS_AUX_DEPTH) ──────
+	 * Appended; written only when struct_size covers them.
+	 */
+
+	//! XRT_DP_LIFT_AUX_* bits the module can return alongside SBS / NVIEW
+	//! views (through xrt_display_processor_d3d11::lift_get_depth); 0 = none.
+	uint32_t aux_outputs;
+	//! Meaning of that auxiliary depth: XRT_DP_LIFT_DEPTH_RELATIVE / _METRIC.
+	uint32_t aux_depth_semantics;
 };
+
+/*!
+ * @name Auxiliary outputs (ADR-048 Addendum A)
+ *
+ * Announced by XRT_DP_LIFT_HAS_AUX_DEPTH (append-only, ADR-020: no ABI bump),
+ * together with the D3D11 slot lift_get_depth (XRT_DP_D3D11_HAS_LIFT_DEPTH).
+ * @{
+ */
+#define XRT_DP_LIFT_HAS_AUX_DEPTH 1
+
+//! xrt_dp_lift_caps::aux_outputs / xrt_dp_lift_stream_info::aux_outputs bit:
+//! the depth map of the same inference that produced the views.
+#define XRT_DP_LIFT_AUX_DEPTH 1u
+
+//! xrt_dp_lift_depth::encoding — values match XR_LIFT_DEPTH_ENCODING_*_DXR.
+#define XRT_DP_LIFT_DEPTH_ENCODING_LINEAR 0u  //!< decoded value = depth
+#define XRT_DP_LIFT_DEPTH_ENCODING_INVERSE 1u //!< decoded value = 1 / depth
+/*! @} */
 
 //! Stream creation parameters (runtime-filled).
 struct xrt_dp_lift_stream_info
@@ -97,6 +127,75 @@ struct xrt_dp_lift_stream_info
 	uint32_t mode;         //!< ONE XRT_DP_LIFT_MODE_* bit
 	uint32_t content_hint; //!< 0 video, 1 photo
 	float input_scale;     //!< (0,1]: convert at reduced resolution; 1 = native
+
+	/*
+	 * ── Auxiliary outputs (ADR-048 Addendum A, XRT_DP_LIFT_HAS_AUX_DEPTH) ───
+	 * Appended; read only when struct_size covers them.
+	 */
+
+	//! XRT_DP_LIFT_AUX_* bits the app asked for on this SBS / NVIEW stream
+	//! (never set for DEPTH / GAUSSIANS). A module that sees
+	//! XRT_DP_LIFT_AUX_DEPTH keeps each conversion's depth map for
+	//! lift_get_depth — ideally from the same inference as the views.
+	uint32_t aux_outputs;
+	//! DXGI_FORMAT hint for the depth map (R32_FLOAT / R16_FLOAT); 0 = any.
+	uint32_t aux_depth_format;
+};
+
+/*!
+ * The auxiliary depth map of the conversion lift_convert just returned
+ * (xrt_display_processor_d3d11::lift_get_depth). The runtime pre-sets
+ * @c struct_size (zeroing the rest); the DP writes only fields within it.
+ *
+ * Vendor-neutral by construction: everything a consumer needs to place the
+ * depth in metric space — the encoding of the samples, their unit, the
+ * camera the module assumed, and the depth it put on the screen plane — and
+ * nothing about how the module got there. The RUNTIME derives the display
+ * alignment (XrLiftDepthResultDXR::depthToDisplay) from these plus the
+ * viewpoints and rect it already owns; the plug-in only reports.
+ *
+ * Decoding (runtime and app): d = value_scale * sample + value_offset; depth =
+ * d (LINEAR) or 1 / d (INVERSE), in @c units.
+ */
+struct xrt_dp_lift_depth
+{
+	uint32_t struct_size;
+	//! DXGI_FORMAT of @c resource: DXGI_FORMAT_R32_FLOAT (41) or _R16_FLOAT (54).
+	uint32_t format;
+	//! ID3D11Resource* (a 2D texture) on the lift device, owned by the DP,
+	//! valid until the NEXT lift_convert on this stream (the runtime copies it
+	//! out before then). NULL = no depth for this conversion.
+	void *resource;
+	uint32_t width;  //!< texels
+	uint32_t height; //!< texels
+	//! XRT_DP_LIFT_DEPTH_RELATIVE / XRT_DP_LIFT_DEPTH_METRIC (metres).
+	uint32_t units;
+	//! XRT_DP_LIFT_DEPTH_ENCODING_*.
+	uint32_t encoding;
+	float value_scale;  //!< decode: d = value_scale * sample + value_offset (0 is read as 1)
+	float value_offset; //!< (see value_scale)
+	//! The input frame the depth refers to (w x h of the lift_convert call).
+	uint32_t source_width;
+	uint32_t source_height;
+	//! Pinhole intrinsics the module assumed, in DEPTH-MAP pixels (u right,
+	//! v down, origin top-left corner); focal <= 0 = unknown.
+	float focal_x_px;
+	float focal_y_px;
+	float principal_x_px;
+	float principal_y_px;
+	//! Decoded depth range of this map, in @c units; 0 = unknown.
+	float near_depth;
+	float far_depth;
+	//! The decoded depth (in @c units) the conversion put at ZERO disparity —
+	//! on the screen plane — after resolving xrt_dp_lift_params::convergence
+	//! (including AUTO). <= 0 = unknown (the runtime then reports no display
+	//! transform).
+	float convergence_depth;
+	//! Non-zero = produced by the SAME inference as the views the preceding
+	//! lift_convert returned (not a second pass, not a cached older frame).
+	uint32_t same_inference;
+	//! The module's own frame / inference counter, informational (logged).
+	uint64_t vendor_frame_id;
 };
 
 /*!
@@ -185,7 +284,34 @@ struct xrt_dp_lift_params
 	//! XRT_DP_LIFT_VIEWPOINT_FRAME_*: origin of the viewpoints passed to
 	//! lift_convert. Always RECT from a runtime that fills this field.
 	uint32_t viewpoint_frame;
+
+	/*
+	 * ── App rig (ADR-048 Addendum A, XRT_DP_LIFT_HAS_APP_RIG) ──────────────
+	 * Appended; read only when struct_size covers them.
+	 */
+
+	//! XRT_DP_LIFT_VIEWPOINTS_*: where the viewpoints came from. With
+	//! DISPLAY_RIG / CAMERA_RIG they are the app's rig eyes (the xrLocateViews
+	//! math, the rect as the screen) — the same eyes the app renders its own
+	//! 3D from, so a module must reproduce them as given (no extra gain).
+	uint32_t viewpoint_source;
+	//! The reference viewing distance the runtime used (axis pinning, rig
+	//! nominal viewer), metres from the rect plane; 0 = unknown.
+	float nominal_z_m;
 };
+
+/*!
+ * @name App rig (ADR-048 Addendum A) — xrt_dp_lift_params appended fields
+ * Announced by XRT_DP_LIFT_HAS_APP_RIG (append-only, ADR-020: no ABI bump).
+ * @{
+ */
+#define XRT_DP_LIFT_HAS_APP_RIG 1
+
+#define XRT_DP_LIFT_VIEWPOINTS_TRACKED 0u     //!< tracked eyes + the viewpoint policy
+#define XRT_DP_LIFT_VIEWPOINTS_EXPLICIT 1u    //!< the app's explicit viewpoints
+#define XRT_DP_LIFT_VIEWPOINTS_DISPLAY_RIG 2u //!< tracked eyes through the app's display rig
+#define XRT_DP_LIFT_VIEWPOINTS_CAMERA_RIG 3u  //!< tracked eyes through the app's camera rig
+/*! @} */
 
 /*!
  * Pre-set @p caps for a lift_get_caps call: zero it and stamp struct_size.
@@ -198,6 +324,19 @@ xrt_dp_lift_caps_init(struct xrt_dp_lift_caps *caps)
 		p[i] = 0;
 	}
 	caps->struct_size = (uint32_t)sizeof(*caps);
+}
+
+/*!
+ * Pre-set @p d for a lift_get_depth call: zero it and stamp struct_size.
+ */
+static inline void
+xrt_dp_lift_depth_init(struct xrt_dp_lift_depth *d)
+{
+	uint8_t *p = (uint8_t *)d;
+	for (uint32_t i = 0; i < (uint32_t)sizeof(*d); i++) {
+		p[i] = 0;
+	}
+	d->struct_size = (uint32_t)sizeof(*d);
 }
 
 #ifdef __cplusplus

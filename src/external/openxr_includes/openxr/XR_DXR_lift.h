@@ -57,7 +57,13 @@
  * viewpoints are relative to the lifted rect's / submitting window's centre
  * (was: the panel centre), XrLiftViewControlDXR (display-rig ipd / parallax
  * factors, axis mode, offset clamp, recentering) and the per-result echo
- * XrLiftResultViewpointsDXR.
+ * XrLiftResultViewpointsDXR. 3 = app camera + metric depth (ADR-048
+ * Addendum A): an XrDisplayRigDXR / XrCameraRigDXR (XR_DXR_view_rig) chained
+ * on XrLiftOptionsDXR or XrWeaveRectLiftDXR drives the TRACKED viewpoints with
+ * the xrLocateViews rig math; EXPLICIT viewpoints are accepted on lifted weave
+ * rects; SBS / NVIEW streams may return an auxiliary depth map from the same
+ * conversion (XrLiftDepthRequestDXR at stream creation, XrLiftDepthResultDXR
+ * on each result, XrLiftDepthPropertiesDXR on the properties).
  */
 #ifndef XR_DXR_LIFT_H
 #define XR_DXR_LIFT_H 1
@@ -70,7 +76,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_lift 1
-#define XR_DXR_lift_SPEC_VERSION 2
+#define XR_DXR_lift_SPEC_VERSION 3
 #define XR_DXR_LIFT_EXTENSION_NAME "XR_DXR_lift"
 
 // Reserved 1004999270..279. Allocation registry: README.md in this directory.
@@ -92,6 +98,10 @@ extern "C" {
 // Spec v2 (ADR-048).
 #define XR_TYPE_LIFT_VIEW_CONTROL_DXR        ((XrStructureType)1004999281)
 #define XR_TYPE_LIFT_RESULT_VIEWPOINTS_DXR   ((XrStructureType)1004999282)
+// Spec v3 (ADR-048 Addendum A).
+#define XR_TYPE_LIFT_DEPTH_REQUEST_DXR       ((XrStructureType)1004999283)
+#define XR_TYPE_LIFT_DEPTH_RESULT_DXR        ((XrStructureType)1004999284)
+#define XR_TYPE_LIFT_DEPTH_PROPERTIES_DXR    ((XrStructureType)1004999285)
 
 //! Size of XrLiftPropertiesDXR::backend, NUL included.
 #define XR_LIFT_BACKEND_NAME_MAX_SIZE_DXR 32
@@ -132,6 +142,19 @@ typedef enum XrLiftDepthSemanticsDXR {
     XR_LIFT_DEPTH_SEMANTICS_METRIC_DXR = 1,
     XR_LIFT_DEPTH_SEMANTICS_MAX_ENUM_DXR = 0x7FFFFFFF
 } XrLiftDepthSemanticsDXR;
+
+/*!
+ * How the samples of an auxiliary depth map encode depth (spec v3). Decode a
+ * sample @c s as d = valueScale * s + valueOffset (XrLiftDepthResultDXR);
+ * with INVERSE, depth = 1 / d. The decoded depth is in the result's units.
+ */
+typedef enum XrLiftDepthEncodingDXR {
+    //! The decoded value IS the depth (larger = farther).
+    XR_LIFT_DEPTH_ENCODING_LINEAR_DXR = 0,
+    //! The decoded value is INVERSE depth (disparity-like; larger = nearer).
+    XR_LIFT_DEPTH_ENCODING_INVERSE_DXR = 1,
+    XR_LIFT_DEPTH_ENCODING_MAX_ENUM_DXR = 0x7FFFFFFF
+} XrLiftDepthEncodingDXR;
 
 typedef enum XrLiftStateDXR {
     //! No module, or the module failed. supportedModes is 0.
@@ -249,6 +272,20 @@ typedef struct XrLiftPropertiesDXR {
 } XrLiftPropertiesDXR;
 
 /*!
+ * Auxiliary-depth capability (spec v3). Chain on XrLiftPropertiesDXR::next;
+ * filled by xrGetLiftPropertiesDXR. @c auxDepthSupported XR_TRUE = an SBS /
+ * NVIEW stream created with XrLiftDepthRequestDXR returns the depth map of the
+ * same conversion with each result; @c auxDepthSemantics is what that depth
+ * means (METRIC = metres). A runtime or module without it leaves XR_FALSE.
+ */
+typedef struct XrLiftDepthPropertiesDXR {
+    XrStructureType          type;               //!< XR_TYPE_LIFT_DEPTH_PROPERTIES_DXR
+    void* XR_MAY_ALIAS       next;
+    XrBool32                 auxDepthSupported;
+    XrLiftDepthSemanticsDXR  auxDepthSemantics;
+} XrLiftDepthPropertiesDXR;
+
+/*!
  * One conversion stream. @c mode is ONE bit the runtime reported in
  * XrLiftPropertiesDXR::supportedModes. @c inputScale (0, 1] asks the module to
  * convert at a reduced resolution (1.0 = native; 0 is read as 1.0) — a latency
@@ -263,6 +300,24 @@ typedef struct XrLiftStreamCreateInfoDXR {
 } XrLiftStreamCreateInfoDXR;
 
 /*!
+ * Ask an SBS / NVIEW stream for its depth map as an auxiliary output (spec
+ * v3). Chain on XrLiftStreamCreateInfoDXR::next. XR_ERROR_VALIDATION_FAILURE
+ * on a DEPTH or GAUSSIANS stream (a DEPTH stream's result already is depth).
+ * Advisory: if the module cannot produce it (XrLiftDepthPropertiesDXR::
+ * auxDepthSupported XR_FALSE) the stream is still created and every
+ * XrLiftDepthResultDXR reports @c depthValid XR_FALSE.
+ *
+ * @c preferredFormat is a DXGI_FORMAT hint (DXGI_FORMAT_R32_FLOAT or
+ * DXGI_FORMAT_R16_FLOAT; 0 = the module's choice). The result's @c format is
+ * authoritative.
+ */
+typedef struct XrLiftDepthRequestDXR {
+    XrStructureType          type;            //!< XR_TYPE_LIFT_DEPTH_REQUEST_DXR
+    const void* XR_MAY_ALIAS next;
+    int64_t                  preferredFormat; //!< DXGI_FORMAT hint; 0 = module's choice
+} XrLiftDepthRequestDXR;
+
+/*!
  * Per-frame conversion parameters. Chain on XrLiftFrameSubmitInfoDXR::next or
  * XrWeaveRectLiftDXR::next; omitted = the module's defaults (auto convergence,
  * strength 1, inpainting on, tracked eyes, 2 views).
@@ -275,8 +330,11 @@ typedef struct XrLiftStreamCreateInfoDXR {
  * produces (2 for SBS; ignored for DEPTH / GAUSSIANS), ≤ maxViews. With
  * EXPLICIT viewpoints, @c viewpoints holds @c viewCount display-space positions
  * (metres; the runtime rebases them to the rect centre before the module sees
- * them, spec v2); on the weave path viewpoints must be TRACKED. Chain
- * XrLiftViewControlDXR on @c next to shape TRACKED viewpoints (spec v2). @c focalPx is the
+ * them, spec v2) — on the plain submit path and, since spec v3, on lifted
+ * weave rects too. Chain XrLiftViewControlDXR on @c next to shape TRACKED
+ * viewpoints (spec v2), and an XrDisplayRigDXR or XrCameraRigDXR
+ * (XR_DXR_view_rig) to derive them with the app's own rig (spec v3, see
+ * XrLiftResultViewpointsDXR). @c focalPx is the
  * submitted image's focal length in pixels of @c extent (for a photo, e.g. the
  * fx of an estimated intrinsics); <= 0 = unknown, the module assumes its
  * default field of view. Photo → Gaussians modules take it as input; DEPTH /
@@ -341,6 +399,25 @@ typedef struct XrLiftViewControlDXR {
  * space (panel centre = 0) and @c rectSize the region's physical size.
  * @c viewpointCountOutput 0 = no viewpoints were known (the module used its
  * defaults), or a DEPTH stream.
+ *
+ * App rig (spec v3, ADR-048 Addendum A). An XrDisplayRigDXR or XrCameraRigDXR
+ * chained on XrLiftOptionsDXR (or directly on XrWeaveRectLiftDXR; direct wins;
+ * a camera rig wins over a display rig) makes the runtime derive the TRACKED
+ * viewpoints with the SAME math xrLocateViews runs for that rig, with the
+ * lifted rect as the screen: display rig = the processed eyes (ipdFactor,
+ * parallaxFactor) scaled by perspectiveFactor; camera rig = the physical
+ * viewer whose off-axis frustum onto the rect equals the camera rig's view
+ * frustum (convergenceDiopters, verticalFov, metersToVirtual;
+ * convergenceDiopters 0 = parallel cameras = one viewpoint for every view).
+ * The rig's @c pose and virtualDisplayHeight only place the app's virtual
+ * world and do not change the physical viewpoints. The rig replaces
+ * XrLiftViewControlDXR's ipdFactor / parallaxFactor; its axisMode, clamp and
+ * recentering still apply, to the viewer BEFORE the rig maps it — chain
+ * XrLiftViewControlDXR with XR_LIFT_AXIS_MODE_XYZ_DXR and recentering OFF for
+ * viewpoints identical to xrLocateViews'. The rig rides with the options,
+ * like EXPLICIT viewpoints: a submit carrying options without a rig clears
+ * it; a submit with no options keeps the stream's last one. Ignored for
+ * EXPLICIT viewpoints and for DEPTH / GAUSSIANS streams.
  */
 typedef struct XrLiftResultViewpointsDXR {
     XrStructureType    type;                 //!< XR_TYPE_LIFT_RESULT_VIEWPOINTS_DXR
@@ -350,6 +427,79 @@ typedef struct XrLiftResultViewpointsDXR {
     XrVector3f         rectCenter;           //!< display space, metres
     XrExtent2Df        rectSize;             //!< metres
 } XrLiftResultViewpointsDXR;
+
+/*!
+ * The auxiliary depth map of a result (spec v3, ADR-048 Addendum A). Chain on
+ * XrLiftResultDXR::next of an SBS / NVIEW stream created with
+ * XrLiftDepthRequestDXR; filled on every successful acquire. @c depthValid
+ * XR_FALSE = no depth for this result (a module without aux depth, or it
+ * declined this frame); every other field is then zero.
+ *
+ * Handles follow the main result's export rule: @c depthTexture (a D3D11 NT
+ * shared handle, runtime-owned, @c extent / @c format) and @c fence are
+ * handed out on the FIRST acquire that carries depth and again whenever the
+ * depth texture is reallocated; NULL otherwise. @c fence is the SAME fence
+ * object as XrLiftResultDXR::fence (a second handle to it; close both) and
+ * @c fenceValue equals XrLiftResultDXR::fenceValue: one wait covers the views
+ * and the depth. The caller finishes sampling before its next acquire.
+ *
+ * Samples: decode @c s as d = valueScale * s + valueOffset, then
+ * depth = d (LINEAR) or 1 / d (INVERSE), in @c units (METRIC = metres along
+ * the source camera's optical axis; RELATIVE = unitless, larger = farther).
+ * @c nearDepth / @c farDepth bound the decoded depth (0 = unknown).
+ * @c sameInference XR_TRUE = the depth comes from the very inference that
+ * produced this result's views; @c frameId always equals
+ * XrLiftResultDXR::frameId.
+ *
+ * Intrinsics (@c intrinsicsValid): the source camera the module assumed, in
+ * pixels of the depth map (u right, v down, origin at the top-left corner):
+ * @c focalLengthPx and @c principalPointPx. With metric depth they place every
+ * texel in the CAMERA's metric space:
+ * X = (u - cx) * depth / fx, Y = -(v - cy) * depth / fy, Z = -depth.
+ *
+ * Display alignment (@c transformValid): @c depthToDisplay maps a texel into
+ * DISPLAY space (metres, panel centre = 0, +x right, +y up, +z toward the
+ * viewer — the frame of XrLiftResultViewpointsDXR::rectCenter) the way the
+ * woven result presents it: the source image fills the lifted rect, seen from
+ * @c viewpoint (the midpoint of the viewpoints the views were synthesized
+ * for, rect-relative, as in XrLiftResultViewpointsDXR), and the depth
+ * @c convergenceDepth (decoded units) lies ON the screen plane. Column-major
+ * 4x4 (m[col * 4 + row]) applied to the homogeneous column
+ * (un * depth, vn * depth, depth, 1), where un = (u + 0.5) / extent.width and
+ * vn = (v + 0.5) / extent.height are the texel centre's normalised
+ * coordinates; the output's w is 1. depth = convergenceDepth lands on the
+ * rect, depth -> 0 converges on the viewpoint, and every texel stays on the
+ * ray from the viewpoint through its rect position — so content the app
+ * renders from XrLiftResultViewpointsDXR's eyes lines up with the lifted
+ * picture. The spec (§4.3) derives it. Valid only with METRIC units, a known
+ * @c convergenceDepth and a known rect; RELATIVE depth reports
+ * transformValid / intrinsicsValid XR_FALSE rather than inventing a scale.
+ */
+typedef struct XrLiftDepthResultDXR {
+    XrStructureType         type;             //!< XR_TYPE_LIFT_DEPTH_RESULT_DXR
+    void* XR_MAY_ALIAS      next;
+    XrBool32                depthValid;
+    void*                   depthTexture;     //!< shared HANDLE on first depth acquire / realloc, else NULL
+    void*                   fence;            //!< shared fence HANDLE with depthTexture, else NULL
+    uint64_t                fenceValue;       //!< == XrLiftResultDXR::fenceValue
+    XrExtent2Di             extent;           //!< depth map size, texels
+    int64_t                 format;           //!< DXGI_FORMAT (R32_FLOAT / R16_FLOAT)
+    XrLiftDepthSemanticsDXR units;
+    XrLiftDepthEncodingDXR  encoding;
+    float                   valueScale;
+    float                   valueOffset;
+    float                   nearDepth;        //!< decoded units; 0 = unknown
+    float                   farDepth;         //!< decoded units; 0 = unknown
+    XrBool32                sameInference;
+    uint64_t                frameId;          //!< == XrLiftResultDXR::frameId
+    XrBool32                intrinsicsValid;
+    XrVector2f              focalLengthPx;    //!< fx, fy in depth-map pixels
+    XrVector2f              principalPointPx; //!< cx, cy in depth-map pixels
+    float                   convergenceDepth; //!< decoded depth on the screen plane; <= 0 = unknown
+    XrVector3f              viewpoint;        //!< rect-relative metres (XrLiftResultViewpointsDXR frame)
+    XrBool32                transformValid;
+    float                   depthToDisplay[16]; //!< column-major; see above
+} XrLiftDepthResultDXR;
 
 /*!
  * One frame into a stream. NON-BLOCKING: the runtime snapshots the input's
@@ -389,7 +539,7 @@ typedef struct XrLiftFrameSubmitInfoDXR {
  */
 typedef struct XrLiftResultDXR {
     XrStructureType    type;          //!< XR_TYPE_LIFT_RESULT_DXR
-    void* XR_MAY_ALIAS next;          //!< chain XrLiftResultViewpointsDXR here (v2)
+    void* XR_MAY_ALIAS next;          //!< chain XrLiftResultViewpointsDXR (v2) / XrLiftDepthResultDXR (v3)
     uint64_t           frameId;       //!< the xrSubmitLiftFrameDXR frame this converts
     XrTime             sourceTime;    //!< that frame's sourceTime, verbatim
     void*              outputTexture; //!< shared HANDLE on first acquire / realloc, else NULL
@@ -444,7 +594,7 @@ typedef struct XrLiftBlobDXR {
  */
 typedef struct XrWeaveRectLiftDXR {
     XrStructureType          type;      //!< XR_TYPE_WEAVE_RECT_LIFT_DXR
-    const void* XR_MAY_ALIAS next;      //!< chain XrLiftOptionsDXR / XrLiftViewControlDXR here
+    const void* XR_MAY_ALIAS next;      //!< chain XrLiftOptionsDXR / XrLiftViewControlDXR / a view rig here
     uint32_t                 rectIndex; //!< index into XrWeaveSubmitRectsDXR::rects
     XrLiftStreamDXR          stream;
 } XrWeaveRectLiftDXR;

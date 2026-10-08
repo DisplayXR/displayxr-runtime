@@ -784,6 +784,42 @@ struct xrt_display_processor_d3d11
 	 * @param panel_y  Window client-area top edge, screen-relative device px.
 	 */
 	void (*set_present_origin)(struct xrt_display_processor_d3d11 *xdp, int32_t panel_x, int32_t panel_y);
+
+	/*!
+	 * The auxiliary DEPTH map of the conversion @ref lift_convert just
+	 * returned for stream @p id (ADR-048 Addendum A, XR_DXR_lift v3).
+	 *
+	 * Called by the runtime on its lift thread, immediately after a
+	 * successful lift_convert of an SBS / NVIEW stream that was created with
+	 * XRT_DP_LIFT_AUX_DEPTH in xrt_dp_lift_stream_info::aux_outputs — never
+	 * for any other stream, never before the stream's first conversion.
+	 * Same threading, device and context as lift_convert.
+	 *
+	 * The depth should come from the SAME inference that produced the views
+	 * (report it in xrt_dp_lift_depth::same_inference). @p out->resource is
+	 * DP-owned and must stay valid until the next lift_convert on @p id —
+	 * the runtime copies it into its own export texture before then, so a
+	 * module may keep one depth texture per stream and overwrite it.
+	 *
+	 * @p out arrives zeroed with struct_size pre-set (xrt_dp_lift_depth_init);
+	 * write only fields within it.
+	 *
+	 * Optional — an absent slot (older plug-in struct_size) or NULL ⟹ no
+	 * auxiliary depth (XrLiftDepthResultDXR::depthValid stays XR_FALSE).
+	 * Report the capability through xrt_dp_lift_caps::aux_outputs. Appended
+	 * after @ref set_present_origin per ADR-020 (append-only within a major,
+	 * no ABI bump), announced by XRT_DP_D3D11_HAS_LIFT_DEPTH.
+	 *
+	 * @param xdp            Pointer to self.
+	 * @param id             The plug-in's stream id (lift_stream_create).
+	 * @param d3d11_context  The lift device's immediate context.
+	 * @param[out] out       Depth map + metadata (struct_size pre-set).
+	 * @return false = no depth for this conversion.
+	 */
+	bool (*lift_get_depth)(struct xrt_display_processor_d3d11 *xdp,
+	                       uint64_t id,
+	                       void *d3d11_context,
+	                       struct xrt_dp_lift_depth *out);
 };
 
 
@@ -867,7 +903,8 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, lift_convert_blob
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_overlay_2d)         == XRT_DP_D3D11_BASE_OFF + 30 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_overlay_2d_filter_strength) == XRT_DP_D3D11_BASE_OFF + 31 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_present_origin)     == XRT_DP_D3D11_BASE_OFF + 32 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                                == XRT_DP_D3D11_BASE_OFF + 33 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, lift_get_depth)         == XRT_DP_D3D11_BASE_OFF + 33 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                                == XRT_DP_D3D11_BASE_OFF + 34 * sizeof(void *), XRT_DP_ABI_MSG);
 
 /*!
  * Defined when this header carries the five lift slots (lift_get_caps,
@@ -878,6 +915,14 @@ XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                    
  * XRT_PLUGIN_API_VERSION_CURRENT bump (ADR-020).
  */
 #define XRT_DP_D3D11_HAS_LIFT 1
+
+/*!
+ * Defined when this header carries the lift_get_depth slot (ADR-048
+ * Addendum A, XR_DXR_lift v3 auxiliary depth), so a plug-in built against an
+ * older runtime can #ifdef-guard it. Purely additive: no
+ * XRT_PLUGIN_API_VERSION_CURRENT bump (ADR-020).
+ */
+#define XRT_DP_D3D11_HAS_LIFT_DEPTH 1
 
 /*!
  * Defined when this header carries the get_background_preview slot, so a
@@ -1436,6 +1481,33 @@ xrt_display_processor_d3d11_has_lift(struct xrt_display_processor_d3d11 *xdp)
 {
 	return XRT_DP_HAS_SLOT(xdp, lift_convert) && xdp->lift_get_caps != NULL && xdp->lift_stream_create != NULL &&
 	       xdp->lift_stream_destroy != NULL && xdp->lift_convert != NULL;
+}
+
+/*!
+ * @copydoc xrt_display_processor_d3d11::lift_get_depth
+ *
+ * Helper: pre-sets @p out (xrt_dp_lift_depth_init) and returns false — no
+ * depth — when the slot is absent (older plug-in struct_size) or NULL, when
+ * the DP declines, or when it returned no resource.
+ *
+ * @public @memberof xrt_display_processor_d3d11
+ */
+static inline bool
+xrt_display_processor_d3d11_lift_get_depth(struct xrt_display_processor_d3d11 *xdp,
+                                           uint64_t id,
+                                           void *d3d11_context,
+                                           struct xrt_dp_lift_depth *out)
+{
+	xrt_dp_lift_depth_init(out);
+	if (!XRT_DP_HAS_SLOT(xdp, lift_get_depth) || xdp->lift_get_depth == NULL) {
+		return false;
+	}
+	if (!xdp->lift_get_depth(xdp, id, d3d11_context, out) || out->resource == NULL || out->width == 0 ||
+	    out->height == 0) {
+		xrt_dp_lift_depth_init(out);
+		return false;
+	}
+	return true;
 }
 
 /*!
