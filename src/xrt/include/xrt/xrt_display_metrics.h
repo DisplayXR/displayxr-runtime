@@ -140,7 +140,7 @@ struct xrt_window_metrics
 /*!
  * One window segment — the part of a window's canvas on one screen — as the
  * view math needs it (multi-screen M3). Produced by an in-process compositor
- * that segments its window (Vulkan native, desktop Linux).
+ * that segments its window (Vulkan native on desktop Linux, D3D11 on Windows).
  *
  * @ingroup xrt_iface
  */

@@ -504,6 +504,16 @@ struct comp_d3d11_compositor
 	uint64_t seg_pinned_display_id;
 	struct comp_seg_rect seg_window; //!< the window's client area in desktop device px
 	bool have_seg_window;
+	/*!
+	 * Multi-screen M3: what the app thread reads (xrLocateViews) and hands
+	 * back (xrEndFrame) while the weave thread owns the segment manager —
+	 * a small lock of its own, never c->mutex (the repaint thread holds that
+	 * across its whole replay).
+	 */
+	std::mutex seg_pub_mutex;
+	struct xrt_segment_metrics seg_pub;          //!< the table the last weave took (count 0 = one view set)
+	struct xrt_segment_view_routing seg_route;   //!< the routing the last locate handed out
+	struct comp_d3d11_eff_layout seg_route_logged; //!< change-only logging of the routed layout
 
 	//! System devices (for qwerty driver keyboard input and display mode toggle).
 	struct xrt_system_devices *xsysd;
@@ -2156,6 +2166,85 @@ d3d11_hash_target(ID3D11Device *device,
  * re-reads an app-owned texture and never ticks a per-frame state machine — see
  * d3d11_composite_zone_mask, and the D3D12 leg for what happens when it does.
  */
+/*!
+ * Multi-screen M3: turn the routing the last xrLocateViews handed out into
+ * per-segment tile rects on this frame's effective layout. The D3D11 twin of
+ * vk_route_effective_layout: on any inconsistency (a segment's views past
+ * what the layer submitted, a degenerate rect) the routing is dropped for the
+ * frame and the tiles are painted unrouted.
+ */
+static void
+d3d11_route_effective_layout(struct comp_d3d11_compositor *c, uint32_t layer_view_count)
+{
+	struct xrt_segment_view_routing r;
+	{
+		std::lock_guard<std::mutex> seg_lock(c->seg_pub_mutex);
+		r = c->seg_route;
+	}
+	struct comp_d3d11_eff_layout *L = &c->eff_layout;
+	L->route_count = 0;
+	if (r.count == 0 || r.count > XRT_MAX_SEGMENTS || L->views == 0 || L->tile_w == 0 || L->tile_h == 0) {
+		return;
+	}
+	const struct comp_seg_rect canvas = {
+	    r.canvas.offset.w,
+	    r.canvas.offset.h,
+	    (uint32_t)(r.canvas.extent.w > 0 ? r.canvas.extent.w : 0),
+	    (uint32_t)(r.canvas.extent.h > 0 ? r.canvas.extent.h : 0),
+	};
+	for (uint32_t k = 0; k < r.count; k++) {
+		// Across a 2D<->3D toggle the mode (tile count) can change between
+		// the locate and this commit: route the views the tiles can hold.
+		const uint32_t n = r.view_count[k] < L->views ? r.view_count[k] : L->views;
+		if (n == 0 || r.first_view[k] + n > layer_view_count) {
+			return;
+		}
+		const struct comp_seg_rect seg = {
+		    r.rect[k].offset.w,
+		    r.rect[k].offset.h,
+		    (uint32_t)(r.rect[k].extent.w > 0 ? r.rect[k].extent.w : 0),
+		    (uint32_t)(r.rect[k].extent.h > 0 ? r.rect[k].extent.h : 0),
+		};
+		struct comp_seg_rect tr;
+		if (!comp_segments_tile_rect(&seg, &canvas, L->tile_w, L->tile_h, &tr)) {
+			return;
+		}
+		L->route[k].first_view = r.first_view[k];
+		L->route[k].view_count = n;
+		L->route[k].x = tr.x;
+		L->route[k].y = tr.y;
+		L->route[k].w = tr.w;
+		L->route[k].h = tr.h;
+	}
+	L->route_count = r.count;
+
+	// One INFO line per routing change (a move, a resize, a mode switch).
+	if (memcmp(L->route, c->seg_route_logged.route, sizeof(L->route)) != 0 ||
+	    L->route_count != c->seg_route_logged.route_count || L->tile_w != c->seg_route_logged.tile_w ||
+	    L->tile_h != c->seg_route_logged.tile_h) {
+		c->seg_route_logged = *L;
+		U_LOG_I("segments: per-segment views routed — %u segment(s) x %u view(s), tile %ux%u; [0] views %u.. "
+		        "at %d,%d %ux%u; [1] views %u.. at %d,%d %ux%u",
+		        L->route_count, L->views, L->tile_w, L->tile_h, L->route[0].first_view, L->route[0].x,
+		        L->route[0].y, L->route[0].w, L->route[0].h, L->route_count > 1 ? L->route[1].first_view : 0,
+		        L->route_count > 1 ? L->route[1].x : 0, L->route_count > 1 ? L->route[1].y : 0,
+		        L->route_count > 1 ? L->route[1].w : 0, L->route_count > 1 ? L->route[1].h : 0);
+	}
+}
+
+//! The projection-class layer's submitted view count (what routing may index).
+static uint32_t
+d3d11_projection_layer_view_count(const struct comp_layer_accum *layers)
+{
+	for (uint32_t i = 0; i < layers->layer_count; i++) {
+		const enum xrt_layer_type t = layers->layers[i].data.type;
+		if (t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH) {
+			return layers->layers[i].data.view_count;
+		}
+	}
+	return 0;
+}
+
 static bool
 d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 {
@@ -2591,15 +2680,19 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 	bool seg_split = false;
 	if (!zero_copy && !c->split_active && !eff_canvas.valid && c->have_seg_window && c->seg_screens != nullptr &&
 	    atlas_srv != nullptr) {
-		if (c->seg_rebuild) {
-			comp_d3d11_segments_destroy(&c->segments);
-			c->seg_rebuild = false;
-		}
-		if (c->segments == nullptr) {
-			c->segments = comp_d3d11_segments_create(d3d11_out_device(c));
-			if (c->segments != nullptr) {
-				comp_d3d11_segments_set_screens(c->segments, c->seg_screens, c->seg_sys_info,
-				                                c->seg_pinned_display_id);
+		if (c->seg_rebuild || c->segments == nullptr) {
+			// The app thread reads c->segments for eyes (M3): swap under the lock.
+			std::lock_guard<std::mutex> seg_lock(c->seg_pub_mutex);
+			if (c->seg_rebuild) {
+				comp_d3d11_segments_destroy(&c->segments);
+				c->seg_rebuild = false;
+			}
+			if (c->segments == nullptr) {
+				c->segments = comp_d3d11_segments_create(d3d11_out_device(c));
+				if (c->segments != nullptr) {
+					comp_d3d11_segments_set_screens(c->segments, c->seg_screens, c->seg_sys_info,
+					                                c->seg_pinned_display_id);
+				}
 			}
 		}
 		if (comp_d3d11_segments_enabled(c->segments)) {
@@ -2611,6 +2704,29 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 			// Every segment DP follows the session's 2D/3D mode, like the primary.
 			comp_d3d11_segments_set_display_mode(c->segments, c->hardware_display_3d);
 		}
+	}
+
+	/*
+	 * Multi-screen M3: publish the table this weave took, for the next
+	 * xrLocateViews to frame per-segment views from. Nothing is published
+	 * (count 0 = one view set) unless the window really is woven per segment.
+	 */
+	{
+		struct xrt_segment_metrics m;
+		memset(&m, 0, sizeof(m));
+		if (seg_split) {
+			const struct comp_seg_rect canvas = {0, 0, c->seg_window.w, c->seg_window.h};
+			(void)comp_d3d11_segments_get_metrics(c->segments, &c->seg_window, &canvas,
+			                                      c->display_processor != nullptr, &m);
+		}
+		std::lock_guard<std::mutex> seg_lock(c->seg_pub_mutex);
+		m.generation = c->seg_pub.generation;
+		struct xrt_segment_metrics prev = c->seg_pub;
+		prev.generation = m.generation;
+		if (memcmp(&prev, &m, sizeof(m)) != 0) {
+			m.generation++;
+		}
+		c->seg_pub = m;
 	}
 
 	if (seg_split) {
@@ -3464,6 +3580,8 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// and the capture providers — they must all agree on the frame's
 	// geometry.
 	comp_d3d11_renderer_compute_effective_layout(c->renderer, &c->layer_accum, &c->eff_layout);
+	// Multi-screen M3: per-segment views -> a mosaic per tile (no-op unless routed).
+	d3d11_route_effective_layout(c, d3d11_projection_layer_view_count(&c->layer_accum));
 
 	// Zero-copy check: can we pass the app's swapchain directly to the DP?
 	//
@@ -3567,6 +3685,13 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
+
+	// Multi-screen M3: a routed frame is a mosaic the renderer must paint; the
+	// app's swapchain image can never be handed to the DP as-is.
+	if (c->eff_layout.route_count > 0) {
+		zero_copy = false;
+		zc_srv = nullptr;
+	}
 
 	// No CPU-side wait for the app's GPU work here, by design: the app renders
 	// on this same immediate context, and D3D11 executes it in submission order,
@@ -8390,6 +8515,50 @@ comp_d3d11_compositor_set_screens(struct xrt_compositor *xc,
 	free(c->seg_sys_info);
 	c->seg_sys_info = info_copy;
 	c->seg_pinned_display_id = pinned_display_id;
+	// ...and nothing may frame views from the old table meanwhile.
+	std::lock_guard<std::mutex> seg_lock(c->seg_pub_mutex);
+	memset(&c->seg_pub, 0, sizeof(c->seg_pub));
+}
+
+extern "C" bool
+comp_d3d11_compositor_get_segment_metrics(struct xrt_compositor *xc, struct xrt_segment_metrics *out)
+{
+	if (out == nullptr) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+	if (xc == nullptr) {
+		return false;
+	}
+	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+	std::lock_guard<std::mutex> seg_lock(c->seg_pub_mutex);
+	*out = c->seg_pub;
+	// The eyes are predicted NOW, per segment: the primary from the session's
+	// own DP, every other screen from its segment DP (guarded against the
+	// weave destroying it: the manager is swapped under this same lock).
+	for (uint32_t k = 0; k < out->count && k < XRT_MAX_SEGMENTS; k++) {
+		struct xrt_segment_metric *s = &out->seg[k];
+		if (s->is_primary) {
+			s->have_eyes = c->display_processor != nullptr &&
+			               xrt_display_processor_d3d11_get_predicted_eye_positions(c->display_processor,
+			                                                                      &s->eyes) &&
+			               s->eyes.valid;
+		} else {
+			s->have_eyes = comp_d3d11_segments_get_eyes(c->segments, s->screen_id, &s->eyes);
+		}
+	}
+	return out->count > 0;
+}
+
+extern "C" void
+comp_d3d11_compositor_set_view_routing(struct xrt_compositor *xc, const struct xrt_segment_view_routing *routing)
+{
+	if (xc == nullptr || routing == nullptr) {
+		return;
+	}
+	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+	std::lock_guard<std::mutex> seg_lock(c->seg_pub_mutex);
+	c->seg_route = *routing;
 }
 
 extern "C" void

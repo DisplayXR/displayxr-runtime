@@ -181,6 +181,14 @@ deferred-release list because the immediate context executes in order). What dif
   The service / hosted path is not segmented yet (ADR-035 amendment, M6 second half).
 - **sim_display** implements both slots on D3D11 too, so a two-monitor Windows box with no vendor
   hardware exercises the split path (anaglyph on both halves).
+- **Per-segment views (M3) on Windows** ride the same state-tracker path as Linux: `oxr_system` counts
+  the registry's D3D11 factories for the view-set capacity, `xrLocateViews` reads
+  `comp_d3d11_compositor_get_segment_metrics` (the last weave's table + each segment's eyes, the
+  secondary screen's from its own DP — on a Leia panel the pinned nominal viewer), `xrEndFrame` hands
+  the routing to `comp_d3d11_compositor_set_view_routing`, and the renderer paints each segment's
+  views at that segment's rect inside every tile (the mosaic; quads and equirect2 once per segment
+  with that segment's camera). A routed frame is never zero-copy. This is what makes an untracked
+  second panel render from its own viewer instead of the tracked panel's.
 
 ## Per-segment views (M3)
 

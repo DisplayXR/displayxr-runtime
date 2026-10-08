@@ -3149,6 +3149,14 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 		comp_vk_native_compositor_set_view_routing(&sess->xcn->base, &route);
 	}
 #endif
+#if defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR) && defined(XRT_OS_WINDOWS)
+	// Multi-screen M3 on Windows: same hand-off to the in-process D3D11 compositor.
+	if (sess->is_d3d11_native_compositor && sess->xcn != NULL) {
+		struct xrt_segment_view_routing route;
+		oxr_session_take_segment_view_routing(sess, &route);
+		comp_d3d11_compositor_set_view_routing(&sess->xcn->base, &route);
+	}
+#endif
 
 	xrt_result_t xret;
 	xret = xrt_comp_layer_begin(xc, &data);

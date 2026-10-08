@@ -72,7 +72,7 @@ two_screen_table()
 
 TEST_CASE("view-set capacity: only where a window can ever be split", "[oxr][segment_views]")
 {
-	// No segmenting compositor (Windows/macOS/Android, a service session): 1.
+	// No segmenting compositor (macOS/Android, a non-D3D11 Windows session, a service session): 1.
 	CHECK(oxr_segment_views_set_capacity(0, false) == 1);
 	CHECK(oxr_segment_views_set_capacity(3, false) == 1);
 	// One DP-backed screen (or none): 1 — the pre-M3 count.
