@@ -3230,10 +3230,11 @@ comp_ipc_client_compositor_lift_submit(struct xrt_compositor *xc,
                                        const struct xrt_dp_lift_params *params,
                                        const float *viewpoints,
                                        uint32_t viewpoint_count,
+                                       const struct xrt_lift_view_control *view_control,
                                        uint64_t *out_frame_id)
 {
 	return ipc_client_lift_submit(lift_conn(xc), stream_id, handle, is_dxgi, width, height, source_time, params,
-	                              viewpoints, viewpoint_count, out_frame_id);
+	                              viewpoints, viewpoint_count, view_control, out_frame_id);
 }
 
 xrt_result_t

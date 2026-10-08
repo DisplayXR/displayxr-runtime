@@ -53,6 +53,7 @@ ipc_client_lift_submit(struct ipc_connection *ipc_c,
                        const struct xrt_dp_lift_params *params,
                        const float *viewpoints,
                        uint32_t viewpoint_count,
+                       const struct xrt_lift_view_control *view_control,
                        uint64_t *out_frame_id);
 
 //! @p out_ready false = nothing newer than the last acquire (NOT READY).

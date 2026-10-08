@@ -67,6 +67,11 @@ struct d3d11_lift_result_info
 	uint32_t format; //!< DXGI_FORMAT
 	uint32_t view_count;
 	bool output_realloc; //!< the export texture changed: the caller must re-import it
+	//! ADR-048 echo: viewpoints the result was synthesized for (rect-relative).
+	uint32_t viewpoint_count;
+	float viewpoints[3 * XRT_LIFT_MAX_VIEWS];
+	float rect_center[3];
+	float rect_size[2];
 };
 
 //! One acquired blob result (xrAcquireLiftBlobDXR).
@@ -115,6 +120,9 @@ struct d3d11_lift_pin
  *                         to every TRACKED conversion. Called from the lift
  *                         thread with no lift lock held. May be NULL.
  * @param eyes_ud          user data for @p eyes_fn.
+ * @param nominal_z        the display's nominal viewing distance, metres
+ *                         (<= 0 = 0.5 m) — the viewpoint policy's straight-on
+ *                         viewer (ADR-048).
  */
 struct d3d11_lift *
 d3d11_lift_create(ID3D11Device *svc_device,
@@ -123,7 +131,8 @@ d3d11_lift_create(ID3D11Device *svc_device,
                   void *lift_factory,
                   void *fallback_factory,
                   bool (*eyes_fn)(void *ud, struct xrt_eye_positions *out),
-                  void *eyes_ud);
+                  void *eyes_ud,
+                  float nominal_z);
 
 //! Stop the lift thread, destroy every stream and the lift DP/device.
 void
@@ -157,6 +166,9 @@ d3d11_lift_stream_mode(struct d3d11_lift *lift, uint64_t owner, uint64_t id);
  * Takes the service context mutex internally — call WITHOUT it held.
  * The handle is the service's to close (a duplicated NT handle) unless
  * @p is_dxgi. @p params NULL = the stream's last parameters.
+ * @p view_control NULL = the stream's last policy (initially the ADR-048
+ * defaults). @p frame = the submitting window (centre + size) the viewpoints
+ * are rebased to; NULL / invalid = the panel centre.
  */
 xrt_result_t
 d3d11_lift_submit_handle(struct d3d11_lift *lift,
@@ -170,6 +182,8 @@ d3d11_lift_submit_handle(struct d3d11_lift *lift,
                          const struct xrt_dp_lift_params *params,
                          const float *viewpoints,
                          uint32_t viewpoint_floats,
+                         const struct xrt_lift_view_control *view_control,
+                         const struct xrt_lift_rect_frame *frame,
                          uint64_t *out_frame_id);
 
 /*!
@@ -179,6 +193,8 @@ d3d11_lift_submit_handle(struct d3d11_lift *lift,
  * @p src. The snapshot's long edge is capped at DXR_LIFT_MAX_INPUT_EDGE
  * (default 1920, 0 = off; u_lift_cap_dims) — the result is stretched back into
  * the rect, so consumers must sample it, never assume result size == rect size.
+ * @p view_control / @p frame as for d3d11_lift_submit_handle (@p frame = the
+ * lifted rect's physical centre + size).
  */
 xrt_result_t
 d3d11_lift_submit_srv_locked(struct d3d11_lift *lift,
@@ -193,6 +209,8 @@ d3d11_lift_submit_srv_locked(struct d3d11_lift *lift,
                              uint32_t h,
                              int64_t source_time,
                              const struct xrt_dp_lift_params *params,
+                             const struct xrt_lift_view_control *view_control,
+                             const struct xrt_lift_rect_frame *frame,
                              uint64_t *out_frame_id);
 
 //! Pin the stream's latest result for a service-device read (the weave).

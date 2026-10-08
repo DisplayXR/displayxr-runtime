@@ -24544,6 +24544,47 @@ comp_d3d11_service_compositor_export_transparent_output_fence(struct xrt_composi
  *
  */
 
+/*!
+ * ADR-048: the physical region a lift frame came from — rect @p rect (in the
+ * client window's pixels, @p win_w x @p win_h; NULL = the whole window) of
+ * client @p xc's window, as a centre in display space (metres, +y up) and a
+ * size. Without window metrics (no window, headless connection) the frame is
+ * the panel: centre 0, the display's size, valid = false.
+ */
+static void
+lift_rect_frame(struct d3d11_service_system *sys,
+                struct xrt_compositor *xc,
+                const struct xrt_rect *rect,
+                uint32_t win_w,
+                uint32_t win_h,
+                struct xrt_lift_rect_frame *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->width_m = sys->base.info.display_width_m;
+	out->height_m = sys->base.info.display_height_m;
+	struct xrt_window_metrics wm = {};
+	if (xc == nullptr || xc->destroy != compositor_destroy ||
+	    !comp_d3d11_service_get_client_app_window_metrics(&sys->base, xc, &wm) || !wm.valid ||
+	    wm.window_width_m <= 0.0f || wm.window_height_m <= 0.0f) {
+		return;
+	}
+	out->center[0] = wm.window_center_offset_x_m;
+	out->center[1] = wm.window_center_offset_y_m;
+	out->center[2] = wm.window_center_offset_z_m;
+	out->width_m = wm.window_width_m;
+	out->height_m = wm.window_height_m;
+	if (rect != nullptr && win_w > 0 && win_h > 0) {
+		// Rect fractions of the window (window pixels, y down) -> metres (y up).
+		const float fx = ((float)rect->offset.w + 0.5f * (float)rect->extent.w) / (float)win_w - 0.5f;
+		const float fy = ((float)rect->offset.h + 0.5f * (float)rect->extent.h) / (float)win_h - 0.5f;
+		out->center[0] += fx * wm.window_width_m;
+		out->center[1] -= fy * wm.window_height_m;
+		out->width_m = (float)rect->extent.w / (float)win_w * wm.window_width_m;
+		out->height_m = (float)rect->extent.h / (float)win_h * wm.window_height_m;
+	}
+	out->valid = true;
+}
+
 static const struct xrt_lift_weave_rect *
 lift_binding_for_rect(const struct xrt_lift_weave_rect *rects, uint32_t count, uint32_t rect_index)
 {
@@ -24605,9 +24646,12 @@ lift_weave_rect_batch(struct d3d11_service_system *sys,
 		return true; // nothing visible to lift; nothing to weave either
 	}
 	uint64_t frame_id = 0;
+	struct xrt_lift_rect_frame frame;
+	lift_rect_frame(sys, &c->base.base, &rect, win_w, win_h, &frame);
 	(void)d3d11_lift_submit_srv_locked(lift, owner, b->stream_id, in_srv, in_w, in_h, (uint32_t)x0, (uint32_t)y0,
 	                                   (uint32_t)(x1 - x0), (uint32_t)(y1 - y0), (int64_t)os_monotonic_get_ns(),
-	                                   b->has_params ? &b->params : nullptr, &frame_id);
+	                                   b->has_params ? &b->params : nullptr,
+	                                   b->has_view_control ? &b->view_control : nullptr, &frame, &frame_id);
 
 	const float rx = (float)rect.offset.w, ry = (float)rect.offset.h;
 	const float rw = (float)rect.extent.w, rh = (float)rect.extent.h;
@@ -24709,9 +24753,12 @@ lift_weave_rects_nview(struct d3d11_service_system *sys,
 		const uint32_t x0 = (uint32_t)fx0, y0 = (uint32_t)fy0;
 		const uint32_t w = (uint32_t)(fx1 - fx0), h = (uint32_t)(fy1 - fy0);
 		uint64_t frame_id = 0;
-		(void)d3d11_lift_submit_srv_locked(lift, owner, b->stream_id, crop_srv, packed_w, packed_h, x0, y0, w, h,
-		                                   (int64_t)os_monotonic_get_ns(), b->has_params ? &b->params : nullptr,
-		                                   &frame_id);
+		struct xrt_lift_rect_frame frame;
+		lift_rect_frame(sys, &c->base.base, &r, win_w, win_h, &frame);
+		(void)d3d11_lift_submit_srv_locked(lift, owner, b->stream_id, crop_srv, packed_w, packed_h, x0, y0, w,
+		                                   h, (int64_t)os_monotonic_get_ns(),
+		                                   b->has_params ? &b->params : nullptr,
+		                                   b->has_view_control ? &b->view_control : nullptr, &frame, &frame_id);
 
 		struct d3d11_lift_pin pin = {};
 		if (!d3d11_lift_pin_latest(lift, owner, b->stream_id, &pin) || pin.view_count == 0) {
@@ -31896,8 +31943,9 @@ svc_lift(struct xrt_system_compositor *xsysc)
 	if (sys->lift == nullptr) {
 		void *lift_factory = sys->base.info.dp_factory_d3d11_lift;
 		void *fallback = comp_dp_factory_for_window(&sys->base.info, COMP_DP_PRIMARY_MONITOR, COMP_DP_API_D3D11);
-		sys->lift = d3d11_lift_create(sys->device.get(), sys->context.get(), &sys->immediate_ctx_mutex,
-		                              lift_factory, fallback, svc_lift_eyes, (void *)xsysc);
+		sys->lift =
+		    d3d11_lift_create(sys->device.get(), sys->context.get(), &sys->immediate_ctx_mutex, lift_factory,
+		                      fallback, svc_lift_eyes, (void *)xsysc, sys->base.info.nominal_viewer_z_m);
 		U_LOG_W("[lift] lift module created (lift-only factory %s, fallback factory %s)",
 		        lift_factory != nullptr ? "present" : "absent", fallback != nullptr ? "present" : "absent");
 	}
@@ -31960,6 +32008,7 @@ comp_d3d11_service_lift_release_owner(struct xrt_system_compositor *xsysc, uint6
 
 extern "C" xrt_result_t
 comp_d3d11_service_lift_submit(struct xrt_system_compositor *xsysc,
+                               struct xrt_compositor *xc,
                                uint64_t owner,
                                uint64_t id,
                                xrt_graphics_buffer_handle_t handle,
@@ -31970,6 +32019,7 @@ comp_d3d11_service_lift_submit(struct xrt_system_compositor *xsysc,
                                const struct xrt_dp_lift_params *params,
                                const float *viewpoints,
                                uint32_t viewpoint_floats,
+                               const struct xrt_lift_view_control *view_control,
                                uint64_t *out_frame_id)
 {
 	struct d3d11_lift *l = svc_lift(xsysc);
@@ -31979,8 +32029,11 @@ comp_d3d11_service_lift_submit(struct xrt_system_compositor *xsysc,
 		}
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
+	// ADR-048: the session's window is the frame (the panel when it has none).
+	struct xrt_lift_rect_frame frame;
+	lift_rect_frame(d3d11_service_system_from_xrt(xsysc), xc, nullptr, 0, 0, &frame);
 	return d3d11_lift_submit_handle(l, owner, id, (HANDLE)handle, is_dxgi, w, h, source_time, params, viewpoints,
-	                                viewpoint_floats, out_frame_id);
+	                                viewpoint_floats, view_control, &frame, out_frame_id);
 }
 
 extern "C" xrt_result_t
@@ -32007,6 +32060,10 @@ comp_d3d11_service_lift_acquire(struct xrt_system_compositor *xsysc,
 	out->format = r.format;
 	out->view_count = r.view_count;
 	out->output_realloc = r.output_realloc;
+	out->viewpoint_count = r.viewpoint_count;
+	memcpy(out->viewpoints, r.viewpoints, sizeof(out->viewpoints));
+	memcpy(out->rect_center, r.rect_center, sizeof(out->rect_center));
+	memcpy(out->rect_size, r.rect_size, sizeof(out->rect_size));
 	return xret;
 }
 

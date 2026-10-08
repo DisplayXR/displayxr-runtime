@@ -645,8 +645,9 @@ cmd_probe(int argc, const char **argv)
 		}
 		uint64_t t_submit = os_monotonic_get_ns();
 		uint64_t frame_id = 0;
-		xret = ipc_client_lift_submit(&ipc_c, sid, (xrt_graphics_buffer_handle_t)g.in_handle, false,
-		                              (uint32_t)iw, (uint32_t)ih, (int64_t)i, &params, nullptr, 0, &frame_id);
+		xret =
+		    ipc_client_lift_submit(&ipc_c, sid, (xrt_graphics_buffer_handle_t)g.in_handle, false, (uint32_t)iw,
+		                           (uint32_t)ih, (int64_t)i, &params, nullptr, 0, nullptr, &frame_id);
 		if (xret != XRT_SUCCESS) {
 			printf("%6d submit refused (xrt_result=%d) — retrying next frame\n", i, (int)xret);
 			continue;

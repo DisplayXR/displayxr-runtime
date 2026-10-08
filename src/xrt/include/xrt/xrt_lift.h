@@ -27,6 +27,35 @@ extern "C" {
 //! Max explicit viewpoints per submit (mirrors XR_LIFT_MAX_VIEWS_DXR).
 #define XRT_LIFT_MAX_VIEWS 8
 
+/*!
+ * The viewpoint policy of a stream (XrLiftViewControlDXR, ADR-048). Values
+ * are the XR_DXR_lift enum values (axis 1..3, recenter 0..2); the service
+ * sanitizes them (u_lift_view_control_sanitize).
+ */
+struct xrt_lift_view_control
+{
+	float ipd_factor;
+	float parallax_factor;
+	uint32_t axis_mode;
+	float max_offset_m;
+	uint32_t recenter_mode;
+	float hold_s; //!< < 0 = default
+	float tau_s;  //!< <= 0 = default
+};
+
+/*!
+ * The physical region a lift frame came from (ADR-048): its centre in display
+ * space (metres, panel centre = 0, +y up) and its size. TRACKED and EXPLICIT
+ * viewpoints are rebased to @c center before the module sees them.
+ */
+struct xrt_lift_rect_frame
+{
+	float center[3];
+	float width_m;
+	float height_m;
+	bool valid; //!< false = the panel centre, size unknown
+};
+
 //! One acquired texture result.
 struct xrt_lift_result
 {
@@ -39,6 +68,12 @@ struct xrt_lift_result
 	uint32_t format; //!< DXGI_FORMAT
 	uint32_t view_count;
 	bool output_realloc; //!< export texture changed: re-export it to the caller
+	//! ADR-048 echo: the viewpoints this result was synthesized for, relative
+	//! to @c rect_center (display axes, metres). 0 = none known.
+	uint32_t viewpoint_count;
+	float viewpoints[3 * XRT_LIFT_MAX_VIEWS];
+	float rect_center[3]; //!< display space, metres
+	float rect_size[2];   //!< metres
 };
 
 //! One acquired blob result.
@@ -57,6 +92,8 @@ struct xrt_lift_weave_rect
 	uint32_t rect_index;
 	bool has_params;
 	struct xrt_dp_lift_params params;
+	bool has_view_control; //!< XrLiftViewControlDXR chained (ADR-048)
+	struct xrt_lift_view_control view_control;
 };
 
 //! One stream's counters + effective rate (XrLiftStreamStatsDXR).
