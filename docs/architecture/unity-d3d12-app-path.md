@@ -99,6 +99,16 @@ the VK avatar demo. Two consequences worth knowing on the runtime side:
 - The zones path softens the old "fixed-resolution" caveat: per-**zone** resolution follows
   the zone rect via live realloc, even though per-**eye** stereo topology stays fixed at 2.
 
+## 2D→3D conversion (`XR_DXR_lift`) from the in-process provider
+
+The provider's session is in-process, yet it can use the vendor conversion module: the
+runtime opens a sessionless, lift-only connection to the service on the first lift call and
+runs the ordinary lift calls on it (ADR-049) — one conversion runtime per machine, shared with
+the browser. Results come back as NT handles the provider opens on Unity's D3D12 device
+(`OpenSharedHandle` of the texture and fence, `Wait` on the fence); inputs are D3D12 shared
+textures without a keyed mutex, so the provider completes and double-buffers them (spec §5.3).
+Lifted weave rects stay IPC-only — the provider composes SBS/N-view results into its own eyes.
+
 ## How this differs from a native D3D12 app (`cube_handle_d3d12_win`)
 
 | | `cube_handle_d3d12_win` | Unity D3D12 (provider) |

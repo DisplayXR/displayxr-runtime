@@ -52,3 +52,4 @@
 - [ADR-046](ADR-046-depth-aware-cursor.md) — Depth-aware cursor — opt-in only; the app knows the depth, the runtime places the cursor
 - [ADR-047](ADR-047-multi-screen-segments-and-per-screen-views.md) — Multi-screen — segments and per-screen views
 - [ADR-048](ADR-048-lift-viewpoint-policy.md) — Lift viewpoint policy — window-relative viewpoints, rig gains, axis mode and ease-back are runtime policy
+- [ADR-049](ADR-049-in-process-lift-rides-the-service.md) — In-process lift rides the service — one conversion module per machine, reached over a lift-only connection
