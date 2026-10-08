@@ -678,7 +678,7 @@ webcam is the expensive case (first hardware run: 11.3 Hz, mostly a CPU split of
 
 | Path | What runs | When |
 |---|---|---|
-| **Hardware** (default) | a D3D11 device (`VIDEO_SUPPORT`, multithread-protected) on the adapter that has a hardware MJPEG decoder MFT (matched by PCI vendor; the most dedicated memory wins, `DXR_STEREO_CAMERA_UVC_ADAPTER=<substring>` picks), handed to the reader as `MF_SOURCE_READER_D3D_MANAGER` + `MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS`; NV12 is requested **at the output size**, so the GPU decodes **and** downscales (half-SBS 3840×2160 → 2560×720); one `CopySubresourceRegion` into a staging NV12 texture, an event query polled (not a blocking `Map`, which would hold the device lock MF's decoder needs), one `Map`, copy out, `Unmap`, the sample returned at once | an adapter with a hardware MJPEG decoder exists, and MF actually inserted a hardware decoder (checked after the topology is built; a software decoder behind the device manager is reopened on the software path) |
+| **Hardware** (default) | a D3D11 device (`VIDEO_SUPPORT`, multithread-protected) on the adapter that has a hardware MJPEG decoder MFT (matched by PCI vendor; the most dedicated memory wins, `DXR_STEREO_CAMERA_UVC_ADAPTER=<substring>` picks), handed to the reader as `MF_SOURCE_READER_D3D_MANAGER` + `MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS`; NV12 is requested **at the output size**, so the GPU decodes **and** downscales (half-SBS 3840×2160 → 2560×720) — with an anamorphic output pixel aspect (`PAR_out = PAR_src · src_w·out_h / (src_h·out_w)`, 1:2 here), because the video processor otherwise preserves the display aspect and **letterboxes** (the first real-webcam run got a centred ~1280 px picture between black bars); readback is **pipelined** over a ring of 3 staging NV12 textures: each read queues a `CopySubresourceRegion` + event query and delivers the newest copy that has already finished (waiting, by polling — never a blocking `Map` that would hold the device lock MF's decoder needs — on the older one only when two are in flight), one `Map`, copy out, `Unmap`, the sample returned at once. A synchronous copy measured 22–25 ms per frame on the real webcam (the copy waits behind the decode) and capped it at 36 Hz | an adapter with a hardware MJPEG decoder exists, and MF actually inserted a hardware decoder (checked after the topology is built; a software decoder behind the device manager is reopened on the software path) |
 | **Software** (fallback, one WARN with the reason) | the plain reader; MF's multithreaded MJPEG decoder + video processor, also asked for the output size | no capable adapter, the hardware open failed, or `DXR_STEREO_CAMERA_UVC_DECODER=software` |
 
 `DXR_STEREO_CAMERA_UVC_DECODER=hardware` refuses the fallback (the open fails instead). The service
@@ -688,10 +688,13 @@ MJPEG Video Decoder MFT (hardware), HARDWARE (GPU decode + scale) path, reader o
 --decoder` prints the policy, the decoders registered and the adapter it would use, and
 `displayxr-cli camera uvc-decode-bench <file>` runs a media file (a 4K MJPEG AVI) through the
 identical open / read / split path with requests paced to the file's frame rate — no camera.
-On the development laptop (RTX 3080 + Intel iGPU, a 3840×2160@60 half-SBS MJPEG file, out
-2560×720): hardware NVIDIA 54–58 Hz read rate (the asynchronous decoder runs ahead of a file, so
-some frames are superseded; a sensor-paced camera has no backlog), hardware Intel 60 Hz, software
-with MF scaling 59.9 Hz (0 superseded, CPU-heavy); the source's own 4K → 2 × 1280×720 resample,
+The bench also checks the picture: per eye, the mean luma of the outer 5 % columns against the
+centre, and exits 4 on dark side bars (`tests_uvc_capture_mf` asserts the same through the real
+backend on a generated YUY2 AVI, both policies). On the development laptop (RTX 3080 + Intel iGPU,
+a bright 3840×2160@60 half-SBS MJPEG file, out 2560×720, no bars on any path): hardware Intel
+60.0 Hz (readback 0.7 ms), hardware NVIDIA 51–53 Hz (readback 6–7 ms — a file lets the
+asynchronous NVIDIA MFT decode ~5× ahead of the paced requests and the copies queue behind that
+backlog; a 60 Hz camera has none), software with MF scaling 59.7 Hz (0 superseded, CPU-heavy); the source's own 4K → 2 × 1280×720 resample,
 used only when no scaler is available, costs ~25 ms (was ~110 ms), a pre-scaled frame 0.3 ms. Linux: V4L2 is a TODO
 (`os_uvc_capture_stubs.c` records the plan); other platforms: none. A config with `"fake": true`
 (or `{"disparity": 0.04, "dy": 0.005, "pixel": "nv12"|"yuy2", "fps": 30}`, fractions of the eye

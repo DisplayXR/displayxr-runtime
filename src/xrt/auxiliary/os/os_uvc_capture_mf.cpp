@@ -660,9 +660,13 @@ struct mf_handle
 	ID3D11Device *dev = nullptr;
 	ID3D11DeviceContext *ctx = nullptr;
 	IMFDXGIDeviceManager *dxgi_mgr = nullptr;
-	ID3D11Texture2D *staging = nullptr;
-	ID3D11Query *copy_done = nullptr;
-	bool mapped = false;
+	//! The pipelined readback ring (read_back_texture).
+	static const int RING = 3;
+	ID3D11Texture2D *ring[RING] = {};
+	ID3D11Query *ring_q[RING] = {};
+	int64_t ring_t[RING] = {};
+	int pend[RING] = {}; //!< slots whose copy is queued, not yet returned (oldest first)
+	int npend = 0;
 	uint8_t *cpu = nullptr; //!< the read-back frame (tight NV12), valid until the next read
 	size_t cpu_size = 0;
 
@@ -681,10 +685,6 @@ struct mf_handle
 void
 unlock_held(mf_handle *h)
 {
-	if (h->mapped) {
-		h->ctx->Unmap(h->staging, 0);
-		h->mapped = false;
-	}
 	if (h->held_2d != nullptr) {
 		h->held_2d->Unlock2D();
 		safe_release(h->held_2d);
@@ -870,7 +870,34 @@ set_output(IMFSourceReader *reader, IMFMediaType *native, const GUID &subtype, u
 		hr = MFSetAttributeRatio(out, MF_MT_FRAME_RATE, num, den);
 	}
 	if (SUCCEEDED(hr)) {
-		hr = MFSetAttributeRatio(out, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+		// The video processor preserves the DISPLAY aspect ratio: asked for
+		// 2560x720 from a 16:9 3840x2160 frame with square pixels it LETTERBOXES
+		// (measured on the real webcam: a centred ~1280 px picture between
+		// black bars). Declare the output's pixels anamorphic so its display
+		// aspect equals the source's — the scale is then a plain per-axis
+		// resize of the whole SBS frame, each half staying its own eye:
+		//   PAR_out = PAR_src * (src_w * out_h) / (src_h * out_w)   (1:2 here)
+		UINT32 pn = 1, pd = 1;
+		if (FAILED(MFGetAttributeRatio(native, MF_MT_PIXEL_ASPECT_RATIO, &pn, &pd)) || pn == 0 || pd == 0) {
+			pn = pd = 1;
+		}
+		const uint32_t ow = w > 0 ? w : nw, oh = h > 0 ? h : nh;
+		uint64_t num = (uint64_t)pn * nw * oh, den = (uint64_t)pd * nh * ow;
+		for (uint64_t a = num, b = den; b != 0;) { // reduce by the gcd
+			uint64_t r = a % b;
+			a = b;
+			b = r;
+			if (b == 0) {
+				num /= a;
+				den /= a;
+			}
+		}
+		while (num > 0xffffffffull || den > 0xffffffffull) {
+			num >>= 1;
+			den >>= 1;
+		}
+		hr = MFSetAttributeRatio(out, MF_MT_PIXEL_ASPECT_RATIO, (UINT32)(num > 0 ? num : 1),
+		                         (UINT32)(den > 0 ? den : 1));
 	}
 	if (SUCCEEDED(hr)) {
 		hr = out->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
@@ -1107,8 +1134,11 @@ teardown_reader(mf_handle *h)
 		h->cb->Release();
 		h->cb = nullptr;
 	}
-	safe_release(h->copy_done);
-	safe_release(h->staging);
+	for (int i = 0; i < mf_handle::RING; i++) {
+		safe_release(h->ring_q[i]);
+		safe_release(h->ring[i]);
+	}
+	h->npend = 0;
 	safe_release(h->dxgi_mgr);
 	safe_release(h->ctx);
 	safe_release(h->dev);
@@ -1178,13 +1208,26 @@ mf_open(void *ctx, const char *id, const u_stereo_uvc_mode *mode, uint32_t out_w
 	return true;
 }
 
-//! Hardware path: copy the decoded (scaled) NV12 texture to staging, Map it.
-bool
-read_back_texture(mf_handle *h, IMFMediaBuffer *buf, u_stereo_uvc_raw_frame *out)
+/*!
+ * Hardware path readback, PIPELINED over a ring of @ref RING staging textures:
+ * this read queues the GPU copy of the frame just decoded into one slot and
+ * returns the frame queued by the PREVIOUS read, whose copy has long finished
+ * — so the readback overlaps the decode of the next frame instead of waiting
+ * for it (a synchronous copy + Map measured 22-25 ms per 4K MJPEG frame on
+ * the real webcam: the copy waits behind the decode). Cost: one frame of
+ * latency. The very first read only primes the ring.
+ * @return 1 = @p out holds a frame (stamped @p out_t), 0 = primed (no frame
+ *         yet), -1 = not a DXGI texture / failure (caller locks the buffer).
+ */
+int
+map_slot(mf_handle *h, int take, int64_t t0, u_stereo_uvc_raw_frame *out, int64_t *out_t);
+
+int
+read_back_texture(mf_handle *h, IMFMediaBuffer *buf, int64_t t_ns, u_stereo_uvc_raw_frame *out, int64_t *out_t)
 {
 	IMFDXGIBuffer *db = nullptr;
 	if (FAILED(buf->QueryInterface(IID_PPV_ARGS(&db)))) {
-		return false;
+		return -1;
 	}
 	ID3D11Texture2D *tex = nullptr;
 	UINT sub = 0;
@@ -1192,78 +1235,120 @@ read_back_texture(mf_handle *h, IMFMediaBuffer *buf, u_stereo_uvc_raw_frame *out
 	safe_release(db);
 	if (!ok) {
 		safe_release(tex);
-		return false;
+		return -1;
 	}
 	D3D11_TEXTURE2D_DESC td;
 	tex->GetDesc(&td);
 	if (td.Format != DXGI_FORMAT_NV12 || td.Width < h->width || td.Height < h->height) {
 		safe_release(tex);
-		return false;
+		return -1;
 	}
-	if (h->staging == nullptr) {
-		D3D11_TEXTURE2D_DESC sd = {};
-		sd.Width = h->width;
-		sd.Height = h->height;
-		sd.MipLevels = 1;
-		sd.ArraySize = 1;
-		sd.Format = DXGI_FORMAT_NV12;
-		sd.SampleDesc.Count = 1;
-		sd.Usage = D3D11_USAGE_STAGING;
-		sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-		if (FAILED(h->dev->CreateTexture2D(&sd, nullptr, &h->staging))) {
-			safe_release(tex);
-			return false;
+	for (int i = 0; i < mf_handle::RING; i++) {
+		if (h->ring[i] == nullptr) {
+			D3D11_TEXTURE2D_DESC sd = {};
+			sd.Width = h->width;
+			sd.Height = h->height;
+			sd.MipLevels = 1;
+			sd.ArraySize = 1;
+			sd.Format = DXGI_FORMAT_NV12;
+			sd.SampleDesc.Count = 1;
+			sd.Usage = D3D11_USAGE_STAGING;
+			sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+			D3D11_QUERY_DESC qd = {D3D11_QUERY_EVENT, 0};
+			if (FAILED(h->dev->CreateTexture2D(&sd, nullptr, &h->ring[i])) ||
+			    FAILED(h->dev->CreateQuery(&qd, &h->ring_q[i]))) {
+				safe_release(tex);
+				return -1;
+			}
 		}
 	}
 	const int64_t t0 = os_monotonic_get_ns();
-	D3D11_BOX box = {0, 0, 0, h->width, h->height, 1};
-	h->ctx->CopySubresourceRegion(h->staging, 0, 0, 0, 0, tex, sub, &box);
-	safe_release(tex);
-	// Wait for the copy by polling an event query instead of a blocking Map:
-	// the device is multithread-protected and shared with MF's decoder, and a
-	// Map that waits on the GPU would hold the device lock the decoder needs
-	// to submit the next frame.
-	if (h->copy_done == nullptr) {
-		D3D11_QUERY_DESC qd = {D3D11_QUERY_EVENT, 0};
-		h->dev->CreateQuery(&qd, &h->copy_done);
+	// Queue this frame's copy into a free slot (the GPU orders it after the
+	// decode that wrote the texture; the decoder may reuse the texture after).
+	int s = -1;
+	for (int c = 0; c < mf_handle::RING && s < 0; c++) {
+		bool used = false;
+		for (int k = 0; k < h->npend; k++) {
+			used |= h->pend[k] == c;
+		}
+		s = used ? -1 : c;
 	}
-	if (h->copy_done != nullptr) {
-		h->ctx->End(h->copy_done);
-		h->ctx->Flush();
-		const int64_t give_up = os_monotonic_get_ns() + 100ll * 1000 * 1000;
-		while (h->ctx->GetData(h->copy_done, nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_FALSE &&
-		       os_monotonic_get_ns() < give_up) {
-			Sleep(0);
+	if (s < 0) { // cannot happen (at most RING - 1 pending): reset the ring
+		h->npend = 0;
+		s = 0;
+	}
+	D3D11_BOX box = {0, 0, 0, h->width, h->height, 1};
+	h->ctx->CopySubresourceRegion(h->ring[s], 0, 0, 0, 0, tex, sub, &box);
+	safe_release(tex);
+	h->ctx->End(h->ring_q[s]);
+	h->ctx->Flush();
+	h->ring_t[s] = t_ns;
+	h->pend[h->npend++] = s;
+	// Deliver the NEWEST copy that has already finished — possibly this very
+	// frame when the GPU is quick — and drop the older ones (latest wins).
+	for (int k = h->npend - 1; k >= 0; k--) {
+		if (h->ctx->GetData(h->ring_q[h->pend[k]], nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK) {
+			const int take = h->pend[k];
+			const int remain = h->npend - 1 - k;
+			for (int r = 0; r < remain; r++) {
+				h->pend[r] = h->pend[k + 1 + r];
+			}
+			h->npend = remain;
+			return map_slot(h, take, t0, out, out_t);
 		}
 	}
-	D3D11_MAPPED_SUBRESOURCE m = {};
-	if (FAILED(h->ctx->Map(h->staging, 0, D3D11_MAP_READ, 0, &m))) {
-		return false;
+	// None finished yet. With two copies in flight, wait for the older one (it
+	// was queued a frame ago); with one, the frame comes out on a later read.
+	if (h->npend >= 2) {
+		const int take = h->pend[0];
+		for (int r = 0; r + 1 < h->npend; r++) {
+			h->pend[r] = h->pend[r + 1];
+		}
+		h->npend--;
+		return map_slot(h, take, t0, out, out_t);
 	}
-	// Copy out and Unmap at once: neither the staging texture nor (after the
-	// caller releases it) the decoder's sample is held while the frame is
-	// consumed — a hardware decoder's output pool is small, and a held map /
-	// sample can stall it.
+	return 0;
+}
+
+/*!
+ * Map ring slot @p take (its copy was queued earlier), copy the frame out to
+ * h->cpu, Unmap. 1 = frame in @p out, -1 = failure.
+ */
+int
+map_slot(mf_handle *h, int take, int64_t t0, u_stereo_uvc_raw_frame *out, int64_t *out_t)
+{
+	// The previous copy: normally done long ago. Poll (never a blocking Map:
+	// the device is multithread-protected and shared with MF's decoder).
+	const int64_t give_up = os_monotonic_get_ns() + 100ll * 1000 * 1000;
+	while (h->ctx->GetData(h->ring_q[take], nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_FALSE &&
+	       os_monotonic_get_ns() < give_up) {
+		Sleep(0);
+	}
+	D3D11_MAPPED_SUBRESOURCE m = {};
+	if (FAILED(h->ctx->Map(h->ring[take], 0, D3D11_MAP_READ, 0, &m))) {
+		return -1;
+	}
+	// Copy out and Unmap at once: no staging texture or decoder sample is held
+	// while the frame is consumed.
 	const size_t pitch = h->width;
 	const size_t need = pitch * h->height * 3 / 2;
 	if (h->cpu_size < need) {
 		uint8_t *nb = (uint8_t *)std::realloc(h->cpu, need);
 		if (nb == nullptr) {
-			h->ctx->Unmap(h->staging, 0);
-			return false;
+			h->ctx->Unmap(h->ring[take], 0);
+			return -1;
 		}
 		h->cpu = nb;
 		h->cpu_size = need;
 	}
-	const uint8_t *src_uv =
-	    (const uint8_t *)m.pData + (size_t)m.RowPitch * h->height; // UV follows Y in staging NV12
+	const uint8_t *src_uv = (const uint8_t *)m.pData + (size_t)m.RowPitch * h->height; // UV follows Y
 	for (uint32_t y = 0; y < h->height; y++) {
 		std::memcpy(h->cpu + y * pitch, (const uint8_t *)m.pData + (size_t)y * m.RowPitch, pitch);
 	}
 	for (uint32_t y = 0; y < h->height / 2; y++) {
 		std::memcpy(h->cpu + (h->height + y) * pitch, src_uv + (size_t)y * m.RowPitch, pitch);
 	}
-	h->ctx->Unmap(h->staging, 0);
+	h->ctx->Unmap(h->ring[take], 0);
 	h->readback_ns += os_monotonic_get_ns() - t0;
 	out->pixel = U_STEREO_UVC_PIXEL_NV12;
 	out->width = h->width;
@@ -1272,7 +1357,8 @@ read_back_texture(mf_handle *h, IMFMediaBuffer *buf, u_stereo_uvc_raw_frame *out
 	out->pitches[0] = (uint32_t)pitch;
 	out->planes[1] = h->cpu + pitch * h->height;
 	out->pitches[1] = (uint32_t)pitch;
-	return true;
+	*out_t = h->ring_t[take];
+	return 1;
 }
 
 uint32_t
@@ -1307,6 +1393,20 @@ mf_read(void *handle, int64_t timeout_ns, u_stereo_uvc_raw_frame *out)
 	DWORD fail_flags = h->cb->fail_flags_;
 	const unsigned long long delivered = h->cb->delivered_, superseded = h->cb->dropped_;
 	LeaveCriticalSection(&h->cb->lock_);
+	if (sample == nullptr && h->hw && h->npend > 0) {
+		// No newer frame within the timeout (end of a file, a paused camera):
+		// deliver the newest one still in the readback ring rather than lose it.
+		const int take = h->pend[h->npend - 1];
+		h->npend = 0;
+		std::memset(out, 0, sizeof(*out));
+		int64_t t_take = 0;
+		if (map_slot(h, take, os_monotonic_get_ns(), out, &t_take) > 0) {
+			out->time_ns = t_take;
+			out->time_is_exposure = false;
+			h->frames++;
+			return U_STEREO_UVC_READ_OK;
+		}
+	}
 	if (sample == nullptr) {
 		if (failed) {
 			U_LOG_W(
@@ -1328,7 +1428,12 @@ mf_read(void *handle, int64_t timeout_ns, u_stereo_uvc_raw_frame *out)
 		return U_STEREO_UVC_READ_TIMEOUT;
 	}
 	std::memset(out, 0, sizeof(*out));
-	if (h->hw && read_back_texture(h, h->held_buf, out)) {
+	const int rb = h->hw ? read_back_texture(h, h->held_buf, t_ns, out, &t_ns) : -1;
+	if (rb == 0) {
+		unlock_held(h); // primed: the copy is queued, the sample can go back to the decoder
+		return U_STEREO_UVC_READ_TIMEOUT;
+	}
+	if (rb > 0) {
 		unlock_held(h); // the frame is in h->cpu now: give the sample back to the decoder
 		out->time_ns = t_ns;
 		out->time_is_exposure = false;

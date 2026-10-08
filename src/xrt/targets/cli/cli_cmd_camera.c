@@ -1536,11 +1536,17 @@ cmd_uvc_decode_bench(int argc, const char **argv)
 	       layout == U_STEREO_UVC_LAYOUT_SBS_FULL ? "sbs-full" : "sbs-half", ew, eh, 2 * ew, eh);
 	uint32_t frames = 0, raw_w = 0, raw_h = 0;
 	int64_t read_ns = 0, split_ns = 0, lat_ns = 0, t_first = 0, t_last = 0;
+	const int64_t t_start = os_monotonic_get_ns();
 	while (frames < max_frames) {
 		struct u_stereo_uvc_raw_frame raw;
 		int64_t t0 = os_monotonic_get_ns();
-		uint32_t r = b.read(h, 2000ll * 1000 * 1000, &raw); // 2 s with no frame = the file ended
+		uint32_t r = b.read(h, 100ll * 1000 * 1000, &raw);
 		int64_t t1 = os_monotonic_get_ns();
+		// A TIMEOUT is not the end (the GPU path's first read only primes its
+		// readback ring): stop after 2 s without a frame, or on ERROR (end of file).
+		if (r == U_STEREO_UVC_READ_TIMEOUT && t1 - (frames > 0 ? t_last : t_start) < 2000ll * 1000 * 1000) {
+			continue;
+		}
 		if (r != U_STEREO_UVC_READ_OK) {
 			if (verbose) {
 				printf("  read #%u -> %s after %.2f ms\n", frames,
@@ -1572,6 +1578,37 @@ cmd_uvc_decode_bench(int argc, const char **argv)
 		frames++;
 	}
 	b.close(h);
+	// Image-content check of the last delivered SBS frame: per eye, the mean
+	// luma of its outer 5 % columns against its centre half. A letterboxed /
+	// pillarboxed scale (black side bars) shows as dark edges — meaningful on
+	// a test file whose picture is bright edge to edge.
+	bool bars = false;
+	if (frames > 0) {
+		const uint32_t edge = ew / 20 > 0 ? ew / 20 : 1;
+		for (uint32_t e = 0; e < 2; e++) {
+			double sum[3] = {0, 0, 0};
+			uint64_t cnt[3] = {0, 0, 0};
+			for (uint32_t y = 0; y < eh; y++) {
+				const uint8_t *row = dst + lay.offset[0] + (size_t)y * lay.pitch[0] + (size_t)e * ew;
+				for (uint32_t x = 0; x < ew; x++) {
+					int k = x < edge                          ? 0
+					        : x >= ew - edge                  ? 2
+					        : (x >= ew / 4 && x < ew * 3 / 4) ? 1
+					                                          : -1;
+					if (k >= 0) {
+						sum[k] += row[x];
+						cnt[k]++;
+					}
+				}
+			}
+			double l = sum[0] / (double)cnt[0], c = sum[1] / (double)cnt[1], r = sum[2] / (double)cnt[2];
+			bool dark = c > 40.0 && (l < 0.5 * c || r < 0.5 * c);
+			bars |= dark;
+			printf("content check, %s eye: mean luma outer-left %.1f / centre %.1f / outer-right %.1f%s\n",
+			       e == 0 ? "left" : "right", l, c, r,
+			       dark ? "  <- DARK SIDE BARS (letterboxed scale?)" : "");
+		}
+	}
 	free(dst);
 	if (frames < 2) {
 		printf("decoded %u frame(s) — nothing to measure\n", frames);
@@ -1588,6 +1625,10 @@ cmd_uvc_decode_bench(int argc, const char **argv)
 	    "latency %.2f ms\n",
 	    (double)read_ns / (frames - 1) * 1e-6, (double)split_ns / (frames - 1) * 1e-6,
 	    (double)lat_ns / (frames - 1) * 1e-6);
+	if (bars) {
+		printf("FAIL: dark side bars in the delivered frame — the scale is not a plain resize\n");
+		return 4;
+	}
 	return 0;
 }
 
