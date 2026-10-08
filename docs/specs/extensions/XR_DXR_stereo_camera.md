@@ -647,8 +647,8 @@ cameras are enumerated first, and a device whose OS id, or whose USB VID:PID, eq
 camera's `platformDeviceHint` (e.g. `"04f2:b70c"`) is skipped.
 
 **Frames.** The backend delivers decoded NV12 or YUY2 (Windows: an async `IMFSourceReader` with
-advanced video processing, so MJPEG is decoded by the system's MJPEG decoder MFT; the reader
-keeps only the newest sample). The source splits each frame into an NV12 SBS image of two
+advanced video processing; the reader keeps only the newest sample) — preferably already at the
+output size, 2 × eye width × eye height (below). The source splits each frame into an NV12 SBS image of two
 square-pixel eyes, LEFT lens left: SBS_FULL eyes are `(W/2) × H`, SBS_HALF eyes `(W/2) × (H/2)`
 (a 2:1-squeezed half carries that much information; the vertical 2:1 is an exact two-row
 average), both capped at 1280 px wide with the aspect kept, unless `eye_size` says otherwise
@@ -672,8 +672,27 @@ i.e. the squeezed half for SBS_HALF — an anisotropic K is fine), optional
 `distortion_model: fisheye` for 4-coefficient KB4; 4–5 coefficients are RADTAN5, 8 RADTAN8. A
 file that cannot be read or parsed is logged and the nominal model is used.
 
-**Backends.** Windows: Media Foundation (`mf`, `mfplat`, `mfreadwrite`, `mfuuid`, linked only into
-the service and `displayxr-cli`, via `aux_os_uvc`). Linux: V4L2 is a TODO
+**Backends.** Windows: Media Foundation (`mf`, `mfplat`, `mfreadwrite`, `mfuuid`, `d3d11`, `dxgi`,
+linked only into the service and `displayxr-cli`, via `aux_os_uvc`). **Decode path** — a 4K60 MJPEG
+webcam is the expensive case (first hardware run: 11.3 Hz, mostly a CPU split of the full 4K frame):
+
+| Path | What runs | When |
+|---|---|---|
+| **Hardware** (default) | a D3D11 device (`VIDEO_SUPPORT`, multithread-protected) on the adapter that has a hardware MJPEG decoder MFT (matched by PCI vendor; the most dedicated memory wins, `DXR_STEREO_CAMERA_UVC_ADAPTER=<substring>` picks), handed to the reader as `MF_SOURCE_READER_D3D_MANAGER` + `MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS`; NV12 is requested **at the output size**, so the GPU decodes **and** downscales (half-SBS 3840×2160 → 2560×720); one `CopySubresourceRegion` into a staging NV12 texture, an event query polled (not a blocking `Map`, which would hold the device lock MF's decoder needs), one `Map`, copy out, `Unmap`, the sample returned at once | an adapter with a hardware MJPEG decoder exists, and MF actually inserted a hardware decoder (checked after the topology is built; a software decoder behind the device manager is reopened on the software path) |
+| **Software** (fallback, one WARN with the reason) | the plain reader; MF's multithreaded MJPEG decoder + video processor, also asked for the output size | no capable adapter, the hardware open failed, or `DXR_STEREO_CAMERA_UVC_DECODER=software` |
+
+`DXR_STEREO_CAMERA_UVC_DECODER=hardware` refuses the fallback (the open fails instead). The service
+logs which ran, per open: `uvc capture (Media Foundation): started 3840x2160@60.00 — decoder NVIDIA
+MJPEG Video Decoder MFT (hardware), HARDWARE (GPU decode + scale) path, reader output NV12
+2560x720`, and at close the frame count and mean readback. `displayxr-cli camera uvc-devices
+--decoder` prints the policy, the decoders registered and the adapter it would use, and
+`displayxr-cli camera uvc-decode-bench <file>` runs a media file (a 4K MJPEG AVI) through the
+identical open / read / split path with requests paced to the file's frame rate — no camera.
+On the development laptop (RTX 3080 + Intel iGPU, a 3840×2160@60 half-SBS MJPEG file, out
+2560×720): hardware NVIDIA 54–58 Hz read rate (the asynchronous decoder runs ahead of a file, so
+some frames are superseded; a sensor-paced camera has no backlog), hardware Intel 60 Hz, software
+with MF scaling 59.9 Hz (0 superseded, CPU-heavy); the source's own 4K → 2 × 1280×720 resample,
+used only when no scaler is available, costs ~25 ms (was ~110 ms), a pre-scaled frame 0.3 ms. Linux: V4L2 is a TODO
 (`os_uvc_capture_stubs.c` records the plan); other platforms: none. A config with `"fake": true`
 (or `{"disparity": 0.04, "dy": 0.005, "pixel": "nv12"|"yuy2", "fps": 30}`, fractions of the eye
 width / height) REPLACES real capture with a synthetic device ("DisplayXR synthetic SBS camera",
@@ -681,7 +700,7 @@ id `dxr-fake-uvc`) that renders a known disparity and a known right-eye vertical
 layout — the hardware-free path through the whole manager (`tests_stereo_camera_manager`, and
 `camera probe --rectified` against a service on any OS).
 
-**Diagnostics.** `displayxr-cli camera list` tags each camera `(source: plugin|uvc)` (`"source"` in
+**Diagnostics.** (See also the decode-path tools above.) `displayxr-cli camera list` tags each camera `(source: plugin|uvc)` (`"source"` in
 `--json`; the wire carries it in the former `reserved` word of the properties — the OpenXR struct
 is unchanged). `displayxr-cli camera uvc-devices [--modes]` runs locally (no service): the config
 path and parse result, every capture device present with its VID:PID and OS id, which entry
@@ -735,7 +754,8 @@ The whole path (enumerate → consent → start → acquire → rectify) then ru
 
 ```
 displayxr-cli camera list [--json]                    # properties + state + source (plugin|uvc) of every camera
-displayxr-cli camera uvc-devices [--modes]            # §9a: UVC webcam config + devices (local, no service)
+displayxr-cli camera uvc-devices [--modes] [--decoder]  # §9a: UVC webcam config + devices + decode path (local)
+displayxr-cli camera uvc-decode-bench <file>          # §9a: a media file through the webcam decode path
 displayxr-cli camera calib <id> [--raw|--rectified] [--json]
 displayxr-cli camera probe [<id>] [--raw] [--format gray8|nv12|bgra8] [--fps F]
                               [--frames N] [--seconds S] [--out DIR]

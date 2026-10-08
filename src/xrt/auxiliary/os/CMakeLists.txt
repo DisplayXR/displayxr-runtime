@@ -106,7 +106,9 @@ if(WIN32)
 	target_sources(aux_os_uvc PRIVATE os_uvc_capture_mf.cpp)
 	# mf: MFEnumDeviceSources / MFCreateDeviceSource; mfplat: MFStartup, media
 	# types; mfreadwrite: the source reader; mfuuid: the MF GUIDs.
-	target_link_libraries(aux_os_uvc PRIVATE mf mfplat mfreadwrite mfuuid ole32)
+	# d3d11 + dxgi: the hardware MJPEG decode path (IMFDXGIDeviceManager on the
+	# adapter that has a hardware MJPEG decoder MFT; staging readback).
+	target_link_libraries(aux_os_uvc PRIVATE mf mfplat mfreadwrite mfuuid ole32 d3d11 dxgi)
 else()
 	# Desktop Linux: V4L2 is a TODO (see the file); everything else has none.
 	target_sources(aux_os_uvc PRIVATE os_uvc_capture_stubs.c)
