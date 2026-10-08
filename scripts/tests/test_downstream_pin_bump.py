@@ -129,8 +129,11 @@ class ManifestTests(unittest.TestCase):
     def test_default_surface_covers_every_dp_header(self):
         # A new graphics-API DP header that is not listed would be invisible to
         # the features gate -- its new slots would never trigger a repin.
+        # xrt_dp_*.h are DP-side contracts (e.g. xrt_dp_lift.h) whose XRT_DP_*_HAS_*
+        # macros gate plug-in code exactly like the per-API vtable headers.
+        inc = REPO_ROOT / "src/xrt/include/xrt"
         on_disk = {"src/xrt/include/xrt/" + p.name
-                   for p in (REPO_ROOT / "src/xrt/include/xrt").glob("xrt_display_processor*.h")}
+                   for pat in ("xrt_display_processor*.h", "xrt_dp_*.h") for p in inc.glob(pat)}
         missing = on_disk - set(self.man["feature_surface"]["headers"])
         self.assertFalse(missing, "add to downstream-pins.json feature_surface.headers: %s" % sorted(missing))
 
