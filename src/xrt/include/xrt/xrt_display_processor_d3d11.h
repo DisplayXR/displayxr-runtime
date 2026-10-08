@@ -635,8 +635,12 @@ struct xrt_display_processor_d3d11
 	 * @param input_resource  ID3D11Resource* on the lift device, RGBA8, exactly
 	 *                        @p w x @p h. Valid for the duration of the call.
 	 * @param p               per-frame parameters (never NULL).
-	 * @param viewpoints_xyz  @p viewpoint_floats / 3 display-space eye positions
-	 *                        (metres) to synthesize for. The runtime ALWAYS
+	 * @param viewpoints_xyz  @p viewpoint_floats / 3 eye positions (metres) to
+	 *                        synthesize for, in the frame @p p->viewpoint_frame
+	 *                        names: relative to the lifted RECT's centre from a
+	 *                        runtime with XRT_DP_LIFT_HAS_VIEWPOINT_POLICY (the
+	 *                        viewpoint policy already applied, ADR-048), else
+	 *                        relative to the panel centre. The runtime ALWAYS
 	 *                        passes them when it has them: the app's explicit
 	 *                        viewpoints, else the panel DP's predicted tracked
 	 *                        eyes (the pair; a module spreads N views around

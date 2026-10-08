@@ -99,6 +99,30 @@ struct xrt_dp_lift_stream_info
 	float input_scale;     //!< (0,1]: convert at reduced resolution; 1 = native
 };
 
+/*!
+ * @name Viewpoint policy (ADR-048) — xrt_dp_lift_params appended fields
+ *
+ * Announced by XRT_DP_LIFT_HAS_VIEWPOINT_POLICY (append-only, ADR-020: no ABI
+ * bump). A plug-in built against it reads the fields only when
+ * xrt_dp_lift_params::struct_size covers them; a runtime that predates them
+ * passes a shorter struct_size and display-frame viewpoints (panel centre).
+ * @{
+ */
+#define XRT_DP_LIFT_HAS_VIEWPOINT_POLICY 1
+
+//! xrt_dp_lift_params::viewpoint_frame: viewpoints are relative to the PANEL
+//! centre (the pre-ADR-048 contract; what a short struct_size implies).
+#define XRT_DP_LIFT_VIEWPOINT_FRAME_DISPLAY 0u
+//! xrt_dp_lift_params::viewpoint_frame: viewpoints are relative to the CENTRE
+//! of the lifted rect (or the submitting window), display axes, metres.
+#define XRT_DP_LIFT_VIEWPOINT_FRAME_RECT 1u
+
+//! xrt_dp_lift_params::axis_mode — values match XR_LIFT_AXIS_MODE_*_DXR.
+#define XRT_DP_LIFT_AXIS_X 1u   //!< horizontal look-around only (default)
+#define XRT_DP_LIFT_AXIS_XY 2u  //!< + vertical
+#define XRT_DP_LIFT_AXIS_XYZ 3u //!< + distance
+/*! @} */
+
 //! Upper bound on explicit viewpoints the runtime passes to lift_convert.
 #define XRT_DP_LIFT_MAX_EXPLICIT_VIEWPOINTS 8
 
@@ -131,6 +155,36 @@ struct xrt_dp_lift_params
 	 * modules ignore it.
 	 */
 	float focal_px;
+
+	/*
+	 * ── Viewpoint policy (ADR-048, XRT_DP_LIFT_HAS_VIEWPOINT_POLICY) ────────
+	 * Appended; read only when struct_size covers them. The RUNTIME owns the
+	 * policy — rebasing to the rect, ipd / parallax factors, axis masking,
+	 * clamping and recentering are already applied to the viewpoints
+	 * lift_convert receives. The plug-in only translates them into its
+	 * module's units: normalise by baseline_m (not a fixed eye distance),
+	 * honour every component it is sent (axis_mode says which ones the runtime
+	 * let through — the others are already 0 / at the reference distance), and
+	 * map the offset range onto its own range using max_offset_m and the rect
+	 * size.
+	 */
+
+	//! Physical width of the lifted region (rect / window) in metres; 0 = unknown.
+	float rect_width_m;
+	//! Physical height of the lifted region in metres; 0 = unknown.
+	float rect_height_m;
+	//! Distance between the outermost viewpoints of the pair the runtime
+	//! resolved (eye separation after the ipd factor), metres; 0 = no
+	//! viewpoints / unknown (use the module's own default).
+	float baseline_m;
+	//! XRT_DP_LIFT_AXIS_*: which midpoint components follow the viewer.
+	uint32_t axis_mode;
+	//! The clamp the runtime applied to the x / y offset of the viewpoints'
+	//! midpoint from the rect centre, metres; 0 = unclamped.
+	float max_offset_m;
+	//! XRT_DP_LIFT_VIEWPOINT_FRAME_*: origin of the viewpoints passed to
+	//! lift_convert. Always RECT from a runtime that fills this field.
+	uint32_t viewpoint_frame;
 };
 
 /*!
