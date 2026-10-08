@@ -959,6 +959,24 @@ The encoding is `comp_vk_native_wl_move_sync_encode` (pinned by
 `MoveSyncChoice.decode` (pinned by `scripts/test_gnome_extension_move_sync.js`
 against a transcription of the same function).
 
+The extension reads the tag off the window's surface actors (`_readTag`): the
+1x1 actor is the tag, and the **main surface** is the actor whose content is
+the window's texture — `MetaWindowActor.get_texture()` is the main surface's
+`MetaShapedTexture`, and mutter sets that same object as the surface actor's
+content, so the pairing is structural: the toplevel's own surface, the one the
+tag is a subsurface of (runtime and present-owner alike, §9.8). The tag is
+decoded as its position minus the main surface's, both relative to the window
+actor (`MoveSyncChoice.pick`, extension version 12, pinned by the same test).
+Versions 9–11 took the **largest** surface actor instead. Under libdecor-gtk —
+GLFW 3.4's and SDL2/SDL3's stock decorations on GNOME — the shadow subsurface
+is larger than the content, so every tag decoded against the shadow's origin,
+no frame ever resolved against the window's history, and the hold timed out on
+every title-bar drag: stale frames and visible 3D stutter, found on the LeiaSR
+OpenGL example (the same drag was smooth with libdecor disabled). An app that
+draws its own chrome in a smaller subsurface, as the test apps and the browser
+do, was never affected. Without a texture match (none handed out, or no actor
+carrying it — not seen on mutter 45–50) the largest actor still stands in.
+
 ### 9.3 Placement rules (`MoveSyncChoice` in `lib.js`)
 
 The extension resolves the tag against the positions the window had in the
@@ -1147,17 +1165,20 @@ extension) it should keep the tag mapped, or accept the hitch.
 tags nothing); `DXR_WL_TEST_TAG=toggle:ON_MS:OFF_MS` maps it for `ON_MS`, then
 unmaps it for `OFF_MS`, repeating. The registration is unchanged.
 
-**Decoding against the parent surface: not possible from GJS on GNOME 50.**
-The tag is decoded as its offset from the largest surface actor of the window
-(§9.2). The parent surface would be the exact reference, but mutter 50
-flattens a window's surface actors into siblings under one
-`MetaSurfaceContainerActorWayland` (the tag's Clutter parent is the
-container, not its parent surface), `MetaSurfaceActorWayland` exposes no
-surface accessor or property to GObject introspection, and `Meta.WaylandSurface`
-exposes only `get_window()`. Only the sibling order hints at the parent (a
-`place_below` tag sits just before it), which a client may reorder. The
-largest-surface rule stays; a present-owner keeps its tag a subsurface of the
-surface that carries the woven content, and that surface the largest.
+**Decoding against the parent surface: not possible from GJS on GNOME 50 —
+the main surface is found by its texture instead (version 12).** The parent
+surface would be the exact reference, but mutter 50 flattens a window's
+surface actors into siblings under one `MetaSurfaceContainerActorWayland` (the
+tag's Clutter parent is the container, not its parent surface),
+`MetaSurfaceActorWayland` exposes no surface accessor or property to GObject
+introspection, and `Meta.WaylandSurface` exposes only `get_window()`. Only the
+sibling order hints at the parent (a `place_below` tag sits just before it),
+which a client may reorder. What *is* reachable is the toplevel's own surface:
+`MetaWindowActor.get_texture()` returns its `MetaShapedTexture`, which is that
+surface actor's content (§9.2). So a present-owner keeps its tag a subsurface
+of the toplevel's (root) surface — the browser's root surface already is — and
+that surface no longer has to be the largest; versions 9–11 decoded against
+the largest surface, which a client-side shadow bigger than the content broke.
 
 **Measured** (the §9.7 harness, private headless GNOME Shell 50.1,
 `cube_handle_vk_linux` on sim_display only, stamp audit after every paint;
