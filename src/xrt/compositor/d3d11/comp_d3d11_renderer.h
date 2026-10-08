@@ -352,6 +352,35 @@ comp_d3d11_renderer_blit_stretch(struct comp_d3d11_renderer *renderer,
                                  uint32_t target_width,
                                  uint32_t target_height);
 
+/*!
+ * Multi-screen M6: linearly scale one rect of a texture into one rect of the
+ * currently relevant render target — the flat-2D fill of a segment no DP can
+ * weave (and of the canvas no screen covers), the D3D11 twin of the Vulkan
+ * segments' `vkCmdBlitImage`. Opaque, no colour transform. Binds @p rtv, a
+ * viewport = @p dst and the renderer's own quad pipeline; the caller re-binds
+ * whatever it needs afterwards.
+ *
+ * @param renderer The renderer.
+ * @param src_srv  Source texture SRV (ID3D11ShaderResourceView*).
+ * @param src_x,src_y,src_w,src_h  Source rect in source texels.
+ * @param rtv      Destination render target view (ID3D11RenderTargetView*).
+ * @param dst_x,dst_y,dst_w,dst_h  Destination rect in target pixels.
+ *
+ * @ingroup comp_d3d11
+ */
+xrt_result_t
+comp_d3d11_renderer_blit_rect(struct comp_d3d11_renderer *renderer,
+                              void *src_srv,
+                              int32_t src_x,
+                              int32_t src_y,
+                              uint32_t src_w,
+                              uint32_t src_h,
+                              void *rtv,
+                              int32_t dst_x,
+                              int32_t dst_y,
+                              uint32_t dst_w,
+                              uint32_t dst_h);
+
 
 #ifdef __cplusplus
 }

@@ -227,6 +227,24 @@ comp_d3d11_compositor_get_window_metrics(struct xrt_compositor *xc,
                                           struct xrt_window_metrics *out_metrics);
 
 /*!
+ * Multi-screen M6 (ADR-047 D2 on Windows): hand the compositor the system's
+ * screen list, so a window that spans several monitors is woven per segment,
+ * each by its own screen's display processor, into the one back buffer. Call
+ * once at session creation. @p pinned_display_id is the session's
+ * `XrSessionDisplayBindingDXR` (0 = none); a pinned session is never
+ * segmented. A window on the primary screen only keeps the single-DP path
+ * byte for byte.
+ *
+ * @ingroup comp_d3d11
+ */
+struct xrt_screen_list;
+void
+comp_d3d11_compositor_set_screens(struct xrt_compositor *xc,
+                                  const struct xrt_screen_list *list,
+                                  const struct xrt_system_compositor_info *info,
+                                  uint64_t pinned_display_id);
+
+/*!
  * XR_DXR_depth_budget: whether this session asked for the rear depth budget.
  *
  * Latched exactly like the transparency flag, and for the same reason: the
