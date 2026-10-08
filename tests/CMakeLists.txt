@@ -831,3 +831,12 @@ if(TARGET ipc_server)
 							 --allow-running-no-tests
 		)
 endif()
+
+# ADR-043 Amendment 4, Windows: the Media Foundation UVC backend's scaled output
+# (GPU and CPU video processor) is a plain resize, never letterboxed — through
+# the real backend on a generated YUY2 AVI. SKIPs without Media Foundation.
+if(WIN32 AND TARGET aux_os_uvc)
+	add_executable(tests_uvc_capture_mf tests_uvc_capture_mf.cpp)
+	target_link_libraries(tests_uvc_capture_mf PRIVATE xrt-external-catch2 aux_util aux_os aux_os_uvc)
+	add_test(NAME tests_uvc_capture_mf COMMAND tests_uvc_capture_mf --success --allow-running-no-tests)
+endif()
