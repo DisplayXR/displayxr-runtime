@@ -27,7 +27,7 @@ u_lift_view_control_default(struct u_lift_view_control *vc)
 	vc->parallax_factor = 1.0f;
 	vc->axis_mode = U_LIFT_AXIS_X;
 	vc->max_offset_m = 0.0f;
-	vc->recenter_mode = U_LIFT_RECENTER_EASE_TO_CURRENT;
+	vc->recenter_mode = U_LIFT_RECENTER_EASE_BACK;
 	vc->hold_s = U_LIFT_RECENTER_HOLD_DEFAULT_S;
 	vc->tau_s = U_LIFT_RECENTER_TAU_DEFAULT_S;
 }
@@ -43,8 +43,8 @@ u_lift_view_control_sanitize(struct u_lift_view_control *vc)
 	if (!isfinite(vc->max_offset_m) || vc->max_offset_m < 0.0f) {
 		vc->max_offset_m = 0.0f;
 	}
-	if (vc->recenter_mode > U_LIFT_RECENTER_EASE_TO_NEUTRAL) {
-		vc->recenter_mode = U_LIFT_RECENTER_EASE_TO_CURRENT;
+	if (vc->recenter_mode > U_LIFT_RECENTER_EASE_BACK) {
+		vc->recenter_mode = U_LIFT_RECENTER_EASE_BACK;
 	}
 	if (!isfinite(vc->hold_s) || vc->hold_s < 0.0f) {
 		vc->hold_s = U_LIFT_RECENTER_HOLD_DEFAULT_S;
@@ -85,9 +85,12 @@ live_len(const float d[3], uint32_t axis_mode)
 }
 
 /*!
- * One step of the recenter filter on midpoint @p c (in / out). Neutral is the
- * rect's straight-on viewer (0, 0, nz). Frame-rate independent: the ease
- * factor per step is 1 - exp(-dt / tau).
+ * One step of the ease-back filter on midpoint @p c (in / out). The rendered
+ * midpoint is the straight-on viewer (0, 0, nz) plus the head's offset from a
+ * REFERENCE that follows the head: after the hold the reference slides to the
+ * head, so the camera returns to the scene camera origin; a new movement is an
+ * offset from the reference again (temporary look-around). Frame-rate
+ * independent: the ease factor per step is 1 - exp(-dt / tau).
  */
 static void
 recenter_step(const struct u_lift_view_control *vc, struct u_lift_recenter *r, float nz, uint64_t now_ns, float c[3])
@@ -99,7 +102,6 @@ recenter_step(const struct u_lift_view_control *vc, struct u_lift_recenter *r, f
 		r->valid = true;
 		r->last_ns = now_ns;
 		memcpy(r->ref, neutral, sizeof(r->ref));
-		r->gain = 1.0f;
 		r->beyond_s = 0.0f;
 		r->easing = false;
 	}
@@ -110,42 +112,25 @@ recenter_step(const struct u_lift_view_control *vc, struct u_lift_recenter *r, f
 	r->last_ns = now_ns;
 	const float k = 1.0f - expf(-dt / vc->tau_s);
 
-	if (vc->recenter_mode == U_LIFT_RECENTER_EASE_TO_CURRENT) {
-		const float d[3] = {c[0] - r->ref[0], c[1] - r->ref[1], c[2] - r->ref[2]};
-		const float len = live_len(d, vc->axis_mode);
-		r->beyond_s = len > U_LIFT_RECENTER_THRESHOLD_M ? r->beyond_s + dt : 0.0f;
-		if (!r->easing && len > U_LIFT_RECENTER_THRESHOLD_M && r->beyond_s >= vc->hold_s) {
-			r->easing = true;
-		}
-		if (r->easing) {
-			for (int i = 0; i < 3; i++) {
-				r->ref[i] += d[i] * k;
-			}
-			const float d2[3] = {c[0] - r->ref[0], c[1] - r->ref[1], c[2] - r->ref[2]};
-			if (live_len(d2, vc->axis_mode) < 0.25f * U_LIFT_RECENTER_THRESHOLD_M) {
-				r->easing = false; // settled; the next excursion holds again first
-				r->beyond_s = 0.0f;
-			}
-		}
-		// Rendered midpoint = the straight-on viewer + the offset from the reference.
+	const float d[3] = {c[0] - r->ref[0], c[1] - r->ref[1], c[2] - r->ref[2]};
+	const float len = live_len(d, vc->axis_mode);
+	r->beyond_s = len > U_LIFT_RECENTER_THRESHOLD_M ? r->beyond_s + dt : 0.0f;
+	if (!r->easing && len > U_LIFT_RECENTER_THRESHOLD_M && r->beyond_s >= vc->hold_s) {
+		r->easing = true;
+	}
+	if (r->easing) {
 		for (int i = 0; i < 3; i++) {
-			c[i] = neutral[i] + (c[i] - r->ref[i]);
+			r->ref[i] += d[i] * k;
 		}
-	} else if (vc->recenter_mode == U_LIFT_RECENTER_EASE_TO_NEUTRAL) {
-		const float d[3] = {c[0] - neutral[0], c[1] - neutral[1], c[2] - neutral[2]};
-		if (live_len(d, vc->axis_mode) > U_LIFT_RECENTER_THRESHOLD_M) {
-			r->beyond_s += dt;
-			if (r->beyond_s >= vc->hold_s) {
-				r->gain -= r->gain * k; // the rendered offset decays toward 0
-			}
-		} else {
-			// Back on the rect's axis: look-around returns, same time constant.
+		const float d2[3] = {c[0] - r->ref[0], c[1] - r->ref[1], c[2] - r->ref[2]};
+		if (live_len(d2, vc->axis_mode) < 0.25f * U_LIFT_RECENTER_THRESHOLD_M) {
+			r->easing = false; // settled; the next excursion holds again first
 			r->beyond_s = 0.0f;
-			r->gain += (1.0f - r->gain) * k;
 		}
-		for (int i = 0; i < 3; i++) {
-			c[i] = neutral[i] + d[i] * r->gain;
-		}
+	}
+	// Rendered midpoint = the straight-on viewer + the offset from the reference.
+	for (int i = 0; i < 3; i++) {
+		c[i] = neutral[i] + (c[i] - r->ref[i]);
 	}
 }
 

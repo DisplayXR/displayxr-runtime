@@ -14,7 +14,9 @@
  *  2. parallax     - lerp the midpoint toward the nominal viewer
  *                    (0, 0, nominal_z) by 1 - parallax_factor (step 1b);
  *  3. axis mask    - X: midpoint y = 0 and z = nominal_z; XY: z = nominal_z;
- *  4. recenter     - the per-stream ease filter (see u_lift_recenter);
+ *  4. recenter     - the per-stream ease-back filter (see u_lift_recenter):
+ *                    after a hold the camera returns to the scene camera
+ *                    origin; new head motion gives temporary look-around;
  *  5. clamp        - midpoint x / y to +- max_offset_m (0 = unclamped).
  *
  * No locks, no clock, no GPU: the caller passes time in, so the filter is
@@ -39,8 +41,7 @@ extern "C" {
 
 //! Values match XR_LIFT_RECENTER_MODE_*_DXR.
 #define U_LIFT_RECENTER_OFF 0u
-#define U_LIFT_RECENTER_EASE_TO_CURRENT 1u
-#define U_LIFT_RECENTER_EASE_TO_NEUTRAL 2u
+#define U_LIFT_RECENTER_EASE_BACK 1u
 
 #define U_LIFT_RECENTER_HOLD_DEFAULT_S 1.0f
 #define U_LIFT_RECENTER_TAU_DEFAULT_S 2.0f
@@ -72,19 +73,18 @@ struct u_lift_recenter
 {
 	bool valid;       //!< false = the next sample re-initialises
 	uint64_t last_ns; //!< time of the previous sample
-	float ref[3];     //!< EASE_TO_CURRENT: the reference viewer midpoint
-	float gain;       //!< EASE_TO_NEUTRAL: rendered fraction of the offset, [0, 1]
+	float ref[3];     //!< the reference viewer midpoint (follows the head)
 	float beyond_s;   //!< how long the offset has stayed beyond the threshold
-	bool easing;      //!< EASE_TO_CURRENT: hold elapsed, the reference is moving
+	bool easing;      //!< hold elapsed: the reference is moving toward the head
 };
 
-//! The defaults (ADR-048): ipd 1, parallax 1, X, unclamped, EASE_TO_CURRENT, 1 s, 2 s.
+//! The defaults (ADR-048): ipd 1, parallax 1, X, unclamped, EASE_BACK, 1 s, 2 s.
 void
 u_lift_view_control_default(struct u_lift_view_control *vc);
 
 /*!
  * Clamp / default every field of @p vc into its valid range: factors to
- * [0, 1], unknown axis mode -> X, unknown recenter mode -> EASE_TO_CURRENT,
+ * [0, 1], unknown axis mode -> X, unknown recenter mode -> EASE_BACK,
  * hold < 0 -> default, tau <= 0 -> default, non-finite values -> defaults.
  */
 void

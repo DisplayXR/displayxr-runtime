@@ -157,7 +157,7 @@ stream**: the last one sent applies until another is sent. Omitted, the defaults
 | `parallaxFactor` | 1 | lerps the midpoint toward the nominal viewer `(0, 0, nominal distance)`: 1 = follow the viewer, 0 = fixed straight-on — step 1b |
 | `axisMode` | X | which midpoint components follow the viewer: X, XY or XYZ. Masked components are pinned (y = 0, z = the nominal distance) |
 | `maxOffsetMeters` | 0 (none) | clamp of the midpoint's x / y offset from the rect centre |
-| `recenterMode` | EASE_TO_CURRENT | how the look-around returns to centre (below) |
+| `recenterMode` | EASE_BACK | OFF or EASE_BACK: whether the camera returns to centre after a hold (below) |
 | `recenterHoldSeconds` | 1 s | how long the offset must stay beyond ~5 mm before recentering starts (< 0 = default) |
 | `recenterTimeConstantSeconds` | 2 s | exponential time constant of the recentering (<= 0 = default) |
 
@@ -166,17 +166,17 @@ Order, per conversion: rebase → ipd factor → parallax factor → axis mask �
 **Recentering.** One filter per stream, frame-rate independent (`1 - exp(-dt / tau)` per step),
 reset when the stream is created and whenever eye tracking is lost.
 
-- `EASE_TO_CURRENT` (default) — the reference viewer position starts at the straight-on viewer.
-  When the viewer's offset from it has stayed beyond the threshold for the hold time, the
-  reference slides toward the viewer with the time constant. A viewer who settles off-axis sees
-  the picture return to its straight-on composition; a new head movement still looks around
-  immediately, relative to where they settled.
-- `EASE_TO_NEUTRAL` — after the same hold the rendered offset decays toward 0; it comes back
-  (same time constant) once the viewer returns to the rect's axis.
+- `EASE_BACK` (default) — the camera eases back to the scene camera origin. If you move your
+  head you see look-around temporarily; once your offset has stayed beyond the threshold for the
+  hold time, the camera returns to centre — no look-around — with the time constant. Any new
+  head motion gives immediate, temporary look-around again. (Mechanically: a reference viewer
+  position starts at the straight-on viewer and, after the hold, slides toward the head; the
+  rendered offset is the head's offset from that reference, so it decays to 0 wherever the
+  viewer settles.)
 - `OFF` — the rendered offset is always the viewer's offset from the rect centre.
 
 **Defaults changed behaviour.** A v1 caller that chains nothing gets the rect-relative rebase
-and the EASE_TO_CURRENT default. `DXR_LIFT_RECENTER=off` (service environment, read once when
+and the EASE_BACK default. `DXR_LIFT_RECENTER=off` (service environment, read once when
 the lift module is created) forces recentering OFF for every stream, for A/B.
 
 **Echo.** Chain `XrLiftResultViewpointsDXR` on `XrLiftResultDXR` to receive the viewpoints the
@@ -439,7 +439,7 @@ order: runtime → extensions auto-sync → consumers.
 | Version | Change |
 |---|---|
 | 1 | Initial: properties + states, streams (DEPTH / SBS / NVIEW / GAUSSIANS), non-blocking latest-wins submit, texture acquire (weave-style handles + fence), blob acquire (two-call latch), weave-rect lift chain, per-stream priority scheduling + stats, `focalPx`. |
-| 2 | Viewpoint policy (ADR-048, §4.1): viewpoints relative to the lifted rect / submitting window centre (was: the panel centre), `XrLiftViewControlDXR` (ipd / parallax factors, axis mode, offset clamp, recentering; defaults X + EASE_TO_CURRENT 1 s / 2 s), `XrLiftResultViewpointsDXR` echo. |
+| 2 | Viewpoint policy (ADR-048, §4.1): viewpoints relative to the lifted rect / submitting window centre (was: the panel centre), `XrLiftViewControlDXR` (ipd / parallax factors, axis mode, offset clamp, recentering; defaults X + EASE_BACK 1 s / 2 s), `XrLiftResultViewpointsDXR` echo. |
 
 ## Probing on a Windows box — gotchas (first N0 run, 2026-09-25)
 

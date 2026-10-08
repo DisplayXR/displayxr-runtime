@@ -9,9 +9,9 @@
  *  - the defaults keep v1's X-only look-around for the first second;
  *  - ipd / parallax follow the display-rig steps 1a / 1b;
  *  - masked axes are pinned (y = 0, z = nominal) and the clamp bounds x / y;
- *  - EASE_TO_CURRENT: nothing moves before the hold; after it the rendered
- *    offset decays with the time constant, independent of the frame rate;
- *  - EASE_TO_NEUTRAL decays the offset and restores look-around on return;
+ *  - EASE_BACK: nothing moves before the hold; after it the camera returns
+ *    to the scene camera origin with the time constant, independent of the
+ *    frame rate, and new head motion gives temporary look-around;
  *  - a reset (stream create / tracking loss) forgets the filter.
  */
 
@@ -81,7 +81,7 @@ TEST_CASE("lift viewpoint: sanitize fills defaults", "[lift_viewpoint]")
 	CHECK(vc.parallax_factor == 0.0f);
 	CHECK(vc.axis_mode == U_LIFT_AXIS_X);
 	CHECK(vc.max_offset_m == 0.0f);
-	CHECK(vc.recenter_mode == U_LIFT_RECENTER_EASE_TO_CURRENT);
+	CHECK(vc.recenter_mode == U_LIFT_RECENTER_EASE_BACK);
 	CHECK(vc.hold_s == U_LIFT_RECENTER_HOLD_DEFAULT_S);
 	CHECK(vc.tau_s == U_LIFT_RECENTER_TAU_DEFAULT_S);
 }
@@ -141,7 +141,7 @@ TEST_CASE("lift viewpoint: axis mask and clamp", "[lift_viewpoint]")
 	CHECK(out[3] - out[0] == Catch::Approx(0.064f));
 }
 
-TEST_CASE("lift viewpoint: EASE_TO_CURRENT holds, then decays with tau", "[lift_viewpoint]")
+TEST_CASE("lift viewpoint: EASE_BACK holds, then returns to the origin with tau", "[lift_viewpoint]")
 {
 	u_lift_view_control vc;
 	u_lift_view_control_default(&vc); // hold 1 s, tau 2 s
@@ -187,21 +187,21 @@ TEST_CASE("lift viewpoint: a small offset never starts the hold", "[lift_viewpoi
 	CHECK(x == Catch::Approx(0.003f));
 }
 
-TEST_CASE("lift viewpoint: EASE_TO_NEUTRAL decays and recovers", "[lift_viewpoint]")
+TEST_CASE("lift viewpoint: EASE_BACK after a return to centre gives look-around again", "[lift_viewpoint]")
 {
 	u_lift_view_control vc;
 	u_lift_view_control_default(&vc);
-	vc.recenter_mode = U_LIFT_RECENTER_EASE_TO_NEUTRAL;
 	u_lift_recenter r = {};
 	uint64_t t = 0;
-	float x = run(vc, r, 0.10f, 0.5f, 60.0f, t);
-	CHECK(x == Catch::Approx(0.10f));
-	x = run(vc, r, 0.10f, 20.0f, 60.0f, t);
+	// Settle off-axis: the camera returns to the origin.
+	float x = run(vc, r, 0.10f, 20.0f, 60.0f, t);
 	CHECK(std::fabs(x) < 0.002f);
-	// Back on axis for a while: look-around is restored.
-	run(vc, r, 0.0f, 20.0f, 60.0f, t);
-	x = run(vc, r, 0.10f, 1.0f / 60.0f, 60.0f, t);
-	CHECK(x == Catch::Approx(0.10f).margin(0.003f));
+	// Walk back to the rect axis: that motion is temporary look-around the other way...
+	x = run(vc, r, 0.0f, 1.0f / 60.0f, 60.0f, t);
+	CHECK(x == Catch::Approx(-0.10f).margin(0.003f));
+	// ...which eases back to the origin too.
+	x = run(vc, r, 0.0f, 20.0f, 60.0f, t);
+	CHECK(std::fabs(x) < 0.002f);
 }
 
 TEST_CASE("lift viewpoint: reset forgets the reference", "[lift_viewpoint]")

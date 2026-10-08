@@ -197,8 +197,7 @@ oxr_lift_view_control_from_xr(struct oxr_logger *log, const XrLiftViewControlDXR
 		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "XrLiftViewControlDXR::axisMode (%d) invalid",
 		                 (int)v->axisMode);
 	}
-	if (v->recenterMode < XR_LIFT_RECENTER_MODE_OFF_DXR ||
-	    v->recenterMode > XR_LIFT_RECENTER_MODE_EASE_TO_NEUTRAL_DXR) {
+	if (v->recenterMode < XR_LIFT_RECENTER_MODE_OFF_DXR || v->recenterMode > XR_LIFT_RECENTER_MODE_EASE_BACK_DXR) {
 		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "XrLiftViewControlDXR::recenterMode (%d) invalid",
 		                 (int)v->recenterMode);
 	}

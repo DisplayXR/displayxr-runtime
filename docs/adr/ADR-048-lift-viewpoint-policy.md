@@ -83,14 +83,18 @@ policy is identical for every vendor and testable without hardware.
 
 One filter per stream, frame-rate independent, reset on stream create and on tracking loss:
 
-- **EASE_TO_CURRENT (default).** The reference starts at the straight-on viewer. When the
-  viewer's offset from it has stayed beyond a few millimetres for `recenterHoldSeconds`
-  (default 1 s), the reference slides toward the viewer with time constant
-  `recenterTimeConstantSeconds` (default 2 s). Someone who settles off-axis sees the picture
-  return to its intended composition; a new head movement still produces immediate look-around.
-- **EASE_TO_NEUTRAL.** After the same hold the rendered offset decays to 0; look-around returns
-  when the viewer comes back to the rect's axis.
+- **EASE_BACK (default).** The camera eases back to (0, 0, 0), the scene camera origin. If you
+  move your head you see look-around temporarily; once your offset has stayed beyond a few
+  millimetres for `recenterHoldSeconds` (default 1 s), the camera returns to centre, with no
+  look-around, with time constant `recenterTimeConstantSeconds` (default 2 s). Any new head
+  motion gives immediate, temporary look-around again. Mechanically, a reference viewer position
+  follows the head after the hold and the rendered offset is the head's offset from it, so it
+  decays to 0 wherever the viewer settles.
 - **OFF.** The plain rect-relative offset.
+
+An "ease to the rect axis" variant (decay the offset, restore look-around only once the viewer
+returns to the rect's axis) was considered and rejected: a viewer who settles off-axis would
+lose look-around until they moved back.
 
 ### D4. Apps steer it per stream, and can see what was used
 
@@ -101,7 +105,7 @@ and size — so an app compositing its own 3D over a lifted frame can render for
 
 ### D5. Defaults change behaviour, with an A/B switch
 
-Defaults are ipd 1, parallax 1, axis X, no clamp, EASE_TO_CURRENT, 1 s hold, 2 s time constant.
+Defaults are ipd 1, parallax 1, axis X, no clamp, EASE_BACK, 1 s hold, 2 s time constant.
 Existing callers (the browser's lifted media) therefore change in two ways without asking: the
 viewpoint is centred on the lifted rect, and an off-axis viewer is eased back after a second.
 The first is the fix; the second is the chosen experience. `DXR_LIFT_RECENTER=off` in the

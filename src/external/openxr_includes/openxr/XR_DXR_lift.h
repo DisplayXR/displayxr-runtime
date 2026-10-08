@@ -200,22 +200,21 @@ typedef enum XrLiftAxisModeDXR {
  *
  *  - OFF: the rendered offset is the viewer's offset from the rect centre,
  *    always (v1 behaviour, but rect-relative).
- *  - EASE_TO_CURRENT (default): the reference follows the viewer. Once the
- *    offset has stayed beyond a small threshold for recenterHoldSeconds, the
- *    reference slides toward the viewer's current position with time
- *    constant recenterTimeConstantSeconds — a viewer who settles off-axis
- *    sees the picture return to its straight-on composition, while a head
- *    movement still produces immediate look-around.
- *  - EASE_TO_NEUTRAL: after the same hold, the rendered offset decays toward
- *    0 (the straight-on view of the rect centre) with the same time constant.
+ *  - EASE_BACK (default): the camera eases back to the scene camera origin.
+ *    Moving the head gives look-around temporarily; once the viewer's offset
+ *    has stayed beyond a small threshold for recenterHoldSeconds, the camera
+ *    returns to centre (no look-around) with time constant
+ *    recenterTimeConstantSeconds. Any new head motion gives immediate,
+ *    temporary look-around again. (The reference viewer position follows
+ *    the head, so the rendered offset decays to 0 wherever the viewer
+ *    settles.)
  *
  * Frame-rate independent; one filter per stream, reset when the stream is
  * created and whenever tracking is lost.
  */
 typedef enum XrLiftRecenterModeDXR {
     XR_LIFT_RECENTER_MODE_OFF_DXR = 0,
-    XR_LIFT_RECENTER_MODE_EASE_TO_CURRENT_DXR = 1,
-    XR_LIFT_RECENTER_MODE_EASE_TO_NEUTRAL_DXR = 2,
+    XR_LIFT_RECENTER_MODE_EASE_BACK_DXR = 1,
     XR_LIFT_RECENTER_MODE_MAX_ENUM_DXR = 0x7FFFFFFF
 } XrLiftRecenterModeDXR;
 
@@ -304,7 +303,7 @@ typedef struct XrLiftOptionsDXR {
  *
  * Omitted entirely, the runtime applies the defaults: ipdFactor 1,
  * parallaxFactor 1, axisMode X, maxOffsetMeters 0 (no clamp), recenterMode
- * EASE_TO_CURRENT, hold 1 s, time constant 2 s.
+ * EASE_BACK, hold 1 s, time constant 2 s.
  *
  * Frame: every viewpoint is relative to the CENTRE of the lifted region — the
  * lifted weave rect, or for xrSubmitLiftFrameDXR the session's window (the

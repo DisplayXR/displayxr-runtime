@@ -29,7 +29,7 @@ extern "C" {
 
 /*!
  * The viewpoint policy of a stream (XrLiftViewControlDXR, ADR-048). Values
- * are the XR_DXR_lift enum values (axis 1..3, recenter 0..2); the service
+ * are the XR_DXR_lift enum values (axis 1..3, recenter 0 off / 1 ease-back); the service
  * sanitizes them (u_lift_view_control_sanitize).
  */
 struct xrt_lift_view_control

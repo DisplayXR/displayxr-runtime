@@ -824,6 +824,13 @@ lift_reap(d3d11_lift *l, std::unique_lock<std::mutex> &lk)
 	}
 }
 
+//! Log name of a recenter mode.
+static const char *
+recenter_str(uint32_t mode)
+{
+	return mode == U_LIFT_RECENTER_EASE_BACK ? "ease-back" : "off";
+}
+
 //! The viewpoints one conversion uses (ADR-048), and what the DP is told about them.
 struct viewpoint_result
 {
@@ -907,9 +914,9 @@ resolve_viewpoints(d3d11_lift *l,
 		st.logged_vc_valid = true;
 		U_LOG_W(
 		    "[lift] stream %llu viewpoint policy: ipd=%.2f parallax=%.2f axis=%u max_offset=%.3f m "
-		    "recenter=%u hold=%.2f s tau=%.2f s (rect-relative viewpoints, ADR-048)",
+		    "recenter=%s hold=%.2f s tau=%.2f s (rect-relative viewpoints, ADR-048)",
 		    (unsigned long long)st.id, vc.ipd_factor, vc.parallax_factor, vc.axis_mode, vc.max_offset_m,
-		    vc.recenter_mode, vc.hold_s, vc.tau_s);
+		    recenter_str(vc.recenter_mode), vc.hold_s, vc.tau_s);
 	}
 
 	struct xrt_eye_positions eyes = {};
@@ -1115,9 +1122,9 @@ lift_convert_one(d3d11_lift *l, lift_stream &st, std::unique_lock<std::mutex> &l
 			U_LOG_I(
 			    "[lift] stream %llu viewpoints: rect centre=(%.3f, %.3f) m size=%.3fx%.3f m mid=(%.3f, "
 			    "%.3f, "
-			    "%.3f) baseline=%.4f m axis=%u recenter=%u",
+			    "%.3f) baseline=%.4f m axis=%u recenter=%s",
 			    (unsigned long long)st.id, vr.centre[0], vr.centre[1], vr.rect_w, vr.rect_h, vr.mid[0],
-			    vr.mid[1], vr.mid[2], vr.baseline, vr.axis_mode, vr.recenter_mode);
+			    vr.mid[1], vr.mid[2], vr.baseline, vr.axis_mode, recenter_str(vr.recenter_mode));
 		}
 	}
 	l->cv.notify_all();
