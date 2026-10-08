@@ -371,6 +371,13 @@ static struct xrt_plugin_iface g_sim_display_iface = {
 #else
     .create_dp_vk_for_screen = NULL,
 #endif
+
+    /* Multi-screen M6: one D3D11 DP per screen a spanning window covers. */
+#if defined(_WIN32)
+    .create_dp_d3d11_for_screen = sim_display_dp_factory_d3d11_for_screen,
+#else
+    .create_dp_d3d11_for_screen = NULL,
+#endif
 };
 
 
