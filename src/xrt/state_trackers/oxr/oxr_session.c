@@ -4156,9 +4156,9 @@ locate_views_one(struct oxr_logger *log,
  */
 
 //! The compositor's segment table, when this session's compositor segments its
-//! window (in-process Vulkan, desktop Linux). Everything else — the other
-//! native compositors, IPC/service sessions (the service never segments) —
-//! answers false and keeps one view set.
+//! window (in-process Vulkan on desktop Linux, in-process D3D11 on Windows).
+//! Everything else — the other native compositors, IPC/service sessions (the
+//! service never segments) — answers false and keeps one view set.
 static bool
 locate_get_segment_metrics(struct oxr_session *sess, struct xrt_segment_metrics *out)
 {
@@ -4167,9 +4167,13 @@ locate_get_segment_metrics(struct oxr_session *sess, struct xrt_segment_metrics 
 	if (sess->xcn != NULL && sess->is_vk_native_compositor) {
 		return comp_vk_native_compositor_get_segment_metrics(&sess->xcn->base, out) && out->count > 0;
 	}
-#else
-	(void)sess;
 #endif
+#if defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR) && defined(XRT_OS_WINDOWS)
+	if (sess->xcn != NULL && sess->is_d3d11_native_compositor) {
+		return comp_d3d11_compositor_get_segment_metrics(&sess->xcn->base, out) && out->count > 0;
+	}
+#endif
+	(void)sess;
 	return false;
 }
 

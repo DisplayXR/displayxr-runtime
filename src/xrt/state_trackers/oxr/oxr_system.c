@@ -171,9 +171,10 @@ oxr_system_fill_in(
 	/*
 	 * Multi-screen M3: advertise one view set per segment only where a
 	 * window can ever be split — the in-process Vulkan compositor on desktop
-	 * Linux, with at least two registry screens that have a DP factory. A
-	 * single-screen box, a service session and every other platform keep the
-	 * pre-M3 count, so existing multiview apps and the CTS see no change.
+	 * Linux or the in-process D3D11 compositor on Windows, with at least two
+	 * registry screens that have a DP factory. A single-screen box, a service
+	 * session and every other platform keep the pre-M3 count, so existing
+	 * multiview apps and the CTS see no change.
 	 */
 	{
 		uint32_t with_factory = 0;
@@ -188,6 +189,24 @@ oxr_system_fill_in(
 			const struct xrt_dp_factory_registry *reg = &sys->xsysc->info.dp_registry;
 			for (uint32_t e = 0; e < reg->entry_count && e < XRT_DP_REGISTRY_MAX_ENTRIES; e++) {
 				if (reg->entries[e].dp_factory_vk != NULL) {
+					with_factory++;
+				}
+			}
+		}
+#elif defined(XRT_OS_WINDOWS) && defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR)
+		// Multi-screen M3 on Windows: the in-process D3D11 compositor
+		// segments a window the same way (comp_d3d11_segments); the
+		// registry's D3D11 factory is what says a screen has a DP. The
+		// capacity is per system, so a D3D12 / GL / Vulkan session on the
+		// same box advertises the doubled count too and never splits — the
+		// tail views then repeat view 0, which the contract allows.
+		const char *segs_env = getenv("DXR_SEGMENTS");
+		const bool segments_off = segs_env != NULL && segs_env[0] == '0';
+		if (sys->xsysc != NULL && !sys->xsysc->info.is_service_mode && !segments_off) {
+			can_segment = true;
+			const struct xrt_dp_factory_registry *reg = &sys->xsysc->info.dp_registry;
+			for (uint32_t e = 0; e < reg->entry_count && e < XRT_DP_REGISTRY_MAX_ENTRIES; e++) {
+				if (reg->entries[e].dp_factory_d3d11 != NULL) {
 					with_factory++;
 				}
 			}

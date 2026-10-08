@@ -65,6 +65,7 @@ struct comp_d3d11_segments
 	uint32_t screen_count;
 	struct comp_segments_screen screens[COMP_SEGMENTS_MAX_SCREENS];
 	struct xrt_screen_binding bindings[COMP_SEGMENTS_MAX_SCREENS];
+	struct xrt_screen_info info[COMP_SEGMENTS_MAX_SCREENS]; //!< per-screen size + nominal viewer (M3)
 	const struct xrt_plugin_iface *iface[COMP_SEGMENTS_MAX_SCREENS];
 	struct xrt_plugin_instance *inst[COMP_SEGMENTS_MAX_SCREENS];
 	struct seg_screen_state st[COMP_SEGMENTS_MAX_SCREENS];
@@ -405,6 +406,7 @@ comp_d3d11_segments_set_screens(struct comp_d3d11_segments *segs,
 		if (e != nullptr) {
 			snprintf(b->serial, sizeof(b->serial), "%s", e->serial);
 		}
+		segs->info[n] = s->info;
 		n++;
 	}
 	segs->screen_count = n;
@@ -702,6 +704,73 @@ comp_d3d11_segments_set_display_mode(struct comp_d3d11_segments *segs, bool enab
 }
 
 extern "C" bool
+comp_d3d11_segments_get_metrics(const struct comp_d3d11_segments *segs,
+                                const struct comp_seg_rect *window_desktop,
+                                const struct comp_seg_rect *canvas,
+                                bool primary_has_dp,
+                                struct xrt_segment_metrics *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (segs == nullptr || !segs->enabled || !segs->logged_split || window_desktop == nullptr ||
+	    canvas == nullptr) {
+		return false;
+	}
+	const struct comp_segment_table *t = &segs->table;
+	if (t->count == 0 || t->count > XRT_MAX_SEGMENTS) {
+		// More screens than view sets: the window keeps one view set (M2).
+		return false;
+	}
+	for (uint32_t k = 0; k < t->count; k++) {
+		const struct comp_segment *g = &t->seg[k];
+		if (g->screen_index >= segs->screen_count) {
+			return false;
+		}
+		const uint32_t i = g->screen_index;
+		const struct seg_screen_state *st = &segs->st[i];
+		struct xrt_segment_metric *m = &out->seg[k];
+		m->screen_id = g->screen_id;
+		m->window_rect.offset.w = g->window_rect.x;
+		m->window_rect.offset.h = g->window_rect.y;
+		m->window_rect.extent.w = (int)g->window_rect.w;
+		m->window_rect.extent.h = (int)g->window_rect.h;
+		m->screen_rect.offset.w = g->screen_rect.x;
+		m->screen_rect.offset.h = g->screen_rect.y;
+		m->screen_rect.extent.w = (int)g->screen_rect.w;
+		m->screen_rect.extent.h = (int)g->screen_rect.h;
+		m->screen_desktop_left = segs->screens[i].desktop.x;
+		m->screen_desktop_top = segs->screens[i].desktop.y;
+		m->screen_desktop_width = segs->screens[i].desktop.w;
+		m->screen_desktop_height = segs->screens[i].desktop.h;
+		m->screen_width_m = segs->info[i].width_m;
+		m->screen_height_m = segs->info[i].height_m;
+		m->nominal_viewer_x_m = segs->info[i].nominal_viewer_x_m;
+		m->nominal_viewer_y_m = segs->info[i].nominal_viewer_y_m;
+		m->nominal_viewer_z_m = segs->info[i].nominal_viewer_z_m;
+		m->is_primary = g->is_primary;
+		if (g->is_primary) {
+			m->has_dp = primary_has_dp;
+			m->tolerates_resample = false; // the primary keeps the session-level gates
+			m->woven = primary_has_dp;
+		} else {
+			m->has_dp = st->dp != nullptr;
+			m->tolerates_resample = st->tolerates_resample;
+			m->woven = comp_segments_decide(m->has_dp, st->tolerates_resample, g->screen_1to1) ==
+			           COMP_SEG_RENDER_WEAVE;
+		}
+	}
+	out->count = t->count;
+	out->canvas.offset.w = canvas->x;
+	out->canvas.offset.h = canvas->y;
+	out->canvas.extent.w = (int)canvas->w;
+	out->canvas.extent.h = (int)canvas->h;
+	out->window_screen_left = window_desktop->x;
+	out->window_screen_top = window_desktop->y;
+	out->window_pixel_width = window_desktop->w;
+	out->window_pixel_height = window_desktop->h;
+	return true;
+}
+
+extern "C" bool
 comp_d3d11_segments_get_eyes(struct comp_d3d11_segments *segs, uint64_t screen_id, struct xrt_eye_positions *out)
 {
 	if (segs == nullptr || out == nullptr) {
@@ -711,7 +780,7 @@ comp_d3d11_segments_get_eyes(struct comp_d3d11_segments *segs, uint64_t screen_i
 	os_mutex_lock(&segs->dp_mutex);
 	const int i = screen_index_of(segs, screen_id);
 	if (i >= 0 && segs->st[i].dp != nullptr) {
-		ok = xrt_display_processor_d3d11_get_predicted_eye_positions(segs->st[i].dp, out);
+		ok = xrt_display_processor_d3d11_get_predicted_eye_positions(segs->st[i].dp, out) && out->valid;
 	}
 	os_mutex_unlock(&segs->dp_mutex);
 	return ok;

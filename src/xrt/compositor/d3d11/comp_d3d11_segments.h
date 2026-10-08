@@ -27,6 +27,7 @@
 
 #include "xrt/xrt_compiler.h"
 #include "xrt/xrt_compositor.h"
+#include "xrt/xrt_display_metrics.h"
 #include "xrt/xrt_display_processor_d3d11.h"
 #include "xrt/xrt_screen.h"
 #include "util/comp_segments.h"
@@ -151,6 +152,22 @@ comp_d3d11_segments_set_display_mode(struct comp_d3d11_segments *segs, bool enab
  */
 bool
 comp_d3d11_segments_get_eyes(struct comp_d3d11_segments *segs, uint64_t screen_id, struct xrt_eye_positions *out);
+
+/*!
+ * Multi-screen M3: the last update's segment table as per-segment view
+ * metrics (geometry, each screen's physical size + nominal viewer, whether it
+ * is woven). Eyes are NOT filled — they are predicted per query
+ * (@ref comp_d3d11_segments_get_eyes).
+ *
+ * @return false when the last update did not split the window, or split it
+ *         into more than XRT_MAX_SEGMENTS segments (one view set then).
+ */
+bool
+comp_d3d11_segments_get_metrics(const struct comp_d3d11_segments *segs,
+                                const struct comp_seg_rect *window_desktop,
+                                const struct comp_seg_rect *canvas,
+                                bool primary_has_dp,
+                                struct xrt_segment_metrics *out);
 
 #ifdef __cplusplus
 }

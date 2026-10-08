@@ -1629,6 +1629,9 @@ comp_d3d11_renderer_compute_effective_layout(struct comp_d3d11_renderer *rendere
 	}
 
 	out_layout->views = views;
+	// Multi-screen M3: routing is decided by the compositor, after this.
+	out_layout->route_count = 0;
+	memset(out_layout->route, 0, sizeof(out_layout->route));
 	if (views == 1) {
 		// Mono content: one tile spanning the full content region (the
 		// paint box additionally caps to the window target — see
@@ -1700,6 +1703,52 @@ set_view_viewport(struct comp_d3d11_renderer *renderer,
 	viewport.MinDepth = 0.0f;
 	viewport.MaxDepth = 1.0f;
 	internals.context->RSSetViewports(1, &viewport);
+}
+
+/*!
+ * Multi-screen M3: the viewport for segment @p k's local view @p view_index —
+ * the segment's rect inside tile @p view_index (the mosaic). False when the
+ * segment has no view @p view_index or an empty rect; the caller then draws
+ * nothing for that segment in this tile.
+ */
+static bool
+set_routed_viewport(struct comp_d3d11_renderer *renderer,
+                    uint32_t view_index,
+                    uint32_t k,
+                    const struct comp_d3d11_eff_layout *layout,
+                    uint32_t target_width,
+                    uint32_t target_height)
+{
+	if (k >= layout->route_count || k >= XRT_MAX_SEGMENTS || view_index >= layout->route[k].view_count ||
+	    layout->route[k].w == 0 || layout->route[k].h == 0) {
+		return false;
+	}
+	auto internals = get_internals(renderer->c);
+	float tx, ty, tw, th;
+	get_view_tile_box(renderer, view_index, layout, target_width, target_height, &tx, &ty, &tw, &th);
+	D3D11_VIEWPORT viewport = {};
+	viewport.TopLeftX = tx + static_cast<float>(layout->route[k].x);
+	viewport.TopLeftY = ty + static_cast<float>(layout->route[k].y);
+	viewport.Width = static_cast<float>(layout->route[k].w);
+	viewport.Height = static_cast<float>(layout->route[k].h);
+	viewport.MinDepth = 0.0f;
+	viewport.MaxDepth = 1.0f;
+	internals.context->RSSetViewports(1, &viewport);
+	return true;
+}
+
+//! Multi-screen M3: the end of the last routed view range (0 = unrouted).
+static uint32_t
+routed_view_end(const struct comp_d3d11_eff_layout *layout)
+{
+	uint32_t n = 0;
+	for (uint32_t k = 0; k < layout->route_count && k < XRT_MAX_SEGMENTS; k++) {
+		const uint32_t end = layout->route[k].first_view + layout->route[k].view_count;
+		if (end > n) {
+			n = end;
+		}
+	}
+	return n > XRT_MAX_VIEWS ? XRT_MAX_VIEWS : n;
 }
 
 extern "C" xrt_result_t
@@ -1822,13 +1871,19 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
 	    have_wm ? xrt_vec3{canvas->window_center_offset_x_m, canvas->window_center_offset_y_m,
 	                       canvas->window_center_offset_z_m}
 	            : xrt_vec3{0.0f, 0.0f, 0.0f};
+	// Multi-screen M3: under routing a quad / equirect2 is drawn once per
+	// routed view, with THAT view's camera — so resolve every routed view's
+	// camera, not only the first tile's worth.
+	const uint32_t routed_end = routed_view_end(layout);
+	const uint32_t cam_count = routed_end > effective_views ? routed_end : effective_views;
 	struct comp_layer_view_camera cameras[XRT_MAX_VIEWS] = {};
-	for (uint32_t view = 0; view < effective_views && view < XRT_MAX_VIEWS; view++) {
+	for (uint32_t view = 0; view < cam_count && view < XRT_MAX_VIEWS; view++) {
 		comp_layer_view_camera_select_eyes(layers, view, eyes, effective_views,
 		                                   have_wm ? &canvas_center : nullptr,
 		                                   have_wm ? canvas->window_width_m : 0.0f,
 		                                   have_wm ? canvas->window_height_m : 0.0f, &cameras[view]);
 	}
+	const bool routed = layout->route_count > 0;
 
 	for (uint32_t view_index = 0; view_index < effective_views; view_index++) {
 		set_view_viewport(renderer, view_index, layout, target_width, target_height);
@@ -1881,11 +1936,29 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
 				ID3D11BlendState *bs = blend_state_for(renderer, mode);
 				if (bs != renderer->blend_opaque) {
 					internals.context->OMSetBlendState(bs, nullptr, 0xFFFFFFFF);
-					render_projection_layer(renderer, layer, view_index, mode);
-					internals.context->OMSetBlendState(renderer->blend_opaque, nullptr,
-					                                   0xFFFFFFFF);
+				}
+				if (routed) {
+					// Multi-screen M3: the tile is a mosaic — segment k's
+					// local view `view_index` (layer view first_view +
+					// view_index) lands at the segment's rect inside this
+					// tile. The blend mode was decided once for the tile
+					// above and is shared by its segments.
+					for (uint32_t k = 0; k < layout->route_count && k < XRT_MAX_SEGMENTS; k++) {
+						const uint32_t lv = layout->route[k].first_view + view_index;
+						if (lv >= layer->data.view_count ||
+						    !set_routed_viewport(renderer, view_index, k, layout, target_width,
+						                         target_height)) {
+							continue;
+						}
+						render_projection_layer(renderer, layer, lv, mode);
+					}
+					set_view_viewport(renderer, view_index, layout, target_width, target_height);
 				} else {
 					render_projection_layer(renderer, layer, view_index, mode);
+				}
+				if (bs != renderer->blend_opaque) {
+					internals.context->OMSetBlendState(renderer->blend_opaque, nullptr,
+					                                   0xFFFFFFFF);
 				}
 				break;
 			}
@@ -1952,8 +2025,26 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
 				// outcomes, not errors, and a quad that did not
 				// paint this tile must not turn a following
 				// projection layer into a non-first one.
-				if (render_quad_layer(renderer, layer, view_index, effective_views,
-				                      &cameras[view_index].pose, &cameras[view_index].fov)) {
+				if (routed) {
+					// Multi-screen M3: once per segment, with that segment's
+					// view camera, confined to its rect in this tile.
+					bool drew = false;
+					for (uint32_t k = 0; k < layout->route_count && k < XRT_MAX_SEGMENTS; k++) {
+						const uint32_t lv = layout->route[k].first_view + view_index;
+						if (lv >= XRT_MAX_VIEWS ||
+						    !set_routed_viewport(renderer, view_index, k, layout, target_width,
+						                         target_height)) {
+							continue;
+						}
+						drew |= render_quad_layer(renderer, layer, lv, cam_count, &cameras[lv].pose,
+						                          &cameras[lv].fov);
+					}
+					set_view_viewport(renderer, view_index, layout, target_width, target_height);
+					if (drew) {
+						comp_layer_tile_mark_composited(&tile);
+					}
+				} else if (render_quad_layer(renderer, layer, view_index, effective_views,
+				                             &cameras[view_index].pose, &cameras[view_index].fov)) {
 					comp_layer_tile_mark_composited(&tile);
 				}
 				break;
@@ -1989,8 +2080,25 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
 				 * erasing it.
 				 */
 				const enum comp_layer_blend_mode mode = comp_layer_blend_mode(layer->data.flags);
-				if (render_equirect2_layer(renderer, layer, view_index, effective_views,
-				                           &cameras[view_index].pose, &cameras[view_index].fov, mode)) {
+				if (routed) {
+					bool drew = false;
+					for (uint32_t k = 0; k < layout->route_count && k < XRT_MAX_SEGMENTS; k++) {
+						const uint32_t lv = layout->route[k].first_view + view_index;
+						if (lv >= XRT_MAX_VIEWS ||
+						    !set_routed_viewport(renderer, view_index, k, layout, target_width,
+						                         target_height)) {
+							continue;
+						}
+						drew |= render_equirect2_layer(renderer, layer, lv, cam_count, &cameras[lv].pose,
+						                               &cameras[lv].fov, mode);
+					}
+					set_view_viewport(renderer, view_index, layout, target_width, target_height);
+					if (drew) {
+						comp_layer_tile_mark_composited(&tile);
+					}
+				} else if (render_equirect2_layer(renderer, layer, view_index, effective_views,
+				                                  &cameras[view_index].pose, &cameras[view_index].fov,
+				                                  mode)) {
 					comp_layer_tile_mark_composited(&tile);
 				}
 				break;

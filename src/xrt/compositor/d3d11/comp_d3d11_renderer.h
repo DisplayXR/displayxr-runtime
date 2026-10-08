@@ -42,6 +42,26 @@ struct comp_d3d11_eff_layout
 	uint32_t rows;   //!< atlas tile rows
 	uint32_t tile_w; //!< per-tile width in pixels
 	uint32_t tile_h; //!< per-tile height in pixels
+
+	/*!
+	 * Multi-screen M3 (Windows): per-segment views. 0 = one view set fills
+	 * every tile (the only case before M3). Otherwise the projection layer
+	 * carries one view set per window segment and each tile is a MOSAIC:
+	 * local view j of segment k is placed at that segment's rect inside tile
+	 * j, so cropping a segment's rect out of every tile
+	 * (comp_d3d11_segments) yields exactly that segment's own views. Quads
+	 * and equirect2 layers are drawn once per segment with that segment's
+	 * camera; zones are not routed. Filled by the compositor after
+	 * comp_d3d11_renderer_compute_effective_layout (which zeroes it).
+	 */
+	uint32_t route_count;
+	struct
+	{
+		uint32_t first_view; //!< first layer view of the segment
+		uint32_t view_count; //!< its views (<= @ref views)
+		int32_t x, y;        //!< the segment's rect inside a tile, tile px
+		uint32_t w, h;
+	} route[XRT_MAX_SEGMENTS];
 };
 
 /*!
