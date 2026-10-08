@@ -4992,6 +4992,12 @@ oxr_session_destroy(struct oxr_logger *log, struct oxr_handle_base *hb)
 	// MCP tool handler stops reading.
 	oxr_mcp_tools_detach_session(sess);
 
+#ifdef OXR_HAVE_DXR_lift
+	// ADR-049: the lift streams (children) are already destroyed; close the
+	// in-process session's lift-only service connection behind them.
+	oxr_lift_session_fini(sess);
+#endif
+
 #ifdef OXR_HAVE_DXR_mcp_tools
 	// Unregister the session's app-defined tools (XR_DXR_mcp_tools) and
 	// fail their pending calls before the event queue is drained below.

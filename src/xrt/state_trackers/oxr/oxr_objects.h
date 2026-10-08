@@ -137,6 +137,7 @@ struct oxr_xdev_list;
 struct oxr_plane_detector_ext;
 struct oxr_local_3d_zone_ext;
 struct oxr_lift_stream_dxr;
+struct ipc_client_lift_link;
 struct oxr_stereo_camera_stream_dxr;
 
 #define XRT_MAX_HANDLE_CHILDREN 256
@@ -2840,6 +2841,14 @@ struct oxr_session
 	//! True if using GL native compositor (not multi_compositor).
 	bool is_gl_native_compositor;
 
+	/*!
+	 * XR_DXR_lift for an IN-PROCESS session (ADR-049): the lift-only service
+	 * connection, created on the first lift call and freed after the
+	 * session's lift streams (its children). NULL on IPC sessions, whose
+	 * lift calls ride the session's own connection.
+	 */
+	struct ipc_client_lift_link *lift_link;
+
 	//! True if session was created with an external window handle (XR_DXR_win32_window_binding).
 	bool has_external_window;
 
@@ -4483,7 +4492,18 @@ struct oxr_lift_stream_dxr
 	bool exported; //!< the caller holds the current export texture + fence
 	bool depth_requested; //!< XR_DXR_lift v3: created with XrLiftDepthRequestDXR
 	bool depth_exported;  //!< the caller holds the current depth texture + fence
+	//! In-process session (ADR-049): the lift link generation the stream was
+	//! created on. A stream of a dead generation died with that connection.
+	uint32_t link_gen;
 };
+
+/*!
+ * Free an in-process session's lift-only service connection (ADR-049).
+ * Called from the session's destroy, after its lift streams (children) are
+ * gone. No-op for an IPC session or one that never used lift.
+ */
+void
+oxr_lift_session_fini(struct oxr_session *sess);
 #endif // OXR_HAVE_DXR_lift
 
 #ifdef OXR_HAVE_DXR_stereo_camera

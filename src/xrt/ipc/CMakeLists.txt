@@ -70,6 +70,8 @@ add_library(
 	client/ipc_client_connection.c
 	client/ipc_client_lift.c
 	client/ipc_client_lift.h
+	client/ipc_client_lift_link.c
+	client/ipc_client_lift_link.h
 	client/ipc_client_stereo_camera.c
 	client/ipc_client_stereo_camera.h
 	client/ipc_client_device.c

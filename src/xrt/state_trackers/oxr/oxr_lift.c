@@ -7,15 +7,28 @@
  * @ingroup oxr_api
  *
  * The conversion runs in the service (d3d11_lift.cpp, its own thread and
- * device); these entry points validate, forward to thin IPC-client bridges
- * (ipc_client_compositor.c — st_oxr does not pull the ipc_client include path,
- * so the symbols resolve at link time, the oxr_weave.c pattern) and translate
- * results. IPC-only, like XR_DXR_weave: an in-process session reports
- * XR_ERROR_FEATURE_UNSUPPORTED from every entry point.
+ * device); these entry points validate, call ipc_client_lift.c on a service
+ * connection and translate results. Lift streams belong to a CONNECTION, not a
+ * session, so there are two routes to the one conversion module:
+ *
+ *  - an IPC session uses its own connection (ipc_client_compositor.c hands it
+ *    over — the symbol resolves at link time, the oxr_weave.c pattern);
+ *  - an in-process D3D11 / D3D12 session on Windows (engine apps — the Unity
+ *    display provider renders in-process on its own D3D12 device) uses a
+ *    lift-only connection the session owns (ipc_client_lift_link.c), opened in
+ *    the background on first use (ADR-049). Results come back as the same NT
+ *    handles (texture + ID3D11Fence-created shared fence) a D3D12 device opens
+ *    with OpenSharedHandle.
+ *
+ * Any other in-process session reports XR_ERROR_FEATURE_UNSUPPORTED.
  *
  * Error contract (mirrors XR_DXR_weave §4b):
- *  - a dead pipe (XRT_ERROR_IPC_FAILURE) marks the session lost →
+ *  - IPC session: a dead pipe (XRT_ERROR_IPC_FAILURE) marks the session lost →
  *    XR_ERROR_INSTANCE_LOST, then XR_ERROR_SESSION_LOST;
+ *  - in-process session: a dead lift connection never touches the session —
+ *    the call is a transient XR_ERROR_RUNTIME_FAILURE, streams of that
+ *    connection then report XR_ERROR_FEATURE_UNSUPPORTED (recreate them), and
+ *    properties reconnect in the background;
  *  - a transient service refusal (XRT_ERROR_WEAVE_REFUSED — keyed-mutex miss)
  *    is a non-fatal XR_ERROR_RUNTIME_FAILURE, retry next frame;
  *  - no module / mode unsupported (XRT_ERROR_FEATURE_NOT_SUPPORTED) is
@@ -34,76 +47,28 @@
 #include "util/u_trace_marker.h"
 #include "util/u_logging.h"
 
+#include "xrt/xrt_instance.h"
 #include "xrt/xrt_lift.h"
 
+// st_oxr carries the ipc include path (oxr_workspace.c); these two headers
+// need nothing generated.
+#include "client/ipc_client_lift.h"
+#include "client/ipc_client_lift_link.h"
+
+#ifdef XRT_OS_WINDOWS
+#include "xrt/xrt_windows.h"
+#endif
+
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #ifdef OXR_HAVE_DXR_lift
 
-// IPC-bridge wrappers (defined in ipc_client_compositor.c).
-xrt_result_t
-comp_ipc_client_compositor_lift_get_properties(struct xrt_compositor *xc, struct xrt_dp_lift_caps *out_caps);
-xrt_result_t
-comp_ipc_client_compositor_lift_stream_create(struct xrt_compositor *xc,
-                                              uint32_t mode,
-                                              uint32_t content_hint,
-                                              float input_scale,
-                                              uint32_t aux_outputs,
-                                              uint32_t aux_depth_format,
-                                              uint64_t *out_stream_id);
-xrt_result_t
-comp_ipc_client_compositor_lift_stream_destroy(struct xrt_compositor *xc, uint64_t stream_id);
-xrt_result_t
-comp_ipc_client_compositor_lift_submit(struct xrt_compositor *xc,
-                                       uint64_t stream_id,
-                                       xrt_graphics_buffer_handle_t handle,
-                                       bool is_dxgi,
-                                       uint32_t width,
-                                       uint32_t height,
-                                       int64_t source_time,
-                                       const struct xrt_dp_lift_params *params,
-                                       const float *viewpoints,
-                                       uint32_t viewpoint_count,
-                                       const struct xrt_lift_view_control *view_control,
-                                       const struct xrt_lift_rig *rig,
-                                       uint64_t *out_frame_id);
-xrt_result_t
-comp_ipc_client_compositor_lift_acquire(struct xrt_compositor *xc,
-                                        uint64_t stream_id,
-                                        bool *out_ready,
-                                        struct xrt_lift_result *out_result);
-xrt_result_t
-comp_ipc_client_compositor_lift_get_output(struct xrt_compositor *xc,
-                                           uint64_t stream_id,
-                                           bool *out_have,
-                                           xrt_graphics_buffer_handle_t *out_handle);
-xrt_result_t
-comp_ipc_client_compositor_lift_get_depth_output(struct xrt_compositor *xc,
-                                                 uint64_t stream_id,
-                                                 bool *out_have,
-                                                 xrt_graphics_buffer_handle_t *out_handle);
-xrt_result_t
-comp_ipc_client_compositor_lift_get_fence(struct xrt_compositor *xc,
-                                          uint64_t stream_id,
-                                          bool *out_have,
-                                          xrt_graphics_sync_handle_t *out_handle);
-xrt_result_t
-comp_ipc_client_compositor_lift_acquire_blob(struct xrt_compositor *xc,
-                                             uint64_t stream_id,
-                                             uint64_t capacity,
-                                             uint8_t *out_bytes,
-                                             bool *out_ready,
-                                             bool *out_delivered,
-                                             struct xrt_lift_blob_info *out_info);
-
-xrt_result_t
-comp_ipc_client_compositor_lift_set_priority(struct xrt_compositor *xc, uint64_t stream_id, uint32_t priority);
-xrt_result_t
-comp_ipc_client_compositor_lift_stats(struct xrt_compositor *xc,
-                                      uint64_t stream_id,
-                                      struct xrt_lift_stream_stats *out_stats);
+// IPC-session bridge (defined in ipc_client_compositor.c): the session's connection.
+struct ipc_connection *
+comp_ipc_client_compositor_lift_connection(struct xrt_compositor *xc);
 
 // The OpenXR and DP encodings must agree (the wire carries the DP one).
 _Static_assert(XR_LIFT_MODE_DEPTH_DXR == XRT_DP_LIFT_MODE_DEPTH, "lift mode mismatch");
@@ -138,13 +103,164 @@ lift_session_is_ipc(struct oxr_session *sess)
 	return !inprocess;
 }
 
+/*!
+ * ADR-049: which in-process sessions reach the service's module over a
+ * lift-only connection. The conversion service is the Windows D3D11 service
+ * and its results are D3D NT handles, which a D3D11 or D3D12 device opens
+ * directly; other in-process APIs keep XR_ERROR_FEATURE_UNSUPPORTED.
+ */
+static bool
+lift_inprocess_eligible(struct oxr_session *sess)
+{
+#ifdef XRT_OS_WINDOWS
+	return sess->is_d3d11_native_compositor || sess->is_d3d12_native_compositor;
+#else
+	(void)sess;
+	return false;
+#endif
+}
+
+//! The session's lift link, created on first use (no connect yet).
+static struct ipc_client_lift_link *
+lift_link_get(struct oxr_session *sess)
+{
+#ifdef XRT_OS_WINDOWS
+	struct ipc_client_lift_link *link = (struct ipc_client_lift_link *)InterlockedCompareExchangePointer(
+	    (PVOID volatile *)&sess->lift_link, NULL, NULL);
+	if (link != NULL) {
+		return link;
+	}
+
+	// Name the connection after the executable so `displayxr-cli clients` and
+	// the service log say whose it is.
+	char exe[MAX_PATH] = {0};
+	const char *base = "app";
+	if (GetModuleFileNameA(NULL, exe, (DWORD)sizeof(exe)) > 0) {
+		const char *slash = strrchr(exe, '\\');
+		base = slash != NULL ? slash + 1 : exe;
+	}
+	char label[XRT_MAX_APPLICATION_NAME_SIZE];
+	snprintf(label, sizeof(label), "%s (in-process lift)", base);
+
+	struct ipc_client_lift_link *made = NULL;
+	if (ipc_client_lift_link_create(label, &made) != XRT_SUCCESS) {
+		return NULL;
+	}
+	// Two threads may race the first lift call of a session: one link wins.
+	link = (struct ipc_client_lift_link *)InterlockedCompareExchangePointer((PVOID volatile *)&sess->lift_link,
+	                                                                        made, NULL);
+	if (link != NULL) {
+		ipc_client_lift_link_destroy(&made);
+		return link;
+	}
+	return made;
+#else
+	(void)sess;
+	return NULL;
+#endif
+}
+
+void
+oxr_lift_session_fini(struct oxr_session *sess)
+{
+	if (sess != NULL && sess->lift_link != NULL) {
+		ipc_client_lift_link_destroy(&sess->lift_link);
+	}
+}
+
+//! The connection one lift call rides, and how its failure is treated.
+struct lift_route
+{
+	struct ipc_connection *c; //!< NULL = no connection right now (in-process only)
+	bool inprocess;           //!< the session's lift-only link (ADR-049)
+	uint32_t gen;             //!< link generation the connection belongs to
+	enum ipc_client_lift_link_state state;
+};
+
+/*!
+ * Pick the route. IPC session: its own connection, always. Eligible in-process
+ * session: the lift link; @p wait_ms bounds a wait for an in-flight connect
+ * (0 for everything but stream creation). On XR_SUCCESS the caller must
+ * lift_route_close() it; route->c may still be NULL in-process (see state).
+ */
+static XrResult
+lift_route_open(
+    struct oxr_logger *log, struct oxr_session *sess, uint32_t wait_ms, struct lift_route *route, const char *what)
+{
+	memset(route, 0, sizeof(*route));
+	if (lift_session_is_ipc(sess)) {
+		route->c = comp_ipc_client_compositor_lift_connection(&sess->xcn->base);
+		route->state = IPC_CLIENT_LIFT_LINK_CONNECTED;
+		return XR_SUCCESS;
+	}
+	if (!lift_inprocess_eligible(sess)) {
+		return oxr_error(log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "%s: in-process 2D→3D conversion is available to D3D11 / D3D12 sessions on Windows "
+		                 "only (other sessions: the out-of-process service path)",
+		                 what);
+	}
+	struct ipc_client_lift_link *link = lift_link_get(sess);
+	if (link == NULL) {
+		return oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "%s: could not create the lift service link", what);
+	}
+	route->inprocess = true;
+	route->c = ipc_client_lift_link_acquire_wait(link, wait_ms, &route->state, &route->gen);
+	return XR_SUCCESS;
+}
+
+static void
+lift_route_close(struct oxr_session *sess, struct lift_route *route, xrt_result_t last_xret)
+{
+	if (route->inprocess && route->c != NULL) {
+		ipc_client_lift_link_release(sess->lift_link, route->gen, last_xret == XRT_ERROR_IPC_FAILURE);
+	}
+	route->c = NULL;
+}
+
+/*!
+ * A stream call's route: the stream's own connection, or -- in-process, when
+ * that connection died -- XR_ERROR_FEATURE_UNSUPPORTED (the stream is gone with
+ * it; the app destroys it and creates a new one).
+ */
+static XrResult
+lift_stream_route_open(struct oxr_logger *log,
+                       struct oxr_lift_stream_dxr *st,
+                       struct lift_route *route,
+                       const char *what)
+{
+	XrResult r = lift_route_open(log, st->sess, 0, route, what);
+	if (r != XR_SUCCESS) {
+		return r;
+	}
+	if (route->inprocess && (route->c == NULL || route->gen != st->link_gen)) {
+		lift_route_close(st->sess, route, XRT_SUCCESS);
+		return oxr_error(log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "%s: this stream belonged to a lift service connection that is gone - destroy it and "
+		                 "create a new one once xrGetLiftPropertiesDXR reports READY",
+		                 what);
+	}
+	return XR_SUCCESS;
+}
+
 //! Map a service result; returns XR_SUCCESS only for XRT_SUCCESS.
 static XrResult
-lift_xret(struct oxr_logger *log, struct oxr_session *sess, xrt_result_t xret, const char *what)
+lift_xret(struct oxr_logger *log,
+          struct oxr_session *sess,
+          const struct lift_route *route,
+          xrt_result_t xret,
+          const char *what)
 {
 	switch (xret) {
 	case XRT_SUCCESS: return XR_SUCCESS;
 	case XRT_ERROR_IPC_FAILURE:
+		if (route->inprocess) {
+			// The session renders in-process: losing the lift-only connection
+			// loses its streams, never the session (ADR-049).
+			return oxr_error(log, XR_ERROR_RUNTIME_FAILURE,
+			                 "%s: the lift service connection is gone (session unaffected; recreate lift "
+			                 "streams once xrGetLiftPropertiesDXR reports READY)",
+			                 what);
+		}
 		sess->has_lost = true;
 		return oxr_error(log, XR_ERROR_INSTANCE_LOST, "%s: the runtime service connection is gone", what);
 	case XRT_ERROR_FEATURE_NOT_SUPPORTED:
@@ -273,7 +389,14 @@ oxr_lift_stream_destroy_cb(struct oxr_logger *log, struct oxr_handle_base *hb)
 	struct oxr_lift_stream_dxr *st = (struct oxr_lift_stream_dxr *)hb;
 	// Best effort: a dead connection already took every stream with it.
 	if (st->sess != NULL && st->sess->xcn != NULL && !st->sess->has_lost) {
-		(void)comp_ipc_client_compositor_lift_stream_destroy(&st->sess->xcn->base, st->id);
+		struct lift_route route;
+		if (lift_route_open(log, st->sess, 0, &route, "xrDestroyLiftStreamDXR") == XR_SUCCESS) {
+			xrt_result_t xret = XRT_SUCCESS;
+			if (route.c != NULL && (!route.inprocess || route.gen == st->link_gen)) {
+				xret = ipc_client_lift_stream_destroy(route.c, st->id);
+			}
+			lift_route_close(st->sess, &route, xret);
+		}
 	}
 	free(st);
 	return XR_SUCCESS;
@@ -298,17 +421,26 @@ oxr_xrGetLiftPropertiesDXR(XrSession session, XrLiftPropertiesDXR *properties)
 	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_lift);
 	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, properties, XR_TYPE_LIFT_PROPERTIES_DXR);
 
-	if (!lift_session_is_ipc(sess)) {
-		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrGetLiftPropertiesDXR: 2D→3D conversion is only available on the out-of-process "
-		                 "(service) path");
+	struct lift_route route;
+	XrResult r = lift_route_open(&log, sess, 0, &route, "xrGetLiftPropertiesDXR");
+	if (r != XR_SUCCESS) {
+		return r;
 	}
 
 	struct xrt_dp_lift_caps caps;
-	xrt_result_t xret = comp_ipc_client_compositor_lift_get_properties(&sess->xcn->base, &caps);
-	XrResult r = lift_xret(&log, sess, xret, "xrGetLiftPropertiesDXR");
-	if (r != XR_SUCCESS) {
-		return r;
+	xrt_dp_lift_caps_init(&caps);
+	if (route.c == NULL) {
+		// In-process, no connection right now (ADR-049): a connect in flight
+		// reads ACTIVATING (poll), no service reads UNAVAILABLE (open default).
+		caps.state = route.state == IPC_CLIENT_LIFT_LINK_CONNECTING ? XRT_DP_LIFT_STATE_ACTIVATING
+		                                                            : XRT_DP_LIFT_STATE_UNAVAILABLE;
+	} else {
+		xrt_result_t xret = ipc_client_lift_get_properties(route.c, &caps);
+		lift_route_close(sess, &route, xret);
+		r = lift_xret(&log, sess, &route, xret, "xrGetLiftPropertiesDXR");
+		if (r != XR_SUCCESS) {
+			return r;
+		}
 	}
 	properties->supportedModes = (XrLiftModeFlagsDXR)caps.modes;
 	properties->maxStreams = caps.max_streams;
@@ -382,16 +514,31 @@ oxr_xrCreateLiftStreamDXR(XrSession session, const XrLiftStreamCreateInfoDXR *cr
 		                       ? (uint32_t)dreq->preferredFormat
 		                       : 0u;
 	}
-	if (!lift_session_is_ipc(sess)) {
+	// Creation is a setup call: in-process it may wait for the background
+	// connect (bounded by the connect's own service-starting window).
+	struct lift_route route;
+	XrResult r = lift_route_open(&log, sess, 6000, &route, "xrCreateLiftStreamDXR");
+	if (r != XR_SUCCESS) {
+		return r;
+	}
+	if (route.c == NULL) {
+		if (route.state == IPC_CLIENT_LIFT_LINK_CONNECTING) {
+			return oxr_error(
+			    &log, XR_ERROR_RUNTIME_FAILURE,
+			    "xrCreateLiftStreamDXR: the lift service connection is still being made - retry");
+		}
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrCreateLiftStreamDXR: only available on the out-of-process (service) path");
+		                 "xrCreateLiftStreamDXR: no service to convert with (xrGetLiftPropertiesDXR reports "
+		                 "UNAVAILABLE)");
 	}
 
 	uint64_t id = 0;
-	xrt_result_t xret = comp_ipc_client_compositor_lift_stream_create(
-	    &sess->xcn->base, mode, (uint32_t)createInfo->contentHint,
-	    createInfo->inputScale > 0.0f ? createInfo->inputScale : 1.0f, aux_outputs, aux_depth_format, &id);
-	XrResult r = lift_xret(&log, sess, xret, "xrCreateLiftStreamDXR");
+	xrt_result_t xret = ipc_client_lift_stream_create(route.c, mode, (uint32_t)createInfo->contentHint,
+	                                                  createInfo->inputScale > 0.0f ? createInfo->inputScale : 1.0f,
+	                                                  aux_outputs, aux_depth_format, &id);
+	const uint32_t gen = route.gen;
+	lift_route_close(sess, &route, xret);
+	r = lift_xret(&log, sess, &route, xret, "xrCreateLiftStreamDXR");
 	if (r != XR_SUCCESS) {
 		return r;
 	}
@@ -402,6 +549,7 @@ oxr_xrCreateLiftStreamDXR(XrSession session, const XrLiftStreamCreateInfoDXR *cr
 	st->id = id;
 	st->mode = mode;
 	st->depth_requested = aux_outputs != 0;
+	st->link_gen = gen;
 	*stream = XRT_CAST_PTR_TO_OXR_HANDLE(XrLiftStreamDXR, st);
 	return XR_SUCCESS;
 }
@@ -479,21 +627,30 @@ oxr_xrSubmitLiftFrameDXR(XrLiftStreamDXR stream, const XrLiftFrameSubmitInfoDXR 
 		}
 	}
 
-	xrt_result_t xret = comp_ipc_client_compositor_lift_submit(
-	    &sess->xcn->base, st->id, (xrt_graphics_buffer_handle_t)(intptr_t)submitInfo->inputTexture,
+	struct lift_route route;
+	XrResult rr = lift_stream_route_open(&log, st, &route, "xrSubmitLiftFrameDXR");
+	if (rr != XR_SUCCESS) {
+		return rr;
+	}
+	xrt_result_t xret = ipc_client_lift_submit(
+	    route.c, st->id, (xrt_graphics_buffer_handle_t)(intptr_t)submitInfo->inputTexture,
 	    submitInfo->inputIsDxgi == XR_TRUE, (uint32_t)submitInfo->extent.width, (uint32_t)submitInfo->extent.height,
 	    (int64_t)submitInfo->sourceTime, pp, vp_count > 0 ? vps : NULL, vp_count, vcp, rigp, frameId);
-	return lift_xret(&log, sess, xret, "xrSubmitLiftFrameDXR");
+	lift_route_close(sess, &route, xret);
+	return lift_xret(&log, sess, &route, xret, "xrSubmitLiftFrameDXR");
 }
 
 //! Fill an XrLiftDepthResultDXR from an acquired result (+ handles on first
-//! depth acquire / reallocation).
+//! depth acquire / reallocation) over the result's @p route; on a failed
+//! export *out_xret carries the service result for lift_route_close().
 static XrResult
 lift_fill_depth_result(struct oxr_logger *log,
                        struct oxr_session *sess,
                        struct oxr_lift_stream_dxr *st,
+                       const struct lift_route *route,
                        const struct xrt_lift_result *r,
-                       XrLiftDepthResultDXR *d)
+                       XrLiftDepthResultDXR *d,
+                       xrt_result_t *out_xret)
 {
 	XrStructureType type = d->type;
 	void *next = d->next;
@@ -537,15 +694,15 @@ lift_fill_depth_result(struct oxr_logger *log,
 		xrt_graphics_buffer_handle_t th = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
 		xrt_graphics_sync_handle_t fh = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
 		xrt_result_t xret =
-		    comp_ipc_client_compositor_lift_get_depth_output(&sess->xcn->base, st->id, &have_tex, &th);
-		XrResult xr = lift_xret(log, sess, xret, "xrAcquireLiftResultDXR (depth export)");
-		if (xr != XR_SUCCESS) {
-			return xr;
+		    ipc_client_lift_get_depth_output(route->c, st->id, &have_tex, NULL, NULL, NULL, &th);
+		if (xret != XRT_SUCCESS) {
+			*out_xret = xret;
+			return lift_xret(log, sess, route, xret, "xrAcquireLiftResultDXR (depth export)");
 		}
-		xret = comp_ipc_client_compositor_lift_get_fence(&sess->xcn->base, st->id, &have_fence, &fh);
-		xr = lift_xret(log, sess, xret, "xrAcquireLiftResultDXR (depth fence export)");
-		if (xr != XR_SUCCESS) {
-			return xr;
+		xret = ipc_client_lift_get_fence(route->c, st->id, &have_fence, &fh);
+		if (xret != XRT_SUCCESS) {
+			*out_xret = xret;
+			return lift_xret(log, sess, route, xret, "xrAcquireLiftResultDXR (depth fence export)");
 		}
 		const bool got_tex = have_tex && th != XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
 		const bool got_fence = have_fence && fh != XRT_GRAPHICS_SYNC_HANDLE_INVALID;
@@ -580,15 +737,19 @@ oxr_xrAcquireLiftResultDXR(XrLiftStreamDXR stream, XrLiftResultDXR *result)
 	result->outputTexture = NULL;
 	result->fence = NULL;
 
-	bool ready = false;
-	struct xrt_lift_result r;
-	xrt_result_t xret = comp_ipc_client_compositor_lift_acquire(&sess->xcn->base, st->id, &ready, &r);
-	XrResult xr = lift_xret(&log, sess, xret, "xrAcquireLiftResultDXR");
+	struct lift_route route;
+	XrResult xr = lift_stream_route_open(&log, st, &route, "xrAcquireLiftResultDXR");
 	if (xr != XR_SUCCESS) {
 		return xr;
 	}
-	if (!ready) {
-		return XR_LIFT_NOT_READY_DXR;
+
+	bool ready = false;
+	struct xrt_lift_result r;
+	xrt_result_t xret = ipc_client_lift_acquire(route.c, st->id, &ready, &r);
+	if (xret != XRT_SUCCESS || !ready) {
+		lift_route_close(sess, &route, xret);
+		xr = lift_xret(&log, sess, &route, xret, "xrAcquireLiftResultDXR");
+		return xr != XR_SUCCESS ? xr : XR_LIFT_NOT_READY_DXR;
 	}
 
 	result->frameId = r.frame_id;
@@ -623,15 +784,15 @@ oxr_xrAcquireLiftResultDXR(XrLiftStreamDXR stream, XrLiftResultDXR *result)
 		bool have_tex = false, have_fence = false;
 		xrt_graphics_buffer_handle_t th = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
 		xrt_graphics_sync_handle_t fh = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
-		xret = comp_ipc_client_compositor_lift_get_output(&sess->xcn->base, st->id, &have_tex, &th);
-		xr = lift_xret(&log, sess, xret, "xrAcquireLiftResultDXR (output export)");
-		if (xr != XR_SUCCESS) {
-			return xr;
+		xret = ipc_client_lift_get_output(route.c, st->id, &have_tex, NULL, NULL, NULL, &th);
+		if (xret != XRT_SUCCESS) {
+			lift_route_close(sess, &route, xret);
+			return lift_xret(&log, sess, &route, xret, "xrAcquireLiftResultDXR (output export)");
 		}
-		xret = comp_ipc_client_compositor_lift_get_fence(&sess->xcn->base, st->id, &have_fence, &fh);
-		xr = lift_xret(&log, sess, xret, "xrAcquireLiftResultDXR (fence export)");
-		if (xr != XR_SUCCESS) {
-			return xr;
+		xret = ipc_client_lift_get_fence(route.c, st->id, &have_fence, &fh);
+		if (xret != XRT_SUCCESS) {
+			lift_route_close(sess, &route, xret);
+			return lift_xret(&log, sess, &route, xret, "xrAcquireLiftResultDXR (fence export)");
 		}
 		const bool got_tex = have_tex && th != XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
 		const bool got_fence = have_fence && fh != XRT_GRAPHICS_SYNC_HANDLE_INVALID;
@@ -649,11 +810,14 @@ oxr_xrAcquireLiftResultDXR(XrLiftStreamDXR stream, XrLiftResultDXR *result)
 	XrLiftDepthResultDXR *dres =
 	    OXR_GET_OUTPUT_FROM_CHAIN(result, XR_TYPE_LIFT_DEPTH_RESULT_DXR, XrLiftDepthResultDXR);
 	if (dres != NULL) {
-		xr = lift_fill_depth_result(&log, sess, st, &r, dres);
+		xret = XRT_SUCCESS;
+		xr = lift_fill_depth_result(&log, sess, st, &route, &r, dres, &xret);
 		if (xr != XR_SUCCESS) {
+			lift_route_close(sess, &route, xret);
 			return xr;
 		}
 	}
+	lift_route_close(sess, &route, XRT_SUCCESS);
 	return XR_SUCCESS;
 }
 
@@ -677,11 +841,17 @@ oxr_xrAcquireLiftBlobDXR(XrLiftStreamDXR stream, XrLiftBlobDXR *blob)
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "XrLiftBlobDXR::bytes is NULL with a capacity");
 	}
 
+	struct lift_route route;
+	XrResult xr = lift_stream_route_open(&log, st, &route, "xrAcquireLiftBlobDXR");
+	if (xr != XR_SUCCESS) {
+		return xr;
+	}
 	bool ready = false, delivered = false;
 	struct xrt_lift_blob_info info;
-	xrt_result_t xret = comp_ipc_client_compositor_lift_acquire_blob(
-	    &sess->xcn->base, st->id, blob->byteCapacityInput, blob->bytes, &ready, &delivered, &info);
-	XrResult xr = lift_xret(&log, sess, xret, "xrAcquireLiftBlobDXR");
+	xrt_result_t xret = ipc_client_lift_acquire_blob(route.c, st->id, blob->byteCapacityInput, blob->bytes, &ready,
+	                                                 &delivered, &info);
+	lift_route_close(sess, &route, xret);
+	xr = lift_xret(&log, sess, &route, xret, "xrAcquireLiftBlobDXR");
 	if (xr != XR_SUCCESS) {
 		return xr;
 	}
@@ -720,8 +890,14 @@ oxr_xrSetLiftStreamPriorityDXR(XrLiftStreamDXR stream, XrLiftPriorityDXR priorit
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "xrSetLiftStreamPriorityDXR: priority (%d) invalid",
 		                 (int)priority);
 	}
-	xrt_result_t xret = comp_ipc_client_compositor_lift_set_priority(&sess->xcn->base, st->id, (uint32_t)priority);
-	return lift_xret(&log, sess, xret, "xrSetLiftStreamPriorityDXR");
+	struct lift_route route;
+	XrResult xr = lift_stream_route_open(&log, st, &route, "xrSetLiftStreamPriorityDXR");
+	if (xr != XR_SUCCESS) {
+		return xr;
+	}
+	xrt_result_t xret = ipc_client_lift_set_priority(route.c, st->id, (uint32_t)priority);
+	lift_route_close(sess, &route, xret);
+	return lift_xret(&log, sess, &route, xret, "xrSetLiftStreamPriorityDXR");
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
@@ -736,9 +912,15 @@ oxr_xrGetLiftStreamStatsDXR(XrLiftStreamDXR stream, XrLiftStreamStatsDXR *stats)
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
 	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, stats, XR_TYPE_LIFT_STREAM_STATS_DXR);
 
+	struct lift_route route;
+	XrResult xr = lift_stream_route_open(&log, st, &route, "xrGetLiftStreamStatsDXR");
+	if (xr != XR_SUCCESS) {
+		return xr;
+	}
 	struct xrt_lift_stream_stats s;
-	xrt_result_t xret = comp_ipc_client_compositor_lift_stats(&sess->xcn->base, st->id, &s);
-	XrResult xr = lift_xret(&log, sess, xret, "xrGetLiftStreamStatsDXR");
+	xrt_result_t xret = ipc_client_lift_stats(route.c, st->id, &s);
+	lift_route_close(sess, &route, xret);
+	xr = lift_xret(&log, sess, &route, xret, "xrGetLiftStreamStatsDXR");
 	if (xr != XR_SUCCESS) {
 		return xr;
 	}

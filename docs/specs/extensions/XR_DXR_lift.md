@@ -4,10 +4,10 @@
 |---|---|
 | **Extension Name** | `XR_DXR_lift` |
 | **Spec Version** | 3 |
-| **Extension Type** | Instance extension (service path — Windows/D3D11; advertised on every desktop platform, where a service without a module reports `supportedModes = 0`) |
+| **Extension Type** | Instance extension (conversion in the service — Windows/D3D11; IPC sessions, and in-process D3D11/D3D12 sessions on Windows over a lift-only connection (ADR-049); advertised on every desktop platform, where a service without a module reports `supportedModes = 0`) |
 | **Header** | `src/external/openxr_includes/openxr/XR_DXR_lift.h` (canonical; auto-syncs to `displayxr-extensions`) |
 | **Status** | Provisional (`1004999270–285` block, pending Khronos registry) |
-| **Decision record** | [ADR-042](../../adr/ADR-042-vendor-2d3d-conversion-supersedes-default.md); viewpoint policy, app rig and auxiliary depth: [ADR-048](../../adr/ADR-048-lift-viewpoint-policy.md) (+ Addendum A) |
+| **Decision record** | [ADR-042](../../adr/ADR-042-vendor-2d3d-conversion-supersedes-default.md); viewpoint policy, app rig and auxiliary depth: [ADR-048](../../adr/ADR-048-lift-viewpoint-policy.md) (+ Addendum A) · in-process: [ADR-049](../../adr/ADR-049-in-process-lift-rides-the-service.md) |
 | **Plug-in contract** | `src/xrt/include/xrt/xrt_dp_lift.h` + the lift slots of `xrt_display_processor_d3d11` (`XRT_DP_D3D11_HAS_LIFT`), [`xrt_plugin_iface.md` § lift](../../reference/xrt_plugin_iface.md#turning-2d-into-3d-the-lift-slots-adr-042-xr_dxr_lift) |
 
 ## 1. What it is
@@ -51,7 +51,8 @@ if (props.state == XR_LIFT_STATE_READY_DXR && (props.supportedModes & XR_LIFT_MO
 
 | Situation | `xrGetLiftPropertiesDXR` |
 |---|---|
-| In-process session (any platform) | `XR_ERROR_FEATURE_UNSUPPORTED` — lift is IPC-only, like the weave service |
+| In-process D3D11 / D3D12 session on Windows (engine apps, e.g. the Unity display provider) | the service's module, reached over a lift-only connection the session opens in the background on its first lift call (ADR-049): `ACTIVATING` while it connects, then the rows below; `UNAVAILABLE` when no service is running (it is never launched for this) or the service refuses the connection (e.g. a from-source runtime against a different installed service) |
+| Any other in-process session (GL, Vulkan, Metal; any non-Windows platform) | `XR_ERROR_FEATURE_UNSUPPORTED` |
 | Service without a module (macOS, Linux, Android, or a Windows plug-in without lift slots, sim_display) | `XR_SUCCESS`, `supportedModes = 0`, `UNAVAILABLE` |
 | First query on a Windows service with a module | `ACTIVATING` (the service is bringing its lift device + the plug-in's lift DP up in the background) |
 | Module loading (model weights, licence check, engine build) | `ACTIVATING` — poll ≤ 2 Hz, do not fall back permanently |
@@ -331,6 +332,23 @@ Why a separate entry point rather than a struct chained on the texture acquire: 
 kinds never coexist on a stream, and a blob needs the two-call size negotiation a texture does
 not. One call per result kind keeps each contract minimal.
 
+### 5.3 D3D12 callers (engine apps, ADR-049)
+
+The handles are D3D12-consumable as they are: the export texture is an NT-handle shared texture
+**without** a keyed mutex, the fence an NT-handle shared fence.
+
+- **Results:** `ID3D12Device::OpenSharedHandle(outputTexture)` → `ID3D12Resource`,
+  `OpenSharedHandle(fence)` → `ID3D12Fence`; close both handles. Per result:
+  `ID3D12CommandQueue::Wait(fence, fenceValue)` before the first read. The rest of §5.1 holds.
+- **Adapter:** results live on the service's ingest adapter (the LUID an IPC D3D session is
+  told to use). A device on another adapter cannot open them — treat an `OpenSharedHandle`
+  failure as `UNAVAILABLE` and fall back.
+- **Input:** create the input with `D3D12_HEAP_FLAG_SHARED` and `ID3D12Device::CreateSharedHandle`
+  and pass that NT handle (`inputIsDxgi = XR_FALSE`). D3D12 has no keyed mutex, so the service
+  snapshots the texture at submit **without a GPU wait**: complete the writes before
+  `xrSubmitLiftFrameDXR` (signal + CPU-wait a fence) and do not rewrite the texture until a later
+  frame — double-buffer the input. A submit-side fence is planned (ADR-049 follow-ups).
+
 ## 6. Lifting weave rects
 
 ```c
@@ -465,7 +483,12 @@ UI rates.
 - **Vendor knobs live in the SERVICE's environment** (e.g. a module's backend selection), not
   the app's — the conversion runs in `displayxr-service.exe`.
 - **Streams belong to the IPC connection**, not the session, and die with it; the calls need no
-  compositor session, which is what lets `displayxr-cli lift` drive them headless.
+  compositor session, which is what lets `displayxr-cli lift` drive them headless — and what lets
+  an in-process session use lift (ADR-049): it opens a sessionless `APP` connection named
+  `<exe> (in-process lift)` (`ipc_client_lift_link.c`, background connect, never launches the
+  service, retried at most every 5 s) and runs the same calls on it. WARN lines in the app's
+  log: `[lift] in-process: lift-only service connection up (generation N)`, `... no service
+  connection for 2D->3D conversion ...` (once), `... connection (generation N) is gone ...`.
 
 ## 10. Error codes and connection loss
 
@@ -475,11 +498,11 @@ Mirrors XR_DXR_weave §4b.
 |---|---|---|
 | `XR_LIFT_NOT_READY_DXR` (success) | no result newer than the last acquired | yes |
 | `XR_ERROR_VALIDATION_FAILURE` | a struct out of contract (mode not one bit, bad viewCount, EXPLICIT without viewpoints, `XrLiftDepthRequestDXR` on a DEPTH / GAUSSIANS stream, wrong acquire for the mode, bad `rectIndex`) | yes — caller bug, nothing sent |
-| `XR_ERROR_FEATURE_UNSUPPORTED` | in-process session; mode not supported by a READY module; no module | yes — permanent for that request |
+| `XR_ERROR_FEATURE_UNSUPPORTED` | in-process session other than D3D11/D3D12 on Windows; mode not supported by a READY module; no module; in-process: a stream of a lift connection that was lost (destroy it, create a new one) | yes — permanent for that request |
 | `XR_ERROR_LIMIT_REACHED` | `maxStreams` reached | yes |
 | `XR_ERROR_SIZE_INSUFFICIENT` | blob capacity too small (latch kept) | yes |
 | `XR_ERROR_RUNTIME_FAILURE` | the service refused this call over a healthy pipe — most commonly the 4 ms input keyed-mutex miss, or a stream the service no longer knows | **yes — retry next frame** |
-| `XR_ERROR_INSTANCE_LOST` | the IPC connection is gone | no — recover with a new instance (weave §4b) |
+| `XR_ERROR_INSTANCE_LOST` | the IPC connection is gone (IPC sessions only — an in-process session's lift connection dying is `XR_ERROR_RUNTIME_FAILURE` on that call; the session renders on, and the next `xrGetLiftPropertiesDXR` reconnects) | no — recover with a new instance (weave §4b) |
 | `XR_ERROR_SESSION_LOST` | any call after that | no |
 
 ## 11. Vendor contract, in one table
@@ -531,6 +554,7 @@ WARP + the lift-only factory): modes 0 passes; only malformed caps fail
 | DisplayXR Browser (Chromium fork) | GPU process → service | `xrGetLiftPropertiesDXR` to decide vendor vs open default (ADR-042); `XrWeaveSubmitLiftRectsDXR` for inline 2D video/images lifted in place; `xrSubmitLiftFrameDXR` + acquire where the page wants the depth/views itself |
 | DisplayXR web SDK (`@displayxr/inline3d`) | via the browser | the same policy: prefer the runtime module when READY; GAUSSIANS via the blob path supersedes the SDK's open photo → splats lift |
 | 3D calling (up to 4 mono tiles) | app → service | one SBS stream per tile; `xrSetLiftStreamPriorityDXR` HIGH for the active speaker |
+| Engine apps (Unity display provider, D3D12 in-process) | in-process session → lift-only connection → service (ADR-049) | streams + texture acquire (§5.3); no weave rects (the app composes the views itself) |
 | `displayxr-cli lift` | DIAG IPC | caps + the N0 probe (§12) |
 
 When changing the header, byte-sync every consumer's vendored copy and rebuild it — coupled-PR
@@ -543,6 +567,10 @@ order: runtime → extensions auto-sync → consumers.
 | 1 | Initial: properties + states, streams (DEPTH / SBS / NVIEW / GAUSSIANS), non-blocking latest-wins submit, texture acquire (weave-style handles + fence), blob acquire (two-call latch), weave-rect lift chain, per-stream priority scheduling + stats, `focalPx`. |
 | 2 | Viewpoint policy (ADR-048, §4.1): viewpoints relative to the lifted rect / submitting window centre (was: the panel centre), `XrLiftViewControlDXR` (ipd / parallax factors, axis mode, offset clamp, recentering; defaults X + EASE_BACK 1 s / 2 s), `XrLiftResultViewpointsDXR` echo. |
 | 3 | App camera + metric depth (ADR-048 Addendum A, §4.2–4.3): `XrDisplayRigDXR` / `XrCameraRigDXR` on `XrLiftOptionsDXR` / `XrWeaveRectLiftDXR` drive the TRACKED viewpoints with the `xrLocateViews` rig math; EXPLICIT viewpoints accepted on lifted weave rects; auxiliary depth for SBS / NVIEW streams — `XrLiftDepthRequestDXR`, `XrLiftDepthResultDXR` (texture + shared fence, units, encoding, intrinsics, convergence depth, viewpoint, `depthToDisplay`), `XrLiftDepthPropertiesDXR`. A separate version from 2 because v2 can ship on its own (#1864): an app tests `SPEC_VERSION >= 3` for these. |
+
+Runtime behaviour, no spec-version change: in-process D3D11 / D3D12 sessions on Windows use lift
+over a lift-only connection (ADR-049). A consumer detects it the same way as before — an older
+runtime answers `xrGetLiftPropertiesDXR` on such a session with `XR_ERROR_FEATURE_UNSUPPORTED`.
 
 ## Probing on a Windows box — gotchas (first N0 run, 2026-09-25)
 
