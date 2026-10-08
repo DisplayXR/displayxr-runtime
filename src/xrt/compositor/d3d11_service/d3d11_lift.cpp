@@ -15,6 +15,7 @@
 #include "xrt/xrt_display_processor_d3d11.h"
 
 #include "util/u_lift_mailbox.h"
+#include "util/u_lift_viewpoint.h"
 #include "util/u_logging.h"
 #include "os/os_time.h"
 
@@ -25,6 +26,7 @@
 #include <dxgi1_2.h>
 
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -240,6 +242,10 @@ struct lift_in_slot
 	//! The part of the submitted rect this frame holds (letterbox crop):
 	//! x0, y0, x1, y1 normalised to the rect. {0,0,1,1} = the whole rect.
 	float active[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+	//! ADR-048: the stream's viewpoint policy and the region this frame came
+	//! from, as of this frame's submit.
+	xrt_lift_view_control vc = {};
+	xrt_lift_rect_frame frame = {};
 };
 
 //! One output ring slot: created on the LIFT device, opened on the SERVICE device.
@@ -255,6 +261,11 @@ struct lift_out_slot
 	std::shared_ptr<std::vector<uint8_t>> blob; //!< GAUSSIANS
 	uint32_t blob_format = 0;
 	float active[4] = {0.0f, 0.0f, 1.0f, 1.0f}; //!< the input's lift_in_slot::active
+	//! ADR-048 echo: the viewpoints this result was synthesized for.
+	uint32_t vp_count = 0;
+	float vps[3 * XRT_DP_LIFT_MAX_EXPLICIT_VIEWPOINTS] = {};
+	float rect_center[3] = {};
+	float rect_size[2] = {};
 };
 
 //! One letterbox profile readback (service device, producer thread only).
@@ -277,6 +288,9 @@ struct lift_stream
 	xrt_dp_lift_params last_params = {};
 	float last_viewpoints[3 * XRT_DP_LIFT_MAX_EXPLICIT_VIEWPOINTS] = {};
 	uint32_t last_viewpoint_floats = 0;
+	//! ADR-048: the sticky viewpoint policy (XrLiftViewControlDXR), set at
+	//! stream create to the defaults; replaced by every submit that carries one.
+	xrt_lift_view_control vc = {};
 
 	uint32_t priority = U_LIFT_PRIORITY_NORMAL; //!< XrLiftPriorityDXR
 	bool dead = false;                          //!< destroy requested; the lift thread reaps it
@@ -288,6 +302,11 @@ struct lift_stream
 	bool dp_failed = false;
 	ID3D11Texture2D *exact_tex = nullptr;
 	uint32_t exact_w = 0, exact_h = 0;
+	//! ADR-048 recenter filter (lift thread only). Zero = reset: stream create.
+	u_lift_recenter recenter = {};
+	//! The last policy WARNed about (lift thread only): WARN on change, never per frame.
+	xrt_lift_view_control logged_vc = {};
+	bool logged_vc_valid = false;
 
 	// Caller-input import cache (service device, producer thread only).
 	HANDLE imp_handle = nullptr;
@@ -334,6 +353,11 @@ struct d3d11_lift
 	xrt_dp_factory_d3d11_fn_t fallback_factory = nullptr;
 	bool (*eyes_fn)(void *ud, struct xrt_eye_positions *out) = nullptr;
 	void *eyes_ud = nullptr;
+	//! The display's nominal viewing distance (ADR-048 straight-on viewer).
+	float nominal_z = U_LIFT_NOMINAL_Z_DEFAULT_M;
+	//! DXR_LIFT_RECENTER=off, read once at create: force recentering OFF for
+	//! every stream (A/B against the ADR-048 default ease-back).
+	bool recenter_off = false;
 
 	// Snapshot blit (service device).
 	ID3D11VertexShader *snap_vs = nullptr;
@@ -800,6 +824,126 @@ lift_reap(d3d11_lift *l, std::unique_lock<std::mutex> &lk)
 	}
 }
 
+//! Log name of a recenter mode.
+static const char *
+recenter_str(uint32_t mode)
+{
+	return mode == U_LIFT_RECENTER_EASE_BACK ? "ease-back" : "off";
+}
+
+//! The viewpoints one conversion uses (ADR-048), and what the DP is told about them.
+struct viewpoint_result
+{
+	uint32_t floats = 0;   //!< 3 x viewpoints in the caller's array
+	float centre[3] = {};  //!< rect centre, display space
+	float rect_w = 0.0f;   //!< metres; 0 = unknown
+	float rect_h = 0.0f;   //!< metres; 0 = unknown
+	float baseline = 0.0f; //!< first-to-last viewpoint distance
+	float mid[3] = {};     //!< midpoint after the policy
+	uint32_t axis_mode = XRT_DP_LIFT_AXIS_X;
+	float max_offset = 0.0f;
+	uint32_t recenter_mode = U_LIFT_RECENTER_OFF;
+};
+
+/*!
+ * Resolve the viewpoints of one conversion (lift thread, no lock held).
+ *
+ * Every viewpoint is rebased to the lifted region's centre (@p frame; the
+ * panel centre when it has none). EXPLICIT viewpoints (the caller's, in
+ * @p vps on entry) get only that rebase. TRACKED ones are resolved HERE, per
+ * conversion, from the panel's predicted eyes (the lift DP has no tracker
+ * session of its own) and then run through the stream's viewpoint policy
+ * (u_lift_viewpoint.h): rig factors, axis mask, recenter filter, clamp.
+ * DEPTH / GAUSSIANS streams get none.
+ */
+static viewpoint_result
+resolve_viewpoints(d3d11_lift *l,
+                   lift_stream &st,
+                   uint32_t view_count,
+                   const xrt_lift_view_control &in_vc,
+                   const xrt_lift_rect_frame &frame,
+                   float *vps,
+                   uint32_t vp_floats)
+{
+	viewpoint_result r;
+	if (frame.valid) {
+		memcpy(r.centre, frame.center, sizeof(r.centre));
+	}
+	r.rect_w = frame.width_m > 0.0f ? frame.width_m : 0.0f;
+	r.rect_h = frame.height_m > 0.0f ? frame.height_m : 0.0f;
+
+	if (vp_floats >= 3) {
+		// EXPLICIT: the app's own viewpoints, only rebased.
+		const uint32_t n = vp_floats / 3;
+		u_lift_viewpoint_rebase(vps, n, r.centre);
+		r.floats = 3 * n;
+		r.axis_mode = XRT_DP_LIFT_AXIS_XYZ;
+		for (uint32_t i = 0; i < n; i++) {
+			for (int a = 0; a < 3; a++) {
+				r.mid[a] += vps[3 * i + a] / (float)n;
+			}
+		}
+		if (n >= 2) {
+			const float *f = &vps[0];
+			const float *e = &vps[3 * (n - 1)];
+			const float dx = e[0] - f[0], dy = e[1] - f[1], dz = e[2] - f[2];
+			r.baseline = sqrtf(dx * dx + dy * dy + dz * dz);
+		}
+		return r;
+	}
+	if (l->eyes_fn == nullptr || st.info.mode == XRT_DP_LIFT_MODE_GAUSSIANS ||
+	    st.info.mode == XRT_DP_LIFT_MODE_DEPTH) {
+		return r;
+	}
+
+	u_lift_view_control vc = {in_vc.ipd_factor,    in_vc.parallax_factor, in_vc.axis_mode, in_vc.max_offset_m,
+	                          in_vc.recenter_mode, in_vc.hold_s,          in_vc.tau_s};
+	u_lift_view_control_sanitize(&vc);
+	if (l->recenter_off) {
+		vc.recenter_mode = U_LIFT_RECENTER_OFF;
+	}
+	r.axis_mode = vc.axis_mode;
+	r.max_offset = vc.max_offset_m;
+	r.recenter_mode = vc.recenter_mode;
+	// WARN when a stream's effective policy changes (an app sets it once, or
+	// on a user toggle), never per frame.
+	const xrt_lift_view_control eff = {vc.ipd_factor,    vc.parallax_factor, vc.axis_mode, vc.max_offset_m,
+	                                   vc.recenter_mode, vc.hold_s,          vc.tau_s};
+	if (!st.logged_vc_valid || memcmp(&eff, &st.logged_vc, sizeof(eff)) != 0) {
+		st.logged_vc = eff;
+		st.logged_vc_valid = true;
+		U_LOG_W(
+		    "[lift] stream %llu viewpoint policy: ipd=%.2f parallax=%.2f axis=%u max_offset=%.3f m "
+		    "recenter=%s hold=%.2f s tau=%.2f s (rect-relative viewpoints, ADR-048)",
+		    (unsigned long long)st.id, vc.ipd_factor, vc.parallax_factor, vc.axis_mode, vc.max_offset_m,
+		    recenter_str(vc.recenter_mode), vc.hold_s, vc.tau_s);
+	}
+
+	struct xrt_eye_positions eyes = {};
+	if (!l->eyes_fn(l->eyes_ud, &eyes) || !eyes.valid || eyes.count < 2) {
+		u_lift_recenter_reset(&st.recenter); // no eyes: the filter starts over
+		return r;
+	}
+	if (!eyes.is_tracking) {
+		// Tracking lost: the vendor's fallback eyes are still used, but the
+		// recenter filter forgets its reference (ADR-048: reset on loss).
+		u_lift_recenter_reset(&st.recenter);
+	}
+	// The pair (a module spreads N views around it), or N eyes when the panel
+	// reports exactly the stream's view count.
+	uint32_t n = eyes.count == view_count ? eyes.count : 2;
+	n = n > XRT_DP_LIFT_MAX_EXPLICIT_VIEWPOINTS ? XRT_DP_LIFT_MAX_EXPLICIT_VIEWPOINTS : n;
+	for (uint32_t i = 0; i < n; i++) {
+		vps[3 * i + 0] = eyes.eyes[i].x;
+		vps[3 * i + 1] = eyes.eyes[i].y;
+		vps[3 * i + 2] = eyes.eyes[i].z;
+	}
+	u_lift_viewpoint_rebase(vps, n, r.centre);
+	u_lift_viewpoint_apply(&vc, &st.recenter, l->nominal_z, os_monotonic_get_ns(), vps, n, vps, &r.baseline, r.mid);
+	r.floats = 3 * n;
+	return r;
+}
+
 /*!
  * Convert the pending frame of @p st. Called with @p lk HELD; drops it around
  * every GPU / module call and returns with it held.
@@ -814,33 +958,28 @@ lift_convert_one(d3d11_lift *l, lift_stream &st, std::unique_lock<std::mutex> &l
 	}
 	st.converting = true;
 	lift_in_slot &in = st.in[in_slot];
-	const xrt_dp_lift_params params = in.params;
+	xrt_dp_lift_params params = in.params;
 	float vps[3 * XRT_DP_LIFT_MAX_EXPLICIT_VIEWPOINTS];
 	memcpy(vps, in.viewpoints, sizeof(vps));
 	uint32_t vp_floats = in.viewpoint_floats;
 	float active[4];
 	memcpy(active, in.active, sizeof(active));
+	const xrt_lift_view_control in_vc = in.vc;
+	const xrt_lift_rect_frame frame = in.frame;
 	const uint32_t w = meta.width, h = meta.height;
 	lk.unlock();
 
-	// TRACKED viewpoints are resolved HERE, per conversion, from the panel's
-	// predicted eyes, and always handed to the module explicitly: the lift DP
-	// has no tracker session of its own. The pair (a module spreads N views
-	// around it); nothing when no eyes are known yet.
-	if (vp_floats == 0 && l->eyes_fn != nullptr && st.info.mode != XRT_DP_LIFT_MODE_GAUSSIANS &&
-	    st.info.mode != XRT_DP_LIFT_MODE_DEPTH) {
-		struct xrt_eye_positions eyes = {};
-		if (l->eyes_fn(l->eyes_ud, &eyes) && eyes.valid && eyes.count >= 2) {
-			uint32_t n = eyes.count == params.view_count ? eyes.count : 2;
-			n = n > XRT_DP_LIFT_MAX_EXPLICIT_VIEWPOINTS ? XRT_DP_LIFT_MAX_EXPLICIT_VIEWPOINTS : n;
-			for (uint32_t i = 0; i < n; i++) {
-				vps[3 * i + 0] = eyes.eyes[i].x;
-				vps[3 * i + 1] = eyes.eyes[i].y;
-				vps[3 * i + 2] = eyes.eyes[i].z;
-			}
-			vp_floats = 3 * n;
-		}
-	}
+	// ADR-048: rect-relative viewpoints + the stream's viewpoint policy, and
+	// what the DP is told about them (appended xrt_dp_lift_params fields).
+	const viewpoint_result vr = resolve_viewpoints(l, st, params.view_count, in_vc, frame, vps, vp_floats);
+	vp_floats = vr.floats;
+	params.struct_size = (uint32_t)sizeof(params);
+	params.rect_width_m = vr.rect_w;
+	params.rect_height_m = vr.rect_h;
+	params.baseline_m = vr.baseline;
+	params.axis_mode = vr.axis_mode;
+	params.max_offset_m = vr.max_offset;
+	params.viewpoint_frame = XRT_DP_LIFT_VIEWPOINT_FRAME_RECT;
 
 	bool ok = true;
 	// 1. The module's own stream, created lazily (module contract: lift thread only).
@@ -945,6 +1084,11 @@ lift_convert_one(d3d11_lift *l, lift_stream &st, std::unique_lock<std::mutex> &l
 				l->lift_context->Flush();
 				o.view_count = views;
 				memcpy(o.active, active, sizeof(o.active));
+				o.vp_count = vp_floats / 3;
+				memcpy(o.vps, vps, sizeof(o.vps));
+				memcpy(o.rect_center, vr.centre, sizeof(o.rect_center));
+				o.rect_size[0] = vr.rect_w;
+				o.rect_size[1] = vr.rect_h;
 			}
 		}
 	} else if (ok && is_blob) {
@@ -974,6 +1118,14 @@ lift_convert_one(d3d11_lift *l, lift_stream &st, std::unique_lock<std::mutex> &l
 		    (unsigned long long)st.id, (unsigned long long)st.mb.submitted, (unsigned long long)st.mb.converted,
 		    (unsigned long long)st.mb.dropped, (unsigned long long)st.mb.failed, st.mb.lat_last_ns / 1e6,
 		    st.mb.lat_ema_ns / 1e6, st.mb.lat_min_ns / 1e6, st.mb.lat_max_ns / 1e6);
+		if (vp_floats >= 3) {
+			U_LOG_I(
+			    "[lift] stream %llu viewpoints: rect centre=(%.3f, %.3f) m size=%.3fx%.3f m mid=(%.3f, "
+			    "%.3f, "
+			    "%.3f) baseline=%.4f m axis=%u recenter=%s",
+			    (unsigned long long)st.id, vr.centre[0], vr.centre[1], vr.rect_w, vr.rect_h, vr.mid[0],
+			    vr.mid[1], vr.mid[2], vr.baseline, vr.axis_mode, recenter_str(vr.recenter_mode));
+		}
 	}
 	l->cv.notify_all();
 }
@@ -1123,7 +1275,8 @@ d3d11_lift_create(ID3D11Device *svc_device,
                   void *lift_factory,
                   void *fallback_factory,
                   bool (*eyes_fn)(void *ud, struct xrt_eye_positions *out),
-                  void *eyes_ud)
+                  void *eyes_ud,
+                  float nominal_z)
 {
 	if (svc_device == nullptr || svc_context == nullptr || svc_ctx_mutex == nullptr) {
 		return nullptr;
@@ -1138,6 +1291,14 @@ d3d11_lift_create(ID3D11Device *svc_device,
 	l->fallback_factory = (xrt_dp_factory_d3d11_fn_t)fallback_factory;
 	l->eyes_fn = eyes_fn;
 	l->eyes_ud = eyes_ud;
+	l->nominal_z = nominal_z > 0.0f ? nominal_z : U_LIFT_NOMINAL_Z_DEFAULT_M;
+	{
+		const char *rc = getenv("DXR_LIFT_RECENTER");
+		l->recenter_off = rc != nullptr && (_stricmp(rc, "off") == 0 || strcmp(rc, "0") == 0);
+		if (l->recenter_off) {
+			U_LOG_W("[lift] DXR_LIFT_RECENTER=%s: viewpoint recentering forced OFF for every stream", rc);
+		}
+	}
 	(void)svc_device->QueryInterface(__uuidof(ID3D11Device1), (void **)&l->svc_device1);
 	(void)svc_context->QueryInterface(__uuidof(ID3D11DeviceContext4), (void **)&l->svc_context4);
 
@@ -1345,6 +1506,12 @@ d3d11_lift_stream_create(struct d3d11_lift *l,
 	st->last_params.strength = 1.0f;
 	st->last_params.inpaint = 1;
 	st->last_params.view_count = m == XRT_DP_LIFT_MODE_NVIEW ? 4 : 2;
+	{
+		u_lift_view_control d;
+		u_lift_view_control_default(&d);
+		st->vc = {d.ipd_factor,    d.parallax_factor, d.axis_mode, d.max_offset_m,
+		          d.recenter_mode, d.hold_s,          d.tau_s};
+	}
 	*out_id = st->id;
 	U_LOG_W("[lift] stream %llu created (mode=%u hint=%u scale=%.2f, owner=%llu)", (unsigned long long)st->id, m,
 	        info->content_hint, st->info.input_scale, (unsigned long long)owner);
@@ -1648,6 +1815,8 @@ submit_locked(d3d11_lift *l,
               const xrt_dp_lift_params *params,
               const float *viewpoints,
               uint32_t viewpoint_floats,
+              const xrt_lift_view_control *view_control,
+              const xrt_lift_rect_frame *frame,
               uint32_t max_input_edge,
               bool letterbox,
               uint64_t *out_frame_id)
@@ -1715,8 +1884,13 @@ submit_locked(d3d11_lift *l,
 				memcpy(st->last_viewpoints, viewpoints, st->last_viewpoint_floats * sizeof(float));
 			}
 		}
+		if (view_control != nullptr) {
+			st->vc = *view_control; // sticky (sanitized on the lift thread)
+		}
 		lift_in_slot &in = st->in[slot];
 		in.params = st->last_params;
+		in.vc = st->vc;
+		in.frame = frame != nullptr ? *frame : xrt_lift_rect_frame{};
 		if (capped && in.params.focal_px > 0.0f) {
 			in.params.focal_px *= (float)dw / (float)cw; // focal is in INPUT pixels (a crop keeps the scale)
 		}
@@ -1768,6 +1942,8 @@ d3d11_lift_submit_srv_locked(struct d3d11_lift *l,
                              uint32_t h,
                              int64_t source_time,
                              const struct xrt_dp_lift_params *params,
+                             const struct xrt_lift_view_control *view_control,
+                             const struct xrt_lift_rect_frame *frame,
                              uint64_t *out_frame_id)
 {
 	if (l == nullptr || !l->snap_ok || src == nullptr || out_frame_id == nullptr) {
@@ -1775,7 +1951,7 @@ d3d11_lift_submit_srv_locked(struct d3d11_lift *l,
 	}
 	// Weave-rect snapshot: the service's size cap applies.
 	return submit_locked(l, owner, id, src, src_tw, src_th, x, y, w, h, source_time, params, nullptr, 0,
-	                     l->max_input_edge, l->letterbox, out_frame_id);
+	                     view_control, frame, l->max_input_edge, l->letterbox, out_frame_id);
 }
 
 xrt_result_t
@@ -1790,6 +1966,8 @@ d3d11_lift_submit_handle(struct d3d11_lift *l,
                          const struct xrt_dp_lift_params *params,
                          const float *viewpoints,
                          uint32_t viewpoint_floats,
+                         const struct xrt_lift_view_control *view_control,
+                         const struct xrt_lift_rect_frame *frame,
                          uint64_t *out_frame_id)
 {
 	if (out_frame_id != nullptr) {
@@ -1884,7 +2062,8 @@ d3d11_lift_submit_handle(struct d3d11_lift *l,
 		// An app's explicit frame: its size and content are the app's choice —
 		// never capped, never letterbox-cropped.
 		xret = submit_locked(l, owner, id, st->imp_srv, st->imp_w, st->imp_h, 0, 0, w, h, source_time, params,
-		                     viewpoints, viewpoint_floats, /*max_input_edge*/ 0, /*letterbox*/ false, out_frame_id);
+		                     viewpoints, viewpoint_floats, view_control, frame, /*max_input_edge*/ 0,
+		                     /*letterbox*/ false, out_frame_id);
 	}
 	if (acquired) {
 		st->imp_km->ReleaseSync(0);
@@ -2070,6 +2249,10 @@ d3d11_lift_acquire_result(
 	out->format = o->format;
 	out->view_count = o->view_count;
 	out->output_realloc = realloc;
+	out->viewpoint_count = o->vp_count > XRT_LIFT_MAX_VIEWS ? XRT_LIFT_MAX_VIEWS : o->vp_count;
+	memcpy(out->viewpoints, o->vps, sizeof(out->viewpoints));
+	memcpy(out->rect_center, o->rect_center, sizeof(out->rect_center));
+	memcpy(out->rect_size, o->rect_size, sizeof(out->rect_size));
 	*out_ready = true;
 	unpin();
 	return XRT_SUCCESS;

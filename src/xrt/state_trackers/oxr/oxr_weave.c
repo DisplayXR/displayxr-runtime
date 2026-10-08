@@ -108,6 +108,9 @@ xrt_result_t
 comp_ipc_client_compositor_lift_weave_rects(struct xrt_compositor *xc,
                                             uint32_t count,
                                             const struct xrt_lift_weave_rect *rects);
+//! XrLiftViewControlDXR -> xrt (oxr_lift.c).
+XrResult
+oxr_lift_view_control_from_xr(struct oxr_logger *log, const XrLiftViewControlDXR *v, struct xrt_lift_view_control *out);
 #endif
 
 // Forward decls of the IPC-bridge wrappers (defined in ipc_client_compositor.c).
@@ -805,6 +808,20 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 				lr[i].params.inpaint = o->inpaint == XR_TRUE ? 1u : 0u;
 				lr[i].params.view_count = o->viewCount;
 				lr[i].params.focal_px = o->focalPx > 0.0f ? o->focalPx : 0.0f;
+			}
+			// Spec v2 (ADR-048): the viewpoint policy, chained directly on the
+			// rect (wins) or on its XrLiftOptionsDXR.
+			const XrLiftViewControlDXR *v =
+			    OXR_GET_INPUT_FROM_CHAIN(e, XR_TYPE_LIFT_VIEW_CONTROL_DXR, XrLiftViewControlDXR);
+			if (v == NULL && o != NULL) {
+				v = OXR_GET_INPUT_FROM_CHAIN(o, XR_TYPE_LIFT_VIEW_CONTROL_DXR, XrLiftViewControlDXR);
+			}
+			if (v != NULL) {
+				XrResult vr = oxr_lift_view_control_from_xr(&log, v, &lr[i].view_control);
+				if (vr != XR_SUCCESS) {
+					return vr;
+				}
+				lr[i].has_view_control = true;
 			}
 		}
 		xrt_result_t lx = comp_ipc_client_compositor_lift_weave_rects(&sess->xcn->base, lifts->liftCount, lr);

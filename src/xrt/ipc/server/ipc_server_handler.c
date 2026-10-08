@@ -8445,11 +8445,14 @@ ipc_handle_lift_submit_frame(volatile struct ipc_client_state *ics,
 	lift_params_from_ipc(&args->params, &params);
 	uint32_t vp_count = args->params.viewpoint_count > IPC_LIFT_MAX_VIEWS ? IPC_LIFT_MAX_VIEWS
 	                                                                     : args->params.viewpoint_count;
-	// The handle is the service's from here (closed or cached inside).
-	return comp_d3d11_service_lift_submit(xsysc, lift_owner(ics), args->stream_id, in_handle, in_is_dxgi,
-	                                      args->width, args->height, args->source_time,
-	                                      args->has_params ? &params : NULL, args->params.viewpoints,
-	                                      args->has_params ? 3 * vp_count : 0, out_frame_id);
+	const bool has_vc = args->has_params && args->params.has_view_control != 0;
+	// The handle is the service's from here (closed or cached inside). The
+	// session's compositor (NULL on a headless connection) names the window the
+	// viewpoints are rebased to (ADR-048).
+	return comp_d3d11_service_lift_submit(
+	    xsysc, ics->xc, lift_owner(ics), args->stream_id, in_handle, in_is_dxgi, args->width, args->height,
+	    args->source_time, args->has_params ? &params : NULL, args->params.viewpoints,
+	    args->has_params ? 3 * vp_count : 0, has_vc ? &args->params.view_control : NULL, out_frame_id);
 #else
 	(void)args;
 	weave_submit_release_handles(handles, handle_count);
@@ -8486,6 +8489,10 @@ ipc_handle_lift_acquire_result(volatile struct ipc_client_state *ics,
 	out_lift_result->format = r.format;
 	out_lift_result->view_count = r.view_count;
 	out_lift_result->output_realloc = r.output_realloc ? 1u : 0u;
+	out_lift_result->viewpoint_count = r.viewpoint_count;
+	memcpy(out_lift_result->viewpoints, r.viewpoints, sizeof(out_lift_result->viewpoints));
+	memcpy(out_lift_result->rect_center, r.rect_center, sizeof(out_lift_result->rect_center));
+	memcpy(out_lift_result->rect_size, r.rect_size, sizeof(out_lift_result->rect_size));
 	return xret;
 #else
 	(void)stream_id;
@@ -8654,6 +8661,8 @@ ipc_handle_lift_weave_rects(volatile struct ipc_client_state *ics, const struct 
 		rects[i].params.inpaint = w->inpaint;
 		rects[i].params.view_count = w->view_count > IPC_LIFT_MAX_VIEWS ? IPC_LIFT_MAX_VIEWS : w->view_count;
 		rects[i].params.focal_px = w->focal_px;
+		rects[i].has_view_control = w->has_view_control != 0;
+		rects[i].view_control = w->view_control;
 	}
 	if (!comp_d3d11_service_lift_set_weave_rects(ics->xc, lift_owner(ics), args->count, rects)) {
 		// A rect naming a stream this connection does not own (or a non-SBS/NVIEW

@@ -60,6 +60,7 @@ comp_ipc_client_compositor_lift_submit(struct xrt_compositor *xc,
                                        const struct xrt_dp_lift_params *params,
                                        const float *viewpoints,
                                        uint32_t viewpoint_count,
+                                       const struct xrt_lift_view_control *view_control,
                                        uint64_t *out_frame_id);
 xrt_result_t
 comp_ipc_client_compositor_lift_acquire(struct xrt_compositor *xc,
@@ -181,6 +182,33 @@ lift_validate_options(struct oxr_logger *log, const XrLiftOptionsDXR *o, bool we
 			                 "XrLiftOptionsDXR: EXPLICIT viewpoints need viewCount >= 1 and viewpoints");
 		}
 	}
+	return XR_SUCCESS;
+}
+
+/*!
+ * XrLiftViewControlDXR (spec v2, ADR-048) -> the runtime's view control.
+ * Validates the enums; the service clamps the floats. Shared with
+ * oxr_weave.c (the weave-rect chain).
+ */
+XrResult
+oxr_lift_view_control_from_xr(struct oxr_logger *log, const XrLiftViewControlDXR *v, struct xrt_lift_view_control *out)
+{
+	if (v->axisMode < XR_LIFT_AXIS_MODE_X_DXR || v->axisMode > XR_LIFT_AXIS_MODE_XYZ_DXR) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "XrLiftViewControlDXR::axisMode (%d) invalid",
+		                 (int)v->axisMode);
+	}
+	if (v->recenterMode < XR_LIFT_RECENTER_MODE_OFF_DXR || v->recenterMode > XR_LIFT_RECENTER_MODE_EASE_BACK_DXR) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "XrLiftViewControlDXR::recenterMode (%d) invalid",
+		                 (int)v->recenterMode);
+	}
+	memset(out, 0, sizeof(*out));
+	out->ipd_factor = v->ipdFactor;
+	out->parallax_factor = v->parallaxFactor;
+	out->axis_mode = (uint32_t)v->axisMode;
+	out->max_offset_m = v->maxOffsetMeters;
+	out->recenter_mode = (uint32_t)v->recenterMode;
+	out->hold_s = v->recenterHoldSeconds;
+	out->tau_s = v->recenterTimeConstantSeconds;
 	return XR_SUCCESS;
 }
 
@@ -336,6 +364,8 @@ oxr_xrSubmitLiftFrameDXR(XrLiftStreamDXR stream, const XrLiftFrameSubmitInfoDXR 
 	const struct xrt_dp_lift_params *pp = NULL;
 	float vps[3 * XR_LIFT_MAX_VIEWS_DXR];
 	uint32_t vp_count = 0;
+	struct xrt_lift_view_control vc;
+	const struct xrt_lift_view_control *vcp = NULL;
 	const XrLiftOptionsDXR *opt = OXR_GET_INPUT_FROM_CHAIN(submitInfo, XR_TYPE_LIFT_OPTIONS_DXR, XrLiftOptionsDXR);
 	if (opt != NULL) {
 		XrResult vr = lift_validate_options(&log, opt, /*weave_path*/ false);
@@ -344,6 +374,15 @@ oxr_xrSubmitLiftFrameDXR(XrLiftStreamDXR stream, const XrLiftFrameSubmitInfoDXR 
 		}
 		lift_params_from_xr(opt, st->mode, &params);
 		pp = &params;
+		const XrLiftViewControlDXR *v =
+		    OXR_GET_INPUT_FROM_CHAIN(opt, XR_TYPE_LIFT_VIEW_CONTROL_DXR, XrLiftViewControlDXR);
+		if (v != NULL) {
+			vr = oxr_lift_view_control_from_xr(&log, v, &vc);
+			if (vr != XR_SUCCESS) {
+				return vr;
+			}
+			vcp = &vc;
+		}
 		if (opt->viewpointSource == XR_LIFT_VIEWPOINT_SOURCE_EXPLICIT_DXR) {
 			vp_count = opt->viewCount;
 			for (uint32_t i = 0; i < vp_count; i++) {
@@ -357,7 +396,7 @@ oxr_xrSubmitLiftFrameDXR(XrLiftStreamDXR stream, const XrLiftFrameSubmitInfoDXR 
 	xrt_result_t xret = comp_ipc_client_compositor_lift_submit(
 	    &sess->xcn->base, st->id, (xrt_graphics_buffer_handle_t)(intptr_t)submitInfo->inputTexture,
 	    submitInfo->inputIsDxgi == XR_TRUE, (uint32_t)submitInfo->extent.width, (uint32_t)submitInfo->extent.height,
-	    (int64_t)submitInfo->sourceTime, pp, vp_count > 0 ? vps : NULL, vp_count, frameId);
+	    (int64_t)submitInfo->sourceTime, pp, vp_count > 0 ? vps : NULL, vp_count, vcp, frameId);
 	return lift_xret(&log, sess, xret, "xrSubmitLiftFrameDXR");
 }
 
@@ -400,6 +439,24 @@ oxr_xrAcquireLiftResultDXR(XrLiftStreamDXR stream, XrLiftResultDXR *result)
 	result->format = (int64_t)r.format;
 	result->viewCount = r.view_count;
 	result->latency = (XrDuration)r.latency_ns;
+
+	// Spec v2 (ADR-048): echo the viewpoints this result was synthesized for.
+	XrLiftResultViewpointsDXR *echo =
+	    OXR_GET_OUTPUT_FROM_CHAIN(result, XR_TYPE_LIFT_RESULT_VIEWPOINTS_DXR, XrLiftResultViewpointsDXR);
+	if (echo != NULL) {
+		uint32_t n = r.viewpoint_count > XR_LIFT_MAX_VIEWS_DXR ? XR_LIFT_MAX_VIEWS_DXR : r.viewpoint_count;
+		echo->viewpointCountOutput = n;
+		for (uint32_t i = 0; i < XR_LIFT_MAX_VIEWS_DXR; i++) {
+			echo->viewpoints[i].x = i < n ? r.viewpoints[3 * i + 0] : 0.0f;
+			echo->viewpoints[i].y = i < n ? r.viewpoints[3 * i + 1] : 0.0f;
+			echo->viewpoints[i].z = i < n ? r.viewpoints[3 * i + 2] : 0.0f;
+		}
+		echo->rectCenter.x = r.rect_center[0];
+		echo->rectCenter.y = r.rect_center[1];
+		echo->rectCenter.z = r.rect_center[2];
+		echo->rectSize.width = r.rect_size[0];
+		echo->rectSize.height = r.rect_size[1];
+	}
 
 	// Handles: first acquire and every reallocation (the weave output pattern).
 	if (r.output_realloc || !st->exported) {

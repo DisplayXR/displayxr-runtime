@@ -53,7 +53,11 @@
  *
  * Version history: 1 = initial (properties, streams, texture results, the
  * weave-rect lift chain, the Gaussian-splat blob path, per-stream priority
- * scheduling and stream stats).
+ * scheduling and stream stats). 2 = viewpoint policy (ADR-048): TRACKED
+ * viewpoints are relative to the lifted rect's / submitting window's centre
+ * (was: the panel centre), XrLiftViewControlDXR (display-rig ipd / parallax
+ * factors, axis mode, offset clamp, recentering) and the per-result echo
+ * XrLiftResultViewpointsDXR.
  */
 #ifndef XR_DXR_LIFT_H
 #define XR_DXR_LIFT_H 1
@@ -66,7 +70,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_lift 1
-#define XR_DXR_lift_SPEC_VERSION 1
+#define XR_DXR_lift_SPEC_VERSION 2
 #define XR_DXR_LIFT_EXTENSION_NAME "XR_DXR_lift"
 
 // Reserved 1004999270..279. Allocation registry: README.md in this directory.
@@ -85,6 +89,9 @@ extern "C" {
 #define XR_LIFT_NOT_READY_DXR                ((XrResult)1004999279)
 // Second decade 1004999280..289 (the first is full).
 #define XR_TYPE_LIFT_STREAM_STATS_DXR        ((XrStructureType)1004999280)
+// Spec v2 (ADR-048).
+#define XR_TYPE_LIFT_VIEW_CONTROL_DXR        ((XrStructureType)1004999281)
+#define XR_TYPE_LIFT_RESULT_VIEWPOINTS_DXR   ((XrStructureType)1004999282)
 
 //! Size of XrLiftPropertiesDXR::backend, NUL included.
 #define XR_LIFT_BACKEND_NAME_MAX_SIZE_DXR 32
@@ -176,6 +183,41 @@ typedef enum XrLiftPriorityDXR {
     XR_LIFT_PRIORITY_MAX_ENUM_DXR = 0x7FFFFFFF
 } XrLiftPriorityDXR;
 
+/*!
+ * Which viewpoint components a TRACKED lift follows (spec v2, ADR-048). The
+ * others are pinned to the rect's centre line (x, y = 0) or to the reference
+ * viewing distance (z). X is the default: horizontal look-around only.
+ */
+typedef enum XrLiftAxisModeDXR {
+    XR_LIFT_AXIS_MODE_X_DXR = 1,
+    XR_LIFT_AXIS_MODE_XY_DXR = 2,
+    XR_LIFT_AXIS_MODE_XYZ_DXR = 3,
+    XR_LIFT_AXIS_MODE_MAX_ENUM_DXR = 0x7FFFFFFF
+} XrLiftAxisModeDXR;
+
+/*!
+ * How a TRACKED lift's look-around returns to centre (spec v2, ADR-048).
+ *
+ *  - OFF: the rendered offset is the viewer's offset from the rect centre,
+ *    always (v1 behaviour, but rect-relative).
+ *  - EASE_BACK (default): the camera eases back to the scene camera origin.
+ *    Moving the head gives look-around temporarily; once the viewer's offset
+ *    has stayed beyond a small threshold for recenterHoldSeconds, the camera
+ *    returns to centre (no look-around) with time constant
+ *    recenterTimeConstantSeconds. Any new head motion gives immediate,
+ *    temporary look-around again. (The reference viewer position follows
+ *    the head, so the rendered offset decays to 0 wherever the viewer
+ *    settles.)
+ *
+ * Frame-rate independent; one filter per stream, reset when the stream is
+ * created and whenever tracking is lost.
+ */
+typedef enum XrLiftRecenterModeDXR {
+    XR_LIFT_RECENTER_MODE_OFF_DXR = 0,
+    XR_LIFT_RECENTER_MODE_EASE_BACK_DXR = 1,
+    XR_LIFT_RECENTER_MODE_MAX_ENUM_DXR = 0x7FFFFFFF
+} XrLiftRecenterModeDXR;
+
 typedef enum XrLiftBlobFormatDXR {
     //! Binary little-endian PLY in the reference 3DGS layout (x y z nx ny nz
     //! f_dc_0..2 [f_rest_*] opacity scale_0..2 rot_0..3).
@@ -232,7 +274,9 @@ typedef struct XrLiftStreamCreateInfoDXR {
  * calibrated budget). @c viewCount is the number of views an NVIEW stream
  * produces (2 for SBS; ignored for DEPTH / GAUSSIANS), ≤ maxViews. With
  * EXPLICIT viewpoints, @c viewpoints holds @c viewCount display-space positions
- * (metres); on the weave path viewpoints must be TRACKED. @c focalPx is the
+ * (metres; the runtime rebases them to the rect centre before the module sees
+ * them, spec v2); on the weave path viewpoints must be TRACKED. Chain
+ * XrLiftViewControlDXR on @c next to shape TRACKED viewpoints (spec v2). @c focalPx is the
  * submitted image's focal length in pixels of @c extent (for a photo, e.g. the
  * fx of an estimated intrinsics); <= 0 = unknown, the module assumes its
  * default field of view. Photo → Gaussians modules take it as input; DEPTH /
@@ -249,6 +293,63 @@ typedef struct XrLiftOptionsDXR {
     const XrVector3f*          viewpoints;      //!< viewCount entries when EXPLICIT, else ignored
     float                      focalPx;         //!< input focal length in input pixels; <= 0 = unknown (GAUSSIANS)
 } XrLiftOptionsDXR;
+
+/*!
+ * Viewpoint policy for TRACKED lifts (spec v2, ADR-048). Chain on
+ * XrLiftOptionsDXR::next, or directly on XrWeaveRectLiftDXR::next (the
+ * direct chain wins if both are present). Ignored for EXPLICIT viewpoints and
+ * for DEPTH / GAUSSIANS streams. Sticky per stream, like XrLiftOptionsDXR:
+ * the last one sent applies until another is sent.
+ *
+ * Omitted entirely, the runtime applies the defaults: ipdFactor 1,
+ * parallaxFactor 1, axisMode X, maxOffsetMeters 0 (no clamp), recenterMode
+ * EASE_BACK, hold 1 s, time constant 2 s.
+ *
+ * Frame: every viewpoint is relative to the CENTRE of the lifted region — the
+ * lifted weave rect, or for xrSubmitLiftFrameDXR the session's window (the
+ * panel centre when the session has none) — in display axes (+x right, +y
+ * up, +z toward the viewer), metres.
+ *
+ * Order of operations, per conversion: rebase the eyes to the rect centre;
+ * scale their separation about their midpoint by @c ipdFactor (display-rig
+ * step 1a); lerp their midpoint toward the nominal viewer (0, 0, nominal
+ * distance) by 1 - @c parallaxFactor (step 1b); mask the midpoint's axes not
+ * in @c axisMode; recenter (see XrLiftRecenterModeDXR); clamp the midpoint's
+ * x / y offset to @c maxOffsetMeters.
+ *
+ * @c recenterHoldSeconds < 0 and @c recenterTimeConstantSeconds <= 0 select
+ * the defaults (1 s, 2 s).
+ */
+typedef struct XrLiftViewControlDXR {
+    XrStructureType            type;                        //!< XR_TYPE_LIFT_VIEW_CONTROL_DXR
+    const void* XR_MAY_ALIAS   next;
+    float                      ipdFactor;                   //!< [0, 1]: eye-separation scale (0 = mono)
+    float                      parallaxFactor;              //!< [0, 1]: 0 = always the nominal viewer, 1 = follow
+    XrLiftAxisModeDXR          axisMode;
+    float                      maxOffsetMeters;             //!< x / y offset clamp, metres; <= 0 = none
+    XrLiftRecenterModeDXR      recenterMode;
+    float                      recenterHoldSeconds;         //!< < 0 = default (1 s)
+    float                      recenterTimeConstantSeconds; //!< <= 0 = default (2 s)
+} XrLiftViewControlDXR;
+
+/*!
+ * The viewpoints a texture result was actually synthesized for (spec v2,
+ * ADR-048), after the viewpoint policy — so an app can render matching 3D
+ * content for the same eyes. Chain on XrLiftResultDXR::next; filled on every
+ * successful acquire. Same frame as XrLiftViewControlDXR (rect-centre
+ * relative, display axes, metres); @c rectCenter is that origin in display
+ * space (panel centre = 0) and @c rectSize the region's physical size.
+ * @c viewpointCountOutput 0 = no viewpoints were known (the module used its
+ * defaults), or a DEPTH stream.
+ */
+typedef struct XrLiftResultViewpointsDXR {
+    XrStructureType    type;                 //!< XR_TYPE_LIFT_RESULT_VIEWPOINTS_DXR
+    void* XR_MAY_ALIAS next;
+    uint32_t           viewpointCountOutput; //!< 0..XR_LIFT_MAX_VIEWS_DXR
+    XrVector3f         viewpoints[XR_LIFT_MAX_VIEWS_DXR];
+    XrVector3f         rectCenter;           //!< display space, metres
+    XrExtent2Df        rectSize;             //!< metres
+} XrLiftResultViewpointsDXR;
 
 /*!
  * One frame into a stream. NON-BLOCKING: the runtime snapshots the input's
@@ -288,7 +389,7 @@ typedef struct XrLiftFrameSubmitInfoDXR {
  */
 typedef struct XrLiftResultDXR {
     XrStructureType    type;          //!< XR_TYPE_LIFT_RESULT_DXR
-    void* XR_MAY_ALIAS next;
+    void* XR_MAY_ALIAS next;          //!< chain XrLiftResultViewpointsDXR here (v2)
     uint64_t           frameId;       //!< the xrSubmitLiftFrameDXR frame this converts
     XrTime             sourceTime;    //!< that frame's sourceTime, verbatim
     void*              outputTexture; //!< shared HANDLE on first acquire / realloc, else NULL
@@ -343,7 +444,7 @@ typedef struct XrLiftBlobDXR {
  */
 typedef struct XrWeaveRectLiftDXR {
     XrStructureType          type;      //!< XR_TYPE_WEAVE_RECT_LIFT_DXR
-    const void* XR_MAY_ALIAS next;      //!< chain XrLiftOptionsDXR here
+    const void* XR_MAY_ALIAS next;      //!< chain XrLiftOptionsDXR / XrLiftViewControlDXR here
     uint32_t                 rectIndex; //!< index into XrWeaveSubmitRectsDXR::rects
     XrLiftStreamDXR          stream;
 } XrWeaveRectLiftDXR;

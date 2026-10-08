@@ -505,7 +505,13 @@ struct xrt_dp_lift_stream_info { uint32_t struct_size; uint32_t mode; uint32_t c
                                  float input_scale; };
 struct xrt_dp_lift_params { uint32_t struct_size; float convergence; /* [0,1] relative depth at the glass; <0 AUTO */
                             float strength; uint32_t inpaint; uint32_t view_count;
-                            float focal_px; /* appended: input focal length in px; <=0 unknown (GAUSSIANS) */ };
+                            float focal_px; /* appended: input focal length in px; <=0 unknown (GAUSSIANS) */
+                            /* appended, XRT_DP_LIFT_HAS_VIEWPOINT_POLICY (ADR-048): */
+                            float rect_width_m, rect_height_m; /* lifted region size; 0 unknown */
+                            float baseline_m;      /* first-to-last viewpoint distance; 0 = none */
+                            uint32_t axis_mode;    /* 1 X, 2 XY, 3 XYZ: components that follow the viewer */
+                            float max_offset_m;    /* x/y clamp the runtime applied; 0 none */
+                            uint32_t viewpoint_frame; /* 0 DISPLAY (panel centre), 1 RECT (lifted rect centre) */ };
 
 /* xrt_display_processor_d3d11, slots 25..29 */
 bool (*lift_get_caps)(xdp, struct xrt_dp_lift_caps *out);
@@ -542,9 +548,17 @@ xrt_dp_factory_d3d11_fn_t create_dp_d3d11_lift; /* a DP that serves ONLY the lif
   (`XrLiftPriorityDXR`) and timestamps. A `false` return means "no output this frame"; the
   runtime keeps the previous result.
 - **Viewpoints are always explicit.** For SBS/N-view the runtime passes `viewpoints_xyz` —
-  the app's EXPLICIT viewpoints, else the panel DP's predicted tracked eye pair (display space,
-  metres). Give them precedence over any tracker of your own; the lift DP has none. NULL/0 only
-  while no eyes are known.
+  the app's EXPLICIT viewpoints, else the panel DP's predicted tracked eye pair (metres). Give
+  them precedence over any tracker of your own; the lift DP has none. NULL/0 only while no eyes
+  are known.
+- **Viewpoints are rect-relative and already shaped (ADR-048).** With
+  `viewpoint_frame == RECT` (every runtime that fills the field) they are relative to the
+  lifted rect's centre, and the runtime has already applied the viewpoint policy — ipd /
+  parallax factors, axis mask, ease-back, clamp. Translate units only: normalise by
+  `baseline_m` (not a fixed eye distance), honour every component you are sent (`axis_mode`
+  says which ones are live), and use `max_offset_m` + the rect size to map onto your module's
+  range. A `struct_size` that stops before these fields means panel-centred viewpoints (an
+  older runtime).
 - **Output layout.** SBS = two views side by side; NVIEW = `view_count` views in one row, view 0
   leftmost; DEPTH = one channel (any single-channel or RGBA format — say which in
   `out_format`). The runtime weaves SBS/NVIEW results itself on the ordinary weave path

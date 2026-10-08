@@ -1065,6 +1065,8 @@ struct ipc_lift_params
 	uint32_t viewpoint_count;  //!< 0 = tracked eyes; else explicit, <= IPC_LIFT_MAX_VIEWS
 	float focal_px;            //!< input focal length, input pixels; <= 0 = unknown
 	float viewpoints[3 * IPC_LIFT_MAX_VIEWS]; //!< xyz, display space, metres
+	uint32_t has_view_control;                //!< XrLiftViewControlDXR chained (ADR-048)
+	struct xrt_lift_view_control view_control;
 };
 
 /*!
@@ -1103,7 +1105,10 @@ struct ipc_lift_result
 	uint32_t format;         //!< DXGI_FORMAT
 	uint32_t view_count;
 	uint32_t output_realloc; //!< 1 = the export texture changed since the last acquire
-	uint32_t reserved;
+	uint32_t viewpoint_count; //!< ADR-048 echo; 0 = none
+	float viewpoints[3 * IPC_LIFT_MAX_VIEWS];
+	float rect_center[3];
+	float rect_size[2];
 };
 
 /*!
@@ -1123,7 +1128,8 @@ struct ipc_lift_weave_rect
 	uint32_t inpaint;
 	uint32_t view_count;
 	float focal_px;
-	uint32_t reserved;
+	uint32_t has_view_control; //!< XrLiftViewControlDXR chained (ADR-048)
+	struct xrt_lift_view_control view_control;
 };
 
 /*!

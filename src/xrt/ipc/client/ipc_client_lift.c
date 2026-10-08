@@ -94,6 +94,7 @@ ipc_client_lift_submit(struct ipc_connection *ipc_c,
                        const struct xrt_dp_lift_params *params,
                        const float *viewpoints,
                        uint32_t viewpoint_count,
+                       const struct xrt_lift_view_control *view_control,
                        uint64_t *out_frame_id)
 {
 	if (ipc_c == NULL || out_frame_id == NULL) {
@@ -109,6 +110,10 @@ ipc_client_lift_submit(struct ipc_connection *ipc_c,
 	if (params != NULL) {
 		args.has_params = 1;
 		params_to_ipc(params, viewpoints, viewpoint_count, &args.params);
+		if (view_control != NULL) {
+			args.params.has_view_control = 1;
+			args.params.view_control = *view_control;
+		}
 	}
 	xrt_graphics_buffer_handle_t handles[1] = {handle};
 #if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
@@ -150,6 +155,10 @@ ipc_client_lift_acquire(struct ipc_connection *ipc_c,
 	out_result->format = r.format;
 	out_result->view_count = r.view_count;
 	out_result->output_realloc = r.output_realloc != 0;
+	out_result->viewpoint_count = r.viewpoint_count > XRT_LIFT_MAX_VIEWS ? XRT_LIFT_MAX_VIEWS : r.viewpoint_count;
+	memcpy(out_result->viewpoints, r.viewpoints, sizeof(out_result->viewpoints));
+	memcpy(out_result->rect_center, r.rect_center, sizeof(out_result->rect_center));
+	memcpy(out_result->rect_size, r.rect_size, sizeof(out_result->rect_size));
 	return XRT_SUCCESS;
 }
 
@@ -264,6 +273,8 @@ ipc_client_lift_weave_rects(struct ipc_connection *ipc_c, uint32_t count, const 
 		args.rects[i].inpaint = rects[i].params.inpaint;
 		args.rects[i].view_count = rects[i].params.view_count;
 		args.rects[i].focal_px = rects[i].params.focal_px;
+		args.rects[i].has_view_control = rects[i].has_view_control ? 1u : 0u;
+		args.rects[i].view_control = rects[i].view_control;
 	}
 	return ipc_call_lift_weave_rects(ipc_c, &args);
 }

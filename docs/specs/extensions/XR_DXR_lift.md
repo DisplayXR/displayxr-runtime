@@ -3,11 +3,11 @@
 | Field | Value |
 |---|---|
 | **Extension Name** | `XR_DXR_lift` |
-| **Spec Version** | 1 |
+| **Spec Version** | 2 |
 | **Extension Type** | Instance extension (service path — Windows/D3D11; advertised on every desktop platform, where a service without a module reports `supportedModes = 0`) |
 | **Header** | `src/external/openxr_includes/openxr/XR_DXR_lift.h` (canonical; auto-syncs to `displayxr-extensions`) |
-| **Status** | Provisional (`1004999270–280` block, pending Khronos registry) |
-| **Decision record** | [ADR-042](../../adr/ADR-042-vendor-2d3d-conversion-supersedes-default.md) |
+| **Status** | Provisional (`1004999270–282` block, pending Khronos registry) |
+| **Decision record** | [ADR-042](../../adr/ADR-042-vendor-2d3d-conversion-supersedes-default.md); viewpoint policy: [ADR-048](../../adr/ADR-048-lift-viewpoint-policy.md) |
 | **Plug-in contract** | `src/xrt/include/xrt/xrt_dp_lift.h` + the lift slots of `xrt_display_processor_d3d11` (`XRT_DP_D3D11_HAS_LIFT`), [`xrt_plugin_iface.md` § lift](../../reference/xrt_plugin_iface.md#turning-2d-into-3d-the-lift-slots-adr-042-xr_dxr_lift) |
 
 ## 1. What it is
@@ -129,6 +129,67 @@ module defaults):
 panel display processor's predicted eyes just before each conversion and hands the pair to the
 module; a module spreads N views around it. The lift display processor has no tracker session
 of its own.
+
+### 4.1 Viewpoint frame and policy (spec v2, ADR-048)
+
+**Frame.** Every viewpoint the module receives is relative to the **centre of the lifted
+region**, in display axes (+x right, +y up, +z toward the viewer), metres:
+
+| Path | Region |
+|---|---|
+| lifted weave rect (§6) | that rect, on the weave client's window |
+| `xrSubmitLiftFrameDXR` | the session's window (its window binding / presenter window) |
+| `xrSubmitLiftFrameDXR` on a connection with no session window (e.g. `displayxr-cli lift`) | the panel |
+
+So a lifted video in a corner window looks straight-on to a viewer facing that window, not to a
+viewer facing the panel centre (the same window-relative rule ADR-012 sets for Kooima). This
+**rebase is unconditional** in v2 — it fixes v1, which passed panel-centred eyes. EXPLICIT
+viewpoints are given in display space as before and are rebased the same way; nothing else is
+applied to them.
+
+**Policy** (`XrLiftViewControlDXR`, TRACKED only). Chain it on `XrLiftOptionsDXR` (submit or
+weave rect) or directly on `XrWeaveRectLiftDXR` (the direct chain wins). It is **sticky per
+stream**: the last one sent applies until another is sent. Omitted, the defaults apply:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `ipdFactor` | 1 | scales each eye's offset from the pair midpoint ([0, 1]; 0 = mono) — display-rig step 1a |
+| `parallaxFactor` | 1 | lerps the midpoint toward the nominal viewer `(0, 0, nominal distance)`: 1 = follow the viewer, 0 = fixed straight-on — step 1b |
+| `axisMode` | X | which midpoint components follow the viewer: X, XY or XYZ. Masked components are pinned (y = 0, z = the nominal distance) |
+| `maxOffsetMeters` | 0 (none) | clamp of the midpoint's x / y offset from the rect centre |
+| `recenterMode` | EASE_BACK | OFF or EASE_BACK: whether the camera returns to centre after a hold (below) |
+| `recenterHoldSeconds` | 1 s | how long the offset must stay beyond ~5 mm before recentering starts (< 0 = default) |
+| `recenterTimeConstantSeconds` | 2 s | exponential time constant of the recentering (<= 0 = default) |
+
+Order, per conversion: rebase → ipd factor → parallax factor → axis mask → recenter → clamp.
+
+**Recentering.** One filter per stream, frame-rate independent (`1 - exp(-dt / tau)` per step),
+reset when the stream is created and whenever eye tracking is lost.
+
+- `EASE_BACK` (default) — the camera eases back to the scene camera origin. If you move your
+  head you see look-around temporarily; once your offset has stayed beyond the threshold for the
+  hold time, the camera returns to centre — no look-around — with the time constant. Any new
+  head motion gives immediate, temporary look-around again. (Mechanically: a reference viewer
+  position starts at the straight-on viewer and, after the hold, slides toward the head; the
+  rendered offset is the head's offset from that reference, so it decays to 0 wherever the
+  viewer settles.)
+- `OFF` — the rendered offset is always the viewer's offset from the rect centre.
+
+**Defaults changed behaviour.** A v1 caller that chains nothing gets the rect-relative rebase
+and the EASE_BACK default. `DXR_LIFT_RECENTER=off` (service environment, read once when
+the lift module is created) forces recentering OFF for every stream, for A/B.
+
+**Echo.** Chain `XrLiftResultViewpointsDXR` on `XrLiftResultDXR` to receive the viewpoints the
+result was synthesized for (after the policy, same frame), the region's centre in display space
+and its size — so an app can render matching 3D for the same eyes. `viewpointCountOutput` 0 =
+no viewpoints were known (the module used its defaults) or a DEPTH stream.
+
+**What the module is told.** The DP receives the processed viewpoints plus, in appended
+`xrt_dp_lift_params` fields (`XRT_DP_LIFT_HAS_VIEWPOINT_POLICY`): `viewpoint_frame` (RECT),
+`rect_width_m` / `rect_height_m`, `baseline_m` (first-to-last viewpoint distance, i.e. the eye
+separation after the ipd factor), `axis_mode` and `max_offset_m`. The plug-in only translates
+units — it normalises by `baseline_m` rather than a fixed eye distance, and honours every
+component it is sent.
 
 ## 5. Acquiring results
 
@@ -328,7 +389,7 @@ Mirrors XR_DXR_weave §4b.
 | latest-wins mailbox, drops, frame ids | the model, its backend, licensing, warm-up (reported as ACTIVATING) |
 | output ring copies, export textures, fences | an output valid until its next call |
 | priority scheduling across streams | nothing about scheduling |
-| tracked eyes → explicit viewpoints | honouring explicit viewpoints over any tracker of its own |
+| tracked eyes → explicit viewpoints, rebased to the lifted rect, with the viewpoint policy applied (ADR-048) | honouring explicit viewpoints over any tracker of its own; unit translation only (normalise by `baseline_m`, honour every component sent) |
 | weaving SBS / N-view results (ADR-007) | never weaving a lift result |
 | timestamps, latency, stats | reporting `typical_latency_ns` |
 
@@ -378,6 +439,7 @@ order: runtime → extensions auto-sync → consumers.
 | Version | Change |
 |---|---|
 | 1 | Initial: properties + states, streams (DEPTH / SBS / NVIEW / GAUSSIANS), non-blocking latest-wins submit, texture acquire (weave-style handles + fence), blob acquire (two-call latch), weave-rect lift chain, per-stream priority scheduling + stats, `focalPx`. |
+| 2 | Viewpoint policy (ADR-048, §4.1): viewpoints relative to the lifted rect / submitting window centre (was: the panel centre), `XrLiftViewControlDXR` (ipd / parallax factors, axis mode, offset clamp, recentering; defaults X + EASE_BACK 1 s / 2 s), `XrLiftResultViewpointsDXR` echo. |
 
 ## Probing on a Windows box — gotchas (first N0 run, 2026-09-25)
 
