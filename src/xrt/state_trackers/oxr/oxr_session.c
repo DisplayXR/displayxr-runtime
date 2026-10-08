@@ -4416,6 +4416,25 @@ oxr_session_locate_views(struct oxr_logger *log,
 	    oxr_segment_views_layout(&m, &l)) {
 		total = oxr_segment_views_assign(m.count, active, reported, first, cnt);
 	}
+	{
+		// Change-only diagnostic: the inputs of the split decision, so a
+		// window that is woven per segment but located as one view set can
+		// be explained from the log (a screen of unknown size, a capacity
+		// of 1, more segments than sets). Never per frame.
+		static uint32_t last_sig = 0;
+		const uint32_t sig = (m.count << 28) ^ (total << 20) ^ (active << 12) ^ (reported << 4) ^
+		                     (uint32_t)sess->sys->multiview_set_capacity;
+		if (sig != last_sig) {
+			last_sig = sig;
+			U_LOG_W("per-segment views: segments=%u capacity=%u active=%u reported=%u -> total=%u; "
+			        "[0] %.3fx%.3f m desk %ux%u win %dx%d; [1] %.3fx%.3f m desk %ux%u win %dx%d",
+			        m.count, sess->sys->multiview_set_capacity, active, reported, total, m.seg[0].screen_width_m,
+			        m.seg[0].screen_height_m, m.seg[0].screen_desktop_width, m.seg[0].screen_desktop_height,
+			        m.seg[0].window_rect.extent.w, m.seg[0].window_rect.extent.h, m.seg[1].screen_width_m,
+			        m.seg[1].screen_height_m, m.seg[1].screen_desktop_width, m.seg[1].screen_desktop_height,
+			        m.seg[1].window_rect.extent.w, m.seg[1].window_rect.extent.h);
+		}
+	}
 	if (total == 0) {
 		// More segments than view sets, or a screen of unknown size: one
 		// view set for the whole window (the M2 crop path).
