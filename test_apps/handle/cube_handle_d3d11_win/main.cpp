@@ -1136,6 +1136,19 @@ static void RenderOneFrame(RenderState& rs) {
                         viewState.next = &rawProbe;
                     }
 
+                    // Multi-screen M3 (ADR-041 + XR_DXR_display_info v22): how
+                    // many located views are live this frame, and which of them
+                    // belong to which display when the window spans displays —
+                    // chained in front of whatever the rig probe put there.
+                    XrViewActivityStateDXR viewActivity = {XR_TYPE_VIEW_ACTIVITY_STATE_DXR};
+                    XrViewDisplayBindingDXR viewBindingStorage[4] = {};
+                    XrViewDisplayBindingsDXR viewBindings = {XR_TYPE_VIEW_DISPLAY_BINDINGS_DXR};
+                    viewBindings.bindingCapacityInput = 4;
+                    viewBindings.bindings = viewBindingStorage;
+                    viewBindings.next = viewState.next;
+                    viewActivity.next = &viewBindings;
+                    viewState.next = &viewActivity;
+
                     // XR_DXR_view_rig (#396 W7): drive the runtime rig matching
                     // the app's current mode (C selects the rig) with the app's
                     // tunables — the runtime owns the window/canvas resolve and
@@ -1184,6 +1197,46 @@ static void RenderOneFrame(RenderState& rs) {
                     }
 
                     xrLocateViews(xr.session, &locateInfo, &viewState, 8, &viewCount, rawViews);
+
+                    // Multi-screen M3: with the window spanning displays the
+                    // runtime hands out one view set per display; render ALL
+                    // of them (the sum is activeViewCount), each set's local
+                    // view j into tile j at that display's segment rect (placed
+                    // below once the tile size is known). Tiled layout only;
+                    // the array layout keeps its two slices.
+                    const bool routedViews =
+                        !ArrayLayoutEnabled() && !monoMode &&
+                        xr.viewConfigType == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR &&
+                        viewBindings.bindingCountOutput > 0 && viewBindings.bindingCountOutput <= 4;
+                    if (routedViews) {
+                        int routedEyes = 0;
+                        for (uint32_t b = 0; b < viewBindings.bindingCountOutput; b++) {
+                            const int end = (int)(viewBindingStorage[b].firstView + viewBindingStorage[b].viewCount);
+                            if (end > routedEyes) routedEyes = end;
+                        }
+                        if (routedEyes > (int)locatedCount) routedEyes = (int)locatedCount;
+                        if (routedEyes > 0) eyeCount = routedEyes;
+                    }
+                    {
+                        // Log the bindings when they change (one line, never per frame).
+                        static std::string lastBindings;
+                        std::string now = routedViews ? "routed" : "single";
+                        for (uint32_t b = 0; routedViews && b < viewBindings.bindingCountOutput; b++) {
+                            const XrViewDisplayBindingDXR& vb = viewBindingStorage[b];
+                            char buf[160];
+                            snprintf(buf, sizeof(buf), " [display 0x%llx views %u..%u at %d,%d %dx%d]",
+                                     (unsigned long long)vb.displayId, vb.firstView,
+                                     vb.firstView + vb.viewCount - 1, vb.segmentRect.offset.x,
+                                     vb.segmentRect.offset.y, vb.segmentRect.extent.width,
+                                     vb.segmentRect.extent.height);
+                            now += buf;
+                        }
+                        if (now != lastBindings) {
+                            LOG_INFO("view sets: %s (activeViewCount=%u, rendering %d)", now.c_str(),
+                                     viewActivity.activeViewCount, eyeCount);
+                            lastBindings = now;
+                        }
+                    }
 
                     // #1370: the grip / joint markers are located in LOCAL. On the
                     // rig path the runtime returns render-ready views IN LOCAL, so a
@@ -1468,9 +1521,47 @@ static void RenderOneFrame(RenderState& rs) {
                             if (renderH > capH) renderH = capH;
                         }
 
+                        // Multi-screen M3: per-view placement under routing — the
+                        // display's segment rect (window px) scaled into the tile,
+                        // edges rounded independently so two segments sharing a
+                        // seam share the tile column (cube_handle_vk_linux does
+                        // exactly this).
+                        struct ViewPlace {
+                            uint32_t tile;
+                            int32_t x, y;
+                            uint32_t w, h;
+                            bool set;
+                        };
+                        ViewPlace viewPlace[8] = {};
+                        if (routedViews && g_windowWidth > 0 && g_windowHeight > 0) {
+                            const float fx = (float)renderW / (float)g_windowWidth;
+                            const float fy = (float)renderH / (float)g_windowHeight;
+                            for (uint32_t b = 0; b < viewBindings.bindingCountOutput; b++) {
+                                const XrViewDisplayBindingDXR& vb = viewBindingStorage[b];
+                                const int32_t x0 = (int32_t)lroundf((float)vb.segmentRect.offset.x * fx);
+                                const int32_t y0 = (int32_t)lroundf((float)vb.segmentRect.offset.y * fy);
+                                const int32_t x1 = (int32_t)lroundf(
+                                    (float)(vb.segmentRect.offset.x + vb.segmentRect.extent.width) * fx);
+                                const int32_t y1 = (int32_t)lroundf(
+                                    (float)(vb.segmentRect.offset.y + vb.segmentRect.extent.height) * fy);
+                                const uint32_t sw = x1 > x0 ? (uint32_t)(x1 - x0) : 1;
+                                const uint32_t sh = y1 > y0 ? (uint32_t)(y1 - y0) : 1;
+                                for (uint32_t j = 0; j < vb.viewCount && j < tileColumns * tileRows; j++) {
+                                    const uint32_t i = vb.firstView + j;
+                                    if (i >= 8) break;
+                                    viewPlace[i] = {j, x0, y0, sw, sh, true};
+                                }
+                            }
+                        }
+
                         for (int eye = 0; eye < eyeCount; eye++) {
+                            const bool placed = routedViews && eye < 8 && viewPlace[eye].set;
                             uint32_t tileX = monoMode ? 0 : (eye % tileColumns);
                             uint32_t tileY = monoMode ? 0 : (eye / tileColumns);
+                            if (placed) {
+                                tileX = viewPlace[eye].tile % tileColumns;
+                                tileY = viewPlace[eye].tile / tileColumns;
+                            }
 
                             // ARRAY: render into array slice `eye` via a per-slice
                             // TEXTURE2DARRAY RTV at a full (0,0) viewport. TILED:
@@ -1507,6 +1598,13 @@ static void RenderOneFrame(RenderState& rs) {
                             vp.TopLeftY = arrayLayout ? 0.0f : (FLOAT)(tileY * renderH);
                             vp.Width = (FLOAT)renderW;
                             vp.Height = (FLOAT)renderH;
+                            if (placed) {
+                                // Multi-screen M3: this view's display segment inside its tile.
+                                vp.TopLeftX = (FLOAT)((int32_t)(tileX * renderW) + viewPlace[eye].x);
+                                vp.TopLeftY = (FLOAT)((int32_t)(tileY * renderH) + viewPlace[eye].y);
+                                vp.Width = (FLOAT)viewPlace[eye].w;
+                                vp.Height = (FLOAT)viewPlace[eye].h;
+                            }
                             vp.MaxDepth = 1.0f;
                             renderer.context->RSSetViewports(1, &vp);
 
@@ -1603,6 +1701,14 @@ static void RenderOneFrame(RenderState& rs) {
                                 (int32_t)renderW,
                                 (int32_t)renderH
                             };
+                            if (placed) {
+                                // Multi-screen M3: the sub-rect this view was rendered into.
+                                projectionViews[eye].subImage.imageRect.offset = {
+                                    (int32_t)(tileX * renderW) + viewPlace[eye].x,
+                                    (int32_t)(tileY * renderH) + viewPlace[eye].y};
+                                projectionViews[eye].subImage.imageRect.extent = {(int32_t)viewPlace[eye].w,
+                                                                                  (int32_t)viewPlace[eye].h};
+                            }
                             projectionViews[eye].subImage.imageArrayIndex = arrayLayout ? (uint32_t)eye : 0;
 
                             int safeIdx = (eye < (int)viewCount) ? eye : 0;
