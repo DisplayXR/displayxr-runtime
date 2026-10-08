@@ -535,3 +535,77 @@ u_camera_consent_persistent_id(struct u_camera_consent *c,
 	}
 	u_camera_consent_persistent_id_keyed(c->secret, sizeof(c->secret), device_identity, consumer_exe, out);
 }
+
+
+/*
+ *
+ * The prompt hand-off (#1842).
+ *
+ */
+
+uint64_t
+u_camera_consent_handoff_begin(struct u_camera_consent_handoff *h)
+{
+	h->generation++;
+	if (h->generation == 0) {
+		h->generation = 1; // 0 means "no request"
+	}
+	h->state = U_CAMERA_CONSENT_HANDOFF_PENDING;
+	h->answer = U_CAMERA_CONSENT_PROMPT_TIMEOUT;
+	return h->generation;
+}
+
+enum u_camera_consent_handoff_result
+u_camera_consent_handoff_answer(struct u_camera_consent_handoff *h,
+                                uint64_t generation,
+                                enum u_camera_consent_prompt_answer answer)
+{
+	enum u_camera_consent_handoff_result r = U_CAMERA_CONSENT_HANDOFF_ACCEPTED;
+	if (generation == 0 || generation != h->generation) {
+		r = U_CAMERA_CONSENT_HANDOFF_DROPPED_STALE;
+	} else if (h->state == U_CAMERA_CONSENT_HANDOFF_TIMED_OUT) {
+		r = U_CAMERA_CONSENT_HANDOFF_DROPPED_LATE;
+	} else if (h->state != U_CAMERA_CONSENT_HANDOFF_PENDING) {
+		r = U_CAMERA_CONSENT_HANDOFF_DROPPED_DOUBLE;
+	}
+	if (r != U_CAMERA_CONSENT_HANDOFF_ACCEPTED) {
+		h->dropped++;
+		return r;
+	}
+	h->state = U_CAMERA_CONSENT_HANDOFF_ANSWERED;
+	h->answer = answer;
+	return r;
+}
+
+enum u_camera_consent_prompt_answer
+u_camera_consent_handoff_finish(struct u_camera_consent_handoff *h, uint64_t generation)
+{
+	if (generation == 0 || generation != h->generation) {
+		// Not the current request (cannot happen with one requester at a
+		// time): whatever became of it, it was not answered for us.
+		return U_CAMERA_CONSENT_PROMPT_TIMEOUT;
+	}
+	if (h->state == U_CAMERA_CONSENT_HANDOFF_ANSWERED) {
+		return h->answer;
+	}
+	h->state = U_CAMERA_CONSENT_HANDOFF_TIMED_OUT;
+	return U_CAMERA_CONSENT_PROMPT_TIMEOUT;
+}
+
+bool
+u_camera_consent_handoff_is_pending(const struct u_camera_consent_handoff *h, uint64_t generation)
+{
+	return generation != 0 && generation == h->generation && h->state == U_CAMERA_CONSENT_HANDOFF_PENDING;
+}
+
+const char *
+u_camera_consent_handoff_result_str(enum u_camera_consent_handoff_result r)
+{
+	switch (r) {
+	case U_CAMERA_CONSENT_HANDOFF_ACCEPTED: return "accepted";
+	case U_CAMERA_CONSENT_HANDOFF_DROPPED_LATE: return "the request had already timed out";
+	case U_CAMERA_CONSENT_HANDOFF_DROPPED_DOUBLE: return "the request was already answered";
+	case U_CAMERA_CONSENT_HANDOFF_DROPPED_STALE: return "the dialog belongs to an older request";
+	default: return "?";
+	}
+}

@@ -15,6 +15,7 @@
 #include "util/u_sha256.h"
 #include "xrt/xrt_instance.h"
 
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -693,6 +694,170 @@ TEST_CASE("camera consent: the prompt's answers", "[camera_consent]")
 		d = r.eval();
 		CHECK(d.why == U_CAMERA_CONSENT_WHY_ALLOW_ONCE);
 		CHECK(r.env.prompts == 1);
+	}
+}
+
+TEST_CASE("prompt hand-off: the first transition out of PENDING wins", "[camera_consent][handoff]")
+{
+	u_camera_consent_handoff h{};
+	SECTION("an answer before the timeout is THE answer")
+	{
+		uint64_t g = u_camera_consent_handoff_begin(&h);
+		CHECK(g != 0);
+		CHECK(u_camera_consent_handoff_is_pending(&h, g));
+		CHECK(u_camera_consent_handoff_answer(&h, g, U_CAMERA_CONSENT_PROMPT_ALLOW) ==
+		      U_CAMERA_CONSENT_HANDOFF_ACCEPTED);
+		CHECK(!u_camera_consent_handoff_is_pending(&h, g));
+		CHECK(u_camera_consent_handoff_finish(&h, g) == U_CAMERA_CONSENT_PROMPT_ALLOW);
+		CHECK(h.dropped == 0);
+	}
+	SECTION("an answer after the requester gave up is dropped")
+	{
+		uint64_t g = u_camera_consent_handoff_begin(&h);
+		CHECK(u_camera_consent_handoff_finish(&h, g) == U_CAMERA_CONSENT_PROMPT_TIMEOUT);
+		CHECK(h.state == U_CAMERA_CONSENT_HANDOFF_TIMED_OUT);
+		CHECK(u_camera_consent_handoff_answer(&h, g, U_CAMERA_CONSENT_PROMPT_ALLOW) ==
+		      U_CAMERA_CONSENT_HANDOFF_DROPPED_LATE);
+		CHECK(h.state == U_CAMERA_CONSENT_HANDOFF_TIMED_OUT);
+		// Settling again does not resurrect it.
+		CHECK(u_camera_consent_handoff_finish(&h, g) == U_CAMERA_CONSENT_PROMPT_TIMEOUT);
+		CHECK(h.dropped == 1);
+	}
+	SECTION("a double answer: the first wins")
+	{
+		uint64_t g = u_camera_consent_handoff_begin(&h);
+		CHECK(u_camera_consent_handoff_answer(&h, g, U_CAMERA_CONSENT_PROMPT_DENY) ==
+		      U_CAMERA_CONSENT_HANDOFF_ACCEPTED);
+		CHECK(u_camera_consent_handoff_answer(&h, g, U_CAMERA_CONSENT_PROMPT_ALLOW) ==
+		      U_CAMERA_CONSENT_HANDOFF_DROPPED_DOUBLE);
+		CHECK(u_camera_consent_handoff_finish(&h, g) == U_CAMERA_CONSENT_PROMPT_DENY);
+		CHECK(h.dropped == 1);
+	}
+	SECTION("a leftover dialog of an older request cannot answer the new one")
+	{
+		uint64_t g1 = u_camera_consent_handoff_begin(&h);
+		CHECK(u_camera_consent_handoff_finish(&h, g1) == U_CAMERA_CONSENT_PROMPT_TIMEOUT);
+		uint64_t g2 = u_camera_consent_handoff_begin(&h);
+		CHECK(g2 != g1);
+		CHECK(!u_camera_consent_handoff_is_pending(&h, g1));
+		CHECK(u_camera_consent_handoff_answer(&h, g1, U_CAMERA_CONSENT_PROMPT_ALLOW) ==
+		      U_CAMERA_CONSENT_HANDOFF_DROPPED_STALE);
+		CHECK(u_camera_consent_handoff_is_pending(&h, g2));
+		CHECK(u_camera_consent_handoff_finish(&h, g2) == U_CAMERA_CONSENT_PROMPT_TIMEOUT);
+	}
+	SECTION("generation 0 never matches")
+	{
+		CHECK(u_camera_consent_handoff_answer(&h, 0, U_CAMERA_CONSENT_PROMPT_ALLOW) ==
+		      U_CAMERA_CONSENT_HANDOFF_DROPPED_STALE);
+		CHECK(!u_camera_consent_handoff_is_pending(&h, 0));
+		CHECK(u_camera_consent_handoff_finish(&h, 0) == U_CAMERA_CONSENT_PROMPT_TIMEOUT);
+	}
+	SECTION("the generation never wraps to 0")
+	{
+		h.generation = UINT64_MAX;
+		CHECK(u_camera_consent_handoff_begin(&h) == 1);
+	}
+	for (int r = U_CAMERA_CONSENT_HANDOFF_ACCEPTED; r <= U_CAMERA_CONSENT_HANDOFF_DROPPED_STALE; r++) {
+		CHECK(std::string(u_camera_consent_handoff_result_str((u_camera_consent_handoff_result)r)) != "?");
+	}
+}
+
+namespace {
+
+/*!
+ * A prompt provider built on the hand-off the way the tray / menu bar are: the
+ * "click" lands either before the requester settles (in time) or after it
+ * (late), as the issue's dialog did (#1842).
+ */
+struct handoff_env
+{
+	u_camera_consent_handoff h{};
+	u_camera_consent_prompt_answer click = U_CAMERA_CONSENT_PROMPT_ALLOW;
+	bool click_in_time = true;
+	bool click_twice = false;
+	uint64_t last_gen = 0;
+	std::vector<u_camera_consent_handoff_result> results;
+};
+
+u_camera_consent_prompt_answer
+he_prompt(void *ctx, const char *exe, const char *app, long pid, uint32_t timeout_ms)
+{
+	(void)exe;
+	(void)app;
+	(void)pid;
+	(void)timeout_ms;
+	auto *e = (handoff_env *)ctx;
+	uint64_t g = u_camera_consent_handoff_begin(&e->h);
+	e->last_gen = g;
+	if (e->click_in_time) {
+		e->results.push_back(u_camera_consent_handoff_answer(&e->h, g, e->click));
+		if (e->click_twice) {
+			e->results.push_back(u_camera_consent_handoff_answer(&e->h, g, U_CAMERA_CONSENT_PROMPT_ALLOW));
+		}
+	}
+	// The wait ended: settle. A click after this point is late.
+	return u_camera_consent_handoff_finish(&e->h, g);
+}
+
+const u_camera_consent_env_ops handoff_env_ops = {nullptr, he_prompt, nullptr, nullptr, nullptr};
+
+} // namespace
+
+TEST_CASE("camera consent: an answer after the prompt timed out is never stored (#1842)", "[camera_consent][handoff]")
+{
+	fake_store store;
+	handoff_env env;
+	u_camera_consent c;
+	u_camera_consent_init(&c, &fake_store_ops, &store, &handoff_env_ops, &env);
+	u_camera_consent_decision d;
+
+	SECTION("late Allow: refused, nothing stored, asked again next time")
+	{
+		env.click_in_time = false;
+		u_camera_consent_evaluate(&c, "/apps/caller", "Caller", 100, 0, &d);
+		CHECK(d.verdict == U_CAMERA_CONSENT_REFUSED);
+		CHECK(d.why == U_CAMERA_CONSENT_WHY_PROMPT_TIMEOUT);
+		// The user clicks Allow on the dialog that was still on screen.
+		CHECK(u_camera_consent_handoff_answer(&env.h, env.last_gen, U_CAMERA_CONSENT_PROMPT_ALLOW) ==
+		      U_CAMERA_CONSENT_HANDOFF_DROPPED_LATE);
+		CHECK(store.sets == 0);
+		CHECK(store.apps.count("/apps/caller") == 0);
+		// Next request: prompted again (not a stored Allow); the stale click
+		// cannot answer it either.
+		env.click_in_time = false;
+		u_camera_consent_evaluate(&c, "/apps/caller", "Caller", 100, 0, &d);
+		CHECK(d.why == U_CAMERA_CONSENT_WHY_PROMPT_TIMEOUT);
+		CHECK(u_camera_consent_handoff_answer(&env.h, env.last_gen - 1, U_CAMERA_CONSENT_PROMPT_ALLOW) ==
+		      U_CAMERA_CONSENT_HANDOFF_DROPPED_STALE);
+		CHECK(store.sets == 0);
+	}
+	SECTION("late Allow once: no once-grant either")
+	{
+		env.click_in_time = false;
+		u_camera_consent_evaluate(&c, "/apps/caller", "Caller", 100, 0, &d);
+		CHECK(u_camera_consent_handoff_answer(&env.h, env.last_gen, U_CAMERA_CONSENT_PROMPT_ALLOW_ONCE) ==
+		      U_CAMERA_CONSENT_HANDOFF_DROPPED_LATE);
+		CHECK(c.once_count == 0);
+	}
+	SECTION("Allow in time: stored")
+	{
+		u_camera_consent_evaluate(&c, "/apps/caller", "Caller", 100, 0, &d);
+		CHECK(d.verdict == U_CAMERA_CONSENT_ALLOWED);
+		CHECK(d.why == U_CAMERA_CONSENT_WHY_PROMPT_ALLOW);
+		CHECK(store.apps["/apps/caller"] == U_CAMERA_CONSENT_STORED_ALLOW);
+		CHECK(store.sets == 1);
+	}
+	SECTION("Deny then Allow on the same prompt: the Deny is stored, the Allow dropped")
+	{
+		env.click = U_CAMERA_CONSENT_PROMPT_DENY;
+		env.click_twice = true;
+		u_camera_consent_evaluate(&c, "/apps/caller", "Caller", 100, 0, &d);
+		CHECK(d.why == U_CAMERA_CONSENT_WHY_PROMPT_DENY);
+		REQUIRE(env.results.size() == 2);
+		CHECK(env.results[0] == U_CAMERA_CONSENT_HANDOFF_ACCEPTED);
+		CHECK(env.results[1] == U_CAMERA_CONSENT_HANDOFF_DROPPED_DOUBLE);
+		CHECK(store.apps["/apps/caller"] == U_CAMERA_CONSENT_STORED_DENY);
+		CHECK(store.sets == 1);
 	}
 }
 
