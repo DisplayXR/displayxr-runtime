@@ -85,7 +85,7 @@
     "XR_DXR_lift": {
       "group": "rendering",
       "title": "2D-to-3D Conversion",
-      "summary": "Asynchronous access to a vendor's 2D-to-3D conversion module (depth, stereo, N-view, or photo-to-Gaussian-splats): submit 2D frames, acquire the latest converted result, or flag a weave rect as 2D so the service lifts it before weaving; the runtime owns the viewpoint policy (window-relative look-around, rig factors, axis mode, ease-back)"
+      "summary": "Asynchronous access to a vendor's 2D-to-3D conversion module (depth, stereo, N-view, or photo-to-Gaussian-splats): submit 2D frames, acquire the latest converted result, or flag a weave rect as 2D so the service lifts it before weaving; the runtime owns the viewpoint policy (window-relative look-around, rig factors, axis mode, ease-back), can derive the viewpoints from the app's own view rig, and returns metric depth from the same inference as an auxiliary output aligned to display space"
     },
     "XR_DXR_win32_window_binding": {
       "group": "windowing",

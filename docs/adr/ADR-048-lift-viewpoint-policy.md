@@ -1,6 +1,6 @@
 # ADR-048: Lift viewpoint policy — window-relative viewpoints, rig gains, axis mode and ease-back are runtime policy
 
-**Status:** Accepted (2026-10-08) · Phase 1 implemented · spec:
+**Status:** Accepted (2026-10-08) · Phase 1 implemented · Addendum A (app rig + auxiliary depth, spec v3) implemented · spec:
 [XR_DXR_lift.md §4.1](../specs/extensions/XR_DXR_lift.md#41-viewpoint-frame-and-policy-spec-v2-adr-048) ·
 extends [ADR-042](ADR-042-vendor-2d3d-conversion-supersedes-default.md) · applies
 [ADR-012](ADR-012-window-relative-kooima-projection.md) to lifted content · same split of labour as
@@ -125,9 +125,79 @@ service's environment forces recentering off for every stream, for A/B compariso
 
 ## Later phases (not decided here)
 
-- Accept a full `XrCameraRigDXR` / `XrDisplayRigDXR` on lift options so lifted frames and
-  app-rendered 3D share one camera computed with the `xrLocateViews` math.
+- ~~Accept a full `XrCameraRigDXR` / `XrDisplayRigDXR` on lift options~~ — decided in
+  Addendum A (A1).
 - A metric, off-axis camera input on the vendor module (eye positions in metres relative to a
   screen plane of given size plus a depth scale), replacing today's dimensionless viewpoints.
-- Metric depth as an auxiliary output aligned to the rigs.
+- ~~Metric depth as an auxiliary output aligned to the rigs~~ — decided in Addendum A (A2).
 - Lift in-process (D3D12) for engine apps.
+
+## Addendum A (2026-10-08): the app's rig drives the viewpoints; depth is an auxiliary output
+
+**Status:** Accepted · XR_DXR_lift spec v3 ·
+spec: [XR_DXR_lift.md §4.2–4.3](../specs/extensions/XR_DXR_lift.md#42-app-rig-drives-the-viewpoints-spec-v3-adr-048-addendum-a)
+
+An app that mixes its own rendered 3D with lifted 2D content (a 3D scene around a lifted video
+panel, a depth-aware cursor over lifted video) needs both to share one camera and one metric
+space. Phase 1 gave lifted content window-relative viewpoints and a runtime-owned policy; this
+addendum lets the app hand the runtime **its own rig**, and lets the module hand back **depth**.
+
+### A1. An app rig is computed with the `xrLocateViews` math — never re-implemented
+
+An `XrDisplayRigDXR` or `XrCameraRigDXR` (`XR_DXR_view_rig`) chained on `XrLiftOptionsDXR` or
+`XrWeaveRectLiftDXR` makes the runtime derive the TRACKED lift viewpoints by running **the same
+shared rig core `xrLocateViews` runs** (displayxr-common, `dxr_view_math.h`), with the lifted
+rect as the screen. The display rig's eyes come straight out of `dxr_display3d_compute_views`.
+The camera rig's eyes are the physical viewer whose Kooima frustum onto the rect equals the
+camera's off-axis frustum (`E = Z0·(l·invd + ẑ)`, `Z0 = rect_h / 2·tan(vfov/2)`) — the only
+local step, and it is checked against the shared core frustum by frustum in
+`tests_aux_lift_rig_depth`. Why not a separate lift camera model: two code paths for "the eyes
+this rig sees" would drift, and the whole point is that the app's 3D and the lifted pixels agree.
+
+The rig replaces the policy's ipd / parallax factors (the rig has its own); the axis mask,
+ease-back and clamp still shape the viewer before the rig maps it, so the Phase 1 defaults keep
+working for an app that only wants its rig's scale. An app that wants the located eyes exactly
+chains XYZ + recentering OFF. The rig rides with the options (like explicit viewpoints), matching
+`XR_DXR_view_rig`'s own per-call rule. EXPLICIT viewpoints are now accepted on lifted weave rects:
+the Phase 1 refusal only existed because nothing could consume them there.
+
+The DP is told the viewpoints' origin (`viewpoint_source`: TRACKED / EXPLICIT / DISPLAY_RIG /
+CAMERA_RIG) and the reference distance (`nominal_z_m`), appended to `xrt_dp_lift_params`
+(`XRT_DP_LIFT_HAS_APP_RIG`). Rig viewpoints are the app's eyes, so the plug-in reproduces them as
+given — no extra view gain.
+
+### A2. Depth is an auxiliary output of SBS / NVIEW streams, from the same inference
+
+A separate DEPTH stream runs a separate conversion, so its depth need not belong to the frame
+whose views are woven. Instead an SBS / NVIEW stream created with `XrLiftDepthRequestDXR`
+returns, with each result, the depth of **that** conversion (`XrLiftDepthResultDXR`): a texture
+behind the views' own fence, its encoding and units, the module's intrinsics, the convergence
+depth it placed on the screen, the viewpoint it refers to, and **`depthToDisplay`**.
+
+`depthToDisplay` is runtime policy, derived — not reported by the vendor: the source image fills
+the lifted rect seen from the viewpoint midpoint `C`, and the convergence depth `dc` lies on the
+screen plane, so a texel `(un, vn)` of depth `d` lands at `R + C + (P(un, vn) − C)·d/dc`. That is
+linear in `(un·d, vn·d, d, 1)`: one 4×4. It is honest about what it is — the **display** geometry
+of the woven result, the same perspective as the echoed eyes — and the intrinsics stay available
+separately for the **camera** geometry. With RELATIVE depth the runtime reports neither, rather
+than inventing a scale.
+
+DP contract (ADR-020, append-only, no ABI bump): `xrt_dp_lift_caps` += `aux_outputs`,
+`aux_depth_semantics`; `xrt_dp_lift_stream_info` += `aux_outputs`, `aux_depth_format`; a new
+`struct xrt_dp_lift_depth`; and D3D11 DP slot 33 **`lift_get_depth`**
+(`XRT_DP_D3D11_HAS_LIFT_DEPTH`), called right after a successful `lift_convert` of a stream that
+asked for depth. A slot rather than an out-struct on `lift_convert`: `lift_convert`'s signature
+shipped and is frozen, and a separate call keeps depth optional per stream and per plug-in (an
+absent slot reads as "no depth", which is exactly the old-plug-in case).
+
+### Consequences
+
+- An app renders its 3D with the echoed eyes (or its own rig) and the lifted picture lines up;
+  with metric depth it can occlude and point at lifted content in display metres.
+- Full fidelity needs a metric, off-axis camera input in the vendor module (the module's own
+  camera today is an oblique shear around a convergence plane, not a pinhole); until then the
+  runtime's rig viewpoints reach the module through the same dimensionless translation as Phase 1.
+- Depth quality and "same inference" are vendor capabilities, reported per result; the runtime
+  never synthesizes depth.
+- Spec v3 (not folded into v2): v2 can ship on its own, and an app keys these features on
+  `SPEC_VERSION >= 3`.

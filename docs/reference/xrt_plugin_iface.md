@@ -511,7 +511,20 @@ struct xrt_dp_lift_params { uint32_t struct_size; float convergence; /* [0,1] re
                             float baseline_m;      /* first-to-last viewpoint distance; 0 = none */
                             uint32_t axis_mode;    /* 1 X, 2 XY, 3 XYZ: components that follow the viewer */
                             float max_offset_m;    /* x/y clamp the runtime applied; 0 none */
-                            uint32_t viewpoint_frame; /* 0 DISPLAY (panel centre), 1 RECT (lifted rect centre) */ };
+                            uint32_t viewpoint_frame; /* 0 DISPLAY (panel centre), 1 RECT (lifted rect centre) */
+                            /* appended, XRT_DP_LIFT_HAS_APP_RIG (ADR-048 Addendum A): */
+                            uint32_t viewpoint_source; /* 0 TRACKED, 1 EXPLICIT, 2 DISPLAY_RIG, 3 CAMERA_RIG */
+                            float nominal_z_m; };
+/* appended to caps / stream_info, XRT_DP_LIFT_HAS_AUX_DEPTH: caps.aux_outputs + aux_depth_semantics,
+   stream_info.aux_outputs (XRT_DP_LIFT_AUX_DEPTH) + aux_depth_format (DXGI hint) */
+struct xrt_dp_lift_depth { uint32_t struct_size; uint32_t format; /* R32_FLOAT / R16_FLOAT */
+                           void *resource; /* DP-owned, valid until the next lift_convert on the stream */
+                           uint32_t width, height, units /* 0 relative, 1 metric */, encoding /* 0 linear, 1 inverse */;
+                           float value_scale, value_offset; /* d = scale * sample + offset */
+                           uint32_t source_width, source_height;
+                           float focal_x_px, focal_y_px, principal_x_px, principal_y_px; /* depth-map px */
+                           float near_depth, far_depth, convergence_depth; /* decoded units; <=0 unknown */
+                           uint32_t same_inference; uint64_t vendor_frame_id; };
 
 /* xrt_display_processor_d3d11, slots 25..29 */
 bool (*lift_get_caps)(xdp, struct xrt_dp_lift_caps *out);
@@ -525,6 +538,8 @@ bool (*lift_convert)(xdp, uint64_t id, void *d3d11_context, void *input_resource
 bool (*lift_convert_blob)(xdp, uint64_t id, void *d3d11_context, void *input_resource, uint32_t w, uint32_t h,
                           const struct xrt_dp_lift_params *p, uint32_t *out_format /* 1 PLY_3DGS, 2 SOG */,
                           const void **out_bytes /* valid until the next call */, size_t *out_size);
+/* slot 33, XRT_DP_D3D11_HAS_LIFT_DEPTH: the depth of the conversion lift_convert just returned */
+bool (*lift_get_depth)(xdp, uint64_t id, void *d3d11_context, struct xrt_dp_lift_depth *out);
 
 /* xrt_plugin_iface, appended */
 xrt_dp_factory_d3d11_fn_t create_dp_d3d11_lift; /* a DP that serves ONLY the lift slots */
@@ -559,6 +574,16 @@ xrt_dp_factory_d3d11_fn_t create_dp_d3d11_lift; /* a DP that serves ONLY the lif
   says which ones are live), and use `max_offset_m` + the rect size to map onto your module's
   range. A `struct_size` that stops before these fields means panel-centred viewpoints (an
   older runtime).
+- **App-rig viewpoints (ADR-048 Addendum A).** With `viewpoint_source` DISPLAY_RIG /
+  CAMERA_RIG the viewpoints are the app's own rig eyes (the `xrLocateViews` math, the rect as the
+  screen) — the eyes the app renders its 3D from. Reproduce them as given: no extra view gain.
+- **Auxiliary depth (ADR-048 Addendum A).** A stream whose `stream_info.aux_outputs` has
+  `XRT_DP_LIFT_AUX_DEPTH` gets a `lift_get_depth` call right after each successful
+  `lift_convert`. Return that conversion's depth — ideally from the same inference
+  (`same_inference`) — as an R32F / R16F texture you own until the next convert, with its
+  encoding, units, intrinsics and `convergence_depth` (the decoded depth you put at zero
+  disparity). The runtime copies it out and derives the display transform itself; report, don't
+  align. Advertise it in `caps.aux_outputs` / `aux_depth_semantics`. No slot ⟹ no depth.
 - **Output layout.** SBS = two views side by side; NVIEW = `view_count` views in one row, view 0
   leftmost; DEPTH = one channel (any single-channel or RGBA format — say which in
   `out_format`). The runtime weaves SBS/NVIEW results itself on the ordinary weave path
