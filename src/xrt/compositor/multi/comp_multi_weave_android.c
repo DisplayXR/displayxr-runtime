@@ -101,6 +101,8 @@ weave_split_enabled(void)
 #include <stdlib.h>
 
 #include <android/hardware_buffer.h>
+#include <dlfcn.h>
+#include <inttypes.h>
 
 /*
  *
@@ -253,6 +255,59 @@ weave_import_ahb(struct vk_bundle *vk,
 	return true;
 }
 
+/*
+ * AHardwareBuffer identity across IPC (#1865).
+ *
+ * Every AHardwareBuffer_recvHandleFromUnixSocket() wraps the received native
+ * handle in a NEW GraphicBuffer, so the AHardwareBuffer * the IPC receive hands
+ * us is different on every submit even when the caller re-sends the same
+ * buffer — and since the cache holds the previous reference, the new pointer can
+ * never alias it. Keyed by pointer, both caches below therefore missed on every
+ * frame: the input and the v4 overlay were released and re-imported (Vulkan
+ * AHB import + memory + view) per submit, and the overlay path logged a WARN
+ * each time.
+ *
+ * AHardwareBuffer_getId() returns a system-wide id that is stable across
+ * processes for the lifetime of the allocation, which is the right key. It is
+ * API 31; the runtime's minSdk is 29, so it is resolved at run time. Where it is
+ * missing the key falls back to the pointer, i.e. the old behaviour.
+ */
+typedef int (*weave_pfn_ahb_get_id)(const AHardwareBuffer *buffer, uint64_t *out_id);
+static weave_pfn_ahb_get_id weave_ahb_get_id_fn;
+static pthread_once_t weave_ahb_get_id_once = PTHREAD_ONCE_INIT;
+
+static void
+weave_resolve_ahb_get_id(void)
+{
+	weave_ahb_get_id_fn = (weave_pfn_ahb_get_id)dlsym(RTLD_DEFAULT, "AHardwareBuffer_getId");
+	U_LOG_W("weave(#1865): AHardwareBuffer_getId %s — import caches keyed by %s",
+	        weave_ahb_get_id_fn != NULL ? "available" : "unavailable (API < 31)",
+	        weave_ahb_get_id_fn != NULL ? "buffer id" : "pointer only");
+}
+
+//! System-wide buffer id, or 0 when unknown.
+static uint64_t
+weave_ahb_id(const void *ahb)
+{
+	pthread_once(&weave_ahb_get_id_once, weave_resolve_ahb_get_id);
+	uint64_t id = 0;
+	if (ahb == NULL || weave_ahb_get_id_fn == NULL ||
+	    weave_ahb_get_id_fn((const AHardwareBuffer *)ahb, &id) != 0) {
+		return 0;
+	}
+	return id;
+}
+
+//! Does the incoming buffer name the buffer behind the cached import?
+static bool
+weave_ahb_matches(const void *cached, uint64_t cached_id, const void *incoming, uint64_t incoming_id)
+{
+	if (cached == NULL || incoming == NULL) {
+		return false;
+	}
+	return cached == incoming || (cached_id != 0 && cached_id == incoming_id);
+}
+
 static void
 weave_release_input(struct vk_bundle *vk, struct multi_compositor *mc)
 {
@@ -273,6 +328,7 @@ weave_release_input(struct vk_bundle *vk, struct multi_compositor *mc)
 		u_graphics_buffer_unref(&h);
 		mc->weave.in_ahb = NULL;
 	}
+	mc->weave.in_ahb_id = 0;
 	mc->weave.in_w = 0;
 	mc->weave.in_h = 0;
 }
@@ -297,6 +353,7 @@ weave_release_overlay(struct vk_bundle *vk, struct multi_compositor *mc)
 		u_graphics_buffer_unref(&h);
 		mc->weave.overlay_ahb = NULL;
 	}
+	mc->weave.overlay_ahb_id = 0;
 	mc->weave.overlay_w = 0;
 	mc->weave.overlay_h = 0;
 }
@@ -1827,10 +1884,13 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 			break;
 		}
 
-		// (Re)import the input on identity change. AHardwareBuffer pointers are
-		// stable for as long as anyone holds a reference, and we hold one for the
-		// cached import — so pointer identity is a sound cache key here.
-		if (mc->weave.in_image == VK_NULL_HANDLE || mc->weave.in_ahb != (void *)input) {
+		// (Re)import the input on identity change. NOT pointer identity: every
+		// IPC receive produces a fresh AHardwareBuffer * for the same buffer, so
+		// the key is the system-wide buffer id (#1865, weave_ahb_id). On a hit the
+		// per-call reference stays in `input` and is released at the end.
+		const uint64_t input_id = weave_ahb_id((void *)input);
+		if (mc->weave.in_image == VK_NULL_HANDLE ||
+		    !weave_ahb_matches(mc->weave.in_ahb, mc->weave.in_ahb_id, (void *)input, input_id)) {
 			weave_release_input(vk, mc);
 			if (!weave_import_ahb(vk, (void *)input,
 			                      XRT_SWAPCHAIN_USAGE_SAMPLED | XRT_SWAPCHAIN_USAGE_TRANSFER_SRC,
@@ -1839,7 +1899,13 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 				break;
 			}
 			mc->weave.in_ahb = (void *)input; // adopt the reference
+			mc->weave.in_ahb_id = input_id;
 			mc->weave.in_first_use = true;
+			const uint32_t n = mc->weave.in_imports++;
+			if (n == 0 || (n % 300) == 0) {
+				U_LOG_W("weave(#1036) input import #%u (%ux%u, id=%" PRIu64 ")", n + 1, mc->weave.in_w,
+				        mc->weave.in_h, input_id);
+			}
 			input = XRT_GRAPHICS_BUFFER_HANDLE_INVALID; // ownership transferred
 		}
 
@@ -1862,18 +1928,26 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		//     output as the frame; before v18 that frame would have had its 2D
 		//     missing.
 		mc->weave.overlay_this_submit = overlay != XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+		const uint64_t overlay_id = weave_ahb_id((void *)overlay);
 		if (overlay != XRT_GRAPHICS_BUFFER_HANDLE_INVALID &&
-		    (mc->weave.overlay_image == VK_NULL_HANDLE || mc->weave.overlay_ahb != (void *)overlay)) {
+		    (mc->weave.overlay_image == VK_NULL_HANDLE ||
+		     !weave_ahb_matches(mc->weave.overlay_ahb, mc->weave.overlay_ahb_id, (void *)overlay, overlay_id))) {
 			weave_release_overlay(vk, mc);
 			if (weave_import_ahb(vk, (void *)overlay, XRT_SWAPCHAIN_USAGE_SAMPLED,
 			                     &mc->weave.overlay_image, &mc->weave.overlay_memory,
 			                     &mc->weave.overlay_view, &mc->weave.overlay_w, &mc->weave.overlay_h,
 			                     "overlay")) {
 				mc->weave.overlay_ahb = (void *)overlay;
+				mc->weave.overlay_ahb_id = overlay_id;
 				mc->weave.overlay_first_use = true;
 				overlay = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
-				U_LOG_W("weave(#1036) v4: overlay import cached (%ux%u)", mc->weave.overlay_w,
-				        mc->weave.overlay_h);
+				// Throttled: a producer that really does change buffers every frame
+				// must not turn this into a per-frame WARN (#1865).
+				const uint32_t n = mc->weave.overlay_imports++;
+				if (n == 0 || (n % 300) == 0) {
+					U_LOG_W("weave(#1036) v4: overlay import #%u cached (%ux%u, id=%" PRIu64 ")", n + 1,
+					        mc->weave.overlay_w, mc->weave.overlay_h, overlay_id);
+				}
 			} else {
 				const uint32_t n = mc->weave.overlay_refusals++;
 				if (n == 0 || (n % 300) == 0) {

@@ -728,6 +728,9 @@ struct multi_compositor
 		//! @name Cached input import (rebuilt when the AHardwareBuffer changes)
 		//! @{
 		void *in_ahb; //!< Acquired AHardwareBuffer * (adopted from the IPC receive).
+		//! AHardwareBuffer_getId of @c in_ahb (0 = unknown) — the cache key (#1865).
+		uint64_t in_ahb_id;
+		uint32_t in_imports; //!< Input imports so far (throttles the import WARN).
 		VkImage in_image;
 		VkDeviceMemory in_memory;
 		VkImageView in_view; //!< Full-image view (v6 zero-copy DP sample source).
@@ -786,6 +789,9 @@ struct multi_compositor
 		//! @name v4 DP-composited 2D overlay atlas (browser#18)
 		//! @{
 		void *overlay_ahb;
+		//! AHardwareBuffer_getId of @c overlay_ahb (0 = unknown) — the cache key (#1865).
+		uint64_t overlay_ahb_id;
+		uint32_t overlay_imports; //!< Overlay imports so far (throttles the import WARN).
 		VkImage overlay_image;
 		VkDeviceMemory overlay_memory;
 		VkImageView overlay_view;
@@ -796,7 +802,7 @@ struct multi_compositor
 		/*!
 		 * XR_DXR_weave v18: THIS submit chained an overlay. The import above is
 		 * a cache (an AHardwareBuffer is re-sent every frame and matched by
-		 * pointer), so @c overlay_image outlives the submit that brought it; the
+		 * buffer id, #1865), so @c overlay_image outlives the submit that brought it; the
 		 * overlay is composited only when the current submit carries one.
 		 */
 		bool overlay_this_submit;
