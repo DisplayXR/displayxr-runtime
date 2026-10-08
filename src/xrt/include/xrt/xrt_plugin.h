@@ -1275,6 +1275,48 @@ struct xrt_plugin_iface
 	                                        int32_t target_format,
 	                                        const struct xrt_screen_binding *binding,
 	                                        struct xrt_display_processor **out_xdp);
+
+	/*!
+	 * Create a D3D11 display processor for ONE screen this plug-in won in
+	 * the per-monitor registry (multi-screen M6, ADR-047 D2 on Windows): the
+	 * in-process D3D11 compositor weaves a window that spans several
+	 * monitors per segment, each by its own screen's DP, into the one
+	 * presented back buffer.
+	 *
+	 * Same contract as @ref create_dp_d3d11 (`xrt_dp_factory_d3d11_fn_t`),
+	 * plus everything @ref create_dp_vk_for_screen promises:
+	 *   - @p binding names the screen; never NULL. Vendor DPs resolve it to
+	 *     their own display identity (`binding->display_id`, else their
+	 *     per-monitor claim) and bind their weaver to THAT display.
+	 *   - @p window_handle: the session's real HWND for the DP of the screen
+	 *     that holds the MAJORITY of the window (it keeps the vendor's drag
+	 *     phase-snap), NULL for every other screen's DP, which is windowless
+	 *     and gets its phase from
+	 *     @ref xrt_display_processor_d3d11::set_present_origin plus the
+	 *     canvas offset. A DP must weave with a NULL window.
+	 *   - The compositor binds the back buffer, then calls
+	 *     @ref xrt_display_processor_d3d11::process_atlas with
+	 *     `canvas = the segment` and a pre-cropped atlas holding exactly that
+	 *     segment's views; the DP MUST confine its output — viewport AND
+	 *     scissor — to the canvas, and must not assume it is the first
+	 *     writer to the back buffer this frame.
+	 *   - Several instances coexist in one process, one per screen.
+	 *
+	 * Optional. NULL (or a plug-in whose `struct_size` predates this field)
+	 * ⟹ the plug-in's screens other than the session's primary one get a
+	 * flat 2D view (never a @ref create_dp_d3d11 DP, for the reason given on
+	 * @ref create_dp_vk_for_screen). Appended per ADR-020 (append-only
+	 * within a major; gated by @ref struct_size; no
+	 * XRT_PLUGIN_API_VERSION_CURRENT bump) after
+	 * @ref create_dp_vk_for_screen. Announced by
+	 * @ref XRT_PLUGIN_IFACE_HAS_CREATE_DP_D3D11_FOR_SCREEN.
+	 */
+	xrt_result_t (*create_dp_d3d11_for_screen)(struct xrt_plugin_instance *inst,
+	                                           void *d3d11_device,
+	                                           void *d3d11_context,
+	                                           void *window_handle,
+	                                           const struct xrt_screen_binding *binding,
+	                                           struct xrt_display_processor_d3d11 **out_xdp);
 };
 
 /*!
@@ -1341,6 +1383,28 @@ xrt_plugin_iface_has_create_dp_vk_for_screen(const struct xrt_plugin_iface *ifac
 	       iface->struct_size >= offsetof(struct xrt_plugin_iface, create_dp_vk_for_screen) +
 	                                 sizeof(iface->create_dp_vk_for_screen) &&
 	       iface->create_dp_vk_for_screen != NULL;
+}
+
+/*!
+ * Defined when @ref xrt_plugin_iface carries @ref
+ * xrt_plugin_iface::create_dp_d3d11_for_screen (multi-screen M6, Windows), so
+ * a plug-in built against an older runtime header can #ifdef-guard
+ * implementing it.
+ */
+#define XRT_PLUGIN_IFACE_HAS_CREATE_DP_D3D11_FOR_SCREEN 1
+
+/*!
+ * True when @p iface implements @ref
+ * xrt_plugin_iface::create_dp_d3d11_for_screen (and its struct_size covers the
+ * slot).
+ */
+static inline bool
+xrt_plugin_iface_has_create_dp_d3d11_for_screen(const struct xrt_plugin_iface *iface)
+{
+	return iface != NULL &&
+	       iface->struct_size >= offsetof(struct xrt_plugin_iface, create_dp_d3d11_for_screen) +
+	                                 sizeof(iface->create_dp_d3d11_for_screen) &&
+	       iface->create_dp_d3d11_for_screen != NULL;
 }
 
 /*!

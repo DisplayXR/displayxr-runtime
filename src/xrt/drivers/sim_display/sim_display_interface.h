@@ -284,6 +284,22 @@ sim_display_dp_factory_d3d11(void *d3d11_device,
                               struct xrt_display_processor_d3d11 **out_xdp);
 
 /*!
+ * Multi-screen M6: per-screen D3D11 factory, the Windows twin of
+ * `sim_display_dp_factory_vk_for_screen` — matches
+ * `xrt_plugin_iface::create_dp_d3d11_for_screen`. The DP describes the bound
+ * screen and confines its draw to the canvas it is handed.
+ *
+ * @ingroup drv_sim_display
+ */
+xrt_result_t
+sim_display_dp_factory_d3d11_for_screen(struct xrt_plugin_instance *inst,
+                                        void *d3d11_device,
+                                        void *d3d11_context,
+                                        void *window_handle,
+                                        const struct xrt_screen_binding *binding,
+                                        struct xrt_display_processor_d3d11 **out_xdp);
+
+/*!
  * Create a simulation D3D12 display processor.
  *
  * For SBS mode, shaders are still compiled but act as a pass-through.
