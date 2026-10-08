@@ -3,11 +3,11 @@
 | Field | Value |
 |---|---|
 | **Extension Name** | `XR_DXR_lift` |
-| **Spec Version** | 2 |
+| **Spec Version** | 3 |
 | **Extension Type** | Instance extension (service path — Windows/D3D11; advertised on every desktop platform, where a service without a module reports `supportedModes = 0`) |
 | **Header** | `src/external/openxr_includes/openxr/XR_DXR_lift.h` (canonical; auto-syncs to `displayxr-extensions`) |
-| **Status** | Provisional (`1004999270–282` block, pending Khronos registry) |
-| **Decision record** | [ADR-042](../../adr/ADR-042-vendor-2d3d-conversion-supersedes-default.md); viewpoint policy: [ADR-048](../../adr/ADR-048-lift-viewpoint-policy.md) |
+| **Status** | Provisional (`1004999270–285` block, pending Khronos registry) |
+| **Decision record** | [ADR-042](../../adr/ADR-042-vendor-2d3d-conversion-supersedes-default.md); viewpoint policy, app rig and auxiliary depth: [ADR-048](../../adr/ADR-048-lift-viewpoint-policy.md) (+ Addendum A) |
 | **Plug-in contract** | `src/xrt/include/xrt/xrt_dp_lift.h` + the lift slots of `xrt_display_processor_d3d11` (`XRT_DP_D3D11_HAS_LIFT`), [`xrt_plugin_iface.md` § lift](../../reference/xrt_plugin_iface.md#turning-2d-into-3d-the-lift-slots-adr-042-xr_dxr_lift) |
 
 ## 1. What it is
@@ -147,7 +147,7 @@ viewer facing the panel centre (the same window-relative rule ADR-012 sets for K
 viewpoints are given in display space as before and are rebased the same way; nothing else is
 applied to them.
 
-**Policy** (`XrLiftViewControlDXR`, TRACKED only). Chain it on `XrLiftOptionsDXR` (submit or
+**Policy** (`XrLiftViewControlDXR`, TRACKED only; with an app rig see §4.2). Chain it on `XrLiftOptionsDXR` (submit or
 weave rect) or directly on `XrWeaveRectLiftDXR` (the direct chain wins). It is **sticky per
 stream**: the last one sent applies until another is sent. Omitted, the defaults apply:
 
@@ -190,6 +190,106 @@ no viewpoints were known (the module used its defaults) or a DEPTH stream.
 separation after the ipd factor), `axis_mode` and `max_offset_m`. The plug-in only translates
 units — it normalises by `baseline_m` rather than a fixed eye distance, and honours every
 component it is sent.
+
+### 4.2 App rig drives the viewpoints (spec v3, ADR-048 Addendum A)
+
+An app that renders its own 3D next to (or around) lifted content wants both to share **one
+camera**. Chain the same `XR_DXR_view_rig` descriptor it chains on `xrLocateViews` — an
+`XrDisplayRigDXR` or an `XrCameraRigDXR` — on `XrLiftOptionsDXR` (submit or weave rect) or
+directly on `XrWeaveRectLiftDXR` (the direct chain wins; a camera rig wins over a display rig,
+as in `xrLocateViews`). The runtime then derives the TRACKED viewpoints with **the same
+functions `xrLocateViews` runs** (displayxr-common's shared rig core, `dxr_view_math.h`), with
+the lifted rect as the screen:
+
+| Rig | Lift viewpoints (rect-relative metres) |
+|---|---|
+| `XrDisplayRigDXR` | `dxr_display3d_compute_views(...).eye_display` with the rect as the screen and `virtualDisplayHeight` = the rect height (m2v = 1): the eyes after `ipdFactor` / `parallaxFactor` (steps 1a / 1b), scaled by `perspectiveFactor`. With m2v ≠ 1 these are exactly the located `eye_display / m2v`. |
+| `XrCameraRigDXR` | the physical viewer whose Kooima frustum onto the rect **equals** the camera rig's frustum: with `l = m2v · (processed eye − (0, 0, nominal))` (the shared camera3d core's eye, identity pose), `invd = convergenceDiopters`, `ht = tan(verticalFov / 2)` and `Z0 = rect_h / (2 ht)`: **E = Z0 · (l · invd + (0, 0, 1))**. Proof: Kooima's `tan_right = (W/2 − Ex)/Ez` reduces to the camera's `(ht·aspect − lx·invd) / (1 + lz·invd)`; likewise for the other three edges. `convergenceDiopters` 0 (parallel cameras) collapses every view onto `(0, 0, Z0)` — no lift parallax, which is what parallel cameras see of a flat image. |
+
+The rig `pose` and `virtualDisplayHeight` only place the app's virtual world; they do not move
+the physical viewpoints. The rig **replaces** `XrLiftViewControlDXR`'s `ipdFactor` /
+`parallaxFactor`; its axis mask, recentering and clamp still apply, to the viewer **before** the
+rig maps it (order: rebase → axis mask → recenter → clamp → rig). For viewpoints identical to
+`xrLocateViews`' (to float tolerance — `tests_aux_lift_rig_depth` checks both rigs against the
+shared core), chain `XrLiftViewControlDXR` with `XR_LIFT_AXIS_MODE_XYZ_DXR` and recentering OFF.
+
+The rig **rides with the options**, like EXPLICIT viewpoints: a submit (or lifted rect) that
+carries `XrLiftOptionsDXR` without a rig clears it; one that carries no options keeps the
+stream's last rig. EXPLICIT viewpoints, DEPTH and GAUSSIANS streams ignore it. The echo
+(`XrLiftResultViewpointsDXR`) reports the rig's viewpoints, so the app renders from the very eyes
+the lifted views were synthesized for. The DP is told where they came from in
+`xrt_dp_lift_params::viewpoint_source` (`DISPLAY_RIG` / `CAMERA_RIG`; `XRT_DP_LIFT_HAS_APP_RIG`)
+and must reproduce them as given — no extra view gain — plus `nominal_z_m`.
+
+**EXPLICIT viewpoints on lifted weave rects** are accepted since v3, with the same validation
+and the same rect rebase as on a submit.
+
+### 4.3 Auxiliary depth (spec v3, ADR-048 Addendum A)
+
+An SBS / NVIEW stream can return the **depth map of the same inference** that produced its
+views, so app content can occlude, intersect and point at lifted video in one metric space
+(ADR-046 cursor depth and ADR-040's rear budget reason about it the same way).
+
+- **Ask** at creation: chain `XrLiftDepthRequestDXR` on `XrLiftStreamCreateInfoDXR`
+  (`preferredFormat`: `DXGI_FORMAT_R32_FLOAT` / `_R16_FLOAT` / 0). On a DEPTH or GAUSSIANS stream
+  it is `XR_ERROR_VALIDATION_FAILURE`. **Capability**: `XrLiftDepthPropertiesDXR` chained on
+  `XrLiftPropertiesDXR` (`auxDepthSupported`, `auxDepthSemantics`). A request the module cannot
+  serve still creates the stream; results then report `depthValid = XR_FALSE`.
+- **Receive**: chain `XrLiftDepthResultDXR` on `XrLiftResultDXR`. `depthTexture` + `fence`
+  follow §5.1's export rule (first acquire that carries depth, and every depth reallocation);
+  the fence is the SAME object as the views' fence with the SAME `fenceValue` — one wait covers
+  both. `frameId` equals the result's; `sameInference` says the module produced depth and views
+  in one pass.
+- **Decode** a sample `s`: `d = valueScale · s + valueOffset`; `depth = d` (LINEAR) or `1 / d`
+  (INVERSE), in `units` (METRIC = metres along the source camera's axis; RELATIVE = unitless,
+  larger = farther). `nearDepth` / `farDepth` bound it (0 = unknown).
+- **Intrinsics** (`intrinsicsValid`, METRIC only): the source camera the module assumed, in
+  depth-map pixels — `focalLengthPx`, `principalPointPx` — place a texel `(u, v)` in the
+  camera's metric frame: `X = (u − cx)·depth/fx`, `Y = −(v − cy)·depth/fy`, `Z = −depth`.
+
+**`depthToDisplay` — the display alignment.** The woven result presents the source image on the
+lifted rect, seen from the viewpoint midpoint `C` (= `viewpoint`, rect-relative — the midpoint of
+the echoed viewpoints, or the straight-on viewer `(0, 0, nominal)` when none were known), with the
+module's convergence depth `dc` (= `convergenceDepth`, the decoded depth it put at zero
+disparity) **on the screen plane**. So a texel at normalised coordinates `(un, vn)` — texel
+centre, `un = (u + 0.5)/width`, `vn = (v + 0.5)/height`, v down — sits on the rect at
+
+    P = (W·(un − ½), H·(½ − vn), 0)                (rect-relative; W × H = the rect in metres)
+
+and a texel of depth `d` lies on the ray from the viewpoint through `P`, at the fraction `d / dc`
+of the way:
+
+    X = R + C + (P − C) · d / dc                   (R = rectCenter, display space)
+
+`d = dc` lands on the rect (z = the screen plane), `d → 0` converges on the viewpoint, `d > dc` is
+behind the screen. `X` is linear in `(un·d, vn·d, d, 1)`, so it is one column-major 4×4
+(`m[col·4 + row]`, output `w` = 1):
+
+| column | multiplies | x | y | z | w |
+|---|---|---|---|---|---|
+| 0 | `un·d` | `W/dc` | 0 | 0 | 0 |
+| 1 | `vn·d` | 0 | `−H/dc` | 0 | 0 |
+| 2 | `d` | `(−W/2 − Cx)/dc` | `(H/2 − Cy)/dc` | `−Cz/dc` | 0 |
+| 3 | 1 | `Rx + Cx` | `Ry + Cy` | `Rz + Cz` | 1 |
+
+Content an app renders from the echoed eyes (or from its own rig, §4.2) therefore lines up with
+the lifted picture: both are perspective images of the same points from the same viewpoint. The
+transform is the *display* geometry (strength 1); the intrinsics describe the *camera* geometry —
+the two coincide only when the module's field of view equals the rect's angular size from `C`.
+`transformValid` needs METRIC units, `dc > 0` and a known rect; **RELATIVE depth reports
+`transformValid` / `intrinsicsValid` XR_FALSE rather than inventing a scale.** Reference
+implementation and tests: `src/xrt/auxiliary/util/u_lift_depth.{h,c}`,
+`tests/tests_aux_lift_rig_depth.cpp`.
+
+**DP side.** The runtime passes the request in `xrt_dp_lift_stream_info::aux_outputs`
+(`XRT_DP_LIFT_AUX_DEPTH`, + `aux_depth_format`), and right after each successful `lift_convert`
+of such a stream calls the appended D3D11 slot **`lift_get_depth`** (`XRT_DP_D3D11_HAS_LIFT_DEPTH`),
+which fills `struct xrt_dp_lift_depth` (`XRT_DP_LIFT_HAS_AUX_DEPTH`): the DP-owned R32F / R16F
+texture (valid until the next convert), units, encoding + scale / offset, source size, focal /
+principal point, near / far, `convergence_depth`, `same_inference`, the module's frame id. The
+runtime copies it into the result's ring slot and then the per-stream depth export texture,
+and derives `depthToDisplay` itself. Capability: `xrt_dp_lift_caps::aux_outputs` /
+`aux_depth_semantics`. An older plug-in (no slot) simply returns no depth.
 
 ## 5. Acquiring results
 
@@ -246,7 +346,8 @@ xrWeaveSubmitDXR(session, &in, &out);
 "The content of weave rect `rectIndex` is 2D — lift it before weaving." An `XrRect2Di` has no
 `next`, so the association is by index into `XrWeaveSubmitRectsDXR::rects`; up to
 `XR_WEAVE_SUBMIT_MAX_LIFT_RECTS_DXR` (8) rects per submit. The stream must be an SBS or NVIEW
-stream of the same session; options on the weave path must use TRACKED viewpoints.
+stream of the same session. Since v3 options on the weave path may use EXPLICIT viewpoints
+(§4.2), and a rig may be chained on the rect or its options.
 
 What the caller draws:
 
@@ -373,7 +474,7 @@ Mirrors XR_DXR_weave §4b.
 | Result | When | Session still usable? |
 |---|---|---|
 | `XR_LIFT_NOT_READY_DXR` (success) | no result newer than the last acquired | yes |
-| `XR_ERROR_VALIDATION_FAILURE` | a struct out of contract (mode not one bit, bad viewCount, EXPLICIT without viewpoints, EXPLICIT on a weave rect, wrong acquire for the mode, bad `rectIndex`) | yes — caller bug, nothing sent |
+| `XR_ERROR_VALIDATION_FAILURE` | a struct out of contract (mode not one bit, bad viewCount, EXPLICIT without viewpoints, `XrLiftDepthRequestDXR` on a DEPTH / GAUSSIANS stream, wrong acquire for the mode, bad `rectIndex`) | yes — caller bug, nothing sent |
 | `XR_ERROR_FEATURE_UNSUPPORTED` | in-process session; mode not supported by a READY module; no module | yes — permanent for that request |
 | `XR_ERROR_LIMIT_REACHED` | `maxStreams` reached | yes |
 | `XR_ERROR_SIZE_INSUFFICIENT` | blob capacity too small (latch kept) | yes |
@@ -389,7 +490,8 @@ Mirrors XR_DXR_weave §4b.
 | latest-wins mailbox, drops, frame ids | the model, its backend, licensing, warm-up (reported as ACTIVATING) |
 | output ring copies, export textures, fences | an output valid until its next call |
 | priority scheduling across streams | nothing about scheduling |
-| tracked eyes → explicit viewpoints, rebased to the lifted rect, with the viewpoint policy applied (ADR-048) | honouring explicit viewpoints over any tracker of its own; unit translation only (normalise by `baseline_m`, honour every component sent) |
+| tracked eyes → explicit viewpoints, rebased to the lifted rect, with the viewpoint policy applied (ADR-048) — or derived from the app's rig with the `xrLocateViews` math (v3) | honouring explicit viewpoints over any tracker of its own; unit translation only (normalise by `baseline_m`, honour every component sent; rig viewpoints reproduced as given) |
+| copying the auxiliary depth out, exporting it, the display transform (`depthToDisplay`) | returning the depth of the same inference + its metadata (`lift_get_depth`) |
 | weaving SBS / N-view results (ADR-007) | never weaving a lift result |
 | timestamps, latency, stats | reporting `typical_latency_ns` |
 
@@ -440,6 +542,7 @@ order: runtime → extensions auto-sync → consumers.
 |---|---|
 | 1 | Initial: properties + states, streams (DEPTH / SBS / NVIEW / GAUSSIANS), non-blocking latest-wins submit, texture acquire (weave-style handles + fence), blob acquire (two-call latch), weave-rect lift chain, per-stream priority scheduling + stats, `focalPx`. |
 | 2 | Viewpoint policy (ADR-048, §4.1): viewpoints relative to the lifted rect / submitting window centre (was: the panel centre), `XrLiftViewControlDXR` (ipd / parallax factors, axis mode, offset clamp, recentering; defaults X + EASE_BACK 1 s / 2 s), `XrLiftResultViewpointsDXR` echo. |
+| 3 | App camera + metric depth (ADR-048 Addendum A, §4.2–4.3): `XrDisplayRigDXR` / `XrCameraRigDXR` on `XrLiftOptionsDXR` / `XrWeaveRectLiftDXR` drive the TRACKED viewpoints with the `xrLocateViews` rig math; EXPLICIT viewpoints accepted on lifted weave rects; auxiliary depth for SBS / NVIEW streams — `XrLiftDepthRequestDXR`, `XrLiftDepthResultDXR` (texture + shared fence, units, encoding, intrinsics, convergence depth, viewpoint, `depthToDisplay`), `XrLiftDepthPropertiesDXR`. A separate version from 2 because v2 can ship on its own (#1864): an app tests `SPEC_VERSION >= 3` for these. |
 
 ## Probing on a Windows box — gotchas (first N0 run, 2026-09-25)
 
