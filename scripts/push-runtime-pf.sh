@@ -93,6 +93,22 @@ ST="$(tag_of "$PF/displayxr-service.exe")"
 echo "== PF client=$CT service=$ST"
 [ -n "$CT" ] && [ "$CT" = "$ST" ] || { echo "ERROR: client/service tag mismatch after copy — DO NOT leave it like this" >&2; exit 1; }
 
+# 4b. Make the registry tell the truth about what is now in Program Files. Version-gated
+#     installers read HKLM\Software\DisplayXR\Runtime\Version, not the binaries: the Leia
+#     plug-in installer refuses (exit 5, "runtime too old") and the browser installer may chain
+#     a runtime "upgrade" when the registry still names the previously INSTALLED release even
+#     though a newer dev build sits in PF. Seen 2026-10-08: a v2.28-based push left Version=2.26.0
+#     and leia v2.11.0's installer aborted. A real installer rewrites this value on its next run.
+NEWVER="$(printf '%s' "$CT" | sed -E 's/^v([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
+if printf '%s' "$NEWVER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+  OLDVER="$(reg query 'HKLM\Software\DisplayXR\Runtime' //v Version //reg:64 2>/dev/null | awk '/Version/{print $3}')"
+  if [ "$OLDVER" != "$NEWVER" ]; then
+    reg add 'HKLM\Software\DisplayXR\Runtime' //v Version //t REG_SZ //d "$NEWVER" //f //reg:64 >/dev/null 2>&1 \
+      && echo "== registry Runtime\\Version: ${OLDVER:-<none>} -> $NEWVER (version-gated installers now see the pushed build)" \
+      || echo "WARN: could not update HKLM Runtime\Version (${OLDVER:-<none>}, build is $NEWVER) — run elevated, or version-gated installers (Leia plug-in exit 5) will see the old version" >&2
+  fi
+fi
+
 # 5. Restart the service so any residual mismatch surfaces immediately.
 taskkill //F //IM displayxr-service.exe >/dev/null 2>&1 || true
 sleep 1
