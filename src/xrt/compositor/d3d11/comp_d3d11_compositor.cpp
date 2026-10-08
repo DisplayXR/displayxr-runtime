@@ -14,6 +14,8 @@
 #include "util/comp_display_refresh_win.h"
 #include "comp_d3d11_renderer.h"
 #include "comp_d3d11_outcomp.h"
+#include "comp_d3d11_segments.h" // multi-screen M6
+#include "xrt/xrt_screen.h"
 #include "comp_d3d11_window.h"
 #include "comp_d3d11_state_guard.h"
 #include "comp_xbridge.h"
@@ -487,6 +489,21 @@ struct comp_d3d11_compositor
 
 	//! Generic D3D11 display processor (vendor-agnostic weaving).
 	struct xrt_display_processor_d3d11 *display_processor;
+
+	/*!
+	 * Multi-screen M6 (ADR-047 D2 on Windows): a window spanning monitors is
+	 * woven per segment, each by its own screen's DP, into the one back
+	 * buffer. The screen list + DP registry arrive at session creation
+	 * (comp_d3d11_compositor_set_screens, under c->mutex); the manager is
+	 * (re)built lazily on the weave thread, which also holds c->mutex.
+	 */
+	struct comp_d3d11_segments *segments;
+	struct xrt_screen_list *seg_screens;              //!< heap copy, NULL = not handed over
+	struct xrt_system_compositor_info *seg_sys_info; //!< heap copy (the DP registry)
+	bool seg_rebuild;                                //!< a new list arrived: rebuild on the next weave
+	uint64_t seg_pinned_display_id;
+	struct comp_seg_rect seg_window; //!< the window's client area in desktop device px
+	bool have_seg_window;
 
 	//! System devices (for qwerty driver keyboard input and display mode toggle).
 	struct xrt_system_devices *xsysd;
@@ -2564,13 +2581,72 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 	xrt_display_processor_d3d11_set_predicted_scanout(
 	    c->display_processor, comp_d3d11_target_predict_weave_to_scanout_ns(c->target));
 
-	xrt_display_processor_d3d11_process_atlas(
-	    c->display_processor, d3d11_out_context(c), atlas_srv, view_width, view_height,
-	    tile_columns, tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, target_width, target_height,
-	    eff_canvas.valid ? eff_canvas.x : 0,
-	    eff_canvas.valid ? eff_canvas.y : 0,
-	    eff_canvas.valid ? eff_canvas.w : 0,
-	    eff_canvas.valid ? eff_canvas.h : 0);
+	/*
+	 * Multi-screen M6 (ADR-047 D2): does this window span monitors? Only off
+	 * the zero-copy path (the atlas must be ours to crop), off the #918 split
+	 * (the output adapter owns that pipeline), and for a whole-window canvas
+	 * (a zones / Local2D frame keeps the single-DP path — out of scope here).
+	 * A window on the primary screen only also stays single-DP, byte for byte.
+	 */
+	bool seg_split = false;
+	if (!zero_copy && !c->split_active && !eff_canvas.valid && c->have_seg_window && c->seg_screens != nullptr &&
+	    atlas_srv != nullptr) {
+		if (c->seg_rebuild) {
+			comp_d3d11_segments_destroy(&c->segments);
+			c->seg_rebuild = false;
+		}
+		if (c->segments == nullptr) {
+			c->segments = comp_d3d11_segments_create(d3d11_out_device(c));
+			if (c->segments != nullptr) {
+				comp_d3d11_segments_set_screens(c->segments, c->seg_screens, c->seg_sys_info,
+				                                c->seg_pinned_display_id);
+			}
+		}
+		if (comp_d3d11_segments_enabled(c->segments)) {
+			const struct comp_seg_rect canvas = {0, 0, c->seg_window.w, c->seg_window.h};
+			const uint32_t mode_index =
+			    (c->xdev != nullptr && c->xdev->hmd != nullptr) ? c->xdev->hmd->active_rendering_mode_index : 0;
+			seg_split = comp_d3d11_segments_update(c->segments, &c->seg_window, &canvas, d3d11_out_context(c),
+			                                       mode_index);
+			// Every segment DP follows the session's 2D/3D mode, like the primary.
+			comp_d3d11_segments_set_display_mode(c->segments, c->hardware_display_3d);
+		}
+	}
+
+	if (seg_split) {
+		struct comp_d3d11_segments_frame sf = {};
+		sf.context = d3d11_out_context(c);
+		sf.src_srv = atlas_srv;
+		sf.view_width = view_width;
+		sf.view_height = view_height;
+		sf.tile_columns = tile_columns;
+		sf.tile_rows = tile_rows;
+		sf.src_format = (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM;
+		sf.target_rtv = comp_d3d11_target_get_rtv(c->target);
+		sf.target_width = target_width;
+		sf.target_height = target_height;
+		sf.canvas.x = 0;
+		sf.canvas.y = 0;
+		sf.canvas.w = c->seg_window.w;
+		sf.canvas.h = c->seg_window.h;
+		sf.transparent_background = c->transparent_background;
+		sf.atlas_encoding = -1; // the in-process D3D11 path declares none to the primary either
+		sf.primary_dp = c->display_processor;
+		sf.renderer = c->renderer;
+		comp_d3d11_segments_record(c->segments, &sf);
+		// The segment path leaves the back buffer bound at full viewport;
+		// re-bind through the target so everything after sees exactly the
+		// state the single-DP path leaves.
+		comp_d3d11_target_bind(c->target);
+	} else {
+		xrt_display_processor_d3d11_process_atlas(
+		    c->display_processor, d3d11_out_context(c), atlas_srv, view_width, view_height,
+		    tile_columns, tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, target_width, target_height,
+		    eff_canvas.valid ? eff_canvas.x : 0,
+		    eff_canvas.valid ? eff_canvas.y : 0,
+		    eff_canvas.valid ? eff_canvas.w : 0,
+		    eff_canvas.valid ? eff_canvas.h : 0);
+	}
 
 	// XR_DXR_depth_budget: evaluate the rear budget from the background the
 	// DP just composited under. AFTER process_atlas, because that is the point
@@ -4016,6 +4092,14 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 	if (c->owns_window && c->own_window != nullptr) {
 		comp_d3d11_window_set_snap_provider(c->own_window, NULL, NULL);
 	}
+
+	// Multi-screen M6: segment DPs + crop textures, before the primary DP
+	// (the repaint thread is already stopped, so no weave is in flight).
+	comp_d3d11_segments_destroy(&c->segments);
+	free(c->seg_screens);
+	c->seg_screens = nullptr;
+	free(c->seg_sys_info);
+	c->seg_sys_info = nullptr;
 
 	// Destroy display processor (handles all vendor cleanup internally)
 	xrt_display_processor_d3d11_destroy(&c->display_processor);
@@ -8207,6 +8291,15 @@ comp_d3d11_compositor_get_window_metrics(struct xrt_compositor *xc, struct xrt_w
 	POINT client_origin = {0, 0};
 	ClientToScreen(metrics_hwnd, &client_origin);
 
+	// Multi-screen M6: the window's desktop rect, for the segment table.
+	// Device px — every DisplayXR executable is per-monitor DPI aware
+	// (#1201), the same space the screen registry's monitor rects are in.
+	c->seg_window.x = client_origin.x;
+	c->seg_window.y = client_origin.y;
+	c->seg_window.w = win_px_w;
+	c->seg_window.h = win_px_h;
+	c->have_seg_window = true;
+
 	// Compute pixel size (meters per pixel)
 	float pixel_size_x = disp_w_m / (float)disp_px_w;
 	float pixel_size_y = disp_h_m / (float)disp_px_h;
@@ -8266,6 +8359,37 @@ comp_d3d11_compositor_request_display_mode(struct xrt_compositor *xc, bool enabl
 	}
 
 	return false;
+}
+
+extern "C" void
+comp_d3d11_compositor_set_screens(struct xrt_compositor *xc,
+                                  const struct xrt_screen_list *list,
+                                  const struct xrt_system_compositor_info *info,
+                                  uint64_t pinned_display_id)
+{
+	if (xc == nullptr || list == nullptr || info == nullptr) {
+		return;
+	}
+	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+	struct xrt_screen_list *copy = U_TYPED_CALLOC(struct xrt_screen_list);
+	struct xrt_system_compositor_info *info_copy = U_TYPED_CALLOC(struct xrt_system_compositor_info);
+	if (copy == nullptr || info_copy == nullptr) {
+		free(copy);
+		free(info_copy);
+		return;
+	}
+	*copy = *list;
+	*info_copy = *info;
+
+	// The weave (app thread's layer_commit and the repaint thread) runs under
+	// c->mutex; the manager is rebuilt there on the next weave, never here.
+	std::lock_guard<std::mutex> lock(c->mutex);
+	c->seg_rebuild = true;
+	free(c->seg_screens);
+	c->seg_screens = copy;
+	free(c->seg_sys_info);
+	c->seg_sys_info = info_copy;
+	c->seg_pinned_display_id = pinned_display_id;
 }
 
 extern "C" void

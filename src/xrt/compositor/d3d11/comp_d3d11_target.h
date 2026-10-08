@@ -288,6 +288,16 @@ void *
 comp_d3d11_target_get_back_buffer(struct comp_d3d11_target *target);
 
 /*!
+ * Get the back buffer's render target view (ID3D11RenderTargetView*) — the
+ * view @ref comp_d3d11_target_bind binds. Multi-screen M6: the segment path
+ * clears it and re-binds it between segment DPs.
+ *
+ * @ingroup comp_d3d11
+ */
+void *
+comp_d3d11_target_get_rtv(struct comp_d3d11_target *target);
+
+/*!
  * Resize the target swapchain.
  *
  * @param target The target.

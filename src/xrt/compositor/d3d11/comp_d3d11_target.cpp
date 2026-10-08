@@ -1156,6 +1156,15 @@ comp_d3d11_target_get_back_buffer(struct comp_d3d11_target *target)
 	return target->back_buffer;
 }
 
+extern "C" void *
+comp_d3d11_target_get_rtv(struct comp_d3d11_target *target)
+{
+	if (target == nullptr) {
+		return nullptr;
+	}
+	return target->rtv;
+}
+
 extern "C" xrt_result_t
 comp_d3d11_target_resize(struct comp_d3d11_target *target,
                          uint32_t width,

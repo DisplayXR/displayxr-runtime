@@ -6200,6 +6200,25 @@ oxr_session_create(struct oxr_logger *log,
 	}
 #endif
 
+#if defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR) && defined(XRT_OS_WINDOWS)
+	// Multi-screen M6: the Windows twin — the in-process D3D11 compositor
+	// weaves a window that spans monitors per segment, each with its own
+	// screen's DP (windowless, phase from set_present_origin); the primary
+	// screen's DP keeps the real HWND.
+	if (sess->is_d3d11_native_compositor && sess->xcn != NULL) {
+		struct xrt_screen_list *screens = U_TYPED_CALLOC(struct xrt_screen_list);
+		if (screens != NULL) {
+			oxr_system_get_screens(sys, screens);
+			uint64_t pinned = 0;
+#ifdef OXR_HAVE_DXR_display_info
+			pinned = bound_display_id;
+#endif
+			comp_d3d11_compositor_set_screens(&sess->xcn->base, screens, &sys->xsysc->info, pinned);
+			free(screens);
+		}
+	}
+#endif
+
 #ifdef OXR_HAVE_DXR_depth_budget
 	// XR_DXR_depth_budget: the create-info chain is gone by locate time, and
 	// the rear-depth DEFAULT is a function of transparency, so remember it.
