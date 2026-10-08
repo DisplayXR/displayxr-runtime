@@ -14,7 +14,9 @@
 
 #include "xrt/xrt_display_processor_d3d11.h"
 
+#include "util/u_lift_depth.h"
 #include "util/u_lift_mailbox.h"
+#include "util/u_lift_rig.h"
 #include "util/u_lift_viewpoint.h"
 #include "util/u_logging.h"
 #include "os/os_time.h"
@@ -246,6 +248,8 @@ struct lift_in_slot
 	//! from, as of this frame's submit.
 	xrt_lift_view_control vc = {};
 	xrt_lift_rect_frame frame = {};
+	//! XR_DXR_lift v3: the stream's app rig as of this frame (type NONE = none).
+	xrt_lift_rig rig = {};
 };
 
 //! One output ring slot: created on the LIFT device, opened on the SERVICE device.
@@ -266,6 +270,16 @@ struct lift_out_slot
 	float vps[3 * XRT_DP_LIFT_MAX_EXPLICIT_VIEWPOINTS] = {};
 	float rect_center[3] = {};
 	float rect_size[2] = {};
+	//! XR_DXR_lift v3 auxiliary depth: a second texture of this slot (lift
+	//! device, keyed mutex, opened on the service device) + its metadata.
+	ID3D11Texture2D *d_lift_tex = nullptr;
+	IDXGIKeyedMutex *d_lift_km = nullptr;
+	HANDLE d_share = nullptr;
+	ID3D11Texture2D *d_svc_tex = nullptr;
+	IDXGIKeyedMutex *d_svc_km = nullptr;
+	uint32_t d_w = 0, d_h = 0, d_format = 0;
+	bool has_depth = false;         //!< this slot's result carries depth
+	xrt_lift_depth_info depth = {}; //!< metadata (valid / realloc set at acquire)
 };
 
 //! One letterbox profile readback (service device, producer thread only).
@@ -291,6 +305,8 @@ struct lift_stream
 	//! ADR-048: the sticky viewpoint policy (XrLiftViewControlDXR), set at
 	//! stream create to the defaults; replaced by every submit that carries one.
 	xrt_lift_view_control vc = {};
+	//! XR_DXR_lift v3: the app rig, riding with the options (see submit_locked).
+	xrt_lift_rig rig = {};
 
 	uint32_t priority = U_LIFT_PRIORITY_NORMAL; //!< XrLiftPriorityDXR
 	bool dead = false;                          //!< destroy requested; the lift thread reaps it
@@ -307,6 +323,11 @@ struct lift_stream
 	//! The last policy WARNed about (lift thread only): WARN on change, never per frame.
 	xrt_lift_view_control logged_vc = {};
 	bool logged_vc_valid = false;
+	//! The last rig WARNed about (lift thread only).
+	xrt_lift_rig logged_rig = {};
+	//! XR_DXR_lift v3: one-shot WARNs about the auxiliary depth (lift thread).
+	bool depth_logged = false;
+	bool depth_missing_logged = false;
 
 	// Caller-input import cache (service device, producer thread only).
 	HANDLE imp_handle = nullptr;
@@ -323,6 +344,10 @@ struct lift_stream
 	HANDLE exp_fence_handle = nullptr;
 	uint64_t exp_fence_value = 0;
 	uint32_t exp_w = 0, exp_h = 0, exp_format = 0;
+	//! XR_DXR_lift v3: the depth export texture (same fence as exp_tex).
+	ID3D11Texture2D *exp_depth_tex = nullptr;
+	HANDLE exp_depth_handle = nullptr;
+	uint32_t exp_depth_w = 0, exp_depth_h = 0, exp_depth_format = 0;
 
 	// Blob latch (xrAcquireLiftBlobDXR two-call idiom).
 	std::shared_ptr<std::vector<uint8_t>> blob_latched;
@@ -510,6 +535,76 @@ out_slot_release(lift_out_slot &s)
 	rel(s.lift_tex);
 	s.w = s.h = s.format = s.view_count = 0;
 	s.blob.reset();
+	rel(s.d_svc_km);
+	rel(s.d_svc_tex);
+	close_handle(s.d_share);
+	rel(s.d_lift_km);
+	rel(s.d_lift_tex);
+	s.d_w = s.d_h = s.d_format = 0;
+	s.has_depth = false;
+}
+
+/*!
+ * XR_DXR_lift v3: make out slot @p s's DEPTH texture @p w x @p h @p format —
+ * the views' pattern (created on the lift device with a keyed mutex, opened
+ * on the service device). Lift thread only.
+ */
+static bool
+depth_slot_ensure(d3d11_lift *l, lift_out_slot &s, uint32_t w, uint32_t h, uint32_t format)
+{
+	if (s.d_lift_tex != nullptr && s.d_w == w && s.d_h == h && s.d_format == format) {
+		return true;
+	}
+	rel(s.d_svc_km);
+	rel(s.d_svc_tex);
+	close_handle(s.d_share);
+	rel(s.d_lift_km);
+	rel(s.d_lift_tex);
+	s.d_w = s.d_h = s.d_format = 0;
+
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = w;
+	td.Height = h;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = (DXGI_FORMAT)format;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_DEFAULT;
+	td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	td.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+	HRESULT hr = l->lift_device->CreateTexture2D(&td, nullptr, &s.d_lift_tex);
+	if (SUCCEEDED(hr)) {
+		hr = s.d_lift_tex->QueryInterface(__uuidof(IDXGIKeyedMutex), (void **)&s.d_lift_km);
+	}
+	IDXGIResource1 *r1 = nullptr;
+	if (SUCCEEDED(hr)) {
+		hr = s.d_lift_tex->QueryInterface(__uuidof(IDXGIResource1), (void **)&r1);
+	}
+	if (SUCCEEDED(hr)) {
+		hr = r1->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr,
+		                            &s.d_share);
+	}
+	rel(r1);
+	if (SUCCEEDED(hr)) {
+		hr = l->svc_device1->OpenSharedResource1(s.d_share, __uuidof(ID3D11Texture2D), (void **)&s.d_svc_tex);
+	}
+	if (SUCCEEDED(hr)) {
+		hr = s.d_svc_tex->QueryInterface(__uuidof(IDXGIKeyedMutex), (void **)&s.d_svc_km);
+	}
+	if (FAILED(hr)) {
+		U_LOG_E("[lift] depth slot %ux%u fmt=%u create/share failed: 0x%08lx", w, h, format, (unsigned long)hr);
+		rel(s.d_svc_km);
+		rel(s.d_svc_tex);
+		close_handle(s.d_share);
+		rel(s.d_lift_km);
+		rel(s.d_lift_tex);
+		return false;
+	}
+	s.d_w = w;
+	s.d_h = h;
+	s.d_format = format;
+	U_LOG_I("[lift] depth slot %ux%u fmt=%u ready", w, h, format);
+	return true;
 }
 
 /*!
@@ -657,6 +752,8 @@ stream_release_gpu(lift_stream &st)
 	close_handle(st.exp_fence_handle);
 	rel(st.exp_tex);
 	close_handle(st.exp_handle);
+	rel(st.exp_depth_tex);
+	close_handle(st.exp_depth_handle);
 	st.blob_latched.reset();
 	for (auto &r : st.lb_rb) {
 		rel(r.staging);
@@ -843,7 +940,30 @@ struct viewpoint_result
 	uint32_t axis_mode = XRT_DP_LIFT_AXIS_X;
 	float max_offset = 0.0f;
 	uint32_t recenter_mode = U_LIFT_RECENTER_OFF;
+	uint32_t source = XRT_DP_LIFT_VIEWPOINTS_TRACKED; //!< XRT_DP_LIFT_VIEWPOINTS_*
 };
+
+//! Midpoint + first-to-last distance of @p n viewpoints (3 floats each).
+static void
+viewpoints_mid_baseline(const float *vps, uint32_t n, float mid[3], float *baseline)
+{
+	mid[0] = mid[1] = mid[2] = 0.0f;
+	*baseline = 0.0f;
+	if (n == 0) {
+		return;
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		for (int a = 0; a < 3; a++) {
+			mid[a] += vps[3 * i + a] / (float)n;
+		}
+	}
+	if (n >= 2) {
+		const float *f = &vps[0];
+		const float *e = &vps[3 * (n - 1)];
+		const float dx = e[0] - f[0], dy = e[1] - f[1], dz = e[2] - f[2];
+		*baseline = sqrtf(dx * dx + dy * dy + dz * dz);
+	}
+}
 
 /*!
  * Resolve the viewpoints of one conversion (lift thread, no lock held).
@@ -854,6 +974,10 @@ struct viewpoint_result
  * conversion, from the panel's predicted eyes (the lift DP has no tracker
  * session of its own) and then run through the stream's viewpoint policy
  * (u_lift_viewpoint.h): rig factors, axis mask, recenter filter, clamp.
+ * With an app rig (XR_DXR_lift v3, ADR-048 Addendum A) the rig replaces the
+ * policy's ipd / parallax factors: the policy (axis mask, recenter, clamp)
+ * runs on the viewer first, then the rig maps the eyes with the xrLocateViews
+ * math (u_lift_rig.h), the rect as the screen.
  * DEPTH / GAUSSIANS streams get none.
  */
 static viewpoint_result
@@ -861,6 +985,7 @@ resolve_viewpoints(d3d11_lift *l,
                    lift_stream &st,
                    uint32_t view_count,
                    const xrt_lift_view_control &in_vc,
+                   const xrt_lift_rig &in_rig,
                    const xrt_lift_rect_frame &frame,
                    float *vps,
                    uint32_t vp_floats)
@@ -878,17 +1003,8 @@ resolve_viewpoints(d3d11_lift *l,
 		u_lift_viewpoint_rebase(vps, n, r.centre);
 		r.floats = 3 * n;
 		r.axis_mode = XRT_DP_LIFT_AXIS_XYZ;
-		for (uint32_t i = 0; i < n; i++) {
-			for (int a = 0; a < 3; a++) {
-				r.mid[a] += vps[3 * i + a] / (float)n;
-			}
-		}
-		if (n >= 2) {
-			const float *f = &vps[0];
-			const float *e = &vps[3 * (n - 1)];
-			const float dx = e[0] - f[0], dy = e[1] - f[1], dz = e[2] - f[2];
-			r.baseline = sqrtf(dx * dx + dy * dy + dz * dz);
-		}
+		r.source = XRT_DP_LIFT_VIEWPOINTS_EXPLICIT;
+		viewpoints_mid_baseline(vps, n, r.mid, &r.baseline);
 		return r;
 	}
 	if (l->eyes_fn == nullptr || st.info.mode == XRT_DP_LIFT_MODE_GAUSSIANS ||
@@ -918,6 +1034,47 @@ resolve_viewpoints(d3d11_lift *l,
 		    (unsigned long long)st.id, vc.ipd_factor, vc.parallax_factor, vc.axis_mode, vc.max_offset_m,
 		    recenter_str(vc.recenter_mode), vc.hold_s, vc.tau_s);
 	}
+	// XR_DXR_lift v3 app rig (sanitized here, on the lift thread, like the policy).
+	u_lift_rig rig = {in_rig.type,
+	                  in_rig.ipd_factor,
+	                  in_rig.parallax_factor,
+	                  in_rig.perspective_factor,
+	                  in_rig.inv_convergence_distance,
+	                  in_rig.half_tan_vfov,
+	                  in_rig.m2v};
+	u_lift_rig_sanitize(&rig);
+	const xrt_lift_rig eff_rig = {rig.type,
+	                              rig.ipd_factor,
+	                              rig.parallax_factor,
+	                              rig.perspective_factor,
+	                              rig.inv_convergence_distance,
+	                              rig.half_tan_vfov,
+	                              rig.m2v};
+	if (memcmp(&eff_rig, &st.logged_rig, sizeof(eff_rig)) != 0) {
+		st.logged_rig = eff_rig;
+		if (rig.type == U_LIFT_RIG_DISPLAY) {
+			U_LOG_W(
+			    "[lift] stream %llu app display rig: ipd=%.2f parallax=%.2f perspective=%.2f "
+			    "(viewpoints = the xrLocateViews eyes, rect as the screen; ADR-048 Addendum A)",
+			    (unsigned long long)st.id, rig.ipd_factor, rig.parallax_factor, rig.perspective_factor);
+		} else if (rig.type == U_LIFT_RIG_CAMERA) {
+			U_LOG_W(
+			    "[lift] stream %llu app camera rig: ipd=%.2f parallax=%.2f convergence=%.3f /unit "
+			    "half_tan_vfov=%.3f m2v=%.3f (viewpoints = the equivalent physical viewer; ADR-048 "
+			    "Addendum A)",
+			    (unsigned long long)st.id, rig.ipd_factor, rig.parallax_factor,
+			    rig.inv_convergence_distance, rig.half_tan_vfov, rig.m2v);
+		} else {
+			U_LOG_W("[lift] stream %llu app rig cleared: tracked viewpoints + policy",
+			        (unsigned long long)st.id);
+		}
+	}
+	if (rig.type != U_LIFT_RIG_NONE) {
+		// The rig owns the eye factors (step 1a / 1b): the policy keeps its
+		// axis mask, recentering and clamp, applied to the viewer.
+		vc.ipd_factor = 1.0f;
+		vc.parallax_factor = 1.0f;
+	}
 
 	struct xrt_eye_positions eyes = {};
 	if (!l->eyes_fn(l->eyes_ud, &eyes) || !eyes.valid || eyes.count < 2) {
@@ -940,8 +1097,102 @@ resolve_viewpoints(d3d11_lift *l,
 	}
 	u_lift_viewpoint_rebase(vps, n, r.centre);
 	u_lift_viewpoint_apply(&vc, &st.recenter, l->nominal_z, os_monotonic_get_ns(), vps, n, vps, &r.baseline, r.mid);
+	if (rig.type != U_LIFT_RIG_NONE && u_lift_rig_apply(&rig, l->nominal_z, r.rect_w, r.rect_h, vps, n, vps)) {
+		r.source = rig.type == U_LIFT_RIG_CAMERA ? XRT_DP_LIFT_VIEWPOINTS_CAMERA_RIG
+		                                         : XRT_DP_LIFT_VIEWPOINTS_DISPLAY_RIG;
+		viewpoints_mid_baseline(vps, n, r.mid, &r.baseline);
+	}
 	r.floats = 3 * n;
 	return r;
+}
+
+/*!
+ * XR_DXR_lift v3 (ADR-048 Addendum A): fetch the auxiliary depth of the
+ * conversion lift_convert just returned for @p st, copy it into out slot
+ * @p o, and derive what the app is told (xrt_lift_depth_info) — including the
+ * display transform, from the viewpoints and rect the runtime already owns.
+ * Lift thread, no lock held, right after the views were copied into @p o.
+ */
+static void
+lift_copy_depth(d3d11_lift *l, lift_stream &st, lift_out_slot &o, const viewpoint_result &vr)
+{
+	xrt_dp_lift_depth dd;
+	if (!xrt_display_processor_d3d11_lift_get_depth(l->dp, st.dp_id, l->lift_context, &dd)) {
+		if (!st.depth_missing_logged) {
+			st.depth_missing_logged = true;
+			U_LOG_W("[lift] stream %llu asked for auxiliary depth but the module returned none%s",
+			        (unsigned long long)st.id,
+			        XRT_DP_HAS_SLOT(l->dp, lift_get_depth) && l->dp->lift_get_depth != nullptr
+			            ? ""
+			            : " (the plug-in has no lift_get_depth slot)");
+		}
+		return;
+	}
+	if (dd.format != DXGI_FORMAT_R32_FLOAT && dd.format != DXGI_FORMAT_R16_FLOAT) {
+		if (!st.depth_missing_logged) {
+			st.depth_missing_logged = true;
+			U_LOG_W("[lift] stream %llu: module depth format %u is not R32_FLOAT / R16_FLOAT — dropped",
+			        (unsigned long long)st.id, dd.format);
+		}
+		return;
+	}
+	if (!depth_slot_ensure(l, o, dd.width, dd.height, dd.format)) {
+		return;
+	}
+	HRESULT hr = o.d_lift_km->AcquireSync(0, 100);
+	if (FAILED(hr) || hr == (HRESULT)WAIT_TIMEOUT) {
+		return;
+	}
+	D3D11_BOX box = {0, 0, 0, dd.width, dd.height, 1};
+	l->lift_context->CopySubresourceRegion(o.d_lift_tex, 0, 0, 0, 0, (ID3D11Resource *)dd.resource, 0, &box);
+	o.d_lift_km->ReleaseSync(0);
+	l->lift_context->Flush();
+
+	xrt_lift_depth_info &di = o.depth;
+	di = xrt_lift_depth_info{};
+	di.width = dd.width;
+	di.height = dd.height;
+	di.format = dd.format;
+	di.units = dd.units == XRT_DP_LIFT_DEPTH_METRIC ? XRT_DP_LIFT_DEPTH_METRIC : XRT_DP_LIFT_DEPTH_RELATIVE;
+	di.encoding = dd.encoding == XRT_DP_LIFT_DEPTH_ENCODING_INVERSE ? XRT_DP_LIFT_DEPTH_ENCODING_INVERSE
+	                                                                : XRT_DP_LIFT_DEPTH_ENCODING_LINEAR;
+	di.same_inference = dd.same_inference != 0 ? 1u : 0u;
+	di.value_scale = dd.value_scale != 0.0f && std::isfinite(dd.value_scale) ? dd.value_scale : 1.0f;
+	di.value_offset = std::isfinite(dd.value_offset) ? dd.value_offset : 0.0f;
+	di.near_depth = dd.near_depth > 0.0f ? dd.near_depth : 0.0f;
+	di.far_depth = dd.far_depth > 0.0f ? dd.far_depth : 0.0f;
+	const bool metric = di.units == XRT_DP_LIFT_DEPTH_METRIC;
+	// RELATIVE depth: no intrinsics, no transform — never a faked scale.
+	if (metric && dd.focal_x_px > 0.0f && dd.focal_y_px > 0.0f) {
+		di.intrinsics_valid = 1;
+		di.focal[0] = dd.focal_x_px;
+		di.focal[1] = dd.focal_y_px;
+		di.principal[0] = dd.principal_x_px;
+		di.principal[1] = dd.principal_y_px;
+	}
+	di.convergence_depth = dd.convergence_depth > 0.0f ? dd.convergence_depth : 0.0f;
+	// The depth refers to the source camera = the midpoint of the synthesized
+	// viewpoints (the straight-on viewer when none were known).
+	if (vr.floats >= 3) {
+		memcpy(di.viewpoint, vr.mid, sizeof(di.viewpoint));
+	} else {
+		di.viewpoint[0] = di.viewpoint[1] = 0.0f;
+		di.viewpoint[2] = l->nominal_z;
+	}
+	di.transform_valid = metric && u_lift_depth_to_display(di.viewpoint, vr.centre, vr.rect_w, vr.rect_h,
+	                                                       di.convergence_depth, di.depth_to_display)
+	                         ? 1u
+	                         : 0u;
+	o.has_depth = true;
+	if (!st.depth_logged) {
+		st.depth_logged = true;
+		U_LOG_W(
+		    "[lift] stream %llu auxiliary depth: %ux%u fmt=%u units=%s encoding=%s same_inference=%u "
+		    "convergence=%.3f intrinsics=%s transform=%s (ADR-048 Addendum A)",
+		    (unsigned long long)st.id, dd.width, dd.height, dd.format, metric ? "metric" : "relative",
+		    di.encoding == XRT_DP_LIFT_DEPTH_ENCODING_INVERSE ? "inverse" : "linear", di.same_inference,
+		    di.convergence_depth, di.intrinsics_valid ? "yes" : "no", di.transform_valid ? "yes" : "no");
+	}
 }
 
 /*!
@@ -966,12 +1217,14 @@ lift_convert_one(d3d11_lift *l, lift_stream &st, std::unique_lock<std::mutex> &l
 	memcpy(active, in.active, sizeof(active));
 	const xrt_lift_view_control in_vc = in.vc;
 	const xrt_lift_rect_frame frame = in.frame;
+	const xrt_lift_rig in_rig = in.rig;
 	const uint32_t w = meta.width, h = meta.height;
 	lk.unlock();
 
-	// ADR-048: rect-relative viewpoints + the stream's viewpoint policy, and
-	// what the DP is told about them (appended xrt_dp_lift_params fields).
-	const viewpoint_result vr = resolve_viewpoints(l, st, params.view_count, in_vc, frame, vps, vp_floats);
+	// ADR-048: rect-relative viewpoints + the stream's viewpoint policy (and,
+	// v3, the app rig), and what the DP is told about them (appended
+	// xrt_dp_lift_params fields).
+	const viewpoint_result vr = resolve_viewpoints(l, st, params.view_count, in_vc, in_rig, frame, vps, vp_floats);
 	vp_floats = vr.floats;
 	params.struct_size = (uint32_t)sizeof(params);
 	params.rect_width_m = vr.rect_w;
@@ -980,6 +1233,9 @@ lift_convert_one(d3d11_lift *l, lift_stream &st, std::unique_lock<std::mutex> &l
 	params.axis_mode = vr.axis_mode;
 	params.max_offset_m = vr.max_offset;
 	params.viewpoint_frame = XRT_DP_LIFT_VIEWPOINT_FRAME_RECT;
+	params.viewpoint_source = vr.source;
+	params.nominal_z_m = l->nominal_z;
+	const bool want_depth = (st.info.aux_outputs & XRT_DP_LIFT_AUX_DEPTH) != 0;
 
 	bool ok = true;
 	// 1. The module's own stream, created lazily (module contract: lift thread only).
@@ -1090,6 +1346,13 @@ lift_convert_one(d3d11_lift *l, lift_stream &st, std::unique_lock<std::mutex> &l
 				o.rect_size[0] = vr.rect_w;
 				o.rect_size[1] = vr.rect_h;
 			}
+		}
+		// XR_DXR_lift v3: the auxiliary depth of THIS conversion, copied into
+		// the same ring slot (the DP's texture is valid only until its next
+		// lift_convert on this stream).
+		o.has_depth = false;
+		if (ok && want_depth) {
+			lift_copy_depth(l, st, o, vr);
 		}
 	} else if (ok && is_blob) {
 		lift_out_slot &o = st.out[out_slot];
@@ -1500,6 +1763,14 @@ d3d11_lift_stream_create(struct d3d11_lift *l,
 	if (!(st->info.input_scale > 0.0f) || st->info.input_scale > 1.0f) {
 		st->info.input_scale = 1.0f;
 	}
+	// XR_DXR_lift v3: auxiliary depth rides SBS / NVIEW streams only (a
+	// caller's shorter struct carries none).
+	if (info->struct_size < offsetof(xrt_dp_lift_stream_info, aux_depth_format) + sizeof(uint32_t) ||
+	    (m != XRT_DP_LIFT_MODE_SBS && m != XRT_DP_LIFT_MODE_NVIEW)) {
+		st->info.aux_outputs = 0;
+		st->info.aux_depth_format = 0;
+	}
+	st->info.aux_outputs &= XRT_DP_LIFT_AUX_DEPTH;
 	u_lift_mailbox_init(&st->mb);
 	st->last_params.struct_size = (uint32_t)sizeof(st->last_params);
 	st->last_params.convergence = -1.0f;
@@ -1513,8 +1784,9 @@ d3d11_lift_stream_create(struct d3d11_lift *l,
 		          d.recenter_mode, d.hold_s,          d.tau_s};
 	}
 	*out_id = st->id;
-	U_LOG_W("[lift] stream %llu created (mode=%u hint=%u scale=%.2f, owner=%llu)", (unsigned long long)st->id, m,
-	        info->content_hint, st->info.input_scale, (unsigned long long)owner);
+	U_LOG_W("[lift] stream %llu created (mode=%u hint=%u scale=%.2f aux=%u, owner=%llu)",
+	        (unsigned long long)st->id, m, info->content_hint, st->info.input_scale, st->info.aux_outputs,
+	        (unsigned long long)owner);
 	l->streams[st->id] = std::move(st);
 	l->live_streams++;
 	l->cv.notify_all();
@@ -1816,6 +2088,7 @@ submit_locked(d3d11_lift *l,
               const float *viewpoints,
               uint32_t viewpoint_floats,
               const xrt_lift_view_control *view_control,
+              const xrt_lift_rig *rig,
               const xrt_lift_rect_frame *frame,
               uint32_t max_input_edge,
               bool letterbox,
@@ -1887,9 +2160,15 @@ submit_locked(d3d11_lift *l,
 		if (view_control != nullptr) {
 			st->vc = *view_control; // sticky (sanitized on the lift thread)
 		}
+		if (params != nullptr || rig != nullptr) {
+			// XR_DXR_lift v3: the rig rides with the options, like explicit
+			// viewpoints — options without a rig clear it.
+			st->rig = rig != nullptr ? *rig : xrt_lift_rig{};
+		}
 		lift_in_slot &in = st->in[slot];
 		in.params = st->last_params;
 		in.vc = st->vc;
+		in.rig = st->rig;
 		in.frame = frame != nullptr ? *frame : xrt_lift_rect_frame{};
 		if (capped && in.params.focal_px > 0.0f) {
 			in.params.focal_px *= (float)dw / (float)cw; // focal is in INPUT pixels (a crop keeps the scale)
@@ -1942,16 +2221,20 @@ d3d11_lift_submit_srv_locked(struct d3d11_lift *l,
                              uint32_t h,
                              int64_t source_time,
                              const struct xrt_dp_lift_params *params,
+                             const float *viewpoints,
+                             uint32_t viewpoint_floats,
                              const struct xrt_lift_view_control *view_control,
+                             const struct xrt_lift_rig *rig,
                              const struct xrt_lift_rect_frame *frame,
                              uint64_t *out_frame_id)
 {
 	if (l == nullptr || !l->snap_ok || src == nullptr || out_frame_id == nullptr) {
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
-	// Weave-rect snapshot: the service's size cap applies.
-	return submit_locked(l, owner, id, src, src_tw, src_th, x, y, w, h, source_time, params, nullptr, 0,
-	                     view_control, frame, l->max_input_edge, l->letterbox, out_frame_id);
+	// Weave-rect snapshot: the service's size cap applies. XR_DXR_lift v3: a
+	// lifted rect may carry EXPLICIT viewpoints and an app rig.
+	return submit_locked(l, owner, id, src, src_tw, src_th, x, y, w, h, source_time, params, viewpoints,
+	                     viewpoint_floats, view_control, rig, frame, l->max_input_edge, l->letterbox, out_frame_id);
 }
 
 xrt_result_t
@@ -1967,6 +2250,7 @@ d3d11_lift_submit_handle(struct d3d11_lift *l,
                          const float *viewpoints,
                          uint32_t viewpoint_floats,
                          const struct xrt_lift_view_control *view_control,
+                         const struct xrt_lift_rig *rig,
                          const struct xrt_lift_rect_frame *frame,
                          uint64_t *out_frame_id)
 {
@@ -2062,7 +2346,7 @@ d3d11_lift_submit_handle(struct d3d11_lift *l,
 		// An app's explicit frame: its size and content are the app's choice —
 		// never capped, never letterbox-cropped.
 		xret = submit_locked(l, owner, id, st->imp_srv, st->imp_w, st->imp_h, 0, 0, w, h, source_time, params,
-		                     viewpoints, viewpoint_floats, view_control, frame, /*max_input_edge*/ 0,
+		                     viewpoints, viewpoint_floats, view_control, rig, frame, /*max_input_edge*/ 0,
 		                     /*letterbox*/ false, out_frame_id);
 	}
 	if (acquired) {
@@ -2226,19 +2510,80 @@ d3d11_lift_acquire_result(
 		        o->h, o->format);
 	}
 
+	// XR_DXR_lift v3: the auxiliary depth export texture, the same pattern
+	// (sized to the result's depth, re-created on change). A failure here only
+	// costs this result its depth, never the views.
+	bool depth_realloc = false;
+	bool depth_ok = false;
+	if (o->has_depth && o->d_svc_tex != nullptr) {
+		depth_ok = true;
+		if (st->exp_depth_tex == nullptr || st->exp_depth_w != o->d_w || st->exp_depth_h != o->d_h ||
+		    st->exp_depth_format != o->d_format) {
+			rel(st->exp_depth_tex);
+			close_handle(st->exp_depth_handle);
+			D3D11_TEXTURE2D_DESC td = {};
+			td.Width = o->d_w;
+			td.Height = o->d_h;
+			td.MipLevels = 1;
+			td.ArraySize = 1;
+			td.Format = (DXGI_FORMAT)o->d_format;
+			td.SampleDesc.Count = 1;
+			td.Usage = D3D11_USAGE_DEFAULT;
+			td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+			td.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
+			HRESULT dhr = l->svc_device->CreateTexture2D(&td, nullptr, &st->exp_depth_tex);
+			IDXGIResource1 *r1 = nullptr;
+			if (SUCCEEDED(dhr)) {
+				dhr = st->exp_depth_tex->QueryInterface(__uuidof(IDXGIResource1), (void **)&r1);
+			}
+			if (SUCCEEDED(dhr)) {
+				dhr = r1->CreateSharedHandle(nullptr,
+				                             DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+				                             nullptr, &st->exp_depth_handle);
+			}
+			rel(r1);
+			if (FAILED(dhr)) {
+				U_LOG_E("[lift] depth export texture %ux%u fmt=%u create failed: 0x%08lx", o->d_w,
+				        o->d_h, o->d_format, (unsigned long)dhr);
+				rel(st->exp_depth_tex);
+				close_handle(st->exp_depth_handle);
+				st->exp_depth_w = st->exp_depth_h = st->exp_depth_format = 0;
+				depth_ok = false;
+			} else {
+				st->exp_depth_w = o->d_w;
+				st->exp_depth_h = o->d_h;
+				st->exp_depth_format = o->d_format;
+				depth_realloc = true;
+				U_LOG_W("[lift] stream %llu depth export texture %ux%u fmt=%u ready",
+				        (unsigned long long)id, o->d_w, o->d_h, o->d_format);
+			}
+		}
+	}
+
 	HRESULT hr = o->svc_km->AcquireSync(0, 4);
 	if (FAILED(hr) || hr == (HRESULT)WAIT_TIMEOUT) {
 		unpin();
 		return XRT_ERROR_WEAVE_REFUSED;
 	}
+	if (depth_ok) {
+		HRESULT dhr = o->d_svc_km->AcquireSync(0, 4);
+		depth_ok = SUCCEEDED(dhr) && dhr != (HRESULT)WAIT_TIMEOUT;
+	}
 	{
 		std::lock_guard<std::mutex> ctx_lock(*l->svc_ctx_mutex);
 		l->svc_context->CopyResource(st->exp_tex, o->svc_tex);
+		if (depth_ok) {
+			l->svc_context->CopyResource(st->exp_depth_tex, o->d_svc_tex);
+		}
+		// One fence covers the views and the depth (XrLiftDepthResultDXR).
 		st->exp_fence_value++;
 		l->svc_context4->Signal(st->exp_fence, st->exp_fence_value);
 		l->svc_context->Flush();
 	}
 	o->svc_km->ReleaseSync(0);
+	if (depth_ok) {
+		o->d_svc_km->ReleaseSync(0);
+	}
 
 	out->frame_id = meta.frame_id;
 	out->source_time = meta.source_time;
@@ -2253,6 +2598,11 @@ d3d11_lift_acquire_result(
 	memcpy(out->viewpoints, o->vps, sizeof(out->viewpoints));
 	memcpy(out->rect_center, o->rect_center, sizeof(out->rect_center));
 	memcpy(out->rect_size, o->rect_size, sizeof(out->rect_size));
+	if (depth_ok) {
+		out->depth = o->depth;
+		out->depth.valid = 1;
+		out->depth.realloc = depth_realloc ? 1u : 0u;
+	}
 	*out_ready = true;
 	unpin();
 	return XRT_SUCCESS;
@@ -2294,6 +2644,30 @@ d3d11_lift_export_fence(struct d3d11_lift *l, uint64_t owner, uint64_t id, HANDL
 		return false;
 	}
 	*out_handle = st->exp_fence_handle;
+	return true;
+}
+
+bool
+d3d11_lift_export_depth(struct d3d11_lift *l,
+                        uint64_t owner,
+                        uint64_t id,
+                        HANDLE *out_handle,
+                        uint32_t *out_w,
+                        uint32_t *out_h,
+                        uint32_t *out_format)
+{
+	if (l == nullptr) {
+		return false;
+	}
+	std::lock_guard<std::mutex> g(l->mtx);
+	lift_stream *st = find_live(l, owner, id);
+	if (st == nullptr || st->exp_depth_handle == nullptr) {
+		return false;
+	}
+	*out_handle = st->exp_depth_handle;
+	*out_w = st->exp_depth_w;
+	*out_h = st->exp_depth_h;
+	*out_format = st->exp_depth_format;
 	return true;
 }
 

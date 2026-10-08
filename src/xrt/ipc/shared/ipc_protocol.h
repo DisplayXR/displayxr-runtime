@@ -1046,9 +1046,11 @@ struct ipc_lift_properties
 	uint32_t max_views;
 	uint32_t depth_semantics;
 	uint32_t state;
-	uint32_t reserved;
+	uint32_t aux_outputs; //!< XRT_DP_LIFT_AUX_* (XR_DXR_lift v3)
 	uint64_t typical_latency_ns;
 	char backend[32];
+	uint32_t aux_depth_semantics; //!< XRT_DP_LIFT_DEPTH_* of the aux depth
+	uint32_t reserved;
 };
 
 /*!
@@ -1067,6 +1069,7 @@ struct ipc_lift_params
 	float viewpoints[3 * IPC_LIFT_MAX_VIEWS]; //!< xyz, display space, metres
 	uint32_t has_view_control;                //!< XrLiftViewControlDXR chained (ADR-048)
 	struct xrt_lift_view_control view_control;
+	struct xrt_lift_rig rig; //!< XR_DXR_lift v3 app rig; type NONE = none
 };
 
 /*!
@@ -1109,12 +1112,14 @@ struct ipc_lift_result
 	float viewpoints[3 * IPC_LIFT_MAX_VIEWS];
 	float rect_center[3];
 	float rect_size[2];
+	struct xrt_lift_depth_info depth; //!< XR_DXR_lift v3 auxiliary depth (handle via lift_get_depth_output)
 };
 
 /*!
- * One lift-flagged weave rect. Weave-path lifts always synthesize for the
- * tracked eyes, so no viewpoints ride here (keeps 8 rects well inside
- * IPC_BUF_SIZE).
+ * One lift-flagged weave rect. EXPLICIT viewpoints (XR_DXR_lift v3) do NOT
+ * ride here — 8 rects of them would overflow IPC_BUF_SIZE — but in one
+ * lift_weave_rect_viewpoints call per such rect, sent just before
+ * lift_weave_rects; @c viewpoint_count says whether this rect expects them.
  *
  * @ingroup ipc
  */
@@ -1130,6 +1135,24 @@ struct ipc_lift_weave_rect
 	float focal_px;
 	uint32_t has_view_control; //!< XrLiftViewControlDXR chained (ADR-048)
 	struct xrt_lift_view_control view_control;
+	uint32_t viewpoint_count; //!< XR_DXR_lift v3: EXPLICIT viewpoints staged for it; 0 = tracked
+	struct xrt_lift_rig rig;  //!< XR_DXR_lift v3 app rig; type NONE = none
+};
+
+/*!
+ * lift_weave_rect_viewpoints arguments (XR_DXR_lift v3): the EXPLICIT
+ * viewpoints of one lifted rect of the NEXT lift_weave_rects on the same
+ * connection, keyed by stream (display space, metres). Consumed — and the
+ * staging cleared — by that lift_weave_rects.
+ *
+ * @ingroup ipc
+ */
+struct ipc_arg_lift_rect_viewpoints
+{
+	uint64_t stream_id;
+	uint32_t viewpoint_count; //!< <= IPC_LIFT_MAX_VIEWS
+	uint32_t reserved;
+	float viewpoints[3 * IPC_LIFT_MAX_VIEWS];
 };
 
 /*!

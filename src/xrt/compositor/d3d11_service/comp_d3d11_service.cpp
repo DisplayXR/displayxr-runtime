@@ -24651,7 +24651,9 @@ lift_weave_rect_batch(struct d3d11_service_system *sys,
 	(void)d3d11_lift_submit_srv_locked(lift, owner, b->stream_id, in_srv, in_w, in_h, (uint32_t)x0, (uint32_t)y0,
 	                                   (uint32_t)(x1 - x0), (uint32_t)(y1 - y0), (int64_t)os_monotonic_get_ns(),
 	                                   b->has_params ? &b->params : nullptr,
-	                                   b->has_view_control ? &b->view_control : nullptr, &frame, &frame_id);
+	                                   b->viewpoint_floats > 0 ? b->viewpoints : nullptr, b->viewpoint_floats,
+	                                   b->has_view_control ? &b->view_control : nullptr,
+	                                   b->rig.type != XRT_LIFT_RIG_NONE ? &b->rig : nullptr, &frame, &frame_id);
 
 	const float rx = (float)rect.offset.w, ry = (float)rect.offset.h;
 	const float rw = (float)rect.extent.w, rh = (float)rect.extent.h;
@@ -24755,10 +24757,12 @@ lift_weave_rects_nview(struct d3d11_service_system *sys,
 		uint64_t frame_id = 0;
 		struct xrt_lift_rect_frame frame;
 		lift_rect_frame(sys, &c->base.base, &r, win_w, win_h, &frame);
-		(void)d3d11_lift_submit_srv_locked(lift, owner, b->stream_id, crop_srv, packed_w, packed_h, x0, y0, w,
-		                                   h, (int64_t)os_monotonic_get_ns(),
-		                                   b->has_params ? &b->params : nullptr,
-		                                   b->has_view_control ? &b->view_control : nullptr, &frame, &frame_id);
+		(void)d3d11_lift_submit_srv_locked(
+		    lift, owner, b->stream_id, crop_srv, packed_w, packed_h, x0, y0, w, h,
+		    (int64_t)os_monotonic_get_ns(), b->has_params ? &b->params : nullptr,
+		    b->viewpoint_floats > 0 ? b->viewpoints : nullptr, b->viewpoint_floats,
+		    b->has_view_control ? &b->view_control : nullptr,
+		    b->rig.type != XRT_LIFT_RIG_NONE ? &b->rig : nullptr, &frame, &frame_id);
 
 		struct d3d11_lift_pin pin = {};
 		if (!d3d11_lift_pin_latest(lift, owner, b->stream_id, &pin) || pin.view_count == 0) {
@@ -32020,6 +32024,7 @@ comp_d3d11_service_lift_submit(struct xrt_system_compositor *xsysc,
                                const float *viewpoints,
                                uint32_t viewpoint_floats,
                                const struct xrt_lift_view_control *view_control,
+                               const struct xrt_lift_rig *rig,
                                uint64_t *out_frame_id)
 {
 	struct d3d11_lift *l = svc_lift(xsysc);
@@ -32033,7 +32038,7 @@ comp_d3d11_service_lift_submit(struct xrt_system_compositor *xsysc,
 	struct xrt_lift_rect_frame frame;
 	lift_rect_frame(d3d11_service_system_from_xrt(xsysc), xc, nullptr, 0, 0, &frame);
 	return d3d11_lift_submit_handle(l, owner, id, (HANDLE)handle, is_dxgi, w, h, source_time, params, viewpoints,
-	                                viewpoint_floats, view_control, &frame, out_frame_id);
+	                                viewpoint_floats, view_control, rig, &frame, out_frame_id);
 }
 
 extern "C" xrt_result_t
@@ -32064,6 +32069,7 @@ comp_d3d11_service_lift_acquire(struct xrt_system_compositor *xsysc,
 	memcpy(out->viewpoints, r.viewpoints, sizeof(out->viewpoints));
 	memcpy(out->rect_center, r.rect_center, sizeof(out->rect_center));
 	memcpy(out->rect_size, r.rect_size, sizeof(out->rect_size));
+	out->depth = r.depth;
 	return xret;
 }
 
@@ -32097,6 +32103,24 @@ comp_d3d11_service_lift_export_fence(struct xrt_system_compositor *xsysc,
 		return false;
 	}
 	*out_handle = (xrt_graphics_sync_handle_t)h;
+	return true;
+}
+
+extern "C" bool
+comp_d3d11_service_lift_export_depth(struct xrt_system_compositor *xsysc,
+                                     uint64_t owner,
+                                     uint64_t id,
+                                     xrt_graphics_buffer_handle_t *out_handle,
+                                     uint32_t *out_width,
+                                     uint32_t *out_height,
+                                     uint32_t *out_format)
+{
+	struct d3d11_lift *l = svc_lift(xsysc);
+	HANDLE h = nullptr;
+	if (l == nullptr || !d3d11_lift_export_depth(l, owner, id, &h, out_width, out_height, out_format)) {
+		return false;
+	}
+	*out_handle = (xrt_graphics_buffer_handle_t)h;
 	return true;
 }
 

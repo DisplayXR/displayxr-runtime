@@ -72,6 +72,8 @@ struct d3d11_lift_result_info
 	float viewpoints[3 * XRT_LIFT_MAX_VIEWS];
 	float rect_center[3];
 	float rect_size[2];
+	//! XR_DXR_lift v3: the auxiliary depth (valid = 0 when none).
+	struct xrt_lift_depth_info depth;
 };
 
 //! One acquired blob result (xrAcquireLiftBlobDXR).
@@ -168,7 +170,9 @@ d3d11_lift_stream_mode(struct d3d11_lift *lift, uint64_t owner, uint64_t id);
  * @p is_dxgi. @p params NULL = the stream's last parameters.
  * @p view_control NULL = the stream's last policy (initially the ADR-048
  * defaults). @p frame = the submitting window (centre + size) the viewpoints
- * are rebased to; NULL / invalid = the panel centre.
+ * are rebased to; NULL / invalid = the panel centre. @p rig (XR_DXR_lift v3)
+ * rides with the options: replaced (NULL = cleared) whenever @p params or
+ * @p rig is non-NULL, kept otherwise.
  */
 xrt_result_t
 d3d11_lift_submit_handle(struct d3d11_lift *lift,
@@ -183,6 +187,7 @@ d3d11_lift_submit_handle(struct d3d11_lift *lift,
                          const float *viewpoints,
                          uint32_t viewpoint_floats,
                          const struct xrt_lift_view_control *view_control,
+                         const struct xrt_lift_rig *rig,
                          const struct xrt_lift_rect_frame *frame,
                          uint64_t *out_frame_id);
 
@@ -194,7 +199,9 @@ d3d11_lift_submit_handle(struct d3d11_lift *lift,
  * (default 1920, 0 = off; u_lift_cap_dims) — the result is stretched back into
  * the rect, so consumers must sample it, never assume result size == rect size.
  * @p view_control / @p frame as for d3d11_lift_submit_handle (@p frame = the
- * lifted rect's physical centre + size).
+ * lifted rect's physical centre + size). @p viewpoints / @p rig: a lifted
+ * rect's EXPLICIT viewpoints and app rig (XR_DXR_lift v3), same rules as
+ * d3d11_lift_submit_handle.
  */
 xrt_result_t
 d3d11_lift_submit_srv_locked(struct d3d11_lift *lift,
@@ -209,7 +216,10 @@ d3d11_lift_submit_srv_locked(struct d3d11_lift *lift,
                              uint32_t h,
                              int64_t source_time,
                              const struct xrt_dp_lift_params *params,
+                             const float *viewpoints,
+                             uint32_t viewpoint_floats,
                              const struct xrt_lift_view_control *view_control,
+                             const struct xrt_lift_rig *rig,
                              const struct xrt_lift_rect_frame *frame,
                              uint64_t *out_frame_id);
 
@@ -241,6 +251,17 @@ d3d11_lift_export_output(struct d3d11_lift *lift,
 
 bool
 d3d11_lift_export_fence(struct d3d11_lift *lift, uint64_t owner, uint64_t id, HANDLE *out_handle);
+
+//! XR_DXR_lift v3: the auxiliary depth export texture's NT handle
+//! (service-owned; the IPC layer duplicates it). Signalled by the same fence.
+bool
+d3d11_lift_export_depth(struct d3d11_lift *lift,
+                        uint64_t owner,
+                        uint64_t id,
+                        HANDLE *out_handle,
+                        uint32_t *out_w,
+                        uint32_t *out_h,
+                        uint32_t *out_format);
 
 /*!
  * xrAcquireLiftBlobDXR with the two-call latch (see XrLiftBlobDXR). On

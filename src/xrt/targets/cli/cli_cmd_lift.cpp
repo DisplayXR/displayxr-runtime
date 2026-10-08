@@ -600,7 +600,7 @@ cmd_probe(int argc, const char **argv)
 	uint64_t sid = 0;
 	xrt_result_t xret = ipc_client_lift_stream_create(
 	    &ipc_c, mode, mode == XRT_DP_LIFT_MODE_GAUSSIANS ? XRT_DP_LIFT_CONTENT_PHOTO : XRT_DP_LIFT_CONTENT_VIDEO,
-	    1.0f, &sid);
+	    1.0f, /*aux_outputs*/ 0, /*aux_depth_format*/ 0, &sid);
 	if (xret != XRT_SUCCESS) {
 		printf("lift_stream_create failed: %d\n", (int)xret);
 		ipc_client_connection_fini(&ipc_c);
@@ -647,7 +647,7 @@ cmd_probe(int argc, const char **argv)
 		uint64_t frame_id = 0;
 		xret =
 		    ipc_client_lift_submit(&ipc_c, sid, (xrt_graphics_buffer_handle_t)g.in_handle, false, (uint32_t)iw,
-		                           (uint32_t)ih, (int64_t)i, &params, nullptr, 0, nullptr, &frame_id);
+		                           (uint32_t)ih, (int64_t)i, &params, nullptr, 0, nullptr, nullptr, &frame_id);
 		if (xret != XRT_SUCCESS) {
 			printf("%6d submit refused (xrt_result=%d) — retrying next frame\n", i, (int)xret);
 			continue;

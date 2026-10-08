@@ -29,9 +29,16 @@ struct ipc_connection;
 xrt_result_t
 ipc_client_lift_get_properties(struct ipc_connection *ipc_c, struct xrt_dp_lift_caps *out_caps);
 
+//! @p aux_outputs / @p aux_depth_format: XR_DXR_lift v3 auxiliary depth request
+//! (XRT_DP_LIFT_AUX_*, DXGI hint); 0 / 0 = none.
 xrt_result_t
-ipc_client_lift_stream_create(
-    struct ipc_connection *ipc_c, uint32_t mode, uint32_t content_hint, float input_scale, uint64_t *out_stream_id);
+ipc_client_lift_stream_create(struct ipc_connection *ipc_c,
+                              uint32_t mode,
+                              uint32_t content_hint,
+                              float input_scale,
+                              uint32_t aux_outputs,
+                              uint32_t aux_depth_format,
+                              uint64_t *out_stream_id);
 
 xrt_result_t
 ipc_client_lift_stream_destroy(struct ipc_connection *ipc_c, uint64_t stream_id);
@@ -54,6 +61,7 @@ ipc_client_lift_submit(struct ipc_connection *ipc_c,
                        const float *viewpoints,
                        uint32_t viewpoint_count,
                        const struct xrt_lift_view_control *view_control,
+                       const struct xrt_lift_rig *rig,
                        uint64_t *out_frame_id);
 
 //! @p out_ready false = nothing newer than the last acquire (NOT READY).
@@ -72,6 +80,17 @@ ipc_client_lift_get_output(struct ipc_connection *ipc_c,
                            uint32_t *out_height,
                            uint32_t *out_format,
                            xrt_graphics_buffer_handle_t *out_handle);
+
+//! XR_DXR_lift v3: the stream's auxiliary depth export texture (a NEW
+//! handle, caller-owned) + its layout.
+xrt_result_t
+ipc_client_lift_get_depth_output(struct ipc_connection *ipc_c,
+                                 uint64_t stream_id,
+                                 bool *out_have,
+                                 uint32_t *out_width,
+                                 uint32_t *out_height,
+                                 uint32_t *out_format,
+                                 xrt_graphics_buffer_handle_t *out_handle);
 
 //! The stream's export fence (a NEW handle, caller-owned).
 xrt_result_t

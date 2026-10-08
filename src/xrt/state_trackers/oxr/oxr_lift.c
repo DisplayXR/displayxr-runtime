@@ -36,6 +36,7 @@
 
 #include "xrt/xrt_lift.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -45,8 +46,13 @@
 xrt_result_t
 comp_ipc_client_compositor_lift_get_properties(struct xrt_compositor *xc, struct xrt_dp_lift_caps *out_caps);
 xrt_result_t
-comp_ipc_client_compositor_lift_stream_create(
-    struct xrt_compositor *xc, uint32_t mode, uint32_t content_hint, float input_scale, uint64_t *out_stream_id);
+comp_ipc_client_compositor_lift_stream_create(struct xrt_compositor *xc,
+                                              uint32_t mode,
+                                              uint32_t content_hint,
+                                              float input_scale,
+                                              uint32_t aux_outputs,
+                                              uint32_t aux_depth_format,
+                                              uint64_t *out_stream_id);
 xrt_result_t
 comp_ipc_client_compositor_lift_stream_destroy(struct xrt_compositor *xc, uint64_t stream_id);
 xrt_result_t
@@ -61,6 +67,7 @@ comp_ipc_client_compositor_lift_submit(struct xrt_compositor *xc,
                                        const float *viewpoints,
                                        uint32_t viewpoint_count,
                                        const struct xrt_lift_view_control *view_control,
+                                       const struct xrt_lift_rig *rig,
                                        uint64_t *out_frame_id);
 xrt_result_t
 comp_ipc_client_compositor_lift_acquire(struct xrt_compositor *xc,
@@ -72,6 +79,11 @@ comp_ipc_client_compositor_lift_get_output(struct xrt_compositor *xc,
                                            uint64_t stream_id,
                                            bool *out_have,
                                            xrt_graphics_buffer_handle_t *out_handle);
+xrt_result_t
+comp_ipc_client_compositor_lift_get_depth_output(struct xrt_compositor *xc,
+                                                 uint64_t stream_id,
+                                                 bool *out_have,
+                                                 xrt_graphics_buffer_handle_t *out_handle);
 xrt_result_t
 comp_ipc_client_compositor_lift_get_fence(struct xrt_compositor *xc,
                                           uint64_t stream_id,
@@ -109,6 +121,9 @@ _Static_assert(XR_LIFT_MAX_VIEWS_DXR == XRT_LIFT_MAX_VIEWS, "lift view bound mis
 _Static_assert(XR_WEAVE_SUBMIT_MAX_LIFT_RECTS_DXR == XRT_LIFT_WEAVE_RECTS_MAX, "lift rect bound mismatch");
 _Static_assert(XR_LIFT_BACKEND_NAME_MAX_SIZE_DXR == sizeof(((struct xrt_dp_lift_caps *)0)->backend),
                "backend name size mismatch");
+_Static_assert(XR_LIFT_DEPTH_ENCODING_LINEAR_DXR == XRT_DP_LIFT_DEPTH_ENCODING_LINEAR &&
+                   XR_LIFT_DEPTH_ENCODING_INVERSE_DXR == XRT_DP_LIFT_DEPTH_ENCODING_INVERSE,
+               "lift depth encoding mismatch");
 
 //! Same rule as oxr_weave.c: IPC sessions carry no in-process native flag.
 static bool
@@ -171,12 +186,8 @@ lift_validate_options(struct oxr_logger *log, const XrLiftOptionsDXR *o, bool we
 		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "XrLiftOptionsDXR::viewpointSource (%d) invalid",
 		                 (int)o->viewpointSource);
 	}
+	(void)weave_path; // XR_DXR_lift v3: EXPLICIT is valid on the weave path too
 	if (o->viewpointSource == XR_LIFT_VIEWPOINT_SOURCE_EXPLICIT_DXR) {
-		if (weave_path) {
-			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
-			                 "XrLiftOptionsDXR: EXPLICIT viewpoints are not allowed on a weave rect "
-			                 "(the weave path always synthesizes for the tracked eyes)");
-		}
 		if (o->viewCount == 0 || o->viewpoints == NULL) {
 			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
 			                 "XrLiftOptionsDXR: EXPLICIT viewpoints need viewCount >= 1 and viewpoints");
@@ -210,6 +221,50 @@ oxr_lift_view_control_from_xr(struct oxr_logger *log, const XrLiftViewControlDXR
 	out->hold_s = v->recenterHoldSeconds;
 	out->tau_s = v->recenterTimeConstantSeconds;
 	return XR_SUCCESS;
+}
+
+/*!
+ * XR_DXR_lift v3 (ADR-048 Addendum A): the app rig on a lift, if any — an
+ * XrCameraRigDXR or XrDisplayRigDXR chained on @p direct (wins) or on
+ * @p options (either may be NULL); a camera rig wins over a display rig, as in
+ * xrLocateViews. Boundary-converted exactly like xrLocateViews' rig
+ * (verticalFov -> half-tangent, convergenceDiopters = inverse distance,
+ * metersToVirtual 0 -> 1); the service clamps. Shared with oxr_weave.c.
+ * Returns false (out->type NONE) when none is chained.
+ */
+bool
+oxr_lift_rig_from_chain(const void *direct, const void *options, struct xrt_lift_rig *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->type = XRT_LIFT_RIG_NONE;
+	const void *chains[2] = {direct, options};
+	for (int c = 0; c < 2; c++) {
+		const XrBaseInStructure *head = (const XrBaseInStructure *)chains[c];
+		if (head == NULL) {
+			continue;
+		}
+		const XrCameraRigDXR *crig = OXR_GET_INPUT_FROM_CHAIN(head, XR_TYPE_CAMERA_RIG_DXR, XrCameraRigDXR);
+		if (crig != NULL) {
+			out->type = XRT_LIFT_RIG_CAMERA;
+			out->ipd_factor = crig->ipdFactor;
+			out->parallax_factor = crig->parallaxFactor;
+			out->inv_convergence_distance = crig->convergenceDiopters;
+			out->half_tan_vfov = tanf(crig->verticalFov * 0.5f);
+			out->m2v = crig->metersToVirtual > 0.0f ? crig->metersToVirtual : 1.0f;
+			out->perspective_factor = 1.0f;
+			return true;
+		}
+		const XrDisplayRigDXR *drig = OXR_GET_INPUT_FROM_CHAIN(head, XR_TYPE_DISPLAY_RIG_DXR, XrDisplayRigDXR);
+		if (drig != NULL) {
+			out->type = XRT_LIFT_RIG_DISPLAY;
+			out->ipd_factor = drig->ipdFactor;
+			out->parallax_factor = drig->parallaxFactor;
+			out->perspective_factor = drig->perspectiveFactor;
+			out->m2v = 1.0f;
+			return true;
+		}
+	}
+	return false;
 }
 
 static XrResult
@@ -267,6 +322,16 @@ oxr_xrGetLiftPropertiesDXR(XrSession session, XrLiftPropertiesDXR *properties)
 	memcpy(properties->backend, caps.backend, sizeof(properties->backend));
 	properties->backend[sizeof(properties->backend) - 1] = '\0';
 	properties->typicalLatency = (XrDuration)caps.typical_latency_ns;
+
+	// Spec v3 (ADR-048 Addendum A): the auxiliary-depth capability.
+	XrLiftDepthPropertiesDXR *dp =
+	    OXR_GET_OUTPUT_FROM_CHAIN(properties, XR_TYPE_LIFT_DEPTH_PROPERTIES_DXR, XrLiftDepthPropertiesDXR);
+	if (dp != NULL) {
+		dp->auxDepthSupported = (caps.aux_outputs & XRT_DP_LIFT_AUX_DEPTH) != 0 ? XR_TRUE : XR_FALSE;
+		dp->auxDepthSemantics = caps.aux_depth_semantics == XRT_DP_LIFT_DEPTH_METRIC
+		                            ? XR_LIFT_DEPTH_SEMANTICS_METRIC_DXR
+		                            : XR_LIFT_DEPTH_SEMANTICS_RELATIVE_DXR;
+	}
 	return XR_SUCCESS;
 }
 
@@ -303,6 +368,20 @@ oxr_xrCreateLiftStreamDXR(XrSession session, const XrLiftStreamCreateInfoDXR *cr
 		                 "XrLiftStreamCreateInfoDXR::inputScale (%f) must be in [0, 1]",
 		                 (double)createInfo->inputScale);
 	}
+	// Spec v3 (ADR-048 Addendum A): auxiliary depth, SBS / NVIEW only.
+	const XrLiftDepthRequestDXR *dreq =
+	    OXR_GET_INPUT_FROM_CHAIN(createInfo, XR_TYPE_LIFT_DEPTH_REQUEST_DXR, XrLiftDepthRequestDXR);
+	uint32_t aux_outputs = 0, aux_depth_format = 0;
+	if (dreq != NULL) {
+		if (mode != XRT_DP_LIFT_MODE_SBS && mode != XRT_DP_LIFT_MODE_NVIEW) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "XrLiftDepthRequestDXR: auxiliary depth is for SBS / NVIEW streams only");
+		}
+		aux_outputs = XRT_DP_LIFT_AUX_DEPTH;
+		aux_depth_format = dreq->preferredFormat > 0 && dreq->preferredFormat <= UINT32_MAX
+		                       ? (uint32_t)dreq->preferredFormat
+		                       : 0u;
+	}
 	if (!lift_session_is_ipc(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
 		                 "xrCreateLiftStreamDXR: only available on the out-of-process (service) path");
@@ -311,7 +390,7 @@ oxr_xrCreateLiftStreamDXR(XrSession session, const XrLiftStreamCreateInfoDXR *cr
 	uint64_t id = 0;
 	xrt_result_t xret = comp_ipc_client_compositor_lift_stream_create(
 	    &sess->xcn->base, mode, (uint32_t)createInfo->contentHint,
-	    createInfo->inputScale > 0.0f ? createInfo->inputScale : 1.0f, &id);
+	    createInfo->inputScale > 0.0f ? createInfo->inputScale : 1.0f, aux_outputs, aux_depth_format, &id);
 	XrResult r = lift_xret(&log, sess, xret, "xrCreateLiftStreamDXR");
 	if (r != XR_SUCCESS) {
 		return r;
@@ -322,6 +401,7 @@ oxr_xrCreateLiftStreamDXR(XrSession session, const XrLiftStreamCreateInfoDXR *cr
 	st->sess = sess;
 	st->id = id;
 	st->mode = mode;
+	st->depth_requested = aux_outputs != 0;
 	*stream = XRT_CAST_PTR_TO_OXR_HANDLE(XrLiftStreamDXR, st);
 	return XR_SUCCESS;
 }
@@ -366,6 +446,8 @@ oxr_xrSubmitLiftFrameDXR(XrLiftStreamDXR stream, const XrLiftFrameSubmitInfoDXR 
 	uint32_t vp_count = 0;
 	struct xrt_lift_view_control vc;
 	const struct xrt_lift_view_control *vcp = NULL;
+	struct xrt_lift_rig rig;
+	const struct xrt_lift_rig *rigp = NULL;
 	const XrLiftOptionsDXR *opt = OXR_GET_INPUT_FROM_CHAIN(submitInfo, XR_TYPE_LIFT_OPTIONS_DXR, XrLiftOptionsDXR);
 	if (opt != NULL) {
 		XrResult vr = lift_validate_options(&log, opt, /*weave_path*/ false);
@@ -383,6 +465,10 @@ oxr_xrSubmitLiftFrameDXR(XrLiftStreamDXR stream, const XrLiftFrameSubmitInfoDXR 
 			}
 			vcp = &vc;
 		}
+		// Spec v3: an app rig rides with the options (absent = cleared).
+		if (oxr_lift_rig_from_chain(NULL, opt, &rig)) {
+			rigp = &rig;
+		}
 		if (opt->viewpointSource == XR_LIFT_VIEWPOINT_SOURCE_EXPLICIT_DXR) {
 			vp_count = opt->viewCount;
 			for (uint32_t i = 0; i < vp_count; i++) {
@@ -396,8 +482,82 @@ oxr_xrSubmitLiftFrameDXR(XrLiftStreamDXR stream, const XrLiftFrameSubmitInfoDXR 
 	xrt_result_t xret = comp_ipc_client_compositor_lift_submit(
 	    &sess->xcn->base, st->id, (xrt_graphics_buffer_handle_t)(intptr_t)submitInfo->inputTexture,
 	    submitInfo->inputIsDxgi == XR_TRUE, (uint32_t)submitInfo->extent.width, (uint32_t)submitInfo->extent.height,
-	    (int64_t)submitInfo->sourceTime, pp, vp_count > 0 ? vps : NULL, vp_count, vcp, frameId);
+	    (int64_t)submitInfo->sourceTime, pp, vp_count > 0 ? vps : NULL, vp_count, vcp, rigp, frameId);
 	return lift_xret(&log, sess, xret, "xrSubmitLiftFrameDXR");
+}
+
+//! Fill an XrLiftDepthResultDXR from an acquired result (+ handles on first
+//! depth acquire / reallocation).
+static XrResult
+lift_fill_depth_result(struct oxr_logger *log,
+                       struct oxr_session *sess,
+                       struct oxr_lift_stream_dxr *st,
+                       const struct xrt_lift_result *r,
+                       XrLiftDepthResultDXR *d)
+{
+	XrStructureType type = d->type;
+	void *next = d->next;
+	memset(d, 0, sizeof(*d));
+	d->type = type;
+	d->next = next;
+	const struct xrt_lift_depth_info *di = &r->depth;
+	if (!st->depth_requested || di->valid == 0) {
+		return XR_SUCCESS; // depthValid XR_FALSE, everything else zero
+	}
+	d->depthValid = XR_TRUE;
+	d->fenceValue = r->fence_value;
+	d->extent.width = (int32_t)di->width;
+	d->extent.height = (int32_t)di->height;
+	d->format = (int64_t)di->format;
+	d->units = di->units == XRT_DP_LIFT_DEPTH_METRIC ? XR_LIFT_DEPTH_SEMANTICS_METRIC_DXR
+	                                                 : XR_LIFT_DEPTH_SEMANTICS_RELATIVE_DXR;
+	d->encoding = di->encoding == XRT_DP_LIFT_DEPTH_ENCODING_INVERSE ? XR_LIFT_DEPTH_ENCODING_INVERSE_DXR
+	                                                                 : XR_LIFT_DEPTH_ENCODING_LINEAR_DXR;
+	d->valueScale = di->value_scale;
+	d->valueOffset = di->value_offset;
+	d->nearDepth = di->near_depth;
+	d->farDepth = di->far_depth;
+	d->sameInference = di->same_inference != 0 ? XR_TRUE : XR_FALSE;
+	d->frameId = r->frame_id;
+	d->intrinsicsValid = di->intrinsics_valid != 0 ? XR_TRUE : XR_FALSE;
+	d->focalLengthPx.x = di->focal[0];
+	d->focalLengthPx.y = di->focal[1];
+	d->principalPointPx.x = di->principal[0];
+	d->principalPointPx.y = di->principal[1];
+	d->convergenceDepth = di->convergence_depth;
+	d->viewpoint.x = di->viewpoint[0];
+	d->viewpoint.y = di->viewpoint[1];
+	d->viewpoint.z = di->viewpoint[2];
+	d->transformValid = di->transform_valid != 0 ? XR_TRUE : XR_FALSE;
+	memcpy(d->depthToDisplay, di->depth_to_display, sizeof(d->depthToDisplay));
+
+	// Handles: first depth acquire and every reallocation (the views' rule).
+	if (di->realloc != 0 || !st->depth_exported) {
+		bool have_tex = false, have_fence = false;
+		xrt_graphics_buffer_handle_t th = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+		xrt_graphics_sync_handle_t fh = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
+		xrt_result_t xret =
+		    comp_ipc_client_compositor_lift_get_depth_output(&sess->xcn->base, st->id, &have_tex, &th);
+		XrResult xr = lift_xret(log, sess, xret, "xrAcquireLiftResultDXR (depth export)");
+		if (xr != XR_SUCCESS) {
+			return xr;
+		}
+		xret = comp_ipc_client_compositor_lift_get_fence(&sess->xcn->base, st->id, &have_fence, &fh);
+		xr = lift_xret(log, sess, xret, "xrAcquireLiftResultDXR (depth fence export)");
+		if (xr != XR_SUCCESS) {
+			return xr;
+		}
+		const bool got_tex = have_tex && th != XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+		const bool got_fence = have_fence && fh != XRT_GRAPHICS_SYNC_HANDLE_INVALID;
+		if (got_tex) {
+			d->depthTexture = (void *)(intptr_t)th;
+		}
+		if (got_fence) {
+			d->fence = (void *)(intptr_t)fh;
+		}
+		st->depth_exported = got_tex && got_fence;
+	}
+	return XR_SUCCESS;
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
@@ -483,6 +643,16 @@ oxr_xrAcquireLiftResultDXR(XrLiftStreamDXR stream, XrLiftResultDXR *result)
 		}
 		// Latch only on a complete export (the #1427 rule): a miss retries.
 		st->exported = got_tex && got_fence;
+	}
+
+	// Spec v3 (ADR-048 Addendum A): the auxiliary depth of this result.
+	XrLiftDepthResultDXR *dres =
+	    OXR_GET_OUTPUT_FROM_CHAIN(result, XR_TYPE_LIFT_DEPTH_RESULT_DXR, XrLiftDepthResultDXR);
+	if (dres != NULL) {
+		xr = lift_fill_depth_result(&log, sess, st, &r, dres);
+		if (xr != XR_SUCCESS) {
+			return xr;
+		}
 	}
 	return XR_SUCCESS;
 }

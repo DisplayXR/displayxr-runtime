@@ -111,6 +111,8 @@ comp_ipc_client_compositor_lift_weave_rects(struct xrt_compositor *xc,
 //! XrLiftViewControlDXR -> xrt (oxr_lift.c).
 XrResult
 oxr_lift_view_control_from_xr(struct oxr_logger *log, const XrLiftViewControlDXR *v, struct xrt_lift_view_control *out);
+bool
+oxr_lift_rig_from_chain(const void *direct, const void *options, struct xrt_lift_rig *out);
 #endif
 
 // Forward decls of the IPC-bridge wrappers (defined in ipc_client_compositor.c).
@@ -793,12 +795,31 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 			lr[i].rect_index = e->rectIndex;
 			const XrLiftOptionsDXR *o = OXR_GET_INPUT_FROM_CHAIN(e, XR_TYPE_LIFT_OPTIONS_DXR, XrLiftOptionsDXR);
 			if (o != NULL) {
-				if (o->viewpointSource == XR_LIFT_VIEWPOINT_SOURCE_EXPLICIT_DXR ||
-				    o->viewCount > XR_LIFT_MAX_VIEWS_DXR) {
-					return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-					                 "xrWeaveSubmitDXR: lifts[%u] options: TRACKED viewpoints only on the "
-					                 "weave path, viewCount <= %u",
-					                 i, (uint32_t)XR_LIFT_MAX_VIEWS_DXR);
+				if (o->viewCount > XR_LIFT_MAX_VIEWS_DXR ||
+				    (o->viewpointSource != XR_LIFT_VIEWPOINT_SOURCE_TRACKED_DXR &&
+				     o->viewpointSource != XR_LIFT_VIEWPOINT_SOURCE_EXPLICIT_DXR)) {
+					return oxr_error(
+					    &log, XR_ERROR_VALIDATION_FAILURE,
+					    "xrWeaveSubmitDXR: lifts[%u] options: viewCount <= %u and a valid "
+					    "viewpointSource",
+					    i, (uint32_t)XR_LIFT_MAX_VIEWS_DXR);
+				}
+				// XR_DXR_lift v3: EXPLICIT viewpoints on a lifted rect, with the
+				// same validation as on a submit.
+				if (o->viewpointSource == XR_LIFT_VIEWPOINT_SOURCE_EXPLICIT_DXR) {
+					if (o->viewCount == 0 || o->viewpoints == NULL) {
+						return oxr_error(
+						    &log, XR_ERROR_VALIDATION_FAILURE,
+						    "xrWeaveSubmitDXR: lifts[%u] options: EXPLICIT viewpoints need "
+						    "viewCount >= 1 and viewpoints",
+						    i);
+					}
+					for (uint32_t k = 0; k < o->viewCount; k++) {
+						lr[i].viewpoints[3 * k + 0] = o->viewpoints[k].x;
+						lr[i].viewpoints[3 * k + 1] = o->viewpoints[k].y;
+						lr[i].viewpoints[3 * k + 2] = o->viewpoints[k].z;
+					}
+					lr[i].viewpoint_floats = 3 * o->viewCount;
 				}
 				lr[i].has_params = true;
 				lr[i].params.struct_size = (uint32_t)sizeof(lr[i].params);
@@ -823,6 +844,9 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 				}
 				lr[i].has_view_control = true;
 			}
+			// Spec v3 (ADR-048 Addendum A): an app rig, directly on the rect
+			// (wins) or on its XrLiftOptionsDXR.
+			(void)oxr_lift_rig_from_chain(e, o, &lr[i].rig);
 		}
 		xrt_result_t lx = comp_ipc_client_compositor_lift_weave_rects(&sess->xcn->base, lifts->liftCount, lr);
 		if (lx == XRT_ERROR_IPC_FAILURE) {

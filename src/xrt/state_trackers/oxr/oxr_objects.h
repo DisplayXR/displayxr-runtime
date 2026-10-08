@@ -4481,6 +4481,8 @@ struct oxr_lift_stream_dxr
 	uint64_t id;   //!< service-side stream id
 	uint32_t mode; //!< XRT_DP_LIFT_MODE_* (one bit)
 	bool exported; //!< the caller holds the current export texture + fence
+	bool depth_requested; //!< XR_DXR_lift v3: created with XrLiftDepthRequestDXR
+	bool depth_exported;  //!< the caller holds the current depth texture + fence
 };
 #endif // OXR_HAVE_DXR_lift
 

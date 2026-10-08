@@ -1273,7 +1273,7 @@ comp_d3d11_service_lift_release_owner(struct xrt_system_compositor *xsysc, uint6
  * @p xc is the submitting session's compositor (NULL on a headless
  * connection): its window is the frame the viewpoints are rebased to
  * (ADR-048); without one, the panel centre. @p view_control NULL = the
- * stream's last policy.
+ * stream's last policy. @p rig (XR_DXR_lift v3) rides with @p params.
  */
 xrt_result_t
 comp_d3d11_service_lift_submit(struct xrt_system_compositor *xsysc,
@@ -1289,6 +1289,7 @@ comp_d3d11_service_lift_submit(struct xrt_system_compositor *xsysc,
                                const float *viewpoints,
                                uint32_t viewpoint_floats,
                                const struct xrt_lift_view_control *view_control,
+                               const struct xrt_lift_rig *rig,
                                uint64_t *out_frame_id);
 
 //! xrAcquireLiftResultDXR. @p out_ready false = nothing newer (NOT READY).
@@ -1313,6 +1314,16 @@ comp_d3d11_service_lift_export_fence(struct xrt_system_compositor *xsysc,
                                      uint64_t owner,
                                      uint64_t id,
                                      xrt_graphics_sync_handle_t *out_handle);
+
+//! XR_DXR_lift v3: the stream's auxiliary depth export texture (service-owned).
+bool
+comp_d3d11_service_lift_export_depth(struct xrt_system_compositor *xsysc,
+                                     uint64_t owner,
+                                     uint64_t id,
+                                     xrt_graphics_buffer_handle_t *out_handle,
+                                     uint32_t *out_width,
+                                     uint32_t *out_height,
+                                     uint32_t *out_format);
 
 /*!
  * xrAcquireLiftBlobDXR (two-call latch). On delivery @p out_bytes is a malloc'd

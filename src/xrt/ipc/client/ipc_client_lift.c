@@ -65,13 +65,19 @@ ipc_client_lift_get_properties(struct ipc_connection *ipc_c, struct xrt_dp_lift_
 }
 
 xrt_result_t
-ipc_client_lift_stream_create(
-    struct ipc_connection *ipc_c, uint32_t mode, uint32_t content_hint, float input_scale, uint64_t *out_stream_id)
+ipc_client_lift_stream_create(struct ipc_connection *ipc_c,
+                              uint32_t mode,
+                              uint32_t content_hint,
+                              float input_scale,
+                              uint32_t aux_outputs,
+                              uint32_t aux_depth_format,
+                              uint64_t *out_stream_id)
 {
 	if (ipc_c == NULL || out_stream_id == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
-	return ipc_call_lift_stream_create(ipc_c, mode, content_hint, input_scale, out_stream_id);
+	return ipc_call_lift_stream_create(ipc_c, mode, content_hint, input_scale, aux_outputs, aux_depth_format,
+	                                   out_stream_id);
 }
 
 xrt_result_t
@@ -95,6 +101,7 @@ ipc_client_lift_submit(struct ipc_connection *ipc_c,
                        const float *viewpoints,
                        uint32_t viewpoint_count,
                        const struct xrt_lift_view_control *view_control,
+                       const struct xrt_lift_rig *rig,
                        uint64_t *out_frame_id)
 {
 	if (ipc_c == NULL || out_frame_id == NULL) {
@@ -113,6 +120,9 @@ ipc_client_lift_submit(struct ipc_connection *ipc_c,
 		if (view_control != NULL) {
 			args.params.has_view_control = 1;
 			args.params.view_control = *view_control;
+		}
+		if (rig != NULL) {
+			args.params.rig = *rig; // XR_DXR_lift v3; type NONE = none
 		}
 	}
 	xrt_graphics_buffer_handle_t handles[1] = {handle};
@@ -159,7 +169,36 @@ ipc_client_lift_acquire(struct ipc_connection *ipc_c,
 	memcpy(out_result->viewpoints, r.viewpoints, sizeof(out_result->viewpoints));
 	memcpy(out_result->rect_center, r.rect_center, sizeof(out_result->rect_center));
 	memcpy(out_result->rect_size, r.rect_size, sizeof(out_result->rect_size));
+	out_result->depth = r.depth;
 	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_client_lift_get_depth_output(struct ipc_connection *ipc_c,
+                                 uint64_t stream_id,
+                                 bool *out_have,
+                                 uint32_t *out_width,
+                                 uint32_t *out_height,
+                                 uint32_t *out_format,
+                                 xrt_graphics_buffer_handle_t *out_handle)
+{
+	if (ipc_c == NULL || out_have == NULL || out_handle == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	*out_have = false;
+	*out_handle = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+	uint32_t w = 0, h = 0, f = 0;
+	xrt_result_t xret = ipc_call_lift_get_depth_output(ipc_c, stream_id, out_have, &w, &h, &f, out_handle, 1);
+	if (out_width != NULL) {
+		*out_width = w;
+	}
+	if (out_height != NULL) {
+		*out_height = h;
+	}
+	if (out_format != NULL) {
+		*out_format = f;
+	}
+	return xret;
 }
 
 xrt_result_t
@@ -261,6 +300,24 @@ ipc_client_lift_weave_rects(struct ipc_connection *ipc_c, uint32_t count, const 
 	if (ipc_c == NULL || count > IPC_LIFT_WEAVE_RECTS_MAX || (count > 0 && rects == NULL)) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
+	// XR_DXR_lift v3: EXPLICIT viewpoints of lifted rects do not fit the rects
+	// message; stage them first, one call per such rect.
+	for (uint32_t i = 0; i < count; i++) {
+		if (rects[i].viewpoint_floats < 3) {
+			continue;
+		}
+		struct ipc_arg_lift_rect_viewpoints va;
+		U_ZERO(&va);
+		va.stream_id = rects[i].stream_id;
+		uint32_t n = rects[i].viewpoint_floats / 3;
+		n = n > IPC_LIFT_MAX_VIEWS ? IPC_LIFT_MAX_VIEWS : n;
+		va.viewpoint_count = n;
+		memcpy(va.viewpoints, rects[i].viewpoints, (size_t)n * 3 * sizeof(float));
+		xrt_result_t vx = ipc_call_lift_weave_rect_viewpoints(ipc_c, &va);
+		if (vx == XRT_ERROR_IPC_FAILURE) {
+			return vx;
+		}
+	}
 	struct ipc_arg_lift_weave_rects args;
 	U_ZERO(&args);
 	args.count = count;
@@ -275,6 +332,8 @@ ipc_client_lift_weave_rects(struct ipc_connection *ipc_c, uint32_t count, const 
 		args.rects[i].focal_px = rects[i].params.focal_px;
 		args.rects[i].has_view_control = rects[i].has_view_control ? 1u : 0u;
 		args.rects[i].view_control = rects[i].view_control;
+		args.rects[i].viewpoint_count = rects[i].viewpoint_floats / 3;
+		args.rects[i].rig = rects[i].rig;
 	}
 	return ipc_call_lift_weave_rects(ipc_c, &args);
 }

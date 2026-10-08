@@ -3208,9 +3208,12 @@ comp_ipc_client_compositor_lift_stream_create(struct xrt_compositor *xc,
                                               uint32_t mode,
                                               uint32_t content_hint,
                                               float input_scale,
+                                              uint32_t aux_outputs,
+                                              uint32_t aux_depth_format,
                                               uint64_t *out_stream_id)
 {
-	return ipc_client_lift_stream_create(lift_conn(xc), mode, content_hint, input_scale, out_stream_id);
+	return ipc_client_lift_stream_create(lift_conn(xc), mode, content_hint, input_scale, aux_outputs,
+	                                     aux_depth_format, out_stream_id);
 }
 
 xrt_result_t
@@ -3231,10 +3234,11 @@ comp_ipc_client_compositor_lift_submit(struct xrt_compositor *xc,
                                        const float *viewpoints,
                                        uint32_t viewpoint_count,
                                        const struct xrt_lift_view_control *view_control,
+                                       const struct xrt_lift_rig *rig,
                                        uint64_t *out_frame_id)
 {
 	return ipc_client_lift_submit(lift_conn(xc), stream_id, handle, is_dxgi, width, height, source_time, params,
-	                              viewpoints, viewpoint_count, view_control, out_frame_id);
+	                              viewpoints, viewpoint_count, view_control, rig, out_frame_id);
 }
 
 xrt_result_t
@@ -3253,6 +3257,15 @@ comp_ipc_client_compositor_lift_get_output(struct xrt_compositor *xc,
                                            xrt_graphics_buffer_handle_t *out_handle)
 {
 	return ipc_client_lift_get_output(lift_conn(xc), stream_id, out_have, NULL, NULL, NULL, out_handle);
+}
+
+xrt_result_t
+comp_ipc_client_compositor_lift_get_depth_output(struct xrt_compositor *xc,
+                                                 uint64_t stream_id,
+                                                 bool *out_have,
+                                                 xrt_graphics_buffer_handle_t *out_handle)
+{
+	return ipc_client_lift_get_depth_output(lift_conn(xc), stream_id, out_have, NULL, NULL, NULL, out_handle);
 }
 
 xrt_result_t

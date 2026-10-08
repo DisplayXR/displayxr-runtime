@@ -18,6 +18,7 @@
 #include <d3d11.h>
 #include <d3dcompiler.h>
 
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -74,6 +75,14 @@ struct fake_stream
 	uint32_t out_w, out_h;
 	DXGI_FORMAT out_fmt;
 	std::vector<uint8_t> blob;
+	// XR_DXR_lift v3 auxiliary depth (SBS / NVIEW streams that asked for it).
+	bool aux_depth;
+	ID3D11Texture2D *depth;
+	ID3D11RenderTargetView *depth_rtv;
+	uint32_t depth_w, depth_h;
+	bool depth_ready;  //!< the last convert rendered a depth map
+	float convergence; //!< xrt_dp_lift_params::convergence of the last convert
+	uint64_t frames;
 };
 
 struct sim_fake_lift
@@ -117,6 +126,8 @@ stream_release(fake_stream &s)
 {
 	safe_release(s.rtv);
 	safe_release(s.out);
+	safe_release(s.depth_rtv);
+	safe_release(s.depth);
 	s.blob.clear();
 	s.blob.shrink_to_fit();
 	s.used = false;
@@ -227,6 +238,9 @@ sim_fake_lift_get_caps(struct sim_fake_lift *fl, struct xrt_dp_lift_caps *out)
 	out->max_views = SIM_FAKE_LIFT_MAX_VIEWS;
 	out->depth_semantics = XRT_DP_LIFT_DEPTH_RELATIVE;
 	out->state = XRT_DP_LIFT_STATE_READY;
+	// The fake's auxiliary depth is a synthetic METRIC ramp (1 m .. 2 m).
+	out->aux_outputs = XRT_DP_LIFT_AUX_DEPTH;
+	out->aux_depth_semantics = XRT_DP_LIFT_DEPTH_METRIC;
 	out->typical_latency_ns = (uint64_t)debug_get_num_option_sim_display_fake_lift_latency_ms() * 1000000ull;
 	snprintf(out->backend, sizeof(out->backend), "sim_display-fake");
 	return true;
@@ -249,6 +263,10 @@ sim_fake_lift_stream_create(struct sim_fake_lift *fl, const struct xrt_dp_lift_s
 			s.used = true;
 			s.id = ++fl->next_id;
 			s.mode = m;
+			s.aux_depth = (m == XRT_DP_LIFT_MODE_SBS || m == XRT_DP_LIFT_MODE_NVIEW) &&
+			              info->struct_size >= offsetof(struct xrt_dp_lift_stream_info, aux_depth_format) +
+			                                       sizeof(uint32_t) &&
+			              (info->aux_outputs & XRT_DP_LIFT_AUX_DEPTH) != 0;
 			*out_id = s.id;
 			return true;
 		}
@@ -294,6 +312,69 @@ ensure_out(struct sim_fake_lift *fl, fake_stream &s, uint32_t w, uint32_t h, DXG
 	s.out_w = w;
 	s.out_h = h;
 	s.out_fmt = fmt;
+	return true;
+}
+
+static bool
+fake_ensure_depth(struct sim_fake_lift *fl, fake_stream &s, uint32_t w, uint32_t h)
+{
+	if (s.depth != nullptr && s.depth_w == w && s.depth_h == h) {
+		return true;
+	}
+	safe_release(s.depth_rtv);
+	safe_release(s.depth);
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = w;
+	td.Height = h;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = DXGI_FORMAT_R32_FLOAT;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_DEFAULT;
+	td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+	if (FAILED(fl->device->CreateTexture2D(&td, nullptr, &s.depth)) ||
+	    FAILED(fl->device->CreateRenderTargetView(s.depth, nullptr, &s.depth_rtv))) {
+		safe_release(s.depth_rtv);
+		safe_release(s.depth);
+		return false;
+	}
+	s.depth_w = w;
+	s.depth_h = h;
+	return true;
+}
+
+extern "C" bool
+sim_fake_lift_get_depth(struct sim_fake_lift *fl, uint64_t id, void *d3d11_context, struct xrt_dp_lift_depth *out)
+{
+	(void)d3d11_context;
+	if (fl == nullptr || out == nullptr || out->struct_size < sizeof(struct xrt_dp_lift_depth)) {
+		return false;
+	}
+	fake_stream *s = find_stream(fl, id);
+	if (s == nullptr || !s->aux_depth || !s->depth_ready || s->depth == nullptr) {
+		return false;
+	}
+	out->format = (uint32_t)DXGI_FORMAT_R32_FLOAT;
+	out->resource = s->depth;
+	out->width = s->depth_w;
+	out->height = s->depth_h;
+	out->units = XRT_DP_LIFT_DEPTH_METRIC;
+	out->encoding = XRT_DP_LIFT_DEPTH_ENCODING_LINEAR;
+	out->value_scale = 1.0f; // sample = v in [0, 1] -> 1 m (top) .. 2 m (bottom)
+	out->value_offset = 1.0f;
+	out->source_width = s->depth_w;
+	out->source_height = s->depth_h;
+	const float f = 0.78f * (float)(s->depth_w > s->depth_h ? s->depth_w : s->depth_h);
+	out->focal_x_px = f;
+	out->focal_y_px = f;
+	out->principal_x_px = 0.5f * (float)s->depth_w;
+	out->principal_y_px = 0.5f * (float)s->depth_h;
+	out->near_depth = 1.0f;
+	out->far_depth = 2.0f;
+	// Relative convergence c in [0, 1] over the 1..2 m range; AUTO = mid.
+	out->convergence_depth = s->convergence < 0.0f ? 1.5f : 1.0f + (s->convergence > 1.0f ? 1.0f : s->convergence);
+	out->same_inference = 1;
+	out->vendor_frame_id = s->frames;
 	return true;
 }
 
@@ -371,6 +452,25 @@ sim_fake_lift_convert(struct sim_fake_lift *fl,
 	ctx->Draw(4, 0);
 	ID3D11ShaderResourceView *null_srv = nullptr;
 	ctx->PSSetShaderResources(0, 1, &null_srv);
+
+	// XR_DXR_lift v3: the auxiliary depth of the SAME (fake) inference — the
+	// ramp the DEPTH mode draws, at input size, R32F; decoded as 1 + v metres.
+	s->depth_ready = false;
+	if (s->aux_depth && !depth && fake_ensure_depth(fl, *s, w, h)) {
+		D3D11_VIEWPORT dvp = {};
+		dvp.Width = (float)w;
+		dvp.Height = (float)h;
+		dvp.MaxDepth = 1.0f;
+		ctx->RSSetViewports(1, &dvp);
+		D3D11_RECT dsc = {0, 0, (LONG)w, (LONG)h};
+		ctx->RSSetScissorRects(1, &dsc);
+		ctx->OMSetRenderTargets(1, &s->depth_rtv, nullptr);
+		ctx->PSSetShader(fl->ps_depth, nullptr, 0);
+		ctx->Draw(4, 0);
+		s->depth_ready = true;
+		s->convergence = p != nullptr ? p->convergence : -1.0f;
+		s->frames++;
+	}
 	ID3D11RenderTargetView *null_rtv = nullptr;
 	ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
 	safe_release(srv);
