@@ -28,6 +28,10 @@
 //      frame, shown where it was woven for; a tag going away releases at once
 //      to the window; toggling; and an always-tagged app is placed exactly
 //      as without the gate.
+//   8. The surface pick (version 12): the main surface is the actor carrying
+//      the window's texture, not the largest one — under libdecor-gtk the
+//      shadow is larger than the content and the old rule decoded every tag
+//      against it; the size rule remains the fallback without a texture.
 'use strict';
 
 const GLib = imports.gi.GLib;
@@ -292,6 +296,46 @@ print('7. the tag gate (version 10)');
             'always tagged: the gated hold places every frame exactly as the ungated one');
         check(st.stats.holds === 1 && st.stats.tagLost === 0, 'always tagged: one hold, never released by the gate');
     }
+}
+
+print('8. surface pick (version 12): the main surface by its texture, not by size');
+{
+    const T = {name: 'main texture'}, S = {name: 'shadow texture'}, B = {name: 'bar texture'};
+    const G = {name: 'tag texture'};
+    // An app drawing its own chrome (the test apps, the browser): the content
+    // surface, a smaller title bar above it, the tag below it.
+    const own = [{w: 1200, h: 900, content: T}, {w: 1200, h: 40, content: B}, {w: 1, h: 1, content: G}];
+    let r = MS.pick(own, T);
+    check(r.main === 0 && r.tag === 2 && r.byTexture, 'own chrome: the content is main (by texture), the 1x1 the tag');
+    r = MS.pick(own, null);
+    check(r.main === 0 && r.tag === 2 && !r.byTexture, 'own chrome, no texture: the largest is main (the version 9-11 rule)');
+    // libdecor-gtk (GLFW 3.4 / SDL stock decorations): a shadow subsurface
+    // LARGER than the content, a title bar, the content, the tag.
+    const decorated = [{w: 1240, h: 980, content: S}, {w: 1200, h: 40, content: B},
+        {w: 1200, h: 900, content: T}, {w: 1, h: 1, content: G}];
+    r = MS.pick(decorated, T);
+    check(r.main === 2 && r.tag === 3 && r.byTexture, 'libdecor: the content is main, not the larger shadow');
+    r = MS.pick(decorated, null);
+    check(r.main === 0 && !r.byTexture, 'libdecor, no texture: the shadow wins by size (what versions 9-11 did)');
+    r = MS.pick(decorated, {name: 'a texture no actor carries'});
+    check(r.main === 0 && !r.byTexture, 'texture carried by no actor: falls back to size');
+    check(MS.pick([{w: 1200, h: 900, content: T}], T).tag === -1, 'no 1x1 actor: no tag');
+    check(MS.pick([{w: 1, h: 1, content: G}], T).main === -1, 'only a tag: no main');
+    check(MS.pick([{w: 1, h: 1, content: G}, {w: 1200, h: 900, content: T}], T).main === 1,
+        'a 1x1 actor is never the main surface, whatever it carries');
+    // End to end at the libdecor layout, positions relative to the window
+    // actor: shadow at (-20,-20), bar at (0,-40), content at (0,0), the tag
+    // at content + encode(woven).
+    const woven = [1234, -77];
+    const pos = [[-20, -20], [0, -40], [0, 0], [cEncode(woven[0]), cEncode(woven[1])]];
+    r = MS.pick(decorated, T);
+    let d = MS.decode(pos[r.tag][0], pos[r.tag][1], pos[r.main][0], pos[r.main][1]);
+    check(d[0] === cEncode(woven[0]) && d[1] === cEncode(woven[1]),
+        'libdecor: the tag decodes to the woven position against the content');
+    const old = MS.pick(decorated, null);
+    d = MS.decode(pos[r.tag][0], pos[r.tag][1], pos[old.main][0], pos[old.main][1]);
+    check(d[0] === cEncode(woven[0] + 20) && d[1] === cEncode(woven[1] + 20),
+        'libdecor: against the shadow it decoded 20 px off (the version 9-11 bug)');
 }
 
 if (failed) {

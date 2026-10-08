@@ -308,6 +308,54 @@
             return [MoveSyncChoice.mod(tagX - mainX, m), MoveSyncChoice.mod(tagY - mainY, m)];
         },
 
+        /*
+         * Which of a window's surface actors are the tag and the MAIN
+         * surface (extension version 12). @p surfaces: one {w, h, content}
+         * per actor under the window actor with a non-empty size, in tree
+         * order; @p texture: the main surface's texture
+         * (MetaWindowActor.get_texture(), a MetaShapedTexture), or null.
+         *
+         * The tag is the 1x1 surface. The main surface is the actor whose
+         * CONTENT is that texture: mutter sets the main surface's
+         * MetaShapedTexture as its surface actor's content and hands the
+         * same object out from the window actor, so the pairing is
+         * structural — the toplevel's own surface, the one the tag is a
+         * subsurface of (runtime and present-owner alike), whatever else
+         * the client stacks around it.
+         *
+         * Versions 9-11 took the LARGEST surface instead. Under
+         * libdecor-gtk (GLFW 3.4's and SDL's stock decorations on GNOME)
+         * the shadow subsurface is larger than the content, so every tag
+         * decoded against the shadow's origin, no frame ever resolved, and
+         * the hold timed out on every title-bar drag — stale frames and 3D
+         * stutter (found on the LeiaSR OpenGL example). The largest surface
+         * stands in only without a texture (none handed out, or no actor
+         * carrying it), where it is still the version 9-11 behaviour.
+         *
+         * Returns {main, tag, byTexture}: indices into @p surfaces (-1 when
+         * absent) and whether the main surface was found by its texture.
+         */
+        pick(surfaces, texture) {
+            let main = -1, tag = -1, best = -1, byTexture = false;
+            for (let i = 0; i < surfaces.length; i++) {
+                const s = surfaces[i];
+                if (s.w === 1 && s.h === 1) {
+                    tag = i;
+                    continue;
+                }
+                if (byTexture)
+                    continue;
+                if (texture && s.content === texture) {
+                    main = i;
+                    byTexture = true;
+                } else if (s.w * s.h > best) {
+                    best = s.w * s.h;
+                    main = i;
+                }
+            }
+            return {main, tag, byTexture};
+        },
+
         //! The newest entry of @p hist ({x, y, t}, oldest first) whose
         //! position matches @p tag, or null.
         resolve(hist, tag) {
@@ -1782,31 +1830,35 @@
 
             //! The tag of the buffer the window shows NOW: [x, y] or null.
             _readTag(actor) {
+                // Every surface actor under the window actor, with its
+                // position relative to the window actor. mutter 45-50 keep
+                // them flat under one container; summing the offsets covers
+                // a nested tree as well.
                 const surfaces = [];
-                const walk = a => {
+                const walk = (a, ox, oy) => {
                     for (const ch of a.get_children()) {
                         const [w, h] = ch.get_size();
+                        const [x, y] = ch.get_position();
                         if (w > 0 && h > 0)
-                            surfaces.push(ch);
-                        walk(ch);
+                            surfaces.push({actor: ch, w, h, x: ox + x, y: oy + y, content: ch.get_content()});
+                        walk(ch, ox + x, oy + y);
                     }
                 };
-                walk(actor);
-                let main = null, tag = null, best = -1;
-                for (const a of surfaces) {
-                    const [w, h] = a.get_size();
-                    if (w === 1 && h === 1) {
-                        tag = a;
-                    } else if (w * h > best) {
-                        best = w * h;
-                        main = a;
-                    }
-                }
-                if (!tag || !main || !tag.visible)
+                walk(actor, 0, 0);
+                // The main surface by its texture (version 12), not by size:
+                // see MoveSyncChoice.pick.
+                const texture = actor.get_texture?.() ?? null;
+                const {main, tag, byTexture} = MoveSyncChoice.pick(surfaces, texture);
+                if (main < 0 || tag < 0 || !surfaces[tag].actor.visible)
                     return null;
-                const [tx, ty] = tag.get_position();
-                const [mx, my] = main.get_position();
-                return MoveSyncChoice.decode(tx, ty, mx, my);
+                if (this._debug && this._mainRule !== byTexture) {
+                    this._mainRule = byTexture;
+                    log(`displayxr: move sync: main surface found by ${byTexture
+                        ? 'its texture' : 'size (no texture match — a decorated window may decode wrong)'} ` +
+                        `(${surfaces.length} surface actors)`);
+                }
+                const t = surfaces[tag], m = surfaces[main];
+                return MoveSyncChoice.decode(t.x, t.y, m.x, m.y);
             }
 
             _beforeUpdate() {

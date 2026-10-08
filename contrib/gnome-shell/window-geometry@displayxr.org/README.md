@@ -250,6 +250,15 @@ systemctl --user unset-environment DISPLAYXR_DEBUG   # then log out/in again
   (every monitor at scale 1, where the two modes agree). The drag-lattice
   choice and the stamp audit weigh device px by the same factor. The schema
   stays `version: 1`, because no field changed meaning. See the spec, §4.1.
+- Version 12, no interface change: the move-sync tag is decoded against the
+  window's **main surface found by its texture** (`MetaWindowActor.get_texture()`
+  is the toplevel surface actor's content), no longer against the largest
+  surface actor. Under libdecor-gtk — GLFW 3.4's and SDL2/SDL3's stock
+  decorations on GNOME — the shadow subsurface is larger than the content, so
+  versions 9–11 decoded every tag against the shadow, resolved nothing, and
+  timed out on every title-bar drag (stale frames, visible 3D stutter; found
+  on the LeiaSR OpenGL example). Apps that draw their own chrome, the test
+  apps and the browser among them, were never affected. See the spec, §9.2.
 
 Verify capture exclusion is live:
 
