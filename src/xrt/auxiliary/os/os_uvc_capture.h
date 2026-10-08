@@ -38,6 +38,15 @@ extern "C" {
 bool
 os_uvc_capture_backend(struct u_stereo_uvc_backend *out);
 
+/*!
+ * Human-readable report of the decode path open() would take (`displayxr-cli
+ * camera uvc-devices --decoder`): the decoder policy, the hardware / software
+ * MJPEG decoders registered, the adapters and which one would decode. Touches
+ * no camera. A platform without a backend says so.
+ */
+void
+os_uvc_capture_decoder_report(char *out, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif

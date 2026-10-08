@@ -234,8 +234,10 @@ SBS webcam needs no vendor code, so it lives in the runtime.
 
 **Consequences.** **+** Any display + any SBS UVC stereo webcam, no plug-in, same privacy model.
 **+** The fake backend (`"fake"` in the config) runs the whole manager hardware-free
-(`tests_stereo_camera_manager`). **−** A decoded-MJPEG CPU cost the plug-in path does not have
-(the reader's decoder MFT; 4K60 MJPEG is heavy in software — the config can pick a smaller mode),
-plus one CPU split/resample per frame. **−** Linux has no backend yet (V4L2 is a TODO). **−** A
+(`tests_stereo_camera_manager`). **−** MJPEG decoding the plug-in path does not have. A 4K60
+webcam is decoded on the GPU by default (a hardware MJPEG decoder MFT on the adapter that has one,
+via a DXGI device manager, scaled to the output size before it crosses to the CPU), with MF's
+software decoder as the logged fallback; the first hardware run, before that path, delivered
+11.3 Hz. **−** Linux has no backend yet (V4L2 is a TODO). **−** A
 loose `match` could claim the wrong webcam; the ambiguity rule and `uvc-devices` mitigate, the
 config is still the user's statement of which device is a stereo pair.

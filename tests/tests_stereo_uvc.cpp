@@ -34,6 +34,7 @@
 #include "util/u_stereo_vrefine.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -583,6 +584,47 @@ TEST_CASE("uvc split: eye order, full vs half, NV12 and YUY2", "[stereo_uvc]")
 		bad.pixel = 99;
 		CHECK_FALSE(u_stereo_uvc_split(&bad, false, 8, 8, out.data(), &lay));
 	}
+}
+
+TEST_CASE("uvc split: cost of a half-SBS 3840x2160 NV12 frame to 2 x 1280x720", "[stereo_uvc][.perf]")
+{
+	const uint32_t W = 3840, H = 2160;
+	std::vector<uint8_t> nv12((size_t)W * H * 3 / 2);
+	for (size_t i = 0; i < nv12.size(); i++) {
+		nv12[i] = (uint8_t)(i * 2654435761u >> 24);
+	}
+	u_stereo_uvc_raw_frame in;
+	std::memset(&in, 0, sizeof(in));
+	in.pixel = U_STEREO_UVC_PIXEL_NV12;
+	in.width = W;
+	in.height = H;
+	in.planes[0] = nv12.data();
+	in.planes[1] = nv12.data() + (size_t)W * H;
+	in.pitches[0] = in.pitches[1] = W;
+	u_stereo_camera_planes lay;
+	REQUIRE(u_stereo_camera_layout(XRT_PLUGIN_STEREO_CAMERA_FORMAT_NV12, 2560, 720, &lay));
+	std::vector<uint8_t> out(lay.size);
+	for (uint32_t eye_w : {1280u, 2560u / 2}) {
+		auto t0 = std::chrono::steady_clock::now();
+		const int n = 20;
+		for (int i = 0; i < n; i++) {
+			REQUIRE(u_stereo_uvc_split(&in, false, eye_w, 720, out.data(), &lay));
+		}
+		double ms =
+		    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / n;
+		std::printf("[uvc split perf] 3840x2160 NV12 half-SBS -> 2 x %ux720: %.2f ms/frame\n", eye_w, ms);
+	}
+	// The GPU path hands over 2560x720 already: a straight copy.
+	in.width = 2560;
+	in.height = 720;
+	in.pitches[0] = in.pitches[1] = 2560;
+	in.planes[1] = nv12.data() + (size_t)2560 * 720;
+	auto t0 = std::chrono::steady_clock::now();
+	for (int i = 0; i < 50; i++) {
+		REQUIRE(u_stereo_uvc_split(&in, false, 1280, 720, out.data(), &lay));
+	}
+	double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 50;
+	std::printf("[uvc split perf] 2560x720 (GPU-scaled) -> 2 x 1280x720: %.3f ms/frame\n", ms);
 }
 
 namespace {

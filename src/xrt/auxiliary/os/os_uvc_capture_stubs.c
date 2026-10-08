@@ -19,6 +19,7 @@
 
 #include "os/os_uvc_capture.h"
 
+#include <stdio.h>
 #include <string.h>
 
 bool
@@ -26,4 +27,12 @@ os_uvc_capture_backend(struct u_stereo_uvc_backend *out)
 {
 	memset(out, 0, sizeof(*out));
 	return false;
+}
+
+void
+os_uvc_capture_decoder_report(char *out, size_t cap)
+{
+	if (out != NULL && cap > 0) {
+		snprintf(out, cap, "no UVC capture backend on this platform (Linux V4L2 is a TODO)\n");
+	}
 }

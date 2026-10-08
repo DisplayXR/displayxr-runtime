@@ -31,7 +31,12 @@
  *   camera uvc-devices [--modes]                 ADR-043 Amendment 4, LOCAL: the UVC stereo webcam
  *                                                config (stereo-cameras.json) + the capture devices
  *                                                present, each marked with the entry claiming it;
- *                                                --modes lists the modes of CLAIMED devices only
+ *                                                --modes lists the modes of CLAIMED devices only;
+ *                                                --decoder: the MJPEG decode path (hardware MFT
+ *                                                + adapter, or software) — touches no camera
+ *   camera uvc-decode-bench <file> [--layout sbs-half|sbs-full] [--eye WxH] [--frames N] [--verbose]
+ *                                                a media file (4K MJPEG AVI) through the identical
+ *                                                webcam decode / readback / split path, no camera
  *
  * `list` prints each camera's source: "plugin" (the display plug-in's slots) or
  * "uvc" (the service's own side-by-side webcam source; Amendment 4).
@@ -1360,6 +1365,15 @@ static int
 cmd_uvc_devices(int argc, const char **argv)
 {
 	bool modes = cli_has_flag(argc, argv, "--modes");
+	if (cli_has_flag(argc, argv, "--decoder")) {
+		// The decode path the service's open() would take — touches no camera.
+		static char report[8192];
+		os_uvc_capture_decoder_report(report, sizeof(report));
+		printf("UVC MJPEG decode path:\n%s", report);
+		printf(
+		    "(the service log line \"uvc capture (Media Foundation): started ... decoder ...\" confirms "
+		    "the decoder MF actually inserted, per open)\n\n");
+	}
 	struct u_stereo_uvc_config cfg;
 	char path[1024], err[256] = {0};
 	enum u_stereo_uvc_config_load_result r = u_stereo_uvc_config_load(&cfg, path, sizeof(path), err, sizeof(err));
@@ -1459,6 +1473,124 @@ cmd_uvc_devices(int argc, const char **argv)
 	return 0;
 }
 
+/*!
+ * `camera uvc-decode-bench <file> [--layout sbs-half|sbs-full] [--eye WxH] [--frames N]`:
+ * decode a media FILE (e.g. a 4K MJPEG AVI) through the exact open / read
+ * path the service uses for a UVC webcam (same decoder policy, GPU decode +
+ * scale, staging readback, then the source's split), unpaced, and report the
+ * throughput. No camera, no service. DXR_STEREO_CAMERA_UVC_DECODER applies.
+ */
+static int
+cmd_uvc_decode_bench(int argc, const char **argv)
+{
+	if (argc < 4 || argv[3][0] == '-') {
+		printf(
+		    "usage: displayxr-cli camera uvc-decode-bench <file> [--layout sbs-half|sbs-full] [--eye WxH] "
+		    "[--frames N]\n");
+		return 1;
+	}
+	uint32_t layout = U_STEREO_UVC_LAYOUT_SBS_HALF, want_w = 0, want_h = 0, max_frames = 600;
+	bool verbose = cli_has_flag(argc, argv, "--verbose");
+	for (int i = 4; i < argc; i++) {
+		if (strcmp(argv[i], "--layout") == 0 && i + 1 < argc) {
+			layout = strcmp(argv[++i], "sbs-full") == 0 ? U_STEREO_UVC_LAYOUT_SBS_FULL
+			                                            : U_STEREO_UVC_LAYOUT_SBS_HALF;
+		} else if (strcmp(argv[i], "--eye") == 0 && i + 1 < argc) {
+			if (sscanf(argv[++i], "%ux%u", &want_w, &want_h) != 2) {
+				want_w = want_h = 0;
+			}
+		} else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
+			max_frames = (uint32_t)strtoul(argv[++i], NULL, 10);
+		}
+	}
+	struct u_stereo_uvc_backend b;
+	if (!os_uvc_capture_backend(&b)) {
+		printf("no capture backend on this platform\n");
+		return 2;
+	}
+	char id[1100];
+	snprintf(id, sizeof(id), "file:%s", argv[3]);
+	struct u_stereo_uvc_mode modes[U_STEREO_UVC_MAX_MODES];
+	uint32_t nm = b.list_modes(b.ctx, id, modes, U_STEREO_UVC_MAX_MODES);
+	if (nm == 0) {
+		printf("cannot read \"%s\" (no NV12 / YUY2 / MJPEG video stream)\n", argv[3]);
+		return 2;
+	}
+	uint32_t ew = 0, eh = 0;
+	if (!u_stereo_uvc_eye_size(layout, modes[0].width, modes[0].height, want_w, want_h, &ew, &eh)) {
+		printf("%ux%u cannot be split\n", modes[0].width, modes[0].height);
+		return 2;
+	}
+	struct u_stereo_camera_planes lay;
+	if (!u_stereo_camera_layout(XRT_STEREO_CAMERA_FORMAT_NV12, 2 * ew, eh, &lay)) {
+		return 2;
+	}
+	uint8_t *dst = malloc((size_t)lay.size);
+	void *h = NULL;
+	if (dst == NULL || !b.open(b.ctx, id, &modes[0], 2 * ew, eh, &h)) {
+		printf("open failed (see the WARN lines above)\n");
+		free(dst);
+		return 2;
+	}
+	printf("file %ux%u@%.2f -> %s, %ux%u per eye (SBS %ux%u)\n", modes[0].width, modes[0].height, modes[0].fps,
+	       layout == U_STEREO_UVC_LAYOUT_SBS_FULL ? "sbs-full" : "sbs-half", ew, eh, 2 * ew, eh);
+	uint32_t frames = 0, raw_w = 0, raw_h = 0;
+	int64_t read_ns = 0, split_ns = 0, lat_ns = 0, t_first = 0, t_last = 0;
+	while (frames < max_frames) {
+		struct u_stereo_uvc_raw_frame raw;
+		int64_t t0 = os_monotonic_get_ns();
+		uint32_t r = b.read(h, 2000ll * 1000 * 1000, &raw); // 2 s with no frame = the file ended
+		int64_t t1 = os_monotonic_get_ns();
+		if (r != U_STEREO_UVC_READ_OK) {
+			if (verbose) {
+				printf("  read #%u -> %s after %.2f ms\n", frames,
+				       r == U_STEREO_UVC_READ_TIMEOUT ? "TIMEOUT" : "ERROR", (double)(t1 - t0) * 1e-6);
+			}
+			break; // end of file (or a failure)
+		}
+		bool ok = u_stereo_uvc_split(&raw, false, ew, eh, dst, &lay);
+		int64_t t2 = os_monotonic_get_ns();
+		if (verbose && frames < 8) {
+			printf("  frame %u: read %.2f ms, split %.2f ms, %ux%u\n", frames, (double)(t1 - t0) * 1e-6,
+			       (double)(t2 - t1) * 1e-6, raw.width, raw.height);
+		}
+		if (!ok) {
+			printf("split failed on a %ux%u frame\n", raw.width, raw.height);
+			break;
+		}
+		if (frames == 0) {
+			t_first = t2;
+			raw_w = raw.width;
+			raw_h = raw.height;
+		} else {
+			read_ns += t1 - t0;
+			split_ns += t2 - t1;
+			// Arrival of the decoded sample in the reader callback -> split done.
+			lat_ns += raw.time_ns > 0 && t2 > raw.time_ns ? t2 - raw.time_ns : 0;
+		}
+		t_last = t2;
+		frames++;
+	}
+	b.close(h);
+	free(dst);
+	if (frames < 2) {
+		printf("decoded %u frame(s) — nothing to measure\n", frames);
+		return 3;
+	}
+	double secs = (double)(t_last - t_first) * 1e-9;
+	printf(
+	    "delivered %u frames in %.2f s = %.1f frames/s (read rate; requests paced to the file's frame rate); "
+	    "raw frame %ux%u%s\n",
+	    frames, secs, (frames - 1) / secs, raw_w, raw_h,
+	    raw_w == 2 * ew && raw_h == eh ? " (scaled by the decoder path)" : " (full size: CPU downscale)");
+	printf(
+	    "per frame: read (wait + readback) %.2f ms, split / resample %.2f ms; decoded-sample -> split-done "
+	    "latency %.2f ms\n",
+	    (double)read_ns / (frames - 1) * 1e-6, (double)split_ns / (frames - 1) * 1e-6,
+	    (double)lat_ns / (frames - 1) * 1e-6);
+	return 0;
+}
+
 static void
 usage(void)
 {
@@ -1476,8 +1608,11 @@ usage(void)
 	    "Deny;\n"
 	    "                                    a user-writable <exe> needs --signer, spec 7.1.1)\n"
 	    "       signer <exe>|--self          path class + Authenticode signer (exit 3 = not validly signed)\n"
-	    "       uvc-devices [--modes]        UVC stereo webcam config + capture devices (local; --modes:\n"
-	    "                                    capture modes of the CLAIMED devices only, never started)\n"
+	    "       uvc-devices [--modes] [--decoder]  UVC stereo webcam config + capture devices (local;\n"
+	    "                                    --modes: capture modes of the CLAIMED devices only, never\n"
+	    "                                    started; --decoder: hardware/software MJPEG decode path)\n"
+	    "       uvc-decode-bench <file> [--layout sbs-half|sbs-full] [--eye WxH] [--frames N]\n"
+	    "                                    decode a media file through the webcam path (no camera)\n"
 	    "       status | stop-all | sharing on|off | fake-lock on|off   (over IPC, DIAG)\n"
 	    "exit codes: 4 consent refused, 6 sharing off, 7 busy, 8 ended by the service, 5 rows misaligned\n");
 }
@@ -1501,6 +1636,9 @@ cli_cmd_camera(int argc, const char **argv)
 	}
 	if (strcmp(sub, "uvc-devices") == 0) {
 		return cmd_uvc_devices(argc, argv);
+	}
+	if (strcmp(sub, "uvc-decode-bench") == 0) {
+		return cmd_uvc_decode_bench(argc, argv);
 	}
 	// Control ops: DIAG class over IPC.
 	uint32_t onoff = 0;

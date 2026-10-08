@@ -362,8 +362,20 @@ struct u_stereo_uvc_backend
 	 * to read its media types, but never starts streaming. NULL / 0 = unknown.
 	 */
 	uint32_t (*list_modes)(void *ctx, const char *id, struct u_stereo_uvc_mode *out, uint32_t cap);
-	//! Open + start @p id at @p mode (exact size; fps best effort).
-	bool (*open)(void *ctx, const char *id, const struct u_stereo_uvc_mode *mode, void **out_handle);
+	/*!
+	 * Open + start @p id at @p mode (exact size; fps best effort). @p out_w x
+	 * @p out_h is the frame size the source will resample to (2 x eye width x
+	 * eye height): a backend that can decode + scale on the GPU delivers that
+	 * instead of the full capture size (half-SBS 3840x2160 -> 2560x720). 0 =
+	 * no preference. The source resamples whatever arrives, so honouring it is
+	 * optional.
+	 */
+	bool (*open)(void *ctx,
+	             const char *id,
+	             const struct u_stereo_uvc_mode *mode,
+	             uint32_t out_w,
+	             uint32_t out_h,
+	             void **out_handle);
 	//! Block up to @p timeout_ns for the next decoded frame; valid until the next read / close.
 	uint32_t (*read)(void *handle, int64_t timeout_ns, struct u_stereo_uvc_raw_frame *out);
 	void (*close)(void *handle);
