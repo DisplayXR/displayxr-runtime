@@ -153,6 +153,35 @@ or destroy is one WARN.
 - Capture: with the window split, the post-compose atlas capture also writes each
   segment's DP input as `<stem>.seg<i>.png`.
 
+## Windows / D3D11 (M6)
+
+The in-process D3D11 compositor carries the same model in `d3d11/comp_d3d11_segments.{h,cpp}`,
+a line-for-line twin of the Vulkan manager with the GPU work in D3D11 terms
+(`CopySubresourceRegion` crops, `ClearRenderTargetView`, a renderer rect blit for flat 2D, no
+deferred-release list because the immediate context executes in order). What differs on Windows:
+
+- **Two appended ABI slots, no version bump** (ADR-020): `xrt_plugin_iface::create_dp_d3d11_for_screen`
+  (the D3D11 twin of the Vulkan per-screen factory) and `xrt_display_processor_d3d11::set_present_origin`.
+  A plug-in without them gets flat 2D on its other screens, exactly like Vulkan.
+- **The window.** The session's primary DP keeps the real HWND and so the vendor's drag phase-snap;
+  every other screen's DP is created with a NULL window and phases from `set_present_origin` + the
+  canvas offset. The vendor weaver reads the current D3D11 viewport **and scissor** and writes only
+  inside them, so the segment path sets both to the segment before every `process_atlas`, and the
+  back buffer is re-bound before every DP. (ADR-047's "HWND follows the majority segment" is a
+  follow-up: today the HWND stays with the primary screen's DP.)
+- **Units.** The window rect comes from `ClientToScreen` in a per-monitor-DPI-aware process, i.e.
+  device px — the same space as the registry's monitor rects. A DPI-virtualised origin would weave on
+  the wrong lattice and look plausible (`docs/reference/dpi-awareness.md`).
+- **The untracked screen.** The SR tracker follows the runtime's active display only, so a weaver
+  bound to any other display sees no face and would fall back to 2D. The Leia plug-in pins that
+  weaver to its nominal viewer and leaves the lens to the active panel (David, 2026-10-07; SR D3/D4
+  move both per device later). The runtime does nothing special: the DP owns it.
+- **Not segmented on Windows:** zero-copy frames, the #918 output-adapter split, a zones / Local2D
+  frame (any non-whole-window canvas), the shared-texture path, a pinned session, `DXR_SEGMENTS=0`.
+  The service / hosted path is not segmented yet (ADR-035 amendment, M6 second half).
+- **sim_display** implements both slots on D3D11 too, so a two-monitor Windows box with no vendor
+  hardware exercises the split path (anaglyph on both halves).
+
 ## Per-segment views (M3)
 
 Under `PRIMARY_MULTIVIEW_DXR` each segment gets its **own** views instead of a crop of
