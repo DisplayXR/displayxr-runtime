@@ -68,6 +68,10 @@ sim_fake_lift_convert(struct sim_fake_lift *fl,
                       uint32_t *out_h,
                       uint32_t *out_format);
 
+//! XR_DXR_lift v3: the synthetic metric depth of the last convert (aux depth).
+bool
+sim_fake_lift_get_depth(struct sim_fake_lift *fl, uint64_t id, void *d3d11_context, struct xrt_dp_lift_depth *out);
+
 bool
 sim_fake_lift_convert_blob(struct sim_fake_lift *fl,
                            uint64_t id,

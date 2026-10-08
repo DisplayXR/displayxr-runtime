@@ -957,6 +957,15 @@ sim_dp_d3d11_lift_convert_blob(struct xrt_display_processor_d3d11 *xdp,
 	                                  out_format, out_bytes, out_size);
 }
 
+static bool
+sim_dp_d3d11_lift_get_depth(struct xrt_display_processor_d3d11 *xdp,
+                            uint64_t id,
+                            void *d3d11_context,
+                            struct xrt_dp_lift_depth *out)
+{
+	return sim_fake_lift_get_depth(sim_dp_d3d11(xdp)->fake_lift, id, d3d11_context, out);
+}
+
 static xrt_result_t
 sim_display_processor_d3d11_create_bound(enum sim_display_output_mode mode,
                                          void *d3d11_device,
@@ -1094,6 +1103,7 @@ sim_display_processor_d3d11_create_bound(enum sim_display_output_mode mode,
 			sdp->base.lift_stream_destroy = sim_dp_d3d11_lift_stream_destroy;
 			sdp->base.lift_convert = sim_dp_d3d11_lift_convert;
 			sdp->base.lift_convert_blob = sim_dp_d3d11_lift_convert_blob;
+			sdp->base.lift_get_depth = sim_dp_d3d11_lift_get_depth;
 		}
 	}
 

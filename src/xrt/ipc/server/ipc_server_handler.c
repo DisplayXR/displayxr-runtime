@@ -8352,6 +8352,8 @@ ipc_handle_lift_get_properties(volatile struct ipc_client_state *ics, struct ipc
 		out_props->typical_latency_ns = caps.typical_latency_ns;
 		memcpy(out_props->backend, caps.backend, sizeof(out_props->backend));
 		out_props->backend[sizeof(out_props->backend) - 1] = '\0';
+		out_props->aux_outputs = caps.aux_outputs;
+		out_props->aux_depth_semantics = caps.aux_depth_semantics;
 	}
 #endif
 	// Anything else: modes 0, UNAVAILABLE — a successful answer, not an error.
@@ -8363,6 +8365,8 @@ ipc_handle_lift_stream_create(volatile struct ipc_client_state *ics,
                               uint32_t mode,
                               uint32_t content_hint,
                               float input_scale,
+                              uint32_t aux_outputs,
+                              uint32_t aux_depth_format,
                               uint64_t *out_stream_id)
 {
 	IPC_TRACE_MARKER();
@@ -8379,12 +8383,16 @@ ipc_handle_lift_stream_create(volatile struct ipc_client_state *ics,
 		info.mode = mode;
 		info.content_hint = content_hint;
 		info.input_scale = input_scale;
+		info.aux_outputs = aux_outputs;
+		info.aux_depth_format = aux_depth_format;
 		return comp_d3d11_service_lift_stream_create(xsysc, lift_owner(ics), &info, out_stream_id);
 	}
 #else
 	(void)mode;
 	(void)content_hint;
 	(void)input_scale;
+	(void)aux_outputs;
+	(void)aux_depth_format;
 #endif
 	return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 }
@@ -8446,13 +8454,15 @@ ipc_handle_lift_submit_frame(volatile struct ipc_client_state *ics,
 	uint32_t vp_count = args->params.viewpoint_count > IPC_LIFT_MAX_VIEWS ? IPC_LIFT_MAX_VIEWS
 	                                                                     : args->params.viewpoint_count;
 	const bool has_vc = args->has_params && args->params.has_view_control != 0;
+	const bool has_rig = args->has_params && args->params.rig.type != XRT_LIFT_RIG_NONE;
 	// The handle is the service's from here (closed or cached inside). The
 	// session's compositor (NULL on a headless connection) names the window the
 	// viewpoints are rebased to (ADR-048).
 	return comp_d3d11_service_lift_submit(
 	    xsysc, ics->xc, lift_owner(ics), args->stream_id, in_handle, in_is_dxgi, args->width, args->height,
 	    args->source_time, args->has_params ? &params : NULL, args->params.viewpoints,
-	    args->has_params ? 3 * vp_count : 0, has_vc ? &args->params.view_control : NULL, out_frame_id);
+	    args->has_params ? 3 * vp_count : 0, has_vc ? &args->params.view_control : NULL,
+	    has_rig ? &args->params.rig : NULL, out_frame_id);
 #else
 	(void)args;
 	weave_submit_release_handles(handles, handle_count);
@@ -8493,6 +8503,7 @@ ipc_handle_lift_acquire_result(volatile struct ipc_client_state *ics,
 	memcpy(out_lift_result->viewpoints, r.viewpoints, sizeof(out_lift_result->viewpoints));
 	memcpy(out_lift_result->rect_center, r.rect_center, sizeof(out_lift_result->rect_center));
 	memcpy(out_lift_result->rect_size, r.rect_size, sizeof(out_lift_result->rect_size));
+	out_lift_result->depth = r.depth;
 	return xret;
 #else
 	(void)stream_id;
@@ -8533,6 +8544,47 @@ ipc_handle_lift_get_output(volatile struct ipc_client_state *ics,
 		out_handles[0] = h;
 		*out_handle_count = 1;
 		*out_have_output = true;
+	}
+#else
+	(void)stream_id;
+	(void)out_handles;
+#endif
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_handle_lift_get_depth_output(volatile struct ipc_client_state *ics,
+                                 uint64_t stream_id,
+                                 bool *out_have_depth,
+                                 uint32_t *out_width,
+                                 uint32_t *out_height,
+                                 uint32_t *out_format,
+                                 uint32_t max_handle_count,
+                                 xrt_graphics_buffer_handle_t *out_handles,
+                                 uint32_t *out_handle_count)
+{
+	IPC_TRACE_MARKER();
+	*out_have_depth = false;
+	*out_width = 0;
+	*out_height = 0;
+	*out_format = 0;
+	*out_handle_count = 0;
+	xrt_result_t auth = require_lift_client(ics, "lift_get_depth_output");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (max_handle_count < 1) {
+		return XRT_SUCCESS;
+	}
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	struct xrt_system_compositor *xsysc = lift_xsysc(ics);
+	xrt_graphics_buffer_handle_t h = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+	if (xsysc != NULL && comp_d3d11_service_lift_export_depth(xsysc, lift_owner(ics), stream_id, &h, out_width,
+	                                                          out_height, out_format)) {
+		// Service-owned: the transport DuplicateHandle's it into the caller.
+		out_handles[0] = h;
+		*out_handle_count = 1;
+		*out_have_depth = true;
 	}
 #else
 	(void)stream_id;
@@ -8633,6 +8685,37 @@ ipc_handle_lift_acquire_blob(volatile struct ipc_client_state *ics, uint64_t str
 	return xret;
 }
 
+// XR_DXR_lift v3 grew the lift messages (rig per rect; explicit viewpoints
+// ride their own call precisely so these stay inside one pipe message).
+static_assert(sizeof(struct ipc_lift_weave_rects_msg) <= IPC_BUF_SIZE, "lift_weave_rects message exceeds IPC_BUF_SIZE");
+static_assert(sizeof(struct ipc_lift_weave_rect_viewpoints_msg) <= IPC_BUF_SIZE,
+              "lift_weave_rect_viewpoints message exceeds IPC_BUF_SIZE");
+static_assert(sizeof(struct ipc_lift_submit_frame_msg) <= IPC_BUF_SIZE,
+              "lift_submit_frame message exceeds IPC_BUF_SIZE");
+
+xrt_result_t
+ipc_handle_lift_weave_rect_viewpoints(volatile struct ipc_client_state *ics,
+                                      const struct ipc_arg_lift_rect_viewpoints *args)
+{
+	IPC_TRACE_MARKER();
+	xrt_result_t auth = require_present_owner(ics, "lift_weave_rect_viewpoints");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (args->viewpoint_count == 0 || args->viewpoint_count > IPC_LIFT_MAX_VIEWS) {
+		return XRT_ERROR_IPC_FAILURE; // untrusted wire
+	}
+	if (ics->lift_staged_vps_count >= IPC_LIFT_WEAVE_RECTS_MAX) {
+		return XRT_ERROR_WEAVE_REFUSED; // more than one weave submit's worth: drop
+	}
+	// Staged until the next lift_weave_rects on this connection (which clears it).
+	struct ipc_arg_lift_rect_viewpoints *slot =
+	    (struct ipc_arg_lift_rect_viewpoints *)&ics->lift_staged_vps[ics->lift_staged_vps_count];
+	*slot = *args;
+	ics->lift_staged_vps_count++;
+	return XRT_SUCCESS;
+}
+
 xrt_result_t
 ipc_handle_lift_weave_rects(volatile struct ipc_client_state *ics, const struct ipc_arg_lift_weave_rects *args)
 {
@@ -8663,7 +8746,24 @@ ipc_handle_lift_weave_rects(volatile struct ipc_client_state *ics, const struct 
 		rects[i].params.focal_px = w->focal_px;
 		rects[i].has_view_control = w->has_view_control != 0;
 		rects[i].view_control = w->view_control;
+		rects[i].rig = w->rig;
+		// XR_DXR_lift v3: this rect's EXPLICIT viewpoints, staged by
+		// lift_weave_rect_viewpoints just before (none staged = tracked).
+		if (w->viewpoint_count > 0) {
+			for (uint32_t k = 0; k < ics->lift_staged_vps_count; k++) {
+				const struct ipc_arg_lift_rect_viewpoints *sv =
+				    (const struct ipc_arg_lift_rect_viewpoints *)&ics->lift_staged_vps[k];
+				if (sv->stream_id == w->stream_id) {
+					uint32_t n = sv->viewpoint_count > XRT_LIFT_MAX_VIEWS ? XRT_LIFT_MAX_VIEWS
+					                                                      : sv->viewpoint_count;
+					rects[i].viewpoint_floats = 3 * n;
+					memcpy(rects[i].viewpoints, sv->viewpoints, (size_t)n * 3 * sizeof(float));
+					break;
+				}
+			}
+		}
 	}
+	ics->lift_staged_vps_count = 0;
 	if (!comp_d3d11_service_lift_set_weave_rects(ics->xc, lift_owner(ics), args->count, rects)) {
 		// A rect naming a stream this connection does not own (or a non-SBS/NVIEW
 		// one): refused, non-fatal. The submit then weaves those rects as drawn.

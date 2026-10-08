@@ -26,8 +26,12 @@ add_library(
 	u_bitwise.c
 	u_cursor_depth.c
 	u_cursor_depth.h
+	u_lift_depth.c
+	u_lift_depth.h
 	u_lift_mailbox.c
 	u_lift_mailbox.h
+	u_lift_rig.c
+	u_lift_rig.h
 	u_lift_viewpoint.c
 	u_lift_viewpoint.h
 	u_snap_grid.c
@@ -201,6 +205,11 @@ endif()
 # Make the displayxr_mcp framework available to every aux_util consumer
 # (compositors use mcp_capture, oxr uses mcp_server / mcp_log_ring).
 target_link_libraries(aux_util PUBLIC displayxr_mcp::mcp)
+
+# XR_DXR_lift app rig (u_lift_rig.c, ADR-048 Addendum A) runs the shared
+# displayxr-common rig core - the same functions xrLocateViews runs (aux_math
+# FetchContents displayxr-common before this directory).
+target_link_libraries(aux_util PRIVATE displayxr::math_core)
 
 # CoreFoundation needed for CFRetain/CFRelease in u_handles.c (Metal handle ref counting).
 if(APPLE)

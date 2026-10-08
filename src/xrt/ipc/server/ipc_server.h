@@ -221,6 +221,14 @@ struct ipc_client_state
 	uint64_t lift_owner;
 
 	/*!
+	 * XR_DXR_lift v3: EXPLICIT viewpoints of lifted weave rects, staged by
+	 * lift_weave_rect_viewpoints and consumed (cleared) by the next
+	 * lift_weave_rects on this connection — they do not fit that message.
+	 */
+	struct ipc_arg_lift_rect_viewpoints lift_staged_vps[IPC_LIFT_WEAVE_RECTS_MAX];
+	uint32_t lift_staged_vps_count;
+
+	/*!
 	 * XR_DXR_stereo_camera (ADR-043): this connection's stream-owner token,
 	 * taken from the camera manager on first stream create (0 = never used a
 	 * camera). A token, not the ics pointer: the thread slot is reused by later

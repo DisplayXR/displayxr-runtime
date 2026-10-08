@@ -843,7 +843,9 @@
 		"in": [
 			{"name": "mode", "type": "uint32_t"},
 			{"name": "content_hint", "type": "uint32_t"},
-			{"name": "input_scale", "type": "float"}
+			{"name": "input_scale", "type": "float"},
+			{"name": "aux_outputs", "type": "uint32_t"},
+			{"name": "aux_depth_format", "type": "uint32_t"}
 		],
 		"out": [
 			{"name": "stream_id", "type": "uint64_t"}
@@ -889,6 +891,19 @@
 		"out_handles": {"type": "xrt_graphics_buffer_handle_t"}
 	},
 
+	"lift_get_depth_output": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"}
+		],
+		"out": [
+			{"name": "have_depth", "type": "bool"},
+			{"name": "width", "type": "uint32_t"},
+			{"name": "height", "type": "uint32_t"},
+			{"name": "format", "type": "uint32_t"}
+		],
+		"out_handles": {"type": "xrt_graphics_buffer_handle_t"}
+	},
+
 	"lift_get_fence": {
 		"in": [
 			{"name": "stream_id", "type": "uint64_t"}
@@ -927,6 +942,12 @@
 		],
 		"out": [
 			{"name": "stats", "type": "struct xrt_lift_stream_stats"}
+		]
+	},
+
+	"lift_weave_rect_viewpoints": {
+		"in": [
+			{"name": "args", "type": "struct ipc_arg_lift_rect_viewpoints"}
 		]
 	},
 
