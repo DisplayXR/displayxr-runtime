@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  XR_DXR_weave on the macOS service path (#759) — the macOS analogue of
- *         the D3D11 service weave (#625).
+ * @brief  XR_DXR_weave on the macOS service path (#759) — the platform front
+ *         end over the vk / metal backends.
  * @author David Fattal
  * @ingroup comp_multi
  *
@@ -18,72 +18,66 @@
  *
  *  - Input texture   = a caller-allocated IOSurface. It crosses the IPC as a
  *    global IOSurfaceID (ipc_message_channel_unix.c) and arrives here as a
- *    retained IOSurfaceRef, imported into a VkImage via VK_EXT_metal_objects +
- *    VK_EXT_external_memory_metal (same pattern as
- *    comp_vk_native_compositor.c import_shared_iosurface).
- *  - Output texture  = a service-allocated IOSurface-backed VkImage (the
- *    VkExportMetalObjectCreateInfoEXT allocation pattern from
- *    vk_image_allocator.c), exported back to the caller as an IOSurfaceRef.
+ *    retained IOSurfaceRef. This file owns that ref (an identity cache keyed by
+ *    IOSurfaceID); the backend wraps it as its own texture.
+ *  - Output texture  = a service-allocated IOSurface, exported back to the
+ *    caller as an IOSurfaceRef.
  *  - Input-ready sync: there is no keyed mutex on macOS. The contract is that
  *    the caller completes its GPU writes into the input IOSurface before
- *    calling xrWeaveSubmitDXR (mirrors the existing macOS IPC submit_fallback
- *    model, comp_vk_client.c).
- *  - Completion sync: SYNCHRONOUS — the service vkWaitForFences before the IPC
- *    reply returns, so xrWeaveSubmitDXR returning IS the completion signal.
- *    weave_get_fence reports no fence; XrWeaveOutputDXR::fence stays NULL and
- *    fenceValue is a plain monotonic counter.
- *  - Output sizing: batch (v3) submits size the output from the INPUT IOSurface
- *    dims — the v3 contract makes the input window-client-sized, so no window
- *    geometry query is needed. Legacy single-rect submits size it from
- *    rect offset+extent (the Windows fallback rule).
- *  - Window bind: stored for future phase use only. sim_display has no
- *    snap_window_rect (anaglyph has no interlace lattice), so
- *    xrWeaveSnapWindowRectDXR is the well-defined identity snap.
+ *    calling xrWeaveSubmitDXR.
+ *  - Completion sync: SYNCHRONOUS — the backend waits for the GPU before the
+ *    IPC reply returns, so xrWeaveSubmitDXR returning IS the completion signal.
+ *  - Output sizing: batch (v3) = the INPUT IOSurface dims (the v3 contract
+ *    makes the input window-client-sized); legacy single rect = rect
+ *    offset+extent; v6 = one content view, or the window when the DP does not
+ *    tolerate a resample of its output (a lenticular lattice must reach the
+ *    panel 1:1).
+ *  - Window geometry (spec v7): `windowOriginOnScreen` is global CoreGraphics
+ *    space in BACKING pixels (y down). The engine resolves the panel
+ *    (displayId = CGDirectDisplayID, else the display containing the origin,
+ *    else the main display) and feeds the DP `origin - panel origin` as its
+ *    present origin before every weave (Metal backend).
  *
- * The weave itself is ONE xrt_display_processor process_atlas per submit over a
- * window-sized 2x1 SBS scratch atlas that all rects are blitted into — the same
- * one-weave-per-frame batch strategy as Windows (per-rect weave() calls degrade
- * a vendor weaver's predictor; see comp_d3d11_service.cpp). The DP instance is
- * created from the plug-in's Vulkan factory (dp_factory_vk), i.e. exactly the
- * DP family the macOS shared-surface path already drives — sim_display's
- * anaglyph SPIR-V pipeline runs on MoltenVK today.
+ * The GPU work lives behind comp_multi_weave_macos_backend.h:
+ *  - vk    — MoltenVK + the plug-in's Vulkan DP (sim_display's shipping path,
+ *            unchanged from the single-file engine);
+ *  - metal — native Metal + the plug-in's Metal DP (the only family the Leia
+ *            macOS plug-in exports).
+ * DXR_WEAVE_MAC_BACKEND=auto|metal|vk picks it once per client (auto: metal
+ * iff the plug-in has no Vulkan DP factory but has a Metal one).
  */
 
 #include "xrt/xrt_compositor.h"
 #include "xrt/xrt_display_processor.h"
 #include "xrt/xrt_display_metrics.h"
 #include "xrt/xrt_handles.h"
+#include "xrt/xrt_session.h"
 
+#include "os/os_time.h"
+#include "util/u_debug.h"
 #include "util/u_misc.h"
 #include "util/u_logging.h"
 
-#include "vk/vk_helpers.h"
-
 #include "comp_multi_private.h"
+#include "comp_multi_weave_macos_backend.h"
 
 #ifdef XRT_OS_MACOS
 
 #include <IOSurface/IOSurface.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <CoreGraphics/CoreGraphics.h>
+
+#include <math.h>
+#include <string.h>
+
+DEBUG_GET_ONCE_OPTION(weave_mac_backend, "DXR_WEAVE_MAC_BACKEND", "auto")
+
 
 /*
  *
  * Helpers.
  *
  */
-
-//! Everything is BGRA8 end-to-end: IOSurfaces are canonically BGRA on macOS and
-//! the DP factory gets the same format so its pipelines/render-pass match.
-#define WEAVE_VK_FORMAT VK_FORMAT_B8G8R8A8_UNORM
-
-static struct vk_bundle *
-weave_get_vk(struct multi_compositor *mc)
-{
-	if (mc == NULL || mc->msc == NULL || mc->msc->target_service == NULL) {
-		return NULL;
-	}
-	return comp_target_service_get_vk(mc->msc->target_service);
-}
 
 //! Lazily create the per-client engine lock (multi_compositor is zero-alloced).
 static void
@@ -98,874 +92,212 @@ weave_ensure_mutex(struct multi_compositor *mc)
 }
 
 /*!
- * Import a caller IOSurface as a VkImage usable as a blit source. Same
- * VK_EXT_metal_objects + VK_EXT_external_memory_metal dance as
- * comp_vk_native_compositor.c::import_shared_iosurface.
+ * Pick the backend once per client. auto: metal iff the plug-in exports no
+ * Vulkan DP factory but a Metal one (Leia), else vk — so sim_display (which
+ * exports both) keeps the shipping Vulkan path byte for byte.
  */
-static bool
-weave_import_input(struct vk_bundle *vk, struct multi_compositor *mc, IOSurfaceRef surface)
+static const struct comp_multi_weave_macos_backend *
+weave_pick_backend(struct multi_compositor *mc)
 {
-#if defined(VK_EXT_metal_objects) && defined(VK_EXT_external_memory_metal)
-	if (!vk->has_EXT_metal_objects || !vk->has_EXT_external_memory_metal) {
-		U_LOG_E("weave(#759): VK_EXT_metal_objects / VK_EXT_external_memory_metal unavailable");
-		return false;
-	}
+	const struct xrt_system_compositor_info *info = &mc->msc->base.info;
+	const bool have_vk = info->dp_factory_vk != NULL;
+	const bool have_metal = info->dp_factory_metal != NULL;
+	const char *opt = debug_get_option_weave_mac_backend();
+	const struct comp_multi_weave_macos_backend *b = &comp_multi_weave_macos_backend_vk;
+	const char *why = "auto";
 
-	uint32_t width = (uint32_t)IOSurfaceGetWidth(surface);
-	uint32_t height = (uint32_t)IOSurfaceGetHeight(surface);
-	if (width == 0 || height == 0) {
-		U_LOG_E("weave(#759): input IOSurface has zero dimensions");
-		return false;
-	}
-
-	VkExportMetalObjectCreateInfoEXT export_metal_tex_info = {
-	    .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT,
-	    .exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_TEXTURE_BIT_EXT,
-	};
-	VkImportMetalIOSurfaceInfoEXT import_iosurface_info = {
-	    .sType = VK_STRUCTURE_TYPE_IMPORT_METAL_IO_SURFACE_INFO_EXT,
-	    .pNext = &export_metal_tex_info,
-	    .ioSurface = surface,
-	};
-	VkImageCreateInfo image_ci = {
-	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-	    .pNext = &import_iosurface_info,
-	    .imageType = VK_IMAGE_TYPE_2D,
-	    .format = WEAVE_VK_FORMAT,
-	    .extent = {width, height, 1},
-	    .mipLevels = 1,
-	    .arrayLayers = 1,
-	    .samples = VK_SAMPLE_COUNT_1_BIT,
-	    .tiling = VK_IMAGE_TILING_OPTIMAL,
-	    .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-	    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-	};
-
-	VkImage image = VK_NULL_HANDLE;
-	VkResult ret = vk->vkCreateImage(vk->device, &image_ci, NULL, &image);
-	if (ret != VK_SUCCESS) {
-		U_LOG_E("weave(#759): vkCreateImage(input IOSurface) failed: %d", ret);
-		return false;
-	}
-
-	// Export the MTLTexture MoltenVK created over the IOSurface — its handle
-	// is what the memory import below is keyed on.
-	VkExportMetalTextureInfoEXT export_tex_info = {
-	    .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT,
-	    .image = image,
-	    .plane = VK_IMAGE_ASPECT_COLOR_BIT,
-	};
-	VkExportMetalObjectsInfoEXT export_objects_info = {
-	    .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT,
-	    .pNext = &export_tex_info,
-	};
-	vk->vkExportMetalObjectsEXT(vk->device, &export_objects_info);
-	if (export_tex_info.mtlTexture == NULL) {
-		U_LOG_E("weave(#759): failed to export MTLTexture from input VkImage");
-		vk->vkDestroyImage(vk->device, image, NULL);
-		return false;
-	}
-
-	VkMemoryRequirements requirements = {0};
-	vk->vkGetImageMemoryRequirements(vk->device, image, &requirements);
-
-	VkMemoryMetalHandlePropertiesEXT metal_props = {
-	    .sType = VK_STRUCTURE_TYPE_MEMORY_METAL_HANDLE_PROPERTIES_EXT,
-	};
-	ret = vk->vkGetMemoryMetalHandlePropertiesEXT(vk->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT,
-	                                              export_tex_info.mtlTexture, &metal_props);
-	if (ret != VK_SUCCESS) {
-		U_LOG_E("weave(#759): vkGetMemoryMetalHandlePropertiesEXT failed: %d", ret);
-		vk->vkDestroyImage(vk->device, image, NULL);
-		return false;
-	}
-	requirements.memoryTypeBits = metal_props.memoryTypeBits;
-
-	VkImportMemoryMetalHandleInfoEXT import_memory_info = {
-	    .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_METAL_HANDLE_INFO_EXT,
-	    .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT,
-	    .handle = export_tex_info.mtlTexture,
-	};
-	VkMemoryDedicatedAllocateInfoKHR dedicated_info = {
-	    .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO_KHR,
-	    .pNext = &import_memory_info,
-	    .image = image,
-	};
-
-	uint32_t memory_type_index = UINT32_MAX;
-	VkPhysicalDeviceMemoryProperties mem_props;
-	vk->vkGetPhysicalDeviceMemoryProperties(vk->physical_device, &mem_props);
-	for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
-		if ((requirements.memoryTypeBits & (1u << i)) != 0) {
-			memory_type_index = i;
-			break;
-		}
-	}
-	if (memory_type_index == UINT32_MAX) {
-		U_LOG_E("weave(#759): no valid memory type for input IOSurface");
-		vk->vkDestroyImage(vk->device, image, NULL);
-		return false;
-	}
-
-	VkMemoryAllocateInfo alloc_info = {
-	    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-	    .pNext = &dedicated_info,
-	    .allocationSize = requirements.size,
-	    .memoryTypeIndex = memory_type_index,
-	};
-	VkDeviceMemory memory = VK_NULL_HANDLE;
-	ret = vk->vkAllocateMemory(vk->device, &alloc_info, NULL, &memory);
-	if (ret != VK_SUCCESS) {
-		U_LOG_E("weave(#759): vkAllocateMemory(input IOSurface) failed: %d", ret);
-		vk->vkDestroyImage(vk->device, image, NULL);
-		return false;
-	}
-	ret = vk->vkBindImageMemory(vk->device, image, memory, 0);
-	if (ret != VK_SUCCESS) {
-		U_LOG_E("weave(#759): vkBindImageMemory(input IOSurface) failed: %d", ret);
-		vk->vkFreeMemory(vk->device, memory, NULL);
-		vk->vkDestroyImage(vk->device, image, NULL);
-		return false;
-	}
-
-	// Full-image view: the SBS path only blits the input (TRANSFER_SRC) so it
-	// never needed one, but the v6 zero-copy path (#774) samples the input
-	// atlas directly through the DP, which takes an atlas VkImageView.
-	VkImageView view = VK_NULL_HANDLE;
-	{
-		VkImageViewCreateInfo view_ci = {
-		    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-		    .image = image,
-		    .viewType = VK_IMAGE_VIEW_TYPE_2D,
-		    .format = WEAVE_VK_FORMAT,
-		    .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1},
-		};
-		ret = vk->vkCreateImageView(vk->device, &view_ci, NULL, &view);
-		if (ret != VK_SUCCESS) {
-			U_LOG_E("weave(#759): vkCreateImageView(input) failed: %d", ret);
-			vk->vkFreeMemory(vk->device, memory, NULL);
-			vk->vkDestroyImage(vk->device, image, NULL);
-			return false;
-		}
-	}
-
-	mc->weave.in_image = image;
-	mc->weave.in_memory = memory;
-	mc->weave.in_view = view;
-	mc->weave.in_w = width;
-	mc->weave.in_h = height;
-	mc->weave.in_first_use = true;
-	return true;
+	if (opt != NULL && strcmp(opt, "vk") == 0) {
+		why = "DXR_WEAVE_MAC_BACKEND=vk";
+	} else if (opt != NULL && strcmp(opt, "metal") == 0) {
+#ifdef COMP_MULTI_WEAVE_HAVE_METAL
+		b = &comp_multi_weave_macos_backend_metal;
+		why = "DXR_WEAVE_MAC_BACKEND=metal";
 #else
-	(void)vk;
-	(void)mc;
-	(void)surface;
-	return false;
+		why = "DXR_WEAVE_MAC_BACKEND=metal, but this build has no Metal backend";
 #endif
-}
-
-static void
-weave_release_input(struct vk_bundle *vk, struct multi_compositor *mc)
-{
-	if (mc->weave.in_view != VK_NULL_HANDLE) {
-		vk->vkDestroyImageView(vk->device, mc->weave.in_view, NULL);
-		mc->weave.in_view = VK_NULL_HANDLE;
-	}
-	if (mc->weave.in_image != VK_NULL_HANDLE) {
-		vk->vkDestroyImage(vk->device, mc->weave.in_image, NULL);
-		mc->weave.in_image = VK_NULL_HANDLE;
-	}
-	if (mc->weave.in_memory != VK_NULL_HANDLE) {
-		vk->vkFreeMemory(vk->device, mc->weave.in_memory, NULL);
-		mc->weave.in_memory = VK_NULL_HANDLE;
-	}
-	if (mc->weave.in_iosurface != NULL) {
-		CFRelease((IOSurfaceRef)mc->weave.in_iosurface);
-		mc->weave.in_iosurface = NULL;
-	}
-	mc->weave.in_iosurface_id = 0;
-	mc->weave.in_w = 0;
-	mc->weave.in_h = 0;
-}
-
-/*!
- * Import a caller IOSurface as a sampler-source VkImage (+ view) for the v4
- * overlay atlas — the same VK_EXT_metal_objects dance as weave_import_input but
- * into the SEPARATE overlay cache (so it never clobbers the SBS input) and with
- * a view the premul-over blend samples. The atlas is premultiplied BGRA8.
- */
-static bool
-weave_import_overlay(struct vk_bundle *vk, struct multi_compositor *mc, IOSurfaceRef surface)
-{
-#if defined(VK_EXT_metal_objects) && defined(VK_EXT_external_memory_metal)
-	if (!vk->has_EXT_metal_objects || !vk->has_EXT_external_memory_metal) {
-		U_LOG_E("weave(#759) v4: VK_EXT_metal_objects / VK_EXT_external_memory_metal unavailable");
-		return false;
-	}
-
-	uint32_t width = (uint32_t)IOSurfaceGetWidth(surface);
-	uint32_t height = (uint32_t)IOSurfaceGetHeight(surface);
-	if (width == 0 || height == 0) {
-		U_LOG_E("weave(#759) v4: overlay IOSurface has zero dimensions");
-		return false;
-	}
-
-	VkExportMetalObjectCreateInfoEXT export_metal_tex_info = {
-	    .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT,
-	    .exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_TEXTURE_BIT_EXT,
-	};
-	VkImportMetalIOSurfaceInfoEXT import_iosurface_info = {
-	    .sType = VK_STRUCTURE_TYPE_IMPORT_METAL_IO_SURFACE_INFO_EXT,
-	    .pNext = &export_metal_tex_info,
-	    .ioSurface = surface,
-	};
-	VkImageCreateInfo image_ci = {
-	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-	    .pNext = &import_iosurface_info,
-	    .imageType = VK_IMAGE_TYPE_2D,
-	    .format = WEAVE_VK_FORMAT,
-	    .extent = {width, height, 1},
-	    .mipLevels = 1,
-	    .arrayLayers = 1,
-	    .samples = VK_SAMPLE_COUNT_1_BIT,
-	    .tiling = VK_IMAGE_TILING_OPTIMAL,
-	    .usage = VK_IMAGE_USAGE_SAMPLED_BIT,
-	    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-	};
-
-	VkImage image = VK_NULL_HANDLE;
-	VkResult ret = vk->vkCreateImage(vk->device, &image_ci, NULL, &image);
-	if (ret != VK_SUCCESS) {
-		U_LOG_E("weave(#759) v4: vkCreateImage(overlay IOSurface) failed: %d", ret);
-		return false;
-	}
-
-	VkExportMetalTextureInfoEXT export_tex_info = {
-	    .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT,
-	    .image = image,
-	    .plane = VK_IMAGE_ASPECT_COLOR_BIT,
-	};
-	VkExportMetalObjectsInfoEXT export_objects_info = {
-	    .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT,
-	    .pNext = &export_tex_info,
-	};
-	vk->vkExportMetalObjectsEXT(vk->device, &export_objects_info);
-	if (export_tex_info.mtlTexture == NULL) {
-		U_LOG_E("weave(#759) v4: failed to export MTLTexture from overlay VkImage");
-		vk->vkDestroyImage(vk->device, image, NULL);
-		return false;
-	}
-
-	VkMemoryRequirements requirements = {0};
-	vk->vkGetImageMemoryRequirements(vk->device, image, &requirements);
-
-	VkMemoryMetalHandlePropertiesEXT metal_props = {
-	    .sType = VK_STRUCTURE_TYPE_MEMORY_METAL_HANDLE_PROPERTIES_EXT,
-	};
-	ret = vk->vkGetMemoryMetalHandlePropertiesEXT(vk->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT,
-	                                              export_tex_info.mtlTexture, &metal_props);
-	if (ret != VK_SUCCESS) {
-		U_LOG_E("weave(#759) v4: vkGetMemoryMetalHandlePropertiesEXT failed: %d", ret);
-		vk->vkDestroyImage(vk->device, image, NULL);
-		return false;
-	}
-	requirements.memoryTypeBits = metal_props.memoryTypeBits;
-
-	VkImportMemoryMetalHandleInfoEXT import_memory_info = {
-	    .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_METAL_HANDLE_INFO_EXT,
-	    .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT,
-	    .handle = export_tex_info.mtlTexture,
-	};
-	VkMemoryDedicatedAllocateInfoKHR dedicated_info = {
-	    .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO_KHR,
-	    .pNext = &import_memory_info,
-	    .image = image,
-	};
-
-	uint32_t memory_type_index = UINT32_MAX;
-	VkPhysicalDeviceMemoryProperties mem_props;
-	vk->vkGetPhysicalDeviceMemoryProperties(vk->physical_device, &mem_props);
-	for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
-		if ((requirements.memoryTypeBits & (1u << i)) != 0) {
-			memory_type_index = i;
-			break;
+	} else {
+		if (opt != NULL && strcmp(opt, "auto") != 0) {
+			U_LOG_W("weave(#759): DXR_WEAVE_MAC_BACKEND='%s' is not auto|metal|vk — using auto", opt);
 		}
-	}
-	if (memory_type_index == UINT32_MAX) {
-		U_LOG_E("weave(#759) v4: no valid memory type for overlay IOSurface");
-		vk->vkDestroyImage(vk->device, image, NULL);
-		return false;
-	}
-
-	VkMemoryAllocateInfo alloc_info = {
-	    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-	    .pNext = &dedicated_info,
-	    .allocationSize = requirements.size,
-	    .memoryTypeIndex = memory_type_index,
-	};
-	VkDeviceMemory memory = VK_NULL_HANDLE;
-	ret = vk->vkAllocateMemory(vk->device, &alloc_info, NULL, &memory);
-	if (ret != VK_SUCCESS) {
-		U_LOG_E("weave(#759) v4: vkAllocateMemory(overlay IOSurface) failed: %d", ret);
-		vk->vkDestroyImage(vk->device, image, NULL);
-		return false;
-	}
-	ret = vk->vkBindImageMemory(vk->device, image, memory, 0);
-	if (ret != VK_SUCCESS) {
-		U_LOG_E("weave(#759) v4: vkBindImageMemory(overlay IOSurface) failed: %d", ret);
-		vk->vkFreeMemory(vk->device, memory, NULL);
-		vk->vkDestroyImage(vk->device, image, NULL);
-		return false;
-	}
-
-	VkImageViewCreateInfo view_ci = {
-	    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-	    .image = image,
-	    .viewType = VK_IMAGE_VIEW_TYPE_2D,
-	    .format = WEAVE_VK_FORMAT,
-	    .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1},
-	};
-	VkImageView view = VK_NULL_HANDLE;
-	ret = vk->vkCreateImageView(vk->device, &view_ci, NULL, &view);
-	if (ret != VK_SUCCESS) {
-		U_LOG_E("weave(#759) v4: vkCreateImageView(overlay) failed: %d", ret);
-		vk->vkFreeMemory(vk->device, memory, NULL);
-		vk->vkDestroyImage(vk->device, image, NULL);
-		return false;
-	}
-
-	mc->weave.overlay_image = image;
-	mc->weave.overlay_memory = memory;
-	mc->weave.overlay_view = view;
-	mc->weave.overlay_w = width;
-	mc->weave.overlay_h = height;
-	mc->weave.overlay_first_use = true;
-	return true;
-#else
-	(void)vk;
-	(void)mc;
-	(void)surface;
-	return false;
+#ifdef COMP_MULTI_WEAVE_HAVE_METAL
+		if (!have_vk && have_metal) {
+			b = &comp_multi_weave_macos_backend_metal;
+		}
 #endif
+	}
+
+	U_LOG_W("weave(#759): macOS weave backend=%s (%s; plug-in DP factories: vk=%s metal=%s)", b->name, why,
+	        have_vk ? "yes" : "no", have_metal ? "yes" : "no");
+	return b;
 }
 
-static void
-weave_release_overlay(struct vk_bundle *vk, struct multi_compositor *mc)
-{
-	if (mc->weave.overlay_view != VK_NULL_HANDLE) {
-		vk->vkDestroyImageView(vk->device, mc->weave.overlay_view, NULL);
-		mc->weave.overlay_view = VK_NULL_HANDLE;
-	}
-	if (mc->weave.overlay_image != VK_NULL_HANDLE) {
-		vk->vkDestroyImage(vk->device, mc->weave.overlay_image, NULL);
-		mc->weave.overlay_image = VK_NULL_HANDLE;
-	}
-	if (mc->weave.overlay_memory != VK_NULL_HANDLE) {
-		vk->vkFreeMemory(vk->device, mc->weave.overlay_memory, NULL);
-		mc->weave.overlay_memory = VK_NULL_HANDLE;
-	}
-	if (mc->weave.overlay_iosurface != NULL) {
-		CFRelease((IOSurfaceRef)mc->weave.overlay_iosurface);
-		mc->weave.overlay_iosurface = NULL;
-	}
-	mc->weave.overlay_iosurface_id = 0;
-	mc->weave.overlay_w = 0;
-	mc->weave.overlay_h = 0;
-}
-
-//! Plain device-local image + view (the SBS scratch atlas).
+/*!
+ * One display's rect in global CoreGraphics BACKING pixels (CGDisplayBounds is
+ * in points; the scale is the mode's pixel width over its point width).
+ */
 static bool
-weave_create_scratch(struct vk_bundle *vk, struct multi_compositor *mc, uint32_t w, uint32_t h)
+weave_display_backing_rect(
+    CGDirectDisplayID d, int32_t *out_x, int32_t *out_y, uint32_t *out_w, uint32_t *out_h, double *out_scale)
 {
-	VkImageCreateInfo image_ci = {
-	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-	    .imageType = VK_IMAGE_TYPE_2D,
-	    .format = WEAVE_VK_FORMAT,
-	    .extent = {w, h, 1},
-	    .mipLevels = 1,
-	    .arrayLayers = 1,
-	    .samples = VK_SAMPLE_COUNT_1_BIT,
-	    .tiling = VK_IMAGE_TILING_OPTIMAL,
-	    .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-	    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-	};
-	VkResult ret = vk->vkCreateImage(vk->device, &image_ci, NULL, &mc->weave.sbs_image);
-	if (ret != VK_SUCCESS) {
+	const CGRect b = CGDisplayBounds(d);
+	if (b.size.width <= 0.0 || b.size.height <= 0.0) {
 		return false;
 	}
-
-	VkMemoryRequirements reqs;
-	vk->vkGetImageMemoryRequirements(vk->device, mc->weave.sbs_image, &reqs);
-	uint32_t mti = UINT32_MAX;
-	if (!vk_get_memory_type(vk, reqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &mti)) {
-		vk->vkDestroyImage(vk->device, mc->weave.sbs_image, NULL);
-		mc->weave.sbs_image = VK_NULL_HANDLE;
-		return false;
-	}
-	VkMemoryAllocateInfo alloc = {
-	    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-	    .allocationSize = reqs.size,
-	    .memoryTypeIndex = mti,
-	};
-	ret = vk->vkAllocateMemory(vk->device, &alloc, NULL, &mc->weave.sbs_memory);
-	if (ret != VK_SUCCESS || vk->vkBindImageMemory(vk->device, mc->weave.sbs_image, mc->weave.sbs_memory, 0) !=
-	                             VK_SUCCESS) {
-		vk->vkDestroyImage(vk->device, mc->weave.sbs_image, NULL);
-		mc->weave.sbs_image = VK_NULL_HANDLE;
-		if (mc->weave.sbs_memory != VK_NULL_HANDLE) {
-			vk->vkFreeMemory(vk->device, mc->weave.sbs_memory, NULL);
-			mc->weave.sbs_memory = VK_NULL_HANDLE;
+	double scale = 1.0;
+	CGDisplayModeRef mode = CGDisplayCopyDisplayMode(d);
+	if (mode != NULL) {
+		const size_t pw = CGDisplayModeGetPixelWidth(mode);
+		if (pw > 0) {
+			scale = (double)pw / b.size.width;
 		}
-		return false;
+		CGDisplayModeRelease(mode);
 	}
-
-	VkImageViewCreateInfo view_ci = {
-	    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-	    .image = mc->weave.sbs_image,
-	    .viewType = VK_IMAGE_VIEW_TYPE_2D,
-	    .format = WEAVE_VK_FORMAT,
-	    .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1},
-	};
-	ret = vk->vkCreateImageView(vk->device, &view_ci, NULL, &mc->weave.sbs_view);
-	if (ret != VK_SUCCESS) {
-		return false;
-	}
-
-	mc->weave.sbs_w = w;
-	mc->weave.sbs_h = h;
-	mc->weave.sbs_first_use = true;
+	*out_x = (int32_t)lround(b.origin.x * scale);
+	*out_y = (int32_t)lround(b.origin.y * scale);
+	*out_w = (uint32_t)lround(b.size.width * scale);
+	*out_h = (uint32_t)lround(b.size.height * scale);
+	*out_scale = scale;
 	return true;
 }
 
 /*!
- * Per-eye un-squeeze staging (struct comp_multi_weave_eye_stage): free one
- * slot's image. The caller guarantees no in-flight GPU work still reads it.
+ * Resolve the panel-relative present origin from the stored geometry — only
+ * when it changed (geometry_dirty), the result is cached and re-sent to the DP
+ * every submit. Panel: the reported displayId (a CGDirectDisplayID; -1 and 0
+ * mean not reported), else the active display whose backing-px rect contains the origin, else the main
+ * display. Logs one WARN per change (a human-rate event: a window move).
  */
 static void
-weave_eye_stage_release(struct vk_bundle *vk, struct comp_multi_weave_eye_stage *s)
+weave_resolve_present_origin_locked(struct multi_compositor *mc)
 {
-	if (s->image != VK_NULL_HANDLE) {
-		vk->vkDestroyImage(vk->device, s->image, NULL);
-		s->image = VK_NULL_HANDLE;
+	if (!mc->weave.have_geometry || !mc->weave.geometry_dirty) {
+		return;
 	}
-	if (s->memory != VK_NULL_HANDLE) {
-		vk->vkFreeMemory(vk->device, s->memory, NULL);
-		s->memory = VK_NULL_HANDLE;
-	}
-	s->w = 0;
-	s->h = 0;
-	s->format = VK_FORMAT_UNDEFINED;
-}
+	mc->weave.geometry_dirty = false;
 
-static void
-weave_eye_stage_release_all(struct vk_bundle *vk, struct multi_compositor *mc)
-{
-	for (uint32_t i = 0; i < COMP_MULTI_WEAVE_EYE_STAGE_SLOTS; i++) {
-		weave_eye_stage_release(vk, &mc->weave.eye_stage[i][0]);
-		weave_eye_stage_release(vk, &mc->weave.eye_stage[i][1]);
+	const int32_t wx = mc->weave.win_x;
+	const int32_t wy = mc->weave.win_y;
+	int32_t px = 0, py = 0;
+	uint32_t pw = 0, ph = 0;
+	double scale = 1.0;
+	CGDirectDisplayID panel = 0;
+	const char *how = NULL;
+
+	// displayId -1 (spec: unknown / single display) and 0 are "not reported".
+	if (mc->weave.win_display_id != 0 && mc->weave.win_display_id != -1 &&
+	    weave_display_backing_rect((CGDirectDisplayID)mc->weave.win_display_id, &px, &py, &pw, &ph, &scale)) {
+		panel = (CGDirectDisplayID)mc->weave.win_display_id;
+		how = "reported displayId";
 	}
+	if (panel == 0) {
+		CGDirectDisplayID ids[16];
+		uint32_t n = 0;
+		if (CGGetActiveDisplayList(16, ids, &n) == kCGErrorSuccess) {
+			for (uint32_t i = 0; i < n && panel == 0; i++) {
+				int32_t x = 0, y = 0;
+				uint32_t w = 0, h = 0;
+				double s = 1.0;
+				if (weave_display_backing_rect(ids[i], &x, &y, &w, &h, &s) && wx >= x &&
+				    wx < x + (int32_t)w && wy >= y && wy < y + (int32_t)h) {
+					panel = ids[i];
+					px = x, py = y, pw = w, ph = h, scale = s;
+					how = "display containing the origin";
+				}
+			}
+		}
+	}
+	if (panel == 0) {
+		panel = CGMainDisplayID();
+		if (!weave_display_backing_rect(panel, &px, &py, &pw, &ph, &scale)) {
+			px = py = 0;
+			pw = ph = 0;
+			scale = 1.0;
+		}
+		how = "main display (fallback)";
+	}
+
+	mc->weave.have_present_origin = true;
+	mc->weave.present_origin_x = wx - px;
+	mc->weave.present_origin_y = wy - py;
+
+	const bool fed = mc->weave.backend != NULL && mc->weave.backend->feeds_present_origin;
+	U_LOG_W(
+	    "weave(#759): present origin (%d,%d) panel-relative backing px on display 0x%x (%s; panel %d,%d %ux%u "
+	    "backing px, scale %.2f) — %s every submit",
+	    mc->weave.present_origin_x, mc->weave.present_origin_y, (unsigned)panel, how, px, py, pw, ph, scale,
+	    fed ? "fed to the DP phase slot (set_present_origin)" : "NOT fed (this backend has no phase feed)");
 }
 
 /*!
- * The staging image of rect @p slot / @p eye, EXACTLY @p w x @p h in @p format,
- * (re)allocated only when one of those changes (rects are stable frame to frame,
- * so steady state allocates nothing). VK_NULL_HANDLE on failure: the caller then
- * stretches straight out of the input (the pre-fix, edge-bleeding path) rather
- * than drop the rect. Called while recording, before this frame's first use.
+ * Forward a hardware 2D/3D wish to the backend's DP and, once it accepted a
+ * change, tell this client's session (#961 semantics; the Linux twin is
+ * comp_multi_weave_linux.c weave_apply_display_mode_locked).
  */
-static VkImage
-weave_eye_stage_get(struct vk_bundle *vk,
-                    struct multi_compositor *mc,
-                    uint32_t slot,
-                    uint32_t eye,
-                    uint32_t w,
-                    uint32_t h,
-                    VkFormat format)
-{
-	if (slot >= COMP_MULTI_WEAVE_EYE_STAGE_SLOTS || eye > 1 || w == 0 || h == 0) {
-		return VK_NULL_HANDLE;
-	}
-	struct comp_multi_weave_eye_stage *s = &mc->weave.eye_stage[slot][eye];
-	if (s->image != VK_NULL_HANDLE && s->w == w && s->h == h && s->format == format) {
-		return s->image;
-	}
-	if (s->image != VK_NULL_HANDLE) {
-		// A resized rect (rare): an earlier submit whose fence wait timed out may
-		// still read the old image — never free it under the GPU.
-		vk->vkQueueWaitIdle(vk->main_queue->queue);
-		weave_eye_stage_release(vk, s);
-	}
-
-	VkExtent2D extent = {.width = w, .height = h};
-	VkResult ret = vk_create_image_simple(vk, extent, format,
-	                                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-	                                      &s->memory, &s->image);
-	if (ret != VK_SUCCESS) {
-		s->image = VK_NULL_HANDLE;
-		s->memory = VK_NULL_HANDLE;
-		static bool logged = false;
-		if (!logged) {
-			logged = true;
-			U_LOG_E(
-			    "weave(#759): eye staging vk_create_image_simple(%ux%u) failed: %s — "
-			    "stretching from the input (edge bleed)",
-			    w, h, vk_result_string(ret));
-		}
-		return VK_NULL_HANDLE;
-	}
-	s->w = w;
-	s->h = h;
-	s->format = format;
-	return s->image;
-}
-
-static void
-weave_release_scratch(struct vk_bundle *vk, struct multi_compositor *mc)
-{
-	weave_eye_stage_release_all(vk, mc);
-	if (mc->weave.sbs_view != VK_NULL_HANDLE) {
-		vk->vkDestroyImageView(vk->device, mc->weave.sbs_view, NULL);
-		mc->weave.sbs_view = VK_NULL_HANDLE;
-	}
-	if (mc->weave.sbs_image != VK_NULL_HANDLE) {
-		vk->vkDestroyImage(vk->device, mc->weave.sbs_image, NULL);
-		mc->weave.sbs_image = VK_NULL_HANDLE;
-	}
-	if (mc->weave.sbs_memory != VK_NULL_HANDLE) {
-		vk->vkFreeMemory(vk->device, mc->weave.sbs_memory, NULL);
-		mc->weave.sbs_memory = VK_NULL_HANDLE;
-	}
-	mc->weave.sbs_w = 0;
-	mc->weave.sbs_h = 0;
-}
-
-//! v6 crop staging (#774): a device-local image + view holding the top-left
-//! packed region (tile_columns*cvw x tile_rows*cvh) when the input atlas is
-//! larger than the active mode's tiles. Sampled by the DP (SAMPLED) after a
-//! single box copy from the input (TRANSFER_DST). No zero-copy = no crop image.
 static bool
-weave_create_crop(struct vk_bundle *vk, struct multi_compositor *mc, uint32_t w, uint32_t h)
+weave_apply_display_mode_locked(struct multi_compositor *mc, bool want_3d, const char *why)
 {
-	VkImageCreateInfo image_ci = {
-	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-	    .imageType = VK_IMAGE_TYPE_2D,
-	    .format = WEAVE_VK_FORMAT,
-	    .extent = {w, h, 1},
-	    .mipLevels = 1,
-	    .arrayLayers = 1,
-	    .samples = VK_SAMPLE_COUNT_1_BIT,
-	    .tiling = VK_IMAGE_TILING_OPTIMAL,
-	    .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-	    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-	};
-	VkResult ret = vk->vkCreateImage(vk->device, &image_ci, NULL, &mc->weave.crop_image);
-	if (ret != VK_SUCCESS) {
+	bool has_slot = false;
+	const int64_t t0_ns = os_monotonic_get_ns();
+	const bool accepted = mc->weave.backend->request_display_mode(mc, want_3d, &has_slot);
+	const double dp_ms = (double)(os_monotonic_get_ns() - t0_ns) / 1e6;
+	const char *slow = dp_ms > 50.0 ? " (slow)" : "";
+	if (!accepted) {
+		U_LOG_W(
+		    "weave(#759): the display processor REJECTED hardware %s (%s) in %.1f ms%s — panel state "
+		    "unchanged, no event sent",
+		    want_3d ? "3D" : "2D", why, dp_ms, slow);
 		return false;
 	}
 
-	VkMemoryRequirements reqs;
-	vk->vkGetImageMemoryRequirements(vk->device, mc->weave.crop_image, &reqs);
-	uint32_t mti = UINT32_MAX;
-	if (!vk_get_memory_type(vk, reqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &mti)) {
-		vk->vkDestroyImage(vk->device, mc->weave.crop_image, NULL);
-		mc->weave.crop_image = VK_NULL_HANDLE;
-		return false;
-	}
-	VkMemoryAllocateInfo alloc = {
-	    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-	    .allocationSize = reqs.size,
-	    .memoryTypeIndex = mti,
-	};
-	ret = vk->vkAllocateMemory(vk->device, &alloc, NULL, &mc->weave.crop_memory);
-	if (ret != VK_SUCCESS ||
-	    vk->vkBindImageMemory(vk->device, mc->weave.crop_image, mc->weave.crop_memory, 0) != VK_SUCCESS) {
-		vk->vkDestroyImage(vk->device, mc->weave.crop_image, NULL);
-		mc->weave.crop_image = VK_NULL_HANDLE;
-		if (mc->weave.crop_memory != VK_NULL_HANDLE) {
-			vk->vkFreeMemory(vk->device, mc->weave.crop_memory, NULL);
-			mc->weave.crop_memory = VK_NULL_HANDLE;
-		}
-		return false;
+	const bool prev_3d = !mc->weave.hw_2d_confirmed;
+	mc->weave.hw_2d_confirmed = !want_3d;
+	if (prev_3d == want_3d) {
+		return true; // already there (a re-assert keeps a drifted vendor honest)
 	}
 
-	VkImageViewCreateInfo view_ci = {
-	    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-	    .image = mc->weave.crop_image,
-	    .viewType = VK_IMAGE_VIEW_TYPE_2D,
-	    .format = WEAVE_VK_FORMAT,
-	    .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1},
-	};
-	ret = vk->vkCreateImageView(vk->device, &view_ci, NULL, &mc->weave.crop_view);
-	if (ret != VK_SUCCESS) {
-		return false;
-	}
+	bool panel_3d = false;
+	const bool have_readback = mc->weave.backend->get_hardware_3d_state(mc, &panel_3d);
+	U_LOG_W(
+	    "weave(#759): hardware %s -> %s (%s) on the %s weave backend's display processor (%s) in %.1f ms%s; "
+	    "DP readback: %s",
+	    prev_3d ? "3D" : "2D", want_3d ? "3D" : "2D", why, mc->weave.backend->name,
+	    has_slot ? "request_display_mode accepted" : "mode-neutral DP, nothing to switch", dp_ms, slow,
+	    have_readback ? (panel_3d ? "3D (may lag — the lens switches asynchronously)"
+	                              : "2D (may lag — the lens switches asynchronously)")
+	                  : "none (the DP has no get_hardware_3d_state)");
 
-	mc->weave.crop_w = w;
-	mc->weave.crop_h = h;
-	mc->weave.crop_first_use = true;
+	union xrt_session_event xse = {0};
+	xse.hardware_display_state_change.type = XRT_SESSION_EVENT_HARDWARE_DISPLAY_STATE_CHANGE;
+	xse.hardware_display_state_change.hardware_display_3d = want_3d;
+	const xrt_result_t xret = multi_compositor_push_event(mc, &xse);
+	if (xret != XRT_SUCCESS) {
+		U_LOG_W("weave(#759): could not push the hardware-state event to the session: %d", xret);
+	}
 	return true;
 }
 
-static void
-weave_release_crop(struct vk_bundle *vk, struct multi_compositor *mc)
-{
-	if (mc->weave.crop_view != VK_NULL_HANDLE) {
-		vk->vkDestroyImageView(vk->device, mc->weave.crop_view, NULL);
-		mc->weave.crop_view = VK_NULL_HANDLE;
-	}
-	if (mc->weave.crop_image != VK_NULL_HANDLE) {
-		vk->vkDestroyImage(vk->device, mc->weave.crop_image, NULL);
-		mc->weave.crop_image = VK_NULL_HANDLE;
-	}
-	if (mc->weave.crop_memory != VK_NULL_HANDLE) {
-		vk->vkFreeMemory(vk->device, mc->weave.crop_memory, NULL);
-		mc->weave.crop_memory = VK_NULL_HANDLE;
-	}
-	mc->weave.crop_w = 0;
-	mc->weave.crop_h = 0;
-}
-
-/*!
- * IOSurface-backed output image + view + framebuffer, IOSurfaceRef exported for
- * the caller (vk_image_allocator.c export pattern).
- */
+//! Pick + bring up the backend; applies a 2D wish recorded before bring-up.
 static bool
-weave_create_output(struct vk_bundle *vk, struct multi_compositor *mc, uint32_t w, uint32_t h)
+weave_ensure_backend_locked(struct multi_compositor *mc)
 {
-#if defined(VK_EXT_metal_objects)
-	if (!vk->has_EXT_metal_objects) {
-		U_LOG_E("weave(#759): VK_EXT_metal_objects unavailable for output export");
+	if (mc->weave.backend == NULL) {
+		mc->weave.backend = weave_pick_backend(mc);
+	}
+	if (!mc->weave.backend->ensure_engine(mc)) {
 		return false;
 	}
-
-	VkExportMetalObjectCreateInfoEXT export_metal_info = {
-	    .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT,
-	    .exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_IOSURFACE_BIT_EXT,
-	};
-	VkImageCreateInfo image_ci = {
-	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-	    .pNext = &export_metal_info,
-	    .imageType = VK_IMAGE_TYPE_2D,
-	    .format = WEAVE_VK_FORMAT,
-	    .extent = {w, h, 1},
-	    .mipLevels = 1,
-	    .arrayLayers = 1,
-	    .samples = VK_SAMPLE_COUNT_1_BIT,
-	    .tiling = VK_IMAGE_TILING_OPTIMAL,
-	    .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-	             VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-	    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-	};
-	VkResult ret = vk->vkCreateImage(vk->device, &image_ci, NULL, &mc->weave.out_image);
-	if (ret != VK_SUCCESS) {
-		U_LOG_E("weave(#759): vkCreateImage(output) failed: %d", ret);
-		return false;
-	}
-
-	VkMemoryRequirements reqs;
-	vk->vkGetImageMemoryRequirements(vk->device, mc->weave.out_image, &reqs);
-	uint32_t mti = UINT32_MAX;
-	if (!vk_get_memory_type(vk, reqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &mti)) {
-		vk->vkDestroyImage(vk->device, mc->weave.out_image, NULL);
-		mc->weave.out_image = VK_NULL_HANDLE;
-		return false;
-	}
-	VkMemoryDedicatedAllocateInfoKHR dedicated = {
-	    .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO_KHR,
-	    .image = mc->weave.out_image,
-	};
-	VkMemoryAllocateInfo alloc = {
-	    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-	    .pNext = &dedicated,
-	    .allocationSize = reqs.size,
-	    .memoryTypeIndex = mti,
-	};
-	ret = vk->vkAllocateMemory(vk->device, &alloc, NULL, &mc->weave.out_memory);
-	if (ret != VK_SUCCESS || vk->vkBindImageMemory(vk->device, mc->weave.out_image, mc->weave.out_memory, 0) !=
-	                             VK_SUCCESS) {
-		U_LOG_E("weave(#759): output memory alloc/bind failed");
-		vk->vkDestroyImage(vk->device, mc->weave.out_image, NULL);
-		mc->weave.out_image = VK_NULL_HANDLE;
-		if (mc->weave.out_memory != VK_NULL_HANDLE) {
-			vk->vkFreeMemory(vk->device, mc->weave.out_memory, NULL);
-			mc->weave.out_memory = VK_NULL_HANDLE;
+	if (!mc->weave.backend_ready) {
+		mc->weave.backend_ready = true;
+		// 3D is the default, so only a 2D wish that arrived before this DP
+		// existed needs acting on (the Linux engine's bring-up rule).
+		if (!mc->hardware_display_3d) {
+			(void)weave_apply_display_mode_locked(mc, false,
+			                                      "deferred request, applied at engine bring-up");
 		}
-		return false;
 	}
-
-	// Export the backing IOSurface for the caller (retained; released on
-	// resize/teardown — the IPC send only reads its IOSurfaceID).
-	VkExportMetalIOSurfaceInfoEXT export_surface = {
-	    .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_IO_SURFACE_INFO_EXT,
-	    .image = mc->weave.out_image,
-	};
-	VkExportMetalObjectsInfoEXT export_info = {
-	    .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT,
-	    .pNext = &export_surface,
-	};
-	vk->vkExportMetalObjectsEXT(vk->device, &export_info);
-	if (export_surface.ioSurface == NULL) {
-		U_LOG_E("weave(#759): failed to export output IOSurface");
-		return false;
-	}
-	CFRetain(export_surface.ioSurface);
-	mc->weave.out_iosurface = (void *)export_surface.ioSurface;
-
-	VkImageViewCreateInfo view_ci = {
-	    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-	    .image = mc->weave.out_image,
-	    .viewType = VK_IMAGE_VIEW_TYPE_2D,
-	    .format = WEAVE_VK_FORMAT,
-	    .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1},
-	};
-	ret = vk->vkCreateImageView(vk->device, &view_ci, NULL, &mc->weave.out_view);
-	if (ret != VK_SUCCESS) {
-		return false;
-	}
-
-	VkFramebufferCreateInfo fb_ci = {
-	    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-	    .renderPass = mc->weave.render_pass,
-	    .attachmentCount = 1,
-	    .pAttachments = &mc->weave.out_view,
-	    .width = w,
-	    .height = h,
-	    .layers = 1,
-	};
-	ret = vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &mc->weave.out_fb);
-	if (ret != VK_SUCCESS) {
-		return false;
-	}
-
-	mc->weave.out_w = w;
-	mc->weave.out_h = h;
-	return true;
-#else
-	(void)vk;
-	(void)mc;
-	(void)w;
-	(void)h;
-	return false;
-#endif
-}
-
-static void
-weave_release_output(struct vk_bundle *vk, struct multi_compositor *mc)
-{
-	if (mc->weave.out_fb != VK_NULL_HANDLE) {
-		vk->vkDestroyFramebuffer(vk->device, mc->weave.out_fb, NULL);
-		mc->weave.out_fb = VK_NULL_HANDLE;
-	}
-	if (mc->weave.out_view != VK_NULL_HANDLE) {
-		vk->vkDestroyImageView(vk->device, mc->weave.out_view, NULL);
-		mc->weave.out_view = VK_NULL_HANDLE;
-	}
-	if (mc->weave.out_image != VK_NULL_HANDLE) {
-		vk->vkDestroyImage(vk->device, mc->weave.out_image, NULL);
-		mc->weave.out_image = VK_NULL_HANDLE;
-	}
-	if (mc->weave.out_memory != VK_NULL_HANDLE) {
-		vk->vkFreeMemory(vk->device, mc->weave.out_memory, NULL);
-		mc->weave.out_memory = VK_NULL_HANDLE;
-	}
-	if (mc->weave.out_iosurface != NULL) {
-		CFRelease((IOSurfaceRef)mc->weave.out_iosurface);
-		mc->weave.out_iosurface = NULL;
-	}
-	mc->weave.out_w = 0;
-	mc->weave.out_h = 0;
-}
-
-/*!
- * One-time engine bring-up: command pool + buffer, fence, render pass
- * (compatible with the DP's own — same single BGRA8 color attachment), and the
- * DP instance from the plug-in's Vulkan factory. Mirrors shared_surface_init.
- */
-static bool
-weave_ensure_engine(struct vk_bundle *vk, struct multi_compositor *mc)
-{
-	if (mc->weave.engine_initialized) {
-		return true;
-	}
-
-	VkCommandPoolCreateInfo pool_info = {
-	    .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-	    .queueFamilyIndex = vk->main_queue->family_index,
-	    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-	};
-	if (vk->vkCreateCommandPool(vk->device, &pool_info, NULL, &mc->weave.cmd_pool) != VK_SUCCESS) {
-		return false;
-	}
-	VkCommandBufferAllocateInfo cb_info = {
-	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-	    .commandPool = mc->weave.cmd_pool,
-	    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-	    .commandBufferCount = 1,
-	};
-	if (vk->vkAllocateCommandBuffers(vk->device, &cb_info, &mc->weave.cmd) != VK_SUCCESS) {
-		return false;
-	}
-	VkFenceCreateInfo fence_info = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-	if (vk->vkCreateFence(vk->device, &fence_info, NULL, &mc->weave.fence) != VK_SUCCESS) {
-		return false;
-	}
-
-	// Render pass the output framebuffer is created against. Compatibility with
-	// the DP's internal render pass only needs matching attachment count /
-	// format / samples (load-store ops and layouts don't participate).
-	VkAttachmentDescription color_attachment = {
-	    .format = WEAVE_VK_FORMAT,
-	    .samples = VK_SAMPLE_COUNT_1_BIT,
-	    .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
-	    .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-	    .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-	    .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-	    .initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-	    .finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-	};
-	VkAttachmentReference color_ref = {.attachment = 0, .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
-	VkSubpassDescription subpass = {
-	    .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
-	    .colorAttachmentCount = 1,
-	    .pColorAttachments = &color_ref,
-	};
-	VkRenderPassCreateInfo rp_info = {
-	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
-	    .attachmentCount = 1,
-	    .pAttachments = &color_attachment,
-	    .subpassCount = 1,
-	    .pSubpasses = &subpass,
-	};
-	if (vk->vkCreateRenderPass(vk->device, &rp_info, NULL, &mc->weave.render_pass) != VK_SUCCESS) {
-		return false;
-	}
-
-	// The DP that weaves — same Vulkan plug-in factory family the macOS
-	// shared-surface path drives (sim_display anaglyph runs on MoltenVK).
-	xrt_dp_factory_vk_fn_t factory = (xrt_dp_factory_vk_fn_t)mc->msc->base.info.dp_factory_vk;
-	if (factory == NULL) {
-		U_LOG_E("weave(#759): no Vulkan DP factory — cannot weave");
-		return false;
-	}
-	xrt_result_t xret = factory(vk,                                       // vk_bundle
-	                            (void *)(uintptr_t)mc->weave.cmd_pool,    // cmd_pool
-	                            NULL,                                     // window_handle (present-owner's, not ours)
-	                            (int32_t)WEAVE_VK_FORMAT,                 // target_format
-	                            &mc->weave.dp);
-	if (xret != XRT_SUCCESS || mc->weave.dp == NULL) {
-		U_LOG_E("weave(#759): Vulkan DP factory failed: %d", xret);
-		return false;
-	}
-
-	mc->weave.engine_initialized = true;
-	U_LOG_W("weave(#759): macOS weave engine initialized (BGRA8, synchronous)");
 	return true;
 }
+
 
 /*
  *
@@ -982,8 +314,8 @@ comp_multi_weave_bind_window(struct xrt_compositor *xc, uint64_t window_id)
 	}
 	weave_ensure_mutex(mc);
 	os_mutex_lock(&mc->weave.mutex);
-	// Stored for future interlace-phase use only: sim_display (anaglyph) has no
-	// lattice, and macOS window geometry is derived from the input surface.
+	// Stored only: the present origin comes from the explicit geometry (spec v7),
+	// never from the id (it is an opaque handle on macOS).
 	mc->weave.window_id = window_id;
 	os_mutex_unlock(&mc->weave.mutex);
 	U_LOG_W("weave(#759): bound present-owner window id 0x%" PRIx64, window_id);
@@ -998,28 +330,30 @@ comp_multi_weave_set_window_geometry(struct xrt_compositor *xc,
                                      uint32_t client_h,
                                      int32_t display_id)
 {
-	// Spec v7 (#1036): macOS derives its weave geometry from the input IOSurface
-	// dims and sim_display's anaglyph has no interlace lattice to phase-align, so
-	// there is still nothing to feed a DP *phase* slot with here.
-	//
-	// It IS stored, though (#1116): a weave-only present-owner has no
-	// session_render, so this report is the only window rect
-	// multi_compositor_get_window_metrics() can serve — without it the session
-	// falls back to a display-scoped Kooima and any chained display-zone rect is
-	// discarded. ADR-033: the placement authority reports geometry; recording it
-	// is geometry bookkeeping, not phase.
+	// Spec v7 (#1036). Two consumers:
+	//  - the DP phase (Metal backend): the panel-relative present origin is
+	//    resolved from this at the next submit and fed every submit;
+	//  - window metrics (#1116): a weave-only present-owner has no
+	//    session_render, so this report is the only window rect
+	//    multi_compositor_get_window_metrics() can serve.
+	// ADR-033: the placement authority reports geometry; the weaver owns phase.
 	struct multi_compositor *mc = multi_compositor(xc);
 	if (mc == NULL || mc->msc == NULL || client_w == 0 || client_h == 0) {
 		return false;
 	}
 	weave_ensure_mutex(mc);
 	os_mutex_lock(&mc->weave.mutex);
+	const bool changed = !mc->weave.have_geometry || mc->weave.win_x != origin_x || mc->weave.win_y != origin_y ||
+	                     mc->weave.win_display_id != display_id;
 	mc->weave.have_geometry = true;
 	mc->weave.win_x = origin_x;
 	mc->weave.win_y = origin_y;
 	mc->weave.win_w = client_w;
 	mc->weave.win_h = client_h;
 	mc->weave.win_display_id = display_id;
+	if (changed) {
+		mc->weave.geometry_dirty = true;
+	}
 	os_mutex_unlock(&mc->weave.mutex);
 	return true;
 }
@@ -1055,10 +389,6 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 	if (mc == NULL || mc->msc == NULL || in_handle == NULL) {
 		return false;
 	}
-	struct vk_bundle *vk = weave_get_vk(mc);
-	if (vk == NULL) {
-		return false;
-	}
 
 	// The handler hands us ownership of the retained IOSurfaceRef the IPC
 	// receive looked up; we either adopt it into the cache or release it.
@@ -1076,14 +406,20 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 
 	bool ok = false;
 	do {
-		if (!weave_ensure_engine(vk, mc)) {
+		if (!weave_ensure_backend_locked(mc)) {
 			break;
 		}
+		const struct comp_multi_weave_macos_backend *be = mc->weave.backend;
 
 		// (Re)import the input on identity change (new IOSurface = new id).
-		if (mc->weave.in_image == VK_NULL_HANDLE || mc->weave.in_iosurface_id != surface_id) {
-			weave_release_input(vk, mc);
-			if (!weave_import_input(vk, mc, surface)) {
+		if (mc->weave.in_iosurface == NULL || mc->weave.in_iosurface_id != surface_id) {
+			be->release_input(mc);
+			if (mc->weave.in_iosurface != NULL) {
+				CFRelease((IOSurfaceRef)mc->weave.in_iosurface);
+				mc->weave.in_iosurface = NULL;
+			}
+			mc->weave.in_iosurface_id = 0;
+			if (!be->import_input(mc, surface)) {
 				break;
 			}
 			mc->weave.in_iosurface = (void *)surface; // adopt the retained ref
@@ -1094,9 +430,14 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		// v4 overlay: (re)import on identity change. On a matching id we keep the
 		// cached import and release the (redundant) per-call ref at the epilogue.
 		if (overlay != NULL &&
-		    (mc->weave.overlay_image == VK_NULL_HANDLE || mc->weave.overlay_iosurface_id != overlay_id)) {
-			weave_release_overlay(vk, mc);
-			if (weave_import_overlay(vk, mc, overlay)) {
+		    (mc->weave.overlay_iosurface == NULL || mc->weave.overlay_iosurface_id != overlay_id)) {
+			be->release_overlay(mc);
+			if (mc->weave.overlay_iosurface != NULL) {
+				CFRelease((IOSurfaceRef)mc->weave.overlay_iosurface);
+				mc->weave.overlay_iosurface = NULL;
+			}
+			mc->weave.overlay_iosurface_id = 0;
+			if (be->import_overlay(mc, overlay)) {
 				mc->weave.overlay_iosurface = (void *)overlay; // adopt the retained ref
 				mc->weave.overlay_iosurface_id = overlay_id;
 				overlay = NULL; // ownership transferred
@@ -1109,7 +450,7 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		// means the caller already packed the atlas the way every DisplayXR app
 		// does — tiles contiguous from the top-left at (content_view_w,
 		// content_view_h) in a worst-case-sized input (ADR-010). No SBS scratch,
-		// no per-rect unpack blits, no firstChunk clear: crop the top-left packed
+		// no per-rect unpack, no firstChunk clear: crop the top-left packed
 		// region if the worst case is bigger (ADR-030 crop-before-DP) and weave
 		// once. The woven output IS one content view (= the whole window); the
 		// present-owner reads back per-element window-regions from it.
@@ -1129,13 +470,23 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 			}
 		}
 
-		// Output dims: v6 = one content view (cvw x cvh); batch = the
-		// (window-client-sized) input; legacy = rect offset+extent (the Windows
-		// GetClientRect-less fallback).
+		// Output dims: v6 = one content view (cvw x cvh), or the window when the
+		// DP's lattice must not be resampled; batch = the (window-client-sized)
+		// input; legacy = rect offset+extent (the Windows GetClientRect-less
+		// fallback).
 		uint32_t want_w = 0, want_h = 0;
 		if (nview) {
 			want_w = cvw;
 			want_h = cvh;
+			if (!be->output_tolerates_resample(mc)) {
+				if (mc->weave.have_geometry && mc->weave.win_w > 0 && mc->weave.win_h > 0) {
+					want_w = mc->weave.win_w;
+					want_h = mc->weave.win_h;
+				} else {
+					want_w = mc->weave.in_w;
+					want_h = mc->weave.in_h;
+				}
+			}
 		} else if (rect_count > 0) {
 			want_w = mc->weave.in_w;
 			want_h = mc->weave.in_h;
@@ -1147,500 +498,34 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 			break;
 		}
 
-		// (Re)allocate output (+ SBS scratch on the non-v6 paths) on resize. The
-		// scratch is the window-sized 2x1 SBS atlas (2*w x h) — ONE weave per
-		// submit. v6 samples the input (or the crop image) directly, so it needs
-		// no scratch.
-		if (mc->weave.out_image == VK_NULL_HANDLE || mc->weave.out_w != want_w ||
-		    mc->weave.out_h != want_h) {
-			// Never yank resources out from under in-flight GPU work.
-			vk->vkQueueWaitIdle(vk->main_queue->queue);
-			weave_release_output(vk, mc);
-			weave_release_scratch(vk, mc);
-			if (!weave_create_output(vk, mc, want_w, want_h)) {
-				break;
-			}
-			if (!nview && !weave_create_scratch(vk, mc, want_w * 2, want_h)) {
-				break;
-			}
-		}
-
-		// v6 crop staging: (re)create when the packed region is smaller than the
-		// input (the common ADR-010 case). Zero-copy (packed == input) samples
-		// the input directly and needs no crop image.
-		const bool v6_zero_copy = nview && (packed_w == mc->weave.in_w && packed_h == mc->weave.in_h);
-		if (nview && !v6_zero_copy &&
-		    (mc->weave.crop_image == VK_NULL_HANDLE || mc->weave.crop_w != packed_w ||
-		     mc->weave.crop_h != packed_h)) {
-			vk->vkQueueWaitIdle(vk->main_queue->queue);
-			weave_release_crop(vk, mc);
-			if (!weave_create_crop(vk, mc, packed_w, packed_h)) {
-				break;
-			}
-		}
-
-		// ---- Record ----
-		VkCommandBuffer cmd = mc->weave.cmd;
-		vk->vkResetCommandBuffer(cmd, 0);
-		VkCommandBufferBeginInfo begin = {
-		    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-		    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-		};
-		if (vk->vkBeginCommandBuffer(cmd, &begin) != VK_SUCCESS) {
+		if (!be->ensure_output(mc, want_w, want_h, nview)) {
 			break;
 		}
 
-		VkImageSubresourceRange range = {
-		    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1};
+		weave_resolve_present_origin_locked(mc);
 
-		// Atlas source for the DP sample + the atlas grid it describes. Legacy /
-		// batch weaves the window-sized 2x1 SBS scratch; v6 (#774) weaves the
-		// caller's already-packed N-view atlas — the input directly (zero-copy)
-		// or a cropped copy of its top-left packed region.
-		VkImage dp_src_image = mc->weave.sbs_image;
-		VkImageView dp_src_view = mc->weave.sbs_view;
-		uint32_t atlas_view_w = mc->weave.out_w;
-		uint32_t atlas_view_h = mc->weave.out_h;
-		uint32_t grid_cols = 2, grid_rows = 1;
-
-		if (nview) {
-			// v6: no SBS scratch, no per-rect unpack blits, no firstChunk clear.
-			// Transparency between elements is carried by the caller's own atlas
-			// alpha, which reaches the DP untouched.
-			if (v6_zero_copy) {
-				// The packed atlas fills the input exactly — sample it directly.
-				// Kept GENERAL across frames otherwise (UNDEFINED would discard
-				// the caller's pixels); restored to GENERAL after the weave.
-				VkImageMemoryBarrier in_to_read = {
-				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-				    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-				    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-				    .oldLayout = mc->weave.in_first_use ? VK_IMAGE_LAYOUT_UNDEFINED
-				                                        : VK_IMAGE_LAYOUT_GENERAL,
-				    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-				    .image = mc->weave.in_image,
-				    .subresourceRange = range,
-				};
-				mc->weave.in_first_use = false;
-				vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-				                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1,
-				                         &in_to_read);
-				dp_src_image = mc->weave.in_image;
-				dp_src_view = mc->weave.in_view;
-			} else {
-				// Crop the top-left packed region (tiles are contiguous, so it
-				// is a single rectangle — ONE box copy, not a per-tile gather).
-				VkImageMemoryBarrier in_to_src = {
-				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-				    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-				    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-				    .oldLayout = mc->weave.in_first_use ? VK_IMAGE_LAYOUT_UNDEFINED
-				                                        : VK_IMAGE_LAYOUT_GENERAL,
-				    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-				    .image = mc->weave.in_image,
-				    .subresourceRange = range,
-				};
-				mc->weave.in_first_use = false;
-				vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-				                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1,
-				                         &in_to_src);
-
-				VkImageMemoryBarrier crop_to_dst = {
-				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-				    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
-				    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-				    .oldLayout = mc->weave.crop_first_use ? VK_IMAGE_LAYOUT_UNDEFINED
-				                                          : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-				    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-				    .image = mc->weave.crop_image,
-				    .subresourceRange = range,
-				};
-				mc->weave.crop_first_use = false;
-				vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-				                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1,
-				                         &crop_to_dst);
-
-				VkImageCopy copy = {
-				    .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
-				    .srcOffset = {0, 0, 0},
-				    .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
-				    .dstOffset = {0, 0, 0},
-				    .extent = {packed_w, packed_h, 1},
-				};
-				vk->vkCmdCopyImage(cmd, mc->weave.in_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-				                   mc->weave.crop_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-
-				VkImageMemoryBarrier crop_to_read = {
-				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-				    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-				    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-				    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-				    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-				    .image = mc->weave.crop_image,
-				    .subresourceRange = range,
-				};
-				vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-				                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1,
-				                         &crop_to_read);
-				dp_src_image = mc->weave.crop_image;
-				dp_src_view = mc->weave.crop_view;
-			}
-			atlas_view_w = cvw;
-			atlas_view_h = cvh;
-			grid_cols = layout->tile_columns;
-			grid_rows = layout->tile_rows;
-		} else {
-
-		// Input: keep GENERAL across frames (UNDEFINED would discard the
-		// caller's pixels); the barrier makes external writes visible.
-		VkImageMemoryBarrier in_barrier = {
-		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-		    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-		    .oldLayout = mc->weave.in_first_use ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL,
-		    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-		    .image = mc->weave.in_image,
-		    .subresourceRange = range,
+		const struct comp_multi_weave_macos_params params = {
+		    .rect_count = rect_count,
+		    .rects = rects,
+		    .want_w = want_w,
+		    .want_h = want_h,
+		    .first_chunk = weave_frame_first,
+		    .nview = nview,
+		    .v6_zero_copy = nview && (packed_w == mc->weave.in_w && packed_h == mc->weave.in_h),
+		    .cvw = cvw,
+		    .cvh = cvh,
+		    .packed_w = packed_w,
+		    .packed_h = packed_h,
+		    .tile_columns = nview ? layout->tile_columns : 2,
+		    .tile_rows = nview ? layout->tile_rows : 1,
+		    .view_count = nview ? layout->view_count : 2,
+		    .have_present_origin = mc->weave.have_present_origin,
+		    .present_origin_x = mc->weave.present_origin_x,
+		    .present_origin_y = mc->weave.present_origin_y,
 		};
-		mc->weave.in_first_use = false;
-		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
-		                         NULL, 0, NULL, 1, &in_barrier);
-
-		// Scratch -> TRANSFER_DST (persists across frames: stale regions from
-		// closed elements re-weave harmlessly; the caller composites back only
-		// its current rects — same contract as the Windows output).
-		VkImageMemoryBarrier sbs_to_dst = {
-		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
-		    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-		    .oldLayout = mc->weave.sbs_first_use ? VK_IMAGE_LAYOUT_UNDEFINED
-		                                         : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-		    .image = mc->weave.sbs_image,
-		    .subresourceRange = range,
-		};
-		mc->weave.sbs_first_use = false;
-		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-		                         0, NULL, 0, NULL, 1, &sbs_to_dst);
-
-		// v5 firstChunk (browser#22): clear the SBS scratch to premultiplied
-		// transparent (0,0,0,0) on the first submit of a frame, so regions BETWEEN
-		// the woven tiles come out alpha 0 instead of stale — the present-owner can
-		// then draw the woven output back WHOLE-WINDOW (opaque tiles replace the
-		// page, transparent gaps show it through). The DP is alpha-native (passes
-		// the atlas alpha through the weave), so cleared gaps stay transparent while
-		// blitted tiles keep the page's opaque alpha. Opt-in: legacy present-owners
-		// draw back only their own tiles and skip it (accumulate-across-submits).
-		if (weave_frame_first) {
-			VkClearColorValue sbs_transparent = {.float32 = {0.0f, 0.0f, 0.0f, 0.0f}};
-			vk->vkCmdClearColorImage(cmd, mc->weave.sbs_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-			                         &sbs_transparent, 1, &range);
-			// Order the whole-image clear before the per-rect blits (both TRANSFER
-			// writes to overlapping regions — no implicit ordering within a stage).
-			VkImageMemoryBarrier clear_to_blit = {
-			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-			    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-			    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-			    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-			    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-			    .image = mc->weave.sbs_image,
-			    .subresourceRange = range,
-			};
-			vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-			                         0, NULL, 0, NULL, 1, &clear_to_blit);
-		}
-
-		// Un-squeeze each rect's SBS halves into the two atlas tiles: left half ->
-		// left tile at the rect's window position (stretched to full rect width),
-		// right half -> right tile offset by out_w. A LINEAR blit clamps at the
-		// edge of the whole SOURCE IMAGE, not at srcOffsets, so stretching straight
-		// out of the input would read 25 % of the texel beyond each half-rect (the
-		// caller's never-cleared ring on the outer edges = a dark 1-px border; the
-		// other eye at the midline). Each half is therefore first copied 1:1 into
-		// an image of exactly its size and that WHOLE image is stretched: the edge
-		// clamp is then the half-rect's own outermost texel centres. Odd widths
-		// keep the split they always had: left = rw / 2, right = the rest.
-		struct xrt_rect legacy_rect = {
-		    .offset = {.w = 0, .h = 0},
-		    .extent = {.w = (int)want_w, .h = (int)want_h},
-		};
-		const struct xrt_rect *blit_rects = rect_count > 0 ? rects : &legacy_rect;
-		uint32_t blit_count = rect_count > 0 ? rect_count : 1;
-		if (blit_count > COMP_MULTI_WEAVE_EYE_STAGE_SLOTS) {
-			blit_count = COMP_MULTI_WEAVE_EYE_STAGE_SLOTS; // The IPC server already rejects more.
-		}
-
-		VkImageBlit eye_blits[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS * 2];
-		VkImage eye_src[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS * 2]; // VK_NULL_HANDLE = straight from the input.
-		VkImage stage_images[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS * 2];
-		VkImageCopy stage_copies[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS * 2];
-		VkImageMemoryBarrier stage_barriers[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS * 2];
-		uint32_t eye_count = 0;
-		uint32_t staged_count = 0;
-		const VkImageSubresourceLayers color_layer = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1};
-
-		for (uint32_t i = 0; i < blit_count; i++) {
-			// xrt_offset names its fields w/h; they hold x/y here.
-			int32_t rx = blit_rects[i].offset.w;
-			int32_t ry = blit_rects[i].offset.h;
-			int32_t rw = blit_rects[i].extent.w;
-			int32_t rh = blit_rects[i].extent.h;
-			if (rw <= 0 || rh <= 0) {
-				continue;
-			}
-			// Clamp to the input.
-			if (rx < 0 || ry < 0 || (uint32_t)(rx + rw) > mc->weave.in_w ||
-			    (uint32_t)(ry + rh) > mc->weave.in_h) {
-				continue;
-			}
-			int32_t half = rw / 2;
-			if (half <= 0) {
-				continue;
-			}
-
-			// Tile position = the rect's own window position (1:1 vertically).
-			const int32_t dx0 = rx;
-			const int32_t dy0 = ry;
-			const int32_t dx1 = rx + rw;
-			const int32_t dy1 = ry + rh;
-			const int32_t src_x[2] = {rx, rx + half};
-			const int32_t src_w[2] = {half, rw - half};
-			const int32_t tile_x[2] = {0, (int32_t)mc->weave.out_w}; // Right tile (+out_w).
-			for (uint32_t e = 0; e < 2; e++) {
-				VkImage stage = weave_eye_stage_get(vk, mc, i, e, (uint32_t)src_w[e], (uint32_t)rh,
-				                                    WEAVE_VK_FORMAT);
-				eye_blits[eye_count] = (VkImageBlit){
-				    .srcSubresource = color_layer,
-				    .srcOffsets = {{src_x[e], ry, 0}, {src_x[e] + src_w[e], ry + rh, 1}},
-				    .dstSubresource = color_layer,
-				    .dstOffsets = {{tile_x[e] + dx0, dy0, 0}, {tile_x[e] + dx1, dy1, 1}},
-				};
-				if (stage != VK_NULL_HANDLE) {
-					// Stretch the WHOLE staged image instead of the input sub-rect.
-					eye_blits[eye_count].srcOffsets[0] = (VkOffset3D){0, 0, 0};
-					eye_blits[eye_count].srcOffsets[1] = (VkOffset3D){src_w[e], rh, 1};
-					stage_images[staged_count] = stage;
-					stage_copies[staged_count] = (VkImageCopy){
-					    .srcSubresource = color_layer,
-					    .srcOffset = {src_x[e], ry, 0},
-					    .dstSubresource = color_layer,
-					    .dstOffset = {0, 0, 0},
-					    .extent = {(uint32_t)src_w[e], (uint32_t)rh, 1},
-					};
-					// Fully overwritten by the copy: discard from UNDEFINED. The
-					// TRANSFER src scope orders it after an earlier submit's
-					// stretch read of the same image (WAR — execution only).
-					stage_barriers[staged_count] = (VkImageMemoryBarrier){
-					    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-					    .srcAccessMask = 0,
-					    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-					    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-					    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-					    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-					    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-					    .image = stage,
-					    .subresourceRange = range,
-					};
-					staged_count++;
-				}
-				eye_src[eye_count] = stage;
-				eye_count++;
-			}
-		}
-
-		if (staged_count > 0) {
-			vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-			                         0, NULL, 0, NULL, staged_count, stage_barriers);
-			for (uint32_t k = 0; k < staged_count; k++) {
-				vk->vkCmdCopyImage(cmd, mc->weave.in_image, VK_IMAGE_LAYOUT_GENERAL, stage_images[k],
-				                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &stage_copies[k]);
-			}
-			// Copy writes -> stretch reads.
-			for (uint32_t k = 0; k < staged_count; k++) {
-				stage_barriers[k].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-				stage_barriers[k].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-				stage_barriers[k].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-				stage_barriers[k].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-			}
-			vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-			                         0, NULL, 0, NULL, staged_count, stage_barriers);
-		}
-
-		// Stretches, in rect order (a later rect still overwrites an overlapping
-		// earlier one).
-		for (uint32_t k = 0; k < eye_count; k++) {
-			const bool staged = eye_src[k] != VK_NULL_HANDLE;
-			VkImage src = staged ? eye_src[k] : mc->weave.in_image;
-			VkImageLayout src_layout =
-			    staged ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
-			vk->vkCmdBlitImage(cmd, src, src_layout, mc->weave.sbs_image,
-			                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &eye_blits[k], VK_FILTER_LINEAR);
-		}
-
-		// Scratch -> SHADER_READ for the DP sample.
-		VkImageMemoryBarrier sbs_to_read = {
-		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-		    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-		    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-		    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		    .image = mc->weave.sbs_image,
-		    .subresourceRange = range,
-		};
-		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
-		                         0, NULL, 0, NULL, 1, &sbs_to_read);
-		} // end !nview (legacy/batch SBS record)
-
-		// Output -> COLOR_ATTACHMENT (fully re-rendered every submit, so the
-		// discard from UNDEFINED is fine).
-		VkImageMemoryBarrier out_to_attach = {
-		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		    .srcAccessMask = 0,
-		    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-		    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-		    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-		    .image = mc->weave.out_image,
-		    .subresourceRange = range,
-		};
-		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-		                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1,
-		                         &out_to_attach);
-
-		// ONE process_atlas per submit. Legacy/batch: 2x1 SBS, per-eye dims = the
-		// window. v6: the caller's grid at content_view dims — output is one
-		// content view (cvw x cvh = the whole window).
-		xrt_display_processor_set_target_color_view(mc->weave.dp, mc->weave.out_view);
-		xrt_display_processor_process_atlas(mc->weave.dp, cmd,                             //
-		                                    (VkImage_XDP)dp_src_image, dp_src_view,        //
-		                                    atlas_view_w, atlas_view_h,                    //
-		                                    grid_cols, grid_rows,                          //
-		                                    (VkFormat_XDP)WEAVE_VK_FORMAT,                 //
-		                                    mc->weave.out_fb,                              //
-		                                    (VkImage_XDP)mc->weave.out_image,              //
-		                                    mc->weave.out_w, mc->weave.out_h,              //
-		                                    (VkFormat_XDP)WEAVE_VK_FORMAT,                 //
-		                                    0, 0, 0, 0);
-
-		// v6: restore the input atlas to GENERAL so the next frame's barrier
-		// (oldLayout=GENERAL) is correct and the caller's external Metal writes
-		// land into a defined layout. (In the crop path the input's last use was
-		// the box copy; in zero-copy it was the DP sample.)
-		if (nview) {
-			VkImageMemoryBarrier in_restore = {
-			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-			    .srcAccessMask = v6_zero_copy ? VK_ACCESS_SHADER_READ_BIT : VK_ACCESS_TRANSFER_READ_BIT,
-			    .dstAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-			    .oldLayout = v6_zero_copy ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-			                              : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-			    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-			    .image = mc->weave.in_image,
-			    .subresourceRange = range,
-			};
-			vk->vkCmdPipelineBarrier(cmd,
-			                         v6_zero_copy ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
-			                                      : VK_PIPELINE_STAGE_TRANSFER_BIT,
-			                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &in_restore);
-		}
-
-		// v4 overlay atlas (browser#18): composite the caller's window-sized
-		// premultiplied-alpha 2D atlas OVER the woven output with a premul "over"
-		// blend (out = overlay + (1-overlay.a)*out), so crisp 2D lands on top of
-		// the interlaced 3D at screen depth. The overlay is NOT woven — it is drawn
-		// after process_atlas onto the same output attachment. Reuses aux_vk's
-		// vk_local2d_composite flatten_premul pipeline (One / OneMinusSrcAlpha, all
-		// RGBA). process_atlas leaves out_image in COLOR_ATTACHMENT_OPTIMAL.
-		if (mc->weave.overlay_image != VK_NULL_HANDLE) {
-			bool blend_ready = mc->weave.overlay_blend_initialized;
-			if (!blend_ready) {
-				blend_ready = vk_local2d_composite_init(&mc->weave.overlay_blend, vk,
-				                                        WEAVE_VK_FORMAT, WEAVE_VK_FORMAT);
-				mc->weave.overlay_blend_initialized = blend_ready;
-				if (blend_ready) {
-					U_LOG_W("weave(#759) v4: premul-over blend pipeline ready");
-				} else {
-					U_LOG_E("weave(#759) v4: premul-over blend init failed");
-				}
-			}
-			if (blend_ready) {
-				// Overlay -> SHADER_READ (make the caller's external write visible).
-				VkImageMemoryBarrier ov_to_read = {
-				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-				    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-				    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-				    .oldLayout = mc->weave.overlay_first_use
-				                     ? VK_IMAGE_LAYOUT_UNDEFINED
-				                     : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-				    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-				    .image = mc->weave.overlay_image,
-				    .subresourceRange = range,
-				};
-				mc->weave.overlay_first_use = false;
-				vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-				                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1,
-				                         &ov_to_read);
-
-				// Make the weave's color writes available to the blend pass's
-				// LOAD_OP_LOAD + "over" (out stays COLOR_ATTACHMENT_OPTIMAL).
-				VkImageMemoryBarrier out_weave_to_blend = {
-				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-				    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-				    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
-				                     VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-				    .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-				    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-				    .image = mc->weave.out_image,
-				    .subresourceRange = range,
-				};
-				vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-				                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0,
-				                         NULL, 1, &out_weave_to_blend);
-
-				// One whole-window premul "over": the atlas is transparent
-				// (alpha 0) everywhere except the 2D regions, so a single
-				// full-window composite is correct. out_fb is render-pass
-				// compatible with the flatten pass (same BGRA8 single attachment).
-				vk_local2d_composite_begin_frame(&mc->weave.overlay_blend, vk);
-				vk_local2d_composite_flatten_draw(&mc->weave.overlay_blend, vk, cmd, mc->weave.out_fb,
-				                                  mc->weave.out_w, mc->weave.out_h,
-				                                  mc->weave.overlay_view,       //
-				                                  0, 0, mc->weave.out_w, mc->weave.out_h, // dst = full window
-				                                  0.0f, 0.0f, 1.0f, 1.0f,       // src = whole atlas, no flip
-				                                  /*unpremultiplied*/ false);
-			}
-		}
-
-		// Output -> GENERAL for the caller's cross-API (Metal) read.
-		VkImageMemoryBarrier out_to_general = {
-		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-		    .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
-		    .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-		    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-		    .image = mc->weave.out_image,
-		    .subresourceRange = range,
-		};
-		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-		                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &out_to_general);
-
-		if (vk->vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+		if (!be->record_and_wait(mc, &params)) {
 			break;
 		}
-
-		// ---- Submit + synchronous completion (the macOS sync contract). ----
-		VkSubmitInfo submit = {
-		    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-		    .commandBufferCount = 1,
-		    .pCommandBuffers = &cmd,
-		};
-		vk_queue_lock(vk->main_queue);
-		VkResult ret = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit, mc->weave.fence);
-		vk_queue_unlock(vk->main_queue);
-		if (ret != VK_SUCCESS) {
-			U_LOG_E("weave(#759): vkQueueSubmit failed: %d", ret);
-			break;
-		}
-		vk->vkWaitForFences(vk->device, 1, &mc->weave.fence, VK_TRUE, UINT64_MAX);
-		vk->vkResetFences(vk->device, 1, &mc->weave.fence);
 
 		mc->weave.fence_value++;
 
@@ -1651,7 +536,7 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		// Eyes flow OUT (runtime -> caller) for the caller's next off-axis
 		// frame; the weave itself reads the tracker DP-internally.
 		U_ZERO(out_eyes);
-		if (!xrt_display_processor_get_predicted_eye_positions(mc->weave.dp, out_eyes)) {
+		if (!be->get_eyes(mc, out_eyes)) {
 			U_ZERO(out_eyes);
 		}
 
@@ -1714,10 +599,10 @@ comp_multi_weave_snap_window_rect(struct xrt_compositor *xc,
                                   int32_t *out_snapped_x,
                                   int32_t *out_snapped_y)
 {
-	// sim_display has no snap_window_rect (anaglyph has no interlace lattice).
-	// The VK DP vtable does carry the slot since #1588; wiring the macOS weave
-	// engine to it is a separate job (it would have to resolve the per-session
-	// DP first) and nothing on macOS drags a weaving window today.
+	// Identity: neither the VK nor the Metal DP vtable a macOS plug-in fills
+	// carries a snap the engine wires today (the Metal vtable has no
+	// snap_window_rect slot at all), and nothing on macOS drags a weaving window
+	// yet. The handler then reports the identity snap.
 	(void)xc;
 	(void)origin_x;
 	(void)origin_y;
@@ -1728,46 +613,54 @@ comp_multi_weave_snap_window_rect(struct xrt_compositor *xc,
 	return false;
 }
 
+bool
+comp_multi_weave_macos_request_display_mode(struct multi_compositor *mc, bool enable_3d)
+{
+	if (mc == NULL || mc->msc == NULL) {
+		return false;
+	}
+	weave_ensure_mutex(mc);
+	os_mutex_lock(&mc->weave.mutex);
+	const bool had_pending_2d = !mc->weave.backend_ready && !mc->hardware_display_3d;
+	mc->hardware_display_3d = enable_3d;
+	bool ok = true;
+	if (mc->weave.backend_ready) {
+		ok = weave_apply_display_mode_locked(mc, enable_3d, "xrRequestDisplayModeDXR");
+	} else if (enable_3d && had_pending_2d) {
+		U_LOG_W(
+		    "weave(#759): hardware 3D requested before the weave engine exists — the recorded 2D request is "
+		    "withdrawn, nothing to apply at bring-up");
+	} else if (!enable_3d) {
+		U_LOG_W(
+		    "weave(#759): hardware 2D requested before the weave engine exists — recorded, applied when the "
+		    "engine comes up");
+	}
+	os_mutex_unlock(&mc->weave.mutex);
+	return ok;
+}
+
 void
 comp_multi_weave_fini(struct multi_compositor *mc)
 {
 	if (mc == NULL || !mc->weave.mutex_initialized) {
 		return;
 	}
-	struct vk_bundle *vk = weave_get_vk(mc);
 	os_mutex_lock(&mc->weave.mutex);
-	if (vk != NULL) {
-		if (mc->weave.engine_initialized) {
-			// Nothing may be in flight (submits are synchronous), but a
-			// belt-and-braces idle keeps teardown safe if that changes.
-			vk->vkQueueWaitIdle(vk->main_queue->queue);
-		}
-		weave_release_input(vk, mc);
-		weave_release_overlay(vk, mc);
-		weave_release_scratch(vk, mc);
-		weave_release_crop(vk, mc);
-		weave_release_output(vk, mc);
-		if (mc->weave.overlay_blend_initialized) {
-			vk_local2d_composite_fini(&mc->weave.overlay_blend, vk);
-			mc->weave.overlay_blend_initialized = false;
-		}
-		if (mc->weave.dp != NULL) {
-			xrt_display_processor_destroy(&mc->weave.dp);
-		}
-		if (mc->weave.render_pass != VK_NULL_HANDLE) {
-			vk->vkDestroyRenderPass(vk->device, mc->weave.render_pass, NULL);
-			mc->weave.render_pass = VK_NULL_HANDLE;
-		}
-		if (mc->weave.fence != VK_NULL_HANDLE) {
-			vk->vkDestroyFence(vk->device, mc->weave.fence, NULL);
-			mc->weave.fence = VK_NULL_HANDLE;
-		}
-		if (mc->weave.cmd_pool != VK_NULL_HANDLE) {
-			vk->vkDestroyCommandPool(vk->device, mc->weave.cmd_pool, NULL);
-			mc->weave.cmd_pool = VK_NULL_HANDLE;
-		}
+	if (mc->weave.backend != NULL) {
+		mc->weave.backend->fini(mc);
 	}
-	mc->weave.engine_initialized = false;
+	if (mc->weave.in_iosurface != NULL) {
+		CFRelease((IOSurfaceRef)mc->weave.in_iosurface);
+		mc->weave.in_iosurface = NULL;
+	}
+	mc->weave.in_iosurface_id = 0;
+	if (mc->weave.overlay_iosurface != NULL) {
+		CFRelease((IOSurfaceRef)mc->weave.overlay_iosurface);
+		mc->weave.overlay_iosurface = NULL;
+	}
+	mc->weave.overlay_iosurface_id = 0;
+	mc->weave.backend = NULL;
+	mc->weave.backend_ready = false;
 	os_mutex_unlock(&mc->weave.mutex);
 	os_mutex_destroy(&mc->weave.mutex);
 	mc->weave.mutex_initialized = false;

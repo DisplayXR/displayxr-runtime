@@ -45,6 +45,8 @@
 struct comp_target;
 struct xrt_eye_positions;
 struct xrt_weave_atlas_layout;
+struct xrt_display_processor_metal;
+struct comp_multi_weave_macos_backend;
 struct android_custom_surface;
 struct xrt_window_metrics;
 struct xrt_system_devices;
@@ -570,7 +572,9 @@ struct multi_compositor
 	 * into a window-sized 2x1 SBS scratch atlas, run ONE DP process_atlas
 	 * into an IOSurface-backed output, and wait completion before the IPC
 	 * reply (synchronous contract — no cross-process fence on macOS).
-	 * Implemented in comp_multi_weave_macos.c.
+	 * Implemented in comp_multi_weave_macos.c (front end) over one of two
+	 * backends — comp_multi_weave_macos_vk.c (MoltenVK, the fields below) or
+	 * comp_multi_weave_macos_metal.m (native Metal, opaque `metal` state).
 	 */
 	struct
 	{
@@ -590,23 +594,46 @@ struct multi_compositor
 		 */
 		bool fence_pending;
 		VkRenderPass render_pass; //!< Output fb's pass (DP-compatible, BGRA8).
-		struct xrt_display_processor *dp;
+		struct xrt_display_processor *dp; //!< vk backend's DP (Vulkan vtable only).
+
+		//! @name Backend seam (comp_multi_weave_macos_backend.h)
+		//! @{
+		//! The backend owning the GPU objects, picked once at the first submit
+		//! (DXR_WEAVE_MAC_BACKEND=auto|metal|vk). NULL until then.
+		const struct comp_multi_weave_macos_backend *backend;
+		bool backend_ready;  //!< ensure_engine succeeded at least once.
+		//! Metal backend state (opaque; comp_multi_weave_macos_metal.m).
+		void *metal;
+		//! The Metal backend's DP. NEVER stored in `dp`: comp_multi_compositor.c
+		//! calls the Vulkan vtable on `dp`.
+		struct xrt_display_processor_metal *dp_metal;
+		//! @}
+
+		//! Hardware 2D as last confirmed by the backend's DP
+		//! (comp_multi_weave_macos_request_display_mode).
+		bool hw_2d_confirmed;
 
 		uint64_t window_id;   //!< Present-owner window id from bind (future phase use).
 		uint64_t fence_value; //!< Monotonic; completion is synchronous on macOS.
 
 		//! @name Explicit window geometry (spec v7 XrWeaveWindowGeometryDXR)
-		//! Recorded here purely as the placement authority's report (ADR-033):
-		//! macOS derives its weave geometry from the input IOSurface, so nothing
-		//! feeds a DP phase slot — but a weave-only session has no
-		//! `session_render`, so this is the ONLY window rect
-		//! multi_compositor_get_window_metrics() can report (#1116).
+		//! The placement authority's report (ADR-033). On macOS the origin is
+		//! global CoreGraphics space in BACKING pixels (y down). The Metal
+		//! backend feeds the DP its panel-relative present origin from it every
+		//! submit; a weave-only session has no `session_render`, so this is
+		//! also the ONLY window rect multi_compositor_get_window_metrics() can
+		//! report (#1116).
 		//! @{
 		bool have_geometry;
 		int32_t win_x, win_y;
 		uint32_t win_w, win_h;
 		int32_t win_display_id;
 		bool metrics_logged; //!< One-shot log of the first metrics report.
+		//! Geometry changed since the present origin was last resolved.
+		bool geometry_dirty;
+		//! Cached panel-relative present origin (resolved when geometry_dirty).
+		bool have_present_origin;
+		int32_t present_origin_x, present_origin_y;
 		//! @}
 
 		//! @name Cached input import (rebuilt when the IOSurfaceID changes)
@@ -1538,6 +1565,21 @@ comp_multi_weave_export_output(struct xrt_compositor *xc,
 
 bool
 comp_multi_weave_export_fence(struct xrt_compositor *xc, xrt_graphics_sync_handle_t *out_handle);
+
+#ifdef XRT_OS_MACOS
+/*!
+ * Hardware 2D/3D request for a macOS XR_DXR_weave present-owner (the twin of
+ * comp_multi_weave_linux_request_display_mode): a weave-only session has no
+ * session_render, so multi_compositor_request_display_mode routes here and the
+ * request reaches the weave engine's own DP (vk or Metal backend), inline on
+ * the IPC thread under mc->weave.mutex. Before the engine exists the wish is
+ * recorded and applied at engine bring-up. Emits
+ * XRT_SESSION_EVENT_HARDWARE_DISPLAY_STATE_CHANGE once the DP accepted a change
+ * (a DP without the slot is mode-neutral and counts as accepted).
+ */
+bool
+comp_multi_weave_macos_request_display_mode(struct multi_compositor *mc, bool enable_3d);
+#endif
 
 #ifdef XRT_OS_LINUX_DESKTOP
 /*!
