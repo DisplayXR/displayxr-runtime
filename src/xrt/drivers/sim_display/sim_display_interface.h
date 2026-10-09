@@ -339,6 +339,22 @@ sim_display_dp_factory_d3d12(void *d3d12_device,
                               struct xrt_display_processor_d3d12 **out_xdp);
 
 /*!
+ * Multi-screen M6: per-screen D3D12 factory, the D3D12 twin of
+ * `sim_display_dp_factory_d3d11_for_screen` — matches
+ * `xrt_plugin_iface::create_dp_d3d12_for_screen`. The DP describes the bound
+ * screen and confines its draw (viewport + scissor) to the canvas it is handed.
+ *
+ * @ingroup drv_sim_display
+ */
+xrt_result_t
+sim_display_dp_factory_d3d12_for_screen(struct xrt_plugin_instance *inst,
+                                        void *d3d12_device,
+                                        void *d3d12_command_queue,
+                                        void *window_handle,
+                                        const struct xrt_screen_binding *binding,
+                                        struct xrt_display_processor_d3d12 **out_xdp);
+
+/*!
  * Set an external device as the pose source for a sim_display HMD.
  *
  * When set, the sim_display HMD delegates get_tracked_pose to the

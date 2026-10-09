@@ -21,6 +21,7 @@
 
 #include "xrt/xrt_display_processor_d3d12.h"
 #include "xrt/xrt_display_metrics.h"
+#include "xrt/xrt_plugin.h" // xrt_screen_binding (multi-screen M6)
 
 #include "util/u_debug.h"
 #include "util/u_logging.h"
@@ -199,6 +200,22 @@ struct sim_display_processor_d3d12_impl
 	uint32_t zone_last_mask_w, zone_last_mask_h;
 	uint64_t zone_last_seq;
 	bool zone_active; //!< A client mask is currently published (not cleared).
+
+	//! Multi-screen M6 (D3D12): this instance was created for ONE screen
+	//! (`create_dp_d3d12_for_screen`); then it describes THAT screen and
+	//! confines its draw to the canvas it is handed. The unbound DP — every
+	//! pre-M6 caller — keeps the process-wide panel and the full-target draw.
+	bool screen_bound;
+	uint64_t screen_monitor_id;
+	int32_t screen_left, screen_top;
+	uint32_t screen_px_w, screen_px_h;
+	float screen_w_m, screen_h_m;
+	//! set_present_origin: the window's client-area origin on the bound
+	//! screen (device px). Stored for parity with the Vulkan / D3D11 DPs;
+	//! sim's D3D12 modes have no phase-sensitive interlace (#817), so it
+	//! affects no pixel.
+	bool have_present_origin;
+	int32_t present_origin_x, present_origin_y;
 };
 
 static inline struct sim_display_processor_d3d12_impl *
@@ -233,13 +250,6 @@ sim_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
                              uint32_t canvas_width,
                              uint32_t canvas_height)
 {
-	// TODO(#85): Pass canvas_offset_x/y to vendor weaver for interlacing
-	// phase correction once Leia SR SDK supports sub-rect offset.
-	(void)canvas_offset_x;
-	(void)canvas_offset_y;
-	(void)canvas_width;
-	(void)canvas_height;
-
 	(void)format; // colorspace handled by SRV/format selection, not this arg
 
 	(void)target_resource; // sim_display uses target_rtv_cpu_handle via render pass
@@ -292,7 +302,10 @@ sim_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 	rtv_handle.ptr = static_cast<SIZE_T>(target_rtv_cpu_handle);
 	cmd_list->OMSetRenderTargets(1, &rtv_handle, FALSE, nullptr);
 
-	// Set viewport
+	// Set viewport + scissor. A screen-bound DP (multi-screen M6) is handed a
+	// canvas that is ITS segment of the target and must draw only there (a
+	// command list carries no viewport/scissor to inherit, so the DP sets
+	// both); the unbound DP keeps the pre-M6 full-target draw.
 	D3D12_VIEWPORT viewport = {};
 	viewport.TopLeftX = 0.0f;
 	viewport.TopLeftY = 0.0f;
@@ -300,14 +313,22 @@ sim_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 	viewport.Height = static_cast<float>(target_height);
 	viewport.MinDepth = 0.0f;
 	viewport.MaxDepth = 1.0f;
-	cmd_list->RSSetViewports(1, &viewport);
-
-	// Set scissor rect
 	D3D12_RECT scissor = {};
 	scissor.left = 0;
 	scissor.top = 0;
 	scissor.right = static_cast<LONG>(target_width);
 	scissor.bottom = static_cast<LONG>(target_height);
+	if (sdp->screen_bound && canvas_width > 0 && canvas_height > 0) {
+		viewport.TopLeftX = static_cast<float>(canvas_offset_x);
+		viewport.TopLeftY = static_cast<float>(canvas_offset_y);
+		viewport.Width = static_cast<float>(canvas_width);
+		viewport.Height = static_cast<float>(canvas_height);
+		scissor.left = canvas_offset_x;
+		scissor.top = canvas_offset_y;
+		scissor.right = canvas_offset_x + static_cast<LONG>(canvas_width);
+		scissor.bottom = canvas_offset_y + static_cast<LONG>(canvas_height);
+	}
+	cmd_list->RSSetViewports(1, &viewport);
 	cmd_list->RSSetScissorRects(1, &scissor);
 
 	// Set SRV via root descriptor table
@@ -334,8 +355,101 @@ sim_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 }
 
 
-// #856: panel geometry -> compositor computes window-scoped Kooima.
-SIM_ZONE_DEFINE_PANEL_METRIC_FNS(sim_dp_d3d12, xrt_display_processor_d3d12)
+// #856: panel geometry -> compositor computes window-scoped Kooima. A
+// screen-bound instance (multi-screen M6) answers for ITS screen; the unbound
+// one for the process-wide panel at the desktop origin, as before.
+static bool
+sim_dp_d3d12_get_display_dimensions(struct xrt_display_processor_d3d12 *xdp, float *out_width_m, float *out_height_m)
+{
+	struct sim_display_processor_d3d12_impl *sdp = sim_dp_d3d12(xdp);
+	if (out_width_m == nullptr || out_height_m == nullptr) {
+		return false;
+	}
+	if (sdp->screen_bound) {
+		*out_width_m = sdp->screen_w_m;
+		*out_height_m = sdp->screen_h_m;
+	} else {
+		sim_display_get_panel_metrics(out_width_m, out_height_m, nullptr, nullptr);
+	}
+	return (*out_width_m > 0.0f && *out_height_m > 0.0f);
+}
+
+static bool
+sim_dp_d3d12_get_display_pixel_info(struct xrt_display_processor_d3d12 *xdp,
+                                    uint32_t *out_pixel_width,
+                                    uint32_t *out_pixel_height,
+                                    int32_t *out_screen_left,
+                                    int32_t *out_screen_top)
+{
+	struct sim_display_processor_d3d12_impl *sdp = sim_dp_d3d12(xdp);
+	if (out_pixel_width == nullptr || out_pixel_height == nullptr) {
+		return false;
+	}
+	int32_t left = 0, top = 0;
+	if (sdp->screen_bound) {
+		*out_pixel_width = sdp->screen_px_w;
+		*out_pixel_height = sdp->screen_px_h;
+		left = sdp->screen_left;
+		top = sdp->screen_top;
+	} else {
+		sim_display_get_panel_metrics(nullptr, nullptr, out_pixel_width, out_pixel_height);
+	}
+	if (out_screen_left != nullptr) {
+		*out_screen_left = left;
+	}
+	if (out_screen_top != nullptr) {
+		*out_screen_top = top;
+	}
+	return (*out_pixel_width > 0 && *out_pixel_height > 0);
+}
+
+/*!
+ * Multi-screen M6: the window's client-area origin on the bound screen. Kept
+ * for parity with the Vulkan / D3D11 DPs; no D3D12 sim mode reads it (#817).
+ */
+static void
+sim_dp_d3d12_set_present_origin(struct xrt_display_processor_d3d12 *xdp, int32_t panel_x, int32_t panel_y)
+{
+	struct sim_display_processor_d3d12_impl *sdp = sim_dp_d3d12(xdp);
+	sdp->have_present_origin = true;
+	sdp->present_origin_x = panel_x;
+	sdp->present_origin_y = panel_y;
+}
+
+/*!
+ * Seed the per-instance screen from a binding (multi-screen M6). Same rules as
+ * the D3D11 DP's sim_dp_d3d11_bind_screen: physical size from the EDID mm,
+ * else the process-wide panel's; pixels from the device mode, else the
+ * desktop size; origin = the screen's desktop origin.
+ */
+static void
+sim_dp_d3d12_bind_screen(struct sim_display_processor_d3d12_impl *sdp, const struct xrt_screen_binding *b)
+{
+	if (b == nullptr || b->struct_size < offsetof(struct xrt_screen_binding, desktop_scale)) {
+		return;
+	}
+	float def_w_m = 0.0f, def_h_m = 0.0f;
+	uint32_t def_px_w = 0, def_px_h = 0;
+	sim_display_get_panel_metrics(&def_w_m, &def_h_m, &def_px_w, &def_px_h);
+
+	sdp->screen_bound = true;
+	sdp->screen_monitor_id = b->monitor_id;
+	sdp->screen_left = b->desktop_left;
+	sdp->screen_top = b->desktop_top;
+	sdp->screen_px_w = b->native_pixel_width != 0 ? b->native_pixel_width : b->desktop_width;
+	sdp->screen_px_h = b->native_pixel_height != 0 ? b->native_pixel_height : b->desktop_height;
+	if (sdp->screen_px_w == 0 || sdp->screen_px_h == 0) {
+		sdp->screen_px_w = def_px_w;
+		sdp->screen_px_h = def_px_h;
+	}
+	if (b->physical_width_mm != 0 && b->physical_height_mm != 0) {
+		sdp->screen_w_m = (float)b->physical_width_mm / 1000.0f;
+		sdp->screen_h_m = (float)b->physical_height_mm / 1000.0f;
+	} else {
+		sdp->screen_w_m = def_w_m;
+		sdp->screen_h_m = def_h_m;
+	}
+}
 
 static bool
 sim_dp_d3d12_get_predicted_eye_positions(struct xrt_display_processor_d3d12 *xdp,
@@ -618,10 +732,11 @@ sim_dp_d3d12_get_scanout_caps(struct xrt_display_processor_d3d12 *xdp, struct xr
  *
  */
 
-extern "C" xrt_result_t
-sim_display_processor_d3d12_create(enum sim_display_output_mode mode,
-                                   void *d3d12_device,
-                                   struct xrt_display_processor_d3d12 **out_xdp)
+static xrt_result_t
+sim_display_processor_d3d12_create_bound(enum sim_display_output_mode mode,
+                                         void *d3d12_device,
+                                         const struct xrt_screen_binding *binding,
+                                         struct xrt_display_processor_d3d12 **out_xdp)
 {
 	if (out_xdp == nullptr) {
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
@@ -651,6 +766,8 @@ sim_display_processor_d3d12_create(enum sim_display_output_mode mode,
 	sdp->base.publish_local_zone_mask = sim_dp_d3d12_publish_local_zone_mask; // #224 / ADR-027
 	sdp->base.clear_local_zone_mask = sim_dp_d3d12_clear_local_zone_mask;     // #224 / ADR-027
 	sdp->base.get_scanout_caps = sim_dp_d3d12_get_scanout_caps;
+	sdp->base.set_present_origin = sim_dp_d3d12_set_present_origin; // multi-screen M6
+	sim_dp_d3d12_bind_screen(sdp, binding);
 
 	// #224 / ADR-027 zone test double config (shared parser).
 	sim_zone_config_from_env(&sdp->zone_cfg, "D3D12");
@@ -751,6 +868,15 @@ sim_display_processor_d3d12_create(enum sim_display_output_mode mode,
 }
 
 
+extern "C" xrt_result_t
+sim_display_processor_d3d12_create(enum sim_display_output_mode mode,
+                                   void *d3d12_device,
+                                   struct xrt_display_processor_d3d12 **out_xdp)
+{
+	return sim_display_processor_d3d12_create_bound(mode, d3d12_device, nullptr, out_xdp);
+}
+
+
 /*
  *
  * Factory function — matches xrt_dp_factory_d3d12_fn_t signature.
@@ -769,4 +895,27 @@ sim_display_dp_factory_d3d12(void *d3d12_device,
 	enum sim_display_output_mode mode = sim_display_get_output_mode();
 
 	return sim_display_processor_d3d12_create(mode, d3d12_device, out_xdp);
+}
+
+
+/*
+ * Multi-screen M6 (D3D12): one D3D12 DP per screen a spanning window covers.
+ * The window handle is ignored like the plain factory's (sim weaves against no
+ * window); the binding seeds the instance's screen.
+ */
+extern "C" xrt_result_t
+sim_display_dp_factory_d3d12_for_screen(struct xrt_plugin_instance *inst,
+                                        void *d3d12_device,
+                                        void *d3d12_command_queue,
+                                        void *window_handle,
+                                        const struct xrt_screen_binding *binding,
+                                        struct xrt_display_processor_d3d12 **out_xdp)
+{
+	(void)inst;
+	(void)d3d12_command_queue;
+	(void)window_handle;
+	if (binding == nullptr) {
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+	return sim_display_processor_d3d12_create_bound(sim_display_get_output_mode(), d3d12_device, binding, out_xdp);
 }
