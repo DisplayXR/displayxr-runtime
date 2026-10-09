@@ -158,6 +158,7 @@ Integrate your 3D display hardware into DisplayXR.
 - [ADR-048](adr/ADR-048-lift-viewpoint-policy.md) — Lift viewpoint policy — window-relative viewpoints, rig gains, axis mode and ease-back are runtime policy
 - [ADR-049](adr/ADR-049-in-process-lift-rides-the-service.md) — In-process lift rides the service — one conversion module per machine, reached over a lift-only connection
 - [ADR-050](adr/ADR-050-macos-runtime-owns-window-placement.md) — On macOS the runtime owns window placement — phase-snapped, atomic drag and resize by default
+- [ADR-051](adr/ADR-051-display-status-model-and-dashboard.md) — Display status — one vendor-generic model, the service owns the truth, the panel stays dumb
 <!-- END ADR INDEX -->
 
 ---
@@ -213,6 +214,7 @@ Cross-cutting references that don't belong to a single audience.
 - [Adapter Selection](reference/adapter-selection.md) — `DXR_D3D_FORCE_GPU` / `DXR_VK_FORCE_GPU` supported contract (hybrid iGPU/dGPU machines, in-process `getenv` caveat)
 - [DPI Awareness](reference/dpi-awareness.md) — the DLL rule: Win32 geometry read inside the runtime answers in the HOST app's DPI space, so publish-worthy rects must pin a per-monitor-v2 thread context
 - [Control Panel performance settings](roadmap/control-panel-performance-settings.md) — census of all 71 `DXR_*` levers (read site, mechanism, default, tier) + the design for a persisted settings store the runtime reads inside the app process (design only)
+- [Display dashboard](roadmap/display-dashboard.md) — multi-screen status for the CLI (`status --watch`), the Control Panel (Displays + Windows tabs) and agents: snapshot schema, warnings as data, the DIAG RPCs, the `get_screen_status` plug-in slot, phasing (design, ADR-051)
 - [Workspace Stability](reference/workspace-stability.md) — the wedge family (lock starvation, fence jams, blocking presents, vendor-DP and MCP write wedges), the no-unbounded-work principle (#925), and the diagnostic toolkit ([RENDER] tell, PDBs, wedge captures, close gauntlet)
 
 Vendor-specific reference docs now live in [`vendors/<vendor>/`](vendors/).

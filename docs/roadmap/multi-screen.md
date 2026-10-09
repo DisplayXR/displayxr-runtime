@@ -262,6 +262,8 @@ Slot and tag reservations (97/98, Win 106/107, tags 22/23/24/25) were approved b
   On macOS a straddling window is only fully visible with "Displays have separate Spaces" OFF
   (the default is ON, which clips it to the display holding most of it; one-shot WARN, logout to change).
 
+> Status surface: the per-screen / per-window state this plan creates is shown by the display dashboard (ADR-051, [`display-dashboard.md`](display-dashboard.md)): `displayxr-cli status`, the Control Panel Displays + Windows tabs, and the `get_screen_status` plug-in slot for the vendor cell.
+
 ## 6. Risks and open questions
 
 1. **Render cost** of a straddling window is 2× views. Acceptable; the common case is one

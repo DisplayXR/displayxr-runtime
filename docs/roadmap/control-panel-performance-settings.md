@@ -274,7 +274,7 @@ process resolves the same chain. Three surfaces, in order of value:
 |---|---|---|
 | **0** | GPU topology + provenance in `displayxr-cli info --json`, rendered by the panel. No behaviour change. | **SHIPPED** |
 | **1** | `u_setting` chain + allow-list; the three user controls; `displayxr-cli perf`; the anti-stale banner. | **SHIPPED** |
-| **2** | Gated "Developer settings" list (Tier 1 + Tier 2, with provenance). Wants the panel on **tabs** first — it is nine sections in one scroll column now, and at 250 % DPI you see about a third of it. | design |
+| **2** | Gated "Developer settings" list (Tier 1 + Tier 2, with provenance). Wants the panel on **tabs** first — the tab layout, the long-lived `status --watch` child and the Displays / Windows pages are specified in [`display-dashboard.md`](display-dashboard.md) (ADR-051) — it is nine sections in one scroll column now, and at 250 % DPI you see about a third of it. | design |
 | **3** | Tier-2 live service settings over the existing `DIAG` IPC path. | design |
 
 ### The three controls, as shipped
