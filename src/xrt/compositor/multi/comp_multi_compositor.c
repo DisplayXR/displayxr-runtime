@@ -2109,11 +2109,12 @@ multi_compositor_get_predicted_eye_positions(struct multi_compositor *mc, struct
 	if (mc->weave.dp != NULL) {
 		return xrt_display_processor_get_predicted_eye_positions(mc->weave.dp, out_eye_pos);
 	}
-#ifdef XRT_OS_MACOS
+#if defined(XRT_OS_MACOS) && defined(COMP_MULTI_WEAVE_HAVE_METAL)
 	// The macOS weave's Metal backend keeps its DP apart: `weave.dp` only ever
-	// holds a Vulkan-vtable DP.
+	// holds a Vulkan-vtable DP. Read through the backend so the vendor call
+	// runs inside an autorelease pool (this is an IPC pthread with none).
 	if (mc->weave.dp_metal != NULL) {
-		return xrt_display_processor_metal_get_predicted_eye_positions(mc->weave.dp_metal, out_eye_pos);
+		return comp_multi_weave_macos_metal_predicted_eyes(mc->weave.dp_metal, out_eye_pos);
 	}
 #endif
 #endif
