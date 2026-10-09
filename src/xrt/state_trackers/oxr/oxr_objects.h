@@ -2885,6 +2885,15 @@ struct oxr_session
 	struct xrt_segment_view_routing seg_route;
 	//! Last per-segment view layout logged (one INFO line per change).
 	struct xrt_segment_view_routing seg_route_logged;
+	/*!
+	 * Multi-screen over IPC (ADR-047 Amendment 2): this service session asked
+	 * the service to segment its window (compositor_segments_enable), so its
+	 * locates fetch the service's segment table and its frames send the
+	 * routing — only on a box whose service can segment at all.
+	 */
+	bool seg_ipc;
+	//! The routing last sent to the service (it is sent change-only).
+	struct xrt_segment_view_routing seg_route_sent;
 
 #ifdef XRT_OS_ANDROID
 	//! The last ANativeWindow this session published into `android_globals`
