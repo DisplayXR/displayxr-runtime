@@ -91,14 +91,16 @@ Four consequences for this skill:
   and the publish's "Assert the Windows build's UA-CH release stamp matches the tag" step
   refuses the run with `stamped browser_version=0.0.0-dev but the tag is 1.7.1`, skipping sign
   + publish. Re-dispatching the publish with the same run ids fails the same way; only a
-  rebuild fixes it. The Linux lane has no `browser_version` input and is not asserted.
+  rebuild fixes it. The Linux lane's input is `deb_version=X.Y.Z` (the publish asserts the
+  .deb's `Version` == `X.Y.Z-1`; without it the lane stamps `X.Y.Z+N.g<sha>` from git
+  describe and "Locate the assets" refuses it).
   Hit for real on v1.7.1 (2026-10-09): three green dev-stamped lanes, one more hour of box
   time. Full pre-tag recipe for the browser:
   ```bash
   SHA=$(git rev-parse origin/main)   # the commit you are about to tag
   gh workflow run build-box.yml         -R DisplayXR/displayxr-browser-pvt --ref main -f patch_ref=$SHA -f lifecycle_only=false -f browser_version=X.Y.Z
   gh workflow run build-box-android.yml -R DisplayXR/displayxr-browser-pvt --ref main -f patch_ref=$SHA -f lifecycle_only=false -f browser_version=X.Y.Z
-  gh workflow run build-box-linux.yml   -R DisplayXR/displayxr-browser-pvt --ref main -f patch_ref=$SHA -f lifecycle_only=false   # after android frees the builder
+  gh workflow run build-box-linux.yml   -R DisplayXR/displayxr-browser-pvt --ref main -f patch_ref=$SHA -f lifecycle_only=false -f deb_version=X.Y.Z   # after android frees the builder
   ```
 - **THE TAG TRIGGER WORKS, BUT ONLY IF A BUILD RAN AT THE COMMIT YOU TAG. Arrange that
   before you tag.** The publish resolves which build to ship by matching a successful
