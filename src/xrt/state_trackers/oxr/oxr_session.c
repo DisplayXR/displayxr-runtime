@@ -131,6 +131,14 @@ struct xrt_window_metrics;
 bool
 comp_ipc_client_compositor_get_window_metrics(struct xrt_compositor *xc, struct xrt_window_metrics *out_metrics);
 
+// Multi-screen M6/M3 over IPC (ADR-047 Amendment 2) — same linkage pattern.
+// The table / routing travel by value; see ipc_client.h.
+struct xrt_segment_metrics;
+void
+comp_ipc_client_compositor_segments_enable(struct xrt_compositor *xc, uint64_t pinned_display_id);
+bool
+comp_ipc_client_compositor_get_segment_metrics(struct xrt_compositor *xc, struct xrt_segment_metrics *out_metrics);
+
 // IPC-client DP tracking state (#441 Phase 2) — same linkage pattern as
 // above. Consumed ONLY for the derived isTracking value + tracking-state
 // event; view poses stay server-computed (ipc_try_get_sr_view_poses).
@@ -3471,8 +3479,12 @@ locate_views_one(struct oxr_logger *log,
 #else
 	const bool zone_chained = false;
 #endif
-	const bool rig_route_native =
-	    (rig_active || view_raw != NULL || zone_chained) && !sess->is_bridge_relay && sess->xcn != NULL;
+	// Multi-screen over IPC (ADR-047 Amendment 2): a per-segment locate is
+	// framed HERE, from the segment's own eyes and canvas the service sent
+	// (seg); the server's rig call computes one view set for the whole window
+	// and would overwrite it, so a segment locate never takes it.
+	const bool rig_route_native = (rig_active || view_raw != NULL || zone_chained) && !sess->is_bridge_relay &&
+	                              sess->xcn != NULL && seg == NULL;
 	const bool rig_route_bridge = view_raw != NULL && sess->is_bridge_relay;
 	if ((rig_route_native || rig_route_bridge) && ipc_service_mode) {
 		struct ipc_view_rig_info rig_info = {0};
@@ -3674,9 +3686,13 @@ locate_views_one(struct oxr_logger *log,
 	// fovs[0..active_view_count-1] (see #246). Entries beyond active are
 	// filled by the device's get_view_poses and must not be overwritten.
 	if (!ipc_rig_done) {
+		// Multi-screen over IPC: a segment's views are computed client-side
+		// from that segment's eyes (the server knows one view set only), so
+		// its Kooima FOVs are the answer, not the device's.
+		const bool seg_ipc_fov = seg != NULL && sess->seg_ipc;
 		struct xrt_fov kooima_fovs[XRT_MAX_VIEWS];
 		uint32_t fov_save_count = (active_view_count < view_count) ? active_view_count : view_count;
-		if (have_kooima_fov && (have_view_state || rig_active)) {
+		if (have_kooima_fov && (have_view_state || rig_active || seg_ipc_fov)) {
 			for (uint32_t ei = 0; ei < fov_save_count; ei++) {
 				kooima_fovs[ei] = fovs[ei];
 			}
@@ -3696,7 +3712,7 @@ locate_views_one(struct oxr_logger *log,
 		// 3D state (non-IPC mode) or a chained view rig. In IPC mode, the
 		// server already computes 3D-adjusted Kooima FOVs and returns them
 		// via get_view_poses — don't override those.
-		if (have_kooima_fov && (have_view_state || rig_active)) {
+		if (have_kooima_fov && (have_view_state || rig_active || seg_ipc_fov)) {
 			for (uint32_t ei = 0; ei < fov_save_count; ei++) {
 				fovs[ei] = kooima_fovs[ei];
 			}
@@ -4156,13 +4172,18 @@ locate_views_one(struct oxr_logger *log,
  */
 
 //! The compositor's segment table, when this session's compositor segments its
-//! window (in-process Vulkan on desktop Linux, in-process D3D11 on Windows).
-//! Everything else — the other native compositors, IPC/service sessions (the
-//! service never segments) — answers false and keeps one view set.
+//! window (in-process Vulkan on desktop Linux, in-process D3D11 on Windows, the
+//! D3D11 service for a Windows IPC session that enabled it — one round trip,
+//! only on a box with two DP-backed screens). Everything else — the other
+//! native compositors, every other service session — answers false and keeps
+//! one view set.
 static bool
 locate_get_segment_metrics(struct oxr_session *sess, struct xrt_segment_metrics *out)
 {
 	memset(out, 0, sizeof(*out));
+	if (sess->seg_ipc && sess->xcn != NULL) {
+		return comp_ipc_client_compositor_get_segment_metrics(&sess->xcn->base, out) && out->count > 0;
+	}
 #ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
 	if (sess->xcn != NULL && sess->is_vk_native_compositor) {
 		return comp_vk_native_compositor_get_segment_metrics(&sess->xcn->base, out) && out->count > 0;
@@ -6287,6 +6308,24 @@ oxr_session_create(struct oxr_logger *log,
 			comp_metal_compositor_set_screens(&sess->xcn->base, screens, &sys->xsysc->info, pinned);
 			free(screens);
 		}
+	}
+#endif
+
+#ifdef XRT_OS_WINDOWS
+	// Multi-screen M6/M3 over IPC (ADR-047 Amendment 2): the D3D11 service
+	// weaves a direct client's window per screen the same way. It owns the
+	// screen registry, so only the session's pin crosses the wire. Asked for
+	// only where a window can split at all (two DP-backed screens: the set
+	// capacity), so a single-screen box never sends it and never pays the
+	// per-locate table fetch.
+	if (sys->xsysc != NULL && sys->xsysc->info.is_service_mode && sys->xsysc->xmcc == NULL && sess->xcn != NULL &&
+	    !sess->is_bridge_relay && !xsi.is_workspace_controller && sys->multiview_set_capacity > 1) {
+		uint64_t pinned = 0;
+#ifdef OXR_HAVE_DXR_display_info
+		pinned = bound_display_id;
+#endif
+		comp_ipc_client_compositor_segments_enable(&sess->xcn->base, pinned);
+		sess->seg_ipc = true;
 	}
 #endif
 

@@ -171,9 +171,9 @@ oxr_system_fill_in(
 	/*
 	 * Multi-screen M3: advertise one view set per segment only where a
 	 * window can ever be split — the in-process Vulkan compositor on desktop
-	 * Linux, the in-process D3D11 compositor on Windows or the in-process
-	 * Metal compositor on macOS, with at least two
-	 * registry screens that have a DP factory. A single-screen box, a service
+	 * Linux, the in-process D3D11 compositor or the D3D11 service on Windows,
+	 * or the in-process Metal compositor on macOS, with at least two registry
+	 * screens that have a DP factory. A single-screen box, a Linux service
 	 * session and every other platform keep the pre-M3 count, so existing
 	 * multiview apps and the CTS see no change.
 	 */
@@ -201,9 +201,17 @@ oxr_system_fill_in(
 		// capacity is per system, so a D3D12 / GL / Vulkan session on the
 		// same box advertises the doubled count too and never splits — the
 		// tail views then repeat view 0, which the contract allows.
+		//
+		// Service sessions too (ADR-047 Amendment 2): the D3D11 service
+		// segments a direct IPC client's window the same way. The registry
+		// counted here is then the SERVICE's — `xrt_system_compositor_info`
+		// crosses the wire by value, so each entry's factory pointer is a
+		// service-process address: never called here, only tested for NULL
+		// ("the service can make a D3D11 DP for that screen"). A
+		// single-screen box still counts 1 and keeps the pre-M3 count.
 		const char *segs_env = getenv("DXR_SEGMENTS");
 		const bool segments_off = segs_env != NULL && segs_env[0] == '0';
-		if (sys->xsysc != NULL && !sys->xsysc->info.is_service_mode && !segments_off) {
+		if (sys->xsysc != NULL && !segments_off) {
 			can_segment = true;
 			const struct xrt_dp_factory_registry *reg = &sys->xsysc->info.dp_registry;
 			for (uint32_t e = 0; e < reg->entry_count && e < XRT_DP_REGISTRY_MAX_ENTRIES; e++) {
