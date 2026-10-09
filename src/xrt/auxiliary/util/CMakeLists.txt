@@ -138,6 +138,8 @@ add_library(
 	u_setting.h
 	u_space_overseer.c
 	u_space_overseer.h
+	u_status_snapshot.c
+	u_status_snapshot.h
 	u_string_list.cpp
 	u_string_list.h
 	u_string_list.hpp

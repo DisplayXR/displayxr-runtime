@@ -14,6 +14,7 @@ add_library(
 			    target_input_plugin_loader.c target_input_plugin_loader.h
 			    target_plugin_loader.c target_plugin_loader.h
 			    target_screens.c target_screens.h
+			    target_status_snapshot.c target_status_snapshot.h
 			    target_screen_pin.c target_screen_pin.h
 			    target_plugin_preload_sanitize.c target_plugin_preload_sanitize.h
 			    target_plugin_path_guard.c target_plugin_path_guard.h

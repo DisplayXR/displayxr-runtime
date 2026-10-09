@@ -46,6 +46,9 @@ cli_print_help(int argc, const char **argv)
 	P("                      'runtime activate [<manifest>]', 'runtime restore'.\n");
 	P("  displays [--json] - Enumerate connected displays via EDID (vendor-neutral).\n");
 	P("           [--claims] - Also show which plug-in claims each display (loads plug-ins).\n");
+	P("  status [--json]   - Display status snapshot (ADR-051): one row per screen with its claim,\n");
+	P("                      metres, roles, tracking and warnings. From the service when reachable,\n");
+	P("                      else headless (labelled 'source: headless').\n");
 	P("  clients [--json]  - List the running service's IPC clients with their verified class\n");
 	P("                      (#960). Connects over IPC as a DIAG client; non-elevated on Windows.\n");
 	P("  lift <...>        - 2D->3D conversion module (XR_DXR_lift, ADR-042), over IPC (DIAG).\n");
@@ -97,6 +100,9 @@ main(int argc, const char **argv)
 	}
 	if (strcmp(argv[1], "displays") == 0) {
 		return cli_cmd_displays(argc, argv);
+	}
+	if (strcmp(argv[1], "status") == 0) {
+		return cli_cmd_status(argc, argv);
 	}
 	if (strcmp(argv[1], "clients") == 0) {
 		return cli_cmd_clients(argc, argv);
