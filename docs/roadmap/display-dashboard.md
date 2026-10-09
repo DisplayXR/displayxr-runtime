@@ -351,10 +351,10 @@ enable is a shared vote that `destroy` does not withdraw); config resolve at mos
 |---|---|---|
 | **0** landed | `displays --claims --json`: `schema`, claim serial, mm; `selftest` metres check | — |
 | **1** ✅ landed | `xrt_display_status.h`; headless builder `target_status_snapshot_build_headless` (targets/common) + pure `u_status_warnings_derive` / `u_status_snapshot_to_cjson` / `u_status_snapshot_format_text` (aux_util); `displayxr-cli status [--json]` (`status_fetch_service` stub for phase 2); warnings §4; `struct ipc_service_health` + `ipc_server_get_health` behind `[HEALTH]`, `struct comp_d3d11_render_diag` + `comp_d3d11_service_get_render_diag` behind `[RENDER]` (log lines byte-identical); `tests_status_snapshot` | — |
-| **2** | the three DIAG RPCs, generation counters, `status --watch`; `clients` gains presenter / lease / window / owner | 1 |
+| **2** ✅ landed | the three DIAG-only RPCs (`system_get_status_generation`; `system_get_status_snapshot(screen_index)` = `xrt_status_head` + one screen row; `system_get_client_segments(client_id)` = one client row + its raw `xrt_segment_metrics`) — fixed-size by-value replies, each stamped with its generation; the service snapshot (`ipc_server_status.c` + `target_status_snapshot_build_service`, registered by the service target as `ipc_server_status_provider`) with `topology` / `status` counters bumped on connect / disconnect / re-probe and on whatever a status read finds moved (screen list, plug-in state, client flags, presenter, lease, window, segment generation, owner, DP backend, `is_tracking` edge, mode), 2 s floor, lazy rebuild; Windows `native` from DisplayConfig's preferred mode (`NOT_NATIVE` can fire); `status` over DIAG with labelled headless fallback, `status --watch [--interval ms]` (NDJSON with `--json`); `clients` gains presenter / lease / window / owner_screen; `tests_status_ipc` | 1 |
 | **3** ✅ | plug-in slot `get_screen_status` + `sim_display` implementation + iface doc — **landed** (slot first; its consumer arrives with 1/2) | 1 |
 | **4** | Control Panel: tabs, long-lived `--watch` child, Displays + Windows pages, desktop map, Overview summary line | 2 |
-| **5** | MCP `get_status_snapshot` (session-free, wraps the CLI) | 2 |
+| **5** ✅ landed | MCP `get_status_snapshot` (session-free, returns `displayxr-cli status --json` verbatim) | 2 |
 | **6** | the vendor plug-in fills the cell from the SDK query; "Open in vendor" | 3 + §9.1–9.2 |
 
 Phases 1–3 are runtime PRs with CI coverage (`tests_ipc_proto.py` for the appended

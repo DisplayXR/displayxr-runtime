@@ -136,3 +136,8 @@ the `displayxr-mcp` adapter's `--target workspace` mode
 App-registered tools carry `_meta {"displayxr/group": "app"}` and are
 exposed by default; Phase A introspection stays `diagnostic` (hidden
 unless `--expose-diagnostics`).
+
+The runtime also registers session-free diagnostic tools that wrap
+`displayxr-cli … --json` (`get_runtime_status`, `run_selftest`,
+`list_display_processors`, `set_preferred_dp`, and `get_status_snapshot` — the
+ADR-051 display status snapshot, `displayxr-cli status --json` verbatim).
