@@ -490,10 +490,15 @@ twice. The other plug-ins are claim sources only. No device is created from
 them, and active-plug-in selection is unchanged.
 
 Unlike Windows, POSIX loads the others **only when they could matter**. The
-active plug-in wins every monitor it claims (#1521), and only a different
-pinned plug-in outranks it. So when the active plug-in claims every monitor
-and no other plug-in is preferred, the source set is the active plug-in alone,
-and nothing else is `dlopen`ed or probed. That covers
+active plug-in wins every monitor it claims (#1521), at any confidence, and
+only a different PreferredPlugin or a `DXR_SCREEN_PLUGIN` pin naming a
+different plug-in for that monitor outranks it. So when the active plug-in
+claims every monitor, no other plug-in is preferred, and no pin for a
+connected monitor names another plug-in, the source set is the active plug-in
+alone, and nothing else is `dlopen`ed or probed
+(`target_screen_active_decides_every_monitor`, unit-tested). The pin clause is
+what keeps `XRT_PREFERRED_PLUGIN_ID=sim-display DXR_SCREEN_PLUGIN=HDMI-1=leia-sr`
+(below) working: leia-sr must be loaded for the pin to find its claim. Without a pin, the shortcut covers
 `XRT_PREFERRED_PLUGIN_ID=sim-display` (sim-display claims every monitor), so
 pinning sim-display does not load the Leia plug-in or touch the SR service.
 The check is repeated on every resolve.

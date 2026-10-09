@@ -129,3 +129,56 @@ TEST_CASE("winner rule: pin > PreferredPlugin > active > confidence", "[target][
 	CHECK(why == TARGET_SCREEN_PICK_NONE);
 	CHECK(unclaimed);
 }
+
+TEST_CASE("claim-source shortcut: the active plug-in alone decides only without a competing pin",
+          "[target][screen_pin]")
+{
+	// ds1-linux: eDP-1 laptop panel + the DS1 on HDMI-1; sim-display active and
+	// claiming both at FALLBACK, as it claims every monitor.
+	target_screen_monitor mons[] = {
+	    {0x1111, "eDP-1", "eDP-1", true},
+	    {0x886e4475353b22b9ull, "HDMI-1", "HDMI-A-1", true},
+	};
+	target_screen_pins none;
+	REQUIRE(target_screen_pin_parse(nullptr, &none, nullptr) == 0);
+
+	// Nothing outranks the active plug-in: the shortcut holds, whatever the
+	// confidence of its claims (rule 3 is confidence-blind, #1521 — see the
+	// "No pin, no preferred" case above: sim at FALLBACK beats leia VERIFIED).
+	CHECK(target_screen_active_decides_every_monitor("sim-display", nullptr, &none, mons, 2));
+	CHECK(target_screen_active_decides_every_monitor("sim-display", "sim-display", &none, mons, 2));
+
+	// A different PreferredPlugin may outrank it (efa3f88d0's original guard).
+	CHECK_FALSE(target_screen_active_decides_every_monitor("sim-display", "leia-sr", &none, mons, 2));
+
+	// A monitor the active plug-in does not claim: another plug-in may.
+	mons[1].active_claims = false;
+	CHECK_FALSE(target_screen_active_decides_every_monitor("leia-sr", nullptr, &none, mons, 2));
+	mons[1].active_claims = true;
+
+	// THE BUG: the documented sim-session-with-a-woven-DS1 recipe,
+	// XRT_PREFERRED_PLUGIN_ID=sim-display DXR_SCREEN_PLUGIN=HDMI-1=leia-sr.
+	// The pin outranks sim on HDMI-1, so leia-sr must be loaded for its claim.
+	target_screen_pins pins;
+	REQUIRE(target_screen_pin_parse("HDMI-1=leia-sr", &pins, nullptr) == 1);
+	CHECK_FALSE(target_screen_active_decides_every_monitor("sim-display", "sim-display", &pins, mons, 2));
+	CHECK_FALSE(target_screen_active_decides_every_monitor("sim-display", nullptr, &pins, mons, 2));
+	// By connector and by monitor id too.
+	REQUIRE(target_screen_pin_parse("hdmi-a-1=leia-sr", &pins, nullptr) == 1);
+	CHECK_FALSE(target_screen_active_decides_every_monitor("sim-display", nullptr, &pins, mons, 2));
+	REQUIRE(target_screen_pin_parse("0x886e4475353b22b9=leia-sr", &pins, nullptr) == 1);
+	CHECK_FALSE(target_screen_active_decides_every_monitor("sim-display", nullptr, &pins, mons, 2));
+
+	// A pin naming the active plug-in itself (any case) changes nothing.
+	REQUIRE(target_screen_pin_parse("HDMI-1=SIM-DISPLAY", &pins, nullptr) == 1);
+	CHECK(target_screen_active_decides_every_monitor("sim-display", nullptr, &pins, mons, 2));
+
+	// A pin for a monitor that is not connected cannot change this resolve.
+	REQUIRE(target_screen_pin_parse("DP-3=leia-sr", &pins, nullptr) == 1);
+	CHECK(target_screen_active_decides_every_monitor("sim-display", nullptr, &pins, mons, 2));
+
+	// No active plug-in, or no monitors: never short-circuit.
+	CHECK_FALSE(target_screen_active_decides_every_monitor(nullptr, nullptr, &none, mons, 2));
+	CHECK_FALSE(target_screen_active_decides_every_monitor("sim-display", nullptr, &none, mons, 0));
+	CHECK_FALSE(target_screen_active_decides_every_monitor("sim-display", nullptr, &none, nullptr, 2));
+}
