@@ -29,12 +29,13 @@
  *    IPC reply returns, so xrWeaveSubmitDXR returning IS the completion signal.
  *  - Output sizing: batch (v3) = the INPUT IOSurface dims (the v3 contract
  *    makes the input window-client-sized); legacy single rect = rect
- *    offset+extent; v6 = one content view, or the window when the DP does not
- *    tolerate a resample of its output (a lenticular lattice must reach the
- *    panel 1:1).
+ *    offset+extent; v6 = one content view, or the reported window when the
+ *    DP does not tolerate a resample of its output (a lenticular lattice must
+ *    reach the panel 1:1).
  *  - Window geometry (spec v7): `windowOriginOnScreen` is global CoreGraphics
  *    space in BACKING pixels (y down). The engine resolves the panel
- *    (displayId = CGDirectDisplayID, else the display containing the origin,
+ *    (displayId = CGDirectDisplayID, else the display containing the origin —
+ *    ambiguous with mixed backing scales, so such setups must send displayId —
  *    else the main display) and feeds the DP `origin - panel origin` as its
  *    present origin before every weave (Metal backend).
  *
@@ -164,8 +165,9 @@ weave_display_backing_rect(
  * Resolve the panel-relative present origin from the stored geometry — only
  * when it changed (geometry_dirty), the result is cached and re-sent to the DP
  * every submit. Panel: the reported displayId (a CGDirectDisplayID; -1 and 0
- * mean not reported), else the active display whose backing-px rect contains the origin, else the main
- * display. Logs one WARN per change (a human-rate event: a window move).
+ * mean not reported), else the active display containing the origin, else the
+ * main display. WARNs on the first resolve and whenever the resolved panel or
+ * its scale changes; an origin-only change (a drag) is INFO.
  */
 static void
 weave_resolve_present_origin_locked(struct multi_compositor *mc)
@@ -182,6 +184,7 @@ weave_resolve_present_origin_locked(struct multi_compositor *mc)
 	double scale = 1.0;
 	CGDirectDisplayID panel = 0;
 	const char *how = NULL;
+	bool fallback = false;
 
 	// displayId -1 (spec: unknown / single display) and 0 are "not reported".
 	if (mc->weave.win_display_id != 0 && mc->weave.win_display_id != -1 &&
@@ -190,20 +193,46 @@ weave_resolve_present_origin_locked(struct multi_compositor *mc)
 		how = "reported displayId";
 	}
 	if (panel == 0) {
+		// Containment, per display in that display's OWN units: the origin is
+		// backing px, so test origin / scale_d against the display's point
+		// bounds. With mixed scales several displays can match (the backing-px
+		// spaces of different-scale displays overlap) — prefer a non-main one
+		// and ask the caller for displayId.
 		CGDirectDisplayID ids[16];
 		uint32_t n = 0;
+		uint32_t matches = 0;
+		const CGDirectDisplayID main_id = CGMainDisplayID();
 		if (CGGetActiveDisplayList(16, ids, &n) == kCGErrorSuccess) {
-			for (uint32_t i = 0; i < n && panel == 0; i++) {
+			for (uint32_t i = 0; i < n; i++) {
 				int32_t x = 0, y = 0;
 				uint32_t w = 0, h = 0;
 				double s = 1.0;
-				if (weave_display_backing_rect(ids[i], &x, &y, &w, &h, &s) && wx >= x &&
-				    wx < x + (int32_t)w && wy >= y && wy < y + (int32_t)h) {
+				if (!weave_display_backing_rect(ids[i], &x, &y, &w, &h, &s)) {
+					continue;
+				}
+				const CGRect b = CGDisplayBounds(ids[i]);
+				const CGPoint pt = CGPointMake((double)wx / s, (double)wy / s);
+				if (!CGRectContainsPoint(b, pt)) {
+					continue;
+				}
+				matches++;
+				if (panel == 0 || (panel == main_id && ids[i] != main_id)) {
 					panel = ids[i];
 					px = x, py = y, pw = w, ph = h, scale = s;
-					how = "display containing the origin";
 				}
 			}
+		}
+		if (matches > 1) {
+			how = "display containing the origin (AMBIGUOUS: several match, picked the non-main one)";
+			if (!mc->weave.present_ambiguity_logged) {
+				mc->weave.present_ambiguity_logged = true;
+				U_LOG_W(
+				    "weave(#759): window origin (%d,%d) backing px lies in %u displays (mixed backing "
+				    "scales) — picked 0x%x; the caller should chain XrWeaveWindowGeometryDXR.displayId",
+				    wx, wy, matches, (unsigned)panel);
+			}
+		} else if (matches == 1) {
+			how = "display containing the origin";
 		}
 	}
 	if (panel == 0) {
@@ -214,18 +243,63 @@ weave_resolve_present_origin_locked(struct multi_compositor *mc)
 			scale = 1.0;
 		}
 		how = "main display (fallback)";
+		fallback = true;
 	}
+
+	const bool first = !mc->weave.have_present_origin;
+	const bool panel_changed =
+	    first || mc->weave.present_panel != (uint32_t)panel || mc->weave.present_panel_scale != scale;
 
 	mc->weave.have_present_origin = true;
 	mc->weave.present_origin_x = wx - px;
 	mc->weave.present_origin_y = wy - py;
+	mc->weave.present_panel = (uint32_t)panel;
+	mc->weave.present_panel_x = px;
+	mc->weave.present_panel_y = py;
+	mc->weave.present_panel_scale = scale;
+	mc->weave.present_panel_fallback = fallback;
+	mc->weave.present_check_counter = 0;
 
 	const bool fed = mc->weave.backend != NULL && mc->weave.backend->feeds_present_origin;
-	U_LOG_W(
-	    "weave(#759): present origin (%d,%d) panel-relative backing px on display 0x%x (%s; panel %d,%d %ux%u "
-	    "backing px, scale %.2f) — %s every submit",
-	    mc->weave.present_origin_x, mc->weave.present_origin_y, (unsigned)panel, how, px, py, pw, ph, scale,
-	    fed ? "fed to the DP phase slot (set_present_origin)" : "NOT fed (this backend has no phase feed)");
+	if (panel_changed) {
+		U_LOG_W(
+		    "weave(#759): present origin (%d,%d) panel-relative backing px on display 0x%x (%s; panel %d,%d "
+		    "%ux%u backing px, scale %.2f) — %s every submit",
+		    mc->weave.present_origin_x, mc->weave.present_origin_y, (unsigned)panel, how, px, py, pw, ph, scale,
+		    fed ? "fed to the DP phase slot (set_present_origin)" : "NOT fed (this backend has no phase feed)");
+	} else {
+		U_LOG_I("weave(#759): present origin (%d,%d) on display 0x%x", mc->weave.present_origin_x,
+		        mc->weave.present_origin_y, (unsigned)panel);
+	}
+}
+
+//! Submits between display-reconfiguration checks of the cached panel.
+#define WEAVE_PANEL_RECHECK_SUBMITS 60
+
+/*!
+ * Display reconfiguration (arrangement / scale change) without a window move:
+ * every WEAVE_PANEL_RECHECK_SUBMITS submits, re-read the cached panel's
+ * backing rect and re-resolve if it moved, rescaled or vanished (a fallback
+ * resolve is always retried — a display may now contain the origin).
+ */
+static void
+weave_recheck_panel_locked(struct multi_compositor *mc)
+{
+	if (!mc->weave.have_present_origin || mc->weave.geometry_dirty) {
+		return;
+	}
+	if (++mc->weave.present_check_counter < WEAVE_PANEL_RECHECK_SUBMITS) {
+		return;
+	}
+	mc->weave.present_check_counter = 0;
+	int32_t x = 0, y = 0;
+	uint32_t w = 0, h = 0;
+	double s = 1.0;
+	const bool ok = weave_display_backing_rect((CGDirectDisplayID)mc->weave.present_panel, &x, &y, &w, &h, &s);
+	if (!ok || mc->weave.present_panel_fallback || x != mc->weave.present_panel_x ||
+	    y != mc->weave.present_panel_y || s != mc->weave.present_panel_scale) {
+		mc->weave.geometry_dirty = true;
+	}
 }
 
 /*!
@@ -470,22 +544,22 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 			}
 		}
 
-		// Output dims: v6 = one content view (cvw x cvh), or the window when the
-		// DP's lattice must not be resampled; batch = the (window-client-sized)
+		// Output dims: v6 = one content view (cvw x cvh), or the window (if
+		// reported) when the DP's lattice must not be resampled; batch = the (window-client-sized)
 		// input; legacy = rect offset+extent (the Windows GetClientRect-less
 		// fallback).
 		uint32_t want_w = 0, want_h = 0;
 		if (nview) {
 			want_w = cvw;
 			want_h = cvh;
-			if (!be->output_tolerates_resample(mc)) {
-				if (mc->weave.have_geometry && mc->weave.win_w > 0 && mc->weave.win_h > 0) {
-					want_w = mc->weave.win_w;
-					want_h = mc->weave.win_h;
-				} else {
-					want_w = mc->weave.in_w;
-					want_h = mc->weave.in_h;
-				}
+			// A non-resample-tolerant DP's lattice must reach the panel 1:1:
+			// size the output to the window when the caller reported one.
+			// Without geometry stay at one content view — the worst-case input
+			// (N views wide) is never the window.
+			if (!be->output_tolerates_resample(mc) && mc->weave.have_geometry && mc->weave.win_w > 0 &&
+			    mc->weave.win_h > 0) {
+				want_w = mc->weave.win_w;
+				want_h = mc->weave.win_h;
 			}
 		} else if (rect_count > 0) {
 			want_w = mc->weave.in_w;
@@ -502,6 +576,7 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 			break;
 		}
 
+		weave_recheck_panel_locked(mc);
 		weave_resolve_present_origin_locked(mc);
 
 		const struct comp_multi_weave_macos_params params = {

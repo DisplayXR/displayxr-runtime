@@ -634,6 +634,15 @@ struct multi_compositor
 		//! Cached panel-relative present origin (resolved when geometry_dirty).
 		bool have_present_origin;
 		int32_t present_origin_x, present_origin_y;
+		//! The panel the cached origin was resolved against + its backing-px
+		//! origin and scale, re-checked every N submits so a display
+		//! reconfiguration (arrangement / scale change) re-resolves it.
+		uint32_t present_panel;
+		int32_t present_panel_x, present_panel_y;
+		double present_panel_scale;
+		bool present_panel_fallback; //!< Resolved via the main-display fallback.
+		uint32_t present_check_counter;
+		bool present_ambiguity_logged; //!< One-shot "send displayId" hint.
 		//! @}
 
 		//! @name Cached input import (rebuilt when the IOSurfaceID changes)
@@ -1579,6 +1588,17 @@ comp_multi_weave_export_fence(struct xrt_compositor *xc, xrt_graphics_sync_handl
  */
 bool
 comp_multi_weave_macos_request_display_mode(struct multi_compositor *mc, bool enable_3d);
+
+#ifdef COMP_MULTI_WEAVE_HAVE_METAL
+/*!
+ * The Metal weave backend DP's predicted eyes, read inside an autorelease
+ * pool (the caller runs on an IPC pthread with none). Plain-C entry for
+ * multi_compositor_get_predicted_eye_positions.
+ */
+bool
+comp_multi_weave_macos_metal_predicted_eyes(struct xrt_display_processor_metal *dp,
+                                            struct xrt_eye_positions *out_eye_pos);
+#endif
 #endif
 
 #ifdef XRT_OS_LINUX_DESKTOP

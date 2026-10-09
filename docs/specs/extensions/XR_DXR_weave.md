@@ -391,9 +391,9 @@ The macOS service (comp_multi + null compositor) implements the same bind / subm
 contract with these platform substitutions (`comp_multi_weave_macos.c` front end over a vk or
 metal backend, below):
 
-| Contract point | Windows (D3D11 service) | macOS (comp_multi Vulkan) |
+| Contract point | Windows (D3D11 service) | macOS (comp_multi, vk or metal backend) |
 |---|---|---|
-| `windowHandle` | HWND (DP phase snap + `GetClientRect` sizing) | opaque id, stored only — the phase comes from the chained `XrWeaveWindowGeometryDXR` (below) |
+| `windowHandle` | HWND (DP phase snap + `GetClientRect` sizing) | opaque id, stored only — on the metal backend the phase comes from the chained `XrWeaveWindowGeometryDXR` (below); the vk backend (sim_display) records that geometry for Kooima / window metrics only |
 | `inputTexture` | D3D11 NT / legacy-DXGI shared HANDLE | **IOSurfaceRef** (crosses IPC as a global IOSurfaceID) |
 | `inputIsDxgi` | selects legacy-DXGI open path | ignored |
 | Input-ready sync | keyed mutex `AcquireSync(0)` | caller completes GPU writes **before** `xrWeaveSubmitDXR` |
@@ -417,17 +417,25 @@ semantics. Two behaviours are DP-driven on the metal backend only: a DP that is 
 alpha-native gets a post-weave alpha pass (output alpha = the views' max alpha at that pixel,
 so v5's transparent gaps survive an opaque weaver), and a DP whose output must not be
 resampled (no `TOLERATES_RESAMPLE` scanout flag — a lenticular lattice) gets a v6 output sized
-to the **window** (`clientSize`, else the input) instead of one content view.
+to the **window** (`clientSize`) instead of one content view; without a reported geometry the
+v6 output stays one content view (the worst-case input is never the window). A v4 overlay is
+composited over the whole output on both backends, stretched if its size differs (macOS does
+not apply desktop Linux's v17 stale-size rule).
 
 **Window geometry units (v7 on macOS).** `windowOriginOnScreen` is the client area's top-left
 in **global CoreGraphics space, in backing pixels** (y down, origin = the top-left of the
 global CG display space, i.e. `CGDisplayBounds` points × the display's backing scale);
 `clientSize` is in backing pixels; `displayId` is the `CGDirectDisplayID` of the panel the
 window is on (`-1`/`0` = not reported). The engine resolves the panel (the reported id, else
-the active display whose backing-pixel rect contains the origin, else the main display) and
+the active display containing the origin — tested per display as `origin / scale` against its
+`CGDisplayBounds` points — else the main display) and
 feeds the DP its **present origin** — `origin − round(CGDisplayBounds(panel).origin × scale)`,
 panel-relative backing pixels — through `set_present_origin` before every weave (metal
-backend; the vk backend does not feed a phase). This is a platform note, not a wire change.
+backend; the vk backend does not feed a phase). **Mixed-scale setups must send `displayId`:**
+the backing-pixel spaces of displays with different scales overlap, so containment can match
+several panels (the engine then prefers the non-main one and logs once). A display
+reconfiguration (arrangement or scale change) is picked up within 60 submits without a window
+move. This is a platform note, not a wire change.
 
 ## 5b. Android platform mapping (#1036)
 

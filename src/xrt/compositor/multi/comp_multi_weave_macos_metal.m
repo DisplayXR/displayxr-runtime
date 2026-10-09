@@ -13,7 +13,8 @@
  *  - Device: ONE MTLCreateSystemDefaultDevice per service (lazy, process
  *    lifetime) + one MTLCommandQueue per client. Both outlive the DP, which
  *    may hold a vendor weaver created on them.
- *  - DP: dp_factory_metal(device, queue, NULL window) — windowless; its phase
+ *  - DP: dp_factory_metal(device, queue, NULL window) — windowless (a factory
+ *    failure is retried, rate-limited: a vendor service may not be up yet); its phase
  *    comes only from set_present_origin, fed before every weave from the
  *    front end's resolved panel-relative origin.
  *  - Input / overlay: the caller's IOSurfaces wrapped as BGRA8 MTLTextures
@@ -52,6 +53,7 @@
 #include "xrt/xrt_display_processor_metal.h"
 #include "xrt/xrt_display_metrics.h"
 
+#include "os/os_time.h"
 #include "util/u_misc.h"
 #include "util/u_logging.h"
 
@@ -72,8 +74,22 @@
 
 struct weave_metal
 {
-	bool initialized;
-	bool failed; //!< One-shot: don't re-run a hopeless bring-up every submit.
+	bool initialized;   //!< Device objects + DP ready.
+	bool objects_ready; //!< Queue + PSOs built (the DP may still be missing).
+	//! Permanent latch: no device / queue / shader / PSO, or no Metal DP factory
+	//! at all — don't re-run a hopeless bring-up every submit.
+	bool failed;
+
+	//! @name DP factory retry (a vendor DP can fail transiently, e.g. its
+	//! tracking service is not up yet): retried, rate-limited.
+	//! @{
+	bool dp_failed_once;
+	uint32_t dp_retry_submits; //!< Submits since the last factory attempt.
+	int64_t dp_last_try_ns;
+	//! @}
+
+	bool sbs_fresh; //!< SBS scratch just (re)allocated: clear on its first use.
+	uint32_t cmd_fail_count; //!< Failed command buffers (rate-limited log).
 
 	id<MTLCommandQueue> queue;
 	id<MTLRenderPipelineState> unsqueeze_pso; //!< SBS half -> scratch tile (no blend).
@@ -285,25 +301,14 @@ weave_metal_private_texture(uint32_t w, uint32_t h, MTLTextureUsage usage)
  *
  */
 
-static bool
-mtlb_ensure_engine(struct multi_compositor *mc)
-{
-	struct weave_metal *wm = wm_of(mc);
-	if (wm != NULL && wm->initialized) {
-		return true;
-	}
-	if (wm != NULL && wm->failed) {
-		return false;
-	}
-	if (wm == NULL) {
-		wm = calloc(1, sizeof(*wm));
-		if (wm == NULL) {
-			return false;
-		}
-		mc->weave.metal = wm;
-	}
-	wm->failed = true; // cleared on success below
+//! Factory retry cadence after a DP factory failure.
+#define WEAVE_METAL_DP_RETRY_SUBMITS 60
+#define WEAVE_METAL_DP_RETRY_NS (1000LL * 1000LL * 1000LL)
 
+//! Queue + shaders + PSOs. Any failure here is permanent (wm->failed).
+static bool
+weave_metal_create_objects(struct weave_metal *wm)
+{
 	@autoreleasepool {
 		id<MTLDevice> dev = weave_metal_device();
 		if (dev == nil) {
@@ -331,19 +336,75 @@ mtlb_ensure_engine(struct multi_compositor *mc)
 		if (wm->unsqueeze_pso == nil || wm->alpha_pso == nil || wm->over_pso == nil) {
 			return false;
 		}
+	}
+	return true;
+}
 
-		xrt_dp_factory_metal_fn_t factory = (xrt_dp_factory_metal_fn_t)mc->msc->base.info.dp_factory_metal;
-		if (factory == NULL) {
-			U_LOG_E("weave(#759) metal: the plug-in has no Metal DP factory — cannot weave");
+static bool
+mtlb_ensure_engine(struct multi_compositor *mc)
+{
+	struct weave_metal *wm = wm_of(mc);
+	if (wm != NULL && wm->initialized) {
+		return true;
+	}
+	if (wm != NULL && wm->failed) {
+		return false;
+	}
+	if (wm == NULL) {
+		wm = calloc(1, sizeof(*wm));
+		if (wm == NULL) {
 			return false;
 		}
+		mc->weave.metal = wm;
+	}
+
+	if (!wm->objects_ready) {
+		if (!weave_metal_create_objects(wm)) {
+			wm->failed = true;
+			return false;
+		}
+		wm->objects_ready = true;
+	}
+
+	xrt_dp_factory_metal_fn_t factory = (xrt_dp_factory_metal_fn_t)mc->msc->base.info.dp_factory_metal;
+	if (factory == NULL) {
+		U_LOG_E("weave(#759) metal: the plug-in has no Metal DP factory — cannot weave");
+		wm->failed = true;
+		return false;
+	}
+
+	// A factory failure may be transient (a vendor service not up yet): retry
+	// every WEAVE_METAL_DP_RETRY_SUBMITS submits or WEAVE_METAL_DP_RETRY_NS,
+	// whichever comes first.
+	const int64_t now_ns = os_monotonic_get_ns();
+	if (wm->dp_failed_once) {
+		wm->dp_retry_submits++;
+		if (wm->dp_retry_submits < WEAVE_METAL_DP_RETRY_SUBMITS &&
+		    now_ns - wm->dp_last_try_ns < WEAVE_METAL_DP_RETRY_NS) {
+			return false;
+		}
+	}
+	wm->dp_retry_submits = 0;
+	wm->dp_last_try_ns = now_ns;
+
+	@autoreleasepool {
+		id<MTLDevice> dev = weave_metal_device();
 		// Windowless: the present-owner owns its NSWindow; phase comes from
 		// set_present_origin.
 		xrt_result_t xret = factory((void *)dev, (void *)wm->queue, NULL, &mc->weave.dp_metal);
 		if (xret != XRT_SUCCESS || mc->weave.dp_metal == NULL) {
-			U_LOG_E("weave(#759) metal: Metal DP factory failed: %d", xret);
+			if (!wm->dp_failed_once) {
+				U_LOG_W(
+				    "weave(#759) metal: Metal DP factory failed: %d — retrying every %d submits / 1 s "
+				    "(submits fail until it comes up)",
+				    xret, WEAVE_METAL_DP_RETRY_SUBMITS);
+			}
+			wm->dp_failed_once = true;
 			mc->weave.dp_metal = NULL;
 			return false;
+		}
+		if (wm->dp_failed_once) {
+			U_LOG_W("weave(#759) metal: Metal DP factory succeeded on retry");
 		}
 
 		struct xrt_display_processor_metal *dp = mc->weave.dp_metal;
@@ -351,7 +412,6 @@ mtlb_ensure_engine(struct multi_compositor *mc)
 		wm->tolerates_resample = xrt_display_processor_metal_tolerates_resample(dp);
 		wm->has_present_origin_slot = XRT_DP_HAS_SLOT(dp, set_present_origin) && dp->set_present_origin != NULL;
 
-		wm->failed = false;
 		wm->initialized = true;
 		U_LOG_W(
 		    "weave(#759): macOS weave engine initialized — backend=metal on '%s' (BGRA8, synchronous; DP "
@@ -465,6 +525,7 @@ mtlb_ensure_output(struct multi_compositor *mc, uint32_t want_w, uint32_t want_h
 			U_LOG_E("weave(#759) metal: SBS scratch (%ux%u) allocation failed", want_w * 2, want_h);
 			return false;
 		}
+		wm->sbs_fresh = true; // undefined contents: never Load it
 	}
 	return true;
 }
@@ -481,8 +542,10 @@ weave_metal_encode_unsqueeze(struct multi_compositor *mc,
 	// v5 firstChunk (browser#22): clear to premultiplied transparent so regions
 	// BETWEEN the woven tiles come out alpha 0; otherwise the scratch persists
 	// across submits (stale regions re-weave harmlessly; the caller composites
-	// back only its current rects).
-	rp.colorAttachments[0].loadAction = p->first_chunk ? MTLLoadActionClear : MTLLoadActionLoad;
+	// back only its current rects). A freshly allocated scratch has undefined
+	// contents, so its first use clears too.
+	rp.colorAttachments[0].loadAction = (p->first_chunk || wm->sbs_fresh) ? MTLLoadActionClear : MTLLoadActionLoad;
+	wm->sbs_fresh = false;
 	rp.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
 	rp.colorAttachments[0].storeAction = MTLStoreActionStore;
 
@@ -638,8 +701,12 @@ mtlb_record_and_wait(struct multi_compositor *mc, const struct comp_multi_weave_
 		}
 
 		// v4 overlay (browser#18): composite the premultiplied 2D atlas OVER the
-		// woven output — not woven, so crisp 2D lands at screen depth. Same rule
-		// as the vk backend: a cached overlay is composited every submit.
+		// woven output — not woven, so crisp 2D lands at screen depth. Same rules
+		// as the vk backend: a cached overlay is composited every submit, and it
+		// is sampled over the WHOLE output whatever its size (the vk flatten
+		// draw maps src 0..1 onto the full window too — an overlay of another
+		// size is stretched, not dropped; only desktop Linux ignores a
+		// stale-size overlay, spec v17).
 		if (wm->overlay_tex != nil) {
 			MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
 			rp.colorAttachments[0].texture = wm->out_tex;
@@ -656,9 +723,14 @@ mtlb_record_and_wait(struct multi_compositor *mc, const struct comp_multi_weave_
 		[cmd commit];
 		[cmd waitUntilCompleted];
 		if ([cmd status] != MTLCommandBufferStatusCompleted) {
-			NSError *err = [cmd error];
-			U_LOG_E("weave(#759) metal: command buffer failed (status %d): %s", (int)[cmd status],
-			        err != nil ? [[err localizedDescription] UTF8String] : "?");
+			// Rate-limited: the first failure, then one line per 300.
+			const uint32_t n = ++wm->cmd_fail_count;
+			if (n == 1 || n % 300 == 0) {
+				NSError *err = [cmd error];
+				const char *why = err != nil ? [[err localizedDescription] UTF8String] : "?";
+				U_LOG_E("weave(#759) metal: command buffer failed (status %d, %u failures so far): %s",
+				        (int)[cmd status], n, why);
+			}
 		} else {
 			ok = true;
 		}
@@ -666,52 +738,70 @@ mtlb_record_and_wait(struct multi_compositor *mc, const struct comp_multi_weave_
 	return ok;
 }
 
+// The hooks below call into the vendor DP on the client's IPC pthread, which
+// has no autorelease pool: each body runs inside its own.
+
+bool
+comp_multi_weave_macos_metal_predicted_eyes(struct xrt_display_processor_metal *dp,
+                                            struct xrt_eye_positions *out_eye_pos)
+{
+	@autoreleasepool {
+		return dp != NULL && xrt_display_processor_metal_get_predicted_eye_positions(dp, out_eye_pos);
+	}
+}
+
 static bool
 mtlb_get_eyes(struct multi_compositor *mc, struct xrt_eye_positions *out_eyes)
 {
-	return mc->weave.dp_metal != NULL &&
-	       xrt_display_processor_metal_get_predicted_eye_positions(mc->weave.dp_metal, out_eyes);
+	return comp_multi_weave_macos_metal_predicted_eyes(mc->weave.dp_metal, out_eyes);
 }
 
 static bool
 mtlb_request_display_mode(struct multi_compositor *mc, bool enable_3d, bool *out_has_slot)
 {
-	struct xrt_display_processor_metal *dp = mc->weave.dp_metal;
-	*out_has_slot = dp != NULL && XRT_DP_HAS_SLOT(dp, request_display_mode) && dp->request_display_mode != NULL;
-	return *out_has_slot ? xrt_display_processor_metal_request_display_mode(dp, enable_3d) : true;
+	@autoreleasepool {
+		struct xrt_display_processor_metal *dp = mc->weave.dp_metal;
+		*out_has_slot =
+		    dp != NULL && XRT_DP_HAS_SLOT(dp, request_display_mode) && dp->request_display_mode != NULL;
+		return *out_has_slot ? xrt_display_processor_metal_request_display_mode(dp, enable_3d) : true;
+	}
 }
 
 static bool
 mtlb_get_hardware_3d_state(struct multi_compositor *mc, bool *out_is_3d)
 {
-	return mc->weave.dp_metal != NULL &&
-	       xrt_display_processor_metal_get_hardware_3d_state(mc->weave.dp_metal, out_is_3d);
+	@autoreleasepool {
+		return mc->weave.dp_metal != NULL &&
+		       xrt_display_processor_metal_get_hardware_3d_state(mc->weave.dp_metal, out_is_3d);
+	}
 }
 
 static void
 mtlb_fini(struct multi_compositor *mc)
 {
-	struct weave_metal *wm = wm_of(mc);
-	// The DP first: a vendor DP destroys its weaver (created on our device +
-	// queue) before its own SDK instance, and both must go before the queue.
-	if (mc->weave.dp_metal != NULL) {
-		xrt_display_processor_metal_destroy(&mc->weave.dp_metal);
+	@autoreleasepool {
+		struct weave_metal *wm = wm_of(mc);
+		// The DP first: a vendor DP destroys its weaver (created on our device +
+		// queue) before its own SDK instance, and both must go before the queue.
+		if (mc->weave.dp_metal != NULL) {
+			xrt_display_processor_metal_destroy(&mc->weave.dp_metal);
+		}
+		if (wm == NULL) {
+			return;
+		}
+		weave_metal_release_output(mc, wm);
+		[wm->in_tex release];
+		[wm->overlay_tex release];
+		[wm->crop_tex release];
+		[wm->unsqueeze_pso release];
+		[wm->alpha_pso release];
+		[wm->over_pso release];
+		[wm->queue release];
+		free(wm);
+		mc->weave.metal = NULL;
+		mc->weave.in_w = mc->weave.in_h = 0;
+		mc->weave.overlay_w = mc->weave.overlay_h = 0;
 	}
-	if (wm == NULL) {
-		return;
-	}
-	weave_metal_release_output(mc, wm);
-	[wm->in_tex release];
-	[wm->overlay_tex release];
-	[wm->crop_tex release];
-	[wm->unsqueeze_pso release];
-	[wm->alpha_pso release];
-	[wm->over_pso release];
-	[wm->queue release];
-	free(wm);
-	mc->weave.metal = NULL;
-	mc->weave.in_w = mc->weave.in_h = 0;
-	mc->weave.overlay_w = mc->weave.overlay_h = 0;
 }
 
 const struct comp_multi_weave_macos_backend comp_multi_weave_macos_backend_metal = {
