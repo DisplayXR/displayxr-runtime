@@ -637,6 +637,42 @@ comp_metal_segments_enabled(const struct comp_metal_segments *segs)
 	return segs != NULL && segs->enabled;
 }
 
+/*!
+ * macOS "Displays have separate Spaces" (com.apple.spaces `spans-displays`
+ * absent or false = ON, the default). With it ON the WindowServer shows a
+ * window spanning displays ONLY on the display holding most of it; the rest
+ * is clipped even though it is rendered and woven. The setting only changes
+ * after a logout, so one read per process is enough. Diagnostic only — no
+ * behaviour depends on it. `DXR_TEST_SEPARATE_SPACES=0|1` overrides the read
+ * (to exercise the warning on a box configured either way).
+ */
+static bool
+separate_spaces_on(void)
+{
+	static int cached = -1;
+	if (cached < 0) {
+		const char *e = getenv("DXR_TEST_SEPARATE_SPACES");
+		if (e != NULL && (e[0] == '0' || e[0] == '1')) {
+			cached = e[0] == '1' ? 1 : 0;
+		} else {
+			bool spans = false;
+			CFPropertyListRef v = CFPreferencesCopyAppValue(CFSTR("spans-displays"), CFSTR("com.apple.spaces"));
+			if (v != NULL) {
+				if (CFGetTypeID(v) == CFBooleanGetTypeID()) {
+					spans = CFBooleanGetValue((CFBooleanRef)v);
+				} else if (CFGetTypeID(v) == CFNumberGetTypeID()) {
+					int n = 0;
+					CFNumberGetValue((CFNumberRef)v, kCFNumberIntType, &n);
+					spans = n != 0;
+				}
+				CFRelease(v);
+			}
+			cached = spans ? 0 : 1;
+		}
+	}
+	return cached == 1;
+}
+
 bool
 comp_metal_segments_update(struct comp_metal_segments *segs, const struct comp_metal_seg_window *win, uint32_t mode_index)
 {
@@ -667,6 +703,17 @@ comp_metal_segments_update(struct comp_metal_segments *segs, const struct comp_m
 
 	const bool split = comp_segments_table_is_split(&segs->table_pt, win->frame_pt.w, win->frame_pt.h);
 	convert_table(segs);
+
+	// One-shot: a window spanning displays under separate Spaces is clipped
+	// by the WindowServer to the display holding most of it.
+	static bool warned_separate_spaces = false;
+	if (!warned_separate_spaces && segs->table_pt.count >= 2 && separate_spaces_on()) {
+		warned_separate_spaces = true;
+		U_LOG_W("macOS 'Displays have separate Spaces' is ON — a window spanning displays is shown only on the "
+		        "display holding most of it (the rest is rendered but clipped by the WindowServer); turn it off "
+		        "in System Settings → Desktop & Dock → Mission Control (requires logout) for multi-display "
+		        "windows");
+	}
 
 	// Re-ask each DP's resample tolerance on a mode or table change only.
 	const bool table_changed =

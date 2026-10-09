@@ -119,6 +119,9 @@ for it. This is the default; an app can opt out.
   `SIM_DISPLAY_METAL_SNAP_PERIOD=N` (N > 1) installs a test double that snaps horizontal
   displacement to whole multiples of N backing px, to exercise the snap, the size absorption and
   the Retina lattice without hardware.
+- Dragging a window across displays only shows it on both with macOS "Displays have separate
+  Spaces" OFF; with it ON (the default) the WindowServer clips it to the display holding most of
+  it — the segments path logs a one-shot WARN (comp-segments.md § macOS / Metal).
 - A window resized past the display the atlas was sized for no longer reads past the atlas (the
   crop blit is clamped; it used to assert under `MTL_DEBUG_LAYER=1`).
 
