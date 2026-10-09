@@ -37,6 +37,12 @@
 // #1580: the ONE per-view camera every layer type is projected through.
 #include "util/comp_layer_view_camera.h"
 #include "util/comp_dp_factory.h"
+// Multi-screen M6/M3 on the service path: the in-process segment manager and
+// the shared routing / publish helpers.
+#include "util/comp_segments_route.h"
+#include "comp_d3d11_outcomp.h"
+#include "comp_d3d11_segments.h"
+#include "xrt/xrt_screen.h"
 
 #include "comp_d3d11_window.h"
 
@@ -951,6 +957,42 @@ struct d3d11_service_compositor
 	uint32_t pipe_tile_columns;
 	uint32_t pipe_tile_rows;
 	bool pipe_frame_ready;
+
+	/*!
+	 * Multi-screen M6/M3 on the service path (ADR-047 Amendment 2): this
+	 * client's window, when it spans monitors, is woven per screen by the
+	 * direct pipeline — the in-process compositor's segment manager, made on
+	 * the OUTPUT device. Opt-in: nothing here exists until the client sends
+	 * `compositor_segments_enable` (its oxr session does that only on a box
+	 * with two DP-backed screens), so a single-screen client is untouched.
+	 *
+	 * Threads. `segments`, `seg_outcomp` and `seg_device` are the render
+	 * thread's (it creates, updates and records them holding render_mutex);
+	 * compositor_destroy frees them under render_mutex too. `seg_mutex`
+	 * guards the hand-offs: the screen list (written by the IPC thread), the
+	 * published table (read by the IPC thread at xrLocateViews) and every
+	 * swap of `segments` (the IPC thread reads segment eyes through it).
+	 * Leaf lock: nothing is waited on while holding it.
+	 *
+	 * `seg_route` is the routing the client's last splitting locate handed
+	 * back; it is written and read only on this client's own IPC thread
+	 * (set_view_routing, then layer_commit — one connection, in order).
+	 */
+	std::mutex seg_mutex;
+	struct xrt_screen_list *seg_screens;             //!< heap copy; NULL = segmentation not enabled
+	struct xrt_system_compositor_info *seg_sys_info; //!< heap copy (the DP registry)
+	uint64_t seg_pinned_display_id;
+	bool seg_rebuild; //!< a new list arrived: rebuild the manager on the next weave
+	struct comp_d3d11_segments *segments;
+	struct comp_d3d11_outcomp *seg_outcomp; //!< flat-2D fill, on @ref seg_device
+	ID3D11Device *seg_device;               //!< the device the two above were made on
+	struct xrt_segment_metrics seg_pub;     //!< the table the last direct weave took
+	//! When a direct weave of this client last published @ref seg_pub
+	//! (monotonic ns). A table older than SVC_SEG_PUB_FRESH_NS is not handed
+	//! out: the client is no longer the direct presenter (focus moved, the
+	//! workspace took over, its frames stalled), so it locates one view set.
+	int64_t seg_pub_ns;
+	struct xrt_segment_view_routing seg_route;
 
 	//! #1140: the recipe the per-client atlas ACTUALLY HOLDS — the per-view
 	//! content dims and the view count of the last commit that PAINTED it.
@@ -13984,6 +14026,206 @@ pipeline_return_app_grant(struct d3d11_multi_compositor *mc,
 	}
 }
 
+/*
+ *
+ * Multi-screen M6/M3 on the service path (ADR-047 Amendment 2): a direct IPC
+ * client's window that spans monitors, woven per screen.
+ *
+ */
+
+//! How long a direct weave's segment table stays valid for the client's
+//! locates (~15 frames at 60 Hz): long enough for a skipped or slow frame,
+//! short enough that a client which lost the panel stops locating per segment.
+#define SVC_SEG_PUB_FRESH_NS ((int64_t)250 * 1000 * 1000)
+
+//! The window's client area in desktop device px. The service is per-monitor
+//! DPI aware (dpi_aware.manifest), so this is the space the screen registry's
+//! monitor rects are in; GetClientRect / ClientToScreen work cross-process on
+//! the app's real HWND and send no message.
+static bool
+svc_seg_window_rect(HWND hwnd, struct comp_seg_rect *out)
+{
+	RECT cr;
+	POINT origin = {0, 0};
+	if (hwnd == nullptr || !IsWindow(hwnd) || !GetClientRect(hwnd, &cr) || cr.right <= 0 || cr.bottom <= 0 ||
+	    !ClientToScreen(hwnd, &origin)) {
+		return false;
+	}
+	out->x = origin.x;
+	out->y = origin.y;
+	out->w = (uint32_t)cr.right;
+	out->h = (uint32_t)cr.bottom;
+	return true;
+}
+
+//! Drop the client's segment manager and its flat-2D unit. Render thread (or
+//! compositor_destroy), holding render_mutex: no weave is in flight. The
+//! pointer is swapped out under seg_mutex, which is what the IPC thread reads
+//! segment eyes under, so no reader can still be inside the manager when it
+//! is destroyed.
+static void
+svc_seg_release(struct d3d11_service_compositor *c)
+{
+	struct comp_d3d11_segments *old = nullptr;
+	{
+		std::lock_guard<std::mutex> lk(c->seg_mutex);
+		old = c->segments;
+		c->segments = nullptr;
+		struct xrt_segment_metrics none;
+		memset(&none, 0, sizeof(none)); // memcmp'd: padding too
+		(void)comp_segments_publish(&c->seg_pub, &none);
+	}
+	comp_d3d11_segments_destroy(&old);
+	comp_d3d11_outcomp_destroy(&c->seg_outcomp);
+	c->seg_device = nullptr;
+}
+
+/*!
+ * The direct pipeline's segment path for the focused client: when its window
+ * spans monitors, weave it per screen into the presenter's back buffer — the
+ * panel DP (bound to the app's HWND, so it keeps the vendor's phase-snap) on
+ * the primary screen's segment, a windowless per-screen DP from the registry
+ * (`create_dp_d3d11_for_screen`, phase from `set_present_origin`) on every
+ * other, flat 2D where no DP can weave. The in-process D3D11 compositor's own
+ * manager (comp_d3d11_segments), made on the OUTPUT device so it is right
+ * under the #918 split too; the atlas it crops is the one the single-DP path
+ * would have woven (the client's crop, or the egress slot under the split).
+ *
+ * Scope: an APP_HWND presenter (a window the app owns, which is what can sit
+ * across a seam). A hosted client presents into the service's own window on
+ * the panel, a present-owner / client-texture client weaves on its own, and a
+ * zones frame keeps the single-DP path — as in-process. A client that never
+ * sent `compositor_segments_enable` returns false before anything else: the
+ * frame is the single-DP one, byte for byte.
+ *
+ * Every call also publishes the table this weave took (count 0 = one view
+ * set), for the client's next xrLocateViews.
+ *
+ * Render thread, holding render_mutex. The caller has bound @p present_rtv and
+ * fed @p dp this frame's transparency, encoding and timing.
+ *
+ * @return true when the frame was woven per segment (the caller then skips
+ *         its single process_atlas).
+ */
+static bool
+pipeline_segments_weave(struct d3d11_service_system *sys,
+                        struct d3d11_service_compositor *fc,
+                        enum d3d11_presenter_kind kind,
+                        HWND present_hwnd,
+                        ID3D11RenderTargetView *present_rtv,
+                        struct xrt_display_processor_d3d11 *dp,
+                        ID3D11ShaderResourceView *dp_input_srv,
+                        uint32_t view_w,
+                        uint32_t view_h,
+                        uint32_t cols,
+                        uint32_t rows,
+                        uint32_t target_w,
+                        uint32_t target_h)
+{
+	ID3D11Device *dev = svc_out_device(sys);
+	ID3D11DeviceContext *ctx = svc_out_context(sys);
+	bool rebuild = false;
+	{
+		std::lock_guard<std::mutex> lk(fc->seg_mutex);
+		if (fc->seg_screens == nullptr) {
+			return false; // never enabled: the single-DP path, untouched
+		}
+		rebuild = fc->seg_rebuild || fc->seg_device != dev;
+	}
+
+	if (rebuild) {
+		// A new screen list, or the output device moved (#918 split engaged
+		// or released): the segment DPs and crops belong to the old device.
+		svc_seg_release(fc);
+		struct comp_d3d11_segments *ns = comp_d3d11_segments_create(dev);
+		bool enabled = false;
+		{
+			std::lock_guard<std::mutex> lk(fc->seg_mutex);
+			if (ns != nullptr) {
+				comp_d3d11_segments_set_screens(ns, fc->seg_screens, fc->seg_sys_info,
+				                                fc->seg_pinned_display_id);
+				enabled = comp_d3d11_segments_enabled(ns);
+			}
+			fc->segments = ns;
+			fc->seg_rebuild = false;
+		}
+		if (comp_d3d11_outcomp_create(dev, ctx, &fc->seg_outcomp) != XRT_SUCCESS) {
+			fc->seg_outcomp = nullptr; // segments that cannot weave then stay black, not flat 2D
+		}
+		fc->seg_device = dev; // tried once per device / list, never per frame
+		if (enabled) {
+			// Lifecycle (once per manager): the rig's proof that this IPC
+			// client's segment DPs are made in the service, on the device
+			// that presents.
+			U_LOG_W(
+			    "segments: IPC client %p (pid %ld) — a window spanning monitors is woven per screen by the "
+			    "service's direct pipeline; segment DPs on the %s device %p (multi-screen M6, service "
+			    "path)",
+			    (void *)fc, fc->client_pid, sys->split_active ? "OUTPUT" : "app", (void *)dev);
+		}
+	}
+
+	struct xrt_segment_metrics m;
+	memset(&m, 0, sizeof(m)); // memcmp'd by the publish: padding too
+	bool split = false;
+	struct comp_seg_rect win = {};
+	if (kind == PRESENTER_APP_HWND && fc->segments != nullptr && comp_d3d11_segments_enabled(fc->segments) &&
+	    dp != nullptr && dp_input_srv != nullptr && !fc->zone_published && present_rtv != nullptr &&
+	    svc_seg_window_rect(present_hwnd, &win)) {
+		const struct comp_seg_rect canvas = {0, 0, win.w, win.h};
+		const uint32_t mode_index = (sys->xdev != nullptr && sys->xdev->hmd != nullptr)
+		                                ? sys->xdev->hmd->active_rendering_mode_index
+		                                : 0;
+		split = comp_d3d11_segments_update(fc->segments, &win, &canvas, ctx, mode_index);
+		// Every segment DP follows the panel's 2D/3D state, like the panel DP.
+		comp_d3d11_segments_set_display_mode(fc->segments, sys->hardware_display_3d);
+		if (split) {
+			(void)comp_d3d11_segments_get_metrics(fc->segments, &win, &canvas, /*primary_has_dp*/ true, &m);
+		}
+	}
+	{
+		std::lock_guard<std::mutex> lk(fc->seg_mutex);
+		(void)comp_segments_publish(&fc->seg_pub, &m);
+		fc->seg_pub_ns = (int64_t)os_monotonic_get_ns();
+	}
+	if (!split) {
+		return false;
+	}
+
+	struct comp_d3d11_segments_frame sf = {};
+	sf.context = ctx;
+	sf.src_srv = dp_input_srv;
+	sf.view_width = view_w;
+	sf.view_height = view_h;
+	sf.tile_columns = cols;
+	sf.tile_rows = rows;
+	sf.src_format = (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM;
+	sf.target_rtv = present_rtv;
+	sf.target_width = target_w;
+	sf.target_height = target_h;
+	sf.canvas.x = 0;
+	sf.canvas.y = 0;
+	sf.canvas.w = win.w;
+	sf.canvas.h = win.h;
+	sf.transparent_background = false; // an APP_HWND presenter is woven opaque (pipeline_dp_set_transparency)
+	sf.atlas_encoding = (int)service_single_client_atlas_encoding(fc);
+	sf.primary_dp = dp;
+	sf.outcomp = fc->seg_outcomp;
+	comp_d3d11_segments_record(fc->segments, &sf);
+
+	// Leave exactly the state the single-DP path leaves: the back buffer
+	// bound, full-target viewport and scissor.
+	ctx->OMSetRenderTargets(1, &present_rtv, nullptr);
+	D3D11_VIEWPORT full_vp = {};
+	full_vp.Width = (float)target_w;
+	full_vp.Height = (float)target_h;
+	full_vp.MaxDepth = 1.0f;
+	ctx->RSSetViewports(1, &full_vp);
+	D3D11_RECT full_scissor = {0, 0, (LONG)target_w, (LONG)target_h};
+	ctx->RSSetScissorRects(1, &full_scissor);
+	return true;
+}
+
 static void
 pipeline_default_policy_render(struct d3d11_service_system *sys,
                                struct d3d11_multi_compositor *mc,
@@ -14033,6 +14275,16 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 			// (#939): there both are desktop peers and z-order already shows
 			// the foreground one.
 			pipeline_park_loser_for_winner(mc, was_focused, best);
+			// Multi-screen M6: the outgoing presenter's segment DPs go with
+			// the panel — one set of per-screen weavers at a time, rebuilt
+			// if it takes the panel back (svc_seg_release clears the device
+			// it was made on, which is the rebuild trigger).
+			if (was_focused >= 0 && was_focused < D3D11_MULTI_MAX_CLIENTS) {
+				struct d3d11_service_compositor *oc = mc->clients[was_focused].compositor;
+				if (oc != nullptr && (oc->segments != nullptr || oc->seg_outcomp != nullptr)) {
+					svc_seg_release(oc);
+				}
+			}
 			// #1018: the INCOMING one may itself be parked — restore it, or
 			// the ready-probe skips it every frame and the panel goes black.
 			// Covers the survivor-fallback path too (holder exits -> next).
@@ -14464,10 +14716,15 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		xrt_display_processor_d3d11_set_frame_timing(dp, mc->panel_r_ns,
 		                                             (uint64_t)(U_TIME_1S_IN_NS / sys->refresh_rate));
 		svc_assert_same_device(dp_input_srv, svc_out_device(sys));
-		xrt_display_processor_d3d11_process_atlas(dp, svc_out_context(sys), dp_input_srv, weave_view_w,
-		                                          weave_view_h, weave_cols, weave_rows,
-		                                          DXGI_FORMAT_R8G8B8A8_UNORM, target_w, target_h, 0, 0, 0,
-		                                          0);
+		// Multi-screen M6 (ADR-047 Amendment 2): a window across a seam is
+		// woven per screen; anything else (and every client that never
+		// enabled segments) takes the single weave below, unchanged.
+		if (!pipeline_segments_weave(sys, fc, kind, present_hwnd, present_rtv, dp, dp_input_srv, weave_view_w,
+		                             weave_view_h, weave_cols, weave_rows, target_w, target_h)) {
+			xrt_display_processor_d3d11_process_atlas(
+			    dp, svc_out_context(sys), dp_input_srv, weave_view_w, weave_view_h, weave_cols, weave_rows,
+			    DXGI_FORMAT_R8G8B8A8_UNORM, target_w, target_h, 0, 0, 0, 0);
+		}
 		g_frame_witness_service.count_weave(!witness_take_fresh_paint(fc), sys->hardware_display_3d);
 	} else if (sys->split_active && dp_input_srv != nullptr) {
 		/*
@@ -17986,8 +18243,17 @@ struct service_proj_view_blit
 	float dst_w, dst_h;               //!< 0 = no scale (source fits the slot)
 	bool is_array;                    //!< ADR-032 layered source
 	uint32_t array_slice;
+	//! Multi-screen M3: this view has no place in this frame's atlas (a routed
+	//! frame's view past every segment's range, or any view past the packed
+	//! tiles) — the caller draws nothing for it.
+	bool skip;
 };
 
+/*!
+ * @p packed_tiles is the tile count this commit packs (the active mode's, 1
+ * in hardware 2D) — what a routed view's local index must fit (multi-screen
+ * M3, see the routing block at the end).
+ */
 static void
 service_proj_view_blit_resolve(struct d3d11_service_system *sys,
                                struct d3d11_service_compositor *c,
@@ -17997,6 +18263,7 @@ service_proj_view_blit_resolve(struct d3d11_service_system *sys,
                                bool bridge_override,
                                uint32_t active_vw,
                                uint32_t active_vh,
+                               uint32_t packed_tiles,
                                struct service_proj_view_blit *out)
 {
 	float src_x = static_cast<float>(layer->data.proj.v[eye].sub.rect.offset.w);
@@ -18070,6 +18337,76 @@ service_proj_view_blit_resolve(struct d3d11_service_system *sys,
 	// it needs no change.
 	out->is_array = view_desc->ArraySize > 1;
 	out->array_slice = static_cast<uint32_t>(layer->data.proj.v[eye].sub.array_index);
+	out->skip = false;
+
+	/*
+	 * Multi-screen M3 on the service path: per-segment views. The client's
+	 * last splitting xrLocateViews handed out one view set per window segment
+	 * and sent the routing back (compositor_set_view_routing) ahead of this
+	 * commit. The atlas keeps the active mode's grid; tile j becomes a mosaic
+	 * of every segment's j-th view, each scaled into ITS segment's rect inside
+	 * the tile — the rect the segment crop reads (comp_segments_tile_rect), so
+	 * each segment DP weaves exactly its own views. The same placement the
+	 * in-process renderer paints (comp_d3d11_renderer, set_routed_viewport).
+	 * An inconsistent routing (the mode changed between the locate and the
+	 * commit, a degenerate rect) is dropped for the frame and the views are
+	 * placed unrouted.
+	 */
+	if (c->seg_route.count > 0 && packed_tiles > 0) {
+		uint32_t tw =
+		    bridge_override ? active_vw : static_cast<uint32_t>(layer->data.proj.v[0].sub.rect.extent.w);
+		uint32_t th =
+		    bridge_override ? active_vh : static_cast<uint32_t>(layer->data.proj.v[0].sub.rect.extent.h);
+		if (tw > layout_vw) {
+			tw = layout_vw; // the content clamp the commit applies after the loop
+		}
+		if (th > layout_vh) {
+			th = layout_vh;
+		}
+		if (comp_segments_route_active(&c->seg_route, layer->data.view_count, packed_tiles, tw, th)) {
+			struct comp_segments_route_slot slot;
+			if (!comp_segments_route_place(&c->seg_route, layer->data.view_count, packed_tiles, tw, th, eye,
+			                               &slot)) {
+				out->skip = true;
+				return;
+			}
+			uint32_t rx = 0, ry = 0;
+			u_tiling_view_origin(slot.tile, cols, layout_vw, layout_vh, &rx, &ry);
+			out->dst_x = static_cast<float>(rx + (uint32_t)slot.rect.x);
+			out->dst_y = static_cast<float>(ry + (uint32_t)slot.rect.y);
+			out->dst_w = static_cast<float>(slot.rect.w); // always scaled into the segment rect
+			out->dst_h = static_cast<float>(slot.rect.h);
+			return;
+		}
+	}
+	if (eye >= packed_tiles && packed_tiles > 0) {
+		out->skip = true; // only reachable when a routed range widened the loop
+	}
+}
+
+/*!
+ * Multi-screen M3: how many of a projection layer's views this commit walks
+ * when the client routes per-segment views — the end of the last segment's
+ * range (each clamped to @p packed_tiles), or 0 when the routing does not fit
+ * what the layer submitted (the commit then walks the packed tiles only).
+ */
+static uint32_t
+service_seg_route_end(const struct d3d11_service_compositor *c, uint32_t layer_view_count, uint32_t packed_tiles)
+{
+	const struct xrt_segment_view_routing *r = &c->seg_route;
+	if (r->count == 0 || r->count > XRT_MAX_SEGMENTS || packed_tiles == 0) {
+		return 0;
+	}
+	uint32_t end = 0;
+	for (uint32_t k = 0; k < r->count; k++) {
+		const uint32_t n = r->view_count[k] < packed_tiles ? r->view_count[k] : packed_tiles;
+		const uint32_t e = r->first_view[k] + n;
+		if (n == 0 || e > layer_view_count) {
+			return 0;
+		}
+		end = e > end ? e : end;
+	}
+	return end > XRT_MAX_VIEWS ? XRT_MAX_VIEWS : end;
 }
 
 /*!
@@ -21222,6 +21559,16 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			proj_view_count = 1;
 		if (proj_view_count > XRT_MAX_VIEWS)
 			proj_view_count = XRT_MAX_VIEWS;
+		// Multi-screen M3: the grid this commit packs stays the mode's; a
+		// routed frame (per-segment views) walks every segment's views, which
+		// the resolver lays into that grid as a mosaic. Unrouted: identical.
+		const uint32_t packed_view_count = proj_view_count;
+		{
+			const uint32_t route_end = service_seg_route_end(c, layer->data.view_count, packed_view_count);
+			if (route_end > proj_view_count) {
+				proj_view_count = route_end;
+			}
+		}
 
 		// #575: remember what this frame actually packed (see eff_view_count
 		// decl). The handoff/crop below derive their grid from this, not the
@@ -21234,7 +21581,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		// resolves the same count in practice, and single-projection frames are
 		// untouched either way.)
 		if (projection_layers_painted == 0) {
-			eff_view_count = proj_view_count;
+			eff_view_count = packed_view_count;
 		}
 
 		// Extract per-view swapchains, textures, and image indices
@@ -21772,10 +22119,14 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		else if (sys->workspace_mode) zc_reason = "workspace_mode";
 		else if (color_blocks_zc)
 			zc_reason = "color_needs_encode";
+		// Multi-screen M3: a routed frame's atlas is a mosaic the service
+		// builds; the app's image is never it.
+		else if (proj_view_count != packed_view_count)
+			zc_reason = "segment_routed";
 
 		if (!has_ui_layers && !has_window_space_layers && !zones_frame && !has_local_2d &&
-		    projection_layer_count <= 1 && all_views_zc_eligible && !sys->workspace_mode &&
-		    !color_blocks_zc) {
+		    projection_layer_count <= 1 && all_views_zc_eligible && !sys->workspace_mode && !color_blocks_zc &&
+		    proj_view_count == packed_view_count) {
 			// Check all views reference the same swapchain image
 			bool all_same = true;
 			for (uint32_t eye = 1; eye < proj_view_count; eye++) {
@@ -22020,7 +22371,10 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			// passes can never place the same view differently.
 			struct service_proj_view_blit pvb = {};
 			service_proj_view_blit_resolve(sys, c, layer, eye, &view_descs[eye], bridge_override, active_vw,
-				                       active_vh, &pvb);
+				                       active_vh, packed_view_count, &pvb);
+			if (pvb.skip) {
+				continue; // multi-screen M3: no place for this view in the mosaic
+			}
 			const float src_x = pvb.src_x;
 			const float src_y = pvb.src_y;
 			const float src_w = pvb.src_w;
@@ -22871,7 +23225,11 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 					struct service_proj_view_blit pvb = {};
 					service_proj_view_blit_resolve(sys, c, layer, view_index, &pdesc,
-					                               bridge_override, active_vw, active_vh, &pvb);
+					                               bridge_override, active_vw, active_vh,
+					                               ui_view_count, &pvb);
+					if (pvb.skip) {
+						continue; // multi-screen M3: no place in this frame's mosaic
+					}
 					blit_to_atlas_texture(sys, &c->render, psc->images[pimg].srv.get(), pvb.src_x,
 					                      pvb.src_y, pvb.src_w, pvb.src_h, pvb.src_tex_w,
 					                      pvb.src_tex_h, pvb.dst_x, pvb.dst_y, pvb.dst_w, pvb.dst_h,
@@ -24401,6 +24759,17 @@ compositor_destroy(struct xrt_compositor *xc)
 		}
 		c->workspace_sync_fence.reset();
 	}
+
+	// Multi-screen M6: the segment DPs are the render thread's; tear them down
+	// under render_mutex so no weave of this client is in flight.
+	if (c->segments != nullptr || c->seg_outcomp != nullptr) {
+		render_mutex_fair_lock lock(sys);
+		svc_seg_release(c);
+	}
+	free(c->seg_screens);
+	c->seg_screens = nullptr;
+	free(c->seg_sys_info);
+	c->seg_sys_info = nullptr;
 
 	delete c;
 }
@@ -29357,6 +29726,128 @@ comp_d3d11_service_get_client_app_window_metrics(struct xrt_system_compositor *x
 	out_metrics->valid = true;
 
 	return true;
+}
+
+/*
+ *
+ * Multi-screen M6/M3 over IPC (ADR-047 Amendment 2). The IPC server is the
+ * caller: it owns the screen registry handle (the server's instance) and the
+ * client's connection; everything below runs on that client's IPC thread.
+ *
+ */
+
+void
+comp_d3d11_service_set_client_segment_screens(struct xrt_system_compositor *xsysc,
+                                              struct xrt_compositor *xc,
+                                              const struct xrt_screen_list *list,
+                                              uint64_t pinned_display_id)
+{
+	if (xsysc == nullptr || xc == nullptr || list == nullptr || !comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+
+	struct xrt_screen_list *copy = U_TYPED_CALLOC(struct xrt_screen_list);
+	struct xrt_system_compositor_info *info_copy = U_TYPED_CALLOC(struct xrt_system_compositor_info);
+	if (copy == nullptr || info_copy == nullptr) {
+		free(copy);
+		free(info_copy);
+		return;
+	}
+	*copy = *list;
+	// The registry (iface + instance per screen) as it stands now — a copy,
+	// like the in-process compositor takes, so a later refresh of the live
+	// info cannot tear what the render thread builds the manager from.
+	*info_copy = sys->base.info;
+
+	{
+		// The render thread rebuilds the manager from this on its next weave
+		// of this client — never here (the manager is the render thread's).
+		std::lock_guard<std::mutex> lk(c->seg_mutex);
+		free(c->seg_screens);
+		c->seg_screens = copy;
+		free(c->seg_sys_info);
+		c->seg_sys_info = info_copy;
+		c->seg_pinned_display_id = pinned_display_id;
+		c->seg_rebuild = true;
+		// ...and nothing may frame views from the old table meanwhile.
+		struct xrt_segment_metrics none;
+		memset(&none, 0, sizeof(none));
+		(void)comp_segments_publish(&c->seg_pub, &none);
+	}
+	// Once per session (lifecycle).
+	U_LOG_W(
+	    "segments: IPC client %p (pid %ld) enabled segments — %u screen(s) in the registry, pinned display "
+	    "0x%016llx",
+	    (void *)c, c->client_pid, list->count, (unsigned long long)pinned_display_id);
+}
+
+bool
+comp_d3d11_service_get_client_segment_metrics(struct xrt_system_compositor *xsysc,
+                                              struct xrt_compositor *xc,
+                                              struct xrt_segment_metrics *out)
+{
+	if (out == nullptr) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+	if (xsysc == nullptr || xc == nullptr || !comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return false;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	{
+		// Leaf: the table plus every SECONDARY screen's eyes, predicted now
+		// from its segment DP (comp_d3d11_segments_get_eyes is safe against
+		// the weave creating or destroying segment DPs; the manager itself is
+		// only swapped under this lock).
+		std::lock_guard<std::mutex> lk(c->seg_mutex);
+		if ((int64_t)os_monotonic_get_ns() - c->seg_pub_ns > SVC_SEG_PUB_FRESH_NS) {
+			return false; // not the direct presenter right now: one view set
+		}
+		*out = c->seg_pub;
+		for (uint32_t k = 0; k < out->count && k < XRT_MAX_SEGMENTS; k++) {
+			struct xrt_segment_metric *s = &out->seg[k];
+			if (!s->is_primary) {
+				s->have_eyes = comp_d3d11_segments_get_eyes(c->segments, s->screen_id, &s->eyes);
+			}
+		}
+	}
+	// The PRIMARY screen's eyes are the panel DP's — the same query
+	// compositor_get_predicted_eye_positions answers, which takes
+	// render_mutex. Taken AFTER seg_mutex is released: the render thread holds
+	// render_mutex when it takes seg_mutex, so the two never nest here.
+	for (uint32_t k = 0; k < out->count && k < XRT_MAX_SEGMENTS; k++) {
+		struct xrt_segment_metric *s = &out->seg[k];
+		if (s->is_primary) {
+			struct xrt_eye_positions eyes;
+			memset(&eyes, 0, sizeof(eyes));
+			s->have_eyes =
+			    comp_d3d11_service_get_predicted_eye_positions_full_for_client(xsysc, xc, &eyes) &&
+			    eyes.valid;
+			if (s->have_eyes) {
+				s->eyes = eyes;
+			}
+		}
+	}
+	return out->count > 0;
+}
+
+void
+comp_d3d11_service_set_client_view_routing(struct xrt_system_compositor *xsysc,
+                                           struct xrt_compositor *xc,
+                                           const struct xrt_segment_view_routing *routing)
+{
+	if (xsysc == nullptr || xc == nullptr || routing == nullptr || !comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	// This client's IPC thread is the only reader (its next layer_commit):
+	// one connection, handled in order, so no lock.
+	c->seg_route = *routing;
+	if (c->seg_route.count > XRT_MAX_SEGMENTS) {
+		memset(&c->seg_route, 0, sizeof(c->seg_route)); // never index past the arrays
+	}
 }
 
 void
