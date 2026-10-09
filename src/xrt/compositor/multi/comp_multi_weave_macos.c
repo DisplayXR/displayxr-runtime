@@ -162,34 +162,38 @@ weave_display_backing_rect(
 }
 
 /*!
- * Resolve the panel-relative present origin from the stored geometry — only
- * when it changed (geometry_dirty), the result is cached and re-sent to the DP
- * every submit. Panel: the reported displayId (a CGDirectDisplayID; -1 and 0
- * mean not reported), else the active display containing the origin, else the
- * main display. WARNs on the first resolve and whenever the resolved panel or
- * its scale changes; an origin-only change (a drag) is INFO.
+ * The panel a point in the weave geometry convention (global CoreGraphics
+ * space in BACKING px, y down) lies on, and that panel's backing rect + scale.
+ * Panel: @p display_id (a CGDirectDisplayID; -1 and 0 mean not reported), else
+ * the active display containing the point, else the main display. Pure: the
+ * caller logs. @p out_matches counts the containing displays (>1 = ambiguous,
+ * mixed backing scales — the non-main one is picked).
  */
-static void
-weave_resolve_present_origin_locked(struct multi_compositor *mc)
+static CGDirectDisplayID
+weave_resolve_panel(int32_t wx,
+                    int32_t wy,
+                    int32_t display_id,
+                    int32_t *out_px,
+                    int32_t *out_py,
+                    uint32_t *out_pw,
+                    uint32_t *out_ph,
+                    double *out_scale,
+                    const char **out_how,
+                    bool *out_fallback,
+                    uint32_t *out_matches)
 {
-	if (!mc->weave.have_geometry || !mc->weave.geometry_dirty) {
-		return;
-	}
-	mc->weave.geometry_dirty = false;
-
-	const int32_t wx = mc->weave.win_x;
-	const int32_t wy = mc->weave.win_y;
 	int32_t px = 0, py = 0;
 	uint32_t pw = 0, ph = 0;
 	double scale = 1.0;
 	CGDirectDisplayID panel = 0;
 	const char *how = NULL;
 	bool fallback = false;
+	uint32_t matches = 0;
 
 	// displayId -1 (spec: unknown / single display) and 0 are "not reported".
-	if (mc->weave.win_display_id != 0 && mc->weave.win_display_id != -1 &&
-	    weave_display_backing_rect((CGDirectDisplayID)mc->weave.win_display_id, &px, &py, &pw, &ph, &scale)) {
-		panel = (CGDirectDisplayID)mc->weave.win_display_id;
+	if (display_id != 0 && display_id != -1 &&
+	    weave_display_backing_rect((CGDirectDisplayID)display_id, &px, &py, &pw, &ph, &scale)) {
+		panel = (CGDirectDisplayID)display_id;
 		how = "reported displayId";
 	}
 	if (panel == 0) {
@@ -200,7 +204,6 @@ weave_resolve_present_origin_locked(struct multi_compositor *mc)
 		// and ask the caller for displayId.
 		CGDirectDisplayID ids[16];
 		uint32_t n = 0;
-		uint32_t matches = 0;
 		const CGDirectDisplayID main_id = CGMainDisplayID();
 		if (CGGetActiveDisplayList(16, ids, &n) == kCGErrorSuccess) {
 			for (uint32_t i = 0; i < n; i++) {
@@ -224,13 +227,6 @@ weave_resolve_present_origin_locked(struct multi_compositor *mc)
 		}
 		if (matches > 1) {
 			how = "display containing the origin (AMBIGUOUS: several match, picked the non-main one)";
-			if (!mc->weave.present_ambiguity_logged) {
-				mc->weave.present_ambiguity_logged = true;
-				U_LOG_W(
-				    "weave(#759): window origin (%d,%d) backing px lies in %u displays (mixed backing "
-				    "scales) — picked 0x%x; the caller should chain XrWeaveWindowGeometryDXR.displayId",
-				    wx, wy, matches, (unsigned)panel);
-			}
 		} else if (matches == 1) {
 			how = "display containing the origin";
 		}
@@ -244,6 +240,49 @@ weave_resolve_present_origin_locked(struct multi_compositor *mc)
 		}
 		how = "main display (fallback)";
 		fallback = true;
+	}
+	*out_px = px;
+	*out_py = py;
+	*out_pw = pw;
+	*out_ph = ph;
+	*out_scale = scale;
+	*out_how = how;
+	*out_fallback = fallback;
+	*out_matches = matches;
+	return panel;
+}
+
+/*!
+ * Resolve the panel-relative present origin from the stored geometry — only
+ * when it changed (geometry_dirty), the result is cached and re-sent to the DP
+ * every submit. Panel: see weave_resolve_panel(). WARNs on the first resolve
+ * and whenever the resolved panel or its scale changes; an origin-only change
+ * (a drag) is INFO.
+ */
+static void
+weave_resolve_present_origin_locked(struct multi_compositor *mc)
+{
+	if (!mc->weave.have_geometry || !mc->weave.geometry_dirty) {
+		return;
+	}
+	mc->weave.geometry_dirty = false;
+
+	const int32_t wx = mc->weave.win_x;
+	const int32_t wy = mc->weave.win_y;
+	int32_t px = 0, py = 0;
+	uint32_t pw = 0, ph = 0;
+	double scale = 1.0;
+	const char *how = NULL;
+	bool fallback = false;
+	uint32_t matches = 0;
+	const CGDirectDisplayID panel = weave_resolve_panel(wx, wy, mc->weave.win_display_id, &px, &py, &pw, &ph,
+	                                                    &scale, &how, &fallback, &matches);
+	if (matches > 1 && !mc->weave.present_ambiguity_logged) {
+		mc->weave.present_ambiguity_logged = true;
+		U_LOG_W(
+		    "weave(#759): window origin (%d,%d) backing px lies in %u displays (mixed backing "
+		    "scales) — picked 0x%x; the caller should chain XrWeaveWindowGeometryDXR.displayId",
+		    wx, wy, matches, (unsigned)panel);
 	}
 
 	const bool first = !mc->weave.have_present_origin;
@@ -674,18 +713,43 @@ comp_multi_weave_snap_window_rect(struct xrt_compositor *xc,
                                   int32_t *out_snapped_x,
                                   int32_t *out_snapped_y)
 {
-	// Identity: neither the VK nor the Metal DP vtable a macOS plug-in fills
-	// carries a snap the engine wires today (the Metal vtable has no
-	// snap_window_rect slot at all), and nothing on macOS drags a weaving window
-	// yet. The handler then reports the identity snap.
-	(void)xc;
-	(void)origin_x;
-	(void)origin_y;
-	(void)target_x;
-	(void)target_y;
-	(void)out_snapped_x;
-	(void)out_snapped_y;
-	return false;
+	// The caller's points are in the weave geometry convention (spec v7 §5:
+	// global CoreGraphics space in BACKING px, y down — the same space as
+	// XrWeaveWindowGeometryDXR.windowOriginOnScreen). A macOS DP's snap slot
+	// takes panel-relative backing px (the set_present_origin lattice), so
+	// translate by the panel the gesture-start origin lies on, snap, and
+	// translate back. Resolved per call from the origin (the stored displayId
+	// disambiguates mixed scales when geometry has been sent; nothing about the
+	// cached present origin is touched), so a snap before any geometry or any
+	// submit still finds its panel. false (identity) when the engine is not up
+	// yet or its backend/DP has no snap — the vk backend never snaps.
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (mc == NULL || mc->msc == NULL || out_snapped_x == NULL || out_snapped_y == NULL) {
+		return false;
+	}
+	weave_ensure_mutex(mc);
+	os_mutex_lock(&mc->weave.mutex);
+	bool snapped = false;
+	const struct comp_multi_weave_macos_backend *b = mc->weave.backend;
+	if (mc->weave.backend_ready && b != NULL && b->snap_window_rect != NULL) {
+		int32_t px = 0, py = 0;
+		uint32_t pw = 0, ph = 0;
+		double scale = 1.0;
+		const char *how = NULL;
+		bool fallback = false;
+		uint32_t matches = 0;
+		const int32_t display_id = mc->weave.have_geometry ? mc->weave.win_display_id : -1;
+		(void)weave_resolve_panel(origin_x, origin_y, display_id, &px, &py, &pw, &ph, &scale, &how, &fallback,
+		                          &matches);
+		int32_t sx = target_x - px, sy = target_y - py;
+		if (b->snap_window_rect(mc, origin_x - px, origin_y - py, target_x - px, target_y - py, &sx, &sy)) {
+			*out_snapped_x = sx + px;
+			*out_snapped_y = sy + py;
+			snapped = true;
+		}
+	}
+	os_mutex_unlock(&mc->weave.mutex);
+	return snapped;
 }
 
 bool

@@ -400,7 +400,7 @@ metal backend, below):
 | Output sizing | bound window client rect | batch: **input IOSurface dims** (the v3 input is window-client-sized by contract); legacy: rect offset+extent |
 | `weavedTexture` | shared NT HANDLE (caller `CloseHandle`s) | retained IOSurfaceRef (caller `CFRelease`s) |
 | `fence` / `fenceValue` | shared D3D fence, GPU-wait | **no fence — completion is SYNCHRONOUS**: `xrWeaveSubmitDXR` returns after the weave finished on the GPU. `fence` stays NULL; `fenceValue` is a plain monotonic counter |
-| `xrWeaveSnapWindowRectDXR` | vendor DP lattice snap | identity (the VK DP snap slot exists since #1588, but sim/anaglyph has no lattice to snap to) |
+| `xrWeaveSnapWindowRectDXR` | vendor DP lattice snap | **metal backend:** the Metal DP's `snap_window_rect` slot (ADR-050). `originRect` / `targetRect` / `snapped` are in the **weave geometry convention** — global CoreGraphics space × the panel's backing scale, BACKING px, y down, the same frame as `XrWeaveWindowGeometryDXR.windowOriginOnScreen`; the engine resolves the panel from `originRect.offset` (the bound geometry's `displayId` when one was chained, else the display containing it, else the main display), hands the DP panel-relative backing px and translates the answer back. Identity (snapped == target, `XR_SUCCESS`) before the first submit has brought the engine up, or when the DP declines / has no slot (sim_display unless `SIM_DISPLAY_METAL_SNAP_PERIOD>1`; Leia with no tracked viewer). **vk backend:** identity |
 
 The batch algorithm is identical (all rects blitted into ONE window-sized 2×1 SBS scratch, ONE
 `process_atlas` per submit). Verification harness: `test_apps/probes/weave_probe_vk_macos`

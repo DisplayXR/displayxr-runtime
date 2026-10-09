@@ -776,6 +776,23 @@ mtlb_get_hardware_3d_state(struct multi_compositor *mc, bool *out_is_3d)
 	}
 }
 
+//! ADR-050 slot on the weave path: the points arrive panel-relative backing px.
+static bool
+mtlb_snap_window_rect(struct multi_compositor *mc,
+                      int32_t origin_x,
+                      int32_t origin_y,
+                      int32_t target_x,
+                      int32_t target_y,
+                      int32_t *out_x,
+                      int32_t *out_y)
+{
+	if (mc->weave.dp_metal == NULL) {
+		return false;
+	}
+	return xrt_display_processor_metal_snap_window_rect(mc->weave.dp_metal, origin_x, origin_y, target_x,
+	                                                    target_y, out_x, out_y);
+}
+
 static void
 mtlb_fini(struct multi_compositor *mc)
 {
@@ -818,5 +835,6 @@ const struct comp_multi_weave_macos_backend comp_multi_weave_macos_backend_metal
     .get_eyes = mtlb_get_eyes,
     .request_display_mode = mtlb_request_display_mode,
     .get_hardware_3d_state = mtlb_get_hardware_3d_state,
+    .snap_window_rect = mtlb_snap_window_rect,
     .fini = mtlb_fini,
 };
