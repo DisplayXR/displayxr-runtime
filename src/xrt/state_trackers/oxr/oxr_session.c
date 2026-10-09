@@ -4173,6 +4173,11 @@ locate_get_segment_metrics(struct oxr_session *sess, struct xrt_segment_metrics 
 		return comp_d3d11_compositor_get_segment_metrics(&sess->xcn->base, out) && out->count > 0;
 	}
 #endif
+#if defined(XRT_HAVE_METAL_NATIVE_COMPOSITOR) && defined(XRT_OS_MACOS)
+	if (sess->xcn != NULL && sess->is_metal_native_compositor) {
+		return comp_metal_compositor_get_segment_metrics(&sess->xcn->base, out) && out->count > 0;
+	}
+#endif
 	(void)sess;
 	return false;
 }
@@ -6243,6 +6248,25 @@ oxr_session_create(struct oxr_logger *log,
 			pinned = bound_display_id;
 #endif
 			comp_d3d11_compositor_set_screens(&sess->xcn->base, screens, &sys->xsysc->info, pinned);
+			free(screens);
+		}
+	}
+#endif
+
+#if defined(XRT_HAVE_METAL_NATIVE_COMPOSITOR) && defined(XRT_OS_MACOS)
+	// Multi-screen on macOS: the in-process Metal compositor weaves a window
+	// that spans displays per segment, each with its own display's DP
+	// (windowless, phase from set_present_origin); the primary display's DP
+	// keeps the app's NSView.
+	if (sess->is_metal_native_compositor && sess->xcn != NULL && sys->xsysc != NULL) {
+		struct xrt_screen_list *screens = U_TYPED_CALLOC(struct xrt_screen_list);
+		if (screens != NULL) {
+			oxr_system_get_screens(sys, screens);
+			uint64_t pinned = 0;
+#ifdef OXR_HAVE_DXR_display_info
+			pinned = bound_display_id;
+#endif
+			comp_metal_compositor_set_screens(&sess->xcn->base, screens, &sys->xsysc->info, pinned);
 			free(screens);
 		}
 	}

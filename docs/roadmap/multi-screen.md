@@ -254,7 +254,11 @@ Slot and tag reservations (97/98, Win 106/107, tags 22/23/24/25) were approved b
   Mac screen. Rects are top-down **points** (the space windows are placed in, as
   `XrDisplayDesktopInfoDXR` already was); the backing-pixel mode is the screen's
   `nativePixelWidth/Height`, and the display UUID is its device name and monitor-id key.
-  **Next on macOS: Metal segments** (the per-screen segment compositor, M2's Metal twin).
+  **Metal segments** followed (the per-screen segment compositor, M2's Metal twin):
+  `comp_metal_segments`, two appended slots (`create_dp_metal_for_screen`, Metal
+  `set_present_origin` in backing px relative to the display's `CGDisplayBounds` origin — the
+  units the Leia SR Metal weaver takes), sim_display Metal, and M3 per-segment views through the
+  same state-tracker path (`docs/architecture/comp-segments.md` § *macOS / Metal*).
 
 ## 6. Risks and open questions
 

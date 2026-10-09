@@ -448,6 +448,22 @@ sim_display_dp_factory_metal(void *metal_device,
                              struct xrt_display_processor_metal **out_xdp);
 
 /*!
+ * Multi-screen on macOS: per-screen Metal factory, the twin of
+ * `sim_display_dp_factory_d3d11_for_screen` — matches
+ * `xrt_plugin_iface::create_dp_metal_for_screen`. The DP describes the bound
+ * screen and confines its draw to the canvas it is handed (load, scissor).
+ *
+ * @ingroup drv_sim_display
+ */
+xrt_result_t
+sim_display_dp_factory_metal_for_screen(struct xrt_plugin_instance *inst,
+                                        void *metal_device,
+                                        void *command_queue,
+                                        void *window_handle,
+                                        const struct xrt_screen_binding *binding,
+                                        struct xrt_display_processor_metal **out_xdp);
+
+/*!
  * Create a simulation GL display processor.
  *
  * All 3 GLSL shaders (SBS, anaglyph, blend) are compiled at init

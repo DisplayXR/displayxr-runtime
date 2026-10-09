@@ -20,6 +20,7 @@
 #import <IOSurface/IOSurface.h>
 
 #include "comp_metal_compositor.h"
+#include "comp_metal_segments.h" // multi-screen on macOS
 
 #include "util/comp_layer_accum.h"
 // #1581 quad layers: the shared per-view camera (#1580) and the N-view
@@ -444,6 +445,37 @@ struct comp_metal_compositor
 		//! Newest finished read; guarded by `mutex` (locate may be on another thread).
 		struct u_cursor_depth_patch_result result;
 	} cursor_depth;
+
+	/*
+	 * Multi-screen on macOS (ADR-047 D2): a window whose content view spans
+	 * displays is woven per segment, each by its own display's DP
+	 * (comp_metal_segments). A window on the primary display only keeps the
+	 * single-DP path exactly.
+	 */
+	struct comp_metal_segments *segments;     //!< NULL until the first weave after set_screens
+	struct xrt_screen_list *seg_screens;      //!< heap copy, NULL = not handed over
+	struct xrt_system_compositor_info *seg_sys_info; //!< heap copy (the DP registry)
+	bool seg_rebuild;                         //!< a new list arrived: rebuild on the next weave
+	uint64_t seg_pinned_display_id;
+
+	//! M3: the table the last weave took (count 0 = one view set) and the
+	//! routing the last xrLocateViews handed out. Guarded by seg_pub_mutex
+	//! (the app thread's locate reads them; the commit writes them).
+	struct os_mutex seg_pub_mutex;
+	struct xrt_segment_metrics seg_pub;
+	struct xrt_segment_view_routing seg_route;
+	//! Change-only logging of the routed layout.
+	uint32_t seg_route_logged_count;
+	uint32_t seg_route_logged_key[XRT_MAX_SEGMENTS * 6 + 2];
+};
+
+//! Multi-screen M3: one segment's views placed in every tile (the mosaic).
+struct metal_seg_route
+{
+	uint32_t first_view;
+	uint32_t view_count;
+	int32_t x, y; //!< the segment's rect inside a tile, tile px
+	uint32_t w, h;
 };
 
 /*
@@ -462,6 +494,110 @@ static inline struct comp_metal_swapchain *
 metal_swapchain(struct xrt_swapchain *xsc)
 {
 	return (struct comp_metal_swapchain *)xsc;
+}
+
+/*!
+ * Multi-screen M3: turn the routing the last xrLocateViews handed out into
+ * per-segment tile rects on this frame's atlas layout. The Metal twin of
+ * d3d11_route_effective_layout: on any inconsistency (a segment's views past
+ * what the layer submitted, a degenerate rect) the routing is dropped for the
+ * frame (returns 0) and the tiles are painted unrouted.
+ */
+static uint32_t
+metal_route_layer(struct comp_metal_compositor *c,
+                  const struct xrt_segment_view_routing *r,
+                  uint32_t layer_view_count,
+                  uint32_t tiles,
+                  uint32_t tile_w,
+                  uint32_t tile_h,
+                  struct metal_seg_route out[XRT_MAX_SEGMENTS])
+{
+	if (r->count == 0 || r->count > XRT_MAX_SEGMENTS || tiles == 0 || tile_w == 0 || tile_h == 0) {
+		return 0;
+	}
+	const struct comp_seg_rect canvas = {
+	    r->canvas.offset.w,
+	    r->canvas.offset.h,
+	    (uint32_t)(r->canvas.extent.w > 0 ? r->canvas.extent.w : 0),
+	    (uint32_t)(r->canvas.extent.h > 0 ? r->canvas.extent.h : 0),
+	};
+	for (uint32_t k = 0; k < r->count; k++) {
+		// Across a 2D<->3D toggle the mode (tile count) can change between
+		// the locate and this commit: route the views the tiles can hold.
+		const uint32_t n = r->view_count[k] < tiles ? r->view_count[k] : tiles;
+		if (n == 0 || r->first_view[k] + n > layer_view_count || r->first_view[k] + n > XRT_MAX_VIEWS) {
+			return 0;
+		}
+		const struct comp_seg_rect seg = {
+		    r->rect[k].offset.w,
+		    r->rect[k].offset.h,
+		    (uint32_t)(r->rect[k].extent.w > 0 ? r->rect[k].extent.w : 0),
+		    (uint32_t)(r->rect[k].extent.h > 0 ? r->rect[k].extent.h : 0),
+		};
+		struct comp_seg_rect tr;
+		if (!comp_segments_tile_rect(&seg, &canvas, tile_w, tile_h, &tr)) {
+			return 0;
+		}
+		out[k].first_view = r->first_view[k];
+		out[k].view_count = n;
+		out[k].x = tr.x;
+		out[k].y = tr.y;
+		out[k].w = tr.w;
+		out[k].h = tr.h;
+	}
+
+	// One INFO line per routing change (a move, a resize, a mode switch).
+	uint32_t key[XRT_MAX_SEGMENTS * 6 + 2] = {0};
+	key[0] = tile_w;
+	key[1] = tile_h;
+	for (uint32_t k = 0; k < r->count; k++) {
+		key[2 + k * 6 + 0] = out[k].first_view;
+		key[2 + k * 6 + 1] = out[k].view_count;
+		key[2 + k * 6 + 2] = (uint32_t)out[k].x;
+		key[2 + k * 6 + 3] = (uint32_t)out[k].y;
+		key[2 + k * 6 + 4] = out[k].w;
+		key[2 + k * 6 + 5] = out[k].h;
+	}
+	if (r->count != c->seg_route_logged_count || memcmp(key, c->seg_route_logged_key, sizeof(key)) != 0) {
+		c->seg_route_logged_count = r->count;
+		memcpy(c->seg_route_logged_key, key, sizeof(key));
+		U_LOG_I("segments: per-segment views routed — %u segment(s), tile %ux%u; [0] views %u..+%u at %d,%d "
+		        "%ux%u; [1] views %u..+%u at %d,%d %ux%u",
+		        r->count, tile_w, tile_h, out[0].first_view, out[0].view_count, out[0].x, out[0].y, out[0].w,
+		        out[0].h, r->count > 1 ? out[1].first_view : 0, r->count > 1 ? out[1].view_count : 0,
+		        r->count > 1 ? out[1].x : 0, r->count > 1 ? out[1].y : 0, r->count > 1 ? out[1].w : 0,
+		        r->count > 1 ? out[1].h : 0);
+	}
+	return r->count;
+}
+
+/*!
+ * Multi-screen: the content view's frame in top-down global POINTS (origin =
+ * the main display's top-left — the CGDisplayBounds space the screen registry
+ * is in) and the drawable size. False when there is no on-screen view.
+ */
+static bool
+metal_seg_window(struct comp_metal_compositor *c, id<MTLTexture> target, struct comp_metal_seg_window *out)
+{
+	NSView *view = c->view;
+	NSWindow *win = view != nil ? view.window : nil;
+	NSArray<NSScreen *> *screens = [NSScreen screens];
+	if (win == nil || target == nil || screens.count == 0) {
+		return false;
+	}
+	NSRect in_win = [view convertRect:view.bounds toView:nil];
+	NSRect in_screen = [win convertRectToScreen:in_win];
+	// AppKit global space is bottom-up from the main display's bottom edge;
+	// flip against the main display (screens[0]) height.
+	const CGFloat main_h = screens[0].frame.size.height;
+	const CGFloat top = main_h - (in_screen.origin.y + in_screen.size.height);
+	out->frame_pt.x = (int32_t)floor(in_screen.origin.x + 0.5);
+	out->frame_pt.y = (int32_t)floor(top + 0.5);
+	out->frame_pt.w = (uint32_t)floor(in_screen.size.width + 0.5);
+	out->frame_pt.h = (uint32_t)floor(in_screen.size.height + 0.5);
+	out->drawable_w = (uint32_t)target.width;
+	out->drawable_h = (uint32_t)target.height;
+	return out->frame_pt.w > 0 && out->frame_pt.h > 0;
 }
 
 //! #439: any active mask — explicit submitted, or implicit from the last
@@ -3588,11 +3724,26 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 	// HUD is rendered after weave, before present (see below)
 
+	// Multi-screen M3: the routing the app's last xrLocateViews handed out
+	// (per-segment view sets). Only a whole-window drawable frame is ever
+	// segmented, so only such a frame is routed; a routed frame is a mosaic
+	// the compositor must paint, so it never zero-copies.
+	struct xrt_segment_view_routing seg_route_in;
+	memset(&seg_route_in, 0, sizeof(seg_route_in));
+	if (c->seg_screens != NULL && c->shared_texture == nil && !eff_canvas.valid && !mask_active) {
+		os_mutex_lock(&c->seg_pub_mutex);
+		seg_route_in = c->seg_route;
+		os_mutex_unlock(&c->seg_pub_mutex);
+		if (seg_route_in.count > XRT_MAX_SEGMENTS) {
+			seg_route_in.count = 0;
+		}
+	}
+
 	// Zero-copy check: can we pass the app's swapchain directly to the DP?
 	bool zero_copy = false;
 	id<MTLTexture> zc_texture = nil;
 
-	if (c->layer_accum.layer_count == 1) {
+	if (c->layer_accum.layer_count == 1 && seg_route_in.count == 0) {
 		struct comp_layer *layer = &c->layer_accum.layers[0];
 		if (layer->data.type == XRT_LAYER_PROJECTION ||
 		    layer->data.type == XRT_LAYER_PROJECTION_DEPTH) {
@@ -3794,7 +3945,50 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 					atlas_view_h = c->view_height;
 				}
 			}
-			for (uint32_t eye = 0; eye < view_count; eye++) {
+
+			// Multi-screen M3: per-segment views. Each segment's local view
+			// j lands in tile j at that segment's rect inside the tile (the
+			// mosaic), so cropping a segment out of every tile yields its
+			// own views. Any inconsistency drops the routing for the frame.
+			struct metal_seg_route routes[XRT_MAX_SEGMENTS];
+			uint32_t route_count = 0;
+			if (!is_zone && seg_route_in.count > 0 && view_count > 1) {
+				route_count = metal_route_layer(c, &seg_route_in, layer->data.view_count,
+				                                atlas_cols * atlas_rows, atlas_view_w, atlas_view_h, routes);
+			}
+			bool route_mode_set[XRT_MAX_VIEWS] = {false};
+			enum comp_layer_blend_mode route_mode[XRT_MAX_VIEWS];
+			uint32_t draw_count = view_count;
+			if (route_count > 0) {
+				draw_count = 0;
+				for (uint32_t k = 0; k < route_count; k++) {
+					draw_count += routes[k].view_count;
+				}
+			}
+			for (uint32_t draw = 0; draw < draw_count; draw++) {
+				// Unrouted: draw = eye = tile. Routed: walk segment k's
+				// views; `eye` is the layer view, `tile_i` its tile.
+				uint32_t eye = draw;
+				uint32_t tile_i = draw;
+				const struct metal_seg_route *rt = NULL;
+				if (route_count > 0) {
+					uint32_t d = draw;
+					for (uint32_t k = 0; k < route_count; k++) {
+						if (d < routes[k].view_count) {
+							rt = &routes[k];
+							break;
+						}
+						d -= routes[k].view_count;
+					}
+					if (rt == NULL) {
+						continue;
+					}
+					tile_i = d;
+					eye = rt->first_view + d;
+				}
+				if (eye >= XRT_MAX_VIEWS) {
+					continue;
+				}
 				// How this draw composites (#1621), resolved BEFORE the
 				// draw can bail out so "which layer is the tile's base"
 				// is a pure function of the layer LIST, not of a
@@ -3805,15 +3999,24 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				// it marks the tile (a projection layer after it blends
 				// over it) but bypasses the first-layer gate.
 				enum comp_layer_blend_mode mode;
-				if (eye < XRT_MAX_VIEWS && is_zone) {
-					comp_layer_tile_mark_composited(&tiles[eye]);
+				if (tile_i < XRT_MAX_VIEWS && is_zone) {
+					comp_layer_tile_mark_composited(&tiles[tile_i]);
 					mode = (layer->data.flags &
 					        XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0
 					           ? COMP_LAYER_BLEND_STRAIGHT
 					           : COMP_LAYER_BLEND_PREMULTIPLIED;
+				} else if (rt != NULL && tile_i < XRT_MAX_VIEWS) {
+					// The segments are disjoint: each is the layer's first
+					// write into its part of the tile, so the blend mode is
+					// decided once per tile and shared by its segments.
+					if (!route_mode_set[tile_i]) {
+						route_mode_set[tile_i] = true;
+						route_mode[tile_i] = comp_layer_tile_blend_mode(&tiles[tile_i], layer->data.flags);
+					}
+					mode = route_mode[tile_i];
 				} else {
 					mode = comp_layer_tile_blend_mode(
-					    eye < XRT_MAX_VIEWS ? &tiles[eye] : NULL, layer->data.flags);
+					    tile_i < XRT_MAX_VIEWS ? &tiles[tile_i] : NULL, layer->data.flags);
 				}
 
 				struct xrt_swapchain *sc = layer->sc_array[eye];
@@ -3875,12 +4078,19 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				// per its own mode_3d from request_display_mode.
 				MTLViewport vp;
 				{
-					uint32_t tile_x = eye % atlas_cols;
-					uint32_t tile_y = eye / atlas_cols;
+					uint32_t tile_x = tile_i % atlas_cols;
+					uint32_t tile_y = tile_i / atlas_cols;
 					vp.originX = tile_x * atlas_view_w;
 					vp.originY = tile_y * atlas_view_h;
 					vp.width = atlas_view_w;
 					vp.height = atlas_view_h;
+					if (rt != NULL) {
+						// M3 mosaic: the segment's rect inside the tile.
+						vp.originX += rt->x;
+						vp.originY += rt->y;
+						vp.width = rt->w;
+						vp.height = rt->h;
+					}
 				}
 				if (is_zone) {
 					// XR_DXR_display_zones: scale the zone rect
@@ -4523,6 +4733,82 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			                                              (__bridge void *)bd_tex, bd_w, bd_h);
 		}
 
+		/*
+		 * Multi-screen (ADR-047 D2 on macOS): does this window span displays?
+		 * Only for a whole-window drawable frame (a zones / Local2D / mask
+		 * frame, an output rect or the shared-IOSurface path keeps the
+		 * single-DP path). A window on the primary display only also stays
+		 * single-DP, exactly as before.
+		 */
+		bool seg_split = false;
+		struct comp_metal_seg_window seg_win;
+		memset(&seg_win, 0, sizeof(seg_win));
+		if (c->seg_screens != NULL && c->shared_texture == nil && drawable != nil && !eff_canvas.valid &&
+		    !mask_active && metal_seg_window(c, output_texture, &seg_win)) {
+			if (c->seg_rebuild || c->segments == NULL) {
+				// The app thread reads c->segments for eyes (M3): swap under the lock.
+				os_mutex_lock(&c->seg_pub_mutex);
+				if (c->seg_rebuild) {
+					comp_metal_segments_destroy(&c->segments);
+					c->seg_rebuild = false;
+				}
+				if (c->segments == NULL) {
+					c->segments = comp_metal_segments_create((__bridge void *)c->device,
+					                                         (__bridge void *)c->command_queue);
+					if (c->segments != NULL) {
+						comp_metal_segments_set_screens(c->segments, c->seg_screens, c->seg_sys_info,
+						                                c->seg_pinned_display_id);
+					}
+				}
+				os_mutex_unlock(&c->seg_pub_mutex);
+			}
+			if (comp_metal_segments_enabled(c->segments)) {
+				const uint32_t mode_index = (c->xdev != NULL && c->xdev->hmd != NULL)
+				                                ? c->xdev->hmd->active_rendering_mode_index
+				                                : 0;
+				seg_split = comp_metal_segments_update(c->segments, &seg_win, mode_index);
+				// Every segment DP follows the session's 2D/3D mode, like the primary.
+				comp_metal_segments_set_display_mode(c->segments, c->hardware_display_3d);
+			}
+		}
+
+		/*
+		 * M3: publish the table this weave took, for the next xrLocateViews
+		 * to frame per-segment views from (count 0 = one view set).
+		 */
+		if (c->seg_screens != NULL) {
+			struct xrt_segment_metrics m;
+			memset(&m, 0, sizeof(m));
+			if (seg_split) {
+				(void)comp_metal_segments_get_metrics(c->segments, c->display_processor != NULL, &m);
+			}
+			os_mutex_lock(&c->seg_pub_mutex);
+			m.generation = c->seg_pub.generation;
+			struct xrt_segment_metrics prev = c->seg_pub;
+			prev.generation = m.generation;
+			if (memcmp(&prev, &m, sizeof(m)) != 0) {
+				m.generation++;
+			}
+			c->seg_pub = m;
+			os_mutex_unlock(&c->seg_pub_mutex);
+		}
+
+		if (seg_split) {
+			struct comp_metal_segments_frame sf;
+			memset(&sf, 0, sizeof(sf));
+			sf.command_buffer = (__bridge void *)cmd_buf;
+			sf.src_texture = (__bridge void *)dp_src;
+			sf.view_width = atlas_view_w;
+			sf.view_height = atlas_view_h;
+			sf.tile_columns = atlas_cols;
+			sf.tile_rows = atlas_rows;
+			sf.target_texture = (__bridge void *)output_texture;
+			sf.target_width = dp_target_w;
+			sf.target_height = dp_target_h;
+			sf.transparent_background = c->transparent_background;
+			sf.primary_dp = c->display_processor;
+			comp_metal_segments_record(c->segments, &sf);
+		} else {
 		// Effective canvas (#439): while a mask is active this is the
 		// full client-window rect — the DP weaves every pixel the mask
 		// can select (Phase-2 rule).
@@ -4542,6 +4828,7 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		    eff_canvas.valid ? eff_canvas.y : 0,
 		    eff_canvas.valid ? eff_canvas.w : 0,
 		    eff_canvas.valid ? eff_canvas.h : 0);
+		}
 	} else {
 		// No display processor: simple blit passthrough.
 		MTLRenderPassDescriptor *blit_pass = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -4676,6 +4963,13 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	// 3. Release DP crop texture
 	[c->dp_input_texture release];
 	c->dp_input_texture = nil;
+
+	// 3b. Multi-screen: segment DPs + crop textures, before the primary DP.
+	comp_metal_segments_destroy(&c->segments);
+	free(c->seg_screens);
+	c->seg_screens = NULL;
+	free(c->seg_sys_info);
+	c->seg_sys_info = NULL;
 
 	// 4. Destroy display processor — first withdrawing this client's zone
 	// contribution from the vendor's union (#224 P4 clear-on-teardown edge).
@@ -4813,6 +5107,7 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 
 	} // @autoreleasepool — all autoreleased ObjC objects drained here
 
+	os_mutex_destroy(&c->seg_pub_mutex);
 	os_mutex_destroy(&c->mutex);
 
 	free(c);
@@ -5294,6 +5589,9 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 	}
 	c->hardware_display_3d = true; // Start in 3D mode (session begin will confirm)
 
+	// Multi-screen: the published segment table + routing (M3).
+	os_mutex_init(&c->seg_pub_mutex);
+
 	// Create HUD overlay for runtime-owned windows
 	if (c->owns_window) {
 		u_hud_create(&c->hud, pixel_width);
@@ -5493,6 +5791,84 @@ comp_metal_compositor_request_display_mode(struct xrt_compositor *xc, bool enabl
 	// Delegate to display processor (may be a no-op for sim_display)
 	xrt_display_processor_metal_request_display_mode(c->display_processor, enable_3d);
 	return true;
+}
+
+void
+comp_metal_compositor_set_screens(struct xrt_compositor *xc,
+                                  const struct xrt_screen_list *list,
+                                  const struct xrt_system_compositor_info *info,
+                                  uint64_t pinned_display_id)
+{
+	if (xc == NULL || list == NULL || info == NULL) {
+		return;
+	}
+	struct comp_metal_compositor *c = metal_comp(xc);
+	struct xrt_screen_list *copy = U_TYPED_CALLOC(struct xrt_screen_list);
+	struct xrt_system_compositor_info *info_copy = U_TYPED_CALLOC(struct xrt_system_compositor_info);
+	if (copy == NULL || info_copy == NULL) {
+		free(copy);
+		free(info_copy);
+		return;
+	}
+	*copy = *list;
+	*info_copy = *info;
+
+	// The weave (layer_commit, app thread) rebuilds the manager on its next
+	// frame, never here. The commit and this setter both run on the app's
+	// thread in practice; the seg_pub lock covers the locate-side readers.
+	os_mutex_lock(&c->seg_pub_mutex);
+	c->seg_rebuild = true;
+	free(c->seg_screens);
+	c->seg_screens = copy;
+	free(c->seg_sys_info);
+	c->seg_sys_info = info_copy;
+	c->seg_pinned_display_id = pinned_display_id;
+	// ...and nothing may frame views from the old table meanwhile.
+	memset(&c->seg_pub, 0, sizeof(c->seg_pub));
+	os_mutex_unlock(&c->seg_pub_mutex);
+}
+
+bool
+comp_metal_compositor_get_segment_metrics(struct xrt_compositor *xc, struct xrt_segment_metrics *out)
+{
+	if (out == NULL) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+	if (xc == NULL) {
+		return false;
+	}
+	struct comp_metal_compositor *c = metal_comp(xc);
+	os_mutex_lock(&c->seg_pub_mutex);
+	*out = c->seg_pub;
+	// The eyes are predicted NOW, per segment: the primary from the session's
+	// own DP, every other display from its segment DP (guarded against the
+	// weave destroying it: the manager is swapped under this same lock).
+	for (uint32_t k = 0; k < out->count && k < XRT_MAX_SEGMENTS; k++) {
+		struct xrt_segment_metric *s = &out->seg[k];
+		if (s->is_primary) {
+			s->have_eyes = c->display_processor != NULL &&
+			               xrt_display_processor_metal_get_predicted_eye_positions(c->display_processor,
+			                                                                      &s->eyes) &&
+			               s->eyes.valid;
+		} else {
+			s->have_eyes = comp_metal_segments_get_eyes(c->segments, s->screen_id, &s->eyes);
+		}
+	}
+	os_mutex_unlock(&c->seg_pub_mutex);
+	return out->count > 0;
+}
+
+void
+comp_metal_compositor_set_view_routing(struct xrt_compositor *xc, const struct xrt_segment_view_routing *routing)
+{
+	if (xc == NULL || routing == NULL) {
+		return;
+	}
+	struct comp_metal_compositor *c = metal_comp(xc);
+	os_mutex_lock(&c->seg_pub_mutex);
+	c->seg_route = *routing;
+	os_mutex_unlock(&c->seg_pub_mutex);
 }
 
 void

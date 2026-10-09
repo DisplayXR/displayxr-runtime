@@ -18,6 +18,7 @@
 #include "xrt/xrt_defines.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_display_metrics.h"
+#include "xrt/xrt_screen.h"
 #include "util/u_cursor_depth.h"
 
 // Forward declarations
@@ -218,6 +219,45 @@ comp_metal_compositor_request_display_mode(struct xrt_compositor *xc, bool enabl
  */
 void
 comp_metal_compositor_set_eye_tracking_mode(struct xrt_compositor *xc, uint32_t mode);
+
+/*!
+ * Multi-screen on macOS (ADR-047 D2): hand the compositor the system's screen
+ * list and DP registry, so a window whose content view spans displays is
+ * woven per segment, each by its own display's DP
+ * (`create_dp_metal_for_screen`, windowless, phase from set_present_origin).
+ * A session pinned to one display (@p pinned_display_id != 0, from
+ * `XrSessionDisplayBindingDXR`) or `DXR_SEGMENTS=0` is never segmented. A
+ * window on the primary display only keeps the single-DP path exactly.
+ *
+ * @ingroup comp_metal
+ */
+void
+comp_metal_compositor_set_screens(struct xrt_compositor *xc,
+                                  const struct xrt_screen_list *list,
+                                  const struct xrt_system_compositor_info *info,
+                                  uint64_t pinned_display_id);
+
+/*!
+ * Multi-screen M3 (macOS): the segment table the last weave took, with each
+ * segment's eyes predicted NOW (the primary from the session's DP, the others
+ * from their segment DP), for xrLocateViews to frame per-segment views.
+ * Returns false (count 0) when the window is not segmented.
+ *
+ * @ingroup comp_metal
+ */
+bool
+comp_metal_compositor_get_segment_metrics(struct xrt_compositor *xc, struct xrt_segment_metrics *out);
+
+/*!
+ * Multi-screen M3 (macOS): which views of the next frame belong to which
+ * window segment — what the app's last xrLocateViews handed out. The
+ * projection pass paints each segment's views into that segment's rect of
+ * every tile (a mosaic) and the segment path crops them out per display.
+ *
+ * @ingroup comp_metal
+ */
+void
+comp_metal_compositor_set_view_routing(struct xrt_compositor *xc, const struct xrt_segment_view_routing *routing);
 
 /*!
  * Set system devices for qwerty driver support.

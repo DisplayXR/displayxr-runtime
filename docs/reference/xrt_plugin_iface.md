@@ -351,6 +351,52 @@ as "needs 1:1"). A lenticular weave leaves it clear; the runtime then paints fla
 segment whose screen is resampled, and the #1595 / #1831 session gates degrade as before.
 sim_display sets it for every output but INTERLACED.
 
+### `create_dp_metal_for_screen` (multi-screen on macOS)
+
+```c
+xrt_result_t (*create_dp_metal_for_screen)(struct xrt_plugin_instance *inst,
+                                           void *metal_device,     // id<MTLDevice>
+                                           void *command_queue,    // id<MTLCommandQueue>
+                                           void *window_handle,    // NSView*, NULL today
+                                           const struct xrt_screen_binding *binding,
+                                           struct xrt_display_processor_metal **out_xdp);
+```
+
+The Metal twin of `create_dp_vk_for_screen` / `create_dp_d3d11_for_screen`, used by the
+in-process Metal compositor (`compositor/metal/comp_metal_segments.m`). Appended after
+`create_dp_d3d11_for_screen` (`struct_size`-gated, no ABI bump); guard with
+`#ifdef XRT_PLUGIN_IFACE_HAS_CREATE_DP_METAL_FOR_SCREEN`. **Exactly what a plug-in implements:**
+
+1. **The factory.** Same as `create_dp_metal`, plus `binding`: on macOS `desktop_*` is the
+   display's `CGDisplayBounds` in top-down **points**, `native_pixel_*` its current mode in
+   backing px, `desktop_scale` its backing scale, `device_name` the CoreGraphics display UUID,
+   `serial` your claim's serial. Resolve it to your SDK's display (`binding->display_id`, else
+   your per-monitor claim) and bind the weaver to THAT display. Answer
+   `get_display_dimensions` / `get_display_pixel_info` for it. `window_handle` is NULL: the DP
+   is windowless and must weave without a view.
+2. **`xrt_display_processor_metal::set_present_origin`** (new Metal DP slot, appended after
+   `get_background_preview`; guard with `#ifdef XRT_DP_METAL_HAS_PRESENT_ORIGIN`). The runtime
+   calls it every frame before `process_atlas` with the window content view's top-left in
+   **backing pixels of that display, relative to its `CGDisplayBounds` origin** (top-down) —
+   exactly what the Leia SR Metal weaver's `srWeaverSetPresentOrigin` takes. Forward it; do NOT
+   recompute it from a window (you were not given one). Phase = origin + `canvas_offset`; the
+   runtime guarantees that sum is the segment's top-left on the panel even when the window's
+   backing scale differs from the display's (the origin absorbs the difference). It is sent
+   only where the window's pixels reach the panel 1:1.
+3. **`process_atlas` with `canvas = the segment`** (drawable px) and a pre-cropped atlas
+   holding exactly that segment's views, on the frame's shared command buffer. You encode your
+   own render pass, so: **`MTLLoadActionLoad` on the target, never `Clear`** (other segments are
+   already there), and **viewport AND scissor rect = the canvas**.
+4. **`get_scanout_caps`**: set `XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE` only if the output
+   survives a WindowServer resample (a lenticular weave does not). The runtime counts a display
+   as 1:1 when its backing scale equals the window's and points × scale equal its native mode.
+5. `request_display_mode` follows the session; `set_background_2d(NULL)` is sent once.
+
+The session's own DP (from `create_dp_metal`, with the app's NSView) keeps weaving the
+system-default display's segment; it runs FIRST each split frame, so it may still clear. A
+plug-in without this slot gets flat 2D on its other displays. Reference implementation:
+`sim_display_dp_factory_metal_for_screen` (`drivers/sim_display/sim_display_processor_metal.m`).
+
 ### `set_pose_source`
 
 ```c
@@ -773,8 +819,9 @@ Flags (`XRT_PLUGIN_STEREO_CAMERA_*`) mirror the XR bits: `SHARED_WITH_EYE_TRACKI
 **Slot order.** The six slots are the LAST members of the iface, appended (ADR-020) after
 everything that was on `main` before them: `… vk_bundle_fn_table_offset` → `create_dp_d3d11_lift`
 (ADR-042) → `get_platform_state` (ADR-045) → `stereo_camera_enumerate … stereo_camera_close`
-→ `get_display_info_for_monitor` (multi-screen M1) → `create_dp_vk_for_screen` (multi-screen M2,
-now the last member).
+→ `get_display_info_for_monitor` (multi-screen M1) → `create_dp_vk_for_screen` (multi-screen M2)
+→ `create_dp_d3d11_for_screen` (M6, Windows) → `create_dp_metal_for_screen` (macOS, now the last
+member).
 `tests_stereo_camera` pins that order (lift right after the vk fingerprint, platform-state right
 after lift, the camera block right after platform-state and ending the struct), so a reorder or a
 slot squeezed in between fails on the host, not on a vendor box.

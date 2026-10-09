@@ -314,7 +314,8 @@ TEST_CASE("plug-in iface: camera slots are appended after lift and platform-stat
 	CHECK(offsetof(xrt_plugin_iface, stereo_camera_enumerate) == platform_state_end);
 	// Multi-screen M1 appended get_display_info_for_monitor right after the
 	// camera block, M2 create_dp_vk_for_screen right after that, and M6
-	// (Windows) create_dp_d3d11_for_screen right after that; it now ends the
+	// (Windows) create_dp_d3d11_for_screen right after that, and the macOS
+	// segments create_dp_metal_for_screen right after that; it now ends the
 	// struct.
 	CHECK(offsetof(xrt_plugin_iface, get_display_info_for_monitor) ==
 	      offsetof(xrt_plugin_iface, stereo_camera_close) + sizeof(void *));
@@ -322,7 +323,9 @@ TEST_CASE("plug-in iface: camera slots are appended after lift and platform-stat
 	      offsetof(xrt_plugin_iface, get_display_info_for_monitor) + sizeof(void *));
 	CHECK(offsetof(xrt_plugin_iface, create_dp_d3d11_for_screen) ==
 	      offsetof(xrt_plugin_iface, create_dp_vk_for_screen) + sizeof(void *));
-	CHECK(offsetof(xrt_plugin_iface, create_dp_d3d11_for_screen) + sizeof(void *) == sizeof(xrt_plugin_iface));
+	CHECK(offsetof(xrt_plugin_iface, create_dp_metal_for_screen) ==
+	      offsetof(xrt_plugin_iface, create_dp_d3d11_for_screen) + sizeof(void *));
+	CHECK(offsetof(xrt_plugin_iface, create_dp_metal_for_screen) + sizeof(void *) == sizeof(xrt_plugin_iface));
 
 	xrt_plugin_iface iface{};
 	iface.struct_size = (uint32_t)offsetof(xrt_plugin_iface, stereo_camera_enumerate);
