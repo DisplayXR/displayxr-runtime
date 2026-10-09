@@ -3073,7 +3073,7 @@ ipc_handle_compositor_get_predicted_eye_positions(volatile struct ipc_client_sta
 }
 
 /*
- * Multi-screen M6/M3 over IPC (ADR-047 Amendment 2): per-screen weaving of a
+ * Multi-screen M6/M3 over IPC (ADR-047 Amendment 3): per-screen weaving of a
  * direct client's window, and per-segment views for its xrLocateViews. The
  * service owns the screen registry (its own instance), so the client sends
  * only its session's display pin; the table and the routing then cross the

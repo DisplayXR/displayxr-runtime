@@ -202,7 +202,7 @@ oxr_system_fill_in(
 		// same box advertises the doubled count too and never splits — the
 		// tail views then repeat view 0, which the contract allows.
 		//
-		// Service sessions too (ADR-047 Amendment 2): the D3D11 service
+		// Service sessions too (ADR-047 Amendment 3): the D3D11 service
 		// segments a direct IPC client's window the same way. The registry
 		// counted here is then the SERVICE's — `xrt_system_compositor_info`
 		// crosses the wire by value, so each entry's factory pointer is a

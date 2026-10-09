@@ -131,7 +131,7 @@ struct xrt_window_metrics;
 bool
 comp_ipc_client_compositor_get_window_metrics(struct xrt_compositor *xc, struct xrt_window_metrics *out_metrics);
 
-// Multi-screen M6/M3 over IPC (ADR-047 Amendment 2) — same linkage pattern.
+// Multi-screen M6/M3 over IPC (ADR-047 Amendment 3) — same linkage pattern.
 // The table / routing travel by value; see ipc_client.h.
 struct xrt_segment_metrics;
 void
@@ -3479,7 +3479,7 @@ locate_views_one(struct oxr_logger *log,
 #else
 	const bool zone_chained = false;
 #endif
-	// Multi-screen over IPC (ADR-047 Amendment 2): a per-segment locate is
+	// Multi-screen over IPC (ADR-047 Amendment 3): a per-segment locate is
 	// framed HERE, from the segment's own eyes and canvas the service sent
 	// (seg); the server's rig call computes one view set for the whole window
 	// and would overwrite it, so a segment locate never takes it.
@@ -6312,7 +6312,7 @@ oxr_session_create(struct oxr_logger *log,
 #endif
 
 #ifdef XRT_OS_WINDOWS
-	// Multi-screen M6/M3 over IPC (ADR-047 Amendment 2): the D3D11 service
+	// Multi-screen M6/M3 over IPC (ADR-047 Amendment 3): the D3D11 service
 	// weaves a direct client's window per screen the same way. It owns the
 	// screen registry, so only the session's pin crosses the wire. Asked for
 	// only where a window can split at all (two DP-backed screens: the set

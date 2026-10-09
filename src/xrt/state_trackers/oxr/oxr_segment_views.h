@@ -294,7 +294,7 @@ oxr_segment_views_route_take(struct xrt_segment_view_routing *frame, struct xrt_
 
 /*!
  * Must the routing @p next be sent to an out-of-process compositor that last
- * received @p sent? (Multi-screen M3 over IPC, ADR-047 Amendment 2: the
+ * received @p sent? (Multi-screen M3 over IPC, ADR-047 Amendment 3: the
  * service keeps the last routing it was given, so the client sends it only on
  * a change — a window that stays split costs no round trip per frame, and the
  * first unrouted frame after a split is sent once, which clears it.)
