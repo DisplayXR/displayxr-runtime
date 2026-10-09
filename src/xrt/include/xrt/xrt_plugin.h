@@ -845,6 +845,108 @@ struct xrt_plugin_stereo_camera;
 
 
 /*!
+ * @name Per-screen vendor status (ADR-051 D2)
+ *
+ * The vendor summary cell the display dashboard shows for each screen a
+ * plug-in claimed, filled by @ref xrt_plugin_iface::get_screen_status. The
+ * runtime shows these values and strings; it never learns what they mean for
+ * a given vendor. Enum values are stable ABI (appended only).
+ * @{
+ */
+
+//! @ref xrt_plugin_screen_status::tracker — the screen's eye tracker.
+enum xrt_plugin_tracker_state
+{
+	//! The screen has no tracker (or the plug-in does not know of one).
+	XRT_PLUGIN_TRACKER_STATE_NONE = 0,
+	//! A tracker exists and is stopped (nobody asked for it).
+	XRT_PLUGIN_TRACKER_STATE_OFF = 1,
+	//! The tracker is starting (camera warming up).
+	XRT_PLUGIN_TRACKER_STATE_STARTING = 2,
+	//! The tracker is running and delivering.
+	XRT_PLUGIN_TRACKER_STATE_RUNNING = 3,
+	//! The tracker should be running and is not (lost, failed, unplugged).
+	XRT_PLUGIN_TRACKER_STATE_DOWN = 4,
+	//! The vendor cannot report a tracker state for this screen.
+	XRT_PLUGIN_TRACKER_STATE_UNSUPPORTED = 5,
+};
+
+//! @ref xrt_plugin_screen_status::lens — the screen's optical state.
+enum xrt_plugin_lens_state
+{
+	XRT_PLUGIN_LENS_STATE_2D = 0,
+	XRT_PLUGIN_LENS_STATE_3D = 1,
+	XRT_PLUGIN_LENS_STATE_UNKNOWN = 2,
+};
+
+//! @ref xrt_plugin_screen_warning::level values.
+enum xrt_plugin_screen_warning_level
+{
+	XRT_PLUGIN_SCREEN_WARNING_LEVEL_INFO = 0,
+	XRT_PLUGIN_SCREEN_WARNING_LEVEL_WARN = 1,
+	XRT_PLUGIN_SCREEN_WARNING_LEVEL_CRITICAL = 2,
+};
+
+//! Current @ref xrt_plugin_screen_status::version.
+#define XRT_PLUGIN_SCREEN_STATUS_VERSION 1
+//! Capacity of @ref xrt_plugin_screen_status::warnings.
+#define XRT_PLUGIN_SCREEN_STATUS_MAX_WARNINGS 8
+
+//! One vendor warning about a screen, shown verbatim (never parsed).
+struct xrt_plugin_screen_warning
+{
+	//! Stable machine code, e.g. "TRACKER_DOWN". UTF-8, NUL-terminated.
+	char code[32];
+	//! @ref xrt_plugin_screen_warning_level value.
+	uint8_t level;
+	//! One user-facing sentence. UTF-8, NUL-terminated, truncated to fit.
+	char text[96];
+};
+
+/*!
+ * Out-param of @ref xrt_plugin_iface::get_screen_status. The caller sets
+ * @ref struct_size and zero-fills the rest before the call; the plug-in MUST
+ * NOT write past `struct_size`. Grows only by appending (and bumping
+ * @ref version); no ABI bump.
+ */
+struct xrt_plugin_screen_status
+{
+	//! `sizeof(struct xrt_plugin_screen_status)` as the CALLER knows it.
+	uint32_t struct_size;
+	//! @ref XRT_PLUGIN_SCREEN_STATUS_VERSION the plug-in filled.
+	uint32_t version;
+	//! Moves whenever anything below may have changed; a poller skips a screen
+	//! whose counter did not move. Bumped on the vendor's own device /
+	//! topology events, never by polling the hardware.
+	uint64_t change_counter;
+	//! The vendor platform is up for this screen.
+	bool ready;
+	//! The vendor positively identified this screen as its hardware.
+	bool verified;
+	//! A valid calibration exists for this screen (vendor-defined meaning).
+	bool calibrated;
+	enum xrt_plugin_tracker_state tracker;
+	enum xrt_plugin_lens_state lens;
+	//! Vendor model name, UTF-8, "" = unknown.
+	char model[32];
+	//! Vendor serial, UTF-8, "" = unknown.
+	char serial[32];
+	//! Valid entries in @ref warnings (<= XRT_PLUGIN_SCREEN_STATUS_MAX_WARNINGS).
+	uint32_t warning_count;
+	struct xrt_plugin_screen_warning warnings[XRT_PLUGIN_SCREEN_STATUS_MAX_WARNINGS];
+	/*!
+	 * Command line that opens the vendor's own dashboard on this screen, with
+	 * `{serial}` and `{monitor_id}` placeholders the runtime substitutes, e.g.
+	 * `"<exe> --page displays --display {serial}"`. "" = none. The runtime
+	 * launches it on request and never parses it.
+	 */
+	char dashboard_command[160];
+};
+
+/*! @} */
+
+
+/*!
  * The plug-in's vtable. Filled in by the plug-in inside its
  * `xrtPluginNegotiate` implementation and handed back to the runtime via
  * the `out_iface` out-param. Storage is owned by the plug-in; the
@@ -1411,6 +1513,35 @@ struct xrt_plugin_iface
 	                                           void *window_handle,
 	                                           const struct xrt_screen_binding *binding,
 	                                           struct xrt_display_processor_d3d12 **out_xdp);
+
+	/*!
+	 * Vendor summary for ONE screen this plug-in claimed (ADR-051 D2): fill
+	 * @p out for the monitor @p monitor_id (an
+	 * @ref xrt_display_descriptor::monitor_id this plug-in returned a claim
+	 * for). The caller sets `out->struct_size` and zero-fills the rest; the
+	 * plug-in writes nothing past it and sets `out->version`.
+	 *
+	 * PASSIVE: this call must not create or touch a tracker, lens, display or
+	 * weaver handle, must not create a per-call vendor instance, and must
+	 * return in < 20 ms. It may be polled every 2 s by the service and by
+	 * diagnostic processes. Bump @ref xrt_plugin_screen_status::change_counter
+	 * on the vendor's own device / topology events so a poller can skip an
+	 * unchanged screen.
+	 *
+	 * @p inst may be NULL (a plug-in whose probe keeps no instance state).
+	 * Returns XRT_SUCCESS when @p out was filled, an error for a monitor the
+	 * plug-in did not claim; the runtime then shows "no vendor status".
+	 *
+	 * Optional. NULL (or a plug-in whose `struct_size` predates this field)
+	 * ⟹ "no vendor status" — never an error. Appended per ADR-020
+	 * (append-only within a major; gated by @ref struct_size; no
+	 * XRT_PLUGIN_API_VERSION_CURRENT bump) after
+	 * @ref create_dp_d3d12_for_screen. Announced by
+	 * @ref XRT_PLUGIN_IFACE_HAS_GET_SCREEN_STATUS.
+	 */
+	xrt_result_t (*get_screen_status)(struct xrt_plugin_instance *inst,
+	                                  uint64_t monitor_id,
+	                                  struct xrt_plugin_screen_status *out);
 };
 
 /*!
@@ -1543,6 +1674,27 @@ xrt_plugin_iface_has_create_dp_d3d12_for_screen(const struct xrt_plugin_iface *i
 	       iface->struct_size >= offsetof(struct xrt_plugin_iface, create_dp_d3d12_for_screen) +
 	                                 sizeof(iface->create_dp_d3d12_for_screen) &&
 	       iface->create_dp_d3d12_for_screen != NULL;
+}
+
+/*!
+ * Defined when @ref xrt_plugin_iface carries @ref
+ * xrt_plugin_iface::get_screen_status and this header defines @ref
+ * xrt_plugin_screen_status (ADR-051 D2), so a plug-in built against an older
+ * runtime header can #ifdef-guard implementing it.
+ */
+#define XRT_PLUGIN_IFACE_HAS_GET_SCREEN_STATUS 1
+
+/*!
+ * True when @p iface implements @ref xrt_plugin_iface::get_screen_status (and
+ * its struct_size covers the slot).
+ */
+static inline bool
+xrt_plugin_iface_has_get_screen_status(const struct xrt_plugin_iface *iface)
+{
+	return iface != NULL &&
+	       iface->struct_size >=
+	           offsetof(struct xrt_plugin_iface, get_screen_status) + sizeof(iface->get_screen_status) &&
+	       iface->get_screen_status != NULL;
 }
 
 /*!
