@@ -385,9 +385,13 @@ void RenderScene(
         : imageIndex;
     glBindFramebuffer_(GL_FRAMEBUFFER, renderer.fbos[fboIdx]);
 
-    // TODO: If the swapchain format is GL_SRGB8_ALPHA8, we may need
-    // glEnable(GL_FRAMEBUFFER_SRGB) here for correct linear-to-sRGB conversion.
-    // Without it, output may appear too dark compared to the D3D11 version.
+    // ADR-044 / INV-4.6: the swapchain is GL_SRGB8_ALPHA8 and GL_FRAMEBUFFER_SRGB
+    // stays DISABLED on purpose. The shaders emit the authored DISPLAY-REFERRED
+    // colours (the textures are plain GL_RGBA, never decoded), so a raw write
+    // stores exactly those bytes in an honestly-declared encoded swapchain and
+    // the format-honest GL compositor (>= v2.21.2) decodes them once on sample.
+    // Enabling GL_FRAMEBUFFER_SRGB here would encode them a second time
+    // (washed out) -- that is the #1882 class of bug, not a fix for a dark image.
 
     glViewport(viewportX, viewportY, width, height);
     glScissor(viewportX, viewportY, width, height);

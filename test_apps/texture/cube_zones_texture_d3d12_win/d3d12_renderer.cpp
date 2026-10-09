@@ -7,6 +7,7 @@
 
 #include "d3d12_renderer.h"
 #include "d3d12_clear.h"   // dxr::ClearRenderTargetViewDisplayReferred (#1647)
+#include "color_policy.h"  // dxr::IsSrgbColorFormat / RenderSceneLinear (ADR-044)
 #include "logging.h"
 #include "mip_chain.h"
 #include <d3d12sdklayers.h>
@@ -87,7 +88,18 @@ float4 PSMain(PSInput input) : SV_TARGET {
     float3 lightDir = normalize(float3(0.3, 0.8, 0.5));
     float diffuse = max(dot(mappedNormal, lightDir), 0.0) * 0.7 + 0.3;
 
-    return float4(basecolor * ao * diffuse, 1.0);
+    float3 col = basecolor * ao * diffuse;
+#ifdef DXR_LINEARIZE
+    // ADR-044 / INV-4.6 (#1882). The cube's authored colours (and its
+    // basecolor/AO textures, uploaded as plain UNORM) are DISPLAY-REFERRED.
+    // When the RTV this PSO targets is `_SRGB` the render target encodes on
+    // write, so emitting those numbers raw encodes them twice -- the washed-out
+    // cube David saw on the rig. Decoding here makes the round-trip an
+    // identity: the bytes stored are exactly the authored ones, honestly
+    // declared as encoded. Same rule as the D3D11 reference renderer.
+    col = (col <= 0.04045) ? (col / 12.92) : pow((col + 0.055) / 1.055, 2.4);
+#endif
+    return float4(col, 1.0);
 }
 )";
 
@@ -113,13 +125,22 @@ PSInput VSMain(VSInput input) {
 }
 
 float4 PSMain(PSInput input) : SV_TARGET {
-    return color;
+    float3 col = color.rgb;
+#ifdef DXR_LINEARIZE
+    // Same rule as the cube PS: the grid colour is authored display-referred.
+    col = (col <= 0.04045) ? (col / 12.92) : pow((col + 0.055) / 1.055, 2.4);
+#endif
+    return float4(col, color.a);
 }
 )";
 
-static bool CompileShader(const char* source, const char* entryPoint, const char* target, ID3DBlob** blob) {
+// ADR-044 / INV-4.6: `linearize` defines DXR_LINEARIZE so the pixel shaders
+// emit SCENE-LINEAR for an `_SRGB` render target (which encodes on write).
+static bool CompileShader(const char* source, const char* entryPoint, const char* target, ID3DBlob** blob,
+                          bool linearize = false) {
     ComPtr<ID3DBlob> errorBlob;
-    HRESULT hr = D3DCompile(source, strlen(source), nullptr, nullptr, nullptr,
+    const D3D_SHADER_MACRO macros[] = { { "DXR_LINEARIZE", "1" }, { nullptr, nullptr } };
+    HRESULT hr = D3DCompile(source, strlen(source), nullptr, linearize ? macros : nullptr, nullptr,
         entryPoint, target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, blob, &errorBlob);
     if (FAILED(hr)) {
         if (errorBlob) {
@@ -128,6 +149,22 @@ static bool CompileShader(const char* source, const char* entryPoint, const char
         return false;
     }
     return true;
+}
+
+// Must the pixel shaders decode their display-referred colours for THIS render
+// target? Keyed on the format the RTV/PSO is created with, not on the
+// process-wide dxr::RenderSceneLinear() flag, for the same reason the clear
+// helper is (#1647): the runtime hands out TYPELESS swapchain textures, so the
+// view is what arms the hardware encode, and a caller that resolves the view to
+// the UNORM sibling (cube_hosted_legacy_d3d12_win writes raw bytes) must get
+// the raw variant even though the swapchain itself was noted `_SRGB`.
+// DXR_TRUE_LINEAR still overrides both ways (the ADR-021 matrix cells).
+static bool LinearizeForTarget(DXGI_FORMAT rtvFormat) {
+    const char* e = getenv("DXR_TRUE_LINEAR");
+    if (e != nullptr && *e != '\0') {
+        return dxr::RenderSceneLinear();
+    }
+    return dxr::IsSrgbColorFormat((int64_t)rtvFormat);
 }
 
 static ComPtr<ID3D12Resource> CreateUploadBuffer(ID3D12Device* device, const void* data, UINT64 size) {
@@ -685,12 +722,19 @@ bool CreateSwapchainRTVs(D3D12Renderer& renderer,
         psoDesc.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
         psoDesc.SampleDesc.Count = 1;
 
-        // Recompile shaders for PSO recreation
+        // Recompile shaders for PSO recreation. This is the first point where
+        // the real RTV format is known, so it is where the ADR-044 decision is
+        // made: an `_SRGB` target gets the scene-linear PS variant (#1882).
+        const bool linearize = LinearizeForTarget(format);
+        LOG_WARN("[color] rtvFormat=%u sceneLinear=%s (ADR-044: %s)", (unsigned)format,
+                 linearize ? "yes" : "no",
+                 linearize ? "the _SRGB RTV encodes on write, so the PS decodes its authored colours"
+                           : "raw target, authored display-referred bytes are written verbatim");
         ComPtr<ID3DBlob> cubeVS, cubePS, gridVS, gridPS;
         if (!CompileShader(g_cubeShaderSource, "VSMain", "vs_5_0", &cubeVS) ||
-            !CompileShader(g_cubeShaderSource, "PSMain", "ps_5_0", &cubePS) ||
+            !CompileShader(g_cubeShaderSource, "PSMain", "ps_5_0", &cubePS, linearize) ||
             !CompileShader(g_gridShaderSource, "VSMain", "vs_5_0", &gridVS) ||
-            !CompileShader(g_gridShaderSource, "PSMain", "ps_5_0", &gridPS)) {
+            !CompileShader(g_gridShaderSource, "PSMain", "ps_5_0", &gridPS, linearize)) {
             LOG_ERROR("Failed to recompile shaders for format 0x%X", format);
             return false;
         }

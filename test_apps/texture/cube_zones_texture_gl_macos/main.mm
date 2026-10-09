@@ -2200,11 +2200,11 @@ static bool CreateSwapchain(AppXrSession &app)
     int64_t selectedFormat = formats[0];
     bool haveSrgb = false, haveRgba8 = false;
     for (auto f : formats) {
-        if (f == 0x8C43) haveSrgb = true;
-        if (f == 0x8058) haveRgba8 = true;
+        if (f == GL_SRGB8_ALPHA8) haveSrgb = true;
+        if (f == GL_RGBA8) haveRgba8 = true;
     }
-    if (haveSrgb) selectedFormat = 0x8C43;
-    else if (haveRgba8) selectedFormat = 0x8058;
+    if (haveSrgb) selectedFormat = GL_SRGB8_ALPHA8;
+    else if (haveRgba8) selectedFormat = GL_RGBA8;
     for (auto f : formats) {
         LOG_INFO("  format 0x%llx%s", (long long)f, f == selectedFormat ? " (selected)" : "");
     }
