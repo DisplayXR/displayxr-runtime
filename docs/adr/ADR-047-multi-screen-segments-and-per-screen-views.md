@@ -72,3 +72,16 @@ detail, not the model.
   service. The first three shipped on the LeiaSR Linux line on 2026-10-07; the fourth
   needs two panels.
 - Milestones, gates and the SR work items: `docs/roadmap/multi-screen.md`.
+
+## Amendment 1 (2026-10-09): segments under the weave-on-scanout split
+
+The first Windows implementation refused to segment a window whenever the D3D11 #918
+output-device split was engaged, which ADR-039 makes the default on every hybrid box and
+keeps even on one adapter, so the shipping configuration never segmented. Decision: **a
+segment DP lives on the device that presents.** Under the split that is the output
+(scanout) device, where the session's own DP already is: the segment DPs are created there
+through the unchanged `create_dp_d3d11_for_screen` slot (it is handed the output device and
+context), they weave the output-side copy of the composed atlas (the egress slot), and each
+segment keeps its own viewport, scissor and present origin exactly as off the split. The
+split is not a separate segment path; the primary screen's DP keeps the real HWND. Detail:
+`docs/architecture/comp-segments.md` § *Windows / D3D11*.

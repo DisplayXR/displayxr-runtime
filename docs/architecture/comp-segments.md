@@ -176,8 +176,19 @@ deferred-release list because the immediate context executes in order). What dif
   bound to any other display sees no face and would fall back to 2D. The Leia plug-in pins that
   weaver to its nominal viewer and leaves the lens to the active panel (David, 2026-10-07; SR D3/D4
   move both per device later). The runtime does nothing special: the DP owns it.
-- **Not segmented on Windows:** zero-copy frames, the #918 output-adapter split, a zones / Local2D
-  frame (any non-whole-window canvas), the shared-texture path, a pinned session, `DXR_SEGMENTS=0`.
+- **Under the #918 weave-on-scanout split** (ADR-039 — the default on hybrid boxes, and engaged even
+  on one adapter) the window is segmented the same way, on the device that presents: the segment
+  manager, its DPs and its crop textures live on the OUTPUT device (`d3d11_out_device()` /
+  `d3d11_out_context()`, which off the split are the app's), the DPs' input is the egress slot being
+  woven (the output-side copy of the composed atlas, already cropped to the box that slot was painted
+  at), and the flat-2D fill draws through the output composite unit (`comp_d3d11_outcomp_blit_rect`,
+  the renderer's blit re-made on that device). Same function, same table, same per-segment viewport /
+  scissor / present origin, same #1863 routing (the mosaic is painted on the app device and crosses the
+  bridge like any atlas). A slot one frame behind a resizing window is cropped at its own view size
+  against the live canvas — the single-DP split weave's one-frame lag, no more. A split session logs
+  one WARN when its segment manager is made (`segments: under the #918 output-device split …`).
+- **Not segmented on Windows:** zero-copy frames, a zones / Local2D frame (any non-whole-window
+  canvas), the shared-texture path, a pinned session, `DXR_SEGMENTS=0`.
   The service / hosted path is not segmented yet (ADR-035 amendment, M6 second half).
 - **sim_display** implements both slots on D3D11 too, so a two-monitor Windows box with no vendor
   hardware exercises the split path (anaglyph on both halves).
