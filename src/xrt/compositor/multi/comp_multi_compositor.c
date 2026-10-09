@@ -43,6 +43,10 @@
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_system.h"
 
+#ifdef XRT_OS_MACOS
+#include "xrt/xrt_display_processor_metal.h" // weave Metal backend DP (#759)
+#endif
+
 #ifdef XRT_OS_WINDOWS
 #include "comp_d3d11_window.h"
 #include <windows.h>
@@ -2105,6 +2109,13 @@ multi_compositor_get_predicted_eye_positions(struct multi_compositor *mc, struct
 	if (mc->weave.dp != NULL) {
 		return xrt_display_processor_get_predicted_eye_positions(mc->weave.dp, out_eye_pos);
 	}
+#ifdef XRT_OS_MACOS
+	// The macOS weave's Metal backend keeps its DP apart: `weave.dp` only ever
+	// holds a Vulkan-vtable DP.
+	if (mc->weave.dp_metal != NULL) {
+		return xrt_display_processor_metal_get_predicted_eye_positions(mc->weave.dp_metal, out_eye_pos);
+	}
+#endif
 #endif
 
 	out_eye_pos->valid = false;
@@ -2466,6 +2477,16 @@ multi_compositor_request_display_mode(struct multi_compositor *mc, bool enable_3
 	// weave engine's own instance (mc->weave.dp), so the request goes there.
 	if (mc != NULL && !mc->session_render.initialized) {
 		return comp_multi_weave_linux_request_display_mode(mc, enable_3d);
+	}
+#endif
+#if defined(COMP_MULTI_HAVE_WEAVE) && defined(XRT_OS_MACOS)
+	// The macOS twin (#759): a weave-only present-owner (a browser) has no
+	// session_render either, so a 2D page could never switch the lens off.
+	// Its DP is the weave engine's (vk or Metal backend). Only a client that
+	// has touched the weave service (bind_window comes first) is routed here,
+	// so a shared-surface app keeps its old behaviour.
+	if (mc != NULL && !mc->session_render.initialized && mc->weave.mutex_initialized) {
+		return comp_multi_weave_macos_request_display_mode(mc, enable_3d);
 	}
 #endif
 	if (mc == NULL || !mc->session_render.initialized) {

@@ -24,7 +24,11 @@
  * Run (service already started with the sim display plug-in):
  *   SIM_DISPLAY_OUTPUT=anaglyph XRT_PLUGIN_SEARCH_PATH=.../plugins displayxr-service &
  *   XRT_FORCE_MODE=ipc XR_RUNTIME_JSON=build/openxr_displayxr-dev.json \
- *     ./weave_probe_gl_macos
+ *     ./weave_probe_vk_macos [--geometry ox,oy[,display]]
+ *
+ * The service picks its weave backend with DXR_WEAVE_MAC_BACKEND=auto|metal|vk
+ * (sim_display exports both DP families, so auto = vk); every check above holds
+ * on both backends.
  */
 
 #include <IOSurface/IOSurface.h>
@@ -314,8 +318,26 @@ split_exts(const std::string &s, std::vector<std::string> &storage, std::vector<
 int
 main(int argc, char **argv)
 {
-	(void)argc;
-	(void)argv;
+	// --geometry ox,oy[,display]: bind with xrWeaveBindWindow2DXR + a chained
+	// XrWeaveWindowGeometryDXR (spec v7) whose origin is global CoreGraphics
+	// BACKING px (y down) and whose client size is the probe's window. The
+	// service then resolves + forwards a panel-relative present origin to the
+	// DP (Metal backend) and logs it once; the CPU checks are unchanged.
+	bool have_geometry = false;
+	int geom_x = 0, geom_y = 0, geom_display = -1;
+	for (int i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--geometry") == 0 && i + 1 < argc) {
+			int n = sscanf(argv[++i], "%d,%d,%d", &geom_x, &geom_y, &geom_display);
+			if (n < 2) {
+				LOG("bad --geometry '%s' (want ox,oy[,display])", argv[i]);
+				return 1;
+			}
+			have_geometry = true;
+		} else {
+			LOG("usage: %s [--geometry ox,oy[,display]]", argv[0]);
+			return 1;
+		}
+	}
 
 	// ---- Instance with the weave + vulkan-enable extensions.
 	uint32_t ext_count = 0;
@@ -488,7 +510,26 @@ main(int argc, char **argv)
 		return 1;
 	}
 
-	XR_CHECK(pfn_bind(session, (void *)(uintptr_t)0x1)); // fake window id (phase-anchor only)
+	if (have_geometry) {
+		PFN_xrWeaveBindWindow2DXR pfn_bind2 = NULL;
+		xrGetInstanceProcAddr(instance, "xrWeaveBindWindow2DXR", (PFN_xrVoidFunction *)&pfn_bind2);
+		if (pfn_bind2 == NULL) {
+			LOG("failed to resolve xrWeaveBindWindow2DXR");
+			return 1;
+		}
+		XrWeaveWindowGeometryDXR geom = {(XrStructureType)XR_TYPE_WEAVE_WINDOW_GEOMETRY_DXR};
+		geom.windowOriginOnScreen = {geom_x, geom_y};
+		geom.clientSize = {(int32_t)kWinW, (int32_t)kWinH};
+		geom.displayId = geom_display;
+		XrWeaveBindWindowInfoDXR bind_info = {(XrStructureType)XR_TYPE_WEAVE_BIND_WINDOW_INFO_DXR};
+		bind_info.next = &geom;
+		bind_info.windowHandle = (void *)(uintptr_t)0x1; // fake window id
+		XR_CHECK(pfn_bind2(session, &bind_info));
+		LOG("bound with geometry origin=(%d,%d) client=%ux%u displayId=%d", geom_x, geom_y, kWinW, kWinH,
+		    geom_display);
+	} else {
+		XR_CHECK(pfn_bind(session, (void *)(uintptr_t)0x1)); // fake window id (phase-anchor only)
+	}
 
 	// ---- Build the window-sized squeezed-SBS input.
 	IOSurfaceRef input = create_input_surface();

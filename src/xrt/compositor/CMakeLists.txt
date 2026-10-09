@@ -339,6 +339,11 @@ if(APPLE)
 		comp_multi PRIVATE "-framework IOSurface" "-framework CoreFoundation"
 				   "-framework CoreGraphics"
 		)
+	if(XRT_HAVE_METAL)
+		target_sources(comp_multi PRIVATE multi/comp_multi_weave_macos_metal.m)
+		target_compile_definitions(comp_multi PRIVATE COMP_MULTI_WEAVE_HAVE_METAL)
+		target_link_libraries(comp_multi PRIVATE "-framework Metal" "-framework Foundation")
+	endif()
 endif()
 
 if(ANDROID)
