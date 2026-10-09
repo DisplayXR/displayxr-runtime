@@ -85,6 +85,21 @@ Four consequences for this skill:
   tag to date (0.1.26 … 0.1.31) points straight at its content commit; `preview-0.1.31`
   (2026-09-08) was cut this way deliberately. If `main` has moved past the built commit (docs
   landed), the tag still goes on the built commit — it is fine for it to sit behind `main`.
+- **AND THOSE BUILDS MUST CARRY THE VERSION STAMP: dispatch the Windows AND Android lanes
+  with `-f browser_version=X.Y.Z`.** The stamp (UA-CH release version, `build-info.json`
+  `browser_version`) is baked at BUILD time; a lane dispatched without it builds `0.0.0-dev`,
+  and the publish's "Assert the Windows build's UA-CH release stamp matches the tag" step
+  refuses the run with `stamped browser_version=0.0.0-dev but the tag is 1.7.1`, skipping sign
+  + publish. Re-dispatching the publish with the same run ids fails the same way; only a
+  rebuild fixes it. The Linux lane has no `browser_version` input and is not asserted.
+  Hit for real on v1.7.1 (2026-10-09): three green dev-stamped lanes, one more hour of box
+  time. Full pre-tag recipe for the browser:
+  ```bash
+  SHA=$(git rev-parse origin/main)   # the commit you are about to tag
+  gh workflow run build-box.yml         -R DisplayXR/displayxr-browser-pvt --ref main -f patch_ref=$SHA -f lifecycle_only=false -f browser_version=X.Y.Z
+  gh workflow run build-box-android.yml -R DisplayXR/displayxr-browser-pvt --ref main -f patch_ref=$SHA -f lifecycle_only=false -f browser_version=X.Y.Z
+  gh workflow run build-box-linux.yml   -R DisplayXR/displayxr-browser-pvt --ref main -f patch_ref=$SHA -f lifecycle_only=false   # after android frees the builder
+  ```
 - **THE TAG TRIGGER WORKS, BUT ONLY IF A BUILD RAN AT THE COMMIT YOU TAG. Arrange that
   before you tag.** The publish resolves which build to ship by matching a successful
   `build-box*.yml` run against the tagged commit, and the build lanes take their source
