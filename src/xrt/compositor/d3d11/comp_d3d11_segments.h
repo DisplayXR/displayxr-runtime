@@ -37,15 +37,17 @@ extern "C" {
 #endif
 
 struct comp_d3d11_segments;
-struct comp_d3d11_renderer;
+struct comp_d3d11_outcomp;
 
 /*!
  * Create the segment manager. Nothing is allocated on the GPU until a segment
  * needs it.
  *
  * @param d3d11_device  The device segment DPs and crop textures are created on
- *                      (ID3D11Device*, borrowed; under the #918 split this is
- *                      the OUTPUT device, the one the back buffer lives on).
+ *                      (ID3D11Device*, borrowed): the device that PRESENTS,
+ *                      i.e. the one the back buffer lives on — under the #918
+ *                      weave-on-scanout split (ADR-039) that is the OUTPUT
+ *                      device, off it the app device.
  */
 struct comp_d3d11_segments *
 comp_d3d11_segments_create(void *d3d11_device);
@@ -99,6 +101,8 @@ struct comp_d3d11_segments_frame
 	//! The context to record on (ID3D11DeviceContext*; the output context under the split).
 	void *context;
 	//! The DP's input this frame: the atlas cropped to content (ID3D11ShaderResourceView*).
+	//! Under the #918 split this is the output-side copy of the composed atlas
+	//! (the egress slot being woven), so it lives on the same device as the DPs.
 	void *src_srv;
 	uint32_t view_width;
 	uint32_t view_height;
@@ -121,8 +125,9 @@ struct comp_d3d11_segments_frame
 	//! The session's primary DP (weaves the primary screen's segment). The
 	//! caller has already fed it this frame's background, timing and encoding.
 	struct xrt_display_processor_d3d11 *primary_dp;
-	//! For the flat-2D fill (comp_d3d11_renderer_blit_rect).
-	struct comp_d3d11_renderer *renderer;
+	//! For the flat-2D fill (comp_d3d11_outcomp_blit_rect): the output
+	//! composite unit, which lives on the same device as the target.
+	struct comp_d3d11_outcomp *outcomp;
 };
 
 /*!
