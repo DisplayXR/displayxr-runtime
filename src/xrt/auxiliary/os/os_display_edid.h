@@ -84,7 +84,7 @@ struct os_display_edid_monitor
 	void *hmonitor;           //!< HMONITOR on Windows, NULL elsewhere
 
 	/*!
-	 * @name Runtime-private extras (desktop Linux and macOS; zero elsewhere)
+	 * @name Runtime-private extras (physical size: Windows, desktop Linux, macOS; the rest: Linux, macOS)
 	 *
 	 * Not plug-in ABI: @ref xrt_display_descriptor is built from the fields
 	 * above and is unchanged. These feed `displayxr-cli displays`, the
