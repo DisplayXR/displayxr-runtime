@@ -695,6 +695,25 @@ bool (*snap_window_rect)(struct xrt_display_processor_vk *xdp, /* or _d3d11 */
   runtime-owned window, the D3D11 service for a cross-process present owner, and — on
   desktop Linux, where a client cannot hook the window manager's drag — the **app**, through
   `xrWeaveSnapWindowRectDXR`. Always *before* the window moves.
+- **macOS / Metal (ADR-050): the runtime is the window owner.** Appended after
+  `set_present_origin` on `xrt_display_processor_metal` with the identical signature
+  (`XRT_DP_METAL_HAS_SNAP_WINDOW_RECT`). The in-process Metal compositor owns every eligible
+  window's drag and resize: it calls the slot once per drag step with the content origin at
+  **gesture start** and the proposed content origin, in **backing (device) px**, top-down, and
+  moves the window to the answer in the same Core Animation transaction that presents the frame
+  woven for it. On an edge resize by the left / top edge the far edges stay put and the size
+  absorbs your correction; a right / bottom-only resize never calls you. On Retina the runtime
+  only offers you reachable positions (`origin + scale·Z`) and keeps your answer only if it is
+  one. With multiple 3D screens it asks the DP of the screen holding the content origin.
+  **What a Leia Metal DP implements:** `srWeaverSnapToPhase(weaver, origin_x, origin_y,
+  target_x, target_y, &x, &y)` — `SR_SUCCESS` → write `x, y`, return true; `SR_DECLINED` (no
+  viewer tracked yet) or any other result → return false (the runtime keeps the target and the
+  move stays atomic, just unsnapped).
+  **And `set_present_origin` wins:** for a runtime-placed window the compositor calls
+  `set_present_origin` every frame with the origin the window was actually moved to *for this
+  frame*. A DP that also derives its origin from its NSView (polling the view's frame) must use
+  the runtime's value for that frame — the view still reports the pre-move position until the
+  transaction commits.
 
   **The runtime feeds the weaver the window's TRUE origin and never quantises it.** This is
   a rule hardware established, not a style preference. A Vulkan build briefly re-snapped the

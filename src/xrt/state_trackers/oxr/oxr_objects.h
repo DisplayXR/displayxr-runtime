@@ -2128,6 +2128,15 @@ oxr_session_populate_metal_native(struct oxr_logger *log,
                                   void *shared_texture_handle,
                                   bool transparent_background,
                                   struct oxr_session *sess);
+
+/*!
+ * ADR-050: hand the bound window's drag + resize to the Metal compositor
+ * (runtime-owned, phase-snapped, atomic), unless @p app_owned or the session
+ * is not eligible (offscreen / shared texture / workspace / sub-view binding,
+ * DXR_MACOS_NATIVE_DRAG=1).
+ */
+void
+oxr_session_metal_native_setup_window_placement(struct oxr_session *sess, bool app_owned);
 #endif
 
 #if defined(XRT_HAVE_METAL_NATIVE_COMPOSITOR) && defined(XR_USE_GRAPHICS_API_VULKAN)

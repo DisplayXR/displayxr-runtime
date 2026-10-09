@@ -144,4 +144,13 @@ oxr_session_populate_metal_native(struct oxr_logger *log,
 	return XR_SUCCESS;
 }
 
+void
+oxr_session_metal_native_setup_window_placement(struct oxr_session *sess, bool app_owned)
+{
+	if (sess == NULL || sess->xcn == NULL || !sess->is_metal_native_compositor) {
+		return;
+	}
+	comp_metal_compositor_setup_window_placement(&sess->xcn->base, app_owned);
+}
+
 #endif /* XRT_HAVE_METAL_NATIVE_COMPOSITOR */

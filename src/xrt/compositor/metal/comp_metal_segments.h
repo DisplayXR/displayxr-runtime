@@ -152,6 +152,20 @@ bool
 comp_metal_segments_get_eyes(struct comp_metal_segments *segs, uint64_t screen_id, struct xrt_eye_positions *out);
 
 /*!
+ * Runtime-owned placement (ADR-050): the display processor to phase-snap a
+ * window drag with — the one of the screen holding (@p x_pt, @p y_pt), in
+ * top-down global points. @p primary_dp for the primary (system-default)
+ * screen or a point on no listed screen; that screen's segment DP when it has
+ * one; NULL for a listed screen without a DP (nothing to snap to). Commit
+ * thread only (the thread that creates / destroys segment DPs).
+ */
+struct xrt_display_processor_metal *
+comp_metal_segments_snap_dp_at(struct comp_metal_segments *segs,
+                               struct xrt_display_processor_metal *primary_dp,
+                               double x_pt,
+                               double y_pt);
+
+/*!
  * M3: the last update's table as per-segment view metrics (window rects in
  * drawable px; screen rects / desktop rects in points × the drawable scale).
  * Eyes are not filled.

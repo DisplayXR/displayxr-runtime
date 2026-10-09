@@ -2007,6 +2007,19 @@ static bool CreateSession(AppXrSession &app, MetalRenderer &r)
         }
     }
 
+    // ADR-050 test knob: DXR_TEST_PLACEMENT_APP_OWNED=1 keeps AppKit's native
+    // window drag / resize (opts out of the runtime-owned placement, spec v8).
+    XrCocoaWindowPlacementInfoDXR placementInfo = {};
+    placementInfo.type = XR_TYPE_COCOA_WINDOW_PLACEMENT_INFO_DXR;
+    {
+        const char *e = getenv("DXR_TEST_PLACEMENT_APP_OWNED");
+        if (e != nullptr && e[0] == '1') {
+            placementInfo.flags = XR_COCOA_WINDOW_PLACEMENT_APP_OWNED_BIT_DXR;
+            cocoaBinding.next = &placementInfo;
+            LOG_INFO("DXR_TEST_PLACEMENT_APP_OWNED=1: chaining XrCocoaWindowPlacementInfoDXR (APP_OWNED)");
+        }
+    }
+
     if (app.hasCocoaWindowBinding) {
         metalBinding.next = &cocoaBinding;
         LOG_INFO("Chaining XR_DXR_cocoa_window_binding with NSView %p", cocoaBinding.viewHandle);
@@ -3801,6 +3814,33 @@ int main(int argc, char **argv)
             }
             if (moveFrame >= 0 && g_frameCounter == moveFrame) {
                 (void)ApplyTestWindowRect("DXR_TEST_WINDOW_RECT2");
+            }
+        }
+
+        // Test knob (ADR-050, app-initiated move): DXR_TEST_APP_MOVE="F,dx,dy"
+        // calls -setFrameOrigin: by (dx,dy) points (AppKit, bottom-up) at frame
+        // F and then every 30 frames, 5 times — a move made OUTSIDE the
+        // runtime's placement path, which the runtime must re-snap on its
+        // next atomic present.
+        {
+            static long amFrame = -2;
+            static double amDx = 0.0, amDy = 0.0;
+            if (amFrame == -2) {
+                amFrame = -1;
+                const char *e = getenv("DXR_TEST_APP_MOVE");
+                long f = 0;
+                if (e != nullptr && sscanf(e, "%ld,%lf,%lf", &f, &amDx, &amDy) == 3 && f >= 0) {
+                    amFrame = f;
+                }
+            }
+            if (amFrame >= 0 && g_window != nil && (long)g_frameCounter >= amFrame &&
+                ((long)g_frameCounter - amFrame) % 30 == 0 && ((long)g_frameCounter - amFrame) / 30 < 5) {
+                NSPoint o = [g_window frame].origin;
+                o.x += amDx;
+                o.y += amDy;
+                [g_window setFrameOrigin:o];
+                LOG_INFO("DXR_TEST_APP_MOVE: frame %llu setFrameOrigin -> %.1f,%.1f",
+                         (unsigned long long)g_frameCounter, o.x, o.y);
             }
         }
 

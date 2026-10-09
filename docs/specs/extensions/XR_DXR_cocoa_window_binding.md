@@ -3,8 +3,8 @@
 | Property | Value |
 |----------|-------|
 | Extension Name | `XR_DXR_cocoa_window_binding` |
-| Spec Version | 7 |
-| Type Values | `XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_DXR` (1004999004), `XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR` (1004999002) |
+| Spec Version | 8 |
+| Type Values | `XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_DXR` (1004999004), `XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR` (1004999002), `XR_TYPE_COCOA_WINDOW_PLACEMENT_INFO_DXR` (1004999330, v8) |
 | Author | Leia Inc. |
 | Platform | macOS (Cocoa / AppKit). |
 
@@ -24,7 +24,7 @@ The target use case is **desktop 3D light field displays** on macOS, where the a
 
 Same as `XR_DXR_win32_window_binding` — desktop 3D displays are monitors, not headsets. The application needs to own its window for input handling, multi-app compositing, and hybrid 2D/3D UI. On macOS, the runtime uses Metal (via MoltenVK for Vulkan apps) and needs a `CAMetalLayer`-backed view to render into.
 
-**Phase alignment note:** Lenticular displays compute interlacing patterns from the content's screen-space position. The display processor needs the NSView to track its position on the physical display each frame. On Windows, advanced vendors hook `WM_WINDOWPOSCHANGING` to snap window drag to phase-aligned coordinates (see [XR_DXR_win32_window_binding §2.4](XR_DXR_win32_window_binding.md)). macOS equivalents (e.g., `NSWindowDelegate` position tracking) are a future item for vendor SDKs that support macOS. For IOSurface-based `_texture` apps, the canvas sub-rect from `xrSetSharedTextureOutputRectDXR` flows through the compositor to the display processor's `process_atlas()` call as `canvas_offset_x/y` and `canvas_width/height`, enabling correct phase correction. The app's real NSView is passed directly to the display processor -- no hidden windows are involved.
+**Phase alignment note:** Lenticular displays compute interlacing patterns from the content's screen-space position. The display processor needs the NSView to track its position on the physical display each frame. On Windows, advanced vendors hook `WM_WINDOWPOSCHANGING` to snap window drag to phase-aligned coordinates (see [XR_DXR_win32_window_binding §2.4](XR_DXR_win32_window_binding.md)). On macOS there is no such hook, and the WindowServer's own title-bar drag slides the last presented frame without a re-weave — so since **v8 the runtime owns the window's drag and resize by default** (§5.4, [ADR-050](../../adr/ADR-050-macos-runtime-owns-window-placement.md)). For IOSurface-based `_texture` apps, the canvas sub-rect from `xrSetSharedTextureOutputRectDXR` flows through the compositor to the display processor's `process_atlas()` call as `canvas_offset_x/y` and `canvas_width/height`, enabling correct phase correction. The app's real NSView is passed directly to the display processor -- no hidden windows are involved.
 
 ---
 
@@ -158,6 +158,50 @@ Useful for:
 - Texture apps (`_texture` class) where the app composites the final output
 - Multi-process compositing via IOSurface
 
+### 5.4 Window placement ownership (v8, ADR-050)
+
+For an in-process **Metal** session in windowed mode whose `viewHandle` is its window's
+`contentView` (and for a `_hosted` session's runtime-created window), the runtime **owns the
+window's drag and resize by default**:
+
+- The window is made non-movable for AppKit (`movable = NO`). A title-bar drag, an edge / corner
+  resize (an 8 pt zone on both sides of each frame edge) and the zoom button / title-bar
+  double-click are performed by the runtime: every step is phase-snapped by the display processor
+  (`snap_window_rect`, anchored at the gesture start) and applied in the same Core Animation
+  transaction that presents the frame woven for it. Minimum content size 320 × 200 pt (or the
+  window's `contentMinSize` if larger).
+- The window's delegate is replaced by a forwarding proxy: every delegate message still reaches the
+  app's delegate (the proxy declines AppKit's animated zoom and re-queues it through the snapped
+  path). `window.delegate` returns the proxy; it answers `-isEqual:` / `-hash` as the app's
+  delegate. Setting a new delegate is supported (the proxy re-wraps it).
+- A window frame change the app makes itself (`setFrameOrigin:` etc.) is re-snapped on the next
+  present; the frame the app's own move showed is off-phase (≤ 1 frame).
+- Clicks in the content area, on the traffic lights, and keyboard input are untouched.
+
+Not applied (AppKit keeps the window): offscreen and shared-IOSurface sessions, workspace (shell)
+sessions, a `viewHandle` that is a sub-view of the window, `DXR_MACOS_NATIVE_DRAG=1`, and an app
+that opts out:
+
+```c
+#define XR_TYPE_COCOA_WINDOW_PLACEMENT_INFO_DXR ((XrStructureType)1004999330)
+typedef XrFlags64 XrCocoaWindowPlacementFlagsDXR;
+static const XrCocoaWindowPlacementFlagsDXR XR_COCOA_WINDOW_PLACEMENT_APP_OWNED_BIT_DXR = 0x00000001;
+
+typedef struct XrCocoaWindowPlacementInfoDXR {
+    XrStructureType                type;   // XR_TYPE_COCOA_WINDOW_PLACEMENT_INFO_DXR
+    const void* XR_MAY_ALIAS       next;
+    XrCocoaWindowPlacementFlagsDXR flags;  // XR_COCOA_WINDOW_PLACEMENT_APP_OWNED_BIT_DXR or 0
+} XrCocoaWindowPlacementInfoDXR;
+```
+
+Chain it on `XrCocoaWindowBindingCreateInfoDXR::next`. An app that owns its placement can still
+phase-snap its own moves with `xrWeaveSnapWindowRectDXR` / `xrWeaveSnapWindowGridDXR`
+(`XR_DXR_weave`), which an in-process Metal session answers from its display processor (backing
+px; identity when the display processor has no lattice).
+
+Scope today: the Metal compositor. Vulkan / GL sessions on macOS and out-of-process (service)
+sessions keep AppKit's placement (ADR-050 follow-ups).
+
 ---
 
 ## 6. Session Creation Example
@@ -241,4 +285,5 @@ The Cocoa binding tracks `XR_DXR_win32_window_binding` for forward-compatibility
 | 4 | 2026-04-24 | David Fattal | Read-back contract clarified: runtime writes the canvas region at `(x, y)` (not origin) in the shared IOSurface, matching `xrSetSharedTextureOutputRectDXR` args. Apps must sample at `uvOffset + uv * uvScale`. See ADR-010. |
 | 6 | 2026-05-28 | David Fattal | Added `xrSetSharedTextureSurround2DEXT` (parity with `XR_DXR_win32_window_binding` v6). Lets `_texture` apps register a full-view 2D IOSurface whose pixels outside the canvas sub-rect are blitted into the target swapchain each frame. Enables apps on fixed-3D-zone displays to fill the surround region with full-resolution 2D content. *(Removed in v7.)* |
 | 7 | 2026-06-21 | David Fattal | Removed `xrSetSharedTextureOutputRectDXR` + `xrSetSharedTextureSurround2DEXT` — superseded by [`XR_DXR_display_zones`](XR_DXR_display_zones.md) (ADR-031). See [`docs/roadmap/surround-zones-deprecation.md`](../../roadmap/surround-zones-deprecation.md). |
+| 8 | 2026-10-08 | David Fattal | Runtime-owned window placement by default on macOS (Metal, [ADR-050](../../adr/ADR-050-macos-runtime-owns-window-placement.md)), §5.4. Added `XrCocoaWindowPlacementInfoDXR` + `XR_COCOA_WINDOW_PLACEMENT_APP_OWNED_BIT_DXR` (1004999330) to opt out. The header's `SPEC_VERSION` had stayed at 6 through the v7 removal; v8 realigns it. |
 | 6 (erratum) | 2026-06-06 | David Fattal | Surround deltas corrected to match the shipped Metal implementation (#406): pixel format must match the multiview shared IOSurface (not "must be RGBA8Unorm"); dims are confirmed window-sized with re-register-on-resize; fill is window-clamped per #464 (window rect minus canvas, never the worst-case extent); sync is CFRetain + coherent IOSurface (no fence/use-count in-process). No version bump — text aligned to behavior, no ABI change. |

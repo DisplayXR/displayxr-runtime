@@ -12,7 +12,15 @@ if(APPLE AND XRT_HAVE_METAL)
 		comp_metal_compositor.h
 		comp_metal_segments.m
 		comp_metal_segments.h
+		comp_metal_placement.m
+		comp_metal_placement.h
 		)
+
+	# Runtime-owned window placement (ADR-050) holds WEAK references to the
+	# app's window, view and delegate, which only ARC expresses. It includes
+	# nothing from os/os_threading.h (whose inlines are not ARC-clean), so it
+	# alone is compiled with ARC; the rest of the library stays MRR.
+	set_source_files_properties(comp_metal_placement.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 
 	target_link_libraries(
 		comp_metal

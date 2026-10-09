@@ -1001,6 +1001,25 @@ comp_metal_segments_get_metrics(const struct comp_metal_segments *segs,
 	return true;
 }
 
+struct xrt_display_processor_metal *
+comp_metal_segments_snap_dp_at(struct comp_metal_segments *segs,
+                               struct xrt_display_processor_metal *primary_dp,
+                               double x_pt,
+                               double y_pt)
+{
+	if (segs == NULL || !segs->enabled) {
+		return primary_dp;
+	}
+	for (uint32_t i = 0; i < segs->screen_count; i++) {
+		const struct comp_seg_rect *d = &segs->screens[i].desktop;
+		if (x_pt >= (double)d->x && x_pt < (double)d->x + (double)d->w && y_pt >= (double)d->y &&
+		    y_pt < (double)d->y + (double)d->h) {
+			return segs->screens[i].is_primary ? primary_dp : segs->st[i].dp;
+		}
+	}
+	return primary_dp;
+}
+
 bool
 comp_metal_segments_get_eyes(struct comp_metal_segments *segs, uint64_t screen_id, struct xrt_eye_positions *out)
 {

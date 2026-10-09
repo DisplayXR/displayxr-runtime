@@ -95,7 +95,7 @@
     "XR_DXR_cocoa_window_binding": {
       "group": "windowing",
       "title": "Cocoa Window Binding",
-      "summary": "App-provided NSView, IOSurface sharing"
+      "summary": "App-provided NSView, IOSurface sharing, runtime-owned phase-snapped window drag/resize (opt-out)"
     },
     "XR_DXR_xlib_window_binding": {
       "group": "windowing",

@@ -79,6 +79,13 @@
 #include "vk_native/comp_vk_native_compositor.h"
 #endif
 
+#ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
+// macOS (ADR-050): the same pure DP query for an in-process Metal session —
+// the route an app that opted OUT of the runtime-owned placement
+// (XR_COCOA_WINDOW_PLACEMENT_APP_OWNED_BIT_DXR) snaps its own moves through.
+#include "metal/comp_metal_compositor.h"
+#endif
+
 #include <assert.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -1142,6 +1149,20 @@ oxr_xrWeaveSnapWindowRectDXR(XrSession session,
 			return XR_SUCCESS;
 		}
 #endif
+#ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
+		if (sess->is_metal_native_compositor) {
+			// Backing px of the Metal DP's lattice; identity when the DP has
+			// no snap_window_rect slot (sim_display by default, older
+			// plug-ins) or declines (no tracked viewer yet).
+			(void)comp_metal_compositor_snap_window_rect(&sess->xcn->base, originRect->offset.x,
+			                                             originRect->offset.y, targetRect->offset.x,
+			                                             targetRect->offset.y, &sx, &sy);
+			snappedRect->offset.x = sx;
+			snappedRect->offset.y = sy;
+			snappedRect->extent = targetRect->extent;
+			return XR_SUCCESS;
+		}
+#endif
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
 		                 "xrWeaveSnapWindowRectDXR: no in-process snap route for this session's "
 		                 "compositor (the rest of the weave service is out-of-process only)");
@@ -1172,6 +1193,22 @@ grid_point_vk_native(void *userdata,
 {
 	return comp_vk_native_compositor_snap_window_rect((struct xrt_compositor *)userdata, origin_x, origin_y,
 	                                                  target_x, target_y, out_x, out_y);
+}
+#endif
+
+#ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
+//! u_snap_grid_point_fn over the in-process Metal DP's per-point snap (ADR-050).
+static bool
+grid_point_metal_native(void *userdata,
+                        int32_t origin_x,
+                        int32_t origin_y,
+                        int32_t target_x,
+                        int32_t target_y,
+                        int32_t *out_x,
+                        int32_t *out_y)
+{
+	return comp_metal_compositor_snap_window_rect((struct xrt_compositor *)userdata, origin_x, origin_y, target_x,
+	                                              target_y, out_x, out_y);
 }
 #endif
 
@@ -1230,6 +1267,15 @@ oxr_xrWeaveSnapWindowGridDXR(XrSession session,
 #if defined(XRT_HAVE_VK_NATIVE_COMPOSITOR) && defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
 		if (sess->is_vk_native_compositor) {
 			u_snap_grid_eval(&grid, grid_point_vk_native, &sess->xcn->base, out, &dec, NULL, NULL);
+			if (declined != NULL) {
+				*declined = dec ? XR_TRUE : XR_FALSE;
+			}
+			return XR_SUCCESS;
+		}
+#endif
+#ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
+		if (sess->is_metal_native_compositor) {
+			u_snap_grid_eval(&grid, grid_point_metal_native, &sess->xcn->base, out, &dec, NULL, NULL);
 			if (declined != NULL) {
 				*declined = dec ? XR_TRUE : XR_FALSE;
 			}

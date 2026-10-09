@@ -1,7 +1,7 @@
 ---
 status: Active
 owner: David Fattal
-updated: 2026-08-16
+updated: 2026-10-08
 ---
 # Separation of Concerns: App → OXR → Compositor → Driver/DP
 
@@ -10,6 +10,7 @@ This document defines what each architectural layer owns and what must not cross
 ## Layer 1: Application
 
 - Provides window handle (`_handle`, `_texture`) or lets runtime create one (`_hosted`)
+- Owns its window's lifecycle, content and input — but **on macOS, not its drag / resize by default**: for an in-process Metal session the runtime performs title-bar drag, edge / corner resize and zoom ([ADR-050](../adr/ADR-050-macos-runtime-owns-window-placement.md)); an app opts back in with `XR_COCOA_WINDOW_PLACEMENT_APP_OWNED_BIT_DXR` and then snaps its own moves through `xrWeaveSnapWindowRectDXR`
 - Creates swapchains at recommended dimensions
 - Renders views into swapchain tiles
 - Optionally enables `XR_DXR_display_info` for mode awareness
@@ -35,6 +36,7 @@ This document defines what each architectural layer owns and what must not cross
 - Calls `xdp->process_atlas()` to transform atlas → display output
 - Eye position pass-through from display processor to OXR
 - Window management (uses app-provided handle or creates own)
+- **Window placement on macOS (Metal, [ADR-050](../adr/ADR-050-macos-runtime-owns-window-placement.md))**: owns the drag / resize gesture of the bound window — the move is phase-snapped by the DP (`snap_window_rect`) and applied in the same Core Animation transaction as the frame woven for it; the DP is told the applied origin (`set_present_origin`). The compositor owns *when* and *where* a window lands; the DP owns *which* positions preserve the phase. Never a phase computation in the runtime
 - **Must NOT contain**: OpenXR extension logic, vendor-specific interlacing, mode enumeration
 
 ## Layer 4: Device Drivers (`src/xrt/drivers/`)
@@ -77,6 +79,7 @@ The layers above describe one process. When the compositor runs out-of-process, 
 | Eye positions | — | queries | extracts from DP | DP provides |
 | Display dimensions | — | queries | — | DP provides |
 | Window metrics | — | — | computes from HWND + DP display info | DP provides display dims/pixels only |
+| Window drag / resize (macOS Metal, ADR-050) | opts out or not | parses opt-out | owns gesture + atomic present | DP snaps (`snap_window_rect`) |
 
 ## Vendor Isolation Rule
 
