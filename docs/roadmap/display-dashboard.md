@@ -349,7 +349,7 @@ enable is a shared vote that `destroy` does not withdraw); config resolve at mos
 
 | Phase | Content | Depends on |
 |---|---|---|
-| **0** | `displays --claims --json`: `schema`, claim serial, mm; `selftest` metres check | — |
+| **0** landed | `displays --claims --json`: `schema`, claim serial, mm; `selftest` metres check | — |
 | **1** | `xrt_display_status.h`, `u_status_snapshot_build` (headless), `displayxr-cli status [--json]`, warnings §4; `service_health` struct behind `[HEALTH]` / `[RENDER]` | — |
 | **2** | the three DIAG RPCs, generation counters, `status --watch`; `clients` gains presenter / lease / window / owner | 1 |
 | **3** | plug-in slot `get_screen_status` + `sim_display` implementation + iface doc | 1 |
