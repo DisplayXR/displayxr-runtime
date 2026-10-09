@@ -1084,6 +1084,48 @@ static const struct mcp_tool TOOL_GET_RUNTIME_STATUS = {
     .fn = tool_get_runtime_status,
 };
 
+/*!
+ * ADR-051 D4 (display dashboard phase 5): the display status snapshot, the
+ * same JSON `displayxr-cli status --json` prints — from the running service
+ * when the CLI can reach it, else the headless one, labelled by its `source`
+ * key. Returned verbatim, so an agent sees exactly what the human's panel
+ * renders. Its own buffer: a multi-screen snapshot with live windows is larger
+ * than the other tools' JSON.
+ */
+static cJSON *
+tool_get_status_snapshot(const cJSON *params, void *userdata)
+{
+	(void)params;
+	(void)userdata;
+	const size_t cap = 512 * 1024;
+	char *out = malloc(cap);
+	if (out == NULL) {
+		return error_object("out of memory");
+	}
+	cJSON *j = NULL;
+	if (!run_displayxr_cli("status --json", out, cap) || out[0] == '\0') {
+		j = error_object("failed to run displayxr-cli (is it installed next to the runtime?)");
+	} else {
+		j = cJSON_Parse(out);
+		if (j == NULL) {
+			j = error_object("displayxr-cli returned unparseable JSON");
+		}
+	}
+	free(out);
+	return j;
+}
+static const struct mcp_tool TOOL_GET_STATUS_SNAPSHOT = {
+    .name = "get_status_snapshot",
+    .description =
+        "Session-free display status snapshot (ADR-051): one row per screen (claim, native vs "
+        "desktop mode, metres, roles, live eye tracking, bound display processors, vendor cell, "
+        "warnings as data) and every live window (presenter, panel lease, rect, owner screen, "
+        "per-screen segments, integrity counters). From the running service when reachable, else "
+        "headless (`source` says which). Mirrors `displayxr-cli status --json`.",
+    .input_schema_json = "{\"type\":\"object\",\"properties\":{}}",
+    .fn = tool_get_status_snapshot,
+};
+
 static cJSON *
 tool_run_selftest(const cJSON *params, void *userdata)
 {
@@ -1182,6 +1224,7 @@ oxr_mcp_tools_register_all(void)
 	mcp_server_register_tool(&TOOL_CAPTURE_FRAME);
 	// Session-free diagnostics (#378) — usable with no app running.
 	mcp_server_register_tool(&TOOL_GET_RUNTIME_STATUS);
+	mcp_server_register_tool(&TOOL_GET_STATUS_SNAPSHOT);
 	mcp_server_register_tool(&TOOL_RUN_SELFTEST);
 	mcp_server_register_tool(&TOOL_LIST_DISPLAY_PROCESSORS);
 	mcp_server_register_tool(&TOOL_SET_PREFERRED_DP);
