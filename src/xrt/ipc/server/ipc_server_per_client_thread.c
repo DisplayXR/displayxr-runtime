@@ -108,6 +108,8 @@ common_shutdown(volatile struct ipc_client_state *ics)
 
 	// Decrement the connected client counter
 	ics->server->global_state.connected_client_count--;
+	// ADR-051: a disconnect is a status event (leaf lock; safe under this one).
+	ipc_server_status_bump(ics->server, false);
 
 	os_mutex_unlock(&ics->server->global_state.lock);
 
