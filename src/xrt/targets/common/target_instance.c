@@ -163,9 +163,9 @@ fill_dp_factories_from_plugin(struct xrt_system_compositor_info *info, const str
  * loader now ENFORCES it (#1521): the active plug-in wins any monitor it claims,
  * so the primary-monitor winner is the active plug-in whenever it claims that
  * monitor — it is no longer merely assumed from EDID confidence. Populated on
- * Windows and desktop Linux (RandR joined to DRM sysfs, multi-screen M0); a
- * no-op (empty registry) on macOS and Android, where the EDID enumerator
- * returns no monitors.
+ * Windows, desktop Linux (RandR joined to DRM sysfs, multi-screen M0) and
+ * macOS (CoreGraphics displays joined to IOKit EDID); a no-op (empty
+ * registry) on Android, where the EDID enumerator returns no monitors.
  */
 static void
 build_dp_registry(struct xrt_system_compositor_info *info)
@@ -759,8 +759,7 @@ fill_display_desktop_info(struct xrt_system_compositor_info *info)
 			(void)snprintf(scale_str, sizeof(scale_str), " at %.0f%%", desktop.scale * 100.0);
 		}
 		(void)snprintf(device_mode, sizeof(device_mode), "; connector mode %ux%u%s (%s)", desktop.native_width,
-		               desktop.native_height, scale_str,
-		               desktop.native_source == OS_DISPLAY_NATIVE_SOURCE_COMPOSITOR ? "compositor" : "DRM");
+		               desktop.native_height, scale_str, os_display_native_source_str(desktop.native_source));
 	}
 
 	const int one_to_one = os_display_desktop_info_is_1to1(&desktop);

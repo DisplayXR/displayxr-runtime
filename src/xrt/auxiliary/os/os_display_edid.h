@@ -16,7 +16,16 @@
  * (pure Wayland) the records come from DRM alone and carry
  * @ref os_display_edid_monitor::origin_unknown.
  *
- * Other platforms: stubs that return zero results.
+ * macOS: one record per active CoreGraphics display (`CGGetActiveDisplayList`,
+ * mirrors folded), placed in POINTS in the top-down global display space
+ * (`CGDisplayBounds` — the space windows are placed in, as on the other
+ * platforms), with the backing-pixel mode in
+ * @ref os_display_edid_monitor::native_width. Identity comes from the raw EDID
+ * IOKit publishes when one matches the display's CoreGraphics vendor/model/
+ * serial, else from those CoreGraphics numbers alone. See
+ * `os_display_edid_macos.c`.
+ *
+ * Other platforms (Android): stubs that return zero results.
  */
 
 #pragma once
@@ -44,8 +53,8 @@ enum os_edid_diag_error
 };
 
 /*!
- * How a monitor's placement record was tied to its EDID (desktop Linux; the
- * other platforms leave @ref OS_EDID_JOIN_NONE).
+ * How a monitor's placement record was tied to its EDID (desktop Linux and
+ * macOS; Windows leaves @ref OS_EDID_JOIN_NONE).
  */
 enum os_display_edid_join
 {
@@ -55,6 +64,8 @@ enum os_display_edid_join
 	OS_EDID_JOIN_MODE = 3,       //!< Unique match on pixel mode.
 	OS_EDID_JOIN_DRM_ONLY = 4,   //!< No placement source (no X server): DRM record alone.
 	OS_EDID_JOIN_RANDR_EDID = 5, //!< The X server's own EDID output property.
+	OS_EDID_JOIN_IOKIT_EDID = 6, //!< macOS: an IOKit EDID blob matching the display's CG vendor/model/serial.
+	OS_EDID_JOIN_CG_IDS = 7,     //!< macOS: no EDID found; identity from CoreGraphics' vendor/model/serial.
 };
 
 /*!
@@ -73,7 +84,7 @@ struct os_display_edid_monitor
 	void *hmonitor;           //!< HMONITOR on Windows, NULL elsewhere
 
 	/*!
-	 * @name Runtime-private extras (desktop Linux today; zero elsewhere)
+	 * @name Runtime-private extras (desktop Linux and macOS; zero elsewhere)
 	 *
 	 * Not plug-in ABI: @ref xrt_display_descriptor is built from the fields
 	 * above and is unchanged. These feed `displayxr-cli displays`, the
@@ -84,9 +95,13 @@ struct os_display_edid_monitor
 	uint32_t physical_width_mm;     //!< Detailed-timing mm, else bytes 21 x 10, else RandR; 0 = unknown.
 	uint32_t physical_height_mm;    //!< As above, bytes 22 x 10.
 	uint32_t native_width;          //!< The connector's device mode (may differ from pixel_width
-	uint32_t native_height;         //!< under a scaled X screen); 0 = unknown.
+	uint32_t native_height;         //!< under a scaled X screen; macOS: the mode's backing pixels,
+	                                //!< pixel_width being points); 0 = unknown.
 	char connector[32];             //!< DRM connector, e.g. "card1-HDMI-A-1"; "" = unknown.
-	char output_name[32];           //!< RandR output name, e.g. "HDMI-1"; "" = none.
+	char output_name[64];           //!< RandR output name, e.g. "HDMI-1"; macOS: the display UUID
+	                                //!< (= os_display_desktop_info::device_name); "" = none.
+	char display_name[64];          //!< Human-readable model name (EDID 0xFC descriptor, else the
+	                                //!< OS's); macOS only today; "" = unknown.
 	bool origin_unknown;            //!< screen_left/top are NOT a desktop position (DRM-only record).
 	enum os_display_edid_join join; //!< How the EDID was tied to the placement record.
 
@@ -117,6 +132,7 @@ struct os_display_edid_list
  * On Windows, uses SetupAPI to read EDID from the registry and
  * correlates with EnumDisplayMonitors for HMONITOR handles.
  * On desktop Linux, joins RandR monitors to DRM sysfs connectors.
+ * On macOS, walks the active CoreGraphics displays and reads EDID via IOKit.
  * On other platforms, sets count to 0.
  *
  * @param[out] out_list  Receives the enumerated monitors.
@@ -153,6 +169,8 @@ os_display_edid_join_str(enum os_display_edid_join join)
 	case OS_EDID_JOIN_MODE: return "mode";
 	case OS_EDID_JOIN_DRM_ONLY: return "drm-only";
 	case OS_EDID_JOIN_RANDR_EDID: return "randr-edid";
+	case OS_EDID_JOIN_IOKIT_EDID: return "iokit-edid";
+	case OS_EDID_JOIN_CG_IDS: return "cg-ids";
 	case OS_EDID_JOIN_NONE:
 	default: return "none";
 	}

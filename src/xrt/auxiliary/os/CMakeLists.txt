@@ -33,7 +33,18 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
 	# Desktop Linux (multi-screen M0): RandR monitors joined to DRM sysfs
 	# connectors. Needs os_display_desktop_x11.c + os_display_connector_linux.c,
 	# added below under the same condition.
-	target_sources(aux_os PRIVATE os_display_edid_linux.h os_display_edid_linux.c)
+	target_sources(
+		aux_os PRIVATE os_display_edid_linux.h os_display_edid_linux.c os_display_edid_parse.h
+			       os_display_edid_parse.c
+		)
+elseif(APPLE)
+	# macOS: CoreGraphics displays (os_display_desktop_macos.c, added below)
+	# joined to the EDID blobs IOKit publishes. IOKit is a system framework.
+	target_sources(
+		aux_os PRIVATE os_display_edid_macos.c os_display_macos.h os_display_edid_parse.h
+			       os_display_edid_parse.c
+		)
+	target_link_libraries(aux_os PRIVATE "-framework IOKit")
 else()
 	target_sources(aux_os PRIVATE os_display_edid_stubs.c)
 endif()
