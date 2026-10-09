@@ -1860,6 +1860,10 @@ struct d3d11_service_system
 	 * @{
 	 */
 	std::atomic<int64_t> render_diag_window_start_ns{0};
+	//! ADR-051: the last completed [RENDER] window as data (the log formats it);
+	//! guarded by @ref render_diag_last_mutex, read by comp_d3d11_service_get_render_diag.
+	std::mutex render_diag_last_mutex;
+	struct comp_d3d11_render_diag render_diag_last = {};
 	std::atomic<uint32_t> render_diag_capture_renders{0};
 	std::atomic<int64_t> render_diag_capture_render_total_ns{0};
 	std::atomic<uint32_t> render_diag_client_renders{0};
@@ -9887,28 +9891,26 @@ emit_render_diag_if_window_elapsed(struct d3d11_service_system *sys)
 		return;
 	}
 
-	uint32_t cap_r =
-	    sys->render_diag_capture_renders.exchange(0, std::memory_order_relaxed);
-	int64_t cap_total =
-	    sys->render_diag_capture_render_total_ns.exchange(0, std::memory_order_relaxed);
-	uint32_t cli_r =
-	    sys->render_diag_client_renders.exchange(0, std::memory_order_relaxed);
-	uint32_t cli_s =
-	    sys->render_diag_client_skips.exchange(0, std::memory_order_relaxed);
-	int64_t cli_total =
-	    sys->render_diag_client_render_total_ns.exchange(0, std::memory_order_relaxed);
-	int64_t wait_total =
-	    sys->render_diag_mutex_wait_total_ns.exchange(0, std::memory_order_relaxed);
-	uint32_t wait_count =
-	    sys->render_diag_mutex_wait_count.exchange(0, std::memory_order_relaxed);
-
-	uint32_t cap_avg_us = (cap_r > 0) ? (uint32_t)(cap_total / 1000 / cap_r) : 0u;
-	uint32_t cli_avg_us = (cli_r > 0) ? (uint32_t)(cli_total / 1000 / cli_r) : 0u;
-	uint32_t wait_avg_us = (wait_count > 0) ? (uint32_t)(wait_total / 1000 / wait_count) : 0u;
-
-	U_LOG_W(
-	    "[RENDER] capture_renders=%u capture_avg_us=%u client_renders=%u client_skips=%u client_avg_us=%u wait_avg_us=%u window_s=10",
-	    cap_r, cap_avg_us, cli_r, cli_s, cli_avg_us, wait_avg_us);
+	// Drain the window into one struct; the log lines below format it and
+	// comp_d3d11_service_get_render_diag hands it out (ADR-051).
+	struct comp_d3d11_render_diag d = {};
+	d.valid = true;
+	d.window_s = 10;
+	{
+		uint32_t cap_r = sys->render_diag_capture_renders.exchange(0, std::memory_order_relaxed);
+		int64_t cap_total = sys->render_diag_capture_render_total_ns.exchange(0, std::memory_order_relaxed);
+		uint32_t cli_r = sys->render_diag_client_renders.exchange(0, std::memory_order_relaxed);
+		uint32_t cli_s = sys->render_diag_client_skips.exchange(0, std::memory_order_relaxed);
+		int64_t cli_total = sys->render_diag_client_render_total_ns.exchange(0, std::memory_order_relaxed);
+		int64_t wait_total = sys->render_diag_mutex_wait_total_ns.exchange(0, std::memory_order_relaxed);
+		uint32_t wait_count = sys->render_diag_mutex_wait_count.exchange(0, std::memory_order_relaxed);
+		d.capture_renders = cap_r;
+		d.capture_avg_us = (cap_r > 0) ? (uint32_t)(cap_total / 1000 / cap_r) : 0u;
+		d.client_renders = cli_r;
+		d.client_skips = cli_s;
+		d.client_avg_us = (cli_r > 0) ? (uint32_t)(cli_total / 1000 / cli_r) : 0u;
+		d.wait_avg_us = (wait_count > 0) ? (uint32_t)(wait_total / 1000 / wait_count) : 0u;
+	}
 
 	// #964: pipeline presenter counters on the same window. The ratio
 	// pipe_active_present : pipe_active_skip is the diagnostic for the
@@ -9918,25 +9920,20 @@ emit_render_diag_if_window_elapsed(struct d3d11_service_system *sys)
 	// pipe_active_backoff counts only the watchdog/occlusion parking.
 	// presenter = enum d3d11_presenter_kind of the active presenter at emit.
 	if (pipeline_always_on(sys)) {
-		uint32_t ap = sys->render_diag_pipe_active_present.exchange(0, std::memory_order_relaxed);
-		uint32_t as = sys->render_diag_pipe_active_skip.exchange(0, std::memory_order_relaxed);
-		uint32_t ab = sys->render_diag_pipe_active_backoff.exchange(0, std::memory_order_relaxed);
-		uint32_t fp = sys->render_diag_pipe_flat_present.exchange(0, std::memory_order_relaxed);
-		uint32_t fs = sys->render_diag_pipe_flat_skip.exchange(0, std::memory_order_relaxed);
-		uint32_t rb = sys->render_diag_pipe_rebind.exchange(0, std::memory_order_relaxed);
-		uint32_t sr = sys->render_diag_dp_stale_recreate.exchange(0, std::memory_order_relaxed);
-		uint32_t ac = sys->render_diag_atlas_contention.exchange(0, std::memory_order_relaxed);
-		uint32_t cw = sys->render_diag_ctx_waits.exchange(0, std::memory_order_relaxed);
-		int pk = sys->render_diag_pipe_presenter.load(std::memory_order_relaxed);
-		uint32_t rh = sys->render_diag_recipe_hold.exchange(0, std::memory_order_relaxed);
-		uint32_t zk = sys->render_diag_zones_skip.exchange(0, std::memory_order_relaxed);
-		uint32_t uk = sys->render_diag_ui_acq_skip.exchange(0, std::memory_order_relaxed);
-		U_LOG_W(
-		    "[RENDER] pipe_active_present=%u pipe_active_skip=%u pipe_active_backoff=%u "
-		    "pipe_flat_present=%u pipe_flat_skip=%u pipe_rebind=%u dp_stale_recreate=%u "
-		    "atlas_contention=%u ctx_waits=%u presenter=%d recipe_hold=%u zones_skip=%u "
-		    "ui_acq_skip=%u window_s=10",
-		    ap, as, ab, fp, fs, rb, sr, ac, cw, pk, rh, zk, uk);
+		d.pipe_valid = true;
+		d.pipe_active_present = sys->render_diag_pipe_active_present.exchange(0, std::memory_order_relaxed);
+		d.pipe_active_skip = sys->render_diag_pipe_active_skip.exchange(0, std::memory_order_relaxed);
+		d.pipe_active_backoff = sys->render_diag_pipe_active_backoff.exchange(0, std::memory_order_relaxed);
+		d.pipe_flat_present = sys->render_diag_pipe_flat_present.exchange(0, std::memory_order_relaxed);
+		d.pipe_flat_skip = sys->render_diag_pipe_flat_skip.exchange(0, std::memory_order_relaxed);
+		d.pipe_rebind = sys->render_diag_pipe_rebind.exchange(0, std::memory_order_relaxed);
+		d.dp_stale_recreate = sys->render_diag_dp_stale_recreate.exchange(0, std::memory_order_relaxed);
+		d.atlas_contention = sys->render_diag_atlas_contention.exchange(0, std::memory_order_relaxed);
+		d.ctx_waits = sys->render_diag_ctx_waits.exchange(0, std::memory_order_relaxed);
+		d.presenter = sys->render_diag_pipe_presenter.load(std::memory_order_relaxed);
+		d.recipe_hold = sys->render_diag_recipe_hold.exchange(0, std::memory_order_relaxed);
+		d.zones_skip = sys->render_diag_zones_skip.exchange(0, std::memory_order_relaxed);
+		d.ui_acq_skip = sys->render_diag_ui_acq_skip.exchange(0, std::memory_order_relaxed);
 
 		/*
 		 * #918: the split's own window. `xb_kb` is atlas transport per window,
@@ -9946,12 +9943,13 @@ emit_render_diag_if_window_elapsed(struct d3d11_service_system *sys)
 		 * output-device crop rescued from a worst-case egress ring. Emitted only
 		 * when Stage A succeeded, so an ordinary session's log is unchanged.
 		 */
+		d.split_available = sys->split_available;
 		if (sys->split_available) {
-			uint32_t dr = sys->render_diag_pipe_dev_rebind.exchange(0, std::memory_order_relaxed);
-			uint32_t fk = sys->render_diag_flat_skip_split.exchange(0, std::memory_order_relaxed);
-			uint32_t mk = sys->render_diag_maskpub_skip.exchange(0, std::memory_order_relaxed);
-			uint32_t ns = sys->render_diag_split_no_slot.exchange(0, std::memory_order_relaxed);
-			uint32_t oc = sys->render_diag_split_out_crop.exchange(0, std::memory_order_relaxed);
+			d.pipe_dev_rebind = sys->render_diag_pipe_dev_rebind.exchange(0, std::memory_order_relaxed);
+			d.flat_skip = sys->render_diag_flat_skip_split.exchange(0, std::memory_order_relaxed);
+			d.maskpub_skip = sys->render_diag_maskpub_skip.exchange(0, std::memory_order_relaxed);
+			d.no_slot = sys->render_diag_split_no_slot.exchange(0, std::memory_order_relaxed);
+			d.out_crop = sys->render_diag_split_out_crop.exchange(0, std::memory_order_relaxed);
 			const uint64_t xb_bytes =
 			    sys->xbridge != nullptr ? comp_xbridge_take_atlas_bytes(sys->xbridge) : 0;
 			/*
@@ -9970,15 +9968,43 @@ emit_render_diag_if_window_elapsed(struct d3d11_service_system *sys)
 			                       : ing.mode == COMP_XBRIDGE_INGRESS_DIRECT ? "direct"
 			                       : ing.mode == COMP_XBRIDGE_INGRESS_STAGED ? "staged"
 			                                                                 : "none";
+			d.split_active = (int)sys->split_active;
+			d.xb_kb = xb_bytes / 1024u;
+			d.xb_degraded = (int)(sys->xbridge != nullptr && comp_xbridge_is_degraded(sys->xbridge));
+			snprintf(d.ingress, sizeof(d.ingress), "%s", ing_name);
+			d.ing_direct = (uint64_t)ing.direct;
+			d.ing_staged = (uint64_t)ing.staged;
+			d.ing_rebind = (uint64_t)ing.rebind;
+			d.ing_churn = (uint64_t)ing.churn;
+			d.ing_leak = (uint64_t)ing.leak;
+		} else {
+			snprintf(d.split_off_reason, sizeof(d.split_off_reason), "%s", sys->split_off_reason);
+		}
+	}
+
+	// The [RENDER] lines are grepped by peers: keep them byte-identical.
+	U_LOG_W(
+	    "[RENDER] capture_renders=%u capture_avg_us=%u client_renders=%u client_skips=%u client_avg_us=%u "
+	    "wait_avg_us=%u window_s=10",
+	    d.capture_renders, d.capture_avg_us, d.client_renders, d.client_skips, d.client_avg_us, d.wait_avg_us);
+	if (d.pipe_valid) {
+		U_LOG_W(
+		    "[RENDER] pipe_active_present=%u pipe_active_skip=%u pipe_active_backoff=%u "
+		    "pipe_flat_present=%u pipe_flat_skip=%u pipe_rebind=%u dp_stale_recreate=%u "
+		    "atlas_contention=%u ctx_waits=%u presenter=%d recipe_hold=%u zones_skip=%u "
+		    "ui_acq_skip=%u window_s=10",
+		    d.pipe_active_present, d.pipe_active_skip, d.pipe_active_backoff, d.pipe_flat_present,
+		    d.pipe_flat_skip, d.pipe_rebind, d.dp_stale_recreate, d.atlas_contention, d.ctx_waits, d.presenter,
+		    d.recipe_hold, d.zones_skip, d.ui_acq_skip);
+		if (d.split_available) {
 			U_LOG_W(
 			    "[RENDER] split=%d xb_kb=%llu xb_degraded=%d pipe_dev_rebind=%u "
 			    "flat_skip=%u maskpub_skip=%u no_slot=%u out_crop=%u ingress=%s ing_direct=%llu "
 			    "ing_staged=%llu ing_rebind=%llu ing_churn=%llu ing_leak=%llu window_s=10",
-			    (int)sys->split_active, (unsigned long long)(xb_bytes / 1024u),
-			    (int)(sys->xbridge != nullptr && comp_xbridge_is_degraded(sys->xbridge)), dr, fk, mk, ns,
-			    oc, ing_name, (unsigned long long)ing.direct, (unsigned long long)ing.staged,
-			    (unsigned long long)ing.rebind, (unsigned long long)ing.churn,
-			    (unsigned long long)ing.leak);
+			    d.split_active, (unsigned long long)d.xb_kb, d.xb_degraded, d.pipe_dev_rebind, d.flat_skip,
+			    d.maskpub_skip, d.no_slot, d.out_crop, d.ingress, (unsigned long long)d.ing_direct,
+			    (unsigned long long)d.ing_staged, (unsigned long long)d.ing_rebind,
+			    (unsigned long long)d.ing_churn, (unsigned long long)d.ing_leak);
 		} else {
 			/*
 			 * SPLIT OFF — say so, and say why. Without this the whole
@@ -9991,8 +10017,13 @@ emit_render_diag_if_window_elapsed(struct d3d11_service_system *sys)
 			 * them as zeros would put eleven meaningless fields into every
 			 * 10 s window on every single-GPU box.
 			 */
-			U_LOG_W("[RENDER] split=0 reason=%s", sys->split_off_reason);
+			U_LOG_W("[RENDER] split=0 reason=%s", d.split_off_reason);
 		}
+	}
+
+	{
+		std::lock_guard<std::mutex> lk(sys->render_diag_last_mutex);
+		sys->render_diag_last = d;
 	}
 
 	sys->render_diag_window_start_ns.store(now_ns, std::memory_order_relaxed);
@@ -31104,6 +31135,21 @@ comp_d3d11_service_dp_backend_state(struct xrt_system_compositor *xsysc)
 		return XRT_DP_BACKEND_STATE_OK;
 	}
 	return d3d11_service_system_from_xrt(xsysc)->dp_backend_state.load(std::memory_order_relaxed);
+}
+
+extern "C" void
+comp_d3d11_service_get_render_diag(struct xrt_system_compositor *xsysc, struct comp_d3d11_render_diag *out)
+{
+	if (out == nullptr) {
+		return;
+	}
+	*out = {};
+	if (xsysc == nullptr) {
+		return;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	std::lock_guard<std::mutex> lk(sys->render_diag_last_mutex);
+	*out = sys->render_diag_last;
 }
 
 extern "C" bool

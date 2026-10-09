@@ -664,6 +664,73 @@ error:
 static bool
 controller_connected_locked(struct ipc_server *s); // #962, defined below
 
+/*!
+ * Fill @p out with the [HEALTH] facts. Caller holds global_state.lock (the
+ * same lock connect/disconnect take), so the snapshot is consistent with the
+ * slot table.
+ */
+static void
+fill_health_locked(struct ipc_server *s, struct ipc_service_health *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->max_clients = s->max_clients;
+	out->active_idx = s->global_state.active_client_index;
+	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+		if (s->threads[i].state != IPC_THREAD_RUNNING && s->threads[i].state != IPC_THREAD_STARTING) {
+			continue;
+		}
+		volatile struct ipc_client_state *ics = &s->threads[i].ics;
+		const struct ipc_app_state *cs = (const struct ipc_app_state *)&ics->client_state;
+		struct ipc_service_health_slot *h = &out->slots[out->slot_count++];
+		h->slot = i;
+		h->id = cs->id;
+		h->pid = (int64_t)cs->pid;
+		h->client_class = cs->client_class;
+		h->class_verified = ics->class_verified;
+		snprintf(h->name, sizeof(h->name), "%s", cs->info.application_name);
+		h->session_active = cs->session_active;
+		h->session_visible = cs->session_visible;
+		h->session_focused = cs->session_focused;
+		h->io_active = ics->io_active;
+		h->primary_application = cs->primary_application;
+		h->swapchain_count = ics->swapchain_count;
+		h->space_count = ics->space_count;
+	}
+	// #961: who holds the PANEL LEASE — the controller while one is connected,
+	// else (default policy) the focused client, else nobody.
+	if (controller_connected_locked(s)) {
+		out->lease = IPC_SERVICE_LEASE_CONTROLLER;
+	} else if (out->active_idx >= 0) {
+		out->lease = IPC_SERVICE_LEASE_SLOT;
+		out->lease_slot = out->active_idx;
+	} else {
+		out->lease = IPC_SERVICE_LEASE_NONE;
+	}
+	// #1002: the device state. A lost device makes every client fail
+	// identically and silently; one word in the summary line is the
+	// difference between "why is everything black" and a known cause.
+	// Same idea for the vendor display processor's BACKEND: the vendor platform
+	// service can restart underneath us, after which a DP that cannot reconnect
+	// keeps returning successful-but-stale eye positions and every app weaves
+	// untracked. "degraded" = the DP is reconnecting, "stale" = it cannot and
+	// the compositor is recreating it.
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc != NULL) {
+		out->device_removed = comp_d3d11_service_device_is_removed(s->xsysc);
+		out->dp_state_known = true;
+		out->dp_backend_state = comp_d3d11_service_dp_backend_state(s->xsysc);
+	}
+#endif
+}
+
+void
+ipc_server_get_health(struct ipc_server *s, struct ipc_service_health *out)
+{
+	os_mutex_lock(&s->global_state.lock);
+	fill_health_locked(s, out);
+	os_mutex_unlock(&s->global_state.lock);
+}
+
 static void
 emit_health_if_elapsed(struct ipc_server *s)
 {
@@ -678,61 +745,44 @@ emit_health_if_elapsed(struct ipc_server *s)
 	}
 	last_ns = now_ns;
 
+	// Large (one entry per slot) and only ever touched by the mainloop thread.
+	static struct ipc_service_health h;
 	os_mutex_lock(&s->global_state.lock);
-	uint32_t active = 0;
-	int32_t active_idx = s->global_state.active_client_index;
-	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
-		if (s->threads[i].state != IPC_THREAD_RUNNING && s->threads[i].state != IPC_THREAD_STARTING) {
-			continue;
-		}
-		volatile struct ipc_client_state *ics = &s->threads[i].ics;
-		const struct ipc_app_state *cs = (const struct ipc_app_state *)&ics->client_state;
-		const char *name = cs->info.application_name[0] ? cs->info.application_name : "?";
+	fill_health_locked(s, &h);
+
+	// The log lines below are grepped by peers: keep them byte-identical.
+	for (uint32_t k = 0; k < h.slot_count; k++) {
+		const struct ipc_service_health_slot *sl = &h.slots[k];
+		const char *name = sl->name[0] ? sl->name : "?";
 		// #960: the verified class ("APP" until describe_client has run).
-		const char *kind = ics->class_verified ? ipc_server_client_class_str(cs->client_class) : "unverified";
-		active++;
+		const char *kind = sl->class_verified ? ipc_server_client_class_str(sl->client_class) : "unverified";
 		U_LOG_W(
 		    "[HEALTH] slot=%u id=%u pid=%d class=%s name='%s' session=%c%c%c io=%c primary=%c%s "
 		    "swapchains=%u spaces=%u",
-		    i, cs->id, (int)cs->pid, kind, name, cs->session_active ? 'a' : '-',
-		    cs->session_visible ? 'v' : '-', cs->session_focused ? 'f' : '-', ics->io_active ? 'y' : 'n',
-		    cs->primary_application ? 'y' : 'n', ((int32_t)i == active_idx) ? " ACTIVE" : "",
-		    ics->swapchain_count, ics->space_count);
+		    sl->slot, sl->id, (int)sl->pid, kind, name, sl->session_active ? 'a' : '-',
+		    sl->session_visible ? 'v' : '-', sl->session_focused ? 'f' : '-', sl->io_active ? 'y' : 'n',
+		    sl->primary_application ? 'y' : 'n', ((int32_t)sl->slot == h.active_idx) ? " ACTIVE" : "",
+		    sl->swapchain_count, sl->space_count);
 	}
-	// #961: who holds the PANEL LEASE — the controller while one is connected,
-	// else (default policy) the focused client, else nobody.
 	char lease[32];
-	if (controller_connected_locked(s)) {
-		snprintf(lease, sizeof(lease), "controller");
-	} else if (active_idx >= 0) {
-		snprintf(lease, sizeof(lease), "slot=%d", active_idx);
-	} else {
-		snprintf(lease, sizeof(lease), "none");
+	switch (h.lease) {
+	case IPC_SERVICE_LEASE_CONTROLLER: snprintf(lease, sizeof(lease), "controller"); break;
+	case IPC_SERVICE_LEASE_SLOT: snprintf(lease, sizeof(lease), "slot=%d", h.lease_slot); break;
+	default: snprintf(lease, sizeof(lease), "none"); break;
 	}
-	// #1002: name the device state here too. A lost device makes every client
-	// fail identically and silently; one word in the summary line is the
-	// difference between "why is everything black" and a known cause.
-	const char *device_state = "ok";
-	// Same idea for the vendor display processor's BACKEND: the vendor platform
-	// service can restart underneath us, after which a DP that cannot reconnect
-	// keeps returning successful-but-stale eye positions and every app weaves
-	// untracked. "degraded" = the DP is reconnecting, "stale" = it cannot and
-	// the compositor is recreating it.
+	const char *device_state = h.device_removed ? "REMOVED" : "ok";
 	const char *dp_state = "n/a";
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
-	if (s->xsysc != NULL && comp_d3d11_service_device_is_removed(s->xsysc)) {
-		device_state = "REMOVED";
-	}
-	if (s->xsysc != NULL) {
-		switch (comp_d3d11_service_dp_backend_state(s->xsysc)) {
+	if (h.dp_state_known) {
+		switch (h.dp_backend_state) {
 		case XRT_DP_BACKEND_STATE_DEGRADED: dp_state = "degraded"; break;
 		case XRT_DP_BACKEND_STATE_STALE: dp_state = "stale"; break;
 		default: dp_state = "ok"; break;
 		}
 	}
 #endif
-	U_LOG_W("[HEALTH] clients=%u/%u active_idx=%d lease=%s device=%s dp=%s window_s=%ld", active, s->max_clients,
-	        active_idx, lease, device_state, dp_state, period_ms / 1000);
+	U_LOG_W("[HEALTH] clients=%u/%u active_idx=%d lease=%s device=%s dp=%s window_s=%ld", h.slot_count,
+	        h.max_clients, h.active_idx, lease, device_state, dp_state, period_ms / 1000);
 	os_mutex_unlock(&s->global_state.lock);
 }
 

@@ -728,6 +728,61 @@ const char *
 ipc_server_client_class_str(uint32_t client_class);
 
 /*!
+ * One connected slot's IPC-layer health facts — what one `[HEALTH] slot=…` log
+ * line prints (#951), kept as data so the log and the status snapshot
+ * (ADR-051 D3, phase 2) read the same struct and cannot drift.
+ */
+struct ipc_service_health_slot
+{
+	uint32_t slot;                            //!< Server thread slot index.
+	uint32_t id;                              //!< Client id.
+	int64_t pid;                              //!< Client process id.
+	uint32_t client_class;                    //!< Verified `enum xrt_client_class`.
+	bool class_verified;                      //!< false = "unverified" (describe_client not run yet).
+	char name[XRT_MAX_APPLICATION_NAME_SIZE]; //!< Application name ("" = unknown).
+	bool session_active;                      //!< Session flags.
+	bool session_visible;                     //!< See @ref session_active.
+	bool session_focused;                     //!< See @ref session_active.
+	bool io_active;                           //!< Input routed to this client.
+	bool primary_application;                 //!< Primary application.
+	uint32_t swapchain_count;                 //!< Live swapchains.
+	uint32_t space_count;                     //!< Live spaces.
+};
+
+//! Who holds the panel lease (#961).
+enum ipc_service_lease_kind
+{
+	IPC_SERVICE_LEASE_NONE = 0,       //!< Nobody.
+	IPC_SERVICE_LEASE_CONTROLLER = 1, //!< The connected workspace controller.
+	IPC_SERVICE_LEASE_SLOT = 2,       //!< The focused client's slot (default policy).
+};
+
+/*!
+ * The service's health summary — the `[HEALTH]` log lines as data (#951,
+ * #961, #1002). Filled under `global_state.lock`.
+ */
+struct ipc_service_health
+{
+	uint32_t slot_count;                                   //!< Valid entries in @ref slots.
+	struct ipc_service_health_slot slots[IPC_MAX_CLIENTS]; //!< Connected slots, in slot order.
+	uint32_t max_clients;                                  //!< Runtime-admitted client cap.
+	int32_t active_idx;                                    //!< Active client slot (-1 = none).
+	enum ipc_service_lease_kind lease;                     //!< Panel lease holder kind.
+	int32_t lease_slot;                                    //!< Slot holding the lease (LEASE_SLOT only).
+	bool device_removed;                                   //!< The service's D3D11 device is REMOVED.
+	bool dp_state_known;                                   //!< A service compositor reports DP backend state.
+	uint32_t dp_backend_state;                             //!< `XRT_DP_BACKEND_STATE_*` (iff @ref dp_state_known).
+};
+
+/*!
+ * ADR-051: copy the current health summary into @p out, under
+ * `global_state.lock` (the lock the `[HEALTH]` emitter holds). For the
+ * phase-2 status RPCs; safe from any thread.
+ */
+void
+ipc_server_get_health(struct ipc_server *s, struct ipc_service_health *out);
+
+/*!
  * #960: per-class admission quota (ADR-035 D6). CONTROLLER 1, RELAY 1,
  * PRESENT_OWNER 2, DIAG 4, PROVIDER_HOST 2 (outside the app budget), APP =
  * s->max_clients minus the reserved controller slot (0 = unlimited within the cap).

@@ -891,6 +891,67 @@ uint32_t
 comp_d3d11_service_dp_backend_state(struct xrt_system_compositor *xsysc);
 
 /*!
+ * One 10 s `[RENDER]` window as data (Phase 3 / #964 / #918), so the log lines
+ * and the status snapshot (ADR-051, phase 2) read the same struct and cannot
+ * drift. Filled by the emitter as it drains the window counters; the getter
+ * returns the last COMPLETED window.
+ *
+ * @ingroup comp_d3d11_service
+ */
+struct comp_d3d11_render_diag
+{
+	bool valid;               //!< At least one window has completed.
+	uint32_t window_s;        //!< Window length, seconds.
+	uint32_t capture_renders; //!< Capture-thread renders in the window.
+	uint32_t capture_avg_us;  //!< Their average, µs.
+	uint32_t client_renders;  //!< Client-driven renders.
+	uint32_t client_skips;    //!< Client-driven skips.
+	uint32_t client_avg_us;   //!< Client render average, µs.
+	uint32_t wait_avg_us;     //!< Render-mutex wait average, µs.
+
+	bool pipe_valid;              //!< The always-on pipeline ran (the `pipe_*` fields are meaningful).
+	uint32_t pipe_active_present; //!< Active presenter presents.
+	uint32_t pipe_active_skip;    //!< Active presenter probe-then-skips.
+	uint32_t pipe_active_backoff; //!< Watchdog / occlusion parking.
+	uint32_t pipe_flat_present;   //!< Flat presenter presents.
+	uint32_t pipe_flat_skip;      //!< Flat presenter skips.
+	uint32_t pipe_rebind;         //!< Presenter rebinds.
+	uint32_t dp_stale_recreate;   //!< DP recreations after a STALE backend.
+	uint32_t atlas_contention;    //!< Atlas reads skipped mid-write (#1018).
+	uint32_t ctx_waits;           //!< Immediate-context waits (#1589).
+	int presenter;                //!< `enum d3d11_presenter_kind` at emit.
+	uint32_t recipe_hold;         //!< Recipe holds.
+	uint32_t zones_skip;          //!< Zones-composite skips.
+	uint32_t ui_acq_skip;         //!< UI acquire skips.
+
+	bool split_available;      //!< Stage A of the weave-on-scanout split succeeded (#918).
+	int split_active;          //!< The split is engaged.
+	uint64_t xb_kb;            //!< Bridge atlas transport, KiB per window.
+	int xb_degraded;           //!< The cross-adapter fence watchdog gave up.
+	uint32_t pipe_dev_rebind;  //!< Output-device rebinds.
+	uint32_t flat_skip;        //!< Flat skips on the split.
+	uint32_t maskpub_skip;     //!< Mask-publish skips.
+	uint32_t no_slot;          //!< Frames with no bridge slot.
+	uint32_t out_crop;         //!< Frames rescued by the output-device crop.
+	char ingress[12];          //!< "adaptive" / "direct" / "staged" / "none".
+	uint64_t ing_direct;       //!< Direct ingress submits (window).
+	uint64_t ing_staged;       //!< Staged ingress submits (window).
+	uint64_t ing_rebind;       //!< Settled source changes (lifetime).
+	uint64_t ing_churn;        //!< Unsettled key changes (lifetime).
+	uint64_t ing_leak;         //!< Dropped opens (lifetime; any non-zero is a bug).
+	char split_off_reason[80]; //!< Why the split is off (iff !split_available).
+};
+
+/*!
+ * ADR-051: copy the last completed `[RENDER]` window into @p out (zeroed, with
+ * `valid = false`, before the first one completes). Safe from any thread.
+ *
+ * @ingroup comp_d3d11_service
+ */
+void
+comp_d3d11_service_get_render_diag(struct xrt_system_compositor *xsysc, struct comp_d3d11_render_diag *out);
+
+/*!
  * #964 (D-5): is the COMPOSITOR the one focus authority right now?
  *
  * True on the always-on pipeline (i.e. always, unless DXR_LEGACY_STANDALONE=1):
