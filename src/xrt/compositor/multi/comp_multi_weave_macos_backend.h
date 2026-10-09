@@ -108,6 +108,18 @@ struct comp_multi_weave_macos_backend
 	bool (*request_display_mode)(struct multi_compositor *mc, bool enable_3d, bool *out_has_slot);
 	bool (*get_hardware_3d_state)(struct multi_compositor *mc, bool *out_is_3d);
 
+	//! Phase-snap a drag step (xrWeaveSnapWindowRectDXR): the DP's snap slot with
+	//! the front end's points already translated to PANEL-RELATIVE backing px
+	//! (y down). true only when the DP produced a snap (outputs valid, same
+	//! frame); false = identity. NULL = no snap on this backend.
+	bool (*snap_window_rect)(struct multi_compositor *mc,
+	                         int32_t origin_x,
+	                         int32_t origin_y,
+	                         int32_t target_x,
+	                         int32_t target_y,
+	                         int32_t *out_x,
+	                         int32_t *out_y);
+
 	//! Release every backend object (the DP first-class: it is destroyed before
 	//! the device objects it was created on).
 	void (*fini)(struct multi_compositor *mc);

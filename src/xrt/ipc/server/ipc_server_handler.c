@@ -7223,10 +7223,11 @@ ipc_handle_weave_snap_window_rect(volatile struct ipc_client_state *ics,
 #elif defined(COMP_MULTI_HAVE_WEAVE)
 	// The weave engine owns the service-side display processor, so the snap
 	// routes through it: its xrt_display_processor_vk's snap_window_rect slot
-	// (the same slot the in-process vk_native compositor uses). Identity today
-	// on macOS / Android (sim_display has no interlace lattice, #759); on
-	// desktop Linux it is the real snap through the weave engine's own DP
-	// (#1699 R2) — identity until the first submit has brought that DP up.
+	// (the same slot the in-process vk_native compositor uses). Identity on
+	// Android; on desktop Linux it is the real snap through the weave engine's
+	// own DP (#1699 R2); on macOS the Metal backend routes it to the Metal DP's
+	// snap slot (ADR-050; the vk backend stays identity). Identity until the
+	// first submit has brought that DP up.
 	int32_t sx = target_x, sy = target_y;
 	if (comp_multi_weave_snap_window_rect(ics->xc, origin_x, origin_y, target_x, target_y, &sx, &sy)) {
 		*out_snapped = true;

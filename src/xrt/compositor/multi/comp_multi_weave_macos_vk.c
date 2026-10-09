@@ -1580,6 +1580,7 @@ const struct comp_multi_weave_macos_backend comp_multi_weave_macos_backend_vk = 
     .get_eyes = vkb_get_eyes,
     .request_display_mode = vkb_request_display_mode,
     .get_hardware_3d_state = vkb_get_hardware_3d_state,
+    .snap_window_rect = NULL, // unchanged: no snap on the vk weave path (identity)
     .fini = vkb_fini,
 };
 

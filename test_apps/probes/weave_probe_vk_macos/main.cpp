@@ -24,7 +24,14 @@
  * Run (service already started with the sim display plug-in):
  *   SIM_DISPLAY_OUTPUT=anaglyph XRT_PLUGIN_SEARCH_PATH=.../plugins displayxr-service &
  *   XRT_FORCE_MODE=ipc XR_RUNTIME_JSON=build/openxr_displayxr-dev.json \
- *     ./weave_probe_vk_macos [--geometry ox,oy[,display]]
+ *     ./weave_probe_vk_macos [--geometry ox,oy[,display]] [--snap [period]]
+ *
+ * --snap: xrWeaveSnapWindowRectDXR legs (ADR-050 on the weave path). Before the
+ * first submit (engine not up) the snap must be the identity; after the
+ * submits it must be the identity too unless [period] > 1 is given, which
+ * asserts the snap of a vertical lattice of that period — set the SERVICE's
+ * SIM_DISPLAY_METAL_SNAP_PERIOD to the same value and DXR_WEAVE_MAC_BACKEND=metal
+ * (the vk backend never snaps on macOS, so pass no period there).
  *
  * The service picks its weave backend with DXR_WEAVE_MAC_BACKEND=auto|metal|vk
  * (sim_display exports both DP families, so auto = vk); every check above holds
@@ -43,6 +50,7 @@
 #include <openxr/XR_DXR_weave.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -325,8 +333,15 @@ main(int argc, char **argv)
 	// DP (Metal backend) and logs it once; the CPU checks are unchanged.
 	bool have_geometry = false;
 	int geom_x = 0, geom_y = 0, geom_display = -1;
+	bool do_snap = false;
+	int snap_period = 0; // 0/1 = expect identity
 	for (int i = 1; i < argc; i++) {
-		if (strcmp(argv[i], "--geometry") == 0 && i + 1 < argc) {
+		if (strcmp(argv[i], "--snap") == 0) {
+			do_snap = true;
+			if (i + 1 < argc && argv[i + 1][0] != '-') {
+				snap_period = atoi(argv[++i]);
+			}
+		} else if (strcmp(argv[i], "--geometry") == 0 && i + 1 < argc) {
 			int n = sscanf(argv[++i], "%d,%d,%d", &geom_x, &geom_y, &geom_display);
 			if (n < 2) {
 				LOG("bad --geometry '%s' (want ox,oy[,display])", argv[i]);
@@ -334,7 +349,7 @@ main(int argc, char **argv)
 			}
 			have_geometry = true;
 		} else {
-			LOG("usage: %s [--geometry ox,oy[,display]]", argv[0]);
+			LOG("usage: %s [--geometry ox,oy[,display]] [--snap [period]]", argv[0]);
 			return 1;
 		}
 	}
@@ -573,6 +588,39 @@ main(int argc, char **argv)
 	submit.inputIsDxgi = XR_FALSE;
 	submit.firstChunk = XR_TRUE; // single submit per frame → first → clears woven output transparent (v5)
 
+	// ---- --snap: xrWeaveSnapWindowRectDXR. Points in the weave geometry
+	// convention (global CoreGraphics BACKING px, y down); dx = 13, dy = 11.
+	PFN_xrWeaveSnapWindowRectDXR pfn_snap = NULL;
+	const XrRect2Di snap_origin = {{200, 150}, {(int32_t)kWinW, (int32_t)kWinH}};
+	const XrRect2Di snap_target = {{213, 161}, {(int32_t)kWinW, (int32_t)kWinH}};
+	auto snap_leg = [&](const char *when, bool expect_snap) -> bool {
+		XrRect2Di got = {};
+		XrResult r = pfn_snap(session, &snap_origin, &snap_target, &got);
+		XrRect2Di want = snap_target;
+		if (expect_snap) {
+			const int dx = snap_target.offset.x - snap_origin.offset.x;
+			const int n = dx >= 0 ? (dx + snap_period / 2) / snap_period
+			                      : -((-dx + snap_period / 2) / snap_period);
+			want.offset.x = snap_origin.offset.x + n * snap_period;
+		}
+		const bool ok = r == XR_SUCCESS && got.offset.x == want.offset.x && got.offset.y == want.offset.y &&
+		                got.extent.width == want.extent.width && got.extent.height == want.extent.height;
+		LOG("snap %s: rc=%d origin=(%d,%d) target=(%d,%d) -> (%d,%d %dx%d) want (%d,%d %dx%d) [%s] -> %s", when,
+		    (int)r, snap_origin.offset.x, snap_origin.offset.y, snap_target.offset.x, snap_target.offset.y,
+		    got.offset.x, got.offset.y, got.extent.width, got.extent.height, want.offset.x, want.offset.y,
+		    want.extent.width, want.extent.height, expect_snap ? "lattice" : "identity", ok ? "OK" : "WRONG");
+		return ok;
+	};
+	bool snap_ok = true;
+	if (do_snap) {
+		xrGetInstanceProcAddr(instance, "xrWeaveSnapWindowRectDXR", (PFN_xrVoidFunction *)&pfn_snap);
+		if (pfn_snap == NULL) {
+			LOG("FAIL: failed to resolve xrWeaveSnapWindowRectDXR");
+			return 1;
+		}
+		snap_ok = snap_leg("before first submit (engine not up)", false) && snap_ok;
+	}
+
 	IOSurfaceRef output = NULL;
 	uint32_t out_w = 0, out_h = 0;
 	for (int frame = 0; frame < 5; frame++) {
@@ -602,6 +650,11 @@ main(int argc, char **argv)
 		return 1;
 	}
 
+	if (do_snap) {
+		snap_ok = snap_leg("after submits (engine up)", snap_period > 1) && snap_ok;
+		LOG("snap: %s", snap_ok ? "PASS" : "FAIL");
+	}
+
 	// ---- Verify the anaglyph weave on the CPU.
 	dump_ppm(output, "/tmp/weave_probe_macos_output.ppm");
 
@@ -615,7 +668,7 @@ main(int argc, char **argv)
 	    {"rectB(cyan)", kRectB.offset.x + kRectB.extent.width / 2, kRectB.offset.y + kRectB.extent.height / 2,
 	     false},
 	};
-	bool pass = true;
+	bool pass = snap_ok;
 	for (const auto &c : checks) {
 		uint8_t r = 0, g = 0, b = 0;
 		if (!sample_px(output, c.x, c.y, &r, &g, &b)) {
