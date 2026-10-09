@@ -147,6 +147,21 @@ bool
 sim_display_fake_tracking_is_tracking(void);
 
 /*!
+ * One sample of the simulated tracking state AND how many tracking edges the
+ * square wave has produced so far, read off the same clock reading so the two
+ * always agree (ADR-051: the per-screen status `change_counter` moves exactly
+ * when @ref sim_display_fake_tracking_is_tracking flips).
+ *
+ * @param[out] out_edges Edge count: 0 when fake tracking is off or has no
+ *                       period, else elapsed half-periods (monotonic). May be
+ *                       NULL.
+ * @return The same value @ref sim_display_fake_tracking_is_tracking returns.
+ * @ingroup drv_sim_display
+ */
+bool
+sim_display_fake_tracking_sample(uint64_t *out_edges);
+
+/*!
  * Set the view count for the active rendering mode.
  *
  * Thread-safe (atomic). Called when the rendering mode changes.
