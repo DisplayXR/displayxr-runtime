@@ -39,6 +39,7 @@ add_executable(
 	cli_cmd_input.c
 	cli_cmd_runtime.c
 	cli_cmd_displays.c
+	cli_cmd_status.c
 	cli_cmd_probe.c
 	cli_cmd_test.c
 	cli_cmd_clients.c
@@ -83,6 +84,7 @@ target_link_libraries(
 		target_instance_no_comp
 		target_lists
 		drv_includes
+		xrt-external-cjson
 	)
 
 # #960: `displayxr-cli clients` connects to the live service over IPC (DIAG class).
