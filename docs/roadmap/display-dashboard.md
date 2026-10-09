@@ -257,7 +257,18 @@ WINDOWS  1 client
     views 2/2 (reported 4)   paint 1811 present 1809 skip 2   weave: scanout
 ```
 
-## 8. The Control Panel
+## 8. The Control Panel — now the DisplayXR Dashboard
+
+**The panel is the Avalonia app `displayxr-dashboard.exe`** (`src/dashboard/`, .NET 9 /
+Avalonia 11, the vendor dashboard's toolset and visual language: a left navigation rail
+with badges, cards, chips and badges). It replaces the ImGui Control Panel, which stays in
+the installer until its removal PR. Pages: **Home** (the Overview below), **Displays**,
+**Windows**, **Performance**, **Developer**; the header carries the source pill
+(`source: service · gen t/s` or headless), Refresh and Copy diagnostics (the snapshot
+JSON). Build / run / debug and the exact feed cadence: [`src/dashboard/README.md`](../../src/dashboard/README.md).
+The mockup below predates it and still describes the content; the desktop map is an
+Avalonia custom-drawn control rather than an ImGui draw-list, and each Displays card
+carries the phase-7 per-screen display-processor selector when the CLI offers it.
 
 The panel keeps its rules (asInvoker, links no runtime code, spawns the CLI) and changes
 how it spawns it: once, `displayxr-cli status --watch --json`, reading NDJSON from the
@@ -312,8 +323,8 @@ text as the screen row.
 **Performance** and **Developer** are the shipped controls and the designed Phase-2 list,
 unchanged.
 
-Feed discipline in the panel: the child runs only while the window is visible and not
-minimised (SDL window events), the last snapshot is kept through a child restart, "no
+Feed discipline in the panel: the child runs only while a status page (Home, Displays,
+Windows) is on screen and the window is not minimised, the last snapshot is kept through a child restart, "no
 service — headless" is a banner, and the tab badge counts warn / critical only.
 
 ## 9. Open items on the vendor side (proposals, not commitments)
@@ -353,7 +364,7 @@ enable is a shared vote that `destroy` does not withdraw); config resolve at mos
 | **1** ✅ landed | `xrt_display_status.h`; headless builder `target_status_snapshot_build_headless` (targets/common) + pure `u_status_warnings_derive` / `u_status_snapshot_to_cjson` / `u_status_snapshot_format_text` (aux_util); `displayxr-cli status [--json]` (`status_fetch_service` stub for phase 2); warnings §4; `struct ipc_service_health` + `ipc_server_get_health` behind `[HEALTH]`, `struct comp_d3d11_render_diag` + `comp_d3d11_service_get_render_diag` behind `[RENDER]` (log lines byte-identical); `tests_status_snapshot` | — |
 | **2** ✅ landed | the three DIAG-only RPCs (`system_get_status_generation`; `system_get_status_snapshot(screen_index)` = `xrt_status_head` + one screen row; `system_get_client_segments(client_id)` = one client row + its raw `xrt_segment_metrics`) — fixed-size by-value replies, each stamped with its generation; the service snapshot (`ipc_server_status.c` + `target_status_snapshot_build_service`, registered by the service target as `ipc_server_status_provider`) with `topology` / `status` counters bumped on connect / disconnect / re-probe and on whatever a status read finds moved (screen list, plug-in state, client flags, presenter, lease, window, segment generation, owner, DP backend, `is_tracking` edge, mode), 2 s floor, lazy rebuild; Windows `native` from DisplayConfig's preferred mode (`NOT_NATIVE` can fire); `status` over DIAG with labelled headless fallback, `status --watch [--interval ms]` (NDJSON with `--json`); `clients` gains presenter / lease / window / owner_screen; `tests_status_ipc` | 1 |
 | **3** ✅ | plug-in slot `get_screen_status` + `sim_display` implementation + iface doc — **landed** (slot first; its consumer arrives with 1/2) | 1 |
-| **4** | Control Panel: tabs, long-lived `--watch` child, Displays + Windows pages, desktop map, Overview summary line | 2 |
+| **4** | The DisplayXR Dashboard (`src/dashboard/`, Avalonia): pages, long-lived `--watch` child, Displays + Windows pages, desktop map, Home summary line | 2 |
 | **5** ✅ landed | MCP `get_status_snapshot` (session-free, returns `displayxr-cli status --json` verbatim) | 2 |
 | **6** | the vendor plug-in fills the cell from the SDK query; "Open in vendor" | 3 + §9.1–9.2 |
 

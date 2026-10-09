@@ -134,6 +134,8 @@ cmake .. -DCMAKE_BUILD_TYPE=Debug -G Ninja && cmake --build .
 ```
 Key options: `XRT_FEATURE_SERVICE` (out-of-process service mode), `BUILD_TESTING`. Vendor DP code is **not** a CMake option — all `drv_*` implementations ship as plug-in DLLs discovered at `xrCreateInstance`.
 
+**DisplayXR Dashboard** (`src/dashboard/`, Avalonia / .NET 9 — the Control Panel's successor): `scripts\build_windows.bat dashboard` (or `all`, which publishes it into `_package\bin` before the installer; no `dotnet` = WARN + skip), `dotnet test src\dashboard\DisplayXR.Dashboard.sln`; run it non-elevated. Details: `src/dashboard/README.md`.
+
 ### Tests & formatting
 ```bash
 cd build && ctest
