@@ -261,6 +261,19 @@ buffer, in order). What differs on macOS:
 - Test knob: `cube_handle_metal_macos` honours `DXR_TEST_WINDOW_RECT=x,y,w,h` (content rect, top-down
   points) and, once at frame `DXR_TEST_WINDOW_MOVE_FRAME` (default 300), `DXR_TEST_WINDOW_RECT2`.
 
+## Windows / D3D12 (M6)
+
+Status: the in-process D3D12 compositor (the Unity display provider's path) carries the same
+model in `d3d12/comp_d3d12_segments.{h,cpp}`, behaving like the pre-split D3D11 path: two more
+appended slots, no ABI bump (`xrt_plugin_iface::create_dp_d3d12_for_screen`,
+`xrt_display_processor_d3d12::set_present_origin`), every segment recorded onto the one weave
+command list (crop per screen, each crop with its own SRV descriptor, the DP sets viewport +
+scissor from the canvas itself), the same non-segmented cases (plus the #1264 reroute and a back
+buffer that does not match the client area), M3 per-segment views through
+`comp_d3d12_compositor_get_segment_metrics` / `set_view_routing` and a mosaic in the D3D12
+renderer, and `oxr_system` counting a D3D11 **or** D3D12 factory toward the view-set capacity.
+sim_display implements both D3D12 slots. Not yet run on hardware.
+
 ## Per-segment views (M3)
 
 Under `PRIMARY_MULTIVIEW_DXR` each segment gets its **own** views instead of a crop of
