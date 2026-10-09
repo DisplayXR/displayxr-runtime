@@ -28,12 +28,19 @@ int
 cli_cmd_selftest(int argc, const char **argv)
 {
 	struct cli_query_result r;
-	cli_query_run(&r);
+	// Fill, PRINT, flush, then tear down (#1892): a plug-in worker thread can
+	// end the process during teardown; printing afterwards lost the tail of
+	// the JSON about one run in ten, with exit code 0.
+	struct cli_query_handles h;
+	cli_query_fill(&r, &h, NULL);
 
 	if (cli_has_flag(argc, argv, "--json")) {
 		cli_query_print_selftest_json(&r);
 	} else {
 		cli_query_print_selftest_text(&r);
 	}
+	fflush(stdout);
+	fflush(stderr);
+	cli_query_teardown(&h);
 	return (int)r.result_code;
 }
