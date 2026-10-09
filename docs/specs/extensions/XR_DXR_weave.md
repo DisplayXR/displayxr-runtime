@@ -387,12 +387,13 @@ instead.
 
 ## 5. macOS platform mapping (#759)
 
-The macOS service (comp_multi + null compositor, Vulkan/MoltenVK) implements the same bind /
-submit / snap contract with these platform substitutions (`comp_multi_weave_macos.c`):
+The macOS service (comp_multi + null compositor) implements the same bind / submit / snap
+contract with these platform substitutions (`comp_multi_weave_macos.c` front end over a vk or
+metal backend, below):
 
 | Contract point | Windows (D3D11 service) | macOS (comp_multi Vulkan) |
 |---|---|---|
-| `windowHandle` | HWND (DP phase snap + `GetClientRect` sizing) | opaque id, stored only (sim/anaglyph has no lattice) |
+| `windowHandle` | HWND (DP phase snap + `GetClientRect` sizing) | opaque id, stored only — the phase comes from the chained `XrWeaveWindowGeometryDXR` (below) |
 | `inputTexture` | D3D11 NT / legacy-DXGI shared HANDLE | **IOSurfaceRef** (crosses IPC as a global IOSurfaceID) |
 | `inputIsDxgi` | selects legacy-DXGI open path | ignored |
 | Input-ready sync | keyed mutex `AcquireSync(0)` | caller completes GPU writes **before** `xrWeaveSubmitDXR` |
@@ -403,7 +404,30 @@ submit / snap contract with these platform substitutions (`comp_multi_weave_maco
 
 The batch algorithm is identical (all rects blitted into ONE window-sized 2×1 SBS scratch, ONE
 `process_atlas` per submit). Verification harness: `test_apps/probes/weave_probe_vk_macos`
-(headless; CPU-checks the sim anaglyph weave — left-eye-white → red, right-eye-white → cyan).
+(headless; CPU-checks the sim anaglyph weave — left-eye-white → red, right-eye-white → cyan;
+`--geometry ox,oy[,display]` binds with a chained `XrWeaveWindowGeometryDXR`).
+
+**Two engine backends, one contract.** The service picks one per client
+(`DXR_WEAVE_MAC_BACKEND=auto|metal|vk`, default `auto`): **vk** (MoltenVK + the plug-in's
+Vulkan DP — the table above) or **metal** (native Metal + the plug-in's **Metal** DP, created
+windowless). `auto` picks metal only when the plug-in exports no Vulkan DP factory but a Metal
+one — the Leia macOS plug-in — so sim_display (which exports both) keeps the vk path. Nothing
+on the wire differs: same IOSurfaces in and out, same synchronous completion, same v3/v4/v5/v6
+semantics. Two behaviours are DP-driven on the metal backend only: a DP that is not
+alpha-native gets a post-weave alpha pass (output alpha = the views' max alpha at that pixel,
+so v5's transparent gaps survive an opaque weaver), and a DP whose output must not be
+resampled (no `TOLERATES_RESAMPLE` scanout flag — a lenticular lattice) gets a v6 output sized
+to the **window** (`clientSize`, else the input) instead of one content view.
+
+**Window geometry units (v7 on macOS).** `windowOriginOnScreen` is the client area's top-left
+in **global CoreGraphics space, in backing pixels** (y down, origin = the top-left of the
+global CG display space, i.e. `CGDisplayBounds` points × the display's backing scale);
+`clientSize` is in backing pixels; `displayId` is the `CGDirectDisplayID` of the panel the
+window is on (`-1`/`0` = not reported). The engine resolves the panel (the reported id, else
+the active display whose backing-pixel rect contains the origin, else the main display) and
+feeds the DP its **present origin** — `origin − round(CGDisplayBounds(panel).origin × scale)`,
+panel-relative backing pixels — through `set_present_origin` before every weave (metal
+backend; the vk backend does not feed a phase). This is a platform note, not a wire change.
 
 ## 5b. Android platform mapping (#1036)
 
