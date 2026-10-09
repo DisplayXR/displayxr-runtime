@@ -1326,5 +1326,23 @@
 		"out": [
 			{"name": "value", "type": "uint32_t"}
 		]
+	},
+
+	"compositor_segments_enable": {
+		"in": [
+			{"name": "pinned_display_id", "type": "uint64_t"}
+		]
+	},
+
+	"compositor_get_segment_metrics": {
+		"out": [
+			{"name": "metrics", "type": "struct xrt_segment_metrics"}
+		]
+	},
+
+	"compositor_set_view_routing": {
+		"in": [
+			{"name": "routing", "type": "struct xrt_segment_view_routing"}
+		]
 	}
 }

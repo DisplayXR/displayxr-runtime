@@ -155,6 +155,33 @@ bool
 comp_ipc_client_compositor_get_window_metrics(struct xrt_compositor *xc, struct xrt_window_metrics *out_metrics);
 
 /*!
+ * Multi-screen M6/M3 over IPC (ADR-047 Amendment 2) — same gating contract as
+ * comp_ipc_client_compositor_get_window_metrics (only valid when @p xc is an
+ * ipc_client_compositor).
+ *
+ * - `segments_enable`: ask the service to weave this session's window per
+ *   screen when it spans monitors (the service owns the screen registry;
+ *   @p pinned_display_id is the session's XrSessionDisplayBindingDXR pin, 0 =
+ *   none). Sent once, at session create.
+ * - `get_segment_metrics`: the segment table the service's last weave of this
+ *   window took, eyes predicted now (count 0 = one view set). False on an
+ *   empty table or a failed call.
+ * - `set_view_routing`: where each segment's views are in the next frame's
+ *   projection layer (count 0 = unrouted). Best-effort.
+ */
+struct xrt_segment_metrics;
+struct xrt_segment_view_routing;
+
+void
+comp_ipc_client_compositor_segments_enable(struct xrt_compositor *xc, uint64_t pinned_display_id);
+
+bool
+comp_ipc_client_compositor_get_segment_metrics(struct xrt_compositor *xc, struct xrt_segment_metrics *out_metrics);
+
+void
+comp_ipc_client_compositor_set_view_routing(struct xrt_compositor *xc, const struct xrt_segment_view_routing *routing);
+
+/*!
  * Phase 2 workspace_sync_fence bridges. Same gating contract as
  * comp_ipc_client_compositor_get_window_metrics — only valid when @p xc is
  * an ipc_client_compositor. Used by the D3D11 client compositor to import

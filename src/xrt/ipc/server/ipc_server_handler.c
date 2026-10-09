@@ -3072,6 +3072,84 @@ ipc_handle_compositor_get_predicted_eye_positions(volatile struct ipc_client_sta
 	return XRT_SUCCESS;
 }
 
+/*
+ * Multi-screen M6/M3 over IPC (ADR-047 Amendment 2): per-screen weaving of a
+ * direct client's window, and per-segment views for its xrLocateViews. The
+ * service owns the screen registry (its own instance), so the client sends
+ * only its session's display pin; the table and the routing then cross the
+ * wire by value. Off the D3D11 service compositor these are inert: enable is
+ * a no-op, the table is empty (one view set), the routing is dropped.
+ */
+static_assert(sizeof(struct ipc_compositor_get_segment_metrics_reply) <= IPC_BUF_SIZE,
+              "compositor_get_segment_metrics reply exceeds IPC_BUF_SIZE");
+static_assert(sizeof(struct ipc_compositor_set_view_routing_msg) <= IPC_BUF_SIZE,
+              "compositor_set_view_routing message exceeds IPC_BUF_SIZE");
+
+xrt_result_t
+ipc_handle_compositor_segments_enable(volatile struct ipc_client_state *ics, uint64_t pinned_display_id)
+{
+	IPC_TRACE_MARKER();
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (ics->server != NULL && ics->server->xsysc != NULL && ics->xc != NULL &&
+	    comp_d3d11_service_is_d3d11_service(ics->server->xsysc)) {
+		struct xrt_screen_list *list = U_TYPED_CALLOC(struct xrt_screen_list);
+		if (list == NULL) {
+			return XRT_ERROR_ALLOCATION;
+		}
+		if (xrt_instance_enumerate_displays(ics->server->xinst, list) != XRT_SUCCESS) {
+			memset(list, 0, sizeof(*list)); // no screens: the manager stays disabled
+		}
+		comp_d3d11_service_set_client_segment_screens(ics->server->xsysc, (struct xrt_compositor *)ics->xc,
+		                                              list, pinned_display_id);
+		free(list);
+	}
+#else
+	(void)ics;
+	(void)pinned_display_id;
+#endif
+
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_handle_compositor_get_segment_metrics(volatile struct ipc_client_state *ics,
+                                          struct xrt_segment_metrics *out_metrics)
+{
+	IPC_TRACE_MARKER();
+
+	memset(out_metrics, 0, sizeof(*out_metrics));
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (ics->server != NULL && ics->server->xsysc != NULL && ics->xc != NULL) {
+		(void)comp_d3d11_service_get_client_segment_metrics(ics->server->xsysc,
+		                                                    (struct xrt_compositor *)ics->xc, out_metrics);
+	}
+#else
+	(void)ics;
+#endif
+
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_handle_compositor_set_view_routing(volatile struct ipc_client_state *ics,
+                                       const struct xrt_segment_view_routing *routing)
+{
+	IPC_TRACE_MARKER();
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (ics->server != NULL && ics->server->xsysc != NULL && ics->xc != NULL) {
+		comp_d3d11_service_set_client_view_routing(ics->server->xsysc, (struct xrt_compositor *)ics->xc,
+		                                           routing);
+	}
+#else
+	(void)ics;
+	(void)routing;
+#endif
+
+	return XRT_SUCCESS;
+}
+
 xrt_result_t
 ipc_handle_compositor_predict_frame(volatile struct ipc_client_state *ics,
                                     int64_t *out_frame_id,

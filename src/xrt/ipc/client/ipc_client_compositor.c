@@ -240,6 +240,63 @@ comp_ipc_client_compositor_get_window_metrics(struct xrt_compositor *xc, struct 
 }
 
 /*
+ * Multi-screen M6/M3 over IPC (ADR-047 Amendment 2). Same gating contract as
+ * comp_ipc_client_compositor_get_window_metrics. See ipc_client.h.
+ */
+void
+comp_ipc_client_compositor_segments_enable(struct xrt_compositor *xc, uint64_t pinned_display_id)
+{
+	if (xc == NULL) {
+		return;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return;
+	}
+	xrt_result_t xret = ipc_call_compositor_segments_enable(icc->ipc_c, pinned_display_id);
+	if (xret != XRT_SUCCESS) {
+		U_LOG_W(
+		    "multi-screen: compositor_segments_enable failed (%d) — this session's window is woven by one DP",
+		    (int)xret);
+	}
+}
+
+bool
+comp_ipc_client_compositor_get_segment_metrics(struct xrt_compositor *xc, struct xrt_segment_metrics *out_metrics)
+{
+	if (out_metrics == NULL) {
+		return false;
+	}
+	memset(out_metrics, 0, sizeof(*out_metrics));
+	if (xc == NULL) {
+		return false;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return false;
+	}
+	xrt_result_t xret = ipc_call_compositor_get_segment_metrics(icc->ipc_c, out_metrics);
+	if (xret != XRT_SUCCESS || out_metrics->count > XRT_MAX_SEGMENTS) {
+		memset(out_metrics, 0, sizeof(*out_metrics)); // one view set
+		return false;
+	}
+	return out_metrics->count > 0;
+}
+
+void
+comp_ipc_client_compositor_set_view_routing(struct xrt_compositor *xc, const struct xrt_segment_view_routing *routing)
+{
+	if (xc == NULL || routing == NULL) {
+		return;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return;
+	}
+	(void)ipc_call_compositor_set_view_routing(icc->ipc_c, routing);
+}
+
+/*
  * Push the session's eye-tracking control mode (MANAGED=0 / MANUAL=1) to the
  * out-of-process display processor (#522). Same gating contract as
  * comp_ipc_client_compositor_get_window_metrics: only call when `xc` is an
