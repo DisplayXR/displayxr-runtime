@@ -104,3 +104,25 @@ primary takes its phase from `set_present_origin` like any segment; drag snap, t
 anchor and the hosted window's snap provider follow the owner. Eyes and view routing are
 unchanged: the primary screen's DP still serves the primary screen. Logic:
 `comp_segments_owner_*` (unit-tested); detail: `docs/architecture/comp-segments.md`.
+
+## Amendment 3 (2026-10-09): segments on the service / IPC path
+
+An `_ipc` client is composited by `displayxr-service`, not in its own process, so the
+service has to segment its window and the client's `xrLocateViews` has to learn the table
+from the other side of the wire. Decisions:
+
+- **The service owns the screens.** The screen registry already lives in the service (its
+  instance's `enumerate_displays`, which `xrEnumerateDisplaysDXR` reaches over IPC), so a
+  client sends only its session's display pin (`compositor_segments_enable`); the service
+  builds the client's segment manager from its own registry, on the device that presents.
+- **Only the direct single-client pipeline segments** (`pipeline_default_policy_render`,
+  an `APP_HWND` presenter). The workspace / compose path (`multi_compositor_render`) keeps
+  one presenter, the service window on the panel, so it stays single-screen: that is a
+  separate decision (per-screen presenters for the workspace), not a consequence of this one.
+- **The table and the routing cross the wire by value** (`compositor_get_segment_metrics`,
+  `compositor_set_view_routing`, appended to `proto.json`); per-segment views are then
+  framed client-side from each segment's eyes exactly as in-process, and the service paints
+  the routed mosaic into the client's atlas. A client that never opts in — every
+  single-screen box — sends nothing new and is composited byte for byte as before.
+
+Detail: `docs/architecture/comp-segments.md` § *Service / IPC path*.

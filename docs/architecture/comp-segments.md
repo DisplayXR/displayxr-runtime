@@ -197,7 +197,7 @@ deferred-release list because the immediate context executes in order). What dif
   one WARN when its segment manager is made (`segments: under the #918 output-device split …`).
 - **Not segmented on Windows:** zero-copy frames, a zones / Local2D frame (any non-whole-window
   canvas), the shared-texture path, a pinned session, `DXR_SEGMENTS=0`.
-  The service / hosted path is not segmented yet (ADR-035 amendment, M6 second half).
+  The service has its own section below (*Service / IPC path*).
 - **sim_display** implements both slots on D3D11 too, so a two-monitor Windows box with no vendor
   hardware exercises the split path (anaglyph on both halves).
 - **Per-segment views (M3) on Windows** ride the same state-tracker path as Linux: `oxr_system` counts
@@ -302,5 +302,46 @@ set). Quads and equirect2 layers are drawn once per segment in each tile, with t
 segment's view camera, viewport and scissor confined to the segment's rect (the compose
 pass; the blit fallback draws no quads at all).
 
-**IPC.** In-process only: the service never segments, so a service session always sees
-an empty table, one view set and no bindings (its own segmentation is M6).
+**IPC.** See *Service / IPC path* below: the D3D11 service publishes the same table for
+a direct client, and the client frames per-segment views from it exactly as above.
+
+## Service / IPC path (Windows, ADR-047 Amendment 2)
+
+An `_ipc` client (`XRT_FORCE_MODE=ipc`, or any app under a running service) is composited by
+`displayxr-service`. The same segment manager weaves its window there:
+
+- **Opt-in.** At session create the client sends `compositor_segments_enable(pin)` — only when
+  its system's set capacity is above 1, i.e. the service's registry has two screens with a
+  D3D11 DP factory (`oxr_system` counts the by-value copy of the service's registry; the
+  pointers are only NULL-tested). The service answers with its OWN screen list (its instance,
+  the one `xrEnumerateDisplaysDXR` reports) and keeps a heap copy per client. A single-screen
+  box never sends it; a client that did not send it is never segmented.
+- **Where it weaves.** Only the direct single-client pipeline (`pipeline_default_policy_render`)
+  for an `APP_HWND` presenter — the app's own window, the only kind that can sit across a seam.
+  `pipeline_segments_weave` replaces that frame's single `process_atlas`: the client's manager
+  (`comp_d3d11_segments`, linked from the `comp_d3d11_segs` library), made on `svc_out_device`
+  (the output device under the #918 split), with the panel DP — bound to the app's HWND — as
+  the primary and the client's crop (or the egress slot) as the atlas. The window rect is the
+  app HWND's client area from `ClientToScreen` in the per-monitor-DPI-aware service, i.e.
+  device px. One client's segment DPs exist at a time: a focus change releases the outgoing
+  presenter's, and a table older than 250 ms (the client no longer weaves directly — focus
+  moved, the workspace took over) is not handed out, so that client locates one view set. A hosted client presents into the service's window on the panel, a
+  present-owner / client-texture client weaves on its own thread and a zones frame keeps the
+  single DP: none is segmented.
+- **Compose / shell mode** (`multi_compositor_render`) is unchanged: one presenter, the
+  service window on the panel, so a workspace window is never segmented and its table stays
+  empty. Per-screen workspace presenters are a separate decision.
+- **Per-segment views.** `xrLocateViews` fetches the table with `compositor_get_segment_metrics`
+  (a round trip per locate, only for an opted-in session): the service fills each segment's
+  eyes at query time — the primary from the panel DP, the others from their segment DPs. The
+  client then runs the in-process locate unchanged, with two IPC-only differences: the
+  segment's client-side Kooima FOVs are kept over the device's single-set answer, and a
+  segment locate never takes the server rig call (`locate_views_rig`), which knows one view
+  set. `xrEndFrame` sends the routing with `compositor_set_view_routing`, change-only (the
+  service keeps the last one). The service lays a routed frame into the client's atlas as the
+  mosaic (`comp_segments_route_place`, `util/comp_segments_route.h`, unit-tested by
+  `tests/tests_segments_ipc.cpp`); a routed frame never zero-copies.
+- **Not yet on the service path:** quads / equirect / cylinder layers in a routed frame are
+  drawn once per tile with that tile's camera (in-process draws them per segment), and a
+  second projection layer is routed only where the per-tile pass visits it (segment 0).
+
