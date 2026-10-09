@@ -378,6 +378,13 @@ static struct xrt_plugin_iface g_sim_display_iface = {
 #else
     .create_dp_d3d11_for_screen = NULL,
 #endif
+
+    /* Multi-screen on macOS: one Metal DP per screen a spanning window covers. */
+#if defined(__APPLE__)
+    .create_dp_metal_for_screen = sim_display_dp_factory_metal_for_screen,
+#else
+    .create_dp_metal_for_screen = NULL,
+#endif
 };
 
 

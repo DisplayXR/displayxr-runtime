@@ -1317,6 +1317,59 @@ struct xrt_plugin_iface
 	                                           void *window_handle,
 	                                           const struct xrt_screen_binding *binding,
 	                                           struct xrt_display_processor_d3d11 **out_xdp);
+
+	/*!
+	 * Create a Metal display processor for ONE screen this plug-in won in
+	 * the per-monitor registry (multi-screen on macOS, ADR-047 D2): the
+	 * in-process Metal compositor weaves a window that spans several
+	 * displays per segment, each by its own screen's DP, into the one
+	 * CAMetalLayer drawable.
+	 *
+	 * Same contract as @ref create_dp_metal (`xrt_dp_factory_metal_fn_t`),
+	 * plus everything @ref create_dp_vk_for_screen promises. What a plug-in
+	 * implements:
+	 *   - @p inst is this plug-in's instance (NULL for a plug-in without
+	 *     instance state).
+	 *   - @p binding names the screen; never NULL. `desktop_*` is the
+	 *     display's `CGDisplayBounds` in top-down POINTS; `native_pixel_*`
+	 *     is its current mode in backing px; `desktop_scale` its backing
+	 *     scale; `device_name` the CoreGraphics display UUID. Vendor DPs
+	 *     resolve it to their own display identity (`binding->display_id`,
+	 *     else their per-monitor claim) and bind their weaver to THAT
+	 *     display. The DP should answer `get_display_dimensions` /
+	 *     `get_display_pixel_info` for that screen.
+	 *   - @p window_handle is NULL today: every per-screen DP is windowless
+	 *     and gets its phase from
+	 *     @ref xrt_display_processor_metal::set_present_origin (backing px
+	 *     relative to that display's `CGDisplayBounds` origin, computed by
+	 *     the runtime per frame) plus the canvas offset — it must not try to
+	 *     derive the origin from a window. The session's own NSView stays
+	 *     with the primary screen's @ref create_dp_metal DP. A DP must weave
+	 *     with a NULL view.
+	 *   - The compositor calls @ref xrt_display_processor_metal::process_atlas
+	 *     on the shared command buffer with `canvas = the segment` (drawable
+	 *     px) and a pre-cropped atlas holding exactly that segment's views.
+	 *     The DP encodes its own render pass, so it MUST confine its output —
+	 *     viewport AND scissor rect — to the canvas, and must not assume it
+	 *     is the first writer to the target this frame: use
+	 *     `MTLLoadActionLoad`, never `MTLLoadActionClear`, on the target.
+	 *   - Several instances coexist in one process, one per screen.
+	 *
+	 * Optional. NULL (or a plug-in whose `struct_size` predates this field)
+	 * ⟹ the plug-in's screens other than the session's primary one get a
+	 * flat 2D view (never a @ref create_dp_metal DP, for the reason given on
+	 * @ref create_dp_vk_for_screen). Appended per ADR-020 (append-only
+	 * within a major; gated by @ref struct_size; no
+	 * XRT_PLUGIN_API_VERSION_CURRENT bump) after
+	 * @ref create_dp_d3d11_for_screen. Announced by
+	 * @ref XRT_PLUGIN_IFACE_HAS_CREATE_DP_METAL_FOR_SCREEN.
+	 */
+	xrt_result_t (*create_dp_metal_for_screen)(struct xrt_plugin_instance *inst,
+	                                           void *metal_device,
+	                                           void *command_queue,
+	                                           void *window_handle,
+	                                           const struct xrt_screen_binding *binding,
+	                                           struct xrt_display_processor_metal **out_xdp);
 };
 
 /*!
@@ -1405,6 +1458,28 @@ xrt_plugin_iface_has_create_dp_d3d11_for_screen(const struct xrt_plugin_iface *i
 	       iface->struct_size >= offsetof(struct xrt_plugin_iface, create_dp_d3d11_for_screen) +
 	                                 sizeof(iface->create_dp_d3d11_for_screen) &&
 	       iface->create_dp_d3d11_for_screen != NULL;
+}
+
+/*!
+ * Defined when @ref xrt_plugin_iface carries @ref
+ * xrt_plugin_iface::create_dp_metal_for_screen (multi-screen on macOS), so a
+ * plug-in built against an older runtime header can #ifdef-guard
+ * implementing it (pair it with XRT_DP_METAL_HAS_PRESENT_ORIGIN).
+ */
+#define XRT_PLUGIN_IFACE_HAS_CREATE_DP_METAL_FOR_SCREEN 1
+
+/*!
+ * True when @p iface implements @ref
+ * xrt_plugin_iface::create_dp_metal_for_screen (and its struct_size covers the
+ * slot).
+ */
+static inline bool
+xrt_plugin_iface_has_create_dp_metal_for_screen(const struct xrt_plugin_iface *iface)
+{
+	return iface != NULL &&
+	       iface->struct_size >= offsetof(struct xrt_plugin_iface, create_dp_metal_for_screen) +
+	                                 sizeof(iface->create_dp_metal_for_screen) &&
+	       iface->create_dp_metal_for_screen != NULL;
 }
 
 /*!

@@ -190,6 +190,52 @@ deferred-release list because the immediate context executes in order). What dif
   with that segment's camera). A routed frame is never zero-copy. This is what makes an untracked
   second panel render from its own viewer instead of the tracked panel's.
 
+## macOS / Metal
+
+The in-process Metal compositor carries the same model in `metal/comp_metal_segments.{h,m}`, a twin
+of the D3D11 manager with the GPU work in Metal terms (a clear pass, blit-encoder crops, a small
+sub-rect blit pipeline for flat 2D; every DP encodes its own render pass on the frame's one command
+buffer, in order). What differs on macOS:
+
+- **Two appended ABI slots, no version bump** (ADR-020): `xrt_plugin_iface::create_dp_metal_for_screen`
+  and `xrt_display_processor_metal::set_present_origin`. A plug-in without them gets flat 2D on its
+  other displays. What a plug-in implements is spelled out in `docs/reference/xrt_plugin_iface.md`.
+- **Units — the macOS-specific part.** The registry holds each display's `CGDisplayBounds` in
+  top-down **points** plus its native backing px, and the window's content view is read in the same
+  points (AppKit's bottom-up frame flipped against the main display). The table is cut in points,
+  so a seam is exact whatever the scales, then converted per segment:
+  - the **canvas** (`window_rect`) → the drawable's px (points × the drawable's scale, edges rounded
+    independently so neighbours share the seam column);
+  - the **present origin** → that display's own backing px relative to its `CGDisplayBounds`
+    origin, chosen so `origin + canvas offset` = the segment's top-left on the panel even when the
+    window's backing scale differs from the display's. That is exactly what the Leia SR Metal
+    weaver's `srWeaverSetPresentOrigin` takes, so a per-screen DP forwards it and never recomputes
+    it from a window;
+  - **1:1** → the display's backing scale equals the drawable's AND its points × scale equal its
+    native mode. A "looks like" scaled mode (the WindowServer downsamples the 2x backing) or a
+    window straddling a 1x and a 2x display (the window has ONE backing scale; the other display
+    gets it resampled) is not 1:1, and a lenticular weave is refused there (flat 2D);
+  - the **published M3 metrics** → points × the drawable's scale throughout: a window pixel on
+    display *i* covers 1/scale points of it, so the per-pixel physical pitch the view math uses is
+    right on every display.
+- **The window.** The session's DP keeps the app's NSView (it is the system-default display's DP).
+  Every other display's DP is windowless.
+- **Not segmented on macOS:** the shared-IOSurface (`_texture`) path, a zones / Local2D / mask frame
+  or an output rect (any non-whole-window canvas), a session with no DP, a pinned session,
+  `DXR_SEGMENTS=0`, the service / IPC path. Unlike D3D11, a zero-copy frame IS segmented (the crop
+  reads the app's swapchain at the same tile stride); a routed (M3) frame is never zero-copy.
+- **Per-segment views (M3)** ride the same state-tracker path: `oxr_system` counts the registry's
+  Metal factories for the view-set capacity, `xrLocateViews` reads
+  `comp_metal_compositor_get_segment_metrics`, `xrEndFrame` hands the routing to
+  `comp_metal_compositor_set_view_routing`, and the projection pass paints each segment's views at
+  its rect inside every tile. Quads and equirect layers are NOT routed on Metal yet (drawn once per
+  tile with the tile's camera, as unsegmented).
+- **sim_display** implements both slots on Metal (a bound DP loads the target and scissors to its
+  canvas; every Metal sim output tolerates a resample, since INTERLACED falls back to anaglyph on
+  this backend, #817), so a two-display Mac with no vendor hardware exercises the split path.
+- Test knob: `cube_handle_metal_macos` honours `DXR_TEST_WINDOW_RECT=x,y,w,h` (content rect, top-down
+  points) and, once at frame `DXR_TEST_WINDOW_MOVE_FRAME` (default 300), `DXR_TEST_WINDOW_RECT2`.
+
 ## Per-segment views (M3)
 
 Under `PRIMARY_MULTIVIEW_DXR` each segment gets its **own** views instead of a crop of

@@ -368,6 +368,46 @@ struct xrt_display_processor_metal
 	 */
 	bool (*get_background_preview)(struct xrt_display_processor_metal *xdp,
 	                               struct xrt_dp_background_preview *out_preview);
+
+	/*!
+	 * Multi-screen (ADR-047 D2 on macOS, the Metal twin of
+	 * @ref xrt_display_processor_vk::set_present_origin and
+	 * xrt_display_processor_d3d11::set_present_origin): where the window's
+	 * content view sits on the DP's screen, so a WINDOWLESS DP (created
+	 * through `xrt_plugin_iface::create_dp_metal_for_screen` with a NULL
+	 * view) can phase its interlace to the panel.
+	 *
+	 * **Units — BACKING PIXELS of the DP's screen, relative to the top-left
+	 * of that screen's `CGDisplayBounds`** (top-down, i.e. the panel's own
+	 * pixel lattice: points × that screen's backing scale). This is exactly
+	 * the origin the Leia SR Metal weaver consumes; the runtime computes it
+	 * per frame from the window frame and the screen registry, so a
+	 * per-screen DP takes it from this slot and must NOT recompute it from a
+	 * window it was never given.
+	 *
+	 * Phase = this origin + the canvas offset handed to @ref process_atlas.
+	 * The runtime guarantees `origin + canvas_offset` = the segment's
+	 * top-left in that screen's backing px, even when the window's backing
+	 * scale differs from the screen's (the canvas offset is in the
+	 * drawable's px; the origin absorbs the difference). Either value may be
+	 * negative for a window that starts off that screen. Called every frame
+	 * the DP weaves (cheap; a drag moves it). It is sent only where the
+	 * window's pixels reach the panel unresampled; elsewhere only a
+	 * resample-tolerant DP weaves, and it has no phase.
+	 *
+	 * A DP that holds the real NSView derives its phase from the view itself
+	 * and may ignore this call.
+	 *
+	 * Optional — an absent slot (older plug-in `struct_size`) or NULL ⟹ the
+	 * DP has no windowed-phase support and weaves display-scoped. Appended
+	 * after @ref get_background_preview per ADR-020 (append-only within a
+	 * major, no version bump — gated by @ref XRT_DP_HAS_SLOT).
+	 *
+	 * @param xdp      Pointer to self.
+	 * @param panel_x  Window content-view left edge, screen-relative backing px.
+	 * @param panel_y  Window content-view top edge, screen-relative backing px.
+	 */
+	void (*set_present_origin)(struct xrt_display_processor_metal *xdp, int32_t panel_x, int32_t panel_y);
 };
 
 
@@ -426,7 +466,16 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, publish_local_zon
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, clear_local_zone_mask)        == XRT_DP_METAL_BASE_OFF + 15 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, get_scanout_caps)             == XRT_DP_METAL_BASE_OFF + 16 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, get_background_preview) == XRT_DP_METAL_BASE_OFF + 17 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_metal)                                == XRT_DP_METAL_BASE_OFF + 18 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, set_present_origin)     == XRT_DP_METAL_BASE_OFF + 18 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_metal)                                == XRT_DP_METAL_BASE_OFF + 19 * sizeof(void *), XRT_DP_ABI_MSG);
+
+/*!
+ * Defined when this header carries the set_present_origin slot (multi-screen
+ * on macOS), so a plug-in built against an older runtime header can
+ * #ifdef-guard its implementation — the coupled-ABI-addition pattern (see
+ * XRT_DP_VK_HAS_PRESENT_ORIGIN / XRT_DP_D3D11_HAS_PRESENT_ORIGIN).
+ */
+#define XRT_DP_METAL_HAS_PRESENT_ORIGIN 1
 
 /*!
  * Defined when this header carries the get_background_preview slot, so a
@@ -781,6 +830,44 @@ xrt_display_processor_metal_get_background_preview(struct xrt_display_processor_
 		return false;
 	}
 	return xdp->get_background_preview(xdp, out_preview);
+}
+
+/*!
+ * @copydoc xrt_display_processor_metal::set_present_origin
+ *
+ * Helper for calling through the function pointer; a no-op when the slot is
+ * absent (older plug-in `struct_size`) or NULL.
+ *
+ * @public @memberof xrt_display_processor_metal
+ */
+static inline void
+xrt_display_processor_metal_set_present_origin(struct xrt_display_processor_metal *xdp,
+                                               int32_t panel_x,
+                                               int32_t panel_y)
+{
+	if (!XRT_DP_HAS_SLOT(xdp, set_present_origin) || xdp->set_present_origin == NULL) {
+		return;
+	}
+	xdp->set_present_origin(xdp, panel_x, panel_y);
+}
+
+/*!
+ * Does the DP's output survive a display-server resample
+ * (@ref XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE)? Every "didn't answer" case —
+ * absent slot, NULL, false return — is false (the conservative reading). The
+ * Metal twin of xrt_display_processor_vk_tolerates_resample.
+ *
+ * @public @memberof xrt_display_processor_metal
+ */
+static inline bool
+xrt_display_processor_metal_tolerates_resample(struct xrt_display_processor_metal *xdp)
+{
+	struct xrt_dp_scanout_caps caps;
+	xrt_dp_scanout_caps_init(&caps);
+	if (!xrt_display_processor_metal_get_scanout_caps(xdp, &caps)) {
+		return false;
+	}
+	return (caps.flags & XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE) != 0;
 }
 
 #ifdef __cplusplus

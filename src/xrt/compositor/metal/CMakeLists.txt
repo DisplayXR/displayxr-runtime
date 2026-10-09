@@ -10,6 +10,8 @@ if(APPLE AND XRT_HAVE_METAL)
 		comp_metal STATIC
 		comp_metal_compositor.m
 		comp_metal_compositor.h
+		comp_metal_segments.m
+		comp_metal_segments.h
 		)
 
 	target_link_libraries(
