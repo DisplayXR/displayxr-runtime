@@ -1,0 +1,93 @@
+{
+	"checks":	[{
+			"name":	"instance",
+			"ok":	true,
+			"detail":	"xrt_instance_create ok"
+		}, {
+			"name":	"system",
+			"ok":	true,
+			"detail":	"system devices created"
+		}, {
+			"name":	"head_device",
+			"ok":	true,
+			"detail":	"Leia 3D Display"
+		}, {
+			"name":	"active_plugin",
+			"ok":	true,
+			"detail":	"id='leia-sr' name='DisplayXR Leia SR' (ABI v5)"
+		}, {
+			"name":	"vendor_dp",
+			"ok":	true,
+			"detail":	"no better-ranked plug-in failed to load (active ProbeOrder=50, 0 declined their probe)"
+		}, {
+			"name":	"display_info",
+			"ok":	true,
+			"detail":	"get_display_info returned valid struct"
+		}, {
+			"name":	"display_dims",
+			"ok":	true,
+			"detail":	"0.3442m x 0.1936m, 3840x2160 px == \\\\.\\DISPLAY1 current mode (3840x2160 @ 60 Hz)"
+		}, {
+			"name":	"dpi_awareness",
+			"ok":	true,
+			"detail":	"process is per-monitor-aware"
+		}, {
+			"name":	"stereo_camera_caps",
+			"ok":	true,
+			"detail":	"plug-in has no stereo camera slots (OK)"
+		}, {
+			"name":	"zone_caps",
+			"ok":	true,
+			"detail":	"supported=1 grid=1x1 max_mask=0x0 max_hz=0 wish_fractional=0 granularity=0"
+		}, {
+			"name":	"lift_caps",
+			"ok":	true,
+			"detail":	"modes=0x3 state=1 streams=32 views=8 depth=relative latency=22.0ms backend='neurd-directml' (lift-only factory)"
+		}, {
+			"name":	"gpu_topology",
+			"ok":	true,
+			"detail":	"weave-on-scanout topology: APPLIES (render != scanout)"
+		}, {
+			"name":	"vk_repaint_tier",
+			"ok":	true,
+			"detail":	"VK_LAYER_DXR_queue_lock reachable (C:/Program Files/DisplayXR/Runtime/VkLayer_DXR_queue_lock.dll)"
+		}, {
+			"name":	"active_runtime",
+			"ok":	true,
+			"detail":	"C:\\Program Files\\DisplayXR\\Runtime\\DisplayXR_win64.json (this install)"
+		}, {
+			"name":	"input_providers",
+			"ok":	true,
+			"detail":	"not evaluated: provider 'portalvr-input' loaded but its hardware is absent (OK — qwerty holds the hand roles)"
+		}, {
+			"name":	"rig_role",
+			"ok":	true,
+			"detail":	"not evaluated: navigation device 'PortalVR Navigation' found but its provider's hardware is absent (OK — the runtime's fly camera holds the rig)"
+		}],
+	"dpi_awareness":	"per-monitor-aware",
+	"plugins":	[{
+			"id":	"leia-sr",
+			"display_name":	"DisplayXR Leia SR",
+			"version":	"2.9.3",
+			"probe_order":	50,
+			"fallback":	false,
+			"load_result":	"ACTIVE",
+			"platform_state":	"READY",
+			"hint":	"",
+			"reason":	"",
+			"os_error":	0
+		}, {
+			"id":	"sim-display",
+			"display_name":	"DisplayXR Sim Display",
+			"version":	"2.26.0",
+			"probe_order":	200,
+			"fallback":	true,
+			"load_result":	"NOT_ATTEMPTED",
+			"platform_state":	"UNKNOWN",
+			"hint":	"",
+			"reason":	"",
+			"os_error":	0
+		}],
+	"verdict":	"PASS",
+	"result_code":	0
+}
