@@ -152,6 +152,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
 	# RandR <-> DRM join. Hardware-free.
 	list(APPEND tests tests_aux_display_edid_linux)
 endif()
+if(APPLE)
+	# macOS monitor enumeration -- CG vendor byte order, the EDID <-> display
+	# match, the shared parser on an IOKit EDID, and a live smoke check that
+	# SKIPs on a headless runner.
+	list(APPEND tests tests_aux_display_edid_macos)
+endif()
 if(TARGET comp_vk_native
    AND CMAKE_SYSTEM_NAME STREQUAL "Linux"
    AND NOT ANDROID

@@ -246,7 +246,15 @@ Slot and tag reservations (97/98, Win 106/107, tags 22/23/24/25) were approved b
   (`srLensGetSerialNumber`, slot 48, already works on Linux for the one-panel case). The opaque
   `displayId` is the handle the runtime passes back into P2; it never needs to parse it.
 - (d) Phase 1 platforms: Linux (X11, XWayland, and native Wayland through the present-origin
-  path, which is the default DisplayXR path on this box) + Windows. macOS out of scope.
+  path, which is the default DisplayXR path on this box) + Windows. macOS was out of phase 1;
+  its **monitor enumeration has since landed** (`os_display_edid_macos.c`: CoreGraphics
+  displays joined to the IOKit EDID — the `EDID` property on Apple Silicon's DCP transport,
+  `IODisplayEDID` on Intel — with the CG vendor/model/serial as the identity fallback). So the
+  claim registry, `displayxr-cli displays --claims` and `xrEnumerateDisplaysDXR` list every
+  Mac screen. Rects are top-down **points** (the space windows are placed in, as
+  `XrDisplayDesktopInfoDXR` already was); the backing-pixel mode is the screen's
+  `nativePixelWidth/Height`, and the display UUID is its device name and monitor-id key.
+  **Next on macOS: Metal segments** (the per-screen segment compositor, M2's Metal twin).
 
 ## 6. Risks and open questions
 

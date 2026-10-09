@@ -176,6 +176,7 @@ cli_cmd_displays_claims(const struct os_display_edid_list *list, bool json)
 				cJSON_AddNumberToObject(c, "physical_height_mm", (double)m->physical_height_mm);
 				cJSON_AddStringToObject(c, "connector", m->connector);
 				cJSON_AddStringToObject(c, "output_name", m->output_name);
+				cJSON_AddStringToObject(c, "display_name", m->display_name);
 				cJSON_AddBoolToObject(c, "primary", m->is_primary);
 			}
 			cJSON_AddItemToArray(arr, c);
@@ -209,6 +210,9 @@ cli_cmd_displays_claims(const struct os_display_edid_list *list, bool json)
 			   m->physical_width_mm, m->physical_height_mm, m->output_name[0] != '\0' ? "  output=" : "",
 			   m->output_name, m->connector[0] != '\0' ? "  connector=" : "", m->connector,
 			   m->is_primary ? "  [primary]" : "");
+			if (m->display_name[0] != '\0' || m->native_width > 0) {
+				PT("    '%s'  native %ux%u\n", m->display_name, m->native_width, m->native_height);
+			}
 		}
 		PT("    plug-in='%s'  confidence=%s  apis=%s%s%s\n", e->plugin_id, confidence_label(e->confidence),
 		   apis, e->serial[0] != '\0' ? "  serial=" : "", e->serial);
@@ -258,6 +262,7 @@ cli_cmd_displays(int argc, const char **argv)
 			cJSON_AddNumberToObject(d, "native_height", (double)m->native_height);
 			cJSON_AddStringToObject(d, "connector", m->connector);
 			cJSON_AddStringToObject(d, "output_name", m->output_name);
+			cJSON_AddStringToObject(d, "display_name", m->display_name);
 			cJSON_AddStringToObject(d, "join", os_display_edid_join_str(m->join));
 			cJSON_AddBoolToObject(d, "origin_unknown", m->origin_unknown);
 			cJSON_AddItemToArray(arr, d);
@@ -284,8 +289,8 @@ cli_cmd_displays(int argc, const char **argv)
 		PT("(none enumerated; diag_error=%d gdi=%u setupdi=%u edid_reads=%u win32err=%u)\n",
 		   (int)list.diag_error, list.diag_gdi_count, list.diag_setupdi_count, list.diag_edid_read_count,
 		   list.diag_win32_error);
-		PT("Note: EDID enumeration is implemented on Windows and desktop Linux; other platforms report "
-		   "none.\n");
+		PT("Note: EDID enumeration is implemented on Windows, desktop Linux and macOS; other platforms "
+		   "report none.\n");
 		return 0;
 	}
 	for (uint32_t i = 0; i < list.count; i++) {
@@ -299,6 +304,9 @@ cli_cmd_displays(int argc, const char **argv)
 			PT("    serial=0x%08X  %ux%u mm  native %ux%u  output='%s' connector='%s' join=%s\n",
 			   m->serial_number, m->physical_width_mm, m->physical_height_mm, m->native_width,
 			   m->native_height, m->output_name, m->connector, os_display_edid_join_str(m->join));
+		}
+		if (m->display_name[0] != '\0') {
+			PT("    name='%s'\n", m->display_name);
 		}
 	}
 	return 0;

@@ -59,7 +59,24 @@ enum os_display_native_source
 	//! The kernel's mode list (DRM sysfs): the X11 size when it is one of
 	//! the modes, else the preferred one.
 	OS_DISPLAY_NATIVE_SOURCE_DRM,
+	//! macOS: the current CoreGraphics display mode's backing-pixel size
+	//! (`CGDisplayModeGetPixelWidth`) — the framebuffer the window server
+	//! scans out, while the rect is in points.
+	OS_DISPLAY_NATIVE_SOURCE_COREGRAPHICS,
 };
+
+//! Short name of a @ref os_display_native_source, for logs and the CLI.
+static inline const char *
+os_display_native_source_str(enum os_display_native_source src)
+{
+	switch (src) {
+	case OS_DISPLAY_NATIVE_SOURCE_COMPOSITOR: return "compositor";
+	case OS_DISPLAY_NATIVE_SOURCE_DRM: return "DRM";
+	case OS_DISPLAY_NATIVE_SOURCE_COREGRAPHICS: return "CoreGraphics";
+	case OS_DISPLAY_NATIVE_SOURCE_NONE:
+	default: return "unknown";
+	}
+}
 
 /*!
  * Desktop geometry and identity of one monitor.
@@ -145,8 +162,11 @@ struct os_display_desktop_info
 	 * "is an X11 window on this output 1:1?" becomes a comparison instead of
 	 * a guess.
 	 *
-	 * Desktop Linux only (Mutter DisplayConfig, else DRM sysfs). 0 = unknown,
-	 * which every consumer must treat as "keep current behaviour".
+	 * Desktop Linux (Mutter DisplayConfig, else DRM sysfs) and macOS (the
+	 * current mode's backing pixels; @ref scale is then the backing scale,
+	 * e.g. 2.0 on Retina, and the rect is in points, so the "is 1:1" test
+	 * below reads 0 on every HiDPI display by design). 0 = unknown, which
+	 * every consumer must treat as "keep current behaviour".
 	 * @{
 	 */
 	uint32_t native_width;
@@ -245,10 +265,11 @@ struct os_display_panel_match
 /*!
  * Enumerate every active monitor.
  *
- * Implemented on desktop Linux (RandR 1.5). Windows, macOS and the stub return
- * 0, which makes @ref os_display_desktop_info_for_panel fall through to the
- * origin/primary rules — i.e. exactly the behaviour those platforms had before
- * size matching existed.
+ * Implemented on desktop Linux (RandR 1.5) and macOS (CoreGraphics active
+ * display list, main display first, mirrors folded). Windows and the stub
+ * return 0, which makes @ref os_display_desktop_info_for_panel fall through to
+ * the origin/primary rules — i.e. exactly the behaviour those platforms had
+ * before size matching existed.
  *
  * @param[out] out_infos Array of at least @p max_infos entries.
  * @param max_infos Capacity of @p out_infos.

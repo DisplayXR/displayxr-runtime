@@ -780,7 +780,7 @@ dp_confidence_label(uint32_t c)
  * picking the entry exactly as `comp_dp_factory_for_window(COMP_DP_PRIMARY_
  * MONITOR)` does (`xrt_dp_registry_primary_entry`: the active plug-in's
  * monitor, else entries[0]). Runs after the active plug-in is known; safe headless (no
- * service, no GPU). On macOS/Android the EDID enumerator yields no monitors, so
+ * service, no GPU). On Android the EDID enumerator yields no monitors, so
  * the registry is empty and the service path falls back to the scalar — reported
  * as agreement, never a false mismatch.
  */
@@ -2117,11 +2117,12 @@ cli_query_print_info_text(const struct cli_query_result *r)
 		if (r->desktop_info.scale > 0.0) {
 			printf(" at %.0f%%", r->desktop_info.scale * 100.0);
 		}
-		printf(" (%s) - %s\n",
-		       r->desktop_info.native_source == OS_DISPLAY_NATIVE_SOURCE_COMPOSITOR ? "compositor" : "DRM",
-		       one_to_one == 1 ? "the rect is device pixels (X11 windows land 1:1)"
-		                       : "the rect is NOT device pixels: X11 windows there are resampled, so they "
-		                         "present 2D (#1831)");
+		printf(" (%s) - %s\n", os_display_native_source_str(r->desktop_info.native_source),
+		       r->desktop_info.native_source == OS_DISPLAY_NATIVE_SOURCE_COREGRAPHICS
+		           ? "the rect is in points; the mode is the backing store's pixels"
+		       : one_to_one == 1 ? "the rect is device pixels (X11 windows land 1:1)"
+		                         : "the rect is NOT device pixels: X11 windows there are resampled, so they "
+		                           "present 2D (#1831)");
 	}
 	if ((r->desktop_match.rule == OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH ||
 	     r->desktop_match.rule == OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE) &&
