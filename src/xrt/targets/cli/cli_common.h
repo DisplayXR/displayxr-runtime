@@ -42,7 +42,7 @@ cli_cmd_displays(int argc, const char **argv);
 int
 cli_cmd_probe(int argc, const char **argv);
 
-//! `status [--json]` — the display status snapshot (ADR-051).
+//! `status [--json] [--watch [--interval ms]]` — the display status snapshot (ADR-051).
 int
 cli_cmd_status(int argc, const char **argv);
 
