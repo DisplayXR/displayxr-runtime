@@ -473,6 +473,126 @@ comp_segments_lifecycle_drain(struct comp_segments_lifecycle *lc, struct comp_se
 
 /*
  *
+ * Window-handle ownership.
+ *
+ */
+
+static uint64_t
+seg_area(const struct comp_segment *g)
+{
+	return (uint64_t)g->window_rect.w * (uint64_t)g->window_rect.h;
+}
+
+uint32_t
+comp_segments_majority(const struct comp_segment_table *t)
+{
+	if (t == NULL || t->count == 0) {
+		return UINT32_MAX;
+	}
+	uint32_t best = 0;
+	uint64_t best_area = 0;
+	bool best_primary = false;
+	for (uint32_t i = 0; i < t->count && i < COMP_SEGMENTS_MAX; i++) {
+		const uint64_t area = seg_area(&t->seg[i]);
+		const bool primary = t->seg[i].is_primary;
+		if (i == 0 || area > best_area || (area == best_area && primary && !best_primary)) {
+			best = i;
+			best_area = area;
+			best_primary = primary;
+		}
+	}
+	return best;
+}
+
+void
+comp_segments_owner_init(struct comp_segments_owner *o, uint64_t primary_id, uint64_t hold_ns, uint32_t margin_pct)
+{
+	if (o == NULL) {
+		return;
+	}
+	memset(o, 0, sizeof(*o));
+	o->hold_ns = hold_ns > 0 ? hold_ns : COMP_SEGMENTS_DEFAULT_HANDOFF_HOLD_NS;
+	o->margin_pct = margin_pct > 0 ? margin_pct : COMP_SEGMENTS_DEFAULT_HANDOFF_MARGIN_PCT;
+	o->owner_id = primary_id;
+}
+
+static void
+owner_reset_candidate(struct comp_segments_owner *o)
+{
+	o->candidate_id = 0;
+	o->candidate_since_ns = 0;
+	o->failed_id = 0;
+}
+
+uint64_t
+comp_segments_owner_update(struct comp_segments_owner *o, const struct comp_segment_table *t, uint64_t now_ns)
+{
+	if (o == NULL) {
+		return 0;
+	}
+	const uint32_t mj = comp_segments_majority(t);
+	if (mj == UINT32_MAX) {
+		// On no screen: nothing to follow, and the clock restarts.
+		owner_reset_candidate(o);
+		return 0;
+	}
+	const struct comp_segment *c = &t->seg[mj];
+	if (c->screen_id == o->owner_id || !(c->is_primary || c->has_dp_factory)) {
+		// The owner holds the majority, or the majority cannot be woven.
+		owner_reset_candidate(o);
+		return 0;
+	}
+
+	uint64_t total = 0;
+	uint64_t owner_area = 0;
+	for (uint32_t i = 0; i < t->count && i < COMP_SEGMENTS_MAX; i++) {
+		const uint64_t a = seg_area(&t->seg[i]);
+		total += a;
+		if (t->seg[i].screen_id == o->owner_id) {
+			owner_area += a;
+		}
+	}
+	const uint64_t cand_area = seg_area(c);
+	// cand - owner >= margin% of the on-screen area, in integers.
+	if (cand_area <= owner_area || (cand_area - owner_area) * 100u < total * (uint64_t)o->margin_pct) {
+		// Inside the dead band: not a clear majority, the clock restarts.
+		owner_reset_candidate(o);
+		return 0;
+	}
+
+	if (c->screen_id != o->candidate_id) {
+		o->candidate_id = c->screen_id;
+		o->candidate_since_ns = now_ns;
+		o->failed_id = 0;
+	}
+	if (o->failed_id == c->screen_id) {
+		return 0;
+	}
+	if (now_ns - o->candidate_since_ns < o->hold_ns) {
+		return 0;
+	}
+	return c->screen_id;
+}
+
+void
+comp_segments_owner_set_result(struct comp_segments_owner *o, uint64_t target_id, bool ok, uint64_t owner_id)
+{
+	if (o == NULL) {
+		return;
+	}
+	o->owner_id = owner_id;
+	if (ok) {
+		owner_reset_candidate(o);
+	} else {
+		// Keep timing the same challenger, but do not retry it until the
+		// majority leaves it.
+		o->failed_id = target_id;
+	}
+}
+
+
+/*
+ *
  * Deferred release.
  *
  */

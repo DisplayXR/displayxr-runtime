@@ -392,6 +392,194 @@ TEST_CASE("comp_segments: lifecycle hysteresis")
 	}
 }
 
+namespace {
+
+// The laptop panel (primary, 0x1 on the win box) at the origin and the DS1 to
+// its right, both 3840x2160 1:1. A 1000x500 window at x places
+// (3840 - x) px on the laptop.
+const uint64_t LAPTOP = 0x1;
+const uint64_t ACER = 0x2;
+const uint64_t MS = 1000ull * 1000ull;
+
+comp_segment_table
+window_at(int32_t x, bool acer_has_factory = true)
+{
+	comp_segments_screen scr[2] = {
+	    screen(LAPTOP, 0, 0, 3840, 2160, 3840, 2160, true),
+	    screen(ACER, 3840, 0, 3840, 2160, 3840, 2160, false),
+	};
+	scr[1].has_dp_factory = acer_has_factory;
+	comp_seg_rect win{x, 100, 1000, 500};
+	comp_segment_table t{};
+	comp_segments_compute(&win, nullptr, scr, 2, &t);
+	return t;
+}
+
+//! Feed @p t every 16 ms for @p ms; return the first hand-off target (0 = none).
+uint64_t
+feed(comp_segments_owner &o, const comp_segment_table &t, uint64_t &now, uint64_t ms)
+{
+	uint64_t target = 0;
+	for (uint64_t elapsed = 0; elapsed <= ms; elapsed += 16) {
+		const uint64_t r = comp_segments_owner_update(&o, &t, now);
+		if (r != 0 && target == 0) {
+			target = r;
+		}
+		now += 16 * MS;
+	}
+	return target;
+}
+
+} // namespace
+
+TEST_CASE("comp_segments: majority rule", "[comp_segments]")
+{
+	comp_segment_table t = window_at(3840 - 300); // 300 laptop / 700 Acer
+	REQUIRE(t.count == 2);
+	CHECK(t.seg[comp_segments_majority(&t)].screen_id == ACER);
+	t = window_at(3840 - 700);
+	CHECK(t.seg[comp_segments_majority(&t)].screen_id == LAPTOP);
+	t = window_at(3840 - 500); // exact tie -> the primary
+	CHECK(t.seg[comp_segments_majority(&t)].screen_id == LAPTOP);
+	comp_segment_table empty{};
+	CHECK(comp_segments_majority(&empty) == UINT32_MAX);
+	CHECK(comp_segments_majority(nullptr) == UINT32_MAX);
+}
+
+TEST_CASE("comp_segments: HWND owner hysteresis", "[comp_segments]")
+{
+	comp_segments_owner o;
+	comp_segments_owner_init(&o, LAPTOP, 0, 0);
+	uint64_t now = 1000 * MS;
+
+	SECTION("defaults: the primary owns it, 0.5 s hold, 20 % margin")
+	{
+		CHECK(o.owner_id == LAPTOP);
+		CHECK(o.hold_ns == COMP_SEGMENTS_DEFAULT_HANDOFF_HOLD_NS);
+		CHECK(o.hold_ns == 500 * MS);
+		CHECK(o.margin_pct == COMP_SEGMENTS_DEFAULT_HANDOFF_MARGIN_PCT);
+	}
+
+	SECTION("a window on one screen never hands off")
+	{
+		CHECK(feed(o, window_at(100), now, 5000) == 0);
+		CHECK(o.owner_id == LAPTOP);
+		CHECK(o.candidate_id == 0);
+	}
+
+	SECTION("a majority inside the dead band never hands off")
+	{
+		// 45 % laptop / 55 % Acer: the Acer holds the majority, but not by 20 %.
+		CHECK(feed(o, window_at(3840 - 450), now, 5000) == 0);
+		// 41 / 59: still inside.
+		CHECK(feed(o, window_at(3840 - 410), now, 5000) == 0);
+	}
+
+	SECTION("a clear majority hands off only after the hold")
+	{
+		const comp_segment_table t = window_at(3840 - 300); // 30 / 70
+		CHECK(comp_segments_owner_update(&o, &t, now) == 0);
+		CHECK(o.candidate_id == ACER);
+		CHECK(comp_segments_owner_update(&o, &t, now + 499 * MS) == 0);
+		CHECK(comp_segments_owner_update(&o, &t, now + 500 * MS) == ACER);
+		comp_segments_owner_set_result(&o, ACER, true, ACER);
+		CHECK(o.owner_id == ACER);
+		// Owned: no further hand-off while it holds the majority.
+		now += 600 * MS;
+		CHECK(feed(o, t, now, 2000) == 0);
+	}
+
+	SECTION("exactly the margin (60 / 40) is a clear majority")
+	{
+		CHECK(feed(o, window_at(3840 - 400), now, 600) == ACER);
+	}
+
+	SECTION("a window entirely on the other screen hands off")
+	{
+		CHECK(feed(o, window_at(5000), now, 600) == ACER);
+	}
+
+	SECTION("a dip into the dead band restarts the clock")
+	{
+		const comp_segment_table clear = window_at(3840 - 200);
+		const comp_segment_table band = window_at(3840 - 450);
+		CHECK(comp_segments_owner_update(&o, &clear, now) == 0);
+		CHECK(comp_segments_owner_update(&o, &clear, now + 400 * MS) == 0);
+		CHECK(comp_segments_owner_update(&o, &band, now + 450 * MS) == 0);
+		CHECK(comp_segments_owner_update(&o, &clear, now + 500 * MS) == 0);
+		CHECK(comp_segments_owner_update(&o, &clear, now + 999 * MS) == 0);
+		CHECK(comp_segments_owner_update(&o, &clear, now + 1000 * MS) == ACER);
+	}
+
+	SECTION("a drag back and forth across the seam never flaps")
+	{
+		// Sweep the window across the seam and back every 300 ms: each pass
+		// spends < 0.5 s on either side of the dead band.
+		uint64_t handoffs = 0;
+		for (int pass = 0; pass < 20; pass++) {
+			for (int step = 0; step < 18; step++) {
+				const int32_t on_laptop = (pass % 2 == 0) ? 900 - step * 45 : 100 + step * 45;
+				const comp_segment_table t = window_at(3840 - on_laptop);
+				const uint64_t r = comp_segments_owner_update(&o, &t, now);
+				if (r != 0) {
+					handoffs++;
+					comp_segments_owner_set_result(&o, r, true, r);
+				}
+				now += 16 * MS;
+			}
+		}
+		CHECK(handoffs == 0);
+		CHECK(o.owner_id == LAPTOP);
+	}
+
+	SECTION("after a hand-off, the way back needs the same margin and hold")
+	{
+		REQUIRE(feed(o, window_at(3840 - 300), now, 600) == ACER);
+		comp_segments_owner_set_result(&o, ACER, true, ACER);
+		// 55 % laptop: inside the band from the Acer's side.
+		CHECK(feed(o, window_at(3840 - 550), now, 5000) == 0);
+		// Back on the laptop: hand back after the hold.
+		CHECK(feed(o, window_at(100), now, 600) == LAPTOP);
+		comp_segments_owner_set_result(&o, LAPTOP, true, LAPTOP);
+		CHECK(o.owner_id == LAPTOP);
+	}
+
+	SECTION("a failed target is not retried until the majority leaves it")
+	{
+		const comp_segment_table t = window_at(3840 - 300);
+		REQUIRE(feed(o, t, now, 600) == ACER);
+		comp_segments_owner_set_result(&o, ACER, false, LAPTOP); // rolled back
+		CHECK(o.owner_id == LAPTOP);
+		CHECK(feed(o, t, now, 5000) == 0);
+		// The majority leaves the Acer, then comes back: one more try.
+		CHECK(feed(o, window_at(100), now, 100) == 0);
+		CHECK(feed(o, t, now, 600) == ACER);
+	}
+
+	SECTION("no owner after a failed rollback: the majority takes it")
+	{
+		REQUIRE(feed(o, window_at(3840 - 300), now, 600) == ACER);
+		comp_segments_owner_set_result(&o, ACER, false, 0);
+		CHECK(o.owner_id == 0);
+		// The laptop becomes the majority: it takes the handle after the hold.
+		CHECK(feed(o, window_at(3840 - 800), now, 600) == LAPTOP);
+	}
+
+	SECTION("a screen without a DP factory is never a target")
+	{
+		CHECK(feed(o, window_at(3840 - 100, false), now, 5000) == 0);
+		CHECK(o.owner_id == LAPTOP);
+	}
+
+	SECTION("off every screen: nothing to follow")
+	{
+		comp_segment_table empty{};
+		CHECK(comp_segments_owner_update(&o, &empty, now) == 0);
+		CHECK(comp_segments_owner_update(&o, nullptr, now) == 0);
+		CHECK(o.owner_id == LAPTOP);
+	}
+}
+
 TEST_CASE("comp_segments: deferred release")
 {
 	comp_segments_retire r{};

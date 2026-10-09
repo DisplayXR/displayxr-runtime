@@ -23,6 +23,8 @@
  *     segment refuse-rather-than-resample policy (weave, or a flat 2D blit).
  *   - @ref comp_segments_lifecycle — hysteresis for creating and destroying a
  *     segment's DP, so a window dragged across a seam never thrashes DPs.
+ *   - @ref comp_segments_owner — hysteresis for which screen's DP holds the
+ *     window handle (it follows the majority segment, ADR-047 Amendment 2).
  *
  * The rect math is @ref u_multi_display_compute_slices (half-open, so a seam
  * belongs to exactly one screen).
@@ -350,6 +352,85 @@ comp_segments_lifecycle_is_live(const struct comp_segments_lifecycle *lc, uint64
 void
 comp_segments_lifecycle_drain(struct comp_segments_lifecycle *lc, struct comp_segments_actions *out);
 
+
+
+/*
+ *
+ * Window-handle ownership: the HWND follows the majority segment.
+ *
+ */
+
+//! Default: how long a new majority must hold before the window handle moves (ns).
+#define COMP_SEGMENTS_DEFAULT_HANDOFF_HOLD_NS (500ull * 1000ull * 1000ull)
+
+//! Default: the margin a challenger's area must beat the owner's by, in percent
+//! of the window's on-screen area (20 = a 60/40 split between two screens).
+#define COMP_SEGMENTS_DEFAULT_HANDOFF_MARGIN_PCT 20u
+
+/*!
+ * The segment holding most of the window: the largest window-px area; an exact
+ * tie goes to the primary screen, else to the earlier (leftmost) segment. The
+ * same rule as `oxr_segment_views_majority`, so the screen a single view set
+ * is framed from and the screen that owns the window handle agree.
+ *
+ * @return the index into @p t, or UINT32_MAX when @p t is empty.
+ */
+uint32_t
+comp_segments_majority(const struct comp_segment_table *t);
+
+/*!
+ * Which screen's display processor holds the window's real handle (the
+ * vendor's drag phase-snap and window-scoped behaviour follow it). Every other
+ * segment's DP is windowless and is phased by `set_present_origin`.
+ *
+ * Starts on the primary screen. A hand-off to another screen is due only when
+ *   - that screen holds the majority (@ref comp_segments_majority),
+ *   - its area beats the current owner's by at least `margin_pct` percent of
+ *     the window's on-screen area (an absent owner counts as 0), and
+ *   - both have held continuously for `hold_ns`.
+ * The margin is a dead band around the seam and the hold rides out a drag, so
+ * a window dragged back and forth across a seam never flaps the handle (a
+ * hand-off rebuilds two DPs). A target that could not take the handle is not
+ * retried until the majority leaves it. A screen with no DP factory is never a
+ * target (its segment is flat 2D).
+ */
+struct comp_segments_owner
+{
+	uint64_t hold_ns;
+	uint32_t margin_pct;
+	//! The screen whose DP holds the handle; 0 = none (a failed hand-off).
+	uint64_t owner_id;
+	//! The challenger being timed, 0 = none.
+	uint64_t candidate_id;
+	uint64_t candidate_since_ns;
+	//! A target whose hand-off failed; skipped until it stops being the challenger.
+	uint64_t failed_id;
+};
+
+/*!
+ * Initialise with the primary screen as the owner. 0 for either threshold
+ * selects the default.
+ */
+void
+comp_segments_owner_init(struct comp_segments_owner *o, uint64_t primary_id, uint64_t hold_ns, uint32_t margin_pct);
+
+/*!
+ * Advance one metric update with the current table at @p now_ns.
+ *
+ * @return the screen id the handle should move to now, or 0 for no change. The
+ *         caller performs the hand-off and reports it with
+ *         @ref comp_segments_owner_set_result.
+ */
+uint64_t
+comp_segments_owner_update(struct comp_segments_owner *o, const struct comp_segment_table *t, uint64_t now_ns);
+
+/*!
+ * Report a hand-off's outcome: @p owner_id is the screen whose DP holds the
+ * handle afterwards (the target on success; the old owner after a rollback;
+ * 0 when no DP holds it). @p ok false latches @p target_id as failed.
+ */
+void
+comp_segments_owner_set_result(struct comp_segments_owner *o, uint64_t target_id, bool ok, uint64_t owner_id);
 
 
 /*
