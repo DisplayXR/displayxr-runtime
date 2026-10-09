@@ -81,6 +81,17 @@ path_dir(const char *path, char *out, size_t out_len)
 	if (path == NULL || out_len == 0) {
 		return;
 	}
+#ifdef XRT_OS_WINDOWS
+	// A peer launched through an 8.3 name (SPARKS~1 for a user directory with
+	// spaces) reports that spelling as its image path, while the service knows
+	// its own long name; the directories are the same on disk, so compare the
+	// long spellings (#960).
+	char long_path[1024];
+	const DWORD long_n = GetLongPathNameA(path, long_path, (DWORD)sizeof(long_path));
+	if (long_n > 0 && long_n < sizeof(long_path)) {
+		path = long_path;
+	}
+#endif
 	size_t n = strlen(path);
 	size_t cut = 0;
 	for (size_t i = 0; i < n; i++) {
