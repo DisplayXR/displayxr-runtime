@@ -72,7 +72,7 @@ two_screen_table()
 
 TEST_CASE("view-set capacity: only where a window can ever be split", "[oxr][segment_views]")
 {
-	// No segmenting compositor (macOS/Android, a non-D3D11 Windows session, a service session): 1.
+	// No segmenting compositor (macOS/Android, a GL / Vulkan Windows session, a service session): 1.
 	CHECK(oxr_segment_views_set_capacity(0, false) == 1);
 	CHECK(oxr_segment_views_set_capacity(3, false) == 1);
 	// One DP-backed screen (or none): 1 — the pre-M3 count.
@@ -81,6 +81,29 @@ TEST_CASE("view-set capacity: only where a window can ever be split", "[oxr][seg
 	// Two or more: up to XRT_MAX_SEGMENTS.
 	CHECK(oxr_segment_views_set_capacity(2, true) == 2);
 	CHECK(oxr_segment_views_set_capacity(5, true) == XRT_MAX_SEGMENTS);
+}
+
+TEST_CASE("Windows: a screen counts toward the capacity with a D3D11 OR a D3D12 factory", "[oxr][segment_views]")
+{
+	int d3d11_factory = 0;
+	int d3d12_factory = 0;
+	// Multi-screen M6: both in-process Windows compositors segment, so either
+	// factory makes the screen DP-backed.
+	CHECK(oxr_segment_views_win_entry_has_dp(&d3d11_factory, &d3d12_factory));
+	CHECK(oxr_segment_views_win_entry_has_dp(&d3d11_factory, nullptr));
+	CHECK(oxr_segment_views_win_entry_has_dp(nullptr, &d3d12_factory));
+	// A D3D12-only plug-in (no D3D11 factory) used to count zero screens.
+	CHECK_FALSE(oxr_segment_views_win_entry_has_dp(nullptr, nullptr));
+
+	// Two D3D12-only screens: two view sets, as two D3D11 screens give.
+	uint32_t with_factory = 0;
+	const void *entries[2][2] = {{nullptr, &d3d12_factory}, {nullptr, &d3d12_factory}};
+	for (const auto &e : entries) {
+		if (oxr_segment_views_win_entry_has_dp(e[0], e[1])) {
+			with_factory++;
+		}
+	}
+	CHECK(oxr_segment_views_set_capacity(with_factory, true) == 2);
 }
 
 TEST_CASE("PRIMARY_MULTIVIEW_DXR reports one view set per possible segment", "[oxr][segment_views]")

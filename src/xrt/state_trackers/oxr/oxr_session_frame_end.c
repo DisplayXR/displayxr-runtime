@@ -3186,6 +3186,14 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 			sess->seg_route_sent = route;
 		}
 	}
+#if defined(XRT_HAVE_D3D12_NATIVE_COMPOSITOR) && defined(XRT_OS_WINDOWS)
+	// Multi-screen M3 on Windows: same hand-off to the in-process D3D12 compositor.
+	if (sess->is_d3d12_native_compositor && sess->xcn != NULL) {
+		struct xrt_segment_view_routing route;
+		oxr_session_take_segment_view_routing(sess, &route);
+		comp_d3d12_compositor_set_view_routing(&sess->xcn->base, &route);
+	}
+#endif
 
 	xrt_result_t xret;
 	xret = xrt_comp_layer_begin(xc, &data);
