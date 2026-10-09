@@ -62,7 +62,7 @@ if [ "$MODE" = sim ]; then
     export DXR_PLUGIN_EXCLUSIVE=sim-display
     export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT:-anaglyph}"
 else
-    LEIA_PLUGIN_DIR="${LEIA_PLUGIN_DIR:-$GH/displayxr-leia-plugin.wt-macos/build-macos-weave/_plugins}"
+    LEIA_PLUGIN_DIR="${LEIA_PLUGIN_DIR:-$GH/displayxr-leia-plugin.wt-macos/build-macos-weave2/_plugins}"
     LEIASR_MACOS_DIR="${LEIASR_MACOS_DIR:-$GH/LeiaSR-macos}"
     [ -f "$LEIA_PLUGIN_DIR/050-leia-sr.json" ] || { echo "error: no Leia plug-in at $LEIA_PLUGIN_DIR" >&2; exit 1; }
     pgrep -x SRService >/dev/null || echo "warning: SRService is not running — the Leia DP will have no tracker" >&2
