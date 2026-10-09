@@ -32,6 +32,13 @@
 
 typedef struct cJSON cJSON;
 
+/*!
+ * Top-level `"schema"` of the CLI's published `--json` shapes (`info`,
+ * `displays`, `displays --claims`; ADR-051, display dashboard phase 0). Keys
+ * are only ever added; bump this only on an incompatible change.
+ */
+#define CLI_JSON_SCHEMA 1
+
 struct xrt_instance;
 struct xrt_instance_info;
 struct xrt_system;
