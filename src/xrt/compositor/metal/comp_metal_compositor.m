@@ -4862,6 +4862,7 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			sf.target_height = dp_target_h;
 			sf.transparent_background = c->transparent_background;
 			sf.primary_dp = c->display_processor;
+			sf.primary_present_origin = c->placement_frame_valid;
 			comp_metal_segments_record(c->segments, &sf);
 		} else {
 		// Runtime-owned placement (ADR-050): the DP is told the APPLIED

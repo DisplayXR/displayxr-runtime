@@ -835,6 +835,26 @@ comp_metal_segments_record(struct comp_metal_segments *segs, const struct comp_m
 					xrt_display_processor_metal_set_present_origin(dp, g->present_origin_x,
 					                                               g->present_origin_y);
 				}
+			} else if (f->primary_present_origin && g->screen_1to1 != COMP_SEG_1TO1_NO) {
+				// ADR-050: the primary DP gets the applied origin too, in its
+				// screen's backing px relative to its CGDisplayBounds, so that
+				// origin + canvas offset = this segment's top-left on the panel
+				// (the same rule as every other segment). A DP that also polls
+				// its view must let this call win (the view lags the move).
+				xrt_display_processor_metal_set_present_origin(dp, g->present_origin_x, g->present_origin_y);
+				static int trace = -1;
+				if (trace < 0) {
+					const char *e = getenv("DXR_MACOS_PLACEMENT_TRACE");
+					trace = (e != NULL && e[0] == '1') ? 1 : 0;
+				}
+				static int32_t last_x = INT32_MIN, last_y = INT32_MIN;
+				if (trace == 1 && (g->present_origin_x != last_x || g->present_origin_y != last_y)) {
+					last_x = g->present_origin_x;
+					last_y = g->present_origin_y;
+					U_LOG_W("placement: split frame, primary DP present origin %d,%d (canvas %d,%d %ux%u)",
+					        g->present_origin_x, g->present_origin_y, g->window_rect.x, g->window_rect.y,
+					        g->window_rect.w, g->window_rect.h);
+				}
 			}
 			xrt_display_processor_metal_process_atlas(
 			    dp, (__bridge void *)cmd, (__bridge void *)st->crop, tile[k].w, tile[k].h, f->tile_columns,

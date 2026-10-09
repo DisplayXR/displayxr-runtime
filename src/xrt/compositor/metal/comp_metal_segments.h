@@ -125,6 +125,12 @@ struct comp_metal_segments_frame
 	bool transparent_background;
 	//! The session's primary DP (weaves the primary screen's segment).
 	struct xrt_display_processor_metal *primary_dp;
+	//! Runtime-owned placement (ADR-050): also send the PRIMARY DP its
+	//! segment's present origin (computed, like every segment's, from the
+	//! rect this frame is woven for — the applied one). Without it the
+	//! primary DP falls back to polling its NSView, which mid-drag still
+	//! reports the pre-move position until the CA transaction commits.
+	bool primary_present_origin;
 };
 
 /*!
