@@ -491,6 +491,21 @@ struct comp_d3d11_compositor
 	struct xrt_display_processor_d3d11 *display_processor;
 
 	/*!
+	 * ADR-047 Amendment 2: while another screen holds the window, the segment
+	 * manager swaps display_processor for a windowless DP of the primary
+	 * screen (and back) on the weave thread under c->mutex. The weave's own
+	 * uses need nothing more; the app-thread entry points that read
+	 * display_processor WITHOUT c->mutex take this leaf lock, which the swap
+	 * holds across the pointer exchange.
+	 */
+	std::mutex dp_swap_mutex;
+	//! The DP the own window's drag snap asks (the window's holder); NULL = display_processor.
+	struct xrt_display_processor_d3d11 *snap_dp;
+	//! The app's last eye-tracking mode, re-sent to a swapped-in primary DP.
+	bool eye_tracking_mode_set;
+	uint32_t eye_tracking_mode;
+
+	/*!
 	 * Multi-screen M6 (ADR-047 D2 on Windows): a window spanning monitors is
 	 * woven per segment, each by its own screen's DP, into the one back
 	 * buffer. The screen list + DP registry arrive at session creation
@@ -819,11 +834,79 @@ d3d11_compositor_snap_window_rect_cb(void *userdata,
                                      int32_t *out_y)
 {
 	auto *c = static_cast<struct comp_d3d11_compositor *>(userdata);
-	if (c == nullptr || c->display_processor == nullptr) {
+	if (c == nullptr) {
 		return false;
 	}
-	return xrt_display_processor_d3d11_snap_window_rect(c->display_processor, origin_x, origin_y,
-	                                                    target_x, target_y, out_x, out_y);
+	// The DP holding the window snaps it (ADR-047 Amendment 2: another
+	// screen's segment DP while that screen holds the majority). Both
+	// pointers only change with this provider detached.
+	struct xrt_display_processor_d3d11 *dp = c->snap_dp != nullptr ? c->snap_dp : c->display_processor;
+	if (dp == nullptr) {
+		return false;
+	}
+	return xrt_display_processor_d3d11_snap_window_rect(dp, origin_x, origin_y, target_x, target_y, out_x, out_y);
+}
+
+/*!
+ * ADR-047 Amendment 2 hook: install @p dp as the session's primary DP (weave
+ * thread, c->mutex held) and return the previous one for the segment manager
+ * to destroy. Re-sends the session-level state a new DP has not seen.
+ */
+static struct xrt_display_processor_d3d11 *
+d3d11_segments_swap_primary_cb(void *userdata, struct xrt_display_processor_d3d11 *dp)
+{
+	auto *c = static_cast<struct comp_d3d11_compositor *>(userdata);
+	struct xrt_display_processor_d3d11 *old = nullptr;
+	{
+		std::lock_guard<std::mutex> lock(c->dp_swap_mutex);
+		old = c->display_processor;
+		c->display_processor = dp;
+	}
+	if (dp != nullptr) {
+		xrt_display_processor_d3d11_set_transparent_background(dp, c->transparent_background, false);
+		xrt_display_processor_d3d11_set_shared_texture_present(dp, c->has_shared_texture);
+		xrt_display_processor_d3d11_request_display_mode(dp, c->hardware_display_3d);
+		if (c->eye_tracking_mode_set) {
+			xrt_display_processor_d3d11_set_eye_tracking_mode(dp, c->eye_tracking_mode);
+		}
+		// This weave's per-frame inputs, already sent to the old DP. (Under
+		// the #918 split the backdrop rides the slot: the next weave has it.)
+		xrt_display_processor_d3d11_set_frame_timing(dp, comp_d3d11_target_get_measured_weave_ns(c->target),
+		                                             (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
+		xrt_display_processor_d3d11_set_predicted_scanout(
+		    dp, comp_d3d11_target_predict_weave_to_scanout_ns(c->target));
+		if (!c->split_active) {
+			xrt_display_processor_d3d11_set_background_2d(dp, c->repaint.backdrop_srv,
+			                                              c->repaint.backdrop_w, c->repaint.backdrop_h);
+		}
+	}
+	// A zone mask published to the old DP is gone with it; the next publish
+	// starts fresh instead of clearing a mask the new DP never saw.
+	c->zone_published = false;
+	return old;
+}
+
+/*!
+ * ADR-047 Amendment 2 hook: bracket a hand-off. The own window's drag snap is
+ * detached (the setter's exclusive lock waits out a snap in flight) before
+ * any DP holding the window dies, and re-armed on the DP holding it after.
+ */
+static void
+d3d11_segments_hwnd_bracket_cb(void *userdata, bool begin, struct xrt_display_processor_d3d11 *hwnd_dp)
+{
+	auto *c = static_cast<struct comp_d3d11_compositor *>(userdata);
+	const bool snapping = c->owns_window && c->own_window != nullptr;
+	if (begin) {
+		if (snapping) {
+			comp_d3d11_window_set_snap_provider(c->own_window, NULL, NULL);
+		}
+		c->snap_dp = nullptr;
+		return;
+	}
+	c->snap_dp = hwnd_dp;
+	if (snapping) {
+		comp_d3d11_window_set_snap_provider(c->own_window, d3d11_compositor_snap_window_rect_cb, c);
+	}
 }
 
 // #439 Phase 1 authored zone-mask helpers (XR_DXR_local_3d_zone). Defined
@@ -2700,6 +2783,18 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 			if (c->segments == nullptr) {
 				c->segments = comp_d3d11_segments_create(d3d11_out_device(c));
 				if (c->segments != nullptr) {
+					// ADR-047 Amendment 2: the window follows the majority
+					// screen — sessions with a real window only (a shared-
+					// texture session's app HWND is a position anchor, #696).
+					if (c->hwnd != nullptr && !c->has_shared_texture &&
+					    c->display_processor != nullptr) {
+						struct comp_d3d11_segments_hwnd_hooks hooks = {};
+						hooks.hwnd = c->hwnd;
+						hooks.userdata = c;
+						hooks.swap_primary = d3d11_segments_swap_primary_cb;
+						hooks.bracket = d3d11_segments_hwnd_bracket_cb;
+						comp_d3d11_segments_set_hwnd_hooks(c->segments, &hooks);
+					}
 					comp_d3d11_segments_set_screens(c->segments, c->seg_screens, c->seg_sys_info,
 					                                c->seg_pinned_display_id);
 				}
@@ -4241,7 +4336,10 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 
 	// Multi-screen M6: segment DPs + crop textures, before the primary DP
 	// (the repaint thread is already stopped, so no weave is in flight).
+	// No hooks: the window is not handed back to a primary DP about to die.
+	comp_d3d11_segments_set_hwnd_hooks(c->segments, nullptr);
 	comp_d3d11_segments_destroy(&c->segments);
+	c->snap_dp = nullptr;
 	free(c->seg_screens);
 	c->seg_screens = nullptr;
 	free(c->seg_sys_info);
@@ -8294,6 +8392,7 @@ comp_d3d11_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
                                                   struct xrt_eye_positions *out_eye_pos)
 {
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+	std::lock_guard<std::mutex> dp_lock(c->dp_swap_mutex);
 
 	if (c->display_processor != nullptr) {
 		if (xrt_display_processor_d3d11_get_predicted_eye_positions(c->display_processor, out_eye_pos) &&
@@ -8311,6 +8410,7 @@ comp_d3d11_compositor_get_display_dimensions(struct xrt_compositor *xc,
                                               float *out_height_m)
 {
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+	std::lock_guard<std::mutex> dp_lock(c->dp_swap_mutex);
 
 	if (c->display_processor != nullptr) {
 		return xrt_display_processor_d3d11_get_display_dimensions(
@@ -8398,6 +8498,7 @@ comp_d3d11_compositor_get_window_metrics(struct xrt_compositor *xc, struct xrt_w
 	// runtime-side Kooima (rig path, raw channel, legacy-2D fovs) ran
 	// display-scoped (#396 W7).
 	HWND metrics_hwnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
+	std::lock_guard<std::mutex> dp_lock(c->dp_swap_mutex); // ADR-047 Amendment 2 swap
 	if (c->display_processor == nullptr || metrics_hwnd == nullptr) {
 		return false;
 	}
@@ -8499,6 +8600,7 @@ comp_d3d11_compositor_request_display_mode(struct xrt_compositor *xc, bool enabl
 	}
 
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+	std::lock_guard<std::mutex> dp_lock(c->dp_swap_mutex);
 
 	if (c->display_processor != nullptr) {
 		return xrt_display_processor_d3d11_request_display_mode(c->display_processor, enable_3d);
@@ -8560,6 +8662,7 @@ comp_d3d11_compositor_get_segment_metrics(struct xrt_compositor *xc, struct xrt_
 	for (uint32_t k = 0; k < out->count && k < XRT_MAX_SEGMENTS; k++) {
 		struct xrt_segment_metric *s = &out->seg[k];
 		if (s->is_primary) {
+			std::lock_guard<std::mutex> dp_lock(c->dp_swap_mutex);
 			s->have_eyes = c->display_processor != nullptr &&
 			               xrt_display_processor_d3d11_get_predicted_eye_positions(c->display_processor,
 			                                                                      &s->eyes) &&
@@ -8590,7 +8693,10 @@ comp_d3d11_compositor_set_eye_tracking_mode(struct xrt_compositor *xc, uint32_t 
 	}
 
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+	std::lock_guard<std::mutex> dp_lock(c->dp_swap_mutex);
 
+	c->eye_tracking_mode_set = true;
+	c->eye_tracking_mode = mode;
 	if (c->display_processor != nullptr) {
 		xrt_display_processor_d3d11_set_eye_tracking_mode(c->display_processor, mode);
 	}

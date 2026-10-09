@@ -15,11 +15,16 @@
  * `create_dp_d3d11_for_screen`), or whose DP needs 1:1 pixels on a resampled
  * screen, gets a flat 2D blit of one view instead.
  *
- * The session's primary DP (`comp_d3d11_compositor::display_processor`, the
- * one holding the real HWND and so the vendor's drag phase-snap) keeps weaving
- * the primary screen's segment and keeps owning everything view-related. A
- * window entirely on the primary screen never enters this module's record
- * path: that case stays byte-for-byte the single-DP path.
+ * The session's primary DP (`comp_d3d11_compositor::display_processor`) keeps
+ * weaving the primary screen's segment and keeps owning everything
+ * view-related. The real HWND (and so the vendor's drag phase-snap) follows
+ * the screen holding the majority of the window (ADR-047 Amendment 2): when
+ * another screen clearly holds it for 0.5 s, that screen's segment DP is
+ * recreated WITH the window and the primary DP is swapped for a windowless
+ * one (through @ref comp_d3d11_segments_hwnd_hooks), and back. A window
+ * entirely on the primary screen never enters this module's record path while
+ * the primary holds the window: that case stays byte-for-byte the single-DP
+ * path.
  *
  * Design note: docs/architecture/comp-segments.md (§ Windows / D3D11).
  */
@@ -54,10 +59,47 @@ comp_d3d11_segments_create(void *d3d11_device);
 
 /*!
  * Tear down every segment DP and crop texture. The caller guarantees no weave
- * is in flight (the repaint thread is stopped).
+ * is in flight (the repaint thread is stopped). With hooks set and another
+ * screen holding the window, the window is handed back to the primary DP
+ * first; clear the hooks before a teardown that destroys the primary DP too.
  */
 void
 comp_d3d11_segments_destroy(struct comp_d3d11_segments **segs_ptr);
+
+/*!
+ * How the manager moves the session's window between DPs (ADR-047
+ * Amendment 2). All callbacks run on the weave thread with the compositor's
+ * weave lock held.
+ */
+struct comp_d3d11_segments_hwnd_hooks
+{
+	//! The session's real window (HWND). NULL disables the hand-off.
+	void *hwnd;
+	void *userdata;
+	/*!
+	 * Install @p dp as the session's primary DP and return the previous one,
+	 * which the manager destroys. The compositor re-sends its session-level
+	 * state (transparency, 2D/3D mode, eye-tracking mode) to @p dp and guards
+	 * the exchange against its other threads.
+	 */
+	struct xrt_display_processor_d3d11 *(*swap_primary)(void *userdata, struct xrt_display_processor_d3d11 *dp);
+	/*!
+	 * Brackets a hand-off: @p begin true before any DP holding the window is
+	 * destroyed; false after, with @p hwnd_dp the DP holding the window now —
+	 * NULL when it is the session's primary DP (or none does). The compositor
+	 * routes its own window's drag snap to it. Optional.
+	 */
+	void (*bracket)(void *userdata, bool begin, struct xrt_display_processor_d3d11 *hwnd_dp);
+};
+
+/*!
+ * Enable the window-handle hand-off. Call before
+ * @ref comp_d3d11_segments_set_screens. NULL (or a NULL window) disables it:
+ * the window stays with the primary DP.
+ */
+void
+comp_d3d11_segments_set_hwnd_hooks(struct comp_d3d11_segments *segs,
+                                   const struct comp_d3d11_segments_hwnd_hooks *hooks);
 
 /*!
  * Hand over the system's screens and DP registry. Segmentation is enabled only
@@ -85,8 +127,13 @@ comp_d3d11_segments_enabled(const struct comp_d3d11_segments *segs);
  * @param d3d11_context   The context handed to new segment DPs.
  * @param mode_index      The head's active rendering-mode index; a change
  *                        re-reads each segment DP's resample tolerance.
+ * Runs the window-handle hand-off when one is due (two DP creates, between
+ * two weaves).
+ *
  * @return true when this frame must take the split path
- *         (@ref comp_d3d11_segments_record); false = the single-DP path.
+ *         (@ref comp_d3d11_segments_record) — the window spans screens, or
+ *         the primary DP is windowless (another screen holds the window) and
+ *         needs its present origin; false = the single-DP path.
  */
 bool
 comp_d3d11_segments_update(struct comp_d3d11_segments *segs,
