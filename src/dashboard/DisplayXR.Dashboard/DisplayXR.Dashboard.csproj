@@ -1,0 +1,45 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- DisplayXR Dashboard (ADR-051 D4): an Avalonia renderer over displayxr-cli.
+       It links no runtime or vendor code; every fact comes from the CLI's JSON. -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <OutputType Condition="'$(OS)' != 'Windows_NT'">Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>displayxr-dashboard</AssemblyName>
+    <RootNamespace>DisplayXR.Dashboard</RootNamespace>
+    <Product>DisplayXR Dashboard</Product>
+    <Company>The DisplayXR Project</Company>
+    <Copyright>Copyright 2026, The DisplayXR Project</Copyright>
+    <Version>1.0.0</Version>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>../../../assets/displayxr_app.ico</ApplicationIcon>
+    <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- Windows-only calls (job object, CreateProcess) are behind OperatingSystem.IsWindows(). -->
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(PublishSingleFile)' == 'true'">
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <DebugType>embedded</DebugType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The runtime's own app icon (assets/displayxr_app.ico): window + exe icon. -->
+    <AvaloniaResource Include="../../../assets/displayxr_app.ico" Link="Assets/displayxr.ico" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Avalonia" Version="11.2.3" />
+    <PackageReference Include="Avalonia.Desktop" Version="11.2.3" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="11.2.3" />
+    <PackageReference Include="Avalonia.Fonts.Inter" Version="11.2.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="DisplayXR.Dashboard.Tests" />
+  </ItemGroup>
+</Project>

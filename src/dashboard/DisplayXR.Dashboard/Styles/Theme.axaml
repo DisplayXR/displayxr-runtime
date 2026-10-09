@@ -1,0 +1,77 @@
+<ResourceDictionary xmlns="https://github.com/avaloniaui"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <!-- The DisplayXR Dashboard palette: the one place a colour, a radius or a
+         font is written down. Pages use DynamicResource; code uses Ui/Tokens.cs.
+         Dark only. -->
+
+    <!-- Foregrounds -->
+    <Color x:Key="FgColor">#F4F7FC</Color>
+    <Color x:Key="FgDimColor">#B6BFCD</Color>
+    <Color x:Key="SoftColor">#C5D0E6</Color>
+    <Color x:Key="MutedColor">#8293B2</Color>
+    <Color x:Key="SecondaryColor">#5B6F94</Color>
+    <Color x:Key="LineColor">#26334C</Color>
+    <Color x:Key="AccentTextColor">#9DBEF0</Color>
+
+    <!-- Surfaces -->
+    <Color x:Key="WindowColorA">#0B1220</Color>
+    <Color x:Key="WindowColorB">#111B2E</Color>
+    <Color x:Key="WindowColorC">#192740</Color>
+    <Color x:Key="RailColorA">#070C16</Color>
+    <Color x:Key="RailColorB">#0B1322</Color>
+    <Color x:Key="RailColorC">#142037</Color>
+    <Color x:Key="PanelColor">#14203A</Color>
+    <Color x:Key="PanelRaisedColor">#192743</Color>
+    <Color x:Key="FieldColor">#0E1729</Color>
+    <Color x:Key="NavHoverColor">#18243B</Color>
+    <Color x:Key="NavSelectedColor">#22324F</Color>
+
+    <!-- States and accent -->
+    <Color x:Key="AccentColor">#4C9AFF</Color>
+    <Color x:Key="AccentHoverColor">#6DAEFF</Color>
+    <Color x:Key="OkColor">#4CC38A</Color>
+    <Color x:Key="InfoColor">#8FB4EE</Color>
+    <Color x:Key="WarnColor">#F5B53D</Color>
+    <Color x:Key="CriticalColor">#F2684A</Color>
+    <Color x:Key="SystemAccentColor">#4C9AFF</Color>
+
+    <SolidColorBrush x:Key="FgBrush" Color="{StaticResource FgColor}"/>
+    <SolidColorBrush x:Key="FgDimBrush" Color="{StaticResource FgDimColor}"/>
+    <SolidColorBrush x:Key="SoftBrush" Color="{StaticResource SoftColor}"/>
+    <SolidColorBrush x:Key="MutedBrush" Color="{StaticResource MutedColor}"/>
+    <SolidColorBrush x:Key="SecondaryBrush" Color="{StaticResource SecondaryColor}"/>
+    <SolidColorBrush x:Key="LineBrush" Color="{StaticResource LineColor}"/>
+    <SolidColorBrush x:Key="AccentTextBrush" Color="{StaticResource AccentTextColor}"/>
+    <SolidColorBrush x:Key="PanelBrush" Color="{StaticResource PanelColor}"/>
+    <SolidColorBrush x:Key="PanelRaisedBrush" Color="{StaticResource PanelRaisedColor}"/>
+    <SolidColorBrush x:Key="FieldBrush" Color="{StaticResource FieldColor}"/>
+    <SolidColorBrush x:Key="NavHoverBrush" Color="{StaticResource NavHoverColor}"/>
+    <SolidColorBrush x:Key="NavSelectedBrush" Color="{StaticResource NavSelectedColor}"/>
+    <SolidColorBrush x:Key="AccentBrush" Color="{StaticResource AccentColor}"/>
+    <SolidColorBrush x:Key="AccentHoverBrush" Color="{StaticResource AccentHoverColor}"/>
+    <SolidColorBrush x:Key="OkBrush" Color="{StaticResource OkColor}"/>
+    <SolidColorBrush x:Key="InfoBrush" Color="{StaticResource InfoColor}"/>
+    <SolidColorBrush x:Key="WarnBrush" Color="{StaticResource WarnColor}"/>
+    <SolidColorBrush x:Key="CriticalBrush" Color="{StaticResource CriticalColor}"/>
+    <SolidColorBrush x:Key="WarnFillBrush" Color="#2A2414"/>
+    <SolidColorBrush x:Key="CriticalFillBrush" Color="#2E1A18"/>
+
+    <LinearGradientBrush x:Key="WindowBackgroundBrush" StartPoint="0%,0%" EndPoint="0%,100%">
+        <GradientStop Color="{StaticResource WindowColorA}" Offset="0"/>
+        <GradientStop Color="{StaticResource WindowColorB}" Offset="0.65"/>
+        <GradientStop Color="{StaticResource WindowColorC}" Offset="1.0"/>
+    </LinearGradientBrush>
+    <LinearGradientBrush x:Key="RailBackgroundBrush" StartPoint="0%,0%" EndPoint="0%,100%">
+        <GradientStop Color="{StaticResource RailColorA}" Offset="0"/>
+        <GradientStop Color="{StaticResource RailColorB}" Offset="0.55"/>
+        <GradientStop Color="{StaticResource RailColorC}" Offset="1.0"/>
+    </LinearGradientBrush>
+
+    <CornerRadius x:Key="PanelRadius">12</CornerRadius>
+    <CornerRadius x:Key="ButtonRadius">8</CornerRadius>
+    <CornerRadius x:Key="FieldRadius">8</CornerRadius>
+    <CornerRadius x:Key="ChipRadius">11</CornerRadius>
+
+    <FontFamily x:Key="MonoFont">Cascadia Mono, Consolas, Courier New</FontFamily>
+</ResourceDictionary>
