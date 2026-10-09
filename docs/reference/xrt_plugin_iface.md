@@ -426,6 +426,46 @@ system-default display's segment; it runs FIRST each split frame, so it may stil
 plug-in without this slot gets flat 2D on its other displays. Reference implementation:
 `sim_display_dp_factory_metal_for_screen` (`drivers/sim_display/sim_display_processor_metal.m`).
 
+### `get_screen_status` (display dashboard, ADR-051 D2)
+
+```c
+xrt_result_t (*get_screen_status)(struct xrt_plugin_instance *inst, uint64_t monitor_id,
+                                  struct xrt_plugin_screen_status *out);
+```
+
+The vendor summary cell for ONE screen the plug-in claimed (`monitor_id` is a
+`xrt_display_descriptor::monitor_id` it returned a claim for). The dashboard (`displayxr-cli
+status`, the Control Panel's Displays page) shows the values and strings; the runtime never
+learns what they mean for a vendor. `struct xrt_plugin_screen_status` (caller sets `struct_size`
+and zero-fills; the plug-in sets `version = 1` and never writes past `struct_size`):
+
+| Field | Meaning |
+|---|---|
+| `change_counter` | Moves whenever anything below may have changed; a poller skips a screen whose counter did not move. |
+| `ready` / `verified` / `calibrated` | Platform up for this screen / positively identified as the vendor's hardware / a valid calibration exists (vendor-defined). |
+| `tracker` | `XRT_PLUGIN_TRACKER_STATE_{NONE, OFF, STARTING, RUNNING, DOWN, UNSUPPORTED}`. |
+| `lens` | `XRT_PLUGIN_LENS_STATE_{2D, 3D, UNKNOWN}`. |
+| `model[32]` / `serial[32]` | UTF-8, `""` = unknown. |
+| `warning_count` + `warnings[8]` | `{code[32], level (INFO/WARN/CRITICAL), text[96]}`, shown verbatim, never parsed. |
+| `dashboard_command[160]` | Command line opening the vendor's dashboard on this screen, with `{serial}` / `{monitor_id}` placeholders; `""` = none. Launched on request, never parsed. |
+
+**The call must be PASSIVE** — the vendor dashboard learned these the hard way:
+
+- no tracker, lens, display or weaver handle (a tracker handle wakes the screen's camera; a lens
+  enable is a shared vote that `destroy` does not withdraw);
+- no per-call vendor instance — keep the one long-lived instance you already have;
+- return in < 20 ms; expect to be polled every 2 s by the service and by diagnostic processes;
+- bump `change_counter` on your own device / topology events, never by polling hardware.
+
+NULL (or a `struct_size` that predates the slot) reads as "no vendor status", never an error;
+so does an error return for one screen. Appended after `create_dp_d3d12_for_screen` per ADR-020
+(`struct_size`-gated, no `XRT_PLUGIN_API_VERSION_CURRENT` bump; ABI stays 5); guard with
+`#ifdef XRT_PLUGIN_IFACE_HAS_GET_SCREEN_STATUS`, test with
+`xrt_plugin_iface_has_get_screen_status()`. Reference implementation:
+`sim_display_plugin_get_screen_status` (`drivers/sim_display/sim_display_plugin.c`), whose
+`tracker` follows `SIM_DISPLAY_FAKE_TRACKING` / `_PERIOD_MS` so the live UI is testable with no
+hardware.
+
 ### `set_pose_source`
 
 ```c
@@ -869,7 +909,8 @@ everything that was on `main` before them: `… vk_bundle_fn_table_offset` → `
 (ADR-042) → `get_platform_state` (ADR-045) → `stereo_camera_enumerate … stereo_camera_close`
 → `get_display_info_for_monitor` (multi-screen M1) → `create_dp_vk_for_screen` (multi-screen M2)
 → `create_dp_d3d11_for_screen` (M6, D3D11) → `create_dp_metal_for_screen` (macOS) →
-`create_dp_d3d12_for_screen` (M6, D3D12, now the last member).
+`create_dp_d3d12_for_screen` (M6, D3D12) → `get_screen_status` (ADR-051 dashboard, now the last
+member).
 `tests_stereo_camera` pins that order (lift right after the vk fingerprint, platform-state right
 after lift, the camera block right after platform-state and ending the struct), so a reorder or a
 slot squeezed in between fails on the host, not on a vendor box.

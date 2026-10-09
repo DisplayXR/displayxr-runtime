@@ -352,7 +352,7 @@ enable is a shared vote that `destroy` does not withdraw); config resolve at mos
 | **0** | `displays --claims --json`: `schema`, claim serial, mm; `selftest` metres check | — |
 | **1** | `xrt_display_status.h`, `u_status_snapshot_build` (headless), `displayxr-cli status [--json]`, warnings §4; `service_health` struct behind `[HEALTH]` / `[RENDER]` | — |
 | **2** | the three DIAG RPCs, generation counters, `status --watch`; `clients` gains presenter / lease / window / owner | 1 |
-| **3** | plug-in slot `get_screen_status` + `sim_display` implementation + iface doc | 1 |
+| **3** ✅ | plug-in slot `get_screen_status` + `sim_display` implementation + iface doc — **landed** (slot first; its consumer arrives with 1/2) | 1 |
 | **4** | Control Panel: tabs, long-lived `--watch` child, Displays + Windows pages, desktop map, Overview summary line | 2 |
 | **5** | MCP `get_status_snapshot` (session-free, wraps the CLI) | 2 |
 | **6** | the vendor plug-in fills the cell from the SDK query; "Open in vendor" | 3 + §9.1–9.2 |
