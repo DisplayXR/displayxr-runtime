@@ -387,6 +387,16 @@ surface under test. Grep your app's log for `DP weave scope:` to see what the
 runtime read, and for the follow-up warning when a scanout-scoped DP lands on a
 windowed path.
 
+### Optional: per-screen status for the dashboard
+
+Implement `get_screen_status` (ADR-051 D2, `#ifdef XRT_PLUGIN_IFACE_HAS_GET_SCREEN_STATUS`) to
+give each screen you claim a row in `displayxr-cli status` and the Control Panel: ready /
+verified / calibrated, tracker and lens state, model and serial, up to eight warnings shown
+verbatim, and an optional command line that opens your own dashboard on that screen. It must be
+passive — no tracker / lens / display handle, no per-call SDK instance, < 20 ms, pollable every
+2 s — see [`xrt_plugin_iface.md`](../reference/xrt_plugin_iface.md#get_screen_status-display-dashboard-adr-051-d2).
+Leave it NULL and the dashboard shows "no vendor status".
+
 ### Plug-in lifetime + threading
 
 - `xrtPluginNegotiate` is called exactly once per process, at first `xrCreateInstance`.
