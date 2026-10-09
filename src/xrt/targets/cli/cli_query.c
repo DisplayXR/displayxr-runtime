@@ -16,6 +16,7 @@
 #endif
 
 #include "cli_query.h"
+#include "cli_metres_check.h"
 
 #include "xrt/xrt_space.h"
 #include "xrt/xrt_system.h"
@@ -2297,6 +2298,7 @@ cJSON *
 cli_query_info_to_cjson(const struct cli_query_result *r)
 {
 	cJSON *root = cJSON_CreateObject();
+	cJSON_AddNumberToObject(root, "schema", (double)CLI_JSON_SCHEMA);
 
 	if (r->x11_scale_ok) {
 		cJSON *xs = cJSON_AddObjectToObject(root, "x11_coordinate_space");
@@ -2778,6 +2780,42 @@ struct check
 };
 
 /*!
+ * Display dashboard phase 0 (ADR-051 `NO_PHYSICAL_SIZE`): count the screens
+ * claimed at VERIFIED confidence and those among them that resolved to 0 m.
+ * Returns the number missing metres; pure over @p r, so the check row, the
+ * WARN lines and the JSON `warnings[]` can never disagree.
+ */
+static uint32_t
+count_verified_without_metres(const struct cli_query_result *r, uint32_t *out_verified)
+{
+	uint32_t verified = 0;
+	uint32_t missing = 0;
+	for (uint32_t i = 0; r->screens_probed && i < r->screens.count && i < XRT_SCREEN_LIST_MAX; i++) {
+		const struct xrt_screen *sc = &r->screens.screens[i];
+		if (sc->confidence >= (uint32_t)XRT_DISPLAY_CLAIM_VERIFIED) {
+			verified++;
+		}
+		if (cli_screen_verified_without_metres(sc)) {
+			missing++;
+		}
+	}
+	if (out_verified != NULL) {
+		*out_verified = verified;
+	}
+	return missing;
+}
+
+//! The one-sentence `NO_PHYSICAL_SIZE` text for screen @p sc.
+static void
+no_physical_size_text(const struct xrt_screen *sc, char *out, size_t cap)
+{
+	snprintf(out, cap,
+	         "Screen 0x%016llx ('%s') is claimed VERIFIED by '%s' but has no physical size from the plug-in "
+	         "or EDID, so a window spanning it gets one view set for the whole window instead of one per screen.",
+	         (unsigned long long)sc->id, or_q(sc->device_name), or_q(sc->plugin_id));
+}
+
+/*!
  * Build the ordered list of checks the self-test reports. Returns the count
  * and whether the overall verdict is PASS. A check is only meaningful up to
  * the first failure; later checks are reported as not-run (ok=false) only
@@ -2931,6 +2969,28 @@ build_checks(const struct cli_query_result *r, struct check *out)
 	c->ok = !r->rig_evaluated || (r->rig_role_ok && r->rig_moves_ok && r->rig_recenter_ok);
 	snprintf(c->detail, sizeof(c->detail), "%s", r->rig_note[0] != '\0' ? r->rig_note : "not evaluated");
 
+	// Display dashboard phase 0 (ADR-051): every VERIFIED claim has metres.
+	// NON-FAILING: a 0 m screen is a warning (the per-segment view layout
+	// refuses it, so a straddling window gets one view set), never an exit
+	// code; the WARN lines and `warnings[]` carry the per-screen detail.
+	{
+		uint32_t verified = 0;
+		const uint32_t missing = count_verified_without_metres(r, &verified);
+		c = &out[n++];
+		c->name = "verified_metres";
+		c->ok = true;
+		if (!r->screens_probed) {
+			snprintf(c->detail, sizeof(c->detail), "%s", "not evaluated");
+		} else if (missing > 0) {
+			snprintf(c->detail, sizeof(c->detail),
+			         "WARNING: %u of %u VERIFIED screen(s) have no physical size (NO_PHYSICAL_SIZE)",
+			         missing, verified);
+		} else {
+			snprintf(c->detail, sizeof(c->detail), "%u VERIFIED screen(s), all with physical metres",
+			         verified);
+		}
+	}
+
 	// X11 window-placement quantum. INFORMATIONAL — always ok: a scaled
 	// output is a user display setting, not a broken install, and failing
 	// selftest on it would make CI and every HiDPI laptop red. The detail
@@ -2958,6 +3018,15 @@ cli_query_print_selftest_text(const struct cli_query_result *r)
 		P("%s: %s — %s\n", checks[i].ok ? "PASS" : "FAIL", checks[i].name, checks[i].detail);
 	}
 
+	// ADR-051 NO_PHYSICAL_SIZE: warnings only, never the exit code.
+	for (uint32_t i = 0; r->screens_probed && i < r->screens.count && i < XRT_SCREEN_LIST_MAX; i++) {
+		if (cli_screen_verified_without_metres(&r->screens.screens[i])) {
+			char text[320];
+			no_physical_size_text(&r->screens.screens[i], text, sizeof(text));
+			P("WARN: NO_PHYSICAL_SIZE — %s\n", text);
+		}
+	}
+
 	// ADR-045: informational — never changes the verdict or the exit code.
 	print_plugin_states_text(r);
 
@@ -2982,6 +3051,20 @@ cli_query_selftest_to_cjson(const struct cli_query_result *r)
 		cJSON_AddBoolToObject(c, "ok", checks[i].ok);
 		cJSON_AddStringToObject(c, "detail", checks[i].detail);
 		cJSON_AddItemToArray(arr, c);
+	}
+
+	// ADR-051 warnings as data: {code, level, text}; never changes the verdict.
+	cJSON *warnings = cJSON_AddArrayToObject(root, "warnings");
+	for (uint32_t i = 0; r->screens_probed && i < r->screens.count && i < XRT_SCREEN_LIST_MAX; i++) {
+		if (cli_screen_verified_without_metres(&r->screens.screens[i])) {
+			char text[320];
+			no_physical_size_text(&r->screens.screens[i], text, sizeof(text));
+			cJSON *w = cJSON_CreateObject();
+			cJSON_AddStringToObject(w, "code", "NO_PHYSICAL_SIZE");
+			cJSON_AddStringToObject(w, "level", "warn");
+			cJSON_AddStringToObject(w, "text", text);
+			cJSON_AddItemToArray(warnings, w);
+		}
 	}
 
 	cJSON_AddStringToObject(root, "dpi_awareness", r->dpi_awareness);

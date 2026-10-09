@@ -143,6 +143,7 @@ cli_cmd_displays_claims(const struct os_display_edid_list *list, bool json)
 
 	if (json) {
 		cJSON *root = cJSON_CreateObject();
+		cJSON_AddNumberToObject(root, "schema", (double)CLI_JSON_SCHEMA);
 		cJSON_AddNumberToObject(root, "monitor_count", (double)dn);
 		cJSON_AddNumberToObject(root, "claimed_count", (double)reg.entry_count);
 		cJSON *arr = cJSON_AddArrayToObject(root, "claims");
@@ -235,6 +236,7 @@ cli_cmd_displays(int argc, const char **argv)
 
 	if (cli_has_flag(argc, argv, "--json")) {
 		cJSON *root = cJSON_CreateObject();
+		cJSON_AddNumberToObject(root, "schema", (double)CLI_JSON_SCHEMA);
 		cJSON_AddNumberToObject(root, "count", (double)list.count);
 		cJSON *arr = cJSON_AddArrayToObject(root, "displays");
 		for (uint32_t i = 0; i < list.count; i++) {

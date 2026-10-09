@@ -36,6 +36,7 @@ set(tests
     tests_aux_x11_scale
     tests_aux_display_desktop_select
     tests_cli_dims_check
+    tests_cli_metres_check
     tests_comp_vblank_grid
     tests_comp_zone_tier1
     tests_comp_swapchain_ring
@@ -551,6 +552,11 @@ target_link_libraries(tests_xrt_active_mode_scale PRIVATE xrt-interfaces)
 # of printing it. A header of pure integer decisions (the probe that feeds it is
 # Windows-only, the rule is not), so there is nothing to link but the include.
 target_include_directories(tests_cli_dims_check PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/cli)
+
+# Display dashboard phase 0 (ADR-051): the non-failing selftest rule "every
+# VERIFIED claim has physical metres" (the 0 m screen trap). Header-only.
+target_include_directories(tests_cli_metres_check PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/cli)
+target_link_libraries(tests_cli_metres_check PRIVATE xrt-interfaces)
 
 # Android late-weave / repaint pacing (#868/#902). The vblank grid is
 # header-only and deliberately free of Vulkan and DXGI types — that is what
