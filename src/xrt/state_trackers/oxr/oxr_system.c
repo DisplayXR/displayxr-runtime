@@ -171,9 +171,9 @@ oxr_system_fill_in(
 	/*
 	 * Multi-screen M3: advertise one view set per segment only where a
 	 * window can ever be split — the in-process Vulkan compositor on desktop
-	 * Linux, the in-process D3D11 compositor or the D3D11 service on Windows,
-	 * or the in-process Metal compositor on macOS, with at least two registry
-	 * screens that have a DP factory. A single-screen box, a Linux service
+	 * Linux, the in-process D3D11 / D3D12 compositors or the D3D11 service on
+	 * Windows, or the in-process Metal compositor on macOS, with at least two
+	 * registry screens that have a DP factory. A single-screen box, a Linux service
 	 * session and every other platform keep the pre-M3 count, so existing
 	 * multiview apps and the CTS see no change.
 	 */
@@ -194,13 +194,15 @@ oxr_system_fill_in(
 				}
 			}
 		}
-#elif defined(XRT_OS_WINDOWS) && defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR)
-		// Multi-screen M3 on Windows: the in-process D3D11 compositor
-		// segments a window the same way (comp_d3d11_segments); the
-		// registry's D3D11 factory is what says a screen has a DP. The
-		// capacity is per system, so a D3D12 / GL / Vulkan session on the
-		// same box advertises the doubled count too and never splits — the
-		// tail views then repeat view 0, which the contract allows.
+#elif defined(XRT_OS_WINDOWS) &&                                                                                       \
+    (defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR) || defined(XRT_HAVE_D3D12_NATIVE_COMPOSITOR))
+		// Multi-screen M3 on Windows: the in-process D3D11 and D3D12
+		// compositors segment a window the same way (comp_d3d11_segments,
+		// comp_d3d12_segments); a registry D3D11 or D3D12 factory is what
+		// says a screen has a DP. The capacity is per system, so a GL /
+		// Vulkan session on the same box advertises the doubled count too
+		// and never splits — the tail views then repeat view 0, which the
+		// contract allows.
 		//
 		// Service sessions too (ADR-047 Amendment 3): the D3D11 service
 		// segments a direct IPC client's window the same way. The registry
@@ -215,7 +217,8 @@ oxr_system_fill_in(
 			can_segment = true;
 			const struct xrt_dp_factory_registry *reg = &sys->xsysc->info.dp_registry;
 			for (uint32_t e = 0; e < reg->entry_count && e < XRT_DP_REGISTRY_MAX_ENTRIES; e++) {
-				if (reg->entries[e].dp_factory_d3d11 != NULL) {
+				if (oxr_segment_views_win_entry_has_dp(reg->entries[e].dp_factory_d3d11,
+				                                       reg->entries[e].dp_factory_d3d12)) {
 					with_factory++;
 				}
 			}

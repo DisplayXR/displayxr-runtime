@@ -1348,6 +1348,88 @@ render_window_space_layer(struct comp_d3d12_renderer *r,
 
 
 /*!
+ * Multi-screen M3: the end of the last routed view range (0 = unrouted).
+ */
+static uint32_t
+routed_view_end(const struct comp_d3d12_eff_layout *layout)
+{
+	uint32_t n = 0;
+	for (uint32_t k = 0; k < layout->route_count && k < XRT_MAX_SEGMENTS; k++) {
+		const uint32_t end = layout->route[k].first_view + layout->route[k].view_count;
+		if (end > n) {
+			n = end;
+		}
+	}
+	return n > XRT_MAX_VIEWS ? XRT_MAX_VIEWS : n;
+}
+
+/*!
+ * Multi-screen M3: how many draws tile @p vi takes — one per routed segment
+ * under routing, else one.
+ */
+static uint32_t
+tile_draw_count(const struct comp_d3d12_eff_layout *layout)
+{
+	return layout->route_count > 0 ? layout->route_count : 1u;
+}
+
+/*!
+ * Multi-screen M3: draw @p k of tile @p vi — which layer view it shows and
+ * where, in target px. Unrouted: the tile's own view at the tile box
+ * (@p vp_w × @p vp_h, the mono clamp applied). Routed: segment k's local view
+ * @p vi at the segment's rect inside the tile. False = nothing to draw (the
+ * segment has fewer views, or an empty rect).
+ */
+static bool
+tile_draw(const struct comp_d3d12_eff_layout *layout,
+          uint32_t vi,
+          uint32_t k,
+          uint32_t vp_w,
+          uint32_t vp_h,
+          uint32_t *out_view,
+          D3D12_VIEWPORT *out_vp,
+          D3D12_RECT *out_scissor)
+{
+	const uint32_t tile_x = (vi % layout->cols) * layout->tile_w;
+	const uint32_t tile_y = (vi / layout->cols) * layout->tile_h;
+	D3D12_VIEWPORT vp = {};
+	vp.TopLeftX = static_cast<float>(tile_x);
+	vp.TopLeftY = static_cast<float>(tile_y);
+	vp.Width = static_cast<float>(vp_w);
+	vp.Height = static_cast<float>(vp_h);
+	vp.MinDepth = 0.0f;
+	vp.MaxDepth = 1.0f;
+	D3D12_RECT sc = {};
+	sc.left = tile_x;
+	sc.top = tile_y;
+	sc.right = tile_x + vp_w;
+	sc.bottom = tile_y + vp_h;
+	uint32_t view = vi;
+	if (layout->route_count > 0) {
+		if (k >= layout->route_count || k >= XRT_MAX_SEGMENTS || vi >= layout->route[k].view_count ||
+		    layout->route[k].w == 0 || layout->route[k].h == 0) {
+			return false;
+		}
+		view = layout->route[k].first_view + vi;
+		vp.TopLeftX += static_cast<float>(layout->route[k].x);
+		vp.TopLeftY += static_cast<float>(layout->route[k].y);
+		vp.Width = static_cast<float>(layout->route[k].w);
+		vp.Height = static_cast<float>(layout->route[k].h);
+		sc.left = static_cast<LONG>(tile_x) + layout->route[k].x;
+		sc.top = static_cast<LONG>(tile_y) + layout->route[k].y;
+		sc.right = sc.left + static_cast<LONG>(layout->route[k].w);
+		sc.bottom = sc.top + static_cast<LONG>(layout->route[k].h);
+	}
+	if (view >= XRT_MAX_VIEWS) {
+		return false;
+	}
+	*out_view = view;
+	*out_vp = vp;
+	*out_scissor = sc;
+	return true;
+}
+
+/*!
  * Render one `XrCompositionLayerQuad` into every view tile it is visible in
  * (#1581). Ported from the D3D11 reference render_quad_layer(), and sharing
  * every policy decision with it through comp_layer_view_camera.h.
@@ -1394,10 +1476,14 @@ render_quad_layer(struct comp_d3d12_renderer *r,
 	 * Resolved up front so a quad no view can see costs no barrier and no
 	 * descriptor slot.
 	 */
+	// Multi-screen M3: under routing every routed view (camera) is a
+	// candidate, framed against the whole routed view count.
+	const uint32_t routed_end = routed_view_end(layout);
+	const uint32_t vis_count = routed_end > view_count ? routed_end : view_count;
 	bool visible[XRT_MAX_VIEWS] = {};
 	bool any_visible = false;
-	for (uint32_t vi = 0; vi < view_count && vi < XRT_MAX_VIEWS; vi++) {
-		visible[vi] = is_layer_view_visible_n(data, vi, view_count) &&
+	for (uint32_t vi = 0; vi < vis_count && vi < XRT_MAX_VIEWS; vi++) {
+		visible[vi] = is_layer_view_visible_n(data, vi, vis_count) &&
 		              comp_layer_quad_is_front_facing(&q->pose, &cameras[vi].pose.position);
 		any_visible = any_visible || visible[vi];
 	}
@@ -1494,8 +1580,15 @@ render_quad_layer(struct comp_d3d12_renderer *r,
 		}
 	}
 
-	for (uint32_t vi = 0; vi < view_count && vi < XRT_MAX_VIEWS; vi++) {
-		if (!visible[vi]) {
+	// Multi-screen M3: one draw per tile, or one per routed segment per tile
+	// (draw d = tile ti, segment d % n — view vi at its rect).
+	const uint32_t draws_per_tile = tile_draw_count(layout);
+	for (uint32_t d = 0; d < view_count * draws_per_tile && d / draws_per_tile < XRT_MAX_VIEWS; d++) {
+		const uint32_t ti = d / draws_per_tile;
+		uint32_t vi = 0;
+		D3D12_VIEWPORT vp = {};
+		D3D12_RECT scissor = {};
+		if (!tile_draw(layout, ti, d % draws_per_tile, vp_w, vp_h, &vi, &vp, &scissor) || !visible[vi]) {
 			continue;
 		}
 
@@ -1532,7 +1625,7 @@ render_quad_layer(struct comp_d3d12_renderer *r,
 		 * SHADER emits: the fold below is half of that mode, the
 		 * blending-off pipeline state the other.
 		 */
-		const enum comp_layer_blend_mode mode = comp_layer_subrect_blend_mode(&tiles[vi], data->flags);
+		const enum comp_layer_blend_mode mode = comp_layer_subrect_blend_mode(&tiles[ti], data->flags);
 		comp_layer_blend_fold_opaque_cover(mode, color_scale, color_bias);
 
 		const float array_params[4] = {layered ? static_cast<float>(q->sub.array_index) : 0.0f, 0.0f, 0.0f,
@@ -1545,23 +1638,7 @@ render_quad_layer(struct comp_d3d12_renderer *r,
 		cmd_list->SetGraphicsRoot32BitConstants(1, 4, color_bias, 24);
 		cmd_list->SetGraphicsRoot32BitConstants(1, 4, array_params, 28);
 
-		const uint32_t tile_x = (vi % layout->cols) * layout->tile_w;
-		const uint32_t tile_y = (vi / layout->cols) * layout->tile_h;
-
-		D3D12_VIEWPORT vp = {};
-		vp.TopLeftX = static_cast<float>(tile_x);
-		vp.TopLeftY = static_cast<float>(tile_y);
-		vp.Width = static_cast<float>(vp_w);
-		vp.Height = static_cast<float>(vp_h);
-		vp.MinDepth = 0.0f;
-		vp.MaxDepth = 1.0f;
 		cmd_list->RSSetViewports(1, &vp);
-
-		D3D12_RECT scissor = {};
-		scissor.left = tile_x;
-		scissor.top = tile_y;
-		scissor.right = tile_x + vp_w;
-		scissor.bottom = tile_y + vp_h;
 		cmd_list->RSSetScissorRects(1, &scissor);
 
 		cmd_list->DrawInstanced(4, 1, 0, 0);
@@ -1636,10 +1713,14 @@ render_equirect2_layer(struct comp_d3d12_renderer *r,
 	 * and applying it here would drop a viewer standing INSIDE the sphere,
 	 * which is the ordinary case for a 360 background.
 	 */
+	// Multi-screen M3: under routing every routed view (camera) is a
+	// candidate, framed against the whole routed view count.
+	const uint32_t routed_end = routed_view_end(layout);
+	const uint32_t vis_count = routed_end > view_count ? routed_end : view_count;
 	bool visible[XRT_MAX_VIEWS] = {};
 	bool any_visible = false;
-	for (uint32_t vi = 0; vi < view_count && vi < XRT_MAX_VIEWS; vi++) {
-		visible[vi] = is_layer_view_visible_n(data, vi, view_count);
+	for (uint32_t vi = 0; vi < vis_count && vi < XRT_MAX_VIEWS; vi++) {
+		visible[vi] = is_layer_view_visible_n(data, vi, vis_count);
 		any_visible = any_visible || visible[vi];
 	}
 	if (!any_visible) {
@@ -1732,8 +1813,15 @@ render_equirect2_layer(struct comp_d3d12_renderer *r,
 		}
 	}
 
-	for (uint32_t vi = 0; vi < view_count && vi < XRT_MAX_VIEWS; vi++) {
-		if (!visible[vi]) {
+	// Multi-screen M3: one draw per tile, or one per routed segment per tile
+	// (draw d = tile ti, segment d % n — view vi at its rect).
+	const uint32_t draws_per_tile = tile_draw_count(layout);
+	for (uint32_t d = 0; d < view_count * draws_per_tile && d / draws_per_tile < XRT_MAX_VIEWS; d++) {
+		const uint32_t ti = d / draws_per_tile;
+		uint32_t vi = 0;
+		D3D12_VIEWPORT vp = {};
+		D3D12_RECT scissor = {};
+		if (!tile_draw(layout, ti, d % draws_per_tile, vp_w, vp_h, &vi, &vp, &scissor) || !visible[vi]) {
 			continue;
 		}
 
@@ -1783,7 +1871,7 @@ render_equirect2_layer(struct comp_d3d12_renderer *r,
 		 * covers and nowhere else, which is what "the layer's alpha is one"
 		 * means.
 		 */
-		const enum comp_layer_blend_mode mode = comp_layer_subrect_blend_mode(&tiles[vi], data->flags);
+		const enum comp_layer_blend_mode mode = comp_layer_subrect_blend_mode(&tiles[ti], data->flags);
 		comp_layer_blend_fold_opaque_cover(mode, constants.color_scale, constants.color_bias);
 
 		// The spec says +INFINITY for "as far away as possible"; the shader
@@ -1801,23 +1889,7 @@ render_equirect2_layer(struct comp_d3d12_renderer *r,
 		// there is no per-field offset table to keep in step with the HLSL.
 		cmd_list->SetGraphicsRoot32BitConstants(1, kEquirect2RootConstants, &constants, 0);
 
-		const uint32_t tile_x = (vi % layout->cols) * layout->tile_w;
-		const uint32_t tile_y = (vi / layout->cols) * layout->tile_h;
-
-		D3D12_VIEWPORT vp = {};
-		vp.TopLeftX = static_cast<float>(tile_x);
-		vp.TopLeftY = static_cast<float>(tile_y);
-		vp.Width = static_cast<float>(vp_w);
-		vp.Height = static_cast<float>(vp_h);
-		vp.MinDepth = 0.0f;
-		vp.MaxDepth = 1.0f;
 		cmd_list->RSSetViewports(1, &vp);
-
-		D3D12_RECT scissor = {};
-		scissor.left = tile_x;
-		scissor.top = tile_y;
-		scissor.right = tile_x + vp_w;
-		scissor.bottom = tile_y + vp_h;
 		cmd_list->RSSetScissorRects(1, &scissor);
 
 		// Fullscreen strip, 4 vertices — the viewport restricts it to the tile.
@@ -2982,8 +3054,13 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 	    have_wm ? xrt_vec3{canvas->window_center_offset_x_m, canvas->window_center_offset_y_m,
 	                       canvas->window_center_offset_z_m}
 	            : xrt_vec3{0.0f, 0.0f, 0.0f};
+	// Multi-screen M3: under routing a quad / equirect2 is drawn once per
+	// routed view, with THAT view's camera — so resolve every routed view's
+	// camera, not only the first tile's worth.
+	const uint32_t routed_end = routed_view_end(layout);
+	const uint32_t cam_count = routed_end > view_count ? routed_end : view_count;
 	struct comp_layer_view_camera cameras[XRT_MAX_VIEWS] = {};
-	for (uint32_t view = 0; view < view_count && view < XRT_MAX_VIEWS; view++) {
+	for (uint32_t view = 0; view < cam_count && view < XRT_MAX_VIEWS; view++) {
 		comp_layer_view_camera_select_eyes(layers, view, eyes, view_count, have_wm ? &canvas_center : nullptr,
 		                                   have_wm ? canvas->window_width_m : 0.0f,
 		                                   have_wm ? canvas->window_height_m : 0.0f, &cameras[view]);
@@ -3072,7 +3149,39 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 
 		uint32_t layer_view_count = layer->data.view_count;
 
-		for (uint32_t vi = 0; vi < layer_view_count && vi < view_count; vi++) {
+		// Multi-screen M3: a routed frame paints each tile as a mosaic — one
+		// draw per segment, layer view first_view[k] + ti at the segment's
+		// rect (zones are never routed). Unrouted: one draw, view ti.
+		const bool routed = layout->route_count > 0 && !is_zone;
+		const uint32_t draws_per_tile = routed ? layout->route_count : 1u;
+		const uint32_t tile_count =
+		    routed ? view_count : (layer_view_count < view_count ? layer_view_count : view_count);
+		struct comp_layer_tile_state *tile = nullptr;
+		enum comp_layer_blend_mode proj_mode = COMP_LAYER_BLEND_REPLACE;
+		for (uint32_t d = 0; d < tile_count * draws_per_tile; d++) {
+			const uint32_t ti = d / draws_per_tile;
+			const uint32_t dk = d % draws_per_tile;
+			if (dk == 0) {
+				// #1598 for the tile, decided ONCE before its draws (see
+				// below): every segment of a tile's first projection layer
+				// is that tile's base.
+				tile = ti < XRT_MAX_VIEWS ? &tiles[ti] : nullptr;
+				proj_mode = COMP_LAYER_BLEND_REPLACE;
+				if (!is_zone) {
+					proj_mode = comp_layer_tile_blend_mode(tile, layer->data.flags);
+				}
+			}
+			uint32_t vi = ti;
+			if (routed) {
+				if (dk >= XRT_MAX_SEGMENTS || ti >= layout->route[dk].view_count ||
+				    layout->route[dk].w == 0 || layout->route[dk].h == 0) {
+					continue;
+				}
+				vi = layout->route[dk].first_view + ti;
+				if (vi >= layer_view_count || vi >= XRT_MAX_VIEWS) {
+					continue;
+				}
+			}
 			/*
 			 * #1598: resolved BEFORE the swapchain lookups below, so
 			 * the mark is EAGER — a projection layer that fails to
@@ -3096,12 +3205,6 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 			 * unflagged zone must stay PREMULTIPLIED so its texture
 			 * alpha survives).
 			 */
-			struct comp_layer_tile_state *tile = vi < XRT_MAX_VIEWS ? &tiles[vi] : nullptr;
-			enum comp_layer_blend_mode proj_mode = COMP_LAYER_BLEND_REPLACE;
-			if (!is_zone) {
-				proj_mode = comp_layer_tile_blend_mode(tile, layer->data.flags);
-			}
-
 			struct xrt_swapchain *xsc = layer->sc_array[vi];
 			if (xsc == nullptr) {
 				continue;
@@ -3224,7 +3327,7 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 			gpu_srv.ptr += renderer->srv_descriptor_size * srv_slot;
 
 			// Tile position in the effective atlas grid (#542)
-			uint32_t tile_idx = vi;
+			uint32_t tile_idx = ti;
 			uint32_t tile_x = (tile_idx % layout->cols) * layout->tile_w;
 			uint32_t tile_y = (tile_idx / layout->cols) * layout->tile_h;
 
@@ -3316,13 +3419,24 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 				cmd_list->SetPipelineState(proj_pso);
 			}
 
-			cmd_list->RSSetViewports(1, &vp);
-
 			D3D12_RECT scissor = {};
 			scissor.left = tile_x;
 			scissor.top = tile_y;
 			scissor.right = tile_x + vp_w;
 			scissor.bottom = tile_y + vp_h;
+			if (routed) {
+				// Multi-screen M3: this segment's rect inside the tile.
+				vp.TopLeftX += static_cast<float>(layout->route[dk].x);
+				vp.TopLeftY += static_cast<float>(layout->route[dk].y);
+				vp.Width = static_cast<float>(layout->route[dk].w);
+				vp.Height = static_cast<float>(layout->route[dk].h);
+				scissor.left = static_cast<LONG>(tile_x) + layout->route[dk].x;
+				scissor.top = static_cast<LONG>(tile_y) + layout->route[dk].y;
+				scissor.right = scissor.left + static_cast<LONG>(layout->route[dk].w);
+				scissor.bottom = scissor.top + static_cast<LONG>(layout->route[dk].h);
+			}
+
+			cmd_list->RSSetViewports(1, &vp);
 			cmd_list->RSSetScissorRects(1, &scissor);
 
 			if (draw_log && is_zone) {
@@ -3500,6 +3614,9 @@ comp_d3d12_renderer_compute_effective_layout(struct comp_d3d12_renderer *rendere
 	}
 
 	out_layout->views = views;
+	// Multi-screen M3: routing is decided by the compositor, after this.
+	out_layout->route_count = 0;
+	memset(out_layout->route, 0, sizeof(out_layout->route));
 	if (views == 1) {
 		out_layout->cols = 1;
 		out_layout->rows = 1;
@@ -3928,5 +4045,66 @@ comp_d3d12_renderer_flatten_local_2d(struct comp_d3d12_renderer *renderer,
 	src_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
 	cmd_list->ResourceBarrier(1, &src_barrier);
 
+	return XRT_SUCCESS;
+}
+
+
+extern "C" xrt_result_t
+comp_d3d12_renderer_blit_rect(struct comp_d3d12_renderer *renderer,
+                              void *cmd_list_ptr,
+                              void *srv_heap,
+                              uint64_t src_srv,
+                              uint32_t src_tex_w,
+                              uint32_t src_tex_h,
+                              int32_t src_x,
+                              int32_t src_y,
+                              uint32_t src_w,
+                              uint32_t src_h,
+                              uint64_t rtv,
+                              int32_t dst_x,
+                              int32_t dst_y,
+                              uint32_t dst_w,
+                              uint32_t dst_h)
+{
+	auto *cmd_list = static_cast<ID3D12GraphicsCommandList *>(cmd_list_ptr);
+	auto *heap = static_cast<ID3D12DescriptorHeap *>(srv_heap);
+	if (renderer == nullptr || cmd_list == nullptr || heap == nullptr || src_srv == 0 || rtv == 0 ||
+	    src_tex_w == 0 || src_tex_h == 0 || src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 ||
+	    renderer->blit_pso[0] == nullptr) {
+		return XRT_ERROR_D3D12;
+	}
+
+	ID3D12DescriptorHeap *heaps[] = {heap};
+	cmd_list->SetDescriptorHeaps(1, heaps);
+	cmd_list->SetGraphicsRootSignature(renderer->root_signature);
+	// Index 0 = the R8G8B8A8_UNORM pipeline, the DXGI back buffer's format.
+	cmd_list->SetPipelineState(renderer->blit_pso[0]);
+	D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle;
+	rtv_handle.ptr = static_cast<SIZE_T>(rtv);
+	cmd_list->OMSetRenderTargets(1, &rtv_handle, FALSE, nullptr);
+	cmd_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+
+	D3D12_VIEWPORT vp = {};
+	vp.TopLeftX = static_cast<float>(dst_x);
+	vp.TopLeftY = static_cast<float>(dst_y);
+	vp.Width = static_cast<float>(dst_w);
+	vp.Height = static_cast<float>(dst_h);
+	vp.MinDepth = 0.0f;
+	vp.MaxDepth = 1.0f;
+	cmd_list->RSSetViewports(1, &vp);
+	D3D12_RECT sc = {dst_x, dst_y, dst_x + static_cast<LONG>(dst_w), dst_y + static_cast<LONG>(dst_h)};
+	cmd_list->RSSetScissorRects(1, &sc);
+
+	D3D12_GPU_DESCRIPTOR_HANDLE gpu;
+	gpu.ptr = src_srv;
+	cmd_list->SetGraphicsRootDescriptorTable(0, gpu);
+	const float src_rect[4] = {
+	    static_cast<float>(src_x) / static_cast<float>(src_tex_w),
+	    static_cast<float>(src_y) / static_cast<float>(src_tex_h),
+	    static_cast<float>(src_w) / static_cast<float>(src_tex_w),
+	    static_cast<float>(src_h) / static_cast<float>(src_tex_h),
+	};
+	cmd_list->SetGraphicsRoot32BitConstants(1, 4, src_rect, 0);
+	cmd_list->DrawInstanced(4, 1, 0, 0);
 	return XRT_SUCCESS;
 }

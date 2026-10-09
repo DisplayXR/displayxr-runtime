@@ -18,6 +18,8 @@ if(WIN32 AND XRT_HAVE_D3D12)
 		comp_d3d12_outcomp.h
 		comp_d3d12_renderer.cpp
 		comp_d3d12_renderer.h
+		comp_d3d12_segments.cpp
+		comp_d3d12_segments.h
 		comp_d3d12_swapchain.cpp
 		comp_d3d12_swapchain.h
 		comp_d3d12_target.cpp

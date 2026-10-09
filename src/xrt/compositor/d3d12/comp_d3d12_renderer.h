@@ -41,6 +41,27 @@ struct comp_d3d12_eff_layout
 	uint32_t rows;   //!< atlas tile rows
 	uint32_t tile_w; //!< per-tile width in pixels
 	uint32_t tile_h; //!< per-tile height in pixels
+
+	/*!
+	 * Multi-screen M3 (Windows D3D12, the twin of comp_d3d11_eff_layout's):
+	 * per-segment views. 0 = one view set fills every tile (the only case
+	 * before M3). Otherwise the projection layer carries one view set per
+	 * window segment and each tile is a MOSAIC: local view j of segment k is
+	 * placed at that segment's rect inside tile j, so cropping a segment's
+	 * rect out of every tile (comp_d3d12_segments) yields exactly that
+	 * segment's own views. Quads and equirect2 layers are drawn once per
+	 * segment with that segment's camera; zones are not routed. Filled by
+	 * the compositor after comp_d3d12_renderer_compute_effective_layout
+	 * (which zeroes it).
+	 */
+	uint32_t route_count;
+	struct
+	{
+		uint32_t first_view; //!< first layer view of the segment
+		uint32_t view_count; //!< its views (<= @ref views)
+		int32_t x, y;        //!< the segment's rect inside a tile, tile px
+		uint32_t w, h;
+	} route[XRT_MAX_SEGMENTS];
 };
 
 /*!
@@ -163,6 +184,43 @@ comp_d3d12_renderer_draw_window_space_pass(struct comp_d3d12_renderer *renderer,
                                             uint32_t target_width,
                                             uint32_t target_height,
                                             const struct comp_d3d12_eff_layout *layout);
+
+/*!
+ * Multi-screen M6: linearly scale one rect of a texture into one rect of a
+ * render target — the flat-2D fill of a segment no DP can weave (and of the
+ * canvas no screen covers), the D3D12 twin of comp_d3d11_renderer_blit_rect.
+ * Opaque, no colour transform, through the renderer's UNORM blit pipeline
+ * (the DXGI back buffer's format). Records onto @p cmd_list: binds
+ * @p srv_heap, the root signature + pipeline, @p rtv, viewport + scissor =
+ * @p dst; the caller re-binds whatever it needs afterwards. The source must
+ * already be in PIXEL_SHADER_RESOURCE.
+ *
+ * @param cmd_list   ID3D12GraphicsCommandList*.
+ * @param srv_heap   ID3D12DescriptorHeap* holding @p src_srv (shader-visible).
+ * @param src_srv    The source's SRV, D3D12_GPU_DESCRIPTOR_HANDLE::ptr.
+ * @param src_tex_w,src_tex_h  The source texture's size.
+ * @param src_x,src_y,src_w,src_h  Source rect in source texels.
+ * @param rtv        D3D12_CPU_DESCRIPTOR_HANDLE::ptr of the destination.
+ * @param dst_x,dst_y,dst_w,dst_h  Destination rect in target pixels.
+ *
+ * @ingroup comp_d3d12
+ */
+xrt_result_t
+comp_d3d12_renderer_blit_rect(struct comp_d3d12_renderer *renderer,
+                              void *cmd_list,
+                              void *srv_heap,
+                              uint64_t src_srv,
+                              uint32_t src_tex_w,
+                              uint32_t src_tex_h,
+                              int32_t src_x,
+                              int32_t src_y,
+                              uint32_t src_w,
+                              uint32_t src_h,
+                              uint64_t rtv,
+                              int32_t dst_x,
+                              int32_t dst_y,
+                              uint32_t dst_w,
+                              uint32_t dst_h);
 
 /*!
  * Get the atlas texture SRV GPU descriptor handle for weaving.

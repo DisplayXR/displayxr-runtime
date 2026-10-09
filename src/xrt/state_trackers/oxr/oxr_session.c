@@ -4172,11 +4172,11 @@ locate_views_one(struct oxr_logger *log,
  */
 
 //! The compositor's segment table, when this session's compositor segments its
-//! window (in-process Vulkan on desktop Linux, in-process D3D11 on Windows, the
-//! D3D11 service for a Windows IPC session that enabled it — one round trip,
-//! only on a box with two DP-backed screens). Everything else — the other
-//! native compositors, every other service session — answers false and keeps
-//! one view set.
+//! window (in-process Vulkan on desktop Linux, in-process D3D11 / D3D12 on
+//! Windows, the D3D11 service for a Windows IPC session that enabled it — one
+//! round trip, only on a box with two DP-backed screens). Everything else —
+//! the other native compositors, every other service session — answers false
+//! and keeps one view set.
 static bool
 locate_get_segment_metrics(struct oxr_session *sess, struct xrt_segment_metrics *out)
 {
@@ -4197,6 +4197,11 @@ locate_get_segment_metrics(struct oxr_session *sess, struct xrt_segment_metrics 
 #if defined(XRT_HAVE_METAL_NATIVE_COMPOSITOR) && defined(XRT_OS_MACOS)
 	if (sess->xcn != NULL && sess->is_metal_native_compositor) {
 		return comp_metal_compositor_get_segment_metrics(&sess->xcn->base, out) && out->count > 0;
+	}
+#endif
+#if defined(XRT_HAVE_D3D12_NATIVE_COMPOSITOR) && defined(XRT_OS_WINDOWS)
+	if (sess->xcn != NULL && sess->is_d3d12_native_compositor) {
+		return comp_d3d12_compositor_get_segment_metrics(&sess->xcn->base, out) && out->count > 0;
 	}
 #endif
 	(void)sess;
@@ -6326,6 +6331,24 @@ oxr_session_create(struct oxr_logger *log,
 #endif
 		comp_ipc_client_compositor_segments_enable(&sess->xcn->base, pinned);
 		sess->seg_ipc = true;
+	}
+#endif
+
+#if defined(XRT_HAVE_D3D12_NATIVE_COMPOSITOR) && defined(XRT_OS_WINDOWS)
+	// Multi-screen M6: the same hand-off to the in-process D3D12 compositor
+	// (the Unity display provider's path) — per-segment DPs, windowless, phase
+	// from set_present_origin; the primary screen's DP keeps the real HWND.
+	if (sess->is_d3d12_native_compositor && sess->xcn != NULL) {
+		struct xrt_screen_list *screens = U_TYPED_CALLOC(struct xrt_screen_list);
+		if (screens != NULL) {
+			oxr_system_get_screens(sys, screens);
+			uint64_t pinned = 0;
+#ifdef OXR_HAVE_DXR_display_info
+			pinned = bound_display_id;
+#endif
+			comp_d3d12_compositor_set_screens(&sess->xcn->base, screens, &sys->xsysc->info, pinned);
+			free(screens);
+		}
 	}
 #endif
 

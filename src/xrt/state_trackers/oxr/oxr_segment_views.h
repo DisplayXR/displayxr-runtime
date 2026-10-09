@@ -52,6 +52,20 @@ oxr_segment_views_set_capacity(uint32_t screens_with_dp_factory, bool can_segmen
 }
 
 /*!
+ * Does one DP-registry entry give its screen a display processor a Windows
+ * in-process compositor can segment with? Both the D3D11 and the D3D12
+ * compositor segment windows (multi-screen M6), and the view-set capacity is
+ * per system, so a screen counts toward @ref oxr_segment_views_set_capacity
+ * when EITHER factory is set (the entry's `dp_factory_d3d11` /
+ * `dp_factory_d3d12`).
+ */
+static inline bool
+oxr_segment_views_win_entry_has_dp(const void *dp_factory_d3d11, const void *dp_factory_d3d12)
+{
+	return dp_factory_d3d11 != NULL || dp_factory_d3d12 != NULL;
+}
+
+/*!
  * The view count `PRIMARY_MULTIVIEW_DXR` reports: the device max per view set,
  * times the system's set capacity (@ref oxr_segment_views_set_capacity), capped
  * at @ref XRT_MAX_VIEWS. On a system that can never split a window (one screen

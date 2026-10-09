@@ -182,6 +182,46 @@ bool
 comp_d3d12_compositor_request_display_mode(struct xrt_compositor *xc, bool enable_3d);
 
 /*!
+ * Multi-screen M6 (ADR-047 D2 on Windows, D3D12): hand the compositor the
+ * system's screen list, so a window that spans several monitors is woven per
+ * segment, each by its own screen's display processor, into the one back
+ * buffer. Call once at session creation. @p pinned_display_id is the session's
+ * `XrSessionDisplayBindingDXR` (0 = none); a pinned session is never
+ * segmented. A window on the primary screen only keeps the single-DP path
+ * byte for byte. The D3D12 twin of comp_d3d11_compositor_set_screens.
+ *
+ * @ingroup comp_d3d12
+ */
+struct xrt_screen_list;
+void
+comp_d3d12_compositor_set_screens(struct xrt_compositor *xc,
+                                  const struct xrt_screen_list *list,
+                                  const struct xrt_system_compositor_info *info,
+                                  uint64_t pinned_display_id);
+
+/*!
+ * Multi-screen M3 (Windows D3D12): the segment table the last weave took, with
+ * each segment's eyes predicted NOW (the primary from the session's DP, the
+ * others from their segment DP), for xrLocateViews to frame per-segment
+ * views. Thread-safe against the weave. `out->count == 0` = one view set.
+ *
+ * @ingroup comp_d3d12
+ */
+bool
+comp_d3d12_compositor_get_segment_metrics(struct xrt_compositor *xc, struct xrt_segment_metrics *out);
+
+/*!
+ * Multi-screen M3 (Windows D3D12): which views of the next frame belong to
+ * which window segment — what the app's last xrLocateViews handed out. The
+ * renderer paints each segment's views into that segment's rect of every tile
+ * (a mosaic) and the segment path crops them out per screen. Thread-safe.
+ *
+ * @ingroup comp_d3d12
+ */
+void
+comp_d3d12_compositor_set_view_routing(struct xrt_compositor *xc, const struct xrt_segment_view_routing *routing);
+
+/*!
  * Select the eye-tracking control mode (MANAGED=0 / MANUAL=1) on the display
  * processor — the policy counterpart to @ref
  * comp_d3d12_compositor_request_display_mode. No-op if the DP doesn't react.
