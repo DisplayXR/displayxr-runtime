@@ -15,6 +15,7 @@
  */
 
 #include "os_display_edid.h"
+#include "os_display_edid_parse.h"
 
 #include <windows.h>
 #include <setupapi.h>
@@ -61,7 +62,11 @@ monitor_enum_proc(HMONITOR hMonitor, HDC hdcMonitor, LPRECT lprcMonitor, LPARAM 
  * Returns true if EDID was found and manufacturer/product IDs extracted.
  */
 static bool
-read_edid_from_regkey(HKEY hKey, uint16_t *out_manufacturer_id, uint16_t *out_product_id)
+read_edid_from_regkey(HKEY hKey,
+                      uint16_t *out_manufacturer_id,
+                      uint16_t *out_product_id,
+                      uint32_t *out_width_mm,
+                      uint32_t *out_height_mm)
 {
 	BYTE edid_buf[256];
 	DWORD edid_size = sizeof(edid_buf);
@@ -75,6 +80,15 @@ read_edid_from_regkey(HKEY hKey, uint16_t *out_manufacturer_id, uint16_t *out_pr
 	// EDID bytes 8-9: manufacturer ID, bytes 10-11: product ID
 	*out_manufacturer_id = *(uint16_t *)&edid_buf[8];
 	*out_product_id = *(uint16_t *)&edid_buf[10];
+
+	// Physical size (first detailed timing's mm, else base-block cm); 0 = unknown.
+	// A short or headerless blob still yields the ids above, just no size.
+	struct os_display_edid_parsed parsed;
+	*out_width_mm = 0;
+	*out_height_mm = 0;
+	if (os_display_edid_parse(edid_buf, edid_size, &parsed)) {
+		os_display_edid_parsed_mm(&parsed, out_width_mm, out_height_mm);
+	}
 	return true;
 }
 
@@ -378,6 +392,8 @@ os_display_edid_enumerate(struct os_display_edid_list *out_list)
 	{
 		uint16_t mfr_id;
 		uint16_t prod_id;
+		uint32_t width_mm; // EDID physical size, 0 = unknown
+		uint32_t height_mm;
 		char hwid[64]; // Extracted hardware ID (e.g., "AUO2E9A")
 	} setupdi_devices[OS_DISPLAY_EDID_MAX_MONITORS];
 	uint32_t setupdi_count = 0;     // devices that yielded a readable EDID blob
@@ -400,7 +416,8 @@ os_display_edid_enumerate(struct os_display_edid_list *out_list)
 		}
 
 		uint16_t mfr_id = 0, prod_id = 0;
-		bool got_edid = read_edid_from_regkey(hKey, &mfr_id, &prod_id);
+		uint32_t width_mm = 0, height_mm = 0;
+		bool got_edid = read_edid_from_regkey(hKey, &mfr_id, &prod_id, &width_mm, &height_mm);
 		RegCloseKey(hKey);
 
 		if (!got_edid) {
@@ -416,6 +433,8 @@ os_display_edid_enumerate(struct os_display_edid_list *out_list)
 		if (setupdi_count < OS_DISPLAY_EDID_MAX_MONITORS) {
 			setupdi_devices[setupdi_count].mfr_id = mfr_id;
 			setupdi_devices[setupdi_count].prod_id = prod_id;
+			setupdi_devices[setupdi_count].width_mm = width_mm;
+			setupdi_devices[setupdi_count].height_mm = height_mm;
 			extract_hardware_id(instance_id, setupdi_devices[setupdi_count].hwid,
 			                    sizeof(setupdi_devices[setupdi_count].hwid));
 			setupdi_count++;
@@ -452,6 +471,8 @@ os_display_edid_enumerate(struct os_display_edid_list *out_list)
 			struct os_display_edid_monitor *mon = &out_list->monitors[out_list->count];
 			mon->manufacturer_id = setupdi_devices[s].mfr_id;
 			mon->product_id = setupdi_devices[s].prod_id;
+			mon->physical_width_mm = setupdi_devices[s].width_mm;
+			mon->physical_height_mm = setupdi_devices[s].height_mm;
 			mon->screen_left = gdi_ctx.rects[g].left;
 			mon->screen_top = gdi_ctx.rects[g].top;
 			mon->pixel_width = (uint32_t)(gdi_ctx.rects[g].right - gdi_ctx.rects[g].left);

@@ -27,7 +27,7 @@ endif()
 # EDID-based display identification (vendor-neutral monitor enumeration)
 target_sources(aux_os PRIVATE os_display_edid.h)
 if(WIN32)
-	target_sources(aux_os PRIVATE os_display_edid_win32.c)
+	target_sources(aux_os PRIVATE os_display_edid_win32.c os_display_edid_parse.h os_display_edid_parse.c)
 	target_link_libraries(aux_os PRIVATE setupapi)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
 	# Desktop Linux (multi-screen M0): RandR monitors joined to DRM sysfs

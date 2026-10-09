@@ -51,6 +51,7 @@ set(tests
     tests_aux_zone_canvas
     tests_aux_tiling_zero_copy
     tests_aux_screen_info
+    tests_aux_display_edid_parse
     tests_aux_tiling_row_origin
     tests_aux_wayland_geom
     tests_comp_wl_move_sync_tag
@@ -280,6 +281,9 @@ target_link_libraries(tests_aux_tiling_zero_copy PRIVATE xrt-interfaces)
 # system-default / plug-in per-monitor slot / EDID-derived rules. Header only;
 # it reads the plug-in ABI structs, hence xrt-interfaces.
 target_link_libraries(tests_aux_screen_info PRIVATE xrt-interfaces)
+
+# Portable EDID parser (physical mm) shared by the Windows, Linux + macOS readers.
+target_link_libraries(tests_aux_display_edid_parse PRIVATE aux_os xrt-interfaces)
 
 # #1625 -- the atlas tile ROW ORIGIN: view 0 is the top-left tile as displayed,
 # on every backend. The GL-vs-everyone-else disagreement was two lines of
