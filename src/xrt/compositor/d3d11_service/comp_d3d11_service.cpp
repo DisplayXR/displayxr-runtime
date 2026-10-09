@@ -22,6 +22,7 @@
 #include "xrt/xrt_session.h"
 #include "xrt/xrt_display_processor_d3d11.h"
 #include "xrt/xrt_display_metrics.h"
+#include "xrt/xrt_display_status.h"
 
 // #1589/#1610: the shared format-honesty policy (hatch + fast-path predicate).
 #include "util/u_color_encoding.h"
@@ -31150,6 +31151,65 @@ comp_d3d11_service_get_render_diag(struct xrt_system_compositor *xsysc, struct c
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
 	std::lock_guard<std::mutex> lk(sys->render_diag_last_mutex);
 	*out = sys->render_diag_last;
+}
+
+extern "C" bool
+comp_d3d11_service_get_client_status(struct xrt_system_compositor *xsysc,
+                                     struct xrt_compositor *xc,
+                                     struct comp_d3d11_client_status *out)
+{
+	if (out == nullptr) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+	if (xsysc == nullptr || xc == nullptr || !comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return false;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+
+	// Lifetime: compositor_destroy leaves all_clients (under clients_mutex)
+	// before it frees anything, so holding clients_mutex across the whole read
+	// keeps a compositor found in it whole. Lock order render_mutex ->
+	// clients_mutex (the only order); the reads below re-enter render_mutex
+	// (recursive, already ours) and take seg_mutex (a leaf). Nothing they call
+	// takes clients_mutex.
+	render_mutex_fair_lock render_lock(sys);
+	std::lock_guard<std::mutex> reg(sys->clients_mutex);
+	bool found = false;
+	for (struct d3d11_service_compositor *other : sys->all_clients) {
+		if (other == c) {
+			found = true;
+			break;
+		}
+	}
+	if (!found) {
+		return false;
+	}
+	out->live = true;
+
+	switch (c->presenter) {
+	case PRESENTER_APP_HWND: out->presenter = XRT_STATUS_PRESENTER_APP_HWND; break;
+	case PRESENTER_CLIENT_TEXTURE: out->presenter = XRT_STATUS_PRESENTER_CLIENT_TEXTURE; break;
+	case PRESENTER_SERVICE_WINDOW: out->presenter = XRT_STATUS_PRESENTER_SERVICE_WINDOW; break;
+	case PRESENTER_SELF: out->presenter = XRT_STATUS_PRESENTER_SELF; break;
+	default: out->presenter = XRT_STATUS_PRESENTER_NONE; break;
+	}
+
+	struct xrt_eye_positions eyes;
+	memset(&eyes, 0, sizeof(eyes));
+	if (c->presenter != PRESENTER_NONE &&
+	    comp_d3d11_service_get_predicted_eye_positions_full_for_client(xsysc, xc, &eyes)) {
+		out->eyes_answered = true;
+		out->is_tracking = eyes.valid && eyes.is_tracking;
+	}
+	(void)comp_d3d11_service_get_client_window_metrics(xsysc, xc, &out->window);
+	(void)comp_d3d11_service_get_client_segment_metrics(xsysc, xc, &out->segments);
+	{
+		std::lock_guard<std::mutex> lk(c->seg_mutex);
+		out->owner_screen = comp_d3d11_segments_get_owner(c->segments);
+	}
+	return true;
 }
 
 extern "C" bool

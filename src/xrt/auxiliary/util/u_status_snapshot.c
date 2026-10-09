@@ -48,6 +48,8 @@ u_status_presenter_str(enum xrt_status_presenter p)
 	switch (p) {
 	case XRT_STATUS_PRESENTER_APP_HWND: return "APP_HWND";
 	case XRT_STATUS_PRESENTER_CLIENT_TEXTURE: return "CLIENT_TEXTURE";
+	case XRT_STATUS_PRESENTER_SERVICE_WINDOW: return "SERVICE_WINDOW";
+	case XRT_STATUS_PRESENTER_SELF: return "SELF";
 	default: return "NONE";
 	}
 }
@@ -445,6 +447,67 @@ u_status_warnings_derive(struct xrt_status_snapshot *snap)
 			                            U_STATUS_W_PLUGIN_NOT_READY, XRT_STATUS_LEVEL_CRITICAL, text);
 		}
 	}
+}
+
+
+/*
+ *
+ * Wire pieces (phase 2).
+ *
+ */
+
+void
+u_status_snapshot_get_head(const struct xrt_status_snapshot *snap, struct xrt_status_head *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (snap == NULL) {
+		return;
+	}
+	out->schema = snap->schema;
+	out->source = snap->source;
+	out->generation = snap->generation;
+	out->runtime = snap->runtime;
+	out->plugin_count = snap->plugin_count < XRT_STATUS_MAX_PLUGINS ? snap->plugin_count : XRT_STATUS_MAX_PLUGINS;
+	memcpy(out->plugins, snap->plugins, sizeof(out->plugins));
+	out->screen_count = snap->screen_count < XRT_STATUS_MAX_SCREENS ? snap->screen_count : XRT_STATUS_MAX_SCREENS;
+	out->client_count = snap->client_count < XRT_STATUS_MAX_CLIENTS ? snap->client_count : XRT_STATUS_MAX_CLIENTS;
+	for (uint32_t i = 0; i < out->client_count; i++) {
+		out->client_ids[i] = snap->clients[i].id;
+	}
+	out->workspace = snap->workspace;
+	out->warning_count =
+	    snap->warning_count < XRT_STATUS_MAX_WARNINGS ? snap->warning_count : XRT_STATUS_MAX_WARNINGS;
+	memcpy(out->warnings, snap->warnings, sizeof(out->warnings));
+}
+
+void
+u_status_snapshot_set_head(struct xrt_status_snapshot *snap, const struct xrt_status_head *head)
+{
+	memset(snap, 0, sizeof(*snap));
+	if (head == NULL) {
+		return;
+	}
+	snap->schema = head->schema;
+	snap->source = head->source;
+	snap->generation = head->generation;
+	snap->runtime = head->runtime;
+	snap->plugin_count = head->plugin_count < XRT_STATUS_MAX_PLUGINS ? head->plugin_count : XRT_STATUS_MAX_PLUGINS;
+	memcpy(snap->plugins, head->plugins, sizeof(snap->plugins));
+	snap->screen_count = head->screen_count < XRT_STATUS_MAX_SCREENS ? head->screen_count : XRT_STATUS_MAX_SCREENS;
+	snap->client_count = head->client_count < XRT_STATUS_MAX_CLIENTS ? head->client_count : XRT_STATUS_MAX_CLIENTS;
+	for (uint32_t i = 0; i < snap->client_count; i++) {
+		snap->clients[i].id = head->client_ids[i];
+	}
+	snap->workspace = head->workspace;
+	snap->warning_count =
+	    head->warning_count < XRT_STATUS_MAX_WARNINGS ? head->warning_count : XRT_STATUS_MAX_WARNINGS;
+	memcpy(snap->warnings, head->warnings, sizeof(snap->warnings));
+}
+
+bool
+u_status_generation_equal(const struct xrt_status_generation *a, const struct xrt_status_generation *b)
+{
+	return a->topology == b->topology && a->status == b->status;
 }
 
 

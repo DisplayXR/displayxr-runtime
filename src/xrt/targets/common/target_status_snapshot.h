@@ -23,6 +23,7 @@ extern "C" {
 
 struct xrt_instance;
 struct xrt_system_devices;
+struct xrt_dp_factory_registry;
 
 /*!
  * Build the snapshot a process starting now would get, in-process: runtime
@@ -48,6 +49,41 @@ void
 target_status_snapshot_build_headless(struct xrt_instance *xi,
                                       struct xrt_system_devices *xsysd,
                                       struct xrt_status_snapshot *out);
+
+/*!
+ * Build the authoritative snapshot inside the running service (ADR-051 D3,
+ * phase 2): the same identity rows as the headless builder, plus what only the
+ * service knows — `source = SERVICE`, the generation counters, the client
+ * rows, each screen's bound DPs, live tracking state (+ how long it has not
+ * tracked) and mode, and the workspace. Warnings are derived last, so
+ * TRACKER_DOWN and SEGMENT_FLAT_2D can fire.
+ *
+ * Registered with the IPC server as its status provider by the service target
+ * (`ipc_server_set_status_provider`), which gathers @p live and calls this
+ * lazily — on the first status RPC after a generation moved, never per frame.
+ *
+ * Passive (ADR-051 D5): reads the instance's screen list (under its own lock)
+ * and @p reg; re-probes nothing, creates no DP, tracker or window.
+ *
+ * @param xi   The service's instance (`xrt_instance_enumerate_displays`).
+ * @param reg  The service's DP registry (claim serials + per-API factories); may be NULL.
+ * @param live The service-only facts, gathered by the IPC server; may be NULL.
+ * @param out  Filled completely (zeroed first).
+ */
+void
+target_status_snapshot_build_service(struct xrt_instance *xi,
+                                     const struct xrt_dp_factory_registry *reg,
+                                     const struct xrt_status_live *live,
+                                     struct xrt_status_snapshot *out);
+
+/*!
+ * A key that moves when the plug-ins' load results / live platform states /
+ * hints change, or (with the ADR-051 D2 `get_screen_status` slot) any claiming
+ * plug-in's per-screen `change_counter` moves. The service folds it into its
+ * `topology` generation; cheap enough to sample at the status poll rate.
+ */
+uint64_t
+target_status_snapshot_change_key(const struct xrt_dp_factory_registry *reg);
 
 #ifdef __cplusplus
 }

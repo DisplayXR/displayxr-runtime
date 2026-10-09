@@ -952,6 +952,47 @@ void
 comp_d3d11_service_get_render_diag(struct xrt_system_compositor *xsysc, struct comp_d3d11_render_diag *out);
 
 /*!
+ * One client compositor's live facts for the display status snapshot
+ * (ADR-051 D3, phase 2) — what the `[HEALTH]` / `[RENDER]` structs do not
+ * carry per client.
+ *
+ * @ingroup comp_d3d11_service
+ */
+struct comp_d3d11_client_status
+{
+	//! The compositor is a live client of this service (false: everything below is zero).
+	bool live;
+	//! Who presents it, as an `enum xrt_status_presenter` value.
+	uint32_t presenter;
+	//! The DP that answers this client's eye query answered.
+	bool eyes_answered;
+	//! ...and reports a tracked viewer.
+	bool is_tracking;
+	//! The client's window (its canvas), as `system_get_client_window_metrics` reports it.
+	struct xrt_window_metrics window;
+	//! Screen whose DP holds the window handle (multi-screen owner), 0 = no segment manager.
+	uint64_t owner_screen;
+	//! The segment table the last direct weave took + per-segment eyes (count 0 = one view set).
+	struct xrt_segment_metrics segments;
+};
+
+/*!
+ * ADR-051: fill @p out for client compositor @p xc. Read-only and safe against
+ * the client's concurrent teardown: @p xc is dereferenced only after it is
+ * found in the service's live-client registry, which is held (under the
+ * render mutex) for the whole read, so a compositor being destroyed is either
+ * still whole or already skipped. Any IPC thread.
+ *
+ * @return false when @p xc is not (or no longer) a live client of this service.
+ *
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_get_client_status(struct xrt_system_compositor *xsysc,
+                                     struct xrt_compositor *xc,
+                                     struct comp_d3d11_client_status *out);
+
+/*!
  * #964 (D-5): is the COMPOSITOR the one focus authority right now?
  *
  * True on the always-on pipeline (i.e. always, unless DXR_LEGACY_STANDALONE=1):
