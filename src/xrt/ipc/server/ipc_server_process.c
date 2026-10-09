@@ -302,6 +302,9 @@ teardown_all(struct ipc_server *s)
 	// Before the instance: the camera threads call into the plug-in.
 	ipc_server_stereo_camera_destroy(&s->stereo_camera);
 
+	// ADR-051: the status snapshot (no threads; reads only on DIAG RPCs).
+	ipc_server_status_fini(s);
+
 	xrt_syscomp_destroy(&s->xsysc);
 
 	teardown_idevs(s);
@@ -626,6 +629,9 @@ init_all(struct ipc_server *s, enum u_logging_level log_level)
 	// XR_DXR_stereo_camera (ADR-043): the service owns every plug-in camera.
 	s->stereo_camera = ipc_server_stereo_camera_create(s->xinst);
 
+	// ADR-051 D3: the display status snapshot + generation counters.
+	ipc_server_status_init(s);
+
 	// Always succeeds.
 	init_idevs(s);
 	init_tracking_origins(s);
@@ -922,6 +928,9 @@ reprobe_run(struct ipc_server *s, const char *reason)
 	U_LOG_I("display re-probe (%s): re-evaluating display-processor selection.", reason != NULL ? reason : "?");
 	const bool was_fallback = s->xsysc->info.active_plugin_is_fallback;
 	s->xsysc->info.refresh_display_processors(&s->xsysc->info);
+	// ADR-051 D6: a world-event re-probe is a topology event (the next status
+	// read rebuilds the snapshot).
+	ipc_server_status_bump(s, true);
 	if (was_fallback && !s->xsysc->info.active_plugin_is_fallback) {
 		U_LOG_W("display re-probe (%s): adopted plug-in '%s' (was the fallback).",
 		        reason != NULL ? reason : "?", s->xsysc->info.active_plugin_id);
@@ -1714,6 +1723,8 @@ ipc_server_handle_client_connected(struct ipc_server *vs, xrt_ipc_handle_t ipc_h
 
 	// Increment the connected client counter
 	vs->global_state.connected_client_count++;
+	// ADR-051: a connect is a status event (leaf lock; safe under this one).
+	ipc_server_status_bump(vs, false);
 
 	// A client connected, so we're no longer in a delayed exit state
 	// (The delay thread will still check the client count before exiting)

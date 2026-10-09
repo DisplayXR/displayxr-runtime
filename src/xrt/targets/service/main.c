@@ -32,6 +32,7 @@
 #include "service_client_class.h" // #960
 
 #include "target_lists.h"
+#include "target_status_snapshot.h" // ADR-051 D3: the status provider
 
 // #950: run ipc_server_main under the structured-exception guard so an
 // exception escaping the main thread is recorded ([TERMINATE]) before it
@@ -53,6 +54,21 @@ service_main_body(void *p)
 }
 
 #include <string.h> // strcmp for --workspace flag
+
+/*!
+ * ADR-051 D3: the rows of the display status snapshot only this target can
+ * fill (the loader + screen registry live in targets/common, above the IPC
+ * server). Read lazily on DIAG status RPCs; never per frame.
+ */
+static void
+register_status_provider(void)
+{
+	static const struct ipc_server_status_provider provider = {
+	    .build = target_status_snapshot_build_service,
+	    .change_key = target_status_snapshot_change_key,
+	};
+	ipc_server_set_status_provider(&provider);
+}
 
 
 // Insert the on load constructor to init trace marker.
@@ -369,6 +385,7 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 	// #960: verify CONTROLLER (registered controller binary) / DIAG (runtime dir)
 	// class claims — facts only the service target can check.
 	ipc_server_set_client_class_verify_provider(service_client_class_verify);
+	register_status_provider();
 
 	// Same plumbing for the file-dialog capability bit so the IPC server can
 	// short-circuit `session_request_file_picker` when the active controller
@@ -469,6 +486,7 @@ main(int argc, char *argv[])
 	// #960: class verification (controller manifests are cross-platform; the
 	// orchestrator entry only exists on macOS).
 	ipc_server_set_client_class_verify_provider(service_client_class_verify);
+	register_status_provider();
 
 	struct ipc_server_main_info ismi = {
 	    .udgci =

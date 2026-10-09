@@ -530,6 +530,10 @@ struct ipc_server
 	//! XR_DXR_stereo_camera (ADR-043): the camera manager (never NULL once
 	//! the server is initialised; it may expose zero cameras).
 	struct ipc_server_stereo_camera *stereo_camera;
+
+	//! ADR-051 D3: the display status snapshot + generation counters
+	//! (`ipc_server_status.c`); NULL only if its allocation failed.
+	struct ipc_server_status *status;
 };
 
 
@@ -781,6 +785,69 @@ struct ipc_service_health
  */
 void
 ipc_server_get_health(struct ipc_server *s, struct ipc_service_health *out);
+
+/*!
+ * ADR-051 D3: what only the service TARGET can fill into a status snapshot
+ * (runtime identity, plug-ins, the screen rows — the loader lives in
+ * targets/common, above this library). Registered by the service's main;
+ * same lifetime model as the other `ipc_server_set_*_provider` hooks.
+ */
+struct ipc_server_status_provider
+{
+	//! `target_status_snapshot_build_service`: the whole snapshot from the
+	//! service's instance + DP registry + the live facts gathered here.
+	void (*build)(struct xrt_instance *xi,
+	              const struct xrt_dp_factory_registry *reg,
+	              const struct xrt_status_live *live,
+	              struct xrt_status_snapshot *out);
+	//! `target_status_snapshot_change_key`: moves with the plug-ins' load /
+	//! platform state and vendor change counters (folded into `topology`).
+	uint64_t (*change_key)(const struct xrt_dp_factory_registry *reg);
+};
+
+//! Register (or, with NULL, clear) the status provider.
+void
+ipc_server_set_status_provider(const struct ipc_server_status_provider *provider);
+
+/*!
+ * @name Display status snapshot (ADR-051 D3; `ipc_server_status.c`)
+ *
+ * The service-side snapshot behind the three session-free DIAG RPCs. The
+ * `topology` / `status` counters move on events (bump sites below, plus what a
+ * status read finds changed), with a 2 s floor; the snapshot is rebuilt lazily
+ * on the first piece read after a counter moved. Nothing here runs unless a
+ * DIAG consumer reads, and nothing logs.
+ * @{
+ */
+//! Allocate the status state (init_all).
+void
+ipc_server_status_init(struct ipc_server *s);
+//! Free it (teardown_all).
+void
+ipc_server_status_fini(struct ipc_server *s);
+/*!
+ * Bump a counter from an event site (client connect / disconnect, display
+ * re-probe). Takes only a leaf lock: callable while holding anything.
+ */
+void
+ipc_server_status_bump(struct ipc_server *s, bool topology);
+//! `system_get_status_generation`.
+xrt_result_t
+ipc_server_status_get_generation(struct ipc_server *s, struct xrt_status_generation *out);
+//! `system_get_status_snapshot(screen_index)`: the head + one screen row (zeroed past the count).
+xrt_result_t
+ipc_server_status_get_snapshot_piece(struct ipc_server *s,
+                                     uint32_t screen_index,
+                                     struct xrt_status_head *out_head,
+                                     struct xrt_status_screen *out_screen);
+//! `system_get_client_segments(client_id)`: that client's row + raw segment table, at the snapshot's generation.
+xrt_result_t
+ipc_server_status_get_client(struct ipc_server *s,
+                             uint32_t client_id,
+                             struct xrt_status_client *out_client,
+                             struct xrt_segment_metrics *out_metrics,
+                             struct xrt_status_generation *out_generation);
+/*! @} */
 
 /*!
  * #960: per-class admission quota (ADR-035 D6). CONTROLLER 1, RELAY 1,

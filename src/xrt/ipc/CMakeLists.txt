@@ -125,6 +125,7 @@ add_library(
 	server/ipc_server_peer_creds.c
 	server/ipc_server_peer_creds.h
 	server/ipc_server_process.c
+	server/ipc_server_status.c
 	server/ipc_server_stereo_camera.c
 	server/ipc_server_stereo_camera.h
 	)
