@@ -2672,13 +2672,23 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 
 	/*
 	 * Multi-screen M6 (ADR-047 D2): does this window span monitors? Only off
-	 * the zero-copy path (the atlas must be ours to crop), off the #918 split
-	 * (the output adapter owns that pipeline), and for a whole-window canvas
-	 * (a zones / Local2D frame keeps the single-DP path — out of scope here).
-	 * A window on the primary screen only also stays single-DP, byte for byte.
+	 * the zero-copy path (the atlas must be ours to crop) and for a
+	 * whole-window canvas (a zones / Local2D frame keeps the single-DP path —
+	 * out of scope here). A window on the primary screen only stays single-DP,
+	 * byte for byte.
+	 *
+	 * The #918 weave-on-scanout split (ADR-039, the default on hybrid boxes)
+	 * takes the same path: everything here is already on the device that
+	 * presents. The primary DP was made on it, the segment manager is created
+	 * on d3d11_out_device() and hands its DPs d3d11_out_context(), and
+	 * atlas_srv is the egress slot being woven — the output-side copy of the
+	 * composed atlas, already cropped to the box that slot was painted at. A
+	 * slot one frame behind the window (the R2 resize lag) is cropped per
+	 * segment at its own view size against the live canvas, the same
+	 * one-frame lag the single-DP split weave has.
 	 */
 	bool seg_split = false;
-	if (!zero_copy && !c->split_active && !eff_canvas.valid && c->have_seg_window && c->seg_screens != nullptr &&
+	if (!zero_copy && !eff_canvas.valid && c->have_seg_window && c->seg_screens != nullptr &&
 	    atlas_srv != nullptr) {
 		if (c->seg_rebuild || c->segments == nullptr) {
 			// The app thread reads c->segments for eyes (M3): swap under the lock.
@@ -2692,6 +2702,17 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 				if (c->segments != nullptr) {
 					comp_d3d11_segments_set_screens(c->segments, c->seg_screens, c->seg_sys_info,
 					                                c->seg_pinned_display_id);
+				}
+				// Lifecycle (once per manager), split sessions only so the
+				// split-off WARN set is unchanged: names the device the
+				// segment DPs are made on, the rig's proof they present.
+				if (c->segments != nullptr && c->split_active &&
+				    comp_d3d11_segments_enabled(c->segments)) {
+					U_LOG_W(
+					    "segments: under the #918 output-device split — segment DPs are created on "
+					    "the OUTPUT device (LUID=%08lx:%08lx, device %p) and weave the egress slot",
+					    (unsigned long)c->out_luid.HighPart, (unsigned long)c->out_luid.LowPart,
+					    (void *)c->out_dev);
 				}
 			}
 		}
@@ -2748,7 +2769,7 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 		sf.transparent_background = c->transparent_background;
 		sf.atlas_encoding = -1; // the in-process D3D11 path declares none to the primary either
 		sf.primary_dp = c->display_processor;
-		sf.renderer = c->renderer;
+		sf.outcomp = c->outcomp; // on the output device, like the target
 		comp_d3d11_segments_record(c->segments, &sf);
 		// The segment path leaves the back buffer bound at full viewport;
 		// re-bind through the target so everything after sees exactly the
