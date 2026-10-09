@@ -316,7 +316,8 @@ TEST_CASE("plug-in iface: camera slots are appended after lift and platform-stat
 	// camera block, M2 create_dp_vk_for_screen right after that, and M6
 	// (Windows) create_dp_d3d11_for_screen right after that, the macOS
 	// segments create_dp_metal_for_screen right after that, then M6 D3D12
-	// create_dp_d3d12_for_screen right after that; it now ends the struct.
+	// create_dp_d3d12_for_screen right after that, then the ADR-051 dashboard
+	// get_screen_status right after that; it now ends the struct.
 	CHECK(offsetof(xrt_plugin_iface, get_display_info_for_monitor) ==
 	      offsetof(xrt_plugin_iface, stereo_camera_close) + sizeof(void *));
 	CHECK(offsetof(xrt_plugin_iface, create_dp_vk_for_screen) ==
@@ -327,12 +328,38 @@ TEST_CASE("plug-in iface: camera slots are appended after lift and platform-stat
 	      offsetof(xrt_plugin_iface, create_dp_d3d11_for_screen) + sizeof(void *));
 	CHECK(offsetof(xrt_plugin_iface, create_dp_d3d12_for_screen) ==
 	      offsetof(xrt_plugin_iface, create_dp_metal_for_screen) + sizeof(void *));
-	CHECK(offsetof(xrt_plugin_iface, create_dp_d3d12_for_screen) + sizeof(void *) == sizeof(xrt_plugin_iface));
+	CHECK(offsetof(xrt_plugin_iface, get_screen_status) ==
+	      offsetof(xrt_plugin_iface, create_dp_d3d12_for_screen) + sizeof(void *));
+	CHECK(offsetof(xrt_plugin_iface, get_screen_status) + sizeof(void *) == sizeof(xrt_plugin_iface));
 
 	xrt_plugin_iface iface{};
 	iface.struct_size = (uint32_t)offsetof(xrt_plugin_iface, stereo_camera_enumerate);
 	CHECK_FALSE(xrt_plugin_iface_has_stereo_camera(&iface)); // an older plug-in
 	CHECK_FALSE(xrt_plugin_iface_has_stereo_camera(nullptr));
+}
+
+static xrt_result_t
+fake_get_screen_status(xrt_plugin_instance *, uint64_t, xrt_plugin_screen_status *)
+{
+	return XRT_SUCCESS;
+}
+
+TEST_CASE("plug-in iface: get_screen_status is struct_size-gated (ADR-051 D2)", "[stereo_camera]")
+{
+	xrt_plugin_iface iface{};
+	iface.get_screen_status = fake_get_screen_status;
+	// A plug-in built before the slot: its struct ends at create_dp_d3d12_for_screen.
+	iface.struct_size = (uint32_t)offsetof(xrt_plugin_iface, get_screen_status);
+	CHECK_FALSE(xrt_plugin_iface_has_get_screen_status(&iface));
+	iface.struct_size = (uint32_t)sizeof(xrt_plugin_iface);
+	CHECK(xrt_plugin_iface_has_get_screen_status(&iface));
+	iface.get_screen_status = nullptr; // full size, slot left NULL = no vendor status
+	CHECK_FALSE(xrt_plugin_iface_has_get_screen_status(&iface));
+	CHECK_FALSE(xrt_plugin_iface_has_get_screen_status(nullptr));
+	// The status cell's own size is ABI the vendor builds against.
+	STATIC_REQUIRE(sizeof(xrt_plugin_screen_status) == 1288);
+	STATIC_REQUIRE(offsetof(xrt_plugin_screen_status, warnings) == 96);
+	STATIC_REQUIRE(sizeof(xrt_plugin_screen_warning) == 129);
 }
 
 TEST_CASE("stereo camera value types agree with the plug-in encodings", "[stereo_camera]")
