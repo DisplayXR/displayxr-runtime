@@ -65,6 +65,7 @@ set(tests
     tests_oxr_layer_space
     tests_oxr_view_config_rule
     tests_oxr_segment_views
+    tests_segments_ipc
     tests_target_screen_pin
     tests_oxr_legacy_mode_rule
     tests_oxr_mode_fillable_rule
@@ -613,6 +614,21 @@ target_link_libraries(tests_comp_segments PRIVATE xrt-interfaces aux_util)
 target_sources(tests_oxr_segment_views PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr/oxr_segment_views.c)
 target_include_directories(tests_oxr_segment_views PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr)
 target_link_libraries(tests_oxr_segment_views PRIVATE xrt-interfaces aux_math)
+
+# Multi-screen on the service / IPC path (ADR-047 Amendment 2): the routed-view
+# mosaic placement and the change-only table publish (compositor/util), the
+# client's change-only routing send (oxr), and -- where the IPC protocol is
+# generated -- that the two new wire messages fit one IPC buffer.
+target_sources(tests_segments_ipc PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/comp_segments.c)
+target_include_directories(
+	tests_segments_ipc PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor
+	${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
+	)
+target_link_libraries(tests_segments_ipc PRIVATE xrt-interfaces aux_util)
+if(TARGET ipc_shared)
+	target_link_libraries(tests_segments_ipc PRIVATE ipc_shared)
+	target_compile_definitions(tests_segments_ipc PRIVATE DXR_TESTS_HAVE_IPC_PROTOCOL)
+endif()
 
 # Multi-screen M4 — DXR_SCREEN_PLUGIN (per-screen plug-in pin) and the per-monitor
 # winner rule of the DP registry, pure functions of target_screen_pin.c.
