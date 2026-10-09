@@ -4,12 +4,13 @@ setlocal enabledelayedexpansion
 :: ============================================================
 :: DisplayXR Local Build Script
 :: Downloads all dependencies on first run, then builds.
-:: Usage: scripts\build_windows.bat [generate|build|installer|test-apps|vs2022|all]
+:: Usage: scripts\build_windows.bat [generate|build|installer|test-apps|vs2022|dashboard|all]
 ::   generate   - CMake generate only (Ninja Multi-Config)
 ::   build      - Build runtime + install
 ::   installer  - Build runtime installer
 ::   test-apps  - Build all test apps
 ::   vs2022     - Generate Visual Studio 2022 solution (build_vs2022\XRT.sln)
+::   dashboard  - DisplayXR Dashboard only (dotnet publish; skipped with a WARN without dotnet)
 ::   all        - Everything (default)
 ::
 :: The DisplayXR Shell ships from a separate repo. Installer download:
@@ -152,8 +153,12 @@ echo.
 :: ============================================================
 if "%TARGET%"=="build" if exist "%REPO%build\build.ninja" goto :do_build
 if "%TARGET%"=="installer" if exist "%REPO%build\build.ninja" goto :do_installer
+:: The Avalonia dashboard lands in _package\bin first, so the installer packs it.
+call :build_dashboard
+
 if "%TARGET%"=="test-apps" goto :do_test_apps
 if "%TARGET%"=="vs2022" goto :do_vs2022
+if "%TARGET%"=="dashboard" goto :do_dashboard_only
 
 echo === CMake Generate ===
 cmake -S "%REPO%." -B "%REPO%build" -G "Ninja Multi-Config" ^
@@ -388,3 +393,27 @@ goto :done
 echo.
 echo === ALL DONE ===
 endlocal
+exit /b 0
+
+:do_dashboard_only
+call :build_dashboard
+goto :done
+
+:: ============================================================
+:: DisplayXR Dashboard (Avalonia / .NET, src\dashboard) - optional
+:: ============================================================
+:: Never fails the C build: no dotnet SDK is a WARN and a skip, and a failed
+:: publish is a WARN too (the installer then simply ships without it).
+:build_dashboard
+where dotnet >nul 2>nul
+if errorlevel 1 (
+    echo WARN: dotnet not found - skipping the DisplayXR Dashboard [install the .NET 9 SDK to build it]
+    exit /b 0
+)
+echo.
+echo === Building DisplayXR Dashboard [dotnet publish] ===
+dotnet publish "%REPO%src\dashboard\DisplayXR.Dashboard\DisplayXR.Dashboard.csproj" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:PublishTrimmed=false -p:EnableCompressionInSingleFile=true -o "%REPO%_package\bin" --nologo
+if errorlevel 1 (
+    echo WARN: DisplayXR Dashboard build FAILED - continuing without it
+)
+exit /b 0
