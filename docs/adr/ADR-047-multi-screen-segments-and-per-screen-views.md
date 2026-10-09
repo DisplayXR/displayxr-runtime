@@ -85,3 +85,22 @@ context), they weave the output-side copy of the composed atlas (the egress slot
 segment keeps its own viewport, scissor and present origin exactly as off the split. The
 split is not a separate segment path; the primary screen's DP keeps the real HWND. Detail:
 `docs/architecture/comp-segments.md` § *Windows / D3D11*.
+
+## Amendment 2 (2026-10-09): the HWND follows the majority segment
+
+Decision 2's "the real HWND goes to the majority-area segment's DP" ships on Windows D3D11
+(it first shipped with the HWND pinned to the primary screen's DP, David 2026-10-07). The
+owner is the segment with the largest window-px area, by the same rule that frames a single
+view set (`oxr_segment_views_majority` / `comp_segments_majority`). A hand-off is due only
+when another screen beats the owner by at least 20 % of the window's on-screen area (a
+60/40 dead band between two screens) continuously for 0.5 s, so a drag across a seam never
+flaps it; a target that fails is not retried until the majority leaves it. Because a weaver
+is one-per-HWND and a live DP's window is never re-pointed, the hand-off creates a
+windowless replacement for the old owner (the primary screen always keeps a DP, as the
+session's own), destroys the old owner's DP, then creates the new owner's DP with the HWND
+through `create_dp_d3d11_for_screen` — rolling back if that fails — all between two weaves,
+so a frame weaves with the old pair or the new pair and never with a gap. The windowless
+primary takes its phase from `set_present_origin` like any segment; drag snap, the window
+anchor and the hosted window's snap provider follow the owner. Eyes and view routing are
+unchanged: the primary screen's DP still serves the primary screen. Logic:
+`comp_segments_owner_*` (unit-tested); detail: `docs/architecture/comp-segments.md`.

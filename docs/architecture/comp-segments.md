@@ -163,12 +163,20 @@ deferred-release list because the immediate context executes in order). What dif
 - **Two appended ABI slots, no version bump** (ADR-020): `xrt_plugin_iface::create_dp_d3d11_for_screen`
   (the D3D11 twin of the Vulkan per-screen factory) and `xrt_display_processor_d3d11::set_present_origin`.
   A plug-in without them gets flat 2D on its other screens, exactly like Vulkan.
-- **The window.** The session's primary DP keeps the real HWND and so the vendor's drag phase-snap;
-  every other screen's DP is created with a NULL window and phases from `set_present_origin` + the
-  canvas offset. The vendor weaver reads the current D3D11 viewport **and scissor** and writes only
-  inside them, so the segment path sets both to the segment before every `process_atlas`, and the
-  back buffer is re-bound before every DP. (ADR-047's "HWND follows the majority segment" is a
-  follow-up: today the HWND stays with the primary screen's DP.)
+- **The window.** The real HWND, and so the vendor's drag phase-snap, belongs to the DP of the
+  screen holding the majority of the window (ADR-047 Amendment 2); every other screen's DP is
+  windowless and phases from `set_present_origin` + the canvas offset. It starts on the primary DP.
+  `comp_segments_owner_update` (pure, unit-tested) calls a hand-off when another screen beats the
+  owner by ≥ 20 % of the on-screen area for 0.5 s; `hwnd_handoff` then makes a windowless
+  replacement for the old owner (the primary is swapped through the compositor's `swap_primary`
+  hook, which re-sends transparency / mode / eye-tracking mode and guards the exchange with
+  `dp_swap_mutex`), destroys the old owner's DP, and makes the new owner's with the HWND — rolling
+  back on failure — between two weaves. While the primary is windowless the split path runs even
+  for a window back on the primary alone (it needs its present origin) until the hand-back. One
+  WARN per flip: `segments: window handle handed from '<dev>' to '<dev>' …` (or `… FAILED …`).
+  Only sessions with a real window hand off (not the shared-texture path). The vendor weaver reads
+  the current D3D11 viewport **and scissor** and writes only inside them, so the segment path sets
+  both to the segment before every `process_atlas`, and the back buffer is re-bound before every DP.
 - **Units.** The window rect comes from `ClientToScreen` in a per-monitor-DPI-aware process, i.e.
   device px — the same space as the registry's monitor rects. A DPI-virtualised origin would weave on
   the wrong lattice and look plausible (`docs/reference/dpi-awareness.md`).
