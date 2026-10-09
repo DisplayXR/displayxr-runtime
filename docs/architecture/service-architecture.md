@@ -371,6 +371,33 @@ closed with **no message to the client**. An evicted-but-alive client (#925 S4) 
 | Client-side loss | any RPC failure → `XRT_ERROR_IPC_FAILURE` → `has_lost` → `XR_ERROR_INSTANCE_LOST` at 43 sites; **no reconnect, no `InstanceLossPending`** | `oxr_xret.h:22-32` |
 | Per-client RPC serialisation | every `ipc_call_*` takes `ipc_c->mutex` for the whole round trip — a client's render and main threads share one pipe and one lock (why #924's app main thread sat in `NtWriteFile`) | `shared/proto.py:68-131` |
 
+**Display status snapshot (ADR-051 D3, dashboard phase 2).** The service owns one
+`xrt_status_snapshot` and two generation counters, `topology` (screens + plug-ins) and
+`status` (everything else), in `ipc_server_status.c`. Event sites bump them directly —
+client connect / disconnect (`status`) and the world-event display re-probe (`topology`) —
+under a leaf lock, so they are safe from any context. Every other input is compared on the
+reading consumer's own IPC thread: each status read re-gathers the cheap live facts (slot
+table + session flags, presenter, lease, window, segment-table generation, window-handle
+owner, each bound DP's backend state and `is_tracking`, the mode) and the screen list +
+plug-in state, bumps the counter whose inputs moved, and once per 2 s rebuilds the snapshot
+and bumps `status` only if its content changed. The snapshot is rebuilt lazily, on the first
+piece read after a counter moved; with no DIAG consumer nothing runs, and nothing on the
+20 Hz main loop or the render thread changed. The identity rows (runtime, plug-ins,
+screens) come from the service target's registered `ipc_server_status_provider`
+(`target_status_snapshot_build_service`, targets/common); the live facts come from
+`ipc_server_get_health`, `comp_d3d11_service_get_render_diag` and
+`comp_d3d11_service_get_client_status` (which validates the compositor against the
+live-client registry under `render_mutex` → `clients_mutex` before reading it). Three
+session-free RPCs, **DIAG class only** (`XRT_ERROR_NOT_AUTHORIZED` otherwise):
+`system_get_status_generation` → `{topology, status}`; `system_get_status_snapshot(screen_index)`
+→ the `xrt_status_head` (everything but the rows, plus client ids) and one screen row;
+`system_get_client_segments(client_id)` → one client row + its raw `xrt_segment_metrics`.
+Each reply is a fixed-size struct by value (the `system_enumerate_displays` mechanism) and
+carries the generation it belongs to, so a reader that straddles a rebuild refetches.
+`compositor_get_segment_metrics` stays own-session. Consumers: `displayxr-cli status`
+(`--watch` holds one DIAG slot and polls the counters), the Control Panel through it, MCP
+`get_status_snapshot` through the CLI.
+
 ---
 
 ## 3. Threads and locks
