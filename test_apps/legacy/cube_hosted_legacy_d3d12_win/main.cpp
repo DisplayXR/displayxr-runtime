@@ -146,18 +146,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         LOG_INFO("Enumerated %u D3D12 swapchain images", count);
     }
 
-    // Determine swapchain format for RTV creation.
+    // Determine the RTV format (ADR-044 / INV-4.6).
     //
-    // The runtime deliberately creates 8-bit colour swapchain resources as
-    // TYPELESS so it can pick the view interpretation itself
-    // (comp_d3d12_swapchain.cpp), and it then samples the atlas through an
-    // *_UNORM SRV -- no sRGB decode (comp_d3d12_compositor.cpp, "mirrors the
-    // GL skip-decode fix"). So the app must write raw UNORM to match.
-    //
-    // Resolving TYPELESS to *_UNORM_SRGB instead made the hardware sRGB-encode
-    // on write while the runtime still read the bytes as UNORM, double-encoding
-    // every colour: the 0.05/0.05/0.25 clear landed at #3F3F89 instead of
-    // #0D0D40, i.e. a washed-out purple rather than dark navy.
+    // CreateSwapchain() asked for an `_SRGB` swapchain (displayxr-common's
+    // default), and the runtime hands out TYPELESS resources. This app takes
+    // the "display-referred bytes, GPU sRGB-write OFF" row of ADR-044 section 2:
+    // the RTV is resolved to the plain *_UNORM sibling, so the shaders' authored
+    // colours and the 0.05/0.05/0.25 clear land verbatim, and the format-honest
+    // D3D12 compositor (>= v2.21.1) decodes the `_SRGB`-declared swapchain
+    // exactly once on sample. The shared d3d12_renderer keys its scene-linear
+    // PS variant on the RTV format it is given (#1882), so a UNORM RTV gets the
+    // raw variant here while cube_handle_d3d12_win's `_SRGB` RTV gets the
+    // decoding one -- both store the same bytes.
     DXGI_FORMAT rtvFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
     if (swapchainImages.size() > 0 && swapchainImages[0].texture != nullptr) {
         D3D12_RESOURCE_DESC desc = swapchainImages[0].texture->GetDesc();

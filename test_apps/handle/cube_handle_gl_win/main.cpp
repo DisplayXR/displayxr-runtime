@@ -597,7 +597,10 @@ static uint32_t g_quadTexSize = 256;
 static bool CreateAndFillQuadTexture(XrSessionManager& xr, uint32_t size) {
     XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
     sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-    sci.format = 0x8058; // GL_RGBA8
+    // ADR-044 / INV-4.6: the bytes below are display-referred and land by a raw
+    // glTexSubImage2D, so declare them GL_SRGB8_ALPHA8 (UNORM would be encoded
+    // a second time by the format-honest compositor).
+    sci.format = PickPanelFormat(xr.session, 0x8C43 /* GL_SRGB8_ALPHA8 */, 0x8058 /* GL_RGBA8 */);
     sci.sampleCount = 1;
     sci.width = size;
     sci.height = size;

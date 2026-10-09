@@ -712,10 +712,14 @@ static void PresentAndMaybeDump(RenderState& rs) {
 // ---------------------------------------------------------------------------
 
 // Pick the swapchain format the strip + zones use. Prefer the session's main
-// swapchain format (already chosen by CreateSwapchain). Falls back to BGRA8.
+// swapchain format (already chosen by CreateSwapchain -- `_SRGB` by default,
+// ADR-044 / INV-4.6). Falls back to the BGRA8 `_SRGB` code: the strip is
+// cleared through dxr::VkDisplayReferredClearColor() keyed on its own format
+// and the zones render with the same uLinearize rule as the main swapchain,
+// so a UNORM fallback would be read as LINEAR and encoded a second time.
 static int64_t PickZoneFormat(XrSessionManager& xr) {
     if (xr.swapchain.format != 0) return xr.swapchain.format;
-    return (int64_t)VK_FORMAT_B8G8R8A8_UNORM;
+    return (int64_t)VK_FORMAT_B8G8R8A8_SRGB;
 }
 
 // Find a memory type for the strip staging buffer.

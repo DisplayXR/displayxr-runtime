@@ -1503,13 +1503,20 @@ static bool CreateSwapchain(AppXrSession &app)
     XR_CHECK(xrEnumerateSwapchainFormats(app.session, formatCount, &formatCount, formats.data()));
 
     LOG_INFO("Supported swapchain formats:");
+    // ADR-044 / INV-4.6: prefer GL_SRGB8_ALPHA8, fall back to GL_RGBA8.
+    // The shaders write display-referred bytes with GL_FRAMEBUFFER_SRGB
+    // off, so an `_SRGB` swapchain stores exactly the authored bytes, honestly
+    // declared; the format-honest GL compositor (>= v2.21.2) reads a UNORM
+    // swapchain as LINEAR and encodes it -- the old GL_RGBA8 preference came
+    // out washed out there.
     int64_t selectedFormat = formats[0];
+    bool haveSrgb = false, haveRgba8 = false;
     for (auto f : formats) {
-        // Prefer GL_RGBA8 (0x8058) or GL_SRGB8_ALPHA8 (0x8C43)
-        if (f == 0x8058) { // GL_RGBA8
-            selectedFormat = f;
-        }
+        if (f == GL_SRGB8_ALPHA8) haveSrgb = true;
+        if (f == GL_RGBA8) haveRgba8 = true;
     }
+    if (haveSrgb) selectedFormat = GL_SRGB8_ALPHA8;
+    else if (haveRgba8) selectedFormat = GL_RGBA8;
     for (auto f : formats) {
         LOG_INFO("  format 0x%llx%s", (long long)f, f == selectedFormat ? " (selected)" : "");
     }
