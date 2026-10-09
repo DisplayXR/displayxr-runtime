@@ -73,6 +73,12 @@ target_link_libraries(
 # guard that builds the bridge is satisfied wherever this library builds at all.
 target_link_libraries(comp_d3d11_service PRIVATE comp_xbridge)
 
+# Multi-screen M6 on the service path: a direct (non-workspace) IPC client's
+# window spanning monitors is woven per screen by the in-process compositor's
+# own segment manager (comp_d3d11_segs, split out of comp_d3d11 for exactly
+# this). comp_util carries the backend-agnostic segment math (comp_segments.c).
+target_link_libraries(comp_d3d11_service PRIVATE comp_d3d11_segs comp_util)
+
 target_include_directories(comp_d3d11_service PRIVATE
 	${CMAKE_CURRENT_SOURCE_DIR}/..
 	${CMAKE_CURRENT_SOURCE_DIR}/../d3d11

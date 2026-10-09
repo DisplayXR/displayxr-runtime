@@ -273,6 +273,53 @@ comp_d3d11_service_get_client_app_window_metrics(struct xrt_system_compositor *x
                                                   struct xrt_compositor *xc,
                                                   struct xrt_window_metrics *out_metrics);
 
+struct xrt_screen_list;
+struct xrt_segment_metrics;
+struct xrt_segment_view_routing;
+
+/*!
+ * Multi-screen M6 over IPC (ADR-047 Amendment 2): enable per-screen weaving of
+ * this client's window. The IPC server passes the SERVICE's screen list (its
+ * own instance's `enumerate_displays`) and the session's
+ * `XrSessionDisplayBindingDXR` pin (0 = none; a pinned session is never
+ * segmented). The render thread builds the client's segment manager from it
+ * on its next direct weave; a client that never calls this is never
+ * segmented.
+ *
+ * @ingroup comp_d3d11_service
+ */
+void
+comp_d3d11_service_set_client_segment_screens(struct xrt_system_compositor *xsysc,
+                                              struct xrt_compositor *xc,
+                                              const struct xrt_screen_list *list,
+                                              uint64_t pinned_display_id);
+
+/*!
+ * Multi-screen M3 over IPC: the segment table the last direct weave of this
+ * client took (count 0 = one view set), with every segment's eyes predicted
+ * now — the primary screen's from the panel DP, the others from their segment
+ * DPs. What the client's `xrLocateViews` frames per-segment views from.
+ *
+ * @return true when the window is woven per segment.
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_get_client_segment_metrics(struct xrt_system_compositor *xsysc,
+                                              struct xrt_compositor *xc,
+                                              struct xrt_segment_metrics *out);
+
+/*!
+ * Multi-screen M3 over IPC: where each segment's views are in the client's
+ * next projection layer (what its last splitting `xrLocateViews` handed out;
+ * count 0 = unrouted). Sent change-only, ahead of the commit it applies to.
+ *
+ * @ingroup comp_d3d11_service
+ */
+void
+comp_d3d11_service_set_client_view_routing(struct xrt_system_compositor *xsysc,
+                                           struct xrt_compositor *xc,
+                                           const struct xrt_segment_view_routing *routing);
+
 /*!
  * Check if the compositor's window is still valid (not closed by user).
  *
