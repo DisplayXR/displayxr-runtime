@@ -878,6 +878,11 @@ client_dll_ok:
 	; Control Panel's only extra dep) is picked up by the *.dll sweep below.
 	File /nonfatal "${BIN_DIR}\displayxr-cli.exe"
 	File /nonfatal "${BIN_DIR}\displayxr-control-panel.exe"
+	; DisplayXR Dashboard (src/dashboard, Avalonia/.NET, ADR-051 D4): the
+	; Control Panel's successor, a self-contained single-file exe that, like
+	; the panel, only spawns displayxr-cli. /nonfatal: a build without the
+	; .NET SDK has no dashboard, and the installer still builds.
+	File /nonfatal "${BIN_DIR}\displayxr-dashboard.exe"
 
 	; Sweep a STRAY vulkan-1.dll left by any pre-#105 install (#1229).
 	;
@@ -1170,6 +1175,8 @@ Section "Start Menu Shortcuts" SecShortcuts
 	; Control Panel shortcut (replaces the retired Runtime Switcher — #378)
 	IfFileExists "$INSTDIR\displayxr-control-panel.exe" 0 +2
 		CreateShortCut "$SMPROGRAMS\DisplayXR\DisplayXR Control Panel.lnk" "$INSTDIR\displayxr-control-panel.exe"
+	IfFileExists "$INSTDIR\displayxr-dashboard.exe" 0 +2
+		CreateShortCut "$SMPROGRAMS\DisplayXR\DisplayXR Dashboard.lnk" "$INSTDIR\displayxr-dashboard.exe"
 
 	CreateShortCut "$SMPROGRAMS\DisplayXR\Uninstall DisplayXR.lnk" "$INSTDIR\Uninstall.exe"
 SectionEnd
@@ -1333,6 +1340,7 @@ Section "Uninstall"
 	Delete "$INSTDIR\displayxr-webxr-bridge.exe"
 	Delete "$INSTDIR\displayxr-cli.exe"
 	Delete "$INSTDIR\displayxr-control-panel.exe"
+	Delete "$INSTDIR\displayxr-dashboard.exe"
 	Delete "$INSTDIR\DisplayXR_win64.json"
 	Delete "$INSTDIR\install.log"
 
@@ -1371,6 +1379,7 @@ Section "Uninstall"
 	; Remove Start Menu shortcuts (workspace-controller shortcuts are
 	; removed by their own cascade-uninstaller; nothing left to clean here)
 	Delete "$SMPROGRAMS\DisplayXR\DisplayXR Control Panel.lnk"
+	Delete "$SMPROGRAMS\DisplayXR\DisplayXR Dashboard.lnk"
 	Delete "$SMPROGRAMS\DisplayXR\DisplayXR Runtime Switcher.lnk"
 	Delete "$SMPROGRAMS\DisplayXR\Uninstall DisplayXR.lnk"
 	RMDir "$SMPROGRAMS\DisplayXR"
