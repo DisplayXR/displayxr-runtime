@@ -177,6 +177,37 @@ comp_d3d11_outcomp_composite_2d_masked(struct comp_d3d11_outcomp *outcomp,
                                        uint32_t composite_mode,
                                        bool opaque_present);
 
+/*!
+ * Scaled rect blit on the unit's device: sample the @p src_w × @p src_h
+ * sub-rect at (@p src_x, @p src_y) of @p src_srv and write it, linearly
+ * scaled, into the @p dst_w × @p dst_h rect at (@p dst_x, @p dst_y) of
+ * @p rtv. Opaque, no scissor, no depth.
+ *
+ * The output-device twin of comp_d3d11_renderer_blit_rect, with the same
+ * shaders, sampler and fixed-function state, so the pixels are identical; it
+ * exists because the destination is the weave target, which under the #918
+ * split lives on the scanout device the renderer knows nothing about.
+ * Multi-screen M6 uses it for the flat-2D fill of segments that cannot be
+ * woven. The shaders are compiled on first use, so a session that never
+ * blits pays nothing.
+ *
+ * Leaves @p rtv bound and the viewport at the destination rect.
+ *
+ * @ingroup comp_d3d11
+ */
+xrt_result_t
+comp_d3d11_outcomp_blit_rect(struct comp_d3d11_outcomp *outcomp,
+                             void *src_srv,
+                             int32_t src_x,
+                             int32_t src_y,
+                             uint32_t src_w,
+                             uint32_t src_h,
+                             void *rtv,
+                             int32_t dst_x,
+                             int32_t dst_y,
+                             uint32_t dst_w,
+                             uint32_t dst_h);
+
 #ifdef __cplusplus
 }
 #endif

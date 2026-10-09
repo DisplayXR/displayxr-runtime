@@ -19,6 +19,7 @@
 
 #include "comp_d3d11_outcomp.h"
 #include "d3d_shared/comp_masked_composite_shaders.h"
+#include "d3d11_layer_shaders.h" // multi-screen M6: the rect blit reuses the renderer's shaders
 
 #include "util/u_logging.h"
 #include "util/u_misc.h"
@@ -169,6 +170,18 @@ struct comp_d3d11_outcomp
 	uint32_t weave_scratch_w, weave_scratch_h;
 	//! Grow events, reported once at destroy — the number #918 F10 is about.
 	uint64_t weave_scratch_reallocs;
+
+	/*!
+	 * Multi-screen M6: the scaled rect blit (@ref comp_d3d11_outcomp_blit_rect),
+	 * the renderer's projection shaders + linear sampler re-made on this
+	 * device. Created on first use; @ref blit_failed latches a failed create
+	 * so it is not retried every frame.
+	 */
+	ID3D11VertexShader *blit_vs;
+	ID3D11PixelShader *blit_ps;
+	ID3D11Buffer *blit_cb;
+	ID3D11SamplerState *sampler_linear;
+	bool blit_failed;
 };
 
 #define SAFE_RELEASE(p)                                                                                                \
@@ -400,6 +413,10 @@ comp_d3d11_outcomp_destroy(struct comp_d3d11_outcomp **outcomp_ptr)
 		}
 	}
 
+	SAFE_RELEASE(oc->sampler_linear);
+	SAFE_RELEASE(oc->blit_cb);
+	SAFE_RELEASE(oc->blit_ps);
+	SAFE_RELEASE(oc->blit_vs);
 	SAFE_RELEASE(oc->weave_scratch_srv);
 	SAFE_RELEASE(oc->weave_scratch);
 	SAFE_RELEASE(oc->depth_stencil_state);
@@ -618,5 +635,158 @@ comp_d3d11_outcomp_composite_2d_masked(struct comp_d3d11_outcomp *outcomp,
 	outcomp->ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
 
 	rtv->Release();
+	return XRT_SUCCESS;
+}
+
+/*!
+ * Create the blit's shaders, constant buffer and linear sampler on first use.
+ * The same HLSL and sampler desc as comp_d3d11_renderer's, so a flat-2D fill
+ * on the output device matches the one the renderer draws off the split.
+ */
+static bool
+outcomp_ensure_blit(struct comp_d3d11_outcomp *oc)
+{
+	if (oc->blit_vs != nullptr && oc->blit_ps != nullptr && oc->blit_cb != nullptr &&
+	    oc->sampler_linear != nullptr) {
+		return true;
+	}
+	if (oc->blit_failed) {
+		return false;
+	}
+	oc->blit_failed = true; // cleared on success below
+
+	ID3DBlob *blob = nullptr;
+	if (outcomp_compile_shader(projection_vs_source, "VSMain", "vs_5_0", &blob) != XRT_SUCCESS) {
+		U_LOG_E("D3D11 outcomp: blit vertex shader compile failed");
+		return false;
+	}
+	HRESULT hr =
+	    oc->dev->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &oc->blit_vs);
+	blob->Release();
+	if (FAILED(hr)) {
+		U_LOG_E("D3D11 outcomp: blit vertex shader create failed: 0x%08x", hr);
+		return false;
+	}
+	if (outcomp_compile_shader(projection_ps_source, "PSMain", "ps_5_0", &blob) != XRT_SUCCESS) {
+		U_LOG_E("D3D11 outcomp: blit pixel shader compile failed");
+		return false;
+	}
+	hr = oc->dev->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &oc->blit_ps);
+	blob->Release();
+	if (FAILED(hr)) {
+		U_LOG_E("D3D11 outcomp: blit pixel shader create failed: 0x%08x", hr);
+		return false;
+	}
+
+	D3D11_BUFFER_DESC cb = {};
+	cb.ByteWidth = sizeof(LayerConstants);
+	cb.Usage = D3D11_USAGE_DYNAMIC;
+	cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+	cb.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+	hr = oc->dev->CreateBuffer(&cb, nullptr, &oc->blit_cb);
+	if (FAILED(hr)) {
+		U_LOG_E("D3D11 outcomp: blit constant buffer create failed: 0x%08x", hr);
+		return false;
+	}
+
+	D3D11_SAMPLER_DESC sd = {};
+	sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+	sd.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+	sd.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+	sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+	hr = oc->dev->CreateSamplerState(&sd, &oc->sampler_linear);
+	if (FAILED(hr)) {
+		U_LOG_E("D3D11 outcomp: linear sampler create failed: 0x%08x", hr);
+		return false;
+	}
+	oc->blit_failed = false;
+	return true;
+}
+
+extern "C" xrt_result_t
+comp_d3d11_outcomp_blit_rect(struct comp_d3d11_outcomp *outcomp,
+                             void *src_srv,
+                             int32_t src_x,
+                             int32_t src_y,
+                             uint32_t src_w,
+                             uint32_t src_h,
+                             void *rtv,
+                             int32_t dst_x,
+                             int32_t dst_y,
+                             uint32_t dst_w,
+                             uint32_t dst_h)
+{
+	if (outcomp == nullptr || src_srv == nullptr || rtv == nullptr || src_w == 0 || src_h == 0 || dst_w == 0 ||
+	    dst_h == 0) {
+		return XRT_ERROR_D3D;
+	}
+	if (!outcomp_ensure_blit(outcomp)) {
+		return XRT_ERROR_D3D;
+	}
+	ID3D11DeviceContext *ctx = outcomp->ctx;
+	auto *srv = static_cast<ID3D11ShaderResourceView *>(src_srv);
+	auto *target_rtv = static_cast<ID3D11RenderTargetView *>(rtv);
+
+	// The source rect in normalised texture space needs the texture's size.
+	ID3D11Resource *res = nullptr;
+	srv->GetResource(&res);
+	if (res == nullptr) {
+		return XRT_ERROR_D3D;
+	}
+	D3D11_TEXTURE2D_DESC desc = {};
+	static_cast<ID3D11Texture2D *>(res)->GetDesc(&desc);
+	res->Release();
+	if (desc.Width == 0 || desc.Height == 0) {
+		return XRT_ERROR_D3D;
+	}
+
+	ctx->OMSetRenderTargets(1, &target_rtv, nullptr);
+	D3D11_VIEWPORT vp = {};
+	vp.TopLeftX = static_cast<float>(dst_x);
+	vp.TopLeftY = static_cast<float>(dst_y);
+	vp.Width = static_cast<float>(dst_w);
+	vp.Height = static_cast<float>(dst_h);
+	vp.MaxDepth = 1.0f;
+	ctx->RSSetViewports(1, &vp);
+	// Scissor is off in this rasterizer state; the viewport alone confines a
+	// fullscreen strip to the destination rect.
+	ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+	ctx->IASetInputLayout(nullptr);
+	ctx->VSSetShader(outcomp->blit_vs, nullptr, 0);
+	ctx->PSSetShader(outcomp->blit_ps, nullptr, 0);
+	ctx->RSSetState(outcomp->rasterizer_state);
+	ctx->OMSetDepthStencilState(outcomp->depth_stencil_state, 0);
+	ctx->OMSetBlendState(outcomp->blend_opaque, nullptr, 0xFFFFFFFF);
+	ctx->PSSetSamplers(0, 1, &outcomp->sampler_linear);
+	ctx->PSSetShaderResources(0, 1, &srv);
+
+	LayerConstants constants = {};
+	constants.mvp[0] = 1.0f;
+	constants.mvp[5] = 1.0f;
+	constants.mvp[10] = 1.0f;
+	constants.mvp[15] = 1.0f;
+	constants.post_transform[0] = static_cast<float>(src_x) / static_cast<float>(desc.Width);
+	constants.post_transform[1] = static_cast<float>(src_y) / static_cast<float>(desc.Height);
+	constants.post_transform[2] = static_cast<float>(src_w) / static_cast<float>(desc.Width);
+	constants.post_transform[3] = static_cast<float>(src_h) / static_cast<float>(desc.Height);
+	constants.color_scale[0] = 1.0f;
+	constants.color_scale[1] = 1.0f;
+	constants.color_scale[2] = 1.0f;
+	constants.color_scale[3] = 1.0f;
+
+	D3D11_MAPPED_SUBRESOURCE mapped;
+	HRESULT hr = ctx->Map(outcomp->blit_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+	if (FAILED(hr)) {
+		return XRT_ERROR_D3D;
+	}
+	memcpy(mapped.pData, &constants, sizeof(constants));
+	ctx->Unmap(outcomp->blit_cb, 0);
+	ctx->VSSetConstantBuffers(0, 1, &outcomp->blit_cb);
+	ctx->PSSetConstantBuffers(0, 1, &outcomp->blit_cb);
+
+	ctx->Draw(4, 0);
+
+	ID3D11ShaderResourceView *null_srv = nullptr;
+	ctx->PSSetShaderResources(0, 1, &null_srv);
 	return XRT_SUCCESS;
 }

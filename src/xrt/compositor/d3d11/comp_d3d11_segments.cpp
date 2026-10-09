@@ -17,7 +17,7 @@
 
 #include "comp_d3d11_segments.h"
 
-#include "comp_d3d11_renderer.h"
+#include "comp_d3d11_outcomp.h"
 #include "d3d/d3d_dxgi_formats.h"
 #include "os/os_threading.h"
 #include "util/u_logging.h"
@@ -655,7 +655,7 @@ comp_d3d11_segments_record(struct comp_d3d11_segments *segs, const struct comp_d
 		}
 	}
 	flat_n += comp_segments_uncovered(t, &f->canvas, &flat_dst[flat_n], COMP_SEGMENTS_MAX_UNCOVERED);
-	if (flat_n > 0 && f->renderer != nullptr) {
+	if (flat_n > 0 && f->outcomp != nullptr) {
 		const uint32_t views = f->tile_columns * f->tile_rows;
 		const uint32_t vi = views > 0 ? (views - 1) / 2 : 0;
 		const int32_t base_x = (int32_t)((vi % f->tile_columns) * f->view_width);
@@ -666,8 +666,8 @@ comp_d3d11_segments_record(struct comp_d3d11_segments *segs, const struct comp_d
 			if (!comp_segments_tile_rect(d, &f->canvas, f->view_width, f->view_height, &s)) {
 				continue; // thinner than one source pixel
 			}
-			comp_d3d11_renderer_blit_rect(f->renderer, src_srv, base_x + s.x, base_y + s.y, s.w, s.h, rtv,
-			                              d->x, d->y, d->w, d->h);
+			comp_d3d11_outcomp_blit_rect(f->outcomp, src_srv, base_x + s.x, base_y + s.y, s.w, s.h, rtv,
+			                             d->x, d->y, d->w, d->h);
 		}
 	}
 
