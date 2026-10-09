@@ -53,6 +53,7 @@ set(tests
     tests_aux_tiling_zero_copy
     tests_aux_screen_info
     tests_status_snapshot
+    tests_status_ipc
     tests_aux_display_edid_parse
     tests_aux_tiling_row_origin
     tests_aux_wayland_geom
@@ -288,6 +289,16 @@ target_link_libraries(tests_aux_screen_info PRIVATE xrt-interfaces)
 # ADR-051 -- the display status snapshot: §4 warning rules, §3 JSON shape, §7
 # text formatter (util/u_status_snapshot.h). Pure; synthetic snapshots only.
 target_link_libraries(tests_status_snapshot PRIVATE xrt-interfaces)
+
+# ADR-051 D3 (phase 2) -- the snapshot crosses the DIAG IPC path as head + one
+# screen row per system_get_status_snapshot reply + one client row per
+# system_get_client_segments reply; this round-trips a synthetic snapshot
+# through the generated message structs where the protocol is generated.
+target_link_libraries(tests_status_ipc PRIVATE xrt-interfaces)
+if(TARGET ipc_shared)
+	target_link_libraries(tests_status_ipc PRIVATE ipc_shared)
+	target_compile_definitions(tests_status_ipc PRIVATE DXR_TESTS_HAVE_IPC_PROTOCOL)
+endif()
 
 # Portable EDID parser (physical mm) shared by the Windows, Linux + macOS readers.
 target_link_libraries(tests_aux_display_edid_parse PRIVATE aux_os xrt-interfaces)
