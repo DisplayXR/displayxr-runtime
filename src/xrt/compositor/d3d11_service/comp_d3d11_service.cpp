@@ -959,7 +959,7 @@ struct d3d11_service_compositor
 	bool pipe_frame_ready;
 
 	/*!
-	 * Multi-screen M6/M3 on the service path (ADR-047 Amendment 2): this
+	 * Multi-screen M6/M3 on the service path (ADR-047 Amendment 3): this
 	 * client's window, when it spans monitors, is woven per screen by the
 	 * direct pipeline — the in-process compositor's segment manager, made on
 	 * the OUTPUT device. Opt-in: nothing here exists until the client sends
@@ -14028,7 +14028,7 @@ pipeline_return_app_grant(struct d3d11_multi_compositor *mc,
 
 /*
  *
- * Multi-screen M6/M3 on the service path (ADR-047 Amendment 2): a direct IPC
+ * Multi-screen M6/M3 on the service path (ADR-047 Amendment 3): a direct IPC
  * client's window that spans monitors, woven per screen.
  *
  */
@@ -14716,7 +14716,7 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		xrt_display_processor_d3d11_set_frame_timing(dp, mc->panel_r_ns,
 		                                             (uint64_t)(U_TIME_1S_IN_NS / sys->refresh_rate));
 		svc_assert_same_device(dp_input_srv, svc_out_device(sys));
-		// Multi-screen M6 (ADR-047 Amendment 2): a window across a seam is
+		// Multi-screen M6 (ADR-047 Amendment 3): a window across a seam is
 		// woven per screen; anything else (and every client that never
 		// enabled segments) takes the single weave below, unchanged.
 		if (!pipeline_segments_weave(sys, fc, kind, present_hwnd, present_rtv, dp, dp_input_srv, weave_view_w,
@@ -29730,7 +29730,7 @@ comp_d3d11_service_get_client_app_window_metrics(struct xrt_system_compositor *x
 
 /*
  *
- * Multi-screen M6/M3 over IPC (ADR-047 Amendment 2). The IPC server is the
+ * Multi-screen M6/M3 over IPC (ADR-047 Amendment 3). The IPC server is the
  * caller: it owns the screen registry handle (the server's instance) and the
  * client's connection; everything below runs on that client's IPC thread.
  *

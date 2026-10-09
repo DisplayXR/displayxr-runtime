@@ -40,7 +40,7 @@
 
 #include <openxr/XR_DXR_win32_window_binding.h>
 
-// Multi-screen M3 over IPC (ADR-047 Amendment 2): the routing hand-off to the
+// Multi-screen M3 over IPC (ADR-047 Amendment 3): the routing hand-off to the
 // D3D11 service. Declared here rather than via ipc_client.h (st_oxr does not
 // pull the ipc_client include path); the runtime links ipc_client.
 struct xrt_compositor;
@@ -3174,7 +3174,7 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 		comp_metal_compositor_set_view_routing(&sess->xcn->base, &route);
 	}
 #endif
-	// Multi-screen M3 over IPC (ADR-047 Amendment 2): the same hand-off to the
+	// Multi-screen M3 over IPC (ADR-047 Amendment 3): the same hand-off to the
 	// D3D11 service, change-only — the service keeps the last routing, so a
 	// window that stays split costs no extra round trip per frame. Sent ahead
 	// of this frame's layer_commit on the same connection, so it applies to it.

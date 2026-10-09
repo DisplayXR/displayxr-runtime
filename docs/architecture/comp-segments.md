@@ -305,7 +305,7 @@ pass; the blit fallback draws no quads at all).
 **IPC.** See *Service / IPC path* below: the D3D11 service publishes the same table for
 a direct client, and the client frames per-segment views from it exactly as above.
 
-## Service / IPC path (Windows, ADR-047 Amendment 2)
+## Service / IPC path (Windows, ADR-047 Amendment 3)
 
 An `_ipc` client (`XRT_FORCE_MODE=ipc`, or any app under a running service) is composited by
 `displayxr-service`. The same segment manager weaves its window there:

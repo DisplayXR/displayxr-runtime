@@ -615,7 +615,7 @@ target_sources(tests_oxr_segment_views PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/sta
 target_include_directories(tests_oxr_segment_views PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr)
 target_link_libraries(tests_oxr_segment_views PRIVATE xrt-interfaces aux_math)
 
-# Multi-screen on the service / IPC path (ADR-047 Amendment 2): the routed-view
+# Multi-screen on the service / IPC path (ADR-047 Amendment 3): the routed-view
 # mosaic placement and the change-only table publish (compositor/util), the
 # client's change-only routing send (oxr), and -- where the IPC protocol is
 # generated -- that the two new wire messages fit one IPC buffer.

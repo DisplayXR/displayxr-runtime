@@ -240,7 +240,7 @@ comp_ipc_client_compositor_get_window_metrics(struct xrt_compositor *xc, struct 
 }
 
 /*
- * Multi-screen M6/M3 over IPC (ADR-047 Amendment 2). Same gating contract as
+ * Multi-screen M6/M3 over IPC (ADR-047 Amendment 3). Same gating contract as
  * comp_ipc_client_compositor_get_window_metrics. See ipc_client.h.
  */
 void

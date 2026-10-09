@@ -149,7 +149,7 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         self.assertEqual(call.out_handles.arg_names, ("handles", "handle_count"))
 
     def test_segment_calls_are_appended(self):
-        # Multi-screen on the service path (ADR-047 Amendment 2): the three
+        # Multi-screen on the service path (ADR-047 Amendment 3): the three
         # calls ride at the END of proto.json, so every earlier command keeps
         # its enum value (append-only; the u_git_tag gate refuses a skewed
         # client/service pair at connect anyway).

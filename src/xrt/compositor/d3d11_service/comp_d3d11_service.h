@@ -278,7 +278,7 @@ struct xrt_segment_metrics;
 struct xrt_segment_view_routing;
 
 /*!
- * Multi-screen M6 over IPC (ADR-047 Amendment 2): enable per-screen weaving of
+ * Multi-screen M6 over IPC (ADR-047 Amendment 3): enable per-screen weaving of
  * this client's window. The IPC server passes the SERVICE's screen list (its
  * own instance's `enumerate_displays`) and the session's
  * `XrSessionDisplayBindingDXR` pin (0 = none; a pinned session is never

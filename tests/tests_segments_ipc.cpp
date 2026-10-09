@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief Multi-screen segments on the service / IPC path (ADR-047 Amendment 2):
+ * @brief Multi-screen segments on the service / IPC path (ADR-047 Amendment 3):
  *        the routed-view placement the D3D11 service paints its atlas mosaic
  *        with, the change-only publish of the segment table, the client's
  *        change-only routing send, and the wire messages that carry both.

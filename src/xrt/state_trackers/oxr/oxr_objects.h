@@ -2886,7 +2886,7 @@ struct oxr_session
 	//! Last per-segment view layout logged (one INFO line per change).
 	struct xrt_segment_view_routing seg_route_logged;
 	/*!
-	 * Multi-screen over IPC (ADR-047 Amendment 2): this service session asked
+	 * Multi-screen over IPC (ADR-047 Amendment 3): this service session asked
 	 * the service to segment its window (compositor_segments_enable), so its
 	 * locates fetch the service's segment table and its frames send the
 	 * routing — only on a box whose service can segment at all.
