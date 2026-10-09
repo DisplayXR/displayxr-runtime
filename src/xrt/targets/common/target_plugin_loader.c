@@ -3693,26 +3693,35 @@ fill_registry_entry(struct xrt_dp_registry_entry *e,
 #if !defined(XRT_OS_WINDOWS) && !defined(XRT_OS_ANDROID)
 /*!
  * POSIX: does the active plug-in, on its own, already decide every monitor?
- * True when it claims every descriptor and no OTHER plug-in is pinned as
- * preferred. The active plug-in wins every monitor it claims (#1521), and a
- * preferred plug-in is the only thing that outranks it — so when both hold,
- * loading and probing every other installed plug-in cannot change a single
- * registry entry. It would only dlopen them, run their vendor probes (Leia's
- * reaches the SR service and the shared panel), and keep their instances.
- * Typical cases: `XRT_PREFERRED_PLUGIN_ID=sim-display`, or sim-display active
- * because no vendor plug-in is installed.
+ * The active plug-in wins every monitor it claims, at any confidence (#1521),
+ * and only two things outrank it: a different PreferredPlugin, and a
+ * `DXR_SCREEN_PLUGIN` pin naming a different plug-in for that monitor. When it
+ * claims every descriptor and neither applies, loading and probing every other
+ * installed plug-in cannot change a single registry entry. It would only
+ * dlopen them, run their vendor probes (Leia's reaches the SR service and the
+ * shared panel), and keep their instances. Typical cases:
+ * `XRT_PREFERRED_PLUGIN_ID=sim-display`, or sim-display active because no
+ * vendor plug-in is installed.
+ *
+ * The pin check matters: `XRT_PREFERRED_PLUGIN_ID=sim-display
+ * DXR_SCREEN_PLUGIN=HDMI-1=leia-sr` (the documented sim-session-with-a-woven-
+ * DS1 recipe) needs leia-sr loaded as a claim source, or the pin finds no
+ * leia-sr claim and is ignored. The decision itself is the pure
+ * target_screen_active_decides_every_monitor() (unit-tested). Caller holds
+ * @ref g_refresh_mutex (the monitor side table).
  */
 static bool
 active_plugin_decides_every_monitor(const struct xrt_display_descriptor *descs, uint32_t n)
 {
-	if (g_active_iface == NULL || descs == NULL || n == 0) {
+	if (g_active_iface == NULL || g_active_iface->id == NULL || descs == NULL || n == 0) {
 		return false;
 	}
 	char preferred[64] = {0};
-	if (target_plugin_get_preferred(preferred, sizeof(preferred)) &&
-	    (g_active_iface->id == NULL || strcmp(preferred, g_active_iface->id) != 0)) {
-		return false; // a different plug-in is pinned: it may outrank the active one
-	}
+	const bool have_preferred = target_plugin_get_preferred(preferred, sizeof(preferred));
+
+	struct target_screen_pins pins;
+	target_screen_pin_parse(getenv("DXR_SCREEN_PLUGIN"), &pins, NULL);
+
 	const struct plugin_display_source active = {
 	    .iface = g_active_iface,
 	    .inst = g_active_instance,
@@ -3720,16 +3729,27 @@ active_plugin_decides_every_monitor(const struct xrt_display_descriptor *descs, 
 	};
 	struct xrt_display_claim claims[XRT_DP_REGISTRY_MAX_ENTRIES];
 	const uint32_t cn = query_source_claims(&active, descs, n, claims, XRT_DP_REGISTRY_MAX_ENTRIES);
-	for (uint32_t d = 0; d < n; d++) {
-		bool claimed = false;
-		for (uint32_t c = 0; c < cn && !claimed; c++) {
-			claimed = claims[c].monitor_id == descs[d].monitor_id;
+
+	struct target_screen_monitor mons[XRT_DP_REGISTRY_MAX_ENTRIES];
+	const uint32_t mn = n < XRT_DP_REGISTRY_MAX_ENTRIES ? n : XRT_DP_REGISTRY_MAX_ENTRIES;
+	for (uint32_t d = 0; d < mn; d++) {
+		mons[d].monitor_id = descs[d].monitor_id;
+		mons[d].output_name = "";
+		mons[d].connector = "";
+		mons[d].active_claims = false;
+		for (uint32_t c = 0; c < cn && !mons[d].active_claims; c++) {
+			mons[d].active_claims = claims[c].monitor_id == descs[d].monitor_id;
 		}
-		if (!claimed) {
-			return false;
+		for (uint32_t i = 0; i < g_monitor_side_count; i++) {
+			if (g_monitor_side[i].monitor_id == descs[d].monitor_id) {
+				mons[d].output_name = g_monitor_side[i].mon.output_name;
+				mons[d].connector = g_monitor_side[i].mon.connector;
+				break;
+			}
 		}
 	}
-	return true;
+	return target_screen_active_decides_every_monitor(g_active_iface->id, have_preferred ? preferred : NULL, &pins,
+	                                                  mons, mn);
 }
 #endif
 

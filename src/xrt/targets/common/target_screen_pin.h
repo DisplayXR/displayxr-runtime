@@ -110,6 +110,41 @@ target_screen_pick(const struct target_screen_candidate *cands,
                    enum target_screen_pick_reason *out_reason,
                    bool *out_pin_unclaimed);
 
+/*!
+ * One monitor of a resolve, as the source-set shortcut sees it: its names (for
+ * the pin match; either may be NULL/"") and whether the ACTIVE plug-in has a
+ * claim on it, at any confidence.
+ */
+struct target_screen_monitor
+{
+	uint64_t monitor_id;
+	const char *output_name;
+	const char *connector;
+	bool active_claims;
+};
+
+/*!
+ * Can the active plug-in alone decide every monitor, so that no other plug-in
+ * need be loaded as a claim source (POSIX, efa3f88d0)? Mirrors
+ * @ref target_screen_pick: no other plug-in can win a monitor the active one
+ * claims unless it is the PreferredPlugin or a `DXR_SCREEN_PLUGIN` pin names it
+ * for that monitor. So this is true only when @p active_id claims every monitor,
+ * @p preferred is NULL/"" or the active plug-in itself (exact match, as in
+ * target_screen_pick), and no pin that matches one of @p mons names a different
+ * plug-in (case-insensitive, as in target_screen_pick).
+ *
+ * Claim confidence is deliberately NOT consulted: rule 3 (the active plug-in,
+ * #1521) is confidence-blind, so a FALLBACK claim by the active plug-in beats a
+ * VERIFIED one from any other plug-in. Loading the others could not change the
+ * outcome; only a pin can, and it is handled here.
+ */
+bool
+target_screen_active_decides_every_monitor(const char *active_id,
+                                           const char *preferred,
+                                           const struct target_screen_pins *pins,
+                                           const struct target_screen_monitor *mons,
+                                           uint32_t count);
+
 #ifdef __cplusplus
 }
 #endif

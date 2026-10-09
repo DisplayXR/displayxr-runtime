@@ -217,3 +217,29 @@ target_screen_pick(const struct target_screen_candidate *cands,
 	}
 	return pick;
 }
+
+bool
+target_screen_active_decides_every_monitor(const char *active_id,
+                                           const char *preferred,
+                                           const struct target_screen_pins *pins,
+                                           const struct target_screen_monitor *mons,
+                                           uint32_t count)
+{
+	if (active_id == NULL || active_id[0] == '\0' || mons == NULL || count == 0) {
+		return false;
+	}
+	if (preferred != NULL && preferred[0] != '\0' && strcmp(preferred, active_id) != 0) {
+		return false; // a different plug-in is preferred: it outranks the active one
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		if (!mons[i].active_claims) {
+			return false; // another plug-in may claim it
+		}
+		const int pin =
+		    target_screen_pin_find(pins, mons[i].monitor_id, mons[i].output_name, mons[i].connector);
+		if (pin >= 0 && !name_eq(pins->pin[pin].plugin_id, active_id)) {
+			return false; // a pin names another plug-in for this monitor
+		}
+	}
+	return true;
+}
