@@ -344,6 +344,35 @@ Appended after `get_display_info_for_monitor` per ADR-020 (`struct_size`-gated, 
 belong to the ACTIVE plug-in; mixed vendors are M4. Reference implementation:
 `sim_display_dp_factory_vk_for_screen` (`drivers/sim_display/sim_display_processor.c`).
 
+### `create_dp_d3d11_for_screen` / `create_dp_d3d12_for_screen` (multi-screen M6, Windows)
+
+```c
+xrt_result_t (*create_dp_d3d11_for_screen)(struct xrt_plugin_instance *inst, void *d3d11_device,
+                                           void *d3d11_context, void *window_handle,
+                                           const struct xrt_screen_binding *binding,
+                                           struct xrt_display_processor_d3d11 **out_xdp);
+xrt_result_t (*create_dp_d3d12_for_screen)(struct xrt_plugin_instance *inst, void *d3d12_device,
+                                           void *d3d12_command_queue, void *window_handle,
+                                           const struct xrt_screen_binding *binding,
+                                           struct xrt_display_processor_d3d12 **out_xdp);
+```
+
+The Windows twins of `create_dp_vk_for_screen`, for the in-process D3D11 and D3D12 compositors.
+Same `binding` rules; `window_handle` is the session's real HWND only for the DP that keeps the
+vendor's drag phase-snap and NULL for every other screen's DP, whose phase comes from the
+appended per-API `set_present_origin` slot (`xrt_display_processor_d3d11::set_present_origin`,
+`xrt_display_processor_d3d12::set_present_origin`, both `struct_size`-gated, announced by
+`XRT_DP_D3D11_HAS_PRESENT_ORIGIN` / `XRT_DP_D3D12_HAS_PRESENT_ORIGIN`), called before every weave,
+plus the canvas offset. `process_atlas` gets `canvas = the segment` and a pre-cropped atlas
+holding exactly that segment's views; confine viewport AND scissor to the canvas and do not
+assume you are the first writer. On D3D12 every segment records onto ONE command list, which
+carries no viewport/scissor a DP could inherit — the DP sets both itself from the canvas; the
+atlas arrives as a plain 2D texture in `COMMON` with its own SRV descriptor. Appended after
+`create_dp_vk_for_screen` (D3D11) and `create_dp_metal_for_screen` (D3D12) per ADR-020 (ABI stays
+5); guard with `#ifdef XRT_PLUGIN_IFACE_HAS_CREATE_DP_D3D11_FOR_SCREEN` /
+`XRT_PLUGIN_IFACE_HAS_CREATE_DP_D3D12_FOR_SCREEN`. Reference implementations:
+`sim_display_dp_factory_d3d11_for_screen` / `sim_display_dp_factory_d3d12_for_screen`.
+
 **The 1:1 capability.** Report through the existing `get_scanout_caps` slot whether your output
 survives a display-server resample: `XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE` in
 `xrt_dp_scanout_caps::flags` (carved from the former `reserved[0]`, so an older plug-in reads
@@ -839,8 +868,8 @@ Flags (`XRT_PLUGIN_STEREO_CAMERA_*`) mirror the XR bits: `SHARED_WITH_EYE_TRACKI
 everything that was on `main` before them: `… vk_bundle_fn_table_offset` → `create_dp_d3d11_lift`
 (ADR-042) → `get_platform_state` (ADR-045) → `stereo_camera_enumerate … stereo_camera_close`
 → `get_display_info_for_monitor` (multi-screen M1) → `create_dp_vk_for_screen` (multi-screen M2)
-→ `create_dp_d3d11_for_screen` (M6, Windows) → `create_dp_metal_for_screen` (macOS, now the last
-member).
+→ `create_dp_d3d11_for_screen` (M6, D3D11) → `create_dp_metal_for_screen` (macOS) →
+`create_dp_d3d12_for_screen` (M6, D3D12, now the last member).
 `tests_stereo_camera` pins that order (lift right after the vk fingerprint, platform-state right
 after lift, the camera block right after platform-state and ending the struct), so a reorder or a
 slot squeezed in between fails on the host, not on a vendor box.
