@@ -69,6 +69,7 @@ connection cap (`[CAP] … slots in use`) still applies first, at accept.
 | the 13 `require_workspace_controller` mutators (#955) + `workspace_enumerate_clients` / `workspace_get_client_info` | CONTROLLER (fail closed) |
 | `weave_bind_window` / `weave_submit` / `weave_get_output` / `weave_get_fence` / `weave_snap_window_rect` | PRESENT_OWNER |
 | `workspace_capture_frame` (whole-atlas capture) | CONTROLLER, DIAG always; APP only outside workspace mode (its standalone atlas is its own content) |
+| `system_get_status_generation` / `system_get_status_snapshot` / `system_get_client_segments` (ADR-051 display status; any client's segment table, read-only) | DIAG |
 | `session_create` with a native compositor | not RELAY |
 | session role flags `is_workspace_controller` / `is_bridge_relay` seen by the compositor | derived from the verified class, not the client's `xrt_session_info` claim |
 
