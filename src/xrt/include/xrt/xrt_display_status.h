@@ -22,9 +22,13 @@
  *    live tracking state and the bound DPs, workspace.
  *  - phase 3: the plug-in slot `get_screen_status` — the per-screen vendor cell.
  *
- * Size: tens of KB (see `tests_status_snapshot`), which is far above the IPC
- * message budget, so phase 2 crosses it as head + per-screen + per-client
- * pieces, exactly as `system_enumerate_displays` / segment metrics do today.
+ * Size: tens of KB (see `tests_status_snapshot`), so the service does not send
+ * it as one reply: it crosses as @ref xrt_status_head + one
+ * @ref xrt_status_screen per `system_get_status_snapshot(screen_index)` reply
+ * + one @ref xrt_status_client per `system_get_client_segments(client_id)`
+ * reply — each a fixed-size struct by value, the mechanism
+ * `system_enumerate_displays` uses for `xrt_screen_list` (see
+ * `u_status_snapshot_get_head` / `u_status_snapshot_set_head`).
  *
  * @ingroup xrt_iface
  */
@@ -98,6 +102,8 @@ enum xrt_status_presenter
 	XRT_STATUS_PRESENTER_APP_HWND = 0,       //!< The service presents into the app's own window.
 	XRT_STATUS_PRESENTER_CLIENT_TEXTURE = 1, //!< The client presents a shared texture itself.
 	XRT_STATUS_PRESENTER_NONE = 2,           //!< Nothing presents for it right now.
+	XRT_STATUS_PRESENTER_SERVICE_WINDOW = 3, //!< Hosted: the service presents into its own window.
+	XRT_STATUS_PRESENTER_SELF = 4,           //!< A weave present-owner: it weaves and presents itself.
 };
 
 //! Who holds the panel lease, from a client's point of view (JSON lower-case, §3).
@@ -465,6 +471,62 @@ struct xrt_status_snapshot
 	struct xrt_status_workspace workspace;                       //!< Workspace state (phase 2).
 	uint32_t warning_count;                                      //!< Valid entries in @ref warnings.
 	struct xrt_status_warning warnings[XRT_STATUS_MAX_WARNINGS]; //!< System-level warnings.
+};
+
+/*!
+ * The snapshot minus its per-screen and per-client rows — the piece every
+ * `system_get_status_snapshot` reply carries (ADR-051 D3, phase 2). The rows
+ * cross separately, by index (screens) and by id (@ref client_ids); a reader
+ * reassembles them with `u_status_snapshot_set_head` and checks that every
+ * piece carries the same @ref generation.
+ */
+struct xrt_status_head
+{
+	uint32_t schema;                                             //!< @ref XRT_STATUS_SCHEMA.
+	enum xrt_status_source source;                               //!< Where it was built.
+	struct xrt_status_generation generation;                     //!< Generation the pieces belong to.
+	struct xrt_status_runtime runtime;                           //!< Runtime identity.
+	uint32_t plugin_count;                                       //!< Valid entries in @ref plugins.
+	struct xrt_status_plugin plugins[XRT_STATUS_MAX_PLUGINS];    //!< Registered plug-ins.
+	uint32_t screen_count;                                       //!< Screens to fetch by index.
+	uint32_t client_count;                                       //!< Valid entries in @ref client_ids.
+	uint32_t client_ids[XRT_STATUS_MAX_CLIENTS];                 //!< Clients, snapshot order.
+	struct xrt_status_workspace workspace;                       //!< Workspace state.
+	uint32_t warning_count;                                      //!< Valid entries in @ref warnings.
+	struct xrt_status_warning warnings[XRT_STATUS_MAX_WARNINGS]; //!< System-level warnings.
+};
+
+//! Live DPs the service reports into one build (one primary per client + its segment DPs + its own).
+#define XRT_STATUS_MAX_LIVE_DPS 64
+
+/*!
+ * One display processor the service has bound right now, as the service
+ * builder (`target_status_snapshot_build_service`) maps it onto a screen.
+ */
+struct xrt_status_live_dp
+{
+	//! Screen the DP weaves (0 = the system-default screen, which the builder resolves).
+	uint64_t screen_id;
+	struct xrt_status_dp dp;  //!< Client, API, kind, backend.
+	bool answered;            //!< The DP answered the eye query.
+	bool is_tracking;         //!< It reports a tracked viewer (iff @ref answered).
+	uint32_t not_tracking_ms; //!< How long it has answered NOT tracking (0 when tracking).
+};
+
+/*!
+ * What only the running service knows (ADR-051 D3), gathered by the IPC
+ * server and merged by `target_status_snapshot_build_service` into the rows
+ * the headless builder already fills. Plain data, no pointers.
+ */
+struct xrt_status_live
+{
+	struct xrt_status_generation generation;                  //!< The service's counters.
+	uint32_t client_count;                                    //!< Valid entries in @ref clients.
+	struct xrt_status_client clients[XRT_STATUS_MAX_CLIENTS]; //!< Fully filled client rows.
+	uint32_t dp_count;                                        //!< Valid entries in @ref dps.
+	struct xrt_status_live_dp dps[XRT_STATUS_MAX_LIVE_DPS];   //!< Bound DPs.
+	struct xrt_status_mode mode;                              //!< The head's current rendering mode.
+	struct xrt_status_workspace workspace;                    //!< Workspace state.
 };
 
 #ifdef __cplusplus

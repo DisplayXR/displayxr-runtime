@@ -95,6 +95,26 @@ size_t
 u_status_snapshot_format_text(const struct xrt_status_snapshot *snap, char *buf, size_t cap);
 
 /*!
+ * The head piece of @p snap (everything but the screen and client rows, plus
+ * the client ids) — what each `system_get_status_snapshot` reply carries.
+ */
+void
+u_status_snapshot_get_head(const struct xrt_status_snapshot *snap, struct xrt_status_head *out);
+
+/*!
+ * Start reassembling a snapshot from its head: zeroes @p snap, copies the head
+ * fields back and sets `screen_count` / `client_count` + each client row's
+ * `id`. The caller then fills `screens[i]` and `clients[i]` from the per-row
+ * replies (each must carry @ref xrt_status_head::generation, else refetch).
+ */
+void
+u_status_snapshot_set_head(struct xrt_status_snapshot *snap, const struct xrt_status_head *head);
+
+//! Both counters equal.
+bool
+u_status_generation_equal(const struct xrt_status_generation *a, const struct xrt_status_generation *b);
+
+/*!
  * @name Stable enum spellings (as serialised)
  * @{
  */

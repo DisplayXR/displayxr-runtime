@@ -29,6 +29,7 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifdef XRT_OS_WINDOWS
@@ -276,7 +277,95 @@ win_monitor_scale(int32_t x, int32_t y)
 	}
 	return (float)dx / 96.0f;
 }
+
+/*!
+ * The native (preferred) mode of the monitor whose GDI source is
+ * @p gdi_device_name (`\\.\DISPLAY1`): DisplayConfig's target preferred
+ * mode, matched to the monitor through its path's source GDI name. Windows
+ * only — the EDID reader fills no native mode there, so without this
+ * `NOT_NATIVE` could never fire. Plain user32 exports (already on the link
+ * line); read-only, no mode is changed.
+ *
+ * @return true with @p out_w / @p out_h (and @p out_refresh_mhz, the
+ *         preferred timing's vsync, 0 when unknown) filled.
+ */
+static bool
+win_preferred_mode(const char *gdi_device_name, uint32_t *out_w, uint32_t *out_h, uint32_t *out_refresh_mhz)
+{
+	if (gdi_device_name == NULL || gdi_device_name[0] == '\0') {
+		return false;
+	}
+	wchar_t wname[CCHDEVICENAME];
+	if (MultiByteToWideChar(CP_UTF8, 0, gdi_device_name, -1, wname, CCHDEVICENAME) == 0) {
+		return false;
+	}
+	UINT32 np = 0, nm = 0;
+	if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) != ERROR_SUCCESS || np == 0) {
+		return false;
+	}
+	DISPLAYCONFIG_PATH_INFO *paths = calloc(np, sizeof(*paths));
+	DISPLAYCONFIG_MODE_INFO *modes = calloc(nm > 0 ? nm : 1, sizeof(*modes));
+	bool found = false;
+	if (paths != NULL && modes != NULL &&
+	    QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &np, paths, &nm, modes, NULL) == ERROR_SUCCESS) {
+		for (UINT32 i = 0; i < np && !found; i++) {
+			DISPLAYCONFIG_SOURCE_DEVICE_NAME src;
+			memset(&src, 0, sizeof(src));
+			src.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+			src.header.size = sizeof(src);
+			src.header.adapterId = paths[i].sourceInfo.adapterId;
+			src.header.id = paths[i].sourceInfo.id;
+			if (DisplayConfigGetDeviceInfo(&src.header) != ERROR_SUCCESS ||
+			    wcscmp(src.viewGdiDeviceName, wname) != 0) {
+				continue;
+			}
+			DISPLAYCONFIG_TARGET_PREFERRED_MODE pref;
+			memset(&pref, 0, sizeof(pref));
+			pref.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_PREFERRED_MODE;
+			pref.header.size = sizeof(pref);
+			pref.header.adapterId = paths[i].targetInfo.adapterId;
+			pref.header.id = paths[i].targetInfo.id;
+			if (DisplayConfigGetDeviceInfo(&pref.header) != ERROR_SUCCESS || pref.width == 0 ||
+			    pref.height == 0) {
+				continue;
+			}
+			*out_w = pref.width;
+			*out_h = pref.height;
+			const DISPLAYCONFIG_RATIONAL *r = &pref.targetMode.targetVideoSignalInfo.vSyncFreq;
+			*out_refresh_mhz =
+			    r->Denominator != 0 ? (uint32_t)((uint64_t)r->Numerator * 1000u / r->Denominator) : 0u;
+			found = true;
+		}
+	}
+	free(paths);
+	free(modes);
+	return found;
+}
 #endif
+
+/*!
+ * The native mode of a screen row: the registry's device mode where the
+ * platform reader fills one (Linux DRM, macOS), DisplayConfig's preferred mode
+ * on Windows. Shared by the headless and the service builder.
+ */
+static void
+fill_native(const struct xrt_screen *in, struct xrt_status_screen *s)
+{
+	s->native.width = in->native_width;
+	s->native.height = in->native_height;
+#ifdef XRT_OS_WINDOWS
+	uint32_t w = 0, h = 0, mhz = 0;
+	if (win_preferred_mode(s->device_name, &w, &h, &mhz)) {
+		s->native.width = w;
+		s->native.height = h;
+		if (s->native.refresh_mhz == 0) {
+			s->native.refresh_mhz = mhz;
+		}
+	}
+#endif
+	s->native.is_native = s->native.width > 0 && s->native.height > 0 && s->native.width == s->desktop.width &&
+	                      s->native.height == s->desktop.height;
+}
 
 static void
 fill_screen(const struct xrt_screen *in,
@@ -330,10 +419,7 @@ fill_screen(const struct xrt_screen *in,
 		               s->edid.manufacturer[0] != '\0' ? s->edid.manufacturer : "???", s->edid.product);
 	}
 
-	s->native.width = in->native_width;
-	s->native.height = in->native_height;
-	s->native.is_native = in->native_width > 0 && in->native_height > 0 && in->native_width == in->desktop_width &&
-	                      in->native_height == in->desktop_height;
+	fill_native(in, s);
 
 	// Millimetres: the plug-in's metres when it described this screen, else EDID.
 	const bool from_plugin = (in->info.source == XRT_SCREEN_INFO_SOURCE_SYSTEM ||
@@ -373,6 +459,96 @@ fill_screen(const struct xrt_screen *in,
 	s->eye_tracking.state = XRT_STATUS_TRACKING_NO_DP; // headless: nothing is bound
 }
 
+#ifdef XRT_PLUGIN_IFACE_HAS_GET_SCREEN_STATUS
+/*!
+ * The claiming plug-in's vendor cell for one registry entry (ADR-051 D2),
+ * through the passive `get_screen_status` slot. False when the plug-in has no
+ * such slot or does not answer for this monitor ("no vendor status").
+ */
+static bool
+query_vendor_status(const struct xrt_dp_registry_entry *e, struct xrt_plugin_screen_status *out)
+{
+	const struct xrt_plugin_iface *iface = (const struct xrt_plugin_iface *)e->owning_iface;
+	if (!xrt_plugin_iface_has_get_screen_status(iface)) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+	out->struct_size = (uint32_t)sizeof(*out);
+	return iface->get_screen_status((struct xrt_plugin_instance *)e->owning_instance, e->monitor_id, out) ==
+	       XRT_SUCCESS;
+}
+
+//! Fill a screen row's vendor cell from the slot, verbatim.
+static void
+fill_vendor(const struct xrt_dp_factory_registry *reg, struct xrt_status_screen *s)
+{
+	const struct xrt_dp_registry_entry *e = registry_find(reg, s->id);
+	struct xrt_plugin_screen_status vs;
+	if (e == NULL || !query_vendor_status(e, &vs)) {
+		return;
+	}
+	struct xrt_status_vendor *v = &s->vendor;
+	v->present = true;
+	v->ready = vs.ready;
+	v->verified = vs.verified;
+	v->calibrated = vs.calibrated;
+	switch (vs.tracker) {
+	case XRT_PLUGIN_TRACKER_STATE_NONE: v->tracker = XRT_STATUS_VENDOR_TRACKER_NONE; break;
+	case XRT_PLUGIN_TRACKER_STATE_OFF: v->tracker = XRT_STATUS_VENDOR_TRACKER_OFF; break;
+	case XRT_PLUGIN_TRACKER_STATE_STARTING: v->tracker = XRT_STATUS_VENDOR_TRACKER_STARTING; break;
+	case XRT_PLUGIN_TRACKER_STATE_RUNNING: v->tracker = XRT_STATUS_VENDOR_TRACKER_RUNNING; break;
+	case XRT_PLUGIN_TRACKER_STATE_DOWN: v->tracker = XRT_STATUS_VENDOR_TRACKER_DOWN; break;
+	case XRT_PLUGIN_TRACKER_STATE_UNSUPPORTED: v->tracker = XRT_STATUS_VENDOR_TRACKER_UNSUPPORTED; break;
+	default: v->tracker = XRT_STATUS_VENDOR_TRACKER_UNKNOWN; break;
+	}
+	switch (vs.lens) {
+	case XRT_PLUGIN_LENS_STATE_2D: v->lens = XRT_STATUS_VENDOR_LENS_2D; break;
+	case XRT_PLUGIN_LENS_STATE_3D: v->lens = XRT_STATUS_VENDOR_LENS_3D; break;
+	default: v->lens = XRT_STATUS_VENDOR_LENS_UNKNOWN; break;
+	}
+	(void)snprintf(v->model, sizeof(v->model), "%.*s", (int)sizeof(vs.model) - 1, vs.model);
+	(void)snprintf(v->serial, sizeof(v->serial), "%.*s", (int)sizeof(vs.serial) - 1, vs.serial);
+	(void)snprintf(v->dashboard_command, sizeof(v->dashboard_command), "%.*s",
+	               (int)sizeof(vs.dashboard_command) - 1, vs.dashboard_command);
+	// The worst vendor warning (first of the highest level), verbatim.
+	int worst = -1;
+	const uint32_t nw = vs.warning_count < XRT_PLUGIN_SCREEN_STATUS_MAX_WARNINGS
+	                        ? vs.warning_count
+	                        : XRT_PLUGIN_SCREEN_STATUS_MAX_WARNINGS;
+	for (uint32_t k = 0; k < nw; k++) {
+		if (worst < 0 || vs.warnings[k].level > vs.warnings[worst].level) {
+			worst = (int)k;
+		}
+	}
+	if (worst >= 0) {
+		const struct xrt_plugin_screen_warning *w = &vs.warnings[worst];
+		(void)snprintf(v->worst_warning.code, sizeof(v->worst_warning.code), "%.*s", (int)sizeof(w->code) - 1,
+		               w->code);
+		v->worst_warning.level = w->level >= XRT_PLUGIN_SCREEN_WARNING_LEVEL_CRITICAL
+		                             ? XRT_STATUS_LEVEL_CRITICAL
+		                         : w->level == XRT_PLUGIN_SCREEN_WARNING_LEVEL_WARN ? XRT_STATUS_LEVEL_WARN
+		                                                                            : XRT_STATUS_LEVEL_INFO;
+		(void)snprintf(v->worst_warning.text, sizeof(v->worst_warning.text), "%.*s", (int)sizeof(w->text) - 1,
+		               w->text);
+	}
+}
+#endif
+
+//! One row per screen of @p list, in registry order (both builders).
+static void
+fill_screens(const struct xrt_screen_list *list,
+             const struct xrt_dp_factory_registry *reg,
+             struct xrt_status_snapshot *out)
+{
+	for (uint32_t i = 0; i < list->count && i < XRT_STATUS_MAX_SCREENS; i++) {
+		fill_screen(&list->screens[i], i, reg, &out->screens[i]);
+#ifdef XRT_PLUGIN_IFACE_HAS_GET_SCREEN_STATUS
+		fill_vendor(reg, &out->screens[i]);
+#endif
+		out->screen_count++;
+	}
+}
+
 void
 target_status_snapshot_build_headless(struct xrt_instance *xi,
                                       struct xrt_system_devices *xsysd,
@@ -409,10 +585,187 @@ target_status_snapshot_build_headless(struct xrt_instance *xi,
 		target_screens_build(&reg, active != NULL ? active->id : NULL, &sys, &list);
 	}
 
-	for (uint32_t i = 0; i < list.count && i < XRT_STATUS_MAX_SCREENS; i++) {
-		fill_screen(&list.screens[i], i, &reg, &out->screens[i]);
-		out->screen_count++;
+	fill_screens(&list, &reg, out);
+
+	u_status_warnings_derive(out);
+}
+
+
+/*
+ *
+ * Service builder (phase 2).
+ *
+ */
+
+//! Index of the screen row with id @p id, -1 when none.
+static int
+screen_index_of(const struct xrt_status_snapshot *out, uint64_t id)
+{
+	for (uint32_t i = 0; i < out->screen_count; i++) {
+		if (out->screens[i].id == id) {
+			return (int)i;
+		}
+	}
+	return -1;
+}
+
+//! The runtime-default screen (the one the service's own DP weaves), 0 when none.
+static uint64_t
+default_screen_id(const struct xrt_status_snapshot *out)
+{
+	for (uint32_t i = 0; i < out->screen_count; i++) {
+		if (out->screens[i].roles.runtime_default) {
+			return out->screens[i].id;
+		}
+	}
+	return out->screen_count > 0 ? out->screens[0].id : 0;
+}
+
+/*!
+ * Bind the live DPs to their screens: each screen's `dps[]`, its live
+ * tracking state (TRACKING if any bound DP tracks, NOT_TRACKING with the
+ * shortest not-tracking time if every answering DP does not, UNKNOWN if none
+ * answered, NO_DP if none is bound) and the head's mode on every screen a DP
+ * weaves.
+ */
+static void
+merge_live_dps(const struct xrt_status_live *live, struct xrt_status_snapshot *out)
+{
+	const uint64_t def = default_screen_id(out);
+	bool answered[XRT_STATUS_MAX_SCREENS] = {false};
+	bool tracking[XRT_STATUS_MAX_SCREENS] = {false};
+	uint32_t min_nt_ms[XRT_STATUS_MAX_SCREENS];
+	for (uint32_t i = 0; i < XRT_STATUS_MAX_SCREENS; i++) {
+		min_nt_ms[i] = UINT32_MAX;
+	}
+
+	for (uint32_t d = 0; d < live->dp_count && d < XRT_STATUS_MAX_LIVE_DPS; d++) {
+		const struct xrt_status_live_dp *ld = &live->dps[d];
+		const int si = screen_index_of(out, ld->screen_id != 0 ? ld->screen_id : def);
+		if (si < 0) {
+			continue; // a screen the registry no longer lists
+		}
+		struct xrt_status_screen *s = &out->screens[si];
+		bool dup = false;
+		for (uint32_t k = 0; k < s->dp_count; k++) {
+			dup |= s->dps[k].client_id == ld->dp.client_id && s->dps[k].kind == ld->dp.kind;
+		}
+		if (!dup && s->dp_count < XRT_STATUS_MAX_SCREEN_DPS) {
+			s->dps[s->dp_count++] = ld->dp;
+		}
+		if (ld->answered) {
+			answered[si] = true;
+			if (ld->is_tracking) {
+				tracking[si] = true;
+			} else if (ld->not_tracking_ms < min_nt_ms[si]) {
+				min_nt_ms[si] = ld->not_tracking_ms;
+			}
+		}
+	}
+
+	for (uint32_t i = 0; i < out->screen_count; i++) {
+		struct xrt_status_screen *s = &out->screens[i];
+		if (s->dp_count == 0) {
+			s->eye_tracking.state = XRT_STATUS_TRACKING_NO_DP;
+			continue;
+		}
+		if (tracking[i]) {
+			s->eye_tracking.state = XRT_STATUS_TRACKING_TRACKING;
+		} else if (answered[i]) {
+			s->eye_tracking.state = XRT_STATUS_TRACKING_NOT_TRACKING;
+			s->eye_tracking.not_tracking_ms = min_nt_ms[i] != UINT32_MAX ? min_nt_ms[i] : 0u;
+		} else {
+			s->eye_tracking.state = XRT_STATUS_TRACKING_UNKNOWN;
+		}
+		if (live->mode.valid) {
+			s->mode = live->mode;
+		}
+	}
+}
+
+void
+target_status_snapshot_build_service(struct xrt_instance *xi,
+                                     const struct xrt_dp_factory_registry *reg,
+                                     const struct xrt_status_live *live,
+                                     struct xrt_status_snapshot *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->schema = XRT_STATUS_SCHEMA;
+	out->source = XRT_STATUS_SOURCE_SERVICE;
+	if (live != NULL) {
+		out->generation = live->generation;
+	}
+
+	fill_runtime(&out->runtime);
+	fill_plugins(out); // target_plugin_get_status merges the active plug-in's LIVE platform state
+
+	// The screen list the service's apps see (its instance's registry, read
+	// under the instance's own lock), joined with the service's DP registry
+	// for claim serials + per-API factories. Nothing is re-probed here: a
+	// status read never round-trips the plug-ins' probe_displays (D5).
+	struct xrt_screen_list *list = calloc(1, sizeof(*list));
+	if (list != NULL && xi != NULL && xrt_instance_enumerate_displays(xi, list) == XRT_SUCCESS) {
+		struct xrt_dp_factory_registry empty;
+		memset(&empty, 0, sizeof(empty));
+		fill_screens(list, reg != NULL ? reg : &empty, out);
+	}
+	free(list);
+
+	if (live != NULL) {
+		const uint32_t nc =
+		    live->client_count < XRT_STATUS_MAX_CLIENTS ? live->client_count : XRT_STATUS_MAX_CLIENTS;
+		const uint64_t def = default_screen_id(out);
+		for (uint32_t i = 0; i < nc; i++) {
+			out->clients[i] = live->clients[i];
+			// A presenting client whose window no segment DP holds is woven by
+			// the panel DP on the runtime-default screen.
+			if (out->clients[i].owner_screen == 0 &&
+			    out->clients[i].presenter != XRT_STATUS_PRESENTER_NONE) {
+				out->clients[i].owner_screen = def;
+			}
+		}
+		out->client_count = nc;
+		merge_live_dps(live, out);
+		out->workspace = live->workspace;
 	}
 
 	u_status_warnings_derive(out);
+}
+
+uint64_t
+target_status_snapshot_change_key(const struct xrt_dp_factory_registry *reg)
+{
+	// FNV-1a over what the "topology" counter covers beyond the screen list:
+	// each plug-in's load result + live platform state + hint, and (with the
+	// ADR-051 D2 slot) every claiming plug-in's per-screen change counter.
+	uint64_t h = 1469598103934665603ull;
+#define MIX(ptr, len)                                                                                                  \
+	do {                                                                                                           \
+		const unsigned char *b_ = (const unsigned char *)(ptr);                                                \
+		for (size_t k_ = 0; k_ < (size_t)(len); k_++) {                                                        \
+			h = (h ^ b_[k_]) * 1099511628211ull;                                                           \
+		}                                                                                                      \
+	} while (0)
+
+	struct target_plugin_status st[16];
+	const int ns = target_plugin_get_status(st, 16);
+	for (int i = 0; i < ns; i++) {
+		MIX(st[i].id, strlen(st[i].id));
+		MIX(&st[i].result, sizeof(st[i].result));
+		MIX(&st[i].platform_state, sizeof(st[i].platform_state));
+		MIX(st[i].hint, strlen(st[i].hint));
+	}
+#ifdef XRT_PLUGIN_IFACE_HAS_GET_SCREEN_STATUS
+	for (uint32_t i = 0; reg != NULL && i < reg->entry_count && i < XRT_DP_REGISTRY_MAX_ENTRIES; i++) {
+		struct xrt_plugin_screen_status vs;
+		if (query_vendor_status(&reg->entries[i], &vs)) {
+			MIX(&reg->entries[i].monitor_id, sizeof(reg->entries[i].monitor_id));
+			MIX(&vs.change_counter, sizeof(vs.change_counter));
+		}
+	}
+#else
+	(void)reg;
+#endif
+#undef MIX
+	return h;
 }

@@ -206,6 +206,15 @@ bool
 comp_d3d11_segments_get_eyes(struct comp_d3d11_segments *segs, uint64_t screen_id, struct xrt_eye_positions *out);
 
 /*!
+ * The screen whose DP holds the session's window handle right now (ADR-047
+ * Amendment 2), 0 when none does or segmentation is off. Status read for the
+ * display dashboard (ADR-051); the caller serialises with
+ * @ref comp_d3d11_segments_update (the service holds its render mutex).
+ */
+uint64_t
+comp_d3d11_segments_get_owner(const struct comp_d3d11_segments *segs);
+
+/*!
  * Multi-screen M3: the last update's segment table as per-segment view
  * metrics (geometry, each screen's physical size + nominal viewer, whether it
  * is woven). Eyes are NOT filled — they are predicted per query
