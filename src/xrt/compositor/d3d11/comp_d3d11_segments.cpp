@@ -1038,6 +1038,16 @@ comp_d3d11_segments_get_metrics(const struct comp_d3d11_segments *segs,
 	return true;
 }
 
+extern "C" uint64_t
+comp_d3d11_segments_get_owner(const struct comp_d3d11_segments *segs)
+{
+	if (segs == nullptr || !segs->enabled || segs->owner_index < 0 ||
+	    (uint32_t)segs->owner_index >= segs->screen_count) {
+		return 0;
+	}
+	return segs->screens[segs->owner_index].id;
+}
+
 extern "C" bool
 comp_d3d11_segments_get_eyes(struct comp_d3d11_segments *segs, uint64_t screen_id, struct xrt_eye_positions *out)
 {
