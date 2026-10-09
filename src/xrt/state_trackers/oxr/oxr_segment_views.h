@@ -293,6 +293,40 @@ oxr_segment_views_route_take(struct xrt_segment_view_routing *frame, struct xrt_
 }
 
 /*!
+ * Must the routing @p next be sent to an out-of-process compositor that last
+ * received @p sent? (Multi-screen M3 over IPC, ADR-047 Amendment 2: the
+ * service keeps the last routing it was given, so the client sends it only on
+ * a change — a window that stays split costs no round trip per frame, and the
+ * first unrouted frame after a split is sent once, which clears it.)
+ *
+ * Compares only the fields that mean something for @p next's count: entries
+ * past the count are don't-care (the take resets them, but a sender must not
+ * re-send because of them).
+ */
+static inline bool
+oxr_segment_views_route_differs(const struct xrt_segment_view_routing *sent,
+                                const struct xrt_segment_view_routing *next)
+{
+	if (sent->count != next->count) {
+		return true;
+	}
+	if (next->count == 0) {
+		return false;
+	}
+	if (memcmp(&sent->canvas, &next->canvas, sizeof(next->canvas)) != 0) {
+		return true;
+	}
+	for (uint32_t k = 0; k < next->count && k < XRT_MAX_SEGMENTS; k++) {
+		if (sent->screen_id[k] != next->screen_id[k] || sent->first_view[k] != next->first_view[k] ||
+		    sent->view_count[k] != next->view_count[k] ||
+		    memcmp(&sent->rect[k], &next->rect[k], sizeof(next->rect[k])) != 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/*!
  * Which located view view @p i carries: itself while active, view 0 for the
  * inactive tail `[active_view_count, reported)` — the ADR-041 alias, the same
  * with one view set or one per segment.
