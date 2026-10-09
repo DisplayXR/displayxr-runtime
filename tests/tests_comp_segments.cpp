@@ -10,6 +10,7 @@
 
 #include "catch_amalgamated.hpp"
 
+#include <cmath>
 #include <cstring>
 
 namespace {
@@ -450,4 +451,36 @@ TEST_CASE("tile rects: adjacent segments share the seam column (M3 routing == M2
 	CHECK_FALSE(comp_segments_tile_rect(&outside, &canvas2, 800, 900, &a));
 	const comp_seg_rect zero = {0, 0, 0, 0};
 	CHECK_FALSE(comp_segments_tile_rect(&left, &zero, 800, 900, &a));
+}
+
+TEST_CASE("tile rects: a split egress slot one frame behind the window still partitions its own tile",
+          "[comp_segments]")
+{
+	// Under the #918 weave-on-scanout split the D3D11 segments crop the egress
+	// slot being woven, which during a resize drag was painted for the
+	// PREVIOUS window size (the R2 lag): the tile is the slot's own, the canvas
+	// the live window. The crop must still cover that tile exactly, with
+	// neighbours sharing the seam column, whichever way the window moved.
+	// Live window: 1649 px wide, straddling a seam at window x = 825 (odd, so
+	// the scaled seam is fractional).
+	const comp_seg_rect canvas = {0, 0, 1649, 1788};
+	const comp_seg_rect left = {0, 0, 825, 1788};
+	const comp_seg_rect right = {825, 0, 824, 1788};
+	// Slot tiles one frame behind a growing (800) and a shrinking (840)
+	// window, plus the matched one (824/825 ~ 1649 / 2).
+	const uint32_t tile_ws[] = {800, 824, 840};
+	for (uint32_t tw : tile_ws) {
+		CAPTURE(tw);
+		comp_seg_rect a, b;
+		REQUIRE(comp_segments_tile_rect(&left, &canvas, tw, 894, &a));
+		REQUIRE(comp_segments_tile_rect(&right, &canvas, tw, 894, &b));
+		CHECK(a.x == 0);
+		CHECK(a.x + (int32_t)a.w == b.x); // no gap, no overlap
+		CHECK(b.x + (int32_t)b.w == (int32_t)tw);
+		CHECK(a.h == 894);
+		CHECK(b.h == 894);
+		// The seam sits where the live window puts it, scaled to the slot.
+		const double seam = 825.0 * tw / 1649.0;
+		CHECK(std::abs((double)b.x - seam) <= 0.5);
+	}
 }
