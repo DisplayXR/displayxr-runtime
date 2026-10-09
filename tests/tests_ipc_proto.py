@@ -148,6 +148,23 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         call = self._call("weave_get_fence")
         self.assertEqual(call.out_handles.arg_names, ("handles", "handle_count"))
 
+    def test_segment_calls_are_appended(self):
+        # Multi-screen on the service path (ADR-047 Amendment 2): the three
+        # calls ride at the END of proto.json, so every earlier command keeps
+        # its enum value (append-only; the u_git_tag gate refuses a skewed
+        # client/service pair at connect anyway).
+        names = [c.name for c in self.p.calls]
+        tail = ["compositor_segments_enable", "compositor_get_segment_metrics", "compositor_set_view_routing"]
+        self.assertEqual(names[-3:], tail)
+        enable = self._call("compositor_segments_enable")
+        self.assertEqual([(a.name, a.typename) for a in enable.in_args], [("pinned_display_id", "uint64_t")])
+        get = self._call("compositor_get_segment_metrics")
+        self.assertEqual([(a.name, a.typename) for a in get.out_args],
+                         [("metrics", "struct xrt_segment_metrics")])
+        route = self._call("compositor_set_view_routing")
+        self.assertEqual([(a.name, a.typename) for a in route.in_args],
+                         [("routing", "struct xrt_segment_view_routing")])
+
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
