@@ -1,0 +1,330 @@
+{
+	"runtime":	{
+		"description":	"DisplayXR Runtime (based on Monado/XRT)",
+		"git_tag":	"v2.31.0-51-gcf8056075",
+		"plugin_abi_version":	5
+	},
+	"active_openxr_runtime":	{
+		"set":	true,
+		"value":	"C:\\Program Files\\DisplayXR\\Runtime\\DisplayXR_win64.json"
+	},
+	"plugins":	[{
+			"id":	"leia-sr",
+			"display_name":	"DisplayXR Leia SR",
+			"version":	"2.9.3",
+			"probe_order":	50,
+			"fallback":	false,
+			"load_result":	"ACTIVE",
+			"platform_state":	"READY",
+			"hint":	"",
+			"reason":	"",
+			"os_error":	0
+		}, {
+			"id":	"sim-display",
+			"display_name":	"DisplayXR Sim Display",
+			"version":	"2.26.0",
+			"probe_order":	200,
+			"fallback":	true,
+			"load_result":	"NOT_ATTEMPTED",
+			"platform_state":	"UNKNOWN",
+			"hint":	"",
+			"reason":	"",
+			"os_error":	0
+		}],
+	"plugin":	{
+		"id":	"leia-sr",
+		"display_name":	"DisplayXR Leia SR",
+		"vendor":	"Leia Inc.",
+		"version":	"v2.9.3",
+		"abi_version":	5
+	},
+	"device":	"Leia 3D Display",
+	"rendering_modes":	[{
+			"mode_index":	0,
+			"name":	"2D",
+			"view_count":	1,
+			"hardware_display_3d":	false,
+			"has_tracking":	false,
+			"can_rotate":	false,
+			"view_scale":	{
+				"x":	1,
+				"y":	1
+			}
+		}, {
+			"mode_index":	1,
+			"name":	"LeiaSR",
+			"view_count":	2,
+			"hardware_display_3d":	true,
+			"has_tracking":	true,
+			"can_rotate":	false,
+			"view_scale":	{
+				"x":	0.5,
+				"y":	0.5
+			}
+		}],
+	"display":	{
+		"physical_width_m":	0.344217598438263,
+		"physical_height_m":	0.1936223953962326,
+		"pixel_width":	3840,
+		"pixel_height":	2160,
+		"viewer_m":	{
+			"x":	0,
+			"y":	0.10000000149011612,
+			"z":	0.600000023841858
+		},
+		"recommended_view_scale":	{
+			"x":	0.5,
+			"y":	0.5
+		},
+		"screen_pos":	{
+			"left":	0,
+			"top":	0
+		},
+		"desktop_rect":	{
+			"resolved":	true,
+			"left":	0,
+			"top":	0,
+			"width":	3840,
+			"height":	2160,
+			"device_name":	"\\\\.\\DISPLAY1",
+			"is_primary":	true,
+			"is_panel_confirmed":	true,
+			"rule":	"primary fallback",
+			"match_candidates":	0,
+			"monitors_enumerated":	0,
+			"origin_overrides_plugin":	false
+		},
+		"eye_tracking":	{
+			"supported_modes":	1,
+			"default_mode":	0,
+			"supported_label":	"MANAGED",
+			"default_label":	"MANAGED"
+		},
+		"native_mode":	{
+			"probed":	true,
+			"device":	"\\\\.\\DISPLAY1",
+			"pixel_width":	3840,
+			"pixel_height":	2160,
+			"refresh_hz":	60,
+			"matches_reported":	true,
+			"note":	"3840x2160 px == \\\\.\\DISPLAY1 current mode (3840x2160 @ 60 Hz)"
+		}
+	},
+	"dpi_awareness":	"per-monitor-aware",
+	"dp_selection":	{
+		"probed":	true,
+		"mismatch":	false,
+		"in_process_plugin_id":	"leia-sr",
+		"service_plugin_id":	"leia-sr",
+		"service_confidence":	"VERIFIED",
+		"monitor_count":	2,
+		"claim_count":	2
+	},
+	"displays":	[{
+			"id":	"0x8c413a2f61152ce7",
+			"device_name":	"\\\\.\\DISPLAY1",
+			"plugin_id":	"leia-sr",
+			"system_default":	true,
+			"primary":	true,
+			"tracked":	true,
+			"desktop_left":	0,
+			"desktop_top":	0,
+			"desktop_width":	3840,
+			"desktop_height":	2160,
+			"native_width":	0,
+			"native_height":	0,
+			"desktop_scale":	0,
+			"info_source":	"system",
+			"width_m":	0.344217598438263,
+			"height_m":	0.1936223953962326,
+			"pixel_width":	3840,
+			"pixel_height":	2160,
+			"nominal_viewer_x_m":	0,
+			"nominal_viewer_y_m":	0.10000000149011612,
+			"nominal_viewer_z_m":	0.600000023841858,
+			"recommended_view_scale_x":	0.5,
+			"recommended_view_scale_y":	0.5,
+			"supported_eye_tracking_modes":	1,
+			"default_eye_tracking_mode":	0
+		}, {
+			"id":	"0xb72ea4c616544d01",
+			"device_name":	"",
+			"plugin_id":	"leia-sr",
+			"system_default":	false,
+			"primary":	false,
+			"tracked":	false,
+			"desktop_left":	3840,
+			"desktop_top":	0,
+			"desktop_width":	3840,
+			"desktop_height":	2160,
+			"native_width":	0,
+			"native_height":	0,
+			"desktop_scale":	0,
+			"info_source":	"derived",
+			"width_m":	0.34400001168251038,
+			"height_m":	0.193000003695488,
+			"pixel_width":	3840,
+			"pixel_height":	2160,
+			"nominal_viewer_x_m":	0,
+			"nominal_viewer_y_m":	0,
+			"nominal_viewer_z_m":	0.59807133674621582,
+			"recommended_view_scale_x":	1,
+			"recommended_view_scale_y":	1,
+			"supported_eye_tracking_modes":	0,
+			"default_eye_tracking_mode":	0
+		}],
+	"vk_repaint_tier":	{
+		"probed":	true,
+		"registered":	true,
+		"enabled":	true,
+		"manifest_ok":	true,
+		"library_ok":	true,
+		"manifest":	"C:\\Program Files\\DisplayXR\\Runtime\\VkLayer_DXR_queue_lock.json",
+		"library_path":	"C:/Program Files/DisplayXR/Runtime/VkLayer_DXR_queue_lock.dll",
+		"note":	"VK_LAYER_DXR_queue_lock reachable (C:/Program Files/DisplayXR/Runtime/VkLayer_DXR_queue_lock.dll)"
+	},
+	"gpu_topology":	{
+		"probed":	true,
+		"verdict":	"weave-on-scanout topology: APPLIES (render != scanout)",
+		"applies":	true,
+		"weave_on_scanout_env":	"<unset>",
+		"service_split":	"service split: WOULD ENGAGE (default on, render != scanout); ingress adaptive (default)",
+		"split_ingress":	"adaptive (default)",
+		"service_ingest":	"service ingest: 'NVIDIA GeForce RTX 3080 Laptop GPU' LUID=00000000:00014d64 (most VRAM) — the adapter clients must share (ADR-037 §7)",
+		"adapters":	[{
+				"name":	"NVIDIA GeForce RTX 3080 Laptop GPU",
+				"luid":	"00000000:00014d64",
+				"dedicated_vram_bytes":	8407482368
+			}, {
+				"name":	"Intel(R) UHD Graphics",
+				"luid":	"00000000:00013ddb",
+				"dedicated_vram_bytes":	134217728
+			}],
+		"scanout":	{
+			"resolved":	true,
+			"name":	"Intel(R) UHD Graphics",
+			"luid":	"00000000:00013ddb"
+		},
+		"render_suggestion":	{
+			"resolved":	true,
+			"name":	"NVIDIA GeForce RTX 3080 Laptop GPU",
+			"luid":	"00000000:00014d64"
+		},
+		"service_ingest_adapter":	{
+			"resolved":	true,
+			"name":	"NVIDIA GeForce RTX 3080 Laptop GPU",
+			"luid":	"00000000:00014d64",
+			"provenance":	"most VRAM"
+		}
+	},
+	"input_providers":	{
+		"registered":	2,
+		"force_qwerty":	false,
+		"hardware_present":	false,
+		"evaluated":	false,
+		"note":	"not evaluated: provider 'portalvr-input' loaded but its hardware is absent (OK — qwerty holds the hand roles)"
+	},
+	"rig_role":	{
+		"evaluated":	false,
+		"note":	"not evaluated: navigation device 'PortalVR Navigation' found but its provider's hardware is absent (OK — the runtime's fly camera holds the rig)"
+	},
+	"lift_caps":	{
+		"probed":	true,
+		"malformed":	false,
+		"note":	"modes=0x3 state=1 streams=32 views=8 depth=relative latency=22.0ms backend='neurd-directml' (lift-only factory)",
+		"modes":	3,
+		"state":	1,
+		"max_streams":	32,
+		"max_views":	8,
+		"backend":	"neurd-directml"
+	},
+	"zone_caps":	{
+		"probed":	true,
+		"note":	"supported=1 grid=1x1 max_mask=0x0 max_hz=0 wish_fractional=0 granularity=0",
+		"malformed":	false,
+		"supported":	1,
+		"zone_grid":	{
+			"width":	1,
+			"height":	1
+		},
+		"max_mask":	{
+			"width":	0,
+			"height":	0
+		},
+		"max_update_hz":	0,
+		"wish_fractional":	0,
+		"switch_granularity":	0,
+		"switch_granularity_label":	"unknown"
+	},
+	"gpu":	{
+		"probed":	true,
+		"note":	"",
+		"verdict":	"weave-on-scanout topology: APPLIES (render != scanout)",
+		"split_applies":	true,
+		"adapters":	[{
+				"index":	0,
+				"name":	"NVIDIA GeForce RTX 3080 Laptop GPU",
+				"luid":	"00000000:00014d64",
+				"dedicated_vram_mb":	8018
+			}, {
+				"index":	1,
+				"name":	"Intel(R) UHD Graphics",
+				"luid":	"00000000:00013ddb",
+				"dedicated_vram_mb":	128
+			}],
+		"scanout":	{
+			"resolved":	true,
+			"name":	"Intel(R) UHD Graphics",
+			"luid":	"00000000:00013ddb"
+		},
+		"render":	{
+			"resolved":	true,
+			"name":	"NVIDIA GeForce RTX 3080 Laptop GPU",
+			"luid":	"00000000:00014d64"
+		},
+		"service_ingest":	{
+			"resolved":	true,
+			"name":	"NVIDIA GeForce RTX 3080 Laptop GPU",
+			"luid":	"00000000:00014d64",
+			"provenance":	"most VRAM",
+			"line":	"service ingest: 'NVIDIA GeForce RTX 3080 Laptop GPU' LUID=00000000:00014d64 (most VRAM) — the adapter clients must share (ADR-037 §7)"
+		},
+		"split":	{
+			"weave_on_scanout_set":	false,
+			"weave_on_scanout":	null,
+			"weave_on_scanout_source":	"default",
+			"ingress":	"adaptive (default)",
+			"service_split":	"service split: WOULD ENGAGE (default on, render != scanout); ingress adaptive (default)"
+		}
+	},
+	"performance":	{
+		"note":	"Resolved as a process starting now would resolve it: environment first, then the per-user file, then the machine default. A row whose source is \"env\" reflects THIS process's environment only.",
+		"user_file":	"C:\\Users\\dev\\AppData\\Local\\DisplayXR\\settings.json",
+		"user_written":	"2026-08-28",
+		"levers":	[{
+				"name":	"DXR_D3D_FORCE_GPU",
+				"value":	null,
+				"source":	"default"
+			}, {
+				"name":	"DXR_VK_FORCE_GPU",
+				"value":	null,
+				"source":	"default"
+			}, {
+				"name":	"DXR_WEAVE_ON_SCANOUT",
+				"value":	null,
+				"source":	"default"
+			}, {
+				"name":	"DXR_WEAVE_REPAINT",
+				"value":	null,
+				"source":	"default"
+			}, {
+				"name":	"DXR_FRAME_WITNESS",
+				"value":	null,
+				"source":	"default"
+			}, {
+				"name":	"DXR_FRAME_STAGE_TIMING",
+				"value":	null,
+				"source":	"default"
+			}]
+	}
+}

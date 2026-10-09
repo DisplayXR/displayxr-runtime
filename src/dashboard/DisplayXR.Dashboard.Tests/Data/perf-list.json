@@ -1,0 +1,29 @@
+{
+	"user_file":	"C:\\Users\\dev\\AppData\\Local\\DisplayXR\\settings.json",
+	"user_written":	"2026-08-28",
+	"levers":	[{
+			"name":	"DXR_D3D_FORCE_GPU",
+			"value":	null,
+			"source":	"default"
+		}, {
+			"name":	"DXR_VK_FORCE_GPU",
+			"value":	null,
+			"source":	"default"
+		}, {
+			"name":	"DXR_WEAVE_ON_SCANOUT",
+			"value":	null,
+			"source":	"default"
+		}, {
+			"name":	"DXR_WEAVE_REPAINT",
+			"value":	null,
+			"source":	"default"
+		}, {
+			"name":	"DXR_FRAME_WITNESS",
+			"value":	null,
+			"source":	"default"
+		}, {
+			"name":	"DXR_FRAME_STAGE_TIMING",
+			"value":	null,
+			"source":	"default"
+		}]
+}

@@ -1,0 +1,22 @@
+{
+	"preferred":	null,
+	"plugins":	[{
+			"id":	"leia-sr",
+			"display_name":	"DisplayXR Leia SR",
+			"vendor":	"Leia Inc.",
+			"version":	"2.9.3",
+			"probe_order":	50,
+			"binary_path":	"C:\\Program Files\\DisplayXR\\Plugins\\LeiaSR\\DisplayXR-LeiaSR.dll",
+			"active":	true,
+			"preferred":	false
+		}, {
+			"id":	"sim-display",
+			"display_name":	"DisplayXR Sim Display",
+			"vendor":	"DisplayXR",
+			"version":	"2.26.0",
+			"probe_order":	200,
+			"binary_path":	"C:\\Program Files\\DisplayXR\\Runtime\\plugins\\DisplayXR-SimDisplay.dll",
+			"active":	false,
+			"preferred":	false
+		}]
+}
