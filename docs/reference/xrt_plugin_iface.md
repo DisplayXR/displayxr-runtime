@@ -301,6 +301,8 @@ append. Reference implementation: `sim_display_plugin.c` (EDID mm, else its
 `SIM_DISPLAY_WIDTH_M/HEIGHT_M` defaults; its usual nominal viewer; `SIM_DISPLAY_FAKE_TRACKING`
 semantics unchanged).
 
+**Where claims surface.** `displayxr-cli displays --claims --json` publishes each winning claim (plug-in id, confidence, your claim's `serial` verbatim, EDID mm) and is polled by vendor dashboards, so its shape is a contract versioned by a top-level `"schema"` (keys only ever added; ADR-051).
+
 ### `create_dp_vk_for_screen` (multi-screen M2)
 
 ```c
