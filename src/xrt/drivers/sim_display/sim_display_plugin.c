@@ -40,6 +40,15 @@
 #endif
 
 #include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+
+
+/*!
+ * ADR-051: bumped on every probe_displays so the per-screen status
+ * change_counter moves when the monitor set is re-probed.
+ */
+static xrt_atomic_s32_t g_sim_display_probe_count = 0;
 
 
 /*
@@ -219,6 +228,8 @@ sim_display_plugin_probe_displays(struct xrt_plugin_instance *inst,
 {
 	(void)inst;
 
+	xrt_atomic_s32_inc_return(&g_sim_display_probe_count);
+
 	/*
 	 * sim_display is the vendor-neutral fallback (#69 / ADR-015): claim
 	 * EVERY descriptor at FALLBACK confidence so it backstops any monitor no
@@ -252,6 +263,55 @@ sim_display_plugin_probe_displays(struct xrt_plugin_instance *inst,
 		c->serial[0] = '\0';
 	}
 	return n;
+}
+
+/*!
+ * ADR-051 D2 per-screen status: synthetic values, so every dashboard row has
+ * one on a box with no hardware. Pure C, reads only process-local state —
+ * passive by construction.
+ */
+static xrt_result_t
+sim_display_plugin_get_screen_status(struct xrt_plugin_instance *inst,
+                                     uint64_t monitor_id,
+                                     struct xrt_plugin_screen_status *out)
+{
+	(void)inst;
+	if (out == NULL || out->struct_size < sizeof(struct xrt_plugin_screen_status)) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED; // caller too old for v1: "no vendor status"
+	}
+
+	uint64_t edges = 0;
+	bool tracking = sim_display_fake_tracking_sample(&edges);
+
+	out->version = XRT_PLUGIN_SCREEN_STATUS_VERSION;
+	// Both terms are monotonic, so the sum moves on every tracker edge and
+	// every re-probe, and nowhere else. cmpxchg(0, 0) is an atomic load.
+	int32_t probes = xrt_atomic_s32_cmpxchg(&g_sim_display_probe_count, 0, 0);
+	out->change_counter = edges + (uint64_t)(uint32_t)probes;
+	out->ready = true;
+	out->verified = true;
+	out->calibrated = true;
+	if (!sim_display_fake_tracking_enabled()) {
+		out->tracker = XRT_PLUGIN_TRACKER_STATE_NONE;
+	} else {
+		out->tracker = tracking ? XRT_PLUGIN_TRACKER_STATE_RUNNING : XRT_PLUGIN_TRACKER_STATE_DOWN;
+	}
+	// The output mode is one process-singleton atomic, shared by every screen
+	// sim drives: it is the mode of THIS process (in a diagnostic process that
+	// is the SIM_DISPLAY_OUTPUT start-up mode, not a client's live one).
+	out->lens = sim_display_get_output_mode() == SIM_DISPLAY_OUTPUT_PASSTHROUGH ? XRT_PLUGIN_LENS_STATE_2D
+	                                                                            : XRT_PLUGIN_LENS_STATE_3D;
+	snprintf(out->model, sizeof(out->model), "Sim");
+	snprintf(out->serial, sizeof(out->serial), "SIM-%016llx", (unsigned long long)monitor_id);
+	out->warning_count = 1;
+	memset(out->warnings, 0, sizeof(out->warnings));
+	snprintf(out->warnings[0].code, sizeof(out->warnings[0].code), "SIMULATED");
+	out->warnings[0].level = XRT_PLUGIN_SCREEN_WARNING_LEVEL_INFO;
+	// UTF-8 em dash spelled out: MSVC reads this file in the ANSI code page.
+	snprintf(out->warnings[0].text, sizeof(out->warnings[0].text),
+	         "Simulated display processor \xE2\x80\x94 no hardware");
+	out->dashboard_command[0] = '\0';
+	return XRT_SUCCESS;
 }
 
 
@@ -392,6 +452,9 @@ static struct xrt_plugin_iface g_sim_display_iface = {
 #else
     .create_dp_d3d12_for_screen = NULL,
 #endif
+
+    /* ADR-051 D2: per-screen status for the dashboard (pure C, every platform). */
+    .get_screen_status = sim_display_plugin_get_screen_status,
 };
 
 

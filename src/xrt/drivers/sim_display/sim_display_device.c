@@ -154,6 +154,15 @@ sim_display_fake_tracking_enabled(void)
 bool
 sim_display_fake_tracking_is_tracking(void)
 {
+	return sim_display_fake_tracking_sample(NULL);
+}
+
+bool
+sim_display_fake_tracking_sample(uint64_t *out_edges)
+{
+	if (out_edges != NULL) {
+		*out_edges = 0;
+	}
 	if (!sim_display_fake_tracking_enabled()) {
 		return false; // Honest: sim_display never really tracks.
 	}
@@ -170,9 +179,14 @@ sim_display_fake_tracking_is_tracking(void)
 		return true; // Toggle on, no period: always tracking.
 	}
 
-	// Square wave: tracking for one period, lost for the next.
+	// Square wave: tracking for one period, lost for the next. Every
+	// half-period boundary is one edge.
 	int64_t now_ms = (int64_t)(os_monotonic_get_ns() / 1000000);
-	return ((now_ms / period_ms) % 2) == 0;
+	int64_t half_periods = now_ms / period_ms;
+	if (out_edges != NULL) {
+		*out_edges = (uint64_t)half_periods;
+	}
+	return (half_periods % 2) == 0;
 }
 
 void
