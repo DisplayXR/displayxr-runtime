@@ -221,6 +221,39 @@ void
 comp_metal_compositor_set_eye_tracking_mode(struct xrt_compositor *xc, uint32_t mode);
 
 /*!
+ * Runtime-owned window placement on macOS (ADR-050): take over the bound
+ * window's title-bar drag, edge / corner resize and zoom, phase-snap every
+ * step through the DP's `snap_window_rect` and apply it in the same Core
+ * Animation transaction as the frame woven for it. A no-op (AppKit keeps the
+ * window, logged once) when @p app_owned (the app chained
+ * `XR_COCOA_WINDOW_PLACEMENT_APP_OWNED_BIT_DXR`), `DXR_MACOS_NATIVE_DRAG=1`,
+ * an offscreen / shared-IOSurface / workspace session, or a bound view that
+ * is not its window's contentView. Call once, after creation.
+ *
+ * @ingroup comp_metal
+ */
+void
+comp_metal_compositor_setup_window_placement(struct xrt_compositor *xc, bool app_owned);
+
+/*!
+ * Phase-snap a proposed window origin with the session's display processor
+ * (xrt_display_processor_metal::snap_window_rect): the in-process route of
+ * xrWeaveSnapWindowRectDXR, for an app that owns its own placement. Backing
+ * px, same frame for both points. Outputs are always written (the target on
+ * false = no snap support / declined).
+ *
+ * @ingroup comp_metal
+ */
+bool
+comp_metal_compositor_snap_window_rect(struct xrt_compositor *xc,
+                                       int32_t origin_x,
+                                       int32_t origin_y,
+                                       int32_t target_x,
+                                       int32_t target_y,
+                                       int32_t *out_x,
+                                       int32_t *out_y);
+
+/*!
  * Multi-screen on macOS (ADR-047 D2): hand the compositor the system's screen
  * list and DP registry, so a window whose content view spans displays is
  * woven per segment, each by its own display's DP

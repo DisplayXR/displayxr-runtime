@@ -408,6 +408,57 @@ struct xrt_display_processor_metal
 	 * @param panel_y  Window content-view top edge, screen-relative backing px.
 	 */
 	void (*set_present_origin)(struct xrt_display_processor_metal *xdp, int32_t panel_x, int32_t panel_y);
+
+	/*!
+	 * Snap a proposed window origin to the nearest interlace-phase-equivalent
+	 * position (window-drag phase lock on macOS, ADR-050). The Metal twin of
+	 * @ref xrt_display_processor_vk::snap_window_rect (and D3D11 slot 18):
+	 * same signature, same semantics, so a plug-in can share one body (on
+	 * Leia: `srWeaverSnapToPhase`).
+	 *
+	 * The runtime owns the window gesture on macOS (it moves / resizes the
+	 * window itself, in the same Core Animation transaction as the frame
+	 * woven for the new origin); it calls this once per drag step with the
+	 * content origin at GESTURE START and the proposed content origin, and
+	 * moves the window to the answer. Only the DISPLACEMENT matters (the DP
+	 * canonicalises `target - origin`), so both points need only share one
+	 * frame.
+	 *
+	 * **Units — BACKING (device) pixels, top-down**, the same lattice as
+	 * @ref set_present_origin. Never points: a Retina scale factor does not
+	 * cancel the way a translation does.
+	 *
+	 * A snap PRESERVES the phase the window had at @p origin_x / @p origin_y;
+	 * it does not find a good one. A DP with no lens lattice (sim_display) or
+	 * no tracked viewer yet (SR answers SR_DECLINED) returns false and the
+	 * runtime uses the target unchanged — the move is still atomic, only
+	 * unsnapped.
+	 *
+	 * Must be cheap, non-blocking and free of side effects: a pure query. It
+	 * must not move a window, re-phase a live weaver, or touch the lens.
+	 *
+	 * Optional — absent slot (older plug-in `struct_size`) or NULL ⟹ no snap
+	 * support. Appended after @ref set_present_origin per ADR-020
+	 * (append-only within a major; no version bump — gated by
+	 * @ref XRT_DP_HAS_SLOT).
+	 *
+	 * @param      xdp       Pointer to self.
+	 * @param      origin_x  Gesture-start content left, backing px.
+	 * @param      origin_y  Gesture-start content top, backing px.
+	 * @param      target_x  Proposed content left, backing px, SAME frame as the origin.
+	 * @param      target_y  Proposed content top, backing px, SAME frame as the origin.
+	 * @param[out] out_x     Phase-snapped content left, in the caller's frame.
+	 * @param[out] out_y     Phase-snapped content top, in the caller's frame.
+	 * @return true if a snap was produced (out_x/out_y valid); false ⟹ the
+	 *         caller uses target_x/target_y unchanged.
+	 */
+	bool (*snap_window_rect)(struct xrt_display_processor_metal *xdp,
+	                         int32_t origin_x,
+	                         int32_t origin_y,
+	                         int32_t target_x,
+	                         int32_t target_y,
+	                         int32_t *out_x,
+	                         int32_t *out_y);
 };
 
 
@@ -467,7 +518,8 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, clear_local_zone_
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, get_scanout_caps)             == XRT_DP_METAL_BASE_OFF + 16 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, get_background_preview) == XRT_DP_METAL_BASE_OFF + 17 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, set_present_origin)     == XRT_DP_METAL_BASE_OFF + 18 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_metal)                                == XRT_DP_METAL_BASE_OFF + 19 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, snap_window_rect)       == XRT_DP_METAL_BASE_OFF + 19 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_metal)                                == XRT_DP_METAL_BASE_OFF + 20 * sizeof(void *), XRT_DP_ABI_MSG);
 
 /*!
  * Defined when this header carries the set_present_origin slot (multi-screen
@@ -476,6 +528,13 @@ XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_metal)                    
  * XRT_DP_VK_HAS_PRESENT_ORIGIN / XRT_DP_D3D11_HAS_PRESENT_ORIGIN).
  */
 #define XRT_DP_METAL_HAS_PRESENT_ORIGIN 1
+
+/*!
+ * Defined when this header carries the snap_window_rect slot (runtime-owned
+ * window placement on macOS, ADR-050), so a plug-in built against an older
+ * runtime header can #ifdef-guard its implementation.
+ */
+#define XRT_DP_METAL_HAS_SNAP_WINDOW_RECT 1
 
 /*!
  * Defined when this header carries the get_background_preview slot, so a
@@ -849,6 +908,41 @@ xrt_display_processor_metal_set_present_origin(struct xrt_display_processor_meta
 		return;
 	}
 	xdp->set_present_origin(xdp, panel_x, panel_y);
+}
+
+/*!
+ * @copydoc xrt_display_processor_metal::snap_window_rect
+ *
+ * Helper for calling through the function pointer. Returns false (and writes
+ * the target to the outputs) when the slot is absent (older plug-in
+ * `struct_size`), NULL, or the DP declined.
+ *
+ * @public @memberof xrt_display_processor_metal
+ */
+static inline bool
+xrt_display_processor_metal_snap_window_rect(struct xrt_display_processor_metal *xdp,
+                                             int32_t origin_x,
+                                             int32_t origin_y,
+                                             int32_t target_x,
+                                             int32_t target_y,
+                                             int32_t *out_x,
+                                             int32_t *out_y)
+{
+	if (out_x == NULL || out_y == NULL) {
+		return false;
+	}
+	*out_x = target_x;
+	*out_y = target_y;
+	if (!XRT_DP_HAS_SLOT(xdp, snap_window_rect) || xdp->snap_window_rect == NULL) {
+		return false;
+	}
+	int32_t sx = target_x, sy = target_y;
+	if (!xdp->snap_window_rect(xdp, origin_x, origin_y, target_x, target_y, &sx, &sy)) {
+		return false;
+	}
+	*out_x = sx;
+	*out_y = sy;
+	return true;
 }
 
 /*!

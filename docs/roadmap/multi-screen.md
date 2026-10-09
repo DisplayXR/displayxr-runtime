@@ -259,6 +259,8 @@ Slot and tag reservations (97/98, Win 106/107, tags 22/23/24/25) were approved b
   `set_present_origin` in backing px relative to the display's `CGDisplayBounds` origin — the
   units the Leia SR Metal weaver takes), sim_display Metal, and M3 per-segment views through the
   same state-tracker path (`docs/architecture/comp-segments.md` § *macOS / Metal*).
+  On macOS a straddling window is only fully visible with "Displays have separate Spaces" OFF
+  (the default is ON, which clips it to the display holding most of it; one-shot WARN, logout to change).
 
 ## 6. Risks and open questions
 

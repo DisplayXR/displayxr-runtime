@@ -5711,9 +5711,27 @@ oxr_session_create_impl(struct oxr_logger *log,
 			bool offscreen = (xsi->external_window_handle == NULL) &&
 			                 (xsi->readback_callback != NULL || xsi->shared_texture_handle != NULL);
 
-			return oxr_session_populate_metal_native(log, sys, metal, xsi->external_window_handle, offscreen,
-			                                        xsi->shared_texture_handle,
-			                                        xsi->transparent_background_enabled, *out_session);
+			XrResult mret = oxr_session_populate_metal_native(
+			    log, sys, metal, xsi->external_window_handle, offscreen, xsi->shared_texture_handle,
+			    xsi->transparent_background_enabled, *out_session);
+			if (mret != XR_SUCCESS) {
+				return mret;
+			}
+
+			// ADR-050: the runtime owns the window's drag + resize unless the
+			// app chained XrCocoaWindowPlacementInfoDXR with APP_OWNED (on the
+			// Cocoa binding's next chain, which this walk reaches too).
+			bool placement_app_owned = false;
+#ifdef XR_TYPE_COCOA_WINDOW_PLACEMENT_INFO_DXR
+			const XrCocoaWindowPlacementInfoDXR *placement = OXR_GET_INPUT_FROM_CHAIN(
+			    createInfo, XR_TYPE_COCOA_WINDOW_PLACEMENT_INFO_DXR, XrCocoaWindowPlacementInfoDXR);
+			if (placement != NULL &&
+			    (placement->flags & XR_COCOA_WINDOW_PLACEMENT_APP_OWNED_BIT_DXR) != 0) {
+				placement_app_owned = true;
+			}
+#endif
+			oxr_session_metal_native_setup_window_placement(*out_session, placement_app_owned);
+			return XR_SUCCESS;
 		}
 #else
 		U_LOG_IFL_I(U_LOGGING_INFO, "Metal native compositor NOT compiled in (XRT_HAVE_METAL_NATIVE_COMPOSITOR not defined)");

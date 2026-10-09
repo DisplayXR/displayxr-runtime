@@ -125,6 +125,12 @@ struct comp_metal_segments_frame
 	bool transparent_background;
 	//! The session's primary DP (weaves the primary screen's segment).
 	struct xrt_display_processor_metal *primary_dp;
+	//! Runtime-owned placement (ADR-050): also send the PRIMARY DP its
+	//! segment's present origin (computed, like every segment's, from the
+	//! rect this frame is woven for — the applied one). Without it the
+	//! primary DP falls back to polling its NSView, which mid-drag still
+	//! reports the pre-move position until the CA transaction commits.
+	bool primary_present_origin;
 };
 
 /*!
@@ -150,6 +156,20 @@ comp_metal_segments_set_display_mode(struct comp_metal_segments *segs, bool enab
  */
 bool
 comp_metal_segments_get_eyes(struct comp_metal_segments *segs, uint64_t screen_id, struct xrt_eye_positions *out);
+
+/*!
+ * Runtime-owned placement (ADR-050): the display processor to phase-snap a
+ * window drag with — the one of the screen holding (@p x_pt, @p y_pt), in
+ * top-down global points. @p primary_dp for the primary (system-default)
+ * screen or a point on no listed screen; that screen's segment DP when it has
+ * one; NULL for a listed screen without a DP (nothing to snap to). Commit
+ * thread only (the thread that creates / destroys segment DPs).
+ */
+struct xrt_display_processor_metal *
+comp_metal_segments_snap_dp_at(struct comp_metal_segments *segs,
+                               struct xrt_display_processor_metal *primary_dp,
+                               double x_pt,
+                               double y_pt);
 
 /*!
  * M3: the last update's table as per-segment view metrics (window rects in

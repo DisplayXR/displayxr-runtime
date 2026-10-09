@@ -637,6 +637,42 @@ comp_metal_segments_enabled(const struct comp_metal_segments *segs)
 	return segs != NULL && segs->enabled;
 }
 
+/*!
+ * macOS "Displays have separate Spaces" (com.apple.spaces `spans-displays`
+ * absent or false = ON, the default). With it ON the WindowServer shows a
+ * window spanning displays ONLY on the display holding most of it; the rest
+ * is clipped even though it is rendered and woven. The setting only changes
+ * after a logout, so one read per process is enough. Diagnostic only — no
+ * behaviour depends on it. `DXR_TEST_SEPARATE_SPACES=0|1` overrides the read
+ * (to exercise the warning on a box configured either way).
+ */
+static bool
+separate_spaces_on(void)
+{
+	static int cached = -1;
+	if (cached < 0) {
+		const char *e = getenv("DXR_TEST_SEPARATE_SPACES");
+		if (e != NULL && (e[0] == '0' || e[0] == '1')) {
+			cached = e[0] == '1' ? 1 : 0;
+		} else {
+			bool spans = false;
+			CFPropertyListRef v = CFPreferencesCopyAppValue(CFSTR("spans-displays"), CFSTR("com.apple.spaces"));
+			if (v != NULL) {
+				if (CFGetTypeID(v) == CFBooleanGetTypeID()) {
+					spans = CFBooleanGetValue((CFBooleanRef)v);
+				} else if (CFGetTypeID(v) == CFNumberGetTypeID()) {
+					int n = 0;
+					CFNumberGetValue((CFNumberRef)v, kCFNumberIntType, &n);
+					spans = n != 0;
+				}
+				CFRelease(v);
+			}
+			cached = spans ? 0 : 1;
+		}
+	}
+	return cached == 1;
+}
+
 bool
 comp_metal_segments_update(struct comp_metal_segments *segs, const struct comp_metal_seg_window *win, uint32_t mode_index)
 {
@@ -667,6 +703,17 @@ comp_metal_segments_update(struct comp_metal_segments *segs, const struct comp_m
 
 	const bool split = comp_segments_table_is_split(&segs->table_pt, win->frame_pt.w, win->frame_pt.h);
 	convert_table(segs);
+
+	// One-shot: a window spanning displays under separate Spaces is clipped
+	// by the WindowServer to the display holding most of it.
+	static bool warned_separate_spaces = false;
+	if (!warned_separate_spaces && segs->table_pt.count >= 2 && separate_spaces_on()) {
+		warned_separate_spaces = true;
+		U_LOG_W("macOS 'Displays have separate Spaces' is ON — a window spanning displays is shown only on the "
+		        "display holding most of it (the rest is rendered but clipped by the WindowServer); turn it off "
+		        "in System Settings → Desktop & Dock → Mission Control (requires logout) for multi-display "
+		        "windows");
+	}
 
 	// Re-ask each DP's resample tolerance on a mode or table change only.
 	const bool table_changed =
@@ -835,6 +882,26 @@ comp_metal_segments_record(struct comp_metal_segments *segs, const struct comp_m
 					xrt_display_processor_metal_set_present_origin(dp, g->present_origin_x,
 					                                               g->present_origin_y);
 				}
+			} else if (f->primary_present_origin && g->screen_1to1 != COMP_SEG_1TO1_NO) {
+				// ADR-050: the primary DP gets the applied origin too, in its
+				// screen's backing px relative to its CGDisplayBounds, so that
+				// origin + canvas offset = this segment's top-left on the panel
+				// (the same rule as every other segment). A DP that also polls
+				// its view must let this call win (the view lags the move).
+				xrt_display_processor_metal_set_present_origin(dp, g->present_origin_x, g->present_origin_y);
+				static int trace = -1;
+				if (trace < 0) {
+					const char *e = getenv("DXR_MACOS_PLACEMENT_TRACE");
+					trace = (e != NULL && e[0] == '1') ? 1 : 0;
+				}
+				static int32_t last_x = INT32_MIN, last_y = INT32_MIN;
+				if (trace == 1 && (g->present_origin_x != last_x || g->present_origin_y != last_y)) {
+					last_x = g->present_origin_x;
+					last_y = g->present_origin_y;
+					U_LOG_W("placement: split frame, primary DP present origin %d,%d (canvas %d,%d %ux%u)",
+					        g->present_origin_x, g->present_origin_y, g->window_rect.x, g->window_rect.y,
+					        g->window_rect.w, g->window_rect.h);
+				}
 			}
 			xrt_display_processor_metal_process_atlas(
 			    dp, (__bridge void *)cmd, (__bridge void *)st->crop, tile[k].w, tile[k].h, f->tile_columns,
@@ -999,6 +1066,25 @@ comp_metal_segments_get_metrics(const struct comp_metal_segments *segs,
 	out->window_pixel_width = segs->win.drawable_w;
 	out->window_pixel_height = segs->win.drawable_h;
 	return true;
+}
+
+struct xrt_display_processor_metal *
+comp_metal_segments_snap_dp_at(struct comp_metal_segments *segs,
+                               struct xrt_display_processor_metal *primary_dp,
+                               double x_pt,
+                               double y_pt)
+{
+	if (segs == NULL || !segs->enabled) {
+		return primary_dp;
+	}
+	for (uint32_t i = 0; i < segs->screen_count; i++) {
+		const struct comp_seg_rect *d = &segs->screens[i].desktop;
+		if (x_pt >= (double)d->x && x_pt < (double)d->x + (double)d->w && y_pt >= (double)d->y &&
+		    y_pt < (double)d->y + (double)d->h) {
+			return segs->screens[i].is_primary ? primary_dp : segs->st[i].dp;
+		}
+	}
+	return primary_dp;
 }
 
 bool

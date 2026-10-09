@@ -233,6 +233,12 @@ buffer, in order). What differs on macOS:
 - **sim_display** implements both slots on Metal (a bound DP loads the target and scissors to its
   canvas; every Metal sim output tolerates a resample, since INTERLACED falls back to anaglyph on
   this backend, #817), so a two-display Mac with no vendor hardware exercises the split path.
+- **"Displays have separate Spaces" clips a straddling window.** With that macOS setting ON (the
+  default: `com.apple.spaces` `spans-displays` absent or false) the WindowServer shows a window
+  spanning displays only on the display holding most of it; the other segments are rendered and
+  woven but never reach their panel. The runtime logs a one-shot WARN the first time a window
+  resolves to ≥ 2 segments under it (no behaviour change); turn it off in System Settings → Desktop
+  & Dock → Mission Control (requires logout). `DXR_TEST_SEPARATE_SPACES=0|1` overrides the read.
 - Test knob: `cube_handle_metal_macos` honours `DXR_TEST_WINDOW_RECT=x,y,w,h` (content rect, top-down
   points) and, once at frame `DXR_TEST_WINDOW_MOVE_FRAME` (default 300), `DXR_TEST_WINDOW_RECT2`.
 

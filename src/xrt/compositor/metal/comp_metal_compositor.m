@@ -21,6 +21,7 @@
 
 #include "comp_metal_compositor.h"
 #include "comp_metal_segments.h" // multi-screen on macOS
+#include "comp_metal_placement.h" // runtime-owned window placement (ADR-050)
 
 #include "util/comp_layer_accum.h"
 // #1581 quad layers: the shared per-view camera (#1580) and the N-view
@@ -467,6 +468,17 @@ struct comp_metal_compositor
 	//! Change-only logging of the routed layout.
 	uint32_t seg_route_logged_count;
 	uint32_t seg_route_logged_key[XRT_MAX_SEGMENTS * 6 + 2];
+
+	/*
+	 * Runtime-owned window placement on macOS (ADR-050): drag + resize are
+	 * the runtime's, phase-snapped by the DP and applied in the same CA
+	 * transaction as the frame woven for them. NULL = not eligible / opted
+	 * out (AppKit owns the window as before).
+	 */
+	struct comp_metal_placement *placement;
+	//! This commit's placement decision (valid while @ref placement_frame_valid).
+	struct comp_metal_placement_frame placement_frame;
+	bool placement_frame_valid;
 };
 
 //! Multi-screen M3: one segment's views placed in every tile (the mosaic).
@@ -584,6 +596,19 @@ metal_seg_window(struct comp_metal_compositor *c, id<MTLTexture> target, struct 
 	NSArray<NSScreen *> *screens = [NSScreen screens];
 	if (win == nil || target == nil || screens.count == 0) {
 		return false;
+	}
+	if (c->placement_frame_valid) {
+		// Runtime-owned placement (ADR-050): the rect this present is woven
+		// for — already applied on the main-thread path, about to be applied
+		// (in the same transaction) on the deferred one.
+		const struct comp_metal_placement_frame *pf = &c->placement_frame;
+		out->frame_pt.x = (int32_t)floor(pf->content_x + 0.5);
+		out->frame_pt.y = (int32_t)floor(pf->content_y + 0.5);
+		out->frame_pt.w = (uint32_t)floor(pf->content_w + 0.5);
+		out->frame_pt.h = (uint32_t)floor(pf->content_h + 0.5);
+		out->drawable_w = (uint32_t)target.width;
+		out->drawable_h = (uint32_t)target.height;
+		return out->frame_pt.w > 0 && out->frame_pt.h > 0;
 	}
 	NSRect in_win = [view convertRect:view.bounds toView:nil];
 	NSRect in_screen = [win convertRectToScreen:in_win];
@@ -3565,10 +3590,26 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	float dt = (c->last_frame_ns > 0) ? (float)(now_ns - c->last_frame_ns) / 1e9f : 0.016f;
 	c->last_frame_ns = now_ns;
 
+	// Runtime-owned placement (ADR-050): decide where this present goes and,
+	// on the main thread, open the CA transaction and apply the pending move
+	// / resize BEFORE the drawable is taken, so the frame is woven for the
+	// window's new origin and size and lands with it.
+	c->placement_frame_valid = false;
+	if (c->placement != NULL && c->shared_texture == nil && c->metal_layer != nil) {
+		c->placement_frame_valid =
+		    comp_metal_placement_begin_present(c->placement, (__bridge void *)c->metal_layer, &c->placement_frame);
+	}
+
 	// Update CAMetalLayer drawable size on window resize
 	if (c->metal_layer != nil && c->view != nil) {
 		NSRect backing = [c->view convertRectToBacking:c->view.bounds];
 		CGSize newSize = CGSizeMake(backing.size.width, backing.size.height);
+		if (c->placement_frame_valid) {
+			// The placement's content rect is the authority (the view itself
+			// is resized only on the main thread, possibly after this).
+			newSize = CGSizeMake(round(c->placement_frame.content_w * c->placement_frame.scale),
+			                     round(c->placement_frame.content_h * c->placement_frame.scale));
+		}
 		if (c->metal_layer.drawableSize.width != newSize.width ||
 		    c->metal_layer.drawableSize.height != newSize.height) {
 			c->metal_layer.drawableSize = newSize;
@@ -3594,6 +3635,11 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				        c->metal_layer.drawableSize.width, c->metal_layer.drawableSize.height,
 				        (void *)c->view.window, c->view.window != nil ? (int)[c->view.window isVisible] : -1);
 			}
+			if (c->placement_frame_valid) {
+				// Close the transaction (the move, if any, still lands).
+				comp_metal_placement_end_present(c->placement, NULL, NULL, &c->placement_frame);
+				c->placement_frame_valid = false;
+			}
 			return XRT_SUCCESS; // Non-fatal, skip this frame
 		}
 		static int s_first_drawable_logged = 0;
@@ -3608,6 +3654,10 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	id<MTLCommandBuffer> cmd_buf = [c->command_queue commandBuffer];
 	if (cmd_buf == nil) {
 		U_LOG_E("Failed to create command buffer");
+		if (c->placement_frame_valid) {
+			comp_metal_placement_end_present(c->placement, NULL, NULL, &c->placement_frame);
+			c->placement_frame_valid = false;
+		}
 		return XRT_SUCCESS;
 	}
 
@@ -4700,11 +4750,16 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 			// Blit content region from atlas into intermediate texture
 			id<MTLBlitCommandEncoder> blit = [cmd_buf blitCommandEncoder];
+			// Clamp to the atlas: a window larger than the display the atlas
+			// was sized for (a runtime-owned resize past the screen, a window
+			// spanning displays) must not read past it — the Metal debug layer
+			// asserts on that and the overflow is undefined otherwise.
 			[blit copyFromTexture:atlas_src
 			          sourceSlice:0
 			          sourceLevel:0
 			         sourceOrigin:MTLOriginMake(0, 0, 0)
-			           sourceSize:MTLSizeMake(content_w, content_h, 1)
+			           sourceSize:MTLSizeMake(MIN(content_w, (uint32_t)atlas_src.width),
+			                                  MIN(content_h, (uint32_t)atlas_src.height), 1)
 			            toTexture:c->dp_input_texture
 			     destinationSlice:0
 			     destinationLevel:0
@@ -4807,8 +4862,17 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			sf.target_height = dp_target_h;
 			sf.transparent_background = c->transparent_background;
 			sf.primary_dp = c->display_processor;
+			sf.primary_present_origin = c->placement_frame_valid;
 			comp_metal_segments_record(c->segments, &sf);
 		} else {
+		// Runtime-owned placement (ADR-050): the DP is told the APPLIED
+		// origin of the window this frame lands in. A DP that polls its own
+		// view position must let this call win.
+		if (c->placement_frame_valid) {
+			xrt_display_processor_metal_set_present_origin(c->display_processor,
+			                                               c->placement_frame.present_origin_x,
+			                                               c->placement_frame.present_origin_y);
+		}
 		// Effective canvas (#439): while a mask is active this is the
 		// full client-window rect — the DP weaves every pixel the mask
 		// can select (Phase-2 rule).
@@ -4902,10 +4966,20 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	}
 
 	// Present and commit
-	if (drawable != nil) {
-		[cmd_buf presentDrawable:drawable];
+	if (c->placement_frame_valid) {
+		// presentsWithTransaction: commit, wait until scheduled, present
+		// explicitly, close the transaction that moved the window (or hand
+		// both to the main thread) — comp_metal_placement_end_present.
+		[cmd_buf commit];
+		comp_metal_placement_end_present(c->placement, (__bridge void *)cmd_buf, (__bridge void *)drawable,
+		                                 &c->placement_frame);
+		c->placement_frame_valid = false;
+	} else {
+		if (drawable != nil) {
+			[cmd_buf presentDrawable:drawable];
+		}
+		[cmd_buf commit];
 	}
-	[cmd_buf commit];
 
 	// For shared texture mode, wait for GPU completion so the IOSurface
 	// is fully written before the app reads it.
@@ -4947,6 +5021,9 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	// while backing resources still exist — prevents crash when the
 	// run loop's pool drains after the compositor is already freed.
 	@autoreleasepool {
+
+	// 0. Give the window's drag / resize back to AppKit (ADR-050).
+	comp_metal_placement_destroy(&c->placement);
 
 	// 1. GPU drain — wait for all in-flight command buffers to finish
 	//    before releasing any resources they may reference.
@@ -5791,6 +5868,79 @@ comp_metal_compositor_request_display_mode(struct xrt_compositor *xc, bool enabl
 	// Delegate to display processor (may be a no-op for sim_display)
 	xrt_display_processor_metal_request_display_mode(c->display_processor, enable_3d);
 	return true;
+}
+
+/*!
+ * Snap provider for the runtime-owned placement (ADR-050): the DP of the
+ * screen holding the content origin — the primary (session) DP, or a
+ * segment's per-screen DP when the origin sits on another 3D screen. Runs on
+ * the commit thread (begin_present), the same thread that creates and
+ * destroys segment DPs, so no lock is needed.
+ */
+static bool
+metal_placement_snap(void *userdata,
+                     double probe_x,
+                     double probe_y,
+                     int32_t origin_x,
+                     int32_t origin_y,
+                     int32_t target_x,
+                     int32_t target_y,
+                     int32_t *out_x,
+                     int32_t *out_y)
+{
+	struct comp_metal_compositor *c = (struct comp_metal_compositor *)userdata;
+	struct xrt_display_processor_metal *dp = c->display_processor;
+	if (c->segments != NULL && comp_metal_segments_enabled(c->segments)) {
+		dp = comp_metal_segments_snap_dp_at(c->segments, c->display_processor, probe_x, probe_y);
+	}
+	if (dp == NULL) {
+		return false;
+	}
+	return xrt_display_processor_metal_snap_window_rect(dp, origin_x, origin_y, target_x, target_y, out_x, out_y);
+}
+
+void
+comp_metal_compositor_setup_window_placement(struct xrt_compositor *xc, bool app_owned)
+{
+	if (xc == NULL) {
+		return;
+	}
+	struct comp_metal_compositor *c = metal_comp(xc);
+	if (c->placement != NULL) {
+		return;
+	}
+	const char *why = NULL;
+	if (!comp_metal_placement_eligible((__bridge void *)c->view, c->offscreen, c->shared_iosurface != NULL,
+	                                   app_owned, &why)) {
+		U_LOG_W("macOS window placement: AppKit-owned (%s)", why != NULL ? why : "not eligible");
+		return;
+	}
+	c->placement = comp_metal_placement_create((__bridge void *)c->view, metal_placement_snap, c);
+}
+
+bool
+comp_metal_compositor_snap_window_rect(struct xrt_compositor *xc,
+                                       int32_t origin_x,
+                                       int32_t origin_y,
+                                       int32_t target_x,
+                                       int32_t target_y,
+                                       int32_t *out_x,
+                                       int32_t *out_y)
+{
+	if (out_x == NULL || out_y == NULL) {
+		return false;
+	}
+	*out_x = target_x;
+	*out_y = target_y;
+	if (xc == NULL) {
+		return false;
+	}
+	struct comp_metal_compositor *c = metal_comp(xc);
+	// Pure query against the session's own DP (the app-owned-placement
+	// route, xrWeaveSnapWindowRectDXR). Not the segment DPs: those are
+	// created and destroyed on the commit thread and this runs on the app's.
+	return xrt_display_processor_metal_snap_window_rect(c->display_processor, origin_x, origin_y, target_x,
+	                                                    target_y, out_x, out_y);
 }
 
 void

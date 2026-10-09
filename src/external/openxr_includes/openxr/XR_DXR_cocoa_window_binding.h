@@ -45,7 +45,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_cocoa_window_binding 1
-#define XR_DXR_cocoa_window_binding_SPEC_VERSION 6
+#define XR_DXR_cocoa_window_binding_SPEC_VERSION 8
 #define XR_DXR_COCOA_WINDOW_BINDING_EXTENSION_NAME "XR_DXR_cocoa_window_binding"
 
 // Use a value in the vendor extension range (1000000000+)
@@ -119,6 +119,45 @@ typedef struct XrCocoaWindowBindingCreateInfoDXR {
                                                            //!< on macOS. (Sibling of
                                                            //!< XrWin32WindowBindingCreateInfoDXR.transparentBackgroundEnabled.)
 } XrCocoaWindowBindingCreateInfoDXR;
+
+// ---- Spec v8: window placement ownership (ADR-050) ----
+
+#define XR_TYPE_COCOA_WINDOW_PLACEMENT_INFO_DXR ((XrStructureType)1004999330)
+
+typedef XrFlags64 XrCocoaWindowPlacementFlagsDXR;
+
+/*!
+ * The APP keeps its window's drag / resize: the runtime does not take the
+ * gesture over (see XrCocoaWindowPlacementInfoDXR).
+ */
+static const XrCocoaWindowPlacementFlagsDXR XR_COCOA_WINDOW_PLACEMENT_APP_OWNED_BIT_DXR = 0x00000001;
+
+/*!
+ * @brief Who owns the bound window's drag + resize (spec v8, ADR-050).
+ *
+ * By default (this structure absent, or no bit set) the runtime OWNS the
+ * window's placement for an in-process Metal session whose bound view is its
+ * window's contentView: a title-bar drag, an edge / corner resize and the
+ * zoom button are performed by the runtime, each step phase-snapped by the
+ * display processor and applied in the same Core Animation transaction as
+ * the frame woven for it, so a lenticular weave never shows a stale or
+ * off-phase frame while the window moves. The runtime makes the window
+ * non-movable for AppKit (`movable = NO`) and installs a forwarding proxy as
+ * its delegate (the app's delegate keeps receiving every message; compare
+ * delegates with -isEqual:, not ==).
+ *
+ * Chain this structure on XrCocoaWindowBindingCreateInfoDXR::next with
+ * XR_COCOA_WINDOW_PLACEMENT_APP_OWNED_BIT_DXR to keep AppKit's native
+ * drag / resize — e.g. an app with its own window-management UI. Such an app
+ * can still snap its own moves with xrWeaveSnapWindowRectDXR (XR_DXR_weave).
+ *
+ * @extends XrCocoaWindowBindingCreateInfoDXR
+ */
+typedef struct XrCocoaWindowPlacementInfoDXR {
+    XrStructureType                type;   //!< Must be XR_TYPE_COCOA_WINDOW_PLACEMENT_INFO_DXR
+    const void* XR_MAY_ALIAS       next;   //!< Pointer to next structure in chain
+    XrCocoaWindowPlacementFlagsDXR flags;  //!< XR_COCOA_WINDOW_PLACEMENT_APP_OWNED_BIT_DXR or 0
+} XrCocoaWindowPlacementInfoDXR;
 
 #ifdef __cplusplus
 }

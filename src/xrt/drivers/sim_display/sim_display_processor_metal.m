@@ -30,6 +30,13 @@
 #include <string.h>
 
 DEBUG_GET_ONCE_FLOAT_OPTION(sim_display_nominal_z_m_metal, "SIM_DISPLAY_NOMINAL_Z_M", 0.60f)
+// ADR-050 test double: a phase lattice for the runtime-owned macOS placement.
+// 0 (default) = the snap_window_rect slot stays NULL, like any DP without a
+// lens lattice. N > 1 = snap horizontal displacement to whole multiples of N
+// backing px (the shape of the VK test double), so the runtime's snapped
+// drag, the L/T resize's size absorption and the Retina reachable-lattice
+// search can be exercised without hardware.
+DEBUG_GET_ONCE_NUM_OPTION(sim_display_metal_snap_period, "SIM_DISPLAY_METAL_SNAP_PERIOD", 0)
 
 
 /*
@@ -411,6 +418,34 @@ sim_dp_metal_set_present_origin(struct xrt_display_processor_metal *xdp, int32_t
 }
 
 /*!
+ * ADR-050 test double (SIM_DISPLAY_METAL_SNAP_PERIOD > 1 only): preserve the
+ * phase of a vertical lattice of that period — snap the horizontal
+ * displacement from the gesture-start origin to whole periods; y passes
+ * through (a vertical lenticular's phase does not depend on y).
+ */
+static bool
+sim_dp_metal_snap_window_rect(struct xrt_display_processor_metal *xdp,
+                              int32_t origin_x,
+                              int32_t origin_y,
+                              int32_t target_x,
+                              int32_t target_y,
+                              int32_t *out_x,
+                              int32_t *out_y)
+{
+	(void)xdp;
+	(void)origin_y;
+	const int32_t period = (int32_t)debug_get_num_option_sim_display_metal_snap_period();
+	if (out_x == NULL || out_y == NULL || period <= 1) {
+		return false;
+	}
+	const int32_t dx = target_x - origin_x;
+	const int32_t n = dx >= 0 ? (dx + period / 2) / period : -((-dx + period / 2) / period);
+	*out_x = origin_x + n * period;
+	*out_y = target_y;
+	return true;
+}
+
+/*!
  * Seed the per-instance screen from a binding (multi-screen). Physical size
  * from the EDID mm, else the process-wide panel's; pixels from the device
  * mode, else the desktop size; origin = the screen's desktop origin. Same rules
@@ -747,6 +782,11 @@ sim_display_processor_metal_create_bound(enum sim_display_output_mode mode,
 	sdp->base.clear_local_zone_mask = sim_dp_metal_clear_local_zone_mask;     // #224 / ADR-027
 	sdp->base.get_scanout_caps = sim_dp_metal_get_scanout_caps;
 	sdp->base.set_present_origin = sim_dp_metal_set_present_origin; // multi-screen (macOS)
+	// ADR-050: NULL unless the test double is asked for — sim's Metal
+	// backend has no lens lattice, so by default a drag is atomic but unsnapped.
+	if (debug_get_num_option_sim_display_metal_snap_period() > 1) {
+		sdp->base.snap_window_rect = sim_dp_metal_snap_window_rect;
+	}
 	sim_dp_metal_bind_screen(sdp, binding);
 
 	// #224 / ADR-027 zone test double config (shared parser).
