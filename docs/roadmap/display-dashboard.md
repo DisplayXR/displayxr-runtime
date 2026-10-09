@@ -353,7 +353,7 @@ enable is a shared vote that `destroy` does not withdraw); config resolve at mos
 | **1** ✅ landed | `xrt_display_status.h`; headless builder `target_status_snapshot_build_headless` (targets/common) + pure `u_status_warnings_derive` / `u_status_snapshot_to_cjson` / `u_status_snapshot_format_text` (aux_util); `displayxr-cli status [--json]` (`status_fetch_service` stub for phase 2); warnings §4; `struct ipc_service_health` + `ipc_server_get_health` behind `[HEALTH]`, `struct comp_d3d11_render_diag` + `comp_d3d11_service_get_render_diag` behind `[RENDER]` (log lines byte-identical); `tests_status_snapshot` | — |
 | **2** | the three DIAG RPCs, generation counters, `status --watch`; `clients` gains presenter / lease / window / owner | 1 |
 | **3** ✅ | plug-in slot `get_screen_status` + `sim_display` implementation + iface doc — **landed** (slot first; its consumer arrives with 1/2) | 1 |
-| **4** | Control Panel: tabs, long-lived `--watch` child, Displays + Windows pages, desktop map, Overview summary line | 2 |
+| **4** ✅ landed | Control Panel: tabs (Overview / Displays / Windows / Performance / Developer placeholder), long-lived `--watch` child read on a thread, Displays + Windows pages, desktop map, Overview summary line, Displays warn/critical badge. Caveat: landed before phase 2, so only the automatic fallback (a child that exits after one snapshot or within 5 s flips the feed to polling headless `status --json` every 30 s, the headless cadence rule: a headless run creates a vendor instance) was exercised; the `--watch` NDJSON path is untested until phase 2 ships | 2 |
 | **5** | MCP `get_status_snapshot` (session-free, wraps the CLI) | 2 |
 | **6** | the vendor plug-in fills the cell from the SDK query; "Open in vendor" | 3 + §9.1–9.2 |
 
