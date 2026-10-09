@@ -2760,6 +2760,7 @@ cli_query_print_info_json(const struct cli_query_result *r)
 	char *out = cJSON_Print(root);
 	if (out != NULL) {
 		printf("%s\n", out);
+		fflush(stdout); // #1892: the tail must be out before any teardown
 		cJSON_free(out);
 	}
 	cJSON_Delete(root);
