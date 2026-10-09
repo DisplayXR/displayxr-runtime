@@ -22,6 +22,8 @@
 #include "xrt/xrt_results.h"
 #include "util/u_logging.h"
 
+#include "util/u_status_snapshot.h"
+
 #include "client/ipc_client_connection.h"
 #include "client/ipc_client.h"
 #include "ipc_client_generated.h"
@@ -98,7 +100,8 @@ cli_cmd_clients(int argc, const char **argv)
 		printf("{\"connected\": true, \"workspace_active\": %s, \"clients\": [", ws_active ? "true" : "false");
 	} else {
 		printf("service: connected, workspace_mode=%s, clients=%u\n", ws_active ? "on" : "off", list.id_count);
-		printf("%-5s %-7s %-14s %-32s %-8s %-3s\n", "id", "pid", "class", "name", "session", "io");
+		printf("%-5s %-7s %-14s %-32s %-8s %-3s %-14s %-10s %-24s %-18s\n", "id", "pid", "class", "name",
+		       "session", "io", "presenter", "lease", "window", "owner_screen");
 	}
 
 	uint32_t printed = 0;
@@ -109,19 +112,58 @@ cli_cmd_clients(int argc, const char **argv)
 		}
 		bool self = strcmp(ias.info.application_name, "displayxr-cli") == 0 &&
 		            ias.client_class == XRT_CLIENT_CLASS_DIAG;
+
+		// ADR-051: presenter / lease / window / owner screen, from the
+		// service's status row for this client (absent on an older service).
+		struct xrt_status_client row;
+		struct xrt_segment_metrics seg;
+		struct xrt_status_generation gen;
+		memset(&row, 0, sizeof(row));
+		const bool have_row =
+		    ipc_call_system_get_client_segments(&ipc_c, ias.id, &row, &seg, &gen) == XRT_SUCCESS;
+		char window[48] = "-";
+		char owner[24] = "-";
+		if (have_row && row.window.valid) {
+			snprintf(window, sizeof(window), "%d,%d %ux%u", row.window.left, row.window.top,
+			         row.window.width, row.window.height);
+		}
+		if (have_row && row.owner_screen != 0) {
+			snprintf(owner, sizeof(owner), "0x%016llx", (unsigned long long)row.owner_screen);
+		}
+		const char *presenter = have_row ? u_status_presenter_str(row.presenter) : "-";
+		const char *lease = have_row ? u_status_lease_str(row.lease) : "-";
+
 		if (json) {
 			printf(
 			    "%s{\"id\": %u, \"pid\": %d, \"class\": \"%s\", \"name\": \"%s\", \"active\": %s, "
-			    "\"visible\": %s, \"focused\": %s, \"primary\": %s, \"io_active\": %s}",
+			    "\"visible\": %s, \"focused\": %s, \"primary\": %s, \"io_active\": %s",
 			    printed ? ", " : "", ias.id, (int)ias.pid, class_str(ias.client_class),
 			    ias.info.application_name, ias.session_active ? "true" : "false",
 			    ias.session_visible ? "true" : "false", ias.session_focused ? "true" : "false",
 			    ias.primary_application ? "true" : "false", ias.io_active ? "true" : "false");
+			// ADR-051 keys (null when the service has no status row for it).
+			if (have_row) {
+				printf(", \"presenter\": \"%s\", \"lease\": \"%s\"", presenter, lease);
+			} else {
+				printf(", \"presenter\": null, \"lease\": null");
+			}
+			if (have_row && row.window.valid) {
+				printf(", \"window\": {\"left\": %d, \"top\": %d, \"width\": %u, \"height\": %u}",
+				       row.window.left, row.window.top, row.window.width, row.window.height);
+			} else {
+				printf(", \"window\": null");
+			}
+			if (have_row && row.owner_screen != 0) {
+				printf(", \"owner_screen\": \"%s\"}", owner);
+			} else {
+				printf(", \"owner_screen\": null}");
+			}
 		} else {
-			printf("%-5u %-7d %-14s %-32.32s %c%c%c      %c%s\n", ias.id, (int)ias.pid,
-			       class_str(ias.client_class), ias.info.application_name, ias.session_active ? 'a' : '-',
-			       ias.session_visible ? 'v' : '-', ias.session_focused ? 'f' : '-',
-			       ias.io_active ? 'y' : 'n',
+			printf("%-5u %-7d %-14s %-32.32s %c%c%c      %c   %-14s %-10s %-24s %-18s%s\n", ias.id,
+			       (int)ias.pid, class_str(ias.client_class), ias.info.application_name,
+			       ias.session_active ? 'a' : '-', ias.session_visible ? 'v' : '-',
+			       ias.session_focused ? 'f' : '-', ias.io_active ? 'y' : 'n', presenter, lease, window,
+			       owner,
 			       self                      ? "  (self)"
 			       : ias.primary_application ? "  PRIMARY"
 			                                 : "");
