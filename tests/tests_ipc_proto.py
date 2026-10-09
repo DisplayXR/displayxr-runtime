@@ -155,7 +155,10 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # client/service pair at connect anyway).
         names = [c.name for c in self.p.calls]
         tail = ["compositor_segments_enable", "compositor_get_segment_metrics", "compositor_set_view_routing"]
-        self.assertEqual(names[-3:], tail)
+        i = names.index(tail[0])
+        self.assertEqual(names[i:i + 3], tail)
+        # Only later appends may follow them (ADR-051's status calls).
+        self.assertTrue(all(n.startswith("system_get_") for n in names[i + 3:]), names[i + 3:])
         enable = self._call("compositor_segments_enable")
         self.assertEqual([(a.name, a.typename) for a in enable.in_args], [("pinned_display_id", "uint64_t")])
         get = self._call("compositor_get_segment_metrics")
@@ -164,6 +167,32 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         route = self._call("compositor_set_view_routing")
         self.assertEqual([(a.name, a.typename) for a in route.in_args],
                          [("routing", "struct xrt_segment_view_routing")])
+
+    def test_status_calls_are_appended(self):
+        # ADR-051 D3 (display dashboard phase 2): the three session-free DIAG
+        # status calls ride at the END of proto.json (append-only), and the
+        # snapshot crosses in fixed-size pieces — the head + one screen row per
+        # call, one client row per call — each carrying its generation.
+        names = [c.name for c in self.p.calls]
+        tail = ["system_get_status_generation", "system_get_status_snapshot", "system_get_client_segments"]
+        self.assertEqual(names[-3:], tail)
+        gen = self._call("system_get_status_generation")
+        self.assertEqual(gen.in_args, [])
+        self.assertEqual([(a.name, a.typename) for a in gen.out_args],
+                         [("generation", "struct xrt_status_generation")])
+        snap = self._call("system_get_status_snapshot")
+        self.assertEqual([(a.name, a.typename) for a in snap.in_args], [("screen_index", "uint32_t")])
+        self.assertEqual([(a.name, a.typename) for a in snap.out_args],
+                         [("head", "struct xrt_status_head"), ("screen", "struct xrt_status_screen")])
+        seg = self._call("system_get_client_segments")
+        self.assertEqual([(a.name, a.typename) for a in seg.in_args], [("client_id", "uint32_t")])
+        self.assertEqual([(a.name, a.typename) for a in seg.out_args],
+                         [("client", "struct xrt_status_client"), ("metrics", "struct xrt_segment_metrics"),
+                          ("generation", "struct xrt_status_generation")])
+        for call in (gen, snap, seg):
+            self.assertFalse(call.in_handles, call.name)
+            self.assertFalse(call.out_handles, call.name)
+            self.assertFalse(call.varlen, call.name)
 
 
 if __name__ == "__main__":
