@@ -524,6 +524,26 @@ jobs:
           }
           Write-Host "PASS: headless self-test + per-display claim resolution succeeded."
 
+      # The DisplayXR Dashboard (src/dashboard, Avalonia/.NET) is published into
+      # _package/bin before the installer is packed, so the installer ships it.
+      # Soft: a dashboard failure must not block the runtime installer (the
+      # Dashboard job below is where it fails loudly).
+      - name: Setup .NET (dashboard)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.x'
+
+      - name: Publish DisplayXR Dashboard into the package
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        continue-on-error: true
+        shell: pwsh
+        run: >-
+          dotnet publish src/dashboard/DisplayXR.Dashboard/DisplayXR.Dashboard.csproj
+          -c Release -r win-x64 --self-contained true
+          -p:PublishSingleFile=true -p:PublishTrimmed=false -p:EnableCompressionInSingleFile=true
+          -o _package/bin --nologo
+
       - name: Build Installer
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: cmake --build build --config Release --target installer
@@ -567,6 +587,48 @@ jobs:
 
       # No OneDrive upload: reviewers use the upload-artifact steps above; release
       # assets attach to the GitHub Release on tag (the single distribution point).
+
+  # The DisplayXR Dashboard (src/dashboard): an Avalonia / .NET renderer over
+  # displayxr-cli (ADR-051 D4). Tests + a self-contained single-file publish,
+  # uploaded as an artifact. Not a required check; doc-only PRs skip the work.
+  Dashboard:
+    needs: DetectChanges
+    runs-on: windows-2022
+    steps:
+      - name: Doc-only PR — skipping the dashboard build
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "DetectChanges flagged docs_only=true; nothing to build."
+
+      - name: Checkout repository
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/checkout@v5
+
+      - name: Setup .NET
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.x'
+
+      - name: Test
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: dotnet test src/dashboard/DisplayXR.Dashboard.sln -c Release --nologo
+
+      - name: Publish displayxr-dashboard.exe
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: >-
+          dotnet publish src/dashboard/DisplayXR.Dashboard/DisplayXR.Dashboard.csproj
+          -c Release -r win-x64 --self-contained true
+          -p:PublishSingleFile=true -p:PublishTrimmed=false -p:EnableCompressionInSingleFile=true
+          -o dashboard-out --nologo
+
+      - name: Upload dashboard
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          retention-days: 7
+          name: DisplayXR-Dashboard
+          if-no-files-found: error
+          path: dashboard-out/displayxr-dashboard.exe
 
   # All Windows test apps, built in one shot through the globbing aggregator
   # (test_apps/CMakeLists.txt discovers every <class>/<app>/CMakeLists.txt and
