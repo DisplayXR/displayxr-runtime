@@ -4058,6 +4058,77 @@ ipc_handle_system_get_display_status(volatile struct ipc_client_state *_ics, str
 	return XRT_SUCCESS;
 }
 
+/*
+ * ADR-051 D3 (display dashboard phase 2): the service's display status
+ * snapshot, session-free, for DIAG clients only (`displayxr-cli status`, the
+ * Control Panel through it, the MCP surface through the CLI). Read-only. The
+ * snapshot crosses in fixed-size pieces — the head with one screen row per
+ * `system_get_status_snapshot(screen_index)`, one client row per
+ * `system_get_client_segments(client_id)` — each carrying the generation it
+ * belongs to, so a reader that sees two generations refetches.
+ */
+static xrt_result_t
+require_status_diag(volatile struct ipc_client_state *ics, const char *what)
+{
+	if (ics->client_state.client_class != XRT_CLIENT_CLASS_DIAG) {
+		IPC_WARN(ics->server, "%s: denied — caller pid %ld is class %s (display status: DIAG only).", what,
+		         (long)ics->client_state.pid, ipc_server_client_class_str(ics->client_state.client_class));
+		return XRT_ERROR_NOT_AUTHORIZED;
+	}
+	return XRT_SUCCESS;
+}
+
+static_assert(sizeof(struct ipc_system_get_status_snapshot_msg) <= IPC_BUF_SIZE,
+              "system_get_status_snapshot message exceeds IPC_BUF_SIZE");
+static_assert(sizeof(struct ipc_system_get_client_segments_msg) <= IPC_BUF_SIZE,
+              "system_get_client_segments message exceeds IPC_BUF_SIZE");
+
+xrt_result_t
+ipc_handle_system_get_status_generation(volatile struct ipc_client_state *ics,
+                                        struct xrt_status_generation *out_generation)
+{
+	memset(out_generation, 0, sizeof(*out_generation));
+	xrt_result_t xret = require_status_diag(ics, "system_get_status_generation");
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	return ipc_server_status_get_generation(ics->server, out_generation);
+}
+
+xrt_result_t
+ipc_handle_system_get_status_snapshot(volatile struct ipc_client_state *ics,
+                                      uint32_t screen_index,
+                                      struct xrt_status_head *out_head,
+                                      struct xrt_status_screen *out_screen)
+{
+	memset(out_head, 0, sizeof(*out_head));
+	memset(out_screen, 0, sizeof(*out_screen));
+	xrt_result_t xret = require_status_diag(ics, "system_get_status_snapshot");
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	return ipc_server_status_get_snapshot_piece(ics->server, screen_index, out_head, out_screen);
+}
+
+xrt_result_t
+ipc_handle_system_get_client_segments(volatile struct ipc_client_state *ics,
+                                      uint32_t client_id,
+                                      struct xrt_status_client *out_client,
+                                      struct xrt_segment_metrics *out_metrics,
+                                      struct xrt_status_generation *out_generation)
+{
+	memset(out_client, 0, sizeof(*out_client));
+	memset(out_metrics, 0, sizeof(*out_metrics));
+	memset(out_generation, 0, sizeof(*out_generation));
+	xrt_result_t xret = require_status_diag(ics, "system_get_client_segments");
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	// Any client's table, read-only — compositor_get_segment_metrics stays
+	// own-session.
+	return ipc_server_status_get_client(ics->server, client_id, out_client, out_metrics, out_generation);
+}
+
 xrt_result_t
 ipc_handle_system_get_properties(volatile struct ipc_client_state *_ics, struct xrt_system_properties *out_properties)
 {

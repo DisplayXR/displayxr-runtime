@@ -25,6 +25,7 @@
 #include "xrt/xrt_space.h"
 #include "xrt/xrt_tracking.h"
 #include "xrt/xrt_display_metrics.h"
+#include "xrt/xrt_display_status.h"
 #include "xrt/xrt_stereo_camera.h"
 #include "xrt/xrt_screen.h"
 #include "xrt/xrt_config_build.h"

@@ -1344,5 +1344,32 @@
 		"in": [
 			{"name": "routing", "type": "struct xrt_segment_view_routing"}
 		]
+	},
+
+	"system_get_status_generation": {
+		"out": [
+			{"name": "generation", "type": "struct xrt_status_generation"}
+		]
+	},
+
+	"system_get_status_snapshot": {
+		"in": [
+			{"name": "screen_index", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "head", "type": "struct xrt_status_head"},
+			{"name": "screen", "type": "struct xrt_status_screen"}
+		]
+	},
+
+	"system_get_client_segments": {
+		"in": [
+			{"name": "client_id", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "client", "type": "struct xrt_status_client"},
+			{"name": "metrics", "type": "struct xrt_segment_metrics"},
+			{"name": "generation", "type": "struct xrt_status_generation"}
+		]
 	}
 }
