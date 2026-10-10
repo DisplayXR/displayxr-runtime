@@ -82,7 +82,7 @@ public sealed class DashboardContext
             var r = await Cli.RunAsync("info --json", InfoTimeout);
             InfoResult? info = null;
             string? err = null;
-            if (r.Started && !r.TimedOut && InfoResult.TryParse(r.Stdout, out info, out err))
+            if (r.Started && !r.TimedOut && InfoResult.TryParse(r.Json, out info, out err))
             {
                 Info = info;
                 InfoError = null;
@@ -131,7 +131,7 @@ public sealed class DashboardContext
         try
         {
             var r = await Cli.RunAsync("dp list --json", InfoTimeout);
-            if (r.Ok && DpList.TryParse(r.Stdout, out var list)) { Dp = list; DpError = null; _dpWhen = DateTime.Now; }
+            if (r.Ok && DpList.TryParse(r.Json, out var list)) { Dp = list; DpError = null; _dpWhen = DateTime.Now; }
             else DpError = r.Ok ? "Could not read 'displayxr-cli dp list --json'." : r.Summary;
         }
         catch (Exception ex) { DpError = ex.Message; DashboardLog.Error("dp list", ex); }
@@ -150,7 +150,7 @@ public sealed class DashboardContext
         try
         {
             var r = await Cli.RunAsync("perf list --json", ActionTimeout);
-            if (r.Ok && PerfStateParser.TryParse(r.Stdout, out var p)) { Perf = p; PerfError = null; PerfWhen = DateTime.Now; }
+            if (r.Ok && PerfStateParser.TryParse(r.Json, out var p)) { Perf = p; PerfError = null; PerfWhen = DateTime.Now; }
             else PerfError = r.Ok ? "Could not read 'displayxr-cli perf list --json'." : r.Summary;
         }
         catch (Exception ex) { PerfError = ex.Message; DashboardLog.Error("perf list", ex); }
@@ -166,8 +166,12 @@ public sealed class DashboardContext
         try
         {
             var r = await Cli.RunAsync("selftest --json", SelftestTimeout);
-            if (r.Started && !r.TimedOut && SelftestResult.TryParse(r.Stdout, DateTime.Now, out var st)) Selftest = st;
-            else SelftestError = r.Summary;
+            if (r.Started && !r.TimedOut && SelftestResult.TryParse(r.Json, DateTime.Now, out var st)) Selftest = st;
+            else
+            {
+                SelftestError = r.Summary;
+                DashboardLog.Warn($"selftest: exit {r.ExitCode}, timed out {r.TimedOut}, {r.Stdout.Length} bytes stdout; stderr tail: {Tail(r.Stderr)}");
+            }
         }
         catch (Exception ex) { SelftestError = ex.Message; DashboardLog.Error("selftest", ex); }
         finally
@@ -222,6 +226,8 @@ public sealed class DashboardContext
         if (area is "dp" or "screen-dp") await LoadDpAsync(force: true);
         if (area == "runtime") await LoadInfoAsync(force: true);
     }
+
+    private static string Tail(string s) => s.Length <= 400 ? s : s[^400..];
 
     public bool HasMultipleAdapters => Info?.Gpu is { Probed: true } g && g.Adapters.Count > 1;
 

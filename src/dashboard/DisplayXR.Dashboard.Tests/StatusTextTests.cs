@@ -192,6 +192,16 @@ public class StatusTextTests
     }
 
     [Fact]
+    public void CliResult_SlicesJsonAndSkipsLogLines()
+    {
+        var r = new CliResult(1, "WARN [x] plug-in chatter\n{\"verdict\":\"PASS\"}\ntrailing", "WARN [y] a\n ERROR [z] b\n", false, null);
+        Assert.Equal("{\"verdict\":\"PASS\"}", r.Json);
+        var noOut = new CliResult(3, "", "WARN [sanitize] pre-load\nERROR [ipc] gone\n", false, null);
+        Assert.Equal("displayxr-cli exited with code 3 without a result.", noOut.Summary);
+        Assert.Equal("PreferredPlugin set.", new CliResult(0, " WARN [a] b\nPreferredPlugin set.\n", "", false, null).Summary);
+    }
+
+    [Fact]
     public void VendorCommand_IsNotParsed()
     {
         Assert.Equal("v.exe --page displays --display SN1 --id 0x1",

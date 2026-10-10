@@ -281,9 +281,9 @@ public sealed class StatusFeed : IDisposable
         _pollInFlight = false;
         if (gen != _pollGen || Mode != FeedMode.Polling || !Wanted) return;
         _pollsSinceWatch++;
-        if (result.Started && !result.TimedOut && StatusSnapshotParser.TryParse(result.Stdout, out _, out _))
+        if (result.Started && !result.TimedOut && StatusSnapshotParser.TryParse(result.Json, out _, out _))
         {
-            Accept(result.Stdout);
+            Accept(result.Json);
         }
         else
         {
