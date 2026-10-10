@@ -249,6 +249,10 @@ struct comp_vk_split
 	//! app thread's xrLocateViews. Taken before @ref dp_mutex, never after.
 	struct os_mutex seg_mutex;
 	struct xrt_segment_metrics seg_pub; //!< the table the last weave took (count 0 = one view set)
+	//! #1883: the partition staged for the next submit, and each submitted
+	//! frame's partition keyed by its bridge sequence (the egress slot lags).
+	struct comp_segments_content seg_content_staged;
+	struct comp_segments_content_ring seg_content_ring;
 	/*!
 	 * Guards @ref dp against the app-thread forwarders below: the segment
 	 * manager swaps it for a windowless per-screen DP (and back) when the
@@ -916,6 +920,19 @@ comp_vk_split_set_screens(struct comp_vk_split *s,
 	os_mutex_lock(&s->seg_mutex);
 	memset(&s->seg_pub, 0, sizeof(s->seg_pub));
 	os_mutex_unlock(&s->seg_mutex);
+}
+
+extern "C" void
+comp_vk_split_stage_segment_content(struct comp_vk_split *s, const struct comp_segments_content *content)
+{
+	if (s == nullptr) {
+		return;
+	}
+	if (content != nullptr) {
+		s->seg_content_staged = *content;
+	} else {
+		memset(&s->seg_content_staged, 0, sizeof(s->seg_content_staged));
+	}
 }
 
 extern "C" bool
@@ -2025,6 +2042,8 @@ comp_vk_split_submit_atlas(struct comp_vk_split *s,
 		}
 	}
 	s->seq++;
+	// #1883: the slot this fills carries the frame's segment partition.
+	comp_segments_content_ring_put(&s->seg_content_ring, s->seq, &s->seg_content_staged);
 	comp_xbridge_submit(s->xbridge, s->seq, s->layout_gen, handoff->texture, content_w, content_h);
 	if (km != nullptr) {
 		km->ReleaseSync(0);
@@ -2597,8 +2616,22 @@ comp_vk_split_weave_and_present(struct comp_vk_split *s, bool is_repaint, const 
 		 * compositor drives it under its own split: crop per segment out of
 		 * the egress slot, each screen's DP over its canvas, flat 2D through
 		 * the output composite unit where a segment cannot weave.
+		 *
+		 * #1883: the slot was painted a frame or two before the frame being
+		 * committed, so its per-segment mosaic sits where THAT frame's routing
+		 * put it; the crop reads the slot's own partition (by its sequence).
+		 * A slot no longer in the ring is treated as unrouted (live crop).
 		 */
+		struct comp_segments_content slot_content = {};
+		{
+			uint64_t slot_seq = 0;
+			if (!comp_xbridge_slot_seq(s->xbridge, slot, &slot_seq) ||
+			    !comp_segments_content_ring_get(&s->seg_content_ring, slot_seq, &slot_content)) {
+				memset(&slot_content, 0, sizeof(slot_content));
+			}
+		}
 		struct comp_d3d11_segments_frame sf = {};
+		sf.content = &slot_content;
 		sf.context = s->out_ctx;
 		sf.src_srv = atlas_srv;
 		sf.view_width = weave_view_w;
@@ -3129,6 +3162,13 @@ comp_vk_split_set_screens(struct comp_vk_split *split,
 	(void)list;
 	(void)info;
 	(void)pinned_display_id;
+}
+
+extern "C" void
+comp_vk_split_stage_segment_content(struct comp_vk_split *split, const struct comp_segments_content *content)
+{
+	(void)split;
+	(void)content;
 }
 
 extern "C" bool

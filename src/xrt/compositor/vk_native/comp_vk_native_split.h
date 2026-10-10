@@ -123,6 +123,7 @@ struct comp_vk_split;
 struct xrt_screen_list;
 struct xrt_segment_metrics;
 struct xrt_system_compositor_info;
+struct comp_segments_content;
 struct comp_vk_deposit_handoff;
 //! XR_DXR_depth_budget - taken by pointer only; see xrt/xrt_display_processor.h.
 struct xrt_dp_background_preview;
@@ -733,6 +734,16 @@ comp_vk_split_set_screens(struct comp_vk_split *split,
  */
 bool
 comp_vk_split_get_segment_metrics(struct comp_vk_split *split, struct xrt_segment_metrics *out);
+
+/*!
+ * #1883: the segment partition the atlas about to be submitted was PAINTED
+ * with (the renderer's per-segment mosaic; NULL / count 0 = unrouted). Call
+ * right before @ref comp_vk_split_submit_atlas: the submit records it under the
+ * slot's sequence, so the weave crops each segment's views out of the egress
+ * slot where THAT frame painted them — the slot lags the committed frame.
+ */
+void
+comp_vk_split_stage_segment_content(struct comp_vk_split *split, const struct comp_segments_content *content);
 /*! @} */
 
 #ifdef __cplusplus

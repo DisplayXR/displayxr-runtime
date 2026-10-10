@@ -203,6 +203,16 @@ struct comp_vk_native_segments_frame
 	//! The canvas the atlas holds, window px (whole-canvas view dims above).
 	struct comp_seg_rect canvas;
 
+	/*!
+	 * #1883: the partition @ref src_image's pixels were PAINTED with — a
+	 * routed (M3) frame's per-segment mosaic, recorded with the frame. Each
+	 * segment's views are cropped from where they were painted and woven over
+	 * the live segment, never cut at the live seam (which during a drag has
+	 * moved since the locate). NULL / count 0 = one view set (unrouted): the
+	 * live partition is exact.
+	 */
+	const struct comp_segments_content *content;
+
 	//! Clear colour alpha for the target outside every segment; also
 	//! re-declared to segment DPs when it changes.
 	bool transparent_background;
