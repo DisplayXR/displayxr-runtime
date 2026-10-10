@@ -2128,6 +2128,17 @@ multi_compositor_get_predicted_eye_positions(struct multi_compositor *mc, struct
 #endif
 #endif
 
+#ifdef COMP_MULTI_SHARED_SURFACE
+	// A shared-surface client (#59 / #710) has no per-session DP: the ONE shared
+	// DP weaves it, so its eyes are the ones steering this client's weave.
+	// Without this a tracked panel's locates fell back to the nominal viewer.
+	// shared_dp lives until the system compositor is destroyed (lock-free read,
+	// as above).
+	if (mc->msc != NULL && mc->msc->shared_dp != NULL) {
+		return xrt_display_processor_get_predicted_eye_positions(mc->msc->shared_dp, out_eye_pos);
+	}
+#endif
+
 	out_eye_pos->valid = false;
 	return false;
 }

@@ -91,6 +91,35 @@ ipc_server_input_queue_set_pointer_capture(bool captured);
 bool
 ipc_server_input_queue_pointer_captured(void);
 
+/*!
+ * Route one service-window input event to the right per-target queue(s) — the
+ * #61 policy the macOS AppKit pump implements inline (ipc_server_macos_appkit.m
+ * route_input_event), shared here for desktop Linux (ipc_server_linux_input.c):
+ * the controller always receives buttons / motion / keys; content pointer and
+ * motion are also forwarded to the window under the cursor
+ * (comp_multi_workspace_hit_test_window_px); scroll routes exclusively; keys
+ * follow the focused client except workspace chords (Ctrl-chords, TAB, ESC,
+ * DELETE, F11, arrows, [ ]). While the launcher band holds the input grab, or a
+ * controller gesture holds pointer capture, everything goes to the controller
+ * only. With no controller and no placed window every event lands on the
+ * controller queue, which a lone forced-IPC app drains. Thread-safe.
+ */
+void
+ipc_server_input_route(const struct ipc_workspace_input_event *event);
+
+/*!
+ * Inject a synthetic KEY down + up for the workspace controller only
+ * (IPC_INPUT_TARGET_CONTROLLER queue), bypassing hit-test / focus routing.
+ * For a hotkey that the platform grabs outside the service window (the
+ * desktop-Linux launch combo, grabbed by the GNOME extension or by the service
+ * on bare X11, stays armed while the controller runs), so the controller still
+ * sees the combo as it does on Windows. @p vk_code is a Windows VK code,
+ * @p modifiers the IPC wire layout (bit0 SHIFT, bit1 CTRL, bit2 ALT).
+ * Thread-safe; callable from any thread.
+ */
+void
+ipc_server_input_queue_push_controller_key(uint32_t vk_code, uint32_t modifiers);
+
 #ifdef __cplusplus
 }
 #endif

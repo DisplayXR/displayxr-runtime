@@ -194,6 +194,25 @@ elseif(XRT_HAVE_LINUX)
 	if(XRT_HAVE_VULKAN)
 		target_link_libraries(ipc_server PRIVATE aux_vk)
 	endif()
+	# Desktop-Linux shared spatial surface (#710, #967): the workspace handler
+	# arms use the generic per-target input queues (shared with macOS), fed by
+	# the service window's input capture (comp_window_linux -> sink installed
+	# by ipc_server_linux_input.c).
+	if(NOT ANDROID)
+		target_sources(
+			ipc_server
+			PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_input_queue.c
+				${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_input_queue.h
+			)
+	endif()
+	if(TARGET comp_linux_window)
+		target_sources(
+			ipc_server
+			PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_linux_input.c
+				${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_linux_input.h
+			)
+		target_link_libraries(ipc_server PRIVATE comp_linux_window)
+	endif()
 elseif(APPLE)
 	target_sources(
 		ipc_server

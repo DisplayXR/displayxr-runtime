@@ -30,8 +30,11 @@ DEBUG_GET_ONCE_NUM_OPTION(test_exit_on_disconnect, "DXR_TEST_EXIT_ON_DISCONNECT"
 #include "d3d11_service/comp_d3d11_service.h"
 #endif
 
-#ifdef XRT_OS_MACOS
-#include "ipc_server_input_queue.h" // #61: drop a client's input-routing queue on destroy
+#include "multi/comp_multi_interface.h" // COMP_MULTI_SHARED_SURFACE
+
+#ifdef COMP_MULTI_SHARED_SURFACE
+#include "ipc_server_input_queue.h"     // #61: drop a client's input-routing queue on destroy
+#include "multi/comp_multi_workspace.h" // workspace_active + controller state on controller loss
 #endif
 
 #ifndef XRT_OS_WINDOWS
@@ -218,6 +221,14 @@ common_shutdown(volatile struct ipc_client_state *ics)
 			ics->server->xsysc->info.workspace_mode = false;
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 			comp_d3d11_service_deactivate_workspace(ics->server->xsysc);
+#endif
+#if defined(COMP_MULTI_SHARED_SURFACE)
+			// The shared surface keeps rendering while workspace_active; a dead
+			// controller must not leave it (and its cursor / band) up (#61).
+			comp_multi_system_set_workspace_active(ics->server->xsysc, false);
+			comp_multi_workspace_reset_controller_state();
+			ipc_server_input_queue_set_input_grab(false);
+			ipc_server_input_queue_set_pointer_capture(false);
 #endif
 		}
 	}
@@ -611,7 +622,7 @@ ipc_server_client_destroy_session_and_compositor(volatile struct ipc_client_stat
 	// pointer (its key) is freed and potentially reused for a new client, which
 	// would otherwise inherit stale forwarded events. The compositor pointer value
 	// is still a valid key here even though xrt_comp_destroy frees the object.
-#ifdef XRT_OS_MACOS
+#ifdef COMP_MULTI_SHARED_SURFACE
 	ipc_server_input_queue_drop((void *)ics->xc);
 #endif
 
