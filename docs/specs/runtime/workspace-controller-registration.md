@@ -237,7 +237,7 @@ stored and reported in the canonical spelling (modifiers in the order above, key
 listed). Anything else is rejected. Implementation: `service_hotkey.c`, unit-tested in
 `tests_service_workspace_config`.
 
-**Matching.** The service's `WH_KEYBOARD_LL` hook fires on the configured key with
+**Matching.** (Windows; Linux: see *Linux* below.) The service's `WH_KEYBOARD_LL` hook fires on the configured key with
 **exactly** the configured modifier set down — every required modifier down, every other
 modifier up — so `Ctrl+Space` does not swallow `Ctrl+Shift+Space` or the `Win+Space` IME
 switch. As before (#344) the hook is installed only in `auto` mode while the controller is
@@ -295,6 +295,87 @@ Nothing requires it to.
 
 **Tray.** The active controller's submenu shows a greyed `Launch hotkey: <combo>` (or
 `none`) line, and the tray tooltip names the combo — never a hard-coded Ctrl+Space.
+
+## Linux: orchestration, launch hotkey, lifecycle
+
+The desktop-Linux `displayxr-service` orchestrates the active controller like macOS
+(`service_orchestrator.c`, the shared POSIX block): manifest discovery (*POSIX discovery*
+below), `posix_spawn("<binary> --service-managed")` with the service's environment plus
+`DISPLAYXR_WORKSPACE_SESSION=1` and `DISPLAYXR_WORKSPACE_HOTKEY=<combo>` (unset with no
+hotkey), a `waitpid` watcher that respawns the controller after a crash **only in the
+legacy `enable` mode** (1 s settle; in `auto` an exit or crash returns to the off state and
+the next launch brings it back — Windows and macOS behave the same), and the four DIAG
+providers: `system_workspace_launch` (the dashboard's *Launch now*),
+`system_reload_service_config`, `system_workspace_hotkey_suspend`, and the workspace PID
+provider, so `workspace_activate` is accepted only from the controller the service spawned
+(before this, Linux fell to manual first-claim mode). CONTROLLER-class verification
+compares the peer's executable with the manifest `binary` after `realpath()` of both sides,
+so a manifest may name the binary through a symlink.
+
+**Launch hotkey.** Linux has no `WH_KEYBOARD_LL`; `service_hotkey_linux.c` picks one of two
+backends each time the combo is (re)applied, and re-picks when the extension comes or goes:
+
+1. **GNOME Shell extension** `window-geometry@displayxr.org` **version 13+**
+   (`org.displayxr.WorkspaceHotkey1` on the `org.displayxr.WindowGeometry` bus name;
+   `wayland-window-geometry.md` §10). Works under Wayland *and* X11 GNOME, through
+   mutter's own `grab_accelerator`. The service pushes the combo it resolved from
+   `service.json` in GTK syntax (`Ctrl+Space` → `<Control>space`) together with its own
+   systemd user unit (parsed from `/proc/self/cgroup`, `displayxr.service`):
+   `Configure(accelerator, unit)`. `service.json` stays authoritative — the extension only
+   caches the last pushed value. A disabled controller, `hotkey: null` or no registered
+   controller pushes `""`, which releases the grab (no controller, no grab — Ctrl+Space is
+   never taken from other apps on a box without one).
+2. **X11 root-window grab** (`DISPLAY` set, no `WAYLAND_DISPLAY`, no v13 extension):
+   `xcb_grab_key` of the combo's keysym (with and without CapsLock / NumLock) on the root
+   window, **only while the service process runs**.
+
+Neither → one WARN; *Launch now* and `displayxr-cli workspace launch <id>` still work.
+Matching is the exact modifier set, as on Windows. `Win` is X11 `Mod4` / GTK `<Super>`.
+
+**Lifecycle: the service is not resident, the extension is.** The `.deb`'s service is
+socket-activated and exits 30 s after its last client (`IPC_EXIT_WHEN_IDLE`), because it
+holds a Vulkan device and the display processor (a vendor plug-in may run an eye
+tracker). Keeping it resident just to hold a chord would cost exactly that for every user
+with a controller installed, so the chord lives in the extension instead:
+
+- *Service running* — a press makes the extension emit `Activated`; the service hears it
+  and spawns the controller through the launch path (`ALREADY_RUNNING` is a no-op).
+- *Service not running* — the extension sees that its configuring client's bus connection
+  is gone, so a press also calls `org.freedesktop.systemd1.Manager.StartUnit(unit,
+  "replace")` and remembers the press for 30 s. The starting service connects, pushes its
+  combo (`Configure`), and the reply's `pending = true` makes it spawn the controller. The
+  controller is an IPC client, so the service stays up while it runs and idle-exits 30 s
+  after it closes.
+- *Extension restarted* (lock screen, shell restart) — it reloads the cached combo from
+  `$XDG_STATE_HOME/displayxr/workspace-hotkey.json`; a running service sees the bus name
+  re-appear and pushes again.
+
+Consequences: the chord goes live the first time the service runs with a controller
+registered (any DisplayXR client, the dashboard, or a `displayxr-cli workspace …` command
+starts it); the X11-only fallback works only while some client keeps the service up
+(set `IPC_EXIT_WHEN_IDLE=0` in a `systemctl --user edit displayxr.service` drop-in to keep
+it resident on such a desktop).
+
+**While the controller runs.** Windows uninstalls the hook while the controller runs
+because the controller registers its own toggle chord (#344). A Wayland client cannot
+grab a chord, so on Linux the grab **stays armed** and a running controller receives the
+press as the extension's `Activated(u timestamp)` signal (subscribe on the session bus:
+sender `org.displayxr.WindowGeometry`, path `/org/displayxr/WorkspaceHotkey`, interface
+`org.displayxr.WorkspaceHotkey1`) — that is its dismiss/toggle chord. The service ignores
+a press while the controller runs. On X11 without the extension the service holds the grab,
+so a controller there binds its own dismiss key inside its window.
+
+**App discovery directories (Linux).** The registered-mode `.displayxr.json` drop-in
+directories (`displayxr-app-manifest.md` §2.2 / §5) on Linux, scanned in this order, the
+first manifest for a given `exe_path` winning:
+
+1. `$XDG_DATA_HOME/DisplayXR/apps/` (default `~/.local/share/DisplayXR/apps/`) — per-user
+2. `/usr/local/share/displayxr/apps/` — locally installed
+3. `/usr/share/displayxr/apps/` — distribution packages (`.deb`)
+
+The casing mirrors the controller roots below (per-user `DisplayXR`, system `displayxr`).
+The runtime does not scan these; workspace controllers do (the DisplayXR Shell's Linux
+port implements it).
 
 ## Service-side discovery
 
