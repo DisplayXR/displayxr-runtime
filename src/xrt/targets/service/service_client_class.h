@@ -34,6 +34,16 @@ extern "C" {
 bool
 service_client_class_verify(long peer_pid, const char *peer_exe_path, uint32_t declared_class);
 
+/*!
+ * Whether two executable paths name the same binary — the comparison the
+ * CONTROLLER / DIAG checks use. Windows: case-insensitive, either separator.
+ * POSIX: byte-equal, or equal after realpath() of both sides (the kernel
+ * reports a peer's executable symlink-resolved, a manifest may name it through
+ * a symlink). Empty / NULL never matches. Exposed for unit tests.
+ */
+bool
+service_client_class_path_equal(const char *a, const char *b);
+
 #ifdef __cplusplus
 }
 #endif

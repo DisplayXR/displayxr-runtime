@@ -116,6 +116,11 @@ endif()
 if(TARGET target_workspace_config)
 	list(APPEND tests tests_service_workspace_config)
 endif()
+# #960 CONTROLLER-class verification on POSIX: realpath-compare of the peer's
+# (kernel-resolved) executable against a manifest `binary` that may be a symlink.
+if(TARGET target_workspace_config AND NOT WIN32)
+	list(APPEND tests tests_service_client_class)
+endif()
 if(XRT_HAVE_D3D11)
 	list(APPEND tests tests_aux_d3d_d3d11 tests_aux_d3d_render_adapter tests_comp_client_d3d11
 	     tests_comp_xbridge_plane_policy tests_comp_split_gate tests_comp_eye_dp_policy
@@ -684,6 +689,15 @@ target_include_directories(tests_target_screen_pin PRIVATE ${PROJECT_SOURCE_DIR}
 
 if(TARGET target_workspace_config)
 	target_link_libraries(tests_service_workspace_config PRIVATE target_workspace_config xrt-external-cjson)
+endif()
+if(TARGET tests_service_client_class)
+	target_sources(
+		tests_service_client_class PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/service/service_client_class.c
+		)
+	# Compiled without the orchestrator (a service-target-only unit): the
+	# manifest registry is the source of truth here.
+	target_compile_definitions(tests_service_client_class PRIVATE SERVICE_CLIENT_CLASS_NO_ORCHESTRATOR)
+	target_link_libraries(tests_service_client_class PRIVATE target_workspace_config xrt-interfaces)
 endif()
 
 if(XRT_BUILD_DRIVER_HANDTRACKING)
