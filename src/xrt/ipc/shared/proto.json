@@ -1371,5 +1371,8 @@
 			{"name": "metrics", "type": "struct xrt_segment_metrics"},
 			{"name": "generation", "type": "struct xrt_status_generation"}
 		]
+	},
+
+	"system_request_display_reprobe": {
 	}
 }

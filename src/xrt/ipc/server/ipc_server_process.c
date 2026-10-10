@@ -30,6 +30,7 @@
 #include "util/u_pretty_print.h"
 
 #include "util/u_git_tag.h"
+#include "util/u_setting.h"
 
 #include "shared/ipc_protocol.h"
 #include "shared/ipc_shmem.h"
@@ -927,7 +928,23 @@ reprobe_run(struct ipc_server *s, const char *reason)
 	}
 	U_LOG_I("display re-probe (%s): re-evaluating display-processor selection.", reason != NULL ? reason : "?");
 	const bool was_fallback = s->xsysc->info.active_plugin_is_fallback;
+	// Display dashboard phase 7: a per-screen DP preference may have been
+	// written since this process read the stores (`dp use --screen`, the
+	// dashboard) — re-read them before re-resolving.
+	u_setting_per_screen_reload();
 	s->xsysc->info.refresh_display_processors(&s->xsysc->info);
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	// ...and hand the re-resolved screens to every client's segment manager:
+	// a screen whose plug-in changed gets its segment DP recreated (the
+	// session's primary DP never swaps live).
+	if (s->xinst != NULL && comp_d3d11_service_is_d3d11_service(s->xsysc)) {
+		struct xrt_screen_list *list = U_TYPED_CALLOC(struct xrt_screen_list);
+		if (list != NULL && xrt_instance_enumerate_displays(s->xinst, list) == XRT_SUCCESS) {
+			comp_d3d11_service_refresh_segment_screens(s->xsysc, list);
+		}
+		free(list);
+	}
+#endif
 	// ADR-051 D6: a world-event re-probe is a topology event (the next status
 	// read rebuilds the snapshot).
 	ipc_server_status_bump(s, true);
