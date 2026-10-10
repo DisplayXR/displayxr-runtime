@@ -38,6 +38,10 @@ name: Build Linux
 # themselves (DebInstall is a matrix, so its context names move when the
 # supported-release list changes); the LinuxPackaging aggregator below carries
 # the stable required context "Linux Packaging" on their behalf.
+#
+# DashboardLinux job: tests + publishes the DisplayXR Dashboard (src/dashboard,
+# Avalonia / .NET 9) as a self-contained linux-x64 single file, ONCE; Deb and
+# Package download that artifact so the .deb and the tarball ship the same bits.
 
 on:
   workflow_dispatch: {}
@@ -131,6 +135,61 @@ jobs:
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: ./scripts/build_linux.sh --apps
 
+  # The DisplayXR Dashboard for Linux (src/dashboard/README.md): xunit tests on
+  # Linux, then `dotnet publish` linux-x64, self-contained single file (no .NET
+  # runtime on the target, InvariantGlobalization = no ICU, the Skia / HarfBuzz
+  # natives inside the bundle). Built on the host runner, not in the 22.04
+  # container: the published ELF is Microsoft's prebuilt .NET host (glibc
+  # >= 2.23 floor) plus the app payload, so the build host's glibc does not
+  # reach it — the Deb job's DXR_DEB_MAX_GLIBC check re-proves that on every
+  # run. Deb and Package consume the artifact (DXR_DASHBOARD_BIN).
+  DashboardLinux:
+    needs: DetectChanges
+    runs-on: ubuntu-latest
+    steps:
+      - name: Docs-only short-circuit
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "Doc-only change — reporting success without building."
+
+      - uses: actions/checkout@v5
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        with:
+          fetch-depth: 0 # git describe stamps the dashboard's --version
+
+      - uses: actions/setup-dotnet@v4
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        with:
+          dotnet-version: '9.x'
+
+      - name: Test
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: dotnet test src/dashboard/DisplayXR.Dashboard.sln -c Release --nologo
+
+      - name: Publish displayxr-dashboard (linux-x64, self-contained single file)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          VERSION="$(git describe --tags --always 2>/dev/null || echo unknown)"
+          dotnet publish src/dashboard/DisplayXR.Dashboard/DisplayXR.Dashboard.csproj \
+            -c Release -r linux-x64 --self-contained true \
+            -p:PublishSingleFile=true -p:PublishTrimmed=false -p:EnableCompressionInSingleFile=true \
+            -p:InformationalVersion="$VERSION" -p:IncludeSourceRevisionInInformationalVersion=false \
+            -o dashboard-out --nologo
+          ls -l dashboard-out
+          # One file: every native library is inside the bundle.
+          [ "$(find dashboard-out -type f ! -name '*.pdb' | wc -l)" = 1 ]
+          echo "--- DT_NEEDED"; objdump -p dashboard-out/displayxr-dashboard | awk '/NEEDED/{print "  " $2}'
+          echo "--- glibc floor"; objdump -T dashboard-out/displayxr-dashboard | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
+          # No display server: --version must not open a window.
+          env -u DISPLAY -u WAYLAND_DISPLAY dashboard-out/displayxr-dashboard --version | tee /dev/stderr | grep -q "^displayxr-dashboard $VERSION$"
+
+      - name: Upload dashboard
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          name: displayxr-dashboard-linux-x64
+          path: dashboard-out/displayxr-dashboard
+          if-no-files-found: error
+
   # Packaging gate (#705): produce the tarball, run its own install.sh
   # (user-level), and prove the installed tree works end-to-end — selftest
   # resolving the runtime + plug-in purely from the installed XDG paths (no
@@ -144,7 +203,7 @@ jobs:
   # host below it. (Building on the NEXT LTS moved to the Newest job below, so
   # that toolchain coverage is kept.)
   Package:
-    needs: DetectChanges
+    needs: [DetectChanges, DashboardLinux]
     runs-on: ubuntu-latest
     container: ubuntu:22.04
     steps:
@@ -172,11 +231,21 @@ jobs:
           submodules: recursive
           fetch-depth: 0 # git describe needs tags for the tarball version
 
+      - uses: actions/download-artifact@v6
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        with:
+          name: displayxr-dashboard-linux-x64
+          path: ${{ runner.temp }}/dashboard
+
       - name: Build + package
         # --hybrid (#1744): the shipped configuration — in-process runtime for
         # ordinary apps, IPC to displayxr-service for present-owners.
         if: needs.DetectChanges.outputs.docs_only != 'true'
+        env:
+          DXR_DASHBOARD_BIN: ${{ runner.temp }}/dashboard/displayxr-dashboard
+          DXR_REQUIRE_DASHBOARD: "1"
         run: |
+          chmod +x "$DXR_DASHBOARD_BIN"
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           ./scripts/build_linux.sh --hybrid --no-test
           ./scripts/package_linux.sh --no-build
@@ -201,8 +270,15 @@ jobs:
           test -f "$HOME/.config/systemd/user/displayxr.socket"
           grep -qx "ExecStart=$HOME/.local/share/displayxr/bin/displayxr-service" \
             "$HOME/.config/systemd/user/displayxr.service"
+          # The dashboard: beside the CLI, in the menu, and it starts with no
+          # display server.
+          grep -qx "Exec=$HOME/.local/share/displayxr/bin/displayxr-dashboard" \
+            "$HOME/.local/share/applications/displayxr-dashboard.desktop"
+          test -f "$HOME/.local/share/icons/hicolor/256x256/apps/displayxr-dashboard.png"
+          env -u DISPLAY -u WAYLAND_DISPLAY "$HOME/.local/share/displayxr/bin/displayxr-dashboard" --version
           ./uninstall.sh
           test ! -f "$HOME/.config/systemd/user/displayxr.socket"
+          test ! -f "$HOME/.local/share/applications/displayxr-dashboard.desktop"
           # Uninstall must leave no ActiveRuntime behind.
           test ! -f "$HOME/.config/openxr/1/active_runtime.json"
 
@@ -312,7 +388,7 @@ jobs:
   # built here: Track B needs the commercial SR SDK, so it is produced on an
   # SR-equipped box, not public CI.
   Deb:
-    needs: DetectChanges
+    needs: [DetectChanges, DashboardLinux]
     runs-on: ubuntu-latest
     container: ubuntu:22.04
     env:
@@ -364,9 +440,19 @@ jobs:
           submodules: recursive
           fetch-depth: 0 # git describe needs tags for the .deb version
 
+      - uses: actions/download-artifact@v6
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        with:
+          name: displayxr-dashboard-linux-x64
+          path: ${{ runner.temp }}/dashboard
+
       - name: Build runtime .deb (clean Release build)
         if: needs.DetectChanges.outputs.docs_only != 'true'
+        env:
+          DXR_DASHBOARD_BIN: ${{ runner.temp }}/dashboard/displayxr-dashboard
+          DXR_REQUIRE_DASHBOARD: "1"
         run: |
+          chmod +x "$DXR_DASHBOARD_BIN"
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           ./scripts/package_deb_linux.sh
           echo "built:"; ls -lh dist/displayxr-runtime_*_amd64.deb
@@ -452,7 +538,7 @@ jobs:
   # unconditionally and asserting on needs.*.result is what makes it a gate.
   LinuxPackaging:
     name: Linux Packaging
-    needs: [DetectChanges, Deb, Package, DebInstall]
+    needs: [DetectChanges, DashboardLinux, Deb, Package, DebInstall]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -467,6 +553,7 @@ jobs:
           # (!= 'true'), so we land here — and must fail rather than green-light
           # a run whose change classification never happened.
           RESULT_DETECTCHANGES: ${{ needs.DetectChanges.result }}
+          RESULT_DASHBOARDLINUX: ${{ needs.DashboardLinux.result }}
           RESULT_DEB: ${{ needs.Deb.result }}
           RESULT_PACKAGE: ${{ needs.Package.result }}
           # Matrix job: 'success' only when every leg succeeded (fail-fast is
@@ -475,10 +562,10 @@ jobs:
         run: |
           set -u
           rc=0
-          for leg in DETECTCHANGES DEB PACKAGE DEBINSTALL; do
+          for leg in DETECTCHANGES DASHBOARDLINUX DEB PACKAGE DEBINSTALL; do
             var="RESULT_${leg}"
             result="${!var}"
-            printf '%-14s %s\n' "$leg" "${result:-<missing>}"
+            printf '%-15s %s\n' "$leg" "${result:-<missing>}"
             # Anything that is not an outright success fails the gate —
             # including 'skipped', which on the non-docs_only path can only
             # mean a leg was bypassed by a condition it should not have been.

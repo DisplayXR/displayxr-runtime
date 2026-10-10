@@ -102,7 +102,9 @@ public sealed class DeveloperPage : Page
         {
             string dir = Path.GetDirectoryName(DashboardLog.Path)!;
             Directory.CreateDirectory(dir);
-            Process.Start(new ProcessStartInfo("explorer.exe", $"\"{dir}\"") { UseShellExecute = false })?.Dispose();
+            string opener = OperatingSystem.IsWindows() ? "explorer.exe" : "xdg-open";
+            try { Process.Start(new ProcessStartInfo(opener, $"\"{dir}\"") { UseShellExecute = false })?.Dispose(); }
+            catch (Exception ex) { DashboardLog.Warn($"open log folder ({opener}): {ex.Message}"); }
         }, "outline", "sm");
         return U.Card(U.VStack(14, U.CardTitle("This dashboard", null, open), kv));
     }

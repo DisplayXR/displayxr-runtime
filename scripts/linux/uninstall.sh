@@ -19,6 +19,7 @@ if [ "$SYSTEM" = 1 ]; then
     DP_ROOT=/usr/local/share/displayxr/DisplayProcessors
     EXT_ROOT=/usr/local/share/gnome-shell/extensions
     UNIT_DIR=/usr/local/lib/systemd/user
+    SHARE_ROOT=/usr/local/share
 else
     DATA_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}"
     CONFIG_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}"
@@ -27,6 +28,7 @@ else
     DP_ROOT="$DATA_ROOT/DisplayXR/DisplayProcessors"
     EXT_ROOT="$DATA_ROOT/gnome-shell/extensions"
     UNIT_DIR="$CONFIG_ROOT/systemd/user"
+    SHARE_ROOT="$DATA_ROOT"
 fi
 
 # displayxr-service units (#1744): the socket-activated pair, and v1's plain
@@ -81,9 +83,13 @@ if [ "$SYSTEM" = 1 ]; then
     fi
 fi
 
+# DisplayXR Dashboard menu entry + icon.
+rm -f "$SHARE_ROOT/applications/displayxr-dashboard.desktop" \
+    "$SHARE_ROOT/icons/hicolor/256x256/apps/displayxr-dashboard.png"
+
 if [ "$SYSTEM" = 1 ]; then
     # /usr/local is shared — remove only what install.sh placed.
-    rm -f "$PREFIX/bin/displayxr-cli" "$PREFIX/bin/displayxr-service" \
+    rm -f "$PREFIX/bin/displayxr-cli" "$PREFIX/bin/displayxr-service" "$PREFIX/bin/displayxr-dashboard" \
         "$PREFIX/bin/displayxr-gnome-extension-enable" \
         "$PREFIX/lib/openxr_displayxr.so" "$PREFIX/lib/displayxr/plugins/DisplayXR-SimDisplay.so"
     rmdir -p "$PREFIX/lib/displayxr/plugins" 2>/dev/null || true
