@@ -55,6 +55,11 @@ cli_print_help(int argc, const char **argv)
 	P("                      every <ms> (default 500, min 100) and print only on a change: one\n");
 	P("                      NDJSON line per change with --json, else the table redrawn in place.\n");
 	P("                      Ends on Ctrl-C or stdin EOF.\n");
+	P("  workspace <...>   - Workspace controllers (role, registration) and their launch settings.\n");
+	P("                      'workspace list [--json]', 'workspace set <id> --hotkey <combo> |\n");
+	P("                      --no-hotkey | --mode auto|disabled', 'workspace reset <id>',\n");
+	P("                      'workspace launch <id>', 'workspace hotkey-suspend on|off'\n");
+	P("                      (the last two through the running service).\n");
 	P("  clients [--json]  - List the running service's IPC clients with their verified class\n");
 	P("                      (#960), presenter, panel lease, window rect and owner screen.\n");
 	P("                      Connects over IPC as a DIAG client; non-elevated on Windows.\n");
@@ -113,6 +118,9 @@ main(int argc, const char **argv)
 	}
 	if (strcmp(argv[1], "clients") == 0) {
 		return cli_cmd_clients(argc, argv);
+	}
+	if (strcmp(argv[1], "workspace") == 0) {
+		return cli_cmd_workspace(argc, argv);
 	}
 	if (strcmp(argv[1], "test") == 0) {
 		return cli_cmd_test(argc, argv);
