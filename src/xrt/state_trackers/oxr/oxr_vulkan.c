@@ -645,6 +645,19 @@ oxr_vk_create_vulkan_instance(struct oxr_logger *log,
 	 * shared-queue tier only after resolving the layer's marker entry point on
 	 * the created device (handshake, not hope) — so a failed injection
 	 * degrades, never breaks. DXR_VK_QUEUE_MODE=off|queue skips injection.
+	 *
+	 * Android (#1905): same injection, different job. The Android build of
+	 * the layer locks per DEVICE (Adreno shares one GSL context across the
+	 * graphics family's queues, so an app submit on idx 0 racing the repaint
+	 * on idx 1 corrupts it). The marker resolving there does NOT move the
+	 * repaint onto the app's queue: the compositor only takes the
+	 * shared-queue tier when it has NO runtime-owned queue, and Adreno gives
+	 * it idx 1 — so the repaint keeps its own queue and the layer's device
+	 * lock is what serializes the two. Discovery: the loader finds
+	 * libVkLayer_DXR_queue_lock.so only on its layer search path (the app's
+	 * own lib dir, or gpu_debug_layer_app's on a debug setup); when it is
+	 * absent the create fails VK_ERROR_LAYER_NOT_PRESENT and the retry below
+	 * restores today's behaviour exactly.
 	 */
 	const char **merged_layers = NULL;
 	{
