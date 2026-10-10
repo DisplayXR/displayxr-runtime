@@ -29815,6 +29815,120 @@ comp_d3d11_service_set_client_segment_screens(struct xrt_system_compositor *xsys
 	    (void *)c, c->client_pid, list->count, (unsigned long long)pinned_display_id);
 }
 
+//! The screen of @p list with id @p id, or nullptr.
+static const struct xrt_screen *
+svc_seg_find_screen(const struct xrt_screen_list *list, uint64_t id)
+{
+	for (uint32_t i = 0; i < list->count && i < XRT_SCREEN_LIST_MAX; i++) {
+		if (list->screens[i].id == id) {
+			return &list->screens[i];
+		}
+	}
+	return nullptr;
+}
+
+//! The registry entry of @p reg for monitor @p id, or nullptr.
+static struct xrt_dp_registry_entry *
+svc_seg_find_entry(struct xrt_dp_factory_registry *reg, uint64_t id)
+{
+	for (uint32_t i = 0; i < reg->entry_count && i < XRT_DP_REGISTRY_MAX_ENTRIES; i++) {
+		if (reg->entries[i].monitor_id == id) {
+			return &reg->entries[i];
+		}
+	}
+	return nullptr;
+}
+
+void
+comp_d3d11_service_refresh_segment_screens(struct xrt_system_compositor *xsysc, const struct xrt_screen_list *list)
+{
+	if (xsysc == nullptr || list == nullptr || !comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+
+	// Lifetime: a compositor found in all_clients under clients_mutex stays
+	// whole (compositor_destroy leaves the list first). seg_mutex is a leaf.
+	std::lock_guard<std::mutex> reg_lock(sys->clients_mutex);
+	for (struct d3d11_service_compositor *c : sys->all_clients) {
+		std::lock_guard<std::mutex> lk(c->seg_mutex);
+		const struct xrt_screen_list *old = c->seg_screens;
+		if (old == nullptr || c->seg_sys_info == nullptr) {
+			continue; // segments never enabled for this client
+		}
+
+		// The session's primary screen: its DP is the session's own.
+		uint64_t primary_id = 0;
+		for (uint32_t i = 0; i < old->count && i < XRT_SCREEN_LIST_MAX; i++) {
+			if ((old->screens[i].flags & XRT_SCREEN_FLAG_SYSTEM_DEFAULT) != 0) {
+				primary_id = old->screens[i].id;
+				break;
+			}
+		}
+
+		bool changed = false;
+		for (uint32_t i = 0; i < list->count && i < XRT_SCREEN_LIST_MAX; i++) {
+			const struct xrt_screen *ns = &list->screens[i];
+			const struct xrt_screen *os = svc_seg_find_screen(old, ns->id);
+			if (os == nullptr || strcmp(os->plugin_id, ns->plugin_id) == 0) {
+				continue;
+			}
+			if (ns->id == primary_id) {
+				U_LOG_W(
+				    "segments: IPC client %p (pid %ld) — its primary screen 0x%016llx is now claimed "
+				    "by '%s' (was '%s'); the session's own DP never swaps live — applies to the next "
+				    "session",
+				    (void *)c, c->client_pid, (unsigned long long)ns->id, ns->plugin_id, os->plugin_id);
+				continue;
+			}
+			U_LOG_W("segments: screen 0x%016llx now claimed by '%s' (was '%s') — segment DP recreated",
+			        (unsigned long long)ns->id, ns->plugin_id, os->plugin_id);
+			changed = true;
+		}
+		if (!changed) {
+			continue;
+		}
+
+		struct xrt_screen_list *copy = U_TYPED_CALLOC(struct xrt_screen_list);
+		struct xrt_system_compositor_info *info_copy = U_TYPED_CALLOC(struct xrt_system_compositor_info);
+		if (copy == nullptr || info_copy == nullptr) {
+			free(copy);
+			free(info_copy);
+			continue;
+		}
+		*copy = *list;
+		*info_copy = sys->base.info;
+		// The primary screen keeps what its session started with.
+		if (primary_id != 0) {
+			const struct xrt_screen *os = svc_seg_find_screen(old, primary_id);
+			struct xrt_dp_registry_entry *oe =
+			    svc_seg_find_entry(&c->seg_sys_info->dp_registry, primary_id);
+			struct xrt_dp_registry_entry *ne = svc_seg_find_entry(&info_copy->dp_registry, primary_id);
+			for (uint32_t i = 0; i < copy->count && i < XRT_SCREEN_LIST_MAX && os != nullptr; i++) {
+				if (copy->screens[i].id == primary_id) {
+					snprintf(copy->screens[i].plugin_id, sizeof(copy->screens[i].plugin_id), "%s",
+					         os->plugin_id);
+					copy->screens[i].confidence = os->confidence;
+				}
+			}
+			if (oe != nullptr && ne != nullptr) {
+				*ne = *oe;
+			}
+		}
+		free(c->seg_screens);
+		c->seg_screens = copy;
+		free(c->seg_sys_info);
+		c->seg_sys_info = info_copy;
+		// The render thread rebuilds the manager on its next weave of this
+		// client: the old segment DPs are released, and the lifecycle makes
+		// each again from its screen's (new) registry entry.
+		c->seg_rebuild = true;
+		struct xrt_segment_metrics none;
+		memset(&none, 0, sizeof(none));
+		(void)comp_segments_publish(&c->seg_pub, &none);
+	}
+}
+
 bool
 comp_d3d11_service_get_client_segment_metrics(struct xrt_system_compositor *xsysc,
                                               struct xrt_compositor *xc,
