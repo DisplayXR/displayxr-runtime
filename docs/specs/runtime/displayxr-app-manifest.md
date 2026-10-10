@@ -53,6 +53,14 @@ The manifest sits in a system-known discovery directory and points at any execut
 └── vendor_app.displayxr.json
 ```
 
+On Linux (`exe_path` is any absolute path to an executable; no `.exe` suffix):
+
+```
+$XDG_DATA_HOME/DisplayXR/apps/            ← per-user (default ~/.local/share/DisplayXR/apps/)
+/usr/local/share/displayxr/apps/          ← locally installed
+/usr/share/displayxr/apps/                ← distribution packages (.deb)
+```
+
 - The manifest filename can be anything ending in `.displayxr.json`. Recommended convention: `<sanitized_exe_basename>.displayxr.json`.
 - `exe_path` MUST be present and resolve to an existing `.exe`. Manifests whose exe no longer exists are skipped with a warning.
 - Icon paths are still resolved **relative to the manifest file**, so installers should drop icon files alongside the manifest (not next to the exe).
@@ -156,6 +164,9 @@ A workspace controller's scanner walks two kinds of paths in this order. The dir
 %LOCALAPPDATA%\DisplayXR\apps\          ← per-user, user/installer-writable
 %ProgramData%\DisplayXR\apps\           ← system-wide, installer-writable (elevated)
 ```
+Linux, in this order: `$XDG_DATA_HOME/DisplayXR/apps/` (default
+`~/.local/share/DisplayXR/apps/`), `/usr/local/share/displayxr/apps/`,
+`/usr/share/displayxr/apps/` (see `workspace-controller-registration.md` § Linux).
 
 These paths are **DisplayXR-runtime-branded, not workspace-controller-branded**. Installers write here regardless of which workspace controller(s) the user runs. Third-party controllers that don't honor this convention can still ship — they just won't see apps installed for the ecosystem.
 
