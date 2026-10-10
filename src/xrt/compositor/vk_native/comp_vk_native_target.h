@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include "xrt/xrt_config_os.h"
 #include "xrt/xrt_defines.h"
 #include "xrt/xrt_results.h"
 #include "xrt/xrt_vulkan_includes.h"
@@ -320,6 +321,33 @@ enum comp_vk_native_target_surface_state
  */
 enum comp_vk_native_target_surface_state
 comp_vk_native_target_sync_surface(struct comp_vk_native_target *target);
+
+#ifdef XRT_OS_ANDROID
+struct vk_bundle;
+
+/*!
+ * #1905 (Android only): vkQueueSubmit, retried ONCE after 1 ms if it returns
+ * VK_ERROR_INITIALIZATION_FAILED (-3). Any other result — and a second -3 — is
+ * returned unchanged, so the caller's existing failure path still runs.
+ *
+ * MITIGATION, not the fix. On Adreno every submit in the process lands on one
+ * GSL context; the app's own vkQueueSubmit (which the runtime cannot
+ * serialise) racing a runtime submit on another queue corrupts the context
+ * timestamp (`gsl_context_base_next_timestamp: next client ts N must be
+ * greater than current ts N`), and the NEXT submit returns -3 even though
+ * nothing about it is wrong. A failed submit leaves its command buffers,
+ * semaphores and fence untouched (Vulkan spec, vkQueueSubmit), so the SAME
+ * submit info is safe to resubmit. The structural fix is to serialise every
+ * submit in the process (a queue-lock layer, or a second VkDevice for the
+ * runtime) — tracked on #1905.
+ *
+ * Logs the first retry and every 100th after it (WARN, with @p site), never
+ * per frame.
+ */
+VkResult
+comp_vk_native_queue_submit_retry(
+    struct vk_bundle *vk, VkQueue queue, const VkSubmitInfo *submit, VkFence fence, const char *site);
+#endif
 
 #ifdef __cplusplus
 }
