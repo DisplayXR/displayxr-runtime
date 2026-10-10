@@ -66,7 +66,7 @@ static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t s_thread;
 static bool s_started = false;
 static bool s_stop = false;
-static bool s_dirty = false;         //!< combo or suspend changed
+static bool s_dirty = false;             //!< combo or suspend changed
 static char s_combo[SERVICE_HOTKEY_MAX]; //!< "" = disarmed
 static bool s_suspend = false;
 static service_hotkey_linux_activate_fn s_on_activate = NULL;
@@ -428,7 +428,8 @@ x11_ungrab(struct worker *w)
 	}
 	for (int k = 0; k < w->x11_keycode_count; k++) {
 		for (size_t v = 0; v < sizeof(s_lock_variants) / sizeof(s_lock_variants[0]); v++) {
-			xcb_ungrab_key(w->xcb, w->x11_keycodes[k], w->root, (uint16_t)(w->x11_mods | s_lock_variants[v]));
+			xcb_ungrab_key(w->xcb, w->x11_keycodes[k], w->root,
+			               (uint16_t)(w->x11_mods | s_lock_variants[v]));
 		}
 	}
 	w->x11_keycode_count = 0;
@@ -512,7 +513,8 @@ x11_dispatch(struct worker *w)
 		const uint8_t type = ev->response_type & 0x7f;
 		if (type == XCB_KEY_PRESS && w->backend == BACKEND_X11 && !w->applied_suspend) {
 			const xcb_key_press_event_t *kp = (const xcb_key_press_event_t *)ev;
-			const uint16_t state = kp->state & (uint16_t)~(SERVICE_HOTKEY_X11_LOCK | SERVICE_HOTKEY_X11_MOD2);
+			const uint16_t state =
+			    kp->state & (uint16_t)~(SERVICE_HOTKEY_X11_LOCK | SERVICE_HOTKEY_X11_MOD2);
 			bool ours = false;
 			for (int k = 0; k < w->x11_keycode_count; k++) {
 				ours = ours || kp->detail == w->x11_keycodes[k];
@@ -586,7 +588,8 @@ apply(struct worker *w, const char *combo, bool suspend, bool ext_just_left)
 	if (ext_present(w)) {
 		char accel[64] = "";
 		struct service_hotkey hk;
-		if (armed && (!service_hotkey_parse(combo, &hk) || !service_hotkey_to_accelerator(&hk, accel, sizeof(accel)))) {
+		if (armed &&
+		    (!service_hotkey_parse(combo, &hk) || !service_hotkey_to_accelerator(&hk, accel, sizeof(accel)))) {
 			accel[0] = '\0';
 		}
 		bool pending = false;
@@ -628,8 +631,9 @@ apply(struct worker *w, const char *combo, bool suspend, bool ext_just_left)
 	}
 	if (x11_grab(w, combo)) {
 		if (w->backend != BACKEND_X11) {
-			U_LOG_W("Workspace hotkey: armed %s via an X11 root-window grab (only while this service runs).",
-			        combo);
+			U_LOG_W(
+			    "Workspace hotkey: armed %s via an X11 root-window grab (only while this service runs).",
+			    combo);
 		}
 		w->backend = BACKEND_X11;
 		return;

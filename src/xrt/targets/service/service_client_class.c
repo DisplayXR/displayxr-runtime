@@ -17,7 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#if (defined(XRT_OS_WINDOWS) || defined(XRT_OS_MACOS) || defined(XRT_OS_LINUX_DESKTOP)) &&                         \
+#if (defined(XRT_OS_WINDOWS) || defined(XRT_OS_MACOS) || defined(XRT_OS_LINUX_DESKTOP)) &&                             \
     !defined(SERVICE_CLIENT_CLASS_NO_ORCHESTRATOR)
 #include "service_orchestrator.h"
 #define HAVE_ORCHESTRATOR 1
