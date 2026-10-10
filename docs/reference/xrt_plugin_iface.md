@@ -375,6 +375,41 @@ atlas arrives as a plain 2D texture in `COMMON` with its own SRV descriptor. App
 `XRT_PLUGIN_IFACE_HAS_CREATE_DP_D3D12_FOR_SCREEN`. Reference implementations:
 `sim_display_dp_factory_d3d11_for_screen` / `sim_display_dp_factory_d3d12_for_screen`.
 
+### `create_dp_gl_for_screen` (multi-screen M6, Windows OpenGL)
+
+```c
+xrt_result_t (*create_dp_gl_for_screen)(struct xrt_plugin_instance *inst, void *window_handle,
+                                        const struct xrt_screen_binding *binding,
+                                        struct xrt_display_processor_gl **out_xdp);
+```
+
+The OpenGL twin, for the in-process GL compositor (`cube_handle_gl_win`, GL demos). Same `binding`
+and `window_handle` rules as the D3D11 slot, plus the GL factory's own: the compositor's GL context
+is current on the calling thread, every later call into the DP happens on that one context, and
+several per-screen DPs share it (load your own GLAD table — the per-DLL trap the plain factory
+already has). Phase from the appended `xrt_display_processor_gl::set_present_origin`
+(`struct_size`-gated, `XRT_DP_GL_HAS_PRESENT_ORIGIN`) plus the canvas offset. What is GL-specific:
+
+- `process_atlas` draws into the bound framebuffer (the window, or the transparent path's
+  transit FBO), and the runtime has set `glViewport` **and** `glScissor` (`GL_SCISSOR_TEST` on) to
+  the segment. The canvas you are handed is top-left origin like every backend's; in GL's
+  bottom-left framebuffer coordinates the segment is
+  `(canvas_x, target_height − canvas_y − canvas_height, canvas_width, canvas_height)`. Do not
+  re-state a whole-target viewport and do not disable the scissor.
+- The atlas is a `GL_TEXTURE_2D` holding exactly the segment's views in the usual GL tile order
+  (view 0 in the top row of `v`, #1625).
+- **The session's own DP (from the plain `create_dp_gl`) weaves the primary screen's segment the
+  same way**, so a plug-in that implements this slot must also honour a non-empty canvas on its
+  plain GL DP. The GL compositor therefore segments a window only when the primary screen's
+  plug-in implements this slot: a pre-M6 GL DP re-states a whole-target viewport inside
+  `process_atlas` (the old GL contract said "the caller sets the viewport", and DPs re-stated it),
+  which would weave the primary segment's crop across the whole window.
+
+Appended after `get_screen_status` per ADR-020 (ABI stays 5); guard with
+`#ifdef XRT_PLUGIN_IFACE_HAS_CREATE_DP_GL_FOR_SCREEN`, test with
+`xrt_plugin_iface_has_create_dp_gl_for_screen()`. Reference implementation:
+`sim_display_dp_factory_gl_for_screen` (`drivers/sim_display/sim_display_processor_gl.c`).
+
 **The 1:1 capability.** Report through the existing `get_scanout_caps` slot whether your output
 survives a display-server resample: `XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE` in
 `xrt_dp_scanout_caps::flags` (carved from the former `reserved[0]`, so an older plug-in reads
@@ -911,8 +946,8 @@ everything that was on `main` before them: `… vk_bundle_fn_table_offset` → `
 (ADR-042) → `get_platform_state` (ADR-045) → `stereo_camera_enumerate … stereo_camera_close`
 → `get_display_info_for_monitor` (multi-screen M1) → `create_dp_vk_for_screen` (multi-screen M2)
 → `create_dp_d3d11_for_screen` (M6, D3D11) → `create_dp_metal_for_screen` (macOS) →
-`create_dp_d3d12_for_screen` (M6, D3D12) → `get_screen_status` (ADR-051 dashboard, now the last
-member).
+`create_dp_d3d12_for_screen` (M6, D3D12) → `get_screen_status` (ADR-051 dashboard) →
+`create_dp_gl_for_screen` (M6, OpenGL, now the last member).
 `tests_stereo_camera` pins that order (lift right after the vk fingerprint, platform-state right
 after lift, the camera block right after platform-state and ending the struct), so a reorder or a
 slot squeezed in between fails on the host, not on a vendor box.

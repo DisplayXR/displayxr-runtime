@@ -317,7 +317,8 @@ TEST_CASE("plug-in iface: camera slots are appended after lift and platform-stat
 	// (Windows) create_dp_d3d11_for_screen right after that, the macOS
 	// segments create_dp_metal_for_screen right after that, then M6 D3D12
 	// create_dp_d3d12_for_screen right after that, then the ADR-051 dashboard
-	// get_screen_status right after that; it now ends the struct.
+	// get_screen_status right after that, then M6 OpenGL
+	// create_dp_gl_for_screen right after that; it now ends the struct.
 	CHECK(offsetof(xrt_plugin_iface, get_display_info_for_monitor) ==
 	      offsetof(xrt_plugin_iface, stereo_camera_close) + sizeof(void *));
 	CHECK(offsetof(xrt_plugin_iface, create_dp_vk_for_screen) ==
@@ -330,7 +331,9 @@ TEST_CASE("plug-in iface: camera slots are appended after lift and platform-stat
 	      offsetof(xrt_plugin_iface, create_dp_metal_for_screen) + sizeof(void *));
 	CHECK(offsetof(xrt_plugin_iface, get_screen_status) ==
 	      offsetof(xrt_plugin_iface, create_dp_d3d12_for_screen) + sizeof(void *));
-	CHECK(offsetof(xrt_plugin_iface, get_screen_status) + sizeof(void *) == sizeof(xrt_plugin_iface));
+	CHECK(offsetof(xrt_plugin_iface, create_dp_gl_for_screen) ==
+	      offsetof(xrt_plugin_iface, get_screen_status) + sizeof(void *));
+	CHECK(offsetof(xrt_plugin_iface, create_dp_gl_for_screen) + sizeof(void *) == sizeof(xrt_plugin_iface));
 
 	xrt_plugin_iface iface{};
 	iface.struct_size = (uint32_t)offsetof(xrt_plugin_iface, stereo_camera_enumerate);
@@ -342,6 +345,61 @@ static xrt_result_t
 fake_get_screen_status(xrt_plugin_instance *, uint64_t, xrt_plugin_screen_status *)
 {
 	return XRT_SUCCESS;
+}
+
+static xrt_result_t
+fake_create_dp_gl_for_screen(xrt_plugin_instance *, void *, const xrt_screen_binding *, xrt_display_processor_gl **)
+{
+	return XRT_SUCCESS;
+}
+
+TEST_CASE("plug-in iface: create_dp_gl_for_screen is struct_size-gated (multi-screen M6, GL)", "[stereo_camera]")
+{
+	xrt_plugin_iface iface{};
+	iface.create_dp_gl_for_screen = fake_create_dp_gl_for_screen;
+	// A plug-in built before the slot: its struct ends at get_screen_status.
+	iface.struct_size = (uint32_t)offsetof(xrt_plugin_iface, create_dp_gl_for_screen);
+	CHECK_FALSE(xrt_plugin_iface_has_create_dp_gl_for_screen(&iface));
+	iface.struct_size = (uint32_t)sizeof(xrt_plugin_iface);
+	CHECK(xrt_plugin_iface_has_create_dp_gl_for_screen(&iface));
+	iface.create_dp_gl_for_screen = nullptr; // full size, slot left NULL = flat 2D on other screens
+	CHECK_FALSE(xrt_plugin_iface_has_create_dp_gl_for_screen(&iface));
+	CHECK_FALSE(xrt_plugin_iface_has_create_dp_gl_for_screen(nullptr));
+}
+
+static int g_gl_origin_calls = 0;
+static int32_t g_gl_origin_x = 0, g_gl_origin_y = 0;
+
+static void
+fake_gl_set_present_origin(xrt_display_processor_gl *, int32_t x, int32_t y)
+{
+	g_gl_origin_calls++;
+	g_gl_origin_x = x;
+	g_gl_origin_y = y;
+}
+
+TEST_CASE("GL DP: set_present_origin is the appended last slot, struct_size-gated (multi-screen M6)", "[stereo_camera]")
+{
+	// Appended after get_background_preview (ADR-020); it ends the vtable.
+	STATIC_REQUIRE(offsetof(xrt_display_processor_gl, set_present_origin) ==
+	               offsetof(xrt_display_processor_gl, get_background_preview) + sizeof(void *));
+	STATIC_REQUIRE(offsetof(xrt_display_processor_gl, set_present_origin) + sizeof(void *) ==
+	               sizeof(xrt_display_processor_gl));
+
+	xrt_display_processor_gl dp{};
+	dp.set_present_origin = fake_gl_set_present_origin;
+	g_gl_origin_calls = 0;
+	// A DP built against an older header: the helper must not read the slot.
+	dp.struct_size = (uint32_t)offsetof(xrt_display_processor_gl, set_present_origin);
+	xrt_display_processor_gl_set_present_origin(&dp, 10, 20);
+	CHECK(g_gl_origin_calls == 0);
+	dp.struct_size = (uint32_t)sizeof(xrt_display_processor_gl);
+	xrt_display_processor_gl_set_present_origin(&dp, -1920, 40);
+	CHECK(g_gl_origin_calls == 1);
+	CHECK(g_gl_origin_x == -1920);
+	CHECK(g_gl_origin_y == 40);
+	// No scanout caps answered: the conservative reading, "needs 1:1".
+	CHECK_FALSE(xrt_display_processor_gl_tolerates_resample(&dp));
 }
 
 TEST_CASE("plug-in iface: get_screen_status is struct_size-gated (ADR-051 D2)", "[stereo_camera]")

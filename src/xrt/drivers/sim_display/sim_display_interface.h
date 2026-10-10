@@ -528,6 +528,22 @@ sim_display_dp_factory_gl(void *window_handle,
                            struct xrt_display_processor_gl **out_xdp);
 
 /*!
+ * Multi-screen M6: per-screen GL factory, the GL twin of
+ * `sim_display_dp_factory_d3d11_for_screen` — matches
+ * `xrt_plugin_iface::create_dp_gl_for_screen`. The DP describes the bound
+ * screen, confines its draw (viewport + scissor) to the canvas it is handed and
+ * takes its interlace phase from set_present_origin. The compositor's GL
+ * context must be current.
+ *
+ * @ingroup drv_sim_display
+ */
+xrt_result_t
+sim_display_dp_factory_gl_for_screen(struct xrt_plugin_instance *inst,
+                                     void *window_handle,
+                                     const struct xrt_screen_binding *binding,
+                                     struct xrt_display_processor_gl **out_xdp);
+
+/*!
  * Create the simulation display system builder.
  *
  * Always available as fallback. Use FORCE_SIM_DISPLAY=1 to override vendor drivers.
