@@ -71,6 +71,7 @@ set(tests
     tests_oxr_segment_views
     tests_segments_ipc
     tests_target_screen_pin
+    tests_u_setting_per_screen
     tests_oxr_legacy_mode_rule
     tests_oxr_mode_fillable_rule
     tests_oxr_tracking_properties_rule

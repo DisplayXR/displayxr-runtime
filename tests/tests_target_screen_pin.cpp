@@ -15,6 +15,7 @@
 #include "target_screen_pin.h"
 
 #include <cstring>
+#include <string>
 
 TEST_CASE("DXR_SCREEN_PLUGIN parses match=id pairs", "[target][screen_pin]")
 {
@@ -181,4 +182,168 @@ TEST_CASE("claim-source shortcut: the active plug-in alone decides only without 
 	CHECK_FALSE(target_screen_active_decides_every_monitor(nullptr, nullptr, &none, mons, 2));
 	CHECK_FALSE(target_screen_active_decides_every_monitor("sim-display", nullptr, &none, mons, 0));
 	CHECK_FALSE(target_screen_active_decides_every_monitor("sim-display", nullptr, &none, nullptr, 2));
+}
+
+
+/*
+ *
+ * Display dashboard phase 7: the per-screen display-processor preference.
+ *
+ */
+
+TEST_CASE("per-screen preference: the resolver rule over a synthetic two-monitor registry", "[target][screen_pin]")
+{
+	// Two Leia panels; leia-sr is active and claims both VERIFIED, sim-display
+	// claims every monitor at FALLBACK (sources in ProbeOrder: leia 50, sim 200).
+	const target_screen_candidate laptop[] = {
+	    {"leia-sr", 100, true},
+	    {"sim-display", 10, false},
+	};
+	const target_screen_candidate ds1[] = {
+	    {"leia-sr", 100, true},
+	    {"sim-display", 10, false},
+	};
+	target_screen_pick_reason why;
+	bool pin_unclaimed = true;
+	bool pref_unclaimed = true;
+
+	// Preference "sim on DS1": DS1 -> sim at its FALLBACK claim, over the
+	// active plug-in's VERIFIED one (#1521 yields to the explicit preference)...
+	CHECK(target_screen_pick_ex(ds1, 2, nullptr, "sim-display", nullptr, &why, &pin_unclaimed, &pref_unclaimed) ==
+	      1);
+	CHECK(why == TARGET_SCREEN_PICK_SCREEN_PREF);
+	CHECK_FALSE(pin_unclaimed);
+	CHECK_FALSE(pref_unclaimed);
+	// ...while the laptop, with no preference, stays with the active plug-in.
+	CHECK(target_screen_pick_ex(laptop, 2, nullptr, nullptr, nullptr, &why, &pin_unclaimed, &pref_unclaimed) == 0);
+	CHECK(why == TARGET_SCREEN_PICK_ACTIVE);
+	CHECK_FALSE(pref_unclaimed);
+
+	// The preference id matches case-insensitively (written by hand / a UI).
+	CHECK(target_screen_pick_ex(ds1, 2, nullptr, "Sim-Display", nullptr, &why, nullptr, nullptr) == 1);
+	CHECK(why == TARGET_SCREEN_PICK_SCREEN_PREF);
+
+	// It outranks the global PreferredPlugin for that screen.
+	CHECK(target_screen_pick_ex(ds1, 2, nullptr, "sim-display", "leia-sr", &why, nullptr, nullptr) == 1);
+	CHECK(why == TARGET_SCREEN_PICK_SCREEN_PREF);
+	CHECK(target_screen_pick_ex(ds1, 2, nullptr, "leia-sr", "sim-display", &why, nullptr, nullptr) == 0);
+	CHECK(why == TARGET_SCREEN_PICK_SCREEN_PREF);
+
+	// A preference for a plug-in with no claim on the monitor (not loaded, or
+	// it does not claim it) is ignored and reported; the normal rules decide.
+	CHECK(target_screen_pick_ex(ds1, 2, nullptr, "other-vendor", nullptr, &why, &pin_unclaimed, &pref_unclaimed) ==
+	      0);
+	CHECK(why == TARGET_SCREEN_PICK_ACTIVE);
+	CHECK(pref_unclaimed);
+	CHECK_FALSE(pin_unclaimed);
+	const target_screen_candidate only_sim[] = {
+	    {"sim-display", 10, false},
+	};
+	CHECK(target_screen_pick_ex(only_sim, 1, nullptr, "leia-sr", nullptr, &why, nullptr, &pref_unclaimed) == 0);
+	CHECK(why == TARGET_SCREEN_PICK_CONFIDENCE);
+	CHECK(pref_unclaimed);
+
+	// A DXR_SCREEN_PLUGIN pin (bring-up knob) still outranks it, and an
+	// unclaimed preference is still reported under a pin.
+	CHECK(target_screen_pick_ex(ds1, 2, "leia-sr", "sim-display", nullptr, &why, &pin_unclaimed, &pref_unclaimed) ==
+	      0);
+	CHECK(why == TARGET_SCREEN_PICK_PIN);
+	CHECK_FALSE(pref_unclaimed);
+	CHECK(target_screen_pick_ex(ds1, 2, "leia-sr", "zzz", nullptr, &why, nullptr, &pref_unclaimed) == 0);
+	CHECK(pref_unclaimed);
+
+	// No candidates: the preference is unclaimed.
+	CHECK(target_screen_pick_ex(nullptr, 0, nullptr, "sim-display", nullptr, &why, nullptr, &pref_unclaimed) == -1);
+	CHECK(why == TARGET_SCREEN_PICK_NONE);
+	CHECK(pref_unclaimed);
+
+	// target_screen_pick is the same rule without a preference.
+	CHECK(target_screen_pick(ds1, 2, nullptr, nullptr, &why, nullptr) == 0);
+	CHECK(why == TARGET_SCREEN_PICK_ACTIVE);
+}
+
+TEST_CASE("per-screen preference: the claim-source shortcut loads the others for it", "[target][screen_pin]")
+{
+	target_screen_monitor mons[] = {
+	    {0x1111, "eDP-1", "eDP-1", true, nullptr},
+	    {0x2222, "HDMI-1", "HDMI-A-1", true, nullptr},
+	};
+	target_screen_pins none;
+	REQUIRE(target_screen_pin_parse(nullptr, &none, nullptr) == 0);
+	CHECK(target_screen_active_decides_every_monitor("leia-sr", nullptr, &none, mons, 2));
+	// A preference for another plug-in on one monitor needs its claim.
+	mons[1].screen_pref = "sim-display";
+	CHECK_FALSE(target_screen_active_decides_every_monitor("leia-sr", nullptr, &none, mons, 2));
+	// One naming the active plug-in itself (any case) changes nothing.
+	mons[1].screen_pref = "LEIA-SR";
+	CHECK(target_screen_active_decides_every_monitor("leia-sr", nullptr, &none, mons, 2));
+	mons[1].screen_pref = "";
+	CHECK(target_screen_active_decides_every_monitor("leia-sr", nullptr, &none, mons, 2));
+}
+
+TEST_CASE("screen key: PNP-PROD-SERIAL, qualified on a zero serial or a collision", "[target][screen_key]")
+{
+	// "AUO" packed as the EDID stores it (little-endian): 0x06AF -> bytes AF 06.
+	const uint16_t auo = 0xAF06;
+	char pnp[4];
+	target_screen_pnp_code(auo, pnp);
+	CHECK(std::string(pnp) == "AUO");
+	target_screen_pnp_code(0, pnp);
+	CHECK(std::string(pnp) == "???");
+
+	char keys[4][TARGET_SCREEN_KEY_MAX];
+
+	SECTION("distinct serials: plain keys, stable whatever the device names")
+	{
+		const target_screen_key_input in[] = {
+		    {auo, 0xB194, 0x0000ABCD, "\\\\.\\DISPLAY1"},
+		    {auo, 0xB194, 0x0000ABCE, "\\\\.\\DISPLAY5"},
+		};
+		target_screen_keys_build(in, 2, keys);
+		CHECK(std::string(keys[0]) == "AUO-B194-0000ABCD");
+		CHECK(std::string(keys[1]) == "AUO-B194-0000ABCE");
+	}
+
+	SECTION("a zero serial is qualified with the device name")
+	{
+		const target_screen_key_input in[] = {
+		    {auo, 0x1234, 0, "\\\\.\\DISPLAY2"},
+		};
+		target_screen_keys_build(in, 1, keys);
+		CHECK(std::string(keys[0]) == "AUO-1234-00000000@DISPLAY2");
+	}
+
+	SECTION("two identical panels (same EDID serial): both qualified, so both distinct")
+	{
+		const target_screen_key_input in[] = {
+		    {auo, 0x1234, 0x01010101, "\\\\.\\DISPLAY1"},
+		    {auo, 0x1234, 0x01010101, "\\\\.\\DISPLAY3"},
+		    {auo, 0x5678, 0x01010101, "HDMI-1"},
+		};
+		target_screen_keys_build(in, 3, keys);
+		CHECK(std::string(keys[0]) == "AUO-1234-01010101@DISPLAY1");
+		CHECK(std::string(keys[1]) == "AUO-1234-01010101@DISPLAY3");
+		CHECK(std::string(keys[2]) == "AUO-5678-01010101"); // not part of the collision
+		CHECK(std::string(keys[0]) != std::string(keys[1]));
+	}
+
+	SECTION("no device name: the base key stands")
+	{
+		const target_screen_key_input in[] = {
+		    {auo, 0x1234, 0, nullptr},
+		};
+		target_screen_keys_build(in, 1, keys);
+		CHECK(std::string(keys[0]) == "AUO-1234-00000000");
+	}
+
+	SECTION("a long device name never overflows the key")
+	{
+		const std::string longname(200, 'D');
+		const target_screen_key_input in[] = {
+		    {auo, 0x1234, 0, longname.c_str()},
+		};
+		target_screen_keys_build(in, 1, keys);
+		CHECK(std::strlen(keys[0]) == TARGET_SCREEN_KEY_MAX - 1);
+		CHECK(std::string(keys[0]).rfind("AUO-1234-00000000@D", 0) == 0);
+	}
 }

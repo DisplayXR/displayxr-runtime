@@ -157,8 +157,10 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         tail = ["compositor_segments_enable", "compositor_get_segment_metrics", "compositor_set_view_routing"]
         i = names.index(tail[0])
         self.assertEqual(names[i:i + 3], tail)
-        # Only later appends may follow them (ADR-051's status calls).
-        self.assertTrue(all(n.startswith("system_get_") for n in names[i + 3:]), names[i + 3:])
+        # Only later appends may follow them (ADR-051's status calls, then
+        # display dashboard phase 7's re-probe request).
+        self.assertTrue(all(n.startswith("system_get_") or n == "system_request_display_reprobe"
+                            for n in names[i + 3:]), names[i + 3:])
         enable = self._call("compositor_segments_enable")
         self.assertEqual([(a.name, a.typename) for a in enable.in_args], [("pinned_display_id", "uint64_t")])
         get = self._call("compositor_get_segment_metrics")
@@ -175,7 +177,7 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # call, one client row per call — each carrying its generation.
         names = [c.name for c in self.p.calls]
         tail = ["system_get_status_generation", "system_get_status_snapshot", "system_get_client_segments"]
-        self.assertEqual(names[-3:], tail)
+        self.assertEqual(names[-4:-1], tail)
         gen = self._call("system_get_status_generation")
         self.assertEqual(gen.in_args, [])
         self.assertEqual([(a.name, a.typename) for a in gen.out_args],
@@ -193,6 +195,19 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
             self.assertFalse(call.in_handles, call.name)
             self.assertFalse(call.out_handles, call.name)
             self.assertFalse(call.varlen, call.name)
+
+    def test_reprobe_request_is_appended(self):
+        # Display dashboard phase 7: `dp use|reset --screen` asks the running
+        # service to re-probe now. Session-free, DIAG only, no payload — and
+        # the LAST call, so every earlier command keeps its enum value.
+        names = [c.name for c in self.p.calls]
+        self.assertEqual(names[-1], "system_request_display_reprobe")
+        call = self._call("system_request_display_reprobe")
+        self.assertEqual(call.in_args, [])
+        self.assertEqual(call.out_args, [])
+        self.assertFalse(call.in_handles)
+        self.assertFalse(call.out_handles)
+        self.assertFalse(call.varlen)
 
 
 if __name__ == "__main__":
