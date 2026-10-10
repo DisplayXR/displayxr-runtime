@@ -80,7 +80,7 @@
     "XR_DXR_weave": {
       "group": "rendering",
       "title": "Window Weave Service",
-      "summary": "Window-bound synchronous weave for present-owners: hand the runtime a stereo texture and a window rect, get back a weaved shared texture and a fence"
+      "summary": "Window-bound synchronous weave for present-owners: hand the runtime a stereo texture and a window rect, get back a weaved shared texture and a fence; a window spanning two 3D screens is woven per screen, with each screen's eyes and each rect's per-screen parts handed back"
     },
     "XR_DXR_lift": {
       "group": "rendering",
