@@ -2772,6 +2772,23 @@ struct xrt_dp_registry_entry
 	//! struct xrt_plugin_instance *), for a future per-display lifecycle.
 	const void *owning_iface;
 	void *owning_instance;
+
+	/*
+	 * Display dashboard phase 7: the per-screen display-processor
+	 * preference (`displayxr-cli dp use <id> --screen <key>`). Sources are
+	 * `enum u_setting_source` values: 0 none, 1 env, 2 user, 3 machine.
+	 */
+	//! A per-screen preference won this monitor (over confidence and the active plug-in).
+	bool forced;
+	//! Where the preference that forced it came from; 0 when not forced.
+	uint32_t forced_source;
+	//! The preference set for this monitor, honoured or not ("" = none).
+	char preferred_plugin[32];
+	//! Where @ref preferred_plugin came from; 0 = none.
+	uint32_t preferred_source;
+	//! The system-default screen, forced to a plug-in other than the active
+	//! one: the primary DP weaves with this entry (set by the instance).
+	bool primary_override;
 };
 
 /*!
@@ -2791,7 +2808,9 @@ struct xrt_dp_factory_registry
 /*!
  * The registry entry a "don't care which monitor" caller (the D3D11 service
  * compositor, in-process GL — `COMP_DP_PRIMARY_MONITOR`) should weave with:
- * the first monitor the ACTIVE plug-in won, else entries[0].
+ * the system-default screen when a per-screen preference forced it
+ * (`primary_override`), else the first monitor the ACTIVE plug-in won, else
+ * entries[0].
  *
  * entries[0] alone is the first monitor in OS enumeration order — normally
  * the Windows primary. On a laptop driving an external 3D panel that is the
@@ -2806,6 +2825,13 @@ xrt_dp_registry_primary_entry(const struct xrt_dp_factory_registry *reg, const c
 {
 	if (reg == NULL || reg->entry_count == 0) {
 		return NULL;
+	}
+	// A per-screen preference on the system-default screen (display
+	// dashboard phase 7) names the primary DP's plug-in explicitly.
+	for (uint32_t i = 0; i < reg->entry_count; i++) {
+		if (reg->entries[i].primary_override) {
+			return &reg->entries[i];
+		}
 	}
 	if (active_plugin_id != NULL && active_plugin_id[0] != '\0') {
 		for (uint32_t i = 0; i < reg->entry_count; i++) {

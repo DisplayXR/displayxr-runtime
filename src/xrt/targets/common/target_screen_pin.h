@@ -86,11 +86,12 @@ struct target_screen_candidate
 
 enum target_screen_pick_reason
 {
-	TARGET_SCREEN_PICK_NONE = 0,       //!< No candidate.
-	TARGET_SCREEN_PICK_PIN = 1,        //!< `DXR_SCREEN_PLUGIN` pin for this monitor.
-	TARGET_SCREEN_PICK_PREFERRED = 2,  //!< PreferredPlugin override (#791).
-	TARGET_SCREEN_PICK_ACTIVE = 3,     //!< The active plug-in claims it (#1521).
-	TARGET_SCREEN_PICK_CONFIDENCE = 4, //!< Highest confidence, ties to the lower ProbeOrder.
+	TARGET_SCREEN_PICK_NONE = 0,        //!< No candidate.
+	TARGET_SCREEN_PICK_PIN = 1,         //!< `DXR_SCREEN_PLUGIN` pin for this monitor.
+	TARGET_SCREEN_PICK_PREFERRED = 2,   //!< PreferredPlugin override (#791).
+	TARGET_SCREEN_PICK_ACTIVE = 3,      //!< The active plug-in claims it (#1521).
+	TARGET_SCREEN_PICK_CONFIDENCE = 4,  //!< Highest confidence, ties to the lower ProbeOrder.
+	TARGET_SCREEN_PICK_SCREEN_PREF = 5, //!< Per-screen preference (`dp use <id> --screen <key>`).
 };
 
 /*!
@@ -111,6 +112,29 @@ target_screen_pick(const struct target_screen_candidate *cands,
                    bool *out_pin_unclaimed);
 
 /*!
+ * The per-monitor winner with the per-screen display-processor preference
+ * (display dashboard phase 7): a `DXR_SCREEN_PLUGIN` pin, then the per-screen
+ * preference @p screen_pref, then the global @p preferred, then the active
+ * plug-in, then confidence. The per-screen preference wins at ANY claim
+ * confidence (a FALLBACK sim-display claim included) and so outranks the
+ * active plug-in's "wins every monitor it claims" rule (#1521), but only when
+ * its plug-in claims the monitor; otherwise it is ignored and
+ * @p out_pref_unclaimed is set (the caller WARNs). Its plug-in id matches
+ * case-insensitively (typed by hand, or written by a UI).
+ *
+ * @ref target_screen_pick is this with @p screen_pref NULL.
+ */
+int
+target_screen_pick_ex(const struct target_screen_candidate *cands,
+                      uint32_t count,
+                      const char *pin_plugin,
+                      const char *screen_pref,
+                      const char *preferred,
+                      enum target_screen_pick_reason *out_reason,
+                      bool *out_pin_unclaimed,
+                      bool *out_pref_unclaimed);
+
+/*!
  * One monitor of a resolve, as the source-set shortcut sees it: its names (for
  * the pin match; either may be NULL/"") and whether the ACTIVE plug-in has a
  * claim on it, at any confidence.
@@ -121,6 +145,8 @@ struct target_screen_monitor
 	const char *output_name;
 	const char *connector;
 	bool active_claims;
+	//! The per-screen preference for this monitor (NULL/"" = none).
+	const char *screen_pref;
 };
 
 /*!
@@ -131,7 +157,9 @@ struct target_screen_monitor
  * for that monitor. So this is true only when @p active_id claims every monitor,
  * @p preferred is NULL/"" or the active plug-in itself (exact match, as in
  * target_screen_pick), and no pin that matches one of @p mons names a different
- * plug-in (case-insensitive, as in target_screen_pick).
+ * plug-in (case-insensitive, as in target_screen_pick), and no monitor's
+ * per-screen preference (@ref target_screen_monitor::screen_pref) names a
+ * different plug-in.
  *
  * Claim confidence is deliberately NOT consulted: rule 3 (the active plug-in,
  * #1521) is confidence-blind, so a FALLBACK claim by the active plug-in beats a
@@ -144,6 +172,48 @@ target_screen_active_decides_every_monitor(const char *active_id,
                                            const struct target_screen_pins *pins,
                                            const struct target_screen_monitor *mons,
                                            uint32_t count);
+
+/*
+ *
+ * Stable screen key (display dashboard phase 7).
+ *
+ */
+
+//! Size of a screen key, incl. the NUL.
+#define TARGET_SCREEN_KEY_MAX 64
+
+/*!
+ * One monitor's identity, as the key derivation sees it.
+ */
+struct target_screen_key_input
+{
+	uint16_t manufacturer_id; //!< EDID manufacturer id, as stored (little-endian PNP packing).
+	uint16_t product_id;      //!< EDID product code.
+	uint32_t serial;          //!< EDID serial number (0 = none).
+	const char *device_name;  //!< OS device name (Windows GDI name, Linux connector, macOS display UUID).
+};
+
+/*!
+ * Decode an EDID manufacturer id (stored little-endian; the spec packs it
+ * big-endian as three 5-bit letters) into its 3-letter PNP code ("AUO"); a
+ * letter outside A-Z becomes '?'.
+ */
+void
+target_screen_pnp_code(uint16_t manufacturer_id, char out[4]);
+
+/*!
+ * Derive every monitor's stable screen key, the identity a per-screen
+ * preference is stored under. Unlike the per-boot `monitor_id` it survives a
+ * reboot and a desktop re-arrangement: `"<PNP>-<PROD>-<SERIAL>"`, the PNP
+ * code, the product as 4 upper-case hex digits and the EDID serial as 8
+ * (`"AUO-1234-0000ABCD"`). When the serial is 0, or two monitors of @p in
+ * would get the same key, that monitor's key gets `"@<device_name>"` appended
+ * (`"AUO-1234-00000000@DISPLAY2"`), unique as long as the OS device names are.
+ * A Windows GDI name loses its `\\.\` namespace prefix there, so a key never
+ * needs shell escaping. Pure.
+ */
+void
+target_screen_keys_build(const struct target_screen_key_input *in, uint32_t n, char (*out)[TARGET_SCREEN_KEY_MAX]);
 
 #ifdef __cplusplus
 }

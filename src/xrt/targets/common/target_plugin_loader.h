@@ -401,6 +401,18 @@ target_plugin_get_monitor_record(uint64_t monitor_id,
                                  struct xrt_display_descriptor *out_desc,
                                  struct os_display_edid_monitor *out_mon);
 
+/*!
+ * The stable screen key of a monitor from the last
+ * @ref target_plugin_build_descriptors (display dashboard phase 7):
+ * `"<PNP>-<PROD>-<SERIAL>"`, `"@<device>"`-qualified when the serial is 0 or
+ * two monitors would collide (`target_screen_keys_build`). The identity a
+ * per-screen display-processor preference is stored under — unlike the
+ * per-boot monitor id it survives a reboot. @p out_device (may be NULL)
+ * receives the OS device name used to qualify it. False when the id is unknown.
+ */
+bool
+target_plugin_get_monitor_key(uint64_t monitor_id, char *out_key, size_t key_cap, char *out_device, size_t device_cap);
+
 struct xrt_plugin_display_info;
 struct os_display_edid_monitor;
 struct os_display_panel_hint;

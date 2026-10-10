@@ -41,6 +41,7 @@
 #include "os/os_display_edid.h"
 #include "os/os_display_desktop.h"
 #include "util/u_logging.h"
+#include "util/u_setting.h"
 
 #include <errno.h>
 #include <stddef.h>
@@ -3227,6 +3228,10 @@ static struct
 	uint64_t monitor_id;
 	struct os_display_edid_monitor mon;
 	struct xrt_display_descriptor desc;
+	//! Stable screen key (target_screen_keys_build), the per-screen preference's identity.
+	char key[TARGET_SCREEN_KEY_MAX];
+	//! OS device name the key was qualified with (Windows GDI name, else output / connector).
+	char device_name[64];
 } g_monitor_side[XRT_DP_REGISTRY_MAX_ENTRIES];
 static uint32_t g_monitor_side_count = 0;
 
@@ -3304,6 +3309,27 @@ log_monitor_join_once(const struct os_display_edid_list *list)
 	}
 }
 
+/*!
+ * The OS device name of an enumerated monitor, for its screen key: the GDI
+ * name of the monitor at its origin on Windows (the EDID record carries no
+ * output name there), else its RandR output / macOS UUID, else its connector.
+ */
+static void
+monitor_device_name(const struct os_display_edid_monitor *m, char *out, size_t cap)
+{
+	out[0] = '\0';
+#ifdef XRT_OS_WINDOWS
+	struct os_display_desktop_info dm;
+	memset(&dm, 0, sizeof(dm));
+	if (os_display_desktop_info_at(m->screen_left, m->screen_top, &dm) && dm.left == m->screen_left &&
+	    dm.top == m->screen_top) {
+		(void)snprintf(out, cap, "%.*s", (int)(cap - 1), dm.device_name);
+		return;
+	}
+#endif
+	(void)snprintf(out, cap, "%s", m->output_name[0] != '\0' ? m->output_name : m->connector);
+}
+
 uint32_t
 target_plugin_build_descriptors(const struct os_display_edid_list *list,
                                 struct xrt_display_descriptor *out,
@@ -3339,15 +3365,55 @@ target_plugin_build_descriptors(const struct os_display_edid_list *list,
 		os_mutex_lock(&g_refresh_mutex);
 	}
 	g_monitor_side_count = n < XRT_DP_REGISTRY_MAX_ENTRIES ? n : XRT_DP_REGISTRY_MAX_ENTRIES;
+	struct target_screen_key_input key_in[XRT_DP_REGISTRY_MAX_ENTRIES];
 	for (uint32_t i = 0; i < g_monitor_side_count; i++) {
 		g_monitor_side[i].monitor_id = out[i].monitor_id;
 		g_monitor_side[i].mon = list->monitors[i];
 		g_monitor_side[i].desc = out[i];
+		monitor_device_name(&list->monitors[i], g_monitor_side[i].device_name,
+		                    sizeof(g_monitor_side[i].device_name));
+		key_in[i].manufacturer_id = list->monitors[i].manufacturer_id;
+		key_in[i].product_id = list->monitors[i].product_id;
+		key_in[i].serial = list->monitors[i].serial_number;
+		key_in[i].device_name = g_monitor_side[i].device_name;
+	}
+	// Display dashboard phase 7: the stable key a per-screen preference is
+	// stored under (the monitor id is per boot).
+	char keys[XRT_DP_REGISTRY_MAX_ENTRIES][TARGET_SCREEN_KEY_MAX];
+	target_screen_keys_build(key_in, g_monitor_side_count, keys);
+	for (uint32_t i = 0; i < g_monitor_side_count; i++) {
+		(void)snprintf(g_monitor_side[i].key, sizeof(g_monitor_side[i].key), "%s", keys[i]);
 	}
 	if (g_refresh_mutex_initialized) {
 		os_mutex_unlock(&g_refresh_mutex);
 	}
 	return n;
+}
+
+bool
+target_plugin_get_monitor_key(uint64_t monitor_id, char *out_key, size_t key_cap, char *out_device, size_t device_cap)
+{
+	bool found = false;
+	if (g_refresh_mutex_initialized) {
+		os_mutex_lock(&g_refresh_mutex);
+	}
+	for (uint32_t i = 0; i < g_monitor_side_count; i++) {
+		if (g_monitor_side[i].monitor_id != monitor_id) {
+			continue;
+		}
+		if (out_key != NULL && key_cap > 0) {
+			(void)snprintf(out_key, key_cap, "%s", g_monitor_side[i].key);
+		}
+		if (out_device != NULL && device_cap > 0) {
+			(void)snprintf(out_device, device_cap, "%s", g_monitor_side[i].device_name);
+		}
+		found = true;
+		break;
+	}
+	if (g_refresh_mutex_initialized) {
+		os_mutex_unlock(&g_refresh_mutex);
+	}
+	return found;
 }
 
 bool
@@ -3694,8 +3760,9 @@ fill_registry_entry(struct xrt_dp_registry_entry *e,
 /*!
  * POSIX: does the active plug-in, on its own, already decide every monitor?
  * The active plug-in wins every monitor it claims, at any confidence (#1521),
- * and only two things outrank it: a different PreferredPlugin, and a
- * `DXR_SCREEN_PLUGIN` pin naming a different plug-in for that monitor. When it
+ * and only three things outrank it: a different PreferredPlugin, a
+ * `DXR_SCREEN_PLUGIN` pin naming a different plug-in for that monitor, and a
+ * per-screen preference naming one (display dashboard phase 7). When it
  * claims every descriptor and neither applies, loading and probing every other
  * installed plug-in cannot change a single registry entry. It would only
  * dlopen them, run their vendor probes (Leia's reaches the SR service and the
@@ -3731,6 +3798,7 @@ active_plugin_decides_every_monitor(const struct xrt_display_descriptor *descs, 
 	const uint32_t cn = query_source_claims(&active, descs, n, claims, XRT_DP_REGISTRY_MAX_ENTRIES);
 
 	struct target_screen_monitor mons[XRT_DP_REGISTRY_MAX_ENTRIES];
+	char screen_pref[XRT_DP_REGISTRY_MAX_ENTRIES][64];
 	const uint32_t mn = n < XRT_DP_REGISTRY_MAX_ENTRIES ? n : XRT_DP_REGISTRY_MAX_ENTRIES;
 	for (uint32_t d = 0; d < mn; d++) {
 		mons[d].monitor_id = descs[d].monitor_id;
@@ -3740,10 +3808,15 @@ active_plugin_decides_every_monitor(const struct xrt_display_descriptor *descs, 
 		for (uint32_t c = 0; c < cn && !mons[d].active_claims; c++) {
 			mons[d].active_claims = claims[c].monitor_id == descs[d].monitor_id;
 		}
+		mons[d].screen_pref = NULL;
 		for (uint32_t i = 0; i < g_monitor_side_count; i++) {
 			if (g_monitor_side[i].monitor_id == descs[d].monitor_id) {
 				mons[d].output_name = g_monitor_side[i].mon.output_name;
 				mons[d].connector = g_monitor_side[i].mon.connector;
+				if (u_setting_get_preferred_plugin_for_screen(g_monitor_side[i].key, screen_pref[d],
+				                                              sizeof(screen_pref[d]), NULL) != NULL) {
+					mons[d].screen_pref = screen_pref[d];
+				}
 				break;
 			}
 		}
@@ -3803,6 +3876,25 @@ ensure_display_sources(const struct xrt_display_descriptor *descs, uint32_t n)
 		g_display_source_count = 1;
 	}
 #endif
+}
+
+//! Case-insensitive plug-in id compare (a per-screen preference is written by hand or a UI).
+static bool
+screen_ids_equal(const char *a, const char *b)
+{
+	for (; *a != '\0' && *b != '\0'; a++, b++) {
+		char ca = *a, cb = *b;
+		if (ca >= 'A' && ca <= 'Z') {
+			ca = (char)(ca - 'A' + 'a');
+		}
+		if (cb >= 'A' && cb <= 'Z') {
+			cb = (char)(cb - 'A' + 'a');
+		}
+		if (ca != cb) {
+			return false;
+		}
+	}
+	return *a == *b;
 }
 
 void
@@ -3915,6 +4007,21 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 				break;
 			}
 		}
+		// Display dashboard phase 7: the per-screen preference, by the
+		// monitor's stable key (env > per-user file > machine).
+		const char *screen_key = "";
+		for (uint32_t i = 0; i < g_monitor_side_count; i++) {
+			if (g_monitor_side[i].monitor_id == desc->monitor_id) {
+				screen_key = g_monitor_side[i].key;
+				break;
+			}
+		}
+		char screen_pref[64] = {0};
+		enum u_setting_source pref_source = U_SETTING_SOURCE_DEFAULT;
+		const bool have_screen_pref =
+		    screen_key[0] != '\0' && u_setting_get_preferred_plugin_for_screen(
+		                                 screen_key, screen_pref, sizeof(screen_pref), &pref_source) != NULL;
+
 		const int pin_idx = target_screen_pin_find(&pins, desc->monitor_id, out_name, conn_name);
 		const char *pin_plugin = pin_idx >= 0 ? pins.pin[pin_idx].plugin_id : NULL;
 		if (pin_idx >= 0) {
@@ -3923,8 +4030,22 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 
 		enum target_screen_pick_reason reason = TARGET_SCREEN_PICK_NONE;
 		bool pin_unclaimed = false;
-		const int pick = target_screen_pick(cands, nc, pin_plugin, have_preferred ? preferred_id : NULL,
-		                                    &reason, &pin_unclaimed);
+		bool pref_unclaimed = false;
+		const int pick = target_screen_pick_ex(cands, nc, pin_plugin, have_screen_pref ? screen_pref : NULL,
+		                                       have_preferred ? preferred_id : NULL, &reason, &pin_unclaimed,
+		                                       &pref_unclaimed);
+		if (pref_unclaimed) {
+			// The named plug-in is not loaded, or it has no claim on this monitor.
+			bool loaded = false;
+			for (int s = 0; s < g_display_source_count && !loaded; s++) {
+				const struct xrt_plugin_iface *sif = g_display_sources[s].iface;
+				loaded = sif != NULL && sif->id != NULL && screen_ids_equal(sif->id, screen_pref);
+			}
+			U_LOG_W("plugin loader: per-screen preference '%s' -> '%s' ignored: %s", screen_key,
+			        screen_pref,
+			        loaded ? "that plug-in has no claim on this screen"
+			               : "that plug-in is not loaded (not registered, or it failed to load)");
+		}
 		if (pin_unclaimed) {
 			U_LOG_W(
 			    "plugin loader: DXR_SCREEN_PLUGIN pins monitor 0x%016llx ('%s'/'%s') to '%s', which has no "
@@ -3944,7 +4065,20 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 			}
 		}
 
-		if (reason == TARGET_SCREEN_PICK_PIN) {
+		if (reason == TARGET_SCREEN_PICK_SCREEN_PREF) {
+			// Once per resolve (rare: instance create, re-probe), and it is the
+			// one line that explains a screen woven by a non-default plug-in.
+			bool over_active = false;
+			for (uint32_t i = 0; i < nc && !cands[pick].is_active; i++) {
+				over_active |= cands[i].is_active;
+			}
+			U_LOG_W(
+			    "plugin loader: monitor 0x%016llx (screen '%s') -> '%s' by a per-screen preference (%s; "
+			    "confidence=%u)%s",
+			    (unsigned long long)desc->monitor_id, screen_key, cands[pick].plugin_id,
+			    u_setting_source_str(pref_source), cands[pick].confidence,
+			    over_active ? " — the active plug-in's claim on it yields to the explicit preference" : "");
+		} else if (reason == TARGET_SCREEN_PICK_PIN) {
 			U_LOG_I(
 			    "plugin loader: monitor 0x%016llx ('%s'/'%s') → '%s' by DXR_SCREEN_PLUGIN (confidence=%u; "
 			    "outranks PreferredPlugin and the active plug-in for this monitor)",
@@ -3970,6 +4104,14 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 		}
 		struct xrt_dp_registry_entry *e = &out_registry->entries[out_registry->entry_count++];
 		fill_registry_entry(e, desc, best_src, best_claim);
+		if (have_screen_pref) {
+			(void)snprintf(e->preferred_plugin, sizeof(e->preferred_plugin), "%s", screen_pref);
+			e->preferred_source = (uint32_t)pref_source;
+		}
+		if (reason == TARGET_SCREEN_PICK_SCREEN_PREF) {
+			e->forced = true;
+			e->forced_source = (uint32_t)pref_source;
+		}
 		U_LOG_I("plugin loader: monitor 0x%016llx → plug-in '%s' (confidence=%u)",
 		        (unsigned long long)e->monitor_id, e->plugin_id, e->confidence);
 		if (reason == TARGET_SCREEN_PICK_PIN && e->dp_factory_vk == NULL && e->dp_factory_gl == NULL &&
