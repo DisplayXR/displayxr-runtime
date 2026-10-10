@@ -1368,7 +1368,7 @@ struct multi_system_compositor
 	int android_window_valid_state;
 #endif
 
-#ifdef XRT_OS_MACOS
+#ifdef COMP_MULTI_SHARED_SURFACE
 	/*!
 	 * @name Shared spatial surface (#59, the spatial-desktop re-architecture)
 	 *
@@ -1384,6 +1384,11 @@ struct multi_system_compositor
 	 * @{
 	 */
 	bool shared_surface_initialized; //!< True once the shared window + resources exist.
+	int64_t shared_init_retry_ns;    //!< After a failed target create: no retry before this (0 = none pending).
+	//! D-5 (#967): the hardware 2D/3D state last applied to shared_dp
+	//! (-1 = never), converged each frame from the lens owner's wish
+	//! (mc->hardware_display_3d of the focused client, or of a lone client).
+	int shared_hw_3d_applied;
 	bool shared_window_visible;      //!< #61: full-screen window currently shown (orderFront) vs hidden (orderOut).
 	struct comp_target *shared_target;             //!< The one full-screen NSWindow target.
 	struct xrt_display_processor *shared_dp;       //!< The one DP that weaves the combined atlas.
@@ -1441,7 +1446,7 @@ struct multi_system_compositor
 	bool shared_deco_honest_failed; //!< Sticky: setup failed once, legacy decorations from then on.
 	bool shared_deco_logged;        //!< The one-time regime WARN has been emitted.
 	//! @}
-#endif
+#endif // COMP_MULTI_SHARED_SURFACE
 };
 
 /*!

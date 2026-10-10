@@ -2,14 +2,14 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Rounded-corner + edge-feather content composite pipeline (macOS).
+ * @brief  Rounded-corner + edge-feather content composite pipeline (shared surface).
  * @author David Fattal
  * @ingroup comp_multi
  */
 
 #include "comp_multi_content_blend.h"
 
-#ifdef XRT_OS_MACOS
+#ifdef COMP_MULTI_SHARED_SURFACE
 
 #include "util/u_logging.h"
 
@@ -1497,4 +1497,4 @@ comp_multi_content_blend_fini(struct comp_multi_content_blend *blend, struct vk_
 	memset(blend, 0, sizeof(*blend));
 }
 
-#endif // XRT_OS_MACOS
+#endif // COMP_MULTI_SHARED_SURFACE

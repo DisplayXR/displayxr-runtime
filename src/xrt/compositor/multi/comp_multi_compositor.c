@@ -2485,7 +2485,13 @@ multi_compositor_request_display_mode(struct multi_compositor *mc, bool enable_3
 	// every hardware request on the floor — the panel's lens stayed on over a
 	// 2D tab while the browser believed the request had landed. Its DP is the
 	// weave engine's own instance (mc->weave.dp), so the request goes there.
-	if (mc != NULL && !mc->session_render.initialized) {
+	//
+	// #710: with the shared spatial surface, a composited (non-weave) client
+	// also has no session_render; only a client that has bound a weave window
+	// is a weave client. Any other request is recorded below as the wish the
+	// shared surface converges on (the weave engine reads the same wish at its
+	// bring-up, so a pre-bind request from a present-owner is not lost).
+	if (mc != NULL && !mc->session_render.initialized && mc->weave.window_bound) {
 		return comp_multi_weave_linux_request_display_mode(mc, enable_3d);
 	}
 #endif
@@ -2497,6 +2503,16 @@ multi_compositor_request_display_mode(struct multi_compositor *mc, bool enable_3
 	// so a shared-surface app keeps its old behaviour.
 	if (mc != NULL && !mc->session_render.initialized && mc->weave.mutex_initialized) {
 		return comp_multi_weave_macos_request_display_mode(mc, enable_3d);
+	}
+#endif
+#ifdef COMP_MULTI_SHARED_SURFACE
+	// D-5 (#967): a shared-surface client has no per-session DP; its wish is
+	// applied to the ONE shared display processor by the render thread
+	// (shared_converge_display_mode_locked), which also emits the hardware
+	// state event once the DP accepted it.
+	if (mc != NULL && !mc->session_render.initialized) {
+		mc->hardware_display_3d = enable_3d;
+		return true;
 	}
 #endif
 	if (mc == NULL || !mc->session_render.initialized) {
