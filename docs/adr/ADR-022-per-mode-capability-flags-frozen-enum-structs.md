@@ -78,6 +78,29 @@ own `XrEyeTrackingModeCapabilitiesDXR` chaining to `XrSystemProperties`).
   own repo per ADR-019); the versions.json ABI gate held the runtime bump
   until a matched pair existed, as designed (ADR-020).
 
+## Amendment 1 (2026-10-10, #1855): sim_display's advertisement under webcam tracking
+
+sim_display's honest "no tracker" advertisement now has a third state. With
+`SIM_DISPLAY_WEBCAM_TRACKING=1` **and** a face estimator built into the
+plug-in, sim_display really tracks the viewer from a plain webcam, so it
+advertises what a tracking vendor does: `supported_eye_tracking_modes |=
+MANAGED_BIT`, `default_eye_tracking_mode = MANAGED`, and `has_tracking` on its
+3D rendering modes (2D passthrough stays untracked). The consistency rule
+(`supported_eye_tracking_modes != 0` ⇔ some mode has `has_tracking`) holds in
+every combination: neither toggle → 0 / no tracked mode; `SIM_DISPLAY_FAKE_TRACKING`
+→ MANUAL; webcam → MANAGED; both → MANAGED | MANUAL with MANAGED the default.
+
+Only MANAGED is offered for the webcam path: on loss it animates the eyes back
+to the nominal viewer itself (the vendor-side collapse of the MANAGED
+contract) and it has no hardware 2D/3D switch to hand to an app. Multi-screen
+per-monitor descriptions are unchanged — segment display processors keep their
+nominal viewer, because the camera's pose is known relative to one panel only.
+
+**The default build carries no estimator** (which model and inference
+dependency to ship is #1855's open question), and without one the toggle only
+logs a WARN: no capability changes and no camera opens. Nothing an app sees
+changes until an estimator lands.
+
 ## References
 
 - #441 (umbrella), runtime PRs #443 / #446 / #451; vendor rebuilds tracked in
@@ -86,3 +109,4 @@ own `XrEyeTrackingModeCapabilitiesDXR` chaining to `XrSystemProperties`).
 - `docs/specs/extensions/XR_DXR_display_info.md` §7c (v14 API surface)
 - `docs/specs/vendor/eye-tracking-modes.md` (capability layering + contract)
 - ADR-020 (plug-in ABI policy this builds on)
+- #1855 (sim_display webcam tracking — Amendment 1)
