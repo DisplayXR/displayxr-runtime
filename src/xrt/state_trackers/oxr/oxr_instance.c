@@ -789,7 +789,9 @@ oxr_instance_create(struct oxr_logger *log,
 	// env-var-overrides: install the MCP Tools package (writes the
 	// capability marker — REG_DWORD Enabled=1 on Windows, a one-byte
 	// file under /Library/Application Support/DisplayXR/Capabilities/MCP/
-	// on macOS) and the MCP server starts in every handle-app process.
+	// on macOS, ~/.config/displayxr/capabilities/mcp/Enabled or
+	// /etc/displayxr/capabilities/mcp/Enabled on Linux) and the MCP server
+	// starts in every handle-app process.
 	// DISPLAYXR_MCP=1/0 in the environment wins as an explicit override
 	// (CI, dev iteration, quick disable). No marker + no env var ⇒
 	// zero runtime cost. See oxr_mcp_capability_enabled().

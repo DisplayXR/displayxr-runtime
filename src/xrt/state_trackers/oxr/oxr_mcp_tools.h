@@ -102,6 +102,11 @@ oxr_mcp_tools_submit_capture(const char *path, uint32_t mode);
  *   macOS:   @c /Library/Application Support/DisplayXR/Capabilities/MCP/Enabled
  *            (first byte == @c '1', written root:wheel 0644 by the
  *            postinstall script in DisplayXRMCP-*.pkg).
+ *   Linux:   @c $XDG_CONFIG_HOME/displayxr/capabilities/mcp/Enabled
+ *            (default @c ~/.config/...), then
+ *            @c /etc/displayxr/capabilities/mcp/Enabled; first byte
+ *            == @c '1', the first existing marker decides
+ *            (u_mcp_capability.h).
  *
  * Combine with @ref mcp_check_env_or so the @c DISPLAYXR_MCP env var
  * still wins as an explicit override:

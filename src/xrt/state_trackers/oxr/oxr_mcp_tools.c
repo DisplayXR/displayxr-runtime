@@ -28,6 +28,7 @@
 
 #include "util/u_logging.h"
 #include "util/u_file_logging.h"
+#include "util/u_mcp_capability.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -909,6 +910,9 @@ oxr_mcp_log_sink(const char *file,
 //            first byte == '1'. Written (as root:wheel 0644) by the
 //            postinstall script in DisplayXRMCP-*.pkg. See
 //            displayxr-mcp/installer/macos/scripts/postinstall.
+//   Linux:   $XDG_CONFIG_HOME/displayxr/capabilities/mcp/Enabled (default
+//            ~/.config/...), then /etc/displayxr/capabilities/mcp/Enabled;
+//            first byte == '1', the first existing marker decides.
 //
 // Returns true iff the marker is present AND set to enabled. The
 // DISPLAYXR_MCP env var still wins as a force-enable / force-disable
@@ -936,17 +940,10 @@ oxr_mcp_capability_enabled(void)
 	return rc == ERROR_SUCCESS && value_type == REG_DWORD && value == 1;
 #else
 	// POSIX mirror — file-existence + first-byte check. Equivalent
-	// semantics to the Win32 REG_DWORD == 1 above.
-	static const char path[] =
-	    "/Library/Application Support/DisplayXR/Capabilities/MCP/Enabled";
-	int fd = open(path, O_RDONLY);
-	if (fd < 0) {
-		return false;
-	}
-	char b = 0;
-	ssize_t n = read(fd, &b, 1);
-	close(fd);
-	return n == 1 && b == '1';
+	// semantics to the Win32 REG_DWORD == 1 above. The paths are per
+	// platform (macOS /Library, desktop Linux XDG config then /etc) — see
+	// u_mcp_capability.h.
+	return u_mcp_capability_marker_enabled();
 #endif
 }
 
