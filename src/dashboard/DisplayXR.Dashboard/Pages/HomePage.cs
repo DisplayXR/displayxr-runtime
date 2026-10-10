@@ -106,7 +106,7 @@ public sealed class HomePage : Page
         kv.Add("Active OpenXR runtime", activeBlock);
 
         string service = s is null ? (Ctx.Feed.IsRunning ? "connecting…" : "—")
-            : s.IsService ? $"connected{StatusText.Sep}generation {s.Generation.Topology}/{s.Generation.Status}"
+            : s.IsService ? "connected"
             : "not reached (headless snapshot)";
         kv.Add("Service", service, brush: s?.IsService == true ? Tokens.For(Level.Ok) : null);
         if (s is not null)

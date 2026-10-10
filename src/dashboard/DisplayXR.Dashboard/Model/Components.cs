@@ -28,12 +28,7 @@ public sealed record InfoComponents(
     {
         bool wcKnown = root.ValueKind == JsonValueKind.Object && root.TryGetProperty("workspace_controllers", out var wcArr)
                        && wcArr.ValueKind == JsonValueKind.Array;
-        var controllers = root.Arr("workspace_controllers").Where(e => e.ValueKind == JsonValueKind.Object)
-            .Select(e => new RegisteredController(e.Str("id"), e.Str("name"), e.Str("version"), e.Str("exe"),
-                e.Arr("actions").Select(a => a.ValueKind == JsonValueKind.String ? a.GetString() ?? ""
-                                           : a.ValueKind == JsonValueKind.Object ? a.Str("name", a.Str("id")) : "")
-                 .Where(a => a.Length > 0).ToArray()))
-            .ToArray();
+        var controllers = RegisteredController.ReadAll(root, "workspace_controllers");
 
         // input_providers: today one summary object; a per-provider array is accepted too
         // (either top-level, or as "providers" inside the summary).
@@ -74,14 +69,65 @@ public sealed record InfoComponents(
     }
 }
 
-public sealed record RegisteredController(string Id, string Name, string Version, string Exe, IReadOnlyList<string> Actions);
+/// <summary>How a workspace controller is launched (phase 8); null when the CLI predates it.</summary>
+public sealed record LaunchConfig(string Mode, string? Hotkey, string Source)
+{
+    public bool Disabled => Mode == "disabled";
+}
+
+/// <summary>
+/// A registered workspace controller, from <c>info --json</c>
+/// <c>workspace_controllers[]</c> or <c>workspace list --json</c>
+/// <c>controllers[]</c> (same shape). <see cref="Connected"/> is null when the
+/// source cannot know (headless).
+/// </summary>
+public sealed record RegisteredController(string Id, string Name, string Version, string Exe, IReadOnlyList<string> Actions,
+                                          string Vendor = "", bool? Connected = null, long? Pid = null, LaunchConfig? Launch = null)
+{
+    public static RegisteredController Read(JsonElement e)
+    {
+        var l = e.Obj("launch");
+        return new RegisteredController(
+            e.Str("id"), e.Str("display_name", e.Str("name")), e.Str("version"), e.Str("binary", e.Str("exe")),
+            e.Arr("actions").Select(a => a.ValueKind == JsonValueKind.String ? a.GetString() ?? ""
+                                       : a.ValueKind == JsonValueKind.Object ? a.Str("name", a.Str("id")) : "")
+             .Where(a => a.Length > 0).ToArray(),
+            e.Str("vendor"),
+            e.Has("connected") && e.GetProperty("connected").ValueKind is JsonValueKind.True or JsonValueKind.False ? e.Bool("connected") : null,
+            e.Has("pid") && e.GetProperty("pid").ValueKind == JsonValueKind.Number ? e.Long("pid") : null,
+            l is { } lo ? new LaunchConfig(lo.Str("mode", "auto"), lo.StrOrNull("hotkey"), lo.Str("source", "default")) : null);
+    }
+
+    public static IReadOnlyList<RegisteredController> ReadAll(JsonElement root, string key) =>
+        root.Arr(key).Where(e => e.ValueKind == JsonValueKind.Object).Select(Read).Where(c => c.Id.Length > 0 || c.Name.Length > 0).ToArray();
+}
+
+/// <summary><c>displayxr-cli workspace list --json</c> (phase 8).</summary>
+public sealed record WorkspaceList(string? ActiveId, IReadOnlyList<RegisteredController> Controllers)
+{
+    public static bool TryParse(string? json, out WorkspaceList? list)
+    {
+        list = null;
+        if (string.IsNullOrWhiteSpace(json)) return false;
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object || !root.Has("controllers")) return false;
+            list = new WorkspaceList(root.StrOrNull("active_id"), RegisteredController.ReadAll(root, "controllers"));
+            return true;
+        }
+        catch (Exception ex) when (ex is JsonException or InvalidOperationException) { return false; }
+    }
+}
 public sealed record InputProviderRow(string Name, string Id, bool HardwarePresent, bool Active, string Note);
 public sealed record InputSummary(int Registered, bool HardwarePresent, bool Evaluated, bool ForceQwerty, string? ActiveId, string Note);
 public sealed record RigRole(bool Evaluated, string? Device, string Note);
 public sealed record LiftModule(bool Probed, bool Malformed, string? Backend, long Modes, long? State, int MaxStreams, int MaxViews, string Note);
 
 /// <summary>One row of a Components section.</summary>
-public sealed record ComponentItem(string Name, Level Level, IReadOnlyList<(string Text, Level Level)> Chips, IReadOnlyList<string> Lines);
+public sealed record ComponentItem(string Name, Level Level, IReadOnlyList<(string Text, Level Level)> Chips, IReadOnlyList<string> Lines,
+                                   RegisteredController? Controller = null);
 
 /// <summary>One role: what it is, how many are registered / connected, and its rows.</summary>
 public sealed record ComponentSection(string Id, string Title, string Role, int Count, int Connected,
@@ -101,9 +147,12 @@ public static class Components
     private static string Plural(int n, string one, string many) => StatusText.Plural(n, one, many);
 
     /// <summary>Every section, in page order. Sections whose source is absent are omitted (stereo camera).</summary>
-    public static IReadOnlyList<ComponentSection> Build(StatusSnapshot? s, InfoComponents? info)
+    public static IReadOnlyList<ComponentSection> Build(StatusSnapshot? s, InfoComponents? info, WorkspaceList? workspace = null)
     {
         info ??= InfoComponents.Empty;
+        // `workspace list --json` (live connected / pid / launch) supersedes info's copy of the same array.
+        if (workspace is not null)
+            info = info with { WorkspaceControllers = workspace.Controllers, WorkspaceControllersKnown = true };
         var list = new List<ComponentSection>
         {
             DisplayProcessors(s),
@@ -159,17 +208,20 @@ public static class Components
 
         foreach (var reg in info.WorkspaceControllers)
         {
-            var client = connected.FirstOrDefault(c => !matched.Contains(c.Id) && Matches(reg, c));
+            var client = connected.FirstOrDefault(c => !matched.Contains(c.Id) && (reg.Pid is { } pid ? c.Pid == pid : Matches(reg, c)));
             if (client is not null) matched.Add(client.Id);
+            bool isConnected = reg.Connected ?? client is not null;
             string name = reg.Name.Length > 0 ? reg.Name : reg.Id;
-            var lines = new List<string> { Line(name, client is not null, workspaceOn) };
-            var detail = new[] { reg.Id.Length > 0 && reg.Id != name ? reg.Id : "", reg.Version.Length > 0 ? "version " + reg.Version : "", reg.Exe }
+            var lines = new List<string> { Line(name, isConnected, workspaceOn) };
+            var detail = new[] { reg.Vendor, reg.Id.Length > 0 && reg.Id != name ? reg.Id : "", reg.Version.Length > 0 ? "version " + reg.Version : "", reg.Exe }
                 .Where(x => x.Length > 0).ToArray();
             if (detail.Length > 0) lines.Add(string.Join(Sep, detail));
             if (client is not null) lines.Add(ClientLine(client));
+            else if (isConnected && reg.Pid is { } p) lines.Add($"pid {p}");
             if (reg.Actions.Count > 0) lines.Add("Actions: " + string.Join(", ", reg.Actions));
-            items.Add(new ComponentItem(name, client is not null ? Level.Ok : Level.Plain,
-                new[] { (client is not null ? "connected" : "registered, not running", client is not null ? Level.Ok : Level.Plain) }, lines));
+            string state = isConnected ? (client?.Pid ?? reg.Pid) is { } cp ? $"connected (pid {cp})" : "connected" : "registered, not running";
+            items.Add(new ComponentItem(name, isConnected ? Level.Ok : Level.Plain,
+                new[] { (state, isConnected ? Level.Ok : Level.Plain) }, lines, reg));
         }
         foreach (var c in connected.Where(c => !matched.Contains(c.Id)))
         {
@@ -181,10 +233,11 @@ public static class Components
             items.Add(new ComponentItem(snapName, workspaceOn ? Level.Info : Level.Plain, new[] { ("not connected", Level.Plain) },
                 new[] { Line(snapName, false, workspaceOn) }));
 
-        string summary = connected.Count > 0 ? $"{connected.Count} connected" : "none connected";
+        int nConnected = Math.Max(connected.Count, info.WorkspaceControllers.Count(r => r.Connected == true));
+        string summary = nConnected > 0 ? $"{nConnected} connected" : "none connected";
         return new ComponentSection("workspace_controller", "Workspace controller",
             "A workspace controller hosts other apps' 3D windows; the runtime treats it as a client class, not a product.",
-            items.Count, connected.Count, $"{summary}{Sep}workspace {(workspaceOn ? "on" : "off")}"
+            items.Count, nConnected, $"{summary}{Sep}workspace {(workspaceOn ? "on" : "off")}"
                 + (info.WorkspaceControllersKnown ? $"{Sep}{Plural(info.WorkspaceControllers.Count, "registered", "registered")}" : ""),
             items);
     }
