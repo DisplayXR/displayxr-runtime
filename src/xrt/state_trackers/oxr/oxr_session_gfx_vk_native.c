@@ -23,6 +23,7 @@
 
 #include "xrt/xrt_instance.h"
 #include "xrt/xrt_config_have.h"
+#include "xrt/xrt_config_os.h"
 #include "xrt/xrt_gfx_vk.h"
 
 #include "vk/vk_helpers.h"
@@ -165,6 +166,30 @@ oxr_session_populate_vk_with_metal_native(struct oxr_logger *log,
 	sess->compositor = &xcvk->base;
 	sess->create_swapchain = oxr_swapchain_vk_create;
 
+	/*
+	 * sess->xcn IS a comp_metal compositor on this route (the comp_vk_client
+	 * wrapper only lives in sess->compositor), so every per-compositor query
+	 * the state tracker routes on is_metal_native_compositor — eye positions,
+	 * window metrics, display-mode requests, zones, segments, set_screens,
+	 * placement, snap — must take the Metal branch. Without the flag those
+	 * dispatchers fell through to the in-process multi-compositor branch
+	 * (xmcc != NULL on macOS) and cast this comp_metal to a multi_compositor:
+	 * the SIGBUS in multi_compositor_get_predicted_eye_positions at the first
+	 * xrLocateViews, intermittent because it read whatever lay at that offset.
+	 * Others (capture, weave, workspace) classify a session with NO native
+	 * flag as an IPC client and would have called comp_ipc_client_* on it.
+	 *
+	 * The flag names the COMPOSITOR, not the app's graphics API: code that
+	 * needs the app API reads sess->gfx_ext (VULKAN here), and the swapchains
+	 * are client_vk ones (sess->create_swapchain above).
+	 */
+	sess->is_metal_native_compositor = true;
+	sess->is_vk_via_metal = true;
+
+	// Same as the Metal-native path: no multi-compositor event system here.
+	sess->compositor_visible = true;
+	sess->compositor_focused = true;
+
 	// Propagate native compositor's visibility/focus flags to the client wrapper.
 	// oxr_session_create_impl reads these from sess->compositor->info to drive
 	// the SYNCHRONIZED → VISIBLE → FOCUSED state transitions.
@@ -174,6 +199,65 @@ oxr_session_populate_vk_with_metal_native(struct oxr_logger *log,
 	U_LOG_W("Using Metal native compositor for Vulkan app (VK → Metal via MoltenVK)");
 
 	return XR_SUCCESS;
+}
+
+/*
+ * DXR_MACOS_VK_VIA_METAL: unset (auto) = decide from the active DP's factories;
+ * 1 = always present VK apps through comp_metal; 0 = never (keep vk_native even
+ * for a Metal-only DP, i.e. run unwoven — the pre-routing behaviour).
+ */
+DEBUG_GET_ONCE_TRISTATE_OPTION(macos_vk_via_metal, "DXR_MACOS_VK_VIA_METAL")
+
+bool
+oxr_vk_route_via_metal(struct oxr_system *sys)
+{
+#if defined(XRT_OS_MACOS)
+	static bool logged = false;
+
+	const void *dp_vk = NULL;
+	const void *dp_metal = NULL;
+	if (sys->xsysc != NULL) {
+		dp_vk = sys->xsysc->info.dp_factory_vk;
+		dp_metal = sys->xsysc->info.dp_factory_metal;
+	}
+
+	bool route = false;
+	const char *why = NULL;
+	switch (debug_get_tristate_option_macos_vk_via_metal()) {
+	case DEBUG_TRISTATE_ON:
+		route = true;
+		why = "forced by DXR_MACOS_VK_VIA_METAL=1";
+		break;
+	case DEBUG_TRISTATE_OFF:
+		route = false;
+		why = "forced off by DXR_MACOS_VK_VIA_METAL=0";
+		break;
+	default:
+		route = dp_vk == NULL && dp_metal != NULL;
+		why = route ? "active display processor offers a Metal weaver but no Vulkan one"
+		            : (dp_vk != NULL ? "active display processor offers a Vulkan weaver"
+		                             : "no display processor factory for either API");
+		break;
+	}
+
+	// The Metal route also needs the Metal compositor itself to be usable
+	// (in-process, not disabled by OXR_ENABLE_METAL_NATIVE_COMPOSITOR=0).
+	if (route && !oxr_metal_native_compositor_supported(sys, NULL)) {
+		route = false;
+		why = "Metal native compositor unavailable (service mode or disabled)";
+	}
+
+	if (!logged) {
+		logged = true;
+		U_LOG_W("macOS Vulkan app route: %s (%s; dp_factory_vk=%s dp_factory_metal=%s)",
+		        route ? "Metal compositor (VK -> comp_vk_client -> comp_metal)" : "vk_native compositor", why,
+		        dp_vk != NULL ? "yes" : "no", dp_metal != NULL ? "yes" : "no");
+	}
+	return route;
+#else
+	(void)sys;
+	return false;
+#endif
 }
 
 #endif /* XRT_HAVE_METAL_NATIVE_COMPOSITOR && XR_USE_GRAPHICS_API_VULKAN */

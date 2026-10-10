@@ -526,8 +526,11 @@ oxr_xrAcquireLocal3DZoneRenderTargetDXR(XrLocal3DZoneMaskDXR mask, void *binding
 #ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
 	if (sess->is_metal_native_compositor) {
 		// No Metal Tier-3 binding type in header v3 — author via Tier 1/2.
+		// A Vulkan app presented by comp_metal (macOS, Metal-only DP) lands
+		// here too: comp_metal owns the mask, so there is no VkImage to hand out.
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "Tier-3 freeform masks are not available on Metal (use Tier 1/2)");
+		                 "Tier-3 freeform masks are not available on Metal%s (use Tier 1/2)",
+		                 sess->is_vk_via_metal ? " (Vulkan app presented by the Metal compositor)" : "");
 	}
 #endif
 

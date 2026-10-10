@@ -1921,6 +1921,35 @@ static void CleanupVkRenderer(VkRenderer& renderer) {
 static AppDelegate *g_appDelegate = nil;
 static AppWindowDelegate *g_windowDelegate = nil;
 
+// Test knob: place the window's CONTENT rect at x,y,w,h in top-down global
+// points (origin = the main display's top-left, the CGDisplayBounds /
+// XrDisplayDesktopPositionDXR space), e.g. to put it on a given display or
+// make it straddle two without dragging. Read from @p env_name; false when
+// unset or malformed. Same knob as cube_handle_metal_macos.
+static bool ApplyTestWindowRect(const char *env_name) {
+    const char *e = getenv(env_name);
+    if (e == nullptr || g_window == nil) {
+        return false;
+    }
+    int x = 0, y = 0, w = 0, h = 0;
+    if (sscanf(e, "%d,%d,%d,%d", &x, &y, &w, &h) != 4 || w <= 0 || h <= 0) {
+        LOG_WARN("%s='%s' ignored (want x,y,w,h in top-down points)", env_name, e);
+        return false;
+    }
+    NSScreen *primary = [NSScreen screens].firstObject;
+    if (primary == nil) {
+        return false;
+    }
+    const CGFloat bottom = primary.frame.size.height - (CGFloat)y - (CGFloat)h;
+    NSRect content = NSMakeRect((CGFloat)x, bottom, (CGFloat)w, (CGFloat)h);
+    NSRect frame = [g_window frameRectForContentRect:content];
+    // setFrame:display: does not run constrainFrameRect, so a window may
+    // straddle displays exactly where asked.
+    [g_window setFrame:frame display:YES];
+    LOG_INFO("%s: content rect -> %d,%d %dx%d pt (top-down)", env_name, x, y, w, h);
+    return true;
+}
+
 static bool CreateMacOSWindow(uint32_t width, uint32_t height, int32_t screenLeft, int32_t screenTop) {
     @autoreleasepool {
         [NSApplication sharedApplication];
@@ -1934,19 +1963,39 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height, int32_t screenLef
         // top-left, XrDisplayDesktopPositionDXR); flip into AppKit's bottom-up
         // space. (0,0) = primary — the titled window is auto-constrained below
         // the menu bar, so it is always a safe create position.
-        NSRect frame = NSMakeRect(100, 100, width, height);
-        NSScreen *primary = [NSScreen screens].firstObject;
-        if (primary != nil) {
-            CGFloat topY = primary.frame.size.height - (CGFloat)screenTop;
-            frame = NSMakeRect((CGFloat)screenLeft, topY - (CGFloat)height, width, height);
-        }
         NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                            NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable;
+        // Resolve the NSScreen that holds the panel's top-left, and put the
+        // WHOLE window (title bar included) inside its visibleFrame. Placing
+        // the content top AT the panel top pushes the title bar off-screen,
+        // and AppKit then re-constrains the window onto [NSScreen mainScreen]
+        // -- whichever screen has focus at launch, i.e. often the laptop.
+        // Same fix as cube_handle_metal_macos.
+        NSRect frame = NSMakeRect(100, 100, width, height);
+        NSScreen *target = nil;
+        NSScreen *primary = [NSScreen screens].firstObject;
+        if (primary != nil) {
+            const NSPoint p = NSMakePoint((CGFloat)screenLeft + 1.0,
+                                          primary.frame.size.height - (CGFloat)screenTop - 1.0);
+            for (NSScreen *s in [NSScreen screens]) {
+                if (NSPointInRect(p, s.frame)) { target = s; break; }
+            }
+        }
+        if (target != nil) {
+            const NSRect vf = target.visibleFrame; // below that screen's menu bar
+            const NSRect wf = [NSWindow frameRectForContentRect:NSMakeRect(0, 0, width, height) styleMask:style];
+            const CGFloat titleH = wf.size.height - (CGFloat)height;
+            frame = NSMakeRect(vf.origin.x, NSMaxY(vf) - titleH - (CGFloat)height, width, height);
+        }
 
         g_window = [[NSWindow alloc] initWithContentRect:frame
                                                styleMask:style
                                                  backing:NSBackingStoreBuffered
                                                    defer:NO];
+        if (target != nil) {
+            // Global coordinates, title bar on-screen: no re-constrain.
+            [g_window setFrame:[g_window frameRectForContentRect:frame] display:NO];
+        }
 
         [g_window setTitle:@"Vulkan Cube — VK Native Compositor (External Window)"];
         [g_window setAcceptsMouseMovedEvents:YES];
@@ -1968,8 +2017,12 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height, int32_t screenLef
 
         // HUD now lives as an XR_EXT_window_space_layer composed by the runtime.
 
+        (void)ApplyTestWindowRect("DXR_TEST_WINDOW_RECT");
         [g_window makeKeyAndOrderFront:nil];
         [NSApp activateIgnoringOtherApps:YES];
+        // Ordering front may re-constrain the frame onto one display; put
+        // the test rect back once the window is on screen.
+        (void)ApplyTestWindowRect("DXR_TEST_WINDOW_RECT");
 
         // Pump events so the window appears
         NSEvent *event;
@@ -3866,6 +3919,20 @@ int main() {
         g_frameCount++;
         g_avgFrameTime = g_avgFrameTime * 0.95 + deltaTime * 0.05;
 
+        // Test knob: move the window once, at frame DXR_TEST_WINDOW_MOVE_FRAME
+        // (default 300), to DXR_TEST_WINDOW_RECT2 — exercises a segment table
+        // change (split -> single, or the reverse) in one run.
+        {
+            static long moveFrame = -2;
+            if (moveFrame == -2) {
+                const char *mf = getenv("DXR_TEST_WINDOW_MOVE_FRAME");
+                moveFrame = getenv("DXR_TEST_WINDOW_RECT2") != nullptr ? (mf != nullptr ? atol(mf) : 300) : -1;
+            }
+            if (moveFrame >= 0 && (long)g_frameCount == moveFrame) {
+                (void)ApplyTestWindowRect("DXR_TEST_WINDOW_RECT2");
+            }
+        }
+
         // #1581: create + fill the quad probe texture once the session runs.
         if (g_quadTest && !g_quadActive && g_frameCount >= kQuadActivationFrame) {
             static bool quadAttempted = false;
@@ -4025,11 +4092,63 @@ int main() {
                         eyeTrackingState.next = &viewRigRaw;
                     }
 
+                    // Multi-screen M3 (XR_DXR_display_info v22): when the window
+                    // spans displays the runtime hands out one view set per
+                    // display; which views belong to which display (and its
+                    // segment rect) comes back here. Same recipe as
+                    // cube_handle_metal_macos.
+                    XrViewActivityStateDXR viewActivity = {XR_TYPE_VIEW_ACTIVITY_STATE_DXR};
+                    XrViewDisplayBindingDXR viewBindingStorage[4] = {};
+                    XrViewDisplayBindingsDXR viewBindings = {XR_TYPE_VIEW_DISPLAY_BINDINGS_DXR};
+                    viewBindings.bindingCapacityInput = 4;
+                    viewBindings.bindings = viewBindingStorage;
+                    viewBindings.next = viewState.next;
+                    viewActivity.next = &viewBindings;
+                    viewState.next = &viewActivity;
+
                     uint32_t viewCount = (uint32_t)xr.configViews.size();
                     std::vector<XrView> views(viewCount, {XR_TYPE_VIEW});
 
                     XrResult locResult = xrLocateViews(xr.session, &locateInfo,
                         &viewState, viewCount, &viewCount, views.data());
+
+                    // Multi-screen M3: render EVERY view set (the sum is
+                    // activeViewCount), each set's local view j into tile j at
+                    // that display's segment rect (placed below once the tile
+                    // size is known).
+                    const bool routedViews = XR_SUCCEEDED(locResult) && display3D &&
+                                             xr.viewConfigType == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR &&
+                                             viewBindings.bindingCountOutput > 0 &&
+                                             viewBindings.bindingCountOutput <= 4;
+                    if (routedViews) {
+                        int routedEyes = 0;
+                        for (uint32_t b = 0; b < viewBindings.bindingCountOutput; b++) {
+                            const int end = (int)(viewBindingStorage[b].firstView + viewBindingStorage[b].viewCount);
+                            if (end > routedEyes) routedEyes = end;
+                        }
+                        if (routedEyes > (int)locatedCount) routedEyes = (int)locatedCount;
+                        if (routedEyes > (int)viewCount) routedEyes = (int)viewCount;
+                        if (routedEyes > 0) eyeCount = routedEyes;
+                    }
+                    {
+                        static std::string lastBindings;
+                        std::string now = routedViews ? "routed" : "single";
+                        for (uint32_t b = 0; routedViews && b < viewBindings.bindingCountOutput; b++) {
+                            const XrViewDisplayBindingDXR &vb = viewBindingStorage[b];
+                            char buf[160];
+                            snprintf(buf, sizeof(buf), " [display 0x%llx views %u..%u at %d,%d %dx%d]",
+                                     (unsigned long long)vb.displayId, vb.firstView,
+                                     vb.firstView + vb.viewCount - 1, vb.segmentRect.offset.x,
+                                     vb.segmentRect.offset.y, vb.segmentRect.extent.width,
+                                     vb.segmentRect.extent.height);
+                            now += buf;
+                        }
+                        if (now != lastBindings) {
+                            LOG_INFO("view sets: %s (activeViewCount=%u, rendering %d)", now.c_str(),
+                                     viewActivity.activeViewCount, eyeCount);
+                            lastBindings = now;
+                        }
+                    }
 
                     // Capture the runtime's resolved CANVAS size (the window
                     // client area in meters) — the physical_height_m the
@@ -4102,11 +4221,44 @@ int main() {
                         const float rigVH =
                             g_input.viewParams.virtualDisplayHeight / g_input.viewParams.scaleFactor;
 
+                        // Multi-screen M3: per-view placement under routing — the
+                        // display's segment rect (window px) scaled into the tile,
+                        // edges rounded independently so two segments sharing a
+                        // seam share the column.
+                        struct ViewPlace {
+                            uint32_t tile;
+                            int32_t x, y;
+                            uint32_t w, h;
+                            bool set;
+                        };
+                        ViewPlace viewPlace[8] = {};
+                        if (routedViews && g_windowW > 0 && g_windowH > 0) {
+                            const float fx = (float)renderW / (float)g_windowW;
+                            const float fy = (float)renderH / (float)g_windowH;
+                            for (uint32_t b = 0; b < viewBindings.bindingCountOutput; b++) {
+                                const XrViewDisplayBindingDXR &vb = viewBindingStorage[b];
+                                const int32_t x0 = (int32_t)lroundf((float)vb.segmentRect.offset.x * fx);
+                                const int32_t y0 = (int32_t)lroundf((float)vb.segmentRect.offset.y * fy);
+                                const int32_t x1 = (int32_t)lroundf(
+                                    (float)(vb.segmentRect.offset.x + vb.segmentRect.extent.width) * fx);
+                                const int32_t y1 = (int32_t)lroundf(
+                                    (float)(vb.segmentRect.offset.y + vb.segmentRect.extent.height) * fy);
+                                const uint32_t sw = x1 > x0 ? (uint32_t)(x1 - x0) : 1;
+                                const uint32_t sh = y1 > y0 ? (uint32_t)(y1 - y0) : 1;
+                                for (uint32_t j = 0; j < vb.viewCount && j < tileColumns * tileRows; j++) {
+                                    const uint32_t i = vb.firstView + j;
+                                    if (i >= 8) break;
+                                    viewPlace[i] = {j, x0, y0, sw, sh, true};
+                                }
+                            }
+                        }
+
                         rendered = true;
                         uint32_t imageIndex;
                         if (AcquireSwapchainImage(xr, imageIndex)) {
                             std::vector<EyeRenderParams> eyeParams(eyeCount);
                             for (int eye = 0; eye < eyeCount; eye++) {
+                                const bool placed = routedViews && eye < 8 && viewPlace[eye].set;
                                 int vi = eye < (int)viewCount ? eye : 0;
                                 XrFovf submitFov = views[vi].fov;
                                 if (useRig) {
@@ -4128,18 +4280,29 @@ int main() {
                                 // Tile-aware viewport: place each view in the correct tile position
                                 uint32_t tileX = display3D ? (eye % tileColumns) : 0;
                                 uint32_t tileY = display3D ? (eye / tileColumns) : 0;
+                                uint32_t vpW = renderW;
+                                uint32_t vpH = renderH;
+                                if (placed) {
+                                    tileX = viewPlace[eye].tile % tileColumns;
+                                    tileY = viewPlace[eye].tile / tileColumns;
+                                }
                                 uint32_t vpX = tileX * renderW;
                                 uint32_t vpY = tileY * renderH;
+                                if (placed) {
+                                    // Multi-screen M3: this view's display segment inside its tile.
+                                    vpX = (uint32_t)((int32_t)vpX + viewPlace[eye].x);
+                                    vpY = (uint32_t)((int32_t)vpY + viewPlace[eye].y);
+                                    vpW = viewPlace[eye].w;
+                                    vpH = viewPlace[eye].h;
+                                }
                                 eyeParams[eye].viewportX = vpX;
                                 eyeParams[eye].viewportY = vpY;
-                                eyeParams[eye].width = renderW;
-                                eyeParams[eye].height = renderH;
+                                eyeParams[eye].width = vpW;
+                                eyeParams[eye].height = vpH;
 
                                 projectionViews[eye].subImage.swapchain = xr.swapchain.swapchain;
                                 projectionViews[eye].subImage.imageRect.offset = {(int32_t)vpX, (int32_t)vpY};
-                                projectionViews[eye].subImage.imageRect.extent = {
-                                    (int32_t)renderW,
-                                    (int32_t)renderH};
+                                projectionViews[eye].subImage.imageRect.extent = {(int32_t)vpW, (int32_t)vpH};
                                 projectionViews[eye].subImage.imageArrayIndex = 0;
                                 projectionViews[eye].pose = views[eye < (int)viewCount ? eye : 0].pose;
                                 projectionViews[eye].fov = submitFov;

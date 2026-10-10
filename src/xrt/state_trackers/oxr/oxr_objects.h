@@ -2153,6 +2153,17 @@ oxr_session_populate_vk_with_metal_native(struct oxr_logger *log,
                                            void *shared_iosurface,
                                            bool transparent_background,
                                            struct oxr_session *sess);
+
+/*!
+ * macOS: should this Vulkan session be presented by the Metal native
+ * compositor instead of vk_native? True when the active display processor
+ * offers a Metal factory but no Vulkan one (a Metal-only vendor plug-in such
+ * as Leia SR on macOS, whose only weaver is Metal) — vk_native would have no
+ * DP to weave with. DXR_MACOS_VK_VIA_METAL=1|0 forces either way. Logs the
+ * decision once (WARN). False off macOS / without both compositors.
+ */
+bool
+oxr_vk_route_via_metal(struct oxr_system *sys);
 #endif
 
 #endif
@@ -2839,7 +2850,17 @@ struct oxr_session
 	bool is_d3d11_native_compositor;
 
 	//! True if using Metal native compositor (not multi_compositor).
+	//! Also true for a Vulkan app routed through comp_metal (see
+	//! is_vk_via_metal): the flag names the compositor behind xcn.
 	bool is_metal_native_compositor;
+
+	/*!
+	 * A Vulkan app presented by the Metal native compositor (macOS):
+	 * sess->xcn is comp_metal, sess->compositor its comp_vk_client wrapper.
+	 * Implies is_metal_native_compositor. Diagnostic/reporting only — every
+	 * compositor dispatch keys on is_metal_native_compositor.
+	 */
+	bool is_vk_via_metal;
 
 	//! True if using D3D12 native compositor (not multi_compositor).
 	bool is_d3d12_native_compositor;

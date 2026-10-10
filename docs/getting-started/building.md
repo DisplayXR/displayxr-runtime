@@ -104,6 +104,10 @@ brew install cmake ninja eigen vulkan-sdk
 
 Builds the runtime, OpenXR loader, and test apps. The macOS Vulkan native compositor runs via MoltenVK over a CAMetalLayer-backed surface (see `cube_handle_vk_macos`); an earlier `VK_ERROR_EXTENSION_NOT_PRESENT` runtime failure was a MoltenVK-era issue that has since been resolved. The remaining macOS-Vulkan dev gotcha is a two-`libvulkan` loader-image conflict (the dev build's image vs the installed runtime's) — share one loader image / pin `XR_RUNTIME_JSON` to avoid it.
 
+**Which compositor presents a Vulkan app on macOS.** vk_native by default; the Metal compositor (Vulkan app → `comp_vk_client` → `comp_metal`, MoltenVK imports the Metal swapchain images) when the active display processor offers a Metal weaver but no Vulkan one — the Leia SR plug-in on macOS is Metal-only, so this is how a Vulkan app weaves on a Leia panel. `DXR_MACOS_VK_VIA_METAL=1|0` forces either route; the decision is logged once (`macOS Vulkan app route: …`). On the Metal route the session is a Metal-native session in every respect (placement, segments, zones Tier 1/2, `/tmp/dxr_atlas_trigger` capture), with the Metal compositor's colour model (ADR-044 §1).
+
+**`DYLD_LIBRARY_PATH` replaces the runtime the manifest names.** dyld resolves `DYLD_LIBRARY_PATH` by the library's LEAF name even for the loader's absolute `dlopen` of `library_path`, so any other `openxr_displayxr.dylib` on that path (`_package/DisplayXR-macOS/lib`, or a vendor plug-in tree's `env.sh`, which adds its own runtime build) silently wins over the one `XR_RUNTIME_JSON` points at. When mixing trees, put the intended runtime's directory FIRST on `DYLD_LIBRARY_PATH`, and confirm with a log line only that build emits.
+
 ### Linux
 
 > **Ubuntu 22.04, 24.04 and 26.04 are supported.** On 22.04, use an X11
