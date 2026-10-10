@@ -43,6 +43,26 @@ public sealed class ComponentsPage : Page
 
     protected override bool DeferRebuild => _capturing is not null || _openDropDowns > 0;
 
+    private TextBlock? _suspendNote;
+
+    /// <summary>End a capture: the hotkey hook is handed back on every exit path.</summary>
+    private void EndCapture()
+    {
+        _capturing = null;
+        Ctx.HotkeySuspend.End();
+    }
+
+    public override void OnHidden()
+    {
+        if (_capturing is not null) EndCapture();
+    }
+
+    protected override void UpdateInPlace()
+    {
+        // Known only after the first "on" came back: shown without a rebuild.
+        if (_suspendNote is not null) _suspendNote.IsVisible = _capturing is not null && Ctx.HotkeySuspend.Unsupported;
+    }
+
     private IReadOnlyList<ComponentSection> Sections() =>
         Components.Build(Ctx.Feed.Snapshot, Ctx.Info?.Components, Ctx.Workspace);
 
@@ -64,6 +84,7 @@ public sealed class ComponentsPage : Page
     protected override Control Build()
     {
         _openDropDowns = 0;
+        _suspendNote = null;
         var page = U.VStack(18);
         if (Ctx.Info is null)
             page.Children.Add(U.Notice(Ctx.InfoError is null ? Level.Info : Level.Warn,
@@ -160,11 +181,12 @@ public sealed class ComponentsPage : Page
         };
         if (capturing)
         {
+            capture.GotFocus += (_, _) => Ctx.HotkeySuspend.Begin();
             capture.AttachedToVisualTree += (_, _) => Avalonia.Threading.Dispatcher.UIThread.Post(() => capture.Focus());
             capture.LostFocus += (_, _) =>
             {
                 if (_capturing != id) return;
-                _capturing = null;
+                EndCapture();
                 Avalonia.Threading.Dispatcher.UIThread.Post(() => Update(force: true));
             };
             capture.AddHandler(InputElement.KeyDownEvent, (_, e) =>
@@ -172,7 +194,7 @@ public sealed class ComponentsPage : Page
                 e.Handled = true;
                 if (e.Key == Avalonia.Input.Key.Escape && e.KeyModifiers == Avalonia.Input.KeyModifiers.None)
                 {
-                    _capturing = null;
+                    EndCapture();
                     Update(force: true);
                     return;
                 }
@@ -180,7 +202,7 @@ public sealed class ComponentsPage : Page
                 var mods = KeyNames.Modifiers(e.KeyModifiers);
                 string? name = KeyNames.Name(e.Key);
                 string? why = name is null ? "That key cannot be used." : Hotkey.Validate(mods, name);
-                _capturing = null;
+                EndCapture();
                 _captureNoteFor = id;
                 if (why is not null)
                 {
@@ -233,6 +255,12 @@ public sealed class ComponentsPage : Page
         U.AddFlow(chips, note, 6, 4);
 
         var col = U.VStack(6, row, chips);
+        if (capturing)
+        {
+            _suspendNote = U.Wrapped("Press a combo other than the current one while the workspace hotkey is active.", "soft");
+            _suspendNote.IsVisible = Ctx.HotkeySuspend.Unsupported;
+            col.Children.Add(_suspendNote);
+        }
         if (_captureNoteFor == id && _captureNote is { } cn)
             col.Children.Add(U.WarningRow(new StatusWarning("HOTKEY", WarningLevel.Warn, cn)));
         if (Ctx.LastActionArea == "workspace" && Ctx.LastAction is { } la && Ctx.LastActionFailed)

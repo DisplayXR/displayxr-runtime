@@ -106,6 +106,7 @@ public sealed class MainWindow : Window
 
         _feed.Changed += OnStateChanged;
         _ctx.Changed += OnStateChanged;
+        _ctx.HotkeySuspend.Changed += () => Dispatcher.UIThread.Post(OnStateChanged);
         PropertyChanged += (_, e) =>
         {
             if (e.Property == WindowStateProperty) _feed.SetPaused(WindowState == WindowState.Minimized);
@@ -515,6 +516,14 @@ public sealed class MainWindow : Window
     {
         if (_shutdown) return;
         _shutdown = true;
+        try
+        {
+            // Hand the workspace hotkey back before the process goes (the service
+            // would also resume on its own when we disconnect or after 60 s).
+            _ctx.HotkeySuspend.End();
+            _ctx.HotkeySuspend.Drain().Wait(TimeSpan.FromSeconds(3));
+        }
+        catch (Exception ex) { DashboardLog.Warn($"hotkey resume at exit: {ex.Message}"); }
         _feed.Changed -= OnStateChanged;
         _ctx.Changed -= OnStateChanged;
         _feed.Dispose();

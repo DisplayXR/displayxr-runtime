@@ -161,6 +161,7 @@ public sealed class FixtureProcessSource : IProcessSource
         lock (_gate)
         {
             if (a is [_, "list", "--json"]) return new CliResult(0, _workspace!.ToJsonString(), "", false, null);
+            if (a is [_, "hotkey-suspend", "on" or "off"]) return new CliResult(0, $"Workspace hotkey {(a[2] == "on" ? "suspended" : "resumed")}.", "", false, null);
             JsonObject? Find(string id) => _workspace!["controllers"]?.AsArray()
                 .OfType<JsonObject>().FirstOrDefault(c => c["id"]?.GetValue<string>() == id.Trim('"'));
             if (a is [_, "set", var sid, .. var rest] && Find(sid) is { } c && c["launch"] is JsonObject l)
