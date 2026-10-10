@@ -15,6 +15,9 @@ uint32_t g_weaveSpecVersion = 0;
 PFN_xrWeaveBindWindowDXR g_pfnWeaveBindWindow = nullptr;
 PFN_xrWeaveSubmitDXR g_pfnWeaveSubmit = nullptr;
 PFN_xrWeaveSetScreenFlatRegionsDXR g_pfnWeaveSetScreenFlat = nullptr;
+bool g_hasLiftExt = false;
+uint32_t g_cursorDepthSpecVersion = 0;
+PFN_xrCreateLiftStreamDXR g_pfnCreateLiftStream = nullptr;
 
 #define XR_CHECK(call)                                                                                                  \
 	do {                                                                                                               \
@@ -81,6 +84,12 @@ InitializeOpenXR(XrSessionManager &xr)
 			g_hasWeaveExt = true;
 			g_weaveSpecVersion = ext.extensionVersion;
 		}
+		if (strcmp(ext.extensionName, XR_DXR_LIFT_EXTENSION_NAME) == 0) {
+			g_hasLiftExt = true;
+		}
+		if (strcmp(ext.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0) {
+			g_cursorDepthSpecVersion = ext.extensionVersion;
+		}
 	}
 
 	LOG_INFO("XR_KHR_D3D11_enable:         %s", hasD3D11 ? "AVAILABLE" : "NOT FOUND");
@@ -113,6 +122,16 @@ InitializeOpenXR(XrSessionManager &xr)
 		enabled.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
 	}
 	enabled.push_back(XR_DXR_WEAVE_EXTENSION_NAME);
+	// --lift: harmless when unused (no stream is created, nothing is chained).
+	if (g_hasLiftExt) {
+		enabled.push_back(XR_DXR_LIFT_EXTENSION_NAME);
+	}
+	if (g_cursorDepthSpecVersion > 0) {
+		enabled.push_back(XR_DXR_CURSOR_DEPTH_EXTENSION_NAME);
+	}
+	LOG_INFO("XR_DXR_lift:                 %s", g_hasLiftExt ? "AVAILABLE" : "NOT FOUND");
+	LOG_INFO("XR_DXR_cursor_depth:         %s (runtime spec v%u; v3 = lifted-rect cursor)",
+	         g_cursorDepthSpecVersion > 0 ? "AVAILABLE" : "NOT FOUND", g_cursorDepthSpecVersion);
 
 	XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
 	strcpy_s(createInfo.applicationInfo.applicationName, "DXRWeaveRpcProbe");
@@ -122,6 +141,9 @@ InitializeOpenXR(XrSessionManager &xr)
 	createInfo.enabledExtensionCount = (uint32_t)enabled.size();
 	createInfo.enabledExtensionNames = enabled.data();
 	XR_CHECK_LOG(xrCreateInstance(&createInfo, &xr.instance));
+	if (g_hasLiftExt) {
+		xrGetInstanceProcAddr(xr.instance, "xrCreateLiftStreamDXR", (PFN_xrVoidFunction *)&g_pfnCreateLiftStream);
+	}
 
 	XrSystemGetInfo systemInfo = {XR_TYPE_SYSTEM_GET_INFO};
 	systemInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
