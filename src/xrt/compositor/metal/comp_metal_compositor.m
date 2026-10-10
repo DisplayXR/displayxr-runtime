@@ -66,6 +66,7 @@
 #endif
 
 #include <math.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -142,6 +143,9 @@ struct comp_metal_compositor
 
 	//! CAMetalLayer for presentation.
 	CAMetalLayer *metal_layer;
+
+	//! Times metal_sync_layer_scale found the layer at the wrong scale.
+	uint32_t layer_scale_fixes;
 
 	//! Render pipeline for atlas layer compositing.
 	id<MTLRenderPipelineState> projection_pipeline;
@@ -1433,6 +1437,78 @@ create_window(struct comp_metal_compositor *c, uint32_t width, uint32_t height,
 	return success;
 }
 
+/*!
+ * Keep the presenting CAMetalLayer 1:1 with the window's backing store.
+ *
+ * WindowServer composites a layer whose contentsScale differs from its
+ * window's backingScaleFactor by RESAMPLING the drawable (e.g. contentsScale 1
+ * on a 2x display with a bounds x 2 drawable: the drawable is scaled 0.5x and
+ * back). That is invisible on ordinary content and fatal to a lenticular
+ * weave, which is computed per physical subpixel: the resampled weave shows
+ * as red/teal bands. An app's own layer (makeBackingLayer) easily leaves
+ * contentsScale at 1, and AppKit only manages it for layers it creates, so
+ * the compositor owns it for every layer it presents into: contentsScale =
+ * the window's backingScaleFactor (set on the main thread), nearest
+ * magnification/minification as a guard, and drawableSize = bounds x
+ * contentsScale (layer_commit). One WARN names the app's value the first
+ * time it is wrong, so app authors learn; later corrections (backing / screen
+ * changes) are counted and logged at INFO.
+ *
+ * Callable from any thread; the read is cheap, the fix is dispatched.
+ */
+//! A contentsScale fix is queued on the main thread (process-wide: the block
+//! must not reference a compositor that may be destroyed before it runs).
+static _Atomic bool g_layer_scale_fix_pending = false;
+
+static void
+metal_sync_layer_scale(struct comp_metal_compositor *c, NSView *view, const char *when)
+{
+	CAMetalLayer *layer = c->metal_layer;
+	if (layer == nil || view == nil) {
+		return;
+	}
+	NSWindow *win = view.window;
+	const CGFloat want = win != nil && win.backingScaleFactor > 0 ? win.backingScaleFactor : 0.0;
+	if (want <= 0.0) {
+		return;
+	}
+	const CGFloat have = layer.contentsScale;
+	const bool filters_ok = [layer.magnificationFilter isEqualToString:kCAFilterNearest] &&
+	                        [layer.minificationFilter isEqualToString:kCAFilterNearest];
+	if (have == want && filters_ok) {
+		return;
+	}
+	if (atomic_exchange(&g_layer_scale_fix_pending, true)) {
+		return; // a fix is already queued; judge again once it has landed
+	}
+	if (have != want) {
+		c->layer_scale_fixes++;
+		if (c->layer_scale_fixes == 1) {
+			U_LOG_W("CAMetalLayer contentsScale %.2f != the window's backingScaleFactor %.2f (%s) — WindowServer "
+			        "would RESAMPLE every drawable (a lenticular weave turns into colour bands); setting it to "
+			        "%.2f. App authors: set layer.contentsScale = window.backingScaleFactor on a layer you "
+			        "create (makeBackingLayer) and on backing changes",
+			        have, want, when, want);
+		} else {
+			U_LOG_I("CAMetalLayer contentsScale %.2f -> %.2f (%s; correction #%u)", have, want, when,
+			        c->layer_scale_fixes);
+		}
+	}
+	[layer retain];
+	void (^fix)(void) = ^{
+		layer.contentsScale = want;
+		layer.magnificationFilter = kCAFilterNearest;
+		layer.minificationFilter = kCAFilterNearest;
+		atomic_store(&g_layer_scale_fix_pending, false);
+		[layer release];
+	};
+	if ([NSThread isMainThread]) {
+		fix();
+	} else {
+		dispatch_async(dispatch_get_main_queue(), fix);
+	}
+}
+
 static bool
 setup_external_window(struct comp_metal_compositor *c, NSView *external_view,
                       bool transparent_background)
@@ -1480,9 +1556,11 @@ setup_external_window(struct comp_metal_compositor *c, NSView *external_view,
 		U_LOG_W("Transparent background enabled: external CAMetalLayer set isOpaque=NO");
 	}
 
-	// Ensure Retina backing scale is applied so drawables are at physical resolution
+	// Ensure Retina backing scale is applied so drawables are at physical
+	// resolution (and the layer is never resampled — metal_sync_layer_scale).
 	CGFloat scale = 1.0;
 	if (external_view.window != nil) {
+		metal_sync_layer_scale(c, external_view, "adopting the app's layer");
 		scale = external_view.window.backingScaleFactor;
 	} else {
 		scale = [NSScreen mainScreen].backingScaleFactor;
@@ -3712,6 +3790,9 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 	// Update CAMetalLayer drawable size on window resize
 	if (c->metal_layer != nil && c->view != nil) {
+		// contentsScale == backingScaleFactor, re-checked every frame (a
+		// screen / backing change, or an app resetting its own layer).
+		metal_sync_layer_scale(c, c->view, "frame");
 		NSRect backing = [c->view convertRectToBacking:c->view.bounds];
 		CGSize newSize = CGSizeMake(backing.size.width, backing.size.height);
 		if (c->placement_frame_valid) {
