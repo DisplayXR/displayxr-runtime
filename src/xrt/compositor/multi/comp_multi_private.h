@@ -639,6 +639,7 @@ struct multi_compositor
 		//! reconfiguration (arrangement / scale change) re-resolves it.
 		uint32_t present_panel;
 		int32_t present_panel_x, present_panel_y;
+		uint32_t present_panel_w, present_panel_h; //!< Its backing-px size.
 		double present_panel_scale;
 		bool present_panel_fallback; //!< Resolved via the main-display fallback.
 		uint32_t present_check_counter;
@@ -1588,6 +1589,22 @@ comp_multi_weave_export_fence(struct xrt_compositor *xc, xrt_graphics_sync_handl
  */
 bool
 comp_multi_weave_macos_request_display_mode(struct multi_compositor *mc, bool enable_3d);
+
+/*!
+ * Where a macOS XR_DXR_weave present-owner's window sits on its panel, for the
+ * per-window Kooima (ipc_try_get_oop_view_poses): the bound geometry (global
+ * CoreGraphics BACKING px, y down) re-based to the resolved panel's backing
+ * origin — the same panel and origin the weave feeds the DP phase slot — plus
+ * that panel's backing size. False when no geometry was bound.
+ */
+bool
+comp_multi_weave_macos_window_on_panel(struct multi_compositor *mc,
+                                       int32_t *out_x,
+                                       int32_t *out_y,
+                                       uint32_t *out_w,
+                                       uint32_t *out_h,
+                                       uint32_t *out_panel_w,
+                                       uint32_t *out_panel_h);
 
 #ifdef COMP_MULTI_WEAVE_HAVE_METAL
 /*!

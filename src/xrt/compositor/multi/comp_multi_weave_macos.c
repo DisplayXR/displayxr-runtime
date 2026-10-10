@@ -62,6 +62,8 @@
 #include "comp_multi_private.h"
 #include "comp_multi_weave_macos_backend.h"
 
+#include "os/os_display_macos.h"
+
 #ifdef XRT_OS_MACOS
 
 #include <IOSurface/IOSurface.h>
@@ -133,30 +135,25 @@ weave_pick_backend(struct multi_compositor *mc)
 }
 
 /*!
- * One display's rect in global CoreGraphics BACKING pixels (CGDisplayBounds is
- * in points; the scale is the mode's pixel width over its point width).
+ * One display's rect in global CoreGraphics BACKING pixels, from the shared
+ * macOS monitor record (#1872, os_display_macos_fill_desktop_info): its rect
+ * is top-down POINTS and its scale the current mode's backing pixels over
+ * points, so backing = points x scale. One source for the weave's phase origin
+ * and its per-window Kooima (comp_multi_weave_macos_window_on_panel).
  */
 static bool
 weave_display_backing_rect(
     CGDirectDisplayID d, int32_t *out_x, int32_t *out_y, uint32_t *out_w, uint32_t *out_h, double *out_scale)
 {
-	const CGRect b = CGDisplayBounds(d);
-	if (b.size.width <= 0.0 || b.size.height <= 0.0) {
+	struct os_display_desktop_info info;
+	if (!os_display_macos_fill_desktop_info((uint32_t)d, &info) || info.width == 0 || info.height == 0) {
 		return false;
 	}
-	double scale = 1.0;
-	CGDisplayModeRef mode = CGDisplayCopyDisplayMode(d);
-	if (mode != NULL) {
-		const size_t pw = CGDisplayModeGetPixelWidth(mode);
-		if (pw > 0) {
-			scale = (double)pw / b.size.width;
-		}
-		CGDisplayModeRelease(mode);
-	}
-	*out_x = (int32_t)lround(b.origin.x * scale);
-	*out_y = (int32_t)lround(b.origin.y * scale);
-	*out_w = (uint32_t)lround(b.size.width * scale);
-	*out_h = (uint32_t)lround(b.size.height * scale);
+	const double scale = info.scale > 0.0 ? info.scale : 1.0;
+	*out_x = (int32_t)lround((double)info.left * scale);
+	*out_y = (int32_t)lround((double)info.top * scale);
+	*out_w = info.native_width > 0 ? info.native_width : (uint32_t)lround((double)info.width * scale);
+	*out_h = info.native_height > 0 ? info.native_height : (uint32_t)lround((double)info.height * scale);
 	*out_scale = scale;
 	return true;
 }
@@ -202,10 +199,10 @@ weave_resolve_panel(int32_t wx,
 		// bounds. With mixed scales several displays can match (the backing-px
 		// spaces of different-scale displays overlap) — prefer a non-main one
 		// and ask the caller for displayId.
-		CGDirectDisplayID ids[16];
-		uint32_t n = 0;
+		uint32_t ids[OS_DISPLAY_DESKTOP_MAX_MONITORS];
+		const uint32_t n = os_display_macos_list_displays(ids, OS_DISPLAY_DESKTOP_MAX_MONITORS);
 		const CGDirectDisplayID main_id = CGMainDisplayID();
-		if (CGGetActiveDisplayList(16, ids, &n) == kCGErrorSuccess) {
+		{
 			for (uint32_t i = 0; i < n; i++) {
 				int32_t x = 0, y = 0;
 				uint32_t w = 0, h = 0;
@@ -213,7 +210,8 @@ weave_resolve_panel(int32_t wx,
 				if (!weave_display_backing_rect(ids[i], &x, &y, &w, &h, &s)) {
 					continue;
 				}
-				const CGRect b = CGDisplayBounds(ids[i]);
+				// The display's point bounds, back from its backing rect.
+				const CGRect b = CGRectMake((double)x / s, (double)y / s, (double)w / s, (double)h / s);
 				const CGPoint pt = CGPointMake((double)wx / s, (double)wy / s);
 				if (!CGRectContainsPoint(b, pt)) {
 					continue;
@@ -295,6 +293,8 @@ weave_resolve_present_origin_locked(struct multi_compositor *mc)
 	mc->weave.present_panel = (uint32_t)panel;
 	mc->weave.present_panel_x = px;
 	mc->weave.present_panel_y = py;
+	mc->weave.present_panel_w = pw;
+	mc->weave.present_panel_h = ph;
 	mc->weave.present_panel_scale = scale;
 	mc->weave.present_panel_fallback = fallback;
 	mc->weave.present_check_counter = 0;
@@ -336,7 +336,8 @@ weave_recheck_panel_locked(struct multi_compositor *mc)
 	double s = 1.0;
 	const bool ok = weave_display_backing_rect((CGDirectDisplayID)mc->weave.present_panel, &x, &y, &w, &h, &s);
 	if (!ok || mc->weave.present_panel_fallback || x != mc->weave.present_panel_x ||
-	    y != mc->weave.present_panel_y || s != mc->weave.present_panel_scale) {
+	    y != mc->weave.present_panel_y || w != mc->weave.present_panel_w || h != mc->weave.present_panel_h ||
+	    s != mc->weave.present_panel_scale) {
 		mc->weave.geometry_dirty = true;
 	}
 }
@@ -468,6 +469,57 @@ comp_multi_weave_set_window_geometry(struct xrt_compositor *xc,
 		mc->weave.geometry_dirty = true;
 	}
 	os_mutex_unlock(&mc->weave.mutex);
+	return true;
+}
+
+bool
+comp_multi_weave_macos_window_on_panel(struct multi_compositor *mc,
+                                       int32_t *out_x,
+                                       int32_t *out_y,
+                                       uint32_t *out_w,
+                                       uint32_t *out_h,
+                                       uint32_t *out_panel_w,
+                                       uint32_t *out_panel_h)
+{
+	// Lock-free read of the geometry, the same trade
+	// multi_compositor_get_window_metrics() makes for this very rect: the
+	// client's IPC thread is the only writer (bind/geometry/submit are its own
+	// RPCs, serialized with its locates), so a locate never races a write here.
+	if (mc == NULL || !mc->weave.have_geometry || mc->weave.win_w == 0 || mc->weave.win_h == 0) {
+		return false;
+	}
+	const int32_t wx = mc->weave.win_x;
+	const int32_t wy = mc->weave.win_y;
+
+	int32_t px = 0, py = 0;
+	uint32_t pw = 0, ph = 0;
+	if (mc->weave.have_present_origin && !mc->weave.geometry_dirty) {
+		// The origin the DP phase is being fed right now — one answer for the
+		// weave and the Kooima, and no display query on the per-frame path
+		// (weave_recheck_panel_locked keeps it fresh across reconfigurations).
+		px = mc->weave.present_panel_x;
+		py = mc->weave.present_panel_y;
+		pw = mc->weave.present_panel_w;
+		ph = mc->weave.present_panel_h;
+	} else {
+		// Before the first submit, or moved since the last one: resolve the
+		// panel exactly as the next submit will (pure, no state written).
+		double s = 1.0;
+		const char *how = NULL;
+		bool fallback = false;
+		uint32_t matches = 0;
+		(void)weave_resolve_panel(wx, wy, mc->weave.win_display_id, &px, &py, &pw, &ph, &s, &how, &fallback,
+		                          &matches);
+	}
+	if (pw == 0 || ph == 0) {
+		return false;
+	}
+	*out_x = wx - px;
+	*out_y = wy - py;
+	*out_w = mc->weave.win_w;
+	*out_h = mc->weave.win_h;
+	*out_panel_w = pw;
+	*out_panel_h = ph;
 	return true;
 }
 

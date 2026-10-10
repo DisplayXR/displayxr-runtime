@@ -61,4 +61,5 @@ target_link_libraries(weave_probe_vk_macos PRIVATE
     Vulkan::Vulkan
     "-framework IOSurface"
     "-framework CoreFoundation"
+    "-framework CoreGraphics"
 )
