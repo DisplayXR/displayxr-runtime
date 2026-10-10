@@ -373,6 +373,16 @@ comp_multi_workspace_copy_overlays(struct comp_multi_overlay_state *out_states,
                                    struct xrt_swapchain **out_xscs,
                                    uint32_t max);
 
+/*!
+ * Drop the controller-owned session-global state — cursor sprite, overlays and
+ * the focused client — when the workspace controller deactivates or
+ * disconnects, so a dead controller's cursor / launcher band does not stay
+ * composited on the surface (and its swapchains are released). Per-client
+ * chrome, poses and styles are dropped with their clients.
+ */
+void
+comp_multi_workspace_reset_controller_state(void);
+
 #ifdef __cplusplus
 }
 #endif

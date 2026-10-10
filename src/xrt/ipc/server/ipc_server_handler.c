@@ -54,7 +54,8 @@
 // XRT_FEATURE_COMP_MULTI_WEAVE_LINUX — #1699). Header-only, safe everywhere.
 #include "multi/comp_multi_interface.h"
 
-#if defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS) || defined(COMP_MULTI_HAVE_WEAVE)
+#if defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS) || defined(COMP_MULTI_HAVE_WEAVE) ||                              \
+    defined(COMP_MULTI_SHARED_SURFACE)
 // Out-of-process non-D3D11 service path (Android #510, macOS #48): the per-client
 // compositor is a multi_compositor; the server pulls its live present-target
 // extent for the client's Kooima and runs the server-side Kooima for the
@@ -64,23 +65,24 @@
 #include "xrt/xrt_display_metrics.h" // struct xrt_eye_positions (DP-tracked eyes; Leia M2)
 #endif
 
-#if defined(XRT_OS_MACOS)
-// macOS service input forwarding (#48): drain the generic queue fed by the
-// AppKit pump's NSEvent capture (ipc_server_macos_appkit.m).
+#if defined(COMP_MULTI_SHARED_SURFACE)
+// Shared-surface service input forwarding (macOS #48, desktop Linux #710): drain
+// the generic per-target queues fed by the service window's input capture
+// (ipc_server_macos_appkit.m / ipc_server_linux_input.c).
 #include "ipc_server_input_queue.h"
-// macOS workspace chrome (#48): the generic comp_multi chrome registry the
-// per-session render path composites from (the cross-platform analogue of the
-// D3D11 monolith's per-slot chrome storage).
+// Workspace chrome / pose / cursor / overlays (#48): the generic comp_multi
+// workspace registry the shared surface composites from (the cross-platform
+// analogue of the D3D11 monolith's per-slot storage).
 #include "multi/comp_multi_workspace.h"
 // Forward decl: the canonical-id → per-session compositor resolver is defined
 // lower in this file (alongside the chrome RPC handlers) but is also used by
 // the earlier get_window_pose handler.
 static struct xrt_compositor *
-macos_workspace_find_client_xc(struct ipc_server *s, uint32_t client_id);
+multi_workspace_find_client_xc(struct ipc_server *s, uint32_t client_id);
 #endif
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR) || defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS) ||                  \
-    defined(COMP_MULTI_HAVE_WEAVE)
+    defined(COMP_MULTI_HAVE_WEAVE) || defined(COMP_MULTI_SHARED_SURFACE)
 // Shared Kooima rig math (#396 W7): same displayxr-common core as the
 // in-process oxr_session.c path and every app/engine consumer. Both server-side
 // Kooima paths (D3D11 service on Windows, null+comp_multi on Android/macOS and
@@ -485,7 +487,7 @@ validate_device_id(volatile struct ipc_client_state *ics, int64_t device_id, str
 #define IPC_CHECK_SWAPCHAIN_ID(ICS, ID) do { if ((ID) >= IPC_MAX_CLIENT_SWAPCHAINS) { IPC_ERROR((ICS)->server, "swapchain id %u out of range", (ID)); return XRT_ERROR_IPC_FAILURE; } } while (0)
 #define IPC_CHECK_SEMAPHORE_ID(ICS, ID) do { if ((ID) >= IPC_MAX_CLIENT_SEMAPHORES) { IPC_ERROR((ICS)->server, "semaphore id %u out of range", (ID)); return XRT_ERROR_IPC_FAILURE; } } while (0)
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR) || defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS) ||                  \
-    defined(COMP_MULTI_HAVE_WEAVE)
+    defined(COMP_MULTI_HAVE_WEAVE) || defined(COMP_MULTI_SHARED_SURFACE)
 /*!
  * Fill surplus view slots [from, view_count) with valid poses.
  *
@@ -1211,7 +1213,8 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 }
 #endif // XRT_HAVE_D3D11_SERVICE_COMPOSITOR
 
-#if defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS) || defined(COMP_MULTI_HAVE_WEAVE)
+#if defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS) || defined(COMP_MULTI_HAVE_WEAVE) ||                              \
+    defined(COMP_MULTI_SHARED_SURFACE)
 /*!
  * Server-side Kooima for the out-of-process null+comp_multi path (Android #510,
  * macOS #48, desktop Linux with the weave engine #1699).
@@ -1410,8 +1413,8 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 	}
 #endif
 
-#ifdef XRT_OS_MACOS
-	// Shared spatial surface (#59) PER-WINDOW Kooima. Each client composites into a
+#ifdef COMP_MULTI_SHARED_SURFACE
+	// Shared spatial surface (#59; macOS, and desktop Linux #710) PER-WINDOW Kooima. Each client composites into a
 	// TILED window, not the full display, so the Kooima screen must be the WINDOW's
 	// physical size — otherwise the client renders for the wide display aspect and a
 	// tall window squishes the blit. Use the controller-placed window pose: its
@@ -1451,7 +1454,9 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 			                       fabsf(win_orient.z) > 0.0001f || fabsf(win_orient.w - 1.0f) > 0.0001f);
 		}
 	}
+#endif // COMP_MULTI_SHARED_SURFACE
 
+#ifdef XRT_OS_MACOS
 	// PER-WINDOW Kooima for a macOS weave present-owner (the DisplayXR Browser)
 	// — the macOS counterpart of the desktop-Linux #1699 block above. The
 	// window is the geometry the caller bound (xrWeaveBindWindow2DXR /
@@ -1707,7 +1712,7 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 		}
 	}
 
-#ifdef XRT_OS_MACOS
+#ifdef COMP_MULTI_SHARED_SURFACE
 	// #59 Task 10: rotate the (window-centre-relative) render eyes into the
 	// window's LOCAL frame by the inverse window orientation — the eyes above are
 	// already centre-relative (win_eye_offset subtracted), so this is exactly the
@@ -1902,7 +1907,7 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 
 	return true;
 }
-#endif // XRT_OS_ANDROID || XRT_OS_MACOS || COMP_MULTI_HAVE_WEAVE
+#endif // XRT_OS_ANDROID || XRT_OS_MACOS || COMP_MULTI_HAVE_WEAVE || COMP_MULTI_SHARED_SURFACE
 
 
 static xrt_result_t
@@ -3134,8 +3139,8 @@ ipc_handle_compositor_get_predicted_eye_positions(volatile struct ipc_client_sta
 		(void)comp_d3d11_service_get_predicted_eye_positions_full_for_client(
 		    ics->server->xsysc, (struct xrt_compositor *)ics->xc, &eyes);
 	}
-#elif defined(XRT_OS_MACOS)
-	// macOS null+comp_multi service: THIS client's DP — its per-session DP,
+#elif defined(XRT_OS_MACOS) || defined(XRT_OS_LINUX_DESKTOP)
+	// macOS / desktop-Linux null+comp_multi service: THIS client's DP — its per-session DP,
 	// else its weave engine's (vk or Metal backend), the same eye source
 	// ipc_try_get_oop_view_poses uses for its views. Without this branch a
 	// macOS IPC session's XrViewEyeTrackingStateDXR.isTracking was constant
@@ -4521,6 +4526,11 @@ ipc_handle_workspace_activate(volatile struct ipc_client_state *_ics)
 #ifdef XRT_OS_WINDOWS
 			comp_d3d11_service_ensure_workspace_window(s->xsysc);
 #endif
+#if defined(COMP_MULTI_SHARED_SURFACE)
+			// A service started in workspace mode lands here on the first
+			// activate: the shared surface must still learn a controller is up.
+			comp_multi_system_set_workspace_active(s->xsysc, true);
+#endif
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 			// Force-reset to 3D on EVERY activate, including this
 			// already-in-workspace-mode path. The service is normally
@@ -4548,11 +4558,11 @@ ipc_handle_workspace_activate(volatile struct ipc_client_state *_ics)
 		comp_d3d11_service_ensure_workspace_window(s->xsysc);
 #endif
 
-#ifdef XRT_OS_MACOS
+#ifdef COMP_MULTI_SHARED_SURFACE
 		// #61: keep the shared spatial surface rendering (empty backdrop + DXR
 		// splash + launcher band) while the controller is connected, even with no
-		// content app — wakes the render thread (the macOS analogue of eagerly
-		// creating the workspace window above).
+		// content app — wakes the render thread (the shared-surface analogue of
+		// eagerly creating the workspace window above).
 		comp_multi_system_set_workspace_active(s->xsysc, true);
 #endif
 
@@ -4597,9 +4607,13 @@ ipc_handle_workspace_deactivate(volatile struct ipc_client_state *_ics)
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 		comp_d3d11_service_deactivate_workspace(s->xsysc);
 #endif
-#ifdef XRT_OS_MACOS
-		// #61: let the shared-surface render thread idle again (no controller).
+#ifdef COMP_MULTI_SHARED_SURFACE
+		// #61: let the shared-surface render thread idle again (no controller),
+		// and drop the controller's cursor / overlays / focus.
 		comp_multi_system_set_workspace_active(s->xsysc, false);
+		comp_multi_workspace_reset_controller_state();
+		ipc_server_input_queue_set_input_grab(false);
+		ipc_server_input_queue_set_pointer_capture(false);
 #endif
 	}
 
@@ -4708,7 +4722,7 @@ ipc_handle_workspace_set_input_grab(volatile struct ipc_client_state *_ics, bool
 	IPC_INFO(s, "Workspace: set_input_grab %s", grab ? "true" : "false");
 	comp_d3d11_service_set_input_grab(s->xsysc, grab);
 	return XRT_SUCCESS;
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	// #61: the launcher band grabs all input. Flag the AppKit router so every
 	// event goes to the controller queue only (no content forwarding) until the
 	// band closes and the shell releases the grab.
@@ -4742,7 +4756,7 @@ ipc_handle_workspace_set_cursor_depth(volatile struct ipc_client_state *_ics,
 	// Per-frame; never log here (would flood the service log).
 	comp_d3d11_service_workspace_set_cursor_depth(s->xsysc, hit_z_m, over_window != 0, dim_factor);
 	return XRT_SUCCESS;
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	(void)s;
 	(void)dim_factor; // v1 cursor is flat; dim not yet applied.
 	comp_multi_workspace_set_cursor_depth(hit_z_m, over_window != 0);
@@ -4836,14 +4850,14 @@ ipc_handle_workspace_set_window_pose(volatile struct ipc_client_state *_ics,
 	bool ok = comp_d3d11_service_set_client_window_pose(s->xsysc, target_xc, pose, width_m, height_m);
 
 	return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	// Tier-2 (#59): reposition + resize the client's runtime-owned NSWindow into a
 	// display sub-rect so multiple apps tile instead of stacking full-screen. The
 	// shell's grid/drag/resize layout primitives all funnel here through the same
 	// xrSetWorkspaceClientWindowPoseDXR path the Windows monolith uses.
 	IPC_INFO(s, "Workspace: set_window_pose client_id=%u pos=(%.3f,%.3f,%.3f) size=%.3fx%.3f (macOS)",
 	         client_id, pose->position.x, pose->position.y, pose->position.z, width_m, height_m);
-	struct xrt_compositor *target_xc = macos_workspace_find_client_xc(s, client_id);
+	struct xrt_compositor *target_xc = multi_workspace_find_client_xc(s, client_id);
 	if (target_xc == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
@@ -4895,12 +4909,12 @@ ipc_handle_workspace_set_window_visibility(volatile struct ipc_client_state *_ic
 
 	bool ok = comp_d3d11_service_set_client_visibility(s->xsysc, target_xc, visible);
 	return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	// macOS OOP: record the minimized/hidden state in the workspace registry. The
 	// per-session render path (render_per_session_clients_locked) reads it and
 	// renders a black desktop canvas + overlays for a hidden client instead of
 	// skipping it, so the taskbar stays visible while minimized (#61).
-	struct xrt_compositor *target_xc = macos_workspace_find_client_xc(s, client_id);
+	struct xrt_compositor *target_xc = multi_workspace_find_client_xc(s, client_id);
 	if (target_xc == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
@@ -4943,13 +4957,13 @@ ipc_handle_workspace_get_window_pose(volatile struct ipc_client_state *_ics,
 
 	bool ok = comp_d3d11_service_get_client_window_pose(s->xsysc, target_xc, out_pose, out_width_m, out_height_m);
 	return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	// macOS OOP single-app model: the client fills the display, so its window
 	// IS the display. Return the display dims (consistent with where the chrome
 	// composite, session_render_chrome_overlay, places chrome) + an identity
 	// pose. This unblocks the shell's per-client chrome sizing (#61); true
 	// per-client window placement is Tier-2 (#59).
-	struct xrt_compositor *target_xc = macos_workspace_find_client_xc(s, client_id);
+	struct xrt_compositor *target_xc = multi_workspace_find_client_xc(s, client_id);
 	if (target_xc == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
@@ -5059,7 +5073,7 @@ ipc_handle_workspace_set_focused_client(volatile struct ipc_client_state *_ics, 
 		if (s->xsysc != NULL) {
 			comp_d3d11_service_set_focused_slot(s->xsysc, -1);
 		}
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 		// #59 Task 10: clear the focus tint (no client tinted).
 		comp_multi_workspace_set_focused_client(NULL);
 #else
@@ -5102,10 +5116,10 @@ ipc_handle_workspace_set_focused_client(volatile struct ipc_client_state *_ics, 
 	int mc_slot = comp_d3d11_service_workspace_find_slot_by_xc(s->xsysc, xc);
 	comp_d3d11_service_set_focused_slot(s->xsysc, mc_slot);
 	return XRT_SUCCESS;
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	// #59 Task 10: the compositor's focus-tint gate is the authority on macOS.
 	// The macOS shell passes canonical client ids (no 1000+slot form).
-	struct xrt_compositor *xc = macos_workspace_find_client_xc(s, client_id);
+	struct xrt_compositor *xc = multi_workspace_find_client_xc(s, client_id);
 	if (xc == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
@@ -5240,10 +5254,11 @@ ipc_handle_workspace_enumerate_input_events(volatile struct ipc_client_state *_i
 
 	unsigned long expected_pid = effective_workspace_controller_pid(s);
 	unsigned long caller_pid = (unsigned long)_ics->client_state.pid;
-#ifndef XRT_OS_MACOS
+#ifndef COMP_MULTI_SHARED_SURFACE
 	// Single shared queue (Windows/Android): the activate-registered controller
 	// pid gates the drain so a content app can't steal the controller's input.
-	// macOS has per-client queues (#61), so it keys by caller below instead.
+	// The shared surface (macOS #61, desktop Linux) has per-client queues, so it
+	// keys by caller below instead.
 	if (expected_pid != 0 && caller_pid != expected_pid) {
 		return XRT_ERROR_NOT_AUTHORIZED;
 	}
@@ -5260,7 +5275,7 @@ ipc_handle_workspace_enumerate_input_events(volatile struct ipc_client_state *_i
 	}
 	bool ok = comp_d3d11_service_workspace_drain_input_events(s->xsysc, capacity, out_batch);
 	return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	// macOS null+comp_multi service (#48/#61): the AppKit router hit-tests each
 	// NSEvent and pushes it onto a per-target queue. Each client drains only its
 	// own: the workspace controller drains the controller queue (NULL key); a
@@ -5302,7 +5317,7 @@ ipc_handle_workspace_pointer_capture_set(volatile struct ipc_client_state *_ics,
 	}
 	bool ok = comp_d3d11_service_workspace_pointer_capture_set(s->xsysc, enabled, button);
 	return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	// macOS has no OS-level pointer capture to toggle: the appkit pump already
 	// publishes POINTER_MOTION every cycle from a global CGEventGetLocation poll
 	// (carrying the pressed-button mask), so a gesture's motion flows whether or
@@ -5358,12 +5373,12 @@ ipc_handle_workspace_request_client_exit(volatile struct ipc_client_state *_ics,
 		return XRT_ERROR_IPC_FAILURE;
 	}
 	return comp_d3d11_service_workspace_request_exit_by_slot(s->xsysc, slot);
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	// macOS OOP (#59): resolve the canonical client id to its per-session
 	// compositor and push an exit request — the chrome close (X) button / DELETE
 	// key path. The window-close global never fires in this route (the service
 	// pump doesn't track NSWindows), so this is the app-quit mechanism.
-	struct xrt_compositor *target_xc = macos_workspace_find_client_xc(s, client_id);
+	struct xrt_compositor *target_xc = multi_workspace_find_client_xc(s, client_id);
 	if (target_xc == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
@@ -5579,7 +5594,7 @@ ipc_handle_workspace_get_client_info(volatile struct ipc_client_state *_ics,
 			}
 		}
 	}
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	// macOS shared surface: like the D3D11 path above, report session_visible
 	// from the WORKSPACE minimize state, not the xrSession lifecycle flag. A
 	// freshly-connected OOP client sits in a non-VISIBLE session state until the
@@ -5687,13 +5702,13 @@ ipc_handle_workspace_capture_frame(volatile struct ipc_client_state *_ics,
 // dispatches to comp_d3d11_service. Layout has the same client_id→slot
 // resolution.
 
-#if defined(XRT_OS_MACOS)
+#if defined(COMP_MULTI_SHARED_SURFACE)
 // Resolve a canonical workspace client id to its per-session compositor
 // (== ics->xc == the multi_compositor the render path keys chrome by, #48). The
 // macOS service hands the controller canonical ids from EnumerateWorkspaceClients,
 // so no 1000+slot normalization is needed here (that is the D3D11-only form).
 static struct xrt_compositor *
-macos_workspace_find_client_xc(struct ipc_server *s, uint32_t client_id)
+multi_workspace_find_client_xc(struct ipc_server *s, uint32_t client_id)
 {
 	struct xrt_compositor *xc = NULL;
 	os_mutex_lock(&s->global_state.lock);
@@ -5773,7 +5788,7 @@ ipc_handle_workspace_register_chrome_swapchain(volatile struct ipc_client_state 
 	IPC_INFO(s, "Workspace: register_chrome_swapchain client_id=%u swapchain_id=%u → slot=%d",
 	         client_id, swapchain_id, slot);
 	return comp_d3d11_service_workspace_register_chrome_swapchain_by_slot(s->xsysc, slot, client_id, swapchain_id, xsc);
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	// Generic comp_multi path (#48): store the controller's chrome swapchain in
 	// the chrome registry, keyed by the *target* client's compositor; the
 	// per-session render path composites it (no D3D11 monolith / slots here).
@@ -5785,7 +5800,7 @@ ipc_handle_workspace_register_chrome_swapchain(volatile struct ipc_client_state 
 		IPC_WARN(s, "Workspace: register_chrome_swapchain - swapchain %u not bound", swapchain_id);
 		return XRT_ERROR_IPC_FAILURE;
 	}
-	struct xrt_compositor *target_xc = macos_workspace_find_client_xc(s, client_id);
+	struct xrt_compositor *target_xc = multi_workspace_find_client_xc(s, client_id);
 	if (target_xc == NULL) {
 		// Client may not be bound yet — controller retries.
 		IPC_WARN(s, "Workspace: register_chrome_swapchain - client %u not bound yet", client_id);
@@ -5818,7 +5833,7 @@ ipc_handle_workspace_unregister_chrome_swapchain(volatile struct ipc_client_stat
 	}
 	IPC_INFO(s, "Workspace: unregister_chrome_swapchain swapchain_id=%u", swapchain_id);
 	return comp_d3d11_service_workspace_unregister_chrome_swapchain(s->xsysc, swapchain_id);
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	IPC_INFO(s, "Workspace: unregister_chrome_swapchain swapchain_id=%u (macOS)", swapchain_id);
 	comp_multi_workspace_chrome_unregister_by_id(swapchain_id);
 	return XRT_SUCCESS;
@@ -5872,11 +5887,11 @@ ipc_handle_workspace_set_chrome_layout(volatile struct ipc_client_state *_ics,
 	}
 
 	return comp_d3d11_service_workspace_set_chrome_layout_by_slot(s->xsysc, slot, layout);
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	if (layout == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
-	struct xrt_compositor *target_xc = macos_workspace_find_client_xc(s, client_id);
+	struct xrt_compositor *target_xc = multi_workspace_find_client_xc(s, client_id);
 	if (target_xc == NULL) {
 		IPC_WARN(s, "Workspace: set_chrome_layout - client %u not found", client_id);
 		return XRT_ERROR_IPC_FAILURE;
@@ -5953,7 +5968,7 @@ ipc_handle_workspace_set_cursor(volatile struct ipc_client_state *_ics,
 	                                                info->hot_x, info->hot_y,
 	                                                info->size_meters,
 	                                                info->visible != 0);
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	(void)s;
 	if (info == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
@@ -5998,7 +6013,7 @@ ipc_handle_workspace_set_overlay(volatile struct ipc_client_state *_ics,
 	                                                 info->size_w_m, info->size_h_m,
 	                                                 info->visible != 0,
 	                                                 info->stereo_sbs != 0);
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	(void)s;
 	if (info == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
@@ -6060,11 +6075,11 @@ ipc_handle_workspace_update_chrome_layer_pose(volatile struct ipc_client_state *
 	}
 
 	return comp_d3d11_service_workspace_update_chrome_layer_pose_by_slot(s->xsysc, slot, pose_in_client);
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	if (pose_in_client == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
-	struct xrt_compositor *target_xc = macos_workspace_find_client_xc(s, client_id);
+	struct xrt_compositor *target_xc = multi_workspace_find_client_xc(s, client_id);
 	if (target_xc == NULL) {
 		// Per-frame call — quieter than set_chrome_layout (no warn).
 		return XRT_ERROR_IPC_FAILURE;
@@ -6200,7 +6215,7 @@ ipc_handle_workspace_set_client_style(volatile struct ipc_client_state *_ics,
 	return comp_d3d11_service_set_client_style_by_slot(s->xsysc, slot, style)
 	           ? XRT_SUCCESS
 	           : XRT_ERROR_IPC_FAILURE;
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	// macOS shared surface (#59 Task 10): store the controller's per-client style.
 	// The content compositing loop applies the focus tint to the focused client's
 	// edge — the macOS analogue of the D3D11 service per-slot style, which renders
@@ -6211,7 +6226,7 @@ ipc_handle_workspace_set_client_style(volatile struct ipc_client_state *_ics,
 	if (s == NULL || style == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
-	struct xrt_compositor *target_xc = macos_workspace_find_client_xc(s, client_id);
+	struct xrt_compositor *target_xc = multi_workspace_find_client_xc(s, client_id);
 	if (target_xc == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
@@ -7917,7 +7932,7 @@ ipc_handle_device_get_view_poses(volatile struct ipc_client_state *ics,
 	                               view_count, NULL, NULL, &reply.head_relation, fovs, poses)) {
 		reply.result = XRT_SUCCESS;
 	} else
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	// Out-of-process macOS (#48): DP-sourced server-side Kooima (see
 	// ipc_handle_device_get_view_poses_2 for the rationale).
 	if (ipc_try_get_oop_view_poses(ics, xdev, fallback_eye_relation, at_timestamp_ns, view_count, NULL, NULL,
@@ -7992,7 +8007,7 @@ ipc_handle_device_get_view_poses_2(volatile struct ipc_client_state *ics,
 	                               out_info->poses)) {
 		return XRT_SUCCESS;
 	}
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	// Out-of-process macOS (#48): null+comp_multi service path. Legacy apps locate
 	// via the non-rig device_get_view_poses, so route them through the same
 	// DP-sourced server-side Kooima as the rig path — otherwise the fallback below
@@ -8064,7 +8079,8 @@ ipc_handle_session_locate_views_rig(volatile struct ipc_client_state *ics,
 	                               out_info->fovs, out_info->poses)) {
 		return XRT_SUCCESS;
 	}
-#elif defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS) || defined(COMP_MULTI_HAVE_WEAVE)
+#elif defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS) || defined(COMP_MULTI_HAVE_WEAVE) ||                            \
+    defined(COMP_MULTI_SHARED_SURFACE)
 	// Out-of-process Android (#510) / macOS (#48) / desktop Linux (#1699): the
 	// service runs null+comp_multi, not the D3D11 service compositor, so run the
 	// server-side Kooima for that path.

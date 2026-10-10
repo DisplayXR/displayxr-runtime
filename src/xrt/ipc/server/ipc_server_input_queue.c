@@ -8,6 +8,9 @@
 
 #include "ipc_server_input_queue.h"
 
+#include "multi/comp_multi_workspace.h" // hit-test + focus for ipc_server_input_route
+#include "os/os_time.h"
+
 #include <pthread.h>
 #include <string.h>
 
@@ -169,4 +172,99 @@ ipc_server_input_queue_pointer_captured(void)
 	bool v = g_pointer_capture;
 	pthread_mutex_unlock(&g_lock);
 	return v;
+}
+
+
+/*
+ *
+ * Routing (#61) — shared by the desktop-Linux surface input; the macOS pump
+ * keeps its inline copy of the same policy.
+ *
+ */
+
+//! Workspace chords stay with the controller and never reach a content app.
+static bool
+is_workspace_key(uint32_t vk, uint32_t mods)
+{
+	if (mods & (1u << 1)) { // CTRL
+		return true;
+	}
+	switch (vk) {
+	case 0x09: // VK_TAB    — cycle focus
+	case 0x1B: // VK_ESCAPE — restore maximized / close launcher
+	case 0x2E: // VK_DELETE — close window
+	case 0x7A: // VK_F11    — maximize toggle
+	case 0x25: // VK_LEFT
+	case 0x26: // VK_UP
+	case 0x27: // VK_RIGHT
+	case 0x28: // VK_DOWN
+	case 0xDB: // VK_OEM_4 [ — step Z back
+	case 0xDD: // VK_OEM_6 ] — step Z forward
+		return true;
+	default: return false;
+	}
+}
+
+void
+ipc_server_input_route(const struct ipc_workspace_input_event *ev)
+{
+	const bool grab = ipc_server_input_queue_input_grabbed();
+	const bool cap = ipc_server_input_queue_pointer_captured();
+
+	switch (ev->event_type) {
+	case IPC_WORKSPACE_INPUT_EVENT_KEY:
+		ipc_server_input_queue_push(IPC_INPUT_TARGET_CONTROLLER, ev);
+		if (!grab && !is_workspace_key(ev->u.key.vk_code, ev->u.key.modifiers)) {
+			void *app = comp_multi_workspace_get_focused_client();
+			if (app != NULL) {
+				ipc_server_input_queue_push(app, ev);
+			}
+		}
+		break;
+	case IPC_WORKSPACE_INPUT_EVENT_SCROLL:
+		if (grab || cap) {
+			ipc_server_input_queue_push(IPC_INPUT_TARGET_CONTROLLER, ev);
+		} else {
+			void *app = comp_multi_workspace_hit_test_window_px((int32_t)ev->u.scroll.cursor_x,
+			                                                    (int32_t)ev->u.scroll.cursor_y);
+			ipc_server_input_queue_push(app != NULL ? app : IPC_INPUT_TARGET_CONTROLLER, ev);
+		}
+		break;
+	case IPC_WORKSPACE_INPUT_EVENT_POINTER:
+		ipc_server_input_queue_push(IPC_INPUT_TARGET_CONTROLLER, ev);
+		if (!grab && !cap) {
+			void *app = comp_multi_workspace_hit_test_window_px((int32_t)ev->u.pointer.cursor_x,
+			                                                    (int32_t)ev->u.pointer.cursor_y);
+			if (app != NULL) {
+				ipc_server_input_queue_push(app, ev);
+			}
+		}
+		break;
+	case IPC_WORKSPACE_INPUT_EVENT_POINTER_MOTION:
+		ipc_server_input_queue_push(IPC_INPUT_TARGET_CONTROLLER, ev);
+		if (!grab && !cap) {
+			void *app = comp_multi_workspace_hit_test_window_px((int32_t)ev->u.pointer_motion.cursor_x,
+			                                                    (int32_t)ev->u.pointer_motion.cursor_y);
+			if (app != NULL) {
+				ipc_server_input_queue_push(app, ev);
+			}
+		}
+		break;
+	default: ipc_server_input_queue_push(IPC_INPUT_TARGET_CONTROLLER, ev); break;
+	}
+}
+
+void
+ipc_server_input_queue_push_controller_key(uint32_t vk_code, uint32_t modifiers)
+{
+	struct ipc_workspace_input_event ev;
+	memset(&ev, 0, sizeof(ev));
+	ev.event_type = IPC_WORKSPACE_INPUT_EVENT_KEY;
+	ev.timestamp_ms = (uint32_t)(os_monotonic_get_ns() / 1000000);
+	ev.u.key.vk_code = vk_code;
+	ev.u.key.modifiers = modifiers;
+	ev.u.key.is_down = 1;
+	ipc_server_input_queue_push(IPC_INPUT_TARGET_CONTROLLER, &ev);
+	ev.u.key.is_down = 0;
+	ipc_server_input_queue_push(IPC_INPUT_TARGET_CONTROLLER, &ev);
 }

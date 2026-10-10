@@ -42,8 +42,11 @@
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 #include "d3d11_service/comp_d3d11_service.h" // #962: focused-slot authority
 #include "xrt/xrt_display_processor_d3d11.h"  // XRT_DP_BACKEND_STATE_* for the [HEALTH] dp= word
-#elif defined(XRT_OS_MACOS)
-#include "multi/comp_multi_workspace.h" // #962: focused-client authority
+#else
+#include "multi/comp_multi_interface.h" // COMP_MULTI_SHARED_SURFACE
+#if defined(COMP_MULTI_SHARED_SURFACE)
+#include "multi/comp_multi_workspace.h" // #962: focused-client authority (macOS, desktop Linux)
+#endif
 #endif
 
 #include <stdlib.h>
@@ -64,6 +67,10 @@
 
 #if defined(XRT_OS_MACOS)
 #include <CoreFoundation/CoreFoundation.h>
+#endif
+
+#if defined(XRT_HAVE_COMP_LINUX_WINDOW)
+#include "server/ipc_server_linux_input.h" // service-surface input → workspace queues (#710)
 #endif
 
 
@@ -317,6 +324,10 @@ teardown_all(struct ipc_server *s)
 	xrt_instance_destroy(&s->xinst);
 
 	ipc_server_mainloop_deinit(&s->ml);
+
+#if defined(XRT_HAVE_COMP_LINUX_WINDOW)
+	ipc_server_linux_input_uninstall();
+#endif
 
 	u_process_destroy(s->process);
 
@@ -642,6 +653,12 @@ init_all(struct ipc_server *s, enum u_logging_level log_level)
 		xret = XRT_ERROR_IPC_MAINLOOP_FAILED_TO_INIT;
 	}
 	IPC_CHK_WITH_GOTO(s, xret, "ipc_server_mainloop_init", error);
+
+#if defined(XRT_HAVE_COMP_LINUX_WINDOW)
+	// Desktop Linux (#710): the shared surface's window input feeds the
+	// workspace input queues (the macOS AppKit pump's role).
+	ipc_server_linux_input_install(s);
+#endif
 
 	// Never fails, do this second last.
 	init_server_state(s);
@@ -1255,7 +1272,7 @@ compositor_focused_xc(struct ipc_server *s)
 {
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	return s->xsysc != NULL ? comp_d3d11_service_get_focused_xc(s->xsysc) : NULL;
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	(void)s;
 	return comp_multi_workspace_get_focused_client();
 #else
