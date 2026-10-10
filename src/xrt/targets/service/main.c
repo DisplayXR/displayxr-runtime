@@ -470,6 +470,13 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 #include "service_orchestrator.h"
 #endif
 
+#ifdef XRT_OS_LINUX_DESKTOP
+// Linux workspace orchestrator: the macOS posix_spawn orchestrator plus the
+// launch hotkey (service_hotkey_linux.c). Kept apart from the macOS blocks.
+#include "service_config.h"
+#include "service_orchestrator.h"
+#endif
+
 int
 main(int argc, char *argv[])
 {
@@ -514,8 +521,29 @@ main(int argc, char *argv[])
 	ipc_server_set_workspace_hotkey_suspend_provider(service_orchestrator_request_hotkey_suspend);
 #endif
 
+#ifdef XRT_OS_LINUX_DESKTOP
+	// Linux orchestrator: discover the registered workspace controller (POSIX
+	// manifests), spawn it per its launch mode / on the launch hotkey, respawn
+	// it in ENABLE mode. The PID provider makes workspace_activate accept only
+	// the controller we spawned (0 → manual mode, first-claim wins, as before).
+	struct service_config linux_cfg;
+	service_config_load(&linux_cfg);
+	service_orchestrator_init(&linux_cfg);
+
+	ipc_server_set_workspace_pid_provider(service_orchestrator_get_workspace_pid);
+	ipc_server_set_workspace_supports_file_dialog_provider(
+	    service_orchestrator_get_workspace_supports_file_dialog);
+	ipc_server_set_workspace_summon_provider(service_orchestrator_summon_workspace);
+
+	// Display dashboard phase 8: live re-apply of service.json, launch-now and
+	// the hotkey-capture suspend.
+	ipc_server_set_service_config_reload_provider(service_orchestrator_request_config_reload);
+	ipc_server_set_workspace_launch_provider(service_orchestrator_request_launch);
+	ipc_server_set_workspace_hotkey_suspend_provider(service_orchestrator_request_hotkey_suspend);
+#endif
+
 	// #960: class verification (controller manifests are cross-platform; the
-	// orchestrator entry only exists on macOS).
+	// orchestrator entry exists on macOS and desktop Linux).
 	ipc_server_set_client_class_verify_provider(service_client_class_verify);
 	register_status_provider();
 
@@ -541,6 +569,11 @@ main(int argc, char *argv[])
 
 #ifdef XRT_OS_MACOS
 	// Terminate the managed workspace controller + join the watcher thread.
+	service_orchestrator_shutdown();
+#endif
+
+#ifdef XRT_OS_LINUX_DESKTOP
+	// Release the hotkey, terminate the managed controller, join the watcher.
 	service_orchestrator_shutdown();
 #endif
 

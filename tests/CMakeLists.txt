@@ -121,6 +121,12 @@ endif()
 if(TARGET target_workspace_config AND NOT WIN32)
 	list(APPEND tests tests_service_client_class)
 endif()
+# Desktop-Linux workspace orchestrator (spawn / respawn / hotkey arming, with a
+# stubbed hotkey backend and a shell-script controller) and the Linux hotkey
+# worker built without its D-Bus / X11 backends -- neither touches the desktop.
+if(TARGET target_workspace_config AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+	list(APPEND tests tests_service_orchestrator_linux tests_service_hotkey_linux)
+endif()
 if(XRT_HAVE_D3D11)
 	list(APPEND tests tests_aux_d3d_d3d11 tests_aux_d3d_render_adapter tests_comp_client_d3d11
 	     tests_comp_xbridge_plane_policy tests_comp_split_gate tests_comp_eye_dp_policy
@@ -698,6 +704,21 @@ if(TARGET tests_service_client_class)
 	# manifest registry is the source of truth here.
 	target_compile_definitions(tests_service_client_class PRIVATE SERVICE_CLIENT_CLASS_NO_ORCHESTRATOR)
 	target_link_libraries(tests_service_client_class PRIVATE target_workspace_config xrt-interfaces)
+endif()
+if(TARGET tests_service_orchestrator_linux)
+	target_sources(
+		tests_service_orchestrator_linux
+		PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/service/service_orchestrator.c
+		)
+	target_link_libraries(
+		tests_service_orchestrator_linux PRIVATE target_workspace_config xrt-interfaces aux_os xrt-pthreads
+		)
+	target_sources(
+		tests_service_hotkey_linux PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/service/service_hotkey_linux.c
+		)
+	target_link_libraries(
+		tests_service_hotkey_linux PRIVATE target_workspace_config xrt-interfaces aux_os xrt-pthreads
+		)
 endif()
 
 if(XRT_BUILD_DRIVER_HANDTRACKING)

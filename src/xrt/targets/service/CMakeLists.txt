@@ -78,6 +78,30 @@ if(APPLE)
 	)
 endif()
 
+# Desktop-Linux orchestrator: the macOS posix_spawn orchestrator (same #elif
+# block) plus the launch hotkey — a GNOME Shell extension keybinding over the
+# session bus (libdbus) and an X11 root-window grab fallback (xcb). Both are
+# optional: without either the controller is launched from the dashboard / CLI.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+	target_sources(displayxr-service PRIVATE
+		service_orchestrator.c
+		service_orchestrator.h
+		service_hotkey_linux.c
+		service_hotkey_linux.h
+	)
+	target_link_libraries(displayxr-service PRIVATE aux_os xrt-pthreads)
+	if(XRT_HAVE_DBUS)
+		target_compile_definitions(displayxr-service PRIVATE SERVICE_HOTKEY_HAVE_DBUS)
+		target_include_directories(displayxr-service SYSTEM PRIVATE ${DBUS_INCLUDE_DIRS})
+		target_link_libraries(displayxr-service PRIVATE ${DBUS_LIBRARIES})
+	endif()
+	if(XRT_HAVE_XCB)
+		target_compile_definitions(displayxr-service PRIVATE SERVICE_HOTKEY_HAVE_XCB)
+		target_include_directories(displayxr-service SYSTEM PRIVATE ${XCB_INCLUDE_DIRS})
+		target_link_libraries(displayxr-service PRIVATE ${XCB_LIBRARIES})
+	endif()
+endif()
+
 install(TARGETS displayxr-service RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(MSVC)
 	# Stage the service PDB next to the exe in _package/bin so dev deploys
