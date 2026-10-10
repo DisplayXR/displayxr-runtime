@@ -25,7 +25,7 @@ releases](#supported-releases) below.
 
 **Still open** — none of these gate an in-process `_handle`/`_hosted` app, which
 is the shipping path: Phase 2b service-side render (**#710**, service/IPC mode
-only); windowed-3D phase origin (**#729/#730**, twin of Windows #85); Wayland
+only — code-complete on the shared spatial surface, panel run pending); windowed-3D phase origin (**#729/#730**, twin of Windows #85); Wayland
 windowed weaving (**#817**) — the extension + runtime consumer are validated
 live on GNOME 50 / Ubuntu 26.04 (2026-09-19), and the logical→device conversion
 that actually feeds the phase landed with **#1596** (plus **#1595**, which
@@ -325,30 +325,65 @@ DP plug-in weave** (macOS is the exact analog); vk_native is instantiated
 in-process only (`oxr_session_gfx_vk_native.c`). The DP-weave path is
 platform-neutral and needs no VkSurface.
 
-**Phase 2b — on-screen out-of-process present (pending Linux hardware, with
-Phase 1b).** Validate with `displayxr-service` + a client under
-`XRT_FORCE_MODE=ipc` (swapchain-image fd-passing over the unix socket). Known
-gaps to wire when a display exists, all mirroring the macOS arms:
+**Phase 2b — on-screen out-of-process present + the spatial workspace (#710,
+#967) — code-complete, headless-verified; first panel run pending.** The Linux
+service now renders through the **comp_multi shared spatial surface**, the
+macOS model (#59), not a per-session target:
 
-1. **No `comp_window_xcb` comp_target** — `compositor/main/` only has
-   `comp_window_android.c` / `comp_window_macos.m`. A Linux service-owned
-   window target should reuse the Phase 1 XCB helper
-   (`comp_vk_native_window_xcb.c`).
-2. **`null_compositor_init_target_service` has no Linux arm**
-   (`null_compositor.c`, WIN32/ANDROID/MACOS only) —
-   `create_from_window` stays NULL, so the service can't own a present window.
-3. **`ipc_server_handler.c` server-side present/Kooima block is fenced
-   `XRT_OS_ANDROID || XRT_OS_MACOS`** (the `comp_multi_private.h` include and
-   the ~500-line block at 903-1394, plus sibling fence sites) — extend with
-   `XRT_OS_LINUX_DESKTOP` and mirror the APPLE `aux_vk` link in
-   `ipc/CMakeLists.txt`.
-4. The Linux service orchestrator stubs (`service_orchestrator.c:1634+`) are
-   fine for MVP (no child auto-spawn) — note they aren't even compiled on
-   Linux; `targets/service/CMakeLists.txt` has no Linux source arm and
-   `main.c`'s non-macOS path never calls them.
+1. **Service window target** — `compositor/main/comp_window_linux.{c,h}`
+   (lib `comp_linux_window`, the `comp_macos_window` twin): a
+   `comp_target_swapchain` over a service-owned **X11** window (Xorg, or
+   XWayland on a Wayland session) via `VK_KHR_xcb_surface`, fullscreened on the
+   panel's RandR monitor with the #715 EWMH recipe, with a bounded wait for the
+   WM's fullscreen geometry before the first swapchain. It owns an event thread
+   that decodes keys (as **Windows VK codes**, autorepeat dropped), buttons,
+   motion (coalesced) and wheel into a process-wide sink.
+2. **Null compositor Linux arm** — `create_from_window` / `destroy_target`
+   create that window; the panel placement rides the handle slot
+   (`struct comp_window_linux_placement`, from `xsysc->info.display_screen_*`).
+3. **Shared surface on Linux** — the former `XRT_OS_MACOS` block in
+   `comp_multi_system.c` (and the rounded-corner content pipeline) is gated on
+   `COMP_MULTI_SHARED_SURFACE` (`macOS || XRT_OS_LINUX_DESKTOP`,
+   `comp_multi_interface.h`): one window, one atlas, one DP, one present; a lone
+   IPC client with no controller is drawn flat at full display. Only the
+   visibility toggle and (Linux) OS-pointer hide are platform calls. The
+   shared DP now also takes the client's hardware 2D/3D wish (D-5 of
+   `comp-multi-one-pipeline.md`), following the focused (or lone) client, and
+   serves predicted eyes to shared-surface clients' locates.
+4. **Workspace handler arms** — every `workspace_*` arm that served macOS
+   serves `COMP_MULTI_SHARED_SURFACE` (pose, visibility, focus, chrome, cursor,
+   overlays, style, client info, exit, input grab / capture / drain), plus the
+   placed-window per-window Kooima and the legacy `device_get_view_poses`
+   routing. Controller deactivate / disconnect hides the surface and drops its
+   cursor, overlays, focus, grab and capture.
+5. **Input** — `ipc_server_linux_input.c` installs the window's sink;
+   `ipc_server_input_route()` (the #61 policy, `ipc_server_input_queue.c`)
+   feeds the per-target queues: controller always, content under the cursor
+   (pointer / motion; scroll exclusively), keys to the focused client except
+   workspace chords. `ipc_server_input_queue_push_controller_key()` lets the
+   orchestrator forward its launch hotkey (grabbed outside the window) to the
+   controller.
+6. **Wakeup event (POSIX form, proposal)** — `xrAcquireWorkspaceWakeupEventDXR`
+   returns an eventfd readable on every controller-queue push (poll + read 8
+   bytes to reset). The public header text ("non-Windows returns
+   FEATURE_UNSUPPORTED") is unchanged pending review.
 
-**Done when:** a handle/hosted app runs out-of-process against
-`displayxr-service` on Linux.
+Verified **headless** — a private `gnome-shell --headless --virtual-monitor`
+with its own XWayland, sim-display only, nothing on a real output: a forced-IPC
+hosted Vulkan cube composites through the service surface; a Vulkan controller
+probe activates the workspace, places / focuses the client (pose round-trip,
+tiled with rounded corners in the atlas), receives KEY / POINTER / MOTION
+events from synthetic X events on the surface, and wakes on the eventfd; the
+surface hides when the controller leaves. **Not yet verified:** a real panel
+(Leia DP weave of the shared atlas, lens 2D/3D), chrome / cursor / overlay
+composition from a real controller (the Linux shell port), fractional-scale
+XWayland (150 % is known to break X11 weaving), native Wayland (there is no
+xdg-shell service window yet — XWayland only), and `CLIENT_CONNECTED` /
+`FRAME_TICK` events (not emitted by the comp_multi platforms; macOS has none
+either).
+
+**Done when:** the Linux shell drives N Vulkan clients on the panel through
+`displayxr-service`.
 
 **Phase 2c — `XR_DXR_weave` present-owner engine on the service (#1699) — stages A
 and B landed.** `comp_multi_weave_linux.c` (built by default,
