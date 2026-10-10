@@ -455,6 +455,13 @@ static struct xrt_plugin_iface g_sim_display_iface = {
 
     /* ADR-051 D2: per-screen status for the dashboard (pure C, every platform). */
     .get_screen_status = sim_display_plugin_get_screen_status,
+
+/* Multi-screen M6 (GL): one GL DP per screen a spanning window covers. */
+#if !defined(XRT_OS_ANDROID) && defined(XRT_HAVE_OPENGL)
+    .create_dp_gl_for_screen = sim_display_dp_factory_gl_for_screen,
+#else
+    .create_dp_gl_for_screen = NULL,
+#endif
 };
 
 

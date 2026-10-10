@@ -1542,6 +1542,48 @@ struct xrt_plugin_iface
 	xrt_result_t (*get_screen_status)(struct xrt_plugin_instance *inst,
 	                                  uint64_t monitor_id,
 	                                  struct xrt_plugin_screen_status *out);
+
+	/*!
+	 * Create an OpenGL display processor for ONE screen this plug-in won in
+	 * the per-monitor registry (multi-screen M6, ADR-047 D2 on Windows): the
+	 * in-process GL compositor weaves a window that spans several monitors
+	 * per segment, each by its own screen's DP, into the one window
+	 * framebuffer. The GL twin of @ref create_dp_d3d11_for_screen.
+	 *
+	 * Same contract as @ref create_dp_gl (`xrt_dp_factory_gl_fn_t`) — the
+	 * compositor's GL context is CURRENT on the calling thread, and every
+	 * later call into the DP happens with that same context current — plus
+	 * everything @ref create_dp_d3d11_for_screen promises, in GL terms:
+	 *   - @p binding names the screen; never NULL.
+	 *   - @p window_handle: the session's real window (HWND) for the screen
+	 *     holding the majority of the window, NULL for every other screen's
+	 *     DP, which is windowless and gets its phase from
+	 *     @ref xrt_display_processor_gl::set_present_origin plus the canvas
+	 *     offset. A DP must weave with a NULL window.
+	 *   - @ref xrt_display_processor_gl::process_atlas gets
+	 *     `canvas = the segment` (window client-area px, TOP-LEFT origin
+	 *     like every backend), a pre-cropped `GL_TEXTURE_2D` holding exactly
+	 *     that segment's views, and the window framebuffer bound as the draw
+	 *     framebuffer with `glViewport` AND `glScissor` (GL_SCISSOR_TEST on)
+	 *     already set to the segment — in GL's BOTTOM-left framebuffer
+	 *     coordinates, i.e. y = target_height − canvas_y − canvas_height.
+	 *     The DP must keep its output inside that rect (do not reset the
+	 *     viewport to the whole target, do not disable the scissor) and must
+	 *     not assume it is the first writer to the framebuffer this frame.
+	 *   - Several instances coexist in one process, one per screen, on ONE
+	 *     GL context.
+	 *
+	 * Optional. NULL (or a plug-in whose `struct_size` predates this field)
+	 * ⟹ the plug-in's screens other than the session's primary one get a
+	 * flat 2D view. Appended per ADR-020 (append-only within a major; gated
+	 * by @ref struct_size; no XRT_PLUGIN_API_VERSION_CURRENT bump) after
+	 * @ref get_screen_status. Announced by
+	 * @ref XRT_PLUGIN_IFACE_HAS_CREATE_DP_GL_FOR_SCREEN.
+	 */
+	xrt_result_t (*create_dp_gl_for_screen)(struct xrt_plugin_instance *inst,
+	                                        void *window_handle,
+	                                        const struct xrt_screen_binding *binding,
+	                                        struct xrt_display_processor_gl **out_xdp);
 };
 
 /*!
@@ -1695,6 +1737,27 @@ xrt_plugin_iface_has_get_screen_status(const struct xrt_plugin_iface *iface)
 	       iface->struct_size >=
 	           offsetof(struct xrt_plugin_iface, get_screen_status) + sizeof(iface->get_screen_status) &&
 	       iface->get_screen_status != NULL;
+}
+
+/*!
+ * Defined when @ref xrt_plugin_iface carries @ref
+ * xrt_plugin_iface::create_dp_gl_for_screen (multi-screen M6, Windows OpenGL),
+ * so a plug-in built against an older runtime header can #ifdef-guard
+ * implementing it.
+ */
+#define XRT_PLUGIN_IFACE_HAS_CREATE_DP_GL_FOR_SCREEN 1
+
+/*!
+ * True when @p iface implements @ref xrt_plugin_iface::create_dp_gl_for_screen
+ * (and its struct_size covers the slot).
+ */
+static inline bool
+xrt_plugin_iface_has_create_dp_gl_for_screen(const struct xrt_plugin_iface *iface)
+{
+	return iface != NULL &&
+	       iface->struct_size >= offsetof(struct xrt_plugin_iface, create_dp_gl_for_screen) +
+	                                 sizeof(iface->create_dp_gl_for_screen) &&
+	       iface->create_dp_gl_for_screen != NULL;
 }
 
 /*!
