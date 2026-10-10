@@ -104,6 +104,31 @@ struct d3d11_lift_pin
 	//! (the bars) the caller weaves the 2D input FLAT, identical in every view.
 	float active[4];
 	bool valid;
+
+	/*
+	 * ADR-046 Amendment 1 (depth cursor on lifted content).
+	 */
+
+	//! The viewpoints this result was synthesized for, relative to
+	//! @c rect_center (display axes, metres; ADR-048). 0 = none known.
+	uint32_t vp_count;
+	float vps[3 * XRT_LIFT_MAX_VIEWS];
+	float rect_center[3]; //!< display space, metres
+	float rect_size[2];   //!< metres
+	//! The result's auxiliary depth on the service device (NULL = none). Its
+	//! keyed mutex is held only after d3d11_lift_pin_depth returned true.
+	ID3D11Texture2D *depth_tex;
+	IDXGIKeyedMutex *depth_km;
+	bool depth_held;
+	uint32_t depth_w, depth_h, depth_format;
+	uint32_t depth_encoding; //!< XRT_DP_LIFT_DEPTH_ENCODING_*
+	float depth_value_scale;
+	float depth_value_offset;
+	//! z in front of the screen = relief_scale / depth + relief_offset
+	//! (xrt_dp_lift_depth::relief_*); false = the module reported none.
+	bool relief_valid;
+	float relief_scale;
+	float relief_offset;
 };
 
 /*!
@@ -226,6 +251,12 @@ d3d11_lift_submit_srv_locked(struct d3d11_lift *lift,
 //! Pin the stream's latest result for a service-device read (the weave).
 bool
 d3d11_lift_pin_latest(struct d3d11_lift *lift, uint64_t owner, uint64_t id, struct d3d11_lift_pin *out);
+
+//! ADR-046 Amendment 1: also take the pinned result's depth map (its keyed
+//! mutex, without waiting). False = the result has none, or it is busy this
+//! frame. Released by d3d11_lift_unpin.
+bool
+d3d11_lift_pin_depth(struct d3d11_lift_pin *pin);
 
 void
 d3d11_lift_unpin(struct d3d11_lift_pin *pin);
