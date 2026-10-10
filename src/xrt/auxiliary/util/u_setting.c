@@ -94,6 +94,8 @@ struct entry
 static struct entry s_entries[MANAGED_COUNT];
 static char s_written[32];
 static bool s_loaded = false;
+//! The per-screen preference cache (bottom of this file) is loaded.
+static bool s_screen_loaded;
 
 #ifdef XRT_OS_WINDOWS
 static CRITICAL_SECTION s_lock;
@@ -577,6 +579,16 @@ u_setting_user_clear_all(void)
 	if (root == NULL) {
 		return false;
 	}
+	// The per-screen display-processor preferences are a display assignment,
+	// not a tuning option: `perf reset` keeps them (`dp reset --screen all`
+	// clears them).
+	cJSON *old = user_load_json();
+	cJSON *screens =
+	    old != NULL ? cJSON_DetachItemFromObjectCaseSensitive(old, U_SETTING_PER_SCREEN_JSON_KEY) : NULL;
+	cJSON_Delete(old);
+	if (screens != NULL) {
+		cJSON_AddItemToObject(root, U_SETTING_PER_SCREEN_JSON_KEY, screens);
+	}
 	bool ok = user_save_json(root);
 	cJSON_Delete(root);
 	if (ok) {
@@ -631,5 +643,453 @@ u_setting_reload(void)
 {
 	lock();
 	s_loaded = false;
+	s_screen_loaded = false;
 	unlock();
+}
+
+
+/*
+ *
+ * Per-screen display-processor preference (display dashboard phase 7).
+ *
+ */
+
+#define SCREEN_PREF_MAX 16
+#define SCREEN_ENV_MAX 1024
+
+#ifdef XRT_OS_WINDOWS
+#define SCREEN_MACHINE_KEY_PATH L"Software\\DisplayXR\\DisplayProcessors\\PreferredPlugin"
+#endif
+
+struct screen_pref
+{
+	char key[U_SETTING_SCREEN_KEY_MAX];
+	char id[SETTING_VALUE_MAX];
+};
+
+static struct screen_pref s_screen_user[SCREEN_PREF_MAX];
+static uint32_t s_screen_user_count = 0;
+static struct screen_pref s_screen_machine[SCREEN_PREF_MAX];
+static uint32_t s_screen_machine_count = 0;
+
+static bool
+str_ieq(const char *a, const char *b)
+{
+	if (a == NULL || b == NULL) {
+		return false;
+	}
+	for (; *a != '\0' && *b != '\0'; a++, b++) {
+		char ca = *a, cb = *b;
+		if (ca >= 'A' && ca <= 'Z') {
+			ca = (char)(ca - 'A' + 'a');
+		}
+		if (cb >= 'A' && cb <= 'Z') {
+			cb = (char)(cb - 'A' + 'a');
+		}
+		if (ca != cb) {
+			return false;
+		}
+	}
+	return *a == '\0' && *b == '\0';
+}
+
+static bool
+is_space(char c)
+{
+	return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+static void
+copy_trim(char *dst, size_t cap, const char *b, const char *e)
+{
+	while (b < e && is_space(*b)) {
+		b++;
+	}
+	while (e > b && is_space(e[-1])) {
+		e--;
+	}
+	size_t n = (size_t)(e - b);
+	if (n >= cap) {
+		n = cap - 1;
+	}
+	memcpy(dst, b, n);
+	dst[n] = '\0';
+}
+
+static bool
+screen_key_valid(const char *key)
+{
+	if (key == NULL || key[0] == '\0' || strlen(key) >= U_SETTING_SCREEN_KEY_MAX) {
+		return false;
+	}
+	return strchr(key, '=') == NULL && strchr(key, ';') == NULL;
+}
+
+bool
+u_setting_per_screen_env_lookup(const char *spec, const char *key, char *buf, size_t cap)
+{
+	if (spec == NULL || key == NULL || key[0] == '\0' || buf == NULL || cap == 0) {
+		return false;
+	}
+	const char *p = spec;
+	while (*p != '\0') {
+		const char *end = strchr(p, ';');
+		if (end == NULL) {
+			end = p + strlen(p);
+		}
+		// The first '=' splits: a key never contains one (refused on write).
+		const char *eq = NULL;
+		for (const char *q = p; q < end; q++) {
+			if (*q == '=') {
+				eq = q;
+				break;
+			}
+		}
+		if (eq != NULL) {
+			char k[U_SETTING_SCREEN_KEY_MAX];
+			char v[SETTING_VALUE_MAX];
+			copy_trim(k, sizeof(k), p, eq);
+			copy_trim(v, sizeof(v), eq + 1, end);
+			if (k[0] != '\0' && v[0] != '\0' && str_ieq(k, key)) {
+				snprintf(buf, cap, "%s", v);
+				return true;
+			}
+		}
+		p = (*end == ';') ? end + 1 : end;
+	}
+	return false;
+}
+
+//! The `preferred_plugin_per_screen` object of a parsed settings root, or NULL.
+static const cJSON *
+screen_object(const cJSON *root)
+{
+	if (root == NULL || !cJSON_IsObject(root)) {
+		return NULL;
+	}
+	const cJSON *o = cJSON_GetObjectItemCaseSensitive(root, U_SETTING_PER_SCREEN_JSON_KEY);
+	return cJSON_IsObject(o) ? o : NULL;
+}
+
+static bool
+screen_object_lookup(const cJSON *obj, const char *key, char *buf, size_t cap)
+{
+	if (obj == NULL || key == NULL) {
+		return false;
+	}
+	const cJSON *it = NULL;
+	cJSON_ArrayForEach(it, obj)
+	{
+		if (it->string != NULL && str_ieq(it->string, key) && cJSON_IsString(it) && it->valuestring != NULL &&
+		    it->valuestring[0] != '\0') {
+			snprintf(buf, cap, "%s", it->valuestring);
+			return true;
+		}
+	}
+	return false;
+}
+
+bool
+u_setting_per_screen_json_lookup(const char *json_text, const char *key, char *buf, size_t cap)
+{
+	if (json_text == NULL || key == NULL || key[0] == '\0' || buf == NULL || cap == 0) {
+		return false;
+	}
+	cJSON *root = cJSON_Parse(json_text);
+	const bool ok = screen_object_lookup(screen_object(root), key, buf, cap);
+	cJSON_Delete(root);
+	return ok;
+}
+
+const char *
+u_setting_per_screen_resolve(const char *key,
+                             const char *env_spec,
+                             const char *user_json,
+                             const char *machine_value,
+                             char *buf,
+                             size_t cap,
+                             enum u_setting_source *out_source)
+{
+	enum u_setting_source src = U_SETTING_SOURCE_DEFAULT;
+	const char *ret = NULL;
+	if (key != NULL && key[0] != '\0' && buf != NULL && cap > 0) {
+		if (u_setting_per_screen_env_lookup(env_spec, key, buf, cap)) {
+			src = U_SETTING_SOURCE_ENV;
+			ret = buf;
+		} else if (u_setting_per_screen_json_lookup(user_json, key, buf, cap)) {
+			src = U_SETTING_SOURCE_USER;
+			ret = buf;
+		} else if (machine_value != NULL && machine_value[0] != '\0') {
+			snprintf(buf, cap, "%s", machine_value);
+			src = U_SETTING_SOURCE_MACHINE;
+			ret = buf;
+		}
+	}
+	if (out_source != NULL) {
+		*out_source = src;
+	}
+	return ret;
+}
+
+#ifdef XRT_OS_WINDOWS
+//! Every value under the machine key, into @ref s_screen_machine. Caller holds the lock.
+static void
+screen_machine_load_locked(void)
+{
+	HKEY hk = NULL;
+	if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, SCREEN_MACHINE_KEY_PATH, 0, KEY_READ | KEY_WOW64_64KEY, &hk) !=
+	    ERROR_SUCCESS) {
+		return;
+	}
+	for (DWORD i = 0; s_screen_machine_count < SCREEN_PREF_MAX; i++) {
+		wchar_t wname[U_SETTING_SCREEN_KEY_MAX];
+		wchar_t wval[SETTING_VALUE_MAX];
+		DWORD name_len = (DWORD)(sizeof(wname) / sizeof(wname[0]));
+		DWORD val_bytes = sizeof(wval) - sizeof(wchar_t);
+		DWORD type = 0;
+		const LSTATUS rc = RegEnumValueW(hk, i, wname, &name_len, NULL, &type, (BYTE *)wval, &val_bytes);
+		if (rc == ERROR_NO_MORE_ITEMS) {
+			break;
+		}
+		if (rc != ERROR_SUCCESS || type != REG_SZ) {
+			continue; // too long, or not a string: not set
+		}
+		wval[val_bytes / sizeof(wchar_t)] = L'\0';
+		struct screen_pref *e = &s_screen_machine[s_screen_machine_count];
+		if (WideCharToMultiByte(CP_UTF8, 0, wname, -1, e->key, (int)sizeof(e->key), NULL, NULL) <= 0 ||
+		    WideCharToMultiByte(CP_UTF8, 0, wval, -1, e->id, (int)sizeof(e->id), NULL, NULL) <= 0 ||
+		    e->key[0] == '\0' || e->id[0] == '\0') {
+			continue;
+		}
+		s_screen_machine_count++;
+	}
+	RegCloseKey(hk);
+}
+#endif
+
+//! Caller holds the lock.
+static void
+screen_load_locked(void)
+{
+	if (s_screen_loaded) {
+		return;
+	}
+	s_screen_loaded = true;
+	memset(s_screen_user, 0, sizeof(s_screen_user));
+	memset(s_screen_machine, 0, sizeof(s_screen_machine));
+	s_screen_user_count = 0;
+	s_screen_machine_count = 0;
+
+	cJSON *root = user_load_json();
+	const cJSON *obj = screen_object(root);
+	const cJSON *it = NULL;
+	if (obj != NULL) {
+		cJSON_ArrayForEach(it, obj)
+		{
+			if (s_screen_user_count >= SCREEN_PREF_MAX) {
+				break;
+			}
+			if (it->string == NULL || !screen_key_valid(it->string) || !cJSON_IsString(it) ||
+			    it->valuestring == NULL || it->valuestring[0] == '\0') {
+				continue;
+			}
+			struct screen_pref *e = &s_screen_user[s_screen_user_count++];
+			snprintf(e->key, sizeof(e->key), "%s", it->string);
+			snprintf(e->id, sizeof(e->id), "%s", it->valuestring);
+		}
+	}
+	cJSON_Delete(root);
+
+#ifdef XRT_OS_WINDOWS
+	screen_machine_load_locked();
+#endif
+}
+
+static const char *
+screen_find(const struct screen_pref *arr, uint32_t n, const char *key)
+{
+	for (uint32_t i = 0; i < n; i++) {
+		if (str_ieq(arr[i].key, key)) {
+			return arr[i].id;
+		}
+	}
+	return NULL;
+}
+
+const char *
+u_setting_get_preferred_plugin_for_screen(const char *key, char *buf, size_t cap, enum u_setting_source *out_source)
+{
+	if (out_source != NULL) {
+		*out_source = U_SETTING_SOURCE_DEFAULT;
+	}
+	if (key == NULL || key[0] == '\0' || buf == NULL || cap == 0) {
+		return NULL;
+	}
+
+	// 1. The environment always wins, as for every other option.
+	char env[SCREEN_ENV_MAX];
+	if (env_get_raw(env, sizeof(env), U_SETTING_PER_SCREEN_ENV) != NULL &&
+	    u_setting_per_screen_env_lookup(env, key, buf, cap)) {
+		if (out_source != NULL) {
+			*out_source = U_SETTING_SOURCE_ENV;
+		}
+		return buf;
+	}
+
+	// 2/3. The cached stores.
+	const char *ret = NULL;
+	enum u_setting_source src = U_SETTING_SOURCE_DEFAULT;
+	lock();
+	screen_load_locked();
+	const char *user = screen_find(s_screen_user, s_screen_user_count, key);
+	const char *machine = screen_find(s_screen_machine, s_screen_machine_count, key);
+	if (user != NULL) {
+		snprintf(buf, cap, "%s", user);
+		src = U_SETTING_SOURCE_USER;
+		ret = buf;
+	} else if (machine != NULL) {
+		snprintf(buf, cap, "%s", machine);
+		src = U_SETTING_SOURCE_MACHINE;
+		ret = buf;
+	}
+	unlock();
+	if (out_source != NULL) {
+		*out_source = src;
+	}
+	return ret;
+}
+
+void
+u_setting_per_screen_reload(void)
+{
+	lock();
+	s_screen_loaded = false;
+	unlock();
+}
+
+bool
+u_setting_user_set_preferred_plugin_for_screen(const char *key, const char *plugin_id)
+{
+	if (!screen_key_valid(key) || (plugin_id != NULL && strlen(plugin_id) >= SETTING_VALUE_MAX)) {
+		return false;
+	}
+	cJSON *root = user_load_json();
+	if (root == NULL) {
+		return false;
+	}
+	cJSON *obj = cJSON_GetObjectItemCaseSensitive(root, U_SETTING_PER_SCREEN_JSON_KEY);
+	if (obj != NULL && !cJSON_IsObject(obj)) {
+		cJSON_DeleteItemFromObjectCaseSensitive(root, U_SETTING_PER_SCREEN_JSON_KEY);
+		obj = NULL;
+	}
+	const bool set = plugin_id != NULL && plugin_id[0] != '\0';
+	if (obj == NULL && set) {
+		obj = cJSON_AddObjectToObject(root, U_SETTING_PER_SCREEN_JSON_KEY);
+	}
+	if (obj != NULL) {
+		// Drop every spelling of the key, then add the new value.
+		cJSON *it = obj->child;
+		while (it != NULL) {
+			cJSON *next = it->next;
+			if (it->string != NULL && str_ieq(it->string, key)) {
+				cJSON_Delete(cJSON_DetachItemViaPointer(obj, it));
+			}
+			it = next;
+		}
+		if (set) {
+			cJSON_AddStringToObject(obj, key, plugin_id);
+		} else if (obj->child == NULL) {
+			cJSON_DeleteItemFromObjectCaseSensitive(root, U_SETTING_PER_SCREEN_JSON_KEY);
+		}
+	}
+	const bool ok = user_save_json(root);
+	cJSON_Delete(root);
+	if (ok) {
+		u_setting_per_screen_reload();
+	}
+	return ok;
+}
+
+bool
+u_setting_user_clear_preferred_plugin_per_screen(void)
+{
+	cJSON *root = user_load_json();
+	if (root == NULL) {
+		return false;
+	}
+	if (cJSON_GetObjectItemCaseSensitive(root, U_SETTING_PER_SCREEN_JSON_KEY) == NULL) {
+		cJSON_Delete(root);
+		return true; // nothing to do: do not touch the file
+	}
+	cJSON_DeleteItemFromObjectCaseSensitive(root, U_SETTING_PER_SCREEN_JSON_KEY);
+	const bool ok = user_save_json(root);
+	cJSON_Delete(root);
+	if (ok) {
+		u_setting_per_screen_reload();
+	}
+	return ok;
+}
+
+enum u_setting_write_result
+u_setting_machine_set_preferred_plugin_for_screen(const char *key, const char *plugin_id)
+{
+#ifdef XRT_OS_WINDOWS
+	if (key == NULL) {
+		// Every machine-tier preference: the whole subkey.
+		const LSTATUS rc = RegDeleteKeyExW(HKEY_LOCAL_MACHINE, SCREEN_MACHINE_KEY_PATH, KEY_WOW64_64KEY, 0);
+		if (rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND) {
+			u_setting_per_screen_reload();
+			return U_SETTING_WRITE_OK;
+		}
+		return rc == ERROR_ACCESS_DENIED ? U_SETTING_WRITE_DENIED : U_SETTING_WRITE_FAILED;
+	}
+	if (!screen_key_valid(key) || (plugin_id != NULL && strlen(plugin_id) >= SETTING_VALUE_MAX)) {
+		return U_SETTING_WRITE_FAILED;
+	}
+	wchar_t wkey[U_SETTING_SCREEN_KEY_MAX];
+	if (MultiByteToWideChar(CP_UTF8, 0, key, -1, wkey, (int)(sizeof(wkey) / sizeof(wkey[0]))) <= 0) {
+		return U_SETTING_WRITE_FAILED;
+	}
+	const bool set = plugin_id != NULL && plugin_id[0] != '\0';
+	HKEY hk = NULL;
+	LSTATUS rc;
+	if (set) {
+		// 64-bit view, matching every HKLM\Software\DisplayXR reader.
+		rc = RegCreateKeyExW(HKEY_LOCAL_MACHINE, SCREEN_MACHINE_KEY_PATH, 0, NULL, 0,
+		                     KEY_SET_VALUE | KEY_WOW64_64KEY, NULL, &hk, NULL);
+	} else {
+		rc =
+		    RegOpenKeyExW(HKEY_LOCAL_MACHINE, SCREEN_MACHINE_KEY_PATH, 0, KEY_SET_VALUE | KEY_WOW64_64KEY, &hk);
+		if (rc == ERROR_FILE_NOT_FOUND) {
+			return U_SETTING_WRITE_OK; // nothing to clear
+		}
+	}
+	if (rc != ERROR_SUCCESS) {
+		return rc == ERROR_ACCESS_DENIED ? U_SETTING_WRITE_DENIED : U_SETTING_WRITE_FAILED;
+	}
+	if (set) {
+		wchar_t wid[SETTING_VALUE_MAX];
+		if (MultiByteToWideChar(CP_UTF8, 0, plugin_id, -1, wid, (int)(sizeof(wid) / sizeof(wid[0]))) <= 0) {
+			RegCloseKey(hk);
+			return U_SETTING_WRITE_FAILED;
+		}
+		rc = RegSetValueExW(hk, wkey, 0, REG_SZ, (const BYTE *)wid,
+		                    (DWORD)((wcslen(wid) + 1) * sizeof(wchar_t)));
+	} else {
+		rc = RegDeleteValueW(hk, wkey);
+		if (rc == ERROR_FILE_NOT_FOUND) {
+			rc = ERROR_SUCCESS;
+		}
+	}
+	RegCloseKey(hk);
+	if (rc != ERROR_SUCCESS) {
+		return rc == ERROR_ACCESS_DENIED ? U_SETTING_WRITE_DENIED : U_SETTING_WRITE_FAILED;
+	}
+	u_setting_per_screen_reload();
+	return U_SETTING_WRITE_OK;
+#else
+	(void)key;
+	(void)plugin_id;
+	return U_SETTING_WRITE_UNSUPPORTED;
+#endif
 }
