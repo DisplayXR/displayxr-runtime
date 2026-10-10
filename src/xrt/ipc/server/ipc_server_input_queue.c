@@ -14,6 +14,12 @@
 #include <pthread.h>
 #include <string.h>
 
+#ifdef XRT_OS_LINUX_DESKTOP
+#include <sys/eventfd.h>
+#include <stdint.h>
+#include <unistd.h>
+#endif
+
 // Power-of-two ring so head/tail wrap with a mask. Sized well above a frame's
 // worth of events at 60 Hz; on overflow the oldest event is overwritten.
 #define INPUT_QUEUE_CAPACITY 128
@@ -74,6 +80,40 @@ find_or_add_locked(void *target)
 	return NULL;
 }
 
+#ifdef XRT_OS_LINUX_DESKTOP
+//! Controller wakeup (xrAcquireWorkspaceWakeupEventDXR, POSIX form): an eventfd
+//! the server keeps for its lifetime; every controller-queue push makes it
+//! readable. -1 until first acquired. Guarded by g_lock.
+static int g_wakeup_fd = -1;
+
+int
+ipc_server_input_queue_get_wakeup_fd(void)
+{
+	pthread_mutex_lock(&g_lock);
+	if (g_wakeup_fd < 0) {
+		g_wakeup_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+	}
+	int fd = g_wakeup_fd;
+	pthread_mutex_unlock(&g_lock);
+	return fd;
+}
+
+//! Caller holds g_lock.
+static void
+signal_wakeup_locked(void)
+{
+	if (g_wakeup_fd >= 0) {
+		uint64_t one = 1;
+		// EAGAIN only when the counter is saturated — already signalled.
+		(void)!write(g_wakeup_fd, &one, sizeof(one));
+	}
+}
+#else
+static inline void
+signal_wakeup_locked(void)
+{}
+#endif
+
 void
 ipc_server_input_queue_push(void *target, const struct ipc_workspace_input_event *event)
 {
@@ -95,6 +135,9 @@ ipc_server_input_queue_push(void *target, const struct ipc_workspace_input_event
 		} else {
 			// Full: the write above clobbered the oldest slot, advance tail too.
 			q->tail++;
+		}
+		if (q->target == IPC_INPUT_TARGET_CONTROLLER) {
+			signal_wakeup_locked();
 		}
 	}
 	pthread_mutex_unlock(&g_lock);
