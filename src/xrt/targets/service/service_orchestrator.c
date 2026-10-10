@@ -1054,11 +1054,18 @@ workspace_watch_thread_func(LPVOID param)
 	return (DWORD)(uintptr_t)u_crash_guard_run("workspace_watch_thread_func", workspace_watch_thread_body_adapter, (void *)param);
 }
 
-#elif defined(XRT_OS_MACOS)
+#elif defined(XRT_OS_MACOS) || defined(XRT_OS_LINUX_DESKTOP)
 
 /*
  *
- * macOS orchestrator — auto-spawn + crash-respawn the workspace controller.
+ * macOS / desktop-Linux orchestrator — auto-spawn + crash-respawn the
+ * workspace controller.
+ *
+ * Linux reuses the macOS posix_spawn + waitpid-watcher model unchanged and adds
+ * the launch hotkey (service_hotkey_linux.c: GNOME Shell extension keybinding,
+ * X11 root grab fallback), the DISPLAYXR_WORKSPACE_HOTKEY advisory and a reaper
+ * for fire-and-forget action children. Every Linux-only piece below sits in an
+ * XRT_OS_LINUX_DESKTOP block, so the macOS build is unchanged.
  *
  * Pieces 1+2 of the macOS spatial-shell port (#61): discover a registered
  * workspace controller (cross-platform service_workspace_registry), posix_spawn
@@ -1082,6 +1089,11 @@ workspace_watch_thread_func(LPVOID param)
 #include <errno.h>
 
 extern char **environ;
+
+#ifdef XRT_OS_LINUX_DESKTOP
+#include "service_hotkey_linux.h"
+#include <stdio.h>
+#endif
 
 
 /*
@@ -1170,9 +1182,15 @@ detect_workspace_controller(const struct service_config *cfg)
 	struct workspace_controller_entry entries[WORKSPACE_REGISTRY_MAX_ENTRIES];
 	int n = service_workspace_registry_enumerate(entries, WORKSPACE_REGISTRY_MAX_ENTRIES);
 	if (n <= 0) {
+#ifdef XRT_OS_LINUX_DESKTOP
+		OW("No workspace controllers registered "
+		   "($XDG_DATA_HOME/DisplayXR/WorkspaceControllers, /usr/local/share/displayxr/WorkspaceControllers, "
+		   "/usr/share/displayxr/WorkspaceControllers empty); running in standalone-platform mode");
+#else
 		OW("No workspace controllers registered "
 		   "(~/Library/Application Support/DisplayXR/WorkspaceControllers empty); "
 		   "running in standalone-platform mode");
+#endif
 		return;
 	}
 
@@ -1220,7 +1238,18 @@ build_child_envp(void)
 		}
 	}
 
+#ifdef XRT_OS_LINUX_DESKTOP
+	// Advisory, for the controller (Windows parity): the combo that summons
+	// it, unset when there is none. Replaces any inherited value.
+	static char hotkey_var[sizeof("DISPLAYXR_WORKSPACE_HOTKEY=") + SERVICE_HOTKEY_MAX];
+	const bool have_hotkey = s_launch.has_hotkey && s_launch.hotkey_text[0] != '\0';
+	if (have_hotkey) {
+		snprintf(hotkey_var, sizeof(hotkey_var), "DISPLAYXR_WORKSPACE_HOTKEY=%s", s_launch.hotkey_text);
+	}
+	int extra = (have_session ? 0 : 1) + (have_hotkey ? 1 : 0);
+#else
 	int extra = have_session ? 0 : 1;
+#endif
 	char **envp = (char **)malloc(sizeof(char *) * (size_t)(count + extra + 1));
 	if (envp == NULL) {
 		return NULL;
@@ -1228,11 +1257,21 @@ build_child_envp(void)
 
 	int i = 0;
 	for (char **e = environ; *e != NULL; e++) {
+#ifdef XRT_OS_LINUX_DESKTOP
+		if (strncmp(*e, "DISPLAYXR_WORKSPACE_HOTKEY=", 27) == 0) {
+			continue;
+		}
+#endif
 		envp[i++] = *e;
 	}
 	if (!have_session) {
 		envp[i++] = (char *)session_var;
 	}
+#ifdef XRT_OS_LINUX_DESKTOP
+	if (have_hotkey) {
+		envp[i++] = hotkey_var;
+	}
+#endif
 	envp[i] = NULL;
 	return envp;
 }
@@ -1411,6 +1450,61 @@ apply_workspace_mode(enum service_child_mode mode)
 	}
 }
 
+#ifdef XRT_OS_LINUX_DESKTOP
+/*!
+ * Push the active controller's launch combo to the hotkey backend: armed only
+ * while a controller is registered, its mode is not disabled and it has a
+ * hotkey (Windows parity: no controller, no grab). Unlike Windows (#344) the
+ * grab stays armed while the controller runs: a Wayland client cannot grab a
+ * chord, so a running controller learns of presses from the extension's
+ * `Activated` signal instead (see the registration spec, Linux section).
+ */
+static void
+rearm_hotkey(void)
+{
+	pthread_mutex_lock(&s_lock);
+	const bool armed = s_workspace_available && s_launch.mode != SERVICE_CHILD_DISABLE && s_launch.has_hotkey;
+	char combo[SERVICE_HOTKEY_MAX];
+	snprintf(combo, sizeof(combo), "%s", armed ? s_launch.hotkey_text : "");
+	pthread_mutex_unlock(&s_lock);
+	service_hotkey_linux_arm(combo);
+}
+
+//! Hotkey worker thread: a press of the launch combo.
+static void
+hotkey_activated(void)
+{
+	pthread_mutex_lock(&s_lock);
+	const bool available = s_workspace_available;
+	const enum service_child_mode mode = s_launch.mode;
+	const bool running = s_workspace_running;
+	pthread_mutex_unlock(&s_lock);
+
+	if (!available || mode == SERVICE_CHILD_DISABLE) {
+		return;
+	}
+	if (running) {
+		// The controller owns its dismiss: it sees the same press through the
+		// extension's Activated signal.
+		OL(U_LOGGING_INFO, "Launch hotkey: workspace controller already running");
+		return;
+	}
+	spawn_workspace();
+}
+
+//! Reap one fire-and-forget child (dispatch_controller_action) so it never
+//! lingers as a zombie. The controller itself is reaped by the watcher only.
+static void *
+reap_child_thread(void *p)
+{
+	pid_t pid = (pid_t)(intptr_t)p;
+	int status = 0;
+	while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+	}
+	return NULL;
+}
+#endif
+
 
 /*
  *
@@ -1442,6 +1536,10 @@ service_orchestrator_init(const struct service_config *cfg)
 	refresh_launch_settings();
 
 	apply_workspace_mode(s_launch.mode);
+#ifdef XRT_OS_LINUX_DESKTOP
+	service_hotkey_linux_start(hotkey_activated);
+	rearm_hotkey();
+#endif
 	return true;
 }
 
@@ -1467,11 +1565,20 @@ service_orchestrator_apply_config(const struct service_config *cfg)
 	if (new_mode != old_mode) {
 		apply_workspace_mode(new_mode);
 	}
+#ifdef XRT_OS_LINUX_DESKTOP
+	// Linux: a changed combo / mode / selection re-arms the grab. Never
+	// restarts a running controller.
+	rearm_hotkey();
+#endif
 }
 
 void
 service_orchestrator_shutdown(void)
 {
+#ifdef XRT_OS_LINUX_DESKTOP
+	// First, so no press spawns a controller during teardown.
+	service_hotkey_linux_stop();
+#endif
 	pthread_mutex_lock(&s_lock);
 	s_shutting_down = true;
 	bool join = s_watch_started;
@@ -1513,6 +1620,9 @@ service_orchestrator_refresh_workspace_controller(void)
 	if (was_available != s_workspace_available) {
 		apply_workspace_mode(s_launch.mode);
 	}
+#ifdef XRT_OS_LINUX_DESKTOP
+	rearm_hotkey();
+#endif
 }
 
 const char *
@@ -1555,6 +1665,12 @@ service_orchestrator_dispatch_controller_action(const char *action_name)
 
 	// Fire-and-forget — the controller is responsible for singleton forwarding.
 	// Detach so the child never becomes a zombie (we never waitpid it here).
+#ifdef XRT_OS_LINUX_DESKTOP
+	pthread_t reaper;
+	if (pthread_create(&reaper, NULL, reap_child_thread, (void *)(intptr_t)pid) == 0) {
+		pthread_detach(reaper);
+	}
+#endif
 	OW("Dispatched controller action: %s --workspace-action %s", s_workspace_active.binary,
 	   action_name);
 }
@@ -1607,9 +1723,16 @@ service_orchestrator_request_launch(const char *controller_id)
 bool
 service_orchestrator_request_hotkey_suspend(bool suspend)
 {
+#ifdef XRT_OS_LINUX_DESKTOP
+	// The grab (extension keybinding or X11 root grab) comes out / goes back;
+	// 60 s safety timeout as on Windows.
+	service_hotkey_linux_suspend(suspend);
+	return true;
+#else
 	// No service-owned global hotkey hook on macOS: nothing to take out.
 	(void)suspend;
 	return true;
+#endif
 }
 
 const char *
@@ -1624,9 +1747,9 @@ service_orchestrator_get_workspace_mode(void)
 	return s_launch.mode;
 }
 
-#else // !XRT_OS_WINDOWS && !XRT_OS_MACOS
+#else // !XRT_OS_WINDOWS && !XRT_OS_MACOS && !XRT_OS_LINUX_DESKTOP
 
-// Stubs for other platforms (Linux, Android)
+// Stubs for other platforms (Android)
 
 bool
 service_orchestrator_init(const struct service_config *cfg)
