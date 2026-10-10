@@ -61,8 +61,12 @@ set(DISPLAYXR_EXTENSIONS_INCLUDE_DIR "${_dxr_ext_includes}" CACHE PATH
 FetchContent_Declare(
     displayxr_common
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    GIT_TAG v2.0.0
-    GIT_SHALLOW TRUE
+    # displayxr-common#73 (mode_switch.h header-only + ModeSwitch::step(), the
+    # one-call smooth 2D<->3D sequencer every platform's apps use). DRAFT pin to
+    # the PR commit: re-pin to the release tag that carries it before merging
+    # (a SHA cannot be fetched shallow, hence GIT_SHALLOW FALSE).
+    GIT_TAG 5d71fdb9008055c07522e6bab9fbae40cf1b260f
+    GIT_SHALLOW FALSE
 )
 FetchContent_MakeAvailable(displayxr_common)
 

@@ -40,7 +40,8 @@
 // stb_image implementation TU lives in displayxr::common (stb_image_impl_macos.cpp) — declarations only here (#396 W4).
 #include "stb_image.h"
 #include "view_params.h"
-#include "mode_switch.h" // dxr::ModeSwitch — smooth 2D<->3D disparity ramp (inline on macOS)
+#include "mode_switch.h" // dxr::ModeSwitch — smooth 2D<->3D disparity ramp (step() per frame)
+#include "mode_switch_test_knob.h" // DXR_TEST_MODE_TOGGLE_S scripted toggles + ramp trace
 #include "rig_mode.h"
 #include "atlas_capture.h"
 #include "xr_window_space_hud.h"
@@ -762,10 +763,12 @@ struct InputState {
 // Cube test apps start with the WSUI HUD hidden — it skews perf comparisons
 // against HUD-less apps (avatar, Unity). Shift+Tab shows it when wanted.
 static InputState g_input = [] { InputState s; s.hudVisible = false; return s; }();
-// Smooth 2D<->3D disparity ramp, driven inline (macOS has its own AppXrSession/
-// InputState, not the Windows-only XrSessionManager helper).
+// Smooth 2D<->3D disparity ramp (displayxr-common mode_switch.h). macOS has its
+// own AppXrSession/InputState, not the Windows-only XrSessionManager, so it calls
+// the platform-neutral dxr::ModeSwitch::step() directly (defaults: 0.18 s).
 static dxr::ModeSwitch g_modeSwitch;
-static bool g_modeSwitchConfigured = false;
+// DXR_TEST_MODE_TOGGLE_S: scripted 3D<->2D toggles + per-frame ramp trace.
+static dxr_test::ModeSwitchToggleKnob g_modeSwitchKnob;
 static const float CAMERA_HALF_TAN_VFOV = 0.32491969623f; // tan(18deg) -> 36deg vFOV
 
 // HUD window-space layer (XR_EXT_window_space_layer): replaces the legacy
@@ -1930,48 +1933,37 @@ int main(int argc, char **argv)
             }
         }
 
-        // Rendering mode requests (V=cycle next, 0-8=jump absolute) through the
-        // dxr::ModeSwitch sequencer: it eases g_input.viewParams.ipdFactor around
-        // the switch and fires xrRequestDisplayRenderingModeDXR on the right frame.
-        // The runtime owns the current mode; the XrEventDataRenderingModeChangedDXR
-        // event updates app.currentModeIndex (render paths + HUD read it directly).
-        if (!g_modeSwitchConfigured) {
-            g_modeSwitch.configure(0.18f, dxr::ModeSwitchEasing::SmoothStep);
-            g_modeSwitchConfigured = true;
-        }
+        // Rendering mode requests (V=cycle next, 0-8=jump absolute) go through
+        // displayxr-common's dxr::ModeSwitch::step() — the same sequencer the
+        // Windows apps drive via XrSessionUpdateModeSwitch: it eases
+        // g_input.viewParams.ipdFactor around the switch and says on which frame
+        // to call xrRequestDisplayRenderingModeDXR (README "Smooth 2D<->3D
+        // transitions"). The runtime owns the current mode; the
+        // XrEventDataRenderingModeChangedDXR event updates app.currentModeIndex.
         {
-            const float steady = g_input.viewParams.steadyIpdFactor;
-            auto vcOf = [&](uint32_t m) -> uint32_t {
-                return (m < app.renderingModeCount && app.renderingModeViewCounts[m] > 0)
-                           ? app.renderingModeViewCounts[m] : 1;
-            };
-            int32_t target = -1;
+            int32_t want = -1;
             if (g_input.cycleRenderingModeRequested) {
                 g_input.cycleRenderingModeRequested = false;
-                if (app.renderingModeCount > 0)
-                    target = (int32_t)((app.currentModeIndex + 1) % app.renderingModeCount);
+                want = dxr::ModeSwitch::cycleTarget(app.currentModeIndex, app.renderingModeCount);
             }
             if (g_input.absoluteRenderingModeRequested >= 0) {
-                int32_t a = g_input.absoluteRenderingModeRequested;
+                want = g_input.absoluteRenderingModeRequested;
                 g_input.absoluteRenderingModeRequested = -1;
-                if ((uint32_t)a < app.renderingModeCount) target = a;
             }
-            if (target >= 0 && app.session != XR_NULL_HANDLE && app.pfnRequestDisplayRenderingModeEXT) {
-                const float curIpd = g_modeSwitch.active() ? g_modeSwitch.ipd() : steady;
-                g_modeSwitch.request((uint32_t)target, vcOf((uint32_t)target),
-                                     app.currentModeIndex, vcOf(app.currentModeIndex),
-                                     curIpd, steady);
-            }
-            if (g_modeSwitch.active()) {
-                float ipd = steady; bool fire = false; uint32_t mode = app.currentModeIndex;
-                g_modeSwitch.update(dt, &ipd, &fire, &mode);
-                g_input.viewParams.ipdFactor = ipd;
-                if (fire && mode != app.currentModeIndex && app.session != XR_NULL_HANDLE &&
-                    app.pfnRequestDisplayRenderingModeEXT)
-                    app.pfnRequestDisplayRenderingModeEXT(app.session, mode);
-            } else {
-                g_input.viewParams.ipdFactor = steady;
-            }
+            const int32_t knob = g_modeSwitchKnob.poll(dt, app.currentModeIndex, app.renderingModeCount,
+                                                       app.renderingModeViewCounts);
+            if (knob >= 0) want = knob;
+            const bool canRequest = app.session != XR_NULL_HANDLE && app.pfnRequestDisplayRenderingModeEXT;
+            const bool wasActive = g_modeSwitch.active();
+            const dxr::ModeSwitchFrame f = g_modeSwitch.step(
+                dt, canRequest ? want : -1, app.renderingModeCount, app.renderingModeViewCounts,
+                app.currentModeIndex, g_input.viewParams.steadyIpdFactor);
+            g_input.viewParams.ipdFactor = f.ipd;
+            if (f.fire && canRequest)
+                app.pfnRequestDisplayRenderingModeEXT(app.session, f.mode);
+            if (g_modeSwitchKnob.tracing() && (wasActive || g_modeSwitch.active()))
+                LOG_INFO("ModeSwitch trace: dt=%.4f ipd=%.4f fire=%d mode=%u current=%u", dt, f.ipd,
+                         (int)f.fire, f.mode, app.currentModeIndex);
         }
 
         UpdateCameraMovement(g_input, dt, app.displayHeightM);

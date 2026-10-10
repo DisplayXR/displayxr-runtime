@@ -53,6 +53,7 @@ JVM_EXTS = {".java", ".kt"}
 RULES = {
     "F-1": "Run the frame loop from READY, gated on a 'session running' flag (not SYNCHRONIZED+); a compliant runtime only leaves READY on your first xrBeginFrame, so a SYNCHRONIZED+ gate deadlocks (black screen).",
     "INV-2.8": "Apps requesting MANUAL eye tracking SHOULD handle XrEventDataEyeTrackingStateChangedDXR (tracking loss is the app's problem in MANUAL).",
+    "INV-2.9": "Apps that request rendering modes SHOULD ease the switch through displayxr-common's dxr::ModeSwitch (step() per frame, or XrSessionUpdateModeSwitch on Windows): the runtime switches in one frame and never ramps the disparity, so a direct xrRequestDisplayRenderingModeDXR on a key press snaps between full parallax and flat. Checked per leg.",
     "INV-3.1": "An N-view app BEGINS XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR (when enumerated; needs XR_DXR_display_info), locates into an XRT_MAX_VIEWS (8)-wide buffer and submits the active mode's viewCount. A stereo-fixed app stays on PRIMARY_STEREO and receives exactly 2. Deriving eyeCount from the rendering mode's viewCount without the opt-in is an error: PRIMARY_STEREO reports 2 and rejects viewCount>2.",
     "INV-3.4": "A projection layer carries the LOCATED view count (what xrLocateViews returned), for every view configuration type. Render only the active mode's views, then alias the inactive tail [active, located) onto view 0's subImage keeping each view's own located pose/fov (DxrAliasInactiveViews in dxr_view_config.h: test_apps/common in-tree, displayxr-common outside). Checked per leg: every platform directory of a multi-leg app must call it itself. Submitting the ACTIVE count is under-submit and xrEndFrame now refuses it (ADR-041). A 3D zone layer is a projection layer and obeys the same rule.",
     "INV-4.3": "Per-tile render size = window/canvas x scaleXY, never display size.",
@@ -664,6 +665,61 @@ def check_manual_tracking_event(root: Path, findings: list):
         ))
 
 
+# INV-2.9: a call (not a typedef / PFN declaration / string) of the rendering-mode
+# request, directly or through a function pointer whose name says so.
+MODE_REQUEST_CALL_RE = re.compile(r"\b\w*RequestDisplayRenderingMode\w*\s*\(\s*\w")
+MODE_REQUEST_DECL_RE = re.compile(r"\bPFN_\w*RequestDisplayRenderingMode|XRAPI_\w+\s+\w*RequestDisplayRenderingMode")
+MODE_SWITCH_HELPER_RE = re.compile(r"\bModeSwitch\b|\bXrSessionUpdateModeSwitch\b|mode_switch\.h")
+
+
+def check_mode_switch_easing(root: Path, findings: list):
+    """INV-2.9 (advisory) — ease rendering-mode switches through dxr::ModeSwitch.
+
+    The runtime switches a rendering mode in one frame (atlas recipe, DP weave
+    choice, lens) and never eases the disparity — that is app content. So a leg
+    that requests modes but never references the shared sequencer snaps on
+    every V press. Per leg (LEG_DIRS), because the Windows leg routing through
+    XrSessionUpdateModeSwitch says nothing about a hand-written macOS leg.
+    """
+    first_call = {}  # leg -> (path, line)
+    eased = set()
+    for p in sorted(root.rglob("*")):
+        if p.suffix.lower() not in SOURCE_EXTS or not p.is_file():
+            continue
+        if any(part in EXCLUDE_DIRS for part in p.relative_to(root).parts[:-1]):
+            continue
+        try:
+            text = strip_comments(p.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+        leg = leg_of(p, root)
+        if MODE_SWITCH_HELPER_RE.search(text):
+            eased.add(leg)
+        if leg in first_call:
+            continue
+        for m in MODE_REQUEST_CALL_RE.finditer(text):
+            line_start = text.rfind("\n", 0, m.start()) + 1
+            line_end = text.find("\n", m.start())
+            line_text = text[line_start:line_end if line_end >= 0 else len(text)]
+            if MODE_REQUEST_DECL_RE.search(line_text) or "GetInstanceProcAddr" in line_text:
+                continue
+            first_call[leg] = (rel(p, root), text.count("\n", 0, m.start()) + 1)
+            break
+
+    for leg, (path, line) in sorted(first_call.items()):
+        if leg in eased:
+            continue
+        findings.append(Finding(
+            WARN, "INV-2.9", path, line,
+            f"{'Leg ' + repr(leg) + ' requests' if leg else 'App requests'} rendering modes but never "
+            "uses dxr::ModeSwitch — every switch snaps between full parallax and flat.",
+            "Route V / 0-8 requests through displayxr-common mode_switch.h: call "
+            "g_modeSwitch.step(dt, want, modeCount, modeViewCounts, currentMode, steadyIpd) every frame, "
+            "submit f.ipd as the rig ipdFactor and request f.mode when f.fire (Windows "
+            "XrSessionManager apps: XrSessionUpdateModeSwitch).",
+        ))
+
+
 # INV-4.9: the two sides of the correlation.
 #   - the app opts INTO the Khronos extension (macro or the literal name), and
 #   - it reallocates a swapchain in the region that HANDLES the event.
@@ -1141,6 +1197,7 @@ def main(argv=None) -> int:
     scan_manifests(root, findings)
     check_mcp_pairing(root, findings)
     check_manual_tracking_event(root, findings)
+    check_mode_switch_easing(root, findings)
     check_views_change_realloc(root, findings)
     check_android(root, findings)
     findings = dedupe(findings)
