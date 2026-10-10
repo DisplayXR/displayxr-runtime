@@ -238,3 +238,8 @@ jobs:
         # would have caught the gauss demo's Android leg preferring UNORM after
         # #1589 made UNORM swapchains linear.
         run: python3 scripts/tests/test_check_displayxr_app_color.py
+
+      - name: App-linter INV-2.9 mode-switch easing unit tests
+        # Hermetic. Pins the per-leg "requests modes but never uses dxr::ModeSwitch"
+        # check: the runtime never eases a 2D<->3D switch, the app must.
+        run: python3 scripts/tests/test_check_displayxr_app_mode_switch.py

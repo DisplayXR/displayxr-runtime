@@ -58,6 +58,8 @@
 #include <unistd.h>
 
 #include "view_params.h"
+#include "mode_switch.h" // dxr::ModeSwitch — smooth 2D<->3D disparity ramp (step() per frame)
+#include "mode_switch_test_knob.h" // DXR_TEST_MODE_TOGGLE_S scripted toggles + ramp trace
 #include "rig_mode.h"
 #include "projection_depth.h"
 #include "atlas_capture.h"
@@ -216,6 +218,12 @@ static NSView *g_metalView = nil;
 // Cube test apps start with the WSUI HUD hidden — it skews perf comparisons
 // against HUD-less apps (avatar, Unity). Shift+Tab shows it when wanted.
 static InputState g_input = [] { InputState s; s.hudVisible = false; return s; }();
+// Smooth 2D<->3D transition (displayxr-common mode_switch.h): a normalised
+// 0..1 disparity scale applied to every rig's ipdFactor (see the main loop).
+static dxr::ModeSwitch g_modeSwitch;
+static float g_modeRamp = 1.0f;
+// DXR_TEST_MODE_TOGGLE_S: scripted 3D<->2D toggles + per-frame ramp trace.
+static dxr_test::ModeSwitchToggleKnob g_modeSwitchKnob;
 static const float CAMERA_HALF_TAN_VFOV = 0.32491969623f; // tan(18°) → 36° vFOV
 
 // Borderless fullscreen state
@@ -3432,7 +3440,7 @@ static void RenderZonesFrame(AppXrSession& xr, VkRenderer& renderer, const XrFra
         rigStructs[zi] = {XR_TYPE_DISPLAY_RIG_DXR};
         rigStructs[zi].pose = {{0, 0, 0, 1}, {0, 0, 0}};
         rigStructs[zi].virtualDisplayHeight = kZoneVirtualDisplayHeight;
-        rigStructs[zi].ipdFactor = z.ipdFactor;
+        rigStructs[zi].ipdFactor = z.ipdFactor * g_modeRamp;
         rigStructs[zi].parallaxFactor = 1.0f;
         rigStructs[zi].perspectiveFactor = z.perspectiveFactor;
 
@@ -3816,26 +3824,39 @@ int main() {
         if (vkRenderer.cubeRotation > 2.0f * 3.14159265f)
             vkRenderer.cubeRotation -= 2.0f * 3.14159265f;
 
-        // Handle rendering mode requests (V=cycle next, 0-8=jump absolute).
-        // Single source of truth: the runtime owns the current mode. Keypresses
-        // are REQUESTS — we call xrRequestDisplayRenderingModeDXR and let the
-        // XrEventDataRenderingModeChangedDXR event update xr.currentModeIndex.
-        // Render paths and HUD read xr.currentModeIndex directly.
-        if (g_input.cycleRenderingModeRequested) {
-            g_input.cycleRenderingModeRequested = false;
-            if (xr.pfnRequestDisplayRenderingModeEXT && xr.session != XR_NULL_HANDLE &&
-                xr.renderingModeCount > 0) {
-                uint32_t next = (xr.currentModeIndex + 1) % xr.renderingModeCount;
-                xr.pfnRequestDisplayRenderingModeEXT(xr.session, next);
+        // Rendering mode requests (V=cycle next, 0-8=jump absolute) go through
+        // displayxr-common's dxr::ModeSwitch::step() (README "Smooth 2D<->3D
+        // transitions"). Zones carry their own ipdFactor (zone A 1.0, zone B
+        // 0.6) on top of the user-tuned main rig, so the sequencer runs as a
+        // normalised SCALE (steadyIpd = 1): g_modeRamp multiplies every rig's
+        // ipdFactor below. The runtime owns the current mode; the
+        // XrEventDataRenderingModeChangedDXR event updates xr.currentModeIndex.
+        {
+            int32_t want = -1;
+            if (g_input.cycleRenderingModeRequested) {
+                g_input.cycleRenderingModeRequested = false;
+                want = dxr::ModeSwitch::cycleTarget(xr.currentModeIndex, xr.renderingModeCount);
             }
-        }
-        if (g_input.absoluteRenderingModeRequested >= 0) {
-            uint32_t target = (uint32_t)g_input.absoluteRenderingModeRequested;
-            g_input.absoluteRenderingModeRequested = -1;
-            if (xr.pfnRequestDisplayRenderingModeEXT && xr.session != XR_NULL_HANDLE &&
-                target < xr.renderingModeCount) {
-                xr.pfnRequestDisplayRenderingModeEXT(xr.session, target);
+            if (g_input.absoluteRenderingModeRequested >= 0) {
+                want = g_input.absoluteRenderingModeRequested;
+                g_input.absoluteRenderingModeRequested = -1;
             }
+            if (xr.sessionRunning) {
+                const int32_t knob = g_modeSwitchKnob.poll(deltaTime, xr.currentModeIndex, xr.renderingModeCount,
+                                                           xr.renderingModeViewCounts);
+                if (knob >= 0) want = knob;
+            }
+            const bool canRequest = xr.session != XR_NULL_HANDLE && xr.pfnRequestDisplayRenderingModeEXT;
+            const bool wasActive = g_modeSwitch.active();
+            const dxr::ModeSwitchFrame f = g_modeSwitch.step(
+                deltaTime, canRequest ? want : -1, xr.renderingModeCount, xr.renderingModeViewCounts,
+                xr.currentModeIndex, 1.0f);
+            g_modeRamp = f.ipd;
+            if (f.fire && canRequest)
+                xr.pfnRequestDisplayRenderingModeEXT(xr.session, f.mode);
+            if (g_modeSwitchKnob.tracing() && (wasActive || g_modeSwitch.active()))
+                LOG_INFO("ModeSwitch trace: dt=%.4f ramp=%.4f fire=%d mode=%u current=%u", deltaTime, f.ipd,
+                         (int)f.fire, f.mode, xr.currentModeIndex);
         }
 
         // Handle eye tracking mode toggle (T key)
@@ -3953,7 +3974,7 @@ int main() {
                         rigPose.position = {g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ};
                         if (rigCamera) {
                             cameraRig.pose = rigPose;
-                            cameraRig.ipdFactor = g_input.viewParams.ipdFactor;
+                            cameraRig.ipdFactor = g_input.viewParams.ipdFactor * g_modeRamp;
                             cameraRig.parallaxFactor = g_input.viewParams.parallaxFactor;
                             cameraRig.convergenceDiopters = g_input.viewParams.invConvergenceDistance;
                             cameraRig.verticalFov =
@@ -3964,7 +3985,7 @@ int main() {
                             displayRig.pose = rigPose;
                             displayRig.virtualDisplayHeight =
                                 g_input.viewParams.virtualDisplayHeight / g_input.viewParams.scaleFactor;
-                            displayRig.ipdFactor = g_input.viewParams.ipdFactor;
+                            displayRig.ipdFactor = g_input.viewParams.ipdFactor * g_modeRamp;
                             displayRig.parallaxFactor = g_input.viewParams.parallaxFactor;
                             displayRig.perspectiveFactor = g_input.viewParams.perspectiveFactor;
                             locateInfo.next = &displayRig;
