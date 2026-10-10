@@ -3213,6 +3213,33 @@ ipc_handle_compositor_get_segment_metrics(volatile struct ipc_client_state *ics,
 	return XRT_SUCCESS;
 }
 
+/*
+ * XR_DXR_weave v19 (#1884, ADR-047 Amendment 4): the present-owner's per-screen
+ * segment table of its last weave, with every screen's eyes. Inert (an empty
+ * table) off the D3D11 service compositor and for a client that never enabled
+ * segments.
+ */
+static_assert(sizeof(struct ipc_weave_get_segments_reply) <= IPC_BUF_SIZE,
+              "weave_get_segments reply exceeds IPC_BUF_SIZE");
+
+xrt_result_t
+ipc_handle_weave_get_segments(volatile struct ipc_client_state *ics, struct xrt_segment_metrics *out_metrics)
+{
+	IPC_TRACE_MARKER();
+
+	memset(out_metrics, 0, sizeof(*out_metrics));
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (ics->server != NULL && ics->server->xsysc != NULL && ics->xc != NULL &&
+	    comp_d3d11_service_is_d3d11_service(ics->server->xsysc)) {
+		(void)comp_d3d11_service_weave_get_segments((struct xrt_compositor *)ics->xc, out_metrics);
+	}
+#else
+	(void)ics;
+#endif
+
+	return XRT_SUCCESS;
+}
+
 xrt_result_t
 ipc_handle_compositor_set_view_routing(volatile struct ipc_client_state *ics,
                                        const struct xrt_segment_view_routing *routing)

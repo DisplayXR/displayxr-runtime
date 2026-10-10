@@ -283,6 +283,32 @@ comp_ipc_client_compositor_get_segment_metrics(struct xrt_compositor *xc, struct
 	return out_metrics->count > 0;
 }
 
+/*
+ * XR_DXR_weave v19 (#1884): the per-screen segment table of this session's
+ * last weave. Asked for only by a caller that chained XrWeaveOutputRectPartsDXR
+ * (oxr_weave.c), so a pre-v19 caller sends nothing new.
+ */
+xrt_result_t
+comp_ipc_client_compositor_weave_get_segments(struct xrt_compositor *xc, struct xrt_segment_metrics *out_metrics)
+{
+	if (out_metrics == NULL) {
+		return XRT_SUCCESS; // nothing to fill
+	}
+	memset(out_metrics, 0, sizeof(*out_metrics));
+	if (xc == NULL) {
+		return XRT_SUCCESS; // no compositor: one eye set
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_SUCCESS;
+	}
+	xrt_result_t xret = ipc_call_weave_get_segments(icc->ipc_c, out_metrics);
+	if (xret != XRT_SUCCESS || out_metrics->count > XRT_MAX_SEGMENTS) {
+		memset(out_metrics, 0, sizeof(*out_metrics)); // one eye set
+	}
+	return xret;
+}
+
 void
 comp_ipc_client_compositor_set_view_routing(struct xrt_compositor *xc, const struct xrt_segment_view_routing *routing)
 {

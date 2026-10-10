@@ -175,6 +175,11 @@ struct comp_d3d11_segments_frame
 	//! For the flat-2D fill (comp_d3d11_outcomp_blit_rect): the output
 	//! composite unit, which lives on the same device as the target.
 	struct comp_d3d11_outcomp *outcomp;
+	//! The client presents the target itself over its own window (an
+	//! XR_DXR_weave present-owner, #1884): declared to segment DPs as
+	//! set_transparent_background's `client_presents`, like the session DP's.
+	//! False (zero-init) for a compositor that presents its own back buffer.
+	bool client_presents;
 };
 
 /*!
@@ -204,6 +209,28 @@ comp_d3d11_segments_set_display_mode(struct comp_d3d11_segments *segs, bool enab
  */
 bool
 comp_d3d11_segments_get_eyes(struct comp_d3d11_segments *segs, uint64_t screen_id, struct xrt_eye_positions *out);
+
+/*!
+ * Which display processor a drag snap of the window should use (#1884, the
+ * XR_DXR_weave present-owner's `xrWeaveSnapWindowRectDXR`): the screen holding
+ * the majority of the window at its PROPOSED desktop rect @p window_desktop,
+ * with the same hysteresis as the window-handle owner (ADR-047 Amendment 2 —
+ * a clear margin held for 0.5 s), so a drag across a seam does not flip the
+ * lattice under the cursor. Nothing is created or destroyed: a screen whose
+ * segment DP does not exist yet keeps the current lattice until it does.
+ *
+ * Caller serialises with @ref comp_d3d11_segments_update (the service holds
+ * its render mutex for both).
+ *
+ * @param[out] out_screen_id  The screen whose lattice applies (0 = none / off).
+ * @return that screen's segment DP, or NULL when it is the primary screen (the
+ *         session's own DP snaps) or segmentation is off.
+ */
+struct xrt_display_processor_d3d11 *
+comp_d3d11_segments_snap_dp(struct comp_d3d11_segments *segs,
+                            const struct comp_seg_rect *window_desktop,
+                            uint64_t now_ns,
+                            uint64_t *out_screen_id);
 
 /*!
  * The screen whose DP holds the session's window handle right now (ADR-047

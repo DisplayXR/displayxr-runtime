@@ -220,6 +220,24 @@
  * overlay IS its 2D gates on extensionVersion >= 17 before relying on it, and
  * otherwise keeps a mismatched overlay off the wire itself.
  *
+ * Per-screen parts of each weave rect (SPEC_VERSION 19, #1884, ADR-047
+ * Amendment 4). On a system with two or more 3D screens the bound window can
+ * straddle a seam. The runtime then weaves the window PER SCREEN: each screen's
+ * part is woven by that screen's own display processor, at that screen's own
+ * interlace phase, and each screen's part has its own viewer (that screen's eye
+ * tracker). One eye pair per submit is then wrong for the part on the other
+ * screen, so v19 adds XrWeaveOutputRectPartsDXR, chained on
+ * XrWeaveOutputDXR::next: the window's per-screen segments, each with its own
+ * eyes (in THAT screen's display space), and every submitted rect split into
+ * per-screen parts. The caller renders the pixels of each part from its
+ * segment's eyes. On a window entirely on one screen (every window on a
+ * one-screen system) segmentCount is 0 and the base XrWeaveOutputDXR eyes apply
+ * to everything, exactly as before. A caller that does not chain the struct sees
+ * no change at all. Batch (v3) and N-view (v6) submits are segmented; a legacy
+ * single-rect submit is not. Windows (D3D11 service) only; segmentCount is 0
+ * elsewhere. xrWeaveSnapWindowRectDXR snaps against the lattice of the screen
+ * holding the majority of the window (same hysteresis as ADR-047 Amendment 2).
+ *
  * Android: an overlay is per submit, and an unreadable one refuses (SPEC_VERSION
  * 18). No new structure: from v18 the Android engine applies the v16 rule too
  * (a chained overlay it cannot import refuses the submit, XR_ERROR_RUNTIME_FAILURE,
@@ -312,7 +330,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_weave 1
-#define XR_DXR_weave_SPEC_VERSION 18
+#define XR_DXR_weave_SPEC_VERSION 19
 #define XR_DXR_WEAVE_EXTENSION_NAME "XR_DXR_weave"
 
 // Reserved 1004999190..199. Final values reconcile with the Khronos registry
@@ -353,6 +371,8 @@ extern "C" {
 #define XR_TYPE_WEAVE_SUBMIT_OVERLAY_UNCHANGED_DXR ((XrStructureType)1004999290)
 // Spec v15 (ADR-027 Amendment): the caller's lens-filter strength for the 2D layer.
 #define XR_TYPE_WEAVE_SUBMIT_OVERLAY_FILTER_DXR    ((XrStructureType)1004999291)
+// Spec v19 (#1884): per-screen parts of each weave rect + per-screen eyes.
+#define XR_TYPE_WEAVE_OUTPUT_RECT_PARTS_DXR        ((XrStructureType)1004999292)
 
 //! Upper bound on eye positions carried by XrWeaveSubmitInfoDXR (mirrors the
 //! runtime's XRT_MAX_VIEWS). Phase 1: carried but unused.
@@ -362,6 +382,15 @@ extern "C" {
 //! runtime's IPC message stays within its fixed buffer). Callers with more
 //! visible elements split into multiple batched submits.
 #define XR_WEAVE_SUBMIT_MAX_RECTS_DXR 32
+
+//! Upper bound on the per-screen segments one XrWeaveOutputRectPartsDXR reports
+//! (spec v19; mirrors the runtime's XRT_MAX_SEGMENTS). A window across more
+//! screens than this is reported unsegmented (segmentCount 0).
+#define XR_WEAVE_MAX_SEGMENTS_DXR 2
+
+//! Upper bound on rect parts one XrWeaveOutputRectPartsDXR reports (spec v19):
+//! every submitted rect split at every seam.
+#define XR_WEAVE_MAX_RECT_PARTS_DXR (XR_WEAVE_SUBMIT_MAX_RECTS_DXR * XR_WEAVE_MAX_SEGMENTS_DXR)
 
 //! Upper bound on flat rects carried by one XrWeaveSubmitFlatRegionsDXR (spec
 //! v8). Smaller than XR_WEAVE_SUBMIT_MAX_RECTS_DXR on purpose: the flat list
@@ -1103,6 +1132,90 @@ typedef struct XrWeaveSubmitOverlayFilterDXR {
     const void* XR_MAY_ALIAS next;
     float                    filterStrength; //!< 0 = no lens filtering .. 1 = full; omit = DP default
 } XrWeaveSubmitOverlayFilterDXR;
+
+/*!
+ * @brief One screen's segment of the bound window (spec v19, #1884).
+ *
+ * The part of the window's client area that lands on one screen, the display
+ * processor that weaves it, and that screen's viewer. @c eyes are in THAT
+ * screen's display space (metres, origin at the screen's centre, the same
+ * convention XrWeaveOutputDXR::eyes use for the primary screen), so an
+ * off-axis projection for this segment is built against THIS screen's
+ * physical rectangle (@c screenSizeMeters), with the part's position on it
+ * taken from XrWeaveRectPartDXR::screenRect.
+ *
+ * @c woven is XR_FALSE when the runtime cannot weave this segment (the screen
+ * has no display processor, or its DP needs 1:1 pixels on a resampled screen):
+ * the runtime then shows one view of it flat (the left view of a stereo pair;
+ * the middle view of an N-view atlas) and @c eyesValid is usually XR_FALSE.
+ */
+typedef struct XrWeaveScreenSegmentDXR {
+    uint64_t    displayId;        //!< the screen (XrDisplayDXR::displayId, XR_DXR_display_info)
+    XrRect2Di   windowRect;       //!< window-and-screen intersection, window-relative device px (y-down)
+    XrRect2Di   screenRect;       //!< the same pixels, relative to the screen's own top-left
+    XrExtent2Di screenSize;       //!< the screen's size, device px
+    XrExtent2Df screenSizeMeters; //!< the screen's physical size, metres (0 = unknown)
+    XrBool32    isPrimary;        //!< the system-default screen (the one XrWeaveOutputDXR::eyes describe)
+    XrBool32    woven;            //!< XR_TRUE = woven in 3D by this screen's DP; XR_FALSE = one view, flat
+    uint32_t    eyeCount;
+    XrVector3f  eyes[XR_WEAVE_MAX_EYES_DXR]; //!< this screen's tracked eyes, THIS screen's display space
+    XrBool32    eyesValid;
+    XrBool32    eyesTracking;
+} XrWeaveScreenSegmentDXR;
+
+/*!
+ * @brief The part of one submitted weave rect that lands on one screen (spec v19).
+ *
+ * @c windowRect is the part in the window's space (the space of
+ * XrWeaveSubmitRectsDXR::rects); @c rectRelative is the same part relative to
+ * its rect's own top-left, i.e. where those pixels sit inside the rect's
+ * content (inside each SBS half, at full rect scale, on the batch layout);
+ * @c screenRect is the same part relative to its screen's top-left. The caller
+ * renders exactly @c rectRelative of rect @c rectIndex from
+ * segments[@c segmentIndex].eyes.
+ */
+typedef struct XrWeaveRectPartDXR {
+    uint32_t  rectIndex;    //!< index into the submitted XrWeaveSubmitRectsDXR::rects
+    uint32_t  segmentIndex; //!< index into XrWeaveOutputRectPartsDXR::segments
+    XrRect2Di windowRect;   //!< the part, window-relative device px
+    XrRect2Di rectRelative; //!< the part, relative to the rect's top-left
+    XrRect2Di screenRect;   //!< the part, relative to the screen's top-left
+} XrWeaveRectPartDXR;
+
+/*!
+ * @brief Per-screen segments and per-screen rect parts of a submit (spec v19, #1884).
+ *
+ * Chain onto XrWeaveOutputDXR::next (zero-initialised). Every successful
+ * xrWeaveSubmitDXR fills it with what THIS submit's weave did:
+ *
+ *  - @c segmentCount 0: the window was woven by one display processor (it is
+ *    on one screen, the submit used the legacy single-rect layout, or the
+ *    system has one 3D screen). The base XrWeaveOutputDXR::eyes apply to every
+ *    rect and @c partCount is 0. This is every pre-v19 frame.
+ *  - @c segmentCount >= 1: the window was woven per screen. @c segments lists
+ *    the window's screens left to right, each with its own eyes; @c parts lists
+ *    every non-empty (rect, segment) intersection, ordered by rect, then left to
+ *    right. A rect wholly on one screen has exactly one part covering all of it.
+ *    Render each part from its segment's eyes for the NEXT frame (the same
+ *    one-frame lag the base eyes have). The base eyes still describe the
+ *    primary screen.
+ *
+ * @c generation changes whenever the segment geometry changes (a move, a
+ * resize, a screen change) and not when only the eyes do, so a caller can
+ * re-plan its per-part render targets on a change only.
+ *
+ * The parts are computed for the rects of THIS submit, in submission order; a
+ * frame split across several submits gets each submit's parts separately.
+ */
+typedef struct XrWeaveOutputRectPartsDXR {
+    XrStructureType         type; //!< XR_TYPE_WEAVE_OUTPUT_RECT_PARTS_DXR
+    void* XR_MAY_ALIAS      next;
+    uint32_t                segmentCount; //!< 0 = not segmented (use XrWeaveOutputDXR::eyes)
+    XrWeaveScreenSegmentDXR segments[XR_WEAVE_MAX_SEGMENTS_DXR];
+    uint32_t                partCount;
+    XrWeaveRectPartDXR      parts[XR_WEAVE_MAX_RECT_PARTS_DXR];
+    uint64_t                generation; //!< bumped on a segment-geometry change
+} XrWeaveOutputRectPartsDXR;
 
 typedef XrResult (XRAPI_PTR *PFN_xrWeaveBindWindowDXR)(
     XrSession session, void* windowHandle);

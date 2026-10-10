@@ -1392,5 +1392,11 @@
 		"in": [
 			{"name": "suspend", "type": "bool"}
 		]
+	},
+
+	"weave_get_segments": {
+		"out": [
+			{"name": "metrics", "type": "struct xrt_segment_metrics"}
+		]
 	}
 }
