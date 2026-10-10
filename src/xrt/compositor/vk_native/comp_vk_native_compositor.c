@@ -7925,7 +7925,7 @@ vk_midframe_active(const struct comp_vk_native_compositor *c)
  * atlas — that IS the depth-1 bound, and since everything the weave reads is
  * written only after it, the single atlas is never overwritten mid-sample.
  * A second atlas would buy nothing: commit and weave serialise on c->mutex
- * and the app queue anyway. Frames whose weave reads app images (c) keep the
+ * anyway. Frames whose weave reads app images (c) keep the
  * blocking wait (vk_async_handoff_eligible), as do zero-copy frames (the
  * "atlas" is then the app's own image).
  *
@@ -8030,8 +8030,9 @@ enum vk_async_drain
  *
  * @p from_commit: layer_commit's drain consumes the request (clears
  * outstanding_seq) and feeds the trace; any other app-thread entry point (the
- * zone-mask API, which shares the renderer's command pool and the app queue
- * with the weave) only waits for it.
+ * zone-mask API — its state is read by the serve's tail, and the tail's
+ * trigger-gated captures record on the renderer's pool and submit on the app
+ * queue, as the zone-mask API does) only waits for it.
  *
  * Same 2 s deadline, abandon-by-serial and trylock evidence test as the
  * blocking wait in layer_commit (#1394), for the same reasons — repeated here
@@ -8120,7 +8121,7 @@ vk_async_handoff_drain(struct comp_vk_native_compositor *c, bool from_commit)
 /*!
  * #1905 ask 2: drain for an app-thread entry point outside layer_commit (the
  * zone-mask API). Returns false when the weave is wedged — the caller then
- * fails rather than record on a command pool a parked weave may own.
+ * fails rather than race a parked weave's tail on the renderer's pool.
  */
 static bool
 vk_async_handoff_quiesce(struct comp_vk_native_compositor *c)
@@ -11857,9 +11858,11 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		// dxr_midframe_fill_resolve). Logged once with the reason.
 		c->repaint.mf.layer_live = layer_live;
 		c->repaint.mf.enabled = dxr_midframe_fill_resolve(layer_live);
-		// #1905 ask 2: the non-blocking hand-off keys on the same marker —
-		// the served weave then submits on the app's queue while the app
-		// may be submitting too, which only the layer makes legal.
+		// #1905 ask 2: the non-blocking hand-off keys on the same marker.
+		// Its serve runs on the runtime-owned queue (never the app's, where it
+		// would queue behind the app's next frame), concurrently with the
+		// app's own submits — on Adreno both share one GSL context, so the
+		// layer must serialise them, exactly as for the fill.
 		c->hand_async.enabled =
 		    dxr_async_handoff_resolve(layer_live, c->repaint_queue != VK_NULL_HANDLE, c->weave_hand.enabled);
 #endif
@@ -16889,7 +16892,8 @@ comp_vk_native_compositor_zone_mask_create(struct xrt_compositor *xc, uint32_t w
 	struct comp_vk_native_compositor *c = vk_comp(xc);
 #ifdef VK_MIDFRAME_FILL
 	// #1905 ask 2: these record on the renderer's command pool and submit on
-	// the app queue — both shared with an outstanding non-blocking weave.
+	// the app queue, as the outstanding weave's tail may (trigger-gated
+	// captures), and they change zone state the tail reads — drain it first.
 	if (!vk_async_handoff_quiesce(c)) {
 		return XRT_ERROR_VULKAN;
 	}
@@ -16970,7 +16974,8 @@ comp_vk_native_compositor_zone_mask_set_whole(struct xrt_compositor *xc, void *m
 	struct comp_vk_native_compositor *c = vk_comp(xc);
 #ifdef VK_MIDFRAME_FILL
 	// #1905 ask 2: these record on the renderer's command pool and submit on
-	// the app queue — both shared with an outstanding non-blocking weave.
+	// the app queue, as the outstanding weave's tail may (trigger-gated
+	// captures), and they change zone state the tail reads — drain it first.
 	if (!vk_async_handoff_quiesce(c)) {
 		return XRT_ERROR_VULKAN;
 	}
@@ -17005,7 +17010,8 @@ comp_vk_native_compositor_zone_mask_set_rects(struct xrt_compositor *xc,
 	struct comp_vk_native_compositor *c = vk_comp(xc);
 #ifdef VK_MIDFRAME_FILL
 	// #1905 ask 2: these record on the renderer's command pool and submit on
-	// the app queue — both shared with an outstanding non-blocking weave.
+	// the app queue, as the outstanding weave's tail may (trigger-gated
+	// captures), and they change zone state the tail reads — drain it first.
 	if (!vk_async_handoff_quiesce(c)) {
 		return XRT_ERROR_VULKAN;
 	}
@@ -17043,7 +17049,8 @@ comp_vk_native_compositor_zone_mask_acquire_rt(struct xrt_compositor *xc,
 	struct comp_vk_native_compositor *c = vk_comp(xc);
 #ifdef VK_MIDFRAME_FILL
 	// #1905 ask 2: these record on the renderer's command pool and submit on
-	// the app queue — both shared with an outstanding non-blocking weave.
+	// the app queue, as the outstanding weave's tail may (trigger-gated
+	// captures), and they change zone state the tail reads — drain it first.
 	if (!vk_async_handoff_quiesce(c)) {
 		return XRT_ERROR_VULKAN;
 	}
@@ -17082,7 +17089,8 @@ comp_vk_native_compositor_zone_mask_submit(struct xrt_compositor *xc, void *mask
 	struct comp_vk_native_compositor *c = vk_comp(xc);
 #ifdef VK_MIDFRAME_FILL
 	// #1905 ask 2: these record on the renderer's command pool and submit on
-	// the app queue — both shared with an outstanding non-blocking weave.
+	// the app queue, as the outstanding weave's tail may (trigger-gated
+	// captures), and they change zone state the tail reads — drain it first.
 	if (!vk_async_handoff_quiesce(c)) {
 		return XRT_ERROR_VULKAN;
 	}
