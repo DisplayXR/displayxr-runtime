@@ -11,6 +11,26 @@ namespace DisplayXR.Dashboard.Feed;
 public sealed record CliResult(int ExitCode, string Stdout, string Stderr, bool TimedOut, string? StartError)
 {
     public bool Started => StartError is null;
+
+    /// <summary>The runtime's log lines (U_LOG: " WARN [fn] ...", "ERROR [fn] ...") are never a result.</summary>
+    private static bool IsLogLine(string l) =>
+        l.StartsWith("WARN ", StringComparison.Ordinal) || l.StartsWith("ERROR ", StringComparison.Ordinal) ||
+        l.StartsWith("INFO ", StringComparison.Ordinal) || l.StartsWith("DEBUG ", StringComparison.Ordinal) ||
+        l.StartsWith("TRACE ", StringComparison.Ordinal);
+
+    /// <summary>
+    /// The JSON document in stdout: from the first '{' to the last '}', so a
+    /// log line a plug-in printed to stdout around it cannot break the parse
+    /// (the same extraction the CI gate uses).
+    /// </summary>
+    public string Json
+    {
+        get
+        {
+            int a = Stdout.IndexOf('{'), b = Stdout.LastIndexOf('}');
+            return a >= 0 && b > a ? Stdout[a..(b + 1)] : Stdout;
+        }
+    }
     public bool Ok => Started && !TimedOut && ExitCode == 0;
 
     /// <summary>The first non-empty line a person should read: stdout, else stderr, else the failure.</summary>
@@ -22,9 +42,9 @@ public sealed record CliResult(int ExitCode, string Stdout, string Stderr, bool 
             if (TimedOut) return "displayxr-cli did not answer in time.";
             foreach (var text in new[] { Stdout, Stderr })
                 foreach (var line in text.Split('\n'))
-                    if (line.Trim().Length > 0 && !line.TrimStart().StartsWith(" WARN", StringComparison.Ordinal))
+                    if (line.Trim().Length > 0 && !IsLogLine(line.TrimStart()))
                         return line.Trim();
-            return ExitCode == 0 ? "(done)" : $"displayxr-cli exited with code {ExitCode}.";
+            return ExitCode == 0 ? "(done)" : $"displayxr-cli exited with code {ExitCode} without a result.";
         }
     }
 }

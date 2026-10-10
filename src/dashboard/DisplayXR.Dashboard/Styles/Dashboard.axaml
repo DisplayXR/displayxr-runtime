@@ -183,6 +183,28 @@
         <Setter Property="Foreground" Value="{DynamicResource FgBrush}"/>
     </Style>
 
+    <!-- A string content becomes a TextBlock, and the TextBlock style above
+         beats the colour the Button hands down: name the label colour per
+         button class on the label itself. -->
+    <Style Selector="Button.primary TextBlock">
+        <Setter Property="Foreground" Value="#06101F"/>
+    </Style>
+    <Style Selector="Button.warn TextBlock">
+        <Setter Property="Foreground" Value="{DynamicResource WarnBrush}"/>
+    </Style>
+    <Style Selector="Button.quiet TextBlock">
+        <Setter Property="Foreground" Value="{DynamicResource SoftBrush}"/>
+    </Style>
+    <Style Selector="Button.link TextBlock">
+        <Setter Property="Foreground" Value="{DynamicResource AccentTextBrush}"/>
+    </Style>
+    <Style Selector="Button.link:pointerover TextBlock">
+        <Setter Property="Foreground" Value="{DynamicResource FgBrush}"/>
+    </Style>
+    <Style Selector="Button:disabled TextBlock">
+        <Setter Property="Foreground" Value="{DynamicResource SecondaryBrush}"/>
+    </Style>
+
     <!-- The window's caption buttons (minimise / maximise / close over the
          extended client area) are Buttons too: give them back a flat,
          Windows-like look instead of the page button above. -->
