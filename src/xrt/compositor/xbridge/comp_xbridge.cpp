@@ -2662,6 +2662,16 @@ comp_xbridge_slot_layout(struct comp_xbridge *xb, int32_t slot, uint64_t *out_ge
 	return true;
 }
 
+extern "C" bool
+comp_xbridge_slot_seq(struct comp_xbridge *xb, int32_t slot, uint64_t *out_seq)
+{
+	if (xb == nullptr || out_seq == nullptr || slot < 0 || slot >= XB_EGRESS_RING || xb->eg_seq[slot] == 0) {
+		return false;
+	}
+	*out_seq = xb->eg_seq[slot];
+	return true;
+}
+
 /*!
  * Latch Option II — an app-device NT-shared staging ring the producer CAN open.
  * Costs one extra same-adapter copy per frame; runs only when the renderer's own

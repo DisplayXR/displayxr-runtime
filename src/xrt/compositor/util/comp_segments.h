@@ -243,6 +243,101 @@ comp_segments_tile_rect(const struct comp_seg_rect *seg,
                         uint32_t tile_h,
                         struct comp_seg_rect *out);
 
+/*
+ * The partition the atlas content was painted with (#1883).
+ */
+
+//! Max segments a @ref comp_segments_content describes.
+#define COMP_SEGMENTS_CONTENT_MAX 4
+
+/*!
+ * Where each segment's own views sit in an atlas, as the frame that PAINTED it
+ * laid them out (multi-screen M3: a routed frame is a mosaic, segment k's
+ * views at segment k's rect inside every tile).
+ *
+ * The routing comes from the table the frame was LOCATED against, which
+ * during a drag is older than the table the weave cuts from the live window:
+ * the seam column has moved since. Cropping the mosaic at the live seam hands
+ * each DP a sliver of its neighbour's views (#1883). The content partition is
+ * carried with the pixels instead (the renderer atlas, the #918 egress slot,
+ * the service client's atlas) and the crop reads it.
+ *
+ * @ref count 0 = one view set fills every tile (an unrouted frame): the atlas
+ * has no partition of its own and the live one is exact.
+ */
+struct comp_segments_content
+{
+	uint32_t count;
+	//! The screen whose views sit at @ref rect.
+	uint64_t screen_id[COMP_SEGMENTS_CONTENT_MAX];
+	//! Each segment as the content was painted for it, window px.
+	struct comp_seg_rect rect[COMP_SEGMENTS_CONTENT_MAX];
+	//! The canvas @ref rect is relative to, window px (the painted window's).
+	struct comp_seg_rect canvas;
+};
+
+/*!
+ * The rect inside a view tile that holds segment @p seg's views — what the
+ * per-segment crop (and the flat-2D fill) reads.
+ *
+ * With @p content routed (count > 0) and listing @p seg's screen, this is that
+ * screen's rect as the content was PAINTED (@ref comp_segments_tile_rect of the
+ * content rect against the content canvas), never the live one: each DP weaves
+ * exactly its own views, and the DP stretches them over its live segment (its
+ * canvas), which during a drag differs by the window's motion since the locate
+ * — a sub-percent scale for a frame, where cropping at the live seam showed a
+ * sliver of the neighbour's views. Unrouted content (NULL / count 0), or a
+ * screen the content does not list (the frame a segment appears), maps the
+ * live segment against the live canvas, as before.
+ *
+ * @param seg      The live segment (window px; only `screen_id` and `window_rect` are read).
+ * @param canvas   The live canvas the atlas is mapped against when unrouted, window px.
+ * @param tile_w/tile_h  One view tile of the atlas being woven, px.
+ * @param content  The partition the atlas was painted with, or NULL.
+ * @param[out] out The rect inside a tile.
+ * @return false when the rect is outside the canvas or thinner than a tile pixel.
+ */
+bool
+comp_segments_source_rect(const struct comp_segment *seg,
+                          const struct comp_seg_rect *canvas,
+                          uint32_t tile_w,
+                          uint32_t tile_h,
+                          const struct comp_segments_content *content,
+                          struct comp_seg_rect *out);
+
+//! Depth of a @ref comp_segments_content_ring (> any egress ring).
+#define COMP_SEGMENTS_CONTENT_RING 8
+
+/*!
+ * The content partition of the last few submitted frames, keyed by the frame
+ * sequence a transport stamps on its slots (#918: the weave consumes an egress
+ * slot a frame or two behind the frame being committed, so the partition has
+ * to travel with that slot, not with the current frame).
+ */
+struct comp_segments_content_ring
+{
+	uint64_t seq[COMP_SEGMENTS_CONTENT_RING]; //!< 0 = empty
+	struct comp_segments_content content[COMP_SEGMENTS_CONTENT_RING];
+};
+
+/*!
+ * Record frame @p seq's partition (@p content NULL = unrouted). @p seq 0 is
+ * ignored.
+ */
+void
+comp_segments_content_ring_put(struct comp_segments_content_ring *r,
+                               uint64_t seq,
+                               const struct comp_segments_content *content);
+
+/*!
+ * The partition frame @p seq was painted with. False (and @p out zeroed =
+ * unrouted) when it is no longer, or never was, recorded.
+ */
+bool
+comp_segments_content_ring_get(const struct comp_segments_content_ring *r,
+                               uint64_t seq,
+                               struct comp_segments_content *out);
+
 /*!
  * Equal geometry and screens (used to log a table change once).
  */
