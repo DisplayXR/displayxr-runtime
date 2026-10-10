@@ -126,7 +126,8 @@ service_orchestrator_get_workspace_pid(void);
  * IPC server to gate `session_request_file_picker` dispatch so apps
  * fall back to a flat OS dialog when the controller has no picker.
  *
- * Returns false on non-Windows or when no controller is registered.
+ * Returns false when no controller is registered (POSIX: the manifest's
+ * `supports_file_dialog`).
  */
 bool
 service_orchestrator_get_workspace_supports_file_dialog(void);
@@ -138,9 +139,9 @@ service_orchestrator_get_workspace_supports_file_dialog(void);
  * status item / Ctrl+Space hotkey, #61) launch the controller through the same
  * registry-discovery + crash-respawn path as startup.
  *
- * macOS-only: defined in the `XRT_OS_MACOS` orchestrator branch. The Windows
+ * Defined in the macOS / desktop-Linux orchestrator branch. The Windows
  * orchestrator summons via its own Ctrl+Space trampoline and never references
- * this symbol; the POSIX-stub platforms (Linux/Android) have no orchestrator.
+ * this symbol; Android has no orchestrator (stubs only).
  */
 void
 service_orchestrator_summon_workspace(void);
