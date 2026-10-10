@@ -20,6 +20,7 @@
 
 #include "server/ipc_server.h"
 #include "server/ipc_server_peer_creds.h"
+#include "server/ipc_server_interface.h"
 #include "util/u_client_class.h"
 #include "ipc_server_generated.h"
 #include "xrt/xrt_device.h"
@@ -4127,6 +4128,26 @@ ipc_handle_system_get_client_segments(volatile struct ipc_client_state *ics,
 	// Any client's table, read-only — compositor_get_segment_metrics stays
 	// own-session.
 	return ipc_server_status_get_client(ics->server, client_id, out_client, out_metrics, out_generation);
+}
+
+/*
+ * Display dashboard phase 7: `displayxr-cli dp use|reset --screen` (and the
+ * dashboard through it) wrote a per-screen display-processor preference; ask
+ * the re-probe worker to re-resolve now instead of at the next world event.
+ * Session-free, DIAG only, and it does nothing but flag the debounced request
+ * (the worker re-reads the preference stores before it resolves).
+ */
+xrt_result_t
+ipc_handle_system_request_display_reprobe(volatile struct ipc_client_state *ics)
+{
+	xrt_result_t xret = require_status_diag(ics, "system_request_display_reprobe");
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+#ifndef XRT_OS_ANDROID
+	ipc_server_request_display_reprobe("per-screen DP preference changed");
+#endif
+	return XRT_SUCCESS;
 }
 
 xrt_result_t
