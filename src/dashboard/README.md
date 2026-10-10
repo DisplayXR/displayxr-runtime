@@ -20,8 +20,11 @@ the sibling `displayxr-cli.exe`, rendering its JSON.
 
 - One long-lived `displayxr-cli status --watch --json` child while a status page (Home,
   Displays, Windows) is on screen and the window is not minimised. Moving between status
-  pages keeps the same child; Performance / Developer / minimise stop it (stdin closed,
-  then killed after 1.5 s) and drop the snapshot.
+  pages keeps the same child. Leaving for Performance / Developer stops it after a 15 s
+  linger (a quick hop back reuses it: a child that cannot reach the service builds a
+  headless snapshot, and each of those creates a vendor instance); minimising stops it at
+  once. Stopping = stdin closed (the CLI's stop signal), killed after 1.5 s if it lingers,
+  and the snapshot is dropped.
 - A child that exits after ≥ 10 s is restarted; two young exits in a row → fallback to
   `status --json` **every 30 s, never faster** (each headless run creates a vendor
   instance), with a "Live feed unavailable" banner. A poll that sees `source: service`, or

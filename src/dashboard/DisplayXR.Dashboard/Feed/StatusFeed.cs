@@ -44,6 +44,13 @@ public sealed class StatusFeed : IDisposable
     /// <summary>While polling, retry the watch child every this many polls even if no poll saw the service.</summary>
     public const int RetryWatchEveryPolls = 4;
     public static readonly TimeSpan PollTimeout = TimeSpan.FromSeconds(60);
+    /// <summary>
+    /// After the last page releases the feed, the child lingers this long before
+    /// it is stopped: a hop Home -> Performance -> Home must not restart it,
+    /// because a child that cannot reach the service builds a headless snapshot,
+    /// and each one creates a vendor instance. Minimising stops it at once.
+    /// </summary>
+    public static readonly TimeSpan ReleaseLinger = TimeSpan.FromSeconds(15);
 
     private readonly IProcessSource _source;
     private readonly IFeedScheduler _sched;
@@ -62,6 +69,7 @@ public sealed class StatusFeed : IDisposable
     private bool _pollInFlight;
     private int _pollsSinceWatch;
     private bool _recovering;
+    private IDisposable? _linger;
 
     public StatusFeed(IProcessSource source, IFeedScheduler scheduler)
     {
@@ -88,12 +96,22 @@ public sealed class StatusFeed : IDisposable
     public void Hold()
     {
         _holders++;
+        CancelLinger();
         Sync();
     }
 
     public void Release()
     {
         _holders = Math.Max(0, _holders - 1);
+        if (_holders == 0 && !_paused && !_disposed && Mode != FeedMode.Idle && _linger is null)
+        {
+            _linger = _sched.Schedule(ReleaseLinger, () =>
+            {
+                _linger = null;
+                Sync();
+            });
+            return;
+        }
         Sync();
     }
 
@@ -101,7 +119,17 @@ public sealed class StatusFeed : IDisposable
     {
         if (_paused == paused) return;
         _paused = paused;
+        CancelLinger();
         Sync();
+    }
+
+    /// <summary>The child is still running for a page that was just left (see <see cref="ReleaseLinger"/>).</summary>
+    public bool IsLingering => _linger is not null;
+
+    private void CancelLinger()
+    {
+        _linger?.Dispose();
+        _linger = null;
     }
 
     /// <summary>The manual kick: drop the child (or the polling) and start a fresh watch.</summary>
@@ -126,7 +154,7 @@ public sealed class StatusFeed : IDisposable
             StartWatch();
             RaiseChanged();
         }
-        else if (!Wanted && Mode != FeedMode.Idle)
+        else if (!Wanted && Mode != FeedMode.Idle && _linger is null)
         {
             // Released: nothing runs for nobody, and the snapshot is dropped so a
             // badge never shows stale data (ADR-051 D5.4).
@@ -316,6 +344,7 @@ public sealed class StatusFeed : IDisposable
     public void Dispose()
     {
         if (_disposed) return;
+        CancelLinger();
         StopAll(keepSnapshot: false);
         _disposed = true;
     }
