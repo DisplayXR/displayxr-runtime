@@ -132,7 +132,8 @@ struct fixture
 		// controller stays up until killed.
 		std::ofstream s(script);
 		s << "#!/bin/sh\n"
-		  << "echo \"$$ $* session=${DISPLAYXR_WORKSPACE_SESSION:-} hotkey=${DISPLAYXR_WORKSPACE_HOTKEY:-}\" >> '"
+		  << "echo \"$$ $* session=${DISPLAYXR_WORKSPACE_SESSION:-} hotkey=${DISPLAYXR_WORKSPACE_HOTKEY:-}\" "
+		     ">> '"
 		  << log << "'\n"
 		  << "case \"$1\" in --workspace-action) exit 0 ;; esac\n"
 		  << "exec sleep 60\n";

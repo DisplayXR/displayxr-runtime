@@ -61,8 +61,8 @@ struct bus
 	std::string
 	call(const char *method, int bool_arg = -1)
 	{
-		DBusMessage *m = dbus_message_new_method_call("org.displayxr.WindowGeometry", "/org/displayxr/WorkspaceHotkey",
-		                                              "org.displayxr.Test1", method);
+		DBusMessage *m = dbus_message_new_method_call(
+		    "org.displayxr.WindowGeometry", "/org/displayxr/WorkspaceHotkey", "org.displayxr.Test1", method);
 		if (bool_arg >= 0) {
 			dbus_bool_t b = bool_arg ? TRUE : FALSE;
 			dbus_message_append_args(m, DBUS_TYPE_BOOLEAN, &b, DBUS_TYPE_INVALID);

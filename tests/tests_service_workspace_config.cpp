@@ -182,15 +182,14 @@ TEST_CASE("hotkey grammar maps on to X11 keysyms and modifier masks", "[service]
 	CHECK(x11("Ctrl+ArrowLeft").keysym == 0xff51u);
 	CHECK(x11("Ctrl+Down").keysym == 0xff54u);
 	CHECK(x11("Ctrl+Shift+Alt+Win+BracketRight").keysym == 0x005du);
-	CHECK(x11("Ctrl+Shift+Alt+Win+BracketRight").mods ==
-	      (SERVICE_HOTKEY_X11_CONTROL | SERVICE_HOTKEY_X11_SHIFT | SERVICE_HOTKEY_X11_MOD1 |
-	       SERVICE_HOTKEY_X11_MOD4));
+	CHECK(x11("Ctrl+Shift+Alt+Win+BracketRight").mods == (SERVICE_HOTKEY_X11_CONTROL | SERVICE_HOTKEY_X11_SHIFT |
+	                                                      SERVICE_HOTKEY_X11_MOD1 | SERVICE_HOTKEY_X11_MOD4));
 
 	// Every key the grammar accepts maps (no hole in the table).
-	const char *keys[] = {"Space", "Tab",   "Enter", "Backquote", "Minus",  "Equals",   "BracketLeft",
-	                      "BracketRight", "Semicolon", "Quote", "Comma", "Period", "Slash", "Backslash",
-	                      "Insert", "Delete", "Home", "End", "PageUp", "PageDown", "Left", "Up", "Right",
-	                      "Down"};
+	const char *keys[] = {"Space",       "Tab",          "Enter",     "Backquote", "Minus", "Equals",
+	                      "BracketLeft", "BracketRight", "Semicolon", "Quote",     "Comma", "Period",
+	                      "Slash",       "Backslash",    "Insert",    "Delete",    "Home",  "End",
+	                      "PageUp",      "PageDown",     "Left",      "Up",        "Right", "Down"};
 	for (const char *k : keys) {
 		std::string combo = std::string("Ctrl+") + k;
 		INFO(combo);
