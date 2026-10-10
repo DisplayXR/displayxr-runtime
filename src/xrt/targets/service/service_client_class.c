@@ -17,7 +17,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#if defined(XRT_OS_WINDOWS) || defined(XRT_OS_MACOS)
+#if (defined(XRT_OS_WINDOWS) || defined(XRT_OS_MACOS)) &&                         \
+    !defined(SERVICE_CLIENT_CLASS_NO_ORCHESTRATOR)
 #include "service_orchestrator.h"
 #define HAVE_ORCHESTRATOR 1
 #endif
@@ -33,6 +34,9 @@
 #endif
 #ifdef XRT_OS_LINUX
 #include <unistd.h>
+#endif
+#ifndef XRT_OS_WINDOWS
+#include <limits.h> // PATH_MAX
 #endif
 
 
@@ -58,11 +62,8 @@ norm_ch(char c)
 }
 
 static bool
-path_equal(const char *a, const char *b)
+path_equal_bytes(const char *a, const char *b)
 {
-	if (a == NULL || b == NULL || a[0] == 0 || b[0] == 0) {
-		return false;
-	}
 	while (*a != 0 && *b != 0) {
 		if (norm_ch(*a) != norm_ch(*b)) {
 			return false;
@@ -71,6 +72,36 @@ path_equal(const char *a, const char *b)
 		b++;
 	}
 	return *a == 0 && *b == 0;
+}
+
+bool
+service_client_class_path_equal(const char *a, const char *b)
+{
+	if (a == NULL || b == NULL || a[0] == 0 || b[0] == 0) {
+		return false;
+	}
+	if (path_equal_bytes(a, b)) {
+		return true;
+	}
+#ifndef XRT_OS_WINDOWS
+	// The kernel reports a peer's executable symlink-resolved (/proc/<pid>/exe
+	// on Linux), while a manifest may name the binary through a symlink
+	// (/usr/bin/foo -> ../lib/foo/bin/foo, a versioned install dir). Compare the
+	// canonical spellings of both sides; a side that does not resolve (deleted
+	// binary, " (deleted)" suffix) only ever matches byte-for-byte above.
+	char ra[PATH_MAX];
+	char rb[PATH_MAX];
+	if (realpath(a, ra) != NULL && realpath(b, rb) != NULL) {
+		return path_equal_bytes(ra, rb);
+	}
+#endif
+	return false;
+}
+
+static bool
+path_equal(const char *a, const char *b)
+{
+	return service_client_class_path_equal(a, b);
 }
 
 //! Directory part of a path (up to and excluding the last separator), normalised.
