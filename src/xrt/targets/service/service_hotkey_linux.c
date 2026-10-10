@@ -575,7 +575,7 @@ release_backend(struct worker *w)
 
 //! (Re)apply @p combo / @p suspend. Picks the backend afresh each time.
 static void
-apply(struct worker *w, const char *combo, bool suspend)
+apply(struct worker *w, const char *combo, bool suspend, bool ext_just_left)
 {
 	const bool armed = combo[0] != '\0';
 
@@ -637,7 +637,9 @@ apply(struct worker *w, const char *combo, bool suspend)
 #endif
 
 	w->backend = BACKEND_NONE;
-	if (!w->warned_none) {
+	// The extension leaving (lock screen, shell restart) is transient: it
+	// comes back and is re-configured; that is not the "nothing works" case.
+	if (!w->warned_none && !ext_just_left) {
 		w->warned_none = true;
 		U_LOG_W(
 		    "Workspace hotkey: no way to grab '%s' in this session (no GNOME Shell extension "
@@ -692,14 +694,16 @@ worker_main(void *arg)
 			dirty = true;
 		}
 
+		bool ext_changed = false;
 #ifdef SERVICE_HOTKEY_HAVE_DBUS
 		if (w.ext_changed) {
 			w.ext_changed = false;
+			ext_changed = true;
 			dirty = true; // the extension appeared / left: re-pick the backend
 		}
 #endif
 		if (dirty) {
-			apply(&w, combo, suspend);
+			apply(&w, combo, suspend, ext_changed && w.backend == BACKEND_EXTENSION);
 		}
 
 		// Wait for input on either connection, or the next request tick.
