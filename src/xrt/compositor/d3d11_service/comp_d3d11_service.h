@@ -295,6 +295,21 @@ comp_d3d11_service_set_client_segment_screens(struct xrt_system_compositor *xsys
                                               uint64_t pinned_display_id);
 
 /*!
+ * Display dashboard phase 7: the screen registry was re-resolved (a display
+ * re-probe — e.g. after a per-screen DP preference changed). For every client
+ * that enabled segments, a screen whose plug-in changed gets its segment DP
+ * recreated: the client's manager is rebuilt from @p list on its next weave,
+ * and the lifecycle's hysteresis makes each DP again. The client's primary
+ * (system-default) screen keeps the registry entry its session started with —
+ * the session's own DP never swaps live — so a change there only applies to
+ * the next session. A list with no plug-in change is a no-op.
+ *
+ * @ingroup comp_d3d11_service
+ */
+void
+comp_d3d11_service_refresh_segment_screens(struct xrt_system_compositor *xsysc, const struct xrt_screen_list *list);
+
+/*!
  * Multi-screen M3 over IPC: the segment table the last direct weave of this
  * client took (count 0 = one view set), with every segment's eyes predicted
  * now — the primary screen's from the panel DP, the others from their segment
