@@ -531,8 +531,7 @@ main(int argc, char *argv[])
 	service_orchestrator_init(&linux_cfg);
 
 	ipc_server_set_workspace_pid_provider(service_orchestrator_get_workspace_pid);
-	ipc_server_set_workspace_supports_file_dialog_provider(
-	    service_orchestrator_get_workspace_supports_file_dialog);
+	ipc_server_set_workspace_supports_file_dialog_provider(service_orchestrator_get_workspace_supports_file_dialog);
 	ipc_server_set_workspace_summon_provider(service_orchestrator_summon_workspace);
 
 	// Display dashboard phase 8: live re-apply of service.json, launch-now and
