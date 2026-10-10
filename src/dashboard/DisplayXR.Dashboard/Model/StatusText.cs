@@ -167,8 +167,11 @@ public static class StatusText
     public sealed record DpChoice(string? PluginId, string Label);
 
     /// <summary>
-    /// The selector on a screen card: "Auto (effective)" then every registered
-    /// plug-in; the selection is the screen's preferred plug-in, else Auto.
+    /// The selector on a screen card: "Auto (effective)" then the plug-ins that
+    /// CLAIMED that screen (<c>screens[].candidates</c>, at any confidence: the
+    /// ones that can drive it), or every registered plug-in when the CLI does not
+    /// list candidates (older CLI). The selection is the screen's preferred
+    /// plug-in, else Auto; a preference outside the list is appended and named.
     /// Null — no row at all — when the CLI predates per-screen overrides: no
     /// <c>key</c> on the screen, or a <c>dp list --json</c> without
     /// <c>screens[]</c>. The second check is a safety interlock, not a nicety:
@@ -182,20 +185,53 @@ public static class StatusText
         string? effective = ds?.EffectivePlugin ?? s.Claim.PluginId;
         string? preferred = ds is not null ? ds.PreferredPlugin : s.Claim.PreferredPlugin;
         var items = new List<DpChoice> { new(null, $"Auto ({effective ?? "none"})") };
-        foreach (var p in dp.Plugins)
-            items.Add(new DpChoice(p.Id, p.Name.Length > 0 ? $"{p.Name} ({p.Id})" : p.Id));
+        foreach (var id in DpOptionIds(ds, dp))
+        {
+            var row = dp.Plugins.FirstOrDefault(p => string.Equals(p.Id, id, StringComparison.OrdinalIgnoreCase));
+            items.Add(new DpChoice(id, row is { Name.Length: > 0 } ? $"{row.Name} ({id})" : id));
+        }
         int selected = 0;
         if (preferred is not null)
         {
-            selected = items.FindIndex(i => i.PluginId == preferred);
+            selected = items.FindIndex(i => string.Equals(i.PluginId, preferred, StringComparison.OrdinalIgnoreCase));
             if (selected < 0)
             {
-                items.Add(new DpChoice(preferred, $"{preferred} (not registered)"));
+                bool registered = dp.Plugins.Any(p => string.Equals(p.Id, preferred, StringComparison.OrdinalIgnoreCase));
+                items.Add(new DpChoice(preferred, $"{preferred} ({(registered ? "no claim on this screen" : "not registered")})"));
                 selected = items.Count - 1;
             }
         }
         return (items, selected);
     }
+
+    /// <summary>
+    /// The plug-in ids a screen's selector offers: its claimants in source
+    /// (ProbeOrder) order, or every registered plug-in without a candidate list.
+    /// </summary>
+    public static IReadOnlyList<string> DpOptionIds(DpScreen? ds, DpList dp) =>
+        ds?.Candidates is { } cands
+            ? cands.Select(c => c.PluginId).Distinct(StringComparer.OrdinalIgnoreCase).ToList()
+            : dp.Plugins.Select(p => p.Id).ToList();
+
+    /// <summary>
+    /// The Developer page's machine-wide override notice: only when a global
+    /// PreferredPlugin is set (<c>dp list --json</c> <c>preferred</c>); null otherwise.
+    /// </summary>
+    public static (string Title, string Text)? MachineOverrideNotice(DpList? dp) => dp?.Preferred is { Length: > 0 } id
+        ? ($"A machine-wide display-processor override is set: {id} (applies to every screen).",
+           "Choose per screen on Displays. Clearing it needs administrator rights.")
+        : null;
+
+    public sealed record HomeScreenDp(string Name, string? Plugin, string? Forced);
+
+    /// <summary>
+    /// Home's per-screen summary: each screen's effective display processor
+    /// (dp list's resolve when read, else the snapshot's claim) and its forced chip.
+    /// </summary>
+    public static IReadOnlyList<HomeScreenDp> HomeScreenDps(StatusSnapshot s, DpList? dp) =>
+        s.Screens.Select(x => new HomeScreenDp(ScreenName(x),
+            dp?.Screen(x.Key)?.EffectivePlugin ?? (x.Claim.IsClaimed ? x.Claim.PluginId : null),
+            ForcedChip(x, dp))).ToList();
 
     public static string Quote(string arg) => arg.Length == 0 || arg.Any(c => char.IsWhiteSpace(c) || c == '"')
         ? "\"" + arg.Replace("\"", "\\\"") + "\"" : arg;

@@ -247,10 +247,8 @@ public sealed class DashboardContext
             if (last is not null)
             {
                 LastActionFailed = !last.Ok;
-                string summary = last.Summary;
-                if (!last.Ok && area == "dp" && !Ui.Elevation.IsElevated)
-                    summary += " — the display-processor override is a machine-wide (HKLM) setting: run the dashboard as administrator to change it.";
-                LastAction = summary;
+                // Verbatim: the CLI's own words (the pages say what needs admin).
+                LastAction = last.Summary;
             }
         }
         catch (Exception ex)

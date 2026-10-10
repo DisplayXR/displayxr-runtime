@@ -192,6 +192,101 @@ public class StatusTextTests
     }
 
     [Fact]
+    public void DpList_ReadsCandidates_AbsentIsNull()
+    {
+        Assert.True(DpList.TryParse("""
+        { "preferred": null, "plugins": [
+            { "id": "leia-sr", "display_name": "DisplayXR Leia SR", "probe_order": 50 },
+            { "id": "vendor2", "display_name": "Vendor Two", "probe_order": 100 },
+            { "id": "sim-display", "display_name": "", "probe_order": 200 } ],
+          "screens": [
+            { "key": "k0", "effective_plugin": "leia-sr", "preferred_plugin": null, "forced": false, "apply": "next-session",
+              "candidates": [ { "plugin_id": "leia-sr", "confidence": 100 }, { "plugin_id": "sim-display", "confidence": 10 } ] },
+            { "key": "k1", "effective_plugin": "vendor2", "preferred_plugin": null, "forced": false, "apply": "live",
+              "candidates": [ { "plugin_id": "vendor2", "confidence": 80 }, { "plugin_id": "sim-display", "confidence": 10 } ] },
+            { "key": "k2", "effective_plugin": "sim-display", "candidates": null },
+            { "key": "k3", "effective_plugin": null, "candidates": [] } ] }
+        """, out var dp));
+        var k0 = dp!.Screen("k0")!;
+        Assert.Equal(new[] { new DpCandidate("leia-sr", 100), new DpCandidate("sim-display", 10) }, k0.Candidates!);
+        Assert.Null(dp.Screen("k2")!.Candidates);          // not an array: unknown, not "none"
+        Assert.Empty(dp.Screen("k3")!.Candidates!);        // an empty list: nothing claimed it
+
+        // Older CLI (no candidates key at all): null too.
+        Assert.True(DpList.TryParse("""{ "plugins": ["leia-sr"], "screens": [ { "key": "k0" } ] }""", out var old));
+        Assert.Null(old!.Screen("k0")!.Candidates);
+    }
+
+    [Fact]
+    public void DpSelector_ListsOnlyThatScreensClaimants()
+    {
+        var plugins = new[]
+        {
+            new DpRow("leia-sr", "DisplayXR Leia SR", "", "", 50, true, false),
+            new DpRow("vendor2", "Vendor Two", "", "", 100, false, false),
+            new DpRow("sim-display", "", "", "", 200, false, false),
+        };
+        var leiaPanel = Design.Screens[0] with { Key = "k0" };
+        var v2Panel = Design.Screens[1] with { Key = "k1" };
+        var dp = new DpList(null, plugins, new[]
+        {
+            new DpScreen("k0", "", "", "leia-sr", null, null, false, "next-session",
+                         new[] { new DpCandidate("leia-sr", 100), new DpCandidate("sim-display", 10) }),
+            new DpScreen("k1", "", "", "vendor2", null, null, false, "live",
+                         new[] { new DpCandidate("vendor2", 80), new DpCandidate("sim-display", 10) }),
+        });
+        Assert.Equal(new[] { "Auto (leia-sr)", "DisplayXR Leia SR (leia-sr)", "sim-display" },
+                     StatusText.DpSelector(leiaPanel, dp)!.Value.Items.Select(i => i.Label));
+        Assert.Equal(new[] { "Auto (vendor2)", "Vendor Two (vendor2)", "sim-display" },
+                     StatusText.DpSelector(v2Panel, dp)!.Value.Items.Select(i => i.Label));
+
+        // A preference for a registered plug-in that does not claim the screen
+        // stays visible (selected) and says why it is not honoured.
+        var stale = dp with { Screens = new[] { dp.Screens![0] with { PreferredPlugin = "vendor2", PreferredSource = "user" } } };
+        var sel = StatusText.DpSelector(leiaPanel, stale)!.Value;
+        Assert.Equal("vendor2 (no claim on this screen)", sel.Items[sel.Selected].Label);
+
+        // Fallback: no candidates listed (older CLI) -> every registered plug-in.
+        var older = new DpList(null, plugins, new[] { new DpScreen("k0", "", "", "leia-sr", null, null, false, "live") });
+        Assert.Equal(new[] { "Auto (leia-sr)", "DisplayXR Leia SR (leia-sr)", "Vendor Two (vendor2)", "sim-display" },
+                     StatusText.DpSelector(leiaPanel, older)!.Value.Items.Select(i => i.Label));
+        Assert.Equal(new[] { "leia-sr", "vendor2", "sim-display" }, StatusText.DpOptionIds(null, older));
+    }
+
+    [Fact]
+    public void MachineOverrideNotice_OnlyWhenAGlobalOverrideIsSet()
+    {
+        var plugins = new[] { new DpRow("leia-sr", "", "", "", 50, true, false), new DpRow("sim-display", "", "", "", 200, false, true) };
+        Assert.Null(StatusText.MachineOverrideNotice(null));                               // not read yet
+        Assert.Null(StatusText.MachineOverrideNotice(new DpList(null, plugins)));         // unset: nothing at all
+        Assert.Null(StatusText.MachineOverrideNotice(new DpList("", plugins)));
+        var n = StatusText.MachineOverrideNotice(new DpList("sim-display", plugins))!.Value;
+        Assert.Equal("A machine-wide display-processor override is set: sim-display (applies to every screen).", n.Title);
+        Assert.StartsWith("Choose per screen on Displays.", n.Text);
+        Assert.True(DpList.TryParse(TestData.Text("dp-list.json"), out var real));
+        Assert.Null(StatusText.MachineOverrideNotice(real));
+    }
+
+    [Fact]
+    public void HomeScreenDps_EffectivePerScreen()
+    {
+        var a = Design.Screens[0] with { Key = "k0" };
+        var b = Design.Screens[1] with { Key = "k1" };
+        var snap = Design with { Screens = new[] { a, b } };
+        var fromSnapshot = StatusText.HomeScreenDps(snap, null);
+        Assert.Equal(new[] { a.Claim.PluginId, b.Claim.PluginId }, fromSnapshot.Select(d => d.Plugin));
+        var dp = new DpList(null, System.Array.Empty<DpRow>(), new[]
+        {
+            new DpScreen("k1", "", "", "sim-display", "sim-display", "user", true, "live"),
+        });
+        var rows = StatusText.HomeScreenDps(snap, dp);
+        Assert.Equal(StatusText.ScreenName(b), rows[1].Name);
+        Assert.Equal("sim-display", rows[1].Plugin);
+        Assert.Equal("forced (user)", rows[1].Forced);
+        Assert.Equal(a.Claim.PluginId, rows[0].Plugin);
+    }
+
+    [Fact]
     public void CliResult_SlicesJsonAndSkipsLogLines()
     {
         var r = new CliResult(1, "WARN [x] plug-in chatter\n{\"verdict\":\"PASS\"}\ntrailing", "WARN [y] a\n ERROR [z] b\n", false, null);

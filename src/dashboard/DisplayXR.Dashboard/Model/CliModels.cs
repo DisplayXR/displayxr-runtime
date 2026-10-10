@@ -123,9 +123,18 @@ public sealed record InfoResult(
 
 public sealed record DpRow(string Id, string Name, string Vendor, string Version, int ProbeOrder, bool Active, bool Preferred);
 
-/// <summary>One screen of <c>dp list --json</c> <c>screens[]</c> (phase 7, per-screen override).</summary>
+/// <summary>A plug-in that claimed a screen (at any confidence): one that can drive it.</summary>
+public sealed record DpCandidate(string PluginId, int Confidence);
+
+/// <summary>
+/// One screen of <c>dp list --json</c> <c>screens[]</c> (phase 7, per-screen override).
+/// <see cref="Candidates"/> is null when the CLI does not list them (older CLI, or a
+/// resolve that asked only the active plug-in): the selector then offers every
+/// registered plug-in.
+/// </summary>
 public sealed record DpScreen(string Key, string DeviceName, string FriendlyName, string? EffectivePlugin,
-                              string? PreferredPlugin, string? PreferredSource, bool Forced, string? Apply);
+                              string? PreferredPlugin, string? PreferredSource, bool Forced, string? Apply,
+                              IReadOnlyList<DpCandidate>? Candidates = null);
 
 public sealed record DpList(string? Preferred, IReadOnlyList<DpRow> Plugins, IReadOnlyList<DpScreen>? Screens = null)
 {
@@ -152,7 +161,11 @@ public sealed record DpList(string? Preferred, IReadOnlyList<DpRow> Plugins, IRe
                 ? root.Arr("screens").Where(s => s.ValueKind == JsonValueKind.Object && s.Str("key").Length > 0)
                       .Select(s => new DpScreen(s.Str("key"), s.Str("device_name"), s.Str("friendly_name"),
                           s.StrOrNull("effective_plugin"), s.StrOrNull("preferred_plugin"), s.StrOrNull("preferred_source"),
-                          s.Bool("forced"), s.StrOrNull("apply"))).ToArray()
+                          s.Bool("forced"), s.StrOrNull("apply"),
+                          s.TryGetProperty("candidates", out var ca) && ca.ValueKind == JsonValueKind.Array
+                              ? ca.EnumerateArray().Where(c => c.ValueKind == JsonValueKind.Object && c.Str("plugin_id").Length > 0)
+                                 .Select(c => new DpCandidate(c.Str("plugin_id"), c.Int("confidence"))).ToArray()
+                              : null)).ToArray()
                 : null;
             list = new DpList(root.StrOrNull("preferred"), plugins, screens);
             return true;
