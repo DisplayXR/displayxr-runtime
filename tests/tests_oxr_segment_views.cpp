@@ -89,21 +89,54 @@ TEST_CASE("Windows: a screen counts toward the capacity with a D3D11 OR a D3D12 
 	int d3d12_factory = 0;
 	// Multi-screen M6: both in-process Windows compositors segment, so either
 	// factory makes the screen DP-backed.
-	CHECK(oxr_segment_views_win_entry_has_dp(&d3d11_factory, &d3d12_factory));
-	CHECK(oxr_segment_views_win_entry_has_dp(&d3d11_factory, nullptr));
-	CHECK(oxr_segment_views_win_entry_has_dp(nullptr, &d3d12_factory));
+	CHECK(oxr_segment_views_win_entry_has_dp(&d3d11_factory, &d3d12_factory, nullptr));
+	CHECK(oxr_segment_views_win_entry_has_dp(&d3d11_factory, nullptr, nullptr));
+	CHECK(oxr_segment_views_win_entry_has_dp(nullptr, &d3d12_factory, nullptr));
 	// A D3D12-only plug-in (no D3D11 factory) used to count zero screens.
-	CHECK_FALSE(oxr_segment_views_win_entry_has_dp(nullptr, nullptr));
+	CHECK_FALSE(oxr_segment_views_win_entry_has_dp(nullptr, nullptr, nullptr));
 
 	// Two D3D12-only screens: two view sets, as two D3D11 screens give.
 	uint32_t with_factory = 0;
 	const void *entries[2][2] = {{nullptr, &d3d12_factory}, {nullptr, &d3d12_factory}};
 	for (const auto &e : entries) {
-		if (oxr_segment_views_win_entry_has_dp(e[0], e[1])) {
+		if (oxr_segment_views_win_entry_has_dp(e[0], e[1], nullptr)) {
 			with_factory++;
 		}
 	}
 	CHECK(oxr_segment_views_set_capacity(with_factory, true) == 2);
+}
+
+TEST_CASE("Windows: a Vulkan factory counts too (the in-process Vulkan compositor segments, M6)",
+          "[oxr][segment_views]")
+{
+	int vk_factory = 0;
+	int d3d11_factory = 0;
+	// A Vulkan-only claim (no D3D factory) makes its screen DP-backed: the
+	// in-process Vulkan compositor segments with create_dp_vk_for_screen.
+	CHECK(oxr_segment_views_win_entry_has_dp(nullptr, nullptr, &vk_factory));
+	CHECK(oxr_segment_views_win_entry_has_dp(&d3d11_factory, nullptr, &vk_factory));
+
+	// The Leia plug-in on a two-panel box claims both screens with D3D11 AND
+	// Vulkan factories: still two screens, never four.
+	uint32_t with_factory = 0;
+	const void *entries[2][3] = {{&d3d11_factory, nullptr, &vk_factory}, {&d3d11_factory, nullptr, &vk_factory}};
+	for (const auto &e : entries) {
+		if (oxr_segment_views_win_entry_has_dp(e[0], e[1], e[2])) {
+			with_factory++;
+		}
+	}
+	CHECK(with_factory == 2);
+	CHECK(oxr_segment_views_set_capacity(with_factory, true) == 2);
+
+	// One Vulkan-backed screen next to an unclaimed monitor: one view set.
+	with_factory = 0;
+	const void *mixed[2][3] = {{nullptr, nullptr, &vk_factory}, {nullptr, nullptr, nullptr}};
+	for (const auto &e : mixed) {
+		if (oxr_segment_views_win_entry_has_dp(e[0], e[1], e[2])) {
+			with_factory++;
+		}
+	}
+	CHECK(oxr_segment_views_set_capacity(with_factory, true) == 1);
 }
 
 TEST_CASE("PRIMARY_MULTIVIEW_DXR reports one view set per possible segment", "[oxr][segment_views]")
