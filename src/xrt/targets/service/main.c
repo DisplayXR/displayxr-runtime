@@ -31,6 +31,25 @@
 #include "server/ipc_server.h"
 #include "service_client_class.h" // #960
 
+#ifdef XRT_OS_WINDOWS
+#include "shared/ipc_protocol.h" // enum ipc_workspace_launch_status
+
+// Display dashboard phase 8: the orchestrator's launch result, mapped onto the
+// system_workspace_launch wire status (registered as the provider below).
+static uint32_t
+workspace_launch_provider(const char *controller_id)
+{
+	switch (service_orchestrator_request_launch(controller_id)) {
+	case SERVICE_LAUNCH_STARTED: return IPC_WORKSPACE_LAUNCH_STARTED;
+	case SERVICE_LAUNCH_NOT_ACTIVE: return IPC_WORKSPACE_LAUNCH_NOT_ACTIVE;
+	case SERVICE_LAUNCH_DISABLED: return IPC_WORKSPACE_LAUNCH_DISABLED;
+	case SERVICE_LAUNCH_ALREADY_RUNNING: return IPC_WORKSPACE_LAUNCH_ALREADY_RUNNING;
+	case SERVICE_LAUNCH_NO_CONTROLLER: return IPC_WORKSPACE_LAUNCH_NO_CONTROLLER;
+	default: return IPC_WORKSPACE_LAUNCH_UNSUPPORTED;
+	}
+}
+#endif
+
 #include "target_lists.h"
 #include "target_status_snapshot.h" // ADR-051 D3: the status provider
 
@@ -393,6 +412,13 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 	ipc_server_set_workspace_supports_file_dialog_provider(
 	    service_orchestrator_get_workspace_supports_file_dialog);
 
+	// Display dashboard phase 8: `displayxr-cli workspace set|launch` (DIAG)
+	// re-apply service.json live and launch the controller through the
+	// hotkey's own spawn path.
+	ipc_server_set_service_config_reload_provider(service_orchestrator_request_config_reload);
+	ipc_server_set_workspace_launch_provider(workspace_launch_provider);
+	ipc_server_set_workspace_hotkey_suspend_provider(service_orchestrator_request_hotkey_suspend);
+
 	u_trace_marker_init();
 	u_metrics_init();
 
@@ -481,6 +507,11 @@ main(int argc, char *argv[])
 	// Let the macOS menu-bar status item / Ctrl+Space hotkey summon the
 	// controller through the orchestrator's registry-discovery + respawn path.
 	ipc_server_set_workspace_summon_provider(service_orchestrator_summon_workspace);
+
+	// Display dashboard phase 8: live re-apply of service.json + launch-now.
+	ipc_server_set_service_config_reload_provider(service_orchestrator_request_config_reload);
+	ipc_server_set_workspace_launch_provider(service_orchestrator_request_launch);
+	ipc_server_set_workspace_hotkey_suspend_provider(service_orchestrator_request_hotkey_suspend);
 #endif
 
 	// #960: class verification (controller manifests are cross-platform; the

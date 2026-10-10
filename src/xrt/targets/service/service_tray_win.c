@@ -179,6 +179,25 @@ lifecycle_type_to_mode(const char *type, enum service_child_mode *out)
 	return false;
 }
 
+//! Id of the active workspace controller ("" when none).
+static const char *
+active_controller_id(void)
+{
+	const struct workspace_controller_entry *entry = service_orchestrator_get_workspace_entry();
+	return entry != NULL ? entry->id : "";
+}
+
+//! The active controller's effective mode as the menu should show it
+//! (display dashboard phase 8: a per-controller entry in service.json wins
+//! over the top-level `workspace` spelling).
+static enum service_child_mode
+effective_workspace_mode(void)
+{
+	struct service_launch_resolved r;
+	service_config_resolve_launch(&s_config, active_controller_id(), true, &r);
+	return r.mode;
+}
+
 //! Append a workspace-controller-published Actions list to @p sub. Returns
 //! true if at least one menu item was appended (caller can decide whether
 //! to fall back to hardcoded defaults). Marks the active lifecycle mode
@@ -213,7 +232,7 @@ append_published_actions(HMENU sub, const struct workspace_controller_entry *ent
 
 		// Mark the active lifecycle mode with a checkmark.
 		enum service_child_mode mode;
-		if (lifecycle_type_to_mode(a->type, &mode) && mode == s_config.workspace) {
+		if (lifecycle_type_to_mode(a->type, &mode) && mode == effective_workspace_mode()) {
 			flags |= MF_CHECKED;
 		}
 
@@ -314,7 +333,23 @@ show_context_menu(HWND hwnd)
 			AppendMenuW(workspace_sub, MF_STRING, IDM_WORKSPACE_AUTO, L"Auto");
 			AppendMenuW(workspace_sub, MF_STRING, IDM_WORKSPACE_DISABLE, L"Disable");
 			CheckMenuRadioItem(workspace_sub, IDM_WORKSPACE_ENABLE, IDM_WORKSPACE_AUTO,
-			                   workspace_mode_to_id(s_config.workspace), MF_BYCOMMAND);
+			                   workspace_mode_to_id(effective_workspace_mode()), MF_BYCOMMAND);
+		}
+
+		// Display dashboard phase 8: the configured launch combo
+		// (service.json; `displayxr-cli workspace set <id> --hotkey`), never a
+		// hard-coded Ctrl+Space. Informational, so greyed.
+		{
+			const char *combo = service_orchestrator_get_launch_hotkey();
+			wchar_t combo_wide[64] = L"";
+			if (combo != NULL && combo[0] != '\0') {
+				MultiByteToWideChar(CP_UTF8, 0, combo, -1, combo_wide, ARRAYSIZE(combo_wide));
+			}
+			wchar_t line[96];
+			_snwprintf_s(line, ARRAYSIZE(line), _TRUNCATE, L"Launch hotkey: %ls",
+			             combo_wide[0] != L'\0' ? combo_wide : L"none");
+			AppendMenuW(workspace_sub, MF_SEPARATOR, 0, NULL);
+			AppendMenuW(workspace_sub, MF_STRING | MF_GRAYED, 0, line);
 		}
 
 		// Convert UTF-8 display name to wide for the parent menu item.
@@ -364,6 +399,19 @@ show_context_menu(HWND hwnd)
 }
 
 //! Save config and notify the orchestrator.
+static void
+config_changed(void);
+
+//! Tray menu mode write: the top-level `workspace` (back-compat) and the
+//! active controller's per-controller entry move together, then save + apply.
+static void
+set_workspace_mode(enum service_child_mode mode)
+{
+	s_config.workspace = mode;
+	service_config_sync_active_mode(&s_config, active_controller_id());
+	config_changed();
+}
+
 static void
 config_changed(void)
 {
@@ -881,8 +929,20 @@ update_status_tooltip(void)
 		_snwprintf_s(wcam, ARRAYSIZE(wcam), _TRUNCATE, L"\n3D camera in use by %ls%ls", who,
 		             cst.locked ? L" (suspended: locked)" : L"");
 	}
+	// Display dashboard phase 8: the configured launch combo, when a workspace
+	// controller is registered and has one.
+	wchar_t wkey[64] = L"";
+	{
+		const char *combo =
+		    service_orchestrator_is_workspace_available() ? service_orchestrator_get_launch_hotkey() : "";
+		wchar_t wcombo[48] = L"";
+		if (combo != NULL && combo[0] != '\0' &&
+		    MultiByteToWideChar(CP_UTF8, 0, combo, -1, wcombo, ARRAYSIZE(wcombo)) != 0) {
+			_snwprintf_s(wkey, ARRAYSIZE(wkey), _TRUNCATE, L"\nWorkspace: %ls", wcombo);
+		}
+	}
 	wchar_t tip[ARRAYSIZE(s_nid.szTip)];
-	_snwprintf_s(tip, ARRAYSIZE(tip), _TRUNCATE, L"DisplayXR Service\n%ls%ls", wline, wcam);
+	_snwprintf_s(tip, ARRAYSIZE(tip), _TRUNCATE, L"DisplayXR Service\n%ls%ls%ls", wline, wkey, wcam);
 	if (wcscmp(tip, s_nid.szTip) == 0) {
 		return;
 	}
@@ -1147,8 +1207,7 @@ tray_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
 			enum service_child_mode mode;
 			if (lifecycle_type_to_mode(a->type, &mode)) {
-				s_config.workspace = mode;
-				config_changed();
+				set_workspace_mode(mode);
 			} else if (strncmp(a->type, "controller:", 11) == 0) {
 				service_orchestrator_dispatch_controller_action(a->type + 11);
 			}
@@ -1160,18 +1219,9 @@ tray_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		switch (cmd_id) {
 		// Workspace mode radio group — fallback path when the active
 		// controller did not publish an Actions list.
-		case IDM_WORKSPACE_ENABLE:
-			s_config.workspace = SERVICE_CHILD_ENABLE;
-			config_changed();
-			break;
-		case IDM_WORKSPACE_AUTO:
-			s_config.workspace = SERVICE_CHILD_AUTO;
-			config_changed();
-			break;
-		case IDM_WORKSPACE_DISABLE:
-			s_config.workspace = SERVICE_CHILD_DISABLE;
-			config_changed();
-			break;
+		case IDM_WORKSPACE_ENABLE: set_workspace_mode(SERVICE_CHILD_ENABLE); break;
+		case IDM_WORKSPACE_AUTO: set_workspace_mode(SERVICE_CHILD_AUTO); break;
+		case IDM_WORKSPACE_DISABLE: set_workspace_mode(SERVICE_CHILD_DISABLE); break;
 
 		// Open the runtime diagnostics Control Panel
 		case IDM_CONTROL_PANEL:
@@ -1417,4 +1467,13 @@ void *
 service_tray_get_hwnd(void)
 {
 	return (void *)s_tray_hwnd;
+}
+
+void
+service_tray_set_config(const struct service_config *cfg)
+{
+	if (cfg != NULL) {
+		s_config = *cfg;
+	}
+	update_status_tooltip();
 }

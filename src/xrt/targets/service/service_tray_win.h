@@ -44,6 +44,15 @@ service_tray_cleanup(void);
 void *
 service_tray_get_hwnd(void);
 
+/*!
+ * Replace the tray's copy of the config (the one its menu writes save) with
+ * @p cfg and refresh the tooltip. Display dashboard phase 8: called by the
+ * orchestrator's reload path so a later menu click saves on top of what
+ * `displayxr-cli workspace set` wrote. Tray thread only.
+ */
+void
+service_tray_set_config(const struct service_config *cfg);
+
 #ifdef __cplusplus
 }
 #endif
