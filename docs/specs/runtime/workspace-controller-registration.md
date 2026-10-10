@@ -192,6 +192,110 @@ uninstaller's final
 `DeleteRegKey HKLM "Software\DisplayXR\WorkspaceControllers"` removes
 any orphan registration keys.
 
+## Launch settings (user-customizable)
+
+How the service launches a registered controller is the **user's** setting, not the
+controller's: the runtime knows a controller only by its role and its registration (the
+`<id>` subkey), and the user picks the chord that summons it and whether it may be
+launched at all. Display dashboard phase 8; the dashboard reads and writes these through
+`displayxr-cli`, never the file directly.
+
+**Store.** `service.json` (per-user: `%LOCALAPPDATA%\DisplayXR\service.json`, POSIX
+`$XDG_CONFIG_HOME/displayxr/service.json`) carries a `controllers` map keyed by the
+registration `<id>`:
+
+```json
+{
+  "workspace": "auto",
+  "workspace_binary": "",
+  "start_on_login": true,
+  "controllers": {
+    "shell": { "hotkey": "Ctrl+Shift+F9", "mode": "auto" }
+  }
+}
+```
+
+| key | absent | values |
+|---|---|---|
+| `hotkey` | `Ctrl+Space` | a combo (below), or `null` = no hotkey (launch from the tray / `workspace launch` only) |
+| `mode` | `auto` | `auto` (on demand) or `disabled` (never launched, no hook) |
+
+An entry exists only while it differs from the defaults (the CLI prunes it back), so
+"an entry exists" is what `source: "user"` reports. The top-level `workspace` keeps its
+old meaning — **the active controller's** mode (`auto` / `disable` / the legacy
+always-on `enable`) — and every writer (CLI, tray menu) keeps it and the active
+controller's `mode` in step. In a hand-edited file where they disagree, the
+per-controller entry wins. `enable` has no per-controller spelling and reports as `auto`.
+
+**Combo grammar.** `[Ctrl+][Shift+][Alt+][Win+]<Key>`, at least one modifier.
+`<Key>` is `Space`, `A`-`Z`, `0`-`9`, `F1`-`F24`, `Tab`, `Enter`, `Backquote`, `Minus`,
+`Equals`, `BracketLeft`, `BracketRight`, `Semicolon`, `Quote`, `Comma`, `Period`, `Slash`,
+`Backslash`, `Insert`, `Delete`, `Home`, `End`, `PageUp`, `PageDown`, `Left`, `Up`,
+`Right`, `Down`. The parser is case-insensitive, takes the modifiers in any order (each
+once) and also accepts `ArrowLeft`/`ArrowUp`/`ArrowRight`/`ArrowDown`; everything is
+stored and reported in the canonical spelling (modifiers in the order above, keys as
+listed). Anything else is rejected. Implementation: `service_hotkey.c`, unit-tested in
+`tests_service_workspace_config`.
+
+**Matching.** The service's `WH_KEYBOARD_LL` hook fires on the configured key with
+**exactly** the configured modifier set down — every required modifier down, every other
+modifier up — so `Ctrl+Space` does not swallow `Ctrl+Shift+Space` or the `Win+Space` IME
+switch. As before (#344) the hook is installed only in `auto` mode while the controller is
+**not** running; `disabled` or `hotkey: null` installs no hook at all.
+
+**Active controller.** `active_id` is the controller the service spawns — the selection
+rule of *Service-side discovery* below (`service_config_pick_controller`, shared by the
+service and the CLI). Only the active controller is launched by the hotkey or
+`workspace launch`; settings for the others are stored and apply once one is active.
+
+**CLI.**
+
+```
+displayxr-cli workspace list [--json]
+displayxr-cli workspace set <id> --hotkey "<combo>" | --no-hotkey | --mode auto|disabled
+displayxr-cli workspace reset <id>                 # back to Ctrl+Space, auto
+displayxr-cli workspace launch <id>                # spawn now, through the running service
+displayxr-cli workspace hotkey-suspend on|off      # take the hook out / put it back
+```
+
+`workspace list --json`:
+
+```json
+{ "active_id": "<id>" | null,
+  "dev_override": "<path>" | null,
+  "controllers": [ { "id", "display_name", "vendor", "version", "binary",
+                     "registered": true,
+                     "connected": bool | null, "pid": int | null,
+                     "launch": { "mode": "auto" | "disabled",
+                                 "hotkey": "<combo>" | null,
+                                 "source": "default" | "user" } } ] }
+```
+
+`id` is the registration subkey; `display_name` / `vendor` / `version` / `binary` are the
+registration values verbatim. `connected` / `pid` come from the running service over DIAG
+IPC (a `CONTROLLER`-class client whose executable is the controller's `binary`); both are
+`null` when no service is reachable. `dev_override` is the `workspace_binary` path override,
+when set (no registered controller is then active). `info --json` carries the same objects
+as `workspace_controllers[]`, headless (`connected` / `pid` null). The CLI checks that the
+service pipe exists before connecting, so a settings read never auto-starts the service.
+
+**Live apply.** Three session-free, DIAG-only RPCs (appended to `proto.json`):
+
+| RPC | what the service does |
+|---|---|
+| `system_reload_service_config` | re-reads `service.json` on the tray thread and applies it through the same function the tray menu uses: a changed combo re-installs the hook, a changed mode applies the mode (`disabled` terminates a running controller, exactly as the tray's Disable does); a hotkey change never restarts a running controller. `workspace set` / `reset` call it, and print "applies on next service start" when no service is reachable |
+| `system_workspace_launch(controller)` → `status` | the hotkey's own spawn path. `status`: `0` started, `1` not the active controller, `2` disabled, `3` already running (the orchestrator's child, or a controller started outside it), `4` no controller, `5` no orchestrator |
+| `system_workspace_hotkey_suspend(suspend)` | `true`: take the hook out of the input pipeline so a hotkey-capture box (the dashboard's) sees the **current** combo — config and a running controller untouched; `false`: re-install it from the current config. Not tied to the caller's connection (the caller is a one-shot CLI); it resumes on an explicit `false` or after a **60 s** safety timeout that every `true` re-arms. One WARN on suspend, one on resume with the reason (`explicit` / `timeout`) |
+
+**Advisory to the controller.** The service exports `DISPLAYXR_WORKSPACE_HOTKEY=<combo>`
+(unset when there is none) into the environment the controller is spawned with. While the
+controller runs, dismissing it is the controller's own binding (it owns its toggle chord,
+#344); a controller that wants the summon and dismiss chords to agree reads this variable.
+Nothing requires it to.
+
+**Tray.** The active controller's submenu shows a greyed `Launch hotkey: <combo>` (or
+`none`) line, and the tray tooltip names the combo — never a hard-coded Ctrl+Space.
+
 ## Service-side discovery
 
 At service startup, the orchestrator (`service_orchestrator.c`):
@@ -207,7 +311,10 @@ At service startup, the orchestrator (`service_orchestrator.c`):
    if not registered.
 4. Else, pick the first enumerated entry.
 5. If no entries exist, the runtime runs in standalone-platform mode
-   — no workspace submenu in the tray, no Ctrl+Space hotkey.
+   — no workspace submenu in the tray, no launch hotkey.
+
+Steps 1, 3 and 4 are `service_config_pick_controller()`, the one selection rule the
+service and `displayxr-cli workspace list` (`active_id`) share.
 
 Tray UI (when one or more controllers are registered) shows the
 active controller's `DisplayName` as the submenu parent. A future
