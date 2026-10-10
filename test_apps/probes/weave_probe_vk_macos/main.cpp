@@ -33,6 +33,16 @@
  * SIM_DISPLAY_METAL_SNAP_PERIOD to the same value and DXR_WEAVE_MAC_BACKEND=metal
  * (the vk backend never snaps on macOS, so pass no period there).
  *
+ * --views <service-log> (needs --geometry): per-window OOP views for a weave
+ * session. After the submits it locates views (PRIMARY_STEREO) with a chained
+ * XrDisplayRigDXR + a window-centred XrDisplayZoneDXR and asserts: views valid
+ * + tracked, raw eyes tracked when the probe runs with
+ * SIM_DISPLAY_FAKE_TRACKING=1 (set it on the SERVICE too), the two eyes
+ * differ (stereo), and the service log's "(macOS weave)" per-window offset
+ * equals the window centre's offset from the panel centre within 1 mm (panel
+ * = displayId, else the display containing the origin, else main; pitch from
+ * XR_DXR_display_info).
+ *
  * The service picks its weave backend with DXR_WEAVE_MAC_BACKEND=auto|metal|vk
  * (sim_display exports both DP families, so auto = vk); every check above holds
  * on both backends.
@@ -40,6 +50,7 @@
 
 #include <IOSurface/IOSurface.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <CoreGraphics/CoreGraphics.h>
 
 #include <vulkan/vulkan.h>
 
@@ -48,11 +59,16 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 #include <openxr/XR_DXR_weave.h>
+#include <openxr/XR_DXR_display_info.h>
+#include <openxr/XR_DXR_view_rig.h>
+#include <openxr/XR_DXR_local_3d_zone.h>
+#include <openxr/XR_DXR_display_zones.h>
 
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -323,6 +339,199 @@ split_exts(const std::string &s, std::vector<std::string> &storage, std::vector<
 	}
 }
 
+/*!
+ * A display's rect in global CoreGraphics BACKING px (points x the mode's
+ * backing scale) — the convention XrWeaveWindowGeometryDXR uses on macOS.
+ */
+static bool
+display_backing_rect(CGDirectDisplayID d, double *x, double *y, double *w, double *h)
+{
+	const CGRect b = CGDisplayBounds(d);
+	if (b.size.width <= 0.0) {
+		return false;
+	}
+	double scale = 1.0;
+	CGDisplayModeRef mode = CGDisplayCopyDisplayMode(d);
+	if (mode != NULL) {
+		scale = (double)CGDisplayModeGetPixelWidth(mode) / b.size.width;
+		CGDisplayModeRelease(mode);
+	}
+	*x = b.origin.x * scale;
+	*y = b.origin.y * scale;
+	*w = b.size.width * scale;
+	*h = b.size.height * scale;
+	return true;
+}
+
+//! The panel a weave geometry origin lands on: displayId, else containment, else main.
+static CGDirectDisplayID
+probe_panel(int ox, int oy, int display_id, double *px, double *py, double *pw, double *ph)
+{
+	if (display_id > 0 && display_backing_rect((CGDirectDisplayID)display_id, px, py, pw, ph)) {
+		return (CGDirectDisplayID)display_id;
+	}
+	CGDirectDisplayID ids[16];
+	uint32_t n = 0;
+	if (CGGetActiveDisplayList(16, ids, &n) == kCGErrorSuccess) {
+		for (uint32_t i = 0; i < n; i++) {
+			double x, y, w, h;
+			if (display_backing_rect(ids[i], &x, &y, &w, &h) && ox >= x && ox < x + w && oy >= y &&
+			    oy < y + h) {
+				*px = x, *py = y, *pw = w, *ph = h;
+				return ids[i];
+			}
+		}
+	}
+	CGDirectDisplayID m = CGMainDisplayID();
+	display_backing_rect(m, px, py, pw, ph);
+	return m;
+}
+
+/*!
+ * --views: per-window OOP views of a weave session (the macOS browser path).
+ * Locates PRIMARY_STEREO with a display rig + a window-centred zone, then
+ * checks validity, tracking, stereo, and the service-logged window offset.
+ */
+static bool
+views_leg(XrInstance instance,
+          XrSystemId system_id,
+          XrSession session,
+          int ox,
+          int oy,
+          int display_id,
+          const char *service_log)
+{
+	// Panel physical size + pixel width -> square pitch (what the runtime uses).
+	XrDisplayInfoDXR info = {(XrStructureType)XR_TYPE_DISPLAY_INFO_DXR};
+	XrSystemProperties sp = {XR_TYPE_SYSTEM_PROPERTIES};
+	sp.next = &info;
+	if (XR_FAILED(xrGetSystemProperties(instance, system_id, &sp)) || info.displayPixelWidth == 0 ||
+	    info.displaySizeMeters.width <= 0.0f) {
+		LOG("views FAIL: no XrDisplayInfoDXR (px=%u, m=%.4f)", info.displayPixelWidth,
+		    (double)info.displaySizeMeters.width);
+		return false;
+	}
+	const double pitch = (double)info.displaySizeMeters.width / (double)info.displayPixelWidth;
+	double px = 0, py = 0, pw = 0, ph = 0;
+	const CGDirectDisplayID panel = probe_panel(ox, oy, display_id, &px, &py, &pw, &ph);
+	const double want_x = ((ox - px) + kWinW * 0.5 - pw * 0.5) * pitch;
+	const double want_y = -(((oy - py) + kWinH * 0.5 - ph * 0.5) * pitch);
+	LOG("views: panel 0x%x backing (%.0f,%.0f %.0fx%.0f), pitch %.6f m/px -> expected window offset "
+	    "(%.4f,%.4f) m",
+	    (unsigned)panel, px, py, pw, ph, pitch, want_x, want_y);
+
+	XrReferenceSpaceCreateInfo rsci = {XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+	rsci.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+	rsci.poseInReferenceSpace.orientation.w = 1.0f;
+	XrSpace space = XR_NULL_HANDLE;
+	if (XR_FAILED(xrCreateReferenceSpace(session, &rsci, &space))) {
+		LOG("views FAIL: xrCreateReferenceSpace");
+		return false;
+	}
+
+	// A window-centred zone, so the zone adds no offset of its own and the
+	// logged window offset is the whole story.
+	XrDisplayZoneDXR zone = {(XrStructureType)XR_TYPE_DISPLAY_ZONE_DXR};
+	zone.zoneId = 1;
+	zone.rect = {{(int32_t)kWinW / 4, (int32_t)kWinH / 4}, {(int32_t)kWinW / 2, (int32_t)kWinH / 2}};
+	XrDisplayRigDXR rig = {(XrStructureType)XR_TYPE_DISPLAY_RIG_DXR};
+	rig.next = &zone;
+	rig.pose.orientation.w = 1.0f;
+	rig.virtualDisplayHeight = (float)(kWinH / 2 * pitch); // m2v = 1 for the zone
+	rig.ipdFactor = 1.0f;
+	rig.parallaxFactor = 1.0f;
+	rig.perspectiveFactor = 1.0f;
+
+	XrViewLocateInfo vli = {XR_TYPE_VIEW_LOCATE_INFO};
+	vli.next = &rig;
+	vli.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+	vli.displayTime = 1000000000; // any valid time: the sim/fake tracker is time-free
+	vli.space = space;
+
+	XrViewEyeTrackingStateDXR ets = {(XrStructureType)XR_TYPE_VIEW_EYE_TRACKING_STATE_DXR};
+	XrViewDisplayRawDXR raw = {(XrStructureType)XR_TYPE_VIEW_DISPLAY_RAW_DXR};
+	raw.next = &ets;
+	XrViewState vs = {XR_TYPE_VIEW_STATE};
+	vs.next = &raw;
+	XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+	uint32_t n = 0;
+	XrResult r = XR_SUCCESS;
+	// A few locates: the per-window log line is written on the first one.
+	for (int i = 0; i < 3 && XR_SUCCEEDED(r); i++) {
+		vli.displayTime += 16666666;
+		r = xrLocateViews(session, &vli, &vs, 2, &n, views);
+	}
+	xrDestroySpace(space);
+	if (XR_FAILED(r) || n != 2) {
+		LOG("views FAIL: xrLocateViews -> %d (n=%u)", (int)r, n);
+		return false;
+	}
+
+	bool ok = true;
+	const XrViewStateFlags need = XR_VIEW_STATE_POSITION_VALID_BIT | XR_VIEW_STATE_ORIENTATION_VALID_BIT |
+	                              XR_VIEW_STATE_POSITION_TRACKED_BIT | XR_VIEW_STATE_ORIENTATION_TRACKED_BIT;
+	const bool flags_ok = (vs.viewStateFlags & need) == need;
+	LOG("views: viewStateFlags=0x%llx (want valid+tracked) -> %s", (unsigned long long)vs.viewStateFlags,
+	    flags_ok ? "OK" : "WRONG");
+	ok = ok && flags_ok;
+
+	const char *ft = getenv("SIM_DISPLAY_FAKE_TRACKING");
+	const bool want_tracking = ft != NULL && ft[0] == '1';
+	LOG("views: raw eyes=%u isTracking=%d [0]=(%.4f,%.4f,%.4f) [1]=(%.4f,%.4f,%.4f) canvas %.4fx%.4fm",
+	    raw.eyeCountOutput, (int)raw.isTracking, (double)raw.rawEyes[0].x, (double)raw.rawEyes[0].y,
+	    (double)raw.rawEyes[0].z, (double)raw.rawEyes[1].x, (double)raw.rawEyes[1].y, (double)raw.rawEyes[1].z,
+	    (double)raw.canvasSizeMeters.width, (double)raw.canvasSizeMeters.height);
+	if (want_tracking) {
+		const bool t_ok = raw.isTracking == XR_TRUE;
+		LOG("views: DP eyes tracked (SIM_DISPLAY_FAKE_TRACKING=1) -> %s", t_ok ? "OK" : "WRONG");
+		ok = ok && t_ok;
+		// The derived per-view state rides a separate IPC (eye positions RPC).
+		const bool e_ok = ets.isTracking == XR_TRUE;
+		LOG("views: XrViewEyeTrackingStateDXR.isTracking=%d -> %s", (int)ets.isTracking, e_ok ? "OK" : "WRONG");
+		ok = ok && e_ok;
+	}
+
+	const XrVector3f &a = views[0].pose.position;
+	const XrVector3f &b = views[1].pose.position;
+	const double sep = sqrt((double)(a.x - b.x) * (a.x - b.x) + (double)(a.y - b.y) * (a.y - b.y) +
+	                        (double)(a.z - b.z) * (a.z - b.z));
+	const bool stereo_ok = sep > 0.01 && views[0].fov.angleLeft != views[1].fov.angleLeft;
+	LOG("views: eye0=(%.4f,%.4f,%.4f) eye1=(%.4f,%.4f,%.4f) sep=%.4f m, fovL %.4f vs %.4f -> %s", a.x, a.y,
+	    a.z, b.x, b.y, b.z, sep, (double)views[0].fov.angleLeft, (double)views[1].fov.angleLeft,
+	    stereo_ok ? "OK (stereo)" : "WRONG (mono / identical)");
+	ok = ok && stereo_ok;
+
+	// The service's lifecycle line for THIS window (last match wins).
+	FILE *f = fopen(service_log, "r");
+	if (f == NULL) {
+		LOG("views FAIL: cannot open service log %s", service_log);
+		return false;
+	}
+	char line[1024];
+	bool found = false;
+	double got_x = 0, got_y = 0;
+	while (fgets(line, sizeof(line), f) != NULL) {
+		if (strstr(line, "(macOS weave)") == NULL) {
+			continue;
+		}
+		const char *o = strstr(line, "offset=(");
+		double x = 0, y = 0;
+		if (o != NULL && sscanf(o, "offset=(%lf,%lf)", &x, &y) == 2) {
+			got_x = x, got_y = y, found = true;
+		}
+	}
+	fclose(f);
+	if (!found) {
+		LOG("views FAIL: no \"(macOS weave)\" per-window line in %s", service_log);
+		return false;
+	}
+	const bool off_ok = fabs(got_x - want_x) <= 0.001 && fabs(got_y - want_y) <= 0.001 &&
+	                    (fabs(got_x) > 0.0005 || fabs(got_y) > 0.0005);
+	LOG("views: service winOffset=(%.4f,%.4f) m vs expected (%.4f,%.4f) m (tol 1 mm, non-zero) -> %s", got_x,
+	    got_y, want_x, want_y, off_ok ? "OK" : "WRONG");
+	return ok && off_ok;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -335,8 +544,11 @@ main(int argc, char **argv)
 	int geom_x = 0, geom_y = 0, geom_display = -1;
 	bool do_snap = false;
 	int snap_period = 0; // 0/1 = expect identity
+	const char *views_log = NULL; // --views <service log>
 	for (int i = 1; i < argc; i++) {
-		if (strcmp(argv[i], "--snap") == 0) {
+		if (strcmp(argv[i], "--views") == 0 && i + 1 < argc) {
+			views_log = argv[++i];
+		} else if (strcmp(argv[i], "--snap") == 0) {
 			do_snap = true;
 			if (i + 1 < argc && argv[i + 1][0] != '-') {
 				snap_period = atoi(argv[++i]);
@@ -349,9 +561,13 @@ main(int argc, char **argv)
 			}
 			have_geometry = true;
 		} else {
-			LOG("usage: %s [--geometry ox,oy[,display]] [--snap [period]]", argv[0]);
+			LOG("usage: %s [--geometry ox,oy[,display]] [--snap [period]] [--views <service-log>]", argv[0]);
 			return 1;
 		}
+	}
+	if (views_log != NULL && !have_geometry) {
+		LOG("--views needs --geometry (the per-window Kooima keys on the bound window)");
+		return 1;
 	}
 
 	// ---- Instance with the weave + vulkan-enable extensions.
@@ -359,8 +575,11 @@ main(int argc, char **argv)
 	XR_CHECK(xrEnumerateInstanceExtensionProperties(NULL, 0, &ext_count, NULL));
 	std::vector<XrExtensionProperties> exts(ext_count, {XR_TYPE_EXTENSION_PROPERTIES});
 	XR_CHECK(xrEnumerateInstanceExtensionProperties(NULL, ext_count, &ext_count, exts.data()));
-	bool has_weave = false, has_vk = false;
+	bool has_weave = false, has_vk = false, has_rig = false, has_zones = false, has_info = false;
 	for (const auto &e : exts) {
+		has_rig = has_rig || strcmp(e.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0;
+		has_zones = has_zones || strcmp(e.extensionName, XR_DXR_DISPLAY_ZONES_EXTENSION_NAME) == 0;
+		has_info = has_info || strcmp(e.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0;
 		if (strcmp(e.extensionName, XR_DXR_WEAVE_EXTENSION_NAME) == 0) {
 			has_weave = true;
 		}
@@ -374,14 +593,21 @@ main(int argc, char **argv)
 		return 1;
 	}
 
-	const char *enabled[] = {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME, XR_DXR_WEAVE_EXTENSION_NAME};
+	if (views_log != NULL && (!has_rig || !has_zones || !has_info)) {
+		LOG("--views needs XR_DXR_view_rig (%d) + XR_DXR_display_zones (%d) + XR_DXR_display_info (%d)",
+		    (int)has_rig, (int)has_zones, (int)has_info);
+		return 1;
+	}
+	const char *enabled[] = {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME, XR_DXR_WEAVE_EXTENSION_NAME,
+	                         XR_DXR_VIEW_RIG_EXTENSION_NAME, XR_DXR_DISPLAY_ZONES_EXTENSION_NAME,
+	                         XR_DXR_DISPLAY_INFO_EXTENSION_NAME, XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME};
 	XrInstanceCreateInfo ici = {XR_TYPE_INSTANCE_CREATE_INFO};
 	snprintf(ici.applicationInfo.applicationName, sizeof(ici.applicationInfo.applicationName), "%s",
 	         "DXRWeaveProbeMacOS");
 	ici.applicationInfo.applicationVersion = 1;
 	snprintf(ici.applicationInfo.engineName, sizeof(ici.applicationInfo.engineName), "%s", "None");
 	ici.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
-	ici.enabledExtensionCount = 2;
+	ici.enabledExtensionCount = views_log != NULL ? 6 : 2; // display_zones requires local_3d_zone
 	ici.enabledExtensionNames = enabled;
 	XrInstance instance = XR_NULL_HANDLE;
 	XR_CHECK(xrCreateInstance(&ici, &instance));
@@ -655,6 +881,12 @@ main(int argc, char **argv)
 		LOG("snap: %s", snap_ok ? "PASS" : "FAIL");
 	}
 
+	bool views_ok = true;
+	if (views_log != NULL) {
+		views_ok = views_leg(instance, system_id, session, geom_x, geom_y, geom_display, views_log);
+		LOG("views: %s", views_ok ? "PASS" : "FAIL");
+	}
+
 	// ---- Verify the anaglyph weave on the CPU.
 	dump_ppm(output, "/tmp/weave_probe_macos_output.ppm");
 
@@ -668,7 +900,7 @@ main(int argc, char **argv)
 	    {"rectB(cyan)", kRectB.offset.x + kRectB.extent.width / 2, kRectB.offset.y + kRectB.extent.height / 2,
 	     false},
 	};
-	bool pass = snap_ok;
+	bool pass = snap_ok && views_ok;
 	for (const auto &c : checks) {
 		uint8_t r = 0, g = 0, b = 0;
 		if (!sample_px(output, c.x, c.y, &r, &g, &b)) {

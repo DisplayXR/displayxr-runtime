@@ -1451,6 +1451,52 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 			                       fabsf(win_orient.z) > 0.0001f || fabsf(win_orient.w - 1.0f) > 0.0001f);
 		}
 	}
+
+	// PER-WINDOW Kooima for a macOS weave present-owner (the DisplayXR Browser)
+	// — the macOS counterpart of the desktop-Linux #1699 block above. The
+	// window is the geometry the caller bound (xrWeaveBindWindow2DXR /
+	// xrWeaveSetWindowGeometryDXR: global CoreGraphics BACKING px, y down),
+	// re-based by the weave front end to the SAME panel and origin it feeds the
+	// DP phase slot. screen = the window's metres, render eyes rebased to the
+	// window centre, so the off-axis frustum looks THROUGH the window instead
+	// of spanning the panel. multi_compositor_get_window_metrics() cannot do
+	// this re-base on macOS (it has no panel origin for a global CG rect), so
+	// without it the window's offset from the panel centre was dropped and
+	// every off-centre window rendered as if centred. A controller-placed
+	// window (#59 above) keeps its pose; no bound geometry → display-scoped.
+	if (!placed_window) {
+		int32_t wx = 0, wy = 0;
+		uint32_t ww = 0, wh = 0, pw = 0, ph = 0;
+		// Square-pixel pitch from the panel's physical size, as the Linux arm
+		// and the display-zones rebase below use it.
+		float pitch = 0.0f;
+		if (s->xsysc->info.display_pixel_width > 0 && s->xsysc->info.display_width_m > 0.0f) {
+			pitch = s->xsysc->info.display_width_m / (float)s->xsysc->info.display_pixel_width;
+		}
+		if (pitch > 0.0f && comp_multi_weave_macos_window_on_panel(mc, &wx, &wy, &ww, &wh, &pw, &ph)) {
+			screen_width_m = (float)ww * pitch;
+			screen_height_m = (float)wh * pitch;
+			// +x right in both frames; y negated because screen pixels are
+			// y-down and eye coordinates are y-up.
+			win_eye_offset_x = ((float)wx + (float)ww * 0.5f - (float)pw * 0.5f) * pitch;
+			win_eye_offset_y = -(((float)wy + (float)wh * 0.5f - (float)ph * 0.5f) * pitch);
+			win_eye_offset_z = 0.0f;
+			// Lifecycle only (a window moved or resized), never per frame.
+			static int32_t logged_x = INT32_MIN, logged_y = INT32_MIN;
+			static uint32_t logged_w = 0, logged_h = 0;
+			if (wx != logged_x || wy != logged_y || ww != logged_w || wh != logged_h) {
+				logged_x = wx;
+				logged_y = wy;
+				logged_w = ww;
+				logged_h = wh;
+				IPC_WARN(s,
+				         "oop Kooima: per-window rect=(%d,%d %ux%u)px on panel %ux%u canvas=%.4fx%.4fm "
+				         "offset=(%.4f,%.4f)m (macOS weave)",
+				         wx, wy, ww, wh, pw, ph, (double)screen_width_m, (double)screen_height_m,
+				         (double)win_eye_offset_x, (double)win_eye_offset_y);
+			}
+		}
+	}
 #endif
 
 	// Full-window meters + pixel dims, captured BEFORE the zone rebase below
@@ -1848,10 +1894,10 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 		float fov_aspect = (v != 0.0f) ? (h / v) : 0.0f;
 		IPC_WARN(s,
 		         "oop Kooima: views=%u screen=%.3fx%.3fm winOffset=(%.4f,%.4f)m FOV H=%.1f° V=%.1f° "
-		         "fovAspect=%.3f tracking=%d rig=%d zone=%d",
+		         "fovAspect=%.3f dp_eyes=%d tracking=%d rig=%d zone=%d",
 		         view_count, (double)screen_width_m, (double)screen_height_m, (double)win_eye_offset_x,
 		         (double)win_eye_offset_y, (double)h, (double)v,
-		         (double)fov_aspect, (int)is_tracking, (int)rig_display, (int)zone_applied);
+		         (double)fov_aspect, (int)have_dp_eyes, (int)is_tracking, (int)rig_display, (int)zone_applied);
 	}
 
 	return true;
@@ -3087,6 +3133,16 @@ ipc_handle_compositor_get_predicted_eye_positions(volatile struct ipc_client_sta
 		// even while its own located views are tracked.
 		(void)comp_d3d11_service_get_predicted_eye_positions_full_for_client(
 		    ics->server->xsysc, (struct xrt_compositor *)ics->xc, &eyes);
+	}
+#elif defined(XRT_OS_MACOS)
+	// macOS null+comp_multi service: THIS client's DP — its per-session DP,
+	// else its weave engine's (vk or Metal backend), the same eye source
+	// ipc_try_get_oop_view_poses uses for its views. Without this branch a
+	// macOS IPC session's XrViewEyeTrackingStateDXR.isTracking was constant
+	// FALSE (and the tracking-state edge event never fired) even while its
+	// located views and the weave itself tracked the head.
+	if (ics->xc != NULL) {
+		(void)multi_compositor_get_predicted_eye_positions(multi_compositor(ics->xc), &eyes);
 	}
 #else
 	(void)ics;
