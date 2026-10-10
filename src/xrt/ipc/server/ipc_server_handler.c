@@ -9089,6 +9089,7 @@ ipc_handle_lift_weave_rects(volatile struct ipc_client_state *ics, const struct 
 		rects[i].has_view_control = w->has_view_control != 0;
 		rects[i].view_control = w->view_control;
 		rects[i].rig = w->rig;
+		rects[i].depth_cursor = w->depth_cursor != 0;
 		// XR_DXR_lift v3: this rect's EXPLICIT viewpoints, staged by
 		// lift_weave_rect_viewpoints just before (none staged = tracked).
 		if (w->viewpoint_count > 0) {

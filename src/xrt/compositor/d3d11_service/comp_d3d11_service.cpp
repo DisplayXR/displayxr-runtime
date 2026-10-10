@@ -846,6 +846,8 @@ struct d3d11_client_render_resources
 	//! last weave submit got the depth cursor (bit = binding index), and each
 	//! lifted stream's cursor state.
 	uint32_t                               lift_cursor_mask;
+	//! Why the last lifted-rect cursor was / was not drawn (logged on change).
+	int                                    lift_cursor_reason;
 	struct svc_lift_cursor                 lift_cursor[XRT_LIFT_WEAVE_RECTS_MAX];
 
 	//! Cached import of the caller's v4 overlay atlas (browser#18), keyed by the
@@ -25370,24 +25372,67 @@ struct svc_lift_cursor_view
  * true when the cursor was drawn this frame — the caller then reports the
  * rect, and the app hides its OS cursor over it.
  */
+enum svc_lift_cursor_reason
+{
+	SVC_LC_DRAWN = 1,
+	SVC_LC_WORKSPACE_CURSOR,
+	SVC_LC_NO_WINDOW,
+	SVC_LC_NO_RECT_OR_VIEWPOINTS,
+	SVC_LC_NO_CURSOR_POS,
+	SVC_LC_NOT_OVER_WINDOW,
+	SVC_LC_NOT_OVER_PICTURE,
+	SVC_LC_NO_RELIEF,
+	SVC_LC_NO_DEPTH_SAMPLE,
+	SVC_LC_BAD_EYES,
+	SVC_LC_PROJECT_FAILED,
+	SVC_LC_NO_SPRITE,
+};
+
+static const char *
+svc_lift_cursor_reason_str(int r)
+{
+	switch (r) {
+	case SVC_LC_DRAWN: return "DRAWN";
+	case SVC_LC_WORKSPACE_CURSOR: return "not drawn: a workspace cursor is shown";
+	case SVC_LC_NO_WINDOW: return "not drawn: no bound weave window";
+	case SVC_LC_NO_RECT_OR_VIEWPOINTS: return "not drawn: empty rect, no viewpoints or no rect size";
+	case SVC_LC_NO_CURSOR_POS: return "not drawn: GetCursorPos failed";
+	case SVC_LC_NOT_OVER_WINDOW: return "not drawn: the cursor is not over the bound window";
+	case SVC_LC_NOT_OVER_PICTURE: return "not drawn: the cursor is not over the lifted picture";
+	case SVC_LC_NO_RELIEF: return "not drawn: no relief mapping (module without a display mapping)";
+	case SVC_LC_NO_DEPTH_SAMPLE: return "not drawn: no recent depth reading yet";
+	case SVC_LC_BAD_EYES: return "not drawn: viewpoints not in front of the screen";
+	case SVC_LC_PROJECT_FAILED: return "not drawn: degenerate placement";
+	case SVC_LC_NO_SPRITE: return "not drawn: no sprite";
+	default: return "?";
+	}
+}
+
 static bool
-svc_lift_cursor_draw(struct d3d11_service_system *sys,
-                     struct d3d11_service_compositor *c,
-                     struct d3d11_lift_pin *pin,
-                     const struct xrt_rect &rect,
-                     const struct svc_lift_cursor_view *views,
-                     uint32_t view_count,
-                     ID3D11RenderTargetView *rtv,
-                     float target_w,
-                     float target_h)
+svc_lift_cursor_draw_impl(struct d3d11_service_system *sys,
+                          struct d3d11_service_compositor *c,
+                          struct d3d11_lift_pin *pin,
+                          const struct xrt_rect &rect,
+                          const struct svc_lift_cursor_view *views,
+                          uint32_t view_count,
+                          ID3D11RenderTargetView *rtv,
+                          float target_w,
+                          float target_h,
+                          int *why)
 {
 	// The workspace controller draws its own cursor; never two (until Phase 4).
 	if (sys->cursor_visible && sys->cursor_xsc != nullptr) {
+		*why = SVC_LC_WORKSPACE_CURSOR;
 		return false;
 	}
 	HWND hwnd = c->render.weave_hwnd;
-	if (hwnd == nullptr || rect.extent.w <= 0 || rect.extent.h <= 0 || pin->vp_count == 0 ||
-	    pin->rect_size[0] <= 0.0f || pin->rect_size[1] <= 0.0f) {
+	if (hwnd == nullptr) {
+		*why = SVC_LC_NO_WINDOW;
+		return false;
+	}
+	if (rect.extent.w <= 0 || rect.extent.h <= 0 || pin->vp_count == 0 || pin->rect_size[0] <= 0.0f ||
+	    pin->rect_size[1] <= 0.0f) {
+		*why = SVC_LC_NO_RECT_OR_VIEWPOINTS;
 		return false;
 	}
 	const uint64_t now_ns = os_monotonic_get_ns();
@@ -25398,16 +25443,19 @@ svc_lift_cursor_draw(struct d3d11_service_system *sys,
 	// that window (not another one on top of it).
 	POINT pt;
 	if (!GetCursorPos(&pt)) {
+		*why = SVC_LC_NO_CURSOR_POS;
 		return false;
 	}
 	HWND under = WindowFromPoint(pt);
 	if (under == nullptr || GetAncestor(under, GA_ROOT) != GetAncestor(hwnd, GA_ROOT) || !ScreenToClient(hwnd, &pt)) {
+		*why = SVC_LC_NOT_OVER_WINDOW;
 		return false;
 	}
 	const float fx = ((float)pt.x - (float)rect.offset.w) / (float)rect.extent.w;
 	const float fy = ((float)pt.y - (float)rect.offset.h) / (float)rect.extent.h;
 	const float a0 = pin->active[0], a1 = pin->active[1], a2 = pin->active[2], a3 = pin->active[3];
 	if (fx < a0 || fx >= a2 || fy < a1 || fy >= a3 || a2 <= a0 || a3 <= a1) {
+		*why = SVC_LC_NOT_OVER_PICTURE;
 		return false; // not over the converted picture (outside, or over a letterbox bar)
 	}
 
@@ -25433,12 +25481,18 @@ svc_lift_cursor_draw(struct d3d11_service_system *sys,
 		        pin->relief_valid ? "yes" : "NO (module renders without a display mapping)", pin->vp_count);
 	}
 	// No depth reading yet, or none recently (depth stopped): leave the OS cursor.
-	if (!pin->relief_valid || !lc->have_sample || now_ns - lc->sample_ns > 500000000ull) {
+	if (!pin->relief_valid) {
+		*why = SVC_LC_NO_RELIEF;
+		return false;
+	}
+	if (!lc->have_sample || now_ns - lc->sample_ns > 500000000ull) {
+		*why = SVC_LC_NO_DEPTH_SAMPLE;
 		return false;
 	}
 
 	float e[3];
 	if (!u_lift_cursor_eye_midpoint(pin->vps, pin->vp_count, e)) {
+		*why = SVC_LC_BAD_EYES;
 		return false;
 	}
 	struct u_cursor_depth_tuning tuning;
@@ -25453,11 +25507,13 @@ svc_lift_cursor_draw(struct d3d11_service_system *sys,
 	float xy[2 * U_LIFT_CURSOR_MAX_VIEWS];
 	const uint32_t nvp = pin->vp_count > U_LIFT_CURSOR_MAX_VIEWS ? U_LIFT_CURSOR_MAX_VIEWS : pin->vp_count;
 	if (!u_lift_cursor_project(e, sx, sy, d, pin->vps, nvp, xy)) {
+		*why = SVC_LC_PROJECT_FAILED;
 		return false;
 	}
 
 	ID3D11ShaderResourceView *sprite = svc_lift_cursor_sprite(sys);
 	if (sprite == nullptr) {
+		*why = SVC_LC_NO_SPRITE;
 		return false;
 	}
 	struct svc_cursor_quad quads[SVC_CURSOR_MAX_QUADS];
@@ -25478,7 +25534,30 @@ svc_lift_cursor_draw(struct d3d11_service_system *sys,
 	}
 	svc_draw_cursor_quads(sys, rtv, target_w, target_h, sprite, SVC_LIFT_CURSOR_SPRITE_W, SVC_LIFT_CURSOR_SPRITE_H,
 	                      quads, nq, /*tint*/ nullptr, /*convert_srgb*/ false);
+	*why = SVC_LC_DRAWN;
 	return true;
+}
+
+//! svc_lift_cursor_draw_impl + one WARN whenever the outcome changes (never per frame).
+static bool
+svc_lift_cursor_draw(struct d3d11_service_system *sys,
+                     struct d3d11_service_compositor *c,
+                     struct d3d11_lift_pin *pin,
+                     const struct xrt_rect &rect,
+                     const struct svc_lift_cursor_view *views,
+                     uint32_t view_count,
+                     ID3D11RenderTargetView *rtv,
+                     float target_w,
+                     float target_h)
+{
+	int why = 0;
+	const bool drawn = svc_lift_cursor_draw_impl(sys, c, pin, rect, views, view_count, rtv, target_w, target_h, &why);
+	if (why != c->render.lift_cursor_reason) {
+		c->render.lift_cursor_reason = why;
+		U_LOG_W("[lift cursor] stream %llu: %s", (unsigned long long)pin->stream_id,
+		        svc_lift_cursor_reason_str(why));
+	}
+	return drawn;
 }
 
 /*!
