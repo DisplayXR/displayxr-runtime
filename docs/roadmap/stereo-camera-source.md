@@ -99,6 +99,14 @@ process across milestones):
 
 ## C. Android
 
+> **Android design proposal (2026-10-06):** [stereo-camera-android.md](stereo-camera-android.md)
+> works through who owns the tablet's Camera2 pair, given that opening the front pair evicts the
+> vendor head tracker. It recommends shipping the rear pair first, then having the runtime satellite
+> that weaves for the browser own the front pair and drive in-app tracking from it, with a
+> vendor-service-owned pair as the end state. It also covers the browser capture path, calibration
+> and rotation, Android consent (package identity rather than executable path), the ABI additions
+> for zero-copy, and gated phases A0–A4/B2 that supersede A1/B2 below.
+
 ### C.0 Field facts (NP02J / K68 tablet, measured 2026-09-26)
 
 **Camera topology.** Camera2 reports six ids on the tablet: 0 and 2 are back lenses, 1 and 3 front

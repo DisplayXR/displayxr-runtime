@@ -180,6 +180,7 @@ Design docs, status trackers, and plans — some shipped, some in progress. Afte
 - [Spatial Desktop PRD](roadmap/spatial-desktop-prd.md) — product vision
 - [PR FAQ](roadmap/prfaq.md) — press-release-style framing
 - [Stereo Camera Source](roadmap/stereo-camera-source.md) — a display's (eye-tracking) stereo camera as a plug-in-provided, privacy-gated source for web calls: browser `getUserMedia` integration, Android, phased plan (design, ADR-043)
+- [Stereo Camera on Android](roadmap/stereo-camera-android.md) — who owns the tablet's Camera2 stereo pair (exclusive with the head tracker), the Android browser capture path, calibration/rotation, Android consent, ABI additions, gated phases (proposal)
 - [Spatial Workspace Extensions Plan](roadmap/spatial-workspace-extensions-plan.md) — three-phase plan to decouple the shell from the runtime: boundary rename (Phase 1, done), policy migration behind extensions (Phase 2), repo severance (Phase 3)
 - [Workspace Extensions Header Sketch](roadmap/spatial-workspace-extensions-headers-draft.md) — `XR_DXR_spatial_workspace.h` C-level API draft (historical: the separate app-launcher extension sketched there was dropped; launcher tiles ship as `*.displayxr.json` manifests)
 - [Workspace Controller Detection](roadmap/spatial-workspace-controller-detection.md) — Phase 2.0 prep: orchestrator detects installed controller via sidecar `.controller.json` manifest
