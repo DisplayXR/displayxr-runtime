@@ -79,6 +79,14 @@ set(SIM_DISPLAY_SOURCES
 	sim_display/sim_display_stereo_camera.h
 	sim_display/sim_display_stereo_camera_pattern.c
 	sim_display/sim_display_stereo_camera_pattern.h
+	# #1855: opt-in webcam eye tracking (SIM_DISPLAY_WEBCAM_TRACKING=1).
+	sim_display/sim_display_face_estimator.h
+	sim_display/sim_display_face_estimator_none.c
+	sim_display/sim_display_webcam.c
+	sim_display/sim_display_webcam_tracker.c
+	sim_display/sim_display_webcam_tracker.h
+	sim_display/sim_display_webcam_tracking.c
+	sim_display/sim_display_webcam_tracking.h
 	)
 
 # Vulkan display processor (anaglyph/blend shaders)
@@ -141,7 +149,7 @@ add_library(drv_sim_display STATIC ${SIM_DISPLAY_SOURCES})
 # aux_ogl is only needed by the desktop-GL display processor (gated on
 # NOT ANDROID AND XRT_HAVE_OPENGL above) — keep this link in lockstep so a
 # headless Linux build without GL doesn't drag in GL/GLES aux.
-target_link_libraries(drv_sim_display PRIVATE xrt-interfaces aux_util aux_os PUBLIC drv_includes)
+target_link_libraries(drv_sim_display PRIVATE xrt-interfaces aux_util aux_os aux_os_uvc PUBLIC drv_includes)
 if(NOT ANDROID AND XRT_HAVE_OPENGL)
 	target_link_libraries(drv_sim_display PRIVATE aux_ogl)
 endif()
@@ -221,7 +229,7 @@ if(ANDROID OR XRT_HAVE_LINUX)
 	# (APK lib dir on Android; the plug-in search dir on Linux) and the loader
 	# preloads siblings by path (#333). See docs/roadmap/linux-support.md.
 	target_link_libraries(drv_sim_display_plugin PRIVATE
-		xrt-interfaces aux_util aux_os drv_includes)
+		xrt-interfaces aux_util aux_os aux_os_uvc drv_includes)
 	if(NOT ANDROID AND XRT_HAVE_OPENGL)
 		# Non-Android desktop GL build: the GL DP is compiled in, so it needs
 		# aux_ogl. (Headless Linux without GL skips this, matching the static lib.)
@@ -243,10 +251,21 @@ else()
 			xrt-interfaces
 			aux_util
 			aux_os
+			aux_os_uvc
 			aux_ogl
 			drv_includes
 		)
 	add_dependencies(drv_sim_display_plugin ${RUNTIME_TARGET})
+	if(MSVC)
+		# #1855: the webcam tracker's capture backend (aux_os_uvc, Media
+		# Foundation) is reached only under SIM_DISPLAY_WEBCAM_TRACKING=1.
+		# Delay-load it so every process that loads this plug-in does not map
+		# MF at load — and so the plug-in still loads on Windows "N" editions,
+		# which ship without Media Foundation.
+		target_link_options(drv_sim_display_plugin PRIVATE
+			"/DELAYLOAD:mf.dll" "/DELAYLOAD:mfplat.dll" "/DELAYLOAD:mfreadwrite.dll")
+		target_link_libraries(drv_sim_display_plugin PRIVATE delayimp)
+	endif()
 endif()
 target_include_directories(drv_sim_display_plugin PRIVATE
 	${CMAKE_CURRENT_SOURCE_DIR}/sim_display

@@ -141,14 +141,10 @@ sim_display_plugin_get_display_info(struct xrt_plugin_instance *inst,
 	 * toggle re-enables MANUAL_BIT (paired with HAS_TRACKING on the 3D
 	 * rendering modes in sim_display_device.c) so the MANUAL path and
 	 * XrEventDataEyeTrackingStateChangedDXR are testable without
-	 * hardware. */
-	if (sim_display_fake_tracking_enabled()) {
-		out_info->supported_eye_tracking_modes = 2u; /* MANUAL_BIT */
-		out_info->default_eye_tracking_mode = 1u;    /* MANUAL */
-	} else {
-		out_info->supported_eye_tracking_modes = 0u; /* no tracking */
-		out_info->default_eye_tracking_mode = 0u;    /* undefined; keep 0 */
-	}
+	 * hardware. Opt-in webcam tracking (#1855, SIM_DISPLAY_WEBCAM_TRACKING
+	 * with a face estimator built in) adds MANAGED_BIT and makes MANAGED the
+	 * default. Neither: 0 / 0. */
+	sim_display_eye_tracking_caps(&out_info->supported_eye_tracking_modes, &out_info->default_eye_tracking_mode);
 
 	return true;
 }
@@ -282,6 +278,14 @@ sim_display_plugin_get_screen_status(struct xrt_plugin_instance *inst,
 
 	uint64_t edges = 0;
 	bool tracking = sim_display_fake_tracking_sample(&edges);
+	// #1855: a running webcam tracker is the real state (MANAGED wins over the fake).
+	bool webcam_tracking = false;
+	uint64_t webcam_edges = 0;
+	const bool webcam = sim_display_webcam_tracking_status(&webcam_tracking, &webcam_edges);
+	if (webcam) {
+		tracking = webcam_tracking;
+		edges = webcam_edges;
+	}
 
 	out->version = XRT_PLUGIN_SCREEN_STATUS_VERSION;
 	// Both terms are monotonic, so the sum moves on every tracker edge and
@@ -291,7 +295,7 @@ sim_display_plugin_get_screen_status(struct xrt_plugin_instance *inst,
 	out->ready = true;
 	out->verified = true;
 	out->calibrated = true;
-	if (!sim_display_fake_tracking_enabled()) {
+	if (!webcam && !sim_display_fake_tracking_enabled()) {
 		out->tracker = XRT_PLUGIN_TRACKER_STATE_NONE;
 	} else {
 		out->tracker = tracking ? XRT_PLUGIN_TRACKER_STATE_RUNNING : XRT_PLUGIN_TRACKER_STATE_DOWN;

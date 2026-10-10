@@ -265,6 +265,8 @@ struct sim_display_processor_gl
 
 	//! Nominal viewer parameters for faked eye positions.
 	float ipd_m;
+	//! Holds a reference on the webcam tracker (#1855); see sim_display_webcam_tracking_apply.
+	bool webcam_ref;
 	float nominal_x_m;
 	float nominal_y_m;
 	float nominal_z_m;
@@ -399,6 +401,10 @@ sim_dp_gl_get_predicted_eye_positions(struct xrt_display_processor_gl *xdp,
 	out->timestamp_ns = os_monotonic_get_ns();
 	out->valid = true;
 	out->is_tracking = sim_display_fake_tracking_is_tracking(); // false unless SIM_DISPLAY_FAKE_TRACKING (#441)
+	// #1855: opt-in webcam tracking overrides the nominal eyes (no-op unless
+	// SIM_DISPLAY_WEBCAM_TRACKING; a screen-bound segment DP stays nominal).
+	sim_display_webcam_tracking_apply(out, sdp->nominal_x_m, sdp->nominal_y_m, sdp->nominal_z_m, sdp->ipd_m,
+	                                  &sdp->webcam_ref);
 	return true;
 }
 
@@ -416,6 +422,7 @@ sim_dp_gl_destroy(struct xrt_display_processor_gl *xdp)
 		glDeleteVertexArrays(1, &sdp->vao_empty);
 	}
 
+	sim_display_webcam_tracking_release(&sdp->webcam_ref);
 	free(sdp);
 }
 

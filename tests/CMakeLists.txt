@@ -86,6 +86,7 @@ set(tests
     tests_stereo_rectify
     tests_stereo_vrefine
     tests_stereo_uvc
+    tests_sim_webcam_tracking
 	)
 if(XRT_BUILD_DRIVER_QWERTY)
 	list(APPEND tests tests_qwerty_camera_profile tests_qwerty_velocity)
@@ -824,6 +825,17 @@ target_include_directories(tests_lift_mailbox PRIVATE ${PROJECT_SOURCE_DIR}/src/
 # XR_DXR_lift v3 (ADR-048 Addendum A): the app-rig mapping is checked against the
 # shared displayxr-common rig core xrLocateViews runs.
 target_link_libraries(tests_aux_lift_rig_depth PRIVATE displayxr::math_core)
+
+# #1855: sim_display webcam eye tracking -- geometry, one-euro, timeout/collapse,
+# device/mode selection, and the worker end to end on the synthetic UVC backend
+# with a fake face estimator (no camera is ever opened).
+target_sources(
+	tests_sim_webcam_tracking
+	PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_webcam_tracking.c
+		${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_webcam_tracker.c
+		${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_face_estimator_none.c
+	)
+target_include_directories(tests_sim_webcam_tracking PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display)
 
 # ADR-043: the sim_display FAKE stereo camera's scene is pinned host-side next to
 # the ring / conversion / disparity-probe tests (it compiles into the plug-in).
