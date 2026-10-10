@@ -994,6 +994,19 @@ struct d3d11_service_compositor
 	//! workspace took over, its frames stalled), so it locates one view set.
 	int64_t seg_pub_ns;
 	struct xrt_segment_view_routing seg_route;
+	/*!
+	 * #1883: the per-segment partition this client's atlas is painted with.
+	 * `seg_route_painting` is set by this commit's projection pass when it
+	 * placed views routed (IPC thread); `seg_content_painted` is held with
+	 * the #1140 `painted_*` recipe (it changes only when the atlas does); and
+	 * `pipe_seg_content` is its copy published with `pipe_content_*` under
+	 * @ref seg_mutex, which the render thread's segment crop reads — so each
+	 * segment DP weaves the views painted for it, never a sliver of its
+	 * neighbour's cut at the live window's seam during a drag.
+	 */
+	bool seg_route_painting;
+	struct comp_segments_content seg_content_painted;
+	struct comp_segments_content pipe_seg_content;
 
 	//! #1140: the recipe the per-client atlas ACTUALLY HOLDS — the per-view
 	//! content dims and the view count of the last commit that PAINTED it.
@@ -2059,6 +2072,13 @@ struct d3d11_service_system
 	uint32_t split_layout_rows{1};
 	//! Monotonic app-frame counter — the one sequence every bridge fence uses.
 	uint64_t split_seq{0};
+	/*!
+	 * #1883: the multi-screen content partition each submitted frame's atlas
+	 * was painted with, keyed by @ref split_seq — the slot the direct segment
+	 * weave consumes can be a tick older than the frame it submitted.
+	 * Render thread only.
+	 */
+	struct comp_segments_content_ring split_seg_content_ring = {};
 
 	/*!
 	 * #918 PR 4 — the OUTPUT-DEVICE crop, and the one thing on the output half
@@ -13834,6 +13854,9 @@ svc_after_present(weave_latency_log *log, const char *site, IDXGISwapChain1 *sc)
  *        grid is part of the generation signature and a slot of a foreign
  *        generation is refused above, so this is the grid that painted the slot
  *        — never live `pipe_tile_*` state, which may have moved since. Optional.
+ * @param io_seg_content In: the multi-screen segment partition this frame's
+ *        atlas was painted with (#1883). Out: the woven slot's own, zeroed
+ *        (unrouted) when no longer recorded. Optional; NULL submits unrouted.
  *
  * #1140 — SINGLE SOURCE. All four DP-recipe terms (view w/h, cols/rows) leave
  * this helper together, describing the ONE slot being woven. Mixing a slot's
@@ -13856,7 +13879,8 @@ pipeline_split_bridge_atlas(struct d3d11_service_system *sys,
                             uint32_t *io_view_w,
                             uint32_t *io_view_h,
                             uint32_t *out_cols = nullptr,
-                            uint32_t *out_rows = nullptr)
+                            uint32_t *out_rows = nullptr,
+                            struct comp_segments_content *io_seg_content = nullptr)
 {
 	if (sys->xbridge == nullptr || crop_tex == nullptr || cols == 0 || rows == 0) {
 		return nullptr;
@@ -13912,6 +13936,9 @@ pipeline_split_bridge_atlas(struct d3d11_service_system *sys,
 	(void)comp_xbridge_set_source(sys->xbridge, src_share, src_key);
 
 	sys->split_seq++;
+	// #1883: the slot carries this frame's segment partition (by seq); the
+	// compose path passes none (unrouted).
+	comp_segments_content_ring_put(&sys->split_seg_content_ring, sys->split_seq, io_seg_content);
 	comp_xbridge_submit(sys->xbridge, sys->split_seq, sys->split_layout_gen, crop_tex, content_w, content_h);
 
 	// Opportunistic: the newest slot whose consumer copy has already completed,
@@ -13989,6 +14016,15 @@ pipeline_split_bridge_atlas(struct d3d11_service_system *sys,
 	}
 	if (out_rows != nullptr) {
 		*out_rows = sys->split_layout_rows;
+	}
+	// #1883: and at its own segment partition — the one the frame that
+	// filled this slot was painted with, not this tick's.
+	if (io_seg_content != nullptr) {
+		uint64_t slot_seq = 0;
+		if (!comp_xbridge_slot_seq(sys->xbridge, slot, &slot_seq) ||
+		    !comp_segments_content_ring_get(&sys->split_seg_content_ring, slot_seq, io_seg_content)) {
+			memset(io_seg_content, 0, sizeof(*io_seg_content));
+		}
 	}
 	return srv;
 }
@@ -14131,7 +14167,9 @@ svc_seg_release(struct d3d11_service_compositor *c)
  * frame is the single-DP one, byte for byte.
  *
  * Every call also publishes the table this weave took (count 0 = one view
- * set), for the client's next xrLocateViews.
+ * set), for the client's next xrLocateViews. @p content is the partition the
+ * woven atlas was painted with (#1883): the table is cut from the live window,
+ * each segment's views are cropped from where that frame put them.
  *
  * Render thread, holding render_mutex. The caller has bound @p present_rtv and
  * fed @p dp this frame's transparency, encoding and timing.
@@ -14152,7 +14190,8 @@ pipeline_segments_weave(struct d3d11_service_system *sys,
                         uint32_t cols,
                         uint32_t rows,
                         uint32_t target_w,
-                        uint32_t target_h)
+                        uint32_t target_h,
+                        const struct comp_segments_content *content)
 {
 	ID3D11Device *dev = svc_out_device(sys);
 	ID3D11DeviceContext *ctx = svc_out_context(sys);
@@ -14239,6 +14278,7 @@ pipeline_segments_weave(struct d3d11_service_system *sys,
 	sf.canvas.y = 0;
 	sf.canvas.w = win.w;
 	sf.canvas.h = win.h;
+	sf.content = content;              // #1883: crop where the views were painted
 	sf.transparent_background = false; // an APP_HWND presenter is woven opaque (pipeline_dp_set_transparency)
 	sf.atlas_encoding = (int)service_single_client_atlas_encoding(fc);
 	sf.primary_dp = dp;
@@ -14613,6 +14653,14 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 	// than guessing from the active rendering mode.
 	fc->render.last_dp_content_w = fc->pipe_content_w;
 	fc->render.last_dp_content_h = fc->pipe_content_h;
+	// #1883: the segment partition of what was just cropped (published with
+	// pipe_content_*), so a window across a seam is cropped where its views
+	// were painted — under the split, replaced by the woven slot's own below.
+	struct comp_segments_content seg_content;
+	{
+		std::lock_guard<std::mutex> lk(fc->seg_mutex);
+		seg_content = fc->pipe_seg_content;
+	}
 
 	/*
 	 * #918 — THE SPLIT. Crop first (on the app device, where the client's atlas
@@ -14645,10 +14693,10 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		 * 2D.
 		 */
 		const bool crop_is_source = (crop_tex != nullptr && crop_tex == fc->render.crop_texture.get());
-		dp_input_srv = pipeline_split_bridge_atlas(sys, focused, crop_tex,
-		                                           crop_is_source ? fc->render.split_share_handle : nullptr,
-		                                           crop_is_source ? fc->render.split_share_key : 0, cols, rows,
-		                                           &weave_view_w, &weave_view_h, &weave_cols, &weave_rows);
+		dp_input_srv = pipeline_split_bridge_atlas(
+		    sys, focused, crop_tex, crop_is_source ? fc->render.split_share_handle : nullptr,
+		    crop_is_source ? fc->render.split_share_key : 0, cols, rows, &weave_view_w, &weave_view_h,
+		    &weave_cols, &weave_rows, &seg_content);
 		if (dp_input_srv == nullptr) {
 			/*
 			 * Nothing weavable this frame — warmup, or a slot whose recipe the
@@ -14752,7 +14800,7 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		// woven per screen; anything else (and every client that never
 		// enabled segments) takes the single weave below, unchanged.
 		if (!pipeline_segments_weave(sys, fc, kind, present_hwnd, present_rtv, dp, dp_input_srv, weave_view_w,
-		                             weave_view_h, weave_cols, weave_rows, target_w, target_h)) {
+		                             weave_view_h, weave_cols, weave_rows, target_w, target_h, &seg_content)) {
 			xrt_display_processor_d3d11_process_atlas(
 			    dp, svc_out_context(sys), dp_input_srv, weave_view_w, weave_view_h, weave_cols, weave_rows,
 			    DXGI_FORMAT_R8G8B8A8_UNORM, target_w, target_h, 0, 0, 0, 0);
@@ -18402,6 +18450,7 @@ service_proj_view_blit_resolve(struct d3d11_service_system *sys,
 				out->skip = true;
 				return;
 			}
+			c->seg_route_painting = true; // #1883: this commit's atlas is a routed mosaic
 			uint32_t rx = 0, ry = 0;
 			u_tiling_view_origin(slot.tile, cols, layout_vw, layout_vh, &rx, &ry);
 			out->dst_x = static_cast<float>(rx + (uint32_t)slot.rect.x);
@@ -21387,6 +21436,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	// stays false the atlas still holds the LAST good frame, so the recipe must
 	// be held with it (see the `painted_*` block below).
 	bool content_dims_painted = false;
+	c->seg_route_painting = false; // #1883: set by the projection pass when it routes
 
 	// Bridge-relay: read active per-view tile dims pushed by the bridge.
 	// The bridge (as the sample's proxy) owns windowSize × viewScale and
@@ -22829,6 +22879,9 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		c->painted_content_w = content_view_w;
 		c->painted_content_h = content_view_h;
 		c->painted_view_count = eff_view_count;
+		// #1883: and the partition its views were laid out with.
+		comp_segments_content_from_routing(c->seg_route_painting ? &c->seg_route : nullptr,
+		                                   &c->seg_content_painted);
 		// DXR_FRAME_WITNESS: a fresh app frame is now in this client's atlas.
 		// Unconditional (one relaxed increment per painting commit is cheaper
 		// than the env probe that would gate it).
@@ -23653,6 +23706,12 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		c->pipe_tile_rows = pipe_rows > 0 ? pipe_rows : 1;
 		if (content_view_w > 0 && content_view_h > 0) {
 			c->pipe_frame_ready = true;
+		}
+		{
+			// #1883: the partition of what this atlas holds, for the
+			// render thread's per-segment crop.
+			std::lock_guard<std::mutex> lk(c->seg_mutex);
+			c->pipe_seg_content = c->seg_content_painted;
 		}
 
 		// #1017: a CLIENT_TEXTURE client weaves HERE, on its own IPC thread —

@@ -575,8 +575,10 @@ comp_d3d12_segments_record(struct comp_d3d12_segments *segs, const struct comp_d
 
 	for (uint32_t k = 0; k < t->count; k++) {
 		const struct comp_segment *g = &t->seg[k];
+		// #1883: where THIS segment's views were painted — for a routed
+		// frame the partition it was located for, not the live seam.
 		have_tile[k] =
-		    comp_segments_tile_rect(&g->window_rect, &f->canvas, f->view_width, f->view_height, &tile[k]);
+		    comp_segments_source_rect(g, &f->canvas, f->view_width, f->view_height, f->content, &tile[k]);
 		const int i = (int)g->screen_index;
 		screen_of[k] = i;
 		st_of[k] = (i >= 0 && (uint32_t)i < segs->screen_count) ? &segs->st[i] : nullptr;
@@ -704,12 +706,15 @@ comp_d3d12_segments_record(struct comp_d3d12_segments *segs, const struct comp_d
 	 * stereo pair), linearly scaled from the view tile to the window rect.
 	 */
 	struct comp_seg_rect flat_dst[COMP_SEGMENTS_MAX + COMP_SEGMENTS_MAX_UNCOVERED];
+	struct comp_seg_rect flat_src[COMP_SEGMENTS_MAX] = {};
 	uint32_t flat_n = 0;
 	for (uint32_t k = 0; k < t->count; k++) {
 		if (!weave[k] && have_tile[k]) {
+			flat_src[flat_n] = tile[k]; // the segment's own views (#1883), like the crop
 			flat_dst[flat_n++] = t->seg[k].window_rect;
 		}
 	}
+	const uint32_t flat_seg_n = flat_n;
 	flat_n += comp_segments_uncovered(t, &f->canvas, &flat_dst[flat_n], COMP_SEGMENTS_MAX_UNCOVERED);
 	if (flat_n > 0 && f->renderer != nullptr) {
 		const uint32_t views = f->tile_columns * f->tile_rows;
@@ -721,7 +726,9 @@ comp_d3d12_segments_record(struct comp_d3d12_segments *segs, const struct comp_d
 		for (uint32_t k = 0; k < flat_n; k++) {
 			const struct comp_seg_rect *d = &flat_dst[k];
 			struct comp_seg_rect s;
-			if (!comp_segments_tile_rect(d, &f->canvas, f->view_width, f->view_height, &s)) {
+			if (k < flat_seg_n) {
+				s = flat_src[k];
+			} else if (!comp_segments_tile_rect(d, &f->canvas, f->view_width, f->view_height, &s)) {
 				continue; // thinner than one source pixel
 			}
 			comp_d3d12_renderer_blit_rect(f->renderer, cl, segs->srv_heap, srv, (uint32_t)src_desc.Width,

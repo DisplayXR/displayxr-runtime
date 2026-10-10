@@ -15,6 +15,7 @@
 #include "comp_d3d11_renderer.h"
 #include "comp_d3d11_outcomp.h"
 #include "comp_d3d11_segments.h" // multi-screen M6
+#include "util/comp_segments_route.h"
 #include "xrt/xrt_screen.h"
 #include "comp_d3d11_window.h"
 #include "comp_d3d11_state_guard.h"
@@ -529,6 +530,15 @@ struct comp_d3d11_compositor
 	struct xrt_segment_metrics seg_pub;          //!< the table the last weave took (count 0 = one view set)
 	struct xrt_segment_view_routing seg_route;   //!< the routing the last locate handed out
 	struct comp_d3d11_eff_layout seg_route_logged; //!< change-only logging of the routed layout
+	/*!
+	 * #1883: the per-segment partition the renderer atlas is painted with
+	 * (eff_layout's routing; count 0 = unrouted), set with eff_layout so a
+	 * repaint replays it with the atlas it describes. Under the #918 split the
+	 * woven egress slot can be a frame or two older than that atlas, so each
+	 * submitted frame's partition is also recorded by its split_seq.
+	 */
+	struct comp_segments_content seg_content;
+	struct comp_segments_content_ring seg_content_ring;
 
 	//! System devices (for qwerty driver keyboard input and display mode toggle).
 	struct xrt_system_devices *xsysd;
@@ -2266,6 +2276,7 @@ d3d11_route_effective_layout(struct comp_d3d11_compositor *c, uint32_t layer_vie
 	}
 	struct comp_d3d11_eff_layout *L = &c->eff_layout;
 	L->route_count = 0;
+	memset(&c->seg_content, 0, sizeof(c->seg_content));
 	if (r.count == 0 || r.count > XRT_MAX_SEGMENTS || L->views == 0 || L->tile_w == 0 || L->tile_h == 0) {
 		return;
 	}
@@ -2300,6 +2311,8 @@ d3d11_route_effective_layout(struct comp_d3d11_compositor *c, uint32_t layer_vie
 		L->route[k].h = tr.h;
 	}
 	L->route_count = r.count;
+	// #1883: the partition these pixels are painted with, for the segment crop.
+	comp_segments_content_from_routing(&r, &c->seg_content);
 
 	// One INFO line per routing change (a move, a resize, a mode switch).
 	if (memcmp(L->route, c->seg_route_logged.route, sizeof(L->route)) != 0 ||
@@ -2464,6 +2477,11 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 	 * the entire woven frame on every repaint).
 	 */
 	int32_t weave_slot = -1;
+	// #1883: the segment partition of the atlas being woven — the renderer
+	// atlas's (set with eff_layout, so a repaint replays it), or under the
+	// split the woven slot's own (resolved with the slot below).
+	struct comp_segments_content slot_content = {};
+	const struct comp_segments_content *weave_content = &c->seg_content;
 	if (c->split_active) {
 		const uint64_t want_gen = c->split_layout_gen;
 		int32_t slot;
@@ -2583,6 +2601,22 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 			return false;
 		}
 		weave_slot = slot;
+
+		/*
+		 * #1883: the segment partition travels with the pixels too. This slot
+		 * was painted a frame or two before the frame being committed, so its
+		 * per-segment mosaic sits where THAT frame's routing put it; the
+		 * segment crop below reads it from here, never from the live frame.
+		 * A slot no longer in the ring is treated as unrouted (live crop).
+		 */
+		{
+			uint64_t slot_seq = 0;
+			if (!comp_xbridge_slot_seq(c->xbridge, slot, &slot_seq) ||
+			    !comp_segments_content_ring_get(&c->seg_content_ring, slot_seq, &slot_content)) {
+				memset(&slot_content, 0, sizeof(slot_content));
+			}
+			weave_content = &slot_content;
+		}
 
 		/*
 		 * #918 Phase 2a — the 2D-under backdrop, from the slot. Same GPU wait,
@@ -2861,6 +2895,7 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 		sf.canvas.y = 0;
 		sf.canvas.w = c->seg_window.w;
 		sf.canvas.h = c->seg_window.h;
+		sf.content = weave_content; // #1883: crop where the views were painted
 		sf.transparent_background = c->transparent_background;
 		sf.atlas_encoding = -1; // the in-process D3D11 path declares none to the primary either
 		sf.primary_dp = c->display_processor;
@@ -4029,6 +4064,8 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			// active mode, so a V-key mode switch or a resize lands here.
 			comp_xbridge_set_content_size(c->xbridge, bridge_w, bridge_h, c->split_layout_gen);
 			c->split_seq++;
+			// #1883: the slot carries this frame's segment partition (by seq).
+			comp_segments_content_ring_put(&c->seg_content_ring, c->split_seq, &c->seg_content);
 			comp_xbridge_submit(c->xbridge, c->split_seq, c->split_layout_gen,
 			                    comp_d3d11_renderer_get_atlas_texture(c->renderer), bridge_w, bridge_h);
 		}
