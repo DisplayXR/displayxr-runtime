@@ -544,6 +544,10 @@ jobs:
           # silently dropped this plug-in from a build once — and without this
           # line CI would not have noticed a device with zero plug-ins.
           need libdxrp200_sim_display.so "drv_sim_display_plugin dropped out of the CMake target list"
+          # #1905: the queue-lock Vulkan layer (per-queue). The Android loader
+          # finds it by file name on its layer search path, so the exact name
+          # is the contract (libVkLayer*.so).
+          need libVkLayer_DXR_queue_lock.so "VkLayer_DXR_queue_lock dropped out of the CMake target list"
 
           if [ "${{ matrix.variant }}" = "neutral" ]; then
             # ADR-019 guard for the vendor-neutral APK. Note this is the EXACT
