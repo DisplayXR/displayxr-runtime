@@ -112,6 +112,15 @@
 #include "android/android_globals.h"
 // #1401: the container-scaled tell itself, shared with the state tracker.
 #include "android/android_mini_window_tell.h"
+
+/*
+ * #1905: mid-frame fills — the repaint loop may fill at panel rate while the
+ * app is mid-frame. Android-only by construction: every block it adds is
+ * behind this one macro, so no other platform compiles a byte of it. (A
+ * separate macro, rather than bare XRT_OS_ANDROID, only so the platform-neutral
+ * logic can be compile-checked off-device with -DVK_MIDFRAME_FILL=1.)
+ */
+#define VK_MIDFRAME_FILL 1
 #endif
 
 // Direct-scanout present path (ST-5539). Only compiled when the bundle carries
@@ -946,6 +955,36 @@ struct comp_vk_native_compositor
 		uint64_t mask_view;
 
 		uint64_t count, ticks;          //!< Diagnostics.
+
+#ifdef VK_MIDFRAME_FILL
+		/*!
+		 * #1905: mid-frame fill state. Repaint-thread-only except
+		 * commit_entry_ns (see there), so it needs no lock.
+		 */
+		struct
+		{
+			//! When the last app-frame weave this thread SERVED started / ended.
+			uint64_t serve_start_ns, serve_end_ns;
+			//! EMA of the spacing between served app weaves — the app's frame
+			//! interval as the weave thread sees it. Predicts the next post.
+			uint64_t serve_iv_ema_ns;
+			//! EMA of a mid-frame fill's lock-to-present duration.
+			uint64_t fire_ema_ns;
+			//! EMA of layer_commit ENTRY -> post (serve start): how far ahead of
+			//! the post the app first wants c->mutex.
+			uint64_t commit_lead_ema_ns;
+			/*!
+			 * The ONE app-thread-written field: stamped at layer_commit entry,
+			 * before it takes c->mutex. Plain store/load of an aligned 64-bit
+			 * value, read by this thread at serve time — the same benign-race
+			 * contract as weave_hand.heartbeat (no stdatomic per CLAUDE.md); a
+			 * stale read only skews one sample of a bounded EMA.
+			 */
+			uint64_t commit_entry_ns;
+			//! Trace-window tallies (#1257 row; zeroed when a row goes out).
+			uint32_t fires, in_frame, skip_pending, skip_predict;
+		} mf;
+#endif
 	} repaint;
 
 	/*!
@@ -7483,6 +7522,144 @@ vk_app_submit_window_open(const struct comp_vk_native_compositor *c)
 	return true;
 }
 
+#ifdef VK_MIDFRAME_FILL
+/*!
+ * #1905 kill switch: fill at panel rate while the app is MID-FRAME (Android).
+ * DXR_MIDFRAME_FILL / `debug.dxr.midframe_fill` — "0" disables. Default ON.
+ *
+ * Why it exists. A GPU-bound Android app is never between frames: it is
+ * either inside xrEndFrame (app_frame_in_progress) or rendering its next one,
+ * and the legacy quiet gate ("quiet >= 1.2 periods since the last APP frame")
+ * almost never opens inside a ~35 ms interval. Measured on a Lume phone
+ * (Adreno 740, 60 Hz): earthview 0.0-0.2 fills/s, weave + face refresh at the
+ * app's ~28 Hz while the panel and the vendor SDK sustain 60. The present path
+ * is not the bottleneck (acquire 0.1 ms, present 0.36 ms); the loop simply
+ * never fires.
+ *
+ * What it changes, and only when the default gate schedule is in force (an
+ * explicit DXR_WEAVE_REPAINT_GATE / debug.dxr.weave_repaint_gate, the #1257
+ * partition, the force probe and move fills all keep their own logic):
+ *   - the `app_frame_in_progress` bail is dropped — a fill reads only the
+ *     PUBLISHED repaint state (c->repaint.*), never layer_accum;
+ *   - the quiet gate is replaced by vk_midframe_gate_open(): pace off the last
+ *     PRESENT (served app weave or fill), not off the last app frame;
+ *   - app-frame priority is kept by construction: a fill never starts while
+ *     an app weave is posted (weave_hand.pending re-checked under the lock),
+ *     and never starts when it is predicted to still be running when the app's
+ *     next frame is posted.
+ * Off restores the prior behaviour exactly.
+ */
+static bool
+dxr_midframe_fill_enabled(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		on = 1;
+		const char *e = getenv("DXR_MIDFRAME_FILL");
+		if (e != NULL && e[0] != '\0') {
+			on = (e[0] == '0') ? 0 : 1;
+		}
+#ifdef XRT_OS_ANDROID
+		else {
+			char sp[PROP_VALUE_MAX] = {0};
+			if (__system_property_get("debug.dxr.midframe_fill", sp) > 0 && sp[0] != '\0') {
+				on = (sp[0] == '0') ? 0 : 1;
+			}
+		}
+#endif
+		U_LOG_W(
+		    "#1905: mid-frame fill %s — the repaint loop %s fill at panel rate while the app "
+		    "is mid-frame (DXR_MIDFRAME_FILL / debug.dxr.midframe_fill)",
+		    on ? "ON" : "OFF", on ? "WILL" : "will NOT");
+	}
+	return on == 1;
+}
+
+/*!
+ * #1905: does the mid-frame schedule own this tick?
+ *
+ * Only on top of the DEFAULT gate schedule (mode 3, resolved by the
+ * u_repaint_gate_open call that always precedes this), with the partition
+ * throttle NOT engaged, and with #1196 single weave ownership live — the
+ * served-weave stamps this schedule paces off only exist there.
+ */
+static bool
+vk_midframe_active(const struct comp_vk_native_compositor *c)
+{
+	return dxr_midframe_fill_enabled() && c->repaint.gate.mode == 3 && c->repaint.partition.next_release_ns == 0 &&
+	       c->weave_hand.enabled == 1 && c->repaint.force != 1;
+}
+
+/*!
+ * #1905: may a mid-frame fill start at @p now_ns?
+ *
+ *  1. HALF A PERIOD past the last present (served app weave END, or fill END).
+ *     The late-weave grid sleep inside the acquire then places the weave at
+ *     next_vblank - budget, so the fill targets the NEXT vblank rather than
+ *     the one the last present already took.
+ *  2. At most ONE fill per panel period: fill START to fill START >= 0.9
+ *     periods (the same 0.9 spacing constant the #1257 stall branches use).
+ *  3. APP FIRST: once the app's interval is known and the app is not overdue,
+ *     refuse a fill predicted to still be running when the app's next
+ *     layer_commit wants c->mutex (last serve start + interval EMA - the
+ *     measured commit-entry-to-post lead), with a quarter-period guard. A fill
+ *     cannot be pre-empted once it holds c->mutex; this is what keeps it from
+ *     delaying a hand-off (the mode-4 "fill" failure in u_repaint_gate.h was
+ *     exactly a fill delaying xrEndFrame).
+ *
+ * @p predict_refused, when non-NULL, reports that (3) was the reason.
+ */
+static bool
+vk_midframe_gate_open(const struct comp_vk_native_compositor *c,
+                      uint64_t now_ns,
+                      uint64_t period_ns,
+                      bool *predict_refused)
+{
+	if (predict_refused != NULL) {
+		*predict_refused = false;
+	}
+	const uint64_t last_end = c->repaint.mf.serve_end_ns > c->repaint.gate.last_repaint_end_ns
+	                              ? c->repaint.mf.serve_end_ns
+	                              : c->repaint.gate.last_repaint_end_ns;
+	if (last_end == 0 || now_ns < last_end || now_ns - last_end < period_ns / 2) {
+		return false;
+	}
+	const uint64_t last_fill = c->repaint.gate.last_repaint_ns;
+	if (last_fill != 0 && now_ns > last_fill && now_ns - last_fill < (period_ns * 9) / 10) {
+		return false;
+	}
+	const uint64_t iv = c->repaint.mf.serve_iv_ema_ns;
+	const uint64_t s0 = c->repaint.mf.serve_start_ns;
+	if (iv != 0 && s0 != 0) {
+		const uint64_t next_post = s0 + iv;
+		const uint64_t lead = c->repaint.mf.commit_lead_ema_ns < iv ? c->repaint.mf.commit_lead_ema_ns : 0;
+		const uint64_t next_commit = next_post - lead;
+		// Overdue by half a period or more: the app is hitching, not pacing —
+		// the original #868 case. Fill; there is no imminent post to protect.
+		const bool overdue = now_ns > next_post + period_ns / 2;
+		const uint64_t est = c->repaint.mf.fire_ema_ns != 0 ? c->repaint.mf.fire_ema_ns : period_ns / 2;
+		if (!overdue && now_ns + est + period_ns / 4 > next_commit) {
+			if (predict_refused != NULL) {
+				*predict_refused = true;
+			}
+			return false;
+		}
+	}
+	return true;
+}
+
+//! #1905: is an app-frame weave posted and not yet served? Takes the hand-off
+//! leaf lock; legal with c->mutex held (c->mutex -> weave_hand.mutex only).
+static bool
+vk_midframe_app_weave_pending(struct comp_vk_native_compositor *c)
+{
+	os_mutex_lock(&c->weave_hand.mutex);
+	const bool pending = c->weave_hand.pending;
+	os_mutex_unlock(&c->weave_hand.mutex);
+	return pending;
+}
+#endif // VK_MIDFRAME_FILL
+
 static bool
 dxr_vblank_grid_pacing_enabled(void)
 {
@@ -7667,6 +7844,35 @@ vk_repaint_thread(void *ptr)
 			// an epoch-length first interval in DXR_FRAME_STAGE_TIMING.
 			h_fp[0] = h_fp0;
 
+#ifdef VK_MIDFRAME_FILL
+			// #1905: the app's interval as this thread sees it (serve START to
+			// serve START), the predictor for the next post. Bounded like the
+			// other interval EMAs so a pause restarts it instead of skewing it.
+			{
+				const uint64_t s_now = os_monotonic_get_ns();
+				if (c->repaint.mf.serve_start_ns != 0) {
+					const uint64_t d = s_now - c->repaint.mf.serve_start_ns;
+					if (d > 1000000ULL && d < 500000000ULL) {
+						c->repaint.mf.serve_iv_ema_ns =
+						    c->repaint.mf.serve_iv_ema_ns == 0
+						        ? d
+						        : (c->repaint.mf.serve_iv_ema_ns * 7 + d) / 8;
+					} else {
+						c->repaint.mf.serve_iv_ema_ns = 0;
+					}
+				}
+				c->repaint.mf.serve_start_ns = s_now;
+				const uint64_t ce = c->repaint.mf.commit_entry_ns;
+				if (ce != 0 && ce <= s_now && s_now - ce < 100000000ULL) {
+					const uint64_t lead = s_now - ce;
+					c->repaint.mf.commit_lead_ema_ns =
+					    c->repaint.mf.commit_lead_ema_ns == 0
+					        ? lead
+					        : (c->repaint.mf.commit_lead_ema_ns * 7 + lead) / 8;
+				}
+			}
+#endif
+
 			os_mutex_lock(&c->mutex);
 			if (os_thread_helper_is_running(&c->repaint_thread) && c->display_processor != NULL &&
 			    c->target != NULL) {
@@ -7677,6 +7883,11 @@ vk_repaint_thread(void *ptr)
 			}
 			// else: torn down under the waiter. Fail the frame, never strand it.
 			os_mutex_unlock(&c->mutex);
+#ifdef VK_MIDFRAME_FILL
+			// #1905: the app weave's present is the "last present" a mid-frame
+			// fill paces off — stamped here, on the weave thread, at the END.
+			c->repaint.mf.serve_end_ns = os_monotonic_get_ns();
+#endif
 
 			os_mutex_lock(&c->weave_hand.mutex);
 			// Drop the result if this request was abandoned (or superseded)
@@ -7700,8 +7911,30 @@ vk_repaint_thread(void *ptr)
 		if (u_repaint_trace_enabled(&c->repaint.trace)) {
 			const uint64_t tn = os_monotonic_get_ns();
 			u_repaint_trace_tick(&c->repaint.trace, tn);
+#ifdef VK_MIDFRAME_FILL
+			const uint64_t mf_row_before = c->repaint.trace.last_report_ns;
+#endif
 			u_repaint_trace_report(&c->repaint.trace, tn, "vk", &c->repaint.gate, period_ns,
 			                       &c->repaint.partition);
+#ifdef VK_MIDFRAME_FILL
+			// #1905: companion to the #1257 row, emitted only when that row
+			// just went out (so at its ~5 s cadence, trace-gated, never per
+			// frame) — kept out of u_repaint_gate.h so no other backend's row
+			// changes. Window tallies over the same 5 s.
+			if (mf_row_before != 0 && c->repaint.trace.last_report_ns != mf_row_before) {
+				U_LOG_W(
+				    "#1905 trace site=vk midframe{on=%d fires=%u in_frame=%u skip_pending=%u "
+				    "skip_predict=%u app_iv=%.1fms fire=%.2fms}",
+				    (int)vk_midframe_active(c), c->repaint.mf.fires, c->repaint.mf.in_frame,
+				    c->repaint.mf.skip_pending, c->repaint.mf.skip_predict,
+				    (double)c->repaint.mf.serve_iv_ema_ns / 1e6,
+				    (double)c->repaint.mf.fire_ema_ns / 1e6);
+				c->repaint.mf.fires = 0;
+				c->repaint.mf.in_frame = 0;
+				c->repaint.mf.skip_pending = 0;
+				c->repaint.mf.skip_predict = 0;
+			}
+#endif
 		}
 
 		// #868 diag: where the loop actually goes. A repaint that never fires
@@ -7717,7 +7950,15 @@ vk_repaint_thread(void *ptr)
 			        (unsigned long long)(os_monotonic_get_ns() - c->repaint.last_app_frame_ns));
 		}
 
+#ifdef VK_MIDFRAME_FILL
+		// #1905: under the mid-frame schedule the app being inside xrEndFrame
+		// is not a reason to skip — the app-priority checks below replace it.
+		// `armed` and the opt-in #1394 submit-window guard still apply.
+		if (!c->repaint.armed || vk_app_submit_window_open(c) ||
+		    (c->repaint.app_frame_in_progress && !vk_midframe_active(c))) {
+#else
 		if (!c->repaint.armed || c->repaint.app_frame_in_progress || vk_app_submit_window_open(c)) {
+#endif
 			u_repaint_trace_bail_armed(&c->repaint.trace);
 			continue;
 		}
@@ -7730,11 +7971,34 @@ vk_repaint_thread(void *ptr)
 		// every N vblanks) each app frame gets a budget of N-1 repaints,
 		// presented clear of the app's own queue slot; otherwise it is the
 		// legacy fixed 2-period gate. See u_repaint_gate.h for the design.
+#ifdef VK_MIDFRAME_FILL
+		// #1905: the gate always runs first (it resolves the schedule mode
+		// vk_midframe_active keys on); under the mid-frame schedule its
+		// verdict is then replaced by the present-relative one.
+		bool mf_fill = false;
+		if (c->repaint.force != 1 && !move_fill) {
+			const uint64_t now_g = os_monotonic_get_ns();
+			bool open = u_repaint_gate_open(&c->repaint.gate, now_g, period_ns, &c->repaint.partition);
+			if (vk_midframe_active(c)) {
+				bool predict_refused = false;
+				open = vk_midframe_gate_open(c, now_g, period_ns, &predict_refused);
+				if (predict_refused) {
+					c->repaint.mf.skip_predict++;
+				}
+				mf_fill = open;
+			}
+			if (!open) {
+				u_repaint_trace_bail_gate(&c->repaint.trace);
+				continue;
+			}
+		}
+#else
 		if (c->repaint.force != 1 && !move_fill &&
 		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns, &c->repaint.partition)) {
 			u_repaint_trace_bail_gate(&c->repaint.trace);
 			continue;
 		}
+#endif
 
 		/*
 		 * #902 PHASE HOLD. The gate above says "allowed"; this says "not yet".
@@ -7901,6 +8165,32 @@ vk_repaint_thread(void *ptr)
 		// Re-check under the lock. app_frame_in_progress is load-bearing and
 		// is NOT bypassed by the force probe: replaying into a half-written
 		// layer_accum does not exercise the feature, it corrupts the frame.
+#ifdef VK_MIDFRAME_FILL
+		/*
+		 * #1905: a mid-frame fill does not need app_frame_in_progress clear —
+		 * it replays only the published c->repaint.* state, which the app
+		 * thread writes under THIS lock — but it MUST yield to a posted app
+		 * frame. layer_commit posts and then releases c->mutex, so this is
+		 * exactly the race where a fill that was waiting for the lock wins
+		 * it ahead of the weave thread's own serve: bail, and the loop top
+		 * serves the app frame next. (app_frame_in_progress is what used to
+		 * catch this, by being true for the whole hand-off.)
+		 */
+		const bool mf_locked = mf_fill && vk_midframe_active(c);
+		if (!os_thread_helper_is_running(&c->repaint_thread) || !c->repaint.armed ||
+		    (c->repaint.app_frame_in_progress && !mf_locked) || vk_app_submit_window_open(c) ||
+		    c->display_processor == NULL || c->target == NULL) {
+			u_repaint_trace_bail_race(&c->repaint.trace);
+			os_mutex_unlock(&c->mutex);
+			continue;
+		}
+		if (mf_locked && vk_midframe_app_weave_pending(c)) {
+			c->repaint.mf.skip_pending++;
+			u_repaint_trace_bail_race(&c->repaint.trace);
+			os_mutex_unlock(&c->mutex);
+			continue;
+		}
+#else
 		if (!os_thread_helper_is_running(&c->repaint_thread) || !c->repaint.armed ||
 		    c->repaint.app_frame_in_progress || vk_app_submit_window_open(c) || c->display_processor == NULL ||
 		    c->target == NULL) {
@@ -7908,6 +8198,7 @@ vk_repaint_thread(void *ptr)
 			os_mutex_unlock(&c->mutex);
 			continue;
 		}
+#endif
 		if (comp_vk_native_target_get_generation(c->target) != gen_before) {
 			// Resized/recreated across the pace. begin_frame's disarm
 			// normally catches this first; the acquire-side out-of-date
@@ -7927,8 +8218,18 @@ vk_repaint_thread(void *ptr)
 			os_mutex_unlock(&c->mutex);
 			continue;
 		}
+#ifdef VK_MIDFRAME_FILL
+		// #1905: a mid-frame fill re-runs ITS gate instead — an app weave
+		// served while we waited for the lock moved serve_end_ns.
+		const bool relock_gate_ok = mf_locked ? vk_midframe_gate_open(c, os_monotonic_get_ns(), period_ns, NULL)
+		                                      : !(c->repaint.force != 1 && !move_fill_locked &&
+		                                          !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(),
+		                                                               period_ns, &c->repaint.partition));
+		if (!relock_gate_ok) {
+#else
 		if (c->repaint.force != 1 && !move_fill_locked &&
 		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns, &c->repaint.partition)) {
+#endif
 			u_repaint_trace_bail_race(&c->repaint.trace);
 			os_mutex_unlock(&c->mutex);
 			continue;
@@ -7986,6 +8287,11 @@ vk_repaint_thread(void *ptr)
 		// between this and fire_t0, so one read serves both: fire_t0 pairs with
 		// fire_t1 for DURATION (trace + #1264 shed), rp_start_ns feeds spacing.
 		const uint64_t rp_start_ns = fire_t0;
+#ifdef VK_MIDFRAME_FILL
+		// #1905 trace: the app is MID-FRAME (between xrBeginFrame and the end
+		// of xrEndFrame) as this fill starts.
+		const bool mf_in_frame_at_fire = c->repaint.app_frame_in_progress || c->repaint.app_submit_window;
+#endif
 		// zero_copy is hard false: c->repaint.armed is only set off that path.
 		vk_dp_weave_and_present(c, /*is_repaint=*/true, /*zero_copy=*/false, 0, 0, 0, 0, 0,
 		                        tgt_width, tgt_height, /*ftime=*/false, fp, &skip_frame);
@@ -7998,6 +8304,23 @@ vk_repaint_thread(void *ptr)
 		const uint64_t fire_t1 = os_monotonic_get_ns();
 		u_repaint_gate_note_repaint(&c->repaint.gate, rp_start_ns);
 		u_repaint_trace_fire(&c->repaint.trace, fire_t0, fire_t1);
+#ifdef VK_MIDFRAME_FILL
+		if (mf_locked) {
+			// #1905: the duration the app-first prediction budgets for —
+			// includes the late-weave grid sleep inside the acquire and the
+			// fill fence-park, i.e. everything this fill can make a posted
+			// app frame wait behind.
+			const uint64_t d = fire_t1 - fire_t0;
+			if (d < 200000000ULL) {
+				c->repaint.mf.fire_ema_ns =
+				    c->repaint.mf.fire_ema_ns == 0 ? d : (c->repaint.mf.fire_ema_ns * 7 + d) / 8;
+			}
+			c->repaint.mf.fires++;
+			if (mf_in_frame_at_fire) {
+				c->repaint.mf.in_frame++;
+			}
+		}
+#endif
 		os_mutex_unlock(&c->mutex);
 
 		static bool logged = false;
@@ -9209,6 +9532,11 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	}
 
 	bool lock_released = false;
+#ifdef VK_MIDFRAME_FILL
+	// #1905: when the app first wants the lock — the mid-frame fill's
+	// app-first prediction keeps a fill from holding it across this point.
+	c->repaint.mf.commit_entry_ns = os_monotonic_get_ns();
+#endif
 	os_mutex_lock(&c->mutex);
 	xrt_result_t xret = vk_compositor_layer_commit_locked(xc, sync_handle, &lock_released);
 	c->repaint.app_frame_in_progress = false;
@@ -10712,6 +11040,11 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 			        "debug.dxr.weave_single_thread; 0 disables)",
 			        single ? "single — app frames weave on the repaint thread"
 			               : "legacy — app thread and repaint thread both weave");
+#ifdef VK_MIDFRAME_FILL
+			// #1905: resolve (and log, once) the mid-frame fill switch at
+			// startup rather than on the repaint thread's first tick.
+			(void)dxr_midframe_fill_enabled();
+#endif
 		}
 
 		/*
