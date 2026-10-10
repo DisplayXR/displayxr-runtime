@@ -131,9 +131,37 @@ public class StatusFeedTests
         feed.Release();
         Assert.False(src.Last.Stopped);
         feed.Release();
+        Assert.False(src.Last.Stopped); // lingers for a quick hop back
+        Assert.True(feed.IsLingering);
+        clock.Advance(StatusFeed.ReleaseLinger);
         Assert.True(src.Last.Stopped);
         Assert.Equal(FeedMode.Idle, feed.Mode);
         Assert.Null(feed.Snapshot); // D5.4: no stale badge after release
+    }
+
+    [Fact]
+    public void QuickHopBack_KeepsTheSameChild()
+    {
+        var (feed, src, clock) = Make();
+        feed.Hold();
+        feed.Release();                 // Home -> Performance
+        clock.Advance(TimeSpan.FromSeconds(5));
+        feed.Hold();                    // -> back to Displays
+        clock.Advance(TimeSpan.FromSeconds(30));
+        Assert.Single(src.Children);
+        Assert.False(src.Last.Stopped);
+        Assert.False(feed.IsLingering);
+    }
+
+    [Fact]
+    public void MinimiseWhileLingering_StopsAtOnce()
+    {
+        var (feed, src, _) = Make();
+        feed.Hold();
+        feed.Release();
+        feed.SetPaused(true);
+        Assert.True(src.Last.Stopped);
+        Assert.False(feed.IsLingering);
     }
 
     [Fact]
