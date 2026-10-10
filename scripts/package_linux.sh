@@ -9,6 +9,10 @@
 # Output: dist/displayxr-runtime-linux-<arch>-<version>.tar.gz containing
 #   bin/displayxr-cli bin/displayxr-service
 #   bin/displayxr-gnome-extension-enable
+#   bin/displayxr-dashboard  (the DisplayXR Dashboard: self-contained .NET single
+#       file, beside the displayxr-cli it runs; from resolve_dashboard_bin.sh)
+#   share/applications/displayxr-dashboard.desktop.in + share/icons/displayxr-dashboard.png
+#       (install.sh writes the menu entry with the installed path)
 #   lib/openxr_displayxr.so
 #   lib/displayxr/plugins/DisplayXR-SimDisplay.so
 #   share/gnome-shell/extensions/window-geometry@displayxr.org/  (GNOME Shell
@@ -82,6 +86,11 @@ fi
 # why this is a strings check rather than a NEEDED one).
 "$ROOT/scripts/check_linux_runtime_wayland.sh" "$RUNTIME_SO" || exit 1
 
+# The DisplayXR Dashboard — same source as the .deb's (see package_deb_linux.sh).
+DASH_TMP="$(mktemp -d)"
+trap 'rm -rf "$DASH_TMP"' EXIT
+DASHBOARD_BIN="$("$ROOT/scripts/linux/dashboard/resolve_dashboard_bin.sh" "$DASH_TMP")"
+
 EXT_UUID="window-geometry@displayxr.org"
 EXT_SRC="$ROOT/contrib/gnome-shell/$EXT_UUID"
 # Both entry-point forms ship: extension.js is the GNOME 45+ ES module (the
@@ -106,6 +115,12 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE/bin" "$STAGE/lib/displayxr/plugins" "$STAGE/share/gnome-shell/extensions/$EXT_UUID" \
     "$STAGE/share/systemd/user"
 cp "$CLI_BIN" "$STAGE/bin/"
+if [ -n "$DASHBOARD_BIN" ]; then
+    install -m 0755 "$DASHBOARD_BIN" "$STAGE/bin/displayxr-dashboard"
+    mkdir -p "$STAGE/share/applications" "$STAGE/share/icons"
+    cp "$ROOT/scripts/linux/dashboard/displayxr-dashboard.desktop.in" "$STAGE/share/applications/"
+    cp "$ROOT/scripts/linux/dashboard/displayxr-dashboard.png" "$STAGE/share/icons/"
+fi
 cp "$SERVICE_BIN" "$STAGE/bin/"
 cp "$ROOT/scripts/linux/systemd/displayxr.socket" "$ROOT/scripts/linux/systemd/displayxr.service.in" \
     "$STAGE/share/systemd/user/"
@@ -174,6 +189,13 @@ Check it is running:
 ## Verify
 
     ~/.local/share/displayxr/bin/displayxr-cli selftest
+
+## Dashboard
+
+\`install.sh\` adds "DisplayXR Dashboard" to your applications menu
+(\`bin/displayxr-dashboard\`, beside the displayxr-cli it runs). It needs a
+desktop session's fontconfig and X11 client libraries (present on every
+desktop); \`displayxr-dashboard --version\` runs without a display.
 
 ## Vendor display plug-ins
 

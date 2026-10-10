@@ -68,10 +68,33 @@ self-contained, compressed single file). CI: the `Dashboard` job in `build-windo
 before the installer, which installs it beside `displayxr-cli.exe` with a Start-menu
 shortcut "DisplayXR Dashboard".
 
+## Linux
+
+The `.deb` and the tarball ship it (`scripts/package_deb_linux.sh`,
+`scripts/package_linux.sh`): `/usr/lib/displayxr/bin/displayxr-dashboard` (tarball:
+`bin/displayxr-dashboard`) beside `displayxr-cli`, plus a "DisplayXR Dashboard" menu entry
+and icon from `scripts/linux/dashboard/`. Published as
+
+```bash
+dotnet publish src/dashboard/DisplayXR.Dashboard/DisplayXR.Dashboard.csproj -c Release -r linux-x64 \
+  --self-contained true -p:PublishSingleFile=true -p:PublishTrimmed=false -p:EnableCompressionInSingleFile=true
+```
+
+(no .NET runtime needed on the target; `InvariantGlobalization` = no ICU; the Skia /
+HarfBuzz natives are inside the file and extract on first run to `~/.net`, or
+`$DOTNET_BUNDLE_EXTRACT_BASE_DIR`). The window needs fontconfig and the X11 client
+libraries (the `.deb`'s `Recommends`). `displayxr-dashboard --version` prints the version
+and exits without a display server: it is the packaging smoke on Ubuntu 22.04 / 24.04 /
+26.04. CI: the `DashboardLinux` job in `build-linux.yml` (Linux tests + the publish, one
+artifact for both packages). On Linux the CLI is resolved next to the binary, then
+`/usr/lib/displayxr/bin`, `~/.local/share/displayxr/bin`, `/usr/bin`. The Windows-only
+parts (the job object, raising the first instance) are no-ops there.
+
 ## Run and debug
 
-- The CLI is resolved next to the exe, then `C:\Program Files\DisplayXR\Runtime`;
-  `DXR_DASHBOARD_CLI=<path>` overrides it (development).
+- The CLI is resolved next to the exe, then `C:\Program Files\DisplayXR\Runtime` (Linux:
+  see above); `DXR_DASHBOARD_CLI=<path>` overrides it (development).
+- `--version` prints the version and exits (no window).
 - `--page displays|windows|performance|developer|home` opens on that page.
 - `--fixture <file.ndjson>` replays snapshots from a file instead of `status --watch`
   (one line every 2 s, looping) and simulates the per-screen `dp` verbs in memory, so the

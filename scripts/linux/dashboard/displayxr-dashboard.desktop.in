@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=DisplayXR Dashboard
+GenericName=3D display settings
+Comment=Displays, windows, components and performance of the DisplayXR runtime
+Exec=@DASHBOARD_BIN@
+TryExec=@DASHBOARD_BIN@
+Icon=displayxr-dashboard
+Terminal=false
+Categories=Settings;System;
+Keywords=DisplayXR;OpenXR;3D;display;
