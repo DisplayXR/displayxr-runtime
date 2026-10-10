@@ -90,6 +90,8 @@
 #include <dwrite.h>
 #include <wrl/client.h>
 
+#include <wincodec.h> // --lift: load the still
+
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib> // atoi — --flat-band / --screen-flat parsing
@@ -209,6 +211,108 @@ static ComPtr<ID3D11Texture2D> g_weavedTex;
 static ComPtr<ID3D11Fence> g_weaveFence;
 static uint32_t g_weavedW = 0, g_weavedH = 0;
 
+// ---- --lift: a real still, lifted by the runtime (XR_DXR_lift) ----------------
+// `--lift[=path]` (or DXR_WEAVE_LIFT_IMAGE=path, which may contain spaces) draws
+// a 2D still into the weave rect and flags the rect as LIFTED: the runtime
+// converts it and weaves the views. `--lift-cursor` also chains
+// XrCursorDepthLiftRectDXR (XR_DXR_cursor_depth v3, ADR-046 Amendment 1): the
+// runtime draws the depth-aware cursor into the lifted views, and this probe
+// hides its OS cursor over the rect only on frames the runtime reports it drew.
+static bool g_lift = false;
+static bool g_liftCursor = false;
+static std::wstring g_liftPath;
+static XrLiftStreamDXR g_liftStream = XR_NULL_HANDLE;
+static ComPtr<IWICBitmapSource> g_liftImage; //!< decoded once, rescaled per rect size
+static ComPtr<ID3D11Texture2D> g_liftTex;    //!< the still at the current rect size
+static uint32_t g_liftTexW = 0, g_liftTexH = 0;
+static volatile bool g_liftCursorDrawn = false; //!< last submit: the runtime drew the cursor
+static RECT g_liftRect = {};                    //!< the lifted rect, client pixels
+
+//! Decode the still once (WIC), as 32bpp RGBA.
+static bool
+LoadLiftImage()
+{
+	ComPtr<IWICImagingFactory> wic;
+	if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic)))) {
+		LOG_ERROR("--lift: WIC unavailable");
+		return false;
+	}
+	ComPtr<IWICBitmapDecoder> dec;
+	ComPtr<IWICBitmapFrameDecode> frame;
+	ComPtr<IWICFormatConverter> conv;
+	if (FAILED(wic->CreateDecoderFromFilename(g_liftPath.c_str(), nullptr, GENERIC_READ,
+	                                          WICDecodeMetadataCacheOnDemand, &dec)) ||
+	    FAILED(dec->GetFrame(0, &frame)) || FAILED(wic->CreateFormatConverter(&conv)) ||
+	    FAILED(conv->Initialize(frame.Get(), GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, nullptr, 0.0,
+	                            WICBitmapPaletteTypeCustom))) {
+		LOG_ERROR("--lift: cannot decode '%ls'", g_liftPath.c_str());
+		return false;
+	}
+	// Keep the factory alive through the converter's lifetime.
+	g_liftImage = conv;
+	wic.Detach();
+	UINT w = 0, h = 0;
+	g_liftImage->GetSize(&w, &h);
+	LOG_INFO("--lift: still '%ls' %ux%u", g_liftPath.c_str(), w, h);
+	return true;
+}
+
+//! The still stretched to @p w x @p h, as an RGBA8 texture (rebuilt on resize).
+static bool
+EnsureLiftTexture(uint32_t w, uint32_t h)
+{
+	if (g_liftTex && g_liftTexW == w && g_liftTexH == h) {
+		return true;
+	}
+	g_liftTex.Reset();
+	ComPtr<IWICImagingFactory> wic;
+	ComPtr<IWICBitmapScaler> scaler;
+	if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic))) ||
+	    FAILED(wic->CreateBitmapScaler(&scaler)) ||
+	    FAILED(scaler->Initialize(g_liftImage.Get(), w, h, WICBitmapInterpolationModeFant))) {
+		return false;
+	}
+	std::vector<uint8_t> px((size_t)w * h * 4);
+	if (FAILED(scaler->CopyPixels(nullptr, w * 4, (UINT)px.size(), px.data()))) {
+		return false;
+	}
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = w;
+	td.Height = h;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_IMMUTABLE;
+	td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	D3D11_SUBRESOURCE_DATA init = {px.data(), w * 4, 0};
+	if (FAILED(g_device->CreateTexture2D(&td, &init, &g_liftTex))) {
+		return false;
+	}
+	g_liftTexW = w;
+	g_liftTexH = h;
+	return true;
+}
+
+//! Batch layout, lifted: the WHOLE rect holds the 2D frame (not squeezed SBS);
+//! the rest of the window-sized input is a transparent gap.
+static void
+RenderLiftStill(int32_t rx, int32_t ry, int32_t rw, int32_t rh)
+{
+	if (!g_sbsRtv || !g_sbsMutex || rw <= 0 || rh <= 0 || !EnsureLiftTexture((uint32_t)rw, (uint32_t)rh)) {
+		return;
+	}
+	if (g_sbsMutex->AcquireSync(0, 1000) != S_OK) {
+		return;
+	}
+	const float gap[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+	g_context->ClearView(g_sbsRtv.Get(), gap, nullptr, 0);
+	D3D11_BOX box = {0, 0, 0, (UINT)rw, (UINT)rh, 1};
+	g_context->CopySubresourceRegion(g_sbsTex.Get(), 0, (UINT)rx, (UINT)ry, 0, g_liftTex.Get(), 0, &box);
+	g_context->Flush();
+	g_sbsMutex->ReleaseSync(0);
+}
+
 // ---- Win32 window -----------------------------------------------------------
 static LRESULT CALLBACK
 WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -226,6 +330,17 @@ WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			g_quit = true;
 		}
 		return 0;
+	case WM_SETCURSOR:
+		// --lift-cursor: the runtime draws the cursor into the lifted views; hide
+		// the OS one over the rect only while it reports it did (else keep it).
+		if (g_liftCursor && LOWORD(lParam) == HTCLIENT && g_liftCursorDrawn) {
+			POINT pt;
+			if (GetCursorPos(&pt) && ScreenToClient(hwnd, &pt) && PtInRect(&g_liftRect, pt)) {
+				SetCursor(nullptr);
+				return TRUE;
+			}
+		}
+		return DefWindowProc(hwnd, msg, wParam, lParam);
 	default: return DefWindowProc(hwnd, msg, wParam, lParam);
 	}
 }
@@ -1033,6 +1148,16 @@ ParseOptions(PWSTR cmdLineW)
 				} else {
 					LOG_ERROR("--size: bad value '%s' (want WxH) — ignored", tok + 7);
 				}
+			} else if (_stricmp(tok, "--lift") == 0 || _strnicmp(tok, "--lift=", 7) == 0) {
+				g_lift = true;
+				if (tok[6] == '=') {
+					wchar_t wp[MAX_PATH] = {0};
+					MultiByteToWideChar(CP_UTF8, 0, tok + 7, -1, wp, MAX_PATH);
+					g_liftPath = wp;
+				}
+			} else if (_stricmp(tok, "--lift-cursor") == 0) {
+				g_lift = true;
+				g_liftCursor = true;
 			} else if (_strnicmp(tok, "--rect=", 7) != 0) {
 				LOG_INFO("unrecognized argument '%s' — ignored", tok);
 			}
@@ -1107,6 +1232,23 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 		LOG_INFO("v8 sticky screen flat regions: CLEAR (rectCount 0)");
 	}
 
+	if (g_lift) {
+		wchar_t envp[MAX_PATH] = {0};
+		if (g_liftPath.empty() && GetEnvironmentVariableW(L"DXR_WEAVE_LIFT_IMAGE", envp, MAX_PATH) > 0) {
+			g_liftPath = envp;
+		}
+		CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+		if (g_liftPath.empty() || !LoadLiftImage()) {
+			LOG_ERROR("--lift needs an image: --lift=<path> or DXR_WEAVE_LIFT_IMAGE=<path>");
+			return 1;
+		}
+		if (g_useV6) {
+			LOG_INFO("--lift: v6 layout not supported by this probe — using the batch layout");
+			g_useV6 = false;
+		}
+		g_overlayMode = OVERLAY_NONE; // nothing over the picture under test
+	}
+
 	XrSessionManager xr;
 	if (!InitializeOpenXR(xr)) {
 		return 1;
@@ -1178,6 +1320,32 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 	// present-owner's request was stored and never applied (the only consumer
 	// was the per-client commit, which a weave caller never runs), and the
 	// force-3D kick then pinned it to the first 3D-capable mode.
+	if (g_lift) {
+		if (!g_hasLiftExt || g_pfnCreateLiftStream == nullptr) {
+			LOG_ERROR("--lift: XR_DXR_lift is not available on this runtime");
+			return 1;
+		}
+		if (g_liftCursor && g_cursorDepthSpecVersion < 3) {
+			LOG_ERROR("--lift-cursor: the runtime's XR_DXR_cursor_depth is v%u (needs v3) — lifting without it",
+			          g_cursorDepthSpecVersion);
+			g_liftCursor = false;
+		}
+		// The cursor is placed from the conversion's own depth map: ask for it.
+		XrLiftDepthRequestDXR dreq = {XR_TYPE_LIFT_DEPTH_REQUEST_DXR};
+		XrLiftStreamCreateInfoDXR ci = {XR_TYPE_LIFT_STREAM_CREATE_INFO_DXR};
+		ci.next = g_liftCursor ? &dreq : nullptr;
+		ci.mode = XR_LIFT_MODE_SBS_DXR;
+		ci.contentHint = XR_LIFT_CONTENT_HINT_VIDEO_DXR; // the browser's case: a video frame
+		ci.inputScale = 1.0f;
+		XrResult lr = g_pfnCreateLiftStream(xr.session, &ci, &g_liftStream);
+		LogXrResult("xrCreateLiftStreamDXR", lr);
+		if (XR_FAILED(lr)) {
+			return 1;
+		}
+		LOG_INFO("--lift: SBS stream created (depth %s, depth cursor %s)", g_liftCursor ? "requested" : "off",
+		         g_liftCursor ? "REQUESTED" : "off");
+	}
+
 	if (g_requestMode >= 0) {
 		PFN_xrRequestDisplayRenderingModeDXR pfnReqMode = nullptr;
 		xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeDXR",
@@ -1262,10 +1430,17 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 				continue;
 			}
 
-			// Render this frame's pre-weave SBS pair off-axis from the eyes the
-			// runtime returned LAST frame (look-around / virtual-camera motion), into
-			// the element's window-relative rect (rest of the window = transparent gap).
-			RenderSbsLookAround(g_lastEyeX[0], g_lastEyeX[1], rx, ry, (int32_t)rw, (int32_t)rh);
+			if (g_lift) {
+				// --lift: the 2D still in the rect; the runtime lifts it.
+				RenderLiftStill(rx, ry, (int32_t)rw, (int32_t)rh);
+				g_liftRect = {rx, ry, rx + (LONG)rw, ry + (LONG)rh};
+			} else {
+				// Render this frame's pre-weave SBS pair off-axis from the eyes the
+				// runtime returned LAST frame (look-around / virtual-camera motion),
+				// into the element's window-relative rect (rest of the window =
+				// transparent gap).
+				RenderSbsLookAround(g_lastEyeX[0], g_lastEyeX[1], rx, ry, (int32_t)rw, (int32_t)rh);
+			}
 		}
 
 		// v4: keep the overlay atlas sized to the window client area so the DP
@@ -1376,7 +1551,26 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 			tail = &flat.next;
 		}
 
+		// --lift: flag rect 0 as 2D-to-lift; --lift-cursor asks the runtime to draw
+		// the depth cursor into its lifted views (XR_DXR_cursor_depth v3).
+		XrCursorDepthLiftRectDXR cursorReq = {XR_TYPE_CURSOR_DEPTH_LIFT_RECT_DXR};
+		XrWeaveRectLiftDXR liftRect = {XR_TYPE_WEAVE_RECT_LIFT_DXR};
+		XrWeaveSubmitLiftRectsDXR lifts = {XR_TYPE_WEAVE_SUBMIT_LIFT_RECTS_DXR};
+		if (g_lift && g_liftStream != XR_NULL_HANDLE) {
+			liftRect.rectIndex = 0;
+			liftRect.stream = g_liftStream;
+			liftRect.next = g_liftCursor ? &cursorReq : nullptr;
+			lifts.liftCount = 1;
+			lifts.lifts = &liftRect;
+			*tail = &lifts;
+			tail = &lifts.next;
+		}
+
 		XrWeaveOutputDXR out = {XR_TYPE_WEAVE_OUTPUT_DXR};
+		XrCursorDepthLiftStateDXR cursorState = {XR_TYPE_CURSOR_DEPTH_LIFT_STATE_DXR};
+		if (g_liftCursor) {
+			out.next = &cursorState;
+		}
 
 		LARGE_INTEGER t0, t1;
 		QueryPerformanceCounter(&t0);
@@ -1408,6 +1602,20 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 			} else {
 				LOG_INFO("v8 XrWeaveSubmitFlatRegionsDXR CHAIN NOT SENT (--flat-band absent) — "
 				         "wish = the whole weave rect, i.e. pre-v8 behaviour");
+			}
+		}
+
+		if (g_liftCursor) {
+			const bool drawn = (cursorState.drawnLiftMask & 1u) != 0;
+			if (drawn != g_liftCursorDrawn) {
+				LOG_INFO("--lift-cursor: runtime %s the depth cursor (frame %llu)",
+				         drawn ? "DRAWS" : "does NOT draw", (unsigned long long)frame);
+				g_liftCursorDrawn = drawn;
+				// Re-evaluate WM_SETCURSOR now rather than on the next mouse move.
+				POINT pt;
+				if (GetCursorPos(&pt)) {
+					SetCursorPos(pt.x, pt.y);
+				}
 			}
 		}
 
