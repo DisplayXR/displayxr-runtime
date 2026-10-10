@@ -975,10 +975,23 @@ struct comp_vk_native_compositor
 #ifdef VK_MIDFRAME_FILL
 		/*!
 		 * #1905: mid-frame fill state. Written and read only by the repaint
-		 * thread, so it needs no lock.
+		 * thread (enabled/layer_live: once at create, before it starts), so
+		 * it needs no lock.
 		 */
 		struct
 		{
+			//! The resolved switch (dxr_midframe_fill_resolve): auto = ON
+			//! iff the queue-lock layer is live on this device; the
+			//! env/property forces it either way.
+			bool enabled;
+			//! #902 marker handshake resolved on THIS device's chain at
+			//! create — VK_LAYER_DXR_queue_lock serialises every vkQueue*
+			//! call in the process, the app's own included.
+			bool layer_live;
+			//! Unlocked fence-park time inside the current fill (#1264 S1
+			//! park site), subtracted from its wall time so fill_ema and
+			//! the duty measure only the time the fill held c->mutex.
+			uint64_t fill_parked_ns;
 			//! When the last app-frame weave this thread SERVED started / ended.
 			uint64_t serve_start_ns, serve_end_ns;
 			//! EMA of the spacing between served app weaves (the app's frame
@@ -987,10 +1000,11 @@ struct comp_vk_native_compositor
 			//! Consecutive serve-interval samples rejected as outliers.
 			uint32_t serve_iv_rejects;
 			/*!
-			 * EMA of a fill's wall time with c->mutex held (fire_t0 -> fire_t1),
-			 * over EVERY fill — legacy and mid-frame — seeded from the first.
-			 * The duty governor's only input; never frozen, because it does not
-			 * gate the fills that feed it to zero.
+			 * EMA of the time a fill HELD c->mutex (fire_t0 -> fire_t1 minus
+			 * any unlocked fence-park), over EVERY fill — legacy and
+			 * mid-frame — seeded from the first. The duty governor's only
+			 * input; never frozen, because it does not gate the fills that
+			 * feed it to zero.
 			 */
 			uint64_t fill_ema_ns;
 			//! This fill holds c->mutex across its own GPU wait (no fence-park).
@@ -7231,11 +7245,10 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 				}
 #ifdef VK_MIDFRAME_FILL
 				/*
-				 * #1905: a mid-frame-schedule fill waits UNDER the lock (see
-				 * dxr_midframe_fill_park: the unlocked park is where the
-				 * app's renderer_draw submit collided with this thread on
-				 * Adreno's single GSL context). Bounded, so a fence that does
-				 * not signal falls through to the ordinary park below and
+				 * #1905: with midframe_fill_park=0 (A/B only; the default
+				 * parks) a mid-frame-schedule fill waits UNDER the lock — see
+				 * dxr_midframe_fill_park. Bounded, so a fence that does not
+				 * signal falls through to the ordinary park below and
 				 * c->mutex is never held indefinitely (#1394 un-wedge needs
 				 * it free).
 				 */
@@ -7251,11 +7264,19 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 					    comp_vk_native_target_get_generation(c->target);
 					const uint64_t serial_park = c->present_serial;
 					c->fill_parked = true;
+#ifdef VK_MIDFRAME_FILL
+					const uint64_t park_t0 = os_monotonic_get_ns();
+#endif
 					os_mutex_unlock(&c->mutex);
 					vk->vkWaitForFences(vk->device, 1, fence_p, VK_TRUE, UINT64_MAX);
 					vk->vkResetFences(vk->device, 1, fence_p);
 					os_mutex_lock(&c->mutex);
 					c->fill_parked = false;
+#ifdef VK_MIDFRAME_FILL
+					// #1905: unlocked time (wait + relock), not app-visible —
+					// excluded from fill_ema / the duty (lock-held only).
+					c->repaint.mf.fill_parked_ns += os_monotonic_get_ns() - park_t0;
+#endif
 					// GPU is done — the command buffer is free regardless of
 					// what the validation below decides.
 					vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
@@ -7623,30 +7644,36 @@ vk_app_submit_window_open(const struct comp_vk_native_compositor *c)
 
 #ifdef VK_MIDFRAME_FILL
 /*!
- * #1905 opt-in: fill at panel rate while the app is MID-FRAME (Android).
- * DXR_MIDFRAME_FILL / `debug.dxr.midframe_fill` — must be "1" to enable.
- * Default OFF.
+ * #1905: fill at panel rate while the app is MID-FRAME (Android).
  *
- * Why it is OFF by default. Mid-frame fills put a runtime submit on the
- * repaint queue while the app is submitting on its own — and on Adreno both
- * land on ONE GSL context, but only the runtime's submits are serialised (by
- * c->mutex); the app's own vkQueueSubmit calls are not, and cannot be from
- * here. The collision corrupts the context timestamp and the NEXT submit
- * fails with VK_ERROR_INITIALIZATION_FAILED. When that next submit is the
- * runtime's, comp_vk_native_queue_submit_retry recovers it; when it is the
- * APP's, the app's frame is lost silently — earthview lost 12 of its own
- * submits in 30 s under forced fills — and an app that waits a fence on such
- * a submit would hang. So until app-side submits are serialised with the
- * fill's (a process-wide queue-lock layer, or a second VkDevice giving the
- * runtime its own GSL context), more fills mid-frame means more of these, and
- * the feature stays opt-in for measurement.
+ * Enable policy (dxr_midframe_fill_resolve, once at create): ON when
+ * VK_LAYER_DXR_queue_lock is live on the app's device — the #902 marker
+ * handshake, resolved through THIS device's vkGetDeviceProcAddr, so it is true
+ * however the layer got into the chain (the oxr_vulkan.c injection, the app's
+ * nativeLibraryDir, or the gpu_debug_layer_app settings path) and never
+ * depends on a log line. Absent: OFF. DXR_MIDFRAME_FILL /
+ * `debug.dxr.midframe_fill` "1" forces ON (test), "0" forces OFF; empty = auto.
+ *
+ * Why it needs the layer. Mid-frame fills put a runtime submit on the repaint
+ * queue while the app is submitting on its own — and on Adreno both queues
+ * land on ONE GSL context. The runtime's submits are serialised by c->mutex;
+ * the app's own vkQueueSubmit calls are not, and cannot be from here. The
+ * collision corrupts the context timestamp and the NEXT submit fails with
+ * VK_ERROR_INITIALIZATION_FAILED: when that next submit is the runtime's,
+ * comp_vk_native_queue_submit_retry recovers it; when it is the APP's, the
+ * app's frame is lost silently (earthview lost 12 of its own submits in 30 s
+ * under forced fills without the layer), and an app that waits a fence on it
+ * would hang. The layer's per-queue lock wraps every vkQueue* call in the
+ * process, the app's included — measured on the Lume phone with the layer
+ * live: 0 GSL warnings, 0 submit -3, across forced and mid-frame fills.
  *
  * Why it exists. A GPU-bound Android app is never between frames: it is
  * either inside xrEndFrame (app_frame_in_progress) or rendering its next one,
  * and the legacy quiet gate ("quiet >= 1.2 periods since the last APP frame")
  * almost never opens inside a ~35 ms interval. Measured on a Lume phone
  * (Adreno 740, 60 Hz): earthview 0.0-0.2 fills/s, weave + face refresh at the
- * app's ~28 Hz while the panel and the vendor SDK sustain 60.
+ * app's ~28 Hz while the panel and the vendor SDK sustain 60. With the layer
+ * and this on: earthview W 50 Hz, model viewer W 31.5 Hz, app fps = baseline.
  *
  * What it changes (see vk_midframe_gate_open for the rule):
  *   - the `app_frame_in_progress` bail is dropped. Safe because on Android
@@ -7657,38 +7684,42 @@ vk_app_submit_window_open(const struct comp_vk_native_compositor *c)
  *     present-paced rule says yes; while the app is mid-frame every fill
  *     (legacy-admitted too) must pass the present-paced spacing + duty rule;
  *   - every fill yields to a posted app frame (weave_hand.pending, re-checked
- *     under the lock) and holds c->mutex across its own GPU wait (no
- *     fence-park; see dxr_midframe_fill_park for why).
- * Off (the default) is the prior gating. (The layer_stage publish stays
- * either way — it is the same frame, published under the lock instead of
- * written in place.)
+ *     under the lock); its GPU wait fence-parks unlocked by default
+ *     (dxr_midframe_fill_park).
+ * Off is the prior gating. (The layer_stage publish stays either way — it is
+ * the same frame, published under the lock instead of written in place.)
  */
 static bool
-dxr_midframe_fill_enabled(void)
+dxr_midframe_fill_resolve(bool layer_live)
 {
-	static int on = -1;
-	if (on < 0) {
-		on = 0;
-		const char *e = getenv("DXR_MIDFRAME_FILL");
-		if (e != NULL && e[0] != '\0') {
-			on = (e[0] == '1') ? 1 : 0;
-		}
-#ifdef XRT_OS_ANDROID
-		else {
-			char sp[PROP_VALUE_MAX] = {0};
-			if (__system_property_get("debug.dxr.midframe_fill", sp) > 0 && sp[0] != '\0') {
-				on = (sp[0] == '1') ? 1 : 0;
-			}
-		}
-#endif
-		U_LOG_W(
-		    "#1905: mid-frame fill %s — the repaint loop %s fill at panel rate while the app is "
-		    "mid-frame. Default OFF: until app submits are serialised with the fill's (shared Adreno "
-		    "GSL context), mid-frame fills can fail the APP's own vkQueueSubmit. Opt in with "
-		    "DXR_MIDFRAME_FILL=1 / setprop debug.dxr.midframe_fill 1",
-		    on ? "ON (opt-in)" : "OFF (default)", on ? "WILL" : "will NOT");
+	int forced = -1; // -1 = auto
+	const char *e = getenv("DXR_MIDFRAME_FILL");
+	if (e != NULL && e[0] != '\0') {
+		forced = (e[0] == '1') ? 1 : 0;
 	}
-	return on == 1;
+#ifdef XRT_OS_ANDROID
+	else {
+		char sp[PROP_VALUE_MAX] = {0};
+		if (__system_property_get("debug.dxr.midframe_fill", sp) > 0 && sp[0] != '\0') {
+			forced = (sp[0] == '1') ? 1 : 0;
+		}
+	}
+#endif
+	const bool on = forced >= 0 ? (forced == 1) : layer_live;
+	U_LOG_W(
+	    "#1905: mid-frame fill %s — %s (DXR_MIDFRAME_FILL / debug.dxr.midframe_fill: 1 forces ON, 0 "
+	    "forces OFF, empty = auto on the queue-lock layer)",
+	    on ? "ON" : "OFF",
+	    forced == 1   ? (layer_live ? "forced ON; VK_LAYER_DXR_queue_lock is live"
+	                                : "forced ON WITHOUT VK_LAYER_DXR_queue_lock: app submits are NOT "
+	                                  "serialised with fills, expect Adreno GSL -3 / lost app submits")
+	    : forced == 0 ? (layer_live ? "forced OFF; VK_LAYER_DXR_queue_lock is live"
+	                                : "forced OFF; VK_LAYER_DXR_queue_lock absent")
+	    : layer_live  ? "auto: VK_LAYER_DXR_queue_lock is live on this device (it serialises the app's "
+	                    "submits with the fill's)"
+	                  : "auto: VK_LAYER_DXR_queue_lock absent on this device, app submits would race the "
+	                    "fill's on a shared GSL context");
+	return on;
 }
 
 /*!
@@ -7697,13 +7728,19 @@ dxr_midframe_fill_enabled(void)
  * clamped to [5, 100].
  *
  * The cap is a closed loop on MEASURED cost, not a prediction: a fill holds
- * c->mutex for fill_ema_ns, so allowing one present-paced fill start every
- * fill_ema / duty keeps fills holding the lock at most `duty` of the time —
- * the rest is guaranteed to the app's layer_commit. 60 is chosen from the
- * force-probe data (FORCE ran fills at ~18-32/s with no app regression on
- * model viewer and 10-30% on earthview): at earthview's ~20 ms fills it
- * allows ~30 fills/s; at model viewer's measured ~45 ms fill wall time
- * (lock contention included) it caps at ~13/s. It applies to EVERY fill
+ * c->mutex for fill_ema_ns (LOCK-HELD time only — an unlocked fence-park is
+ * excluded, since the app's layer_commit is not blocked by it), so allowing
+ * one present-paced fill start every fill_ema / duty keeps fills holding the
+ * lock at most `duty` of the time — the rest is guaranteed to the app's
+ * layer_commit. 60 is chosen from the force-probe data (FORCE ran fills at
+ * ~18-32/s with no app regression on model viewer and 10-30% on earthview).
+ * Sanity against round 4 (layer live, park=1), when the EMA still included the
+ * park: model viewer fill_ema 21.4 ms -> spacing 35.7 ms -> <= 28 fills/s, yet
+ * it ran 10.5/s with skip_pending=43 — most refusals were "an app weave is
+ * posted", the right priority, not the duty. With the park excluded the EMA is
+ * smaller, so the duty term binds even less and the 0.9 P floor + the P/2
+ * present spacing (<= panel rate) are what bound fills. NOTE the cap governs
+ * lock occupancy only, not the fill's GPU share. It applies to EVERY fill
  * that starts while the app is mid-frame — legacy-gate ones included (round 3;
  * exempting them let back-to-back legacy fills run the duty to 43-48%).
  * Between app frames legacy fills keep their old, unthrottled verdict.
@@ -7735,34 +7772,30 @@ dxr_midframe_fill_duty(void)
 }
 
 /*!
- * #1905: may a fill fence-park (release c->mutex across its GPU wait)?
- * DXR_MIDFRAME_FILL_PARK / `debug.dxr.midframe_fill_park` — "1" re-enables
- * the park for A/B. Default OFF while mid-frame fill is active.
+ * #1905: may a mid-frame-schedule fill fence-park (release c->mutex across
+ * its GPU wait, the #1264 S1 park)? DXR_MIDFRAME_FILL_PARK /
+ * `debug.dxr.midframe_fill_park` — default 1 (park); "0" selects the
+ * lock-held wait for A/B.
  *
- * Why not park. On Adreno the runtime-owned repaint queue is NOT an
- * independent submission context — every submit in the process lands on one
- * GSL context (see the #1394 note at begin_frame). The runtime's own submits
- * (the app frame's renderer_draw on the app queue, the fill's submit + present
- * on the repaint queue) are all made under c->mutex, so they are serialised —
- * EXCEPT across the fence-park, the one window where the repaint thread runs
- * vkWaitForFences/vkResetFences without c->mutex while the app's layer_commit
- * takes it and submits renderer_draw. Under the FORCE probe that collided
- * ~0.7 times/s on the Lume phone (`gsl_context_base_next_timestamp: next
- * client ts N must be greater than current ts N` on the APP thread, then
- * renderer_draw `Failed to submit renderer commands: -3`), and never with
- * fills off. The park also lets renderer_draw rewrite the atlas while the
- * fill's weave may still read it on the GPU. Holding the lock closes both: the
- * app's commit waits at most one fill's GPU time, and it was going to
- * vkQueueWaitIdle its own atlas submit right after anyway. The wait under the
- * lock is BOUNDED (see the park site): past it, the fill parks as before, so a
- * fence that never signals cannot turn into a held c->mutex (#1394).
+ * History. Round 2 held c->mutex across the fill's GPU wait as a mitigation
+ * for the Adreno GSL -3 (the park was the one window where the repaint
+ * thread's wait ran beside the app's renderer_draw submit). It did not fix the
+ * race — the race is CPU-side, between the app's own unlocked vkQueueSubmit
+ * and any runtime submit; VK_LAYER_DXR_queue_lock fixes it — and it costs a
+ * GPU-saturated app: model viewer with the layer, park=0 vs park=1, app fps
+ * 13.2 -> 8.9 vs 13.4 -> 9.9 (baseline 13.5 -> 9.9), weave 25.8 vs 31.5 Hz;
+ * earthview W 48.3 vs 50.2 Hz. The app's layer_commit waited out every fill's
+ * GPU time. The park's other cost (renderer_draw may rewrite the atlas while
+ * the fill's weave still reads it on the GPU) is the same as for every legacy
+ * fill, which always parked. The lock-held wait stays BOUNDED when selected
+ * (see the park site).
  */
 static bool
 dxr_midframe_fill_park(void)
 {
 	static int park = -1;
 	if (park < 0) {
-		park = 0;
+		park = 1;
 		const char *e = getenv("DXR_MIDFRAME_FILL_PARK");
 		if (e != NULL && e[0] != '\0') {
 			park = (e[0] == '1') ? 1 : 0;
@@ -7775,6 +7808,8 @@ dxr_midframe_fill_park(void)
 			}
 		}
 #endif
+		U_LOG_W("#1905: mid-frame fill GPU wait: %s (DXR_MIDFRAME_FILL_PARK / debug.dxr.midframe_fill_park)",
+		        park ? "fence-park, c->mutex released (default)" : "held under c->mutex (A/B, bounded 250 ms)");
 	}
 	return park == 1;
 }
@@ -7782,7 +7817,7 @@ dxr_midframe_fill_park(void)
 /*!
  * #1905: does the mid-frame schedule own this tick?
  *
- * Keyed on the opt-in switch, #1196 single weave ownership (the served-weave
+ * Keyed on the resolved switch (c->repaint.mf.enabled), #1196 single weave ownership (the served-weave
  * stamps the rule paces off only exist there), the #1257 partition NOT being
  * engaged (it owns its own schedule), and the FORCE probe off (a probe keeps
  * the old path so it stays comparable). Deliberately NOT keyed on the gate
@@ -7792,7 +7827,7 @@ dxr_midframe_fill_park(void)
 static bool
 vk_midframe_active(const struct comp_vk_native_compositor *c)
 {
-	return dxr_midframe_fill_enabled() && c->repaint.partition.next_release_ns == 0 && c->weave_hand.enabled == 1 &&
+	return c->repaint.mf.enabled && c->repaint.partition.next_release_ns == 0 && c->weave_hand.enabled == 1 &&
 	       c->repaint.force != 1;
 }
 
@@ -8151,12 +8186,14 @@ vk_repaint_thread(void *ptr)
 				    win != 0 ? 100.0 * (double)c->repaint.mf.win_busy_ns / (double)win : 0.0;
 				U_LOG_W(
 				    "#1905 trace site=vk midframe{on=%d legacy_fires=%u midframe_fires=%u in_frame=%u "
-				    "skip_pending=%u skip_duty=%u duty=%.0f%%/%u%% fill_ema=%.2fms app_iv=%.1fms}",
+				    "skip_pending=%u skip_duty=%u duty=%.0f%%/%u%% fill_ema=%.2fms app_iv=%.1fms "
+				    "park=%d layer=%d}",
 				    (int)vk_midframe_active(c), c->repaint.mf.legacy_fires,
 				    c->repaint.mf.midframe_fires, c->repaint.mf.in_frame, c->repaint.mf.skip_pending,
 				    c->repaint.mf.skip_duty, duty_pct, dxr_midframe_fill_duty(),
 				    (double)c->repaint.mf.fill_ema_ns / 1e6,
-				    (double)c->repaint.mf.serve_iv_ema_ns / 1e6);
+				    (double)c->repaint.mf.serve_iv_ema_ns / 1e6, (int)dxr_midframe_fill_park(),
+				    (int)c->repaint.mf.layer_live);
 				c->repaint.mf.legacy_fires = 0;
 				c->repaint.mf.midframe_fires = 0;
 				c->repaint.mf.in_frame = 0;
@@ -8541,9 +8578,11 @@ vk_repaint_thread(void *ptr)
 		// #1905 trace: the app is MID-FRAME (between xrBeginFrame and the end
 		// of xrEndFrame) as this fill starts.
 		const bool mf_in_frame_at_fire = c->repaint.app_frame_in_progress || c->repaint.app_submit_window;
-		// No fence-park while the mid-frame schedule is live — see
-		// dxr_midframe_fill_park. Read at the park site, under this lock.
+		// Lock-held GPU wait only when midframe_fill_park=0 (A/B; the
+		// default parks) — see dxr_midframe_fill_park. Read at the park
+		// site, under this lock.
 		c->repaint.mf.hold_lock = mf_locked && !dxr_midframe_fill_park();
+		c->repaint.mf.fill_parked_ns = 0;
 #endif
 		// zero_copy is hard false: c->repaint.armed is only set off that path.
 		vk_dp_weave_and_present(c, /*is_repaint=*/true, /*zero_copy=*/false, 0, 0, 0, 0, 0,
@@ -8560,12 +8599,17 @@ vk_repaint_thread(void *ptr)
 #ifdef VK_MIDFRAME_FILL
 		c->repaint.mf.hold_lock = false;
 		{
-			// #1905: the duty governor's input — EVERY fill's wall time with
-			// c->mutex held (late-weave sleep in the acquire, submit, GPU wait,
-			// present), seeded from the first fill so it is never frozen. A
-			// sample over 200 ms (a recreate, a stall) is clamped rather than
-			// dropped, so a genuinely slow fill still throttles the next ones.
-			uint64_t d = fire_t1 - fire_t0;
+			// #1905: the duty governor's input — EVERY fill's time HOLDING
+			// c->mutex (late-weave sleep in the acquire, submit, present, and
+			// the GPU wait only when it is lock-held), seeded from the first
+			// fill so it is never frozen. The unlocked fence-park is excluded:
+			// the app's layer_commit is not blocked by it, so counting it made
+			// the duty over-throttle on the park path. A sample over 200 ms (a
+			// recreate, a stall) is clamped rather than dropped, so a
+			// genuinely slow fill still throttles the next ones.
+			const uint64_t wall = fire_t1 - fire_t0;
+			const uint64_t parked = c->repaint.mf.fill_parked_ns;
+			uint64_t d = parked < wall ? wall - parked : 0;
 			if (d > 200000000ULL) {
 				d = 200000000ULL;
 			}
@@ -8574,7 +8618,7 @@ vk_repaint_thread(void *ptr)
 			if (c->repaint.mf.win_start_ns == 0) {
 				c->repaint.mf.win_start_ns = fire_t0;
 			}
-			c->repaint.mf.win_busy_ns += fire_t1 - fire_t0;
+			c->repaint.mf.win_busy_ns += parked < wall ? wall - parked : 0;
 			if (mf_fill) {
 				c->repaint.mf.midframe_fires++;
 			} else {
@@ -11311,10 +11355,11 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 			        single ? "single — app frames weave on the repaint thread"
 			               : "legacy — app thread and repaint thread both weave");
 #ifdef VK_MIDFRAME_FILL
-			// #1905: resolve (and log, once) the mid-frame fill switch at
-			// startup rather than on the repaint thread's first tick.
-			(void)dxr_midframe_fill_enabled();
+			// #1905: resolve (and log, once) the duty + park knobs at
+			// startup rather than on the repaint thread's first tick. The
+			// switch itself needs the #902 marker — resolved below.
 			(void)dxr_midframe_fill_duty();
+			(void)dxr_midframe_fill_park();
 #endif
 		}
 
@@ -11352,6 +11397,14 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		                           c->repaint.enabled == 1)
 		                              ? 1
 		                              : 0;
+#ifdef VK_MIDFRAME_FILL
+		// #1905 enable policy: mid-frame fill auto-enables on the same
+		// marker handshake — the layer is live in this device's chain, so the
+		// app's own submits are serialised with the fill's (see
+		// dxr_midframe_fill_resolve). Logged once with the reason.
+		c->repaint.mf.layer_live = layer_live;
+		c->repaint.mf.enabled = dxr_midframe_fill_resolve(layer_live);
+#endif
 
 		if (c->repaint_queue == VK_NULL_HANDLE && c->repaint.shared_queue == 0) {
 			if (c->repaint.enabled == 1) {
