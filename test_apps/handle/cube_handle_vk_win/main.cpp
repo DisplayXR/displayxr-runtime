@@ -773,6 +773,21 @@ static void RenderThreadFunc(
                             viewState.next = &rawProbe;
                         }
 
+                        // Multi-screen M3/M6 (ADR-041 + XR_DXR_display_info
+                        // v22): how many located views are live this frame,
+                        // and which of them belong to which display when the
+                        // window spans displays — chained in front of whatever
+                        // the rig probe put there. Same as cube_handle_d3d11_win
+                        // and cube_handle_vk_linux.
+                        XrViewActivityStateDXR viewActivity = {XR_TYPE_VIEW_ACTIVITY_STATE_DXR};
+                        XrViewDisplayBindingDXR viewBindingStorage[4] = {};
+                        XrViewDisplayBindingsDXR viewBindings = {XR_TYPE_VIEW_DISPLAY_BINDINGS_DXR};
+                        viewBindings.bindingCapacityInput = 4;
+                        viewBindings.bindings = viewBindingStorage;
+                        viewBindings.next = viewState.next;
+                        viewActivity.next = &viewBindings;
+                        viewState.next = &viewActivity;
+
                         // XR_DXR_view_rig (#396 W7): drive the runtime rig
                         // matching the app's current mode (C selects the rig)
                         // with the app's tunables — the runtime owns the window
@@ -817,6 +832,45 @@ static void RenderThreadFunc(
                         }
                         xrLocateViews(xr->session, &locateInfo, &viewState, 8, &viewCount, rawViews);
                         LOG_INFO("[FRAME] Raw LocateViews done");
+
+                        // Multi-screen M3/M6: with the window spanning displays
+                        // the runtime hands out one view set per display; render
+                        // ALL of them (the sum is activeViewCount), each set's
+                        // local view j into tile j at that display's segment
+                        // rect (placed below once the tile size is known).
+                        const bool routedViews =
+                            !monoMode && xr->viewConfigType == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR &&
+                            viewBindings.bindingCountOutput > 0 && viewBindings.bindingCountOutput <= 4;
+                        if (routedViews) {
+                            int routedEyes = 0;
+                            for (uint32_t b = 0; b < viewBindings.bindingCountOutput; b++) {
+                                const int end =
+                                    (int)(viewBindingStorage[b].firstView + viewBindingStorage[b].viewCount);
+                                if (end > routedEyes) routedEyes = end;
+                            }
+                            if (routedEyes > (int)locatedCount) routedEyes = (int)locatedCount;
+                            if (routedEyes > 0) eyeCount = routedEyes;
+                        }
+                        {
+                            // Log the bindings when they change (one line, never per frame).
+                            static std::string lastBindings;
+                            std::string now = routedViews ? "routed" : "single";
+                            for (uint32_t b = 0; routedViews && b < viewBindings.bindingCountOutput; b++) {
+                                const XrViewDisplayBindingDXR& vb = viewBindingStorage[b];
+                                char buf[160];
+                                snprintf(buf, sizeof(buf), " [display 0x%llx views %u..%u at %d,%d %dx%d]",
+                                         (unsigned long long)vb.displayId, vb.firstView,
+                                         vb.firstView + vb.viewCount - 1, vb.segmentRect.offset.x,
+                                         vb.segmentRect.offset.y, vb.segmentRect.extent.width,
+                                         vb.segmentRect.extent.height);
+                                now += buf;
+                            }
+                            if (now != lastBindings) {
+                                LOG_INFO("view sets: %s (activeViewCount=%u, rendering %d)", now.c_str(),
+                                         viewActivity.activeViewCount, eyeCount);
+                                lastBindings = now;
+                            }
+                        }
 
                         // Capture the runtime's resolved CANVAS size (the window
                         // client area in meters) into g_inputState so next frame's
@@ -946,6 +1000,39 @@ static void RenderThreadFunc(
                         if (AcquireSwapchainImage(*xr, imageIndex)) {
                             LOG_INFO("[FRAME] Acquired image %u", imageIndex);
 
+                            // Multi-screen M3/M6: per-view placement under routing —
+                            // the display's segment rect (window px) scaled into the
+                            // tile, edges rounded independently so two segments
+                            // sharing a seam share the tile column (as
+                            // cube_handle_d3d11_win / cube_handle_vk_linux do).
+                            struct ViewPlace {
+                                uint32_t tile;
+                                int32_t x, y;
+                                uint32_t w, h;
+                                bool set;
+                            };
+                            ViewPlace viewPlace[8] = {};
+                            if (routedViews && windowW > 0 && windowH > 0) {
+                                const float fx = (float)renderW / (float)windowW;
+                                const float fy = (float)renderH / (float)windowH;
+                                for (uint32_t b = 0; b < viewBindings.bindingCountOutput; b++) {
+                                    const XrViewDisplayBindingDXR& vb = viewBindingStorage[b];
+                                    const int32_t x0 = (int32_t)lroundf((float)vb.segmentRect.offset.x * fx);
+                                    const int32_t y0 = (int32_t)lroundf((float)vb.segmentRect.offset.y * fy);
+                                    const int32_t x1 = (int32_t)lroundf(
+                                        (float)(vb.segmentRect.offset.x + vb.segmentRect.extent.width) * fx);
+                                    const int32_t y1 = (int32_t)lroundf(
+                                        (float)(vb.segmentRect.offset.y + vb.segmentRect.extent.height) * fy);
+                                    const uint32_t sw = x1 > x0 ? (uint32_t)(x1 - x0) : 1;
+                                    const uint32_t sh = y1 > y0 ? (uint32_t)(y1 - y0) : 1;
+                                    for (uint32_t j = 0; j < vb.viewCount && j < tileColumns * tileRows; j++) {
+                                        const uint32_t i = vb.firstView + j;
+                                        if (i >= 8) break;
+                                        viewPlace[i] = {j, x0, y0, sw, sh, true};
+                                    }
+                                }
+                            }
+
                             // Build per-eye render params for single-pass rendering
                             std::vector<EyeRenderParams> eyeParams(eyeCount);
                             for (int eye = 0; eye < eyeCount; eye++) {
@@ -954,10 +1041,19 @@ static void RenderThreadFunc(
                                 uint32_t tileY = monoMode ? 0 : (eye / tileColumns);
                                 uint32_t vpX = tileX * renderW;
                                 uint32_t vpY = tileY * renderH;
+                                uint32_t vpW = renderW;
+                                uint32_t vpH = renderH;
+                                if (routedViews && eye < 8 && viewPlace[eye].set) {
+                                    // Routed: this view's own segment of its tile.
+                                    vpX = (viewPlace[eye].tile % tileColumns) * renderW + (uint32_t)viewPlace[eye].x;
+                                    vpY = (viewPlace[eye].tile / tileColumns) * renderH + (uint32_t)viewPlace[eye].y;
+                                    vpW = viewPlace[eye].w;
+                                    vpH = viewPlace[eye].h;
+                                }
                                 eyeParams[eye].viewportX = vpX;
                                 eyeParams[eye].viewportY = vpY;
-                                eyeParams[eye].width = renderW;
-                                eyeParams[eye].height = renderH;
+                                eyeParams[eye].width = vpW;
+                                eyeParams[eye].height = vpH;
                                 if (useAppProjection) {
                                     int vi = monoMode ? 0 : eye;
                                     eyeParams[eye].viewMatrix = ColumnMajorToXMMatrix(stereoViews[vi].view_matrix);
@@ -978,17 +1074,15 @@ static void RenderThreadFunc(
                                 useAppProjection ? 1.0f : inputSnapshot.viewParams.scaleFactor);
 
                             for (int eye = 0; eye < eyeCount; eye++) {
-                                uint32_t tileX = monoMode ? 0 : (eye % tileColumns);
-                                uint32_t tileY = monoMode ? 0 : (eye / tileColumns);
-                                uint32_t vpX = tileX * renderW;
-                                uint32_t vpY = tileY * renderH;
+                                // The rect each view was rendered into (its tile,
+                                // or under routing its segment of the tile).
                                 projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
                                 projectionViews[eye].subImage.swapchain = xr->swapchain.swapchain;
                                 projectionViews[eye].subImage.imageRect.offset = {
-                                    (int32_t)vpX, (int32_t)vpY};
+                                    (int32_t)eyeParams[eye].viewportX, (int32_t)eyeParams[eye].viewportY};
                                 projectionViews[eye].subImage.imageRect.extent = {
-                                    (int32_t)renderW,
-                                    (int32_t)renderH
+                                    (int32_t)eyeParams[eye].width,
+                                    (int32_t)eyeParams[eye].height
                                 };
                                 projectionViews[eye].subImage.imageArrayIndex = 0;
                                 projectionViews[eye].pose = monoMode ? monoPose : rawViews[eye < (int)viewCount ? eye : 0].pose;
