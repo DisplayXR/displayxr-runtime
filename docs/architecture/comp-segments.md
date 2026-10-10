@@ -282,6 +282,58 @@ buffer that does not match the client area), M3 per-segment views through
 renderer, and `oxr_system` counting a D3D11 **or** D3D12 factory toward the view-set capacity.
 sim_display implements both D3D12 slots. Not yet run on hardware.
 
+## Windows / OpenGL (M6)
+
+The in-process OpenGL compositor carries the same model in `gl/comp_gl_segments.{h,cpp}`, a twin of
+the D3D11 manager — screen-table join, lifecycle, the window handle following the majority screen
+(ADR-047 Amendment 2, through a `swap_primary` hook that re-sends transparency / shared-texture /
+mode / eye-tracking mode and swaps under the compositor's `dp_swap_mutex`), decide loop,
+primary-first weave order, flat-2D fill — with the GPU work in GL terms. What differs:
+
+- **Two appended ABI slots, no version bump** (ADR-020): `xrt_plugin_iface::create_dp_gl_for_screen`
+  and `xrt_display_processor_gl::set_present_origin` (`XRT_DP_GL_HAS_PRESENT_ORIGIN`).
+- **Coordinates.** Everything in `comp_segments` is top-left; every GL target is bottom-left, and
+  the GL atlas flips its tile rows (#1625). The three conversions live in
+  `util/comp_segments_gl.h` (`comp_segments_gl_flip`, `_atlas_rect`, `_crop_rect`) and the crop,
+  the per-segment weave viewport, the flat fill and the M3 routed viewport all go through them
+  (host-tested in `tests_comp_segments`).
+- **The frame.** Clear the bound target; crop each woven segment's tiles out of the atlas into its
+  own `GL_RGBA8` texture with `glBlitFramebuffer` (same tile grid and row order, so a DP reads it
+  like a whole-canvas atlas); for each DP re-bind the target and set `glViewport` **and**
+  `glScissor` to the segment (bottom-left), then `process_atlas` with `canvas = the segment`
+  (top-left); the flat 2D fill is a scissor-off `glBlitFramebuffer` of the middle view. The target
+  is whatever the window present bound — the window's default framebuffer, or the transparent
+  path's DComp transit / readback FBO — so transparency segments too.
+- **One context.** DPs are created, used and destroyed on the compositor's one GL context, current
+  on the weave thread (the app thread's commit or the #868 repaint, both under `c->mutex`). GL runs
+  in order on it: no deferred-release list.
+- **The primary's plug-in must have the slot** (ADR-047 Amendment 5): a pre-M6 GL DP re-states a
+  whole-target viewport in `process_atlas`, so with it the window keeps the single-DP path (one
+  WARN at set-up names the plug-in).
+- **No #918 split** on GL (ADR-037 §5), so nothing like Amendment 1.
+- **Not segmented on GL:** zero-copy frames (the atlas is the app's texture), the shared-texture
+  (`_texture`) path, a Local2D / zones / mask frame (the composite path), a present target whose
+  size differs from the client area (the DComp transit is fixed-size), a pinned session,
+  `DXR_SEGMENTS=0`, macOS.
+- **sim_display** implements both GL slots: a bound DP describes its screen, confines viewport +
+  scissor to the canvas, and phases the interlaced mode from `set_present_origin`. Its unbound DP
+  now honours a non-empty canvas too (identical whenever the canvas is empty — every GL call site
+  but the segment path).
+- **Per-segment views (M3).** `oxr_system` counts a registry GL factory toward the Windows
+  view-set capacity (`oxr_segment_views_win_entry_has_gl_dp`), `xrLocateViews` reads
+  `comp_gl_compositor_get_segment_metrics`, `xrEndFrame` hands the routing to
+  `comp_gl_compositor_set_view_routing`, and the projection pass paints each submitted view at its
+  segment's rect inside its tile (`comp_segments_route_place`, the service's mapping), with each
+  tile's blend mode decided once. The segment crop and the flat fill read the partition the atlas
+  was painted with (#1883: `comp_segments_source_rect`, the content kept with the repaint
+  snapshot), never the live seam. A routed frame is never zero-copy. Quads and equirect2 layers
+  are NOT routed on GL yet (drawn once per tile with the tile's camera, as unsegmented — Metal's
+  current state).
+- **Leia** (`displayxr-leia-plugin`): the GL DP gets `create_dp_gl_for_screen` (EXTERNAL routing +
+  display binding, KEEP_DRAG_SNAP with the real HWND, simulated viewer only without a tracker of
+  its own, bound lens with SR D3) and honours a non-empty canvas on every GL DP. Not yet run on
+  hardware.
+
 ## Per-segment views (M3)
 
 Under `PRIMARY_MULTIVIEW_DXR` each segment gets its **own** views instead of a crop of
