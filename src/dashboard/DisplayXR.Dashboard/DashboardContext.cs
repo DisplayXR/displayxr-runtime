@@ -25,7 +25,11 @@ public sealed class DashboardContext
         Feed = feed;
         CliInfo = cli;
         Cli = runner ?? cli;
+        HotkeySuspend = new HotkeySuspend(Cli);
     }
+
+    /// <summary>Suspends the service's workspace hotkey while the capture box has focus.</summary>
+    public HotkeySuspend HotkeySuspend { get; }
 
     public StatusFeed Feed { get; }
     /// <summary>Where the one-shot verbs run (the CLI, or the fixture source in --fixture mode).</summary>
