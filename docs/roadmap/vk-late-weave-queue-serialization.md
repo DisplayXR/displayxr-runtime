@@ -315,3 +315,28 @@ also 0 GSL warnings, 0 `Failed to render layers` and 0 CNSDK -3.
   semaphores cannot do this. Per-queue scope (the default) has neither hazard.
 - The layer covers every `VkDevice` in the app process, including ones the app
   creates for itself.
+- **`vkDeviceWaitIdle` gap: closed.** The spec externally synchronizes host
+  access to *every* queue of the device for the duration of the call, and on
+  Adreno a concurrent `vkQueueSubmit` on another thread races it on the shared
+  GSL context (the -3 class above). The runtime calls it on the weave/repaint
+  thread during target recreate (`comp_vk_native_target.cpp`, rotation /
+  `OUT_OF_DATE`) and on the `debug.dxr.weave_postwait_queue=0` path, while the
+  app keeps submitting. The layer now intercepts it on every platform: it takes
+  every registered queue's mutex in ascending registry-slot order (per-device
+  scope: the one device mutex), calls down, and releases in reverse. That order
+  cannot invert against the other entry points, which each hold exactly one
+  queue mutex and acquire nothing while holding it. The registry lock is held
+  only to snapshot the set, never while waiting on a queue mutex. Registration
+  stays complete: both `vkGetDeviceQueue` and `vkGetDeviceQueue2` are
+  intercepted, and a queue first seen at a submit is registered lazily.
+  What remains:
+  - A queue registered *after* the snapshot (a `vkGetDeviceQueue` racing the
+    wait-idle) or beyond `QL_MAX_QUEUES` (16) is not locked.
+  - The app's submits now wait out the whole device drain instead of racing
+    it. That is the spec's contract, but a recreate costs the app a stall.
+  - A deadlock is possible if a queue has a pending timeline-semaphore wait
+    whose signal only a *later* submit from another thread provides
+    (wait-before-signal). That submit is blocked behind the wait-idle's locks.
+    Without the layer this case is a spec violation that happens to race
+    through, so the runtime should still prefer per-queue
+    `vkQueueWaitIdle`/fences over `vkDeviceWaitIdle` on a shared device.

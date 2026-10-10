@@ -235,6 +235,7 @@ struct ql_device
 	PFN_vkQueuePresentKHR QueuePresentKHR;
 	PFN_vkQueueWaitIdle QueueWaitIdle;
 	PFN_vkQueueBindSparse QueueBindSparse;
+	PFN_vkDeviceWaitIdle DeviceWaitIdle;
 	PFN_vkQueueBeginDebugUtilsLabelEXT QueueBeginDebugUtilsLabelEXT;
 	PFN_vkQueueEndDebugUtilsLabelEXT QueueEndDebugUtilsLabelEXT;
 	PFN_vkQueueInsertDebugUtilsLabelEXT QueueInsertDebugUtilsLabelEXT;
@@ -494,6 +495,7 @@ ql_CreateDevice(VkPhysicalDevice physicalDevice,
 		d->QueuePresentKHR = (PFN_vkQueuePresentKHR)next_gdpa(dev, "vkQueuePresentKHR");
 		d->QueueWaitIdle = (PFN_vkQueueWaitIdle)next_gdpa(dev, "vkQueueWaitIdle");
 		d->QueueBindSparse = (PFN_vkQueueBindSparse)next_gdpa(dev, "vkQueueBindSparse");
+		d->DeviceWaitIdle = (PFN_vkDeviceWaitIdle)next_gdpa(dev, "vkDeviceWaitIdle");
 		d->QueueBeginDebugUtilsLabelEXT =
 		    (PFN_vkQueueBeginDebugUtilsLabelEXT)next_gdpa(dev, "vkQueueBeginDebugUtilsLabelEXT");
 		d->QueueEndDebugUtilsLabelEXT =
@@ -681,6 +683,58 @@ ql_QueueInsertDebugUtilsLabelEXT(VkQueue queue, const VkDebugUtilsLabelEXT *pLab
 	}
 }
 
+/*!
+ * vkDeviceWaitIdle: the spec externally synchronizes host access to EVERY
+ * VkQueue created from @p device for the duration of the call, so it takes
+ * every registered queue's mutex (per-device scope: the one device mutex).
+ * On Adreno a concurrent vkQueueSubmit on another thread races it on the
+ * shared GSL context — the #1905 -3 class, hit by the runtime's target
+ * recreate (rotation / OUT_OF_DATE) while the app keeps submitting.
+ *
+ * Lock order: ascending slot index in dev->queues[]. Every other locked entry
+ * point holds exactly ONE queue mutex and acquires nothing while holding it,
+ * so it can never wait on a mutex while owning one this function wants next;
+ * two concurrent DeviceWaitIdles on the same device acquire in the same
+ * order. The registry lock is only held for the snapshot, never while
+ * waiting on a queue mutex. Slots are never reused within a device's life
+ * (freed only by vkDestroyDevice, which the app must not race with this).
+ *
+ * Residual: a queue first registered AFTER the snapshot (a vkGetDeviceQueue
+ * racing this call), or beyond QL_MAX_QUEUES, is not locked.
+ */
+static VKAPI_ATTR VkResult VKAPI_CALL
+ql_DeviceWaitIdle(VkDevice device)
+{
+	ql_mutex_lock(&g_registry_lock);
+	struct ql_device *d = ql_device_find(ql_key(device));
+	ql_mutex_t *locks[QL_MAX_QUEUES];
+	int n = 0;
+	if (d != NULL) {
+		if (d->per_device) {
+			locks[n++] = &d->device_mutex;
+		} else {
+			for (int i = 0; i < QL_MAX_QUEUES; i++) {
+				if (d->queues[i].queue != NULL) {
+					locks[n++] = &d->queues[i].mutex;
+				}
+			}
+		}
+	}
+	ql_mutex_unlock(&g_registry_lock);
+	if (d == NULL || d->DeviceWaitIdle == NULL) {
+		return VK_ERROR_DEVICE_LOST;
+	}
+
+	for (int i = 0; i < n; i++) {
+		ql_mutex_lock(locks[i]);
+	}
+	VkResult res = d->DeviceWaitIdle(device);
+	for (int i = n - 1; i >= 0; i--) {
+		ql_mutex_unlock(locks[i]);
+	}
+	return res;
+}
+
 /*
  *
  * Proc-addr dispatch.
@@ -756,6 +810,9 @@ ql_device_intercept(struct ql_device *d, const char *pName)
 		return (d == NULL || d->QueueInsertDebugUtilsLabelEXT != NULL)
 		           ? (PFN_vkVoidFunction)ql_QueueInsertDebugUtilsLabelEXT
 		           : NULL;
+	}
+	if (strcmp(pName, "vkDeviceWaitIdle") == 0) {
+		return (PFN_vkVoidFunction)ql_DeviceWaitIdle;
 	}
 	if (strcmp(pName, QL_MARKER_NAME) == 0) {
 		return (PFN_vkVoidFunction)ql_GetQueueLockMarker;
