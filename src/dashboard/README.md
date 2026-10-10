@@ -10,12 +10,12 @@ the sibling `displayxr-cli.exe`, rendering its JSON.
 
 | Page | Reads | Writes |
 |---|---|---|
-| Home | the status feed; `info --json` once per show and on Refresh; `dp list --json`; `selftest --json` on click | `runtime activate`, `dp reset` |
-| Displays | the status feed (screens, desktop map); `dp list --json` for the per-screen selector | `dp use <id> --screen <key>`, `dp reset --screen <key>` |
+| Home | the status feed; `info --json` once per show and on Refresh; `dp list --json` (each screen's effective DP, read-only); `selftest --json` on click | `runtime activate`, `dp reset` (only when a machine-wide override is set) |
+| Displays | the status feed (screens, desktop map); `dp list --json` for the per-screen selector (its options: that screen's `candidates`) | `dp use <id> --screen <key>`, `dp reset --screen <key>` |
 | Windows | the status feed (clients) | — |
 | Components | the status feed (clients by class); `info --json`; `workspace list --json` | `workspace set <id> --hotkey <combo>` / `--no-hotkey` / `--mode auto\|disabled`, `workspace launch <id>` |
 | Performance | `perf list --json`, `info --json` (adapters) | `perf set` / `perf reset` |
-| Developer | `dp list --json` | `dp use <id>`, `dp reset` (machine-wide; admin) |
+| Developer | `dp list --json` (`preferred` only: a machine-wide override is shown as a notice) | `dp reset` (machine-wide; admin) |
 
 **Components** groups what is plugged into the runtime by ROLE, never by product:
 display processors, the workspace controller (its launch hotkey / mode / "Launch now",
@@ -78,7 +78,8 @@ shortcut "DisplayXR Dashboard".
   live-service pages can be laid out without a service that answers. Fixtures and their
   generator: `src/dashboard/fixtures/` (`two-panels`, `stress-16x32`, `components`,
   `empty-headless`). A `workspace-list.json` beside the fixture simulates the
-  `workspace list|set|launch` verbs in memory.
+  `workspace list|set|launch` verbs in memory, and a `dp-machine-override.txt` (one plug-in
+  id) simulates a machine-wide `PreferredPlugin` that a global `dp reset` clears.
 - Log: `%LOCALAPPDATA%\DisplayXR\dashboard.log` — lifecycle, child starts / exits, and
   every exception (unhandled AppDomain / TaskScheduler / Dispatcher handlers log and keep
   going). The Developer page shows its path and the session's error count.

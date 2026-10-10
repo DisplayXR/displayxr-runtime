@@ -481,8 +481,24 @@ displayxr-cli displays --claims [--json]                # + key / forced / force
 ```
 
 `dp list --json` `screens[]`: `{key, device_name, friendly_name, effective_plugin,
-preferred_plugin|null, preferred_source|null, forced, apply}`, from the headless snapshot
-(what a process starting now resolves).
+preferred_plugin|null, preferred_source|null, forced, apply, candidates}`, from the headless
+snapshot (what a process starting now resolves). `candidates` is
+`[{plugin_id, confidence}]`: every plug-in whose `probe_displays` claimed that monitor, at
+any confidence, in ProbeOrder (`target_plugin_get_monitor_candidates`, filled where the
+resolver collects the claims, `target_screen_collect_candidates`). It is absent when the
+resolve asked only the active plug-in (the POSIX claim-source shortcut), since the list
+would then be incomplete. Additive; `schema` unchanged.
+
+**In the dashboard** the per-screen selector on each Displays card is the one place a
+screen's DP is chosen: "Auto (<effective>)" first, then only that screen's `candidates` —
+the plug-ins that can actually drive it, so a box with Leia + sim on one panel and vendor2
++ sim on another offers each panel its own pair — falling back to every registered plug-in
+when the CLI lists no `candidates` (older CLI). Home shows each screen's effective DP
+read-only with a link to Displays. The global `PreferredPlugin` (`dp use <id>`, one plug-in
+for every monitor) has no selector: when one is set, Developer (and Home) show it as an
+amber notice — "A machine-wide display-processor override is set: <id> (applies to every
+screen)" — with a "Clear machine-wide override" button (`dp reset`, admin; a failure shows
+the CLI's message verbatim). Unset, nothing about it is shown.
 
 ## 13. Components and launch settings (phase 8)
 

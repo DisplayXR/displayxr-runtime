@@ -50,7 +50,9 @@ public sealed class HomePage : Page
             sb.Append(s.Source).Append('|').Append(s.Runtime).Append('|').Append(s.Workspace).Append('|');
             foreach (var p in s.Plugins) sb.Append(p).Append(';');
             sb.Append(StatusText.HomeLine(s));
+            foreach (var d in StatusText.HomeScreenDps(s, Ctx.Dp)) sb.Append(d).Append(';');
         }
+        sb.Append('|').Append(Ctx.Dp?.Preferred).Append(Ctx.ActionRunning);
         return sb.ToString();
     }
 
@@ -59,10 +61,12 @@ public sealed class HomePage : Page
         var s = Ctx.Feed.Snapshot;
         var page = U.VStack(18);
 
-        if (Ctx.PreferredPlugin is { } pref)
-            page.Children.Add(U.Notice(Level.Warn, $"Display-processor override active: '{pref}' is forced for every app",
-                "It persists across reboots until it is reset (PreferredPlugin, machine-wide).",
-                U.Button("Reset override", () => _ = Ctx.RunActionsAsync("dp", "dp reset"), "warn", "sm")));
+        if (StatusText.MachineOverrideNotice(Ctx.Dp) is { } ov)
+        {
+            var clear = U.Button("Clear machine-wide override", () => _ = Ctx.RunActionsAsync("dp", "dp reset"), "warn", "sm");
+            clear.IsEnabled = !Ctx.ActionRunning;
+            page.Children.Add(U.Notice(Level.Warn, ov.Title, ov.Text, clear));
+        }
 
         if (s is not null && StatusText.HomeLine(s) is { } line)
         {
@@ -74,6 +78,8 @@ public sealed class HomePage : Page
                 U.Button("Open Displays", () => Ctx.Navigate("displays"), "outline", "sm")));
         }
 
+        if (s is not null && s.Screens.Count > 0) page.Children.Add(ScreensCard(s));
+
         var grid = new U.CardGrid(2) { MinColumnWidth = 440 };
         grid.Add(RuntimeCard(s));
         grid.Add(PluginsCard(s));
@@ -81,6 +87,23 @@ public sealed class HomePage : Page
         grid.Add(SelftestCard());
         page.Children.Add(grid);
         return page;
+    }
+
+    /// <summary>
+    /// Each screen's effective display processor, read-only: the selector is on
+    /// Displays (one place to change it).
+    /// </summary>
+    private Control ScreensCard(StatusSnapshot s)
+    {
+        var link = U.Button("Change on Displays →", () => Ctx.Navigate("displays"), "link");
+        var kv = new U.KvList(220);
+        foreach (var d in StatusText.HomeScreenDps(s, Ctx.Dp))
+        {
+            var value = U.Flow(8, 4, U.Text(d.Plugin ?? "not claimed", "value"));
+            if (d.Forced is { } f) U.AddFlow(value, U.Chip(f, Level.Warn));
+            kv.Add(d.Name, value);
+        }
+        return U.Card(U.VStack(12, U.CardTitle("Display processor per screen", null, link), kv));
     }
 
     private Control RuntimeCard(StatusSnapshot? s)

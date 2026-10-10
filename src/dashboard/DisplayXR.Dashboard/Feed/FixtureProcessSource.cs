@@ -23,8 +23,11 @@ namespace DisplayXR.Dashboard.Feed;
 /// display-processor verbs (<c>dp list --json</c>, <c>dp use &lt;id&gt; --screen
 /// &lt;key&gt;</c>, <c>dp reset --screen &lt;key|all&gt;</c>) are simulated in
 /// memory, and the replayed snapshots carry the resulting
-/// <c>claim.preferred_plugin</c> / <c>forced</c>. Every other verb goes to the
-/// real CLI.</para>
+/// <c>claim.preferred_plugin</c> / <c>forced</c>. A screen's <c>candidates</c>
+/// are its claiming plug-in plus every <c>fallback</c> plug-in (sim-display
+/// claims every monitor). A <c>dp-machine-override.txt</c> beside the fixture
+/// (one plug-in id) simulates a machine-wide PreferredPlugin that a global
+/// <c>dp reset</c> clears. Every other verb goes to the real CLI.</para>
 /// </summary>
 public sealed class FixtureProcessSource : IProcessSource
 {
@@ -33,7 +36,8 @@ public sealed class FixtureProcessSource : IProcessSource
     private readonly object _gate = new();
     private readonly Dictionary<string, string> _preferred = new();
     private readonly List<(string Key, string Device, string Name, string? Plugin)> _screens = new();
-    private readonly List<(string Id, string Name)> _plugins = new();
+    private readonly List<(string Id, string Name, bool Fallback)> _plugins = new();
+    private string? _machinePreferred;
     // workspace-list.json beside the fixture: the phase-8 `workspace` verbs, simulated.
     private readonly JsonObject? _workspace;
     public static readonly TimeSpan Interval = TimeSpan.FromSeconds(2);
@@ -51,11 +55,19 @@ public sealed class FixtureProcessSource : IProcessSource
                         _screens.Add((key, s["device_name"]?.GetValue<string>() ?? "", s["friendly_name"]?.GetValue<string>() ?? "",
                                       s["claim"]?["plugin_id"]?.GetValue<string?>()));
                 foreach (var p in root["plugins"]?.AsArray() ?? new JsonArray())
-                    if (p?["id"]?.GetValue<string>() is { } id) _plugins.Add((id, p["name"]?.GetValue<string>() ?? ""));
+                    if (p?["id"]?.GetValue<string>() is { } id)
+                        _plugins.Add((id, p["name"]?.GetValue<string>() ?? "", p["fallback"]?.GetValue<bool>() ?? false));
             }
         }
         catch (Exception ex) { DashboardLog.Warn($"fixture: {ex.Message}"); }
-        string ws = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(path)) ?? ".", "workspace-list.json");
+        string dir = Path.GetDirectoryName(Path.GetFullPath(path)) ?? ".";
+        try
+        {
+            string mo = Path.Combine(dir, "dp-machine-override.txt");
+            if (File.Exists(mo) && File.ReadAllText(mo).Trim() is { Length: > 0 } id) _machinePreferred = id;
+        }
+        catch (Exception ex) { DashboardLog.Warn($"fixture machine override: {ex.Message}"); }
+        string ws = Path.Combine(dir, "workspace-list.json");
         try { if (File.Exists(ws)) _workspace = JsonNode.Parse(File.ReadAllText(ws)) as JsonObject; }
         catch (Exception ex) { DashboardLog.Warn($"fixture workspace: {ex.Message}"); }
         DashboardLog.Info($"fixture mode: {_lines.Length} line(s) from {path}; {_screens.Count} keyed screen(s); workspace {(_workspace is null ? "absent" : "simulated")}");
@@ -121,11 +133,11 @@ public sealed class FixtureProcessSource : IProcessSource
             {
                 var o = new JsonObject
                 {
-                    ["preferred"] = null,
+                    ["preferred"] = _machinePreferred,
                     ["plugins"] = new JsonArray(_plugins.Select(p => (JsonNode)new JsonObject
                     {
                         ["id"] = p.Id, ["display_name"] = p.Name, ["vendor"] = "", ["version"] = "",
-                        ["probe_order"] = 0, ["active"] = false, ["preferred"] = false,
+                        ["probe_order"] = 0, ["active"] = false, ["preferred"] = p.Id == _machinePreferred,
                     }).ToArray()),
                     ["screens"] = new JsonArray(_screens.Select(s =>
                     {
@@ -135,6 +147,10 @@ public sealed class FixtureProcessSource : IProcessSource
                             ["key"] = s.Key, ["device_name"] = s.Device, ["friendly_name"] = s.Name,
                             ["effective_plugin"] = forced ? pref : s.Plugin, ["preferred_plugin"] = forced ? pref : null,
                             ["preferred_source"] = forced ? "user" : null, ["forced"] = forced, ["apply"] = "live",
+                            ["candidates"] = new JsonArray(_plugins
+                                .Where(p => p.Id == s.Plugin || p.Fallback)
+                                .Select(p => (JsonNode)new JsonObject { ["plugin_id"] = p.Id, ["confidence"] = p.Fallback ? 10 : 100 })
+                                .ToArray()),
                         };
                     }).ToArray()),
                 };
@@ -145,6 +161,11 @@ public sealed class FixtureProcessSource : IProcessSource
                 if (!_screens.Any(s => s.Key == key)) return new CliResult(1, "", $"dp use: no screen '{key}'", false, null);
                 _preferred[key] = id;
                 return new CliResult(0, $"Screen {key}: display processor '{id}' (user override, applies live)", "", false, null);
+            }
+            if (a is [_, "reset"])
+            {
+                _machinePreferred = null;
+                return new CliResult(0, "PreferredPlugin override cleared — normal ProbeOrder discovery restored.", "", false, null);
             }
             if (a is [_, "reset", "--screen", var which])
             {

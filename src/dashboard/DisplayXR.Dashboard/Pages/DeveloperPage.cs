@@ -15,9 +15,11 @@ using DisplayXR.Dashboard.Ui;
 namespace DisplayXR.Dashboard.Pages;
 
 /// <summary>
-/// Developer: the PreferredPlugin switch (Tier 1 of the old panel), the
-/// designed-but-unbuilt Phase-2 settings list, and the dashboard's own
-/// diagnostics (log path, CLI path, feed state).
+/// Developer: the designed-but-unbuilt Phase-2 settings list and the
+/// dashboard's own diagnostics (log path, CLI path, feed state). The display
+/// processor is chosen per screen on Displays; a machine-wide PreferredPlugin
+/// (one plug-in for every monitor, wrong on a mixed-vendor box) only shows here
+/// as a notice with a way to clear it.
 /// </summary>
 public sealed class DeveloperPage : Page
 {
@@ -25,7 +27,7 @@ public sealed class DeveloperPage : Page
 
     public override bool HoldsFeed => false;
 
-    public override string Caption => "Display-processor override, the planned developer settings, and this dashboard's own diagnostics.";
+    public override string Caption => "The planned developer settings and this dashboard's own diagnostics.";
 
     public override void OnShown() => _ = Ctx.LoadDpAsync(maxAge: TimeSpan.FromMinutes(1));
 
@@ -35,18 +37,14 @@ public sealed class DeveloperPage : Page
         sb.Append(Ctx.ActionRunning).Append('|').Append(Ctx.LastActionArea).Append(Ctx.LastAction).Append('|')
           .Append(Ctx.DpError).Append('|').Append(Ctx.Feed.Mode).Append('|').Append(Ctx.Feed.ChildStarts).Append('|')
           .Append(DashboardLog.ErrorCount).Append('|').Append(Ctx.Feed.Snapshot?.Source);
-        if (Ctx.Dp is { } dp)
-        {
-            sb.Append(dp.Preferred);
-            foreach (var r in dp.Plugins) sb.Append(r).Append(';');
-        }
+        sb.Append(Ctx.Dp?.Preferred);
         return sb.ToString();
     }
 
     protected override Control Build()
     {
         var page = U.VStack(18);
-        page.Children.Add(OverrideCard());
+        if (OverrideNotice() is { } notice) page.Children.Add(notice);
         var grid = new U.CardGrid(2) { MinColumnWidth = 440 };
         grid.Add(PhaseTwoCard());
         grid.Add(DiagnosticsCard());
@@ -54,50 +52,24 @@ public sealed class DeveloperPage : Page
         return page;
     }
 
-    private Control OverrideCard()
+    /// <summary>
+    /// Only when a machine-wide PreferredPlugin is set: an amber notice and the
+    /// way out. The per-screen choice lives on Displays (one place to change it).
+    /// </summary>
+    private Control? OverrideNotice()
     {
-        var reset = U.Button("Reset to default discovery", () => _ = Ctx.RunActionsAsync("dp", "dp reset"), "outline", "sm");
-        reset.IsEnabled = !Ctx.ActionRunning && Ctx.Dp?.Preferred is not null;
-        var body = U.VStack(14, U.CardTitle("Display-processor override (PreferredPlugin)",
-            "Forces one display-processor plug-in for every app, machine-wide, until it is reset. Unset (the normal state), the runtime picks by probe order and per-monitor claim.", reset));
-
-        var dp = Ctx.Dp;
-        if (dp is null)
+        bool failed = Ctx.LastActionArea == "dp" && Ctx.LastActionFailed && Ctx.LastAction is not null;
+        if (StatusText.MachineOverrideNotice(Ctx.Dp) is not { } n)
         {
-            body.Children.Add(U.Wrapped(Ctx.DpError ?? "Reading the registered plug-ins…", Ctx.DpError is null ? "empty" : "soft"));
-            return U.Card(body);
+            // Cleared (or never set): nothing about it, unless a clear just failed.
+            return failed ? U.Notice(Level.Critical, "The machine-wide override did not change", Ctx.LastAction!) : null;
         }
-        if (dp.Preferred is { } pref)
-            body.Children.Add(U.Notice(Level.Warn, $"Override active: '{pref}'", "It persists across reboots until it is reset."));
-        else
-            body.Children.Add(U.Wrapped("PreferredPlugin is unset: automatic selection.", "dim"));
-
-        var list = U.VStack(0);
-        for (int i = 0; i < dp.Plugins.Count; i++)
-        {
-            var r = dp.Plugins[i];
-            if (i > 0) list.Children.Add(U.Rule());
-            var name = U.Text(r.Name.Length > 0 ? r.Name : r.Id, "value");
-            name.FontWeight = Avalonia.Media.FontWeight.SemiBold;
-            var head = U.Flow(8, 4, name);
-            if (r.Active) U.AddFlow(head, U.Chip("active", Level.Ok));
-            if (r.Preferred) U.AddFlow(head, U.Chip("preferred", Level.Warn));
-            var meta = U.Text($"{r.Id}{StatusText.Sep}{r.Version}{StatusText.Sep}ProbeOrder {r.ProbeOrder}", "meta");
-            var col = U.VStack(2, head, meta);
-            string id = r.Id;
-            var use = U.Button(r.Preferred ? "In use" : "Use", () => _ = Ctx.RunActionsAsync("dp", $"dp use {id}"), "outline", "sm");
-            use.IsEnabled = !Ctx.ActionRunning && !r.Preferred;
-            var g = new Grid { ColumnDefinitions = new ColumnDefinitions("*,Auto"), Margin = new Thickness(0, 10) };
-            g.Children.Add(col);
-            Grid.SetColumn(use, 1);
-            g.Children.Add(use);
-            list.Children.Add(g);
-        }
-        body.Children.Add(list);
-        body.Children.Add(U.Wrapped("A switch takes effect on the next process: restart the service or relaunch the app. Writing the override needs administrator rights.", "desc"));
-        if (Ctx.LastActionArea == "dp" && Ctx.LastAction is { } a)
-            body.Children.Add(U.Notice(Ctx.LastActionFailed ? Level.Critical : Level.Info, Ctx.LastActionFailed ? "The override did not change" : "Done", a));
-        return U.Card(body);
+        var clear = U.Button("Clear machine-wide override", () => _ = Ctx.RunActionsAsync("dp", "dp reset"), "warn", "sm");
+        clear.IsEnabled = !Ctx.ActionRunning;
+        var displays = U.Button("Open Displays", () => Ctx.Navigate("displays"), "outline", "sm");
+        var box = U.VStack(8, U.Notice(Level.Warn, n.Title, n.Text, clear, displays));
+        if (failed) box.Children.Add(U.Wrapped(Ctx.LastAction!, "soft"));
+        return box;
     }
 
     private static Control PhaseTwoCard()
