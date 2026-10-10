@@ -2384,6 +2384,95 @@ metal_window_backing_dims(struct comp_metal_compositor *c,
  * anchored), regardless of any xrSetSharedTextureOutputRectDXR call.
  * Mirrors d3d11_effective_canvas.
  */
+/*!
+ * Debug-only weave test pattern, DXR_DEBUG_ATLAS_PATTERN=lr_white_black.
+ *
+ * Returns a texture the size of the cropped DP input (cols x rows tiles of
+ * view_w x view_h) with tile 0 (the left view) pure white and every other tile
+ * pure black, opaque — handed to the DP in place of the app's atlas, so a
+ * weave can be judged on a known input inside the app's own process / route /
+ * window. Built once per size (CPU pattern, one buffer-to-texture blit),
+ * cached; nil when the knob is off (the default, zero cost). One WARN.
+ */
+static id<MTLTexture>
+metal_debug_atlas_pattern(struct comp_metal_compositor *c,
+                          id<MTLCommandBuffer> cmd_buf,
+                          uint32_t cols,
+                          uint32_t rows,
+                          uint32_t view_w,
+                          uint32_t view_h)
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		const char *e = getenv("DXR_DEBUG_ATLAS_PATTERN");
+		enabled = (e != NULL && strcmp(e, "lr_white_black") == 0) ? 1 : 0;
+		if (enabled) {
+			U_LOG_W("DXR_DEBUG_ATLAS_PATTERN=lr_white_black: the DP weaves a TEST PATTERN (left view white, "
+			        "right view black), not the app's content — debug only");
+		}
+	}
+	if (!enabled || cols == 0 || rows == 0 || view_w == 0 || view_h == 0) {
+		return nil;
+	}
+	static id<MTLTexture> tex = nil;
+	static id<MTLDevice> tex_device = nil;
+	static uint32_t tex_cols = 0, tex_rows = 0, tex_vw = 0, tex_vh = 0;
+	const uint32_t w = cols * view_w;
+	const uint32_t h = rows * view_h;
+	if (tex != nil && tex_device == c->device && tex_cols == cols && tex_rows == rows && tex_vw == view_w &&
+	    tex_vh == view_h) {
+		return tex;
+	}
+	[tex release];
+	tex = nil;
+
+	const size_t row_bytes = (size_t)w * 4;
+	id<MTLBuffer> buf = [c->device newBufferWithLength:row_bytes * h options:MTLResourceStorageModeShared];
+	if (buf == nil) {
+		return nil;
+	}
+	uint8_t *px = (uint8_t *)buf.contents;
+	for (uint32_t y = 0; y < h; y++) {
+		for (uint32_t x = 0; x < w; x++) {
+			const bool white = (x / view_w) == 0 && (y / view_h) == 0; // tile 0
+			uint8_t *p = px + (size_t)y * row_bytes + (size_t)x * 4;   // BGRA8
+			p[0] = p[1] = p[2] = white ? 255 : 0;
+			p[3] = 255;
+		}
+	}
+	MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                                                width:w
+	                                                                               height:h
+	                                                                            mipmapped:NO];
+	desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+	desc.storageMode = MTLStorageModePrivate;
+	tex = [c->device newTextureWithDescriptor:desc];
+	if (tex == nil) {
+		[buf release];
+		return nil;
+	}
+	id<MTLBlitCommandEncoder> blit = [cmd_buf blitCommandEncoder];
+	[blit copyFromBuffer:buf
+	           sourceOffset:0
+	      sourceBytesPerRow:row_bytes
+	    sourceBytesPerImage:row_bytes * h
+	             sourceSize:MTLSizeMake(w, h, 1)
+	              toTexture:tex
+	       destinationSlice:0
+	       destinationLevel:0
+	      destinationOrigin:MTLOriginMake(0, 0, 0)];
+	[blit endEncoding];
+	[buf release]; // the command buffer retains it until the copy completes
+	tex_device = c->device;
+	tex_cols = cols;
+	tex_rows = rows;
+	tex_vw = view_w;
+	tex_vh = view_h;
+	U_LOG_W("DXR_DEBUG_ATLAS_PATTERN: pattern %ux%u (%ux%u tiles of %ux%u; tile 0 white, rest black)", w, h, cols,
+	        rows, view_w, view_h);
+	return tex;
+}
+
 static struct u_canvas_rect
 metal_effective_canvas(struct comp_metal_compositor *c,
                        id<MTLTexture> output_texture,
@@ -4787,6 +4876,17 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			    destinationOrigin:MTLOriginMake(0, 0, 0)];
 			[blit endEncoding];
 			dp_src = c->dp_input_texture;
+		}
+
+		// Debug only (DXR_DEBUG_ATLAS_PATTERN=lr_white_black): the DP weaves a
+		// fixed pattern instead of the app's content — tile 0 (left view) pure
+		// white, every other tile pure black, opaque.
+		{
+			id<MTLTexture> pattern = metal_debug_atlas_pattern(c, cmd_buf, atlas_cols, atlas_rows,
+			                                                  atlas_view_w, atlas_view_h);
+			if (pattern != nil) {
+				dp_src = pattern;
+			}
 		}
 
 		// DP target: full output_texture dims. The canvas sub-rect is
