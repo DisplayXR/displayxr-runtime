@@ -166,7 +166,7 @@ public class StatusTextTests
         Assert.Equal("dp reset --screen k1", StatusText.DpVerb("k1", forced.Items[0]));
         Assert.Equal("dp reset --screen \"a b\"", StatusText.DpVerb("a b", forced.Items[0]));
 
-        var unknown = new DpList(null, plugins, new[] { new DpScreen("k1", "", "", "x", "gone-plugin", "machine", true, "next_session") });
+        var unknown = new DpList(null, plugins, new[] { new DpScreen("k1", "", "", "x", "gone-plugin", "machine", true, "next-session") });
         var u = StatusText.DpSelector(keyed, unknown)!.Value;
         Assert.Equal("gone-plugin (not registered)", u.Items[u.Selected].Label);
         Assert.StartsWith("applies to new sessions", StatusText.ApplyLabel(keyed, unknown));

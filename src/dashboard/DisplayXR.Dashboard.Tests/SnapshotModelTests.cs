@@ -196,13 +196,13 @@ public class SnapshotModelTests
         var s = TestData.Parse("""
         { "schema": 1, "screens": [ { "id": "0x1", "key": "edid:AUO-B194-1",
           "claim": { "plugin_id": "sim-display", "confidence": "VERIFIED", "forced": true,
-                     "preferred_plugin": "sim-display", "preferred_source": "user", "apply": "next_session" } } ] }
+                     "preferred_plugin": "sim-display", "preferred_source": "user", "apply": "next-session" } } ] }
         """);
         var sc = s.Screens[0];
         Assert.Equal("edid:AUO-B194-1", sc.Key);
         Assert.True(sc.Claim.Forced);
         Assert.Equal("sim-display", sc.Claim.PreferredPlugin);
         Assert.Equal("user", sc.Claim.PreferredSource);
-        Assert.Equal("next_session", sc.Claim.Apply);
+        Assert.Equal("next-session", sc.Claim.Apply);
     }
 }

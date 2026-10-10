@@ -27,7 +27,7 @@ public sealed class DeveloperPage : Page
 
     public override string Caption => "Display-processor override, the planned developer settings, and this dashboard's own diagnostics.";
 
-    public override void OnShown() => _ = Ctx.LoadDpAsync();
+    public override void OnShown() => _ = Ctx.LoadDpAsync(maxAge: TimeSpan.FromMinutes(1));
 
     protected override string Key()
     {

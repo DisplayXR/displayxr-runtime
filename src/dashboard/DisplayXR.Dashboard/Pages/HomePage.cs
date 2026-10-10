@@ -37,7 +37,7 @@ public sealed class HomePage : Page
     public override void OnShown()
     {
         _ = Ctx.LoadInfoAsync(force: false);
-        _ = Ctx.LoadDpAsync();
+        _ = Ctx.LoadDpAsync(maxAge: TimeSpan.FromMinutes(10));
     }
 
     protected override string Key()
