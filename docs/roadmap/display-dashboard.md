@@ -369,6 +369,7 @@ enable is a shared vote that `destroy` does not withdraw); config resolve at mos
 | **4** | The DisplayXR Dashboard (`src/dashboard/`, Avalonia): pages, long-lived `--watch` child, Displays + Windows pages, desktop map, Home summary line | 2 |
 | **5** ✅ landed | MCP `get_status_snapshot` (session-free, returns `displayxr-cli status --json` verbatim) | 2 |
 | **6** | the vendor plug-in fills the cell from the SDK query; "Open in vendor" | 3 + §9.1–9.2 |
+| **8** ✅ landed | components by role + user-customizable launch settings (§13): `workspace list [--json]` (`active_id`, registration values, live `connected` / `pid`, `launch` {mode, hotkey, source}), `workspace set / reset / launch / hotkey-suspend`; `info --json` `workspace_controllers[]`; `service.json` `controllers` map; the combo grammar; the hook matches the configured combo exactly; DIAG `system_reload_service_config`, `system_workspace_launch`, `system_workspace_hotkey_suspend`; tray shows the configured combo; `tests_service_workspace_config`, `tests_ipc_proto` | 2 |
 | **7** ✅ landed | per-screen display-processor preference (§12): stable screen `key`; `u_setting_get_preferred_plugin_for_screen` (env / per-user / HKLM); the resolver rule; `claim.forced` / `preferred_plugin` / `preferred_source` / `apply` + `CLAIM_FORCED`; `dp use|reset --screen`, `dp list` `screens[]`; DIAG `system_request_display_reprobe`; the service recreates a changed screen's segment DPs on re-probe; `tests_target_screen_pin`, `tests_u_setting_per_screen` | 2 |
 
 Phases 1–3 are runtime PRs with CI coverage (`tests_ipc_proto.py` for the appended
@@ -482,3 +483,38 @@ displayxr-cli displays --claims [--json]                # + key / forced / force
 `dp list --json` `screens[]`: `{key, device_name, friendly_name, effective_plugin,
 preferred_plugin|null, preferred_source|null, forced, apply}`, from the headless snapshot
 (what a process starting now resolves).
+
+## 13. Components and launch settings (phase 8)
+
+The dashboard shows the connected components **by role**. A *workspace controller* is a
+client class that hosts other apps' 3D windows; the runtime never knows a product name —
+a controller is its registration (`WorkspaceControllers\<id>`, or the POSIX manifest) and,
+while it runs, a `CONTROLLER`-class IPC client verified against that registration (#960).
+
+### 13.1 What the dashboard reads
+
+`displayxr-cli workspace list --json` — one object per registered controller (`id`,
+`display_name`, `vendor`, `version`, `binary`, `registered`, `connected`, `pid`, `launch`),
+plus `active_id` (the one the service spawns) and `dev_override`. `connected` / `pid` are
+`null` when no service is reachable; the CLI never auto-starts the service for this read.
+`info --json` carries the same objects headless as `workspace_controllers[]`.
+
+### 13.2 What the dashboard writes
+
+| control | CLI | applies |
+|---|---|---|
+| hotkey | `workspace set <id> --hotkey "<combo>"` / `--no-hotkey` | live (`system_reload_service_config`); hook re-installed with the new combo |
+| mode | `workspace set <id> --mode auto\|disabled` | live; `disabled` removes the hook, stops future launches and — exactly like the tray's Disable — terminates a running controller |
+| defaults | `workspace reset <id>` | live |
+| launch now | `workspace launch <id>` | refused with a reason when disabled, already running, not the active controller, or no service |
+| capture box | `workspace hotkey-suspend on` while capturing, `off` after | the hook is out so the box sees the current combo; 60 s safety timeout |
+
+Combo grammar, store, precedence and the RPCs:
+`docs/specs/runtime/workspace-controller-registration.md` § *Launch settings*.
+
+### 13.3 What it does not do
+
+No new controller registration from the dashboard (installers own the registry); no
+multi-controller switching UI yet (`workspace_binary` stays the selector, and `active_id`
+reports it); no per-controller settings on macOS beyond storage — there is no
+service-owned global hook there yet.
