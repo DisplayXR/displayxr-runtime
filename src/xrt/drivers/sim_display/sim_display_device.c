@@ -782,7 +782,8 @@ sim_display_hmd_create(void)
 	// SIM_DISPLAY_FAKE_TRACKING toggle the 3D modes claim HAS_TRACKING so
 	// the MANUAL path + tracking-state event are exercisable without
 	// hardware (matches the MANUAL_BIT the plug-in then advertises).
-	if (sim_display_fake_tracking_enabled()) {
+	// Opt-in webcam tracking (#1855) makes them tracked for real (MANAGED).
+	if (sim_display_fake_tracking_enabled() || sim_display_webcam_tracking_enabled()) {
 		for (uint32_t m = 1; m < hmd->base.rendering_mode_count; m++) {
 			hmd->base.rendering_modes[m].mode_flags |= XRT_RENDERING_MODE_FLAG_HAS_TRACKING;
 		}

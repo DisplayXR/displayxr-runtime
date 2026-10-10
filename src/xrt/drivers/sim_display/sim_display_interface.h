@@ -27,6 +27,7 @@ struct xrt_display_processor_gl;
 struct vk_bundle;
 struct xrt_plugin_instance;
 struct xrt_screen_binding;
+struct xrt_eye_positions;
 
 /*!
  * @defgroup drv_sim_display Simulation 3D Display Driver
@@ -160,6 +161,56 @@ sim_display_fake_tracking_is_tracking(void);
  */
 bool
 sim_display_fake_tracking_sample(uint64_t *out_edges);
+
+/*!
+ * Webcam eye tracking (#1855), opt-in: `SIM_DISPLAY_WEBCAM_TRACKING=1`.
+ * Was it asked for? (Cached env read; all of the below are no-ops without it.)
+ * @ingroup drv_sim_display
+ */
+bool
+sim_display_webcam_tracking_requested(void);
+
+/*!
+ * Requested AND a face estimator is built in — only then does sim_display
+ * advertise MANAGED tracking (and HAS_TRACKING on its 3D modes) and open a
+ * camera. See sim_display_face_estimator.h.
+ * @ingroup drv_sim_display
+ */
+bool
+sim_display_webcam_tracking_enabled(void);
+
+/*!
+ * Override a DP's nominal @p out with the webcam-tracked eyes (keeping
+ * out->count's layout: 1 = midpoint, 2 = the pair, 4 = the pair 32 mm below
+ * and above). The first call with *@p dp_ref false takes a reference on the
+ * process tracker (starting it); @ref sim_display_webcam_tracking_release
+ * drops it. Pass @p dp_ref NULL for a screen-bound DP (never tracked).
+ * Never blocks on the camera.
+ * @return false (and @p out untouched) when webcam tracking is off or not running.
+ * @ingroup drv_sim_display
+ */
+bool
+sim_display_webcam_tracking_apply(
+    struct xrt_eye_positions *out, float nominal_x_m, float nominal_y_m, float nominal_z_m, float ipd_m, bool *dp_ref);
+
+//! Drop a DP's tracker reference (DP destroy). Stops the camera with the last one.
+void
+sim_display_webcam_tracking_release(bool *dp_ref);
+
+/*!
+ * Tracker state for the per-screen status (ADR-051): is_tracking now and the
+ * edge count. @return false when webcam tracking is not enabled.
+ */
+bool
+sim_display_webcam_tracking_status(bool *out_tracking, uint64_t *out_edges);
+
+/*!
+ * The eye-tracking control contracts the session display advertises:
+ * MANUAL under SIM_DISPLAY_FAKE_TRACKING, MANAGED under enabled webcam
+ * tracking (the default when both), none otherwise.
+ */
+void
+sim_display_eye_tracking_caps(uint32_t *out_supported, uint32_t *out_default);
 
 /*!
  * Set the view count for the active rendering mode.
