@@ -15,6 +15,7 @@
 #include "comp_d3d12_renderer.h"
 #include "comp_d3d12_outcomp.h"
 #include "comp_d3d12_segments.h" // multi-screen M6 (D3D12)
+#include "util/comp_segments_route.h"
 #include "xrt/xrt_screen.h"
 
 // #918 D12-3 — the output-device split: the activation decision and the
@@ -458,6 +459,8 @@ struct comp_d3d12_compositor
 	struct xrt_segment_metrics seg_pub;            //!< the table the last weave took (count 0 = one view set)
 	struct xrt_segment_view_routing seg_route;     //!< the routing the last locate handed out
 	struct comp_d3d12_eff_layout seg_route_logged; //!< change-only logging of the routed layout
+	//! #1883: the partition this frame's atlas is painted with (eff_layout's routing; count 0 = unrouted).
+	struct comp_segments_content seg_content;
 
 	/*!
 	 * XR_DXR_depth_budget (rear depth budget).
@@ -745,6 +748,8 @@ struct comp_d3d12_compositor
 		//! where the 2D should be. Replaying is cheap next to the weave.
 		ID3D12Resource *atlas;
 		uint32_t content_w, content_h;
+		//! #1883: the per-segment partition @ref atlas was painted with (count 0 = unrouted).
+		struct comp_segments_content seg_content;
 
 		//! The 2D-under backdrop the last app frame flattened. Reused for the
 		//! same reason as mask_res — the flatten reads app-owned textures.
@@ -3827,6 +3832,7 @@ d3d12_route_effective_layout(struct comp_d3d12_compositor *c, uint32_t layer_vie
 	}
 	struct comp_d3d12_eff_layout *L = &c->eff_layout;
 	L->route_count = 0;
+	memset(&c->seg_content, 0, sizeof(c->seg_content));
 	if (r.count == 0 || r.count > XRT_MAX_SEGMENTS || L->views == 0 || L->tile_w == 0 || L->tile_h == 0) {
 		return;
 	}
@@ -3861,6 +3867,8 @@ d3d12_route_effective_layout(struct comp_d3d12_compositor *c, uint32_t layer_vie
 		L->route[k].h = tr.h;
 	}
 	L->route_count = r.count;
+	// #1883: the partition these pixels are painted with, for the segment crop.
+	comp_segments_content_from_routing(&r, &c->seg_content);
 
 	// One INFO line per routing change (a move, a resize, a mode switch).
 	if (memcmp(L->route, c->seg_route_logged.route, sizeof(L->route)) != 0 ||
@@ -4279,6 +4287,9 @@ d3d12_dp_weave_and_present(struct comp_d3d12_compositor *c, bool is_repaint, ID3
 		sf.canvas.y = 0;
 		sf.canvas.w = seg_window.w;
 		sf.canvas.h = seg_window.h;
+		// #1883: crop each segment's views where this atlas painted them (the
+		// routing it was located for), not at the seam of the live window.
+		sf.content = &c->repaint.seg_content;
 		sf.transparent_background = c->transparent_background;
 		sf.primary_dp = c->display_processor;
 		sf.renderer = c->renderer;
@@ -5808,6 +5819,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			c->repaint.atlas = atlas_resource;
 			c->repaint.content_w = tile_columns * view_width;
 			c->repaint.content_h = tile_rows * view_height;
+			c->repaint.seg_content = c->seg_content;
 			c->repaint.armed = !zero_copy;
 
 			// Atlas barrier, crop, 2D-under flatten, weave, composite, HUD and

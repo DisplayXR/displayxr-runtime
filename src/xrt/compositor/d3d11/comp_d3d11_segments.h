@@ -163,6 +163,15 @@ struct comp_d3d11_segments_frame
 	uint32_t target_height;
 	//! The canvas the atlas holds, window px (whole-canvas view dims above).
 	struct comp_seg_rect canvas;
+	/*!
+	 * #1883: the partition @ref src_srv's pixels were PAINTED with — a routed
+	 * (M3) frame's per-segment mosaic, recorded with the frame (the egress
+	 * slot's own under the #918 split). Each segment's views are cropped from
+	 * where they were painted and woven over the live segment, never cut at
+	 * the live seam. NULL / count 0 = one view set (unrouted): the live
+	 * partition is exact.
+	 */
+	const struct comp_segments_content *content;
 	//! Clear alpha for the target outside every segment; also re-declared to
 	//! segment DPs when it changes.
 	bool transparent_background;

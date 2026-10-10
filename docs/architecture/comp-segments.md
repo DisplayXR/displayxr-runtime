@@ -193,7 +193,8 @@ deferred-release list because the immediate context executes in order). What dif
   the renderer's blit re-made on that device). Same function, same table, same per-segment viewport /
   scissor / present origin, same #1863 routing (the mosaic is painted on the app device and crosses the
   bridge like any atlas). A slot one frame behind a resizing window is cropped at its own view size
-  against the live canvas — the single-DP split weave's one-frame lag, no more. A split session logs
+  against the live canvas — the single-DP split weave's one-frame lag, no more; a routed slot is
+  cropped at the partition it was painted with (#1883, *Per-segment views* below). A split session logs
   one WARN when its segment manager is made (`segments: under the #918 output-device split …`).
 - **Not segmented on Windows:** zero-copy frames, a zones / Local2D frame (any non-whole-window
   canvas), the shared-texture path, a pinned session, `DXR_SEGMENTS=0`.
@@ -309,6 +310,27 @@ views*; API: `XrViewDisplayBindingsDXR` in `XR_DXR_display_info` v22).
    DP weaves its own frustum. A routed frame never zero-copies (the mosaic is built by
    the renderer, not by the app). Chosen over per-segment sub-atlases because it keeps
    one atlas, one crop path, one capture path.
+
+   **The partition travels with the pixels (#1883).** The routing comes from the table
+   the frame was *located* against; the weave cuts its table from the window *now*.
+   During a drag those differ by the window's motion since the locate (one frame
+   in-process, two under the #918 split, whose egress slot lags), so cropping the mosaic
+   at the live seam handed each DP a sliver of its neighbour's views — a few px of one
+   panel's content on the other panel's side, gone at rest. So the routed frame's
+   partition (`comp_segments_content`: each screen's rect + the canvas, from the routing)
+   is recorded with the atlas — the renderer atlas (and the repaint that replays it), the
+   egress slot (a `comp_segments_content_ring` keyed by the bridge `seq`,
+   `comp_xbridge_slot_seq`), the service client's atlas (held with the #1140 recipe) —
+   and the crop reads each segment's views where they were painted
+   (`comp_segments_source_rect`). The live table still owns *placement*: each DP's canvas,
+   viewport/scissor and present origin are where the window is, because that is where
+   the back buffer lands on the panels; the DP stretches its views over its live segment
+   (a sub-percent scale for one frame of a drag). Partitioning the placement with the old
+   table instead would weave the strip between the two seams with the wrong screen's DP
+   onto the other panel — the same sliver, from the other side. An unrouted frame (one
+   view set) has no partition of its own and keeps the live crop, which is exact for it.
+   D3D11 in-process (split and not), the D3D11 service and D3D12 carry it; the Vulkan
+   and Metal twins do not yet.
 4. **Capture.** `displayxr_atlas.seg<i>.png` is each segment's DP input, i.e. that
    segment's own views.
 
