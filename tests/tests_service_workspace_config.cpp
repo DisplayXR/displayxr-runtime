@@ -128,6 +128,108 @@ TEST_CASE("hotkey parser rejects everything outside the grammar", "[service][hot
 	CHECK_FALSE(service_hotkey_format(&ok, tiny, sizeof(tiny)));
 }
 
+namespace {
+
+struct x11_key
+{
+	uint32_t keysym;
+	uint32_t mods;
+};
+
+x11_key
+x11(const char *text)
+{
+	service_hotkey hk;
+	REQUIRE(service_hotkey_parse(text, &hk));
+	x11_key k{0, 0};
+	REQUIRE(service_hotkey_to_x11(&hk, &k.keysym, &k.mods));
+	return k;
+}
+
+std::string
+accel(const char *text)
+{
+	service_hotkey hk;
+	REQUIRE(service_hotkey_parse(text, &hk));
+	char buf[64];
+	REQUIRE(service_hotkey_to_accelerator(&hk, buf, sizeof(buf)));
+	return buf;
+}
+
+} // namespace
+
+TEST_CASE("hotkey grammar maps on to X11 keysyms and modifier masks", "[service][hotkey][linux]")
+{
+	// keysymdef.h: XK_space 0x20, XK_a 0x61, XK_F1 0xffbe, XK_Return 0xff0d ...
+	CHECK(x11("Ctrl+Space").keysym == 0x0020u);
+	CHECK(x11("Ctrl+Space").mods == SERVICE_HOTKEY_X11_CONTROL);
+	CHECK(x11("Alt+A").keysym == 0x0061u); // the level-0 (lower-case) keysym
+	CHECK(x11("Alt+Z").keysym == 0x007au);
+	CHECK(x11("Alt+A").mods == SERVICE_HOTKEY_X11_MOD1);
+	CHECK(x11("Win+0").keysym == 0x0030u);
+	CHECK(x11("Win+9").keysym == 0x0039u);
+	CHECK(x11("Win+9").mods == SERVICE_HOTKEY_X11_MOD4);
+	CHECK(x11("Shift+F1").keysym == 0xffbeu);
+	CHECK(x11("Shift+F12").keysym == 0xffc9u);
+	CHECK(x11("Shift+F24").keysym == 0xffd5u);
+	CHECK(x11("Ctrl+Enter").keysym == 0xff0du);
+	CHECK(x11("Ctrl+Tab").keysym == 0xff09u);
+	CHECK(x11("Ctrl+Backquote").keysym == 0x0060u);
+	CHECK(x11("Ctrl+Quote").keysym == 0x0027u);
+	CHECK(x11("Ctrl+Delete").keysym == 0xffffu);
+	CHECK(x11("Ctrl+PageUp").keysym == 0xff55u);
+	CHECK(x11("Ctrl+PageDown").keysym == 0xff56u);
+	CHECK(x11("Ctrl+ArrowLeft").keysym == 0xff51u);
+	CHECK(x11("Ctrl+Down").keysym == 0xff54u);
+	CHECK(x11("Ctrl+Shift+Alt+Win+BracketRight").keysym == 0x005du);
+	CHECK(x11("Ctrl+Shift+Alt+Win+BracketRight").mods ==
+	      (SERVICE_HOTKEY_X11_CONTROL | SERVICE_HOTKEY_X11_SHIFT | SERVICE_HOTKEY_X11_MOD1 |
+	       SERVICE_HOTKEY_X11_MOD4));
+
+	// Every key the grammar accepts maps (no hole in the table).
+	const char *keys[] = {"Space", "Tab",   "Enter", "Backquote", "Minus",  "Equals",   "BracketLeft",
+	                      "BracketRight", "Semicolon", "Quote", "Comma", "Period", "Slash", "Backslash",
+	                      "Insert", "Delete", "Home", "End", "PageUp", "PageDown", "Left", "Up", "Right",
+	                      "Down"};
+	for (const char *k : keys) {
+		std::string combo = std::string("Ctrl+") + k;
+		INFO(combo);
+		CHECK(x11(combo.c_str()).keysym != 0u);
+		CHECK(!accel(combo.c_str()).empty());
+	}
+
+	// Invalid input is refused with zeroed outputs.
+	service_hotkey none{0, 0};
+	uint32_t ks = 1, m = 1;
+	CHECK_FALSE(service_hotkey_to_x11(&none, &ks, &m));
+	CHECK(ks == 0u);
+	CHECK(m == 0u);
+	service_hotkey bogus{SERVICE_HOTKEY_MOD_CTRL, 0x07};
+	CHECK_FALSE(service_hotkey_to_x11(&bogus, &ks, &m));
+}
+
+TEST_CASE("hotkey grammar maps on to GTK accelerators", "[service][hotkey][linux]")
+{
+	CHECK(accel("Ctrl+Space") == "<Control>space");
+	CHECK(accel("ctrl+shift+f5") == "<Control><Shift>F5");
+	CHECK(accel("Alt+Win+A") == "<Alt><Super>a");
+	CHECK(accel("Win+PageDown") == "<Super>Page_Down");
+	CHECK(accel("Ctrl+Equals") == "<Control>equal");
+	CHECK(accel("Ctrl+Enter") == "<Control>Return");
+	CHECK(accel("Ctrl+Quote") == "<Control>apostrophe");
+	CHECK(accel("Ctrl+Backquote") == "<Control>grave");
+	CHECK(accel("Shift+Alt+7") == "<Shift><Alt>7");
+
+	service_hotkey hk;
+	REQUIRE(service_hotkey_parse("Ctrl+Shift+Alt+Win+BracketRight", &hk));
+	char small[8];
+	CHECK_FALSE(service_hotkey_to_accelerator(&hk, small, sizeof(small)));
+	CHECK(small[0] == '\0');
+	service_hotkey none{0, 0};
+	char buf[64];
+	CHECK_FALSE(service_hotkey_to_accelerator(&none, buf, sizeof(buf)));
+}
+
 TEST_CASE("defaults: Ctrl+Space, auto, source default", "[service][config]")
 {
 	service_config cfg = defaults();
