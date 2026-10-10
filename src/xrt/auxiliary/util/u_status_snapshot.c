@@ -173,6 +173,24 @@ u_status_confidence_str(uint32_t c)
 }
 
 const char *
+u_status_pref_source_str(enum xrt_status_pref_source s)
+{
+	switch (s) {
+	case XRT_STATUS_PREF_SOURCE_ENV: return "env";
+	case XRT_STATUS_PREF_SOURCE_USER: return "user";
+	case XRT_STATUS_PREF_SOURCE_MACHINE: return "machine";
+	case XRT_STATUS_PREF_SOURCE_NONE:
+	default: return NULL;
+	}
+}
+
+const char *
+u_status_apply_str(enum xrt_status_apply a)
+{
+	return a == XRT_STATUS_APPLY_NEXT_SESSION ? "next-session" : "live";
+}
+
+const char *
 u_status_platform_state_str(uint32_t state)
 {
 	switch (state) {
@@ -354,6 +372,15 @@ u_status_warnings_derive(struct xrt_status_snapshot *snap)
 			screen_warn(s, U_STATUS_W_CLAIM_EDID_ONLY, XRT_STATUS_LEVEL_INFO,
 			            "Claimed by EDID identity, not verified by the vendor: check that the vendor "
 			            "platform sees this display.");
+		}
+
+		// CLAIM_FORCED — a per-screen preference picked this screen's plug-in
+		// (display dashboard phase 7): not a fault, but the dashboard shows it.
+		if (claimed && s->claim.forced) {
+			const char *src = u_status_pref_source_str(s->claim.preferred_source);
+			(void)snprintf(text, sizeof(text), "Plug-in forced by a per-screen preference (%s)",
+			               src != NULL ? src : "unknown");
+			screen_warn(s, U_STATUS_W_CLAIM_FORCED, XRT_STATUS_LEVEL_INFO, text);
 		}
 
 		// NO_PHYSICAL_SIZE — the 0 m trap, for a screen a DP can be made for.
@@ -598,6 +625,7 @@ screen_to_cjson(const struct xrt_status_screen *s)
 	cJSON_AddNumberToObject(o, "index", (double)s->index);
 	cJSON_AddStringToObject(o, "device_name", s->device_name);
 	cJSON_AddStringToObject(o, "friendly_name", s->friendly_name);
+	add_str_or_null(o, "key", s->key);
 
 	cJSON *edid = cJSON_AddObjectToObject(o, "edid");
 	cJSON_AddStringToObject(edid, "manufacturer", s->edid.manufacturer);
@@ -633,6 +661,10 @@ screen_to_cjson(const struct xrt_status_screen *s)
 	cJSON_AddNumberToObject(claim, "confidence_value", (double)s->claim.confidence);
 	cJSON_AddStringToObject(claim, "serial", s->claim.serial);
 	add_apis(claim, s->claim.apis);
+	cJSON_AddBoolToObject(claim, "forced", s->claim.forced);
+	add_str_or_null(claim, "preferred_plugin", s->claim.preferred_plugin);
+	add_str_or_null(claim, "preferred_source", u_status_pref_source_str(s->claim.preferred_source));
+	cJSON_AddStringToObject(claim, "apply", u_status_apply_str(s->claim.apply));
 
 	cJSON *lay = cJSON_AddObjectToObject(o, "layout");
 	cJSON_AddNumberToObject(lay, "width_m", (double)s->layout.width_m);
