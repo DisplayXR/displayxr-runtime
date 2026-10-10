@@ -133,16 +133,15 @@ count_code_lines_with(const std::string &src, const std::string &needle)
 }
 
 //! Every native compositor that composes layers into an atlas the display
-//! processor consumes, relative to the compositor source root. Metal is
-//! deliberately absent: its #1589 leg is still open, and a test that fails for
-//! a known-open leg is noise, not a guard. Add a backend here the moment it
-//! grows a compose target.
+//! processor consumes, relative to the compositor source root. Add a backend
+//! here the moment it grows a compose target (Metal: ADR-044).
 const char *const kColorBackends[] = {
     "d3d11/comp_d3d11_renderer.cpp",
     "d3d11_service/comp_d3d11_service.cpp",
     "d3d12/comp_d3d12_renderer.cpp",
     "gl/comp_gl_compositor.cpp",
     "vk_native/comp_vk_native_renderer.c",
+    "metal/comp_metal_compositor.m",
 };
 
 /*!
@@ -168,6 +167,7 @@ const char *const kZeroCopyOwners[] = {
     "d3d11_service/comp_d3d11_service.cpp",
     "gl/comp_gl_compositor.cpp",
     "vk_native/comp_vk_native_compositor.c",
+    "metal/comp_metal_compositor.m",
 };
 
 //! vk_native's compose shaders live beside the renderer as GLSL compiled to
@@ -403,6 +403,54 @@ TEST_CASE("colour: the GL leg spells the same model in GL (#1589/#1610)")
 	                                                         "gl_bind_layer_source(). Another is a read that "
 	                                                         "decided its own colour space.");
 	CHECK(direct_skip == 1);
+}
+
+TEST_CASE("colour: the Metal leg spells the same model in Metal (ADR-044)")
+{
+	/*
+	 * Metal states the model with the least machinery of any backend, and
+	 * that is exactly what makes it easy to lose in review:
+	 *
+	 *   - the encode is the ATTACHMENT: the atlas is created with
+	 *     MTLTextureUsagePixelFormatView and a frame that owes an encode or a
+	 *     blend renders through its BGRA8Unorm_sRGB VIEW. A pipeline's
+	 *     attachment format must match, so every atlas pipeline has an
+	 *     _sRGB-attachment twin;
+	 *   - the "raw copy to the atlas" is the identity: the view aliases the
+	 *     atlas's storage, so the DP reads the encoded bytes through the
+	 *     UNORM atlas with nothing in between — there is no publish step a
+	 *     draw could sneak into;
+	 *   - "does this sample decode?" is the VIEW the draw binds, chosen in
+	 *     one helper, metal_layer_source_view().
+	 */
+	const std::string path = std::string(DXR_COMP_SRC_DIR) + "/metal/comp_metal_compositor.m";
+	const std::string src = read_whole_file(path);
+
+	INFO("the atlas must be created with MTLTextureUsagePixelFormatView, or its _sRGB view is illegal");
+	CHECK(contains_in_code(src, "MTLTextureUsagePixelFormatView"));
+	INFO("...and the compose target must be the atlas's OWN _sRGB view (aliasing = the raw copy)");
+	CHECK(contains_in_code(src, "[c->atlas_texture newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB]"));
+
+	const std::string twin = function_body(src, "metal_srgb_twin");
+	INFO("metal_srgb_twin() must exist — every atlas pipeline's _sRGB-attachment twin is built in one place");
+	REQUIRE_FALSE(twin.empty());
+	CHECK(twin.find("MTLPixelFormatBGRA8Unorm_sRGB") != std::string::npos);
+	INFO("...and must build nothing under the shared escape hatch");
+	CHECK(twin.find("u_color_legacy_unorm_encoded(") != std::string::npos);
+
+	const std::string pick = function_body(src, "metal_layer_source_view");
+	INFO("metal_layer_source_view() must exist — the single source-view (colour space) choice");
+	REQUIRE_FALSE(pick.empty());
+
+	// The non-decoding read is metal_srgb_to_unorm(); outside its own
+	// definition it may appear only inside metal_layer_source_view(). A second
+	// call site is a draw that decided its own colour space.
+	const size_t direct = count_code_lines_with(src, "metal_srgb_to_unorm(");
+	INFO("comp_metal_compositor.m names metal_srgb_to_unorm( on "
+	     << direct << " code line(s), expected 2 — its definition and the one call in "
+	        "metal_layer_source_view()");
+	CHECK(direct == 2);
+	CHECK(pick.find("metal_srgb_to_unorm(") != std::string::npos);
 }
 
 TEST_CASE("colour: the vk_native leg spells the same model in Vulkan (#1589/#1610)")

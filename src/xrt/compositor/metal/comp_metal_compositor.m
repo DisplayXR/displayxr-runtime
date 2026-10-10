@@ -50,6 +50,7 @@
 #include "util/u_tiling.h"
 #include "util/u_canvas.h"
 #include "util/u_capture_intent.h"
+#include "util/u_color_encoding.h"
 #include "util/u_image_capture.h"
 #include <displayxr_mcp/mcp_capture.h>
 
@@ -170,6 +171,42 @@ struct comp_metal_compositor
 
 	//! Render pipeline for fullscreen blit (atlas→target passthrough).
 	id<MTLRenderPipelineState> blit_pipeline;
+
+	/*!
+	 * ADR-044 / #1589 / #1610 — the format-honest compose target.
+	 *
+	 * The atlas stays `BGRA8Unorm` holding ENCODED bytes (what the DP, the
+	 * captures and the crop copy read). It is created with
+	 * `MTLTextureUsagePixelFormatView`, and @ref atlas_srgb_view is its
+	 * `BGRA8Unorm_sRGB` view: a frame that owes an encode or a blend renders
+	 * THROUGH that view, so the hardware decodes on read-for-blend, blends
+	 * in linear light and encodes on write. The view aliases the atlas's
+	 * own storage, so the "raw copy to the atlas" other backends need is
+	 * the identity here — the DP reads the very bytes the encode wrote,
+	 * through the UNORM atlas, with no conversion in between.
+	 *
+	 * Each atlas pipeline has a twin whose colour attachment is
+	 * `BGRA8Unorm_sRGB` (a pipeline's attachment format must match the
+	 * texture it renders into). nil under DXR_COLOR_LEGACY_UNORM_ENCODED.
+	 */
+	id<MTLTexture> atlas_srgb_view;
+	struct
+	{
+		id<MTLRenderPipelineState> projection;
+		id<MTLRenderPipelineState> proj_premult;
+		id<MTLRenderPipelineState> proj_straight;
+		id<MTLRenderPipelineState> quad_straight;
+		id<MTLRenderPipelineState> quad_premult;
+		id<MTLRenderPipelineState> quad_opaque;
+		id<MTLRenderPipelineState> local2d_premult;
+		id<MTLRenderPipelineState> local2d_unpremult;
+	} srgb_pipes;
+
+	//! One-shot "the compose target engaged" WARN (#1610 evidence line).
+	bool compose_target_logged;
+
+	//! Last atlas encoding declared to the primary DP (-1 = never).
+	int dp_atlas_encoding_latched;
 
 	//! Sampler state for texture sampling.
 	id<MTLSamplerState> sampler_linear;
@@ -312,6 +349,10 @@ struct comp_metal_compositor
 	//! input of the masked composite) + the weave snapshot it lerps against.
 	id<MTLTexture> local2d_scratch;
 	id<MTLTexture> weave_scratch;
+	//! `BGRA8Unorm_sRGB` view of @ref local2d_scratch — the Local2D flatten
+	//! renders through it (linear blend, encode on write); every reader
+	//! samples the UNORM scratch and so still sees ENCODED bytes (#1795).
+	id<MTLTexture> local2d_scratch_srgb;
 	uint32_t composite_w;               //!< Current scratch width (0 = not allocated)
 	uint32_t composite_h;               //!< Current scratch height
 
@@ -319,6 +360,7 @@ struct comp_metal_compositor
 	//! projection in list order), handed to the DP via set_background_2d so it
 	//! composites `backdrop over captured-desktop` under the 3D weave.
 	id<MTLTexture> backdrop_scratch;
+	id<MTLTexture> backdrop_scratch_srgb; //!< its `_sRGB` view (#1795, as local2d_scratch_srgb)
 	uint32_t backdrop_w;                //!< Current backdrop scratch width (0 = none)
 	uint32_t backdrop_h;
 
@@ -822,9 +864,10 @@ static NSString *const metal_shader_source = @
  */
 
 // Map an sRGB Metal pixel format to its plain UNORM sibling (identity
-// otherwise). Used to sample an app sRGB swapchain through a non-decoding view
-// so the compositor passes the app's display-referred bytes through to the DP
-// unchanged. Mirrors the GL/D3D/VK sRGB-passthrough fixes.
+// otherwise). The NON-decoding read of an `_SRGB` swapchain: the app's encoded
+// bytes come through unchanged. Only right where the write is a passthrough
+// too (the fast path, the legacy hatch, the zero-copy handoff) — see
+// metal_layer_source_view().
 static MTLPixelFormat
 metal_srgb_to_unorm(MTLPixelFormat format)
 {
@@ -833,6 +876,68 @@ metal_srgb_to_unorm(MTLPixelFormat format)
 	case MTLPixelFormatBGRA8Unorm_sRGB: return MTLPixelFormatBGRA8Unorm;
 	default: return format;
 	}
+}
+
+//! Does @p format hold ENCODED colour (ADR-044 §1: the format says what its
+//! bytes mean)? Every other colour format this compositor allocates —
+//! RGBA8/BGRA8 UNORM, RGB10A2Unorm, RGBA16Float — holds LINEAR values.
+static bool
+metal_format_is_srgb(MTLPixelFormat format)
+{
+	return format == MTLPixelFormatRGBA8Unorm_sRGB || format == MTLPixelFormatBGRA8Unorm_sRGB;
+}
+
+/*!
+ * THE one place a layer source's colour space is chosen (#1589) — the Metal
+ * twin of D3D12's layer_source_format() and GL's gl_bind_layer_source(). Every
+ * draw that samples an app swapchain gets its texture here, so no site can
+ * quietly keep the non-decoding read while its target encodes on write (which
+ * is one half of every failing GradientFormatsLinearVsNonLinear pair).
+ *
+ *  - @p honest (the draw renders through an `_sRGB` target): sample the source
+ *    AS DECLARED — an `_SRGB` swapchain decodes to linear, a UNORM / float one
+ *    is read as the linear values OpenXR says it holds.
+ *  - otherwise (the write is a passthrough): the non-decoding view, so the
+ *    app's bytes reach the atlas unchanged — the pre-#1589 behaviour, kept for
+ *    the fast path and the legacy hatch.
+ *
+ * Also pins an array swapchain to @p array_index (imageArrayIndex, the Metal
+ * analog of the D3D12 #656 fix). Returns a +1 reference (this file is MRR);
+ * the caller releases it once the draw is encoded — the command buffer holds
+ * its own reference to every texture it binds.
+ */
+static id<MTLTexture>
+metal_layer_source_view(id<MTLTexture> tex, uint32_t array_index, bool honest)
+{
+	const MTLPixelFormat fmt = honest ? tex.pixelFormat : metal_srgb_to_unorm(tex.pixelFormat);
+	id<MTLTexture> v = nil;
+	if (tex.textureType == MTLTextureType2DArray) {
+		v = [tex newTextureViewWithPixelFormat:fmt
+		                           textureType:MTLTextureType2D
+		                                levels:NSMakeRange(0, tex.mipmapLevelCount)
+		                                slices:NSMakeRange(array_index, 1)];
+	} else if (fmt != tex.pixelFormat) {
+		v = [tex newTextureViewWithPixelFormat:fmt];
+	}
+	return v != nil ? v : [tex retain];
+}
+
+/*!
+ * A display-referred clear colour for a target that may encode on write.
+ * Clear values are taken in the ATTACHMENT's space: on the `_sRGB` compose
+ * view they are linear, so the RGB is decoded on the CPU first (the way
+ * vk_native and the displayxr-common clear helpers do). Alpha is never
+ * converted. Never shader arithmetic — this is a constant.
+ */
+static MTLClearColor
+metal_display_referred_clear(double r, double g, double b, double a, bool target_encodes)
+{
+	if (target_encodes) {
+		r = u_color_srgb_decode((float)r);
+		g = u_color_srgb_decode((float)g);
+		b = u_color_srgb_decode((float)b);
+	}
+	return MTLClearColorMake(r, g, b, a);
 }
 
 static MTLPixelFormat
@@ -907,6 +1012,42 @@ iosurface_fourcc_to_metal_format(uint32_t fourcc)
 	case 'RGBA': return MTLPixelFormatRGBA8Unorm;
 	default:     return MTLPixelFormatBGRA8Unorm;
 	}
+}
+
+/*!
+ * The `BGRA8Unorm_sRGB`-attachment twin of the pipeline @p desc describes
+ * (ADR-044): identical shaders and blend state, so the only difference is that
+ * the fixed-function blender reads the target decoded, blends in linear light
+ * and writes encoded. @p desc is left as it was. nil under the legacy hatch
+ * (nothing ever composes then) or on failure, which the per-frame decision
+ * treats as "no compose target" — the frame then takes the passthrough path.
+ */
+static id<MTLRenderPipelineState>
+metal_srgb_twin(struct comp_metal_compositor *c, MTLRenderPipelineDescriptor *desc, const char *what)
+{
+	if (u_color_legacy_unorm_encoded()) {
+		return nil;
+	}
+	const MTLPixelFormat prev = desc.colorAttachments[0].pixelFormat;
+	desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm_sRGB;
+	NSError *err = nil;
+	id<MTLRenderPipelineState> p = [c->device newRenderPipelineStateWithDescriptor:desc error:&err];
+	desc.colorAttachments[0].pixelFormat = prev;
+	if (p == nil) {
+		U_LOG_E("Color (#1610) [metal]: failed to create the _sRGB-target %s pipeline: %s — frames that owe "
+		        "an encode will pass through instead",
+		        what, err != nil ? err.localizedDescription.UTF8String : "?");
+	}
+	return p;
+}
+
+//! Every `_sRGB`-target twin exists, so a frame may compose in linear light.
+static bool
+metal_srgb_pipes_ready(const struct comp_metal_compositor *c)
+{
+	return c->srgb_pipes.projection != nil && c->srgb_pipes.proj_premult != nil &&
+	       c->srgb_pipes.proj_straight != nil && c->srgb_pipes.quad_straight != nil &&
+	       c->srgb_pipes.quad_premult != nil && c->srgb_pipes.quad_opaque != nil;
 }
 
 static bool
@@ -992,6 +1133,7 @@ compile_shaders(struct comp_metal_compositor *c)
 		proj_desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
 
 		c->projection_pipeline = [c->device newRenderPipelineStateWithDescriptor:proj_desc error:&error];
+		c->srgb_pipes.projection = metal_srgb_twin(c, proj_desc, "projection");
 		[proj_desc release];
 		if (c->projection_pipeline == nil) {
 			U_LOG_E("Failed to create projection pipeline: %s",
@@ -1027,6 +1169,7 @@ compile_shaders(struct comp_metal_compositor *c)
 		pb_desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
 
 		c->proj_premult_pipeline = [c->device newRenderPipelineStateWithDescriptor:pb_desc error:&error];
+		c->srgb_pipes.proj_premult = metal_srgb_twin(c, pb_desc, "projection premultiplied");
 		if (c->proj_premult_pipeline == nil) {
 			U_LOG_E("Failed to create projection premultiplied pipeline: %s",
 			        error.localizedDescription.UTF8String);
@@ -1036,6 +1179,7 @@ compile_shaders(struct comp_metal_compositor *c)
 
 		pb_desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
 		c->proj_straight_pipeline = [c->device newRenderPipelineStateWithDescriptor:pb_desc error:&error];
+		c->srgb_pipes.proj_straight = metal_srgb_twin(c, pb_desc, "projection straight-alpha");
 		[pb_desc release];
 		if (c->proj_straight_pipeline == nil) {
 			U_LOG_E("Failed to create projection straight-alpha pipeline: %s",
@@ -1080,6 +1224,7 @@ compile_shaders(struct comp_metal_compositor *c)
 		quad_desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
 
 		c->quad_straight_pipeline = [c->device newRenderPipelineStateWithDescriptor:quad_desc error:&error];
+		c->srgb_pipes.quad_straight = metal_srgb_twin(c, quad_desc, "quad straight-alpha");
 		if (c->quad_straight_pipeline == nil) {
 			U_LOG_E("Failed to create quad straight-alpha pipeline: %s",
 			        error.localizedDescription.UTF8String);
@@ -1091,6 +1236,7 @@ compile_shaders(struct comp_metal_compositor *c)
 
 		quad_desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
 		c->quad_premult_pipeline = [c->device newRenderPipelineStateWithDescriptor:quad_desc error:&error];
+		c->srgb_pipes.quad_premult = metal_srgb_twin(c, quad_desc, "quad premultiplied");
 		if (c->quad_premult_pipeline == nil) {
 			U_LOG_E("Failed to create quad premultiplied pipeline: %s",
 			        error.localizedDescription.UTF8String);
@@ -1104,6 +1250,7 @@ compile_shaders(struct comp_metal_compositor *c)
 		// base blit. The two differ only in the alpha the shader emits.
 		quad_desc.colorAttachments[0].blendingEnabled = NO;
 		c->quad_opaque_pipeline = [c->device newRenderPipelineStateWithDescriptor:quad_desc error:&error];
+		c->srgb_pipes.quad_opaque = metal_srgb_twin(c, quad_desc, "quad opaque");
 		[quad_desc release];
 		[quad_fs release];
 		[quad_vs release];
@@ -1132,6 +1279,7 @@ compile_shaders(struct comp_metal_compositor *c)
 		l2d_desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
 
 		c->local2d_premult_pipeline = [c->device newRenderPipelineStateWithDescriptor:l2d_desc error:&error];
+		c->srgb_pipes.local2d_premult = metal_srgb_twin(c, l2d_desc, "Local2D premultiplied");
 		if (c->local2d_premult_pipeline == nil) {
 			U_LOG_E("Failed to create local-2D premult pipeline: %s",
 			        error.localizedDescription.UTF8String);
@@ -1141,6 +1289,7 @@ compile_shaders(struct comp_metal_compositor *c)
 
 		l2d_desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
 		c->local2d_unpremult_pipeline = [c->device newRenderPipelineStateWithDescriptor:l2d_desc error:&error];
+		c->srgb_pipes.local2d_unpremult = metal_srgb_twin(c, l2d_desc, "Local2D unpremultiplied");
 		[l2d_desc release];
 		if (c->local2d_unpremult_pipeline == nil) {
 			U_LOG_E("Failed to create local-2D unpremult pipeline: %s",
@@ -1249,13 +1398,23 @@ create_atlas_texture(struct comp_metal_compositor *c,
 	                                width:atlas_width
 	                               height:atlas_height
 	                            mipmapped:NO];
-	desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	// PixelFormatView: the format-honest compose renders through a
+	// BGRA8Unorm_sRGB view of this same storage (ADR-044, see
+	// atlas_srgb_view). The atlas itself stays UNORM and ENCODED.
+	desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
 	desc.storageMode = MTLStorageModePrivate;
 
 	c->atlas_texture = [c->device newTextureWithDescriptor:desc];
 	if (c->atlas_texture == nil) {
 		U_LOG_E("Failed to create atlas texture");
 		return false;
+	}
+	if (!u_color_legacy_unorm_encoded()) {
+		c->atlas_srgb_view = [c->atlas_texture newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB];
+		if (c->atlas_srgb_view == nil) {
+			U_LOG_E("Color (#1610) [metal]: failed to create the atlas's _sRGB view — frames that owe an "
+			        "encode will pass through instead");
+		}
 	}
 
 	// Depth texture
@@ -2875,6 +3034,20 @@ metal_update_zone_feather_mask(struct comp_metal_compositor *c,
 }
 
 /*!
+ * #1795 — does the Local2D flatten blend in linear light, each layer sampled as
+ * its declared format? Yes unless the shared escape hatch is on (or the
+ * `_sRGB`-target flatten pipelines failed to build). The flatten target is
+ * the scratch's `_sRGB` view; every reader of the scratch samples it UNORM and
+ * so still sees ENCODED bytes.
+ */
+static bool
+metal_local2d_honest(const struct comp_metal_compositor *c)
+{
+	return !u_color_legacy_unorm_encoded() && c->srgb_pipes.local2d_premult != nil &&
+	       c->srgb_pipes.local2d_unpremult != nil;
+}
+
+/*!
  * Ensure the window-sized 2D scratch + weave snapshot textures exist at w×h.
  */
 static bool
@@ -2884,6 +3057,8 @@ metal_ensure_composite_scratch(struct comp_metal_compositor *c, uint32_t w, uint
 		return true;
 	}
 
+	[c->local2d_scratch_srgb release];
+	c->local2d_scratch_srgb = nil;
 	[c->local2d_scratch release];
 	c->local2d_scratch = nil;
 	[c->weave_scratch release];
@@ -2896,8 +3071,11 @@ metal_ensure_composite_scratch(struct comp_metal_compositor *c, uint32_t w, uint
 	                                                       width:w
 	                                                      height:h
 	                                                   mipmapped:NO];
-	desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
 	c->local2d_scratch = [c->device newTextureWithDescriptor:desc];
+	if (c->local2d_scratch != nil && metal_local2d_honest(c)) {
+		c->local2d_scratch_srgb = [c->local2d_scratch newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB];
+	}
 
 	desc.usage = MTLTextureUsageShaderRead;
 	c->weave_scratch = [c->device newTextureWithDescriptor:desc];
@@ -2924,6 +3102,8 @@ metal_ensure_backdrop_scratch(struct comp_metal_compositor *c, uint32_t w, uint3
 	if (c->backdrop_w == w && c->backdrop_h == h && c->backdrop_scratch != nil) {
 		return true;
 	}
+	[c->backdrop_scratch_srgb release];
+	c->backdrop_scratch_srgb = nil;
 	[c->backdrop_scratch release];
 	c->backdrop_scratch = nil;
 	c->backdrop_w = 0;
@@ -2934,11 +3114,14 @@ metal_ensure_backdrop_scratch(struct comp_metal_compositor *c, uint32_t w, uint3
 	                                                       width:w
 	                                                      height:h
 	                                                   mipmapped:NO];
-	desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
 	c->backdrop_scratch = [c->device newTextureWithDescriptor:desc];
 	if (c->backdrop_scratch == nil) {
 		U_LOG_E("Failed to allocate backdrop scratch texture (%ux%u)", w, h);
 		return false;
+	}
+	if (metal_local2d_honest(c)) {
+		c->backdrop_scratch_srgb = [c->backdrop_scratch newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB];
 	}
 	c->backdrop_w = w;
 	c->backdrop_h = h;
@@ -2946,16 +3129,20 @@ metal_ensure_backdrop_scratch(struct comp_metal_compositor *c, uint32_t w, uint3
 }
 
 // #439 Phase 3 / #491 part 3 — draw one Local2D layer into the currently-bound
-// flatten render encoder (premultiplied / unpremultiplied "over", sRGB
-// passthrough). Dest rect clips to the w×h window scratch; clipped fractions
-// carry into the source UVs. Shared by the over-flatten (masked composite) and
-// the under-flatten (backdrop).
+// flatten render encoder (premultiplied / unpremultiplied "over"). Dest rect
+// clips to the w×h window scratch; clipped fractions carry into the source
+// UVs. Shared by the over-flatten (masked composite) and the under-flatten
+// (backdrop). @p honest (#1795): the encoder renders through the scratch's
+// `_sRGB` view, so the layer is sampled as its declared format and blended in
+// linear light; otherwise the legacy passthrough (non-decoding read into the
+// UNORM scratch).
 static void
 metal_flatten_one_local2d_layer(struct comp_metal_compositor *c,
                                 id<MTLRenderCommandEncoder> enc,
                                 struct comp_layer *layer,
                                 uint32_t w,
-                                uint32_t h)
+                                uint32_t h,
+                                bool honest)
 {
 	struct xrt_swapchain *sc = layer->sc_array[0];
 	if (sc == NULL) {
@@ -2997,18 +3184,8 @@ metal_flatten_one_local2d_layer(struct comp_metal_compositor *c,
 		nr.h = 1.0f;
 	}
 
-	// sRGB passthrough (see projection pass).
-	id<MTLTexture> src_tex = msc->images[img_idx];
-	id<MTLTexture> src_view = nil;
-	{
-		MTLPixelFormat unorm_fmt = metal_srgb_to_unorm(src_tex.pixelFormat);
-		if (unorm_fmt != src_tex.pixelFormat) {
-			src_view = [src_tex newTextureViewWithPixelFormat:unorm_fmt];
-			if (src_view != nil) {
-				src_tex = src_view;
-			}
-		}
-	}
+	id<MTLTexture> src_view =
+	    metal_layer_source_view(msc->images[img_idx], layer->data.local_2d.sub.array_index, honest);
 
 	MTLViewport vp;
 	vp.originX = x0;
@@ -3020,8 +3197,12 @@ metal_flatten_one_local2d_layer(struct comp_metal_compositor *c,
 	[enc setViewport:vp];
 
 	bool unpremult = (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0;
-	[enc setRenderPipelineState:unpremult ? c->local2d_unpremult_pipeline : c->local2d_premult_pipeline];
-	[enc setFragmentTexture:src_tex atIndex:0];
+	if (honest) {
+		[enc setRenderPipelineState:unpremult ? c->srgb_pipes.local2d_unpremult : c->srgb_pipes.local2d_premult];
+	} else {
+		[enc setRenderPipelineState:unpremult ? c->local2d_unpremult_pipeline : c->local2d_premult_pipeline];
+	}
+	[enc setFragmentTexture:src_view atIndex:0];
 	[enc setFragmentSamplerState:c->sampler_linear atIndex:0];
 
 	struct {
@@ -3115,8 +3296,11 @@ metal_flatten_backdrop_2d(struct comp_metal_compositor *c,
 		return nil;
 	}
 
+	// #1795: through the `_sRGB` view when honest (the clear is (0,0,0,0),
+	// a fixed point of the transfer function, so it needs no decode).
+	const bool honest = c->backdrop_scratch_srgb != nil && metal_local2d_honest(c);
 	MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
-	pass.colorAttachments[0].texture = c->backdrop_scratch;
+	pass.colorAttachments[0].texture = honest ? c->backdrop_scratch_srgb : c->backdrop_scratch;
 	pass.colorAttachments[0].loadAction = MTLLoadActionClear;
 	pass.colorAttachments[0].storeAction = MTLStoreActionStore;
 	pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
@@ -3127,7 +3311,7 @@ metal_flatten_backdrop_2d(struct comp_metal_compositor *c,
 		if (layer->data.type != XRT_LAYER_LOCAL_2D) {
 			continue;
 		}
-		metal_flatten_one_local2d_layer(c, enc, layer, w, h);
+		metal_flatten_one_local2d_layer(c, enc, layer, w, h, honest);
 	}
 	[enc endEncoding];
 
@@ -3299,10 +3483,12 @@ metal_composite_local_2d(struct comp_metal_compositor *c,
 		return false;
 	}
 
-	// Step 4 — fill the 2D scratch.
+	// Step 4 — fill the 2D scratch. #1795: through its `_sRGB` view when
+	// honest; the (0,0,0,0) clear is a fixed point, so it needs no decode.
 	{
+		const bool honest = c->local2d_scratch_srgb != nil && metal_local2d_honest(c);
 		MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
-		pass.colorAttachments[0].texture = c->local2d_scratch;
+		pass.colorAttachments[0].texture = honest ? c->local2d_scratch_srgb : c->local2d_scratch;
 		pass.colorAttachments[0].loadAction = MTLLoadActionClear;
 		pass.colorAttachments[0].storeAction = MTLStoreActionStore;
 		pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
@@ -3322,7 +3508,7 @@ metal_composite_local_2d(struct comp_metal_compositor *c,
 			if (!zones_frame && proj_idx >= 0 && (int32_t)i < proj_idx) {
 				continue; // under-layer (backdrop) — handled pre-weave
 			}
-			metal_flatten_one_local2d_layer(c, enc, layer, w, h);
+			metal_flatten_one_local2d_layer(c, enc, layer, w, h, honest);
 		}
 
 		[enc endEncoding];
@@ -3523,29 +3709,49 @@ metal_sync_zone_mask_to_dp(struct comp_metal_compositor *c)
  * per-draw constants as well as bind the pipeline returned here.
  */
 static id<MTLRenderPipelineState>
-metal_proj_pipeline_for(struct comp_metal_compositor *c, enum comp_layer_blend_mode mode)
+metal_proj_pipeline_for(struct comp_metal_compositor *c, enum comp_layer_blend_mode mode, bool srgb_target)
 {
 	switch (mode) {
-	case COMP_LAYER_BLEND_PREMULTIPLIED: return c->proj_premult_pipeline;
-	case COMP_LAYER_BLEND_STRAIGHT: return c->proj_straight_pipeline;
+	case COMP_LAYER_BLEND_PREMULTIPLIED: return srgb_target ? c->srgb_pipes.proj_premult : c->proj_premult_pipeline;
+	case COMP_LAYER_BLEND_STRAIGHT: return srgb_target ? c->srgb_pipes.proj_straight : c->proj_straight_pipeline;
 	case COMP_LAYER_BLEND_REPLACE:
 	case COMP_LAYER_BLEND_OPAQUE_COVER:
-	default: return c->projection_pipeline;
+	default: return srgb_target ? c->srgb_pipes.projection : c->projection_pipeline;
 	}
 }
 
 //! The QUAD-shader pipeline for one shared blend mode; same OPAQUE_COVER
-//! caveat as @ref metal_proj_pipeline_for.
+//! caveat as @ref metal_proj_pipeline_for. @p srgb_target picks the twin whose
+//! attachment is the atlas's `_sRGB` view (ADR-044).
 static id<MTLRenderPipelineState>
-metal_quad_pipeline_for(struct comp_metal_compositor *c, enum comp_layer_blend_mode mode)
+metal_quad_pipeline_for(struct comp_metal_compositor *c, enum comp_layer_blend_mode mode, bool srgb_target)
 {
 	switch (mode) {
-	case COMP_LAYER_BLEND_PREMULTIPLIED: return c->quad_premult_pipeline;
-	case COMP_LAYER_BLEND_STRAIGHT: return c->quad_straight_pipeline;
+	case COMP_LAYER_BLEND_PREMULTIPLIED: return srgb_target ? c->srgb_pipes.quad_premult : c->quad_premult_pipeline;
+	case COMP_LAYER_BLEND_STRAIGHT: return srgb_target ? c->srgb_pipes.quad_straight : c->quad_straight_pipeline;
 	case COMP_LAYER_BLEND_REPLACE:
 	case COMP_LAYER_BLEND_OPAQUE_COVER:
-	default: return c->quad_opaque_pipeline;
+	default: return srgb_target ? c->srgb_pipes.quad_opaque : c->quad_opaque_pipeline;
 	}
+}
+
+/*!
+ * #1484 / ADR-044 §4 — state the atlas encoding to the primary DP, on change
+ * only (the plug-in may log every switch; this is a per-frame path). Every
+ * in-process Metal frame hands the DP ENCODED bytes — the compose target
+ * encodes on write, the passthrough paths carry the app's encoded bytes — so
+ * this declares the slot's own default, explicitly, the way vk_native does.
+ */
+static void
+metal_dp_assert_atlas_encoding(struct comp_metal_compositor *c, enum xrt_atlas_encoding enc)
+{
+	if (c->display_processor == NULL || c->dp_atlas_encoding_latched == (int)enc) {
+		return;
+	}
+	xrt_display_processor_metal_set_atlas_encoding(c->display_processor, enc);
+	U_LOG_W("Color (#1484) [metal]: atlas encoding declared to the DP: %s",
+	        enc == XRT_ATLAS_ENCODING_LINEAR ? "LINEAR" : "ENCODED");
+	c->dp_atlas_encoding_latched = (int)enc;
 }
 
 /*
@@ -3980,6 +4186,60 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
+	/*
+	 * ADR-044 / #1589 / #1610 — does this frame owe an encode or a blend?
+	 *
+	 * The swapchain FORMAT says what its bytes mean: `_SRGB` holds encoded
+	 * colour, UNORM / float hold linear values. A frame whose tile is
+	 * painted by exactly one full-tile projection layer out of `_SRGB`
+	 * swapchains owes neither, and takes the passthrough path verbatim (the
+	 * atlas is byte-identical to the pre-#1589 runtime). Every other frame
+	 * renders through the atlas's `_sRGB` view: sources sampled as declared,
+	 * blended in linear light, encoded once on write. The decision is the
+	 * SHARED predicate's; this scan only gathers its inputs.
+	 *
+	 * Local2D layers do not count: they never paint the atlas (they flatten
+	 * post-weave, honestly on their own — metal_local2d_honest()).
+	 */
+	const bool color_legacy = u_color_legacy_unorm_encoded();
+	uint32_t color_layers = 0;
+	bool color_base_is_projection = false;
+	bool color_all_srgb = true;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		const struct comp_layer *l = &c->layer_accum.layers[i];
+		const enum xrt_layer_type t = l->data.type;
+		const bool is_proj = t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH;
+		const bool per_view = is_proj || t == XRT_LAYER_ZONE_3D;
+		if (!per_view && t != XRT_LAYER_QUAD && t != XRT_LAYER_WINDOW_SPACE) {
+			continue;
+		}
+		color_layers++;
+		color_base_is_projection = is_proj;
+		const uint32_t n = per_view ? l->data.view_count : 1;
+		for (uint32_t v = 0; v < n && v < XRT_MAX_VIEWS; v++) {
+			struct xrt_swapchain *sc = l->sc_array[v];
+			if (sc == NULL) {
+				continue;
+			}
+			struct comp_metal_swapchain *msc = metal_swapchain(sc);
+			if (msc->image_count == 0 || msc->images[0] == nil ||
+			    !metal_format_is_srgb(msc->images[0].pixelFormat)) {
+				color_all_srgb = false;
+			}
+		}
+	}
+	const bool color_fast =
+	    u_color_compose_fast_path(color_legacy, color_layers, color_base_is_projection, color_all_srgb);
+	// A missing view / twin pipeline (allocation failure) degrades to the
+	// passthrough path rather than drawing through a mismatched pipeline.
+	const bool compose_linear = !color_fast && c->atlas_srgb_view != nil && metal_srgb_pipes_ready(c);
+	if (compose_linear && !c->compose_target_logged) {
+		c->compose_target_logged = true;
+		U_LOG_W("Color (#1610) [metal]: compose target engaged — BGRA8Unorm_sRGB view of the BGRA8Unorm "
+		        "atlas (%u layer(s), all sources _SRGB: %s); the atlas stays ENCODED",
+		        color_layers, color_all_srgb ? "yes" : "no");
+	}
+
 	// Zero-copy check: can we pass the app's swapchain directly to the DP?
 	bool zero_copy = false;
 	id<MTLTexture> zc_texture = nil;
@@ -4039,8 +4299,33 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 						if (u_tiling_can_zero_copy(vc, rxs, rys, rws, rhs,
 						                           msc->info.width, msc->info.height, mode,
 						                           U_TILING_ORIGIN_TOP_LEFT)) {
-							zero_copy = true;
-							zc_texture = msc->images[img_idx];
+							/*
+							 * #1589: zero-copy hands the DP bytes it is
+							 * told are ENCODED, and owns no pass in which
+							 * to encode. Only an `_SRGB` swapchain's bytes
+							 * are — a UNORM / float one holds LINEAR values
+							 * (ADR-021 §6), so it takes the atlas path,
+							 * where the compose target does the encode. A
+							 * colour precondition on
+							 * u_tiling_can_zero_copy()'s RESULT, never a
+							 * second tiling rule (ADR-030).
+							 */
+							const bool color_needs_encode =
+							    !metal_format_is_srgb(msc->images[img_idx].pixelFormat) &&
+							    !color_legacy;
+							if (color_needs_encode) {
+								static bool zc_color_warned = false;
+								if (!zc_color_warned) {
+									zc_color_warned = true;
+									U_LOG_W("[ZC] refused: reason=color_needs_encode — a "
+									        "UNORM/float swapchain is scene-linear and "
+									        "owes the sRGB encode, which only the compose "
+									        "path can apply (#1589)");
+								}
+							} else {
+								zero_copy = true;
+								zc_texture = msc->images[img_idx];
+							}
 						}
 					}
 				}
@@ -4060,10 +4345,14 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	uint32_t atlas_cols = c->tile_columns;
 	uint32_t atlas_rows = c->tile_rows;
 
-	// Step 1: Render layers into atlas texture (skip if zero-copy)
+	// Step 1: Render layers into atlas texture (skip if zero-copy).
+	// ADR-044: a frame that owes an encode or a blend renders through the
+	// atlas's `_sRGB` view (encode on write, linear blending); the fast
+	// path writes the UNORM atlas directly, as before.
+	id<MTLTexture> atlas_target = compose_linear ? c->atlas_srgb_view : c->atlas_texture;
 	if (!zero_copy && c->atlas_texture != nil && c->layer_accum.layer_count > 0) {
 		MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
-		pass.colorAttachments[0].texture = c->atlas_texture;
+		pass.colorAttachments[0].texture = atlas_target;
 		pass.colorAttachments[0].loadAction = MTLLoadActionClear;
 		pass.colorAttachments[0].storeAction = MTLStoreActionStore;
 		// Clear to (0,0,0,0) when the app requested transparent background so
@@ -4074,9 +4363,10 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		// zone layers into the window-spanning atlas — the unzoned area
 		// must weave to nothing (transparent) so the MODE_ZONES composite
 		// (and any #803 feather ramp) blends toward the desktop.
-		pass.colorAttachments[0].clearColor = (c->transparent_background || zones_frame)
-		    ? MTLClearColorMake(0.0, 0.0, 0.0, 0.0)
-		    : MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
+		// Display-referred, decoded on the CPU when the target encodes.
+		pass.colorAttachments[0].clearColor =
+		    metal_display_referred_clear(0.0, 0.0, 0.0, (c->transparent_background || zones_frame) ? 0.0 : 1.0,
+		                                 compose_linear);
 		pass.depthAttachment.texture = c->depth_texture;
 		pass.depthAttachment.loadAction = MTLLoadActionClear;
 		pass.depthAttachment.storeAction = MTLStoreActionDontCare;
@@ -4271,37 +4561,8 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 					continue;
 				}
 
-				id<MTLTexture> src_tex = msc->images[img_idx];
-				if (src_tex == nil) {
+				if (msc->images[img_idx] == nil) {
 					continue;
-				}
-				// Select the array slice (imageArrayIndex) AND apply sRGB->UNORM
-				// passthrough in one view. Under single-pass-instanced the app
-				// submits an arraySize>1 texture with per-view slice 0/1; a plain
-				// 2D bind samples slice 0 for both eyes (flat output). A 2D view
-				// pinned to the slice binds correctly to the texture2d<float>
-				// shader — the Metal analog of the D3D12 #656 fix (mirrors
-				// D3D11/GL/VK). The sRGB->UNORM sample avoids the GPU
-				// auto-decoding sRGB->linear; the DP wants display-referred bytes
-				// (no-op for UNORM).
-				{
-					MTLPixelFormat view_fmt = metal_srgb_to_unorm(src_tex.pixelFormat);
-					if (src_tex.textureType == MTLTextureType2DArray) {
-						uint32_t array_index = layer->data.proj.v[eye].sub.array_index;
-						id<MTLTexture> v = [src_tex
-						    newTextureViewWithPixelFormat:view_fmt
-						                      textureType:MTLTextureType2D
-						                           levels:NSMakeRange(0, src_tex.mipmapLevelCount)
-						                           slices:NSMakeRange(array_index, 1)];
-						if (v != nil) {
-							src_tex = v;
-						}
-					} else if (view_fmt != src_tex.pixelFormat) {
-						id<MTLTexture> v = [src_tex newTextureViewWithPixelFormat:view_fmt];
-						if (v != nil) {
-							src_tex = v;
-						}
-					}
 				}
 
 				// Use sub-image norm_rect to sample correct region of source texture
@@ -4366,9 +4627,15 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				// the shared mode resolved above; depth stays disabled
 				// for zone draws — a later overlapping zone must neither
 				// be depth-rejected nor overwrite (D3D11 parity).
-				[encoder setRenderPipelineState:metal_proj_pipeline_for(c, mode)];
+				[encoder setRenderPipelineState:metal_proj_pipeline_for(c, mode, compose_linear)];
 				[encoder setDepthStencilState:(is_zone ? c->depth_stencil_state_disabled
 				                                       : c->depth_stencil_state)];
+				// The slice (imageArrayIndex — single-pass-instanced submits
+				// one array texture, slices 0/1) and the colour space in one
+				// view: as declared into the `_sRGB` target, non-decoding on
+				// the passthrough path (metal_layer_source_view).
+				id<MTLTexture> src_tex = metal_layer_source_view(
+				    msc->images[img_idx], layer->data.proj.v[eye].sub.array_index, compose_linear);
 				[encoder setFragmentTexture:src_tex atIndex:0];
 				[encoder setFragmentSamplerState:c->sampler_linear atIndex:0];
 
@@ -4423,6 +4690,7 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 				// Draw fullscreen triangle
 				[encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+				[src_tex release];
 			}
 		}
 
@@ -4443,7 +4711,7 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			cmd_buf = [c->command_queue commandBuffer];
 
 			MTLRenderPassDescriptor *ws_pass = [MTLRenderPassDescriptor renderPassDescriptor];
-			ws_pass.colorAttachments[0].texture = c->atlas_texture;
+			ws_pass.colorAttachments[0].texture = atlas_target;
 			ws_pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
 			ws_pass.colorAttachments[0].storeAction = MTLStoreActionStore;
 			ws_pass.depthAttachment.texture = c->depth_texture;
@@ -4569,39 +4837,16 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 					if (img_idx >= qmsc->image_count) {
 						continue;
 					}
-					id<MTLTexture> src_tex = qmsc->images[img_idx];
-					if (src_tex == nil) {
+					if (qmsc->images[img_idx] == nil) {
 						continue;
 					}
-
-					// Sample through a UNORM view so the GPU does NOT decode
-					// sRGB. The atlas is UNORM holding sRGB-ENCODED bytes, and
-					// zones/Local2D already blend in that encoded space; a
-					// quad that linearized here would blend against encoded
-					// neighbours and come out wrong. Array slice handled the
-					// same way as the projection pass.
-					{
-						MTLPixelFormat view_fmt = metal_srgb_to_unorm(src_tex.pixelFormat);
-						if (src_tex.textureType == MTLTextureType2DArray) {
-							uint32_t ai = q->sub.array_index;
-							id<MTLTexture> v = [src_tex
-							    newTextureViewWithPixelFormat:view_fmt
-							                      textureType:MTLTextureType2D
-							                           levels:NSMakeRange(
-							                                      0,
-							                                      src_tex.mipmapLevelCount)
-							                           slices:NSMakeRange(ai, 1)];
-							if (v != nil) {
-								src_tex = v;
-							}
-						} else if (view_fmt != src_tex.pixelFormat) {
-							id<MTLTexture> v =
-							    [src_tex newTextureViewWithPixelFormat:view_fmt];
-							if (v != nil) {
-								src_tex = v;
-							}
-						}
-					}
+					// A quad always shares a frame with other layers, so it
+					// is never on the fast path: sampled as declared and
+					// blended in linear light into the `_sRGB` target (the
+					// legacy hatch keeps the old non-decoding read). Array
+					// slice handled the same way as the projection pass.
+					id<MTLTexture> src_tex =
+					    metal_layer_source_view(qmsc->images[img_idx], q->sub.array_index, compose_linear);
 
 					// MVP exactly as the D3D11 renderer's render_quad_layer:
 					// model = pose * scale(size.x, size.y, 1), view from the
@@ -4676,7 +4921,7 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 					const enum comp_layer_blend_mode mode = comp_layer_blend_mode(data->flags);
 					comp_layer_blend_fold_opaque_cover(mode, qc.color_scale, qc.color_bias);
 
-					[encoder setRenderPipelineState:metal_quad_pipeline_for(c, mode)];
+					[encoder setRenderPipelineState:metal_quad_pipeline_for(c, mode, compose_linear)];
 					[encoder setDepthStencilState:c->depth_stencil_state_disabled];
 					[encoder setFragmentTexture:src_tex atIndex:0];
 					[encoder setFragmentSamplerState:c->sampler_linear atIndex:0];
@@ -4685,6 +4930,7 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 					[encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
 					            vertexStart:0
 					            vertexCount:4];
+					[src_tex release];
 				}
 			}
 
@@ -4724,20 +4970,15 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			if (img_idx >= msc->image_count) {
 				continue;
 			}
-			id<MTLTexture> src_tex = msc->images[img_idx];
-			if (src_tex == nil) {
+			if (msc->images[img_idx] == nil) {
 				continue;
 			}
-			// sRGB passthrough (see projection pass): sample through a UNORM view.
-			{
-				MTLPixelFormat unorm_fmt = metal_srgb_to_unorm(src_tex.pixelFormat);
-				if (unorm_fmt != src_tex.pixelFormat) {
-					id<MTLTexture> v = [src_tex newTextureViewWithPixelFormat:unorm_fmt];
-					if (v != nil) {
-						src_tex = v;
-					}
-				}
-			}
+			// Like a quad, a window-space layer is never on the fast path:
+			// sampled as its DECLARED format and blended in linear light into
+			// the `_sRGB` target (ADR-044 §7: the vk_native #1795 behaviour).
+			// An `_SRGB` HUD of encoded bytes reads back its bytes; a UNORM
+			// one is linear and is encoded once.
+			id<MTLTexture> src_tex = metal_layer_source_view(msc->images[img_idx], ws->sub.array_index, compose_linear);
 
 			// #1788: window-space layers BLEND over the projection content,
 			// same rule as D3D11/D3D12, vk_native and GL (#1786/#1787):
@@ -4752,7 +4993,9 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			bool ws_premultiplied =
 			    (layer->data.flags & XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT) == 0;
 			id<MTLRenderPipelineState> ws_pipeline =
-			    ws_premultiplied ? c->proj_premult_pipeline : c->proj_straight_pipeline;
+			    metal_proj_pipeline_for(c,
+			                            ws_premultiplied ? COMP_LAYER_BLEND_PREMULTIPLIED : COMP_LAYER_BLEND_STRAIGHT,
+			                            compose_linear);
 
 			// Source UV sub-rect (default to full texture if not specified)
 			struct xrt_normalized_rect nr = ws->sub.norm_rect;
@@ -4841,6 +5084,7 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				[encoder setFragmentBytes:&constants length:sizeof(constants) atIndex:0];
 				[encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 			}
+			[src_tex release];
 		}
 
 		[encoder endEncoding];
@@ -4897,8 +5141,13 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
-	// Step 2: Process atlas through display processor, or simple blit fallback
-	id<MTLTexture> atlas_src = zero_copy ? zc_texture : c->atlas_texture;
+	// Step 2: Process atlas through display processor, or simple blit fallback.
+	// Zero-copy hands the DP the app's own image. The DP is told the atlas is
+	// ENCODED and samples whatever it is handed, so an `_SRGB` image must
+	// reach it through its non-decoding view: decoding on that read would
+	// land linear values under an ENCODED stamp (ADR-044 §4).
+	id<MTLTexture> zc_raw_view = (zero_copy && zc_texture != nil) ? metal_layer_source_view(zc_texture, 0, false) : nil;
+	id<MTLTexture> atlas_src = zero_copy ? zc_raw_view : c->atlas_texture;
 	if (c->display_processor != NULL && atlas_src != nil) {
 		// Crop atlas to content dims before passing to DP.
 		// The DP expects texture dimensions to match content exactly.
@@ -5075,6 +5324,7 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			                                               c->placement_frame.present_origin_x,
 			                                               c->placement_frame.present_origin_y);
 		}
+		metal_dp_assert_atlas_encoding(c, XRT_ATLAS_ENCODING_ENCODED);
 		// Effective canvas (#439): while a mask is active this is the
 		// full client-window rect — the DP weaves every pixel the mask
 		// can select (Phase-2 rule).
@@ -5202,6 +5452,8 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// Reset layer accumulator
 	c->layer_accum.layer_count = 0;
 
+	[zc_raw_view release];
+
 	return XRT_SUCCESS;
 }
 
@@ -5295,10 +5547,14 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	c->implicit_mask_tex = nil;
 	free(c->implicit_mask_bytes);
 	c->implicit_mask_bytes = NULL;
+	[c->local2d_scratch_srgb release];
+	c->local2d_scratch_srgb = nil;
 	[c->local2d_scratch release];
 	c->local2d_scratch = nil;
 	[c->weave_scratch release];
 	c->weave_scratch = nil;
+	[c->backdrop_scratch_srgb release];
+	c->backdrop_scratch_srgb = nil;
 	[c->backdrop_scratch release]; // #491 part 3
 	c->backdrop_scratch = nil;
 	[c->local2d_premult_pipeline release];
@@ -5318,6 +5574,8 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	c->hud_blit_pipeline = nil;
 
 	// 6. Release Metal resources (MRR — explicit release)
+	[c->atlas_srgb_view release]; // a view: released before the atlas it aliases
+	c->atlas_srgb_view = nil;
 	[c->atlas_texture release];
 	c->atlas_texture = nil;
 	// XR_DXR_cursor_depth 3a readback slots (nil unless ever requested); the
@@ -5342,6 +5600,16 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	c->quad_premult_pipeline = nil;
 	[c->quad_opaque_pipeline release];
 	c->quad_opaque_pipeline = nil;
+	// ADR-044 _sRGB-target twins (all nil under the legacy hatch).
+	[c->srgb_pipes.projection release];
+	[c->srgb_pipes.proj_premult release];
+	[c->srgb_pipes.proj_straight release];
+	[c->srgb_pipes.quad_straight release];
+	[c->srgb_pipes.quad_premult release];
+	[c->srgb_pipes.quad_opaque release];
+	[c->srgb_pipes.local2d_premult release];
+	[c->srgb_pipes.local2d_unpremult release];
+	memset(&c->srgb_pipes, 0, sizeof(c->srgb_pipes));
 	[c->blit_pipeline release];
 	c->blit_pipeline = nil;
 	[c->sampler_linear release];
@@ -5839,6 +6107,11 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 		U_LOG_W("System atlas worst-case: %ux%u (fallback was %ux%u)",
 		        atlas_w, atlas_h, pixel_width, pixel_height);
 	}
+
+	// ADR-044: state the colour regime once (the evidence line a capture is
+	// judged against), and that no atlas encoding has been declared yet.
+	u_color_log_state_once("metal");
+	c->dp_atlas_encoding_latched = -1;
 
 	// Compile shaders
 	if (!compile_shaders(c)) {
