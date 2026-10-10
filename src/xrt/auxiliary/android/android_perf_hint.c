@@ -38,6 +38,7 @@ typedef APerformanceHintSession *(*pfn_create_session)(APerformanceHintManager *
 typedef int (*pfn_update_target)(APerformanceHintSession *, int64_t);
 typedef int (*pfn_report_actual)(APerformanceHintSession *, int64_t);
 typedef void (*pfn_close_session)(APerformanceHintSession *);
+typedef int64_t (*pfn_get_preferred_rate)(APerformanceHintManager *);
 
 static struct
 {
@@ -48,6 +49,7 @@ static struct
 	pfn_update_target update_target;
 	pfn_report_actual report_actual;
 	pfn_close_session close_session;
+	pfn_get_preferred_rate get_preferred_rate; // diagnostics only; may be NULL
 } adpf;
 
 static void
@@ -70,6 +72,8 @@ resolve_adpf(void)
 	adpf.update_target = (pfn_update_target)dlsym(lib, "APerformanceHint_updateTargetWorkDuration");
 	adpf.report_actual = (pfn_report_actual)dlsym(lib, "APerformanceHint_reportActualWorkDuration");
 	adpf.close_session = (pfn_close_session)dlsym(lib, "APerformanceHint_closeSession");
+	// API 33, diagnostics only (#1917) — not part of adpf.ok.
+	adpf.get_preferred_rate = (pfn_get_preferred_rate)dlsym(lib, "APerformanceHint_getPreferredUpdateRateNanos");
 
 	adpf.ok = adpf.get_manager != NULL && adpf.create_session != NULL && adpf.update_target != NULL &&
 	          adpf.report_actual != NULL && adpf.close_session != NULL;
@@ -102,7 +106,16 @@ android_perf_hint_session_create(int32_t tid, int64_t target_duration_ns)
 	int32_t thread_ids[1] = {tid};
 	APerformanceHintSession *ndk_session = adpf.create_session(manager, thread_ids, 1, target_duration_ns);
 	if (ndk_session == NULL) {
-		U_LOG_W("ADPF: createSession failed; perf hints off");
+		// #1917: the manager's preferred update rate tells the two failure causes apart.
+		// -1 means the Power HAL has no hint-session support (dumpsys performance_hint →
+		// "HAL Support: false"); a positive rate means sessions exist and our arguments
+		// (tid, target) are what got rejected.
+		int64_t preferred_ns = adpf.get_preferred_rate != NULL ? adpf.get_preferred_rate(manager) : -2;
+		U_LOG_W(
+		    "ADPF: createSession failed (tid %d, target %.2f ms, preferred rate %lld ns%s); perf hints off "
+		    "[preferred rate -1 => Power HAL has no hint sessions; >0 => check our arguments]",
+		    tid, target_duration_ns / 1e6, (long long)preferred_ns,
+		    adpf.get_preferred_rate != NULL ? "" : " (getPreferredUpdateRateNanos unresolved)");
 		return NULL;
 	}
 

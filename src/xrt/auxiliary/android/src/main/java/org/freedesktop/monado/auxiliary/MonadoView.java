@@ -20,6 +20,7 @@ import android.hardware.display.DisplayManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.os.SystemClock;
 import android.util.DisplayMetrics;
 import android.util.Log;
@@ -191,7 +192,11 @@ public class MonadoView extends SurfaceView
             systemUiController = new SystemUiController(activity.getWindow().getDecorView());
             systemUiController.hide();
             pinDisplayModeIfRequested(activity);
+            applySustainedPerformanceIfRequested(activity);
             registerHostDestroyHook(activity);
+        } else if (isSustainedPerfRequested() && !sustainedPerfOverlaySkipLogged) {
+            sustainedPerfOverlaySkipLogged = true;
+            Log.w(TAG, "MonadoView: debug.dxr.sustained_perf=1 but this is a service-owned overlay (no host Activity); skipped (#1917)");
         }
         SurfaceHolder surfaceHolder = getHolder();
         surfaceHolder.addCallback(this);
@@ -1063,6 +1068,7 @@ public class MonadoView extends SurfaceView
      */
     @Keep
     public static void removeFromWindow(@NonNull MonadoView view) {
+        view.clearSustainedPerformance();
         view.unregisterHostDestroyHook();
         view.detachFromWindow();
     }
@@ -1167,6 +1173,7 @@ public class MonadoView extends SurfaceView
                             return;
                         }
                         Log.i(TAG, "Host activity destroyed — removing the hosted window (#1389)");
+                        clearSustainedPerformance();
                         unregisterHostDestroyHook();
                         detachFromWindow();
                     }
@@ -1479,6 +1486,93 @@ public class MonadoView extends SurfaceView
             // Never let a display-policy nicety take down session creation.
             Log.w(TAG, "MonadoView: display-mode pin failed: " + e);
         }
+    }
+
+    // ---------------------------------------------------------------- sustained perf (#1917)
+
+    /** Set once a service-owned overlay has logged that it skipped the sustained-perf request. */
+    private static boolean sustainedPerfOverlaySkipLogged = false;
+
+    /** True once setSustainedPerformanceMode(true) was applied to the host window. UI thread. */
+    private boolean sustainedPerfApplied = false;
+
+    /** Reads {@code debug.dxr.sustained_perf} ("1" = on) via the same hidden-API route as above. */
+    private static boolean isSustainedPerfRequested() {
+        try {
+            Class<?> sp = Class.forName("android.os.SystemProperties");
+            String v =
+                    (String) sp.getMethod("get", String.class)
+                            .invoke(null, "debug.dxr.sustained_perf");
+            return "1".equals(v);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** Run on the UI thread: inline when already there, otherwise posted to the main looper. */
+    private static void runOnUiThread(@NonNull Runnable r) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            r.run();
+        } else {
+            new Handler(Looper.getMainLooper()).post(r);
+        }
+    }
+
+    /**
+     * EXPERIMENT (#1917), default OFF: ask for sustained-performance mode on the host window.
+     *
+     * <p>Measured on the Lume phone and the NP02J (Android 13, Adreno 740): the Power HAL has no
+     * ADPF hint sessions ({@code dumpsys performance_hint} → HAL Support: false), so
+     * {@code APerformanceHint_createSession} fails, and the msm-adreno-tz governor parks the GPU at
+     * 220 MHz (max 680) under a submit→wait app. Fixed-performance mode changed nothing; this is the
+     * last app-reachable lever. It trades peak clocks for a stable sustainable level, so it stays
+     * behind {@code debug.dxr.sustained_perf=1} until measured.
+     */
+    private void applySustainedPerformanceIfRequested(@NonNull final Activity activity) {
+        if (!isSustainedPerfRequested()) {
+            return;
+        }
+        runOnUiThread(
+                () -> {
+                    boolean supported = false;
+                    boolean applied = false;
+                    try {
+                        PowerManager pm =
+                                (PowerManager) activity.getSystemService(Context.POWER_SERVICE);
+                        supported = pm != null && pm.isSustainedPerformanceModeSupported();
+                        if (supported) {
+                            activity.getWindow().setSustainedPerformanceMode(true);
+                            applied = true;
+                            sustainedPerfApplied = true;
+                        }
+                    } catch (Exception e) {
+                        Log.w(TAG, "MonadoView: setSustainedPerformanceMode failed: " + e);
+                    }
+                    Log.w(TAG, "MonadoView: sustained-perf (#1917) supported="
+                            + (supported ? "yes" : "no") + " applied=" + (applied ? "yes" : "no")
+                            + " activity=" + activity.getClass().getName());
+                });
+    }
+
+    /** Undo {@link #applySustainedPerformanceIfRequested}; no-op unless it was applied. */
+    private void clearSustainedPerformance() {
+        final Activity activity = hostActivity;
+        if (activity == null) {
+            return;
+        }
+        runOnUiThread(
+                () -> {
+                    if (!sustainedPerfApplied) {
+                        return;
+                    }
+                    sustainedPerfApplied = false;
+                    try {
+                        activity.getWindow().setSustainedPerformanceMode(false);
+                        Log.w(TAG, "MonadoView: sustained-perf cleared (#1917)");
+                    } catch (Exception e) {
+                        Log.w(TAG, "MonadoView: clearing sustained-perf failed: " + e);
+                    }
+                });
     }
 
 }
