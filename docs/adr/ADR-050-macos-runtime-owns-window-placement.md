@@ -114,6 +114,19 @@ for it. This is the default; an app can opt out.
   it touches the cursor only inside the resize zones, and on leaving restores the cursor it
   replaced **only if its own cursor is still current**. Same opt-outs as the gesture
   (`DXR_MACOS_NATIVE_DRAG=1`, the app-owned bit), since both live in the placement object.
+- **Rule: an activating click must reach AppKit.** A native title-bar or edge click on a window
+  that is not key activates the app and makes the window key. Measured on macOS 26: the
+  WindowServer may mark the app active before delivery, but AppKit makes the window key only when
+  the mouse-down itself passes through `-[NSApp sendEvent:]`. Swallowed, the app is left active
+  with **no key window** (no keyboard input, no resize cursor), and neither
+  `makeKeyAndOrderFront:`, `makeKeyWindow`, `[NSApp activate]` nor `NSRunningApplication`
+  activation, at once or retried later, repairs it. So when the window is not key the monitor
+  still starts the gesture but returns the mouse-down to AppKit (after `[NSApp activate]` /
+  `activateIgnoringOtherApps:` if the app is inactive), retargeted to the title-bar centre when it
+  was an edge click so AppKit does not start its own live resize. `movable = NO` keeps AppKit from
+  dragging; the drags and the mouse-up still go through the monitor, so a click-and-drag on a
+  background window activates it and moves / resizes it in one gesture (verified: 20 atomic
+  steps, 0 native-resize tripwires, rendering uninterrupted).
 - **App-initiated moves.** A frame change made outside this path (`setFrameOrigin` from the app, a
   display reconfiguration) is detected at the next present by comparing the window frame with the
   last frame the runtime applied; the new origin is snapped relative to the last **presented**

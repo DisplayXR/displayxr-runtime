@@ -517,7 +517,53 @@ on_lattice(int32_t anchor, int32_t v, uint32_t q)
 		        (e & EDGE_B) ? " B" : "", content_start.size.width, content_start.size.height, anchor_px_x,
 		        anchor_px_y);
 	}
-	// What the swallowed click would have done.
+	// What the swallowed click would have done. A native title-bar / edge
+	// click on a window that is not key ACTIVATES the app and makes the
+	// window key. Measured on macOS 26 (sim-display, a second app
+	// frontmost): the WindowServer marks the app active before the event is
+	// delivered, but AppKit completes the activation (the window becoming
+	// key) only when the mouse-down itself goes through -[NSApp sendEvent:].
+	// Swallowed, the app is left active with NO key window, and neither
+	// makeKeyAndOrderFront:, makeKeyWindow, [NSApp activate] nor
+	// NSRunningApplication activation (at once or retried later) changes
+	// that: no keyboard input, no resize cursor. So an activating click is
+	// handed to AppKit, retargeted to the title-bar centre (an edge click as
+	// it stands would start AppKit's own live resize). The window is
+	// movable = NO, so AppKit does not drag it; the gesture stays ours (the
+	// drags and the mouse-up still pass through this monitor).
+	if (!NSApp.isActive) {
+		if (@available(macOS 14.0, *)) {
+			[NSApp activate];
+		} else {
+			[NSApp activateIgnoringOtherApps:YES];
+		}
+	}
+	if (!win.isKeyWindow) {
+		NSEvent *fwd = ev;
+		if (e != 0) {
+			const NSRect f = win.frame;
+			const NSRect c = [win contentRectForFrameRect:f];
+			const NSPoint title_mid = NSMakePoint(NSMidX(f), (NSMaxY(c) + NSMaxY(f)) * 0.5);
+			NSEvent *t = [NSEvent mouseEventWithType:ev.type
+			                                location:[win convertPointFromScreen:title_mid]
+			                           modifierFlags:ev.modifierFlags
+			                               timestamp:ev.timestamp
+			                            windowNumber:ev.windowNumber
+			                                 context:nil
+			                             eventNumber:ev.eventNumber
+			                              clickCount:ev.clickCount
+			                                pressure:ev.pressure];
+			if (t != nil) {
+				fwd = t;
+			}
+		}
+		if (trace_enabled()) {
+			U_LOG_W("placement: activating click — mouse-down handed to AppKit%s so the window becomes key "
+			        "(active=%d)",
+			        fwd != ev ? " (retargeted to the title bar)" : "", NSApp.isActive ? 1 : 0);
+		}
+		return fwd;
+	}
 	[win makeKeyAndOrderFront:nil];
 	return nil;
 }
@@ -582,6 +628,14 @@ update_resize_cursor(DXRMetalPlacement *pl)
 {
 	NSWindow *win = pl.window;
 	unsigned e = 0;
+	if (trace_enabled()) {
+		static int last_active = -1;
+		const int active = NSApp.isActive ? 1 : 0;
+		if (active != last_active) {
+			last_active = active;
+			U_LOG_W("placement: app %s", active ? "active" : "inactive (resize cursor off)");
+		}
+	}
 	if (pl->gesture == 2) {
 		e = pl->edges; // keep the cursor for the whole resize, wherever the mouse is
 	} else if (win != nil && pl->gesture == 0 && !atomic_load(&pl->closed) && NSApp.isActive && win.isKeyWindow &&
