@@ -413,6 +413,30 @@ target_plugin_get_monitor_record(uint64_t monitor_id,
 bool
 target_plugin_get_monitor_key(uint64_t monitor_id, char *out_key, size_t key_cap, char *out_device, size_t device_cap);
 
+/*!
+ * One plug-in that claimed a monitor (at any confidence) in the last
+ * @ref target_plugin_resolve_displays: a plug-in that can drive it.
+ */
+struct target_plugin_screen_candidate
+{
+	char plugin_id[64];  //!< The claiming plug-in's id.
+	uint32_t confidence; //!< `enum xrt_display_claim_confidence` value of its claim.
+};
+
+/*!
+ * Every plug-in whose `probe_displays` claimed @p monitor_id in the last
+ * @ref target_plugin_resolve_displays, in source order (ascending ProbeOrder),
+ * winner or not (display dashboard: the per-screen selector's options).
+ * Writes up to @p max entries and their count to @p out_count. False when the
+ * id is unknown, no resolve has run, or the last resolve asked only the active
+ * plug-in (the POSIX claim-source shortcut), so the list would be incomplete.
+ */
+bool
+target_plugin_get_monitor_candidates(uint64_t monitor_id,
+                                     struct target_plugin_screen_candidate *out,
+                                     uint32_t max,
+                                     uint32_t *out_count);
+
 struct xrt_plugin_display_info;
 struct os_display_edid_monitor;
 struct os_display_panel_hint;

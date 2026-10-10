@@ -3232,6 +3232,11 @@ static struct
 	char key[TARGET_SCREEN_KEY_MAX];
 	//! OS device name the key was qualified with (Windows GDI name, else output / connector).
 	char device_name[64];
+	//! Every plug-in that claimed this monitor in the last resolve, in source order (dashboard).
+	struct target_plugin_screen_candidate cands[TARGET_PLUGIN_MAX_SOURCES];
+	uint32_t cand_count;
+	//! @ref cands is from a resolve over every loadable plug-in (not the POSIX active-only shortcut).
+	bool cands_valid;
 } g_monitor_side[XRT_DP_REGISTRY_MAX_ENTRIES];
 static uint32_t g_monitor_side_count = 0;
 
@@ -3368,6 +3373,8 @@ target_plugin_build_descriptors(const struct os_display_edid_list *list,
 	struct target_screen_key_input key_in[XRT_DP_REGISTRY_MAX_ENTRIES];
 	for (uint32_t i = 0; i < g_monitor_side_count; i++) {
 		g_monitor_side[i].monitor_id = out[i].monitor_id;
+		g_monitor_side[i].cand_count = 0;
+		g_monitor_side[i].cands_valid = false;
 		g_monitor_side[i].mon = list->monitors[i];
 		g_monitor_side[i].desc = out[i];
 		monitor_device_name(&list->monitors[i], g_monitor_side[i].device_name,
@@ -3408,6 +3415,41 @@ target_plugin_get_monitor_key(uint64_t monitor_id, char *out_key, size_t key_cap
 			(void)snprintf(out_device, device_cap, "%s", g_monitor_side[i].device_name);
 		}
 		found = true;
+		break;
+	}
+	if (g_refresh_mutex_initialized) {
+		os_mutex_unlock(&g_refresh_mutex);
+	}
+	return found;
+}
+
+bool
+target_plugin_get_monitor_candidates(uint64_t monitor_id,
+                                     struct target_plugin_screen_candidate *out,
+                                     uint32_t max,
+                                     uint32_t *out_count)
+{
+	bool found = false;
+	if (out_count != NULL) {
+		*out_count = 0;
+	}
+	if (g_refresh_mutex_initialized) {
+		os_mutex_lock(&g_refresh_mutex);
+	}
+	for (uint32_t i = 0; i < g_monitor_side_count; i++) {
+		if (g_monitor_side[i].monitor_id != monitor_id) {
+			continue;
+		}
+		if (g_monitor_side[i].cands_valid) {
+			uint32_t n = 0;
+			for (; out != NULL && n < g_monitor_side[i].cand_count && n < max; n++) {
+				out[n] = g_monitor_side[i].cands[n];
+			}
+			if (out_count != NULL) {
+				*out_count = n;
+			}
+			found = true;
+		}
 		break;
 	}
 	if (g_refresh_mutex_initialized) {
@@ -3928,9 +3970,24 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 	// Query every source once for the full descriptor set.
 	static struct xrt_display_claim src_claims[TARGET_PLUGIN_MAX_SOURCES][XRT_DP_REGISTRY_MAX_ENTRIES];
 	uint32_t src_claim_count[TARGET_PLUGIN_MAX_SOURCES] = {0};
-	for (int s = 0; s < g_display_source_count; s++) {
+	// The same claims flattened for target_screen_collect_candidates.
+	static uint64_t src_mon[TARGET_PLUGIN_MAX_SOURCES][XRT_DP_REGISTRY_MAX_ENTRIES];
+	static uint32_t src_conf[TARGET_PLUGIN_MAX_SOURCES][XRT_DP_REGISTRY_MAX_ENTRIES];
+	struct target_screen_source_claims src_view[TARGET_PLUGIN_MAX_SOURCES];
+	const uint32_t src_count = g_display_source_count > 0 ? (uint32_t)g_display_source_count : 0;
+	for (uint32_t s = 0; s < src_count; s++) {
 		src_claim_count[s] =
 		    query_source_claims(&g_display_sources[s], descriptors, dn, src_claims[s], XRT_DP_REGISTRY_MAX_ENTRIES);
+		for (uint32_t c = 0; c < src_claim_count[s]; c++) {
+			src_mon[s][c] = src_claims[s][c].monitor_id;
+			src_conf[s][c] = (uint32_t)src_claims[s][c].confidence;
+		}
+		const struct xrt_plugin_iface *sif = g_display_sources[s].iface;
+		src_view[s].plugin_id = (sif != NULL && sif->id != NULL) ? sif->id : "";
+		src_view[s].is_active = g_active_iface != NULL && sif == g_active_iface;
+		src_view[s].monitor_ids = src_mon[s];
+		src_view[s].confidences = src_conf[s];
+		src_view[s].count = src_claim_count[s];
 	}
 
 	// #791: an explicit PreferredPlugin override (`displayxr-cli dp use <id>`,
@@ -3979,21 +4036,30 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 		struct target_screen_candidate cands[TARGET_PLUGIN_MAX_SOURCES];
 		const struct plugin_display_source *cand_src[TARGET_PLUGIN_MAX_SOURCES];
 		const struct xrt_display_claim *cand_claim[TARGET_PLUGIN_MAX_SOURCES];
-		uint32_t nc = 0;
-		for (int s = 0; s < g_display_source_count && nc < TARGET_PLUGIN_MAX_SOURCES; s++) {
-			for (uint32_t c = 0; c < src_claim_count[s]; c++) {
-				if (src_claims[s][c].monitor_id != desc->monitor_id) {
-					continue;
-				}
-				const struct xrt_plugin_iface *sif = g_display_sources[s].iface;
-				cands[nc].plugin_id = (sif != NULL && sif->id != NULL) ? sif->id : "";
-				cands[nc].confidence = (uint32_t)src_claims[s][c].confidence;
-				cands[nc].is_active = g_active_iface != NULL && sif == g_active_iface;
-				cand_src[nc] = &g_display_sources[s];
-				cand_claim[nc] = &src_claims[s][c];
-				nc++;
-				break; // one claim per source per monitor
+		uint32_t cand_s[TARGET_PLUGIN_MAX_SOURCES];
+		uint32_t cand_c[TARGET_PLUGIN_MAX_SOURCES];
+		const uint32_t nc = target_screen_collect_candidates(src_view, src_count, desc->monitor_id, cands,
+		                                                     cand_s, cand_c, TARGET_PLUGIN_MAX_SOURCES);
+		for (uint32_t i = 0; i < nc; i++) {
+			cand_src[i] = &g_display_sources[cand_s[i]];
+			cand_claim[i] = &src_claims[cand_s[i]][cand_c[i]];
+		}
+
+		// The dashboard's per-screen selector lists exactly these: the
+		// plug-ins that can drive this monitor. Complete only when every
+		// loadable plug-in was asked (not the POSIX active-only shortcut).
+		for (uint32_t i = 0; i < g_monitor_side_count; i++) {
+			if (g_monitor_side[i].monitor_id != desc->monitor_id) {
+				continue;
 			}
+			for (uint32_t k = 0; k < nc; k++) {
+				(void)snprintf(g_monitor_side[i].cands[k].plugin_id,
+				               sizeof(g_monitor_side[i].cands[k].plugin_id), "%s", cands[k].plugin_id);
+				g_monitor_side[i].cands[k].confidence = cands[k].confidence;
+			}
+			g_monitor_side[i].cand_count = nc;
+			g_monitor_side[i].cands_valid = !g_display_sources_active_only;
+			break;
 		}
 
 		// This monitor's names, for the pin match (the side table is

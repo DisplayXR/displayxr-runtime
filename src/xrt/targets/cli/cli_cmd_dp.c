@@ -158,6 +158,20 @@ cmd_list(int argc, const char **argv)
 			add_str_or_null(o, "preferred_source", u_status_pref_source_str(s->claim.preferred_source));
 			cJSON_AddBoolToObject(o, "forced", s->claim.forced);
 			cJSON_AddStringToObject(o, "apply", u_status_apply_str(s->claim.apply));
+			// Every plug-in that claimed this screen, at any confidence: what
+			// can drive it (the dashboard's per-screen selector). Absent when
+			// the resolve did not ask every plug-in (POSIX active-only shortcut).
+			struct target_plugin_screen_candidate cands[MAX_DPS];
+			uint32_t nc = 0;
+			if (target_plugin_get_monitor_candidates(s->id, cands, MAX_DPS, &nc)) {
+				cJSON *carr = cJSON_AddArrayToObject(o, "candidates");
+				for (uint32_t k = 0; k < nc; k++) {
+					cJSON *c = cJSON_CreateObject();
+					cJSON_AddStringToObject(c, "plugin_id", cands[k].plugin_id);
+					cJSON_AddNumberToObject(c, "confidence", (double)cands[k].confidence);
+					cJSON_AddItemToArray(carr, c);
+				}
+			}
 			cJSON_AddItemToArray(sarr, o);
 		}
 		char *out = cJSON_Print(root);
