@@ -55,6 +55,18 @@
  * Closing the probe must destroy only its own DP: the panel keeps its mode and
  * the split does not change.
  *
+ * ── Spec v19 per-screen parts (#1884, ADR-047 Amendment 4) ──────────────────
+ *
+ * On a runtime reporting spec >= 19 the probe chains XrWeaveOutputRectPartsDXR
+ * on every submit and logs, on every geometry change (the struct's
+ * `generation`), how the service split the window: each screen segment
+ * (display id, window rect, woven or flat, its eyes) and each part of the
+ * weave rect. Run with `--rect=full` on a two-panel box and drag the window
+ * across the seam: the log must go from `segments=0` (one panel) to
+ * `segments=2` with two parts whose eyes differ (each panel's own tracker),
+ * and back. The probe itself still renders ONE eye pair (the base eyes) —
+ * it proves the runtime half; rendering per part is the browser's job.
+ *
  * ── Spec v8 per-region hardware wish (browser#88) ────────────────────────────
  *
  * Two flags drive the two ways to declare a region PHYSICALLY FLAT, so the wish
@@ -1377,6 +1389,14 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 		}
 
 		XrWeaveOutputDXR out = {XR_TYPE_WEAVE_OUTPUT_DXR};
+		// v19 (#1884): ask for the per-screen split of the weave rect. static:
+		// the struct is ~4 KB and is re-read every frame.
+		static XrWeaveOutputRectPartsDXR parts;
+		if (g_weaveSpecVersion >= 19) {
+			memset(&parts, 0, sizeof(parts));
+			parts.type = XR_TYPE_WEAVE_OUTPUT_RECT_PARTS_DXR;
+			out.next = &parts;
+		}
 
 		LARGE_INTEGER t0, t1;
 		QueryPerformanceCounter(&t0);
@@ -1408,6 +1428,38 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 			} else {
 				LOG_INFO("v8 XrWeaveSubmitFlatRegionsDXR CHAIN NOT SENT (--flat-band absent) — "
 				         "wish = the whole weave rect, i.e. pre-v8 behaviour");
+			}
+		}
+
+		// v19: log the per-screen split on a geometry change only (generation).
+		if (g_weaveSpecVersion >= 19) {
+			static uint64_t s_lastGen = UINT64_MAX;
+			static uint32_t s_lastSegs = UINT32_MAX;
+			if (parts.generation != s_lastGen || parts.segmentCount != s_lastSegs) {
+				s_lastGen = parts.generation;
+				s_lastSegs = parts.segmentCount;
+				LOG_INFO("v19 per-screen: segments=%u parts=%u generation=%llu%s", parts.segmentCount,
+				         parts.partCount, (unsigned long long)parts.generation,
+				         parts.segmentCount == 0 ? " (one display processor: base eyes apply)" : "");
+				for (uint32_t k = 0; k < parts.segmentCount; k++) {
+					const XrWeaveScreenSegmentDXR &g = parts.segments[k];
+					LOG_INFO("  segment %u: display 0x%016llx%s window %d,%d %dx%d screen %d,%d %s "
+					         "eyes(valid=%d track=%d n=%u L=%.4f,%.4f,%.4f)",
+					         k, (unsigned long long)g.displayId, g.isPrimary ? " (primary)" : "",
+					         g.windowRect.offset.x, g.windowRect.offset.y, g.windowRect.extent.width,
+					         g.windowRect.extent.height, g.screenRect.offset.x, g.screenRect.offset.y,
+					         g.woven ? "woven" : "FLAT 2D", g.eyesValid, g.eyesTracking, g.eyeCount,
+					         g.eyeCount > 0 ? g.eyes[0].x : 0.0f, g.eyeCount > 0 ? g.eyes[0].y : 0.0f,
+					         g.eyeCount > 0 ? g.eyes[0].z : 0.0f);
+				}
+				for (uint32_t i = 0; i < parts.partCount; i++) {
+					const XrWeaveRectPartDXR &p = parts.parts[i];
+					LOG_INFO("  part %u: rect %u on segment %u — window %d,%d %dx%d, in-rect %d,%d, "
+					         "on-screen %d,%d",
+					         i, p.rectIndex, p.segmentIndex, p.windowRect.offset.x, p.windowRect.offset.y,
+					         p.windowRect.extent.width, p.windowRect.extent.height, p.rectRelative.offset.x,
+					         p.rectRelative.offset.y, p.screenRect.offset.x, p.screenRect.offset.y);
+				}
 			}
 		}
 
