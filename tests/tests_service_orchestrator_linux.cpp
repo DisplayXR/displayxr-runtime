@@ -100,6 +100,18 @@ service_hotkey_linux_unit_from_cgroup(const char *, char *out, unsigned out_size
 	return false;
 }
 
+// Controller-key queue stand-in (tests/fake_controller_key): the chord forward.
+namespace {
+std::vector<std::pair<uint32_t, uint32_t>> g_forwarded;
+}
+
+extern "C" void
+ipc_server_input_queue_push_controller_key(uint32_t vk_code, uint32_t modifiers)
+{
+	std::lock_guard<std::mutex> l(g_hk_lock);
+	g_forwarded.emplace_back(vk_code, modifiers);
+}
+
 
 /*
  *
@@ -283,9 +295,20 @@ TEST_CASE("hotkey press spawns the controller; a press while running is a no-op"
 	press();
 	REQUIRE(f.wait_lines(1));
 	REQUIRE(wait_pid(true));
-	press(); // controller running: it handles the chord itself
+	{
+		std::lock_guard<std::mutex> l(g_hk_lock);
+		CHECK(g_forwarded.empty()); // the spawning press is not forwarded
+	}
+	press(); // controller running: no second spawn, the chord goes to it
 	std::this_thread::sleep_for(std::chrono::milliseconds(300));
 	CHECK(f.lines().size() == 1);
+	{
+		std::lock_guard<std::mutex> l(g_hk_lock);
+		REQUIRE(g_forwarded.size() == 1);
+		CHECK(g_forwarded[0].first == 0x20u);  // VK_SPACE
+		CHECK(g_forwarded[0].second == 0x2u); // bit1 = Ctrl
+		g_forwarded.clear();
+	}
 
 	// Suspend is forwarded to the backend.
 	CHECK(service_orchestrator_request_hotkey_suspend(true));
@@ -396,4 +419,16 @@ TEST_CASE("controller actions are fire-and-forget and reaped", "[service][orches
 		std::this_thread::sleep_for(std::chrono::milliseconds(20));
 	}
 	CHECK(reaped);
+}
+
+TEST_CASE("controller-key modifier mapping (bit0 Shift, bit1 Ctrl, bit2 Alt)", "[service][orchestrator][linux]")
+{
+	CHECK(service_orchestrator_controller_key_mods(SERVICE_HOTKEY_MOD_CTRL) == 0x2u);
+	CHECK(service_orchestrator_controller_key_mods(SERVICE_HOTKEY_MOD_SHIFT) == 0x1u);
+	CHECK(service_orchestrator_controller_key_mods(SERVICE_HOTKEY_MOD_ALT) == 0x4u);
+	CHECK(service_orchestrator_controller_key_mods(SERVICE_HOTKEY_MOD_CTRL | SERVICE_HOTKEY_MOD_SHIFT |
+	                                               SERVICE_HOTKEY_MOD_ALT) == 0x7u);
+	// No Win bit in the controller-key encoding: dropped.
+	CHECK(service_orchestrator_controller_key_mods(SERVICE_HOTKEY_MOD_WIN) == 0u);
+	CHECK(service_orchestrator_controller_key_mods(SERVICE_HOTKEY_MOD_WIN | SERVICE_HOTKEY_MOD_ALT) == 0x4u);
 }
