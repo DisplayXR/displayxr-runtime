@@ -157,9 +157,11 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         tail = ["compositor_segments_enable", "compositor_get_segment_metrics", "compositor_set_view_routing"]
         i = names.index(tail[0])
         self.assertEqual(names[i:i + 3], tail)
-        # Only later appends may follow them (ADR-051's status calls, then
-        # display dashboard phase 7's re-probe request).
-        self.assertTrue(all(n.startswith("system_get_") or n == "system_request_display_reprobe"
+        # Only later appends may follow them (ADR-051's status calls, display
+        # dashboard phase 7's re-probe request, phase 8's launch settings).
+        later = ("system_request_display_reprobe", "system_reload_service_config", "system_workspace_launch",
+                 "system_workspace_hotkey_suspend")
+        self.assertTrue(all(n.startswith("system_get_") or n in later
                             for n in names[i + 3:]), names[i + 3:])
         enable = self._call("compositor_segments_enable")
         self.assertEqual([(a.name, a.typename) for a in enable.in_args], [("pinned_display_id", "uint64_t")])
@@ -177,7 +179,9 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # call, one client row per call — each carrying its generation.
         names = [c.name for c in self.p.calls]
         tail = ["system_get_status_generation", "system_get_status_snapshot", "system_get_client_segments"]
-        self.assertEqual(names[-4:-1], tail)
+        i = names.index(tail[0])
+        self.assertEqual(names[i:i + 3], tail)
+        self.assertEqual(names[i + 3], "system_request_display_reprobe")
         gen = self._call("system_get_status_generation")
         self.assertEqual(gen.in_args, [])
         self.assertEqual([(a.name, a.typename) for a in gen.out_args],
@@ -198,16 +202,47 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
 
     def test_reprobe_request_is_appended(self):
         # Display dashboard phase 7: `dp use|reset --screen` asks the running
-        # service to re-probe now. Session-free, DIAG only, no payload — and
-        # the LAST call, so every earlier command keeps its enum value.
+        # service to re-probe now. Session-free, DIAG only, no payload —
+        # appended, so every earlier command keeps its enum value (only phase
+        # 8's three calls follow it).
         names = [c.name for c in self.p.calls]
-        self.assertEqual(names[-1], "system_request_display_reprobe")
+        self.assertEqual(names[-4], "system_request_display_reprobe")
         call = self._call("system_request_display_reprobe")
         self.assertEqual(call.in_args, [])
         self.assertEqual(call.out_args, [])
         self.assertFalse(call.in_handles)
         self.assertFalse(call.out_handles)
         self.assertFalse(call.varlen)
+
+    def test_workspace_launch_calls_are_appended(self):
+        # Display dashboard phase 8: `workspace set` asks the running service
+        # to re-apply service.json (no payload), `workspace launch <id>` to
+        # spawn a controller through the hotkey's own path (the id in, a launch
+        # status out), and a hotkey-capture box takes the launch hook out /
+        # puts it back (one bool in). Session-free, DIAG only, the LAST three.
+        names = [c.name for c in self.p.calls]
+        self.assertEqual(names[-3:], ["system_reload_service_config", "system_workspace_launch",
+                                      "system_workspace_hotkey_suspend"])
+        suspend = self._call("system_workspace_hotkey_suspend")
+        self.assertEqual([(a.name, a.typename) for a in suspend.in_args], [("suspend", "bool")])
+        self.assertEqual(suspend.out_args, [])
+        self.assertFalse(suspend.in_handles or suspend.out_handles or suspend.varlen)
+        reload_call = self._call("system_reload_service_config")
+        self.assertEqual(reload_call.in_args, [])
+        self.assertEqual(reload_call.out_args, [])
+        launch = self._call("system_workspace_launch")
+        self.assertEqual([(a.name, a.typename) for a in launch.in_args],
+                         [("controller", "struct ipc_workspace_controller_id")])
+        self.assertEqual([(a.name, a.typename) for a in launch.out_args], [("status", "uint32_t")])
+        for call in (reload_call, launch):
+            self.assertFalse(call.in_handles, call.name)
+            self.assertFalse(call.out_handles, call.name)
+            self.assertFalse(call.varlen, call.name)
+        # The generated server dispatch reaches both handlers.
+        text = self._generate("generate_server_c", "ipc_server_generated.c")
+        self.assertIn("ipc_handle_system_reload_service_config(", text)
+        self.assertIn("ipc_handle_system_workspace_launch(", text)
+        self.assertIn("ipc_handle_system_workspace_hotkey_suspend(", text)
 
 
 if __name__ == "__main__":
