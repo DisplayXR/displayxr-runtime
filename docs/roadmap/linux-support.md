@@ -577,6 +577,25 @@ window on a scaled 22.04 desktop cannot present a 1:1 buffer and the runtime
 degrades it to flat 2D (see *Refuse rather than resample*, #1595). **X11 is the
 recommended session on 22.04.**
 
+### Phase 4c — workspace orchestration (the Linux shell)
+
+The service orchestrates a registered workspace controller (the DisplayXR Shell's
+Linux port) like Windows and macOS: discovery from the POSIX manifest roots
+(`/usr/share/displayxr/WorkspaceControllers/` for a `.deb`), spawn with
+`--service-managed` on the launch hotkey / the dashboard's *Launch now* /
+`displayxr-cli workspace launch`, crash respawn in the legacy `enable` mode, live
+`service.json` reload, the hotkey-capture suspend, and `workspace_activate`
+authenticated against the spawned PID. The launch chord is held by the GNOME Shell
+extension (version 13, `org.displayxr.WorkspaceHotkey1`), not the service: the service
+is socket-activated and idle-exits, so a press with no service running makes the
+extension start `displayxr.service` and hand the press to it. X11 without the
+extension: a root-window grab while the service runs. Design and lifecycle:
+`docs/specs/runtime/workspace-controller-registration.md` § *Linux*. Unit-tested
+(`tests_service_orchestrator_linux`, `tests_service_hotkey_linux[_dbus]`,
+`tests_service_client_class`, `scripts/test_gnome_extension_workspace_hotkey.js`);
+**not yet run on a desktop** — the v13 extension has not been loaded in a live GNOME
+Shell, and there is no Linux shell build to spawn yet.
+
 ### Conformance — the Linux CTS arms (#1527)
 
 Until #1527 the platform had **no conformance coverage at all**: `build-linux.yml`
