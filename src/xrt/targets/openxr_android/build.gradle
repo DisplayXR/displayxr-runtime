@@ -412,8 +412,15 @@ android {
             // discovery never mistakes it for a DP.
             // displayxr-service: the service .so hosted by MonadoService and
             // the MonadoServiceSlotN satellites.
+            // VkLayer_DXR_queue_lock: libVkLayer_DXR_queue_lock.so, the #1905
+            // per-device queue-serialization layer. Shipped here so a userdebug
+            // device can load it into an APP process with
+            // gpu_debug_layer_app=<this package> (the loader scans this APK's
+            // lib dir for libVkLayer*.so). Inert unless a loader is pointed at
+            // it — the runtime's injection retries without it when absent.
             cmake.targets "openxr_displayxr", "displayxr-service",
-                "drv_sim_display_plugin", "displayxr-diag"
+                "drv_sim_display_plugin", "displayxr-diag",
+                "VkLayer_DXR_queue_lock"
 
             // Cross-building Android on a host that has a system cJSON
             // (e.g. macOS `brew install cjson`, Linux `libcjson-dev`) leaks the

@@ -6,6 +6,20 @@
 # Deliberately dependency-free: Vulkan headers only (a layer must NOT link the
 # loader — recursion), no xrt/aux libs.
 
+# Android (#1905): SHARED, not MODULE — AGP packages the SHARED_LIBRARY targets
+# it is told to build (build.gradle cmake.targets) into lib/<abi>/, the same
+# route drv_sim_display_plugin takes. The Android loader finds the layer by
+# FILE NAME (libVkLayer*.so on its layer search path), no manifest.
+if(ANDROID)
+	add_library(VkLayer_DXR_queue_lock SHARED queue_lock_layer.c)
+	# Android liblog for the one-shot "loaded" line; libc has pthreads.
+	target_link_libraries(VkLayer_DXR_queue_lock PRIVATE log)
+	set_target_properties(VkLayer_DXR_queue_lock PROPERTIES C_VISIBILITY_PRESET hidden)
+	target_link_options(VkLayer_DXR_queue_lock PRIVATE "LINKER:-Bsymbolic")
+	target_include_directories(VkLayer_DXR_queue_lock PRIVATE ${Vulkan_INCLUDE_DIR})
+	return()
+endif()
+
 add_library(VkLayer_DXR_queue_lock MODULE queue_lock_layer.c)
 
 # Windows exports come from the .def (no dllexport in code — vk_layer.h's plain
