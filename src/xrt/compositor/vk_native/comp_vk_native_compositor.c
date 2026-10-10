@@ -1000,6 +1000,11 @@ struct comp_vk_native_compositor
 			uint64_t win_start_ns, win_busy_ns;
 			//! Trace-window tallies (#1257 row; zeroed when a row goes out).
 			uint32_t legacy_fires, midframe_fires, in_frame, skip_pending, skip_duty;
+			//! Last duty refusal counted into skip_duty. The loop ticks at
+			//! P/4, so one deferred fill used to count ~4 times; a refusal
+			//! now counts once per 0.9 P (the fill spacing floor) — i.e.
+			//! per fill the cap actually withheld, not per tick.
+			uint64_t last_duty_skip_ns;
 		} mf;
 #endif
 	} repaint;
@@ -7625,8 +7630,9 @@ vk_app_submit_window_open(const struct comp_vk_native_compositor *c)
  *     layer_accum is only written under c->mutex (the app accumulates into
  *     layer_stage, published at layer_commit), so a fill never reads a
  *     half-written frame;
- *   - a fill fires if the legacy gate says yes OR the present-paced rule says
- *     yes — never fewer fills than legacy;
+ *   - between app frames a fill fires if the legacy gate says yes OR the
+ *     present-paced rule says yes; while the app is mid-frame every fill
+ *     (legacy-admitted too) must pass the present-paced spacing + duty rule;
  *   - every fill yields to a posted app frame (weave_hand.pending, re-checked
  *     under the lock) and holds c->mutex across its own GPU wait (no
  *     fence-park; see dxr_midframe_fill_park for why).
@@ -7671,8 +7677,10 @@ dxr_midframe_fill_enabled(void)
  * force-probe data (FORCE ran fills at ~18-32/s with no app regression on
  * model viewer and 10-30% on earthview): at earthview's ~20 ms fills it
  * allows ~30 fills/s; at model viewer's measured ~45 ms fill wall time
- * (lock contention included) it caps at ~13/s. Legacy-gate fills are not
- * subject to it (they were never throttled before).
+ * (lock contention included) it caps at ~13/s. It applies to EVERY fill
+ * that starts while the app is mid-frame — legacy-gate ones included (round 3;
+ * exempting them let back-to-back legacy fills run the duty to 43-48%).
+ * Between app frames legacy fills keep their old, unthrottled verdict.
  */
 static uint32_t
 dxr_midframe_fill_duty(void)
@@ -7763,8 +7771,10 @@ vk_midframe_active(const struct comp_vk_native_compositor *c)
 }
 
 /*!
- * #1905: may a present-paced fill start at @p now_ns? (OR-ed with the legacy
- * gate by the caller — this only ever ADDS fills.)
+ * #1905: may a present-paced fill start at @p now_ns? OR-ed with the legacy
+ * gate between app frames (there it only ever ADDS fills); AND-ed with it while
+ * the app is mid-frame (vk_midframe_app_mid), where it is the throttle every
+ * fill must pass.
  *
  *  1. HALF A PERIOD past the last present (served app weave END, or fill END),
  *     so the fill targets the NEXT vblank rather than the one the last present
@@ -7813,6 +7823,31 @@ vk_midframe_gate_open(const struct comp_vk_native_compositor *c,
 		}
 	}
 	return true;
+}
+
+/*!
+ * #1905: is the app MID-FRAME (between xrBeginFrame and the end of its
+ * xrEndFrame submit)? This is the window where fills compete with the app for
+ * c->mutex and the GPU, so every fill admitted in it — by the legacy gate or
+ * the present-paced rule — must also pass vk_midframe_gate_open's spacing +
+ * duty rule. Between frames the legacy gate keeps its unthrottled verdict.
+ */
+static bool
+vk_midframe_app_mid(const struct comp_vk_native_compositor *c)
+{
+	return c->repaint.app_frame_in_progress || c->repaint.app_submit_window;
+}
+
+//! #1905: count a duty refusal into the trace tally — once per withheld fill
+//! (0.9 P), not once per P/4 loop tick.
+static void
+vk_midframe_note_duty_skip(struct comp_vk_native_compositor *c, uint64_t now_ns, uint64_t period_ns)
+{
+	const uint64_t last = c->repaint.mf.last_duty_skip_ns;
+	if (last == 0 || now_ns < last || now_ns - last >= (period_ns * 9) / 10) {
+		c->repaint.mf.skip_duty++;
+		c->repaint.mf.last_duty_skip_ns = now_ns;
+	}
 }
 
 //! #1905: is an app-frame weave posted and not yet served? Takes the hand-off
@@ -8143,21 +8178,26 @@ vk_repaint_thread(void *ptr)
 		// presented clear of the app's own queue slot; otherwise it is the
 		// legacy fixed 2-period gate. See u_repaint_gate.h for the design.
 #ifdef VK_MIDFRAME_FILL
-		// #1905: legacy verdict OR the present-paced rule — the legacy gate's
-		// fills always still happen. mf_fill marks a fill ONLY the new rule
-		// admitted: it re-checks that rule under the lock and is the one the
-		// duty governor throttles.
+		// #1905: legacy verdict OR the present-paced rule. mf_fill marks a
+		// fill ONLY the new rule admitted (it re-checks that rule under the
+		// lock). While the app is MID-FRAME a legacy-admitted fill must ALSO
+		// pass the spacing + duty rule: round 2 exempted it, and on model
+		// viewer legacy fills (quiet >= 1.2 P, no spacing of their own) then
+		// fired back-to-back mid-frame, each holding c->mutex across its GPU
+		// wait — fill_ema 37-43 ms, duty 43-48%, app 12.2 -> 7.5 fps vs the
+		// 13.5 -> 9.9 baseline. Between frames the legacy verdict stands.
 		bool mf_fill = false;
 		if (c->repaint.force != 1 && !move_fill) {
 			const uint64_t now_g = os_monotonic_get_ns();
 			bool open = u_repaint_gate_open(&c->repaint.gate, now_g, period_ns, &c->repaint.partition);
-			if (!open && mf_on) {
+			if (mf_on && (!open || vk_midframe_app_mid(c))) {
 				bool duty_refused = false;
-				mf_fill = vk_midframe_gate_open(c, now_g, period_ns, &duty_refused);
+				const bool mf_ok = vk_midframe_gate_open(c, now_g, period_ns, &duty_refused);
 				if (duty_refused) {
-					c->repaint.mf.skip_duty++;
+					vk_midframe_note_duty_skip(c, now_g, period_ns);
 				}
-				open = mf_fill;
+				mf_fill = mf_ok && !open;
+				open = mf_ok;
 			}
 			if (!open) {
 				u_repaint_trace_bail_gate(&c->repaint.trace);
@@ -8395,12 +8435,20 @@ vk_repaint_thread(void *ptr)
 		// #1905: a fill only the present-paced rule admitted re-runs THAT rule
 		// — an app weave served while we waited for the lock moved
 		// serve_end_ns. A legacy-admitted fill re-runs the legacy gate as
-		// before.
-		const bool relock_gate_ok = (mf_locked && mf_fill)
-		                                ? vk_midframe_gate_open(c, os_monotonic_get_ns(), period_ns, NULL)
-		                                : !(c->repaint.force != 1 && !move_fill_locked &&
-		                                    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(),
-		                                                         period_ns, &c->repaint.partition));
+		// before, AND the present-paced rule if the app is mid-frame now (it
+		// may have entered xrBeginFrame while this thread waited).
+		const uint64_t now_r = os_monotonic_get_ns();
+		bool relock_gate_ok;
+		if (mf_locked && mf_fill) {
+			relock_gate_ok = vk_midframe_gate_open(c, now_r, period_ns, NULL);
+		} else {
+			relock_gate_ok =
+			    !(c->repaint.force != 1 && !move_fill_locked &&
+			      !u_repaint_gate_open(&c->repaint.gate, now_r, period_ns, &c->repaint.partition));
+			if (relock_gate_ok && mf_locked && !move_fill_locked && vk_midframe_app_mid(c)) {
+				relock_gate_ok = vk_midframe_gate_open(c, now_r, period_ns, NULL);
+			}
+		}
 		if (!relock_gate_ok) {
 #else
 		if (c->repaint.force != 1 && !move_fill_locked &&
