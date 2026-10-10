@@ -51,6 +51,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <strings.h> // strcasecmp
 #include <string>
 #include <chrono>
 #include <vector>
@@ -1761,6 +1762,53 @@ static bool CreateSpaces(AppXrSession &app)
     return true;
 }
 
+// ============================================================================
+// Colour swapchain (ADR-044 / INV-4.6)
+// ============================================================================
+//
+// This app authors DISPLAY-REFERRED colour: its shaders, clears and textures
+// produce the bytes it wants on screen. A swapchain's format says what its
+// bytes mean, and the runtime believes it: UNORM holds LINEAR values (which a
+// format-honest compositor encodes once more — washed out), `_SRGB` holds
+// encoded ones. So the app requests BGRA8Unorm_sRGB and renders through a
+// BGRA8Unorm VIEW of the same storage: the pipelines keep their BGRA8Unorm
+// attachments and the authored bytes land unconverted (ADR-044 §2, "display-
+// referred bytes moved without conversion"). No shader or clear-colour change.
+//
+// DXR_SWAPCHAIN_ENCODING=unorm reproduces the old UNORM request (A/B: it
+// washes out on runtime >= the Metal format-honest change, unless
+// DXR_COLOR_LEGACY_UNORM_ENCODED=1 is also set).
+static int64_t ChooseAppColorFormat(const std::vector<int64_t> &formats)
+{
+    const char *enc = getenv("DXR_SWAPCHAIN_ENCODING");
+    const bool forceUnorm = enc != nullptr && strcasecmp(enc, "unorm") == 0;
+    const int64_t preferred[] = {
+        forceUnorm ? (int64_t)MTLPixelFormatBGRA8Unorm : (int64_t)MTLPixelFormatBGRA8Unorm_sRGB,
+        forceUnorm ? (int64_t)MTLPixelFormatBGRA8Unorm_sRGB : (int64_t)MTLPixelFormatBGRA8Unorm,
+    };
+    for (int64_t p : preferred) {
+        for (int64_t f : formats) {
+            if (f == p) {
+                return f;
+            }
+        }
+    }
+    return formats.empty() ? 0 : formats[0];
+}
+
+// The texture the app RENDERS into for swapchain image @p tex: a BGRA8Unorm
+// view of an `_SRGB` image (raw bytes, no encode on write), else the image.
+static id<MTLTexture> AppRenderTarget(id<MTLTexture> tex)
+{
+    if (tex != nil && tex.pixelFormat == MTLPixelFormatBGRA8Unorm_sRGB) {
+        id<MTLTexture> view = [tex newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm];
+        if (view != nil) {
+            return view;
+        }
+    }
+    return tex;
+}
+
 static bool CreateSwapchain(AppXrSession &app)
 {
     // Size swapchain for the maximum atlas across all rendering modes.
@@ -1783,12 +1831,9 @@ static bool CreateSwapchain(AppXrSession &app)
     XR_CHECK(xrEnumerateSwapchainFormats(app.session, formatCount, &formatCount, formats.data()));
 
     LOG_INFO("Supported swapchain formats:");
-    int64_t selectedFormat = formats[0];
-    for (auto f : formats) {
-        if (f == (int64_t)MTLPixelFormatBGRA8Unorm) {
-            selectedFormat = f;
-        }
-    }
+    // ADR-044: the _SRGB sibling of the BGRA8 pipelines' format (see
+    // ChooseAppColorFormat) — this app's bytes are display-referred.
+    int64_t selectedFormat = ChooseAppColorFormat(formats);
     for (auto f : formats) {
         LOG_INFO("  format %lld%s", (long long)f, f == selectedFormat ? " (selected)" : "");
     }
@@ -1818,7 +1863,7 @@ static bool CreateSwapchain(AppXrSession &app)
 
     app.swapchain.images.resize(imageCount);
     for (uint32_t i = 0; i < imageCount; i++) {
-        app.swapchain.images[i] = (__bridge id<MTLTexture>)metalImages[i].texture;
+        app.swapchain.images[i] = AppRenderTarget((__bridge id<MTLTexture>)metalImages[i].texture);
         LOG_INFO("Swapchain image %u: MTLTexture %p (%lux%lu)",
                  i, metalImages[i].texture,
                  (unsigned long)app.swapchain.images[i].width,
@@ -2088,7 +2133,7 @@ static bool CreateZoneResources(AppXrSession &app, DisplayZone &z, uint32_t view
     }
     z.images.resize(n);
     for (uint32_t i = 0; i < n; i++) {
-        z.images[i] = (__bridge id<MTLTexture>)imgs[i].texture;
+        z.images[i] = AppRenderTarget((__bridge id<MTLTexture>)imgs[i].texture); // same format as the main swapchain
     }
 
     LOG_INFO("[zones] zone %u: rect %d,%d %dx%d -> swapchain %ux%u (%u tiles of %ux%u)",
