@@ -23,7 +23,8 @@
 
 'use strict';
 
-const {Clutter, GObject, Meta, Gio, GLib, Graphene} = imports.gi;
+const {Clutter, GObject, Meta, Gio, GLib, Graphene, Shell} = imports.gi;
+const Main = imports.ui.main;
 const ExtensionUtils = imports.misc.extensionUtils;
 
 let service = null;
@@ -40,7 +41,7 @@ function init() {
     // capability bits 3 and 4 (move sync, its v10 tag gate) stay clear; the
     // runtime then takes the lattice path.
     const {WindowGeometryService} = globalThis.displayxrWindowGeometry.build(
-        {Clutter, GObject, Meta, Gio, GLib, Graphene, moveSync: false});
+        {Clutter, GObject, Meta, Gio, GLib, Graphene, Main, Shell, moveSync: false});
     service = new WindowGeometryService();
     // Shells that take init()'s return value use it as the state object and
     // call enable()/disable() on IT; shells that ignore the return value call
