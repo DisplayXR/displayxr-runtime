@@ -1,0 +1,16 @@
+{
+	"runtime": { "description": "DisplayXR Runtime", "git_tag": "v2.33.0", "plugin_abi_version": 5 },
+	"workspace_controllers": [
+		{ "id": "workspace-host", "name": "Workspace Host", "version": "3.1.0",
+		  "exe": "C:\\Program Files\\Vendor\\workspace-host.exe", "actions": ["toggle", { "name": "launcher" }] },
+		{ "id": "other-controller", "name": "Other Controller", "version": "0.1", "exe": "other.exe", "actions": [] }
+	],
+	"input_providers": [
+		{ "id": "hands-x", "name": "Hands X", "hardware_present": true, "active": true, "note": "tracking both hands" },
+		{ "id": "pads-y", "display_name": "Pads Y", "hardware_present": false }
+	],
+	"rig_role": { "evaluated": true, "device": "Nav Puck", "note": "rig follows the nav device" },
+	"lift_caps": { "probed": true, "malformed": false, "note": "modes=0x3", "modes": 3, "state": 1,
+	               "max_streams": 32, "max_views": 8, "backend": "backend-name-verbatim" },
+	"stereo_camera": { "present": true, "name": "Cam 7", "fps": 60, "nested": { "ignored": 1 } }
+}

@@ -62,6 +62,9 @@ public sealed record InfoResult(
     string ActiveRuntimeValue, string? ActivePluginId, string ActivePluginName, string ActivePluginVendor,
     string ActivePluginVersion, string Device, IReadOnlyList<InfoPlugin> Plugins, GpuTopology? Gpu, PerfState Perf)
 {
+    /// <summary>The Components page's blocks (workspace controllers, input, conversion, camera).</summary>
+    public InfoComponents Components { get; init; } = InfoComponents.Empty;
+
     public bool ActiveRuntimeIsDisplayXR =>
         ActiveRuntimeSet && ActiveRuntimeValue.Contains("DisplayXR", StringComparison.OrdinalIgnoreCase);
 
@@ -107,7 +110,7 @@ public sealed record InfoResult(
                     p.Str("id"), p.Str("display_name"), p.Str("version"), p.Str("load_result"),
                     p.Str("platform_state", "UNKNOWN"), p.Str("hint"), p.Str("reason"), p.Bool("fallback"),
                     p.Int("probe_order"))).ToArray(),
-                gpu, perf);
+                gpu, perf) { Components = InfoComponents.Read(root) };
             return true;
         }
         catch (Exception ex) when (ex is JsonException or InvalidOperationException or FormatException)

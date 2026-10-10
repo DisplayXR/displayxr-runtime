@@ -9,6 +9,7 @@ Run from this directory:  python gen_fixtures.py
                         and one line is cut short (the "last read failed" path)
   stress-16x32.ndjson   16 screens in a 4x4 grid, 32 clients, NOT_NATIVE /
                         CLAIM_FALLBACK / unclaimed rows
+  components.ndjson     a CONTROLLER, a PRESENT_OWNER, an app and a DIAG client
   empty-headless.ndjson zero screens, zero clients, source headless
 """
 import json
@@ -145,6 +146,22 @@ def main():
                               owner=owner, segs=[seg(owner, 0, 800, 500)], paint=1000 + k))
     with open("stress-16x32.ndjson", "w", newline="\n") as f:
         f.write(dump(snap(screens, clients, gen=(3, 99))) + "\n")
+
+    # Components: a workspace controller, a present owner, an app and the DIAG reader.
+    comp = two_panels(2500, flat=False)
+    comp["workspace"] = {"enabled": True, "controller": "workspace-host"}
+    comp["clients"] = [
+        client(1, 5120, "workspace-host.exe", cls="CONTROLLER",
+               window={"left": 0, "top": 0, "width": 3840, "height": 2160}, owner=A,
+               flags={"active": True, "visible": True, "focused": False, "overlay": True}),
+        client(2, 6200, "capture_app.exe", cls="PRESENT_OWNER", presenter="CLIENT_TEXTURE",
+               window={"left": 4200, "top": 300, "width": 1600, "height": 900}, owner=B,
+               flags={"active": True, "visible": True, "focused": False, "overlay": False}),
+        comp["clients"][0],
+        client(5, 31120, "displayxr-cli.exe", cls="DIAG"),
+    ]
+    with open("components.ndjson", "w", newline="\n") as f:
+        f.write(dump(comp) + "\n")
 
     with open("empty-headless.ndjson", "w", newline="\n") as f:
         f.write(dump(snap([], [], gen=(0, 0), source="headless", warnings=[

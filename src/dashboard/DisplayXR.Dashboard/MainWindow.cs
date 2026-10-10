@@ -88,7 +88,7 @@ public sealed class MainWindow : Window
             Toast = ShowToast,
         };
 
-        _pages = new List<Page> { new HomePage(), new DisplaysPage(), new WindowsPage(), new PerformancePage(), new DeveloperPage() };
+        _pages = new List<Page> { new HomePage(), new DisplaysPage(), new WindowsPage(), new ComponentsPage(), new PerformancePage(), new DeveloperPage() };
         foreach (var p in _pages)
         {
             p.Bind(_ctx);
@@ -415,6 +415,9 @@ public sealed class MainWindow : Window
             case "home":
                 _ = _ctx.LoadInfoAsync(force: true);
                 _ = _ctx.LoadDpAsync(force: true);
+                break;
+            case "components":
+                _ = _ctx.LoadInfoAsync(force: true);
                 break;
             case "performance":
                 _ = _ctx.LoadPerfAsync(force: true);
