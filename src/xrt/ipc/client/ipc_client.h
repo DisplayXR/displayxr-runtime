@@ -182,6 +182,15 @@ void
 comp_ipc_client_compositor_set_view_routing(struct xrt_compositor *xc, const struct xrt_segment_view_routing *routing);
 
 /*!
+ * XR_DXR_weave v19 (#1884, ADR-047 Amendment 4): the per-screen segment table
+ * of this present-owner's last weave, every screen's eyes included (count 0 =
+ * woven by one display processor). Zeroed on any failure; the result is
+ * XRT_ERROR_IPC_FAILURE only for a dead connection.
+ */
+xrt_result_t
+comp_ipc_client_compositor_weave_get_segments(struct xrt_compositor *xc, struct xrt_segment_metrics *out_metrics);
+
+/*!
  * Phase 2 workspace_sync_fence bridges. Same gating contract as
  * comp_ipc_client_compositor_get_window_metrics — only valid when @p xc is
  * an ipc_client_compositor. Used by the D3D11 client compositor to import

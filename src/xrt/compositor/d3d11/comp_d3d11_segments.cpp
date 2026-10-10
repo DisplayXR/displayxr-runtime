@@ -52,7 +52,7 @@ struct seg_screen_state
 	struct xrt_display_processor_d3d11 *dp; //!< NULL until the lifecycle creates it.
 	bool configured;                        //!< set_background_2d(NULL) sent once.
 	int encoding_latched;                   //!< last atlas encoding declared, -1 = none.
-	int transparent_latched;                //!< last transparency declared, -1 = none.
+	int transparent_latched;                //!< last transparency (bit 0 bg, bit 1 client presents), -1 = none.
 	int mode_sent;                          //!< last 2D/3D mode sent, -1 = none.
 	bool tolerates_resample;
 	bool has_hwnd; //!< this DP holds the session's window (the owner).
@@ -83,6 +83,9 @@ struct comp_d3d11_segments
 	 */
 	struct comp_d3d11_segments_hwnd_hooks hooks;
 	struct comp_segments_owner owner;
+	//! Whose lattice a present-owner's drag snaps to (#1884): the majority
+	//! screen, same hysteresis as the handle owner, but nothing is rebuilt.
+	struct comp_segments_owner snap_owner;
 	uint32_t primary_index;   //!< index of the primary screen, UINT32_MAX = none
 	int owner_index;          //!< index of the screen holding the handle, -1 = none
 	bool primary_for_screen;  //!< the primary's plug-in has create_dp_d3d11_for_screen
@@ -641,6 +644,7 @@ comp_d3d11_segments_set_screens(struct comp_d3d11_segments *segs,
 		if (segs->primary_index != UINT32_MAX) {
 			segs->owner_index = (int)segs->primary_index;
 			comp_segments_owner_init(&segs->owner, segs->screens[segs->primary_index].id, 0, 0);
+			comp_segments_owner_init(&segs->snap_owner, segs->screens[segs->primary_index].id, 0, 0);
 		}
 		const bool handoff = segs->hooks.swap_primary != nullptr && segs->primary_for_screen;
 		U_LOG_W(
@@ -882,10 +886,12 @@ comp_d3d11_segments_record(struct comp_d3d11_segments *segs, const struct comp_d
 					xrt_display_processor_d3d11_set_atlas_encoding(
 					    dp, (enum xrt_atlas_encoding)f->atlas_encoding);
 				}
-				if (st->transparent_latched != (int)f->transparent_background) {
-					st->transparent_latched = (int)f->transparent_background;
+				const int transparency =
+				    (f->transparent_background ? 1 : 0) | (f->client_presents ? 2 : 0);
+				if (st->transparent_latched != transparency) {
+					st->transparent_latched = transparency;
 					xrt_display_processor_d3d11_set_transparent_background(
-					    dp, f->transparent_background, false);
+					    dp, f->transparent_background, f->client_presents);
 				}
 				if (st->mode_sent != (int)segs->mode_3d) {
 					st->mode_sent = (int)segs->mode_3d;
@@ -1053,6 +1059,47 @@ comp_d3d11_segments_get_owner(const struct comp_d3d11_segments *segs)
 		return 0;
 	}
 	return segs->screens[segs->owner_index].id;
+}
+
+extern "C" struct xrt_display_processor_d3d11 *
+comp_d3d11_segments_snap_dp(struct comp_d3d11_segments *segs,
+                            const struct comp_seg_rect *window_desktop,
+                            uint64_t now_ns,
+                            uint64_t *out_screen_id)
+{
+	if (out_screen_id != nullptr) {
+		*out_screen_id = 0;
+	}
+	if (segs == nullptr || !segs->enabled || window_desktop == nullptr || segs->primary_index == UINT32_MAX) {
+		return nullptr;
+	}
+	// The table at the PROPOSED position, not the last weave's: the snap
+	// answers "where may the window land", ahead of any weave there.
+	struct comp_segment_table t;
+	comp_segments_compute(window_desktop, nullptr, segs->screens, segs->screen_count, &t);
+	const uint64_t target = comp_segments_owner_update(&segs->snap_owner, &t, now_ns);
+	if (target != 0) {
+		const int ti = screen_index_of(segs, target);
+		const bool is_primary = ti >= 0 && (uint32_t)ti == segs->primary_index;
+		if (ti >= 0 && (is_primary || segs->st[ti].dp != nullptr)) {
+			comp_segments_owner_set_result(&segs->snap_owner, target, true, target);
+			// A drag crossing the dead band: an event, not per frame.
+			U_LOG_I("segments: drag snap follows screen 0x%016llx's lattice (majority, #1884)",
+			        (unsigned long long)target);
+		}
+		// Else that screen has no DP yet (its segment has not lived through
+		// the lifecycle's create delay): keep the current lattice and ask
+		// again next snap. No failure latch — nothing was torn down.
+	}
+	const uint64_t owner = segs->snap_owner.owner_id;
+	if (out_screen_id != nullptr) {
+		*out_screen_id = owner;
+	}
+	const int oi = owner != 0 ? screen_index_of(segs, owner) : -1;
+	if (oi < 0 || (uint32_t)oi == segs->primary_index) {
+		return nullptr; // the primary: the session's own DP snaps
+	}
+	return segs->st[oi].dp; // NULL if retired meanwhile: the caller falls back
 }
 
 extern "C" bool

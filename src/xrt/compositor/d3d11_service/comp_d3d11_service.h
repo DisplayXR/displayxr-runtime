@@ -1401,6 +1401,21 @@ comp_d3d11_service_weave_snap_window_rect(struct xrt_compositor *xc,
                                           int32_t *out_x,
                                           int32_t *out_y);
 
+/*!
+ * XR_DXR_weave v19 (#1884, ADR-047 Amendment 4): what the last accepted
+ * @ref comp_d3d11_service_weave_submit of this present-owner did per screen —
+ * the bound window's segment table (count 0 = woven by one display processor)
+ * with every segment's eyes, the primary's being the submit's own base eyes.
+ * The client cuts its submitted rects at the table's seams (u_weave_rect_parts).
+ *
+ * Only a client that sent `compositor_segments_enable` is ever segmented, and
+ * only batch / v6 submits; otherwise the table is empty.
+ *
+ * @return true when the last submit was woven per segment.
+ */
+bool
+comp_d3d11_service_weave_get_segments(struct xrt_compositor *xc, struct xrt_segment_metrics *out);
+
 /*
  * XR_DXR_lift (ADR-042) — 2D→3D conversion streams. SYSTEM-level (a stream is
  * owned by an IPC connection, identified by @p owner, not by a session), so a

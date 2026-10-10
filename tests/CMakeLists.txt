@@ -70,6 +70,7 @@ set(tests
     tests_oxr_view_config_rule
     tests_oxr_segment_views
     tests_segments_ipc
+    tests_weave_segments
     tests_target_screen_pin
     tests_u_setting_per_screen
     tests_oxr_legacy_mode_rule
@@ -662,6 +663,18 @@ target_link_libraries(tests_segments_ipc PRIVATE xrt-interfaces aux_util)
 if(TARGET ipc_shared)
 	target_link_libraries(tests_segments_ipc PRIVATE ipc_shared)
 	target_compile_definitions(tests_segments_ipc PRIVATE DXR_TESTS_HAVE_IPC_PROTOCOL)
+endif()
+
+# XR_DXR_weave v19 (#1884, ADR-047 Amendment 4): a present-owner's weave rects
+# split per screen -- the segment table (compositor/util), the per-rect parts
+# the client cuts from it (aux util, header-only) and, where the IPC protocol
+# is generated, the weave_get_segments reply carrying every screen's eyes.
+target_sources(tests_weave_segments PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/comp_segments.c)
+target_include_directories(tests_weave_segments PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+target_link_libraries(tests_weave_segments PRIVATE xrt-interfaces aux_util)
+if(TARGET ipc_shared)
+	target_link_libraries(tests_weave_segments PRIVATE ipc_shared)
+	target_compile_definitions(tests_weave_segments PRIVATE DXR_TESTS_HAVE_IPC_PROTOCOL)
 endif()
 
 # Multi-screen M4 — DXR_SCREEN_PLUGIN (per-screen plug-in pin) and the per-monitor

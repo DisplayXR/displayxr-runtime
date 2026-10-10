@@ -59,6 +59,7 @@
 #include "util/u_trace_marker.h"
 #include "util/u_logging.h"
 #include "util/u_snap_grid.h"
+#include "util/u_weave_rect_parts.h"
 
 #include "oxr_api_funcs.h"
 #include "oxr_api_verify.h"
@@ -106,6 +107,9 @@ static_assert(sizeof(XrWeaveSnapGridPointDXR) == 2 && offsetof(XrWeaveSnapGridPo
 static_assert(XR_WEAVE_SNAP_GRID_MAX_POINTS_DXR == U_SNAP_GRID_MAX_POINTS, "grid point bound mismatch");
 static_assert(XR_WEAVE_SNAP_GRID_MAX_AXIS_DXR == U_SNAP_GRID_MAX_AXIS, "grid axis bound mismatch");
 static_assert(XR_WEAVE_SNAP_GRID_NO_DELTA_DXR == U_SNAP_GRID_NO_DELTA, "grid sentinel mismatch");
+// Spec v19 (#1884): the per-screen table is the per-segment views' table.
+static_assert(XR_WEAVE_MAX_SEGMENTS_DXR == XRT_MAX_SEGMENTS, "weave segment bound mismatch");
+static_assert(XR_WEAVE_MAX_EYES_DXR <= ARRAY_SIZE(((struct xrt_eye_positions *)0)->eyes), "weave eye bound mismatch");
 
 #ifdef OXR_HAVE_DXR_lift
 #include "xrt/xrt_lift.h"
@@ -133,6 +137,10 @@ ipc_client_connection_export(enum u_logging_level log_level, xrt_ipc_handle_t *o
 
 xrt_result_t
 comp_ipc_client_compositor_weave_bind_window(struct xrt_compositor *xc, uint64_t hwnd);
+
+//! XR_DXR_weave v19 (#1884): the last weave's per-screen segment table.
+xrt_result_t
+comp_ipc_client_compositor_weave_get_segments(struct xrt_compositor *xc, struct xrt_segment_metrics *out_metrics);
 
 xrt_result_t
 comp_ipc_client_compositor_weave_set_window_geometry(struct xrt_compositor *xc,
@@ -455,6 +463,112 @@ oxr_xrWeaveBindWindow2DXR(XrSession session, const XrWeaveBindWindowInfoDXR *bin
 		OXR_CHECK_XRET_MSG(&log, sess, xret, "xrWeaveBindWindow2DXR: geometry update failed (xrt_result=%d)",
 		                   (int)xret);
 	}
+	return XR_SUCCESS;
+}
+
+/*!
+ * Spec v19 (#1884, ADR-047 Amendment 4): fill a chained
+ * XrWeaveOutputRectPartsDXR from the service's per-screen table of the submit
+ * that just landed — every screen's eyes, and the submitted @p rects cut at
+ * the seams (u_weave_rect_parts). segmentCount 0 (the window was woven by one
+ * display processor, or this platform's service does not segment) leaves the
+ * caller on the base eyes.
+ *
+ * @return XR_SUCCESS, or the lost-connection error when the fetch hit a dead
+ *         pipe. Any other failure is reported as "not segmented".
+ */
+static XrResult
+oxr_weave_fill_rect_parts(struct oxr_logger *log,
+                          struct oxr_session *sess,
+                          uint32_t rect_count,
+                          const struct xrt_rect *rects,
+                          XrWeaveOutputRectPartsDXR *out)
+{
+	out->segmentCount = 0;
+	out->partCount = 0;
+	out->generation = 0;
+	memset(out->segments, 0, sizeof(out->segments));
+	memset(out->parts, 0, sizeof(out->parts));
+	if (rect_count == 0) {
+		return XR_SUCCESS; // legacy single-rect submit: never segmented
+	}
+
+	struct xrt_segment_metrics m;
+	memset(&m, 0, sizeof(m));
+#ifdef XRT_OS_WINDOWS
+	// Only the D3D11 service segments a present-owner's window; elsewhere the
+	// answer is always "one display processor", so do not pay a round trip.
+	xrt_result_t xret = comp_ipc_client_compositor_weave_get_segments(&sess->xcn->base, &m);
+	if (xret == XRT_ERROR_IPC_FAILURE) {
+		OXR_CHECK_XRET_MSG(log, sess, xret,
+		                   "xrWeaveSubmitDXR: weave segment table fetch failed (xrt_result=%d)", (int)xret);
+	}
+	if (xret != XRT_SUCCESS) {
+		memset(&m, 0, sizeof(m));
+	}
+#else
+	(void)log;
+	(void)sess;
+#endif
+	if (m.count == 0 || m.count > XR_WEAVE_MAX_SEGMENTS_DXR) {
+		return XR_SUCCESS;
+	}
+
+	for (uint32_t k = 0; k < m.count; k++) {
+		const struct xrt_segment_metric *g = &m.seg[k];
+		XrWeaveScreenSegmentDXR *o = &out->segments[k];
+		o->displayId = g->screen_id;
+		o->windowRect.offset.x = g->window_rect.offset.w; // xrt_offset names its fields w/h
+		o->windowRect.offset.y = g->window_rect.offset.h;
+		o->windowRect.extent.width = g->window_rect.extent.w;
+		o->windowRect.extent.height = g->window_rect.extent.h;
+		o->screenRect.offset.x = g->screen_rect.offset.w;
+		o->screenRect.offset.y = g->screen_rect.offset.h;
+		o->screenRect.extent.width = g->screen_rect.extent.w;
+		o->screenRect.extent.height = g->screen_rect.extent.h;
+		o->screenSize.width = (int32_t)g->screen_desktop_width;
+		o->screenSize.height = (int32_t)g->screen_desktop_height;
+		o->screenSizeMeters.width = g->screen_width_m;
+		o->screenSizeMeters.height = g->screen_height_m;
+		o->isPrimary = g->is_primary ? XR_TRUE : XR_FALSE;
+		o->woven = g->woven ? XR_TRUE : XR_FALSE;
+		const bool have = g->have_eyes && g->eyes.valid;
+		uint32_t ec = have ? g->eyes.count : 0;
+		if (ec > XR_WEAVE_MAX_EYES_DXR) {
+			ec = XR_WEAVE_MAX_EYES_DXR;
+		}
+		o->eyeCount = ec;
+		for (uint32_t i = 0; i < ec; i++) {
+			o->eyes[i].x = g->eyes.eyes[i].x;
+			o->eyes[i].y = g->eyes.eyes[i].y;
+			o->eyes[i].z = g->eyes.eyes[i].z;
+		}
+		o->eyesValid = have ? XR_TRUE : XR_FALSE;
+		o->eyesTracking = have && g->eyes.is_tracking ? XR_TRUE : XR_FALSE;
+	}
+	out->segmentCount = m.count;
+	out->generation = m.generation;
+
+	struct u_weave_rect_part parts[XR_WEAVE_MAX_RECT_PARTS_DXR];
+	const uint32_t n = u_weave_rect_parts(&m, rects, rect_count, parts, XR_WEAVE_MAX_RECT_PARTS_DXR);
+	for (uint32_t i = 0; i < n; i++) {
+		XrWeaveRectPartDXR *o = &out->parts[i];
+		o->rectIndex = parts[i].rect_index;
+		o->segmentIndex = parts[i].segment_index;
+		o->windowRect.offset.x = parts[i].window_rect.offset.w;
+		o->windowRect.offset.y = parts[i].window_rect.offset.h;
+		o->windowRect.extent.width = parts[i].window_rect.extent.w;
+		o->windowRect.extent.height = parts[i].window_rect.extent.h;
+		o->rectRelative.offset.x = parts[i].rect_rel.offset.w;
+		o->rectRelative.offset.y = parts[i].rect_rel.offset.h;
+		o->rectRelative.extent.width = parts[i].rect_rel.extent.w;
+		o->rectRelative.extent.height = parts[i].rect_rel.extent.h;
+		o->screenRect.offset.x = parts[i].screen_rect.offset.w;
+		o->screenRect.offset.y = parts[i].screen_rect.offset.h;
+		o->screenRect.extent.width = parts[i].screen_rect.extent.w;
+		o->screenRect.extent.height = parts[i].screen_rect.extent.h;
+	}
+	out->partCount = n;
 	return XR_SUCCESS;
 }
 
@@ -956,6 +1070,19 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 	}
 	output->eyesValid = eyes.valid ? XR_TRUE : XR_FALSE;
 	output->eyesTracking = eyes.is_tracking ? XR_TRUE : XR_FALSE;
+
+	// Spec v19 (#1884, ADR-047 Amendment 4): a window across a seam is woven
+	// per screen; the caller that asks gets every screen's eyes and its rects
+	// cut at the seams. Fetched only when the struct is chained, so a pre-v19
+	// caller sends exactly the pre-v19 messages.
+	XrWeaveOutputRectPartsDXR *out_parts =
+	    OXR_GET_OUTPUT_FROM_CHAIN(output, XR_TYPE_WEAVE_OUTPUT_RECT_PARTS_DXR, XrWeaveOutputRectPartsDXR);
+	if (out_parts != NULL) {
+		XrResult pr = oxr_weave_fill_rect_parts(&log, sess, rect_count, rects, out_parts);
+		if (pr != XR_SUCCESS) {
+			return pr; // a dead connection only
+		}
+	}
 
 	bool need_export = !sess->weave.exported || w != sess->weave.last_w || h != sess->weave.last_h;
 	if (have_out && w != 0 && h != 0 && need_export) {

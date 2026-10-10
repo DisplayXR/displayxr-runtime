@@ -1008,6 +1008,31 @@ struct d3d11_service_compositor
 	struct comp_segments_content seg_content_painted;
 	struct comp_segments_content pipe_seg_content;
 
+	/*!
+	 * Multi-screen M6 for a present-owner (#1884, ADR-047 Amendment 4): an
+	 * XR_DXR_weave caller's bound window, when it spans monitors, is woven per
+	 * screen by weave_submit — a segment manager of its own, separate from the
+	 * direct pipeline's above, because the woven handback lives on the RENDER
+	 * device (`sys->device`, where the #1172 ingest DP is), not the output
+	 * device, and because the two paths run on different threads. Built from
+	 * the same opt-in screen list (`seg_screens`), so a client that never sent
+	 * `compositor_segments_enable` is never segmented here either.
+	 *
+	 * Threads. `weave_segs`, `weave_seg_outcomp` and `weave_seg_device` belong
+	 * to weave_submit / the weave snap, which both hold render_mutex;
+	 * compositor_destroy frees them under it too. `weave_seg_rebuild` and
+	 * `weave_seg_pub` / `weave_seg_out` are guarded by `seg_mutex` (the list is
+	 * written by any IPC thread; the table is read by `weave_get_segments`).
+	 */
+	bool weave_seg_rebuild; //!< a new list arrived: rebuild the weave manager on the next submit
+	struct comp_d3d11_segments *weave_segs;
+	struct comp_d3d11_outcomp *weave_seg_outcomp; //!< flat-2D fill, on @ref weave_seg_device
+	ID3D11Device *weave_seg_device;
+	//! The last accepted submit's table, eyes zeroed: the change-only generation source.
+	struct xrt_segment_metrics weave_seg_pub;
+	//! The same table with every segment's eyes, as the submit predicted them.
+	struct xrt_segment_metrics weave_seg_out;
+
 	//! #1140: the recipe the per-client atlas ACTUALLY HOLDS — the per-view
 	//! content dims and the view count of the last commit that PAINTED it.
 	//!
@@ -14148,6 +14173,10 @@ svc_seg_release(struct d3d11_service_compositor *c)
 	c->seg_device = nullptr;
 }
 
+//! #1884: the present-owner's weave segment manager (defined with weave_submit).
+static void
+weave_seg_release(struct d3d11_service_compositor *c);
+
 /*!
  * The direct pipeline's segment path for the focused client: when its window
  * spans monitors, weave it per screen into the presenter's back buffer — the
@@ -24853,9 +24882,11 @@ compositor_destroy(struct xrt_compositor *xc)
 
 	// Multi-screen M6: the segment DPs are the render thread's; tear them down
 	// under render_mutex so no weave of this client is in flight.
-	if (c->segments != nullptr || c->seg_outcomp != nullptr) {
+	if (c->segments != nullptr || c->seg_outcomp != nullptr || c->weave_segs != nullptr ||
+	    c->weave_seg_outcomp != nullptr) {
 		render_mutex_fair_lock lock(sys);
 		svc_seg_release(c);
+		weave_seg_release(c); // #1884: the present-owner's weave segment DPs
 	}
 	free(c->seg_screens);
 	c->seg_screens = nullptr;
@@ -26349,6 +26380,251 @@ weave_timing_account(struct d3d11_service_system *sys,
 	r->weave_cpu_ov_unchanged = 0;
 }
 
+/*
+ *
+ * Multi-screen M6 for a present-owner (#1884, ADR-047 Amendment 4): an
+ * XR_DXR_weave caller's bound window that spans monitors is woven per screen,
+ * each screen's part by that screen's display processor, into the one woven
+ * handback texture; every screen's eyes go back to the caller.
+ *
+ */
+
+//! Drop the present-owner's weave segment manager. Holding render_mutex (no
+//! weave or snap of this client is in flight).
+static void
+weave_seg_release(struct d3d11_service_compositor *c)
+{
+	comp_d3d11_segments_destroy(&c->weave_segs);
+	comp_d3d11_outcomp_destroy(&c->weave_seg_outcomp);
+	c->weave_seg_device = nullptr;
+	std::lock_guard<std::mutex> lk(c->seg_mutex);
+	struct xrt_segment_metrics none;
+	memset(&none, 0, sizeof(none)); // memcmp'd by the publish: padding too
+	(void)comp_segments_publish(&c->weave_seg_pub, &none);
+	c->weave_seg_out = c->weave_seg_pub;
+}
+
+/*!
+ * One metric update of the present-owner's weave segments: (re)build the
+ * manager from the opt-in screen list when it changed (or the render device
+ * did), recompute the table for the bound window, run the DP lifecycle.
+ *
+ * The manager lives on `sys->device` — the device the woven handback and the
+ * #1172 ingest DP live on, i.e. the device this weave writes. (The direct
+ * pipeline's manager is on the OUTPUT device for the same reason: a segment
+ * DP is made where its target is.)
+ *
+ * Holding render_mutex and immediate_ctx_mutex.
+ *
+ * @return true when this submit must be woven per segment; @p out_win then
+ *         holds the window's client area in desktop px.
+ */
+static bool
+weave_seg_update(struct d3d11_service_system *sys,
+                 struct d3d11_service_compositor *c,
+                 HWND wnd,
+                 uint32_t win_w,
+                 uint32_t win_h,
+                 struct comp_seg_rect *out_win)
+{
+	ID3D11Device *dev = sys->device.get();
+	ID3D11DeviceContext *ctx = sys->context.get();
+	bool rebuild = false;
+	{
+		std::lock_guard<std::mutex> lk(c->seg_mutex);
+		if (c->seg_screens == nullptr) {
+			return false; // never enabled: the single-DP weave, untouched
+		}
+		rebuild = c->weave_seg_rebuild || c->weave_seg_device != dev;
+	}
+	if (rebuild) {
+		weave_seg_release(c);
+		struct comp_d3d11_segments *ns = comp_d3d11_segments_create(dev);
+		bool enabled = false;
+		{
+			std::lock_guard<std::mutex> lk(c->seg_mutex);
+			if (ns != nullptr) {
+				comp_d3d11_segments_set_screens(ns, c->seg_screens, c->seg_sys_info,
+				                                c->seg_pinned_display_id);
+				enabled = comp_d3d11_segments_enabled(ns);
+			}
+			c->weave_seg_rebuild = false;
+		}
+		c->weave_segs = ns;
+		if (comp_d3d11_outcomp_create(dev, ctx, &c->weave_seg_outcomp) != XRT_SUCCESS) {
+			c->weave_seg_outcomp = nullptr; // segments that cannot weave then stay transparent, not flat 2D
+		}
+		c->weave_seg_device = dev; // tried once per device / list, never per frame
+		if (enabled) {
+			// Lifecycle (once per manager).
+			U_LOG_W(
+			    "segments: present-owner %p (pid %ld) — a bound window spanning monitors is woven "
+			    "per screen by weave_submit; segment DPs on the render device %p, per-screen eyes "
+			    "out (XR_DXR_weave v19, #1884)",
+			    (void *)c, c->client_pid, (void *)dev);
+		}
+	}
+	if (c->weave_segs == nullptr || !comp_d3d11_segments_enabled(c->weave_segs)) {
+		return false;
+	}
+	struct comp_seg_rect win = {};
+	if (!svc_seg_window_rect(wnd, &win) || win.w != win_w || win.h != win_h) {
+		return false; // no live window, or a resize in flight: weave this frame whole
+	}
+	const struct comp_seg_rect canvas = {0, 0, win.w, win.h};
+	const uint32_t mode_index =
+	    (sys->xdev != nullptr && sys->xdev->hmd != nullptr) ? sys->xdev->hmd->active_rendering_mode_index : 0;
+	const bool split = comp_d3d11_segments_update(c->weave_segs, &win, &canvas, ctx, mode_index);
+	// Every segment DP follows the panel's 2D/3D state, like the panel DP.
+	comp_d3d11_segments_set_display_mode(c->weave_segs, sys->hardware_display_3d);
+	*out_win = win;
+	return split;
+}
+
+/*!
+ * Weave a segmented submit: the window-canvas atlas @p src_srv (views
+ * @p view_w x @p view_h, @p cols x @p rows) cropped per segment and woven by
+ * each screen's DP into the handback, scissored to its segment; flat 2D where
+ * a segment cannot be woven. @p dp (the client's weave DP) weaves the primary
+ * screen's segment.
+ *
+ * The v4 overlay is NOT handed to a DP here: it is window-sized and a DP
+ * composites it over its whole target, which no segment DP covers. The
+ * runtime's post-weave blit composites it instead (ov_in_dp stays false), the
+ * pre-ADR-027-Amendment fallback every DP without the slot already gets.
+ *
+ * Holding render_mutex and immediate_ctx_mutex.
+ */
+static void
+weave_seg_record(struct d3d11_service_system *sys,
+                 struct d3d11_service_compositor *c,
+                 struct xrt_display_processor_d3d11 *dp,
+                 ID3D11ShaderResourceView *src_srv,
+                 uint32_t view_w,
+                 uint32_t view_h,
+                 uint32_t cols,
+                 uint32_t rows,
+                 uint32_t win_w,
+                 uint32_t win_h)
+{
+	ID3D11DeviceContext *ctx = sys->context.get();
+	// Stateless slot: say "no overlay this frame" so the primary DP does not
+	// keep compositing a previous frame's layer over its segment.
+	(void)xrt_display_processor_d3d11_set_overlay_2d(dp, ctx, nullptr, 0, 0, XRT_ATLAS_ENCODING_ENCODED, false);
+
+	struct comp_d3d11_segments_frame sf = {};
+	sf.context = ctx;
+	sf.src_srv = src_srv;
+	sf.view_width = view_w;
+	sf.view_height = view_h;
+	sf.tile_columns = cols;
+	sf.tile_rows = rows;
+	sf.src_format = (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM; // as the single-DP weave declares it
+	sf.target_rtv = c->render.weave_output_rtv.get();
+	sf.target_width = win_w;
+	sf.target_height = win_h;
+	sf.canvas.x = 0;
+	sf.canvas.y = 0;
+	sf.canvas.w = win_w;
+	sf.canvas.h = win_h;
+	// The present-owner composites the handback over its own window: alpha
+	// carries the 2D-vs-3D split, so the background is transparent and the
+	// client presents (pipeline_dp_set_transparency(..., client_presents=true)
+	// for the session's DP).
+	sf.transparent_background = true;
+	sf.client_presents = true;
+	sf.atlas_encoding = (int)service_single_client_atlas_encoding(c);
+	sf.primary_dp = dp;
+	sf.outcomp = c->weave_seg_outcomp;
+	comp_d3d11_segments_record(c->weave_segs, &sf);
+
+	// Leave exactly the state the single-DP weave leaves: the handback bound,
+	// full-target viewport and scissor.
+	ID3D11RenderTargetView *rtvs[] = {c->render.weave_output_rtv.get()};
+	ctx->OMSetRenderTargets(1, rtvs, nullptr);
+	D3D11_VIEWPORT vp = {};
+	vp.Width = (float)win_w;
+	vp.Height = (float)win_h;
+	vp.MaxDepth = 1.0f;
+	ctx->RSSetViewports(1, &vp);
+	D3D11_RECT sc = {0, 0, (LONG)win_w, (LONG)win_h};
+	ctx->RSSetScissorRects(1, &sc);
+}
+
+/*!
+ * Publish what this submit's weave did, for `weave_get_segments`: the table
+ * (count 0 = woven by one DP) with every segment's eyes — the primary's from
+ * @p primary_eyes (what the submit returns as its base eyes), the others
+ * predicted now from their segment DPs. The generation moves on a geometry
+ * change only (the eyes are not part of what is compared).
+ *
+ * Holding render_mutex.
+ */
+static void
+weave_seg_publish(struct d3d11_service_compositor *c,
+                  bool split,
+                  const struct comp_seg_rect *win,
+                  const struct xrt_eye_positions *primary_eyes)
+{
+	struct xrt_segment_metrics m;
+	memset(&m, 0, sizeof(m)); // memcmp'd by the publish: padding too
+	if (split && c->weave_segs != nullptr) {
+		const struct comp_seg_rect canvas = {0, 0, win->w, win->h};
+		(void)comp_d3d11_segments_get_metrics(c->weave_segs, win, &canvas, /*primary_has_dp*/ true, &m);
+	}
+	struct xrt_segment_metrics out;
+	{
+		std::lock_guard<std::mutex> lk(c->seg_mutex);
+		(void)comp_segments_publish(&c->weave_seg_pub, &m);
+		out = c->weave_seg_pub;
+	}
+	for (uint32_t k = 0; k < out.count && k < XRT_MAX_SEGMENTS; k++) {
+		struct xrt_segment_metric *s = &out.seg[k];
+		if (s->is_primary) {
+			s->have_eyes = primary_eyes != nullptr && primary_eyes->valid;
+			if (s->have_eyes) {
+				s->eyes = *primary_eyes;
+			}
+		} else {
+			s->have_eyes = comp_d3d11_segments_get_eyes(c->weave_segs, s->screen_id, &s->eyes);
+		}
+	}
+	std::lock_guard<std::mutex> lk(c->seg_mutex);
+	c->weave_seg_out = out;
+}
+
+/*!
+ * The display processor whose lattice a drag snap of the present-owner's
+ * window uses (#1884): the majority screen's segment DP at the PROPOSED
+ * position, with the handle owner's hysteresis — NULL for the primary screen
+ * (the caller's own snap path) or when the window is not segmented.
+ *
+ * @p target_x / @p target_y position the window FRAME (WM_WINDOWPOSCHANGING);
+ * the screens split the CLIENT area, so the frame-to-client offset of the
+ * window as it stands now is carried to the target.
+ *
+ * Holding render_mutex.
+ */
+static struct xrt_display_processor_d3d11 *
+weave_seg_snap_dp(struct d3d11_service_compositor *c, int32_t target_x, int32_t target_y)
+{
+	if (c->weave_segs == nullptr || !comp_d3d11_segments_enabled(c->weave_segs)) {
+		return nullptr;
+	}
+	HWND wnd = c->render.weave_hwnd;
+	struct comp_seg_rect client = {};
+	RECT wr = {};
+	if (!svc_seg_window_rect(wnd, &client) || !GetWindowRect(wnd, &wr)) {
+		return nullptr;
+	}
+	struct comp_seg_rect at = {};
+	at.x = target_x + (client.x - wr.left);
+	at.y = target_y + (client.y - wr.top);
+	at.w = client.w;
+	at.h = client.h;
+	return comp_d3d11_segments_snap_dp(c->weave_segs, &at, os_monotonic_get_ns(), nullptr);
+}
+
 bool
 comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
                                xrt_graphics_buffer_handle_t in_handle,
@@ -26954,6 +27230,15 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	 *     bounded trail instead of an unbounded one.
 	 */
 	const bool legacy_single_rect = (!nview && rect_count == 0);
+
+	// #1884 (ADR-047 Amendment 4): a bound window across a seam is woven per
+	// screen. Batch and v6 only — both weave the WHOLE window as one canvas,
+	// which is what the segment table cuts; the legacy branch weaves one
+	// element-sized canvas per call and stays single-DP. A client that never
+	// enabled segments (every single-screen box) returns false here before
+	// anything else, so its submit is the single-DP one, byte for byte.
+	struct comp_seg_rect seg_win = {};
+	const bool seg_split = !legacy_single_rect && weave_seg_update(sys, c, wnd, win_w, win_h, &seg_win);
 	bool clear_output = weave_frame_first;
 	if (weave_frame_first) {
 		c->render.weave_saw_frame_first = true;
@@ -27134,12 +27419,17 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		D3D11_RECT weave_scissor = {0, 0, (LONG)win_w, (LONG)win_h};
 		sys->context->RSSetScissorRects(1, &weave_scissor);
 		gpu_frame.stamp(WEAVE_TS_PRE_WEAVE);
-		hand_overlay_to_dp();
-		xrt_display_processor_d3d11_process_atlas(dp, sys->context.get(), dp_srv,
-		                                          /*view_w*/ cvw, /*view_h*/ cvh,
-		                                          layout->tile_columns, layout->tile_rows,
-		                                          DXGI_FORMAT_R8G8B8A8_UNORM, win_w, win_h,
-		                                          /*canvas_offset*/ 0, 0, win_w, win_h);
+		if (seg_split) {
+			weave_seg_record(sys, c, dp, dp_srv, cvw, cvh, layout->tile_columns, layout->tile_rows, win_w,
+			                 win_h);
+		} else {
+			hand_overlay_to_dp();
+			xrt_display_processor_d3d11_process_atlas(dp, sys->context.get(), dp_srv,
+			                                          /*view_w*/ cvw, /*view_h*/ cvh, layout->tile_columns,
+			                                          layout->tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, win_w,
+			                                          win_h,
+			                                          /*canvas_offset*/ 0, 0, win_w, win_h);
+		}
 		// #625 present-owner: a real panel-DP weave, driven by the client's own
 		// synchronous submit. It presents the woven texture itself, so this
 		// contributes to present/s with no matching panel flip (see header note).
@@ -27345,12 +27635,17 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		D3D11_RECT weave_scissor = {0, 0, (LONG)win_w, (LONG)win_h};
 		sys->context->RSSetScissorRects(1, &weave_scissor);
 		gpu_frame.stamp(WEAVE_TS_PRE_WEAVE);
-		hand_overlay_to_dp();
-		xrt_display_processor_d3d11_process_atlas(dp, sys->context.get(), c->render.weave_sbs_srv.get(),
-		                                          /*view_w*/ win_w, /*view_h*/ win_h,
-		                                          /*tile_columns*/ 2, /*tile_rows*/ 1,
-		                                          DXGI_FORMAT_R8G8B8A8_UNORM, win_w, win_h,
-		                                          /*canvas_offset*/ 0, 0, win_w, win_h);
+		if (seg_split) {
+			weave_seg_record(sys, c, dp, c->render.weave_sbs_srv.get(), win_w, win_h, /*cols*/ 2,
+			                 /*rows*/ 1, win_w, win_h);
+		} else {
+			hand_overlay_to_dp();
+			xrt_display_processor_d3d11_process_atlas(dp, sys->context.get(), c->render.weave_sbs_srv.get(),
+			                                          /*view_w*/ win_w, /*view_h*/ win_h,
+			                                          /*tile_columns*/ 2, /*tile_rows*/ 1,
+			                                          DXGI_FORMAT_R8G8B8A8_UNORM, win_w, win_h,
+			                                          /*canvas_offset*/ 0, 0, win_w, win_h);
+		}
 		g_frame_witness_service.count_weave(/*repaint*/ false, sys->hardware_display_3d);
 
 		// Batch phase split (throttled): blits (shared input -> SBS atlas,
@@ -27457,6 +27752,18 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	// itself is DP-internal — this is the only eye flow, and it's OUT.
 	if (out_eyes != nullptr) {
 		xrt_display_processor_d3d11_get_predicted_eye_positions(dp, out_eyes);
+	}
+	// #1884: and what this weave did per screen, with every screen's eyes,
+	// for the caller's XrWeaveOutputRectPartsDXR (weave_get_segments). A
+	// client that never enabled segments has nothing to publish.
+	if (seg_split || c->weave_segs != nullptr) {
+		struct xrt_eye_positions primary_eyes = {};
+		if (out_eyes != nullptr) {
+			primary_eyes = *out_eyes;
+		} else if (seg_split) {
+			xrt_display_processor_d3d11_get_predicted_eye_positions(dp, &primary_eyes);
+		}
+		weave_seg_publish(c, seg_split, &seg_win, &primary_eyes);
 	}
 
 	/* #964: a present-owner never commits a projection layer, so nothing else
@@ -27586,6 +27893,23 @@ comp_d3d11_service_weave_snap_window_rect(struct xrt_compositor *xc,
 	// weaver's. While this client is focused the panel DP is bound to its own
 	// weave_hwnd, so the snap is against the right window.
 	struct xrt_display_processor_d3d11 *sdp = panel_dp(c->sys, c);
+
+	// #1884 (ADR-047 Amendment 4): a present-owner whose window is woven per
+	// screen snaps to the lattice of the screen holding the majority of the
+	// window at the proposed position (the handle owner's hysteresis, so a
+	// drag across the seam does not flip lattices under the cursor). That
+	// screen's segment DP answers; a DP without snap support falls back to the
+	// panel DP below, which is the pre-#1884 answer.
+	struct xrt_display_processor_d3d11 *seg_dp = weave_seg_snap_dp(c, target_x, target_y);
+	if (seg_dp != nullptr) {
+		int32_t gx = target_x, gy = target_y;
+		if (xrt_display_processor_d3d11_snap_window_rect(seg_dp, origin_x, origin_y, target_x, target_y, &gx,
+		                                                 &gy)) {
+			*out_x = gx;
+			*out_y = gy;
+			return true;
+		}
+	}
 	if (sdp == nullptr) {
 		return false;
 	}
@@ -27597,6 +27921,22 @@ comp_d3d11_service_weave_snap_window_rect(struct xrt_compositor *xc,
 	*out_x = sx;
 	*out_y = sy;
 	return true;
+}
+
+extern "C" bool
+comp_d3d11_service_weave_get_segments(struct xrt_compositor *xc, struct xrt_segment_metrics *out)
+{
+	if (out == nullptr) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+	if (xc == nullptr || xc->destroy != compositor_destroy) {
+		return false;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	std::lock_guard<std::mutex> lk(c->seg_mutex); // leaf
+	*out = c->weave_seg_out;
+	return out->count > 0;
 }
 
 
@@ -29862,6 +30202,7 @@ comp_d3d11_service_set_client_segment_screens(struct xrt_system_compositor *xsys
 		c->seg_sys_info = info_copy;
 		c->seg_pinned_display_id = pinned_display_id;
 		c->seg_rebuild = true;
+		c->weave_seg_rebuild = true; // #1884: the present-owner's weave manager too
 		// ...and nothing may frame views from the old table meanwhile.
 		struct xrt_segment_metrics none;
 		memset(&none, 0, sizeof(none));
@@ -29982,6 +30323,7 @@ comp_d3d11_service_refresh_segment_screens(struct xrt_system_compositor *xsysc, 
 		// client: the old segment DPs are released, and the lifecycle makes
 		// each again from its screen's (new) registry entry.
 		c->seg_rebuild = true;
+		c->weave_seg_rebuild = true; // #1884: the present-owner's weave manager too
 		struct xrt_segment_metrics none;
 		memset(&none, 0, sizeof(none));
 		(void)comp_segments_publish(&c->seg_pub, &none);
