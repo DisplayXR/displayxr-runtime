@@ -590,6 +590,29 @@ comp_segments_owner_set_result(struct comp_segments_owner *o, uint64_t target_id
 	}
 }
 
+bool
+comp_segments_owner_needs_windowless_replacement(const struct comp_segment_table *t,
+                                                 uint64_t owner_id,
+                                                 bool owner_is_primary,
+                                                 bool owner_has_factory)
+{
+	if (owner_id == 0) {
+		return false; // nobody holds the window: nothing to replace
+	}
+	if (owner_is_primary) {
+		return true; // the session always keeps its own DP
+	}
+	if (!owner_has_factory || t == NULL) {
+		return false;
+	}
+	for (uint32_t k = 0; k < t->count; k++) {
+		if (t->seg[k].screen_id == owner_id && t->seg[k].window_rect.w > 0 && t->seg[k].window_rect.h > 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
 
 /*
  *

@@ -16,6 +16,7 @@
 #include "vk/vk_helpers.h"
 
 #include "os/os_threading.h"
+#include "os/os_time.h"
 
 #include "util/u_logging.h"
 #include "util/u_misc.h"
@@ -74,6 +75,9 @@ struct seg_screen_state
 	int transparent_latched;
 	//! The session-wide 2D/3D mode last sent to this DP (-1 = never).
 	int mode_sent;
+	//! Windows (ADR-047 Amendment 2): this DP holds the session's window —
+	//! it is the owner, and phases from the window, not the present origin.
+	bool has_hwnd;
 
 	/*!
 	 * One DP input image PER FRAME CLASS. The repaint ("fill") parks on its
@@ -138,6 +142,22 @@ struct comp_vk_native_segments
 
 	//! Rendering-mode index the segment DPs' tolerance was last read at.
 	uint32_t mode_index;
+
+	/*
+	 * Who holds the window handle (ADR-047 Amendment 2, Windows). Off the
+	 * primary, the owner's DP lives in st[owner_index].dp with has_hwnd set,
+	 * and the session's primary DP is a windowless per-screen DP the
+	 * compositor swapped in through hooks.swap_primary.
+	 */
+	struct comp_vk_native_segments_hwnd_hooks hooks;
+	struct comp_segments_owner owner;
+	uint32_t primary_index;  //!< index of the primary screen, UINT32_MAX = none
+	int owner_index;         //!< index of the screen holding the handle, -1 = none
+	bool primary_for_screen; //!< the primary's plug-in has create_dp_vk_for_screen
+	bool primary_windowless; //!< the session's primary DP is windowless right now
+	//! The last update's swapchain format (the hand-back at destroy / set_screens).
+	int32_t target_format;
+	bool have_target_format;
 
 	/*!
 	 * Guards every seg_screen_state::dp pointer swap against
@@ -348,6 +368,7 @@ dp_release(struct comp_vk_native_segments *segs, uint32_t i)
 	st->encoding_latched = -1;
 	st->transparent_latched = -1;
 	st->tolerates_resample = false;
+	st->has_hwnd = false;
 	for (uint32_t k = 0; k < SEG_CLASS_COUNT; k++) {
 		crop_retire(segs, &st->crop[k]);
 	}
@@ -355,9 +376,11 @@ dp_release(struct comp_vk_native_segments *segs, uint32_t i)
 }
 
 /*!
- * Create screen @p i's segment DP through the plug-in's per-screen factory.
- * Windowless (NULL window) on purpose: a segment DP's phase comes from
- * set_present_origin (ADR-033).
+ * Make (not install) a DP for screen @p i through the plug-in's per-screen
+ * factory. @p window is NULL for a windowless segment DP — its phase comes from
+ * set_present_origin (ADR-033) — and, on Windows only, the session's real HWND
+ * for the screen that owns it (the majority screen, whose DP keeps the vendor's
+ * drag phase-snap, ADR-047 Amendment 2).
  *
  * There is deliberately NO fallback to the plain `create_dp_vk`: that DP would
  * describe the plug-in's process-wide panel instead of this screen, and
@@ -366,17 +389,15 @@ dp_release(struct comp_vk_native_segments *segs, uint32_t i)
  * A plug-in without the slot gets flat 2D on its other screens
  * (has_dp_factory is false, so this is never reached for it).
  */
-static bool
-dp_create(struct comp_vk_native_segments *segs, uint32_t i, int32_t target_format)
+static struct xrt_display_processor *
+dp_make(struct comp_vk_native_segments *segs, uint32_t i, int32_t target_format, void *window)
 {
-	struct seg_screen_state *st = &segs->st[i];
 	const struct xrt_plugin_iface *iface = segs->iface[i];
+	const bool can = segs->screens[i].is_primary ? segs->primary_for_screen : segs->screens[i].has_dp_factory;
 	xrt_result_t xret = XRT_ERROR_DEVICE_CREATION_FAILED;
-	const char *how = "none";
 
 	struct xrt_display_processor *dp = NULL;
-	if (segs->screens[i].has_dp_factory && xrt_plugin_iface_has_create_dp_vk_for_screen(iface)) {
-		how = "create_dp_vk_for_screen";
+	if (can && xrt_plugin_iface_has_create_dp_vk_for_screen(iface)) {
 		/*
 		 * #868: same queue swap as vk_make_dp_vk — a vendor DP captures
 		 * vk->main_queue once, at creation, for its internal submits, and the
@@ -387,8 +408,8 @@ dp_create(struct comp_vk_native_segments *segs, uint32_t i, int32_t target_forma
 		if (segs->dp_queue != VK_NULL_HANDLE) {
 			segs->vk->main_queue->queue = segs->dp_queue;
 		}
-		xret = iface->create_dp_vk_for_screen(segs->inst[i], segs->vk, (void *)(uintptr_t)segs->cmd_pool, NULL,
-		                                      target_format, &segs->bindings[i], &dp);
+		xret = iface->create_dp_vk_for_screen(segs->inst[i], segs->vk, (void *)(uintptr_t)segs->cmd_pool,
+		                                      window, target_format, &segs->bindings[i], &dp);
 		segs->vk->main_queue->queue = saved;
 	}
 
@@ -396,24 +417,211 @@ dp_create(struct comp_vk_native_segments *segs, uint32_t i, int32_t target_forma
 		if (dp != NULL) {
 			xrt_display_processor_destroy(&dp);
 		}
-		U_LOG_W("segments: could not create a DP for screen 0x%016llx ('%s', plug-in '%s') via %s (%d) — "
-		        "that segment stays flat 2D",
-		        (unsigned long long)segs->screens[i].id, segs->bindings[i].device_name,
-		        segs->screens[i].plugin_id, how, (int)xret);
-		return false;
+		U_LOG_W(
+		    "segments: could not create a %s DP for screen 0x%016llx ('%s', plug-in '%s') via "
+		    "create_dp_vk_for_screen (%d)",
+		    window != NULL ? "window-holding" : "windowless", (unsigned long long)segs->screens[i].id,
+		    segs->bindings[i].device_name, segs->screens[i].plugin_id, (int)xret);
+		return NULL;
 	}
+	return dp;
+}
+
+/*!
+ * Install @p dp (may be NULL) as screen @p i's segment DP, latches reset so
+ * the next weave configures it. Returns the DP it replaced, for the caller to
+ * retire (once this returns, get_eyes can no longer reach it).
+ */
+static struct xrt_display_processor *
+dp_install(struct comp_vk_native_segments *segs, uint32_t i, struct xrt_display_processor *dp, bool has_hwnd)
+{
+	struct seg_screen_state *st = &segs->st[i];
+	// The app thread reads st->dp for eyes (M3): swap under the lock.
 	os_mutex_lock(&segs->dp_mutex);
+	struct xrt_display_processor *old = st->dp;
 	st->dp = dp;
 	os_mutex_unlock(&segs->dp_mutex);
-	st->tolerates_resample = xrt_display_processor_vk_tolerates_resample((struct xrt_display_processor_vk *)st->dp);
+	st->tolerates_resample =
+	    dp != NULL && xrt_display_processor_vk_tolerates_resample((struct xrt_display_processor_vk *)dp);
+	st->has_hwnd = dp != NULL && has_hwnd;
 	st->configured = false;
 	st->encoding_latched = -1;
 	st->transparent_latched = -1;
+	st->mode_sent = -1;
+	if (dp == NULL) {
+		for (uint32_t k = 0; k < SEG_CLASS_COUNT; k++) {
+			crop_retire(segs, &st->crop[k]);
+		}
+	}
+	return old;
+}
+
+/*!
+ * The lifecycle's CREATE: a windowless segment DP for screen @p i. A screen
+ * that already has a DP (it holds the window handle) keeps it.
+ */
+static bool
+dp_create(struct comp_vk_native_segments *segs, uint32_t i, int32_t target_format)
+{
+	if (segs->st[i].dp != NULL) {
+		return true;
+	}
+	struct xrt_display_processor *dp = dp_make(segs, i, target_format, NULL);
+	if (dp == NULL) {
+		U_LOG_W("segments: screen 0x%016llx's segment stays flat 2D", (unsigned long long)segs->screens[i].id);
+		return false;
+	}
+	(void)dp_install(segs, i, dp, false);
 	// Lifecycle event (hysteresis-gated), not per frame.
-	U_LOG_W("segments: created a segment DP for screen 0x%016llx ('%s', plug-in '%s') via %s — %s",
-	        (unsigned long long)segs->screens[i].id, segs->bindings[i].device_name, segs->screens[i].plugin_id,
-	        how, st->tolerates_resample ? "tolerates a resample" : "needs 1:1 pixels");
+	U_LOG_W(
+	    "segments: created a segment DP for screen 0x%016llx ('%s', plug-in '%s') via "
+	    "create_dp_vk_for_screen — %s",
+	    (unsigned long long)segs->screens[i].id, segs->bindings[i].device_name, segs->screens[i].plugin_id,
+	    segs->st[i].tolerates_resample ? "tolerates a resample" : "needs 1:1 pixels");
 	return true;
+}
+
+static const char *
+screen_name(const struct comp_vk_native_segments *segs, int i)
+{
+	return i >= 0 ? segs->bindings[i].device_name : "(none)";
+}
+
+/*!
+ * Put @p dp in screen @p i's slot — as the DP holding the window handle
+ * (@p has_hwnd) or as a windowless one — and retire what it replaces (deferred:
+ * a parked fill may still execute a command buffer that references it). The
+ * primary's slot is the session's own DP, swapped by the compositor.
+ */
+static void
+slot_replace(struct comp_vk_native_segments *segs, uint32_t i, struct xrt_display_processor *dp, bool has_hwnd)
+{
+	struct xrt_display_processor *old = NULL;
+	if (i == segs->primary_index) {
+		old = segs->hooks.swap_primary(segs->hooks.userdata, dp);
+		segs->primary_windowless = !has_hwnd;
+	} else {
+		old = dp_install(segs, i, dp, has_hwnd);
+		if (dp != NULL) {
+			// The lifecycle tracks this screen's DP as live: no second create.
+			comp_segments_lifecycle_set_created(&segs->lc, segs->screens[i].id, true);
+		}
+	}
+	release_deferred(segs, SEG_RETIRE_DP, (uint64_t)(uintptr_t)old);
+}
+
+/*!
+ * Move the window handle from the current owner to screen @p t (ADR-047
+ * Amendment 2) — the D3D11 manager's hwnd_handoff, in Vulkan terms. One weaver
+ * per window, and a live DP's window cannot be re-pointed, so:
+ *   1. make a windowless replacement for the old owner (the primary always
+ *      needs one; another screen only while the window still covers it) —
+ *      failing that, abort with nothing changed;
+ *   2. swap it in and retire the old owner's DP, which frees the window;
+ *   3. make the target's DP WITH the window and swap it in — failing that,
+ *      roll back (the old owner takes the window again).
+ * All of it runs on the weave thread between two weaves (the caller holds the
+ * compositor lock), so a frame weaves with the old pair or the new pair and
+ * never with a gap.
+ *
+ * Retiring is deferred while a fill may be in flight, and the WINDOW is
+ * released only when the old DP is really destroyed. So the old owner's DP is
+ * handed back to Vulkan before step 3 whenever the caller declared this update
+ * release-safe (the common case); otherwise a vendor that refuses a second
+ * weaver per window refuses step 3, the hand-off rolls back, and the owner
+ * hysteresis does not retry until the majority leaves and comes back — never
+ * a gap, never a flap.
+ */
+static void
+hwnd_handoff(struct comp_vk_native_segments *segs, uint32_t t, int32_t target_format)
+{
+	const int o = segs->owner_index;
+	if (o == (int)t) {
+		return;
+	}
+	const uint64_t t_id = segs->screens[t].id;
+	const uint64_t t0 = os_monotonic_get_ns();
+
+	// 1. The old owner's windowless replacement.
+	struct xrt_display_processor *w = NULL;
+	const bool o_needs_dp = o >= 0 && comp_segments_owner_needs_windowless_replacement(
+	                                      &segs->table, segs->screens[o].id, (uint32_t)o == segs->primary_index,
+	                                      segs->screens[o].has_dp_factory);
+	if (o_needs_dp) {
+		w = dp_make(segs, (uint32_t)o, target_format, NULL);
+		if (w == NULL) {
+			U_LOG_W("segments: the window handle stays with '%s' — no windowless DP to replace it with",
+			        screen_name(segs, o));
+			comp_segments_owner_set_result(&segs->owner, t_id, false, segs->screens[o].id);
+			return;
+		}
+	}
+
+	// 2. Free the window.
+	if (segs->hooks.bracket != NULL) {
+		segs->hooks.bracket(segs->hooks.userdata, true, NULL);
+	}
+	if (o >= 0) {
+		slot_replace(segs, (uint32_t)o, w, false);
+	}
+	// The old owner's DP is on the retire list; it releases the window only
+	// when destroyed, so hand it back now if no fill is in flight.
+	if (segs->release_safe) {
+		retire_drain(segs, true);
+	}
+
+	// 3. The target takes the window.
+	struct xrt_display_processor *h = dp_make(segs, t, target_format, segs->hooks.hwnd);
+	int now_owner = -1;
+	if (h != NULL) {
+		slot_replace(segs, t, h, true);
+		now_owner = (int)t;
+	} else if (o >= 0) {
+		// Roll back: the old owner takes it again.
+		struct xrt_display_processor *back = dp_make(segs, (uint32_t)o, target_format, segs->hooks.hwnd);
+		if (back != NULL) {
+			slot_replace(segs, (uint32_t)o, back, true);
+			now_owner = o;
+		}
+	}
+	segs->owner_index = now_owner;
+	if (segs->hooks.bracket != NULL) {
+		// The DP the drag snap asks now; NULL = the session's primary DP.
+		struct xrt_display_processor *hdp = NULL;
+		if (now_owner >= 0 && (uint32_t)now_owner != segs->primary_index) {
+			hdp = segs->st[now_owner].dp;
+		}
+		segs->hooks.bracket(segs->hooks.userdata, false, hdp);
+	}
+	comp_segments_owner_set_result(&segs->owner, t_id, h != NULL, now_owner >= 0 ? segs->screens[now_owner].id : 0);
+
+	// One line per flip (the flip itself is hysteresis-gated).
+	const double ms = (double)(os_monotonic_get_ns() - t0) / 1.0e6;
+	if (h != NULL) {
+		U_LOG_W(
+		    "segments: window handle handed from '%s' to '%s' (screen 0x%016llx holds the majority) in "
+		    "%.1f ms — drag snap follows it; '%s' weaves windowless (Vulkan)",
+		    screen_name(segs, o), screen_name(segs, (int)t), (unsigned long long)t_id, ms,
+		    screen_name(segs, o));
+	} else {
+		U_LOG_W("segments: window handle hand-off to '%s' FAILED after %.1f ms — %s (Vulkan)",
+		        screen_name(segs, (int)t), ms,
+		        now_owner >= 0 ? "rolled back to the previous owner" : "no DP holds the window now");
+	}
+}
+
+/*!
+ * Hand the window back to the primary screen's DP (a screen-list rebuild or a
+ * teardown while another screen owns it). No-op when the primary owns it.
+ */
+static void
+hwnd_return_to_primary(struct comp_vk_native_segments *segs)
+{
+	if (segs->hooks.swap_primary == NULL || segs->primary_index == UINT32_MAX || !segs->have_target_format ||
+	    (segs->owner_index == (int)segs->primary_index && !segs->primary_windowless)) {
+		return;
+	}
+	hwnd_handoff(segs, segs->primary_index, segs->target_format);
 }
 
 /*!
@@ -485,6 +693,8 @@ comp_vk_native_segments_create(struct vk_bundle *vk, VkCommandPool cmd_pool, VkQ
 	segs->cmd_pool = cmd_pool;
 	segs->dp_queue = dp_queue;
 	segs->display_mode = -1;
+	segs->primary_index = UINT32_MAX;
+	segs->owner_index = -1;
 	for (uint32_t i = 0; i < COMP_SEGMENTS_MAX_SCREENS; i++) {
 		segs->st[i].mode_sent = -1;
 	}
@@ -503,11 +713,16 @@ comp_vk_native_segments_destroy(struct comp_vk_native_segments **segs_ptr)
 		return;
 	}
 	struct comp_vk_native_segments *segs = *segs_ptr;
+	// The caller guarantees nothing in flight (see the header).
+	segs->release_safe = true;
+	// Another screen holds the window: hand it back to the session's primary
+	// DP first (no hooks = compositor teardown, where the primary DP goes
+	// too). An empty table: the old owner needs no windowless replacement.
+	segs->table.count = 0;
+	hwnd_return_to_primary(segs);
 	for (uint32_t i = 0; i < COMP_SEGMENTS_MAX_SCREENS; i++) {
 		dp_release(segs, i);
 	}
-	// The caller guarantees nothing in flight (see the header).
-	segs->release_safe = true;
 	retire_drain(segs, true);
 	segs->release_safe = false;
 	os_mutex_destroy(&segs->dp_mutex);
@@ -525,10 +740,19 @@ comp_vk_native_segments_set_screens(struct comp_vk_native_segments *segs,
 		return;
 	}
 	// A new screen set invalidates every segment DP built for the old one.
+	// The window goes back to the primary DP first (an empty table: the old
+	// owner needs no windowless replacement). Deferred releases only: a fill
+	// may be in flight.
+	segs->table.count = 0;
+	hwnd_return_to_primary(segs);
 	for (uint32_t i = 0; i < COMP_SEGMENTS_MAX_SCREENS; i++) {
 		dp_release(segs, i);
 	}
 	comp_segments_lifecycle_init(&segs->lc, 0, 0);
+	segs->primary_index = UINT32_MAX;
+	segs->owner_index = -1;
+	segs->primary_for_screen = false;
+	segs->primary_windowless = false;
 	segs->enabled = false;
 	segs->screen_count = 0;
 	segs->have_logged_table = false;
@@ -598,7 +822,16 @@ comp_vk_native_segments_set_screens(struct comp_vk_native_segments *segs,
 
 		segs->iface[n] = NULL;
 		segs->inst[n] = NULL;
-		if (e != NULL && !cs->is_primary) {
+		if (cs->is_primary) {
+			// The primary's own plug-in, for the window-handle hand-off
+			// (Windows): a windowless primary DP while another screen
+			// holds the window.
+			segs->iface[n] = (const struct xrt_plugin_iface *)e->owning_iface;
+			segs->inst[n] = (struct xrt_plugin_instance *)e->owning_instance;
+			segs->primary_for_screen =
+			    e->dp_factory_vk != NULL && xrt_plugin_iface_has_create_dp_vk_for_screen(segs->iface[n]);
+			segs->primary_index = n;
+		} else if (e != NULL) {
 			/*
 			 * Multi-screen M3 (closes the M4 runtime gap): a segment's DP
 			 * comes from ITS screen's registry entry, whichever plug-in
@@ -656,11 +889,48 @@ comp_vk_native_segments_set_screens(struct comp_vk_native_segments *segs,
 		    primary_entry->plugin_id, vendors);
 	}
 	segs->enabled = n >= 2;
-	if (segs->enabled) {
-		U_LOG_W("segments: %u screens, plug-in '%s' — a window spanning screens is woven per screen "
-		        "(multi-screen M2)",
-		        n, primary_entry->plugin_id);
+	if (segs->primary_index == UINT32_MAX) {
+		segs->primary_for_screen = false; // no primary segment: nothing to hand off from
 	}
+	if (segs->enabled) {
+		if (segs->primary_index != UINT32_MAX) {
+			segs->owner_index = (int)segs->primary_index;
+			comp_segments_owner_init(&segs->owner, segs->screens[segs->primary_index].id, 0, 0);
+		}
+		const bool handoff = segs->hooks.swap_primary != NULL && segs->primary_for_screen;
+		U_LOG_W(
+		    "segments: %u screens, plug-in '%s' — a window spanning screens is woven per screen "
+		    "(multi-screen, Vulkan); the window handle %s",
+		    n, primary_entry->plugin_id,
+		    handoff ? "follows the majority screen"
+		            : (segs->hooks.swap_primary == NULL
+		                   ? "stays with the primary DP (no window to hand off)"
+		                   : "stays with the primary DP (its plug-in has no create_dp_vk_for_screen)"));
+	}
+}
+
+void
+comp_vk_native_segments_set_hwnd_hooks(struct comp_vk_native_segments *segs,
+                                       const struct comp_vk_native_segments_hwnd_hooks *hooks)
+{
+	if (segs == NULL) {
+		return;
+	}
+	if (hooks == NULL || hooks->hwnd == NULL || hooks->swap_primary == NULL) {
+		memset(&segs->hooks, 0, sizeof(segs->hooks));
+		return;
+	}
+	segs->hooks = *hooks;
+}
+
+uint64_t
+comp_vk_native_segments_get_owner(const struct comp_vk_native_segments *segs)
+{
+	if (segs == NULL || !segs->enabled || segs->owner_index < 0 ||
+	    (uint32_t)segs->owner_index >= segs->screen_count) {
+		return 0;
+	}
+	return segs->screens[segs->owner_index].id;
 }
 
 bool
@@ -683,10 +953,12 @@ comp_vk_native_segments_update(struct comp_vk_native_segments *segs,
 	// Retired DPs / images go back to Vulkan only when no fill is in flight.
 	segs->release_safe = release_safe;
 	retire_drain(segs, release_safe);
-	segs->release_safe = false;
 	if (!segs->enabled || window_desktop == NULL) {
+		segs->release_safe = false;
 		return false;
 	}
+	segs->target_format = target_format;
+	segs->have_target_format = true;
 
 	comp_segments_compute(window_desktop, canvas, segs->screens, segs->screen_count, &segs->table);
 
@@ -700,10 +972,26 @@ comp_vk_native_segments_update(struct comp_vk_native_segments *segs,
 		if (act.items[a].action == COMP_SEG_ACTION_CREATE) {
 			const bool ok = dp_create(segs, (uint32_t)i, target_format);
 			comp_segments_lifecycle_set_created(&segs->lc, act.items[a].screen_id, ok);
-		} else if (act.items[a].action == COMP_SEG_ACTION_DESTROY) {
+		} else if (act.items[a].action == COMP_SEG_ACTION_DESTROY && !segs->st[i].has_hwnd) {
+			// The DP holding the window outlives its segment: it moves
+			// only by a hand-off (below), never by a retire.
 			dp_release(segs, (uint32_t)i);
 		}
 	}
+
+	/*
+	 * ADR-047 Amendment 2 (Windows): the window handle follows the majority
+	 * screen, hysteresis in comp_segments_owner (a clear margin held for
+	 * 0.5 s). No hooks (Linux, a windowless session) = never.
+	 */
+	if (segs->hooks.swap_primary != NULL && segs->primary_for_screen) {
+		const uint64_t target = comp_segments_owner_update(&segs->owner, &segs->table, os_monotonic_get_ns());
+		const int ti = target != 0 ? screen_index_of(segs, target) : -1;
+		if (ti >= 0) {
+			hwnd_handoff(segs, (uint32_t)ti, target_format);
+		}
+	}
+	segs->release_safe = false;
 
 	const uint32_t cw = canvas != NULL && canvas->w > 0 ? canvas->w : window_desktop->w;
 	const uint32_t ch = canvas != NULL && canvas->h > 0 ? canvas->h : window_desktop->h;
@@ -747,7 +1035,10 @@ comp_vk_native_segments_update(struct comp_vk_native_segments *segs,
 	if (!split) {
 		segs->cap_count = 0;
 	}
-	return split;
+	// A windowless primary DP needs its present origin, which only the split
+	// path sends: keep it while another screen (or nobody) holds the window,
+	// even with the window back on the primary alone (until the hand-back).
+	return split || segs->primary_windowless;
 }
 
 bool
@@ -775,8 +1066,17 @@ comp_vk_native_segments_record(struct comp_vk_native_segments *segs,
 
 	for (uint32_t k = 0; k < t->count; k++) {
 		const struct comp_segment *g = &t->seg[k];
-		have_tile[k] =
-		    segment_tile_rect(&g->window_rect, &f->canvas, f->view_width, f->view_height, &tx[k], &ty[k], &tw[k], &th[k]);
+		// #1883: where THIS segment's views were painted — for a routed frame
+		// the partition it was located for, not the live seam.
+		{
+			struct comp_seg_rect r;
+			have_tile[k] =
+			    comp_segments_source_rect(g, &f->canvas, f->view_width, f->view_height, f->content, &r);
+			tx[k] = r.x;
+			ty[k] = r.y;
+			tw[k] = r.w;
+			th[k] = r.h;
+		}
 		const int i = (int)g->screen_index;
 		st_of[k] = (i >= 0 && (uint32_t)i < segs->screen_count) ? &segs->st[i] : NULL;
 		if (g->is_primary) {
@@ -883,7 +1183,15 @@ comp_vk_native_segments_record(struct comp_vk_native_segments *segs,
 				              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 				              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
 			}
-			if (!g->is_primary) {
+			if (g->is_primary) {
+				// The session feeds its own DP everything else; windowless
+				// (another screen holds the window), it needs its phase here.
+				if (segs->primary_windowless && g->screen_1to1 != COMP_SEG_1TO1_NO) {
+					xrt_display_processor_vk_set_present_origin(
+					    (struct xrt_display_processor_vk *)dp, g->present_origin_x,
+					    g->present_origin_y);
+				}
+			} else {
 				struct xrt_display_processor_vk *vdp = (struct xrt_display_processor_vk *)dp;
 				if (!st->configured) {
 					st->configured = true;
@@ -906,7 +1214,9 @@ comp_vk_native_segments_record(struct comp_vk_native_segments *segs,
 				// Phase only where window px ARE device px; a resampled
 				// screen's origin is in the wrong units (and only a
 				// resample-tolerant DP weaves there, which has no phase).
-				if (g->screen_1to1 != COMP_SEG_1TO1_NO) {
+				// The DP holding the window phases from it, like the
+				// primary always has.
+				if (!st->has_hwnd && g->screen_1to1 != COMP_SEG_1TO1_NO) {
 					xrt_display_processor_vk_set_present_origin(vdp, g->present_origin_x,
 					                                            g->present_origin_y);
 				}
@@ -934,12 +1244,16 @@ comp_vk_native_segments_record(struct comp_vk_native_segments *segs,
 	 * seam registration as the shipped off-panel band (#1654).
 	 */
 	struct comp_seg_rect flat_dst[COMP_SEGMENTS_MAX + COMP_SEGMENTS_MAX_UNCOVERED];
+	struct comp_seg_rect flat_src[COMP_SEGMENTS_MAX] = {0};
 	uint32_t flat_n = 0;
 	for (uint32_t k = 0; k < t->count; k++) {
 		if (!weave[k] && have_tile[k]) {
+			// The segment's own views (#1883), like the crop.
+			flat_src[flat_n] = (struct comp_seg_rect){tx[k], ty[k], tw[k], th[k]};
 			flat_dst[flat_n++] = t->seg[k].window_rect;
 		}
 	}
+	const uint32_t flat_seg_n = flat_n;
 	flat_n += comp_segments_uncovered(t, &f->canvas, &flat_dst[flat_n], COMP_SEGMENTS_MAX_UNCOVERED);
 	if (flat_n > 0) {
 		const uint32_t views = f->tile_columns * f->tile_rows;
@@ -958,7 +1272,13 @@ comp_vk_native_segments_record(struct comp_vk_native_segments *segs,
 			const struct comp_seg_rect *d = &flat_dst[k];
 			int32_t sx = 0, sy = 0;
 			uint32_t sw = 0, sh = 0;
-			if (!segment_tile_rect(d, &f->canvas, f->view_width, f->view_height, &sx, &sy, &sw, &sh)) {
+			if (k < flat_seg_n) {
+				sx = flat_src[k].x;
+				sy = flat_src[k].y;
+				sw = flat_src[k].w;
+				sh = flat_src[k].h;
+			} else if (!segment_tile_rect(d, &f->canvas, f->view_width, f->view_height, &sx, &sy, &sw,
+			                              &sh)) {
 				continue; // thinner than one source pixel
 			}
 			VkImageBlit blit = {

@@ -17,7 +17,9 @@
 // XR_DXR_depth_budget: struct xrt_dp_background_preview (the per-API slot
 // headers only forward-declare it - the vtable takes it by pointer).
 #include "xrt/xrt_display_processor.h"
+#include "xrt/xrt_display_metrics.h"
 #include "xrt/xrt_limits.h"
+#include "xrt/xrt_screen.h"
 
 #include "util/u_logging.h"
 #include "util/u_misc.h"
@@ -51,8 +53,12 @@
 #include "comp_split_gate.h"
 #include "comp_xbridge.h"
 #include "d3d11/comp_d3d11_outcomp.h"
+#include "d3d11/comp_d3d11_segments.h"
 #include "d3d11/comp_d3d11_target.h"
 #include "d3d/d3d_scanout_helpers.hpp"
+
+#include "os/os_threading.h"
+#include "util/comp_segments.h"
 
 
 /*
@@ -226,6 +232,38 @@ struct comp_vk_split
 	//! ADR-027 P4 — the scanout weaver's zone capability, probed once.
 	int zone_dp_state;
 	bool zone_published;
+
+	/*!
+	 * @name Multi-screen M6 under the split (ADR-047 Amendments 1 + 2)
+	 *
+	 * The D3D11 segment manager, on the OUTPUT device. @ref segments is made
+	 * lazily on the first weave after @ref comp_vk_split_set_screens.
+	 * @{
+	 */
+	struct comp_d3d11_segments *segments;
+	struct xrt_screen_list *seg_screens;             //!< heap copy, NULL = never handed over
+	struct xrt_system_compositor_info *seg_sys_info; //!< heap copy (the DP registry)
+	uint64_t seg_pinned_display_id;
+	bool seg_rebuild; //!< a new list arrived: rebuild on the next weave
+	//! Guards @ref segments (create / destroy) and @ref seg_pub against the
+	//! app thread's xrLocateViews. Taken before @ref dp_mutex, never after.
+	struct os_mutex seg_mutex;
+	struct xrt_segment_metrics seg_pub; //!< the table the last weave took (count 0 = one view set)
+	//! #1883: the partition staged for the next submit, and each submitted
+	//! frame's partition keyed by its bridge sequence (the egress slot lags).
+	struct comp_segments_content seg_content_staged;
+	struct comp_segments_content_ring seg_content_ring;
+	/*!
+	 * Guards @ref dp against the app-thread forwarders below: the segment
+	 * manager swaps it for a windowless per-screen DP (and back) when the
+	 * window handle moves between screens (Amendment 2). Leaf lock.
+	 */
+	struct os_mutex dp_mutex;
+	bool mutexes_init;
+	//! The session's eye-tracking mode, re-sent to a swapped-in DP.
+	uint32_t eye_tracking_mode;
+	bool eye_tracking_mode_set;
+	/*! @} */
 
 	uint64_t composites, composite_bails;
 
@@ -617,6 +655,9 @@ split_release_plane_view(struct comp_vk_split::split_plane_view *v)
 	v->seq = 0;
 }
 
+static void
+split_segments_release(struct comp_vk_split *s);
+
 //! Release the output half. Idempotent; leaves the borrowed app end alone.
 static void
 split_release_out(struct comp_vk_split *s)
@@ -652,6 +693,13 @@ split_release_out(struct comp_vk_split *s)
 	s->dp_input_w = 0;
 	s->dp_input_h = 0;
 	/*
+	 * Multi-screen M6: the segment DPs go first, with no window hand-back (the
+	 * split's own DP goes right after) — so whichever DP holds the window
+	 * (a segment DP or the split's) is gone before the app-device create
+	 * that follows a retire binds the window again.
+	 */
+	split_segments_release(s);
+	/*
 	 * The weaver dies BEFORE its device, and before the target it was writing
 	 * into is gone — the (hwnd, device) bind key means a weaver left alive here
 	 * would silently refuse the app-device create that follows a retire.
@@ -678,6 +726,244 @@ split_release_out(struct comp_vk_split *s)
 	s->app_dev = NULL;
 	s->app_ctx = NULL;
 	s->app_adapter = NULL;
+}
+
+
+static void
+split_destroy_mutexes(struct comp_vk_split *s)
+{
+	if (s->mutexes_init) {
+		os_mutex_destroy(&s->seg_mutex);
+		os_mutex_destroy(&s->dp_mutex);
+		s->mutexes_init = false;
+	}
+}
+
+
+/*
+ *
+ * Multi-screen M6 under the split (ADR-047 Amendments 1 + 2).
+ *
+ */
+
+/*!
+ * Amendment 2 hook: install @p dp as the split's weaver (weave thread, the
+ * compositor lock held) and return the previous one for the segment manager
+ * to destroy. Re-sends the session-level state a new DP has not seen; the
+ * per-frame inputs follow, because the hand-off runs before them in
+ * @ref comp_vk_split_weave_and_present.
+ */
+static struct xrt_display_processor_d3d11 *
+split_seg_swap_primary_cb(void *userdata, struct xrt_display_processor_d3d11 *dp)
+{
+	struct comp_vk_split *s = static_cast<struct comp_vk_split *>(userdata);
+	os_mutex_lock(&s->dp_mutex);
+	struct xrt_display_processor_d3d11 *old = s->dp;
+	s->dp = dp;
+	os_mutex_unlock(&s->dp_mutex);
+	if (dp != nullptr) {
+		xrt_display_processor_d3d11_set_transparent_background(dp, s->transparent_background,
+		                                                       /*client_presents=*/false);
+		xrt_display_processor_d3d11_set_shared_texture_present(dp, false);
+		xrt_display_processor_d3d11_request_display_mode(dp, s->mode_3d);
+		if (s->eye_tracking_mode_set) {
+			xrt_display_processor_d3d11_set_eye_tracking_mode(dp, s->eye_tracking_mode);
+		}
+	}
+	// A zone wish published to the old DP goes with it; the next publish
+	// starts fresh instead of clearing a mask the new DP never saw.
+	s->zone_published = false;
+	return old;
+}
+
+//! Tear the segment manager down (no window hand-back: the split's DP goes next).
+static void
+split_segments_release(struct comp_vk_split *s)
+{
+	if (!s->mutexes_init) {
+		return;
+	}
+	os_mutex_lock(&s->seg_mutex);
+	comp_d3d11_segments_set_hwnd_hooks(s->segments, nullptr);
+	comp_d3d11_segments_destroy(&s->segments);
+	memset(&s->seg_pub, 0, sizeof(s->seg_pub));
+	os_mutex_unlock(&s->seg_mutex);
+	free(s->seg_screens);
+	s->seg_screens = nullptr;
+	free(s->seg_sys_info);
+	s->seg_sys_info = nullptr;
+}
+
+/*!
+ * One metric update for the segment manager, run on the weave thread before
+ * any per-frame DP input is sent (a window-handle hand-off may swap @ref dp).
+ * Builds the manager on the OUTPUT device on first use or after
+ * @ref comp_vk_split_set_screens, reads the window's client rect (device px:
+ * every DisplayXR executable is per-monitor DPI aware, #1201) and publishes
+ * the table this weave took for the next xrLocateViews.
+ *
+ * @return true when this weave takes the per-segment path.
+ */
+static bool
+split_segments_update(struct comp_vk_split *s, uint32_t tgt_w, uint32_t tgt_h, struct comp_seg_rect *out_window)
+{
+	bool split = false;
+	struct comp_seg_rect win = {0, 0, 0, 0};
+	if (s->seg_screens != nullptr && s->seg_sys_info != nullptr && s->hwnd != nullptr && s->dp != nullptr) {
+		RECT rc = {};
+		POINT org = {0, 0};
+		if (GetClientRect(s->hwnd, &rc) && ClientToScreen(s->hwnd, &org)) {
+			win.x = org.x;
+			win.y = org.y;
+			win.w = (uint32_t)(rc.right > rc.left ? rc.right - rc.left : 0);
+			win.h = (uint32_t)(rc.bottom > rc.top ? rc.bottom - rc.top : 0);
+		}
+	}
+	if (win.w > 0 && win.h > 0) {
+		if (s->seg_rebuild || s->segments == nullptr) {
+			os_mutex_lock(&s->seg_mutex); // the app thread reads s->segments for eyes
+			if (s->seg_rebuild) {
+				comp_d3d11_segments_set_hwnd_hooks(s->segments, nullptr);
+				comp_d3d11_segments_destroy(&s->segments);
+				s->seg_rebuild = false;
+			}
+			if (s->segments == nullptr) {
+				s->segments = comp_d3d11_segments_create(s->out_dev);
+				if (s->segments != nullptr) {
+					// ADR-047 Amendment 2: the window follows the majority
+					// screen, by swapping this split's own DP.
+					struct comp_d3d11_segments_hwnd_hooks hooks = {};
+					hooks.hwnd = s->hwnd;
+					hooks.userdata = s;
+					hooks.swap_primary = split_seg_swap_primary_cb;
+					// The SDK's WndProc drag snap needs no runtime provider.
+					hooks.bracket = nullptr;
+					comp_d3d11_segments_set_hwnd_hooks(s->segments, &hooks);
+					comp_d3d11_segments_set_screens(s->segments, s->seg_screens, s->seg_sys_info,
+					                                s->seg_pinned_display_id);
+					if (comp_d3d11_segments_enabled(s->segments)) {
+						// Lifecycle (once per manager): names the device the
+						// segment DPs are made on, the rig's proof they present.
+						U_LOG_W(
+						    "segments: under the VK #918 output-device split — segment DPs are "
+						    "created on the OUTPUT device (LUID=%08lx:%08lx, device %p) and "
+						    "weave "
+						    "the egress slot (ADR-047 Amendment 1, Vulkan)",
+						    (unsigned long)s->out_luid.HighPart,
+						    (unsigned long)s->out_luid.LowPart, (void *)s->out_dev);
+					}
+				}
+			}
+			os_mutex_unlock(&s->seg_mutex);
+		}
+		if (comp_d3d11_segments_enabled(s->segments)) {
+			// The canvas is the window, clamped to the chain: a window that has
+			// just grown is ahead of the swapchain for a frame (#1178).
+			const struct comp_seg_rect canvas = {0, 0, win.w < tgt_w ? win.w : tgt_w,
+			                                     win.h < tgt_h ? win.h : tgt_h};
+			const uint32_t mode_index = (s->xdev != nullptr && s->xdev->hmd != nullptr)
+			                                ? s->xdev->hmd->active_rendering_mode_index
+			                                : 0;
+			split = comp_d3d11_segments_update(s->segments, &win, &canvas, s->out_ctx, mode_index);
+			// Every segment DP follows the session's 2D/3D mode, like the primary.
+			comp_d3d11_segments_set_display_mode(s->segments, s->mode_3d);
+		}
+	}
+
+	// Multi-screen M3: publish the table this weave took (count 0 = one view set).
+	struct xrt_segment_metrics m;
+	memset(&m, 0, sizeof(m));
+	if (split) {
+		const struct comp_seg_rect canvas = {0, 0, win.w < tgt_w ? win.w : tgt_w,
+		                                     win.h < tgt_h ? win.h : tgt_h};
+		(void)comp_d3d11_segments_get_metrics(s->segments, &win, &canvas, s->dp != nullptr, &m);
+	}
+	os_mutex_lock(&s->seg_mutex);
+	m.generation = s->seg_pub.generation;
+	struct xrt_segment_metrics prev = s->seg_pub;
+	prev.generation = m.generation;
+	if (memcmp(&prev, &m, sizeof(m)) != 0) {
+		m.generation++;
+	}
+	s->seg_pub = m;
+	os_mutex_unlock(&s->seg_mutex);
+
+	*out_window = win;
+	return split;
+}
+
+extern "C" void
+comp_vk_split_set_screens(struct comp_vk_split *s,
+                          const struct xrt_screen_list *list,
+                          const struct xrt_system_compositor_info *info,
+                          uint64_t pinned_display_id)
+{
+	if (s == nullptr || list == nullptr || info == nullptr) {
+		return;
+	}
+	struct xrt_screen_list *lc = U_TYPED_CALLOC(struct xrt_screen_list);
+	struct xrt_system_compositor_info *ic = U_TYPED_CALLOC(struct xrt_system_compositor_info);
+	if (lc == nullptr || ic == nullptr) {
+		free(lc);
+		free(ic);
+		return;
+	}
+	*lc = *list;
+	*ic = *info;
+	free(s->seg_screens);
+	free(s->seg_sys_info);
+	s->seg_screens = lc;
+	s->seg_sys_info = ic;
+	s->seg_pinned_display_id = pinned_display_id;
+	s->seg_rebuild = true;
+	// Nothing may frame views from the old table meanwhile.
+	os_mutex_lock(&s->seg_mutex);
+	memset(&s->seg_pub, 0, sizeof(s->seg_pub));
+	os_mutex_unlock(&s->seg_mutex);
+}
+
+extern "C" void
+comp_vk_split_stage_segment_content(struct comp_vk_split *s, const struct comp_segments_content *content)
+{
+	if (s == nullptr) {
+		return;
+	}
+	if (content != nullptr) {
+		s->seg_content_staged = *content;
+	} else {
+		memset(&s->seg_content_staged, 0, sizeof(s->seg_content_staged));
+	}
+}
+
+extern "C" bool
+comp_vk_split_get_segment_metrics(struct comp_vk_split *s, struct xrt_segment_metrics *out)
+{
+	if (out == nullptr) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+	if (s == nullptr || !s->mutexes_init) {
+		return false;
+	}
+	os_mutex_lock(&s->seg_mutex);
+	*out = s->seg_pub;
+	// The eyes are predicted NOW, per segment: the primary from the split's
+	// own DP, every other screen from its segment DP (guarded against the
+	// weave destroying it).
+	for (uint32_t k = 0; k < out->count && k < XRT_MAX_SEGMENTS; k++) {
+		struct xrt_segment_metric *g = &out->seg[k];
+		if (g->is_primary) {
+			os_mutex_lock(&s->dp_mutex);
+			g->have_eyes = s->dp != nullptr &&
+			               xrt_display_processor_d3d11_get_predicted_eye_positions(s->dp, &g->eyes) &&
+			               g->eyes.valid;
+			os_mutex_unlock(&s->dp_mutex);
+		} else {
+			g->have_eyes = comp_d3d11_segments_get_eyes(s->segments, g->screen_id, &g->eyes);
+		}
+	}
+	os_mutex_unlock(&s->seg_mutex);
+	return out->count > 0;
 }
 
 
@@ -783,6 +1069,10 @@ comp_vk_split_stage_a(const struct comp_vk_split_info *info,
 		*out_short_reason = COMP_SPLIT_REASON_STAGE_A_FAILED;
 		return XRT_ERROR_ALLOCATION;
 	}
+	// Multi-screen M6 (segments + the window-handle hand-off).
+	os_mutex_init(&s->seg_mutex);
+	os_mutex_init(&s->dp_mutex);
+	s->mutexes_init = true;
 	s->xdev = info->xdev;
 	s->hwnd = (HWND)info->hwnd;
 	s->dp_factory_d3d11 = info->dp_factory_d3d11;
@@ -869,6 +1159,7 @@ comp_vk_split_stage_a(const struct comp_vk_split_info *info,
 
 	if (reason != nullptr) {
 		split_release_out(s);
+		split_destroy_mutexes(s);
 		free(s);
 		*out_short_reason = (stage_a_token != nullptr) ? stage_a_token : COMP_SPLIT_REASON_STAGE_A_FAILED;
 		U_LOG_W("VK output-device split DISABLED (%s) — falling back to the stock single-device Vulkan "
@@ -1070,6 +1361,7 @@ comp_vk_split_destroy(struct comp_vk_split **split_ptr)
 	    (unsigned long long)s->composite_bails);
 
 	split_release_out(s);
+	split_destroy_mutexes(s);
 	free(s);
 }
 
@@ -1750,6 +2042,8 @@ comp_vk_split_submit_atlas(struct comp_vk_split *s,
 		}
 	}
 	s->seq++;
+	// #1883: the slot this fills carries the frame's segment partition.
+	comp_segments_content_ring_put(&s->seg_content_ring, s->seq, &s->seg_content_staged);
 	comp_xbridge_submit(s->xbridge, s->seq, s->layout_gen, handoff->texture, content_w, content_h);
 	if (km != nullptr) {
 		km->ReleaseSync(0);
@@ -2237,6 +2531,14 @@ comp_vk_split_weave_and_present(struct comp_vk_split *s, bool is_repaint, const 
 	comp_d3d11_target_get_dimensions(s->target, &tgt_w, &tgt_h);
 	split_check_target_follows_window(s, tgt_w, tgt_h);
 
+	/*
+	 * Multi-screen M6 (ADR-047 Amendment 1): a window spanning screens is
+	 * woven per segment on THIS device. Run first: the window-handle hand-off
+	 * (Amendment 2) may swap s->dp, and everything below feeds s->dp.
+	 */
+	struct comp_seg_rect seg_window = {0, 0, 0, 0};
+	const bool seg_split = split_segments_update(s, tgt_w, tgt_h, &seg_window);
+
 	// Late-weave pacing + the weave-latency harness mark, on the scanout
 	// adapter where the present now happens.
 	if (is_repaint) {
@@ -2308,10 +2610,55 @@ comp_vk_split_weave_and_present(struct comp_vk_split *s, bool is_repaint, const 
 	if (canvas != nullptr) {
 		cv = *canvas;
 	}
-	xrt_display_processor_d3d11_process_atlas(s->dp, s->out_ctx, atlas_srv, weave_view_w, weave_view_h, weave_cols,
-	                                          weave_rows, (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM, tgt_w, tgt_h,
-	                                          cv.offset.w, cv.offset.h, (uint32_t)cv.extent.w,
-	                                          (uint32_t)cv.extent.h);
+	if (seg_split) {
+		/*
+		 * The D3D11 segment manager, exactly as the in-process D3D11
+		 * compositor drives it under its own split: crop per segment out of
+		 * the egress slot, each screen's DP over its canvas, flat 2D through
+		 * the output composite unit where a segment cannot weave.
+		 *
+		 * #1883: the slot was painted a frame or two before the frame being
+		 * committed, so its per-segment mosaic sits where THAT frame's routing
+		 * put it; the crop reads the slot's own partition (by its sequence).
+		 * A slot no longer in the ring is treated as unrouted (live crop).
+		 */
+		struct comp_segments_content slot_content = {};
+		{
+			uint64_t slot_seq = 0;
+			if (!comp_xbridge_slot_seq(s->xbridge, slot, &slot_seq) ||
+			    !comp_segments_content_ring_get(&s->seg_content_ring, slot_seq, &slot_content)) {
+				memset(&slot_content, 0, sizeof(slot_content));
+			}
+		}
+		struct comp_d3d11_segments_frame sf = {};
+		sf.content = &slot_content;
+		sf.context = s->out_ctx;
+		sf.src_srv = atlas_srv;
+		sf.view_width = weave_view_w;
+		sf.view_height = weave_view_h;
+		sf.tile_columns = weave_cols;
+		sf.tile_rows = weave_rows;
+		sf.src_format = (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM;
+		sf.target_rtv = comp_d3d11_target_get_rtv(s->target);
+		sf.target_width = tgt_w;
+		sf.target_height = tgt_h;
+		sf.canvas.x = 0;
+		sf.canvas.y = 0;
+		sf.canvas.w = seg_window.w < tgt_w ? seg_window.w : tgt_w;
+		sf.canvas.h = seg_window.h < tgt_h ? seg_window.h : tgt_h;
+		sf.transparent_background = s->transparent_background;
+		sf.atlas_encoding = -1; // the split declares none to its own DP either
+		sf.primary_dp = s->dp;
+		sf.outcomp = split_ensure_outcomp(s) ? s->outcomp : nullptr;
+		(void)comp_d3d11_segments_record(s->segments, &sf);
+		// Everything after sees the state the single-DP path leaves.
+		comp_d3d11_target_bind(s->target);
+	} else {
+		xrt_display_processor_d3d11_process_atlas(s->dp, s->out_ctx, atlas_srv, weave_view_w, weave_view_h,
+		                                          weave_cols, weave_rows, (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM,
+		                                          tgt_w, tgt_h, cv.offset.w, cv.offset.h, (uint32_t)cv.extent.w,
+		                                          (uint32_t)cv.extent.h);
+	}
 
 	/*
 	 * VK-1b-2 — the masked 2D-over-3D composite, then the HUD, both on the OUT
@@ -2419,67 +2766,95 @@ comp_vk_split_render_diag(struct comp_vk_split *s)
  *
  */
 
+/*
+ * Every forwarder below runs on the APP thread and holds dp_mutex across the
+ * call: the weave may swap s->dp for another screen's DP (ADR-047 Amendment 2,
+ * a window-handle hand-off), and the old one is destroyed right after.
+ */
+
 extern "C" bool
 comp_vk_split_get_predicted_eye_positions(struct comp_vk_split *s, struct xrt_eye_positions *out_eye_pos)
 {
-	if (s == nullptr || s->dp == nullptr) {
+	if (s == nullptr) {
 		return false;
 	}
-	return xrt_display_processor_d3d11_get_predicted_eye_positions(s->dp, out_eye_pos);
+	os_mutex_lock(&s->dp_mutex);
+	const bool ok = s->dp != nullptr && xrt_display_processor_d3d11_get_predicted_eye_positions(s->dp, out_eye_pos);
+	os_mutex_unlock(&s->dp_mutex);
+	return ok;
 }
 
 extern "C" bool
 comp_vk_split_get_display_dimensions(struct comp_vk_split *s, float *out_width_m, float *out_height_m)
 {
-	if (s == nullptr || s->dp == nullptr) {
+	if (s == nullptr) {
 		return false;
 	}
-	return xrt_display_processor_d3d11_get_display_dimensions(s->dp, out_width_m, out_height_m);
+	os_mutex_lock(&s->dp_mutex);
+	const bool ok =
+	    s->dp != nullptr && xrt_display_processor_d3d11_get_display_dimensions(s->dp, out_width_m, out_height_m);
+	os_mutex_unlock(&s->dp_mutex);
+	return ok;
 }
 
 extern "C" bool
 comp_vk_split_get_display_pixel_info(
     struct comp_vk_split *s, uint32_t *out_width_px, uint32_t *out_height_px, int32_t *out_left, int32_t *out_top)
 {
-	if (s == nullptr || s->dp == nullptr) {
+	if (s == nullptr) {
 		return false;
 	}
-	return xrt_display_processor_d3d11_get_display_pixel_info(s->dp, out_width_px, out_height_px, out_left,
-	                                                          out_top);
+	os_mutex_lock(&s->dp_mutex);
+	const bool ok = s->dp != nullptr && xrt_display_processor_d3d11_get_display_pixel_info(
+	                                        s->dp, out_width_px, out_height_px, out_left, out_top);
+	os_mutex_unlock(&s->dp_mutex);
+	return ok;
 }
 
 extern "C" bool
 comp_vk_split_request_display_mode(struct comp_vk_split *s, bool enable_3d)
 {
-	if (s == nullptr || s->dp == nullptr) {
+	if (s == nullptr) {
 		return false;
 	}
-	const bool ok = xrt_display_processor_d3d11_request_display_mode(s->dp, enable_3d);
+	os_mutex_lock(&s->dp_mutex);
+	const bool ok = s->dp != nullptr && xrt_display_processor_d3d11_request_display_mode(s->dp, enable_3d);
 	if (ok) {
 		// The weave marks' mode_3d source — see the field doc.
 		s->mode_3d = enable_3d;
 	}
+	os_mutex_unlock(&s->dp_mutex);
 	return ok;
 }
 
 extern "C" void
 comp_vk_split_set_eye_tracking_mode(struct comp_vk_split *s, uint32_t mode)
 {
-	if (s == nullptr || s->dp == nullptr) {
+	if (s == nullptr) {
 		return;
 	}
-	xrt_display_processor_d3d11_set_eye_tracking_mode(s->dp, mode);
+	os_mutex_lock(&s->dp_mutex);
+	// Remembered for a swapped-in DP (Amendment 2).
+	s->eye_tracking_mode = mode;
+	s->eye_tracking_mode_set = true;
+	if (s->dp != nullptr) {
+		xrt_display_processor_d3d11_set_eye_tracking_mode(s->dp, mode);
+	}
+	os_mutex_unlock(&s->dp_mutex);
 }
 
 extern "C" bool
 comp_vk_split_get_background_preview(struct comp_vk_split *s, struct xrt_dp_background_preview *out_preview)
 {
-	if (s == nullptr || s->dp == nullptr || out_preview == nullptr) {
+	if (s == nullptr || out_preview == nullptr) {
 		return false;
 	}
 	// Pixels only. The inline wrapper already answers false for a plug-in whose
 	// vtable predates the slot, so an older weaver is "no source", not a crash.
-	return xrt_display_processor_d3d11_get_background_preview(s->dp, out_preview);
+	os_mutex_lock(&s->dp_mutex);
+	const bool ok = s->dp != nullptr && xrt_display_processor_d3d11_get_background_preview(s->dp, out_preview);
+	os_mutex_unlock(&s->dp_mutex);
+	return ok;
 }
 
 #else /* !(XRT_OS_WINDOWS && XRT_HAVE_D3D11) */
@@ -2774,6 +3149,35 @@ comp_vk_split_get_background_preview(struct comp_vk_split *split, struct xrt_dp_
 {
 	(void)split;
 	(void)out_preview;
+	return false;
+}
+
+extern "C" void
+comp_vk_split_set_screens(struct comp_vk_split *split,
+                          const struct xrt_screen_list *list,
+                          const struct xrt_system_compositor_info *info,
+                          uint64_t pinned_display_id)
+{
+	(void)split;
+	(void)list;
+	(void)info;
+	(void)pinned_display_id;
+}
+
+extern "C" void
+comp_vk_split_stage_segment_content(struct comp_vk_split *split, const struct comp_segments_content *content)
+{
+	(void)split;
+	(void)content;
+}
+
+extern "C" bool
+comp_vk_split_get_segment_metrics(struct comp_vk_split *split, struct xrt_segment_metrics *out)
+{
+	(void)split;
+	if (out != NULL) {
+		memset(out, 0, sizeof(*out));
+	}
 	return false;
 }
 

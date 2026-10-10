@@ -527,6 +527,29 @@ comp_segments_owner_update(struct comp_segments_owner *o, const struct comp_segm
 void
 comp_segments_owner_set_result(struct comp_segments_owner *o, uint64_t target_id, bool ok, uint64_t owner_id);
 
+/*!
+ * During a window-handle hand-off, does the OLD owner need a windowless
+ * replacement DP before its DP (which holds the window) is destroyed? A weaver
+ * is one-per-window and a live DP's window cannot be re-pointed, so the old
+ * owner's DP must go; this says whether something must take its place:
+ *   - the primary screen always keeps a DP (it is the session's own DP), and
+ *   - another screen keeps one only while the window still covers it and its
+ *     plug-in can make a per-screen DP (else its segment is flat 2D anyway).
+ *
+ * The rule the D3D11 manager's hwnd_handoff applies inline; the Vulkan manager
+ * (comp_vk_native_segments) shares it from here.
+ *
+ * @param t                 The current segment table.
+ * @param owner_id          The screen whose DP holds the window now (0 = none).
+ * @param owner_is_primary  That screen is the primary (system-default) one.
+ * @param owner_has_factory That screen's plug-in has the per-screen factory.
+ */
+bool
+comp_segments_owner_needs_windowless_replacement(const struct comp_segment_table *t,
+                                                 uint64_t owner_id,
+                                                 bool owner_is_primary,
+                                                 bool owner_has_factory);
+
 
 /*
  *

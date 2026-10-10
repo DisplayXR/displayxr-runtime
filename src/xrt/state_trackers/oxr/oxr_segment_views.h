@@ -53,16 +53,19 @@ oxr_segment_views_set_capacity(uint32_t screens_with_dp_factory, bool can_segmen
 
 /*!
  * Does one DP-registry entry give its screen a display processor a Windows
- * in-process compositor can segment with? Both the D3D11 and the D3D12
- * compositor segment windows (multi-screen M6), and the view-set capacity is
- * per system, so a screen counts toward @ref oxr_segment_views_set_capacity
- * when EITHER factory is set (the entry's `dp_factory_d3d11` /
- * `dp_factory_d3d12`).
+ * in-process compositor can segment with? The D3D11, D3D12 and Vulkan
+ * compositors all segment windows (multi-screen M6; the Vulkan one under the
+ * #918 split segments with D3D11 DPs on the scanout adapter), and the view-set
+ * capacity is per system, so a screen counts toward
+ * @ref oxr_segment_views_set_capacity when ANY of those factories is set (the
+ * entry's `dp_factory_d3d11` / `dp_factory_d3d12` / `dp_factory_vk`).
  */
 static inline bool
-oxr_segment_views_win_entry_has_dp(const void *dp_factory_d3d11, const void *dp_factory_d3d12)
+oxr_segment_views_win_entry_has_dp(const void *dp_factory_d3d11,
+                                   const void *dp_factory_d3d12,
+                                   const void *dp_factory_vk)
 {
-	return dp_factory_d3d11 != NULL || dp_factory_d3d12 != NULL;
+	return dp_factory_d3d11 != NULL || dp_factory_d3d12 != NULL || dp_factory_vk != NULL;
 }
 
 /*!

@@ -120,6 +120,10 @@
 
 struct xrt_device;
 struct comp_vk_split;
+struct xrt_screen_list;
+struct xrt_segment_metrics;
+struct xrt_system_compositor_info;
+struct comp_segments_content;
 struct comp_vk_deposit_handoff;
 //! XR_DXR_depth_budget - taken by pointer only; see xrt/xrt_display_processor.h.
 struct xrt_dp_background_preview;
@@ -690,6 +694,56 @@ comp_vk_split_set_eye_tracking_mode(struct comp_vk_split *split, uint32_t mode);
  */
 bool
 comp_vk_split_get_background_preview(struct comp_vk_split *split, struct xrt_dp_background_preview *out_preview);
+/*! @} */
+
+/*!
+ * @name Multi-screen M6 under the split (ADR-047 Amendment 1, Vulkan)
+ *
+ * Under the split the weave is the D3D11 one on the scanout adapter, so a
+ * window spanning screens is segmented the way the in-process D3D11
+ * compositor segments it under ITS split: the D3D11 segment manager
+ * (comp_d3d11_segments) lives on the OUTPUT device, its DPs come from each
+ * screen's `create_dp_d3d11_for_screen`, they weave the egress slot, and the
+ * window handle follows the majority screen (ADR-047 Amendment 2) by swapping
+ * the split's own DP. The Vulkan segment manager is not used while the split
+ * is up.
+ * @{
+ */
+
+/*!
+ * Hand over the system's screens and DP registry (copied). The segment
+ * manager is (re)built on the next weave. Caller holds the compositor lock.
+ *
+ * @param list               The screens (xrEnumerateDisplaysDXR's list).
+ * @param info               System compositor info: the DP registry.
+ * @param pinned_display_id  The session's display binding, 0 = none (a pinned
+ *                           session is never segmented).
+ */
+void
+comp_vk_split_set_screens(struct comp_vk_split *split,
+                          const struct xrt_screen_list *list,
+                          const struct xrt_system_compositor_info *info,
+                          uint64_t pinned_display_id);
+
+/*!
+ * The segment table the last weave took, as per-segment view metrics, with
+ * each segment's eyes predicted NOW (the primary from the split's DP, every
+ * other screen from its segment DP). App thread (xrLocateViews).
+ *
+ * @return false when the last weave did not split the window.
+ */
+bool
+comp_vk_split_get_segment_metrics(struct comp_vk_split *split, struct xrt_segment_metrics *out);
+
+/*!
+ * #1883: the segment partition the atlas about to be submitted was PAINTED
+ * with (the renderer's per-segment mosaic; NULL / count 0 = unrouted). Call
+ * right before @ref comp_vk_split_submit_atlas: the submit records it under the
+ * slot's sequence, so the weave crops each segment's views out of the egress
+ * slot where THAT frame painted them — the slot lags the committed frame.
+ */
+void
+comp_vk_split_stage_segment_content(struct comp_vk_split *split, const struct comp_segments_content *content);
 /*! @} */
 
 #ifdef __cplusplus

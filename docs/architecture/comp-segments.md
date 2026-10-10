@@ -42,7 +42,6 @@ half-open, so a window flush to a seam belongs to exactly one screen.
   the owning plug-in's iface + instance, kept resident by the loader as a claim source,
   M0): its ABI-checked factory
   `xrt_plugin_iface::create_dp_vk_for_screen` with an `xrt_screen_binding`
-  `xrt_plugin_iface::create_dp_vk_for_screen` with an `xrt_screen_binding`
   (monitor id, desktop rect, native px, mm, serial) — only that slot: a plug-in
   without it gets a flat 2D view on its other screens, never a plain `create_dp_vk`
   DP (which would describe the wrong panel and may clear the whole target). It is
@@ -142,7 +141,8 @@ or destroy is one WARN.
 - In-process Vulkan compositor, desktop Linux, **X11/XWayland**: root coordinates
   are desktop-absolute, the same space as the registry's RandR rects. Native Wayland
   stays primary-only — the geometry payload does not describe the other monitors
-  (`docs/specs/runtime/wayland-window-geometry.md` §5).
+  (`docs/specs/runtime/wayland-window-geometry.md` §5). On **Windows** the same
+  compositor segments too — see *Windows / Vulkan (M6)* below.
 - **Mixed vendors** (M3): a Leia DS1 next to a sim_display laptop panel is
   segmented like any other layout; each segment DP comes from its own screen's plug-in
   and the table logs one INFO line naming the vendors. A plug-in whose VK factory was
@@ -209,6 +209,65 @@ deferred-release list because the immediate context executes in order). What dif
   views at that segment's rect inside every tile (the mosaic; quads and equirect2 once per segment
   with that segment's camera). A routed frame is never zero-copy. This is what makes an untracked
   second panel render from its own viewer instead of the tracked panel's.
+
+## Windows / Vulkan (M6)
+
+The in-process Vulkan compositor (`cube_handle_vk_win`, the Vulkan `displayxr-demo-*` apps)
+segments a spanning window on Windows as well (ADR-047 Amendment 5). Which manager weaves depends
+on where the weave runs, which the Vulkan #918 output-device split (#1178) decides:
+
+- **Off the split** — the Vulkan manager above (`comp_vk_native_segments`), unchanged from Linux
+  except for the window:
+  - **Units.** The window rect is the HWND's client area from `ClientToScreen`, cached by the
+    same `vk_get_window_metrics` read the present origin uses — device px in a per-monitor-DPI-aware
+    process (every DisplayXR executable embeds the manifest, #1201), the registry's monitor space.
+  - **The window follows the majority screen** (ADR-047 Amendment 2), the D3D11 policy in Vulkan
+    terms: `comp_vk_native_segments_hwnd_hooks` (set only on Windows, only for a session with a
+    real window, never the shared-texture path), `comp_segments_owner_*` hysteresis, a windowless
+    replacement first (`comp_segments_owner_needs_windowless_replacement`), rollback on failure,
+    the HWND-holding DP made through `create_dp_vk_for_screen` with the window. The compositor's
+    `swap_primary` installs the new primary under `dp_swap_mutex` (the app-thread readers — eyes,
+    panel geometry, 2D/3D, eye-tracking mode, the snap — take it too) and re-sends transparency,
+    shared-texture present, the 2D/3D mode and the eye-tracking mode; the weave site replays that
+    weave's per-frame inputs (target view, backdrop, frame timing, atlas encoding) to the new DP.
+    The snap (`xrWeaveSnapWindowRectDXR`) asks the DP holding the window.
+  - **Retire, never destroy, on a hand-off.** A repaint parked on its fence with the lock released
+    (#1264 S1) may still execute a command buffer that references the old DP, so a replaced DP goes
+    on the retire list like every other segment resource. The list is drained before the new owner
+    is made whenever the update is release-safe (no parked repaint) — a vendor weaver is one per
+    window and only a destroyed one lets go of it. In the rare unsafe case the new owner's create
+    may be refused; the hand-off then rolls back and is retried only after the majority leaves.
+  - One WARN per flip: `segments: window handle handed from '<dev>' to '<dev>' … (Vulkan)`.
+- **Under the split** — the weave is the D3D11 one on the scanout adapter, so the window is
+  segmented by the **D3D11** manager (`comp_d3d11_segments`, linked into the Vulkan compositor from
+  `comp_d3d11_segs`) exactly as § *Windows / D3D11* describes for the D3D11 compositor's own split:
+  made on the output device, DPs from `create_dp_d3d11_for_screen`, the egress slot cropped per
+  segment, flat 2D through the split's output composite unit, the hand-off swapping the split's
+  own DP (`split_seg_swap_primary_cb`, guarded by the split's `dp_mutex`). It runs in
+  `comp_vk_split_weave_and_present` right after the swapchain image is acquired and before any
+  per-frame DP input, so a hand-off's new DP gets them all. One WARN when the manager is made:
+  `segments: under the VK #918 output-device split — segment DPs are created on the OUTPUT device …`.
+  `comp_vk_native_compositor_set_screens` forwards the list to the split; a split that retires
+  mid-session leaves the Vulkan manager to take over on the next weave.
+- **Per-segment views (M3)** work on both arms: `oxr_system` counts a registry Vulkan factory
+  toward the view-set capacity on Windows (alongside D3D11 / D3D12), `xrLocateViews` reads
+  `comp_vk_native_compositor_get_segment_metrics` (which asks the split when it is up), and the
+  Vulkan renderer paints the mosaic on the app device — under the split it crosses the bridge
+  like any atlas.
+- **Not segmented on Windows / Vulkan:** zero-copy frames, a self-submitting DP or one without a
+  render pass (off the split), the shared-texture path, a pinned session, `DXR_SEGMENTS=0`.
+- **Vendor side.** The Leia plug-in's Vulkan per-screen DP is SR v2 only (routing, binding, present
+  origin and the simulated viewer exist only on the v2 C API); a process on the bundled v1 Vulkan
+  weavers gets flat 2D on its other screens. Under the split the plug-in's D3D11 per-screen DP is
+  what weaves, so no Vulkan slot is involved there.
+- **#1883 on both arms:** each segment's views are cropped where the frame PAINTED them, never at
+  the live seam. Off the split the partition is set with `eff_layout`'s routing
+  (`comp_vk_native_compositor::seg_content`, so a repaint replays it with its atlas) and handed to
+  `comp_vk_native_segments_frame::content` — which also fixes the Linux M2/M3 path, the same
+  module; under the split the compositor stages it before every `comp_vk_split_submit_atlas`
+  (`comp_vk_split_stage_segment_content`), the split records it under the bridge sequence and the
+  weave looks up the woven slot's own partition (`comp_xbridge_slot_seq`), exactly the D3D11
+  split's ring.
 
 ## macOS / Metal
 

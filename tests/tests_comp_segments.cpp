@@ -581,6 +581,38 @@ TEST_CASE("comp_segments: HWND owner hysteresis", "[comp_segments]")
 	}
 }
 
+TEST_CASE("comp_segments: hand-off replaces the old owner only where something must weave", "[comp_segments]")
+{
+	// The shared rule of every backend's hand-off (D3D11, Vulkan, the Vulkan
+	// #918 split): before the DP holding the window is destroyed, does its
+	// screen need a windowless replacement?
+	const comp_segment_table spanning = window_at(3840 - 300); // both screens
+	const comp_segment_table on_laptop = window_at(100);       // the laptop only
+	REQUIRE(spanning.count == 2);
+	REQUIRE(on_laptop.count == 1);
+
+	// The primary always keeps a DP: it is the session's own.
+	CHECK(comp_segments_owner_needs_windowless_replacement(&spanning, LAPTOP, true, true));
+	CHECK(comp_segments_owner_needs_windowless_replacement(&on_laptop, LAPTOP, true, false));
+	CHECK(comp_segments_owner_needs_windowless_replacement(nullptr, LAPTOP, true, false));
+
+	// Another screen keeps one only while the window still covers it...
+	CHECK(comp_segments_owner_needs_windowless_replacement(&spanning, ACER, false, true));
+	CHECK_FALSE(comp_segments_owner_needs_windowless_replacement(&on_laptop, ACER, false, true));
+	// ...and only when its plug-in can make a per-screen DP (else flat 2D).
+	CHECK_FALSE(comp_segments_owner_needs_windowless_replacement(&spanning, ACER, false, false));
+
+	// An empty table (the hand-back at teardown / a screen-list rebuild):
+	// only the primary is replaced.
+	comp_segment_table empty{};
+	CHECK_FALSE(comp_segments_owner_needs_windowless_replacement(&empty, ACER, false, true));
+	CHECK(comp_segments_owner_needs_windowless_replacement(&empty, LAPTOP, true, true));
+
+	// Nobody holds the window (a failed hand-off): nothing to replace.
+	CHECK_FALSE(comp_segments_owner_needs_windowless_replacement(&spanning, 0, false, true));
+	CHECK_FALSE(comp_segments_owner_needs_windowless_replacement(&spanning, 0, true, true));
+}
+
 TEST_CASE("comp_segments: deferred release")
 {
 	comp_segments_retire r{};

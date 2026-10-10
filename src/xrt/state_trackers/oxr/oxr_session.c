@@ -4186,8 +4186,8 @@ locate_views_one(struct oxr_logger *log,
  */
 
 //! The compositor's segment table, when this session's compositor segments its
-//! window (in-process Vulkan on desktop Linux, in-process D3D11 / D3D12 on
-//! Windows, the D3D11 service for a Windows IPC session that enabled it — one
+//! window (in-process Vulkan on desktop Linux and Windows, in-process D3D11 /
+//! D3D12 on Windows, the D3D11 service for a Windows IPC session that enabled it — one
 //! round trip, only on a box with two DP-backed screens). Everything else —
 //! the other native compositors, every other service session — answers false
 //! and keeps one view set.
@@ -6299,10 +6299,12 @@ oxr_session_create(struct oxr_logger *log,
 	}
 #endif
 
-#if defined(XRT_HAVE_VK_NATIVE_COMPOSITOR) && defined(XRT_OS_LINUX_DESKTOP)
-	// Multi-screen M2: the in-process Vulkan compositor weaves a window that
-	// spans screens per segment, each with its own screen's DP; it needs the
-	// screen list (and stays single-DP for a session pinned to one display).
+#if defined(XRT_HAVE_VK_NATIVE_COMPOSITOR) && (defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_WINDOWS))
+	// Multi-screen M2 (Linux) / M6 (Windows): the in-process Vulkan compositor
+	// weaves a window that spans screens per segment, each with its own
+	// screen's DP; it needs the screen list (and stays single-DP for a session
+	// pinned to one display). On Windows under the #918 split the compositor
+	// hands the list on to the split's D3D11 segment manager.
 	if (sess->is_vk_native_compositor && sess->xcn != NULL) {
 		struct xrt_screen_list *screens = U_TYPED_CALLOC(struct xrt_screen_list);
 		if (screens != NULL) {
