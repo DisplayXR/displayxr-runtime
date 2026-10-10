@@ -40,3 +40,11 @@ endif()
 if(APPLE)
 	target_link_libraries(comp_null PRIVATE comp_macos_window)
 endif()
+
+# Desktop-Linux out-of-process present path (#710): the null compositor is the
+# service's system compositor on Linux too, and its target service creates the
+# runtime-owned X11 surface (comp_window_linux) the comp_multi shared spatial
+# surface presents to.
+if(TARGET comp_linux_window)
+	target_link_libraries(comp_null PRIVATE comp_linux_window)
+endif()

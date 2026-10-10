@@ -254,6 +254,33 @@ if(APPLE)
 endif()
 
 ###
+# Shared desktop-Linux service window (#710, #967): the runtime-owned X11
+# surface (Xorg or XWayland) the service's comp_multi shared spatial surface
+# presents to, plus the comp_target_swapchain it drives. The comp_macos_window
+# twin: comp_null creates it through the target service, comp_multi toggles its
+# visibility / cursor, and the IPC server installs its input sink, so it is one
+# library every consumer links. Consumers see XRT_HAVE_COMP_LINUX_WINDOW.
+# Defined before add_subdirectory(null) so comp_null can link it.
+if(XRT_HAVE_LINUX
+   AND NOT ANDROID
+   AND XRT_HAVE_XCB
+   AND XRT_HAVE_VULKAN
+   )
+	add_library(
+		comp_linux_window STATIC main/comp_window_linux.c main/comp_window_linux.h
+					 main/comp_target_swapchain.c
+		)
+	target_link_libraries(
+		comp_linux_window
+		PUBLIC xrt-interfaces
+		PRIVATE aux_util aux_os aux_vk ${XCB_LIBRARIES}
+		)
+	target_include_directories(comp_linux_window PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+	target_include_directories(comp_linux_window PRIVATE ${XCB_INCLUDE_DIRS})
+	target_compile_definitions(comp_linux_window INTERFACE XRT_HAVE_COMP_LINUX_WINDOW)
+endif()
+
+###
 # Null compositor
 #
 
@@ -353,6 +380,12 @@ if(ANDROID)
 	# no extra link is needed beyond the NDK's libandroid, which aux_android
 	# already carries.
 	target_sources(comp_multi PRIVATE multi/comp_multi_weave_android.c)
+endif()
+
+# Desktop-Linux shared spatial surface (#710, #967): visibility + cursor toggles
+# on the service-owned X11 surface (comp_window_linux).
+if(TARGET comp_linux_window)
+	target_link_libraries(comp_multi PRIVATE comp_linux_window)
 endif()
 
 if(XRT_FEATURE_COMP_MULTI_WEAVE_LINUX)
