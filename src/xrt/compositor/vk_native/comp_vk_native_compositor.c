@@ -1161,16 +1161,17 @@ struct comp_vk_native_compositor
 		//! Resolved once at create (dxr_async_handoff_resolve).
 		bool enabled;
 		//! The serial of the posted-but-not-awaited request; 0 = none.
-		//! App thread only (posted and drained by layer_commit).
+		//! Under weave_hand.mutex: set at the post, cleared only by
+		//! layer_commit's drain. Other app-thread drains (the zone-mask
+		//! entry points, which may run on any app thread) only wait on it.
 		uint64_t outstanding_seq;
-		//! TRACE: EMA of the app thread's hand-off wait — the post->served
-		//! wait on a blocking frame, the drain wait on a non-blocking one.
-		//! Written by the app thread, read by the trace row on the weave
-		//! thread: a benign race (a torn read misprints one trace field).
+		//! TRACE, all under weave_hand.mutex: EMA of the app thread's
+		//! hand-off wait — the post->served wait on a blocking frame, the
+		//! commit drain on a non-blocking one — and the window tallies
+		//! (snapshotted + zeroed with the #1905 row): frames posted
+		//! non-blocking / blocking, and commit drains that actually had to
+		//! wait (> 0.5 ms — the previous weave was still unserved: the bound).
 		uint64_t wait_ema_ns;
-		//! TRACE window tallies (zeroed with the #1905 row): frames posted
-		//! non-blocking / blocking, and drains that actually had to wait
-		//! (> 0.5 ms — the previous weave was still unserved: the bound).
 		uint32_t win_async, win_sync, win_stalls;
 	} hand_async;
 #endif
@@ -7896,16 +7897,18 @@ vk_midframe_active(const struct comp_vk_native_compositor *c)
 static bool
 dxr_async_handoff_resolve(bool layer_live, int single)
 {
+	// Exactly "1" forces ON, exactly "0" forces OFF; anything else ("auto",
+	// "true", empty) is auto. The env, when set non-empty, wins over the prop.
 	int forced = -1; // -1 = auto
 	const char *e = getenv("DXR_ASYNC_HANDOFF");
 	if (e != NULL && e[0] != '\0') {
-		forced = (e[0] == '1') ? 1 : 0;
+		forced = strcmp(e, "1") == 0 ? 1 : strcmp(e, "0") == 0 ? 0 : -1;
 	}
 #ifdef XRT_OS_ANDROID
 	else {
 		char sp[PROP_VALUE_MAX] = {0};
-		if (__system_property_get("debug.dxr.async_handoff", sp) > 0 && sp[0] != '\0') {
-			forced = (sp[0] == '1') ? 1 : 0;
+		if (__system_property_get("debug.dxr.async_handoff", sp) > 0) {
+			forced = strcmp(sp, "1") == 0 ? 1 : strcmp(sp, "0") == 0 ? 0 : -1;
 		}
 	}
 #endif
@@ -7946,7 +7949,7 @@ vk_async_handoff_eligible(const struct comp_vk_native_compositor *c, bool zero_c
 	return true;
 }
 
-//! TRACE: fold one app-side hand-off wait into the EMA (app thread only).
+//! TRACE: fold one app-side hand-off wait into the EMA. weave_hand.mutex held.
 static void
 vk_async_note_wait(struct comp_vk_native_compositor *c, uint64_t d)
 {
@@ -7963,26 +7966,33 @@ enum vk_async_drain
 
 /*!
  * #1905 ask 2: THE BOUND. Wait for the posted-but-unawaited weave before the
- * next commit overwrites anything it reads. In the normal case (app frame
- * longer than the weave) it was served long ago and this returns at once.
+ * caller touches anything it reads or records from. In the normal case (app
+ * frame longer than the weave) it was served long ago and this returns at once.
+ *
+ * @p from_commit: layer_commit's drain consumes the request (clears
+ * outstanding_seq) and feeds the trace; any other app-thread entry point (the
+ * zone-mask API, which shares the renderer's command pool and the app queue
+ * with the weave) only waits for it.
  *
  * Same 2 s deadline, abandon-by-serial and trylock evidence test as the
  * blocking wait in layer_commit (#1394), for the same reasons — repeated here
  * rather than shared so the non-Android frame path stays byte-identical.
- * Called by the app thread with c->mutex NOT held.
+ * Called with c->mutex NOT held.
  */
 static enum vk_async_drain
-vk_async_handoff_drain(struct comp_vk_native_compositor *c)
+vk_async_handoff_drain(struct comp_vk_native_compositor *c, bool from_commit)
 {
-	const uint64_t my_seq = c->hand_async.outstanding_seq;
-	if (my_seq == 0) {
-		return VK_ASYNC_DRAIN_CLEAR;
-	}
-	c->hand_async.outstanding_seq = 0;
-
 	const uint64_t t0 = os_monotonic_get_ns();
 	bool abandoned = false;
 	os_mutex_lock(&c->weave_hand.mutex);
+	const uint64_t my_seq = c->hand_async.outstanding_seq;
+	if (my_seq == 0) {
+		os_mutex_unlock(&c->weave_hand.mutex);
+		return VK_ASYNC_DRAIN_CLEAR;
+	}
+	if (from_commit) {
+		c->hand_async.outstanding_seq = 0;
+	}
 	const uint64_t deadline_ns = t0 + 2ULL * 1000 * 1000 * 1000;
 	while (c->weave_hand.pending && c->weave_hand.seq == my_seq) {
 		os_cond_wait_timeout_ns(&c->weave_hand.cond, &c->weave_hand.mutex, 100ULL * 1000 * 1000);
@@ -8003,14 +8013,16 @@ vk_async_handoff_drain(struct comp_vk_native_compositor *c)
 	if (!abandoned) {
 		c->weave_hand.consecutive_expiries = 0;
 	}
+	if (from_commit) {
+		const uint64_t d = os_monotonic_get_ns() - t0;
+		vk_async_note_wait(c, d);
+		if (d > 500ULL * 1000) {
+			c->hand_async.win_stalls++;
+		}
+	}
 	const uint64_t hb_at_expiry = c->weave_hand.heartbeat;
 	os_mutex_unlock(&c->weave_hand.mutex);
 
-	const uint64_t d = os_monotonic_get_ns() - t0;
-	vk_async_note_wait(c, d);
-	if (d > 500ULL * 1000) {
-		c->hand_async.win_stalls++;
-	}
 	if (!abandoned) {
 		return VK_ASYNC_DRAIN_CLEAR;
 	}
@@ -8044,6 +8056,21 @@ vk_async_handoff_drain(struct comp_vk_native_compositor *c)
 	    "(non-blocking hand-off drain). The app keeps running; the window will not update until the "
 	    "thread returns.");
 	return VK_ASYNC_DRAIN_WEDGED;
+}
+
+/*!
+ * #1905 ask 2: drain for an app-thread entry point outside layer_commit (the
+ * zone-mask API). Returns false when the weave is wedged — the caller then
+ * fails rather than record on a command pool a parked weave may own.
+ */
+static bool
+vk_async_handoff_quiesce(struct comp_vk_native_compositor *c)
+{
+	switch (vk_async_handoff_drain(c, /*from_commit=*/false)) {
+	case VK_ASYNC_DRAIN_LOCK_TAKEN: os_mutex_unlock(&c->mutex); return true;
+	case VK_ASYNC_DRAIN_WEDGED: return false;
+	default: return true;
+	}
 }
 
 /*!
@@ -8408,8 +8435,16 @@ vk_repaint_thread(void *ptr)
 #ifdef VK_MIDFRAME_FILL
 			// #1905 ask 2: nobody waits for a non-blocking request, so its
 			// post-weave tail runs here, still under c->mutex.
+			// Only for a request that is still the live one: a serve the
+			// requester abandoned (#1394) must not stamp the gate or consume
+			// a capture. c->mutex -> weave_hand.mutex is the legal order.
 			if (h_async) {
-				vk_async_handoff_tail(c, h_skip, h_result);
+				os_mutex_lock(&c->weave_hand.mutex);
+				const bool live = c->weave_hand.pending && c->weave_hand.seq == serve_seq;
+				os_mutex_unlock(&c->weave_hand.mutex);
+				if (live) {
+					vk_async_handoff_tail(c, h_skip, h_result);
+				}
 			}
 #endif
 			os_mutex_unlock(&c->mutex);
@@ -8455,6 +8490,15 @@ vk_repaint_thread(void *ptr)
 				const uint64_t win = c->repaint.mf.win_start_ns != 0 && tn > c->repaint.mf.win_start_ns
 				                         ? tn - c->repaint.mf.win_start_ns
 				                         : 0;
+				os_mutex_lock(&c->weave_hand.mutex);
+				const uint32_t ha_async = c->hand_async.win_async;
+				const uint32_t ha_total = c->hand_async.win_async + c->hand_async.win_sync;
+				const uint32_t ha_stalls = c->hand_async.win_stalls;
+				const double ha_wait_ms = (double)c->hand_async.wait_ema_ns / 1e6;
+				c->hand_async.win_async = 0;
+				c->hand_async.win_sync = 0;
+				c->hand_async.win_stalls = 0;
+				os_mutex_unlock(&c->weave_hand.mutex);
 				const double duty_pct =
 				    win != 0 ? 100.0 * (double)c->repaint.mf.win_busy_ns / (double)win : 0.0;
 				U_LOG_W(
@@ -8467,12 +8511,8 @@ vk_repaint_thread(void *ptr)
 				    c->repaint.mf.skip_duty, duty_pct, dxr_midframe_fill_duty(),
 				    (double)c->repaint.mf.fill_ema_ns / 1e6, (double)c->repaint.mf.parked_ema_ns / 1e6,
 				    (double)c->repaint.mf.serve_iv_ema_ns / 1e6, (int)dxr_midframe_fill_park(),
-				    (int)c->repaint.mf.layer_live, (int)c->hand_async.enabled, c->hand_async.win_async,
-				    c->hand_async.win_async + c->hand_async.win_sync,
-				    (double)c->hand_async.wait_ema_ns / 1e6, c->hand_async.win_stalls);
-				c->hand_async.win_async = 0;
-				c->hand_async.win_sync = 0;
-				c->hand_async.win_stalls = 0;
+				    (int)c->repaint.mf.layer_live, (int)c->hand_async.enabled, ha_async, ha_total,
+				    ha_wait_ms, ha_stalls);
 				c->repaint.mf.legacy_fires = 0;
 				c->repaint.mf.midframe_fires = 0;
 				c->repaint.mf.in_frame = 0;
@@ -9846,6 +9886,14 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 #endif
 				my_seq = ++c->weave_hand.seq;
 				c->weave_hand.pending = true;
+#ifdef VK_MIDFRAME_FILL
+				if (async_post) {
+					c->hand_async.outstanding_seq = my_seq;
+					c->hand_async.win_async++;
+				} else {
+					c->hand_async.win_sync++;
+				}
+#endif
 				os_cond_broadcast(&c->weave_hand.cond);
 				os_mutex_unlock(&c->weave_hand.mutex);
 #ifdef VK_MIDFRAME_FILL
@@ -9858,11 +9906,8 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 					 * reads (the depth-1 bound). Every return path below
 					 * that tail would have taken is the weave thread's now.
 					 */
-					c->hand_async.outstanding_seq = my_seq;
-					c->hand_async.win_async++;
 					return XRT_SUCCESS;
 				}
-				c->hand_async.win_sync++;
 				const uint64_t hand_t0 = os_monotonic_get_ns();
 #endif
 
@@ -9929,7 +9974,9 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 				const uint64_t hb_at_expiry = c->weave_hand.heartbeat;
 				os_mutex_unlock(&c->weave_hand.mutex);
 #ifdef VK_MIDFRAME_FILL
+				os_mutex_lock(&c->weave_hand.mutex);
 				vk_async_note_wait(c, os_monotonic_get_ns() - hand_t0);
+				os_mutex_unlock(&c->weave_hand.mutex);
 #endif
 
 				if (abandoned) {
@@ -10155,7 +10202,7 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	 * the atlas it samples. Normally long done (returns at once); otherwise
 	 * this is where the app waits — at most one frame ahead of the weave.
 	 */
-	const enum vk_async_drain drain = vk_async_handoff_drain(c);
+	const enum vk_async_drain drain = vk_async_handoff_drain(c, /*from_commit=*/true);
 	if (drain == VK_ASYNC_DRAIN_WEDGED) {
 		c->repaint.app_frame_in_progress = false;
 		c->repaint.app_submit_window = false;
@@ -16774,6 +16821,13 @@ xrt_result_t
 comp_vk_native_compositor_zone_mask_create(struct xrt_compositor *xc, uint32_t w, uint32_t h, void **out_mask)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	// #1905 ask 2: these record on the renderer's command pool and submit on
+	// the app queue — both shared with an outstanding non-blocking weave.
+	if (!vk_async_handoff_quiesce(c)) {
+		return XRT_ERROR_VULKAN;
+	}
+#endif
 	struct vk_bundle *vk = &c->vk;
 	if (out_mask == NULL || !c->local2d_initialized) {
 		return XRT_ERROR_ALLOCATION;
@@ -16848,6 +16902,13 @@ xrt_result_t
 comp_vk_native_compositor_zone_mask_set_whole(struct xrt_compositor *xc, void *mask_ptr, bool enable_3d)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	// #1905 ask 2: these record on the renderer's command pool and submit on
+	// the app queue — both shared with an outstanding non-blocking weave.
+	if (!vk_async_handoff_quiesce(c)) {
+		return XRT_ERROR_VULKAN;
+	}
+#endif
 	struct vk_bundle *vk = &c->vk;
 	struct comp_vk_native_zone_mask *mask = (struct comp_vk_native_zone_mask *)mask_ptr;
 	if (mask == NULL || mask->fb == VK_NULL_HANDLE) {
@@ -16876,6 +16937,13 @@ comp_vk_native_compositor_zone_mask_set_rects(struct xrt_compositor *xc,
                                               const struct xrt_rect *rects)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	// #1905 ask 2: these record on the renderer's command pool and submit on
+	// the app queue — both shared with an outstanding non-blocking weave.
+	if (!vk_async_handoff_quiesce(c)) {
+		return XRT_ERROR_VULKAN;
+	}
+#endif
 	struct vk_bundle *vk = &c->vk;
 	struct comp_vk_native_zone_mask *mask = (struct comp_vk_native_zone_mask *)mask_ptr;
 	if (mask == NULL || mask->fb == VK_NULL_HANDLE || (count > 0 && rects == NULL)) {
@@ -16907,6 +16975,13 @@ comp_vk_native_compositor_zone_mask_acquire_rt(struct xrt_compositor *xc,
                                                uint32_t *out_h)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	// #1905 ask 2: these record on the renderer's command pool and submit on
+	// the app queue — both shared with an outstanding non-blocking weave.
+	if (!vk_async_handoff_quiesce(c)) {
+		return XRT_ERROR_VULKAN;
+	}
+#endif
 	struct vk_bundle *vk = &c->vk;
 	struct comp_vk_native_zone_mask *mask = (struct comp_vk_native_zone_mask *)mask_ptr;
 	if (mask == NULL || mask->tex == VK_NULL_HANDLE || out_image == NULL || out_image_view == NULL ||
@@ -16939,6 +17014,13 @@ xrt_result_t
 comp_vk_native_compositor_zone_mask_submit(struct xrt_compositor *xc, void *mask_ptr)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	// #1905 ask 2: these record on the renderer's command pool and submit on
+	// the app queue — both shared with an outstanding non-blocking weave.
+	if (!vk_async_handoff_quiesce(c)) {
+		return XRT_ERROR_VULKAN;
+	}
+#endif
 	struct vk_bundle *vk = &c->vk;
 	struct comp_vk_native_zone_mask *mask = (struct comp_vk_native_zone_mask *)mask_ptr;
 	if (mask == NULL || mask->tex == VK_NULL_HANDLE || mask->staged == VK_NULL_HANDLE) {
@@ -16994,6 +17076,21 @@ comp_vk_native_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mas
 	if (mask == NULL) {
 		return;
 	}
+#ifdef VK_MIDFRAME_FILL
+	/*
+	 * #1905 ask 2: an outstanding non-blocking weave runs its tail
+	 * (vk_sync_zone_mask_to_dp -> active_zone_mask) on the weave thread, so
+	 * drain it, then unhook the mask under c->mutex — the lock that tail (and
+	 * every weave) reads it under — before freeing. Skipped only while the
+	 * weave is wedged holding c->mutex (#1394): blocking there would hang the
+	 * app, and a parked weave reads nothing.
+	 */
+	(void)vk_async_handoff_quiesce(c);
+	const bool zm_locked = !vk_weave_blocked(c);
+	if (zm_locked) {
+		os_mutex_lock(&c->mutex);
+	}
+#endif
 	vk->vkDeviceWaitIdle(vk->device); // mask may be in flight
 	if (c->active_zone_mask == mask) {
 		c->active_zone_mask = NULL; // revert to implicit / legacy behavior
@@ -17010,6 +17107,11 @@ comp_vk_native_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mas
 	if (c->zone_wish_view == mask->staged_view) {
 		c->zone_wish_view = VK_NULL_HANDLE;
 	}
+#ifdef VK_MIDFRAME_FILL
+	if (zm_locked) {
+		os_mutex_unlock(&c->mutex);
+	}
+#endif
 	vk_destroy_rt(c, &mask->staged, &mask->staged_mem, &mask->staged_view, NULL);
 	vk_destroy_rt(c, &mask->tex, &mask->tex_mem, &mask->tex_view, &mask->fb);
 	free(mask);
