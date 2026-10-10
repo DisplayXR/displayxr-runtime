@@ -144,6 +144,9 @@ gfx_api_name(const struct oxr_session *sess)
 		return "d3d11";
 	if (sess->is_d3d12_native_compositor)
 		return "d3d12";
+	// A Vulkan app presented by comp_metal (macOS) is still a Vulkan app.
+	if (sess->is_vk_via_metal)
+		return "vulkan";
 	if (sess->is_metal_native_compositor)
 		return "metal";
 	if (sess->is_gl_native_compositor)

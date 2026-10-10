@@ -66,6 +66,7 @@
 #endif
 
 #include <math.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -142,6 +143,9 @@ struct comp_metal_compositor
 
 	//! CAMetalLayer for presentation.
 	CAMetalLayer *metal_layer;
+
+	//! Times metal_sync_layer_scale found the layer at the wrong scale.
+	uint32_t layer_scale_fixes;
 
 	//! Render pipeline for atlas layer compositing.
 	id<MTLRenderPipelineState> projection_pipeline;
@@ -1433,6 +1437,78 @@ create_window(struct comp_metal_compositor *c, uint32_t width, uint32_t height,
 	return success;
 }
 
+/*!
+ * Keep the presenting CAMetalLayer 1:1 with the window's backing store.
+ *
+ * WindowServer composites a layer whose contentsScale differs from its
+ * window's backingScaleFactor by RESAMPLING the drawable (e.g. contentsScale 1
+ * on a 2x display with a bounds x 2 drawable: the drawable is scaled 0.5x and
+ * back). That is invisible on ordinary content and fatal to a lenticular
+ * weave, which is computed per physical subpixel: the resampled weave shows
+ * as red/teal bands. An app's own layer (makeBackingLayer) easily leaves
+ * contentsScale at 1, and AppKit only manages it for layers it creates, so
+ * the compositor owns it for every layer it presents into: contentsScale =
+ * the window's backingScaleFactor (set on the main thread), nearest
+ * magnification/minification as a guard, and drawableSize = bounds x
+ * contentsScale (layer_commit). One WARN names the app's value the first
+ * time it is wrong, so app authors learn; later corrections (backing / screen
+ * changes) are counted and logged at INFO.
+ *
+ * Callable from any thread; the read is cheap, the fix is dispatched.
+ */
+//! A contentsScale fix is queued on the main thread (process-wide: the block
+//! must not reference a compositor that may be destroyed before it runs).
+static _Atomic bool g_layer_scale_fix_pending = false;
+
+static void
+metal_sync_layer_scale(struct comp_metal_compositor *c, NSView *view, const char *when)
+{
+	CAMetalLayer *layer = c->metal_layer;
+	if (layer == nil || view == nil) {
+		return;
+	}
+	NSWindow *win = view.window;
+	const CGFloat want = win != nil && win.backingScaleFactor > 0 ? win.backingScaleFactor : 0.0;
+	if (want <= 0.0) {
+		return;
+	}
+	const CGFloat have = layer.contentsScale;
+	const bool filters_ok = [layer.magnificationFilter isEqualToString:kCAFilterNearest] &&
+	                        [layer.minificationFilter isEqualToString:kCAFilterNearest];
+	if (have == want && filters_ok) {
+		return;
+	}
+	if (atomic_exchange(&g_layer_scale_fix_pending, true)) {
+		return; // a fix is already queued; judge again once it has landed
+	}
+	if (have != want) {
+		c->layer_scale_fixes++;
+		if (c->layer_scale_fixes == 1) {
+			U_LOG_W("CAMetalLayer contentsScale %.2f != the window's backingScaleFactor %.2f (%s) — WindowServer "
+			        "would RESAMPLE every drawable (a lenticular weave turns into colour bands); setting it to "
+			        "%.2f. App authors: set layer.contentsScale = window.backingScaleFactor on a layer you "
+			        "create (makeBackingLayer) and on backing changes",
+			        have, want, when, want);
+		} else {
+			U_LOG_I("CAMetalLayer contentsScale %.2f -> %.2f (%s; correction #%u)", have, want, when,
+			        c->layer_scale_fixes);
+		}
+	}
+	[layer retain];
+	void (^fix)(void) = ^{
+		layer.contentsScale = want;
+		layer.magnificationFilter = kCAFilterNearest;
+		layer.minificationFilter = kCAFilterNearest;
+		atomic_store(&g_layer_scale_fix_pending, false);
+		[layer release];
+	};
+	if ([NSThread isMainThread]) {
+		fix();
+	} else {
+		dispatch_async(dispatch_get_main_queue(), fix);
+	}
+}
+
 static bool
 setup_external_window(struct comp_metal_compositor *c, NSView *external_view,
                       bool transparent_background)
@@ -1480,9 +1556,11 @@ setup_external_window(struct comp_metal_compositor *c, NSView *external_view,
 		U_LOG_W("Transparent background enabled: external CAMetalLayer set isOpaque=NO");
 	}
 
-	// Ensure Retina backing scale is applied so drawables are at physical resolution
+	// Ensure Retina backing scale is applied so drawables are at physical
+	// resolution (and the layer is never resampled — metal_sync_layer_scale).
 	CGFloat scale = 1.0;
 	if (external_view.window != nil) {
+		metal_sync_layer_scale(c, external_view, "adopting the app's layer");
 		scale = external_view.window.backingScaleFactor;
 	} else {
 		scale = [NSScreen mainScreen].backingScaleFactor;
@@ -2384,6 +2462,95 @@ metal_window_backing_dims(struct comp_metal_compositor *c,
  * anchored), regardless of any xrSetSharedTextureOutputRectDXR call.
  * Mirrors d3d11_effective_canvas.
  */
+/*!
+ * Debug-only weave test pattern, DXR_DEBUG_ATLAS_PATTERN=lr_white_black.
+ *
+ * Returns a texture the size of the cropped DP input (cols x rows tiles of
+ * view_w x view_h) with tile 0 (the left view) pure white and every other tile
+ * pure black, opaque — handed to the DP in place of the app's atlas, so a
+ * weave can be judged on a known input inside the app's own process / route /
+ * window. Built once per size (CPU pattern, one buffer-to-texture blit),
+ * cached; nil when the knob is off (the default, zero cost). One WARN.
+ */
+static id<MTLTexture>
+metal_debug_atlas_pattern(struct comp_metal_compositor *c,
+                          id<MTLCommandBuffer> cmd_buf,
+                          uint32_t cols,
+                          uint32_t rows,
+                          uint32_t view_w,
+                          uint32_t view_h)
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		const char *e = getenv("DXR_DEBUG_ATLAS_PATTERN");
+		enabled = (e != NULL && strcmp(e, "lr_white_black") == 0) ? 1 : 0;
+		if (enabled) {
+			U_LOG_W("DXR_DEBUG_ATLAS_PATTERN=lr_white_black: the DP weaves a TEST PATTERN (left view white, "
+			        "right view black), not the app's content — debug only");
+		}
+	}
+	if (!enabled || cols == 0 || rows == 0 || view_w == 0 || view_h == 0) {
+		return nil;
+	}
+	static id<MTLTexture> tex = nil;
+	static id<MTLDevice> tex_device = nil;
+	static uint32_t tex_cols = 0, tex_rows = 0, tex_vw = 0, tex_vh = 0;
+	const uint32_t w = cols * view_w;
+	const uint32_t h = rows * view_h;
+	if (tex != nil && tex_device == c->device && tex_cols == cols && tex_rows == rows && tex_vw == view_w &&
+	    tex_vh == view_h) {
+		return tex;
+	}
+	[tex release];
+	tex = nil;
+
+	const size_t row_bytes = (size_t)w * 4;
+	id<MTLBuffer> buf = [c->device newBufferWithLength:row_bytes * h options:MTLResourceStorageModeShared];
+	if (buf == nil) {
+		return nil;
+	}
+	uint8_t *px = (uint8_t *)buf.contents;
+	for (uint32_t y = 0; y < h; y++) {
+		for (uint32_t x = 0; x < w; x++) {
+			const bool white = (x / view_w) == 0 && (y / view_h) == 0; // tile 0
+			uint8_t *p = px + (size_t)y * row_bytes + (size_t)x * 4;   // BGRA8
+			p[0] = p[1] = p[2] = white ? 255 : 0;
+			p[3] = 255;
+		}
+	}
+	MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                                                width:w
+	                                                                               height:h
+	                                                                            mipmapped:NO];
+	desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+	desc.storageMode = MTLStorageModePrivate;
+	tex = [c->device newTextureWithDescriptor:desc];
+	if (tex == nil) {
+		[buf release];
+		return nil;
+	}
+	id<MTLBlitCommandEncoder> blit = [cmd_buf blitCommandEncoder];
+	[blit copyFromBuffer:buf
+	           sourceOffset:0
+	      sourceBytesPerRow:row_bytes
+	    sourceBytesPerImage:row_bytes * h
+	             sourceSize:MTLSizeMake(w, h, 1)
+	              toTexture:tex
+	       destinationSlice:0
+	       destinationLevel:0
+	      destinationOrigin:MTLOriginMake(0, 0, 0)];
+	[blit endEncoding];
+	[buf release]; // the command buffer retains it until the copy completes
+	tex_device = c->device;
+	tex_cols = cols;
+	tex_rows = rows;
+	tex_vw = view_w;
+	tex_vh = view_h;
+	U_LOG_W("DXR_DEBUG_ATLAS_PATTERN: pattern %ux%u (%ux%u tiles of %ux%u; tile 0 white, rest black)", w, h, cols,
+	        rows, view_w, view_h);
+	return tex;
+}
+
 static struct u_canvas_rect
 metal_effective_canvas(struct comp_metal_compositor *c,
                        id<MTLTexture> output_texture,
@@ -3623,6 +3790,9 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 	// Update CAMetalLayer drawable size on window resize
 	if (c->metal_layer != nil && c->view != nil) {
+		// contentsScale == backingScaleFactor, re-checked every frame (a
+		// screen / backing change, or an app resetting its own layer).
+		metal_sync_layer_scale(c, c->view, "frame");
 		NSRect backing = [c->view convertRectToBacking:c->view.bounds];
 		CGSize newSize = CGSizeMake(backing.size.width, backing.size.height);
 		if (c->placement_frame_valid) {
@@ -4787,6 +4957,17 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			    destinationOrigin:MTLOriginMake(0, 0, 0)];
 			[blit endEncoding];
 			dp_src = c->dp_input_texture;
+		}
+
+		// Debug only (DXR_DEBUG_ATLAS_PATTERN=lr_white_black): the DP weaves a
+		// fixed pattern instead of the app's content — tile 0 (left view) pure
+		// white, every other tile pure black, opaque.
+		{
+			id<MTLTexture> pattern = metal_debug_atlas_pattern(c, cmd_buf, atlas_cols, atlas_rows,
+			                                                  atlas_view_w, atlas_view_h);
+			if (pattern != nil) {
+				dp_src = pattern;
+			}
 		}
 
 		// DP target: full output_texture dims. The canvas sub-rect is

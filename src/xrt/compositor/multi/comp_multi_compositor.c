@@ -1400,6 +1400,15 @@ multi_compositor_request_display_refresh_rate(struct xrt_compositor *xc, float d
 }
 
 static void
+multi_compositor_destroy(struct xrt_compositor *xc);
+
+bool
+multi_compositor_is(const struct xrt_compositor *xc)
+{
+	return xc != NULL && xc->destroy == multi_compositor_destroy;
+}
+
+static void
 multi_compositor_destroy(struct xrt_compositor *xc)
 {
 	COMP_TRACE_MARKER();

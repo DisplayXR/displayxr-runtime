@@ -1925,6 +1925,35 @@ static void CleanupVkRenderer(VkRenderer& renderer) {
 static AppDelegate *g_appDelegate = nil;
 static AppWindowDelegate *g_windowDelegate = nil;
 
+// Test knob: place the window's CONTENT rect at x,y,w,h in top-down global
+// points (origin = the main display's top-left, the CGDisplayBounds /
+// XrDisplayDesktopPositionDXR space), e.g. to put it on a given display or
+// make it straddle two without dragging. Read from @p env_name; false when
+// unset or malformed. Same knob as cube_handle_metal_macos.
+static bool ApplyTestWindowRect(const char *env_name) {
+    const char *e = getenv(env_name);
+    if (e == nullptr || g_window == nil) {
+        return false;
+    }
+    int x = 0, y = 0, w = 0, h = 0;
+    if (sscanf(e, "%d,%d,%d,%d", &x, &y, &w, &h) != 4 || w <= 0 || h <= 0) {
+        LOG_WARN("%s='%s' ignored (want x,y,w,h in top-down points)", env_name, e);
+        return false;
+    }
+    NSScreen *primary = [NSScreen screens].firstObject;
+    if (primary == nil) {
+        return false;
+    }
+    const CGFloat bottom = primary.frame.size.height - (CGFloat)y - (CGFloat)h;
+    NSRect content = NSMakeRect((CGFloat)x, bottom, (CGFloat)w, (CGFloat)h);
+    NSRect frame = [g_window frameRectForContentRect:content];
+    // setFrame:display: does not run constrainFrameRect, so a window may
+    // straddle displays exactly where asked.
+    [g_window setFrame:frame display:YES];
+    LOG_INFO("%s: content rect -> %d,%d %dx%d pt (top-down)", env_name, x, y, w, h);
+    return true;
+}
+
 static bool CreateMacOSWindow(uint32_t width, uint32_t height, int32_t screenLeft, int32_t screenTop) {
     @autoreleasepool {
         [NSApplication sharedApplication];
@@ -1938,19 +1967,39 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height, int32_t screenLef
         // top-left, XrDisplayDesktopPositionDXR); flip into AppKit's bottom-up
         // space. (0,0) = primary — the titled window is auto-constrained below
         // the menu bar, so it is always a safe create position.
-        NSRect frame = NSMakeRect(100, 100, width, height);
-        NSScreen *primary = [NSScreen screens].firstObject;
-        if (primary != nil) {
-            CGFloat topY = primary.frame.size.height - (CGFloat)screenTop;
-            frame = NSMakeRect((CGFloat)screenLeft, topY - (CGFloat)height, width, height);
-        }
         NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                            NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable;
+        // Resolve the NSScreen that holds the panel's top-left, and put the
+        // WHOLE window (title bar included) inside its visibleFrame. Placing
+        // the content top AT the panel top pushes the title bar off-screen,
+        // and AppKit then re-constrains the window onto [NSScreen mainScreen]
+        // -- whichever screen has focus at launch, i.e. often the laptop.
+        // Same fix as cube_handle_metal_macos.
+        NSRect frame = NSMakeRect(100, 100, width, height);
+        NSScreen *target = nil;
+        NSScreen *primary = [NSScreen screens].firstObject;
+        if (primary != nil) {
+            const NSPoint p = NSMakePoint((CGFloat)screenLeft + 1.0,
+                                          primary.frame.size.height - (CGFloat)screenTop - 1.0);
+            for (NSScreen *s in [NSScreen screens]) {
+                if (NSPointInRect(p, s.frame)) { target = s; break; }
+            }
+        }
+        if (target != nil) {
+            const NSRect vf = target.visibleFrame; // below that screen's menu bar
+            const NSRect wf = [NSWindow frameRectForContentRect:NSMakeRect(0, 0, width, height) styleMask:style];
+            const CGFloat titleH = wf.size.height - (CGFloat)height;
+            frame = NSMakeRect(vf.origin.x, NSMaxY(vf) - titleH - (CGFloat)height, width, height);
+        }
 
         g_window = [[NSWindow alloc] initWithContentRect:frame
                                                styleMask:style
                                                  backing:NSBackingStoreBuffered
                                                    defer:NO];
+        if (target != nil) {
+            // Global coordinates, title bar on-screen: no re-constrain.
+            [g_window setFrame:[g_window frameRectForContentRect:frame] display:NO];
+        }
 
         [g_window setTitle:@"Vulkan Cube — VK Native Compositor (External Window)"];
         [g_window setAcceptsMouseMovedEvents:YES];
@@ -1972,8 +2021,12 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height, int32_t screenLef
 
         // HUD now lives as an XR_EXT_window_space_layer composed by the runtime.
 
+        (void)ApplyTestWindowRect("DXR_TEST_WINDOW_RECT");
         [g_window makeKeyAndOrderFront:nil];
         [NSApp activateIgnoringOtherApps:YES];
+        // Ordering front may re-constrain the frame onto one display; put
+        // the test rect back once the window is on screen.
+        (void)ApplyTestWindowRect("DXR_TEST_WINDOW_RECT");
 
         // Pump events so the window appears
         NSEvent *event;

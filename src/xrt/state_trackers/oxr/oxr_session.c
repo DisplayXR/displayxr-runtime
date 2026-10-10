@@ -370,6 +370,11 @@ oxr_session_get_predicted_eye_positions(struct oxr_session *sess, struct xrt_eye
 	// In IPC mode, sess->xcn is an IPC proxy, not a multi_compositor.
 	// xmcc is only non-NULL for in-process multi_system_compositor.
 	if (sess->sys->xsysc->xmcc != NULL) {
+		// xmcc says the SYSTEM is in-process multi, not that THIS session's
+		// compositor is a multi_compositor (see multi_compositor_is()).
+		if (!multi_compositor_is(&sess->xcn->base)) {
+			return false;
+		}
 		struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
 		return multi_compositor_get_predicted_eye_positions(mc, out_eye_pos);
 	}
@@ -563,6 +568,9 @@ oxr_session_get_window_metrics(struct oxr_session *sess,
 	// Vendor-neutral path — works for both SR and sim_display (in-process only).
 	// IPC clients have an ipc_client_compositor, not a multi_compositor.
 	if (sess->sys->xsysc->xmcc != NULL) {
+		if (!multi_compositor_is(&sess->xcn->base)) {
+			return false; // never an IPC proxy in-process either
+		}
 		struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
 		return session_cache_window_metrics(sess, out_metrics,
 		                                    multi_compositor_get_window_metrics(mc, out_metrics));
@@ -654,6 +662,9 @@ oxr_session_request_display_mode(struct oxr_logger *log, struct oxr_session *ses
 	// In-process multi compositor path (not used for IPC clients).
 	// IPC clients have an ipc_client_compositor, not a multi_compositor.
 	if (sess->sys->xsysc != NULL && sess->sys->xsysc->xmcc != NULL) {
+		if (!multi_compositor_is(&sess->xcn->base)) {
+			return XR_SUCCESS;
+		}
 		struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
 		success = multi_compositor_request_display_mode(mc, enable_3d);
 		if (success) {
@@ -779,6 +790,9 @@ oxr_session_set_eye_tracking_mode(struct oxr_session *sess, uint32_t mode)
 
 	// In-process multi compositor path (not used for IPC clients).
 	if (sess->sys->xsysc != NULL && sess->sys->xsysc->xmcc != NULL) {
+		if (!multi_compositor_is(&sess->xcn->base)) {
+			return;
+		}
 		struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
 		multi_compositor_set_eye_tracking_mode(mc, mode);
 		return;
@@ -5234,6 +5248,26 @@ oxr_session_allocate_and_init(struct oxr_logger *log,
 	} while (0)
 
 
+#ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
+/*!
+ * ADR-050: did the app chain XrCocoaWindowPlacementInfoDXR with APP_OWNED (on
+ * the Cocoa binding's next chain, which this walk reaches too)? Shared by every
+ * session that comp_metal presents — Metal apps and Vulkan apps routed to it.
+ */
+XRT_MAYBE_UNUSED static bool
+oxr_cocoa_window_placement_app_owned(const XrSessionCreateInfo *createInfo)
+{
+#ifdef XR_TYPE_COCOA_WINDOW_PLACEMENT_INFO_DXR
+	const XrCocoaWindowPlacementInfoDXR *placement = OXR_GET_INPUT_FROM_CHAIN(
+	    createInfo, XR_TYPE_COCOA_WINDOW_PLACEMENT_INFO_DXR, XrCocoaWindowPlacementInfoDXR);
+	return placement != NULL && (placement->flags & XR_COCOA_WINDOW_PLACEMENT_APP_OWNED_BIT_DXR) != 0;
+#else
+	(void)createInfo;
+	return false;
+#endif
+}
+#endif
+
 /*
  * Does allocation, population and basic init, so we can use early-returns to
  * simplify code flow and avoid weird if/else.
@@ -5415,8 +5449,14 @@ oxr_session_create_impl(struct oxr_logger *log,
 #if defined(XRT_HAVE_VK_NATIVE_COMPOSITOR)
 		// Direct Vulkan path (Windows + macOS via MoltenVK).
 		// On macOS, this takes priority over the Metal compositor path
-		// unless shared textures are requested or env var disables it.
-		if (oxr_vk_native_compositor_supported(sys, xsi->external_window_handle)) {
+		// unless the active DP can only weave with Metal (see
+		// oxr_vk_route_via_metal — e.g. Leia SR on macOS), or the env var
+		// disables it.
+		bool vk_via_metal = false;
+#if defined(XRT_HAVE_METAL_NATIVE_COMPOSITOR)
+		vk_via_metal = oxr_vk_route_via_metal(sys);
+#endif
+		if (!vk_via_metal && oxr_vk_native_compositor_supported(sys, xsi->external_window_handle)) {
 			void *window_handle = xsi->external_window_handle;
 			void *shared_texture_handle = xsi->shared_texture_handle;
 
@@ -5558,14 +5598,22 @@ oxr_session_create_impl(struct oxr_logger *log,
 			XrResult ret = oxr_session_populate_vk_with_metal_native(
 			    log, sys, vulkan, window_handle, shared_iosurface,
 			    xsi->transparent_background_enabled, *out_session);
-			if (ret == XR_SUCCESS && window_handle != NULL) {
+			if (ret != XR_SUCCESS) {
+				return ret;
+			}
+			if (window_handle != NULL) {
 				(*out_session)->has_external_window = true;
 				struct xrt_device *head = GET_XDEV_BY_ROLE((*out_session)->sys, head);
 				if (head != NULL) {
 					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_EXT_APP_MODE, 1);
 				}
 			}
-			return ret;
+			// ADR-050: comp_metal presents this session, so it owns the
+			// window's drag + resize exactly as for a Metal app (same
+			// XrCocoaWindowPlacementInfoDXR opt-out on the Cocoa binding).
+			oxr_session_metal_native_setup_window_placement(
+			    *out_session, oxr_cocoa_window_placement_app_owned(createInfo));
+			return XR_SUCCESS;
 		}
 #endif
 
@@ -5745,18 +5793,9 @@ oxr_session_create_impl(struct oxr_logger *log,
 			}
 
 			// ADR-050: the runtime owns the window's drag + resize unless the
-			// app chained XrCocoaWindowPlacementInfoDXR with APP_OWNED (on the
-			// Cocoa binding's next chain, which this walk reaches too).
-			bool placement_app_owned = false;
-#ifdef XR_TYPE_COCOA_WINDOW_PLACEMENT_INFO_DXR
-			const XrCocoaWindowPlacementInfoDXR *placement = OXR_GET_INPUT_FROM_CHAIN(
-			    createInfo, XR_TYPE_COCOA_WINDOW_PLACEMENT_INFO_DXR, XrCocoaWindowPlacementInfoDXR);
-			if (placement != NULL &&
-			    (placement->flags & XR_COCOA_WINDOW_PLACEMENT_APP_OWNED_BIT_DXR) != 0) {
-				placement_app_owned = true;
-			}
-#endif
-			oxr_session_metal_native_setup_window_placement(*out_session, placement_app_owned);
+			// app chained XrCocoaWindowPlacementInfoDXR with APP_OWNED.
+			oxr_session_metal_native_setup_window_placement(
+			    *out_session, oxr_cocoa_window_placement_app_owned(createInfo));
 			return XR_SUCCESS;
 		}
 #else

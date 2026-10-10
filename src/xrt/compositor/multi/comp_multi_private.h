@@ -1152,6 +1152,20 @@ multi_compositor(struct xrt_compositor *xc)
 }
 
 /*!
+ * Is @p xc really a @ref multi_compositor (identified by its destroy slot)?
+ *
+ * The state tracker reaches multi_compositor() as the in-process fallback of
+ * its per-compositor dispatchers, keyed on "the system has an xmcc". That key
+ * says nothing about the SESSION's compositor: a session presented by a native
+ * compositor whose is_*_native flag was not set fell through and was cast —
+ * the macOS VK-via-Metal SIGBUS. Check with this before casting.
+ *
+ * @ingroup comp_multi
+ */
+bool
+multi_compositor_is(const struct xrt_compositor *xc);
+
+/*!
  * Create a multi client wrapper compositor.
  *
  * @ingroup comp_multi
