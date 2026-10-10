@@ -315,6 +315,22 @@ struct comp_vk_native_compositor
 	//! Accumulated layers for the current frame.
 	struct comp_layer_accum layer_accum;
 
+#ifdef VK_MIDFRAME_FILL
+	/*!
+	 * #1905: the APP's private accumulator. On Android the app thread
+	 * accumulates into this (begin_frame / layer_begin / layer_* / discard,
+	 * none of which hold c->mutex) and layer_commit publishes it into
+	 * @ref layer_accum under c->mutex. layer_accum is therefore only ever
+	 * written under the lock, so a fill may read it at any moment — including
+	 * while the app is mid-frame, which is what lets the repaint loop drop the
+	 * app_frame_in_progress bail. Without this a mid-frame fill reads
+	 * layer_count / Local2D / zone rects while the app rewrites them
+	 * (vk_composite_local_2d's reuse_twod path), and a 2D-over app flickers
+	 * its overlay at fill rate.
+	 */
+	struct comp_layer_accum layer_stage;
+#endif
+
 	//! Compositor settings.
 	struct comp_vk_settings settings;
 
@@ -958,31 +974,32 @@ struct comp_vk_native_compositor
 
 #ifdef VK_MIDFRAME_FILL
 		/*!
-		 * #1905: mid-frame fill state. Repaint-thread-only except
-		 * commit_entry_ns (see there), so it needs no lock.
+		 * #1905: mid-frame fill state. Written and read only by the repaint
+		 * thread, so it needs no lock.
 		 */
 		struct
 		{
 			//! When the last app-frame weave this thread SERVED started / ended.
 			uint64_t serve_start_ns, serve_end_ns;
-			//! EMA of the spacing between served app weaves — the app's frame
-			//! interval as the weave thread sees it. Predicts the next post.
+			//! EMA of the spacing between served app weaves (the app's frame
+			//! interval as the weave thread sees it). Trace-only; 0 = no data.
 			uint64_t serve_iv_ema_ns;
-			//! EMA of a mid-frame fill's lock-to-present duration.
-			uint64_t fire_ema_ns;
-			//! EMA of layer_commit ENTRY -> post (serve start): how far ahead of
-			//! the post the app first wants c->mutex.
-			uint64_t commit_lead_ema_ns;
+			//! Consecutive serve-interval samples rejected as outliers.
+			uint32_t serve_iv_rejects;
 			/*!
-			 * The ONE app-thread-written field: stamped at layer_commit entry,
-			 * before it takes c->mutex. Plain store/load of an aligned 64-bit
-			 * value, read by this thread at serve time — the same benign-race
-			 * contract as weave_hand.heartbeat (no stdatomic per CLAUDE.md); a
-			 * stale read only skews one sample of a bounded EMA.
+			 * EMA of a fill's wall time with c->mutex held (fire_t0 -> fire_t1),
+			 * over EVERY fill — legacy and mid-frame — seeded from the first.
+			 * The duty governor's only input; never frozen, because it does not
+			 * gate the fills that feed it to zero.
 			 */
-			uint64_t commit_entry_ns;
+			uint64_t fill_ema_ns;
+			//! This fill holds c->mutex across its own GPU wait (no fence-park).
+			//! Set by this thread under c->mutex right before the fill.
+			bool hold_lock;
+			//! Trace window: start, and summed fill wall time inside it.
+			uint64_t win_start_ns, win_busy_ns;
 			//! Trace-window tallies (#1257 row; zeroed when a row goes out).
-			uint32_t fires, in_frame, skip_pending, skip_predict;
+			uint32_t legacy_fires, midframe_fires, in_frame, skip_pending, skip_duty;
 		} mf;
 #endif
 	} repaint;
@@ -2392,7 +2409,11 @@ vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 	// pay a clock read per frame when it is off — which is the default.
 	c->repaint.app_frame_begin_ns = dxr_weave_app_submit_guard() ? os_monotonic_get_ns() : 0;
 
+#ifdef VK_MIDFRAME_FILL
+	c->layer_stage.layer_count = 0;
+#else
 	c->layer_accum.layer_count = 0;
+#endif
 	return XRT_SUCCESS;
 }
 
@@ -2403,7 +2424,11 @@ vk_compositor_discard_frame(struct xrt_compositor *xc, int64_t frame_id)
 	// #1394: a discarded frame submits nothing more — close the window the
 	// matching begin_frame opened, or the repaint loop stays gated on it.
 	c->repaint.app_submit_window = false;
+#ifdef VK_MIDFRAME_FILL
+	c->layer_stage.layer_count = 0;
+#else
 	c->layer_accum.layer_count = 0;
+#endif
 	return XRT_SUCCESS;
 }
 
@@ -2423,7 +2448,11 @@ vk_compositor_layer_begin(struct xrt_compositor *xc, const struct xrt_layer_fram
 	// opened at begin_frame, is the one that covers them.
 	c->repaint.app_frame_in_progress = true;
 
+#ifdef VK_MIDFRAME_FILL
+	comp_layer_accum_begin(&c->layer_stage, data);
+#else
 	comp_layer_accum_begin(&c->layer_accum, data);
+#endif
 	return XRT_SUCCESS;
 }
 
@@ -2434,7 +2463,11 @@ vk_compositor_layer_projection(struct xrt_compositor *xc,
                                 const struct xrt_layer_data *data)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	comp_layer_accum_projection(&c->layer_stage, xsc, data);
+#else
 	comp_layer_accum_projection(&c->layer_accum, xsc, data);
+#endif
 	return XRT_SUCCESS;
 }
 
@@ -2446,7 +2479,11 @@ vk_compositor_layer_projection_depth(struct xrt_compositor *xc,
                                       const struct xrt_layer_data *data)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	comp_layer_accum_projection_depth(&c->layer_stage, xsc, d_xsc, data);
+#else
 	comp_layer_accum_projection_depth(&c->layer_accum, xsc, d_xsc, data);
+#endif
 	return XRT_SUCCESS;
 }
 
@@ -2457,7 +2494,11 @@ vk_compositor_layer_quad(struct xrt_compositor *xc,
                           const struct xrt_layer_data *data)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	comp_layer_accum_quad(&c->layer_stage, xsc, data);
+#else
 	comp_layer_accum_quad(&c->layer_accum, xsc, data);
+#endif
 	return XRT_SUCCESS;
 }
 
@@ -2468,7 +2509,11 @@ vk_compositor_layer_cube(struct xrt_compositor *xc,
                           const struct xrt_layer_data *data)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	comp_layer_accum_cube(&c->layer_stage, xsc, data);
+#else
 	comp_layer_accum_cube(&c->layer_accum, xsc, data);
+#endif
 	return XRT_SUCCESS;
 }
 
@@ -2479,7 +2524,11 @@ vk_compositor_layer_cylinder(struct xrt_compositor *xc,
                               const struct xrt_layer_data *data)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	comp_layer_accum_cylinder(&c->layer_stage, xsc, data);
+#else
 	comp_layer_accum_cylinder(&c->layer_accum, xsc, data);
+#endif
 	return XRT_SUCCESS;
 }
 
@@ -2490,7 +2539,11 @@ vk_compositor_layer_equirect1(struct xrt_compositor *xc,
                                const struct xrt_layer_data *data)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	comp_layer_accum_equirect1(&c->layer_stage, xsc, data);
+#else
 	comp_layer_accum_equirect1(&c->layer_accum, xsc, data);
+#endif
 	return XRT_SUCCESS;
 }
 
@@ -2501,7 +2554,11 @@ vk_compositor_layer_equirect2(struct xrt_compositor *xc,
                                const struct xrt_layer_data *data)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	comp_layer_accum_equirect2(&c->layer_stage, xsc, data);
+#else
 	comp_layer_accum_equirect2(&c->layer_accum, xsc, data);
+#endif
 	return XRT_SUCCESS;
 }
 
@@ -2520,7 +2577,11 @@ vk_compositor_layer_window_space(struct xrt_compositor *xc,
                                   const struct xrt_layer_data *data)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	comp_layer_accum_window_space(&c->layer_stage, xsc, data);
+#else
 	comp_layer_accum_window_space(&c->layer_accum, xsc, data);
+#endif
 	return XRT_SUCCESS;
 }
 
@@ -2537,7 +2598,11 @@ vk_compositor_layer_local_2d(struct xrt_compositor *xc,
                              const struct xrt_layer_data *data)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	comp_layer_accum_local_2d(&c->layer_stage, xsc, data);
+#else
 	comp_layer_accum_local_2d(&c->layer_accum, xsc, data);
+#endif
 	return XRT_SUCCESS;
 }
 
@@ -2553,7 +2618,11 @@ vk_compositor_layer_zone_3d(struct xrt_compositor *xc,
                             const struct xrt_layer_data *data)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	comp_layer_accum_zone_3d(&c->layer_stage, xsc, data);
+#else
 	comp_layer_accum_zone_3d(&c->layer_accum, xsc, data);
+#endif
 	return XRT_SUCCESS;
 }
 
@@ -7147,7 +7216,24 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 					const char *pe = getenv("DXR_FILL_FENCE_PARK");
 					park = (pe != NULL && pe[0] == '0') ? 0 : 1;
 				}
+#ifdef VK_MIDFRAME_FILL
+				/*
+				 * #1905: a mid-frame-schedule fill waits UNDER the lock (see
+				 * dxr_midframe_fill_park: the unlocked park is where the
+				 * app's renderer_draw submit collided with this thread on
+				 * Adreno's single GSL context). Bounded, so a fence that does
+				 * not signal falls through to the ordinary park below and
+				 * c->mutex is never held indefinitely (#1394 un-wedge needs
+				 * it free).
+				 */
+				if (is_repaint && c->repaint.mf.hold_lock &&
+				    vk->vkWaitForFences(vk->device, 1, fence_p, VK_TRUE, 250ULL * 1000 * 1000) ==
+				        VK_SUCCESS) {
+					vk->vkResetFences(vk->device, 1, fence_p);
+				} else if (is_repaint && park == 1 && c->target != NULL) {
+#else
 				if (is_repaint && park == 1 && c->target != NULL) {
+#endif
 					const uint32_t gen_park =
 					    comp_vk_native_target_get_generation(c->target);
 					const uint64_t serial_park = c->present_serial;
@@ -7532,22 +7618,20 @@ vk_app_submit_window_open(const struct comp_vk_native_compositor *c)
  * and the legacy quiet gate ("quiet >= 1.2 periods since the last APP frame")
  * almost never opens inside a ~35 ms interval. Measured on a Lume phone
  * (Adreno 740, 60 Hz): earthview 0.0-0.2 fills/s, weave + face refresh at the
- * app's ~28 Hz while the panel and the vendor SDK sustain 60. The present path
- * is not the bottleneck (acquire 0.1 ms, present 0.36 ms); the loop simply
- * never fires.
+ * app's ~28 Hz while the panel and the vendor SDK sustain 60.
  *
- * What it changes, and only when the default gate schedule is in force (an
- * explicit DXR_WEAVE_REPAINT_GATE / debug.dxr.weave_repaint_gate, the #1257
- * partition, the force probe and move fills all keep their own logic):
- *   - the `app_frame_in_progress` bail is dropped — a fill reads only the
- *     PUBLISHED repaint state (c->repaint.*), never layer_accum;
- *   - the quiet gate is replaced by vk_midframe_gate_open(): pace off the last
- *     PRESENT (served app weave or fill), not off the last app frame;
- *   - app-frame priority is kept by construction: a fill never starts while
- *     an app weave is posted (weave_hand.pending re-checked under the lock),
- *     and never starts when it is predicted to still be running when the app's
- *     next frame is posted.
- * Off restores the prior behaviour exactly.
+ * What it changes (see vk_midframe_gate_open for the rule):
+ *   - the `app_frame_in_progress` bail is dropped. Safe because on Android
+ *     layer_accum is only written under c->mutex (the app accumulates into
+ *     layer_stage, published at layer_commit), so a fill never reads a
+ *     half-written frame;
+ *   - a fill fires if the legacy gate says yes OR the present-paced rule says
+ *     yes — never fewer fills than legacy;
+ *   - every fill yields to a posted app frame (weave_hand.pending, re-checked
+ *     under the lock) and holds c->mutex across its own GPU wait (no
+ *     fence-park; see dxr_midframe_fill_park for why).
+ * Off restores the prior gating. (The layer_stage publish stays — it is the
+ * same frame, published under the lock instead of written in place.)
  */
 static bool
 dxr_midframe_fill_enabled(void)
@@ -7576,47 +7660,137 @@ dxr_midframe_fill_enabled(void)
 }
 
 /*!
+ * #1905: the duty-cycle cap for present-paced fills, in percent of wall time.
+ * DXR_MIDFRAME_FILL_DUTY / `debug.dxr.midframe_fill_duty`, default 60,
+ * clamped to [5, 100].
+ *
+ * The cap is a closed loop on MEASURED cost, not a prediction: a fill holds
+ * c->mutex for fill_ema_ns, so allowing one present-paced fill start every
+ * fill_ema / duty keeps fills holding the lock at most `duty` of the time —
+ * the rest is guaranteed to the app's layer_commit. 60 is chosen from the
+ * force-probe data (FORCE ran fills at ~18-32/s with no app regression on
+ * model viewer and 10-30% on earthview): at earthview's ~20 ms fills it
+ * allows ~30 fills/s; at model viewer's measured ~45 ms fill wall time
+ * (lock contention included) it caps at ~13/s. Legacy-gate fills are not
+ * subject to it (they were never throttled before).
+ */
+static uint32_t
+dxr_midframe_fill_duty(void)
+{
+	static int duty = -1;
+	if (duty < 0) {
+		duty = 60;
+		const char *e = getenv("DXR_MIDFRAME_FILL_DUTY");
+#ifdef XRT_OS_ANDROID
+		char sp[PROP_VALUE_MAX] = {0};
+		if ((e == NULL || e[0] == '\0') && __system_property_get("debug.dxr.midframe_fill_duty", sp) > 0 &&
+		    sp[0] != '\0') {
+			e = sp;
+		}
+#endif
+		if (e != NULL && e[0] != '\0') {
+			const long v = strtol(e, NULL, 10);
+			duty = v < 5 ? 5 : (v > 100 ? 100 : (int)v);
+		}
+		U_LOG_W(
+		    "#1905: mid-frame fill duty cap %d%% (DXR_MIDFRAME_FILL_DUTY / "
+		    "debug.dxr.midframe_fill_duty)",
+		    duty);
+	}
+	return (uint32_t)duty;
+}
+
+/*!
+ * #1905: may a fill fence-park (release c->mutex across its GPU wait)?
+ * DXR_MIDFRAME_FILL_PARK / `debug.dxr.midframe_fill_park` — "1" re-enables
+ * the park for A/B. Default OFF while mid-frame fill is active.
+ *
+ * Why not park. On Adreno the runtime-owned repaint queue is NOT an
+ * independent submission context — every submit in the process lands on one
+ * GSL context (see the #1394 note at begin_frame). The runtime's own submits
+ * (the app frame's renderer_draw on the app queue, the fill's submit + present
+ * on the repaint queue) are all made under c->mutex, so they are serialised —
+ * EXCEPT across the fence-park, the one window where the repaint thread runs
+ * vkWaitForFences/vkResetFences without c->mutex while the app's layer_commit
+ * takes it and submits renderer_draw. Under the FORCE probe that collided
+ * ~0.7 times/s on the Lume phone (`gsl_context_base_next_timestamp: next
+ * client ts N must be greater than current ts N` on the APP thread, then
+ * renderer_draw `Failed to submit renderer commands: -3`), and never with
+ * fills off. The park also lets renderer_draw rewrite the atlas while the
+ * fill's weave may still read it on the GPU. Holding the lock closes both: the
+ * app's commit waits at most one fill's GPU time, and it was going to
+ * vkQueueWaitIdle its own atlas submit right after anyway. The wait under the
+ * lock is BOUNDED (see the park site): past it, the fill parks as before, so a
+ * fence that never signals cannot turn into a held c->mutex (#1394).
+ */
+static bool
+dxr_midframe_fill_park(void)
+{
+	static int park = -1;
+	if (park < 0) {
+		park = 0;
+		const char *e = getenv("DXR_MIDFRAME_FILL_PARK");
+		if (e != NULL && e[0] != '\0') {
+			park = (e[0] == '1') ? 1 : 0;
+		}
+#ifdef XRT_OS_ANDROID
+		else {
+			char sp[PROP_VALUE_MAX] = {0};
+			if (__system_property_get("debug.dxr.midframe_fill_park", sp) > 0 && sp[0] != '\0') {
+				park = (sp[0] == '1') ? 1 : 0;
+			}
+		}
+#endif
+	}
+	return park == 1;
+}
+
+/*!
  * #1905: does the mid-frame schedule own this tick?
  *
- * Only on top of the DEFAULT gate schedule (mode 3, resolved by the
- * u_repaint_gate_open call that always precedes this), with the partition
- * throttle NOT engaged, and with #1196 single weave ownership live — the
- * served-weave stamps this schedule paces off only exist there.
+ * Keyed on the kill switch, #1196 single weave ownership (the served-weave
+ * stamps the rule paces off only exist there), the #1257 partition NOT being
+ * engaged (it owns its own schedule), and the FORCE probe off (a probe keeps
+ * the old path so it stays comparable). Deliberately NOT keyed on the gate
+ * mode: that is 0 until the first u_repaint_gate_open, so keying on it made
+ * the first tick of every session take the legacy bail.
  */
 static bool
 vk_midframe_active(const struct comp_vk_native_compositor *c)
 {
-	return dxr_midframe_fill_enabled() && c->repaint.gate.mode == 3 && c->repaint.partition.next_release_ns == 0 &&
-	       c->weave_hand.enabled == 1 && c->repaint.force != 1;
+	return dxr_midframe_fill_enabled() && c->repaint.partition.next_release_ns == 0 && c->weave_hand.enabled == 1 &&
+	       c->repaint.force != 1;
 }
 
 /*!
- * #1905: may a mid-frame fill start at @p now_ns?
+ * #1905: may a present-paced fill start at @p now_ns? (OR-ed with the legacy
+ * gate by the caller — this only ever ADDS fills.)
  *
- *  1. HALF A PERIOD past the last present (served app weave END, or fill END).
- *     The late-weave grid sleep inside the acquire then places the weave at
- *     next_vblank - budget, so the fill targets the NEXT vblank rather than
- *     the one the last present already took.
- *  2. At most ONE fill per panel period: fill START to fill START >= 0.9
- *     periods (the same 0.9 spacing constant the #1257 stall branches use).
- *  3. APP FIRST: once the app's interval is known and the app is not overdue,
- *     refuse a fill predicted to still be running when the app's next
- *     layer_commit wants c->mutex (last serve start + interval EMA - the
- *     measured commit-entry-to-post lead), with a quarter-period guard. A fill
- *     cannot be pre-empted once it holds c->mutex; this is what keeps it from
- *     delaying a hand-off (the mode-4 "fill" failure in u_repaint_gate.h was
- *     exactly a fill delaying xrEndFrame).
+ *  1. HALF A PERIOD past the last present (served app weave END, or fill END),
+ *     so the fill targets the NEXT vblank rather than the one the last present
+ *     already took.
+ *  2. Fill START to fill START >= max(0.9 P, fill_ema * 100 / duty). The 0.9 P
+ *     floor keeps it to one fill per panel period (same spacing constant as
+ *     the #1257 stall branches); the duty term is the governor — it caps the
+ *     share of wall time fills hold c->mutex at `duty` percent, measured from
+ *     actual fills (dxr_midframe_fill_duty).
  *
- * @p predict_refused, when non-NULL, reports that (3) was the reason.
+ * No prediction of the app's next post: the round-1 predictor refused ~100%
+ * of fills on device and froze its own estimate (it only updated on the fills
+ * it refused). App priority is instead structural — a posted app frame always
+ * wins the lock race (weave_hand.pending, checked under the lock), and the
+ * duty cap bounds how long the app can wait for c->mutex in aggregate.
+ *
+ * @p duty_refused, when non-NULL, reports that (2)'s duty term was the reason.
  */
 static bool
 vk_midframe_gate_open(const struct comp_vk_native_compositor *c,
                       uint64_t now_ns,
                       uint64_t period_ns,
-                      bool *predict_refused)
+                      bool *duty_refused)
 {
-	if (predict_refused != NULL) {
-		*predict_refused = false;
+	if (duty_refused != NULL) {
+		*duty_refused = false;
 	}
 	const uint64_t last_end = c->repaint.mf.serve_end_ns > c->repaint.gate.last_repaint_end_ns
 	                              ? c->repaint.mf.serve_end_ns
@@ -7625,22 +7799,15 @@ vk_midframe_gate_open(const struct comp_vk_native_compositor *c,
 		return false;
 	}
 	const uint64_t last_fill = c->repaint.gate.last_repaint_ns;
-	if (last_fill != 0 && now_ns > last_fill && now_ns - last_fill < (period_ns * 9) / 10) {
-		return false;
-	}
-	const uint64_t iv = c->repaint.mf.serve_iv_ema_ns;
-	const uint64_t s0 = c->repaint.mf.serve_start_ns;
-	if (iv != 0 && s0 != 0) {
-		const uint64_t next_post = s0 + iv;
-		const uint64_t lead = c->repaint.mf.commit_lead_ema_ns < iv ? c->repaint.mf.commit_lead_ema_ns : 0;
-		const uint64_t next_commit = next_post - lead;
-		// Overdue by half a period or more: the app is hitching, not pacing —
-		// the original #868 case. Fill; there is no imminent post to protect.
-		const bool overdue = now_ns > next_post + period_ns / 2;
-		const uint64_t est = c->repaint.mf.fire_ema_ns != 0 ? c->repaint.mf.fire_ema_ns : period_ns / 2;
-		if (!overdue && now_ns + est + period_ns / 4 > next_commit) {
-			if (predict_refused != NULL) {
-				*predict_refused = true;
+	if (last_fill != 0 && now_ns > last_fill) {
+		const uint64_t since = now_ns - last_fill;
+		if (since < (period_ns * 9) / 10) {
+			return false;
+		}
+		const uint64_t duty_gap = c->repaint.mf.fill_ema_ns * 100 / dxr_midframe_fill_duty();
+		if (since < duty_gap) {
+			if (duty_refused != NULL) {
+				*duty_refused = true;
 			}
 			return false;
 		}
@@ -7845,31 +8012,25 @@ vk_repaint_thread(void *ptr)
 			h_fp[0] = h_fp0;
 
 #ifdef VK_MIDFRAME_FILL
-			// #1905: the app's interval as this thread sees it (serve START to
-			// serve START), the predictor for the next post. Bounded like the
-			// other interval EMAs so a pause restarts it instead of skewing it.
+			// #1905 (trace): the app's interval as this thread sees it, serve
+			// START to serve START. Outlier-rejecting: a sample > 2x the EMA
+			// (a hitch, a pause) is dropped, and only three in a row reseed —
+			// so one 400 ms stall cannot poison it. 0 means "no data".
 			{
 				const uint64_t s_now = os_monotonic_get_ns();
-				if (c->repaint.mf.serve_start_ns != 0) {
-					const uint64_t d = s_now - c->repaint.mf.serve_start_ns;
-					if (d > 1000000ULL && d < 500000000ULL) {
-						c->repaint.mf.serve_iv_ema_ns =
-						    c->repaint.mf.serve_iv_ema_ns == 0
-						        ? d
-						        : (c->repaint.mf.serve_iv_ema_ns * 7 + d) / 8;
-					} else {
-						c->repaint.mf.serve_iv_ema_ns = 0;
+				const uint64_t s_prev = c->repaint.mf.serve_start_ns;
+				if (s_prev != 0 && s_now > s_prev) {
+					const uint64_t d = s_now - s_prev;
+					const uint64_t ema = c->repaint.mf.serve_iv_ema_ns;
+					if (ema == 0 || d <= 2 * ema) {
+						c->repaint.mf.serve_iv_ema_ns = ema == 0 ? d : (ema * 7 + d) / 8;
+						c->repaint.mf.serve_iv_rejects = 0;
+					} else if (++c->repaint.mf.serve_iv_rejects >= 3) {
+						c->repaint.mf.serve_iv_ema_ns = d;
+						c->repaint.mf.serve_iv_rejects = 0;
 					}
 				}
 				c->repaint.mf.serve_start_ns = s_now;
-				const uint64_t ce = c->repaint.mf.commit_entry_ns;
-				if (ce != 0 && ce <= s_now && s_now - ce < 100000000ULL) {
-					const uint64_t lead = s_now - ce;
-					c->repaint.mf.commit_lead_ema_ns =
-					    c->repaint.mf.commit_lead_ema_ns == 0
-					        ? lead
-					        : (c->repaint.mf.commit_lead_ema_ns * 7 + lead) / 8;
-				}
 			}
 #endif
 
@@ -7922,17 +8083,26 @@ vk_repaint_thread(void *ptr)
 			// frame) — kept out of u_repaint_gate.h so no other backend's row
 			// changes. Window tallies over the same 5 s.
 			if (mf_row_before != 0 && c->repaint.trace.last_report_ns != mf_row_before) {
+				const uint64_t win = c->repaint.mf.win_start_ns != 0 && tn > c->repaint.mf.win_start_ns
+				                         ? tn - c->repaint.mf.win_start_ns
+				                         : 0;
+				const double duty_pct =
+				    win != 0 ? 100.0 * (double)c->repaint.mf.win_busy_ns / (double)win : 0.0;
 				U_LOG_W(
-				    "#1905 trace site=vk midframe{on=%d fires=%u in_frame=%u skip_pending=%u "
-				    "skip_predict=%u app_iv=%.1fms fire=%.2fms}",
-				    (int)vk_midframe_active(c), c->repaint.mf.fires, c->repaint.mf.in_frame,
-				    c->repaint.mf.skip_pending, c->repaint.mf.skip_predict,
-				    (double)c->repaint.mf.serve_iv_ema_ns / 1e6,
-				    (double)c->repaint.mf.fire_ema_ns / 1e6);
-				c->repaint.mf.fires = 0;
+				    "#1905 trace site=vk midframe{on=%d legacy_fires=%u midframe_fires=%u in_frame=%u "
+				    "skip_pending=%u skip_duty=%u duty=%.0f%%/%u%% fill_ema=%.2fms app_iv=%.1fms}",
+				    (int)vk_midframe_active(c), c->repaint.mf.legacy_fires,
+				    c->repaint.mf.midframe_fires, c->repaint.mf.in_frame, c->repaint.mf.skip_pending,
+				    c->repaint.mf.skip_duty, duty_pct, dxr_midframe_fill_duty(),
+				    (double)c->repaint.mf.fill_ema_ns / 1e6,
+				    (double)c->repaint.mf.serve_iv_ema_ns / 1e6);
+				c->repaint.mf.legacy_fires = 0;
+				c->repaint.mf.midframe_fires = 0;
 				c->repaint.mf.in_frame = 0;
 				c->repaint.mf.skip_pending = 0;
-				c->repaint.mf.skip_predict = 0;
+				c->repaint.mf.skip_duty = 0;
+				c->repaint.mf.win_busy_ns = 0;
+				c->repaint.mf.win_start_ns = tn;
 			}
 #endif
 		}
@@ -7952,10 +8122,11 @@ vk_repaint_thread(void *ptr)
 
 #ifdef VK_MIDFRAME_FILL
 		// #1905: under the mid-frame schedule the app being inside xrEndFrame
-		// is not a reason to skip — the app-priority checks below replace it.
-		// `armed` and the opt-in #1394 submit-window guard still apply.
-		if (!c->repaint.armed || vk_app_submit_window_open(c) ||
-		    (c->repaint.app_frame_in_progress && !vk_midframe_active(c))) {
+		// is not a reason to skip — layer_accum is only written under the
+		// lock, and a posted app frame is checked under it below. `armed` and
+		// the opt-in #1394 submit-window guard still apply.
+		const bool mf_on = vk_midframe_active(c);
+		if (!c->repaint.armed || vk_app_submit_window_open(c) || (c->repaint.app_frame_in_progress && !mf_on)) {
 #else
 		if (!c->repaint.armed || c->repaint.app_frame_in_progress || vk_app_submit_window_open(c)) {
 #endif
@@ -7972,20 +8143,21 @@ vk_repaint_thread(void *ptr)
 		// presented clear of the app's own queue slot; otherwise it is the
 		// legacy fixed 2-period gate. See u_repaint_gate.h for the design.
 #ifdef VK_MIDFRAME_FILL
-		// #1905: the gate always runs first (it resolves the schedule mode
-		// vk_midframe_active keys on); under the mid-frame schedule its
-		// verdict is then replaced by the present-relative one.
+		// #1905: legacy verdict OR the present-paced rule — the legacy gate's
+		// fills always still happen. mf_fill marks a fill ONLY the new rule
+		// admitted: it re-checks that rule under the lock and is the one the
+		// duty governor throttles.
 		bool mf_fill = false;
 		if (c->repaint.force != 1 && !move_fill) {
 			const uint64_t now_g = os_monotonic_get_ns();
 			bool open = u_repaint_gate_open(&c->repaint.gate, now_g, period_ns, &c->repaint.partition);
-			if (vk_midframe_active(c)) {
-				bool predict_refused = false;
-				open = vk_midframe_gate_open(c, now_g, period_ns, &predict_refused);
-				if (predict_refused) {
-					c->repaint.mf.skip_predict++;
+			if (!open && mf_on) {
+				bool duty_refused = false;
+				mf_fill = vk_midframe_gate_open(c, now_g, period_ns, &duty_refused);
+				if (duty_refused) {
+					c->repaint.mf.skip_duty++;
 				}
-				mf_fill = open;
+				open = mf_fill;
 			}
 			if (!open) {
 				u_repaint_trace_bail_gate(&c->repaint.trace);
@@ -8167,16 +8339,17 @@ vk_repaint_thread(void *ptr)
 		// layer_accum does not exercise the feature, it corrupts the frame.
 #ifdef VK_MIDFRAME_FILL
 		/*
-		 * #1905: a mid-frame fill does not need app_frame_in_progress clear —
-		 * it replays only the published c->repaint.* state, which the app
-		 * thread writes under THIS lock — but it MUST yield to a posted app
-		 * frame. layer_commit posts and then releases c->mutex, so this is
-		 * exactly the race where a fill that was waiting for the lock wins
-		 * it ahead of the weave thread's own serve: bail, and the loop top
-		 * serves the app frame next. (app_frame_in_progress is what used to
+		 * #1905: under the mid-frame schedule a fill does not need
+		 * app_frame_in_progress clear — on Android layer_accum and the
+		 * c->repaint.* replay state are only written under THIS lock (the app
+		 * accumulates into layer_stage) — but every fill MUST yield to a
+		 * posted app frame. layer_commit posts and then releases c->mutex,
+		 * so this is exactly the race where a fill that was waiting for the
+		 * lock wins it ahead of the weave thread's own serve: bail, and the
+		 * loop top serves the app frame next. (app_frame_in_progress is what used to
 		 * catch this, by being true for the whole hand-off.)
 		 */
-		const bool mf_locked = mf_fill && vk_midframe_active(c);
+		const bool mf_locked = mf_on && vk_midframe_active(c);
 		if (!os_thread_helper_is_running(&c->repaint_thread) || !c->repaint.armed ||
 		    (c->repaint.app_frame_in_progress && !mf_locked) || vk_app_submit_window_open(c) ||
 		    c->display_processor == NULL || c->target == NULL) {
@@ -8219,12 +8392,15 @@ vk_repaint_thread(void *ptr)
 			continue;
 		}
 #ifdef VK_MIDFRAME_FILL
-		// #1905: a mid-frame fill re-runs ITS gate instead — an app weave
-		// served while we waited for the lock moved serve_end_ns.
-		const bool relock_gate_ok = mf_locked ? vk_midframe_gate_open(c, os_monotonic_get_ns(), period_ns, NULL)
-		                                      : !(c->repaint.force != 1 && !move_fill_locked &&
-		                                          !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(),
-		                                                               period_ns, &c->repaint.partition));
+		// #1905: a fill only the present-paced rule admitted re-runs THAT rule
+		// — an app weave served while we waited for the lock moved
+		// serve_end_ns. A legacy-admitted fill re-runs the legacy gate as
+		// before.
+		const bool relock_gate_ok = (mf_locked && mf_fill)
+		                                ? vk_midframe_gate_open(c, os_monotonic_get_ns(), period_ns, NULL)
+		                                : !(c->repaint.force != 1 && !move_fill_locked &&
+		                                    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(),
+		                                                         period_ns, &c->repaint.partition));
 		if (!relock_gate_ok) {
 #else
 		if (c->repaint.force != 1 && !move_fill_locked &&
@@ -8291,6 +8467,9 @@ vk_repaint_thread(void *ptr)
 		// #1905 trace: the app is MID-FRAME (between xrBeginFrame and the end
 		// of xrEndFrame) as this fill starts.
 		const bool mf_in_frame_at_fire = c->repaint.app_frame_in_progress || c->repaint.app_submit_window;
+		// No fence-park while the mid-frame schedule is live — see
+		// dxr_midframe_fill_park. Read at the park site, under this lock.
+		c->repaint.mf.hold_lock = mf_locked && !dxr_midframe_fill_park();
 #endif
 		// zero_copy is hard false: c->repaint.armed is only set off that path.
 		vk_dp_weave_and_present(c, /*is_repaint=*/true, /*zero_copy=*/false, 0, 0, 0, 0, 0,
@@ -8305,18 +8484,29 @@ vk_repaint_thread(void *ptr)
 		u_repaint_gate_note_repaint(&c->repaint.gate, rp_start_ns);
 		u_repaint_trace_fire(&c->repaint.trace, fire_t0, fire_t1);
 #ifdef VK_MIDFRAME_FILL
-		if (mf_locked) {
-			// #1905: the duration the app-first prediction budgets for —
-			// includes the late-weave grid sleep inside the acquire and the
-			// fill fence-park, i.e. everything this fill can make a posted
-			// app frame wait behind.
-			const uint64_t d = fire_t1 - fire_t0;
-			if (d < 200000000ULL) {
-				c->repaint.mf.fire_ema_ns =
-				    c->repaint.mf.fire_ema_ns == 0 ? d : (c->repaint.mf.fire_ema_ns * 7 + d) / 8;
+		c->repaint.mf.hold_lock = false;
+		{
+			// #1905: the duty governor's input — EVERY fill's wall time with
+			// c->mutex held (late-weave sleep in the acquire, submit, GPU wait,
+			// present), seeded from the first fill so it is never frozen. A
+			// sample over 200 ms (a recreate, a stall) is clamped rather than
+			// dropped, so a genuinely slow fill still throttles the next ones.
+			uint64_t d = fire_t1 - fire_t0;
+			if (d > 200000000ULL) {
+				d = 200000000ULL;
 			}
-			c->repaint.mf.fires++;
-			if (mf_in_frame_at_fire) {
+			c->repaint.mf.fill_ema_ns =
+			    c->repaint.mf.fill_ema_ns == 0 ? d : (c->repaint.mf.fill_ema_ns * 7 + d) / 8;
+			if (c->repaint.mf.win_start_ns == 0) {
+				c->repaint.mf.win_start_ns = fire_t0;
+			}
+			c->repaint.mf.win_busy_ns += fire_t1 - fire_t0;
+			if (mf_fill) {
+				c->repaint.mf.midframe_fires++;
+			} else {
+				c->repaint.mf.legacy_fires++;
+			}
+			if (mf_locked && mf_in_frame_at_fire) {
 				c->repaint.mf.in_frame++;
 			}
 		}
@@ -9532,12 +9722,18 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	}
 
 	bool lock_released = false;
-#ifdef VK_MIDFRAME_FILL
-	// #1905: when the app first wants the lock — the mid-frame fill's
-	// app-first prediction keeps a fill from holding it across this point.
-	c->repaint.mf.commit_entry_ns = os_monotonic_get_ns();
-#endif
 	os_mutex_lock(&c->mutex);
+#ifdef VK_MIDFRAME_FILL
+	// #1905: publish the app's privately accumulated frame under the lock —
+	// the only place layer_accum is written on Android. Only the used layers
+	// are copied (a handful, not XRT_MAX_LAYERS).
+	c->layer_accum.data = c->layer_stage.data;
+	c->layer_accum.layer_count = c->layer_stage.layer_count;
+	if (c->layer_stage.layer_count > 0) {
+		memcpy(c->layer_accum.layers, c->layer_stage.layers,
+		       sizeof(c->layer_stage.layers[0]) * c->layer_stage.layer_count);
+	}
+#endif
 	xrt_result_t xret = vk_compositor_layer_commit_locked(xc, sync_handle, &lock_released);
 	c->repaint.app_frame_in_progress = false;
 	c->repaint.app_submit_window = false;
@@ -11044,6 +11240,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 			// #1905: resolve (and log, once) the mid-frame fill switch at
 			// startup rather than on the repaint thread's first tick.
 			(void)dxr_midframe_fill_enabled();
+			(void)dxr_midframe_fill_duty();
 #endif
 		}
 
