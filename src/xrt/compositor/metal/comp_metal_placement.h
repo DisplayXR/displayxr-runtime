@@ -27,6 +27,11 @@
  *    zoom and queues the proposed frame on the same path) that forwards every
  *    other message to the app's own delegate, so an app delegate is never
  *    clobbered;
+ *  - AppKit no longer shows its frame-resize cursors (it never sees those
+ *    mouse-downs, and the zone outside the window gets no mouse-moved), so
+ *    every present polls the mouse against the same zones and sets the
+ *    system resize cursor there — restoring the cursor it replaced only if
+ *    its own is still current, never touching the content area's cursor;
  *  - the compositor applies the pending rect, phase-snapped by the display
  *    processor (`snap_window_rect`, anchored at the gesture start), in the
  *    SAME Core Animation transaction that presents the frame woven for it

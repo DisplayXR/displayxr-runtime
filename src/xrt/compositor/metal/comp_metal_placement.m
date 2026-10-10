@@ -121,6 +121,12 @@ screen_for_top_left(NSRect content, NSWindow *win)
 	BOOL orig_movable_bg;
 	BOOL warned_native_resize;
 	BOOL warned_live_resize;
+	//! Resize-cursor feedback (see update_resize_cursor): the edges whose
+	//! cursor is shown, the cursor this module set (nil = none), and the
+	//! cursor that was current before it (restored only if ours still is).
+	unsigned cursor_edges;
+	NSCursor *cursor_ours;
+	NSCursor *cursor_prev;
 
 	// ---- guarded by lock ----
 	bool pending;
@@ -152,6 +158,7 @@ screen_for_top_left(NSRect content, NSWindow *win)
 	_Atomic unsigned native_resizes;
 	_Atomic unsigned live_resizes;
 	_Atomic bool closed;
+	_Atomic bool cursor_poll_queued; //!< a main-thread cursor poll is outstanding
 }
 @property(nonatomic, weak) NSWindow *window;
 @property(nonatomic, weak) NSView *view;
@@ -520,6 +527,131 @@ on_lattice(int32_t anchor, int32_t v, uint32_t q)
 
 /*
  *
+ * Resize-cursor feedback (main thread).
+ *
+ * AppKit never sees the edge mouse-downs (the monitor swallows them), so it
+ * never shows its frame-resize cursors, and the 8 pt zone OUTSIDE the window
+ * gets no mouse-moved events at all. So the cursor is driven from a poll of
+ * NSEvent.mouseLocation (once per present, see begin_present) against the
+ * very zones handleEvent: hit-tests. Only the resize zones are touched: the
+ * cursor this module set is restored to the one it replaced, and only if it
+ * is still the current one (an app cursor set meanwhile is left alone).
+ *
+ */
+
+static NSCursor *
+resize_cursor_for(unsigned e)
+{
+	if (@available(macOS 15.0, *)) {
+		NSUInteger pos = 0; // closed enum: build the bits, cast once
+		if (e & EDGE_T) {
+			pos |= NSCursorFrameResizePositionTop;
+		}
+		if (e & EDGE_B) {
+			pos |= NSCursorFrameResizePositionBottom;
+		}
+		if (e & EDGE_L) {
+			pos |= NSCursorFrameResizePositionLeft;
+		}
+		if (e & EDGE_R) {
+			pos |= NSCursorFrameResizePositionRight;
+		}
+		return [NSCursor frameResizeCursorFromPosition:(NSCursorFrameResizePosition)pos
+		                                  inDirections:NSCursorFrameResizeDirectionsAll];
+	}
+	// Pre-15: no public diagonal cursors; a corner shows the horizontal one.
+	if (e & (EDGE_L | EDGE_R)) {
+		return [NSCursor resizeLeftRightCursor];
+	}
+	return [NSCursor resizeUpDownCursor];
+}
+
+//! Is the window the topmost one at @p m (inside its frame)? Outside the frame
+//! (the outer margin) the point belongs to whatever is below: accept it.
+static bool
+window_owns_point(NSWindow *win, NSPoint m)
+{
+	if (!NSPointInRect(m, win.frame)) {
+		return true;
+	}
+	return [NSWindow windowNumberAtPoint:m belowWindowWithWindowNumber:0] == win.windowNumber;
+}
+
+static void
+update_resize_cursor(DXRMetalPlacement *pl)
+{
+	NSWindow *win = pl.window;
+	unsigned e = 0;
+	if (pl->gesture == 2) {
+		e = pl->edges; // keep the cursor for the whole resize, wherever the mouse is
+	} else if (win != nil && pl->gesture == 0 && !atomic_load(&pl->closed) && NSApp.isActive && win.isKeyWindow &&
+	           win.isVisible && !win.miniaturized && (win.styleMask & NSWindowStyleMaskFullScreen) == 0) {
+		const NSPoint m = [NSEvent mouseLocation];
+		if (!on_standard_button(win, m) && window_owns_point(win, m)) {
+			e = resize_edges_at(win, m);
+		}
+	}
+
+	if (e != 0) {
+		NSCursor *cur = [NSCursor currentCursor];
+		if (pl->cursor_ours == nil) {
+			pl->cursor_prev = cur;
+		}
+		if (e != pl->cursor_edges || cur != pl->cursor_ours) {
+			// Also re-set when AppKit's cursor rects reset it (inner zone).
+			NSCursor *want =
+			    (e == pl->cursor_edges && pl->cursor_ours != nil) ? pl->cursor_ours : resize_cursor_for(e);
+			[want set];
+			const bool changed = e != pl->cursor_edges;
+			pl->cursor_ours = want;
+			pl->cursor_edges = e;
+			if (changed && trace_enabled()) {
+				U_LOG_W("placement: resize cursor (edges%s%s%s%s)", (e & EDGE_L) ? " L" : "",
+				        (e & EDGE_R) ? " R" : "", (e & EDGE_T) ? " T" : "", (e & EDGE_B) ? " B" : "");
+			}
+		}
+		return;
+	}
+	if (pl->cursor_ours != nil) {
+		// Restore only what we replaced, and only if nobody changed it since.
+		if ([NSCursor currentCursor] == pl->cursor_ours) {
+			[(pl->cursor_prev != nil ? pl->cursor_prev : [NSCursor arrowCursor]) set];
+		}
+		if (trace_enabled()) {
+			U_LOG_W("placement: resize cursor released");
+		}
+		pl->cursor_ours = nil;
+		pl->cursor_prev = nil;
+		pl->cursor_edges = 0;
+	}
+}
+
+//! Per-present cursor poll from any thread: inline on main, else one queued
+//! main-thread poll at a time (never piles up behind a busy main thread).
+static void
+poll_resize_cursor(DXRMetalPlacement *pl)
+{
+	if ([NSThread isMainThread]) {
+		update_resize_cursor(pl);
+		return;
+	}
+	bool expected = false;
+	if (!atomic_compare_exchange_strong(&pl->cursor_poll_queued, &expected, true)) {
+		return;
+	}
+	__weak DXRMetalPlacement *weak_pl = pl;
+	dispatch_async(dispatch_get_main_queue(), ^{
+		DXRMetalPlacement *s = weak_pl;
+		if (s != nil) {
+			atomic_store(&s->cursor_poll_queued, false);
+			update_resize_cursor(s);
+		}
+	});
+}
+
+
+/*
+ *
  * C API
  *
  */
@@ -594,6 +726,7 @@ comp_metal_placement_create(void *ns_view, comp_metal_placement_snap_fn snap, vo
 	atomic_store(&pl->native_resizes, 0u);
 	atomic_store(&pl->live_resizes, 0u);
 	atomic_store(&pl->closed, false);
+	atomic_store(&pl->cursor_poll_queued, false);
 	pl.view = view;
 
 	__block bool ok = false;
@@ -678,6 +811,10 @@ comp_metal_placement_destroy(struct comp_metal_placement **p_ptr)
 			[NSEvent removeMonitor:pl.monitor];
 			pl.monitor = nil;
 		}
+		// Give back a resize cursor still set by this module.
+		atomic_store(&pl->closed, true);
+		pl->gesture = 0;
+		update_resize_cursor(pl);
 		for (id o in pl.observers) {
 			[[NSNotificationCenter defaultCenter] removeObserver:o];
 		}
@@ -844,14 +981,19 @@ verify_present(DXRMetalPlacement *pl,
 }
 
 static void
-apply_frame(NSWindow *win, CAMetalLayer *layer, NSRect frame, NSRect content, CGFloat scale)
+apply_frame(NSWindow *win, CAMetalLayer *layer, NSRect frame, CGFloat scale)
 {
 	if (NSEqualSizes(frame.size, win.frame.size)) {
 		[win setFrameOrigin:frame.origin];
 	} else {
 		// NEVER display:YES — that draws outside this transaction.
 		[win setFrame:frame display:NO];
-		layer.drawableSize = CGSizeMake(round(content.size.width * scale), round(content.size.height * scale));
+		// Size the drawable from the content rect AppKit actually applied
+		// (it may constrain the frame: min / max size), never from the one
+		// asked for: a drawable woven at one size and scaled into another
+		// breaks the lens phase.
+		const NSRect applied = [win contentRectForFrameRect:win.frame];
+		layer.drawableSize = CGSizeMake(round(applied.size.width * scale), round(applied.size.height * scale));
 	}
 }
 
@@ -876,6 +1018,7 @@ comp_metal_placement_begin_present(struct comp_metal_placement *p,
 	if (!layer.presentsWithTransaction) {
 		layer.presentsWithTransaction = YES;
 	}
+	poll_resize_cursor(pl);
 
 	// DXR_MACOS_PLACEMENT_FORCE_DEFERRED=1 (test knob): take the off-main
 	// hand-off path even on the main thread. The main queue cannot run the
@@ -986,8 +1129,8 @@ comp_metal_placement_begin_present(struct comp_metal_placement *p,
 		[CATransaction setDisableActions:YES];
 		out->txn_open = true;
 		if (moves || resizes) {
-			apply_frame(win, layer, NSMakeRect(out->frame_x, out->frame_y, out->frame_w, out->frame_h), content,
-			            scale);
+			const NSRect fr = NSMakeRect(out->frame_x, out->frame_y, out->frame_w, out->frame_h);
+			apply_frame(win, layer, fr, scale);
 			// The APPLIED origin is the authority for the present origin
 			// (AppKit may constrain a frame): read it back.
 			const NSRect applied = [win contentRectForFrameRect:win.frame];

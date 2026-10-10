@@ -92,6 +92,28 @@ for it. This is the default; an app can opt out.
   `set_present_origin(applied)` → weave → `[cb commit]` → `waitUntilScheduled` →
   `[drawable present]` → `[CATransaction commit]`. The drawable's texture size is the authority
   for every downstream size.
+- **Rule: size the drawable from the content rect AppKit APPLIED, never the one asked for.**
+  Showing a window (`makeKeyAndOrderFront:`) constrains it to the screen's `visibleFrame`, and
+  `setFrame:` can be clamped by min / max sizes; a drawable sized from the requested rect is woven
+  at one size and scaled into another, which breaks the lens phase (LeiaSR's reference demo shipped
+  exactly that: `--window 1800x1100` on a 1080 pt screen wove 3600×2200 into 3600×2036). The layer
+  commit re-reads the content size (the view, or the placement frame's applied rect) every frame
+  before `nextDrawable`; the resize path reads `contentRectForFrameRect:` back after
+  `setFrame:display:NO` before setting `drawableSize`; and the hosted window re-reads it once it is
+  shown (logging `Hosted window constrained by the screen` when it changed). A window asked at
+  1000 × 1100 pt on a 982 pt screen comes back 823 pt tall and its first drawable is 2000 × 1646 px.
+- **Rule: the runtime that owns the resize also owns the resize cursor.** AppKit never sees the
+  edge mouse-downs, so it never shows its frame-resize cursors, and the 8 pt zone *outside* the
+  window gets no mouse-moved events at all. So every present polls `NSEvent.mouseLocation` (on the
+  main thread; from another commit thread one queued main-thread poll at a time) against the same
+  edge / corner zones the mouse-down hit-test uses, and sets
+  `+[NSCursor frameResizeCursorFromPosition:inDirections:]` (macOS 15+; before that
+  `resizeLeftRightCursor` / `resizeUpDownCursor`) while the mouse is in a zone or a resize is in
+  progress. Only when the app is active, the window is key, visible, not full-screen / minimised,
+  and topmost at that point; the traffic lights are excluded. It never fights the app's own cursor:
+  it touches the cursor only inside the resize zones, and on leaving restores the cursor it
+  replaced **only if its own cursor is still current**. Same opt-outs as the gesture
+  (`DXR_MACOS_NATIVE_DRAG=1`, the app-owned bit), since both live in the placement object.
 - **App-initiated moves.** A frame change made outside this path (`setFrameOrigin` from the app, a
   display reconfiguration) is detected at the next present by comparing the window frame with the
   last frame the runtime applied; the new origin is snapped relative to the last **presented**
