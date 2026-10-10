@@ -145,6 +145,7 @@ per `docs/roadmap/linux-support.md`.
 | `/usr/lib/displayxr/lib/openxr_displayxr.so` | The **hybrid** runtime: ordinary apps (including window-bound apps that enable `XR_DXR_weave` only for drag phase-snap) run in-process; `XR_DXR_weave` present-owners that bind no window of their own (the DisplayXR browser) and workspace controllers go to `displayxr-service` over IPC. |
 | `/usr/lib/displayxr/bin/displayxr-service` (+ `/usr/bin/` link) | The out-of-process compositor (the weave engine lives only here). |
 | `/usr/lib/displayxr/bin/displayxr-cli` (+ `/usr/bin/` link) | `selftest`, `info`, `clients`, … |
+| `/usr/lib/displayxr/bin/displayxr-dashboard` (+ `/usr/bin/` link, menu entry, icon) | The DisplayXR Dashboard (below). |
 | `/usr/lib/displayxr/plugins/` | sim-display fallback DP + its manifest; a vendor plug-in package adds its own. |
 | `/usr/lib/systemd/user/displayxr.{socket,service}` | The service's start mechanism (below). |
 | `/etc/xdg/openxr/1/active_runtime.json` | Written by `postinst` — the Khronos loader's ActiveRuntime. |
@@ -198,6 +199,20 @@ that impossible to ship:
 The tarball carries no dependency metadata, so `package_linux.sh` records the
 same floor in a `GLIBC_FLOOR` file and its `install.sh` refuses a host below it
 rather than unpacking a tree that cannot `dlopen`.
+
+**The DisplayXR Dashboard on Linux.** Both packages ship `displayxr-dashboard`
+(`src/dashboard/`, Avalonia / .NET 9) beside the `displayxr-cli` it runs, with a
+"DisplayXR Dashboard" applications-menu entry (`Settings;System;`) and a 256 px icon.
+It is a self-contained single file: no .NET runtime to install, invariant globalization
+(no ICU), and the Skia / HarfBuzz natives inside the bundle, extracted on first run to
+`~/.net` (`DOTNET_BUNDLE_EXTRACT_BASE_DIR` moves it), never next to the binary. Its ELF
+host is Microsoft's prebuilt .NET host (glibc >= 2.23), so the package's glibc floor is
+unchanged; the window needs fontconfig and the X11 client libraries, which the `.deb`
+lists as `Recommends`. CI publishes it once (the `DashboardLinux` job) for both the
+`.deb` and the tarball, and `DebInstall` runs `displayxr-dashboard --version` (no display
+server) on all three releases. `package_*_linux.sh` take a prebuilt binary from
+`DXR_DASHBOARD_BIN`, else publish it with a local .NET 9 SDK, else package without it
+(a WARN; `DXR_REQUIRE_DASHBOARD=1` makes that an error).
 
 **GNOME Shell extension (GNOME on Wayland).** Windowed weaving under Wayland
 and transparent apps on a Leia panel both depend on the

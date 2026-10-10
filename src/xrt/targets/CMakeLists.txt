@@ -16,9 +16,12 @@ if(XRT_MODULE_CLI)
 endif()
 
 # VK_LAYER_DXR_queue_lock (#902): per-queue submit serialization for the #868
-# late-weave repaint on single-graphics-queue GPUs (Intel iGPUs, AMD). Desktop
-# only — Android has no loader-layer discovery story for us yet.
-if(XRT_HAVE_VULKAN AND NOT ANDROID)
+# late-weave repaint on single-graphics-queue GPUs (Intel iGPUs, AMD). On
+# Android (#1905) it builds as libVkLayer_DXR_queue_lock.so — same per-queue
+# lock, which serializes the app's own submits with the runtime's (measured
+# sufficient on Adreno; `debug.dxr.ql_scope device` is an A/B option) — and is
+# packaged into the runtime APK's lib/arm64-v8a/ — see vk_layer/CMakeLists.txt.
+if(XRT_HAVE_VULKAN)
 	add_subdirectory(vk_layer)
 endif()
 

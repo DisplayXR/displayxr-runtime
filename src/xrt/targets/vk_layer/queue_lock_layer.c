@@ -29,6 +29,36 @@
  * Deliberately dependency-free: no xrt/aux includes, no link against the
  * Vulkan loader (a layer linking the loader can recurse). Plain C + one
  * OS mutex primitive.
+ *
+ * Lock SCOPE (#1905). Default everywhere is one mutex per VkQueue (the #902
+ * external-synchronization contract). On Android a per-VkDevice scope is
+ * selectable (`setprop debug.dxr.ql_scope device`, read at vkCreateDevice).
+ * The device experiment (Lume phone, Adreno 740, force-repaint probe) decided
+ * it: BOTH scopes cleared the "Adreno-GSL ctx N: next client ts ... must be
+ * greater" warnings and the follow-on submit -3 (0 in 30 s), so the race is
+ * between unsynchronised calls on the SAME queue, which a per-queue lock
+ * already serialises — the earlier inference that the app's idx-0 and the
+ * repaint's idx-1 submits collide ACROSS queues was wrong. And per-device
+ * costs: a blocking present / WaitIdle on one queue stalls the other, which
+ * collapsed the runtime's fills from ~20/s to 10/s (weave refresh 41.5 ->
+ * 22.5 Hz) while per-queue kept 41.5 Hz at baseline app fps. So per-queue is
+ * the product scope; "device" stays as the A/B knob. Build-time override:
+ * -DQL_DEFAULT_PER_DEVICE=0|1.
+ *
+ * Android loader contract (frameworks/native vulkan/libvulkan/
+ * layers_extensions.cpp + api.cpp, verified against AOSP main): no JSON
+ * manifest and no vkNegotiateLoaderLayerInterfaceVersion — the loader scans
+ * its layer search path for files named libVkLayer*.so, dlsym()s
+ * vkEnumerateInstanceLayerProperties + vkEnumerateInstanceExtensionProperties
+ * (required; the library is rejected without them) and
+ * vkEnumerateDeviceLayerProperties + vkEnumerateDeviceExtensionProperties
+ * ("optional" — but a layer whose device-layer properties don't memcmp-equal
+ * its instance-layer properties is NOT "global" and is left out of every
+ * DEVICE chain, so for us they are mandatory), then resolves
+ * "<layerName>GetInstanceProcAddr" falling back to "vkGetInstanceProcAddr"
+ * (same for GetDeviceProcAddr). The NDK ships no vk_layer.h; the chain-link
+ * structs below are Android's vk_layer_interface.h layout (its instance link
+ * has no pfnNextGetPhysicalDeviceProcAddr — we never touch that field).
  */
 
 /*
@@ -39,10 +69,73 @@
  */
 #define VK_NO_PROTOTYPES 1
 #include <vulkan/vulkan.h>
-#include <vulkan/vk_layer.h>
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
+
+#ifdef __ANDROID__
+#include <android/log.h>
+#include <sys/system_properties.h>
+
+// Android's vk_layer_interface.h (frameworks/native/vulkan/include/vulkan/),
+// which the NDK does not ship. Layout-identical to the Khronos vk_layer.h for
+// every field this file reads.
+typedef enum VkLayerFunction_
+{
+	VK_LAYER_LINK_INFO = 0,
+	VK_LOADER_DATA_CALLBACK = 1,
+} VkLayerFunction;
+
+typedef struct VkLayerInstanceLink_
+{
+	struct VkLayerInstanceLink_ *pNext;
+	PFN_vkGetInstanceProcAddr pfnNextGetInstanceProcAddr;
+} VkLayerInstanceLink;
+
+typedef VkResult(VKAPI_PTR *PFN_vkSetInstanceLoaderData)(VkInstance instance, void *object);
+typedef VkResult(VKAPI_PTR *PFN_vkSetDeviceLoaderData)(VkDevice device, void *object);
+
+typedef struct
+{
+	VkStructureType sType; // VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO
+	const void *pNext;
+	VkLayerFunction function;
+	union {
+		VkLayerInstanceLink *pLayerInfo;
+		PFN_vkSetInstanceLoaderData pfnSetInstanceLoaderData;
+	} u;
+} VkLayerInstanceCreateInfo;
+
+typedef struct VkLayerDeviceLink_
+{
+	struct VkLayerDeviceLink_ *pNext;
+	PFN_vkGetInstanceProcAddr pfnNextGetInstanceProcAddr;
+	PFN_vkGetDeviceProcAddr pfnNextGetDeviceProcAddr;
+} VkLayerDeviceLink;
+
+typedef struct
+{
+	VkStructureType sType; // VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO
+	const void *pNext;
+	VkLayerFunction function;
+	union {
+		VkLayerDeviceLink *pLayerInfo;
+		PFN_vkSetDeviceLoaderData pfnSetDeviceLoaderData;
+	} u;
+} VkLayerDeviceCreateInfo;
+
+#define QL_LOG_TAG "DXR-queue-lock"
+#define QL_LOGW(...) __android_log_print(ANDROID_LOG_WARN, QL_LOG_TAG, __VA_ARGS__)
+#else
+#include <vulkan/vk_layer.h>
+#endif
+
+//! Default lock scope: per-QUEUE on every platform (#902; #1905 measured
+//! per-queue sufficient on Adreno, per-device costly). See the file header.
+#ifndef QL_DEFAULT_PER_DEVICE
+#define QL_DEFAULT_PER_DEVICE 0
+#endif
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -145,6 +238,9 @@ struct ql_device
 	PFN_vkQueueBeginDebugUtilsLabelEXT QueueBeginDebugUtilsLabelEXT;
 	PFN_vkQueueEndDebugUtilsLabelEXT QueueEndDebugUtilsLabelEXT;
 	PFN_vkQueueInsertDebugUtilsLabelEXT QueueInsertDebugUtilsLabelEXT;
+	//! #1905: when set, every queue of this device shares device_mutex.
+	bool per_device;
+	ql_mutex_t device_mutex;
 	struct ql_queue queues[QL_MAX_QUEUES];
 };
 
@@ -186,6 +282,11 @@ ql_device_find(void *key)
 static ql_mutex_t *
 ql_queue_mutex(struct ql_device *dev, VkQueue queue)
 {
+	if (dev->per_device) {
+		// #1905: one lock for every queue of the device; the per-queue
+		// slots stay unused in this mode.
+		return &dev->device_mutex;
+	}
 	ql_mutex_lock(&g_registry_lock);
 	struct ql_queue *free_slot = NULL;
 	for (int i = 0; i < QL_MAX_QUEUES; i++) {
@@ -205,6 +306,27 @@ ql_queue_mutex(struct ql_device *dev, VkQueue queue)
 	}
 	ql_mutex_unlock(&g_registry_lock);
 	return NULL; // > QL_MAX_QUEUES distinct queues; caller passes through unlocked.
+}
+
+/*!
+ * Resolve the lock scope for a new device: the compile-time default, which
+ * Android lets `debug.dxr.ql_scope` (queue|device) override at run time.
+ */
+static bool
+ql_scope_per_device(void)
+{
+	bool per_device = QL_DEFAULT_PER_DEVICE != 0;
+#ifdef __ANDROID__
+	char v[PROP_VALUE_MAX] = {0};
+	if (__system_property_get("debug.dxr.ql_scope", v) > 0) {
+		if (strcmp(v, "queue") == 0) {
+			per_device = false;
+		} else if (strcmp(v, "device") == 0) {
+			per_device = true;
+		}
+	}
+#endif
+	return per_device;
 }
 
 /*
@@ -271,6 +393,18 @@ ql_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
 		    *pInstance, "vkEnumerateDeviceExtensionProperties");
 	}
 	ql_mutex_unlock(&g_registry_lock);
+
+#ifdef __ANDROID__
+	// One-shot proof-of-load for the #1905 device experiment.
+	static int s_logged = 0;
+	if (!s_logged) {
+		s_logged = 1;
+		QL_LOGW(
+		    "VK_LAYER_DXR_queue_lock: loaded into vkCreateInstance (instance %p, default scope %s; "
+		    "setprop debug.dxr.ql_scope queue|device overrides per device)",
+		    (void *)*pInstance, QL_DEFAULT_PER_DEVICE ? "per-device" : "per-queue");
+	}
+#endif
 
 	return res;
 }
@@ -349,6 +483,8 @@ ql_CreateDevice(VkPhysicalDevice physicalDevice,
 		d->key = ql_key(dev);
 		d->device = dev;
 		d->gdpa = next_gdpa;
+		d->per_device = ql_scope_per_device();
+		ql_mutex_init(&d->device_mutex);
 		d->DestroyDevice = (PFN_vkDestroyDevice)next_gdpa(dev, "vkDestroyDevice");
 		d->GetDeviceQueue = (PFN_vkGetDeviceQueue)next_gdpa(dev, "vkGetDeviceQueue");
 		d->GetDeviceQueue2 = (PFN_vkGetDeviceQueue2)next_gdpa(dev, "vkGetDeviceQueue2");
@@ -365,7 +501,16 @@ ql_CreateDevice(VkPhysicalDevice physicalDevice,
 		d->QueueInsertDebugUtilsLabelEXT =
 		    (PFN_vkQueueInsertDebugUtilsLabelEXT)next_gdpa(dev, "vkQueueInsertDebugUtilsLabelEXT");
 	}
+	bool per_device = d != NULL && d->per_device;
 	ql_mutex_unlock(&g_registry_lock);
+
+#ifdef __ANDROID__
+	QL_LOGW("VK_LAYER_DXR_queue_lock: device %p registered, lock scope %s", (void *)dev,
+	        d == NULL ? "NONE (registry full - calls pass through UNLOCKED)"
+	                  : (per_device ? "per-device (all queues serialized)" : "per-queue"));
+#else
+	(void)per_device;
+#endif
 
 	return res;
 }
@@ -696,9 +841,11 @@ vkGetDeviceProcAddr(VkDevice device, const char *pName)
 	return ql_GetDeviceProcAddr(device, pName);
 }
 
+#ifndef __ANDROID__
 /*
  *
- * Loader negotiation (layer interface v2).
+ * Loader negotiation (layer interface v2) — desktop Khronos loader only; the
+ * Android loader never calls it (it has no negotiation step).
  *
  */
 
@@ -717,3 +864,93 @@ vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface *pVersionStruct
 	pVersionStruct->pfnGetPhysicalDeviceProcAddr = NULL;
 	return VK_SUCCESS;
 }
+#endif // !__ANDROID__
+
+#ifdef __ANDROID__
+/*
+ *
+ * Android loader introspection exports (#1905). See the file header for the
+ * contract. One layer, no extensions; instance and device properties are the
+ * SAME struct so the loader classes us "global" and chains us into devices.
+ *
+ */
+
+static void
+ql_layer_properties(VkLayerProperties *p)
+{
+	memset(p, 0, sizeof(*p));
+	strncpy(p->layerName, QL_LAYER_NAME, sizeof(p->layerName) - 1);
+	p->specVersion = VK_MAKE_API_VERSION(0, 1, 3, 0);
+	p->implementationVersion = 1;
+	strncpy(p->description, "DisplayXR queue-submit serialization (#902/#1905)", sizeof(p->description) - 1);
+}
+
+static VkResult
+ql_enumerate_layer(uint32_t *pPropertyCount, VkLayerProperties *pProperties)
+{
+	if (pProperties == NULL) {
+		*pPropertyCount = 1;
+		return VK_SUCCESS;
+	}
+	if (*pPropertyCount < 1) {
+		return VK_INCOMPLETE;
+	}
+	ql_layer_properties(&pProperties[0]);
+	*pPropertyCount = 1;
+	return VK_SUCCESS;
+}
+
+QL_EXPORT VKAPI_ATTR VkResult VKAPI_CALL
+vkEnumerateInstanceLayerProperties(uint32_t *pPropertyCount, VkLayerProperties *pProperties)
+{
+	return ql_enumerate_layer(pPropertyCount, pProperties);
+}
+
+QL_EXPORT VKAPI_ATTR VkResult VKAPI_CALL
+vkEnumerateDeviceLayerProperties(VkPhysicalDevice physicalDevice,
+                                 uint32_t *pPropertyCount,
+                                 VkLayerProperties *pProperties)
+{
+	(void)physicalDevice;
+	return ql_enumerate_layer(pPropertyCount, pProperties);
+}
+
+QL_EXPORT VKAPI_ATTR VkResult VKAPI_CALL
+vkEnumerateInstanceExtensionProperties(const char *pLayerName,
+                                       uint32_t *pPropertyCount,
+                                       VkExtensionProperties *pProperties)
+{
+	(void)pProperties;
+	if (pLayerName != NULL && strcmp(pLayerName, QL_LAYER_NAME) == 0) {
+		*pPropertyCount = 0;
+		return VK_SUCCESS;
+	}
+	return VK_ERROR_LAYER_NOT_PRESENT;
+}
+
+QL_EXPORT VKAPI_ATTR VkResult VKAPI_CALL
+vkEnumerateDeviceExtensionProperties(VkPhysicalDevice physicalDevice,
+                                     const char *pLayerName,
+                                     uint32_t *pPropertyCount,
+                                     VkExtensionProperties *pProperties)
+{
+	if (pLayerName != NULL && strcmp(pLayerName, QL_LAYER_NAME) == 0) {
+		*pPropertyCount = 0;
+		return VK_SUCCESS;
+	}
+	// Not about us: the Android loader only ever asks with our name (and a
+	// NULL physical device at discovery), but follow the layer convention
+	// and pass anything else down the instance chain.
+	if (physicalDevice == NULL) {
+		return VK_ERROR_LAYER_NOT_PRESENT;
+	}
+	ql_mutex_lock(&g_registry_lock);
+	struct ql_instance *inst = ql_instance_find(ql_key(physicalDevice));
+	PFN_vkEnumerateDeviceExtensionProperties down = inst != NULL ? inst->EnumerateDeviceExtensionProperties : NULL;
+	ql_mutex_unlock(&g_registry_lock);
+	if (down == NULL) {
+		return VK_ERROR_LAYER_NOT_PRESENT;
+	}
+	return down(physicalDevice, pLayerName, pPropertyCount, pProperties);
+}
+#endif // __ANDROID__

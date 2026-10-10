@@ -11,14 +11,18 @@ using System.Threading.Tasks;
 namespace DisplayXR.Dashboard.Feed;
 
 /// <summary>
-/// Spawns the sibling <c>displayxr-cli.exe</c>: next to this exe (an installed
-/// runtime, or <c>_package\bin</c>), else the installed runtime's. Every child
-/// joins a kill-on-close job object, so no <c>displayxr-cli</c> outlives the
-/// dashboard, crash or not.
+/// Spawns the sibling <c>displayxr-cli</c> (<c>displayxr-cli.exe</c> on Windows):
+/// next to this executable (an installed runtime, <c>_package\bin</c>, or the
+/// Linux <c>/usr/lib/displayxr/bin</c> / <c>~/.local/share/displayxr/bin</c>),
+/// else the installed runtime's. Every child joins a kill-on-close job object on
+/// Windows, so no <c>displayxr-cli</c> outlives the dashboard, crash or not.
 /// </summary>
 public sealed class CliProcessSource : IProcessSource
 {
-    public const string ExeName = "displayxr-cli.exe";
+    /// <summary>The CLI's file name on this platform.</summary>
+    public static string ExeName => CliFileName(OperatingSystem.IsWindows());
+
+    public static string CliFileName(bool windows) => windows ? "displayxr-cli.exe" : "displayxr-cli";
 
     public CliProcessSource(string? cliPath = null)
     {
@@ -30,15 +34,55 @@ public sealed class CliProcessSource : IProcessSource
 
     public bool CliExists => File.Exists(CliPath);
 
-    public static string Resolve()
+    public static string Resolve() => Resolve(
+        OperatingSystem.IsWindows(),
+        Environment.GetEnvironmentVariable("DXR_DASHBOARD_CLI"),
+        AppContext.BaseDirectory,
+        OperatingSystem.IsWindows()
+            ? Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles)
+            : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        File.Exists);
+
+    /// <summary>
+    /// The resolution order, pure for the tests: <c>DXR_DASHBOARD_CLI</c>, the
+    /// directory of this executable, then the platform's installed locations —
+    /// Windows <c>%ProgramFiles%\DisplayXR\Runtime</c>; Linux the .deb's
+    /// <c>/usr/lib/displayxr/bin</c>, the tarball's
+    /// <c>~/.local/share/displayxr/bin</c>, then <c>/usr/bin</c>. Nothing found:
+    /// the sibling path (a run then reports it missing).
+    /// </summary>
+    /// <param name="installRoot">Windows: Program Files. Elsewhere: the home directory.</param>
+    public static string Resolve(bool windows, string? overridePath, string baseDir, string installRoot, Func<string, bool> exists)
     {
-        string? overridePath = Environment.GetEnvironmentVariable("DXR_DASHBOARD_CLI");
-        if (!string.IsNullOrWhiteSpace(overridePath) && File.Exists(overridePath)) return overridePath;
-        string beside = Path.Combine(AppContext.BaseDirectory, ExeName);
-        if (File.Exists(beside)) return beside;
-        string installed = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "DisplayXR", "Runtime", ExeName);
-        if (File.Exists(installed)) return installed;
+        if (!string.IsNullOrWhiteSpace(overridePath) && exists(overridePath)) return overridePath;
+        string name = CliFileName(windows);
+        string beside = Join(windows, baseDir, name);
+        if (exists(beside)) return beside;
+        string[] installed = windows
+            ? [Join(true, installRoot, "DisplayXR", "Runtime", name)]
+            : [
+                "/usr/lib/displayxr/bin/" + name,
+                Join(false, installRoot, ".local", "share", "displayxr", "bin", name),
+                "/usr/bin/" + name,
+              ];
+        foreach (string candidate in installed)
+            if (exists(candidate)) return candidate;
         return beside;
+    }
+
+    // Path.Combine with the TARGET platform's separator, so the tests can check
+    // both platforms' resolution from either host.
+    private static string Join(bool windows, params string[] parts)
+    {
+        char sep = windows ? '\\' : '/';
+        var sb = new StringBuilder();
+        foreach (string part in parts)
+        {
+            if (string.IsNullOrEmpty(part)) continue;
+            if (sb.Length > 0 && sb[^1] != '/' && sb[^1] != '\\') sb.Append(sep);
+            sb.Append(part);
+        }
+        return sb.ToString();
     }
 
     private ProcessStartInfo Info(string arguments, bool stdin) => new(CliPath, arguments)

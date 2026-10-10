@@ -268,6 +268,9 @@ controller and how it is launched, present owners, input providers, the conversi
 a stereo camera source, diagnostics clients), **Performance**, **Developer**; the header carries the source pill
 (`source: service · gen t/s` or headless), Refresh and Copy diagnostics (the snapshot
 JSON). Build / run / debug and the exact feed cadence: [`src/dashboard/README.md`](../../src/dashboard/README.md).
+**Linux ships it too:** the `.deb` and the tarball carry `displayxr-dashboard` (self-contained
+.NET single file, beside `displayxr-cli`, with a menu entry), CI-smoked on Ubuntu 22.04 /
+24.04 / 26.04 — see the README's Linux section.
 The mockup below predates it and still describes the content; the desktop map is an
 Avalonia custom-drawn control rather than an ImGui draw-list, and each Displays card
 carries the phase-7 per-screen display-processor selector when the CLI offers it.

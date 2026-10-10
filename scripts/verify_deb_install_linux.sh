@@ -25,6 +25,10 @@
 #     installed service fails the headless smoke (scripts/smoke_service_linux.sh):
 #     detached start with no terminal, an IPC handshake, clean SIGTERM,
 #     stale-socket recovery, and socket activation + exit-when-idle.
+#   * the DisplayXR Dashboard is missing (binary, PATH symlink, menu entry,
+#     icon) or `displayxr-dashboard --version` fails: the self-contained .NET
+#     host must start on the release with no .NET runtime, no ICU and no display
+#     server (`--version` exits before any window is created).
 #
 # With the optional tarball (scripts/package_linux.sh), its ELFs are also checked with
 # `ldd -r`, but only for symbol-VERSION errors (the glibc-floor class): the
@@ -112,6 +116,27 @@ echo "=== displayxr-service: headless smoke (installed binaries, sim-display)"
 "$(dirname "$(readlink -f "$0")")/smoke_service_linux.sh" ||
     { echo "error: displayxr-service smoke failed on $PRETTY_NAME." >&2; fail=1; }
 
+# --- DisplayXR Dashboard ------------------------------------------------------
+echo "=== displayxr-dashboard: payload + --version (no display server)"
+DASH=/usr/lib/displayxr/bin/displayxr-dashboard
+[ -x "$DASH" ] || { echo "error: $DASH not installed" >&2; fail=1; }
+[ "$(readlink -f /usr/bin/displayxr-dashboard 2>/dev/null)" = "$DASH" ] ||
+    { echo "error: /usr/bin/displayxr-dashboard does not resolve to $DASH" >&2; fail=1; }
+grep -qx "Exec=$DASH" /usr/share/applications/displayxr-dashboard.desktop 2>/dev/null ||
+    { echo "error: /usr/share/applications/displayxr-dashboard.desktop missing or not Exec=$DASH" >&2; fail=1; }
+[ -f /usr/share/icons/hicolor/256x256/apps/displayxr-dashboard.png ] ||
+    { echo "error: the dashboard's 256 px icon is not installed" >&2; fail=1; }
+# Unset DISPLAY / WAYLAND_DISPLAY so a stray one cannot mask a --version that
+# reaches for a window. The bundle extracts its natives under $HOME/.net.
+if out="$(env -u DISPLAY -u WAYLAND_DISPLAY HOME="${HOME:-/root}" displayxr-dashboard --version 2>&1)" &&
+    grep -q '^displayxr-dashboard ' <<<"$out"; then
+    echo "    $out"
+else
+    echo "$out" >&2
+    echo "error: displayxr-dashboard --version failed on $PRETTY_NAME." >&2
+    fail=1
+fi
+
 if [ -n "$TARBALL" ]; then
     echo "=== tarball ${TARBALL##*/}: glibc / libstdc++ floor ==="
     T="$(mktemp -d)"
@@ -127,6 +152,19 @@ if [ -n "$TARBALL" ]; then
             echo "    ${elf#"$T"/}: no missing symbol versions"
         fi
     done
+    # The tarball's dashboard must start here too (the tarball has no
+    # Depends, but its .NET host needs nothing beyond libc / libstdc++).
+    TDASH="$(find "$T" -path '*/bin/displayxr-dashboard' -type f | head -1)"
+    if [ -z "$TDASH" ]; then
+        echo "error: the tarball has no bin/displayxr-dashboard" >&2
+        fail=1
+    elif out="$(env -u DISPLAY -u WAYLAND_DISPLAY "$TDASH" --version 2>&1)"; then
+        echo "    tarball dashboard: $out"
+    else
+        echo "$out" >&2
+        echo "error: the tarball's displayxr-dashboard --version failed on $PRETTY_NAME." >&2
+        fail=1
+    fi
     rm -rf "$T"
 fi
 

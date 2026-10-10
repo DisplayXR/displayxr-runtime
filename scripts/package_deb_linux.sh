@@ -34,6 +34,15 @@
 #       explicit opt-out (the script's header has the rules, and why a dconf
 #       default alone would not reach most users)
 #
+#   /usr/lib/displayxr/bin/displayxr-dashboard          (the DisplayXR Dashboard:
+#       Avalonia / .NET 9, self-contained single file — no .NET runtime Depends;
+#       it runs the displayxr-cli beside it)
+#   /usr/bin/displayxr-dashboard -> ../lib/displayxr/bin/displayxr-dashboard
+#   /usr/share/applications/displayxr-dashboard.desktop
+#   /usr/share/icons/hicolor/256x256/apps/displayxr-dashboard.png
+#       (scripts/linux/dashboard/; the binary comes from
+#       resolve_dashboard_bin.sh — CI's DashboardLinux artifact)
+#
 #   Provides/Conflicts/Replaces the virtual package
 #   displayxr-window-geometry-publisher: exactly one installed package may own
 #   the extension's D-Bus name (docs/specs/runtime/wayland-window-geometry.md §4).
@@ -122,6 +131,13 @@ done
     exit 1
 }
 
+# The DisplayXR Dashboard (src/dashboard): prebuilt (DXR_DASHBOARD_BIN), else
+# published here when the .NET SDK is present; CI sets DXR_REQUIRE_DASHBOARD=1.
+DASH_TMP="$(mktemp -d)"
+trap 'rm -rf "$DASH_TMP"' EXIT
+DASHBOARD_BIN="$("$ROOT/scripts/linux/dashboard/resolve_dashboard_bin.sh" "$DASH_TMP")"
+DASH_SRC="$ROOT/scripts/linux/dashboard"
+
 # The runtime must be the HYBRID one (#1744). An in-process-only .so has no IPC
 # client, so present-owners silently lose XR_DXR_weave; an IPC-only one (plain
 # --service) would push EVERY app through the service. The hybrid router's
@@ -187,6 +203,18 @@ install -m 0755 "$CLI_BIN"     "$STAGE/usr/lib/displayxr/bin/displayxr-cli"
 install -m 0755 "$SERVICE_BIN" "$STAGE/usr/lib/displayxr/bin/displayxr-service"
 install -m 0644 "$RUNTIME_SO"  "$STAGE/usr/lib/displayxr/lib/openxr_displayxr.so"
 install -m 0644 "$PLUGIN_SO"   "$STAGE/usr/lib/displayxr/plugins/DisplayXR-SimDisplay.so"
+# The dashboard sits beside displayxr-cli, which it resolves next to itself.
+# Never strip it: the payload is appended to the ELF host.
+if [ -n "$DASHBOARD_BIN" ]; then
+    install -m 0755 "$DASHBOARD_BIN" "$STAGE/usr/lib/displayxr/bin/displayxr-dashboard"
+    ln -s ../lib/displayxr/bin/displayxr-dashboard "$STAGE/usr/bin/displayxr-dashboard"
+    mkdir -p "$STAGE/usr/share/applications" "$STAGE/usr/share/icons/hicolor/256x256/apps"
+    sed 's|@DASHBOARD_BIN@|/usr/lib/displayxr/bin/displayxr-dashboard|g' \
+        "$DASH_SRC/displayxr-dashboard.desktop.in" >"$STAGE/usr/share/applications/displayxr-dashboard.desktop"
+    chmod 0644 "$STAGE/usr/share/applications/displayxr-dashboard.desktop"
+    install -m 0644 "$DASH_SRC/displayxr-dashboard.png" \
+        "$STAGE/usr/share/icons/hicolor/256x256/apps/displayxr-dashboard.png"
+fi
 # PATH entry — relative symlink so it stays valid regardless of install root.
 ln -s ../lib/displayxr/bin/displayxr-cli "$STAGE/usr/bin/displayxr-cli"
 ln -s ../lib/displayxr/bin/displayxr-service "$STAGE/usr/bin/displayxr-service"
@@ -279,6 +307,12 @@ STABLE_SONAMES=(
     libwayland-client.so.0          # libwayland-client0 (move-sync frame tag, #1748)
 )
 ELF_FILES=("$RUNTIME_SO" "$CLI_BIN" "$SERVICE_BIN" "$PLUGIN_SO")
+# The dashboard's ELF host goes through the same checks (its DT_NEEDED are libc,
+# libm, libstdc++, libgcc_s ...; .NET's host needs glibc >= 2.23). The Skia /
+# HarfBuzz natives are INSIDE the single-file bundle, so neither objdump nor
+# dpkg-shlibdeps sees them; what they load at run time (fontconfig, the X11
+# client libraries Avalonia uses) is a desktop's, declared as Recommends below.
+[ -z "$DASHBOARD_BIN" ] || ELF_FILES+=("$STAGE/usr/lib/displayxr/bin/displayxr-dashboard")
 
 command -v dpkg-shlibdeps >/dev/null 2>&1 || {
     echo "error: dpkg-shlibdeps not found — install dpkg-dev." >&2
@@ -354,6 +388,14 @@ fi
 
 INSTALLED_KB="$(du -sk "$STAGE/usr" | cut -f1)"
 
+# The dashboard's GUI needs (loaded by the bundled natives / Avalonia.X11 at
+# window creation, never by `--version`): fontconfig for Skia, and the X11
+# client libraries. Recommends, not Depends: the runtime works without the
+# dashboard, and every desktop has them. Names checked on every supported
+# release by verify_deb_install_linux.sh.
+RECOMMENDS=""
+[ -z "$DASHBOARD_BIN" ] || RECOMMENDS="libfontconfig1, libice6, libsm6, libx11-6, libxcursor1, libxi6, libxrandr2"
+
 # --- control ---------------------------------------------------------------
 cat > "$STAGE/DEBIAN/control" <<EOF
 Package: $PKG
@@ -362,7 +404,8 @@ Section: libs
 Priority: optional
 Architecture: $ARCH
 Depends: $DEPENDS
-Provides: displayxr-window-geometry-publisher
+${RECOMMENDS:+Recommends: $RECOMMENDS
+}Provides: displayxr-window-geometry-publisher
 Conflicts: displayxr-window-geometry-publisher
 Replaces: displayxr-window-geometry-publisher
 Installed-Size: $INSTALLED_KB
@@ -371,8 +414,9 @@ Homepage: https://github.com/DisplayXR/displayxr-runtime
 Description: DisplayXR OpenXR runtime for 3D displays (sim-display)
  Lightweight standalone OpenXR runtime purpose-built for 3D displays. This
  package ships the runtime, the displayxr-service out-of-process compositor,
- the displayxr-cli diagnostic tool, and the vendor-neutral sim-display display
- processor as the built-in fallback.
+ the displayxr-cli diagnostic tool, the DisplayXR Dashboard (displays,
+ windows, components and performance settings, over displayxr-cli), and the
+ vendor-neutral sim-display display processor as the built-in fallback.
  .
  After install the box needs no environment variables: the OpenXR ActiveRuntime
  is registered at /etc/xdg/openxr/1/active_runtime.json and the runtime's

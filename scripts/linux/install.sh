@@ -11,6 +11,8 @@
 #                              socket-activated on first use, exits when idle (#1744)
 #     GNOME Shell extension -> $XDG_DATA_HOME/gnome-shell/extensions/window-geometry@displayxr.org
 #                              and enabled for this user (unless they disabled it)
+#     Dashboard menu entry  -> $XDG_DATA_HOME/applications/displayxr-dashboard.desktop
+#                              + icons/hicolor/256x256/apps/displayxr-dashboard.png
 #
 #   sudo ./install.sh --system
 #     runtime + plug-in     -> /usr/local/{bin,lib}
@@ -20,6 +22,8 @@
 #                              socket enabled for every user (systemctl --global)
 #     GNOME Shell extension -> /usr/local/share/gnome-shell/extensions/window-geometry@displayxr.org
 #                              + /etc/xdg/autostart entry enabling it once per user at login
+#     Dashboard menu entry  -> /usr/local/share/applications/displayxr-dashboard.desktop
+#                              + /usr/local/share/icons/hicolor/256x256/apps/displayxr-dashboard.png
 #
 # The DisplayProcessors directory is a SHARED discovery root: a vendor plug-in
 # installer (e.g. Leia SR) drops its own .so + <probe-order>-<id>.json next to
@@ -57,6 +61,7 @@ if [ "$SYSTEM" = 1 ]; then
     OPENXR_CONF_DIR=/etc/xdg/openxr/1
     DP_ROOT=/usr/local/share/displayxr/DisplayProcessors
     EXT_ROOT=/usr/local/share/gnome-shell/extensions
+    SHARE_ROOT=/usr/local/share
 else
     DATA_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}"
     CONFIG_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}"
@@ -64,6 +69,7 @@ else
     OPENXR_CONF_DIR="$CONFIG_ROOT/openxr/1"
     DP_ROOT="$DATA_ROOT/DisplayXR/DisplayProcessors"
     EXT_ROOT="$DATA_ROOT/gnome-shell/extensions"
+    SHARE_ROOT="$DATA_ROOT"
 fi
 EXT_UUID="window-geometry@displayxr.org"
 
@@ -200,6 +206,16 @@ EOF
         "$PREFIX/bin/displayxr-gnome-extension-enable" --install || true
     fi
     echo "    LOG OUT AND BACK IN for it to load: a Wayland session cannot reload GNOME Shell."
+fi
+
+# --- DisplayXR Dashboard: applications-menu entry ----------------------------
+# The binary went in with bin/ above, beside the displayxr-cli it runs.
+if [ -x "$PREFIX/bin/displayxr-dashboard" ] && [ -f "$HERE/share/applications/displayxr-dashboard.desktop.in" ]; then
+    mkdir -p "$SHARE_ROOT/applications" "$SHARE_ROOT/icons/hicolor/256x256/apps"
+    sed "s|@DASHBOARD_BIN@|$PREFIX/bin/displayxr-dashboard|g" \
+        "$HERE/share/applications/displayxr-dashboard.desktop.in" >"$SHARE_ROOT/applications/displayxr-dashboard.desktop"
+    cp "$HERE/share/icons/displayxr-dashboard.png" "$SHARE_ROOT/icons/hicolor/256x256/apps/displayxr-dashboard.png"
+    echo "==> DisplayXR Dashboard: $SHARE_ROOT/applications/displayxr-dashboard.desktop"
 fi
 
 echo ""

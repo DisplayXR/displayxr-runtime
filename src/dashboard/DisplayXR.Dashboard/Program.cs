@@ -18,6 +18,17 @@ internal static class Program
     [STAThread]
     public static int Main(string[] args)
     {
+        // --version: print and exit before anything touches a display server,
+        // the log or the single-instance mutex (the packaging smoke runs it in
+        // a container with no X11 / Wayland).
+        if (Array.Exists(args, a => a == "--version"))
+        {
+            if (OperatingSystem.IsWindows()) AttachConsole(-1 /* ATTACH_PARENT_PROCESS */);
+            Console.Out.WriteLine($"displayxr-dashboard {VersionText}");
+            Console.Out.Flush();
+            return 0;
+        }
+
         for (int i = 0; i < args.Length - 1; i++)
         {
             if (args[i] == "--page") StartPage = args[i + 1].ToLowerInvariant();
@@ -58,6 +69,21 @@ internal static class Program
             DashboardLog.Info("DisplayXR Dashboard exiting");
         }
     }
+
+    /// <summary>The informational version (CI stamps the runtime's <c>git describe</c>), else the assembly version.</summary>
+    public static string VersionText
+    {
+        get
+        {
+            var asm = typeof(Program).Assembly;
+            var info = (System.Reflection.AssemblyInformationalVersionAttribute?)Attribute.GetCustomAttribute(
+                asm, typeof(System.Reflection.AssemblyInformationalVersionAttribute));
+            return info?.InformationalVersion ?? asm.GetName().Version?.ToString() ?? "unknown";
+        }
+    }
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    private static extern bool AttachConsole(int processId);
 
     private static void RaiseExisting()
     {
