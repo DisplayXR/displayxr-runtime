@@ -1,6 +1,6 @@
 # ADR-046: Depth-aware cursor — opt-in only; the app knows the depth, the runtime places the cursor
 
-**Status:** Proposed (2026-10-06) · Phase 1 implemented · Phase 3a implemented (Metal) · spec:
+**Status:** Proposed (2026-10-06) · Phase 1 implemented · Phase 3a implemented (Metal) · Amendment 1 (lifted content, 2026-10-10) accepted · spec:
 [XR_DXR_cursor_depth.md](../specs/extensions/XR_DXR_cursor_depth.md) · sibling of
 [ADR-040](ADR-040-rear-depth-budget.md) (the same cue conflict, at the cursor instead of the desktop)
 
@@ -138,6 +138,7 @@ display plane gives d > 0, and the cursor settles onto it. A second locate in th
 | 2 | **Runtime-drawn cursor** (`XrCursorDepthDrawRequestDXR`): the compositor draws the sprite into the atlas before the display processor, reading the OS cursor position at the last moment before compositing. For apps that would rather not draw. | One quad per view |
 | 3a (*implemented, Metal; spec v2*) | **Depth-layer source** (`XrCursorDepthSourceDXR`, `XR_KHR_composition_layer_depth`): for apps that already submit depth with their projection layer, as engines commonly can. The app chains one struct on the hint and sends no point. The compositor copies a cursor-sized patch (at most 64×64) of the two outermost views' submitted depth, never waiting on the GPU. The state tracker turns the nearest texel into a point through that layer's own view and `nearZ`/`farZ`, and feeds it to the v1 placement. Depth is exact, and the app needs no hit-test code. See §6. | One ≤ 32 KB blit per requested frame, plus a CPU min over ≤ 8 K floats |
 | 3b | **Runtime-measured depth** (`XrCursorDepthMeasureRequestDXR`): for apps that have no depth (stereo photos and video, legacy content). The compositor block-matches a cursor-sized patch between the outermost views of the submitted atlas. The measured disparity feeds the same filter. It fails safe, falling back to d = 0 on textureless or ambiguous patches. | One tiny compute dispatch |
+| 3c (*Amendment 1*) | **Lifted content** (`XR_DXR_lift` weave rects): the service draws the cursor into the lifted views, placed from the conversion's own depth map and the plug-in's relief mapping. | One ≤ 64×64 depth-patch copy and one quad per view, per opted-in rect under the cursor |
 | 4 | **Shell / IPC**: an opted-in client's placement is shared with the service, so the workspace controller's cursor rises onto window content, not just window surfaces. Clients that didn't opt in keep today's window-plane behaviour. | none extra |
 | 5 | **Web** (*started: displayxr-web `DepthCursor` + `./cursor-depth`*): the inline3d SDK ports the same placement function. The SDK owns its views, so it needs no runtime round-trip. It gets the hint from depth readback or splat expected depth, and draws the sprite with `cursor: none` over the canvas. It is opt-in per viewer (`cursor: 'depth'`). The browser can later offer the lift depth map for converted video. | none in the runtime |
 
@@ -293,3 +294,75 @@ each of them exactly once.
 - **Give the hint in display space (metres from the display plane).** The app would then need
   the world-to-display mapping, which camera rigs scale and move. The locate space is the one
   space the app and the runtime already share.
+
+## Amendment 1 (2026-10-10): lifted content — the service draws, the conversion supplies the depth
+
+**Accepted** (David, 2026-10-10). Tracking: runtime #1907, under epic #1858.
+
+### Why lifted content needs its own path
+
+Every earlier phase assumes the app renders the views, so the app can draw the sprite into them
+(Phase 1, 3a, 5) or at least submit them (2, 3b). A 2D video lifted through `XR_DXR_lift`
+breaks that assumption. The browser hands the service a **2D** frame on a lift-flagged weave
+rect. The conversion module makes the views on the service's lift thread, and the service
+writes them into the weave input (`lift_weave_rects_nview` / `lift_weave_rect_batch` in
+`comp_d3d11_service.cpp`) and weaves. The page never holds a view it could draw into. The only
+code that holds both the views and their depth is the service, at that write. That is also
+where the workspace controller's cursor is already drawn (the shell pushes `hit_z` and a
+sprite, and the service draws one disparity-shifted sprite per tile before the weave), so the
+service draws here too.
+
+### Decision
+
+1. **Opt-in per lifted rect.** A struct chained on `XrWeaveRectLiftDXR::next` asks for a
+   depth cursor on that rect. No struct, no work: §0 holds. The caller hides its own OS cursor
+   over the rect only while the runtime reports, on the weave output, that it drew the cursor
+   for that rect in the frame just woven. Every frame the runtime cannot place the cursor (no
+   depth, no display mapping, cursor outside the rect, 2D fallback), it reports "not drawn" and
+   the OS cursor stays. The failure mode is today's flat cursor, never no cursor.
+2. **Depth source: the conversion's own depth map** (Phase 3c). It is the map from the inference
+   that made the views being woven (`same_inference`). The service copies a cursor-footprint
+   patch (§6's rule, at most 64×64, from the depth map's texels covering the rect's active
+   region) to a small staging ring and reads it back without waiting on the GPU, a frame or two
+   later, exactly like Phase 3a. The nearest texel in the patch is the content point.
+3. **Display mapping from the plug-in, not invented by the runtime.** Placement needs the
+   content's distance in front of the screen **as the views present it**, which depends on how
+   the module rendered: convergence (including its own auto-convergence, which changes per
+   frame), relief thickness, and camera model. The runtime cannot recover that from relative
+   depth, which is why `depthToDisplay` stays metric-only. So `xrt_dp_lift_depth` gains a
+   per-conversion **relief mapping**, appended under a new feature macro (ADR-020, no ABI bump):
+   display z of a texel, in metres toward the viewer (screen = 0), as an affine function of its
+   inverse decoded depth, `z = relief_scale · (1 / depth) + relief_offset`. A module that renders
+   with a physical off-axis camera has this exactly. The Leia plug-in's off-axis renderer places
+   normalised depth n = 1 − h at z = C − n·D, which is affine in h, and h is proportional to
+   1/depth for both its relative and metric models. A module that renders dimensionless
+   disparity reports no mapping, and the cursor stays flat. Because the mapping is per
+   conversion, the cursor tracks the content through convergence changes instead of fighting
+   them.
+4. **Placement and drawing.**
+   - **Placement** is §2–§3 unchanged, using the viewpoints the views were synthesized for (the
+     result's ADR-048 echo): E is their midpoint, S is the cursor's point on the rect, and the
+     content's z gives t and then d.
+   - **Policy and smoothing:** `u_cursor_depth_target` and `u_cursor_depth_filter_step` apply
+     the same margin, clamp and smoothing as every other cursor, with one filter per rect.
+   - **Per-view position:** each view's sprite position is the projection of C = E + t·(S − E)
+     from **that view's** viewpoint onto the rect, so it is exact for SBS and N-view alike, and
+     the sprite keeps its on-screen size.
+   - **Cursor position:** the service reads the OS cursor position at draw time and maps it into
+     the bound window, as the workspace cursor path already does, so pointer latency is the
+     weave's, not the conversion's.
+5. **One drawer.** The workspace cursor pass is factored into a service helper that draws a
+   sprite at per-view positions into an atlas. The shell keeps its behaviour through it, and
+   lifted rects use it too.
+   - **Sprite:** the system arrow for v1. The browser hides the hardware cursor, so the
+     service cannot read the page's cursor shape. A caller-supplied sprite can follow in the
+     same struct.
+6. **Inside the shell.** A lifted rect inside a workspace client would draw a second cursor
+   next to the controller's. Until Phase 4 shares placements with the controller, the service
+   skips the lift cursor while a workspace controller's cursor is visible.
+
+### Not changed
+
+- `depthToDisplay` (`XR_DXR_lift` v3) stays metric-only. The relief mapping is an internal
+  DP-contract field that serves the cursor. Exposing it to apps is a separate decision.
+- No cost for any rect, stream or session that does not chain the request.
