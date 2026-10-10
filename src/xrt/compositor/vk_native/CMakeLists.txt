@@ -66,6 +66,10 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 			# condition, and comp_vk_native_split.cpp compiles to its
 			# honest-NO stubs without it.
 			target_link_libraries(comp_vk_native PRIVATE comp_xbridge comp_d3d11)
+			# Multi-screen M6 under the split (ADR-047 Amendment 1): the
+			# D3D11 segment manager segments a spanning window on the
+			# scanout adapter, as the in-process D3D11 compositor does.
+			target_link_libraries(comp_vk_native PRIVATE comp_d3d11_segs)
 		endif()
 	endif()
 

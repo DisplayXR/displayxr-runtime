@@ -18,11 +18,22 @@
  * keeps weaving the primary screen's segment, and it keeps owning everything
  * view-related (eye positions, window metrics) — per-segment views are M3.
  * A window entirely on the primary screen never enters this module's record
- * path: that case stays byte-for-byte the single-DP path.
+ * path while the primary holds the window: that case stays byte-for-byte the
+ * single-DP path.
  *
- * Scope: desktop Linux, X11/XWayland (root coordinates are desktop-absolute).
- * Native Wayland stays primary-only until the window-geometry service reports
- * a desktop rect (docs/specs/runtime/wayland-window-geometry.md, follow-up).
+ * Scope: desktop Linux, X11/XWayland (root coordinates are desktop-absolute),
+ * and Windows (multi-screen M6: the window rect is the client area from
+ * ClientToScreen in device px). Native Wayland stays primary-only until the
+ * window-geometry service reports a desktop rect
+ * (docs/specs/runtime/wayland-window-geometry.md, follow-up).
+ *
+ * Windows only: the real HWND (and so the vendor's drag phase-snap) follows the
+ * screen holding the majority of the window (ADR-047 Amendment 2), through
+ * @ref comp_vk_native_segments_hwnd_hooks — the same policy the D3D11 manager
+ * runs. On Linux every segment DP is windowless and no hooks are set.
+ * Under the Vulkan #918 split the weave is a D3D11 one on the scanout adapter
+ * and this module is not used: the split segments with the D3D11 manager
+ * (comp_vk_native_split.cpp).
  * Design note: docs/architecture/comp-segments.md.
  */
 
@@ -65,6 +76,52 @@ void
 comp_vk_native_segments_destroy(struct comp_vk_native_segments **segs_ptr);
 
 /*!
+ * How the manager moves the session's window between DPs (ADR-047
+ * Amendment 2, Windows). All callbacks run on the weave thread with the
+ * compositor's lock held, inside @ref comp_vk_native_segments_update (or
+ * @ref comp_vk_native_segments_destroy / set_screens for the hand-back).
+ */
+struct comp_vk_native_segments_hwnd_hooks
+{
+	//! The session's real window (HWND). NULL disables the hand-off.
+	void *hwnd;
+	void *userdata;
+	/*!
+	 * Install @p dp as the session's primary DP and return the previous one.
+	 * The manager RETIRES the returned DP (deferred until no fill is in
+	 * flight — a parked repaint may still execute a command buffer that
+	 * references it), so the compositor must not destroy it. The compositor
+	 * re-sends its session-level state (transparency, 2D/3D mode,
+	 * eye-tracking mode, encoding latch) to @p dp and guards the exchange
+	 * against its app-thread readers.
+	 */
+	struct xrt_display_processor *(*swap_primary)(void *userdata, struct xrt_display_processor *dp);
+	/*!
+	 * Brackets a hand-off: @p begin true before any DP holding the window is
+	 * retired; false after, with @p hwnd_dp the DP holding the window now —
+	 * NULL when it is the session's primary DP (or none does). Optional.
+	 */
+	void (*bracket)(void *userdata, bool begin, struct xrt_display_processor *hwnd_dp);
+};
+
+/*!
+ * Enable the window-handle hand-off. Call before
+ * @ref comp_vk_native_segments_set_screens. NULL (or a NULL window) disables
+ * it: the window stays with the primary DP. Clear it before a teardown that
+ * destroys the primary DP too.
+ */
+void
+comp_vk_native_segments_set_hwnd_hooks(struct comp_vk_native_segments *segs,
+                                       const struct comp_vk_native_segments_hwnd_hooks *hooks);
+
+/*!
+ * The screen whose DP holds the session's window handle right now, 0 when
+ * none does or segmentation is off. Weave thread (status read).
+ */
+uint64_t
+comp_vk_native_segments_get_owner(const struct comp_vk_native_segments *segs);
+
+/*!
  * Hand over the system's screens and DP registry. Segmentation is enabled only
  * when at least two screens are listed, the registry knows the system-default
  * screen, and @p pinned_display_id is 0 (`XrSessionDisplayBindingDXR` pins a
@@ -100,8 +157,12 @@ comp_vk_native_segments_enabled(const struct comp_vk_native_segments *segs);
  *                        wait on the retire list.
  * @param mode_index      The head's active rendering-mode index; a change
  *                        re-reads each segment DP's resample tolerance.
+ * Runs the window-handle hand-off when one is due (Windows, hooks set): two
+ * DP creates between two weaves; the compositor's primary DP may change.
  * @return true when this frame must take the split path
- *         (@ref comp_vk_native_segments_record); false = the single-DP path.
+ *         (@ref comp_vk_native_segments_record) — the window spans screens,
+ *         or the primary DP is windowless (another screen holds the window)
+ *         and needs its present origin; false = the single-DP path.
  */
 bool
 comp_vk_native_segments_update(struct comp_vk_native_segments *segs,
