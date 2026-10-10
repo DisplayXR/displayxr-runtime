@@ -116,7 +116,10 @@ public sealed class MainWindow : Window
             FitToScreen();
             Navigate(_pages.Any(p => p.Id == startPage) ? startPage : "home");
         };
-        ScalingChanged += (_, _) => FitToScreen();
+        // Moving onto a monitor with another scale: Windows rescales the window by
+        // the DPI ratio, which can push it past that monitor's working area (a
+        // 250 % -> 300 % move does). Fit once the move has settled.
+        ScalingChanged += (_, _) => DispatcherTimer.RunOnce(FitToScreen, TimeSpan.FromMilliseconds(250));
         Closing += (_, _) => ShutdownFeed();
     }
 
@@ -483,12 +486,19 @@ public sealed class MainWindow : Window
         {
             var screen = Screens.ScreenFromWindow(this) ?? Screens.Primary;
             if (screen is null) return;
+            if (WindowState != WindowState.Normal) return; // maximised / minimised: the OS owns the size
             double scale = screen.Scaling > 0 ? screen.Scaling : 1;
             double workW = screen.WorkingArea.Width / scale, workH = screen.WorkingArea.Height / scale;
             MinWidth = Math.Min(DesignMinWidth, Math.Max(640, workW - 24));
             MinHeight = Math.Min(DesignMinHeight, Math.Max(480, workH - 24));
             if (Width > workW - 24) Width = Math.Max(MinWidth, workW - 24);
             if (Height > workH - 24) Height = Math.Max(MinHeight, workH - 24);
+            // Pull the window back inside the working area if it hangs off it.
+            var wa = screen.WorkingArea;
+            int w = (int)Math.Round(Width * scale), h = (int)Math.Round(Height * scale);
+            int x = Math.Clamp(Position.X, wa.X, Math.Max(wa.X, wa.Right - w));
+            int y = Math.Clamp(Position.Y, wa.Y, Math.Max(wa.Y, wa.Bottom - h));
+            if (x != Position.X || y != Position.Y) Position = new PixelPoint(x, y);
         }
         catch (Exception ex)
         {

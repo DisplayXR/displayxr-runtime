@@ -97,9 +97,10 @@ public sealed class HomePage : Page
         string? active = info is { ActiveRuntimeQueried: true } ? (info.ActiveRuntimeSet ? info.ActiveRuntimeValue : null)
                        : s?.Runtime.ActiveOpenXrRuntime;
         bool isDxr = active is not null && active.Contains("DisplayXR", StringComparison.OrdinalIgnoreCase);
-        var activeBlock = U.VStack(6, U.Wrapped(active ?? "<unset>", "value", "mono"));
-        ((TextBlock)activeBlock.Children[0]).Foreground = isDxr ? Tokens.For(Level.Ok) : Tokens.For(Level.Critical);
-        if ((info is not null || s is not null) && !isDxr)
+        bool known = info is not null || s is not null; // nothing read yet: no verdict, no red
+        var activeBlock = U.VStack(6, U.Wrapped(known ? active ?? "<unset>" : "—", "value", "mono"));
+        if (known) ((TextBlock)activeBlock.Children[0]).Foreground = isDxr ? Tokens.For(Level.Ok) : Tokens.For(Level.Critical);
+        if (known && !isDxr)
             activeBlock.Children.Add(U.Button("Make DisplayXR the active OpenXR runtime",
                 () => _ = Ctx.RunActionsAsync("runtime", "runtime activate"), "primary", "sm"));
         kv.Add("Active OpenXR runtime", activeBlock);
