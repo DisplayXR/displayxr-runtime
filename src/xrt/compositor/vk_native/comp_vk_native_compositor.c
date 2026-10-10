@@ -989,9 +989,9 @@ struct comp_vk_native_compositor
 			//! call in the process, the app's own included.
 			bool layer_live;
 			//! Unlocked fence-park time inside the current fill (#1264 S1
-			//! park site), subtracted from its wall time so fill_ema and
-			//! the duty measure only the time the fill held c->mutex.
-			uint64_t fill_parked_ns;
+			//! park site), and its EMA. TRACE ONLY — fill_ema / the duty
+			//! deliberately keep the park in (see fill_ema_ns).
+			uint64_t fill_parked_ns, parked_ema_ns;
 			//! When the last app-frame weave this thread SERVED started / ended.
 			uint64_t serve_start_ns, serve_end_ns;
 			//! EMA of the spacing between served app weaves (the app's frame
@@ -1000,11 +1000,12 @@ struct comp_vk_native_compositor
 			//! Consecutive serve-interval samples rejected as outliers.
 			uint32_t serve_iv_rejects;
 			/*!
-			 * EMA of the time a fill HELD c->mutex (fire_t0 -> fire_t1 minus
-			 * any unlocked fence-park), over EVERY fill — legacy and
-			 * mid-frame — seeded from the first. The duty governor's only
-			 * input; never frozen, because it does not gate the fills that
-			 * feed it to zero.
+			 * EMA of a fill's WALL time (fire_t0 -> fire_t1, the unlocked
+			 * fence-park INCLUDED), over EVERY fill — legacy and mid-frame —
+			 * seeded from the first. The duty governor's only input; never
+			 * frozen, because it does not gate the fills that feed it to
+			 * zero. The park stays in on purpose: it is where a fill's GPU
+			 * cost shows up (round 4 measured excluding it as a regression).
 			 */
 			uint64_t fill_ema_ns;
 			//! This fill holds c->mutex across its own GPU wait (no fence-park).
@@ -7273,8 +7274,8 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 					os_mutex_lock(&c->mutex);
 					c->fill_parked = false;
 #ifdef VK_MIDFRAME_FILL
-					// #1905: unlocked time (wait + relock), not app-visible —
-					// excluded from fill_ema / the duty (lock-held only).
+					// #1905: unlocked time (wait + relock) — trace only
+					// (parked_ema); fill_ema / the duty keep it in.
 					c->repaint.mf.fill_parked_ns += os_monotonic_get_ns() - park_t0;
 #endif
 					// GPU is done — the command buffer is free regardless of
@@ -7727,20 +7728,17 @@ dxr_midframe_fill_resolve(bool layer_live)
  * DXR_MIDFRAME_FILL_DUTY / `debug.dxr.midframe_fill_duty`, default 60,
  * clamped to [5, 100].
  *
- * The cap is a closed loop on MEASURED cost, not a prediction: a fill holds
- * c->mutex for fill_ema_ns (LOCK-HELD time only — an unlocked fence-park is
- * excluded, since the app's layer_commit is not blocked by it), so allowing
- * one present-paced fill start every fill_ema / duty keeps fills holding the
- * lock at most `duty` of the time — the rest is guaranteed to the app's
- * layer_commit. 60 is chosen from the force-probe data (FORCE ran fills at
- * ~18-32/s with no app regression on model viewer and 10-30% on earthview).
- * Sanity against round 4 (layer live, park=1), when the EMA still included the
- * park: model viewer fill_ema 21.4 ms -> spacing 35.7 ms -> <= 28 fills/s, yet
- * it ran 10.5/s with skip_pending=43 — most refusals were "an app weave is
- * posted", the right priority, not the duty. With the park excluded the EMA is
- * smaller, so the duty term binds even less and the 0.9 P floor + the P/2
- * present spacing (<= panel rate) are what bound fills. NOTE the cap governs
- * lock occupancy only, not the fill's GPU share. It applies to EVERY fill
+ * The cap is a closed loop on MEASURED cost, not a prediction: fill_ema_ns is
+ * a fill's WALL time, the unlocked fence-park included, so allowing one
+ * present-paced fill start every fill_ema / duty keeps fills in flight at most
+ * `duty` of the time. The park must stay in: a fill's GPU cost shows up as
+ * park time, so it is the only brake on the GPU share fills take from a
+ * GPU-saturated app. Measured on the Lume phone (layer live, park=1), model
+ * viewer: wall-time duty -> fills 10.5/s, app 13.4 -> 9.9 fps = baseline,
+ * weave 31.5 Hz; lock-held-only duty (park excluded) -> fills 13.6/s, app
+ * 13.4 -> 7.3 fps, weave 25.3 Hz. Earthview was fine either way (~51 Hz).
+ * 60 is chosen from the force-probe data (FORCE ran fills at ~18-32/s with no
+ * app regression on model viewer and 10-30% on earthview). It applies to EVERY fill
  * that starts while the app is mid-frame — legacy-gate ones included (round 3;
  * exempting them let back-to-back legacy fills run the duty to 43-48%).
  * Between app frames legacy fills keep their old, unthrottled verdict.
@@ -8186,12 +8184,12 @@ vk_repaint_thread(void *ptr)
 				    win != 0 ? 100.0 * (double)c->repaint.mf.win_busy_ns / (double)win : 0.0;
 				U_LOG_W(
 				    "#1905 trace site=vk midframe{on=%d legacy_fires=%u midframe_fires=%u in_frame=%u "
-				    "skip_pending=%u skip_duty=%u duty=%.0f%%/%u%% fill_ema=%.2fms app_iv=%.1fms "
-				    "park=%d layer=%d}",
+				    "skip_pending=%u skip_duty=%u duty=%.0f%%/%u%% fill_ema=%.2fms parked_ema=%.2fms "
+				    "app_iv=%.1fms park=%d layer=%d}",
 				    (int)vk_midframe_active(c), c->repaint.mf.legacy_fires,
 				    c->repaint.mf.midframe_fires, c->repaint.mf.in_frame, c->repaint.mf.skip_pending,
 				    c->repaint.mf.skip_duty, duty_pct, dxr_midframe_fill_duty(),
-				    (double)c->repaint.mf.fill_ema_ns / 1e6,
+				    (double)c->repaint.mf.fill_ema_ns / 1e6, (double)c->repaint.mf.parked_ema_ns / 1e6,
 				    (double)c->repaint.mf.serve_iv_ema_ns / 1e6, (int)dxr_midframe_fill_park(),
 				    (int)c->repaint.mf.layer_live);
 				c->repaint.mf.legacy_fires = 0;
@@ -8599,26 +8597,27 @@ vk_repaint_thread(void *ptr)
 #ifdef VK_MIDFRAME_FILL
 		c->repaint.mf.hold_lock = false;
 		{
-			// #1905: the duty governor's input — EVERY fill's time HOLDING
-			// c->mutex (late-weave sleep in the acquire, submit, present, and
-			// the GPU wait only when it is lock-held), seeded from the first
-			// fill so it is never frozen. The unlocked fence-park is excluded:
-			// the app's layer_commit is not blocked by it, so counting it made
-			// the duty over-throttle on the park path. A sample over 200 ms (a
-			// recreate, a stall) is clamped rather than dropped, so a
-			// genuinely slow fill still throttles the next ones.
-			const uint64_t wall = fire_t1 - fire_t0;
-			const uint64_t parked = c->repaint.mf.fill_parked_ns;
-			uint64_t d = parked < wall ? wall - parked : 0;
+			// #1905: the duty governor's input — EVERY fill's WALL time
+			// (late-weave sleep in the acquire, submit, GPU wait — parked or
+			// lock-held — and present), seeded from the first fill so it is
+			// never frozen. The park stays IN: it carries the fill's GPU cost,
+			// and excluding it (round 4) let ~30% more fills through on model
+			// viewer at a 25% app-fps cost. A sample over 200 ms (a recreate,
+			// a stall) is clamped rather than dropped, so a genuinely slow
+			// fill still throttles the next ones.
+			uint64_t d = fire_t1 - fire_t0;
 			if (d > 200000000ULL) {
 				d = 200000000ULL;
 			}
 			c->repaint.mf.fill_ema_ns =
 			    c->repaint.mf.fill_ema_ns == 0 ? d : (c->repaint.mf.fill_ema_ns * 7 + d) / 8;
+			// Trace only: how much of that wall time was the unlocked park.
+			const uint64_t parked = c->repaint.mf.fill_parked_ns;
+			c->repaint.mf.parked_ema_ns = (c->repaint.mf.parked_ema_ns * 7 + parked) / 8;
 			if (c->repaint.mf.win_start_ns == 0) {
 				c->repaint.mf.win_start_ns = fire_t0;
 			}
-			c->repaint.mf.win_busy_ns += parked < wall ? wall - parked : 0;
+			c->repaint.mf.win_busy_ns += fire_t1 - fire_t0;
 			if (mf_fill) {
 				c->repaint.mf.midframe_fires++;
 			} else {
