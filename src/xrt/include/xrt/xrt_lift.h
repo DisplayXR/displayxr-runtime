@@ -153,6 +153,9 @@ struct xrt_lift_weave_rect
 	//! metres (3 floats each); 0 = tracked.
 	uint32_t viewpoint_floats;
 	float viewpoints[3 * XRT_LIFT_MAX_VIEWS];
+	//! XR_DXR_cursor_depth v3 (ADR-046 Amendment 1): draw the depth-aware
+	//! cursor into this rect's lifted views (XrCursorDepthLiftRectDXR).
+	bool depth_cursor;
 };
 
 //! One stream's counters + effective rate (XrLiftStreamStatsDXR).

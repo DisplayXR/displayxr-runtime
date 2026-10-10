@@ -69,6 +69,7 @@
 
 #include "util/u_hud.h"
 #include "util/u_tiling.h"
+#include "util/u_lift_cursor.h"
 #include "util/u_image_capture.h"
 #include <displayxr_mcp/mcp_capture.h>
 
@@ -421,6 +422,49 @@ struct d3d11_service_swapchain
  * and display processors, and allows the IPC service to start without creating a
  * window until a client actually connects.
  */
+/*!
+ * ADR-046 Amendment 1: one in-flight depth-patch readback of a lifted rect's
+ * depth map, with how to decode it (the map and its mapping can change per
+ * conversion, so each copy carries the ones it was taken with).
+ */
+struct svc_lift_cursor_rb
+{
+	wil::com_ptr<ID3D11Texture2D> staging; //!< SVC_LIFT_CURSOR_PATCH_MAX square, STAGING, CPU read
+	uint32_t format = 0;                   //!< DXGI_FORMAT of @c staging (R32_FLOAT / R16_FLOAT)
+	bool pending = false;                  //!< a copy is in flight
+	uint64_t seq = 0;                      //!< issue order
+	uint32_t w = 0, h = 0;                 //!< texels copied
+	bool inverse = false;
+	float value_scale = 1.0f, value_offset = 0.0f;
+	float relief_scale = 0.0f, relief_offset = 0.0f;
+};
+
+//! Readbacks in flight per rect: a copy is read 1-2 frames after it is issued.
+#define SVC_LIFT_CURSOR_RB 3
+//! Largest depth patch copied per frame (ADR-046 §6's cap).
+#define SVC_LIFT_CURSOR_PATCH_MAX 64
+
+/*!
+ * ADR-046 Amendment 1: the depth cursor of one lifted stream on a weave client:
+ * its time filter and its patch readbacks. Keyed by lift stream.
+ */
+struct svc_lift_cursor
+{
+	uint64_t stream_id = 0; //!< 0 = free
+	uint64_t last_used_ns = 0;
+	struct u_cursor_depth_filter filter = {};
+	struct svc_lift_cursor_rb rb[SVC_LIFT_CURSOR_RB];
+	uint64_t next_seq = 1;
+	//! The newest readback that completed: content z in front of the screen
+	//! (metres), or no content under the footprint.
+	bool have_sample = false;
+	bool sample_has_content = false;
+	float sample_z = 0.0f;
+	uint64_t sample_seq = 0;
+	uint64_t sample_ns = 0;
+	bool logged = false;
+};
+
 struct d3d11_client_render_resources
 {
 	//! Dedicated-thread window (NULL if using external HWND)
@@ -798,6 +842,11 @@ struct d3d11_client_render_resources
 	//! v6 path: RTV on weave_crop_tex, so lifted views can be written into
 	//! the crop before the weave (a lift frame never takes the zero-copy path).
 	wil::com_ptr<ID3D11RenderTargetView>   weave_crop_rtv;
+	//! XR_DXR_cursor_depth v3 (ADR-046 Amendment 1): which lift bindings of the
+	//! last weave submit got the depth cursor (bit = binding index), and each
+	//! lifted stream's cursor state.
+	uint32_t                               lift_cursor_mask;
+	struct svc_lift_cursor                 lift_cursor[XRT_LIFT_WEAVE_RECTS_MAX];
 
 	//! Cached import of the caller's v4 overlay atlas (browser#18), keyed by the
 	//! shared-handle value exactly like weave_input_* above. A window-sized
@@ -1557,6 +1606,10 @@ struct d3d11_service_system
 	//! #925 S5: service-owned copy of the controller's cursor swapchain
 	//! (DXR_COMPOSE_FROM_COPY).
 	struct compose_copy_cache cursor_copy_cache;
+	//! ADR-046 Amendment 1: the system-arrow sprite the service draws on lifted
+	//! content (created on first use; @c lift_cursor_sprite_failed stops retries).
+	wil::com_ptr<ID3D11ShaderResourceView> lift_cursor_sprite_srv;
+	bool lift_cursor_sprite_failed;
 
 	//! #308 (spec_version 18): controller input grab is active (modal UI like the
 	//! launcher band is up). While set, the cursor renders at z = 0 (zero
@@ -15102,6 +15155,114 @@ pipeline_service_window_closed(struct d3d11_service_system *sys, struct d3d11_mu
 }
 
 /*!
+ * One cursor sprite draw: the top-left corner and size of the sprite in the
+ * target's pixels, and the rect it may not leave (its view's tile).
+ */
+struct svc_cursor_quad
+{
+	float x, y;
+	float w, h;
+	D3D11_RECT clip;
+};
+
+//! Most cursor quads one svc_draw_cursor_quads call draws (one per view tile).
+#define SVC_CURSOR_MAX_QUADS 64
+
+/*!
+ * Draw a cursor sprite once per view into an atlas, before the display
+ * processor weaves it (ADR-046 Phase 2 drawer). The workspace cursor pass and
+ * the lifted-content cursor (ADR-046 Amendment 1) both go through here; the
+ * caller computes the per-view positions, which is where disparity lives.
+ *
+ * Binds its own pipeline state and leaves the scissor at the full target.
+ * The caller holds the immediate-context lock for the whole call.
+ *
+ * @param tint_rgba    multiplicative tint (alpha = opacity), or NULL for none.
+ * @param convert_srgb true when the target stores linear values (an _SRGB RTV)
+ *                     and the sprite is sRGB-encoded.
+ */
+static void
+svc_draw_cursor_quads(struct d3d11_service_system *sys,
+                      ID3D11RenderTargetView *rtv,
+                      float target_w,
+                      float target_h,
+                      ID3D11ShaderResourceView *sprite_srv,
+                      uint32_t sprite_w,
+                      uint32_t sprite_h,
+                      const struct svc_cursor_quad *quads,
+                      uint32_t quad_count,
+                      const float *tint_rgba,
+                      bool convert_srgb)
+{
+	if (rtv == nullptr || sprite_srv == nullptr || sprite_w == 0 || sprite_h == 0 || quad_count == 0) {
+		return;
+	}
+	sys->context->PSSetConstantBuffers(1, 1, sys->color_linearize_cb.addressof());
+	ID3D11RenderTargetView *rtvs[] = {rtv};
+	sys->context->OMSetRenderTargets(1, rtvs, nullptr);
+	sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
+	sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
+	sys->context->RSSetState(sys->rasterizer_state.get());
+	sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+	sys->context->IASetInputLayout(nullptr);
+	D3D11_VIEWPORT vp = {};
+	vp.Width = target_w;
+	vp.Height = target_h;
+	vp.MaxDepth = 1.0f;
+	sys->context->RSSetViewports(1, &vp);
+	sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
+	sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
+	sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+	sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+	sys->context->PSSetShaderResources(0, 1, &sprite_srv);
+	sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
+
+	for (uint32_t i = 0; i < quad_count; i++) {
+		const struct svc_cursor_quad *q = &quads[i];
+		D3D11_MAPPED_SUBRESOURCE m;
+		if (FAILED(sys->context->Map(sys->blit_constant_buffer.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+			continue;
+		}
+		BlitConstants *cb = static_cast<BlitConstants *>(m.pData);
+		memset(cb, 0, sizeof(*cb));
+		cb->src_rect[0] = 0;
+		cb->src_rect[1] = 0;
+		cb->src_rect[2] = (float)sprite_w;
+		cb->src_rect[3] = (float)sprite_h;
+		cb->src_size[0] = (float)sprite_w;
+		cb->src_size[1] = (float)sprite_h;
+		cb->dst_size[0] = target_w;
+		cb->dst_size[1] = target_h;
+		cb->dst_offset[0] = q->x;
+		cb->dst_offset[1] = q->y;
+		cb->dst_rect_wh[0] = q->w;
+		cb->dst_rect_wh[1] = q->h;
+		cb->convert_srgb = convert_srgb ? 1.0f : 0.0f;
+		cb->chrome_alpha = 0.0f;
+		cb->quad_mode = 0.0f;
+		if (tint_rgba != nullptr) {
+			// The shader's flat-tint path (edge_feather <= 0, glow_intensity > 0).
+			cb->edge_feather = 0.0f;
+			cb->glow_intensity = 1.0f;
+			cb->glow_color[0] = tint_rgba[0];
+			cb->glow_color[1] = tint_rgba[1];
+			cb->glow_color[2] = tint_rgba[2];
+			cb->glow_color[3] = tint_rgba[3];
+		} else {
+			cb->glow_intensity = 0.0f;
+		}
+		sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+		sys->context->RSSetScissorRects(1, &q->clip);
+		sys->context->Draw(4, 0);
+	}
+
+	// Restore the full-target scissor for downstream passes (DP, etc.).
+	D3D11_RECT full = {0, 0, (LONG)target_w, (LONG)target_h};
+	sys->context->RSSetScissorRects(1, &full);
+}
+
+
+/*!
  * Render all client atlases into the combined atlas using Level 2 Kooima,
  * then run DP process_atlas and present.
  *
@@ -17521,105 +17682,44 @@ multi_compositor_render(struct d3d11_service_system *sys)
 
 			// Common pipeline state.
 			//
-			// #1589/#1610: bound ONCE here and relied on by every per-tile
-			// draw below, so the lock spans the whole block. The keyed-mutex
-			// acquire above is deliberately outside it. See combine_ctx_lock.
-			combine_ctx_lock ctx_lock(sys);
-			sys->context->PSSetConstantBuffers(1, 1, sys->color_linearize_cb.addressof());
-			ID3D11RenderTargetView *crtvs[] = {multi_combine_rtv(mc)};
-			sys->context->OMSetRenderTargets(1, crtvs, nullptr);
-			sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
-			sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
-			sys->context->RSSetState(sys->rasterizer_state.get());
-			sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-			sys->context->IASetInputLayout(nullptr);
-			D3D11_VIEWPORT cvp = {};
-			cvp.Width = (float)ca_w;
-			cvp.Height = (float)ca_h;
-			cvp.MaxDepth = 1.0f;
-			sys->context->RSSetViewports(1, &cvp);
-			sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
-			sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
-			sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
-			sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
-
-			sys->context->PSSetShaderResources(0, 1, &cursor_srv);
-			sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
-
 			// Iterate every (col, row) tile in the atlas. Each tile gets
 			// one cursor draw at the proportional in-tile position with
 			// per-eye disparity offset. eye_idx = col % 2 matches the
 			// existing window-blit eye-mapping convention; multiview
 			// layouts (col > 1) collapse to one of the two tracked eye
 			// positions the same way windows do.
+			struct svc_cursor_quad quads[SVC_CURSOR_MAX_QUADS];
+			uint32_t quad_count = 0;
 			for (uint32_t row = 0; row < n_rows; row++) {
-				for (uint32_t col = 0; col < n_cols; col++) {
+				for (uint32_t col = 0; col < n_cols && quad_count < SVC_CURSOR_MAX_QUADS; col++) {
 					int eye_idx = (int)(col % 2);
 					float disp_off = (eye_idx == 0) ? +half_disp_tile_px
 					                                : -half_disp_tile_px;
-					float dest_x = (float)(col * tile_w)
-					             + base_tile_x - hot_x_atlas + disp_off;
-					float dest_y = (float)(row * tile_h)
-					             + base_tile_y - hot_y_atlas;
-
-					D3D11_MAPPED_SUBRESOURCE m;
-					if (FAILED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
-					                              D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-						continue;
-					}
-					BlitConstants *cb = static_cast<BlitConstants *>(m.pData);
-					memset(cb, 0, sizeof(*cb));
-					cb->src_rect[0] = 0;
-					cb->src_rect[1] = 0;
-					cb->src_rect[2] = (float)sprite_w_px;
-					cb->src_rect[3] = (float)sprite_h_px;
-					cb->src_size[0] = (float)sprite_w_px;
-					cb->src_size[1] = (float)sprite_h_px;
-					cb->dst_size[0] = (float)ca_w;
-					cb->dst_size[1] = (float)ca_h;
-					cb->dst_offset[0] = dest_x;
-					cb->dst_offset[1] = dest_y;
-					cb->dst_rect_wh[0] = cursor_w_atlas;
-					cb->dst_rect_wh[1] = cursor_h_atlas;
-					cb->convert_srgb = 0.0f;
-					cb->chrome_alpha = 0.0f;
-					cb->quad_mode = 0.0f;
-					if (over_window) {
-						// Multiplicative tint via the shader's
-						// flat-tint path (edge_feather <= 0,
-						// glow_intensity > 0). RGB stays at 1.0
-						// so the cursor keeps its natural color;
-						// alpha drops to 0.55 so the cursor reads
-						// as semi-transparent over content,
-						// reducing lenticular crosstalk on its
-						// bright pixels.
-						cb->edge_feather = 0.0f;
-						cb->glow_intensity = 1.0f;
-						cb->glow_color[0] = body_tint[0];
-						cb->glow_color[1] = body_tint[1];
-						cb->glow_color[2] = body_tint[2];
-						cb->glow_color[3] = body_tint[3];
-					} else {
-						cb->glow_intensity = 0.0f;
-					}
-					sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
-
-					// Tile-local scissor — keeps a left-tile cursor with
+					struct svc_cursor_quad *q = &quads[quad_count++];
+					q->x = (float)(col * tile_w) + base_tile_x - hot_x_atlas + disp_off;
+					q->y = (float)(row * tile_h) + base_tile_y - hot_y_atlas;
+					q->w = cursor_w_atlas;
+					q->h = cursor_h_atlas;
+					// Tile-local clip — keeps a left-tile cursor with
 					// positive disparity from spilling into the right tile.
-					D3D11_RECT cscissor;
-					cscissor.left   = (LONG)(col * tile_w);
-					cscissor.top    = (LONG)(row * tile_h);
-					cscissor.right  = (LONG)((col + 1) * tile_w);
-					cscissor.bottom = (LONG)((row + 1) * tile_h);
-					sys->context->RSSetScissorRects(1, &cscissor);
-
-					sys->context->Draw(4, 0);
+					q->clip.left   = (LONG)(col * tile_w);
+					q->clip.top    = (LONG)(row * tile_h);
+					q->clip.right  = (LONG)((col + 1) * tile_w);
+					q->clip.bottom = (LONG)((row + 1) * tile_h);
 				}
 			}
 
-			// Restore full-atlas scissor for downstream passes (DP, etc.).
-			D3D11_RECT cfull = {0, 0, (LONG)ca_w, (LONG)ca_h};
-			sys->context->RSSetScissorRects(1, &cfull);
+			// #1589/#1610: the helper binds its pipeline state once and every
+			// per-tile draw relies on it, so the lock spans the whole call. The
+			// keyed-mutex acquire above is deliberately outside it. See
+			// combine_ctx_lock.
+			combine_ctx_lock ctx_lock(sys);
+			// Over-window cosmetic (spec 22/23): multiplicative tint, RGB 1 so the
+			// cursor keeps its colour, alpha = the controller's dim factor, to cut
+			// lenticular crosstalk on its bright pixels over content.
+			svc_draw_cursor_quads(sys, multi_combine_rtv(mc), (float)ca_w, (float)ca_h, cursor_srv, sprite_w_px,
+			                      sprite_h_px, quads, quad_count, over_window ? body_tint : nullptr,
+			                      /*convert_srgb*/ false);
 		}
 		if (cursor_mutex_held) {
 			cursor_mutex->ReleaseSync(0);
@@ -25010,6 +25110,377 @@ lift_pick_pair(uint32_t views, uint32_t *out_l, uint32_t *out_r)
 	*out_r = views / 2;
 }
 
+/*
+ *
+ * ADR-046 Amendment 1 (Phase 3c): the depth-aware cursor on lifted content.
+ *
+ * A lifted rect's views are made here, not by the app, so the service draws
+ * the cursor into them, placed from the conversion's own depth map through the
+ * module's relief mapping. Opt-in per rect (xrt_lift_weave_rect::depth_cursor);
+ * a rect that did not ask costs nothing.
+ *
+ */
+
+//! The system arrow, as drawn at 100 % scale: B = outline, W = fill.
+static const char *const k_lift_cursor_arrow[] = {
+    "B...........", "BB..........", "BWB.........", "BWWB........", "BWWWB.......", "BWWWWB......",
+    "BWWWWWB.....", "BWWWWWWB....", "BWWWWWWWB...", "BWWWWWWWWB..", "BWWWWWWWWWB.", "BWWWWWWBBBBB",
+    "BWWWBWWB....", "BWWBBWWB....", "BWB..BWWB...", "BB...BWWB...", "B.....BWWB..", "......BWWB..",
+    ".......BB...",
+};
+#define SVC_LIFT_CURSOR_SPRITE_W 12u
+#define SVC_LIFT_CURSOR_SPRITE_H 19u
+
+static ID3D11ShaderResourceView *
+svc_lift_cursor_sprite(struct d3d11_service_system *sys)
+{
+	if (sys->lift_cursor_sprite_srv) {
+		return sys->lift_cursor_sprite_srv.get();
+	}
+	if (sys->lift_cursor_sprite_failed) {
+		return nullptr;
+	}
+	uint32_t px[SVC_LIFT_CURSOR_SPRITE_W * SVC_LIFT_CURSOR_SPRITE_H];
+	for (uint32_t y = 0; y < SVC_LIFT_CURSOR_SPRITE_H; y++) {
+		for (uint32_t x = 0; x < SVC_LIFT_CURSOR_SPRITE_W; x++) {
+			const char ch = k_lift_cursor_arrow[y][x];
+			// R8G8B8A8_UNORM, little-endian: 0xAABBGGRR. Straight alpha.
+			px[y * SVC_LIFT_CURSOR_SPRITE_W + x] = ch == 'B' ? 0xFF000000u : ch == 'W' ? 0xFFFFFFFFu : 0u;
+		}
+	}
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = SVC_LIFT_CURSOR_SPRITE_W;
+	td.Height = SVC_LIFT_CURSOR_SPRITE_H;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_IMMUTABLE;
+	td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	D3D11_SUBRESOURCE_DATA init = {};
+	init.pSysMem = px;
+	init.SysMemPitch = SVC_LIFT_CURSOR_SPRITE_W * 4;
+	wil::com_ptr<ID3D11Texture2D> tex;
+	HRESULT hr = sys->device->CreateTexture2D(&td, &init, tex.put());
+	if (SUCCEEDED(hr)) {
+		hr = sys->device->CreateShaderResourceView(tex.get(), nullptr, sys->lift_cursor_sprite_srv.put());
+	}
+	if (FAILED(hr)) {
+		U_LOG_E("[lift cursor] sprite texture create failed: 0x%08lx", hr);
+		sys->lift_cursor_sprite_srv.reset();
+		sys->lift_cursor_sprite_failed = true;
+		return nullptr;
+	}
+	return sys->lift_cursor_sprite_srv.get();
+}
+
+//! IEEE 754 half -> float (R16_FLOAT depth maps).
+static float
+svc_half_to_float(uint16_t h)
+{
+	const uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+	uint32_t exp = (h >> 10) & 0x1Fu;
+	uint32_t man = h & 0x3FFu;
+	uint32_t bits;
+	if (exp == 0) {
+		if (man == 0) {
+			bits = sign;
+		} else { // subnormal: normalise
+			exp = 127 - 15 + 1;
+			while ((man & 0x400u) == 0) {
+				man <<= 1;
+				exp--;
+			}
+			bits = sign | (exp << 23) | ((man & 0x3FFu) << 13);
+		}
+	} else if (exp == 31) {
+		bits = sign | 0x7F800000u | (man << 13);
+	} else {
+		bits = sign | ((exp + 127 - 15) << 23) | (man << 13);
+	}
+	float f;
+	memcpy(&f, &bits, sizeof(f));
+	return f;
+}
+
+//! The cursor state of @p stream_id on @p c: found, or a free / the least
+//! recently used slot, reset.
+static struct svc_lift_cursor *
+svc_lift_cursor_slot(struct d3d11_service_compositor *c, uint64_t stream_id, uint64_t now_ns)
+{
+	struct svc_lift_cursor *oldest = nullptr;
+	for (auto &lc : c->render.lift_cursor) {
+		if (lc.stream_id == stream_id) {
+			lc.last_used_ns = now_ns;
+			return &lc;
+		}
+		// A free slot wins; otherwise the least recently used one.
+		if (oldest == nullptr || (oldest->stream_id != 0 &&
+		                          (lc.stream_id == 0 || lc.last_used_ns < oldest->last_used_ns))) {
+			oldest = &lc;
+		}
+	}
+	// Keep the staging textures; drop everything else.
+	oldest->stream_id = stream_id;
+	oldest->last_used_ns = now_ns;
+	oldest->filter = {};
+	for (auto &rb : oldest->rb) {
+		rb.pending = false;
+	}
+	oldest->have_sample = false;
+	oldest->sample_has_content = false;
+	oldest->logged = false;
+	return oldest;
+}
+
+//! Read back every finished patch copy of @p lc without waiting; keep the newest.
+static void
+svc_lift_cursor_poll(struct d3d11_service_system *sys, struct svc_lift_cursor *lc, uint64_t now_ns)
+{
+	for (auto &rb : lc->rb) {
+		if (!rb.pending) {
+			continue;
+		}
+		D3D11_MAPPED_SUBRESOURCE m = {};
+		HRESULT hr = sys->context->Map(rb.staging.get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
+		if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+			continue;
+		}
+		rb.pending = false;
+		if (FAILED(hr)) {
+			continue;
+		}
+		float samples[SVC_LIFT_CURSOR_PATCH_MAX * SVC_LIFT_CURSOR_PATCH_MAX];
+		uint32_t n = 0;
+		for (uint32_t y = 0; y < rb.h; y++) {
+			const uint8_t *row = static_cast<const uint8_t *>(m.pData) + (size_t)y * m.RowPitch;
+			for (uint32_t x = 0; x < rb.w; x++) {
+				if (rb.format == DXGI_FORMAT_R16_FLOAT) {
+					uint16_t hv;
+					memcpy(&hv, row + 2 * x, sizeof(hv));
+					samples[n++] = svc_half_to_float(hv);
+				} else {
+					memcpy(&samples[n++], row + 4 * x, sizeof(float));
+				}
+			}
+		}
+		sys->context->Unmap(rb.staging.get(), 0);
+		if (rb.seq < lc->sample_seq) {
+			continue; // an older copy finished late
+		}
+		float z = 0.0f;
+		lc->sample_has_content = u_lift_cursor_nearest_z(samples, n, rb.inverse, rb.value_scale, rb.value_offset,
+		                                                 rb.relief_scale, rb.relief_offset, &z);
+		lc->sample_z = z;
+		lc->sample_seq = rb.seq;
+		lc->sample_ns = now_ns;
+		lc->have_sample = true;
+	}
+}
+
+//! Copy the depth texels of the footprint around (@p du, @p dv) — normalised
+//! over the depth map — into a free staging slot. Nothing waits on it.
+static void
+svc_lift_cursor_issue(struct d3d11_service_system *sys,
+                      struct svc_lift_cursor *lc,
+                      const struct d3d11_lift_pin *pin,
+                      float du,
+                      float dv,
+                      float radius_u,
+                      float radius_v)
+{
+	struct svc_lift_cursor_rb *rb = nullptr;
+	for (auto &r : lc->rb) {
+		if (!r.pending) {
+			rb = &r;
+			break;
+		}
+	}
+	if (rb == nullptr) {
+		return; // all in flight: skip this frame
+	}
+	const DXGI_FORMAT fmt = (DXGI_FORMAT)pin->depth_format;
+	if (!rb->staging || rb->format != (uint32_t)fmt) {
+		rb->staging.reset();
+		D3D11_TEXTURE2D_DESC td = {};
+		td.Width = SVC_LIFT_CURSOR_PATCH_MAX;
+		td.Height = SVC_LIFT_CURSOR_PATCH_MAX;
+		td.MipLevels = 1;
+		td.ArraySize = 1;
+		td.Format = fmt;
+		td.SampleDesc.Count = 1;
+		td.Usage = D3D11_USAGE_STAGING;
+		td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		if (FAILED(sys->device->CreateTexture2D(&td, nullptr, rb->staging.put()))) {
+			rb->staging.reset();
+			return;
+		}
+		rb->format = (uint32_t)fmt;
+	}
+	const float dw = (float)pin->depth_w, dh = (float)pin->depth_h;
+	int32_t x0 = (int32_t)floorf((du - radius_u) * dw), x1 = (int32_t)ceilf((du + radius_u) * dw);
+	int32_t y0 = (int32_t)floorf((dv - radius_v) * dh), y1 = (int32_t)ceilf((dv + radius_v) * dh);
+	// Cap the patch, keeping it centred on the cursor.
+	const int32_t cap = (int32_t)SVC_LIFT_CURSOR_PATCH_MAX;
+	if (x1 - x0 > cap) {
+		const int32_t cx = (x0 + x1) / 2;
+		x0 = cx - cap / 2;
+		x1 = x0 + cap;
+	}
+	if (y1 - y0 > cap) {
+		const int32_t cy = (y0 + y1) / 2;
+		y0 = cy - cap / 2;
+		y1 = y0 + cap;
+	}
+	x0 = x0 < 0 ? 0 : x0;
+	y0 = y0 < 0 ? 0 : y0;
+	x1 = x1 > (int32_t)pin->depth_w ? (int32_t)pin->depth_w : x1;
+	y1 = y1 > (int32_t)pin->depth_h ? (int32_t)pin->depth_h : y1;
+	if (x1 <= x0 || y1 <= y0) {
+		return;
+	}
+	D3D11_BOX box = {(UINT)x0, (UINT)y0, 0, (UINT)x1, (UINT)y1, 1};
+	sys->context->CopySubresourceRegion(rb->staging.get(), 0, 0, 0, 0, pin->depth_tex, 0, &box);
+	rb->pending = true;
+	rb->seq = lc->next_seq++;
+	rb->w = (uint32_t)(x1 - x0);
+	rb->h = (uint32_t)(y1 - y0);
+	rb->inverse = pin->depth_encoding == XRT_DP_LIFT_DEPTH_ENCODING_INVERSE;
+	rb->value_scale = pin->depth_value_scale;
+	rb->value_offset = pin->depth_value_offset;
+	rb->relief_scale = pin->relief_scale;
+	rb->relief_offset = pin->relief_offset;
+}
+
+/*!
+ * Where one atlas view of a lifted rect lives in the render target: window
+ * pixel (x, y) of the rect maps to target pixel (ox + x * sx, oy + y * sy).
+ */
+struct svc_lift_cursor_view
+{
+	float ox, oy;
+	float sx, sy;
+	D3D11_RECT clip;   //!< the rect's region in this view: the cursor never leaves it
+	uint32_t src_view; //!< the result view (and viewpoint) this atlas view shows
+};
+
+/*!
+ * Place and draw the depth cursor on one lifted rect, before the weave.
+ * @p pin is the result just written into the views (still pinned). Returns
+ * true when the cursor was drawn this frame — the caller then reports the
+ * rect, and the app hides its OS cursor over it.
+ */
+static bool
+svc_lift_cursor_draw(struct d3d11_service_system *sys,
+                     struct d3d11_service_compositor *c,
+                     struct d3d11_lift_pin *pin,
+                     const struct xrt_rect &rect,
+                     const struct svc_lift_cursor_view *views,
+                     uint32_t view_count,
+                     ID3D11RenderTargetView *rtv,
+                     float target_w,
+                     float target_h)
+{
+	// The workspace controller draws its own cursor; never two (until Phase 4).
+	if (sys->cursor_visible && sys->cursor_xsc != nullptr) {
+		return false;
+	}
+	HWND hwnd = c->render.weave_hwnd;
+	if (hwnd == nullptr || rect.extent.w <= 0 || rect.extent.h <= 0 || pin->vp_count == 0 ||
+	    pin->rect_size[0] <= 0.0f || pin->rect_size[1] <= 0.0f) {
+		return false;
+	}
+	const uint64_t now_ns = os_monotonic_get_ns();
+	struct svc_lift_cursor *lc = svc_lift_cursor_slot(c, pin->stream_id, now_ns);
+	svc_lift_cursor_poll(sys, lc, now_ns);
+
+	// The OS cursor, in the bound window's client pixels — only when it is over
+	// that window (not another one on top of it).
+	POINT pt;
+	if (!GetCursorPos(&pt)) {
+		return false;
+	}
+	HWND under = WindowFromPoint(pt);
+	if (under == nullptr || GetAncestor(under, GA_ROOT) != GetAncestor(hwnd, GA_ROOT) || !ScreenToClient(hwnd, &pt)) {
+		return false;
+	}
+	const float fx = ((float)pt.x - (float)rect.offset.w) / (float)rect.extent.w;
+	const float fy = ((float)pt.y - (float)rect.offset.h) / (float)rect.extent.h;
+	const float a0 = pin->active[0], a1 = pin->active[1], a2 = pin->active[2], a3 = pin->active[3];
+	if (fx < a0 || fx >= a2 || fy < a1 || fy >= a3 || a2 <= a0 || a3 <= a1) {
+		return false; // not over the converted picture (outside, or over a letterbox bar)
+	}
+
+	// Sprite size in window pixels: the system arrow at the window's DPI.
+	const UINT dpi = GetDpiForWindow(hwnd);
+	const float scale = dpi > 0 ? (float)dpi / 96.0f : 1.0f;
+	const float spr_w = (float)SVC_LIFT_CURSOR_SPRITE_W * scale, spr_h = (float)SVC_LIFT_CURSOR_SPRITE_H * scale;
+
+	// Phase 3c source: copy the footprint (the sprite + 50 %, ADR-046 §6) of
+	// this result's depth map; it is read back a frame or two later.
+	if (pin->relief_valid && d3d11_lift_pin_depth(pin)) {
+		const float act_w = (a2 - a0) * (float)rect.extent.w, act_h = (a3 - a1) * (float)rect.extent.h;
+		const float du = (fx - a0) / (a2 - a0), dv = (fy - a1) / (a3 - a1);
+		// The arrow hangs below-right of its hotspot: centre the footprint on it.
+		const float cu = du + 0.5f * spr_w / act_w, cv = dv + 0.5f * spr_h / act_h;
+		svc_lift_cursor_issue(sys, lc, pin, cu, cv, 0.75f * spr_w / act_w, 0.75f * spr_h / act_h);
+	}
+	if (!lc->logged) {
+		lc->logged = true;
+		U_LOG_W("[lift cursor] stream %llu: depth cursor requested — depth %s, relief mapping %s, %u viewpoint(s) "
+		        "(ADR-046 Amendment 1)",
+		        (unsigned long long)pin->stream_id, pin->depth_tex != nullptr ? "yes" : "NO",
+		        pin->relief_valid ? "yes" : "NO (module renders without a display mapping)", pin->vp_count);
+	}
+	// No depth reading yet, or none recently (depth stopped): leave the OS cursor.
+	if (!pin->relief_valid || !lc->have_sample || now_ns - lc->sample_ns > 500000000ull) {
+		return false;
+	}
+
+	float e[3];
+	if (!u_lift_cursor_eye_midpoint(pin->vps, pin->vp_count, e)) {
+		return false;
+	}
+	struct u_cursor_depth_tuning tuning;
+	u_cursor_depth_tuning_defaults(&tuning);
+	float content_d = 0.0f;
+	const bool has_content = lc->sample_has_content && u_lift_cursor_disparity_of_z(e, lc->sample_z, &content_d);
+	const float target = u_cursor_depth_target(&tuning, has_content, content_d);
+	const float d = u_cursor_depth_filter_step(&lc->filter, &tuning, target, now_ns);
+
+	// The cursor's point on the rect, rect-centre metres (+y up).
+	const float sx = (fx - 0.5f) * pin->rect_size[0], sy = (0.5f - fy) * pin->rect_size[1];
+	float xy[2 * U_LIFT_CURSOR_MAX_VIEWS];
+	const uint32_t nvp = pin->vp_count > U_LIFT_CURSOR_MAX_VIEWS ? U_LIFT_CURSOR_MAX_VIEWS : pin->vp_count;
+	if (!u_lift_cursor_project(e, sx, sy, d, pin->vps, nvp, xy)) {
+		return false;
+	}
+
+	ID3D11ShaderResourceView *sprite = svc_lift_cursor_sprite(sys);
+	if (sprite == nullptr) {
+		return false;
+	}
+	struct svc_cursor_quad quads[SVC_CURSOR_MAX_QUADS];
+	uint32_t nq = 0;
+	for (uint32_t i = 0; i < view_count && nq < SVC_CURSOR_MAX_QUADS; i++) {
+		const struct svc_lift_cursor_view *v = &views[i];
+		const uint32_t k = v->src_view < nvp ? v->src_view : nvp - 1;
+		// Rect metres -> window pixels -> target pixels. The hotspot is the
+		// arrow's tip, its top-left texel.
+		const float wx = (float)rect.offset.w + (0.5f + xy[2 * k + 0] / pin->rect_size[0]) * (float)rect.extent.w;
+		const float wy = (float)rect.offset.h + (0.5f - xy[2 * k + 1] / pin->rect_size[1]) * (float)rect.extent.h;
+		struct svc_cursor_quad *q = &quads[nq++];
+		q->x = v->ox + wx * v->sx;
+		q->y = v->oy + wy * v->sy;
+		q->w = spr_w * v->sx;
+		q->h = spr_h * v->sy;
+		q->clip = v->clip;
+	}
+	svc_draw_cursor_quads(sys, rtv, target_w, target_h, sprite, SVC_LIFT_CURSOR_SPRITE_W, SVC_LIFT_CURSOR_SPRITE_H,
+	                      quads, nq, /*tint*/ nullptr, /*convert_srgb*/ false);
+	return true;
+}
+
 /*!
  * Batch (v3) layout: rect @p rect is window-sized-input pixels holding a 2D
  * frame. Snapshot it, then blit the stream's latest pair into the left / right
@@ -25095,6 +25566,24 @@ lift_weave_rect_batch(struct d3d11_service_system *sys,
 				blit_to_atlas_texture(sys, &c->render, in_srv, s[0], s[1], s[2], s[3], (float)in_w, (float)in_h,
 				                      (float)(eye * win_w) + s[0], s[1], s[2], s[3], /*is_srgb*/ false,
 				                      /*blend*/ nullptr, rtv, atw, ath);
+			}
+		}
+		// ADR-046 Amendment 1: the depth cursor, into both tiles of the SBS scratch.
+		if (b->depth_cursor) {
+			struct svc_lift_cursor_view cv[2];
+			for (uint32_t eye = 0; eye < 2; eye++) {
+				cv[eye].ox = (float)(eye * win_w);
+				cv[eye].oy = 0.0f;
+				cv[eye].sx = 1.0f;
+				cv[eye].sy = 1.0f;
+				cv[eye].clip.left = (LONG)(eye * win_w) + (LONG)x0;
+				cv[eye].clip.top = (LONG)y0;
+				cv[eye].clip.right = (LONG)(eye * win_w) + (LONG)x1;
+				cv[eye].clip.bottom = (LONG)y1;
+				cv[eye].src_view = eye == 0 ? vl : vr;
+			}
+			if (svc_lift_cursor_draw(sys, c, &pin, rect, cv, 2, rtv, atw, ath)) {
+				c->render.lift_cursor_mask |= 1u << (uint32_t)(b - bindings);
 			}
 		}
 		d3d11_lift_unpin(&pin);
@@ -25190,6 +25679,35 @@ lift_weave_rects_nview(struct d3d11_service_system *sys,
 			                      (float)pin.width, (float)pin.height, dx, dy, aw, ah,
 			                      /*is_srgb*/ false, /*blend*/ nullptr, crop_rtv, (float)packed_w,
 			                      (float)packed_h);
+		}
+		// ADR-046 Amendment 1: the depth cursor, into every tile's copy of the rect.
+		if (b->depth_cursor && layout->view_count <= SVC_CURSOR_MAX_QUADS) {
+			struct svc_lift_cursor_view cv[SVC_CURSOR_MAX_QUADS];
+			for (uint32_t v = 0; v < layout->view_count; v++) {
+				const float tx = (float)((v % layout->tile_columns) * cvw);
+				const float ty = (float)((v / layout->tile_columns) * cvh);
+				cv[v].ox = tx;
+				cv[v].oy = ty;
+				cv[v].sx = sx;
+				cv[v].sy = sy;
+				cv[v].clip.left = (LONG)(tx + (float)x0);
+				cv[v].clip.top = (LONG)(ty + (float)y0);
+				cv[v].clip.right = (LONG)(tx + (float)(x0 + w));
+				cv[v].clip.bottom = (LONG)(ty + (float)(y0 + h));
+				uint32_t src_v = v;
+				if (pin.view_count != layout->view_count) {
+					src_v = layout->view_count > 1
+					            ? (uint32_t)((float)v * (float)(pin.view_count - 1) /
+					                             (float)(layout->view_count - 1) +
+					                         0.5f)
+					            : pin.view_count / 2;
+				}
+				cv[v].src_view = src_v;
+			}
+			if (svc_lift_cursor_draw(sys, c, &pin, r, cv, layout->view_count, crop_rtv, (float)packed_w,
+			                         (float)packed_h)) {
+				c->render.lift_cursor_mask |= 1u << k;
+			}
 		}
 		d3d11_lift_unpin(&pin);
 	}
@@ -25687,6 +26205,13 @@ comp_d3d11_service_weave_set_overlay_unchanged(struct xrt_compositor *xc, bool o
 	}
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 	c->render.weave_overlay_unchanged_next = overlay_unchanged;
+}
+
+uint32_t
+comp_d3d11_service_weave_lift_cursor_mask(struct xrt_compositor *xc)
+{
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	return c != nullptr ? c->render.lift_cursor_mask : 0u;
 }
 
 void
@@ -26368,6 +26893,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		memcpy(lift_rects, c->render.lift_rects, lift_count * sizeof(lift_rects[0]));
 	}
 	c->render.lift_rect_count = 0;
+	c->render.lift_cursor_mask = 0;
 	struct d3d11_lift *lift = lift_count > 0 ? sys->lift : nullptr;
 	if (lift == nullptr) {
 		lift_count = 0;

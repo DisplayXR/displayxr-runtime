@@ -6870,12 +6870,14 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
                         uint32_t *out_height,
                         uint64_t *out_fence_value,
                         struct xrt_eye_positions *out_eyes,
+                        uint32_t *out_lift_cursor_mask,
                         const xrt_graphics_buffer_handle_t *handles,
                         uint32_t handle_count)
 {
 	IPC_TRACE_MARKER();
 
 	*out_have_output = false;
+	*out_lift_cursor_mask = 0;
 	xrt_result_t auth = require_present_owner(ics, "weave_submit");
 	if (auth != XRT_SUCCESS) {
 		weave_submit_release_handles(handles, handle_count);
@@ -7001,6 +7003,8 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	*out_height = h;
 	*out_fence_value = fv;
 	*out_eyes = eyes;
+	// XR_DXR_cursor_depth v3: which lift rects of this submit got the cursor.
+	*out_lift_cursor_mask = comp_d3d11_service_weave_lift_cursor_mask(ics->xc);
 	return XRT_SUCCESS;
 #elif defined(COMP_MULTI_HAVE_WEAVE)
 	// handles[0] is the retained IOSurfaceRef (macOS) / acquired AHardwareBuffer

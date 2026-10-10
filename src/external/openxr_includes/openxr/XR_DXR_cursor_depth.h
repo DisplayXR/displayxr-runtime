@@ -70,7 +70,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_cursor_depth 1
-#define XR_DXR_cursor_depth_SPEC_VERSION 2
+#define XR_DXR_cursor_depth_SPEC_VERSION 3
 #define XR_DXR_CURSOR_DEPTH_EXTENSION_NAME "XR_DXR_cursor_depth"
 
 // Reserved 1004999320-329 (next free decade after stereo_camera's 310-319).
@@ -79,6 +79,9 @@ extern "C" {
 #define XR_TYPE_CURSOR_DEPTH_PLACEMENT_DXR ((XrStructureType)1004999321)
 //! Spec v2 (ADR-046 Phase 3a).
 #define XR_TYPE_CURSOR_DEPTH_SOURCE_DXR ((XrStructureType)1004999322)
+//! Spec v3 (ADR-046 Amendment 1, Phase 3c: lifted content).
+#define XR_TYPE_CURSOR_DEPTH_LIFT_RECT_DXR ((XrStructureType)1004999323)
+#define XR_TYPE_CURSOR_DEPTH_LIFT_STATE_DXR ((XrStructureType)1004999324)
 
 // ---- Input: app chains this on XrViewLocateInfo::next; runtime reads it. ----
 
@@ -208,6 +211,53 @@ typedef struct XrCursorDepthPlacementDXR {
     //! Unfiltered target disparity this locate (content + margin, clamped). Diagnostic.
     float targetDisparity;
 } XrCursorDepthPlacementDXR;
+
+// ---- Spec v3: lifted content (ADR-046 Amendment 1, Phase 3c). ----
+//
+// A 2D element lifted on a weave rect (XR_DXR_lift, XrWeaveRectLiftDXR) has no
+// app that holds its views: the runtime synthesizes them and weaves them. So
+// for such a rect the RUNTIME draws the cursor, into the lifted views, placed
+// from the conversion's own depth map. Requires XR_DXR_lift and XR_DXR_weave,
+// and a lift stream created with XrLiftDepthRequestDXR (no depth, no cursor).
+
+/*!
+ * @brief Request a depth-aware cursor on one lifted rect (spec v3).
+ *
+ * Chain on XrWeaveRectLiftDXR::next. Chaining it IS the request, and it covers
+ * THIS weave submit only: chain it on every submit for as long as you want the
+ * cursor. A rect without it costs the runtime nothing (ADR-046 section 0).
+ *
+ * The runtime reads the OS cursor position itself when it draws, maps it into
+ * the bound window, and draws the cursor only on the rect it is over, with the
+ * same margin, comfort clamp and smoothing as every DisplayXR depth cursor.
+ * It reports what it drew in @ref XrCursorDepthLiftStateDXR; hide the OS
+ * cursor over the rect only for a frame it reports drawn, so the failure mode
+ * is the flat OS cursor, never no cursor.
+ */
+typedef struct XrCursorDepthLiftRectDXR {
+    XrStructureType          type;  //!< Must be XR_TYPE_CURSOR_DEPTH_LIFT_RECT_DXR
+    const void* XR_MAY_ALIAS next;
+    uint32_t                 flags; //!< Reserved, must be 0.
+} XrCursorDepthLiftRectDXR;
+
+/*!
+ * @brief Which lifted rects got the runtime's cursor this submit (spec v3).
+ *
+ * Chain on XrWeaveOutputDXR::next of a submit that requested a cursor on any
+ * rect; filled on every successful submit (0 when it drew none).
+ */
+typedef struct XrCursorDepthLiftStateDXR {
+    XrStructureType    type; //!< Must be XR_TYPE_CURSOR_DEPTH_LIFT_STATE_DXR
+    void* XR_MAY_ALIAS next;
+    /*!
+     * Bit i set = the runtime drew the cursor into lifts[i] of this submit's
+     * XrWeaveSubmitLiftRectsDXR in the output just woven. Clear for every
+     * rect it could not place it on: no depth or display mapping for that
+     * frame, the cursor not over the rect, the views shown flat (2D), or a
+     * workspace cursor already drawn.
+     */
+    uint32_t drawnLiftMask;
+} XrCursorDepthLiftStateDXR;
 
 #ifdef __cplusplus
 }

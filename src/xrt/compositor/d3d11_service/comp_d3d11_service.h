@@ -1366,6 +1366,14 @@ void
 comp_d3d11_service_weave_set_overlay_filter_strength(struct xrt_compositor *xc, float strength);
 
 /*!
+ * XR_DXR_cursor_depth v3 (ADR-046 Amendment 1): which lift rects of the last
+ * @ref comp_d3d11_service_weave_submit got the depth cursor — bit i = the
+ * submit's i-th lift binding (XrWeaveSubmitLiftRectsDXR::lifts[i]).
+ */
+uint32_t
+comp_d3d11_service_weave_lift_cursor_mask(struct xrt_compositor *xc);
+
+/*!
  * Export the persistent server-allocated weaved-output texture handle (+ dims)
  * for the caller to import once and present each frame. Returns false until the
  * first successful @ref comp_d3d11_service_weave_submit has allocated it.

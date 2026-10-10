@@ -280,6 +280,11 @@ struct lift_out_slot
 	uint32_t d_w = 0, d_h = 0, d_format = 0;
 	bool has_depth = false;         //!< this slot's result carries depth
 	xrt_lift_depth_info depth = {}; //!< metadata (valid / realloc set at acquire)
+	//! ADR-046 Amendment 1: the module's relief mapping for this result
+	//! (xrt_dp_lift_depth::relief_*), service-internal — not exported to apps.
+	bool relief_valid = false;
+	float relief_scale = 0.0f;
+	float relief_offset = 0.0f;
 };
 
 //! One letterbox profile readback (service device, producer thread only).
@@ -1184,14 +1189,19 @@ lift_copy_depth(d3d11_lift *l, lift_stream &st, lift_out_slot &o, const viewpoin
 	                         ? 1u
 	                         : 0u;
 	o.has_depth = true;
+	o.relief_valid = dd.relief_valid != 0 && std::isfinite(dd.relief_scale) && std::isfinite(dd.relief_offset) &&
+	                 dd.relief_scale != 0.0f;
+	o.relief_scale = o.relief_valid ? dd.relief_scale : 0.0f;
+	o.relief_offset = o.relief_valid ? dd.relief_offset : 0.0f;
 	if (!st.depth_logged) {
 		st.depth_logged = true;
 		U_LOG_W(
 		    "[lift] stream %llu auxiliary depth: %ux%u fmt=%u units=%s encoding=%s same_inference=%u "
-		    "convergence=%.3f intrinsics=%s transform=%s (ADR-048 Addendum A)",
+		    "convergence=%.3f intrinsics=%s transform=%s relief=%s (ADR-048 Addendum A)",
 		    (unsigned long long)st.id, dd.width, dd.height, dd.format, metric ? "metric" : "relative",
 		    di.encoding == XRT_DP_LIFT_DEPTH_ENCODING_INVERSE ? "inverse" : "linear", di.same_inference,
-		    di.convergence_depth, di.intrinsics_valid ? "yes" : "no", di.transform_valid ? "yes" : "no");
+		    di.convergence_depth, di.intrinsics_valid ? "yes" : "no", di.transform_valid ? "yes" : "no",
+		    o.relief_valid ? "yes" : "no");
 	}
 }
 
@@ -1351,6 +1361,7 @@ lift_convert_one(d3d11_lift *l, lift_stream &st, std::unique_lock<std::mutex> &l
 		// the same ring slot (the DP's texture is valid only until its next
 		// lift_convert on this stream).
 		o.has_depth = false;
+		o.relief_valid = false;
 		if (ok && want_depth) {
 			lift_copy_depth(l, st, o, vr);
 		}
@@ -2396,7 +2407,43 @@ d3d11_lift_pin_latest(struct d3d11_lift *l, uint64_t owner, uint64_t id, struct 
 	out->height = o->h;
 	out->view_count = o->view_count;
 	memcpy(out->active, o->active, sizeof(out->active));
+	out->vp_count = o->vp_count <= XRT_LIFT_MAX_VIEWS ? o->vp_count : XRT_LIFT_MAX_VIEWS;
+	memcpy(out->vps, o->vps, sizeof(float) * 3 * out->vp_count);
+	memcpy(out->rect_center, o->rect_center, sizeof(out->rect_center));
+	memcpy(out->rect_size, o->rect_size, sizeof(out->rect_size));
+	if (o->has_depth && o->d_svc_tex != nullptr && o->d_svc_km != nullptr) {
+		out->depth_tex = o->d_svc_tex;
+		out->depth_km = o->d_svc_km;
+		out->depth_w = o->d_w;
+		out->depth_h = o->d_h;
+		out->depth_format = o->d_format;
+		out->depth_encoding = o->depth.encoding;
+		out->depth_value_scale = o->depth.value_scale;
+		out->depth_value_offset = o->depth.value_offset;
+		out->relief_valid = o->relief_valid;
+		out->relief_scale = o->relief_scale;
+		out->relief_offset = o->relief_offset;
+	}
 	out->valid = true;
+	return true;
+}
+
+bool
+d3d11_lift_pin_depth(struct d3d11_lift_pin *pin)
+{
+	if (pin == nullptr || !pin->valid || pin->depth_km == nullptr) {
+		return false;
+	}
+	if (pin->depth_held) {
+		return true;
+	}
+	// The slot is pinned, so the lift thread will not write it; a busy mutex
+	// means the acquire export is copying it out right now. Skip this frame.
+	HRESULT hr = pin->depth_km->AcquireSync(0, 0);
+	if (FAILED(hr) || hr == (HRESULT)WAIT_TIMEOUT) {
+		return false;
+	}
+	pin->depth_held = true;
 	return true;
 }
 
@@ -2405,6 +2452,9 @@ d3d11_lift_unpin(struct d3d11_lift_pin *pin)
 {
 	if (pin == nullptr || !pin->valid || pin->lift == nullptr) {
 		return;
+	}
+	if (pin->depth_held) {
+		pin->depth_km->ReleaseSync(0);
 	}
 	pin->km->ReleaseSync(0);
 	d3d11_lift *l = pin->lift;

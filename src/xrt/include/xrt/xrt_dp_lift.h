@@ -196,7 +196,34 @@ struct xrt_dp_lift_depth
 	uint32_t same_inference;
 	//! The module's own frame / inference counter, informational (logged).
 	uint64_t vendor_frame_id;
+
+	/*
+	 * ── Relief mapping (ADR-046 Amendment 1, XRT_DP_LIFT_HAS_DEPTH_RELIEF) ──
+	 * Appended; written only when struct_size covers them.
+	 */
+
+	//! Non-zero = @c relief_scale / @c relief_offset are valid for THIS
+	//! conversion. 0 = the module renders without a physical display mapping
+	//! (e.g. dimensionless disparity): the runtime then places nothing on depth.
+	uint32_t relief_valid;
+	//! Where the woven views PRESENT a texel, in metres in front of the screen
+	//! plane (toward the viewer; screen = 0, behind = negative):
+	//!   z = relief_scale * (1 / depth) + relief_offset
+	//! with depth the texel's DECODED depth (see value_scale / encoding). Must
+	//! reflect everything that moved the content this conversion — its
+	//! convergence (including AUTO), relief thickness, strength — so it is
+	//! re-reported on every lift_get_depth. The point lies on the ray from the
+	//! midpoint of the conversion's viewpoints through the texel's position on
+	//! the lifted rect.
+	float relief_scale;
+	float relief_offset; //!< metres; see relief_scale
 };
+
+/*!
+ * xrt_dp_lift_depth carries a relief mapping (ADR-046 Amendment 1: the
+ * depth-aware cursor on lifted content). Append-only, ADR-020: no ABI bump.
+ */
+#define XRT_DP_LIFT_HAS_DEPTH_RELIEF 1
 
 /*!
  * @name Viewpoint policy (ADR-048) — xrt_dp_lift_params appended fields
