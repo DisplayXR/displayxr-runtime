@@ -7935,43 +7935,50 @@ vk_midframe_active(const struct comp_vk_native_compositor *c)
  * GPU work and starved the fills. The switch still requires
  * VK_LAYER_DXR_queue_lock (the #902 marker the mid-frame fill keys on): on
  * Adreno the runtime queue shares the GSL context with the app's, the race
- * #1910 measured. Default OFF until re-measured (dxr_async_handoff_resolve).
+ * #1910 measured. Auto-ON on that layer (dxr_async_handoff_resolve).
  */
 static bool
 dxr_async_handoff_resolve(bool layer_live, bool rt_queue, int single)
 {
 	/*
-	 * Default OFF until a device re-measure shows fills >= ~25/s AND the
-	 * hand-off wait ~0 together (the first A/B had the serve on the app
-	 * queue: +14% app fps, but fills 28/s -> 0 and GetFace 54 -> 32 Hz).
-	 * Exactly "1" asks for ON; exactly "0" or anything else is OFF. The env,
-	 * when set non-empty, wins over the prop.
+	 * AUTO-ON: on when the queue-lock layer is live, single weave ownership
+	 * is on and a runtime-owned queue exists. Measured on the Lume phone
+	 * (earthview, layer live, serve on the runtime queue): GetFace 53.8 ->
+	 * 59.8 Hz (flat 60 Hz presents), fills 28 -> 26/s, hand-off wait 6.0 ->
+	 * 0.54 ms, app +11%. Exactly "1" forces ON (still needs single ownership
+	 * and a runtime queue — without them it is unsafe or a regression), exactly
+	 * "0" disables, anything else is auto. The env, when set non-empty, wins
+	 * over the prop.
 	 */
-	bool want = false;
+	int forced = -1; // -1 = auto
 	const char *e = getenv("DXR_ASYNC_HANDOFF");
 	if (e != NULL && e[0] != '\0') {
-		want = strcmp(e, "1") == 0;
+		forced = strcmp(e, "1") == 0 ? 1 : strcmp(e, "0") == 0 ? 0 : -1;
 	}
 #ifdef XRT_OS_ANDROID
 	else {
 		char sp[PROP_VALUE_MAX] = {0};
 		if (__system_property_get("debug.dxr.async_handoff", sp) > 0) {
-			want = strcmp(sp, "1") == 0;
+			forced = strcmp(sp, "1") == 0 ? 1 : strcmp(sp, "0") == 0 ? 0 : -1;
 		}
 	}
 #endif
-	const bool on = want && single == 1 && layer_live && rt_queue;
+	const bool base = single == 1 && rt_queue;
+	const bool on = forced == 0 ? false : forced == 1 ? base : (base && layer_live);
 	U_LOG_W(
-	    "#1905: non-blocking frame hand-off %s — %s (DXR_ASYNC_HANDOFF / debug.dxr.async_handoff: \"1\" = ON, "
-	    "default OFF)",
+	    "#1905: non-blocking frame hand-off %s — %s (DXR_ASYNC_HANDOFF / debug.dxr.async_handoff: \"1\" forces "
+	    "ON, \"0\" disables, anything else = auto on the queue-lock layer)",
 	    on ? "ON" : "OFF",
-	    !want         ? "default (not requested)"
-	    : single != 1 ? "requested, but needs single weave ownership (#1196), which is off"
-	    : !layer_live ? "requested, but VK_LAYER_DXR_queue_lock is absent: the app's submits would not be "
-	                    "serialised with the weave thread's"
-	    : !rt_queue   ? "requested, but there is no runtime-owned VkQueue: the serve would queue behind the "
-	                    "app's next frame on its queue and starve the fills"
-	                  : "requested; VK_LAYER_DXR_queue_lock is live and the serve runs on the runtime-owned queue");
+	    forced == 0   ? "disabled"
+	    : single != 1 ? "needs single weave ownership (#1196), which is off"
+	    : !rt_queue   ? "no runtime-owned VkQueue: the serve would queue behind the app's next frame on its "
+	                    "queue and starve the fills"
+	    : forced == 1 ? (layer_live ? "forced ON; VK_LAYER_DXR_queue_lock is live"
+	                                : "forced ON WITHOUT VK_LAYER_DXR_queue_lock: app submits are NOT serialised "
+	                                  "with the weave thread's, expect Adreno GSL -3 / lost app submits")
+	    : layer_live  ? "auto: VK_LAYER_DXR_queue_lock is live and the serve runs on the runtime-owned queue"
+	                  : "auto: VK_LAYER_DXR_queue_lock absent on this device — xrEndFrame keeps waiting for the "
+	                    "weave");
 	return on;
 }
 
