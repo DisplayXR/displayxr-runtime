@@ -38,6 +38,9 @@
 #ifdef XRT_OS_MACOS
 #include "main/comp_window_macos.h"
 #endif
+#ifdef XRT_HAVE_COMP_LINUX_WINDOW
+#include "main/comp_window_linux.h"
+#endif
 #include "xrt/xrt_compositor.h"
 #include "xrt/xrt_device.h"
 
@@ -99,12 +102,9 @@ static const char *instance_extensions_common[] = {
     VK_EXT_METAL_SURFACE_EXTENSION_NAME,                    //
 #endif
 #if defined(VK_KHR_xcb_surface) && defined(XRT_OS_LINUX_DESKTOP)
-    // Desktop Linux (#660 Phase 2): null_compositor_init_target_service's
-    // Linux arm wires get_vk only (#1699) — enough for a service-side weave
-    // engine. The out-of-process window-present arm is still not wired (no
-    // comp_window_xcb comp_target, so create_from_window stays NULL).
-    // Advertise VK_KHR_xcb_surface now so the service's VkInstance can build
-    // an XCB surface once that arm lands.
+    // Desktop Linux: the service's per-session target is the runtime-owned
+    // X11 surface (comp_window_linux, #710) — vkCreateXcbSurfaceKHR on an Xorg
+    // or XWayland connection. The weave engine (#1699) needs only get_vk.
     VK_KHR_XCB_SURFACE_EXTENSION_NAME,                      //
 #endif
 };
@@ -1002,11 +1002,8 @@ null_target_service_get_vk_macos(struct comp_target_service *service)
 
 #if defined(XRT_OS_LINUX_DESKTOP)
 /*!
- * Desktop Linux (#1699): a service-side weave engine needs only the service's
- * Vulkan bundle, so this is the sole slot the Linux arm fills. There is no
- * per-session window target — create_from_window / destroy_target stay NULL,
- * and the comp_target_service_* wrappers turn that into
- * XRT_ERROR_DEVICE_CREATION_FAILED / a no-op rather than a NULL call.
+ * Desktop Linux: the service's Vulkan bundle, used by the weave engine (#1699)
+ * and by the comp_multi shared spatial surface (#710, #967).
  */
 static struct vk_bundle *
 null_target_service_get_vk_linux(struct comp_target_service *service)
@@ -1014,6 +1011,96 @@ null_target_service_get_vk_linux(struct comp_target_service *service)
 	struct null_compositor *nc = (struct null_compositor *)service->context;
 	return get_vk(nc);
 }
+
+#if defined(XRT_HAVE_COMP_LINUX_WINDOW)
+/*!
+ * Service callback (desktop Linux, #710): create the service-owned surface
+ * target. The macOS twin (null_target_service_create_from_window_macos): no app
+ * window crosses the process boundary, so the service creates and owns an X11
+ * window (Xorg, or XWayland on a Wayland session) fullscreen on the 3D panel.
+ * @p external_window_handle is a `const struct comp_window_linux_placement *`
+ * (panel origin + size) or NULL for the desktop origin.
+ */
+static xrt_result_t
+null_target_service_create_from_window_linux(struct comp_target_service *service,
+                                             void *external_window_handle,
+                                             struct comp_target **out_target)
+{
+	struct null_compositor *nc = (struct null_compositor *)service->context;
+	const struct comp_window_linux_placement *place =
+	    (const struct comp_window_linux_placement *)external_window_handle;
+
+	// Up-cast: comp_target_swapchain reads ct->c->base.vk, at offset 0 in both
+	// comp_compositor and null_compositor (shared comp_base).
+	struct comp_compositor *c_alias = (struct comp_compositor *)nc;
+
+	struct comp_target *ct = comp_window_linux_create(c_alias, place != NULL ? place->screen_left : 0,
+	                                                  place != NULL ? place->screen_top : 0);
+	if (ct == NULL) {
+		NULL_ERROR(nc, "Linux: failed to allocate the service surface target");
+		return XRT_ERROR_ALLOCATION;
+	}
+
+	// Pre-create fake pacing BEFORE create_images so comp_target_swapchain does
+	// not read ct->c->frame_interval_ns (wrong offset across the cast above).
+	{
+		struct comp_target_swapchain *cts = (struct comp_target_swapchain *)ct;
+		if (cts->upc == NULL) {
+			int64_t now_ns = os_monotonic_get_ns();
+			u_pc_fake_create(nc->settings.frame_interval_ns, now_ns, &cts->upc);
+		}
+	}
+
+	uint32_t w = (place != NULL && place->width > 0) ? place->width : nc->sys_info.display_pixel_width;
+	uint32_t h = (place != NULL && place->height > 0) ? place->height : nc->sys_info.display_pixel_height;
+	if (w == 0 || h == 0) {
+		w = 1920;
+		h = 1080;
+	}
+
+	// Builds the window, waits (bounded) for the WM's fullscreen geometry and
+	// reports the settled size back through ct->width/height.
+	if (!comp_target_init_post_vulkan(ct, w, h)) {
+		NULL_ERROR(nc, "Linux: failed to init the service surface (no X server / XWayland?)");
+		comp_target_destroy(&ct);
+		return XRT_ERROR_VULKAN;
+	}
+
+	struct comp_target_create_images_info info = {
+	    .extent = {.width = ct->width, .height = ct->height},
+	    .image_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+	    .color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+	    .present_mode = VK_PRESENT_MODE_FIFO_KHR,
+	    .format_count = 4,
+	    .formats =
+	        {
+	            VK_FORMAT_B8G8R8A8_UNORM,
+	            VK_FORMAT_R8G8B8A8_UNORM,
+	            VK_FORMAT_B8G8R8A8_SRGB,
+	            VK_FORMAT_R8G8B8A8_SRGB,
+	        },
+	};
+
+	comp_target_create_images(ct, &info);
+
+	if (!comp_target_has_images(ct)) {
+		NULL_ERROR(nc, "Linux: failed to create swapchain images for the service surface");
+		comp_target_destroy(&ct);
+		return XRT_ERROR_VULKAN;
+	}
+
+	NULL_INFO(nc, "Linux: created the service surface target (%ux%u)", ct->width, ct->height);
+	*out_target = ct;
+	return XRT_SUCCESS;
+}
+
+static void
+null_target_service_destroy_target_linux(struct comp_target_service *service, struct comp_target **target)
+{
+	(void)service;
+	comp_target_destroy(target);
+}
+#endif // XRT_HAVE_COMP_LINUX_WINDOW
 #endif // XRT_OS_LINUX_DESKTOP
 
 /*!
@@ -1042,9 +1129,14 @@ null_compositor_init_target_service(struct null_compositor *nc)
 	nc->target_service.get_vk = null_target_service_get_vk_macos;
 	nc->target_service.context = nc;
 #elif defined(XRT_OS_LINUX_DESKTOP)
-	// Desktop Linux (#1699): get_vk only — the service's weave engine runs on
-	// the null compositor's Vulkan device. No window-present arm yet, so
-	// create_from_window / destroy_target are deliberately left NULL.
+	// Desktop Linux: the weave engine (#1699) runs on the null compositor's
+	// Vulkan device; the shared spatial surface (#710, #967) presents to a
+	// service-owned X11 window. Without XCB only get_vk is wired and
+	// comp_target_service_create reports XRT_ERROR_DEVICE_CREATION_FAILED.
+#if defined(XRT_HAVE_COMP_LINUX_WINDOW)
+	nc->target_service.create_from_window = null_target_service_create_from_window_linux;
+	nc->target_service.destroy_target = null_target_service_destroy_target_linux;
+#endif
 	nc->target_service.get_vk = null_target_service_get_vk_linux;
 	nc->target_service.context = nc;
 #endif
