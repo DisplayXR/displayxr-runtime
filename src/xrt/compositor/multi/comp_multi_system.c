@@ -80,6 +80,10 @@
 #include <pthread.h>
 #endif
 
+#ifdef XRT_HAVE_COMP_LINUX_WINDOW
+#include "main/comp_window_linux.h" // shared-surface visibility + cursor (#710)
+#endif
+
 #ifdef XRT_BUILD_DRIVER_QWERTY
 #include "qwerty/qwerty_interface.h"
 #include "xrt/xrt_system.h"
@@ -428,7 +432,7 @@ find_active_blend_mode(struct multi_compositor **overlay_sorted_clients, size_t 
  */
 // Legacy per-session helper (see the #ifndef block below) — guarded out on macOS,
 // which composites every client into the one shared surface instead.
-#ifndef XRT_OS_MACOS
+#ifndef COMP_MULTI_SHARED_SURFACE
 /*!
  * Composite LOCAL_2D layers (XR_DXR_local_3d_zone, e.g. the avatar speech
  * bubble, #568) into the final per-session target, post-weave, by scale-blitting
@@ -549,7 +553,7 @@ composite_local_2d_layers(struct multi_compositor *mc,
 	}
 	return any;
 }
-#endif // !XRT_OS_MACOS
+#endif // !COMP_MULTI_SHARED_SURFACE
 
 static bool
 get_session_layer_view(struct multi_layer_entry *layer,
@@ -604,7 +608,7 @@ get_session_layer_view(struct multi_layer_entry *layer,
 // so this whole path is compiled only for the non-macOS OOP service (Android,
 // and Windows where it is unused in favor of the D3D11 monolith). Guarding it out
 // on macOS keeps the macOS binary free of the dead legacy path.
-#ifndef XRT_OS_MACOS
+#ifndef COMP_MULTI_SHARED_SURFACE
 /*!
  * Initialize intermediate composite resources for pre-display-processing layer compositing.
  * Creates a tiled atlas image, per-eye views, render pass, framebuffers,
@@ -2349,7 +2353,7 @@ workspace_blend_layer(struct multi_compositor *mc,
 	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0,
 	                         NULL, 0, NULL, 1, &to_general);
 }
-#endif // !XRT_OS_MACOS
+#endif // !COMP_MULTI_SHARED_SURFACE
 
 //! Display dims (meters) for this session, DP-first with system-info fallback
 //! (matches the HUD). Returns false if neither yields valid dims.
@@ -2373,7 +2377,7 @@ session_display_dims_m(struct multi_compositor *mc, float *out_w_m, float *out_h
 	return true;
 }
 
-#ifndef XRT_OS_MACOS
+#ifndef COMP_MULTI_SHARED_SURFACE
 /*!
  * Physical size, in meters, of THIS client's window surface (Tier-2, #59). The
  * display's pixel density is uniform, so window_meters = window_px ÷ display
@@ -2404,7 +2408,7 @@ session_window_dims_m(struct multi_compositor *mc, uint32_t fb_w, uint32_t fb_h,
 	*out_h_m = (float)fb_h / px_per_m_y;
 	return true;
 }
-#endif // !XRT_OS_MACOS
+#endif // !COMP_MULTI_SHARED_SURFACE
 
 /*!
  * Public window-dims query for the workspace IPC layer (macOS get_window_pose).
@@ -2451,7 +2455,7 @@ comp_multi_workspace_set_client_window_pose(struct xrt_compositor *xc,
                                             float width_m,
                                             float height_m)
 {
-#ifdef XRT_OS_MACOS
+#ifdef COMP_MULTI_SHARED_SURFACE
 	struct multi_compositor *mc = multi_compositor(xc);
 	if (mc == NULL || pose == NULL) {
 		return false;
@@ -2545,7 +2549,7 @@ comp_multi_workspace_request_client_exit(struct xrt_compositor *target_xc)
 	return r == XRT_SUCCESS;
 }
 
-#ifndef XRT_OS_MACOS
+#ifndef COMP_MULTI_SHARED_SURFACE
 /*!
  * Composite the workspace controller's chrome (e.g. a title pill) over this
  * client's woven content, post-weave, as a flat alpha-blended 2D overlay (#48).
@@ -3730,9 +3734,9 @@ submit_and_present:
 #endif
 
 }
-#endif // !XRT_OS_MACOS
+#endif // !COMP_MULTI_SHARED_SURFACE
 
-#ifdef XRT_OS_MACOS
+#ifdef COMP_MULTI_SHARED_SURFACE
 /*
  * ============================================================================
  * Shared spatial surface (#59) — the macOS analogue of the Windows D3D11
@@ -3761,14 +3765,35 @@ shared_surface_init(struct multi_system_compositor *msc, struct vk_bundle *vk)
 		U_LOG_E("[#59] no target service for shared surface");
 		return false;
 	}
-
-	// macOS: the service creates + owns the full-screen NSWindow; the handle arg
-	// is ignored (null_target_service_create_from_window_macos).
-	xrt_result_t ret = comp_target_service_create(msc->target_service, NULL, &msc->shared_target);
-	if (ret != XRT_SUCCESS || msc->shared_target == NULL) {
-		U_LOG_E("[#59] failed to create shared full-screen target: %d", ret);
+	// A failed window create (no X server / display) is retried with a back-off
+	// instead of every compositor frame, which flooded the log at panel rate.
+	if (msc->shared_init_retry_ns != 0 && os_monotonic_get_ns() < msc->shared_init_retry_ns) {
 		return false;
 	}
+
+	// macOS: the service creates + owns the full-screen NSWindow; the handle arg
+	// is ignored (null_target_service_create_from_window_macos). Desktop Linux
+	// (#710): the service owns an X11 window too, and the handle slot carries
+	// the panel placement (null_target_service_create_from_window_linux) — the
+	// panel origin lives on THIS info, filled from the plug-in after the null
+	// compositor was created.
+	void *window_arg = NULL;
+#if defined(XRT_HAVE_COMP_LINUX_WINDOW)
+	struct comp_window_linux_placement place = {
+	    .screen_left = msc->base.info.display_screen_left,
+	    .screen_top = msc->base.info.display_screen_top,
+	    .width = msc->base.info.display_pixel_width,
+	    .height = msc->base.info.display_pixel_height,
+	};
+	window_arg = &place;
+#endif
+	xrt_result_t ret = comp_target_service_create(msc->target_service, window_arg, &msc->shared_target);
+	if (ret != XRT_SUCCESS || msc->shared_target == NULL) {
+		U_LOG_E("[#59] failed to create shared full-screen target: %d (retrying in 5 s)", ret);
+		msc->shared_init_retry_ns = os_monotonic_get_ns() + (int64_t)5 * U_TIME_1S_IN_NS;
+		return false;
+	}
+	msc->shared_init_retry_ns = 0;
 	struct comp_target *ct = msc->shared_target;
 	U_LOG_W("[#59] created shared full-screen target %ux%u fmt=%d (%u images)", ct->width, ct->height,
 	        ct->format, ct->image_count);
@@ -4985,6 +5010,102 @@ shared_find_client_hud(const struct shared_client_render *e,
  * Composite every active client into the one combined atlas, weave once, present
  * once. The macOS shared-surface analogue of render_per_session_clients_locked.
  */
+//! Show / hide the one service-owned surface window (#61) — the only
+//! platform-specific call the shared surface makes.
+static void
+shared_set_window_visible(struct comp_target *ct, bool visible)
+{
+#if defined(XRT_OS_MACOS)
+	comp_window_macos_set_visible(ct, visible);
+#elif defined(XRT_HAVE_COMP_LINUX_WINDOW)
+	comp_window_linux_set_visible(ct, visible);
+#else
+	(void)ct;
+	(void)visible;
+#endif
+}
+
+/*!
+ * Desktop Linux: hide the X pointer while the controller's cursor sprite is
+ * composited (it would double up), restore it otherwise — a bare IPC client with
+ * no controller keeps the OS pointer. macOS hides its pointer for the whole
+ * lifetime of the shown surface instead (comp_window_macos).
+ */
+static void
+shared_sync_os_cursor(struct multi_system_compositor *msc)
+{
+#if defined(XRT_HAVE_COMP_LINUX_WINDOW)
+	struct xrt_swapchain *cursor_xsc = NULL;
+	struct comp_multi_cursor_state cursor = {0};
+	bool sprite = comp_multi_workspace_get_cursor(&cursor_xsc, &cursor) && cursor.visible && cursor_xsc != NULL;
+	comp_window_linux_set_cursor_hidden(msc->shared_target, sprite);
+#else
+	(void)msc;
+#endif
+}
+
+/*!
+ * D-5 (#967): the shared-DP hardware 2D/3D channel. The ONE display processor
+ * owns the panel's lens, so it follows ONE client's wish: the focused workspace
+ * client when it is on the surface, else a lone client; with several unfocused
+ * clients the lens keeps its state. The wish is mc->hardware_display_3d, set
+ * by multi_compositor_request_display_mode from the IPC thread; applying it
+ * here, on the render thread under list_and_timing_lock, keeps every DP call on
+ * the thread that weaves. Once the DP accepts a change the owner is told
+ * (XRT_SESSION_EVENT_HARDWARE_DISPLAY_STATE_CHANGE carries the REQUESTED state,
+ * #961). A DP without the slot is mode-neutral and counts as accepted.
+ */
+static void
+shared_converge_display_mode_locked(struct multi_system_compositor *msc,
+                                    const struct shared_client_render *order,
+                                    uint32_t order_count)
+{
+	if (msc->shared_dp == NULL || order_count == 0) {
+		return;
+	}
+	struct multi_compositor *owner = NULL;
+	struct xrt_compositor *focused = comp_multi_workspace_get_focused_client();
+	for (uint32_t i = 0; i < order_count; i++) {
+		if (&order[i].mc->base.base == focused) {
+			owner = order[i].mc;
+			break;
+		}
+	}
+	if (owner == NULL && order_count == 1) {
+		owner = order[0].mc;
+	}
+	if (owner == NULL) {
+		return;
+	}
+	const bool want_3d = owner->hardware_display_3d;
+	if (msc->shared_hw_3d_applied == (want_3d ? 1 : 0)) {
+		return;
+	}
+	struct xrt_display_processor *dp = msc->shared_dp;
+	const bool has_slot = XRT_DP_HAS_SLOT(dp, request_display_mode) && dp->request_display_mode != NULL;
+	const bool accepted = has_slot ? xrt_display_processor_request_display_mode(dp, want_3d) : true;
+	if (!accepted) {
+		// Retried next frame only if the wish changes again (no per-frame spam).
+		U_LOG_W("[#967 D-5] shared display processor REJECTED hardware %s — panel state unchanged",
+		        want_3d ? "3D" : "2D");
+		msc->shared_hw_3d_applied = want_3d ? 1 : 0;
+		return;
+	}
+	const bool first = msc->shared_hw_3d_applied < 0;
+	msc->shared_hw_3d_applied = want_3d ? 1 : 0;
+	U_LOG_W("[#967 D-5] shared surface hardware -> %s (%s)", want_3d ? "3D" : "2D",
+	        has_slot ? "request_display_mode accepted" : "mode-neutral DP");
+	if (first && want_3d) {
+		return; // the DP's own default; nothing changed for the session to hear
+	}
+	union xrt_session_event xse = {0};
+	xse.hardware_display_state_change.type = XRT_SESSION_EVENT_HARDWARE_DISPLAY_STATE_CHANGE;
+	xse.hardware_display_state_change.hardware_display_3d = want_3d;
+	if (multi_compositor_push_event(owner, &xse) != XRT_SUCCESS) {
+		U_LOG_W("[#967 D-5] could not push the hardware-state event to the lens owner");
+	}
+}
+
 static void
 render_shared_surface_locked(struct multi_system_compositor *msc, int64_t display_time_ns)
 {
@@ -5088,7 +5209,7 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 		return;
 	}
 	if (should_show != msc->shared_window_visible) {
-		comp_window_macos_set_visible(msc->shared_target, should_show);
+		shared_set_window_visible(msc->shared_target, should_show);
 		msc->shared_window_visible = should_show;
 		U_LOG_W("[#61] shared surface window %s (controller %s, %u client(s))",
 		        should_show ? "shown" : "hidden", msc->workspace_active ? "active" : "gone", order_count);
@@ -5096,6 +5217,9 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 	if (!should_show) {
 		return; // idle: window hidden, desktop visible — don't render the backdrop
 	}
+	shared_sync_os_cursor(msc);
+
+	shared_converge_display_mode_locked(msc, order, order_count);
 
 	// Painter's sort (far first).
 	if (order_count > 1) {
@@ -5677,9 +5801,9 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 	// frozen/slow client simply re-shows its last frame, exactly like a real
 	// desktop window.
 }
-#endif // XRT_OS_MACOS
+#endif // COMP_MULTI_SHARED_SURFACE
 
-#ifndef XRT_OS_MACOS
+#ifndef COMP_MULTI_SHARED_SURFACE
 /*!
  * Render all per-session clients to their own targets.
  * Called after xrt_comp_layer_commit() for sessions with external window handles.
@@ -5772,7 +5896,7 @@ render_per_session_clients_locked(struct multi_system_compositor *msc, int64_t d
 		multi_compositor_retire_delivered_locked(mc, now_ns);
 	}
 }
-#endif // !XRT_OS_MACOS
+#endif // !COMP_MULTI_SHARED_SURFACE
 
 
 
@@ -5807,7 +5931,7 @@ transfer_layers_locked(struct multi_system_compositor *msc, int64_t display_time
 		// and pointlessly rebuilds a target no layers will reach. begin_session flips
 		// session_active back on and the next pass re-inits from the then-current surface.
 		bool skip_session_render_init = false;
-#ifdef XRT_OS_MACOS
+#ifdef COMP_MULTI_SHARED_SURFACE
 		// Shared spatial surface (#59): every client composites into ONE
 		// service-owned full-screen window, so the per-client NSWindow/target/DP
 		// is never created. The shared surface reads each client's delivered
@@ -5987,7 +6111,7 @@ transfer_layers_locked(struct multi_system_compositor *msc, int64_t display_time
 				// (blit into the target's 2D region, #568); the shared/
 				// downstream path has no consumer — drop quietly.
 				break;
-#ifdef XRT_OS_MACOS
+#ifdef COMP_MULTI_SHARED_SURFACE
 			case XRT_LAYER_WINDOW_SPACE:
 				// Window-space HUD: composited INTO the macOS shared-surface
 				// content draw (binding 1 of comp_multi_content_blend, in
@@ -6099,7 +6223,7 @@ update_session_state_locked(struct multi_system_compositor *msc)
 	// (and wakes this thread). macOS-only: elsewhere effective_active ==
 	// active_count, so the state machine is unchanged.
 	uint64_t effective_active = msc->sessions.active_count;
-#ifdef XRT_OS_MACOS
+#ifdef COMP_MULTI_SHARED_SURFACE
 	if (msc->workspace_active) {
 		effective_active = 1;
 	}
@@ -6452,7 +6576,7 @@ multi_main_loop(struct multi_system_compositor *msc)
 		// Render per-session clients to their own targets (Phase 4)
 		// These sessions were skipped in transfer_layers_locked and render separately
 		os_mutex_lock(&msc->list_and_timing_lock);
-#ifdef XRT_OS_MACOS
+#ifdef COMP_MULTI_SHARED_SURFACE
 		// Shared spatial surface (#59): composite every client into ONE
 		// full-screen window + combined atlas → one weave → one present. This is
 		// the only macOS service render path (the legacy per-NSWindow path is gone).
@@ -6662,7 +6786,7 @@ system_compositor_destroy(struct xrt_system_compositor *xsc)
 	// Destroy the render thread first, destroy also stops the thread.
 	os_thread_helper_destroy(&msc->oth);
 
-#ifdef XRT_OS_MACOS
+#ifdef COMP_MULTI_SHARED_SURFACE
 	// Free the shared spatial surface resources (#59) now that the render thread
 	// is stopped but BEFORE the native compositor (which owns the Vulkan device)
 	// and the target service go away.
@@ -6704,7 +6828,7 @@ multi_system_compositor_update_session_status(struct multi_system_compositor *ms
 	os_thread_helper_unlock(&msc->oth);
 }
 
-#ifdef XRT_OS_MACOS
+#ifdef COMP_MULTI_SHARED_SURFACE
 void
 comp_multi_system_set_workspace_active(struct xrt_system_compositor *xsc, bool active)
 {
@@ -6749,12 +6873,13 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
 	// Store the target service for per-session rendering (Phase 3)
 	msc->target_service = target_service;
 
-#ifdef XRT_OS_MACOS
+#ifdef COMP_MULTI_SHARED_SURFACE
 	// Shared spatial surface (#59) is the only macOS service render path: every
 	// client app composites into ONE full-screen window as a 3D spatial window
 	// (the macOS analogue of the Windows D3D11 monolith), instead of one NSWindow
 	// per app. The legacy per-NSWindow path has been removed.
 	msc->shared_fenced_buffer = -1;
+	msc->shared_hw_3d_applied = -1;
 	U_LOG_W("[#59] shared spatial surface (single full-screen window)");
 #endif
 

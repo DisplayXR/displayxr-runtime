@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Rounded-corner + edge-feather content composite pipeline (macOS).
+ * @brief  Rounded-corner + edge-feather content composite pipeline (shared surface).
  * @author David Fattal
  * @ingroup comp_multi
  *
- * macOS-only dedicated Vulkan pipeline that composites each spatial window's
+ * Dedicated Vulkan pipeline that composites each spatial window's
  * client content into the shared-surface atlas with rounded corners and
  * feathered edges — the faithful analogue of the Windows D3D11 content-blit
  * pixel shader (d3d11_service_shaders.h, rounded-rect SDF coverage). It
@@ -21,15 +21,17 @@
  * textures). It does NOT extend vk_hud_blend, which is shared by the
  * chrome/cursor/HUD decorations and uses hand-embedded SPIR-V.
  *
- * The whole module is compiled only on macOS (XRT_OS_MACOS); elsewhere it is an
- * empty translation unit so Windows/Android binaries stay byte-identical.
+ * The whole module is compiled only where the shared spatial surface exists
+ * (COMP_MULTI_SHARED_SURFACE: macOS, desktop Linux); elsewhere it is an empty
+ * translation unit so Windows/Android binaries stay byte-identical.
  */
 
 #pragma once
 
 #include "xrt/xrt_config_os.h"
+#include "multi/comp_multi_interface.h" // COMP_MULTI_SHARED_SURFACE
 
-#ifdef XRT_OS_MACOS
+#ifdef COMP_MULTI_SHARED_SURFACE
 
 #include "vk/vk_helpers.h"
 
@@ -226,4 +228,4 @@ comp_multi_content_blend_fini(struct comp_multi_content_blend *blend, struct vk_
 }
 #endif
 
-#endif // XRT_OS_MACOS
+#endif // COMP_MULTI_SHARED_SURFACE

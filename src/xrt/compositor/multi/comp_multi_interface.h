@@ -44,6 +44,24 @@
 #define COMP_MULTI_HAVE_WEAVE
 #endif
 
+/*!
+ * @def COMP_MULTI_SHARED_SURFACE
+ * Defined when the service renders through the comp_multi SHARED SPATIAL
+ * SURFACE (#59): one service-owned full-screen window, every client app
+ * composited into one combined stereo atlas at its workspace pose, one
+ * display-processor weave, one present (the analogue of the Windows D3D11
+ * monolith). It is the only service render path where defined — the
+ * per-session target path (render_session_to_own_target, Android's default)
+ * is compiled out.
+ *
+ * - macOS: service-owned NSWindow (comp_window_macos).
+ * - Desktop Linux (#710, #967): service-owned X11 window, Xorg or XWayland
+ *   (comp_window_linux).
+ */
+#if defined(XRT_OS_MACOS) || defined(XRT_OS_LINUX_DESKTOP)
+#define COMP_MULTI_SHARED_SURFACE
+#endif
+
 
 #ifdef __cplusplus
 extern "C" {
