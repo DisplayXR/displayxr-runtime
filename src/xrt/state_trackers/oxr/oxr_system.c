@@ -196,11 +196,12 @@ oxr_system_fill_in(
 		}
 #elif defined(XRT_OS_WINDOWS) &&                                                                                       \
     (defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR) || defined(XRT_HAVE_D3D12_NATIVE_COMPOSITOR))
-		// Multi-screen M3 on Windows: the in-process D3D11 and D3D12
-		// compositors segment a window the same way (comp_d3d11_segments,
-		// comp_d3d12_segments); a registry D3D11 or D3D12 factory is what
-		// says a screen has a DP. The capacity is per system, so a GL /
-		// Vulkan session on the same box advertises the doubled count too
+		// Multi-screen M3 on Windows: the in-process D3D11, D3D12 and
+		// OpenGL compositors segment a window the same way
+		// (comp_d3d11_segments, comp_d3d12_segments, comp_gl_segments); a
+		// registry D3D11, D3D12 or GL factory is what says a screen has a
+		// DP. The capacity is per system, so a session whose compositor
+		// does not segment on the same box advertises the doubled count too
 		// and never splits — the tail views then repeat view 0, which the
 		// contract allows.
 		//
@@ -217,8 +218,15 @@ oxr_system_fill_in(
 			can_segment = true;
 			const struct xrt_dp_factory_registry *reg = &sys->xsysc->info.dp_registry;
 			for (uint32_t e = 0; e < reg->entry_count && e < XRT_DP_REGISTRY_MAX_ENTRIES; e++) {
-				if (oxr_segment_views_win_entry_has_dp(reg->entries[e].dp_factory_d3d11,
-				                                       reg->entries[e].dp_factory_d3d12)) {
+				bool has_dp = oxr_segment_views_win_entry_has_dp(reg->entries[e].dp_factory_d3d11,
+				                                                 reg->entries[e].dp_factory_d3d12);
+#ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
+				// Multi-screen M6 (OpenGL): the in-process GL compositor
+				// segments a window too (comp_gl_segments), so a GL factory
+				// makes the screen DP-backed as well.
+				has_dp = has_dp || oxr_segment_views_win_entry_has_gl_dp(reg->entries[e].dp_factory_gl);
+#endif
+				if (has_dp) {
 					with_factory++;
 				}
 			}
