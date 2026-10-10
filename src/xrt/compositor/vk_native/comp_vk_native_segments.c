@@ -1066,8 +1066,17 @@ comp_vk_native_segments_record(struct comp_vk_native_segments *segs,
 
 	for (uint32_t k = 0; k < t->count; k++) {
 		const struct comp_segment *g = &t->seg[k];
-		have_tile[k] =
-		    segment_tile_rect(&g->window_rect, &f->canvas, f->view_width, f->view_height, &tx[k], &ty[k], &tw[k], &th[k]);
+		// #1883: where THIS segment's views were painted — for a routed frame
+		// the partition it was located for, not the live seam.
+		{
+			struct comp_seg_rect r;
+			have_tile[k] =
+			    comp_segments_source_rect(g, &f->canvas, f->view_width, f->view_height, f->content, &r);
+			tx[k] = r.x;
+			ty[k] = r.y;
+			tw[k] = r.w;
+			th[k] = r.h;
+		}
 		const int i = (int)g->screen_index;
 		st_of[k] = (i >= 0 && (uint32_t)i < segs->screen_count) ? &segs->st[i] : NULL;
 		if (g->is_primary) {
@@ -1235,12 +1244,16 @@ comp_vk_native_segments_record(struct comp_vk_native_segments *segs,
 	 * seam registration as the shipped off-panel band (#1654).
 	 */
 	struct comp_seg_rect flat_dst[COMP_SEGMENTS_MAX + COMP_SEGMENTS_MAX_UNCOVERED];
+	struct comp_seg_rect flat_src[COMP_SEGMENTS_MAX] = {0};
 	uint32_t flat_n = 0;
 	for (uint32_t k = 0; k < t->count; k++) {
 		if (!weave[k] && have_tile[k]) {
+			// The segment's own views (#1883), like the crop.
+			flat_src[flat_n] = (struct comp_seg_rect){tx[k], ty[k], tw[k], th[k]};
 			flat_dst[flat_n++] = t->seg[k].window_rect;
 		}
 	}
+	const uint32_t flat_seg_n = flat_n;
 	flat_n += comp_segments_uncovered(t, &f->canvas, &flat_dst[flat_n], COMP_SEGMENTS_MAX_UNCOVERED);
 	if (flat_n > 0) {
 		const uint32_t views = f->tile_columns * f->tile_rows;
@@ -1259,7 +1272,13 @@ comp_vk_native_segments_record(struct comp_vk_native_segments *segs,
 			const struct comp_seg_rect *d = &flat_dst[k];
 			int32_t sx = 0, sy = 0;
 			uint32_t sw = 0, sh = 0;
-			if (!segment_tile_rect(d, &f->canvas, f->view_width, f->view_height, &sx, &sy, &sw, &sh)) {
+			if (k < flat_seg_n) {
+				sx = flat_src[k].x;
+				sy = flat_src[k].y;
+				sw = flat_src[k].w;
+				sh = flat_src[k].h;
+			} else if (!segment_tile_rect(d, &f->canvas, f->view_width, f->view_height, &sx, &sy, &sw,
+			                              &sh)) {
 				continue; // thinner than one source pixel
 			}
 			VkImageBlit blit = {

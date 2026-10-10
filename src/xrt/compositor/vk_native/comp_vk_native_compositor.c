@@ -29,6 +29,7 @@
 #include "util/comp_rear_budget.h"
 #include "util/comp_lazy_transparency.h"
 #include "util/comp_segments.h"
+#include "util/comp_segments_route.h"
 #ifdef XRT_OS_WINDOWS
 #include "util/comp_display_refresh_win.h"
 #endif
@@ -751,6 +752,14 @@ struct comp_vk_native_compositor
 	struct xrt_segment_metrics seg_pub;
 	struct xrt_segment_view_routing seg_route;
 	struct comp_vk_native_eff_layout seg_route_logged;
+	/*!
+	 * #1883: the per-segment partition the renderer atlas is painted with
+	 * (eff_layout's routing; count 0 = unrouted), set with eff_layout so a
+	 * repaint replays it with the atlas it describes. Under the #918 split the
+	 * woven egress slot can be a frame or two older, so the split records
+	 * each submitted frame's partition by its own sequence.
+	 */
+	struct comp_segments_content seg_content;
 #endif // VK_NATIVE_HAVE_SEGMENTS
 
 #ifdef XRT_OS_WINDOWS
@@ -5528,6 +5537,7 @@ vk_route_effective_layout(struct comp_vk_native_compositor *c, uint32_t layer_vi
 
 	struct comp_vk_native_eff_layout *L = &c->eff_layout;
 	L->route_count = 0;
+	memset(&c->seg_content, 0, sizeof(c->seg_content));
 	if (r.count == 0 || r.count > XRT_MAX_SEGMENTS || L->views == 0 || L->tile_w == 0 || L->tile_h == 0) {
 		return;
 	}
@@ -5565,6 +5575,8 @@ vk_route_effective_layout(struct comp_vk_native_compositor *c, uint32_t layer_vi
 		L->route[k].h = tr.h;
 	}
 	L->route_count = r.count;
+	// #1883: the partition these pixels are painted with, for the segment crop.
+	comp_segments_content_from_routing(&r, &c->seg_content);
 
 	// One INFO line per routing change (a move, a resize, a mode switch).
 	if (memcmp(L->route, c->seg_route_logged.route, sizeof(L->route)) != 0 ||
@@ -6831,6 +6843,7 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 				    .canvas = {dp_canvas.offset.w, dp_canvas.offset.h,
 				               (uint32_t)(dp_canvas.extent.w > 0 ? dp_canvas.extent.w : (int)tgt_width),
 				               (uint32_t)(dp_canvas.extent.h > 0 ? dp_canvas.extent.h : (int)tgt_height)},
+				    .content = &c->seg_content, // #1883: crop where the views were painted
 				    .transparent_background = c->transparent_background,
 				    .atlas_encoding = vk_segments_atlas_encoding(c),
 				    .primary_dp = c->display_processor,
@@ -8947,6 +8960,8 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 		struct comp_vk_deposit_handoff handoff = {0};
 		struct comp_vk_deposit *dep = comp_vk_native_renderer_get_deposit(c->renderer);
 		if (comp_vk_deposit_get_handoff(dep, &handoff)) {
+			// #1883: the slot carries this frame's segment partition (by its seq).
+			comp_vk_split_stage_segment_content(c->split, &c->seg_content);
 			comp_vk_split_submit_atlas(c->split, &handoff, c->eff_layout.cols, c->eff_layout.rows,
 			                           c->eff_layout.tile_w, c->eff_layout.tile_h);
 			/*
