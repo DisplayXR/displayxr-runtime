@@ -113,6 +113,8 @@ add_library(
 	u_metrics.h
 	u_misc.c
 	u_misc.h
+	u_mcp_capability.c
+	u_mcp_capability.h
 	u_app_partition.c
 	u_app_partition.h
 	u_native_images_debug.h
