@@ -13,15 +13,18 @@ target_link_libraries(
 		ipc_server
 		target_lists
 		target_instance
+		target_workspace_config
 	)
 
 # Workspace-controller discovery is cross-platform: registry-backed on Windows,
 # JSON-manifest-backed on POSIX (mirrors the plug-in loader). The minimal macOS
 # service orchestration in main.c uses the POSIX path to find + spawn a
 # registered controller (e.g. the macOS shell).
+#
+# service_config.c (service.json, cross-platform), service_hotkey.c (the launch
+# hotkey grammar) and service_workspace_registry.c come from the
+# target_workspace_config library (targets/common), which displayxr-cli links too.
 target_sources(displayxr-service PRIVATE
-	service_workspace_registry.c
-	service_workspace_registry.h
 	service_client_class.c
 	service_client_class.h
 )
@@ -40,8 +43,6 @@ if(WIN32)
 	# Run as GUI app (no console window) with system tray icon and orchestrator
 	set_target_properties(displayxr-service PROPERTIES WIN32_EXECUTABLE TRUE)
 	target_sources(displayxr-service PRIVATE
-		service_config.c
-		service_config.h
 		service_orchestrator.c
 		service_orchestrator.h
 		service_tray_win.c
@@ -72,8 +73,6 @@ endif()
 # unconditionally near the top of this file.
 if(APPLE)
 	target_sources(displayxr-service PRIVATE
-		service_config.c
-		service_config.h
 		service_orchestrator.c
 		service_orchestrator.h
 	)

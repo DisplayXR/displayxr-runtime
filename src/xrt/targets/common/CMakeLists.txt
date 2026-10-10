@@ -165,3 +165,33 @@ if(ANDROID)
 		target_link_libraries(target_instance_hybrid PRIVATE aux_android)
 	endif()
 endif()
+
+####
+# Workspace-controller launch settings (display dashboard phase 8): service.json,
+# the launch-hotkey grammar and the controller registry enumerator. Shared by
+# displayxr-service (which applies them) and displayxr-cli (`workspace list|set|
+# launch`, `info --json`), and unit-tested on their own. The sources stay in
+# targets/service; only the library lives here, because targets/cli is
+# configured whether or not the service is.
+if(NOT ANDROID)
+	set(_dxr_svc_dir ${CMAKE_CURRENT_SOURCE_DIR}/../service)
+	add_library(
+		target_workspace_config STATIC
+		${_dxr_svc_dir}/service_config.c
+		${_dxr_svc_dir}/service_config.h
+		${_dxr_svc_dir}/service_hotkey.c
+		${_dxr_svc_dir}/service_hotkey.h
+		${_dxr_svc_dir}/service_workspace_registry.c
+		${_dxr_svc_dir}/service_workspace_registry.h
+		)
+	target_link_libraries(
+		target_workspace_config
+		PUBLIC xrt-interfaces
+		PRIVATE aux_util xrt-external-cjson
+		)
+	target_include_directories(target_workspace_config PUBLIC ${_dxr_svc_dir})
+	if(WIN32)
+		# SHGetFolderPathA (service.json path); Reg* (the registry enumerator).
+		target_link_libraries(target_workspace_config PRIVATE shell32 advapi32)
+	endif()
+endif()
