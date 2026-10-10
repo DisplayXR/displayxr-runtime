@@ -43,10 +43,18 @@ clear value is taken in the attachment's own space.
 | `cube_handle_vk_linux`, `cube_zones_vk_linux`, `cube_hosted_legacy_vk_linux`, `cube_handle_vk_macos`, `cube_zones_vk_macos`, `cube_hosted_legacy_vk_macos` | same `uLinearize` specialization constant. These apps enumerate formats themselves, so they call `dxr::ChooseColorSwapchainFormat()` + `dxr::NoteColorSwapchainFormat()` directly (the `_SRGB` sibling of `formats[0]`, i.e. `B8G8R8A8_SRGB` on vk_native) before the renderer latches `dxr::RenderSceneLinear()` | as above, including the per-zone premultiplied clears; the zones apps' Local2D strip (`vkCmdClearColorImage`, nothing drawn into it) goes through `dxr::VkDisplayReferredClearColor()` keyed on the strip's own format |
 | `cube_handle_vk_android`, `cube_zones_vk_android` | no displayxr-common on Android: the app prefers `B8G8R8A8_SRGB` / `R8G8B8A8_SRGB` itself and latches `g_scene_linear` from the chosen format; every FS (`shaders/cube.frag`, the crate cube + grid, the HUD text + panel) takes the same `uLinearize` constant | background RGB decoded with the app's own sRGB EOTF off `g_scene_linear` |
 
+| `cube_handle_metal_macos`, `cube_zones_metal_macos`, `cube_hosted_metal_macos`, `cube_hosted_legacy_metal_macos`, `cube_zones_texture_metal_macos` | **no shader change**: the app requests `BGRA8Unorm_sRGB` (`ChooseAppColorFormat`, honours `DXR_SWAPCHAIN_ENCODING=unorm`) and renders through a `BGRA8Unorm` **view** of each swapchain image (`AppRenderTarget`), so its display-referred output lands as raw bytes in an `_SRGB` swapchain (ADR-044 §2, "moved without conversion"). The quad probe textures (CPU bytes) and the quad-array slices (cleared through the UNORM view) are `_SRGB` too; the HUD is `_SRGB` via displayxr-common v2.27.0 | unchanged — a clear through the UNORM view is a raw byte |
+
 The VK apps log the latched decision once at init:
 `WARN [color] colorFormat=<n> sceneLinear=yes|no (...)`. That line is the
 discriminator when a capture looks washed out — it separates "the shader did not
 decode" from "the swapchain is not the format you think it is", with no rebuild.
+
+The Metal cube apps took `BGRA8Unorm` and wrote display-referred bytes. Once the
+Metal compositor became format-honest (ADR-044) that is the washout case:
+`cube_handle_metal_macos`'s atlas background measured `13,13,20` before, `64,64,79`
+with the old binary on the new runtime, `13,13,20` again with the `_SRGB` app, and
+`64,64,79` with `DXR_SWAPCHAIN_ENCODING=unorm` (the A/B).
 
 The Linux, macOS and Android Vulkan cube apps used to take `formats[0]` (or
 prefer UNORM) and write display-referred bytes into a UNORM swapchain. Since
@@ -77,6 +85,27 @@ it now reproduces the washout too (the runtime encodes a UNORM swapchain; add
 - **Transport** → in-process (default), IPC (`set XRT_FORCE_MODE=ipc` + running `displayxr-service.exe`), workspace (launch under `displayxr-shell.exe`).
 
 Model B engages **only** in the workspace/service multi-layer column with honest-`srgb` clients against a `LINEAR`/`EITHER` DP; every other cell is Model A passthrough (B == A when nothing blends), so the in-process fast path is identical across encodings.
+
+### The Metal oracle (`probes/colour_probe_metal_macos`)
+
+Solid layers uploaded with `-replaceRegion:` (no conversion), read back from the
+compositor's per-exe atlas capture (`$TMPDIR/displayxr_atlas_trigger.colour_probe_metal_macos`
+— not the global `/tmp/dxr_atlas_trigger`, which every other Metal/GL app on the
+box races for) by `read_atlas.py`. sim_display, Apple M1 Pro:
+
+| region | before (passthrough) | after (format-honest) |
+|---|---|---|
+| projection `_SRGB` 38 / 200 | 38 / 200 | **38 / 200** (fast path, byte-identical) |
+| projection UNORM 38 / 200 | 38 / 200 | **108 / 229** |
+| window-space `_SRGB` opaque 38 | 38 | **38** |
+| window-space UNORM opaque 38 | 38 | **108** |
+| `_SRGB` black, straight a=128, over 200 | 100 | **146** (over UNORM 200: 168) |
+| `_SRGB` white, straight a=128, over 38 | 147 | **189** (over UNORM 38: 200) |
+| transparent background: alpha under a REPLACE base | 0 | **0** |
+
+`DXR_COLOR_LEGACY_UNORM_ENCODED=1` reproduces every "before" byte. Run with
+`DXR_PROBE_PROJ=srgb|unorm`, `DXR_PROBE_WS=0|1`, `DXR_PROBE_TRANSPARENT=1`,
+`DXR_PROBE_TEXTURE=1` (shared-IOSurface session) and `DXR_ATLAS_CAPTURE_RAW_ALPHA=1`.
 
 ## In-repo DP test double
 

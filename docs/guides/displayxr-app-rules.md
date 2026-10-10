@@ -516,7 +516,8 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
     **second** time → **washed out**: lifted blacks, desaturated colour (a splat demo's authored
     `(229,182,127)` reaches the atlas as `(243,220,187)`). This is the #1589/#1610 format-honest
     colour model, shipped per backend — D3D11 in v2.21.0, D3D12 v2.21.1, GL v2.21.2, **Vulkan
-    (`vk_native`, incl. Android) v2.21.7**; Metal still passes UNORM bytes through. Before those
+    (`vk_native`, incl. Android) v2.21.7**, and **Metal** in the first release after v2.32.0
+    (ADR-044 §1 — the last backend that still passed UNORM bytes through). Before those
     releases a UNORM swapchain *was* a byte passthrough, which is why an app that picked UNORM and
     wrote display-referred bytes looked right until it met a newer runtime — including a leg that
     lagged its siblings (an Android leg that still preferred `{R8G8B8A8_UNORM, B8G8R8A8_UNORM}`
