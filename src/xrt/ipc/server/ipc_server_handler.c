@@ -6286,6 +6286,25 @@ ipc_handle_workspace_acquire_wakeup_event(volatile struct ipc_client_state *_ics
 	out_handles[0] = src;
 	*out_handle_count = 1;
 	return XRT_SUCCESS;
+#elif defined(XRT_OS_LINUX_DESKTOP) && defined(COMP_MULTI_SHARED_SURFACE)
+	// POSIX form (#710): an eventfd made readable by every push onto the
+	// controller's input queue. The generated dispatch sends it without
+	// closing, so the server keeps its copy; the controller receives its own
+	// duplicate (SCM_RIGHTS), polls it for POLLIN and read()s to reset.
+	if (max_handle_count == 0 || out_handles == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	if (_ics->client_state.client_class != XRT_CLIENT_CLASS_CONTROLLER) {
+		return XRT_ERROR_NOT_AUTHORIZED;
+	}
+	int fd = ipc_server_input_queue_get_wakeup_fd();
+	if (fd < 0) {
+		IPC_WARN(s, "Workspace: wakeup eventfd creation failed");
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	out_handles[0] = fd;
+	*out_handle_count = 1;
+	return XRT_SUCCESS;
 #else
 	(void)s;
 	(void)max_handle_count;

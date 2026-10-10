@@ -28,6 +28,7 @@
 #pragma once
 
 #include "shared/ipc_protocol.h"
+#include "xrt/xrt_config_os.h"
 
 #include <stdbool.h>
 
@@ -119,6 +120,19 @@ ipc_server_input_route(const struct ipc_workspace_input_event *event);
  */
 void
 ipc_server_input_queue_push_controller_key(uint32_t vk_code, uint32_t modifiers);
+
+#ifdef XRT_OS_LINUX_DESKTOP
+/*!
+ * The controller wakeup eventfd (POSIX form of xrAcquireWorkspaceWakeupEventDXR):
+ * created on first call, kept for the server's lifetime (never close it), and
+ * made readable by every push onto the controller queue. The IPC reply sends a
+ * duplicate over SCM_RIGHTS; the controller polls its copy for POLLIN and
+ * read()s 8 bytes to reset it (auto-reset semantics; bursts collapse into one
+ * wake, so it drains everything on each wake). -1 if eventfd() failed.
+ */
+int
+ipc_server_input_queue_get_wakeup_fd(void);
+#endif
 
 #ifdef __cplusplus
 }
