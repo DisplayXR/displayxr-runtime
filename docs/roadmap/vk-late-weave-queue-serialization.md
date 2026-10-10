@@ -229,3 +229,77 @@ regression is observable rather than felt.
    `DXR_VK_QUEUE_MODE=layer` on NVIDIA).
 6. Flip default: tier auto-selection ON — VK repaint default-on everywhere,
    matching D3D11/D3D12.
+
+## 7. Android: per-device scope and delivery (#1905)
+
+**Status: PROTOTYPE** (branch `feat/android-queue-lock-layer`; not yet run on a
+device). Companion: PR #1910.
+
+**Why per-device.** On Adreno 740 the app's queue (family 0 idx 0) and the
+runtime's repaint queue (idx 1) are distinct `VkQueue`s, so §2's per-queue
+contract is met. They still share one kernel GSL context, and an app
+`vkQueueSubmit` overlapping a runtime submit on the other queue corrupts its
+timestamp (`Adreno-GSL ctx N: next client ts … must be greater`). The next
+idx-0 submit then fails with -3. The Android build of the layer therefore takes
+**one mutex per `VkDevice`** across the whole §3.1 surface
+(`QL_DEFAULT_PER_DEVICE=1` on `__ANDROID__`; desktop stays per-queue). For an
+A/B run, `setprop debug.dxr.ql_scope queue|device` overrides the scope at
+`vkCreateDevice`. Tier selection (§3.5) is unchanged. Adreno gives the runtime
+idx 1, so the repaint stays on tier 1 with its own queue, and the layer only
+serializes it.
+
+**Android loader contract** (checked against AOSP `frameworks/native`
+`vulkan/libvulkan/layers_extensions.cpp` + `api.cpp`, main branch):
+- There is no JSON manifest and no `vkNegotiateLoaderLayerInterfaceVersion`.
+  The loader scans each directory, or `apk!/lib/<abi>` zip path, on its layer
+  search path for `libVkLayer*.so`.
+- It `dlsym`s `vkEnumerateInstanceLayerProperties` and
+  `vkEnumerateInstanceExtensionProperties`. Both are required: without them
+  the library is rejected.
+- The device-side `vkEnumerateDeviceLayerProperties` and
+  `vkEnumerateDeviceExtensionProperties` are nominally optional. However, a
+  layer whose device properties do not `memcmp`-equal its instance properties
+  is marked non-global, and the loader leaves it out of every **device** chain
+  (`IsLayerGlobal`). For this layer they are therefore mandatory.
+- GIPA/GDPA resolve as `<layerName>GetInstanceProcAddr` first, then fall back
+  to `vkGetInstanceProcAddr`.
+- An unknown layer name fails `vkCreateInstance` with
+  `VK_ERROR_LAYER_NOT_PRESENT`, which is what the §3.3 retry already handles.
+- `gpu_debug_layers` names become implicit layers. An explicit request for the
+  same layer name is de-duplicated (`OverrideLayerNames`).
+- The NDK ships no `vk_layer.h`. The layer defines Android's
+  `vk_layer_interface.h` chain structs locally.
+
+**Delivery.**
+- *Experiment:* the `.so` ships in the runtime APK
+  (`lib/arm64-v8a/libVkLayer_DXR_queue_lock.so`). A userdebug device loads it
+  into an app with `enable_gpu_debug_layers=1`, `gpu_debug_app=<app>`,
+  `gpu_debug_layers=VK_LAYER_DXR_queue_lock` and
+  `gpu_debug_layer_app=org.freedesktop.monado.openxr_runtime.out_of_process`.
+  This path is debug-only: `GraphicsEnvironment.debugLayerEnabled()` requires
+  a debuggable build or app, or the inject-layers metadata.
+- *Product:* ship the `.so` inside the DisplayXR client AAR so it lands in the
+  **app's own** `nativeLibraryDir`. **Verified (AOSP main):**
+  `GraphicsEnvironment.setupGpuLayers()` appends the app's library search
+  paths to the layer path "in all cases", outside the debug gate. In
+  `DiscoverLayers()`, the loader searches `getLayerPaths()` unconditionally;
+  only `/data/local/debug/vulkan` is gated on `isDebuggable()`. So a
+  non-debuggable app can load a layer bundled in its own APK, and the runtime's
+  existing injection names it.
+- *Not verified:* behaviour on the specific Android releases our devices run
+  (only `main` was read), and whether the search path includes the
+  `base.apk!/lib/arm64-v8a` form when an app ships uncompressed,
+  non-extracted libs. The loader supports zip paths; if the form is missing,
+  set `extractNativeLibs=true` as the fallback.
+
+**Hazards to measure before productizing.**
+- A device-wide lock makes a DP-internal `vkQueueWaitIdle`, or a blocking
+  present, stall the **other** queue's submits as well as its own (§5.2,
+  widened).
+- `vkQueueWaitIdle` held under the device lock can **deadlock** in one case:
+  the waited queue has a pending timeline-semaphore wait whose signal the other
+  queue has not been submitted yet (wait-before-signal). Binary semaphores
+  cannot do this. If it ever bites, take WaitIdle out from under the device
+  lock.
+- The layer covers every `VkDevice` in the app process, including ones the app
+  creates for itself.
