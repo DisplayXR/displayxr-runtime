@@ -1173,6 +1173,14 @@ struct comp_vk_native_compositor
 		//! wait (> 0.5 ms — the previous weave was still unserved: the bound).
 		uint64_t wait_ema_ns;
 		uint32_t win_async, win_sync, win_stalls;
+		/*!
+		 * The weave thread is serving a non-blocking request right now.
+		 * Weave thread only, set and cleared under c->mutex around the
+		 * vk_dp_weave_and_present call. Routes that serve's queue work —
+		 * acquire wait, pre-DP flush, weave submit + frame fence, present —
+		 * onto the runtime-owned queue (see the comment at the queue choice).
+		 */
+		bool serving;
 	} hand_async;
 #endif
 	//! Paired with c->mutex. #1394 moved the weave hand-off onto its own
@@ -6378,6 +6386,31 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 	 */
 	VkQueue queue =
 	    (is_repaint && c->repaint_queue != VK_NULL_HANDLE) ? c->repaint_queue : vk->main_queue->queue;
+#ifdef VK_MIDFRAME_FILL
+	/*
+	 * #1905 ask 2: a NON-BLOCKING app weave goes to the runtime-owned queue
+	 * too. Measured on the Lume phone with it on the app's queue: the app had
+	 * already submitted its next frame there, so the acquire's
+	 * vkQueueWaitIdle, the pre-DP flush's vkQueueWaitIdle and the frame-fence
+	 * wait all queued behind the app's GPU work — the serve took ~22 ms wall,
+	 * the app's next post was always pending when it ended, and every fill
+	 * yielded (fills 28/s -> 0, GetFace 54 -> 32 Hz).
+	 *
+	 * Safe to move: the atlas is complete on the host before the request is
+	 * posted (renderer_draw waits its own submit on the app thread), both
+	 * queues are the same family (no ownership transfer), and fills already
+	 * sample that same atlas from this queue. The DP was created against this
+	 * queue (#868, vk_make_dp_vk), so the vendor weave's own submits are here
+	 * already. Fills run on this thread, so the queue holds only this serve's
+	 * work and its waits drain nothing of the app's. The non-blocking switch
+	 * requires a runtime-owned queue (dxr_async_handoff_resolve).
+	 */
+	const bool serve_rt = !is_repaint && c->hand_async.serving && c->repaint_queue != VK_NULL_HANDLE &&
+	                      c->repaint_cmd_pool != VK_NULL_HANDLE;
+	if (serve_rt) {
+		queue = c->repaint_queue;
+	}
+#endif
 
 	// Re-sync the output surface against the live ANativeWindow (Android).
 	// On background→card the SurfaceView's surface is destroyed; presenting
@@ -6472,6 +6505,13 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 	VkCommandPool cmd_pool = is_repaint && c->repaint_cmd_pool != VK_NULL_HANDLE
 	                             ? c->repaint_cmd_pool
 	                             : (VkCommandPool)(uintptr_t)comp_vk_native_renderer_get_cmd_pool(c->renderer);
+#ifdef VK_MIDFRAME_FILL
+	// #1905 ask 2: and its own pool — the renderer's belongs to the app
+	// thread (renderer_draw, the zone-mask API).
+	if (serve_rt) {
+		cmd_pool = c->repaint_cmd_pool;
+	}
+#endif
 
 	VkCommandBufferAllocateInfo alloc_info = {
 	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
@@ -7889,43 +7929,49 @@ vk_midframe_active(const struct comp_vk_native_compositor *c)
  * blocking wait (vk_async_handoff_eligible), as do zero-copy frames (the
  * "atlas" is then the app's own image).
  *
- * The weave runs on the app's queue (vk->main_queue) while the app may be
- * submitting on it, so the switch requires VK_LAYER_DXR_queue_lock (the same
- * #902 marker the mid-frame fill keys on) — without it this would be a bare
- * VkQueue external-sync violation, not merely the Adreno GSL race.
+ * The served weave now runs while the app is submitting its next frame, so
+ * its queue work goes to the runtime-owned queue (see the queue choice in
+ * vk_dp_weave_and_present) — on the app's queue it queued behind the app's
+ * GPU work and starved the fills. The switch still requires
+ * VK_LAYER_DXR_queue_lock (the #902 marker the mid-frame fill keys on): on
+ * Adreno the runtime queue shares the GSL context with the app's, the race
+ * #1910 measured. Default OFF until re-measured (dxr_async_handoff_resolve).
  */
 static bool
-dxr_async_handoff_resolve(bool layer_live, int single)
+dxr_async_handoff_resolve(bool layer_live, bool rt_queue, int single)
 {
-	// Exactly "1" forces ON, exactly "0" forces OFF; anything else ("auto",
-	// "true", empty) is auto. The env, when set non-empty, wins over the prop.
-	int forced = -1; // -1 = auto
+	/*
+	 * Default OFF until a device re-measure shows fills >= ~25/s AND the
+	 * hand-off wait ~0 together (the first A/B had the serve on the app
+	 * queue: +14% app fps, but fills 28/s -> 0 and GetFace 54 -> 32 Hz).
+	 * Exactly "1" asks for ON; exactly "0" or anything else is OFF. The env,
+	 * when set non-empty, wins over the prop.
+	 */
+	bool want = false;
 	const char *e = getenv("DXR_ASYNC_HANDOFF");
 	if (e != NULL && e[0] != '\0') {
-		forced = strcmp(e, "1") == 0 ? 1 : strcmp(e, "0") == 0 ? 0 : -1;
+		want = strcmp(e, "1") == 0;
 	}
 #ifdef XRT_OS_ANDROID
 	else {
 		char sp[PROP_VALUE_MAX] = {0};
 		if (__system_property_get("debug.dxr.async_handoff", sp) > 0) {
-			forced = strcmp(sp, "1") == 0 ? 1 : strcmp(sp, "0") == 0 ? 0 : -1;
+			want = strcmp(sp, "1") == 0;
 		}
 	}
 #endif
-	const bool want = forced >= 0 ? (forced == 1) : layer_live;
-	const bool on = want && single == 1;
+	const bool on = want && single == 1 && layer_live && rt_queue;
 	U_LOG_W(
-	    "#1905: non-blocking frame hand-off %s — %s (DXR_ASYNC_HANDOFF / debug.dxr.async_handoff: 1 forces ON, "
-	    "0 forces OFF, empty = auto on the queue-lock layer)",
+	    "#1905: non-blocking frame hand-off %s — %s (DXR_ASYNC_HANDOFF / debug.dxr.async_handoff: \"1\" = ON, "
+	    "default OFF)",
 	    on ? "ON" : "OFF",
-	    single != 1   ? "needs single weave ownership (#1196), which is off"
-	    : forced == 1 ? (layer_live ? "forced ON; VK_LAYER_DXR_queue_lock is live"
-	                                : "forced ON WITHOUT VK_LAYER_DXR_queue_lock: the weave thread and the app "
-	                                  "submit on the app's queue unsynchronised — undefined behaviour")
-	    : forced == 0 ? "forced OFF"
-	    : layer_live  ? "auto: VK_LAYER_DXR_queue_lock is live (it serialises the weave's submits on the app "
-	                    "queue with the app's own)"
-	                  : "auto: VK_LAYER_DXR_queue_lock absent — xrEndFrame keeps waiting for the weave");
+	    !want         ? "default (not requested)"
+	    : single != 1 ? "requested, but needs single weave ownership (#1196), which is off"
+	    : !layer_live ? "requested, but VK_LAYER_DXR_queue_lock is absent: the app's submits would not be "
+	                    "serialised with the weave thread's"
+	    : !rt_queue   ? "requested, but there is no runtime-owned VkQueue: the serve would queue behind the "
+	                    "app's next frame on its queue and starve the fills"
+	                  : "requested; VK_LAYER_DXR_queue_lock is live and the serve runs on the runtime-owned queue");
 	return on;
 }
 
@@ -7939,6 +7985,12 @@ vk_async_handoff_eligible(const struct comp_vk_native_compositor *c, bool zero_c
 {
 	if (!c->hand_async.enabled || zero_copy || c->local_2d_last_frame || c->zones_frame ||
 	    c->active_zone_mask != NULL) {
+		return false;
+	}
+	// The serve must be able to run on the runtime-owned queue + pool (the
+	// pool is created after the switch resolves and its failure drops the
+	// queue) — on the app's queue it starves the fills.
+	if (c->repaint_queue == VK_NULL_HANDLE || c->repaint_cmd_pool == VK_NULL_HANDLE) {
 		return false;
 	}
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
@@ -8427,9 +8479,15 @@ vk_repaint_thread(void *ptr)
 			if (os_thread_helper_is_running(&c->repaint_thread) && c->display_processor != NULL &&
 			    c->target != NULL) {
 				h_skip = false;
+#ifdef VK_MIDFRAME_FILL
+				c->hand_async.serving = h_async;
+#endif
 				h_result = vk_dp_weave_and_present(c, /*is_repaint=*/false, h_zero_copy, h_zc_image,
 				                                   h_zc_view, h_zc_format, h_zc_w, h_zc_h, h_tgt_w,
 				                                   h_tgt_h, h_ftime, h_fp, &h_skip);
+#ifdef VK_MIDFRAME_FILL
+				c->hand_async.serving = false;
+#endif
 			}
 			// else: torn down under the waiter. Fail the frame, never strand it.
 #ifdef VK_MIDFRAME_FILL
@@ -11795,7 +11853,8 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		// #1905 ask 2: the non-blocking hand-off keys on the same marker —
 		// the served weave then submits on the app's queue while the app
 		// may be submitting too, which only the layer makes legal.
-		c->hand_async.enabled = dxr_async_handoff_resolve(layer_live, c->weave_hand.enabled);
+		c->hand_async.enabled =
+		    dxr_async_handoff_resolve(layer_live, c->repaint_queue != VK_NULL_HANDLE, c->weave_hand.enabled);
 #endif
 
 		if (c->repaint_queue == VK_NULL_HANDLE && c->repaint.shared_queue == 0) {
