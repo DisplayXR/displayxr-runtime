@@ -17,6 +17,9 @@
 #endif
 
 #include "util/comp_layer_accum.h"
+// Multi-screen #1883: the painted-partition type the repaint snapshot carries
+// (declarations only; the segment path itself is Windows-only).
+#include "util/comp_segments.h"
 // #1581 quad layers: the shared per-view camera (#1580) and the N-view
 // LEFT/RIGHT eye-visibility rule.
 #include "util/comp_layer_view_camera.h"
@@ -828,6 +831,10 @@ struct comp_gl_compositor
 		GLuint atlas_tex;
 		uint32_t present_w, present_h;
 		float last_dt;
+		//! #1883: the per-segment partition @ref atlas_tex was painted with
+		//! (count 0 = unrouted) — the segment crop reads it, on the app frame
+		//! and on every repaint of it.
+		struct comp_segments_content seg_content;
 
 		uint64_t count, ticks;       //!< Diagnostics.
 	} repaint;
@@ -3273,6 +3280,10 @@ gl_crop_and_process_dp(
 		sf.canvas.y = 0;
 		sf.canvas.w = output_w;
 		sf.canvas.h = output_h;
+		// #1883: crop each segment's views where this atlas painted them (the
+		// routing it was located for), not at the seam of the live window.
+		// The window path weaves only the atlas the repaint snapshot holds.
+		sf.content = &c->repaint.seg_content;
 		sf.transparent_background = c->transparent_background;
 		sf.primary_dp = c->display_processor;
 		comp_gl_segments_record(c->segments, &sf);
@@ -6109,6 +6120,16 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 	}
 #endif
 
+	// #1883: the partition this frame's atlas is painted with (routed: the
+	// routing it was located for), kept with the atlas for the segment crop.
+	struct comp_segments_content seg_content;
+	memset(&seg_content, 0, sizeof(seg_content));
+#ifdef XRT_OS_WINDOWS
+	if (seg_routed_frame) {
+		comp_segments_content_from_routing(&seg_route, &seg_content);
+	}
+#endif
+
 	// Zero-copy check: can we pass the app's swapchain directly to the DP?
 	bool zero_copy = false;
 	GLuint zc_texture = 0;
@@ -6943,6 +6964,7 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 		// zero-copy path — there the atlas IS the app's own texture, which it
 		// redraws, so replaying it would weave whatever the app has since drawn.
 		c->repaint.atlas_tex = atlas_for_present;
+		c->repaint.seg_content = seg_content;
 		c->repaint.armed = !zero_copy;
 		// The HUD's dt is the APP's frame delta; a repaint reports the last
 		// real frame's, not a repaint-to-repaint interval.
