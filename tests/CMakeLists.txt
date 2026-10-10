@@ -721,6 +721,47 @@ if(TARGET tests_service_orchestrator_linux)
 		)
 endif()
 
+# The hotkey worker's GNOME-extension backend against a fake WorkspaceHotkey1
+# on a PRIVATE session bus (dbus-run-session; python3-gi plays the extension).
+# Registered only where all three exist, so a bare build host just skips it.
+if(TARGET tests_service_hotkey_linux AND XRT_HAVE_DBUS)
+	find_program(DXR_DBUS_RUN_SESSION dbus-run-session)
+	find_package(Python3 COMPONENTS Interpreter QUIET)
+	if(DXR_DBUS_RUN_SESSION AND Python3_Interpreter_FOUND)
+		execute_process(
+			COMMAND ${Python3_EXECUTABLE} -c "from gi.repository import Gio"
+			RESULT_VARIABLE _dxr_py_gi
+			OUTPUT_QUIET ERROR_QUIET
+			)
+		if(_dxr_py_gi EQUAL 0)
+			add_executable(
+				tests_service_hotkey_linux_dbus tests_service_hotkey_linux_dbus.cpp
+				${PROJECT_SOURCE_DIR}/src/xrt/targets/service/service_hotkey_linux.c
+				)
+			target_compile_definitions(tests_service_hotkey_linux_dbus PRIVATE SERVICE_HOTKEY_HAVE_DBUS)
+			target_include_directories(tests_service_hotkey_linux_dbus SYSTEM PRIVATE ${DBUS_INCLUDE_DIRS})
+			target_link_libraries(
+				tests_service_hotkey_linux_dbus
+				PRIVATE xrt-external-catch2
+					aux_util
+					target_workspace_config
+					xrt-interfaces
+					aux_os
+					xrt-pthreads
+					xrt-external-cjson
+					${DBUS_LIBRARIES}
+				)
+			add_test(
+				NAME tests_service_hotkey_linux_dbus
+				COMMAND
+					${DXR_DBUS_RUN_SESSION} -- ${Python3_EXECUTABLE}
+					${CMAKE_CURRENT_SOURCE_DIR}/fake_workspace_hotkey_ext.py
+					$<TARGET_FILE:tests_service_hotkey_linux_dbus> --success
+				)
+		endif()
+	endif()
+endif()
+
 if(XRT_BUILD_DRIVER_HANDTRACKING)
 	target_link_libraries(
 		tests_levenbergmarquardt
