@@ -25,6 +25,7 @@
  * | `SERVICE_HEADLESS` | info     | system |
  * | `DP_DEGRADED`      | warn     | screen |
  * | `DP_STALE`         | critical | screen |
+ * | `CLAIM_FORCED`     | info     | screen |
  *
  * @ingroup aux_util
  */
@@ -55,6 +56,7 @@ extern "C" {
 #define U_STATUS_W_SERVICE_HEADLESS "SERVICE_HEADLESS"
 #define U_STATUS_W_DP_DEGRADED "DP_DEGRADED"
 #define U_STATUS_W_DP_STALE "DP_STALE"
+#define U_STATUS_W_CLAIM_FORCED "CLAIM_FORCED"
 /*! @} */
 
 //! A screen whose DP has not tracked for longer than this raises TRACKER_DOWN (§4).
@@ -147,6 +149,12 @@ u_status_eye_source_str(enum xrt_status_eye_source e);
 //! `enum xrt_display_claim_confidence` value → "VERIFIED" / "EDID" / "FALLBACK" / "NONE" / "UNKNOWN".
 const char *
 u_status_confidence_str(uint32_t confidence);
+//! "user" / "machine" / "env"; NULL for NONE (JSON null).
+const char *
+u_status_pref_source_str(enum xrt_status_pref_source s);
+//! "live" / "next-session".
+const char *
+u_status_apply_str(enum xrt_status_apply a);
 //! `enum xrt_plugin_platform_state` value → "READY", … (same spellings as the loader).
 const char *
 u_status_platform_state_str(uint32_t state);

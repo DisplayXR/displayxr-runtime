@@ -445,7 +445,18 @@ fill_screen(const struct xrt_screen *in,
 	if (e != NULL) {
 		(void)snprintf(s->claim.serial, sizeof(s->claim.serial), "%s", e->serial);
 		s->claim.apis = apis_of(e);
+		// Display dashboard phase 7: the per-screen preference.
+		s->claim.forced = e->forced;
+		(void)snprintf(s->claim.preferred_plugin, sizeof(s->claim.preferred_plugin), "%s", e->preferred_plugin);
+		s->claim.preferred_source = e->preferred_plugin[0] != '\0'
+		                                ? (enum xrt_status_pref_source)e->preferred_source
+		                                : XRT_STATUS_PREF_SOURCE_NONE;
 	}
+	(void)target_plugin_get_monitor_key(in->id, s->key, sizeof(s->key), NULL, 0);
+	// The primary (system-default) screen's DP is the session's own: a change
+	// applies at the next session / service start. Every other screen's DP is
+	// a segment DP the service recreates on its re-probe.
+	s->claim.apply = s->roles.runtime_default ? XRT_STATUS_APPLY_NEXT_SESSION : XRT_STATUS_APPLY_LIVE;
 
 	s->layout.width_m = in->info.width_m;
 	s->layout.height_m = in->info.height_m;

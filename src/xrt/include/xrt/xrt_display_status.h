@@ -87,6 +87,25 @@ enum xrt_status_source
 	XRT_STATUS_SOURCE_HEADLESS = 1, //!< Assembled in-process: "what a process starting now would get".
 };
 
+//! Where a screen's per-screen DP preference came from (JSON lower-case; null for NONE).
+//! Values equal `enum u_setting_source`.
+enum xrt_status_pref_source
+{
+	XRT_STATUS_PREF_SOURCE_NONE = 0,    //!< No preference for this screen.
+	XRT_STATUS_PREF_SOURCE_ENV = 1,     //!< `DXR_PREFERRED_PLUGIN_PER_SCREEN`.
+	XRT_STATUS_PREF_SOURCE_USER = 2,    //!< The per-user settings file (what the dashboard writes).
+	XRT_STATUS_PREF_SOURCE_MACHINE = 3, //!< HKLM (admin).
+};
+
+//! When a change of a screen's DP takes effect (JSON "live" / "next-session").
+enum xrt_status_apply
+{
+	//! A segment DP of the service path: recreated on the service's re-probe.
+	XRT_STATUS_APPLY_LIVE = 0,
+	//! The primary screen (and every in-process app): at the next session / service start.
+	XRT_STATUS_APPLY_NEXT_SESSION = 1,
+};
+
 //! Live tracking state of a screen (JSON upper-case).
 enum xrt_status_tracking
 {
@@ -279,6 +298,14 @@ struct xrt_status_claim
 	uint32_t confidence;                 //!< `enum xrt_display_claim_confidence` value (0 = none).
 	char serial[XRT_STATUS_NAME_MAX];    //!< Vendor serial from the claim ("" if n/a).
 	uint32_t apis;                       //!< `XRT_STATUS_API_BIT_*` factories the claim offers.
+	//! @ref plugin_id won by a per-screen preference (display dashboard phase 7).
+	bool forced;
+	//! The per-screen preference for this screen, honoured or not ("" = none).
+	char preferred_plugin[32];
+	//! Where @ref preferred_plugin came from.
+	enum xrt_status_pref_source preferred_source;
+	//! When a change of this screen's DP takes effect.
+	enum xrt_status_apply apply;
 };
 
 //! The metres + nominal viewer the segment layout uses for a screen.
@@ -330,6 +357,7 @@ struct xrt_status_screen
 	uint32_t index;                              //!< Row index.
 	char device_name[XRT_STATUS_NAME_MAX];       //!< OS device name (`\\.\DISPLAY1`, `HDMI-1`); "" = unknown.
 	char friendly_name[XRT_STATUS_NAME_MAX];     //!< Human name (EDID model, else "PNP PROD").
+	char key[XRT_STATUS_NAME_MAX];               //!< Stable screen key ("" = unknown).
 	struct xrt_status_edid edid;                 //!< EDID identity.
 	struct xrt_status_desktop desktop;           //!< Desktop placement + scale.
 	struct xrt_status_native native;             //!< Native mode.
