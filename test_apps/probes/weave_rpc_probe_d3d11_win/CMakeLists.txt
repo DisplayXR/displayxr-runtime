@@ -92,6 +92,7 @@ target_link_libraries(weave_rpc_probe_d3d11_win PRIVATE
     d3d11
     dxgi
     dcomp
+    windowscodecs
 )
 
 # Embed manifest (copy to build dir; relative path avoids spaces-in-path issues)

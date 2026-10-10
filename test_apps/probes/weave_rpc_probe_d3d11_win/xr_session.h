@@ -20,6 +20,8 @@
 #define XR_USE_GRAPHICS_API_D3D11
 #include "xr_session_common.h"
 #include <openxr/XR_DXR_weave.h>
+#include <openxr/XR_DXR_lift.h>
+#include <openxr/XR_DXR_cursor_depth.h>
 
 // XR_DXR_weave available + enabled on the instance, and the resolved entry points.
 extern bool g_hasWeaveExt;
@@ -33,6 +35,11 @@ extern PFN_xrWeaveBindWindowDXR g_pfnWeaveBindWindow;
 extern PFN_xrWeaveSubmitDXR g_pfnWeaveSubmit;
 //! Spec v8 (browser#88). NULL on a pre-v8 runtime — the sticky-latch tests skip.
 extern PFN_xrWeaveSetScreenFlatRegionsDXR g_pfnWeaveSetScreenFlat;
+//! --lift: XR_DXR_lift (lifted weave rects) and XR_DXR_cursor_depth v3 (the
+//! runtime-drawn depth cursor on them), enabled when the runtime advertises them.
+extern bool g_hasLiftExt;
+extern uint32_t g_cursorDepthSpecVersion; //!< 0 = not advertised
+extern PFN_xrCreateLiftStreamDXR g_pfnCreateLiftStream;
 
 // Initialize OpenXR instance + system; detect/enable D3D11 + win32_window_binding
 // + display_info + weave.

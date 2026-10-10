@@ -334,6 +334,7 @@ ipc_client_lift_weave_rects(struct ipc_connection *ipc_c, uint32_t count, const 
 		args.rects[i].view_control = rects[i].view_control;
 		args.rects[i].viewpoint_count = rects[i].viewpoint_floats / 3;
 		args.rects[i].rig = rects[i].rig;
+		args.rects[i].depth_cursor = rects[i].depth_cursor ? 1u : 0u;
 	}
 	return ipc_call_lift_weave_rects(ipc_c, &args);
 }

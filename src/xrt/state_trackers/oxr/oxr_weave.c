@@ -168,7 +168,8 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         uint32_t *out_width,
                                         uint32_t *out_height,
                                         uint64_t *out_fence_value,
-                                        struct xrt_eye_positions *out_eyes);
+                                        struct xrt_eye_positions *out_eyes,
+                                        uint32_t *out_lift_cursor_mask);
 
 xrt_result_t
 comp_ipc_client_compositor_weave_set_screen_flat_regions(struct xrt_compositor *xc,
@@ -854,6 +855,14 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 			// Spec v3 (ADR-048 Addendum A): an app rig, directly on the rect
 			// (wins) or on its XrLiftOptionsDXR.
 			(void)oxr_lift_rig_from_chain(e, o, &lr[i].rig);
+#ifdef OXR_HAVE_DXR_cursor_depth
+			// XR_DXR_cursor_depth v3 (ADR-046 Amendment 1): the runtime draws
+			// the depth cursor into this rect's lifted views.
+			if (sess->sys->inst->extensions.DXR_cursor_depth) {
+				lr[i].depth_cursor = OXR_GET_INPUT_FROM_CHAIN(e, XR_TYPE_CURSOR_DEPTH_LIFT_RECT_DXR,
+				                                              XrCursorDepthLiftRectDXR) != NULL;
+			}
+#endif
 		}
 		xrt_result_t lx = comp_ipc_client_compositor_lift_weave_rects(&sess->xcn->base, lifts->liftCount, lr);
 		if (lx == XRT_ERROR_IPC_FAILURE) {
@@ -867,6 +876,7 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 	uint32_t w = 0, h = 0;
 	uint64_t fence_value = 0;
 	struct xrt_eye_positions eyes = {0};
+	uint32_t lift_cursor_mask = 0; // XR_DXR_cursor_depth v3; the dma-buf path never draws one
 	int release_fd = -1; // v10: per-frame release sync_file, owned by us until handed out
 	xrt_result_t xret;
 #ifdef XRT_OS_LINUX_DESKTOP
@@ -891,7 +901,8 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		    rect_count > 0 ? rects : NULL, overlay_handle, overlay_is_dxgi, overlay_rect_count,
 		    overlay_rect_count > 0 ? overlay_rects : NULL, submitInfo->firstChunk == XR_TRUE,
 		    layout.view_count > 0 ? &layout : NULL, flat_rect_count, flat_rect_count > 0 ? flat_rects : NULL,
-		    mono_in_2d, overlay_unchanged, overlay_filter_strength, &have_out, &w, &h, &fence_value, &eyes);
+		    mono_in_2d, overlay_unchanged, overlay_filter_strength, &have_out, &w, &h, &fence_value, &eyes,
+		    &lift_cursor_mask);
 	}
 	if (xret == XRT_ERROR_FEATURE_NOT_SUPPORTED) {
 		// The service has no weave engine for this platform (desktop Linux
@@ -956,6 +967,16 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 	}
 	output->eyesValid = eyes.valid ? XR_TRUE : XR_FALSE;
 	output->eyesTracking = eyes.is_tracking ? XR_TRUE : XR_FALSE;
+
+#ifdef OXR_HAVE_DXR_cursor_depth
+	XrCursorDepthLiftStateDXR *cursor_state =
+	    OXR_GET_OUTPUT_FROM_CHAIN(output, XR_TYPE_CURSOR_DEPTH_LIFT_STATE_DXR, XrCursorDepthLiftStateDXR);
+	if (cursor_state != NULL) {
+		cursor_state->drawnLiftMask = lift_cursor_mask;
+	}
+#else
+	(void)lift_cursor_mask;
+#endif
 
 	bool need_export = !sess->weave.exported || w != sess->weave.last_w || h != sess->weave.last_h;
 	if (have_out && w != 0 && h != 0 && need_export) {
