@@ -37,7 +37,8 @@ cli_print_help(int argc, const char **argv)
 	P("  perf <...>        - Performance settings the runtime reads inside each app.\n");
 	P("                      'perf list [--json]', 'perf set <name> <value>', 'perf reset'.\n");
 	P("  dp <...>          - List display processors / set the PreferredPlugin override.\n");
-	P("                      'dp list [--json]', 'dp use <id>', 'dp reset'.\n");
+	P("                      'dp list [--json]', 'dp use <id>', 'dp reset'; per screen:\n");
+	P("                      'dp use <id> --screen <key>', 'dp reset --screen <key>|all'.\n");
 	P("  input <...>       - Input providers (motion controllers, ADR-034).\n");
 	P("                      'input list [--json]', 'input haptic-test [seconds]'.\n");
 	P("  runtime <...>     - Inspect / switch the active OpenXR runtime.\n");

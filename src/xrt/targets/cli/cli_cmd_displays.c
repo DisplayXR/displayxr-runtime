@@ -23,6 +23,7 @@
 #include "xrt/xrt_instance.h"
 #include "xrt/xrt_plugin.h"
 #include "target_plugin_loader.h"
+#include "util/u_setting.h"
 
 #include <cjson/cJSON.h>
 
@@ -164,6 +165,26 @@ cli_cmd_displays_claims(const struct os_display_edid_list *list, bool json)
 			cJSON_AddNumberToObject(c, "pixel_height", (double)e->pixel_height);
 			cJSON_AddNumberToObject(c, "screen_left", (double)e->screen_left);
 			cJSON_AddNumberToObject(c, "screen_top", (double)e->screen_top);
+			// Display dashboard phase 7: the stable screen key and the
+			// per-screen preference (additive; schema stays 1).
+			char key[64] = {0};
+			if (target_plugin_get_monitor_key(e->monitor_id, key, sizeof(key), NULL, 0)) {
+				cJSON_AddStringToObject(c, "key", key);
+			} else {
+				cJSON_AddNullToObject(c, "key");
+			}
+			cJSON_AddBoolToObject(c, "forced", e->forced);
+			if (e->forced) {
+				cJSON_AddStringToObject(c, "forced_source",
+				                        u_setting_source_str((enum u_setting_source)e->forced_source));
+			} else {
+				cJSON_AddNullToObject(c, "forced_source");
+			}
+			if (e->preferred_plugin[0] != '\0') {
+				cJSON_AddStringToObject(c, "preferred_plugin", e->preferred_plugin);
+			} else {
+				cJSON_AddNullToObject(c, "preferred_plugin");
+			}
 			const struct os_display_edid_monitor *m = monitor_for_id(list, descs, dn, e->monitor_id);
 			if (m != NULL) {
 				char pnp[4];
@@ -217,6 +238,13 @@ cli_cmd_displays_claims(const struct os_display_edid_list *list, bool json)
 		}
 		PT("    plug-in='%s'  confidence=%s  apis=%s%s%s\n", e->plugin_id, confidence_label(e->confidence),
 		   apis, e->serial[0] != '\0' ? "  serial=" : "", e->serial);
+		char key[64] = {0};
+		if (target_plugin_get_monitor_key(e->monitor_id, key, sizeof(key), NULL, 0)) {
+			PT("    key='%s'%s%s%s%s\n", key, e->forced ? "  forced by a per-screen preference (" : "",
+			   e->forced ? u_setting_source_str((enum u_setting_source)e->forced_source) : "",
+			   e->forced ? ")" : "",
+			   (!e->forced && e->preferred_plugin[0] != '\0') ? "  (per-screen preference ignored)" : "");
+		}
 	}
 	if (reg.entry_count < dn) {
 		PT("(%u of %u monitor(s) claimed by no plug-in)\n", dn - reg.entry_count, dn);
