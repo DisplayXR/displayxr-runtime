@@ -34,6 +34,12 @@
 #include "xrt/xrt_vulkan_includes.h"
 #include "vk/vk_helpers.h"
 
+// #1905: comp_vk_native_queue_submit_retry. XRT_OS_ANDROID is defined by now
+// (vk_helpers.h -> xrt_compositor.h -> xrt_config_os.h).
+#ifdef XRT_OS_ANDROID
+#include "comp_vk_native_target.h"
+#endif
+
 #include "util/u_debug.h"
 #include "util/u_logging.h"
 #include "util/u_misc.h"
@@ -2231,7 +2237,13 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 	deposit_chain_signal(r, &submit_info, &deposit_timeline, &deposit_sem, &deposit_value, &deposit_wait_value,
 	                     &deposit_wait_stage);
 
+#ifdef XRT_OS_ANDROID
+	// #1905: one retry on -3 (shared-GSL-context race); see the helper.
+	res = comp_vk_native_queue_submit_retry(vk, vk->main_queue->queue, &submit_info, VK_NULL_HANDLE,
+	                                        "renderer_draw_zones");
+#else
 	res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE);
+#endif
 	if (res != VK_SUCCESS) {
 		U_LOG_E("VK zones: failed to submit draw commands: %d", res);
 		// The claimed value will never be signalled — give it back, or a
@@ -2638,7 +2650,20 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	deposit_chain_signal(r, &submit_info, &deposit_timeline, &deposit_sem, &deposit_value, &deposit_wait_value,
 	                     &deposit_wait_stage);
 
+#ifdef XRT_OS_ANDROID
+	/*
+	 * #1905: one retry on -3. This is the submit that loses the shared-GSL
+	 * race on model viewer: the app's unlocked submit on the app queue
+	 * collides with a fill's on the repaint queue, and the NEXT submit on the
+	 * app queue — this one — returns -3, dropping the app frame ("Failed to
+	 * render layers"). The failed submit consumed nothing (the deposit
+	 * timeline value is still unsignalled), so resubmitting it is safe.
+	 */
+	res =
+	    comp_vk_native_queue_submit_retry(vk, vk->main_queue->queue, &submit_info, VK_NULL_HANDLE, "renderer_draw");
+#else
 	res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE);
+#endif
 	if (res != VK_SUCCESS) {
 		U_LOG_E("Failed to submit renderer commands: %d", res);
 		// The claimed value will never be signalled — give it back, or a

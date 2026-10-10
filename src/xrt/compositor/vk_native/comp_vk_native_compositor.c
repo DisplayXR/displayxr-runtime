@@ -7172,7 +7172,15 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 			VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
 			vk->vkCreateFence(vk->device, &fci, NULL, fence_p);
 		}
+#ifdef XRT_OS_ANDROID
+		// #1905: one retry on -3 (shared-GSL-context race; see the helper).
+		// Clean here: nothing has touched the command buffer or the fence
+		// since the failed attempt, which left both unchanged.
+		res = comp_vk_native_queue_submit_retry(vk, queue, &submit_info, *fence_p,
+		                                        is_repaint ? "fill" : "app-weave");
+#else
 		res = vk->vkQueueSubmit(queue, 1, &submit_info, *fence_p);
+#endif
 
 		// Tell the DP the weave went to the GPU, and on which queue. The DP
 		// RECORDED this weave (into `cmd`) but the submit is ours, so without

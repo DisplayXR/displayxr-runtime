@@ -3447,12 +3447,45 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 	// #868: whichever queue the CALLER owns — the app frame uses the app's,
 	// a repaint uses the runtime-owned one. Never mix: a VkQueue is externally
 	// synchronised and the runtime cannot serialise the app's own submits.
+#ifdef XRT_OS_ANDROID
+	// #1905: retried once on -3 — a lost wait leaves image_available signalled
+	// and unwaited, which poisons the next acquire on this semaphore.
+	comp_vk_native_queue_submit_retry(vk, queue, &wait_submit, VK_NULL_HANDLE, "acquire-wait");
+#else
 	vk->vkQueueSubmit(queue, 1, &wait_submit, VK_NULL_HANDLE);
+#endif
 	vk->vkQueueWaitIdle(queue);
 
 	*out_index = target->current_index;
 	return XRT_SUCCESS;
 }
+
+#ifdef XRT_OS_ANDROID
+VkResult
+comp_vk_native_queue_submit_retry(
+    struct vk_bundle *vk, VkQueue queue, const VkSubmitInfo *submit, VkFence fence, const char *site)
+{
+	VkResult res = vk->vkQueueSubmit(queue, 1, submit, fence);
+	if (res != VK_ERROR_INITIALIZATION_FAILED) {
+		return res;
+	}
+	os_nanosleep(1000 * 1000);
+	res = vk->vkQueueSubmit(queue, 1, submit, fence);
+
+	static std::atomic<uint64_t> s_retries{0};
+	static std::atomic<uint64_t> s_recovered{0};
+	const uint64_t n = ++s_retries;
+	const uint64_t ok = (res == VK_SUCCESS) ? ++s_recovered : s_recovered.load();
+	if (n == 1 || n % 100 == 0) {
+		U_LOG_W(
+		    "#1905: vkQueueSubmit returned VK_ERROR_INITIALIZATION_FAILED at %s — retried after 1 ms: "
+		    "%d (%llu retries so far, %llu recovered). Mitigation for the shared-GSL-context submit "
+		    "race; logged first + every 100th.",
+		    site, (int)res, (unsigned long long)n, (unsigned long long)ok);
+	}
+	return res;
+}
+#endif
 
 xrt_result_t
 comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queue, bool counted)
