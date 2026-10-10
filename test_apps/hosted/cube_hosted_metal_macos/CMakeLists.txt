@@ -58,7 +58,11 @@ set(DISPLAYXR_EXTENSIONS_INCLUDE_DIR "${_dxr_ext_includes}" CACHE PATH
 FetchContent_Declare(
     displayxr_common
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    GIT_TAG v2.0.0
+    # v2.27.0: window-space / HUD swapchains prefer the _SRGB sibling of
+    # R8G8B8A8 (ADR-044 §7, displayxr-common#72) — the Metal compositor is
+    # format-honest, so a UNORM HUD of CPU-rasterized (encoded) bytes would be
+    # encoded twice. Same pin as the VK macOS cube apps.
+    GIT_TAG v2.27.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
