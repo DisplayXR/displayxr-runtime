@@ -168,3 +168,16 @@ both halves. Decisions:
 The browser's half (rendering a straddling rect's two parts from two viewers) lives in
 `displayxr-browser-pvt`. Detail: `docs/architecture/comp-segments.md` § *Present-owners*;
 contract: `docs/specs/extensions/XR_DXR_weave.md` §5g.
+
+## Amendment 5 (2026-10-10): segments on the in-process OpenGL compositor (Windows)
+
+The in-process GL compositor (`cube_handle_gl_win`, GL demos) carries the model as
+`gl/comp_gl_segments`, a twin of the D3D11 manager — including the HWND following the majority
+screen (Amendment 2) — through two more appended slots (`create_dp_gl_for_screen`, GL
+`set_present_origin`; ABI stays 5). GL has no output-device split (ADR-037 §5), so Amendment 1 does
+not arise. One decision is GL-specific: **a window is segmented only when the primary screen's
+plug-in implements `create_dp_gl_for_screen`.** The primary segment is woven by the session's own
+DP, and a GL DP built before this amendment re-states a whole-target viewport inside
+`process_atlas`, so it would weave the primary segment's crop across the whole window; a plug-in
+that implements the new slot promises to honour a non-empty canvas on its plain DP too. Detail:
+`docs/architecture/comp-segments.md` § *Windows / OpenGL (M6)*.
