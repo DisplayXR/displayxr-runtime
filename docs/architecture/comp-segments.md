@@ -368,8 +368,9 @@ An `_ipc` client (`XRT_FORCE_MODE=ipc`, or any app under a running service) is c
   device px. One client's segment DPs exist at a time: a focus change releases the outgoing
   presenter's, and a table older than 250 ms (the client no longer weaves directly — focus
   moved, the workspace took over) is not handed out, so that client locates one view set. A hosted client presents into the service's window on the panel, a
-  present-owner / client-texture client weaves on its own thread and a zones frame keeps the
-  single DP: none is segmented.
+  client-texture client weaves on its own and a zones frame keeps the single DP: none is
+  segmented here. A present-owner weaves on its own thread and is segmented there (next
+  section).
 - **Compose / shell mode** (`multi_compositor_render`) is unchanged: one presenter, the
   service window on the panel, so a workspace window is never segmented and its table stays
   empty. Per-screen workspace presenters are a separate decision.
@@ -387,3 +388,40 @@ An `_ipc` client (`XRT_FORCE_MODE=ipc`, or any app under a running service) is c
   drawn once per tile with that tile's camera (in-process draws them per segment), and a
   second projection layer is routed only where the per-tile pass visits it (segment 0).
 
+## Present-owners on the weave service (Windows, ADR-047 Amendment 4)
+
+An `XR_DXR_weave` present-owner (the DisplayXR Browser, `weave_rpc_probe_d3d11_win`) never reaches
+the direct pipeline: it is `PRESENTER_SELF`, and `comp_d3d11_service_weave_submit` weaves its
+pixels into a handback texture on its own IPC thread. That submit is segmented by the same rules:
+
+- **Opt-in and manager.** The same `compositor_segments_enable` list, but a manager of the
+  present-owner's own (`weave_segs`, rebuilt on `weave_seg_rebuild` / a device change), made on
+  `sys->device` — the device the woven handback and the #1172 ingest DP live on. It never shares
+  the direct pipeline's manager: different device, different thread, and a focus change does not
+  release it. Released with the compositor (under `render_mutex`).
+- **Which submits.** v3 batch and v6 N-view: both weave the whole window as one canvas (the SBS
+  scratch at window size, or the content-sized atlas), which is what `comp_segments_compute` cuts.
+  `weave_seg_update` reads the bound HWND's client area (`svc_seg_window_rect`) and runs the table +
+  lifecycle; a client area that does not match the handback size (a resize in flight) is woven
+  whole that frame. Legacy single-rect submits (canvas = one element) are never segmented.
+- **The weave.** `weave_seg_record` replaces the single `process_atlas`: `comp_d3d11_segments_record`
+  crops each segment's views out of the canvas atlas, the session's weave DP weaves the primary
+  screen's segment, each other screen's windowless DP its own (present origin, viewport, scissor
+  = the segment), transparent background and `client_presents` declared to the segment DPs as to
+  the session DP (`comp_d3d11_segments_frame::client_presents`), flat 2D (one view) where nothing
+  can weave. The v4 overlay is told "none" for that frame and composited by the runtime's
+  post-weave blit over the whole handback instead.
+- **Eyes out.** After the fence, `weave_seg_publish` stores the table (`comp_segments_publish`:
+  the generation moves on geometry only) with each segment's eyes — the primary's are the
+  submit's own base eyes, the others predicted from their segment DPs.
+  `weave_get_segments` (appended to `proto.json`) hands it to the client, which fills
+  `XrWeaveOutputRectPartsDXR` and cuts the submitted rects at the seams with
+  `u_weave_rect_parts` (`auxiliary/util/u_weave_rect_parts.h`, unit-tested by
+  `tests/tests_weave_segments.cpp`). Fetched only when the caller chains the struct.
+- **Drag snap.** `comp_d3d11_service_weave_snap_window_rect` first asks
+  `comp_d3d11_segments_snap_dp` for the DP of the screen holding the majority of the window at the
+  proposed position (a separate `comp_segments_owner`, Amendment 2's margin and hold, no failure
+  latch since nothing is torn down), and falls back to the panel DP's snap.
+- **Not covered:** the v8 hardware wish is still published to the panel DP only (the primary
+  screen's lens); a window across more than `XRT_MAX_SEGMENTS` screens is woven per screen but
+  reported unsegmented (one eye set).

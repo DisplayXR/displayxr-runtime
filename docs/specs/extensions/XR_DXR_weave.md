@@ -981,6 +981,77 @@ starts it.
 macOS and Android accept and ignore it — the output stays woven — as a pre-v13 runtime does with
 any unknown chained struct. One `weave(v13)` WARN in the service log per edge.
 
+## 5g. Per-screen parts of each weave rect (v19, #1884)
+
+```c
+#define XR_TYPE_WEAVE_OUTPUT_RECT_PARTS_DXR ((XrStructureType)1004999292)
+#define XR_WEAVE_MAX_SEGMENTS_DXR   2
+#define XR_WEAVE_MAX_RECT_PARTS_DXR (XR_WEAVE_SUBMIT_MAX_RECTS_DXR * XR_WEAVE_MAX_SEGMENTS_DXR)
+
+typedef struct XrWeaveScreenSegmentDXR {     // one screen's part of the bound window
+    uint64_t    displayId;                   // XrDisplayDXR::displayId
+    XrRect2Di   windowRect;                  // window-relative device px
+    XrRect2Di   screenRect;                  // the same pixels, relative to the screen
+    XrExtent2Di screenSize;                  // device px
+    XrExtent2Df screenSizeMeters;            // 0 = unknown
+    XrBool32    isPrimary, woven;
+    uint32_t    eyeCount;
+    XrVector3f  eyes[XR_WEAVE_MAX_EYES_DXR]; // THIS screen's display space
+    XrBool32    eyesValid, eyesTracking;
+} XrWeaveScreenSegmentDXR;
+
+typedef struct XrWeaveRectPartDXR {          // one rect's pixels on one screen
+    uint32_t  rectIndex, segmentIndex;
+    XrRect2Di windowRect, rectRelative, screenRect;
+} XrWeaveRectPartDXR;
+
+typedef struct XrWeaveOutputRectPartsDXR {   // chained on XrWeaveOutputDXR::next
+    XrStructureType type; void* next;
+    uint32_t segmentCount;                   // 0 = one display processor: use the base eyes
+    XrWeaveScreenSegmentDXR segments[XR_WEAVE_MAX_SEGMENTS_DXR];
+    uint32_t partCount;
+    XrWeaveRectPartDXR parts[XR_WEAVE_MAX_RECT_PARTS_DXR];
+    uint64_t generation;                     // moves on a geometry change only
+} XrWeaveOutputRectPartsDXR;
+```
+
+On a system with two or more 3D screens (multi-screen, ADR-047) the bound window can straddle a
+seam. The Windows service then weaves the window **per screen**: each screen's part by that
+screen's display processor, at that screen's interlace phase, and each part has its own viewer
+(that screen's tracker). One eye pair per submit is wrong for the part on the other screen.
+
+**What the runtime does.** For a batch (v3) or N-view (v6) submit from a session whose window
+spans screens, every screen's segment is woven by its own DP into the one handback (scissored to
+the segment); a segment no DP can weave shows one view flat (the left view of a stereo pair, the
+middle view of an N-view atlas). A legacy single-rect submit is never segmented. The v4 overlay is
+composited over the whole handback after the per-screen weave.
+
+**What the caller gets.** Chain a zero-initialised `XrWeaveOutputRectPartsDXR` on
+`XrWeaveOutputDXR::next`:
+
+- `segmentCount == 0`: the window was woven by one DP (on one screen, a legacy submit, a
+  one-screen system, a non-Windows runtime, or a pre-v19 runtime that skipped the struct). The
+  base `XrWeaveOutputDXR::eyes` apply to every rect, exactly as before.
+- `segmentCount >= 1`: `segments` lists the window's screens left to right, each with its eyes in
+  **that screen's display space** (metres, origin at that screen's centre), its physical size and
+  whether it is woven. `parts` lists every non-empty (rect, segment) intersection, by rect then
+  left to right. Render the pixels of `parts[i].rectRelative` inside rect `parts[i].rectIndex`
+  from `segments[parts[i].segmentIndex].eyes`; frame that part's off-axis projection against its
+  screen's physical rectangle using `parts[i].screenRect` (where those pixels sit on the screen)
+  and `screenSize` / `screenSizeMeters`. A rect wholly on one screen has one part, the whole rect.
+  The base eyes still describe the primary screen.
+
+The eyes are for the NEXT frame, as the base eyes are. `generation` moves on a move / resize /
+screen change, so a caller re-plans its per-part render targets on a change only.
+
+**Drag snap.** From v19 `xrWeaveSnapWindowRectDXR` snaps a segmented window to the lattice of the
+screen that holds the majority of it at the proposed position, with the multi-screen hand-off's
+hysteresis (a clear 20 % margin held 0.5 s, so a drag across the seam does not flip lattices under
+the cursor). No API change.
+
+**Gate.** A caller gates on `extensionVersion >= 19` only to know it may expect parts; chaining
+the struct against an older runtime is harmless (skipped, stays zero = "use the base eyes").
+
 ## 6. Version history
 
 | Version | Change |
@@ -1009,6 +1080,10 @@ it keeps such an overlay off the wire there instead.
 | 18 | No new structure: on Android an overlay is **per submit** (composited only on a submit that chains one; before v18 the last imported overlay was composited on every later submit) and a chained overlay the engine cannot import **refuses the submit before the woven output is touched** — the v16 rule. An Android caller that hands its whole 2D over as the overlay gates on `extensionVersion >= 18`. The macOS engine still drops an unreadable overlay. |
 
 **v18 is the same gate on Android**, for the same kind of caller.
+| 19 | `XrWeaveOutputRectPartsDXR` + `XrWeaveScreenSegmentDXR` / `XrWeaveRectPartDXR` (out, per submit): a window spanning two 3D screens is woven per screen and the caller gets each screen's eyes and every weave rect cut at the seams; the drag snap follows the majority screen's lattice (§5g, #1884, ADR-047 Amendment 4). Windows service; `segmentCount` 0 elsewhere. |
+
+**v19 needs no gate to send**: an older runtime skips the struct and it stays zero, which reads as
+"one display processor, use the base eyes".
 
 **v16 is a gate for one kind of caller**: one whose overlay IS its 2D (a whole-page overlay)
 must not send it to an older desktop-Linux runtime, which would weave without it and return
@@ -1056,6 +1131,7 @@ implicit. §4c's entry point + struct settle it: **v9**.
 | DisplayXR Browser (Chromium fork) | GPU-process sync weave | Batch (v3) when the runtime reports spec ≥ 3; per-element legacy loop otherwise |
 | CEF weave host (Step A) | Browser-process sync | Legacy |
 | DisplayXR Browser on Android | Chromium GPU process → satellite compositor (ADR-036 D3) | Batch (v3/v7) — AHardwareBuffer handles + published window geometry |
+| DisplayXR Browser on two 3D screens (planned, #1884) | Chromium GPU process | Batch (v3) or v6 + `XrWeaveOutputRectPartsDXR` (v19): render each rect part from its screen's eyes |
 | DisplayXR Browser on desktop Linux (planned, #1699) | Chromium GPU process (GL/EGL) → comp_multi service | v10 dma-buf + `sync_file` fences; gate on spec ≥ 10. Move-synchronised Wayland drag: v12 woven origin (§5e), gate on spec ≥ 12 |
 
 When changing the header, byte-sync every consumer's vendored copy and rebuild it

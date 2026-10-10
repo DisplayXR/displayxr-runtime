@@ -126,3 +126,45 @@ from the other side of the wire. Decisions:
   single-screen box — sends nothing new and is composited byte for byte as before.
 
 Detail: `docs/architecture/comp-segments.md` § *Service / IPC path*.
+
+## Amendment 4 (2026-10-10): present-owner weave rects are segmented per screen
+
+The DisplayXR Browser does not reach any of the sites above: it is a present-owner on the
+`XR_DXR_weave` service path. It binds its HWND, submits pre-weave pixels plus window-relative
+rects, and composites the woven handback itself, with the eyes flowing back out to it. That site
+wove with the one session DP and returned one eye pair, so an inline-3D element straddling two
+panels was woven on the primary screen's lattice and rendered from the primary screen's viewer on
+both halves. Decisions:
+
+- **`weave_submit` segments the bound window exactly as the direct pipeline does.** Same opt-in
+  (`compositor_segments_enable`, the service's own screen list), same manager
+  (`comp_d3d11_segments`), same table (`comp_segments_compute` over the window's client area
+  with canvas = the whole window), same rules: each screen's DP weaves its segment with
+  canvas, viewport and scissor = the segment and its own present origin; flat 2D where a DP
+  cannot weave; the session's weave DP keeps the HWND and the primary screen. The manager is the
+  present-owner's own, made on the device its woven handback lives on (`sys->device`, where the
+  #1172 ingest DP is), the same rule as Amendment 1 (a segment DP lives where its target is).
+- **Only the window-canvas layouts are segmented**: the v3 batch (window-sized SBS scratch) and
+  the v6 N-view atlas. The legacy single-rect submit weaves one element-sized canvas per call and
+  stays single-DP. A rect is split implicitly: every pixel of it is woven by the screen it lands
+  on.
+- **The 2D overlay is composited after the per-screen weave** by the runtime's blit, not handed to
+  a DP: it is window-sized and no segment DP covers the whole window.
+- **Eyes out per screen: an `XR_DXR_weave` revision (spec v19).** `XrWeaveOutputRectPartsDXR`,
+  chained on `XrWeaveOutputDXR`, returns the window's segments (each with its screen's eyes in
+  that screen's display space, its physical size and whether it is woven) and every submitted
+  rect cut at the seams (`u_weave_rect_parts`: per part, the window rect, the rect-relative rect
+  and the on-screen rect). The table crosses the wire by value in an appended call,
+  `weave_get_segments` (the per-segment views' `xrt_segment_metrics`), fetched only when the
+  caller chains the struct; `weave_submit`'s reply is unchanged. The client cuts the rects
+  itself, so they cross the wire once. A caller that does not chain the struct, and every window
+  on one screen, sees exactly the pre-v19 behaviour.
+- **Drag snap follows the majority screen's lattice.** `xrWeaveSnapWindowRectDXR` asks the
+  segment DP of the screen holding the majority of the window at the PROPOSED position, with
+  Amendment 2's hysteresis (`comp_segments_owner_*`, 20 % margin held 0.5 s) kept separately
+  from the handle owner because nothing is rebuilt; it falls back to the panel DP when that
+  screen has no DP yet or its DP has no snap.
+
+The browser's half (rendering a straddling rect's two parts from two viewers) lives in
+`displayxr-browser-pvt`. Detail: `docs/architecture/comp-segments.md` § *Present-owners*;
+contract: `docs/specs/extensions/XR_DXR_weave.md` §5g.
