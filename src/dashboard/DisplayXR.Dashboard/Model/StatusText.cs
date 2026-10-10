@@ -218,7 +218,7 @@ public static class StatusText
     public static string? ApplyLabel(Screen s, DpList? dp) => (dp?.Screen(s.Key)?.Apply ?? s.Claim.Apply) switch
     {
         "live" => "applies live",
-        "next_session" => "applies to new sessions (service restart / app relaunch)",
+        "next-session" or "next_session" => "applies to new sessions (service restart / app relaunch)",
         null => null,
         var other => other,
     };

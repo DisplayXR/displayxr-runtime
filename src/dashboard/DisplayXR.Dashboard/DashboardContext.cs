@@ -106,16 +106,42 @@ public sealed class DashboardContext
         }
     }
 
-    public async Task LoadDpAsync()
+    public bool DpLoading { get; private set; }
+    private DateTime? _dpWhen;
+    private bool _dpReloadPending;
+
+    /// <summary>
+    /// <c>dp list --json</c>. Since the per-screen overrides it loads every
+    /// plug-in (a headless instance, ~10 s), so it is never polled: read when a
+    /// page that needs it is shown and the last read is older than
+    /// <paramref name="maxAge"/> (rapid page switching reuses it), on Refresh
+    /// and after a change (<paramref name="force"/>), one read at a time.
+    /// </summary>
+    public async Task LoadDpAsync(bool force = false, TimeSpan? maxAge = null)
     {
+        if (DpLoading)
+        {
+            // A change landed while an older read is in flight: read once more after it.
+            if (force) _dpReloadPending = true;
+            return;
+        }
+        if (!force && Dp is not null && _dpWhen is { } t && DateTime.Now - t < (maxAge ?? TimeSpan.FromSeconds(30))) return;
+        DpLoading = true;
+        Bump();
         try
         {
-            var r = await Cli.RunAsync("dp list --json", ActionTimeout);
-            if (r.Ok && DpList.TryParse(r.Stdout, out var list)) { Dp = list; DpError = null; }
+            var r = await Cli.RunAsync("dp list --json", InfoTimeout);
+            if (r.Ok && DpList.TryParse(r.Stdout, out var list)) { Dp = list; DpError = null; _dpWhen = DateTime.Now; }
             else DpError = r.Ok ? "Could not read 'displayxr-cli dp list --json'." : r.Summary;
         }
         catch (Exception ex) { DpError = ex.Message; DashboardLog.Error("dp list", ex); }
+        finally { DpLoading = false; }
         Bump();
+        if (_dpReloadPending)
+        {
+            _dpReloadPending = false;
+            await LoadDpAsync(force: true);
+        }
     }
 
     public async Task LoadPerfAsync(bool force)
@@ -193,7 +219,7 @@ public sealed class DashboardContext
             Bump();
         }
         if (area == "perf") await LoadPerfAsync(force: true);
-        if (area is "dp" or "screen-dp") await LoadDpAsync();
+        if (area is "dp" or "screen-dp") await LoadDpAsync(force: true);
         if (area == "runtime") await LoadInfoAsync(force: true);
     }
 

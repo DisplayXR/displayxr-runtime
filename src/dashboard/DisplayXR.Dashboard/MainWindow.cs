@@ -414,13 +414,14 @@ public sealed class MainWindow : Window
         {
             case "home":
                 _ = _ctx.LoadInfoAsync(force: true);
-                _ = _ctx.LoadDpAsync();
+                _ = _ctx.LoadDpAsync(force: true);
                 break;
             case "performance":
                 _ = _ctx.LoadPerfAsync(force: true);
                 break;
             case "developer":
-                _ = _ctx.LoadDpAsync();
+            case "displays":
+                _ = _ctx.LoadDpAsync(force: true);
                 break;
         }
         ShowToast("Refreshed");

@@ -24,6 +24,9 @@ public sealed class DisplaysPage : Page
     private readonly Dictionary<string, string> _launchNotes = new();
     private string? _dpKey; // the screen whose selector ran the last per-screen action
     private int _openDropDowns;
+    // The choice just made, shown until the re-read dp list reflects it (the
+    // re-read loads every plug-in, ~10 s): without it the combo would snap back.
+    private (string Key, int Index, DpList? Before)? _pending;
 
     protected override bool DeferRebuild => _openDropDowns > 0;
 
@@ -59,7 +62,7 @@ public sealed class DisplaysPage : Page
         var s = Ctx.Feed.Snapshot;
         if (s is null) return "none";
         var sb = new System.Text.StringBuilder(StatusText.Copy(s, includeSource: false));
-        sb.Append('|').Append(string.Join(";", _launchNotes)).Append('|').Append(Ctx.ActionRunning);
+        sb.Append('|').Append(string.Join(";", _launchNotes)).Append('|').Append(Ctx.ActionRunning).Append(Ctx.DpLoading);
         foreach (var x in s.Screens) sb.Append(x.Key).Append(x.Claim.Forced).Append(x.Claim.PreferredPlugin).Append(x.Claim.Apply);
         if (Ctx.Dp is { } dp)
         {
@@ -67,6 +70,7 @@ public sealed class DisplaysPage : Page
             if (dp.Screens is { } ds) foreach (var d in ds) sb.Append(d).Append(';');
         }
         if (Ctx.LastActionArea == "screen-dp") sb.Append(Ctx.LastAction).Append(Ctx.LastActionFailed);
+        sb.Append(_pending?.Key).Append(_pending?.Index).Append(Ctx.Dp?.GetHashCode());
         return sb.ToString();
     }
 
@@ -113,8 +117,19 @@ public sealed class DisplaysPage : Page
     /// </summary>
     private Control? DpRow(Screen s)
     {
+        if (s.Key is not null && Ctx.Dp is null && Ctx.DpLoading)
+        {
+            var wait = U.Text("Display processor: reading the registered plug-ins…", "meta");
+            wait.Margin = new Thickness(0, 6, 0, 0);
+            return wait;
+        }
         if (StatusText.DpSelector(s, Ctx.Dp) is not { } sel || s.Key is null) return null;
         string key = s.Key;
+        if (_pending is { } pend && (!ReferenceEquals(pend.Before, Ctx.Dp) && !Ctx.ActionRunning && !Ctx.DpLoading
+                                     || Ctx.LastActionArea == "screen-dp" && Ctx.LastActionFailed && !Ctx.ActionRunning))
+            _pending = null;
+        bool applying = _pending is { } p0 && p0.Key == key;
+        if (applying && _pending!.Value.Index < sel.Items.Count) sel = (sel.Items, _pending.Value.Index);
         var combo = new ComboBox
         {
             ItemsSource = sel.Items.Select(i => i.Label).ToList(),
@@ -136,12 +151,19 @@ public sealed class DisplaysPage : Page
             int i = combo.SelectedIndex;
             if (i < 0 || i == sel.Selected || i >= sel.Items.Count || Ctx.ActionRunning) return;
             _dpKey = key;
+            _pending = (key, i, Ctx.Dp);
             _ = Ctx.RunActionsAsync("screen-dp", StatusText.DpVerb(key, sel.Items[i]));
         };
         var label = U.Text("Display processor", "label");
         label.VerticalAlignment = VerticalAlignment.Center;
         var row = U.Flow(12, 4, label, combo);
-        if (StatusText.ForcedChip(s, Ctx.Dp) is { } forced) U.AddFlow(row, U.Chip(forced, Level.Warn), 12, 4);
+        if (applying)
+        {
+            var ap = U.Text("applying…", "meta");
+            ap.VerticalAlignment = VerticalAlignment.Center;
+            U.AddFlow(row, ap, 12, 4);
+        }
+        else if (StatusText.ForcedChip(s, Ctx.Dp) is { } forced) U.AddFlow(row, U.Chip(forced, Level.Warn), 12, 4);
         if (StatusText.ApplyLabel(s, Ctx.Dp) is { } apply)
         {
             var a = U.Text(apply, "meta");
