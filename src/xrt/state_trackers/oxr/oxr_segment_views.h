@@ -66,6 +66,19 @@ oxr_segment_views_win_entry_has_dp(const void *dp_factory_d3d11, const void *dp_
 }
 
 /*!
+ * The OpenGL half of @ref oxr_segment_views_win_entry_has_dp: the in-process
+ * GL compositor segments windows on Windows too (multi-screen M6), so a
+ * registry entry's `dp_factory_gl` also makes its screen count toward
+ * @ref oxr_segment_views_set_capacity. Kept separate so each backend's term
+ * is OR-ed in under its own compositor guard.
+ */
+static inline bool
+oxr_segment_views_win_entry_has_gl_dp(const void *dp_factory_gl)
+{
+	return dp_factory_gl != NULL;
+}
+
+/*!
  * The view count `PRIMARY_MULTIVIEW_DXR` reports: the device max per view set,
  * times the system's set capacity (@ref oxr_segment_views_set_capacity), capped
  * at @ref XRT_MAX_VIEWS. On a system that can never split a window (one screen

@@ -17,6 +17,9 @@
 #endif
 
 #include "util/comp_layer_accum.h"
+// Multi-screen #1883: the painted-partition type the repaint snapshot carries
+// (declarations only; the segment path itself is Windows-only).
+#include "util/comp_segments.h"
 // #1581 quad layers: the shared per-view camera (#1580) and the N-view
 // LEFT/RIGHT eye-visibility rule.
 #include "util/comp_layer_view_camera.h"
@@ -32,6 +35,12 @@
 // never links the transport, it only names itself the way the split paths do.
 #include "d3d/d3d_weave_placement.h"
 #include "comp_split_gate.h"
+// Multi-screen M6 (ADR-047 D2): a window spanning monitors is woven per
+// segment, each by its own screen's DP, and (M3) each segment gets its own
+// views — routed into the atlas as a mosaic.
+#include "comp_gl_segments.h"
+#include "util/comp_segments_gl.h"
+#include "util/comp_segments_route.h"
 #endif
 
 #include "xrt/xrt_device.h"
@@ -822,6 +831,10 @@ struct comp_gl_compositor
 		GLuint atlas_tex;
 		uint32_t present_w, present_h;
 		float last_dt;
+		//! #1883: the per-segment partition @ref atlas_tex was painted with
+		//! (count 0 = unrouted) — the segment crop reads it, on the app frame
+		//! and on every repaint of it.
+		struct comp_segments_content seg_content;
 
 		uint64_t count, ticks;       //!< Diagnostics.
 	} repaint;
@@ -889,6 +902,17 @@ struct comp_gl_compositor
 
 	// --- Display processor ---
 	struct xrt_display_processor_gl *display_processor;
+	/*!
+	 * Multi-screen M6 (ADR-047 Amendment 2): guards @ref display_processor
+	 * against the app thread's entry points (eye positions, display mode,
+	 * eye-tracking mode) while the weave swaps it for a windowless one when
+	 * another screen takes the window handle. The weave thread's own reads
+	 * need no lock: the swap happens on that thread.
+	 */
+	struct os_mutex dp_swap_mutex;
+	//! The session's eye-tracking mode, re-sent to a swapped-in primary DP.
+	bool eye_tracking_mode_set;
+	uint32_t eye_tracking_mode;
 	GLuint dp_crop_fbo;            //!< FBO for cropping atlas to content dims before DP
 	GLuint dp_input_texture;       //!< Intermediate texture at content dims for DP input
 	uint32_t dp_input_width;       //!< Current dp_input_texture width (0 = not allocated)
@@ -1079,6 +1103,27 @@ struct comp_gl_compositor
 	//! reports one. See gl_query_context_luid().
 	LUID gl_context_luid;
 	bool gl_context_luid_valid;
+
+	/*!
+	 * @name Multi-screen M6 + M3 (ADR-047 D2/D3, OpenGL)
+	 *
+	 * The segment manager is (re)built on the weave thread, with the GL
+	 * context current, the first weave after comp_gl_compositor_set_screens.
+	 * @ref seg_pub_mutex guards the manager pointer (the app thread asks it
+	 * for segment eyes), the published table and the routing.
+	 * @{
+	 */
+	struct comp_gl_segments *segments;
+	struct xrt_screen_list *seg_screens;             //!< heap copy, NULL = not handed over
+	struct xrt_system_compositor_info *seg_sys_info; //!< heap copy (the DP registry)
+	bool seg_rebuild;                                //!< a new list arrived: rebuild on the next weave
+	uint64_t seg_pinned_display_id;
+	struct os_mutex seg_pub_mutex;
+	struct xrt_segment_metrics seg_pub;               //!< the table the last weave took (count 0 = one view set)
+	struct xrt_segment_view_routing seg_route;        //!< the routing the last locate handed out
+	//! Change-only logging of the applied routing.
+	struct xrt_segment_view_routing seg_route_logged;
+	/*! @} */
 #endif
 };
 
@@ -3109,10 +3154,8 @@ gl_flatten_backdrop_2d(struct comp_gl_compositor *c, uint32_t dst_w, uint32_t ds
  * @param output_h    Output surface height
  */
 static void
-gl_crop_and_process_dp(struct comp_gl_compositor *c,
-                       GLuint atlas_tex,
-                       uint32_t output_w,
-                       uint32_t output_h)
+gl_crop_and_process_dp(
+    struct comp_gl_compositor *c, GLuint atlas_tex, uint32_t output_w, uint32_t output_h, bool seg_split)
 {
 	// Snapshot the caller's draw FBO — the DP must weave into whatever target
 	// the caller bound (window FBO 0, the shared-texture FBO, or the DComp
@@ -3150,7 +3193,9 @@ gl_crop_and_process_dp(struct comp_gl_compositor *c,
 
 	GLuint dp_tex = atlas_tex;
 
-	if (content_w != c->atlas_tex_width || content_h != c->atlas_tex_height) {
+	// Multi-screen M6: the segment path crops per segment from the atlas
+	// itself (below), so the whole-content crop would be wasted work.
+	if (!seg_split && (content_w != c->atlas_tex_width || content_h != c->atlas_tex_height)) {
 		// Content is smaller than atlas — need to crop.
 		// Lazily (re)create intermediate texture at content dims.
 		if (c->dp_input_width != content_w || c->dp_input_height != content_h) {
@@ -3209,6 +3254,40 @@ gl_crop_and_process_dp(struct comp_gl_compositor *c,
 		if (late_weave == 1) {
 			DwmFlush();
 		}
+	}
+#endif
+
+#ifdef XRT_OS_WINDOWS
+	if (seg_split && c->segments != NULL) {
+		/*
+		 * Multi-screen M6: the window spans screens — each segment is woven
+		 * by its own screen's DP into the bound target (the caller's draw
+		 * FBO: the window, or the DComp transit / readback FBO), with
+		 * viewport + scissor = the segment. The atlas holds the canvas
+		 * (= the window client area) at view resolution.
+		 */
+		struct comp_gl_segments_frame sf = {};
+		sf.src_texture = atlas_tex;
+		sf.view_width = eff_tile_w;
+		sf.view_height = eff_tile_h;
+		sf.tile_columns = eff_cols;
+		sf.tile_rows = eff_rows;
+		sf.src_format = GL_RGBA8;
+		sf.target_fbo = (uint32_t)caller_draw_fbo;
+		sf.target_width = output_w;
+		sf.target_height = output_h;
+		sf.canvas.x = 0;
+		sf.canvas.y = 0;
+		sf.canvas.w = output_w;
+		sf.canvas.h = output_h;
+		// #1883: crop each segment's views where this atlas painted them (the
+		// routing it was located for), not at the seam of the live window.
+		// The window path weaves only the atlas the repaint snapshot holds.
+		sf.content = &c->repaint.seg_content;
+		sf.transparent_background = c->transparent_background;
+		sf.primary_dp = c->display_processor;
+		comp_gl_segments_record(c->segments, &sf);
+		return;
 	}
 #endif
 
@@ -4857,6 +4936,119 @@ gl_compute_effective_layout(struct comp_gl_compositor *c)
 	}
 }
 
+#ifdef XRT_OS_WINDOWS
+/*!
+ * ADR-047 Amendment 2 hook: install @p dp as the session's primary DP (weave
+ * thread, c->mutex held, GL context current) and return the previous one for
+ * the segment manager to destroy. Re-sends the session-level state a new DP
+ * has not seen.
+ */
+static struct xrt_display_processor_gl *
+gl_segments_swap_primary_cb(void *userdata, struct xrt_display_processor_gl *dp)
+{
+	struct comp_gl_compositor *c = (struct comp_gl_compositor *)userdata;
+	os_mutex_lock(&c->dp_swap_mutex);
+	struct xrt_display_processor_gl *old = c->display_processor;
+	c->display_processor = dp;
+	os_mutex_unlock(&c->dp_swap_mutex);
+	if (dp != NULL) {
+		xrt_display_processor_gl_set_transparent_background(dp, c->transparent_background, false);
+		xrt_display_processor_gl_set_shared_texture_present(dp, c->has_shared_texture);
+		xrt_display_processor_gl_request_display_mode(dp, c->hardware_display_3d);
+		if (c->eye_tracking_mode_set) {
+			xrt_display_processor_gl_set_eye_tracking_mode(dp, c->eye_tracking_mode);
+		}
+	}
+	// A zone mask published to the old DP is gone with it; the new DP's zone
+	// caps are re-queried and the next publish starts fresh.
+	c->zone_published = false;
+	c->zone_dp_state = 0;
+	return old;
+}
+
+/*!
+ * Multi-screen M6: one metric update of the segment manager for this weave,
+ * and the M3 publish of the table it took. Only the plain whole-window weave
+ * of the compositor's own atlas segments: not a zero-copy frame (the atlas is
+ * the app's texture), not the shared-texture path, not a frame the Local2D /
+ * zones / mask composite drew, and not a present target whose size differs
+ * from the window's client area (the DComp transit is fixed-size).
+ *
+ * Caller holds c->mutex and has the GL context current.
+ *
+ * @return true when this frame takes the split path.
+ */
+static bool
+gl_segments_tick(struct comp_gl_compositor *c, bool eligible, uint32_t present_w, uint32_t present_h)
+{
+	struct comp_seg_rect win = {0, 0, 0, 0};
+	RECT rc;
+	POINT origin = {0, 0};
+	// Device px: every DisplayXR executable is per-monitor DPI aware (#1201),
+	// the same space the screen registry's monitor rects are in.
+	const bool have_win = c->hwnd != NULL && GetClientRect(c->hwnd, &rc) && rc.right > 0 && rc.bottom > 0 &&
+	                      ClientToScreen(c->hwnd, &origin);
+	if (have_win) {
+		win.x = origin.x;
+		win.y = origin.y;
+		win.w = (uint32_t)rc.right;
+		win.h = (uint32_t)rc.bottom;
+	}
+
+	bool seg_split = false;
+	if (eligible && have_win && c->seg_screens != NULL && c->display_processor != NULL && !c->has_shared_texture &&
+	    !c->zones_frame && !c->local_2d_last_frame && win.w == present_w && win.h == present_h) {
+		if (c->seg_rebuild || c->segments == NULL) {
+			// The app thread reads c->segments for eyes (M3): swap under the lock.
+			os_mutex_lock(&c->seg_pub_mutex);
+			if (c->seg_rebuild) {
+				comp_gl_segments_destroy(&c->segments);
+				c->seg_rebuild = false;
+			}
+			if (c->segments == NULL) {
+				c->segments = comp_gl_segments_create();
+				if (c->segments != NULL) {
+					// ADR-047 Amendment 2: the window follows the majority
+					// screen — sessions with a real window only.
+					struct comp_gl_segments_hwnd_hooks hooks = {};
+					hooks.hwnd = (void *)c->hwnd;
+					hooks.userdata = c;
+					hooks.swap_primary = gl_segments_swap_primary_cb;
+					comp_gl_segments_set_hwnd_hooks(c->segments, &hooks);
+					comp_gl_segments_set_screens(c->segments, c->seg_screens, c->seg_sys_info,
+					                             c->seg_pinned_display_id);
+				}
+			}
+			os_mutex_unlock(&c->seg_pub_mutex);
+		}
+		if (comp_gl_segments_enabled(c->segments)) {
+			const struct comp_seg_rect canvas = {0, 0, win.w, win.h};
+			const uint32_t mode_index =
+			    (c->xdev != NULL && c->xdev->hmd != NULL) ? c->xdev->hmd->active_rendering_mode_index : 0;
+			seg_split = comp_gl_segments_update(c->segments, &win, &canvas, mode_index);
+			// Every segment DP follows the session's 2D/3D mode, like the primary.
+			comp_gl_segments_set_display_mode(c->segments, c->hardware_display_3d);
+		}
+	}
+
+	/*
+	 * Multi-screen M3: publish the table this weave took, for the next
+	 * xrLocateViews to frame per-segment views from. Nothing is published
+	 * (count 0 = one view set) unless the window really is woven per segment.
+	 */
+	struct xrt_segment_metrics m;
+	memset(&m, 0, sizeof(m));
+	if (seg_split) {
+		const struct comp_seg_rect canvas = {0, 0, win.w, win.h};
+		(void)comp_gl_segments_get_metrics(c->segments, &win, &canvas, c->display_processor != NULL, &m);
+	}
+	os_mutex_lock(&c->seg_pub_mutex);
+	(void)comp_segments_publish(&c->seg_pub, &m);
+	os_mutex_unlock(&c->seg_pub_mutex);
+	return seg_split;
+}
+#endif // XRT_OS_WINDOWS
+
 /*!
  * #868 / #875: bind the present target, run the masked composite (or the plain
  * weave), and present. Shared by the app frame and the repaint replay.
@@ -4969,8 +5161,16 @@ gl_window_present(struct comp_gl_compositor *c, GLuint atlas_for_present, float 
 				        (unsigned long long)rp_ok, (unsigned long long)rp_no);
 			}
 		}
+		// Multi-screen M6: a window spanning monitors is woven per segment.
+		// Ticked on every weave (the DP lifecycle and the M3 publish need
+		// every frame), segmented only on the plain weave of our own atlas.
+		bool seg_split = false;
+#ifdef XRT_OS_WINDOWS
+		seg_split =
+		    gl_segments_tick(c, !composited && atlas_for_present == c->atlas_texture, present_w, present_h);
+#endif
 		if (!composited) {
-			gl_crop_and_process_dp(c, atlas_for_present, present_w, present_h);
+			gl_crop_and_process_dp(c, atlas_for_present, present_w, present_h, seg_split);
 		}
 	} else {
 		// No display processor: simple blit
@@ -5879,6 +6079,57 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 	// carry a previous frame's answer into a frame that paints nothing.
 	c->compose_active = false;
 
+	// Multi-screen M3: the routing the app's last xrLocateViews handed out,
+	// snapshotted once for this frame. A routed frame paints each tile as a
+	// mosaic (every segment's own view at its rect) and is never zero-copy.
+	struct xrt_segment_view_routing seg_route;
+	memset(&seg_route, 0, sizeof(seg_route));
+	bool seg_routed_frame = false;
+#ifdef XRT_OS_WINDOWS
+	os_mutex_lock(&c->seg_pub_mutex);
+	seg_route = c->seg_route;
+	os_mutex_unlock(&c->seg_pub_mutex);
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		const struct comp_layer *l = &c->layer_accum.layers[i];
+		if (l->data.type == XRT_LAYER_PROJECTION || l->data.type == XRT_LAYER_PROJECTION_DEPTH) {
+			seg_routed_frame = comp_segments_route_active(
+			    &seg_route, l->data.view_count, c->eff_cols * c->eff_rows, c->eff_tile_w, c->eff_tile_h);
+			break;
+		}
+	}
+	// One INFO line per applied-routing change (a move, a resize, a mode switch).
+	{
+		struct xrt_segment_view_routing shown;
+		memset(&shown, 0, sizeof(shown));
+		if (seg_routed_frame) {
+			shown = seg_route;
+		}
+		if (memcmp(&shown, &c->seg_route_logged, sizeof(shown)) != 0) {
+			c->seg_route_logged = shown;
+			if (seg_routed_frame) {
+				U_LOG_I(
+				    "segments: GL per-segment views routed — %u segment(s), tile %ux%u; [0] views %u+%u; [1] "
+				    "views %u+%u",
+				    seg_route.count, c->eff_tile_w, c->eff_tile_h, seg_route.first_view[0],
+				    seg_route.view_count[0], seg_route.count > 1 ? seg_route.first_view[1] : 0,
+				    seg_route.count > 1 ? seg_route.view_count[1] : 0);
+			} else {
+				U_LOG_I("segments: GL per-segment views no longer routed — one view set");
+			}
+		}
+	}
+#endif
+
+	// #1883: the partition this frame's atlas is painted with (routed: the
+	// routing it was located for), kept with the atlas for the segment crop.
+	struct comp_segments_content seg_content;
+	memset(&seg_content, 0, sizeof(seg_content));
+#ifdef XRT_OS_WINDOWS
+	if (seg_routed_frame) {
+		comp_segments_content_from_routing(&seg_route, &seg_content);
+	}
+#endif
+
 	// Zero-copy check: can we pass the app's swapchain directly to the DP?
 	bool zero_copy = false;
 	GLuint zc_texture = 0;
@@ -5890,7 +6141,7 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 			if (idx < c->xdev->rendering_mode_count)
 				mode = &c->xdev->rendering_modes[idx];
 		}
-		if (mode != NULL && c->layer_accum.layer_count == 1) {
+		if (mode != NULL && c->layer_accum.layer_count == 1 && !seg_routed_frame) {
 			struct comp_layer *layer = &c->layer_accum.layers[0];
 			if (layer->data.type == XRT_LAYER_PROJECTION ||
 			    layer->data.type == XRT_LAYER_PROJECTION_DEPTH) {
@@ -6214,7 +6465,32 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 		uint32_t view_count = layer->data.view_count;
 		if (view_count > c->eff_views) view_count = c->eff_views;
 		if (view_count == 0) view_count = 1;
-		for (uint32_t eye = 0; eye < view_count; eye++) {
+
+		/*
+		 * Multi-screen M3: a routed frame paints each tile as a MOSAIC —
+		 * every submitted view goes to its segment's tile, at that
+		 * segment's rect inside it (comp_segments_route_place, the mapping
+		 * the per-segment crop reads with), so cropping a segment out of
+		 * every tile yields exactly its own views. The tile's blend mode is
+		 * decided ONCE (#1598): every segment of a tile's first projection
+		 * layer is that tile's base. Zones are never routed.
+		 */
+		const bool routed = seg_routed_frame && !is_zone;
+		enum comp_layer_blend_mode routed_mode[XRT_MAX_VIEWS];
+		uint32_t draw_count = view_count;
+		if (routed) {
+			const uint32_t route_tiles = c->eff_cols * c->eff_rows;
+			for (uint32_t t = 0; t < route_tiles && t < XRT_MAX_VIEWS; t++) {
+				routed_mode[t] = comp_layer_tile_blend_mode(&tiles[t], layer->data.flags);
+			}
+			draw_count = layer->data.view_count < XRT_MAX_VIEWS ? layer->data.view_count : XRT_MAX_VIEWS;
+		}
+		for (uint32_t eye = 0; eye < draw_count; eye++) {
+			// The atlas tile this view lands in (its own, unrouted) and,
+			// routed, the segment rect inside it (tile px, top-left).
+			uint32_t tile_i = eye;
+			struct comp_seg_rect route_rect = {0, 0, 0, 0};
+			(void)route_rect; // read on Windows only (M3 routing)
 			// How this draw composites (#1621), resolved BEFORE the draw
 			// can bail out so "which layer is the tile's base" is a pure
 			// function of the layer LIST, not of a transient swapchain
@@ -6225,7 +6501,22 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 			// tile (a projection layer after it blends over it) but
 			// bypasses the first-layer gate.
 			enum comp_layer_blend_mode mode;
-			if (eye < XRT_MAX_VIEWS && is_zone) {
+			if (routed) {
+#ifdef XRT_OS_WINDOWS
+				struct comp_segments_route_slot slot;
+				if (!comp_segments_route_place(&seg_route, layer->data.view_count,
+					                       c->eff_cols * c->eff_rows, c->eff_tile_w, c->eff_tile_h,
+					                       eye, &slot) ||
+				    slot.tile >= XRT_MAX_VIEWS) {
+					continue; // past every segment's routed range
+				}
+				tile_i = slot.tile;
+				route_rect = slot.rect;
+				mode = routed_mode[tile_i];
+#else
+				continue;
+#endif
+			} else if (eye < XRT_MAX_VIEWS && is_zone) {
 				comp_layer_tile_mark_composited(&tiles[eye]);
 				mode = (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0
 				           ? COMP_LAYER_BLEND_STRAIGHT
@@ -6266,7 +6557,7 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 			// is that flip. Identity when eff_rows == 1.
 			uint32_t tbx, tby, tbw, tbh; // per-view tile box
 			{
-				u_tiling_view_origin_gl(eye, c->eff_cols, c->eff_rows, c->eff_tile_w, c->eff_tile_h,
+				u_tiling_view_origin_gl(tile_i, c->eff_cols, c->eff_rows, c->eff_tile_w, c->eff_tile_h,
 					                &tbx, &tby);
 				tbw = c->eff_tile_w;
 				tbh = c->eff_tile_h;
@@ -6296,6 +6587,14 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 					continue;
 				}
 				glViewport(zx, zy, zw, zh);
+			} else if (routed) {
+#ifdef XRT_OS_WINDOWS
+				// Multi-screen M3: the segment's rect inside the tile, in the
+				// tile's GL (bottom-left) coordinates. The fullscreen triangle
+				// is clipped to the viewport, so no scissor is needed.
+				const struct comp_seg_rect g = comp_segments_gl_flip(&route_rect, tbh);
+				glViewport((GLint)tbx + g.x, (GLint)tby + g.y, (GLsizei)g.w, (GLsizei)g.h);
+#endif
 			} else {
 				glViewport(tbx, tby, tbw, tbh);
 			}
@@ -6553,7 +6852,7 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 			// needed (the helper returns false). Both land in
 			// shared_present_fbo (distinct from the c->fbo the crop reuses).
 			if (!gl_composite_local_2d(c, atlas_for_present, c->shared_present_fbo, dp_w, dp_h, /*reuse_twod=*/false)) {
-				gl_crop_and_process_dp(c, atlas_for_present, dp_w, dp_h);
+				gl_crop_and_process_dp(c, atlas_for_present, dp_w, dp_h, /*seg_split=*/false);
 			}
 
 			// Bridge the woven (dp_w×dp_h) region into the app's shared
@@ -6633,7 +6932,7 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 			// publish to the DP happens once at end of layer_commit via
 			// gl_sync_zone_mask_to_dp, which consumes the resolved wish.
 			if (!gl_composite_local_2d(c, atlas_for_present, c->iosurface_present_fbo, dp_w, dp_h, /*reuse_twod=*/false)) {
-				gl_crop_and_process_dp(c, atlas_for_present, dp_w, dp_h);
+				gl_crop_and_process_dp(c, atlas_for_present, dp_w, dp_h, /*seg_split=*/false);
 			}
 		} else {
 			// No display processor: simple blit, no Y-flip.
@@ -6665,6 +6964,7 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 		// zero-copy path — there the atlas IS the app's own texture, which it
 		// redraws, so replaying it would weave whatever the app has since drawn.
 		c->repaint.atlas_tex = atlas_for_present;
+		c->repaint.seg_content = seg_content;
 		c->repaint.armed = !zero_copy;
 		// The HUD's dt is the APP's frame delta; a repaint reports the last
 		// real frame's, not a repaint-to-repaint interval.
@@ -6845,7 +7145,20 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 		xrt_display_processor_gl_clear_local_zone_mask(c->display_processor);
 		c->zone_published = false;
 	}
+#ifdef XRT_OS_WINDOWS
+	// Multi-screen M6: the segment DPs (and their GL objects) go first, on
+	// this context. No hooks: the primary DP is destroyed right below, so the
+	// window is not handed back to it.
+	comp_gl_segments_set_hwnd_hooks(c->segments, NULL);
+	comp_gl_segments_destroy(&c->segments);
+	free(c->seg_screens);
+	c->seg_screens = NULL;
+	free(c->seg_sys_info);
+	c->seg_sys_info = NULL;
+	os_mutex_destroy(&c->seg_pub_mutex);
+#endif
 	xrt_display_processor_gl_destroy(&c->display_processor);
+	os_mutex_destroy(&c->dp_swap_mutex);
 
 	// Destroy HUD
 	if (c->hud_texture) glDeleteTextures(1, &c->hud_texture);
@@ -7521,11 +7834,14 @@ comp_gl_compositor_request_display_mode(struct xrt_compositor *xc, bool enable_3
 
 	struct comp_gl_compositor *c = gl_comp(xc);
 
+	// Multi-screen M6: the weave may swap the primary DP (ADR-047 Amendment 2).
+	os_mutex_lock(&c->dp_swap_mutex);
+	bool ok = false;
 	if (c->display_processor != NULL) {
-		return xrt_display_processor_gl_request_display_mode(c->display_processor, enable_3d);
+		ok = xrt_display_processor_gl_request_display_mode(c->display_processor, enable_3d);
 	}
-
-	return false;
+	os_mutex_unlock(&c->dp_swap_mutex);
+	return ok;
 }
 
 void
@@ -7537,9 +7853,13 @@ comp_gl_compositor_set_eye_tracking_mode(struct xrt_compositor *xc, uint32_t mod
 
 	struct comp_gl_compositor *c = gl_comp(xc);
 
+	os_mutex_lock(&c->dp_swap_mutex);
+	c->eye_tracking_mode_set = true; // re-sent to a swapped-in primary DP (M6)
+	c->eye_tracking_mode = mode;
 	if (c->display_processor != NULL) {
 		xrt_display_processor_gl_set_eye_tracking_mode(c->display_processor, mode);
 	}
+	os_mutex_unlock(&c->dp_swap_mutex);
 }
 
 bool
@@ -7552,12 +7872,110 @@ comp_gl_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
 
 	struct comp_gl_compositor *c = gl_comp(xc);
 
-	if (c->display_processor == NULL) {
+	os_mutex_lock(&c->dp_swap_mutex);
+	bool ok = c->display_processor != NULL &&
+	          xrt_display_processor_gl_get_predicted_eye_positions(c->display_processor, out_eye_pos);
+	os_mutex_unlock(&c->dp_swap_mutex);
+	return ok;
+}
+
+void
+comp_gl_compositor_set_screens(struct xrt_compositor *xc,
+                               const struct xrt_screen_list *list,
+                               const struct xrt_system_compositor_info *info,
+                               uint64_t pinned_display_id)
+{
+#ifdef XRT_OS_WINDOWS
+	if (xc == NULL || list == NULL || info == NULL) {
+		return;
+	}
+	struct comp_gl_compositor *c = gl_comp(xc);
+	struct xrt_screen_list *copy = U_TYPED_CALLOC(struct xrt_screen_list);
+	struct xrt_system_compositor_info *info_copy = U_TYPED_CALLOC(struct xrt_system_compositor_info);
+	if (copy == NULL || info_copy == NULL) {
+		free(copy);
+		free(info_copy);
+		return;
+	}
+	*copy = *list;
+	*info_copy = *info;
+
+	// The weave (app thread's layer_commit and the repaint thread) runs under
+	// c->mutex; the manager is rebuilt there, with the GL context current, on
+	// the next weave — never here.
+	os_mutex_lock(&c->mutex);
+	c->seg_rebuild = true;
+	free(c->seg_screens);
+	c->seg_screens = copy;
+	free(c->seg_sys_info);
+	c->seg_sys_info = info_copy;
+	c->seg_pinned_display_id = pinned_display_id;
+	// ...and nothing may frame views from the old table meanwhile.
+	os_mutex_lock(&c->seg_pub_mutex);
+	memset(&c->seg_pub, 0, sizeof(c->seg_pub));
+	os_mutex_unlock(&c->seg_pub_mutex);
+	os_mutex_unlock(&c->mutex);
+#else
+	(void)xc;
+	(void)list;
+	(void)info;
+	(void)pinned_display_id;
+#endif
+}
+
+bool
+comp_gl_compositor_get_segment_metrics(struct xrt_compositor *xc, struct xrt_segment_metrics *out)
+{
+	if (out == NULL) {
 		return false;
 	}
+	memset(out, 0, sizeof(*out));
+#ifdef XRT_OS_WINDOWS
+	if (xc == NULL) {
+		return false;
+	}
+	struct comp_gl_compositor *c = gl_comp(xc);
+	os_mutex_lock(&c->seg_pub_mutex);
+	*out = c->seg_pub;
+	// The eyes are predicted NOW, per segment: the primary from the session's
+	// own DP, every other screen from its segment DP (guarded against the
+	// weave destroying it: the manager is swapped under this same lock).
+	for (uint32_t k = 0; k < out->count && k < XRT_MAX_SEGMENTS; k++) {
+		struct xrt_segment_metric *s = &out->seg[k];
+		if (s->is_primary) {
+			os_mutex_lock(&c->dp_swap_mutex);
+			s->have_eyes =
+			    c->display_processor != NULL &&
+			    xrt_display_processor_gl_get_predicted_eye_positions(c->display_processor, &s->eyes) &&
+			    s->eyes.valid;
+			os_mutex_unlock(&c->dp_swap_mutex);
+		} else {
+			s->have_eyes = comp_gl_segments_get_eyes(c->segments, s->screen_id, &s->eyes);
+		}
+	}
+	os_mutex_unlock(&c->seg_pub_mutex);
+	return out->count > 0;
+#else
+	(void)xc;
+	return false;
+#endif
+}
 
-	return xrt_display_processor_gl_get_predicted_eye_positions(
-		c->display_processor, out_eye_pos);
+void
+comp_gl_compositor_set_view_routing(struct xrt_compositor *xc, const struct xrt_segment_view_routing *routing)
+{
+#ifdef XRT_OS_WINDOWS
+	if (xc == NULL || routing == NULL) {
+		return;
+	}
+	struct comp_gl_compositor *c = gl_comp(xc);
+	os_mutex_lock(&c->seg_pub_mutex);
+	c->seg_route = *routing;
+	os_mutex_unlock(&c->seg_pub_mutex);
+#else
+	(void)xc;
+	(void)routing;
+#endif
 }
 
 bool
@@ -7707,6 +8125,10 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 	// earliest create failure.
 	os_mutex_init(&c->mutex);
 	os_thread_helper_init(&c->repaint_thread);
+	os_mutex_init(&c->dp_swap_mutex); // multi-screen M6 primary-DP swap
+#ifdef XRT_OS_WINDOWS
+	os_mutex_init(&c->seg_pub_mutex);
+#endif
 
 	mcp_capture_init(&c->mcp_capture);
 	mcp_capture_install(&c->mcp_capture);
