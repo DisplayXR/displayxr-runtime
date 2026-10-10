@@ -193,6 +193,69 @@ build_dp_registry(struct xrt_system_compositor_info *info)
 static void
 fill_display_desktop_info(struct xrt_system_compositor_info *info);
 
+/*!
+ * Display dashboard phase 7: a per-screen preference that forces the
+ * SYSTEM-DEFAULT screen to a plug-in other than the active one moves that
+ * screen's DP — the session's own (primary) DP — to the preferred plug-in too:
+ * its registry entry is flagged `primary_override` (what the registry-routed
+ * compositors pick for `COMP_DP_PRIMARY_MONITOR`) and the scalar
+ * `dp_factory_*` (what the scalar-routed in-process compositors use) follow it,
+ * API by API where it offers a factory. The head device, eye tracking and the
+ * rendering modes stay the active plug-in's — only a global `dp use` changes
+ * those.
+ *
+ * Run after the registry and the desktop rect are built — at instance create
+ * (a new in-process session; the service at start) and on every refresh. A
+ * refresh only changes what the NEXT primary DP is made from: the service never
+ * swaps a live primary DP (plugin-discovery §4.2), so for the system-default
+ * screen a preference applies at the next session / service start.
+ */
+static void
+apply_default_screen_preference(struct xrt_system_compositor_info *info)
+{
+	struct xrt_dp_factory_registry *reg = &info->dp_registry;
+	for (uint32_t i = 0; i < reg->entry_count && i < XRT_DP_REGISTRY_MAX_ENTRIES; i++) {
+		reg->entries[i].primary_override = false;
+	}
+	if (reg->entry_count == 0) {
+		return;
+	}
+	struct target_screens_system sys;
+	target_screens_system_from_info(info, &sys);
+	const struct xrt_dp_registry_entry *def = target_screens_pick_default(reg, info->active_plugin_id, &sys, NULL);
+	if (def == NULL || !def->forced || strcmp(def->plugin_id, info->active_plugin_id) == 0) {
+		return;
+	}
+	struct xrt_dp_registry_entry *e = &reg->entries[def - reg->entries];
+	e->primary_override = true;
+	if (e->dp_factory_vk != NULL) {
+		info->dp_factory_vk = e->dp_factory_vk;
+	}
+	if (e->dp_factory_d3d11 != NULL) {
+		info->dp_factory_d3d11 = e->dp_factory_d3d11;
+	}
+	if (e->dp_factory_d3d12 != NULL) {
+		info->dp_factory_d3d12 = e->dp_factory_d3d12;
+	}
+	if (e->dp_factory_gl != NULL) {
+		info->dp_factory_gl = e->dp_factory_gl;
+	}
+	if (e->dp_factory_metal != NULL) {
+		info->dp_factory_metal = e->dp_factory_metal;
+	}
+	// Once per (monitor, plug-in): this runs on every client connect.
+	static uint64_t logged_monitor = 0;
+	static char logged_plugin[64] = {0};
+	if (logged_monitor != e->monitor_id || strcmp(logged_plugin, e->plugin_id) != 0) {
+		logged_monitor = e->monitor_id;
+		(void)snprintf(logged_plugin, sizeof(logged_plugin), "%s", e->plugin_id);
+		U_LOG_W(
+		    "per-screen preference: the system-default screen 0x%016llx is woven by '%s' (forced); the head "
+		    "device, eye tracking and rendering modes stay the active plug-in '%s''s",
+		    (unsigned long long)e->monitor_id, e->plugin_id, info->active_plugin_id);
+	}
+}
+
 /*
  *
  * Plug-in display info: startup pull + post-startup refresh.
@@ -523,6 +586,8 @@ refresh_display_processors_cb(struct xrt_system_compositor_info *info)
 	// against; the registry from instance create still stands. Known geometry
 	// (client connect / compositor create, #342) keeps rebuilding as before.
 	if (!swapped && refreshed == DISPLAY_INFO_REFRESH_UNKNOWN) {
+		// The scalars were just re-filled from the active plug-in.
+		apply_default_screen_preference(info);
 		if (locked) {
 			os_mutex_unlock(&g_display_info_mutex);
 		}
@@ -537,6 +602,7 @@ refresh_display_processors_cb(struct xrt_system_compositor_info *info)
 	if (refreshed == DISPLAY_INFO_REFRESH_APPLIED) {
 		fill_display_desktop_info(info);
 	}
+	apply_default_screen_preference(info);
 	if (locked) {
 		os_mutex_unlock(&g_display_info_mutex);
 	}
@@ -975,6 +1041,10 @@ out:
 		// sim_display expressing no preference — resolves to the primary
 		// monitor, which is the right answer for both readings.
 		fill_display_desktop_info(&xsysc->info);
+
+		// Display dashboard phase 7: a per-screen preference on the
+		// system-default screen moves the primary DP with it.
+		apply_default_screen_preference(&xsysc->info);
 
 		// Publish the system to xrt_instance::enumerate_displays only now that
 		// its display info, registry and desktop rect are all built.

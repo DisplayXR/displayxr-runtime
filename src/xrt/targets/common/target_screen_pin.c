@@ -159,19 +159,24 @@ first_with_id(const struct target_screen_candidate *c, uint32_t n, const char *i
 }
 
 int
-target_screen_pick(const struct target_screen_candidate *cands,
-                   uint32_t count,
-                   const char *pin_plugin,
-                   const char *preferred,
-                   enum target_screen_pick_reason *out_reason,
-                   bool *out_pin_unclaimed)
+target_screen_pick_ex(const struct target_screen_candidate *cands,
+                      uint32_t count,
+                      const char *pin_plugin,
+                      const char *screen_pref,
+                      const char *preferred,
+                      enum target_screen_pick_reason *out_reason,
+                      bool *out_pin_unclaimed,
+                      bool *out_pref_unclaimed)
 {
 	enum target_screen_pick_reason reason = TARGET_SCREEN_PICK_NONE;
 	int pick = -1;
 	bool pin_unclaimed = false;
+	bool pref_unclaimed = false;
+	const bool have_pin = pin_plugin != NULL && pin_plugin[0] != '\0';
+	const bool have_pref = screen_pref != NULL && screen_pref[0] != '\0';
 
 	if (cands != NULL && count > 0) {
-		if (pin_plugin != NULL && pin_plugin[0] != '\0') {
+		if (have_pin) {
 			// A pin is typed by hand: its plug-in id matches
 			// case-insensitively, like its monitor name.
 			pick = first_with_id(cands, count, pin_plugin, true);
@@ -179,6 +184,17 @@ target_screen_pick(const struct target_screen_candidate *cands,
 				reason = TARGET_SCREEN_PICK_PIN;
 			} else {
 				pin_unclaimed = true;
+			}
+		}
+		if (have_pref) {
+			// Looked up even when a pin decided, so a preference whose
+			// plug-in has no claim on the monitor is always reported.
+			const int p = first_with_id(cands, count, screen_pref, true);
+			if (p < 0) {
+				pref_unclaimed = true;
+			} else if (pick < 0) {
+				pick = p;
+				reason = TARGET_SCREEN_PICK_SCREEN_PREF;
 			}
 		}
 		if (pick < 0) {
@@ -205,8 +221,9 @@ target_screen_pick(const struct target_screen_candidate *cands,
 			}
 			reason = TARGET_SCREEN_PICK_CONFIDENCE;
 		}
-	} else if (pin_plugin != NULL && pin_plugin[0] != '\0') {
-		pin_unclaimed = true;
+	} else {
+		pin_unclaimed = have_pin;
+		pref_unclaimed = have_pref;
 	}
 
 	if (out_reason != NULL) {
@@ -215,7 +232,21 @@ target_screen_pick(const struct target_screen_candidate *cands,
 	if (out_pin_unclaimed != NULL) {
 		*out_pin_unclaimed = pin_unclaimed;
 	}
+	if (out_pref_unclaimed != NULL) {
+		*out_pref_unclaimed = pref_unclaimed;
+	}
 	return pick;
+}
+
+int
+target_screen_pick(const struct target_screen_candidate *cands,
+                   uint32_t count,
+                   const char *pin_plugin,
+                   const char *preferred,
+                   enum target_screen_pick_reason *out_reason,
+                   bool *out_pin_unclaimed)
+{
+	return target_screen_pick_ex(cands, count, pin_plugin, NULL, preferred, out_reason, out_pin_unclaimed, NULL);
 }
 
 bool
@@ -240,6 +271,64 @@ target_screen_active_decides_every_monitor(const char *active_id,
 		if (pin >= 0 && !name_eq(pins->pin[pin].plugin_id, active_id)) {
 			return false; // a pin names another plug-in for this monitor
 		}
+		if (mons[i].screen_pref != NULL && mons[i].screen_pref[0] != '\0' &&
+		    !name_eq(mons[i].screen_pref, active_id)) {
+			return false; // a per-screen preference names another plug-in
+		}
 	}
 	return true;
+}
+
+void
+target_screen_pnp_code(uint16_t manufacturer_id, char out[4])
+{
+	const uint16_t v = (uint16_t)((manufacturer_id >> 8) | (manufacturer_id << 8)); // big-endian spec value
+	const int c0 = ((v >> 10) & 0x1F) + 'A' - 1;
+	const int c1 = ((v >> 5) & 0x1F) + 'A' - 1;
+	const int c2 = (v & 0x1F) + 'A' - 1;
+	out[0] = (c0 >= 'A' && c0 <= 'Z') ? (char)c0 : '?';
+	out[1] = (c1 >= 'A' && c1 <= 'Z') ? (char)c1 : '?';
+	out[2] = (c2 >= 'A' && c2 <= 'Z') ? (char)c2 : '?';
+	out[3] = '\0';
+}
+
+static void
+key_base(const struct target_screen_key_input *m, char *out, size_t cap)
+{
+	char pnp[4];
+	target_screen_pnp_code(m->manufacturer_id, pnp);
+	(void)snprintf(out, cap, "%s-%04X-%08X", pnp, (unsigned)m->product_id, (unsigned)m->serial);
+}
+
+void
+target_screen_keys_build(const struct target_screen_key_input *in, uint32_t n, char (*out)[TARGET_SCREEN_KEY_MAX])
+{
+	if (in == NULL || out == NULL) {
+		return;
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		char base[TARGET_SCREEN_KEY_MAX];
+		key_base(&in[i], base, sizeof(base));
+		bool qualify = in[i].serial == 0;
+		for (uint32_t j = 0; j < n && !qualify; j++) {
+			if (j == i) {
+				continue;
+			}
+			char other[TARGET_SCREEN_KEY_MAX];
+			key_base(&in[j], other, sizeof(other));
+			qualify = strcmp(base, other) == 0;
+		}
+		const char *dev = in[i].device_name;
+		// Windows GDI names carry the `\\.\` device namespace; the key
+		// keeps only `DISPLAYn`, so it can be typed in any shell.
+		if (dev != NULL && strncmp(dev, "\\\\.\\", 4) == 0) {
+			dev += 4;
+		}
+		if (qualify && dev != NULL && dev[0] != '\0') {
+			const int room = (int)(TARGET_SCREEN_KEY_MAX - 2 - strlen(base));
+			(void)snprintf(out[i], TARGET_SCREEN_KEY_MAX, "%s@%.*s", base, room > 0 ? room : 0, dev);
+		} else {
+			(void)snprintf(out[i], TARGET_SCREEN_KEY_MAX, "%s", base);
+		}
+	}
 }
