@@ -7623,8 +7623,23 @@ vk_app_submit_window_open(const struct comp_vk_native_compositor *c)
 
 #ifdef VK_MIDFRAME_FILL
 /*!
- * #1905 kill switch: fill at panel rate while the app is MID-FRAME (Android).
- * DXR_MIDFRAME_FILL / `debug.dxr.midframe_fill` — "0" disables. Default ON.
+ * #1905 opt-in: fill at panel rate while the app is MID-FRAME (Android).
+ * DXR_MIDFRAME_FILL / `debug.dxr.midframe_fill` — must be "1" to enable.
+ * Default OFF.
+ *
+ * Why it is OFF by default. Mid-frame fills put a runtime submit on the
+ * repaint queue while the app is submitting on its own — and on Adreno both
+ * land on ONE GSL context, but only the runtime's submits are serialised (by
+ * c->mutex); the app's own vkQueueSubmit calls are not, and cannot be from
+ * here. The collision corrupts the context timestamp and the NEXT submit
+ * fails with VK_ERROR_INITIALIZATION_FAILED. When that next submit is the
+ * runtime's, comp_vk_native_queue_submit_retry recovers it; when it is the
+ * APP's, the app's frame is lost silently — earthview lost 12 of its own
+ * submits in 30 s under forced fills — and an app that waits a fence on such
+ * a submit would hang. So until app-side submits are serialised with the
+ * fill's (a process-wide queue-lock layer, or a second VkDevice giving the
+ * runtime its own GSL context), more fills mid-frame means more of these, and
+ * the feature stays opt-in for measurement.
  *
  * Why it exists. A GPU-bound Android app is never between frames: it is
  * either inside xrEndFrame (app_frame_in_progress) or rendering its next one,
@@ -7644,31 +7659,34 @@ vk_app_submit_window_open(const struct comp_vk_native_compositor *c)
  *   - every fill yields to a posted app frame (weave_hand.pending, re-checked
  *     under the lock) and holds c->mutex across its own GPU wait (no
  *     fence-park; see dxr_midframe_fill_park for why).
- * Off restores the prior gating. (The layer_stage publish stays — it is the
- * same frame, published under the lock instead of written in place.)
+ * Off (the default) is the prior gating. (The layer_stage publish stays
+ * either way — it is the same frame, published under the lock instead of
+ * written in place.)
  */
 static bool
 dxr_midframe_fill_enabled(void)
 {
 	static int on = -1;
 	if (on < 0) {
-		on = 1;
+		on = 0;
 		const char *e = getenv("DXR_MIDFRAME_FILL");
 		if (e != NULL && e[0] != '\0') {
-			on = (e[0] == '0') ? 0 : 1;
+			on = (e[0] == '1') ? 1 : 0;
 		}
 #ifdef XRT_OS_ANDROID
 		else {
 			char sp[PROP_VALUE_MAX] = {0};
 			if (__system_property_get("debug.dxr.midframe_fill", sp) > 0 && sp[0] != '\0') {
-				on = (sp[0] == '0') ? 0 : 1;
+				on = (sp[0] == '1') ? 1 : 0;
 			}
 		}
 #endif
 		U_LOG_W(
-		    "#1905: mid-frame fill %s — the repaint loop %s fill at panel rate while the app "
-		    "is mid-frame (DXR_MIDFRAME_FILL / debug.dxr.midframe_fill)",
-		    on ? "ON" : "OFF", on ? "WILL" : "will NOT");
+		    "#1905: mid-frame fill %s — the repaint loop %s fill at panel rate while the app is "
+		    "mid-frame. Default OFF: until app submits are serialised with the fill's (shared Adreno "
+		    "GSL context), mid-frame fills can fail the APP's own vkQueueSubmit. Opt in with "
+		    "DXR_MIDFRAME_FILL=1 / setprop debug.dxr.midframe_fill 1",
+		    on ? "ON (opt-in)" : "OFF (default)", on ? "WILL" : "will NOT");
 	}
 	return on == 1;
 }
@@ -7764,7 +7782,7 @@ dxr_midframe_fill_park(void)
 /*!
  * #1905: does the mid-frame schedule own this tick?
  *
- * Keyed on the kill switch, #1196 single weave ownership (the served-weave
+ * Keyed on the opt-in switch, #1196 single weave ownership (the served-weave
  * stamps the rule paces off only exist there), the #1257 partition NOT being
  * engaged (it owns its own schedule), and the FORCE probe off (a probe keeps
  * the old path so it stays comparable). Deliberately NOT keyed on the gate
