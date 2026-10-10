@@ -281,6 +281,68 @@ TEST_CASE("per-screen preference: the claim-source shortcut loads the others for
 	CHECK(target_screen_active_decides_every_monitor("leia-sr", nullptr, &none, mons, 2));
 }
 
+TEST_CASE("per-screen candidates: every plug-in that claimed the monitor, in source order", "[target][screen_pin]")
+{
+	// Two monitors. leia-sr (ProbeOrder 50, active) claims only the laptop;
+	// sim-display (ProbeOrder 200) claims both at FALLBACK. A third source
+	// (vendor2) claims nothing here.
+	const uint64_t laptop = 0x1111, ds1 = 0x2222;
+	const uint64_t leia_mon[] = {laptop};
+	const uint32_t leia_conf[] = {100};
+	const uint64_t sim_mon[] = {laptop, ds1};
+	const uint32_t sim_conf[] = {10, 10};
+	const target_screen_source_claims sources[] = {
+	    {"leia-sr", true, leia_mon, leia_conf, 1},
+	    {"vendor2", false, nullptr, nullptr, 0},
+	    {"sim-display", false, sim_mon, sim_conf, 2},
+	};
+	target_screen_candidate out[4];
+	uint32_t src[4];
+	uint32_t claim[4];
+
+	// The laptop: two claimants, in source order, with their confidences.
+	REQUIRE(target_screen_collect_candidates(sources, 3, laptop, out, src, claim, 4) == 2);
+	CHECK(std::string(out[0].plugin_id) == "leia-sr");
+	CHECK(out[0].confidence == 100);
+	CHECK(out[0].is_active);
+	CHECK(src[0] == 0);
+	CHECK(claim[0] == 0);
+	CHECK(std::string(out[1].plugin_id) == "sim-display");
+	CHECK(out[1].confidence == 10);
+	CHECK_FALSE(out[1].is_active);
+	CHECK(src[1] == 2);
+	CHECK(claim[1] == 0);
+
+	// DS1: only sim-display claimed it (its second claim).
+	REQUIRE(target_screen_collect_candidates(sources, 3, ds1, out, src, claim, 4) == 1);
+	CHECK(std::string(out[0].plugin_id) == "sim-display");
+	CHECK(src[0] == 2);
+	CHECK(claim[0] == 1);
+
+	// The list feeds the winner rule unchanged: a preference for sim on the
+	// laptop wins, one for leia-sr on DS1 is unclaimed there.
+	REQUIRE(target_screen_collect_candidates(sources, 3, laptop, out, nullptr, nullptr, 4) == 2);
+	target_screen_pick_reason why;
+	CHECK(target_screen_pick_ex(out, 2, nullptr, "sim-display", nullptr, &why, nullptr, nullptr) == 1);
+	CHECK(why == TARGET_SCREEN_PICK_SCREEN_PREF);
+	bool pref_unclaimed = false;
+	REQUIRE(target_screen_collect_candidates(sources, 3, ds1, out, nullptr, nullptr, 4) == 1);
+	CHECK(target_screen_pick_ex(out, 1, nullptr, "leia-sr", nullptr, &why, nullptr, &pref_unclaimed) == 0);
+	CHECK(pref_unclaimed);
+
+	// One claim per source per monitor, the cap, an unknown monitor, NULLs.
+	const uint64_t dup_mon[] = {ds1, ds1};
+	const uint32_t dup_conf[] = {50, 90};
+	const target_screen_source_claims dup[] = {{"dup", false, dup_mon, dup_conf, 2}};
+	REQUIRE(target_screen_collect_candidates(dup, 1, ds1, out, nullptr, claim, 4) == 1);
+	CHECK(out[0].confidence == 50);
+	CHECK(claim[0] == 0);
+	CHECK(target_screen_collect_candidates(sources, 3, laptop, out, nullptr, nullptr, 1) == 1);
+	CHECK(target_screen_collect_candidates(sources, 3, 0x9999, out, nullptr, nullptr, 4) == 0);
+	CHECK(target_screen_collect_candidates(nullptr, 3, laptop, out, nullptr, nullptr, 4) == 0);
+	CHECK(target_screen_collect_candidates(sources, 3, laptop, nullptr, nullptr, nullptr, 4) == 0);
+}
+
 TEST_CASE("screen key: PNP-PROD-SERIAL, qualified on a zero serial or a collision", "[target][screen_key]")
 {
 	// "AUO" packed as the EDID stores it (little-endian): 0x06AF -> bytes AF 06.

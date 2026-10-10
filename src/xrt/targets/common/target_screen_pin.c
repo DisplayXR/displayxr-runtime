@@ -332,3 +332,41 @@ target_screen_keys_build(const struct target_screen_key_input *in, uint32_t n, c
 		}
 	}
 }
+
+uint32_t
+target_screen_collect_candidates(const struct target_screen_source_claims *sources,
+                                 uint32_t source_count,
+                                 uint64_t monitor_id,
+                                 struct target_screen_candidate *out,
+                                 uint32_t *out_source,
+                                 uint32_t *out_claim,
+                                 uint32_t max)
+{
+	uint32_t n = 0;
+	if (sources == NULL || out == NULL) {
+		return 0;
+	}
+	for (uint32_t s = 0; s < source_count && n < max; s++) {
+		const struct target_screen_source_claims *src = &sources[s];
+		if (src->monitor_ids == NULL || src->confidences == NULL) {
+			continue;
+		}
+		for (uint32_t c = 0; c < src->count; c++) {
+			if (src->monitor_ids[c] != monitor_id) {
+				continue;
+			}
+			out[n].plugin_id = src->plugin_id != NULL ? src->plugin_id : "";
+			out[n].confidence = src->confidences[c];
+			out[n].is_active = src->is_active;
+			if (out_source != NULL) {
+				out_source[n] = s;
+			}
+			if (out_claim != NULL) {
+				out_claim[n] = c;
+			}
+			n++;
+			break; // one claim per source per monitor
+		}
+	}
+	return n;
+}

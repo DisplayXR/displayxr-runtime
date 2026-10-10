@@ -173,6 +173,38 @@ target_screen_active_decides_every_monitor(const char *active_id,
                                            const struct target_screen_monitor *mons,
                                            uint32_t count);
 
+/*!
+ * One claim source's `probe_displays` claims, flattened for
+ * @ref target_screen_collect_candidates: parallel arrays, one entry per claim.
+ */
+struct target_screen_source_claims
+{
+	const char *plugin_id;       //!< The source's plug-in id.
+	bool is_active;              //!< It is the active plug-in.
+	const uint64_t *monitor_ids; //!< Claimed monitor per claim.
+	const uint32_t *confidences; //!< Confidence per claim (parallel to @ref monitor_ids).
+	uint32_t count;              //!< Claims in the arrays.
+};
+
+/*!
+ * Every source's claim on @p monitor_id, in source order (ascending
+ * ProbeOrder) — the candidate list @ref target_screen_pick_ex decides over,
+ * and the set of plug-ins that can drive that monitor (display dashboard: the
+ * per-screen selector's options). One claim per source per monitor (its
+ * first). @p out_source / @p out_claim (may be NULL) receive, per candidate,
+ * the source index and the claim index within that source.
+ *
+ * @return the number of candidates written (at most @p max).
+ */
+uint32_t
+target_screen_collect_candidates(const struct target_screen_source_claims *sources,
+                                 uint32_t source_count,
+                                 uint64_t monitor_id,
+                                 struct target_screen_candidate *out,
+                                 uint32_t *out_source,
+                                 uint32_t *out_claim,
+                                 uint32_t max);
+
 /*
  *
  * Stable screen key (display dashboard phase 7).
