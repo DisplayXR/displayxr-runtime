@@ -46,6 +46,16 @@ cli_cmd_probe(int argc, const char **argv);
 int
 cli_cmd_status(int argc, const char **argv);
 
+struct xrt_status_snapshot;
+
+/*!
+ * Build the HEADLESS status snapshot in this process (an instance + system,
+ * no compositor — what a process starting now would get). Shared by `status`
+ * and `dp list`'s `screens[]`.
+ */
+void
+cli_status_build_headless(struct xrt_status_snapshot *out);
+
 int
 cli_cmd_clients(int argc, const char **argv);
 

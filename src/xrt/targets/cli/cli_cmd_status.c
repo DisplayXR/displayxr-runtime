@@ -190,6 +190,12 @@ status_build_headless(struct xrt_status_snapshot *out)
 	cli_query_teardown(&h);
 }
 
+void
+cli_status_build_headless(struct xrt_status_snapshot *out)
+{
+	status_build_headless(out);
+}
+
 //! Say why the snapshot is headless — on stderr, so stdout stays the snapshot.
 static void
 note_headless(xrt_result_t why)
