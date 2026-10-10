@@ -20,5 +20,6 @@
   <ItemGroup>
     <None Include="Data\*.json" CopyToOutputDirectory="PreserveNewest" />
     <None Include="..\fixtures\*.ndjson" Link="Data\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\fixtures\*.json" Link="Data\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

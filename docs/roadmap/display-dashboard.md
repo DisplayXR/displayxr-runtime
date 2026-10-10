@@ -263,7 +263,9 @@ WINDOWS  1 client
 Avalonia 11, the vendor dashboard's toolset and visual language: a left navigation rail
 with badges, cards, chips and badges). It replaces the ImGui Control Panel, which stays in
 the installer until its removal PR. Pages: **Home** (the Overview below), **Displays**,
-**Windows**, **Performance**, **Developer**; the header carries the source pill
+**Windows**, **Components** (what is plugged in, by role: display processors, the workspace
+controller and how it is launched, present owners, input providers, the conversion module,
+a stereo camera source, diagnostics clients), **Performance**, **Developer**; the header carries the source pill
 (`source: service · gen t/s` or headless), Refresh and Copy diagnostics (the snapshot
 JSON). Build / run / debug and the exact feed cadence: [`src/dashboard/README.md`](../../src/dashboard/README.md).
 The mockup below predates it and still describes the content; the desktop map is an

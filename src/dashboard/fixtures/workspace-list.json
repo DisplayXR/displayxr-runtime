@@ -1,0 +1,11 @@
+{
+  "active_id": "workspace-host",
+  "controllers": [
+    { "id": "workspace-host", "display_name": "Workspace Host", "vendor": "Example Vendor", "version": "3.1.0",
+      "binary": "C:\\Program Files\\Example\\workspace-host.exe", "registered": true, "connected": true, "pid": 5120,
+      "launch": { "mode": "auto", "hotkey": "Ctrl+Space", "source": "default" } },
+    { "id": "other-controller", "display_name": "Other Controller", "vendor": "Another Vendor", "version": "0.4.2",
+      "binary": "C:\\Program Files\\Another\\other-controller.exe", "registered": true, "connected": false, "pid": null,
+      "launch": { "mode": "auto", "hotkey": null, "source": "user" } }
+  ]
+}

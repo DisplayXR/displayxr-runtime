@@ -69,7 +69,7 @@ public class ComponentsTests
         var wc = Section(all, "workspace_controller");
         Assert.Equal(2, wc.Items.Count); // both registered; the connected one matched, not listed twice
         var host = wc.Items.Single(i => i.Name == "Workspace Host");
-        Assert.Contains(("connected", Level.Ok), host.Chips);
+        Assert.Contains(("connected (pid 5120)", Level.Ok), host.Chips);
         Assert.Contains("Actions: toggle, launcher", host.Lines);
         var other = wc.Items.Single(i => i.Name == "Other Controller");
         Assert.Contains(("registered, not running", Level.Plain), other.Chips);

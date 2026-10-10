@@ -418,6 +418,7 @@ public sealed class MainWindow : Window
                 break;
             case "components":
                 _ = _ctx.LoadInfoAsync(force: true);
+                _ = _ctx.LoadWorkspaceAsync(force: true);
                 break;
             case "performance":
                 _ = _ctx.LoadPerfAsync(force: true);

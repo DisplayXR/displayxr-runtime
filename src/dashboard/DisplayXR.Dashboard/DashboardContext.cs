@@ -106,6 +106,44 @@ public sealed class DashboardContext
         }
     }
 
+    public WorkspaceList? Workspace { get; private set; }
+    public bool WorkspaceLoading { get; private set; }
+    /// <summary>The CLI has no <c>workspace list</c> verb (predates phase 8): the launch row stays hidden.</summary>
+    public bool WorkspaceUnsupported { get; private set; }
+    private DateTime? _wsWhen;
+    private bool _wsReloadPending;
+
+    /// <summary><c>workspace list --json</c>: on Components show when older than 30 s, forced after a change.</summary>
+    public async Task LoadWorkspaceAsync(bool force = false)
+    {
+        if (WorkspaceLoading) { if (force) _wsReloadPending = true; return; }
+        if (!force && _wsWhen is { } t && DateTime.Now - t < TimeSpan.FromSeconds(30)) return;
+        WorkspaceLoading = true;
+        Bump();
+        try
+        {
+            var r = await Cli.RunAsync("workspace list --json", InfoTimeout);
+            if (r.Started && !r.TimedOut && WorkspaceList.TryParse(r.Json, out var ws))
+            {
+                Workspace = ws;
+                WorkspaceUnsupported = false;
+            }
+            else if (r.Started && !r.TimedOut)
+            {
+                WorkspaceUnsupported = true; // unknown verb / no JSON: an older CLI
+            }
+            _wsWhen = DateTime.Now;
+        }
+        catch (Exception ex) { DashboardLog.Error("workspace list", ex); }
+        finally { WorkspaceLoading = false; }
+        Bump();
+        if (_wsReloadPending)
+        {
+            _wsReloadPending = false;
+            await LoadWorkspaceAsync(force: true);
+        }
+    }
+
     public bool DpLoading { get; private set; }
     private DateTime? _dpWhen;
     private bool _dpReloadPending;
@@ -224,6 +262,7 @@ public sealed class DashboardContext
         }
         if (area == "perf") await LoadPerfAsync(force: true);
         if (area is "dp" or "screen-dp") await LoadDpAsync(force: true);
+        if (area == "workspace") await LoadWorkspaceAsync(force: true);
         if (area == "runtime") await LoadInfoAsync(force: true);
     }
 

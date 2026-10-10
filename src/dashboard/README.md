@@ -13,8 +13,16 @@ the sibling `displayxr-cli.exe`, rendering its JSON.
 | Home | the status feed; `info --json` once per show and on Refresh; `dp list --json`; `selftest --json` on click | `runtime activate`, `dp reset` |
 | Displays | the status feed (screens, desktop map); `dp list --json` for the per-screen selector | `dp use <id> --screen <key>`, `dp reset --screen <key>` |
 | Windows | the status feed (clients) | — |
+| Components | the status feed (clients by class); `info --json`; `workspace list --json` | `workspace set <id> --hotkey <combo>` / `--no-hotkey` / `--mode auto\|disabled`, `workspace launch <id>` |
 | Performance | `perf list --json`, `info --json` (adapters) | `perf set` / `perf reset` |
 | Developer | `dp list --json` | `dp use <id>`, `dp reset` (machine-wide; admin) |
+
+**Components** groups what is plugged into the runtime by ROLE, never by product:
+display processors, the workspace controller (its launch hotkey / mode / "Launch now",
+phase 8, hidden when the CLI has no `launch` block), present owners, input providers and
+the rig role, the 2D->3D conversion module, a stereo camera source (only when `info`
+reports one) and diagnostics clients. Names are shown verbatim from the components'
+own registration.
 
 ## Feed cadence (ADR-051 D5)
 
@@ -68,7 +76,9 @@ shortcut "DisplayXR Dashboard".
 - `--fixture <file.ndjson>` replays snapshots from a file instead of `status --watch`
   (one line every 2 s, looping) and simulates the per-screen `dp` verbs in memory, so the
   live-service pages can be laid out without a service that answers. Fixtures and their
-  generator: `src/dashboard/fixtures/` (`two-panels`, `stress-16x32`, `empty-headless`).
+  generator: `src/dashboard/fixtures/` (`two-panels`, `stress-16x32`, `components`,
+  `empty-headless`). A `workspace-list.json` beside the fixture simulates the
+  `workspace list|set|launch` verbs in memory.
 - Log: `%LOCALAPPDATA%\DisplayXR\dashboard.log` — lifecycle, child starts / exits, and
   every exception (unhandled AppDomain / TaskScheduler / Dispatcher handlers log and keep
   going). The Developer page shows its path and the session's error count.

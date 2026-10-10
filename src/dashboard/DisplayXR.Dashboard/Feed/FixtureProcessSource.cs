@@ -34,6 +34,8 @@ public sealed class FixtureProcessSource : IProcessSource
     private readonly Dictionary<string, string> _preferred = new();
     private readonly List<(string Key, string Device, string Name, string? Plugin)> _screens = new();
     private readonly List<(string Id, string Name)> _plugins = new();
+    // workspace-list.json beside the fixture: the phase-8 `workspace` verbs, simulated.
+    private readonly JsonObject? _workspace;
     public static readonly TimeSpan Interval = TimeSpan.FromSeconds(2);
 
     public FixtureProcessSource(string path, IProcessSource real)
@@ -53,7 +55,10 @@ public sealed class FixtureProcessSource : IProcessSource
             }
         }
         catch (Exception ex) { DashboardLog.Warn($"fixture: {ex.Message}"); }
-        DashboardLog.Info($"fixture mode: {_lines.Length} line(s) from {path}; {_screens.Count} keyed screen(s)");
+        string ws = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(path)) ?? ".", "workspace-list.json");
+        try { if (File.Exists(ws)) _workspace = JsonNode.Parse(File.ReadAllText(ws)) as JsonObject; }
+        catch (Exception ex) { DashboardLog.Warn($"fixture workspace: {ex.Message}"); }
+        DashboardLog.Info($"fixture mode: {_lines.Length} line(s) from {path}; {_screens.Count} keyed screen(s); workspace {(_workspace is null ? "absent" : "simulated")}");
     }
 
     public IWatchProcess StartWatch(Action<string> onLine, Action<int?> onExit)
@@ -101,6 +106,8 @@ public sealed class FixtureProcessSource : IProcessSource
     {
         if (arguments == "status --json" && _lines.Length > 0)
             return Task.FromResult(new CliResult(0, Apply(_lines[0]), "", false, null));
+        if (_workspace is not null && arguments.StartsWith("workspace ", StringComparison.Ordinal))
+            return Task.FromResult(Workspace(arguments.Split(' ', StringSplitOptions.RemoveEmptyEntries)));
         if (_screens.Count > 0 && arguments.StartsWith("dp ", StringComparison.Ordinal))
             return Task.FromResult(Dp(arguments.Split(' ', StringSplitOptions.RemoveEmptyEntries)));
         return _real.RunAsync(arguments, timeout, cancel);
@@ -144,6 +151,39 @@ public sealed class FixtureProcessSource : IProcessSource
                 if (which == "all") _preferred.Clear();
                 else _preferred.Remove(which);
                 return new CliResult(0, $"Screen {which}: automatic display-processor selection", "", false, null);
+            }
+            return new CliResult(2, "", $"fixture: unsupported '{string.Join(' ', a)}'", false, null);
+        }
+    }
+
+    private CliResult Workspace(string[] a)
+    {
+        lock (_gate)
+        {
+            if (a is [_, "list", "--json"]) return new CliResult(0, _workspace!.ToJsonString(), "", false, null);
+            JsonObject? Find(string id) => _workspace!["controllers"]?.AsArray()
+                .OfType<JsonObject>().FirstOrDefault(c => c["id"]?.GetValue<string>() == id.Trim('"'));
+            if (a is [_, "set", var sid, .. var rest] && Find(sid) is { } c && c["launch"] is JsonObject l)
+            {
+                if (rest is ["--hotkey", var combo])
+                {
+                    if (!Model.Hotkey.TryParse(combo.Trim('"'), out var hk, out var err))
+                        return new CliResult(2, "", $"workspace set: bad hotkey: {err}", false, null);
+                    l["hotkey"] = hk.ToString();
+                }
+                else if (rest is ["--no-hotkey"]) l["hotkey"] = null;
+                else if (rest is ["--mode", "auto" or "disabled"]) l["mode"] = rest[1];
+                else return new CliResult(2, "", "workspace set: bad arguments", false, null);
+                l["source"] = "user";
+                return new CliResult(0, $"Workspace controller '{sid}' updated (live).", "", false, null);
+            }
+            if (a is [_, "launch", var lid] && Find(lid) is { } lc)
+            {
+                if (lc["launch"]?["mode"]?.GetValue<string>() == "disabled")
+                    return new CliResult(1, "", "workspace launch: launching is disabled", false, null);
+                lc["connected"] = true;
+                lc["pid"] = 9999;
+                return new CliResult(0, $"Launched '{lid}'.", "", false, null);
             }
             return new CliResult(2, "", $"fixture: unsupported '{string.Join(' ', a)}'", false, null);
         }
