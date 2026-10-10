@@ -209,6 +209,15 @@ service_orchestrator_request_hotkey_suspend(bool suspend);
 enum service_child_mode
 service_orchestrator_get_workspace_mode(void);
 
+/*!
+ * Desktop Linux only: SERVICE_HOTKEY_MOD_* bits → the controller-key modifier
+ * bits of `ipc_server_input_queue_push_controller_key` (bit0 Shift, bit1 Ctrl,
+ * bit2 Alt; no Win bit), used to forward the launch chord to a running
+ * controller. Exposed for unit tests.
+ */
+uint32_t
+service_orchestrator_controller_key_mods(uint32_t hotkey_mods);
+
 #ifdef __cplusplus
 }
 #endif
