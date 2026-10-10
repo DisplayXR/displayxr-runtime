@@ -1093,6 +1093,9 @@ extern char **environ;
 #ifdef XRT_OS_LINUX_DESKTOP
 #include "service_hotkey_linux.h"
 #include <stdio.h>
+#ifdef SERVICE_HAVE_CONTROLLER_KEY_QUEUE
+#include "server/ipc_server_input_queue.h" // ipc_server_input_queue_push_controller_key
+#endif
 #endif
 
 
@@ -1456,8 +1459,8 @@ apply_workspace_mode(enum service_child_mode mode)
  * while a controller is registered, its mode is not disabled and it has a
  * hotkey (Windows parity: no controller, no grab). Unlike Windows (#344) the
  * grab stays armed while the controller runs: a Wayland client cannot grab a
- * chord, so a running controller learns of presses from the extension's
- * `Activated` signal instead (see the registration spec, Linux section).
+ * chord, so a press while the controller runs is forwarded to it as a
+ * controller key (forward_hotkey_to_controller; registration spec, Linux).
  */
 static void
 rearm_hotkey(void)
@@ -1468,6 +1471,53 @@ rearm_hotkey(void)
 	snprintf(combo, sizeof(combo), "%s", armed ? s_launch.hotkey_text : "");
 	pthread_mutex_unlock(&s_lock);
 	service_hotkey_linux_arm(combo);
+}
+
+/*!
+ * The controller-key modifier bits of ipc_server_input_queue_push_controller_key
+ * (bit0 Shift, bit1 Ctrl, bit2 Alt) from SERVICE_HOTKEY_MOD_* bits. That
+ * encoding has no Win/Super bit: a Win+ combo forwards without it.
+ */
+uint32_t
+service_orchestrator_controller_key_mods(uint32_t hotkey_mods)
+{
+	uint32_t m = 0;
+	if (hotkey_mods & SERVICE_HOTKEY_MOD_SHIFT) {
+		m |= 1u << 0;
+	}
+	if (hotkey_mods & SERVICE_HOTKEY_MOD_CTRL) {
+		m |= 1u << 1;
+	}
+	if (hotkey_mods & SERVICE_HOTKEY_MOD_ALT) {
+		m |= 1u << 2;
+	}
+	return m;
+}
+
+/*!
+ * A press of the launch combo while the controller runs: hand it to the
+ * controller as a key (its dismiss / toggle chord — a Wayland client cannot
+ * grab the chord itself).
+ *
+ * TODO(integration with feat/linux-workspace-compositor): the controller-key
+ * queue (ipc_server_input_queue_push_controller_key, thread-safe, Windows VK
+ * codes) lives on that branch. Defining SERVICE_HAVE_CONTROLLER_KEY_QUEUE
+ * (service/CMakeLists.txt, Linux block) turns this on; the body is the one
+ * call below.
+ */
+static void
+forward_hotkey_to_controller(void)
+{
+	pthread_mutex_lock(&s_lock);
+	const bool has = s_launch.has_hotkey;
+	const struct service_hotkey hk = s_launch.hotkey;
+	pthread_mutex_unlock(&s_lock);
+	if (!has || hk.vk == 0) {
+		return;
+	}
+#ifdef SERVICE_HAVE_CONTROLLER_KEY_QUEUE
+	ipc_server_input_queue_push_controller_key(hk.vk, service_orchestrator_controller_key_mods(hk.mods));
+#endif
 }
 
 //! Hotkey worker thread: a press of the launch combo.
@@ -1484,9 +1534,9 @@ hotkey_activated(void)
 		return;
 	}
 	if (running) {
-		// The controller owns its dismiss: it sees the same press through the
-		// extension's Activated signal.
+		// The controller owns its dismiss: forward the chord to it.
 		OL(U_LOGGING_INFO, "Launch hotkey: workspace controller already running");
+		forward_hotkey_to_controller();
 		return;
 	}
 	spawn_workspace();

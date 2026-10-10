@@ -358,12 +358,14 @@ it resident on such a desktop).
 
 **While the controller runs.** Windows uninstalls the hook while the controller runs
 because the controller registers its own toggle chord (#344). A Wayland client cannot
-grab a chord, so on Linux the grab **stays armed** and a running controller receives the
-press as the extension's `Activated(u timestamp)` signal (subscribe on the session bus:
-sender `org.displayxr.WindowGeometry`, path `/org/displayxr/WorkspaceHotkey`, interface
-`org.displayxr.WorkspaceHotkey1`) — that is its dismiss/toggle chord. The service ignores
-a press while the controller runs. On X11 without the extension the service holds the grab,
-so a controller there binds its own dismiss key inside its window.
+grab a chord, so on Linux the grab **stays armed**. A press while the controller runs is
+**forwarded to it by the service** as a controller key over IPC (the configured combo's
+virtual-key code and modifiers, `ipc_server_input_queue_push_controller_key`; modifier bits
+bit0 Shift, bit1 Ctrl, bit2 Alt — no Win bit), through either backend (extension or X11
+grab). That is its dismiss/toggle chord. The extension's `Activated(u timestamp)` signal
+(sender `org.displayxr.WindowGeometry`, path `/org/displayxr/WorkspaceHotkey`, interface
+`org.displayxr.WorkspaceHotkey1`) carries the same press; a controller should act on ONE of
+the two — the forwarded key is the contract, the signal is informational.
 
 **App discovery directories (Linux).** The registered-mode `.displayxr.json` drop-in
 directories (`displayxr-app-manifest.md` §2.2 / §5) on Linux, scanned in this order, the
