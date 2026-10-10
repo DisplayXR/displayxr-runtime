@@ -301,6 +301,26 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   element's `type` and `next`; reference: `cube_handle_d3d11_win/xr_session.cpp`). Ref:
   `XR_DXR_display_info.h` v14 block, `docs/specs/vendor/eye-tracking-modes.md`.
 
+- **INV-2.9 (advisory) — Ease every mode switch through `dxr::ModeSwitch`.** The runtime
+  switches a rendering mode in **one frame**: the atlas recipe, the DP's weave-vs-flat choice and
+  the switchable lens follow the mode the moment it lands (ADR-028), on every platform and every
+  graphics API. It never ramps the stereo disparity; that is app content. An app that calls
+  `xrRequestDisplayRenderingModeDXR` straight from a key press therefore snaps between full
+  parallax and flat. Route V / 0-8 through displayxr-common's `mode_switch.h`. Call
+  `dxr::ModeSwitch::step(dt, want, modeCount, modeViewCounts, currentMode, steadyIpd)` once per
+  frame, submit the returned `ipd` as the rig's `ipdFactor` (zones apps multiply each zone's
+  `ipdFactor` by it, with `steadyIpd = 1`), and call the request only on the frame it returns
+  `fire`. The sequencer flattens **before** requesting 2D, and requests 3D **before** growing
+  the depth back. Windows `XrSessionManager` apps call `XrSessionUpdateModeSwitch()`, a wrapper
+  over the same function.
+  - Wrong: `if (vPressed) xrRequestDisplayRenderingModeDXR(session, next);`
+  - Right: `test_apps/handle/cube_handle_metal_macos/main.mm` (search `ModeSwitch::step`);
+    zones: `test_apps/handle/cube_zones_metal_macos/main.mm` (`g_modeRamp`).
+  - Contract and wiring: displayxr-common README, *Smooth 2D↔3D transitions*.
+    `DXR_TEST_MODE_TOGGLE_S=<s>` makes the in-tree macOS cube apps toggle 3D↔2D by themselves
+    every `<s>` seconds and log each ramp frame (`ModeSwitch trace:`), so you can verify the ramp
+    without pressing keys.
+
 ---
 
 ## 3. Views — the locate-views gotcha
