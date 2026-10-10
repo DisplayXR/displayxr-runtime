@@ -98,7 +98,7 @@ Camera-to-display pairing is vendor-internal (e.g., a vendor may bundle display 
 - [x] Define `xrt_dp_factory_registry` struct (monitor ID → per-API factory set + confidence + plugin id + serial), on `xrt_system_compositor_info` (runtime v1.9.0).
 - [x] Populate registry at system init: load all plug-ins, run `probe_displays`, resolve claims, assign factories — `target_instance.c::build_dp_registry` (runtime v1.9.0).
 - [ ] **(Phase 3)** Modify compositor creation to look up DP factory from registry by monitor (instead of scalar `xsysc->info.dp_factory_*`) — see [Phase 3 design decisions](#phase-3-design-decisions).
-- [ ] Per-display override configuration (force sim_display on a specific monitor) — generalize the global `PreferredPlugin` (#378) to `PreferredPlugin\<monitor-key>`.
+- [x] Per-display override configuration (force sim_display on a specific monitor) — generalize the global `PreferredPlugin` (#378) to `PreferredPlugin\<monitor-key>`. **Shipped** as the per-screen display-processor preference (display dashboard phase 7): `displayxr-cli dp use <id> --screen <key>`, stable key `<PNP>-<PROD>-<SERIAL>[@<device>]`, env > per-user `settings.json` > HKLM `DisplayProcessors\PreferredPlugin\<key>`; see `docs/roadmap/display-dashboard.md` §12.
 - [ ] **External dep (vendor weaver)** — three tiers (see [Phase 3 design decisions](#phase-3-design-decisions)): **Tier 1** `EXTERNAL_ROUTING` flag (#111 §1–5; needed for *all* multi-display, incl. hosted/workspace); **Tier 2** per-display weaver binding (any 2+ same-vendor displays); **Tier 3** external phase origin for windowless sub-rects (standalone handle/texture spanning). Tier 1 is specced; Tiers 2–3 are the substantive asks.
 
 **HWND ownership and phase snapping:**

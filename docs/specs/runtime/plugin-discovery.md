@@ -99,6 +99,22 @@ plug-in does **not** claim, so the sim-display `FALLBACK` backstop and
 future multi-vendor routing are unaffected. `PreferredPlugin` (§2.1) is
 resolved first and outranks both.
 
+**Per-screen preference (display dashboard phase 7).** A per-screen
+preference (`displayxr-cli dp use <id> --screen <key>`; env
+`DXR_PREFERRED_PLUGIN_PER_SCREEN` > per-user `settings.json` > HKLM
+`DisplayProcessors\PreferredPlugin\<key>`) outranks, for that one monitor,
+the global `PreferredPlugin`, the active-plug-in rule and confidence — only a
+`DXR_SCREEN_PLUGIN` pin outranks it. It wins when its plug-in is loaded and
+claimed the monitor at **any** confidence (sim-display's `FALLBACK` claim
+included); otherwise it is ignored with one WARN and the monitor resolves as
+above. The entry is marked `forced` with its source. On the system-default
+screen it also moves the primary DP (`primary_override`, scalars follow); the
+head device stays the active plug-in's. The service re-reads the preference on
+every re-probe (§4.2) and recreates a changed **secondary** screen's segment
+DPs; the primary DP never swaps live, so the primary screen's choice applies at
+the next session / service start. Key format, store and the hot/next-session
+matrix: `docs/roadmap/display-dashboard.md` §12.
+
 ---
 
 ## 2. Windows: registry-driven discovery

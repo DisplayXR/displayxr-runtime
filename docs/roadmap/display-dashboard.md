@@ -356,6 +356,7 @@ enable is a shared vote that `destroy` does not withdraw); config resolve at mos
 | **4** | Control Panel: tabs, long-lived `--watch` child, Displays + Windows pages, desktop map, Overview summary line | 2 |
 | **5** ✅ landed | MCP `get_status_snapshot` (session-free, returns `displayxr-cli status --json` verbatim) | 2 |
 | **6** | the vendor plug-in fills the cell from the SDK query; "Open in vendor" | 3 + §9.1–9.2 |
+| **7** ✅ landed | per-screen display-processor preference (§12): stable screen `key`; `u_setting_get_preferred_plugin_for_screen` (env / per-user / HKLM); the resolver rule; `claim.forced` / `preferred_plugin` / `preferred_source` / `apply` + `CLAIM_FORCED`; `dp use|reset --screen`, `dp list` `screens[]`; DIAG `system_request_display_reprobe`; the service recreates a changed screen's segment DPs on re-probe; `tests_target_screen_pin`, `tests_u_setting_per_screen` | 2 |
 
 Phases 1–3 are runtime PRs with CI coverage (`tests_ipc_proto.py` for the appended
 messages, a `tests_status_snapshot` unit test over a synthetic registry, the headless
@@ -364,11 +365,107 @@ sim_display box. Nothing in 0–5 waits on the vendor.
 
 ## 11. Non-goals
 
-- Changing claims from the dashboard (per-screen `PreferredPlugin` is a separate,
-  unimplemented roadmap item; the global override stays on the Overview tab).
 - Per-screen settings with provenance: that is the vendor dashboard's model and stays
   there; the runtime's own settings keep the Performance / Developer tabs.
 - Inter-display pose or a space-graph view (display spatial model, #46).
 - A web UI: the snapshot is the contract, so one can be added later without touching the
   service.
 - Any action that wakes a camera or votes on a lens.
+
+## 12. Per-screen display-processor preference (phase 7)
+
+"Two Leia displays, sim-display on one and Leia on the other" — a per-screen override of
+the claim resolution. Landed in phase 7; it lifts the §11 non-goal. The dashboard writes
+the preference through the same store the CLI does and shows the result in the snapshot.
+
+### 12.1 Screen key
+
+Every screen has a `key` that survives a reboot, unlike the per-boot `monitor_id`:
+
+```
+<PNP>-<PROD>-<SERIAL>            e.g.  AUO-B194-0000ABCD
+<PNP>-<PROD>-<SERIAL>@<device>   when the EDID serial is 0, or two screens would collide
+```
+
+`<PNP>` is the 3-letter EDID manufacturer code, `<PROD>` the product code as 4 upper-case
+hex digits, `<SERIAL>` the EDID serial as 8. `<device>` is the OS device name — Windows
+`DISPLAYn` (the GDI name without its `\\.\` namespace, so the key needs no shell escaping),
+the Linux connector, the macOS display UUID. On the two-panel rig both serials are 0:
+`AUO-B194-00000000@DISPLAY1`, `ACR-0001-00000000@DISPLAY5`. Derivation:
+`target_screen_keys_build` (`targets/common/target_screen_pin.h`), unit-tested.
+
+It appears as `screens[*].key` in the snapshot, `claims[*].key` in
+`displays --claims --json` (additive, `schema` stays 1) and `screens[*].key` in
+`dp list --json`. Treat it as an opaque string.
+
+### 12.2 Store and precedence
+
+| tier | where | who writes it |
+|---|---|---|
+| 1 env | `DXR_PREFERRED_PLUGIN_PER_SCREEN="<key>=<id>;<key>=<id>"` | a launcher / harness |
+| 2 user | `"preferred_plugin_per_screen": { "<key>": "<id>" }` in `%LOCALAPPDATA%\DisplayXR\settings.json` (POSIX `$XDG_CONFIG_HOME/displayxr/settings.json`) | the dashboard, `dp use --screen` (no admin) |
+| 3 machine | `HKLM\Software\DisplayXR\DisplayProcessors\PreferredPlugin`, value `<key>` (REG_SZ; Windows only) | `dp use --screen --machine` (admin) |
+
+Env beats user beats machine, the `u_setting` philosophy. The accessor is
+`u_setting_get_preferred_plugin_for_screen(key, buf, cap, &source)`: allow-listed by
+construction (it reads those three places and nothing else), read once per process, every
+failure = "not set". The service re-reads the stores before each display re-probe.
+`perf reset` keeps the object; `dp reset --screen all` removes it.
+
+### 12.3 Resolution
+
+Per monitor, `target_plugin_resolve_displays` picks (`target_screen_pick_ex`): a
+`DXR_SCREEN_PLUGIN` pin, then **the per-screen preference**, then the global
+`PreferredPlugin`, then the active plug-in, then confidence / ProbeOrder. The preference
+wins when its plug-in is loaded and its `probe_displays` claimed that monitor at any
+confidence — sim-display claims every monitor at `FALLBACK`, so "sim on this screen"
+always resolves. The active plug-in's "wins every monitor it claims" rule (#1521) yields
+to it (logged). A preference for a plug-in that is not loaded or did not claim the
+monitor is ignored with one WARN
+(`plugin loader: per-screen preference '<key>' -> '<id>' ignored: <reason>`) and the
+monitor resolves normally. The registry entry carries `forced` / `forced_source` and the
+preference itself (`preferred_plugin` / `preferred_source`, honoured or not).
+
+On the system-default screen the preference also moves that screen's DP — the session's
+own (primary) DP: its entry is flagged `primary_override` (what
+`xrt_dp_registry_primary_entry` returns) and the scalar `dp_factory_*` follow it. The head
+device, eye tracking and rendering modes stay the active plug-in's; only the global
+`dp use` changes those.
+
+### 12.4 Snapshot fields
+
+`xrt_status_screen.key` (JSON `screens[*].key`), and on `xrt_status_claim`:
+
+| JSON | values |
+|---|---|
+| `claim.forced` | `true` when the preference won the screen |
+| `claim.preferred_plugin` | the preference, or `null` |
+| `claim.preferred_source` | `"user"` / `"machine"` / `"env"`, or `null` |
+| `claim.apply` | `"live"` / `"next-session"` (§12.5) |
+
+Warning `CLAIM_FORCED` (info): "Plug-in forced by a per-screen preference (<source>)" —
+the dashboard's amber state.
+
+### 12.5 Hot vs next session
+
+| screen / process | what happens after `dp use --screen` | `apply` |
+|---|---|---|
+| a secondary screen, service path (an IPC app's window spanning onto it) | the CLI asks the service to re-probe (`system_request_display_reprobe`, DIAG); the service re-reads the stores, rebuilds the registry and hands the new screens to every client's segment manager; a screen whose plug-in changed gets its segment DP released and recreated with the new plug-in on the next frames, with the lifecycle's hysteresis (WARN `segments: screen 0x… now claimed by '<id>' (was '<old>') — segment DP recreated`) | `live` |
+| the system-default (primary) screen, service path | the registry changes at once, but the session's own DP never swaps live (plugin-discovery §4.2): the next session the service starts on it — or the service's next start — weaves with the new plug-in | `next-session` |
+| any screen, in-process app | in-process apps do not re-probe: every new session resolves the stores at instance create | `next-session` |
+
+No reachable service (none running, or an elevated prompt on Windows): the CLI says
+"applies on next launch".
+
+### 12.6 CLI
+
+```
+displayxr-cli dp use <id> --screen <key> [--machine]   # per-user; --machine = HKLM (admin)
+displayxr-cli dp reset --screen <key>|all [--machine]
+displayxr-cli dp list [--json]                          # + screens[]
+displayxr-cli displays --claims [--json]                # + key / forced / forced_source / preferred_plugin
+```
+
+`dp list --json` `screens[]`: `{key, device_name, friendly_name, effective_plugin,
+preferred_plugin|null, preferred_source|null, forced, apply}`, from the headless snapshot
+(what a process starting now resolves).
