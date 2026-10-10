@@ -588,6 +588,9 @@ on_lattice(int32_t anchor, int32_t v, uint32_t q)
 static NSCursor *
 resize_cursor_for(unsigned e)
 {
+	// The frame-resize cursors need the macOS 15 SDK at COMPILE time (CI
+	// runners may build against an older one) and macOS 15 at run time.
+#if defined(MAC_OS_VERSION_15_0) && __MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_VERSION_15_0
 	if (@available(macOS 15.0, *)) {
 		NSUInteger pos = 0; // closed enum: build the bits, cast once
 		if (e & EDGE_T) {
@@ -605,6 +608,7 @@ resize_cursor_for(unsigned e)
 		return [NSCursor frameResizeCursorFromPosition:(NSCursorFrameResizePosition)pos
 		                                  inDirections:NSCursorFrameResizeDirectionsAll];
 	}
+#endif
 	// Pre-15: no public diagonal cursors; a corner shows the horizontal one.
 	if (e & (EDGE_L | EDGE_R)) {
 		return [NSCursor resizeLeftRightCursor];
