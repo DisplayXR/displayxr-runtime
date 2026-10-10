@@ -1353,7 +1353,7 @@ struct xrt_plugin_iface
 	 *     with `out_screen_left/top` = the binding's desktop origin.
 	 *   - @p window_handle is NULL on desktop Linux: a segment DP is
 	 *     windowless and gets its phase from `set_present_origin` (ADR-033).
-	 *     On Windows (ADR-047 Amendments 2 + 4) it is the session's real HWND
+	 *     On Windows (ADR-047 Amendments 2 + 5) it is the session's real HWND
 	 *     for the DP of the screen holding the MAJORITY of the window and
 	 *     NULL for every other one, exactly as for
 	 *     @ref create_dp_d3d11_for_screen (the runtime may also ask for a
