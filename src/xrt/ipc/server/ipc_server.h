@@ -901,6 +901,56 @@ ipc_server_set_workspace_summon_provider(ipc_server_workspace_summon_fn fn);
 bool
 ipc_server_request_workspace_summon(void);
 
+/*!
+ * Display dashboard phase 8: function pointer the IPC server calls for the
+ * DIAG RPC `system_reload_service_config` — re-read the service's persisted
+ * config (`service.json`) and apply it live (launch hotkey, per-controller
+ * mode) without restarting a running workspace controller. Returns true when
+ * the reload was accepted (it may complete asynchronously on the service's own
+ * thread). The standalone service registers it; nothing else does.
+ */
+typedef bool (*ipc_server_service_config_reload_fn)(void);
+
+/*!
+ * Register the config-reload provider. Same lifetime model as
+ * `ipc_server_set_workspace_pid_provider`. Pass NULL to clear.
+ */
+void
+ipc_server_set_service_config_reload_provider(ipc_server_service_config_reload_fn fn);
+
+/*!
+ * Display dashboard phase 8: function pointer the IPC server calls for the
+ * DIAG RPC `system_workspace_launch` — spawn workspace controller
+ * @p controller_id now, through the same path as the launch hotkey. Returns an
+ * `enum ipc_workspace_launch_status` value.
+ */
+typedef uint32_t (*ipc_server_workspace_launch_fn)(const char *controller_id);
+
+/*!
+ * Register the workspace-launch provider. Same lifetime model as
+ * `ipc_server_set_workspace_pid_provider`. Pass NULL to clear.
+ */
+void
+ipc_server_set_workspace_launch_provider(ipc_server_workspace_launch_fn fn);
+
+/*!
+ * Display dashboard phase 8: function pointer the IPC server calls for the
+ * DIAG RPC `system_workspace_hotkey_suspend` — @p suspend true takes the
+ * launch-hotkey hook out of the input pipeline (a running controller and the
+ * persisted config are untouched; the service itself resumes after a 60 s
+ * safety timeout, re-armed by every suspend), false re-installs it from the
+ * current config. NOT tied to the caller's connection: the caller is a
+ * one-shot CLI process that exits at once. Returns true when accepted.
+ */
+typedef bool (*ipc_server_workspace_hotkey_suspend_fn)(bool suspend);
+
+/*!
+ * Register the hotkey-suspend provider. Same lifetime model as
+ * `ipc_server_set_workspace_pid_provider`. Pass NULL to clear.
+ */
+void
+ipc_server_set_workspace_hotkey_suspend_provider(ipc_server_workspace_hotkey_suspend_fn fn);
+
 /*
  *
  * Helpers

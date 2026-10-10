@@ -1374,5 +1374,23 @@
 	},
 
 	"system_request_display_reprobe": {
+	},
+
+	"system_reload_service_config": {
+	},
+
+	"system_workspace_launch": {
+		"in": [
+			{"name": "controller", "type": "struct ipc_workspace_controller_id"}
+		],
+		"out": [
+			{"name": "status", "type": "uint32_t"}
+		]
+	},
+
+	"system_workspace_hotkey_suspend": {
+		"in": [
+			{"name": "suspend", "type": "bool"}
+		]
 	}
 }

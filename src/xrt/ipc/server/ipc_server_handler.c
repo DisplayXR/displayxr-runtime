@@ -421,6 +421,31 @@ ipc_server_request_workspace_summon(void)
 	return true;
 }
 
+// Display dashboard phase 8: the service's launch-settings hooks (see the
+// system_reload_service_config / system_workspace_launch handlers).
+static ipc_server_service_config_reload_fn s_service_config_reload_provider = NULL;
+static ipc_server_workspace_launch_fn s_workspace_launch_provider = NULL;
+
+void
+ipc_server_set_service_config_reload_provider(ipc_server_service_config_reload_fn fn)
+{
+	s_service_config_reload_provider = fn;
+}
+
+void
+ipc_server_set_workspace_launch_provider(ipc_server_workspace_launch_fn fn)
+{
+	s_workspace_launch_provider = fn;
+}
+
+static ipc_server_workspace_hotkey_suspend_fn s_workspace_hotkey_suspend_provider = NULL;
+
+void
+ipc_server_set_workspace_hotkey_suspend_provider(ipc_server_workspace_hotkey_suspend_fn fn)
+{
+	s_workspace_hotkey_suspend_provider = fn;
+}
+
 
 /*
  *
@@ -4147,6 +4172,92 @@ ipc_handle_system_request_display_reprobe(volatile struct ipc_client_state *ics)
 #ifndef XRT_OS_ANDROID
 	ipc_server_request_display_reprobe("per-screen DP preference changed");
 #endif
+	return XRT_SUCCESS;
+}
+
+/*
+ * Display dashboard phase 8: `displayxr-cli workspace set` (and the dashboard
+ * through it) rewrote the workspace controllers' launch settings in
+ * service.json; re-read and apply them now (new hotkey hook, mode) instead of
+ * at the next service start. Session-free, DIAG only. A service without an
+ * orchestrator (Android, sdl_test) has no provider: XRT_ERROR_NOT_IMPLEMENTED,
+ * which the CLI reports as "applies on next service start".
+ */
+xrt_result_t
+ipc_handle_system_reload_service_config(volatile struct ipc_client_state *ics)
+{
+	xrt_result_t xret = require_status_diag(ics, "system_reload_service_config");
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	if (s_service_config_reload_provider == NULL) {
+		return XRT_ERROR_NOT_IMPLEMENTED;
+	}
+	if (!s_service_config_reload_provider()) {
+		IPC_WARN(ics->server, "system_reload_service_config: the service could not apply the reload.");
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	IPC_INFO(ics->server, "system_reload_service_config: reload requested by pid %ld.",
+	         (long)ics->client_state.pid);
+	return XRT_SUCCESS;
+}
+
+/*
+ * Display dashboard phase 8: `displayxr-cli workspace launch <id>` — spawn the
+ * workspace controller now, through the same path as the launch hotkey.
+ * Session-free, DIAG only. The refusals (not the active controller, disabled,
+ * already running, none registered) come back in `out_status`, so the CLI can
+ * say which.
+ */
+xrt_result_t
+ipc_handle_system_workspace_launch(volatile struct ipc_client_state *ics,
+                                   const struct ipc_workspace_controller_id *controller,
+                                   uint32_t *out_status)
+{
+	*out_status = IPC_WORKSPACE_LAUNCH_UNSUPPORTED;
+	xrt_result_t xret = require_status_diag(ics, "system_workspace_launch");
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	if (s_workspace_launch_provider == NULL) {
+		return XRT_SUCCESS;
+	}
+	char id[sizeof(controller->id) + 1];
+	memcpy(id, controller->id, sizeof(controller->id));
+	id[sizeof(controller->id)] = '\0'; // never trust the wire to terminate
+	*out_status = s_workspace_launch_provider(id);
+	IPC_WARN(ics->server, "system_workspace_launch('%s') by pid %ld: status %u.", id, (long)ics->client_state.pid,
+	         (unsigned)*out_status);
+	return XRT_SUCCESS;
+}
+
+/*
+ * Display dashboard phase 8: a hotkey-capture box (the dashboard, through
+ * `displayxr-cli workspace hotkey-suspend on|off`) must see the CURRENT combo
+ * instead of the service's hook swallowing it. true = take the hook out
+ * (config and a running controller untouched), false = put it back from the
+ * current config. Session-free, DIAG only. Deliberately NOT tied to the
+ * caller's connection (the caller is a one-shot CLI that exits at once):
+ * resumed only by an explicit false or by the service's 60 s safety timeout,
+ * which every true re-arms. The service logs the suspend / resume WARNs.
+ */
+xrt_result_t
+ipc_handle_system_workspace_hotkey_suspend(volatile struct ipc_client_state *ics, bool suspend)
+{
+	xrt_result_t xret = require_status_diag(ics, "system_workspace_hotkey_suspend");
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	if (s_workspace_hotkey_suspend_provider == NULL) {
+		return XRT_ERROR_NOT_IMPLEMENTED;
+	}
+	if (!s_workspace_hotkey_suspend_provider(suspend)) {
+		IPC_WARN(ics->server, "system_workspace_hotkey_suspend(%s): the service could not apply it.",
+		         suspend ? "true" : "false");
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	IPC_INFO(ics->server, "system_workspace_hotkey_suspend(%s) by pid %ld.", suspend ? "true" : "false",
+	         (long)ics->client_state.pid);
 	return XRT_SUCCESS;
 }
 

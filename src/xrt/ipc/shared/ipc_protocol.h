@@ -406,6 +406,34 @@ struct ipc_file_picker_result_path
 };
 
 /*!
+ * Display dashboard phase 8: the workspace controller a DIAG client asks the
+ * service to launch (`system_workspace_launch`) — the registry subkey name
+ * under `HKLM\Software\DisplayXR\WorkspaceControllers`, NUL-terminated.
+ *
+ * @ingroup ipc
+ */
+struct ipc_workspace_controller_id
+{
+	char id[64];
+};
+
+/*!
+ * `system_workspace_launch` outcome (the `status` out-arg). The RPC itself
+ * returns XRT_SUCCESS whenever it was understood; these say what happened.
+ *
+ * @ingroup ipc
+ */
+enum ipc_workspace_launch_status
+{
+	IPC_WORKSPACE_LAUNCH_STARTED = 0,         //!< spawn posted (same path as the hotkey)
+	IPC_WORKSPACE_LAUNCH_NOT_ACTIVE = 1,      //!< id is not the controller the service spawns
+	IPC_WORKSPACE_LAUNCH_DISABLED = 2,        //!< the controller's mode is "disabled"
+	IPC_WORKSPACE_LAUNCH_ALREADY_RUNNING = 3, //!< it (or another instance) is already up
+	IPC_WORKSPACE_LAUNCH_NO_CONTROLLER = 4,   //!< no controller registered / detected
+	IPC_WORKSPACE_LAUNCH_UNSUPPORTED = 5,     //!< this service has no orchestrator
+};
+
+/*!
  * Phase 2.D: workspace input event wire format. Tagged union with
  * event_type as the discriminator. Mirrors the public XrWorkspaceInputEventDXR
  * but uses plain C types (no XR enum dependency in IPC headers). The state
