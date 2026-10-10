@@ -106,6 +106,34 @@ TEST_CASE("Windows: a screen counts toward the capacity with a D3D11 OR a D3D12 
 	CHECK(oxr_segment_views_set_capacity(with_factory, true) == 2);
 }
 
+TEST_CASE("Windows: a GL factory also makes a screen count toward the capacity (M6, GL)", "[oxr][segment_views]")
+{
+	int gl_factory = 0;
+	CHECK(oxr_segment_views_win_entry_has_gl_dp(&gl_factory));
+	CHECK_FALSE(oxr_segment_views_win_entry_has_gl_dp(nullptr));
+
+	// The oxr_system loop: a screen counts when ANY in-process Windows
+	// compositor that segments has a factory for it. Two GL-only screens give
+	// two view sets, as two D3D11 screens do; a screen with no factory at all
+	// does not count.
+	struct entry
+	{
+		const void *d3d11, *d3d12, *gl;
+	};
+	const entry entries[] = {
+	    {nullptr, nullptr, &gl_factory}, {nullptr, nullptr, &gl_factory}, {nullptr, nullptr, nullptr}};
+	uint32_t with_factory = 0;
+	for (const auto &e : entries) {
+		const bool has_dp =
+		    oxr_segment_views_win_entry_has_dp(e.d3d11, e.d3d12) || oxr_segment_views_win_entry_has_gl_dp(e.gl);
+		if (has_dp) {
+			with_factory++;
+		}
+	}
+	CHECK(with_factory == 2);
+	CHECK(oxr_segment_views_set_capacity(with_factory, true) == 2);
+}
+
 TEST_CASE("PRIMARY_MULTIVIEW_DXR reports one view set per possible segment", "[oxr][segment_views]")
 {
 	// Capacity 1: exactly the pre-M3 count (the device max).

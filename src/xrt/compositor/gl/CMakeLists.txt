@@ -69,6 +69,20 @@ if(WIN32)
 	# GL interop devices stop passing NULL to D3D11CreateDevice.
 	target_link_libraries(comp_gl PRIVATE aux_d3d)
 	target_include_directories(comp_gl PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../xbridge)
+
+	# Multi-screen M6 (ADR-047 D2): a window spanning monitors is woven per
+	# segment, each by its own screen's DP. The backend-agnostic segment math
+	# (comp_segments.c) has no Vulkan deps either, so it is compiled in
+	# directly, like comp_layer_accum above, instead of pulling in comp_util.
+	target_sources(
+		comp_gl
+		PRIVATE comp_gl_segments.cpp
+			comp_gl_segments.h
+			${CMAKE_CURRENT_SOURCE_DIR}/../util/comp_segments.c
+			${CMAKE_CURRENT_SOURCE_DIR}/../util/comp_segments.h
+			${CMAKE_CURRENT_SOURCE_DIR}/../util/comp_segments_gl.h
+			${CMAKE_CURRENT_SOURCE_DIR}/../util/comp_segments_route.h
+		)
 elseif(APPLE)
 	target_link_libraries(comp_gl PRIVATE "-framework OpenGL" "-framework Cocoa" "-framework IOSurface")
 endif()

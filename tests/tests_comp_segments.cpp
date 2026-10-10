@@ -8,6 +8,7 @@
 
 #include "util/comp_segments.h"
 #include "util/comp_segments_route.h"
+#include "util/comp_segments_gl.h"
 
 #include "catch_amalgamated.hpp"
 
@@ -838,4 +839,86 @@ TEST_CASE("content ring: a split slot finds the partition of the frame that fill
 	CHECK(out.count == 0);
 	comp_segments_content_ring_put(&ring, 0, &c); // ignored
 	CHECK_FALSE(comp_segments_content_ring_get(&ring, 0, &out));
+}
+
+TEST_CASE("GL segments: top-left rects flip into the bottom-left framebuffer", "[comp_segments][gl]")
+{
+	// The right half of a 1920x1080 window: same x, y counted from the bottom.
+	const comp_seg_rect right = {960, 0, 960, 1080};
+	comp_seg_rect g = comp_segments_gl_flip(&right, 1080);
+	CHECK(g.x == 960);
+	CHECK(g.y == 0);
+	CHECK(g.w == 960);
+	CHECK(g.h == 1080);
+	// A segment that does not span the window's height (a monitor shorter
+	// than the window): top-left 100 px down -> GL y measured from the bottom.
+	const comp_seg_rect low = {0, 100, 500, 300};
+	g = comp_segments_gl_flip(&low, 1080);
+	CHECK(g.y == 1080 - 100 - 300);
+	CHECK(g.h == 300);
+	// Flipping twice is the identity.
+	const comp_seg_rect back = comp_segments_gl_flip(&g, 1080);
+	CHECK(back.x == low.x);
+	CHECK(back.y == low.y);
+}
+
+TEST_CASE("GL segments: the crop reads a segment from every tile in GL row order", "[comp_segments][gl]")
+{
+	// A 2x2 quad atlas of 400x300 tiles; a segment occupying the right
+	// quarter of the window maps to x 300..400 of every tile, full height.
+	const comp_seg_rect canvas = {0, 0, 1600, 1200};
+	const comp_seg_rect seg = {1200, 0, 400, 1200};
+	comp_seg_rect t;
+	REQUIRE(comp_segments_tile_rect(&seg, &canvas, 400, 300, &t));
+	CHECK(t.x == 300);
+	CHECK(t.y == 0);
+	CHECK(t.w == 100);
+	CHECK(t.h == 300);
+
+	// View 0 (row 0, the TOP row as displayed) lives in GL's TOP row of the
+	// atlas — y = (rows-1-0)*300 = 300 — and view 2 (row 1) at y = 0 (#1625).
+	comp_seg_rect a0 = comp_segments_gl_atlas_rect(&t, 0, 0, 2, 400, 300);
+	comp_seg_rect a2 = comp_segments_gl_atlas_rect(&t, 0, 1, 2, 400, 300);
+	comp_seg_rect a1 = comp_segments_gl_atlas_rect(&t, 1, 0, 2, 400, 300);
+	CHECK(a0.x == 300);
+	CHECK(a0.y == 300);
+	CHECK(a2.x == 300);
+	CHECK(a2.y == 0);
+	CHECK(a1.x == 700);
+	CHECK(a1.y == 300);
+	CHECK(a0.w == 100);
+	CHECK(a0.h == 300);
+
+	// The crop holds the same grid of segment-sized tiles, same row order, so
+	// a DP reads it exactly like a whole-canvas atlas.
+	comp_seg_rect c0 = comp_segments_gl_crop_rect(0, 0, 2, t.w, t.h);
+	comp_seg_rect c2 = comp_segments_gl_crop_rect(0, 1, 2, t.w, t.h);
+	comp_seg_rect c1 = comp_segments_gl_crop_rect(1, 0, 2, t.w, t.h);
+	CHECK(c0.x == 0);
+	CHECK(c0.y == 300);
+	CHECK(c2.y == 0);
+	CHECK(c1.x == 100);
+	CHECK(c1.y == 300);
+	CHECK(c0.w == t.w);
+	CHECK(c0.h == t.h);
+}
+
+TEST_CASE("GL segments: a partial-height segment lands at the right rows inside its tile", "[comp_segments][gl]")
+{
+	// Window 1000x800 over a 1x2 stereo atlas at the same scale; the segment
+	// is the bottom 200 rows of the window (a shorter monitor below a seam).
+	const comp_seg_rect canvas = {0, 0, 1000, 800};
+	const comp_seg_rect seg = {0, 600, 1000, 200};
+	comp_seg_rect t;
+	REQUIRE(comp_segments_tile_rect(&seg, &canvas, 500, 800, &t));
+	CHECK(t.y == 600);
+	CHECK(t.h == 200);
+	// Bottom-left: the bottom 200 rows of the tile are GL rows 0..200.
+	const comp_seg_rect a = comp_segments_gl_atlas_rect(&t, 1, 0, 1, 500, 800);
+	CHECK(a.x == 500);
+	CHECK(a.y == 0);
+	CHECK(a.h == 200);
+	// The routed viewport inside a tile (M3) uses the same flip within the tile.
+	const comp_seg_rect v = comp_segments_gl_flip(&t, 800);
+	CHECK(v.y == a.y);
 }
