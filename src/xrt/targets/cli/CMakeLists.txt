@@ -15,6 +15,14 @@ target_link_libraries(
 	)
 target_include_directories(cli_query PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
+# Display dashboard phase 8: `info --json` carries workspace_controllers[]
+# (service.json + the controller registry; absent on Android, which has no
+# workspace-controller registry).
+if(TARGET target_workspace_config)
+	target_link_libraries(cli_query PRIVATE target_workspace_config)
+	target_compile_definitions(cli_query PRIVATE CLI_HAVE_WORKSPACE_CONFIG)
+endif()
+
 # Headless zone-caps probe (#224 / ADR-027 P4): cli_query.c creates a D3D11
 # WARP device on Windows to exercise the plug-in's create_dp_d3d11 +
 # get_local_zone_caps without a GPU/display.
@@ -43,6 +51,7 @@ add_executable(
 	cli_cmd_probe.c
 	cli_cmd_test.c
 	cli_cmd_clients.c
+	cli_cmd_workspace.c
 	cli_cmd_lift.cpp
 	cli_cmd_camera.c
 	cli_common.h
@@ -85,6 +94,8 @@ target_link_libraries(
 		target_lists
 		drv_includes
 		xrt-external-cjson
+		# Display dashboard phase 8: `workspace list|set|reset|launch`.
+		target_workspace_config
 	)
 
 # #960: `displayxr-cli clients` connects to the live service over IPC (DIAG class).

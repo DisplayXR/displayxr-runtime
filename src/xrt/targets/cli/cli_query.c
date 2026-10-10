@@ -59,6 +59,13 @@
 #include "d3d/d3d_render_adapter.h"  // ADR-037 §2 resolver — the service's ingest adapter (#1153)
 #endif
 
+#ifdef CLI_HAVE_WORKSPACE_CONFIG
+// Display dashboard phase 8: workspace_controllers[] (after <windows.h>: the
+// registry header falls back to its own MAX_PATH otherwise).
+#include "service_config.h"
+#include "service_workspace_registry.h"
+#endif
+
 
 /*
  *
@@ -2749,6 +2756,28 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 			cJSON_AddItemToArray(arr, o);
 		}
 	}
+
+#ifdef CLI_HAVE_WORKSPACE_CONFIG
+	/*
+	 * Display dashboard phase 8: the registered workspace controllers with
+	 * their launch settings — the same objects as `workspace list --json`,
+	 * headless (`connected` / `pid` null; `workspace list` asks the service).
+	 */
+	{
+		struct service_config wcfg;
+		service_config_load(&wcfg);
+		struct workspace_controller_entry wentries[WORKSPACE_REGISTRY_MAX_ENTRIES];
+		const int wn = service_workspace_registry_enumerate(wentries, WORKSPACE_REGISTRY_MAX_ENTRIES);
+		cJSON *wdoc = (cJSON *)service_workspace_controllers_to_cjson(&wcfg, wentries, wn, NULL);
+		cJSON *warr = wdoc != NULL ? cJSON_DetachItemFromObjectCaseSensitive(wdoc, "controllers") : NULL;
+		if (warr != NULL) {
+			cJSON_AddItemToObject(root, "workspace_controllers", warr);
+		} else {
+			cJSON_AddArrayToObject(root, "workspace_controllers");
+		}
+		cJSON_Delete(wdoc);
+	}
+#endif
 
 	return root;
 }

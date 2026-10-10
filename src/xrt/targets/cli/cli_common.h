@@ -59,6 +59,10 @@ cli_status_build_headless(struct xrt_status_snapshot *out);
 int
 cli_cmd_clients(int argc, const char **argv);
 
+//! `workspace list|set|reset|launch` — workspace controllers + launch settings (dashboard phase 8).
+int
+cli_cmd_workspace(int argc, const char **argv);
+
 int
 cli_cmd_test(int argc, const char **argv);
 
