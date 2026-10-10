@@ -346,6 +346,17 @@ bool
 comp_xbridge_slot_layout(struct comp_xbridge *xb, int32_t slot, uint64_t *out_gen, uint32_t *out_w, uint32_t *out_h);
 
 /*!
+ * The `seq` passed to the @ref comp_xbridge_submit that filled @p slot — the
+ * caller's frame key, so per-frame facts the bridge does not carry (the
+ * multi-screen content partition, #1883) can be looked up for the slot being
+ * woven rather than taken from the frame being committed.
+ *
+ * @return false when the slot holds nothing (empty ring, or out of range).
+ */
+bool
+comp_xbridge_slot_seq(struct comp_xbridge *xb, int32_t slot, uint64_t *out_seq);
+
+/*!
  * Ingress Option I: bind the renderer's NT-shared atlas directly, so the
  * producer copies out of the app's own atlas with no extra app-device copy.
  *

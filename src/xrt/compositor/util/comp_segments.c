@@ -672,3 +672,65 @@ comp_segments_tile_rect(const struct comp_seg_rect *seg,
 	out->h = (uint32_t)(by - ay);
 	return true;
 }
+
+bool
+comp_segments_source_rect(const struct comp_segment *seg,
+                          const struct comp_seg_rect *canvas,
+                          uint32_t tile_w,
+                          uint32_t tile_h,
+                          const struct comp_segments_content *content,
+                          struct comp_seg_rect *out)
+{
+	if (seg == NULL) {
+		return false;
+	}
+	if (content != NULL && content->count > 0) {
+		const uint32_t n =
+		    content->count < COMP_SEGMENTS_CONTENT_MAX ? content->count : COMP_SEGMENTS_CONTENT_MAX;
+		for (uint32_t j = 0; j < n; j++) {
+			if (content->screen_id[j] == seg->screen_id) {
+				// Where this screen's views WERE painted.
+				return comp_segments_tile_rect(&content->rect[j], &content->canvas, tile_w, tile_h,
+				                               out);
+			}
+		}
+	}
+	return comp_segments_tile_rect(&seg->window_rect, canvas, tile_w, tile_h, out);
+}
+
+void
+comp_segments_content_ring_put(struct comp_segments_content_ring *r,
+                               uint64_t seq,
+                               const struct comp_segments_content *content)
+{
+	if (r == NULL || seq == 0) {
+		return;
+	}
+	const uint32_t i = (uint32_t)(seq % COMP_SEGMENTS_CONTENT_RING);
+	r->seq[i] = seq;
+	if (content != NULL) {
+		r->content[i] = *content;
+	} else {
+		memset(&r->content[i], 0, sizeof(r->content[i]));
+	}
+}
+
+bool
+comp_segments_content_ring_get(const struct comp_segments_content_ring *r,
+                               uint64_t seq,
+                               struct comp_segments_content *out)
+{
+	if (out == NULL) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+	if (r == NULL || seq == 0) {
+		return false;
+	}
+	const uint32_t i = (uint32_t)(seq % COMP_SEGMENTS_CONTENT_RING);
+	if (r->seq[i] != seq) {
+		return false;
+	}
+	*out = r->content[i];
+	return true;
+}

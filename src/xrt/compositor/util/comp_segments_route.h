@@ -138,6 +138,33 @@ comp_segments_route_active(const struct xrt_segment_view_routing *r,
 }
 
 /*!
+ * The content partition (#1883) of an atlas painted under routing @p r: each
+ * routed segment's screen + window rect + the routing's canvas. Call it only
+ * for a frame that WAS painted routed (the renderer accepted @p r); @p r NULL
+ * (or count 0) gives the unrouted partition.
+ */
+static inline void
+comp_segments_content_from_routing(const struct xrt_segment_view_routing *r, struct comp_segments_content *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (r == NULL || r->count == 0 || r->count > XRT_MAX_SEGMENTS || r->count > COMP_SEGMENTS_CONTENT_MAX) {
+		return;
+	}
+	for (uint32_t k = 0; k < r->count; k++) {
+		out->screen_id[k] = r->screen_id[k];
+		out->rect[k].x = r->rect[k].offset.w;
+		out->rect[k].y = r->rect[k].offset.h;
+		out->rect[k].w = (uint32_t)(r->rect[k].extent.w > 0 ? r->rect[k].extent.w : 0);
+		out->rect[k].h = (uint32_t)(r->rect[k].extent.h > 0 ? r->rect[k].extent.h : 0);
+	}
+	out->canvas.x = r->canvas.offset.w;
+	out->canvas.y = r->canvas.offset.h;
+	out->canvas.w = (uint32_t)(r->canvas.extent.w > 0 ? r->canvas.extent.w : 0);
+	out->canvas.h = (uint32_t)(r->canvas.extent.h > 0 ? r->canvas.extent.h : 0);
+	out->count = r->count;
+}
+
+/*!
  * Publish @p next as the segment table readers frame views from, bumping the
  * generation only when the table (generation aside) changed — so a reader can
  * tell "the same table again" from "a new one" without comparing payloads.
