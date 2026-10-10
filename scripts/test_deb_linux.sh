@@ -52,7 +52,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # new image.
 IMAGE="displayxr-deb-builder:ubuntu2204"
 # Verify: every release the .deb claims to install on.
-VERIFY_IMAGES=("ubuntu:22.04" "ubuntu:24.04" "ubuntu:26.04")
+# Canonical images from ECR Public, same as CI (#1893)
+VERIFY_IMAGES=("public.ecr.aws/ubuntu/ubuntu:22.04" "public.ecr.aws/ubuntu/ubuntu:24.04" "public.ecr.aws/ubuntu/ubuntu:26.04")
 
 VERIFY_ONLY=0
 REBUILD_IMAGE=0
@@ -70,7 +71,8 @@ command -v docker >/dev/null 2>&1 || { echo "error: docker not found" >&2; exit 
 if [ "$REBUILD_IMAGE" = 1 ] || ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     echo "==> Building builder image $IMAGE"
     docker build -t "$IMAGE" -f - "$ROOT" <<'DOCKERFILE'
-FROM ubuntu:22.04
+# Canonical image from ECR Public (#1893)
+FROM public.ecr.aws/ubuntu/ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
 # libwayland-dev + libdbus-1-dev + libxrandr-dev must match the Deb job in
 # build-linux.yml — without them this image would build a Wayland-less /

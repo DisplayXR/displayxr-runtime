@@ -146,7 +146,8 @@ jobs:
   Package:
     needs: DetectChanges
     runs-on: ubuntu-latest
-    container: ubuntu:22.04
+    # Canonical image from ECR Public: no anonymous pull limit (#1893)
+    container: public.ecr.aws/ubuntu/ubuntu:22.04
     steps:
       - name: Docs-only short-circuit
         if: needs.DetectChanges.outputs.docs_only == 'true'
@@ -221,7 +222,8 @@ jobs:
   Newest:
     needs: DetectChanges
     runs-on: ubuntu-latest
-    container: ubuntu:26.04
+    # Canonical image from ECR Public: no anonymous pull limit (#1893)
+    container: public.ecr.aws/ubuntu/ubuntu:26.04
     steps:
       - name: Docs-only short-circuit
         if: needs.DetectChanges.outputs.docs_only == 'true'
@@ -314,7 +316,8 @@ jobs:
   Deb:
     needs: DetectChanges
     runs-on: ubuntu-latest
-    container: ubuntu:22.04
+    # Canonical image from ECR Public: no anonymous pull limit (#1893)
+    container: public.ecr.aws/ubuntu/ubuntu:22.04
     env:
       DXR_DEB_MAX_GLIBC: "2.35" # Ubuntu 22.04 — the oldest supported release
     steps:
@@ -421,7 +424,10 @@ jobs:
       - name: apt install + ldd -r + selftest in clean ubuntu:${{ matrix.release }}
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
-          docker run --rm -v "$PWD:/w" -w /w "ubuntu:${{ matrix.release }}" \
+          # Canonical image from ECR Public: no anonymous pull limit (#1893)
+          # ECR Public throttles bursts ("Rate exceeded") - retry the pull (#1893)
+          for i in 1 2 3 4 5; do docker pull "public.ecr.aws/ubuntu/ubuntu:${{ matrix.release }}" && break; sleep $((i*15)); done
+          docker run --rm -v "$PWD:/w" -w /w "public.ecr.aws/ubuntu/ubuntu:${{ matrix.release }}" \
             ./scripts/verify_deb_install_linux.sh \
               dist/displayxr-runtime_*_amd64.deb dist/displayxr-runtime-linux-*.tar.gz
 
