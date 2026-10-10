@@ -30,17 +30,20 @@
  * Vulkan loader (a layer linking the loader can recurse). Plain C + one
  * OS mutex primitive.
  *
- * Lock SCOPE (#1905). Desktop default is one mutex per VkQueue (the #902
- * external-synchronization contract). Android defaults to ONE mutex per
- * VkDevice: on Adreno 740 the app's queue (family 0 idx 0) and the runtime's
- * repaint queue (idx 1) share one kernel GSL context, and two concurrent
- * submits on DIFFERENT queues corrupt its timestamp ("Adreno-GSL ctx N: next
- * client ts ... must be greater"; the next idx-0 submit then fails with -3).
- * Per-queue locking cannot see that; per-device locking serializes every
- * vkQueue* call in the process across both queues. Override with
- * -DQL_DEFAULT_PER_DEVICE=0|1 at build time, and on Android at run time with
- * `setprop debug.dxr.ql_scope queue|device` (read at vkCreateDevice) — the
- * A/B knob for the device experiment.
+ * Lock SCOPE (#1905). Default everywhere is one mutex per VkQueue (the #902
+ * external-synchronization contract). On Android a per-VkDevice scope is
+ * selectable (`setprop debug.dxr.ql_scope device`, read at vkCreateDevice).
+ * The device experiment (Lume phone, Adreno 740, force-repaint probe) decided
+ * it: BOTH scopes cleared the "Adreno-GSL ctx N: next client ts ... must be
+ * greater" warnings and the follow-on submit -3 (0 in 30 s), so the race is
+ * between unsynchronised calls on the SAME queue, which a per-queue lock
+ * already serialises — the earlier inference that the app's idx-0 and the
+ * repaint's idx-1 submits collide ACROSS queues was wrong. And per-device
+ * costs: a blocking present / WaitIdle on one queue stalls the other, which
+ * collapsed the runtime's fills from ~20/s to 10/s (weave refresh 41.5 ->
+ * 22.5 Hz) while per-queue kept 41.5 Hz at baseline app fps. So per-queue is
+ * the product scope; "device" stays as the A/B knob. Build-time override:
+ * -DQL_DEFAULT_PER_DEVICE=0|1.
  *
  * Android loader contract (frameworks/native vulkan/libvulkan/
  * layers_extensions.cpp + api.cpp, verified against AOSP main): no JSON
@@ -128,14 +131,10 @@ typedef struct
 #include <vulkan/vk_layer.h>
 #endif
 
-//! Default lock scope: per-DEVICE on Android (#1905, Adreno shared GSL
-//! context), per-QUEUE elsewhere (#902). See the file header.
+//! Default lock scope: per-QUEUE on every platform (#902; #1905 measured
+//! per-queue sufficient on Adreno, per-device costly). See the file header.
 #ifndef QL_DEFAULT_PER_DEVICE
-#ifdef __ANDROID__
-#define QL_DEFAULT_PER_DEVICE 1
-#else
 #define QL_DEFAULT_PER_DEVICE 0
-#endif
 #endif
 
 #ifdef _WIN32
@@ -400,8 +399,10 @@ ql_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
 	static int s_logged = 0;
 	if (!s_logged) {
 		s_logged = 1;
-		QL_LOGW("VK_LAYER_DXR_queue_lock: loaded into vkCreateInstance (instance %p, default scope %s)",
-		        (void *)*pInstance, QL_DEFAULT_PER_DEVICE ? "per-device" : "per-queue");
+		QL_LOGW(
+		    "VK_LAYER_DXR_queue_lock: loaded into vkCreateInstance (instance %p, default scope %s; "
+		    "setprop debug.dxr.ql_scope queue|device overrides per device)",
+		    (void *)*pInstance, QL_DEFAULT_PER_DEVICE ? "per-device" : "per-queue");
 	}
 #endif
 

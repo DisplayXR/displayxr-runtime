@@ -413,7 +413,7 @@ android {
             // displayxr-service: the service .so hosted by MonadoService and
             // the MonadoServiceSlotN satellites.
             // VkLayer_DXR_queue_lock: libVkLayer_DXR_queue_lock.so, the #1905
-            // per-device queue-serialization layer. Shipped here so a userdebug
+            // queue-serialization layer (per-queue). Shipped here so a userdebug
             // device can load it into an APP process with
             // gpu_debug_layer_app=<this package> (the loader scans this APK's
             // lib dir for libVkLayer*.so). Inert unless a loader is pointed at

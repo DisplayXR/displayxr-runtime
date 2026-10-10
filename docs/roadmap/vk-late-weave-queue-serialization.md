@@ -230,23 +230,36 @@ regression is observable rather than felt.
 6. Flip default: tier auto-selection ON — VK repaint default-on everywhere,
    matching D3D11/D3D12.
 
-## 7. Android: per-device scope and delivery (#1905)
+## 7. Android: per-queue scope and delivery (#1905)
 
-**Status: PROTOTYPE** (branch `feat/android-queue-lock-layer`; not yet run on a
-device). Companion: PR #1910.
+**Status: PROTOTYPE, device-validated** (branch `feat/android-queue-lock-layer`,
+PR #1915). Companion: PR #1910, which auto-enables mid-frame fill when this
+layer is live.
 
-**Why per-device.** On Adreno 740 the app's queue (family 0 idx 0) and the
-runtime's repaint queue (idx 1) are distinct `VkQueue`s, so §2's per-queue
-contract is met. They still share one kernel GSL context, and an app
-`vkQueueSubmit` overlapping a runtime submit on the other queue corrupts its
-timestamp (`Adreno-GSL ctx N: next client ts … must be greater`). The next
-idx-0 submit then fails with -3. The Android build of the layer therefore takes
-**one mutex per `VkDevice`** across the whole §3.1 surface
-(`QL_DEFAULT_PER_DEVICE=1` on `__ANDROID__`; desktop stays per-queue). For an
-A/B run, `setprop debug.dxr.ql_scope queue|device` overrides the scope at
-`vkCreateDevice`. Tier selection (§3.5) is unchanged. Adreno gives the runtime
+**Scope: per-queue, decided by measurement.** The first hypothesis was that
+on Adreno 740 the app's queue (family 0 idx 0) and the runtime's repaint queue
+(idx 1), though distinct `VkQueue`s, collide *across* queues on their shared
+kernel GSL context (`Adreno-GSL ctx N: next client ts … must be greater`,
+then -3 on the next idx-0 submit), which would have needed one mutex per
+`VkDevice`. The device experiment says otherwise. Lume phone, Adreno 740,
+60 Hz, layer loaded through the `gpu_debug` settings path, force-repaint probe
+(`debug.dxr.weave_repaint_force=1`, which reproduces the -3 at ~0.5/s without
+the layer), 30 s runs:
+
+| scope | GSL warnings | submit -3 | weave refresh (CNSDK GetFace) | fills | app fps |
+|---|---|---|---|---|---|
+| per-queue | 0 | 0 | 41.5 Hz | not recorded | = baseline |
+| per-device | 0 | 0 | 22.5 Hz | 10/s | — |
+
+Per-queue locks already clear the race, so the colliding calls are on the
+**same** queue, which is exactly §2's contract. Per-device adds a cost:
+the app's submits wait behind the fill's blocking present, and fills collapse.
+So **per-queue is the default on every platform** (`QL_DEFAULT_PER_DEVICE=0`).
+`setprop debug.dxr.ql_scope device` (read at `vkCreateDevice`) keeps the
+per-device A/B. Tier selection (§3.5) is unchanged. Adreno gives the runtime
 idx 1, so the repaint stays on tier 1 with its own queue, and the layer only
-serializes it.
+serializes. With the layer live and #1910's mid-frame fill on, there were
+also 0 GSL warnings, 0 `Failed to render layers` and 0 CNSDK -3.
 
 **Android loader contract** (checked against AOSP `frameworks/native`
 `vulkan/libvulkan/layers_extensions.cpp` + `api.cpp`, main branch):
@@ -278,8 +291,8 @@ serializes it.
   `gpu_debug_layer_app=org.freedesktop.monado.openxr_runtime.out_of_process`.
   This path is debug-only: `GraphicsEnvironment.debugLayerEnabled()` requires
   a debuggable build or app, or the inject-layers metadata.
-- *Product:* ship the `.so` inside the DisplayXR client AAR so it lands in the
-  **app's own** `nativeLibraryDir`. **Verified (AOSP main):**
+- *Product (next step, not in this PR):* ship the `.so` inside the DisplayXR
+  client AAR so it lands in the **app's own** `nativeLibraryDir`. **Verified (AOSP main):**
   `GraphicsEnvironment.setupGpuLayers()` appends the app's library search
   paths to the layer path "in all cases", outside the debug gate. In
   `DiscoverLayers()`, the loader searches `getLayerPaths()` unconditionally;
@@ -293,13 +306,12 @@ serializes it.
   set `extractNativeLibs=true` as the fallback.
 
 **Hazards to measure before productizing.**
-- A device-wide lock makes a DP-internal `vkQueueWaitIdle`, or a blocking
-  present, stall the **other** queue's submits as well as its own (§5.2,
-  widened).
-- `vkQueueWaitIdle` held under the device lock can **deadlock** in one case:
-  the waited queue has a pending timeline-semaphore wait whose signal the other
-  queue has not been submitted yet (wait-before-signal). Binary semaphores
-  cannot do this. If it ever bites, take WaitIdle out from under the device
-  lock.
+- With the per-device A/B scope only: a DP-internal `vkQueueWaitIdle`, or a
+  blocking present, stalls the **other** queue's submits as well as its own
+  (§5.2, widened); this is what the 22.5 Hz row above measured.
+  `vkQueueWaitIdle` held under the device lock can also **deadlock** in one
+  case: the waited queue has a pending timeline-semaphore wait whose signal the
+  other queue has not been submitted yet (wait-before-signal). Binary
+  semaphores cannot do this. Per-queue scope (the default) has neither hazard.
 - The layer covers every `VkDevice` in the app process, including ones the app
   creates for itself.

@@ -10747,10 +10747,10 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		/*
 		 * #1905: a live layer must NOT pull a multi-queue device onto the
 		 * shared-queue tier — the repaint_queue == NULL term below is what
-		 * keeps Adreno (runtime queue idx 1) on tier 1, where the Android
-		 * layer's per-DEVICE lock serializes app + repaint submits across
-		 * the two queues. Logged (Android only — desktop log output stays
-		 * as it was) so a device run shows the layer engaged.
+		 * keeps Adreno (runtime queue idx 1) on tier 1, where the layer's
+		 * per-queue locks serialize every submitter on each queue, the
+		 * app's own included. Logged (Android only — desktop log output
+		 * stays as it was) so a device run shows the layer engaged.
 		 */
 #ifdef XRT_OS_ANDROID
 		if (layer_live && c->repaint_queue != VK_NULL_HANDLE) {
