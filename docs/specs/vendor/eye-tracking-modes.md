@@ -236,6 +236,7 @@ Ideally vendors support **both** modes (bits = 3), giving developers the choice.
 - [ ] Vendor display processors pass eye tracking mode to the SDK wrapper when `xrRequestEyeTrackingModeDXR` is called (vendor-side; tracked per plug-in repo)
 - [ ] Event propagation path exists for vendor-initiated 2D/3D switches (MANAGED mode auto-transitions fire `XrEventDataRenderingModeChangedDXR` + `XrEventDataHardwareDisplayStateChangedDXR`)
 - [x] sim_display honest: `supported_eye_tracking_modes = 0`, all modes untracked; `SIM_DISPLAY_FAKE_TRACKING=1` dev toggle re-enables MANUAL_BIT + tracked modes (+ `SIM_DISPLAY_FAKE_TRACKING_PERIOD_MS` square wave) for hardware-free testing (#441, runtime v1.13.0)
+- [ ] sim_display webcam tracking (#1855, ADR-022 Amendment 1): `SIM_DISPLAY_WEBCAM_TRACKING=1` + a built-in face estimator → MANAGED_BIT, MANAGED default, tracked 3D modes; collapse to nominal 300 ms after the face is lost. Plumbing landed; the estimator (model + inference dependency) is open, so the toggle is inert today
 - [x] Per-mode `has_tracking` plumbed plugin → `xrt_rendering_mode.mode_flags` → chained `XrDisplayRenderingModeTrackingInfoDXR` (#441, ABI v3 / header v14 — see ADR-022)
 - [x] `XrEventDataEyeTrackingStateChangedDXR` queued on every derived-isTracking edge (#441; validated against real view-zone edges on 3D-display hardware)
 - [x] `is_tracking` transported over IPC; fake-TRUE fallback removed (#441 Phase 2, PR #446)

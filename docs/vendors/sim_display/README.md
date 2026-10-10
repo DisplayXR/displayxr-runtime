@@ -16,6 +16,7 @@
 | `sim_display_processor_d3d12.cpp` | D3D12 DP variant |
 | `sim_display_processor_gl.c` | OpenGL DP variant |
 | `sim_display_processor_metal.m` | Metal DP variant |
+| `sim_display_webcam*.{c,h}`, `sim_display_face_estimator*` | Opt-in webcam eye tracking (#1855): geometry + smoothing (`_tracking`), the capture worker (`_tracker`), the process glue (`sim_display_webcam.c`), the estimator slot |
 | `shaders/` | Side-by-side / anaglyph compositing shaders |
 
 ## Display modes
@@ -121,9 +122,97 @@ mode *except* interlaced a phase error is invisible in what it draws — the
 audit reports the offset, and the interlaced output is what actually reacts to
 it. The option is diagnostic only; it never changes what is rendered.
 
-## Eye-tracking mode
+## Eye tracking
 
-sim_display reports **MANAGED** mode and feeds a fixed eye position (no actual tracking). The MANAGED/MANUAL contract is in [`docs/specs/vendor/eye-tracking-modes.md`](../../specs/vendor/eye-tracking-modes.md).
+By default sim_display has **no tracker**: it advertises no eye-tracking mode,
+leaves every rendering mode untracked, and its display processors report the
+nominal viewer with `is_tracking = false`. Two opt-in environment toggles change
+that. The MANAGED/MANUAL contract they follow is in
+[`docs/specs/vendor/eye-tracking-modes.md`](../../specs/vendor/eye-tracking-modes.md);
+the advertisement rules are in ADR-022 (Amendment 1).
+
+- `SIM_DISPLAY_FAKE_TRACKING=1` (+ `SIM_DISPLAY_FAKE_TRACKING_PERIOD_MS=N`):
+  a synthetic MANUAL tracker for exercising the tracking-state event. The
+  positions stay nominal.
+- `SIM_DISPLAY_WEBCAM_TRACKING=1`: real head tracking from a plain webcam
+  (MANAGED), described below.
+
+### Webcam eye tracking (#1855)
+
+The goal is look-around on an ordinary monitor with no vendor hardware: a worker
+thread reads a webcam, a face estimator finds the two pupils, and sim_display
+reports the viewer's eye positions in the panel's frame.
+
+> **Status: the plumbing has landed but the face estimator has not.** The
+> default build has no estimator, so setting the toggle logs one WARN
+> (`... this build has no face estimator - camera NOT opened ...`) and nothing
+> else changes. No camera is opened and the advertised capability does not
+> change. Which model and inference dependency to ship is the open question
+> on #1855. The estimator is one interface (`sim_display_face_estimator.h`),
+> so landing one is a self-contained change.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SIM_DISPLAY_WEBCAM_TRACKING` | unset | `1` turns it on. Unset means no thread, no camera, and the capture DLLs are never loaded. |
+| `SIM_DISPLAY_WEBCAM_DEVICE` | first camera | A device index (`0`, `1`, …) or a case-insensitive substring of the camera's name. |
+| `SIM_DISPLAY_WEBCAM_HFOV_DEG` | `70` | The camera's horizontal field of view. Distance accuracy depends on this value, so set it from the camera's spec sheet. |
+| `SIM_DISPLAY_WEBCAM_OFFSET_MM` | `0,0,0` | The camera position relative to the top-centre of the panel's active area, as `x,y,z` in mm (+x right, +y up, +z towards the viewer). A typical bezel camera is about `0,8,0`. |
+| `SIM_DISPLAY_WEBCAM_IPD_MM` | `63` | The inter-pupillary distance prior that the depth estimate uses. |
+| `SIM_DISPLAY_WEBCAM_MIRROR` | unset | `1` if the source delivers a mirrored (selfie) image. Media Foundation does not. |
+
+**Pipeline.** The camera is captured through the runtime's existing UVC
+source: Media Foundation on Windows, with the same backend as the
+`XR_DXR_stereo_camera` UVC source, and the capture DLLs are delay-loaded.
+Linux uses V4L2, which is still a stub there (so Linux has no capture yet).
+The tracker picks the capture mode closest to 640 px wide at up to 60 fps and
+runs the estimator on every frame on its own thread. Each result is mapped,
+smoothed with a one-euro filter and stored as the latest state. The display
+processors read that state through a mutex that is held only for a
+small-struct update, so they never wait on the camera.
+
+**Geometry.** The model is a pinhole camera mounted at the top-centre of the
+panel (plus the offset) and looking straight out, with no tilt. Depth comes
+from the pupils' pixel distance under the IPD prior:
+`Z = f · IPD / d_px`, where `f = (W/2) / tan(hfov/2)`. Each pupil ray is then
+scaled to that depth and expressed in the display frame, in metres, with the
+origin at the panel centre. The output keeps the processor's view layout: one
+view gets the midpoint, two views get the pair, and four views get the pair
+32 mm below and above.
+
+**Tracking loss (MANAGED).** If no face has been seen for more than 300 ms,
+`is_tracking` goes false and the eyes ease back to the nominal viewer over
+500 ms instead of jumping. When the face comes back, the eyes ease from
+wherever the blend was to the tracked position over 300 ms. The per-screen
+status (ADR-051) reports the tracker as RUNNING or DOWN, and its change
+counter moves on every tracking edge.
+
+**Accuracy expectations.** A single plain webcam gives about a centimetre
+laterally at 60 cm. Depth is the weak axis:
+
+- a 5 mm IPD error is about an 8 % depth error;
+- a yawed head shortens the pupil distance and so reads farther away;
+- a wrong field of view scales all three axes;
+- camera tilt is not modelled, so a camera that looks down biases the height.
+
+That is good enough for look-around parallax on anaglyph, SBS or interlaced
+output. It does not replace a calibrated vendor tracker.
+
+**Privacy.** The camera opens only when `SIM_DISPLAY_WEBCAM_TRACKING` is set.
+It opens when the first session display processor asks for eye positions,
+not at plug-in load, so a process that never renders never opens it. It
+closes when the last such processor is destroyed. sim_display logs one WARN
+when the camera opens (name, mode, estimator) and one when it closes. Frames
+never leave the worker: they are not stored, logged or sent anywhere. The
+toggle is per process and is read from that process's own environment, so
+for the IPC path it has to be set on `displayxr-service`.
+
+**Limits.**
+
+- Only MANAGED is offered.
+- Multi-screen segment display processors keep their nominal viewer, because
+  the camera's pose is known relative to one panel only.
+- On a machine that also has a vendor tracking camera, name the webcam with
+  `SIM_DISPLAY_WEBCAM_DEVICE`, because index 0 may be the vendor's camera.
 
 ## When to use
 
