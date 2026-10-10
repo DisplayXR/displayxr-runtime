@@ -64,6 +64,7 @@ add_screen(xrt_status_snapshot &s, uint64_t id, const char *plugin, uint32_t con
 	sc.index = s.screen_count++;
 	SET(sc.device_name, sc.index == 0 ? "\\\\.\\DISPLAY1" : "\\\\.\\DISPLAY5");
 	SET(sc.friendly_name, "AUO B194");
+	SET(sc.key, sc.index == 0 ? "AUO-B194-00000000@DISPLAY1" : "AUO-B194-00000000@DISPLAY5");
 	SET(sc.edid.manufacturer, "AUO");
 	SET(sc.edid.product, "B194");
 	sc.desktop = {sc.index == 0 ? 0 : 3840, 0, 3840, 2160, 2.5f};
@@ -74,6 +75,7 @@ add_screen(xrt_status_snapshot &s, uint64_t id, const char *plugin, uint32_t con
 	SET(sc.claim.plugin_id, plugin);
 	sc.claim.confidence = confidence;
 	SET(sc.claim.serial, "QALA2137AL0011");
+	sc.claim.apply = sc.index == 0 ? XRT_STATUS_APPLY_NEXT_SESSION : XRT_STATUS_APPLY_LIVE;
 	sc.claim.apis =
 	    XRT_STATUS_API_BIT_D3D11 | XRT_STATUS_API_BIT_D3D12 | XRT_STATUS_API_BIT_VK | XRT_STATUS_API_BIT_GL;
 	sc.layout = {0.3442f, 0.1936f, 0.0f, 0.1f, 0.6f, XRT_SCREEN_INFO_SOURCE_SYSTEM};
@@ -136,6 +138,17 @@ find(const xrt_status_warning *arr, uint32_t n, const char *code)
 }
 
 using V = std::vector<std::string>;
+
+//! Owns the snapshot's JSON (the full helper set lives with the JSON tests).
+struct json_doc_light
+{
+	cJSON *root;
+	explicit json_doc_light(const xrt_status_snapshot &s) : root(u_status_snapshot_to_cjson(&s)) {}
+	~json_doc_light()
+	{
+		cJSON_Delete(root);
+	}
+};
 
 } // namespace
 
@@ -235,6 +248,37 @@ TEST_CASE("status: CLAIM_EDID_ONLY is info on an EDID-confidence claim", "[statu
 	REQUIRE(screen_codes(*s, 0) == V{"CLAIM_EDID_ONLY"});
 	CHECK(s->screens[0].warnings[0].level == XRT_STATUS_LEVEL_INFO);
 	CHECK(screen_codes(*s, 1).empty());
+}
+
+TEST_CASE("status: CLAIM_FORCED is info on a screen a per-screen preference forced", "[status][warnings]")
+{
+	auto s = healthy();
+	// The second panel forced to the fallback by the user's preference.
+	SET(s->screens[1].claim.plugin_id, "sim-display");
+	s->screens[1].claim.confidence = XRT_DISPLAY_CLAIM_FALLBACK;
+	s->screens[1].claim.forced = true;
+	SET(s->screens[1].claim.preferred_plugin, "sim-display");
+	s->screens[1].claim.preferred_source = XRT_STATUS_PREF_SOURCE_USER;
+	u_status_warnings_derive(s.get());
+	REQUIRE(screen_codes(*s, 1) == V{"CLAIM_FORCED"});
+	CHECK(s->screens[1].warnings[0].level == XRT_STATUS_LEVEL_INFO);
+	CHECK(std::string(s->screens[1].warnings[0].text) == "Plug-in forced by a per-screen preference (user)");
+	CHECK(screen_codes(*s, 0).empty());
+
+	json_doc_light d(*s);
+	const cJSON *claim = cJSON_GetObjectItem(cJSON_GetArrayItem(cJSON_GetObjectItem(d.root, "screens"), 1), "claim");
+	CHECK(cJSON_IsTrue(cJSON_GetObjectItem(claim, "forced")));
+	CHECK(std::string(cJSON_GetObjectItem(claim, "preferred_plugin")->valuestring) == "sim-display");
+	CHECK(std::string(cJSON_GetObjectItem(claim, "preferred_source")->valuestring) == "user");
+	CHECK(std::string(cJSON_GetObjectItem(claim, "apply")->valuestring) == "live");
+
+	SECTION("a preference that was ignored is reported, but nothing is forced")
+	{
+		SET(s->screens[0].claim.preferred_plugin, "other-vendor");
+		s->screens[0].claim.preferred_source = XRT_STATUS_PREF_SOURCE_ENV;
+		u_status_warnings_derive(s.get());
+		CHECK(screen_codes(*s, 0).empty());
+	}
 }
 
 TEST_CASE("status: NO_PHYSICAL_SIZE is the 0 m trap", "[status][warnings]")
@@ -467,7 +511,7 @@ TEST_CASE("status: JSON has schema first and the §3 key set", "[status][json]")
 	CHECK(str(p0, "platform_state") == "READY");
 
 	const cJSON *sc = cJSON_GetArrayItem(cJSON_GetObjectItem(d.root, "screens"), 0);
-	CHECK(keys(sc) == V{"id", "index", "device_name", "friendly_name", "edid", "desktop", "native", "physical_mm",
+	CHECK(keys(sc) == V{"id", "index", "device_name", "friendly_name", "key", "edid", "desktop", "native", "physical_mm",
 	                    "roles", "claim", "layout", "eye_tracking", "mode", "dps", "vendor", "warnings"});
 	CHECK(str(sc, "id") == "0x8c413a2f61152ce7");
 	CHECK(keys(cJSON_GetObjectItem(sc, "edid")) == V{"manufacturer", "product", "serial"});
@@ -477,7 +521,13 @@ TEST_CASE("status: JSON has schema first and the §3 key set", "[status][json]")
 	CHECK(str(cJSON_GetObjectItem(sc, "physical_mm"), "source") == "plugin");
 	CHECK(keys(cJSON_GetObjectItem(sc, "roles")) == V{"os_main", "runtime_default", "vendor_primary"});
 	const cJSON *claim = cJSON_GetObjectItem(sc, "claim");
-	CHECK(keys(claim) == V{"plugin_id", "confidence", "confidence_value", "serial", "apis"});
+	CHECK(keys(claim) == V{"plugin_id", "confidence", "confidence_value", "serial", "apis", "forced",
+	                       "preferred_plugin", "preferred_source", "apply"});
+	CHECK(str(sc, "key") == "AUO-B194-00000000@DISPLAY1");
+	CHECK(cJSON_IsFalse(cJSON_GetObjectItem(claim, "forced")));
+	CHECK(cJSON_IsNull(cJSON_GetObjectItem(claim, "preferred_plugin")));
+	CHECK(cJSON_IsNull(cJSON_GetObjectItem(claim, "preferred_source")));
+	CHECK(str(claim, "apply") == "next-session");
 	CHECK(str(claim, "confidence") == "VERIFIED");
 	CHECK(str_array(cJSON_GetObjectItem(claim, "apis")) == V{"d3d11", "d3d12", "vk", "gl"});
 	const cJSON *lay = cJSON_GetObjectItem(sc, "layout");
@@ -560,6 +610,12 @@ TEST_CASE("status: enums serialise as the documented strings", "[status][json]")
 	CHECK(std::string(u_status_client_class_str(XRT_CLIENT_CLASS_APP, false)) == "UNVERIFIED");
 	CHECK(std::string(u_status_dp_backend_str(XRT_STATUS_DP_BACKEND_STALE)) == "STALE");
 	CHECK(std::string(u_status_eye_source_str(XRT_STATUS_EYE_SOURCE_DP)) == "DP");
+	CHECK(u_status_pref_source_str(XRT_STATUS_PREF_SOURCE_NONE) == nullptr);
+	CHECK(std::string(u_status_pref_source_str(XRT_STATUS_PREF_SOURCE_USER)) == "user");
+	CHECK(std::string(u_status_pref_source_str(XRT_STATUS_PREF_SOURCE_MACHINE)) == "machine");
+	CHECK(std::string(u_status_pref_source_str(XRT_STATUS_PREF_SOURCE_ENV)) == "env");
+	CHECK(std::string(u_status_apply_str(XRT_STATUS_APPLY_LIVE)) == "live");
+	CHECK(std::string(u_status_apply_str(XRT_STATUS_APPLY_NEXT_SESSION)) == "next-session");
 }
 
 TEST_CASE("status: headless JSON nulls what it cannot know", "[status][json]")
