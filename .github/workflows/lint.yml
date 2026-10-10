@@ -192,6 +192,14 @@ jobs:
         # the monitor scale must not be applied. Plain gjs.
         run: gjs scripts/test_gnome_extension_stage_scale.js
 
+      - name: Workspace hotkey bookkeeping
+        # Unit test for WorkspaceHotkey in lib.js (extension version 13,
+        # org.displayxr.WorkspaceHotkey1): what Configure accepts (incl. every
+        # accelerator the runtime's mapping writes), press with the client
+        # registered vs gone (StartUnit + pending carried to the next
+        # Configure, 30 s window), release, suspend cap, cache round trip.
+        run: gjs scripts/test_gnome_extension_workspace_hotkey.js
+
   cnsdk-pin-guard:
     runs-on: ubuntu-latest
     steps:

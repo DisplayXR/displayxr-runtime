@@ -259,6 +259,24 @@ systemctl --user unset-environment DISPLAYXR_DEBUG   # then log out/in again
   timed out on every title-bar drag (stale frames, visible 3D stutter; found
   on the LeiaSR OpenGL example). Apps that draw their own chrome, the test
   apps and the browser among them, were never affected. See the spec, §9.2.
+- Version 13, new interface: the **workspace hotkey**,
+  `org.displayxr.WorkspaceHotkey1` at `/org/displayxr/WorkspaceHotkey` —
+  `Configure(s accelerator, s unit) -> (b pending)`, `Suspend(b, u timeoutMs)`,
+  `GetState() -> (s)`, signal `Activated(u timestamp)`. A client hands the
+  extension one global accelerator (GTK syntax) and, optionally, a systemd
+  *user* unit. The extension grabs it with `Meta.Display.grab_accelerator`
+  (Wayland and X11 GNOME alike), caches it in
+  `$XDG_STATE_HOME/displayxr/workspace-hotkey.json` so it survives the client's
+  exit and a shell restart, and emits `Activated` on every press. A press while
+  the client's bus connection is gone also starts the unit and is handed back
+  as `pending` by the client's next `Configure` (within 30 s). The DisplayXR
+  service uses it for the workspace-controller launch chord: it pushes the
+  combo from `service.json` and its own unit (`displayxr.service`), and since
+  that service is socket-activated and exits when idle, the extension is what
+  lets the chord start it. A running controller can subscribe to `Activated`
+  for its dismiss toggle (a Wayland client cannot grab a chord). Nothing is
+  grabbed until a client configures. See
+  `docs/specs/runtime/workspace-controller-registration.md` § Linux.
 
 Verify capture exclusion is live:
 
@@ -266,6 +284,14 @@ Verify capture exclusion is live:
 gdbus call --session --dest org.displayxr.WindowGeometry \
   --object-path /org/displayxr/CaptureExclusion \
   --method org.displayxr.CaptureExclusion1.GetState
+```
+
+Inspect the workspace hotkey (version 13+):
+
+```bash
+gdbus call --session --dest org.displayxr.WindowGeometry \
+  --object-path /org/displayxr/WorkspaceHotkey \
+  --method org.displayxr.WorkspaceHotkey1.GetState
 ```
 
 Schema and coordinate-space notes are documented at the top of

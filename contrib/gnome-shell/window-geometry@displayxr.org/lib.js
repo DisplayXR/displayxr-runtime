@@ -114,6 +114,28 @@
 //   progress on that window — the user is still dragging it. See
 //   displayxr-runtime#1609 and docs/specs/runtime/wayland-window-geometry.md §7.
 //
+// Service   : org.displayxr.WindowGeometry          (same bus name)
+// Object    : /org/displayxr/WorkspaceHotkey
+// Interface : org.displayxr.WorkspaceHotkey1         (extension version 13+)
+//   Method  Configure(s accelerator, s unit) -> (b pending)
+//             Grab `accelerator` (GTK syntax, "<Control>space"; "" = release
+//             and forget) as a global keybinding for the caller, and remember
+//             it — with `unit`, a systemd USER unit ("" = none) — across the
+//             caller's exit and shell restarts. `pending`: a press happened
+//             while no caller was registered, within the last 30 s.
+//   Method  Suspend(b suspend, u timeoutMs)
+//             Release the grab (a hotkey-capture box must see the chord) until
+//             Suspend(false) or the timeout (capped at 60 s).
+//   Method  GetState() -> (s)               JSON diagnostics
+//   Signal  Activated(u timestamp)          the accelerator was pressed
+//   A press while the configuring client's bus connection is alive only emits
+//   Activated. A press while it is gone (the client exited — e.g. a
+//   socket-activated service that exits when idle) also starts `unit`
+//   (org.freedesktop.systemd1.Manager.StartUnit, mode "replace") and is
+//   reported back as `pending` by the client's next Configure. The extension
+//   knows nothing about what the client does with a press. See
+//   docs/specs/runtime/workspace-controller-registration.md § Linux.
+//
 // This extension is a SHARED asset — a vendor SDK runtime package may ship it
 // to serve its own non-DisplayXR apps (one publisher, many consumers; ADR-033).
 // Keep the UUID/bus/interface identifiers and the schema rules below intact:
@@ -653,6 +675,123 @@
         },
     };
 
+    /*
+     * ── Workspace hotkey bookkeeping (extension version 13) ──
+     *
+     * Pure logic, no GI: scripts/test_gnome_extension_workspace_hotkey.js
+     * drives it under plain gjs. The GI half (the grab, the D-Bus object, the
+     * cache file, StartUnit) is WorkspaceHotkeyService inside build().
+     */
+    const WorkspaceHotkey = {
+        //! A press with no registered client is reported to the next
+        //! Configure only if that comes within this long (a service that
+        //! never comes up must not launch anything minutes later).
+        PENDING_MS: 30000,
+        //! Longest suspend a caller may ask for (the runtime's safety timeout).
+        MAX_SUSPEND_MS: 60000,
+
+        //! Per-extension state.
+        create() {
+            return {accelerator: '', unit: '', owner: null, pendingUntil: 0, suspendedUntil: 0};
+        },
+
+        //! "" (release) or one or more distinct modifiers then one key name.
+        validAccelerator(a) {
+            if (a === '')
+                return true;
+            if (typeof a !== 'string' || a.length > 64)
+                return false;
+            const m = /^((?:<(?:Control|Shift|Alt|Super)>)+)([A-Za-z0-9_]+)$/.exec(a);
+            if (!m)
+                return false;
+            const mods = m[1].match(/<[A-Za-z]+>/g);
+            return new Set(mods).size === mods.length;
+        },
+
+        //! "" or a plain systemd unit name ending in .service.
+        validUnit(u) {
+            return u === '' || (typeof u === 'string' && u.length <= 255 &&
+                /^[A-Za-z0-9:_.\\@-]+\.service$/.test(u));
+        },
+
+        //! A client (bus unique name @p owner) configured the hotkey. Returns
+        //! whether a press is pending for it (and clears it).
+        configure(st, owner, accelerator, unit, nowMs) {
+            const pending = st.pendingUntil > nowMs && accelerator !== '';
+            st.pendingUntil = 0;
+            st.accelerator = accelerator;
+            st.unit = accelerator === '' ? '' : unit;
+            st.owner = owner;
+            if (accelerator === '')
+                st.suspendedUntil = 0;
+            return pending;
+        },
+
+        //! The client's bus connection went away. Returns true if it was ours.
+        ownerGone(st, owner) {
+            if (st.owner === null || st.owner !== owner)
+                return false;
+            st.owner = null;
+            return true;
+        },
+
+        //! A press: {emit, startUnit}. startUnit is the unit to start, or null.
+        press(st, nowMs) {
+            if (st.accelerator === '' || WorkspaceHotkey.suspended(st, nowMs))
+                return {emit: false, startUnit: null};
+            if (st.owner !== null)
+                return {emit: true, startUnit: null};
+            if (st.unit !== '') {
+                st.pendingUntil = nowMs + WorkspaceHotkey.PENDING_MS;
+                return {emit: true, startUnit: st.unit};
+            }
+            return {emit: true, startUnit: null};
+        },
+
+        //! Returns the suspend length applied, in ms (0 = resumed).
+        suspend(st, on, timeoutMs, nowMs) {
+            if (!on) {
+                st.suspendedUntil = 0;
+                return 0;
+            }
+            const ms = Math.min(Math.max(timeoutMs > 0 ? timeoutMs : WorkspaceHotkey.MAX_SUSPEND_MS, 1),
+                WorkspaceHotkey.MAX_SUSPEND_MS);
+            st.suspendedUntil = nowMs + ms;
+            return ms;
+        },
+
+        suspended(st, nowMs) {
+            return st.suspendedUntil > nowMs;
+        },
+
+        //! Whether the accelerator should be grabbed right now.
+        wantGrab(st, nowMs) {
+            return st.accelerator !== '' && !WorkspaceHotkey.suspended(st, nowMs);
+        },
+
+        //! The cache file: what survives the client's exit and a shell restart.
+        serialize(st) {
+            return JSON.stringify({version: 1, accelerator: st.accelerator, unit: st.unit});
+        },
+
+        //! Restore from the cache file text; anything malformed leaves @p st
+        //! released. Never registers an owner (the client must Configure).
+        deserialize(st, text) {
+            let o = null;
+            try {
+                o = JSON.parse(text);
+            } catch (e) {
+                return false;
+            }
+            if (!o || o.version !== 1 || !WorkspaceHotkey.validAccelerator(o.accelerator) ||
+                !WorkspaceHotkey.validUnit(o.unit ?? ''))
+                return false;
+            st.accelerator = o.accelerator;
+            st.unit = o.accelerator === '' ? '' : (o.unit ?? '');
+            return true;
+        },
+    };
+
     globalThis.displayxrWindowGeometry = {
         //! gi: {Clutter, GObject, Meta, Gio, GLib} — however the caller's
         //! shell spells the import. Returns {WindowGeometryService}.
@@ -669,9 +808,12 @@
         PointerDrag,
         //! The stage-space resolution, exported for its unit test.
         StageScale,
+        //! The workspace hotkey's bookkeeping, exported for its unit test.
+        WorkspaceHotkey,
     };
 
-    function buildModule({Clutter, GObject, Meta, Gio, GLib, Graphene, Mtk, GdkPixbuf, moveSync = true}) {
+    function buildModule({Clutter, GObject, Meta, Gio, GLib, Graphene, Mtk, GdkPixbuf, moveSync = true,
+        Main = null, Shell = null}) {
         //! mutter's layout mode right now (StageScale.layoutMode over the
         //! stage views and monitor scales). Cheap: a handful of views.
         function currentLayoutMode() {
@@ -2353,6 +2495,222 @@
             }
         }
 
+        const HOTKEY_IFACE_XML = `
+<node>
+  <interface name="org.displayxr.WorkspaceHotkey1">
+    <method name="Configure">
+      <arg type="s" direction="in" name="accelerator"/>
+      <arg type="s" direction="in" name="unit"/>
+      <arg type="b" direction="out" name="pending"/>
+    </method>
+    <method name="Suspend">
+      <arg type="b" direction="in" name="suspend"/>
+      <arg type="u" direction="in" name="timeoutMs"/>
+    </method>
+    <method name="GetState">
+      <arg type="s" direction="out" name="json"/>
+    </method>
+    <signal name="Activated">
+      <arg type="u" name="timestamp"/>
+    </signal>
+  </interface>
+</node>`;
+
+        //! Protocol revision of WorkspaceHotkey1, reported by GetState().
+        const WORKSPACE_HOTKEY_VERSION = 1;
+
+        /*
+         * The workspace hotkey (version 13): one global keybinding a client
+         * configures, kept alive across that client's exit. Mutter's
+         * grab_accelerator rather than Main.wm.addKeybinding: the accelerator
+         * is the client's (its own config file is authoritative), so a
+         * gsettings schema — which a system-wide extension would also have to
+         * compile into /usr/share/glib-2.0/schemas — adds nothing; the last
+         * configured value is cached in a small JSON file instead.
+         */
+        class WorkspaceHotkeyService {
+            constructor() {
+                this._st = WorkspaceHotkey.create();
+                this._action = 0;
+                this._actionName = '';
+                this._grabbedAccel = '';
+                this._watchId = 0;
+                this._suspendTimer = 0;
+                const base = typeof GLib.get_user_state_dir === 'function'
+                    ? GLib.get_user_state_dir() : GLib.get_user_cache_dir();
+                this._cacheDir = GLib.build_filenamev([base, 'displayxr']);
+                this._cachePath = GLib.build_filenamev([this._cacheDir, 'workspace-hotkey.json']);
+                this._loadCache();
+
+                this._accelSignal = global.display.connect('accelerator-activated',
+                    (_display, action, _device, timestamp) => {
+                        if (this._action !== 0 && action === this._action)
+                            this._onPress(timestamp);
+                    });
+                this._dbus = Gio.DBusExportedObject.wrapJSObject(HOTKEY_IFACE_XML, this);
+                this._dbus.export(Gio.DBus.session, '/org/displayxr/WorkspaceHotkey');
+                this._sync();
+            }
+
+            destroy() {
+                this._ungrab();
+                if (this._accelSignal) {
+                    global.display.disconnect(this._accelSignal);
+                    this._accelSignal = 0;
+                }
+                this._unwatch();
+                if (this._suspendTimer) {
+                    GLib.source_remove(this._suspendTimer);
+                    this._suspendTimer = 0;
+                }
+                if (this._dbus) {
+                    this._dbus.unexport();
+                    this._dbus = null;
+                }
+            }
+
+            _loadCache() {
+                try {
+                    const [ok, bytes] = GLib.file_get_contents(this._cachePath);
+                    if (ok)
+                        WorkspaceHotkey.deserialize(this._st, new TextDecoder().decode(bytes));
+                } catch (e) {
+                    // No cache yet: nothing is grabbed until a client configures.
+                }
+            }
+
+            _saveCache() {
+                try {
+                    if (this._st.accelerator === '') {
+                        GLib.unlink(this._cachePath);
+                        return;
+                    }
+                    GLib.mkdir_with_parents(this._cacheDir, 0o700);
+                    GLib.file_set_contents(this._cachePath, WorkspaceHotkey.serialize(this._st));
+                } catch (e) {
+                    log(`displayxr: workspace hotkey: could not write ${this._cachePath}: ${e.message}`);
+                }
+            }
+
+            _grab(accel) {
+                const action = global.display.grab_accelerator(accel, Meta.KeyBindingFlags.NONE);
+                if (!action) {
+                    // Another binding owns the chord (or it does not parse).
+                    log(`displayxr: workspace hotkey: could not grab ${accel}`);
+                    return;
+                }
+                this._action = action;
+                this._grabbedAccel = accel;
+                this._actionName = Meta.external_binding_name_for_action(action);
+                Main.wm.allowKeybinding(this._actionName, Shell.ActionMode.NORMAL | Shell.ActionMode.OVERVIEW);
+            }
+
+            _ungrab() {
+                if (this._action === 0)
+                    return;
+                global.display.ungrab_accelerator(this._action);
+                Main.wm.allowKeybinding(this._actionName, Shell.ActionMode.NONE);
+                this._action = 0;
+                this._actionName = '';
+                this._grabbedAccel = '';
+            }
+
+            //! Make the grab match the state (accelerator, suspend).
+            _sync() {
+                const want = WorkspaceHotkey.wantGrab(this._st, Date.now());
+                if (want && this._action !== 0 && this._grabbedAccel === this._st.accelerator)
+                    return;
+                this._ungrab();
+                if (want)
+                    this._grab(this._st.accelerator);
+            }
+
+            _unwatch() {
+                if (this._watchId) {
+                    Gio.bus_unwatch_name(this._watchId);
+                    this._watchId = 0;
+                }
+            }
+
+            _onPress(timestamp) {
+                const r = WorkspaceHotkey.press(this._st, Date.now());
+                if (r.emit && this._dbus) {
+                    this._dbus.emit_signal('Activated', new GLib.Variant('(u)', [(timestamp ?? 0) >>> 0]));
+                }
+                if (r.startUnit) {
+                    Gio.DBus.session.call(
+                        'org.freedesktop.systemd1', '/org/freedesktop/systemd1',
+                        'org.freedesktop.systemd1.Manager', 'StartUnit',
+                        new GLib.Variant('(ss)', [r.startUnit, 'replace']),
+                        null, Gio.DBusCallFlags.NONE, -1, null,
+                        (conn, res) => {
+                            try {
+                                conn.call_finish(res);
+                            } catch (e) {
+                                log(`displayxr: workspace hotkey: StartUnit ${r.startUnit} failed: ${e.message}`);
+                            }
+                        });
+                }
+            }
+
+            ConfigureAsync(params, invocation) {
+                const [accelerator, unit] = params;
+                if (!WorkspaceHotkey.validAccelerator(accelerator) || !WorkspaceHotkey.validUnit(unit)) {
+                    invocation.return_dbus_error('org.freedesktop.DBus.Error.InvalidArgs',
+                        `bad accelerator '${accelerator}' or unit '${unit}'`);
+                    return;
+                }
+                const sender = invocation.get_sender();
+                if (this._st.owner !== sender) {
+                    this._unwatch();
+                    // Registered exactly as long as the caller's bus connection.
+                    this._watchId = Gio.bus_watch_name_on_connection(
+                        Gio.DBus.session, sender, Gio.BusNameWatcherFlags.NONE, null,
+                        () => {
+                            if (WorkspaceHotkey.ownerGone(this._st, sender))
+                                this._unwatch();
+                        });
+                }
+                const pending = WorkspaceHotkey.configure(this._st, sender, accelerator, unit, Date.now());
+                if (accelerator === '') {
+                    this._unwatch();
+                    this._st.owner = null;
+                }
+                this._saveCache();
+                this._sync();
+                invocation.return_value(new GLib.Variant('(b)', [pending]));
+            }
+
+            SuspendAsync(params, invocation) {
+                const [on, timeoutMs] = params;
+                if (this._suspendTimer) {
+                    GLib.source_remove(this._suspendTimer);
+                    this._suspendTimer = 0;
+                }
+                const ms = WorkspaceHotkey.suspend(this._st, on, timeoutMs, Date.now());
+                if (ms > 0) {
+                    this._suspendTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {
+                        this._suspendTimer = 0;
+                        this._sync();
+                        return GLib.SOURCE_REMOVE;
+                    });
+                }
+                this._sync();
+                invocation.return_value(null);
+            }
+
+            GetState() {
+                return JSON.stringify({
+                    version: WORKSPACE_HOTKEY_VERSION,
+                    accelerator: this._st.accelerator,
+                    unit: this._st.unit,
+                    registered: this._st.owner !== null,
+                    grabbed: this._action !== 0,
+                    suspended: WorkspaceHotkey.suspended(this._st, Date.now()),
+                });
+            }
+        }
+
         /*
          * ── The extension proper ─────────────────────────────────────────
          *
@@ -2388,6 +2746,10 @@
                     }
                     this._queueEmit();
                 });
+                // Version 13: the workspace hotkey. Only with the shell's own
+                // keybinding plumbing (Main, Shell) at hand; without it the
+                // object is not exported and a client falls back.
+                this._workspaceHotkey = Main?.wm && Shell ? new WorkspaceHotkeyService() : null;
                 this._nameId = Gio.DBus.session.own_name(
                     'org.displayxr.WindowGeometry',
                     Gio.BusNameOwnerFlags.NONE, null, null);
@@ -2464,6 +2826,10 @@
                 if (this._placement) {
                     this._placement.destroy();
                     this._placement = null;
+                }
+                if (this._workspaceHotkey) {
+                    this._workspaceHotkey.destroy();
+                    this._workspaceHotkey = null;
                 }
                 this._grabbedWindow = null;
 

@@ -1205,3 +1205,34 @@ LMB = mutter's grab, RMB = the pointer drag):
   toggled drag (6 logical px per 8 ms). That is the cost of a tag toggling
   during a drag; it never takes the timeout.
 - App frozen mid-drag with the tag mapped: one timeout per drag, as in §9.7.
+
+## 10. Workspace hotkey — `org.displayxr.WorkspaceHotkey1` (extension version 13)
+
+A Wayland client cannot grab a global chord, and the DisplayXR service that owns
+the workspace-controller launch chord is socket-activated and exits 30 s after its
+last client — so it is usually not running when the chord is pressed. The extension
+is the one long-lived process in the session that can hold a keybinding, so it
+holds it **for** a client:
+
+| member | meaning |
+|---|---|
+| `Configure(s accelerator, s unit) -> (b pending)` | grab `accelerator` (GTK syntax, `<Control>space`; `""` releases and forgets) for the caller, and remember it with `unit` (a systemd **user** unit, `""` = none) across the caller's exit and shell restarts (`$XDG_STATE_HOME/displayxr/workspace-hotkey.json`). `pending`: a press happened while no caller was registered, within the last 30 s |
+| `Suspend(b suspend, u timeoutMs)` | release the grab until `Suspend(false)` or the timeout (capped at 60 s) — a hotkey-capture box must see the chord |
+| `GetState() -> (s)` | JSON diagnostics: `version`, `accelerator`, `unit`, `registered`, `grabbed`, `suspended` |
+| signal `Activated(u timestamp)` | the accelerator was pressed |
+
+The caller is registered exactly as long as its bus connection. A press while it is
+registered only emits `Activated`; a press while it is gone also calls
+`org.freedesktop.systemd1.Manager.StartUnit(unit, "replace")` and is reported back
+by that client's next `Configure`. The grab is `Meta.Display.grab_accelerator`
+(mutter's own path, Wayland and X11 GNOME alike), allowed in the NORMAL and
+OVERVIEW action modes. Nothing is grabbed until a client configures. The bookkeeping
+is the pure `WorkspaceHotkey` object in `lib.js`, unit-tested by
+`scripts/test_gnome_extension_workspace_hotkey.js`; the consumer is
+`src/xrt/targets/service/service_hotkey_linux.c`. Contract and lifecycle:
+`workspace-controller-registration.md` § Linux.
+
+Shared-asset note (§4): the interface knows nothing about DisplayXR — it holds one
+accelerator for one client and starts the unit that client named. The unit name comes
+from the client, the systemd manager is the user's own, and only a `*.service` name is
+accepted.
