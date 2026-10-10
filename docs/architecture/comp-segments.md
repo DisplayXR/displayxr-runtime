@@ -239,6 +239,13 @@ buffer, in order). What differs on macOS:
     right on every display.
 - **The window.** The session's DP keeps the app's NSView (it is the system-default display's DP).
   Every other display's DP is windowless.
+- **The drawable follows the APPLIED window, never the requested one.** AppKit constrains a shown
+  window to the screen's `visibleFrame` (and clamps `setFrame:` to min / max sizes), so the segment
+  table, the canvas and the drawable are all derived from the content rect read back after the
+  window was shown / moved, re-read every frame before `nextDrawable`. A drawable sized from the
+  request would be woven at one size and scaled into another — a broken lens phase on every
+  segment. The runtime-owned placement (ADR-050) also shows the frame-resize cursor over its
+  resize zones, since AppKit no longer sees those mouse-downs.
 - **Not segmented on macOS:** the shared-IOSurface (`_texture`) path, a zones / Local2D / mask frame
   or an output rect (any non-whole-window canvas), a session with no DP, a pinned session,
   `DXR_SEGMENTS=0`, the service / IPC path. Unlike D3D11, a zero-copy frame IS segmented (the crop

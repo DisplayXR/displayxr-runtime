@@ -1383,6 +1383,27 @@ create_window_on_main_thread(struct comp_metal_compositor *c, uint32_t width, ui
 		                                     dequeue:YES]) != nil) {
 			[NSApp sendEvent:event];
 		}
+
+		// Showing the window lets AppKit constrain its frame to the
+		// screen's visibleFrame (a window asked at the panel's full height
+		// comes back shorter by the menu bar + title bar). Re-read the
+		// content rect now: a drawable sized from the REQUESTED rect would
+		// be woven at one size and scaled into another, which breaks the
+		// lens phase. (layer_commit also re-syncs drawableSize from the
+		// view every frame; this keeps the layer honest from the start.)
+		const NSRect shown = [c->window contentRectForFrameRect:c->window.frame];
+		const CGFloat shown_scale = c->window.backingScaleFactor;
+		const CGSize want =
+		    CGSizeMake(round(shown.size.width * shown_scale), round(shown.size.height * shown_scale));
+		const CGSize had = c->metal_layer.drawableSize;
+		if (want.width != had.width || want.height != had.height) {
+			U_LOG_W("Hosted window constrained by the screen: content %ux%u pt asked, %.0fx%.0f pt "
+			        "shown — drawable %.0fx%.0f -> %.0fx%.0f px",
+			        width, height, shown.size.width, shown.size.height, had.width, had.height, want.width,
+			        want.height);
+			c->metal_layer.contentsScale = shown_scale;
+			c->metal_layer.drawableSize = want;
+		}
 	} else {
 		U_LOG_I("Offscreen mode — window created but hidden");
 	}
