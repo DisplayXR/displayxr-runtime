@@ -291,19 +291,26 @@ also 0 GSL warnings, 0 `Failed to render layers` and 0 CNSDK -3.
   `gpu_debug_layer_app=org.freedesktop.monado.openxr_runtime.out_of_process`.
   This path is debug-only: `GraphicsEnvironment.debugLayerEnabled()` requires
   a debuggable build or app, or the inject-layers metadata.
-- *Product (next step, not in this PR):* ship the `.so` inside the DisplayXR
-  client AAR so it lands in the **app's own** `nativeLibraryDir`. **Verified (AOSP main):**
+- *Product (#1919):* the `.so` ships inside the DisplayXR client AAR
+  (`jni/arm64-v8a/`, built by a standalone layer-only CMake project in
+  `displayxr_client/src/main/cpp`; CI asserts it is byte-identical to the
+  runtime APK's copy) so it lands in the **app's own** library path. App-side
+  contract and verification: `docs/getting-started/android-build-guide.md`
+  § *The queue-lock layer ships in the client AAR*. **Verified (AOSP main):**
   `GraphicsEnvironment.setupGpuLayers()` appends the app's library search
   paths to the layer path "in all cases", outside the debug gate. In
   `DiscoverLayers()`, the loader searches `getLayerPaths()` unconditionally;
   only `/data/local/debug/vulkan` is gated on `isDebuggable()`. So a
   non-debuggable app can load a layer bundled in its own APK, and the runtime's
   existing injection names it.
-- *Not verified:* behaviour on the specific Android releases our devices run
-  (only `main` was read), and whether the search path includes the
-  `base.apk!/lib/arm64-v8a` form when an app ships uncompressed,
-  non-extracted libs. The loader supports zip paths; if the form is missing,
-  set `extractNativeLibs=true` as the fallback.
+- *Uncompressed libs — verified in AOSP (#1919), android11/13/14-release and
+  main:* `LoadedApk.makePaths()` puts both `nativeLibraryDir` and
+  `<apk>!/lib/<abi>` on the class loader's library search path, which
+  `ApplicationLoaders` hands to `GraphicsEnvironment.setLayerPaths()`;
+  `DiscoverLayersInPathList()` walks `!/` zip paths, keeping entries that are
+  stored and page-aligned (AGP's uncompressed packaging), and opens them via
+  the app namespace. *Not verified:* the OEM builds our devices run. Fallback:
+  `extractNativeLibs=true` / `useLegacyPackaging true`.
 
 **Hazards to measure before productizing.**
 - With the per-device A/B scope only: a DP-internal `vkQueueWaitIdle`, or a

@@ -430,6 +430,90 @@ adb logcat -d | grep "Hybrid mode:"
 adb shell ps -A -o PID,NAME | grep :dxr   # satellites, one per IPC client
 ```
 
+### The queue-lock layer ships in the client AAR (#1919)
+
+The DisplayXR client AAR (`DisplayXR-Client-<ver>.aar`, attached to every
+runtime `v*` release — the library Android apps already depend on for the
+runtime wake/broker visibility) also carries
+`jni/arm64-v8a/libVkLayer_DXR_queue_lock.so`, the per-queue Vulkan layer from
+#1905.
+
+**Why it has to ride in the app.** On Adreno, unsynchronised `vkQueue*` calls
+from the app and the runtime corrupt the GSL context timestamp; the layer
+serialises them. Only a layer sits in the app's dispatch chain, and Android's
+Vulkan loader only looks for layers on the **app's own** library search path
+(plus the debug-only paths below). A copy inside the runtime APK is invisible
+to a shipped app. When the layer is live, the vk_native compositor's marker
+handshake (`vkGetQueueLockMarkerDXR`) auto-enables mid-frame fills (#1910), so
+the weave refreshes at panel rate instead of app rate. When it is absent,
+everything still works, just at app rate. The AAR copy is built from the same
+commit, NDK and flags as the runtime APK's, and CI asserts the two are
+byte-identical.
+
+**What an app must do: depend on the AAR, nothing else.** The runtime's
+`xrCreateVulkanInstanceKHR` (`XR_KHR_vulkan_enable2`) appends
+`VK_LAYER_DXR_queue_lock` to the app's layer list itself, and retries without
+it if the loader cannot find it.
+
+- Do **not** enable the layer yourself, ship a manifest or JSON for it, or
+  rename the `.so`. The loader discovers it by the `libVkLayer*.so` file name.
+- An app on `XR_KHR_vulkan_enable` (v1) creates its own `VkInstance`, so the
+  runtime cannot inject the layer. That app must add `VK_LAYER_DXR_queue_lock`
+  to `ppEnabledLayerNames` itself, or move to enable2.
+- The layer is `arm64-v8a` only, like the runtime. Other ABIs simply do not get
+  it.
+- Letting your build strip it, as it strips any other native lib, is fine.
+
+**Uncompressed native libs (`extractNativeLibs=false`, AGP's default
+`useLegacyPackaging false`).** AOSP supports this: verified in `android11-release`,
+`android13-release`, `android14-release` and `main`. `LoadedApk.makePaths()` adds
+both `nativeLibraryDir` and `<base.apk>!/lib/<abi>` to the class loader's
+library search path. `GraphicsEnvironment.setupGpuLayers()` appends that whole
+search path to the layer path "in all cases" (outside the debug gate). The
+loader's `DiscoverLayersInPathList()` walks `apk!/` zip paths and accepts
+entries that are **stored and page-aligned**, which is how AGP packages
+uncompressed libs. It then opens them through the app's linker namespace. What
+is *not* verified is the exact OEM builds our devices run. If a device does not
+find the layer with uncompressed libs, the fallback is to extract them:
+
+```gradle
+android { packagingOptions { jniLibs { useLegacyPackaging true } } }
+// equivalently: <application android:extractNativeLibs="true"> in the manifest
+```
+
+(The DisplayXR demos already set `useLegacyPackaging true`.)
+
+**Verify.**
+
+```bash
+unzip -l app-release.apk | grep VkLayer
+#   lib/arm64-v8a/libVkLayer_DXR_queue_lock.so
+adb logcat -d | grep -E "DXR-queue-lock|#1905: mid-frame fill"
+#   DXR-queue-lock: VK_LAYER_DXR_queue_lock: device 0x... registered, lock scope per-queue
+#   #1905: mid-frame fill ON — auto: VK_LAYER_DXR_queue_lock is live on this device ...
+```
+
+If you see `#902: VK_LAYER_DXR_queue_lock not found by the Vulkan loader —
+retrying without` followed by `mid-frame fill OFF — auto: ... absent`, the
+layer did not reach the app's lib path. Check the APK listing first, then
+`extractNativeLibs`. `setprop debug.dxr.midframe_fill 0|1` forces the policy
+either way for A/B testing.
+
+**Apps without the AAR (userdebug only).** The runtime APK also carries the
+layer, so a debug setup can load it into any app from there:
+
+```bash
+adb shell settings put global enable_gpu_debug_layers 1
+adb shell settings put global gpu_debug_app <app.package>
+adb shell settings put global gpu_debug_layers VK_LAYER_DXR_queue_lock
+adb shell settings put global gpu_debug_layer_app org.freedesktop.monado.openxr_runtime.out_of_process
+# undo: for k in enable_gpu_debug_layers gpu_debug_app gpu_debug_layers gpu_debug_layer_app; do adb shell settings delete global $k; done
+```
+
+This path is debug-gated (`GraphicsEnvironment.debugLayerEnabled()` requires a
+debuggable build or app). It is a test path, not a delivery path. Background:
+`docs/roadmap/vk-late-weave-queue-serialization.md` §7.
+
 ## Step 4: Build the test app APK
 
 ```bash
