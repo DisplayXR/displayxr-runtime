@@ -109,6 +109,12 @@ endif()
 if(TARGET target_lists)
 	list(APPEND tests tests_target_backcompat_claim)
 endif()
+# Display dashboard phase 8 -- workspace-controller launch settings: the hotkey
+# grammar, service.json's `controllers` map, the active-controller selection
+# rule and the `workspace list --json` document (target_workspace_config).
+if(TARGET target_workspace_config)
+	list(APPEND tests tests_service_workspace_config)
+endif()
 if(XRT_HAVE_D3D11)
 	list(APPEND tests tests_aux_d3d_d3d11 tests_aux_d3d_render_adapter tests_comp_client_d3d11
 	     tests_comp_xbridge_plane_policy tests_comp_split_gate tests_comp_eye_dp_policy
@@ -662,6 +668,10 @@ endif()
 # winner rule of the DP registry, pure functions of target_screen_pin.c.
 target_sources(tests_target_screen_pin PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/common/target_screen_pin.c)
 target_include_directories(tests_target_screen_pin PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/common)
+
+if(TARGET target_workspace_config)
+	target_link_libraries(tests_service_workspace_config PRIVATE target_workspace_config xrt-external-cjson)
+endif()
 
 if(XRT_BUILD_DRIVER_HANDTRACKING)
 	target_link_libraries(
