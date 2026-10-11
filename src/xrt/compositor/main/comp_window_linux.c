@@ -29,6 +29,7 @@
 #include "main/comp_compositor.h"
 #include "main/comp_target_swapchain.h"
 #include "main/comp_window_linux.h"
+#include "main/comp_window_linux_private.h"
 
 #include <vulkan/vulkan_xcb.h>
 #include <xcb/xcb.h>
@@ -68,8 +69,8 @@ comp_window_linux_set_input_sink(comp_window_linux_input_fn fn, void *userdata)
 	pthread_mutex_unlock(&g_sink_lock);
 }
 
-static void
-emit_input(const struct comp_window_linux_input *ev)
+void
+comp_window_linux_emit_input(const struct comp_window_linux_input *ev)
 {
 	// Held across the call so a sink being cleared cannot race a delivery that
 	// is still using its userdata. The sink must not call back into this file.
@@ -165,7 +166,9 @@ comp_window_linux_keysym_to_vk(uint32_t ks)
  */
 struct comp_window_linux
 {
+	//! Common initial sequence with comp_window_linux_base (keep first, in order).
 	struct comp_target_swapchain base;
+	const struct comp_window_linux_ops *ops;
 
 	//! Panel origin in virtual-desktop px (selects the fullscreen monitor).
 	int32_t screen_left, screen_top;
@@ -455,7 +458,7 @@ handle_event(struct comp_window_linux *cwl,
 	// Anything but motion flushes the coalesced motion first, so ordering
 	// (move-then-click) is preserved.
 	if (type != XCB_MOTION_NOTIFY && *have_pending_motion) {
-		emit_input(pending_motion);
+		comp_window_linux_emit_input(pending_motion);
 		*have_pending_motion = false;
 	}
 
@@ -485,7 +488,7 @@ handle_event(struct comp_window_linux *cwl,
 		if (down && debug_get_bool_option_linux_win_key_debug()) {
 			U_LOG_W("[key] keysym=0x%04x vk=0x%02x mods=0x%x", in.keysym, in.vk_code, in.modifiers);
 		}
-		emit_input(&in);
+		comp_window_linux_emit_input(&in);
 		return;
 	}
 	case XCB_BUTTON_PRESS:
@@ -504,7 +507,7 @@ handle_event(struct comp_window_linux *cwl,
 			}
 			in.type = COMP_WINDOW_LINUX_INPUT_SCROLL;
 			in.scroll_delta = b->detail == 4 ? 1.0f : -1.0f;
-			emit_input(&in);
+			comp_window_linux_emit_input(&in);
 			return;
 		}
 		uint32_t button = 0;
@@ -517,7 +520,7 @@ handle_event(struct comp_window_linux *cwl,
 		in.type = COMP_WINDOW_LINUX_INPUT_BUTTON;
 		in.button = button;
 		in.is_down = down;
-		emit_input(&in);
+		comp_window_linux_emit_input(&in);
 		return;
 	}
 	case XCB_MOTION_NOTIFY: {
@@ -539,7 +542,7 @@ handle_event(struct comp_window_linux *cwl,
 		}
 		memset(cwl->keys_down, 0, sizeof(cwl->keys_down));
 		in.type = COMP_WINDOW_LINUX_INPUT_FOCUS_LOST;
-		emit_input(&in);
+		comp_window_linux_emit_input(&in);
 		return;
 	}
 	case XCB_CONFIGURE_NOTIFY: {
@@ -606,7 +609,7 @@ drain_events(struct comp_window_linux *cwl)
 		free(event);
 	}
 	if (have_pending_motion) {
-		emit_input(&pending_motion);
+		comp_window_linux_emit_input(&pending_motion);
 	}
 }
 
@@ -823,8 +826,8 @@ comp_window_linux_init_post_vulkan(struct comp_target *ct, uint32_t width, uint3
 	return true;
 }
 
-void
-comp_window_linux_set_visible(struct comp_target *ct, bool visible)
+static void
+x11_set_visible(struct comp_target *ct, bool visible)
 {
 	struct comp_window_linux *cwl = (struct comp_window_linux *)ct;
 	if (cwl == NULL || cwl->conn == NULL) {
@@ -845,8 +848,8 @@ comp_window_linux_set_visible(struct comp_target *ct, bool visible)
 	}
 }
 
-void
-comp_window_linux_set_cursor_hidden(struct comp_target *ct, bool hidden)
+static void
+x11_set_cursor_hidden(struct comp_target *ct, bool hidden)
 {
 	struct comp_window_linux *cwl = (struct comp_window_linux *)ct;
 	if (cwl == NULL || cwl->conn == NULL) {
@@ -912,9 +915,16 @@ comp_window_linux_destroy(struct comp_target *ct)
 	free(cwl);
 }
 
+static const struct comp_window_linux_ops x11_ops = {
+    .set_visible = x11_set_visible,
+    .set_cursor_hidden = x11_set_cursor_hidden,
+};
+
 struct comp_target *
-comp_window_linux_create(struct comp_compositor *c, int32_t screen_left, int32_t screen_top)
+comp_window_linux_x11_create(struct comp_compositor *c, const struct comp_window_linux_placement *place)
 {
+	const int32_t screen_left = place != NULL ? place->screen_left : 0;
+	const int32_t screen_top = place != NULL ? place->screen_top : 0;
 	struct comp_window_linux *w = U_TYPED_CALLOC(struct comp_window_linux);
 	if (w == NULL) {
 		return NULL;
@@ -924,6 +934,7 @@ comp_window_linux_create(struct comp_compositor *c, int32_t screen_left, int32_t
 	// over XWayland); force fake pacing as the Android / macOS targets do.
 	comp_target_swapchain_init_and_set_fnptrs(&w->base, COMP_TARGET_FORCE_FAKE_DISPLAY_TIMING);
 
+	w->ops = &x11_ops;
 	pthread_mutex_init(&w->lock, NULL);
 	w->screen_left = screen_left;
 	w->screen_top = screen_top;
@@ -938,4 +949,58 @@ comp_window_linux_create(struct comp_compositor *c, int32_t screen_left, int32_t
 	w->base.base.c = c;
 
 	return &w->base.base;
+}
+
+
+/*
+ *
+ * Public dispatch + backend selection.
+ *
+ */
+
+void
+comp_window_linux_set_visible(struct comp_target *ct, bool visible)
+{
+	struct comp_window_linux_base *b = (struct comp_window_linux_base *)ct;
+	if (b != NULL && b->ops != NULL && b->ops->set_visible != NULL) {
+		b->ops->set_visible(ct, visible);
+	}
+}
+
+void
+comp_window_linux_set_cursor_hidden(struct comp_target *ct, bool hidden)
+{
+	struct comp_window_linux_base *b = (struct comp_window_linux_base *)ct;
+	if (b != NULL && b->ops != NULL && b->ops->set_cursor_hidden != NULL) {
+		b->ops->set_cursor_hidden(ct, hidden);
+	}
+}
+
+/*!
+ * DXR_SERVICE_WINDOW_BACKEND=x11|wayland|auto (default auto). Auto takes native
+ * Wayland when a compositor answers with xdg-shell + viewporter +
+ * fractional-scale — the only path that presents 1:1 on a fractionally scaled
+ * panel (XWayland windows are resampled there, which breaks the weave) — and
+ * X11 otherwise (Xorg, or XWayland without those protocols).
+ */
+struct comp_target *
+comp_window_linux_create(struct comp_compositor *c, const struct comp_window_linux_placement *place)
+{
+	const char *env = getenv("DXR_SERVICE_WINDOW_BACKEND");
+	const bool force_x11 = env != NULL && strcmp(env, "x11") == 0;
+	const bool force_wl = env != NULL && strcmp(env, "wayland") == 0;
+#ifdef XRT_HAVE_COMP_LINUX_WINDOW_WAYLAND
+	if (!force_x11 && (force_wl || comp_window_linux_wayland_available())) {
+		U_LOG_W("comp_window_linux: native Wayland service surface%s", force_wl ? " (forced)" : "");
+		return comp_window_linux_wayland_create(c, place);
+	}
+#else
+	if (force_wl) {
+		U_LOG_W(
+		    "comp_window_linux: DXR_SERVICE_WINDOW_BACKEND=wayland but this build has no Wayland "
+		    "backend — using X11");
+	}
+#endif
+	U_LOG_W("comp_window_linux: X11 service surface%s", force_x11 ? " (forced)" : "");
+	return comp_window_linux_x11_create(c, place);
 }
