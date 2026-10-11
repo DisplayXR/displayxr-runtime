@@ -107,6 +107,10 @@ static const char *instance_extensions_common[] = {
     // or XWayland connection. The weave engine (#1699) needs only get_vk.
     VK_KHR_XCB_SURFACE_EXTENSION_NAME,                      //
 #endif
+#if defined(VK_USE_PLATFORM_WAYLAND_KHR) && defined(XRT_OS_LINUX_DESKTOP)
+    // Desktop Linux: the native-Wayland service surface (#710).
+    VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME,                  //
+#endif
 };
 
 static const char *required_device_extensions[] = {
@@ -1034,8 +1038,7 @@ null_target_service_create_from_window_linux(struct comp_target_service *service
 	// comp_compositor and null_compositor (shared comp_base).
 	struct comp_compositor *c_alias = (struct comp_compositor *)nc;
 
-	struct comp_target *ct = comp_window_linux_create(c_alias, place != NULL ? place->screen_left : 0,
-	                                                  place != NULL ? place->screen_top : 0);
+	struct comp_target *ct = comp_window_linux_create(c_alias, place);
 	if (ct == NULL) {
 		NULL_ERROR(nc, "Linux: failed to allocate the service surface target");
 		return XRT_ERROR_ALLOCATION;
@@ -1066,11 +1069,31 @@ null_target_service_create_from_window_linux(struct comp_target_service *service
 		return XRT_ERROR_VULKAN;
 	}
 
+	// MAILBOX when offered: still vblank-latched (no tearing), and it never
+	// blocks the render loop on a surface the compositor is not showing (the
+	// surface is unmapped while hidden, and a FIFO swapchain could wait on a
+	// frame callback that never comes). The loop is paced by comp_multi.
+	VkPresentModeKHR present_mode = VK_PRESENT_MODE_FIFO_KHR;
+	{
+		struct vk_bundle *vk = get_vk(nc);
+		VkSurfaceKHR surf = ((struct comp_target_swapchain *)ct)->surface.handle;
+		VkPresentModeKHR modes[16];
+		uint32_t n = ARRAY_SIZE(modes);
+		if (surf != VK_NULL_HANDLE &&
+		    vk->vkGetPhysicalDeviceSurfacePresentModesKHR(vk->physical_device, surf, &n, modes) >= VK_SUCCESS) {
+			for (uint32_t i = 0; i < n; i++) {
+				if (modes[i] == VK_PRESENT_MODE_MAILBOX_KHR) {
+					present_mode = VK_PRESENT_MODE_MAILBOX_KHR;
+				}
+			}
+		}
+	}
+
 	struct comp_target_create_images_info info = {
 	    .extent = {.width = ct->width, .height = ct->height},
 	    .image_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
 	    .color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
-	    .present_mode = VK_PRESENT_MODE_FIFO_KHR,
+	    .present_mode = present_mode,
 	    .format_count = 4,
 	    .formats =
 	        {

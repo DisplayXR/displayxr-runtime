@@ -6,20 +6,24 @@
  * @ingroup comp_main
  *
  * The desktop-Linux twin of @ref comp_window_macos (#710, #967): a
- * @ref comp_target_swapchain subclass that presents to a runtime-owned X11
- * window inside the service process via VK_KHR_xcb_surface. The service owns
- * the window (the hosted model) because no app window is passed across the
- * process boundary on this path — it is the ONE full-screen surface the
- * comp_multi shared spatial surface composites every client into.
+ * @ref comp_target_swapchain subclass that presents to a runtime-owned window
+ * inside the service process. The service owns the window (the hosted model)
+ * because no app window is passed across the process boundary on this path —
+ * it is the ONE full-screen surface the comp_multi shared spatial surface
+ * composites every client into.
  *
- * X11 is reached directly on an Xorg session and through XWayland on a
- * Wayland session (GNOME). The window is made fullscreen on the 3D panel's
- * RandR monitor (the panel's desktop origin comes from
- * xrt_system_compositor_info::display_screen_left/top), using the
- * WM-cooperative recipe validated for the in-process hosted window
- * (comp_vk_native_window_xcb.c, #715): mutter discards client-requested
- * geometry for a panel-sized toplevel, so the window is fullscreened onto the
- * monitor instead.
+ * Two backends, picked at create time (DXR_SERVICE_WINDOW_BACKEND=x11|wayland
+ * overrides):
+ *
+ * - **Native Wayland** (comp_window_linux_wayland.c, the default when a
+ *   compositor offers xdg-shell + wp_viewporter + wp_fractional_scale_v1): an
+ *   xdg_toplevel fullscreened on the panel's wl_output, a device-pixel buffer
+ *   mapped 1:1 through the viewport, an opaque region for direct scanout. The
+ *   only 1:1 path on a fractionally scaled GNOME desktop — XWayland windows are
+ *   resampled there, which breaks the weave.
+ * - **X11** (comp_window_linux.c; Xorg, or XWayland as a fallback): fullscreen
+ *   on the panel's RandR monitor with the WM-cooperative recipe validated for
+ *   the in-process hosted window (comp_vk_native_window_xcb.c, #715).
  *
  * Input: the window owns a small event thread. Keyboard / pointer / scroll
  * events on the surface are decoded into @ref comp_window_linux_input (keys
@@ -62,22 +66,21 @@ struct comp_window_linux_placement
 /*!
  * Create a desktop-Linux present target. @p c is the owning compositor (in the
  * service a @ref null_compositor up-cast to @ref comp_compositor — both start
- * with @ref comp_base, so @p c->base.vk is valid). @p screen_left /
- * @p screen_top are the 3D panel's top-left in virtual-desktop pixels; they
- * pick the RandR monitor the window is fullscreened on ((0, 0) = the monitor
- * at the desktop origin).
+ * with @ref comp_base, so @p c->base.vk is valid). @p place (may be NULL =
+ * the monitor at the desktop origin) picks the output the window is
+ * fullscreened on; the target copies it.
  *
- * The X connection, window and VkSurfaceKHR are created in
- * @ref comp_target::init_post_vulkan, which also waits (bounded) for the
- * window manager to settle the fullscreen size so the first swapchain is
- * created at the final extent.
+ * The window-system connection, window and VkSurfaceKHR are created in
+ * @ref comp_target::init_post_vulkan, which also settles the size the first
+ * swapchain is created at (X11: the WM's fullscreen geometry; Wayland: the
+ * panel output's mode in device pixels).
  *
  * @return the target's @ref comp_target base, or NULL on allocation failure.
  *
  * @ingroup comp_main
  */
 struct comp_target *
-comp_window_linux_create(struct comp_compositor *c, int32_t screen_left, int32_t screen_top);
+comp_window_linux_create(struct comp_compositor *c, const struct comp_window_linux_placement *place);
 
 /*!
  * Map (show) or unmap (hide) the full-screen surface window. The service is a
