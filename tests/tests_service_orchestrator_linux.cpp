@@ -279,7 +279,7 @@ TEST_CASE("AUTO: discovered, not spawned at init, launch request spawns once", "
 	REQUIRE(f.wait_lines(2));
 }
 
-TEST_CASE("hotkey press spawns the controller; a press while running is a no-op", "[service][orchestrator][linux]")
+TEST_CASE("hotkey press spawns the controller; a press while running is forwarded to it", "[service][orchestrator][linux]")
 {
 	fixture f;
 	service_config cfg = config(SERVICE_CHILD_AUTO);
