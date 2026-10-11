@@ -52,6 +52,7 @@
 #include <openxr/XR_DXR_view_rig.h>
 #include <openxr/XR_DXR_cursor_depth.h>
 #include "dxr_view_config.h" // #1486 PRIMARY_MULTIVIEW_DXR opt-in
+#include "cursor_depth.h"    // dxr::CursorDepth — XR_DXR_cursor_depth bookkeeping (ADR-046)
 
 // ============================================================================
 // Logging
@@ -893,14 +894,16 @@ static void EnsureDepthTexture(MetalRenderer &r, uint32_t w, uint32_t h)
 // ============================================================================
 // XR_DXR_cursor_depth (ADR-046) — reference adoption.
 //
-// The app owns the depth: each frame it hit-tests the cube under the cursor
-// FOOTPRINT (rays from the outer eyes through a ring of points around the
-// hotspot) and hands the nearest hit to xrLocateViews. The runtime returns
-// where to draw the cursor sprite; the app draws it last, depth test off, and
-// hides the OS cursor while it does. Since spec v4 (ADR-046 Amendment 2) that
-// is only while content pops out of the screen under the cursor: over the
-// floor, empty space or anything on/behind the glass, isActive is false and the
-// OS cursor is the cursor. Opt out with DISPLAYXR_CURSOR_DEPTH=0;
+// The app owns the depth: it answers "ray -> first cube hit" (RayHitCube) and
+// displayxr-common's dxr::CursorDepth does the rest — the pointer as a canvas
+// UV, the footprint rays from the outer eyes of the previous locate, the
+// nearest hit, the struct chain on xrLocateViews, and hiding the OS cursor
+// exactly while the depth cursor replaces it. By default (spec v5) the RUNTIME
+// draws the cursor; DISPLAYXR_CURSOR_DEPTH_DRAW=app draws the crosshair here
+// from the placement instead. Since spec v4 (ADR-046 Amendment 2) a cursor is
+// drawn only while content pops out of the screen under it: over the floor,
+// empty space or anything on/behind the glass, the OS cursor is the cursor.
+// Opt out with DISPLAYXR_CURSOR_DEPTH=0;
 // pick the anchor mode with DISPLAYXR_CURSOR_DEPTH_ANCHOR=hybrid|screen|world
 // (unset = the runtime default, HYBRID).
 // ============================================================================
@@ -938,53 +941,6 @@ static bool RayHitCube(const XrVector3f &o, const XrVector3f &d, float rot, floa
     }
     tOut = t0;
     return true;
-}
-
-// Ray from a located view through canvas point (u, v): Kooima frusta all
-// frame the canvas, so (u, v) maps linearly onto the fov tangents.
-static XrVector3f ViewRayDir(const XrView &view, float u, float v)
-{
-    const float tl = tanf(view.fov.angleLeft), tr = tanf(view.fov.angleRight);
-    const float tu = tanf(view.fov.angleUp), td = tanf(view.fov.angleDown);
-    float dx, dy, dz;
-    quat_rotate_vec3(view.pose.orientation, tl + u * (tr - tl), tu - v * (tu - td), -1.0f, &dx, &dy, &dz);
-    return {dx, dy, dz};
-}
-
-// Nearest cube point (to the viewer) under the cursor footprint, using the
-// outer views of the previous locate. Footprint = the sprite plus 50%.
-static bool CursorFootprintHit(const std::vector<XrView> &views, uint32_t active, float u, float v,
-                               float canvasAspect, float rot, XrVector3f &nearest)
-{
-    if (active < 2 || views.size() < active) return false;
-    const XrView *outer[2] = {&views[0], &views[active - 1]};
-    float fx, fy, fz;
-    quat_rotate_vec3(views[0].pose.orientation, 0.0f, 0.0f, -1.0f, &fx, &fy, &fz);
-    const float r = 0.75f * kCursorHeight; // footprint radius, in canvas heights
-    bool found = false;
-    float best = 1e30f;
-    for (int k = -1; k < 8; k++) {
-        float su = u, sv = v;
-        if (k >= 0) {
-            const float a = (float)k * 0.78539816f;
-            su += r * cosf(a) / canvasAspect;
-            sv += r * sinf(a);
-        }
-        for (const XrView *view : outer) {
-            const XrVector3f d = ViewRayDir(*view, su, sv);
-            float t;
-            if (!RayHitCube(view->pose.position, d, rot, t)) continue;
-            const XrVector3f p = {view->pose.position.x + d.x * t, view->pose.position.y + d.y * t,
-                                  view->pose.position.z + d.z * t};
-            const float depth = p.x * fx + p.y * fy + p.z * fz; // smaller = nearer the viewer
-            if (depth < best) {
-                best = depth;
-                nearest = p;
-                found = true;
-            }
-        }
-    }
-    return found;
 }
 
 static void DrawCursorSprite(MetalRenderer &r, id<MTLRenderCommandEncoder> enc, const float vp_mat[16])
@@ -3023,6 +2979,30 @@ int main(int argc, char **argv)
         app.cursorDepthCustomSprite = false;
     }
 
+    // XR_DXR_cursor_depth (ADR-046): the displayxr-common helper. enable(0)
+    // (extension off / opted out) leaves it inert: no structs, no OS cursor.
+    dxr::CursorDepth cursor;
+    cursor.enable(app.hasCursorDepthExt ? app.cursorDepthSpecVersion : 0);
+    cursor.setWindowCocoa((__bridge void *)g_metalView);
+    cursor.setCursorHeight(kCursorHeight);
+    cursor.setWantPlacement(true); // the diagnostics below
+    if (!app.cursorDepthRuntimeDraw) {
+        cursor.setDrawMode(dxr::CursorDepth::DrawMode::App);
+        cursor.setFootprintBodyOffset(dxr::kCursorCenteredBodyOffset); // our crosshair is centred
+    } else if (app.cursorDepthCustomSprite) {
+        cursor.setSprite(app.cursorSpriteSwapchain, {0.5f, 0.5f}, 0.01f); // ring: hotspot = centre, 1 cm
+    }
+    if (app.cursorDepthChainOptions) cursor.setAnchor(app.cursorDepthAnchor);
+    cursor.useDepthLayer(app.cursorDepthFromLayer);
+    cursor.setRayCast([&renderer](const dxr::CursorRay &r) -> std::optional<float> {
+        float t;
+        return RayHitCube(r.origin, r.dir, renderer.cubeRotation, t) ? std::optional<float>(t) : std::nullopt;
+    });
+    if (const char *fx = getenv("DISPLAYXR_CURSOR_DEPTH_UV")) { // scripted cursor for headless verification
+        float fu, fv;
+        if (sscanf(fx, "%f,%f", &fu, &fv) == 2) cursor.setPointerUV(fu, fv);
+    }
+
     // HUD window-space layer swapchain (XR_EXT_window_space_layer).
     XrHudSwapchain hudSwapchain;
     HudRendererMacOS hudRenderer = {};
@@ -3291,95 +3271,11 @@ int main(int argc, char **argv)
             viewState.next = &viewRigRaw;
         }
 
-        // XR_DXR_cursor_depth (ADR-046): hint from the previous locate's views
-        // (the hit test needs rays, the rays need views - one frame late, which
-        // the runtime's filter absorbs).
-        static std::vector<XrView> prevViews;
-        static uint32_t prevActive = 0;
-        XrCursorDepthHintDXR cursorHint = {XR_TYPE_CURSOR_DEPTH_HINT_DXR};
-        XrCursorDepthPlacementDXR cursorPlacement = {XR_TYPE_CURSOR_DEPTH_PLACEMENT_DXR};
-        // Spec v2 (ADR-046 3a): "find the nearest point in the depth I submit".
-        XrCursorDepthSourceDXR cursorSource = {XR_TYPE_CURSOR_DEPTH_SOURCE_DXR};
-        cursorSource.source = XR_CURSOR_DEPTH_SOURCE_SUBMITTED_DEPTH_DXR;
-        // Spec v3: anchor mode (margin left at the runtime default).
-        XrCursorDepthOptionsDXR cursorOptions = {
-            XR_TYPE_CURSOR_DEPTH_OPTIONS_DXR};
-        cursorOptions.anchorMode = app.cursorDepthAnchor;
-        cursorOptions.margin = 0.0f;
-        // Spec v5 (ADR-046 Amendment 2 B): "runtime, draw it" - with our
-        // sprite (hotspot = its centre, 1 cm tall) or the runtime's default
-        // look (XR_NULL_HANDLE: the OS cursor's shape and size).
-        XrCursorDepthDrawInfoDXR cursorDrawInfo = {XR_TYPE_CURSOR_DEPTH_DRAW_INFO_DXR};
-        cursorDrawInfo.image = app.cursorDepthCustomSprite ? app.cursorSpriteSwapchain : XR_NULL_HANDLE;
-        cursorDrawInfo.hotSpot = {0.5f, 0.5f};
-        cursorDrawInfo.sizeMeters = app.cursorDepthCustomSprite ? 0.01f : 0.0f;
-        cursorDrawInfo.visible = XR_TRUE;
-        XrCursorDepthDrawStateDXR cursorDrawState = {XR_TYPE_CURSOR_DEPTH_DRAW_STATE_DXR};
-        bool cursorInCanvas = false;
-        if (app.hasCursorDepthExt && g_window != nil && g_metalView != nil) {
-            NSPoint pw = [g_window mouseLocationOutsideOfEventStream];
-            NSPoint pv = [g_metalView convertPoint:pw fromView:nil];
-            NSRect b = [g_metalView bounds];
-            if (b.size.width > 0 && b.size.height > 0) {
-                float u = (float)(pv.x / b.size.width);
-                float v = [g_metalView isFlipped] ? (float)(pv.y / b.size.height)
-                                                        : (float)(1.0 - pv.y / b.size.height);
-                // Scripted cursor for headless verification: DISPLAYXR_CURSOR_DEPTH_UV=u,v
-                static float fixedU = -1.0f, fixedV = -1.0f;
-                static bool fixedParsed = false;
-                if (!fixedParsed) {
-                    fixedParsed = true;
-                    const char *fx = getenv("DISPLAYXR_CURSOR_DEPTH_UV");
-                    if (fx == nullptr || sscanf(fx, "%f,%f", &fixedU, &fixedV) != 2) fixedU = fixedV = -1.0f;
-                }
-                if (fixedU >= 0.0f) {
-                    u = fixedU;
-                    v = fixedV;
-                }
-                cursorInCanvas = u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f;
-                if (cursorInCanvas) {
-                    cursorHint.cursorUV = {u, v};
-                    cursorHint.cursorHeight = kCursorHeight;
-                    if (app.cursorDepthFromLayer) {
-                        // No hit test at all: the runtime reads the depth
-                        // this app submits with its projection layer.
-                        cursorHint.hasContent = XR_FALSE;
-                        cursorHint.nearestPoint = {0.0f, 0.0f, 0.0f};
-                    } else {
-                        XrVector3f hit = {0.0f, 0.0f, 0.0f};
-                        cursorHint.hasContent =
-                            CursorFootprintHit(prevViews, prevActive, u, v, (float)(b.size.width / b.size.height),
-                                               renderer.cubeRotation, hit)
-                                ? XR_TRUE
-                                : XR_FALSE;
-                        cursorHint.nearestPoint = hit;
-                    }
-                    // Chain: locateInfo -> hint [-> options] [-> source] ->
-                    // (rig struct).
-                    const void *hintTail = locateInfo.next;
-                    if (app.cursorDepthFromLayer) {
-                        cursorSource.next = hintTail;
-                        hintTail = &cursorSource;
-                    }
-                    if (app.cursorDepthChainOptions) {
-                        cursorOptions.next = hintTail;
-                        hintTail = &cursorOptions;
-                    }
-                    if (app.cursorDepthRuntimeDraw) {
-                        cursorDrawInfo.next = hintTail;
-                        hintTail = &cursorDrawInfo;
-                    }
-                    cursorHint.next = hintTail;
-                    locateInfo.next = &cursorHint;
-                }
-            }
-            cursorPlacement.next = viewState.next;
-            viewState.next = &cursorPlacement;
-            if (app.cursorDepthRuntimeDraw) {
-                cursorDrawState.next = viewState.next;
-                viewState.next = &cursorDrawState;
-            }
-        }
+        // XR_DXR_cursor_depth (ADR-046): pointer UV, the footprint hit test
+        // against the previous locate's views (a frame late, which the
+        // runtime's filter absorbs), and the hint / draw-request / state
+        // structs on both chains. Inert when the extension is off.
+        cursor.chain(locateInfo, viewState);
 
         // Multi-screen M3 (XR_DXR_display_info v22): when the window spans
         // displays the runtime hands out one view set per display; which views
@@ -3396,49 +3292,40 @@ int main(int argc, char **argv)
         uint32_t viewCount = 0;
         xrLocateViews(app.session, &locateInfo, &viewState, (uint32_t)views.size(), &viewCount, views.data());
 
-        if (app.hasCursorDepthExt) {
-            prevViews.assign(views.begin(), views.begin() + viewCount);
+        if (cursor.enabled()) {
             const bool d3 = (app.currentModeIndex < app.renderingModeCount)
                 ? app.renderingModeDisplay3D[app.currentModeIndex] : true;
             const uint32_t mvc = (app.currentModeIndex < app.renderingModeCount)
                 ? app.renderingModeViewCounts[app.currentModeIndex] : 2;
-            prevActive = d3 ? (mvc < viewCount ? mvc : viewCount) : 1;
+            // Hides / shows the OS cursor; remembers the views for next frame.
+            cursor.afterLocate(views.data(), d3 ? (mvc < viewCount ? mvc : viewCount) : 1);
 
-            // App mode: we draw the crosshair from the placement. Runtime mode
-            // (spec v5): the runtime draws, we draw nothing.
-            g_cursorDraw.active = !app.cursorDepthRuntimeDraw && cursorPlacement.isActive == XR_TRUE;
-            g_cursorDraw.pose = cursorPlacement.pose;
-            g_cursorDraw.height = cursorPlacement.height;
-            // The app owns its window's OS cursor: hidden exactly while the
-            // depth cursor replaces it - our own (isActive), or the runtime's
-            // (willDraw: whenever it cannot draw, we keep the OS cursor).
-            const bool depthCursorShown =
-                app.cursorDepthRuntimeDraw ? cursorDrawState.willDraw == XR_TRUE : g_cursorDraw.active;
-            static bool osCursorHidden = false;
-            if (depthCursorShown != osCursorHidden) {
-                if (depthCursorShown) [NSCursor hide]; else [NSCursor unhide];
-                osCursorHidden = depthCursorShown;
-            }
+            // App mode: we draw the crosshair from the placement.
+            const XrCursorDepthPlacementDXR &placement = cursor.placement();
+            g_cursorDraw.active = cursor.appShouldDraw();
+            g_cursorDraw.pose = placement.pose;
+            g_cursorDraw.height = placement.height;
+
             static int willDrawLogged = 0;
-            if (app.cursorDepthRuntimeDraw && willDrawLogged < 3 && cursorInCanvas) {
+            if (cursor.runtimeDraws() && willDrawLogged < 3 && cursor.pointerInCanvas()) {
                 static int lastWillDraw = -1;
-                if ((int)cursorDrawState.willDraw != lastWillDraw) {
-                    lastWillDraw = (int)cursorDrawState.willDraw;
+                if ((int)cursor.drawState().willDraw != lastWillDraw) {
+                    lastWillDraw = (int)cursor.drawState().willDraw;
                     willDrawLogged++;
                     LOG_INFO("cursor_depth: runtime willDraw=%s (uv=%.3f,%.3f disparity=%.3f)",
-                             cursorDrawState.willDraw ? "TRUE" : "FALSE", cursorHint.cursorUV.x,
-                             cursorHint.cursorUV.y, cursorPlacement.disparity);
+                             cursor.drawState().willDraw ? "TRUE" : "FALSE", cursor.hint().cursorUV.x,
+                             cursor.hint().cursorUV.y, placement.disparity);
                 }
             }
             static int cursorLogged = 0;
             const bool cursorHasContent =
-                app.cursorDepthFromLayer ? cursorPlacement.targetDisparity != 0.0f : cursorHint.hasContent == XR_TRUE;
-            if (cursorPlacement.isActive && cursorHasContent && cursorLogged < 3) {
+                app.cursorDepthFromLayer ? placement.targetDisparity != 0.0f : cursor.hint().hasContent == XR_TRUE;
+            if (placement.isActive && cursorHasContent && cursorLogged < 3) {
                 cursorLogged++;
                 LOG_INFO("cursor_depth: uv=(%.3f,%.3f) target=%.3f disparity=%.3f h=%.4f pos=(%.3f,%.3f,%.3f)",
-                         cursorHint.cursorUV.x, cursorHint.cursorUV.y, cursorPlacement.targetDisparity,
-                         cursorPlacement.disparity, cursorPlacement.height, cursorPlacement.pose.position.x,
-                         cursorPlacement.pose.position.y, cursorPlacement.pose.position.z);
+                         cursor.hint().cursorUV.x, cursor.hint().cursorUV.y, placement.targetDisparity,
+                         placement.disparity, placement.height, placement.pose.position.x,
+                         placement.pose.position.y, placement.pose.position.z);
             }
         }
 
