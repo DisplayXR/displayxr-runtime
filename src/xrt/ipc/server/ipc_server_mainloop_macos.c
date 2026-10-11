@@ -84,7 +84,14 @@ create_listen_socket(struct ipc_server_mainloop *ml, int *out_fd)
 
 	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
-	strcpy(addr.sun_path, sock_file);
+	if (!u_file_copy_unix_socket_path(addr.sun_path, sizeof(addr.sun_path), sock_file)) {
+		U_LOG_E(
+		    "IPC socket path is %zu bytes, longer than a unix socket address holds (%zu with the "
+		    "terminator) — shorten XDG_RUNTIME_DIR: %s",
+		    strlen(sock_file), sizeof(addr.sun_path), sock_file);
+		close(fd);
+		return -1;
+	}
 
 	ret = bind(fd, (struct sockaddr *)&addr, sizeof(addr));
 

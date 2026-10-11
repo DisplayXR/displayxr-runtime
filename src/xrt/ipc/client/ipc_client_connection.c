@@ -821,7 +821,14 @@ ipc_client_posix_dial(struct ipc_connection *ipc_c)
 
 	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
-	strcpy(addr.sun_path, sock_file);
+	if (!u_file_copy_unix_socket_path(addr.sun_path, sizeof(addr.sun_path), sock_file)) {
+		IPC_ERROR(ipc_c,
+		          "IPC socket path is %zu bytes, longer than a unix socket address holds (%zu with the "
+		          "terminator) — shorten XDG_RUNTIME_DIR: %s",
+		          strlen(sock_file), sizeof(addr.sun_path), sock_file);
+		close(socket);
+		return -1;
+	}
 
 	ret = connect(socket, (struct sockaddr *)&addr, sizeof(addr));
 	if (ret < 0) {

@@ -254,6 +254,24 @@ u_file_get_path_in_runtime_dir(const char *suffix, char *out_path, size_t out_pa
 	return snprintf(out_path, out_path_size, "%s/%s", tmp, suffix);
 }
 
+bool
+u_file_copy_unix_socket_path(char *sun_path, size_t sun_path_size, const char *path)
+{
+	if (sun_path == NULL || sun_path_size == 0) {
+		return false;
+	}
+	sun_path[0] = '\0';
+	if (path == NULL) {
+		return false;
+	}
+	const size_t len = strlen(path);
+	if (len + 1 > sun_path_size) {
+		return false;
+	}
+	memcpy(sun_path, path, len + 1);
+	return true;
+}
+
 char *
 u_file_read_content(FILE *file, size_t *out_file_size)
 {

@@ -74,6 +74,7 @@ set(tests
     tests_comp_workspace_screens
     tests_target_screen_pin
     tests_u_setting_per_screen
+    tests_u_file_socket_path
     tests_oxr_legacy_mode_rule
     tests_oxr_mode_fillable_rule
     tests_oxr_tracking_properties_rule
