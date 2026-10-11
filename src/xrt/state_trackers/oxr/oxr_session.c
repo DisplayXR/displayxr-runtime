@@ -2317,6 +2317,44 @@ oxr_session_cursor_depth_hand_request(struct oxr_session *sess, const struct u_c
 	return false;
 }
 
+/*
+ * XR_DXR_cursor_depth v5 - the runtime draws the cursor (ADR-046 Amendment 2
+ * B). Metal (in-process) first; the other native compositors and the
+ * service report "cannot draw", so locates report willDraw = false and the
+ * app keeps its flat OS cursor - never no cursor.
+ */
+bool
+oxr_session_cursor_draw_supported(struct oxr_session *sess)
+{
+	if (sess->xcn == NULL) {
+		return false;
+	}
+#ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
+	if (sess->is_metal_native_compositor) {
+		return true;
+	}
+#endif
+	// TODO(ADR-046 Amendment 2 B, rollout step 3): D3D11, D3D12, GL,
+	// vk_native and the IPC/service path (svc_draw_cursor_quads).
+	return false;
+}
+
+bool
+oxr_session_cursor_draw_hand_request(struct oxr_session *sess, const struct u_cursor_draw_request *req)
+{
+	if (sess->xcn == NULL) {
+		return false;
+	}
+#ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
+	if (sess->is_metal_native_compositor) {
+		comp_metal_compositor_set_cursor_draw_request(&sess->xcn->base, req);
+		return true;
+	}
+#endif
+	(void)req;
+	return false;
+}
+
 static bool
 oxr_session_cursor_depth_get_result(struct oxr_session *sess, struct u_cursor_depth_patch_result *out)
 {
@@ -2419,6 +2457,83 @@ oxr_session_cursor_depth_from_layer(struct oxr_session *sess,
 }
 
 /*!
+ * XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B): this locate's placement is
+ * active and the app asked the runtime to draw it. Keep what the frame's
+ * xrEndFrame needs to hand the compositor a draw request, and report
+ * willDraw - unless the cursor cannot be drawn, in which case the app keeps
+ * its flat OS cursor.
+ *
+ * Reached only from a hinted locate that chained XrCursorDepthDrawInfoDXR.
+ */
+static void
+oxr_session_arm_cursor_draw(struct oxr_session *sess,
+                            const XrViewLocateInfo *viewLocateInfo,
+                            const XrCursorDepthDrawInfoDXR *draw_info,
+                            const struct u_cursor_depth_geometry *g,
+                            float disparity,
+                            const struct xrt_vec3 *position,
+                            XrCursorDepthDrawStateDXR *draw_state)
+{
+	if (!draw_info->visible) {
+		return;
+	}
+	if (!sess->cursor_draw.announced) {
+		sess->cursor_draw.announced = true;
+		U_LOG_W(
+		    "XR_DXR_cursor_depth: runtime-drawn cursor requested (%s) - drawing it while content pops "
+		    "out under it (ADR-046 Amendment 2 B, one-time notice)",
+		    draw_info->image != XR_NULL_HANDLE ? "app sprite" : "default look");
+	}
+	if (!oxr_session_cursor_draw_supported(sess)) {
+		if (!sess->cursor_draw.warned_backend) {
+			sess->cursor_draw.warned_backend = true;
+			U_LOG_W(
+			    "XR_DXR_cursor_depth: this compositor cannot draw the cursor yet - reporting willDraw = "
+			    "false, the app keeps its OS cursor (one-time warning)");
+		}
+		return;
+	}
+	// The last armed frame's projection layer was not in the locate space:
+	// still arm (xrEndFrame re-checks the space, so a fixed app recovers),
+	// but report and draw nothing for this frame.
+	const bool will_draw = !(sess->cursor_draw.cannot_draw && sess->cursor_draw.space == viewLocateInfo->space);
+
+	struct oxr_swapchain *image = NULL;
+	if (draw_info->image != XR_NULL_HANDLE) {
+		image = XRT_CAST_OXR_HANDLE_TO_PTR(struct oxr_swapchain *, draw_info->image);
+		if (image->handle.debug != OXR_XR_DEBUG_SWAPCHAIN || image->sess != sess || image->swapchain == NULL) {
+			if (!sess->cursor_draw.warned_image) {
+				sess->cursor_draw.warned_image = true;
+				U_LOG_W(
+				    "XR_DXR_cursor_depth: XrCursorDepthDrawInfoDXR::image is not a live swapchain of "
+				    "this session - not drawing (one-time warning)");
+			}
+			return;
+		}
+	}
+
+	const float t = 1.0f / (1.0f - disparity);
+	const float unit = g->canvas_height * t;
+	if (!(unit > 0.0f) || !isfinite(unit)) {
+		return;
+	}
+
+	sess->cursor_draw.armed = true;
+	sess->cursor_draw.will_draw = will_draw;
+	sess->cursor_draw.space = viewLocateInfo->space;
+	sess->cursor_draw.position = *position;
+	sess->cursor_draw.orientation = g->orientation;
+	sess->cursor_draw.unit = unit;
+	sess->cursor_draw.image = image;
+	sess->cursor_draw.hot_u = draw_info->hotSpot.x;
+	sess->cursor_draw.hot_v = draw_info->hotSpot.y;
+	sess->cursor_draw.size_m = isfinite(draw_info->sizeMeters) ? draw_info->sizeMeters : 0.0f;
+	if (draw_state != NULL) {
+		draw_state->willDraw = will_draw ? XR_TRUE : XR_FALSE;
+	}
+}
+
+/*!
  * XR_DXR_cursor_depth (ADR-046): place the depth-aware cursor for this locate.
  *
  * Runs only when the app chained BOTH the hint (the per-frame request) and the
@@ -2434,19 +2549,43 @@ oxr_session_fill_cursor_depth(struct oxr_session *sess,
                               const XrView *views,
                               uint32_t active_view_count)
 {
+	// Spec v5: the draw report. Filled (false) whenever chained, so an app
+	// never reads a stale willDraw; set true only at the very end below.
+	XrCursorDepthDrawStateDXR *draw_state =
+	    OXR_GET_OUTPUT_FROM_CHAIN(viewState, XR_TYPE_CURSOR_DEPTH_DRAW_STATE_DXR, XrCursorDepthDrawStateDXR);
+	if (draw_state != NULL) {
+		draw_state->willDraw = XR_FALSE;
+	}
+
+	XrCursorDepthPlacementDXR placement_scratch = {.type = XR_TYPE_CURSOR_DEPTH_PLACEMENT_DXR, .next = NULL};
 	XrCursorDepthPlacementDXR *out =
 	    OXR_GET_OUTPUT_FROM_CHAIN(viewState, XR_TYPE_CURSOR_DEPTH_PLACEMENT_DXR, XrCursorDepthPlacementDXR);
+	const XrCursorDepthHintDXR *hint =
+	    OXR_GET_INPUT_FROM_CHAIN(viewLocateInfo, XR_TYPE_CURSOR_DEPTH_HINT_DXR, XrCursorDepthHintDXR);
+	// Spec v5: the draw request is looked up ONLY behind the hint - a session
+	// that never chains it never reaches the drawing path.
+	const XrCursorDepthDrawInfoDXR *draw_info =
+	    hint != NULL ? OXR_GET_INPUT_FROM_CHAIN(hint, XR_TYPE_CURSOR_DEPTH_DRAW_INFO_DXR, XrCursorDepthDrawInfoDXR)
+	                 : NULL;
 	if (out == NULL) {
-		return;
+		if (draw_info == NULL) {
+			return; // nothing asked for: no placement output, no draw request
+		}
+		// A runtime-drawn cursor needs the placement even if the app does
+		// not read it.
+		out = &placement_scratch;
 	}
 	out->isActive = XR_FALSE;
 	out->pose = (XrPosef){{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
 	out->height = 0.0f;
 	out->disparity = 0.0f;
 	out->targetDisparity = 0.0f;
+	if (draw_info != NULL) {
+		// This locate decides the frame's draw; it re-arms below only if
+		// it will draw.
+		sess->cursor_draw.armed = false;
+	}
 
-	const XrCursorDepthHintDXR *hint =
-	    OXR_GET_INPUT_FROM_CHAIN(viewLocateInfo, XR_TYPE_CURSOR_DEPTH_HINT_DXR, XrCursorDepthHintDXR);
 	if (hint == NULL || active_view_count < 2) {
 		return;
 	}
@@ -2522,6 +2661,10 @@ oxr_session_fill_cursor_depth(struct oxr_session *sess,
 	out->pose.orientation = (XrQuaternionf){g.orientation.x, g.orientation.y, g.orientation.z, g.orientation.w};
 	out->pose.position = (XrVector3f){position.x, position.y, position.z};
 	out->height = height;
+
+	if (draw_info != NULL) {
+		oxr_session_arm_cursor_draw(sess, viewLocateInfo, draw_info, &g, disparity, &position, draw_state);
+	}
 }
 #endif // OXR_HAVE_DXR_cursor_depth
 

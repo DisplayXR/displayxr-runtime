@@ -1968,6 +1968,100 @@ cursor_depth_record_layer(struct oxr_session *sess, const XrCompositionLayerProj
 }
 #endif
 
+#ifdef OXR_HAVE_DXR_cursor_depth
+/*!
+ * XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B): this frame's locate said
+ * the runtime will draw the cursor. Map the placement into each view of the
+ * frame's first projection layer - with the poses and fovs the app submitted,
+ * in the layer's own space, which must be the locate space - and hand the
+ * compositor its one-frame draw request.
+ *
+ * Only ever called on an ARMED frame (the caller's single bool test), so a
+ * session that never chained XrCursorDepthDrawInfoDXR never gets here.
+ */
+static void
+cursor_draw_submit(struct oxr_session *sess, const XrFrameEndInfo *frameEndInfo, bool zones_frame)
+{
+	sess->cursor_draw.armed = false;
+
+	const XrCompositionLayerProjection *proj = NULL;
+	for (uint32_t i = 0; i < frameEndInfo->layerCount; i++) {
+		if (frameEndInfo->layers[i]->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
+			proj = (const XrCompositionLayerProjection *)frameEndInfo->layers[i];
+			break;
+		}
+	}
+	// A zones frame places each zone's views at a sub-rect of the tile; the
+	// draw maps into whole tiles, so zones are not drawn yet (follow-up).
+	if (proj == NULL || zones_frame) {
+		sess->cursor_draw.cannot_draw = true;
+		if (!sess->cursor_draw.warned_no_layer) {
+			sess->cursor_draw.warned_no_layer = true;
+			U_LOG_W(
+			    "XR_DXR_cursor_depth: runtime-drawn cursor requested, but the frame has %s - not drawn, "
+			    "reporting willDraw = false (one-time warning)",
+			    zones_frame ? "display zones (not supported yet)" : "no projection layer to draw it with");
+		}
+		return;
+	}
+	// The views the cursor is projected with are the layer's, in the layer's
+	// space; the placement is in the locate space. They must be one XrSpace
+	// (same rule as the depth-layer source): converting between two app
+	// spaces is not worth a per-frame space locate for a cursor.
+	sess->cursor_draw.cannot_draw = proj->space != sess->cursor_draw.space;
+	if (sess->cursor_draw.cannot_draw) {
+		if (!sess->cursor_draw.warned_space) {
+			sess->cursor_draw.warned_space = true;
+			U_LOG_W(
+			    "XR_DXR_cursor_depth: the projection layer's space is not the locate space - the "
+			    "runtime-drawn cursor needs them to be the same XrSpace; reporting willDraw = false "
+			    "(one-time warning)");
+		}
+		return;
+	}
+	if (!sess->cursor_draw.will_draw) {
+		return; // the locate reported false (an earlier mismatch); now cleared
+	}
+
+	struct u_cursor_draw_request req = {0};
+	req.requested = true;
+	req.view_count = proj->viewCount < XRT_MAX_VIEWS ? proj->viewCount : XRT_MAX_VIEWS;
+	for (uint32_t i = 0; i < req.view_count; i++) {
+		// XrPosef/XrFovf are layout-identical to xrt_pose/xrt_fov.
+		const struct u_cursor_depth_view view = {*(const struct xrt_pose *)&proj->views[i].pose,
+		                                         *(const struct xrt_fov *)&proj->views[i].fov};
+		if (!u_cursor_draw_view_from_placement(&view, &sess->cursor_draw.position,
+		                                       &sess->cursor_draw.orientation, sess->cursor_draw.unit,
+		                                       &req.view[i])) {
+			return; // degenerate view: draw nothing rather than a partial cursor
+		}
+	}
+
+	struct oxr_swapchain *sc = sess->cursor_draw.image;
+	if (sc != NULL) {
+		if (!sc->released.yes || sc->released.index < 0 ||
+		    sc->released.index >= (int)sc->swapchain->image_count) {
+			if (!sess->cursor_draw.warned_image) {
+				sess->cursor_draw.warned_image = true;
+				U_LOG_W(
+				    "XR_DXR_cursor_depth: the cursor sprite swapchain has no released image yet - "
+				    "not drawn (one-time warning)");
+			}
+			return;
+		}
+		req.image = sc->swapchain;
+		req.image_index = (uint32_t)sc->released.index;
+	}
+	req.hot_u = sess->cursor_draw.hot_u;
+	req.hot_v = sess->cursor_draw.hot_v;
+	req.size_m = sess->cursor_draw.size_m;
+	if (!u_cursor_draw_should_draw(&req)) {
+		return;
+	}
+	(void)oxr_session_cursor_draw_hand_request(sess, &req);
+}
+#endif
+
 static XrResult
 submit_projection_layer(struct oxr_session *sess,
                         struct xrt_compositor *xc,
@@ -3262,6 +3356,20 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 		default: assert(false && "invalid layer type");
 		}
 	}
+
+#ifdef OXR_HAVE_DXR_cursor_depth
+	// ADR-046 Amendment 2 B. ZERO COST UNLESS REQUESTED: one bool test, true
+	// only on a frame whose locate chained XrCursorDepthDrawInfoDXR with the
+	// placement active. Handed to the compositor before the commit that
+	// draws it.
+	if (sess->cursor_draw.armed) {
+		bool cursor_zones_frame = false;
+#ifdef OXR_HAVE_DXR_display_zones
+		cursor_zones_frame = zones_frame;
+#endif
+		cursor_draw_submit(sess, frameEndInfo, cursor_zones_frame);
+	}
+#endif
 
 	xret = xrt_comp_layer_commit(xc, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
 	OXR_CHECK_XRET(log, sess, xret, xrt_comp_layer_commit);

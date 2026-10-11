@@ -1120,6 +1120,22 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
  */
 bool
 oxr_session_cursor_depth_hand_request(struct oxr_session *sess, const struct u_cursor_depth_patch_request *req);
+
+/*!
+ * XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B): can this session's
+ * compositor draw the cursor?
+ */
+bool
+oxr_session_cursor_draw_supported(struct oxr_session *sess);
+
+/*!
+ * XR_DXR_cursor_depth v5: hand a cursor draw request to the session's native
+ * compositor, for its next commit.
+ *
+ * @return false if this session's compositor cannot draw the cursor.
+ */
+bool
+oxr_session_cursor_draw_hand_request(struct oxr_session *sess, const struct u_cursor_draw_request *req);
 #endif
 
 XrResult
@@ -3141,6 +3157,44 @@ struct oxr_session
 		bool warned_space;     //!< one-shot WARN: layer space != locate space
 		bool warned_no_layer;  //!< one-shot WARN: armed frame had no depth layer
 	} cursor_depth_source;
+
+	/*!
+	 * XR_DXR_cursor_depth v5, the runtime draws the cursor (ADR-046
+	 * Amendment 2 B).
+	 *
+	 * ZERO COST UNLESS REQUESTED: everything here stays zero, and xrEndFrame
+	 * pays one bool test (@ref armed), unless a locate chained
+	 * XrCursorDepthDrawInfoDXR on its hint and the placement was active. The
+	 * compositor is only ever handed a draw request on an armed frame.
+	 */
+	struct
+	{
+		//! Set by a locate whose placement is active and that asked for the
+		//! draw, cleared by the next xrEndFrame.
+		bool armed;
+		//! What that locate reported as willDraw; xrEndFrame draws only if set.
+		bool will_draw;
+		//! That locate's space; the projection layer must be in it.
+		XrSpace space;
+		//! Placement: hotspot point and display-plane orientation, in @ref space.
+		struct xrt_vec3 position;
+		struct xrt_quat orientation;
+		//! One sprite unit: the canvas height scaled by the placement's t.
+		float unit;
+		//! The app's sprite, or NULL for the default look.
+		struct oxr_swapchain *image;
+		float hot_u, hot_v, size_m;
+		//! The last armed frame could not draw (projection layer in another
+		//! space, a zones frame, no projection layer): locates in the same
+		//! space report willDraw = false, and keep arming so xrEndFrame can
+		//! clear this once a frame is drawable again.
+		bool cannot_draw;
+		bool announced;       //!< one-shot WARN on first activation
+		bool warned_backend;  //!< one-shot WARN: compositor cannot draw
+		bool warned_space;    //!< one-shot WARN: layer space != locate space
+		bool warned_no_layer; //!< one-shot WARN: armed frame had no projection layer
+		bool warned_image;    //!< one-shot WARN: sprite swapchain unusable
+	} cursor_draw;
 #endif
 
 #ifdef OXR_HAVE_DXR_display_zones

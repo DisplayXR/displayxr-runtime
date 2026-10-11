@@ -457,3 +457,194 @@ u_cursor_depth_point_from_depth_sample(const struct u_cursor_depth_view *view,
 	*out_point = p;
 	return true;
 }
+
+
+/*
+ *
+ * Spec v5: the runtime draws the cursor (ADR-046 Amendment 2 B).
+ *
+ */
+
+bool
+u_cursor_draw_should_draw(const struct u_cursor_draw_request *req)
+{
+	if (req == NULL || !req->requested || req->view_count < 2 || req->view_count > XRT_MAX_VIEWS) {
+		return false;
+	}
+	for (uint32_t i = 0; i < req->view_count; i++) {
+		const struct u_cursor_draw_view *v = &req->view[i];
+		if (!isfinite(v->origin[0]) || !isfinite(v->origin[1]) || !isfinite(v->axis_x[0]) ||
+		    !isfinite(v->axis_x[1]) || !isfinite(v->axis_y[0]) || !isfinite(v->axis_y[1])) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool
+u_cursor_draw_project(const struct u_cursor_depth_view *view, const struct xrt_vec3 *p, float out_xy[2])
+{
+	// Into the view's own frame: the conjugate rotation of (p - eye).
+	const struct xrt_quat inv = {-view->pose.orientation.x, -view->pose.orientation.y, -view->pose.orientation.z,
+	                             view->pose.orientation.w};
+	const struct xrt_vec3 l = quat_rotate(inv, v3_sub(*p, view->pose.position));
+	if (!(l.z < -1e-9f) || !v3_finite(l)) {
+		return false; // on or behind the eye (the < test also rejects NaN)
+	}
+	const float tl = tanf(view->fov.angle_left);
+	const float tr = tanf(view->fov.angle_right);
+	const float tu = tanf(view->fov.angle_up);
+	const float td = tanf(view->fov.angle_down);
+	if (!(tr - tl > 0.0f) || !(tu - td > 0.0f)) {
+		return false;
+	}
+	// The inverse of view_ray(): the tangents map linearly onto the tile.
+	const float tx = l.x / -l.z;
+	const float ty = l.y / -l.z;
+	out_xy[0] = (tx - tl) / (tr - tl);
+	out_xy[1] = (tu - ty) / (tu - td);
+	return isfinite(out_xy[0]) && isfinite(out_xy[1]);
+}
+
+bool
+u_cursor_draw_view_from_placement(const struct u_cursor_depth_view *view,
+                                  const struct xrt_vec3 *center,
+                                  const struct xrt_quat *orientation,
+                                  float unit,
+                                  struct u_cursor_draw_view *out)
+{
+	if (!(unit > 0.0f) || !isfinite(unit)) {
+		return false;
+	}
+	const struct xrt_vec3 ex = {1.0f, 0.0f, 0.0f};
+	const struct xrt_vec3 ey = {0.0f, 1.0f, 0.0f};
+	const struct xrt_vec3 px = v3_add_scaled(*center, quat_rotate(*orientation, ex), unit);
+	const struct xrt_vec3 py = v3_add_scaled(*center, quat_rotate(*orientation, ey), unit);
+	float o[2], ax[2], ay[2];
+	if (!u_cursor_draw_project(view, center, o) || !u_cursor_draw_project(view, &px, ax) ||
+	    !u_cursor_draw_project(view, &py, ay)) {
+		return false;
+	}
+	out->origin[0] = o[0];
+	out->origin[1] = o[1];
+	out->axis_x[0] = ax[0] - o[0];
+	out->axis_x[1] = ax[1] - o[1];
+	out->axis_y[0] = ay[0] - o[0];
+	out->axis_y[1] = ay[1] - o[1];
+	return true;
+}
+
+void
+u_cursor_draw_corners(
+    const struct u_cursor_draw_view *v, float height, float aspect, float hot_u, float hot_v, float out_xy[4][2])
+{
+	// Texture UV order (0,0), (0,1), (1,0), (1,1). Sprite space: x right in
+	// units of its height (width = aspect), y UP; the hotspot is the origin.
+	static const float uv[4][2] = {{0, 0}, {0, 1}, {1, 0}, {1, 1}};
+	for (int k = 0; k < 4; k++) {
+		const float sx = (uv[k][0] - hot_u) * aspect * height;
+		const float sy = (hot_v - uv[k][1]) * height;
+		out_xy[k][0] = v->origin[0] + sx * v->axis_x[0] + sy * v->axis_y[0];
+		out_xy[k][1] = v->origin[1] + sx * v->axis_x[1] + sy * v->axis_y[1];
+	}
+}
+
+/*
+ * The classic arrow (the web SDK's CURSOR_ARROW), in px of its 19 px height,
+ * y DOWN, tip at (0, 0) = the hotspot. This is the dark outline; the white
+ * fill is it inset by one px.
+ */
+static const float k_arrow[7][2] = {
+    {0.0f, 0.0f}, {0.0f, 16.0f}, {4.2f, 12.4f}, {6.9f, 18.6f}, {9.5f, 17.5f}, {6.8f, 11.5f}, {11.7f, 11.5f},
+};
+
+// Mitred inset by d (same units): every edge moves inward by exactly d.
+static void
+arrow_inset(float d, float out[7][2])
+{
+	const int n = 7;
+	float area = 0.0f;
+	for (int i = 0; i < n; i++) {
+		const int j = (i + 1) % n;
+		area += k_arrow[i][0] * k_arrow[j][1] - k_arrow[j][0] * k_arrow[i][1];
+	}
+	const float sgn = area > 0.0f ? 1.0f : -1.0f;
+	float nrm[7][2];
+	for (int i = 0; i < n; i++) {
+		const int j = (i + 1) % n;
+		const float dx = k_arrow[j][0] - k_arrow[i][0];
+		const float dy = k_arrow[j][1] - k_arrow[i][1];
+		float l = sqrtf(dx * dx + dy * dy);
+		l = l > 0.0f ? l : 1.0f;
+		nrm[i][0] = (-dy / l) * sgn;
+		nrm[i][1] = (dx / l) * sgn;
+	}
+	for (int i = 0; i < n; i++) {
+		const float *a = nrm[(i + n - 1) % n];
+		const float *b = nrm[i];
+		const float k = d / (1.0f + a[0] * b[0] + a[1] * b[1]);
+		out[i][0] = k_arrow[i][0] + (a[0] + b[0]) * k;
+		out[i][1] = k_arrow[i][1] + (a[1] + b[1]) * k;
+	}
+}
+
+// Even-odd crossing test (the arrow is concave at its notch).
+static bool
+poly_contains(const float poly[7][2], float x, float y)
+{
+	bool in = false;
+	for (int i = 0, j = 6; i < 7; j = i++) {
+		const float yi = poly[i][1];
+		const float yj = poly[j][1];
+		if ((yi > y) != (yj > y)) {
+			const float xc = poly[i][0] + (y - yi) / (yj - yi) * (poly[j][0] - poly[i][0]);
+			if (x < xc) {
+				in = !in;
+			}
+		}
+	}
+	return in;
+}
+
+void
+u_cursor_draw_arrow_rgba(uint8_t *rgba, uint32_t w, uint32_t h)
+{
+	if (rgba == NULL || w == 0 || h == 0) {
+		return;
+	}
+	float fill[7][2];
+	arrow_inset(1.0f, fill);
+	// Image px -> arrow px.
+	const float s = U_CURSOR_ARROW_HEIGHT_PX / (float)h;
+	// sRGB-encoded bytes: white fill, near-black outline (the web SDK's
+	// CURSOR_FILL_COLOR / CURSOR_OUTLINE_COLOR).
+	const float fill_c[3] = {255.0f, 255.0f, 255.0f};
+	const float line_c[3] = {5.0f, 5.0f, 8.0f};
+	const int ss = 4;
+	const float n = (float)(ss * ss);
+	for (uint32_t y = 0; y < h; y++) {
+		for (uint32_t x = 0; x < w; x++) {
+			float cov_fill = 0.0f;
+			float cov_line = 0.0f;
+			for (int sy = 0; sy < ss; sy++) {
+				for (int sx = 0; sx < ss; sx++) {
+					const float ax = ((float)x + ((float)sx + 0.5f) / (float)ss) * s;
+					const float ay = ((float)y + ((float)sy + 0.5f) / (float)ss) * s;
+					if (poly_contains((const float(*)[2])fill, ax, ay)) {
+						cov_fill += 1.0f;
+					} else if (poly_contains(k_arrow, ax, ay)) {
+						cov_line += 1.0f;
+					}
+				}
+			}
+			cov_fill /= n;
+			cov_line /= n;
+			uint8_t *p = rgba + ((size_t)y * w + x) * 4;
+			for (int c = 0; c < 3; c++) {
+				// Premultiplied: each colour times its coverage, summed.
+				p[c] = (uint8_t)lrintf(fill_c[c] * cov_fill + line_c[c] * cov_line);
+			}
+			p[3] = (uint8_t)lrintf(255.0f * (cov_fill + cov_line));
+		}
+	}
+}

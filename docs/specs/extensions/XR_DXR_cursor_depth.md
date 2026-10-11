@@ -3,8 +3,8 @@
 | Property | Value |
 |----------|-------|
 | Extension Name | `XR_DXR_cursor_depth` |
-| Spec Version | 4 |
-| Type Values | `XR_TYPE_CURSOR_DEPTH_HINT_DXR` (1004999320) · `XR_TYPE_CURSOR_DEPTH_PLACEMENT_DXR` (1004999321) · `XR_TYPE_CURSOR_DEPTH_SOURCE_DXR` (1004999322, v2) · `XR_TYPE_CURSOR_DEPTH_OPTIONS_DXR` (1004999323, v3) |
+| Spec Version | 5 |
+| Type Values | `XR_TYPE_CURSOR_DEPTH_HINT_DXR` (1004999320) · `XR_TYPE_CURSOR_DEPTH_PLACEMENT_DXR` (1004999321) · `XR_TYPE_CURSOR_DEPTH_SOURCE_DXR` (1004999322, v2) · `XR_TYPE_CURSOR_DEPTH_OPTIONS_DXR` (1004999323, v3) · `XR_TYPE_CURSOR_DEPTH_DRAW_INFO_DXR` (1004999324, v5) · `XR_TYPE_CURSOR_DEPTH_DRAW_STATE_DXR` (1004999325, v5) |
 | Author | The DisplayXR Project |
 | Platform | All. Works on every graphics API, in-process and over IPC; solved in the state tracker. |
 | Decision record | [ADR-046](../../adr/ADR-046-depth-aware-cursor.md) |
@@ -144,6 +144,40 @@ the sprite is drawn.
 
 The same rule, with the same numbers, is implemented by the web SDK's depth cursor.
 
+### 2.5 `XrCursorDepthDrawInfoDXR` (input, spec v5) — "runtime, draw the cursor"
+
+Chained on `XrCursorDepthHintDXR::next`, in any order with the other hint structs. Chaining it
+**is** the per-frame draw request (ADR-046 Amendment 2 B); a frame without it costs the runtime
+nothing. The app then neither draws a sprite nor needs `XrCursorDepthPlacementDXR` (it may still
+chain it, for diagnostics).
+
+| Field | Meaning |
+|---|---|
+| `image` | An ordinary color swapchain this session created with `xrCreateSwapchain`, in the app's own graphics API, filled with any sprite and released at least once. The runtime samples its **last released image** (array layer 0, whole image) as **straight (non-premultiplied) alpha**, decoded per its format (an `_SRGB` format decodes). It must stay alive until the `xrEndFrame` of every frame that names it. `XR_NULL_HANDLE` = the runtime's **default look**: the current OS cursor's shape where the runtime can read it, else the classic arrow (12 × 19, white fill, dark outline, tip = hotspot). |
+| `hotSpot` | The click point in the sprite, normalised, origin top-left, v down. Placed at the cursor. Ignored for the default look (it brings its own). |
+| `sizeMeters` | The sprite's **height** on the panel at the display plane, metres; width follows the image aspect. Scaled with depth, so its apparent size never changes. ≤ 0 or non-finite = the OS cursor's size (the default look's own size; 19 OS points for a custom sprite). |
+| `visible` | `XR_FALSE`: draw nothing. |
+
+**Where it is drawn.** After the app's layers (projection, quad, window-space) and before the
+display processor, one sprite per view tile, depth test off, never occluded, alpha-blended.
+Each view's copy is projected with **that view's submitted pose and fov from the frame's first
+projection layer**, so the projection layer must be in the **same `XrSpace`** as the locate
+(otherwise nothing is drawn and later locates report `willDraw = XR_FALSE` until a frame's layer
+is in the locate space again). Display-zones frames are not drawn yet (same fallback).
+
+### 2.6 `XrCursorDepthDrawStateDXR` (output, spec v5)
+
+Chained on `XrViewState::next`; filled on every locate that chains it. `willDraw` is `XR_TRUE`
+only when this locate chained a hint carrying a visible `XrCursorDepthDrawInfoDXR`, the placement
+is active (the §3 policy: content pops out under the cursor), and the session's compositor can
+draw it. **Hide the OS cursor over the canvas exactly while `willDraw` is `XR_TRUE`.** Whenever
+the runtime cannot draw (another backend, a space mismatch, a zones frame), it reports
+`XR_FALSE`, so the fallback is always the flat OS cursor, never no cursor. The runtime never
+touches the OS cursor itself.
+
+**Backends (v5).** Metal (in-process) draws. D3D11, D3D12, GL, vk_native and the IPC/service path
+report `willDraw = XR_FALSE` with a one-time WARN (ADR-046 Amendment 2 rollout step 3).
+
 ## 3. Runtime behaviour
 
 The canvas point under the cursor is triangulated from the outermost pair of **located views**.
@@ -217,6 +251,28 @@ To get the nearest point within the footprint from a depth buffer:
 
 For splats, use the renderer's alpha-weighted expected depth, not a raycast.
 
+**Runtime-drawn cursor (v5), the recommended adoption.** Same hint, plus the draw request; no
+sprite drawing in the app:
+
+```c
+XrCursorDepthDrawInfoDXR draw = {XR_TYPE_CURSOR_DEPTH_DRAW_INFO_DXR};
+draw.image      = XR_NULL_HANDLE;   // runtime default look (or your own sprite swapchain)
+draw.hotSpot    = (XrVector2f){0.5f, 0.5f};   // ignored for the default look
+draw.sizeMeters = 0.0f;             // the OS cursor's size
+draw.visible    = XR_TRUE;
+hint.next = &draw;
+
+XrCursorDepthDrawStateDXR drawState = {XR_TYPE_CURSOR_DEPTH_DRAW_STATE_DXR};
+XrViewState viewState = {XR_TYPE_VIEW_STATE, &drawState};
+xrLocateViews(session, &locate, &viewState, viewCount, &viewCount, views);
+
+if (drawState.willDraw) hide_os_cursor_over_canvas(); else show_os_cursor();
+// Submit the projection layer in the same XrSpace as locate.space.
+```
+
+Reference: `test_apps/handle/cube_handle_metal_macos` (`DISPLAYXR_CURSOR_DEPTH_DRAW=runtime|app`,
+`DISPLAYXR_CURSOR_DEPTH_SPRITE=custom`).
+
 ## 5. Version history
 
 | Version | Change |
@@ -225,3 +281,4 @@ For splats, use the renderer's alpha-weighted expected depth, not a raycast.
 | 2 | `XrCursorDepthSourceDXR` (1004999322): opt-in depth-layer source. The runtime reads the nearest content from the depth submitted with the projection layer (ADR-046 Phase 3a). Metal compositor first. |
 | 3 | `XrCursorDepthOptionsDXR` (1004999323): anchor mode (HYBRID / SCREEN / WORLD) and margin. HYBRID anchors the line of sight at the last pointer move (§2.4). **Defaults change, deliberately:** the default anchor is now HYBRID (was effectively SCREEN), and the default margin is 0.005 (was 0.03). Both follow testing on a real head-tracked panel: the screen-anchored cursor had disparity but no motion parallax and read as "at the glass", and 0.03 floated it a visibly detached 1–2 cm off the content, where 0.003–0.005 rests on it. An app that wants the v2 placement chains the options struct with `XR_CURSOR_DEPTH_ANCHOR_MODE_SCREEN_DXR` and `margin = 0.03`. |
 | 4 | No new structs; **behaviour changes** (ADR-046 Amendment 2 A, one cursor policy everywhere). **Never behind the glass:** target = d < 0 ? max(d − margin, −0.6) : 0, so content on or behind the display plane leaves the cursor on the plane (v1–v3 let it sink onto content behind the glass, up to +0.6). **Margin back to 0.03** (the reference app's value since Phase 1). **Draw threshold:** `isActive` is now also `XR_FALSE` while the filtered disparity is above −0.005, which is the existing meaning of `isActive = XR_FALSE` (draw nothing, show the OS cursor); `disparity` / `targetDisparity` stay filled as diagnostics. HYBRID stays the default anchor. |
+| 5 | **The runtime draws** (ADR-046 Amendment 2 B). New structs only: `XrCursorDepthDrawInfoDXR` (1004999324, on the hint: the sprite swapchain or `XR_NULL_HANDLE` for the default look, hotspot, size in metres, visibility) and `XrCursorDepthDrawStateDXR` (1004999325, on `XrViewState`: `willDraw`, the app's cue to hide its OS cursor). Drawn after the app's layers and before the display processor, per view, with the projection layer's own views (same-space rule). Default look: the current OS cursor shape, else the classic arrow. Metal (in-process) first; other backends report `willDraw = XR_FALSE`. App-drawn placement (v1–v4) unchanged. |

@@ -1712,6 +1712,16 @@ struct AppXrSession {
     bool cursorDepthChainOptions = false;
     XrCursorDepthAnchorModeDXR cursorDepthAnchor =
         XR_CURSOR_DEPTH_ANCHOR_MODE_HYBRID_DXR;
+    // XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B):
+    // DISPLAYXR_CURSOR_DEPTH_DRAW=runtime (default) | app. Runtime: chain
+    // XrCursorDepthDrawInfoDXR and let the runtime draw the cursor; hide the
+    // OS cursor exactly while XrCursorDepthDrawStateDXR::willDraw. App: draw
+    // the crosshair ourselves from the placement (v1-v4 behaviour).
+    bool cursorDepthRuntimeDraw = false;
+    // DISPLAYXR_CURSOR_DEPTH_SPRITE=custom: hand the runtime our own sprite
+    // (a cyan ring with a dot) instead of its default look.
+    bool cursorDepthCustomSprite = false;
+    XrSwapchain cursorSpriteSwapchain = XR_NULL_HANDLE;
     SwapchainInfo depthSwapchain = {};
     XrViewConfigurationType viewConfigType;
     std::vector<XrViewConfigurationView> configViews;
@@ -1902,6 +1912,22 @@ static bool InitializeOpenXR(AppXrSession &app)
             : app.cursorDepthAnchor == XR_CURSOR_DEPTH_ANCHOR_MODE_WORLD_DXR
                 ? "WORLD"
                 : "HYBRID");
+
+        // Spec v5: who draws the cursor. Default: the runtime.
+        const char *drawWho = getenv("DISPLAYXR_CURSOR_DEPTH_DRAW");
+        const bool wantApp = drawWho != nullptr && strcmp(drawWho, "app") == 0;
+        if (!wantApp && app.cursorDepthSpecVersion >= 5) {
+            app.cursorDepthRuntimeDraw = true;
+            const char *sprite = getenv("DISPLAYXR_CURSOR_DEPTH_SPRITE");
+            app.cursorDepthCustomSprite = sprite != nullptr && strcmp(sprite, "custom") == 0;
+        } else if (!wantApp) {
+            LOG_WARN("XR_DXR_cursor_depth v%u has no runtime-drawn cursor (needs v5) - drawing it ourselves",
+                     app.cursorDepthSpecVersion);
+        }
+        LOG_INFO("XR_DXR_cursor_depth draw: %s",
+                 !app.cursorDepthRuntimeDraw ? "APP (crosshair from the placement)"
+                 : app.cursorDepthCustomSprite ? "RUNTIME, custom sprite (cyan ring)"
+                                               : "RUNTIME, default look");
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -2458,6 +2484,72 @@ static bool CreateAndFillL2DPanel(AppXrSession &app, uint32_t w, uint32_t h, int
 }
 
 // ============================================================================
+// XR_DXR_cursor_depth v5 — a custom cursor sprite for the runtime to draw
+// ============================================================================
+
+// DISPLAYXR_CURSOR_DEPTH_SPRITE=custom: a 64x64 cyan ring with a centre dot
+// (hotspot = the centre), dark-edged so it reads over the white cube. Filled
+// once (acquire / fill / release); the runtime samples the last released
+// image every frame, as STRAIGHT alpha.
+static bool CreateCursorSprite(AppXrSession &app)
+{
+    const uint32_t S = 64;
+    XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+    sci.format = PickPanelFormat(app.session); // _SRGB when offered: the bytes are display-referred
+    sci.sampleCount = 1;
+    sci.width = S;
+    sci.height = S;
+    sci.faceCount = 1;
+    sci.arraySize = 1;
+    sci.mipCount = 1;
+    if (XR_FAILED(xrCreateSwapchain(app.session, &sci, &app.cursorSpriteSwapchain))) {
+        return false;
+    }
+    uint32_t n = 0;
+    xrEnumerateSwapchainImages(app.cursorSpriteSwapchain, 0, &n, nullptr);
+    std::vector<XrSwapchainImageMetalKHR> imgs(n, {XR_TYPE_SWAPCHAIN_IMAGE_METAL_KHR});
+    if (n == 0 || XR_FAILED(xrEnumerateSwapchainImages(app.cursorSpriteSwapchain, n, &n,
+                                                       (XrSwapchainImageBaseHeader *)imgs.data()))) {
+        return false;
+    }
+    XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    uint32_t idx = 0;
+    if (XR_FAILED(xrAcquireSwapchainImage(app.cursorSpriteSwapchain, &ai, &idx))) {
+        return false;
+    }
+    XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wi.timeout = XR_INFINITE_DURATION;
+    xrWaitSwapchainImage(app.cursorSpriteSwapchain, &wi);
+
+    std::vector<uint8_t> buf((size_t)S * S * 4);
+    auto cover = [](float d, float r0, float r1) { // 1 inside [r0, r1], 1-px soft edges
+        const float a = std::min(d - r0 + 0.5f, r1 - d + 0.5f);
+        return a <= 0.0f ? 0.0f : (a >= 1.0f ? 1.0f : a);
+    };
+    for (uint32_t y = 0; y < S; y++) {
+        for (uint32_t x = 0; x < S; x++) {
+            const float d = hypotf((float)x + 0.5f - S * 0.5f, (float)y + 0.5f - S * 0.5f);
+            const float ring = std::max(cover(d, 21.0f, 27.0f), cover(d, 0.0f, 5.0f)); // cyan
+            const float edge = std::max(cover(d, 19.5f, 28.5f), cover(d, 0.0f, 6.5f)); // dark rim
+            uint8_t *px = &buf[((size_t)y * S + x) * 4];
+            // BGRA, straight alpha: cyan where the ring is, near-black rim.
+            px[0] = (uint8_t)(255.0f * ring);
+            px[1] = (uint8_t)(220.0f * ring);
+            px[2] = 0;
+            px[3] = (uint8_t)(255.0f * std::max(ring, edge));
+        }
+    }
+    id<MTLTexture> tex = (__bridge id<MTLTexture>)imgs[idx].texture;
+    [tex replaceRegion:MTLRegionMake2D(0, 0, S, S) mipmapLevel:0 withBytes:buf.data() bytesPerRow:(size_t)S * 4];
+
+    XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    xrReleaseSwapchainImage(app.cursorSpriteSwapchain, &ri);
+    LOG_INFO("Cursor sprite swapchain created: %ux%u (cyan ring, hotspot = centre)", S, S);
+    return true;
+}
+
+// ============================================================================
 // #1581 — quad-layer probe texture
 // ============================================================================
 
@@ -2926,6 +3018,10 @@ int main(int argc, char **argv)
         LOG_ERROR("Failed to create swapchain");
         return 1;
     }
+    if (app.cursorDepthRuntimeDraw && app.cursorDepthCustomSprite && !CreateCursorSprite(app)) {
+        LOG_WARN("Cursor sprite swapchain creation failed - using the runtime's default look");
+        app.cursorDepthCustomSprite = false;
+    }
 
     // HUD window-space layer swapchain (XR_EXT_window_space_layer).
     XrHudSwapchain hudSwapchain;
@@ -3210,6 +3306,15 @@ int main(int argc, char **argv)
             XR_TYPE_CURSOR_DEPTH_OPTIONS_DXR};
         cursorOptions.anchorMode = app.cursorDepthAnchor;
         cursorOptions.margin = 0.0f;
+        // Spec v5 (ADR-046 Amendment 2 B): "runtime, draw it" - with our
+        // sprite (hotspot = its centre, 1 cm tall) or the runtime's default
+        // look (XR_NULL_HANDLE: the OS cursor's shape and size).
+        XrCursorDepthDrawInfoDXR cursorDrawInfo = {XR_TYPE_CURSOR_DEPTH_DRAW_INFO_DXR};
+        cursorDrawInfo.image = app.cursorDepthCustomSprite ? app.cursorSpriteSwapchain : XR_NULL_HANDLE;
+        cursorDrawInfo.hotSpot = {0.5f, 0.5f};
+        cursorDrawInfo.sizeMeters = app.cursorDepthCustomSprite ? 0.01f : 0.0f;
+        cursorDrawInfo.visible = XR_TRUE;
+        XrCursorDepthDrawStateDXR cursorDrawState = {XR_TYPE_CURSOR_DEPTH_DRAW_STATE_DXR};
         bool cursorInCanvas = false;
         if (app.hasCursorDepthExt && g_window != nil && g_metalView != nil) {
             NSPoint pw = [g_window mouseLocationOutsideOfEventStream];
@@ -3260,12 +3365,20 @@ int main(int argc, char **argv)
                         cursorOptions.next = hintTail;
                         hintTail = &cursorOptions;
                     }
+                    if (app.cursorDepthRuntimeDraw) {
+                        cursorDrawInfo.next = hintTail;
+                        hintTail = &cursorDrawInfo;
+                    }
                     cursorHint.next = hintTail;
                     locateInfo.next = &cursorHint;
                 }
             }
             cursorPlacement.next = viewState.next;
             viewState.next = &cursorPlacement;
+            if (app.cursorDepthRuntimeDraw) {
+                cursorDrawState.next = viewState.next;
+                viewState.next = &cursorDrawState;
+            }
         }
 
         // Multi-screen M3 (XR_DXR_display_info v22): when the window spans
@@ -3291,20 +3404,36 @@ int main(int argc, char **argv)
                 ? app.renderingModeViewCounts[app.currentModeIndex] : 2;
             prevActive = d3 ? (mvc < viewCount ? mvc : viewCount) : 1;
 
-            g_cursorDraw.active = cursorPlacement.isActive == XR_TRUE;
+            // App mode: we draw the crosshair from the placement. Runtime mode
+            // (spec v5): the runtime draws, we draw nothing.
+            g_cursorDraw.active = !app.cursorDepthRuntimeDraw && cursorPlacement.isActive == XR_TRUE;
             g_cursorDraw.pose = cursorPlacement.pose;
             g_cursorDraw.height = cursorPlacement.height;
             // The app owns its window's OS cursor: hidden exactly while the
-            // depth cursor replaces it.
+            // depth cursor replaces it - our own (isActive), or the runtime's
+            // (willDraw: whenever it cannot draw, we keep the OS cursor).
+            const bool depthCursorShown =
+                app.cursorDepthRuntimeDraw ? cursorDrawState.willDraw == XR_TRUE : g_cursorDraw.active;
             static bool osCursorHidden = false;
-            if (g_cursorDraw.active != osCursorHidden) {
-                if (g_cursorDraw.active) [NSCursor hide]; else [NSCursor unhide];
-                osCursorHidden = g_cursorDraw.active;
+            if (depthCursorShown != osCursorHidden) {
+                if (depthCursorShown) [NSCursor hide]; else [NSCursor unhide];
+                osCursorHidden = depthCursorShown;
+            }
+            static int willDrawLogged = 0;
+            if (app.cursorDepthRuntimeDraw && willDrawLogged < 3 && cursorInCanvas) {
+                static int lastWillDraw = -1;
+                if ((int)cursorDrawState.willDraw != lastWillDraw) {
+                    lastWillDraw = (int)cursorDrawState.willDraw;
+                    willDrawLogged++;
+                    LOG_INFO("cursor_depth: runtime willDraw=%s (uv=%.3f,%.3f disparity=%.3f)",
+                             cursorDrawState.willDraw ? "TRUE" : "FALSE", cursorHint.cursorUV.x,
+                             cursorHint.cursorUV.y, cursorPlacement.disparity);
+                }
             }
             static int cursorLogged = 0;
             const bool cursorHasContent =
                 app.cursorDepthFromLayer ? cursorPlacement.targetDisparity != 0.0f : cursorHint.hasContent == XR_TRUE;
-            if (g_cursorDraw.active && cursorHasContent && cursorLogged < 3) {
+            if (cursorPlacement.isActive && cursorHasContent && cursorLogged < 3) {
                 cursorLogged++;
                 LOG_INFO("cursor_depth: uv=(%.3f,%.3f) target=%.3f disparity=%.3f h=%.4f pos=(%.3f,%.3f,%.3f)",
                          cursorHint.cursorUV.x, cursorHint.cursorUV.y, cursorPlacement.targetDisparity,
@@ -4075,6 +4204,8 @@ int main(int argc, char **argv)
     if (g_panel2.swapchain != XR_NULL_HANDLE) {
         xrDestroySwapchain(g_panel2.swapchain);
     }
+    if (app.cursorSpriteSwapchain != XR_NULL_HANDLE)
+        xrDestroySwapchain(app.cursorSpriteSwapchain);
     if (app.swapchain.swapchain)
         xrDestroySwapchain(app.swapchain.swapchain);
     if (app.localSpace)

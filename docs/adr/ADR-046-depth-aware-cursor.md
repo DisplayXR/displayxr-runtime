@@ -1,6 +1,6 @@
 # ADR-046: Depth-aware cursor — opt-in only; the app knows the depth, the runtime places the cursor
 
-**Status:** Proposed (2026-10-06) · Phase 1 implemented · Phase 3a implemented (Metal) · spec v3 anchor modes (2026-10-07) · Amendment 1 (lifted content, 2026-10-10) accepted · Amendment 2 (one policy, runtime draws, app chooses the look, 2026-10-11) accepted · spec:
+**Status:** Proposed (2026-10-06) · Phase 1 implemented · Phase 3a implemented (Metal) · spec v3 anchor modes (2026-10-07) · Amendment 1 (lifted content, 2026-10-10) accepted · Amendment 2 (one policy, runtime draws, app chooses the look, 2026-10-11) accepted, §B built on Metal (spec v5) · spec:
 [XR_DXR_cursor_depth.md](../specs/extensions/XR_DXR_cursor_depth.md) · sibling of
 [ADR-040](ADR-040-rear-depth-budget.md) (the same cue conflict, at the cursor instead of the desktop)
 
@@ -572,6 +572,42 @@ sprite and the depth, and the runtime owns the drawing. Apps get the same contra
   panel's pixel pitch, and −0.005 baselines (~0.33 mm at 65 mm IPD) is above 0.5 px on every
   current panel.
 - A.5 (hybrid line-of-sight anchor) was already the v3 default and is unchanged.
+
+#### §B as built on Metal (`XR_DXR_cursor_depth` spec v5)
+
+- **API.** `XrCursorDepthDrawInfoDXR` (on the hint: `image`, `hotSpot`, `sizeMeters`, `visible`)
+  and `XrCursorDepthDrawStateDXR` (on `XrViewState`: `willDraw`). New structs only. The app's
+  sprite is sampled as **straight alpha** from its last released image (the shell cursor's
+  convention). `sizeMeters` is the sprite's height at the glass; ≤ 0 = the OS cursor's size.
+- **State tracker.** A hinted locate that chains the draw request runs the placement even when
+  the app did not chain `XrCursorDepthPlacementDXR`. When the placement is active it records the
+  locate space, hotspot point C, display-plane orientation and one *unit* = canvas height × t,
+  and reports `willDraw`. At `xrEndFrame` (one bool test otherwise) it maps C into **each view of
+  the frame's first projection layer, with the poses and fovs the app submitted**, as an affine
+  map per view (where C lands in the tile, and where one unit along the sprite's X and Y goes).
+  The map is exact because every Kooima image plane is parallel to the display plane, which the
+  sprite lies parallel to. Same-space rule as §6: a layer in another space, a zones frame, or a
+  frame without a projection layer draws nothing and makes the next locates report
+  `willDraw = XR_FALSE` (one-time WARN) until a frame is drawable again, so the fallback is always
+  the OS cursor. Pure helpers in `u_cursor_depth` (`u_cursor_draw_*`), unit-tested, including
+  the compositor gate `u_cursor_draw_should_draw()` (false for a zero-initialised request).
+- **Metal compositor.** The request is consumed by the next commit (one field test otherwise).
+  The cursor is drawn **inside the atlas encoder, after the projection, quad and window-space
+  layers and before the display processor**: one alpha-blended triangle strip per tile, depth
+  off, scissored to the tile, through its own small shader library and four pipelines (straight /
+  premultiplied × UNORM / `_sRGB` target) built on the first request. A frame carrying the cursor
+  never takes the zero-copy path. Because the draw is inside the atlas pass, the
+  `/tmp/dxr_atlas_trigger` dump shows it.
+- **Default look (A.6).** The current OS cursor is mirrored: when the commit runs on the main
+  thread (AppKit is main-thread-only; the `cube_*_macos` apps pump events and render there),
+  `[NSCursor currentCursor]`'s image is rasterised into a small premultiplied `_sRGB` texture,
+  only when the cursor object changes, with its hotspot and its size in points × the panel's
+  metres per point (pixel pitch × backing scale). Off the main thread the last snapshot is
+  kept, else the classic arrow (12 × 19, white fill, dark outline, rasterised procedurally,
+  4 × 4 supersampled). `DXR_CURSOR_DEFAULT_LOOK=arrow` forces the arrow.
+- **Not yet:** D3D11, D3D12, GL, vk_native and the service (`svc_draw_cursor_quads`) report
+  `willDraw = XR_FALSE`; display zones; multi-screen routed frames draw per tile without the
+  segment routing; the 0.5 px floor of A.3 is not applied (−0.005 is above it on current panels).
 
 ### Rollout
 
