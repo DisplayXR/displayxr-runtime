@@ -123,7 +123,7 @@ costs nothing on its own.
 | Field | Meaning |
 |---|---|
 | `anchorMode` | Where the sprite goes laterally as the viewer's head moves. `XR_CURSOR_DEPTH_ANCHOR_MODE_HYBRID_DXR` (0, the default), `_SCREEN_DXR` (1), `_WORLD_DXR` (2). An unknown value behaves as HYBRID. |
-| `margin` | How far in front of the content the cursor floats, as a disparity in eye-baseline units. ≤ 0 or non-finite selects the runtime default, 0.03 (v3 used 0.005). |
+| `margin` | How far in front of the content the cursor floats, as a disparity in eye-baseline units. ≤ 0 or non-finite selects the runtime default, 0.015 (v3 used 0.005; v4–v6 used 0.03 until 2026-10-11). |
 
 **Anchor modes.** E is the cyclopean eye, S the canvas point under the pointer, f the unit display
 normal pointing away from the viewer, e = dot(S − E, f), d the filtered disparity and
@@ -229,7 +229,7 @@ along the display normal measured from the cyclopean eye:
 
 - **never behind the glass** (v4, ADR-046 Amendment 2 A.1): target = d < 0 ? max(d − margin, −0.6) : 0.
   Content on or behind the display plane leaves the cursor on the plane;
-- margin: 0.03 baseline in front of the content (overridable with `XrCursorDepthOptionsDXR::margin`);
+- margin: 0.015 baseline in front of the content, about 1 mm of crossed on-screen disparity at a 63–65 mm IPD (overridable with `XrCursorDepthOptionsDXR::margin`);
 - lateral anchor: HYBRID unless `XrCursorDepthOptionsDXR` selects another mode (§2.4);
 - clamp: d ∈ [−0.6, 0];
 - draw threshold (v4, Amendment 2 A.3): `isActive` only while the filtered d ≤ −0.005 (about 0.3 mm
@@ -326,3 +326,4 @@ Reference: `test_apps/handle/cube_handle_metal_macos` (`DISPLAYXR_CURSOR_DEPTH_D
 | 4 | No new structs; **behaviour changes** (ADR-046 Amendment 2 A, one cursor policy everywhere). **Never behind the glass:** target = d < 0 ? max(d − margin, −0.6) : 0, so content on or behind the display plane leaves the cursor on the plane (v1–v3 let it sink onto content behind the glass, up to +0.6). **Margin back to 0.03** (the reference app's value since Phase 1). **Draw threshold:** `isActive` is now also `XR_FALSE` while the filtered disparity is above −0.005, which is the existing meaning of `isActive = XR_FALSE` (draw nothing, show the OS cursor); `disparity` / `targetDisparity` stay filled as diagnostics. HYBRID stays the default anchor. |
 | 5 | **The runtime draws** (ADR-046 Amendment 2 B). New structs only: `XrCursorDepthDrawInfoDXR` (1004999324, on the hint: the sprite swapchain or `XR_NULL_HANDLE` for the default look, hotspot, size in metres, visibility) and `XrCursorDepthDrawStateDXR` (1004999325, on `XrViewState`: `willDraw`, the app's cue to hide its OS cursor). Drawn after the app's layers and before the display processor, per view, with the projection layer's own views (same-space rule). Default look: the current OS cursor shape, else the classic arrow. Metal (in-process) first; other backends report `willDraw = XR_FALSE`. App-drawn placement (v1–v4) unchanged. |
 | 6 | **Lifted content** (ADR-046 Amendment 1, runtime#1907). New structs only: `XrCursorDepthLiftRectDXR` (1004999326, on `XrWeaveRectLiftDXR`: draw the cursor into this lifted rect's views) and `XrCursorDepthLiftStateDXR` (1004999327, on `XrWeaveOutputDXR`: `drawnLiftMask`). Placed from the lift conversion's depth map through the module's relief mapping (`xrt_dp_lift_depth::relief_*`), §3 policy, D3D11 service. §2.7. |
+| 6 (2026-10-11) | No version bump, no struct change; **default margin halved, 0.03 → 0.015** (ADR-046 Amendment 2 A.2) after the Windows Leia panel check: 0.03 (≈2 mm crossed) floated visibly off the content, 0.015 is ≈1 mm. The margin is a default, not a contract (`XrCursorDepthOptionsDXR::margin` still overrides it), so apps need no change; one that wants the old look chains the options struct with `margin = 0.03`. |

@@ -2452,10 +2452,13 @@ cursor_draw(struct comp_d3d11_renderer *r,
 
 	if (!r->cursor.announced) {
 		r->cursor.announced = true;
+		// The views actually drawn (the request capped to the layout's
+		// tiles, as the loop below does), like the Metal/GL/VK notices.
+		const uint32_t drawn = q->count < layout->views ? q->count : layout->views;
 		U_LOG_W(
-		    "cursor_draw: D3D11 compositor drawing the cursor (%s, %u views, %s; ADR-046 Amendment 2 B, "
+		    "cursor_draw: D3D11 compositor drawing the cursor (%s, %u view(s), %s; ADR-046 Amendment 2 B, "
 		    "one-time notice)",
-		    q->xsc != nullptr ? "app sprite" : "default look", q->count,
+		    q->xsc != nullptr ? "app sprite" : "default look", drawn,
 		    r->compose_active ? "linear compose" : "encoded fast path");
 	}
 

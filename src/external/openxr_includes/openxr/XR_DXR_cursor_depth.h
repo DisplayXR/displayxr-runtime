@@ -53,14 +53,16 @@
  * head-tracked panel: the default anchor is now HYBRID (the sprite follows the
  * pointer's line of sight while the pointer moves, and is world-fixed while it
  * is still, so it motion-parallaxes like the content it rests on) and the
- * default margin was 0.005 (v4 restores 0.03). An app that wants the v1/v2
+ * default margin was 0.005 (v4 restored 0.03, since halved to 0.015). An app that wants the v1/v2
  * placement chains the options struct with XR_CURSOR_DEPTH_ANCHOR_MODE_SCREEN_DXR.
  *
  * Spec v4 (ADR-046 Amendment 2 A, one cursor policy everywhere) changes
  * behaviour, not structs:
  *  - NEVER BEHIND THE GLASS: target = d < 0 ? max(d - margin, -0.6) : 0.
  *    Content on or behind the display plane leaves the cursor on the plane.
- *  - default margin 0.03 again;
+ *  - default margin 0.03 again (halved to 0.015 on 2026-10-11, a default
+ *    change with no struct change: 0.03 floated visibly off the content on
+ *    a real panel);
  *  - isActive is XR_TRUE only while the FILTERED disparity is at least 0.005
  *    eye baselines in front of the plane. On the plane the OS cursor is the
  *    cursor: draw nothing and show it. The filter keeps running while
@@ -258,7 +260,7 @@ typedef struct XrCursorDepthOptionsDXR {
     /*!
      * How far in front of the content the cursor floats, as a disparity in
      * eye-baseline units (> 0). <= 0 or non-finite selects the runtime
-     * default (0.03; spec v3 used 0.005).
+     * default (0.015; spec v3 used 0.005, v4 0.03).
      */
     float                      margin;
 } XrCursorDepthOptionsDXR;
