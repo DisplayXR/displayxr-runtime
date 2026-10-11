@@ -800,3 +800,79 @@ TEST_CASE("comp_ws: overlays per screen — which presenter composes an overlay 
 		}
 	}
 }
+
+TEST_CASE("comp_ws: a synthetic one-click-drag DOWN is always paired with exactly one UP")
+{
+	// The runtime re-delivers a held press to a window the controller just
+	// focused. The real UP only reaches it when the cursor is over its forward
+	// rect at release — a taskbar restore grows the window away from under
+	// the cursor, so the app was left with the button held and every later
+	// hover became a drag (multi-screen rig, 2026-10-11).
+	int app_a = 0, app_b = 0;
+	void *A = &app_a;
+	void *B = &app_b;
+	comp_ws_synth_press p{};
+
+	SECTION("nothing pending: nothing owed")
+	{
+		CHECK(comp_ws_synth_press_settle(&p, false, false, nullptr) == nullptr);
+		CHECK(comp_ws_synth_press_settle(nullptr, false, false, nullptr) == nullptr);
+		CHECK(comp_ws_synth_press_note_down(nullptr, A, 1, 0, 0, 0) == nullptr);
+		CHECK(comp_ws_synth_press_note_down(&p, nullptr, 1, 0, 0, 0) == nullptr);
+		CHECK(p.target == nullptr);
+	}
+
+	SECTION("a drag in one motion: held on the window it was given to keeps waiting")
+	{
+		CHECK(comp_ws_synth_press_note_down(&p, A, 1, 100, 10, 20) == nullptr);
+		CHECK(comp_ws_synth_press_settle(&p, true, false, A) == nullptr);
+		CHECK(comp_ws_synth_press_settle(&p, true, false, A) == nullptr);
+		CHECK(p.target == A);
+	}
+
+	SECTION("the real UP reached the app: paired, nothing posted")
+	{
+		comp_ws_synth_press_note_down(&p, A, 1, 100, 10, 20);
+		CHECK(comp_ws_synth_press_settle(&p, false, true, A) == nullptr);
+		CHECK(p.target == nullptr);
+		CHECK(comp_ws_synth_press_settle(&p, false, false, A) == nullptr); // never twice
+	}
+
+	SECTION("released off the window (restore moved it, other presenter, overlay): post the UP once")
+	{
+		comp_ws_synth_press_note_down(&p, A, 1, 100, 10, 20);
+		CHECK(comp_ws_synth_press_settle(&p, false, false, A) == A);
+		CHECK(p.target == nullptr);
+		CHECK(comp_ws_synth_press_settle(&p, false, false, A) == nullptr);
+	}
+
+	SECTION("focus moved on while held: the old window gets its UP now")
+	{
+		comp_ws_synth_press_note_down(&p, A, 1, 100, 10, 20);
+		CHECK(comp_ws_synth_press_settle(&p, true, false, B) == A);
+		CHECK(comp_ws_synth_press_settle(&p, true, false, B) == nullptr);
+	}
+
+	SECTION("focus cleared (window hidden) while held: UP now")
+	{
+		comp_ws_synth_press_note_down(&p, A, 1, 100, 10, 20);
+		CHECK(comp_ws_synth_press_settle(&p, true, false, nullptr) == A);
+	}
+
+	SECTION("a second synthetic DOWN to another window settles the first")
+	{
+		comp_ws_synth_press_note_down(&p, A, 1, 100, 10, 20);
+		CHECK(comp_ws_synth_press_note_down(&p, B, 1, 200, 30, 40) == A);
+		CHECK(p.target == B);
+		CHECK(p.x == 30);
+		CHECK(p.y == 40);
+		CHECK(comp_ws_synth_press_settle(&p, false, false, B) == B);
+	}
+
+	SECTION("re-noting the same window owes nothing extra")
+	{
+		comp_ws_synth_press_note_down(&p, A, 1, 100, 10, 20);
+		CHECK(comp_ws_synth_press_note_down(&p, A, 1, 150, 11, 21) == nullptr);
+		CHECK(comp_ws_synth_press_settle(&p, false, false, A) == A);
+	}
+}

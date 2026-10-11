@@ -613,6 +613,40 @@ comp_ws_pointer_owner_screen(const struct comp_ws_pointer_owner *o)
 	return (o != NULL && o->valid) ? o->screen_id : 0;
 }
 
+void *
+comp_ws_synth_press_note_down(
+    struct comp_ws_synth_press *p, void *target, uint32_t button, uint32_t timestamp_ms, int32_t x, int32_t y)
+{
+	if (p == NULL || target == NULL) {
+		return NULL;
+	}
+	void *owed = (p->target != NULL && p->target != target) ? p->target : NULL;
+	p->target = target;
+	p->button = button;
+	p->timestamp_ms = timestamp_ms;
+	p->x = x;
+	p->y = y;
+	return owed;
+}
+
+void *
+comp_ws_synth_press_settle(struct comp_ws_synth_press *p, bool button_held, bool up_forwarded, void *focus_target)
+{
+	if (p == NULL || p->target == NULL) {
+		return NULL;
+	}
+	void *target = p->target;
+	if (up_forwarded) {
+		p->target = NULL; // the real UP reached it
+		return NULL;
+	}
+	if (!button_held || focus_target != target) {
+		p->target = NULL;
+		return target;
+	}
+	return NULL; // still dragging on the window it was given to
+}
+
 uint64_t
 comp_ws_overlay_screen(uint64_t overlay_screen_id, const uint64_t *presenter_ids, uint32_t presenter_count)
 {
