@@ -60,6 +60,22 @@ target_include_directories(cube_zones_vk_android BEFORE PRIVATE
 target_include_directories(cube_zones_vk_android PRIVATE
     "${CMAKE_SOURCE_DIR}/../../../../../common")
 
+# displayxr-common — header-only vk_frame_ring.h (dxr::VkFrameRing: N frames in
+# flight, ONE vkQueueSubmit per frame, no wait on the frame just submitted —
+# INV-4.10, runtime #1917 / displayxr-demo-modelviewer#170). Sources only: don't
+# run its CMake (the STATIC lib carries desktop platform sources); its common/
+# dir is appended LAST to the include path so no local header is shadowed.
+include(FetchContent)
+FetchContent_Declare(displayxr_common_rules
+    GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
+    GIT_TAG        v2.29.0
+    GIT_SHALLOW    TRUE)
+FetchContent_GetProperties(displayxr_common_rules)
+if(NOT displayxr_common_rules_POPULATED)
+    FetchContent_Populate(displayxr_common_rules)
+endif()
+target_include_directories(cube_zones_vk_android PRIVATE "${displayxr_common_rules_SOURCE_DIR}/common")
+
 # -u ANativeActivity_onCreate forces the linker to keep the symbol the
 # Android runtime resolves dynamically on Activity launch — without it,
 # the shared lib loads but exposes nothing.
