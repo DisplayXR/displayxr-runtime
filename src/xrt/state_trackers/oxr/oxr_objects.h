@@ -2173,10 +2173,12 @@ oxr_session_populate_vk_with_metal_native(struct oxr_logger *log,
 
 /*!
  * macOS: should this Vulkan session be presented by the Metal native
- * compositor instead of vk_native? True when the active display processor
- * offers a Metal factory but no Vulkan one (a Metal-only vendor plug-in such
- * as Leia SR on macOS, whose only weaver is Metal) — vk_native would have no
- * DP to weave with. DXR_MACOS_VK_VIA_METAL=1|0 forces either way. Logs the
+ * compositor instead of vk_native? True when ANY registered display plug-in
+ * offers a Metal factory but no Vulkan one, whether or not it claimed a display
+ * at start (a Metal-only vendor plug-in such as Leia SR on macOS: its panel may
+ * be hot-plugged later and only comp_metal segments on macOS), or when the
+ * active display processor is Metal-only. DXR_MACOS_VK_VIA_METAL=1|0 forces
+ * either way. Logs the
  * decision once (WARN). False off macOS / without both compositors.
  */
 bool
