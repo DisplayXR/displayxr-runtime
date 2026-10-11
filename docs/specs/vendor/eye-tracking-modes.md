@@ -1,7 +1,7 @@
 ---
 status: Active
 owner: David Fattal
-updated: 2026-06-05
+updated: 2026-10-10
 issues: [81, 441]
 code-paths: [src/external/openxr_includes/openxr/XR_DXR_display_info.h, src/xrt/state_trackers/oxr/]
 ---
@@ -78,6 +78,46 @@ notification primitive for MANUAL mode (replaces per-frame polling of
 `XrViewEyeTrackingStateDXR`); it fires in MANAGED mode too, where apps may use it to drive
 optional UI. Edge detection happens in the runtime's `xrLocateViews` path, so an app that
 never locates views receives no events (it also has no use for them).
+
+### Multi-screen: the session is tracked when any of its screens is (ADR-047 Amendment 7)
+
+On a multi-screen rig every screen has its own DP and its own tracker (ADR-047), and a window
+can present through several of them at once: the session's own DP plus a segment DP per other
+screen it spans (in-process and the service's direct pipeline), the secondary workspace
+presenters its tile touches (ADR-052), or the per-screen segment DPs of a present-owner's weave
+(`XR_DXR_weave`, Amendment 4). Per-screen **eyes** stay per screen: each segment's views come
+from its own screen's DP, as before. The session-level **boolean** is the OR over every DP
+presenting for the session:
+
+```
+isTracking = active_mode.has_tracking && debounce(own_dp.tracked || any(other_presenting_dp.tracked))
+```
+
+- **Rises immediately** when any of them sees a viewer.
+- **One DP presenting** (a window on one screen — every window on a single-screen box): falls
+  immediately, exactly the pre-amendment rule, so MANUAL's "immediate" contract is unchanged.
+- **Several DPs presenting:** falls only after the OR has been false for 0.5 s
+  (`U_TRACKING_ANY_HOLD_NS`), so a viewer walking from one screen to the other never produces a
+  false edge when the first screen lets go a moment before the second acquires. Each DP's own
+  signal is still the vendor's (MANAGED grace period, MANUAL immediate); the hold covers only the
+  hand-over between screens.
+
+What hangs off it: `XrViewEyeTrackingStateDXR.isTracking`, the
+`XrEventDataEyeTrackingStateChangedDXR` edge, `XrWeaveOutputDXR.eyesTracking`, and the
+service's system display status (`system_get_display_status`, an undebounced read). A DP's
+"viewer present" is decided in one place, `u_tracking_dp_viewer_present()`
+(`src/xrt/auxiliary/util/u_tracking_any.h`) — today the DP's eye validity; that is the hook a
+vendor's per-display user-presence signal (e.g. LeiaSR's `SR_EVENT_TYPE_DISPLAY_USER_PRESENCE`,
+capability-gated) will feed through an optional DP slot, with no vendor SDK in the runtime.
+
+The workspace controller's FRAME_TICK viewer follows the same rule: when the primary's DP sees
+nobody but a secondary presenter's DP does, the published viewer is that presenter's, mapped into
+the primary's display space through the workspace's desktop-pixel layout (`comp_ws_map_pose`:
+x/y by each screen's pixel pitch, z unchanged — the screens are treated as coplanar, ADR-052 D2).
+
+Per-screen views are unaffected: the per-view raw block (`XR_DXR_view_rig`) and
+`XrWeaveOutputRectPartsDXR` keep each screen's own `isTracking`. The vendor's MANAGED 2D/3D
+auto-switch also stays per panel: each DP drives its own lens from its own tracker.
 
 ### Tracking loss and eye position reporting
 

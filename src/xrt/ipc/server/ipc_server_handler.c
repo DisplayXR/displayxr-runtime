@@ -3231,6 +3231,27 @@ ipc_handle_compositor_get_window_metrics(volatile struct ipc_client_state *ics,
 	return XRT_SUCCESS;
 }
 
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+/*!
+ * ADR-047 Amendment 7: this client's session-level "is anyone tracked" — its
+ * own DP's answer @p own ORed with every other DP presenting for it
+ * (comp_d3d11_service_get_other_screens_tracking), through @p state's
+ * hand-over debounce (util/u_tracking_any.h). With no other DP presenting the
+ * answer is @p own, exactly as before. Called on the client's own IPC thread.
+ */
+static bool
+session_tracking_or(volatile struct ipc_client_state *ics, struct u_tracking_any *state, bool own)
+{
+	uint32_t others = 0;
+	bool others_tracked = false;
+	if (ics->server != NULL && ics->server->xsysc != NULL) {
+		others_tracked = comp_d3d11_service_get_other_screens_tracking(
+		    ics->server->xsysc, (struct xrt_compositor *)ics->xc, &others, NULL);
+	}
+	return u_tracking_any_update(state, os_monotonic_get_ns(), own, others_tracked, others, U_TRACKING_ANY_HOLD_NS);
+}
+#endif
+
 xrt_result_t
 ipc_handle_compositor_get_predicted_eye_positions(volatile struct ipc_client_state *ics,
                                                   struct xrt_eye_positions *out_eye_positions)
@@ -3253,6 +3274,14 @@ ipc_handle_compositor_get_predicted_eye_positions(volatile struct ipc_client_sta
 		// even while its own located views are tracked.
 		(void)comp_d3d11_service_get_predicted_eye_positions_full_for_client(
 		    ics->server->xsysc, (struct xrt_compositor *)ics->xc, &eyes);
+
+		// ADR-047 Amendment 7: the session is tracked when ANY DP presenting
+		// for it sees a viewer — its own (above), or a segment DP / workspace
+		// presenter / present-owner weave segment on another screen. Only
+		// the boolean changes; the eyes stay this client's own screen's.
+		// The client passes this answer straight through (oxr_session.c).
+		eyes.is_tracking = session_tracking_or(ics, &((struct ipc_client_state *)ics)->tracking_any_locate,
+		                                       u_tracking_dp_viewer_present(&eyes));
 	}
 #elif defined(XRT_OS_MACOS) || defined(XRT_OS_LINUX_DESKTOP)
 	// macOS / desktop-Linux null+comp_multi service: THIS client's DP — its per-session DP,
@@ -4282,6 +4311,20 @@ ipc_handle_system_get_display_status(volatile struct ipc_client_state *_ics, str
 		st.tracking_valid = true;
 		st.is_tracking = eyes.is_tracking;
 	}
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	// ADR-047 Amendment 7: the system is tracking when any presenting DP is —
+	// the panel DP above, or any secondary workspace presenter / segment DP
+	// on another screen. A status read, not a decision: undebounced.
+	if (s->xsysc != NULL && comp_d3d11_service_is_d3d11_service(s->xsysc)) {
+		uint32_t others = 0;
+		if (comp_d3d11_service_get_other_screens_tracking(s->xsysc, NULL, &others, NULL)) {
+			st.is_tracking = true;
+		}
+		if (others > 0) {
+			st.tracking_valid = true;
+		}
+	}
+#endif
 
 	*out_status = st;
 	return XRT_SUCCESS;
@@ -7212,6 +7255,14 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	*out_width = w;
 	*out_height = h;
 	*out_fence_value = fv;
+	// ADR-047 Amendment 7: eyesTracking is "is anyone tracked" over every DP
+	// weaving this window (the session's weave DP + its per-screen segment
+	// DPs). The eyes stay the session weave DP's; per-screen eyes ride
+	// XrWeaveOutputRectPartsDXR as before. eyesValid false keeps eyesTracking false.
+	if (eyes.valid) {
+		eyes.is_tracking = session_tracking_or(ics, &((struct ipc_client_state *)ics)->tracking_any_weave,
+		                                       u_tracking_dp_viewer_present(&eyes));
+	}
 	*out_eyes = eyes;
 	// #1884 (ADR-047 Amendment 4, addendum): how many screens this very submit
 	// was woven on, so the client fetches the per-screen table
