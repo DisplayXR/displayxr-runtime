@@ -286,9 +286,12 @@ the same geometry to serve its own non-DisplayXR apps). The full contract is in
   the ecosystem.
 - **Exactly one installed owner** — a D-Bus well-known name is singly owned, so
   a second publisher binds nothing and silently strands consumers. Any package
-  shipping it declares `Provides:` + `Conflicts:` + `Replaces:` on the virtual
-  package `displayxr-window-geometry-publisher`, and consumers depend on that
-  virtual name rather than on any vendor's package.
+  shipping this extension `Provides:` the virtual package
+  `displayxr-window-geometry-publisher` and declares `Provides:` +
+  `Conflicts:` + `Replaces:` on `displayxr-window-geometry-publisher-gnome`.
+  Consumers depend on the generic name rather than on any vendor's package; a
+  publisher for another compositor (KWin) uses its own suffix and installs
+  alongside.
 - **Ship the whole file set** — `metadata.json`, `lib.js` and **both** entry
   points (`extension.js`, `extension-gnome42.js`) — and select between them by
   the running shell's version, as described under *Two entry points*. Shipping
