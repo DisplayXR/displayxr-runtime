@@ -57,7 +57,9 @@ FetchContent_Declare(
     # v2.27.0: window-space / HUD swapchains prefer the _SRGB sibling of
     # R8G8B8A8 (dxr::ChooseWindowSpaceSwapchainFormat; ADR-044 §7,
     # displayxr-common#72) — a UNORM HUD of encoded bytes was encoded twice.
-    GIT_TAG v2.27.0
+    # v2.29.0: dxr::CursorDepth (common/cursor_depth.h) — the app-side helper for the runtime-drawn
+    # depth cursor (ADR-046 Amendment 2); v2.28.0 brought the shared Vulkan frame ring.
+    GIT_TAG v2.29.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
