@@ -64,7 +64,8 @@ FetchContent_Declare(
     # R8G8B8A8 (ADR-044 §7, displayxr-common#72) — the Metal compositor is
     # format-honest, so a UNORM HUD of CPU-rasterized (encoded) bytes would be
     # encoded twice. Same pin as the VK macOS cube apps.
-    GIT_TAG v2.27.0
+    # v2.29.0: dxr::CursorDepth (common/cursor_depth.h) for the zones cursor (runtime#1949).
+    GIT_TAG v2.29.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
