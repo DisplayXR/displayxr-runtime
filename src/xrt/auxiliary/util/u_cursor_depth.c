@@ -534,6 +534,59 @@ u_cursor_draw_view_from_placement(const struct u_cursor_depth_view *view,
 	return true;
 }
 
+bool
+u_cursor_draw_into_zone(struct u_cursor_draw_request *req, uint32_t target_w, uint32_t target_h, float out_clip[4])
+{
+	out_clip[0] = 0.0f;
+	out_clip[1] = 0.0f;
+	out_clip[2] = 1.0f;
+	out_clip[3] = 1.0f;
+	if (!req->zone_valid) {
+		return true;
+	}
+	if (target_w == 0 || target_h == 0 || req->zone_rect.extent.w <= 0 || req->zone_rect.extent.h <= 0) {
+		return false;
+	}
+	// The zone's sub-rect of the tile, exactly as its layer is placed.
+	const float zx = (float)req->zone_rect.offset.w / (float)target_w;
+	const float zy = (float)req->zone_rect.offset.h / (float)target_h;
+	const float zw = (float)req->zone_rect.extent.w / (float)target_w;
+	const float zh = (float)req->zone_rect.extent.h / (float)target_h;
+
+	const float x0 = zx > 0.0f ? zx : 0.0f;
+	const float y0 = zy > 0.0f ? zy : 0.0f;
+	const float x1 = zx + zw < 1.0f ? zx + zw : 1.0f;
+	const float y1 = zy + zh < 1.0f ? zy + zh : 1.0f;
+	if (!(x1 > x0) || !(y1 > y0)) {
+		return false;
+	}
+
+	const uint32_t n = req->view_count < XRT_MAX_VIEWS ? req->view_count : XRT_MAX_VIEWS;
+	for (uint32_t i = 0; i < n; i++) {
+		struct u_cursor_draw_view *v = &req->view[i];
+		v->origin[0] = zx + v->origin[0] * zw;
+		v->origin[1] = zy + v->origin[1] * zh;
+		v->axis_x[0] *= zw;
+		v->axis_x[1] *= zh;
+		v->axis_y[0] *= zw;
+		v->axis_y[1] *= zh;
+	}
+	out_clip[0] = x0;
+	out_clip[1] = y0;
+	out_clip[2] = x1 - x0;
+	out_clip[3] = y1 - y0;
+	return true;
+}
+
+uint32_t
+u_cursor_draw_canvas_px_h(const struct u_cursor_draw_request *req, uint32_t canvas_px_h)
+{
+	if (req->zone_valid && req->zone_rect.extent.h > 0) {
+		return (uint32_t)req->zone_rect.extent.h;
+	}
+	return canvas_px_h;
+}
+
 void
 u_cursor_draw_corners(
     const struct u_cursor_draw_view *v, float height, float aspect, float hot_u, float hot_v, float out_xy[4][2])

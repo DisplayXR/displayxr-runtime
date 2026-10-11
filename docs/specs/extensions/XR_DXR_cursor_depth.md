@@ -163,7 +163,15 @@ display processor, one sprite per view tile, depth test off, never occluded, alp
 Each view's copy is projected with **that view's submitted pose and fov from the frame's first
 projection layer**, so the projection layer must be in the **same `XrSpace`** as the locate
 (otherwise nothing is drawn and later locates report `willDraw = XR_FALSE` until a frame's layer
-is in the locate space again). Display-zones frames are not drawn yet (same fallback).
+is in the locate space again).
+
+**Display zones.** One cursor per frame, in the 3D zone whose zone-scoped locate carried the
+hint (the zone under the pointer; `cursorUV` is relative to that zone). It is projected with
+**the views of the projection layer chained with that zone's `XrDisplayZoneDXR` (same
+`zoneId`)**, drawn only inside that zone's rect as submitted, never into a 2D zone or another
+3D zone. If the frame has no 3D zone with that `zoneId`, the hint did not ride a zone-scoped
+locate in a zones frame, or a zone-scoped hint arrives in a frame without zones, nothing is
+drawn and later locates report `willDraw = XR_FALSE` (the fallback above).
 
 ### 2.6 `XrCursorDepthDrawStateDXR` (output, spec v5)
 
@@ -171,7 +179,7 @@ Chained on `XrViewState::next`; filled on every locate that chains it. `willDraw
 only when this locate chained a hint carrying a visible `XrCursorDepthDrawInfoDXR`, the placement
 is active (the §3 policy: content pops out under the cursor), and the session's compositor can
 draw it. **Hide the OS cursor over the canvas exactly while `willDraw` is `XR_TRUE`.** Whenever
-the runtime cannot draw (another backend, a space mismatch, a zones frame), it reports
+the runtime cannot draw (another backend, a space mismatch, a zones frame without the hinted zone), it reports
 `XR_FALSE`, so the fallback is always the flat OS cursor, never no cursor. The runtime never
 touches the OS cursor itself.
 
