@@ -184,9 +184,20 @@ snapshot(struct comp_cursor_look *look, HCURSOR hc, float scale)
 	look->os_cursor = (void *)hc;        // shared USER object: nothing to retain
 	look->os_scale = scale;
 	look->generation++;
-	// Not per frame: only when the cursor shape (or the DPI) changes.
-	U_LOG_I("cursor_draw: default look = the current OS cursor (%dx%d px at %u DPI, image %dx%d, hotspot %d,%d)",
-	        tw, th, dpi, native_w, native_h, hot_x, hot_y);
+	// Not per frame: only when the cursor shape (or the DPI) changes. The
+	// FIRST mirror is a one-time WARN (INFO is dropped from the log file, so
+	// an INFO-only line never showed that the mirror ran); later shape
+	// changes stay INFO.
+	static bool announced = false; // process-wide: one notice, whichever compositor mirrors first
+	if (!announced) {
+		announced = true;
+		U_LOG_W("cursor_draw: default look mirrors the OS cursor (%dx%d px at %u DPI, image %dx%d, hotspot "
+		        "%d,%d; one-time notice, later shape changes log at INFO)",
+		        tw, th, dpi, native_w, native_h, hot_x, hot_y);
+	} else {
+		U_LOG_I("cursor_draw: default look = the current OS cursor (%dx%d px at %u DPI, image %dx%d, hotspot %d,%d)",
+		        tw, th, dpi, native_w, native_h, hot_x, hot_y);
+	}
 	return true;
 }
 

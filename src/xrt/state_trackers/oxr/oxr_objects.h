@@ -3182,6 +3182,11 @@ struct oxr_session
 		struct xrt_quat orientation;
 		//! One sprite unit: the canvas height scaled by the placement's t.
 		float unit;
+		//! That locate's ACTIVE view count. A projection layer may carry more
+		//! views (an app submitting for the worst-case mode under
+		//! PRIMARY_MULTIVIEW_DXR); only the active ones are tiles, so the
+		//! request is capped to this.
+		uint32_t view_count;
 		//! The app's sprite, or NULL for the default look.
 		struct oxr_swapchain *image;
 		float hot_u, hot_v, size_m;
