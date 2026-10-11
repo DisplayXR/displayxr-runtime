@@ -332,12 +332,24 @@ macOS model (#59), not a per-session target:
 
 1. **Service window target** — `compositor/main/comp_window_linux.{c,h}`
    (lib `comp_linux_window`, the `comp_macos_window` twin): a
-   `comp_target_swapchain` over a service-owned **X11** window (Xorg, or
-   XWayland on a Wayland session) via `VK_KHR_xcb_surface`, fullscreened on the
-   panel's RandR monitor with the #715 EWMH recipe, with a bounded wait for the
-   WM's fullscreen geometry before the first swapchain. It owns an event thread
-   that decodes keys (as **Windows VK codes**, autorepeat dropped), buttons,
-   motion (coalesced) and wheel into a process-wide sink.
+   `comp_target_swapchain` over a service-owned window, two backends
+   (`DXR_SERVICE_WINDOW_BACKEND=x11|wayland` overrides the automatic pick):
+   - **native Wayland** (`comp_window_linux_wayland.c`, the default when the
+     compositor offers xdg-shell + `wp_viewporter` + `wp_fractional_scale_v1`):
+     an xdg_toplevel fullscreened on the panel's `wl_output` (matched by mode,
+     `u_wl_monitor_is_panel`; mapped windowed first because mutter drops the
+     output of a pre-map `set_fullscreen`), the swapchain at the output's mode
+     and the viewport destination at the logical size — 1:1 on a fractionally
+     scaled panel, where an XWayland window is resampled and the weave breaks —
+     plus an opaque region (direct scanout, #1698) and `wl_seat` input (keys by
+     evdev position, no libxkbcommon). Protocol XML vendored in
+     `src/external/wayland-protocols/` (22.04's wayland-protocols predates
+     fractional-scale-v1).
+   - **X11** (`comp_window_linux.c`; Xorg, or XWayland as the fallback):
+     fullscreen on the panel's RandR monitor with the #715 EWMH recipe.
+
+   Both own an event thread that decodes keys (as **Windows VK codes**),
+   buttons, motion and wheel into a process-wide sink.
 2. **Null compositor Linux arm** — `create_from_window` / `destroy_target`
    create that window; the panel placement rides the handle slot
    (`struct comp_window_linux_placement`, from `xsysc->info.display_screen_*`).
@@ -374,11 +386,15 @@ hosted Vulkan cube composites through the service surface; a Vulkan controller
 probe activates the workspace, places / focuses the client (pose round-trip,
 tiled with rounded corners in the atlas), receives KEY / POINTER / MOTION
 events from synthetic X events on the surface, and wakes on the eventfd; the
-surface hides when the controller leaves. **Not yet verified:** a real panel
+surface hides when the controller leaves. The native-Wayland backend was run
+on the same headless session with the virtual monitor at 1.0 and 1.6667
+(1920x1080 buffer -> 1152x648 logical viewport, fullscreen on the matched
+output, hide / re-show), with real seat input injected through mutter's
+RemoteDesktop API arriving in device pixels. **Not yet verified:** a real panel
 (Leia DP weave of the shared atlas, lens 2D/3D), chrome / cursor / overlay
 composition from a real controller (the Linux shell port), fractional-scale
-XWayland (150 % is known to break X11 weaving), native Wayland (there is no
-xdg-shell service window yet — XWayland only), and `CLIENT_CONNECTED` /
+XWayland on the X11 fallback (150 % is known to break X11 weaving — the
+native-Wayland backend is the fix and the default), and `CLIENT_CONNECTED` /
 `FRAME_TICK` events (not emitted by the comp_multi platforms; macOS has none
 either).
 
