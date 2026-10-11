@@ -4134,8 +4134,20 @@ metal_cursor_draw(struct comp_metal_compositor *c,
                   uint32_t atlas_view_w,
                   uint32_t atlas_view_h,
                   bool compose_linear,
-                  uint32_t canvas_px_h)
+                  uint32_t canvas_px_h,
+                  uint32_t zones_target_w,
+                  uint32_t zones_target_h)
 {
+	// #1949: a zone request's views are zone-normalised - re-express them in
+	// the tile the way the zone's own layer is placed, and clip to the zone.
+	struct u_cursor_draw_request zreq = *req;
+	float clip[4];
+	if (!u_cursor_draw_into_zone(&zreq, zones_target_w, zones_target_h, clip)) {
+		return;
+	}
+	req = &zreq;
+	canvas_px_h = u_cursor_draw_canvas_px_h(req, canvas_px_h);
+
 	if (!metal_cursor_ensure_pipelines(c)) {
 		return;
 	}
@@ -4209,9 +4221,20 @@ metal_cursor_draw(struct comp_metal_compositor *c,
 		MTLViewport vp = {(double)ox, (double)oy, (double)atlas_view_w, (double)atlas_view_h, 0.0, 1.0};
 		[encoder setViewport:vp];
 		// The scissor is mandatory: a cursor at a tile edge must not spill
-		// into the neighbour view (the DP would weave it into the wrong eye).
-		MTLScissorRect sr = {ox, oy, (ox + atlas_view_w > att_w) ? (att_w - ox) : atlas_view_w,
-		                     (oy + atlas_view_h > att_h) ? (att_h - oy) : atlas_view_h};
+		// into the neighbour view (the DP would weave it into the wrong eye),
+		// nor - in a zones frame - out of its zone (#1949).
+		const uint32_t tw = (ox + atlas_view_w > att_w) ? (att_w - ox) : atlas_view_w;
+		const uint32_t th = (oy + atlas_view_h > att_h) ? (att_h - oy) : atlas_view_h;
+		const uint32_t cx0 = (uint32_t)lroundf(clip[0] * (float)atlas_view_w);
+		const uint32_t cy0 = (uint32_t)lroundf(clip[1] * (float)atlas_view_h);
+		uint32_t cx1 = (uint32_t)lroundf((clip[0] + clip[2]) * (float)atlas_view_w);
+		uint32_t cy1 = (uint32_t)lroundf((clip[1] + clip[3]) * (float)atlas_view_h);
+		cx1 = cx1 < tw ? cx1 : tw;
+		cy1 = cy1 < th ? cy1 : th;
+		if (cx1 <= cx0 || cy1 <= cy0) {
+			continue;
+		}
+		MTLScissorRect sr = {ox + cx0, oy + cy0, cx1 - cx0, cy1 - cy0};
 		[encoder setScissorRect:sr];
 
 		float xy[4][2];
@@ -5392,11 +5415,13 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		// never occluded - and before the display processor. Inside this
 		// encoder, so the /tmp/dxr_atlas_trigger dump below shows it.
 		if (cursor_pending) {
-			if (zones_frame) {
-				// The state tracker already refuses zones frames; belt and braces.
+			// A zones frame draws only a zone request (the state tracker
+			// sends nothing else there) and vice versa; belt and braces.
+			if (zones_frame != cursor_req.zone_valid) {
 				if (!c->cursor_draw.warned_zones) {
 					c->cursor_draw.warned_zones = true;
-					U_LOG_W("cursor_draw: zones frame - cursor not drawn (one-time warning)");
+					U_LOG_W("cursor_draw: zones frame / zone request mismatch - cursor not drawn "
+					        "(one-time warning)");
 				}
 			} else {
 				uint32_t canvas_px_h = 0;
@@ -5406,7 +5431,7 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 					canvas_px_h = (uint32_t)output_texture.height;
 				}
 				metal_cursor_draw(c, encoder, &cursor_req, atlas_cols, atlas_rows, atlas_view_w, atlas_view_h,
-				                  compose_linear, canvas_px_h);
+				                  compose_linear, canvas_px_h, zones_target_w, zones_target_h);
 			}
 		}
 

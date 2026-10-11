@@ -2096,12 +2096,26 @@ cursor_record_draws(struct comp_vk_native_renderer *r,
 		}
 		VkViewport vp = {.x = bx, .y = by, .width = bw, .height = bh, .minDepth = 0.0f, .maxDepth = 1.0f};
 		// The scissor is mandatory: a cursor at a tile edge must not spill
-		// into the neighbour view (the DP would weave it into the wrong eye).
-		const float sx1 = bx + bw > (float)r->atlas_alloc_width ? (float)r->atlas_alloc_width : bx + bw;
-		const float sy1 = by + bh > (float)r->atlas_alloc_height ? (float)r->atlas_alloc_height : by + bh;
+		// into the neighbour view (the DP would weave it into the wrong eye),
+		// nor - in a zones frame - out of its zone (#1949).
+		const float cx0 = bx + cur->clip[0] * bw;
+		const float cy0 = by + cur->clip[1] * bh;
+		float sx1 = cx0 + cur->clip[2] * bw;
+		float sy1 = cy0 + cur->clip[3] * bh;
+		sx1 = sx1 > bx + bw ? bx + bw : sx1;
+		sy1 = sy1 > by + bh ? by + bh : sy1;
+		sx1 = sx1 > (float)r->atlas_alloc_width ? (float)r->atlas_alloc_width : sx1;
+		sy1 = sy1 > (float)r->atlas_alloc_height ? (float)r->atlas_alloc_height : sy1;
+		const int32_t sx0i = (int32_t)(cx0 + 0.5f);
+		const int32_t sy0i = (int32_t)(cy0 + 0.5f);
+		const int32_t sx1i = (int32_t)(sx1 + 0.5f);
+		const int32_t sy1i = (int32_t)(sy1 + 0.5f);
+		if (sx1i <= sx0i || sy1i <= sy0i) {
+			continue;
+		}
 		VkRect2D scissor = {
-		    .offset = {(int32_t)bx, (int32_t)by},
-		    .extent = {(uint32_t)(sx1 - bx), (uint32_t)(sy1 - by)},
+		    .offset = {sx0i, sy0i},
+		    .extent = {(uint32_t)(sx1i - sx0i), (uint32_t)(sy1i - sy0i)},
 		};
 
 		const float(*c)[2] = cur->corners[i];
@@ -2679,9 +2693,9 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 
 	// XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B): the runtime-drawn
 	// cursor, LAST in the pass - over every layer it composed, never
-	// occluded - and before the atlas is published to the DP. Zones frames
-	// are refused upstream (the state tracker) and here.
-	if (cursor_ok && !zones_frame) {
+	// occluded - and before the atlas is published to the DP. In a zones
+	// frame it is clipped to the hinted zone (#1949; resolved upstream).
+	if (cursor_ok) {
 		cursor_record_draws(r, cmd, cursor, cursor_view, cursor_sampler, layout);
 	}
 

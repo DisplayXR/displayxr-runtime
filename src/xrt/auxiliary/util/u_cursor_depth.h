@@ -490,6 +490,21 @@ struct u_cursor_draw_request
 	float hot_u, hot_v;
 	//! Sprite HEIGHT on the panel, metres; <= 0 = the OS cursor's size.
 	float size_m;
+
+	/*!
+	 * XR_DXR_display_zones (#1949): the hint rode the zone-scoped locate of
+	 * this 3D zone, and the views above are that zone's submitted views - so
+	 * they are ZONE-normalised (0..1 spans the zone's sub-rect of each tile)
+	 * and one unit is the ZONE's height. The compositor re-expresses them in
+	 * its tile with u_cursor_draw_into_zone() and clips the draw to the zone.
+	 * False (zero-initialised) = the whole tile, as before.
+	 */
+	bool zone_valid;
+	//! The app's zone id (debug / logs only).
+	uint32_t zone_id;
+	//! The zone rect as submitted, client-window pixels, origin top-left -
+	//! the same space every compositor places XRT_LAYER_ZONE_3D layers in.
+	struct xrt_rect zone_rect;
 };
 
 /*!
@@ -529,6 +544,33 @@ u_cursor_draw_view_from_placement(const struct u_cursor_depth_view *view,
 void
 u_cursor_draw_corners(
     const struct u_cursor_draw_view *v, float height, float aspect, float hot_u, float hot_v, float out_xy[4][2]);
+
+/*!
+ * XR_DXR_display_zones (#1949): re-express a zone request in TILE-normalised
+ * coordinates, the way the compositor places the zone's own layer - the zone
+ * rect scaled by tile / @p target (the window the zone rects are authored
+ * against; in a zones frame the tile spans it).
+ *
+ * Rewrites every view of @p req in place (origin into the zone's sub-rect,
+ * axes scaled by its extent) and returns the sub-rect, clipped to the tile, in
+ * @p out_clip (x, y, w, h; tile-normalised, origin top-left): the draw must be
+ * scissored to it, so a cursor at a zone edge never spills into a 2D zone or
+ * a neighbouring 3D zone. A request without a zone is left untouched and
+ * clips to the whole tile.
+ *
+ * @return false if the zone cannot be placed (no target size, or the zone lies
+ *         entirely outside the window): draw nothing.
+ */
+bool
+u_cursor_draw_into_zone(struct u_cursor_draw_request *req, uint32_t target_w, uint32_t target_h, float out_clip[4]);
+
+/*!
+ * The height, in the compositor's target pixels, of the canvas the request's
+ * unit was built for: the zone's height for a zone request, else
+ * @p canvas_px_h (the window / canvas the compositor already uses).
+ */
+uint32_t
+u_cursor_draw_canvas_px_h(const struct u_cursor_draw_request *req, uint32_t canvas_px_h);
 
 /*!
  * Rasterise the classic arrow (white fill, dark one-px outline, tip at the

@@ -6053,8 +6053,19 @@ gl_cursor_update_default(struct comp_gl_compositor *c, float backing_scale)
  *         target).
  */
 static bool
-gl_cursor_draw(struct comp_gl_compositor *c, const struct u_cursor_draw_request *req)
+gl_cursor_draw(struct comp_gl_compositor *c,
+               const struct u_cursor_draw_request *req_in,
+               uint32_t zones_target_w,
+               uint32_t zones_target_h)
 {
+	// #1949: a zone request's views are zone-normalised - re-express them in
+	// the tile the way the zone's own layer is placed, and clip to the zone.
+	struct u_cursor_draw_request zreq = *req_in;
+	const struct u_cursor_draw_request *req = &zreq;
+	float clip[4];
+	if (!u_cursor_draw_into_zone(&zreq, zones_target_w, zones_target_h, clip)) {
+		return false;
+	}
 	if (!gl_cursor_ensure_program(c)) {
 		return false;
 	}
@@ -6074,6 +6085,7 @@ gl_cursor_draw(struct comp_gl_compositor *c, const struct u_cursor_draw_request 
 	if (canvas_px_h == 0) {
 		canvas_px_h = c->eff_rows * c->eff_tile_h;
 	}
+	canvas_px_h = u_cursor_draw_canvas_px_h(req, canvas_px_h); // a zone's own height
 	if (canvas_px_h == 0) {
 		return false;
 	}
@@ -6156,7 +6168,16 @@ gl_cursor_draw(struct comp_gl_compositor *c, const struct u_cursor_draw_request 
 			bh = c->eff_tile_h;
 		}
 		glViewport((GLint)bx, (GLint)by, (GLsizei)bw, (GLsizei)bh);
-		glScissor((GLint)bx, (GLint)by, (GLsizei)bw, (GLsizei)bh);
+		// Clipped to the zone in a zones frame (#1949): the clip is
+		// top-left-origin, the tile box bottom-left.
+		const GLint sx0 = (GLint)bx + (GLint)lroundf(clip[0] * (float)bw);
+		const GLint sx1 = (GLint)bx + (GLint)lroundf((clip[0] + clip[2]) * (float)bw);
+		const GLint sy0 = (GLint)by + (GLint)lroundf((1.0f - clip[1] - clip[3]) * (float)bh);
+		const GLint sy1 = (GLint)by + (GLint)lroundf((1.0f - clip[1]) * (float)bh);
+		if (sx1 <= sx0 || sy1 <= sy0) {
+			continue;
+		}
+		glScissor(sx0, sy0, (GLsizei)(sx1 - sx0), (GLsizei)(sy1 - sy0));
 
 		float xy[4][2];
 		u_cursor_draw_corners(&req->view[i], height, aspect, hot_u, hot_v, xy);
@@ -6238,8 +6259,7 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 	/*
 	 * XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B). ZERO COST UNLESS
 	 * REQUESTED: one field test, false for every session that never chained
-	 * XrCursorDepthDrawInfoDXR. The request covers this commit only. Zones
-	 * frames are refused by the state tracker already; belt and braces.
+	 * XrCursorDepthDrawInfoDXR. The request covers this commit only.
 	 */
 	struct u_cursor_draw_request cursor_req = {};
 	bool cursor_pending = false;
@@ -6247,7 +6267,9 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 	if (c->cursor_draw.req.requested) {
 		cursor_req = c->cursor_draw.req;
 		c->cursor_draw.req.requested = false;
-		cursor_pending = !c->zones_frame && u_cursor_draw_should_draw(&cursor_req);
+		// A zones frame draws only a zone request (#1949; the state tracker
+		// sends nothing else there) and vice versa; belt and braces.
+		cursor_pending = c->zones_frame == cursor_req.zone_valid && u_cursor_draw_should_draw(&cursor_req);
 		c->cursor_draw.pending = cursor_pending;
 		c->cursor_draw.pending_source_srgb =
 		    cursor_req.image == NULL || gl_swapchain_is_srgb(gl_swapchain(cursor_req.image));
@@ -7086,7 +7108,7 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 #ifdef XRT_OS_WINDOWS
 	cursor_routed = seg_routed_frame;
 #endif
-	if (cursor_pending && !cursor_routed && gl_cursor_draw(c, &cursor_req)) {
+	if (cursor_pending && !cursor_routed && gl_cursor_draw(c, &cursor_req, zones_target_w, zones_target_h)) {
 		window_space_drew = true; // republish the compose target
 	}
 

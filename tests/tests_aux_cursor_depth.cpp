@@ -1097,3 +1097,150 @@ TEST_CASE("cursor_draw: the classic arrow - dark outline, white fill, tip at the
 	// Below the tail (arrow px 1, 18.5): empty.
 	CHECK(px(4, 74)[3] == 0);
 }
+
+/*
+ * #1949: display zones. A zone-scoped locate frames its views to the zone rect
+ * (the rect IS the canvas), so the hint's cursorUV, the placement's unit and
+ * the per-view map are all ZONE-normalised. The compositor re-expresses the
+ * map in its tile with u_cursor_draw_into_zone(), exactly the way it places the
+ * zone's own layer (zone rect scaled by tile / window).
+ */
+namespace {
+
+// A window WIN_PX_W x WIN_PX_H px spanning the W x H canvas, and a zone in it.
+constexpr uint32_t WIN_PX_W = 1500;
+constexpr uint32_t WIN_PX_H = 1000;
+
+// Kooima view from a display-space eye onto the sub-rect (px, window origin
+// top-left) of the W x H canvas centred at the origin in the z = 0 plane.
+u_cursor_depth_view
+kooima_rect(xrt_vec3 eye, int32_t x, int32_t y, int32_t w, int32_t h)
+{
+	const float mx = W / (float)WIN_PX_W, my = H / (float)WIN_PX_H;
+	const float l = -W / 2 + (float)x * mx, r = -W / 2 + (float)(x + w) * mx;
+	const float t = H / 2 - (float)y * my, b = H / 2 - (float)(y + h) * my;
+	u_cursor_depth_view v{};
+	const float d = eye.z;
+	v.fov.angle_left = std::atan((l - eye.x) / d);
+	v.fov.angle_right = std::atan((r - eye.x) / d);
+	v.fov.angle_up = std::atan((t - eye.y) / d);
+	v.fov.angle_down = std::atan((b - eye.y) / d);
+	v.pose.orientation = {0, 0, 0, 1};
+	v.pose.position = eye;
+	return v;
+}
+
+} // namespace
+
+TEST_CASE("cursor_draw: a zone request maps into the zone's sub-rect of every tile, N views")
+{
+	// Off-centre zone, four eyes in a row (an N-view zone), viewer off-axis.
+	const int32_t zx = 300, zy = 200, zw = 600, zh = 500;
+	const xrt_vec3 eyes[4] = {
+	    {-0.07f, 0.02f, 0.6f}, {-0.025f, 0.02f, 0.6f}, {0.025f, 0.02f, 0.61f}, {0.07f, 0.02f, 0.6f}};
+	u_cursor_depth_view zone_v[4], full_v[4];
+	for (int i = 0; i < 4; i++) {
+		zone_v[i] = kooima_rect(eyes[i], zx, zy, zw, zh);
+		full_v[i] = kooima_rect(eyes[i], 0, 0, (int32_t)WIN_PX_W, (int32_t)WIN_PX_H);
+	}
+
+	// The hint: cursor at zone UV (0.3, 0.6) - from the zone locate's
+	// outermost pair, as the state tracker solves it.
+	u_cursor_depth_geometry g{};
+	REQUIRE(u_cursor_depth_geometry_solve(&zone_v[0], &zone_v[3], 0.3f, 0.6f, &g));
+	CHECK(g.canvas_height == Catch::Approx(H * (float)zh / (float)WIN_PX_H).margin(1e-5)); // the ZONE's height
+
+	for (float disparity : {0.0f, -0.25f}) {
+		xrt_vec3 c{};
+		float h = 0.0f;
+		u_cursor_depth_place(&g, disparity, 0.05f, &c, &h);
+		const float unit = g.canvas_height / (1.0f - disparity);
+
+		u_cursor_draw_request req{};
+		req.requested = true;
+		req.view_count = 4;
+		for (int i = 0; i < 4; i++) {
+			REQUIRE(u_cursor_draw_view_from_placement(&zone_v[i], &c, &g.orientation, unit, &req.view[i]));
+		}
+		req.zone_valid = true;
+		req.zone_id = 7;
+		req.zone_rect = {{zx, zy}, {zw, zh}};
+		REQUIRE(u_cursor_draw_should_draw(&req));
+
+		float clip[4];
+		REQUIRE(u_cursor_draw_into_zone(&req, WIN_PX_W, WIN_PX_H, clip));
+		CHECK(clip[0] == Catch::Approx(300.0f / 1500.0f));
+		CHECK(clip[1] == Catch::Approx(200.0f / 1000.0f));
+		CHECK(clip[2] == Catch::Approx(600.0f / 1500.0f));
+		CHECK(clip[3] == Catch::Approx(500.0f / 1000.0f));
+
+		// The oracle: the same 3D point and unit seen through views framed to
+		// the WHOLE window land exactly where the remapped zone map says, in
+		// every view - the tile is the window in a zones frame.
+		for (int i = 0; i < 4; i++) {
+			u_cursor_draw_view ref{};
+			REQUIRE(u_cursor_draw_view_from_placement(&full_v[i], &c, &g.orientation, unit, &ref));
+			for (int k = 0; k < 2; k++) {
+				CHECK(req.view[i].origin[k] == Catch::Approx(ref.origin[k]).margin(1e-4));
+				CHECK(req.view[i].axis_x[k] == Catch::Approx(ref.axis_x[k]).margin(1e-4));
+				CHECK(req.view[i].axis_y[k] == Catch::Approx(ref.axis_y[k]).margin(1e-4));
+			}
+		}
+		// On the plane, the hotspot sits at the zone UV inside the zone.
+		if (disparity == 0.0f) {
+			for (int i = 0; i < 4; i++) {
+				CHECK(req.view[i].origin[0] ==
+				      Catch::Approx((300.0f + 0.3f * 600.0f) / 1500.0f).margin(1e-4));
+				CHECK(req.view[i].origin[1] ==
+				      Catch::Approx((200.0f + 0.6f * 500.0f) / 1000.0f).margin(1e-4));
+			}
+		}
+		// One unit is the zone's height: the canvas the compositor sizes
+		// the sprite against is the zone's, in the same px.
+		CHECK(u_cursor_draw_canvas_px_h(&req, WIN_PX_H) == (uint32_t)zh);
+	}
+}
+
+TEST_CASE("cursor_draw: zone clip and refusals")
+{
+	u_cursor_draw_request req{};
+	req.requested = true;
+	req.view_count = 2;
+	req.view[0] = {{0.5f, 0.5f}, {0.1f, 0.0f}, {0.0f, -0.2f}};
+	req.view[1] = req.view[0];
+	float clip[4];
+
+	// No zone: untouched, whole tile, the caller's canvas height.
+	u_cursor_draw_request plain = req;
+	REQUIRE(u_cursor_draw_into_zone(&plain, 0, 0, clip));
+	CHECK(clip[0] == 0.0f);
+	CHECK(clip[1] == 0.0f);
+	CHECK(clip[2] == 1.0f);
+	CHECK(clip[3] == 1.0f);
+	CHECK(plain.view[0].origin[0] == 0.5f);
+	CHECK(u_cursor_draw_canvas_px_h(&plain, 900) == 900u);
+
+	// A zone hanging off the window's right/bottom edge clips to the tile;
+	// the map itself is not clamped (the sprite stays where it belongs).
+	req.zone_valid = true;
+	req.zone_rect = {{1000, 800}, {1000, 400}};
+	u_cursor_draw_request off = req;
+	REQUIRE(u_cursor_draw_into_zone(&off, WIN_PX_W, WIN_PX_H, clip));
+	CHECK(clip[0] == Catch::Approx(1000.0f / 1500.0f));
+	CHECK(clip[2] == Catch::Approx(500.0f / 1500.0f));
+	CHECK(clip[1] == Catch::Approx(0.8f));
+	CHECK(clip[3] == Catch::Approx(0.2f));
+	CHECK(off.view[1].origin[0] == Catch::Approx((1000.0f + 0.5f * 1000.0f) / 1500.0f));
+	CHECK(off.view[1].axis_y[1] == Catch::Approx(-0.2f * 400.0f / 1000.0f));
+
+	// No target size, an empty zone, or a zone wholly outside the window:
+	// nothing is drawn.
+	u_cursor_draw_request r2 = req;
+	CHECK_FALSE(u_cursor_draw_into_zone(&r2, 0, WIN_PX_H, clip));
+	r2 = req;
+	r2.zone_rect = {{10, 10}, {0, 50}};
+	CHECK_FALSE(u_cursor_draw_into_zone(&r2, WIN_PX_W, WIN_PX_H, clip));
+	r2 = req;
+	r2.zone_rect = {{1600, 10}, {100, 50}};
+	CHECK_FALSE(u_cursor_draw_into_zone(&r2, WIN_PX_W, WIN_PX_H, clip));
+}

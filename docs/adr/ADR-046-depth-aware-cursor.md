@@ -606,7 +606,7 @@ sprite and the depth, and the runtime owns the drawing. Apps get the same contra
   kept, else the classic arrow (12 × 19, white fill, dark outline, rasterised procedurally,
   4 × 4 supersampled). `DXR_CURSOR_DEFAULT_LOOK=arrow` forces the arrow.
 - **Not yet:** D3D11, D3D12 and the service (`svc_draw_cursor_quads`) report
-  `willDraw = XR_FALSE`; display zones; multi-screen routed frames draw per tile without the
+  `willDraw = XR_FALSE`; display zones (since drawn, runtime#1949, below); multi-screen routed frames draw per tile without the
   segment routing on Metal (Vulkan and GL skip them); the 0.5 px floor of A.3 is not applied
   (−0.005 is above it on current panels).
 
@@ -668,6 +668,32 @@ sprite and the depth, and the runtime owns the drawing. Apps get the same contra
   Vulkan cubes stay default-on.
 - **Found in passing (Metal, #1941):** on the Vulkan-app-on-Metal fallback a custom sprite is
   handed over as the client swapchain and cast to the native Metal type — runtime#1948.
+
+#### §B as built in display-zones frames (`XR_DXR_cursor_depth` spec v6, unchanged; runtime#1949)
+
+- **One cursor per frame, in the zone under the pointer.** The hint already rides the
+  zone-scoped locate of that zone (§2.1 of the spec): the zone rect is that locate's canvas, so
+  `cursorUV`, the placement and its *unit* (zone height × t) are all zone-relative. The arming
+  locate now also records the `XrDisplayZoneDXR::zoneId` it carried.
+- **State tracker.** In a zones frame `xrEndFrame` maps the placement through the views of the
+  frame's projection layer whose chained `XrDisplayZoneDXR` has that `zoneId` (its submitted
+  poses and fovs, same-space rule unchanged), so the map is ZONE-normalised; the request
+  (`u_cursor_draw_request`) gains `zone_valid` / `zone_id` / `zone_rect` (the rect as SUBMITTED —
+  authoritative per ADR-027). No such zone, a zone-scoped hint in a frame without zones, or a
+  zones frame whose hint was not zone-scoped: nothing drawn, `willDraw = XR_FALSE` on the next
+  locates, one-time WARN — the same OS-cursor fallback as before. No new struct, no spec bump:
+  `willDraw` already tells the app frame by frame.
+- **Compositors (Metal, vk_native, GL).** One pure helper, `u_cursor_draw_into_zone()`, re-expresses
+  the zone-normalised views in the tile exactly the way each compositor places the zone's own
+  layer (zone rect scaled by tile / window), and returns the zone's sub-rect as a clip; the draw
+  is scissored to tile ∩ zone, so a cursor at a zone edge never bleeds into a 2D zone or a
+  neighbouring 3D zone. `u_cursor_draw_canvas_px_h()` sizes the sprite against the zone's height
+  (the canvas its unit was built for). A non-zone request is untouched (clip = whole tile).
+  Zero cost unchanged: all of it runs only on a requested frame.
+- **D3D11 / D3D12** (draft runtime#1944) adopt the same two helpers at their draw site.
+- **Reference app.** `cube_zones_{metal,vk}_macos` adopt `dxr::CursorDepth` via
+  `test_apps/common/cursor_depth_zones.h`: pick the topmost 3D zone under the pointer, hand the
+  helper the pointer in that zone's UV, chain the hint only on that zone's locate.
 
 ### Rollout
 

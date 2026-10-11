@@ -2550,6 +2550,20 @@ oxr_session_arm_cursor_draw(struct oxr_session *sess,
 	sess->cursor_draw.hot_u = draw_info->hotSpot.x;
 	sess->cursor_draw.hot_v = draw_info->hotSpot.y;
 	sess->cursor_draw.size_m = isfinite(draw_info->sizeMeters) ? draw_info->sizeMeters : 0.0f;
+	// #1949: a zone-scoped locate framed its views (and cursorUV, and the
+	// unit above) to that zone; xrEndFrame draws through the zone's layer.
+	sess->cursor_draw.zone_valid = false;
+	sess->cursor_draw.zone_id = 0;
+#ifdef OXR_HAVE_DXR_display_zones
+	if (sess->sys->inst->extensions.DXR_display_zones) {
+		const XrDisplayZoneDXR *zone =
+		    OXR_GET_INPUT_FROM_CHAIN(viewLocateInfo, XR_TYPE_DISPLAY_ZONE_DXR, XrDisplayZoneDXR);
+		if (zone != NULL && zone->rect.extent.width > 0 && zone->rect.extent.height > 0) {
+			sess->cursor_draw.zone_valid = true;
+			sess->cursor_draw.zone_id = zone->zoneId;
+		}
+	}
+#endif
 	if (draw_state != NULL) {
 		draw_state->willDraw = will_draw ? XR_TRUE : XR_FALSE;
 	}

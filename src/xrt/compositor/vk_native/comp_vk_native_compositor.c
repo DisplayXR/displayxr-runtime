@@ -9449,24 +9449,39 @@ vk_shared_submit_and_wait(struct comp_vk_native_compositor *c, const VkSubmitInf
  * per-view placement into this frame's renderer cursor - which image, its
  * size in canvas units, and each view's corners in its tile.
  *
+ * @param target_w The target (window) width in backing pixels - with @p canvas_px_h, what
+ *        a zone rect is scaled against (#1949).
  * @param canvas_px_h The canvas (window) height in backing pixels: the size
  *        the Kooima views were built for, so one unit = canvas height.
  * @return false if nothing can be drawn this frame (the frame is untouched).
  */
 static bool
 vk_cursor_resolve(struct comp_vk_native_compositor *c,
-                  const struct u_cursor_draw_request *req,
+                  const struct u_cursor_draw_request *req_in,
+                  uint32_t target_w,
                   uint32_t canvas_px_h,
                   struct comp_vk_native_cursor_draw *out)
 {
-	if (c->zones_frame) {
-		// The state tracker already refuses zones frames; belt and braces.
+	// A zones frame draws only a zone request (the state tracker sends
+	// nothing else there) and vice versa; belt and braces.
+	if (c->zones_frame != req_in->zone_valid) {
 		if (!c->cursor_draw.warned_zones) {
 			c->cursor_draw.warned_zones = true;
-			U_LOG_W("cursor_draw: zones frame - cursor not drawn (one-time warning)");
+			U_LOG_W(
+			    "cursor_draw: zones frame / zone request mismatch - cursor not drawn (one-time warning)");
 		}
 		return false;
 	}
+	// #1949: a zone request's views are zone-normalised - re-express them in
+	// the tile the way the zone's own layer is placed (zone rect scaled by
+	// tile / target, the renderer's zone pass), and clip to the zone.
+	struct u_cursor_draw_request zreq = *req_in;
+	const struct u_cursor_draw_request *req = &zreq;
+	float clip[4];
+	if (!u_cursor_draw_into_zone(&zreq, target_w, canvas_px_h, clip)) {
+		return false;
+	}
+	canvas_px_h = u_cursor_draw_canvas_px_h(req, canvas_px_h);
 	if (c->eff_layout.route_count > 0) {
 		// Multi-screen M3: a tile is a per-segment mosaic, not one view.
 		if (!c->cursor_draw.warned_routed) {
@@ -9521,6 +9536,7 @@ vk_cursor_resolve(struct comp_vk_native_compositor *c,
 	}
 	const float height = size_m / canvas_h_m; // sprite height, in units
 
+	memcpy(out->clip, clip, sizeof(out->clip));
 	out->view_count = req->view_count < XRT_MAX_VIEWS ? req->view_count : XRT_MAX_VIEWS;
 	for (uint32_t i = 0; i < out->view_count; i++) {
 		u_cursor_draw_corners(&req->view[i], height, aspect, hot_u, hot_v, out->corners[i]);
@@ -9835,7 +9851,7 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 		struct u_cursor_draw_request cursor_req = c->cursor_draw.req;
 		c->cursor_draw.req.requested = false;
 		if (u_cursor_draw_should_draw(&cursor_req)) {
-			(void)vk_cursor_resolve(c, &cursor_req, tgt_height, &cursor_draw);
+			(void)vk_cursor_resolve(c, &cursor_req, tgt_width, tgt_height, &cursor_draw);
 		}
 	}
 

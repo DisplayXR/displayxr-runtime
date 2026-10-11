@@ -355,6 +355,12 @@ struct comp_vk_native_cursor_draw
 	 * u_cursor_draw_corners() output.
 	 */
 	float corners[XRT_MAX_VIEWS][4][2];
+	/*!
+	 * The draw's clip in each tile, tile-normalised (x, y, w, h; origin
+	 * top-left): the whole tile, or a zone's sub-rect in a zones frame (#1949)
+	 * so the cursor never spills out of its zone.
+	 */
+	float clip[4];
 	//! The app's sprite swapchain (sampled at @ref image_index, array layer
 	//! 0) or NULL for the renderer's default-look image.
 	struct xrt_swapchain *xsc;

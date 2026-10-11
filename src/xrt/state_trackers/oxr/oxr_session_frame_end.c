@@ -1976,6 +1976,12 @@ cursor_depth_record_layer(struct oxr_session *sess, const XrCompositionLayerProj
  * in the layer's own space, which must be the locate space - and hand the
  * compositor its one-frame draw request.
  *
+ * Display zones (#1949): one cursor per frame, in the zone whose locate
+ * carried the hint (the zone under the pointer). In a zones frame the views
+ * are THAT zone's layer's, so the map is zone-normalised; the request carries
+ * the zone rect as submitted and the compositor places it the way it places
+ * the zone's own layer.
+ *
  * Only ever called on an ARMED frame (the caller's single bool test), so a
  * session that never chained XrCursorDepthDrawInfoDXR never gets here.
  */
@@ -1985,22 +1991,64 @@ cursor_draw_submit(struct oxr_session *sess, const XrFrameEndInfo *frameEndInfo,
 	sess->cursor_draw.armed = false;
 
 	const XrCompositionLayerProjection *proj = NULL;
-	for (uint32_t i = 0; i < frameEndInfo->layerCount; i++) {
-		if (frameEndInfo->layers[i]->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
-			proj = (const XrCompositionLayerProjection *)frameEndInfo->layers[i];
-			break;
+	struct xrt_rect zone_rect = {{0, 0}, {0, 0}};
+	bool zone_missing = false;
+	if (zones_frame || sess->cursor_draw.zone_valid) {
+		// The hinted zone's layer (a zone locate without a zones frame, or
+		// a zones frame whose hint was not zone-scoped, has none).
+		zone_missing = true;
+#ifdef OXR_HAVE_DXR_display_zones
+		for (uint32_t i = 0; zones_frame && sess->cursor_draw.zone_valid && i < frameEndInfo->layerCount; i++) {
+			if (frameEndInfo->layers[i]->type != XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
+				continue;
+			}
+			const XrCompositionLayerProjection *p =
+			    (const XrCompositionLayerProjection *)frameEndInfo->layers[i];
+			const XrDisplayZoneDXR *zone =
+			    OXR_GET_INPUT_FROM_CHAIN(p, XR_TYPE_DISPLAY_ZONE_DXR, XrDisplayZoneDXR);
+			if (zone != NULL && zone->zoneId == sess->cursor_draw.zone_id) {
+				proj = p;
+				// The submitted rect is authoritative (ADR-027): it is
+				// where the compositor places this zone's tiles.
+				zone_rect.offset.w = zone->rect.offset.x;
+				zone_rect.offset.h = zone->rect.offset.y;
+				zone_rect.extent.w = zone->rect.extent.width;
+				zone_rect.extent.h = zone->rect.extent.height;
+				zone_missing = false;
+				break;
+			}
+		}
+#endif
+	} else {
+		for (uint32_t i = 0; i < frameEndInfo->layerCount; i++) {
+			if (frameEndInfo->layers[i]->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
+				proj = (const XrCompositionLayerProjection *)frameEndInfo->layers[i];
+				break;
+			}
 		}
 	}
-	// A zones frame places each zone's views at a sub-rect of the tile; the
-	// draw maps into whole tiles, so zones are not drawn yet (follow-up).
-	if (proj == NULL || zones_frame) {
+	if (zone_missing) {
+		sess->cursor_draw.cannot_draw = true;
+		if (!sess->cursor_draw.warned_zone) {
+			sess->cursor_draw.warned_zone = true;
+			U_LOG_W(
+			    "XR_DXR_cursor_depth: runtime-drawn cursor requested, but %s - not drawn, reporting "
+			    "willDraw = false (one-time warning)",
+			    !zones_frame ? "the hint rode a zone-scoped locate and the frame has no display zones"
+			    : !sess->cursor_draw.zone_valid
+			        ? "the frame has display zones and the hint did not ride a zone-scoped locate"
+			        : "the frame has no 3D zone with the hinted locate's zoneId");
+		}
+		return;
+	}
+	if (proj == NULL) {
 		sess->cursor_draw.cannot_draw = true;
 		if (!sess->cursor_draw.warned_no_layer) {
 			sess->cursor_draw.warned_no_layer = true;
 			U_LOG_W(
-			    "XR_DXR_cursor_depth: runtime-drawn cursor requested, but the frame has %s - not drawn, "
-			    "reporting willDraw = false (one-time warning)",
-			    zones_frame ? "display zones (not supported yet)" : "no projection layer to draw it with");
+			    "XR_DXR_cursor_depth: runtime-drawn cursor requested, but the frame has no projection "
+			    "layer "
+			    "to draw it with - not drawn, reporting willDraw = false (one-time warning)");
 		}
 		return;
 	}
@@ -2055,6 +2103,11 @@ cursor_draw_submit(struct oxr_session *sess, const XrFrameEndInfo *frameEndInfo,
 	req.hot_u = sess->cursor_draw.hot_u;
 	req.hot_v = sess->cursor_draw.hot_v;
 	req.size_m = sess->cursor_draw.size_m;
+	if (zones_frame) {
+		req.zone_valid = true;
+		req.zone_id = sess->cursor_draw.zone_id;
+		req.zone_rect = zone_rect;
+	}
 	if (!u_cursor_draw_should_draw(&req)) {
 		return;
 	}

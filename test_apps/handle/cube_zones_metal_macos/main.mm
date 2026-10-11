@@ -73,6 +73,7 @@
 #include <openxr/XR_DXR_mcp_tools.h>
 #include <openxr/XR_DXR_view_rig.h>
 #include "dxr_view_config.h" // #1486 PRIMARY_MULTIVIEW_DXR opt-in
+#include "cursor_depth_zones.h" // XR_DXR_cursor_depth on display zones (runtime#1949)
 
 // ============================================================================
 // Logging
@@ -955,6 +956,14 @@ static uint32_t g_renderW = 0, g_renderH = 0;
 
 static const uint32_t kNumZones = 2;
 
+// XR_DXR_cursor_depth (ADR-046, runtime#1949): the runtime draws the depth
+// cursor in the 3D zone under the pointer. The hint rides that zone's
+// zone-scoped locate (cursor_depth_zones.h). Opt out with DISPLAYXR_CURSOR_DEPTH=0;
+// DISPLAYXR_CURSOR_DEPTH_UV=u,v scripts a WINDOW-normalised pointer.
+static bool g_hasCursorDepthExt = false;
+static uint32_t g_cursorDepthSpecVersion = 0;
+static dxr_zones_cursor::ZoneCursor g_zoneCursor;
+
 // Per-zone rig framing for the test: virtual display height in app units
 // (shared by both zones; the cube is 0.06 m tall).
 static const float kZoneVirtualDisplayHeight = 0.30f;
@@ -1437,6 +1446,10 @@ static bool InitializeOpenXR(AppXrSession &app)
             app.hasViewRigExt = true;
         if (strcmp(e.extensionName, XR_DXR_DISPLAY_ZONES_EXTENSION_NAME) == 0)
             g_hasDisplayZonesExt = true;
+        if (strcmp(e.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0) {
+            g_hasCursorDepthExt = true;
+            g_cursorDepthSpecVersion = e.extensionVersion;
+        }
     }
 
     // XR_DXR_display_zones composes XR_DXR_local_3d_zone + XR_DXR_view_rig —
@@ -1485,6 +1498,15 @@ static bool InitializeOpenXR(AppXrSession &app)
     if (g_hasDisplayZonesExt) {
         enabledExts.push_back(XR_DXR_DISPLAY_ZONES_EXTENSION_NAME);
     }
+    if (g_hasCursorDepthExt) {
+        const char *opt = getenv("DISPLAYXR_CURSOR_DEPTH");
+        if (opt != nullptr && strcmp(opt, "0") == 0) {
+            g_hasCursorDepthExt = false; // opted out: the runtime does no cursor work
+        } else {
+            enabledExts.push_back(XR_DXR_CURSOR_DEPTH_EXTENSION_NAME);
+        }
+    }
+    LOG_INFO("XR_DXR_cursor_depth: %s (v%u)", g_hasCursorDepthExt ? "ENABLED" : "off", g_cursorDepthSpecVersion);
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
     strncpy(createInfo.applicationInfo.applicationName, "MetalCubeZonesOpenXR",
@@ -1659,6 +1681,7 @@ static bool CreateSession(AppXrSession &app, MetalRenderer &r)
 
     XR_CHECK(xrCreateSession(app.instance, &sessionInfo, &app.session));
     LOG_INFO("Session created%s", app.hasCocoaWindowBinding ? " (with external window)" : "");
+    g_zoneCursor.init(g_hasCursorDepthExt ? g_cursorDepthSpecVersion : 0, (__bridge void *)g_metalView, 0.06f);
 
     // XR_DXR_mcp_tools: declare identity + register agent tools. The appId
     // MUST match `id` in displayxr/cube_handle_metal_macos.displayxr.json
@@ -2469,6 +2492,17 @@ static void RenderZonesFrame(AppXrSession &app, MetalRenderer &renderer, const X
     std::vector<XrCompositionLayerProjectionView> projViews[kNumZones];
     uint32_t submitViewCounts[kNumZones] = {};
 
+    // XR_DXR_cursor_depth (#1949): pick the topmost 3D zone under the pointer.
+    {
+        XrRect2Di rects[kNumZones];
+        float rots[kNumZones];
+        for (uint32_t zi = 0; zi < kNumZones; zi++) {
+            rects[zi] = g_zonesArr[zi].rect;
+            rots[zi] = renderer.cubeRotation + g_zonesArr[zi].spinPhase;
+        }
+        g_zoneCursor.begin((int32_t)g_windowW, (int32_t)g_windowH, rects, rots, kNumZones);
+    }
+
     for (uint32_t zi = 0; zi < kNumZones; zi++) {
         DisplayZone &z = g_zonesArr[zi];
 
@@ -2494,7 +2528,13 @@ static void RenderZonesFrame(AppXrSession &app, MetalRenderer &renderer, const X
         uint32_t viewCountOutput = 0;
         XrView zoneViews[8];
         for (uint32_t vi = 0; vi < 8; vi++) zoneViews[vi] = {XR_TYPE_VIEW};
+        // XR_DXR_cursor_depth (#1949): the hint rides only the locate of the
+        // zone under the pointer; its canvas is the zone rect.
+        g_zoneCursor.chain(zi, locateInfo, viewState);
         XrResult lr = xrLocateViews(app.session, &locateInfo, &viewState, 8, &viewCountOutput, zoneViews);
+        if (XR_SUCCEEDED(lr)) {
+            g_zoneCursor.afterLocate(zi, zoneViews, viewCountOutput);
+        }
         if (XR_FAILED(lr) || viewCountOutput == 0) {
             static bool warned = false;
             if (!warned) {
@@ -2558,6 +2598,8 @@ static void RenderZonesFrame(AppXrSession &app, MetalRenderer &renderer, const X
         XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
         xrReleaseSwapchainImage(z.swapchain, &ri);
     }
+
+    g_zoneCursor.end(); // pointer over no 3D zone: the OS cursor is the cursor
 
     // Layer list: [projA (zone A chained), projB (zone B chained), strip].
     XrCompositionLayerProjection projLayers[kNumZones];

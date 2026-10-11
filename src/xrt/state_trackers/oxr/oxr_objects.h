@@ -3185,8 +3185,14 @@ struct oxr_session
 		//! The app's sprite, or NULL for the default look.
 		struct oxr_swapchain *image;
 		float hot_u, hot_v, size_m;
+		//! XR_DXR_display_zones (#1949): the arming locate was zone-scoped
+		//! (the hint rode the locate of the zone under the pointer); the
+		//! frame's zone layer with @ref zone_id carries the views to draw with.
+		bool zone_valid;
+		uint32_t zone_id;
 		//! The last armed frame could not draw (projection layer in another
-		//! space, a zones frame, no projection layer): locates in the same
+		//! space, a zones frame without the hinted zone, no projection
+		//! layer): locates in the same
 		//! space report willDraw = false, and keep arming so xrEndFrame can
 		//! clear this once a frame is drawable again.
 		bool cannot_draw;
@@ -3195,6 +3201,7 @@ struct oxr_session
 		bool warned_space;    //!< one-shot WARN: layer space != locate space
 		bool warned_no_layer; //!< one-shot WARN: armed frame had no projection layer
 		bool warned_image;    //!< one-shot WARN: sprite swapchain unusable
+		bool warned_zone;     //!< one-shot WARN: zones frame without the hinted zone
 	} cursor_draw;
 #endif
 
