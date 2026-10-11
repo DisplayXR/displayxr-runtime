@@ -276,6 +276,9 @@ comp_ipc_client_compositor_get_transparent_output_fence(struct xrt_compositor *x
  *   — 0 is byte-for-byte pre-v8.
  *   @p mono_in_2d (spec v13): while the session's hardware state is 2D, the
  *   desktop-Linux engine presents one view (stereo: the left) flat instead of weaving.
+ *   @p out_segment_count (optional, spec v19 cheap split signal): how many
+ *   screens the service wove this submit on — 0 for a window on one screen, so
+ *   the caller fetches the per-screen table (weave_get_segments) only past 0.
  * @c weave_set_screen_flat_regions latches the STICKY screen-space flat regions
  *   (spec v8, absolute physical screen px, held until the next call).
  * @c weave_get_output / @c weave_get_fence fetch the persistent server-allocated
@@ -309,7 +312,8 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         uint32_t *out_width,
                                         uint32_t *out_height,
                                         uint64_t *out_fence_value,
-                                        struct xrt_eye_positions *out_eyes);
+                                        struct xrt_eye_positions *out_eyes,
+                                        uint32_t *out_segment_count);
 
 xrt_result_t
 comp_ipc_client_compositor_weave_set_screen_flat_regions(struct xrt_compositor *xc,

@@ -170,6 +170,43 @@ The browser's half (rendering a straddling rect's two parts from two viewers) li
 `displayxr-browser-pvt`. Detail: `docs/architecture/comp-segments.md` § *Present-owners*;
 contract: `docs/specs/extensions/XR_DXR_weave.md` §5g.
 
+### Amendment 4 addendum (2026-10-10): an element's views come from its own screen
+
+The browser renders no inline-3D pixels itself, so the per-screen eyes of `XrWeaveOutputRectPartsDXR`
+have no consumer there: each element's views come from a zone-scoped `xrLocateViews` with
+`XR_DXR_view_rig` (browser patch 0036), which the service frames in `ipc_try_get_sr_view_poses` from
+the session DP's eyes and the window relative to the primary screen. An element on the second screen
+therefore looked around from the primary screen's viewer and was framed against the wrong panel.
+Decisions:
+
+- **An element wholly on one non-primary screen is framed from that screen.** When the window the
+  locating session frames against is woven per screen and the element's zone rect lies wholly on a
+  non-primary segment (`u_weave_zone_screen_segment`: exactly one segment, table cut from the live
+  window size, the screen's size known), the server swaps in the whole window relative to that
+  screen (`u_weave_segment_window_metrics`, the same arithmetic as
+  `oxr_segment_views_whole_window_metrics`) before the usual zone rebase, and uses that screen's
+  eyes (predicted at the locate from its segment DP) and nominal viewer. The Kooima is then that
+  screen's physical rectangle with the element where it sits on it; the rig math is unchanged.
+- **A straddling element keeps the primary's views.** One pixel across the seam is enough. Its
+  parts are still woven per screen; rendering it per part needs a second view set per element,
+  which is a web API (displayxr-browser-pvt#272). An element on the primary screen, and every
+  window on one screen, are framed exactly as before: no per-screen table exists for them, so the
+  lookup answers before anything changes.
+- **The table follows the window, not the session.** The browser locates from its browser-process
+  session and weaves from its GPU-process session, both bound to its top-level window. The lookup
+  (`comp_d3d11_service_get_zone_weave_screen`) takes the locating client's own last weave table,
+  else that of any present-owner weaving the same HWND, published within the last 250 ms. It
+  takes `clients_mutex` only; `render_mutex` is taken just for an element that is re-framed, to
+  read that screen's fresh eyes.
+- **A cheap split signal.** `weave_submit`'s reply gains a trailing `segment_count`, the count of
+  the table that submit published (appended like the v12 fields; the git-tag gate refuses a skewed
+  pair). The state tracker fetches the table (`weave_get_segments`) for a chained
+  `XrWeaveOutputRectPartsDXR` only when it is non-zero, so a v19 caller pays no extra round trip
+  for a window on one screen, which covers every window on a single-screen box.
+
+No extension revision: the locate API is unchanged and the reply field is internal to the wire.
+Detail: `docs/architecture/comp-segments.md` § *Present-owners*.
+
 ## Amendment 5 (2026-10-10): segments on the in-process OpenGL compositor (Windows)
 
 The in-process GL compositor (`cube_handle_gl_win`, GL demos) carries the model as

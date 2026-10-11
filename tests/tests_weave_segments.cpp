@@ -6,11 +6,18 @@
  *        weave rects split per screen. The segment table the service cuts the
  *        bound window into (comp_segments_compute), the per-rect parts the
  *        client derives from it (u_weave_rect_parts), and the wire message
- *        that carries the table with every screen's eyes.
+ *        that carries the table with every screen's eyes. The Amendment 4
+ *        addendum: the screen whose eyes and geometry frame an element's
+ *        zone-scoped locate (u_weave_zone_screen_segment +
+ *        u_weave_segment_window_metrics), and the submit reply's cheap split
+ *        signal (u_weave_segments_fetch_needed).
  */
 
 #include "util/comp_segments.h"
+#include "util/u_canvas.h"
 #include "util/u_weave_rect_parts.h"
+
+#include "oxr_segment_views.h"
 
 #ifdef DXR_TESTS_HAVE_IPC_PROTOCOL
 #include "shared/ipc_protocol.h"
@@ -19,6 +26,7 @@
 
 #include "catch_amalgamated.hpp"
 
+#include <cstddef>
 #include <cstring>
 
 namespace {
@@ -107,6 +115,60 @@ check_rect(const xrt_rect &r, int x, int y, int w, int h)
 	CHECK(r.offset.h == y);
 	CHECK(r.extent.w == w);
 	CHECK(r.extent.h == h);
+}
+
+// A 1920x1080 panel's physical size, metres (the 15.6" class).
+const float PANEL_W_M = 0.3442f;
+const float PANEL_H_M = 0.1936f;
+
+/*
+ * What comp_d3d11_segments_get_metrics adds to the geometry: every screen's
+ * desktop rect, physical size and nominal viewer, and each screen's own eyes
+ * (weave_seg_publish / comp_d3d11_service_get_zone_weave_screen). Screen i's
+ * viewer sits at x = 0.1 m * i in ITS OWN display space, so the two eye sets
+ * are told apart.
+ */
+void
+with_geometry(xrt_segment_metrics &m, const comp_segments_screen *screens, uint32_t n)
+{
+	for (uint32_t k = 0; k < m.count; k++) {
+		xrt_segment_metric &g = m.seg[k];
+		for (uint32_t i = 0; i < n; i++) {
+			if (screens[i].id != g.screen_id) {
+				continue;
+			}
+			g.screen_desktop_left = screens[i].desktop.x;
+			g.screen_desktop_top = screens[i].desktop.y;
+			g.screen_desktop_width = screens[i].desktop.w;
+			g.screen_desktop_height = screens[i].desktop.h;
+			g.screen_width_m = PANEL_W_M;
+			g.screen_height_m = PANEL_H_M;
+			g.nominal_viewer_z_m = 0.6f + 0.05f * (float)i;
+			g.eyes.count = 2;
+			g.eyes.valid = true;
+			g.eyes.is_tracking = true;
+			g.eyes.eyes[0].x = -0.032f + 0.1f * (float)i;
+			g.eyes.eyes[0].z = 0.6f;
+			g.eyes.eyes[1].x = 0.032f + 0.1f * (float)i;
+			g.eyes.eyes[1].z = 0.6f;
+			g.have_eyes = true;
+		}
+	}
+}
+
+//! The element's canvas as a locate frames it: the window metrics, rebased to the zone.
+xrt_window_metrics
+zone_canvas(const xrt_window_metrics &window, const xrt_rect &zone)
+{
+	xrt_window_metrics wm = window;
+	u_canvas_rect c = {};
+	c.valid = true;
+	c.x = zone.offset.w;
+	c.y = zone.offset.h;
+	c.w = (uint32_t)zone.extent.w;
+	c.h = (uint32_t)zone.extent.h;
+	u_canvas_apply_to_metrics(&wm, &c);
+	return wm;
 }
 
 } // namespace
@@ -252,6 +314,213 @@ TEST_CASE("weave segments: empty and off-screen rects yield nothing; the cap hol
 	bad.count = XRT_MAX_SEGMENTS + 1;
 	CHECK(u_weave_rect_parts(&bad, two_straddling, 2, parts, 4) == 0);
 }
+
+/*
+ * ADR-047 Amendment 4, addendum: a present-owner's zone-scoped locate (an
+ * inline-3D element, XR_DXR_view_rig + XrDisplayZoneDXR) of a window woven per
+ * screen. The server (ipc_try_get_sr_view_poses) asks
+ * u_weave_zone_screen_segment which screen frames the element; when one does,
+ * it locates against u_weave_segment_window_metrics rebased to the zone, with
+ * that segment's eyes. -1 keeps the session's own (primary) framing.
+ */
+
+TEST_CASE("element views: an element wholly on screen 2 is framed from screen 2's eyes and geometry")
+{
+	comp_segments_screen screens[2];
+	two_screens(screens);
+	const comp_seg_rect win = {1400, 100, 1000, 600};
+	xrt_segment_metrics m = publish(win, screens, 2);
+	REQUIRE(m.count == 2);
+	with_geometry(m, screens, 2);
+
+	// Window x 800..950: wholly on the second screen (its seam is at x 520).
+	const xrt_rect zone = xr(800, 300, 150, 120);
+	const int32_t k = u_weave_zone_screen_segment(&m, &zone, win.w, win.h);
+	REQUIRE(k == 1);
+	CHECK(m.seg[k].screen_id == SECOND_ID);
+
+	// Screen 2's eyes, not the primary's.
+	CHECK(m.seg[k].eyes.eyes[0].x == Catch::Approx(0.068f));
+	CHECK(m.seg[k].eyes.eyes[1].x == Catch::Approx(0.132f));
+	CHECK(m.seg[k].nominal_viewer_z_m == Catch::Approx(0.65f));
+
+	xrt_window_metrics whole;
+	REQUIRE(u_weave_segment_window_metrics(&m, (uint32_t)k, &whole));
+	CHECK(whole.display_screen_left == 1920);
+	CHECK(whole.display_pixel_width == 1920u);
+	CHECK(whole.display_width_m == Catch::Approx(PANEL_W_M));
+
+	// Rebased to the element: Kooima against screen 2's physical size, the
+	// element where it sits ON screen 2 (its on-screen rect, as the weave
+	// parts report it, is 280,400 150x120).
+	const xrt_window_metrics el = zone_canvas(whole, zone);
+	const float px = PANEL_W_M / 1920.0f;
+	const float py = PANEL_H_M / 1080.0f;
+	u_weave_rect_part part;
+	REQUIRE(u_weave_rect_parts(&m, &zone, 1, &part, 1) == 1);
+	check_rect(part.screen_rect, 280, 400, 150, 120);
+	CHECK(el.window_screen_left - el.display_screen_left == part.screen_rect.offset.w);
+	CHECK(el.window_screen_top - el.display_screen_top == part.screen_rect.offset.h);
+	CHECK(el.window_width_m == Catch::Approx(150.0f * px));
+	CHECK(el.window_height_m == Catch::Approx(120.0f * py));
+	CHECK(el.window_center_offset_x_m == Catch::Approx((280.0f + 75.0f - 960.0f) * px));
+	CHECK(el.window_center_offset_y_m == Catch::Approx(-((400.0f + 60.0f - 540.0f) * py)));
+
+	// What the primary framing put there instead: the same pixels measured
+	// from the PRIMARY screen's centre, one panel (1920 px) to the left of
+	// where screen 2's eyes are measured from.
+	xrt_window_metrics primary_whole;
+	REQUIRE(u_weave_segment_window_metrics(&m, 0, &primary_whole));
+	const xrt_window_metrics wrong = zone_canvas(primary_whole, zone);
+	CHECK(wrong.window_center_offset_x_m - el.window_center_offset_x_m == Catch::Approx(1920.0f * px));
+}
+
+TEST_CASE("element views: a straddling element keeps the primary's views")
+{
+	comp_segments_screen screens[2];
+	two_screens(screens);
+	const comp_seg_rect win = {1400, 100, 1000, 600};
+	xrt_segment_metrics m = publish(win, screens, 2);
+	REQUIRE(m.count == 2);
+	with_geometry(m, screens, 2);
+
+	// Window x 400..700 crosses the seam at 520: woven per part, but one view
+	// set per element until the page can take two (browser-pvt#272).
+	const xrt_rect straddle = xr(400, 50, 300, 200);
+	CHECK(u_weave_rect_single_segment(&m, &straddle) == -1);
+	CHECK(u_weave_zone_screen_segment(&m, &straddle, win.w, win.h) == -1);
+
+	// One pixel across the seam is already straddling...
+	const xrt_rect sliver = xr(420, 50, 101, 200);
+	CHECK(u_weave_zone_screen_segment(&m, &sliver, win.w, win.h) == -1);
+	// ...and flush against it, the element is wholly on the primary.
+	const xrt_rect flush = xr(420, 50, 100, 200);
+	CHECK(u_weave_rect_single_segment(&m, &flush) == 0);
+	CHECK(u_weave_zone_screen_segment(&m, &flush, win.w, win.h) == -1);
+}
+
+TEST_CASE("element views: an element on the primary screen of a split window keeps the session's framing")
+{
+	comp_segments_screen screens[2];
+	two_screens(screens);
+	const comp_seg_rect win = {1400, 100, 1000, 600};
+	xrt_segment_metrics m = publish(win, screens, 2);
+	REQUIRE(m.count == 2);
+	with_geometry(m, screens, 2);
+	const xrt_rect zone = xr(10, 10, 100, 100);
+	CHECK(u_weave_rect_single_segment(&m, &zone) == 0);
+	CHECK(u_weave_zone_screen_segment(&m, &zone, win.w, win.h) == -1);
+}
+
+TEST_CASE("element views: a window on one screen is unchanged and costs no table fetch")
+{
+	comp_segments_screen screens[2];
+	two_screens(screens);
+	const comp_seg_rect win = {100, 100, 1000, 600};
+	const xrt_segment_metrics m = publish(win, screens, 2);
+	REQUIRE(m.count == 0); // the single-DP weave: weave_submit's reply says 0
+
+	const xrt_rect zone = xr(400, 50, 300, 200);
+	CHECK(u_weave_zone_screen_segment(&m, &zone, win.w, win.h) == -1);
+
+	// The cheap split signal: the state tracker fetches the per-screen table
+	// (weave_get_segments) only when the submit that just landed was woven per
+	// screen. A window on one screen (count 0), and every window on a
+	// single-screen box (which never enables segments), sends nothing more.
+	CHECK_FALSE(u_weave_segments_fetch_needed(1, m.count));
+	CHECK_FALSE(u_weave_segments_fetch_needed(32, 0));
+	// The legacy single-rect submit is never segmented.
+	CHECK_FALSE(u_weave_segments_fetch_needed(0, 2));
+	// A split window does fetch; a corrupt count past the bound does not.
+	const xrt_segment_metrics split = publish({1400, 100, 1000, 600}, screens, 2);
+	CHECK(u_weave_segments_fetch_needed(1, split.count));
+	CHECK_FALSE(u_weave_segments_fetch_needed(1, XRT_MAX_SEGMENTS + 1));
+}
+
+TEST_CASE("element views: a window wholly on screen 2 frames every element from screen 2")
+{
+	comp_segments_screen screens[2];
+	two_screens(screens);
+	const comp_seg_rect win = {2100, 100, 800, 600};
+	xrt_segment_metrics m = publish(win, screens, 2);
+	REQUIRE(m.count == 1);
+	REQUIRE_FALSE(m.seg[0].is_primary);
+	with_geometry(m, screens, 2);
+
+	const xrt_rect zone = xr(100, 100, 200, 150);
+	REQUIRE(u_weave_zone_screen_segment(&m, &zone, win.w, win.h) == 0);
+	xrt_window_metrics whole;
+	REQUIRE(u_weave_segment_window_metrics(&m, 0, &whole));
+	const xrt_window_metrics el = zone_canvas(whole, zone);
+	// On screen 2 at (180 + 100, 100 + 100).
+	CHECK(el.window_screen_left - el.display_screen_left == 280);
+	CHECK(el.window_screen_top - el.display_screen_top == 200);
+}
+
+TEST_CASE("element views: a resize in flight or a screen of unknown size keeps the session's framing")
+{
+	comp_segments_screen screens[2];
+	two_screens(screens);
+	const comp_seg_rect win = {1400, 100, 1000, 600};
+	xrt_segment_metrics m = publish(win, screens, 2);
+	with_geometry(m, screens, 2);
+	const xrt_rect zone = xr(800, 300, 150, 120);
+	REQUIRE(u_weave_zone_screen_segment(&m, &zone, win.w, win.h) == 1);
+
+	// The table was cut from a 1000x600 window; the live one is already larger.
+	CHECK(u_weave_zone_screen_segment(&m, &zone, 1100, 600) == -1);
+
+	xrt_segment_metrics no_size = m;
+	no_size.seg[1].screen_width_m = 0.0f;
+	CHECK(u_weave_zone_screen_segment(&no_size, &zone, win.w, win.h) == -1);
+	xrt_window_metrics wm;
+	CHECK_FALSE(u_weave_segment_window_metrics(&no_size, 1, &wm));
+	CHECK_FALSE(wm.valid);
+}
+
+TEST_CASE("element views: the server's window metrics are the per-segment views' own")
+{
+	// u_weave_segment_window_metrics (aux, for the IPC server) and
+	// oxr_segment_views_whole_window_metrics (the state tracker's per-segment
+	// views) must frame a screen identically: two layouts, every segment.
+	comp_segments_screen screens[2];
+	two_screens(screens);
+	for (int layout = 0; layout < 2; layout++) {
+		if (layout == 1) {
+			screens[1].desktop = {-1920, 0, 1920, 1080};
+		}
+		const comp_seg_rect win =
+		    layout == 0 ? comp_seg_rect{1400, 100, 1000, 600} : comp_seg_rect{-300, 40, 1000, 500};
+		xrt_segment_metrics m = publish(win, screens, 2);
+		REQUIRE(m.count == 2);
+		with_geometry(m, screens, 2);
+		for (uint32_t k = 0; k < m.count; k++) {
+			xrt_window_metrics a;
+			xrt_window_metrics b;
+			REQUIRE(u_weave_segment_window_metrics(&m, k, &a));
+			oxr_segment_views_whole_window_metrics(&m, k, &b);
+			REQUIRE(b.valid);
+			CHECK(std::memcmp(&a, &b, sizeof(a)) == 0);
+		}
+	}
+}
+
+#ifdef DXR_TESTS_HAVE_IPC_PROTOCOL
+TEST_CASE("element views: weave_submit's reply carries the split signal as a trailing field")
+{
+	// Appended after every earlier field (the u_git_tag gate refuses a skewed
+	// client/service pair, and appending keeps every older offset).
+	STATIC_REQUIRE(sizeof(ipc_weave_submit_reply) <= IPC_BUF_SIZE);
+	STATIC_REQUIRE(offsetof(ipc_weave_submit_reply, segment_count) > offsetof(ipc_weave_submit_reply, eyes));
+	ipc_weave_submit_reply reply;
+	std::memset(&reply, 0, sizeof(reply));
+	CHECK(reply.segment_count == 0); // a window on one screen: no table fetch
+	reply.segment_count = 2;
+	ipc_weave_submit_reply wire;
+	std::memcpy(&wire, &reply, sizeof(wire));
+	CHECK(u_weave_segments_fetch_needed(1, wire.segment_count));
+}
+#endif
 
 #ifdef DXR_TESTS_HAVE_IPC_PROTOCOL
 TEST_CASE("weave segments: weave_get_segments carries the table and every screen's eyes verbatim")

@@ -176,7 +176,8 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         uint32_t *out_width,
                                         uint32_t *out_height,
                                         uint64_t *out_fence_value,
-                                        struct xrt_eye_positions *out_eyes);
+                                        struct xrt_eye_positions *out_eyes,
+                                        uint32_t *out_segment_count);
 
 xrt_result_t
 comp_ipc_client_compositor_weave_set_screen_flat_regions(struct xrt_compositor *xc,
@@ -482,6 +483,7 @@ oxr_weave_fill_rect_parts(struct oxr_logger *log,
                           struct oxr_session *sess,
                           uint32_t rect_count,
                           const struct xrt_rect *rects,
+                          uint32_t submit_segment_count,
                           XrWeaveOutputRectPartsDXR *out)
 {
 	out->segmentCount = 0;
@@ -489,8 +491,11 @@ oxr_weave_fill_rect_parts(struct oxr_logger *log,
 	out->generation = 0;
 	memset(out->segments, 0, sizeof(out->segments));
 	memset(out->parts, 0, sizeof(out->parts));
-	if (rect_count == 0) {
-		return XR_SUCCESS; // legacy single-rect submit: never segmented
+	// The submit's own reply says whether this weave was per screen (legacy
+	// single-rect submits never are): a window on one screen — every window
+	// on a single-screen box — costs no second round trip.
+	if (!u_weave_segments_fetch_needed(rect_count, submit_segment_count)) {
+		return XR_SUCCESS;
 	}
 
 	struct xrt_segment_metrics m;
@@ -981,6 +986,7 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 	uint32_t w = 0, h = 0;
 	uint64_t fence_value = 0;
 	struct xrt_eye_positions eyes = {0};
+	uint32_t submit_segment_count = 0; // v19: screens this submit was woven on (0 = one DP)
 	int release_fd = -1; // v10: per-frame release sync_file, owned by us until handed out
 	xrt_result_t xret;
 #ifdef XRT_OS_LINUX_DESKTOP
@@ -1005,7 +1011,8 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		    rect_count > 0 ? rects : NULL, overlay_handle, overlay_is_dxgi, overlay_rect_count,
 		    overlay_rect_count > 0 ? overlay_rects : NULL, submitInfo->firstChunk == XR_TRUE,
 		    layout.view_count > 0 ? &layout : NULL, flat_rect_count, flat_rect_count > 0 ? flat_rects : NULL,
-		    mono_in_2d, overlay_unchanged, overlay_filter_strength, &have_out, &w, &h, &fence_value, &eyes);
+		    mono_in_2d, overlay_unchanged, overlay_filter_strength, &have_out, &w, &h, &fence_value, &eyes,
+		    &submit_segment_count);
 	}
 	if (xret == XRT_ERROR_FEATURE_NOT_SUPPORTED) {
 		// The service has no weave engine for this platform (desktop Linux
@@ -1074,11 +1081,13 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 	// Spec v19 (#1884, ADR-047 Amendment 4): a window across a seam is woven
 	// per screen; the caller that asks gets every screen's eyes and its rects
 	// cut at the seams. Fetched only when the struct is chained, so a pre-v19
-	// caller sends exactly the pre-v19 messages.
+	// caller sends exactly the pre-v19 messages — and only when the submit's
+	// reply says it was woven per screen (segment count > 0), so a window
+	// on one screen costs a v19 caller nothing either.
 	XrWeaveOutputRectPartsDXR *out_parts =
 	    OXR_GET_OUTPUT_FROM_CHAIN(output, XR_TYPE_WEAVE_OUTPUT_RECT_PARTS_DXR, XrWeaveOutputRectPartsDXR);
 	if (out_parts != NULL) {
-		XrResult pr = oxr_weave_fill_rect_parts(&log, sess, rect_count, rects, out_parts);
+		XrResult pr = oxr_weave_fill_rect_parts(&log, sess, rect_count, rects, submit_segment_count, out_parts);
 		if (pr != XR_SUCCESS) {
 			return pr; // a dead connection only
 		}

@@ -1052,6 +1052,21 @@ the cursor). No API change.
 **Gate.** A caller gates on `extensionVersion >= 19` only to know it may expect parts; chaining
 the struct against an older runtime is harmless (skipped, stays zero = "use the base eyes").
 
+**Cost.** The table crosses the wire only when the submit that just landed was woven per screen:
+the submit's own reply says how many segments it was woven on, and the runtime skips the table
+fetch when that is 0. Chaining the struct for a window on one screen
+(every window on a single-screen system) costs nothing.
+
+**Runtime-built views (`XR_DXR_view_rig`).** A caller that takes its views from a zone-scoped
+`xrLocateViews` with a rig descriptor (`XrDisplayZoneDXR` + `XrDisplayRigDXR` /
+`XrCameraRigDXR`) needs no part handling for an element wholly on one screen: when the bound
+window is woven per screen and the zone rect lies wholly on a non-primary screen, the runtime
+frames the locate from **that screen's** eyes and nominal viewer, with the zone placed on that
+screen's physical rectangle (ADR-047 Amendment 4 addendum). `XrViewDisplayRawDXR` then reports
+that screen's eyes and the zone's `canvasRectPx` relative to that screen. A zone that straddles a
+seam is still located from the primary screen; rendering it per part needs a view set per part,
+which no locate returns today.
+
 ## 6. Version history
 
 | Version | Change |

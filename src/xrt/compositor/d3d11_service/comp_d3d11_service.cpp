@@ -28,6 +28,7 @@
 #include "util/u_color_encoding.h"
 #include "util/u_logging.h"
 #include "util/u_weave_scope.h"
+#include "util/u_weave_rect_parts.h" // ADR-047 Amendment 4 addendum: an element's screen
 #include "util/u_misc.h"
 #include "util/u_system.h"
 #include "util/u_time.h"
@@ -1034,6 +1035,11 @@ struct d3d11_service_compositor
 	struct xrt_segment_metrics weave_seg_pub;
 	//! The same table with every segment's eyes, as the submit predicted them.
 	struct xrt_segment_metrics weave_seg_out;
+	//! When @ref weave_seg_out was last published (monotonic ns). A zone-scoped
+	//! locate frames an element from it only while it is fresh
+	//! (SVC_SEG_PUB_FRESH_NS): a window whose weaves stopped keeps its session's
+	//! own framing (comp_d3d11_service_get_zone_weave_screen).
+	int64_t weave_seg_out_ns;
 
 	/*!
 	 * ADR-052 D2 — per-screen views of a WORKSPACE tile (a placed slot of the
@@ -27636,6 +27642,7 @@ weave_seg_publish(struct d3d11_service_compositor *c,
 	}
 	std::lock_guard<std::mutex> lk(c->seg_mutex);
 	c->weave_seg_out = out;
+	c->weave_seg_out_ns = (int64_t)os_monotonic_get_ns();
 }
 
 /*!
@@ -28982,6 +28989,133 @@ comp_d3d11_service_weave_get_segments(struct xrt_compositor *xc, struct xrt_segm
 	std::lock_guard<std::mutex> lk(c->seg_mutex); // leaf
 	*out = c->weave_seg_out;
 	return out->count > 0;
+}
+
+extern "C" uint32_t
+comp_d3d11_service_weave_segment_count(struct xrt_compositor *xc)
+{
+	if (xc == nullptr || xc->destroy != compositor_destroy) {
+		return 0;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	std::lock_guard<std::mutex> lk(c->seg_mutex); // leaf
+	return c->weave_seg_out.count <= XRT_MAX_SEGMENTS ? c->weave_seg_out.count : 0;
+}
+
+extern "C" bool
+comp_d3d11_service_get_zone_weave_screen(struct xrt_system_compositor *xsysc,
+                                         struct xrt_compositor *xc,
+                                         const struct xrt_rect *zone,
+                                         uint32_t live_w,
+                                         uint32_t live_h,
+                                         struct xrt_segment_metrics *out,
+                                         uint32_t *out_index)
+{
+	if (out == nullptr || out_index == nullptr || zone == nullptr) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+	*out_index = 0;
+	if (xsysc == nullptr || xc == nullptr || xc->destroy != compositor_destroy ||
+	    !comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return false;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_service_compositor *self = d3d11_service_compositor_from_xrt(xc);
+
+	// The window this client's locates are framed against — the same
+	// precedence as comp_d3d11_service_get_client_app_window_metrics.
+	HWND hwnd = self->render.weave_hwnd;
+	if (hwnd == nullptr || !IsWindow(hwnd)) {
+		hwnd = self->app_hwnd;
+	}
+	if (hwnd == nullptr || !IsWindow(hwnd)) {
+		hwnd = self->render.hwnd;
+	}
+	if (hwnd == nullptr || !IsWindow(hwnd)) {
+		return false;
+	}
+
+	const int64_t now_ns = (int64_t)os_monotonic_get_ns();
+	struct d3d11_service_compositor *src = nullptr;
+	int64_t src_ns = 0;
+	// This client's own weaves first; then any present-owner weaving the SAME
+	// window. The DisplayXR Browser locates from one session (its browser
+	// process) and weaves from another (its GPU process), both bound to its
+	// top-level window, so the table its element locates need is the GPU
+	// session's.
+	auto consider = [&](struct d3d11_service_compositor *cand) {
+		if (cand == nullptr || cand->render.weave_hwnd != hwnd) {
+			return;
+		}
+		std::lock_guard<std::mutex> lk(cand->seg_mutex); // leaf
+		if (cand->weave_seg_out.count == 0 || cand->weave_seg_out.count > XRT_MAX_SEGMENTS ||
+		    now_ns - cand->weave_seg_out_ns > SVC_SEG_PUB_FRESH_NS) {
+			return; // one display processor, or no weave of this window lately
+		}
+		if (src == nullptr || cand->weave_seg_out_ns > src_ns) {
+			src = cand;
+			src_ns = cand->weave_seg_out_ns;
+			*out = cand->weave_seg_out;
+		}
+	};
+
+	// Pass 1, clients_mutex only: is this window woven per screen at all, and
+	// is the element on a non-primary screen of it? A window on one screen
+	// (every window on a single-screen box) and an element on the primary
+	// answer here, without ever waiting on the render thread's lock.
+	{
+		// Lifetime: a compositor found in all_clients under clients_mutex
+		// stays whole (compositor_destroy leaves the list first).
+		std::lock_guard<std::mutex> reg(sys->clients_mutex);
+		consider(self);
+		if (src == nullptr) {
+			for (struct d3d11_service_compositor *other : sys->all_clients) {
+				if (other != self) {
+					consider(other);
+				}
+			}
+		}
+	}
+	if (src == nullptr) {
+		memset(out, 0, sizeof(*out));
+		return false;
+	}
+
+	// The element's screen, by the table's geometry (u_weave_zone_screen_segment):
+	// a straddling element, one on the primary, a resize in flight -> none.
+	const int32_t k = u_weave_zone_screen_segment(out, zone, live_w, live_h);
+	if (k < 0) {
+		memset(out, 0, sizeof(*out));
+		return false;
+	}
+	*out_index = (uint32_t)k;
+
+	// Pass 2, only for an element on a non-primary screen: that screen's eyes
+	// predicted NOW from its segment DP, like the session's own eyes are for
+	// its locate (the table's own, as of that weave, when the DP cannot
+	// answer). `weave_segs` is swapped by weave_submit under render_mutex, so
+	// that comes first (render_mutex -> clients_mutex is the only order), and
+	// the source is looked up again: it may have left in between.
+	render_mutex_fair_lock render_lock(sys);
+	std::lock_guard<std::mutex> reg(sys->clients_mutex);
+	bool still_here = false;
+	for (struct d3d11_service_compositor *cand : sys->all_clients) {
+		if (cand == src) {
+			still_here = true;
+			break;
+		}
+	}
+	if (still_here && src->weave_segs != nullptr) {
+		struct xrt_segment_metric *g = &out->seg[k];
+		struct xrt_eye_positions eyes;
+		memset(&eyes, 0, sizeof(eyes));
+		if (comp_d3d11_segments_get_eyes(src->weave_segs, g->screen_id, &eyes) && eyes.valid) {
+			g->eyes = eyes;
+			g->have_eyes = true;
+		}
+	}
+	return true;
 }
 
 

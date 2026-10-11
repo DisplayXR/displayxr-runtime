@@ -39,8 +39,11 @@ extern "C" {
  * How many view sets this system can ever need: @ref XRT_MAX_SEGMENTS, but no
  * more than the screens a window could actually be woven on — the DP registry
  * entries that carry a display-processor factory — and only where a compositor
- * segments windows at all (@p can_segment: the in-process Vulkan compositor on
- * desktop Linux, never a service session). Never below 1.
+ * segments windows at all (@p can_segment: the in-process compositors on
+ * desktop Linux and macOS; on Windows the in-process D3D11 / D3D12 compositors
+ * AND a D3D11 service session, ADR-047 Amendment 3, whose present-owners also
+ * get per-screen element views server-side, Amendment 4 addendum). Never below
+ * 1.
  */
 static inline uint32_t
 oxr_segment_views_set_capacity(uint32_t screens_with_dp_factory, bool can_segment)
