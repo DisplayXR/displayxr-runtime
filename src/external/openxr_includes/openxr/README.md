@@ -30,7 +30,7 @@ Rules:
 | 1004999001–002 | `XR_DXR_win32_window_binding` | 002 = `XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR`, deliberately shared with the cocoa binding (`#ifndef`-guarded, same struct) |
 | 1004999003–013 | `XR_DXR_display_info` | 003, 006–008, 010–013 assigned; 005/009 unused gaps |
 | 1004999004 | `XR_DXR_cocoa_window_binding` | + shares 002 (see above) |
-| 1004999100–110 | `XR_DXR_spatial_workspace` | |
+| 1004999100–113 | `XR_DXR_spatial_workspace` | 111–112 screens / placement (spec v25), 113 = `XR_TYPE_WORKSPACE_OVERLAY_SCREEN_DXR` (spec v26); 114–119 free for it |
 | 1004999120–122 | `XR_DXR_workspace_file_dialog` | 122 is an `XrResult`, not an `XrStructureType` |
 | 1004999130–132 | `XR_DXR_mcp_tools` | |
 | 1004999140–142 | `XR_DXR_view_rig` | |

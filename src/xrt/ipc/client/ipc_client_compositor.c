@@ -2034,6 +2034,22 @@ comp_ipc_client_compositor_workspace_set_overlay(struct xrt_compositor *xc,
 	return ipc_call_workspace_set_overlay(icc->ipc_c, info);
 }
 
+// spec_version 26 (ADR-052 Amendment 2): an overlay composed only by @p screen_id's presenter.
+xrt_result_t
+comp_ipc_client_compositor_workspace_set_overlay_on_screen(struct xrt_compositor *xc,
+                                                            const struct ipc_workspace_overlay_info *info,
+                                                            uint64_t screen_id)
+{
+	if (xc == NULL || info == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_workspace_set_overlay_on_screen(icc->ipc_c, info, screen_id);
+}
+
 xrt_result_t
 comp_ipc_client_compositor_workspace_acquire_wakeup_event(struct xrt_compositor *xc,
                                                           xrt_graphics_sync_handle_t *out_handle)

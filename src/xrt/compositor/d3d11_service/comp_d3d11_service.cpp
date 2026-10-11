@@ -1543,6 +1543,10 @@ struct overlay_slot
 	float size_w_m;            //!< Physical overlay width in meters
 	float size_h_m;            //!< Physical overlay height in meters
 	bool  stereo_sbs;          //!< spec_version 19: image is side-by-side stereo
+	//! spec_version 26 (ADR-052 Amendment 2): the screen it lives on; 0 = the
+	//! primary. Resolved per frame (comp_ws_overlay_screen): a screen that is
+	//! not a live secondary presenter draws it on the primary.
+	uint64_t screen_id;
 	struct compose_copy_cache copy_cache; //!< #925 S5 service-owned copy
 };
 
@@ -2860,10 +2864,16 @@ struct svc_ws_pass
 	int32_t origin_dy;
 	uint32_t primary_px_w; //!< The primary's panel size (view-dims scaling).
 	uint32_t primary_px_h;
+	uint64_t screen_id; //!< The presenter's screen (ADR-052 Amendment 2: its overlays).
 };
 
 //! Installed by the render thread around a secondary presenter's pass; NULL otherwise.
 static thread_local const struct svc_ws_pass *t_ws_pass = nullptr;
+
+struct d3d11_multi_compositor;
+//! The live secondary presenters' screen ids (render thread; defined with the presenters).
+static uint32_t
+svc_ws_presenter_ids(const struct d3d11_multi_compositor *mc, uint64_t *out_ids, uint32_t cap);
 
 //! Display geometry as the compose pass sees it: the primary's, or the presenter's in a pass.
 static inline uint32_t
@@ -17740,11 +17750,22 @@ multi_compositor_compose_pass(struct d3d11_service_system *sys,
 	// xrCreateWorkspaceOverlaySwapchainDXR + xrSetWorkspaceOverlayDXR. The map is
 	// keyed by overlayId; std::map iterates ascending so lower ids composite
 	// behind higher ids (the shell picks ids to control z-order).
+	//
+	// ADR-052 Amendment 2 (spec_version 26): each overlay belongs to ONE
+	// presenter -- the screen it was tagged with when that screen is a live
+	// secondary presenter, else the primary (untagged, the primary's own id, or
+	// a screen that is gone: never lost). In a secondary's pass every geometry
+	// read below (svc_geom_*, the tile dims) is already that presenter's, so the
+	// overlay docks in its screen's own normalized space and metres.
+	uint64_t ov_presenter_ids[COMP_WS_MAX_SCREENS] = {};
+	const uint32_t ov_presenter_count =
+	    sys->overlays.empty() ? 0u : svc_ws_presenter_ids(mc, ov_presenter_ids, COMP_WS_MAX_SCREENS);
+	const uint64_t ov_pass_screen = t_ws_pass != nullptr ? t_ws_pass->screen_id : 0;
 	for (auto &ov_kv : sys->overlays) {
-		if (t_ws_pass != nullptr) {
-			break; // ADR-052 D5: overlays stay on the primary presenter
-		}
 		overlay_slot &ov = ov_kv.second; // mutable: S5 copy_cache lives here
+		if (comp_ws_overlay_screen(ov.screen_id, ov_presenter_ids, ov_presenter_count) != ov_pass_screen) {
+			continue; // another presenter's overlay
+		}
 		if (ov.xsc == nullptr) {
 			continue;
 		}
@@ -18152,6 +18173,20 @@ struct svc_ws_presenter
 	int mode_sent;        //!< -1 = never sent
 };
 
+static uint32_t
+svc_ws_presenter_ids(const struct d3d11_multi_compositor *mc, uint64_t *out_ids, uint32_t cap)
+{
+	// Render thread: the only writer of the presenter array (svc_ws_presenters_sync),
+	// so it reads the array without the IPC readers' lock.
+	uint32_t n = 0;
+	for (uint32_t i = 0; mc != nullptr && i < mc->ws_presenter_count && n < cap; i++) {
+		if (mc->ws_presenters[i] != nullptr) {
+			out_ids[n++] = mc->ws_presenters[i]->screen_id;
+		}
+	}
+	return n;
+}
+
 //! The registry entry of monitor @p id, or NULL.
 static const struct xrt_dp_registry_entry *
 svc_ws_registry_entry(const struct d3d11_service_system *sys, uint64_t id)
@@ -18254,6 +18289,10 @@ svc_ws_presenter_create(struct d3d11_service_system *sys,
 	if (mc->ws_reserved_set) {
 		comp_d3d11_window_set_reserved_keys(p->window, mc->ws_reserved_vks, mc->ws_reserved_mods,
 		                                    mc->ws_reserved_count);
+	}
+	// A modal grab already up covers a presenter that appears under it (ADR-052 Amendment 2).
+	if (sys->input_grabbed) {
+		comp_d3d11_window_set_input_suppress(p->window, true);
 	}
 
 	uint32_t w = scr->desktop.w;
@@ -18599,6 +18638,7 @@ svc_ws_presenters_render(struct d3d11_service_system *sys, struct d3d11_multi_co
 		    sys->base.info.display_pixel_width > 0 ? sys->base.info.display_pixel_width : prim->desktop.w;
 		pass.primary_px_h =
 		    sys->base.info.display_pixel_height > 0 ? sys->base.info.display_pixel_height : prim->desktop.h;
+		pass.screen_id = p->screen_id;
 
 		struct svc_compose_target target = {};
 		target.rtv = p->atlas_rtv.get();
@@ -33840,6 +33880,24 @@ comp_d3d11_service_workspace_set_overlay(struct xrt_system_compositor *xsysc,
                                           float size_w_m, float size_h_m,
                                           bool visible, bool stereo_sbs)
 {
+	return comp_d3d11_service_workspace_set_overlay_on_screen(xsysc, overlay_id, xsc, anchor_x, anchor_y, pivot_x,
+	                                                          pivot_y, size_w_m, size_h_m, visible, stereo_sbs, 0);
+}
+
+// spec_version 26 (ADR-052 Amendment 2): the same, on screen @p screen_id (0 =
+// the primary). Which presenter draws it is resolved per frame in the compose
+// pass (comp_ws_overlay_screen), so a screen that disappears falls back to the
+// primary and one that comes back gets its overlay back with no new call.
+extern "C" xrt_result_t
+comp_d3d11_service_workspace_set_overlay_on_screen(struct xrt_system_compositor *xsysc,
+                                                    uint32_t overlay_id,
+                                                    struct xrt_swapchain *xsc,
+                                                    float anchor_x, float anchor_y,
+                                                    float pivot_x, float pivot_y,
+                                                    float size_w_m, float size_h_m,
+                                                    bool visible, bool stereo_sbs,
+                                                    uint64_t screen_id)
+{
 	if (xsysc == nullptr) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
@@ -33862,8 +33920,15 @@ comp_d3d11_service_workspace_set_overlay(struct xrt_system_compositor *xsysc,
 		return XRT_SUCCESS;
 	}
 
+	const bool is_new = sys->overlays.find(overlay_id) == sys->overlays.end();
 	overlay_slot &slot = sys->overlays[overlay_id];
+	if (is_new ? screen_id != 0 : slot.screen_id != screen_id) {
+		// Lifecycle (an overlay placed on / moved to another screen), not per frame.
+		U_LOG_W("workspace overlay %u: on screen 0x%016llx%s", overlay_id, (unsigned long long)screen_id,
+		        screen_id == 0 ? " (the primary)" : "");
+	}
 	slot.xsc = xsc; // borrowed; controller owns lifetime
+	slot.screen_id = screen_id;
 	slot.stereo_sbs = stereo_sbs;
 	slot.anchor_x = anchor_x;
 	slot.anchor_y = anchor_y;
@@ -34195,6 +34260,17 @@ service_ws_cmd_apply(struct d3d11_service_system *sys, const struct ws_command *
 		if (mc->window != nullptr) {
 			comp_d3d11_window_set_input_suppress(mc->window, cmd->flag);
 		}
+		// ADR-052 Amendment 2: the grab covers every presenter window, so a
+		// modal overlay on another screen (a launcher opened there) owns the
+		// clicks made on it instead of having them forwarded to the focused app.
+		AcquireSRWLockExclusive(&mc->ws_presenters_lock);
+		for (uint32_t i = 0; i < mc->ws_presenter_count; i++) {
+			struct svc_ws_presenter *p = mc->ws_presenters[i];
+			if (p != nullptr && p->window != nullptr) {
+				comp_d3d11_window_set_input_suppress(p->window, cmd->flag);
+			}
+		}
+		ReleaseSRWLockExclusive(&mc->ws_presenters_lock);
 		sys->input_grabbed = cmd->flag; // cursor render reads this to pin to z=0
 		U_LOG_W("Workspace: input grab %s", cmd->flag ? "on" : "off");
 		return;

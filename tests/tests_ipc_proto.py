@@ -161,7 +161,8 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # dashboard phase 7's re-probe request, phase 8's launch settings).
         later = ("system_request_display_reprobe", "system_reload_service_config", "system_workspace_launch",
                  "system_workspace_hotkey_suspend", "weave_get_segments", "workspace_enumerate_screens",
-                 "workspace_set_window_placement", "workspace_get_window_placement")
+                 "workspace_set_window_placement", "workspace_get_window_placement",
+                 "workspace_set_overlay_on_screen")
         self.assertTrue(all(n.startswith("system_get_") or n in later
                             for n in names[i + 3:]), names[i + 3:])
         enable = self._call("compositor_segments_enable")
@@ -208,7 +209,7 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # 8's three calls, #1884's weave_get_segments and ADR-052's three
         # workspace-screen calls follow it).
         names = [c.name for c in self.p.calls]
-        self.assertEqual(names[-8], "system_request_display_reprobe")
+        self.assertEqual(names[-9], "system_request_display_reprobe")
         call = self._call("system_request_display_reprobe")
         self.assertEqual(call.in_args, [])
         self.assertEqual(call.out_args, [])
@@ -224,7 +225,7 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # puts it back (one bool in). Session-free, DIAG only; only #1884's
         # weave_get_segments and ADR-052's workspace-screen calls follow them.
         names = [c.name for c in self.p.calls]
-        self.assertEqual(names[-7:-4], ["system_reload_service_config", "system_workspace_launch",
+        self.assertEqual(names[-8:-5], ["system_reload_service_config", "system_workspace_launch",
                                         "system_workspace_hotkey_suspend"])
         suspend = self._call("system_workspace_hotkey_suspend")
         self.assertEqual([(a.name, a.typename) for a in suspend.in_args], [("suspend", "bool")])
@@ -255,7 +256,7 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # gained a trailing count, below). The table is the per-segment views'
         # struct.
         names = [c.name for c in self.p.calls]
-        self.assertEqual(names[-4], "weave_get_segments")  # ADR-052's three calls follow it
+        self.assertEqual(names[-5], "weave_get_segments")  # ADR-052's four calls follow it
         call = self._call("weave_get_segments")
         self.assertEqual(call.in_args, [])
         self.assertEqual([(a.name, a.typename) for a in call.out_args],
@@ -270,8 +271,8 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # END of proto.json, so every earlier command keeps its enum value. A
         # pre-v25 controller sends none of them; set_window_pose is untouched.
         names = [c.name for c in self.p.calls]
-        self.assertEqual(names[-3:], ["workspace_enumerate_screens", "workspace_set_window_placement",
-                                      "workspace_get_window_placement"])
+        self.assertEqual(names[-4:-1], ["workspace_enumerate_screens", "workspace_set_window_placement",
+                                        "workspace_get_window_placement"])
         enum = self._call("workspace_enumerate_screens")
         self.assertEqual(enum.in_args, [])
         self.assertEqual([(a.name, a.typename) for a in enum.out_args],
@@ -291,6 +292,24 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         text = self._generate("generate_server_c", "ipc_server_generated.c")
         for n in ("workspace_enumerate_screens", "workspace_set_window_placement", "workspace_get_window_placement"):
             self.assertIn("ipc_handle_%s(" % n, text)
+
+    def test_workspace_overlay_on_screen_is_appended(self):
+        # XR_DXR_spatial_workspace v26 (ADR-052 Amendment 2, overlays per
+        # screen): a screen-tagged overlay crosses as its own call APPENDED at
+        # the end -- the untagged workspace_set_overlay keeps its enum value and
+        # its wire form, so a pre-v26 controller sends exactly what it always did.
+        names = [c.name for c in self.p.calls]
+        self.assertEqual(names[-1], "workspace_set_overlay_on_screen")
+        call = self._call("workspace_set_overlay_on_screen")
+        self.assertEqual([(a.name, a.typename) for a in call.in_args],
+                         [("info", "struct ipc_workspace_overlay_info"), ("screen_id", "uint64_t")])
+        self.assertEqual(call.out_args, [])
+        self.assertFalse(call.in_handles or call.out_handles or call.varlen)
+        old = self._call("workspace_set_overlay")
+        self.assertEqual([(a.name, a.typename) for a in old.in_args],
+                         [("info", "struct ipc_workspace_overlay_info")])
+        text = self._generate("generate_server_c", "ipc_server_generated.c")
+        self.assertIn("ipc_handle_workspace_set_overlay_on_screen(", text)
 
     def test_weave_submit_split_signal_is_trailing(self):
         # ADR-047 Amendment 4 addendum: weave_submit's reply APPENDS the

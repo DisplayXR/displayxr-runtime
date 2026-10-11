@@ -386,6 +386,23 @@ comp_ws_pointer_owner_note_down(struct comp_ws_pointer_owner *o, uint64_t screen
 uint64_t
 comp_ws_pointer_owner_screen(const struct comp_ws_pointer_owner *o);
 
+/*!
+ * ADR-052 Amendment 2: the presenter that composes a controller overlay tagged
+ * with screen @p overlay_screen_id (`XrWorkspaceOverlayScreenDXR`, spec v26).
+ *
+ * @p presenter_ids lists the live SECONDARY presenters' screen ids. A tagged
+ * overlay whose screen is one of them is drawn by that presenter only; every
+ * other overlay -- untagged (0), tagged with the primary's own id, or tagged
+ * with a screen that is not a live secondary presenter (unknown, a 2D monitor,
+ * unplugged, a single-screen workspace) -- is drawn by the primary, so an
+ * overlay is never lost. Evaluated per frame: an overlay whose screen comes
+ * back follows it without a new call.
+ *
+ * @return the drawing presenter's screen id, 0 for the primary.
+ */
+uint64_t
+comp_ws_overlay_screen(uint64_t overlay_screen_id, const uint64_t *presenter_ids, uint32_t presenter_count);
+
 #ifdef __cplusplus
 }
 #endif

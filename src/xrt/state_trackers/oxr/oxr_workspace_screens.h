@@ -16,6 +16,7 @@
 #include <openxr/openxr.h>
 #include <openxr/XR_DXR_spatial_workspace.h>
 
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -99,6 +100,27 @@ oxr_workspace_placement_from_ipc(const struct ipc_workspace_window_placement *in
 	out->pose.position.z = in->pose.position.z;
 	out->widthMeters = in->width_m;
 	out->heightMeters = in->height_m;
+}
+
+/*!
+ * spec_version 26 (ADR-052 Amendment 2): the screen an overlay is tagged with,
+ * from an XrWorkspaceOverlayScreenDXR chained anywhere on @p info's next chain.
+ * Returns false (and 0) when no such struct is chained -- the pre-v26 call,
+ * which the caller sends exactly as before. A chained struct with screenId 0
+ * also means the primary, but returns true.
+ */
+static inline bool
+oxr_workspace_overlay_screen_from_chain(const XrWorkspaceOverlayInfoDXR *info, uint64_t *out_screen_id)
+{
+	*out_screen_id = 0;
+	const XrBaseInStructure *it = (const XrBaseInStructure *)info->next;
+	for (uint32_t guard = 0; it != NULL && guard < 32; guard++, it = it->next) {
+		if (it->type == XR_TYPE_WORKSPACE_OVERLAY_SCREEN_DXR) {
+			*out_screen_id = ((const XrWorkspaceOverlayScreenDXR *)(const void *)it)->screenId;
+			return true;
+		}
+	}
+	return false;
 }
 
 #ifdef __cplusplus

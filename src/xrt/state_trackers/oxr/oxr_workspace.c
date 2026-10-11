@@ -185,6 +185,11 @@ struct ipc_workspace_overlay_info;
 xrt_result_t
 comp_ipc_client_compositor_workspace_set_overlay(struct xrt_compositor *xc,
                                                   const struct ipc_workspace_overlay_info *info);
+// spec_version 26 (ADR-052 Amendment 2): an overlay on one screen.
+xrt_result_t
+comp_ipc_client_compositor_workspace_set_overlay_on_screen(struct xrt_compositor *xc,
+                                                            const struct ipc_workspace_overlay_info *info,
+                                                            uint64_t screen_id);
 xrt_result_t
 comp_ipc_client_compositor_workspace_acquire_wakeup_event(struct xrt_compositor *xc,
                                                           xrt_graphics_sync_handle_t *out_handle);
@@ -1513,6 +1518,16 @@ oxr_xrSetWorkspaceOverlayDXR(XrSession session, const XrWorkspaceOverlayInfoDXR 
 		OXR_VERIFY_SWAPCHAIN_AND_INIT_LOG(&log, info->swapchain, sc, "xrSetWorkspaceOverlayDXR");
 		struct xrt_swapchain *inner = workspace_unwrap_client_swapchain(sc->sess, sc->swapchain);
 		ipc_info.swapchain_id = comp_ipc_client_compositor_get_swapchain_id(inner);
+	}
+
+	// spec_version 26 (ADR-052 Amendment 2): an XrWorkspaceOverlayScreenDXR on
+	// the chain puts the overlay on that screen. Untagged = the pre-v26 call,
+	// byte for byte (the primary).
+	uint64_t screen_id = 0;
+	if (oxr_workspace_overlay_screen_from_chain(info, &screen_id)) {
+		xrt_result_t xret =
+		    comp_ipc_client_compositor_workspace_set_overlay_on_screen(&sess->xcn->base, &ipc_info, screen_id);
+		return xret_to_xr_result(&log, xret, "workspace_set_overlay_on_screen");
 	}
 
 	xrt_result_t xret = comp_ipc_client_compositor_workspace_set_overlay(&sess->xcn->base, &ipc_info);

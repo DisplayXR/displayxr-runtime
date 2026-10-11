@@ -1422,5 +1422,12 @@
 		"out": [
 			{"name": "placement", "type": "struct ipc_workspace_window_placement"}
 		]
+	},
+
+	"workspace_set_overlay_on_screen": {
+		"in": [
+			{"name": "info", "type": "struct ipc_workspace_overlay_info"},
+			{"name": "screen_id", "type": "uint64_t"}
+		]
 	}
 }
