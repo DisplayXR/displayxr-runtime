@@ -379,6 +379,11 @@ comp_d3d11_service_refresh_segment_screens(struct xrt_system_compositor *xsysc, 
  * now — the primary screen's from the panel DP, the others from their segment
  * DPs. What the client's `xrLocateViews` frames per-segment views from.
  *
+ * For a WORKSPACE tile of a workspace presenting on several screens (ADR-052
+ * D2) the table is instead cut from the tile's placement when its window
+ * straddles presenters (each part with its presenter's eyes), and is empty
+ * otherwise — the direct pipeline's table never applies to a tile.
+ *
  * @return true when the window is woven per segment.
  * @ingroup comp_d3d11_service
  */
@@ -386,6 +391,28 @@ bool
 comp_d3d11_service_get_client_segment_metrics(struct xrt_system_compositor *xsysc,
                                               struct xrt_compositor *xc,
                                               struct xrt_segment_metrics *out);
+
+/*!
+ * ADR-052 D2 — the screen a workspace tile's ONE view set is framed from, when
+ * that is not the primary: the window wholly on a secondary presenter, or
+ * (straddling, for a locate that keeps one view set) mostly on one. Fills the
+ * window metrics in THAT screen's display space (the placement mapped through
+ * desktop pixels; z and orientation unchanged), that screen's predicted eyes
+ * in its own display space (its presenter DP's; its nominal viewer when the
+ * DP gives none) and its nominal viewer — the inputs
+ * `ipc_try_get_sr_view_poses` frames the window-relative Kooima from.
+ *
+ * @return false — the outputs are not to be read — when the client is not a placed
+ *         tile of a multi-presenter workspace, or its window is framed from
+ *         the primary (today's path, unchanged).
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_get_client_workspace_view_frame(struct xrt_system_compositor *xsysc,
+                                                   struct xrt_compositor *xc,
+                                                   struct xrt_window_metrics *out_wm,
+                                                   struct xrt_eye_positions *out_eyes,
+                                                   struct xrt_vec3 *out_nominal);
 
 /*!
  * Multi-screen M3 over IPC: where each segment's views are in the client's

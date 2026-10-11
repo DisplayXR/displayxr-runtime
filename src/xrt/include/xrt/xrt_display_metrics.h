@@ -194,6 +194,11 @@ struct xrt_segment_metrics
 
 	//! Bumped whenever the table's geometry changes (a move, a resize, a screen change).
 	uint64_t generation;
+
+	//! The window plane's distance in front of the screens, metres (+z toward
+	//! the viewer). 0 for an OS window (it IS on the screen plane); a workspace
+	//! tile's pose z (ADR-052 D2) — every segment's canvas sits at this depth.
+	float window_depth_m;
 };
 
 /*!

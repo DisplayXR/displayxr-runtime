@@ -176,7 +176,8 @@ oxr_segment_views_window_metrics(const struct xrt_segment_metrics *m,
 	// to the segment as it sits on its own screen.
 	out->window_center_offset_x_m = l->seg[i].ref_cx;
 	out->window_center_offset_y_m = l->seg[i].ref_cy;
-	out->window_center_offset_z_m = 0.0f;
+	// 0 for an OS window; a workspace tile's depth (ADR-052 D2).
+	out->window_center_offset_z_m = m->window_depth_m;
 	out->valid = true;
 }
 
@@ -205,6 +206,7 @@ oxr_segment_views_whole_window_metrics(const struct xrt_segment_metrics *m, uint
 	const float wcy = (float)(m->window_screen_top - s->screen_desktop_top) + (float)m->window_pixel_height * 0.5f;
 	out->window_center_offset_x_m = (wcx - (float)s->screen_desktop_width * 0.5f) * px;
 	out->window_center_offset_y_m = -(wcy - (float)s->screen_desktop_height * 0.5f) * py;
+	out->window_center_offset_z_m = m->window_depth_m; // 0 for an OS window (ADR-052 D2)
 	out->valid = true;
 }
 

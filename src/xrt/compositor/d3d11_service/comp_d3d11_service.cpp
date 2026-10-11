@@ -1035,6 +1035,21 @@ struct d3d11_service_compositor
 	//! The same table with every segment's eyes, as the submit predicted them.
 	struct xrt_segment_metrics weave_seg_out;
 
+	/*!
+	 * ADR-052 D2 — per-screen views of a WORKSPACE tile (a placed slot of the
+	 * compose path). Nothing is published by a render thread: the framing is
+	 * built on demand at the client's xrLocateViews from the slot's placement
+	 * and the workspace screen set (svc_ws_client_framing).
+	 *
+	 * `ws_seg_pub` (guarded by `seg_mutex`) is the last per-segment table
+	 * handed to the client, eyes zeroed — the change-only generation source.
+	 * `ws_frame_logged` / `ws_table_logged` are change-only lifecycle-log keys
+	 * touched only on this client's own IPC thread (both readers run there).
+	 */
+	struct xrt_segment_metrics ws_seg_pub;
+	uint64_t ws_frame_logged;
+	uint64_t ws_table_logged;
+
 	//! #1140: the recipe the per-client atlas ACTUALLY HOLDS — the per-view
 	//! content dims and the view count of the last commit that PAINTED it.
 	//!
@@ -31597,6 +31612,247 @@ comp_d3d11_service_refresh_segment_screens(struct xrt_system_compositor *xsysc, 
 	}
 }
 
+/*
+ *
+ * ADR-052 D2 — per-screen views of a workspace tile.
+ *
+ * A placed tile is drawn by every presenter its footprint overlaps; its views
+ * are framed from the screen it is on. Built on demand at the client's
+ * xrLocateViews (its own IPC thread) from the slot's placement and the
+ * workspace screen set; nothing here runs on a one-presenter workspace, so a
+ * single-screen box (and every non-workspace client) takes today's path.
+ *
+ */
+
+/*!
+ * Frame workspace tile @p c: its placement (the primary's display space), the
+ * screen set and the window -> presenter split. False when @p c is not a placed
+ * tile of a workspace that presents on more than one screen — every caller then
+ * keeps today's primary path. The slot is read the way
+ * comp_d3d11_service_get_client_window_metrics reads it.
+ */
+static bool
+svc_ws_client_framing(struct d3d11_service_system *sys,
+                      struct d3d11_service_compositor *c,
+                      struct comp_ws_screen_set *set,
+                      struct xrt_pose *pose,
+                      float *w_m,
+                      float *h_m,
+                      struct comp_ws_view_framing *f)
+{
+	if (!sys->workspace_mode || sys->multi_comp == nullptr || c == nullptr) {
+		return false;
+	}
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	const int idx = multi_comp_find_slot(mc, c);
+	if (idx < 0 || !mc->clients[idx].placed) {
+		return false;
+	}
+	{
+		std::lock_guard<std::mutex> lk(sys->ws_screens_mutex);
+		if (comp_ws_screens_presenter_count(&sys->ws_screens) < 2) {
+			return false; // one presenter: the primary frames everything, as before
+		}
+		*set = sys->ws_screens;
+	}
+	*pose = mc->clients[idx].window_pose;
+	*w_m = mc->clients[idx].window_width_m;
+	*h_m = mc->clients[idx].window_height_m;
+	return comp_ws_frame_window(set, pose, *w_m, *h_m, XRT_MAX_SEGMENTS, f);
+}
+
+/*!
+ * Screen @p id's secondary presenter DP's predicted eyes, in THAT screen's
+ * display space. False when the screen has no live presenter, its presenter
+ * has no DP, or the DP gives no answer. The presenter array is read under
+ * `ws_presenters_lock` (a presenter is unpublished there before it is
+ * destroyed); the DP query is the cached, thread-safe one the segment DPs
+ * answer from IPC threads too (comp_d3d11_segments_get_eyes).
+ */
+static bool
+svc_ws_presenter_own_eyes(struct d3d11_multi_compositor *mc, uint64_t id, struct xrt_eye_positions *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (mc == nullptr) {
+		return false;
+	}
+	bool ok = false;
+	AcquireSRWLockExclusive(&mc->ws_presenters_lock);
+	for (uint32_t i = 0; i < mc->ws_presenter_count && i < COMP_WS_MAX_SCREENS; i++) {
+		struct svc_ws_presenter *p = mc->ws_presenters[i];
+		if (p != nullptr && p->screen_id == id) {
+			ok = p->dp != nullptr && xrt_display_processor_d3d11_get_predicted_eye_positions(p->dp, out) &&
+			     out->valid && out->count > 0;
+			break;
+		}
+	}
+	ReleaseSRWLockExclusive(&mc->ws_presenters_lock);
+	if (!ok) {
+		memset(out, 0, sizeof(*out));
+	}
+	return ok;
+}
+
+bool
+comp_d3d11_service_get_client_workspace_view_frame(struct xrt_system_compositor *xsysc,
+                                                   struct xrt_compositor *xc,
+                                                   struct xrt_window_metrics *out_wm,
+                                                   struct xrt_eye_positions *out_eyes,
+                                                   struct xrt_vec3 *out_nominal)
+{
+	if (xsysc == nullptr || xc == nullptr || out_wm == nullptr || out_eyes == nullptr || out_nominal == nullptr ||
+	    !comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return false;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+
+	struct comp_ws_screen_set set;
+	struct comp_ws_view_framing f;
+	struct xrt_pose pose = {};
+	float w_m = 0.0f, h_m = 0.0f;
+	if (!svc_ws_client_framing(sys, c, &set, &pose, &w_m, &h_m, &f)) {
+		return false; // not a tile of a multi-presenter workspace: untouched
+	}
+	const struct comp_ws_screen *s =
+	    f.frame_screen_index < set.count ? &set.screens[f.frame_screen_index] : nullptr;
+	const uint64_t key = (f.off_primary && s != nullptr) ? s->id : 0;
+	bool ok = false;
+	if (key != 0 && comp_ws_window_metrics(&set, s, &pose, w_m, h_m, out_wm)) {
+		// That screen's tracker; without an answer its nominal viewer, a
+		// nominal IPD apart (svc_ws_presenter_eyes' fallback), so the window
+		// is never framed from another screen's eyes.
+		if (!svc_ws_presenter_own_eyes(sys->multi_comp, s->id, out_eyes)) {
+			const float vz = s->nominal_viewer_m[2] > 0.01f ? s->nominal_viewer_m[2] : 0.6f;
+			memset(out_eyes, 0, sizeof(*out_eyes));
+			out_eyes->count = 2;
+			out_eyes->eyes[0] = {s->nominal_viewer_m[0] - 0.032f, s->nominal_viewer_m[1], vz};
+			out_eyes->eyes[1] = {s->nominal_viewer_m[0] + 0.032f, s->nominal_viewer_m[1], vz};
+			out_eyes->valid = true;
+			out_eyes->is_tracking = false;
+		}
+		*out_nominal = {s->nominal_viewer_m[0], s->nominal_viewer_m[1], s->nominal_viewer_m[2]};
+		ok = true;
+	}
+
+	// Lifecycle, change-only (the window changed screens): the rig's proof
+	// that a window on another screen is framed from that screen's viewer.
+	if (key != c->ws_frame_logged) {
+		c->ws_frame_logged = key;
+		if (ok) {
+			U_LOG_W(
+			    "workspace views: client %p (pid %ld) — window %s screen 0x%016llx: views from that "
+			    "screen's eyes (%s, %u) and geometry (%.4fx%.4f m canvas at %.4f,%.4f,%.4f m) "
+			    "(ADR-052 D2)",
+			    (void *)c, c->client_pid, f.part_count == 1 ? "wholly on" : "mostly on",
+			    (unsigned long long)s->id, out_eyes->is_tracking ? "tracked" : "untracked/nominal",
+			    out_eyes->count, out_wm->window_width_m, out_wm->window_height_m,
+			    out_wm->window_center_offset_x_m, out_wm->window_center_offset_y_m,
+			    out_wm->window_center_offset_z_m);
+		} else {
+			U_LOG_W(
+			    "workspace views: client %p (pid %ld) — window on the primary screen: the primary's eyes "
+			    "and geometry (ADR-052 D2)",
+			    (void *)c, c->client_pid);
+		}
+	}
+	return ok;
+}
+
+/*!
+ * ADR-052 D2: the per-segment table of workspace tile @p c when its window
+ * straddles presenters — one segment per part, each with its screen's eyes
+ * (the panel DP's for the primary part, the presenter DP's for the others).
+ * The client's state tracker reads it exactly as it reads the direct
+ * pipeline's (oxr_session_locate_views): a multiview client renders one view
+ * set per screen and routes them back (compositor_set_view_routing, the commit
+ * paints the mosaic — each part's views in its part of every tile, so every
+ * presenter's compose samples the views framed for it); any other client
+ * frames one view set from the majority screen.
+ *
+ * @return true with a table; false (count 0) when @p c is not a workspace
+ *         tile of a multi-presenter workspace (@p handled false — the caller
+ *         keeps the direct pipeline's table) or does not straddle.
+ */
+static bool
+svc_ws_client_segment_table(struct xrt_system_compositor *xsysc,
+                            struct xrt_compositor *xc,
+                            struct xrt_segment_metrics *out,
+                            bool *handled)
+{
+	*handled = false;
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+
+	struct comp_ws_screen_set set;
+	struct comp_ws_view_framing f;
+	struct xrt_pose pose = {};
+	float w_m = 0.0f, h_m = 0.0f;
+	if (!svc_ws_client_framing(sys, c, &set, &pose, &w_m, &h_m, &f)) {
+		return false;
+	}
+	*handled = true; // a workspace tile: the direct pipeline's table never applies
+
+	struct xrt_segment_metrics m;
+	(void)comp_ws_segment_table(&set, &f, pose.position.z, &m);
+	{
+		std::lock_guard<std::mutex> lk(c->seg_mutex);
+		(void)comp_segments_publish(&c->ws_seg_pub, &m); // eyes are zero here: geometry changes only
+		m.generation = c->ws_seg_pub.generation;
+	}
+
+	// Change-only (the set of screens it straddles, not every drag pixel).
+	uint64_t key = 0;
+	if (f.part_count >= 2) {
+		key = ((uint64_t)f.part_count << 56) ^ ((uint64_t)(f.per_segment ? 1 : 0) << 55);
+		for (uint32_t k = 0; k < f.part_count && k < COMP_SEGMENTS_MAX; k++) {
+			key ^= f.parts[k].screen_id * (k + 1u);
+		}
+	}
+	if (key != c->ws_table_logged) {
+		c->ws_table_logged = key;
+		if (m.count >= 2) {
+			U_LOG_W(
+			    "workspace views: client %p (pid %ld) — window straddles %u presenters: per-segment "
+			    "table [0] 0x%016llx %dx%d px, [1] 0x%016llx %dx%d px (a multiview client renders one "
+			    "view set per screen; any other frames from the majority, 0x%016llx) (ADR-052 D2)",
+			    (void *)c, c->client_pid, m.count, (unsigned long long)m.seg[0].screen_id,
+			    m.seg[0].window_rect.extent.w, m.seg[0].window_rect.extent.h,
+			    (unsigned long long)m.seg[1].screen_id, m.seg[1].window_rect.extent.w,
+			    m.seg[1].window_rect.extent.h, (unsigned long long)f.parts[f.majority].screen_id);
+		} else if (f.part_count >= 2) {
+			U_LOG_W(
+			    "workspace views: client %p (pid %ld) — window straddles %u presenters but is %s: one "
+			    "view set from the majority screen 0x%016llx (ADR-052 D2)",
+			    (void *)c, c->client_pid, f.part_count,
+			    f.part_count > XRT_MAX_SEGMENTS ? "on more screens than view sets" : "tilted",
+			    (unsigned long long)f.parts[f.majority].screen_id);
+		}
+	}
+	if (m.count == 0) {
+		return false;
+	}
+
+	// Eyes: never under seg_mutex (the primary's query takes render_mutex).
+	for (uint32_t k = 0; k < m.count && k < XRT_MAX_SEGMENTS; k++) {
+		struct xrt_segment_metric *s = &m.seg[k];
+		struct xrt_eye_positions eyes;
+		memset(&eyes, 0, sizeof(eyes));
+		if (s->is_primary) {
+			s->have_eyes =
+			    comp_d3d11_service_get_predicted_eye_positions_full_for_client(xsysc, xc, &eyes) &&
+			    eyes.valid;
+		} else {
+			s->have_eyes = svc_ws_presenter_own_eyes(sys->multi_comp, s->screen_id, &eyes);
+		}
+		if (s->have_eyes) {
+			s->eyes = eyes; // else the client frames that part from the screen's nominal viewer
+		}
+	}
+	*out = m;
+	return true;
+}
+
 bool
 comp_d3d11_service_get_client_segment_metrics(struct xrt_system_compositor *xsysc,
                                               struct xrt_compositor *xc,
@@ -31608,6 +31864,14 @@ comp_d3d11_service_get_client_segment_metrics(struct xrt_system_compositor *xsys
 	memset(out, 0, sizeof(*out));
 	if (xsysc == nullptr || xc == nullptr || !comp_d3d11_service_is_d3d11_service(xsysc)) {
 		return false;
+	}
+	{
+		// ADR-052 D2: a workspace tile's table comes from its placement.
+		bool handled = false;
+		const bool have = svc_ws_client_segment_table(xsysc, xc, out, &handled);
+		if (handled) {
+			return have;
+		}
 	}
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 	{

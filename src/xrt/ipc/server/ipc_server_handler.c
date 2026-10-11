@@ -587,10 +587,29 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		return false;
 	}
 
+	// ADR-052 D2 — per-screen views of a workspace tile: a window wholly (or,
+	// for this one-view-set locate, mostly) on another presenter's screen is
+	// framed from THAT screen's eyes, geometry and nominal viewer, not the
+	// primary's. False for everything else (a non-workspace client, a tile on
+	// the primary, a one-presenter workspace): the path below is unchanged.
+	// Headless relays own no window and are never tiles.
+	struct xrt_window_metrics ws_wm = {0};
+	struct xrt_eye_positions ws_eyes = {0};
+	struct xrt_vec3 ws_nominal = {0};
+	const bool ws_framed = xc != NULL && comp_d3d11_service_get_client_workspace_view_frame(s->xsysc, xc, &ws_wm,
+	                                                                                        &ws_eyes, &ws_nominal);
+
 	// Get eye positions from SR weaver (currently 2 eyes; array for future N-view)
 	struct xrt_vec3 raw_eyes[XRT_MAX_VIEWS] = {0};
 	uint32_t eye_count = (view_count < 2) ? view_count : 2; // DP currently reports max 2
-	{
+	if (ws_framed) {
+		// That screen's eyes, in its own display space (the window metrics
+		// below are in the same space). A one-eye answer is used for both.
+		for (uint32_t i = 0; i < eye_count; i++) {
+			const uint32_t k = (i < ws_eyes.count) ? i : 0;
+			raw_eyes[i] = (struct xrt_vec3){ws_eyes.eyes[k].x, ws_eyes.eyes[k].y, ws_eyes.eyes[k].z};
+		}
+	} else {
 		struct xrt_vec3 left_eye, right_eye;
 		// Ask THIS client's DP (#625). Each client gets its own DP at
 		// session-create, so a client that never renders a frame — the
@@ -622,7 +641,11 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 	// Timestamp + tracking lock come from the same full DP eye query.
 	if (rig_reply != NULL) {
 		struct xrt_eye_positions full_eyes = {0};
-		if (comp_d3d11_service_get_predicted_eye_positions_full_for_client(s->xsysc, xc, &full_eyes) &&
+		if (ws_framed) {
+			full_eyes = ws_eyes; // the framing screen's set (ADR-052 D2)
+		}
+		if ((ws_framed ||
+		     comp_d3d11_service_get_predicted_eye_positions_full_for_client(s->xsysc, xc, &full_eyes)) &&
 		    full_eyes.valid) {
 			uint32_t raw_n = full_eyes.count;
 			if (raw_n > XRT_MAX_VIEWS) {
@@ -663,7 +686,11 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		bool have_wm = false;
 
 		// Per-client metrics: virtual window size + center offset from pose
-		if (xc != NULL) {
+		if (ws_framed) {
+			// ADR-052 D2: the tile as seen from the screen it is on.
+			wm = ws_wm;
+			have_wm = wm.valid && wm.window_width_m > 0.0f && wm.window_height_m > 0.0f;
+		} else if (xc != NULL) {
 			have_wm = comp_d3d11_service_get_client_window_metrics(s->xsysc, xc, &wm) &&
 			          wm.valid && wm.window_width_m > 0.0f && wm.window_height_m > 0.0f;
 		}
@@ -1075,6 +1102,10 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 	// defaulted the converter to 0.5 while the toggle used 0.6 — the old WebXR
 	// toggle shift, the sole reason this path diverged from oxr_session.c.)
 	struct xrt_vec3 nominal_viewer = {0.0f, s->xsysc->info.nominal_viewer_y_m, s->xsysc->info.nominal_viewer_z_m};
+	if (ws_framed && ws_nominal.z > 0.0f) {
+		// ADR-052 D2: the framing screen's own nominal viewer (its display space).
+		nominal_viewer = (struct xrt_vec3){0.0f, ws_nominal.y, ws_nominal.z};
+	}
 	const struct xrt_vec3 *rig_nominal = (rig_display || rig_camera) ? &nominal_viewer : NULL;
 
 	if (rig_reply != NULL) {

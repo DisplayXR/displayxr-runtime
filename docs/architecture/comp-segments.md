@@ -482,9 +482,18 @@ An `_ipc` client (`XRT_FORCE_MODE=ipc`, or any app under a running service) is c
   client-texture client weaves on its own and a zones frame keeps the single DP: none is
   segmented here. A present-owner weaves on its own thread and is segmented there (next
   section).
-- **Compose / shell mode** (`multi_compositor_render`) is unchanged: one presenter, the
-  service window on the panel, so a workspace window is never segmented and its table stays
-  empty. Per-screen workspace presenters are a separate decision.
+- **Compose / shell mode** (`multi_compositor_render`) never runs this manager. ADR-052
+  gives the workspace one presenter per 3D screen, and its Amendment 1 frames a placed
+  tile's views from the screen it is on:
+  - **Wholly on one presenter.** The server-side view-pose path frames the window from that
+    presenter's eyes and display space.
+  - **Straddling.** `compositor_get_segment_metrics` hands out a table cut from the tile's
+    footprint: one segment per presenter part, with eyes from the panel DP for the primary
+    part and from the presenter DPs for the others. The table carries the tile's depth in
+    `window_depth_m`. The per-segment views, the routing and the mosaic below then apply
+    unchanged.
+
+  The direct pipeline's table never applies to a tile.
 - **Per-segment views.** `xrLocateViews` fetches the table with `compositor_get_segment_metrics`
   (a round trip per locate, only for an opted-in session): the service fills each segment's
   eyes at query time — the primary from the panel DP, the others from their segment DPs. The

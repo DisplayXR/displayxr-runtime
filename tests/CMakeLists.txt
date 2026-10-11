@@ -674,11 +674,17 @@ endif()
 # ADR-052 -- the workspace on N screens: which screens present, the anchor-screen
 # placement mapping, the window -> presenter split and the workspace-pixel
 # cursor space. Pure math, compiled into the unit (comp_util is Vulkan-gated).
+# + the state tracker's per-segment geometry, so a per-screen-views table
+# (ADR-052 D2) is checked against what the client frames from it.
 target_sources(
 	tests_comp_workspace_screens PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/comp_workspace_screens.c
 	${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/comp_segments.c
+	${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr/oxr_segment_views.c
 	)
-target_include_directories(tests_comp_workspace_screens PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+target_include_directories(
+	tests_comp_workspace_screens PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor
+	${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
+	)
 target_link_libraries(tests_comp_workspace_screens PRIVATE xrt-interfaces aux_util)
 
 if(TARGET ipc_shared)

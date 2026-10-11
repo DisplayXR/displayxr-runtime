@@ -26,6 +26,7 @@
 #pragma once
 
 #include "xrt/xrt_defines.h"
+#include "xrt/xrt_display_metrics.h"
 #include "xrt/xrt_screen.h"
 
 #include "util/comp_segments.h"
@@ -223,6 +224,100 @@ bool
 comp_ws_presenter_frame(const struct comp_ws_screen *primary,
                         const struct comp_ws_screen *presenter,
                         struct comp_ws_frame *out);
+
+/*!
+ * Which screen's eyes and geometry a workspace window's views are framed from
+ * (ADR-052 D2, per-screen views). A client renders its window from the viewer
+ * of the screen it is on, not always the primary's:
+ *
+ * - **On one presenter** (one part): that presenter frames the window — its
+ *   eyes, its display space (the pose mapped through desktop pixels, z and
+ *   orientation unchanged). The primary when that is where it is, which is the
+ *   single-screen path byte for byte.
+ * - **Straddling presenters** (two or more parts): a client that renders one
+ *   view set per screen (`PRIMARY_MULTIVIEW_DXR` with set capacity > 1, the
+ *   M3 contract) is handed a per-segment table (@ref comp_ws_segment_table) —
+ *   each part framed from its own screen's eyes; any other client keeps ONE
+ *   view set framed from the **majority** part's screen (most pixels; a tie
+ *   goes to the primary, then to the leftmost — `oxr_segment_views_majority`'s
+ *   rule).
+ *
+ * The per-segment table is cut from the footprint, so it is exact only for a
+ * window parallel to the screens: a tilted window's footprint is the bound of
+ * its rotated corners, which the client's view tiles do not map onto, so a
+ * tilted straddler keeps the majority's one view set (@ref per_segment false).
+ */
+struct comp_ws_view_framing
+{
+	//! The window's footprint, desktop px.
+	struct comp_seg_rect footprint;
+	//! The window -> presenter split (@ref comp_ws_split), left to right.
+	uint32_t part_count;
+	struct comp_ws_part parts[COMP_SEGMENTS_MAX];
+	//! Index into @ref parts of the majority part (0 when there are none).
+	uint32_t majority;
+	//! Index into the set of the screen that frames ONE view set for the
+	//! window: the majority part's screen, the primary when there is no part.
+	uint32_t frame_screen_index;
+	//! True when the framing screen is not the primary (the views change).
+	bool off_primary;
+	//! A per-segment table may be handed out: 2+ parts, at most the caller's
+	//! segment cap, an untilted window.
+	bool per_segment;
+};
+
+/*!
+ * Frame a window placed at @p pose (the PRIMARY's display space — where every
+ * slot's pose lives) with size @p width_m x @p height_m. See
+ * @ref comp_ws_view_framing.
+ *
+ * @param max_segments  The most parts a per-segment table may carry (XRT_MAX_SEGMENTS).
+ * @return false when the set has no primary or the window no footprint
+ *         (@p out then frames from the primary, no parts).
+ */
+bool
+comp_ws_frame_window(const struct comp_ws_screen_set *set,
+                     const struct xrt_pose *pose,
+                     float width_m,
+                     float height_m,
+                     uint32_t max_segments,
+                     struct comp_ws_view_framing *out);
+
+/*!
+ * The window metrics of a window placed at @p pose (the primary's display
+ * space) as seen from screen @p s: @p s is the display, the window's centre,
+ * size and depth are mapped into @p s's display space (@ref comp_ws_map_pose)
+ * and its orientation is unchanged — the canvas the Kooima frustum of a view
+ * set framed from @p s looks through. On the primary this equals the metrics
+ * the single-screen workspace path has always built.
+ *
+ * @return false when either screen has no usable pixel pitch.
+ */
+bool
+comp_ws_window_metrics(const struct comp_ws_screen_set *set,
+                       const struct comp_ws_screen *s,
+                       const struct xrt_pose *pose,
+                       float width_m,
+                       float height_m,
+                       struct xrt_window_metrics *out);
+
+/*!
+ * The per-segment table of a straddling window (@p f with
+ * @ref comp_ws_view_framing::per_segment): one segment per part, in the
+ * `xrt_segment_metrics` shape the state tracker's per-segment views already
+ * read (`oxr_segment_views_*`) — window px = footprint px (desktop px, origin
+ * the footprint's top-left), canvas = the whole footprint, every screen's
+ * desktop rect, size and nominal viewer, @p depth_m = the window's z.
+ * `has_dp` / `woven` say whether the screen is 3D; eyes are left for the
+ * caller (`have_eyes` false), which owns the DPs.
+ *
+ * @return the segment count (0 when @p f is not per-segment).
+ */
+uint32_t
+comp_ws_segment_table(const struct comp_ws_screen_set *set,
+                      const struct comp_ws_view_framing *f,
+                      float depth_m,
+                      struct xrt_segment_metrics *out);
 
 /*!
  * Workspace pixels — the coordinate space of every cursor position the
