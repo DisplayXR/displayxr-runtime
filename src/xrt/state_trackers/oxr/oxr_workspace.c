@@ -32,6 +32,7 @@
 // dispatch wrapper can fill it directly. The CMake include path
 // (state_trackers/oxr/../../ipc) lets us write this as "shared/...".
 #include "shared/ipc_protocol.h"
+#include "oxr_workspace_screens.h"
 
 #include <openxr/XR_DXR_spatial_workspace.h>
 
@@ -74,6 +75,18 @@ xrt_result_t
 comp_ipc_client_compositor_workspace_set_window_visibility(struct xrt_compositor *xc,
                                                            uint32_t client_id,
                                                            bool visible);
+// spec_version 25 (ADR-052): workspace screens + per-screen placement.
+xrt_result_t
+comp_ipc_client_compositor_workspace_enumerate_screens(struct xrt_compositor *xc,
+                                                       struct ipc_workspace_screen_list *out_list);
+xrt_result_t
+comp_ipc_client_compositor_workspace_set_window_placement(struct xrt_compositor *xc,
+                                                          uint32_t client_id,
+                                                          const struct ipc_workspace_window_placement *placement);
+xrt_result_t
+comp_ipc_client_compositor_workspace_get_window_placement(struct xrt_compositor *xc,
+                                                          uint32_t client_id,
+                                                          struct ipc_workspace_window_placement *out_placement);
 xrt_result_t
 comp_ipc_client_compositor_workspace_set_focused_client(struct xrt_compositor *xc, uint32_t client_id);
 // spec_version 24: controller-reserved key table.
@@ -1614,6 +1627,157 @@ oxr_xrSetWorkspaceClientStyleDXR(XrSession session,
 	xrt_result_t xret = comp_ipc_client_compositor_workspace_set_client_style(
 	    &sess->xcn->base, (uint32_t)clientId, &ipc_style);
 	return xret_to_xr_result(&log, xret, "workspace_set_client_style");
+}
+
+
+/*
+ * Screens (spec_version 25, ADR-052)
+ */
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrEnumerateWorkspaceScreensDXR(XrSession session,
+                                   uint32_t capacityInput,
+                                   uint32_t *countOutput,
+                                   XrWorkspaceScreenDXR *screens)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrEnumerateWorkspaceScreensDXR");
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_spatial_workspace);
+	OXR_VERIFY_ARG_NOT_NULL(&log, countOutput);
+	if (capacityInput > 0) {
+		OXR_VERIFY_ARG_NOT_NULL(&log, screens);
+		for (uint32_t i = 0; i < capacityInput; i++) {
+			if (screens[i].type != XR_TYPE_WORKSPACE_SCREEN_DXR) {
+				return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+				                 "xrEnumerateWorkspaceScreensDXR: screens[%u].type must be "
+				                 "XR_TYPE_WORKSPACE_SCREEN_DXR",
+				                 i);
+			}
+		}
+	}
+
+	if (!session_is_ipc_client(sess)) {
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "xrEnumerateWorkspaceScreensDXR requires an IPC-mode session");
+	}
+
+	struct ipc_workspace_screen_list list;
+	memset(&list, 0, sizeof(list));
+	xrt_result_t xret = comp_ipc_client_compositor_workspace_enumerate_screens(&sess->xcn->base, &list);
+	if (xret != XRT_SUCCESS) {
+		return xret_to_xr_result(&log, xret, "workspace_enumerate_screens");
+	}
+	if (list.count > IPC_WORKSPACE_MAX_SCREENS) {
+		list.count = IPC_WORKSPACE_MAX_SCREENS;
+	}
+
+	*countOutput = list.count;
+	if (capacityInput == 0) {
+		return XR_SUCCESS;
+	}
+	if (capacityInput < list.count) {
+		return oxr_error(&log, XR_ERROR_SIZE_INSUFFICIENT,
+		                 "xrEnumerateWorkspaceScreensDXR: capacity %u < %u screens", capacityInput, list.count);
+	}
+
+	int32_t px = 0, py = 0;
+	oxr_workspace_screens_primary_origin(&list, &px, &py);
+	for (uint32_t i = 0; i < list.count; i++) {
+		oxr_workspace_screen_from_ipc(&list.screens[i], px, py, &screens[i]);
+	}
+	return XR_SUCCESS;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetWorkspaceClientWindowPlacementDXR(XrSession session,
+                                           XrWorkspaceClientId clientId,
+                                           const XrWorkspaceWindowPlacementDXR *placement)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceClientWindowPlacementDXR");
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_spatial_workspace);
+	OXR_VERIFY_ARG_NOT_NULL(&log, placement);
+
+	if (placement->type != XR_TYPE_WORKSPACE_WINDOW_PLACEMENT_DXR) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrSetWorkspaceClientWindowPlacementDXR: placement->type must be "
+		                 "XR_TYPE_WORKSPACE_WINDOW_PLACEMENT_DXR");
+	}
+	if (clientId == XR_NULL_WORKSPACE_CLIENT_ID) {
+		return oxr_error(
+		    &log, XR_ERROR_VALIDATION_FAILURE,
+		    "xrSetWorkspaceClientWindowPlacementDXR: clientId must not be XR_NULL_WORKSPACE_CLIENT_ID");
+	}
+	if (!(placement->widthMeters > 0.0f) || !(placement->heightMeters > 0.0f) ||
+	    !isfinite(placement->widthMeters) || !isfinite(placement->heightMeters)) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrSetWorkspaceClientWindowPlacementDXR: widthMeters and heightMeters must be > 0");
+	}
+
+	if (!session_is_ipc_client(sess)) {
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "xrSetWorkspaceClientWindowPlacementDXR requires an IPC-mode session");
+	}
+
+	struct ipc_workspace_window_placement wire;
+	oxr_workspace_placement_to_ipc(placement, &wire);
+	xrt_result_t xret =
+	    comp_ipc_client_compositor_workspace_set_window_placement(&sess->xcn->base, (uint32_t)clientId, &wire);
+	if (xret == XRT_ERROR_INPUT_UNSUPPORTED) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrSetWorkspaceClientWindowPlacementDXR: unknown screenId 0x%016llx",
+		                 (unsigned long long)placement->screenId);
+	}
+	return xret_to_xr_result(&log, xret, "workspace_set_window_placement");
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetWorkspaceClientWindowPlacementDXR(XrSession session,
+                                           XrWorkspaceClientId clientId,
+                                           XrWorkspaceWindowPlacementDXR *placement)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrGetWorkspaceClientWindowPlacementDXR");
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_spatial_workspace);
+	OXR_VERIFY_ARG_NOT_NULL(&log, placement);
+
+	if (placement->type != XR_TYPE_WORKSPACE_WINDOW_PLACEMENT_DXR) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrGetWorkspaceClientWindowPlacementDXR: placement->type must be "
+		                 "XR_TYPE_WORKSPACE_WINDOW_PLACEMENT_DXR");
+	}
+	if (clientId == XR_NULL_WORKSPACE_CLIENT_ID) {
+		return oxr_error(
+		    &log, XR_ERROR_VALIDATION_FAILURE,
+		    "xrGetWorkspaceClientWindowPlacementDXR: clientId must not be XR_NULL_WORKSPACE_CLIENT_ID");
+	}
+
+	if (!session_is_ipc_client(sess)) {
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "xrGetWorkspaceClientWindowPlacementDXR requires an IPC-mode session");
+	}
+
+	struct ipc_workspace_window_placement wire;
+	memset(&wire, 0, sizeof(wire));
+	xrt_result_t xret =
+	    comp_ipc_client_compositor_workspace_get_window_placement(&sess->xcn->base, (uint32_t)clientId, &wire);
+	if (xret != XRT_SUCCESS) {
+		return xret_to_xr_result(&log, xret, "workspace_get_window_placement");
+	}
+	oxr_workspace_placement_from_ipc(&wire, placement);
+	return XR_SUCCESS;
 }
 
 #endif // OXR_HAVE_DXR_spatial_workspace

@@ -160,7 +160,8 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # Only later appends may follow them (ADR-051's status calls, display
         # dashboard phase 7's re-probe request, phase 8's launch settings).
         later = ("system_request_display_reprobe", "system_reload_service_config", "system_workspace_launch",
-                 "system_workspace_hotkey_suspend", "weave_get_segments")
+                 "system_workspace_hotkey_suspend", "weave_get_segments", "workspace_enumerate_screens",
+                 "workspace_set_window_placement", "workspace_get_window_placement")
         self.assertTrue(all(n.startswith("system_get_") or n in later
                             for n in names[i + 3:]), names[i + 3:])
         enable = self._call("compositor_segments_enable")
@@ -204,9 +205,10 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # Display dashboard phase 7: `dp use|reset --screen` asks the running
         # service to re-probe now. Session-free, DIAG only, no payload —
         # appended, so every earlier command keeps its enum value (only phase
-        # 8's three calls and #1884's weave_get_segments follow it).
+        # 8's three calls, #1884's weave_get_segments and ADR-052's three
+        # workspace-screen calls follow it).
         names = [c.name for c in self.p.calls]
-        self.assertEqual(names[-5], "system_request_display_reprobe")
+        self.assertEqual(names[-8], "system_request_display_reprobe")
         call = self._call("system_request_display_reprobe")
         self.assertEqual(call.in_args, [])
         self.assertEqual(call.out_args, [])
@@ -220,9 +222,9 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # spawn a controller through the hotkey's own path (the id in, a launch
         # status out), and a hotkey-capture box takes the launch hook out /
         # puts it back (one bool in). Session-free, DIAG only; only #1884's
-        # weave_get_segments follows them.
+        # weave_get_segments and ADR-052's workspace-screen calls follow them.
         names = [c.name for c in self.p.calls]
-        self.assertEqual(names[-4:-1], ["system_reload_service_config", "system_workspace_launch",
+        self.assertEqual(names[-7:-4], ["system_reload_service_config", "system_workspace_launch",
                                         "system_workspace_hotkey_suspend"])
         suspend = self._call("system_workspace_hotkey_suspend")
         self.assertEqual([(a.name, a.typename) for a in suspend.in_args], [("suspend", "bool")])
@@ -252,7 +254,7 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # a caller that does not chain XrWeaveOutputRectPartsDXR sends exactly
         # the pre-v19 messages. The table is the per-segment views' struct.
         names = [c.name for c in self.p.calls]
-        self.assertEqual(names[-1], "weave_get_segments")
+        self.assertEqual(names[-4], "weave_get_segments")  # ADR-052's three calls follow it
         call = self._call("weave_get_segments")
         self.assertEqual(call.in_args, [])
         self.assertEqual([(a.name, a.typename) for a in call.out_args],
@@ -262,6 +264,34 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         self.assertEqual(sub, ["have_output", "width", "height", "fence_value", "eyes"])
         text = self._generate("generate_server_c", "ipc_server_generated.c")
         self.assertIn("ipc_handle_weave_get_segments(", text)
+
+    def test_workspace_screen_calls_are_appended(self):
+        # XR_DXR_spatial_workspace v25 (ADR-052, the workspace on N screens):
+        # the screen enumeration and the per-screen placement pair ride at the
+        # END of proto.json, so every earlier command keeps its enum value. A
+        # pre-v25 controller sends none of them; set_window_pose is untouched.
+        names = [c.name for c in self.p.calls]
+        self.assertEqual(names[-3:], ["workspace_enumerate_screens", "workspace_set_window_placement",
+                                      "workspace_get_window_placement"])
+        enum = self._call("workspace_enumerate_screens")
+        self.assertEqual(enum.in_args, [])
+        self.assertEqual([(a.name, a.typename) for a in enum.out_args],
+                         [("list", "struct ipc_workspace_screen_list")])
+        put = self._call("workspace_set_window_placement")
+        self.assertEqual([(a.name, a.typename) for a in put.in_args],
+                         [("client_id", "uint32_t"), ("placement", "struct ipc_workspace_window_placement")])
+        self.assertEqual(put.out_args, [])
+        get = self._call("workspace_get_window_placement")
+        self.assertEqual([(a.name, a.typename) for a in get.in_args], [("client_id", "uint32_t")])
+        self.assertEqual([(a.name, a.typename) for a in get.out_args],
+                         [("placement", "struct ipc_workspace_window_placement")])
+        for call in (enum, put, get):
+            self.assertFalse(call.in_handles or call.out_handles or call.varlen, call.name)
+        pose = self._call("workspace_set_window_pose")
+        self.assertEqual([a.name for a in pose.in_args], ["client_id", "pose", "width_m", "height_m"])
+        text = self._generate("generate_server_c", "ipc_server_generated.c")
+        for n in ("workspace_enumerate_screens", "workspace_set_window_placement", "workspace_get_window_placement"):
+            self.assertIn("ipc_handle_%s(" % n, text)
 
 
 if __name__ == "__main__":

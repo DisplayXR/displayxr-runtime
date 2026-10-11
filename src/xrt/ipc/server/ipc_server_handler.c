@@ -4482,6 +4482,32 @@ ipc_handle_system_toggle_io_device(volatile struct ipc_client_state *ics, uint32
 	return XRT_SUCCESS;
 }
 
+/*!
+ * ADR-052: rebuild the workspace's screen set from this server's screen
+ * registry (the instance's `enumerate_displays`). @p activation: a controller
+ * just (re)activated, so it starts un-opted-in to SCREENS_CHANGED.
+ */
+static void
+workspace_refresh_screens(struct ipc_server *s, bool activation)
+{
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s == NULL || s->xsysc == NULL || s->xinst == NULL || !comp_d3d11_service_is_d3d11_service(s->xsysc)) {
+		return;
+	}
+	struct xrt_screen_list *list = U_TYPED_CALLOC(struct xrt_screen_list);
+	if (list == NULL) {
+		return;
+	}
+	if (xrt_instance_enumerate_displays(s->xinst, list) == XRT_SUCCESS) {
+		comp_d3d11_service_workspace_update_screens(s->xsysc, list, activation);
+	}
+	free(list);
+#else
+	(void)s;
+	(void)activation;
+#endif
+}
+
 xrt_result_t
 ipc_handle_workspace_activate(volatile struct ipc_client_state *_ics)
 {
@@ -4511,6 +4537,9 @@ ipc_handle_workspace_activate(volatile struct ipc_client_state *_ics)
 		         caller_pid, expected_pid);
 		return XRT_ERROR_NOT_AUTHORIZED;
 	}
+
+	// ADR-052: the workspace's screens as of this activation.
+	workspace_refresh_screens(s, true);
 
 	if (s->workspace_mode) {
 		IPC_INFO(s, "Workspace: already in workspace mode — ensuring window for relaunch");
@@ -9180,4 +9209,177 @@ ipc_handle_lift_stream_stats(volatile struct ipc_client_state *ics,
 	(void)stream_id;
 #endif
 	return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+}
+
+
+/*
+ *
+ * The workspace on N screens (ADR-052, XR_DXR_spatial_workspace v25).
+ *
+ */
+
+#if !defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+//! No multi-presenter compositor here: list every screen, the system default as the one presenter.
+static void
+workspace_screens_fill_single(const struct xrt_screen_list *list, struct ipc_workspace_screen_list *out)
+{
+	for (uint32_t i = 0; i < list->count && i < XRT_SCREEN_LIST_MAX && out->count < IPC_WORKSPACE_MAX_SCREENS;
+	     i++) {
+		const struct xrt_screen *x = &list->screens[i];
+		if (x->desktop_width == 0 || x->desktop_height == 0) {
+			continue;
+		}
+		struct ipc_workspace_screen *w = &out->screens[out->count++];
+		w->id = x->id;
+		w->desktop_x = x->desktop_left;
+		w->desktop_y = x->desktop_top;
+		w->desktop_w = x->desktop_width;
+		w->desktop_h = x->desktop_height;
+		w->width_m = x->info.width_m > 0.0f ? x->info.width_m : (float)x->physical_width_mm / 1000.0f;
+		w->height_m = x->info.height_m > 0.0f ? x->info.height_m : (float)x->physical_height_mm / 1000.0f;
+		w->nominal_viewer_m[0] = x->info.nominal_viewer_x_m;
+		w->nominal_viewer_m[1] = x->info.nominal_viewer_y_m;
+		w->nominal_viewer_m[2] = x->info.nominal_viewer_z_m;
+		(void)snprintf(w->plugin_id, sizeof(w->plugin_id), "%s", x->plugin_id);
+		if ((x->flags & XRT_SCREEN_FLAG_TRACKED) != 0) {
+			w->flags |= 8u; // XR_WORKSPACE_SCREEN_TRACKED_BIT_DXR
+		}
+		if (x->plugin_id[0] != '\0') {
+			w->flags |= 2u; // XR_WORKSPACE_SCREEN_3D_BIT_DXR
+		}
+		if ((x->flags & XRT_SCREEN_FLAG_SYSTEM_DEFAULT) != 0) {
+			w->flags |= 1u | 4u; // PRIMARY | PRESENTER
+		}
+	}
+}
+#endif
+
+xrt_result_t
+ipc_handle_workspace_enumerate_screens(volatile struct ipc_client_state *_ics,
+                                       struct ipc_workspace_screen_list *out_list)
+{
+	IPC_TRACE_MARKER();
+	struct ipc_server *s = _ics->server;
+	memset(out_list, 0, sizeof(*out_list));
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL || !comp_d3d11_service_is_d3d11_service(s->xsysc)) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	// Re-read the registry so the answer is never staler than the call (a
+	// change found here also raises SCREENS_CHANGED for any later drain).
+	workspace_refresh_screens(s, false);
+	// Only a workspace controller's enumeration subscribes it to the event.
+	const bool is_controller = _ics->client_state.client_class == XRT_CLIENT_CLASS_CONTROLLER;
+	if (!comp_d3d11_service_workspace_get_screens(s->xsysc, is_controller, out_list)) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return XRT_SUCCESS;
+#else
+	if (s->xinst == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct xrt_screen_list *list = U_TYPED_CALLOC(struct xrt_screen_list);
+	if (list == NULL) {
+		return XRT_ERROR_ALLOCATION;
+	}
+	if (xrt_instance_enumerate_displays(s->xinst, list) == XRT_SUCCESS) {
+		workspace_screens_fill_single(list, out_list);
+	}
+	free(list);
+	return XRT_SUCCESS;
+#endif
+}
+
+xrt_result_t
+ipc_handle_workspace_set_window_placement(volatile struct ipc_client_state *_ics,
+                                          uint32_t client_id,
+                                          const struct ipc_workspace_window_placement *placement)
+{
+	IPC_TRACE_MARKER();
+	xrt_result_t authz = require_workspace_controller(_ics, "workspace_set_window_placement");
+	if (authz != XRT_SUCCESS) {
+		return authz;
+	}
+	struct ipc_server *s = _ics->server;
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	IPC_INFO(s, "Workspace: set_window_placement client_id=%u screen=0x%llx pos=(%.3f,%.3f,%.3f) size=%.3fx%.3f",
+	         client_id, (unsigned long long)placement->screen_id, placement->pose.position.x,
+	         placement->pose.position.y, placement->pose.position.z, placement->width_m, placement->height_m);
+
+	// Same addressing as workspace_set_window_pose: 1000+slot, else by id.
+	if (client_id >= 1000) {
+		return comp_d3d11_service_workspace_set_window_placement(s->xsysc, NULL, (int)(client_id - 1000),
+		                                                         placement);
+	}
+	struct xrt_compositor *target_xc = find_client_xc_by_id(s, client_id); // #957
+	if (target_xc == NULL) {
+		IPC_WARN(s, "Workspace: set_window_placement - client %u not found", client_id);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return comp_d3d11_service_workspace_set_window_placement(s->xsysc, target_xc, -1, placement);
+#else
+	// One presenter, no per-screen mapping: only the primary's space exists.
+	if (placement->screen_id != 0) {
+		struct xrt_screen_list *list = U_TYPED_CALLOC(struct xrt_screen_list);
+		bool primary = false;
+		if (list != NULL && s->xinst != NULL &&
+		    xrt_instance_enumerate_displays(s->xinst, list) == XRT_SUCCESS) {
+			const struct xrt_screen *x = xrt_screen_list_find(list, placement->screen_id);
+			primary = x != NULL && (x->flags & XRT_SCREEN_FLAG_SYSTEM_DEFAULT) != 0;
+		}
+		free(list);
+		if (!primary) {
+			return XRT_ERROR_INPUT_UNSUPPORTED;
+		}
+	}
+	return ipc_handle_workspace_set_window_pose(_ics, client_id, &placement->pose, placement->width_m,
+	                                            placement->height_m);
+#endif
+}
+
+xrt_result_t
+ipc_handle_workspace_get_window_placement(volatile struct ipc_client_state *_ics,
+                                          uint32_t client_id,
+                                          struct ipc_workspace_window_placement *out_placement)
+{
+	IPC_TRACE_MARKER();
+	struct ipc_server *s = _ics->server;
+	memset(out_placement, 0, sizeof(*out_placement));
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	if (client_id >= 1000) {
+		return comp_d3d11_service_workspace_get_window_placement(s->xsysc, NULL, (int)(client_id - 1000),
+		                                                         out_placement);
+	}
+	struct xrt_compositor *target_xc = find_client_xc_by_id(s, client_id); // #957
+	if (target_xc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return comp_d3d11_service_workspace_get_window_placement(s->xsysc, target_xc, -1, out_placement);
+#else
+	xrt_result_t xret = ipc_handle_workspace_get_window_pose(_ics, client_id, &out_placement->pose,
+	                                                         &out_placement->width_m, &out_placement->height_m);
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	struct xrt_screen_list *list = U_TYPED_CALLOC(struct xrt_screen_list);
+	if (list != NULL && s->xinst != NULL && xrt_instance_enumerate_displays(s->xinst, list) == XRT_SUCCESS) {
+		for (uint32_t i = 0; i < list->count && i < XRT_SCREEN_LIST_MAX; i++) {
+			if ((list->screens[i].flags & XRT_SCREEN_FLAG_SYSTEM_DEFAULT) != 0) {
+				out_placement->screen_id = list->screens[i].id;
+				break;
+			}
+		}
+	}
+	free(list);
+	return XRT_SUCCESS;
+#endif
 }

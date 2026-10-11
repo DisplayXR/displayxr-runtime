@@ -465,6 +465,7 @@ enum ipc_workspace_input_event_type
 	IPC_WORKSPACE_INPUT_EVENT_FILE_PICKER_REQUEST = 10, //!< spec_version 11: client called xrRequestFilePickerDXR
 	IPC_WORKSPACE_INPUT_EVENT_FULLSCREEN_TOGGLED  = 11, //!< spec_version 15: client's fullscreen/maximize state transitioned
 	IPC_WORKSPACE_INPUT_EVENT_CLIENT_CONNECTED    = 12, //!< spec_version 16: client connected (slot bound); controller owns per-client setup
+	IPC_WORKSPACE_INPUT_EVENT_SCREENS_CHANGED     = 13, //!< spec_version 25: the workspace screen set changed (ADR-052)
 };
 
 struct ipc_workspace_input_event
@@ -576,6 +577,11 @@ struct ipc_workspace_input_event
 		{
 			uint32_t client_id;
 		} client_connected;
+		struct                      //!< spec_version 25: the workspace screen set changed (ADR-052)
+		{
+			uint32_t generation;   //!< The set's new generation (as `workspace_enumerate_screens` reports).
+			uint32_t screen_count; //!< Screens in the new set.
+		} screens_changed;
 	} u;
 };
 
@@ -757,6 +763,55 @@ struct ipc_workspace_overlay_info
 	uint32_t visible;         //!< XrBool32; 0 = hidden even if swapchain valid
 	uint32_t stereo_sbs;      //!< spec_version 19: XrBool32; 1 = side-by-side stereo overlay
 	uint32_t overlay_id;      //!< spec_version 21: keyed-map slot; 0 = default slot. !visible or hidden swapchain removes this id.
+};
+
+/*!
+ * spec_version 25 (ADR-052): the workspace's screens, as
+ * `workspace_enumerate_screens` returns them. POD mirror of
+ * XrWorkspaceScreenDXR; flags are the `XR_WORKSPACE_SCREEN_*_BIT_DXR` bits.
+ * Sized so the reply stays inside IPC_BUF_SIZE.
+ *
+ * @ingroup ipc
+ */
+#define IPC_WORKSPACE_MAX_SCREENS 8
+#define IPC_WORKSPACE_SCREEN_PLUGIN_ID_MAX 48
+
+struct ipc_workspace_screen
+{
+	uint64_t id;              //!< Registry monitor id (= XR_DXR_display_info displayId).
+	int32_t desktop_x;        //!< Desktop rect, OS virtual-desktop pixels.
+	int32_t desktop_y;
+	uint32_t desktop_w;
+	uint32_t desktop_h;
+	float width_m;            //!< Physical size of the visible area, metres.
+	float height_m;
+	uint32_t flags;           //!< XR_WORKSPACE_SCREEN_*_BIT_DXR.
+	uint32_t mode_index;      //!< Presenter's rendering-mode index (presenters only).
+	uint32_t view_count;      //!< That mode's view count (0 = unknown).
+	uint32_t hardware_3d;     //!< XrBool32: the presenter's panel is in hardware 3D.
+	float nominal_viewer_m[3]; //!< Nominal viewer relative to the screen centre, metres.
+	char plugin_id[IPC_WORKSPACE_SCREEN_PLUGIN_ID_MAX]; //!< Claiming plug-in ("" = none).
+};
+
+struct ipc_workspace_screen_list
+{
+	uint32_t count;           //!< <= IPC_WORKSPACE_MAX_SCREENS
+	uint32_t generation;      //!< Bumped on every change a controller must react to.
+	struct ipc_workspace_screen screens[IPC_WORKSPACE_MAX_SCREENS];
+};
+
+/*!
+ * spec_version 25 (ADR-052): a window placement in one screen's display space
+ * — the wire form of XrWorkspaceWindowPlacementDXR. screen_id 0 = the primary.
+ *
+ * @ingroup ipc
+ */
+struct ipc_workspace_window_placement
+{
+	uint64_t screen_id;
+	struct xrt_pose pose;
+	float width_m;
+	float height_m;
 };
 
 /*!

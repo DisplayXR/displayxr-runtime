@@ -293,6 +293,12 @@ live_key(const struct xrt_status_live *live)
 	mix_u64(&h, live->mode.is_3d);
 	mix_u64(&h, live->workspace.enabled);
 	mix_str(&h, live->workspace.controller);
+	mix_u64(&h, live->workspace.screen_count);
+	for (uint32_t w = 0; w < live->workspace.screen_count && w < XRT_STATUS_WORKSPACE_MAX_SCREENS; w++) {
+		mix_u64(&h, live->workspace.screens[w].id);
+		mix_u64(&h, live->workspace.screens[w].primary);
+		mix_u64(&h, live->workspace.screens[w].woven);
+	}
 	return h;
 }
 
@@ -454,6 +460,11 @@ gather_live(struct ipc_server *s, struct ipc_server_status *st, uint64_t now_ns)
 	live->workspace.enabled = s->workspace_mode;
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	// ADR-052: which screens the workspace presents on.
+	if (s->workspace_mode && s->xsysc != NULL && comp_d3d11_service_is_d3d11_service(s->xsysc)) {
+		comp_d3d11_service_workspace_get_status(s->xsysc, &live->workspace);
+	}
+
 	struct comp_d3d11_render_diag rd;
 	memset(&rd, 0, sizeof(rd));
 	if (s->xsysc != NULL && comp_d3d11_service_is_d3d11_service(s->xsysc)) {

@@ -478,6 +478,9 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 	ENTRY_IF_EXT(xrAcquireWorkspaceWakeupEventDXR, DXR_spatial_workspace);
 	ENTRY_IF_EXT(xrSetWorkspaceClientStyleDXR, DXR_spatial_workspace);
 	ENTRY_IF_EXT(xrSetWorkspaceInputGrabDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrEnumerateWorkspaceScreensDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrSetWorkspaceClientWindowPlacementDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrGetWorkspaceClientWindowPlacementDXR, DXR_spatial_workspace);
 #endif
 
 #ifdef OXR_HAVE_DXR_atlas_capture

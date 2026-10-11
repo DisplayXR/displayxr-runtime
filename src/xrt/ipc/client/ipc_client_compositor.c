@@ -1412,6 +1412,50 @@ comp_ipc_client_compositor_workspace_get_window_pose(struct xrt_compositor *xc,
 }
 
 xrt_result_t
+comp_ipc_client_compositor_workspace_enumerate_screens(struct xrt_compositor *xc,
+                                                       struct ipc_workspace_screen_list *out_list)
+{
+	if (xc == NULL || out_list == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_workspace_enumerate_screens(icc->ipc_c, out_list);
+}
+
+xrt_result_t
+comp_ipc_client_compositor_workspace_set_window_placement(struct xrt_compositor *xc,
+                                                          uint32_t client_id,
+                                                          const struct ipc_workspace_window_placement *placement)
+{
+	if (xc == NULL || placement == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_workspace_set_window_placement(icc->ipc_c, client_id, placement);
+}
+
+xrt_result_t
+comp_ipc_client_compositor_workspace_get_window_placement(struct xrt_compositor *xc,
+                                                          uint32_t client_id,
+                                                          struct ipc_workspace_window_placement *out_placement)
+{
+	if (xc == NULL || out_placement == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_workspace_get_window_placement(icc->ipc_c, client_id, out_placement);
+}
+
+xrt_result_t
 comp_ipc_client_compositor_workspace_set_window_visibility(struct xrt_compositor *xc,
                                                            uint32_t client_id,
                                                            bool visible)
@@ -1634,6 +1678,10 @@ comp_ipc_client_compositor_workspace_enumerate_input_events(struct xrt_composito
 			break;
 		case IPC_WORKSPACE_INPUT_EVENT_CLIENT_CONNECTED:
 			out->clientConnected.clientId = (XrWorkspaceClientId)src->u.client_connected.client_id;
+			break;
+		case IPC_WORKSPACE_INPUT_EVENT_SCREENS_CHANGED: // spec_version 25 (ADR-052)
+			out->screensChanged.generation = src->u.screens_changed.generation;
+			out->screensChanged.screenCount = src->u.screens_changed.screen_count;
 			break;
 		default:
 			break;

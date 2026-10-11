@@ -939,6 +939,22 @@ XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSetWorkspaceClientStyleDXR(XrSession session,
                                  XrWorkspaceClientId clientId,
                                  const XrWorkspaceClientStyleDXR *style);
+//! OpenXR API function @ep{xrEnumerateWorkspaceScreensDXR} (spec_version 25)
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrEnumerateWorkspaceScreensDXR(XrSession session,
+                                   uint32_t capacityInput,
+                                   uint32_t *countOutput,
+                                   XrWorkspaceScreenDXR *screens);
+//! OpenXR API function @ep{xrSetWorkspaceClientWindowPlacementDXR} (spec_version 25)
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetWorkspaceClientWindowPlacementDXR(XrSession session,
+                                           XrWorkspaceClientId clientId,
+                                           const XrWorkspaceWindowPlacementDXR *placement);
+//! OpenXR API function @ep{xrGetWorkspaceClientWindowPlacementDXR} (spec_version 25)
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetWorkspaceClientWindowPlacementDXR(XrSession session,
+                                           XrWorkspaceClientId clientId,
+                                           XrWorkspaceWindowPlacementDXR *placement);
 #endif
 
 #ifdef OXR_HAVE_DXR_wayland_surface_binding

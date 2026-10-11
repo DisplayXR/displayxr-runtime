@@ -836,6 +836,16 @@ u_status_snapshot_to_cjson(const struct xrt_status_snapshot *snap)
 	cJSON *ws = cJSON_AddObjectToObject(root, "workspace");
 	cJSON_AddBoolToObject(ws, "enabled", snap->workspace.enabled);
 	add_str_or_null(ws, "controller", snap->workspace.controller);
+	// ADR-052: the screens the workspace presents on (additive; [] when off).
+	cJSON *wss = cJSON_AddArrayToObject(ws, "screens");
+	for (uint32_t i = 0; i < snap->workspace.screen_count && i < XRT_STATUS_WORKSPACE_MAX_SCREENS; i++) {
+		const struct xrt_status_workspace_screen *w = &snap->workspace.screens[i];
+		cJSON *o = cJSON_CreateObject();
+		add_hex_id(o, "id", w->id);
+		cJSON_AddBoolToObject(o, "primary", w->primary);
+		cJSON_AddBoolToObject(o, "woven", w->woven);
+		cJSON_AddItemToArray(wss, o);
+	}
 
 	add_warnings(root, snap->warnings, snap->warning_count);
 	return root;
@@ -1158,8 +1168,19 @@ u_status_snapshot_format_text(const struct xrt_status_snapshot *snap, char *buf,
 
 	// Workspace + system warnings.
 	if (snap->workspace.enabled) {
-		tb_printf(&t, "WORKSPACE  on · controller %s\n",
+		tb_printf(&t, "WORKSPACE  on · controller %s",
 		          snap->workspace.controller[0] != '\0' ? snap->workspace.controller : "?");
+		// ADR-052: the screens it presents on (* = primary, ~ = no live DP).
+		if (snap->workspace.screen_count > 0) {
+			tb_printf(&t, " · screens");
+			for (uint32_t i = 0; i < snap->workspace.screen_count && i < XRT_STATUS_WORKSPACE_MAX_SCREENS;
+			     i++) {
+				const struct xrt_status_workspace_screen *w = &snap->workspace.screens[i];
+				tb_printf(&t, " 0x%llx%s%s", (unsigned long long)w->id, w->primary ? "*" : "",
+				          w->woven ? "" : "~");
+			}
+		}
+		tb_printf(&t, "\n");
 	}
 	if (snap->warning_count > 0) {
 		tb_printf(&t, "WARNINGS\n");
