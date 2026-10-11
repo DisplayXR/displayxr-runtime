@@ -159,6 +159,7 @@ Integrate your 3D display hardware into DisplayXR.
 - [ADR-049](adr/ADR-049-in-process-lift-rides-the-service.md) — In-process lift rides the service — one conversion module per machine, reached over a lift-only connection
 - [ADR-050](adr/ADR-050-macos-runtime-owns-window-placement.md) — On macOS the runtime owns window placement — phase-snapped, atomic drag and resize by default
 - [ADR-051](adr/ADR-051-display-status-model-and-dashboard.md) — Display status — one vendor-generic model, the service owns the truth, the panel stays dumb
+- [ADR-052](adr/ADR-052-workspace-on-n-screens.md) — Workspace on N screens — one presenter per 3D screen, one desktop-space layout
 <!-- END ADR INDEX -->
 
 ---
