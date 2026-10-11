@@ -168,6 +168,36 @@ struct comp_vk_native_renderer
 	//! Command pool for recording blit commands.
 	VkCommandPool cmd_pool;
 
+	/*!
+	 * The compose command buffer, allocated ONCE from cmd_pool and recycled
+	 * with vkResetCommandBuffer by renderer_draw and draw_zones_pass (#1935).
+	 * Allocating + freeing one per frame made the Adreno driver hand its
+	 * command memory back to the kernel on every vkFreeCommandBuffers and
+	 * allocate + zero fresh pages the next frame — ~80% of an sRGB app's
+	 * xrEndFrame CPU, growing as the kgsl pre-zeroed pool drained. A reset
+	 * without RELEASE_RESOURCES keeps that memory. Safe to reset at the top
+	 * of the next draw because both draw paths wait draw_fence (signalled by
+	 * this buffer's own submit) before returning, and a failed submit leaves
+	 * it not pending. Only touched on the thread that owns cmd_pool.
+	 */
+	VkCommandBuffer draw_cmd;
+
+	/*!
+	 * Signalled by the submit of draw_cmd, and the ONLY thing the per-frame
+	 * draw paths wait on (#1917). It used to be vkQueueWaitIdle on the main
+	 * queue — the APP's queue in-process — which waits for everything on it,
+	 * including work another thread (a fill, an app render/submit thread)
+	 * queued after ours, so a pipelining app could be held to one frame in
+	 * flight. Waiting on our own submit keeps exactly the guarantee callers
+	 * need — the atlas is complete when draw returns (the hand-off posts it
+	 * right after), and draw_cmd is idle for the next reset — and on an
+	 * in-order queue it also implies the app's earlier submits for the
+	 * source image are done, which is what the blit depended on anyway.
+	 * Created once (lazily), reset after each wait — never created or
+	 * destroyed per frame.
+	 */
+	VkFence draw_fence;
+
 	//! Number of tile columns in the atlas (default 2 for stereo).
 	uint32_t tile_columns;
 
@@ -925,7 +955,15 @@ comp_vk_native_renderer_destroy(struct comp_vk_native_renderer **renderer_ptr)
 	comp_vk_deposit_destroy(&r->deposit);
 
 	if (r->cmd_pool != VK_NULL_HANDLE) {
+		if (r->draw_cmd != VK_NULL_HANDLE) {
+			vk->vkFreeCommandBuffers(vk->device, r->cmd_pool, 1, &r->draw_cmd);
+			r->draw_cmd = VK_NULL_HANDLE;
+		}
 		vk->vkDestroyCommandPool(vk->device, r->cmd_pool, NULL);
+	}
+	if (r->draw_fence != VK_NULL_HANDLE) {
+		vk->vkDestroyFence(vk->device, r->draw_fence, NULL);
+		r->draw_fence = VK_NULL_HANDLE;
 	}
 
 	free(r);
@@ -1390,7 +1428,7 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
  * entirely GPU-side: the consumer's `ID3D11DeviceContext4::Wait(fence, value)`
  * orders its reads behind this signal without any CPU blocking on Vulkan. In
  * particular the deposit does NOT lean on the pre-existing per-frame
- * `vkQueueWaitIdle` below (#837's to remove) — take that wait away and the
+ * wait below (#837; now a fence on this submit, #1917) — take that wait away and the
  * ordering guarantee here is unchanged.
  *
  * **VK-1 (#1178) — the same submit takes the ring's back-pressure WAIT.** The
@@ -1647,6 +1685,92 @@ zone_pass_usable(struct comp_vk_native_renderer *r,
 	return true;
 }
 
+/*!
+ * Hand out the renderer's persistent compose command buffer, reset and in the
+ * recording state. Allocated on first use, recycled every frame after — never
+ * freed until the pool is destroyed. See the draw_cmd field for why.
+ */
+static VkResult
+renderer_begin_draw_cmd(struct comp_vk_native_renderer *r, VkCommandBuffer *out_cmd)
+{
+	struct vk_bundle *vk = r->vk;
+	VkResult res;
+
+	if (r->draw_cmd == VK_NULL_HANDLE) {
+		VkCommandBufferAllocateInfo alloc_info = {
+		    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+		    .commandPool = r->cmd_pool,
+		    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+		    .commandBufferCount = 1,
+		};
+		res = vk->vkAllocateCommandBuffers(vk->device, &alloc_info, &r->draw_cmd);
+		if (res != VK_SUCCESS) {
+			r->draw_cmd = VK_NULL_HANDLE;
+			return res;
+		}
+	} else {
+		// No RELEASE_RESOURCES: keeping the driver's command memory is the
+		// whole point. cmd_pool has RESET_COMMAND_BUFFER_BIT.
+		res = vk->vkResetCommandBuffer(r->draw_cmd, 0);
+		if (res != VK_SUCCESS) {
+			return res;
+		}
+	}
+
+	VkCommandBufferBeginInfo begin_info = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+	    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+	};
+	res = vk->vkBeginCommandBuffer(r->draw_cmd, &begin_info);
+	if (res != VK_SUCCESS) {
+		return res;
+	}
+	*out_cmd = r->draw_cmd;
+	return VK_SUCCESS;
+}
+
+/*!
+ * Submit draw_cmd on the main queue with draw_fence, and wait for THAT submit
+ * only (see draw_fence). On a failed submit nothing is pending and the fence
+ * is unsignalled, so the next frame can reset both.
+ */
+static VkResult
+renderer_submit_draw_and_wait(struct comp_vk_native_renderer *r, VkSubmitInfo *submit_info, const char *label)
+{
+	struct vk_bundle *vk = r->vk;
+	VkResult res;
+
+	if (r->draw_fence == VK_NULL_HANDLE) {
+		VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+		res = vk->vkCreateFence(vk->device, &fci, NULL, &r->draw_fence);
+		if (res != VK_SUCCESS) {
+			r->draw_fence = VK_NULL_HANDLE;
+			return res;
+		}
+	}
+
+#ifdef XRT_OS_ANDROID
+	// #1905: one retry on -3 (shared-GSL-context race; see the helper). A
+	// failed attempt consumed nothing and left the fence unsignalled.
+	res = comp_vk_native_queue_submit_retry(vk, vk->main_queue->queue, submit_info, r->draw_fence, label);
+#else
+	(void)label;
+	res = vk->vkQueueSubmit(vk->main_queue->queue, 1, submit_info, r->draw_fence);
+#endif
+	if (res != VK_SUCCESS) {
+		return res;
+	}
+
+	VkResult wres = vk->vkWaitForFences(vk->device, 1, &r->draw_fence, VK_TRUE, UINT64_MAX);
+	vk->vkResetFences(vk->device, 1, &r->draw_fence);
+	if (wres != VK_SUCCESS) {
+		// Device lost or similar. The submit DID happen, so report success
+		// (the caller must not abandon the deposit signal); just log.
+		U_LOG_E("VK compose: waiting the %s fence failed: %d", label, wres);
+	}
+	return VK_SUCCESS;
+}
+
 //! Draw-based projection pass for zones frames: clear via loadOp, draw each
 //! zone's view tiles alpha-over in layer-list order, finish in
 //! SHADER_READ_ONLY. Mirrors comp_d3d11_renderer's zone branch.
@@ -1659,25 +1783,12 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 {
 	struct vk_bundle *vk = r->vk;
 
-	VkCommandBufferAllocateInfo alloc_info = {
-	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-	    .commandPool = r->cmd_pool,
-	    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-	    .commandBufferCount = 1,
-	};
-
-	VkCommandBuffer cmd;
-	VkResult res = vk->vkAllocateCommandBuffers(vk->device, &alloc_info, &cmd);
+	VkCommandBuffer cmd = VK_NULL_HANDLE;
+	VkResult res = renderer_begin_draw_cmd(r, &cmd);
 	if (res != VK_SUCCESS) {
-		U_LOG_E("VK zones: failed to allocate command buffer: %d", res);
+		U_LOG_E("VK zones: failed to begin command buffer: %d", res);
 		return XRT_ERROR_VULKAN;
 	}
-
-	VkCommandBufferBeginInfo begin_info = {
-	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-	    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-	};
-	vk->vkBeginCommandBuffer(cmd, &begin_info);
 
 	vk->vkResetDescriptorPool(vk->device, r->zone.descriptor_pool, 0);
 
@@ -2237,24 +2348,20 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 	deposit_chain_signal(r, &submit_info, &deposit_timeline, &deposit_sem, &deposit_value, &deposit_wait_value,
 	                     &deposit_wait_stage);
 
-#ifdef XRT_OS_ANDROID
-	// #1905: one retry on -3 (shared-GSL-context race); see the helper.
-	res = comp_vk_native_queue_submit_retry(vk, vk->main_queue->queue, &submit_info, VK_NULL_HANDLE,
-	                                        "renderer_draw_zones");
-#else
-	res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE);
-#endif
+	// #1905 retry on Android; waits THIS submit's fence, not the queue (#1917).
+	res = renderer_submit_draw_and_wait(r, &submit_info, "renderer_draw_zones");
 	if (res != VK_SUCCESS) {
 		U_LOG_E("VK zones: failed to submit draw commands: %d", res);
 		// The claimed value will never be signalled — give it back, or a
 		// consumer waiting on it waits forever.
 		comp_vk_deposit_abandon_signal(r->deposit);
-		vk->vkFreeCommandBuffers(vk->device, r->cmd_pool, 1, &cmd);
+		// A failed submit leaves the command buffer not pending; the next
+		// draw resets and reuses it (never freed per frame — see draw_cmd).
 		return XRT_ERROR_VULKAN;
 	}
 
-	vk->vkQueueWaitIdle(vk->main_queue->queue);
-	vk->vkFreeCommandBuffers(vk->device, r->cmd_pool, 1, &cmd);
+	// renderer_submit_draw_and_wait() waited draw_fence: the atlas is
+	// complete and draw_cmd is idle for the next reset.
 
 	static bool zones_draw_logged = false;
 	if (!zones_draw_logged) {
@@ -2379,25 +2486,12 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 		}
 	}
 
-	VkCommandBufferAllocateInfo alloc_info = {
-	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-	    .commandPool = r->cmd_pool,
-	    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-	    .commandBufferCount = 1,
-	};
-
-	VkCommandBuffer cmd;
-	VkResult res = vk->vkAllocateCommandBuffers(vk->device, &alloc_info, &cmd);
+	VkCommandBuffer cmd = VK_NULL_HANDLE;
+	VkResult res = renderer_begin_draw_cmd(r, &cmd);
 	if (res != VK_SUCCESS) {
-		U_LOG_E("Failed to allocate command buffer: %d", res);
+		U_LOG_E("Failed to begin command buffer: %d", res);
 		return XRT_ERROR_VULKAN;
 	}
-
-	VkCommandBufferBeginInfo begin_info = {
-	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-	    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-	};
-	vk->vkBeginCommandBuffer(cmd, &begin_info);
 
 	// Transition atlas image to transfer dst
 	cmd_image_barrier(vk, cmd, r->atlas_image,
@@ -2650,7 +2744,6 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	deposit_chain_signal(r, &submit_info, &deposit_timeline, &deposit_sem, &deposit_value, &deposit_wait_value,
 	                     &deposit_wait_stage);
 
-#ifdef XRT_OS_ANDROID
 	/*
 	 * #1905: one retry on -3. This is the submit that loses the shared-GSL
 	 * race on model viewer: the app's unlocked submit on the app queue
@@ -2659,22 +2752,22 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	 * render layers"). The failed submit consumed nothing (the deposit
 	 * timeline value is still unsignalled), so resubmitting it is safe.
 	 */
-	res =
-	    comp_vk_native_queue_submit_retry(vk, vk->main_queue->queue, &submit_info, VK_NULL_HANDLE, "renderer_draw");
-#else
-	res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE);
-#endif
+
+	// That retry lives in the helper (Android only); it waits THIS submit's
+	// fence, not the queue (#1917).
+	res = renderer_submit_draw_and_wait(r, &submit_info, "renderer_draw");
 	if (res != VK_SUCCESS) {
 		U_LOG_E("Failed to submit renderer commands: %d", res);
 		// The claimed value will never be signalled — give it back, or a
 		// consumer waiting on it waits forever.
 		comp_vk_deposit_abandon_signal(r->deposit);
-		vk->vkFreeCommandBuffers(vk->device, r->cmd_pool, 1, &cmd);
+		// A failed submit leaves the command buffer not pending; the next
+		// draw resets and reuses it (never freed per frame — see draw_cmd).
 		return XRT_ERROR_VULKAN;
 	}
 
-	vk->vkQueueWaitIdle(vk->main_queue->queue);
-	vk->vkFreeCommandBuffers(vk->device, r->cmd_pool, 1, &cmd);
+	// renderer_submit_draw_and_wait() waited draw_fence: the atlas is
+	// complete and draw_cmd is idle for the next reset.
 
 	return XRT_SUCCESS;
 }

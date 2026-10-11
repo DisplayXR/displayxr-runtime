@@ -1343,6 +1343,12 @@ struct comp_vk_native_compositor
 	//! is the stepping stone for deferred present. Lazily created.
 	VkFence frame_fence;
 
+	//! #1917: signalled by the shared-texture commit's OWN submits, which
+	//! wait on it instead of vkQueueWaitIdle(main_queue) — the app's queue,
+	//! so idling it also waited for work other threads queued after ours.
+	//! Created once (lazily), reset after every wait — never per frame.
+	VkFence shared_submit_fence;
+
 	//! #439 Phase 3 — masked 2D-over-3D composite (post-weave). Pipelines +
 	//! render passes; created eagerly at compositor init (formats are fixed
 	//! B8G8R8A8_UNORM for both the target and the scratch — see the init).
@@ -9217,6 +9223,40 @@ vk_repaint_thread(void *ptr)
  * thread that is never coming back. The wrapper must then not unlock it. Every
  * other return leaves it false and the lock held.
  */
+/*!
+ * #1917: submit on the main queue and wait for THIS submit only, via a fence
+ * created once per compositor. Replaces vkQueueWaitIdle on the shared-texture
+ * commit path: on an in-order queue our fence also covers everything queued
+ * before it (the app's render of this frame, which the atlas/weave read), so
+ * the guarantee is unchanged — what it no longer waits for is work another
+ * thread queued AFTER ours.
+ */
+static VkResult
+vk_shared_submit_and_wait(struct comp_vk_native_compositor *c, const VkSubmitInfo *si)
+{
+	struct vk_bundle *vk = &c->vk;
+	if (c->shared_submit_fence == VK_NULL_HANDLE) {
+		VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+		VkResult fres = vk->vkCreateFence(vk->device, &fci, NULL, &c->shared_submit_fence);
+		if (fres != VK_SUCCESS) {
+			c->shared_submit_fence = VK_NULL_HANDLE;
+			// Old behaviour rather than none.
+			VkResult res = vk->vkQueueSubmit(vk->main_queue->queue, 1, si, VK_NULL_HANDLE);
+			if (res == VK_SUCCESS) {
+				vk->vkQueueWaitIdle(vk->main_queue->queue);
+			}
+			return res;
+		}
+	}
+	VkResult res = vk->vkQueueSubmit(vk->main_queue->queue, 1, si, c->shared_submit_fence);
+	if (res != VK_SUCCESS) {
+		return res;
+	}
+	vk->vkWaitForFences(vk->device, 1, &c->shared_submit_fence, VK_TRUE, UINT64_MAX);
+	vk->vkResetFences(vk->device, 1, &c->shared_submit_fence);
+	return VK_SUCCESS;
+}
+
 static xrt_result_t
 vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
                                   xrt_graphics_sync_handle_t sync_handle,
@@ -9835,10 +9875,7 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 				    .commandBufferCount = 1,
 				    .pCommandBuffers = &cmd,
 				};
-				res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &pre_si, VK_NULL_HANDLE);
-				if (res == VK_SUCCESS) {
-					vk->vkQueueWaitIdle(vk->main_queue->queue);
-				}
+				res = vk_shared_submit_and_wait(c, &pre_si); // #1917
 			}
 
 			// Hand the DP this frame's backdrop (NULL ⟹ clears it → desktop-only
@@ -9882,9 +9919,8 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 				    .commandBufferCount = 1,
 				    .pCommandBuffers = &cmd,
 				};
-				res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE);
+				res = vk_shared_submit_and_wait(c, &submit_info); // #1917
 				if (res == VK_SUCCESS) {
-					vk->vkQueueWaitIdle(vk->main_queue->queue);
 					weaving_done = true;
 				}
 			}
@@ -9906,10 +9942,7 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 			    .commandBufferCount = 1,
 			    .pCommandBuffers = &cmd,
 			};
-			res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE);
-			if (res == VK_SUCCESS) {
-				vk->vkQueueWaitIdle(vk->main_queue->queue);
-			}
+			res = vk_shared_submit_and_wait(c, &submit_info); // #1917
 		}
 
 		vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
@@ -10578,6 +10611,10 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	if (c->frame_fence != VK_NULL_HANDLE) {
 		c->vk.vkDestroyFence(c->vk.device, c->frame_fence, NULL);
 		c->frame_fence = VK_NULL_HANDLE;
+	}
+	if (c->shared_submit_fence != VK_NULL_HANDLE) {
+		c->vk.vkDestroyFence(c->vk.device, c->shared_submit_fence, NULL);
+		c->shared_submit_fence = VK_NULL_HANDLE;
 	}
 
 	vk_release_local2d_state(c);

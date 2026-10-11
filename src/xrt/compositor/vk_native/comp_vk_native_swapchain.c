@@ -681,6 +681,12 @@ comp_vk_native_swapchain_is_true_srgb(struct xrt_swapchain *xsc)
  * The vkDeviceWaitIdle that guarded the destroy could not help: nothing had
  * been submitted yet. A swapchain's extent is fixed for its lifetime, so the
  * full-size scratch is the only size it ever needs.
+ *
+ * One scratch per swapchain (not per image slot) is enough: its only reader is
+ * the compose blit recorded right after the copy in the SAME command buffer,
+ * and comp_vk_native_renderer_draw() waits that submit idle before returning.
+ * The weave reads the renderer's atlas, never this scratch, so no later
+ * commit's copy can overwrite it while anything still reads it (#1935).
  */
 static bool
 vk_swapchain_ensure_scratch(struct comp_vk_native_swapchain *sc)
