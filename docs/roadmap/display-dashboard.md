@@ -115,7 +115,7 @@ service RPCs in §5 expose. The last row is what the plug-in slot in §6 carries
       "views": { "capacity": 2, "active": 2, "reported": 4 },
       "integrity": { "paint": 1811, "present": 1809, "skip": 2, "weave_placement": "scanout" } }
   ],
-  "workspace": { "enabled": false, "controller": null },
+  "workspace": { "enabled": false, "controller": null, "screens": [] },
   "warnings": []
 }
 ```

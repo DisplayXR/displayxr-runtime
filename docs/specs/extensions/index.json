@@ -120,7 +120,7 @@
     "XR_DXR_spatial_workspace": {
       "group": "workspace",
       "title": "Spatial Workspace",
-      "summary": "Multi-app composition: window pose, hit-test, capture, overlay, modal input grab"
+      "summary": "Multi-app composition across every 3D screen: screen enumeration, per-screen window placement, capture, overlay, modal input grab"
     },
     "XR_DXR_workspace_file_dialog": {
       "group": "workspace",

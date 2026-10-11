@@ -1398,5 +1398,27 @@
 		"out": [
 			{"name": "metrics", "type": "struct xrt_segment_metrics"}
 		]
+	},
+
+	"workspace_enumerate_screens": {
+		"out": [
+			{"name": "list", "type": "struct ipc_workspace_screen_list"}
+		]
+	},
+
+	"workspace_set_window_placement": {
+		"in": [
+			{"name": "client_id", "type": "uint32_t"},
+			{"name": "placement", "type": "struct ipc_workspace_window_placement"}
+		]
+	},
+
+	"workspace_get_window_placement": {
+		"in": [
+			{"name": "client_id", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "placement", "type": "struct ipc_workspace_window_placement"}
+		]
 	}
 }

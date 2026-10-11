@@ -201,6 +201,8 @@ if(XRT_HAVE_VULKAN)
 		util/comp_target_service.h
 		util/comp_vulkan.h
 		util/comp_vulkan.c
+		util/comp_workspace_screens.c
+		util/comp_workspace_screens.h
 		)
 	target_link_libraries(
 		comp_util

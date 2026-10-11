@@ -941,6 +941,8 @@ reprobe_run(struct ipc_server *s, const char *reason)
 		struct xrt_screen_list *list = U_TYPED_CALLOC(struct xrt_screen_list);
 		if (list != NULL && xrt_instance_enumerate_displays(s->xinst, list) == XRT_SUCCESS) {
 			comp_d3d11_service_refresh_segment_screens(s->xsysc, list);
+			// ADR-052: the workspace's screen set (raises SCREENS_CHANGED on a change).
+			comp_d3d11_service_workspace_update_screens(s->xsysc, list, false);
 		}
 		free(list);
 	}

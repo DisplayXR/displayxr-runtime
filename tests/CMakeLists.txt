@@ -71,6 +71,7 @@ set(tests
     tests_oxr_segment_views
     tests_segments_ipc
     tests_weave_segments
+    tests_comp_workspace_screens
     tests_target_screen_pin
     tests_u_setting_per_screen
     tests_oxr_legacy_mode_rule
@@ -90,6 +91,11 @@ set(tests
 	)
 if(XRT_BUILD_DRIVER_QWERTY)
 	list(APPEND tests tests_qwerty_camera_profile tests_qwerty_velocity)
+endif()
+# ADR-052 -- XR_DXR_spatial_workspace v25 over IPC: the screen list and the
+# placement through their wire forms. Needs the generated protocol.
+if(TARGET ipc_shared)
+	list(APPEND tests tests_workspace_screens_ipc)
 endif()
 # #1727 -- the X11 qwerty front-end's edge logic (one click = one select edge).
 if(XRT_BUILD_DRIVER_QWERTY AND XRT_HAVE_XCB AND NOT ANDROID)
@@ -663,6 +669,29 @@ target_link_libraries(tests_segments_ipc PRIVATE xrt-interfaces aux_util)
 if(TARGET ipc_shared)
 	target_link_libraries(tests_segments_ipc PRIVATE ipc_shared)
 	target_compile_definitions(tests_segments_ipc PRIVATE DXR_TESTS_HAVE_IPC_PROTOCOL)
+endif()
+
+# ADR-052 -- the workspace on N screens: which screens present, the anchor-screen
+# placement mapping, the window -> presenter split and the workspace-pixel
+# cursor space. Pure math, compiled into the unit (comp_util is Vulkan-gated).
+target_sources(
+	tests_comp_workspace_screens PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/comp_workspace_screens.c
+	${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/comp_segments.c
+	)
+target_include_directories(tests_comp_workspace_screens PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+target_link_libraries(tests_comp_workspace_screens PRIVATE xrt-interfaces aux_util)
+
+if(TARGET ipc_shared)
+	target_sources(
+		tests_workspace_screens_ipc
+		PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/comp_workspace_screens.c
+			${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/comp_segments.c
+		)
+	target_include_directories(
+		tests_workspace_screens_ipc PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor
+		${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
+		)
+	target_link_libraries(tests_workspace_screens_ipc PRIVATE xrt-interfaces aux_util ipc_shared xrt-external-openxr)
 endif()
 
 # XR_DXR_weave v19 (#1884, ADR-047 Amendment 4): a present-owner's weave rects

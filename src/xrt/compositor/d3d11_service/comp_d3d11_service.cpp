@@ -44,6 +44,8 @@
 #include "comp_d3d11_outcomp.h"
 #include "comp_d3d11_segments.h"
 #include "xrt/xrt_screen.h"
+#include "xrt/xrt_plugin.h"
+#include "util/comp_workspace_screens_ipc.h" // ADR-052: the workspace on N screens
 
 #include "comp_d3d11_window.h"
 
@@ -1520,10 +1522,14 @@ struct ws_command
 	struct d3d11_service_compositor *xc;
 	//! Target for *_SLOT / SET_FOCUS / EXIT_SLOT commands.
 	int slot;
-	//! SET_POSE payload.
+	//! SET_POSE payload. `pose` / `width_m` / `height_m` are always in the
+	//! PRIMARY screen's display space (a placement on another screen is mapped
+	//! at enqueue); `screen_id` is the anchor the controller placed it on
+	//! (0 = the primary — every pre-spec_version-25 set_pose).
 	struct xrt_pose pose;
 	float width_m;
 	float height_m;
+	uint64_t screen_id;
 	//! SET_VIS / INPUT_GRAB payload.
 	bool flag;
 	//! SET_CAP payload.
@@ -2000,6 +2006,27 @@ struct d3d11_service_system
 	//! support Win32 events (currently macOS / Linux — wakeup event is a
 	//! Windows-only optimization).
 	void *workspace_wakeup_event; // HANDLE on Win32, opaque void* in header
+
+	/*!
+	 * @name The workspace's screens (ADR-052, XR_DXR_spatial_workspace v25)
+	 *
+	 * The set every controller-facing screen answer is built from: the
+	 * service's screen registry projected through `comp_ws_screens_build`.
+	 * Rebuilt by the IPC server on workspace activation, on every display
+	 * re-probe (a monitor added / removed / moved, a claim changed) and on
+	 * `workspace_enumerate_screens`; @ref ws_screens_generation moves only
+	 * when the set really changed. `ws_screens_mutex` is a LEAF guarding all
+	 * four fields (IPC threads write, the drain and the pose setters read).
+	 * @{
+	 */
+	std::mutex ws_screens_mutex;
+	struct comp_ws_screen_set ws_screens;
+	uint32_t ws_screens_generation;
+	//! The controller has enumerated at least once: it gets SCREENS_CHANGED.
+	bool ws_screens_optin;
+	//! The generation the controller last saw (enumerated or was told).
+	uint32_t ws_screens_gen_emitted;
+	/*! @} */
 
 	/*!
 	 * #918 OUTPUT-DEVICE SPLIT. Stood up by Stage A in
@@ -3792,6 +3819,13 @@ struct d3d11_multi_client_slot
 	struct xrt_pose       window_pose_last_emitted;
 	float                 window_w_last_emitted;
 	float                 window_h_last_emitted;
+
+	//! spec_version 25 (ADR-052): the screen the controller anchored this
+	//! window on (xrSetWorkspaceClientWindowPlacementDXR); 0 = the primary.
+	//! `window_pose` / `window_width_m` / `window_height_m` stay in the
+	//! primary's display space whatever the anchor — every pre-existing reader
+	//! is unchanged — and the placement getter maps them back to the anchor.
+	uint64_t window_screen_id;
 
 	//! spec_version 10: a Win32 modal popup is open in this client. Set by
 	//! ipc_handle_session_set_modal_state when the in-app CBT hook
@@ -30161,6 +30195,307 @@ comp_d3d11_service_get_client_app_window_metrics(struct xrt_system_compositor *x
 
 /*
  *
+ * The workspace on N screens (ADR-052, XR_DXR_spatial_workspace v25).
+ *
+ * The IPC server owns the screen registry handle (its instance) and calls in
+ * here with the list; everything below runs on IPC threads and touches only
+ * the `ws_screens_*` fields (leaf mutex) or enqueues an S3 command.
+ *
+ */
+
+/*!
+ * Whether this build presents the workspace on more than one screen. Until
+ * the per-screen presenters land (ADR-052 D1) the set is built single-screen:
+ * every other 3D screen is listed, but not as a presenter, so the contract a
+ * controller sees is the truth about what is drawn.
+ */
+static bool
+svc_ws_multi_presenter_supported(void)
+{
+	return false;
+}
+
+static enum comp_ws_policy
+svc_ws_policy(void)
+{
+	if (!svc_ws_multi_presenter_supported()) {
+		return COMP_WS_POLICY_SINGLE;
+	}
+	return comp_ws_policy_from_env(getenv("DXR_SEGMENTS"), getenv("DXR_WORKSPACE_SCREENS"));
+}
+
+//! Bit i: screen i of @p list has a registry claim that can make a D3D11 DP for it.
+static uint32_t
+svc_ws_dp_capable_mask(struct d3d11_service_system *sys, const struct xrt_screen_list *list)
+{
+	uint32_t mask = 0;
+	const struct xrt_dp_factory_registry *reg = &sys->base.info.dp_registry;
+	for (uint32_t i = 0; i < list->count && i < XRT_SCREEN_LIST_MAX && i < 32; i++) {
+		for (uint32_t e = 0; e < reg->entry_count && e < XRT_DP_REGISTRY_MAX_ENTRIES; e++) {
+			const struct xrt_dp_registry_entry *en = &reg->entries[e];
+			if (en->monitor_id != list->screens[i].id) {
+				continue;
+			}
+			if (en->dp_factory_d3d11 != nullptr && xrt_plugin_iface_has_create_dp_d3d11_for_screen(
+			                                           (const struct xrt_plugin_iface *)en->owning_iface)) {
+				mask |= 1u << i;
+			}
+			break;
+		}
+	}
+	return mask;
+}
+
+void
+comp_d3d11_service_workspace_update_screens(struct xrt_system_compositor *xsysc,
+                                            const struct xrt_screen_list *list,
+                                            bool activation)
+{
+	if (xsysc == nullptr || list == nullptr || !comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+
+	struct comp_ws_screen_set set;
+	comp_ws_screens_build(list, svc_ws_dp_capable_mask(sys, list), svc_ws_policy(), &set);
+
+	bool changed = false;
+	bool wake = false;
+	uint32_t gen = 0;
+	{
+		std::lock_guard<std::mutex> lk(sys->ws_screens_mutex);
+		if (activation) {
+			// A (new) controller starts un-opted-in: it gets SCREENS_CHANGED
+			// only once it has enumerated.
+			sys->ws_screens_optin = false;
+		}
+		changed = !comp_ws_screens_equal(&sys->ws_screens, &set);
+		if (changed) {
+			sys->ws_screens = set;
+			sys->ws_screens_generation++;
+		}
+		gen = sys->ws_screens_generation;
+		wake = changed && sys->ws_screens_optin;
+	}
+	if (!changed) {
+		return;
+	}
+
+	// Once per topology change (lifecycle).
+	char ids[256] = {0};
+	for (uint32_t i = 0; i < set.count; i++) {
+		size_t used = strlen(ids);
+		snprintf(ids + used, sizeof(ids) - used, "%s0x%llx%s%s", used > 0 ? ", " : "",
+		         (unsigned long long)set.screens[i].id,
+		         (set.screens[i].flags & COMP_WS_SCREEN_PRIMARY) != 0 ? "*" : "",
+		         (set.screens[i].flags & COMP_WS_SCREEN_PRESENTER) != 0
+		             ? "(P)"
+		             : ((set.screens[i].flags & COMP_WS_SCREEN_3D) != 0 ? "(3D)" : "(2D)"));
+	}
+	U_LOG_W("workspace screens: generation %u — %u screen(s), %u presenter(s): %s", gen, set.count,
+	        comp_ws_screens_presenter_count(&set), ids);
+
+	if (wake && sys->workspace_wakeup_event != nullptr) {
+		SetEvent((HANDLE)sys->workspace_wakeup_event); // the controller drains SCREENS_CHANGED
+	}
+}
+
+bool
+comp_d3d11_service_workspace_get_screens(struct xrt_system_compositor *xsysc,
+                                         bool opt_in,
+                                         struct ipc_workspace_screen_list *out)
+{
+	if (xsysc == nullptr || out == nullptr || !comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return false;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+
+	struct comp_ws_screen_set set;
+	uint32_t gen = 0;
+	{
+		std::lock_guard<std::mutex> lk(sys->ws_screens_mutex);
+		set = sys->ws_screens;
+		gen = sys->ws_screens_generation;
+		if (opt_in) {
+			sys->ws_screens_optin = true;
+			sys->ws_screens_gen_emitted = gen; // the controller is looking at it now
+		}
+	}
+
+	// The primary presenter's live mode (one rendering mode per service today;
+	// a secondary presenter reports its own once it exists).
+	if (set.primary_index < set.count && sys->xdev != nullptr && sys->xdev->hmd != nullptr) {
+		struct comp_ws_screen *p = &set.screens[set.primary_index];
+		const uint32_t idx = sys->xdev->hmd->active_rendering_mode_index;
+		p->mode_index = idx;
+		if (idx < sys->xdev->rendering_mode_count) {
+			p->view_count = sys->xdev->rendering_modes[idx].view_count;
+			p->hardware_3d = sys->xdev->rendering_modes[idx].hardware_display_3d;
+		}
+	}
+	comp_ws_screens_to_ipc(&set, gen, out);
+	return true;
+}
+
+//! Resolve the anchor screen and map a placement into the primary's space. Caller holds ws_screens_mutex.
+static xrt_result_t
+svc_ws_placement_to_primary(struct d3d11_service_system *sys,
+                            const struct ipc_workspace_window_placement *in,
+                            struct xrt_pose *out_pose,
+                            float *out_w,
+                            float *out_h,
+                            uint64_t *out_anchor)
+{
+	*out_pose = in->pose;
+	*out_w = in->width_m;
+	*out_h = in->height_m;
+	*out_anchor = 0;
+	if (in->screen_id == 0) {
+		return XRT_SUCCESS;
+	}
+	const struct comp_ws_screen *from = comp_ws_screens_find(&sys->ws_screens, in->screen_id);
+	const struct comp_ws_screen *prim = comp_ws_screens_find(&sys->ws_screens, 0);
+	if (from == nullptr || prim == nullptr) {
+		return XRT_ERROR_INPUT_UNSUPPORTED; // not a workspace screen
+	}
+	if (from == prim) {
+		return XRT_SUCCESS; // the primary, named by id: same as 0
+	}
+	if (!comp_ws_map_pose(from, prim, &in->pose, in->width_m, in->height_m, out_pose, out_w, out_h)) {
+		return XRT_ERROR_INPUT_UNSUPPORTED;
+	}
+	*out_anchor = from->id;
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+comp_d3d11_service_workspace_set_window_placement(struct xrt_system_compositor *xsysc,
+                                                  struct xrt_compositor *xc,
+                                                  int slot_index,
+                                                  const struct ipc_workspace_window_placement *placement)
+{
+	if (xsysc == nullptr || placement == nullptr || !comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	if (!sys->workspace_mode || sys->multi_comp == nullptr) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	if (xc == nullptr && (slot_index < 0 || slot_index >= D3D11_MULTI_MAX_CLIENTS)) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	struct ws_command cmd = {};
+	xrt_result_t xret;
+	{
+		std::lock_guard<std::mutex> lk(sys->ws_screens_mutex);
+		xret =
+		    svc_ws_placement_to_primary(sys, placement, &cmd.pose, &cmd.width_m, &cmd.height_m, &cmd.screen_id);
+	}
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+
+	// Same floor as set_client_window_pose (in the primary's metres).
+	const float min_dim = 0.02f;
+	if (cmd.width_m < min_dim) {
+		cmd.width_m = min_dim;
+	}
+	if (cmd.height_m < min_dim) {
+		cmd.height_m = min_dim;
+	}
+
+	// #925 S3: enqueue, exactly like the pose setters (success on enqueue).
+	if (xc != nullptr) {
+		cmd.type = WS_CMD_SET_POSE_XC;
+		cmd.xc = d3d11_service_compositor_from_xrt(xc);
+	} else {
+		cmd.type = WS_CMD_SET_POSE_SLOT;
+		cmd.slot = slot_index;
+	}
+	service_ws_cmd_submit(sys, &cmd);
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+comp_d3d11_service_workspace_get_window_placement(struct xrt_system_compositor *xsysc,
+                                                  struct xrt_compositor *xc,
+                                                  int slot_index,
+                                                  struct ipc_workspace_window_placement *out)
+{
+	if (xsysc == nullptr || out == nullptr || !comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (!sys->workspace_mode || mc == nullptr) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	struct xrt_pose pose;
+	float w = 0.0f, h = 0.0f;
+	uint64_t anchor = 0;
+	{
+		render_mutex_fair_lock lock(sys);
+		int slot = xc != nullptr ? multi_comp_find_slot(mc, d3d11_service_compositor_from_xrt(xc)) : slot_index;
+		if (slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS || !mc->clients[slot].active) {
+			return XRT_ERROR_IPC_FAILURE;
+		}
+		pose = mc->clients[slot].window_pose;
+		w = mc->clients[slot].window_width_m;
+		h = mc->clients[slot].window_height_m;
+		anchor = mc->clients[slot].window_screen_id;
+	}
+
+	memset(out, 0, sizeof(*out));
+	out->pose = pose;
+	out->width_m = w;
+	out->height_m = h;
+	std::lock_guard<std::mutex> lk(sys->ws_screens_mutex);
+	const struct comp_ws_screen *prim = comp_ws_screens_find(&sys->ws_screens, 0);
+	const struct comp_ws_screen *to = anchor != 0 ? comp_ws_screens_find(&sys->ws_screens, anchor) : nullptr;
+	if (to != nullptr && prim != nullptr && to != prim &&
+	    comp_ws_map_pose(prim, to, &pose, w, h, &out->pose, &out->width_m, &out->height_m)) {
+		out->screen_id = to->id;
+	} else {
+		// Anchored on the primary, or the anchor screen is gone: the window
+		// stays where it is, in the primary's space.
+		out->screen_id = prim != nullptr ? prim->id : 0;
+	}
+	return XRT_SUCCESS;
+}
+
+void
+comp_d3d11_service_workspace_get_status(struct xrt_system_compositor *xsysc, struct xrt_status_workspace *ws)
+{
+	if (xsysc == nullptr || ws == nullptr || !comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct comp_ws_screen_set set;
+	{
+		std::lock_guard<std::mutex> lk(sys->ws_screens_mutex);
+		set = sys->ws_screens;
+	}
+	// Lock-free read of the panel DP pointer, like every other status reader:
+	// only "is there one" is used.
+	const bool primary_woven = sys->multi_comp != nullptr && sys->multi_comp->display_processor != nullptr;
+	ws->screen_count = 0;
+	for (uint32_t i = 0; i < set.count && ws->screen_count < XRT_STATUS_WORKSPACE_MAX_SCREENS; i++) {
+		const struct comp_ws_screen *s = &set.screens[i];
+		if ((s->flags & COMP_WS_SCREEN_PRESENTER) == 0) {
+			continue;
+		}
+		struct xrt_status_workspace_screen *o = &ws->screens[ws->screen_count++];
+		o->id = s->id;
+		o->primary = (s->flags & COMP_WS_SCREEN_PRIMARY) != 0;
+		o->woven = o->primary ? primary_woven : false;
+	}
+}
+
+
+/*
+ *
  * Multi-screen M6/M3 over IPC (ADR-047 Amendment 3). The IPC server is the
  * caller: it owns the screen registry handle (the server's instance) and the
  * client's connection; everything below runs on that client's IPC thread.
@@ -30793,6 +31128,24 @@ comp_d3d11_service_workspace_drain_input_events(struct xrt_system_compositor *xs
 		out_batch->count++;
 
 		cs->announce_connected = false;
+	}
+
+	// spec_version 25 (ADR-052): SCREENS_CHANGED, at most one per drain, when
+	// the screen set moved past the generation the controller last saw. Only
+	// for a controller that opted in by enumerating — a pre-v25 controller
+	// never sees the new event type.
+	if (out_batch->count < IPC_WORKSPACE_INPUT_EVENT_BATCH_MAX) {
+		std::lock_guard<std::mutex> lk(sys->ws_screens_mutex);
+		if (sys->ws_screens_optin && sys->ws_screens_generation != sys->ws_screens_gen_emitted) {
+			struct ipc_workspace_input_event *ev = &out_batch->events[out_batch->count];
+			memset(ev, 0, sizeof(*ev));
+			ev->event_type = IPC_WORKSPACE_INPUT_EVENT_SCREENS_CHANGED;
+			ev->timestamp_ms = (uint32_t)GetTickCount();
+			ev->u.screens_changed.generation = sys->ws_screens_generation;
+			ev->u.screens_changed.screen_count = sys->ws_screens.count;
+			sys->ws_screens_gen_emitted = sys->ws_screens_generation;
+			out_batch->count++;
+		}
 	}
 
 	// FRAME_TICK: one per displayed frame since the last drain, capped at
@@ -31437,6 +31790,7 @@ service_ws_cmd_apply(struct d3d11_service_system *sys, const struct ws_command *
 		mc->clients[slot].window_pose = cmd->pose;
 		mc->clients[slot].window_width_m = cmd->width_m;
 		mc->clients[slot].window_height_m = cmd->height_m;
+		mc->clients[slot].window_screen_id = cmd->screen_id; // ADR-052: 0 = primary
 		// ADR-018 (#304): first set_pose marks the client placed; the runtime
 		// starts compositing it from here (gated with first-frame-committed).
 		mc->clients[slot].placed = true;
@@ -31470,6 +31824,7 @@ service_ws_cmd_apply(struct d3d11_service_system *sys, const struct ws_command *
 		mc->clients[slot].window_pose = cmd->pose;
 		mc->clients[slot].window_width_m = cmd->width_m;
 		mc->clients[slot].window_height_m = cmd->height_m;
+		mc->clients[slot].window_screen_id = cmd->screen_id; // ADR-052: 0 = primary
 		// ADR-018 (#304): slot-addressed path serves both capture clients
 		// and OpenXR clients posed by 1000+slot.
 		mc->clients[slot].placed = true;

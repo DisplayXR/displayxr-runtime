@@ -428,6 +428,22 @@ xrt_result_t
 comp_ipc_client_compositor_workspace_set_reserved_keys(struct xrt_compositor *xc,
                                                        const struct ipc_workspace_reserved_keys *table);
 
+/*!
+ * spec_version 25 (ADR-052): the workspace's screens, and a window placement
+ * in any screen's display space.
+ */
+xrt_result_t
+comp_ipc_client_compositor_workspace_enumerate_screens(struct xrt_compositor *xc,
+                                                       struct ipc_workspace_screen_list *out_list);
+xrt_result_t
+comp_ipc_client_compositor_workspace_set_window_placement(struct xrt_compositor *xc,
+                                                          uint32_t client_id,
+                                                          const struct ipc_workspace_window_placement *placement);
+xrt_result_t
+comp_ipc_client_compositor_workspace_get_window_placement(struct xrt_compositor *xc,
+                                                          uint32_t client_id,
+                                                          struct ipc_workspace_window_placement *out_placement);
+
 xrt_result_t
 comp_ipc_client_compositor_workspace_get_focused_client(struct xrt_compositor *xc, uint32_t *out_client_id);
 

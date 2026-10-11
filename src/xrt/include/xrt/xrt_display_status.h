@@ -474,11 +474,25 @@ struct xrt_status_generation
 	uint64_t status;   //!< Everything else.
 };
 
+//! Max presenter screens in a @ref xrt_status_workspace (= COMP_WS_MAX_SCREENS).
+#define XRT_STATUS_WORKSPACE_MAX_SCREENS 8
+
+//! One screen the workspace presents on (ADR-052).
+struct xrt_status_workspace_screen
+{
+	uint64_t id;  //!< Screen id (matches a `screens[]` row).
+	bool primary; //!< The primary presenter (the service window's screen).
+	bool woven;   //!< Its presenter has a live display processor.
+};
+
 //! Workspace block (phase 2).
 struct xrt_status_workspace
 {
 	bool enabled;                         //!< A workspace session is active.
 	char controller[XRT_STATUS_NAME_MAX]; //!< Its controller ("" = none).
+	//! ADR-052: the screens the workspace presents on (valid while @ref enabled).
+	uint32_t screen_count;
+	struct xrt_status_workspace_screen screens[XRT_STATUS_WORKSPACE_MAX_SCREENS];
 };
 
 /*!

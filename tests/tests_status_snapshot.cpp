@@ -576,7 +576,38 @@ TEST_CASE("status: JSON has schema first and the §3 key set", "[status][json]")
 	CHECK(keys(cJSON_GetObjectItem(cl, "integrity")) == V{"paint", "present", "skip", "weave_placement"});
 	CHECK(str(cJSON_GetObjectItem(cl, "integrity"), "weave_placement") == "scanout");
 
-	CHECK(keys(cJSON_GetObjectItem(d.root, "workspace")) == V{"enabled", "controller"});
+	CHECK(keys(cJSON_GetObjectItem(d.root, "workspace")) == V{"enabled", "controller", "screens"});
+}
+
+TEST_CASE("status: the workspace block lists the screens it presents on (ADR-052)", "[status][json]")
+{
+	{
+		// Off: an empty array, never absent (additive, always the same shape).
+		auto off = healthy();
+		json_doc d(*off);
+		REQUIRE(d.root != nullptr);
+		const cJSON *scr = cJSON_GetObjectItem(cJSON_GetObjectItem(d.root, "workspace"), "screens");
+		REQUIRE(cJSON_IsArray(scr));
+		CHECK(cJSON_GetArraySize(scr) == 0);
+	}
+
+	auto s = healthy();
+	s->workspace.enabled = true;
+	SET(s->workspace.controller, "ctl");
+	s->workspace.screen_count = 2;
+	s->workspace.screens[0] = {kScreenA, true, true};
+	s->workspace.screens[1] = {kScreenB, false, false};
+
+	json_doc d(*s);
+	REQUIRE(d.root != nullptr);
+	const cJSON *scr = cJSON_GetObjectItem(cJSON_GetObjectItem(d.root, "workspace"), "screens");
+	REQUIRE(cJSON_IsArray(scr));
+	REQUIRE(cJSON_GetArraySize(scr) == 2);
+	const cJSON *a = cJSON_GetArrayItem(scr, 0);
+	CHECK(keys(a) == V{"id", "primary", "woven"});
+	CHECK(cJSON_IsTrue(cJSON_GetObjectItem(a, "primary")));
+	CHECK(cJSON_IsTrue(cJSON_GetObjectItem(a, "woven")));
+	CHECK(cJSON_IsFalse(cJSON_GetObjectItem(cJSON_GetArrayItem(scr, 1), "woven")));
 }
 
 TEST_CASE("status: enums serialise as the documented strings", "[status][json]")
@@ -714,6 +745,10 @@ worst_case()
 	}
 	s->workspace.enabled = true;
 	fill_long(s->workspace.controller, sizeof(s->workspace.controller));
+	s->workspace.screen_count = XRT_STATUS_WORKSPACE_MAX_SCREENS;
+	for (uint32_t w = 0; w < XRT_STATUS_WORKSPACE_MAX_SCREENS; w++) {
+		s->workspace.screens[w] = {~0ull - w, w == 0, false};
+	}
 	return s;
 }
 

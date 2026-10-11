@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | **Extension Name** | `XR_DXR_spatial_workspace` |
-| **Spec Version** | 23 |
+| **Spec Version** | 25 |
 | **Authors** | David Fattal (DisplayXR / Leia Inc.) |
 | **Status** | Provisional — published with the DisplayXR runtime; subject to revision before Khronos registry submission. |
 | **Header** | `src/external/openxr_includes/openxr/XR_DXR_spatial_workspace.h` |
@@ -105,6 +105,67 @@ The runtime ships with **zero default chrome**. If a controller wants chrome (ti
 
 The controller's idle CPU cost goes from ~0.1 % of one core (the polling baseline) to effectively 0 once this handle is wired into its wait set. The reference shell (`displayxr-shell-pvt/src/main.c`) uses it together with the launcher's existing `MsgWaitForMultipleObjects` loop — drain on every wake, sleep otherwise.
 
+### Screens *(spec_version 25, ADR-052)*
+
+The workspace is one layout in desktop space that the runtime presents on every claimed 3D
+screen — one presenter per screen, each composing the windows over it and weaving them with
+that screen's own display processor. The controller learns the screens, places windows on
+any of them, and is told when the set changes; the runtime decides which presenter draws
+what. Nothing below changes behaviour for a controller that does not call it.
+
+- `xrEnumerateWorkspaceScreensDXR(session, capacity, &count, XrWorkspaceScreenDXR *)` —
+  two-call enumerate of every monitor of the desktop, primary first. Per screen:
+  `screenId` (equal to the `XR_DXR_display_info` displayId of the same monitor),
+  `desktopOffset` / `desktopExtent` (OS desktop pixels), `workspaceOffset` (the same origin
+  in workspace pixels, see below), `physicalSizeMeters`, `flags`, the presenter's
+  `currentModeIndex` / `currentViewCount` / `hardware3D`, its `nominalViewerPosition` (its
+  own display space) and the claiming `pluginId`. Flags:
+  - `XR_WORKSPACE_SCREEN_PRIMARY_BIT_DXR` — the system-default 3D screen. Workspace pixels
+    have their origin at its top-left; the pre-v25 pose calls speak its display space.
+  - `XR_WORKSPACE_SCREEN_3D_BIT_DXR` — claimed by a 3D plug-in that can weave it.
+  - `XR_WORKSPACE_SCREEN_PRESENTER_BIT_DXR` — the workspace presents on it. The primary
+    always does; another 3D screen does unless the runtime runs the workspace single-screen
+    (`DXR_SEGMENTS=0` / `DXR_WORKSPACE_SCREENS=single`). A monitor without the 3D bit is
+    listed but never presents (a window part over it is not drawn).
+  - `XR_WORKSPACE_SCREEN_TRACKED_BIT_DXR` — its plug-in reports live eye tracking.
+
+  Calling the function subscribes the controller to SCREENS_CHANGED.
+- `XR_WORKSPACE_INPUT_EVENT_SCREENS_CHANGED_DXR` (= 13) — on the input queue when the set
+  changed (monitor added / removed / moved, a claim changed, a presenter appeared or went
+  away). Payload `screensChanged { generation, screenCount }`; the controller re-enumerates.
+  The runtime does not move windows: a window whose anchor screen disappeared keeps its last
+  position in the primary's space. A mode change is not a screen change (it arrives through
+  `XR_DXR_display_info` as before). Emitted only to a controller that has enumerated.
+- `xrSetWorkspaceClientWindowPlacementDXR(session, clientId, &XrWorkspaceWindowPlacementDXR)`
+  — `{ screenId, pose, widthMeters, heightMeters }`: the pose in `screenId`'s display space
+  (0 = the primary), the size in that screen's metres. The multi-screen form of
+  `xrSetWorkspaceClientWindowPoseDXR`; the first call marks the client placed like a
+  set_pose. The runtime turns the placement into the window's desktop-pixel footprint
+  through the anchor's pixel pitch, and every presenter that footprint overlaps draws the
+  window at the pose the same footprint has in its own display space (its own pixel pitch;
+  z and orientation unchanged). A window may hang off its anchor onto a neighbour; each
+  presenter draws the part over it. An unknown `screenId` is `XR_ERROR_VALIDATION_FAILURE`.
+- `xrGetWorkspaceClientWindowPlacementDXR(session, clientId, &placement)` — the placement in
+  its anchor's space; `screenId` is the anchor, never 0 on output.
+
+**Spaces, in one table.**
+
+| Call / field | Space |
+|---|---|
+| `xrSetWorkspaceClientWindowPlacementDXR`, `xrGetWorkspaceClientWindowPlacementDXR` | the anchor screen's display space |
+| `xrSetWorkspaceClientWindowPoseDXR` (re-anchors on the primary), `xrGetWorkspaceClientWindowPoseDXR`, `WINDOW_POSE_CHANGED` | the primary's display space |
+| every `cursorX` / `cursorY` (POINTER, POINTER_MOTION, SCROLL, FRAME_TICK) | workspace pixels: desktop px minus the primary's `desktopOffset` |
+| FRAME_TICK `viewerPosInDisplaySpace` | the primary's display space |
+| `XrWorkspaceScreenDXR::nominalViewerPosition` | that screen's display space |
+
+**Which client gets which eyes.** A client renders its window from the primary's eyes and
+the primary's display space (its window metrics), and every presenter composes that
+content; this is exact for coplanar, desktop-adjacent screens of equal pixel pitch. Per-part
+views for a client that opts into per-segment views (ADR-052 D2) follow the per-screen
+presenters. **What stays on the primary:** overlays
+(`xrSetWorkspaceOverlayDXR`), frame capture, fullscreen, and the FRAME_TICK viewer. The
+rendering mode and the lens are one per service: every presenter flips together.
+
 ### Per-client visual style *(spec_version 9)*
 
 The runtime is the compositor — it samples each client's swapchain texture and applies the alpha mask, rounded corners, edge feathering, and focus glow that determine how the window's content appears on the panel. The controller cannot access the client texture, so anything affecting how content composites (corners, edges, focus indication) must live behind a runtime API. Rather than enumerate ad-hoc fields per visual treatment, the runtime exposes a single per-client "style" struct the controller pushes; new visual treatments arrive as additive style fields over time without rewriting the composite pipeline.
@@ -144,6 +205,8 @@ Implementation note: today the focus glow renders as an oversized pre-pass behin
 
 **Spec_version 22–23 finish moving input + cursor policy to the controller.** v22 (issue #370) deletes the runtime raycast + `xrWorkspaceHitTestDXR` and the drag / resize / rotation state machines; the controller hit-tests itself and pushes only cursor depth via `xrSetWorkspaceCursorDepthDXR`. v23 (issue #376) adds `dimFactor` to that struct — the controller owns the over-window cursor body alpha (was a hardcoded `0.30`) — and retires the last runtime key intercepts: DELETE (close, via `xrRequestWorkspaceClientExitDXR`) and Ctrl+O (browse + launch) are now controller policy driven off the KEY event stream, joining TAB / F11 / `[` / `]` (#305–#307). The runtime keeps the close / launch / cursor *mechanisms*; the controller decides when and how they fire.
 
+**Spec_version 24–25.** v24 lets the controller declare the key chords it reserves (`xrSetWorkspaceReservedKeysDXR`). v25 (ADR-052) makes the workspace multi-screen: screen enumeration, SCREENS_CHANGED, placement in any screen's display space, and the name *workspace pixels* for the space cursor coordinates were always in. Every addition is opt-in: a v24 controller sends no new call, receives no new event type, and on a one-screen box nothing changes at all.
+
 **Architectural endpoint.** Per the architectural North Star (`feedback_controllers_own_motion`), the runtime owns mechanism, the controller owns policy + appearance. After spec_version 23, this principle holds for chrome, for the wakeup pattern, for the parameterized composite knobs, and for all input / window / cursor policy: the runtime owns the cross-process texture-share mechanism, the depth-pipeline composite, the cursor-sprite composite, the auto-anchor math, the wakeup-event source-of-truth, and the alpha-mask shader; the controller owns every pixel of chrome appearance, every region's hit-region geometry (it runs its own hit-test), every animation curve, the wait primitive that drives its idle behavior, the per-client style values that drive the runtime's compositor knobs, AND every keyboard / window-behavior decision (close, launch, focus-cycle, maximize, depth-step, cursor depth + dim).
 
 ---
@@ -155,6 +218,7 @@ The extension is implemented in this repository:
 - **Header**: `src/external/openxr_includes/openxr/XR_DXR_spatial_workspace.h` (frozen for the runtime ABI, auto-published to `DisplayXR/displayxr-extensions` on each push to main).
 - **State tracker**: `src/xrt/state_trackers/oxr/oxr_workspace.c` (dispatch wrappers); `src/xrt/state_trackers/oxr/oxr_api_negotiate.c` (PFN entries).
 - **IPC**: `src/xrt/ipc/shared/proto.json` (RPC definitions); `src/xrt/ipc/shared/ipc_protocol.h` (event wire format); `src/xrt/ipc/client/ipc_client_compositor.c` (bridge); `src/xrt/ipc/server/ipc_server_handler.c` (server handlers).
+- **Workspace screens (spec_version 25)**: `src/xrt/compositor/util/comp_workspace_screens.{h,c}` (the screen set, the anchor-screen placement mapping, the window → presenter split, workspace pixels — unit-tested in `tests/tests_comp_workspace_screens.cpp`); wire round trip in `tests/tests_workspace_screens_ipc.cpp`.
 - **Service compositor (Windows D3D11)**: `src/xrt/compositor/d3d11_service/comp_d3d11_service.cpp` (drain, hit-test enrichment, FRAME_TICK + FOCUS_CHANGED + POINTER_HOVER emission, controller-chrome composite, chrome quad raycast, chromeRegionId resolution, request_*_by_slot helpers); `src/xrt/compositor/d3d11/comp_d3d11_window.cpp` (WndProc, public ring, Win32 SetCapture / ReleaseCapture).
 - **Reference controller (chrome appearance)**: `displayxr-shell-pvt/src/shell_chrome.cpp` — owns the rounded-pill SDF shader, grip dots + close/min/max button geometry, hover-fade ease-out cubic, per-state re-render. Reads cursor-over-chrome via POINTER_HOVER events; dispatches close → exit RPC, max → fullscreen RPC.
 - **Reference controller (lifecycle)**: `displayxr-shell-pvt/src/main.c` (animation framework, smooth preset transitions, interactive carousel state machine, variable poll cadence, chrome lifecycle wiring).

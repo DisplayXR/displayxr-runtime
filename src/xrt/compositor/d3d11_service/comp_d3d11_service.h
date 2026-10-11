@@ -276,6 +276,70 @@ comp_d3d11_service_get_client_app_window_metrics(struct xrt_system_compositor *x
 struct xrt_screen_list;
 struct xrt_segment_metrics;
 struct xrt_segment_view_routing;
+struct ipc_workspace_screen_list;
+struct ipc_workspace_window_placement;
+struct xrt_status_workspace;
+
+/*!
+ * The workspace on N screens (ADR-052): rebuild the workspace's screen set from
+ * the service's screen registry. Called by the IPC server on workspace
+ * activation (@p activation true: the new controller starts un-opted-in to
+ * SCREENS_CHANGED), on every display re-probe and before every enumeration.
+ * The set's generation moves only when it really changed; a change wakes an
+ * opted-in controller.
+ *
+ * @ingroup comp_d3d11_service
+ */
+void
+comp_d3d11_service_workspace_update_screens(struct xrt_system_compositor *xsysc,
+                                            const struct xrt_screen_list *list,
+                                            bool activation);
+
+/*!
+ * The workspace's screens in `workspace_enumerate_screens` form (presenter
+ * modes filled live). @p opt_in marks the controller as having seen this
+ * generation and subscribes it to SCREENS_CHANGED.
+ *
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_workspace_get_screens(struct xrt_system_compositor *xsysc,
+                                         bool opt_in,
+                                         struct ipc_workspace_screen_list *out);
+
+/*!
+ * xrSetWorkspaceClientWindowPlacementDXR: place a window in any workspace
+ * screen's display space. Addressed by compositor (@p xc) or, when @p xc is
+ * NULL, by slot (the 1000+slot form). Returns XRT_ERROR_INPUT_UNSUPPORTED for
+ * a screen id that is not a workspace screen.
+ *
+ * @ingroup comp_d3d11_service
+ */
+xrt_result_t
+comp_d3d11_service_workspace_set_window_placement(struct xrt_system_compositor *xsysc,
+                                                  struct xrt_compositor *xc,
+                                                  int slot_index,
+                                                  const struct ipc_workspace_window_placement *placement);
+
+/*!
+ * xrGetWorkspaceClientWindowPlacementDXR: the placement in its anchor
+ * screen's space (screen_id = the anchor, never 0 while the set is known).
+ *
+ * @ingroup comp_d3d11_service
+ */
+xrt_result_t
+comp_d3d11_service_workspace_get_window_placement(struct xrt_system_compositor *xsysc,
+                                                  struct xrt_compositor *xc,
+                                                  int slot_index,
+                                                  struct ipc_workspace_window_placement *out);
+
+/*!
+ * Display status (ADR-051): fill the presenter screens of the workspace block.
+ *
+ * @ingroup comp_d3d11_service
+ */
+void
+comp_d3d11_service_workspace_get_status(struct xrt_system_compositor *xsysc, struct xrt_status_workspace *ws);
 
 /*!
  * Multi-screen M6 over IPC (ADR-047 Amendment 3): enable per-screen weaving of

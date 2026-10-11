@@ -35,7 +35,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_spatial_workspace 1
-#define XR_DXR_spatial_workspace_SPEC_VERSION 24
+#define XR_DXR_spatial_workspace_SPEC_VERSION 25
 #define XR_DXR_SPATIAL_WORKSPACE_EXTENSION_NAME "XR_DXR_spatial_workspace"
 
 // Provisional XrStructureType values. The 1004999100..110 range is reserved for
@@ -52,6 +52,8 @@ extern "C" {
 #define XR_TYPE_WORKSPACE_OVERLAY_SWAPCHAIN_CREATE_INFO_DXR ((XrStructureType)1004999108)  // spec_version 17
 #define XR_TYPE_WORKSPACE_OVERLAY_INFO_DXR                  ((XrStructureType)1004999109)  // spec_version 17
 #define XR_TYPE_WORKSPACE_CURSOR_DEPTH_DXR                  ((XrStructureType)1004999110)  // spec_version 22
+#define XR_TYPE_WORKSPACE_SCREEN_DXR                        ((XrStructureType)1004999111)  // spec_version 25
+#define XR_TYPE_WORKSPACE_WINDOW_PLACEMENT_DXR              ((XrStructureType)1004999112)  // spec_version 25
 
 /*!
  * @brief Workspace-local identifier for a client.
@@ -375,6 +377,7 @@ typedef enum XrWorkspaceInputEventTypeDXR {
     XR_WORKSPACE_INPUT_EVENT_FILE_PICKER_REQUEST_DXR = 10, // spec_version 11: a workspace client called xrRequestFilePickerDXR — fetch full info via xrGetFilePickerRequestDXR, deliver result via xrCompleteFilePickerDXR
     XR_WORKSPACE_INPUT_EVENT_FULLSCREEN_TOGGLED_DXR  = 11, // spec_version 15: a workspace client's fullscreen/maximize state transitioned (runtime-driven, e.g. double-click title bar or F11)
     XR_WORKSPACE_INPUT_EVENT_CLIENT_CONNECTED_DXR    = 12, // spec_version 16: a client connected (slot bound). The controller owns ALL per-client setup — initial pose (xrSetWorkspaceClientWindowPoseDXR), and over time chrome / style / focus / entry animation. The runtime does not draw the client until the controller has placed it (set_pose), so there is no flash regardless of controller latency.
+    XR_WORKSPACE_INPUT_EVENT_SCREENS_CHANGED_DXR     = 13, // spec_version 25: the workspace screen set changed (monitor added / removed / moved, a claim changed, a presenter appeared or went away). Re-enumerate with xrEnumerateWorkspaceScreensDXR. Emitted only to a controller that has called xrEnumerateWorkspaceScreensDXR at least once.
     XR_WORKSPACE_INPUT_EVENT_TYPE_MAX_ENUM_DXR  = 0x7FFFFFFF
 } XrWorkspaceInputEventTypeDXR;
 
@@ -406,6 +409,17 @@ typedef enum XrWorkspaceInputEventTypeDXR {
  * Focus-changed events (spec_version 6) fire when the runtime's focused client
  * transitions (TAB cycle, click auto-focus, controller-set, client disconnect).
  * They do NOT fire on every frame when focus is stable.
+ *
+ * Cursor coordinates (spec_version 25 names the space they were always in):
+ * every cursorX / cursorY on this queue is in WORKSPACE PIXELS — OS desktop
+ * pixels relative to the top-left of the primary workspace screen (the one
+ * flagged XR_WORKSPACE_SCREEN_PRIMARY_BIT_DXR). With one presenter that is the
+ * workspace window's client area, exactly as before. With several presenters a
+ * cursor over another screen has coordinates outside the primary's rect
+ * (negative to its left or above it); XrWorkspaceScreenDXR::workspaceOffset
+ * gives every screen's origin in the same space, so the controller finds the
+ * screen under the cursor without another call. FRAME_TICK's viewer position
+ * stays the PRIMARY screen's viewer in the primary's display space.
  */
 typedef struct XrWorkspaceInputEventDXR {
     XrWorkspaceInputEventTypeDXR eventType;
@@ -521,6 +535,15 @@ typedef struct XrWorkspaceInputEventDXR {
             // already bound when the event fires).
             XrWorkspaceClientId     clientId;
         } clientConnected;
+        struct {  // spec_version 25: the workspace screen set changed
+            // (ADR-052). The payload only says that it changed; the
+            // controller re-reads the set with xrEnumerateWorkspaceScreensDXR.
+            // Windows are NOT moved by the runtime: a window whose anchor
+            // screen disappeared keeps its last position in the primary
+            // screen's space, and the controller re-places it as it sees fit.
+            uint32_t                generation;
+            uint32_t                screenCount;
+        } screensChanged;
     };
 } XrWorkspaceInputEventDXR;
 
@@ -1311,6 +1334,141 @@ typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceClientStyleDXR)(
     XrWorkspaceClientId                    clientId,
     const XrWorkspaceClientStyleDXR       *style);
 
+// ---- Screens (spec_version 25, ADR-052) ----
+
+/*!
+ * @brief Workspace screen flag bits (XrWorkspaceScreenDXR::flags).
+ */
+typedef XrFlags64 XrWorkspaceScreenFlagsDXR;
+
+//! The primary workspace screen: the system-default 3D screen. Workspace
+//! pixels (every cursor coordinate) have their origin at its top-left, and the
+//! pre-spec_version-25 window-pose calls speak its display space.
+static const XrWorkspaceScreenFlagsDXR XR_WORKSPACE_SCREEN_PRIMARY_BIT_DXR = 0x00000001;
+//! Claimed by a 3D display plug-in that can weave it.
+static const XrWorkspaceScreenFlagsDXR XR_WORKSPACE_SCREEN_3D_BIT_DXR = 0x00000002;
+//! The workspace presents on this screen: windows placed over it are composed
+//! and woven by this screen's own display processor (ADR-052 D1). The primary
+//! always presents; another 3D screen presents unless the runtime runs the
+//! workspace single-screen. A monitor without the 3D bit is listed (so the
+//! controller sees the whole desktop) but never presents.
+static const XrWorkspaceScreenFlagsDXR XR_WORKSPACE_SCREEN_PRESENTER_BIT_DXR = 0x00000004;
+//! The screen's plug-in reports live eye tracking for it.
+static const XrWorkspaceScreenFlagsDXR XR_WORKSPACE_SCREEN_TRACKED_BIT_DXR = 0x00000008;
+
+#define XR_MAX_WORKSPACE_SCREEN_PLUGIN_ID_SIZE_DXR 64
+
+/*!
+ * @brief One screen of the workspace (spec_version 25).
+ *
+ * Product-neutral: the runtime reports what each screen is and whether the
+ * workspace presents on it; the controller decides what goes where.
+ */
+typedef struct XrWorkspaceScreenDXR {
+    XrStructureType            type;                 // XR_TYPE_WORKSPACE_SCREEN_DXR
+    void* XR_MAY_ALIAS         next;
+    //! Screen id. Equal to the XR_DXR_display_info displayId of the same
+    //! monitor (xrEnumerateDisplaysDXR), so the two lists join on it. Never 0.
+    uint64_t                   screenId;
+    //! The screen's rect in OS desktop pixels.
+    XrOffset2Di                desktopOffset;
+    XrExtent2Di                desktopExtent;
+    //! The same rect's origin in workspace pixels (desktopOffset minus the
+    //! primary's desktopOffset): the space cursor coordinates are reported in.
+    XrOffset2Di                workspaceOffset;
+    //! Physical size of the visible area, metres. When the monitor reports
+    //! none the runtime derives it from the primary's pixel pitch.
+    XrExtent2Df                physicalSizeMeters;
+    XrWorkspaceScreenFlagsDXR  flags;
+    //! The presenter's current rendering-mode index and its view count
+    //! (presenters only; 0 / 0 otherwise). Mode changes do NOT raise
+    //! SCREENS_CHANGED; they arrive through XR_DXR_display_info as before.
+    uint32_t                   currentModeIndex;
+    uint32_t                   currentViewCount;
+    //! XR_TRUE when the presenter's panel is in hardware 3D.
+    XrBool32                   hardware3D;
+    //! The screen's nominal viewer relative to its centre, metres (its own
+    //! display space). A controller hit-testing a cursor on a screen other
+    //! than the primary uses this until per-screen live viewers are exposed.
+    XrVector3f                 nominalViewerPosition;
+    //! Discovery id of the plug-in that claimed the screen ("" = none).
+    char                       pluginId[XR_MAX_WORKSPACE_SCREEN_PLUGIN_ID_SIZE_DXR];
+} XrWorkspaceScreenDXR;
+
+/*!
+ * @brief Enumerate the workspace's screens (two-call idiom, spec_version 25).
+ *
+ * Every monitor of the desktop is listed, primary first. The list is a
+ * snapshot; XR_WORKSPACE_INPUT_EVENT_SCREENS_CHANGED_DXR announces a new one.
+ * Calling this also opts the controller into that event.
+ *
+ * @return XR_SUCCESS, XR_ERROR_SIZE_INSUFFICIENT,
+ *         XR_ERROR_FEATURE_UNSUPPORTED if the session is not the active
+ *         workspace, XR_ERROR_VALIDATION_FAILURE on a bad struct type.
+ */
+typedef XrResult (XRAPI_PTR *PFN_xrEnumerateWorkspaceScreensDXR)(
+    XrSession              session,
+    uint32_t               capacityInput,
+    uint32_t              *countOutput,
+    XrWorkspaceScreenDXR  *screens);
+
+/*!
+ * @brief A window placement in one screen's display space (spec_version 25).
+ *
+ * The pose is in the display space of @ref screenId (origin at that screen's
+ * centre, +x right, +y up, +z toward the viewer, metres) and the size is in
+ * that screen's metres. screenId 0 means the primary.
+ *
+ * The workspace is one desktop-space layout (ADR-052 D2): the runtime turns the
+ * placement into the window's desktop-pixel footprint through the anchor
+ * screen's pixel pitch, and every presenter the footprint overlaps draws the
+ * window, at the pose the same footprint has in ITS display space, woven by
+ * its own display processor. A window may hang off its anchor screen onto a
+ * neighbour; the part over each presenter is drawn by that presenter. Depth
+ * (z) and orientation are not changed by the mapping.
+ */
+typedef struct XrWorkspaceWindowPlacementDXR {
+    XrStructureType       type;            // XR_TYPE_WORKSPACE_WINDOW_PLACEMENT_DXR
+    void* XR_MAY_ALIAS    next;
+    uint64_t              screenId;        // 0 = the primary
+    XrPosef               pose;            // in screenId's display space
+    float                 widthMeters;     // in screenId's metres
+    float                 heightMeters;
+} XrWorkspaceWindowPlacementDXR;
+
+/*!
+ * @brief Place a client's window on any workspace screen (spec_version 25).
+ *
+ * The multi-screen form of xrSetWorkspaceClientWindowPoseDXR, and like it the
+ * first call marks the client placed (the runtime composites it from then on).
+ * The anchor screen sticks to the client: xrGetWorkspaceClientWindowPlacementDXR
+ * reads the placement back in the same screen's space, while
+ * xrGetWorkspaceClientWindowPoseDXR and WINDOW_POSE_CHANGED events keep
+ * speaking the PRIMARY screen's space (the pre-v25 contract). A later
+ * xrSetWorkspaceClientWindowPoseDXR re-anchors the client on the primary.
+ * Placing on the primary is identical to xrSetWorkspaceClientWindowPoseDXR.
+ *
+ * @return XR_SUCCESS, XR_ERROR_VALIDATION_FAILURE (unknown clientId or
+ *         screenId, non-positive size, bad struct type),
+ *         XR_ERROR_FEATURE_UNSUPPORTED if the session is not the active
+ *         workspace.
+ */
+typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceClientWindowPlacementDXR)(
+    XrSession                              session,
+    XrWorkspaceClientId                    clientId,
+    const XrWorkspaceWindowPlacementDXR   *placement);
+
+/*!
+ * @brief Read a client's placement back in its anchor screen's space
+ * (spec_version 25). screenId is the anchor (never 0 on output); a client
+ * placed only through xrSetWorkspaceClientWindowPoseDXR is anchored on the
+ * primary.
+ */
+typedef XrResult (XRAPI_PTR *PFN_xrGetWorkspaceClientWindowPlacementDXR)(
+    XrSession                         session,
+    XrWorkspaceClientId               clientId,
+    XrWorkspaceWindowPlacementDXR    *placement);
+
 #ifndef XR_NO_PROTOTYPES
 XRAPI_ATTR XrResult XRAPI_CALL xrActivateSpatialWorkspaceDXR(
     XrSession session);
@@ -1450,6 +1608,22 @@ XRAPI_ATTR XrResult XRAPI_CALL xrSetWorkspaceClientStyleDXR(
 XRAPI_ATTR XrResult XRAPI_CALL xrSetWorkspaceInputGrabDXR(
     XrSession session,
     XrBool32  grab);
+
+XRAPI_ATTR XrResult XRAPI_CALL xrEnumerateWorkspaceScreensDXR(
+    XrSession              session,
+    uint32_t               capacityInput,
+    uint32_t              *countOutput,
+    XrWorkspaceScreenDXR  *screens);
+
+XRAPI_ATTR XrResult XRAPI_CALL xrSetWorkspaceClientWindowPlacementDXR(
+    XrSession                              session,
+    XrWorkspaceClientId                    clientId,
+    const XrWorkspaceWindowPlacementDXR   *placement);
+
+XRAPI_ATTR XrResult XRAPI_CALL xrGetWorkspaceClientWindowPlacementDXR(
+    XrSession                         session,
+    XrWorkspaceClientId               clientId,
+    XrWorkspaceWindowPlacementDXR    *placement);
 #endif
 
 #ifdef __cplusplus
