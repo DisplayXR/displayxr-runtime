@@ -90,6 +90,18 @@ surface_input_sink(void *userdata, const struct comp_window_linux_input *in)
 		ev.u.scroll.cursor_y = py;
 		ev.u.scroll.modifiers = in->modifiers;
 		break;
+	case COMP_WINDOW_LINUX_INPUT_POINTER_LEAVE:
+		// The pointer is on another output / window: no cursor sprite, and one
+		// off-surface POINTER_MOTION so the controller's hit-test misses and its
+		// hover clears (Windows reports an off-panel cursor the same way, as
+		// out-of-range coordinates). Controller only — content apps keep the
+		// last position they saw, as with any pointer that stops moving.
+		comp_multi_workspace_set_pointer_px(COMP_MULTI_POINTER_OUTSIDE, COMP_MULTI_POINTER_OUTSIDE);
+		ev.event_type = IPC_WORKSPACE_INPUT_EVENT_POINTER_MOTION;
+		ev.u.pointer_motion.cursor_x = COMP_MULTI_POINTER_OUTSIDE;
+		ev.u.pointer_motion.cursor_y = COMP_MULTI_POINTER_OUTSIDE;
+		ipc_server_input_queue_push(IPC_INPUT_TARGET_CONTROLLER, &ev);
+		return;
 	case COMP_WINDOW_LINUX_INPUT_FOCUS_LOST:
 		// No wire event: a client sees its keys stop. A key held across the
 		// loss gets no release; the controller re-syncs on its next press.
