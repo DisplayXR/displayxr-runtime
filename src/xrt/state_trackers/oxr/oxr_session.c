@@ -4286,6 +4286,9 @@ locate_views_one(struct oxr_logger *log,
 			    (et_head->rendering_modes[ami].mode_flags & XRT_RENDERING_MODE_FLAG_HAS_TRACKING) != 0;
 		}
 		bool is_tracking = mode_has_tracking && got_eye_positions && eye_pos.valid && eye_pos.is_tracking;
+		// The answer came over IPC: the service already ORed this client's
+		// other presenting DPs into it, with its own hand-over debounce.
+		bool from_ipc = false;
 
 		// IPC sessions (#441 Phase 2): the in-process eye-position getters
 		// all miss (sess->xcn is an IPC proxy), so fetch the DP tracking
@@ -4315,6 +4318,35 @@ locate_views_one(struct oxr_logger *log,
 			}
 			if (got) {
 				is_tracking = ipc_eyes.is_tracking;
+				from_ipc = true;
+			}
+		}
+
+		// ADR-047 Amendment 7: the session is tracked when ANY DP presenting
+		// for it reports a viewer — its own (above) or another segment's
+		// (oxr_session_locate_views counted them) — falling only after a
+		// hand-over hold when more than one DP presents. A window on one
+		// screen has no other DP: the pass-through, byte for byte. Advanced
+		// only by the locate that owns the session-level side effects.
+		if (seg == NULL || seg->side_effects) {
+			if (!mode_has_tracking) {
+				u_tracking_any_reset(&sess->tracking_any);
+				is_tracking = false;
+			} else {
+				const bool own = is_tracking;
+				const uint32_t others = from_ipc ? 0 : sess->locate_others_count;
+				is_tracking =
+				    u_tracking_any_update(&sess->tracking_any, os_monotonic_get_ns(), own,
+				                          sess->locate_others_tracked, others, U_TRACKING_ANY_HOLD_NS);
+				const bool via_other = is_tracking && !own;
+				if (via_other != sess->tracking_via_other) {
+					sess->tracking_via_other = via_other;
+					U_LOG_W("session tracking: %s (ADR-047 Amendment 7; %u other presenting DP(s))",
+					        via_other ? "tracked through another screen's display processor — the "
+					                    "session's own screen sees no viewer"
+					                  : "back to the session's own screen's display processor",
+					        others);
+				}
 			}
 		}
 
@@ -4442,6 +4474,31 @@ locate_can_split(struct oxr_session *sess, const XrViewLocateInfo *info)
 	return true;
 }
 
+/*!
+ * ADR-047 Amendment 7: note, for the side-effects locate, whether any segment
+ * other than the one it takes its eyes from has a DP reporting a viewer.
+ * @p own is that segment's index, or -1 for "the primary segment" (a locate
+ * without an override uses the session's own DP, which serves the primary).
+ * A segment counts when its DP answered (`have_eyes`); a flat-2D segment has
+ * no DP and does not.
+ */
+static void
+locate_note_others_tracking(struct oxr_session *sess, const struct xrt_segment_metrics *m, int32_t own)
+{
+	sess->locate_others_tracked = false;
+	sess->locate_others_count = 0;
+	for (uint32_t k = 0; k < m->count && k < XRT_MAX_SEGMENTS; k++) {
+		const struct xrt_segment_metric *s = &m->seg[k];
+		if ((own >= 0 && (int32_t)k == own) || (own < 0 && s->is_primary) || !s->have_eyes) {
+			continue;
+		}
+		sess->locate_others_count++;
+		if (u_tracking_dp_viewer_present(&s->eyes)) {
+			sess->locate_others_tracked = true;
+		}
+	}
+}
+
 //! Segment @p i of @p m as a locate override (see struct oxr_locate_segment).
 static void
 locate_segment_override(const struct xrt_segment_metrics *m,
@@ -4545,6 +4602,9 @@ oxr_session_locate_views(struct oxr_logger *log,
 {
 	struct xrt_segment_metrics m;
 	struct xrt_device *xdev = GET_XDEV_BY_ROLE(sess->sys, head);
+	// ADR-047 Amendment 7: no other presenting DP unless the table says so.
+	sess->locate_others_tracked = false;
+	sess->locate_others_count = 0;
 	if (xdev == NULL || xdev->hmd == NULL || !locate_get_segment_metrics(sess, &m)) {
 		// The window is on one screen (or nothing segments it): the
 		// single-screen path, byte for byte.
@@ -4560,6 +4620,10 @@ oxr_session_locate_views(struct oxr_logger *log,
 	}
 
 	const uint32_t mj = oxr_segment_views_majority(&m);
+	// Every locate below that takes the session's own DP (no override) uses
+	// the primary segment's eyes; every override locate publishing the side
+	// effects uses the majority's. Count the OTHER segments' DPs for each.
+	locate_note_others_tracking(sess, &m, -1);
 	bool is_multiview = false;
 #ifdef OXR_HAVE_DXR_display_info
 	is_multiview = sess->view_config_type == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR;
@@ -4587,6 +4651,9 @@ oxr_session_locate_views(struct oxr_logger *log,
 			o.have_eyes = oxr_segment_views_segment_eyes(s, 0.0f, 0.0f, 2, &o.eyes);
 			o.screen_id = s->screen_id;
 			o.side_effects = true;
+			if (o.wm.valid) {
+				locate_note_others_tracking(sess, &m, (int32_t)mj);
+			}
 			struct oxr_locate_segment_out so = {.measurable = true};
 			o.out = &so;
 			ret = locate_views_one(log, sess, viewLocateInfo, viewState, viewCapacityInput, viewCountOutput,
@@ -4688,6 +4755,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 	// Majority last: its locate is the one that writes the app's chained
 	// outputs (raw block, depth budget, tracking state) and the session-level
 	// side effects; the others locate into a bare XrViewState.
+	locate_note_others_tracking(sess, &m, (int32_t)mj);
 	XrViewStateFlags flags = 0;
 	bool first_flags = true;
 	struct oxr_locate_segment_out seg_out = {.measurable = true};

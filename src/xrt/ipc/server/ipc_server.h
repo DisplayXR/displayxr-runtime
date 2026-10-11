@@ -19,6 +19,7 @@
 #include "os/os_threading.h"
 
 #include "util/u_logging.h"
+#include "util/u_tracking_any.h"
 
 #include "shared/ipc_protocol.h"
 #include "shared/ipc_message_channel.h"
@@ -235,6 +236,17 @@ struct ipc_client_state
 	 * connections. Every stream it owns is destroyed at client teardown.
 	 */
 	uint64_t stereo_camera_owner;
+
+	/*!
+	 * ADR-047 Amendment 7: this connection's session-level tracking state —
+	 * the OR over every DP presenting for it, debounced on a screen
+	 * hand-over (util/u_tracking_any.h). One for the eye query its
+	 * xrLocateViews makes, one for the XR_DXR_weave submit's eyesTracking.
+	 * Touched only by this client's own IPC thread; zeroed with the rest of
+	 * the state at connect.
+	 */
+	struct u_tracking_any tracking_any_locate;
+	struct u_tracking_any tracking_any_weave;
 };
 
 enum ipc_thread_state

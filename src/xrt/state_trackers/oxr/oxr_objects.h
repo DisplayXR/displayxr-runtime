@@ -31,6 +31,7 @@
 #include "util/u_hashmap.h"
 #include "util/u_device.h"
 #include "util/u_cursor_depth.h"
+#include "util/u_tracking_any.h"
 
 #include "oxr_extension_support.h"
 #include "oxr_subaction.h"
@@ -3266,6 +3267,21 @@ struct oxr_session
 	//! Edge detection in the xrLocateViews path pushes
 	//! XrEventDataEyeTrackingStateChangedDXR on change.
 	int32_t last_is_tracking;
+
+	//! ADR-047 Amendment 7: the session-level isTracking is the OR over every
+	//! DP presenting for the session (own + other segments), debounced on a
+	//! screen hand-over (util/u_tracking_any.h). Advanced only by the locate
+	//! that publishes the session-level side effects.
+	struct u_tracking_any tracking_any;
+	//! Set by oxr_session_locate_views around the locates it makes: whether
+	//! any segment OTHER than the one whose eyes the side-effects locate uses
+	//! has a DP reporting a viewer, and how many such DPs answered (0 = the
+	//! window is on one screen: the single-screen rule, unchanged).
+	bool locate_others_tracked;
+	uint32_t locate_others_count;
+	//! Change-only log latch: the session reads tracked only through another
+	//! screen's DP (the rig's proof that Amendment 7 is live).
+	bool tracking_via_other;
 
 	//! Cached rendering mode index for detecting compositor-driven mode changes.
 	uint32_t last_rendering_mode_index;

@@ -393,6 +393,32 @@ comp_d3d11_service_get_client_segment_metrics(struct xrt_system_compositor *xsys
                                               struct xrt_segment_metrics *out);
 
 /*!
+ * ADR-047 Amendment 7: do the display processors presenting for @p xc on
+ * screens OTHER than its own (primary) one see a viewer?
+ *
+ * Counted: the direct pipeline's live segment DPs (table fresh within the
+ * publish window), the present-owner weave's segment DPs (eyes as its last
+ * submit predicted them), and the secondary workspace presenters a placed
+ * tile's footprint touches. Each screen counts once. With @p xc NULL (a
+ * compositor-less session, the system status) every one of those across the
+ * service, plus every secondary workspace presenter.
+ *
+ * Eyes are never changed by this; the caller ORs the boolean into its own
+ * (util/u_tracking_any.h). Takes clients_mutex, per-client seg_mutex and
+ * ws_presenters_lock, never render_mutex.
+ *
+ * @param[out] out_count          Other screens whose DP answered (0 = none presents).
+ * @param[out] out_tracked_screen First such screen that sees a viewer (0 = none); may be NULL.
+ * @return true when any of them sees a viewer.
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_get_other_screens_tracking(struct xrt_system_compositor *xsysc,
+                                              struct xrt_compositor *xc,
+                                              uint32_t *out_count,
+                                              uint64_t *out_tracked_screen);
+
+/*!
  * ADR-052 D2 — the screen a workspace tile's ONE view set is framed from, when
  * that is not the primary: the window wholly on a secondary presenter, or
  * (straddling, for a locate that keeps one view set) mostly on one. Fills the

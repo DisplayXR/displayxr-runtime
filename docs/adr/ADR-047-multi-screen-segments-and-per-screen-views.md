@@ -248,3 +248,42 @@ manager weaves, and `oxr_system` counts a registry Vulkan factory toward the vie
 Windows alongside D3D11 / D3D12. Both arms crop each segment where its views were painted (#1883):
 the Vulkan manager from the renderer atlas's partition, the split from the woven egress slot's own,
 recorded per bridge sequence. Detail: `docs/architecture/comp-segments.md` § *Windows / Vulkan*.
+
+## Amendment 7 (2026-10-10): the session is tracked when any of its screens is
+
+Decision 2 gave every segment its own DP and tracker, and the per-segment views already come
+from each screen's eyes (a window on the second panel switched from nominal to tracked eyes when
+the viewer sat in front of it). But every session-level tracking signal still came from the
+primary screen's DP alone: `XrViewEyeTrackingStateDXR.isTracking` and its change event (what a
+MANUAL app drops to 2D on), the `XR_DXR_weave` output's `eyesTracking`, the service's display
+status, the workspace controller's FRAME_TICK viewer. On the two-panel rig: "it feels like only
+the primary camera wakes the tracker" (David, 2026-10-10). Decisions:
+
+- **The session's tracking boolean is the OR over the DPs that currently present for it**: its
+  own DP, plus every live segment DP (in-process D3D11/D3D12/GL/VK through the segment table
+  `xrLocateViews` already reads; the service's direct pipeline, table fresh within its publish
+  window), every secondary workspace presenter the tile's footprint touches (ADR-052), and every
+  per-screen segment DP of a present-owner's weave (Amendment 4). Each screen counts once. Only
+  the boolean changes: eyes, views and per-view raw blocks stay per screen.
+- **Debounce on the combined signal, not a new one per DP** (`util/u_tracking_any.h`). Rises at
+  once; with one DP presenting it falls at once (the pre-amendment pass-through, byte for byte,
+  so a single-screen box and MANUAL's immediacy are unchanged); with several it falls only after
+  the OR has been false for 0.5 s, so a viewer handed from one screen's tracker to the other's
+  never flaps the session. The state tracker advances it on the locate that owns the session's
+  side effects; the service advances one per client connection for the eye query and one for the
+  weave submit. An IPC client passes the service's combined answer through (no second debounce).
+  The system display status ORs undebounced (a read, not a decision).
+- **FRAME_TICK viewer**: when the primary's DP sees nobody and a secondary presenter's DP sees a
+  viewer, the controller gets that presenter's viewer mapped into the primary's display space by
+  `comp_ws_map_pose` (desktop pixels at each screen's pitch, z unchanged). That mapping is the
+  workspace's own one-layout model (ADR-052 D2): exact for coplanar screens, an approximation for
+  angled ones, where it is still the best single frame the controller has.
+- **Hook for per-display presence.** "Is a viewer present at this screen" is decided in one
+  function, `u_tracking_dp_viewer_present()`, today the DP's eye validity. LeiaSR is landing a
+  per-display user-presence event (`SR_EVENT_TYPE_DISPLAY_USER_PRESENCE`, display id +
+  present/absent, capability-gated); when it ships, an append-only optional DP slot (ADR-020)
+  carries it and that function prefers it when the DP answers. No SR SDK dependency now.
+
+Not changed: the vendor's MANAGED auto 2D/3D stays per panel (each DP drives its own lens from
+its own tracker); the in-process HUD shows the session DP's own eyes. Spec:
+`docs/specs/vendor/eye-tracking-modes.md` § *Multi-screen*.
