@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | **Extension Name** | `XR_DXR_spatial_workspace` |
-| **Spec Version** | 25 |
+| **Spec Version** | 26 |
 | **Authors** | David Fattal (DisplayXR / Leia Inc.) |
 | **Status** | Provisional — published with the DisplayXR runtime; subject to revision before Khronos registry submission. |
 | **Header** | `src/external/openxr_includes/openxr/XR_DXR_spatial_workspace.h` |
@@ -169,9 +169,32 @@ geometry of the screen it is on (ADR-052 Amendment 1):
 - **Straddling, any other client.** One view set is framed from the screen holding most of
   the window. A tilted straddler is always framed this way.
 
-Nothing changes for the controller. **What stays on the primary:** overlays
-(`xrSetWorkspaceOverlayDXR`), frame capture, fullscreen, and the FRAME_TICK viewer. The
-rendering mode and the lens are one per service: every presenter flips together.
+Nothing changes for the controller. **What stays on the primary:** frame capture,
+fullscreen, and the FRAME_TICK viewer — and an overlay that is not tagged with a screen (see
+below). The rendering mode and the lens are one per service: every presenter flips together.
+
+### Overlays per screen *(spec_version 26, ADR-052 Amendment 2)*
+
+- `XrWorkspaceOverlayScreenDXR { screenId }` (`XR_TYPE_WORKSPACE_OVERLAY_SCREEN_DXR`),
+  chained on `XrWorkspaceOverlayInfoDXR::next` in `xrSetWorkspaceOverlayDXR`, puts that
+  `overlayId` on one screen: only that screen's presenter composes it, and in that screen's
+  own space — `anchor` is normalized to **that** screen (`[0,1]`, origin its top-left) and
+  `sizeMeters` are its metres. A controller can therefore draw a taskbar, a launcher or a
+  badge on any presenter.
+- **Fallback.** No struct, `screenId` 0, the primary's own id, or a screen that is not (or
+  no longer) a presenter — unknown, a 2D monitor, unplugged, a single-screen workspace —
+  draws the overlay on the primary in the primary's space, so an overlay is never lost. The
+  presenter is resolved every frame: when the screen presents again the overlay goes back to
+  it with no new call.
+- **The tag belongs to the slot.** A later set for the same `overlayId` without the struct
+  puts it back on the primary. Use distinct ids for overlays that show on different screens
+  at once; ascending-id z-order applies within each screen.
+- **Input.** Pointer events over any presenter already reach the controller in workspace
+  pixels (v25). The controller hit-tests an overlay on screen S from `cursor −
+  S.workspaceOffset`, normalized by `S.desktopExtent`. A modal input grab
+  (`xrSetWorkspaceInputGrabDXR`) covers every presenter's window, so clicks on a launcher
+  opened on any screen go to the controller, not to the focused app.
+- A v25 controller sends no new struct and its overlays are drawn exactly as before.
 
 ### Per-client visual style *(spec_version 9)*
 
@@ -212,7 +235,7 @@ Implementation note: today the focus glow renders as an oversized pre-pass behin
 
 **Spec_version 22–23 finish moving input + cursor policy to the controller.** v22 (issue #370) deletes the runtime raycast + `xrWorkspaceHitTestDXR` and the drag / resize / rotation state machines; the controller hit-tests itself and pushes only cursor depth via `xrSetWorkspaceCursorDepthDXR`. v23 (issue #376) adds `dimFactor` to that struct — the controller owns the over-window cursor body alpha (was a hardcoded `0.30`) — and retires the last runtime key intercepts: DELETE (close, via `xrRequestWorkspaceClientExitDXR`) and Ctrl+O (browse + launch) are now controller policy driven off the KEY event stream, joining TAB / F11 / `[` / `]` (#305–#307). The runtime keeps the close / launch / cursor *mechanisms*; the controller decides when and how they fire.
 
-**Spec_version 24–25.** v24 lets the controller declare the key chords it reserves (`xrSetWorkspaceReservedKeysDXR`). v25 (ADR-052) makes the workspace multi-screen: screen enumeration, SCREENS_CHANGED, placement in any screen's display space, and the name *workspace pixels* for the space cursor coordinates were always in. Every addition is opt-in: a v24 controller sends no new call, receives no new event type, and on a one-screen box nothing changes at all.
+**Spec_version 24–25.** v24 lets the controller declare the key chords it reserves (`xrSetWorkspaceReservedKeysDXR`). v25 (ADR-052) makes the workspace multi-screen: screen enumeration, SCREENS_CHANGED, placement in any screen's display space, and the name *workspace pixels* for the space cursor coordinates were always in. Every addition is opt-in: a v24 controller sends no new call, receives no new event type, and on a one-screen box nothing changes at all. v26 (ADR-052 Amendment 2) lifts "overlays only on the primary": `XrWorkspaceOverlayScreenDXR` chained on the overlay info puts an overlay on any presenter, falling back to the primary whenever that screen is not presenting. The base struct does not grow (a chained struct, so a v25 controller's `XrWorkspaceOverlayInfoDXR` is read exactly as before), and the tagged form crosses IPC as its own appended call (`workspace_set_overlay_on_screen`).
 
 **Architectural endpoint.** Per the architectural North Star (`feedback_controllers_own_motion`), the runtime owns mechanism, the controller owns policy + appearance. After spec_version 23, this principle holds for chrome, for the wakeup pattern, for the parameterized composite knobs, and for all input / window / cursor policy: the runtime owns the cross-process texture-share mechanism, the depth-pipeline composite, the cursor-sprite composite, the auto-anchor math, the wakeup-event source-of-truth, and the alpha-mask shader; the controller owns every pixel of chrome appearance, every region's hit-region geometry (it runs its own hit-test), every animation curve, the wait primitive that drives its idle behavior, the per-client style values that drive the runtime's compositor knobs, AND every keyboard / window-behavior decision (close, launch, focus-cycle, maximize, depth-step, cursor depth + dim).
 
@@ -226,6 +249,7 @@ The extension is implemented in this repository:
 - **State tracker**: `src/xrt/state_trackers/oxr/oxr_workspace.c` (dispatch wrappers); `src/xrt/state_trackers/oxr/oxr_api_negotiate.c` (PFN entries).
 - **IPC**: `src/xrt/ipc/shared/proto.json` (RPC definitions); `src/xrt/ipc/shared/ipc_protocol.h` (event wire format); `src/xrt/ipc/client/ipc_client_compositor.c` (bridge); `src/xrt/ipc/server/ipc_server_handler.c` (server handlers).
 - **Workspace screens (spec_version 25)**: `src/xrt/compositor/util/comp_workspace_screens.{h,c}` (the screen set, the anchor-screen placement mapping, the window → presenter split, workspace pixels — unit-tested in `tests/tests_comp_workspace_screens.cpp`); wire round trip in `tests/tests_workspace_screens_ipc.cpp`.
+- **Overlays per screen (spec_version 26)**: `comp_ws_overlay_screen` (which presenter composes an overlay, with the primary fallback — `tests/tests_comp_workspace_screens.cpp`); the chain walk `oxr_workspace_overlay_screen_from_chain` (`tests/tests_workspace_screens_ipc.cpp`); the compose filter in the overlay pass of `comp_d3d11_service.cpp`.
 - **Service compositor (Windows D3D11)**: `src/xrt/compositor/d3d11_service/comp_d3d11_service.cpp` (drain, hit-test enrichment, FRAME_TICK + FOCUS_CHANGED + POINTER_HOVER emission, controller-chrome composite, chrome quad raycast, chromeRegionId resolution, request_*_by_slot helpers); `src/xrt/compositor/d3d11/comp_d3d11_window.cpp` (WndProc, public ring, Win32 SetCapture / ReleaseCapture).
 - **Reference controller (chrome appearance)**: `displayxr-shell-pvt/src/shell_chrome.cpp` — owns the rounded-pill SDF shader, grip dots + close/min/max button geometry, hover-fade ease-out cubic, per-state re-render. Reads cursor-over-chrome via POINTER_HOVER events; dispatches close → exit RPC, max → fullscreen RPC.
 - **Reference controller (lifecycle)**: `displayxr-shell-pvt/src/main.c` (animation framework, smooth preset transitions, interactive carousel state machine, variable poll cadence, chrome lifecycle wiring).

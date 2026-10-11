@@ -35,10 +35,10 @@ extern "C" {
 #endif
 
 #define XR_DXR_spatial_workspace 1
-#define XR_DXR_spatial_workspace_SPEC_VERSION 25
+#define XR_DXR_spatial_workspace_SPEC_VERSION 26
 #define XR_DXR_SPATIAL_WORKSPACE_EXTENSION_NAME "XR_DXR_spatial_workspace"
 
-// Provisional XrStructureType values. The 1004999100..110 range is reserved for
+// Provisional XrStructureType values. The 1004999100..119 range is reserved for
 // this extension; final values reconcile with the Khronos registry before spec
 // freeze.
 #define XR_TYPE_WORKSPACE_CLIENT_INFO_DXR                   ((XrStructureType)1004999100)
@@ -54,6 +54,7 @@ extern "C" {
 #define XR_TYPE_WORKSPACE_CURSOR_DEPTH_DXR                  ((XrStructureType)1004999110)  // spec_version 22
 #define XR_TYPE_WORKSPACE_SCREEN_DXR                        ((XrStructureType)1004999111)  // spec_version 25
 #define XR_TYPE_WORKSPACE_WINDOW_PLACEMENT_DXR              ((XrStructureType)1004999112)  // spec_version 25
+#define XR_TYPE_WORKSPACE_OVERLAY_SCREEN_DXR                ((XrStructureType)1004999113)  // spec_version 26
 
 /*!
  * @brief Workspace-local identifier for a client.
@@ -1182,6 +1183,35 @@ typedef struct XrWorkspaceOverlayInfoDXR {
 typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceOverlayDXR)(
     XrSession                        session,
     const XrWorkspaceOverlayInfoDXR *info);
+
+/*!
+ * @brief The screen a workspace overlay lives on (spec_version 26, ADR-052
+ *        Amendment 2). Chain it on XrWorkspaceOverlayInfoDXR::next.
+ *
+ * Without this struct (or with screenId 0) an overlay is the primary screen's,
+ * exactly as before spec_version 26. With it, the overlay is composed only by
+ * the presenter of @p screenId and in that screen's own space: the overlay's
+ * anchor is normalized to THAT screen ([0,1], origin its top-left) and its
+ * sizeMeters are that screen's metres. A screen that is not (or is no longer) a
+ * presenter -- unknown, a 2D monitor, unplugged, or a workspace running
+ * single-screen -- draws the overlay on the primary, in the primary's space, so
+ * an overlay is never silently lost; once the screen presents again the overlay
+ * moves back to it without a new call. The tag belongs to the overlayId slot:
+ * a later xrSetWorkspaceOverlayDXR for the same id without the struct puts the
+ * overlay back on the primary. Overlay z-order (ascending overlayId) applies
+ * within each screen.
+ *
+ * Input: the pointer events of a cursor over any presenter already reach the
+ * controller in workspace pixels (spec_version 25); the controller hit-tests an
+ * overlay on screen S from the cursor minus S's workspaceOffset, normalized by
+ * S's desktopExtent. A modal input grab (xrSetWorkspaceInputGrabDXR) covers
+ * every presenter, so a launcher on any screen owns the clicks made on it.
+ */
+typedef struct XrWorkspaceOverlayScreenDXR {
+    XrStructureType           type;      // XR_TYPE_WORKSPACE_OVERLAY_SCREEN_DXR
+    const void* XR_MAY_ALIAS  next;
+    uint64_t                  screenId;  // XrWorkspaceScreenDXR::screenId; 0 = the primary
+} XrWorkspaceOverlayScreenDXR;
 
 // ---- Modal input grab (spec_version 18) ----
 

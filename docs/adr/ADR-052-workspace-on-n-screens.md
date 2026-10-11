@@ -115,6 +115,7 @@ controller opt a 2D monitor in as a flat presenter is a later, additive request.
 - **Controller overlays** (`xrSetWorkspaceOverlayDXR`, anchored in normalised display
   coordinates) and **frame capture** (`xrCaptureWorkspaceFrameDXR`) stay on the primary
   presenter; **fullscreen** (`xrRequestWorkspaceClientFullscreenDXR`) fills the primary.
+  *Overlays: superseded by Amendment 2 — an overlay may be tagged with any screen.*
 - **The rendering mode and the lens are one per service.** The panel lease (ADR-035 D2)
   flips every presenter together; a presenter whose DP declines the mode presents flat.
 - **The cursor sprite** is drawn by the presenter under the pointer, at the controller's
@@ -221,3 +222,51 @@ also framed against a canvas half a metre off-centre on a panel it was not on.
 - Geometry: `comp_ws_frame_window`, `comp_ws_window_metrics`, `comp_ws_segment_table`
   (`util/comp_workspace_screens.h`), unit-tested in `tests_comp_workspace_screens` against
   the state tracker's `oxr_segment_views_*`.
+
+## Amendment 2 — overlays per screen (2026-10-11)
+
+**Status:** Accepted. Lifts the overlay half of D5.
+
+**Why.** D5 kept every controller overlay on the primary. On the two-panel rig that put a
+window minimised on the second panel into a taskbar on the first: David, on the rig —
+"minimise on the DS1 still creates the minimised item on the laptop screen. Clicking it does
+revive the app on the DS1, but shouldn't the min tab be on the DS1?" It should: the taskbar,
+the launcher and any badge a controller draws belong on the screen they are about.
+
+**Decision.**
+
+- **An overlay may name its screen.** `XR_DXR_spatial_workspace` spec_version 26 adds
+  `XrWorkspaceOverlayScreenDXR { screenId }`, chained on `XrWorkspaceOverlayInfoDXR`. A
+  chained struct, not a new field: the base struct keeps its size, so a v25 controller is
+  read byte for byte as before. The tagged form crosses IPC as its own appended call
+  (`workspace_set_overlay_on_screen`); the untagged call and its wire form are unchanged.
+- **One presenter composes it, in its own space.** The overlay is drawn only by that
+  screen's presenter. Its anchor is normalised to that screen and its size is in that
+  screen's metres. The secondary pass already runs the primary's compose code with the
+  presenter's geometry installed (`svc_ws_pass`), so the overlay pass needs no new math —
+  only a filter: each overlay is drawn by the pass whose screen `comp_ws_overlay_screen`
+  picks.
+- **The primary is the fallback, evaluated every frame.** Untagged, screenId 0, the primary's
+  own id, or a screen that is not a live secondary presenter (unknown, 2D, removed, a
+  single-screen workspace) — the primary draws it, in the primary's space. An overlay is
+  never lost to a screen that went away, and it follows its screen back when it presents
+  again. The tag belongs to the `overlayId` slot; an untagged set moves it back.
+- **Input already works; the grab now covers every presenter.** Each presenter window
+  already feeds the controller's input ring in workspace pixels, so the controller hit-tests
+  an overlay on any screen from the cursor and that screen's `workspaceOffset`. What did not
+  follow was the modal grab: it suppressed forwarding on the service window only, so a click
+  on a launcher opened on another screen also went to the focused app. The grab is now
+  mirrored onto every presenter window, including one created while it is held.
+
+**Consequences.**
+
+- A one-screen workspace, and every v25 controller, is unchanged: no tag, no new call, the
+  primary composes every overlay as before.
+- Frame capture and fullscreen stay on the primary (D5); so does the FRAME_TICK viewer.
+- Cost: one id-list copy per compose pass while an overlay exists, and a compare per overlay.
+- Diagnostics: `workspace overlay N: on screen 0x…` (WARN, only when an overlay is placed on
+  or moved to another screen).
+- Tests: `comp_ws_overlay_screen` (routing by screen id, untagged → primary, removed →
+  primary and back, exactly one presenter per overlay) in `tests_comp_workspace_screens`; the
+  chain walk and the message size in `tests_workspace_screens_ipc`; the appended call in
+  `tests_ipc_proto`.

@@ -946,6 +946,27 @@ comp_d3d11_service_workspace_set_overlay(struct xrt_system_compositor *xsysc,
                                           bool visible, bool stereo_sbs);
 
 /*!
+ * spec_version 26 (ADR-052 Amendment 2): as
+ * comp_d3d11_service_workspace_set_overlay, with the overlay on screen
+ * @p screen_id. Only that screen's presenter composes it, with @p anchor
+ * normalized to that screen and @p size_w_m x @p size_h_m in its metres. 0, or
+ * a screen that is not a live secondary presenter (unknown, 2D, removed,
+ * single-screen workspace), means the primary -- re-evaluated every frame, so
+ * the overlay follows its screen back when it presents again. The tag belongs
+ * to the overlay_id slot: an untagged set for the same id moves it back to the
+ * primary.
+ */
+xrt_result_t
+comp_d3d11_service_workspace_set_overlay_on_screen(struct xrt_system_compositor *xsysc,
+                                                    uint32_t overlay_id,
+                                                    struct xrt_swapchain *xsc,
+                                                    float anchor_x, float anchor_y,
+                                                    float pivot_x, float pivot_y,
+                                                    float size_w_m, float size_h_m,
+                                                    bool visible, bool stereo_sbs,
+                                                    uint64_t screen_id);
+
+/*!
  * Phase 2.C spec_version 8: lazy-create + return the workspace wakeup
  * event handle (Win32 HANDLE on Windows). The IPC handler then DuplicateHandle's
  * it into the controller process so the controller can wait on it instead

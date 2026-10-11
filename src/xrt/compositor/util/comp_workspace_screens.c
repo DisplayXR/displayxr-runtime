@@ -612,3 +612,17 @@ comp_ws_pointer_owner_screen(const struct comp_ws_pointer_owner *o)
 {
 	return (o != NULL && o->valid) ? o->screen_id : 0;
 }
+
+uint64_t
+comp_ws_overlay_screen(uint64_t overlay_screen_id, const uint64_t *presenter_ids, uint32_t presenter_count)
+{
+	if (overlay_screen_id == 0 || presenter_ids == NULL) {
+		return 0;
+	}
+	for (uint32_t i = 0; i < presenter_count && i < COMP_WS_MAX_SCREENS; i++) {
+		if (presenter_ids[i] == overlay_screen_id) {
+			return overlay_screen_id;
+		}
+	}
+	return 0; // not a live secondary presenter: the primary draws it
+}

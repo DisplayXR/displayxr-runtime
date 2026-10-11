@@ -173,4 +173,37 @@ TEST_CASE("workspace v25 messages fit one IPC buffer")
 	CHECK(sizeof(struct ipc_workspace_enumerate_screens_reply) <= IPC_BUF_SIZE);
 	CHECK(sizeof(struct ipc_workspace_set_window_placement_msg) <= IPC_BUF_SIZE);
 	CHECK(sizeof(struct ipc_workspace_get_window_placement_reply) <= IPC_BUF_SIZE);
+	CHECK(sizeof(struct ipc_workspace_set_overlay_on_screen_msg) <= IPC_BUF_SIZE); // v26
+}
+
+TEST_CASE("workspace overlay screen (v26): the chained tag, or none")
+{
+	XrWorkspaceOverlayInfoDXR info = {XR_TYPE_WORKSPACE_OVERLAY_INFO_DXR};
+	uint64_t id = 0xFFFF;
+
+	SECTION("nothing chained: the pre-v26 call (primary), sent as before")
+	{
+		CHECK_FALSE(oxr_workspace_overlay_screen_from_chain(&info, &id));
+		CHECK(id == 0);
+	}
+
+	SECTION("a tag behind another struct is found")
+	{
+		XrWorkspaceOverlayScreenDXR tag = {XR_TYPE_WORKSPACE_OVERLAY_SCREEN_DXR};
+		tag.screenId = 0x2002;
+		XrWorkspaceCursorDepthDXR other = {XR_TYPE_WORKSPACE_CURSOR_DEPTH_DXR}; // any unrelated struct
+		other.next = &tag;
+		info.next = &other;
+		CHECK(oxr_workspace_overlay_screen_from_chain(&info, &id));
+		CHECK(id == 0x2002);
+	}
+
+	SECTION("a tag with screenId 0 names the primary")
+	{
+		XrWorkspaceOverlayScreenDXR tag = {XR_TYPE_WORKSPACE_OVERLAY_SCREEN_DXR};
+		tag.screenId = 0;
+		info.next = &tag;
+		CHECK(oxr_workspace_overlay_screen_from_chain(&info, &id));
+		CHECK(id == 0);
+	}
 }

@@ -758,3 +758,45 @@ TEST_CASE("comp_ws: the pointer capture goes to the presenter the press went dow
 		CHECK(comp_ws_pointer_owner_screen(&o) == SIDE);
 	}
 }
+
+TEST_CASE("comp_ws: overlays per screen — which presenter composes an overlay (Amendment 2)")
+{
+	// The rig's live secondary presenters (the primary is never in the list).
+	const uint64_t presenters[] = {SIDE};
+
+	SECTION("untagged (pre-v26) and the primary's own id: the primary")
+	{
+		CHECK(comp_ws_overlay_screen(0, presenters, 1) == 0);
+		CHECK(comp_ws_overlay_screen(PANEL, presenters, 1) == 0);
+	}
+
+	SECTION("tagged with a live secondary presenter: that presenter only")
+	{
+		CHECK(comp_ws_overlay_screen(SIDE, presenters, 1) == SIDE);
+	}
+
+	SECTION("a screen that is not a presenter (2D monitor, unknown id): the primary")
+	{
+		CHECK(comp_ws_overlay_screen(FLAT, presenters, 1) == 0);
+		CHECK(comp_ws_overlay_screen(0xDEAD, presenters, 1) == 0);
+	}
+
+	SECTION("its screen removed (or a single-screen workspace): back on the primary, and back again when it returns")
+	{
+		CHECK(comp_ws_overlay_screen(SIDE, presenters, 0) == 0);
+		CHECK(comp_ws_overlay_screen(SIDE, nullptr, 0) == 0);
+		CHECK(comp_ws_overlay_screen(SIDE, presenters, 1) == SIDE);
+	}
+
+	SECTION("every overlay is drawn by exactly one presenter")
+	{
+		const uint64_t passes[] = {0, SIDE}; // the primary's pass, then the secondary's
+		for (uint64_t tag : {(uint64_t)0, PANEL, SIDE, FLAT}) {
+			int drawn = 0;
+			for (uint64_t pass : passes) {
+				drawn += comp_ws_overlay_screen(tag, presenters, 1) == pass ? 1 : 0;
+			}
+			CHECK(drawn == 1);
+		}
+	}
+}

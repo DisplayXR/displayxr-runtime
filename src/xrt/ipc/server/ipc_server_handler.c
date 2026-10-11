@@ -6174,11 +6174,17 @@ ipc_handle_workspace_set_cursor(volatile struct ipc_client_state *_ics,
 #endif
 }
 
-xrt_result_t
-ipc_handle_workspace_set_overlay(volatile struct ipc_client_state *_ics,
-                                  const struct ipc_workspace_overlay_info *info)
+/*!
+ * Shared body of workspace_set_overlay (screen 0 = the primary, pre-v26) and
+ * spec_version 26's workspace_set_overlay_on_screen (ADR-052 Amendment 2).
+ */
+static xrt_result_t
+workspace_set_overlay_common(volatile struct ipc_client_state *_ics,
+                             const struct ipc_workspace_overlay_info *info,
+                             uint64_t screen_id,
+                             const char *what)
 {
-	xrt_result_t authz = require_workspace_controller(_ics, "workspace_set_overlay");
+	xrt_result_t authz = require_workspace_controller(_ics, what);
 	if (authz != XRT_SUCCESS) {
 		return authz;
 	}
@@ -6195,14 +6201,16 @@ ipc_handle_workspace_set_overlay(volatile struct ipc_client_state *_ics,
 		xsc = (struct xrt_swapchain *)_ics->xscs[info->swapchain_id];
 	}
 
-	return comp_d3d11_service_workspace_set_overlay(s->xsysc, info->overlay_id, xsc,
-	                                                 info->anchor_x, info->anchor_y,
-	                                                 info->pivot_x, info->pivot_y,
-	                                                 info->size_w_m, info->size_h_m,
-	                                                 info->visible != 0,
-	                                                 info->stereo_sbs != 0);
+	return comp_d3d11_service_workspace_set_overlay_on_screen(s->xsysc, info->overlay_id, xsc,
+	                                                           info->anchor_x, info->anchor_y,
+	                                                           info->pivot_x, info->pivot_y,
+	                                                           info->size_w_m, info->size_h_m,
+	                                                           info->visible != 0,
+	                                                           info->stereo_sbs != 0, screen_id);
 #elif defined(COMP_MULTI_SHARED_SURFACE)
 	(void)s;
+	// One presenter: every screen tag falls back to the primary (ADR-052 Amendment 2).
+	(void)screen_id;
 	if (info == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
@@ -6217,8 +6225,24 @@ ipc_handle_workspace_set_overlay(volatile struct ipc_client_state *_ics,
 #else
 	(void)s;
 	(void)info;
+	(void)screen_id;
 	return XRT_ERROR_IPC_FAILURE;
 #endif
+}
+
+xrt_result_t
+ipc_handle_workspace_set_overlay(volatile struct ipc_client_state *_ics,
+                                  const struct ipc_workspace_overlay_info *info)
+{
+	return workspace_set_overlay_common(_ics, info, 0, "workspace_set_overlay");
+}
+
+xrt_result_t
+ipc_handle_workspace_set_overlay_on_screen(volatile struct ipc_client_state *_ics,
+                                            const struct ipc_workspace_overlay_info *info,
+                                            uint64_t screen_id)
+{
+	return workspace_set_overlay_common(_ics, info, screen_id, "workspace_set_overlay_on_screen");
 }
 
 xrt_result_t
