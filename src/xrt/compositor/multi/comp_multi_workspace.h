@@ -374,6 +374,31 @@ comp_multi_workspace_copy_overlays(struct comp_multi_overlay_state *out_states,
                                    uint32_t max);
 
 /*!
+ * One shared-surface frame, as the workspace controller's FRAME_TICK reports it
+ * (XR_DXR_spatial_workspace spec_version 6/20/22; payload identical to the
+ * Windows D3D11 service's): the tracked viewer's eye midpoint in display space
+ * (metres) and the cursor in workspace (display) px.
+ */
+struct comp_multi_frame_tick
+{
+	uint64_t timestamp_ns;
+	float viewer_x, viewer_y, viewer_z;
+	bool viewer_valid; //!< The DP reported eyes (held ~0.5 s across a dropout, then false).
+	int32_t cursor_x, cursor_y;
+};
+
+//! Receives one tick per rendered shared-surface frame while a controller is up.
+typedef void (*comp_multi_frame_tick_fn)(void *userdata, const struct comp_multi_frame_tick *tick);
+
+//! Install (or clear, NULL) the process-wide frame-tick sink (the IPC server's input queue).
+void
+comp_multi_workspace_set_frame_tick_sink(comp_multi_frame_tick_fn fn, void *userdata);
+
+//! Called by the shared-surface render loop once per rendered frame.
+void
+comp_multi_workspace_emit_frame_tick(const struct comp_multi_frame_tick *tick);
+
+/*!
  * Drop the controller-owned session-global state — cursor sprite, overlays and
  * the focused client — when the workspace controller deactivates or
  * disconnects, so a dead controller's cursor / launcher band does not stay

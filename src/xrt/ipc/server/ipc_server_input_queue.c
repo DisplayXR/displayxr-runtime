@@ -42,6 +42,8 @@ struct target_queue
 };
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct ipc_workspace_input_event g_frame_tick; //!< Latest tick, under g_lock.
+static bool g_frame_tick_pending;
 static struct target_queue g_queues[INPUT_QUEUE_MAX_TARGETS];
 static bool g_input_grab;
 static bool g_pointer_capture;
@@ -164,8 +166,52 @@ ipc_server_input_queue_drain(void *target, uint32_t capacity, struct ipc_workspa
 		}
 		q->count -= n;
 	}
+	// The coalesced FRAME_TICK rides after the controller's events, if there is
+	// room; otherwise it waits (still the latest) for the next drain.
+	if (target == IPC_INPUT_TARGET_CONTROLLER && g_frame_tick_pending && n < capacity) {
+		out_batch->events[n++] = g_frame_tick;
+		g_frame_tick_pending = false;
+	}
 	out_batch->count = n;
 	pthread_mutex_unlock(&g_lock);
+}
+
+void
+ipc_server_input_queue_publish_frame_tick(const struct ipc_workspace_input_event *tick)
+{
+	if (tick == NULL) {
+		return;
+	}
+	pthread_mutex_lock(&g_lock);
+	g_frame_tick = *tick;
+	g_frame_tick_pending = true;
+	pthread_mutex_unlock(&g_lock);
+}
+
+void
+ipc_server_input_queue_clear_frame_tick(void)
+{
+	pthread_mutex_lock(&g_lock);
+	g_frame_tick_pending = false;
+	pthread_mutex_unlock(&g_lock);
+}
+
+void
+ipc_server_input_queue_frame_tick_sink(void *userdata, const struct comp_multi_frame_tick *tick)
+{
+	(void)userdata;
+	struct ipc_workspace_input_event ev;
+	memset(&ev, 0, sizeof(ev));
+	ev.event_type = IPC_WORKSPACE_INPUT_EVENT_FRAME_TICK;
+	ev.timestamp_ms = (uint32_t)(tick->timestamp_ns / 1000000);
+	ev.u.frame_tick.timestamp_ns = tick->timestamp_ns;
+	ev.u.frame_tick.viewer_x = tick->viewer_x;
+	ev.u.frame_tick.viewer_y = tick->viewer_y;
+	ev.u.frame_tick.viewer_z = tick->viewer_z;
+	ev.u.frame_tick.viewer_valid = tick->viewer_valid ? 1u : 0u;
+	ev.u.frame_tick.cursor_x = tick->cursor_x;
+	ev.u.frame_tick.cursor_y = tick->cursor_y;
+	ipc_server_input_queue_publish_frame_tick(&ev);
 }
 
 void

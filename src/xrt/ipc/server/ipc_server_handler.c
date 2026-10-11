@@ -4614,6 +4614,7 @@ ipc_handle_workspace_deactivate(volatile struct ipc_client_state *_ics)
 		comp_multi_workspace_reset_controller_state();
 		ipc_server_input_queue_set_input_grab(false);
 		ipc_server_input_queue_set_pointer_capture(false);
+		ipc_server_input_queue_clear_frame_tick();
 #endif
 	}
 

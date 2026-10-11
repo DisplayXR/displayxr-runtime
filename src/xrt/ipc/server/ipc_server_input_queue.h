@@ -121,6 +121,28 @@ ipc_server_input_route(const struct ipc_workspace_input_event *event);
 void
 ipc_server_input_queue_push_controller_key(uint32_t vk_code, uint32_t modifiers);
 
+/*!
+ * Publish the latest FRAME_TICK for the controller. Ticks are COALESCED: one
+ * pending slot, overwritten by every publish, appended (once) after the ring's
+ * events by the next controller drain — so a controller that is not draining
+ * sees only the newest tick, never a per-frame backlog that would crowd input
+ * out of its rings. Does not signal the wakeup event (as on Windows, a tick is
+ * not a reason to wake an idle controller; cursor motion, which a tick also
+ * carries, already wakes it).
+ */
+void
+ipc_server_input_queue_publish_frame_tick(const struct ipc_workspace_input_event *tick);
+
+//! Drop a pending tick (controller deactivated / disconnected).
+void
+ipc_server_input_queue_clear_frame_tick(void);
+
+struct comp_multi_frame_tick;
+
+//! comp_multi_frame_tick_fn adapter: builds the wire FRAME_TICK and publishes it.
+void
+ipc_server_input_queue_frame_tick_sink(void *userdata, const struct comp_multi_frame_tick *tick);
+
 #ifdef XRT_OS_LINUX_DESKTOP
 /*!
  * The controller wakeup eventfd (POSIX form of xrAcquireWorkspaceWakeupEventDXR):

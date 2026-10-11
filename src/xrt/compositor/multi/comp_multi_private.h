@@ -1389,6 +1389,11 @@ struct multi_system_compositor
 	//! (-1 = never), converged each frame from the lens owner's wish
 	//! (mc->hardware_display_3d of the focused client, or of a lone client).
 	int shared_hw_3d_applied;
+	//! FRAME_TICK viewer (eye midpoint, display m) last read from shared_dp, and
+	//! how many frames in a row the DP has had no eyes (drops valid after ~0.5 s).
+	float shared_tick_viewer[3];
+	bool shared_tick_viewer_valid;
+	uint32_t shared_tick_viewer_fail_count;
 	bool shared_window_visible;      //!< #61: full-screen window currently shown (orderFront) vs hidden (orderOut).
 	struct comp_target *shared_target;             //!< The one full-screen NSWindow target.
 	struct xrt_display_processor *shared_dp;       //!< The one DP that weaves the combined atlas.
