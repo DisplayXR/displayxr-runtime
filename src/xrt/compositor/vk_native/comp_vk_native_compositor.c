@@ -21,6 +21,7 @@
 #include "comp_vk_native_segments.h"
 
 #include "util/comp_swapchain_ring.h"
+#include "util/comp_cursor_look.h"
 #include "util/comp_zone_tier1.h"
 #include "util/comp_layer_accum.h"
 #include "util/comp_bg2d.h"
@@ -65,6 +66,7 @@
 #include "util/u_tiling.h"
 #include "util/u_canvas.h"
 #include "util/u_capture_intent.h"
+#include "util/u_cursor_depth.h"
 #include "util/u_repaint_gate.h"
 #include "util/u_fill_thread_win.h"
 #include "util/u_image_capture.h"
@@ -1523,6 +1525,27 @@ struct comp_vk_native_compositor
 	//! one pool; resetting it twice while a shared cmd buffer still references
 	//! the earlier sets is a use-after-reset. Cleared at the top of layer_commit.
 	bool local2d_pool_reset_this_frame;
+
+	/*!
+	 * XR_DXR_cursor_depth v5, the runtime draws the cursor (ADR-046
+	 * Amendment 2 B).
+	 *
+	 * ZERO COST UNLESS REQUESTED: all zero for a session that never chained
+	 * XrCursorDepthDrawInfoDXR. layer_commit tests `req.requested` and does
+	 * nothing else; the default look and the renderer's sprite image are
+	 * built on the first real request only.
+	 */
+	struct
+	{
+		//! One-frame request from the state tracker, consumed by the next commit.
+		struct u_cursor_draw_request req;
+		//! The shared default look, uploaded to the renderer on change.
+		struct comp_cursor_look look;
+		uint64_t default_gen;
+		bool default_uploaded;
+		bool warned_zones;
+		bool warned_routed;
+	} cursor_draw;
 };
 
 /*
@@ -9421,6 +9444,98 @@ vk_shared_submit_and_wait(struct comp_vk_native_compositor *c, const VkSubmitInf
 	return VK_SUCCESS;
 }
 
+/*!
+ * XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B): turn the state tracker's
+ * per-view placement into this frame's renderer cursor - which image, its
+ * size in canvas units, and each view's corners in its tile.
+ *
+ * @param canvas_px_h The canvas (window) height in backing pixels: the size
+ *        the Kooima views were built for, so one unit = canvas height.
+ * @return false if nothing can be drawn this frame (the frame is untouched).
+ */
+static bool
+vk_cursor_resolve(struct comp_vk_native_compositor *c,
+                  const struct u_cursor_draw_request *req,
+                  uint32_t canvas_px_h,
+                  struct comp_vk_native_cursor_draw *out)
+{
+	if (c->zones_frame) {
+		// The state tracker already refuses zones frames; belt and braces.
+		if (!c->cursor_draw.warned_zones) {
+			c->cursor_draw.warned_zones = true;
+			U_LOG_W("cursor_draw: zones frame - cursor not drawn (one-time warning)");
+		}
+		return false;
+	}
+	if (c->eff_layout.route_count > 0) {
+		// Multi-screen M3: a tile is a per-segment mosaic, not one view.
+		if (!c->cursor_draw.warned_routed) {
+			c->cursor_draw.warned_routed = true;
+			U_LOG_W("cursor_draw: multi-screen routed frame - cursor not drawn (one-time warning)");
+		}
+		return false;
+	}
+	// Panel pixel pitch (metres per backing pixel) and the OS point.
+	if (!c->sys_info_set || c->sys_info.display_pixel_height == 0 || !(c->sys_info.display_height_m > 0.0f) ||
+	    canvas_px_h == 0) {
+		return false;
+	}
+	const float m_per_px = c->sys_info.display_height_m / (float)c->sys_info.display_pixel_height;
+	const float backing_scale = comp_cursor_look_backing_scale();
+	const float m_per_pt = m_per_px * backing_scale;
+	const float canvas_h_m = (float)canvas_px_h * m_per_px;
+
+	float aspect, hot_u, hot_v, size_m;
+	memset(out, 0, sizeof(*out));
+	if (req->image != NULL) {
+		uint32_t w = 0, h = 0;
+		comp_vk_native_swapchain_get_dimensions(req->image, &w, &h);
+		if (w == 0 || h == 0) {
+			return false;
+		}
+		aspect = (float)w / (float)h;
+		hot_u = req->hot_u;
+		hot_v = req->hot_v;
+		size_m = req->size_m > 0.0f ? req->size_m : U_CURSOR_DRAW_DEFAULT_POINTS * m_per_pt;
+		out->xsc = req->image;
+		out->image_index = req->image_index;
+		out->premultiplied = false; // spec: the app's sprite is STRAIGHT alpha
+	} else {
+		struct comp_cursor_look *look = &c->cursor_draw.look;
+		if (!comp_cursor_look_update(look, backing_scale)) {
+			return false;
+		}
+		if (!c->cursor_draw.default_uploaded || c->cursor_draw.default_gen != look->generation) {
+			if (!comp_vk_native_renderer_set_cursor_default_image(c->renderer, look->rgba, look->w,
+			                                                      look->h)) {
+				return false;
+			}
+			c->cursor_draw.default_gen = look->generation;
+			c->cursor_draw.default_uploaded = true;
+		}
+		aspect = look->aspect;
+		hot_u = look->hot_u;
+		hot_v = look->hot_v;
+		size_m = req->size_m > 0.0f ? req->size_m : look->height_pt * m_per_pt;
+		out->premultiplied = true; // the look's pixels are premultiplied
+	}
+	const float height = size_m / canvas_h_m; // sprite height, in units
+
+	out->view_count = req->view_count < XRT_MAX_VIEWS ? req->view_count : XRT_MAX_VIEWS;
+	for (uint32_t i = 0; i < out->view_count; i++) {
+		u_cursor_draw_corners(&req->view[i], height, aspect, hot_u, hot_v, out->corners[i]);
+	}
+	out->active = true;
+	return true;
+}
+
+void
+comp_vk_native_compositor_set_cursor_draw_request(struct xrt_compositor *xc, const struct u_cursor_draw_request *req)
+{
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	c->cursor_draw.req = *req;
+}
+
 static xrt_result_t
 vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
                                   xrt_graphics_sync_handle_t sync_handle,
@@ -9710,6 +9825,20 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 	// capture path — they must all agree on the frame's geometry.
 	vk_compute_effective_layout(c);
 
+	/*
+	 * XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B). ZERO COST UNLESS
+	 * REQUESTED: one field test, false for every session that never chained
+	 * XrCursorDepthDrawInfoDXR. The request covers this commit only.
+	 */
+	struct comp_vk_native_cursor_draw cursor_draw = {0};
+	if (c->cursor_draw.req.requested) {
+		struct u_cursor_draw_request cursor_req = c->cursor_draw.req;
+		c->cursor_draw.req.requested = false;
+		if (u_cursor_draw_should_draw(&cursor_req)) {
+			(void)vk_cursor_resolve(c, &cursor_req, tgt_height, &cursor_draw);
+		}
+	}
+
 	// Zero-copy check: can we pass the app's swapchain directly to the DP?
 	bool zero_copy = false;
 	uint64_t zc_image_u64 = 0;
@@ -9876,6 +10005,16 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 	}
 #endif
 
+	/*
+	 * XR_DXR_cursor_depth v5: a frame carrying a runtime-drawn cursor
+	 * composes into the atlas - the cursor is drawn there, never into the
+	 * app's own image. Same shape as the guards above: a fact applied to the
+	 * RESULT of `u_tiling_can_zero_copy()` (ADR-030), not a second gate.
+	 */
+	if (cursor_draw.active) {
+		zero_copy = false;
+	}
+
 	// Record the frame's effective capture source = exactly what the DP will
 	// receive (renderer atlas, or the zero-copy app swapchain). The atlas
 	// capture reads this so it shows the DP's input regardless of render mode
@@ -9895,6 +10034,11 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 	// Render projection layers to atlas texture (skip if zero-copy)
 	xrt_result_t xret = XRT_SUCCESS;
 	if (!zero_copy) {
+		if (cursor_draw.active) {
+			// Consumed by the draw below (drawn last in its compose pass,
+			// so the projection-only capture point after it shows it).
+			comp_vk_native_renderer_set_cursor(c->renderer, &cursor_draw);
+		}
 		xret = comp_vk_native_renderer_draw(
 		    c->renderer, &c->layer_accum, &left_eye, &right_eye, tgt_width, tgt_height, &c->eff_layout);
 		if (xret != XRT_SUCCESS) {
@@ -10872,6 +11016,7 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	if (c->renderer != NULL) {
 		comp_vk_native_renderer_destroy(&c->renderer);
 	}
+	comp_cursor_look_fini(&c->cursor_draw.look); // XR_DXR_cursor_depth v5 (empty unless requested)
 
 	comp_vk_alpha_probe_destroy(&c->alpha_probe);
 

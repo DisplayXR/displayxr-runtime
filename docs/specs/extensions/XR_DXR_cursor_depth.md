@@ -153,7 +153,7 @@ chain it, for diagnostics).
 
 | Field | Meaning |
 |---|---|
-| `image` | An ordinary color swapchain this session created with `xrCreateSwapchain`, in the app's own graphics API, filled with any sprite and released at least once. The runtime samples its **last released image** (array layer 0, whole image) as **straight (non-premultiplied) alpha**, decoded per its format (an `_SRGB` format decodes). It must stay alive until the `xrEndFrame` of every frame that names it. `XR_NULL_HANDLE` = the runtime's **default look**: the current OS cursor's shape where the runtime can read it, else the classic arrow (12 × 19, white fill, dark outline, tip = hotspot). |
+| `image` | An ordinary color swapchain this session created with `xrCreateSwapchain`, in the app's own graphics API, filled with any sprite and released at least once. The runtime samples its **last released image** (array layer 0, whole image) as **straight (non-premultiplied) alpha**, decoded per its format (an `_SRGB` format decodes). It must stay alive until the `xrEndFrame` of every frame that names it. On OpenGL the image's top is its **last** row (GL's bottom-left origin, which is how a GL app renders into it); upload a top-down bitmap bottom row first. `XR_NULL_HANDLE` = the runtime's **default look**: the current OS cursor's shape where the runtime can read it, else the classic arrow (12 × 19, white fill, dark outline, tip = hotspot). |
 | `hotSpot` | The click point in the sprite, normalised, origin top-left, v down. Placed at the cursor. Ignored for the default look (it brings its own). |
 | `sizeMeters` | The sprite's **height** on the panel at the display plane, metres; width follows the image aspect. Scaled with depth, so its apparent size never changes. ≤ 0 or non-finite = the OS cursor's size (the default look's own size; 19 OS points for a custom sprite). |
 | `visible` | `XR_FALSE`: draw nothing. |
@@ -175,8 +175,12 @@ the runtime cannot draw (another backend, a space mismatch, a zones frame), it r
 `XR_FALSE`, so the fallback is always the flat OS cursor, never no cursor. The runtime never
 touches the OS cursor itself.
 
-**Backends (v5).** Metal (in-process) draws. D3D11, D3D12, GL, vk_native and the IPC/service path
-report `willDraw = XR_FALSE` with a one-time WARN (ADR-046 Amendment 2 rollout step 3).
+**Backends (v5).** The in-process Metal, Vulkan (vk_native) and OpenGL compositors draw. D3D11,
+D3D12 and the IPC/service path report `willDraw = XR_FALSE` with a one-time WARN (ADR-046
+Amendment 2 rollout step 3). On Vulkan the cursor is drawn after the projection, quad and
+equirect2 layers but **under** window-space layers, which that compositor stamps in a later pass
+(ADR-046 Amendment 2, "§B as built on Vulkan and GL"). The default look mirrors the OS cursor on
+macOS only; elsewhere it is the classic arrow.
 
 ### 2.7 `XrCursorDepthLiftRectDXR` / `XrCursorDepthLiftStateDXR` (spec v6) — lifted content
 

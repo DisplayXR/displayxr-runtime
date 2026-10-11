@@ -312,6 +312,38 @@ struct comp_vk_native_renderer
 	 * reach. NULL (the default) restores the owned-atlas path verbatim.
 	 */
 	struct comp_vk_deposit *deposit;
+
+	/*!
+	 * XR_DXR_cursor_depth v5, the runtime draws the cursor (ADR-046
+	 * Amendment 2 B).
+	 *
+	 * ZERO COST UNLESS REQUESTED: all zero for a session that never chained
+	 * XrCursorDepthDrawInfoDXR. The draw tests `req.active` once; the
+	 * default-look image and its staging buffer are created on the first
+	 * request that needs them. The pipelines are the compose pass's own.
+	 */
+	struct
+	{
+		//! One-frame request from the compositor, consumed by the next draw.
+		struct comp_vk_native_cursor_draw req;
+		//! The default look's sprite: R8G8B8A8 `_SRGB` (UNORM under the
+		//! legacy colour hatch, which samples every source undecoded),
+		//! steady-state SHADER_READ_ONLY_OPTIMAL once uploaded.
+		VkImage default_image;
+		VkDeviceMemory default_memory;
+		VkImageView default_view;
+		uint32_t default_w, default_h;
+		//! Host-visible staging for the next upload.
+		VkBuffer staging;
+		VkDeviceMemory staging_memory;
+		VkDeviceSize staging_size;
+		//! The staged pixels still have to be copied into default_image.
+		bool upload_pending;
+		//! default_image has been uploaded at least once.
+		bool default_ready;
+		bool warned_no_pass;
+		bool announced;
+	} cursor;
 };
 
 /*!
@@ -936,6 +968,9 @@ comp_vk_native_renderer_create(struct comp_vk_native_compositor *c,
 	return XRT_SUCCESS;
 }
 
+static void
+cursor_destroy(struct comp_vk_native_renderer *r);
+
 void
 comp_vk_native_renderer_destroy(struct comp_vk_native_renderer **renderer_ptr)
 {
@@ -950,6 +985,7 @@ comp_vk_native_renderer_destroy(struct comp_vk_native_renderer **renderer_ptr)
 
 	destroy_atlas_resources(r);
 	zone_draw_destroy(r);
+	cursor_destroy(r); // XR_DXR_cursor_depth v5 (all null unless ever requested)
 	// After destroy_atlas_resources — that call drops the borrowed handles
 	// into the deposit's ring, this one frees the ring itself.
 	comp_vk_deposit_destroy(&r->deposit);
@@ -1317,14 +1353,16 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
 		return false;
 	}
 
+	// + 1: the runtime-drawn cursor's set (XR_DXR_cursor_depth v5), so a
+	// frame that exhausts the layer budget still has one for the cursor.
 	VkDescriptorPoolSize pool_size = {
 	    .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-	    .descriptorCount = VK_ZONE_MAX_DRAWS,
+	    .descriptorCount = VK_ZONE_MAX_DRAWS + 1,
 	};
 
 	VkDescriptorPoolCreateInfo dp_ci = {
 	    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-	    .maxSets = VK_ZONE_MAX_DRAWS,
+	    .maxSets = VK_ZONE_MAX_DRAWS + 1,
 	    .poolSizeCount = 1,
 	    .pPoolSizes = &pool_size,
 	};
@@ -1771,6 +1809,333 @@ renderer_submit_draw_and_wait(struct comp_vk_native_renderer *r, VkSubmitInfo *s
 	return VK_SUCCESS;
 }
 
+/*!
+ * The view the compose pass SAMPLES a swapchain image through - the ONE
+ * source-view choice (#1589), for every layer and the cursor sprite alike.
+ *
+ * The view in the format the app asked for, so the GPU DECODES an `_SRGB`
+ * source to linear and passes a UNORM one through as the linear values it
+ * holds; the pass composites in linear light and its attachment re-encodes on
+ * write, so this is the read half of a matched pair. Under the legacy hatch
+ * the pass blends in encoded space, so the non-decoding view.
+ */
+static uint64_t
+compose_source_view(struct xrt_swapchain *xsc, uint32_t image_index)
+{
+	return u_color_legacy_unorm_encoded() ? comp_vk_native_swapchain_get_image_view(xsc, image_index)
+	                                      : comp_vk_native_swapchain_get_true_image_view(xsc, image_index);
+}
+
+/*
+ *
+ * XR_DXR_cursor_depth v5 - the runtime draws the cursor (ADR-046 Amendment 2 B)
+ *
+ * The cursor rides the compose pass: one more alpha-blended quad per view tile
+ * after every layer the pass draws, through the pass's own pipelines (the QUAD
+ * vertex path with an affine MVP), into the private `_SRGB` compose target -
+ * so it blends in linear light, its source is sampled as its declared format,
+ * and the atlas receives ENCODED bytes by the pass's raw copy, exactly like
+ * every other layer. Never double-encoded, never a second colour rule.
+ *
+ */
+
+static void
+cursor_destroy(struct comp_vk_native_renderer *r)
+{
+	struct vk_bundle *vk = r->vk;
+	if (r->cursor.default_view != VK_NULL_HANDLE) {
+		vk->vkDestroyImageView(vk->device, r->cursor.default_view, NULL);
+		r->cursor.default_view = VK_NULL_HANDLE;
+	}
+	if (r->cursor.default_image != VK_NULL_HANDLE) {
+		vk->vkDestroyImage(vk->device, r->cursor.default_image, NULL);
+		r->cursor.default_image = VK_NULL_HANDLE;
+	}
+	if (r->cursor.default_memory != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, r->cursor.default_memory, NULL);
+		r->cursor.default_memory = VK_NULL_HANDLE;
+	}
+	if (r->cursor.staging != VK_NULL_HANDLE) {
+		vk->vkDestroyBuffer(vk->device, r->cursor.staging, NULL);
+		r->cursor.staging = VK_NULL_HANDLE;
+	}
+	if (r->cursor.staging_memory != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, r->cursor.staging_memory, NULL);
+		r->cursor.staging_memory = VK_NULL_HANDLE;
+	}
+	r->cursor.staging_size = 0;
+	r->cursor.default_w = 0;
+	r->cursor.default_h = 0;
+	r->cursor.upload_pending = false;
+	r->cursor.default_ready = false;
+}
+
+void
+comp_vk_native_renderer_set_cursor(struct comp_vk_native_renderer *r, const struct comp_vk_native_cursor_draw *cursor)
+{
+	if (r == NULL || cursor == NULL) {
+		return;
+	}
+	r->cursor.req = *cursor;
+}
+
+bool
+comp_vk_native_renderer_set_cursor_default_image(struct comp_vk_native_renderer *r,
+                                                 const uint8_t *rgba,
+                                                 uint32_t width,
+                                                 uint32_t height)
+{
+	if (r == NULL || rgba == NULL || width == 0 || height == 0) {
+		return false;
+	}
+	struct vk_bundle *vk = r->vk;
+	VkResult res;
+
+	// A new size needs a new image. Only ever called between draws, and every
+	// draw waits its own fence, so nothing in flight references the old one.
+	if (r->cursor.default_image != VK_NULL_HANDLE &&
+	    (r->cursor.default_w != width || r->cursor.default_h != height)) {
+		vk->vkDestroyImageView(vk->device, r->cursor.default_view, NULL);
+		vk->vkDestroyImage(vk->device, r->cursor.default_image, NULL);
+		vk->vkFreeMemory(vk->device, r->cursor.default_memory, NULL);
+		r->cursor.default_view = VK_NULL_HANDLE;
+		r->cursor.default_image = VK_NULL_HANDLE;
+		r->cursor.default_memory = VK_NULL_HANDLE;
+		r->cursor.default_ready = false;
+	}
+	if (r->cursor.default_image == VK_NULL_HANDLE) {
+		// The bytes are sRGB-ENCODED. Sampled decoded (the `_SRGB` format)
+		// into the linear-blend pass; under the legacy hatch the pass blends
+		// in encoded space and every source is read undecoded, so UNORM.
+		const VkFormat fmt =
+		    u_color_legacy_unorm_encoded() ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_R8G8B8A8_SRGB;
+		res = vk_create_image_simple(vk, (VkExtent2D){width, height}, fmt,
+		                             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+		                             &r->cursor.default_memory, &r->cursor.default_image);
+		if (res != VK_SUCCESS) {
+			U_LOG_E("cursor_draw: default-look image %ux%u failed: %d", width, height, res);
+			r->cursor.default_image = VK_NULL_HANDLE;
+			r->cursor.default_memory = VK_NULL_HANDLE;
+			return false;
+		}
+		const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+		res = vk_create_view(vk, r->cursor.default_image, VK_IMAGE_VIEW_TYPE_2D, fmt, range,
+		                     &r->cursor.default_view);
+		if (res != VK_SUCCESS) {
+			U_LOG_E("cursor_draw: default-look view failed: %d", res);
+			cursor_destroy(r);
+			return false;
+		}
+		r->cursor.default_w = width;
+		r->cursor.default_h = height;
+	}
+
+	const VkDeviceSize size = (VkDeviceSize)width * height * 4;
+	if (r->cursor.staging_size < size) {
+		if (r->cursor.staging != VK_NULL_HANDLE) {
+			vk->vkDestroyBuffer(vk->device, r->cursor.staging, NULL);
+			vk->vkFreeMemory(vk->device, r->cursor.staging_memory, NULL);
+			r->cursor.staging = VK_NULL_HANDLE;
+			r->cursor.staging_memory = VK_NULL_HANDLE;
+			r->cursor.staging_size = 0;
+		}
+		if (!vk_buffer_init(vk, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+		                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		                    &r->cursor.staging, &r->cursor.staging_memory)) {
+			U_LOG_E("cursor_draw: default-look staging buffer failed");
+			r->cursor.staging = VK_NULL_HANDLE;
+			r->cursor.staging_memory = VK_NULL_HANDLE;
+			return false;
+		}
+		r->cursor.staging_size = size;
+	}
+	void *mapped = NULL;
+	res = vk->vkMapMemory(vk->device, r->cursor.staging_memory, 0, size, 0, &mapped);
+	if (res != VK_SUCCESS || mapped == NULL) {
+		return false;
+	}
+	memcpy(mapped, rgba, (size_t)size);
+	vk->vkUnmapMemory(vk->device, r->cursor.staging_memory);
+	r->cursor.upload_pending = true;
+	return true;
+}
+
+/*!
+ * Before the pass: copy staged default-look pixels into its image (only when
+ * they changed), and resolve the view + sampler kind the cursor samples.
+ *
+ * @param[out] out_app_image The app sprite's VkImage, to transition for
+ *             sampling with the layers' sources; VK_NULL_HANDLE otherwise.
+ * @return false if there is nothing to sample this frame.
+ */
+static bool
+cursor_prepare(struct comp_vk_native_renderer *r,
+               VkCommandBuffer cmd,
+               const struct comp_vk_native_cursor_draw *cur,
+               VkImageView *out_view,
+               enum vk_compose_sampler *out_sampler,
+               VkImage *out_app_image)
+{
+	struct vk_bundle *vk = r->vk;
+	*out_app_image = VK_NULL_HANDLE;
+	*out_sampler = VK_COMPOSE_SAMPLER_2D;
+
+	if (cur->xsc != NULL) {
+		VkImage img = (VkImage)(uintptr_t)comp_vk_native_swapchain_get_image(cur->xsc, cur->image_index);
+		// Same rule as every layer source (#1589): an `_SRGB` sprite
+		// decodes into the linear blend.
+		const uint64_t v = compose_source_view(cur->xsc, cur->image_index);
+		if (img == VK_NULL_HANDLE || v == 0) {
+			return false;
+		}
+		*out_view = (VkImageView)(uintptr_t)v;
+		*out_sampler = comp_vk_native_swapchain_get_array_size(cur->xsc) > 1 ? VK_COMPOSE_SAMPLER_2D_ARRAY
+		                                                                     : VK_COMPOSE_SAMPLER_2D;
+		*out_app_image = img;
+		return true;
+	}
+
+	if (r->cursor.default_image == VK_NULL_HANDLE) {
+		return false;
+	}
+	if (r->cursor.upload_pending) {
+		cmd_image_barrier(
+		    vk, cmd, r->cursor.default_image,
+		    r->cursor.default_ready ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
+		    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+		    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+		const VkBufferImageCopy region = {
+		    .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+		    .imageExtent = {r->cursor.default_w, r->cursor.default_h, 1},
+		};
+		vk->vkCmdCopyBufferToImage(cmd, r->cursor.staging, r->cursor.default_image,
+		                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+		cmd_image_barrier(vk, cmd, r->cursor.default_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+		                  VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+		r->cursor.upload_pending = false;
+		r->cursor.default_ready = true;
+	}
+	if (!r->cursor.default_ready) {
+		return false;
+	}
+	*out_view = r->cursor.default_view;
+	return true;
+}
+
+/*!
+ * Inside the pass, after every layer: one quad per view tile.
+ *
+ * The compose vertex shader's QUAD path maps the unit square's
+ * `pos = (u - 0.5, 0.5 - v)` through `mvp`; an affine mvp built from three of
+ * the sprite's tile-normalised corners puts texel (u, v) exactly where
+ * u_cursor_draw_corners() said, for any per-view map (Vulkan NDC +y runs down
+ * the viewport, the same direction as the tile's y).
+ */
+static void
+cursor_record_draws(struct comp_vk_native_renderer *r,
+                    VkCommandBuffer cmd,
+                    const struct comp_vk_native_cursor_draw *cur,
+                    VkImageView src_view,
+                    enum vk_compose_sampler sampler_kind,
+                    const struct comp_vk_native_eff_layout *layout)
+{
+	struct vk_bundle *vk = r->vk;
+
+	VkDescriptorSetAllocateInfo ds_ai = {
+	    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+	    .descriptorPool = r->zone.descriptor_pool,
+	    .descriptorSetCount = 1,
+	    .pSetLayouts = &r->zone.set_layout,
+	};
+	VkDescriptorSet set = VK_NULL_HANDLE;
+	if (vk->vkAllocateDescriptorSets(vk->device, &ds_ai, &set) != VK_SUCCESS) {
+		return;
+	}
+	VkDescriptorImageInfo image_info = {
+	    .sampler = r->zone.sampler,
+	    .imageView = src_view,
+	    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	};
+	VkWriteDescriptorSet write = {
+	    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+	    .dstSet = set,
+	    .dstBinding = 0,
+	    .descriptorCount = 1,
+	    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+	    .pImageInfo = &image_info,
+	};
+	vk->vkUpdateDescriptorSets(vk->device, 1, &write, 0, NULL);
+
+	const enum vk_compose_blend blend = cur->premultiplied ? VK_COMPOSE_BLEND_PREMULT : VK_COMPOSE_BLEND_UNPREMULT;
+	vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r->zone.pipelines[blend][sampler_kind]);
+	vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r->zone.pipeline_layout, 0, 1, &set, 0, NULL);
+
+	// Mono content fills the whole content region (one tile box); otherwise
+	// view i owns tile i of the effective grid (#542).
+	const bool mono = layout->views <= 1;
+	const uint32_t tiles = mono ? 1 : layout->cols * layout->rows;
+	const uint32_t n = cur->view_count < tiles ? cur->view_count : tiles;
+	for (uint32_t i = 0; i < n; i++) {
+		float bx, by, bw, bh;
+		if (mono) {
+			bx = 0.0f;
+			by = 0.0f;
+			bw = (float)(layout->cols * layout->tile_w);
+			bh = (float)(layout->rows * layout->tile_h);
+		} else {
+			bx = (float)((i % layout->cols) * layout->tile_w);
+			by = (float)((i / layout->cols) * layout->tile_h);
+			bw = (float)layout->tile_w;
+			bh = (float)layout->tile_h;
+		}
+		if (bw <= 0.0f || bh <= 0.0f || bx >= (float)r->atlas_alloc_width ||
+		    by >= (float)r->atlas_alloc_height) {
+			continue;
+		}
+		VkViewport vp = {.x = bx, .y = by, .width = bw, .height = bh, .minDepth = 0.0f, .maxDepth = 1.0f};
+		// The scissor is mandatory: a cursor at a tile edge must not spill
+		// into the neighbour view (the DP would weave it into the wrong eye).
+		const float sx1 = bx + bw > (float)r->atlas_alloc_width ? (float)r->atlas_alloc_width : bx + bw;
+		const float sy1 = by + bh > (float)r->atlas_alloc_height ? (float)r->atlas_alloc_height : by + bh;
+		VkRect2D scissor = {
+		    .offset = {(int32_t)bx, (int32_t)by},
+		    .extent = {(uint32_t)(sx1 - bx), (uint32_t)(sy1 - by)},
+		};
+
+		const float(*c)[2] = cur->corners[i];
+		const float ex[2] = {c[2][0] - c[0][0], c[2][1] - c[0][1]}; // u: (0,0) -> (1,0)
+		const float ey[2] = {c[1][0] - c[0][0], c[1][1] - c[0][1]}; // v: (0,0) -> (0,1)
+		const float mid[2] = {c[0][0] + 0.5f * (ex[0] + ey[0]), c[0][1] + 0.5f * (ex[1] + ey[1])};
+		// Column-major: NDC = 2 * (mid + pos.x * ex - pos.y * ey) - 1.
+		struct vk_compose_push push = {
+		    .mvp = {2.0f * ex[0], 2.0f * ex[1], 0.0f, 0.0f,   //
+		            -2.0f * ey[0], -2.0f * ey[1], 0.0f, 0.0f, //
+		            0.0f, 0.0f, 1.0f, 0.0f,                   //
+		            2.0f * mid[0] - 1.0f, 2.0f * mid[1] - 1.0f, 0.0f, 1.0f},
+		    .src_rect = {0.0f, 0.0f, 1.0f, 1.0f},
+		    .params = {0.0f, 1.0f, 0.0f, 0.0f}, // array slice 0, QUAD path
+		    .color_scale = {1.0f, 1.0f, 1.0f, 1.0f},
+		    .color_bias = {0.0f, 0.0f, 0.0f, 0.0f},
+		};
+		vk->vkCmdSetViewport(cmd, 0, 1, &vp);
+		vk->vkCmdSetScissor(cmd, 0, 1, &scissor);
+		vk->vkCmdPushConstants(cmd, r->zone.pipeline_layout,
+		                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push),
+		                       &push);
+		vk->vkCmdDraw(cmd, 6, 1, 0, 0);
+	}
+
+	if (!r->cursor.announced) {
+		r->cursor.announced = true;
+		U_LOG_W(
+		    "cursor_draw: Vulkan compositor drawing the cursor (%s, %u view(s); ADR-046 Amendment 2 B, "
+		    "one-time notice)",
+		    cur->xsc != NULL ? "app sprite" : "default look", n);
+	}
+}
+
 //! Draw-based projection pass for zones frames: clear via loadOp, draw each
 //! zone's view tiles alpha-over in layer-list order, finish in
 //! SHADER_READ_ONLY. Mirrors comp_d3d11_renderer's zone branch.
@@ -1779,7 +2144,8 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
                 struct comp_layer_accum *layers,
                 uint32_t target_width,
                 uint32_t target_height,
-                const struct comp_vk_native_eff_layout *layout)
+                const struct comp_vk_native_eff_layout *layout,
+                const struct comp_vk_native_cursor_draw *cursor)
 {
 	struct vk_bundle *vk = r->vk;
 
@@ -1795,7 +2161,7 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 	// Transition each unique source image for sampling. A zone's view tiles
 	// share one swapchain image, so dedupe — re-transitioning would declare
 	// a wrong oldLayout.
-	VkImage transitioned[VK_ZONE_MAX_DRAWS];
+	VkImage transitioned[VK_ZONE_MAX_DRAWS + 1];
 	uint32_t transitioned_count = 0;
 	for (uint32_t i = 0; i < layers->layer_count; i++) {
 		struct comp_layer *layer = &layers->layers[i];
@@ -1848,6 +2214,34 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 			                   VK_ACCESS_SHADER_READ_BIT,
 			                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 			                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+		}
+	}
+
+	/*
+	 * XR_DXR_cursor_depth v5: the cursor's source, resolved (and the default
+	 * look uploaded) outside the pass. An app sprite is transitioned with the
+	 * layers' sources - and handed back with them below - unless a layer
+	 * already samples the same image.
+	 */
+	VkImageView cursor_view = VK_NULL_HANDLE;
+	enum vk_compose_sampler cursor_sampler = VK_COMPOSE_SAMPLER_2D;
+	bool cursor_ok = false;
+	if (cursor != NULL && cursor->active) {
+		VkImage cursor_img = VK_NULL_HANDLE;
+		cursor_ok = cursor_prepare(r, cmd, cursor, &cursor_view, &cursor_sampler, &cursor_img);
+		if (cursor_ok && cursor_img != VK_NULL_HANDLE) {
+			bool seen = false;
+			for (uint32_t t = 0; t < transitioned_count; t++) {
+				seen = seen || transitioned[t] == cursor_img;
+			}
+			if (!seen) {
+				transitioned[transitioned_count++] = cursor_img;
+				cmd_image_barrier(vk, cmd, cursor_img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+				                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+				                  VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+				                  VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+				                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+			}
 		}
 	}
 
@@ -2058,10 +2452,7 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 			 * and #1572's UNORM scratch; neither is wired in here,
 			 * and wiring them in would double-encode.
 			 */
-			const uint64_t src_view_u64 =
-			    u_color_legacy_unorm_encoded()
-			        ? comp_vk_native_swapchain_get_image_view(xsc, sub->image_index)
-			        : comp_vk_native_swapchain_get_true_image_view(xsc, sub->image_index);
+			const uint64_t src_view_u64 = compose_source_view(xsc, sub->image_index);
 			VkImageView src_view = (VkImageView)(uintptr_t)src_view_u64;
 			if (src_view == VK_NULL_HANDLE) {
 				continue;
@@ -2286,6 +2677,14 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 		}
 	}
 
+	// XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B): the runtime-drawn
+	// cursor, LAST in the pass - over every layer it composed, never
+	// occluded - and before the atlas is published to the DP. Zones frames
+	// are refused upstream (the state tracker) and here.
+	if (cursor_ok && !zones_frame) {
+		cursor_record_draws(r, cmd, cursor, cursor_view, cursor_sampler, layout);
+	}
+
 	vk->vkCmdEndRenderPass(cmd);
 
 	/*
@@ -2471,11 +2870,27 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	const bool structure_allows_raw =
 	    !zones_frame && (drawable == 0 || (drawable == 1 && compose_frame_base_is_projection(layers)));
 
-	const bool want_pass =
-	    !(colour_allows_raw && structure_allows_raw) || debug_get_bool_option_vk_force_compose_pass();
+	/*
+	 * XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B): consumed by THIS draw
+	 * only. A frame carrying the runtime-drawn cursor composes through the
+	 * pass - the blit cannot blend - so the cursor is drawn after the layers
+	 * it composes. ZERO COST UNLESS REQUESTED: one field test.
+	 */
+	struct comp_vk_native_cursor_draw cursor = {0};
+	if (r->cursor.req.active) {
+		cursor = r->cursor.req;
+		r->cursor.req.active = false;
+	}
+
+	const bool want_pass = !(colour_allows_raw && structure_allows_raw) ||
+	                       debug_get_bool_option_vk_force_compose_pass() || cursor.active;
 
 	if (want_pass && zone_pass_usable(r, layers, layout)) {
-		return draw_zones_pass(r, layers, target_width, target_height, layout);
+		return draw_zones_pass(r, layers, target_width, target_height, layout, cursor.active ? &cursor : NULL);
+	}
+	if (cursor.active && !r->cursor.warned_no_pass) {
+		r->cursor.warned_no_pass = true;
+		U_LOG_W("cursor_draw: the Vulkan compose pass is unavailable - cursor not drawn (one-time warning)");
 	}
 	if (want_pass) {
 		static bool fallback_warned = false;

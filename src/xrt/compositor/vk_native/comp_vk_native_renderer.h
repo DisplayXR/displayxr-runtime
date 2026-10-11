@@ -10,6 +10,7 @@
 #pragma once
 
 #include "xrt/xrt_defines.h"
+#include "xrt/xrt_limits.h"
 #include "xrt/xrt_display_metrics.h"
 #include "xrt/xrt_results.h"
 
@@ -21,6 +22,7 @@ struct comp_vk_native_renderer;
 struct comp_vk_native_compositor;
 struct comp_layer_accum;
 struct comp_vk_deposit;
+struct xrt_swapchain;
 
 #ifdef __cplusplus
 extern "C" {
@@ -335,6 +337,63 @@ comp_vk_native_renderer_get_cmd_pool(struct comp_vk_native_renderer *renderer);
 void
 comp_vk_native_renderer_set_transparent(struct comp_vk_native_renderer *renderer,
                                          bool transparent_background);
+
+/*!
+ * XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B): one frame's runtime-drawn
+ * cursor, resolved by the compositor - where the sprite's corners land in
+ * each view's tile and which image to sample. Zero-initialised = no cursor.
+ */
+struct comp_vk_native_cursor_draw
+{
+	//! Draw at the next comp_vk_native_renderer_draw only.
+	bool active;
+	//! Views mapped below; view i is drawn into atlas tile i.
+	uint32_t view_count;
+	/*!
+	 * Per view, the sprite's corners in TILE-NORMALISED coordinates (origin
+	 * top-left, y down), in texture order (0,0), (0,1), (1,0), (1,1) - the
+	 * u_cursor_draw_corners() output.
+	 */
+	float corners[XRT_MAX_VIEWS][4][2];
+	//! The app's sprite swapchain (sampled at @ref image_index, array layer
+	//! 0) or NULL for the renderer's default-look image.
+	struct xrt_swapchain *xsc;
+	uint32_t image_index;
+	//! The source holds premultiplied alpha (the default look) rather than
+	//! straight (the app's sprite, per the spec).
+	bool premultiplied;
+};
+
+/*!
+ * Hand the renderer the cursor to draw at its NEXT draw (consumed there).
+ *
+ * The draw forces the compose render pass for that frame (the blit fast path
+ * cannot blend) and draws one alpha-blended quad per view tile AFTER every
+ * layer the pass composes (projection, quad, equirect2) and before the atlas
+ * is published - blending in linear light through the pass's private `_SRGB`
+ * target, sampling the sprite as its declared format, so the atlas stays
+ * ENCODED and is never double-encoded. Nothing is built unless this is called.
+ *
+ * @ingroup comp_vk_native
+ */
+void
+comp_vk_native_renderer_set_cursor(struct comp_vk_native_renderer *renderer,
+                                   const struct comp_vk_native_cursor_draw *cursor);
+
+/*!
+ * Upload the default look's pixels (premultiplied, sRGB-ENCODED RGBA8, top
+ * row first): staged now, copied into the renderer's own sprite image by the
+ * next draw. Call only when the look's image changed.
+ *
+ * @return false if the image or its staging could not be created.
+ *
+ * @ingroup comp_vk_native
+ */
+bool
+comp_vk_native_renderer_set_cursor_default_image(struct comp_vk_native_renderer *renderer,
+                                                 const uint8_t *rgba,
+                                                 uint32_t width,
+                                                 uint32_t height);
 
 #ifdef __cplusplus
 }

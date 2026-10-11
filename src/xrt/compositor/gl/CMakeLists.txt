@@ -26,6 +26,8 @@ target_link_libraries(
 		aux_math
 		aux_ogl
 		xrt-external-stb
+		# XR_DXR_cursor_depth v5: the runtime-drawn cursor's default look.
+		comp_cursor_look
 	)
 
 target_include_directories(comp_gl PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

@@ -256,6 +256,21 @@ if(APPLE)
 endif()
 
 ###
+# XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B): the runtime-drawn cursor's
+# default look (the mirrored OS cursor, else the classic arrow), shared by the
+# Metal, Vulkan and GL compositors so they cannot drift apart on it. Its own
+# tiny library rather than part of comp_util: comp_gl does not link comp_util
+# (which is Vulkan-gated), and none of this needs a graphics API.
+#
+add_library(comp_cursor_look STATIC util/comp_cursor_look.c util/comp_cursor_look.h)
+target_link_libraries(comp_cursor_look PUBLIC xrt-interfaces PRIVATE aux_util)
+target_include_directories(comp_cursor_look PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+if(APPLE)
+	target_sources(comp_cursor_look PRIVATE util/comp_cursor_look_macos.m)
+	target_link_libraries(comp_cursor_look PRIVATE "-framework AppKit")
+endif()
+
+###
 # Shared desktop-Linux service window (#710, #967): the runtime-owned X11
 # surface (Xorg or XWayland) the service's comp_multi shared spatial surface
 # presents to, plus the comp_target_swapchain it drives. The comp_macos_window
