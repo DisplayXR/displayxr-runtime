@@ -586,12 +586,27 @@ bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysicalDevic
         subpass.pColorAttachments = &colorRef;
         subpass.pDepthStencilAttachment = &depthRef;
 
+        // With several frames in flight (dxr::VkFrameRing) the per-eye depth
+        // image is shared by consecutive frames: order this frame's depth
+        // clear/writes after the previous frame's (WAW), and colour likewise.
+        VkSubpassDependency dep = {};
+        dep.srcSubpass = VK_SUBPASS_EXTERNAL;
+        dep.dstSubpass = 0;
+        dep.srcStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dep.dstStageMask = dep.srcStageMask;
+        dep.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        dep.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
         VkRenderPassCreateInfo rpInfo = {};
         rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
         rpInfo.attachmentCount = 2;
         rpInfo.pAttachments = attachments;
         rpInfo.subpassCount = 1;
         rpInfo.pSubpasses = &subpass;
+        rpInfo.dependencyCount = 1;
+        rpInfo.pDependencies = &dep;
 
         if (vkCreateRenderPass(device, &rpInfo, nullptr, &renderer.renderPass) != VK_SUCCESS) {
             LOG_ERROR("Failed to create render pass");
@@ -1214,16 +1229,10 @@ bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysicalDevic
         renderer.texturesLoaded = true;
     }
 
-    // Frame fence
-    {
-        VkFenceCreateInfo fenceInfo = {};
-        fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-        fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-
-        if (vkCreateFence(device, &fenceInfo, nullptr, &renderer.frameFence) != VK_SUCCESS) {
-            LOG_ERROR("Failed to create fence");
-            return false;
-        }
+    // Frame ring (INV-4.10 / #1917): per-frame command buffers + fences.
+    if (!renderer.ring.init(device, physDevice, queue, queueFamilyIndex, dxr::VkFrameRing::Config{})) {
+        LOG_ERROR("Failed to create frame ring");
+        return false;
     }
 
     LOG_INFO("Vulkan renderer initialized");
@@ -1343,20 +1352,13 @@ void RenderScene(
     const EyeRenderParams* eyes, int eyeCount,
     float zoomScale)
 {
-    VkDevice device = renderer.device;
-
-    // Wait for previous frame's fence
-    LOG_INFO("[RenderScene] imageIndex=%u: vkWaitForFences (pre-render)...", imageIndex);
-    VkResult fenceResult = vkWaitForFences(device, 1, &renderer.frameFence, VK_TRUE, UINT64_MAX);
-    LOG_INFO("[RenderScene] vkWaitForFences returned %d", (int)fenceResult);
-    vkResetFences(device, 1, &renderer.frameFence);
-
-    // Begin command buffer
-    vkResetCommandBuffer(renderer.commandBuffer, 0);
-    VkCommandBufferBeginInfo beginInfo = {};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(renderer.commandBuffer, &beginInfo);
+    // Begin this frame's ring slot (waits only the fence of the frame that
+    // used this slot N frames ago).
+    VkCommandBuffer cmd = renderer.ring.beginFrame();
+    if (cmd == VK_NULL_HANDLE) {
+        LOG_ERROR("[RenderScene] imageIndex=%u: ring.beginFrame failed", imageIndex);
+        return;
+    }
 
     // Single render pass with CLEAR covering full framebuffer.
     // Transparent-background mode (DISPLAYXR_TRANSPARENT_BG=1): clear to
@@ -1399,7 +1401,7 @@ void RenderScene(
     rpBegin.pClearValues = clearValues;
 
     __try {
-        vkCmdBeginRenderPass(renderer.commandBuffer, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         LOG_ERROR("[RenderScene] CRASH in vkCmdBeginRenderPass! exception=0x%08X", GetExceptionCode());
         return;
@@ -1425,12 +1427,12 @@ void RenderScene(
         viewport.height = -(float)h;
         viewport.minDepth = 0.0f;
         viewport.maxDepth = 1.0f;
-        vkCmdSetViewport(renderer.commandBuffer, 0, 1, &viewport);
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
 
         VkRect2D scissor = {};
         scissor.offset = {(int32_t)vpX, (int32_t)vpY};
         scissor.extent = {w, h};
-        vkCmdSetScissor(renderer.commandBuffer, 0, 1, &scissor);
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
 
         // Draw cube - base rests on grid at y=0
         {
@@ -1446,19 +1448,19 @@ void RenderScene(
             XMMATRIX cubeModel = cubeRot * cubeScale;
             XMStoreFloat4x4(&pc.model, cubeModel);
 
-            vkCmdBindPipeline(renderer.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer.cubePipeline);
-            vkCmdPushConstants(renderer.commandBuffer, renderer.cubePipelineLayout,
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer.cubePipeline);
+            vkCmdPushConstants(cmd, renderer.cubePipelineLayout,
                 VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pc), &pc);
 
             if (renderer.texturesLoaded) {
-                vkCmdBindDescriptorSets(renderer.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                     renderer.cubePipelineLayout, 0, 1, &renderer.descriptorSet, 0, nullptr);
             }
 
             VkDeviceSize offset = 0;
-            vkCmdBindVertexBuffers(renderer.commandBuffer, 0, 1, &renderer.cubeVertexBuffer, &offset);
-            vkCmdBindIndexBuffer(renderer.commandBuffer, renderer.cubeIndexBuffer, 0, VK_INDEX_TYPE_UINT16);
-            vkCmdDrawIndexed(renderer.commandBuffer, 36, 1, 0, 0, 0);
+            vkCmdBindVertexBuffers(cmd, 0, 1, &renderer.cubeVertexBuffer, &offset);
+            vkCmdBindIndexBuffer(cmd, renderer.cubeIndexBuffer, 0, VK_INDEX_TYPE_UINT16);
+            vkCmdDrawIndexed(cmd, 36, 1, 0, 0, 0);
         }
 
         // Draw grid floor
@@ -1472,36 +1474,30 @@ void RenderScene(
             XMStoreFloat4x4(&pc.transform, gridWVP);
             pc.color[0] = 0.3f; pc.color[1] = 0.3f; pc.color[2] = 0.35f; pc.color[3] = 1.0f;
 
-            vkCmdBindPipeline(renderer.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer.gridPipeline);
-            vkCmdPushConstants(renderer.commandBuffer, renderer.pipelineLayout,
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer.gridPipeline);
+            vkCmdPushConstants(cmd, renderer.pipelineLayout,
                 VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
 
             VkDeviceSize offset = 0;
-            vkCmdBindVertexBuffers(renderer.commandBuffer, 0, 1, &renderer.gridVertexBuffer, &offset);
-            vkCmdDraw(renderer.commandBuffer, renderer.gridVertexCount, 1, 0, 0);
+            vkCmdBindVertexBuffers(cmd, 0, 1, &renderer.gridVertexBuffer, &offset);
+            vkCmdDraw(cmd, renderer.gridVertexCount, 1, 0, 0);
         }
     }
 
-    vkCmdEndRenderPass(renderer.commandBuffer);
-    vkEndCommandBuffer(renderer.commandBuffer);
+    vkCmdEndRenderPass(cmd);
 
-    // Submit
-    VkSubmitInfo submitInfo = {};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &renderer.commandBuffer;
-
-    VkResult submitResult = vkQueueSubmit(renderer.graphicsQueue, 1, &submitInfo, renderer.frameFence);
-    LOG_INFO("[RenderScene] vkQueueSubmit returned %d", (int)submitResult);
-
-    // Wait for completion before returning (runtime needs the image ready)
-    VkResult waitResult = vkWaitForFences(device, 1, &renderer.frameFence, VK_TRUE, UINT64_MAX);
-    LOG_INFO("[RenderScene] vkWaitForFences returned %d - DONE", (int)waitResult);
+    // ONE submit, no wait: the runtime composes on the same VkQueue, so this
+    // work is ordered ahead of it as long as the image is released after.
+    VkResult submitResult = renderer.ring.endFrame();
+    if (submitResult != VK_SUCCESS) {
+        LOG_ERROR("[RenderScene] ring.endFrame (vkQueueSubmit) failed: %d", (int)submitResult);
+    }
 }
 
 void CleanupVkRenderer(VkRenderer& renderer) {
     if (!renderer.device) return;
 
+    renderer.ring.waitAll();
     vkDeviceWaitIdle(renderer.device);
 
     // Cleanup texture resources
@@ -1559,10 +1555,7 @@ void CleanupVkRenderer(VkRenderer& renderer) {
         }
     }
 
-    if (renderer.frameFence) {
-        vkDestroyFence(renderer.device, renderer.frameFence, nullptr);
-        renderer.frameFence = VK_NULL_HANDLE;
-    }
+    renderer.ring.destroy();
     if (renderer.commandPool) {
         vkDestroyCommandPool(renderer.device, renderer.commandPool, nullptr);
         renderer.commandPool = VK_NULL_HANDLE;

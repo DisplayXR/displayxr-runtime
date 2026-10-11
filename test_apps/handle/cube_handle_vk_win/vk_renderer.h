@@ -11,6 +11,7 @@
 #include <vulkan/vulkan.h>
 #include <DirectXMath.h>
 #include <vector>
+#include <vk_frame_ring.h>
 
 struct VkRenderer {
     VkDevice device = VK_NULL_HANDLE;
@@ -57,12 +58,13 @@ struct VkRenderer {
     std::vector<VkImageView> swapchainImageViews[2];
     std::vector<VkFramebuffer> framebuffers[2];
 
-    // Command pool and buffers
+    // Command pool + buffer for the init-time texture upload only.
     VkCommandPool commandPool = VK_NULL_HANDLE;
     VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
 
-    // Fence for frame synchronization
-    VkFence frameFence = VK_NULL_HANDLE;
+    // INV-4.10 / #1917: N frames in flight, one submit per frame, never a wait
+    // on the frame just submitted. Owns the per-frame command buffers + fences.
+    dxr::VkFrameRing ring;
 
     // ADR-021 / INV-4.6: does this renderer emit SCENE-LINEAR? Latched once, at
     // InitializeVkRenderer(), from dxr::RenderSceneLinear() -- the pipelines bake

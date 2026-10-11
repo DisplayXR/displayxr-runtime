@@ -527,17 +527,8 @@ static bool UploadStripPixels(VkRenderer& renderer, VkImage image, uint32_t w, u
     memcpy(mapped, pixels, size);
     vkUnmapMemory(renderer.device, stagingMem);
 
-    VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    cai.commandPool = renderer.commandPool;
-    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cai.commandBufferCount = 1;
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    bool ok = vkAllocateCommandBuffers(renderer.device, &cai, &cmd) == VK_SUCCESS;
-    if (ok) {
-        VkCommandBufferBeginInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkBeginCommandBuffer(cmd, &cbi);
-
+    // One-off (filled once at activation): the ring's sanctioned blocking path.
+    const bool ok = renderer.ring.submitImmediate([&](VkCommandBuffer cmd) {
         VkImageMemoryBarrier toDst = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         toDst.srcAccessMask = 0;
         toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -564,18 +555,7 @@ static bool UploadStripPixels(VkRenderer& renderer, VkImage image, uint32_t w, u
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
                              &toRead);
-
-        vkEndCommandBuffer(cmd);
-
-        VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        si.commandBufferCount = 1;
-        si.pCommandBuffers = &cmd;
-        ok = vkQueueSubmit(renderer.graphicsQueue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS;
-        if (ok) {
-            vkQueueWaitIdle(renderer.graphicsQueue);
-        }
-        vkFreeCommandBuffers(renderer.device, renderer.commandPool, 1, &cmd);
-    }
+    }) == VK_SUCCESS;
 
     vkFreeMemory(renderer.device, stagingMem, nullptr);
     vkDestroyBuffer(renderer.device, staging, nullptr);
@@ -769,6 +749,13 @@ static void RenderZonesFrame(XrSessionManager& xr, VkRenderer& renderer,
     uint32_t submitViewCounts[kNumZones] = {};
     // ADR-041: what each zone LAYER carries (>= submitViewCounts[zi]).
     uint32_t locatedViewCounts[kNumZones] = {};
+    // Zone swapchains acquired this frame; released only after the ONE ring
+    // submit below (INV-4.10: every zone's rendering shares one submit).
+    bool acquired[kNumZones] = {};
+    VkCommandBuffer cmd = renderer.ring.beginFrame();
+    if (cmd == VK_NULL_HANDLE) {
+        LOG_ERROR("[zones] ring.beginFrame failed");
+    }
 
     for (uint32_t zi = 0; zi < kNumZones; zi++) {
         DisplayZone& z = g_zonesArr[zi];
@@ -859,10 +846,11 @@ static void RenderZonesFrame(XrSessionManager& xr, VkRenderer& renderer,
         // Acquire this zone's array swapchain image.
         XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
         uint32_t imageIndex = 0;
-        if (XR_FAILED(xrAcquireSwapchainImage(z.swapchain, &ai, &imageIndex))) {
+        if (cmd == VK_NULL_HANDLE || XR_FAILED(xrAcquireSwapchainImage(z.swapchain, &ai, &imageIndex))) {
             submitViewCounts[zi] = 0;
             continue;
         }
+        acquired[zi] = true;
         XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
         wi.timeout = XR_INFINITE_DURATION;
         xrWaitSwapchainImage(z.swapchain, &wi);
@@ -877,7 +865,7 @@ static void RenderZonesFrame(XrSessionManager& xr, VkRenderer& renderer,
             ep.viewMatrix = ColumnMajorToXMMatrix(rigViews[vi].view_matrix);
             ep.projMatrix = ColumnMajorToXMMatrix(rigViews[vi].projection_matrix);
 
-            RenderSceneToZoneLayer(renderer, z.fb, imageIndex, vi, ep, z.clearColor, z.spinPhase);
+            RenderSceneToZoneLayer(renderer, cmd, z.fb, imageIndex, vi, ep, z.clearColor, z.spinPhase);
 
             projViews[zi][vi].subImage.swapchain = z.swapchain;
             projViews[zi][vi].subImage.imageRect.offset = {0, 0};
@@ -890,9 +878,20 @@ static void RenderZonesFrame(XrSessionManager& xr, VkRenderer& renderer,
         // ADR-041: this zone rendered only `n` views — point the inactive tail
         // at this zone's view-0 layer so the layer can carry `locatedCount`.
         DxrAliasInactiveViews(projViews[zi].data(), zoneViews, locatedCount, n);
+    }
 
+    // ONE submit for every zone layer, no wait; then release the zone images
+    // (the runtime composes on the same VkQueue, so release AFTER the submit).
+    if (cmd != VK_NULL_HANDLE) {
+        const VkResult sr = renderer.ring.endFrame();
+        if (sr != VK_SUCCESS) {
+            LOG_ERROR("[zones] ring.endFrame (vkQueueSubmit) failed: %d", (int)sr);
+        }
+    }
+    for (uint32_t zi = 0; zi < kNumZones; zi++) {
+        if (!acquired[zi]) continue;
         XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-        xrReleaseSwapchainImage(z.swapchain, &ri);
+        xrReleaseSwapchainImage(g_zonesArr[zi].swapchain, &ri);
     }
 
     // Layer list: [projA (zone A chained), projB (zone B chained)].
@@ -1176,6 +1175,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     LOG_INFO("Main thread: render thread joined");
 
     LOG_INFO("=== Shutting down ===");
+    vkRenderer.ring.waitAll();
     if (vkDevice != VK_NULL_HANDLE) vkDeviceWaitIdle(vkDevice);
     for (uint32_t zi = 0; zi < kNumZones; zi++) {
         DestroyZoneArrayFramebuffers(vkRenderer, g_zonesArr[zi].fb);

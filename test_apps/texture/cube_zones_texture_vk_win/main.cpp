@@ -768,49 +768,35 @@ static bool UploadBgraToVkImage(VkRenderer& vk, VkImage img, uint32_t w, uint32_
     memcpy(mapped, buf.data(), buf.size());
     vkUnmapMemory(vk.device, stagingMem);
 
-    VkCommandBufferAllocateInfo cbai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    cbai.commandPool = vk.commandPool;
-    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cbai.commandBufferCount = 1;
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    vkAllocateCommandBuffers(vk.device, &cbai, &cmd);
-    VkCommandBufferBeginInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &cbi);
+    // One-off (strip filled once at activation): the ring's sanctioned
+    // blocking path.
+    vk.ring.submitImmediate([&](VkCommandBuffer cmd) {
+        VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.srcAccessMask = 0;
+        b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = img;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+                             nullptr, 0, nullptr, 1, &b);
 
-    VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    b.srcAccessMask = 0;
-    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.image = img;
-    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
-                         nullptr, 0, nullptr, 1, &b);
+        VkBufferImageCopy region = {};
+        region.bufferRowLength = w;
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageOffset = {0, 0, 0};
+        region.imageExtent = {w, h, 1};
+        vkCmdCopyBufferToImage(cmd, staging, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
-    VkBufferImageCopy region = {};
-    region.bufferRowLength = w;
-    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.imageOffset = {0, 0, 0};
-    region.imageExtent = {w, h, 1};
-    vkCmdCopyBufferToImage(cmd, staging, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-
-    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
-                         nullptr, 0, nullptr, 1, &b);
-
-    vkEndCommandBuffer(cmd);
-    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cmd;
-    vkQueueSubmit(vk.graphicsQueue, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(vk.graphicsQueue);
-    vkFreeCommandBuffers(vk.device, vk.commandPool, 1, &cmd);
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
+                             nullptr, 0, nullptr, 1, &b);
+    });
     vkDestroyBuffer(vk.device, staging, nullptr);
     vkFreeMemory(vk.device, stagingMem, nullptr);
     return true;
@@ -1099,6 +1085,13 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
     uint32_t submitViewCounts[kNumZones] = {};
     // ADR-041: what each zone LAYER carries (>= submitViewCounts[zi]).
     uint32_t locatedViewCounts[kNumZones] = {};
+    // Zone swapchains acquired this frame; released only after the ONE ring
+    // submit below (INV-4.10: every zone's rendering shares one submit).
+    bool acquired[kNumZones] = {};
+    VkCommandBuffer cmd = vk.ring.beginFrame();
+    if (cmd == VK_NULL_HANDLE) {
+        LOG_ERROR("[zones] ring.beginFrame failed");
+    }
 
     for (uint32_t zi = 0; zi < kNumZones; zi++) {
         DisplayZone& z = g_zonesArr[zi];
@@ -1207,20 +1200,35 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
         // Acquire this zone's swapchain image and render every view tile.
         XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
         uint32_t imageIndex = 0;
-        if (XR_FAILED(xrAcquireSwapchainImage(z.swapchain, &ai, &imageIndex))) {
+        if (cmd == VK_NULL_HANDLE || XR_FAILED(xrAcquireSwapchainImage(z.swapchain, &ai, &imageIndex))) {
             submitViewCounts[zi] = 0;
             continue;
         }
+        acquired[zi] = true;
         XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
         wi.timeout = XR_INFINITE_DURATION;
         xrWaitSwapchainImage(z.swapchain, &wi);
 
         // Per-zone clear (premultiplied RGBA) + spin phase via RenderSceneToZone.
-        RenderSceneToZone(vk, z.fb, imageIndex, eyes.data(), (int)n,
+        RenderSceneToZone(vk, cmd, z.fb, imageIndex, eyes.data(), (int)n,
                           z.clearColor, z.spinPhase);
+    }
 
+    // ONE submit for every zone, no wait; then release the zone images (the
+    // runtime composes on the same VkQueue, so release AFTER the submit). No
+    // app-side wait is needed for the texture-mode present either: the app
+    // never reads its own Vulkan output — it presents the runtime-composited
+    // shared texture after xrEndFrame, which the runtime finishes/synchronises.
+    if (cmd != VK_NULL_HANDLE) {
+        const VkResult sr = vk.ring.endFrame();
+        if (sr != VK_SUCCESS) {
+            LOG_ERROR("[zones] ring.endFrame (vkQueueSubmit) failed: %d", (int)sr);
+        }
+    }
+    for (uint32_t zi = 0; zi < kNumZones; zi++) {
+        if (!acquired[zi]) continue;
         XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-        xrReleaseSwapchainImage(z.swapchain, &ri);
+        xrReleaseSwapchainImage(g_zonesArr[zi].swapchain, &ri);
     }
 
     // Layer list: [projA (zone A chained), projB (zone B chained), strip].
@@ -1920,6 +1928,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     LOG_INFO("");
     LOG_INFO("=== Shutting down ===");
 
+    // Drain in-flight ring frames before destroying zone framebuffers/swapchains.
+    vkRenderer.ring.waitAll();
     CleanupZones(vkRenderer);
 
     // Release RenderState ComPtrs first (they hold the swapchain refs).
