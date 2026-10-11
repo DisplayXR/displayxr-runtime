@@ -262,7 +262,8 @@ the primary camera wakes the tracker" (David, 2026-10-10). Decisions:
 - **The session's tracking boolean is the OR over the DPs that currently present for it**: its
   own DP, plus every live segment DP (in-process D3D11/D3D12/GL/VK through the segment table
   `xrLocateViews` already reads; the service's direct pipeline, table fresh within its publish
-  window), every secondary workspace presenter the tile's footprint touches (ADR-052), and every
+  window), every secondary workspace presenter of the workspace (ADR-052; see the rig addendum
+  below for why not just those the tile's footprint touches), and every
   per-screen segment DP of a present-owner's weave (Amendment 4). Each screen counts once. Only
   the boolean changes: eyes, views and per-view raw blocks stay per screen.
 - **Debounce on the combined signal, not a new one per DP** (`util/u_tracking_any.h`). Rises at
@@ -287,3 +288,34 @@ the primary camera wakes the tracker" (David, 2026-10-10). Decisions:
 Not changed: the vendor's MANAGED auto 2D/3D stays per panel (each DP drives its own lens from
 its own tracker); the in-process HUD shows the session DP's own eyes. Spec:
 `docs/specs/vendor/eye-tracking-modes.md` § *Multi-screen*.
+
+**Rig addendum (2026-10-11).** David, two panels, one cube tile on each, laptop camera blocked
+with his face in front of the DS1: "the app collapses to 2D as if lost face". The logs showed:
+
+- **No per-frame flicker.** Each `FRAME_TICK viewer: the primary sees nobody — publishing screen
+  0xb72e…` was followed one frame (~17 ms) later by `back to the primary screen's viewer`, and
+  only at a primary transition (00:18:53.847 / 00:19:33.822 / 00:21:09.758 on loss, 00:19:36.272
+  on acquire), never in the seconds between. The primary is read first in a frame and the DS1
+  second, so a presence change shared by both DPs that lands between the two reads shows as
+  "primary lost, DS1 tracked" for one frame on loss and the reverse on acquire. The DS1
+  presenter's own DP (a bound windowless LeiaSR weaver) reported nobody for the whole time the
+  laptop camera was blocked: its tracked state follows LeiaSR's machine-wide user presence,
+  which only the primary tracker drives today. That is vendor-side; the runtime cannot report a
+  viewer no DP reports. The DS1 tile's session fell 0.5 s after each primary loss (the hold
+  expiring), the laptop tile's at once.
+- **Scope: every presenter of the workspace.** The laptop tile counted only the presenters its
+  footprint touched, i.e. none, so it took the single-DP pass-through and fell immediately even
+  had the DS1 seen him. The workspace is one experience: a viewer seen by any of its panels keeps
+  every tile tracked. A placed tile of a multi-presenter workspace now ORs every secondary
+  presenter (`comp_d3d11_service_get_other_screens_tracking`); falling then takes the 0.5 s hold.
+  Eyes are unchanged, a tile's views stay its own screen's.
+- **The FRAME_TICK viewer picks its source through a dwell** (`u_tracking_source_update`,
+  100 ms): the primary whenever it sees a viewer, otherwise a secondary only once it has been the
+  only one seeing a viewer for 100 ms, kept while it still does. A one-frame skew of a shared
+  signal no longer flips the published viewer.
+- **The app's 2D was not our event.** `cube_handle_d3d11_win` runs MANAGED and does not act on
+  `isTracking`; the plug-in issued no lens switch in the window (`display mode switched` only at
+  session start/stop). What looks 2D is the DS1 weaver's own MANAGED fallback (its eye pair
+  collapsing, which is also how the plug-in derives `is_tracking`). Fixing that needs LeiaSR's
+  per-display presence (`SR_EVENT_TYPE_DISPLAY_USER_PRESENCE`) or a per-device tracker that does
+  not follow the primary's user-lost.
