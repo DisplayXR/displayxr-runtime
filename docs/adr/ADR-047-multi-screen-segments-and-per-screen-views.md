@@ -181,3 +181,32 @@ DP, and a GL DP built before this amendment re-states a whole-target viewport in
 `process_atlas`, so it would weave the primary segment's crop across the whole window; a plug-in
 that implements the new slot promises to honour a non-empty canvas on its plain DP too. Detail:
 `docs/architecture/comp-segments.md` § *Windows / OpenGL (M6)*.
+
+## Amendment 6 (2026-10-10): the in-process Vulkan compositor on Windows
+
+The Vulkan demos and `cube_handle_vk_win` reach the in-process Vulkan compositor, which segmented
+only on desktop Linux (M2). It now segments on Windows too, and it does so on whichever device
+weaves — so there are two arms, chosen by the Vulkan #918 output-device split (#1178), not by
+this ADR:
+
+- **Off the split** (render adapter = scanout adapter, the split's default on a single-GPU box):
+  the Vulkan segment manager runs as on Linux, its DPs made by each screen's
+  `create_dp_vk_for_screen`, with the window rect read from the HWND's client area in device px.
+  Amendment 2 applies unchanged: the HWND follows the majority screen (same `comp_segments_owner`
+  hysteresis, same windowless-replacement-first / rollback hand-off). The one Vulkan-specific
+  rule: a DP a hand-off replaces is RETIRED, not destroyed, because a repaint parked on its fence
+  with the compositor lock released may still execute a command buffer that references it; the
+  retire list is drained before the new owner binds the window whenever no repaint is in flight,
+  and otherwise the hand-off rolls back and waits for the majority to come back (no gap, no flap).
+- **Under the split** (a hybrid box's default): the weave is a D3D11 one on the scanout adapter, so
+  Amendment 1 applies as written even though the app renders Vulkan — the *D3D11* segment manager
+  lives on the output device, its DPs come from `create_dp_d3d11_for_screen`, they weave the egress
+  slot, and the hand-off swaps the split's own DP. The Vulkan manager is not used while the split
+  is up; a split that retires mid-session hands the screen list back to it.
+
+Per-segment views (M3) are unchanged on both arms: the Vulkan renderer paints the mosaic on the
+app device (under the split it crosses the bridge like any atlas), `xrLocateViews` reads whichever
+manager weaves, and `oxr_system` counts a registry Vulkan factory toward the view-set capacity on
+Windows alongside D3D11 / D3D12. Both arms crop each segment where its views were painted (#1883):
+the Vulkan manager from the renderer atlas's partition, the split from the woven egress slot's own,
+recorded per bridge sequence. Detail: `docs/architecture/comp-segments.md` § *Windows / Vulkan*.
