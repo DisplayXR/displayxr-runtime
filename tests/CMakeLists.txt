@@ -195,6 +195,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
 	# parser, DRM sysfs reader (against a temp-dir fixture) and the
 	# RandR <-> DRM join. Hardware-free.
 	list(APPEND tests tests_aux_display_edid_linux)
+	# sim_display adopts a real monitor's device mode + EDID size on desktop
+	# Linux (the #369 fix's twin): the pick, pinned on the DS1 box's records
+	# and end to end from a temp-dir DRM sysfs fixture.
+	list(APPEND tests tests_sim_display_monitor_geometry)
 endif()
 if(APPLE)
 	# macOS monitor enumeration -- CG vendor byte order, the EDID <-> display
@@ -340,6 +344,19 @@ endif()
 
 # Portable EDID parser (physical mm) shared by the Windows, Linux + macOS readers.
 target_link_libraries(tests_aux_display_edid_parse PRIVATE aux_os xrt-interfaces)
+
+if(TARGET tests_sim_display_monitor_geometry)
+	# The pure pick is compiled straight in; the fixture path uses aux_os's
+	# DRM sysfs reader + RandR <-> DRM join, as the plug-in does.
+	target_sources(
+		tests_sim_display_monitor_geometry
+		PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_monitor_geometry.c
+		)
+	target_include_directories(
+		tests_sim_display_monitor_geometry PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display
+		)
+	target_link_libraries(tests_sim_display_monitor_geometry PRIVATE aux_os xrt-interfaces)
+endif()
 
 # #1625 -- the atlas tile ROW ORIGIN: view 0 is the top-left tile as displayed,
 # on every backend. The GL-vs-everyone-else disagreement was two lines of

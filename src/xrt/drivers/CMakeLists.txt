@@ -74,6 +74,8 @@ target_include_directories(drv_sim_display_includes INTERFACE sim_display)
 set(SIM_DISPLAY_SOURCES
 	sim_display/sim_display_device.c
 	sim_display/sim_display_interface.h
+	sim_display/sim_display_monitor_geometry.c
+	sim_display/sim_display_monitor_geometry.h
 	sim_display/sim_display_zone_common.h
 	sim_display/sim_display_stereo_camera.c
 	sim_display/sim_display_stereo_camera.h
