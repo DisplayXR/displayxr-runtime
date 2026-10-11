@@ -11,6 +11,7 @@
 | `sim_display_device.c` | Device enumeration + init |
 | `sim_display_interface.h` | Public driver interface |
 | `sim_display_macos.m` | macOS-specific window setup |
+| `sim_display_monitor_geometry.{h,c}` | Which real monitor the simulated panel adopts (pure; desktop Linux) |
 | `sim_display_processor.c` | Base display processor (mode logic) |
 | `sim_display_processor_d3d11.cpp` | D3D11 DP variant |
 | `sim_display_processor_d3d12.cpp` | D3D12 DP variant |
@@ -33,6 +34,43 @@ Mode is selected at driver init time
 (`SIM_DISPLAY_OUTPUT=2d|anaglyph|sbs|squeezed|quad|blend|interlaced`). See
 `sim_display_processor.c` for the mode dispatch and `shaders/` for the
 per-mode compositing kernels.
+
+## Panel geometry
+
+The simulated panel takes the pixel size and physical size of a real monitor,
+so the display-info pixel density matches the screen the window actually lands
+on. Built-in defaults (1920x1080 px, 0.344x0.194 m) apply only when nothing can
+be detected.
+
+| Platform | Pixels | Physical size |
+|---|---|---|
+| Windows | Primary monitor's current mode (`EnumDisplaySettingsW`, true pixels at any DPI awareness; #369) | default |
+| macOS | Main display's backing pixels | `CGDisplayScreenSize` |
+| Desktop Linux | The connector's **device** mode (DRM sysfs `modes`), else the desktop mode | EDID millimetres |
+
+On desktop Linux the monitor records come from `os_display_edid_enumerate`
+(aux_os, statically linked into the plug-in): the same RandR <-> DRM-sysfs join
+the plug-in loader logs as `monitor N output=... connector=...`. The picked
+monitor is the **primary** one; with no X server (pure Wayland, where DRM-only
+records carry no primary flag) it is the **internal panel** (`eDP` / `LVDS` /
+`DSI` connector); else the first. Device pixels, not the scaled logical size,
+because the service window presents device pixels 1:1: on the ds1-linux laptop
+(eDP-1, 2880x1800, 300x190 mm EDID, 167 % desktop) the panel is 2880x1800 /
+0.300x0.190 m, not 3456x2160 and not 1920x1080. A one-shot WARN names the pick:
+
+```
+sim_display: adopting monitor 0 (primary) output='eDP-1' connector='card1-eDP-1'
+  2880x1800 px (connector mode) 300x190 mm -> panel 2880x1800 px, 0.300x0.190 m
+```
+
+`SIM_DISPLAY_PIXEL_W` / `SIM_DISPLAY_PIXEL_H` / `SIM_DISPLAY_WIDTH_M` /
+`SIM_DISPLAY_HEIGHT_M` each still win over the detected value, per variable.
+The nominal viewer (`SIM_DISPLAY_NOMINAL_Z_M`, default 0.60 m; 10 cm eye
+height) is not derived from the panel size on any platform.
+
+Per-monitor descriptions (multi-screen, `get_display_info_for_monitor` /
+`create_dp_vk_for_screen`) already used each monitor's own EDID mm and device
+mode; this is the head device's (the system-default panel's) geometry.
 
 ## What sim_display does NOT validate — weave geometry
 
