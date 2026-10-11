@@ -158,11 +158,18 @@ what. Nothing below changes behaviour for a controller that does not call it.
 | FRAME_TICK `viewerPosInDisplaySpace` | the primary's display space |
 | `XrWorkspaceScreenDXR::nominalViewerPosition` | that screen's display space |
 
-**Which client gets which eyes.** A client renders its window from the primary's eyes and
-the primary's display space (its window metrics), and every presenter composes that
-content; this is exact for coplanar, desktop-adjacent screens of equal pixel pitch. Per-part
-views for a client that opts into per-segment views (ADR-052 D2) follow the per-screen
-presenters. **What stays on the primary:** overlays
+**Which client gets which eyes.** A client renders its window from the eyes and the
+geometry of the screen it is on (ADR-052 Amendment 1):
+
+- **Wholly on one presenter.** The window is framed from that screen's tracker and display
+  space.
+- **Straddling, segment-aware client.** A `PRIMARY_MULTIVIEW_DXR` client with more than one
+  view set renders one view set per screen, and each presenter shows the views framed for
+  it.
+- **Straddling, any other client.** One view set is framed from the screen holding most of
+  the window. A tilted straddler is always framed this way.
+
+Nothing changes for the controller. **What stays on the primary:** overlays
 (`xrSetWorkspaceOverlayDXR`), frame capture, fullscreen, and the FRAME_TICK viewer. The
 rendering mode and the lens are one per service: every presenter flips together.
 

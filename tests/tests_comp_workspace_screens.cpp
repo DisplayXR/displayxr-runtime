@@ -9,6 +9,8 @@
 
 #include "util/comp_workspace_screens.h"
 
+#include "oxr_segment_views.h" // the client side of a per-segment table (ADR-052 D2)
+
 #include "catch_amalgamated.hpp"
 
 #include <cmath>
@@ -448,4 +450,263 @@ TEST_CASE("comp_ws: policy from the environment")
 	CHECK(comp_ws_policy_from_env("0", "fallback") == COMP_WS_POLICY_SINGLE); // the kill switch wins
 	CHECK(comp_ws_policy_from_env(nullptr, "fallback") == COMP_WS_POLICY_CLAIMED_INCL_FALLBACK);
 	CHECK(comp_ws_policy_from_env(nullptr, "single") == COMP_WS_POLICY_SINGLE);
+}
+
+/*
+ * ADR-052 D2 — per-screen views. The rig: PANEL (3840x2160, 156.25 um/px) at
+ * the origin, SIDE (1920x1080, 208.3 um/px) to its right at desktop x 3840.
+ * Every pose is in the PRIMARY's display space (where a slot's pose lives).
+ */
+namespace {
+
+const float PITCH = 0.00015625f; // the panel's metres per pixel
+
+//! The primary-space pose of a window whose footprint centre is desktop (cx, cy).
+xrt_pose
+pose_at(float cx, float cy, float z = 0.0f)
+{
+	xrt_pose p{};
+	p.orientation.w = 1.0f;
+	p.position.x = (cx - 1920.0f) * PITCH;
+	p.position.y = (1080.0f - cy) * PITCH;
+	p.position.z = z;
+	return p;
+}
+
+} // namespace
+
+TEST_CASE("comp_ws: per-screen views — which screen frames a window")
+{
+	xrt_screen_list l = rig();
+	comp_ws_screen_set set{};
+	comp_ws_screens_build(&l, ALL_DP, COMP_WS_POLICY_CLAIMED, &set);
+	const comp_ws_screen *panel = &set.screens[0];
+	const comp_ws_screen *side = &set.screens[1];
+	comp_ws_view_framing f{};
+
+	SECTION("single screen, unchanged: a window on the panel is framed from the panel, as before")
+	{
+		xrt_pose p = pose_at(1000.0f, 900.0f, 0.02f);
+		p.orientation = {0.0f, 0.1305262f, 0.0f, 0.9914449f}; // 15 deg yaw: any pose, any tilt
+		REQUIRE(comp_ws_frame_window(&set, &p, 0.1f, 0.05f, XRT_MAX_SEGMENTS, &f));
+		CHECK(f.part_count == 1);
+		CHECK(f.parts[0].screen_id == PANEL);
+		CHECK_FALSE(f.off_primary);
+		CHECK_FALSE(f.per_segment);
+		CHECK(f.frame_screen_index == set.primary_index);
+
+		// ... and the metrics from the panel are the single-screen path's: the
+		// pose verbatim, the size verbatim, the panel as the display.
+		xrt_window_metrics wm{};
+		REQUIRE(comp_ws_window_metrics(&set, panel, &p, 0.1f, 0.05f, &wm));
+		CHECK(wm.window_center_offset_x_m == p.position.x);
+		CHECK(wm.window_center_offset_y_m == p.position.y);
+		CHECK(wm.window_center_offset_z_m == p.position.z);
+		CHECK(wm.window_width_m == 0.1f);
+		CHECK(wm.window_height_m == 0.05f);
+		CHECK(wm.window_orientation.y == p.orientation.y);
+		CHECK(wm.display_width_m == 0.60f);
+		CHECK(wm.display_pixel_width == 3840);
+		CHECK(wm.window_pixel_width == 640);
+		CHECK(wm.window_pixel_height == 320);
+	}
+
+	SECTION("a one-presenter workspace never frames off the primary, even over the side panel")
+	{
+		comp_ws_screens_build(&l, ALL_DP, COMP_WS_POLICY_SINGLE, &set);
+		const xrt_pose p = pose_at(4800.0f, 540.0f);
+		REQUIRE(comp_ws_frame_window(&set, &p, 0.1f, 0.05f, XRT_MAX_SEGMENTS, &f));
+		CHECK(f.part_count == 0); // nothing presents there
+		CHECK_FALSE(f.off_primary);
+		CHECK(f.frame_screen_index == set.primary_index);
+	}
+
+	SECTION("wholly on screen 2: screen 2's eyes and framing")
+	{
+		// Centred on the side panel (desktop 4800, 540), 640 x 320 px.
+		const xrt_pose p = pose_at(4800.0f, 540.0f, 0.03f);
+		REQUIRE(comp_ws_frame_window(&set, &p, 640 * PITCH, 320 * PITCH, XRT_MAX_SEGMENTS, &f));
+		REQUIRE(f.part_count == 1);
+		CHECK(f.parts[0].screen_id == SIDE);
+		CHECK(f.off_primary);
+		CHECK_FALSE(f.per_segment); // one part: one view set, framed from SIDE
+		REQUIRE(f.frame_screen_index < set.count);
+		CHECK(set.screens[f.frame_screen_index].id == SIDE);
+
+		xrt_window_metrics wm{};
+		REQUIRE(comp_ws_window_metrics(&set, side, &p, 640 * PITCH, 320 * PITCH, &wm));
+		// The side panel is the display: its size, its pixels, its origin.
+		CHECK(wm.display_width_m == 0.40f);
+		CHECK(wm.display_pixel_width == 1920);
+		CHECK(wm.display_screen_left == 3840);
+		// Centred on it, in ITS metres (208.3 um/px): 640 px = 0.1333 m.
+		CHECK(approx(wm.window_center_offset_x_m, 0.0f));
+		CHECK(approx(wm.window_center_offset_y_m, 0.0f));
+		CHECK(wm.window_center_offset_z_m == 0.03f); // depth carries over
+		CHECK(approx(wm.window_width_m, 640.0f * 0.40f / 1920.0f));
+		CHECK(approx(wm.window_height_m, 320.0f * 0.225f / 1080.0f));
+		CHECK(wm.window_pixel_width == 640);
+		CHECK(wm.window_screen_left == 4800 - 320);
+		CHECK(wm.window_screen_top == 540 - 160);
+
+		// The primary framing it had before this fix was 0.45 m off-centre on
+		// a panel the window is not on — the rig's wrong perspective.
+		xrt_window_metrics old{};
+		REQUIRE(comp_ws_window_metrics(&set, panel, &p, 640 * PITCH, 320 * PITCH, &old));
+		CHECK(approx(old.window_center_offset_x_m, 0.45f));
+	}
+
+	SECTION("straddling, a tie: the primary is the majority; a per-segment table is allowed")
+	{
+		// Footprint 3240..4440 x 400..1000: 600 px on each side of the seam.
+		const xrt_pose p = pose_at(3840.0f, 700.0f);
+		REQUIRE(comp_ws_frame_window(&set, &p, 1200 * PITCH, 600 * PITCH, XRT_MAX_SEGMENTS, &f));
+		REQUIRE(f.part_count == 2);
+		CHECK(f.footprint.x == 3240);
+		CHECK(f.footprint.w == 1200);
+		CHECK(f.majority == 0);
+		CHECK(f.parts[f.majority].screen_id == PANEL);
+		CHECK_FALSE(f.off_primary);
+		CHECK(f.per_segment);
+	}
+
+	SECTION("straddling, mostly on screen 2: the majority is screen 2")
+	{
+		const xrt_pose p = pose_at(3850.0f, 700.0f); // 590 px | 610 px
+		REQUIRE(comp_ws_frame_window(&set, &p, 1200 * PITCH, 600 * PITCH, XRT_MAX_SEGMENTS, &f));
+		REQUIRE(f.part_count == 2);
+		CHECK(f.parts[0].window_rect.w == 590);
+		CHECK(f.parts[1].window_rect.w == 610);
+		CHECK(f.parts[f.majority].screen_id == SIDE);
+		CHECK(f.off_primary);
+		CHECK(f.per_segment);
+	}
+
+	SECTION("a tilted straddler keeps one view set (the footprint is not the window)")
+	{
+		xrt_pose p = pose_at(3850.0f, 700.0f);
+		p.orientation = {0.0f, 0.1305262f, 0.0f, 0.9914449f};
+		REQUIRE(comp_ws_frame_window(&set, &p, 1200 * PITCH, 600 * PITCH, XRT_MAX_SEGMENTS, &f));
+		CHECK(f.part_count == 2);
+		CHECK_FALSE(f.per_segment);
+	}
+
+	SECTION("more parts than view sets: one view set")
+	{
+		const xrt_pose p = pose_at(3850.0f, 700.0f);
+		REQUIRE(comp_ws_frame_window(&set, &p, 1200 * PITCH, 600 * PITCH, 1, &f));
+		CHECK(f.part_count == 2);
+		CHECK_FALSE(f.per_segment);
+	}
+}
+
+TEST_CASE("comp_ws: per-screen views — the straddler's per-segment table")
+{
+	xrt_screen_list l = rig();
+	l.screens[1].info.nominal_viewer_y_m = 0.05f; // SIDE's own viewer, distinct from the panel's
+	l.screens[1].info.nominal_viewer_z_m = 0.45f;
+	comp_ws_screen_set set{};
+	comp_ws_screens_build(&l, ALL_DP, COMP_WS_POLICY_CLAIMED, &set);
+	const comp_ws_screen *side = &set.screens[1];
+	comp_ws_view_framing f{};
+
+	const xrt_pose p = pose_at(3850.0f, 700.0f, 0.04f); // 590 | 610, 4 cm in front
+	REQUIRE(comp_ws_frame_window(&set, &p, 1200 * PITCH, 600 * PITCH, XRT_MAX_SEGMENTS, &f));
+	xrt_segment_metrics m{};
+	REQUIRE(comp_ws_segment_table(&set, &f, p.position.z, &m) == 2);
+
+	SECTION("one segment per part, in the shape the state tracker reads")
+	{
+		CHECK(m.canvas.offset.w == 0);
+		CHECK(m.canvas.extent.w == 1200);
+		CHECK(m.canvas.extent.h == 600);
+		CHECK(m.window_screen_left == 3250);
+		CHECK(m.window_screen_top == 400);
+		CHECK(m.window_pixel_width == 1200);
+		CHECK(m.window_depth_m == 0.04f);
+
+		CHECK(m.seg[0].screen_id == PANEL);
+		CHECK(m.seg[0].is_primary);
+		CHECK(m.seg[0].window_rect.offset.w == 0);
+		CHECK(m.seg[0].window_rect.extent.w == 590);
+		CHECK(m.seg[0].screen_rect.offset.w == 3250);
+		CHECK(m.seg[0].screen_desktop_width == 3840);
+		CHECK(m.seg[0].screen_width_m == 0.60f);
+
+		CHECK(m.seg[1].screen_id == SIDE);
+		CHECK_FALSE(m.seg[1].is_primary);
+		CHECK(m.seg[1].has_dp);
+		CHECK(m.seg[1].window_rect.offset.w == 590);
+		CHECK(m.seg[1].window_rect.extent.w == 610);
+		CHECK(m.seg[1].screen_rect.offset.w == 0);
+		CHECK(m.seg[1].screen_rect.offset.h == 400);
+		CHECK(m.seg[1].screen_desktop_left == 3840);
+		CHECK(m.seg[1].screen_width_m == 0.40f);
+		CHECK(m.seg[1].nominal_viewer_y_m == 0.05f); // SIDE's viewer, not the panel's
+		CHECK(m.seg[1].nominal_viewer_z_m == 0.45f);
+		CHECK_FALSE(m.seg[1].have_eyes); // the service fills them from the presenter DP
+	}
+
+	SECTION("the state tracker's per-segment canvases: each part on its own screen, at the window's depth")
+	{
+		oxr_segment_layout lay{};
+		REQUIRE(oxr_segment_views_layout(&m, &lay));
+		CHECK(lay.majority == 1); // SIDE holds most of it
+
+		// Segment 1 = the part on SIDE: desktop 3840..4450 x 400..1000, i.e.
+		// SIDE px 0..610 x 400..1000, centre (305, 700) — in SIDE's metres.
+		xrt_window_metrics w1{};
+		oxr_segment_views_window_metrics(&m, &lay, 1, &w1);
+		REQUIRE(w1.valid);
+		const float spx = 0.40f / 1920.0f;
+		const float spy = 0.225f / 1080.0f;
+		CHECK(approx(w1.window_center_offset_x_m, (305.0f - 960.0f) * spx));
+		CHECK(approx(w1.window_center_offset_y_m, -(700.0f - 540.0f) * spy));
+		CHECK(w1.window_center_offset_z_m == 0.04f);
+		CHECK(approx(w1.window_width_m, 610.0f * spx));
+		CHECK(w1.display_width_m == 0.40f);
+
+		// Screen 2's tracked eyes reach segment 1 unshifted (it is the
+		// reference frame); the panel's part is framed in the same frame.
+		m.seg[1].eyes.count = 2;
+		m.seg[1].eyes.valid = true;
+		m.seg[1].eyes.eyes[0] = {-0.03f, 0.02f, 0.5f};
+		m.seg[1].eyes.eyes[1] = {0.03f, 0.02f, 0.5f};
+		m.seg[1].have_eyes = true;
+		float dx = 0.0f, dy = 0.0f;
+		oxr_segment_views_own_to_ref(&lay, 1, &dx, &dy);
+		xrt_eye_positions e{};
+		REQUIRE(oxr_segment_views_segment_eyes(&m.seg[1], dx, dy, 2, &e));
+		CHECK(approx(e.eyes[0].x, -0.03f));
+		CHECK(approx(e.eyes[1].z, 0.5f));
+	}
+
+	SECTION("a stereo client's one view set from the majority == the server's framing of that screen")
+	{
+		// The client reads the table (oxr_segment_views_whole_window_metrics on
+		// the majority); a client that never asks for a table gets the server's
+		// framing (comp_ws_window_metrics on the same screen). Same canvas.
+		xrt_window_metrics client{};
+		oxr_segment_views_whole_window_metrics(&m, 1, &client);
+		xrt_window_metrics server{};
+		REQUIRE(comp_ws_window_metrics(&set, side, &p, 1200 * PITCH, 600 * PITCH, &server));
+		REQUIRE(client.valid);
+		CHECK(approx(client.window_center_offset_x_m, server.window_center_offset_x_m));
+		CHECK(approx(client.window_center_offset_y_m, server.window_center_offset_y_m));
+		CHECK(client.window_center_offset_z_m == server.window_center_offset_z_m);
+		CHECK(approx(client.window_width_m, server.window_width_m));
+		CHECK(approx(client.window_height_m, server.window_height_m));
+		CHECK(client.window_screen_left == server.window_screen_left);
+		CHECK(client.window_screen_top == server.window_screen_top);
+	}
+
+	SECTION("no table for a window that is not per-segment")
+	{
+		comp_ws_view_framing one{};
+		const xrt_pose q = pose_at(4800.0f, 540.0f);
+		REQUIRE(comp_ws_frame_window(&set, &q, 640 * PITCH, 320 * PITCH, XRT_MAX_SEGMENTS, &one));
+		xrt_segment_metrics none{};
+		CHECK(comp_ws_segment_table(&set, &one, 0.0f, &none) == 0);
+		CHECK(none.count == 0);
+	}
 }

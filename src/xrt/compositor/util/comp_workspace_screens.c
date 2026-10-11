@@ -358,6 +358,180 @@ comp_ws_presenter_frame(const struct comp_ws_screen *primary,
 
 /*
  *
+ * Per-screen views (ADR-052 D2).
+ *
+ */
+
+//! A pose orientation that keeps the window parallel to the screens (identity up to sign).
+static bool
+ws_untilted(const struct xrt_quat *q)
+{
+	const float n = sqrtf(q->x * q->x + q->y * q->y + q->z * q->z + q->w * q->w);
+	if (!(n > 1e-6f)) {
+		return true; // a zero quaternion is read as identity everywhere else
+	}
+	const float eps = 1e-4f * n;
+	return fabsf(q->x) <= eps && fabsf(q->y) <= eps && fabsf(q->z) <= eps;
+}
+
+bool
+comp_ws_frame_window(const struct comp_ws_screen_set *set,
+                     const struct xrt_pose *pose,
+                     float width_m,
+                     float height_m,
+                     uint32_t max_segments,
+                     struct comp_ws_view_framing *out)
+{
+	if (out == NULL) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+	if (set == NULL || pose == NULL || set->primary_index >= set->count) {
+		return false;
+	}
+	out->frame_screen_index = set->primary_index;
+	const struct comp_ws_screen *prim = &set->screens[set->primary_index];
+	if (!comp_ws_footprint(prim, pose, width_m, height_m, &out->footprint)) {
+		return false;
+	}
+	out->part_count = comp_ws_split(set, &out->footprint, out->parts);
+	if (out->part_count == 0) {
+		return true; // on no presenter: nothing draws it, the primary frames it
+	}
+
+	// Majority: most pixels; an exact tie goes to the primary, else keeps the
+	// earlier (leftmost) part — oxr_segment_views_majority's rule, so the
+	// server and a client reading the table pick the same screen.
+	uint32_t best = 0;
+	uint64_t best_area = 0;
+	bool best_primary = false;
+	for (uint32_t i = 0; i < out->part_count; i++) {
+		const struct comp_ws_part *p = &out->parts[i];
+		const uint64_t area = (uint64_t)p->window_rect.w * (uint64_t)p->window_rect.h;
+		if (i == 0 || area > best_area || (area == best_area && p->is_primary && !best_primary)) {
+			best = i;
+			best_area = area;
+			best_primary = p->is_primary;
+		}
+	}
+	out->majority = best;
+	out->frame_screen_index = out->parts[best].screen_index;
+	out->off_primary = !out->parts[best].is_primary;
+	out->per_segment = out->part_count >= 2 && out->part_count <= max_segments && ws_untilted(&pose->orientation);
+	return true;
+}
+
+bool
+comp_ws_window_metrics(const struct comp_ws_screen_set *set,
+                       const struct comp_ws_screen *s,
+                       const struct xrt_pose *pose,
+                       float width_m,
+                       float height_m,
+                       struct xrt_window_metrics *out)
+{
+	if (out == NULL) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+	const struct comp_ws_screen *prim = comp_ws_screens_find(set, 0);
+	float pmx, pmy, smx, smy;
+	if (s == NULL || pose == NULL || prim == NULL || !ws_pitch(prim, &pmx, &pmy) || !ws_pitch(s, &smx, &smy)) {
+		return false;
+	}
+	struct xrt_pose p;
+	float w = 0.0f, h = 0.0f;
+	if (!comp_ws_map_pose(prim, s, pose, width_m, height_m, &p, &w, &h) || !(w > 0.0f) || !(h > 0.0f)) {
+		return false;
+	}
+
+	out->display_width_m = s->width_m;
+	out->display_height_m = s->height_m;
+	out->display_pixel_width = s->desktop.w;
+	out->display_pixel_height = s->desktop.h;
+	out->display_screen_left = s->desktop.x;
+	out->display_screen_top = s->desktop.y;
+
+	// The window in desktop px (the footprint of an untilted window): the same
+	// pixels whichever screen frames it, the metres are that screen's.
+	const double wpx = (double)w / (double)smx;
+	const double hpx = (double)h / (double)smy;
+	const double cx = (double)s->desktop.x + (double)s->desktop.w * 0.5 + (double)p.position.x / (double)smx;
+	const double cy = (double)s->desktop.y + (double)s->desktop.h * 0.5 - (double)p.position.y / (double)smy;
+	out->window_pixel_width = (uint32_t)floor(wpx + 0.5);
+	out->window_pixel_height = (uint32_t)floor(hpx + 0.5);
+	out->window_screen_left = (int32_t)floor(cx - wpx * 0.5 + 0.5);
+	out->window_screen_top = (int32_t)floor(cy - hpx * 0.5 + 0.5);
+
+	out->window_width_m = w;
+	out->window_height_m = h;
+	out->window_center_offset_x_m = p.position.x;
+	out->window_center_offset_y_m = p.position.y;
+	out->window_center_offset_z_m = p.position.z;
+	out->window_orientation = p.orientation;
+	out->valid = out->window_pixel_width > 0 && out->window_pixel_height > 0;
+	return out->valid;
+}
+
+uint32_t
+comp_ws_segment_table(const struct comp_ws_screen_set *set,
+                      const struct comp_ws_view_framing *f,
+                      float depth_m,
+                      struct xrt_segment_metrics *out)
+{
+	if (out == NULL) {
+		return 0;
+	}
+	memset(out, 0, sizeof(*out)); // memcmp'd by the change-only publish: padding too
+	if (set == NULL || f == NULL || !f->per_segment || f->part_count > XRT_MAX_SEGMENTS) {
+		return 0;
+	}
+	for (uint32_t i = 0; i < f->part_count; i++) {
+		const struct comp_ws_part *p = &f->parts[i];
+		if (p->screen_index >= set->count) {
+			memset(out, 0, sizeof(*out));
+			return 0;
+		}
+		const struct comp_ws_screen *s = &set->screens[p->screen_index];
+		struct xrt_segment_metric *g = &out->seg[i];
+		g->screen_id = p->screen_id;
+		g->window_rect.offset.w = p->window_rect.x;
+		g->window_rect.offset.h = p->window_rect.y;
+		g->window_rect.extent.w = (int32_t)p->window_rect.w;
+		g->window_rect.extent.h = (int32_t)p->window_rect.h;
+		g->screen_rect.offset.w = p->screen_rect.x;
+		g->screen_rect.offset.h = p->screen_rect.y;
+		g->screen_rect.extent.w = (int32_t)p->screen_rect.w;
+		g->screen_rect.extent.h = (int32_t)p->screen_rect.h;
+		g->screen_desktop_left = s->desktop.x;
+		g->screen_desktop_top = s->desktop.y;
+		g->screen_desktop_width = s->desktop.w;
+		g->screen_desktop_height = s->desktop.h;
+		g->screen_width_m = s->width_m;
+		g->screen_height_m = s->height_m;
+		g->nominal_viewer_x_m = s->nominal_viewer_m[0];
+		g->nominal_viewer_y_m = s->nominal_viewer_m[1];
+		g->nominal_viewer_z_m = s->nominal_viewer_m[2];
+		g->is_primary = p->is_primary;
+		g->has_dp = (s->flags & COMP_WS_SCREEN_3D) != 0;
+		g->woven = g->has_dp;
+		g->have_eyes = false;
+	}
+	out->count = f->part_count;
+	out->canvas.offset.w = 0;
+	out->canvas.offset.h = 0;
+	out->canvas.extent.w = (int32_t)f->footprint.w;
+	out->canvas.extent.h = (int32_t)f->footprint.h;
+	out->window_screen_left = f->footprint.x;
+	out->window_screen_top = f->footprint.y;
+	out->window_pixel_width = f->footprint.w;
+	out->window_pixel_height = f->footprint.h;
+	out->window_depth_m = depth_m;
+	return out->count;
+}
+
+
+/*
+ *
  * Cursor.
  *
  */

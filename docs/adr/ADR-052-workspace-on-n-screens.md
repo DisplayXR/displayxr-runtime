@@ -74,13 +74,11 @@ the one every other segment path uses (half-open: a seam column belongs to exact
 screen), and each part is composed into its presenter's atlas and woven by that screen's
 DP. A part that lands on no presenter (a 2D monitor, off-desktop) is not drawn.
 
-Views: a client renders its window from the primary's eyes and the primary's display space
-(its window metrics), and every presenter composes that content — the same limitation the
-in-process path documents for a non-segment-aware app (ADR-047 D3), exact when the screens
-are coplanar, adjacent as the desktop arranges them and of equal pixel pitch. A client that
-opts into per-segment views (`compositor_segments_enable`, ADR-047 Amendment 3) receives
-each part's screen and eyes through the segment metrics it already reads, so the part on
-each screen is framed from that screen's viewer.
+Views: a client renders its window from the eyes and the geometry of the screen it is on
+(Amendment 1 below). A window wholly on one presenter is framed from that presenter's
+screen; a window straddling presenters gives a segment-aware client one view set per part,
+each framed from its own screen's viewer, and any other client one view set framed from the
+screen holding most of it.
 
 ### D3 — A product-neutral contract: screens, a change event, placement on any screen
 
@@ -158,3 +156,68 @@ controller opt a 2D monitor in as a flat presenter is a later, additive request.
   cursor path is the one the primary has always run.
 - Contract: `docs/specs/extensions/XR_DXR_spatial_workspace.md` (spec_version 25). Geometry:
   `src/xrt/compositor/util/comp_workspace_screens.h`.
+
+## Amendment 1 — per-screen views (2026-10-10)
+
+**Status:** Accepted. Implements the part of D2 that the first rollout left as a follow-up.
+
+**Why.** The first rollout composed every window on every presenter it overlaps, woven by
+that screen's own DP, but rendered its content from the primary's eyes in the primary's
+display space. On the two-panel rig a window sitting wholly on the second panel was woven
+by that panel's DP, but its perspective followed the first panel's tracking camera. It was
+also framed against a canvas half a metre off-centre on a panel it was not on.
+
+**Decision.** A workspace window's views are framed from the screen it is on.
+
+- **Wholly on one presenter.** That presenter's screen frames the window. The client's
+  `xrLocateViews` (the server-side view-pose path, `ipc_try_get_sr_view_poses`) takes three
+  inputs from that screen:
+  - **Eyes.** The screen's presenter DP's predicted eyes, in its own display space. If the
+    DP gives no answer, the screen's nominal viewer is used, so the window is never framed
+    from another screen's eyes.
+  - **Canvas.** The window metrics in that screen's display space: the placement mapped
+    through desktop pixels (`comp_ws_map_pose`), with depth and orientation unchanged.
+  - **Nominal viewer.** The screen's own.
+
+  The window-relative Kooima is the same math as before, run against that screen. On the
+  primary nothing changes. On a one-presenter workspace nothing is even looked up.
+- **Straddling presenters.** The service hands the client a per-segment table
+  (`compositor_get_segment_metrics`) cut from the window's footprint. There is one segment
+  per presenter part, each with that screen's eyes: the panel DP's for the primary part, and
+  the presenter DP's for the others. The table has the shape the direct pipeline's table
+  already has, so the state tracker reads it unchanged (`oxr_session_locate_views`,
+  `oxr_segment_views_*`). It carries one new field, `xrt_segment_metrics::window_depth_m`,
+  which is the tile's z, so every segment's canvas sits at the window's depth.
+  - **A segment-aware client.** This is a `PRIMARY_MULTIVIEW_DXR` session with set
+    capacity > 1, the M3 contract. It renders one view set per part (views 0..1 for the
+    primary's part, 2..3 for the other) and routes them back
+    (`compositor_set_view_routing`). The commit paints the mosaic: each part's views go into
+    that part's rect in every tile (`comp_segments_route_place`). Every presenter's compose
+    pass samples the whole tile at the window's footprint, so each presenter draws the views
+    framed for its own screen. The compose pass needs no change.
+  - **Any other client.** It keeps one view set framed from the **majority** part's screen
+    (most pixels; a tie goes to the primary). A client that reads the table and the server
+    path pick the same screen and build the same canvas (unit-tested against each other).
+- **Tilted straddlers keep one view set.** The table is cut from the footprint, which for a
+  tilted window is the bound of its rotated corners. The client's view tiles do not map onto
+  that bound, so a tilted window over a seam keeps the majority's one view set. The same
+  holds for a window over more presenters than the client has view sets.
+- **The controller is unchanged (D5).** Its FRAME_TICK viewer, and its own locates, stay
+  the primary's.
+
+**Consequences.**
+
+- Exactness. A straddler's parts meet exactly at the seam at z = 0. At other depths the
+  compose pass draws the window parallax-shifted per eye, so the seam between the two parts'
+  views moves off the physical seam by that shift. It moves a few pixels at a typical
+  window depth.
+- Cost on a one-presenter workspace: none. Cost on a multi-presenter workspace, per locate
+  of a placed tile: a copy of the screen set under its leaf mutex, the footprint split, and
+  for an off-primary window one presenter DP eye query under `ws_presenters_lock`.
+- Diagnostics. Each line below is a WARN, logged only when it changes:
+  - `workspace views: client … window wholly on screen 0x…: views from that screen's eyes`
+  - `… window straddles 2 presenters: per-segment table …`
+  - `… window on the primary screen: the primary's eyes …`
+- Geometry: `comp_ws_frame_window`, `comp_ws_window_metrics`, `comp_ws_segment_table`
+  (`util/comp_workspace_screens.h`), unit-tested in `tests_comp_workspace_screens` against
+  the state tracker's `oxr_segment_views_*`.
