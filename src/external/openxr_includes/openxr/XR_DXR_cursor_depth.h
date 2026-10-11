@@ -66,6 +66,16 @@
  *    cursor: draw nothing and show it. The filter keeps running while
  *    inactive, so the drawn cursor hands back and returns smoothly.
  *
+ * Spec v5 (ADR-046 Amendment 2 B) lets the RUNTIME draw the cursor, the way
+ * the shell's workspace cursor works: the app chains
+ * @ref XrCursorDepthDrawInfoDXR on the hint (the sprite: its own swapchain,
+ * or XR_NULL_HANDLE for the runtime's default look), and reads
+ * @ref XrCursorDepthDrawStateDXR on XrViewState to learn whether the runtime
+ * will draw it for the frame being located - hiding its OS cursor exactly
+ * while it will. The app then neither hit-draws a sprite nor needs the
+ * placement struct (it may still chain it, for diagnostics). Both structs are
+ * new; no existing struct changed. App-drawn placement (v1-v4) is unchanged.
+ *
  * One call, one space. The hint is chained on XrViewLocateInfo::next and the
  * result on XrViewState::next of the SAME xrLocateViews call, and both are in
  * XrViewLocateInfo::space. The hint normally comes from the previous frame's
@@ -88,7 +98,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_cursor_depth 1
-#define XR_DXR_cursor_depth_SPEC_VERSION 4
+#define XR_DXR_cursor_depth_SPEC_VERSION 5
 #define XR_DXR_CURSOR_DEPTH_EXTENSION_NAME "XR_DXR_cursor_depth"
 
 // Reserved 1004999320-329 (next free decade after stereo_camera's 310-319).
@@ -99,6 +109,9 @@ extern "C" {
 #define XR_TYPE_CURSOR_DEPTH_SOURCE_DXR ((XrStructureType)1004999322)
 //! Spec v3 (anchor mode + margin).
 #define XR_TYPE_CURSOR_DEPTH_OPTIONS_DXR ((XrStructureType)1004999323)
+//! Spec v5 (ADR-046 Amendment 2 B: the runtime draws).
+#define XR_TYPE_CURSOR_DEPTH_DRAW_INFO_DXR ((XrStructureType)1004999324)
+#define XR_TYPE_CURSOR_DEPTH_DRAW_STATE_DXR ((XrStructureType)1004999325)
 
 // ---- Input: app chains this on XrViewLocateInfo::next; runtime reads it. ----
 
@@ -241,6 +254,78 @@ typedef struct XrCursorDepthOptionsDXR {
      */
     float                      margin;
 } XrCursorDepthOptionsDXR;
+
+// ---- Spec v5: the runtime draws the cursor (ADR-046 Amendment 2 B). ----
+
+/*!
+ * @brief Optional, chained on XrCursorDepthHintDXR::next (spec v5): "runtime,
+ * draw the cursor this frame".
+ *
+ * Chaining it IS the per-frame draw request; like the hint, it covers the
+ * frame being located only, so chain it on every frame's hint for as long as
+ * you want the runtime to draw. A frame without it costs the runtime nothing
+ * (ADR-046 section 0): no sprite, no copy, no state.
+ *
+ * The runtime draws the sprite at the placement the hint produced (the same
+ * policy as XrCursorDepthPlacementDXR: never behind the glass, drawn only
+ * while content pops out under the cursor), after the app's layers and before
+ * the display processor, one copy per view, on top of everything and never
+ * occluded. It is drawn with the projection layer's own per-view poses and
+ * fovs, so the projection layer must be submitted in the SAME XrSpace as
+ * XrViewLocateInfo::space (otherwise nothing is drawn and the next locates
+ * report willDraw = XR_FALSE).
+ */
+typedef struct XrCursorDepthDrawInfoDXR {
+    XrStructureType          type;   //!< Must be XR_TYPE_CURSOR_DEPTH_DRAW_INFO_DXR
+    const void* XR_MAY_ALIAS next;
+    /*!
+     * The sprite: an ordinary color swapchain this session created with
+     * xrCreateSwapchain, in the app's own graphics API, filled with any
+     * image (static, animated, a different shape per state) and released at
+     * least once. The runtime samples its LAST RELEASED image, array layer 0,
+     * whole image, as STRAIGHT (non-premultiplied) alpha, sampled per its
+     * format (an _SRGB format decodes). The swapchain must stay alive until
+     * the xrEndFrame of every frame that names it.
+     *
+     * XR_NULL_HANDLE selects the runtime's default look: the current OS
+     * cursor's shape where the runtime can read it, else the classic arrow
+     * (12 x 19, white with a dark outline, tip at the hotspot).
+     */
+    XrSwapchain              image;
+    /*!
+     * The click point inside the sprite, normalised: [0,1]^2, origin
+     * top-left, v down. The runtime places this point at the cursor. Ignored
+     * for the default look, which brings its own hotspot.
+     */
+    XrVector2f               hotSpot;
+    /*!
+     * The sprite's HEIGHT on the panel, in metres, at the display plane (it
+     * is scaled with depth, so its apparent size never changes; its width
+     * follows the image's aspect). <= 0 or non-finite: the OS cursor's size
+     * (the default look's own size; 19 OS points for a custom sprite).
+     */
+    float                    sizeMeters;
+    //! XR_FALSE: draw nothing (willDraw is then XR_FALSE).
+    XrBool32                 visible;
+} XrCursorDepthDrawInfoDXR;
+
+/*!
+ * @brief Optional, chained on XrViewState::next (spec v5): will the runtime
+ * draw the cursor for the frame being located?
+ *
+ * Filled on every locate that chains it. willDraw is XR_TRUE only when this
+ * locate chained a hint carrying a visible XrCursorDepthDrawInfoDXR, the
+ * placement is active (content pops out under the cursor), and this session's
+ * compositor can draw it. Hide your OS cursor over the canvas exactly while
+ * it is XR_TRUE, and show it while it is XR_FALSE: whenever the runtime cannot
+ * draw, the fallback is the flat OS cursor, never no cursor. The runtime never
+ * touches the OS cursor itself.
+ */
+typedef struct XrCursorDepthDrawStateDXR {
+    XrStructureType    type;   //!< Must be XR_TYPE_CURSOR_DEPTH_DRAW_STATE_DXR
+    void* XR_MAY_ALIAS next;
+    XrBool32           willDraw;
+} XrCursorDepthDrawStateDXR;
 
 // ---- Result: app chains this on XrViewState::next; runtime fills it. ----
 

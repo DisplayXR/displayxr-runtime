@@ -52,6 +52,7 @@
 #pragma once
 
 #include "xrt/xrt_defines.h"
+#include "xrt/xrt_limits.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -417,6 +418,126 @@ u_cursor_depth_point_from_depth_sample(const struct u_cursor_depth_view *view,
                                        float sv,
                                        float raw_depth,
                                        struct xrt_vec3 *out_point);
+
+
+/*
+ *
+ * Spec v5: the runtime draws the cursor (ADR-046 Amendment 2 B).
+ *
+ * The state tracker turns the locate's placement (the sprite's hotspot point
+ * C, the display-plane orientation, and the t-scaled canvas height) into, per
+ * submitted view, where C lands in that view's tile and how one unit of
+ * sprite size maps there (u_cursor_draw_view_from_placement). The compositor
+ * then picks the sprite (the app's swapchain, or its default look), its size
+ * in metres, aspect and hotspot, and draws one textured quad per tile
+ * (u_cursor_draw_corners). Every Kooima view's image plane is parallel to the
+ * display plane and the sprite lies in a plane parallel to it, so each view
+ * sees the sprite as a scaled, translated rectangle: the per-view map is
+ * exactly affine, and three projected points describe it.
+ *
+ * ZERO COST UNLESS REQUESTED (ADR-046 section 0): a compositor draws nothing,
+ * allocates nothing and builds no pipeline unless the request it was handed
+ * passes u_cursor_draw_should_draw(), which a zero-initialised request - what
+ * every session that never chained XrCursorDepthDrawInfoDXR has - never does.
+ *
+ */
+
+//! The default look's height, in OS points (the classic arrow; the web SDK's
+//! CURSOR_ARROW_CSS_PX).
+#define U_CURSOR_DRAW_DEFAULT_POINTS 19.0f
+
+//! The classic arrow's box, in px of its 19 px height: 12 x 19, tip at (0, 0).
+#define U_CURSOR_ARROW_WIDTH_PX 12.0f
+#define U_CURSOR_ARROW_HEIGHT_PX 19.0f
+
+struct xrt_swapchain;
+
+/*!
+ * One view's map from sprite space to its tile, in tile-normalised
+ * coordinates (origin top-left, x right, y DOWN; 0..1 spans the tile).
+ */
+struct u_cursor_draw_view
+{
+	//! Where the placement point (the sprite's hotspot) lands.
+	float origin[2];
+	//! Tile displacement of one unit along the sprite's +X (display right).
+	float axis_x[2];
+	//! Tile displacement of one unit along the sprite's +Y (display UP).
+	float axis_y[2];
+};
+
+/*!
+ * What the state tracker asks a compositor to draw at the next commit.
+ * Zero-initialised means "not requested".
+ *
+ * One unit (the view axes) is the canvas height scaled by the placement's t,
+ * so a sprite @c h metres tall on the panel is drawn h / canvas_height_m
+ * units tall, and keeps a constant apparent size as it rises.
+ */
+struct u_cursor_draw_request
+{
+	//! True only for a commit whose frame chained the draw request.
+	bool requested;
+	//! Views mapped below; view i is drawn into atlas tile i.
+	uint32_t view_count;
+	struct u_cursor_draw_view view[XRT_MAX_VIEWS];
+	//! The app's sprite swapchain (sampled at image_index, its last released
+	//! image), or NULL for the default look.
+	struct xrt_swapchain *image;
+	uint32_t image_index;
+	//! The click point in the sprite, normalised (origin top-left, v down).
+	//! Ignored for the default look (it brings its own hotspot).
+	float hot_u, hot_v;
+	//! Sprite HEIGHT on the panel, metres; <= 0 = the OS cursor's size.
+	float size_m;
+};
+
+/*!
+ * The compositor-side gate: false for a zero-initialised request, fewer than
+ * two views, or non-finite geometry - the compositor then does no work.
+ */
+bool
+u_cursor_draw_should_draw(const struct u_cursor_draw_request *req);
+
+/*!
+ * Project a point (in the space of the view's pose) into the view's tile.
+ *
+ * @return false if the point is not in front of the view.
+ */
+bool
+u_cursor_draw_project(const struct u_cursor_depth_view *view, const struct xrt_vec3 *p, float out_xy[2]);
+
+/*!
+ * One view's sprite map from the placement: @p center is the hotspot point,
+ * @p orientation the display plane's (+X right, +Y up), @p unit the length of
+ * one unit in the same space (the t-scaled canvas height).
+ */
+bool
+u_cursor_draw_view_from_placement(const struct u_cursor_depth_view *view,
+                                  const struct xrt_vec3 *center,
+                                  const struct xrt_quat *orientation,
+                                  float unit,
+                                  struct u_cursor_draw_view *out);
+
+/*!
+ * The sprite quad's corners in the tile: a sprite @p height units tall and
+ * @p aspect (width / height) wide, whose hotspot (@p hot_u, @p hot_v; origin
+ * top-left, v down) lands on the view's origin. Corner order is the texture
+ * UV order (0,0), (0,1), (1,0), (1,1) - top-left, bottom-left, top-right,
+ * bottom-right: a triangle strip.
+ */
+void
+u_cursor_draw_corners(
+    const struct u_cursor_draw_view *v, float height, float aspect, float hot_u, float hot_v, float out_xy[4][2]);
+
+/*!
+ * Rasterise the classic arrow (white fill, dark one-px outline, tip at the
+ * top-left corner) into a @p w x @p h RGBA8 image with PREMULTIPLIED alpha.
+ * The arrow's 12 x 19 box is scaled to the image height, so pass
+ * w = ceil(h * 12 / 19). 4 x 4 supersampled.
+ */
+void
+u_cursor_draw_arrow_rgba(uint8_t *rgba, uint32_t w, uint32_t h);
 
 #ifdef __cplusplus
 }

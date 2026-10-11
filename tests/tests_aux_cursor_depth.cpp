@@ -16,6 +16,7 @@
 #include "catch_amalgamated.hpp"
 
 #include <cmath>
+#include <vector>
 
 namespace {
 
@@ -929,4 +930,170 @@ TEST_CASE("cursor_depth source: the depth-layer point gives the same disparity a
 		REQUIRE(u_cursor_depth_point_disparity(&g, &q, &d_layer));
 		CHECK(d_layer == Catch::Approx(d_app).margin(1e-4));
 	}
+}
+
+
+/*
+ *
+ * Spec v5: the runtime draws the cursor (ADR-046 Amendment 2 B).
+ *
+ */
+
+TEST_CASE("cursor_draw: zero cost - a never-requested request never draws")
+{
+	// The compositor-side gate. Every session that never chained
+	// XrCursorDepthDrawInfoDXR hands the compositor exactly this.
+	const u_cursor_draw_request none{};
+	CHECK_FALSE(u_cursor_draw_should_draw(&none));
+	CHECK_FALSE(u_cursor_draw_should_draw(nullptr));
+
+	u_cursor_draw_request req{};
+	req.requested = true;
+	req.view_count = 1; // 2D: one view, nothing to lift
+	CHECK_FALSE(u_cursor_draw_should_draw(&req));
+	req.view_count = 2;
+	CHECK(u_cursor_draw_should_draw(&req));
+	req.view_count = XRT_MAX_VIEWS + 1;
+	CHECK_FALSE(u_cursor_draw_should_draw(&req));
+	req.view_count = 2;
+	req.view[1].axis_y[1] = NAN;
+	CHECK_FALSE(u_cursor_draw_should_draw(&req));
+	req.view[1].axis_y[1] = 0.0f;
+	req.requested = false;
+	CHECK_FALSE(u_cursor_draw_should_draw(&req));
+}
+
+TEST_CASE("cursor_draw: a canvas point projects to its canvas UV in every view, in any rig")
+{
+	Xform x;
+	x.q = {0.0f, std::sin(0.3f), 0.0f, std::cos(0.3f)};
+	x.t = {1.0f, -2.0f, 0.5f};
+	x.s = 12.5f;
+	for (const Xform &xf : {Xform{}, x}) {
+		for (xrt_vec3 eye : {xrt_vec3{-0.032f, 0.0f, 0.6f}, xrt_vec3{0.08f, 0.03f, 0.55f}}) {
+			const u_cursor_depth_view v = kooima(eye, xf);
+			for (float u : {0.0f, 0.3f, 1.0f}) {
+				for (float vv : {0.0f, 0.7f, 1.0f}) {
+					const xrt_vec3 s = apply(xf, {-W / 2 + u * W, H / 2 - vv * H, 0.0f});
+					float xy[2];
+					REQUIRE(u_cursor_draw_project(&v, &s, xy));
+					CHECK(xy[0] == Catch::Approx(u).margin(1e-4));
+					CHECK(xy[1] == Catch::Approx(vv).margin(1e-4));
+				}
+			}
+			// Behind the eye: no projection.
+			const xrt_vec3 behind = apply(xf, {eye.x, eye.y, eye.z + 0.1f});
+			float xy[2];
+			CHECK_FALSE(u_cursor_draw_project(&v, &behind, xy));
+		}
+	}
+}
+
+TEST_CASE("cursor_draw: the sprite lands at the placement's disparity, constant size, hotspot on the point")
+{
+	const xrt_vec3 el{-0.032f, 0.0f, 0.6f};
+	const xrt_vec3 er{0.032f, 0.0f, 0.6f};
+	const u_cursor_depth_view a = kooima(el);
+	const u_cursor_depth_view b = kooima(er);
+	u_cursor_depth_geometry g{};
+	REQUIRE(u_cursor_depth_geometry_solve(&a, &b, 0.5f, 0.5f, &g));
+
+	for (float disparity : {0.0f, -0.1f, -0.4f}) {
+		xrt_vec3 c{};
+		float h = 0.0f;
+		u_cursor_depth_place(&g, disparity, 0.05f, &c, &h);
+		const float t = 1.0f / (1.0f - disparity);
+		const float unit = g.canvas_height * t; // what the state tracker hands over
+
+		u_cursor_draw_view va{}, vb{};
+		REQUIRE(u_cursor_draw_view_from_placement(&a, &c, &g.orientation, unit, &va));
+		REQUIRE(u_cursor_draw_view_from_placement(&b, &c, &g.orientation, unit, &vb));
+
+		// Each eye sees the hotspot where its line through C crosses the glass.
+		const xrt_vec3 gl = on_glass(el, c), gr = on_glass(er, c);
+		CHECK(va.origin[0] == Catch::Approx((gl.x + W / 2) / W).margin(1e-4));
+		CHECK(vb.origin[0] == Catch::Approx((gr.x + W / 2) / W).margin(1e-4));
+		// On-screen disparity = baseline x d (0.064 m x d), in tile widths.
+		CHECK((vb.origin[0] - va.origin[0]) * W == Catch::Approx(0.064f * disparity).margin(1e-5));
+		CHECK(va.origin[1] == Catch::Approx(vb.origin[1]).margin(1e-5));
+
+		// One unit (the t-scaled canvas height) spans exactly one tile height
+		// on the glass at every depth: constant apparent size.
+		CHECK(-va.axis_y[1] == Catch::Approx(1.0f).margin(1e-4));
+		CHECK(va.axis_y[0] == Catch::Approx(0.0f).margin(1e-5));
+		CHECK(va.axis_x[0] * W == Catch::Approx(H).margin(1e-5)); // square pixels: 1 unit wide = H metres
+		CHECK(va.axis_x[1] == Catch::Approx(0.0f).margin(1e-5));
+
+		// Hotspot top-left (an arrow's tip): corner 0 is the origin; the quad
+		// hangs right and down from it.
+		float xy[4][2];
+		u_cursor_draw_corners(&va, 0.05f, 0.6f, 0.0f, 0.0f, xy);
+		CHECK(xy[0][0] == Catch::Approx(va.origin[0]).margin(1e-6));
+		CHECK(xy[0][1] == Catch::Approx(va.origin[1]).margin(1e-6));
+		CHECK(xy[1][1] - xy[0][1] == Catch::Approx(0.05f).margin(1e-5));                  // bottom-left below
+		CHECK((xy[2][0] - xy[0][0]) * W == Catch::Approx(0.05f * 0.6f * H).margin(1e-6)); // top-right
+		// Centred hotspot: the quad's centre is the origin.
+		u_cursor_draw_corners(&vb, 0.05f, 1.0f, 0.5f, 0.5f, xy);
+		CHECK((xy[0][0] + xy[3][0]) * 0.5f == Catch::Approx(vb.origin[0]).margin(1e-6));
+		CHECK((xy[0][1] + xy[3][1]) * 0.5f == Catch::Approx(vb.origin[1]).margin(1e-6));
+	}
+}
+
+TEST_CASE("cursor_draw: the per-view map is the same under any rigid transform plus scale")
+{
+	Xform x;
+	x.q = {0.1f, std::sin(0.4f), 0.05f, std::cos(0.4f)};
+	const float n = std::sqrt(x.q.x * x.q.x + x.q.y * x.q.y + x.q.z * x.q.z + x.q.w * x.q.w);
+	x.q = {x.q.x / n, x.q.y / n, x.q.z / n, x.q.w / n};
+	x.t = {-3.0f, 1.0f, 2.0f};
+	x.s = 12.5f;
+
+	const xrt_vec3 el{0.02f, 0.03f, 0.55f}, er{0.085f, 0.035f, 0.56f};
+	u_cursor_draw_view ref[2]{}, got[2]{};
+	for (int pass = 0; pass < 2; pass++) {
+		const Xform xf = pass == 0 ? Xform{} : x;
+		const u_cursor_depth_view a = kooima(el, xf);
+		const u_cursor_depth_view b = kooima(er, xf);
+		u_cursor_depth_geometry g{};
+		REQUIRE(u_cursor_depth_geometry_solve(&a, &b, 0.3f, 0.6f, &g));
+		xrt_vec3 c{};
+		float h = 0.0f;
+		u_cursor_depth_place(&g, -0.2f, 0.03f, &c, &h);
+		const float unit = g.canvas_height / (1.0f + 0.2f);
+		u_cursor_draw_view *out = pass == 0 ? ref : got;
+		REQUIRE(u_cursor_draw_view_from_placement(&a, &c, &g.orientation, unit, &out[0]));
+		REQUIRE(u_cursor_draw_view_from_placement(&b, &c, &g.orientation, unit, &out[1]));
+	}
+	for (int i = 0; i < 2; i++) {
+		for (int k = 0; k < 2; k++) {
+			CHECK(got[i].origin[k] == Catch::Approx(ref[i].origin[k]).margin(2e-4));
+			CHECK(got[i].axis_x[k] == Catch::Approx(ref[i].axis_x[k]).margin(2e-4));
+			CHECK(got[i].axis_y[k] == Catch::Approx(ref[i].axis_y[k]).margin(2e-4));
+		}
+	}
+}
+
+TEST_CASE("cursor_draw: the classic arrow - dark outline, white fill, tip at the top-left, premultiplied")
+{
+	const uint32_t h = 76, w = 48;
+	std::vector<uint8_t> img((size_t)w * h * 4, 0xAB);
+	u_cursor_draw_arrow_rgba(img.data(), w, h);
+	auto px = [&](uint32_t x, uint32_t y) { return &img[((size_t)y * w + x) * 4]; };
+
+	// Premultiplied: no channel ever exceeds alpha.
+	for (size_t i = 0; i < img.size(); i += 4) {
+		REQUIRE(img[i + 0] <= img[i + 3]);
+		REQUIRE(img[i + 1] <= img[i + 3]);
+		REQUIRE(img[i + 2] <= img[i + 3]);
+	}
+	// The tip (arrow px 0.1, 0.5) is outline: opaque and dark.
+	CHECK(px(0, 2)[3] == 255);
+	CHECK(px(0, 2)[0] < 40);
+	// Inside the head (arrow px 2, 9): white fill.
+	CHECK(px(9, 36)[3] == 255);
+	CHECK(px(9, 36)[0] == 255);
+	// Right of the head, above the wing (arrow px 10, 3): empty.
+	CHECK(px(40, 12)[3] == 0);
+	// Below the tail (arrow px 1, 18.5): empty.
+	CHECK(px(4, 74)[3] == 0);
 }

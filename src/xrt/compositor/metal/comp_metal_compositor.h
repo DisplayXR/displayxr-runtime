@@ -332,6 +332,16 @@ bool
 comp_metal_compositor_get_cursor_depth_result(struct xrt_compositor *xc, struct u_cursor_depth_patch_result *out);
 
 /*!
+ * XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B): draw the cursor sprite into
+ * every view tile at the NEXT layer_commit only, after the app's layers and
+ * before the display processor. Called by the state tracker only on a frame
+ * whose locate chained XrCursorDepthDrawInfoDXR and reported willDraw; a
+ * compositor never handed a request does no cursor work at all.
+ */
+void
+comp_metal_compositor_set_cursor_draw_request(struct xrt_compositor *xc, const struct u_cursor_draw_request *req);
+
+/*!
  * Get the MTLTexture (as void*) for a given swapchain image index.
  * Used by Metal native apps to enumerate swapchain images.
  * The handle stored in xrt_image_native is an IOSurfaceRef for cross-API sharing;

@@ -75,7 +75,7 @@
     "XR_DXR_cursor_depth": {
       "group": "rendering",
       "title": "Depth-Aware Cursor",
-      "summary": "Opt-in: the app reports the nearest content under the cursor at xrLocateViews and gets back a pose and size for a cursor sprite just in front of it, so the pointer never sits behind 3D content"
+      "summary": "Opt-in: the app reports the nearest content under the cursor at xrLocateViews; the runtime places a cursor sprite just in front of it (and, since v5, draws it, with the app's own sprite or the OS cursor's look), so the pointer never sits behind 3D content"
     },
     "XR_DXR_weave": {
       "group": "rendering",

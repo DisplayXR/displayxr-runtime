@@ -493,6 +493,34 @@ struct comp_metal_compositor
 		struct u_cursor_depth_patch_result result;
 	} cursor_depth;
 
+	/*!
+	 * XR_DXR_cursor_depth v5, the runtime draws the cursor (ADR-046
+	 * Amendment 2 B).
+	 *
+	 * ZERO COST UNLESS REQUESTED: all zero/nil for a session that never
+	 * chained XrCursorDepthDrawInfoDXR. layer_commit tests `req.requested`
+	 * and does nothing else; the shader library, pipelines and the default
+	 * sprite are built on the first real request only.
+	 */
+	struct
+	{
+		//! One-frame request from the state tracker, consumed by the next commit.
+		struct u_cursor_draw_request req;
+		//! Built lazily: [premultiplied?][_sRGB target?].
+		id<MTLRenderPipelineState> pipe[2][2];
+		bool pipes_failed;
+		//! The default look's sprite (premultiplied, _sRGB, PixelFormatView).
+		id<MTLTexture> default_tex;
+		//! The OS cursor it mirrors (retained), nil for the arrow fallback.
+		NSCursor *default_os_cursor;
+		float default_aspect;      //!< width / height
+		float default_hot_u;       //!< hotspot, normalised (top-left, v down)
+		float default_hot_v;
+		float default_height_pt;   //!< height in OS points
+		bool announced;
+		bool warned_zones;
+	} cursor_draw;
+
 	/*
 	 * Multi-screen on macOS (ADR-047 D2): a window whose content view spans
 	 * displays is woven per segment, each by its own display's DP
@@ -3957,6 +3985,352 @@ comp_metal_compositor_get_cursor_depth_result(struct xrt_compositor *xc, struct 
 	return out->valid;
 }
 
+
+/*
+ *
+ * XR_DXR_cursor_depth v5 - the runtime draws the cursor (ADR-046 Amendment 2 B)
+ *
+ * After the app's layers are composited into the atlas and before the display
+ * processor, one sprite per view: a textured, alpha-blended quad, depth test
+ * off, at the corners the state tracker's per-view map gives (projected with
+ * the projection layer's own submitted poses and fovs). Everything here is
+ * built on the first real request; a session that never asks pays one bool
+ * test per commit.
+ *
+ */
+
+// Its own tiny library, compiled on the first request only (not in
+// metal_shader_source, which every session compiles).
+static NSString *const metal_cursor_shader_source = @
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "struct CursorOut {\n"
+    "    float4 position [[position]];\n"
+    "    float2 uv;\n"
+    "};\n"
+    "// corners[k]: xy = tile-normalised position (origin top-left, y down),\n"
+    "// zw = texture uv. A 4-vertex triangle strip.\n"
+    "struct CursorConstants {\n"
+    "    float4 corners[4];\n"
+    "};\n"
+    "vertex CursorOut cursor_vertex(uint vid [[vertex_id]],\n"
+    "                               constant CursorConstants &cc [[buffer(0)]]) {\n"
+    "    float4 c = cc.corners[vid % 4];\n"
+    "    CursorOut out;\n"
+    "    out.position = float4(c.x * 2.0 - 1.0, 1.0 - c.y * 2.0, 0.0, 1.0);\n"
+    "    out.uv = c.zw;\n"
+    "    return out;\n"
+    "}\n"
+    "fragment float4 cursor_fragment(CursorOut in [[stage_in]],\n"
+    "                                texture2d<float> tex [[texture(0)]],\n"
+    "                                sampler smp [[sampler(0)]]) {\n"
+    "    return tex.sample(smp, in.uv);\n"
+    "}\n";
+
+//! Straight vs premultiplied blending, into the UNORM atlas or its _sRGB view.
+static bool
+metal_cursor_ensure_pipelines(struct comp_metal_compositor *c)
+{
+	if (c->cursor_draw.pipe[0][0] != nil) {
+		return true;
+	}
+	if (c->cursor_draw.pipes_failed) {
+		return false;
+	}
+	c->cursor_draw.pipes_failed = true; // cleared on success; never retried per frame
+
+	NSError *error = nil;
+	id<MTLLibrary> lib = [c->device newLibraryWithSource:metal_cursor_shader_source options:nil error:&error];
+	if (lib == nil) {
+		U_LOG_E("cursor_draw: shader compile failed: %s",
+		        error != nil ? error.localizedDescription.UTF8String : "?");
+		return false;
+	}
+	id<MTLFunction> vs = [lib newFunctionWithName:@"cursor_vertex"];
+	id<MTLFunction> fs = [lib newFunctionWithName:@"cursor_fragment"];
+	MTLRenderPipelineDescriptor *desc = [[MTLRenderPipelineDescriptor alloc] init];
+	desc.vertexFunction = vs;
+	desc.fragmentFunction = fs;
+	desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+	desc.colorAttachments[0].blendingEnabled = YES;
+	desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+	desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+	desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+	bool ok = vs != nil && fs != nil;
+	for (uint32_t premul = 0; ok && premul < 2; premul++) {
+		desc.colorAttachments[0].sourceRGBBlendFactor =
+		    premul ? MTLBlendFactorOne : MTLBlendFactorSourceAlpha;
+		for (uint32_t srgb = 0; ok && srgb < 2; srgb++) {
+			desc.colorAttachments[0].pixelFormat =
+			    srgb ? MTLPixelFormatBGRA8Unorm_sRGB : MTLPixelFormatBGRA8Unorm;
+			c->cursor_draw.pipe[premul][srgb] = [c->device newRenderPipelineStateWithDescriptor:desc
+			                                                                               error:&error];
+			if (c->cursor_draw.pipe[premul][srgb] == nil) {
+				U_LOG_E("cursor_draw: pipeline creation failed: %s",
+				        error != nil ? error.localizedDescription.UTF8String : "?");
+				ok = false;
+			}
+		}
+	}
+	[desc release];
+	[fs release];
+	[vs release];
+	[lib release];
+	if (ok) {
+		c->cursor_draw.pipes_failed = false;
+	}
+	return ok;
+}
+
+//! Upload premultiplied, sRGB-encoded RGBA8 as the default-look sprite.
+static bool
+metal_cursor_set_default_tex(struct comp_metal_compositor *c, const uint8_t *rgba, uint32_t w, uint32_t h)
+{
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm_sRGB
+	                                                                              width:w
+	                                                                             height:h
+	                                                                          mipmapped:NO];
+	td.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+	id<MTLTexture> tex = [c->device newTextureWithDescriptor:td];
+	if (tex == nil) {
+		return false;
+	}
+	[tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:rgba bytesPerRow:(NSUInteger)w * 4];
+	[c->cursor_draw.default_tex release];
+	c->cursor_draw.default_tex = tex;
+	return true;
+}
+
+//! The classic arrow fallback (Amendment 2 A.6): 12 x 19, tip = hotspot.
+static bool
+metal_cursor_use_arrow(struct comp_metal_compositor *c)
+{
+	if (c->cursor_draw.default_tex != nil && c->cursor_draw.default_os_cursor == nil) {
+		return true; // already the arrow
+	}
+	const uint32_t h = 76; // 4 px per arrow px: crisp up to 4x scale
+	const uint32_t w = (uint32_t)ceilf((float)h * U_CURSOR_ARROW_WIDTH_PX / U_CURSOR_ARROW_HEIGHT_PX);
+	uint8_t *rgba = calloc((size_t)w * h, 4);
+	if (rgba == NULL) {
+		return false;
+	}
+	u_cursor_draw_arrow_rgba(rgba, w, h);
+	const bool ok = metal_cursor_set_default_tex(c, rgba, w, h);
+	free(rgba);
+	if (!ok) {
+		return false;
+	}
+	[c->cursor_draw.default_os_cursor release];
+	c->cursor_draw.default_os_cursor = nil;
+	c->cursor_draw.default_aspect = (float)w / (float)h;
+	c->cursor_draw.default_hot_u = 0.0f;
+	c->cursor_draw.default_hot_v = 0.0f;
+	c->cursor_draw.default_height_pt = U_CURSOR_DRAW_DEFAULT_POINTS;
+	U_LOG_W("cursor_draw: default look = the classic arrow (12x19, tip = hotspot)");
+	return true;
+}
+
+/*!
+ * The default look (Amendment 2 A.6): mirror the CURRENT OS cursor shape.
+ *
+ * AppKit is main-thread-only, so the shape is read only when this commit runs
+ * on the main thread (an app that pumps its own events there, as the
+ * cube_*_macos apps do). Off the main thread the last snapshot is kept, or the
+ * classic arrow if there never was one. DXR_CURSOR_DEFAULT_LOOK=arrow forces
+ * the arrow. The image is re-rasterised only when the cursor object changes.
+ */
+static bool
+metal_cursor_update_default(struct comp_metal_compositor *c, float backing_scale)
+{
+	static int force_arrow = -1;
+	if (force_arrow < 0) {
+		const char *e = getenv("DXR_CURSOR_DEFAULT_LOOK");
+		force_arrow = (e != NULL && strcmp(e, "arrow") == 0) ? 1 : 0;
+	}
+	if (force_arrow || ![NSThread isMainThread]) {
+		return c->cursor_draw.default_tex != nil || metal_cursor_use_arrow(c);
+	}
+
+	NSCursor *cur = [NSCursor currentCursor];
+	if (cur == nil || cur.image == nil) {
+		return c->cursor_draw.default_tex != nil || metal_cursor_use_arrow(c);
+	}
+	if (cur == c->cursor_draw.default_os_cursor && c->cursor_draw.default_tex != nil) {
+		return true;
+	}
+
+	NSImage *img = cur.image;
+	const NSSize sz = img.size; // points
+	const NSPoint hs = cur.hotSpot; // points, origin top-left
+	const CGFloat scale = backing_scale > 0.0f ? backing_scale : 2.0;
+	const uint32_t w = (uint32_t)ceil(sz.width * scale);
+	const uint32_t h = (uint32_t)ceil(sz.height * scale);
+	if (sz.width <= 0.0 || sz.height <= 0.0 || w == 0 || h == 0 || w > 512 || h > 512) {
+		return c->cursor_draw.default_tex != nil || metal_cursor_use_arrow(c);
+	}
+	uint8_t *rgba = calloc((size_t)w * h, 4);
+	CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+	CGContextRef ctx = (rgba != NULL && cs != NULL)
+	                       ? CGBitmapContextCreate(rgba, w, h, 8, (size_t)w * 4, cs,
+	                                               kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big)
+	                       : NULL;
+	bool ok = false;
+	if (ctx != NULL) {
+		// Bitmap-context memory holds the TOP row first, so the upload below
+		// lands top-left-origin, as Metal samples it.
+		NSGraphicsContext *gc = [NSGraphicsContext graphicsContextWithCGContext:ctx flipped:NO];
+		[NSGraphicsContext saveGraphicsState];
+		[NSGraphicsContext setCurrentContext:gc];
+		[img drawInRect:NSMakeRect(0, 0, w, h)
+		       fromRect:NSZeroRect
+		      operation:NSCompositingOperationCopy
+		       fraction:1.0];
+		[NSGraphicsContext restoreGraphicsState];
+		CGContextFlush(ctx);
+		ok = metal_cursor_set_default_tex(c, rgba, w, h);
+		CGContextRelease(ctx);
+	}
+	if (cs != NULL) {
+		CGColorSpaceRelease(cs);
+	}
+	free(rgba);
+	if (!ok) {
+		return c->cursor_draw.default_tex != nil || metal_cursor_use_arrow(c);
+	}
+	[c->cursor_draw.default_os_cursor release];
+	c->cursor_draw.default_os_cursor = [cur retain];
+	c->cursor_draw.default_aspect = (float)(sz.width / sz.height);
+	c->cursor_draw.default_hot_u = (float)(hs.x / sz.width);
+	c->cursor_draw.default_hot_v = (float)(hs.y / sz.height);
+	c->cursor_draw.default_height_pt = (float)sz.height;
+	// Not per frame: only when the app's cursor object changes.
+	U_LOG_W("cursor_draw: default look = the current OS cursor (%.0fx%.0f pt, hotspot %.1f,%.1f%s)", sz.width,
+	        sz.height, hs.x, hs.y, cur == [NSCursor arrowCursor] ? ", arrowCursor" : "");
+	return true;
+}
+
+/*!
+ * Draw the requested cursor into every tile of the open atlas encoder.
+ */
+static void
+metal_cursor_draw(struct comp_metal_compositor *c,
+                  id<MTLRenderCommandEncoder> encoder,
+                  const struct u_cursor_draw_request *req,
+                  uint32_t atlas_cols,
+                  uint32_t atlas_rows,
+                  uint32_t atlas_view_w,
+                  uint32_t atlas_view_h,
+                  bool compose_linear,
+                  uint32_t canvas_px_h)
+{
+	if (!metal_cursor_ensure_pipelines(c)) {
+		return;
+	}
+	// Panel pixel pitch (metres per backing pixel) and the OS point.
+	if (c->sys_info == NULL || c->sys_info->display_pixel_height == 0 || !(c->sys_info->display_height_m > 0.0f) ||
+	    canvas_px_h == 0) {
+		return;
+	}
+	const float m_per_px = c->sys_info->display_height_m / (float)c->sys_info->display_pixel_height;
+	float backing_scale = 1.0f;
+	if (c->metal_layer != nil && c->metal_layer.contentsScale > 0.0) {
+		backing_scale = (float)c->metal_layer.contentsScale;
+	}
+	const float m_per_pt = m_per_px * backing_scale;
+	const float canvas_h_m = (float)canvas_px_h * m_per_px;
+
+	id<MTLTexture> src = nil;
+	float aspect, hot_u, hot_v, size_m;
+	bool premul;
+	bool flip_v = false;
+	if (req->image != NULL) {
+		struct comp_metal_swapchain *msc = metal_swapchain(req->image);
+		if (req->image_index >= msc->image_count || msc->images[req->image_index] == nil ||
+		    msc->info.height == 0) {
+			return;
+		}
+		// Sampled as declared on the _sRGB path, non-decoding on the
+		// passthrough path - the same rule as every other layer source.
+		src = metal_layer_source_view(msc->images[req->image_index], 0, compose_linear);
+		aspect = (float)msc->info.width / (float)msc->info.height;
+		hot_u = req->hot_u;
+		hot_v = req->hot_v;
+		size_m = req->size_m > 0.0f ? req->size_m : U_CURSOR_DRAW_DEFAULT_POINTS * m_per_pt;
+		premul = false; // spec: the app's sprite is STRAIGHT alpha
+		flip_v = c->source_is_gl;
+	} else {
+		if (!metal_cursor_update_default(c, backing_scale)) {
+			return;
+		}
+		src = metal_layer_source_view(c->cursor_draw.default_tex, 0, compose_linear);
+		aspect = c->cursor_draw.default_aspect;
+		hot_u = c->cursor_draw.default_hot_u;
+		hot_v = c->cursor_draw.default_hot_v;
+		size_m = req->size_m > 0.0f ? req->size_m : c->cursor_draw.default_height_pt * m_per_pt;
+		premul = true; // CGBitmapContext output
+	}
+	const float height = size_m / canvas_h_m; // sprite height, in units
+
+	if (!c->cursor_draw.announced) {
+		c->cursor_draw.announced = true;
+		U_LOG_W("cursor_draw: Metal compositor drawing the cursor (%s, %.1f mm tall, %u views; ADR-046 "
+		        "Amendment 2 B, one-time notice)",
+		        req->image != NULL ? "app sprite" : "default look", size_m * 1000.0f, req->view_count);
+	}
+
+	[encoder setRenderPipelineState:c->cursor_draw.pipe[premul ? 1 : 0][compose_linear ? 1 : 0]];
+	[encoder setDepthStencilState:c->depth_stencil_state_disabled];
+	[encoder setFragmentTexture:src atIndex:0];
+	[encoder setFragmentSamplerState:c->sampler_linear atIndex:0];
+
+	const uint32_t tiles = atlas_cols * atlas_rows;
+	const uint32_t n = req->view_count < tiles ? req->view_count : tiles;
+	const uint32_t att_w = (uint32_t)c->atlas_texture.width;
+	const uint32_t att_h = (uint32_t)c->atlas_texture.height;
+	for (uint32_t i = 0; i < n; i++) {
+		const uint32_t ox = (i % atlas_cols) * atlas_view_w;
+		const uint32_t oy = (i / atlas_cols) * atlas_view_h;
+		if (ox >= att_w || oy >= att_h) {
+			continue;
+		}
+		MTLViewport vp = {(double)ox, (double)oy, (double)atlas_view_w, (double)atlas_view_h, 0.0, 1.0};
+		[encoder setViewport:vp];
+		// The scissor is mandatory: a cursor at a tile edge must not spill
+		// into the neighbour view (the DP would weave it into the wrong eye).
+		MTLScissorRect sr = {ox, oy, (ox + atlas_view_w > att_w) ? (att_w - ox) : atlas_view_w,
+		                     (oy + atlas_view_h > att_h) ? (att_h - oy) : atlas_view_h};
+		[encoder setScissorRect:sr];
+
+		float xy[4][2];
+		u_cursor_draw_corners(&req->view[i], height, aspect, hot_u, hot_v, xy);
+		static const float uv[4][2] = {{0, 0}, {0, 1}, {1, 0}, {1, 1}};
+		struct
+		{
+			float corners[4][4];
+		} cc;
+		for (int k = 0; k < 4; k++) {
+			cc.corners[k][0] = xy[k][0];
+			cc.corners[k][1] = xy[k][1];
+			cc.corners[k][2] = uv[k][0];
+			cc.corners[k][3] = flip_v ? 1.0f - uv[k][1] : uv[k][1];
+		}
+		[encoder setVertexBytes:&cc length:sizeof(cc) atIndex:0];
+		[encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+	}
+	[src release];
+
+	// Hand the encoder back with a full-attachment scissor.
+	MTLScissorRect full = {0, 0, att_w, att_h};
+	[encoder setScissorRect:full];
+}
+
+void
+comp_metal_compositor_set_cursor_draw_request(struct xrt_compositor *xc, const struct u_cursor_draw_request *req)
+{
+	struct comp_metal_compositor *c = metal_comp(xc);
+	c->cursor_draw.req = *req;
+}
+
 static xrt_result_t
 metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -3977,6 +4351,17 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			metal_cursor_depth_sample(c, &c->cursor_depth.req);
 		}
 		c->cursor_depth.req.requested = false;
+	}
+
+	// XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B). ZERO COST UNLESS
+	// REQUESTED: one field test, false for every session that never chained
+	// XrCursorDepthDrawInfoDXR. The request covers this commit only.
+	struct u_cursor_draw_request cursor_req;
+	bool cursor_pending = false;
+	if (c->cursor_draw.req.requested) {
+		cursor_req = c->cursor_draw.req;
+		c->cursor_draw.req.requested = false;
+		cursor_pending = u_cursor_draw_should_draw(&cursor_req);
 	}
 
 	// Frame timing for HUD
@@ -4244,7 +4629,9 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	bool zero_copy = false;
 	id<MTLTexture> zc_texture = nil;
 
-	if (c->layer_accum.layer_count == 1 && seg_route_in.count == 0) {
+	// A frame carrying a runtime-drawn cursor composes into the atlas: the
+	// cursor is drawn there, never into the app's own image.
+	if (c->layer_accum.layer_count == 1 && seg_route_in.count == 0 && !cursor_pending) {
 		struct comp_layer *layer = &c->layer_accum.layers[0];
 		if (layer->data.type == XRT_LAYER_PROJECTION ||
 		    layer->data.type == XRT_LAYER_PROJECTION_DEPTH) {
@@ -5087,6 +5474,29 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			[src_tex release];
 		}
 
+		// XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B): the runtime-drawn
+		// cursor, LAST - over the projection, quad and window-space layers,
+		// never occluded - and before the display processor. Inside this
+		// encoder, so the /tmp/dxr_atlas_trigger dump below shows it.
+		if (cursor_pending) {
+			if (zones_frame) {
+				// The state tracker already refuses zones frames; belt and braces.
+				if (!c->cursor_draw.warned_zones) {
+					c->cursor_draw.warned_zones = true;
+					U_LOG_W("cursor_draw: zones frame - cursor not drawn (one-time warning)");
+				}
+			} else {
+				uint32_t canvas_px_h = 0;
+				if (eff_canvas.valid && eff_canvas.h > 0) {
+					canvas_px_h = eff_canvas.h;
+				} else if (output_texture != nil) {
+					canvas_px_h = (uint32_t)output_texture.height;
+				}
+				metal_cursor_draw(c, encoder, &cursor_req, atlas_cols, atlas_rows, atlas_view_w, atlas_view_h,
+				                  compose_linear, canvas_px_h);
+			}
+		}
+
 		[encoder endEncoding];
 	}
 
@@ -5586,6 +5996,17 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 		[c->cursor_depth.buf[s] release];
 		c->cursor_depth.buf[s] = nil;
 	}
+	// XR_DXR_cursor_depth v5 draw resources (nil unless ever requested).
+	for (uint32_t p = 0; p < 2; p++) {
+		for (uint32_t s = 0; s < 2; s++) {
+			[c->cursor_draw.pipe[p][s] release];
+			c->cursor_draw.pipe[p][s] = nil;
+		}
+	}
+	[c->cursor_draw.default_tex release];
+	c->cursor_draw.default_tex = nil;
+	[c->cursor_draw.default_os_cursor release];
+	c->cursor_draw.default_os_cursor = nil;
 	[c->depth_texture release];
 	c->depth_texture = nil;
 	[c->projection_pipeline release];
