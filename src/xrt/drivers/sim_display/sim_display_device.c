@@ -13,8 +13,10 @@
  */
 
 #include "sim_display_interface.h"
+#include "sim_display_monitor_geometry.h"
 
 #include "xrt/xrt_compiler.h"
+#include "xrt/xrt_config_os.h"
 #include "xrt/xrt_device.h"
 
 #include "os/os_time.h"
@@ -632,6 +634,47 @@ sim_display_hmd_create(void)
 			if (getenv("SIM_DISPLAY_PIXEL_H") == NULL) {
 				pixel_h = (int)dm.dmPelsHeight;
 			}
+		}
+	}
+#endif
+
+#ifdef XRT_OS_LINUX_DESKTOP
+	// Desktop-Linux twin of the Windows block above (#369 class): adopt the
+	// real monitor's DEVICE pixels and EDID physical size, from the same
+	// RandR <-> DRM-sysfs records the plug-in loader logs as "monitor N
+	// output=... connector=..." (aux_os, statically linked into this
+	// plug-in, so no runtime internals). Device pixels, not the scaled
+	// logical desktop size: the service window presents 1:1 device pixels,
+	// so a 2880x1800 eDP at 167% is a 2880x1800 panel, not 3456x2160 (and
+	// never the fixed 1920x1080). Explicit env overrides still win, per
+	// variable. The nominal viewer (SIM_DISPLAY_NOMINAL_Z_M, 10 cm eye
+	// height) is left alone, as on Windows and macOS.
+	{
+		struct os_display_edid_list mons;
+		struct sim_display_monitor_geometry geo;
+		if (os_display_edid_enumerate(&mons) && sim_display_pick_monitor_geometry(&mons, &geo)) {
+			const struct os_display_edid_monitor *m = &mons.monitors[geo.index];
+			if (getenv("SIM_DISPLAY_PIXEL_W") == NULL) {
+				pixel_w = (int)geo.pixel_width;
+			}
+			if (getenv("SIM_DISPLAY_PIXEL_H") == NULL) {
+				pixel_h = (int)geo.pixel_height;
+			}
+			if (geo.physical_width_mm > 0 && getenv("SIM_DISPLAY_WIDTH_M") == NULL) {
+				display_w_m = (float)geo.physical_width_mm / 1000.0f;
+			}
+			if (geo.physical_height_mm > 0 && getenv("SIM_DISPLAY_HEIGHT_M") == NULL) {
+				display_h_m = (float)geo.physical_height_mm / 1000.0f;
+			}
+			U_LOG_W(
+			    "sim_display: adopting monitor %u (%s) output='%s' connector='%s' %ux%u px (%s) %ux%u mm "
+			    "-> panel %dx%d px, %.3fx%.3f m (SIM_DISPLAY_* env overrides win)",
+			    geo.index, geo.reason, m->output_name, m->connector, geo.pixel_width, geo.pixel_height,
+			    geo.pixel_is_native ? "connector mode" : "desktop mode", geo.physical_width_mm,
+			    geo.physical_height_mm, pixel_w, pixel_h, display_w_m, display_h_m);
+		} else {
+			U_LOG_W("sim_display: no monitor enumerated, keeping %dx%d px, %.3fx%.3f m", pixel_w, pixel_h,
+			        display_w_m, display_h_m);
 		}
 	}
 #endif
