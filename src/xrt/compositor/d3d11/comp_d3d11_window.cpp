@@ -2283,6 +2283,15 @@ comp_d3d11_window_is_workspace_pointer_capture_enabled(struct comp_d3d11_window 
 extern "C" void
 comp_d3d11_window_set_workspace_pointer_capture(struct comp_d3d11_window *window, bool enabled, uint32_t button)
 {
+	comp_d3d11_window_set_workspace_pointer_capture_ex(window, enabled, button, true);
+}
+
+extern "C" void
+comp_d3d11_window_set_workspace_pointer_capture_ex(struct comp_d3d11_window *window,
+                                                   bool enabled,
+                                                   uint32_t button,
+                                                   bool grab)
+{
 	if (window == NULL) {
 		return;
 	}
@@ -2291,8 +2300,11 @@ comp_d3d11_window_set_workspace_pointer_capture(struct comp_d3d11_window *window
 	// Phase 2.K: also drive Win32 SetCapture / ReleaseCapture so the WndProc
 	// keeps receiving WM_MOUSEMOVE while the cursor leaves the workspace
 	// window during a drag. SetCapture must run on the thread that owns the
-	// HWND, so post to the window thread.
-	if (window->hwnd != NULL) {
+	// HWND, so post to the window thread. Release is always posted (the
+	// window thread only releases a capture it holds); the grab only when
+	// asked — ADR-052: of several presenter windows, only the one the press
+	// went down on can take the capture.
+	if (window->hwnd != NULL && (grab || !enabled)) {
 		PostMessageW(window->hwnd, WM_WORKSPACE_SET_CAPTURE, enabled ? 1 : 0, 0);
 	}
 }

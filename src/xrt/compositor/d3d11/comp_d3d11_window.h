@@ -486,6 +486,20 @@ void
 comp_d3d11_window_set_workspace_pointer_capture(struct comp_d3d11_window *window, bool enabled, uint32_t button);
 
 /*!
+ * ADR-052: comp_d3d11_window_set_workspace_pointer_capture with the Win32
+ * grab made optional. With @p grab false and @p enabled true the window
+ * reports MOTION and applies the capture's forwarding rules, but does not
+ * `SetCapture` — for the presenter windows the press did NOT go down on (a
+ * window on another thread cannot take the capture; only the owner grabs).
+ * A disable always posts the release (guarded on the window thread).
+ */
+void
+comp_d3d11_window_set_workspace_pointer_capture_ex(struct comp_d3d11_window *window,
+                                                   bool enabled,
+                                                   uint32_t button,
+                                                   bool grab);
+
+/*!
  * Phase 2.K: read the current pointer-capture flag. Used by the service
  * compositor to suspend its built-in title-bar drag / resize / RMB rotation
  * while a workspace controller has taken over interactive policy. Lock-free

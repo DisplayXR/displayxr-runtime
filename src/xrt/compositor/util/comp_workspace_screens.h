@@ -349,6 +349,43 @@ comp_ws_screen_at(
 enum comp_ws_policy
 comp_ws_policy_from_env(const char *dxr_segments, const char *dxr_workspace_screens);
 
+/*!
+ * Which presenter window owns the pointer for a controller's pointer capture
+ * (title-bar drag, edge resize, RMB rotation).
+ *
+ * Every presenter window runs its own window thread, and Win32 capture
+ * (`SetCapture`) only takes on the thread whose window the button went down
+ * on. So the controller's "capture the pointer" has to be applied to the
+ * presenter that received the press, not to the primary: a press on a
+ * secondary panel that grabs the primary's window grabs nothing, and the
+ * secondary never reports motion (ADR-052).
+ *
+ * The owner is the source of the newest pointer DOWN drained from the
+ * presenters (wrap-safe `GetTickCount` order; on a tie the later-noted DOWN
+ * wins, so callers note in drain order). Screen id 0 means the primary
+ * presenter (the service window), which is also the answer before any DOWN.
+ */
+struct comp_ws_pointer_owner
+{
+	uint64_t screen_id;    //!< 0 = the primary presenter
+	uint32_t timestamp_ms; //!< the owning DOWN's timestamp
+	bool valid;            //!< false until the first DOWN
+};
+
+/*!
+ * Note a pointer DOWN from presenter @p screen_id (0 = primary) at
+ * @p timestamp_ms. It becomes the owner unless an already-noted DOWN is newer.
+ */
+void
+comp_ws_pointer_owner_note_down(struct comp_ws_pointer_owner *o, uint64_t screen_id, uint32_t timestamp_ms);
+
+/*!
+ * The presenter that owns the pointer: its screen id, 0 for the primary
+ * (also before any DOWN was noted).
+ */
+uint64_t
+comp_ws_pointer_owner_screen(const struct comp_ws_pointer_owner *o);
+
 #ifdef __cplusplus
 }
 #endif

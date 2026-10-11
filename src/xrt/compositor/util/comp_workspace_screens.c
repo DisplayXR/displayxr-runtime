@@ -591,3 +591,24 @@ comp_ws_policy_from_env(const char *dxr_segments, const char *dxr_workspace_scre
 	}
 	return COMP_WS_POLICY_CLAIMED;
 }
+
+void
+comp_ws_pointer_owner_note_down(struct comp_ws_pointer_owner *o, uint64_t screen_id, uint32_t timestamp_ms)
+{
+	if (o == NULL) {
+		return;
+	}
+	// Wrap-safe: a noted DOWN more than half the tick range "ahead" is older.
+	if (o->valid && (int32_t)(timestamp_ms - o->timestamp_ms) < 0) {
+		return;
+	}
+	o->screen_id = screen_id;
+	o->timestamp_ms = timestamp_ms;
+	o->valid = true;
+}
+
+uint64_t
+comp_ws_pointer_owner_screen(const struct comp_ws_pointer_owner *o)
+{
+	return (o != NULL && o->valid) ? o->screen_id : 0;
+}

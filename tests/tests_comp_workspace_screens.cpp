@@ -710,3 +710,51 @@ TEST_CASE("comp_ws: per-screen views — the straddler's per-segment table")
 		CHECK(none.count == 0);
 	}
 }
+
+TEST_CASE("comp_ws: the pointer capture goes to the presenter the press went down on")
+{
+	// Each presenter window has its own thread; Win32 capture only takes on
+	// the window the button went down on. A title-bar drag that starts on a
+	// secondary panel must grab THAT presenter, not the primary (ADR-052).
+	comp_ws_pointer_owner o{};
+
+	SECTION("before any press: the primary (the service window)")
+	{
+		CHECK(comp_ws_pointer_owner_screen(&o) == 0);
+		CHECK(comp_ws_pointer_owner_screen(nullptr) == 0);
+		comp_ws_pointer_owner_note_down(nullptr, SIDE, 5); // tolerated
+	}
+
+	SECTION("a press on the secondary panel makes it the owner, a later press on the primary takes it back")
+	{
+		comp_ws_pointer_owner_note_down(&o, SIDE, 1000);
+		CHECK(comp_ws_pointer_owner_screen(&o) == SIDE);
+		comp_ws_pointer_owner_note_down(&o, 0, 1016);
+		CHECK(comp_ws_pointer_owner_screen(&o) == 0);
+		comp_ws_pointer_owner_note_down(&o, SIDE, 2000);
+		CHECK(comp_ws_pointer_owner_screen(&o) == SIDE);
+	}
+
+	SECTION("drain order: the primary's ring is drained first, an older secondary DOWN does not steal the owner")
+	{
+		comp_ws_pointer_owner_note_down(&o, 0, 5000);
+		comp_ws_pointer_owner_note_down(&o, SIDE, 4990);
+		CHECK(comp_ws_pointer_owner_screen(&o) == 0);
+	}
+
+	SECTION("same tick: the later-noted DOWN wins (the presenters drain after the primary)")
+	{
+		comp_ws_pointer_owner_note_down(&o, 0, 7000);
+		comp_ws_pointer_owner_note_down(&o, SIDE, 7000);
+		CHECK(comp_ws_pointer_owner_screen(&o) == SIDE);
+	}
+
+	SECTION("GetTickCount wrap: a press just after the wrap is newer")
+	{
+		comp_ws_pointer_owner_note_down(&o, 0, 0xFFFFFFF0u);
+		comp_ws_pointer_owner_note_down(&o, SIDE, 0x00000010u);
+		CHECK(comp_ws_pointer_owner_screen(&o) == SIDE);
+		comp_ws_pointer_owner_note_down(&o, 0, 0xFFFFFFF8u); // pre-wrap = older
+		CHECK(comp_ws_pointer_owner_screen(&o) == SIDE);
+	}
+}
