@@ -473,33 +473,75 @@ TEST_CASE("comp_segments: a DP carried across a screen-table change (display hot
 TEST_CASE("comp_segments: the session DP keeps its screen only while its plug-in owns it (display hotplug)",
           "[comp_segments][hotplug]")
 {
+	// The session DP: made by leia-sr for the Odyssey, serial "ODY-1", at
+	// 1512,0 2560x1440 pt, CGDirectDisplayID 3.
 	comp_segments_session_dp sd{};
 	sd.valid = true;
-	sd.monitor_id = EDP;
-	std::strcpy(sd.plugin_id, "sim-display");
+	sd.monitor_id = DS1;
+	std::strcpy(sd.plugin_id, "leia-sr");
+	std::strcpy(sd.serial, "ODY-1");
+	sd.desktop = {1512, 0, 2560, 1440};
+	sd.platform_id = 3;
 
-	const uint64_t ids[] = {EDP, DS1};
-	const char *before[] = {"sim-display", "sim-display"};
-	CHECK(comp_segments_session_dp_screen(&sd, ids, before, 2) == 0);
+	auto cand = [](uint64_t id, const char *plugin, const char *serial, comp_seg_rect r, uint64_t pid) {
+		comp_segments_session_candidate c{};
+		c.monitor_id = id;
+		c.plugin_id = plugin;
+		c.serial = serial;
+		c.desktop = r;
+		c.platform_id = pid;
+		return c;
+	};
+	const comp_seg_rect laptop = {0, 0, 1512, 982};
+	const comp_seg_rect ody = {1512, 0, 2560, 1440};
+	comp_segments_session_miss miss = COMP_SEG_SESSION_OWNS;
 
-	// A panel plugged into another port is claimed by leia-sr: EDP unchanged.
-	const char *other_claimed[] = {"sim-display", "leia-sr"};
-	CHECK(comp_segments_session_dp_screen(&sd, ids, other_claimed, 2) == 0);
+	// As created.
+	comp_segments_session_candidate as_created[] = {
+	    cand(EDP, "sim-display", "", laptop, 1),
+	    cand(DS1, "leia-sr", "ODY-1", ody, 3),
+	};
+	CHECK(comp_segments_session_dp_screen(&sd, as_created, 2, &miss) == 1);
+	CHECK(miss == COMP_SEG_SESSION_OWNS);
 
-	// The session DP's own monitor re-claimed by a vendor whose panel came up
-	// after session start: the session DP owns no screen any more.
-	const char *reclaimed[] = {"leia-sr", "sim-display"};
-	CHECK(comp_segments_session_dp_screen(&sd, ids, reclaimed, 2) == -1);
+	// Unplugged.
+	CHECK(comp_segments_session_dp_screen(&sd, as_created, 1, &miss) == -1);
+	CHECK(miss == COMP_SEG_SESSION_GONE);
 
-	// Its monitor unplugged.
-	const uint64_t only_ds1[] = {DS1};
-	const char *only_ds1_p[] = {"sim-display"};
-	CHECK(comp_segments_session_dp_screen(&sd, only_ds1, only_ds1_p, 1) == -1);
+	// Replugged, panel not authenticated yet: sim-display claims it — re-claimed.
+	comp_segments_session_candidate edid_only[] = {
+	    cand(EDP, "sim-display", "", laptop, 1),
+	    cand(DS1, "sim-display", "", ody, 3),
+	};
+	CHECK(comp_segments_session_dp_screen(&sd, edid_only, 2, &miss) == -1);
+	CHECK(miss == COMP_SEG_SESSION_RECLAIMED);
+
+	// Case D, kept: the SAME serial back at the SAME bounds under the SAME OS
+	// handle — the session DP owns it again, its window-bound weaver is kept.
+	CHECK(comp_segments_session_dp_screen(&sd, as_created, 2, &miss) == 1);
+	CHECK(miss == COMP_SEG_SESSION_OWNS);
+
+	// Case D, recreated: another serial, a renumbered CGDirectDisplayID, or
+	// moved bounds — re-bound: the panel gets a fresh segment DP instead.
+	comp_segments_session_candidate other_serial[] = {cand(DS1, "leia-sr", "ODY-2", ody, 3)};
+	CHECK(comp_segments_session_dp_screen(&sd, other_serial, 1, &miss) == -1);
+	CHECK(miss == COMP_SEG_SESSION_REBOUND);
+	comp_segments_session_candidate renumbered[] = {cand(DS1, "leia-sr", "ODY-1", ody, 4)};
+	CHECK(comp_segments_session_dp_screen(&sd, renumbered, 1, &miss) == -1);
+	CHECK(miss == COMP_SEG_SESSION_REBOUND);
+	comp_segments_session_candidate moved[] = {cand(DS1, "leia-sr", "ODY-1", {-2560, 0, 2560, 1440}, 3)};
+	CHECK(comp_segments_session_dp_screen(&sd, moved, 1, &miss) == -1);
+	CHECK(miss == COMP_SEG_SESSION_REBOUND);
+	comp_segments_session_candidate remoded[] = {cand(DS1, "leia-sr", "ODY-1", {1512, 0, 1920, 1080}, 3)};
+	CHECK(comp_segments_session_dp_screen(&sd, remoded, 1, &miss) == -1);
+	CHECK(miss == COMP_SEG_SESSION_REBOUND);
+	CHECK(std::strcmp(comp_segments_session_miss_str(COMP_SEG_SESSION_REBOUND), "re-bound") == 0);
 
 	// Not recorded yet: no answer.
 	comp_segments_session_dp none{};
-	CHECK(comp_segments_session_dp_screen(&none, ids, before, 2) == -1);
-	CHECK(comp_segments_session_dp_screen(nullptr, ids, before, 2) == -1);
+	CHECK(comp_segments_session_dp_screen(&none, as_created, 2, &miss) == -1);
+	CHECK(miss == COMP_SEG_SESSION_NOT_RECORDED);
+	CHECK(comp_segments_session_dp_screen(nullptr, as_created, 2, nullptr) == -1);
 }
 
 TEST_CASE("comp_segments: a window on one screen the session DP does not own still splits (display hotplug)",

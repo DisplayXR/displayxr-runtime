@@ -4287,6 +4287,12 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 		}
 		struct xrt_dp_registry_entry *e = &out_registry->entries[out_registry->entry_count++];
 		fill_registry_entry(e, desc, best_src, best_claim);
+		for (uint32_t i = 0; i < g_monitor_side_count; i++) {
+			if (g_monitor_side[i].monitor_id == desc->monitor_id) {
+				e->platform_id = g_monitor_side[i].mon.platform_id;
+				break;
+			}
+		}
 		if (have_screen_pref) {
 			(void)snprintf(e->preferred_plugin, sizeof(e->preferred_plugin), "%s", screen_pref);
 			e->preferred_source = (uint32_t)pref_source;

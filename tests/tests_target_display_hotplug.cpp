@@ -96,12 +96,14 @@ TEST_CASE("hotplug sched: an OS event arms follow-ups, a plug-in request does no
 	CHECK(sources == TARGET_HOTPLUG_SOURCE_PLUGIN);
 	CHECK(target_hotplug_sched_deadline(&s) == TARGET_HOTPLUG_NEVER);
 
-	// OS: the run at +300 ms, then follow-ups at +0.5 .. +8 s after it.
+	// OS: the run at +300 ms, then follow-ups at +0.5 .. +32 s after it — the
+	// tail outlasts an SR service retrying FPC authentication (1 s .. 30 s backoff).
 	target_hotplug_sched_event(&s, 10000 * MS, TARGET_HOTPLUG_SOURCE_OS);
 	REQUIRE(target_hotplug_sched_take(&s, 10300 * MS, &followup, &sources));
 	CHECK_FALSE(followup);
 	const uint64_t base = 10300 * MS;
-	const uint64_t offs[] = {500, 1000, 1500, 2000, 3000, 4000, 6000, 8000};
+	const uint64_t offs[] = {500, 1000, 1500, 2000, 3000, 4000, 6000, 8000, 12000, 16000, 24000, 32000};
+	REQUIRE(sizeof(offs) / sizeof(offs[0]) == TARGET_HOTPLUG_FOLLOWUPS);
 	for (uint64_t off : offs) {
 		CHECK(target_hotplug_sched_deadline(&s) == base + off * MS);
 		CHECK_FALSE(target_hotplug_sched_take(&s, base + off * MS - 1, nullptr, nullptr));

@@ -291,6 +291,7 @@ os_display_edid_enumerate(struct os_display_edid_list *out_list)
 		m->native_height = desk.native_height;
 		m->refresh_hz = (desk.native_refresh_mhz + 500u) / 1000u;
 		m->is_primary = desk.is_primary;
+		m->platform_id = ids[i];
 		m->physical_width_mm = desk.physical_width_mm;
 		m->physical_height_mm = desk.physical_height_mm;
 		(void)snprintf(m->output_name, sizeof(m->output_name), "%s", desk.device_name);

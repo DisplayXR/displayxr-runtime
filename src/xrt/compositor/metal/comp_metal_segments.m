@@ -98,6 +98,8 @@ struct comp_metal_segments
 	bool blit_failed;
 
 	bool enabled;
+	//! The session DP owns a listed screen (always true without a recorded identity).
+	bool session_owns;
 	uint32_t screen_count;
 	struct comp_segments_screen screens[COMP_SEGMENTS_MAX_SCREENS]; //!< desktop = POINTS
 	float scale[COMP_SEGMENTS_MAX_SCREENS];                         //!< each screen's backing scale
@@ -551,6 +553,7 @@ comp_metal_segments_set_screens(struct comp_metal_segments *segs,
 
 	comp_segments_lifecycle_init(&segs->lc, 0, 0);
 	segs->enabled = false;
+	segs->session_owns = true;
 	segs->screen_count = 0;
 	segs->have_logged_table = false;
 	segs->logged_split = false;
@@ -585,22 +588,33 @@ comp_metal_segments_set_screens(struct comp_metal_segments *segs,
 		// default may have moved, or that monitor may have been re-claimed
 		// (sim-display -> a vendor whose panel just came up): then no screen
 		// is the primary, and every screen is woven by its own segment DP.
-		uint64_t ids[XRT_DP_REGISTRY_MAX_ENTRIES];
-		const char *pids[XRT_DP_REGISTRY_MAX_ENTRIES];
+		struct comp_segments_session_candidate cands[XRT_DP_REGISTRY_MAX_ENTRIES];
 		const uint32_t en = info->dp_registry.entry_count < XRT_DP_REGISTRY_MAX_ENTRIES
 		                        ? info->dp_registry.entry_count
 		                        : XRT_DP_REGISTRY_MAX_ENTRIES;
 		for (uint32_t e = 0; e < en; e++) {
-			ids[e] = info->dp_registry.entries[e].monitor_id;
-			pids[e] = info->dp_registry.entries[e].plugin_id;
+			const struct xrt_dp_registry_entry *re = &info->dp_registry.entries[e];
+			cands[e] = (struct comp_segments_session_candidate){
+			    .monitor_id = re->monitor_id,
+			    .plugin_id = re->plugin_id,
+			    .serial = re->serial,
+			    .desktop = {re->screen_left, re->screen_top, re->pixel_width, re->pixel_height},
+			    .platform_id = re->platform_id,
+			};
 		}
-		const int at = comp_segments_session_dp_screen(session, ids, pids, en);
+		enum comp_segments_session_miss miss = COMP_SEG_SESSION_OWNS;
+		const int at = comp_segments_session_dp_screen(session, cands, en, &miss);
 		primary_entry = at >= 0 ? &info->dp_registry.entries[at] : NULL;
 		if (primary_entry == NULL) {
-			U_LOG_W("segments: the session's display processor ('%s', made for screen 0x%016llx) no longer owns "
-			        "a listed screen — every screen is woven by its own screen's DP (display hotplug)",
-			        session->plugin_id, (unsigned long long)session->monitor_id);
+			U_LOG_W("segments: the session's display processor ('%s', made for screen 0x%016llx serial '%s' at "
+			        "%d,%d %ux%u, OS handle %llu) no longer owns a listed screen — %s; every screen is woven by "
+			        "its own screen's DP%s (display hotplug)",
+			        session->plugin_id, (unsigned long long)session->monitor_id, session->serial,
+			        session->desktop.x, session->desktop.y, session->desktop.w, session->desktop.h,
+			        (unsigned long long)session->platform_id, comp_segments_session_miss_str(miss),
+			        miss == COMP_SEG_SESSION_REBOUND ? ", a freshly created one for that panel" : "");
 		}
+		segs->session_owns = primary_entry != NULL;
 	} else {
 		// The primary: the system-default screen, woven by the session's own DP.
 		for (uint32_t i = 0; i < list->count && i < XRT_SCREEN_LIST_MAX; i++) {
@@ -737,6 +751,12 @@ finish:
 			carry_release(segs, &carry[k]);
 		}
 	}
+}
+
+bool
+comp_metal_segments_session_owns(const struct comp_metal_segments *segs)
+{
+	return segs == NULL || segs->session_owns;
 }
 
 bool

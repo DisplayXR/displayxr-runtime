@@ -58,8 +58,14 @@ extern "C" {
 #define TARGET_HOTPLUG_SETTLE_NS (300ull * 1000ull * 1000ull)
 //! The longest an event waits however busy the storm (from its first event).
 #define TARGET_HOTPLUG_MAX_DELAY_NS (1000ull * 1000ull * 1000ull)
-//! Follow-up re-runs after an OS / poll event's re-run.
-#define TARGET_HOTPLUG_FOLLOWUPS 8u
+/*!
+ * Follow-up re-runs after an OS / poll event's re-run: 0.5, 1, 1.5, 2, 3, 4,
+ * 6, 8, 12, 16, 24 and 32 s. The tail covers a vendor service that needs
+ * several authentication attempts (the Leia SR service retries FPC
+ * authentication with a backoff from 1 s up to 30 s); a plug-in that can say
+ * when its panel is ready (request_display_rescan) does not depend on it.
+ */
+#define TARGET_HOTPLUG_FOLLOWUPS 12u
 //! "No deadline".
 #define TARGET_HOTPLUG_NEVER UINT64_MAX
 
@@ -97,7 +103,8 @@ struct target_hotplug_sched
 
 /*!
  * Initialise. 0 for @p settle_ns / @p max_delay_ns selects the default; the
- * follow-ups are 0.5, 1, 1.5, 2, 3, 4, 6 and 8 s after the triggering re-run.
+ * follow-ups are @ref TARGET_HOTPLUG_FOLLOWUPS offsets after the triggering
+ * re-run (0.5 s .. 32 s).
  */
 void
 target_hotplug_sched_init(struct target_hotplug_sched *s, uint64_t settle_ns, uint64_t max_delay_ns);
@@ -212,8 +219,10 @@ void
 target_display_hotplug_stop(struct target_display_hotplug **hp_ptr);
 
 /*!
- * Request a re-run from anywhere (any thread, never blocks on a re-run). A
- * no-op when no monitor runs.
+ * Request a re-run from anywhere (any thread, never blocks on a re-run). With
+ * no monitor running yet the request is latched and served by the next
+ * @ref target_display_hotplug_start — a plug-in whose panel authenticates
+ * between discovery and system create must not be lost.
  */
 void
 target_display_hotplug_request(enum target_hotplug_source src, const char *reason);

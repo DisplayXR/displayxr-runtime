@@ -42,7 +42,8 @@ target_hotplug_sched_init(struct target_hotplug_sched *s, uint64_t settle_ns, ui
 	if (s->max_delay_ns < s->settle_ns) {
 		s->max_delay_ns = s->settle_ns;
 	}
-	static const uint32_t offs_ms[TARGET_HOTPLUG_FOLLOWUPS] = {500, 1000, 1500, 2000, 3000, 4000, 6000, 8000};
+	static const uint32_t offs_ms[TARGET_HOTPLUG_FOLLOWUPS] = {500,  1000, 1500,  2000,  3000,  4000,
+	                                                           6000, 8000, 12000, 16000, 24000, 32000};
 	for (uint32_t i = 0; i < TARGET_HOTPLUG_FOLLOWUPS; i++) {
 		s->followup_ns[i] = MS(offs_ms[i]);
 	}
@@ -348,6 +349,9 @@ struct target_display_hotplug
 //! The running monitor; requests from plug-ins and the OS reach it here.
 static pthread_mutex_t g_hp_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct target_display_hotplug *g_hp = NULL;
+//! A request that arrived while no monitor ran (served by the next start).
+static uint32_t g_latched_sources = 0;
+static char g_latched_reason[96];
 
 static const char *
 sources_str(uint32_t s, char *buf, size_t size)
@@ -392,10 +396,13 @@ target_display_hotplug_request(enum target_hotplug_source src, const char *reaso
 		os_mutex_lock(&hp->mutex);
 		event_locked(hp, src, reason);
 		os_mutex_unlock(&hp->mutex);
+	} else {
+		g_latched_sources |= (uint32_t)src;
+		(void)snprintf(g_latched_reason, sizeof(g_latched_reason), "%s", reason != NULL ? reason : "");
 	}
 	pthread_mutex_unlock(&g_hp_lock);
 	if (hp == NULL) {
-		U_LOG_I("display hotplug: request (%s) ignored — no monitor running in this process",
+		U_LOG_I("display hotplug: request (%s) latched — no monitor running yet; the next one serves it",
 		        reason != NULL ? reason : "-");
 	}
 }
@@ -543,6 +550,17 @@ target_display_hotplug_start(target_display_hotplug_rebuild_fn fn, void *user)
 		return NULL;
 	}
 	g_hp = hp;
+	if (g_latched_sources != 0) {
+		// Served by this monitor's first sweep (one event per latched source).
+		for (uint32_t bit = 1; bit <= TARGET_HOTPLUG_SOURCE_TEST; bit <<= 1) {
+			if ((g_latched_sources & bit) != 0) {
+				target_hotplug_sched_event(&hp->sched, os_monotonic_get_ns(),
+				                           (enum target_hotplug_source)bit);
+			}
+		}
+		(void)snprintf(hp->reason, sizeof(hp->reason), "latched: %s", g_latched_reason);
+		g_latched_sources = 0;
+	}
 	pthread_mutex_unlock(&g_hp_lock);
 
 	if (os_thread_start(&hp->thread, hotplug_thread, hp) != 0) {

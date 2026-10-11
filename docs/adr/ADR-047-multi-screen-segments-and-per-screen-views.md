@@ -414,6 +414,38 @@ there was no panel then, was never asked again. Decisions:
    PreferredPlugin, a `DXR_SCREEN_PLUGIN` pin and a per-screen preference all decide exactly as
    before (unit-tested, with mutants).
 
+**Readiness, the window-bound weaver, and eyes (review by the LeiaSR macOS owner).**
+
+- *A plug-in claims only what its backend vouches for.* SR lists a panel in `srEnumerateDisplays`
+  as soon as its EDID matches (`EDID_ONLY`, no serial), before the service has authenticated the
+  FPC; it turns `FPC_VERIFIED` (with the serial) only once `devices/<serial>/primary` is published.
+  The Leia macOS plug-in treats `EDID_ONLY` as present-not-ready: no `probe()` bind, no claim, no
+  `create_dp_metal_for_screen`, so no weaver and no lens touch the panel; sim-display stands in.
+  While an `EDID_ONLY` entry is listed, the plug-in polls the enumeration every 500 ms,
+  **open-ended** (the SR service retries a failed authentication with a 1 s → 30 s backoff, so no
+  fixed window is long enough), and on the `EDID_ONLY → FPC_VERIFIED` edge calls
+  `request_display_rescan` whether or not SR raises a topology event. The same race exists at
+  instance create (a panel plugged just before the app starts) and gets the same answer: the
+  plug-in declines, the poll runs, the verified edge starts a sweep. A request that arrives
+  before the sweep thread exists (between discovery and system create) is latched and served by
+  its first sweep. The runtime's own follow-ups now run to +32 s (0.5 … 8, 12, 16, 24, 32 s) for
+  plug-ins that cannot signal. `DXR_LEIA_ACCEPT_EDID_ONLY=1` restores binding at `EDID_ONLY`.
+- *Case D — a panel replugged under a live window-bound weaver.* The session DP keeps its screen
+  only while the monitor id, the winning plug-in, the claim's **vendor serial**, the **desktop
+  rect** and the **OS output handle** (macOS: the `CGDirectDisplayID`, carried as
+  `xrt_dp_registry_entry::platform_id`) all equal what they were when it was made
+  (`comp_segments_session_dp_screen`, with a reason: gone / re-claimed / re-bound). The same
+  serial back at the same bounds under the same handle hands the screen back to the session DP —
+  its weaver is kept, and the compositor re-sends the session's 2D/3D mode to it, since a
+  replugged panel's lens comes up in its default state. A different serial, a renumbered
+  `CGDirectDisplayID` or moved bounds is "re-bound": the panel gets a freshly created segment DP
+  (a new weaver) and the old window-bound one stays idle for the rest of the session — it cannot
+  be destroyed while it is the session DP (ADR-045 D3).
+- *Eyes.* After a replug the tracker must re-acquire its camera; until then the DP reports
+  nominal or last-good eyes, not tracking. The Leia macOS DP logs the edge (`eye tracking
+  ACQUIRED (fresh_raw=1, non-nominal) N ms after …` / `eye tracking LOST`), so the time from a
+  claim or regain to tracked eyes is measurable.
+
 **Scope shipped.** macOS: the CoreGraphics trigger, the poll, the sweep, the Metal compositor
 (Metal apps and Vulkan apps on the VK-via-Metal route, #1900). A Vulkan app that started on
 sim-display takes the `vk_native` route (sim has a Vulkan factory), which does not segment on

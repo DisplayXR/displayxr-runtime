@@ -91,6 +91,14 @@ comp_metal_segments_set_screens(struct comp_metal_segments *segs,
                                 uint64_t pinned_display_id,
                                 const struct comp_segments_session_dp *session);
 
+/*!
+ * Does the session's own DP own a listed screen after the last set_screens
+ * (display hotplug: false while its panel is unplugged, re-claimed or
+ * re-bound)? True when no identity was recorded.
+ */
+bool
+comp_metal_segments_session_owns(const struct comp_metal_segments *segs);
+
 //! Is segmentation possible at all for this session?
 bool
 comp_metal_segments_enabled(const struct comp_metal_segments *segs);

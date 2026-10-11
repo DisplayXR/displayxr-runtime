@@ -112,20 +112,58 @@ struct comp_segments_session_dp
 	bool valid;
 	uint64_t monitor_id;
 	char plugin_id[COMP_SEGMENTS_ID_MAX];
+	//! The winning claim's vendor serial then ("" = none).
+	char serial[COMP_SEGMENTS_ID_MAX];
+	//! The monitor's desktop rect then.
+	struct comp_seg_rect desktop;
+	//! The OS's handle for the output then (macOS: CGDirectDisplayID; 0 = none).
+	uint64_t platform_id;
 };
 
 /*!
- * Which listed screen is the session DP's: the one with @p sd's monitor id
- * whose winning plug-in is still @p sd's. @p ids and @p plugin_ids are
- * parallel, @p n long.
+ * One registry screen as @ref comp_segments_session_dp_screen compares it.
+ */
+struct comp_segments_session_candidate
+{
+	uint64_t monitor_id;
+	const char *plugin_id;
+	const char *serial;
+	struct comp_seg_rect desktop;
+	uint64_t platform_id;
+};
+
+//! Why the session DP does not own a screen (@ref comp_segments_session_dp_screen).
+enum comp_segments_session_miss
+{
+	COMP_SEG_SESSION_OWNS = 0,     //!< It does.
+	COMP_SEG_SESSION_NOT_RECORDED, //!< No identity recorded (not valid).
+	COMP_SEG_SESSION_GONE,         //!< Its monitor is not listed (unplugged).
+	COMP_SEG_SESSION_RECLAIMED,    //!< Listed, another plug-in wins it.
+	COMP_SEG_SESSION_REBOUND,      //!< Listed, same plug-in, but another serial / place / OS handle.
+};
+
+/*!
+ * Which listed screen is the session DP's: the one with @p sd's monitor id,
+ * still won by @p sd's plug-in, with the SAME vendor serial, the SAME desktop
+ * rect and the SAME OS output handle as when the session DP was made for it.
+ * A panel replugged unchanged is handed back to the session DP (its
+ * window-bound weaver is kept); one that came back as another panel, at
+ * another place or under a renumbered OS handle is not — its screen is woven
+ * by a freshly created segment DP instead, the policy for a weaver whose
+ * binding may be stale (ADR-047 Amendment 7).
  *
- * @return its index, or -1 (gone, re-claimed, or @p sd not valid).
+ * @param[out] out_miss  (may be NULL) why it does not own one.
+ * @return the index into @p cands, or -1.
  */
 int
 comp_segments_session_dp_screen(const struct comp_segments_session_dp *sd,
-                                const uint64_t *ids,
-                                const char *const *plugin_ids,
-                                uint32_t n);
+                                const struct comp_segments_session_candidate *cands,
+                                uint32_t n,
+                                enum comp_segments_session_miss *out_miss);
+
+//! A short word for @p miss ("owns", "gone", "re-claimed", "re-bound", "not recorded").
+const char *
+comp_segments_session_miss_str(enum comp_segments_session_miss miss);
 
 /*!
  * Whether pixels a window draws on a screen reach it unresampled.

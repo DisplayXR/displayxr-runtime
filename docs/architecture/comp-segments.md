@@ -342,9 +342,11 @@ registry) through the compositor's ordinary `set_screens`.
 What a compositor does with it (Metal today; the other managers already rebuild on `set_screens`):
 
 - **The session DP's screen** is the monitor the session DP was made for, while the plug-in that
-  won it at session create still wins it (`comp_segments_session_dp`). Not "whatever is the system
-  default now": the system default can move, and the session DP can only ever weave the panel it
-  was built for.
+  won it at session create still wins it with the same vendor serial, at the same desktop rect,
+  under the same OS output handle (macOS: `CGDirectDisplayID`) (`comp_segments_session_dp`). Not
+  "whatever is the system default now": the system default can move, and the session DP can only
+  ever weave the panel it was built for. A panel replugged unchanged is handed back (the weaver is
+  kept and re-sent the display mode); one that came back changed is woven by a fresh segment DP.
 - **Every other screen** is woven by a segment DP from its own claimant. When the session DP owns
   no listed screen (its monitor was unplugged, or re-claimed — sim-display -> leia-sr once the
   panel's vendor service is up), a single screen is segmented too: the window takes the split path
