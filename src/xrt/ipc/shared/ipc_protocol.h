@@ -1135,6 +1135,11 @@ struct ipc_lift_properties
 	char backend[32];
 	uint32_t aux_depth_semantics; //!< XRT_DP_LIFT_DEPTH_* of the aux depth
 	uint32_t reserved;
+	//! XRT_DP_LIFT_HAS_MODULE_INFO: which module, and why it is (not) usable.
+	uint32_t module_status;
+	uint32_t reserved2;
+	char module_version[48];
+	char module_detail[96];
 };
 
 /*!

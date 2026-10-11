@@ -61,6 +61,11 @@ ipc_client_lift_get_properties(struct ipc_connection *ipc_c, struct xrt_dp_lift_
 	out_caps->typical_latency_ns = props.typical_latency_ns;
 	memcpy(out_caps->backend, props.backend, sizeof(out_caps->backend));
 	out_caps->backend[sizeof(out_caps->backend) - 1] = '\0';
+	out_caps->module_status = props.module_status;
+	memcpy(out_caps->module_version, props.module_version, sizeof(out_caps->module_version));
+	out_caps->module_version[sizeof(out_caps->module_version) - 1] = '\0';
+	memcpy(out_caps->module_detail, props.module_detail, sizeof(out_caps->module_detail));
+	out_caps->module_detail[sizeof(out_caps->module_detail) - 1] = '\0';
 	return XRT_SUCCESS;
 }
 

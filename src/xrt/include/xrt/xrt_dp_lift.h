@@ -100,7 +100,60 @@ struct xrt_dp_lift_caps
 	uint32_t aux_outputs;
 	//! Meaning of that auxiliary depth: XRT_DP_LIFT_DEPTH_RELATIVE / _METRIC.
 	uint32_t aux_depth_semantics;
+
+	/*
+	 * ── Module info (XRT_DP_LIFT_HAS_MODULE_INFO) ──────────────────────────────
+	 * Appended; written only when struct_size covers them. Diagnostics for a
+	 * human (the dashboard, `displayxr-cli info` / `lift caps`): WHICH conversion
+	 * module the plug-in found and, when it is not usable, why. Nothing in the
+	 * runtime branches on them.
+	 */
+
+	//! XRT_DP_LIFT_MODULE_*; 0 (UNKNOWN) = the plug-in does not report it.
+	uint32_t module_status;
+	//! The module's own version string as installed (e.g. its registry
+	//! version), NUL-terminated; "" = unknown / none installed.
+	char module_version[48];
+	//! One line for a human, NUL-terminated, display only — never parsed (e.g.
+	//! "internal build, no licence", "NeurD.dll not found", "0.4.6 is older
+	//! than the minimum 0.4.7").
+	char module_detail[96];
 };
+
+/*!
+ * @name Conversion-module status (xrt_dp_lift_caps::module_status)
+ *
+ * Announced by XRT_DP_LIFT_HAS_MODULE_INFO (append-only, ADR-020: no ABI bump).
+ * @{
+ */
+#define XRT_DP_LIFT_HAS_MODULE_INFO 1
+#define XRT_DP_LIFT_MODULE_UNKNOWN 0u     //!< not reported (an older plug-in)
+#define XRT_DP_LIFT_MODULE_READY 1u       //!< loaded and usable
+#define XRT_DP_LIFT_MODULE_ACTIVATING 2u  //!< found, loading / licence check in progress
+#define XRT_DP_LIFT_MODULE_ABSENT 3u      //!< not installed
+#define XRT_DP_LIFT_MODULE_TOO_OLD 4u     //!< installed but older than the plug-in's minimum
+#define XRT_DP_LIFT_MODULE_UNLICENSED 5u  //!< its licence check refused it
+#define XRT_DP_LIFT_MODULE_LOAD_FAILED 6u //!< found but failed to load / initialise
+#define XRT_DP_LIFT_MODULE_DISABLED 7u    //!< switched off by configuration
+/*! @} */
+
+//! Lowercase name of a XRT_DP_LIFT_MODULE_* value (the `module_status` JSON
+//! string); NULL for UNKNOWN (emit nothing) and "unknown-<n>" style values are
+//! the caller's business.
+static inline const char *
+xrt_dp_lift_module_status_str(uint32_t s)
+{
+	switch (s) {
+	case XRT_DP_LIFT_MODULE_READY: return "ready";
+	case XRT_DP_LIFT_MODULE_ACTIVATING: return "activating";
+	case XRT_DP_LIFT_MODULE_ABSENT: return "absent";
+	case XRT_DP_LIFT_MODULE_TOO_OLD: return "too_old";
+	case XRT_DP_LIFT_MODULE_UNLICENSED: return "unlicensed";
+	case XRT_DP_LIFT_MODULE_LOAD_FAILED: return "load_failed";
+	case XRT_DP_LIFT_MODULE_DISABLED: return "disabled";
+	default: return 0;
+	}
+}
 
 /*!
  * @name Auxiliary outputs (ADR-048 Addendum A)

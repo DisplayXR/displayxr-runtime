@@ -302,6 +302,16 @@ probe_lift_caps_d3d11(struct cli_query_result *r, const struct xrt_plugin_iface 
 		         malformed ? "MALFORMED caps: " : "", caps.modes, caps.state, caps.max_streams, caps.max_views,
 		         caps.depth_semantics == XRT_DP_LIFT_DEPTH_METRIC ? "metric" : "relative",
 		         (double)caps.typical_latency_ns / 1e6, caps.backend, which);
+		const char *ms = xrt_dp_lift_module_status_str(caps.module_status);
+		if (ms != NULL) {
+			char ver[sizeof(caps.module_version)];
+			char det[sizeof(caps.module_detail)];
+			snprintf(ver, sizeof(ver), "%s", caps.module_version);
+			snprintf(det, sizeof(det), "%s", caps.module_detail);
+			const size_t used = strlen(r->lift_probe_note);
+			snprintf(r->lift_probe_note + used, sizeof(r->lift_probe_note) - used, " module=%s%s%s%s%s", ms,
+			         ver[0] != '\0' ? " " : "", ver, det[0] != '\0' ? " — " : "", det);
+		}
 	}
 
 	xrt_display_processor_d3d11_destroy(&xdp);
@@ -2612,6 +2622,18 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 			cJSON_AddNumberToObject(lc, "max_streams", (double)r->lift_caps.max_streams);
 			cJSON_AddNumberToObject(lc, "max_views", (double)r->lift_caps.max_views);
 			cJSON_AddStringToObject(lc, "backend", r->lift_caps.backend);
+			// XRT_DP_LIFT_HAS_MODULE_INFO: only when the plug-in reports it, so an
+			// older plug-in's JSON is byte-for-byte what it was (absent = unknown).
+			const char *ms = xrt_dp_lift_module_status_str(r->lift_caps.module_status);
+			if (ms != NULL) {
+				char ver[sizeof(r->lift_caps.module_version)];
+				char det[sizeof(r->lift_caps.module_detail)];
+				snprintf(ver, sizeof(ver), "%s", r->lift_caps.module_version);
+				snprintf(det, sizeof(det), "%s", r->lift_caps.module_detail);
+				cJSON_AddStringToObject(lc, "module_status", ms);
+				cJSON_AddStringToObject(lc, "module_version", ver);
+				cJSON_AddStringToObject(lc, "module_detail", det);
+			}
 		}
 	}
 
