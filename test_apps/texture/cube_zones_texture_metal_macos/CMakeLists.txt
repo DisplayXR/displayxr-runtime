@@ -66,7 +66,8 @@ FetchContent_Declare(
     # encoded twice. Same pin as the VK macOS cube apps.
     # v2.28.0: dxr::VkFrameRing (common/vk_frame_ring.h) — N frames in flight,
     # one vkQueueSubmit per frame (INV-4.10, #1917). The Vulkan cubes use it.
-    GIT_TAG v2.28.0
+    # v2.29.0: dxr::CursorDepth (common/cursor_depth.h, ADR-046 Amendment 2).
+    GIT_TAG v2.29.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
