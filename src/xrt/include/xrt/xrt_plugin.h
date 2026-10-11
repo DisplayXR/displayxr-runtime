@@ -693,10 +693,39 @@ struct xrt_plugin_host_iface
 	bool (*android_package_is_visible)(const char *package_name);
 
 	/*!
+	 * Tell the runtime that the set of displays this plug-in can drive may
+	 * have changed — a panel came up or went away on the vendor side (its
+	 * service re-authenticated a hotplugged panel, its topology event fired).
+	 * The runtime then re-runs the per-monitor claim sweep (ADR-047
+	 * Amendment 7): it re-enumerates the monitors, re-probes every plug-in
+	 * that is not a claim source yet (so a plug-in that DECLINED at instance
+	 * create is probed again), calls `probe_displays` on every source and
+	 * publishes the new screen table to live sessions. The request is
+	 * debounced and served on a runtime worker thread, never synchronously:
+	 * a plug-in may call it from any thread, including its vendor SDK's event
+	 * thread and while holding its own locks, and it returns at once.
+	 *
+	 * The OS display-reconfiguration event already triggers the same sweep;
+	 * this slot exists for the gap after it — a vendor backend that only
+	 * recognises the panel a few seconds after the OS saw the monitor.
+	 *
+	 * @param reason  Short free text for the runtime's log (may be NULL).
+	 *
+	 * The function pointer stays valid for the process lifetime (it lives in
+	 * the runtime), so a plug-in may copy it at negotiate time and call it
+	 * later — even after its probe() declined. Carved out of the former
+	 * `reserved[]` block like the slots above: `struct_size` is unchanged and
+	 * an older runtime leaves it zero, so plug-ins MUST NULL-check it, and no
+	 * @ref XRT_PLUGIN_API_VERSION_CURRENT bump is needed. Announced by
+	 * @ref XRT_PLUGIN_HOST_HAS_DISPLAY_RESCAN.
+	 */
+	void (*request_display_rescan)(const char *reason);
+
+	/*!
 	 * Reserved space for forward-compatible host-supplied callbacks.
 	 * Plug-ins MUST NOT dereference any reserved slot.
 	 */
-	void *reserved[10];
+	void *reserved[9];
 };
 
 /*!
@@ -716,6 +745,14 @@ struct xrt_plugin_host_iface
  * `#ifdef`-guard its use. runtime#1079 / ADR-036 D2.
  */
 #define XRT_PLUGIN_HOST_HAS_ANDROID_PACKAGE_VISIBILITY 1
+
+/*!
+ * Defined when this header carries the
+ * @ref xrt_plugin_host_iface::request_display_rescan slot (display hotplug,
+ * ADR-047 Amendment 7), so a plug-in that must also compile against an older
+ * runtime header can `#ifdef`-guard its use.
+ */
+#define XRT_PLUGIN_HOST_HAS_DISPLAY_RESCAN 1
 
 /*
  *

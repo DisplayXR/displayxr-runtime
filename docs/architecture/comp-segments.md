@@ -328,6 +328,43 @@ buffer, in order). What differs on macOS:
 - Test knob: `cube_handle_metal_macos` honours `DXR_TEST_WINDOW_RECT=x,y,w,h` (content rect, top-down
   points) and, once at frame `DXR_TEST_WINDOW_MOVE_FRAME` (default 300), `DXR_TEST_WINDOW_RECT2`.
 
+## Display hotplug (ADR-047 Amendment 7)
+
+The screen table a compositor segments against is no longer fixed at session create. A worker
+thread (`targets/common/target_display_hotplug`) re-runs the per-monitor claim sweep when the OS
+reports a display reconfiguration, when a 500 ms poll of the monitor list sees a change, or when a
+plug-in calls `xrt_plugin_host_iface::request_display_rescan`; it loads the plug-ins that are not
+claim sources yet (one that declined at instance create is probed again), re-resolves, and
+publishes a new list with a bumped generation only when the list changed. Each session reads the
+generation in `xrBeginFrame` and re-pushes one consistent snapshot (`get_display_snapshot`: list +
+registry) through the compositor's ordinary `set_screens`.
+
+What a compositor does with it (Metal today; the other managers already rebuild on `set_screens`):
+
+- **The session DP's screen** is the monitor the session DP was made for, while the plug-in that
+  won it at session create still wins it (`comp_segments_session_dp`). Not "whatever is the system
+  default now": the system default can move, and the session DP can only ever weave the panel it
+  was built for.
+- **Every other screen** is woven by a segment DP from its own claimant. When the session DP owns
+  no listed screen (its monitor was unplugged, or re-claimed — sim-display -> leia-sr once the
+  panel's vendor service is up), a single screen is segmented too: the window takes the split path
+  with one segment, never the session DP.
+- **Re-tabling in place.** A segment DP whose screen is listed again with the same
+  `xrt_screen_binding`, by the same plug-in instance, survives the new table
+  (`comp_segments_lifecycle_adopt`); every other one is destroyed on the commit thread between
+  weaves (one WARN, `segments: retiring the segment DP for screen …`). An unplugged panel's DP goes
+  this way.
+- **Logs to read a hotplug by**: `display hotplug: screen table generation N — …` (the diff, then
+  one line per screen with its claimant), `display hotplug: session takes display topology
+  generation A -> B`, `OXR EVENT: Displays changed`, then the usual `segments:` table and
+  `created a segment DP` lines.
+
+Test hook (macOS): `DXR_TEST_FAKE_MONITOR_FILE=<path>`. While the file holds a number S, the main
+display enumerates as two monitors cut at S points (the window can straddle the cut, since the
+WindowServer still shows one display); holding `reid`, the main display gets another identity.
+Creating / deleting the file is a monitor appearing / disappearing for the registry, the desktop
+resolver and the poll.
+
 ## Windows / D3D12 (M6)
 
 Status: the in-process D3D12 compositor (the Unity display provider's path) carries the same

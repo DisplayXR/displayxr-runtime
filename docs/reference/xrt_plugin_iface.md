@@ -78,6 +78,7 @@ older runtime sees a zeroed slot.
 | `get_android_class_host_context` | Android | A `Context` whose `getClassLoader()` can resolve classes shipped in the **runtime's** APK. **Class loading only.** See below. |
 
 ### `get_android_class_host_context` (ADR-036 D2, #1037)
+| `request_display_rescan` | all | "My displays may have changed": the runtime re-runs the per-monitor claim sweep (ADR-047 Amendment 7) — re-enumerates the monitors, probes every plug-in that is not a claim source yet (so one whose `probe()` declined is asked again), calls `probe_displays` on every source and publishes the new screen table to live sessions. Debounced, served on a runtime thread, returns at once; callable from any thread (a vendor SDK's event thread, under the plug-in's own locks) and after `probe()` declined — copy the pointer at negotiate time. Call it when the vendor backend recognises or loses a panel (Leia SR: `SR_EVENT_TYPE_DISPLAY_TOPOLOGY_CHANGED`). `XRT_PLUGIN_HOST_HAS_DISPLAY_RESCAN`. |
 
 ```c
 void *(*get_android_class_host_context)(void);   /* jobject, or NULL */

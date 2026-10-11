@@ -5327,6 +5327,10 @@ oxr_session_frame_begin(struct oxr_logger *log, struct oxr_session *sess)
 		return oxr_error(log, XR_ERROR_CALL_ORDER_INVALID, "xrBeginFrame without xrWaitFrame");
 	}
 
+	// Display hotplug (ADR-047 Amendment 7): a changed screen table reaches
+	// the compositor here, on the app's thread, before this frame's commit.
+	oxr_session_poll_display_topology(log, sess);
+
 	/*
 	 * #1528: latch the active rendering mode's view count for THIS frame.
 	 *
@@ -5629,6 +5633,143 @@ oxr_cocoa_window_placement_app_owned(const XrSessionCreateInfo *createInfo)
  * Does allocation, population and basic init, so we can use early-returns to
  * simplify code flow and avoid weird if/else.
  */
+/*!
+ * Hand the session's in-process compositor the system's screens and the
+ * system info (its per-monitor DP registry) they were built from — one
+ * consistent snapshot (`xrt_instance::get_display_snapshot`), so a display
+ * hotplug's claim sweep can never pair one list with another registry. Called
+ * at session create and again every time the display-topology generation
+ * moves (ADR-047 Amendment 7). The compositors copy both and rebuild their
+ * segment manager on their next weave, on the app's thread.
+ */
+void
+oxr_session_push_screens(struct oxr_logger *log, struct oxr_session *sess, bool initial)
+{
+	(void)log;
+	struct oxr_system *sys = sess->sys;
+	if (sess->xcn == NULL || sys == NULL || sys->xsysc == NULL) {
+		return;
+	}
+	if (!(sess->is_vk_native_compositor || sess->is_d3d11_native_compositor || sess->is_metal_native_compositor ||
+	      sess->is_d3d12_native_compositor || sess->is_gl_native_compositor)) {
+		return;
+	}
+	struct xrt_screen_list *screens = U_TYPED_CALLOC(struct xrt_screen_list);
+	struct xrt_system_compositor_info *info = U_TYPED_CALLOC(struct xrt_system_compositor_info);
+	if (screens == NULL || info == NULL) {
+		free(screens);
+		free(info);
+		return;
+	}
+	uint64_t generation = 0;
+	struct xrt_instance *xinst = sys->inst != NULL ? sys->inst->xinst : NULL;
+	if (xrt_instance_get_display_snapshot(xinst, screens, info, &generation) != XRT_SUCCESS ||
+	    screens->count == 0) {
+		// No live claim sweep (or nothing enumerated): the list as before,
+		// with the system's own info.
+		oxr_system_get_screens(sys, screens);
+		*info = sys->xsysc->info;
+		generation = xrt_instance_get_display_generation(xinst);
+	}
+	sess->display_generation = generation;
+	uint64_t pinned = 0;
+#ifdef OXR_HAVE_DXR_display_info
+	pinned = sess->bound_display_id;
+#endif
+	(void)pinned;
+	(void)initial;
+
+#if defined(XRT_HAVE_VK_NATIVE_COMPOSITOR) && (defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_WINDOWS))
+	// Multi-screen M2 (Linux) / M6 (Windows): the in-process Vulkan compositor
+	// weaves a window that spans screens per segment, each with its own
+	// screen's DP; it needs the screen list (and stays single-DP for a session
+	// pinned to one display). On Windows under the #918 split the compositor
+	// hands the list on to the split's D3D11 segment manager.
+	if (sess->is_vk_native_compositor && sess->xcn != NULL) {
+		comp_vk_native_compositor_set_screens(&sess->xcn->base, screens, pinned);
+	}
+#endif
+
+#if defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR) && defined(XRT_OS_WINDOWS)
+	// Multi-screen M6: the Windows twin — the in-process D3D11 compositor
+	// weaves a window that spans monitors per segment, each with its own
+	// screen's DP (windowless, phase from set_present_origin); the primary
+	// screen's DP keeps the real HWND.
+	if (sess->is_d3d11_native_compositor && sess->xcn != NULL) {
+		comp_d3d11_compositor_set_screens(&sess->xcn->base, screens, info, pinned);
+	}
+#endif
+
+#if defined(XRT_HAVE_METAL_NATIVE_COMPOSITOR) && defined(XRT_OS_MACOS)
+	// Multi-screen on macOS: the in-process Metal compositor weaves a window
+	// that spans displays per segment, each with its own display's DP
+	// (windowless, phase from set_present_origin); the primary display's DP
+	// keeps the app's NSView.
+	if (sess->is_metal_native_compositor && sess->xcn != NULL && sys->xsysc != NULL) {
+		comp_metal_compositor_set_screens(&sess->xcn->base, screens, info, pinned);
+	}
+#endif
+
+#if defined(XRT_HAVE_D3D12_NATIVE_COMPOSITOR) && defined(XRT_OS_WINDOWS)
+	// Multi-screen M6: the same hand-off to the in-process D3D12 compositor
+	// (the Unity display provider's path) — per-segment DPs, windowless, phase
+	// from set_present_origin; the primary screen's DP keeps the real HWND.
+	if (sess->is_d3d12_native_compositor && sess->xcn != NULL) {
+		comp_d3d12_compositor_set_screens(&sess->xcn->base, screens, info, pinned);
+	}
+#endif
+
+#if defined(XRT_HAVE_GL_NATIVE_COMPOSITOR) && defined(XRT_OS_WINDOWS)
+	// Multi-screen M6: the same hand-off to the in-process OpenGL compositor —
+	// per-segment DPs (windowless, phase from set_present_origin); the real
+	// HWND follows the majority screen's DP.
+	if (sess->is_gl_native_compositor && sess->xcn != NULL && sys->xsysc != NULL) {
+		comp_gl_compositor_set_screens(&sess->xcn->base, screens, info, pinned);
+	}
+#endif
+
+	free(screens);
+	free(info);
+}
+
+/*!
+ * Display hotplug (ADR-047 Amendment 7), once per frame on the app's thread:
+ * when the system's display topology moved since this session last looked,
+ * re-push the screens to the compositor and queue XrEventDataDisplaysChangedDXR.
+ * One unlocked read of the generation when nothing changed.
+ */
+void
+oxr_session_poll_display_topology(struct oxr_logger *log, struct oxr_session *sess)
+{
+	struct xrt_instance *xinst = (sess->sys != NULL && sess->sys->inst != NULL) ? sess->sys->inst->xinst : NULL;
+	const uint64_t gen = xrt_instance_get_display_generation(xinst);
+	if (gen == 0 || gen == sess->display_generation) {
+		return;
+	}
+	const uint64_t before = sess->display_generation;
+	oxr_session_push_screens(log, sess, false);
+	if (sess->display_generation == before) {
+		// No in-process compositor took the list: just follow the generation.
+		sess->display_generation = gen;
+	}
+	struct xrt_screen_list *list = U_TYPED_CALLOC(struct xrt_screen_list);
+	uint32_t count = 0;
+	if (list != NULL) {
+		oxr_system_get_screens(sess->sys, list);
+		count = list->count;
+		free(list);
+	}
+	U_LOG_W(
+	    "display hotplug: session takes display topology generation %llu -> %llu (%u display(s)) — screens "
+	    "re-pushed to the compositor, no restart",
+	    (unsigned long long)before, (unsigned long long)sess->display_generation, count);
+#ifdef OXR_HAVE_DXR_display_info
+	if (sess->sys->inst->extensions.DXR_display_info) {
+		oxr_event_push_XrEventDataDisplaysChangedDXR(log, sess, count);
+	}
+#endif
+}
+
 static XrResult
 oxr_session_create_impl(struct oxr_logger *log,
                         struct oxr_system *sys,
@@ -6656,63 +6797,10 @@ oxr_session_create(struct oxr_logger *log,
 	}
 #endif
 
-#if defined(XRT_HAVE_VK_NATIVE_COMPOSITOR) && (defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_WINDOWS))
-	// Multi-screen M2 (Linux) / M6 (Windows): the in-process Vulkan compositor
-	// weaves a window that spans screens per segment, each with its own
-	// screen's DP; it needs the screen list (and stays single-DP for a session
-	// pinned to one display). On Windows under the #918 split the compositor
-	// hands the list on to the split's D3D11 segment manager.
-	if (sess->is_vk_native_compositor && sess->xcn != NULL) {
-		struct xrt_screen_list *screens = U_TYPED_CALLOC(struct xrt_screen_list);
-		if (screens != NULL) {
-			oxr_system_get_screens(sys, screens);
-			uint64_t pinned = 0;
-#ifdef OXR_HAVE_DXR_display_info
-			pinned = bound_display_id;
-#endif
-			comp_vk_native_compositor_set_screens(&sess->xcn->base, screens, pinned);
-			free(screens);
-		}
-	}
-#endif
-
-#if defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR) && defined(XRT_OS_WINDOWS)
-	// Multi-screen M6: the Windows twin — the in-process D3D11 compositor
-	// weaves a window that spans monitors per segment, each with its own
-	// screen's DP (windowless, phase from set_present_origin); the primary
-	// screen's DP keeps the real HWND.
-	if (sess->is_d3d11_native_compositor && sess->xcn != NULL) {
-		struct xrt_screen_list *screens = U_TYPED_CALLOC(struct xrt_screen_list);
-		if (screens != NULL) {
-			oxr_system_get_screens(sys, screens);
-			uint64_t pinned = 0;
-#ifdef OXR_HAVE_DXR_display_info
-			pinned = bound_display_id;
-#endif
-			comp_d3d11_compositor_set_screens(&sess->xcn->base, screens, &sys->xsysc->info, pinned);
-			free(screens);
-		}
-	}
-#endif
-
-#if defined(XRT_HAVE_METAL_NATIVE_COMPOSITOR) && defined(XRT_OS_MACOS)
-	// Multi-screen on macOS: the in-process Metal compositor weaves a window
-	// that spans displays per segment, each with its own display's DP
-	// (windowless, phase from set_present_origin); the primary display's DP
-	// keeps the app's NSView.
-	if (sess->is_metal_native_compositor && sess->xcn != NULL && sys->xsysc != NULL) {
-		struct xrt_screen_list *screens = U_TYPED_CALLOC(struct xrt_screen_list);
-		if (screens != NULL) {
-			oxr_system_get_screens(sys, screens);
-			uint64_t pinned = 0;
-#ifdef OXR_HAVE_DXR_display_info
-			pinned = bound_display_id;
-#endif
-			comp_metal_compositor_set_screens(&sess->xcn->base, screens, &sys->xsysc->info, pinned);
-			free(screens);
-		}
-	}
-#endif
+	// Multi-screen (M2/M6, macOS): hand the in-process compositor the screen
+	// list (and the registry it was built from) so it can weave a window per
+	// screen. Re-run on every display-topology change (ADR-047 Amendment 7).
+	oxr_session_push_screens(log, sess, true);
 
 #ifdef XRT_OS_WINDOWS
 	// Multi-screen M6/M3 over IPC (ADR-047 Amendment 3): the D3D11 service
@@ -6729,42 +6817,6 @@ oxr_session_create(struct oxr_logger *log,
 #endif
 		comp_ipc_client_compositor_segments_enable(&sess->xcn->base, pinned);
 		sess->seg_ipc = true;
-	}
-#endif
-
-#if defined(XRT_HAVE_D3D12_NATIVE_COMPOSITOR) && defined(XRT_OS_WINDOWS)
-	// Multi-screen M6: the same hand-off to the in-process D3D12 compositor
-	// (the Unity display provider's path) — per-segment DPs, windowless, phase
-	// from set_present_origin; the primary screen's DP keeps the real HWND.
-	if (sess->is_d3d12_native_compositor && sess->xcn != NULL) {
-		struct xrt_screen_list *screens = U_TYPED_CALLOC(struct xrt_screen_list);
-		if (screens != NULL) {
-			oxr_system_get_screens(sys, screens);
-			uint64_t pinned = 0;
-#ifdef OXR_HAVE_DXR_display_info
-			pinned = bound_display_id;
-#endif
-			comp_d3d12_compositor_set_screens(&sess->xcn->base, screens, &sys->xsysc->info, pinned);
-			free(screens);
-		}
-	}
-#endif
-
-#if defined(XRT_HAVE_GL_NATIVE_COMPOSITOR) && defined(XRT_OS_WINDOWS)
-	// Multi-screen M6: the same hand-off to the in-process OpenGL compositor —
-	// per-segment DPs (windowless, phase from set_present_origin); the real
-	// HWND follows the majority screen's DP.
-	if (sess->is_gl_native_compositor && sess->xcn != NULL && sys->xsysc != NULL) {
-		struct xrt_screen_list *screens = U_TYPED_CALLOC(struct xrt_screen_list);
-		if (screens != NULL) {
-			oxr_system_get_screens(sys, screens);
-			uint64_t pinned = 0;
-#ifdef OXR_HAVE_DXR_display_info
-			pinned = bound_display_id;
-#endif
-			comp_gl_compositor_set_screens(&sess->xcn->base, screens, &sys->xsysc->info, pinned);
-			free(screens);
-		}
 	}
 #endif
 

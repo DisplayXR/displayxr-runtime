@@ -434,6 +434,94 @@ feed(comp_segments_owner &o, const comp_segment_table &t, uint64_t &now, uint64_
 
 } // namespace
 
+TEST_CASE("comp_segments: a DP carried across a screen-table change (display hotplug)", "[comp_segments][hotplug]")
+{
+	comp_segments_lifecycle lc;
+	comp_segments_lifecycle_init(&lc, 2, 3);
+	comp_segments_actions act{};
+	const comp_segment_table split = straddle_table();
+	const comp_segment_table single = primary_only_table();
+
+	// A new table that still lists EDP the same way keeps its live DP: no
+	// second CREATE (a vendor weaver is not rebuilt for an unrelated monitor).
+	REQUIRE(comp_segments_lifecycle_adopt(&lc, EDP));
+	CHECK(comp_segments_lifecycle_is_live(&lc, EDP));
+	comp_segments_lifecycle_update(&lc, &split, &act);
+	CHECK(count_action(act, COMP_SEG_ACTION_CREATE, EDP) == 0);
+	comp_segments_lifecycle_update(&lc, &split, &act);
+	CHECK(act.count == 0);
+
+	// ...and it is retired by the ordinary rule once its segment is gone.
+	comp_segments_lifecycle_update(&lc, &single, &act);
+	comp_segments_lifecycle_update(&lc, &single, &act);
+	CHECK(act.count == 0);
+	comp_segments_lifecycle_update(&lc, &single, &act);
+	CHECK(count_action(act, COMP_SEG_ACTION_DESTROY, EDP) == 1);
+	CHECK_FALSE(comp_segments_lifecycle_is_live(&lc, EDP));
+
+	// Out of slots: adopt fails (the caller releases that DP instead).
+	comp_segments_lifecycle full;
+	comp_segments_lifecycle_init(&full, 2, 3);
+	for (uint64_t i = 0; i < COMP_SEGMENTS_MAX_SCREENS; i++) {
+		REQUIRE(comp_segments_lifecycle_adopt(&full, 0x100 + i));
+	}
+	CHECK_FALSE(comp_segments_lifecycle_adopt(&full, 0x999));
+	// Adopting a tracked id again reuses its slot.
+	CHECK(comp_segments_lifecycle_adopt(&full, 0x100));
+}
+
+TEST_CASE("comp_segments: the session DP keeps its screen only while its plug-in owns it (display hotplug)",
+          "[comp_segments][hotplug]")
+{
+	comp_segments_session_dp sd{};
+	sd.valid = true;
+	sd.monitor_id = EDP;
+	std::strcpy(sd.plugin_id, "sim-display");
+
+	const uint64_t ids[] = {EDP, DS1};
+	const char *before[] = {"sim-display", "sim-display"};
+	CHECK(comp_segments_session_dp_screen(&sd, ids, before, 2) == 0);
+
+	// A panel plugged into another port is claimed by leia-sr: EDP unchanged.
+	const char *other_claimed[] = {"sim-display", "leia-sr"};
+	CHECK(comp_segments_session_dp_screen(&sd, ids, other_claimed, 2) == 0);
+
+	// The session DP's own monitor re-claimed by a vendor whose panel came up
+	// after session start: the session DP owns no screen any more.
+	const char *reclaimed[] = {"leia-sr", "sim-display"};
+	CHECK(comp_segments_session_dp_screen(&sd, ids, reclaimed, 2) == -1);
+
+	// Its monitor unplugged.
+	const uint64_t only_ds1[] = {DS1};
+	const char *only_ds1_p[] = {"sim-display"};
+	CHECK(comp_segments_session_dp_screen(&sd, only_ds1, only_ds1_p, 1) == -1);
+
+	// Not recorded yet: no answer.
+	comp_segments_session_dp none{};
+	CHECK(comp_segments_session_dp_screen(&none, ids, before, 2) == -1);
+	CHECK(comp_segments_session_dp_screen(nullptr, ids, before, 2) == -1);
+}
+
+TEST_CASE("comp_segments: a window on one screen the session DP does not own still splits (display hotplug)",
+          "[comp_segments][hotplug]")
+{
+	// One screen, re-claimed by a hotplugged vendor: not the primary. The
+	// single-segment table must take the split path, so the screen is woven
+	// by its own segment DP and never by the session DP.
+	comp_segments_screen scr = screen(DS1, 0, 0, 3840, 2160, 3840, 2160, false);
+	const comp_seg_rect win = {100, 100, 1280, 720};
+	comp_segment_table t{};
+	comp_segments_compute(&win, nullptr, &scr, 1, &t);
+	REQUIRE(t.count == 1);
+	CHECK_FALSE(t.seg[0].is_primary);
+	CHECK(comp_segments_table_is_split(&t, 1280, 720));
+
+	// The same screen as the session DP's own: the single-DP path, as ever.
+	scr.is_primary = true;
+	comp_segments_compute(&win, nullptr, &scr, 1, &t);
+	CHECK_FALSE(comp_segments_table_is_split(&t, 1280, 720));
+}
+
 TEST_CASE("comp_segments: majority rule", "[comp_segments]")
 {
 	comp_segment_table t = window_at(3840 - 300); // 300 laptop / 700 Acer

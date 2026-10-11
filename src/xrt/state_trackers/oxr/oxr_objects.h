@@ -1393,6 +1393,21 @@ oxr_system_get_properties(struct oxr_logger *log, struct oxr_system *sys, XrSyst
 void
 oxr_system_get_screens(struct oxr_system *sys, struct xrt_screen_list *out_list);
 
+/*!
+ * Hand the session's in-process compositor the screens + the registry they
+ * were built from (one snapshot). Session create, and every display-topology
+ * change (ADR-047 Amendment 7).
+ */
+void
+oxr_session_push_screens(struct oxr_logger *log, struct oxr_session *sess, bool initial);
+
+/*!
+ * Per frame (xrBeginFrame): pick up a display-topology change — re-push the
+ * screens and queue XrEventDataDisplaysChangedDXR (ADR-047 Amendment 7).
+ */
+void
+oxr_session_poll_display_topology(struct oxr_logger *log, struct oxr_session *sess);
+
 #ifdef OXR_HAVE_DXR_display_info
 //! xrEnumerateDisplaysDXR (XR_DXR_display_info v22).
 XrResult
@@ -1569,6 +1584,14 @@ oxr_event_push_XrEventDataEyeTrackingStateChanged(struct oxr_logger *log,
                                                   struct oxr_session *sess,
                                                   XrBool32 isTracking,
                                                   XrEyeTrackingModeDXR activeMode);
+
+/*!
+ * Push an `XrEventDataDisplaysChangedDXR` (XR_DXR_display_info v23, display
+ * hotplug — ADR-047 Amendment 7): the display list changed and has already
+ * been applied.
+ */
+XrResult
+oxr_event_push_XrEventDataDisplaysChangedDXR(struct oxr_logger *log, struct oxr_session *sess, uint32_t displayCount);
 
 #ifdef OXR_HAVE_DXR_depth_budget
 /*!
@@ -2909,6 +2932,13 @@ struct oxr_session
 	 * the display the app pinned the session to; 0 = runtime decides.
 	 */
 	uint64_t bound_display_id;
+
+	/*!
+	 * Display hotplug (ADR-047 Amendment 7): the display-topology generation
+	 * (`xrt_instance::get_display_generation`) whose screens this session last
+	 * handed its compositor. A frame that sees another re-pushes them.
+	 */
+	uint64_t display_generation;
 
 	/*!
 	 * True when the session is bound to a display OTHER than the system

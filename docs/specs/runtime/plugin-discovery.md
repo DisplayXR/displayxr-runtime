@@ -563,8 +563,20 @@ comes from that screen's registry entry, mixed vendors included —
 
 1. a **per-screen pin** (`DXR_SCREEN_PLUGIN`, below) whose plug-in claims the monitor;
 2. the **PreferredPlugin** override (#791, §2.1/§3.3), if that plug-in claims it;
-3. the **active** plug-in, if it claims it (#1521);
+3. the **active** plug-in, if it claims it (#1521) — unless its claim is `FALLBACK` and a plug-in
+   ranked before it (lower ProbeOrder) claims the monitor above `FALLBACK`: then rule 4 decides.
+   That source can only appear after instance create (display hotplug, ADR-047 Amendment 7 — a
+   better-ranked plug-in that probed at discovery would be the active one), so ProbeOrder forcing
+   and every create-time resolve are unchanged;
 4. the highest **confidence**, ties to the lower ProbeOrder.
+
+**Display hotplug (ADR-047 Amendment 7).** The registry is re-resolved while the process runs
+(OS display reconfiguration, a monitor-list poll, or a plug-in's `request_display_rescan`). Each
+sweep first calls `target_plugin_rescan_claim_sources`: every manifest plug-in that is not a claim
+source yet is loaded and probed again — a vendor plug-in that declined at instance create because
+its panel was absent gets its chance — and inserted in ProbeOrder; existing sources are never
+re-probed or released. A PreferredPlugin naming the active plug-in keeps the shortcut above (nothing
+else loads). macOS/Linux; the Windows twin is a TODO.
 
 **`DXR_SCREEN_PLUGIN` — pin one monitor to a plug-in** (multi-screen M4, #793 phase 3).
 `DXR_SCREEN_PLUGIN=<match>=<plugin-id>[,<match>=<plugin-id>…]`, where `<match>` is

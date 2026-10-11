@@ -438,6 +438,40 @@ comp_segments_lifecycle_set_created(struct comp_segments_lifecycle *lc, uint64_t
 	s->failed = !ok;
 }
 
+int
+comp_segments_session_dp_screen(const struct comp_segments_session_dp *sd,
+                                const uint64_t *ids,
+                                const char *const *plugin_ids,
+                                uint32_t n)
+{
+	if (sd == NULL || !sd->valid || ids == NULL || plugin_ids == NULL) {
+		return -1;
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		if (ids[i] == sd->monitor_id && plugin_ids[i] != NULL && strcmp(plugin_ids[i], sd->plugin_id) == 0) {
+			return (int)i;
+		}
+	}
+	return -1;
+}
+
+bool
+comp_segments_lifecycle_adopt(struct comp_segments_lifecycle *lc, uint64_t screen_id)
+{
+	if (lc == NULL) {
+		return false;
+	}
+	struct comp_segments_slot *s = lc_find(lc, screen_id, true);
+	if (s == NULL) {
+		return false;
+	}
+	s->live = true;
+	s->failed = false;
+	s->present_streak = lc->create_after;
+	s->absent_streak = 0;
+	return true;
+}
+
 bool
 comp_segments_lifecycle_is_live(const struct comp_segments_lifecycle *lc, uint64_t screen_id)
 {

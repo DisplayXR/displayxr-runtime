@@ -31,6 +31,7 @@ struct xrt_space_overseer;
 struct xrt_system;
 struct xrt_system_devices;
 struct xrt_system_compositor;
+struct xrt_system_compositor_info;
 
 struct _JavaVM;
 
@@ -292,6 +293,30 @@ struct xrt_instance
 	 * (the no-compositor instance).
 	 */
 	xrt_result_t (*enumerate_displays)(struct xrt_instance *xinst, struct xrt_screen_list *out_list);
+
+	/*!
+	 * Optional (display hotplug, ADR-047 Amendment 7): the display-topology
+	 * generation — 0 until the system exists, then bumped every time the
+	 * published screen list changes after a display was plugged in, removed,
+	 * re-claimed by another plug-in or moved. Cheap enough to read every frame
+	 * (it takes no lock the claim sweep holds). NULL on instances without a
+	 * live claim sweep (the IPC client instance today).
+	 */
+	uint64_t (*get_display_generation)(struct xrt_instance *xinst);
+
+	/*!
+	 * Optional (display hotplug, ADR-047 Amendment 7): one consistent snapshot
+	 * of the screen list (as @ref enumerate_displays builds it), the system
+	 * compositor info it was built from (its per-monitor DP registry
+	 * included), and the generation they belong to — taken under the lock the
+	 * claim sweep rewrites them under, so a session never pairs one sweep's
+	 * list with another's registry. @p out_info and @p out_generation may be
+	 * NULL. NULL on instances without a live claim sweep.
+	 */
+	xrt_result_t (*get_display_snapshot)(struct xrt_instance *xinst,
+	                                     struct xrt_screen_list *out_list,
+	                                     struct xrt_system_compositor_info *out_info,
+	                                     uint64_t *out_generation);
 };
 
 /*!
@@ -309,6 +334,42 @@ xrt_instance_enumerate_displays(struct xrt_instance *xinst, struct xrt_screen_li
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
 	return xinst->enumerate_displays(xinst, out_list);
+}
+
+/*!
+ * @copydoc xrt_instance::get_display_generation
+ *
+ * 0 when the instance has no implementation (the topology never changes).
+ *
+ * @public @memberof xrt_instance
+ */
+static inline uint64_t
+xrt_instance_get_display_generation(struct xrt_instance *xinst)
+{
+	if (xinst == NULL || xinst->get_display_generation == NULL) {
+		return 0;
+	}
+	return xinst->get_display_generation(xinst);
+}
+
+/*!
+ * @copydoc xrt_instance::get_display_snapshot
+ *
+ * Returns XRT_ERROR_FEATURE_NOT_SUPPORTED when the instance has no
+ * implementation (the caller falls back to @ref xrt_instance_enumerate_displays).
+ *
+ * @public @memberof xrt_instance
+ */
+static inline xrt_result_t
+xrt_instance_get_display_snapshot(struct xrt_instance *xinst,
+                                  struct xrt_screen_list *out_list,
+                                  struct xrt_system_compositor_info *out_info,
+                                  uint64_t *out_generation)
+{
+	if (xinst == NULL || xinst->get_display_snapshot == NULL) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	return xinst->get_display_snapshot(xinst, out_list, out_info, out_generation);
 }
 
 /*!

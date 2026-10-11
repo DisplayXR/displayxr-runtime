@@ -22,6 +22,7 @@
 
 #include "target_plugin_loader.h"
 #include "target_screen_pin.h"
+#include "target_display_hotplug.h"
 #include "xrt/xrt_config_have.h"
 
 #ifdef XRT_HAVE_VULKAN
@@ -995,6 +996,8 @@ load_and_probe_one(const struct plugin_entry *e,
 	struct xrt_plugin_host_iface host = {0};
 	host.struct_size = (uint32_t)sizeof(struct xrt_plugin_host_iface);
 	host.host_api_version = XRT_PLUGIN_API_VERSION_CURRENT;
+	// ADR-047 Amendment 7: a plug-in may ask for the per-monitor claim sweep.
+	host.request_display_rescan = target_display_hotplug_plugin_request;
 #if defined(XRT_OS_ANDROID)
 	// Android plug-ins need the host's JavaVM/activity for vendor-SDK init
 	// (their own statically-linked aux_android copy is never populated).
@@ -2102,6 +2105,8 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 	struct xrt_plugin_host_iface host = {0};
 	host.struct_size = (uint32_t)sizeof(struct xrt_plugin_host_iface);
 	host.host_api_version = XRT_PLUGIN_API_VERSION_CURRENT;
+	// ADR-047 Amendment 7: a plug-in may ask for the per-monitor claim sweep.
+	host.request_display_rescan = target_display_hotplug_plugin_request;
 #if defined(XRT_OS_ANDROID)
 	// Android plug-ins need the host's JavaVM/activity for vendor-SDK init
 	// (their own statically-linked aux_android copy is never populated).
@@ -2696,6 +2701,8 @@ load_and_probe_one(const struct plugin_entry *e, struct xrt_plugin_instance **ou
 	struct xrt_plugin_host_iface host = {0};
 	host.struct_size = (uint32_t)sizeof(struct xrt_plugin_host_iface);
 	host.host_api_version = XRT_PLUGIN_API_VERSION_CURRENT;
+	// ADR-047 Amendment 7: a plug-in may ask for the per-monitor claim sweep.
+	host.request_display_rescan = target_display_hotplug_plugin_request;
 #if defined(XRT_OS_ANDROID)
 	// Android plug-ins need the host's JavaVM/activity for vendor-SDK init
 	// (their own statically-linked aux_android copy is never populated).
@@ -2957,6 +2964,68 @@ collect_display_sources_platform(struct plugin_display_source *out, int max)
 		out[count].iface = g_active_iface;
 		out[count].inst = g_active_instance;
 		out[count].probe_order = g_active_probe_order;
+		count++;
+	}
+	return count;
+}
+
+/*!
+ * Display hotplug (ADR-047 Amendment 7): add to @p out (holding @p count
+ * sources) every manifest plug-in that is not a display-claim source yet — a
+ * vendor plug-in that declined at instance create because its panel was not
+ * attached, or one registered since. Sources already in the set are kept as
+ * they are and never re-probed or destroyed: a live segment DP may have been
+ * made from their instance. The set stays in ascending ProbeOrder (rule 3's
+ * hotplug carve-out reads "ranked before the active plug-in" off that order).
+ * `DXR_PLUGIN_EXCLUSIVE` is honoured exactly as in discovery.
+ *
+ * Caller holds @ref g_refresh_mutex. Returns the new count.
+ */
+static int
+rescan_display_sources_platform(struct plugin_display_source *out, int count, int max)
+{
+	char roots[8][PATH_MAX];
+	int n_roots = target_plugin_build_discovery_roots(roots, (int)(sizeof(roots) / sizeof(roots[0])));
+	struct plugin_entry entries[MAX_PLUGIN_ENTRIES];
+	int n = 0;
+	for (int r = 0; r < n_roots; r++) {
+		n = enumerate_dir(roots[r], entries, n, MAX_PLUGIN_ENTRIES);
+	}
+	qsort(entries, (size_t)n, sizeof(entries[0]), compare_by_filename);
+
+	for (int i = 0; i < n && count < max; i++) {
+		if (plugin_id_excluded(entries[i].id)) {
+			continue;
+		}
+		bool have = false;
+		for (int k = 0; k < count && !have; k++) {
+			const struct xrt_plugin_iface *sif = out[k].iface;
+			have = sif != NULL && sif->id != NULL && strcmp(sif->id, entries[i].id) == 0;
+		}
+		if (have) {
+			continue;
+		}
+
+		uint32_t ver = 0;
+		struct xrt_plugin_instance *inst = NULL;
+		const struct xrt_plugin_iface *iface = load_and_probe_one(&entries[i], &inst, &ver);
+		if (iface == NULL) {
+			continue; // still declines (no panel yet) / failed -> no claims
+		}
+		U_LOG_W(
+		    "plugin loader: display hotplug — '%s' (ProbeOrder=%u) now loads as a display-claim source; it was "
+		    "not one before (declined, failed, or registered since)",
+		    entries[i].id, entries[i].probe_order);
+
+		// Insert in ascending ProbeOrder (after any equal one).
+		int at = count;
+		while (at > 0 && out[at - 1].probe_order > entries[i].probe_order) {
+			out[at] = out[at - 1];
+			at--;
+		}
+		out[at].iface = iface;
+		out[at].inst = inst;
+		out[at].probe_order = entries[i].probe_order;
 		count++;
 	}
 	return count;
@@ -4190,6 +4259,19 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 			    "plugin loader: monitor 0x%016llx → PreferredPlugin override '%s' "
 			    "(forced over EDID confidence)",
 			    (unsigned long long)desc->monitor_id, preferred_id);
+		} else if (reason == TARGET_SCREEN_PICK_BETTER_RANKED) {
+			const char *active_name = "?";
+			for (uint32_t i = 0; i < nc; i++) {
+				if (cands[i].is_active) {
+					active_name = cands[i].plugin_id;
+				}
+			}
+			U_LOG_W(
+			    "plugin loader: monitor 0x%016llx → '%s' (confidence=%u, ProbeOrder=%u, ranked before "
+			    "the active plug-in) — the active plug-in '%s' claims it only as a fallback: a panel "
+			    "that came up after instance create (display hotplug, ADR-047 Amendment 7)",
+			    (unsigned long long)desc->monitor_id, cands[pick].plugin_id, cands[pick].confidence,
+			    cand_src[pick]->probe_order, active_name);
 		} else if (reason == TARGET_SCREEN_PICK_ACTIVE && conf_pick >= 0 && conf_pick != pick) {
 			// One-off per monitor, and only when the override changes the outcome.
 			U_LOG_W(
@@ -4269,5 +4351,50 @@ target_plugin_release_claim_sources(void)
 	if (g_refresh_mutex_initialized) {
 		os_mutex_unlock(&g_refresh_mutex);
 	}
+#endif
+}
+
+uint32_t
+target_plugin_rescan_claim_sources(void)
+{
+#if !defined(XRT_OS_WINDOWS) && !defined(XRT_OS_ANDROID)
+	(void)target_plugin_get_active();
+	if (g_refresh_mutex_initialized) {
+		os_mutex_lock(&g_refresh_mutex);
+	}
+	uint32_t added = 0;
+	if (g_display_source_count >= 0) {
+		// A user-pinned active plug-in (PreferredPlugin == active) wins every
+		// monitor it claims (rule 2), and the shortcut set means it claimed
+		// them all: loading the others could change nothing, and #1874 keeps
+		// them (and the vendor service they reach) out of the process. Any
+		// other set loads the rest now — a better-ranked plug-in may have
+		// found a hotplugged panel (rule 3's carve-out).
+		char preferred[64] = {0};
+		const bool pinned_active = target_plugin_get_preferred(preferred, sizeof(preferred)) &&
+		                           g_active_iface != NULL && g_active_iface->id != NULL &&
+		                           strcmp(preferred, g_active_iface->id) == 0;
+		if (!(g_display_sources_active_only && pinned_active)) {
+			const int before = g_display_source_count;
+			g_display_source_count = rescan_display_sources_platform(
+			    g_display_sources, g_display_source_count, TARGET_PLUGIN_MAX_SOURCES);
+			added = (uint32_t)(g_display_source_count - before);
+			// Every loadable plug-in has now been asked: the set is the full one.
+			g_display_sources_active_only = false;
+		}
+	}
+	// g_display_source_count < 0: never collected; the next resolve collects
+	// (and so probes) every plug-in from scratch.
+	if (g_refresh_mutex_initialized) {
+		os_mutex_unlock(&g_refresh_mutex);
+	}
+	return added;
+#else
+	// TODO(multi-screen hotplug, Windows): the Windows claim-source set is
+	// collected once and kept, so a vendor plug-in that declined at instance
+	// create is never re-probed. Needs the twin of
+	// rescan_display_sources_platform over the registry entries (ADR-047
+	// Amendment 7). Android: one plug-in, no claim-only sources.
+	return 0;
 #endif
 }

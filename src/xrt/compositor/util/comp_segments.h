@@ -94,6 +94,40 @@ struct comp_segments_screen
 };
 
 /*!
+ * What the session's own display processor was made for (display hotplug,
+ * ADR-047 Amendment 7): one monitor, by one plug-in. Recorded from the first
+ * screen table a session sees (the system-default screen and the plug-in that
+ * won it then).
+ *
+ * After a display hotplug the screen table can change under a live session:
+ * the system default can move to another monitor, or the monitor the session
+ * DP serves can be re-claimed by another plug-in (sim-display -> a vendor
+ * whose panel just came up). The session DP is never swapped (ADR-045 D3);
+ * instead it keeps weaving exactly that monitor while that plug-in still owns
+ * it, and every other screen — the re-claimed one included — is woven through
+ * a segment DP from its own claimant, even when it is the only segment.
+ */
+struct comp_segments_session_dp
+{
+	bool valid;
+	uint64_t monitor_id;
+	char plugin_id[COMP_SEGMENTS_ID_MAX];
+};
+
+/*!
+ * Which listed screen is the session DP's: the one with @p sd's monitor id
+ * whose winning plug-in is still @p sd's. @p ids and @p plugin_ids are
+ * parallel, @p n long.
+ *
+ * @return its index, or -1 (gone, re-claimed, or @p sd not valid).
+ */
+int
+comp_segments_session_dp_screen(const struct comp_segments_session_dp *sd,
+                                const uint64_t *ids,
+                                const char *const *plugin_ids,
+                                uint32_t n);
+
+/*!
  * Whether pixels a window draws on a screen reach it unresampled.
  */
 enum comp_seg_1to1
@@ -434,6 +468,18 @@ comp_segments_lifecycle_update(struct comp_segments_lifecycle *lc,
  */
 void
 comp_segments_lifecycle_set_created(struct comp_segments_lifecycle *lc, uint64_t screen_id, bool ok);
+
+/*!
+ * Carry a live DP over into a fresh lifecycle (display hotplug, ADR-047
+ * Amendment 7): a new screen table that still lists @p screen_id, bound the
+ * same way, keeps that screen's DP instead of rebuilding it. The slot is live
+ * with a full present streak, so no CREATE is issued for it; it is destroyed by
+ * the usual absent-streak rule once its segment is gone.
+ *
+ * @return false when out of slots (the caller then releases the DP).
+ */
+bool
+comp_segments_lifecycle_adopt(struct comp_segments_lifecycle *lc, uint64_t screen_id);
 
 /*!
  * Does a DP exist for @p screen_id?

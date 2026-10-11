@@ -89,6 +89,15 @@ if(NOT (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID))
 	target_sources(aux_os PRIVATE os_display_scale_stubs.c)
 endif()
 
+# Display hotplug (ADR-047 Amendment 7): the OS display-reconfiguration
+# notification. macOS has one (CoreGraphics); elsewhere the runtime polls.
+target_sources(aux_os PRIVATE os_display_hotplug.h)
+if(APPLE)
+	target_sources(aux_os PRIVATE os_display_hotplug_macos.c)
+else()
+	target_sources(aux_os PRIVATE os_display_hotplug_stubs.c)
+endif()
+
 if(APPLE)
 	target_sources(aux_os PRIVATE os_macos.c)
 endif()

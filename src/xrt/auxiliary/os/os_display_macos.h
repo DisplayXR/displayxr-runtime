@@ -42,6 +42,29 @@ bool
 os_display_macos_fill_desktop_info(uint32_t display_id, struct os_display_desktop_info *out_info);
 
 /*!
+ * The synthetic monitor of the display-hotplug test hook
+ * (`DXR_TEST_FAKE_MONITOR_FILE`, see os_display_desktop_macos.c). Not a real
+ * `CGDirectDisplayID`: never pass it to CoreGraphics.
+ */
+#define OS_DISPLAY_MACOS_TEST_FAKE_ID 0x0DE7E570u
+
+/*!
+ * Is the display-hotplug test hook splitting the main display right now? When
+ * it is, @p out_split_pt (may be NULL) receives the cut, in points from the
+ * main display's left edge.
+ */
+bool
+os_display_macos_test_split(uint32_t *out_split_pt);
+
+//! Is the display-hotplug test hook re-identifying the main display (file holds `reid`)?
+bool
+os_display_macos_test_reid(void);
+
+//! Is @p display_id the test hook's synthetic monitor (and is it present)?
+bool
+os_display_macos_is_test_fake(uint32_t display_id);
+
+/*!
  * CoreGraphics' vendor number (`CGDisplayVendorNumber`) is the EDID PNP id as
  * a big-endian value ("SAM" = 0x4C2D); @ref os_display_edid_monitor stores
  * EDID bytes 8-9 loaded little-endian, as Windows and Linux do. Swap.

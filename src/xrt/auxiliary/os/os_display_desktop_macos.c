@@ -44,6 +44,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include <CoreGraphics/CoreGraphics.h>
 #include <CoreFoundation/CoreFoundation.h>
@@ -115,13 +116,135 @@ os_display_macos_list_displays(uint32_t *out_ids, uint32_t max_ids)
 				continue;
 			}
 			out_ids[n++] = (uint32_t)did;
+			if (pass == 0 && n < max_ids && os_display_macos_test_split(NULL)) {
+				out_ids[n++] = OS_DISPLAY_MACOS_TEST_FAKE_ID;
+			}
 		}
 	}
 	return n;
 }
 
+/*
+ *
+ * Display-hotplug test hook (ADR-047 Amendment 7).
+ *
+ * `DXR_TEST_FAKE_MONITOR_FILE=<path>`: while <path> exists and holds a
+ * positive integer S, the MAIN display is enumerated as two monitors — itself
+ * cut to its first S points, and a synthetic monitor
+ * (@ref OS_DISPLAY_MACOS_TEST_FAKE_ID) covering the rest of it. Creating or
+ * deleting the file is, for everything that enumerates displays through this
+ * file (the per-monitor registry, the desktop resolver, the hotplug poll), a
+ * monitor appearing next to the main one or going away — on a Mac with one
+ * display and no panel. Nothing changes on screen: the WindowServer still
+ * shows one display, so a window can straddle the cut. Read per call (one
+ * fopen) and only while the variable is set.
+ *
+ * The file holding the word `reid` instead re-identifies the main display
+ * (another device name, so another monitor id): to the runtime the monitor a
+ * session's display processor was made for is unplugged and an unknown one
+ * plugged into its place — the "session DP owns no screen any more" path.
+ *
+ */
+
+bool
+os_display_macos_test_split(uint32_t *out_split_pt)
+{
+	const char *path = getenv("DXR_TEST_FAKE_MONITOR_FILE");
+	if (path == NULL || path[0] == '\0') {
+		return false;
+	}
+	FILE *f = fopen(path, "r");
+	if (f == NULL) {
+		return false;
+	}
+	unsigned v = 0;
+	const int got = fscanf(f, "%u", &v);
+	fclose(f);
+	if (got != 1 || v == 0) {
+		return false;
+	}
+	const CGRect main_bounds = CGDisplayBounds(CGMainDisplayID());
+	if (CGRectIsNull(main_bounds) || (double)v >= main_bounds.size.width) {
+		return false;
+	}
+	if (out_split_pt != NULL) {
+		*out_split_pt = (uint32_t)v;
+	}
+	return true;
+}
+
+bool
+os_display_macos_test_reid(void)
+{
+	const char *path = getenv("DXR_TEST_FAKE_MONITOR_FILE");
+	if (path == NULL || path[0] == '\0') {
+		return false;
+	}
+	FILE *f = fopen(path, "r");
+	if (f == NULL) {
+		return false;
+	}
+	char word[16] = {0};
+	const int got = fscanf(f, "%15s", word);
+	fclose(f);
+	return got == 1 && strcmp(word, "reid") == 0;
+}
+
+bool
+os_display_macos_is_test_fake(uint32_t display_id)
+{
+	return display_id == OS_DISPLAY_MACOS_TEST_FAKE_ID && os_display_macos_test_split(NULL);
+}
+
+//! The real CoreGraphics record of @p display_id.
+static bool
+fill_desktop_info_cg(uint32_t display_id, struct os_display_desktop_info *out_info);
+
+//! Cut a record to [x0, x0 + w) points of its own rect, scaling px and mm with it.
+static void
+cut_desktop_info(struct os_display_desktop_info *d, uint32_t x0, uint32_t w)
+{
+	const double full_w = (double)d->width;
+	const double frac = full_w > 0.0 ? (double)w / full_w : 0.0;
+	d->left += (int32_t)x0;
+	d->width = w;
+	d->native_width = (uint32_t)((double)d->native_width * frac + 0.5);
+	d->width_in_caller_dpi = (uint32_t)((double)d->width_in_caller_dpi * frac + 0.5);
+	d->physical_width_mm = (uint32_t)((double)d->physical_width_mm * frac + 0.5);
+}
+
 bool
 os_display_macos_fill_desktop_info(uint32_t display_id, struct os_display_desktop_info *out_info)
+{
+	uint32_t split = 0;
+	const bool split_on = os_display_macos_test_split(&split);
+	const uint32_t main_id = (uint32_t)CGMainDisplayID();
+	if (display_id == OS_DISPLAY_MACOS_TEST_FAKE_ID) {
+		if (!split_on || !fill_desktop_info_cg(main_id, out_info)) {
+			return false;
+		}
+		const uint32_t w = out_info->width - split;
+		cut_desktop_info(out_info, split, w);
+		out_info->is_primary = false;
+		(void)snprintf(out_info->device_name, sizeof(out_info->device_name), "DXR-TEST-FAKE-MONITOR");
+		return true;
+	}
+	if (!fill_desktop_info_cg(display_id, out_info)) {
+		return false;
+	}
+	if (split_on && display_id == main_id) {
+		cut_desktop_info(out_info, 0, split);
+	}
+	if (display_id == main_id && os_display_macos_test_reid()) {
+		// Another device name = another monitor id (it keys the id on macOS).
+		const size_t len = strnlen(out_info->device_name, sizeof(out_info->device_name));
+		(void)snprintf(out_info->device_name + len, sizeof(out_info->device_name) - len, "-REID");
+	}
+	return true;
+}
+
+static bool
+fill_desktop_info_cg(uint32_t display_id, struct os_display_desktop_info *out_info)
 {
 	if (out_info == NULL) {
 		return false;

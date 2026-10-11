@@ -112,6 +112,9 @@ if(TARGET target_lists)
 	list(APPEND tests tests_input_host_geometry)
 	# Multi-screen M1 -- target_screens_build: registry -> per-screen list.
 	list(APPEND tests tests_target_screens)
+	# ADR-047 Amendment 7 -- display hotplug: the claim sweep's scheduler, the
+	# per-monitor winner across a hotplug, the published-list comparison.
+	list(APPEND tests tests_target_display_hotplug)
 endif()
 # Multi-screen M0 (#69) -- where a plug-in without probe_displays gets its
 # synthesized display claim (its panel's monitor, not the primary). Pure
@@ -400,6 +403,9 @@ target_compile_definitions(
 
 if(TARGET tests_target_screens)
 	target_link_libraries(tests_target_screens PRIVATE target_lists xrt-interfaces aux_os)
+endif()
+if(TARGET tests_target_display_hotplug)
+	target_link_libraries(tests_target_display_hotplug PRIVATE target_lists xrt-interfaces aux_os)
 endif()
 
 if(TARGET tests_input_host_geometry)
