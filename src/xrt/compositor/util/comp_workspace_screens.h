@@ -387,6 +387,56 @@ uint64_t
 comp_ws_pointer_owner_screen(const struct comp_ws_pointer_owner *o);
 
 /*!
+ * A synthetic button DOWN the runtime posted to an app and still owes the UP
+ * for.
+ *
+ * The one-click-drag helper re-delivers a press to a window the controller
+ * focused while the button is held (the real DOWN went to the old focus, or
+ * nowhere). The real UP is forwarded only if the cursor is over the window's
+ * forward rect when the button comes up -- so when the window moved meanwhile
+ * (a taskbar restore growing it out of the dock point under the cursor), or
+ * the release happened on another presenter, or focus moved on, the app was
+ * left with a button held, and every later hover arrived as a drag. This
+ * records the press so the runtime can pair it: whatever happens, the app
+ * gets exactly one UP for the DOWN it was given.
+ *
+ * @p target is an opaque window handle (the app HWND on Windows).
+ */
+struct comp_ws_synth_press
+{
+	void *target;          //!< the app window owed an UP; NULL = none
+	uint32_t button;       //!< 1 = left, 2 = right, 3 = middle
+	uint32_t timestamp_ms; //!< when the DOWN was posted (GetTickCount base)
+	int32_t x, y;          //!< app-client px of the posted DOWN
+};
+
+/*!
+ * Note a synthetic DOWN posted to @p target. Returns the window a previously
+ * pending press is now owed an UP by (a different window; NULL otherwise) --
+ * the caller posts that UP before anything else.
+ */
+void *
+comp_ws_synth_press_note_down(
+    struct comp_ws_synth_press *p, void *target, uint32_t button, uint32_t timestamp_ms, int32_t x, int32_t y);
+
+/*!
+ * Settle a pending synthetic press. Returns the window to post the UP to now
+ * (and forgets the press), or NULL.
+ *
+ * - @p up_forwarded: the input path already forwarded a real UP of that
+ *   button to the target at or after the DOWN -- paired, nothing to post.
+ * - @p button_held false: the button came up without the UP reaching the
+ *   target (released off its rect, on another presenter, over an overlay) --
+ *   post it.
+ * - @p focus_target is not the target: forwarding moved to another window
+ *   while the button is held, so the real UP will never reach the target --
+ *   post it now.
+ * - otherwise still held on the same focus: keep waiting (a drag).
+ */
+void *
+comp_ws_synth_press_settle(struct comp_ws_synth_press *p, bool button_held, bool up_forwarded, void *focus_target);
+
+/*!
  * ADR-052 Amendment 2: the presenter that composes a controller overlay tagged
  * with screen @p overlay_screen_id (`XrWorkspaceOverlayScreenDXR`, spec v26).
  *

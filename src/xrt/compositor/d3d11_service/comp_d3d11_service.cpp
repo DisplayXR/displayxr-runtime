@@ -3014,6 +3014,8 @@ service_ws_cmd_push(struct d3d11_service_system *sys, const struct ws_command *c
 //! instead of re-entering the drain.
 static void
 service_ws_cmd_drain(struct d3d11_service_system *sys);
+static void
+svc_ws_synth_press_settle(struct d3d11_multi_compositor *mc);
 
 //! Enqueue-or-inline helper shared by every converted handler: push, and on
 //! ring exhaustion take the fair lock and apply the same code inline.
@@ -3098,6 +3100,8 @@ service_ws_cmd_drain(struct d3d11_service_system *sys)
 	for (uint32_t i = 0; i < n; i++) {
 		service_ws_cmd_apply(sys, &local[i]);
 	}
+	// A synthetic one-click-drag DOWN is always paired with an UP.
+	svc_ws_synth_press_settle(sys->multi_comp);
 }
 
 
@@ -4323,6 +4327,13 @@ struct d3d11_multi_compositor
 	//! `ws_presenters_lock`.
 	struct comp_ws_pointer_owner ws_pointer_owner;
 	/*! @} */
+
+	//! A synthetic LMB DOWN the one-click-drag helper posted and still owes
+	//! the UP for (comp_ws_synth_press), and the focused app HWND it was
+	//! posted for (the press target can be a child control of it). Render
+	//! thread only: set in synthesize_focus_click_down, settled every drain.
+	struct comp_ws_synth_press ws_synth_press;
+	HWND ws_synth_press_owner;
 
 	//! Focused client index (-1 = none).
 	int32_t focused_slot;
@@ -34077,6 +34088,77 @@ synthesize_focus_click_down(struct d3d11_multi_compositor *mc, int slot)
 	LPARAM lp = MAKELPARAM(app_x, app_y);
 	PostMessage(click_target, WM_MOUSEMOVE, 0, lp);
 	PostMessage(click_target, WM_LBUTTONDOWN, MK_LBUTTON, lp);
+
+	// The DOWN is now owed an UP. The real one is forwarded only if the cursor
+	// is over this window's forward rect at release — not if the window moved
+	// meanwhile (a taskbar restore grows it out of the dock point under the
+	// cursor), the release lands on another presenter, or focus moves on.
+	// svc_ws_synth_press_settle pairs it on every drain.
+	HWND owed = (HWND)comp_ws_synth_press_note_down(&mc->ws_synth_press, click_target, 1, GetTickCount(),
+	                                                app_x, app_y);
+	mc->ws_synth_press_owner = target;
+	if (owed != nullptr && IsWindow(owed)) {
+		PostMessage(owed, WM_LBUTTONUP, 0, 0);
+	}
+}
+
+//! Did a presenter window forward a real UP of @p button to @p target at or after @p since_ms?
+static bool
+svc_ws_up_forwarded_since(struct d3d11_multi_compositor *mc, void *target, uint32_t button, uint32_t since_ms)
+{
+	auto check = [&](struct comp_d3d11_window *w) {
+		uint32_t b = 0, t = 0;
+		void *up = comp_d3d11_window_get_last_pointer_up(w, &b, &t);
+		return up != nullptr && up == target && b == button && (int32_t)(t - since_ms) >= 0;
+	};
+	if (check(mc->window)) {
+		return true;
+	}
+	bool found = false;
+	AcquireSRWLockExclusive(&mc->ws_presenters_lock);
+	for (uint32_t i = 0; !found && i < mc->ws_presenter_count; i++) {
+		struct svc_ws_presenter *p = mc->ws_presenters[i];
+		found = p != nullptr && p->window != nullptr && check(p->window);
+	}
+	ReleaseSRWLockExclusive(&mc->ws_presenters_lock);
+	return found;
+}
+
+/*!
+ * Pair a pending synthetic DOWN with its UP (comp_ws_synth_press): post the UP
+ * once the button is up without a real UP having reached the app, or as soon
+ * as forwarding moved to another window. Every drain, render thread.
+ */
+static void
+svc_ws_synth_press_settle(struct d3d11_multi_compositor *mc)
+{
+	if (mc == nullptr || mc->ws_synth_press.target == nullptr) {
+		return;
+	}
+	struct comp_ws_synth_press *sp = &mc->ws_synth_press;
+	const int vk = sp->button == 2 ? VK_RBUTTON : (sp->button == 3 ? VK_MBUTTON : VK_LBUTTON);
+	const bool held = (GetAsyncKeyState(vk) & 0x8000) != 0;
+	const bool up_fwd = svc_ws_up_forwarded_since(mc, sp->target, sp->button, sp->timestamp_ms);
+
+	// The window forwarding goes to now (update_input_forward's rule). The
+	// press target may be a child control of the focused app: same window.
+	HWND focus = nullptr;
+	const int fs = mc->focused_slot;
+	if (fs >= 0 && fs < D3D11_MULTI_MAX_CLIENTS && mc->clients[fs].active && !mc->clients[fs].modal_open) {
+		focus = mc->clients[fs].app_hwnd;
+	}
+	void *focus_target = (focus != nullptr && focus == mc->ws_synth_press_owner) ? sp->target : (void *)focus;
+
+	const int32_t x = sp->x, y = sp->y;
+	const uint32_t button = sp->button;
+	HWND owed = (HWND)comp_ws_synth_press_settle(sp, held, up_fwd, focus_target);
+	if (owed == nullptr || !IsWindow(owed)) {
+		return;
+	}
+	const UINT msg = button == 2 ? WM_RBUTTONUP : (button == 3 ? WM_MBUTTONUP : WM_LBUTTONUP);
+	PostMessage(owed, msg, 0, MAKELPARAM(x, y));
+	U_LOG_I("Workspace: paired a synthetic button-%u DOWN with an UP (hwnd=%p, %s)", button, (void *)owed,
+	        held ? "focus moved" : "released off the window");
 }
 
 /*

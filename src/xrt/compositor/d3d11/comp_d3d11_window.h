@@ -389,6 +389,15 @@ void *
 comp_d3d11_window_get_last_pointer_down_target(struct comp_d3d11_window *window);
 
 /*!
+ * Return the HWND the most recent real button-UP was forwarded to (NULL if
+ * none yet), with that UP's button (1/2/3) and message time (GetTickCount
+ * base). The service uses it to tell whether a synthetic DOWN it posted for
+ * one-click-drag was paired by a real UP or is still owed one.
+ */
+void *
+comp_d3d11_window_get_last_pointer_up(struct comp_d3d11_window *window, uint32_t *out_button, uint32_t *out_time_ms);
+
+/*!
  * Mark workspace mode as active/inactive on the window. While active, ESC on the
  * compositor window is swallowed instead of posting WM_CLOSE — an empty workspace
  * (no focused app) would otherwise take the service down with its own window.
