@@ -440,13 +440,16 @@ hud_font_init(HudFont &f, VkPhysicalDevice phys, VkDevice device, VkQueue queue,
 	}
 
 	// ── 5. Mapped quad vertex buffer. ──
-	if (!make_buffer(phys, device, sizeof(TextVtx) * kMaxVerts, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+	// One region per frame-ring slot (see HudFont::slot).
+	if (!make_buffer(phys, device, sizeof(TextVtx) * kMaxVerts * HUD_FONT_MAX_SLOTS,
+	                 VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
 	                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
 	                 f.vbuf, f.vbuf_mem)) {
 		HFLOGE("hud_font: vertex buffer failed");
 		return false;
 	}
-	vkMapMemory(device, f.vbuf_mem, 0, sizeof(TextVtx) * kMaxVerts, 0, &f.vbuf_mapped);
+	vkMapMemory(device, f.vbuf_mem, 0, sizeof(TextVtx) * kMaxVerts * HUD_FONT_MAX_SLOTS, 0,
+	            &f.vbuf_mapped);
 
 	// ── 6. SDF rounded-rect panel pipeline (smooth corners, no texture). Same
 	// {vec2 pos; vec2 c} vertex layout + alpha blend + no-depth as the text
@@ -548,13 +551,15 @@ hud_font_init(HudFont &f, VkPhysicalDevice phys, VkDevice device, VkQueue queue,
 			HFLOGE("hud_font: panel pipeline failed (%d)", (int)ppr);
 			return false;
 		}
-		if (!make_buffer(phys, device, sizeof(TextVtx) * 6, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+		if (!make_buffer(phys, device, sizeof(TextVtx) * 6 * HUD_FONT_MAX_SLOTS,
+		                 VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
 		                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
 		                 f.panel_vbuf, f.panel_vbuf_mem)) {
 			HFLOGE("hud_font: panel vbuf failed");
 			return false;
 		}
-		vkMapMemory(device, f.panel_vbuf_mem, 0, sizeof(TextVtx) * 6, 0, &f.panel_vbuf_mapped);
+		vkMapMemory(device, f.panel_vbuf_mem, 0, sizeof(TextVtx) * 6 * HUD_FONT_MAX_SLOTS, 0,
+		            &f.panel_vbuf_mapped);
 	}
 
 	f.ready = true;
@@ -573,7 +578,7 @@ hud_font_build(HudFont &f, const char *text, float ox, float oy, float ndc_per_p
 	if (!f.ready || !f.vbuf_mapped || !text) {
 		return 0;
 	}
-	TextVtx *v = (TextVtx *)f.vbuf_mapped;
+	TextVtx *v = (TextVtx *)f.vbuf_mapped + (f.slot % HUD_FONT_MAX_SLOTS) * kMaxVerts;
 	uint32_t n = 0;
 	const stbtt_bakedchar *cd = (const stbtt_bakedchar *)f.chars;
 	float bx0 = 1e9f, by0 = 1e9f, bx1 = -1e9f, by1 = -1e9f;
@@ -639,7 +644,7 @@ hud_font_draw(HudFont &f, VkCommandBuffer cmd, const float mvp[16], const float 
 	memcpy(push + 16, color, sizeof(float) * 4);
 	vkCmdPushConstants(cmd, f.pipe_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 	                   0, sizeof(push), push);
-	VkDeviceSize off = 0;
+	VkDeviceSize off = sizeof(TextVtx) * kMaxVerts * (f.slot % HUD_FONT_MAX_SLOTS);
 	vkCmdBindVertexBuffers(cmd, 0, 1, &f.vbuf, &off);
 	vkCmdDraw(cmd, vert_count, 1, 0, 0);
 }
@@ -653,7 +658,8 @@ hud_font_draw_panel(HudFont &f, VkCommandBuffer cmd, const float mvp[16], float 
 	}
 	const float hx = 0.5f * (x1 - x0), hy = 0.5f * (y1 - y0);
 	// 6 verts: NDC corner + centered coord (corner relative to panel center).
-	TextVtx *v = (TextVtx *)f.panel_vbuf_mapped;
+	const uint32_t slot = f.slot % HUD_FONT_MAX_SLOTS;
+	TextVtx *v = (TextVtx *)f.panel_vbuf_mapped + slot * 6;
 	v[0] = {{x0, y0}, {-hx, -hy}};
 	v[1] = {{x1, y0}, {hx, -hy}};
 	v[2] = {{x1, y1}, {hx, hy}};
@@ -672,7 +678,7 @@ hud_font_draw_panel(HudFont &f, VkCommandBuffer cmd, const float mvp[16], float 
 	vkCmdPushConstants(cmd, f.panel_layout,
 	                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push),
 	                   push);
-	VkDeviceSize off = 0;
+	VkDeviceSize off = sizeof(TextVtx) * 6 * slot;
 	vkCmdBindVertexBuffers(cmd, 0, 1, &f.panel_vbuf, &off);
 	vkCmdDraw(cmd, 6, 1, 0, 0);
 }

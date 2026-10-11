@@ -21,6 +21,7 @@
 #define HUD_FONT_FIRST_CHAR 32
 #define HUD_FONT_NUM_CHARS 96      // ASCII 32..127
 #define HUD_FONT_MAX_QUADS 256     // plenty for a few short lines
+#define HUD_FONT_MAX_SLOTS 8       // >= dxr::VkFrameRing frames in flight (clamped 1..8)
 
 struct HudFontBakedChar {          // mirrors stbtt_bakedchar (avoids leaking stb in the header)
 	uint16_t x0, y0, x1, y1;
@@ -56,6 +57,10 @@ struct HudFont {
 	void *panel_vbuf_mapped = nullptr;
 
 	// Persistently-mapped glyph quad vertex buffer ({vec2 pos; vec2 uv}).
+	// Both vertex buffers hold HUD_FONT_MAX_SLOTS regions; build/draw use the
+	// region of `slot` — the host sets it to its frame-ring slot each frame so
+	// a rebuild never overwrites vertices an in-flight frame still reads.
+	uint32_t slot = 0;
 	VkBuffer vbuf = VK_NULL_HANDLE;
 	VkDeviceMemory vbuf_mem = VK_NULL_HANDLE;
 	void *vbuf_mapped = nullptr;

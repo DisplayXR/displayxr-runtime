@@ -63,6 +63,7 @@
 #include <android/asset_manager.h>
 #include "crate_scene.h"
 #include "hud_font.h"
+#include <vk_frame_ring.h>
 
 #define LOG_TAG "cube_handle_vk_android"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -401,7 +402,11 @@ srgb_to_linear(float c)
 {
 	return c <= 0.04045f ? c / 12.92f : powf((c + 0.055f) / 1.055f, 2.4f);
 }
-VkCommandPool g_app_cmd_pool = VK_NULL_HANDLE;
+// Frame submission ring (dxr::VkFrameRing, displayxr-common): 3 frames in
+// flight, ONE submit per frame, never a wait on the frame just submitted —
+// INV-4.10 / #1917 (a per-frame submit + vkQueueWaitIdle parks the Adreno
+// governor at ~1/3 clock). Owns the per-frame command buffers + fences.
+dxr::VkFrameRing g_ring;
 
 // Graphics pipeline state for the triangle renderer.
 VkRenderPass g_render_pass = VK_NULL_HANDLE;
@@ -420,10 +425,13 @@ constexpr uint32_t kCubeVertexCount = 36;
 // In-frame HUD: a persistently-mapped host-visible vertex buffer of CubeVertex
 // quads, rebuilt each frame and drawn with an identity MVP (screen-space NDC).
 // Android widgets can't overlay the runtime's display window, so the HUD lives
-// inside the rendered frame.
+// inside the rendered frame. One kHudMaxVerts region PER FRAME-RING SLOT: with
+// several frames in flight, rebuilding a single shared region would overwrite
+// vertices a still-executing frame is reading.
 VkBuffer g_hud_vbuf = VK_NULL_HANDLE;
 VkDeviceMemory g_hud_vbuf_mem = VK_NULL_HANDLE;
 void *g_hud_mapped = nullptr;
+uint32_t g_hud_slots = 1;
 constexpr uint32_t kHudMaxVerts = 8192;
 
 // Authoritative 4-way display rotation, pushed from MainActivity (Surface
@@ -1341,18 +1349,16 @@ create_scene()
 	                        g_render_pass, g_asset_manager, g_scene_linear);
 }
 
-// Standalone command pool for the test app's per-frame cmd buffers.
-// Created lazily once the session + swapchains exist.
+// Frame ring for the per-frame command buffers (INV-4.10). Created lazily once
+// the session + swapchains exist. Android processes have no usable environment,
+// so the frames-in-flight count is passed explicitly.
 bool
-create_cmd_pool()
+create_frame_ring()
 {
-	VkCommandPoolCreateInfo ci = {};
-	ci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-	ci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-	ci.queueFamilyIndex = g_vk_queue_family;
-	VkResult res = vkCreateCommandPool(g_vk_device, &ci, nullptr, &g_app_cmd_pool);
-	if (res != VK_SUCCESS) {
-		LOGE("vkCreateCommandPool failed: %d", res);
+	dxr::VkFrameRing::Config cfg;
+	cfg.framesInFlight = 3;
+	if (!g_ring.init(g_vk_device, g_vk_phys_device, g_vk_queue, g_vk_queue_family, cfg)) {
+		LOGE("frame ring init failed");
 		return false;
 	}
 	return true;
@@ -1381,12 +1387,9 @@ destroy_reference_space()
 }
 
 void
-destroy_cmd_pool()
+destroy_frame_ring()
 {
-	if (g_app_cmd_pool != VK_NULL_HANDLE && g_vk_device != VK_NULL_HANDLE) {
-		vkDestroyCommandPool(g_vk_device, g_app_cmd_pool, nullptr);
-		g_app_cmd_pool = VK_NULL_HANDLE;
-	}
+	g_ring.destroy();
 }
 
 // Record + submit a clear-to-color cmd buffer on the swapchain image
@@ -1629,6 +1632,20 @@ create_render_pass()
 	subpass.pColorAttachments = &color_ref;
 	subpass.pDepthStencilAttachment = &depth_ref;
 
+	// The single atlas depth image is shared by every frame, and with the frame
+	// ring (INV-4.10) several frames are in flight — order this frame's depth
+	// clear/writes after the previous frame's (WAW across submits).
+	VkSubpassDependency depth_dep = {};
+	depth_dep.srcSubpass = VK_SUBPASS_EXTERNAL;
+	depth_dep.dstSubpass = 0;
+	depth_dep.srcStageMask =
+	    VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+	depth_dep.dstStageMask =
+	    VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+	depth_dep.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+	depth_dep.dstAccessMask =
+	    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
 	VkAttachmentDescription attachments[2] = {color, depth};
 	VkRenderPassCreateInfo rpci = {};
 	rpci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
@@ -1636,6 +1653,8 @@ create_render_pass()
 	rpci.pAttachments = attachments;
 	rpci.subpassCount = 1;
 	rpci.pSubpasses = &subpass;
+	rpci.dependencyCount = 1;
+	rpci.pDependencies = &depth_dep;
 
 	VkResult res = vkCreateRenderPass(g_vk_device, &rpci, nullptr, &g_render_pass);
 	if (res != VK_SUCCESS) {
@@ -2050,7 +2069,8 @@ build_hud(CubeVertex *v)
 static bool
 create_hud_buffer()
 {
-	const VkDeviceSize size = sizeof(CubeVertex) * kHudMaxVerts;
+	g_hud_slots = g_ring.framesInFlight() > 0 ? g_ring.framesInFlight() : 1;
+	const VkDeviceSize size = sizeof(CubeVertex) * kHudMaxVerts * g_hud_slots;
 	VkBufferCreateInfo bci = {};
 	bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
 	bci.size = size;
@@ -2074,12 +2094,13 @@ create_hud_buffer()
 		return false;
 	}
 	vkBindBufferMemory(g_vk_device, g_hud_vbuf, g_hud_vbuf_mem, 0);
-	// Persistently mapped (host-coherent): rebuilt each frame in record_atlas.
+	// Persistently mapped (host-coherent): rebuilt each frame in record_atlas,
+	// into the current ring slot's region.
 	if (vkMapMemory(g_vk_device, g_hud_vbuf_mem, 0, size, 0, &g_hud_mapped) != VK_SUCCESS) {
 		LOGE("map HUD vertex buffer failed");
 		return false;
 	}
-	DXR_HW_DBG("HUD vertex buffer created (%u verts max)", kHudMaxVerts);
+	DXR_HW_DBG("HUD vertex buffer created (%u verts max x %u slots)", kHudMaxVerts, g_hud_slots);
 	return true;
 }
 
@@ -2241,20 +2262,13 @@ record_atlas(uint32_t image_idx, const XrView *views, uint32_t view_count, uint3
              uint32_t render_h, uint32_t cols, uint32_t rows, bool swap_lr, const XrPosef &rig_pose)
 {
 	(void)rows;
-	VkCommandBufferAllocateInfo ai = {};
-	ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-	ai.commandPool = g_app_cmd_pool;
-	ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-	ai.commandBufferCount = 1;
-	VkCommandBuffer cmd = VK_NULL_HANDLE;
-	if (vkAllocateCommandBuffers(g_vk_device, &ai, &cmd) != VK_SUCCESS) {
+	// The ring waits only the fence of the frame that used this slot N frames
+	// ago, then hands back its (reset, begun) command buffer.
+	VkCommandBuffer cmd = g_ring.beginFrame();
+	if (cmd == VK_NULL_HANDLE) {
 		return false;
 	}
-
-	VkCommandBufferBeginInfo bi = {};
-	bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-	vkBeginCommandBuffer(cmd, &bi);
+	const uint32_t slot = g_ring.slotIndex();
 
 	// LOAD_OP_CLEAR fills the WHOLE atlas (every tile) once at render-pass
 	// begin. Dark blue, matching cube_handle_vk_win's scene background.
@@ -2329,14 +2343,16 @@ record_atlas(uint32_t image_idx, const XrView *views, uint32_t view_count, uint3
 	uint32_t hud_n = 0;
 	const Mat4 hud_mvp = mat4_identity();
 	const bool hud_ok = (g_hud_vbuf != VK_NULL_HANDLE && g_hud_mapped != nullptr);
+	const uint32_t hud_slot = slot % g_hud_slots;
 	if (hud_ok) {
-		hud_n = build_hud(reinterpret_cast<CubeVertex *>(g_hud_mapped));
+		hud_n = build_hud(reinterpret_cast<CubeVertex *>(g_hud_mapped) + hud_slot * kHudMaxVerts);
 	}
 
 	// Build the crisp stb_truetype text once per frame (drawn per tile below,
 	// on top of the translucent panel). The panel top-left is (-0.975,-0.800).
 	uint32_t hud_text_n = 0;
 	float hud_bbox[4] = {0, 0, 0, 0};  // tight text bounds (NDC) → snug panel
+	g_hud_font.slot = slot;  // per-slot glyph/panel vertex regions (frames in flight)
 	if (g_hud_font.ready) {
 		char xb[16], yb[16], zb[16], block[80];
 		hud_ftoa(g_eye_x.load(std::memory_order_relaxed), xb, sizeof xb);
@@ -2398,7 +2414,7 @@ record_atlas(uint32_t image_idx, const XrView *views, uint32_t view_count, uint3
 			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipeline);
 			vkCmdPushConstants(cmd, g_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
 			                   sizeof(hud_mvp), &hud_mvp);
-			VkDeviceSize hud_off = 0;
+			VkDeviceSize hud_off = sizeof(CubeVertex) * kHudMaxVerts * hud_slot;
 			vkCmdBindVertexBuffers(cmd, 0, 1, &g_hud_vbuf, &hud_off);
 			// Pass 1: translucent panel (blend-constant alpha < 1).
 			if (g_hud_panel_n > 0) {
@@ -2427,19 +2443,14 @@ record_atlas(uint32_t image_idx, const XrView *views, uint32_t view_count, uint3
 	}
 
 	vkCmdEndRenderPass(cmd);
-	vkEndCommandBuffer(cmd);
 
-	VkSubmitInfo si = {};
-	si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-	si.commandBufferCount = 1;
-	si.pCommandBuffers = &cmd;
-	VkResult res = vkQueueSubmit(g_vk_queue, 1, &si, VK_NULL_HANDLE);
-	if (res == VK_SUCCESS) {
-		// Host stall — acceptable for this test app; xrEndFrame needs the
-		// atlas image ready and there's no per-frame fence wired yet.
-		vkQueueWaitIdle(g_vk_queue);
+	// ONE submit with the slot fence and NO wait. The runtime composes on the
+	// same VkQueue, so the caller releases the swapchain image only after this
+	// (queue order puts our work ahead of the compose).
+	VkResult res = g_ring.endFrame();
+	if (res != VK_SUCCESS) {
+		LOGE("record_atlas: frame submit failed: %d", (int)res);
 	}
-	vkFreeCommandBuffers(g_vk_device, g_app_cmd_pool, 1, &cmd);
 
 	DXR_HW_DBG_ONCE("record_atlas: first successful tiled-atlas submit");
 	return res == VK_SUCCESS;
@@ -2768,6 +2779,7 @@ render_frame()
 				res = xrWaitSwapchainImage(g_atlas.swapchain, &wait_img);
 			}
 			if (res == XR_SUCCESS) {
+				// Submits the frame (ring endFrame) BEFORE the release below.
 				record_atlas(img_idx, views, submit_views, render_w, render_h, cols, rows, swap_lr,
 				             rig_pose);
 
@@ -2885,10 +2897,12 @@ destroy_vulkan()
 void
 destroy_instance()
 {
-	// Tear down in reverse-creation order: cmd_pool → space → swapchains
+	// Tear down in reverse-creation order: frame ring → space → swapchains
 	// → session → Vulkan → instance. Doing it any other way invalidates
 	// handles still referenced by the runtime / loader. Drain GPU
-	// before per-view image destruction (audit B6).
+	// before per-view image destruction (audit B6): the frame ring's
+	// in-flight frames first, then the whole device.
+	g_ring.waitAll();
 	if (g_vk_device != VK_NULL_HANDLE) {
 		vkDeviceWaitIdle(g_vk_device);
 	}
@@ -2905,7 +2919,7 @@ destroy_instance()
 	}
 	destroy_pipeline();
 	destroy_render_pass();
-	destroy_cmd_pool();
+	destroy_frame_ring();
 	destroy_reference_space();
 	destroy_swapchains();
 	destroy_session();
@@ -2950,7 +2964,7 @@ handle_cmd(struct android_app *app, int32_t cmd)
 			    query_display_info_and_modes() &&
 			    create_swapchains() &&
 			    create_reference_space() &&
-			    create_cmd_pool() &&
+			    create_frame_ring() &&
 			    create_render_pass() &&
 			    create_pipeline() &&
 			    create_scene() &&
