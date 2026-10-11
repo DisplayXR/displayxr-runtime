@@ -59,6 +59,7 @@ RULES = {
     "INV-4.6": "Request an sRGB swapchain (and store a correctly-encoded image); don't double-encode. A UNORM swapchain is read as LINEAR and encoded by the runtime (#1589), so display-referred bytes in it wash out. Checked per leg: every platform directory must choose _SRGB first.",
     "INV-4.7": "Write every pixel of the imageRect you declare — clear partial-tile renders to (0,0,0,0) first (or shrink the rect); undefined pixels read as opaque magenta on MoltenVK and break transparent-bg.",
     "INV-4.9": "An app that enables XR_EXT_view_configuration_views_change must not call xrCreateSwapchain from its event handler — move subImage.imageRect instead (an app sized at maxImageRect* per ADR-010 never needs to reallocate).",
+    "INV-4.10": "(Vulkan) Frame-submit discipline: >=2 frames in flight, ONE vkQueueSubmit per frame per queue, never wait the fence of the frame just submitted, no vkQueueWaitIdle/vkDeviceWaitIdle on the frame path, command buffers allocated once and reset (dxr::VkFrameRing, displayxr-common >= v2.28.0). Advisory (WARN). Heuristic: per enclosing function of each vkQueueSubmit (brace-matched; +-60-line window fallback), judged only when the function is on the frame path (draw/render pass/dispatch/xrWaitFrame/xrBeginFrame/xrEndFrame, or a render/draw/frame/present name); exempt with `// dxr-lint: allow-blocking-submit <reason>` on the submit or function-header line.",
     "INV-5.9": "VK apps MUST use XR_KHR_vulkan_enable2 (the runtime creates the VkDevice via xrCreateVulkanDeviceKHR); an app-side vkCreateDevice = enable1, which forfeits the #868 weave-rate decoupling and the late-weave pacing.",
     "INV-7.x": "Capture via xrCaptureAtlasDXR — never reintroduce an app-side CaptureAtlasRegion* readback.",
     "INV-7.2": "xrCaptureAtlasDXR pathPrefix takes NO extension; the runtime appends _atlas.png.",
@@ -781,6 +782,258 @@ def check_views_change_realloc(root: Path, findings: list):
                 break  # one finding per handler region is enough
 
 
+# ---------------------------------------------------------------------------
+# INV-4.10 — Vulkan frame-submit discipline (advisory, WARN).
+#
+# A frame loop that submits, then drains (vkQueueWaitIdle / vkDeviceWaitIdle /
+# vkWaitForFences on the fence it just passed), never overlaps CPU and GPU. On a
+# desktop dGPU that costs only the overlap; on a mobile GPU governor
+# (msm-adreno-tz, Adreno 740) the GPU never looks busy and is parked at about a
+# third of its clock (#1917: ~10 fps -> 30 fps in modelviewer#170 once 3 frames
+# were kept in flight with ONE submit per frame). Per-frame
+# vkAllocateCommandBuffers / vkFreeCommandBuffers adds an alloc + zero cost on
+# Adreno (#1935/#1936). The sanctioned shape is displayxr-common's
+# dxr::VkFrameRing (common/vk_frame_ring.h, >= v2.28.0).
+# ---------------------------------------------------------------------------
+
+VK_DISCIPLINE_EXTS = {".c", ".cc", ".cpp", ".cxx", ".mm"}
+VK_SUBMIT_RE = re.compile(r"\bvkQueueSubmit2?(?:KHR)?\s*\(")
+VK_DRAIN_RE = re.compile(r"\b(vkQueueWaitIdle|vkDeviceWaitIdle)\s*\(")
+VK_WAIT_FENCES_RE = re.compile(r"\bvkWaitForFences\s*\(")
+VK_ALLOC_CB_RE = re.compile(r"\bvkAllocateCommandBuffers\s*\(")
+VK_FREE_CB_RE = re.compile(r"\bvkFreeCommandBuffers\s*\(")
+# "This function is on the steady-state frame path": it records drawing (a draw,
+# a render pass, a dispatch) or drives the OpenXR frame cycle
+# (xrWaitFrame/xrBeginFrame/xrEndFrame — NOT the swapchain acquire/release, which
+# one-off static quad-layer fills also call), or its
+# name says render/draw/frame/present ("Renderer" excluded — that is an init
+# function's name, e.g. InitializeVulkanRenderer). A function with none of these
+# is treated as a one-off upload/clear helper — the allowed exception.
+VK_FRAME_BODY_RE = re.compile(
+    r"\bvkCmdDraw\w*\s*\(|\bvkCmdBeginRenderPass\w*\s*\(|\bvkCmdBeginRendering\w*\s*\("
+    r"|\bvkCmdDispatch\w*\s*\(|\bxr(?:WaitFrame|BeginFrame|EndFrame)\s*\("
+)
+VK_FRAME_NAME_RE = re.compile(r"render(?!er)|draw|frame|present", re.IGNORECASE)
+VK_DISCIPLINE_EXEMPT = "dxr-lint: allow-blocking-submit"
+# Fallback window (lines either side of the submit) when no enclosing function
+# body can be delimited.
+VK_DISCIPLINE_WINDOW = 60
+_CONTROL_HEADER_RE = re.compile(r"\b(?:if|for|while|switch|catch)\s*\(|^(?:else|do|try)\b|\belse\s*$")
+_FUNC_HEADER_RE = re.compile(
+    r"(?:(\w+)\s*\([^;{}]*\)|\]\s*(?:\([^;{}]*\))?)"          # name(args)  |  lambda ](args)
+    r"\s*(?:const|noexcept|override|final|mutable|->\s*[\w:<>*&\s]+)*\s*$"
+)
+_OBJC_METHOD_RE = re.compile(r"^\s*[-+]\s*\(")
+
+
+def _brace_pairs(text: str) -> list:
+    """(open_index, close_index) for every matched {...} in comment-stripped text,
+    skipping braces inside string and char literals."""
+    pairs, stack = [], []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in "\"'":
+            j = i + 1
+            while j < n and text[j] != c and text[j] != "\n":
+                j += 2 if text[j] == "\\" else 1
+            i = j + 1
+            continue
+        if c == "{":
+            stack.append(i)
+        elif c == "}" and stack:
+            pairs.append((stack.pop(), i))
+        i += 1
+    return pairs
+
+
+def _header_before(text: str, open_idx: int) -> tuple:
+    """The declaration text in front of a '{' (back to the previous ; { or }),
+    and its start index."""
+    j = open_idx - 1
+    while j >= 0 and text[j] not in ";{}":
+        j -= 1
+    return text[j + 1:open_idx], j + 1
+
+
+def _enclosing_function(text: str, pairs: list, pos: int):
+    """Innermost {...} enclosing `pos` whose header looks like a function (or
+    lambda / ObjC method) definition rather than a control-flow block or an
+    aggregate initializer. Returns (body_start, body_end, header_start, name)."""
+    cands = sorted((p for p in pairs if p[0] < pos < p[1]), key=lambda p: p[0], reverse=True)
+    for o, c in cands:
+        header, hstart = _header_before(text, o)
+        h = " ".join(header.split())
+        if not h:
+            continue
+        if _OBJC_METHOD_RE.match(h):
+            m = re.search(r"\)\s*(\w+)", h)
+            return (o, c, hstart, m.group(1) if m else "")
+        if _CONTROL_HEADER_RE.search(h):
+            continue
+        m = _FUNC_HEADER_RE.search(h)
+        if m:
+            return (o, c, hstart, m.group(1) or "<lambda>")
+    return None
+
+
+def _call_args(text: str, open_paren: int) -> list:
+    """Top-level comma-split arguments of the call whose '(' is at open_paren."""
+    depth, args, cur = 0, [], []
+    for ch in text[open_paren:]:
+        if ch in "([{":
+            depth += 1
+            if depth == 1:
+                continue
+        elif ch in ")]}":
+            depth -= 1
+            if depth == 0:
+                args.append("".join(cur))
+                break
+        if depth == 1 and ch == ",":
+            args.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    return [" ".join(a.split()) for a in args]
+
+
+def _norm_handle(expr: str) -> str:
+    return re.sub(r"[\s&()]", "", expr)
+
+
+def check_vk_frame_discipline(root: Path, findings: list):
+    """INV-4.10 (advisory) — Vulkan frame-submit discipline.
+
+    THE HEURISTIC, stated plainly (a text matcher, not a parser). For every
+    vkQueueSubmit in a .c/.cc/.cpp/.cxx/.mm source, find the enclosing function
+    body by brace matching (innermost {...} whose header looks like a function,
+    lambda or ObjC method; braces in string/char literals are skipped). If none
+    can be delimited, a +-VK_DISCIPLINE_WINDOW-line window around the submit is
+    used instead. Only functions on the FRAME PATH are judged — the body records
+    a draw / render pass / dispatch or calls xrWaitFrame / xrBeginFrame /
+    xrEndFrame, or the function name contains
+    render (not "renderer") / draw / frame / present. A submit in any other
+    function is treated as a one-off upload (the allowed exception) and is not
+    reported. Within a frame-path body it flags:
+      (a) vkQueueWaitIdle( or vkDeviceWaitIdle( anywhere in the body;
+      (b) vkWaitForFences( AFTER the submit whose fence list names the same
+          handle passed as vkQueueSubmit's fence argument (waiting the frame you
+          just submitted);
+      (c) vkAllocateCommandBuffers( AND vkFreeCommandBuffers( both in the body
+          (per-frame command-buffer churn).
+    Exemption: the comment `// dxr-lint: allow-blocking-submit <reason>` on the
+    submit line, or on any line of the function's header (signature through
+    opening brace), suppresses every finding for that submit.
+    """
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in VK_DISCIPLINE_EXTS:
+            continue
+        if any(part in EXCLUDE_DIRS for part in path.relative_to(root).parts[:-1]):
+            continue
+        try:
+            raw = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if "vkQueueSubmit" not in raw:
+            continue
+        text = strip_comments(raw)
+        raw_lines = raw.splitlines()
+        pairs = _brace_pairs(text)
+        reported = set()  # (body_start, sub-check) — one finding per function per check
+
+        def line_of(idx):
+            return text.count("\n", 0, idx) + 1
+
+        for sm in VK_SUBMIT_RE.finditer(text):
+            submit_line = line_of(sm.start())
+            fn = _enclosing_function(text, pairs, sm.start())
+            if fn:
+                b0, b1, hstart, name = fn
+                header_lines = range(line_of(hstart), line_of(b0) + 1)
+            else:
+                lines_all = text.split("\n")
+                lo = max(0, submit_line - 1 - VK_DISCIPLINE_WINDOW)
+                hi = min(len(lines_all), submit_line + VK_DISCIPLINE_WINDOW)
+                b0 = sum(len(l) + 1 for l in lines_all[:lo])
+                b1 = sum(len(l) + 1 for l in lines_all[:hi])
+                name, header_lines = "", range(0)
+            exempt_lines = [submit_line] + list(header_lines)
+            if any(0 < ln <= len(raw_lines) and VK_DISCIPLINE_EXEMPT in raw_lines[ln - 1]
+                   for ln in exempt_lines):
+                continue
+            body = text[b0:b1]
+            if not (VK_FRAME_BODY_RE.search(body) or (name and VK_FRAME_NAME_RE.search(name))):
+                continue  # one-off upload helper — the allowed exception
+            where = f" in `{name}()`" if name and name != "<lambda>" else ""
+            prel = rel(path, root)
+
+            # (a) queue/device drain in the same frame-path function.
+            dm = VK_DRAIN_RE.search(body)
+            if dm and (b0, "a") not in reported:
+                reported.add((b0, "a"))
+                findings.append(Finding(
+                    WARN, "INV-4.10", prel, line_of(b0 + dm.start()),
+                    f"{dm.group(1)} in the same frame-path function as vkQueueSubmit{where} — "
+                    "the CPU drains the GPU every frame, so nothing overlaps; on mobile GPU "
+                    "governors (Adreno msm-adreno-tz) the clock collapses to ~1/3 (#1917).",
+                    "Keep >=2 frames in flight with one submit per frame: dxr::VkFrameRing "
+                    "(displayxr-common common/vk_frame_ring.h, >= v2.28.0) — beginFrame() / "
+                    "tileBarrier() between tiles / endFrame(); waitAll() only on resize/teardown. "
+                    f"A genuine one-off: `// {VK_DISCIPLINE_EXEMPT} <reason>` on the submit line.",
+                ))
+
+            # (b) waiting the fence of the frame just submitted.
+            args = _call_args(text, sm.end() - 1)
+            fence = _norm_handle(args[3]) if len(args) >= 4 else ""
+            if fence and fence not in ("VK_NULL_HANDLE", "nullptr", "NULL", "0") and (b0, "b") not in reported:
+                for wm in VK_WAIT_FENCES_RE.finditer(text, sm.end(), b1):
+                    wargs = _call_args(text, wm.end() - 1)
+                    if len(wargs) >= 3 and fence in _norm_handle(wargs[2]):
+                        reported.add((b0, "b"))
+                        findings.append(Finding(
+                            WARN, "INV-4.10", prel, line_of(wm.start()),
+                            f"vkWaitForFences on `{fence}` right after submitting with it{where} — "
+                            "waiting the frame you just submitted serialises CPU and GPU (zero "
+                            "frames in flight).",
+                            "Wait the fence of the frame from N slots ago, not this one: "
+                            "dxr::VkFrameRing::beginFrame() does exactly that (displayxr-common "
+                            ">= v2.28.0). Exempt a deliberate one-off with "
+                            f"`// {VK_DISCIPLINE_EXEMPT} <reason>`.",
+                        ))
+                        break
+
+            # (d) one un-indexed fence waited BEFORE the submit that signals it:
+            # the next frame waits the previous one — at most ONE frame in flight.
+            # INFO only: a fence reached through a slot pointer (frame->fence) looks
+            # identical to the matcher, so this is a prompt to look, not a verdict.
+            if (fence and "[" not in fence and fence not in ("VK_NULL_HANDLE", "nullptr", "NULL", "0")
+                    and (b0, "b") not in reported and (b0, "d") not in reported):
+                for wm in VK_WAIT_FENCES_RE.finditer(text, b0, sm.start()):
+                    wargs = _call_args(text, wm.end() - 1)
+                    if len(wargs) >= 3 and fence == _norm_handle(wargs[2]):
+                        reported.add((b0, "d"))
+                        findings.append(Finding(
+                            INFO, "INV-4.10", prel, line_of(wm.start()),
+                            f"Single fence `{fence}` waited at the top of the frame and signalled "
+                            f"by its submit{where} — at most one frame in flight (INV-4.10 asks for >=2).",
+                            "Use a ring of N>=2 fences/command buffers indexed by frame slot "
+                            "(dxr::VkFrameRing, displayxr-common >= v2.28.0, defaults to 3).",
+                        ))
+                        break
+
+            # (c) per-frame command-buffer allocation.
+            am = VK_ALLOC_CB_RE.search(body)
+            if am and VK_FREE_CB_RE.search(body) and (b0, "c") not in reported:
+                reported.add((b0, "c"))
+                findings.append(Finding(
+                    WARN, "INV-4.10", prel, line_of(b0 + am.start()),
+                    f"vkAllocateCommandBuffers + vkFreeCommandBuffers in a frame-path function{where} — "
+                    "per-frame command-buffer churn (Adreno pays a fresh zeroed allocation each "
+                    "time, #1935/#1936).",
+                    "Allocate one command buffer per frame slot once and vkResetCommandBuffer() it "
+                    "(dxr::VkFrameRing does this).",
+                ))
 
 
 # ---------------------------------------------------------------------------
@@ -1142,6 +1395,7 @@ def main(argv=None) -> int:
     check_mcp_pairing(root, findings)
     check_manual_tracking_event(root, findings)
     check_views_change_realloc(root, findings)
+    check_vk_frame_discipline(root, findings)
     check_android(root, findings)
     findings = dedupe(findings)
     print_findings(findings, root)
