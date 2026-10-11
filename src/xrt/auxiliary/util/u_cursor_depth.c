@@ -273,26 +273,40 @@ u_cursor_depth_place_anchored(const struct u_cursor_depth_geometry *g,
 	}
 
 	// HYBRID.
-	const bool moved =
-	    !anchor->has_anchor || reprimed || fabsf(u - anchor->last_u) > U_CURSOR_DEPTH_ANCHOR_MOVE_EPS ||
-	    fabsf(v - anchor->last_v) > U_CURSOR_DEPTH_ANCHOR_MOVE_EPS || !(anchor->eye_to_canvas > 0.0f);
-	if (moved) {
-		// Screen placement (already in *out_position); remember this line of sight.
-		anchor->eye = g->eye;
-		anchor->canvas_point = g->canvas_point;
-		anchor->eye_to_canvas = g->eye_to_canvas;
-		anchor->last_u = u;
-		anchor->last_v = v;
-		anchor->last_ns = now_ns;
-		anchor->has_anchor = true;
-		return;
+	bool moved = !anchor->has_anchor || reprimed || fabsf(u - anchor->last_u) > U_CURSOR_DEPTH_ANCHOR_MOVE_EPS ||
+	             fabsf(v - anchor->last_v) > U_CURSOR_DEPTH_ANCHOR_MOVE_EPS || !(anchor->eye_to_canvas > 0.0f);
+	if (!moved) {
+		// The anchor-time line of sight only means something on the canvas it
+		// was taken against. A head move leaves that plane in place; a camera
+		// rig re-converging (or any rig re-pose) moves it, and the line then
+		// points at a different canvas - EarthView's horizon framing went from
+		// e0 = 1 to e = 3.42 under a still pointer, s = 1 - 0.375 * 3.42 < 0,
+		// and the "cursor" sat behind the eye while willDraw said true.
+		const float plane_shift = v3_dot(v3_sub(anchor->canvas_point, g->canvas_point), g->forward);
+		const float facing = v3_dot(anchor->forward, g->forward);
+		moved = !(fabsf(plane_shift) <= U_CURSOR_DEPTH_ANCHOR_PLANE_EPS * g->eye_to_canvas) ||
+		        !(facing >= 1.0f - 1e-5f);
 	}
 	// Pointer still: the point on the anchor-time line of sight E0 -> S0 whose
 	// distance in front of the glass is the CURRENT depth, lift. Same geometry
 	// gives s = t (continuous at the stop); a lateral head move leaves s and so
 	// C unchanged (world-fixed, parallax like content); a depth change slides C
 	// along that line, so from E0 it stays on S0 (the click point).
-	const float s = 1.0f - lift / anchor->eye_to_canvas;
+	const float s = moved ? 0.0f : 1.0f - lift / anchor->eye_to_canvas;
+	// s <= 0 is C on or behind E0 (the head moved back past e0 / (1 - t)):
+	// never place it there - re-anchor on the current line of sight instead.
+	if (moved || !(s > 0.0f) || !isfinite(s)) {
+		// Screen placement (already in *out_position); remember this line of sight.
+		anchor->eye = g->eye;
+		anchor->canvas_point = g->canvas_point;
+		anchor->eye_to_canvas = g->eye_to_canvas;
+		anchor->forward = g->forward;
+		anchor->last_u = u;
+		anchor->last_v = v;
+		anchor->last_ns = now_ns;
+		anchor->has_anchor = true;
+		return;
+	}
 	*out_position = v3_add_scaled(anchor->eye, v3_sub(anchor->canvas_point, anchor->eye), s);
 }
 
@@ -532,6 +546,41 @@ u_cursor_draw_view_from_placement(const struct u_cursor_depth_view *view,
 	out->axis_y[0] = ay[0] - o[0];
 	out->axis_y[1] = ay[1] - o[1];
 	return true;
+}
+
+bool
+u_cursor_draw_placement_drawable(const struct u_cursor_depth_view *views,
+                                 uint32_t view_count,
+                                 const struct xrt_vec3 *center,
+                                 const struct xrt_quat *orientation,
+                                 float unit,
+                                 struct u_cursor_draw_view *out_views)
+{
+	if (views == NULL || center == NULL || orientation == NULL || view_count < 2 || view_count > XRT_MAX_VIEWS) {
+		return false;
+	}
+	bool hotspot_in_a_tile = false;
+	for (uint32_t i = 0; i < view_count; i++) {
+		struct u_cursor_draw_view m;
+		if (!u_cursor_draw_view_from_placement(&views[i], center, orientation, unit, &m)) {
+			return false; // behind (or on) an eye, or a degenerate view
+		}
+		// The sprite map must be finite and neither collapse to nothing nor
+		// blow up (a point grazing the eye plane): one unit is a canvas
+		// height, ~1 tile at the glass, so 1e-4 .. 1e4 tiles is generous.
+		const float lx = sqrtf(m.axis_x[0] * m.axis_x[0] + m.axis_x[1] * m.axis_x[1]);
+		const float ly = sqrtf(m.axis_y[0] * m.axis_y[0] + m.axis_y[1] * m.axis_y[1]);
+		if (!(lx > 1e-4f && lx < 1e4f) || !(ly > 1e-4f && ly < 1e4f)) {
+			return false;
+		}
+		if (m.origin[0] >= 0.0f && m.origin[0] <= 1.0f && m.origin[1] >= 0.0f && m.origin[1] <= 1.0f) {
+			hotspot_in_a_tile = true;
+		}
+		if (out_views != NULL) {
+			out_views[i] = m;
+		}
+	}
+	return hotspot_in_a_tile;
 }
 
 bool

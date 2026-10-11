@@ -2494,6 +2494,8 @@ oxr_session_arm_cursor_draw(struct oxr_session *sess,
                             const struct u_cursor_depth_geometry *g,
                             float disparity,
                             const struct xrt_vec3 *position,
+                            const XrView *views,
+                            uint32_t active_view_count,
                             XrCursorDepthDrawStateDXR *draw_state)
 {
 	if (!draw_info->visible) {
@@ -2515,10 +2517,12 @@ oxr_session_arm_cursor_draw(struct oxr_session *sess,
 		}
 		return;
 	}
-	// The last armed frame's projection layer was not in the locate space:
-	// still arm (xrEndFrame re-checks the space, so a fixed app recovers),
-	// but report and draw nothing for this frame.
-	const bool will_draw = !(sess->cursor_draw.cannot_draw && sess->cursor_draw.space == viewLocateInfo->space);
+	// The last armed frame's projection layer was not in the locate space,
+	// or its placement mapped to no pixels in the submitted views: still arm
+	// (xrEndFrame re-checks, so a fixed app recovers), but report and draw
+	// nothing for this frame.
+	const bool will_draw = !(sess->cursor_draw.cannot_draw && sess->cursor_draw.space == viewLocateInfo->space) &&
+	                       !sess->cursor_draw.draw_failed;
 
 	struct oxr_swapchain *image = NULL;
 	if (draw_info->image != XR_NULL_HANDLE) {
@@ -2537,6 +2541,27 @@ oxr_session_arm_cursor_draw(struct oxr_session *sess,
 	const float t = 1.0f / (1.0f - disparity);
 	const float unit = g->canvas_height * t;
 	if (!(unit > 0.0f) || !isfinite(unit)) {
+		return;
+	}
+
+	// The willDraw contract: report true only for a placement that maps to
+	// cursor pixels in THESE views - the same projection xrEndFrame and the
+	// compositor use. Otherwise the app would hide its OS cursor for a frame
+	// that draws no cursor at all.
+	struct u_cursor_depth_view located[XRT_MAX_VIEWS];
+	const uint32_t n = active_view_count < XRT_MAX_VIEWS ? active_view_count : XRT_MAX_VIEWS;
+	for (uint32_t i = 0; i < n; i++) {
+		// XrPosef/XrFovf are layout-identical to xrt_pose/xrt_fov.
+		located[i].pose = *(const struct xrt_pose *)&views[i].pose;
+		located[i].fov = *(const struct xrt_fov *)&views[i].fov;
+	}
+	if (!u_cursor_draw_placement_drawable(located, n, position, &g->orientation, unit, NULL)) {
+		if (!sess->cursor_draw.warned_undrawable) {
+			sess->cursor_draw.warned_undrawable = true;
+			U_LOG_W(
+			    "XR_DXR_cursor_depth: the cursor placement maps to no pixels in the located views - not "
+			    "drawn, reporting willDraw = false (one-time warning)");
+		}
 		return;
 	}
 
@@ -2699,7 +2724,8 @@ oxr_session_fill_cursor_depth(struct oxr_session *sess,
 	out->height = height;
 
 	if (draw_info != NULL) {
-		oxr_session_arm_cursor_draw(sess, viewLocateInfo, draw_info, &g, disparity, &position, draw_state);
+		oxr_session_arm_cursor_draw(sess, viewLocateInfo, draw_info, &g, disparity, &position, views,
+		                            active_view_count, draw_state);
 	}
 }
 #endif // OXR_HAVE_DXR_cursor_depth

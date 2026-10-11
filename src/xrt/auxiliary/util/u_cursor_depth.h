@@ -41,7 +41,9 @@
  *              on the anchor-time line at the current depth in front of the
  *              glass. Continuous at the stop; a lateral head move keeps C
  *              world-fixed (parallax); a depth change slides C along the
- *              anchor-time line, so it stays on the click point.
+ *              anchor-time line, so it stays on the click point. If the
+ *              canvas PLANE moves (a camera rig re-converging) or s would
+ *              not put C in front of the eye, it re-anchors (SCREEN).
  *
  * Pure C: time is a parameter, never read here.
  *
@@ -158,6 +160,10 @@ struct u_cursor_depth_anchor
 	struct xrt_vec3 canvas_point;
 	//! e0: E0's distance to the canvas along the normal then (> 0).
 	float eye_to_canvas;
+	//! The canvas normal (view forward) then. With S0 it pins the canvas
+	//! plane the anchor was taken against: if the plane moves (a camera rig
+	//! re-converging, a rig re-pose), the anchor is re-taken.
+	struct xrt_vec3 forward;
 	//! Pointer UV of that placement.
 	float last_u, last_v;
 	//! Time of that placement.
@@ -166,6 +172,16 @@ struct u_cursor_depth_anchor
 
 //! Pointer UV change beyond which HYBRID treats the pointer as moving.
 #define U_CURSOR_DEPTH_ANCHOR_MOVE_EPS 1e-4f
+
+/*!
+ * How far the canvas plane may move along its normal, as a fraction of the
+ * eye-to-canvas distance, before HYBRID re-anchors. A head move leaves the
+ * plane where it is (to float noise); a camera rig that re-converges, or a
+ * rig re-pose, moves it - and the anchor-time line of sight then belongs to a
+ * different canvas: s = 1 - (1 - t) e / e0 goes negative once the canvas
+ * recedes past e0 / (1 - t), which puts C BEHIND the eye.
+ */
+#define U_CURSOR_DEPTH_ANCHOR_PLANE_EPS 1e-3f
 
 void
 u_cursor_depth_tuning_defaults(struct u_cursor_depth_tuning *t);
@@ -533,6 +549,31 @@ u_cursor_draw_view_from_placement(const struct u_cursor_depth_view *view,
                                   const struct xrt_quat *orientation,
                                   float unit,
                                   struct u_cursor_draw_view *out);
+
+/*!
+ * THE drawability predicate (spec v5 willDraw contract): true only if a
+ * placement maps to cursor pixels in these views - every view sees the
+ * hotspot in front of its eye with a finite, non-degenerate sprite map
+ * (u_cursor_draw_view_from_placement), and the hotspot lands inside at least
+ * one view's tile (0..1, the zone's sub-rect for a zone-scoped locate).
+ *
+ * The state tracker evaluates it on the located views before it reports
+ * willDraw = true, and again on the submitted views before it hands the
+ * compositor a request, so the report and the draw cannot disagree.
+ *
+ * @param views      @p view_count views (>= 2), in the placement's space.
+ * @param center     The hotspot point C.
+ * @param orientation The display plane's orientation.
+ * @param unit       One sprite unit (the t-scaled canvas height).
+ * @param out_views  Optional: receives the per-view maps (@p view_count).
+ */
+bool
+u_cursor_draw_placement_drawable(const struct u_cursor_depth_view *views,
+                                 uint32_t view_count,
+                                 const struct xrt_vec3 *center,
+                                 const struct xrt_quat *orientation,
+                                 float unit,
+                                 struct u_cursor_draw_view *out_views);
 
 /*!
  * The sprite quad's corners in the tile: a sprite @p height units tall and
