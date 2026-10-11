@@ -295,7 +295,19 @@ struct xrt_screen_binding
  */
 enum xrt_display_claim_confidence
 {
-	XRT_DISPLAY_CLAIM_FALLBACK = 10,  //!< sim_display: "anything unclaimed".
+	XRT_DISPLAY_CLAIM_FALLBACK = 10, //!< sim_display: "anything unclaimed".
+	/*!
+	 * "My panel, but my backend cannot drive it yet" — e.g. a 3D panel whose
+	 * vendor service has not authenticated it after a hotplug. It outranks a
+	 * FALLBACK claim, so no other display processor weaves the panel, but the
+	 * runtime makes NO display processor for it: the screen shows flat 2D (one
+	 * view, no weave, the lens untouched) until the plug-in claims it for real
+	 * and asks for a sweep (`xrt_plugin_host_iface::request_display_rescan`).
+	 * Display hotplug, ADR-047 Amendment 7; announced by
+	 * XRT_PLUGIN_HAS_CLAIM_PRESENT_NOT_READY. An older runtime treats it as an
+	 * ordinary low claim, so the plug-in must also refuse to make a DP for it.
+	 */
+	XRT_DISPLAY_CLAIM_PRESENT_NOT_READY = 20,
 	XRT_DISPLAY_CLAIM_EDID = 50,      //!< matched my EDID table.
 	XRT_DISPLAY_CLAIM_VERIFIED = 100, //!< EDID + SDK/service/serial handshake.
 };
@@ -753,6 +765,12 @@ struct xrt_plugin_host_iface
  * runtime header can `#ifdef`-guard its use.
  */
 #define XRT_PLUGIN_HOST_HAS_DISPLAY_RESCAN 1
+
+/*!
+ * Defined when this header carries @ref XRT_DISPLAY_CLAIM_PRESENT_NOT_READY
+ * (display hotplug, ADR-047 Amendment 7).
+ */
+#define XRT_PLUGIN_HAS_CLAIM_PRESENT_NOT_READY 1
 
 /*
  *

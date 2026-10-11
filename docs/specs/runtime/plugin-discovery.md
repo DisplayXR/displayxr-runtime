@@ -570,6 +570,10 @@ comes from that screen's registry entry, mixed vendors included —
    and every create-time resolve are unchanged;
 4. the highest **confidence**, ties to the lower ProbeOrder.
 
+A winning claim at **`XRT_DISPLAY_CLAIM_PRESENT_NOT_READY`** (20) marks the registry entry
+`not_ready` and clears its DP factories: the plug-in owns the panel, nobody weaves it, and the
+compositors show it flat 2D until the plug-in claims it for real (ADR-047 Amendment 7).
+
 **Display hotplug (ADR-047 Amendment 7).** The registry is re-resolved while the process runs
 (OS display reconfiguration, a monitor-list poll, or a plug-in's `request_display_rescan`). Each
 sweep first calls `target_plugin_rescan_claim_sources`: every manifest plug-in that is not a claim

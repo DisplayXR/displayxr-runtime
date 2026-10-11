@@ -600,6 +600,7 @@ comp_metal_segments_set_screens(struct comp_metal_segments *segs,
 			    .serial = re->serial,
 			    .desktop = {re->screen_left, re->screen_top, re->pixel_width, re->pixel_height},
 			    .platform_id = re->platform_id,
+			    .not_ready = re->not_ready,
 			};
 		}
 		enum comp_segments_session_miss miss = COMP_SEG_SESSION_OWNS;
@@ -705,7 +706,10 @@ comp_metal_segments_set_screens(struct comp_metal_segments *segs,
 		U_LOG_I("segments: screen [%u] 0x%016llx '%s' %d,%d %ux%u pt, native %ux%u, scale %.2f%s%s", n,
 		        (unsigned long long)s->id, s->device_name, s->desktop_left, s->desktop_top, s->desktop_width,
 		        s->desktop_height, s->native_width, s->native_height, segs->scale[n],
-		        cs->is_primary ? " (primary)" : "", cs->has_dp_factory ? " (Metal per-screen DP)" : "");
+		        cs->is_primary ? " (primary)" : "",
+		        cs->has_dp_factory                      ? " (Metal per-screen DP)"
+		        : (e != NULL && e->not_ready) ? " (present, NOT READY: flat 2D)"
+		                                                : "");
 
 		// A live DP from the previous table for this very screen and binding.
 		for (uint32_t k = 0; k < carry_n && !cs->is_primary; k++) {

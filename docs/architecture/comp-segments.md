@@ -361,6 +361,12 @@ What a compositor does with it (Metal today; the other managers already rebuild 
   generation A -> B`, `OXR EVENT: Displays changed`, then the usual `segments:` table and
   `created a segment DP` lines.
 
+- **Present, not ready.** A screen whose winning claim is `XRT_DISPLAY_CLAIM_PRESENT_NOT_READY`
+  (its plug-in owns the panel but cannot drive it yet — a 3D panel not yet authenticated after a
+  hotplug) has no DP factory in the registry: it is segmented like any screen and shown flat 2D,
+  never woven by a fallback DP or by the session DP. `DXR_TEST_SCREEN_NOT_READY=<name|id>` forces
+  it.
+
 Test hook (macOS): `DXR_TEST_FAKE_MONITOR_FILE=<path>`. While the file holds a number S, the main
 display enumerates as two monitors cut at S points (the window can straddle the cut, since the
 WindowServer still shows one display); holding `reid`, the main display gets another identity.

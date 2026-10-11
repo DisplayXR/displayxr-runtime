@@ -454,6 +454,12 @@ comp_segments_session_dp_screen(const struct comp_segments_session_dp *sd,
 			if (c->monitor_id != sd->monitor_id) {
 				continue;
 			}
+			if (c->not_ready) {
+				// Nothing may weave a panel its plug-in cannot drive yet —
+				// not even the session DP that was made for it.
+				miss = COMP_SEG_SESSION_NOT_READY;
+				continue;
+			}
 			if (c->plugin_id == NULL || strcmp(c->plugin_id, sd->plugin_id) != 0) {
 				miss = COMP_SEG_SESSION_RECLAIMED;
 				continue;
@@ -484,6 +490,7 @@ comp_segments_session_miss_str(enum comp_segments_session_miss miss)
 	case COMP_SEG_SESSION_GONE: return "gone";
 	case COMP_SEG_SESSION_RECLAIMED: return "re-claimed";
 	case COMP_SEG_SESSION_REBOUND: return "re-bound";
+	case COMP_SEG_SESSION_NOT_READY: return "not ready (flat 2D until its plug-in can drive it)";
 	}
 	return "?";
 }

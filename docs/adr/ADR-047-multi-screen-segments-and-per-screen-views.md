@@ -419,8 +419,16 @@ there was no panel then, was never asked again. Decisions:
 - *A plug-in claims only what its backend vouches for.* SR lists a panel in `srEnumerateDisplays`
   as soon as its EDID matches (`EDID_ONLY`, no serial), before the service has authenticated the
   FPC; it turns `FPC_VERIFIED` (with the serial) only once `devices/<serial>/primary` is published.
-  The Leia macOS plug-in treats `EDID_ONLY` as present-not-ready: no `probe()` bind, no claim, no
-  `create_dp_metal_for_screen`, so no weaver and no lens touch the panel; sim-display stands in.
+  The Leia macOS plug-in treats `EDID_ONLY` as present-not-ready: no `probe()` bind and no
+  `create_dp_metal_for_screen`, so no weaver and no lens touch the panel. It claims the monitor at
+  the new **`XRT_DISPLAY_CLAIM_PRESENT_NOT_READY`** level (20, appended to the claim enum; announced
+  by `XRT_PLUGIN_HAS_CLAIM_PRESENT_NOT_READY`): it outranks the fallback's claim (so sim-display's
+  anaglyph never reaches a 3D panel), and the runtime flags the registry entry `not_ready` and
+  clears its DP factories. Every compositor then shows that screen **flat 2D** (the existing
+  "segment without a DP" path: one view, no weave, lens untouched), and a session DP made for that
+  monitor does not weave it either (`COMP_SEG_SESSION_NOT_READY`). Vendor-neutral: any plug-in whose
+  backend lags can use the level. `DXR_TEST_SCREEN_NOT_READY=<output|connector|id>` forces it for
+  a test.
   While an `EDID_ONLY` entry is listed, the plug-in polls the enumeration every 500 ms,
   **open-ended** (the SR service retries a failed authentication with a 1 s → 30 s backoff, so no
   fixed window is long enough), and on the `EDID_ONLY → FPC_VERIFIED` edge calls

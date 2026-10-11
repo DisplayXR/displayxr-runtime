@@ -4043,6 +4043,10 @@ screen_ids_equal(const char *a, const char *b)
 	return *a == *b;
 }
 
+//! Monitors the last resolve found "present, not ready" (WARN only on entry). Guarded by g_refresh_mutex.
+static uint64_t g_not_ready_prev[XRT_DP_REGISTRY_MAX_ENTRIES];
+static uint32_t g_not_ready_prev_count = 0;
+
 void
 target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
                                uint32_t descriptor_count,
@@ -4124,6 +4128,10 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 		    "<output|connector|monitor-id-hex>=<plugin-id>[,...]) — ignored",
 		    pins_malformed, pins_malformed == 1 ? "y" : "ies");
 	}
+
+	// Monitors claimed "present, not ready" in this resolve (log edges).
+	uint64_t nr_now[XRT_DP_REGISTRY_MAX_ENTRIES];
+	uint32_t nr_count = 0;
 
 	/*
 	 * The winner per monitor (target_screen_pick, unit-tested): a per-screen
@@ -4293,6 +4301,47 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 				break;
 			}
 		}
+		// Display hotplug (ADR-047 Amendment 7): "present, not ready" — the
+		// plug-in owns the panel, but no display processor may touch it yet:
+		// no factory, so every compositor shows the screen flat 2D.
+		// DXR_TEST_SCREEN_NOT_READY=<output|connector|id-hex> forces it (test).
+		{
+			struct target_screen_pins nr;
+			char spec[96];
+			const char *t = getenv("DXR_TEST_SCREEN_NOT_READY");
+			(void)snprintf(spec, sizeof(spec), "%s=x", t != NULL ? t : "");
+			const bool forced_nr = t != NULL && t[0] != '\0' &&
+			                       target_screen_pin_parse(spec, &nr, NULL) == 1 &&
+			                       target_screen_pin_find(&nr, desc->monitor_id, out_name, conn_name) == 0;
+			if (best_claim->confidence == (uint32_t)XRT_DISPLAY_CLAIM_PRESENT_NOT_READY || forced_nr) {
+				e->not_ready = true;
+				e->dp_factory_vk = NULL;
+				e->dp_factory_gl = NULL;
+				e->dp_factory_d3d11 = NULL;
+				e->dp_factory_d3d12 = NULL;
+				e->dp_factory_metal = NULL;
+				// WARN when a monitor enters the state; repeats (follow-up sweeps) at INFO.
+				bool was_nr = false;
+				for (uint32_t k = 0; k < g_not_ready_prev_count && !was_nr; k++) {
+					was_nr = g_not_ready_prev[k] == desc->monitor_id;
+				}
+				if (nr_count < XRT_DP_REGISTRY_MAX_ENTRIES) {
+					nr_now[nr_count++] = desc->monitor_id;
+				}
+				if (was_nr) {
+					U_LOG_I(
+					    "plugin loader: monitor 0x%016llx → '%s' still PRESENT, NOT READY (flat "
+					    "2D)",
+					    (unsigned long long)desc->monitor_id, e->plugin_id);
+				} else {
+					U_LOG_W(
+					    "plugin loader: monitor 0x%016llx → '%s' PRESENT, NOT READY%s — no display "
+					    "processor, the screen shows flat 2D until the plug-in claims it for real",
+					    (unsigned long long)desc->monitor_id, e->plugin_id,
+					    forced_nr ? " (DXR_TEST_SCREEN_NOT_READY)" : "");
+				}
+			}
+		}
 		if (have_screen_pref) {
 			(void)snprintf(e->preferred_plugin, sizeof(e->preferred_plugin), "%s", screen_pref);
 			e->preferred_source = (uint32_t)pref_source;
@@ -4311,6 +4360,11 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 			    (unsigned long long)e->monitor_id, e->plugin_id);
 		}
 	}
+
+	for (uint32_t i = 0; i < nr_count; i++) {
+		g_not_ready_prev[i] = nr_now[i];
+	}
+	g_not_ready_prev_count = nr_count;
 
 	for (uint32_t i = 0; i < pins.count; i++) {
 		if (!pin_used[i]) {

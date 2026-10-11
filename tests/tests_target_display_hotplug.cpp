@@ -210,6 +210,19 @@ TEST_CASE("hotplug claims: a panel plugged in while sim-display runs goes to its
 	CHECK(std::string(p.plugin) == "sim-display");
 	CHECK(p.why == TARGET_SCREEN_PICK_ACTIVE);
 
+	// The panel is listed by SR but not authenticated yet: leia-sr claims it
+	// PRESENT_NOT_READY (20). That already beats sim-display's FALLBACK claim
+	// (the carve-out), so no sim weave reaches the panel — the registry flags
+	// the entry not-ready and the screen shows flat 2D.
+	{
+		std::vector<fake_source> nr = srcs;
+		nr.insert(nr.begin(), fake_source{"leia-sr", false, {ODYSSEY}, {20}});
+		pick q = resolve(nr, ODYSSEY, nullptr, nullptr);
+		CHECK(std::string(q.plugin) == "leia-sr");
+		CHECK(q.why == TARGET_SCREEN_PICK_BETTER_RANKED);
+		CHECK(q.index == 0);
+	}
+
 	// A follow-up sweep: leia-sr probes OK now and joins the claim sources in
 	// ProbeOrder (before sim-display). Its VERIFIED claim beats the active
 	// plug-in's FALLBACK one — the carve-out — and only on the panel.

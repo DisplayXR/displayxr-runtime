@@ -537,6 +537,15 @@ TEST_CASE("comp_segments: the session DP keeps its screen only while its plug-in
 	CHECK(miss == COMP_SEG_SESSION_REBOUND);
 	CHECK(std::strcmp(comp_segments_session_miss_str(COMP_SEG_SESSION_REBOUND), "re-bound") == 0);
 
+	// Replugged under the session DP's own plug-in, which owns the panel but
+	// cannot drive it yet (EDID_ONLY): not ready — the session DP must not
+	// weave it (flat 2D instead), and gets it back once it is ready again.
+	comp_segments_session_candidate not_ready[] = {cand(DS1, "leia-sr", "", ody, 3)};
+	not_ready[0].not_ready = true;
+	CHECK(comp_segments_session_dp_screen(&sd, not_ready, 1, &miss) == -1);
+	CHECK(miss == COMP_SEG_SESSION_NOT_READY);
+	CHECK(comp_segments_session_dp_screen(&sd, as_created, 2, &miss) == 1);
+
 	// Not recorded yet: no answer.
 	comp_segments_session_dp none{};
 	CHECK(comp_segments_session_dp_screen(&none, as_created, 2, &miss) == -1);

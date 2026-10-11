@@ -2793,6 +2793,10 @@ struct xrt_dp_registry_entry
 	//! replug renumbers it); 0 = none. Display hotplug (ADR-047 Amendment 7):
 	//! part of what a session's own DP must find unchanged to keep its screen.
 	uint64_t platform_id;
+	//! The winning claim is XRT_DISPLAY_CLAIM_PRESENT_NOT_READY: the plug-in
+	//! owns the panel but cannot drive it yet. Every dp_factory_* is NULL, so
+	//! no display processor is made for it and it shows flat 2D.
+	bool not_ready;
 };
 
 /*!

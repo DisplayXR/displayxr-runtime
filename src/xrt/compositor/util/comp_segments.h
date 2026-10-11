@@ -130,6 +130,8 @@ struct comp_segments_session_candidate
 	const char *serial;
 	struct comp_seg_rect desktop;
 	uint64_t platform_id;
+	//! The claim is "present, not ready" (no DP may weave it; flat 2D).
+	bool not_ready;
 };
 
 //! Why the session DP does not own a screen (@ref comp_segments_session_dp_screen).
@@ -140,6 +142,7 @@ enum comp_segments_session_miss
 	COMP_SEG_SESSION_GONE,         //!< Its monitor is not listed (unplugged).
 	COMP_SEG_SESSION_RECLAIMED,    //!< Listed, another plug-in wins it.
 	COMP_SEG_SESSION_REBOUND,      //!< Listed, same plug-in, but another serial / place / OS handle.
+	COMP_SEG_SESSION_NOT_READY,    //!< Listed, but its plug-in cannot drive it yet (flat 2D).
 };
 
 /*!
@@ -161,7 +164,7 @@ comp_segments_session_dp_screen(const struct comp_segments_session_dp *sd,
                                 uint32_t n,
                                 enum comp_segments_session_miss *out_miss);
 
-//! A short word for @p miss ("owns", "gone", "re-claimed", "re-bound", "not recorded").
+//! A short word for @p miss ("owns", "gone", "re-claimed", "re-bound", "not ready", "not recorded").
 const char *
 comp_segments_session_miss_str(enum comp_segments_session_miss miss);
 
