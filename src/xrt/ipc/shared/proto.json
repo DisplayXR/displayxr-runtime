@@ -750,7 +750,8 @@
 			{"name": "height", "type": "uint32_t"},
 			{"name": "fence_value", "type": "uint64_t"},
 			{"name": "eyes", "type": "struct xrt_eye_positions"},
-			{"name": "segment_count", "type": "uint32_t"}
+			{"name": "segment_count", "type": "uint32_t"},
+			{"name": "lift_cursor_mask", "type": "uint32_t"}
 		],
 		"in_handles": {"type": "xrt_graphics_buffer_handle_t"}
 	},

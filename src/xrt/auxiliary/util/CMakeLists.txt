@@ -26,6 +26,8 @@ add_library(
 	u_bitwise.c
 	u_cursor_depth.c
 	u_cursor_depth.h
+	u_lift_cursor.c
+	u_lift_cursor.h
 	u_lift_depth.c
 	u_lift_depth.h
 	u_lift_mailbox.c

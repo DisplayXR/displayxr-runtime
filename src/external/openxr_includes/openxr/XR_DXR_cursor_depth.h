@@ -76,6 +76,11 @@
  * placement struct (it may still chain it, for diagnostics). Both structs are
  * new; no existing struct changed. App-drawn placement (v1-v4) is unchanged.
  *
+ * Spec v6 (ADR-046 Amendment 1, Phase 3c) adds the runtime-drawn cursor on
+ * LIFTED content (XR_DXR_lift weave rects, which have no xrLocateViews): @ref XrCursorDepthLiftRectDXR asks
+ * for it per rect, @ref XrCursorDepthLiftStateDXR reports which rects got it.
+ * Same policy (v4); the depth comes from the conversion's own depth map.
+ *
  * One call, one space. The hint is chained on XrViewLocateInfo::next and the
  * result on XrViewState::next of the SAME xrLocateViews call, and both are in
  * XrViewLocateInfo::space. The hint normally comes from the previous frame's
@@ -98,7 +103,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_cursor_depth 1
-#define XR_DXR_cursor_depth_SPEC_VERSION 5
+#define XR_DXR_cursor_depth_SPEC_VERSION 6
 #define XR_DXR_CURSOR_DEPTH_EXTENSION_NAME "XR_DXR_cursor_depth"
 
 // Reserved 1004999320-329 (next free decade after stereo_camera's 310-319).
@@ -112,6 +117,9 @@ extern "C" {
 //! Spec v5 (ADR-046 Amendment 2 B: the runtime draws).
 #define XR_TYPE_CURSOR_DEPTH_DRAW_INFO_DXR ((XrStructureType)1004999324)
 #define XR_TYPE_CURSOR_DEPTH_DRAW_STATE_DXR ((XrStructureType)1004999325)
+//! Spec v6 (ADR-046 Amendment 1, Phase 3c: the runtime-drawn cursor on lifted content).
+#define XR_TYPE_CURSOR_DEPTH_LIFT_RECT_DXR ((XrStructureType)1004999326)
+#define XR_TYPE_CURSOR_DEPTH_LIFT_STATE_DXR ((XrStructureType)1004999327)
 
 // ---- Input: app chains this on XrViewLocateInfo::next; runtime reads it. ----
 
@@ -375,6 +383,53 @@ typedef struct XrCursorDepthPlacementDXR {
     //! [-0.6, 0]; 0 when the content is on or behind the plane. Diagnostic.
     float targetDisparity;
 } XrCursorDepthPlacementDXR;
+
+// ---- Spec v6: lifted content (ADR-046 Amendment 1, Phase 3c). ----
+//
+// A 2D element lifted on a weave rect (XR_DXR_lift, XrWeaveRectLiftDXR) has no
+// app that holds its views: the runtime synthesizes them and weaves them. So
+// for such a rect the RUNTIME draws the cursor, into the lifted views, placed
+// from the conversion's own depth map. Requires XR_DXR_lift and XR_DXR_weave,
+// and a lift stream created with XrLiftDepthRequestDXR (no depth, no cursor).
+
+/*!
+ * @brief Request a depth-aware cursor on one lifted rect (spec v6).
+ *
+ * Chain on XrWeaveRectLiftDXR::next. Chaining it IS the request, and it covers
+ * THIS weave submit only: chain it on every submit for as long as you want the
+ * cursor. A rect without it costs the runtime nothing (ADR-046 section 0).
+ *
+ * The runtime reads the OS cursor position itself when it draws, maps it into
+ * the bound window, and draws the cursor only on the rect it is over, with the
+ * same margin, comfort clamp and smoothing as every DisplayXR depth cursor.
+ * It reports what it drew in @ref XrCursorDepthLiftStateDXR; hide the OS
+ * cursor over the rect only for a frame it reports drawn, so the failure mode
+ * is the flat OS cursor, never no cursor.
+ */
+typedef struct XrCursorDepthLiftRectDXR {
+    XrStructureType          type;  //!< Must be XR_TYPE_CURSOR_DEPTH_LIFT_RECT_DXR
+    const void* XR_MAY_ALIAS next;
+    uint32_t                 flags; //!< Reserved, must be 0.
+} XrCursorDepthLiftRectDXR;
+
+/*!
+ * @brief Which lifted rects got the runtime's cursor this submit (spec v6).
+ *
+ * Chain on XrWeaveOutputDXR::next of a submit that requested a cursor on any
+ * rect; filled on every successful submit (0 when it drew none).
+ */
+typedef struct XrCursorDepthLiftStateDXR {
+    XrStructureType    type; //!< Must be XR_TYPE_CURSOR_DEPTH_LIFT_STATE_DXR
+    void* XR_MAY_ALIAS next;
+    /*!
+     * Bit i set = the runtime drew the cursor into lifts[i] of this submit's
+     * XrWeaveSubmitLiftRectsDXR in the output just woven. Clear for every
+     * rect it could not place it on: no depth or display mapping for that
+     * frame, the cursor not over the rect, the views shown flat (2D), or a
+     * workspace cursor already drawn.
+     */
+    uint32_t drawnLiftMask;
+} XrCursorDepthLiftStateDXR;
 
 #ifdef __cplusplus
 }

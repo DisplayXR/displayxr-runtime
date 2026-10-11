@@ -766,12 +766,14 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         uint32_t *out_height,
                                         uint64_t *out_fence_value,
                                         struct xrt_eye_positions *out_eyes,
-                                        uint32_t *out_segment_count)
+                                        uint32_t *out_segment_count,
+                                        uint32_t *out_lift_cursor_mask)
 {
 	if (xc == NULL || out_have_output == NULL || out_width == NULL || out_height == NULL ||
-	    out_fence_value == NULL || out_eyes == NULL) {
+	    out_fence_value == NULL || out_eyes == NULL || out_lift_cursor_mask == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
+	*out_lift_cursor_mask = 0;
 	if (rect_count > IPC_WEAVE_SUBMIT_RECTS_MAX || (rect_count > 0 && rects == NULL)) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
@@ -822,10 +824,11 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
 	uint64_t fv = 0;
 	struct xrt_eye_positions eyes = {0};
 	uint32_t segs = 0;
+	uint32_t lift_cursor_mask = 0;
 	// Generated arg order: in args, then in_handles (handles, count), then out
 	// args. This copies the handles, it does not consume them.
-	xrt_result_t xret =
-	    ipc_call_weave_submit(icc->ipc_c, &args, handles, handle_count, &have, &w, &h, &fv, &eyes, &segs);
+	xrt_result_t xret = ipc_call_weave_submit(icc->ipc_c, &args, handles, handle_count, &have, &w, &h, &fv,
+	                                          &eyes, &segs, &lift_cursor_mask);
 	if (xret != XRT_SUCCESS) {
 		return xret;
 	}
@@ -837,6 +840,7 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
 	if (out_segment_count != NULL) {
 		*out_segment_count = segs;
 	}
+	*out_lift_cursor_mask = lift_cursor_mask;
 	return XRT_SUCCESS;
 }
 

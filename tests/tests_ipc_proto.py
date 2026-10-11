@@ -298,9 +298,14 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # tracker fetches the table (weave_get_segments) only for a window
         # woven per screen. Appended like the v12 fields: every earlier field
         # keeps its offset (the u_git_tag gate refuses a skewed pair).
+        # ADR-046 Amendment 1 then APPENDS lift_cursor_mask (XR_DXR_cursor_depth
+        # v3: which lift rects of this submit got the runtime's depth cursor),
+        # after segment_count, by the same rule.
         sub = [a.name for a in self._call("weave_submit").out_args]
-        self.assertEqual(sub, ["have_output", "width", "height", "fence_value", "eyes", "segment_count"])
+        self.assertEqual(sub, ["have_output", "width", "height", "fence_value", "eyes", "segment_count",
+                               "lift_cursor_mask"])
         call = self._call("weave_submit")
+        self.assertEqual(call.out_args[-2].typename, "uint32_t")
         self.assertEqual(call.out_args[-1].typename, "uint32_t")
         # weave_submit_dmabuf (desktop Linux: never segmented) is untouched.
         sub = [a.name for a in self._call("weave_submit_dmabuf").out_args]

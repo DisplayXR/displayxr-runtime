@@ -7077,6 +7077,7 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
                         uint64_t *out_fence_value,
                         struct xrt_eye_positions *out_eyes,
                         uint32_t *out_segment_count,
+                        uint32_t *out_lift_cursor_mask,
                         const xrt_graphics_buffer_handle_t *handles,
                         uint32_t handle_count)
 {
@@ -7086,6 +7087,7 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	// XR_DXR_weave v19 cheap split signal: 0 = woven by one display processor
 	// (every platform but the D3D11 service, every window on one screen).
 	*out_segment_count = 0;
+	*out_lift_cursor_mask = 0;
 	xrt_result_t auth = require_present_owner(ics, "weave_submit");
 	if (auth != XRT_SUCCESS) {
 		weave_submit_release_handles(handles, handle_count);
@@ -7215,6 +7217,8 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	// was woven on, so the client fetches the per-screen table
 	// (weave_get_segments) only when the window actually spans screens.
 	*out_segment_count = comp_d3d11_service_weave_segment_count(ics->xc);
+	// XR_DXR_cursor_depth v6: which lift rects of this submit got the cursor.
+	*out_lift_cursor_mask = comp_d3d11_service_weave_lift_cursor_mask(ics->xc);
 	return XRT_SUCCESS;
 #elif defined(COMP_MULTI_HAVE_WEAVE)
 	// handles[0] is the retained IOSurfaceRef (macOS) / acquired AHardwareBuffer
@@ -9300,6 +9304,7 @@ ipc_handle_lift_weave_rects(volatile struct ipc_client_state *ics, const struct 
 		rects[i].has_view_control = w->has_view_control != 0;
 		rects[i].view_control = w->view_control;
 		rects[i].rig = w->rig;
+		rects[i].depth_cursor = w->depth_cursor != 0;
 		// XR_DXR_lift v3: this rect's EXPLICIT viewpoints, staged by
 		// lift_weave_rect_viewpoints just before (none staged = tracked).
 		if (w->viewpoint_count > 0) {
