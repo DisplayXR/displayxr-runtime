@@ -241,6 +241,14 @@ The reference app then logs why and keeps its hit test. Turning the flag on is a
 CTS-visible decision, deliberately not made here. The evidence below comes from a build with
 `-DXRT_FEATURE_OPENXR_LAYER_DEPTH=ON`.
 
+*CTS impact, measured (#1956).* The original reason for OFF no longer holds. That reason (#33) was
+that `PRIMARY_STEREO` reported more than 2 views, and #1486 removed it. With the flag on, the full
+hosted CTS (5 Windows + 2 Linux arms, against a `main` baseline from the same window) changes only
+`XR_KHR_composition_layer_depth`, from SKIP to PASS, once `comp_gl` advertises and allocates depth
+formats. Without that, the opengl arm errors with "No suitable format". The flip and the GL fix are
+draft PR #1957. Still open, and not covered by CI: the D3D11 service compositor advertises no depth
+formats to IPC clients.
+
 **Compositors.** Metal reads the patch. vk_native, D3D11, D3D12, GL and the IPC/service path have
 compile-safe stubs: `oxr_session_cursor_depth_hand_request()` returns false. They report no
 content (cursor on the display plane) with a one-time WARN. Wiring vk_native is the next step,
