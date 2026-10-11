@@ -11,9 +11,57 @@ android {
     compileSdk project.sharedCompileSdk
     buildToolsVersion = buildToolsVersion
 
+    // #1919: same NDK as the runtime APK (root build.gradle ndk_version).
+    ndkVersion "${ndk_version}"
+
     defaultConfig {
         minSdkVersion project.sharedMinSdk
         targetSdkVersion project.sharedTargetSdk
+
+        // #1919: the AAR carries libVkLayer_DXR_queue_lock.so in
+        // jni/arm64-v8a/, so every app that depends on it gets the #1905
+        // queue-lock layer in its OWN nativeLibraryDir. Android's Vulkan loader
+        // searches the app's library paths for libVkLayer*.so in any app,
+        // debuggable or not, and the runtime's injection (oxr_vulkan.c) enables
+        // it by name at xrCreateVulkanInstanceKHR. With the layer live, the
+        // vk_native compositor's marker handshake auto-enables mid-frame fills
+        // (#1910). See docs/getting-started/android-build-guide.md.
+        //
+        // The cpp/CMakeLists.txt is a standalone project that builds ONLY the
+        // layer (same source dir, same global flags as the root build) -- it
+        // does not configure the runtime tree, so no Eigen, CNSDK or network.
+        // Arguments mirror openxr_android's so the two copies are the same
+        // bytes; CI asserts that.
+        externalNativeBuild {
+            cmake {
+                arguments "-DANDROID_PLATFORM=${project.sharedMinSdk}",
+                    "-DANDROID_STL=c++_static",
+                    "-DANDROID_ARM_NEON=TRUE"
+                targets "VkLayer_DXR_queue_lock"
+            }
+        }
+
+        // The runtime is arm64-only; so is the layer.
+        //noinspection ChromeOsAbiSupport
+        ndk { abiFilters 'arm64-v8a' }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+            version "${cmake_version}"
+        }
+    }
+
+    // Ship the layer unstripped, exactly as the runtime APK does
+    // (openxr_android: doNotStrip '**/*.so'), so the AAR copy and the APK copy
+    // can be compared byte for byte. A consuming app's own packaging strips it
+    // like any other native lib unless that app opts out.
+    packagingOptions {
+        doNotStrip '**/*.so'
+        jniLibs {
+            keepDebugSymbols += "**/*.so"
+        }
     }
 
     buildTypes {

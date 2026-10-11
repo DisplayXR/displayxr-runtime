@@ -664,9 +664,10 @@ jobs:
           retention-days: 14
 
       # ---- the client wake library --------------------------------------
-      # Built in the NEUTRAL leg only. The library is pure Kotlin and carries no
-      # vendor payload, so it is identical in both variants -- building it twice
-      # would race two jobs to attach the same asset name.
+      # Built in the NEUTRAL leg only. The library (Kotlin + the vendor-neutral
+      # queue-lock layer, #1919) carries no vendor payload, so it is identical in
+      # both variants -- building it twice would race two jobs to attach the same
+      # asset name.
       #
       # It has to ship as an AAR rather than as source. Its manifest is load-bearing:
       # it declares the <queries> entries without which Android 11+ package
@@ -675,9 +676,19 @@ jobs:
       # two Kotlin files would have to replicate both by hand -- and hand-copied
       # wake code drifting across five demo repos is the exact bug this replaces
       # (#1453). An AAR merges them into the consumer's manifest.
+      #
+      # #1919: the AAR also carries jni/arm64-v8a/libVkLayer_DXR_queue_lock.so,
+      # the #1905 queue-lock Vulkan layer, so it lands in every consuming app's
+      # own nativeLibraryDir -- the only place Android's loader finds a layer for
+      # a NON-debuggable app. It is built by a standalone CMake project
+      # (displayxr_client/src/main/cpp) that builds only the layer, so this step
+      # needs the NDK but no CNSDK and no runtime tree.
       - name: Build the client wake library (AAR)
         id: clientlib
         if: steps.build.outcome == 'success' && matrix.variant == 'neutral'
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
           set -euo pipefail
           ./gradlew :src:xrt:targets:displayxr_client:assembleRelease --no-daemon --stacktrace
@@ -693,6 +704,67 @@ jobs:
           unzip -p "outlib/DisplayXR-Client-${VER}.aar" AndroidManifest.xml > /tmp/m.xml
           grep -q '<queries>' /tmp/m.xml || { echo "::error::AAR manifest lost <queries>"; exit 1; }
           grep -q 'RuntimeWakeInitializer' /tmp/m.xml || { echo "::error::AAR manifest lost the startup initializer"; exit 1; }
+
+          # #1919: the queue-lock layer must be IN the AAR, under the exact
+          # path/name the Android loader looks for (libVkLayer*.so in the app's
+          # lib dir). If it drops out, every shipped app silently resolves
+          # mid-frame fill to OFF -- nothing on device announces the absence.
+          LAYER=jni/arm64-v8a/libVkLayer_DXR_queue_lock.so
+          unzip -l "outlib/DisplayXR-Client-${VER}.aar" | grep " ${LAYER}\$" >/dev/null \
+            || { echo "::error::AAR is missing ${LAYER} (#1919) -- apps depending on it will not get the queue-lock layer"; exit 1; }
+          echo "  ok: AAR carries ${LAYER}"
+          if unzip -l "outlib/DisplayXR-Client-${VER}.aar" | grep -E ' jni/' | grep -v -E " jni/(arm64-v8a/)?(libVkLayer_DXR_queue_lock\.so)?\$"; then
+            echo "::error::AAR carries native libs other than the queue-lock layer -- the client AAR must not ship runtime code into apps"
+            exit 1
+          fi
+          echo "  ok: no other native libs in the AAR"
+
+          rm -rf _aarchk && mkdir -p _aarchk/aar _aarchk/apk
+          unzip -q -o "outlib/DisplayXR-Client-${VER}.aar" "$LAYER" -d _aarchk/aar
+          APK=$(find src/xrt/targets/openxr_android/build/outputs/apk/release -name '*.apk' | head -1)
+          [ -n "$APK" ] || { echo "::error::no runtime APK to compare the AAR's layer against"; exit 1; }
+          unzip -q -o "$APK" lib/arm64-v8a/libVkLayer_DXR_queue_lock.so -d _aarchk/apk
+          A=_aarchk/aar/$LAYER
+          R=_aarchk/apk/lib/arm64-v8a/libVkLayer_DXR_queue_lock.so
+
+          # Same commit + same NDK + same flags => the same bytes. Both builds
+          # pin DW_AT_comp_dir (-fdebug-compilation-dir=., vk_layer/CMakeLists)
+          # so the build-tree path is not baked in; verified locally that the
+          # root build and the standalone AAR build produce identical files.
+          # A mismatch means the AAR's standalone CMake project has drifted from
+          # the root build's flags/NDK -- fix the drift, do not loosen this.
+          ha=$(sha256sum "$A" | cut -d' ' -f1); hr=$(sha256sum "$R" | cut -d' ' -f1)
+          echo "  AAR layer: $(stat -c %s "$A") bytes sha256=$ha"
+          echo "  APK layer: $(stat -c %s "$R") bytes sha256=$hr"
+          if [ "$ha" != "$hr" ]; then
+            echo "::error::the AAR's libVkLayer_DXR_queue_lock.so differs from the runtime APK's (same commit) -- displayxr_client/src/main/cpp/CMakeLists.txt has drifted from the root build (flags, NDK, STL or platform)"
+            exit 1
+          fi
+          echo "  ok: AAR layer is byte-identical to the runtime APK's"
+
+          # Loader contract, from the artifact (queue_lock_layer.c header,
+          # docs/roadmap/vk-late-weave-queue-serialization.md section 7): the
+          # four enumerate entry points + GIPA/GDPA exported, the #902 marker
+          # name present (it is resolved through GDPA, not exported), and NO
+          # libvulkan dependency (a layer linking the loader recurses).
+          # (No `grep -q` at the end of a pipe here: under pipefail its early
+          # exit SIGPIPEs the producer and fails a check that matched.)
+          LLVM="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          syms=$("$LLVM/llvm-nm" -D --defined-only "$A" | awk '{print $3}')
+          for s in vkEnumerateInstanceLayerProperties vkEnumerateInstanceExtensionProperties \
+                   vkEnumerateDeviceLayerProperties vkEnumerateDeviceExtensionProperties \
+                   vkGetInstanceProcAddr vkGetDeviceProcAddr; do
+            grep -qx "$s" <<<"$syms" || { echo "::error::layer does not export $s -- Android's loader will reject it"; exit 1; }
+          done
+          echo "  ok: Android loader exports present"
+          strings -a "$A" | grep -x vkGetQueueLockMarkerDXR >/dev/null \
+            || { echo "::error::layer lacks the vkGetQueueLockMarkerDXR marker -- the compositor's handshake (#902/#1910) can never resolve"; exit 1; }
+          echo "  ok: vkGetQueueLockMarkerDXR marker present"
+          if "$LLVM/llvm-readelf" -d "$A" | grep NEEDED | grep libvulkan >/dev/null; then
+            echo "::error::layer DT_NEEDEDs libvulkan.so -- a layer must not link the loader"
+            exit 1
+          fi
+          echo "  ok: no libvulkan dependency"
           echo "name=DisplayXR-Client-${VER}.aar" >> "$GITHUB_OUTPUT"
           ls -la outlib
 

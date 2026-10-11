@@ -17,6 +17,12 @@ if(ANDROID)
 	set_target_properties(VkLayer_DXR_queue_lock PROPERTIES C_VISIBILITY_PRESET hidden)
 	target_link_options(VkLayer_DXR_queue_lock PRIVATE "LINKER:-Bsymbolic")
 	target_include_directories(VkLayer_DXR_queue_lock PRIVATE ${Vulkan_INCLUDE_DIR})
+	# #1919: the same .so is built twice per CI run — inside the runtime APK
+	# (root CMakeLists.txt) and inside the client AAR (displayxr_client's
+	# standalone src/main/cpp/CMakeLists.txt). Pin DWARF's DW_AT_comp_dir so the
+	# build-tree path is not baked in; otherwise the two copies differ in their
+	# debug info and hence their build-id, and CI could only compare .text.
+	target_compile_options(VkLayer_DXR_queue_lock PRIVATE -fdebug-compilation-dir=.)
 	return()
 endif()
 
