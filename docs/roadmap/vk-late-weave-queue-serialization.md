@@ -408,8 +408,26 @@ Each trip, recovery and failed probe logs one WARN line with its numbers
 reference). The first four of each kind are WARN; later ones are INFO, and the
 trace row counts them all. The `#1905 trace` row shows the state:
 `handoff{mode=auto|fallback|probe|async|blocking … trips= recovered= probe_fails=}`.
-The #1939 case (13 fps, ~42 ms drains) still trips. #1962's model viewer and
-earthview do not.
+The #1939 case (13 fps, ~42 ms drains) still trips (checked offline: the
+scorer driven by synthetic intervals).
+
+**Measured (#1964, dev APK vs released v2.37.1, auto, 2×30 s per row).**
+
+| device | app | v2.37.1 fps | #1964 fps | GPU clk (MHz) |
+|---|---|---|---|---|
+| phone `D123171101B0` | model viewer | 30.3 / 35.5 | **57.4 / 59.0** | 348–401 → 680 |
+| phone | earthview | 59.4 / 59.4 | 59.8 / 59.8 | 220 → 220 |
+| phone | mediaplayer | 59.9 / 59.9 | 59.8 / 59.8 | 125 → 125 |
+| NP02J `327343950099` | model viewer | 29.5 / 23.6 | **39.2 / 39.1** | 475–550 → 680 |
+| NP02J | earthview | 47.1 / 58.8 | 59.8 / 56.2 | 220–295 |
+| NP02J | mediaplayer | 59.9 / 59.9 | 59.9 / 59.9 | 220 → 220 |
+
+v2.37.1 tripped to blocking at launch in all 12 runs. #1964 did not trip in
+11. The one exception was the NP02J model viewer, run 2: it tripped 7 s after
+launch (25/32 drains over P, 38.3 ms interval), and 1.9 s later the first
+probe window recovered (25.7 ms non-blocking vs 27.8 ms blocking). The
+`debug.dxr.async_handoff=0` control still blocks (phone model viewer 30.0 fps
+at 348 MHz).
 
 **What it does not do.** It does not deepen the hand-off. A depth-D ring would
 need a lock split first: the served weave holds `c->mutex` for its whole
