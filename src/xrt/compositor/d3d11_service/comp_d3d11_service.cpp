@@ -4246,6 +4246,10 @@ struct d3d11_multi_compositor
 	uint32_t ws_reserved_count;
 	uint32_t ws_reserved_vks[IPC_WORKSPACE_MAX_RESERVED_KEYS];
 	uint32_t ws_reserved_mods[IPC_WORKSPACE_MAX_RESERVED_KEYS];
+	//! The presenter the newest pointer DOWN went down on (0 = the service
+	//! window): where the controller's pointer capture is grabbed. Under
+	//! `ws_presenters_lock`.
+	struct comp_ws_pointer_owner ws_pointer_owner;
 	/*! @} */
 
 	//! Focused client index (-1 = none).
@@ -8781,8 +8785,13 @@ svc_ws_presenters_mirror_input_forward(
     struct d3d11_multi_compositor *mc, void *target, int32_t rx, int32_t ry, int32_t rw, int32_t rh, bool is_capture);
 static uint32_t
 svc_ws_presenters_consume_events(struct d3d11_multi_compositor *mc,
-                                 struct workspace_public_event_raw *out,
+                                 struct workspace_public_event_raw *raw,
+                                 uint32_t primary_count,
                                  uint32_t capacity);
+static void
+svc_ws_pointer_capture_set(struct d3d11_multi_compositor *mc, bool enabled, uint32_t button);
+static void *
+svc_ws_last_pointer_down_target(struct d3d11_multi_compositor *mc);
 
 static xrt_result_t
 compositor_begin_session(struct xrt_compositor *xc, const struct xrt_begin_session_info *info)
@@ -18575,17 +18584,36 @@ svc_ws_presenters_render(struct d3d11_service_system *sys, struct d3d11_multi_co
 	}
 }
 
-//! Drain the presenter windows' public input into @p out, cursor in workspace px.
+static bool
+svc_ws_is_pointer_down(const struct workspace_public_event_raw *r)
+{
+	return r->kind == WORKSPACE_PUBLIC_EVENT_POINTER && r->is_down != 0;
+}
+
+/*!
+ * Drain the presenter windows' public input into @p raw after the
+ * @p primary_count events the service window already put there (capacity
+ * counts from @p raw + @p primary_count), cursor in workspace px. Notes which
+ * presenter the newest pointer DOWN went down on — primary's first, in drain
+ * order — for svc_ws_pointer_capture_set.
+ */
 static uint32_t
 svc_ws_presenters_consume_events(struct d3d11_multi_compositor *mc,
-                                 struct workspace_public_event_raw *out,
+                                 struct workspace_public_event_raw *raw,
+                                 uint32_t primary_count,
                                  uint32_t capacity)
 {
 	uint32_t got = 0;
-	if (mc == nullptr || capacity == 0) {
+	if (mc == nullptr) {
 		return 0;
 	}
+	struct workspace_public_event_raw *out = raw + primary_count;
 	AcquireSRWLockExclusive(&mc->ws_presenters_lock);
+	for (uint32_t k = 0; k < primary_count; k++) {
+		if (svc_ws_is_pointer_down(&raw[k])) {
+			comp_ws_pointer_owner_note_down(&mc->ws_pointer_owner, 0, raw[k].timestamp_ms);
+		}
+	}
 	for (uint32_t i = 0; i < mc->ws_presenter_count && got < capacity; i++) {
 		struct svc_ws_presenter *p = mc->ws_presenters[i];
 		if (p == nullptr || p->window == nullptr) {
@@ -18596,11 +18624,63 @@ svc_ws_presenters_consume_events(struct d3d11_multi_compositor *mc,
 		for (uint32_t k = got; k < got + n; k++) {
 			out[k].cursor_x += p->origin_dx;
 			out[k].cursor_y += p->origin_dy;
+			if (svc_ws_is_pointer_down(&out[k])) {
+				comp_ws_pointer_owner_note_down(&mc->ws_pointer_owner, p->screen_id,
+				                                out[k].timestamp_ms);
+			}
 		}
 		got += n;
 	}
 	ReleaseSRWLockExclusive(&mc->ws_presenters_lock);
 	return got;
+}
+
+/*!
+ * The controller's pointer capture across the presenter windows (ADR-052).
+ * Each presenter window has its own thread, and Win32 capture only takes on
+ * the window the button went down on — so the grab goes to the press's
+ * presenter (the service window when that presenter is gone, or with none).
+ * Every other presenter window gets the flag without the grab: it reports
+ * MOTION and applies the capture's forwarding rules should the pointer reach
+ * it. With no secondary presenters this is exactly the old single call on
+ * the service window.
+ */
+static void
+svc_ws_pointer_capture_set(struct d3d11_multi_compositor *mc, bool enabled, uint32_t button)
+{
+	bool owner_is_secondary = false;
+	AcquireSRWLockExclusive(&mc->ws_presenters_lock);
+	const uint64_t owner = comp_ws_pointer_owner_screen(&mc->ws_pointer_owner);
+	for (uint32_t i = 0; i < mc->ws_presenter_count; i++) {
+		struct svc_ws_presenter *p = mc->ws_presenters[i];
+		if (p == nullptr || p->window == nullptr) {
+			continue;
+		}
+		const bool grab = owner != 0 && p->screen_id == owner;
+		owner_is_secondary = owner_is_secondary || grab;
+		comp_d3d11_window_set_workspace_pointer_capture_ex(p->window, enabled, button, grab);
+	}
+	ReleaseSRWLockExclusive(&mc->ws_presenters_lock);
+	comp_d3d11_window_set_workspace_pointer_capture_ex(mc->window, enabled, button, !owner_is_secondary);
+}
+
+//! The app HWND the newest pointer DOWN was forwarded to, by whichever presenter window took it.
+static void *
+svc_ws_last_pointer_down_target(struct d3d11_multi_compositor *mc)
+{
+	void *target = nullptr;
+	bool found = false;
+	AcquireSRWLockExclusive(&mc->ws_presenters_lock);
+	const uint64_t owner = comp_ws_pointer_owner_screen(&mc->ws_pointer_owner);
+	for (uint32_t i = 0; owner != 0 && i < mc->ws_presenter_count; i++) {
+		struct svc_ws_presenter *p = mc->ws_presenters[i];
+		if (p != nullptr && p->window != nullptr && p->screen_id == owner) {
+			target = comp_d3d11_window_get_last_pointer_down_target(p->window);
+			found = true;
+		}
+	}
+	ReleaseSRWLockExclusive(&mc->ws_presenters_lock);
+	return found ? target : comp_d3d11_window_get_last_pointer_down_target(mc->window);
 }
 
 //! The focused client's input-forward rect on every presenter window, in its pixels.
@@ -32115,7 +32195,7 @@ comp_d3d11_service_workspace_drain_input_events(struct xrt_system_compositor *xs
 	uint32_t got = comp_d3d11_window_consume_workspace_public_events(mc->window, raw, want);
 	// ADR-052: the secondary presenters' windows feed the same queue, their
 	// cursor positions moved into workspace pixels.
-	got += svc_ws_presenters_consume_events(mc, raw + got, want - got);
+	got += svc_ws_presenters_consume_events(mc, raw, got, want - got);
 
 	// Phase 2.K: even when the WndProc-side ring is empty, FRAME_TICK and
 	// FOCUS_CHANGED events still need to drain — controllers pace their
@@ -32425,7 +32505,8 @@ comp_d3d11_service_workspace_pointer_capture_set(struct xrt_system_compositor *x
 		// special-case lifecycle ordering.
 		return true;
 	}
-	comp_d3d11_window_set_workspace_pointer_capture(mc->window, enabled, button);
+	// ADR-052: grabbed by the presenter window the press went down on.
+	svc_ws_pointer_capture_set(mc, enabled, button);
 	return true;
 }
 
@@ -32907,7 +32988,7 @@ synthesize_focus_click_down(struct d3d11_multi_compositor *mc, int slot)
 		return;
 	}
 	// If the WndProc already delivered the DOWN to this HWND, don't double it.
-	if ((HWND)comp_d3d11_window_get_last_pointer_down_target(mc->window) == target) {
+	if ((HWND)svc_ws_last_pointer_down_target(mc) == target) {
 		return;
 	}
 
