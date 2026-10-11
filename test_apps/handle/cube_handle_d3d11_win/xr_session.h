@@ -15,6 +15,7 @@
 #include "xr_session_common.h"
 #include <openxr/XR_DXR_local_3d_zone.h>
 #include <openxr/XR_DXR_view_rig.h>
+#include <openxr/XR_DXR_cursor_depth.h>
 
 // INV-1.3 (#715): 3D panel top-left in virtual-desktop pixels (top-down,
 // origin = primary top-left); (0,0) = primary/unknown. Filled by
@@ -26,6 +27,12 @@ extern int32_t g_displayScreenTop;
 // (not on the shared XrSessionManager) — this app is the extension's verify
 // vehicle; promote to xr_session_common when more consumers adopt it.
 extern bool g_hasViewRigExt;
+
+// XR_DXR_cursor_depth (ADR-046) available + enabled on the instance, and the
+// spec version the runtime advertises (v5 = the runtime can draw the cursor).
+// Opt out with DISPLAYXR_CURSOR_DEPTH=0. App-local, like the view-rig flag.
+extern bool g_hasCursorDepthExt;
+extern uint32_t g_cursorDepthSpecVersion;
 
 // XR_EXT_hand_tracking available + enabled on the instance (#825 Tier 2).
 // App-local for the same reason as the view-rig flag — this app is the

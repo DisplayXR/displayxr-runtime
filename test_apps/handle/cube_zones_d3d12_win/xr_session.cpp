@@ -8,6 +8,7 @@
 
 #include "xr_session.h"
 #include "logging.h"
+#include <cstdlib>
 #include <cstring>
 
 bool g_hasViewRigExt = false;
@@ -17,6 +18,8 @@ ZoneMaskHarness g_zone;
 
 // XR_DXR_display_zones (ADR-027) — see xr_session.h.
 bool g_hasDisplayZonesExt = false;
+bool g_hasCursorDepthExt = false;      // XR_DXR_cursor_depth (ADR-046, runtime#1949)
+uint32_t g_cursorDepthSpecVersion = 0;
 DisplayZonesHarness g_zones;
 
 // INV-1.3 (#715): 3D panel top-left in virtual-desktop pixels (top-down,
@@ -108,6 +111,10 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME) == 0) {
             g_zone.available = true;
         }
+        if (strcmp(ext.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0) {
+            g_hasCursorDepthExt = true;
+            g_cursorDepthSpecVersion = ext.extensionVersion;
+        }
         if (strcmp(ext.extensionName, XR_DXR_DISPLAY_ZONES_EXTENSION_NAME) == 0) {
             displayZonesAdvertised = true;
         }
@@ -163,6 +170,15 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     if (g_hasDisplayZonesExt) {
         enabledExtensions.push_back(XR_DXR_DISPLAY_ZONES_EXTENSION_NAME);
     }
+    if (g_hasCursorDepthExt) {
+        const char* opt = getenv("DISPLAYXR_CURSOR_DEPTH");
+        if (opt != nullptr && strcmp(opt, "0") == 0) {
+            g_hasCursorDepthExt = false; // opted out: the runtime does no cursor work
+        } else {
+            enabledExtensions.push_back(XR_DXR_CURSOR_DEPTH_EXTENSION_NAME);
+        }
+    }
+    LOG_INFO("XR_DXR_cursor_depth: %s (v%u)", g_hasCursorDepthExt ? "ENABLED" : "off", g_cursorDepthSpecVersion);
 
     LOG_INFO("Enabling %zu extensions", enabledExtensions.size());
     for (const auto& ext : enabledExtensions) {

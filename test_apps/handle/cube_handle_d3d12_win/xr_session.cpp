@@ -8,9 +8,12 @@
 #include "xr_session.h"
 #include "logging.h"
 #include "dxr_view_config.h"
+#include <cstdlib>
 #include <cstring>
 
 bool g_hasViewRigExt = false;
+bool g_hasCursorDepthExt = false;      // XR_DXR_cursor_depth (ADR-046)
+uint32_t g_cursorDepthSpecVersion = 0;
 
 // #439 Phase 3 — XR_DXR_local_3d_zone harness (see xr_session.h).
 ZoneMaskHarness g_zone;
@@ -103,6 +106,10 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME) == 0) {
             g_zone.available = true;
         }
+        if (strcmp(ext.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0) {
+            g_hasCursorDepthExt = true;
+            g_cursorDepthSpecVersion = ext.extensionVersion;
+        }
     }
 
     LOG_INFO("XR_KHR_D3D12_enable: %s", hasD3D12 ? "AVAILABLE" : "NOT FOUND");
@@ -137,6 +144,15 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     if (g_zone.available) {
         enabledExtensions.push_back(XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME);
     }
+    if (g_hasCursorDepthExt) {
+        const char* opt = getenv("DISPLAYXR_CURSOR_DEPTH");
+        if (opt != nullptr && strcmp(opt, "0") == 0) {
+            g_hasCursorDepthExt = false; // opted out: the runtime does no cursor work
+        } else {
+            enabledExtensions.push_back(XR_DXR_CURSOR_DEPTH_EXTENSION_NAME);
+        }
+    }
+    LOG_INFO("XR_DXR_cursor_depth: %s (v%u)", g_hasCursorDepthExt ? "ENABLED" : "off", g_cursorDepthSpecVersion);
 
     LOG_INFO("Enabling %zu extensions", enabledExtensions.size());
     for (const auto& ext : enabledExtensions) {

@@ -42,6 +42,8 @@ if(WIN32 AND XRT_HAVE_D3D12)
 			# link it without dragging the other one in.
 			aux_d3d
 			comp_xbridge
+			# XR_DXR_cursor_depth v5: the runtime-drawn cursor's default look
+			comp_cursor_look
 			xrt-external-stb
 			d3d12
 			dxgi

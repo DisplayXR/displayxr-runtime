@@ -19,9 +19,13 @@
  *                  afterLocate(zi, views, n)
  *   end()                           pointer over no 3D zone: OS cursor back
  *
- * The pointer is the window's (macOS: the NSView's), or a scripted
- * WINDOW-normalised UV from DISPLAYXR_CURSOR_DEPTH_UV=u,v for headless
- * verification. Opt out with DISPLAYXR_CURSOR_DEPTH=0.
+ * The pointer is the window's (macOS: the NSView's, init(); Windows: the
+ * HWND's client area, initWin32()), or a scripted WINDOW-normalised UV from
+ * DISPLAYXR_CURSOR_DEPTH_UV=u,v for headless verification. Opt out with
+ * DISPLAYXR_CURSOR_DEPTH=0. On Windows dxr::CursorDepth's Win32 adapter
+ * (setWindowWin32) hides the OS cursor over the client area exactly while the
+ * runtime reports willDraw - it subclasses the window procedure and answers
+ * WM_SETCURSOR, from any thread - so the app needs no cursor code of its own.
  */
 
 #pragma once
@@ -34,10 +38,20 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <utility>
 
 #ifdef __OBJC__
 #import <Cocoa/Cocoa.h>
+#endif
+#if defined(_WIN32) && !defined(__OBJC__)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #endif
 
 namespace dxr_zones_cursor {
@@ -84,6 +98,39 @@ public:
 		m_cursor.enable(spec);
 		if (spec == 0) return;
 		m_cursor.setWindowCocoa(nsView);
+		setup();
+	}
+
+#if defined(_WIN32) && !defined(__OBJC__)
+	/*!
+	 * Windows: @p hwnd is the client window the zone rects are authored
+	 * against (reads the pointer, hides the OS cursor via WM_SETCURSOR).
+	 * DISPLAYXR_CURSOR_DEPTH_DRAW=app: hint + placement only, the OS cursor
+	 * is kept (the D3D zone apps draw no in-app crosshair).
+	 */
+	void initWin32(uint32_t spec, void *hwnd, float cubeSize)
+	{
+		m_cubeSize = cubeSize;
+		m_view = hwnd;
+		m_cursor.enable(spec);
+		if (spec == 0) return;
+		const char *who = getenv("DISPLAYXR_CURSOR_DEPTH_DRAW");
+		if (who != nullptr && strcmp(who, "app") == 0) {
+			// Hint + placement only. No window adapter: these apps draw no
+			// crosshair, so the OS cursor must never be hidden.
+			m_cursor.setDrawMode(dxr::CursorDepth::DrawMode::App);
+		} else {
+			m_cursor.setWindowWin32(hwnd);
+		}
+		setup();
+	}
+#endif
+
+	bool enabled() const { return m_cursor.enabled(); }
+
+private:
+	void setup()
+	{
 		m_cursor.setCursorHeight(0.04f);
 		m_cursor.setWantPlacement(true);
 		m_cursor.setRayCast([this](const dxr::CursorRay &r) -> std::optional<float> {
@@ -99,8 +146,7 @@ public:
 		}
 	}
 
-	bool enabled() const { return m_cursor.enabled(); }
-
+public:
 	/*!
 	 * Pick the topmost 3D zone (the last in layer order) under the pointer and
 	 * hand dxr::CursorDepth the pointer in THAT zone's UV.
@@ -166,6 +212,14 @@ private:
 		NSPoint p = [view convertPoint:[view.window mouseLocationOutsideOfEventStream] fromView:nil];
 		const NSRect b = view.bounds;
 		return dxr::cursorCanvasUV(p.x, p.y, b.size.width, b.size.height, !view.isFlipped, uv);
+#elif defined(_WIN32)
+		HWND hwnd = static_cast<HWND>(m_view);
+		POINT pt;
+		RECT rc;
+		if (hwnd == nullptr || !GetCursorPos(&pt) || !ScreenToClient(hwnd, &pt) || !GetClientRect(hwnd, &rc)) {
+			return false;
+		}
+		return dxr::cursorCanvasUV(pt.x, pt.y, rc.right - rc.left, rc.bottom - rc.top, false, uv);
 #else
 		(void)uv;
 		return false;

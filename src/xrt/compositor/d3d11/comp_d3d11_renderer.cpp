@@ -13,6 +13,9 @@
 #include "comp_d3d11_swapchain.h"
 // The embedded HLSL and the constant-buffer structs that must match it.
 #include "d3d11_layer_shaders.h"
+// XR_DXR_cursor_depth v5: the runtime-drawn cursor quad (shared with D3D12).
+#include "d3d_shared/comp_cursor_shaders.h"
+#include "util/comp_cursor_look.h"
 
 #include "util/comp_layer_accum.h"
 // #1580: the ONE per-view camera every layer type is projected through.
@@ -186,6 +189,34 @@ struct comp_d3d11_renderer
 
 	//! @ref u_color_legacy_unorm_encoded, cached at create.
 	bool legacy_color;
+
+	/*!
+	 * XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B) — the runtime-drawn
+	 * cursor. ZERO COST UNLESS REQUESTED: `frame.count` is 0 on every frame
+	 * of a session that never asked, and every resource below stays NULL
+	 * until the first frame that draws one.
+	 */
+	struct
+	{
+		//! This frame's cursor (set by the compositor, cleared after the pass).
+		struct comp_d3d11_cursor_quads frame;
+		ID3D11VertexShader *vs;
+		ID3D11PixelShader *ps;
+		ID3D11PixelShader *ps_array; //!< layered sprite: samples array layer 0
+		ID3D11Buffer *cb;
+		ID3D11BlendState *blend;        //!< straight alpha (the app's sprite)
+		ID3D11BlendState *blend_premul; //!< premultiplied (the default look)
+		ID3D11RasterizerState *raster; //!< no culling, scissor on
+		ID3D11SamplerState *sampler;   //!< linear, CLAMP (no edge bleed)
+		bool failed;                   //!< creation failed once: never retried per frame
+		//! The default look's texture: TYPELESS storage with a non-decoding
+		//! (UNORM) and a decoding (_SRGB) view, re-uploaded when its serial moves.
+		ID3D11Texture2D *look_tex;
+		ID3D11ShaderResourceView *look_srv_raw;
+		ID3D11ShaderResourceView *look_srv_srgb;
+		uint64_t look_generation;
+		bool announced;
+	} cursor;
 };
 
 // The compositor's borrowed handles, handed over explicitly — see
@@ -826,6 +857,19 @@ renderer_frame_takes_fast_path(struct comp_d3d11_renderer *r, struct comp_layer_
 				all_sources_srgb = false;
 			}
 		}
+	}
+
+	// XR_DXR_cursor_depth v5: the cursor sprite is a source this frame too. A
+	// scene-linear (non-`_SRGB`) app sprite owes the encode, which only the
+	// compose target applies. The default look is encoded bytes by
+	// construction (comp_cursor_look), so it never forces a compose. The cursor
+	// is deliberately NOT counted as a contributing layer: on a fast-path
+	// frame its edges blend in encoded space, as on Metal - a few
+	// anti-aliased pixels, not worth a full-atlas copy every frame the
+	// pointer is over content.
+	if (r->cursor.frame.count > 0 && r->cursor.frame.xsc != nullptr &&
+	    !comp_d3d11_swapchain_is_srgb(r->cursor.frame.xsc)) {
+		all_sources_srgb = false;
 	}
 
 	return u_color_compose_fast_path(r->legacy_color, contributing, base_is_projection, all_sources_srgb);
@@ -1538,6 +1582,18 @@ comp_d3d11_renderer_destroy(struct comp_d3d11_renderer **renderer_ptr)
 		x = nullptr;                                                                                           \
 	}
 
+	// XR_DXR_cursor_depth v5 (all NULL unless a cursor was ever drawn).
+	SAFE_RELEASE(r->cursor.look_srv_srgb);
+	SAFE_RELEASE(r->cursor.look_srv_raw);
+	SAFE_RELEASE(r->cursor.look_tex);
+	SAFE_RELEASE(r->cursor.sampler);
+	SAFE_RELEASE(r->cursor.raster);
+	SAFE_RELEASE(r->cursor.blend_premul);
+	SAFE_RELEASE(r->cursor.blend);
+	SAFE_RELEASE(r->cursor.cb);
+	SAFE_RELEASE(r->cursor.ps_array);
+	SAFE_RELEASE(r->cursor.ps);
+	SAFE_RELEASE(r->cursor.vs);
 	SAFE_RELEASE(r->depth_stencil_state);
 	SAFE_RELEASE(r->rasterizer_state);
 	SAFE_RELEASE(r->blend_opaque);
@@ -2149,6 +2205,342 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
 	return XRT_SUCCESS;
 }
 
+/*
+ *
+ * XR_DXR_cursor_depth v5 — the runtime draws the cursor (ADR-046 Amendment 2 B)
+ *
+ * The D3D11 twin of the Metal pass: after the app's layers and before the
+ * display processor, one straight-alpha textured quad per view tile, depth
+ * off, scissored to the tile, at the corners the compositor resolved from the
+ * state tracker's per-view map. Everything is built on the first frame that
+ * draws one; a session that never asks pays one integer test per frame.
+ *
+ */
+
+static void
+cursor_release_pipeline(struct comp_d3d11_renderer *r)
+{
+	if (r->cursor.sampler != nullptr) {
+		r->cursor.sampler->Release();
+		r->cursor.sampler = nullptr;
+	}
+	if (r->cursor.raster != nullptr) {
+		r->cursor.raster->Release();
+		r->cursor.raster = nullptr;
+	}
+	if (r->cursor.blend_premul != nullptr) {
+		r->cursor.blend_premul->Release();
+		r->cursor.blend_premul = nullptr;
+	}
+	if (r->cursor.blend != nullptr) {
+		r->cursor.blend->Release();
+		r->cursor.blend = nullptr;
+	}
+	if (r->cursor.cb != nullptr) {
+		r->cursor.cb->Release();
+		r->cursor.cb = nullptr;
+	}
+	if (r->cursor.ps_array != nullptr) {
+		r->cursor.ps_array->Release();
+		r->cursor.ps_array = nullptr;
+	}
+	if (r->cursor.ps != nullptr) {
+		r->cursor.ps->Release();
+		r->cursor.ps = nullptr;
+	}
+	if (r->cursor.vs != nullptr) {
+		r->cursor.vs->Release();
+		r->cursor.vs = nullptr;
+	}
+}
+
+//! Shaders + fixed-function state, built on the first cursor frame only.
+static bool
+cursor_ensure_pipeline(struct comp_d3d11_renderer *r)
+{
+	if (r->cursor.vs != nullptr) {
+		return true;
+	}
+	if (r->cursor.failed) {
+		return false;
+	}
+	r->cursor.failed = true; // cleared on success; a failure is never retried per frame
+
+	auto internals = get_internals(r->c);
+	ID3D11Device *device = internals.device;
+	ID3DBlob *blob = nullptr;
+	bool ok = compile_shader(device, cursor_quad_vs_source, "main", "vs_5_0", &blob) == XRT_SUCCESS;
+	if (ok) {
+		ok = SUCCEEDED(device->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+		                                          &r->cursor.vs));
+		blob->Release();
+		blob = nullptr;
+	}
+	if (ok) {
+		ok = compile_shader(device, cursor_quad_ps_source, "main", "ps_5_0", &blob) == XRT_SUCCESS;
+	}
+	if (ok) {
+		ok = SUCCEEDED(
+		    device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &r->cursor.ps));
+		blob->Release();
+		blob = nullptr;
+	}
+	if (ok) {
+		// Same source, Texture2DArray: a layered sprite swapchain's SRV.
+		static const D3D_SHADER_MACRO layered[] = {{"DXR_LAYERED", "1"}, {nullptr, nullptr}};
+		ok = compile_shader(device, cursor_quad_ps_source, "main", "ps_5_0", &blob, layered) == XRT_SUCCESS;
+	}
+	if (ok) {
+		ok = SUCCEEDED(device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+		                                         &r->cursor.ps_array));
+		blob->Release();
+		blob = nullptr;
+	}
+	if (ok) {
+		D3D11_BUFFER_DESC bd = {};
+		bd.ByteWidth = sizeof(CursorQuadConstants);
+		bd.Usage = D3D11_USAGE_DEFAULT;
+		bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		ok = SUCCEEDED(device->CreateBuffer(&bd, nullptr, &r->cursor.cb));
+	}
+	if (ok) {
+		// Straight alpha for the app's sprite (the spec), premultiplied
+		// for the default look (comp_cursor_look); alpha accumulates
+		// "over" either way, so a transparent session's atlas keeps a
+		// correct coverage.
+		D3D11_BLEND_DESC bd = {};
+		bd.RenderTarget[0].BlendEnable = TRUE;
+		bd.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+		bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+		bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+		bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+		bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+		bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+		bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+		ok = SUCCEEDED(device->CreateBlendState(&bd, &r->cursor.blend));
+		if (ok) {
+			bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+			ok = SUCCEEDED(device->CreateBlendState(&bd, &r->cursor.blend_premul));
+		}
+	}
+	if (ok) {
+		// No culling: the sprite's winding follows the view's axes. The
+		// scissor is mandatory - a cursor at a tile edge must not spill into
+		// the neighbour view (the DP would weave it into the wrong eye).
+		D3D11_RASTERIZER_DESC rd = {};
+		rd.FillMode = D3D11_FILL_SOLID;
+		rd.CullMode = D3D11_CULL_NONE;
+		rd.DepthClipEnable = TRUE;
+		rd.ScissorEnable = TRUE;
+		ok = SUCCEEDED(device->CreateRasterizerState(&rd, &r->cursor.raster));
+	}
+	if (ok) {
+		// CLAMP: with WRAP, bilinear filtering at the sprite's edge would
+		// pull in the opposite edge (the arrow's tip would fade).
+		D3D11_SAMPLER_DESC sd = {};
+		sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+		sd.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+		sd.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+		sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+		sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+		sd.MaxLOD = D3D11_FLOAT32_MAX;
+		ok = SUCCEEDED(device->CreateSamplerState(&sd, &r->cursor.sampler));
+	}
+	if (!ok) {
+		U_LOG_E("cursor_draw [d3d11]: pipeline creation failed - the runtime-drawn cursor is not drawn");
+		cursor_release_pipeline(r);
+		return false;
+	}
+	r->cursor.failed = false;
+	return true;
+}
+
+//! Upload the default look when its image changed (cursor shape or DPI).
+static bool
+cursor_upload_look(struct comp_d3d11_renderer *r, const struct comp_cursor_look *look)
+{
+	if (look == nullptr || look->rgba == nullptr || look->w == 0 || look->h == 0) {
+		return false;
+	}
+	if (r->cursor.look_tex != nullptr && r->cursor.look_generation == look->generation) {
+		return true;
+	}
+	if (r->cursor.look_srv_srgb != nullptr) {
+		r->cursor.look_srv_srgb->Release();
+		r->cursor.look_srv_srgb = nullptr;
+	}
+	if (r->cursor.look_srv_raw != nullptr) {
+		r->cursor.look_srv_raw->Release();
+		r->cursor.look_srv_raw = nullptr;
+	}
+	if (r->cursor.look_tex != nullptr) {
+		r->cursor.look_tex->Release();
+		r->cursor.look_tex = nullptr;
+	}
+
+	auto internals = get_internals(r->c);
+	// TYPELESS: the same encoded bytes are read raw on the fast path (into the
+	// encoded atlas) and decoded on the compose path (into the `_SRGB` RTV).
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = look->w;
+	td.Height = look->h;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_IMMUTABLE;
+	td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	D3D11_SUBRESOURCE_DATA init = {};
+	init.pSysMem = look->rgba;
+	init.SysMemPitch = look->w * 4;
+	HRESULT hr = internals.device->CreateTexture2D(&td, &init, &r->cursor.look_tex);
+	if (FAILED(hr)) {
+		r->cursor.look_tex = nullptr;
+		return false;
+	}
+	D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+	sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+	sd.Texture2D.MipLevels = 1;
+	sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	hr = internals.device->CreateShaderResourceView(r->cursor.look_tex, &sd, &r->cursor.look_srv_raw);
+	if (SUCCEEDED(hr)) {
+		sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+		hr = internals.device->CreateShaderResourceView(r->cursor.look_tex, &sd, &r->cursor.look_srv_srgb);
+	}
+	if (FAILED(hr)) {
+		return false; // released on the next upload or at destroy
+	}
+	r->cursor.look_generation = look->generation;
+	return true;
+}
+
+/*!
+ * Draw this frame's cursor into every tile of whatever target the frame paints
+ * (the atlas, or the private compose target before its publish).
+ */
+static void
+cursor_draw(struct comp_d3d11_renderer *r,
+            const struct comp_d3d11_eff_layout *layout,
+            uint32_t target_width,
+            uint32_t target_height)
+{
+	const struct comp_d3d11_cursor_quads *q = &r->cursor.frame;
+	if (!cursor_ensure_pipeline(r)) {
+		return;
+	}
+
+	ID3D11ShaderResourceView *srv = nullptr;
+	ID3D11PixelShader *ps = r->cursor.ps;
+	if (q->xsc != nullptr) {
+		// A layered swapchain's SRV is a whole-array Texture2DArray: the
+		// spec samples array layer 0.
+		if (comp_d3d11_swapchain_get_array_size(q->xsc) > 1) {
+			ps = r->cursor.ps_array;
+		}
+		// Format-honest on the compose path, non-decoding on the fast path:
+		// the same rule as every other layer source (ADR-044).
+		srv = layer_source_srv(r, q->xsc, q->image_index);
+	} else {
+		if (!cursor_upload_look(r, q->look)) {
+			return;
+		}
+		srv = r->compose_active ? r->cursor.look_srv_srgb : r->cursor.look_srv_raw;
+	}
+	if (srv == nullptr) {
+		return;
+	}
+
+	if (!r->cursor.announced) {
+		r->cursor.announced = true;
+		U_LOG_W(
+		    "cursor_draw: D3D11 compositor drawing the cursor (%s, %u views, %s; ADR-046 Amendment 2 B, "
+		    "one-time notice)",
+		    q->xsc != nullptr ? "app sprite" : "default look", q->count,
+		    r->compose_active ? "linear compose" : "encoded fast path");
+	}
+
+	auto internals = get_internals(r->c);
+	ID3D11DeviceContext *ctx = internals.context;
+	ID3D11RenderTargetView *rtv = (r->compose_active && r->compose_rtv != nullptr) ? r->compose_rtv : r->atlas_rtv;
+	ctx->OMSetRenderTargets(1, &rtv, nullptr); // no DSV: depth test OFF, never occluded
+	ctx->OMSetBlendState(q->xsc != nullptr ? r->cursor.blend : r->cursor.blend_premul, nullptr, 0xFFFFFFFF);
+	ctx->RSSetState(r->cursor.raster);
+	ctx->IASetInputLayout(nullptr);
+	ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+	ctx->VSSetShader(r->cursor.vs, nullptr, 0);
+	ctx->VSSetConstantBuffers(0, 1, &r->cursor.cb);
+	ctx->PSSetShader(ps, nullptr, 0);
+	ctx->PSSetShaderResources(0, 1, &srv);
+	ctx->PSSetSamplers(0, 1, &r->cursor.sampler);
+
+	static const float uv[4][2] = {{0.0f, 0.0f}, {0.0f, 1.0f}, {1.0f, 0.0f}, {1.0f, 1.0f}};
+	const uint32_t n = q->count < layout->views ? q->count : layout->views;
+	for (uint32_t i = 0; i < n && i < XRT_MAX_VIEWS; i++) {
+		float tx = 0.0f, ty = 0.0f, tw = 0.0f, th = 0.0f;
+		get_view_tile_box(r, i, layout, target_width, target_height, &tx, &ty, &tw, &th);
+		if (tw <= 0.0f || th <= 0.0f) {
+			continue;
+		}
+		D3D11_VIEWPORT vp = {};
+		vp.TopLeftX = tx;
+		vp.TopLeftY = ty;
+		vp.Width = tw;
+		vp.Height = th;
+		vp.MinDepth = 0.0f;
+		vp.MaxDepth = 1.0f;
+		ctx->RSSetViewports(1, &vp);
+		// Tile box ∩ the request's clip (a display zone's sub-rect, else
+		// the whole tile).
+		D3D11_RECT sr = {};
+		sr.left = (LONG)floorf(tx + q->clip[0] * tw);
+		sr.top = (LONG)floorf(ty + q->clip[1] * th);
+		sr.right = (LONG)ceilf(tx + (q->clip[0] + q->clip[2]) * tw);
+		sr.bottom = (LONG)ceilf(ty + (q->clip[1] + q->clip[3]) * th);
+		sr.left = sr.left < (LONG)tx ? (LONG)tx : sr.left;
+		sr.top = sr.top < (LONG)ty ? (LONG)ty : sr.top;
+		sr.right = sr.right > (LONG)(tx + tw) ? (LONG)(tx + tw) : sr.right;
+		sr.bottom = sr.bottom > (LONG)(ty + th) ? (LONG)(ty + th) : sr.bottom;
+		if (sr.right <= sr.left || sr.bottom <= sr.top) {
+			continue;
+		}
+		ctx->RSSetScissorRects(1, &sr);
+
+		CursorQuadConstants cc = {};
+		for (int k = 0; k < 4; k++) {
+			cc.corners[k][0] = q->corners[i][k][0];
+			cc.corners[k][1] = q->corners[i][k][1];
+			cc.corners[k][2] = uv[k][0];
+			cc.corners[k][3] = uv[k][1];
+		}
+		ctx->UpdateSubresource(r->cursor.cb, 0, nullptr, &cc, 0, 0);
+		ctx->Draw(4, 0);
+	}
+
+	// Hand the pipeline back the way the layer passes expect it.
+	ID3D11ShaderResourceView *null_srv = nullptr;
+	ctx->PSSetShaderResources(0, 1, &null_srv);
+	ctx->RSSetState(r->rasterizer_state);
+	ctx->OMSetBlendState(r->blend_opaque, nullptr, 0xFFFFFFFF);
+}
+
+extern "C" void
+comp_d3d11_renderer_set_cursor(struct comp_d3d11_renderer *renderer, const struct comp_d3d11_cursor_quads *quads)
+{
+	if (renderer == nullptr) {
+		return;
+	}
+	if (quads == nullptr || quads->count == 0) {
+		renderer->cursor.frame.count = 0;
+		renderer->cursor.frame.xsc = nullptr;
+		renderer->cursor.frame.look = nullptr;
+		return;
+	}
+	renderer->cursor.frame = *quads;
+	if (renderer->cursor.frame.count > XRT_MAX_VIEWS) {
+		renderer->cursor.frame.count = XRT_MAX_VIEWS;
+	}
+}
+
 extern "C" xrt_result_t
 comp_d3d11_renderer_draw_window_space_pass(struct comp_d3d11_renderer *renderer,
                                             struct comp_layer_accum *layers,
@@ -2166,7 +2558,10 @@ comp_d3d11_renderer_draw_window_space_pass(struct comp_d3d11_renderer *renderer,
 			break;
 		}
 	}
-	if (!any_window_space) {
+	// XR_DXR_cursor_depth v5: the runtime-drawn cursor goes LAST, so a frame
+	// carrying one runs this pass even without a window-space layer.
+	const bool any_cursor = renderer->cursor.frame.count > 0;
+	if (!any_window_space && !any_cursor) {
 		return XRT_SUCCESS;
 	}
 
@@ -2187,6 +2582,12 @@ comp_d3d11_renderer_draw_window_space_pass(struct comp_d3d11_renderer *renderer,
 				render_window_space_layer(renderer, layer, view_index);
 			}
 		}
+	}
+
+	// Over every app layer, never occluded, before the publish (so a
+	// composing frame's cursor is encoded once, with everything else).
+	if (any_cursor) {
+		cursor_draw(renderer, layout, target_width, target_height);
 	}
 
 	renderer_publish_compose_to_atlas(renderer);

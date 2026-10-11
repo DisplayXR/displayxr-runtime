@@ -13,6 +13,7 @@
 // #1580: the eye set and the canvas metres the per-view camera resolver takes.
 #include "xrt/xrt_display_metrics.h"
 #include "xrt/xrt_results.h"
+#include "xrt/xrt_limits.h"
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -21,6 +22,8 @@
 struct comp_d3d12_renderer;
 struct comp_d3d12_compositor;
 struct comp_layer_accum;
+struct xrt_swapchain;
+struct comp_cursor_look;
 
 #ifdef __cplusplus
 extern "C" {
@@ -184,6 +187,46 @@ comp_d3d12_renderer_draw_window_space_pass(struct comp_d3d12_renderer *renderer,
                                             uint32_t target_width,
                                             uint32_t target_height,
                                             const struct comp_d3d12_eff_layout *layout);
+
+/*!
+ * XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B): one frame's runtime-drawn
+ * cursor, resolved by the compositor. The D3D12 twin of
+ * comp_d3d11_cursor_quads: drawn LAST by
+ * @ref comp_d3d12_renderer_draw_window_space_pass (over every app layer,
+ * before its final barrier and the display processor), one straight-alpha
+ * quad per tile, depth off, scissored to the tile, in the frame's colour
+ * treatment (ADR-044). A non-`_SRGB` sprite makes the frame compose.
+ */
+struct comp_d3d12_cursor_quads
+{
+	//! Tiles to draw (view i -> tile i); 0 = no cursor this frame.
+	uint32_t count;
+	//! Per tile, the quad's corners in tile-normalised coordinates (origin
+	//! top-left, y down) in u_cursor_draw_corners() order.
+	float corners[XRT_MAX_VIEWS][4][2];
+	//! The draw's clip in every tile, tile-normalised (x, y, w, h; origin
+	//! top-left): the whole tile {0, 0, 1, 1}, or a display zone's sub-rect
+	//! (u_cursor_draw_into_zone, #1949). The scissor is tile box ∩ clip.
+	float clip[4];
+	//! The app's sprite swapchain (sampled at @ref image_index; its images
+	//! rest in RENDER_TARGET), or NULL for @ref look.
+	struct xrt_swapchain *xsc;
+	uint32_t image_index;
+	//! The default look (compositor-owned, outlives the frame).
+	//! Its pixels are PREMULTIPLIED (comp_cursor_look); an app sprite is
+	//! STRAIGHT (the spec). The renderer blends each accordingly.
+	const struct comp_cursor_look *look;
+};
+
+/*!
+ * Hand the renderer this frame's cursor (NULL or count 0 = none). Call before
+ * @ref comp_d3d12_renderer_draw_projection_pass and clear it after the
+ * window-space pass. A renderer never handed a cursor builds nothing for it.
+ *
+ * @ingroup comp_d3d12
+ */
+void
+comp_d3d12_renderer_set_cursor(struct comp_d3d12_renderer *renderer, const struct comp_d3d12_cursor_quads *quads);
 
 /*!
  * Multi-screen M6: linearly scale one rect of a texture into one rect of a

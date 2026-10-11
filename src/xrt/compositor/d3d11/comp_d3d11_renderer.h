@@ -13,6 +13,7 @@
 // #1580: the canvas metres branch (b) of the per-view camera resolver needs.
 #include "xrt/xrt_display_metrics.h"
 #include "xrt/xrt_results.h"
+#include "xrt/xrt_limits.h"
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -21,6 +22,8 @@
 struct comp_d3d11_renderer;
 struct comp_d3d11_compositor;
 struct comp_layer_accum;
+struct xrt_swapchain;
+struct comp_cursor_look;
 
 #ifdef __cplusplus
 extern "C" {
@@ -204,6 +207,52 @@ comp_d3d11_renderer_draw_window_space_pass(struct comp_d3d11_renderer *renderer,
                                             uint32_t target_width,
                                             uint32_t target_height,
                                             const struct comp_d3d11_eff_layout *layout);
+
+/*!
+ * XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B): one frame's runtime-drawn
+ * cursor, resolved by the compositor - where the sprite lands in each view
+ * tile and what it samples.
+ *
+ * Drawn LAST by @ref comp_d3d11_renderer_draw_window_space_pass - over the
+ * projection, quad and window-space layers, never occluded, before the
+ * display processor - one straight-alpha quad per tile, depth off, scissored
+ * to the tile. The colour treatment is the frame's (ADR-044): through the
+ * private `_SRGB` compose target when the frame composes, with the source's
+ * format-honest view; else straight into the atlas through non-decoding
+ * views. A sprite that is not `_SRGB` (scene-linear, owes the encode) makes
+ * the frame compose.
+ */
+struct comp_d3d11_cursor_quads
+{
+	//! Tiles to draw (view i -> tile i); 0 = no cursor this frame.
+	uint32_t count;
+	//! Per tile, the quad's corners in tile-normalised coordinates (origin
+	//! top-left, y down) in u_cursor_draw_corners() order.
+	float corners[XRT_MAX_VIEWS][4][2];
+	//! The draw's clip in every tile, tile-normalised (x, y, w, h; origin
+	//! top-left): the whole tile {0, 0, 1, 1}, or a display zone's sub-rect
+	//! (u_cursor_draw_into_zone, #1949). The scissor is tile box ∩ clip.
+	float clip[4];
+	//! The app's sprite swapchain (sampled at @ref image_index), or NULL for
+	//! @ref look.
+	struct xrt_swapchain *xsc;
+	uint32_t image_index;
+	//! The default look (compositor-owned, outlives the frame).
+	//! Its pixels are PREMULTIPLIED (comp_cursor_look); an app sprite is
+	//! STRAIGHT (the spec). The renderer blends each accordingly.
+	const struct comp_cursor_look *look;
+};
+
+/*!
+ * Hand the renderer this frame's cursor (NULL or count 0 = none). Call before
+ * @ref comp_d3d11_renderer_draw_projection_pass (the sprite's colour encoding
+ * takes part in the frame's compose decision) and clear it after the
+ * window-space pass. A renderer never handed a cursor builds nothing for it.
+ *
+ * @ingroup comp_d3d11
+ */
+void
+comp_d3d11_renderer_set_cursor(struct comp_d3d11_renderer *renderer, const struct comp_d3d11_cursor_quads *quads);
 
 /*!
  * Get the atlas texture SRV for weaving.

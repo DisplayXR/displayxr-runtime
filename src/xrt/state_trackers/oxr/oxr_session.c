@@ -2319,9 +2319,9 @@ oxr_session_cursor_depth_hand_request(struct oxr_session *sess, const struct u_c
 
 /*
  * XR_DXR_cursor_depth v5 - the runtime draws the cursor (ADR-046 Amendment 2
- * B). The in-process Metal, vk_native and GL compositors draw; the others and
- * the service report "cannot draw", so locates report willDraw = false and
- * the app keeps its flat OS cursor - never no cursor.
+ * B). The in-process Metal, vk_native, GL, D3D11 and D3D12 compositors
+ * draw; the service reports "cannot draw", so locates report willDraw =
+ * false and the app keeps its flat OS cursor - never no cursor.
  */
 bool
 oxr_session_cursor_draw_supported(struct oxr_session *sess)
@@ -2344,8 +2344,18 @@ oxr_session_cursor_draw_supported(struct oxr_session *sess)
 		return true;
 	}
 #endif
-	// TODO(ADR-046 Amendment 2 B, rollout step 3): D3D11, D3D12 and the
-	// IPC/service path (svc_draw_cursor_quads).
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+	if (sess->is_d3d11_native_compositor) {
+		return true;
+	}
+#endif
+#ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
+	if (sess->is_d3d12_native_compositor) {
+		return true;
+	}
+#endif
+	// TODO(ADR-046 Amendment 2 B, rollout step 3): the IPC/service path
+	// (svc_draw_cursor_quads).
 	return false;
 }
 
@@ -2370,6 +2380,18 @@ oxr_session_cursor_draw_hand_request(struct oxr_session *sess, const struct u_cu
 #ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
 	if (sess->is_gl_native_compositor) {
 		comp_gl_compositor_set_cursor_draw_request(&sess->xcn->base, req);
+		return true;
+	}
+#endif
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+	if (sess->is_d3d11_native_compositor) {
+		comp_d3d11_compositor_set_cursor_draw_request(&sess->xcn->base, req);
+		return true;
+	}
+#endif
+#ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
+	if (sess->is_d3d12_native_compositor) {
+		comp_d3d12_compositor_set_cursor_draw_request(&sess->xcn->base, req);
 		return true;
 	}
 #endif
@@ -2571,6 +2593,7 @@ oxr_session_arm_cursor_draw(struct oxr_session *sess,
 	sess->cursor_draw.position = *position;
 	sess->cursor_draw.orientation = g->orientation;
 	sess->cursor_draw.unit = unit;
+	sess->cursor_draw.view_count = n;
 	sess->cursor_draw.image = image;
 	sess->cursor_draw.hot_u = draw_info->hotSpot.x;
 	sess->cursor_draw.hot_v = draw_info->hotSpot.y;

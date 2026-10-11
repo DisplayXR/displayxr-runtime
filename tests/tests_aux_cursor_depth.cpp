@@ -16,6 +16,8 @@
 #include "catch_amalgamated.hpp"
 
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <vector>
 
 namespace {
@@ -1433,4 +1435,70 @@ TEST_CASE("cursor_draw: drawable predicate - the hotspot in ONE tile is enough (
 	REQUIRE(u_cursor_draw_placement_drawable(rp.v, 2, &c, &rp.g.orientation, unit_for(rp.g, d), out));
 	CHECK(out[0].origin[0] > 1.0f);
 	CHECK(out[1].origin[0] <= 1.0f);
+}
+
+// One pixel of a cursor whose colour is c and coverage a, composited by "the
+// OS" over black and over white, exactly as DrawIconEx does.
+static void
+os_draw(const uint8_t c[3], float a, uint8_t on_black[4], uint8_t on_white[4])
+{
+	for (int k = 0; k < 3; k++) {
+		on_black[k] = (uint8_t)lrintf(c[k] * a);
+		on_white[k] = (uint8_t)lrintf(c[k] * a + 255.0f * (1.0f - a));
+	}
+	on_black[3] = on_white[3] = 0; // GDI leaves byte 3 undefined: ignored
+}
+
+TEST_CASE("cursor_draw: unblend recovers premultiplied colour and alpha from the black/white pair")
+{
+	const uint8_t white[3] = {255, 255, 255};
+	const uint8_t orange[3] = {250, 120, 10};
+	const float alphas[] = {0.0f, 0.25f, 0.5f, 0.8f, 1.0f};
+	for (const uint8_t *c : {white, orange}) {
+		for (float a : alphas) {
+			uint8_t b[4], w[4], out[4];
+			os_draw(c, a, b, w);
+			u_cursor_draw_unblend(b, w, 1, out);
+			CAPTURE(a, (int)c[0]);
+			CHECK(std::abs((int)out[3] - (int)lrintf(255.0f * a)) <= 1);
+			for (int k = 0; k < 3; k++) {
+				// PREMULTIPLIED: colour x coverage, never above alpha.
+				CHECK(std::abs((int)out[k] - (int)lrintf(c[k] * a)) <= 1);
+				CHECK(out[k] <= out[3]);
+			}
+			if (a >= 0.25f) {
+				// ...and it un-premultiplies back to the colour drawn.
+				for (int k = 0; k < 3; k++) {
+					const int straight = (int)lrintf(255.0f * out[k] / out[3]);
+					CHECK(std::abs(straight - (int)c[k]) <= (a < 0.5f ? 4 : 2));
+				}
+			} else if (a == 0.0f) {
+				CHECK(out[0] == 0); // transparent = zero, never garbage
+			}
+		}
+	}
+}
+
+TEST_CASE("cursor_draw: unblend - monochrome AND/XOR cursors, inverted pixels opaque white")
+{
+	// AND=0 XOR=0: black. AND=0 XOR=1: white. AND=1 XOR=0: transparent.
+	// AND=1 XOR=1: inverts the screen (white over black, black over white).
+	const uint8_t black_b[4] = {0, 0, 0, 0}, black_w[4] = {0, 0, 0, 0};
+	const uint8_t white_b[4] = {255, 255, 255, 0}, white_w[4] = {255, 255, 255, 0};
+	const uint8_t clear_b[4] = {0, 0, 0, 0}, clear_w[4] = {255, 255, 255, 0};
+	const uint8_t inv_b[4] = {255, 255, 255, 0}, inv_w[4] = {0, 0, 0, 0};
+	uint8_t b[16], w[16], out[16];
+	memcpy(b + 0, black_b, 4), memcpy(w + 0, black_w, 4);
+	memcpy(b + 4, white_b, 4), memcpy(w + 4, white_w, 4);
+	memcpy(b + 8, clear_b, 4), memcpy(w + 8, clear_w, 4);
+	memcpy(b + 12, inv_b, 4), memcpy(w + 12, inv_w, 4);
+	u_cursor_draw_unblend(b, w, 4, out);
+	CHECK((out[0] == 0 && out[3] == 255));                    // opaque black
+	CHECK((out[4] == 255 && out[5] == 255 && out[7] == 255)); // opaque white
+	CHECK(out[11] == 0);                                      // transparent
+	CHECK((out[12] == 255 && out[15] == 255));                // invert -> opaque white
+
+	// MUTANT: taking alpha from GDI's byte 3 (undefined for these cursors)
+	// would make every one of them invisible - byte 3 is 0 in every input.
+	CHECK(out[3] == 255);
 }

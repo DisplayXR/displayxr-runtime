@@ -2076,7 +2076,13 @@ cursor_draw_submit(struct oxr_session *sess, const XrFrameEndInfo *frameEndInfo,
 
 	struct u_cursor_draw_request req = {0};
 	req.requested = true;
+	// Only the views the arming locate reported active: a layer submitted for
+	// the worst-case mode carries views that are not tiles in this one, and
+	// their poses must not decide drawability.
 	req.view_count = proj->viewCount < XRT_MAX_VIEWS ? proj->viewCount : XRT_MAX_VIEWS;
+	if (sess->cursor_draw.view_count >= 2 && req.view_count > sess->cursor_draw.view_count) {
+		req.view_count = sess->cursor_draw.view_count;
+	}
 	struct u_cursor_depth_view submitted[XRT_MAX_VIEWS];
 	for (uint32_t i = 0; i < req.view_count; i++) {
 		// XrPosef/XrFovf are layout-identical to xrt_pose/xrt_fov.

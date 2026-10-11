@@ -8,10 +8,13 @@
 #include "xr_session.h"
 #include "logging.h"
 #include "dxr_view_config.h"
+#include <cstdlib>
 #include <cstring>
 
 // XR_DXR_view_rig (#396 W7): app-local availability flag (see xr_session.h).
 bool g_hasViewRigExt = false;
+bool g_hasCursorDepthExt = false;      // XR_DXR_cursor_depth (ADR-046)
+uint32_t g_cursorDepthSpecVersion = 0;
 bool g_hasHandTrackingExt = false;
 bool g_hasViewsChangeExt = false; // #1488
 
@@ -112,6 +115,10 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME) == 0) {
             g_zone.available = true;
         }
+        if (strcmp(ext.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0) {
+            g_hasCursorDepthExt = true;
+            g_cursorDepthSpecVersion = ext.extensionVersion;
+        }
         if (strcmp(ext.extensionName, XR_EXT_HAND_TRACKING_EXTENSION_NAME) == 0) {
             g_hasHandTrackingExt = true;
         }
@@ -168,6 +175,15 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     if (g_zone.available) {
         enabledExtensions.push_back(XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME);
     }
+    if (g_hasCursorDepthExt) {
+        const char* opt = getenv("DISPLAYXR_CURSOR_DEPTH");
+        if (opt != nullptr && strcmp(opt, "0") == 0) {
+            g_hasCursorDepthExt = false; // opted out: the runtime does no cursor work
+        } else {
+            enabledExtensions.push_back(XR_DXR_CURSOR_DEPTH_EXTENSION_NAME);
+        }
+    }
+    LOG_INFO("XR_DXR_cursor_depth: %s (v%u)", g_hasCursorDepthExt ? "ENABLED" : "off", g_cursorDepthSpecVersion);
     if (g_hasHandTrackingExt) {
         enabledExtensions.push_back(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
     }

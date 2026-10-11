@@ -622,6 +622,23 @@ u_cursor_draw_canvas_px_h(const struct u_cursor_draw_request *req, uint32_t canv
 void
 u_cursor_draw_arrow_rgba(uint8_t *rgba, uint32_t w, uint32_t h);
 
+/*!
+ * Recover a cursor image from two renders of it: one over opaque BLACK, one
+ * over opaque WHITE. This is how the Windows default look reads ANY HCURSOR -
+ * 32-bit alpha, colour + AND mask, or monochrome AND/XOR - without branching
+ * on its type: whatever the OS draws, the two backgrounds reveal it.
+ *
+ * Per pixel, with b and w the two renders (bytes 0..2 colour, byte 3 ignored):
+ * alpha = 1 - mean(w - b), and the render over black IS the premultiplied
+ * colour (clamped to alpha). A pixel the cursor INVERTS (white over black,
+ * black over white - the I-beam's XOR pixels) comes out opaque WHITE: a
+ * compositor cannot invert what is behind it before the weave, and white is
+ * the classic arrow's fill. Output: PREMULTIPLIED alpha (as the classic arrow
+ * and comp_cursor_look), channels in the input's order.
+ */
+void
+u_cursor_draw_unblend(const uint8_t *on_black, const uint8_t *on_white, uint32_t pixel_count, uint8_t *out);
+
 #ifdef __cplusplus
 }
 #endif

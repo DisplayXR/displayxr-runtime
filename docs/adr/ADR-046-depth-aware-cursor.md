@@ -1,6 +1,6 @@
 # ADR-046: Depth-aware cursor — opt-in only; the app knows the depth, the runtime places the cursor
 
-**Status:** Proposed (2026-10-06) · Phase 1 implemented · Phase 3a implemented (Metal) · spec v3 anchor modes (2026-10-07) · Amendment 1 (lifted content, 2026-10-10) accepted · Amendment 2 (one policy, runtime draws, app chooses the look, 2026-10-11) accepted, §B built on Metal, Vulkan and GL (spec v5) · spec:
+**Status:** Proposed (2026-10-06) · Phase 1 implemented · Phase 3a implemented (Metal) · spec v3 anchor modes (2026-10-07) · Amendment 1 (lifted content, 2026-10-10) accepted · Amendment 2 (one policy, runtime draws, app chooses the look, 2026-10-11) accepted, §B built on Metal, Vulkan, GL, D3D11 and D3D12 (spec v5) · spec:
 [XR_DXR_cursor_depth.md](../specs/extensions/XR_DXR_cursor_depth.md) · sibling of
 [ADR-040](ADR-040-rear-depth-budget.md) (the same cue conflict, at the cursor instead of the desktop)
 
@@ -605,7 +605,7 @@ sprite and the depth, and the runtime owns the drawing. Apps get the same contra
   metres per point (pixel pitch × backing scale). Off the main thread the last snapshot is
   kept, else the classic arrow (12 × 19, white fill, dark outline, rasterised procedurally,
   4 × 4 supersampled). `DXR_CURSOR_DEFAULT_LOOK=arrow` forces the arrow.
-- **Not yet:** D3D11, D3D12 and the service (`svc_draw_cursor_quads`) report
+- **Not yet:** the service (`svc_draw_cursor_quads`) reports
   `willDraw = XR_FALSE`; display zones (since drawn, runtime#1949, below); multi-screen routed frames draw per tile without the
   segment routing on Metal (Vulkan and GL skip them); the 0.5 px floor of A.3 is not applied
   (−0.005 is above it on current panels).
@@ -690,10 +690,62 @@ sprite and the depth, and the runtime owns the drawing. Apps get the same contra
   neighbouring 3D zone. `u_cursor_draw_canvas_px_h()` sizes the sprite against the zone's height
   (the canvas its unit was built for). A non-zone request is untouched (clip = whole tile).
   Zero cost unchanged: all of it runs only on a requested frame.
-- **D3D11 / D3D12** (draft runtime#1944) adopt the same two helpers at their draw site.
+- **D3D11 / D3D12** (runtime#1944) use the same two helpers in their resolve step (`u_cursor_draw_into_zone` with the window dims the renderer scales `zone_3d.rect` by; the scissor is tile box ∩ the returned clip), skipping only on a zones-frame / zone-request mismatch.
 - **Reference app.** `cube_zones_{metal,vk}_macos` adopt `dxr::CursorDepth` via
   `test_apps/common/cursor_depth_zones.h`: pick the topmost 3D zone under the pointer, hand the
   helper the pointer in that zone's UV, chain the hint only on that zone's locate.
+
+#### §B as built on D3D11 and D3D12 (in-process; `XR_DXR_cursor_depth` spec v5)
+
+- **Same contract as Metal.** The state tracker hands `comp_d3d11/12_compositor_set_cursor_draw_request`
+  the same one-frame `u_cursor_draw_request`; the commit consumes it with one field test. A cursor
+  frame never zero-copies. The compositor resolves the request into per-tile corners
+  (`u_cursor_draw_corners`) — sprite height in metres ÷ the canvas height in metres (canvas px ×
+  the panel's pixel pitch from the window metrics) — and hands them to its renderer before the
+  projection pass. The renderer draws them **last in the window-space pass**: after the
+  projection, quad and window-space layers, before the compose publish and (D3D12) the atlas's
+  final barrier, so before the display processor. One alpha-blended triangle strip per tile
+  (straight for the app's sprite, premultiplied for the default look), depth off (no DSV), no
+  culling, scissored to the tile (∩ the zone in a display-zones frame — see the zones section
+  above). Multi-screen routed frames draw nothing (one-time WARN). `willDraw` is gated in the
+  state tracker (`u_cursor_draw_placement_drawable`, runtime#1951) for every backend alike.
+- **Shaders.** One shared HLSL pair, `d3d_shared/comp_cursor_shaders.h` (corners in b0 — a
+  D3D11 constant buffer, 16 D3D12 root constants on the existing quad root signature), compiled
+  with `D3DCompile` on the first cursor frame only, like every other in-process shader here. A
+  `DXR_LAYERED` variant samples array layer 0 of a layered sprite. D3D12 builds six pipelines
+  (`[straight | straight layered | premultiplied][_SRGB target]`), since a D3D12 PSO bakes its
+  blend and RTV format.
+- **Colour (ADR-044).** The cursor takes the frame's treatment: on a composing frame it is drawn
+  into the private `_SRGB` compose target through the source's format-honest view (decoding), on
+  a fast-path frame straight into the encoded atlas through the non-decoding view. A
+  non-`_SRGB` app sprite (scene-linear, owes the encode) makes the frame compose; the cursor is
+  not counted as a contributing layer, so a fast-path frame blends the sprite's anti-aliased
+  edges in encoded space, as on Metal. The default look is uploaded once per shape into a
+  TYPELESS texture with a UNORM and an `_SRGB` view, so the white arrow is white either way.
+- **Default look (A.6) — the shared `comp_cursor_look`** (the same entry point Metal, Vulkan and
+  GL use), whose Windows half is `comp_cursor_look_win.c`: `GetCursorInfo()` → `HCURSOR`, drawn
+  with `DrawIconEx` into a 32-bit DIB **twice, over black and over white**, and recovered by
+  `u_cursor_draw_unblend` (alpha = 1 − (white − black); the render over black is the
+  premultiplied colour). That reads every cursor kind the same way — 32-bit alpha, colour + AND
+  mask, monochrome AND/XOR — and turns XOR (invert) pixels into opaque white. Drawn at the size
+  the OS draws it on this panel: `GetSystemMetricsForDpi(SM_CYCURSOR, dpi)` with the window's
+  `GetDpiForWindow` (passed as the look's backing scale, DPI / 96), or the image's own size when
+  larger (accessibility pointer sizes); its `height_pt` is that size in 96-DPI points, so the
+  physical size is `height_pt` × DPI / 96 × the panel's pixel pitch. Cached by `HCURSOR` + scale,
+  so it re-rasterises only on a shape change. `GetCursorInfo` is global, so the compositor thread
+  may call it. While the app has hidden its cursor with `SetCursor(NULL)` — which it does as soon
+  as a locate reports `willDraw`, i.e. on most drawn frames — the shape is the **class cursor of
+  the window under the pointer**, else the last shape, else `IDC_ARROW`. With
+  `DXR_CURSOR_DEFAULT_LOOK=arrow`, or if the cursor cannot be read: the shared classic arrow.
+- **App sprite.** Straight alpha, last released image, hotspot as given; `sizeMeters` ≤ 0 = 19 px
+  at the window's DPI × pixel pitch (the classic arrow's size, as Metal's 19 pt). D3D12 dips the
+  image RENDER_TARGET → PIXEL_SHADER_RESOURCE → RENDER_TARGET around the draw, as for
+  window-space layers.
+- **Reference apps.** `cube_handle_d3d11_win` / `cube_handle_d3d12_win` adopt v5 the way
+  `cube_handle_metal_macos` does (analytic cube hit test → hint; `DISPLAYXR_CURSOR_DEPTH_DRAW`,
+  `_SPRITE=custom`, `_UV`, `DISPLAYXR_CURSOR_DEPTH=0`), hiding the OS cursor over the client
+  area exactly while `willDraw` (`WM_SETCURSOR` → `SetCursor(NULL)`). Their `app` mode keeps the
+  OS cursor and logs the placement; it draws no in-app crosshair.
 
 ### Rollout
 

@@ -27,8 +27,10 @@
 #include "xr_session.h"
 #include <d3d11_1.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <thread>
 #include <string>
@@ -411,6 +413,11 @@ static uint32_t g_hwOverrideModeIndex = 0;
 static UINT g_windowWidth = 1280;
 static UINT g_windowHeight = 720;
 static bool g_inSizeMove = false;  // True while user is dragging/resizing the window
+// XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B): true exactly while the
+// runtime reports willDraw - the runtime draws the cursor, so the OS cursor is
+// hidden over the client area (WM_SETCURSOR below). Render loop and message
+// pump share this thread, so no locking.
+static bool g_hideOsCursor = false;
 static const uint32_t HUD_PIXEL_WIDTH = 380;
 static const uint32_t HUD_PIXEL_HEIGHT = 470;
 static const float CAMERA_HALF_TAN_VFOV = 0.32491969623f; // tan(18°) → 36° vFOV
@@ -591,6 +598,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_LBUTTONUP:
         ReleaseCapture();
         return 0;
+
+    case WM_SETCURSOR:
+        // XR_DXR_cursor_depth v5: while the runtime draws the depth cursor,
+        // the OS cursor is hidden over the client area; everywhere else (title
+        // bar, borders) and whenever willDraw is false, the default handling
+        // shows the class cursor.
+        if (g_hideOsCursor && LOWORD(lParam) == HTCLIENT) {
+            SetCursor(nullptr);
+            return TRUE;
+        }
+        break;
 
     case WM_SIZE:
         if (wParam != SIZE_MINIMIZED) {
@@ -917,6 +935,204 @@ static bool CreateAndFillL2DPanel(XrSessionManager& xr, ID3D11Device* device, ID
     return true;
 }
 
+// ============================================================================
+// XR_DXR_cursor_depth (ADR-046) — reference adoption, spec v5 (Amendment 2 B).
+//
+// Mirrors cube_handle_metal_macos. The app owns the depth: each frame it
+// hit-tests the cube under the cursor FOOTPRINT (rays from the outer views of
+// the previous locate through a ring of points around the hotspot) and hands
+// the nearest hit to xrLocateViews in an XrCursorDepthHintDXR.
+//
+//   DISPLAYXR_CURSOR_DEPTH=0              opt out (extension not enabled)
+//   DISPLAYXR_CURSOR_DEPTH_DRAW=runtime   (default, needs spec v5) chain
+//                                         XrCursorDepthDrawInfoDXR: the RUNTIME
+//                                         draws the cursor into every view
+//                                         before weaving; the OS cursor is
+//                                         hidden exactly while willDraw.
+//   DISPLAYXR_CURSOR_DEPTH_DRAW=app       hint + placement only. This D3D11
+//                                         reference does NOT draw an in-app
+//                                         crosshair (the Metal app does): it
+//                                         keeps the OS cursor and logs the
+//                                         placement — the runtime-drawn path is
+//                                         what this app verifies.
+//   DISPLAYXR_CURSOR_DEPTH_SPRITE=custom  hand the runtime our own sprite (a
+//                                         64x64 cyan ring + centre dot, 1 cm)
+//                                         instead of its default look (the OS
+//                                         cursor's shape and size).
+//   DISPLAYXR_CURSOR_DEPTH_UV=u,v         scripted cursor (canvas-normalised,
+//                                         origin top-left) for headless checks.
+// ============================================================================
+
+static const float kCursorCubeSize = 0.06f;   // RenderScene's default cube edge
+static const float kCursorCubeHeight = 0.03f; // RenderScene(..., cubeHeight = 0.03f)
+static const float kCursorHeight = 0.04f;     // hint footprint, fraction of canvas height
+
+static bool g_cursorRuntimeDraw = false;
+static bool g_cursorCustomSprite = false;
+static XrSwapchain g_cursorSprite = XR_NULL_HANDLE;
+
+static void CursorQuatRotate(const XrQuaternionf& q, float vx, float vy, float vz, XrVector3f& out)
+{
+    // v' = v + 2w (q x v) + 2 q x (q x v)
+    const float tx = 2.0f * (q.y * vz - q.z * vy);
+    const float ty = 2.0f * (q.z * vx - q.x * vz);
+    const float tz = 2.0f * (q.x * vy - q.y * vx);
+    out.x = vx + q.w * tx + (q.y * tz - q.z * ty);
+    out.y = vy + q.w * ty + (q.z * tx - q.x * tz);
+    out.z = vz + q.w * tz + (q.x * ty - q.y * tx);
+}
+
+// Slab test against the cube as RenderScene places it: centred at
+// (0, kCursorCubeHeight, 0), edge kCursorCubeSize, rotated `rot` about +Y
+// (XMMatrixRotationY, row vectors: x' = c x + s z, z' = -s x + c z).
+static bool CursorRayHitCube(const XrVector3f& o, const XrVector3f& d, float rot, float& tOut)
+{
+    const float c = cosf(rot), s = sinf(rot), h = kCursorCubeSize * 0.5f;
+    // local = R^T (world - centre)
+    const float ox = o.x, oy = o.y - kCursorCubeHeight, oz = o.z;
+    const float lo[3] = {c * ox - s * oz, oy, s * ox + c * oz};
+    const float ld[3] = {c * d.x - s * d.z, d.y, s * d.x + c * d.z};
+    float t0 = 0.0f, t1 = 1e30f;
+    for (int i = 0; i < 3; i++) {
+        if (fabsf(ld[i]) < 1e-9f) {
+            if (lo[i] < -h || lo[i] > h) return false;
+            continue;
+        }
+        float ta = (-h - lo[i]) / ld[i], tb = (h - lo[i]) / ld[i];
+        if (ta > tb) std::swap(ta, tb);
+        if (ta > t0) t0 = ta;
+        if (tb < t1) t1 = tb;
+        if (t0 > t1) return false;
+    }
+    tOut = t0;
+    return true;
+}
+
+// Ray from a located view through canvas point (u, v): Kooima frusta all
+// frame the canvas, so (u, v) maps linearly onto the fov tangents.
+static XrVector3f CursorViewRayDir(const XrView& view, float u, float v)
+{
+    const float tl = tanf(view.fov.angleLeft), tr = tanf(view.fov.angleRight);
+    const float tu = tanf(view.fov.angleUp), td = tanf(view.fov.angleDown);
+    XrVector3f d;
+    CursorQuatRotate(view.pose.orientation, tl + u * (tr - tl), tu - v * (tu - td), -1.0f, d);
+    return d;
+}
+
+// Nearest cube point (to the viewer) under the cursor footprint, using the
+// outer views of the previous locate. Footprint = the sprite plus 50%.
+static bool CursorFootprintHit(const std::vector<XrView>& views, uint32_t active, float u, float v,
+                               float canvasAspect, float rot, XrVector3f& nearest)
+{
+    if (active < 2 || views.size() < active) return false;
+    const XrView* outer[2] = {&views[0], &views[active - 1]};
+    XrVector3f fwd;
+    CursorQuatRotate(views[0].pose.orientation, 0.0f, 0.0f, -1.0f, fwd);
+    const float r = 0.75f * kCursorHeight; // footprint radius, in canvas heights
+    bool found = false;
+    float best = 1e30f;
+    for (int k = -1; k < 8; k++) {
+        float su = u, sv = v;
+        if (k >= 0) {
+            const float a = (float)k * 0.78539816f;
+            su += r * cosf(a) / canvasAspect;
+            sv += r * sinf(a);
+        }
+        for (const XrView* view : outer) {
+            const XrVector3f d = CursorViewRayDir(*view, su, sv);
+            float t;
+            if (!CursorRayHitCube(view->pose.position, d, rot, t)) continue;
+            const XrVector3f p = {view->pose.position.x + d.x * t, view->pose.position.y + d.y * t,
+                                  view->pose.position.z + d.z * t};
+            const float depth = p.x * fwd.x + p.y * fwd.y + p.z * fwd.z; // smaller = nearer the viewer
+            if (depth < best) {
+                best = depth;
+                nearest = p;
+                found = true;
+            }
+        }
+    }
+    return found;
+}
+
+// Apply the OS-cursor visibility right away when the pointer is over the
+// client area (WM_SETCURSOR keeps it that way on later mouse moves).
+static void ApplyOsCursorVisibility(HWND hwnd, bool hide)
+{
+    if (g_hideOsCursor == hide) return;
+    g_hideOsCursor = hide;
+    POINT p;
+    RECT rc;
+    if (GetCursorPos(&p) && ScreenToClient(hwnd, &p) && GetClientRect(hwnd, &rc) && PtInRect(&rc, p)) {
+        SetCursor(hide ? nullptr : LoadCursor(nullptr, IDC_ARROW));
+    }
+}
+
+// DISPLAYXR_CURSOR_DEPTH_SPRITE=custom: a 64x64 cyan ring with a centre dot
+// (hotspot = the centre), dark-edged so it reads over the white cube. Filled
+// once (acquire / fill / release); the runtime samples the last released image
+// every frame, as STRAIGHT alpha. _SRGB when offered: the bytes are
+// display-referred.
+static bool CreateCursorSprite(XrSessionManager& xr, ID3D11DeviceContext* context)
+{
+    const uint32_t S = 64;
+    XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+    sci.format = PickPanelFormat(xr.session, (int64_t)DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+                                 (int64_t)DXGI_FORMAT_R8G8B8A8_UNORM);
+    sci.sampleCount = 1;
+    sci.width = S;
+    sci.height = S;
+    sci.faceCount = 1;
+    sci.arraySize = 1;
+    sci.mipCount = 1;
+    if (XR_FAILED(xrCreateSwapchain(xr.session, &sci, &g_cursorSprite))) {
+        g_cursorSprite = XR_NULL_HANDLE;
+        return false;
+    }
+    uint32_t n = 0;
+    xrEnumerateSwapchainImages(g_cursorSprite, 0, &n, nullptr);
+    std::vector<XrSwapchainImageD3D11KHR> imgs(n, {XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
+    if (n == 0 || XR_FAILED(xrEnumerateSwapchainImages(g_cursorSprite, n, &n,
+                                                       (XrSwapchainImageBaseHeader*)imgs.data()))) {
+        return false;
+    }
+    XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    uint32_t idx = 0;
+    if (XR_FAILED(xrAcquireSwapchainImage(g_cursorSprite, &ai, &idx))) {
+        return false;
+    }
+    XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wi.timeout = XR_INFINITE_DURATION;
+    xrWaitSwapchainImage(g_cursorSprite, &wi);
+
+    std::vector<uint8_t> buf((size_t)S * S * 4);
+    auto cover = [](float d, float r0, float r1) { // 1 inside [r0, r1], 1-px soft edges
+        const float a = (std::min)(d - r0 + 0.5f, r1 - d + 0.5f);
+        return a <= 0.0f ? 0.0f : (a >= 1.0f ? 1.0f : a);
+    };
+    for (uint32_t y = 0; y < S; y++) {
+        for (uint32_t x = 0; x < S; x++) {
+            const float d = hypotf((float)x + 0.5f - S * 0.5f, (float)y + 0.5f - S * 0.5f);
+            const float ring = (std::max)(cover(d, 21.0f, 27.0f), cover(d, 0.0f, 5.0f)); // cyan
+            const float edge = (std::max)(cover(d, 19.5f, 28.5f), cover(d, 0.0f, 6.5f)); // dark rim
+            uint8_t* px = &buf[((size_t)y * S + x) * 4];
+            // RGBA, straight alpha: cyan where the ring is, near-black rim.
+            px[0] = 0;
+            px[1] = (uint8_t)(220.0f * ring);
+            px[2] = (uint8_t)(255.0f * ring);
+            px[3] = (uint8_t)(255.0f * (std::max)(ring, edge));
+        }
+    }
+    context->UpdateSubresource(imgs[idx].texture, 0, nullptr, buf.data(), S * 4, 0);
+
+    XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    xrReleaseSwapchainImage(g_cursorSprite, &ri);
+    LOG_INFO("Cursor sprite swapchain created: %ux%u (cyan ring, hotspot = centre, format %lld)", S, S,
+             (long long)sci.format);
+    return true;
+}
+
 // Render a single frame — called from the main loop and from WM_PAINT during
 // drag/resize so that rendering never stalls.
 static void RenderOneFrame(RenderState& rs) {
@@ -1196,7 +1412,108 @@ static void RenderOneFrame(RenderState& rs) {
                         }
                     }
 
+                    // XR_DXR_cursor_depth (ADR-046): hint from the previous
+                    // locate's views (the hit test needs rays, the rays need
+                    // views - one frame late, which the runtime's filter
+                    // absorbs). Chained on THIS locate (the rig one whose
+                    // views are submitted), in front of the rig struct.
+                    static std::vector<XrView> cursorPrevViews;
+                    static uint32_t cursorPrevActive = 0;
+                    XrCursorDepthHintDXR cursorHint = {XR_TYPE_CURSOR_DEPTH_HINT_DXR};
+                    XrCursorDepthPlacementDXR cursorPlacement = {XR_TYPE_CURSOR_DEPTH_PLACEMENT_DXR};
+                    // Spec v5: "runtime, draw it" - with our sprite (hotspot =
+                    // its centre, 1 cm tall) or the runtime's default look
+                    // (XR_NULL_HANDLE: the OS cursor's shape and size).
+                    XrCursorDepthDrawInfoDXR cursorDrawInfo = {XR_TYPE_CURSOR_DEPTH_DRAW_INFO_DXR};
+                    cursorDrawInfo.image = g_cursorCustomSprite ? g_cursorSprite : XR_NULL_HANDLE;
+                    cursorDrawInfo.hotSpot = {0.5f, 0.5f};
+                    cursorDrawInfo.sizeMeters = g_cursorCustomSprite ? 0.01f : 0.0f;
+                    cursorDrawInfo.visible = XR_TRUE;
+                    XrCursorDepthDrawStateDXR cursorDrawState = {XR_TYPE_CURSOR_DEPTH_DRAW_STATE_DXR};
+                    bool cursorInCanvas = false;
+                    if (g_hasCursorDepthExt && g_windowWidth > 0 && g_windowHeight > 0) {
+                        float u = -1.0f, v = -1.0f;
+                        POINT cp;
+                        RECT crc;
+                        if (GetCursorPos(&cp) && ScreenToClient(rs.hwnd, &cp) && GetClientRect(rs.hwnd, &crc) &&
+                            crc.right > crc.left && crc.bottom > crc.top) {
+                            u = (float)cp.x / (float)(crc.right - crc.left);
+                            v = (float)cp.y / (float)(crc.bottom - crc.top);
+                        }
+                        // Scripted cursor for headless verification: DISPLAYXR_CURSOR_DEPTH_UV=u,v
+                        static float fixedU = -1.0f, fixedV = -1.0f;
+                        static bool fixedParsed = false;
+                        if (!fixedParsed) {
+                            fixedParsed = true;
+                            const char* fx = getenv("DISPLAYXR_CURSOR_DEPTH_UV");
+                            if (fx == nullptr || sscanf(fx, "%f,%f", &fixedU, &fixedV) != 2) fixedU = fixedV = -1.0f;
+                        }
+                        if (fixedU >= 0.0f) {
+                            u = fixedU;
+                            v = fixedV;
+                        }
+                        cursorInCanvas = u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f;
+                        if (cursorInCanvas) {
+                            cursorHint.cursorUV = {u, v};
+                            cursorHint.cursorHeight = kCursorHeight;
+                            XrVector3f hit = {0.0f, 0.0f, 0.0f};
+                            cursorHint.hasContent =
+                                CursorFootprintHit(cursorPrevViews, cursorPrevActive, u, v,
+                                                   (float)g_windowWidth / (float)g_windowHeight,
+                                                   renderer.cubeRotation, hit)
+                                    ? XR_TRUE
+                                    : XR_FALSE;
+                            cursorHint.nearestPoint = hit;
+                            // Chain: locateInfo -> hint [-> draw info] -> (rig struct).
+                            const void* hintTail = locateInfo.next;
+                            if (g_cursorRuntimeDraw) {
+                                cursorDrawInfo.next = hintTail;
+                                hintTail = &cursorDrawInfo;
+                            }
+                            cursorHint.next = hintTail;
+                            locateInfo.next = &cursorHint;
+                        }
+                        cursorPlacement.next = viewState.next;
+                        viewState.next = &cursorPlacement;
+                        if (g_cursorRuntimeDraw) {
+                            cursorDrawState.next = viewState.next;
+                            viewState.next = &cursorDrawState;
+                        }
+                    }
+
                     xrLocateViews(xr.session, &locateInfo, &viewState, 8, &viewCount, rawViews);
+
+                    if (g_hasCursorDepthExt) {
+                        cursorPrevViews.assign(rawViews, rawViews + (viewCount < 8 ? viewCount : 8));
+                        cursorPrevActive = monoMode ? 1 : (modeViewCount < viewCount ? modeViewCount : viewCount);
+
+                        // The app owns its window's OS cursor: hidden exactly
+                        // while the runtime draws the depth cursor (willDraw -
+                        // whenever it cannot draw, we keep the OS cursor). App
+                        // mode keeps the OS cursor (no in-app crosshair here).
+                        ApplyOsCursorVisibility(rs.hwnd, g_cursorRuntimeDraw && cursorDrawState.willDraw == XR_TRUE);
+                        static int willDrawLogged = 0;
+                        if (g_cursorRuntimeDraw && willDrawLogged < 3 && cursorInCanvas) {
+                            static int lastWillDraw = -1;
+                            if ((int)cursorDrawState.willDraw != lastWillDraw) {
+                                lastWillDraw = (int)cursorDrawState.willDraw;
+                                willDrawLogged++;
+                                LOG_INFO("cursor_depth: runtime willDraw=%s (uv=%.3f,%.3f disparity=%.3f)",
+                                         cursorDrawState.willDraw ? "TRUE" : "FALSE", cursorHint.cursorUV.x,
+                                         cursorHint.cursorUV.y, cursorPlacement.disparity);
+                            }
+                        }
+                        static int cursorLogged = 0;
+                        if (cursorPlacement.isActive && cursorHint.hasContent && cursorLogged < 3) {
+                            cursorLogged++;
+                            LOG_INFO("cursor_depth: uv=(%.3f,%.3f) target=%.3f disparity=%.3f h=%.4f "
+                                     "pos=(%.3f,%.3f,%.3f)",
+                                     cursorHint.cursorUV.x, cursorHint.cursorUV.y, cursorPlacement.targetDisparity,
+                                     cursorPlacement.disparity, cursorPlacement.height,
+                                     cursorPlacement.pose.position.x, cursorPlacement.pose.position.y,
+                                     cursorPlacement.pose.position.z);
+                        }
+                    }
 
                     // Multi-screen M3: with the window spanning displays the
                     // runtime hands out one view set per display; render ALL
@@ -2062,6 +2379,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
+    // XR_DXR_cursor_depth spec v5: who draws the cursor. Default: the runtime.
+    if (g_hasCursorDepthExt) {
+        const char* drawWho = getenv("DISPLAYXR_CURSOR_DEPTH_DRAW");
+        const bool wantApp = drawWho != nullptr && strcmp(drawWho, "app") == 0;
+        if (!wantApp && g_cursorDepthSpecVersion >= 5) {
+            g_cursorRuntimeDraw = true;
+            const char* sprite = getenv("DISPLAYXR_CURSOR_DEPTH_SPRITE");
+            g_cursorCustomSprite = sprite != nullptr && strcmp(sprite, "custom") == 0;
+        } else if (!wantApp) {
+            LOG_WARN("XR_DXR_cursor_depth v%u has no runtime-drawn cursor (needs v5) - hint only, OS cursor kept",
+                     g_cursorDepthSpecVersion);
+        }
+        LOG_INFO("XR_DXR_cursor_depth draw: %s",
+                 !g_cursorRuntimeDraw ? "APP (hint + placement only; OS cursor kept, no in-app crosshair)"
+                 : g_cursorCustomSprite ? "RUNTIME, custom sprite (cyan ring)"
+                                        : "RUNTIME, default look");
+    }
+
     // INV-1.3: open on the 3D panel (#715) — one-shot move to the panel's
     // desktop position reported by xrGetSystemProperties (virtual-screen
     // coords, top-down; (0,0) = primary/unknown is safe), BEFORE
@@ -2157,6 +2492,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         CleanupD3D11(renderer);
         ShutdownLogging();
         return 1;
+    }
+    if (g_cursorRuntimeDraw && g_cursorCustomSprite && !CreateCursorSprite(xr, renderer.context.Get())) {
+        LOG_WARN("Cursor sprite swapchain creation failed - using the runtime's default look");
+        g_cursorCustomSprite = false;
     }
 
     // Enumerate D3D11 swapchain images
@@ -2303,6 +2642,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     g_xr = nullptr;
     CleanupHands();
+    if (g_cursorSprite != XR_NULL_HANDLE) {
+        xrDestroySwapchain(g_cursorSprite);
+        g_cursorSprite = XR_NULL_HANDLE;
+    }
     CleanupOpenXR(xr);
     if (hudOk) CleanupHudRenderer(hudRenderer);
     CleanupD3D11(renderer);

@@ -19,6 +19,7 @@
 // Forward declarations
 struct comp_d3d12_compositor;
 struct xrt_system_devices;
+struct u_cursor_draw_request;
 
 #ifdef __cplusplus
 extern "C" {
@@ -119,6 +120,18 @@ comp_d3d12_compositor_get_window_metrics(struct xrt_compositor *xc,
  */
 void
 comp_d3d12_compositor_set_rear_budget_requested(struct xrt_compositor *xc, bool requested);
+
+/*!
+ * XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B): draw the cursor sprite into
+ * every view tile at the NEXT layer_commit only, after the app's layers and
+ * before the display processor. Called by the state tracker only on a frame
+ * whose locate chained XrCursorDepthDrawInfoDXR and reported willDraw; a
+ * compositor never handed a request does no cursor work at all.
+ *
+ * @ingroup comp_d3d12
+ */
+void
+comp_d3d12_compositor_set_cursor_draw_request(struct xrt_compositor *xc, const struct u_cursor_draw_request *req);
 
 /*!
  * XR_DXR_depth_budget: the latest budget the render thread computed.
