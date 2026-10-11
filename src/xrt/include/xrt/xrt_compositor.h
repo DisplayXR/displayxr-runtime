@@ -3121,6 +3121,17 @@ struct xrt_system_compositor_info
 	//! both plug-ins when the registry and scalar diverge (#1521).
 	char active_plugin_id[64];
 
+	/*!
+	 * macOS Vulkan-app routing (oxr_vk_route_via_metal): the discovery id of a
+	 * REGISTERED display plug-in whose iface offers a Metal DP factory but no
+	 * Vulkan one — whether or not it claimed a display at start (a plug-in
+	 * that declined still names its factories before probe()); "" if none.
+	 * A Vulkan app is then presented by the Metal compositor from the start,
+	 * so a panel hot-plugged later (ADR-047 Amendment 7) can be woven in a
+	 * segment; vk_native could never weave it. Filled with the DP registry.
+	 */
+	char metal_only_plugin_id[64];
+
 	//! ADR-045: the active plug-in is a FALLBACK (XRT_PLUGIN_PLATFORM_FLAG_FALLBACK).
 	//! A long-lived service keeps re-probing on a slow timer only while this is set.
 	bool active_plugin_is_fallback;

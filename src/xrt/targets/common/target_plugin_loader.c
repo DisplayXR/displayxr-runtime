@@ -33,6 +33,7 @@
 #include "target_plugin_path_guard.h"
 
 #include "xrt/xrt_plugin.h"
+#include "xrt/xrt_display_status.h"
 #include "xrt/xrt_compositor.h"
 #include "xrt/xrt_results.h"
 #include "xrt/xrt_config_os.h"
@@ -445,10 +446,21 @@ status_record_platform_state(const char *id, const struct xrt_plugin_iface *ifac
 	struct xrt_plugin_platform_status ps;
 	bool reported = query_platform_state(iface, &ps);
 	bool changed = false;
+	// The DP factories the iface offers (plain struct fields — no call, so
+	// valid before probe() and for a plug-in that is about to decline).
+	uint32_t apis = 0;
+	if (iface != NULL) {
+		apis |= iface->create_dp_vk != NULL ? XRT_STATUS_API_BIT_VK : 0u;
+		apis |= iface->create_dp_metal != NULL ? XRT_STATUS_API_BIT_METAL : 0u;
+		apis |= iface->create_dp_gl != NULL ? XRT_STATUS_API_BIT_GL : 0u;
+		apis |= iface->create_dp_d3d11 != NULL ? XRT_STATUS_API_BIT_D3D11 : 0u;
+		apis |= iface->create_dp_d3d12 != NULL ? XRT_STATUS_API_BIT_D3D12 : 0u;
+	}
 	status_lock();
 	int i = status_find_or_add_locked(id != NULL ? id : "?");
 	if (i >= 0) {
 		struct target_plugin_status *s = &g_status[i];
+		s->dp_apis = apis;
 		changed = s->platform_state != ps.state || strcmp(s->hint, ps.hint) != 0;
 		s->platform_state = ps.state;
 		s->platform_flags = ps.flags;
@@ -459,6 +471,29 @@ status_record_platform_state(const char *id, const struct xrt_plugin_iface *ifac
 		U_LOG_W("plugin loader:   %s: platform state %s%s%s", id != NULL ? id : "?",
 		        target_plugin_platform_state_str(ps.state), ps.hint[0] != '\0' ? " — " : "", ps.hint);
 	}
+}
+
+bool
+target_plugin_find_metal_only(char *out_id, size_t cap)
+{
+	if (out_id != NULL && cap > 0) {
+		out_id[0] = '\0';
+	}
+	bool found = false;
+	status_lock();
+	for (int i = 0; i < g_status_count && !found; i++) {
+		const struct target_plugin_status *s = &g_status[i];
+		if ((s->platform_flags & XRT_PLUGIN_PLATFORM_FLAG_FALLBACK) != 0 ||
+		    (s->dp_apis & XRT_STATUS_API_BIT_METAL) == 0 || (s->dp_apis & XRT_STATUS_API_BIT_VK) != 0) {
+			continue;
+		}
+		found = true;
+		if (out_id != NULL && cap > 0) {
+			snprintf(out_id, cap, "%s", s->id);
+		}
+	}
+	status_unlock();
+	return found;
 }
 
 const char *

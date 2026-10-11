@@ -216,9 +216,11 @@ oxr_vk_route_via_metal(struct oxr_system *sys)
 
 	const void *dp_vk = NULL;
 	const void *dp_metal = NULL;
+	const char *metal_only = "";
 	if (sys->xsysc != NULL) {
 		dp_vk = sys->xsysc->info.dp_factory_vk;
 		dp_metal = sys->xsysc->info.dp_factory_metal;
+		metal_only = sys->xsysc->info.metal_only_plugin_id;
 	}
 
 	bool route = false;
@@ -233,10 +235,26 @@ oxr_vk_route_via_metal(struct oxr_system *sys)
 		why = "forced off by DXR_MACOS_VK_VIA_METAL=0";
 		break;
 	default:
-		route = dp_vk == NULL && dp_metal != NULL;
-		why = route ? "active display processor offers a Metal weaver but no Vulkan one"
-		            : (dp_vk != NULL ? "active display processor offers a Vulkan weaver"
-		                             : "no display processor factory for either API");
+		/*
+		 * ANY registered display plug-in that can weave only with Metal —
+		 * not just the active one. A plug-in that declined at start (no
+		 * panel attached yet) still counts: with display hotplug (ADR-047
+		 * Amendment 7) its panel can arrive mid-session and be woven in a
+		 * segment, which only comp_metal does on macOS; a session started
+		 * on vk_native would never light it up. A box with only VK-capable
+		 * plug-ins (sim-display) keeps vk_native.
+		 */
+		if (metal_only[0] != '\0') {
+			route = true;
+			why = "a registered display plug-in weaves with Metal only";
+		} else if (dp_vk == NULL && dp_metal != NULL) {
+			route = true;
+			why = "active display processor offers a Metal weaver but no Vulkan one";
+		} else {
+			route = false;
+			why = dp_vk != NULL ? "every registered display plug-in offers a Vulkan weaver"
+			                    : "no display processor factory for either API";
+		}
 		break;
 	}
 
@@ -249,9 +267,12 @@ oxr_vk_route_via_metal(struct oxr_system *sys)
 
 	if (!logged) {
 		logged = true;
-		U_LOG_W("macOS Vulkan app route: %s (%s; dp_factory_vk=%s dp_factory_metal=%s)",
-		        route ? "Metal compositor (VK -> comp_vk_client -> comp_metal)" : "vk_native compositor", why,
-		        dp_vk != NULL ? "yes" : "no", dp_metal != NULL ? "yes" : "no");
+		U_LOG_W(
+		    "macOS Vulkan app route: %s (%s; active dp_factory_vk=%s dp_factory_metal=%s; Metal-only "
+		    "plug-in registered: %s)",
+		    route ? "Metal compositor (VK -> comp_vk_client -> comp_metal)" : "vk_native compositor", why,
+		    dp_vk != NULL ? "yes" : "no", dp_metal != NULL ? "yes" : "no",
+		    metal_only[0] != '\0' ? metal_only : "none");
 	}
 	return route;
 #else

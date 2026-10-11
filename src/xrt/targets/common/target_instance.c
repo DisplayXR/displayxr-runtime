@@ -188,6 +188,11 @@ build_dp_registry(struct xrt_system_compositor_info *info)
 	struct xrt_dp_factory_registry reg;
 	target_plugin_resolve_displays(descs, dn, &reg);
 	info->dp_registry = reg;
+
+	// Resolving the claims loaded every registered plug-in once, so the
+	// loader now knows each one's DP factories — including one that declined
+	// (no panel attached yet). macOS VK routing reads this.
+	(void)target_plugin_find_metal_only(info->metal_only_plugin_id, sizeof(info->metal_only_plugin_id));
 }
 
 static void

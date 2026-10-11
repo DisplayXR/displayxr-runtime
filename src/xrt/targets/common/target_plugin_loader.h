@@ -231,6 +231,9 @@ struct target_plugin_status
 	char reason[160];
 	//! A FALLBACK plug-in (same rule as @ref target_plugin_iface_is_fallback).
 	bool fallback;
+	//! `XRT_STATUS_API_BIT_*` DP factories the iface offers, recorded before
+	//! probe() — so known for a plug-in that then DECLINED too; 0 if never loaded.
+	uint32_t dp_apis;
 };
 
 /*!
@@ -242,6 +245,15 @@ struct target_plugin_status
  */
 int
 target_plugin_get_status(struct target_plugin_status *out, int max);
+
+/*!
+ * The first registered plug-in (in first-seen / probe order) that offers a
+ * Metal DP factory but no Vulkan one, from what the loader recorded before each
+ * probe() — a plug-in that loaded and declined counts. Never loads anything.
+ * Fallback plug-ins are skipped. Returns false (and "") when there is none.
+ */
+bool
+target_plugin_find_metal_only(char *out_id, size_t cap);
 
 //! Short stable name for a @ref target_plugin_load_result ("ACTIVE", ...).
 const char *
