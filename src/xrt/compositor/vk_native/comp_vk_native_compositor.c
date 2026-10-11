@@ -1057,6 +1057,12 @@ struct comp_vk_native_compositor
 		//! seeds its marks from this; without it VK_FSTAGE_PRE measured from
 		//! zero, i.e. from the epoch.
 		uint64_t fp0;
+#ifdef VK_MIDFRAME_FILL
+		//! #1905 ask 2: the requester did NOT wait for this serve (non-blocking
+		//! hand-off). The serve loop then runs the app frame's post-weave tail
+		//! itself (vk_async_handoff_tail) — nobody else is left to run it.
+		bool async;
+#endif
 		/*
 		 * There is deliberately no pointer to the requester's fp[] here. It
 		 * used to be one, and it was only valid while that frame was still
@@ -1137,6 +1143,46 @@ struct comp_vk_native_compositor
 		struct os_mutex mutex;
 		struct os_cond cond;
 	} weave_hand;
+#ifdef VK_MIDFRAME_FILL
+	/*!
+	 * #1905 ask 2: non-blocking in-process hand-off (Android, single ownership).
+	 *
+	 * xrEndFrame posts the weave request and returns once the frame is
+	 * COMMITTED: layers published to layer_accum and the app's projection
+	 * images blitted into the runtime atlas (renderer_draw waits its own
+	 * submit, so those reads are complete). The bound — at most ONE posted,
+	 * unserved weave — is enforced at the top of the NEXT layer_commit
+	 * (vk_async_handoff_drain), before anything the outstanding weave reads
+	 * (layer_accum, eff_layout, the atlas) is overwritten. See the design
+	 * note at vk_async_handoff_eligible.
+	 */
+	struct
+	{
+		//! Resolved once at create (dxr_async_handoff_resolve).
+		bool enabled;
+		//! The serial of the posted-but-not-awaited request; 0 = none.
+		//! Under weave_hand.mutex: set at the post, cleared only by
+		//! layer_commit's drain. Other app-thread drains (the zone-mask
+		//! entry points, which may run on any app thread) only wait on it.
+		uint64_t outstanding_seq;
+		//! TRACE, all under weave_hand.mutex: EMA of the app thread's
+		//! hand-off wait — the post->served wait on a blocking frame, the
+		//! commit drain on a non-blocking one — and the window tallies
+		//! (snapshotted + zeroed with the #1905 row): frames posted
+		//! non-blocking / blocking, and commit drains that actually had to
+		//! wait (> 0.5 ms — the previous weave was still unserved: the bound).
+		uint64_t wait_ema_ns;
+		uint32_t win_async, win_sync, win_stalls;
+		/*!
+		 * The weave thread is serving a non-blocking request right now.
+		 * Weave thread only, set and cleared under c->mutex around the
+		 * vk_dp_weave_and_present call. Routes that serve's queue work —
+		 * acquire wait, pre-DP flush, weave submit + frame fence, present —
+		 * onto the runtime-owned queue (see the comment at the queue choice).
+		 */
+		bool serving;
+	} hand_async;
+#endif
 	//! Paired with c->mutex. #1394 moved the weave hand-off onto its own
 	//! leaf lock (weave_hand.mutex/cond), so nothing signals this today; it
 	//! stays as the compositor-lock condvar for future use.
@@ -6340,6 +6386,31 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 	 */
 	VkQueue queue =
 	    (is_repaint && c->repaint_queue != VK_NULL_HANDLE) ? c->repaint_queue : vk->main_queue->queue;
+#ifdef VK_MIDFRAME_FILL
+	/*
+	 * #1905 ask 2: a NON-BLOCKING app weave goes to the runtime-owned queue
+	 * too. Measured on the Lume phone with it on the app's queue: the app had
+	 * already submitted its next frame there, so the acquire's
+	 * vkQueueWaitIdle, the pre-DP flush's vkQueueWaitIdle and the frame-fence
+	 * wait all queued behind the app's GPU work — the serve took ~22 ms wall,
+	 * the app's next post was always pending when it ended, and every fill
+	 * yielded (fills 28/s -> 0, GetFace 54 -> 32 Hz).
+	 *
+	 * Safe to move: the atlas is complete on the host before the request is
+	 * posted (renderer_draw waits its own submit on the app thread), both
+	 * queues are the same family (no ownership transfer), and fills already
+	 * sample that same atlas from this queue. The DP was created against this
+	 * queue (#868, vk_make_dp_vk), so the vendor weave's own submits are here
+	 * already. Fills run on this thread, so the queue holds only this serve's
+	 * work and its waits drain nothing of the app's. The non-blocking switch
+	 * requires a runtime-owned queue (dxr_async_handoff_resolve).
+	 */
+	const bool serve_rt = !is_repaint && c->hand_async.serving && c->repaint_queue != VK_NULL_HANDLE &&
+	                      c->repaint_cmd_pool != VK_NULL_HANDLE;
+	if (serve_rt) {
+		queue = c->repaint_queue;
+	}
+#endif
 
 	// Re-sync the output surface against the live ANativeWindow (Android).
 	// On background→card the SurfaceView's surface is destroyed; presenting
@@ -6434,6 +6505,13 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 	VkCommandPool cmd_pool = is_repaint && c->repaint_cmd_pool != VK_NULL_HANDLE
 	                             ? c->repaint_cmd_pool
 	                             : (VkCommandPool)(uintptr_t)comp_vk_native_renderer_get_cmd_pool(c->renderer);
+#ifdef VK_MIDFRAME_FILL
+	// #1905 ask 2: and its own pool — the renderer's belongs to the app
+	// thread (renderer_draw, the zone-mask API).
+	if (serve_rt) {
+		cmd_pool = c->repaint_cmd_pool;
+	}
+#endif
 
 	VkCommandBufferAllocateInfo alloc_info = {
 	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
@@ -7829,6 +7907,277 @@ vk_midframe_active(const struct comp_vk_native_compositor *c)
 	       c->repaint.force != 1;
 }
 
+/*
+ * #1905 ask 2 — non-blocking in-process hand-off.
+ *
+ * WHAT THE BLOCKING WAIT PROTECTED. Not the app's projection images:
+ * comp_vk_native_renderer_draw blits them into the runtime atlas and waits
+ * its own submit on the app thread, before the request is posted. What the
+ * served weave still reads is (a) the single runtime atlas, (b) compositor
+ * state the commit wrote for it (layer_accum, eff_layout, repaint.view_*,
+ * the capture source), and (c) on some frames the APP's swapchain images
+ * directly — window-space layers composited into the atlas, the Local2D
+ * flatten/composite, and zones. (a) and (b) are only rewritten by the NEXT
+ * layer_commit, under c->mutex; (c) is rewritten whenever the app reacquires.
+ *
+ * SO: no second atlas. The next commit drains the outstanding request
+ * (vk_async_handoff_drain) before it publishes layer_stage or touches the
+ * atlas — that IS the depth-1 bound, and since everything the weave reads is
+ * written only after it, the single atlas is never overwritten mid-sample.
+ * A second atlas would buy nothing: commit and weave serialise on c->mutex
+ * anyway. Frames whose weave reads app images (c) keep the
+ * blocking wait (vk_async_handoff_eligible), as do zero-copy frames (the
+ * "atlas" is then the app's own image).
+ *
+ * The served weave now runs while the app is submitting its next frame, so
+ * its queue work goes to the runtime-owned queue (see the queue choice in
+ * vk_dp_weave_and_present) — on the app's queue it queued behind the app's
+ * GPU work and starved the fills. The switch still requires
+ * VK_LAYER_DXR_queue_lock (the #902 marker the mid-frame fill keys on): on
+ * Adreno the runtime queue shares the GSL context with the app's, the race
+ * #1910 measured. Auto-ON on that layer (dxr_async_handoff_resolve).
+ */
+static bool
+dxr_async_handoff_resolve(bool layer_live, bool rt_queue, int single)
+{
+	/*
+	 * AUTO-ON: on when the queue-lock layer is live, single weave ownership
+	 * is on and a runtime-owned queue exists. Measured on the Lume phone
+	 * (earthview, layer live, serve on the runtime queue): GetFace 53.8 ->
+	 * 59.8 Hz (flat 60 Hz presents), fills 28 -> 26/s, hand-off wait 6.0 ->
+	 * 0.54 ms, app +11%. Exactly "1" forces ON (still needs single ownership
+	 * and a runtime queue — without them it is unsafe or a regression), exactly
+	 * "0" disables, anything else is auto. The env, when set non-empty, wins
+	 * over the prop.
+	 */
+	int forced = -1; // -1 = auto
+	const char *e = getenv("DXR_ASYNC_HANDOFF");
+	if (e != NULL && e[0] != '\0') {
+		forced = strcmp(e, "1") == 0 ? 1 : strcmp(e, "0") == 0 ? 0 : -1;
+	}
+#ifdef XRT_OS_ANDROID
+	else {
+		char sp[PROP_VALUE_MAX] = {0};
+		if (__system_property_get("debug.dxr.async_handoff", sp) > 0) {
+			forced = strcmp(sp, "1") == 0 ? 1 : strcmp(sp, "0") == 0 ? 0 : -1;
+		}
+	}
+#endif
+	const bool base = single == 1 && rt_queue;
+	const bool on = forced == 0 ? false : forced == 1 ? base : (base && layer_live);
+	U_LOG_W(
+	    "#1905: non-blocking frame hand-off %s — %s (DXR_ASYNC_HANDOFF / debug.dxr.async_handoff: \"1\" forces "
+	    "ON, \"0\" disables, anything else = auto on the queue-lock layer)",
+	    on ? "ON" : "OFF",
+	    forced == 0   ? "disabled"
+	    : single != 1 ? "needs single weave ownership (#1196), which is off"
+	    : !rt_queue   ? "no runtime-owned VkQueue: the serve would queue behind the app's next frame on its "
+	                    "queue and starve the fills"
+	    : forced == 1 ? (layer_live ? "forced ON; VK_LAYER_DXR_queue_lock is live"
+	                                : "forced ON WITHOUT VK_LAYER_DXR_queue_lock: app submits are NOT serialised "
+	                                  "with the weave thread's, expect Adreno GSL -3 / lost app submits")
+	    : layer_live  ? "auto: VK_LAYER_DXR_queue_lock is live and the serve runs on the runtime-owned queue"
+	                  : "auto: VK_LAYER_DXR_queue_lock absent on this device — xrEndFrame keeps waiting for the "
+	                    "weave");
+	return on;
+}
+
+/*!
+ * #1905 ask 2: may THIS frame's weave run without the app waiting for it?
+ * Only when the served weave reads nothing the app owns — see the design
+ * note above. Called under c->mutex, after the frame's layer scan.
+ */
+static bool
+vk_async_handoff_eligible(const struct comp_vk_native_compositor *c, bool zero_copy)
+{
+	if (!c->hand_async.enabled || zero_copy || c->local_2d_last_frame || c->zones_frame ||
+	    c->active_zone_mask != NULL) {
+		return false;
+	}
+	// The serve must be able to run on the runtime-owned queue + pool (the
+	// pool is created after the switch resolves and its failure drops the
+	// queue) — on the app's queue it starves the fills.
+	if (c->repaint_queue == VK_NULL_HANDLE || c->repaint_cmd_pool == VK_NULL_HANDLE) {
+		return false;
+	}
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		if (c->layer_accum.layers[i].data.type == XRT_LAYER_WINDOW_SPACE) {
+			return false; // composited from the app's image AT weave time
+		}
+	}
+	return true;
+}
+
+//! TRACE: fold one app-side hand-off wait into the EMA. weave_hand.mutex held.
+static void
+vk_async_note_wait(struct comp_vk_native_compositor *c, uint64_t d)
+{
+	const uint64_t ema = c->hand_async.wait_ema_ns;
+	c->hand_async.wait_ema_ns = ema == 0 ? (d == 0 ? 1 : d) : (ema * 7 + d) / 8;
+}
+
+enum vk_async_drain
+{
+	VK_ASYNC_DRAIN_CLEAR,      //!< nothing outstanding, or it was served; c->mutex NOT held
+	VK_ASYNC_DRAIN_LOCK_TAKEN, //!< abandoned late weave; c->mutex IS held (trylock won)
+	VK_ASYNC_DRAIN_WEDGED,     //!< abandoned and c->mutex held by the weave: drop this frame
+};
+
+/*!
+ * #1905 ask 2: THE BOUND. Wait for the posted-but-unawaited weave before the
+ * caller touches anything it reads or records from. In the normal case (app
+ * frame longer than the weave) it was served long ago and this returns at once.
+ *
+ * @p from_commit: layer_commit's drain consumes the request (clears
+ * outstanding_seq) and feeds the trace; any other app-thread entry point (the
+ * zone-mask API — its state is read by the serve's tail, and the tail's
+ * trigger-gated captures record on the renderer's pool and submit on the app
+ * queue, as the zone-mask API does) only waits for it.
+ *
+ * Same 2 s deadline, abandon-by-serial and trylock evidence test as the
+ * blocking wait in layer_commit (#1394), for the same reasons — repeated here
+ * rather than shared so the non-Android frame path stays byte-identical.
+ * Called with c->mutex NOT held.
+ */
+static enum vk_async_drain
+vk_async_handoff_drain(struct comp_vk_native_compositor *c, bool from_commit)
+{
+	const uint64_t t0 = os_monotonic_get_ns();
+	bool abandoned = false;
+	os_mutex_lock(&c->weave_hand.mutex);
+	const uint64_t my_seq = c->hand_async.outstanding_seq;
+	if (my_seq == 0) {
+		os_mutex_unlock(&c->weave_hand.mutex);
+		return VK_ASYNC_DRAIN_CLEAR;
+	}
+	if (from_commit) {
+		c->hand_async.outstanding_seq = 0;
+	}
+	const uint64_t deadline_ns = t0 + 2ULL * 1000 * 1000 * 1000;
+	while (c->weave_hand.pending && c->weave_hand.seq == my_seq) {
+		os_cond_wait_timeout_ns(&c->weave_hand.cond, &c->weave_hand.mutex, 100ULL * 1000 * 1000);
+		if (!c->weave_hand.pending || c->weave_hand.seq != my_seq) {
+			break;
+		}
+		if ((uint64_t)os_monotonic_get_ns() < deadline_ns) {
+			continue;
+		}
+		// Expired: withdraw, so a serve that completes later is dropped.
+		c->weave_hand.pending = false;
+		c->weave_hand.seq++;
+		c->weave_hand.result = XRT_SUCCESS;
+		c->weave_hand.skip_frame = true;
+		abandoned = true;
+		break;
+	}
+	if (!abandoned) {
+		c->weave_hand.consecutive_expiries = 0;
+	}
+	if (from_commit) {
+		const uint64_t d = os_monotonic_get_ns() - t0;
+		vk_async_note_wait(c, d);
+		if (d > 500ULL * 1000) {
+			c->hand_async.win_stalls++;
+		}
+	}
+	const uint64_t hb_at_expiry = c->weave_hand.heartbeat;
+	os_mutex_unlock(&c->weave_hand.mutex);
+
+	if (!abandoned) {
+		return VK_ASYNC_DRAIN_CLEAR;
+	}
+
+	// The #1394 evidence test, verbatim in intent: a free c->mutex means the
+	// weave is late, not gone (escalate only on repetition); a held one means
+	// it is parked inside the vendor weaver.
+	c->weave_hand.consecutive_expiries++;
+	if (os_mutex_trylock(&c->mutex) == 0) {
+		c->repaint.armed = false;
+		if (c->weave_hand.consecutive_expiries >= 3) {
+			c->weave_hand.wedged_heartbeat = hb_at_expiry;
+			c->weave_hand.wedged = true;
+			U_LOG_E(
+			    "#1394/#1905: %u consecutive 2 s expiries on the non-blocking hand-off — treating the "
+			    "weave as wedged even though c->mutex is free.",
+			    c->weave_hand.consecutive_expiries);
+		} else {
+			U_LOG_W(
+			    "#1394/#1905: the previous frame's weave took over 2 s — dropped it (%u in a row); "
+			    "c->mutex is free, so the weave thread is late, not wedged.",
+			    c->weave_hand.consecutive_expiries);
+		}
+		return VK_ASYNC_DRAIN_LOCK_TAKEN;
+	}
+	c->repaint.armed = false;
+	c->weave_hand.wedged_heartbeat = hb_at_expiry;
+	c->weave_hand.wedged = true;
+	U_LOG_E(
+	    "#1394/#1905: weave thread unresponsive for 2 s and c->mutex is held — abandoning the weave "
+	    "(non-blocking hand-off drain). The app keeps running; the window will not update until the "
+	    "thread returns.");
+	return VK_ASYNC_DRAIN_WEDGED;
+}
+
+/*!
+ * #1905 ask 2: drain for an app-thread entry point outside layer_commit (the
+ * zone-mask API). Returns false when the weave is wedged — the caller then
+ * fails rather than race a parked weave's tail on the renderer's pool.
+ */
+static bool
+vk_async_handoff_quiesce(struct comp_vk_native_compositor *c)
+{
+	switch (vk_async_handoff_drain(c, /*from_commit=*/false)) {
+	case VK_ASYNC_DRAIN_LOCK_TAKEN: os_mutex_unlock(&c->mutex); return true;
+	case VK_ASYNC_DRAIN_WEDGED: return false;
+	default: return true;
+	}
+}
+
+/*!
+ * #1905 ask 2: the app frame's post-weave tail, for a request nobody waited
+ * on. Mirrors what layer_commit runs after a served blocking weave (the #902
+ * app-interval EMA, the #1257 gate, the ADR-027 zone sideband, the
+ * post-compose capture and the composite tap). Weave thread, c->mutex held —
+ * the same lock the blocking path runs it under, so the serialisation is
+ * unchanged; only the thread differs.
+ */
+static void
+vk_async_handoff_tail(struct comp_vk_native_compositor *c, bool skip_frame, xrt_result_t xret)
+{
+	if (skip_frame) {
+		return;
+	}
+	if (xret != XRT_SUCCESS) {
+		// A blocking frame returned this from xrEndFrame; nobody is waiting
+		// now, so it is logged (throttled) and the frame is lost — exactly
+		// what happens to a failed fill.
+		static uint64_t s_logged_ns = 0;
+		const uint64_t now_ns = os_monotonic_get_ns();
+		if (s_logged_ns == 0 || now_ns - s_logged_ns > 5ULL * 1000 * 1000 * 1000) {
+			s_logged_ns = now_ns;
+			U_LOG_W(
+			    "#1905: non-blocking app weave failed (xrt_result %d) — frame dropped. Throttled to one "
+			    "line per 5 s.",
+			    (int)xret);
+		}
+		return;
+	}
+	const uint64_t now_af = os_monotonic_get_ns();
+	if (c->repaint.last_app_frame_ns != 0) {
+		const uint64_t d = now_af - c->repaint.last_app_frame_ns;
+		if (d > 1000000ULL && d < 500000000ULL) {
+			c->repaint.app_interval_ns =
+			    c->repaint.app_interval_ns == 0 ? d : (c->repaint.app_interval_ns * 7 + d) / 8;
+		}
+	}
+	c->repaint.last_app_frame_ns = now_af;
+	u_repaint_gate_on_app_frame(&c->repaint.gate, c->repaint.last_app_frame_ns);
+
+	vk_sync_zone_mask_to_dp(c);
+	vk_native_dispatch_capture(c, MCP_CAPTURE_MODE_POST_COMPOSE);
+	vk_native_dispatch_composite_tap(c);
+}
+
 /*!
  * #1905: may a present-paced fill start at @p now_ns? OR-ed with the legacy
  * gate between app frames (there it only ever ADDS fills); AND-ed with it while
@@ -8075,6 +8424,9 @@ vk_repaint_thread(void *ptr)
 		uint64_t h_zc_image = 0, h_zc_view = 0;
 		int32_t h_zc_format = 0;
 		uint32_t h_zc_w = 0, h_zc_h = 0, h_tgt_w = 0, h_tgt_h = 0;
+#ifdef VK_MIDFRAME_FILL
+		bool h_async = false;
+#endif
 
 		os_mutex_lock(&c->weave_hand.mutex);
 		if (!c->weave_hand.pending) {
@@ -8093,6 +8445,9 @@ vk_repaint_thread(void *ptr)
 			h_tgt_h = c->weave_hand.tgt_height;
 			h_ftime = c->weave_hand.ftime;
 			h_fp0 = c->weave_hand.fp0;
+#ifdef VK_MIDFRAME_FILL
+			h_async = c->weave_hand.async;
+#endif
 		}
 		os_mutex_unlock(&c->weave_hand.mutex);
 
@@ -8132,11 +8487,32 @@ vk_repaint_thread(void *ptr)
 			if (os_thread_helper_is_running(&c->repaint_thread) && c->display_processor != NULL &&
 			    c->target != NULL) {
 				h_skip = false;
+#ifdef VK_MIDFRAME_FILL
+				c->hand_async.serving = h_async;
+#endif
 				h_result = vk_dp_weave_and_present(c, /*is_repaint=*/false, h_zero_copy, h_zc_image,
 				                                   h_zc_view, h_zc_format, h_zc_w, h_zc_h, h_tgt_w,
 				                                   h_tgt_h, h_ftime, h_fp, &h_skip);
+#ifdef VK_MIDFRAME_FILL
+				c->hand_async.serving = false;
+#endif
 			}
 			// else: torn down under the waiter. Fail the frame, never strand it.
+#ifdef VK_MIDFRAME_FILL
+			// #1905 ask 2: nobody waits for a non-blocking request, so its
+			// post-weave tail runs here, still under c->mutex.
+			// Only for a request that is still the live one: a serve the
+			// requester abandoned (#1394) must not stamp the gate or consume
+			// a capture. c->mutex -> weave_hand.mutex is the legal order.
+			if (h_async) {
+				os_mutex_lock(&c->weave_hand.mutex);
+				const bool live = c->weave_hand.pending && c->weave_hand.seq == serve_seq;
+				os_mutex_unlock(&c->weave_hand.mutex);
+				if (live) {
+					vk_async_handoff_tail(c, h_skip, h_result);
+				}
+			}
+#endif
 			os_mutex_unlock(&c->mutex);
 #ifdef VK_MIDFRAME_FILL
 			// #1905: the app weave's present is the "last present" a mid-frame
@@ -8180,18 +8556,29 @@ vk_repaint_thread(void *ptr)
 				const uint64_t win = c->repaint.mf.win_start_ns != 0 && tn > c->repaint.mf.win_start_ns
 				                         ? tn - c->repaint.mf.win_start_ns
 				                         : 0;
+				os_mutex_lock(&c->weave_hand.mutex);
+				const uint32_t ha_async = c->hand_async.win_async;
+				const uint32_t ha_total = c->hand_async.win_async + c->hand_async.win_sync;
+				const uint32_t ha_stalls = c->hand_async.win_stalls;
+				const double ha_wait_ms = (double)c->hand_async.wait_ema_ns / 1e6;
+				c->hand_async.win_async = 0;
+				c->hand_async.win_sync = 0;
+				c->hand_async.win_stalls = 0;
+				os_mutex_unlock(&c->weave_hand.mutex);
 				const double duty_pct =
 				    win != 0 ? 100.0 * (double)c->repaint.mf.win_busy_ns / (double)win : 0.0;
 				U_LOG_W(
 				    "#1905 trace site=vk midframe{on=%d legacy_fires=%u midframe_fires=%u in_frame=%u "
 				    "skip_pending=%u skip_duty=%u duty=%.0f%%/%u%% fill_ema=%.2fms parked_ema=%.2fms "
-				    "app_iv=%.1fms park=%d layer=%d}",
+				    "app_iv=%.1fms park=%d layer=%d} handoff{async=%d frames=%u/%u wait_ema=%.2fms "
+				    "stalls=%u}",
 				    (int)vk_midframe_active(c), c->repaint.mf.legacy_fires,
 				    c->repaint.mf.midframe_fires, c->repaint.mf.in_frame, c->repaint.mf.skip_pending,
 				    c->repaint.mf.skip_duty, duty_pct, dxr_midframe_fill_duty(),
 				    (double)c->repaint.mf.fill_ema_ns / 1e6, (double)c->repaint.mf.parked_ema_ns / 1e6,
 				    (double)c->repaint.mf.serve_iv_ema_ns / 1e6, (int)dxr_midframe_fill_park(),
-				    (int)c->repaint.mf.layer_live);
+				    (int)c->repaint.mf.layer_live, (int)c->hand_async.enabled, ha_async, ha_total,
+				    ha_wait_ms, ha_stalls);
 				c->repaint.mf.legacy_fires = 0;
 				c->repaint.mf.midframe_fires = 0;
 				c->repaint.mf.in_frame = 0;
@@ -9542,6 +9929,11 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 				 * withdrawn here can only be dropped, never served late.
 				 */
 				uint64_t my_seq;
+#ifdef VK_MIDFRAME_FILL
+				// #1905 ask 2: decided here, under c->mutex, from this frame's
+				// committed layers (see vk_async_handoff_eligible).
+				const bool async_post = vk_async_handoff_eligible(c, zero_copy);
+#endif
 				os_mutex_lock(&c->weave_hand.mutex);
 				c->weave_hand.zero_copy = zero_copy;
 				c->weave_hand.zc_image_u64 = zc_image_u64;
@@ -9555,10 +9947,35 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 				c->weave_hand.fp0 = fp[0];
 				c->weave_hand.result = XRT_SUCCESS;
 				c->weave_hand.skip_frame = false;
+#ifdef VK_MIDFRAME_FILL
+				c->weave_hand.async = async_post;
+#endif
 				my_seq = ++c->weave_hand.seq;
 				c->weave_hand.pending = true;
+#ifdef VK_MIDFRAME_FILL
+				if (async_post) {
+					c->hand_async.outstanding_seq = my_seq;
+					c->hand_async.win_async++;
+				} else {
+					c->hand_async.win_sync++;
+				}
+#endif
 				os_cond_broadcast(&c->weave_hand.cond);
 				os_mutex_unlock(&c->weave_hand.mutex);
+#ifdef VK_MIDFRAME_FILL
+				if (async_post) {
+					/*
+					 * #1905 ask 2: COMMITTED — return without waiting. The
+					 * weave thread serves it as soon as the wrapper drops
+					 * c->mutex and runs the frame's tail itself; the next
+					 * layer_commit drains it before overwriting anything it
+					 * reads (the depth-1 bound). Every return path below
+					 * that tail would have taken is the weave thread's now.
+					 */
+					return XRT_SUCCESS;
+				}
+				const uint64_t hand_t0 = os_monotonic_get_ns();
+#endif
 
 				/*
 				 * #1394: hand the compositor lock over EXPLICITLY.
@@ -9622,6 +10039,11 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 				// runs against its own array seeded from weave_hand.fp0.
 				const uint64_t hb_at_expiry = c->weave_hand.heartbeat;
 				os_mutex_unlock(&c->weave_hand.mutex);
+#ifdef VK_MIDFRAME_FILL
+				os_mutex_lock(&c->weave_hand.mutex);
+				vk_async_note_wait(c, os_monotonic_get_ns() - hand_t0);
+				os_mutex_unlock(&c->weave_hand.mutex);
+#endif
 
 				if (abandoned) {
 					/*
@@ -9839,7 +10261,25 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	}
 
 	bool lock_released = false;
+#ifdef VK_MIDFRAME_FILL
+	/*
+	 * #1905 ask 2: the depth-1 bound. The previous frame's non-blocking weave
+	 * must be served before this frame republishes layer_accum or re-renders
+	 * the atlas it samples. Normally long done (returns at once); otherwise
+	 * this is where the app waits — at most one frame ahead of the weave.
+	 */
+	const enum vk_async_drain drain = vk_async_handoff_drain(c, /*from_commit=*/true);
+	if (drain == VK_ASYNC_DRAIN_WEDGED) {
+		c->repaint.app_frame_in_progress = false;
+		c->repaint.app_submit_window = false;
+		return XRT_SUCCESS;
+	}
+	if (drain != VK_ASYNC_DRAIN_LOCK_TAKEN) {
+		os_mutex_lock(&c->mutex);
+	}
+#else
 	os_mutex_lock(&c->mutex);
+#endif
 #ifdef VK_MIDFRAME_FILL
 	// #1905: publish the app's privately accumulated frame under the lock —
 	// the only place layer_accum is written on Android. Only the used layers
@@ -11418,6 +11858,13 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		// dxr_midframe_fill_resolve). Logged once with the reason.
 		c->repaint.mf.layer_live = layer_live;
 		c->repaint.mf.enabled = dxr_midframe_fill_resolve(layer_live);
+		// #1905 ask 2: the non-blocking hand-off keys on the same marker.
+		// Its serve runs on the runtime-owned queue (never the app's, where it
+		// would queue behind the app's next frame), concurrently with the
+		// app's own submits — on Adreno both share one GSL context, so the
+		// layer must serialise them, exactly as for the fill.
+		c->hand_async.enabled =
+		    dxr_async_handoff_resolve(layer_live, c->repaint_queue != VK_NULL_HANDLE, c->weave_hand.enabled);
 #endif
 
 		if (c->repaint_queue == VK_NULL_HANDLE && c->repaint.shared_queue == 0) {
@@ -16443,6 +16890,14 @@ xrt_result_t
 comp_vk_native_compositor_zone_mask_create(struct xrt_compositor *xc, uint32_t w, uint32_t h, void **out_mask)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	// #1905 ask 2: these record on the renderer's command pool and submit on
+	// the app queue, as the outstanding weave's tail may (trigger-gated
+	// captures), and they change zone state the tail reads — drain it first.
+	if (!vk_async_handoff_quiesce(c)) {
+		return XRT_ERROR_VULKAN;
+	}
+#endif
 	struct vk_bundle *vk = &c->vk;
 	if (out_mask == NULL || !c->local2d_initialized) {
 		return XRT_ERROR_ALLOCATION;
@@ -16517,6 +16972,14 @@ xrt_result_t
 comp_vk_native_compositor_zone_mask_set_whole(struct xrt_compositor *xc, void *mask_ptr, bool enable_3d)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	// #1905 ask 2: these record on the renderer's command pool and submit on
+	// the app queue, as the outstanding weave's tail may (trigger-gated
+	// captures), and they change zone state the tail reads — drain it first.
+	if (!vk_async_handoff_quiesce(c)) {
+		return XRT_ERROR_VULKAN;
+	}
+#endif
 	struct vk_bundle *vk = &c->vk;
 	struct comp_vk_native_zone_mask *mask = (struct comp_vk_native_zone_mask *)mask_ptr;
 	if (mask == NULL || mask->fb == VK_NULL_HANDLE) {
@@ -16545,6 +17008,14 @@ comp_vk_native_compositor_zone_mask_set_rects(struct xrt_compositor *xc,
                                               const struct xrt_rect *rects)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	// #1905 ask 2: these record on the renderer's command pool and submit on
+	// the app queue, as the outstanding weave's tail may (trigger-gated
+	// captures), and they change zone state the tail reads — drain it first.
+	if (!vk_async_handoff_quiesce(c)) {
+		return XRT_ERROR_VULKAN;
+	}
+#endif
 	struct vk_bundle *vk = &c->vk;
 	struct comp_vk_native_zone_mask *mask = (struct comp_vk_native_zone_mask *)mask_ptr;
 	if (mask == NULL || mask->fb == VK_NULL_HANDLE || (count > 0 && rects == NULL)) {
@@ -16576,6 +17047,14 @@ comp_vk_native_compositor_zone_mask_acquire_rt(struct xrt_compositor *xc,
                                                uint32_t *out_h)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	// #1905 ask 2: these record on the renderer's command pool and submit on
+	// the app queue, as the outstanding weave's tail may (trigger-gated
+	// captures), and they change zone state the tail reads — drain it first.
+	if (!vk_async_handoff_quiesce(c)) {
+		return XRT_ERROR_VULKAN;
+	}
+#endif
 	struct vk_bundle *vk = &c->vk;
 	struct comp_vk_native_zone_mask *mask = (struct comp_vk_native_zone_mask *)mask_ptr;
 	if (mask == NULL || mask->tex == VK_NULL_HANDLE || out_image == NULL || out_image_view == NULL ||
@@ -16608,6 +17087,14 @@ xrt_result_t
 comp_vk_native_compositor_zone_mask_submit(struct xrt_compositor *xc, void *mask_ptr)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	// #1905 ask 2: these record on the renderer's command pool and submit on
+	// the app queue, as the outstanding weave's tail may (trigger-gated
+	// captures), and they change zone state the tail reads — drain it first.
+	if (!vk_async_handoff_quiesce(c)) {
+		return XRT_ERROR_VULKAN;
+	}
+#endif
 	struct vk_bundle *vk = &c->vk;
 	struct comp_vk_native_zone_mask *mask = (struct comp_vk_native_zone_mask *)mask_ptr;
 	if (mask == NULL || mask->tex == VK_NULL_HANDLE || mask->staged == VK_NULL_HANDLE) {
@@ -16663,6 +17150,21 @@ comp_vk_native_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mas
 	if (mask == NULL) {
 		return;
 	}
+#ifdef VK_MIDFRAME_FILL
+	/*
+	 * #1905 ask 2: an outstanding non-blocking weave runs its tail
+	 * (vk_sync_zone_mask_to_dp -> active_zone_mask) on the weave thread, so
+	 * drain it, then unhook the mask under c->mutex — the lock that tail (and
+	 * every weave) reads it under — before freeing. Skipped only while the
+	 * weave is wedged holding c->mutex (#1394): blocking there would hang the
+	 * app, and a parked weave reads nothing.
+	 */
+	(void)vk_async_handoff_quiesce(c);
+	const bool zm_locked = !vk_weave_blocked(c);
+	if (zm_locked) {
+		os_mutex_lock(&c->mutex);
+	}
+#endif
 	vk->vkDeviceWaitIdle(vk->device); // mask may be in flight
 	if (c->active_zone_mask == mask) {
 		c->active_zone_mask = NULL; // revert to implicit / legacy behavior
@@ -16679,6 +17181,11 @@ comp_vk_native_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mas
 	if (c->zone_wish_view == mask->staged_view) {
 		c->zone_wish_view = VK_NULL_HANDLE;
 	}
+#ifdef VK_MIDFRAME_FILL
+	if (zm_locked) {
+		os_mutex_unlock(&c->mutex);
+	}
+#endif
 	vk_destroy_rt(c, &mask->staged, &mask->staged_mem, &mask->staged_view, NULL);
 	vk_destroy_rt(c, &mask->tex, &mask->tex_mem, &mask->tex_view, &mask->fb);
 	free(mask);
