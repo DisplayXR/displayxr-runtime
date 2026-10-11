@@ -690,7 +690,7 @@ sprite and the depth, and the runtime owns the drawing. Apps get the same contra
   neighbouring 3D zone. `u_cursor_draw_canvas_px_h()` sizes the sprite against the zone's height
   (the canvas its unit was built for). A non-zone request is untouched (clip = whole tile).
   Zero cost unchanged: all of it runs only on a requested frame.
-- **D3D11 / D3D12** (draft runtime#1944) adopt the same two helpers at their draw site.
+- **D3D11 / D3D12** (runtime#1944) use the same two helpers in their resolve step (`u_cursor_draw_into_zone` with the window dims the renderer scales `zone_3d.rect` by; the scissor is tile box ∩ the returned clip), skipping only on a zones-frame / zone-request mismatch.
 - **Reference app.** `cube_zones_{metal,vk}_macos` adopt `dxr::CursorDepth` via
   `test_apps/common/cursor_depth_zones.h`: pick the topmost 3D zone under the pointer, hand the
   helper the pointer in that zone's UV, chain the hint only on that zone's locate.
@@ -706,8 +706,9 @@ sprite and the depth, and the runtime owns the drawing. Apps get the same contra
   projection, quad and window-space layers, before the compose publish and (D3D12) the atlas's
   final barrier, so before the display processor. One alpha-blended triangle strip per tile
   (straight for the app's sprite, premultiplied for the default look), depth off (no DSV), no
-  culling, scissored to the tile. Multi-screen routed frames draw nothing
-  (one-time WARN).
+  culling, scissored to the tile (∩ the zone in a display-zones frame — see the zones section
+  above). Multi-screen routed frames draw nothing (one-time WARN). `willDraw` is gated in the
+  state tracker (`u_cursor_draw_placement_drawable`, runtime#1951) for every backend alike.
 - **Shaders.** One shared HLSL pair, `d3d_shared/comp_cursor_shaders.h` (corners in b0 — a
   D3D11 constant buffer, 16 D3D12 root constants on the existing quad root signature), compiled
   with `D3DCompile` on the first cursor frame only, like every other in-process shader here. A

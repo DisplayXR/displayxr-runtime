@@ -814,6 +814,7 @@ struct comp_d3d12_compositor
 		//! The default look (the OS cursor mirror, else the arrow).
 		struct comp_cursor_look look;
 		bool warned_routed;
+		bool warned_zones;
 	} cursor_draw;
 };
 
@@ -4699,9 +4700,10 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
  */
 static bool
 d3d12_cursor_resolve(struct comp_d3d12_compositor *c,
-                     const struct u_cursor_draw_request *req,
+                     const struct u_cursor_draw_request *req_in,
                      const struct xrt_window_metrics *metrics,
                      const struct u_canvas_rect *eff_canvas,
+                     uint32_t tgt_width,
                      uint32_t tgt_height,
                      struct comp_d3d12_cursor_quads *out)
 {
@@ -4714,13 +4716,38 @@ d3d12_cursor_resolve(struct comp_d3d12_compositor *c,
 		}
 		return false;
 	}
+	// #1949 display zones: a zones frame carries a ZONE request (views
+	// zone-normalised, through the hinted zone's layer) and nothing else
+	// does. Skip only on a mismatch - the state tracker never sends one;
+	// belt and braces.
+	if (c->zones_frame != req_in->zone_valid) {
+		if (!c->cursor_draw.warned_zones) {
+			c->cursor_draw.warned_zones = true;
+			U_LOG_W(
+			    "cursor_draw [d3d12]: zones frame / zone request mismatch - cursor not drawn (one-time "
+			    "warning)");
+		}
+		return false;
+	}
+	// Re-express a zone request in the tile exactly the way the renderer
+	// places the zone's own layer (zone rect scaled by tile / target), and
+	// clip the draw to the zone. A request without a zone is untouched and
+	// clips to the whole tile.
+	struct u_cursor_draw_request zreq = *req_in;
+	if (!u_cursor_draw_into_zone(&zreq, tgt_width, tgt_height, out->clip)) {
+		return false;
+	}
+	const struct u_cursor_draw_request *req = &zreq;
 	// Panel pixel pitch (metres per pixel): every DisplayXR process is per-
 	// monitor DPI aware, so window and panel pixels are the same pixels.
 	if (metrics == nullptr || metrics->display_pixel_height == 0 || !(metrics->display_height_m > 0.0f)) {
 		return false;
 	}
 	const float m_per_px = metrics->display_height_m / (float)metrics->display_pixel_height;
-	const uint32_t canvas_px_h = (eff_canvas->valid && eff_canvas->h > 0) ? eff_canvas->h : tgt_height;
+	// The canvas the request's unit was built for: the zone's height for a
+	// zone request, else the zone-mask canvas or the target (window).
+	const uint32_t canvas_px_h =
+	    u_cursor_draw_canvas_px_h(req, (eff_canvas->valid && eff_canvas->h > 0) ? eff_canvas->h : tgt_height);
 	if (canvas_px_h == 0) {
 		return false;
 	}
@@ -5312,7 +5339,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		if (cursor_pending) {
 			struct comp_d3d12_cursor_quads quads = {};
 			const bool draw = d3d12_cursor_resolve(c, &cursor_req, have_canvas ? &canvas : nullptr,
-			                                       &eff_canvas, tgt_height, &quads);
+			                                       &eff_canvas, tgt_width, tgt_height, &quads);
 			comp_d3d12_renderer_set_cursor(c->renderer, draw ? &quads : nullptr);
 		}
 

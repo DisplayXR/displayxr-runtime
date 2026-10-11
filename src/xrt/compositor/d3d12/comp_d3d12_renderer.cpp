@@ -3903,11 +3903,20 @@ cursor_draw(struct comp_d3d12_renderer *r,
 		cmd_list->RSSetViewports(1, &vp);
 		// Mandatory: a cursor at a tile edge must not spill into the
 		// neighbour view (the DP would weave it into the wrong eye).
+		// Tile box ∩ the request's clip (a display zone's sub-rect, else
+		// the whole tile).
 		D3D12_RECT sr = {};
-		sr.left = (LONG)tile_x;
-		sr.top = (LONG)tile_y;
-		sr.right = (LONG)(tile_x + vp_w);
-		sr.bottom = (LONG)(tile_y + vp_h);
+		sr.left = (LONG)floorf((float)tile_x + q->clip[0] * (float)vp_w);
+		sr.top = (LONG)floorf((float)tile_y + q->clip[1] * (float)vp_h);
+		sr.right = (LONG)ceilf((float)tile_x + (q->clip[0] + q->clip[2]) * (float)vp_w);
+		sr.bottom = (LONG)ceilf((float)tile_y + (q->clip[1] + q->clip[3]) * (float)vp_h);
+		sr.left = sr.left < (LONG)tile_x ? (LONG)tile_x : sr.left;
+		sr.top = sr.top < (LONG)tile_y ? (LONG)tile_y : sr.top;
+		sr.right = sr.right > (LONG)(tile_x + vp_w) ? (LONG)(tile_x + vp_w) : sr.right;
+		sr.bottom = sr.bottom > (LONG)(tile_y + vp_h) ? (LONG)(tile_y + vp_h) : sr.bottom;
+		if (sr.right <= sr.left || sr.bottom <= sr.top) {
+			continue;
+		}
 		cmd_list->RSSetScissorRects(1, &sr);
 
 		CursorQuadConstants cc = {};

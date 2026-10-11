@@ -2489,11 +2489,20 @@ cursor_draw(struct comp_d3d11_renderer *r,
 		vp.MinDepth = 0.0f;
 		vp.MaxDepth = 1.0f;
 		ctx->RSSetViewports(1, &vp);
+		// Tile box ∩ the request's clip (a display zone's sub-rect, else
+		// the whole tile).
 		D3D11_RECT sr = {};
-		sr.left = (LONG)tx;
-		sr.top = (LONG)ty;
-		sr.right = (LONG)(tx + tw);
-		sr.bottom = (LONG)(ty + th);
+		sr.left = (LONG)floorf(tx + q->clip[0] * tw);
+		sr.top = (LONG)floorf(ty + q->clip[1] * th);
+		sr.right = (LONG)ceilf(tx + (q->clip[0] + q->clip[2]) * tw);
+		sr.bottom = (LONG)ceilf(ty + (q->clip[1] + q->clip[3]) * th);
+		sr.left = sr.left < (LONG)tx ? (LONG)tx : sr.left;
+		sr.top = sr.top < (LONG)ty ? (LONG)ty : sr.top;
+		sr.right = sr.right > (LONG)(tx + tw) ? (LONG)(tx + tw) : sr.right;
+		sr.bottom = sr.bottom > (LONG)(ty + th) ? (LONG)(ty + th) : sr.bottom;
+		if (sr.right <= sr.left || sr.bottom <= sr.top) {
+			continue;
+		}
 		ctx->RSSetScissorRects(1, &sr);
 
 		CursorQuadConstants cc = {};

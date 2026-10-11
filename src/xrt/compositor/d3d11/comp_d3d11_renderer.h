@@ -229,6 +229,10 @@ struct comp_d3d11_cursor_quads
 	//! Per tile, the quad's corners in tile-normalised coordinates (origin
 	//! top-left, y down) in u_cursor_draw_corners() order.
 	float corners[XRT_MAX_VIEWS][4][2];
+	//! The draw's clip in every tile, tile-normalised (x, y, w, h; origin
+	//! top-left): the whole tile {0, 0, 1, 1}, or a display zone's sub-rect
+	//! (u_cursor_draw_into_zone, #1949). The scissor is tile box ∩ clip.
+	float clip[4];
 	//! The app's sprite swapchain (sampled at @ref image_index), or NULL for
 	//! @ref look.
 	struct xrt_swapchain *xsc;
