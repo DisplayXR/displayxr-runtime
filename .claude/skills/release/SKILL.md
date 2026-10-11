@@ -355,26 +355,89 @@ fi
 If `SIGNED=no`, skip straight to Phase 5 and carry the warning into the report.
 
 ### Step 4.5.2: Dispatch the runner build, wait, fetch the signed installer
+**Track the run by identity, never as "the newest run".** The provider's
+`build-signed-release.yml` serialises on one concurrency group that keeps a single
+*waiting* run, so a dispatch from any other release (a `/dxr-release` running in
+parallel) **cancels** ours if it is still waiting, and "newest `workflow_dispatch` run
+since `$SINCE`" then resolves to that other component's run — whose installer the old
+`*Setup-*.exe` glob would happily upload here (2026-10-11 incident; see
+`/dxr-release` Phase 3.5 and `docs/specs/runtime/release-signing.md` § Concurrency).
+Three rules, implemented below: (1) track the run URL `gh workflow run` prints, and in
+the no-URL fallback accept only a run whose job proves it is ours (`Checkout <repo> @
+<ref>` step); (2) a `cancelled` run means displaced — wait for the workflow to go idle
+and re-dispatch **once**, never fall back to "newest"; (3) upload only if the artifact
+holds exactly `DisplayXRSetup-<version>.exe` and that exe carries the version string.
 ```bash
-SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-gh workflow run build-signed-release.yml -R "$SIGN_REPO" \
-   -f component=runtime -f repo=DisplayXR/displayxr-runtime -f ref=[FULL_TAG]
+# ── Signing-run identity helpers ────────────────────────────────────────────
+# sign_dispatch <workflow> <marker> [-f k=v ...]  → sets SIGN_RUN ("" = not located)
+sign_dispatch() {
+  local wf="$1" marker="$2" since out id cand st; shift 2
+  since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  out=$(gh workflow run "$wf" -R "$SIGN_REPO" "$@" 2>&1); printf '%s\n' "$out"
+  # 1) The run gh printed. Recent gh prints the new run's URL on dispatch.
+  id=$(printf '%s\n' "$out" | sed -nE 's#.*/actions/runs/([0-9]+).*#\1#p' | head -1)
+  # 2) Fallback ONLY when nothing was printed: a run created since $since that
+  #    PROVABLY carries our marker — in its job step names (build-signed-release's
+  #    first step is "Checkout <repo> @ <ref>") or, once completed, in its log
+  #    (sign-artifact's log echoes the release_tag). NEVER the bare newest run:
+  #    under parallel releases that is another component's. A run that has not
+  #    started yet shows neither, so keep polling (<= 40 min).
+  if [ -z "$id" ]; then
+    for _ in $(seq 1 160); do
+      while read -r cand st; do
+        [ -n "$cand" ] || continue
+        if gh api "repos/$SIGN_REPO/actions/runs/$cand/jobs" --jq '.jobs[].steps[].name' 2>/dev/null | grep -qF -- "$marker" \
+           || { [ "$st" = completed ] && gh run view "$cand" -R "$SIGN_REPO" --log 2>/dev/null | grep -qF -- "$marker"; }; then
+          id="$cand"; break 2
+        fi
+      done <<RUNS
+$(gh run list -R "$SIGN_REPO" --workflow "$wf" --event workflow_dispatch --limit 20 \
+    --json databaseId,createdAt,status \
+    --jq "[.[]|select(.createdAt>=\"$since\")]|.[]|\"\(.databaseId) \(.status)\"")
+RUNS
+      sleep 15
+    done
+  fi
+  SIGN_RUN="$id"
+}
 
-# Locate the run we just dispatched.
-SIGN_RUN=""
-for _ in $(seq 1 20); do
-  SIGN_RUN=$(gh run list -R "$SIGN_REPO" --workflow build-signed-release.yml \
-              --event workflow_dispatch --limit 8 --json databaseId,createdAt \
-              --jq "[.[]|select(.createdAt>=\"$SINCE\")]|sort_by(.createdAt)|last|.databaseId // empty")
-  [ -n "$SIGN_RUN" ] && break; sleep 5
-done
-[ -n "$SIGN_RUN" ] || { echo "Could not locate the signing run — ship unsigned"; SIGNED=no; }
+# sign_track <workflow> <marker> [-f k=v ...]  → dispatch, wait, and re-dispatch ONCE if
+# the run was cancelled. Returns 0 only on conclusion=success; SIGN_RUN/SIGN_CONCL set.
+sign_track() {
+  local wf="$1" marker="$2" attempt; shift 2
+  SIGN_RUN=""; SIGN_CONCL=""
+  for attempt in 1 2; do
+    sign_dispatch "$wf" "$marker" "$@"
+    [ -n "$SIGN_RUN" ] || { SIGN_CONCL=unlocated; return 1; }
+    echo "tracking $wf run $SIGN_RUN (attempt $attempt)"
+    until [ "$(gh run view "$SIGN_RUN" -R "$SIGN_REPO" --json status --jq .status 2>/dev/null)" = completed ]; do sleep 30; done
+    SIGN_CONCL=$(gh run view "$SIGN_RUN" -R "$SIGN_REPO" --json conclusion --jq .conclusion)
+    [ "$SIGN_CONCL" = cancelled ] && [ "$attempt" = 1 ] || break
+    echo "run $SIGN_RUN was CANCELLED (another release's dispatch displaced it) — waiting for $wf to go idle, then re-dispatching once"
+    while [ "$(gh run list -R "$SIGN_REPO" --workflow "$wf" --limit 20 --json status \
+                --jq '[.[]|select(.status!="completed")]|length')" != 0 ]; do sleep 30; done
+    sleep $((RANDOM % 30))   # de-synchronise agents that idle-waited together
+  done
+  [ "$SIGN_CONCL" = success ]
+}
 
-# Wait for it (runtime build is slow — allow ~30 min).
-[ "$SIGNED" = yes ] && gh run watch "$SIGN_RUN" -R "$SIGN_REPO" --interval 30 --exit-status \
-  || { echo "Signing run failed — ship the unsigned CI asset, flag in report"; SIGNED=no; }
+# exe_has_version <file> <X.Y.Z> — the bare version occurs in the file (NSIS VERSIONINFO
+# is UTF-16LE; macOS `strings` has no -el, hence python).
+exe_has_version() {
+  python3 -I -c 'import sys,re
+d=open(sys.argv[1],"rb").read(); v=sys.argv[2]
+pat=r"(?<![0-9.])"+re.escape(v)+r"(?![0-9])"
+hit=re.search(pat,d.decode("utf-16-le","ignore")) or re.search(pat,d[1:].decode("utf-16-le","ignore")) or re.search(pat.encode(),d)
+sys.exit(0 if hit else 1)' "$1" "$2"; }
 
-# Download the signed installer.
+if sign_track build-signed-release.yml "Checkout DisplayXR/displayxr-runtime @ [FULL_TAG]" \
+     -f component=runtime -f repo=DisplayXR/displayxr-runtime -f ref=[FULL_TAG]; then
+  echo "signing run $SIGN_RUN succeeded"
+else
+  echo "Signing run ${SIGN_RUN:-<none>} ended '$SIGN_CONCL' — ship the unsigned CI asset, flag in report"; SIGNED=no
+fi
+
+# Download the signed installer and PROVE it is ours before anything touches the release.
 if [ "$SIGNED" = yes ]; then
   rm -rf _signed && gh run download "$SIGN_RUN" -R "$SIGN_REPO" -n signed-installer -D _signed
   # Glob-and-test, NEVER `ls`: an `ls -F` alias (Git Bash on the Windows dev box)
@@ -385,9 +448,19 @@ if [ "$SIGNED" = yes ]; then
   # every `gh release upload` on the bad path. Hit for real on v2.21.12: the
   # release sat with no .exe until the file was re-found by hand. `/dxr-release`
   # and `/installer-release` already use this form.
+  #
+  # Identity: EXACTLY the expected file, nothing else, and the version inside it.
+  VER="[FULL_TAG]"; VER="${VER#v}"
+  WANT_EXE="DisplayXRSetup-${VER}.exe"
+  GOT_EXES=$(cd _signed 2>/dev/null && for f in *.exe; do [ -f "$f" ] && echo "$f"; done)
   SIGNED_EXE=""
-  for f in _signed/DisplayXRSetup-*.exe; do [ -f "$f" ] && { SIGNED_EXE="$f"; break; }; done
-  [ -n "$SIGNED_EXE" ] || { echo "No signed installer in the artifact — ship unsigned"; SIGNED=no; }
+  if [ "$GOT_EXES" != "$WANT_EXE" ]; then
+    echo "REFUSING: artifact of run $SIGN_RUN holds [${GOT_EXES//$'\n'/, }], expected exactly $WANT_EXE — wrong run? ship unsigned"; SIGNED=no
+  elif ! exe_has_version "_signed/$WANT_EXE" "$VER"; then
+    echo "REFUSING: _signed/$WANT_EXE does not carry version $VER — ship unsigned"; SIGNED=no
+  else
+    SIGNED_EXE="_signed/$WANT_EXE"
+  fi
 fi
 ```
 
