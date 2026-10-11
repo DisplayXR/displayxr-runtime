@@ -1241,9 +1241,60 @@ vk_create_image_from_native(struct vk_bundle *vk,
 
 	// TODO memoryTypeBits from VkMemoryFdPropertiesKHR
 #elif defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL)
-	// The IOSurface was imported into the VkImage via VkImportMetalIOSurfaceInfoEXT.
-	// Export the correctly-configured MTLTexture that MoltenVK created internally,
-	// then use it for memory import via VkImportMemoryMetalHandleInfoEXT.
+#if defined(VK_EXT_metal_objects)
+	if (vk->has_EXT_metal_objects) {
+		/*
+		 * The IOSurface is already the image's storage (imported at
+		 * vkCreateImage via VkImportMetalIOSurfaceInfoEXT); the memory bound
+		 * here only tells MoltenVK which MTLStorageMode its MTLTexture uses.
+		 * Metal requires Shared (or Managed) for an IOSurface-backed texture:
+		 * MoltenVK maps HOST_VISIBLE|HOST_COHERENT memory to Shared. The old
+		 * path exported the MTLTexture BEFORE any memory was bound, so MoltenVK
+		 * built it as Private, which the Metal API validation layer rejects
+		 * ("IOSurface textures must use MTLStorageModeManaged or
+		 * MTLStorageModeShared", abort under MTL_DEBUG_LAYER=1) and which only
+		 * works by accident without it. Bind host-coherent memory first; the
+		 * texture MoltenVK then creates from the IOSurface is Shared.
+		 */
+		uint32_t memory_type_index = UINT32_MAX;
+		if (!vk_get_memory_type(vk, requirements.memoryTypeBits,
+		                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		                        &memory_type_index)) {
+			VK_ERROR(vk, "IOSurface import: no HOST_VISIBLE|HOST_COHERENT memory type (bits 0x%x)",
+			         requirements.memoryTypeBits);
+			vk->vkDestroyImage(vk->device, image, NULL);
+			return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+		}
+		// NOT a dedicated allocation: MoltenVK refuses a dedicated
+		// host-coherent allocation for an image (VK_ERROR_OUT_OF_DEVICE_MEMORY).
+		VkMemoryAllocateInfo iosurface_alloc = {
+		    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+		    .pNext = NULL,
+		    .allocationSize = requirements.size,
+		    .memoryTypeIndex = memory_type_index,
+		};
+		VkDeviceMemory iosurface_mem = VK_NULL_HANDLE;
+		ret = vk->vkAllocateMemory(vk->device, &iosurface_alloc, NULL, &iosurface_mem);
+		if (ret == VK_SUCCESS) {
+			ret = vk->vkBindImageMemory(vk->device, image, iosurface_mem, 0);
+			if (ret != VK_SUCCESS) {
+				vk->vkFreeMemory(vk->device, iosurface_mem, NULL);
+			}
+		}
+		// The IOSurface reference is the swapchain's (comp_metal owns it), as
+		// on the import path below.
+		u_graphics_buffer_unref(&image_native->handle);
+		if (ret != VK_SUCCESS) {
+			VK_ERROR(vk, "IOSurface import: allocate/bind: %s", vk_result_string(ret));
+			vk->vkDestroyImage(vk->device, image, NULL);
+			return ret;
+		}
+		*out_mem = iosurface_mem;
+		*out_image = image;
+		return VK_SUCCESS;
+	}
+#endif
+	// No VK_EXT_metal_objects: import the handle as an MTLTexture.
 	void *metal_texture_handle = image_native->handle;
 
 #if defined(VK_EXT_metal_objects)
