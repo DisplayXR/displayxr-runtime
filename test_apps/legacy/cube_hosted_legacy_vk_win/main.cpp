@@ -16,6 +16,7 @@
 
 #define VK_USE_PLATFORM_WIN32_KHR
 #include <vulkan/vulkan.h>
+#include <vk_frame_ring.h>
 
 #define XR_USE_GRAPHICS_API_VULKAN
 #include <openxr/openxr.h>
@@ -858,9 +859,11 @@ struct VkRenderer {
     uint32_t fbWidth = 0;
     uint32_t fbHeight = 0;
 
-    VkCommandPool commandPool = VK_NULL_HANDLE;
-    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
-    VkFence frameFence = VK_NULL_HANDLE;
+    VkCommandPool commandPool = VK_NULL_HANDLE; // init-time texture uploads only
+
+    // INV-4.10 / #1917: N frames in flight, one submit per frame, never a wait
+    // on the frame just submitted. Owns the per-frame command buffers + fences.
+    dxr::VkFrameRing ring;
 
     float cubeRotation = 0.0f;
 
@@ -953,12 +956,27 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
         subpass.pColorAttachments = &colorRef;
         subpass.pDepthStencilAttachment = &depthRef;
 
+        // With several frames in flight (dxr::VkFrameRing) the depth image is
+        // shared by consecutive frames: order this frame's depth clear/writes
+        // after the previous frame's (WAW), and colour likewise.
+        VkSubpassDependency dep = {};
+        dep.srcSubpass = VK_SUBPASS_EXTERNAL;
+        dep.dstSubpass = 0;
+        dep.srcStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dep.dstStageMask = dep.srcStageMask;
+        dep.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        dep.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
         VkRenderPassCreateInfo rpInfo = {};
         rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
         rpInfo.attachmentCount = 2;
         rpInfo.pAttachments = attachments;
         rpInfo.subpassCount = 1;
         rpInfo.pSubpasses = &subpass;
+        rpInfo.dependencyCount = 1;
+        rpInfo.pDependencies = &dep;
 
         if (vkCreateRenderPass(device, &rpInfo, nullptr, &renderer.renderPass) != VK_SUCCESS) {
             LOG_ERROR("Failed to create render pass");
@@ -1267,7 +1285,7 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
     memcpy(data, gridVerts.data(), (size_t)gridBufSize);
     vkUnmapMemory(device, renderer.gridVertexMemory);
 
-    // Command pool + buffer + fence
+    // Command pool (init-time texture uploads) + frame ring (INV-4.10 / #1917)
     {
         VkCommandPoolCreateInfo poolInfo = {};
         poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -1275,17 +1293,10 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
         poolInfo.queueFamilyIndex = queueFamilyIndex;
         if (vkCreateCommandPool(device, &poolInfo, nullptr, &renderer.commandPool) != VK_SUCCESS) return false;
 
-        VkCommandBufferAllocateInfo allocInfo = {};
-        allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        allocInfo.commandPool = renderer.commandPool;
-        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        allocInfo.commandBufferCount = 1;
-        if (vkAllocateCommandBuffers(device, &allocInfo, &renderer.commandBuffer) != VK_SUCCESS) return false;
-
-        VkFenceCreateInfo fenceInfo = {};
-        fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-        fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-        if (vkCreateFence(device, &fenceInfo, nullptr, &renderer.frameFence) != VK_SUCCESS) return false;
+        if (!renderer.ring.init(device, physDevice, queue, queueFamilyIndex, dxr::VkFrameRing::Config{})) {
+            LOG_ERROR("Failed to create frame ring");
+            return false;
+        }
     }
 
     // Load textures and create descriptor set
@@ -1440,16 +1451,13 @@ static bool CreateSwapchainFramebuffers(VkRenderer& renderer,
 static void RenderScene(VkRenderer& renderer, uint32_t imageIndex,
     const EyeRenderParams* eyes, int eyeCount)
 {
-    VkDevice device = renderer.device;
-    vkWaitForFences(device, 1, &renderer.frameFence, VK_TRUE, UINT64_MAX);
-    vkResetFences(device, 1, &renderer.frameFence);
-
-    VkCommandBuffer cmd = renderer.commandBuffer;
-    vkResetCommandBuffer(cmd, 0);
-    VkCommandBufferBeginInfo beginInfo = {};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &beginInfo);
+    // Begin this frame's ring slot (waits only the fence of the frame that
+    // used this slot N frames ago).
+    VkCommandBuffer cmd = renderer.ring.beginFrame();
+    if (cmd == VK_NULL_HANDLE) {
+        LOG_ERROR("RenderScene: ring.beginFrame failed");
+        return;
+    }
 
     VkClearValue clearValues[2] = {};
     clearValues[0].color = {{0.05f, 0.05f, 0.25f, 1.0f}};
@@ -1545,14 +1553,12 @@ static void RenderScene(VkRenderer& renderer, uint32_t imageIndex,
     }
 
     vkCmdEndRenderPass(cmd);
-    vkEndCommandBuffer(cmd);
 
-    VkSubmitInfo submitInfo = {};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmd;
-    vkQueueSubmit(renderer.graphicsQueue, 1, &submitInfo, renderer.frameFence);
-    vkWaitForFences(device, 1, &renderer.frameFence, VK_TRUE, UINT64_MAX);
+    // ONE submit, no wait; the caller releases the swapchain image after this.
+    VkResult submitResult = renderer.ring.endFrame();
+    if (submitResult != VK_SUCCESS) {
+        LOG_ERROR("RenderScene: ring.endFrame (vkQueueSubmit) failed: %d", (int)submitResult);
+    }
 }
 
 // ============================================================================
@@ -1561,6 +1567,7 @@ static void RenderScene(VkRenderer& renderer, uint32_t imageIndex,
 
 static void CleanupVkRenderer(VkRenderer& renderer) {
     if (!renderer.device) return;
+    renderer.ring.waitAll();
     vkDeviceWaitIdle(renderer.device);
 
     for (auto fb : renderer.framebuffers) vkDestroyFramebuffer(renderer.device, fb, nullptr);
@@ -1569,7 +1576,7 @@ static void CleanupVkRenderer(VkRenderer& renderer) {
     if (renderer.depthView) vkDestroyImageView(renderer.device, renderer.depthView, nullptr);
     if (renderer.depthImage) vkDestroyImage(renderer.device, renderer.depthImage, nullptr);
     if (renderer.depthMemory) vkFreeMemory(renderer.device, renderer.depthMemory, nullptr);
-    if (renderer.frameFence) vkDestroyFence(renderer.device, renderer.frameFence, nullptr);
+    renderer.ring.destroy();
     if (renderer.commandPool) vkDestroyCommandPool(renderer.device, renderer.commandPool, nullptr);
     if (renderer.gridVertexBuffer) vkDestroyBuffer(renderer.device, renderer.gridVertexBuffer, nullptr);
     if (renderer.gridVertexMemory) vkFreeMemory(renderer.device, renderer.gridVertexMemory, nullptr);
