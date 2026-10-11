@@ -119,6 +119,7 @@ from the other side of the wire. Decisions:
   an `APP_HWND` presenter). The workspace / compose path (`multi_compositor_render`) keeps
   one presenter, the service window on the panel, so it stays single-screen: that is a
   separate decision (per-screen presenters for the workspace), not a consequence of this one.
+  It is ADR-052 (one presenter per 3D screen, one desktop-space layout).
 - **The table and the routing cross the wire by value** (`compositor_get_segment_metrics`,
   `compositor_set_view_routing`, appended to `proto.json`); per-segment views are then
   framed client-side from each segment's eyes exactly as in-process, and the service paints
