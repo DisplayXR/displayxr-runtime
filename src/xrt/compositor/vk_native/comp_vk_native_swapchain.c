@@ -22,6 +22,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef XRT_OS_ANDROID
+#include <sys/system_properties.h>
+#endif
+
 /*!
  * Maximum number of images in a swapchain.
  */
@@ -121,6 +125,44 @@ vk_swapchain_true_format_enabled(void)
 		}
 		cached = true;
 	}
+	return value;
+}
+
+/*!
+ * Kill switch for the compose path's sRGB read (#1935). Default ON: the
+ * renderer composes a truthful-sRGB swapchain by SAMPLING its UNORM view
+ * (sc->views[], legal because the image is MUTABLE_FORMAT with both siblings
+ * in its format list) in a draw straight into the atlas, so no per-frame
+ * vkCmdCopyImage and no scratch image exist. `DXR_VK_SRGB_MUTABLE_VIEW=0` (or,
+ * on Android where an app cannot set the runtime's env, the system property
+ * `debug.dxr.vk_srgb_mutable_view=0`) restores the #1559 scratch copy + blit
+ * for a one-binary A/B. The env, when set non-empty, wins over the property.
+ */
+bool
+comp_vk_native_srgb_mutable_view_enabled(void)
+{
+	static bool cached = false;
+	static bool value = true;
+	if (cached) {
+		return value;
+	}
+	const char *v = getenv("DXR_VK_SRGB_MUTABLE_VIEW");
+#ifdef XRT_OS_ANDROID
+	char sp[PROP_VALUE_MAX] = {0};
+	if ((v == NULL || v[0] == '\0') && __system_property_get("debug.dxr.vk_srgb_mutable_view", sp) > 0) {
+		v = sp;
+	}
+#endif
+	if (v != NULL && (v[0] == '0' || v[0] == 'n' || v[0] == 'N' || v[0] == 'f' || v[0] == 'F' ||
+	                  (v[0] == 'o' && (v[1] == 'f' || v[1] == 'F')))) {
+		value = false;
+	}
+	cached = true;
+	U_LOG_W(
+	    "#1935: sRGB swapchain compose read %s (DXR_VK_SRGB_MUTABLE_VIEW / debug.dxr.vk_srgb_mutable_view=0 "
+	    "restores the scratch copy)",
+	    value ? "= sample the UNORM mutable-format view, no copy"
+	          : "= #1559 raw vkCmdCopyImage into a UNORM scratch, then blit");
 	return value;
 }
 
@@ -328,10 +370,21 @@ comp_vk_native_swapchain_create(struct comp_vk_native_compositor *c,
 	 * MUTABLE_FORMAT + a format list carrying both siblings, and give every
 	 * runtime-internal reader the UNORM sibling instead:
 	 *   - sampling paths use sc->views[], created below in `raw_format`;
-	 *   - the one format-sensitive reader, the compose blit, goes through
-	 *     comp_vk_native_swapchain_stage_unorm_copy() — a raw vkCmdCopyImage
+	 *   - the one format-sensitive reader, the compose fast path, used to be
+	 *     a vkCmdBlitImage — and a blit reads in the IMAGE's format, there is
+	 *     no view to put in front of it. So #1559 staged a raw vkCmdCopyImage
 	 *     (size-compatible formats, no conversion anywhere) into an UNORM
-	 *     scratch, which is then the blit source;
+	 *     scratch every frame and blitted from that. On Adreno that copy
+	 *     turned out to be the frame (#1935: xrEndFrame 52-54 ms of a 53 ms
+	 *     frame on the NP02J tablet, the driver allocating + zeroing GPU
+	 *     memory inside it, cost scaling with the whole image). The fast
+	 *     path now DRAWS a truthful-sRGB swapchain into the atlas instead,
+	 *     sampling sc->views[] — the UNORM view of the same memory, which
+	 *     reads the stored bytes with no decode, i.e. exactly the bytes the
+	 *     copy produced, with no copy and no scratch. The copy + blit is kept
+	 *     only behind DXR_VK_SRGB_MUTABLE_VIEW=0
+	 *     (comp_vk_native_srgb_mutable_view_enabled) and as the fallback if
+	 *     the draw cannot be built;
 	 *   - zero-copy is disabled for these swapchains, so no DP is ever handed
 	 *     an sRGB VkImage (same shape as the #918 guard: a placement fact
 	 *     applied to u_tiling_can_zero_copy()'s RESULT, not a second gate).
@@ -572,8 +625,10 @@ comp_vk_native_swapchain_create(struct comp_vk_native_compositor *c,
 		if (!true_srgb_reported) {
 			true_srgb_reported = true;
 			U_LOG_W(
-			    "#1559: sRGB swapchain: truthful format, compose via UNORM scratch copy; "
-			    "zero-copy disabled (DXR_VK_SWAPCHAIN_TRUE_FORMAT=0 restores the substitution)");
+			    "#1559: sRGB swapchain: truthful format, compose reads it as UNORM (%s); "
+			    "zero-copy disabled (DXR_VK_SWAPCHAIN_TRUE_FORMAT=0 restores the substitution)",
+			    comp_vk_native_srgb_mutable_view_enabled() ? "mutable-format view, #1935"
+			                                               : "scratch copy, DXR_VK_SRGB_MUTABLE_VIEW=0");
 		}
 	}
 

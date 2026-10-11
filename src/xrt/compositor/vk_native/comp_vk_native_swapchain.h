@@ -129,14 +129,29 @@ comp_vk_native_swapchain_get_array_size(struct xrt_swapchain *xsc);
  * #1559: true when this swapchain's `VkImage`s really are in the `*_SRGB`
  * format the app asked for, rather than the UNORM sibling the runtime reads.
  *
- * Two callers care: the compose blit (which must stage a raw copy first, see
- * comp_vk_native_swapchain_stage_unorm_copy()) and the zero-copy gate, which
+ * Two callers care: the compose fast path (which must read it through the
+ * UNORM view — a draw, #1935 — or, with that switched off, stage a raw copy
+ * first, see comp_vk_native_swapchain_stage_unorm_copy()) and the zero-copy
+ * gate, which
  * must stay off for these so no display processor is handed an sRGB image.
  *
  * @ingroup comp_vk_native
  */
 bool
 comp_vk_native_swapchain_is_true_srgb(struct xrt_swapchain *xsc);
+
+/*!
+ * #1935: true (the default) when the compose fast path reads a truthful-sRGB
+ * swapchain by sampling its UNORM mutable-format view (the swapchain's
+ * comp_vk_native_swapchain_get_image_view()) in a draw, instead of staging
+ * comp_vk_native_swapchain_stage_unorm_copy() + a blit every frame.
+ * `DXR_VK_SRGB_MUTABLE_VIEW=0` / Android `debug.dxr.vk_srgb_mutable_view=0`
+ * turns it off. Resolved once per process.
+ *
+ * @ingroup comp_vk_native
+ */
+bool
+comp_vk_native_srgb_mutable_view_enabled(void);
 
 /*!
  * #1559: record a raw copy of a source rect into this swapchain's UNORM
