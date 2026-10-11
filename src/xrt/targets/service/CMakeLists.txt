@@ -178,3 +178,23 @@ if(XRT_HAVE_SDL2)
 		target_link_libraries(displayxr-service PRIVATE drv_qwerty_includes)
 	endif()
 endif()
+
+# Dev-tree parity with the installed layout: the service admits a DIAG client
+# (displayxr-cli status / workspace launch / clients ...) only when its binary
+# sits in the service's own directory (service_client_class.c verify_diag), and
+# the .deb / tarball / macOS bundle already co-locate the two. In the build
+# tree the CLI lands in targets/cli/, so a dev displayxr-cli was demoted to APP
+# and refused. Keep a COPY next to the service (a symlink would not do: the
+# check resolves /proc/<pid>/exe to the real path). The original stays where
+# the scripts look for it. Windows builds already stage both into _package/bin.
+if(TARGET cli AND NOT WIN32)
+	set(_cli_beside_service "${CMAKE_CURRENT_BINARY_DIR}/displayxr-cli${CMAKE_EXECUTABLE_SUFFIX}")
+	add_custom_command(
+		OUTPUT "${_cli_beside_service}"
+		COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:cli> "${_cli_beside_service}"
+		DEPENDS cli $<TARGET_FILE:cli>
+		COMMENT "Copying displayxr-cli next to displayxr-service (DIAG same-directory rule)"
+		VERBATIM
+		)
+	add_custom_target(displayxr-cli-beside-service ALL DEPENDS "${_cli_beside_service}")
+endif()
