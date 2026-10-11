@@ -845,7 +845,7 @@ struct d3d11_client_render_resources
 	//! v6 path: RTV on weave_crop_tex, so lifted views can be written into
 	//! the crop before the weave (a lift frame never takes the zero-copy path).
 	wil::com_ptr<ID3D11RenderTargetView>   weave_crop_rtv;
-	//! XR_DXR_cursor_depth v5 (ADR-046 Amendment 1): which lift bindings of the
+	//! XR_DXR_cursor_depth v6 (ADR-046 Amendment 1): which lift bindings of the
 	//! last weave submit got the depth cursor (bit = binding index), and each
 	//! lifted stream's cursor state.
 	uint32_t                               lift_cursor_mask;

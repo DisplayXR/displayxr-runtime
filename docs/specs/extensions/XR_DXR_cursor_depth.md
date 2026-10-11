@@ -3,8 +3,8 @@
 | Property | Value |
 |----------|-------|
 | Extension Name | `XR_DXR_cursor_depth` |
-| Spec Version | 5 |
-| Type Values | `XR_TYPE_CURSOR_DEPTH_HINT_DXR` (1004999320) · `XR_TYPE_CURSOR_DEPTH_PLACEMENT_DXR` (1004999321) · `XR_TYPE_CURSOR_DEPTH_SOURCE_DXR` (1004999322, v2) · `XR_TYPE_CURSOR_DEPTH_OPTIONS_DXR` (1004999323, v3) · `XR_TYPE_CURSOR_DEPTH_DRAW_INFO_DXR` (1004999324, v5) · `XR_TYPE_CURSOR_DEPTH_DRAW_STATE_DXR` (1004999325, v5) |
+| Spec Version | 6 |
+| Type Values | `XR_TYPE_CURSOR_DEPTH_HINT_DXR` (1004999320) · `XR_TYPE_CURSOR_DEPTH_PLACEMENT_DXR` (1004999321) · `XR_TYPE_CURSOR_DEPTH_SOURCE_DXR` (1004999322, v2) · `XR_TYPE_CURSOR_DEPTH_OPTIONS_DXR` (1004999323, v3) · `XR_TYPE_CURSOR_DEPTH_DRAW_INFO_DXR` (1004999324, v5) · `XR_TYPE_CURSOR_DEPTH_DRAW_STATE_DXR` (1004999325, v5) · `XR_TYPE_CURSOR_DEPTH_LIFT_RECT_DXR` (1004999326, v6) · `XR_TYPE_CURSOR_DEPTH_LIFT_STATE_DXR` (1004999327, v6) |
 | Author | The DisplayXR Project |
 | Platform | All. Works on every graphics API, in-process and over IPC; solved in the state tracker. |
 | Decision record | [ADR-046](../../adr/ADR-046-depth-aware-cursor.md) |
@@ -178,6 +178,26 @@ touches the OS cursor itself.
 **Backends (v5).** Metal (in-process) draws. D3D11, D3D12, GL, vk_native and the IPC/service path
 report `willDraw = XR_FALSE` with a one-time WARN (ADR-046 Amendment 2 rollout step 3).
 
+### 2.7 `XrCursorDepthLiftRectDXR` / `XrCursorDepthLiftStateDXR` (spec v6) — lifted content
+
+For a 2D element lifted on a weave rect (`XR_DXR_lift`, `XrWeaveRectLiftDXR`). No app holds a
+lifted rect's views and the weave path never calls `xrLocateViews`, so these are separate from
+§2.5/§2.6 (ADR-046 Amendment 1).
+
+- **`XrCursorDepthLiftRectDXR`** (input), chained on `XrWeaveRectLiftDXR::next`: draw the depth
+  cursor into this rect's lifted views. Per submit: chain it on every submit for as long as you
+  want it. `flags` is reserved (0). The lift stream must be created with `XrLiftDepthRequestDXR`.
+- **`XrCursorDepthLiftStateDXR`** (output), chained on `XrWeaveOutputDXR::next`: `drawnLiftMask`,
+  bit i = `lifts[i]` of this submit got the cursor in the output just woven. Hide the OS cursor
+  over a lifted rect only while its bit is set.
+
+The runtime reads the OS pointer itself, places the sprite with the §3 policy from the
+conversion's own depth map (through the module's per-conversion relief mapping), and draws one
+sprite per view before the display processor. It reports "not drawn" whenever it cannot place it
+(no depth or relief mapping, pointer off the rect, on the screen plane, a workspace cursor
+shown), so the fallback is always the flat OS cursor. Anchor: SCREEN today; HYBRID follows.
+Backend: the D3D11 service (the only lift weave path today).
+
 ## 3. Runtime behaviour
 
 The canvas point under the cursor is triangulated from the outermost pair of **located views**.
@@ -282,3 +302,4 @@ Reference: `test_apps/handle/cube_handle_metal_macos` (`DISPLAYXR_CURSOR_DEPTH_D
 | 3 | `XrCursorDepthOptionsDXR` (1004999323): anchor mode (HYBRID / SCREEN / WORLD) and margin. HYBRID anchors the line of sight at the last pointer move (§2.4). **Defaults change, deliberately:** the default anchor is now HYBRID (was effectively SCREEN), and the default margin is 0.005 (was 0.03). Both follow testing on a real head-tracked panel: the screen-anchored cursor had disparity but no motion parallax and read as "at the glass", and 0.03 floated it a visibly detached 1–2 cm off the content, where 0.003–0.005 rests on it. An app that wants the v2 placement chains the options struct with `XR_CURSOR_DEPTH_ANCHOR_MODE_SCREEN_DXR` and `margin = 0.03`. |
 | 4 | No new structs; **behaviour changes** (ADR-046 Amendment 2 A, one cursor policy everywhere). **Never behind the glass:** target = d < 0 ? max(d − margin, −0.6) : 0, so content on or behind the display plane leaves the cursor on the plane (v1–v3 let it sink onto content behind the glass, up to +0.6). **Margin back to 0.03** (the reference app's value since Phase 1). **Draw threshold:** `isActive` is now also `XR_FALSE` while the filtered disparity is above −0.005, which is the existing meaning of `isActive = XR_FALSE` (draw nothing, show the OS cursor); `disparity` / `targetDisparity` stay filled as diagnostics. HYBRID stays the default anchor. |
 | 5 | **The runtime draws** (ADR-046 Amendment 2 B). New structs only: `XrCursorDepthDrawInfoDXR` (1004999324, on the hint: the sprite swapchain or `XR_NULL_HANDLE` for the default look, hotspot, size in metres, visibility) and `XrCursorDepthDrawStateDXR` (1004999325, on `XrViewState`: `willDraw`, the app's cue to hide its OS cursor). Drawn after the app's layers and before the display processor, per view, with the projection layer's own views (same-space rule). Default look: the current OS cursor shape, else the classic arrow. Metal (in-process) first; other backends report `willDraw = XR_FALSE`. App-drawn placement (v1–v4) unchanged. |
+| 6 | **Lifted content** (ADR-046 Amendment 1, runtime#1907). New structs only: `XrCursorDepthLiftRectDXR` (1004999326, on `XrWeaveRectLiftDXR`: draw the cursor into this lifted rect's views) and `XrCursorDepthLiftStateDXR` (1004999327, on `XrWeaveOutputDXR`: `drawnLiftMask`). Placed from the lift conversion's depth map through the module's relief mapping (`xrt_dp_lift_depth::relief_*`), §3 policy, D3D11 service. §2.7. |

@@ -227,7 +227,7 @@ static uint32_t g_weavedW = 0, g_weavedH = 0;
 // `--lift[=path]` (or DXR_WEAVE_LIFT_IMAGE=path, which may contain spaces) draws
 // a 2D still into the weave rect and flags the rect as LIFTED: the runtime
 // converts it and weaves the views. `--lift-cursor` also chains
-// XrCursorDepthLiftRectDXR (XR_DXR_cursor_depth v5, ADR-046 Amendment 1): the
+// XrCursorDepthLiftRectDXR (XR_DXR_cursor_depth v6, ADR-046 Amendment 1): the
 // runtime draws the depth-aware cursor into the lifted views, and this probe
 // hides its OS cursor over the rect only on frames the runtime reports it drew.
 static bool g_lift = false;
@@ -1337,8 +1337,8 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 			LOG_ERROR("--lift: XR_DXR_lift is not available on this runtime");
 			return 1;
 		}
-		if (g_liftCursor && g_cursorDepthSpecVersion < 5) {
-			LOG_ERROR("--lift-cursor: the runtime's XR_DXR_cursor_depth is v%u (needs v5) — lifting without it",
+		if (g_liftCursor && g_cursorDepthSpecVersion < 6) {
+			LOG_ERROR("--lift-cursor: the runtime's XR_DXR_cursor_depth is v%u (needs v6) — lifting without it",
 			          g_cursorDepthSpecVersion);
 			g_liftCursor = false;
 		}
@@ -1564,7 +1564,7 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 		}
 
 		// --lift: flag rect 0 as 2D-to-lift; --lift-cursor asks the runtime to draw
-		// the depth cursor into its lifted views (XR_DXR_cursor_depth v5).
+		// the depth cursor into its lifted views (XR_DXR_cursor_depth v6).
 		XrCursorDepthLiftRectDXR cursorReq = {XR_TYPE_CURSOR_DEPTH_LIFT_RECT_DXR};
 		XrWeaveRectLiftDXR liftRect = {XR_TYPE_WEAVE_RECT_LIFT_DXR};
 		XrWeaveSubmitLiftRectsDXR lifts = {XR_TYPE_WEAVE_SUBMIT_LIFT_RECTS_DXR};
