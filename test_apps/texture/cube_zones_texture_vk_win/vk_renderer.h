@@ -18,6 +18,7 @@
 #include <vulkan/vulkan.h>
 #include <DirectXMath.h>
 #include <vector>
+#include <vk_frame_ring.h>
 
 struct VkRenderer {
     VkDevice device = VK_NULL_HANDLE;
@@ -69,12 +70,13 @@ struct VkRenderer {
     std::vector<VkImageView> swapchainImageViews[2];
     std::vector<VkFramebuffer> framebuffers[2];
 
-    // Command pool and buffers
+    // Command pool + buffer for the init-time texture upload only.
     VkCommandPool commandPool = VK_NULL_HANDLE;
     VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
 
-    // Fence for frame synchronization
-    VkFence frameFence = VK_NULL_HANDLE;
+    // INV-4.10 / #1917: N frames in flight, one submit per frame, never a wait
+    // on the frame just submitted. Owns the per-frame command buffers + fences.
+    dxr::VkFrameRing ring;
 
     // ADR-021 / INV-4.6: does this renderer emit SCENE-LINEAR? Latched once, at
     // InitializeVkRenderer(), from dxr::RenderSceneLinear() -- the pipelines bake
@@ -161,8 +163,9 @@ bool CreateZoneFramebuffers(VkRenderer& renderer, ZoneFramebuffers& fb,
 // Render the cube + grid scene into one zone framebuffer with an explicit
 // premultiplied clear color and a per-zone rotation offset (added to
 // renderer.cubeRotation for this submission only — the caller does NOT need to
-// save/restore the shared rotation).
-void RenderSceneToZone(VkRenderer& renderer, ZoneFramebuffers& fb,
+// save/restore the shared rotation). Records into @p cmd (the frame's
+// renderer.ring command buffer); no submit.
+void RenderSceneToZone(VkRenderer& renderer, VkCommandBuffer cmd, ZoneFramebuffers& fb,
     uint32_t imageIndex, const EyeRenderParams* eyes, int eyeCount,
     const float clearColor[4], float rotationOffset);
 

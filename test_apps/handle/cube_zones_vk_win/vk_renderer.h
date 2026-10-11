@@ -19,6 +19,7 @@
 #include <vulkan/vulkan.h>
 #include <DirectXMath.h>
 #include <vector>
+#include <vk_frame_ring.h>
 
 struct VkRenderer {
     VkDevice device = VK_NULL_HANDLE;
@@ -65,12 +66,13 @@ struct VkRenderer {
     std::vector<VkImageView> swapchainImageViews[2];
     std::vector<VkFramebuffer> framebuffers[2];
 
-    // Command pool and buffers
+    // Command pool + buffer for the init-time texture upload only.
     VkCommandPool commandPool = VK_NULL_HANDLE;
     VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
 
-    // Fence for frame synchronization
-    VkFence frameFence = VK_NULL_HANDLE;
+    // INV-4.10 / #1917: N frames in flight, one submit per frame, never a wait
+    // on the frame just submitted. Owns the per-frame command buffers + fences.
+    dxr::VkFrameRing ring;
 
     // ADR-021 / INV-4.6: does this renderer emit SCENE-LINEAR? Latched once, at
     // InitializeVkRenderer(), from dxr::RenderSceneLinear() -- the pipelines bake
@@ -148,7 +150,8 @@ struct ZoneArrayFramebuffers {
     std::vector<VkImageView> colorViews;
     std::vector<VkFramebuffer> framebuffers;
     // Single shared depth image/view (per-view tile sized); the render pass
-    // CLEARs it at the start of every layer submission, so serial reuse is safe.
+    // CLEARs it at the start of every layer, and its EXTERNAL subpass
+    // dependency orders that clear after the previous layer's/frame's writes.
     VkImage depthImage = VK_NULL_HANDLE;
     VkDeviceMemory depthMemory = VK_NULL_HANDLE;
     VkImageView depthView = VK_NULL_HANDLE;
@@ -164,7 +167,8 @@ bool CreateZoneArrayFramebuffers(VkRenderer& renderer, ZoneArrayFramebuffers& fb
 // Render the cube + grid scene for ONE view into (imageIndex, layer) with an
 // explicit premultiplied clear color and a per-zone rotation offset (added to
 // renderer.cubeRotation for this submission only). Full-viewport into the tile.
-void RenderSceneToZoneLayer(VkRenderer& renderer, ZoneArrayFramebuffers& fb,
+// Records into @p cmd (the frame's renderer.ring command buffer); no submit.
+void RenderSceneToZoneLayer(VkRenderer& renderer, VkCommandBuffer cmd, ZoneArrayFramebuffers& fb,
     uint32_t imageIndex, uint32_t layer, const EyeRenderParams& eye,
     const float clearColor[4], float rotationOffset);
 

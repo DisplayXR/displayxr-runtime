@@ -393,7 +393,7 @@ static int64_t PickPanelFormat(XrSession session, int64_t srgb, int64_t unorm) {
     return unorm;
 }
 
-static bool CreateAndFillL2DPanel(XrSessionManager& xr, VkRenderer* renderer, VkCommandPool cmdPool,
+static bool CreateAndFillL2DPanel(XrSessionManager& xr, VkRenderer* renderer,
                                   uint32_t w, uint32_t h, int variant, L2DPanel& out) {
     if (w == 0 || h == 0) {
         return false;
@@ -515,49 +515,34 @@ static bool CreateAndFillL2DPanel(XrSessionManager& xr, VkRenderer* renderer, Vk
     vkUnmapMemory(renderer->device, stagingMem);
 
     // Copy staging → image, then transition to SHADER_READ_ONLY for sampling.
-    VkCommandBufferAllocateInfo cbai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    cbai.commandPool = cmdPool;
-    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cbai.commandBufferCount = 1;
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    vkAllocateCommandBuffers(renderer->device, &cbai, &cmd);
-    VkCommandBufferBeginInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &cbi);
+    // One-off (static content, filled once): the ring's sanctioned blocking path.
+    renderer->ring.submitImmediate([&](VkCommandBuffer cmd) {
+        VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.srcAccessMask = 0;
+        b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = img;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+                             nullptr, 0, nullptr, 1, &b);
 
-    VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    b.srcAccessMask = 0;
-    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.image = img;
-    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
-                         nullptr, 0, nullptr, 1, &b);
+        VkBufferImageCopy region = {};
+        region.bufferRowLength = w;
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageOffset = {0, 0, 0};
+        region.imageExtent = {w, h, 1};
+        vkCmdCopyBufferToImage(cmd, staging, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
-    VkBufferImageCopy region = {};
-    region.bufferRowLength = w;
-    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.imageOffset = {0, 0, 0};
-    region.imageExtent = {w, h, 1};
-    vkCmdCopyBufferToImage(cmd, staging, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-
-    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
-                         nullptr, 0, nullptr, 1, &b);
-
-    vkEndCommandBuffer(cmd);
-    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cmd;
-    vkQueueSubmit(renderer->graphicsQueue, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(renderer->graphicsQueue);
-    vkFreeCommandBuffers(renderer->device, cmdPool, 1, &cmd);
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
+                             nullptr, 0, nullptr, 1, &b);
+    });
     vkDestroyBuffer(renderer->device, staging, nullptr);
     vkFreeMemory(renderer->device, stagingMem, nullptr);
 
@@ -575,7 +560,6 @@ static void RenderThreadFunc(
     uint32_t hudHeight,
     VkBuffer hudStagingBuffer,
     void* hudStagingMapped,
-    VkCommandPool hudCmdPool,
     std::vector<XrSwapchainImageVulkanKHR>* hudSwapchainImages)
 {
     LOG_INFO("[RenderThread] Started");
@@ -1195,67 +1179,50 @@ static void RenderThreadFunc(
                                     UnmapHud(*hud);
                                 }
 
-                                // Copy staging buffer to HUD swapchain image
-                                VkCommandBufferAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-                                allocInfo.commandPool = hudCmdPool;
-                                allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-                                allocInfo.commandBufferCount = 1;
-
-                                VkCommandBuffer cmdBuf;
-                                vkAllocateCommandBuffers(renderer->device, &allocInfo, &cmdBuf);
-
-                                VkCommandBufferBeginInfo beginInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-                                beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-                                vkBeginCommandBuffer(cmdBuf, &beginInfo);
-
+                                // Copy staging buffer to HUD swapchain image. The HUD
+                                // text (perf line) changes every frame and the shared
+                                // staging buffer is rewritten next frame, so this stays
+                                // a blocking upload — via the ring's one sanctioned
+                                // blocking path (no per-frame cmd alloc). HUD is hidden
+                                // by default (Shift+Tab).
                                 VkImage hudImg = (*hudSwapchainImages)[hudImageIndex].image;
-
-                                // Barrier: UNDEFINED -> TRANSFER_DST
-                                VkImageMemoryBarrier barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-                                barrier.srcAccessMask = 0;
-                                barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                                barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-                                barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                                barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                                barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                                barrier.image = hudImg;
-                                barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-                                vkCmdPipelineBarrier(cmdBuf,
-                                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                                    VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                    0, 0, nullptr, 0, nullptr, 1, &barrier);
-
-                                // Copy buffer to image
-                                VkBufferImageCopy region = {};
-                                region.bufferRowLength = hudWidth;
-                                region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-                                region.imageOffset = {0, 0, 0};
-                                region.imageExtent = {hudWidth, hudHeight, 1};
-                                vkCmdCopyBufferToImage(cmdBuf, hudStagingBuffer, hudImg,
-                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-
-                                // Barrier: TRANSFER_DST -> COLOR_ATTACHMENT
-                                barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                                barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-                                barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                                barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-                                vkCmdPipelineBarrier(cmdBuf,
-                                    VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                                    0, 0, nullptr, 0, nullptr, 1, &barrier);
-
-                                vkEndCommandBuffer(cmdBuf);
-
-                                VkSubmitInfo submitInfo = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-                                submitInfo.commandBufferCount = 1;
-                                submitInfo.pCommandBuffers = &cmdBuf;
                                 LOG_INFO("[FRAME] HUD: Submitting GPU commands...");
-                                vkQueueSubmit(renderer->graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-                                LOG_INFO("[FRAME] HUD: vkQueueWaitIdle...");
-                                vkQueueWaitIdle(renderer->graphicsQueue);
-                                LOG_INFO("[FRAME] HUD: GPU done");
+                                renderer->ring.submitImmediate([&](VkCommandBuffer cmdBuf) {
+                                    // Barrier: UNDEFINED -> TRANSFER_DST
+                                    VkImageMemoryBarrier barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                                    barrier.srcAccessMask = 0;
+                                    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                                    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                                    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                                    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                                    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                                    barrier.image = hudImg;
+                                    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                                    vkCmdPipelineBarrier(cmdBuf,
+                                        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                        VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                        0, 0, nullptr, 0, nullptr, 1, &barrier);
 
-                                vkFreeCommandBuffers(renderer->device, hudCmdPool, 1, &cmdBuf);
+                                    // Copy buffer to image
+                                    VkBufferImageCopy region = {};
+                                    region.bufferRowLength = hudWidth;
+                                    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                                    region.imageOffset = {0, 0, 0};
+                                    region.imageExtent = {hudWidth, hudHeight, 1};
+                                    vkCmdCopyBufferToImage(cmdBuf, hudStagingBuffer, hudImg,
+                                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+                                    // Barrier: TRANSFER_DST -> COLOR_ATTACHMENT
+                                    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                                    barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                                    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                                    barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                                    vkCmdPipelineBarrier(cmdBuf,
+                                        VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                        0, 0, nullptr, 0, nullptr, 1, &barrier);
+                                });
+                                LOG_INFO("[FRAME] HUD: GPU done");
 
                                 LOG_INFO("[FRAME] HUD: Releasing swapchain image...");
                                 ReleaseHudSwapchainImage(*xr);
@@ -1302,7 +1269,7 @@ static void RenderThreadFunc(
                             g_panel1Rect.offset = {(int32_t)(winW / 16), (int32_t)(winH * 9 / 16)};
                         }
                         g_panel1Rect.extent = {(int32_t)pw, (int32_t)ph};
-                        bool ok = CreateAndFillL2DPanel(*xr, renderer, hudCmdPool, pw, ph, p1variant, g_panel1);
+                        bool ok = CreateAndFillL2DPanel(*xr, renderer, pw, ph, p1variant, g_panel1);
 
                         // #491 part 3 — a large backdrop submitted BEFORE the
                         // projection (an UNDER layer): the flat 2D plane the
@@ -1314,7 +1281,7 @@ static void RenderThreadFunc(
                             g_backdropRect.offset = {(int32_t)(winW / 2 - bw / 2),
                                                      (int32_t)(winH / 2 - bh / 2)};
                             g_backdropRect.extent = {(int32_t)bw, (int32_t)bh};
-                            ok = CreateAndFillL2DPanel(*xr, renderer, hudCmdPool, bw, bh,
+                            ok = CreateAndFillL2DPanel(*xr, renderer, bw, bh,
                                                        g_l2dBackdropVariant, g_backdrop);
                         }
 
@@ -1324,7 +1291,7 @@ static void RenderThreadFunc(
                             g_panel2Rect.offset = {g_panel1Rect.offset.x + (int32_t)(pw / 2),
                                                    g_panel1Rect.offset.y - (int32_t)(ph / 4)};
                             g_panel2Rect.extent = {(int32_t)pw, (int32_t)ph};
-                            ok = CreateAndFillL2DPanel(*xr, renderer, hudCmdPool, pw, ph, 1, g_panel2);
+                            ok = CreateAndFillL2DPanel(*xr, renderer, pw, ph, 1, g_panel2);
                         }
 
                         if (ok && g_l2dMask && g_zone.available && g_zone.pfnCreate &&
@@ -1704,7 +1671,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     VkBuffer hudStagingBuffer = VK_NULL_HANDLE;
     VkDeviceMemory hudStagingMemory = VK_NULL_HANDLE;
     void* hudStagingMapped = nullptr;
-    VkCommandPool hudCmdPool = VK_NULL_HANDLE;
 
     if (hudOk) {
         // Staging buffer
@@ -1749,17 +1715,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             }
         }
 
-        // Command pool for HUD copy operations
-        if (hudOk) {
-            VkCommandPoolCreateInfo poolInfo = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-            poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-            poolInfo.queueFamilyIndex = queueFamilyIndex;
-            if (vkCreateCommandPool(vkDevice, &poolInfo, nullptr, &hudCmdPool) != VK_SUCCESS) {
-                LOG_WARN("Failed to create HUD command pool");
-                hudOk = false;
-            }
-        }
-
         if (hudOk) {
             LOG_INFO("HUD Vulkan resources created (%ux%u)", hudWidth, hudHeight);
         }
@@ -1780,7 +1735,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     std::thread renderThread(RenderThreadFunc, hwnd, &xr, &vkRenderer,
         hudOk ? &hudRenderer : nullptr, hudWidth, hudHeight,
-        hudStagingBuffer, hudStagingMapped, hudCmdPool,
+        hudStagingBuffer, hudStagingMapped,
         hudOk ? &hudSwapImages : nullptr);
 
     MSG msg = {};
@@ -1797,7 +1752,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     LOG_INFO("");
     LOG_INFO("=== Shutting down ===");
 
-    if (hudCmdPool != VK_NULL_HANDLE) vkDestroyCommandPool(vkDevice, hudCmdPool, nullptr);
+    // Drain in-flight ring frames before freeing anything they may reference.
+    vkRenderer.ring.waitAll();
     if (hudStagingBuffer != VK_NULL_HANDLE) {
         vkUnmapMemory(vkDevice, hudStagingMemory);
         vkDestroyBuffer(vkDevice, hudStagingBuffer, nullptr);
