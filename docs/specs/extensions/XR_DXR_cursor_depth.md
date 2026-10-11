@@ -192,12 +192,14 @@ the runtime cannot draw (another backend, a space mismatch, a zones frame withou
 `XR_FALSE`, so the fallback is always the flat OS cursor, never no cursor. The runtime never
 touches the OS cursor itself.
 
-**Backends (v5).** The in-process Metal, Vulkan (vk_native) and OpenGL compositors draw. D3D11,
-D3D12 and the IPC/service path report `willDraw = XR_FALSE` with a one-time WARN (ADR-046
+**Backends (v5).** The in-process Metal, Vulkan (vk_native), OpenGL, D3D11 and D3D12 compositors
+draw. The IPC/service path reports `willDraw = XR_FALSE` with a one-time WARN (ADR-046
 Amendment 2 rollout step 3). On Vulkan the cursor is drawn after the projection, quad and
 equirect2 layers but **under** window-space layers, which that compositor stamps in a later pass
 (ADR-046 Amendment 2, "§B as built on Vulkan and GL"). The default look mirrors the OS cursor on
-macOS only; elsewhere it is the classic arrow.
+macOS and Windows (on Windows `GetCursorInfo`, or - while the app has hidden it - the class
+cursor of the window under the pointer, drawn at the size the OS draws it on the panel);
+elsewhere it is the classic arrow.
 
 ### 2.7 `XrCursorDepthLiftRectDXR` / `XrCursorDepthLiftStateDXR` (spec v6) — lifted content
 

@@ -68,6 +68,8 @@ struct comp_vk_split; // the reroute fields exist either way; the code does not
 #include "util/u_capture_dims.h"
 #include "util/u_image_capture.h"
 #include "util/u_hud.h"
+#include "util/u_cursor_depth.h"
+#include "util/u_cursor_look.h"
 #include <displayxr_mcp/mcp_capture.h>
 
 // STB_IMAGE_WRITE_STATIC scopes all stbi_write_* to this TU.
@@ -798,6 +800,21 @@ struct comp_d3d12_compositor
 
 	//! Per-frame capture intent. See u_capture_intent.h.
 	struct u_capture_intent capture_intent;
+
+	/*!
+	 * XR_DXR_cursor_depth v5, the runtime draws the cursor (ADR-046
+	 * Amendment 2 B). ZERO COST UNLESS REQUESTED: all zero for a session that
+	 * never chained XrCursorDepthDrawInfoDXR; layer_commit tests
+	 * `req.requested` and does nothing else.
+	 */
+	struct
+	{
+		//! One-frame request from the state tracker, consumed by the next commit.
+		struct u_cursor_draw_request req;
+		//! The default look (the OS cursor mirror, else the arrow).
+		struct u_cursor_look look;
+		bool warned_routed;
+	} cursor_draw;
 };
 
 /*
@@ -4667,6 +4684,105 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 	}
 }
 
+/*
+ *
+ * XR_DXR_cursor_depth v5 - the runtime draws the cursor (ADR-046 Amendment 2 B)
+ *
+ */
+
+/*!
+ * Resolve this frame's cursor request into per-tile quads for the renderer:
+ * pick the sprite (the app's swapchain, or the default look - the OS cursor
+ * mirror, else the arrow), its size in metres, aspect and hotspot, and map it
+ * through each view's placement (u_cursor_draw_corners). False = draw nothing
+ * this frame.
+ */
+static bool
+d3d12_cursor_resolve(struct comp_d3d12_compositor *c,
+                     const struct u_cursor_draw_request *req,
+                     const struct xrt_window_metrics *metrics,
+                     const struct u_canvas_rect *eff_canvas,
+                     uint32_t tgt_height,
+                     struct comp_d3d12_cursor_quads *out)
+{
+	// A routed (multi-screen) frame's tiles are per-segment mosaics; the
+	// per-view map is for whole tiles.
+	if (c->eff_layout.route_count > 0) {
+		if (!c->cursor_draw.warned_routed) {
+			c->cursor_draw.warned_routed = true;
+			U_LOG_W("cursor_draw [d3d12]: multi-screen routed frame - cursor not drawn (one-time warning)");
+		}
+		return false;
+	}
+	// Panel pixel pitch (metres per pixel): every DisplayXR process is per-
+	// monitor DPI aware, so window and panel pixels are the same pixels.
+	if (metrics == nullptr || metrics->display_pixel_height == 0 || !(metrics->display_height_m > 0.0f)) {
+		return false;
+	}
+	const float m_per_px = metrics->display_height_m / (float)metrics->display_pixel_height;
+	const uint32_t canvas_px_h = (eff_canvas->valid && eff_canvas->h > 0) ? eff_canvas->h : tgt_height;
+	if (canvas_px_h == 0) {
+		return false;
+	}
+	const float canvas_h_m = (float)canvas_px_h * m_per_px;
+
+	// The panel's DPI sizes the OS cursor (and the arrow fallback).
+	HWND dpi_hwnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
+	UINT dpi = dpi_hwnd != nullptr ? GetDpiForWindow(dpi_hwnd) : 0;
+	if (dpi == 0) {
+		dpi = 96;
+	}
+
+	float aspect, hot_u, hot_v, size_m;
+	if (req->image != NULL) {
+		uint32_t sw = 0, sh = 0;
+		comp_d3d12_swapchain_get_dimensions(req->image, &sw, &sh);
+		if (sw == 0 || sh == 0) {
+			return false;
+		}
+		aspect = (float)sw / (float)sh;
+		hot_u = req->hot_u;
+		hot_v = req->hot_v;
+		// <= 0: the OS cursor's size (the classic arrow's 19 px at this DPI).
+		size_m =
+		    req->size_m > 0.0f ? req->size_m : U_CURSOR_DRAW_DEFAULT_POINTS * ((float)dpi / 96.0f) * m_per_px;
+		out->xsc = req->image;
+		out->image_index = req->image_index;
+	} else {
+		if (!u_cursor_look_update(&c->cursor_draw.look, dpi)) {
+			return false;
+		}
+		const struct u_cursor_look *look = &c->cursor_draw.look;
+		aspect = (float)look->width / (float)look->height;
+		hot_u = look->hot_u;
+		hot_v = look->hot_v;
+		size_m = req->size_m > 0.0f ? req->size_m : look->height_px * m_per_px;
+		out->look = look;
+	}
+	const float height = size_m / canvas_h_m; // sprite height, in units (canvas heights at t)
+	if (!(height > 0.0f) || !std::isfinite(height)) {
+		return false;
+	}
+	out->count = req->view_count < XRT_MAX_VIEWS ? req->view_count : XRT_MAX_VIEWS;
+	for (uint32_t i = 0; i < out->count; i++) {
+		u_cursor_draw_corners(&req->view[i], height, aspect, hot_u, hot_v, out->corners[i]);
+	}
+	return true;
+}
+
+extern "C" void
+comp_d3d12_compositor_set_cursor_draw_request(struct xrt_compositor *xc, const struct u_cursor_draw_request *req)
+{
+	if (xc == nullptr || req == nullptr) {
+		return;
+	}
+	struct comp_d3d12_compositor *c = d3d12_comp(xc);
+	// Same thread as the commit that consumes it (xrEndFrame), but the lock
+	// keeps it honest against a future caller.
+	std::lock_guard<std::mutex> lock(c->mutex);
+	c->cursor_draw.req = *req;
+}
+
 static xrt_result_t
 d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -4684,6 +4800,17 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// projection-done boundary (PROJECTION_ONLY, once renderer split
 	// lands) or end of frame (POST_COMPOSE).
 	u_capture_intent_poll(&c->capture_intent, &c->mcp_capture);
+
+	// XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B). ZERO COST UNLESS
+	// REQUESTED: one field test, false for every session that never chained
+	// XrCursorDepthDrawInfoDXR. The request covers this commit only.
+	struct u_cursor_draw_request cursor_req;
+	bool cursor_pending = false;
+	if (c->cursor_draw.req.requested) {
+		cursor_req = c->cursor_draw.req;
+		c->cursor_draw.req.requested = false;
+		cursor_pending = u_cursor_draw_should_draw(&cursor_req);
+	}
 
 	// Get predicted eye positions
 	struct xrt_eye_positions eye_pos = {};
@@ -5073,6 +5200,13 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		zc_resource = nullptr;
 	}
 
+	// XR_DXR_cursor_depth v5: a frame carrying a runtime-drawn cursor composes
+	// into the atlas - the cursor is drawn there, never into the app's image.
+	if (cursor_pending) {
+		zero_copy = false;
+		zc_resource = nullptr;
+	}
+
 	// Reset command allocator and command list
 	c->cmd_allocator->Reset();
 	c->cmd_list->Reset(c->cmd_allocator, nullptr);
@@ -5169,11 +5303,24 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		struct xrt_window_metrics canvas = {};
 		const bool have_canvas = comp_d3d12_compositor_get_window_metrics(xc, &canvas);
 
+		// XR_DXR_cursor_depth v5: resolve the cursor BEFORE the projection
+		// pass - its sprite's encoding takes part in the frame's compose
+		// decision. Drawn by the window-space pass, last.
+		if (cursor_pending) {
+			struct comp_d3d12_cursor_quads quads = {};
+			const bool draw = d3d12_cursor_resolve(c, &cursor_req, have_canvas ? &canvas : nullptr,
+			                                       &eff_canvas, tgt_height, &quads);
+			comp_d3d12_renderer_set_cursor(c->renderer, draw ? &quads : nullptr);
+		}
+
 		xret = comp_d3d12_renderer_draw_projection_pass(c->renderer, c->cmd_list, &c->layer_accum, &left_eye,
 		                                                &right_eye, &render_eyes, tgt_width, tgt_height,
 		                                                have_canvas ? &canvas : nullptr, &c->eff_layout);
 		if (xret != XRT_SUCCESS) {
 			U_LOG_E("Failed to render projection pass");
+			if (cursor_pending) {
+				comp_d3d12_renderer_set_cursor(c->renderer, nullptr);
+			}
 			return xret;
 		}
 
@@ -5213,6 +5360,10 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 		xret = comp_d3d12_renderer_draw_window_space_pass(
 		    c->renderer, c->cmd_list, &c->layer_accum, tgt_width, tgt_height, &c->eff_layout);
+		// The cursor covered this frame only.
+		if (cursor_pending) {
+			comp_d3d12_renderer_set_cursor(c->renderer, nullptr);
+		}
 		if (xret != XRT_SUCCESS) {
 			U_LOG_E("Failed to render window-space pass");
 			return xret;
@@ -5992,6 +6143,8 @@ d3d12_compositor_destroy(struct xrt_compositor *xc)
 	u_capture_dims_set_provider(NULL, c);
 	mcp_capture_uninstall();
 	mcp_capture_fini(&c->mcp_capture);
+	// XR_DXR_cursor_depth v5: the default look's image (NULL unless ever drawn).
+	u_cursor_look_fini(&c->cursor_draw.look);
 
 #ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
 	// #1264 reroute teardown: the arm first (its consumer holds NT opens of

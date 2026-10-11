@@ -622,6 +622,31 @@ u_cursor_draw_canvas_px_h(const struct u_cursor_draw_request *req, uint32_t canv
 void
 u_cursor_draw_arrow_rgba(uint8_t *rgba, uint32_t w, uint32_t h);
 
+/*!
+ * Premultiplied -> STRAIGHT alpha, in place, for @p pixel_count 4-byte pixels
+ * (colour in bytes 0..2, alpha in byte 3). A fully transparent pixel keeps
+ * colour 0. Used on the classic arrow, so every backend can blend every
+ * cursor source with ONE straight-alpha rule.
+ */
+void
+u_cursor_draw_unpremultiply(uint8_t *px, uint32_t pixel_count);
+
+/*!
+ * Recover a cursor image from two renders of it: one over opaque BLACK, one
+ * over opaque WHITE. This is how the Windows default look reads ANY HCURSOR -
+ * 32-bit alpha, colour + AND mask, or monochrome AND/XOR - without branching
+ * on its type: whatever the OS draws, the two backgrounds reveal it.
+ *
+ * Per pixel, with b and w the two renders (bytes 0..2 colour, byte 3 ignored):
+ * alpha = 1 - mean(w - b) and colour = b / alpha (the render over black IS the
+ * premultiplied colour). A pixel the cursor INVERTS (white over black, black
+ * over white - the I-beam's XOR pixels) comes out opaque WHITE: a compositor
+ * cannot invert what is behind it before the weave, and white is the classic
+ * arrow's fill. Output: STRAIGHT alpha, channels in the input's order.
+ */
+void
+u_cursor_draw_unblend(const uint8_t *on_black, const uint8_t *on_white, uint32_t pixel_count, uint8_t *out);
+
 #ifdef __cplusplus
 }
 #endif

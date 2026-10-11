@@ -12,10 +12,13 @@
  */
 
 #include "util/u_cursor_depth.h"
+#include "util/u_cursor_look.h"
 
 #include "catch_amalgamated.hpp"
 
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <vector>
 
 namespace {
@@ -1433,4 +1436,131 @@ TEST_CASE("cursor_draw: drawable predicate - the hotspot in ONE tile is enough (
 	REQUIRE(u_cursor_draw_placement_drawable(rp.v, 2, &c, &rp.g.orientation, unit_for(rp.g, d), out));
 	CHECK(out[0].origin[0] > 1.0f);
 	CHECK(out[1].origin[0] <= 1.0f);
+}
+
+TEST_CASE("cursor_draw: unpremultiply - straight colour back, alpha untouched, empty stays black")
+{
+	// White at 50 % coverage (premultiplied 128/128), opaque dark, empty.
+	uint8_t px[3][4] = {{128, 128, 128, 128}, {5, 5, 8, 255}, {0, 0, 0, 0}};
+	u_cursor_draw_unpremultiply(&px[0][0], 3);
+	CHECK(px[0][0] == 255);
+	CHECK(px[0][3] == 128);
+	CHECK(px[1][0] == 5);
+	CHECK(px[1][2] == 8);
+	CHECK(px[1][3] == 255);
+	CHECK(px[2][0] == 0);
+	CHECK(px[2][3] == 0);
+
+	// MUTANT: dividing by 255 instead of alpha would leave the half-covered
+	// white at 128 - a grey fringe around every edge of the arrow.
+	uint8_t edge[4] = {64, 64, 64, 64};
+	u_cursor_draw_unpremultiply(edge, 1);
+	CHECK(edge[0] == 255);
+}
+
+TEST_CASE("cursor_draw: the arrow, straight - white stays white at every coverage")
+{
+	const uint32_t h = 76, w = 48;
+	std::vector<uint8_t> img((size_t)w * h * 4, 0);
+	u_cursor_draw_arrow_rgba(img.data(), w, h);
+	u_cursor_draw_unpremultiply(img.data(), w * h);
+	auto px = [&](uint32_t x, uint32_t y) { return &img[((size_t)y * w + x) * 4]; };
+	CHECK(px(9, 36)[0] == 255); // fill
+	CHECK(px(9, 36)[3] == 255);
+	CHECK(px(0, 2)[0] < 40); // outline, still dark
+	// Any pixel of pure fill coverage (no outline mixed in) is pure white.
+	for (size_t i = 0; i < img.size(); i += 4) {
+		if (img[i + 3] != 0) {
+			REQUIRE(img[i + 0] == img[i + 1]); // grey ramp: R == G
+		}
+	}
+}
+
+// One pixel of a cursor whose colour is c and coverage a, composited by "the
+// OS" over black and over white, exactly as DrawIconEx does.
+static void
+os_draw(const uint8_t c[3], float a, uint8_t on_black[4], uint8_t on_white[4])
+{
+	for (int k = 0; k < 3; k++) {
+		on_black[k] = (uint8_t)lrintf(c[k] * a);
+		on_white[k] = (uint8_t)lrintf(c[k] * a + 255.0f * (1.0f - a));
+	}
+	on_black[3] = on_white[3] = 0; // GDI leaves byte 3 undefined: ignored
+}
+
+TEST_CASE("cursor_draw: unblend recovers colour and alpha from the black/white pair")
+{
+	const uint8_t white[3] = {255, 255, 255};
+	const uint8_t orange[3] = {250, 120, 10};
+	const float alphas[] = {0.0f, 0.25f, 0.5f, 0.8f, 1.0f};
+	for (const uint8_t *c : {white, orange}) {
+		for (float a : alphas) {
+			uint8_t b[4], w[4], out[4];
+			os_draw(c, a, b, w);
+			u_cursor_draw_unblend(b, w, 1, out);
+			CAPTURE(a, (int)c[0]);
+			CHECK(std::abs((int)out[3] - (int)lrintf(255.0f * a)) <= 1);
+			if (a >= 0.25f) {
+				for (int k = 0; k < 3; k++) {
+					// Straight colour within rounding of the 8-bit inputs.
+					CHECK(std::abs((int)out[k] - (int)c[k]) <= (a < 0.5f ? 4 : 2));
+				}
+			} else if (a == 0.0f) {
+				CHECK(out[0] == 0); // transparent = zero, never garbage
+			}
+		}
+	}
+}
+
+TEST_CASE("cursor_draw: unblend - monochrome AND/XOR cursors, inverted pixels opaque white")
+{
+	// AND=0 XOR=0: black. AND=0 XOR=1: white. AND=1 XOR=0: transparent.
+	// AND=1 XOR=1: inverts the screen (white over black, black over white).
+	const uint8_t black_b[4] = {0, 0, 0, 0}, black_w[4] = {0, 0, 0, 0};
+	const uint8_t white_b[4] = {255, 255, 255, 0}, white_w[4] = {255, 255, 255, 0};
+	const uint8_t clear_b[4] = {0, 0, 0, 0}, clear_w[4] = {255, 255, 255, 0};
+	const uint8_t inv_b[4] = {255, 255, 255, 0}, inv_w[4] = {0, 0, 0, 0};
+	uint8_t b[16], w[16], out[16];
+	memcpy(b + 0, black_b, 4), memcpy(w + 0, black_w, 4);
+	memcpy(b + 4, white_b, 4), memcpy(w + 4, white_w, 4);
+	memcpy(b + 8, clear_b, 4), memcpy(w + 8, clear_w, 4);
+	memcpy(b + 12, inv_b, 4), memcpy(w + 12, inv_w, 4);
+	u_cursor_draw_unblend(b, w, 4, out);
+	CHECK((out[0] == 0 && out[3] == 255));                    // opaque black
+	CHECK((out[4] == 255 && out[5] == 255 && out[7] == 255)); // opaque white
+	CHECK(out[11] == 0);                                      // transparent
+	CHECK((out[12] == 255 && out[15] == 255));                // invert -> opaque white
+
+	// MUTANT: taking alpha from GDI's byte 3 (undefined for these cursors)
+	// would make every one of them invisible - byte 3 is 0 in every input.
+	CHECK(out[3] == 255);
+}
+
+TEST_CASE("cursor_look: off Windows (or forced), the default look is the arrow at the DPI's size")
+{
+	struct u_cursor_look look = {};
+	look.force_arrow = 2; // as DXR_CURSOR_DEFAULT_LOOK=arrow
+	REQUIRE(u_cursor_look_update(&look, 96));
+	CHECK_FALSE(look.from_os);
+	CHECK(look.serial == 1);
+	CHECK(look.rgba != nullptr);
+	CHECK(look.hot_u == 0.0f);
+	CHECK(look.hot_v == 0.0f);
+	CHECK(look.height_px == Catch::Approx(U_CURSOR_ARROW_HEIGHT_PX));
+	CHECK(look.width * 19 >= look.height * 12); // the 12 x 19 box, never squashed
+
+	// Unchanged DPI: no re-raster (the serial is what a backend re-uploads on).
+	REQUIRE(u_cursor_look_update(&look, 96));
+	CHECK(look.serial == 1);
+	// 150 %: the same image, drawn 1.5x taller - and a new serial.
+	REQUIRE(u_cursor_look_update(&look, 144));
+	CHECK(look.height_px == Catch::Approx(U_CURSOR_ARROW_HEIGHT_PX * 1.5f));
+	CHECK(look.serial == 2);
+	// 0 means 96.
+	REQUIRE(u_cursor_look_update(&look, 0));
+	CHECK(look.height_px == Catch::Approx(U_CURSOR_ARROW_HEIGHT_PX));
+
+	u_cursor_look_fini(&look);
+	CHECK(look.rgba == nullptr);
+	CHECK(look.serial == 0);
 }

@@ -750,3 +750,58 @@ u_cursor_draw_arrow_rgba(uint8_t *rgba, uint32_t w, uint32_t h)
 		}
 	}
 }
+
+void
+u_cursor_draw_unpremultiply(uint8_t *px, uint32_t pixel_count)
+{
+	if (px == NULL) {
+		return;
+	}
+	for (uint32_t i = 0; i < pixel_count; i++) {
+		uint8_t *p = px + (size_t)i * 4;
+		const uint32_t a = p[3];
+		if (a == 0) {
+			p[0] = p[1] = p[2] = 0;
+			continue;
+		}
+		if (a == 255) {
+			continue;
+		}
+		for (int c = 0; c < 3; c++) {
+			const uint32_t v = ((uint32_t)p[c] * 255u + a / 2u) / a;
+			p[c] = (uint8_t)(v > 255u ? 255u : v);
+		}
+	}
+}
+
+void
+u_cursor_draw_unblend(const uint8_t *on_black, const uint8_t *on_white, uint32_t pixel_count, uint8_t *out)
+{
+	if (on_black == NULL || on_white == NULL || out == NULL) {
+		return;
+	}
+	for (uint32_t i = 0; i < pixel_count; i++) {
+		const uint8_t *b = on_black + (size_t)i * 4;
+		const uint8_t *w = on_white + (size_t)i * 4;
+		uint8_t *o = out + (size_t)i * 4;
+		// How much of the background shows through, summed over 3 channels.
+		// Negative where the cursor inverts (w < b): that is fully opaque.
+		int through = 0;
+		for (int c = 0; c < 3; c++) {
+			through += (int)w[c] - (int)b[c];
+		}
+		int a = 255 - (through + 1) / 3;
+		if (a > 255) {
+			a = 255;
+		}
+		if (a <= 0) {
+			o[0] = o[1] = o[2] = o[3] = 0;
+			continue;
+		}
+		for (int c = 0; c < 3; c++) {
+			const int v = ((int)b[c] * 255 + a / 2) / a;
+			o[c] = (uint8_t)(v > 255 ? 255 : v);
+		}
+		o[3] = (uint8_t)a;
+	}
+}
