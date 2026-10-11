@@ -209,22 +209,33 @@ schema*, not who ships the bits — the `org.freedesktop.*` / `org.gnome.*`
 convention. A vendor package shipping the publisher keeps these identifiers
 unchanged; renaming forks the ecosystem and strands consumers.
 
-**Exactly one installed owner.** A D-Bus well-known name is singly owned: a
-second publisher binds nothing, queues silently, and leaves consumers on
-whichever copy won the race — possibly an older schema. So multiple packages
-may *be able* to ship it, but only one may be installed at a time. The Debian
-idiom for that is a virtual package — every package that ships the extension
-declares all three of:
+**Exactly one installed owner per compositor.** A D-Bus well-known name is
+singly owned: a second publisher binds nothing, queues silently, and leaves
+consumers on whichever copy won the race — possibly an older schema. So
+multiple packages may *be able* to ship a publisher for one compositor, but
+only one may be installed at a time. Publishers for *different* compositors
+never meet: GNOME Shell and KWin never run in the same session, so the bus
+name never has two owners, and a system with both desktops installed must be
+able to carry both publishers (#1928). The Debian idiom for that is two
+virtual packages — a generic one that consumers depend on, and a
+per-compositor one that carries the exclusion. A package shipping the GNOME
+Shell extension declares:
 
 ```
-Provides:  displayxr-window-geometry-publisher
-Conflicts: displayxr-window-geometry-publisher
-Replaces:  displayxr-window-geometry-publisher
+Provides:  displayxr-window-geometry-publisher, displayxr-window-geometry-publisher-gnome
+Conflicts: displayxr-window-geometry-publisher-gnome
+Replaces:  displayxr-window-geometry-publisher-gnome
 ```
 
-so a vendor runtime .deb and a DisplayXR .deb can each satisfy the dependency,
-dpkg refuses to install both, and consumers depend on the virtual name rather
-than on any particular vendor. Files install system-wide to
+and a KWin publisher the same with `-kwin` (any further compositor: its own
+suffix). So a vendor runtime .deb and a DisplayXR .deb can each satisfy the
+dependency, dpkg refuses to install two publishers for the same compositor,
+a GNOME publisher and a KWin publisher install side by side, and consumers
+depend on the generic name rather than on any particular vendor or desktop.
+Never put `Conflicts:` on the generic name: it would make every publisher
+exclude every other, across compositors. A package built before this split
+(it conflicts on the generic name) still excludes all publishers until it is
+upgraded. Files install system-wide to
 `/usr/share/gnome-shell/extensions/window-geometry@displayxr.org/` (not the
 per-user `~/.local/share/...` path used for manual dev installs).
 

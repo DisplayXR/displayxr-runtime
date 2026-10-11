@@ -43,9 +43,12 @@
 #       (scripts/linux/dashboard/; the binary comes from
 #       resolve_dashboard_bin.sh — CI's DashboardLinux artifact)
 #
-#   Provides/Conflicts/Replaces the virtual package
-#   displayxr-window-geometry-publisher: exactly one installed package may own
-#   the extension's D-Bus name (docs/specs/runtime/wayland-window-geometry.md §4).
+#   Provides the virtual package displayxr-window-geometry-publisher (what
+#   consumers depend on) and Provides/Conflicts/Replaces the per-compositor
+#   displayxr-window-geometry-publisher-gnome: exactly one installed package
+#   may own the GNOME extension's D-Bus name, while a publisher for another
+#   compositor (KWin, #1928) installs alongside
+#   (docs/specs/runtime/wayland-window-geometry.md §4).
 #
 #   postinst writes /etc/xdg/openxr/1/active_runtime.json (the Khronos loader
 #   well-known path — the Linux ActiveRuntime equivalent) pointing at the
@@ -405,9 +408,9 @@ Priority: optional
 Architecture: $ARCH
 Depends: $DEPENDS
 ${RECOMMENDS:+Recommends: $RECOMMENDS
-}Provides: displayxr-window-geometry-publisher
-Conflicts: displayxr-window-geometry-publisher
-Replaces: displayxr-window-geometry-publisher
+}Provides: displayxr-window-geometry-publisher, displayxr-window-geometry-publisher-gnome
+Conflicts: displayxr-window-geometry-publisher-gnome
+Replaces: displayxr-window-geometry-publisher-gnome
 Installed-Size: $INSTALLED_KB
 Maintainer: The DisplayXR Project <noreply@displayxr.dev>
 Homepage: https://github.com/DisplayXR/displayxr-runtime

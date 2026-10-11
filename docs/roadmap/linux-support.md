@@ -842,8 +842,9 @@ source comments and, until this section, in no document at all.
 
 - `docs/specs/runtime/wayland-window-geometry.md` — the #817 provider: D-Bus
   interface, JSON schema + versioning, degradation ladder, and the packaging
-  contract (the publisher is a shared asset; exactly one installed owner via
-  the `displayxr-window-geometry-publisher` virtual package).
+  contract (the publisher is a shared asset; exactly one installed owner per
+  compositor via `displayxr-window-geometry-publisher-<compositor>`, while
+  consumers depend on the generic `displayxr-window-geometry-publisher`).
 - `contrib/gnome-shell/window-geometry@displayxr.org/README.md` — install,
   verify with `gdbus call`, and the distributor notes.
 - `docs/specs/extensions/XR_DXR_wayland_surface_binding.md` — the extension
