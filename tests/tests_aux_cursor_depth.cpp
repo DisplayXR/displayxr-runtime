@@ -1244,3 +1244,193 @@ TEST_CASE("cursor_draw: zone clip and refusals")
 	r2.zone_rect = {{1600, 10}, {100, 50}};
 	CHECK_FALSE(u_cursor_draw_into_zone(&r2, WIN_PX_W, WIN_PX_H, clip));
 }
+
+
+/*
+ *
+ * The willDraw contract: report true only for a placement that draws.
+ *
+ */
+
+namespace {
+
+// A camera rig: the display-space scene (eye at `eye_display`, canvas at z = 0)
+// scaled by `scale` about the eye and carried so the eye sits at `at` - the
+// canvas is then `scale * eye_display.z` in front of it, which is what a
+// re-converging camera rig changes from frame to frame.
+Xform
+camera_rig(xrt_vec3 eye_display, float scale, xrt_vec3 at)
+{
+	Xform x;
+	x.s = scale;
+	x.t = {at.x - scale * eye_display.x, at.y - scale * eye_display.y, at.z - scale * eye_display.z};
+	return x;
+}
+
+struct RigPair
+{
+	u_cursor_depth_view v[2];
+	u_cursor_depth_geometry g;
+};
+
+RigPair
+rig_pair(const Xform &x, float u, float v, float head_x = 0.0f)
+{
+	RigPair r{};
+	r.v[0] = kooima({head_x - 0.03f, 0.1f, 0.6f}, x);
+	r.v[1] = kooima({head_x + 0.03f, 0.1f, 0.6f}, x);
+	REQUIRE(u_cursor_depth_geometry_solve(&r.v[0], &r.v[1], u, v, &r.g));
+	return r;
+}
+
+float
+unit_for(const u_cursor_depth_geometry &g, float d)
+{
+	return g.canvas_height / (1.0f - d);
+}
+
+} // namespace
+
+TEST_CASE("cursor_depth: HYBRID - a camera rig re-converging under a still pointer re-anchors, C stays in front")
+{
+	// EarthView's horizon framing: the anchor is taken while the camera rig's
+	// canvas is 1 m from the eye; the rig then re-converges to 3.42 m with the
+	// pointer still. The anchor-time line of sight belongs to the old canvas:
+	// s = 1 - (1 - t) e / e0 = 1 - 0.375 * 3.42 < 0 put C BEHIND the eye, and
+	// willDraw said true over an atlas with no cursor in it.
+	const float u = 0.58f, v = 0.75f, d = -0.6f;
+	const xrt_vec3 eye_at{0.0f, 0.092f, 0.0f};
+	u_cursor_depth_anchor anchor{};
+	float hgt = 0.0f;
+
+	const RigPair near_rig = rig_pair(camera_rig({0.0f, 0.1f, 0.6f}, 1.0f / 0.6f, eye_at), u, v);
+	REQUIRE(near_rig.g.eye_to_canvas == Catch::Approx(1.0f));
+	xrt_vec3 c{};
+	u_cursor_depth_place_anchored(&near_rig.g, d, 0.03f, U_CURSOR_DEPTH_ANCHOR_HYBRID, &anchor, u, v, false,
+	                              16 * MS, &c, &hgt);
+	REQUIRE(anchor.has_anchor);
+
+	const RigPair far_rig = rig_pair(camera_rig({0.0f, 0.1f, 0.6f}, 3.42f / 0.6f, eye_at), u, v);
+	REQUIRE(far_rig.g.eye_to_canvas == Catch::Approx(3.42f));
+	u_cursor_depth_place_anchored(&far_rig.g, d, 0.03f, U_CURSOR_DEPTH_ANCHOR_HYBRID, &anchor, u, v, false, 32 * MS,
+	                              &c, &hgt);
+
+	// Re-anchored on the new canvas: the SCREEN placement, in front of the eye...
+	xrt_vec3 cs{};
+	float hs = 0.0f;
+	u_cursor_depth_place(&far_rig.g, d, 0.03f, &cs, &hs);
+	require_near(c, cs, 1e-5f);
+	CHECK(anchor.eye_to_canvas == Catch::Approx(3.42f));
+	float back = 0.0f;
+	REQUIRE(u_cursor_depth_point_disparity(&far_rig.g, &c, &back));
+	CHECK(back == Catch::Approx(d).margin(1e-4));
+	// ... and it draws.
+	CHECK(u_cursor_draw_placement_drawable(far_rig.v, 2, &c, &far_rig.g.orientation, unit_for(far_rig.g, d),
+	                                       nullptr));
+
+	// A milder re-convergence (3.42 m -> 5 m) keeps s > 0, so only the plane
+	// test catches it: without it C would stay on the old line of sight at
+	// the wrong depth. Re-anchored, it is at the requested disparity.
+	const RigPair farther = rig_pair(camera_rig({0.0f, 0.1f, 0.6f}, 5.0f / 0.6f, eye_at), u, v);
+	xrt_vec3 c5{};
+	u_cursor_depth_place_anchored(&farther.g, d, 0.03f, U_CURSOR_DEPTH_ANCHOR_HYBRID, &anchor, u, v, false, 40 * MS,
+	                              &c5, &hgt);
+	REQUIRE(u_cursor_depth_point_disparity(&farther.g, &c5, &back));
+	CHECK(back == Catch::Approx(d).margin(1e-4));
+	CHECK(anchor.eye_to_canvas == Catch::Approx(5.0f));
+
+	// Back to 3.42 m (re-anchors again), then a head move keeps the canvas
+	// plane: world-fixed, no re-anchor.
+	u_cursor_depth_place_anchored(&far_rig.g, d, 0.03f, U_CURSOR_DEPTH_ANCHOR_HYBRID, &anchor, u, v, false, 44 * MS,
+	                              &c, &hgt);
+	const uint64_t anchored_at = anchor.last_ns;
+	CHECK(anchored_at == 44 * MS);
+	const RigPair head_moved =
+	    rig_pair(camera_rig({0.0f, 0.1f, 0.6f}, 3.42f / 0.6f, eye_at), u, v, /*head_x=*/0.05f);
+	xrt_vec3 c2{};
+	u_cursor_depth_place_anchored(&head_moved.g, d, 0.03f, U_CURSOR_DEPTH_ANCHOR_HYBRID, &anchor, u, v, false,
+	                              48 * MS, &c2, &hgt);
+	require_near(c2, c, 1e-4f);
+	CHECK(anchor.last_ns == anchored_at);
+}
+
+TEST_CASE("cursor_depth: HYBRID - never places C on or behind the eye (head far back re-anchors)")
+{
+	const float u = 0.3f, v = 0.4f, d = -0.6f;
+	u_cursor_depth_anchor anchor{};
+	float hgt = 0.0f;
+	xrt_vec3 c{};
+	const HeadGeom h0 = head({0.0f, 0.0f, 0.3f}, u, v);
+	u_cursor_depth_place_anchored(&h0.g, d, 0.03f, U_CURSOR_DEPTH_ANCHOR_HYBRID, &anchor, u, v, false, 16 * MS, &c,
+	                              &hgt);
+	// Same canvas plane, head 4x farther back: lift = 0.375 * 1.2 > e0 = 0.3.
+	const HeadGeom h1 = head({0.0f, 0.0f, 1.2f}, u, v);
+	u_cursor_depth_place_anchored(&h1.g, d, 0.03f, U_CURSOR_DEPTH_ANCHOR_HYBRID, &anchor, u, v, false, 32 * MS, &c,
+	                              &hgt);
+	xrt_vec3 cs{};
+	float hs = 0.0f;
+	u_cursor_depth_place(&h1.g, d, 0.03f, &cs, &hs);
+	require_near(c, cs, 1e-5f);
+	CHECK(c.z > 0.0f);
+	CHECK(c.z < 1.2f);
+}
+
+TEST_CASE("cursor_draw: drawable predicate - large-scale camera rig, far from the origin")
+{
+	// m2v in the thousands and a rig parked 1e5 m out: floats still resolve it.
+	const float u = 0.58f, v = 0.75f, d = -0.6f;
+	const Xform x = camera_rig({0.0f, 0.1f, 0.6f}, 5000.0f, {1.0e5f, 2.0e4f, -3.0e4f});
+	const RigPair rp = rig_pair(x, u, v);
+	xrt_vec3 c{};
+	float hgt = 0.0f;
+	u_cursor_depth_place(&rp.g, d, 0.03f, &c, &hgt);
+	const float unit = unit_for(rp.g, d);
+
+	u_cursor_draw_view out[2]{};
+	REQUIRE(u_cursor_draw_placement_drawable(rp.v, 2, &c, &rp.g.orientation, unit, out));
+	// The cyclopean projection of C is the pointer: the two views straddle it.
+	CHECK(0.5f * (out[0].origin[0] + out[1].origin[0]) == Catch::Approx(u).margin(2e-3));
+	CHECK(out[0].origin[1] == Catch::Approx(v).margin(2e-3));
+	CHECK(out[0].origin[0] > out[1].origin[0]); // crossed: in front of the glass
+	// One unit (the t-scaled canvas height) at depth t spans one tile height.
+	CHECK(std::fabs(out[0].axis_y[1]) == Catch::Approx(1.0f).margin(2e-3));
+
+	// The placement behind the eye (what the stale HYBRID anchor produced).
+	const xrt_vec3 eye = rp.g.eye;
+	const xrt_vec3 behind = {eye.x + (eye.x - c.x) * 0.2f, eye.y + (eye.y - c.y) * 0.2f,
+	                         eye.z + (eye.z - c.z) * 0.2f};
+	CHECK_FALSE(u_cursor_draw_placement_drawable(rp.v, 2, &behind, &rp.g.orientation, unit, nullptr));
+	// In front, but outside every view's frustum (far off to the side).
+	const xrt_vec3 aside = {c.x + 50.0f * rp.g.canvas_height, c.y, c.z};
+	CHECK_FALSE(u_cursor_draw_placement_drawable(rp.v, 2, &aside, &rp.g.orientation, unit, nullptr));
+	// Degenerate size, too few views, non-finite.
+	CHECK_FALSE(u_cursor_draw_placement_drawable(rp.v, 2, &c, &rp.g.orientation, 0.0f, nullptr));
+	CHECK_FALSE(u_cursor_draw_placement_drawable(rp.v, 2, &c, &rp.g.orientation, 1e-12f, nullptr));
+	CHECK_FALSE(u_cursor_draw_placement_drawable(rp.v, 1, &c, &rp.g.orientation, unit, nullptr));
+	const xrt_vec3 nan_c = {NAN, c.y, c.z};
+	CHECK_FALSE(u_cursor_draw_placement_drawable(rp.v, 2, &nan_c, &rp.g.orientation, unit, nullptr));
+
+	// Behind ONE eye only (unequal eye depths): visible in the other view's
+	// tile, still not drawable - the request would be partial.
+	const u_cursor_depth_view uneq[2] = {kooima({-0.03f, 0.0f, 0.6f}), kooima({0.03f, 0.0f, 0.4f})};
+	const xrt_vec3 between = {-0.03f, 0.0f, 0.5f};
+	u_cursor_draw_view one{};
+	REQUIRE(u_cursor_draw_view_from_placement(&uneq[0], &between, &rp.g.orientation, 0.1f, &one));
+	CHECK(one.origin[0] == Catch::Approx(0.4f).margin(1e-4));
+	CHECK_FALSE(u_cursor_draw_placement_drawable(uneq, 2, &between, &rp.g.orientation, 0.1f, nullptr));
+}
+
+TEST_CASE("cursor_draw: drawable predicate - the hotspot in ONE tile is enough (edge of the window)")
+{
+	// At the right edge, crossed disparity shifts the left view's hotspot past
+	// x = 1 while the right view still shows it: that frame draws.
+	const RigPair rp = rig_pair(Xform{}, 0.999f, 0.5f);
+	const float d = -0.6f;
+	xrt_vec3 c{};
+	float hgt = 0.0f;
+	u_cursor_depth_place(&rp.g, d, 0.03f, &c, &hgt);
+	u_cursor_draw_view out[2]{};
+	REQUIRE(u_cursor_draw_placement_drawable(rp.v, 2, &c, &rp.g.orientation, unit_for(rp.g, d), out));
+	CHECK(out[0].origin[0] > 1.0f);
+	CHECK(out[1].origin[0] <= 1.0f);
+}

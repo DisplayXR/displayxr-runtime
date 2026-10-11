@@ -3196,7 +3196,13 @@ struct oxr_session
 		//! space report willDraw = false, and keep arming so xrEndFrame can
 		//! clear this once a frame is drawable again.
 		bool cannot_draw;
+		//! The last armed frame's placement did not map to cursor pixels in
+		//! the SUBMITTED views (u_cursor_draw_placement_drawable), or its
+		//! sprite had no released image: the next locate reports willDraw =
+		//! false, and xrEndFrame clears this once a frame is drawable again.
+		bool draw_failed;
 		bool announced;       //!< one-shot WARN on first activation
+		bool warned_undrawable; //!< one-shot WARN: placement maps to no cursor pixels
 		bool warned_backend;  //!< one-shot WARN: compositor cannot draw
 		bool warned_space;    //!< one-shot WARN: layer space != locate space
 		bool warned_no_layer; //!< one-shot WARN: armed frame had no projection layer

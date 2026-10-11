@@ -2067,22 +2067,32 @@ cursor_draw_submit(struct oxr_session *sess, const XrFrameEndInfo *frameEndInfo,
 		}
 		return;
 	}
-	if (!sess->cursor_draw.will_draw) {
-		return; // the locate reported false (an earlier mismatch); now cleared
-	}
+
+	// Build the request even when the locate reported false: whether THIS
+	// frame could have drawn is what clears (or keeps) draw_failed, and so
+	// what the next locate reports. Every way out below that draws nothing
+	// sets it - the willDraw contract.
+	sess->cursor_draw.draw_failed = true;
 
 	struct u_cursor_draw_request req = {0};
 	req.requested = true;
 	req.view_count = proj->viewCount < XRT_MAX_VIEWS ? proj->viewCount : XRT_MAX_VIEWS;
+	struct u_cursor_depth_view submitted[XRT_MAX_VIEWS];
 	for (uint32_t i = 0; i < req.view_count; i++) {
 		// XrPosef/XrFovf are layout-identical to xrt_pose/xrt_fov.
-		const struct u_cursor_depth_view view = {*(const struct xrt_pose *)&proj->views[i].pose,
-		                                         *(const struct xrt_fov *)&proj->views[i].fov};
-		if (!u_cursor_draw_view_from_placement(&view, &sess->cursor_draw.position,
-		                                       &sess->cursor_draw.orientation, sess->cursor_draw.unit,
-		                                       &req.view[i])) {
-			return; // degenerate view: draw nothing rather than a partial cursor
+		submitted[i].pose = *(const struct xrt_pose *)&proj->views[i].pose;
+		submitted[i].fov = *(const struct xrt_fov *)&proj->views[i].fov;
+	}
+	// The same predicate the locate reported with, on the submitted views.
+	if (!u_cursor_draw_placement_drawable(submitted, req.view_count, &sess->cursor_draw.position,
+	                                      &sess->cursor_draw.orientation, sess->cursor_draw.unit, req.view)) {
+		if (!sess->cursor_draw.warned_undrawable) {
+			sess->cursor_draw.warned_undrawable = true;
+			U_LOG_W(
+			    "XR_DXR_cursor_depth: the cursor placement maps to no pixels in the submitted views - not "
+			    "drawn, the next locate reports willDraw = false (one-time warning)");
 		}
+		return; // draw nothing rather than a partial cursor
 	}
 
 	struct oxr_swapchain *sc = sess->cursor_draw.image;
@@ -2110,6 +2120,10 @@ cursor_draw_submit(struct oxr_session *sess, const XrFrameEndInfo *frameEndInfo,
 	}
 	if (!u_cursor_draw_should_draw(&req)) {
 		return;
+	}
+	sess->cursor_draw.draw_failed = false;
+	if (!sess->cursor_draw.will_draw) {
+		return; // the locate reported false (an earlier failure); now cleared
 	}
 	(void)oxr_session_cursor_draw_hand_request(sess, &req);
 }

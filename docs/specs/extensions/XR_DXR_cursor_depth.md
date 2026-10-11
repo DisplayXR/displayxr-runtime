@@ -137,7 +137,12 @@ t = 1/(1 − d). The sprite's centre C is:
 
 "Moves" means `cursorUV` changed by more than 1e-4 in u or v since the last moving placement.
 HYBRID also re-anchors (takes the SCREEN position) on the first hinted locate and whenever the
-time filter re-primes (a gap > 0.5 s, or time going backwards). The height
+time filter re-primes (a gap > 0.5 s, or time going backwards), whenever the **canvas plane
+moves** in the locate space (S₀ more than 0.1 % of e off the current canvas plane, or the canvas
+normal turns: a camera rig re-converging, a rig re-pose; a head move leaves the plane in place), and
+whenever s ≤ 0 (C would be on or behind the eye). The anchor-time line of sight belongs to the canvas
+it was taken against: under a still pointer EarthView's camera rig re-converged from e = 1 to 3.42,
+s = 1 − 0.375 × 3.42 went negative and C sat behind the eye. The height
 (`cursorHeight` × canvas height × t) and the orientation are the same in every mode. Hit testing
 is unchanged: the click stays at the pointer's canvas point; the anchor mode only changes where
 the sprite is drawn.
@@ -178,7 +183,11 @@ drawn and later locates report `willDraw = XR_FALSE` (the fallback above).
 Chained on `XrViewState::next`; filled on every locate that chains it. `willDraw` is `XR_TRUE`
 only when this locate chained a hint carrying a visible `XrCursorDepthDrawInfoDXR`, the placement
 is active (the §3 policy: content pops out under the cursor), and the session's compositor can
-draw it. **Hide the OS cursor over the canvas exactly while `willDraw` is `XR_TRUE`.** Whenever
+draw it, and the placement **maps to cursor pixels in this locate's views**: in front of every
+view's eye, a finite, non-degenerate sprite size, and the hotspot inside at least one view's tile
+(the zone, for a zone-scoped locate). `xrEndFrame` applies the same test to the submitted views; a
+frame that fails it draws nothing and the next locate reports `XR_FALSE`.
+**Hide the OS cursor over the canvas exactly while `willDraw` is `XR_TRUE`.** Whenever
 the runtime cannot draw (another backend, a space mismatch, a zones frame without the hinted zone), it reports
 `XR_FALSE`, so the fallback is always the flat OS cursor, never no cursor. The runtime never
 touches the OS cursor itself.
