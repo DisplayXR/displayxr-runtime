@@ -34094,8 +34094,8 @@ synthesize_focus_click_down(struct d3d11_multi_compositor *mc, int slot)
 	// meanwhile (a taskbar restore grows it out of the dock point under the
 	// cursor), the release lands on another presenter, or focus moves on.
 	// svc_ws_synth_press_settle pairs it on every drain.
-	HWND owed = (HWND)comp_ws_synth_press_note_down(&mc->ws_synth_press, click_target, 1, GetTickCount(),
-	                                                app_x, app_y);
+	HWND owed =
+	    (HWND)comp_ws_synth_press_note_down(&mc->ws_synth_press, click_target, 1, GetTickCount(), app_x, app_y);
 	mc->ws_synth_press_owner = target;
 	if (owed != nullptr && IsWindow(owed)) {
 		PostMessage(owed, WM_LBUTTONUP, 0, 0);

@@ -1365,9 +1365,11 @@ wnd_proc_inner(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 						w->last_pointer_down_target = fwd;
 					}
 					if (is_button_up) {
-						InterlockedExchange(&w->last_pointer_up_time_ms, (LONG)GetMessageTime());
+						InterlockedExchange(&w->last_pointer_up_time_ms,
+						                    (LONG)GetMessageTime());
 						InterlockedExchange(&w->last_pointer_up_button, (LONG)evt_button);
-						InterlockedExchangePointer((volatile PVOID *)&w->last_pointer_up_target, fwd);
+						InterlockedExchangePointer((volatile PVOID *)&w->last_pointer_up_target,
+						                           fwd);
 					}
 
 					// For mouse buttons: also inject via SendInput so apps
@@ -2147,8 +2149,8 @@ comp_d3d11_window_get_last_pointer_up(struct comp_d3d11_window *window, uint32_t
 	if (window == NULL) {
 		return NULL;
 	}
-	void *target = (void *)InterlockedCompareExchangePointer(
-	    (volatile PVOID *)&window->last_pointer_up_target, NULL, NULL);
+	void *target =
+	    (void *)InterlockedCompareExchangePointer((volatile PVOID *)&window->last_pointer_up_target, NULL, NULL);
 	if (out_button != NULL) {
 		*out_button = (uint32_t)InterlockedCompareExchange(&window->last_pointer_up_button, 0, 0);
 	}
