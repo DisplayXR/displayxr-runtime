@@ -69,6 +69,7 @@
 #include "logging.h"
 #include "projection_depth.h"
 #include "xr_session.h"
+#include "cursor_depth_zones.h" // XR_DXR_cursor_depth on display zones (runtime#1949)
 
 #include <algorithm>
 #include <atomic>
@@ -129,6 +130,15 @@ struct DisplayZone {
     std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> rtvs;
 };
 static DisplayZone g_zonesArr[kNumZones];
+
+// XR_DXR_cursor_depth (ADR-046, runtime#1949): the runtime draws the depth
+// cursor in the 3D zone under the pointer. The hint rides that zone's
+// zone-scoped locate (cursor_depth_zones.h, dxr::CursorDepth's Win32 adapter
+// hides the OS cursor over the client area exactly while willDraw).
+// DISPLAYXR_CURSOR_DEPTH=0 opts out; DISPLAYXR_CURSOR_DEPTH_DRAW=app keeps the
+// OS cursor (hint + placement only); DISPLAYXR_CURSOR_DEPTH_UV=u,v scripts a
+// WINDOW-normalised pointer.
+static dxr_zones_cursor::ZoneCursor g_zoneCursor;
 
 // #672 isolation: EXACT Unity multi-zone geometry — 936x1712 portrait window,
 // two tall bottom-band zones, zone B pinned to the right edge. Reproduces the
@@ -947,6 +957,17 @@ static XrEnvironmentBlendMode ZonesBlendMode() {
 
 static void RenderZonesFrame(XrSessionManager& xr, D3D12Renderer& renderer,
                              const XrFrameState& frameState) {
+    // XR_DXR_cursor_depth (#1949): pick the topmost 3D zone under the pointer.
+    {
+        XrRect2Di cursorRects[kNumZones];
+        float cursorRots[kNumZones];
+        for (uint32_t zi = 0; zi < kNumZones; zi++) {
+            cursorRects[zi] = g_zonesArr[zi].rect;
+            cursorRots[zi] = renderer.cubeRotation + g_zonesArr[zi].spinPhase;
+        }
+        g_zoneCursor.begin((int32_t)g_windowWidth, (int32_t)g_windowHeight, cursorRects, cursorRots, kNumZones);
+    }
+
     // Per-zone locate + submit data. The zone structs are chained at BOTH
     // points (locate and xrEndFrame) — same instances within the frame.
     XrDisplayZoneDXR zoneStructs[kNumZones];
@@ -995,7 +1016,13 @@ static void RenderZonesFrame(XrSessionManager& xr, D3D12Renderer& renderer,
         uint32_t viewCountOutput = 0;
         XrView zoneViews[8];
         for (uint32_t vi = 0; vi < 8; vi++) zoneViews[vi] = {XR_TYPE_VIEW};
+        // XR_DXR_cursor_depth (#1949): the hint rides only the locate of the
+        // zone under the pointer; its canvas is the zone rect.
+        g_zoneCursor.chain(zi, locateInfo, viewState);
         XrResult lr = xrLocateViews(xr.session, &locateInfo, &viewState, 8, &viewCountOutput, zoneViews);
+        if (XR_SUCCEEDED(lr)) {
+            g_zoneCursor.afterLocate(zi, zoneViews, viewCountOutput);
+        }
         if (XR_FAILED(lr) || viewCountOutput == 0) {
             static bool warned = false;
             if (!warned) { warned = true;
@@ -1104,6 +1131,8 @@ static void RenderZonesFrame(XrSessionManager& xr, D3D12Renderer& renderer,
         XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
         xrReleaseSwapchainImage(z.swapchain, &ri);
     }
+
+    g_zoneCursor.end(); // pointer over no 3D zone: the OS cursor is the cursor
 
     // Layer list: [projA (zone A chained), projB (zone B chained)].
     XrCompositionLayerProjection projLayers[kNumZones];
@@ -1270,6 +1299,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         ShutdownLogging();
         return 1;
     }
+    // XR_DXR_cursor_depth (#1949): the depth cursor rides the zone under the pointer.
+    g_zoneCursor.initWin32(g_hasCursorDepthExt ? g_cursorDepthSpecVersion : 0, hwnd, 0.06f);
 
     if (!CreateSpaces(xr)) {
         LOG_ERROR("Reference space creation failed");

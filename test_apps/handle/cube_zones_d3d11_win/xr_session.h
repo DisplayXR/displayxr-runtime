@@ -18,6 +18,7 @@
 #include "xr_session_common.h"
 #include <openxr/XR_DXR_local_3d_zone.h>
 #include <openxr/XR_DXR_display_zones.h>
+#include <openxr/XR_DXR_cursor_depth.h>
 #include <openxr/XR_DXR_view_rig.h>
 
 // INV-1.3 (#715): 3D panel top-left in virtual-desktop pixels (top-down,
@@ -51,6 +52,12 @@ extern ZoneMaskHarness g_zone;
 // gate (P2) — when absent the app logs an error once and runs the plain
 // single-projection fallback.
 extern bool g_hasDisplayZonesExt;
+
+// XR_DXR_cursor_depth (ADR-046) available + enabled, and the spec version the
+// runtime advertises (v5 = it draws the cursor; zones frames since runtime#1949).
+// Opt out with DISPLAYXR_CURSOR_DEPTH=0.
+extern bool g_hasCursorDepthExt;
+extern uint32_t g_cursorDepthSpecVersion;
 
 struct DisplayZonesHarness {
     PFN_xrGetDisplayZoneCapabilitiesDXR pfnGetCaps = nullptr;
