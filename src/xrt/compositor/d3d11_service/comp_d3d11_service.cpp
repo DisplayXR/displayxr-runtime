@@ -2026,6 +2026,9 @@ struct d3d11_service_system
 	bool ws_screens_optin;
 	//! The generation the controller last saw (enumerated or was told).
 	uint32_t ws_screens_gen_emitted;
+	//! The registry list @ref ws_screens was built from — what a secondary
+	//! presenter's screen binding is filled from (ADR-052 D1).
+	struct xrt_screen_list ws_screen_list;
 	/*! @} */
 
 	/*!
@@ -2744,6 +2747,130 @@ struct combine_ctx_lock
 	combine_ctx_lock &operator=(const combine_ctx_lock &) = delete;
 
 	struct d3d11_service_system *sys;
+};
+
+
+/*
+ *
+ * ADR-052: a SECONDARY presenter's compose pass.
+ *
+ * The workspace composes once per presenter with the same code (the compose
+ * pass below). For the primary nothing is overridden and every reader sees
+ * exactly what it always saw. For a secondary presenter the render thread
+ * installs a `svc_ws_pass` for the duration of its pass: window geometry stays
+ * in the PRIMARY's display space (that is where every slot's pose lives), and
+ * the pass says where that space lands in the presenter's pixels — the
+ * primary's centre in the presenter's pixels and the primary's pixel pitch.
+ * Through desktop pixels that is ADR-052 D2's mapping exactly (footprint-
+ * continuous at the seam). The override is thread-local, so no other thread
+ * ever reads a secondary presenter's geometry.
+ *
+ */
+
+struct svc_ws_presenter; // defined with the presenter machinery (after the compose pass)
+
+struct svc_ws_pass
+{
+	uint32_t px_w; //!< The presenter's panel / atlas size.
+	uint32_t px_h;
+	float w_m; //!< Its physical size.
+	float h_m;
+	float cx_px; //!< The primary display's centre, in the presenter's pixels.
+	float cy_px;
+	float ppm_x; //!< Primary-space metres -> pixels (1 / the primary's pixel pitch).
+	float ppm_y;
+	int32_t origin_dx; //!< Presenter desktop origin minus the primary's (workspace px).
+	int32_t origin_dy;
+	uint32_t primary_px_w; //!< The primary's panel size (view-dims scaling).
+	uint32_t primary_px_h;
+};
+
+//! Installed by the render thread around a secondary presenter's pass; NULL otherwise.
+static thread_local const struct svc_ws_pass *t_ws_pass = nullptr;
+
+//! Display geometry as the compose pass sees it: the primary's, or the presenter's in a pass.
+static inline uint32_t
+svc_geom_px_w(const struct d3d11_service_system *sys)
+{
+	return t_ws_pass != nullptr ? t_ws_pass->px_w : sys->base.info.display_pixel_width;
+}
+
+static inline uint32_t
+svc_geom_px_h(const struct d3d11_service_system *sys)
+{
+	return t_ws_pass != nullptr ? t_ws_pass->px_h : sys->base.info.display_pixel_height;
+}
+
+static inline float
+svc_geom_w_m(const struct d3d11_service_system *sys)
+{
+	return t_ws_pass != nullptr ? t_ws_pass->w_m : sys->base.info.display_width_m;
+}
+
+static inline float
+svc_geom_h_m(const struct d3d11_service_system *sys)
+{
+	return t_ws_pass != nullptr ? t_ws_pass->h_m : sys->base.info.display_height_m;
+}
+
+/*!
+ * Primary-space metres -> the pass's pixels: in a pass, the frame's centre
+ * becomes the primary's centre in the presenter's pixels and the scale the
+ * primary's pitch. No-op outside a pass (the caller's values stand).
+ */
+static inline void
+svc_ws_pass_frame(float *half_px_x, float *half_px_y, float *px_per_m_x, float *px_per_m_y)
+{
+	if (t_ws_pass == nullptr) {
+		return;
+	}
+	*half_px_x = t_ws_pass->cx_px;
+	*half_px_y = t_ws_pass->cy_px;
+	*px_per_m_x = t_ws_pass->ppm_x;
+	*px_per_m_y = t_ws_pass->ppm_y;
+}
+
+//! The cursor's workspace-pixel offset of the pass (0 outside one).
+static inline int32_t
+svc_ws_pass_origin_dx(void)
+{
+	return t_ws_pass != nullptr ? t_ws_pass->origin_dx : 0;
+}
+
+static inline int32_t
+svc_ws_pass_origin_dy(void)
+{
+	return t_ws_pass != nullptr ? t_ws_pass->origin_dy : 0;
+}
+
+/*!
+ * Where one compose pass draws: the service window's combined atlas for the
+ * primary, a presenter's own atlas for a secondary.
+ */
+struct svc_compose_target
+{
+	ID3D11RenderTargetView *rtv;      //!< `R8G8B8A8_UNORM`, byte-exact (clear + Model A).
+	ID3D11RenderTargetView *rtv_srgb; //!< `_SRGB` encode-on-write view (Model B), may be NULL.
+	ID3D11DepthStencilView *dsv;      //!< Depth sibling (window occlusion).
+	bool encodes_on_write;            //!< This pass's combine-target choice (#1764).
+};
+
+//! The pass's combine RTV — `multi_combine_rtv` for a target.
+static inline ID3D11RenderTargetView *
+svc_compose_rtv(const struct svc_compose_target *t)
+{
+	if (t->encodes_on_write && t->rtv_srgb != nullptr) {
+		return t->rtv_srgb;
+	}
+	return t->rtv;
+}
+
+//! What the compose pass decided that the weave needs.
+struct svc_compose_out
+{
+	bool compose_linear;
+	uint32_t dp_view_w;
+	uint32_t dp_view_h;
 };
 
 
@@ -4077,6 +4204,34 @@ struct d3d11_multi_compositor
 	//! Per-client slots.
 	struct d3d11_multi_client_slot clients[D3D11_MULTI_MAX_CLIENTS];
 	uint32_t client_count;
+
+	/*!
+	 * @name ADR-052 D1: the SECONDARY presenters (one per claimed 3D screen
+	 * other than the primary, whose presenter is the service window above).
+	 *
+	 * Created, rendered and destroyed by the render thread (under
+	 * render_mutex). `ws_presenters_lock` (an SRWLOCK: zero is its initial
+	 * state, so the memset this struct gets keeps it valid) guards the array
+	 * membership for the IPC-thread readers: the input drain, the input-forward
+	 * mirror, the reserved-key mirror and the status. A leaf: nothing is taken
+	 * while it is held.
+	 * @{
+	 */
+	SRWLOCK ws_presenters_lock;
+	struct svc_ws_presenter *ws_presenters[COMP_WS_MAX_SCREENS];
+	uint32_t ws_presenter_count;
+	//! The screen-set generation the presenters were built for.
+	uint32_t ws_presenters_gen;
+	//! False forces a rebuild on the next frame (first frame, a closed presenter window).
+	bool ws_presenters_synced;
+	//! The primary screen as of the last rebuild (the presenters' mapping origin).
+	struct comp_ws_screen ws_primary;
+	//! The controller's reserved-key table, mirrored onto every presenter window.
+	bool ws_reserved_set;
+	uint32_t ws_reserved_count;
+	uint32_t ws_reserved_vks[IPC_WORKSPACE_MAX_RESERVED_KEYS];
+	uint32_t ws_reserved_mods[IPC_WORKSPACE_MAX_RESERVED_KEYS];
+	/*! @} */
 
 	//! Focused client index (-1 = none).
 	int32_t focused_slot;
@@ -5558,6 +5713,11 @@ resolve_active_view_dims(const struct d3d11_service_system *sys,
 		uint32_t tr = sys->tile_rows > 0 ? sys->tile_rows : 1;
 		vw = fallback_w / tc;
 		vh = fallback_h / tr;
+	} else if (t_ws_pass != nullptr && t_ws_pass->primary_px_w > 0 && t_ws_pass->primary_px_h > 0) {
+		// ADR-052: a secondary presenter's pass — the mode's view tile, scaled
+		// from the primary's panel to the presenter's (one mode per service).
+		vw = (uint32_t)(((uint64_t)vw * t_ws_pass->px_w) / t_ws_pass->primary_px_w);
+		vh = (uint32_t)(((uint64_t)vh * t_ws_pass->px_h) / t_ws_pass->primary_px_h);
 	}
 	*out_vw = vw;
 	*out_vh = vh;
@@ -8600,6 +8760,14 @@ compositor_create_semaphore(struct xrt_compositor *xc,
 
 static void
 multi_compositor_update_input_forward(struct d3d11_multi_compositor *mc); // forward decl (#929)
+// ADR-052: the secondary presenters' share of input (defined with the presenters).
+static void
+svc_ws_presenters_mirror_input_forward(
+    struct d3d11_multi_compositor *mc, void *target, int32_t rx, int32_t ry, int32_t rw, int32_t rh, bool is_capture);
+static uint32_t
+svc_ws_presenters_consume_events(struct d3d11_multi_compositor *mc,
+                                 struct workspace_public_event_raw *out,
+                                 uint32_t capacity);
 
 static xrt_result_t
 compositor_begin_session(struct xrt_compositor *xc, const struct xrt_begin_session_info *info)
@@ -9517,6 +9685,8 @@ multi_compositor_update_input_forward(struct d3d11_multi_compositor *mc)
 	(void)is_capture; // (kept for the capture-path branch below)
 
 	comp_d3d11_window_set_input_forward(mc->window, (void *)target, rx, ry, rw, rh, is_capture);
+	// ADR-052: the same rect on every secondary presenter window, in its pixels.
+	svc_ws_presenters_mirror_input_forward(mc, (void *)target, rx, ry, rw, rh, is_capture);
 
 	// Track focused capture client (preview only — no foreground/input injection).
 	// SetForegroundWindow disabled: it steals OS focus and constrains the mouse.
@@ -15212,6 +15382,14 @@ pipeline_service_window_closed(struct d3d11_service_system *sys, struct d3d11_mu
 	(void)multi_compositor_ensure_output(sys);
 }
 
+// ADR-052: the compose / present halves of multi_compositor_render, defined after it.
+static void
+svc_ws_presenters_destroy_all(struct d3d11_service_system *sys, struct d3d11_multi_compositor *mc, const char *why);
+static void
+multi_compositor_render_frame(struct d3d11_service_system *sys,
+                              struct d3d11_multi_compositor *mc,
+                              const struct xrt_eye_positions &eye_pos);
+
 /*!
  * Render all client atlases into the combined atlas using Level 2 Kooima,
  * then run DP process_atlas and present.
@@ -15230,6 +15408,11 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			return;
 		}
 		mc = sys->multi_comp;
+	}
+
+	// ADR-052 D1: the secondary presenters live only while a workspace composes.
+	if (mc->ws_presenter_count > 0 && (!sys->workspace_mode || mc->suspended || mc->window_dismissed)) {
+		svc_ws_presenters_destroy_all(sys, mc, "workspace not composing");
 	}
 
 	// #966: the window thread asked for a flat panel on WM_CLOSE (it may not
@@ -15928,6 +16111,23 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	// Must run before rendering so input arrives promptly (~16ms latency).
 	multi_compositor_dispatch_capture_input(mc);
 
+	// ADR-052: compose once per presenter, then weave and present the primary.
+	multi_compositor_render_frame(sys, mc, eye_pos);
+}
+
+/*!
+ * One compose pass (ADR-052): every placed client, its chrome, the overlays
+ * and the cursor into @p T. Runs once for the primary presenter (no
+ * `svc_ws_pass` installed, behaviour unchanged) and once per secondary
+ * presenter (with its pass installed). Render thread, under render_mutex.
+ */
+static void
+multi_compositor_compose_pass(struct d3d11_service_system *sys,
+                              struct d3d11_multi_compositor *mc,
+                              const struct xrt_eye_positions &eye_pos,
+                              struct svc_compose_target *T,
+                              struct svc_compose_out *out)
+{
 	// Clear combined atlas to dark gray background each frame.
 	{
 		// ADR-021 Model B: the backdrop clear bypasses the blit shader, so when
@@ -15959,22 +16159,21 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		                          placed_count > 1 && placed_srgb == placed_count;
 		// #1764: the draws of this tick go through the `_SRGB` RTV when Model B
 		// can encode on write; re-decided below from `compose_linear` itself.
-		mc->combine_encodes_on_write = clear_linear && multi_combine_can_encode_on_write(mc, cap0);
+		T->encodes_on_write = clear_linear && T->rtv_srgb != nullptr && cap0 == XRT_DP_COLOR_EITHER;
 		// The clear ALWAYS goes through the byte-exact UNORM RTV, so the value
 		// is the byte the atlas must hold: encoded #1a1a1a whenever the atlas
 		// holds encoded bytes (Model A, and Model B encoding on write), and the
 		// linear equivalent only for a LINEAR-only DP, whose atlas still holds
 		// linear. (Not through the `_SRGB` view: whether a clear on an sRGB RTV
 		// encodes its colour is exactly the kind of rule this should not lean on.)
-		const bool atlas_holds_linear = clear_linear && !mc->combine_encodes_on_write;
+		const bool atlas_holds_linear = clear_linear && !T->encodes_on_write;
 		const float bg = atlas_holds_linear ? 0.01034f : 0.102f; // #1a1a1a (linear vs encoded)
 		float bg_color[4] = {bg, bg, bg, 1.0f};
-		sys->context->ClearRenderTargetView(mc->combined_atlas_rtv.get(), bg_color);
+		sys->context->ClearRenderTargetView(T->rtv, bg_color);
 		// Phase 2.K: clear depth target to far (1.0) so the per-slot LESS
 		// test resolves occlusion from scratch each frame.
-		if (mc->combined_atlas_dsv) {
-			sys->context->ClearDepthStencilView(mc->combined_atlas_dsv.get(),
-			                                    D3D11_CLEAR_DEPTH, 1.0f, 0);
+		if (T->dsv != nullptr) {
+			sys->context->ClearDepthStencilView(T->dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
 		}
 	}
 
@@ -15992,7 +16191,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			break;
 		}
 	}
-	if (!any_placed && mc->font_atlas_srv) {
+	if (!any_placed && mc->font_atlas_srv && t_ws_pass == nullptr) { // ADR-052: the logo is the primary's
 		// Lazy-load the embedded logo PNG on first entry.
 		if (!mc->logo_load_tried) {
 			mc->logo_load_tried = true;
@@ -16007,8 +16206,8 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			}
 		}
 
-		uint32_t ca_w = sys->base.info.display_pixel_width;
-		uint32_t ca_h = sys->base.info.display_pixel_height;
+		uint32_t ca_w = svc_geom_px_w(sys);
+		uint32_t ca_h = svc_geom_px_h(sys);
 		if (ca_w == 0) ca_w = 3840;
 		if (ca_h == 0) ca_h = 2160;
 		uint32_t num_views = sys->tile_columns * sys->tile_rows;
@@ -16036,7 +16235,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
 		sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
 		sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
-		ID3D11RenderTargetView *rtvs[] = {multi_combine_rtv(mc)};
+		ID3D11RenderTargetView *rtvs[] = {svc_compose_rtv(T)};
 		sys->context->OMSetRenderTargets(1, rtvs, nullptr);
 		sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
 		sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
@@ -16287,25 +16486,26 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	// `_SRGB` RTV: b1 still decodes each source, the ROP blends in linear, and
 	// the hardware re-encodes on write — so the 8-bit atlas holds ENCODED bytes
 	// and is handed off ENCODED (see pipeline_dp_set_encoding below).
-	mc->combine_encodes_on_write = compose_linear && multi_combine_can_encode_on_write(mc, dp_color_cap);
+	T->encodes_on_write = compose_linear && T->rtv_srgb != nullptr && dp_color_cap == XRT_DP_COLOR_EITHER;
 
 	// On-change diagnostic: the compose-model decision + every gate input, so a
-	// "stuck on A" is attributable to dp_cap / layer-count / honest-sRGB.
-	{
+	// "stuck on A" is attributable to dp_cap / layer-count / honest-sRGB. The
+	// primary's pass only (ADR-052): a presenter whose views differ would
+	// otherwise flip the key every frame.
+	if (t_ws_pass == nullptr) {
 		static int last_key = -1;
-		const int key = (compose_linear ? 1 : 0) | ((int)dp_color_cap << 1) |
-		                (render_count << 4) | (honest_srgb_count << 8) |
-		                ((mc->combine_encodes_on_write ? 1 : 0) << 16);
+		const int key = (compose_linear ? 1 : 0) | ((int)dp_color_cap << 1) | (render_count << 4) |
+		                (honest_srgb_count << 8) | ((T->encodes_on_write ? 1 : 0) << 16);
 		if (key != last_key) {
 			last_key = key;
 			U_LOG_W("Color (ADR-021): model=%s  dp_cap=%d(%s) layers=%d honest_srgb=%d atlas=%s handoff=%s",
 			        compose_linear ? "B/linear" : "A/passthrough", (int)dp_color_cap,
-			        dp_color_cap == XRT_DP_COLOR_EITHER    ? "EITHER"
+			        dp_color_cap == XRT_DP_COLOR_EITHER   ? "EITHER"
 			        : dp_color_cap == XRT_DP_COLOR_LINEAR ? "LINEAR"
 			                                              : "ENCODED",
 			        render_count, honest_srgb_count,
-			        mc->combine_encodes_on_write ? "srgb-rtv(encode-on-write)" : "unorm-rtv",
-			        (compose_linear && !mc->combine_encodes_on_write) ? "LINEAR" : "ENCODED");
+			        T->encodes_on_write ? "srgb-rtv(encode-on-write)" : "unorm-rtv",
+			        (compose_linear && !T->encodes_on_write) ? "LINEAR" : "ENCODED");
 		}
 	}
 
@@ -16435,8 +16635,8 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		}
 
 		// Combined atlas dimensions.
-		uint32_t ca_w = sys->base.info.display_pixel_width;
-		uint32_t ca_h = sys->base.info.display_pixel_height;
+		uint32_t ca_w = svc_geom_px_w(sys);
+		uint32_t ca_h = svc_geom_px_h(sys);
 		if (ca_w == 0) ca_w = 3840;
 		if (ca_h == 0) ca_h = 2160;
 		// Tile layout dims: non-legacy sessions use the true per-view dims
@@ -16770,8 +16970,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				    0, 1, sys->blit_constant_buffer.addressof());
 				sys->context->PSSetSamplers(
 				    0, 1, sys->sampler_linear.addressof());
-				ID3D11RenderTargetView *spin_rtvs[] = {
-				    multi_combine_rtv(mc)};
+				ID3D11RenderTargetView *spin_rtvs[] = {svc_compose_rtv(T)};
 				sys->context->OMSetRenderTargets(
 				    1, spin_rtvs, nullptr);
 				D3D11_VIEWPORT spin_vp = {};
@@ -17050,8 +17249,8 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				// Phase 2.K: bind DSV alongside the atlas RTV so the depth
 				// test resolves per-pixel occlusion between this window and
 				// other windows that have already rendered this frame.
-				ID3D11RenderTargetView *ca_rtvs[] = {multi_combine_rtv(mc)};
-				sys->context->OMSetRenderTargets(1, ca_rtvs, mc->combined_atlas_dsv.get());
+				ID3D11RenderTargetView *ca_rtvs[] = {svc_compose_rtv(T)};
+				sys->context->OMSetRenderTargets(1, ca_rtvs, T->dsv);
 				D3D11_VIEWPORT vp = {};
 				vp.Width = static_cast<float>(ca_w);
 				vp.Height = static_cast<float>(ca_h);
@@ -17240,8 +17439,8 @@ multi_compositor_render(struct d3d11_service_system *sys)
 					sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
 					sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
 					sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
-					ID3D11RenderTargetView *cc_rtvs[] = {multi_combine_rtv(mc)};
-					sys->context->OMSetRenderTargets(1, cc_rtvs, mc->combined_atlas_dsv.get());
+					ID3D11RenderTargetView *cc_rtvs[] = {svc_compose_rtv(T)};
+					sys->context->OMSetRenderTargets(1, cc_rtvs, T->dsv);
 					sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
 					sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 					sys->context->IASetInputLayout(nullptr);
@@ -17307,8 +17506,8 @@ multi_compositor_render(struct d3d11_service_system *sys)
 
 	// Reset scissor to full atlas for non-tiled draws (DP processing)
 	{
-		uint32_t full_w = sys->base.info.display_pixel_width;
-		uint32_t full_h = sys->base.info.display_pixel_height;
+		uint32_t full_w = svc_geom_px_w(sys);
+		uint32_t full_h = svc_geom_px_h(sys);
 		if (full_w == 0) full_w = 3840;
 		if (full_h == 0) full_h = 2160;
 		D3D11_RECT full_scissor = {0, 0, (LONG)full_w, (LONG)full_h};
@@ -17340,12 +17539,15 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	// keyed by overlayId; std::map iterates ascending so lower ids composite
 	// behind higher ids (the shell picks ids to control z-order).
 	for (auto &ov_kv : sys->overlays) {
+		if (t_ws_pass != nullptr) {
+			break; // ADR-052 D5: overlays stay on the primary presenter
+		}
 		overlay_slot &ov = ov_kv.second; // mutable: S5 copy_cache lives here
 		if (ov.xsc == nullptr) {
 			continue;
 		}
-		uint32_t ca_w = sys->base.info.display_pixel_width;
-		uint32_t ca_h = sys->base.info.display_pixel_height;
+		uint32_t ca_w = svc_geom_px_w(sys);
+		uint32_t ca_h = svc_geom_px_h(sys);
 		if (ca_w == 0) ca_w = 3840;
 		if (ca_h == 0) ca_h = 2160;
 
@@ -17380,9 +17582,9 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			}
 		}
 		if (overlay_srv != nullptr && sprite_w_px > 0 && sprite_h_px > 0) {
-			float disp_w_m = sys->base.info.display_width_m;
+			float disp_w_m = svc_geom_w_m(sys);
 			if (disp_w_m <= 0.0f) disp_w_m = 0.700f;
-			float disp_h_m = sys->base.info.display_height_m;
+			float disp_h_m = svc_geom_h_m(sys);
 			if (disp_h_m <= 0.0f) disp_h_m = 0.392f;
 
 			// Per-tile atlas region from the active rendering mode (matches the
@@ -17417,7 +17619,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			// acquire above is deliberately outside it. See combine_ctx_lock.
 			combine_ctx_lock ctx_lock(sys);
 			sys->context->PSSetConstantBuffers(1, 1, sys->color_linearize_cb.addressof());
-			ID3D11RenderTargetView *ortvs[] = {multi_combine_rtv(mc)};
+			ID3D11RenderTargetView *ortvs[] = {svc_compose_rtv(T)};
 			sys->context->OMSetRenderTargets(1, ortvs, nullptr);
 			sys->context->OMSetBlendState(sys->blend_premul.get(), nullptr, 0xFFFFFFFF);
 			sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
@@ -17509,8 +17711,8 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	// controller owns the sprite content (shape, color, animation,
 	// branding) via xrCreateWorkspaceCursorSwapchainDXR + xrSetWorkspaceCursorDXR.
 	if (sys->cursor_visible && sys->cursor_xsc != nullptr) {
-		uint32_t ca_w = sys->base.info.display_pixel_width;
-		uint32_t ca_h = sys->base.info.display_pixel_height;
+		uint32_t ca_w = svc_geom_px_w(sys);
+		uint32_t ca_h = svc_geom_px_h(sys);
 		if (ca_w == 0) ca_w = 3840;
 		if (ca_h == 0) ca_h = 2160;
 
@@ -17551,13 +17753,20 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			// 64 mm IPD at 60 cm if unavailable.
 			struct xrt_vec3 eye_l = {-0.032f, 0.0f, 0.6f};
 			struct xrt_vec3 eye_r = {+0.032f, 0.0f, 0.6f};
-			(void)comp_d3d11_service_get_predicted_eye_positions(&sys->base, &eye_l, &eye_r);
+			if (t_ws_pass != nullptr && eye_pos.count >= 2) {
+				// ADR-052: a presenter's pass — its own screen's eyes (mapped
+				// into the primary's space, like the windows).
+				eye_l = {eye_pos.eyes[0].x, eye_pos.eyes[0].y, eye_pos.eyes[0].z};
+				eye_r = {eye_pos.eyes[1].x, eye_pos.eyes[1].y, eye_pos.eyes[1].z};
+			} else {
+				(void)comp_d3d11_service_get_predicted_eye_positions(&sys->base, &eye_l, &eye_r);
+			}
 
-			float disp_w_m = sys->base.info.display_width_m;
+			float disp_w_m = svc_geom_w_m(sys);
 			if (disp_w_m <= 0.0f) disp_w_m = 0.700f;
-			uint32_t panel_w = sys->base.info.display_pixel_width;
+			uint32_t panel_w = svc_geom_px_w(sys);
 			if (panel_w == 0) panel_w = ca_w;
-			uint32_t panel_h = sys->base.info.display_pixel_height;
+			uint32_t panel_h = svc_geom_px_h(sys);
 			if (panel_h == 0) panel_h = ca_h;
 
 			// Per-tile atlas region size from the active rendering mode.
@@ -17599,8 +17808,10 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			// sprite renders at native dimensions.
 			const float scale_x = (float)tile_w / (float)panel_w;
 			const float scale_y = (float)tile_h / (float)panel_h;
-			float base_tile_x = (float)mc->cursor_panel_x * scale_x;
-			float base_tile_y = (float)mc->cursor_panel_y * scale_y;
+			// ADR-052: the cursor is in workspace pixels; a presenter's pass
+			// draws it relative to its own top-left (off its panel = clipped).
+			float base_tile_x = (float)(mc->cursor_panel_x - svc_ws_pass_origin_dx()) * scale_x;
+			float base_tile_y = (float)(mc->cursor_panel_y - svc_ws_pass_origin_dy()) * scale_y;
 
 			// Cursor sprite size + hot spot. spec_version 13: physical
 			// size comes from the controller (sys->cursor_size_m), hot
@@ -17637,7 +17848,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			// acquire above is deliberately outside it. See combine_ctx_lock.
 			combine_ctx_lock ctx_lock(sys);
 			sys->context->PSSetConstantBuffers(1, 1, sys->color_linearize_cb.addressof());
-			ID3D11RenderTargetView *crtvs[] = {multi_combine_rtv(mc)};
+			ID3D11RenderTargetView *crtvs[] = {svc_compose_rtv(T)};
 			sys->context->OMSetRenderTargets(1, crtvs, nullptr);
 			sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
 			sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
@@ -17736,6 +17947,711 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			cursor_mutex->ReleaseSync(0);
 		}
 	}
+
+	out->compose_linear = compose_linear;
+	out->dp_view_w = dp_view_w;
+	out->dp_view_h = dp_view_h;
+}
+
+/*
+ *
+ * ADR-052 D1: the SECONDARY presenters — one per claimed 3D screen other than
+ * the primary (whose presenter is the service window, unchanged).
+ *
+ * Each is a full-screen window on its screen with its own swap chain, its own
+ * combined atlas (+ depth) and its own display processor, made from that
+ * screen's registry entry through `create_dp_d3d11_for_screen` with the
+ * presenter's window. All of it lives on the RENDER device: the compose pass
+ * samples the clients' atlases there, and a presenter's DP lives where its
+ * target is (ADR-047 Amendment 1's rule — the presenter's swap chain is
+ * created on the render device, so that is the device that presents; the
+ * #918 weave-on-scanout split stays the primary's).
+ *
+ * Render thread only (under render_mutex), except the array membership, which
+ * `ws_presenters_lock` publishes to the IPC-thread readers below.
+ *
+ */
+
+struct svc_ws_presenter
+{
+	uint64_t screen_id;
+	//! The set's entry when the presenter was made (geometry + plug-in).
+	struct comp_ws_screen screen;
+	//! Its desktop origin minus the primary's: workspace px of its top-left.
+	int32_t origin_dx;
+	int32_t origin_dy;
+	//! Client rect = back buffer = atlas.
+	uint32_t px_w;
+	uint32_t px_h;
+
+	struct comp_d3d11_window *window;
+	HWND hwnd;
+	wil::com_ptr<IDXGISwapChain1> swap_chain;
+	//! Frame-latency waitable (max latency 1): a free back buffer, claimed without blocking.
+	HANDLE waitable;
+	wil::com_ptr<ID3D11RenderTargetView> back_buffer_rtv;
+
+	//! The presenter's combined atlas, same recipe as the service window's (#1764 views).
+	wil::com_ptr<ID3D11Texture2D> atlas;
+	wil::com_ptr<ID3D11ShaderResourceView> atlas_srv;
+	wil::com_ptr<ID3D11RenderTargetView> atlas_rtv;
+	wil::com_ptr<ID3D11RenderTargetView> atlas_rtv_srgb;
+	wil::com_ptr<ID3D11Texture2D> atlas_depth;
+	wil::com_ptr<ID3D11DepthStencilView> atlas_dsv;
+	//! ADR-030 crop (content-sized), lazily made.
+	wil::com_ptr<ID3D11Texture2D> crop;
+	wil::com_ptr<ID3D11ShaderResourceView> crop_srv;
+	uint32_t crop_w;
+	uint32_t crop_h;
+
+	//! The screen's DP (NULL: its plug-in could not make one — the composition
+	//! is presented unwoven, the primary's no-DP fallback).
+	struct xrt_display_processor_d3d11 *dp;
+	int encoding_latched; //!< -1 = never set
+	int mode_sent;        //!< -1 = never sent
+};
+
+//! The registry entry of monitor @p id, or NULL.
+static const struct xrt_dp_registry_entry *
+svc_ws_registry_entry(const struct d3d11_service_system *sys, uint64_t id)
+{
+	const struct xrt_dp_factory_registry *reg = &sys->base.info.dp_registry;
+	for (uint32_t e = 0; e < reg->entry_count && e < XRT_DP_REGISTRY_MAX_ENTRIES; e++) {
+		if (reg->entries[e].monitor_id == id) {
+			return &reg->entries[e];
+		}
+	}
+	return nullptr;
+}
+
+static void
+svc_ws_presenter_destroy(struct svc_ws_presenter *p)
+{
+	if (p == nullptr) {
+		return;
+	}
+	// The DP first: it is bound to the window.
+	if (p->dp != nullptr) {
+		xrt_display_processor_d3d11_destroy(&p->dp);
+	}
+	p->crop_srv.reset();
+	p->crop.reset();
+	p->atlas_dsv.reset();
+	p->atlas_depth.reset();
+	p->atlas_rtv_srgb.reset();
+	p->atlas_rtv.reset();
+	p->atlas_srv.reset();
+	p->atlas.reset();
+	p->back_buffer_rtv.reset();
+	if (p->waitable != nullptr) {
+		CloseHandle(p->waitable);
+		p->waitable = nullptr;
+	}
+	p->swap_chain.reset();
+	if (p->window != nullptr) {
+		comp_d3d11_window_destroy(&p->window);
+	}
+	delete p;
+}
+
+static void
+svc_ws_presenters_destroy_all(struct d3d11_service_system *sys, struct d3d11_multi_compositor *mc, const char *why)
+{
+	(void)sys;
+	if (mc == nullptr) {
+		return;
+	}
+	struct svc_ws_presenter *gone[COMP_WS_MAX_SCREENS] = {};
+	uint32_t n = 0;
+	AcquireSRWLockExclusive(&mc->ws_presenters_lock);
+	for (uint32_t i = 0; i < mc->ws_presenter_count && i < COMP_WS_MAX_SCREENS; i++) {
+		gone[n++] = mc->ws_presenters[i];
+		mc->ws_presenters[i] = nullptr;
+	}
+	mc->ws_presenter_count = 0;
+	ReleaseSRWLockExclusive(&mc->ws_presenters_lock);
+	mc->ws_presenters_synced = false;
+	for (uint32_t i = 0; i < n; i++) {
+		svc_ws_presenter_destroy(gone[i]);
+	}
+	if (n > 0) {
+		U_LOG_W("workspace presenters: %u secondary presenter(s) torn down (%s)", n, why);
+	}
+}
+
+//! Make the presenter for @p scr (a non-primary presenter screen). NULL on failure (logged).
+static struct svc_ws_presenter *
+svc_ws_presenter_create(struct d3d11_service_system *sys,
+                        struct d3d11_multi_compositor *mc,
+                        const struct comp_ws_screen *scr,
+                        const struct comp_ws_screen *prim,
+                        const struct xrt_screen *xs)
+{
+	struct svc_ws_presenter *p = new svc_ws_presenter();
+	p->screen_id = scr->id;
+	p->screen = *scr;
+	p->origin_dx = scr->desktop.x - prim->desktop.x;
+	p->origin_dy = scr->desktop.y - prim->desktop.y;
+	p->encoding_latched = -1;
+	p->mode_sent = -1;
+
+	// The window: full screen on its monitor (set_fullscreen fills the monitor
+	// the window was placed on), visible.
+	xrt_result_t wret = comp_d3d11_window_create_ex(scr->desktop.w, scr->desktop.h, scr->desktop.x, scr->desktop.y,
+	                                                /*start_hidden*/ false, &p->window);
+	if (wret != XRT_SUCCESS || p->window == nullptr) {
+		U_LOG_E("workspace presenter: screen 0x%016llx — window creation failed (%d)",
+		        (unsigned long long)scr->id, (int)wret);
+		svc_ws_presenter_destroy(p);
+		return nullptr;
+	}
+	p->hwnd = (HWND)comp_d3d11_window_get_hwnd(p->window);
+	comp_d3d11_window_set_workspace_mode_active(p->window, true);
+	if (sys->workspace_wakeup_event != nullptr) {
+		comp_d3d11_window_set_workspace_wakeup_event(p->window, sys->workspace_wakeup_event);
+	}
+	if (mc->ws_reserved_set) {
+		comp_d3d11_window_set_reserved_keys(p->window, mc->ws_reserved_vks, mc->ws_reserved_mods,
+		                                    mc->ws_reserved_count);
+	}
+
+	uint32_t w = scr->desktop.w;
+	uint32_t h = scr->desktop.h;
+	RECT cr;
+	if (GetClientRect(p->hwnd, &cr) && cr.right > cr.left && cr.bottom > cr.top) {
+		w = (uint32_t)(cr.right - cr.left);
+		h = (uint32_t)(cr.bottom - cr.top);
+	}
+	p->px_w = w;
+	p->px_h = h;
+
+	// The swap chain, on the render device, with a frame-latency waitable so
+	// the render thread never blocks on this presenter (#924's rule).
+	DXGI_SWAP_CHAIN_DESC1 sc_desc = {};
+	sc_desc.Width = w;
+	sc_desc.Height = h;
+	sc_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	sc_desc.SampleDesc.Count = 1;
+	sc_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+	sc_desc.BufferCount = 2;
+	sc_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+	sc_desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+	sc_desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+	HRESULT hr = sys->dxgi_factory->CreateSwapChainForHwnd(sys->device.get(), p->hwnd, &sc_desc, nullptr, nullptr,
+	                                                       p->swap_chain.put());
+	if (FAILED(hr)) {
+		(void)service_note_device_lost(sys, hr, "workspace_presenter/swapchain");
+		U_LOG_E("workspace presenter: screen 0x%016llx — swap chain failed (hr=0x%08lX)",
+		        (unsigned long long)scr->id, hr);
+		svc_ws_presenter_destroy(p);
+		return nullptr;
+	}
+	{
+		wil::com_ptr<IDXGISwapChain2> sc2;
+		if (SUCCEEDED(p->swap_chain->QueryInterface(IID_PPV_ARGS(sc2.put())))) {
+			sc2->SetMaximumFrameLatency(1);
+			p->waitable = sc2->GetFrameLatencyWaitableObject();
+		}
+		wil::com_ptr<ID3D11Texture2D> bb;
+		if (SUCCEEDED(p->swap_chain->GetBuffer(0, IID_PPV_ARGS(bb.put())))) {
+			sys->device->CreateRenderTargetView(bb.get(), nullptr, p->back_buffer_rtv.put());
+		}
+	}
+
+	// The atlas: the service window's recipe (#1764) at this screen's size.
+	{
+		D3D11_TEXTURE2D_DESC ad = {};
+		ad.Width = w;
+		ad.Height = h;
+		ad.MipLevels = 1;
+		ad.ArraySize = 1;
+		ad.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+		ad.SampleDesc.Count = 1;
+		ad.Usage = D3D11_USAGE_DEFAULT;
+		ad.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+		hr = sys->device->CreateTexture2D(&ad, nullptr, p->atlas.put());
+		if (SUCCEEDED(hr)) {
+			D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+			sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+			sd.Texture2D.MipLevels = 1;
+			D3D11_RENDER_TARGET_VIEW_DESC rd = {};
+			rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+			sys->device->CreateShaderResourceView(p->atlas.get(), &sd, p->atlas_srv.put());
+			sys->device->CreateRenderTargetView(p->atlas.get(), &rd, p->atlas_rtv.put());
+			D3D11_RENDER_TARGET_VIEW_DESC rds = rd;
+			rds.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+			if (FAILED(
+			        sys->device->CreateRenderTargetView(p->atlas.get(), &rds, p->atlas_rtv_srgb.put()))) {
+				p->atlas_rtv_srgb.reset();
+			}
+			D3D11_TEXTURE2D_DESC dd = {};
+			dd.Width = w;
+			dd.Height = h;
+			dd.MipLevels = 1;
+			dd.ArraySize = 1;
+			dd.Format = DXGI_FORMAT_D32_FLOAT;
+			dd.SampleDesc.Count = 1;
+			dd.Usage = D3D11_USAGE_DEFAULT;
+			dd.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+			if (SUCCEEDED(sys->device->CreateTexture2D(&dd, nullptr, p->atlas_depth.put()))) {
+				sys->device->CreateDepthStencilView(p->atlas_depth.get(), nullptr, p->atlas_dsv.put());
+			}
+		}
+	}
+	if (!p->back_buffer_rtv || !p->atlas_srv || !p->atlas_rtv) {
+		(void)service_note_device_lost(sys, hr, "workspace_presenter/resources");
+		U_LOG_E("workspace presenter: screen 0x%016llx — atlas / back buffer creation failed",
+		        (unsigned long long)scr->id);
+		svc_ws_presenter_destroy(p);
+		return nullptr;
+	}
+
+	// The screen's DP, from ITS registry entry, bound to the presenter window.
+	// Same factory slot and screen binding the segment managers use; no
+	// fallback to the plain factory (that DP describes the plug-in's
+	// process-wide panel, not this screen).
+	const struct xrt_dp_registry_entry *e = svc_ws_registry_entry(sys, scr->id);
+	const struct xrt_plugin_iface *iface =
+	    e != nullptr ? (const struct xrt_plugin_iface *)e->owning_iface : nullptr;
+	if (e != nullptr && e->dp_factory_d3d11 != nullptr && xrt_plugin_iface_has_create_dp_d3d11_for_screen(iface)) {
+		struct xrt_screen_binding b;
+		memset(&b, 0, sizeof(b));
+		b.struct_size = (uint32_t)sizeof(b);
+		b.monitor_id = scr->id;
+		b.desktop_left = scr->desktop.x;
+		b.desktop_top = scr->desktop.y;
+		b.desktop_width = scr->desktop.w;
+		b.desktop_height = scr->desktop.h;
+		if (xs != nullptr) {
+			b.native_pixel_width = xs->native_width;
+			b.native_pixel_height = xs->native_height;
+			b.physical_width_mm = xs->physical_width_mm;
+			b.physical_height_mm = xs->physical_height_mm;
+			b.desktop_scale = xs->desktop_scale;
+			snprintf(b.device_name, sizeof(b.device_name), "%s", xs->device_name);
+		}
+		snprintf(b.serial, sizeof(b.serial), "%s", e->serial);
+		struct xrt_display_processor_d3d11 *dp = nullptr;
+		xrt_result_t dret = XRT_ERROR_DEVICE_CREATION_FAILED;
+		{
+			combine_ctx_lock ctx_lock(sys); // the vendor may record on the shared immediate context
+			dret =
+			    iface->create_dp_d3d11_for_screen((struct xrt_plugin_instance *)e->owning_instance,
+			                                      sys->device.get(), sys->context.get(), p->hwnd, &b, &dp);
+		}
+		if (dret == XRT_SUCCESS && dp != nullptr && dp->process_atlas != nullptr) {
+			p->dp = dp;
+			xrt_display_processor_d3d11_set_background_2d(dp, nullptr, 0, 0);
+			xrt_display_processor_d3d11_set_transparent_background(dp, false, false);
+		} else if (dp != nullptr) {
+			xrt_display_processor_d3d11_destroy(&dp);
+		}
+	}
+
+	// Lifecycle (once per presenter).
+	U_LOG_W(
+	    "workspace presenter: screen 0x%016llx up — %ux%u at (%d,%d), plug-in '%s', %s (render device; "
+	    "workspace px origin %d,%d)",
+	    (unsigned long long)scr->id, w, h, scr->desktop.x, scr->desktop.y, scr->plugin_id,
+	    p->dp != nullptr ? "woven by its own DP" : "NO DP — presented unwoven", p->origin_dx, p->origin_dy);
+	return p;
+}
+
+//! Keep the presenters in step with the screen set (rebuilds only when its generation moves).
+static void
+svc_ws_presenters_sync(struct d3d11_service_system *sys, struct d3d11_multi_compositor *mc)
+{
+	// A presenter window the user closed: rebuild it (the presenter set is the
+	// runtime's, not the user's to dismiss — the workspace itself is closed
+	// through the controller).
+	for (uint32_t i = 0; i < mc->ws_presenter_count; i++) {
+		struct svc_ws_presenter *p = mc->ws_presenters[i];
+		if (p != nullptr && p->window != nullptr && !comp_d3d11_window_is_valid(p->window)) {
+			mc->ws_presenters_synced = false;
+		}
+	}
+
+	uint32_t gen = 0;
+	{
+		std::lock_guard<std::mutex> lk(sys->ws_screens_mutex);
+		gen = sys->ws_screens_generation;
+		if (mc->ws_presenters_synced && gen == mc->ws_presenters_gen) {
+			return;
+		}
+	}
+	// Rare (a topology change): copy the set and the registry list out.
+	struct comp_ws_screen_set *set = new comp_ws_screen_set();
+	struct xrt_screen_list *list = new xrt_screen_list();
+	{
+		std::lock_guard<std::mutex> lk(sys->ws_screens_mutex);
+		gen = sys->ws_screens_generation;
+		*set = sys->ws_screens;
+		*list = sys->ws_screen_list;
+	}
+	mc->ws_presenters_gen = gen;
+	mc->ws_presenters_synced = true;
+
+	// The primary moving re-origins every presenter (workspace px are relative to it).
+	const struct comp_ws_screen *prim = comp_ws_screens_find(set, 0);
+	const struct comp_ws_screen old_primary = mc->ws_primary;
+	if (prim != nullptr) {
+		mc->ws_primary = *prim;
+	}
+
+	// Keep the presenters whose screen is still a non-primary presenter at the
+	// same place with the same claim; tear the rest down.
+	struct svc_ws_presenter *keep[COMP_WS_MAX_SCREENS] = {};
+	struct svc_ws_presenter *gone[COMP_WS_MAX_SCREENS] = {};
+	uint32_t nk = 0, ng = 0;
+	for (uint32_t i = 0; i < mc->ws_presenter_count; i++) {
+		struct svc_ws_presenter *p = mc->ws_presenters[i];
+		const struct comp_ws_screen *s = prim != nullptr ? comp_ws_screens_find(set, p->screen_id) : nullptr;
+		const bool same = s != nullptr && (s->flags & COMP_WS_SCREEN_PRESENTER) != 0 &&
+		                  (s->flags & COMP_WS_SCREEN_PRIMARY) == 0 && s->desktop.x == p->screen.desktop.x &&
+		                  s->desktop.y == p->screen.desktop.y && s->desktop.w == p->screen.desktop.w &&
+		                  s->desktop.h == p->screen.desktop.h && s->width_m == p->screen.width_m &&
+		                  s->height_m == p->screen.height_m && strcmp(s->plugin_id, p->screen.plugin_id) == 0 &&
+		                  prim->desktop.x == old_primary.desktop.x &&
+		                  prim->desktop.y == old_primary.desktop.y && p->window != nullptr &&
+		                  comp_d3d11_window_is_valid(p->window);
+		if (same) {
+			keep[nk++] = p;
+		} else {
+			gone[ng++] = p;
+		}
+	}
+
+	// Make the missing ones (outside the lock: window + DP creation is slow).
+	struct svc_ws_presenter *made[COMP_WS_MAX_SCREENS] = {};
+	uint32_t nm = 0;
+	for (uint32_t i = 0; prim != nullptr && i < set->count && i < COMP_WS_MAX_SCREENS; i++) {
+		const struct comp_ws_screen *s = &set->screens[i];
+		if ((s->flags & COMP_WS_SCREEN_PRESENTER) == 0 || (s->flags & COMP_WS_SCREEN_PRIMARY) != 0) {
+			continue;
+		}
+		bool have = false;
+		for (uint32_t k = 0; k < nk; k++) {
+			have = have || keep[k]->screen_id == s->id;
+		}
+		if (have || nk + nm >= COMP_WS_MAX_SCREENS) {
+			continue;
+		}
+		struct svc_ws_presenter *p =
+		    svc_ws_presenter_create(sys, mc, s, prim, xrt_screen_list_find(list, s->id));
+		if (p != nullptr) {
+			made[nm++] = p;
+		}
+	}
+
+	AcquireSRWLockExclusive(&mc->ws_presenters_lock);
+	uint32_t n = 0;
+	for (uint32_t k = 0; k < nk; k++) {
+		mc->ws_presenters[n++] = keep[k];
+	}
+	for (uint32_t k = 0; k < nm; k++) {
+		mc->ws_presenters[n++] = made[k];
+	}
+	for (uint32_t k = n; k < COMP_WS_MAX_SCREENS; k++) {
+		mc->ws_presenters[k] = nullptr;
+	}
+	mc->ws_presenter_count = n;
+	ReleaseSRWLockExclusive(&mc->ws_presenters_lock);
+
+	for (uint32_t k = 0; k < ng; k++) {
+		svc_ws_presenter_destroy(gone[k]);
+	}
+	if (ng > 0 || nm > 0) {
+		// Lifecycle (topology change), not per frame.
+		U_LOG_W("workspace presenters: generation %u — %u secondary presenter(s) (%u made, %u torn down)", gen,
+		        n, nm, ng);
+		// The new windows need the focused client's input-forward rect.
+		multi_compositor_update_input_forward(mc);
+	}
+	delete list;
+	delete set;
+}
+
+//! A screen's eyes, mapped from its display space into the primary's.
+static void
+svc_ws_presenter_eyes(const struct svc_ws_presenter *p,
+                      const struct comp_ws_screen *prim,
+                      struct xrt_eye_positions *out)
+{
+	struct xrt_eye_positions own = {};
+	if (p->dp != nullptr) {
+		xrt_display_processor_d3d11_get_predicted_eye_positions(p->dp, &own);
+	}
+	if (!own.valid || own.count == 0) {
+		// No tracker answer: the screen's nominal viewer, a nominal IPD apart.
+		const float vz = p->screen.nominal_viewer_m[2] > 0.01f ? p->screen.nominal_viewer_m[2] : 0.6f;
+		own.count = 2;
+		own.eyes[0] = {p->screen.nominal_viewer_m[0] - 0.032f, p->screen.nominal_viewer_m[1], vz};
+		own.eyes[1] = {p->screen.nominal_viewer_m[0] + 0.032f, p->screen.nominal_viewer_m[1], vz};
+		own.valid = true;
+	}
+	*out = own;
+	const uint32_t n = own.count < 8 ? own.count : 8;
+	for (uint32_t i = 0; i < n; i++) {
+		struct xrt_pose in = {};
+		in.orientation.w = 1.0f;
+		in.position.x = own.eyes[i].x;
+		in.position.y = own.eyes[i].y;
+		in.position.z = own.eyes[i].z;
+		struct xrt_pose mapped = in;
+		float mw = 0.0f, mh = 0.0f;
+		if (comp_ws_map_pose(&p->screen, prim, &in, 1.0f, 1.0f, &mapped, &mw, &mh)) {
+			out->eyes[i].x = mapped.position.x;
+			out->eyes[i].y = mapped.position.y;
+			out->eyes[i].z = mapped.position.z;
+		}
+	}
+}
+
+//! Compose, weave and present every secondary presenter (ADR-052 D1/D2).
+static void
+svc_ws_presenters_render(struct d3d11_service_system *sys, struct d3d11_multi_compositor *mc)
+{
+	if (mc->ws_presenter_count == 0) {
+		return;
+	}
+	const struct comp_ws_screen *prim = &mc->ws_primary;
+	if (prim->desktop.w == 0 || prim->desktop.h == 0 || !(prim->width_m > 0.0f) || !(prim->height_m > 0.0f)) {
+		return;
+	}
+
+	for (uint32_t i = 0; i < mc->ws_presenter_count; i++) {
+		struct svc_ws_presenter *p = mc->ws_presenters[i];
+		if (p == nullptr || !p->swap_chain || !p->back_buffer_rtv || !p->atlas_rtv) {
+			continue;
+		}
+		if (p->window != nullptr && !comp_d3d11_window_is_valid(p->window)) {
+			continue; // rebuilt by the next sync
+		}
+		// Where the primary's display space lands in this presenter's pixels.
+		struct comp_ws_frame frame = {};
+		if (!comp_ws_presenter_frame(prim, &p->screen, &frame)) {
+			continue;
+		}
+		// Claim a back buffer without blocking; none free = DWM is not taking
+		// this screen's flips — keep its last frame (#924's rule).
+		if (p->waitable != nullptr && WaitForSingleObject(p->waitable, 0) != WAIT_OBJECT_0) {
+			continue;
+		}
+
+		struct xrt_eye_positions eyes = {};
+		svc_ws_presenter_eyes(p, prim, &eyes);
+
+		struct svc_ws_pass pass = {};
+		pass.px_w = p->px_w;
+		pass.px_h = p->px_h;
+		pass.w_m = p->screen.width_m;
+		pass.h_m = p->screen.height_m;
+		pass.ppm_x = frame.ppm_x;
+		pass.ppm_y = frame.ppm_y;
+		pass.cx_px = frame.cx_px;
+		pass.cy_px = frame.cy_px;
+		pass.origin_dx = p->origin_dx;
+		pass.origin_dy = p->origin_dy;
+		pass.primary_px_w =
+		    sys->base.info.display_pixel_width > 0 ? sys->base.info.display_pixel_width : prim->desktop.w;
+		pass.primary_px_h =
+		    sys->base.info.display_pixel_height > 0 ? sys->base.info.display_pixel_height : prim->desktop.h;
+
+		struct svc_compose_target target = {};
+		target.rtv = p->atlas_rtv.get();
+		target.rtv_srgb = p->atlas_rtv_srgb.get();
+		target.dsv = p->atlas_dsv.get();
+		struct svc_compose_out out = {};
+		uint32_t vw = 0, vh = 0;
+		t_ws_pass = &pass;
+		multi_compositor_compose_pass(sys, mc, eyes, &target, &out);
+		resolve_active_view_dims(sys, p->px_w, p->px_h, &vw, &vh);
+		t_ws_pass = nullptr;
+
+		const uint32_t cols = sys->tile_columns > 0 ? sys->tile_columns : 1;
+		const uint32_t rows = sys->tile_rows > 0 ? sys->tile_rows : 1;
+		uint32_t cw = cols * vw;
+		uint32_t ch = rows * vh;
+		if (cw > p->px_w) {
+			cw = p->px_w;
+		}
+		if (ch > p->px_h) {
+			ch = p->px_h;
+		}
+
+		{
+			combine_ctx_lock ctx_lock(sys);
+			ID3D11ShaderResourceView *src = p->atlas_srv.get();
+			// ADR-030: crop before the DP whenever the content does not fill the atlas.
+			if (vw > 0 && vh > 0 && (cw != p->px_w || ch != p->px_h)) {
+				if (p->crop_w != cw || p->crop_h != ch) {
+					p->crop_srv.reset();
+					p->crop.reset();
+					D3D11_TEXTURE2D_DESC cd = {};
+					cd.Width = cw;
+					cd.Height = ch;
+					cd.MipLevels = 1;
+					cd.ArraySize = 1;
+					cd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+					cd.SampleDesc.Count = 1;
+					cd.Usage = D3D11_USAGE_DEFAULT;
+					cd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+					if (SUCCEEDED(sys->device->CreateTexture2D(&cd, nullptr, p->crop.put()))) {
+						sys->device->CreateShaderResourceView(p->crop.get(), nullptr,
+						                                      p->crop_srv.put());
+					}
+					p->crop_w = cw;
+					p->crop_h = ch;
+				}
+				if (p->crop && p->crop_srv) {
+					for (uint32_t v = 0; v < cols * rows && v < XRT_MAX_VIEWS; v++) {
+						const uint32_t c = v % cols;
+						const uint32_t r = v / cols;
+						D3D11_BOX box = {c * vw, r * vh, 0, c * vw + vw, r * vh + vh, 1};
+						if (box.right > p->px_w || box.bottom > p->px_h) {
+							continue;
+						}
+						sys->context->CopySubresourceRegion(p->crop.get(), 0, c * vw, r * vh, 0,
+						                                    p->atlas.get(), 0, &box);
+					}
+					src = p->crop_srv.get();
+				}
+			}
+
+			if (p->dp != nullptr && vw > 0 && vh > 0) {
+				const int enc = (out.compose_linear && !target.encodes_on_write)
+				                    ? (int)XRT_ATLAS_ENCODING_LINEAR
+				                    : (int)XRT_ATLAS_ENCODING_ENCODED;
+				if (p->encoding_latched != enc) {
+					p->encoding_latched = enc;
+					xrt_display_processor_d3d11_set_atlas_encoding(p->dp,
+					                                               (enum xrt_atlas_encoding)enc);
+				}
+				// One rendering mode / lens per service (ADR-052 D5).
+				const int want_3d = sys->hardware_display_3d ? 1 : 0;
+				if (p->mode_sent != want_3d) {
+					p->mode_sent = want_3d;
+					xrt_display_processor_d3d11_request_display_mode(p->dp, want_3d != 0);
+				}
+				ID3D11RenderTargetView *rt[] = {p->back_buffer_rtv.get()};
+				sys->context->OMSetRenderTargets(1, rt, nullptr);
+				xrt_display_processor_d3d11_process_atlas(p->dp, sys->context.get(), src, vw, vh, cols,
+				                                          rows, DXGI_FORMAT_R8G8B8A8_UNORM, p->px_w,
+				                                          p->px_h, 0, 0, 0, 0);
+			} else {
+				// No DP: the composition unwoven, the primary's no-DP fallback.
+				wil::com_ptr<ID3D11Resource> bb;
+				p->back_buffer_rtv->GetResource(bb.put());
+				if (bb) {
+					sys->context->CopyResource(bb.get(), p->atlas.get());
+				}
+			}
+		}
+
+		// The buffer was claimed above, so this queues without blocking.
+		HRESULT phr = p->swap_chain->Present(1, 0);
+		phr = dxr_test_fake_device_removed(phr);
+		(void)service_note_device_lost(sys, phr, "compose/workspace_presenter_present");
+		if (p->window != nullptr) {
+			comp_d3d11_window_signal_paint_done(p->window);
+		}
+	}
+}
+
+//! Drain the presenter windows' public input into @p out, cursor in workspace px.
+static uint32_t
+svc_ws_presenters_consume_events(struct d3d11_multi_compositor *mc,
+                                 struct workspace_public_event_raw *out,
+                                 uint32_t capacity)
+{
+	uint32_t got = 0;
+	if (mc == nullptr || capacity == 0) {
+		return 0;
+	}
+	AcquireSRWLockExclusive(&mc->ws_presenters_lock);
+	for (uint32_t i = 0; i < mc->ws_presenter_count && got < capacity; i++) {
+		struct svc_ws_presenter *p = mc->ws_presenters[i];
+		if (p == nullptr || p->window == nullptr) {
+			continue;
+		}
+		const uint32_t n =
+		    comp_d3d11_window_consume_workspace_public_events(p->window, out + got, capacity - got);
+		for (uint32_t k = got; k < got + n; k++) {
+			out[k].cursor_x += p->origin_dx;
+			out[k].cursor_y += p->origin_dy;
+		}
+		got += n;
+	}
+	ReleaseSRWLockExclusive(&mc->ws_presenters_lock);
+	return got;
+}
+
+//! The focused client's input-forward rect on every presenter window, in its pixels.
+static void
+svc_ws_presenters_mirror_input_forward(
+    struct d3d11_multi_compositor *mc, void *target, int32_t rx, int32_t ry, int32_t rw, int32_t rh, bool is_capture)
+{
+	if (mc == nullptr) {
+		return;
+	}
+	AcquireSRWLockExclusive(&mc->ws_presenters_lock);
+	for (uint32_t i = 0; i < mc->ws_presenter_count; i++) {
+		struct svc_ws_presenter *p = mc->ws_presenters[i];
+		if (p != nullptr && p->window != nullptr) {
+			comp_d3d11_window_set_input_forward(p->window, target, rx - p->origin_dx, ry - p->origin_dy, rw,
+			                                    rh, is_capture);
+		}
+	}
+	ReleaseSRWLockExclusive(&mc->ws_presenters_lock);
+}
+
+//! Status: does screen @p id's presenter have a live DP?
+static bool
+svc_ws_presenter_is_woven(struct d3d11_multi_compositor *mc, uint64_t id)
+{
+	if (mc == nullptr) {
+		return false;
+	}
+	bool woven = false;
+	AcquireSRWLockExclusive(&mc->ws_presenters_lock);
+	for (uint32_t i = 0; i < mc->ws_presenter_count; i++) {
+		if (mc->ws_presenters[i] != nullptr && mc->ws_presenters[i]->screen_id == id) {
+			woven = mc->ws_presenters[i]->dp != nullptr;
+		}
+	}
+	ReleaseSRWLockExclusive(&mc->ws_presenters_lock);
+	return woven;
+}
+
+
+/*!
+ * The frame after the prelude of multi_compositor_render: the secondary
+ * presenters (each composed, woven and presented on its own), then the
+ * primary's compose and today's weave + present of the service window.
+ */
+static void
+multi_compositor_render_frame(struct d3d11_service_system *sys,
+                              struct d3d11_multi_compositor *mc,
+                              const struct xrt_eye_positions &eye_pos)
+{
+	// ADR-052 D1: the presenter set follows the screen set; then each secondary
+	// presenter composes its part of the layout and weaves it with its own DP.
+	svc_ws_presenters_sync(sys, mc);
+	svc_ws_presenters_render(sys, mc);
+
+	struct svc_compose_target primary_target = {};
+	primary_target.rtv = mc->combined_atlas_rtv.get();
+	primary_target.rtv_srgb = mc->combined_atlas_rtv_srgb.get();
+	primary_target.dsv = mc->combined_atlas_dsv.get();
+	primary_target.encodes_on_write = mc->combine_encodes_on_write;
+	struct svc_compose_out compose_out = {};
+	multi_compositor_compose_pass(sys, mc, eye_pos, &primary_target, &compose_out);
+	mc->combine_encodes_on_write = primary_target.encodes_on_write;
+	const bool compose_linear = compose_out.compose_linear;
+	uint32_t dp_view_w = compose_out.dp_view_w;
+	uint32_t dp_view_h = compose_out.dp_view_h;
 
 	// Send full combined atlas to DP — content is placed at sub-rect positions,
 	// background is dark gray. The DP interlaces the entire image.
@@ -28447,6 +29363,7 @@ system_destroy(struct xrt_system_compositor *xsysc)
 
 	// Clean up multi-compositor
 	if (sys->multi_comp != nullptr) {
+		svc_ws_presenters_destroy_all(sys, sys->multi_comp, "multi-compositor teardown"); // ADR-052
 		multi_compositor_destroy(sys->multi_comp);
 		sys->multi_comp = nullptr;
 	}
@@ -29567,6 +30484,9 @@ slot_pose_to_pixel_rect_for_eye(const struct d3d11_service_system *sys,
 
 	float px_per_m_x = (float)disp_px_w / disp_w_m;
 	float px_per_m_y = (float)disp_px_h / disp_h_m;
+	float half_px_x = (float)disp_px_w / 2.0f;
+	float half_px_y = (float)disp_px_h / 2.0f;
+	svc_ws_pass_frame(&half_px_x, &half_px_y, &px_per_m_x, &px_per_m_y); // ADR-052: a presenter's pass
 
 	float wx = slot->window_pose.position.x;
 	float wy = slot->window_pose.position.y;
@@ -29590,8 +30510,8 @@ slot_pose_to_pixel_rect_for_eye(const struct d3d11_service_system *sys,
 	int32_t w_px = (int32_t)(w_m * px_per_m_x + 0.5f);
 	int32_t h_px = (int32_t)(h_m * px_per_m_y + 0.5f);
 
-	float center_px_x = (float)disp_px_w / 2.0f + wx * px_per_m_x;
-	float center_px_y = (float)disp_px_h / 2.0f - wy * px_per_m_y;
+	float center_px_x = half_px_x + wx * px_per_m_x;
+	float center_px_y = half_px_y - wy * px_per_m_y;
 
 	*out_x = (int32_t)(center_px_x - (float)w_px / 2.0f + 0.5f);
 	*out_y = (int32_t)(center_px_y - (float)h_px / 2.0f + 0.5f);
@@ -29652,6 +30572,13 @@ compute_projected_quad_corners(const struct d3d11_service_system *sys,
 	}
 	float px_per_m_x = (float)disp_px_w / disp_w_m;
 	float px_per_m_y = (float)disp_px_h / disp_h_m;
+	// project_point_for_eye centres on frame/2: in a presenter's pass the frame
+	// is twice the primary's centre in its pixels (ADR-052).
+	float frame_half_x = (float)disp_px_w / 2.0f;
+	float frame_half_y = (float)disp_px_h / 2.0f;
+	svc_ws_pass_frame(&frame_half_x, &frame_half_y, &px_per_m_x, &px_per_m_y);
+	const float frame_w = frame_half_x * 2.0f;
+	const float frame_h = frame_half_y * 2.0f;
 
 	float hw = slot->window_width_m / 2.0f;
 	float hh = slot->window_height_m / 2.0f;
@@ -29682,11 +30609,8 @@ compute_projected_quad_corners(const struct d3d11_service_system *sys,
 		out_w[i] = depth;
 
 		float dpx, dpy;
-		project_point_for_eye(world.x, world.y, world.z,
-		                      eye_x, eye_y, eye_z,
-		                      (float)disp_px_w, (float)disp_px_h,
-		                      px_per_m_x, px_per_m_y,
-		                      &dpx, &dpy);
+		project_point_for_eye(world.x, world.y, world.z, eye_x, eye_y, eye_z, frame_w, frame_h, px_per_m_x,
+		                      px_per_m_y, &dpx, &dpy);
 
 		float frac_x = dpx / (float)ca_w;
 		float frac_y = dpy / (float)ca_h;
@@ -29724,6 +30648,11 @@ project_local_rect_for_eye(const struct d3d11_service_system *sys,
 	}
 	float px_per_m_x = (float)disp_px_w / disp_w_m;
 	float px_per_m_y = (float)disp_px_h / disp_h_m;
+	float frame_half_x = (float)disp_px_w / 2.0f;
+	float frame_half_y = (float)disp_px_h / 2.0f;
+	svc_ws_pass_frame(&frame_half_x, &frame_half_y, &px_per_m_x, &px_per_m_y); // ADR-052
+	const float frame_w = frame_half_x * 2.0f;
+	const float frame_h = frame_half_y * 2.0f;
 
 	// 4 corners in window-local space: TL, BL, TR, BR
 	struct xrt_vec3 local[4] = {
@@ -29746,11 +30675,8 @@ project_local_rect_for_eye(const struct d3d11_service_system *sys,
 		if (out_w) out_w[i] = depth;
 
 		float dpx, dpy;
-		project_point_for_eye(world.x, world.y, world.z,
-		                      eye_x, eye_y, eye_z,
-		                      (float)disp_px_w, (float)disp_px_h,
-		                      px_per_m_x, px_per_m_y,
-		                      &dpx, &dpy);
+		project_point_for_eye(world.x, world.y, world.z, eye_x, eye_y, eye_z, frame_w, frame_h, px_per_m_x,
+		                      px_per_m_y, &dpx, &dpy);
 
 		float frac_x = dpx / (float)ca_w;
 		float frac_y = dpy / (float)ca_h;
@@ -30204,15 +31130,14 @@ comp_d3d11_service_get_client_app_window_metrics(struct xrt_system_compositor *x
  */
 
 /*!
- * Whether this build presents the workspace on more than one screen. Until
- * the per-screen presenters land (ADR-052 D1) the set is built single-screen:
- * every other 3D screen is listed, but not as a presenter, so the contract a
- * controller sees is the truth about what is drawn.
+ * Whether this build presents the workspace on more than one screen (ADR-052
+ * D1). The kill switches (`DXR_SEGMENTS=0`, `DXR_WORKSPACE_SCREENS=single`)
+ * still build the set single-screen.
  */
 static bool
 svc_ws_multi_presenter_supported(void)
 {
-	return false;
+	return true; // ADR-052 D1: the secondary presenters are in (svc_ws_presenters_*)
 }
 
 static enum comp_ws_policy
@@ -30272,6 +31197,7 @@ comp_d3d11_service_workspace_update_screens(struct xrt_system_compositor *xsysc,
 		changed = !comp_ws_screens_equal(&sys->ws_screens, &set);
 		if (changed) {
 			sys->ws_screens = set;
+			sys->ws_screen_list = *list; // the presenters' screen bindings come from it
 			sys->ws_screens_generation++;
 		}
 		gen = sys->ws_screens_generation;
@@ -30322,15 +31248,20 @@ comp_d3d11_service_workspace_get_screens(struct xrt_system_compositor *xsysc,
 		}
 	}
 
-	// The primary presenter's live mode (one rendering mode per service today;
-	// a secondary presenter reports its own once it exists).
-	if (set.primary_index < set.count && sys->xdev != nullptr && sys->xdev->hmd != nullptr) {
-		struct comp_ws_screen *p = &set.screens[set.primary_index];
+	// The presenters' live mode: one rendering mode per service (ADR-052 D5),
+	// so every presenter reports the head's.
+	if (sys->xdev != nullptr && sys->xdev->hmd != nullptr) {
 		const uint32_t idx = sys->xdev->hmd->active_rendering_mode_index;
-		p->mode_index = idx;
-		if (idx < sys->xdev->rendering_mode_count) {
-			p->view_count = sys->xdev->rendering_modes[idx].view_count;
-			p->hardware_3d = sys->xdev->rendering_modes[idx].hardware_display_3d;
+		for (uint32_t i = 0; i < set.count && i < COMP_WS_MAX_SCREENS; i++) {
+			struct comp_ws_screen *p = &set.screens[i];
+			if ((p->flags & COMP_WS_SCREEN_PRESENTER) == 0) {
+				continue;
+			}
+			p->mode_index = idx;
+			if (idx < sys->xdev->rendering_mode_count) {
+				p->view_count = sys->xdev->rendering_modes[idx].view_count;
+				p->hardware_3d = sys->xdev->rendering_modes[idx].hardware_display_3d;
+			}
 		}
 	}
 	comp_ws_screens_to_ipc(&set, gen, out);
@@ -30479,7 +31410,8 @@ comp_d3d11_service_workspace_get_status(struct xrt_system_compositor *xsysc, str
 	}
 	// Lock-free read of the panel DP pointer, like every other status reader:
 	// only "is there one" is used.
-	const bool primary_woven = sys->multi_comp != nullptr && sys->multi_comp->display_processor != nullptr;
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	const bool primary_woven = mc != nullptr && mc->display_processor != nullptr;
 	ws->screen_count = 0;
 	for (uint32_t i = 0; i < set.count && ws->screen_count < XRT_STATUS_WORKSPACE_MAX_SCREENS; i++) {
 		const struct comp_ws_screen *s = &set.screens[i];
@@ -30489,7 +31421,7 @@ comp_d3d11_service_workspace_get_status(struct xrt_system_compositor *xsysc, str
 		struct xrt_status_workspace_screen *o = &ws->screens[ws->screen_count++];
 		o->id = s->id;
 		o->primary = (s->flags & COMP_WS_SCREEN_PRIMARY) != 0;
-		o->woven = o->primary ? primary_woven : false;
+		o->woven = o->primary ? primary_woven : svc_ws_presenter_is_woven(mc, s->id);
 	}
 }
 
@@ -30917,6 +31849,9 @@ comp_d3d11_service_workspace_drain_input_events(struct xrt_system_compositor *xs
 
 	struct workspace_public_event_raw raw[IPC_WORKSPACE_INPUT_EVENT_BATCH_MAX];
 	uint32_t got = comp_d3d11_window_consume_workspace_public_events(mc->window, raw, want);
+	// ADR-052: the secondary presenters' windows feed the same queue, their
+	// cursor positions moved into workspace pixels.
+	got += svc_ws_presenters_consume_events(mc, raw + got, want - got);
 
 	// Phase 2.K: even when the WndProc-side ring is empty, FRAME_TICK and
 	// FOCUS_CHANGED events still need to drain — controllers pace their
@@ -31560,6 +32495,19 @@ comp_d3d11_service_workspace_set_reserved_keys(struct xrt_system_compositor *xsy
 		mods[i] = table->keys[i].modifiers;
 	}
 	comp_d3d11_window_set_reserved_keys(mc->window, vks, mods, count);
+	// ADR-052: every presenter window forwards keys the same way.
+	AcquireSRWLockExclusive(&mc->ws_presenters_lock);
+	mc->ws_reserved_set = true;
+	mc->ws_reserved_count = count;
+	memcpy(mc->ws_reserved_vks, vks, sizeof(vks[0]) * count);
+	memcpy(mc->ws_reserved_mods, mods, sizeof(mods[0]) * count);
+	for (uint32_t i = 0; i < mc->ws_presenter_count; i++) {
+		struct svc_ws_presenter *p = mc->ws_presenters[i];
+		if (p != nullptr && p->window != nullptr) {
+			comp_d3d11_window_set_reserved_keys(p->window, vks, mods, count);
+		}
+	}
+	ReleaseSRWLockExclusive(&mc->ws_presenters_lock);
 	return XRT_SUCCESS;
 }
 
