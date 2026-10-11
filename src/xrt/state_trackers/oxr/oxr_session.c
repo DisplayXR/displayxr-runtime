@@ -2507,12 +2507,21 @@ oxr_session_fill_cursor_depth(struct oxr_session *sess,
 	u_cursor_depth_place_anchored(&g, disparity, hint->cursorHeight, anchor_mode, &sess->cursor_depth_anchor,
 	                              hint->cursorUV.x, hint->cursorUV.y, reprimed, now_ns, &position, &height);
 
+	// Diagnostics are filled whether or not a sprite is drawn (spec v4).
+	out->disparity = disparity;
+	out->targetDisparity = target;
+
+	// Amendment 2 A.3: on the plane it is the OS cursor. isActive (= "draw
+	// a sprite, hide the OS cursor") only while the FILTERED disparity is in
+	// front of the draw threshold. The filter and the anchor above stepped
+	// regardless, so the drawn cursor hands back and returns smoothly.
+	if (!u_cursor_depth_should_draw(&tuning, disparity)) {
+		return;
+	}
 	out->isActive = XR_TRUE;
 	out->pose.orientation = (XrQuaternionf){g.orientation.x, g.orientation.y, g.orientation.z, g.orientation.w};
 	out->pose.position = (XrVector3f){position.x, position.y, position.z};
 	out->height = height;
-	out->disparity = disparity;
-	out->targetDisparity = target;
 }
 #endif // OXR_HAVE_DXR_cursor_depth
 

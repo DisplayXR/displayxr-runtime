@@ -21,6 +21,12 @@
  *    (on-screen disparity = baseline * d): 0 on the canvas, < 0 in front.
  *    Disparity, not distance, is what the eye compares, so margins, clamps
  *    and slew rates are expressed there;
+ *  - ONE POLICY (ADR-046 Amendment 2 A): the cursor is never behind the
+ *    glass. target = d < 0 ? max(d - margin, d_min) : 0, margin 0.03, and
+ *    nothing is drawn (the OS cursor is the cursor) while the filtered
+ *    disparity is above the draw threshold, -0.005
+ *    (u_cursor_depth_should_draw). The filter keeps stepping while nothing
+ *    is drawn, so the drawn cursor hands back smoothly;
  *  - the sprite's height is scaled by t so its apparent size is constant;
  *  - WHERE laterally it goes is the anchor mode (spec v3):
  *      SCREEN  C = E + t (S - E): on the cyclopean ray. Its image on the glass
@@ -57,6 +63,19 @@ extern "C" {
 //! Default sprite height, as a fraction of the canvas height.
 #define U_CURSOR_DEPTH_DEFAULT_HEIGHT 0.03f
 
+//! Default margin in front of content, eye-baseline units (Amendment 2 A.2).
+#define U_CURSOR_DEPTH_DEFAULT_MARGIN 0.03f
+
+/*!
+ * Default draw threshold, eye-baseline units (Amendment 2 A.3): a sprite is
+ * drawn only while the filtered disparity is at or in front of this.
+ *
+ * The ADR also floors it at 0.5 px on the panel. The placement does not know
+ * the panel's pixel pitch, so that floor is the drawing backend's to apply;
+ * at a 65 mm IPD, -0.005 is ~0.33 mm, above 0.5 px on every panel shipped.
+ */
+#define U_CURSOR_DEPTH_DRAW_THRESHOLD (-0.005f)
+
 /*!
  * One located view: the pose and fov exactly as xrLocateViews returns them.
  */
@@ -88,8 +107,12 @@ struct u_cursor_depth_tuning
 	float margin;
 	//! Most crossed disparity the cursor may reach (comfort clamp, < 0).
 	float min_disparity;
-	//! Most uncrossed disparity the cursor may reach (> 0).
+	//! Upper clamp, <= 0. Default 0 (the canvas): never behind the glass.
+	//! Values > 0 are treated as 0 (Amendment 2 A.1).
 	float max_disparity;
+	//! Draw only while the filtered disparity is <= this (< 0; default
+	//! U_CURSOR_DEPTH_DRAW_THRESHOLD; >= 0 or non-finite = the default).
+	float draw_threshold;
 	//! Time constant when rising toward the viewer, seconds (fast: never lag behind content).
 	float rise_tau_s;
 	//! Time constant when sinking away from the viewer, seconds (slow: no flicker at edges).
@@ -169,11 +192,22 @@ bool
 u_cursor_depth_point_disparity(const struct u_cursor_depth_geometry *g, const struct xrt_vec3 *p, float *out_disparity);
 
 /*!
- * The unfiltered target: the content's disparity minus the margin, clamped;
- * 0 (the canvas) when there is no content under the cursor.
+ * The unfiltered target (ADR-046 Amendment 2 A.1):
+ * content_disparity < 0 ? max(content_disparity - margin, min_disparity) : 0,
+ * and never above 0 for any tuning. 0 (the canvas) when there is no content
+ * under the cursor, or the content is on or behind the canvas.
  */
 float
 u_cursor_depth_target(const struct u_cursor_depth_tuning *t, bool has_content, float content_disparity);
+
+/*!
+ * Amendment 2 A.3: should a sprite be drawn at this FILTERED disparity?
+ * True only at or in front of the draw threshold. While false the OS cursor
+ * is the cursor; keep stepping the filter regardless so the hand-back is
+ * smooth.
+ */
+bool
+u_cursor_depth_should_draw(const struct u_cursor_depth_tuning *t, float filtered_disparity);
 
 /*!
  * True if the next u_cursor_depth_filter_step() at @p now_ns will re-prime

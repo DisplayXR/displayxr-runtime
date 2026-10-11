@@ -66,14 +66,21 @@ view_ray(const struct u_cursor_depth_view *view, float u, float v)
 void
 u_cursor_depth_tuning_defaults(struct u_cursor_depth_tuning *t)
 {
-	// 0.5% of the baseline: on a real head-tracked panel the tester found
-	// 0.003-0.005 rests the cursor on the content (~1.5 mm in front of it at
-	// typical viewing distances), while the old 0.03 floated it a visibly
-	// detached ~1-2 cm off it (spec v3).
-	t->margin = 0.005f;
+	// 3% of the baseline: about 2 mm of crossed on-screen disparity at a 65 mm
+	// IPD - reads as in front without looking detached. Spec v3 briefly used
+	// 0.005; ADR-046 Amendment 2 A.2 restores 0.03, the value the reference
+	// app (cube_handle_metal_macos) has shown since Phase 1.
+	t->margin = U_CURSOR_DEPTH_DEFAULT_MARGIN;
 	// d = -0.6 is t = 0.625: the cursor may come ~3/8 of the way to the eye.
 	t->min_disparity = -0.6f;
-	t->max_disparity = 0.6f;
+	// Never behind the glass (Amendment 2 A.1): the cursor is on the canvas
+	// or in front of it. u_cursor_depth_target() also caps any configured
+	// value at 0, so this cannot be raised.
+	t->max_disparity = 0.0f;
+	// Amendment 2 A.3: nothing is drawn (the OS cursor is the cursor) until
+	// the filtered disparity is at least 0.5% of the baseline in front of
+	// the canvas (~0.3 mm on screen at a 65 mm IPD).
+	t->draw_threshold = U_CURSOR_DEPTH_DRAW_THRESHOLD;
 	t->rise_tau_s = 0.03f;
 	t->sink_tau_s = 0.25f;
 	t->stale_s = 0.5f;
@@ -157,14 +164,34 @@ u_cursor_depth_target(const struct u_cursor_depth_tuning *t, bool has_content, f
 	if (!has_content || !isfinite(content_disparity)) {
 		return 0.0f;
 	}
+	// Never behind the glass (ADR-046 Amendment 2 A.1): content on or behind
+	// the canvas leaves the cursor ON the canvas; only content that comes out
+	// of the screen pushes it forward, margin in front of it.
+	if (!(content_disparity < 0.0f)) {
+		return 0.0f;
+	}
 	float d = content_disparity - t->margin;
 	if (d < t->min_disparity) {
 		d = t->min_disparity;
 	}
-	if (d > t->max_disparity) {
-		d = t->max_disparity;
+	// The upper clamp is [.., 0] whatever the tuning says: a max_disparity > 0
+	// (or a margin <= 0 letting d reach above the content) can never put the
+	// cursor behind the glass.
+	const float max_d = (t->max_disparity < 0.0f) ? t->max_disparity : 0.0f;
+	if (d > max_d) {
+		d = max_d;
 	}
 	return d;
+}
+
+bool
+u_cursor_depth_should_draw(const struct u_cursor_depth_tuning *t, float filtered_disparity)
+{
+	// A threshold at or behind the canvas would draw a sprite ON the glass,
+	// where the OS cursor is the cursor (A.3): fall back to the default.
+	const float thr = (t->draw_threshold < 0.0f && isfinite(t->draw_threshold)) ? t->draw_threshold
+	                                                                            : U_CURSOR_DEPTH_DRAW_THRESHOLD;
+	return isfinite(filtered_disparity) && filtered_disparity <= thr;
 }
 
 bool

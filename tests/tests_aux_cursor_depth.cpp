@@ -229,10 +229,131 @@ TEST_CASE("cursor_depth: target = content minus margin, clamped; nothing under i
 	CHECK(u_cursor_depth_target(&t, false, -0.4f) == 0.0f);
 	CHECK(u_cursor_depth_target(&t, true, NAN) == 0.0f);
 	CHECK(u_cursor_depth_target(&t, true, -0.2f) == Catch::Approx(-0.2f - t.margin));
-	CHECK(u_cursor_depth_target(&t, true, 0.0f) == Catch::Approx(-t.margin));
 	CHECK(u_cursor_depth_target(&t, true, -5.0f) == t.min_disparity);
-	CHECK(u_cursor_depth_target(&t, true, 0.95f) == t.max_disparity);
 	CHECK(t.max_disparity < 1.0f); // place() divides by 1 - d
+}
+
+TEST_CASE("cursor_depth: never behind the glass (Amendment 2 A.1)")
+{
+	const auto t = tuning();
+	CHECK(t.max_disparity == 0.0f);
+	// Content ON the canvas: the cursor stays on it (it used to float margin in front).
+	CHECK(u_cursor_depth_target(&t, true, 0.0f) == 0.0f);
+	// Content behind it: the cursor stays on the canvas (it used to sink onto it).
+	CHECK(u_cursor_depth_target(&t, true, 0.3f) == 0.0f);
+	CHECK(u_cursor_depth_target(&t, true, 0.95f) == 0.0f);
+	CHECK(u_cursor_depth_target(&t, true, INFINITY) == 0.0f);
+	// Content just in front: margin in front of it.
+	CHECK(u_cursor_depth_target(&t, true, -0.001f) == Catch::Approx(-0.001f - t.margin));
+
+	// A tuning asking for room behind the glass cannot get it.
+	auto loose = t;
+	loose.max_disparity = 0.6f;
+	CHECK(u_cursor_depth_target(&loose, true, 0.3f) == 0.0f);
+	loose.margin = -0.2f; // a margin pushing the cursor BEHIND content in front
+	CHECK(u_cursor_depth_target(&loose, true, -0.1f) <= 0.0f);
+}
+
+TEST_CASE("cursor_depth: property - the target is never > 0, for any content and geometry")
+{
+	// Random heads, cursor UVs and content points (in front of and behind the
+	// canvas, through the real geometry + disparity path), random tunings.
+	uint32_t seed = 0x1847u;
+	auto rnd = [&seed]() {
+		seed = seed * 1664525u + 1013904223u;
+		return (float)(seed >> 8) / (float)(1u << 24);
+	};
+	int behind = 0, in_front = 0;
+	for (int i = 0; i < 4000; i++) {
+		const xrt_vec3 head{(rnd() - 0.5f) * 0.4f, (rnd() - 0.5f) * 0.2f, 0.35f + rnd() * 0.6f};
+		const auto a = kooima({head.x - 0.032f, head.y, head.z});
+		const auto b = kooima({head.x + 0.032f, head.y, head.z});
+		const float u = rnd(), v = rnd();
+		u_cursor_depth_geometry g{};
+		REQUIRE(u_cursor_depth_geometry_solve(&a, &b, u, v, &g));
+		// Content anywhere from 90% of the way to the eye to 3 m behind the glass.
+		const float z = -3.0f + rnd() * (3.0f + 0.9f * head.z);
+		const xrt_vec3 p{(rnd() - 0.5f) * 0.6f, (rnd() - 0.5f) * 0.4f, z};
+		float d = 0.0f;
+		if (!u_cursor_depth_point_disparity(&g, &p, &d)) {
+			continue;
+		}
+		auto t = tuning();
+		if (i % 3 == 1) {
+			t.max_disparity = rnd() * 0.8f; // misconfigured: room behind the glass
+		}
+		if (i % 5 == 2) {
+			t.margin = (rnd() - 0.5f) * 0.1f; // including <= 0
+		}
+		const float target = u_cursor_depth_target(&t, true, d);
+		CHECK(target <= 0.0f);
+		if (d >= 0.0f) {
+			behind++;
+			CHECK(target == 0.0f);
+		} else {
+			in_front++;
+			if (t.margin > 0.0f && t.max_disparity >= 0.0f) {
+				// In front of the content, inside the comfort clamp.
+				CHECK(target == Catch::Approx(std::fmax(d - t.margin, t.min_disparity)));
+				if (d - t.margin > t.min_disparity) {
+					CHECK(target < d);
+				}
+			}
+		}
+	}
+	CHECK(behind > 500);
+	CHECK(in_front > 500);
+}
+
+TEST_CASE("cursor_depth: draw threshold - on the plane it is the OS cursor (Amendment 2 A.3)")
+{
+	const auto t = tuning();
+	CHECK(t.draw_threshold == Catch::Approx(-0.005f));
+	CHECK_FALSE(u_cursor_depth_should_draw(&t, 0.0f));
+	CHECK_FALSE(u_cursor_depth_should_draw(&t, -0.0049f));
+	CHECK(u_cursor_depth_should_draw(&t, -0.0051f));
+	CHECK(u_cursor_depth_should_draw(&t, -0.3f));
+	CHECK_FALSE(u_cursor_depth_should_draw(&t, NAN));
+	CHECK_FALSE(u_cursor_depth_should_draw(&t, 0.2f));
+	// A threshold at or behind the glass falls back to the default.
+	auto bad = t;
+	bad.draw_threshold = 0.1f;
+	CHECK_FALSE(u_cursor_depth_should_draw(&bad, 0.0f));
+	CHECK_FALSE(u_cursor_depth_should_draw(&bad, -0.004f));
+	CHECK(u_cursor_depth_should_draw(&bad, -0.006f));
+}
+
+TEST_CASE("cursor_depth: the drawn cursor hands back smoothly - the filter steps while hidden")
+{
+	// Content pops out, then goes away: the cursor sinks back over ~250 ms,
+	// drawn until it crosses the threshold, then hidden; never a jump to 0.
+	const auto t = tuning();
+	u_cursor_depth_filter f{};
+	uint64_t now = 1000 * MS;
+	float d = u_cursor_depth_filter_step(&f, &t, u_cursor_depth_target(&t, true, -0.2f), now);
+	CHECK(u_cursor_depth_should_draw(&t, d));
+	float prev = d;
+	bool hidden = false;
+	for (int i = 0; i < 200; i++) {
+		now += 16 * MS;
+		d = u_cursor_depth_filter_step(&f, &t, u_cursor_depth_target(&t, true, 0.4f), now);
+		CHECK(d >= prev);
+		CHECK(d - prev < 0.05f);
+		CHECK(d <= 0.0f);
+		if (!u_cursor_depth_should_draw(&t, d)) {
+			hidden = true;
+		} else {
+			CHECK_FALSE(hidden); // once handed back, stays handed back
+		}
+		prev = d;
+	}
+	CHECK(hidden);
+	// It comes back fast when content pops out again.
+	now += 16 * MS;
+	d = u_cursor_depth_filter_step(&f, &t, u_cursor_depth_target(&t, true, -0.2f), now);
+	now += 16 * MS;
+	d = u_cursor_depth_filter_step(&f, &t, u_cursor_depth_target(&t, true, -0.2f), now);
+	CHECK(u_cursor_depth_should_draw(&t, d));
 }
 
 TEST_CASE("cursor_depth: the filter rises fast and sinks slowly")
@@ -345,11 +466,11 @@ head(xrt_vec3 h, float u, float v)
 
 } // namespace
 
-TEST_CASE("cursor_depth: margin default is 0.005 (spec v3)")
+TEST_CASE("cursor_depth: margin default is 0.03 (Amendment 2 A.2)")
 {
-	// A tester on a real head-tracked panel: 0.003-0.005 rests on the content,
-	// 0.03 floated the cursor a detached ~1-2 cm off it.
-	CHECK(tuning().margin == Catch::Approx(0.005f));
+	// Spec v3 briefly used 0.005; Amendment 2 restores the reference app's 0.03.
+	CHECK(tuning().margin == Catch::Approx(0.03f));
+	CHECK(U_CURSOR_DEPTH_DEFAULT_MARGIN == Catch::Approx(0.03f));
 }
 
 TEST_CASE("cursor_depth: HYBRID - pointer moving = SCREEN placement (on the cyclopean ray)")
