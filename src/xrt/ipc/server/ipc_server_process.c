@@ -46,6 +46,7 @@
 #include "multi/comp_multi_interface.h" // COMP_MULTI_SHARED_SURFACE
 #if defined(COMP_MULTI_SHARED_SURFACE)
 #include "multi/comp_multi_workspace.h" // #962: focused-client authority (macOS, desktop Linux)
+#include "server/ipc_server_input_queue.h" // FRAME_TICK sink
 #endif
 #endif
 
@@ -327,6 +328,9 @@ teardown_all(struct ipc_server *s)
 
 #if defined(XRT_HAVE_COMP_LINUX_WINDOW)
 	ipc_server_linux_input_uninstall();
+#endif
+#if defined(COMP_MULTI_SHARED_SURFACE)
+	comp_multi_workspace_set_frame_tick_sink(NULL, NULL);
 #endif
 
 	u_process_destroy(s->process);
@@ -658,6 +662,11 @@ init_all(struct ipc_server *s, enum u_logging_level log_level)
 	// Desktop Linux (#710): the shared surface's window input feeds the
 	// workspace input queues (the macOS AppKit pump's role).
 	ipc_server_linux_input_install(s);
+#endif
+#if defined(COMP_MULTI_SHARED_SURFACE)
+	// FRAME_TICK (macOS + desktop Linux): the shared surface's per-frame ticks
+	// reach the controller through the coalescing input queue.
+	comp_multi_workspace_set_frame_tick_sink(ipc_server_input_queue_frame_tick_sink, NULL);
 #endif
 
 	// Never fails, do this second last.

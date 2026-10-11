@@ -640,3 +640,29 @@ comp_multi_workspace_reset_controller_state(void)
 	g_focused_xc = NULL;
 	os_mutex_unlock(&g_lock);
 }
+
+static comp_multi_frame_tick_fn g_tick_fn = NULL;
+static void *g_tick_ud = NULL;
+
+void
+comp_multi_workspace_set_frame_tick_sink(comp_multi_frame_tick_fn fn, void *userdata)
+{
+	ensure_lock();
+	os_mutex_lock(&g_lock);
+	g_tick_fn = fn;
+	g_tick_ud = userdata;
+	os_mutex_unlock(&g_lock);
+}
+
+void
+comp_multi_workspace_emit_frame_tick(const struct comp_multi_frame_tick *tick)
+{
+	ensure_lock();
+	os_mutex_lock(&g_lock);
+	comp_multi_frame_tick_fn fn = g_tick_fn;
+	void *ud = g_tick_ud;
+	os_mutex_unlock(&g_lock);
+	if (fn != NULL && tick != NULL) {
+		fn(ud, tick);
+	}
+}

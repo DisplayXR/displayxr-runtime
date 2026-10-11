@@ -5257,6 +5257,18 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 	if (msc->shared_dp != NULL) {
 		(void)xrt_display_processor_get_predicted_eye_positions(msc->shared_dp, &eye_pos);
 	}
+	// FRAME_TICK viewer (the DP's own eyes, before the nominal fallback below):
+	// same rule as the Windows service — held across a short dropout, invalid
+	// after ~30 frames so the controller sees "tracking lost", not a frozen eye.
+	if (eye_pos.valid && eye_pos.count >= 2) {
+		msc->shared_tick_viewer[0] = 0.5f * (eye_pos.eyes[0].x + eye_pos.eyes[1].x);
+		msc->shared_tick_viewer[1] = 0.5f * (eye_pos.eyes[0].y + eye_pos.eyes[1].y);
+		msc->shared_tick_viewer[2] = 0.5f * (eye_pos.eyes[0].z + eye_pos.eyes[1].z);
+		msc->shared_tick_viewer_valid = true;
+		msc->shared_tick_viewer_fail_count = 0;
+	} else if (msc->shared_tick_viewer_valid && ++msc->shared_tick_viewer_fail_count >= 30) {
+		msc->shared_tick_viewer_valid = false;
+	}
 	if (!eye_pos.valid || eye_pos.count < 2) {
 		float nom_y = (msc->base.info.nominal_viewer_y_m != 0.0f) ? msc->base.info.nominal_viewer_y_m : 0.0f;
 		float nom_z = (msc->base.info.nominal_viewer_z_m > 0.0f) ? msc->base.info.nominal_viewer_z_m : 0.6f;
@@ -5785,6 +5797,22 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 	msc->shared_fenced_buffer = -1;
 
 	ret = comp_target_present(ct, vk->main_queue->queue, buffer_index, 0, display_time_ns, 0);
+
+	// One FRAME_TICK per rendered frame for the controller (coalesced by the
+	// IPC queue): it paces its per-frame work on these and casts its hit-test
+	// ray from the tracked viewer they carry.
+	if (msc->workspace_active) {
+		struct comp_multi_frame_tick tick = {
+		    .timestamp_ns = (uint64_t)os_monotonic_get_ns(),
+		    .viewer_x = msc->shared_tick_viewer[0],
+		    .viewer_y = msc->shared_tick_viewer[1],
+		    .viewer_z = msc->shared_tick_viewer[2],
+		    .viewer_valid = msc->shared_tick_viewer_valid,
+		};
+		comp_multi_workspace_get_pointer_px(&tick.cursor_x, &tick.cursor_y);
+		comp_multi_workspace_emit_frame_tick(&tick);
+	}
+
 	if (ret == VK_ERROR_OUT_OF_DATE_KHR || ret == VK_ERROR_SURFACE_LOST_KHR) {
 		U_LOG_W("[#59] shared present %s", vk_result_string(ret));
 	} else if (ret != VK_SUCCESS && ret != VK_SUBOPTIMAL_KHR) {

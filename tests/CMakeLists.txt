@@ -931,3 +931,21 @@ if(WIN32 AND TARGET aux_os_uvc)
 	target_link_libraries(tests_uvc_capture_mf PRIVATE xrt-external-catch2 aux_util aux_os aux_os_uvc)
 	add_test(NAME tests_uvc_capture_mf COMMAND tests_uvc_capture_mf --success --allow-running-no-tests)
 endif()
+
+# Shared-surface FRAME_TICK coalescing into the controller's input queue
+# (macOS + desktop Linux; the queue is pthread-based, so POSIX only). Compiles
+# the queue and the comp_multi workspace registry straight into the unit.
+if(NOT WIN32 AND NOT ANDROID)
+	add_executable(
+		tests_ipc_input_queue_frame_tick
+		tests_ipc_input_queue_frame_tick.cpp
+		${PROJECT_SOURCE_DIR}/src/xrt/ipc/server/ipc_server_input_queue.c
+		${PROJECT_SOURCE_DIR}/src/xrt/compositor/multi/comp_multi_workspace.c
+		)
+	target_include_directories(
+		tests_ipc_input_queue_frame_tick PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/ipc
+							 ${PROJECT_SOURCE_DIR}/src/xrt/compositor
+		)
+	target_link_libraries(tests_ipc_input_queue_frame_tick PRIVATE xrt-external-catch2 aux_util aux_os)
+	add_test(NAME tests_ipc_input_queue_frame_tick COMMAND tests_ipc_input_queue_frame_tick --success)
+endif()
