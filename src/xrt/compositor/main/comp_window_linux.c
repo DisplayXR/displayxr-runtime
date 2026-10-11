@@ -433,6 +433,17 @@ is_autorepeat_pair(const struct comp_window_linux *cwl, xcb_generic_event_t *rel
 	return down && r->detail == p->detail && r->time == p->time;
 }
 
+//! Emit with this window's surface size attached (see comp_window_linux_input).
+static void
+x11_emit(struct comp_window_linux *cwl, struct comp_window_linux_input *in)
+{
+	pthread_mutex_lock(&cwl->lock);
+	in->surface_w = cwl->width;
+	in->surface_h = cwl->height;
+	pthread_mutex_unlock(&cwl->lock);
+	comp_window_linux_emit_input(in);
+}
+
 static void
 set_last_pointer(struct comp_window_linux *cwl, int32_t x, int32_t y)
 {
@@ -458,7 +469,7 @@ handle_event(struct comp_window_linux *cwl,
 	// Anything but motion flushes the coalesced motion first, so ordering
 	// (move-then-click) is preserved.
 	if (type != XCB_MOTION_NOTIFY && *have_pending_motion) {
-		comp_window_linux_emit_input(pending_motion);
+		x11_emit(cwl, pending_motion);
 		*have_pending_motion = false;
 	}
 
@@ -488,7 +499,7 @@ handle_event(struct comp_window_linux *cwl,
 		if (down && debug_get_bool_option_linux_win_key_debug()) {
 			U_LOG_W("[key] keysym=0x%04x vk=0x%02x mods=0x%x", in.keysym, in.vk_code, in.modifiers);
 		}
-		comp_window_linux_emit_input(&in);
+		x11_emit(cwl, &in);
 		return;
 	}
 	case XCB_BUTTON_PRESS:
@@ -507,7 +518,7 @@ handle_event(struct comp_window_linux *cwl,
 			}
 			in.type = COMP_WINDOW_LINUX_INPUT_SCROLL;
 			in.scroll_delta = b->detail == 4 ? 1.0f : -1.0f;
-			comp_window_linux_emit_input(&in);
+			x11_emit(cwl, &in);
 			return;
 		}
 		uint32_t button = 0;
@@ -520,7 +531,7 @@ handle_event(struct comp_window_linux *cwl,
 		in.type = COMP_WINDOW_LINUX_INPUT_BUTTON;
 		in.button = button;
 		in.is_down = down;
-		comp_window_linux_emit_input(&in);
+		x11_emit(cwl, &in);
 		return;
 	}
 	case XCB_MOTION_NOTIFY: {
@@ -542,7 +553,7 @@ handle_event(struct comp_window_linux *cwl,
 		}
 		memset(cwl->keys_down, 0, sizeof(cwl->keys_down));
 		in.type = COMP_WINDOW_LINUX_INPUT_FOCUS_LOST;
-		comp_window_linux_emit_input(&in);
+		x11_emit(cwl, &in);
 		return;
 	}
 	case XCB_CONFIGURE_NOTIFY: {
@@ -609,7 +620,7 @@ drain_events(struct comp_window_linux *cwl)
 		free(event);
 	}
 	if (have_pending_motion) {
-		comp_window_linux_emit_input(&pending_motion);
+		x11_emit(cwl, &pending_motion);
 	}
 }
 
