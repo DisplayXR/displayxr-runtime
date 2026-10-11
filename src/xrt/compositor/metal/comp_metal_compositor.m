@@ -4196,13 +4196,6 @@ metal_cursor_draw(struct comp_metal_compositor *c,
 	}
 	const float height = size_m / canvas_h_m; // sprite height, in units
 
-	if (!c->cursor_draw.announced) {
-		c->cursor_draw.announced = true;
-		U_LOG_W("cursor_draw: Metal compositor drawing the cursor (%s, %.1f mm tall, %u views; ADR-046 "
-		        "Amendment 2 B, one-time notice)",
-		        req->image != NULL ? "app sprite" : "default look", size_m * 1000.0f, req->view_count);
-	}
-
 	[encoder setRenderPipelineState:c->cursor_draw.pipe[premul ? 1 : 0][compose_linear ? 1 : 0]];
 	[encoder setDepthStencilState:c->depth_stencil_state_disabled];
 	[encoder setFragmentTexture:src atIndex:0];
@@ -4210,6 +4203,14 @@ metal_cursor_draw(struct comp_metal_compositor *c,
 
 	const uint32_t tiles = atlas_cols * atlas_rows;
 	const uint32_t n = req->view_count < tiles ? req->view_count : tiles;
+	if (!c->cursor_draw.announced) {
+		c->cursor_draw.announced = true;
+		// The views actually drawn (= atlas tiles in use), not the locate's
+		// view count: a 2-view app on a 4-view-capable display draws 2.
+		U_LOG_W("cursor_draw: Metal compositor drawing the cursor (%s, %.1f mm tall, %u view(s); ADR-046 "
+		        "Amendment 2 B, one-time notice)",
+		        req->image != NULL ? "app sprite" : "default look", size_m * 1000.0f, n);
+	}
 	const uint32_t att_w = (uint32_t)c->atlas_texture.width;
 	const uint32_t att_h = (uint32_t)c->atlas_texture.height;
 	for (uint32_t i = 0; i < n; i++) {

@@ -66,10 +66,11 @@ view_ray(const struct u_cursor_depth_view *view, float u, float v)
 void
 u_cursor_depth_tuning_defaults(struct u_cursor_depth_tuning *t)
 {
-	// 3% of the baseline: about 2 mm of crossed on-screen disparity at a 65 mm
-	// IPD - reads as in front without looking detached. Spec v3 briefly used
-	// 0.005; ADR-046 Amendment 2 A.2 restores 0.03, the value the reference
-	// app (cube_handle_metal_macos) has shown since Phase 1.
+	// 1.5% of the baseline: about 1 mm of crossed on-screen disparity at a
+	// 63-65 mm IPD - reads as in front without looking detached. Spec v3
+	// briefly used 0.005; ADR-046 Amendment 2 A.2 set 0.03, halved to 0.015
+	// on 2026-10-11 after the Windows Leia panel check (0.03 floated visibly
+	// off the content).
 	t->margin = U_CURSOR_DEPTH_DEFAULT_MARGIN;
 	// d = -0.6 is t = 0.625: the cursor may come ~3/8 of the way to the eye.
 	t->min_disparity = -0.6f;

@@ -22,7 +22,7 @@
  *    Disparity, not distance, is what the eye compares, so margins, clamps
  *    and slew rates are expressed there;
  *  - ONE POLICY (ADR-046 Amendment 2 A): the cursor is never behind the
- *    glass. target = d < 0 ? max(d - margin, d_min) : 0, margin 0.03, and
+ *    glass. target = d < 0 ? max(d - margin, d_min) : 0, margin 0.015, and
  *    nothing is drawn (the OS cursor is the cursor) while the filtered
  *    disparity is above the draw threshold, -0.005
  *    (u_cursor_depth_should_draw). The filter keeps stepping while nothing
@@ -66,8 +66,14 @@ extern "C" {
 //! Default sprite height, as a fraction of the canvas height.
 #define U_CURSOR_DEPTH_DEFAULT_HEIGHT 0.03f
 
-//! Default margin in front of content, eye-baseline units (Amendment 2 A.2).
-#define U_CURSOR_DEPTH_DEFAULT_MARGIN 0.03f
+/*!
+ * Default margin in front of content, eye-baseline units (Amendment 2 A.2):
+ * about 1 mm of crossed on-screen disparity at a 63-65 mm IPD. The single
+ * source for every runtime cursor path (in-process draw, zones, lifted video).
+ * Halved from 0.03 on 2026-10-11 after the Windows Leia panel check: 0.03
+ * floated visibly off the content.
+ */
+#define U_CURSOR_DEPTH_DEFAULT_MARGIN 0.015f
 
 /*!
  * Default draw threshold, eye-baseline units (Amendment 2 A.3): a sprite is

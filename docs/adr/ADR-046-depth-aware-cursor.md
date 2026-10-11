@@ -121,7 +121,7 @@ The eye compares disparities, so the margin, clamp and slew rates are expressed 
 
 | Parameter | Default | Why |
 |---|---|---|
-| margin in front of content | 0.03 | about 2 mm crossed on screen at 65 mm IPD: reads as in front without looking detached. Spec v3 briefly lowered it to 0.005 after a head-tracked-panel test; Amendment 2 A.2 restores 0.03. Apps can override it (`XrCursorDepthOptionsDXR::margin`) |
+| margin in front of content | 0.015 | about 1 mm crossed on screen at 63–65 mm IPD: reads as in front without looking detached. Spec v3 briefly lowered it to 0.005 after a head-tracked-panel test; Amendment 2 A.2 restored 0.03, then halved it to 0.015 (2026-10-11). Apps can override it (`XrCursorDepthOptionsDXR::margin`) |
 | clamp | [−0.6, +0.6] — **superseded by Amendment 2: [−0.6, 0], never behind the glass** | t ≥ 0.625: never more than about 3/8 of the way to the eye |
 | rise time constant | 30 ms | never lag behind content that comes forward, or the violation is visible |
 | sink time constant | 250 ms | no flicker when the footprint crosses an edge |
@@ -489,9 +489,11 @@ implementation that the others call.
    `[−0.6, +0.6]` clamp with `[−0.6, 0]`. Rationale: a cursor behind the glass sits behind the
    page, the window chrome and the desktop, which recreates the depth conflict it exists to
    remove.
-2. **Margin 0.03 eye baselines**, about 2 mm of crossed on-screen disparity at a 65 mm IPD.
-   This is the value the reference app (`cube_handle_metal_macos`) has shown since Phase 1.
-   Implementations expose it as a `margin` option and keep 0.03 as the default.
+2. **Margin 0.015 eye baselines**, about 1 mm of crossed on-screen disparity at a 63–65 mm IPD.
+   Implementations expose it as a `margin` option and keep 0.015 as the default.
+   *Halved 2026-10-11 after the Windows Leia panel check: 0.03 floated visibly off the content.*
+   (As first written, A.2 was 0.03, about 2 mm, the value the reference app
+   `cube_handle_metal_macos` had shown since Phase 1.)
 3. **On the plane, it is the OS cursor.** Nothing is drawn while the filtered disparity is above
    the **draw threshold**, −0.005 baselines (about 0.3 mm on screen) and never less than 0.5 px
    on the panel. While nothing is drawn, the OS cursor is the cursor, untouched. The drawn
@@ -562,7 +564,7 @@ sprite and the depth, and the runtime owns the drawing. Apps get the same contra
 #### §A as built in the runtime (#1847, `XR_DXR_cursor_depth` spec v4)
 
 - `u_cursor_depth_target()` is A.1 verbatim; the upper clamp is 0 whatever the tuning says
-  (`max_disparity` defaults to 0 and a value > 0 is treated as 0). Margin default 0.03 (A.2),
+  (`max_disparity` defaults to 0 and a value > 0 is treated as 0). Margin default 0.015 (A.2; 0.03 until 2026-10-11),
   still overridable through `XrCursorDepthOptionsDXR::margin`.
 - A.3 is `u_cursor_depth_should_draw()` (threshold −0.005). The state tracker reports it as
   `XrCursorDepthPlacementDXR::isActive`, whose meaning was already "draw nothing, show the OS

@@ -469,11 +469,19 @@ head(xrt_vec3 h, float u, float v)
 
 } // namespace
 
-TEST_CASE("cursor_depth: margin default is 0.03 (Amendment 2 A.2)")
+TEST_CASE("cursor_depth: margin default is 0.015 (Amendment 2 A.2)")
 {
-	// Spec v3 briefly used 0.005; Amendment 2 restores the reference app's 0.03.
-	CHECK(tuning().margin == Catch::Approx(0.03f));
-	CHECK(U_CURSOR_DEPTH_DEFAULT_MARGIN == Catch::Approx(0.03f));
+	// Spec v3 briefly used 0.005; Amendment 2 set 0.03, halved to 0.015 on
+	// 2026-10-11 after the Windows Leia panel check (0.03 floated visibly off
+	// the content). ~1 mm of crossed on-screen disparity at a 63-65 mm IPD.
+	CHECK(tuning().margin == Catch::Approx(0.015f));
+	CHECK(U_CURSOR_DEPTH_DEFAULT_MARGIN == Catch::Approx(0.015f));
+
+	// The behaviour, not just the constant: content at d = -0.2 puts the
+	// default-tuned cursor at -0.215 (it was -0.23 with 0.03).
+	const auto t = tuning();
+	CHECK(u_cursor_depth_target(&t, true, -0.2f) == Catch::Approx(-0.215f).margin(1e-6f));
+	CHECK(0.015f * 64.0f == Catch::Approx(0.96f)); // ~1 mm at a 64 mm IPD
 }
 
 TEST_CASE("cursor_depth: HYBRID - pointer moving = SCREEN placement (on the cyclopean ray)")
