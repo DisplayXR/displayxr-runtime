@@ -84,7 +84,8 @@ never locates views receives no events (it also has no use for them).
 On a multi-screen rig every screen has its own DP and its own tracker (ADR-047), and a window
 can present through several of them at once: the session's own DP plus a segment DP per other
 screen it spans (in-process and the service's direct pipeline), the secondary workspace
-presenters its tile touches (ADR-052), or the per-screen segment DPs of a present-owner's weave
+presenters of its workspace (ADR-052; every one, not only those its tile touches — a viewer
+seen by any panel keeps every tile tracked), or the per-screen segment DPs of a present-owner's weave
 (`XR_DXR_weave`, Amendment 4). Per-screen **eyes** stay per screen: each segment's views come
 from its own screen's DP, as before. The session-level **boolean** is the OR over every DP
 presenting for the session:
@@ -114,6 +115,9 @@ The workspace controller's FRAME_TICK viewer follows the same rule: when the pri
 nobody but a secondary presenter's DP does, the published viewer is that presenter's, mapped into
 the primary's display space through the workspace's desktop-pixel layout (`comp_ws_map_pose`:
 x/y by each screen's pixel pitch, z unchanged — the screens are treated as coplanar, ADR-052 D2).
+It switches to a secondary only after that screen has been the only one seeing a viewer for
+100 ms (`U_TRACKING_SOURCE_DWELL_NS`), so a presence edge that reaches the DPs a frame apart does
+not flip it for a frame; the primary wins back at once.
 
 Per-screen views are unaffected: the per-view raw block (`XR_DXR_view_rig`) and
 `XrWeaveOutputRectPartsDXR` keep each screen's own `isTracking`. The vendor's MANAGED 2D/3D

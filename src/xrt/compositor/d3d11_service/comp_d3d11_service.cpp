@@ -4417,6 +4417,10 @@ struct d3d11_multi_compositor
 	//! publishes when the primary sees nobody (0 = the primary's own). Render
 	//! thread only; change-only log latch.
 	uint64_t frame_tick_viewer_screen;
+	//! ...picked through a dwell (util/u_tracking_any.h), so a presence
+	//! transition the screens share, which reaches the DPs a frame apart,
+	//! never flips the published viewer for one frame. Render thread only.
+	struct u_tracking_source frame_tick_viewer_src;
 
 	//! Window dismissed by user (ESC).
 	bool window_dismissed;
@@ -19336,33 +19340,57 @@ multi_compositor_render_frame(struct d3d11_service_system *sys,
 			float vx = 0.5f * (pe.eyes[0].x + pe.eyes[1].x);
 			float vy = 0.5f * (pe.eyes[0].y + pe.eyes[1].y);
 			float vz = 0.5f * (pe.eyes[0].z + pe.eyes[1].z);
-			uint64_t from_screen = 0;
-			if (!u_tracking_dp_viewer_present(&pe)) {
-				const struct comp_ws_screen *prim = &mc->ws_primary;
-				for (uint32_t i = 0; i < mc->ws_presenter_count && i < COMP_WS_MAX_SCREENS; i++) {
-					struct svc_ws_presenter *p = mc->ws_presenters[i];
-					struct xrt_eye_positions se;
-					memset(&se, 0, sizeof(se));
-					if (p == nullptr || p->dp == nullptr ||
-					    !xrt_display_processor_d3d11_get_predicted_eye_positions(p->dp, &se) ||
-					    !u_tracking_dp_viewer_present(&se) || se.count < 2) {
-						continue;
-					}
-					struct xrt_pose in = {};
-					in.orientation.w = 1.0f;
-					in.position.x = 0.5f * (se.eyes[0].x + se.eyes[1].x);
-					in.position.y = 0.5f * (se.eyes[0].y + se.eyes[1].y);
-					in.position.z = 0.5f * (se.eyes[0].z + se.eyes[1].z);
-					struct xrt_pose mapped = in;
-					float mw = 0.0f, mh = 0.0f;
-					if (comp_ws_map_pose(&p->screen, prim, &in, 1.0f, 1.0f, &mapped, &mw, &mh)) {
-						vx = mapped.position.x;
-						vy = mapped.position.y;
-						vz = mapped.position.z;
-						from_screen = p->screen_id;
-						break;
+			// Which screen's viewer: the primary whenever it sees one; else a
+			// secondary that has been the only one seeing a viewer for the
+			// dwell (u_tracking_source_update). The chosen secondary is
+			// asked first so the choice does not hop.
+			const bool primary_present = u_tracking_dp_viewer_present(&pe);
+			const struct comp_ws_screen *prim = &mc->ws_primary;
+			uint64_t candidate = 0;
+			struct xrt_pose cand_mapped = {};
+			if (!primary_present) {
+				const uint64_t prev = mc->frame_tick_viewer_src.chosen != 0
+				                          ? mc->frame_tick_viewer_src.chosen
+				                          : mc->frame_tick_viewer_src.pending;
+				for (int pass = 0; pass < 2 && candidate == 0; pass++) {
+					for (uint32_t i = 0; i < mc->ws_presenter_count && i < COMP_WS_MAX_SCREENS; i++) {
+						struct svc_ws_presenter *p = mc->ws_presenters[i];
+						if (p == nullptr || p->dp == nullptr) {
+							continue;
+						}
+						// Pass 0: only the previously chosen / pending
+						// screen. Pass 1: any.
+						if (pass == 0 && (prev == 0 || p->screen_id != prev)) {
+							continue;
+						}
+						struct xrt_eye_positions se;
+						memset(&se, 0, sizeof(se));
+						if (!xrt_display_processor_d3d11_get_predicted_eye_positions(p->dp, &se) ||
+						    !u_tracking_dp_viewer_present(&se) || se.count < 2) {
+							continue;
+						}
+						struct xrt_pose in = {};
+						in.orientation.w = 1.0f;
+						in.position.x = 0.5f * (se.eyes[0].x + se.eyes[1].x);
+						in.position.y = 0.5f * (se.eyes[0].y + se.eyes[1].y);
+						in.position.z = 0.5f * (se.eyes[0].z + se.eyes[1].z);
+						struct xrt_pose mapped = in;
+						float mw = 0.0f, mh = 0.0f;
+						if (comp_ws_map_pose(&p->screen, prim, &in, 1.0f, 1.0f, &mapped, &mw, &mh)) {
+							candidate = p->screen_id;
+							cand_mapped = mapped;
+							break;
+						}
 					}
 				}
+			}
+			const uint64_t from_screen =
+			    u_tracking_source_update(&mc->frame_tick_viewer_src, os_monotonic_get_ns(), primary_present,
+			                             candidate, U_TRACKING_SOURCE_DWELL_NS);
+			if (from_screen != 0) {
+				vx = cand_mapped.position.x;
+				vy = cand_mapped.position.y;
+				vz = cand_mapped.position.z;
 			}
 			if (from_screen != mc->frame_tick_viewer_screen) {
 				mc->frame_tick_viewer_screen = from_screen;
@@ -32798,42 +32826,47 @@ comp_d3d11_service_get_client_segment_metrics(struct xrt_system_compositor *xsys
 }
 
 /*!
- * ADR-047 Amendment 7: the distinct other screens whose DP answered, and the
- * first that sees a viewer. Each screen counts once however many sources
- * name it (a workspace presenter and a segment DP on the same screen).
+ * ADR-047 Amendment 7: note screen @p screen_id's DP answer @p eyes into @p t
+ * (util/u_tracking_any.h: each screen counts once).
  */
-struct svc_other_tracking
-{
-	uint64_t seen[XRT_MAX_SEGMENTS + COMP_WS_MAX_SCREENS];
-	uint32_t count;
-	uint64_t tracked_screen;
-};
-
 static void
-svc_other_tracking_note(struct svc_other_tracking *t, uint64_t screen_id, const struct xrt_eye_positions *eyes)
+svc_other_tracking_note(struct u_tracking_others *t, uint64_t screen_id, const struct xrt_eye_positions *eyes)
 {
-	if (screen_id == 0) {
+	u_tracking_others_note(t, screen_id, u_tracking_dp_viewer_present(eyes));
+}
+
+/*!
+ * ADR-047 Amendment 7: note every secondary workspace presenter's DP. The
+ * presenter ids are copied under ws_presenters_lock, then each DP is asked
+ * through svc_ws_presenter_own_eyes (which re-finds it under the lock).
+ */
+static void
+svc_other_tracking_ws_presenters(struct d3d11_multi_compositor *mc, struct u_tracking_others *t)
+{
+	if (mc == nullptr) {
 		return;
 	}
-	bool known = false;
-	for (uint32_t i = 0; i < t->count; i++) {
-		known |= t->seen[i] == screen_id;
-	}
-	if (!known) {
-		if (t->count >= sizeof(t->seen) / sizeof(t->seen[0])) {
-			return;
+	uint64_t ids[COMP_WS_MAX_SCREENS] = {0};
+	uint32_t n = 0;
+	AcquireSRWLockExclusive(&mc->ws_presenters_lock);
+	for (uint32_t i = 0; i < mc->ws_presenter_count && i < COMP_WS_MAX_SCREENS; i++) {
+		if (mc->ws_presenters[i] != nullptr) {
+			ids[n++] = mc->ws_presenters[i]->screen_id;
 		}
-		t->seen[t->count++] = screen_id;
 	}
-	if (t->tracked_screen == 0 && u_tracking_dp_viewer_present(eyes)) {
-		t->tracked_screen = screen_id;
+	ReleaseSRWLockExclusive(&mc->ws_presenters_lock);
+	for (uint32_t i = 0; i < n; i++) {
+		struct xrt_eye_positions eyes;
+		if (svc_ws_presenter_own_eyes(mc, ids[i], &eyes)) {
+			svc_other_tracking_note(t, ids[i], &eyes);
+		}
 	}
 }
 
 //! A client's direct-pipeline and present-owner segment DPs off the primary.
 //! Caller holds clients_mutex, or is @p c's own IPC thread.
 static void
-svc_other_tracking_client_segments(struct d3d11_service_compositor *c, int64_t now_ns, struct svc_other_tracking *t)
+svc_other_tracking_client_segments(struct d3d11_service_compositor *c, int64_t now_ns, struct u_tracking_others *t)
 {
 	std::lock_guard<std::mutex> lk(c->seg_mutex); // leaf (clients_mutex -> seg_mutex is the existing order)
 	// The direct pipeline: segment DPs predicted now (comp_d3d11_segments_get_eyes
@@ -32882,51 +32915,32 @@ comp_d3d11_service_get_other_screens_tracking(struct xrt_system_compositor *xsys
 	}
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
 	const int64_t now_ns = (int64_t)os_monotonic_get_ns();
-	struct svc_other_tracking t;
+	struct u_tracking_others t;
 	memset(&t, 0, sizeof(t));
 
 	if (xc != nullptr) {
 		struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
-		// A placed tile of a multi-presenter workspace: the secondary
-		// presenters its footprint touches (a tile wholly on a secondary
-		// screen included — it then presents ONLY there).
+		// A placed tile of a multi-presenter workspace: EVERY secondary
+		// presenter, not only those its footprint touches. The workspace is
+		// one experience across its screens — a viewer seen by any of its
+		// panels keeps every tile tracked (David, two-panel rig 2026-10-11:
+		// a tile on the laptop panel dropped to untracked the moment the
+		// laptop camera was blocked, with his face in front of the DS1).
+		// Eyes are untouched: a tile's views stay its own screen's.
 		struct comp_ws_screen_set set;
 		struct comp_ws_view_framing f;
 		struct xrt_pose pose = {};
 		float w_m = 0.0f, h_m = 0.0f;
 		if (svc_ws_client_framing(sys, c, &set, &pose, &w_m, &h_m, &f)) {
-			for (uint32_t k = 0; k < f.part_count && k < COMP_SEGMENTS_MAX; k++) {
-				if (f.parts[k].is_primary) {
-					continue;
-				}
-				struct xrt_eye_positions eyes;
-				if (svc_ws_presenter_own_eyes(sys->multi_comp, f.parts[k].screen_id, &eyes)) {
-					svc_other_tracking_note(&t, f.parts[k].screen_id, &eyes);
-				}
-			}
+			svc_other_tracking_ws_presenters(sys->multi_comp, &t);
 		}
 		// Its own direct / present-owner segments. Lifetime: the caller is
 		// this client's own IPC thread, so @p c is alive.
 		svc_other_tracking_client_segments(c, now_ns, &t);
 	} else {
 		// Every secondary workspace presenter...
-		struct d3d11_multi_compositor *mc = sys->multi_comp;
-		if (mc != nullptr && sys->workspace_mode) {
-			uint64_t ids[COMP_WS_MAX_SCREENS] = {0};
-			uint32_t n = 0;
-			AcquireSRWLockExclusive(&mc->ws_presenters_lock);
-			for (uint32_t i = 0; i < mc->ws_presenter_count && i < COMP_WS_MAX_SCREENS; i++) {
-				if (mc->ws_presenters[i] != nullptr) {
-					ids[n++] = mc->ws_presenters[i]->screen_id;
-				}
-			}
-			ReleaseSRWLockExclusive(&mc->ws_presenters_lock);
-			for (uint32_t i = 0; i < n; i++) {
-				struct xrt_eye_positions eyes;
-				if (svc_ws_presenter_own_eyes(mc, ids[i], &eyes)) {
-					svc_other_tracking_note(&t, ids[i], &eyes);
-				}
-			}
+		if (sys->workspace_mode) {
+			svc_other_tracking_ws_presenters(sys->multi_comp, &t);
 		}
 		// ...and every client's live segment DPs. A compositor found in
 		// all_clients under clients_mutex stays whole (destroy leaves the

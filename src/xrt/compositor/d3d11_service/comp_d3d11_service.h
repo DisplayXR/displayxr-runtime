@@ -398,8 +398,10 @@ comp_d3d11_service_get_client_segment_metrics(struct xrt_system_compositor *xsys
  *
  * Counted: the direct pipeline's live segment DPs (table fresh within the
  * publish window), the present-owner weave's segment DPs (eyes as its last
- * submit predicted them), and the secondary workspace presenters a placed
- * tile's footprint touches. Each screen counts once. With @p xc NULL (a
+ * submit predicted them), and, for a placed tile of a multi-presenter
+ * workspace, EVERY secondary workspace presenter (not only those its
+ * footprint touches: a viewer seen by any panel keeps every tile tracked).
+ * Each screen counts once. With @p xc NULL (a
  * compositor-less session, the system status) every one of those across the
  * service, plus every secondary workspace presenter.
  *
