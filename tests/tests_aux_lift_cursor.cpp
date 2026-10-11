@@ -133,6 +133,23 @@ TEST_CASE("lift cursor: N views spread in order, centred on the cursor", "[lift_
 	CHECK((xy[0] + xy[6]) * 0.5f == Approx(0.0f).margin(1e-7f));
 }
 
+TEST_CASE("lift cursor: the cursor never goes behind the screen plane", "[lift_cursor]")
+{
+	struct u_cursor_depth_tuning t;
+	u_cursor_depth_tuning_defaults(&t);
+	// Out of the screen: in front of the content by the margin.
+	CHECK(u_lift_cursor_pop_target(&t, true, -0.10f) == Approx(-0.10f - t.margin));
+	// Far out: held at the comfort clamp.
+	CHECK(u_lift_cursor_pop_target(&t, true, -5.0f) == Approx(t.min_disparity));
+	// On the plane, behind it, no content, or garbage: the plane itself.
+	CHECK(u_lift_cursor_pop_target(&t, true, 0.0f) == 0.0f);
+	CHECK(u_lift_cursor_pop_target(&t, true, 0.2f) == 0.0f);
+	CHECK(u_lift_cursor_pop_target(&t, false, -0.1f) == 0.0f);
+	CHECK(u_lift_cursor_pop_target(&t, true, NAN) == 0.0f);
+	// The plane is below the draw threshold: the OS cursor stays.
+	CHECK(-u_lift_cursor_pop_target(&t, true, 0.0f) < U_LIFT_CURSOR_DRAW_MIN_DISPARITY);
+}
+
 TEST_CASE("lift cursor: degenerate input draws nothing", "[lift_cursor]")
 {
 	float e[3] = {0.0f, 0.0f, kZ}, xy[4];

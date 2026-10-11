@@ -62,6 +62,19 @@ u_lift_cursor_nearest_z(const float *samples,
 	return any;
 }
 
+float
+u_lift_cursor_pop_target(const struct u_cursor_depth_tuning *t, bool has_content, float content_disparity)
+{
+	if (!has_content || !isfinite(content_disparity) || content_disparity >= 0.0f) {
+		return 0.0f; // nothing in front of the screen: the cursor stays on it
+	}
+	float d = content_disparity - t->margin;
+	if (d < t->min_disparity) {
+		d = t->min_disparity;
+	}
+	return d;
+}
+
 bool
 u_lift_cursor_eye_midpoint(const float *viewpoints, uint32_t count, float out_e[3])
 {

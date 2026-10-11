@@ -26527,6 +26527,7 @@ enum svc_lift_cursor_reason
 	SVC_LC_BAD_EYES,
 	SVC_LC_PROJECT_FAILED,
 	SVC_LC_NO_SPRITE,
+	SVC_LC_ON_PLANE,
 };
 
 static const char *
@@ -26545,6 +26546,7 @@ svc_lift_cursor_reason_str(int r)
 	case SVC_LC_BAD_EYES: return "not drawn: viewpoints not in front of the screen";
 	case SVC_LC_PROJECT_FAILED: return "not drawn: degenerate placement";
 	case SVC_LC_NO_SPRITE: return "not drawn: no sprite";
+	case SVC_LC_ON_PLANE: return "not drawn: nothing comes out of the screen under it (OS cursor on the plane)";
 	default: return "?";
 	}
 }
@@ -26640,8 +26642,15 @@ svc_lift_cursor_draw_impl(struct d3d11_service_system *sys,
 	u_cursor_depth_tuning_defaults(&tuning);
 	float content_d = 0.0f;
 	const bool has_content = lc->sample_has_content && u_lift_cursor_disparity_of_z(e, lc->sample_z, &content_d);
-	const float target = u_cursor_depth_target(&tuning, has_content, content_d);
+	// Never behind the screen: rise only in front of content that comes out of
+	// it. On the plane the caller's own OS cursor is the cursor (David,
+	// 2026-10-10), so nothing is drawn there.
+	const float target = u_lift_cursor_pop_target(&tuning, has_content, content_d);
 	const float d = u_cursor_depth_filter_step(&lc->filter, &tuning, target, now_ns);
+	if (d > -U_LIFT_CURSOR_DRAW_MIN_DISPARITY) {
+		*why = SVC_LC_ON_PLANE;
+		return false;
+	}
 
 	// The cursor's point on the rect, rect-centre metres (+y up).
 	const float sx = (fx - 0.5f) * pin->rect_size[0], sy = (0.5f - fy) * pin->rect_size[1];

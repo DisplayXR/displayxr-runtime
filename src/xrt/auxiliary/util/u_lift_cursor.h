@@ -36,6 +36,23 @@ extern "C" {
 #define U_LIFT_CURSOR_MAX_VIEWS 8
 
 /*!
+ * Below this much crossed disparity (eye-baseline units; ~0.3 mm on the glass
+ * at a 63 mm baseline) the cursor counts as ON the screen plane: the runtime
+ * draws nothing and the caller keeps its OS cursor.
+ */
+#define U_LIFT_CURSOR_DRAW_MIN_DISPARITY 0.005f
+
+/*!
+ * The unfiltered target disparity on lifted content. The cursor never goes
+ * BEHIND the screen plane: it rises only to stay in front of content that
+ * comes OUT of the screen (crossed disparity, < 0) — the content's disparity
+ * minus the margin, clamped at the comfort limit — and is 0 (the plane)
+ * otherwise, including over content at or behind the plane.
+ */
+float
+u_lift_cursor_pop_target(const struct u_cursor_depth_tuning *t, bool has_content, float content_disparity);
+
+/*!
  * Content height in front of the screen (metres) of one depth sample, through
  * the module's relief mapping z = relief_scale / depth + relief_offset.
  *
