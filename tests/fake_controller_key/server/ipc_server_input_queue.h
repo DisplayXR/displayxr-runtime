@@ -2,11 +2,10 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Test stand-in for the controller-key queue declaration that lives on
- *         feat/linux-workspace-compositor (src/xrt/ipc/server/
- *         ipc_server_input_queue.h). tests_service_orchestrator_linux compiles
- *         the orchestrator with SERVICE_HAVE_CONTROLLER_KEY_QUEUE against this
- *         and records the calls. Must match the real signature.
+ * @brief  Test stand-in for the controller-key queue declaration
+ *         (src/xrt/ipc/server/ipc_server_input_queue.h).
+ *         tests_service_orchestrator_linux compiles the orchestrator against
+ *         this and records the calls. Must match the real signature.
  */
 
 #pragma once
