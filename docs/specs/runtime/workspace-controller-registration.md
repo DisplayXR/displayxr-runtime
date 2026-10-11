@@ -350,9 +350,16 @@ with a controller installed, so the chord lives in the extension instead:
   `$XDG_STATE_HOME/displayxr/workspace-hotkey.json`; a running service sees the bus name
   re-appear and pushes again.
 
-Consequences: the chord goes live the first time the service runs with a controller
-registered (any DisplayXR client, the dashboard, or a `displayxr-cli workspace …` command
-starts it); the X11-only fallback works only while some client keeps the service up
+- *Controller just installed, service never ran* (bootstrap) — 5 s after it is enabled,
+  and 2 s after any change in a manifest root it watches (inotify on the roots that exist),
+  the extension lists the manifest roots above (same list, same order) and compares the
+  `*.json` set with the one recorded at the last `Configure`. A different, non-empty set
+  makes it `StartUnit` the service **once** (the last configured unit, else
+  `displayxr.service`); the service connects and pushes the combo — or `""` when it finds
+  no usable controller, which is recorded too, so an unchanged set never starts it again.
+  Cost when nothing changed: a few `readdir`s at login.
+
+Consequences: the X11-only fallback works only while some client keeps the service up
 (set `IPC_EXIT_WHEN_IDLE=0` in a `systemctl --user edit displayxr.service` drop-in to keep
 it resident on such a desktop).
 

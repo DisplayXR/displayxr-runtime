@@ -138,6 +138,60 @@ print('6. cache round trip');
         'junk and unknown versions are refused');
 }
 
+print('7. bootstrap: arm a newly installed controller without a prior service run');
+{
+    // Roots: the runtime's service_workspace_registry.c POSIX order.
+    const r = WH.controllerRoots({XRT_WORKSPACE_CONTROLLER_PATH: '/dev/a:/dev/b:', XDG_DATA_HOME: '/x',
+        HOME: '/home/u'});
+    check(JSON.stringify(r) === JSON.stringify(['/dev/a', '/dev/b', '/x/DisplayXR/WorkspaceControllers',
+        '/usr/local/share/displayxr/WorkspaceControllers', '/usr/share/displayxr/WorkspaceControllers']),
+    'roots: override list, XDG_DATA_HOME, /usr/local/share, /usr/share');
+    const r2 = WH.controllerRoots({HOME: '/home/u'});
+    check(r2[0] === '/home/u/.local/share/DisplayXR/WorkspaceControllers' && r2.length === 3,
+        'roots: ~/.local/share without XDG_DATA_HOME');
+
+    check(WH.fingerprint([]) === '' && WH.fingerprint(['/r/readme.txt']) === '', 'no *.json -> empty fingerprint');
+    const fp = WH.fingerprint(['/usr/share/displayxr/WorkspaceControllers/shell.json', '/r/x.txt']);
+    check(fp === '/usr/share/displayxr/WorkspaceControllers/shell.json', 'fingerprint keeps only manifests');
+    check(WH.fingerprint(['/b.json', '/a.json']) === WH.fingerprint(['/a.json', '/b.json', '/a.json']),
+        'fingerprint is order- and duplicate-independent');
+
+    // Fresh box: shell installed, no cache, service never ran.
+    const st = WH.create();
+    check(!WH.needBootstrap(st, ''), 'no manifests -> never starts anything');
+    check(WH.needBootstrap(st, fp), 'manifest + no cache -> start the unit');
+    check(WH.bootstrapUnit(st) === 'displayxr.service', 'default unit displayxr.service');
+    check(!WH.needBootstrap(st, fp), 'once per manifest set per shell session (idempotent)');
+
+    // The service came up and configured: recorded with the manifest set.
+    WH.configure(st, ':1.9', '<Control>space', 'displayxr-dev.service', 0, fp);
+    WH.ownerGone(st, ':1.9');
+    const after = WH.create();
+    WH.deserialize(after, WH.serialize(st));
+    check(!WH.needBootstrap(after, fp), 'next login, same set -> nothing to do');
+    const fp2 = WH.fingerprint([fp, '/home/u/.local/share/DisplayXR/WorkspaceControllers/acme.json']);
+    check(WH.needBootstrap(after, fp2), 'a newly installed controller -> start once more');
+    check(WH.bootstrapUnit(after) === 'displayxr-dev.service', 'the unit last configured is reused');
+
+    // A service that saw no usable controller pushes "": recorded, no repeat.
+    const none = WH.create();
+    WH.configure(none, ':1.10', '', 'displayxr.service', 0, fp);
+    const reload = WH.create();
+    check(WH.deserialize(reload, WH.serialize(none)) && reload.hasCache, 'a released hotkey is cached too');
+    check(!WH.needBootstrap(reload, fp), 'released for this set -> no start at every login');
+    check(WH.bootstrapUnit(reload) === 'displayxr.service', 'released cache still remembers the unit');
+
+    // A registered (running) client is never bootstrapped.
+    const live = WH.create();
+    WH.configure(live, ':1.11', '<Control>space', 'displayxr.service', 0, '');
+    check(!WH.needBootstrap(live, fp), 'client registered -> no StartUnit');
+
+    // A v13-early cache without `manifests` bootstraps once.
+    const old = WH.create();
+    WH.deserialize(old, '{"version":1,"accelerator":"<Control>space","unit":"displayxr.service"}');
+    check(WH.needBootstrap(old, fp), 'cache without a manifest record -> one start');
+}
+
 if (failed > 0) {
     print(`FAILED: ${failed} check(s)`);
     imports.system.exit(1);

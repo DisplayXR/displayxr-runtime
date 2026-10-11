@@ -273,9 +273,14 @@ systemctl --user unset-environment DISPLAYXR_DEBUG   # then log out/in again
   service uses it for the workspace-controller launch chord: it pushes the
   combo from `service.json` and its own unit (`displayxr.service`), and since
   that service is socket-activated and exits when idle, the extension is what
-  lets the chord start it. A running controller can subscribe to `Activated`
-  for its dismiss toggle (a Wayland client cannot grab a chord). Nothing is
-  grabbed until a client configures. See
+  lets the chord start it. (A running controller gets the press forwarded by
+  the service; `Activated` is informational for it.) Nothing is grabbed until
+  a client configures — but when the set of workspace-controller manifests
+  (`*/DisplayXR/WorkspaceControllers/*.json`, `/usr/share/displayxr/
+  WorkspaceControllers/*.json`, …) differs from the one recorded at the last
+  `Configure`, checked 5 s after enable and on any change in those
+  directories, the extension starts the unit once so a freshly installed
+  controller is armed without the service having run since. See
   `docs/specs/runtime/workspace-controller-registration.md` § Linux.
 
 Verify capture exclusion is live:

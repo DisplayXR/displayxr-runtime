@@ -1226,13 +1226,23 @@ registered only emits `Activated`; a press while it is gone also calls
 `org.freedesktop.systemd1.Manager.StartUnit(unit, "replace")` and is reported back
 by that client's next `Configure`. The grab is `Meta.Display.grab_accelerator`
 (mutter's own path, Wayland and X11 GNOME alike), allowed in the NORMAL and
-OVERVIEW action modes. Nothing is grabbed until a client configures. The bookkeeping
+OVERVIEW action modes. Nothing is grabbed until a client configures.
+
+**Bootstrap.** So a freshly installed workspace controller gets its chord without the
+client having run since, the extension also watches the DisplayXR workspace-controller
+manifest roots (`$XRT_WORKSPACE_CONTROLLER_PATH`, `$XDG_DATA_HOME/DisplayXR/WorkspaceControllers`,
+`/usr/local/share/displayxr/WorkspaceControllers`, `/usr/share/displayxr/WorkspaceControllers`
+— the runtime registry's order): 5 s after enable and 2 s after a change in a watched
+root, if the `*.json` set differs from the one recorded at the last `Configure` (the cache
+records it, including for a `Configure("")`), it starts the last configured unit — else
+`displayxr.service` — once per set per shell session. The bookkeeping
 is the pure `WorkspaceHotkey` object in `lib.js`, unit-tested by
 `scripts/test_gnome_extension_workspace_hotkey.js`; the consumer is
 `src/xrt/targets/service/service_hotkey_linux.c`. Contract and lifecycle:
 `workspace-controller-registration.md` § Linux.
 
-Shared-asset note (§4): the interface knows nothing about DisplayXR — it holds one
+Shared-asset note (§4): the interface itself knows nothing about DisplayXR — it holds one
 accelerator for one client and starts the unit that client named. The unit name comes
 from the client, the systemd manager is the user's own, and only a `*.service` name is
-accepted.
+accepted. The bootstrap is the one DisplayXR-specific piece (the manifest roots and the
+default unit name); it does nothing on a box without workspace-controller manifests.

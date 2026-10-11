@@ -692,7 +692,13 @@
 
         //! Per-extension state.
         create() {
-            return {accelerator: '', unit: '', owner: null, pendingUntil: 0, suspendedUntil: 0};
+            return {
+                accelerator: '', unit: '', owner: null, pendingUntil: 0, suspendedUntil: 0,
+                // Bootstrap (version 13): the manifest set recorded at the last
+                // Configure, whether a cache file was read, the set already
+                // bootstrapped for in this shell session, the last non-empty unit.
+                manifests: '', hasCache: false, bootstrappedFor: '', lastUnit: '',
+            };
         },
 
         //! "" (release) or one or more distinct modifiers then one key name.
@@ -716,11 +722,15 @@
 
         //! A client (bus unique name @p owner) configured the hotkey. Returns
         //! whether a press is pending for it (and clears it).
-        configure(st, owner, accelerator, unit, nowMs) {
+        configure(st, owner, accelerator, unit, nowMs, manifests = '') {
             const pending = st.pendingUntil > nowMs && accelerator !== '';
             st.pendingUntil = 0;
             st.accelerator = accelerator;
             st.unit = accelerator === '' ? '' : unit;
+            if (unit !== '')
+                st.lastUnit = unit;
+            st.manifests = manifests;
+            st.hasCache = true;
             st.owner = owner;
             if (accelerator === '')
                 st.suspendedUntil = 0;
@@ -769,9 +779,70 @@
             return st.accelerator !== '' && !WorkspaceHotkey.suspended(st, nowMs);
         },
 
+        /*
+         * Bootstrap (version 13): a controller installed since the last time a
+         * client configured the hotkey arms nothing until that client runs
+         * again. So the extension looks at the workspace-controller manifest
+         * roots itself — the same list, in the same order, as the runtime's
+         * service_workspace_registry.c — and when the set of manifests differs
+         * from the one recorded at the last Configure, starts the client's unit
+         * ONCE; the client comes up and configures (pushing "" when it sees no
+         * usable controller, which is recorded too, so this never repeats for
+         * an unchanged set).
+         */
+
+        //! systemd user unit started for a bootstrap when no Configure ever
+        //! named one (the DisplayXR runtime's .deb unit).
+        BOOTSTRAP_UNIT: 'displayxr.service',
+
+        //! The manifest roots for env {XRT_WORKSPACE_CONTROLLER_PATH,
+        //! XDG_DATA_HOME, HOME} — service_workspace_registry.c's POSIX order.
+        controllerRoots(env) {
+            const roots = [];
+            const add = r => {
+                if (r && !roots.includes(r))
+                    roots.push(r);
+            };
+            for (const p of (env.XRT_WORKSPACE_CONTROLLER_PATH ?? '').split(':'))
+                add(p);
+            if (env.XDG_DATA_HOME)
+                add(`${env.XDG_DATA_HOME}/DisplayXR/WorkspaceControllers`);
+            else if (env.HOME)
+                add(`${env.HOME}/.local/share/DisplayXR/WorkspaceControllers`);
+            add('/usr/local/share/displayxr/WorkspaceControllers');
+            add('/usr/share/displayxr/WorkspaceControllers');
+            return roots;
+        },
+
+        //! Canonical fingerprint of the manifests found: "root/name.json"
+        //! entries (only *.json), sorted, newline-joined; "" = none.
+        fingerprint(paths) {
+            return [...new Set(paths.filter(p => /\.json$/.test(p)))].sort().join('\n');
+        },
+
+        //! Whether to start the unit for manifest set @p current. Marks it
+        //! done for this shell session when it says yes (idempotent).
+        needBootstrap(st, current) {
+            if (current === '' || st.owner !== null || st.bootstrappedFor === current)
+                return false;
+            if (st.hasCache && st.manifests === current)
+                return false;
+            st.bootstrappedFor = current;
+            return true;
+        },
+
+        //! The unit a bootstrap starts: the last configured one, else the default.
+        bootstrapUnit(st) {
+            return st.unit !== '' ? st.unit : (st.lastUnit || WorkspaceHotkey.BOOTSTRAP_UNIT);
+        },
+
         //! The cache file: what survives the client's exit and a shell restart.
+        //! `manifests` is the controller set seen at the last Configure.
         serialize(st) {
-            return JSON.stringify({version: 1, accelerator: st.accelerator, unit: st.unit});
+            return JSON.stringify({
+                version: 1, accelerator: st.accelerator, unit: st.unit,
+                manifests: st.manifests ?? '', lastUnit: st.lastUnit ?? '',
+            });
         },
 
         //! Restore from the cache file text; anything malformed leaves @p st
@@ -788,6 +859,9 @@
                 return false;
             st.accelerator = o.accelerator;
             st.unit = o.accelerator === '' ? '' : (o.unit ?? '');
+            st.manifests = typeof o.manifests === 'string' ? o.manifests : '';
+            st.lastUnit = WorkspaceHotkey.validUnit(o.lastUnit ?? '') ? (o.lastUnit ?? '') : '';
+            st.hasCache = true;
             return true;
         },
     };
@@ -2550,9 +2624,102 @@
                 this._dbus = Gio.DBusExportedObject.wrapJSObject(HOTKEY_IFACE_XML, this);
                 this._dbus.export(Gio.DBus.session, '/org/displayxr/WorkspaceHotkey');
                 this._sync();
+
+                // Bootstrap (version 13): a controller installed since the last
+                // Configure gets its chord without waiting for the service to
+                // run for another reason. Checked a few seconds after enable
+                // (off the login critical path) and whenever a manifest root
+                // changes (inotify on the roots that exist; debounced).
+                this._monitors = [];
+                this._bootstrapTimer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT_IDLE, 5, () => {
+                    this._bootstrapTimer = 0;
+                    this._maybeBootstrap();
+                    return GLib.SOURCE_REMOVE;
+                });
+                for (const root of this._roots()) {
+                    try {
+                        const dir = Gio.File.new_for_path(root);
+                        if (dir.query_file_type(Gio.FileQueryInfoFlags.NONE, null) !== Gio.FileType.DIRECTORY)
+                            continue;
+                        const mon = dir.monitor_directory(Gio.FileMonitorFlags.NONE, null);
+                        mon.connect('changed', () => this._scheduleBootstrap());
+                        this._monitors.push(mon);
+                    } catch (e) {
+                        // An unreadable root is simply not watched.
+                    }
+                }
+            }
+
+            _roots() {
+                return WorkspaceHotkey.controllerRoots({
+                    XRT_WORKSPACE_CONTROLLER_PATH: GLib.getenv('XRT_WORKSPACE_CONTROLLER_PATH') ?? '',
+                    XDG_DATA_HOME: GLib.getenv('XDG_DATA_HOME') ?? '',
+                    HOME: GLib.get_home_dir(),
+                });
+            }
+
+            //! Fingerprint of the *.json manifests in the roots right now.
+            //! A handful of readdirs; no file is opened.
+            _scanManifests() {
+                const found = [];
+                for (const root of this._roots()) {
+                    try {
+                        const en = Gio.File.new_for_path(root).enumerate_children(
+                            'standard::name', Gio.FileQueryInfoFlags.NONE, null);
+                        let info;
+                        while ((info = en.next_file(null)) !== null)
+                            found.push(`${root}/${info.get_name()}`);
+                        en.close(null);
+                    } catch (e) {
+                        // Missing root: nothing there.
+                    }
+                }
+                return WorkspaceHotkey.fingerprint(found);
+            }
+
+            _scheduleBootstrap() {
+                if (this._bootstrapTimer)
+                    GLib.source_remove(this._bootstrapTimer);
+                this._bootstrapTimer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT_IDLE, 2, () => {
+                    this._bootstrapTimer = 0;
+                    this._maybeBootstrap();
+                    return GLib.SOURCE_REMOVE;
+                });
+            }
+
+            _maybeBootstrap() {
+                const current = this._scanManifests();
+                if (!WorkspaceHotkey.needBootstrap(this._st, current))
+                    return;
+                const unit = WorkspaceHotkey.bootstrapUnit(this._st);
+                log(`displayxr: workspace hotkey: controller manifests changed; starting ${unit} once so it ` +
+                    'can configure the launch chord');
+                this._startUnit(unit);
+            }
+
+            _startUnit(unit) {
+                Gio.DBus.session.call(
+                    'org.freedesktop.systemd1', '/org/freedesktop/systemd1',
+                    'org.freedesktop.systemd1.Manager', 'StartUnit',
+                    new GLib.Variant('(ss)', [unit, 'replace']),
+                    null, Gio.DBusCallFlags.NONE, -1, null,
+                    (conn, res) => {
+                        try {
+                            conn.call_finish(res);
+                        } catch (e) {
+                            log(`displayxr: workspace hotkey: StartUnit ${unit} failed: ${e.message}`);
+                        }
+                    });
             }
 
             destroy() {
+                if (this._bootstrapTimer) {
+                    GLib.source_remove(this._bootstrapTimer);
+                    this._bootstrapTimer = 0;
+                }
+                for (const mon of this._monitors ?? [])
+                    mon.cancel();
+                this._monitors = [];
                 this._ungrab();
                 if (this._accelSignal) {
                     global.display.disconnect(this._accelSignal);
@@ -2581,10 +2748,9 @@
 
             _saveCache() {
                 try {
-                    if (this._st.accelerator === '') {
-                        GLib.unlink(this._cachePath);
-                        return;
-                    }
+                    // A released hotkey is cached too (accelerator ""): it records
+                    // the manifest set the client answered for, so the bootstrap
+                    // does not start the client again for an unchanged set.
                     GLib.mkdir_with_parents(this._cacheDir, 0o700);
                     GLib.file_set_contents(this._cachePath, WorkspaceHotkey.serialize(this._st));
                 } catch (e) {
@@ -2637,20 +2803,8 @@
                 if (r.emit && this._dbus) {
                     this._dbus.emit_signal('Activated', new GLib.Variant('(u)', [(timestamp ?? 0) >>> 0]));
                 }
-                if (r.startUnit) {
-                    Gio.DBus.session.call(
-                        'org.freedesktop.systemd1', '/org/freedesktop/systemd1',
-                        'org.freedesktop.systemd1.Manager', 'StartUnit',
-                        new GLib.Variant('(ss)', [r.startUnit, 'replace']),
-                        null, Gio.DBusCallFlags.NONE, -1, null,
-                        (conn, res) => {
-                            try {
-                                conn.call_finish(res);
-                            } catch (e) {
-                                log(`displayxr: workspace hotkey: StartUnit ${r.startUnit} failed: ${e.message}`);
-                            }
-                        });
-                }
+                if (r.startUnit)
+                    this._startUnit(r.startUnit);
             }
 
             ConfigureAsync(params, invocation) {
@@ -2671,7 +2825,9 @@
                                 this._unwatch();
                         });
                 }
-                const pending = WorkspaceHotkey.configure(this._st, sender, accelerator, unit, Date.now());
+                // The manifest set this Configure answers for (bootstrap).
+                const pending = WorkspaceHotkey.configure(this._st, sender, accelerator, unit, Date.now(),
+                    this._scanManifests());
                 if (accelerator === '') {
                     this._unwatch();
                     this._st.owner = null;
