@@ -445,8 +445,11 @@ static struct
 	struct comp_multi_cursor_state state;
 } g_cursor;
 
-static int32_t g_pointer_x;
-static int32_t g_pointer_y;
+// Starts OUTSIDE the surface: until the platform reports the pointer over the
+// service surface, the cursor sprite is not drawn (it used to be drawn at the
+// shell origin while the pointer was on another output).
+static int32_t g_pointer_x = COMP_MULTI_POINTER_OUTSIDE;
+static int32_t g_pointer_y = COMP_MULTI_POINTER_OUTSIDE;
 
 struct overlay_entry
 {

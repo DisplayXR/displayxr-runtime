@@ -110,11 +110,12 @@ comp_window_linux_set_cursor_hidden(struct comp_target *ct, bool hidden);
  */
 enum comp_window_linux_input_type
 {
-	COMP_WINDOW_LINUX_INPUT_KEY = 0,        //!< vk_code / keysym / is_down / modifiers
-	COMP_WINDOW_LINUX_INPUT_BUTTON = 1,     //!< button / is_down / x / y / modifiers
-	COMP_WINDOW_LINUX_INPUT_MOTION = 2,     //!< x / y / button_mask / modifiers
-	COMP_WINDOW_LINUX_INPUT_SCROLL = 3,     //!< scroll_delta / x / y / modifiers
-	COMP_WINDOW_LINUX_INPUT_FOCUS_LOST = 4, //!< the surface lost keyboard focus
+	COMP_WINDOW_LINUX_INPUT_KEY = 0,           //!< vk_code / keysym / is_down / modifiers
+	COMP_WINDOW_LINUX_INPUT_BUTTON = 1,        //!< button / is_down / x / y / modifiers
+	COMP_WINDOW_LINUX_INPUT_MOTION = 2,        //!< x / y / button_mask / modifiers
+	COMP_WINDOW_LINUX_INPUT_SCROLL = 3,        //!< scroll_delta / x / y / modifiers
+	COMP_WINDOW_LINUX_INPUT_FOCUS_LOST = 4,    //!< the surface lost keyboard focus
+	COMP_WINDOW_LINUX_INPUT_POINTER_LEAVE = 5, //!< the pointer left the surface (an enter is a MOTION)
 };
 
 /*!

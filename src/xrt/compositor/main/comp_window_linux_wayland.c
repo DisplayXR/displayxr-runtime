@@ -470,7 +470,17 @@ ptr_enter(void *data, struct wl_pointer *p, uint32_t serial, struct wl_surface *
 	w->ptr_x = to_buffer_px(w, wl_fixed_to_double(sx), w->buf_w, w->dst_w);
 	w->ptr_y = to_buffer_px(w, wl_fixed_to_double(sy), w->buf_h, w->dst_h);
 	apply_cursor_locked(w);
+	// Report the entry point as motion so the workspace cursor reappears there.
+	struct comp_window_linux_input in = {0};
+	in.type = COMP_WINDOW_LINUX_INPUT_MOTION;
+	in.x = w->ptr_x;
+	in.y = w->ptr_y;
+	in.button_mask = w->button_mask;
+	in.modifiers = w->mods;
+	in.surface_w = (uint32_t)w->buf_w;
+	in.surface_h = (uint32_t)w->buf_h;
 	pthread_mutex_unlock(&w->lock);
+	comp_window_linux_emit_input(&in);
 }
 
 static void
@@ -480,6 +490,11 @@ ptr_leave(void *data, struct wl_pointer *p, uint32_t serial, struct wl_surface *
 	pthread_mutex_lock(&w->lock);
 	w->pointer_in = false;
 	pthread_mutex_unlock(&w->lock);
+	// Off the surface (e.g. onto another output): the workspace stops drawing
+	// its cursor until the next enter.
+	struct comp_window_linux_input in = {0};
+	in.type = COMP_WINDOW_LINUX_INPUT_POINTER_LEAVE;
+	comp_window_linux_emit_input(&in);
 }
 
 static void

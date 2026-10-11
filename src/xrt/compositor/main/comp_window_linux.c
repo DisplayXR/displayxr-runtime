@@ -47,7 +47,8 @@ DEBUG_GET_ONCE_BOOL_OPTION(linux_win_key_debug, "DXR_KEY_DEBUG", false)
 #define CWL_EVENT_MASK                                                                                                 \
 	(XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_KEY_PRESS | XCB_EVENT_MASK_KEY_RELEASE |                     \
 	 XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_BUTTON_RELEASE | XCB_EVENT_MASK_POINTER_MOTION |                 \
-	 XCB_EVENT_MASK_FOCUS_CHANGE | XCB_EVENT_MASK_EXPOSURE)
+	 XCB_EVENT_MASK_FOCUS_CHANGE | XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_ENTER_WINDOW |                         \
+	 XCB_EVENT_MASK_LEAVE_WINDOW)
 
 
 /*
@@ -544,6 +545,35 @@ handle_event(struct comp_window_linux *cwl,
 		pending_motion->button_mask = state_to_button_mask(m->state);
 		pending_motion->modifiers = state_to_mods(m->state);
 		*have_pending_motion = true;
+		return;
+	}
+	case XCB_ENTER_NOTIFY: {
+		// The pointer arrived on the surface: report its position as motion, so
+		// the cursor sprite reappears where it entered.
+		xcb_enter_notify_event_t *en = (xcb_enter_notify_event_t *)event;
+		if (en->detail == XCB_NOTIFY_DETAIL_INFERIOR) {
+			return;
+		}
+		set_last_pointer(cwl, en->event_x, en->event_y);
+		in.type = COMP_WINDOW_LINUX_INPUT_MOTION;
+		in.timestamp_ms = en->time;
+		in.x = en->event_x;
+		in.y = en->event_y;
+		in.button_mask = state_to_button_mask(en->state);
+		in.modifiers = state_to_mods(en->state);
+		x11_emit(cwl, &in);
+		return;
+	}
+	case XCB_LEAVE_NOTIFY: {
+		// Left for another window / output. Grab-mode crossings (a press that
+		// grabs the pointer) and moves into our own subwindows are not leaves.
+		xcb_leave_notify_event_t *lv = (xcb_leave_notify_event_t *)event;
+		if (lv->detail == XCB_NOTIFY_DETAIL_INFERIOR || lv->mode != XCB_NOTIFY_MODE_NORMAL) {
+			return;
+		}
+		in.type = COMP_WINDOW_LINUX_INPUT_POINTER_LEAVE;
+		in.timestamp_ms = lv->time;
+		x11_emit(cwl, &in);
 		return;
 	}
 	case XCB_FOCUS_OUT: {

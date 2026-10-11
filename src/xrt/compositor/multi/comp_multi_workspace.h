@@ -318,6 +318,15 @@ comp_multi_workspace_set_cursor_depth(float hit_z_m, bool over_window);
 bool
 comp_multi_workspace_get_cursor(struct xrt_swapchain **out_xsc, struct comp_multi_cursor_state *out);
 
+/*!
+ * Pointer position meaning "not over the service surface" (both coordinates).
+ * The cursor composite draws nothing for an off-surface position, and FRAME_TICK
+ * / POINTER_MOTION carry it as-is, so a controller's hit-test misses and its
+ * hover clears — the Windows service likewise reports an off-panel cursor as
+ * out-of-range panel coordinates. Also the initial value.
+ */
+#define COMP_MULTI_POINTER_OUTSIDE (-1)
+
 //! Latest pointer position in target framebuffer pixels (top-left origin). The
 //! macOS AppKit pump writes it on mouse move; the cursor composite reads it.
 void
