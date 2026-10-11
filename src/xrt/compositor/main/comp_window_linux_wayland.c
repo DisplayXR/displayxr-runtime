@@ -497,6 +497,8 @@ ptr_motion(void *data, struct wl_pointer *p, uint32_t time, wl_fixed_t sx, wl_fi
 	in.button_mask = w->button_mask;
 	in.modifiers = w->mods;
 	pthread_mutex_unlock(&w->lock);
+	in.surface_w = (uint32_t)w->buf_w;
+	in.surface_h = (uint32_t)w->buf_h;
 	comp_window_linux_emit_input(&in);
 }
 
@@ -527,6 +529,8 @@ ptr_button(void *data, struct wl_pointer *p, uint32_t serial, uint32_t time, uin
 	in.y = w->ptr_y;
 	in.modifiers = w->mods;
 	pthread_mutex_unlock(&w->lock);
+	in.surface_w = (uint32_t)w->buf_w;
+	in.surface_h = (uint32_t)w->buf_h;
 	comp_window_linux_emit_input(&in);
 }
 
@@ -542,6 +546,8 @@ emit_scroll(struct comp_window_linux_wl *w, uint32_t time, float notches)
 	in.y = w->ptr_y;
 	in.modifiers = w->mods;
 	pthread_mutex_unlock(&w->lock);
+	in.surface_w = (uint32_t)w->buf_w;
+	in.surface_h = (uint32_t)w->buf_h;
 	comp_window_linux_emit_input(&in);
 }
 
@@ -632,6 +638,8 @@ kb_leave(void *data, struct wl_keyboard *kb, uint32_t serial, struct wl_surface 
 	pthread_mutex_unlock(&w->lock);
 	struct comp_window_linux_input in = {0};
 	in.type = COMP_WINDOW_LINUX_INPUT_FOCUS_LOST;
+	in.surface_w = (uint32_t)w->buf_w;
+	in.surface_h = (uint32_t)w->buf_h;
 	comp_window_linux_emit_input(&in);
 }
 
@@ -656,6 +664,8 @@ kb_key(void *data, struct wl_keyboard *kb, uint32_t serial, uint32_t time, uint3
 	in.x = w->ptr_x;
 	in.y = w->ptr_y;
 	pthread_mutex_unlock(&w->lock);
+	in.surface_w = (uint32_t)w->buf_w;
+	in.surface_h = (uint32_t)w->buf_h;
 	comp_window_linux_emit_input(&in);
 }
 

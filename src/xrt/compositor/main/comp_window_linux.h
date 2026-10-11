@@ -139,6 +139,10 @@ struct comp_window_linux_input
 	uint32_t button_mask;  //!< MOTION: bit0 = left, bit1 = right, bit2 = middle held
 	float scroll_delta;    //!< SCROLL: wheel notches, positive = up / away from the user
 	uint32_t modifiers;    //!< bit0 = SHIFT, bit1 = CTRL, bit2 = ALT (IPC wire layout)
+	//! The surface's size in the same px as x / y (its buffer), so a consumer
+	//! working in another space (the workspace's display px, when the panel's
+	//! reported size differs from the surface) can rescale. 0 = unknown.
+	uint32_t surface_w, surface_h;
 };
 
 /*!
