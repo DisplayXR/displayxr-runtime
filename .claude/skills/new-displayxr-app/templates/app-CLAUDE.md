@@ -16,6 +16,10 @@ They are binding. The traps agents hit most:
 - **INV-4.3** — per-tile size = **window/canvas × `recommendedViewScaleX/Y`**, never display size.
 - **INV-4.6** — request an **sRGB swapchain** and store a correctly-encoded image (render linear
   with GPU sRGB-write, *or* write display-referred bytes — not both). Data textures stay linear.
+- **INV-4.10** (Vulkan) — keep **≥2 frames in flight** with **one `vkQueueSubmit` per frame**;
+  never wait the fence you just submitted, no `vkQueueWaitIdle`/`vkDeviceWaitIdle` on the frame
+  path, allocate command buffers once and reset them. Use `dxr::VkFrameRing` (displayxr-common
+  `common/vk_frame_ring.h`). A serialised submit→wait loop parks mobile GPUs at ~1/3 clock.
 - **INV-2.4** — the runtime owns the active mode; you *request* via
   `xrRequestDisplayRenderingModeDXR` and update local state only on the change **event**.
 - **INV-7.1/7.2** — capture via `xrCaptureAtlasDXR` (prefix with **no** extension); never

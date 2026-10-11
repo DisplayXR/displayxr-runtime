@@ -2,11 +2,12 @@
 name: new-displayxr-app
 description: |
   Scaffold a new DisplayXR OpenXR app from a known-good test app, wired to the authoring rules so it starts correct instead of tripping the common pitfalls. Clones the nearest cube_* reference app, parameterizes it, drops a workspace manifest + icon placeholders + a per-app CLAUDE.md, wires CMake, and runs the app linter until clean.
-  Usage: /new-displayxr-app <name> [class=handle|texture|hosted] [api=d3d11|d3d12|gl|vk|metal] [platform=win|macos]
+  Usage: /new-displayxr-app <name> [class=handle|texture|hosted] [api=d3d11|d3d12|gl|vk|metal] [platform=win|macos|linux|android]
   Examples:
     /new-displayxr-app photo_viewer class=handle api=d3d11 platform=win
     /new-displayxr-app stereo_player class=handle api=vk platform=macos
     /new-displayxr-app editor class=texture api=d3d11 platform=win
+    /new-displayxr-app tablet_viewer class=handle api=vk platform=android
 ---
 
 # new-displayxr-app — scaffold a correct DisplayXR app
@@ -30,7 +31,8 @@ Resolve these; if any is missing or ambiguous, **ask the user** (AskUserQuestion
 - **class** — `handle` (owns its window; the default and simplest) | `texture` (weaved 3D in a
   regions expressed via `XR_DXR_display_zones`; the shared texture receives the runtime's zones composite) | `hosted` (runtime creates the window).
 - **api** — `d3d11` | `d3d12` | `gl` | `vk` | `metal`.
-- **platform** — `win` | `macos`.
+- **platform** — `win` | `macos` | `linux` | `android`. Linux and Android are **Vulkan-only**
+  (`api=vk`); anything else there has no reference app — say so and ask.
 - **location** — default `test_apps/<class>/<name>_<class>_<api>_<platform>/` (in-tree; apps are
   grouped by **handoff class** folder — `handle/ hosted/ texture/ legacy/ probes/` — with `zones`
   a feature-name modifier, not a folder, so `cube_zones_*` go under `handle/` and
@@ -42,11 +44,18 @@ Target name follows the convention `cube_*`-style: `<name>_<class>_<api>_<platfo
 Pick the exact match; if none exists, pick the same **class+platform** (swap API) or same
 **class+api** (swap platform) and adapt, and tell the user which you used.
 
-| class \ target | win | macos |
-|---|---|---|
-| **handle** | d3d11 → `cube_handle_d3d11_win` · d3d12 → `cube_handle_d3d12_win` · gl → `cube_handle_gl_win` · vk → `cube_handle_vk_win` | gl → `cube_handle_gl_macos` · metal → `cube_handle_metal_macos` · vk → `cube_handle_vk_macos` |
-| **texture** | d3d11 → `cube_zones_texture_d3d11_win` · d3d12 → `cube_zones_texture_d3d12_win` | metal → `cube_zones_texture_metal_macos` |
-| **hosted** | d3d11 → `cube_hosted_d3d11_win` | metal → `cube_hosted_metal_macos` |
+| class \ target | win | macos | linux | android |
+|---|---|---|---|---|
+| **handle** | d3d11 → `cube_handle_d3d11_win` · d3d12 → `cube_handle_d3d12_win` · gl → `cube_handle_gl_win` · vk → `cube_handle_vk_win` | gl → `cube_handle_gl_macos` · metal → `cube_handle_metal_macos` · vk → `cube_handle_vk_macos` | vk → `cube_handle_vk_linux` (zones: `cube_zones_vk_linux`) | vk → `handle/cube_handle_vk_android` (zones: `zones/cube_zones_vk_android`) |
+| **texture** | d3d11 → `cube_zones_texture_d3d11_win` · d3d12 → `cube_zones_texture_d3d12_win` | metal → `cube_zones_texture_metal_macos` | — | — |
+| **hosted** | d3d11 → `cube_hosted_d3d11_win` | metal → `cube_hosted_metal_macos` | vk → `legacy/cube_hosted_legacy_vk_linux` | — |
+
+Linux and Android references sit outside the Windows/macOS class-folder aggregator: the Linux
+cubes are flat under `test_apps/` (or `legacy/`) and are built by an explicit list in
+`scripts/build_linux.sh --apps` (add the new target there); the Android cubes are Gradle modules
+(`include` + `projectDir` in the root `settings.gradle`, built with `./gradlew`), and an Android app
+must also pass the §11 pixel-exactness rules (manifest, SurfaceView, `<queries>`), which the linter
+checks from its `AndroidManifest.xml`.
 
 ## Procedure
 
@@ -124,5 +133,15 @@ Pick the exact match; if none exists, pick the same **class+platform** (swap API
   `VkPhysicalDevicePresentIdFeaturesKHR` + `PresentWaitFeaturesKHR` yourself. Watch the proc names
   — the v1 spellings (`xrGetVulkanGraphicsRequirementsKHR`) are not dispatchable under
   enable2-only, a trap that shipped twice in demo repos.
+- **Vulkan frame-submit discipline (INV-4.10):** every `vk` reference app today still submits
+  then waits (Android: per-frame command-buffer alloc + `vkQueueWaitIdle`; Windows/Linux: wait on
+  the fence just submitted; macOS: one fence, one frame in flight), and the linter WARNs on each.
+  Do **not** copy that loop into a new app. Render through `dxr::VkFrameRing`
+  (displayxr-common `common/vk_frame_ring.h`, ≥ v2.28.0): `beginFrame()` → record every tile into
+  one command buffer with `tileBarrier()` between tiles → `endFrame()` (the one submit) →
+  `xrReleaseSwapchainImage` → `xrEndFrame`; one-off uploads through `submitImmediate()`, resize /
+  teardown through `waitAll()`. On Android this is the difference between ~10 and ~30 fps (#1917).
+  Until the helper is tagged, copy the header in and note the pin to bump. The cube references are
+  converted in a follow-up — do not edit them as part of scaffolding.
 - The linter is advisory on WARNs but **blocking on ERRORs**; treat a clean linter run as the
   definition of "scaffold complete."

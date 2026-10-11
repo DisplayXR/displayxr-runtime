@@ -737,7 +737,7 @@ and `Leia CNSDK DP: alpha-gate pipeline ready`.
 
 ADPF hint sessions are **unsupported** on the Lume phone and the NP02J (Android 13, Adreno 740): `dumpsys performance_hint` reports `HAL Support: false`, so every app logs `ADPF: createSession failed` (the line now carries `APerformanceHint_getPreferredUpdateRateNanos` — `-1` confirms the HAL, `>0` would mean our arguments). Without hints the msm-adreno-tz governor parks the GPU near **220 MHz** (floor 124.8, max 680) at ~50% busy; pinning 680 MHz gave the model viewer +60% fps, while `cmd power set-fixed-performance-mode-enabled` changed nothing.
 Experiment knob, default **off** until measured: `adb shell setprop debug.dxr.sustained_perf 1` makes `MonadoView` request `Window.setSustainedPerformanceMode(true)` on the host Activity (one WARN line reports supported / applied / Activity class; service-owned overlays skip it).
-**App rule:** keep **≥2 frames in flight**. A strictly serialised submit → `vkWaitForFences` → submit loop never looks busy to the governor and runs the GPU at about a third of its max clock.
+**App rule:** keep **≥2 frames in flight**. A strictly serialised submit → `vkWaitForFences` → submit loop never looks busy to the governor and runs the GPU at about a third of its max clock. The full rule (one submit per frame, no per-frame drains or command-buffer allocation), the shared `dxr::VkFrameRing` helper and the lint check: [INV-4.10](../guides/displayxr-app-rules.md) in the app-authoring rules.
 
 ### Device not found by ADB
 
