@@ -69,6 +69,7 @@
 #include "stb_image.h"
 
 #include "color_policy.h"
+#include <vk_frame_ring.h> // dxr::VkFrameRing — INV-4.10 frame-submit discipline
 #include "vk_clear.h"
 
 // ============================================================================
@@ -881,9 +882,12 @@ struct VkRenderer {
     VkBuffer gridVertexBuffer = VK_NULL_HANDLE;
     VkDeviceMemory gridVertexMemory = VK_NULL_HANDLE;
     int gridVertexCount = 0;
-    VkCommandPool commandPool = VK_NULL_HANDLE;
-    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
-    VkFence frameFence = VK_NULL_HANDLE;
+    VkCommandPool commandPool = VK_NULL_HANDLE; // init-time uploads only
+    // INV-4.10 / #1917: N frames in flight, ONE vkQueueSubmit per frame (every
+    // zone of a frame goes into the same command buffer), never a wait on the
+    // frame just submitted. Owns the per-frame command buffers and fences
+    // (and the blocking one-off path, submitImmediate()).
+    dxr::VkFrameRing ring;
     float cubeRotation = 0.0f;
 
     // ADR-021 / INV-4.6: does this renderer emit SCENE-LINEAR? Latched once, at
@@ -1317,12 +1321,31 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
     subpass.pColorAttachments = &colorRef;
     subpass.pDepthStencilAttachment = &depthRef;
 
+    // A framebuffer set's one depth image is shared by every frame, and with
+    // several frames in flight (VkFrameRing) the previous frame's pass may
+    // still be writing it: order this pass's attachment writes after any
+    // earlier ones. The old per-frame fence wait gave this ordering implicitly.
+    VkSubpassDependency dep = {};
+    dep.srcSubpass = VK_SUBPASS_EXTERNAL;
+    dep.dstSubpass = 0;
+    dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                       VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                       VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    dep.dstStageMask = dep.srcStageMask;
+    dep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
     VkRenderPassCreateInfo rpInfo = {};
     rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
     rpInfo.attachmentCount = 2;
     rpInfo.pAttachments = attachments;
     rpInfo.subpassCount = 1;
     rpInfo.pSubpasses = &subpass;
+    rpInfo.dependencyCount = 1;
+    rpInfo.pDependencies = &dep;
     VK_CHECK(vkCreateRenderPass(device, &rpInfo, nullptr, &renderer.renderPass));
 
     // Create second render pass with LOAD instead of CLEAR (for second eye in SBS)
@@ -1610,17 +1633,13 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
     poolInfo.queueFamilyIndex = queueFamilyIndex;
     VK_CHECK(vkCreateCommandPool(device, &poolInfo, nullptr, &renderer.commandPool));
 
-    VkCommandBufferAllocateInfo allocInfo = {};
-    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    allocInfo.commandPool = renderer.commandPool;
-    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandBufferCount = 1;
-    VK_CHECK(vkAllocateCommandBuffers(device, &allocInfo, &renderer.commandBuffer));
-
-    VkFenceCreateInfo fenceInfo = {};
-    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-    VK_CHECK(vkCreateFence(device, &fenceInfo, nullptr, &renderer.frameFence));
+    // Frame ring (default 3 in flight; DXR_VK_FRAMES_IN_FLIGHT overrides).
+    // Grid / cube MVPs are push constants, so the ring owns no UBO.
+    if (!renderer.ring.init(device, physDevice, graphicsQueue, queueFamilyIndex,
+                            dxr::VkFrameRing::Config{})) {
+        LOG_ERROR("VkFrameRing init failed");
+        return false;
+    }
 
     // Load textures and create descriptor set
     {
@@ -1713,22 +1732,15 @@ struct EyeRenderParams {
 // Generalized scene render: cube + grid into any framebuffer set with an
 // explicit clear color and a per-call rotation offset (XR_DXR_display_zones:
 // each zone renders into its own swapchain with its own spin phase and
-// premultiplied background).
+// premultiplied background). RECORDS ONLY, into the ring's open frame — the
+// caller brackets every pass of a frame with ring.beginFrame()/endFrame(), so a
+// frame is one vkQueueSubmit however many zones it draws (INV-4.10).
 static void RenderSceneToFramebuffer(VkRenderer& renderer, SwapchainFramebuffers& fb,
     uint32_t imageIndex, const EyeRenderParams* eyes, int eyeCount,
     const float clearColor[4], float rotationOffset)
 {
-    VkDevice device = renderer.device;
-    vkWaitForFences(device, 1, &renderer.frameFence, VK_TRUE, UINT64_MAX);
-    vkResetFences(device, 1, &renderer.frameFence);
-
-    VkCommandBuffer cmd = renderer.commandBuffer;
-    vkResetCommandBuffer(cmd, 0);
-
-    VkCommandBufferBeginInfo beginInfo = {};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &beginInfo);
+    VkCommandBuffer cmd = renderer.ring.current();
+    if (cmd == VK_NULL_HANDLE) return;
 
     VkClearValue clearValues[2] = {};
     clearValues[0].color = VkClearColorValue{{clearColor[0], clearColor[1], clearColor[2], clearColor[3]}};
@@ -1814,13 +1826,14 @@ static void RenderSceneToFramebuffer(VkRenderer& renderer, SwapchainFramebuffers
     }
 
     vkCmdEndRenderPass(cmd);
-    vkEndCommandBuffer(cmd);
+}
 
-    VkSubmitInfo submitInfo = {};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmd;
-    vkQueueSubmit(renderer.graphicsQueue, 1, &submitInfo, renderer.frameFence);
+// ONE submit for the frame, no wait. Must precede xrReleaseSwapchainImage (the
+// runtime composes on the same queue).
+static void EndRingFrame(VkRenderer& renderer)
+{
+    VkResult r = renderer.ring.endFrame();
+    if (r != VK_SUCCESS) LOG_WARN("VkFrameRing::endFrame: vkQueueSubmit failed (%d)", (int)r);
 }
 
 static void RenderScene(VkRenderer& renderer, uint32_t imageIndex,
@@ -1835,8 +1848,10 @@ static void RenderScene(VkRenderer& renderer, uint32_t imageIndex,
     }();
     const float clearTransparent[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     const float clearOpaque[4] = {0.05f, 0.05f, 0.1f, 1.0f};
+    if (renderer.ring.beginFrame() == VK_NULL_HANDLE) return;
     RenderSceneToFramebuffer(renderer, renderer.swapchainFBs, imageIndex, eyes, eyeCount,
                              transparent_bg ? clearTransparent : clearOpaque, 0.0f);
+    EndRingFrame(renderer);
 }
 
 static void CleanupVkRenderer(VkRenderer& renderer) {
@@ -1852,7 +1867,7 @@ static void CleanupVkRenderer(VkRenderer& renderer) {
         if (fb.depthMemory) vkFreeMemory(renderer.device, fb.depthMemory, nullptr);
     }
 
-    if (renderer.frameFence) vkDestroyFence(renderer.device, renderer.frameFence, nullptr);
+    renderer.ring.destroy(); // after vkDeviceWaitIdle above; frees its pool/fences
     if (renderer.commandPool) vkDestroyCommandPool(renderer.device, renderer.commandPool, nullptr);
     if (renderer.gridVertexBuffer) vkDestroyBuffer(renderer.device, renderer.gridVertexBuffer, nullptr);
     if (renderer.gridVertexMemory) vkFreeMemory(renderer.device, renderer.gridVertexMemory, nullptr);
@@ -3000,7 +3015,7 @@ struct HudVkUploader {
     VkDevice device = VK_NULL_HANDLE;
     VkPhysicalDevice physDevice = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
-    VkCommandPool cmdPool = VK_NULL_HANDLE;
+    dxr::VkFrameRing* ring = nullptr; // uploads go through ring->submitImmediate()
     VkBuffer stagingBuffer = VK_NULL_HANDLE;
     VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
     uint8_t* stagingMapped = nullptr;
@@ -3026,13 +3041,13 @@ static bool VkFindMemoryTypeForHud(VkPhysicalDevice phys, uint32_t typeBits,
 }
 
 static bool InitializeHudVkUploader(HudVkUploader& up,
-    VkDevice device, VkPhysicalDevice phys, VkQueue queue, VkCommandPool pool,
+    VkDevice device, VkPhysicalDevice phys, VkQueue queue, dxr::VkFrameRing* ring,
     uint32_t width, uint32_t height)
 {
     up.device = device;
     up.physDevice = phys;
     up.queue = queue;
-    up.cmdPool = pool;
+    up.ring = ring;
     up.width = width;
     up.height = height;
     up.stagingSize = (VkDeviceSize)width * (VkDeviceSize)height * 4;
@@ -3086,54 +3101,38 @@ static bool UploadHudPixels(HudVkUploader& up, VkImage hudImage,
         }
     }
 
-    VkCommandBufferAllocateInfo ca = {};
-    ca.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    ca.commandPool = up.cmdPool;
-    ca.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    ca.commandBufferCount = 1;
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    if (vkAllocateCommandBuffers(up.device, &ca, &cmd) != VK_SUCCESS) return false;
+    // A HUD upload is a one-off (only when the HUD text changes — see the
+    // caller), so it takes the ring's one sanctioned blocking path: its own
+    // command buffer + fence, allocated once. The wait also keeps the single
+    // staging buffer safe to rewrite next time.
+    VkResult r = up.ring->submitImmediate([&](VkCommandBuffer cmd) {
+        VkImageMemoryBarrier b = {};
+        b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = hudImage;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        b.srcAccessMask = 0;
+        b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &b);
 
-    VkCommandBufferBeginInfo bi = {};
-    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &bi);
+        VkBufferImageCopy region = {};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {up.width, up.height, 1};
+        vkCmdCopyBufferToImage(cmd, up.stagingBuffer, hudImage,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
-    VkImageMemoryBarrier b = {};
-    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.image = hudImage;
-    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    b.srcAccessMask = 0;
-    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        0, 0, nullptr, 0, nullptr, 1, &b);
-
-    VkBufferImageCopy region = {};
-    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.imageExtent = {up.width, up.height, 1};
-    vkCmdCopyBufferToImage(cmd, up.stagingBuffer, hudImage,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-
-    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-        0, 0, nullptr, 0, nullptr, 1, &b);
-
-    vkEndCommandBuffer(cmd);
-    VkSubmitInfo si = {};
-    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cmd;
-    vkQueueSubmit(up.queue, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(up.queue);
-    vkFreeCommandBuffers(up.device, up.cmdPool, 1, &cmd);
-    return true;
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &b);
+    });
+    return r == VK_SUCCESS;
 }
 
 static bool EndFrame(AppXrSession& xr, XrTime displayTime,
@@ -3513,6 +3512,11 @@ static void RenderZonesFrame(AppXrSession& xr, VkRenderer& renderer, const XrFra
         g_zoneCursor.begin((int32_t)g_windowW, (int32_t)g_windowH, rects, rots, kNumZones);
     }
 
+    // INV-4.10: every zone's pass is recorded into ONE ring frame and submitted
+    // once; each zone swapchain is released only after that submit.
+    bool zoneAcquired[kNumZones] = {};
+    renderer.ring.beginFrame();
+
     for (uint32_t zi = 0; zi < kNumZones; zi++) {
         DisplayZone& z = g_zonesArr[zi];
 
@@ -3605,9 +3609,14 @@ static void RenderZonesFrame(AppXrSession& xr, VkRenderer& renderer, const XrFra
 
         RenderSceneToFramebuffer(renderer, g_zoneFbs[zi], imageIndex, eyes.data(), (int)n,
                                  z.clearColor, z.spinPhase);
+        zoneAcquired[zi] = true;
+    }
 
+    EndRingFrame(renderer);
+    for (uint32_t zi = 0; zi < kNumZones; zi++) {
+        if (!zoneAcquired[zi]) continue;
         XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-        xrReleaseSwapchainImage(z.swapchain, &ri);
+        xrReleaseSwapchainImage(g_zonesArr[zi].swapchain, &ri);
     }
 
     g_zoneCursor.end(); // pointer over no 3D zone: the OS cursor is the cursor
@@ -3811,6 +3820,7 @@ int main() {
     VkRenderer vkRenderer = {};
     if (!InitializeVkRenderer(vkRenderer, vkDevice, physDevice, graphicsQueue, queueFamilyIndex, colorFormat)) {
         CleanupOpenXR(xr);
+        vkRenderer.ring.destroy(); // a partial init may have created it; free before the device
         vkDestroyDevice(vkDevice, nullptr);
         vkDestroyInstance(vkInstance, nullptr);
         return 1;
@@ -3852,7 +3862,7 @@ int main() {
             }
             if (InitializeHudRenderer(hudRenderer, HUD_PIXEL_WIDTH, HUD_PIXEL_HEIGHT) &&
                 InitializeHudVkUploader(hudUploader, vkDevice, physDevice,
-                    graphicsQueue, vkRenderer.commandPool,
+                    graphicsQueue, &vkRenderer.ring,
                     HUD_PIXEL_WIDTH, HUD_PIXEL_HEIGHT)) {
                 hudReady = true;
                 LOG_INFO("HUD window-space layer ready (%ux%u, %u images, format %lld)",
@@ -4240,10 +4250,23 @@ int main() {
                 }
 
                 // Render HUD into the window-space layer swapchain (when visible).
+                // INV-4.10: re-render + upload only when the HUD text changed.
+                // Otherwise the layer keeps showing the swapchain's last
+                // released image (OpenXR composes the most recently released
+                // one), so an unchanged HUD costs no acquire, no upload and no
+                // blocking submit.
                 bool hudSubmitted = false;
                 if (hudReady && g_input.hudVisible && rendered && frameState.shouldRender) {
+                    static std::wstring s_hudUploadedKey;
+                    static bool s_hudHasImage = false;
+                    std::wstring hudKey = g_hudSessionText + L'\x1f' + g_hudModeText + L'\x1f' +
+                        g_hudPerfText + L'\x1f' + g_hudDisplayText + L'\x1f' + g_hudEyeText +
+                        L'\x1f' + g_hudCameraText + L'\x1f' + g_hudStereoText + L'\x1f' +
+                        g_hudHelpText;
                     uint32_t hudIndex = 0;
-                    if (AcquireHudSwapchainImage(hudSwapchain, hudIndex)) {
+                    if (s_hudHasImage && hudKey == s_hudUploadedKey) {
+                        hudSubmitted = true;
+                    } else if (AcquireHudSwapchainImage(hudSwapchain, hudIndex)) {
                         uint32_t rowPitch = 0;
                         const void* pixels = RenderHudAndMap(hudRenderer, &rowPitch,
                             g_hudSessionText, g_hudModeText, g_hudPerfText, g_hudDisplayText,
@@ -4251,6 +4274,8 @@ int main() {
                         if (pixels) {
                             if (UploadHudPixels(hudUploader, hudVkImages[hudIndex], pixels, rowPitch)) {
                                 hudSubmitted = true;
+                                s_hudHasImage = true;
+                                s_hudUploadedKey = std::move(hudKey);
                             }
                             UnmapHud(hudRenderer);
                         }
@@ -4407,8 +4432,8 @@ int main() {
     LOG_INFO("=== Shutting down ===");
 
     if (hudReady) {
-        // HUD uploader uses vkRenderer.commandPool — clean up before
-        // CleanupVkRenderer destroys the pool.
+        // HUD uploader submits through vkRenderer.ring — clean up before
+        // CleanupVkRenderer destroys it.
         CleanupHudVkUploader(hudUploader);
         CleanupHudRenderer(hudRenderer);
     }

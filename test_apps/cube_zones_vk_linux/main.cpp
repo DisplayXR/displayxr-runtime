@@ -45,6 +45,7 @@
 #include "dxr_weave_snap.h"
 
 #include <vulkan/vulkan.h>
+#include <vk_frame_ring.h>
 
 #define XR_USE_GRAPHICS_API_VULKAN
 #include <openxr/openxr.h>
@@ -1074,9 +1075,10 @@ struct VkRenderer {
     uint32_t fbWidth = 0;
     uint32_t fbHeight = 0;
 
-    VkCommandPool commandPool = VK_NULL_HANDLE;
-    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
-    VkFence frameFence = VK_NULL_HANDLE;
+    VkCommandPool commandPool = VK_NULL_HANDLE;  // init-time texture uploads only
+    // INV-4.10 / #1917: N frames in flight, one submit per frame, never a wait
+    // on the frame just submitted (replaces the old single cmd + frameFence).
+    dxr::VkFrameRing ring;
 
     float cubeRotation = 0.0f;
 
@@ -1290,12 +1292,32 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
         subpass.pColorAttachments = &colorRef;
         subpass.pDepthStencilAttachment = &depthRef;
 
+        // Each framebuffer set's single depth image (base + per-zone) is shared
+        // by every frame; with N frames in flight (INV-4.10) the next frame's
+        // depth clear must wait for the previous frame's depth writes (WAW),
+        // and the colour layout transition must wait for colour output.
+        VkSubpassDependency dep = {};
+        dep.srcSubpass = VK_SUBPASS_EXTERNAL;
+        dep.dstSubpass = 0;
+        dep.srcStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                           VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dep.dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                           VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dep.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        dep.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
         VkRenderPassCreateInfo rpInfo = {};
         rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
         rpInfo.attachmentCount = 2;
         rpInfo.pAttachments = attachments;
         rpInfo.subpassCount = 1;
         rpInfo.pSubpasses = &subpass;
+        rpInfo.dependencyCount = 1;
+        rpInfo.pDependencies = &dep;
 
         if (vkCreateRenderPass(device, &rpInfo, nullptr, &renderer.renderPass) != VK_SUCCESS) {
             LOG_ERROR("Failed to create render pass");
@@ -1651,7 +1673,7 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
     memcpy(data, gridVerts.data(), (size_t)gridBufSize);
     vkUnmapMemory(device, renderer.gridVertexMemory);
 
-    // Command pool + command buffer
+    // Command pool (init-time texture uploads)
     {
         VkCommandPoolCreateInfo poolInfo = {};
         poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -1662,27 +1684,13 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
             LOG_ERROR("Failed to create command pool");
             return false;
         }
-
-        VkCommandBufferAllocateInfo allocInfo = {};
-        allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        allocInfo.commandPool = renderer.commandPool;
-        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        allocInfo.commandBufferCount = 1;
-
-        if (vkAllocateCommandBuffers(device, &allocInfo, &renderer.commandBuffer) != VK_SUCCESS) {
-            LOG_ERROR("Failed to allocate command buffer");
-            return false;
-        }
     }
 
-    // Frame fence
+    // Frame ring (per-frame command buffers + fences)
     {
-        VkFenceCreateInfo fenceInfo = {};
-        fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-        fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-
-        if (vkCreateFence(device, &fenceInfo, nullptr, &renderer.frameFence) != VK_SUCCESS) {
-            LOG_ERROR("Failed to create fence");
+        dxr::VkFrameRing::Config ringCfg;  // default 3 frames in flight; push constants, no UBO
+        if (!renderer.ring.init(device, physDevice, queue, queueFamilyIndex, ringCfg)) {
+            LOG_ERROR("Failed to create frame ring");
             return false;
         }
     }
@@ -1876,19 +1884,12 @@ static void RenderScene(
     VkRenderer& renderer, uint32_t imageIndex,
     const EyeRenderParams* eyes, int eyeCount)
 {
-    VkDevice device = renderer.device;
-
-    // Wait for previous frame
-    vkWaitForFences(device, 1, &renderer.frameFence, VK_TRUE, UINT64_MAX);
-    vkResetFences(device, 1, &renderer.frameFence);
-
-    // Begin command buffer
-    VkCommandBuffer cmd = renderer.commandBuffer;
-    vkResetCommandBuffer(cmd, 0);
-    VkCommandBufferBeginInfo beginInfo = {};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &beginInfo);
+    // Waits only the slot used N frames ago (INV-4.10), resets + begins its cmd
+    VkCommandBuffer cmd = renderer.ring.beginFrame();
+    if (cmd == VK_NULL_HANDLE) {
+        LOG_ERROR("Frame ring beginFrame failed");
+        return;
+    }
 
     // Begin render pass with full SBS framebuffer
     VkClearValue clearValues[2] = {};
@@ -1994,18 +1995,14 @@ static void RenderScene(
     }
 
     vkCmdEndRenderPass(cmd);
-    vkEndCommandBuffer(cmd);
 
-    // Submit
-    VkSubmitInfo submitInfo = {};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmd;
-
-    vkQueueSubmit(renderer.graphicsQueue, 1, &submitInfo, renderer.frameFence);
-
-    // Wait for completion before returning (runtime needs the image ready)
-    vkWaitForFences(device, 1, &renderer.frameFence, VK_TRUE, UINT64_MAX);
+    // ONE submit with the slot fence, no wait. The caller releases the
+    // swapchain image after this; the runtime composes on the same queue, so
+    // this work is ordered ahead of it.
+    VkResult submitResult = renderer.ring.endFrame();
+    if (submitResult != VK_SUCCESS) {
+        LOG_ERROR("Frame submit failed: %d", (int)submitResult);
+    }
 }
 
 // XR_DXR_display_zones: generalized scene render — the same cube + grid as
@@ -2014,22 +2011,13 @@ static void RenderScene(
 // swapchain with its own spin phase and premultiplied background). Identical
 // draw path to the base RenderScene (single CLEAR pass, negative-viewport
 // Y-flip, cube then grid); only the framebuffer/clear/rotation are parameters.
+// Records into `cmd` (the frame ring's open command buffer) — every zone of a
+// frame goes into the ONE per-frame submit (INV-4.10); no submit here.
 static void RenderSceneToFramebuffer(
-    VkRenderer& renderer, SwapchainFramebuffers& fb, uint32_t imageIndex,
+    VkRenderer& renderer, VkCommandBuffer cmd, SwapchainFramebuffers& fb, uint32_t imageIndex,
     const EyeRenderParams* eyes, int eyeCount,
     const float clearColor[4], float rotationOffset)
 {
-    VkDevice device = renderer.device;
-
-    vkWaitForFences(device, 1, &renderer.frameFence, VK_TRUE, UINT64_MAX);
-    vkResetFences(device, 1, &renderer.frameFence);
-
-    VkCommandBuffer cmd = renderer.commandBuffer;
-    vkResetCommandBuffer(cmd, 0);
-    VkCommandBufferBeginInfo beginInfo = {};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &beginInfo);
 
     VkClearValue clearValues[2] = {};
     clearValues[0].color = {{clearColor[0], clearColor[1], clearColor[2], clearColor[3]}};
@@ -2124,22 +2112,12 @@ static void RenderSceneToFramebuffer(
     }
 
     vkCmdEndRenderPass(cmd);
-    vkEndCommandBuffer(cmd);
-
-    VkSubmitInfo submitInfo = {};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmd;
-    vkQueueSubmit(renderer.graphicsQueue, 1, &submitInfo, renderer.frameFence);
-
-    // Wait for completion before returning (runtime needs the image ready
-    // before we release it to the compositor) — matches the base RenderScene.
-    vkWaitForFences(device, 1, &renderer.frameFence, VK_TRUE, UINT64_MAX);
 }
 
 static void CleanupVkRenderer(VkRenderer& renderer) {
     if (!renderer.device) return;
 
+    renderer.ring.waitAll();
     vkDeviceWaitIdle(renderer.device);
 
     for (auto fb : renderer.framebuffers)
@@ -2163,10 +2141,7 @@ static void CleanupVkRenderer(VkRenderer& renderer) {
         renderer.depthMemory = VK_NULL_HANDLE;
     }
 
-    if (renderer.frameFence) {
-        vkDestroyFence(renderer.device, renderer.frameFence, nullptr);
-        renderer.frameFence = VK_NULL_HANDLE;
-    }
+    renderer.ring.destroy();
     if (renderer.commandPool) {
         vkDestroyCommandPool(renderer.device, renderer.commandPool, nullptr);
         renderer.commandPool = VK_NULL_HANDLE;
@@ -2985,56 +2960,37 @@ static void GetWindowSize(uint32_t& w, uint32_t& h) {
 // One-shot graphics-queue submit clearing a whole VK image to `color` and
 // leaving it in COLOR_ATTACHMENT_OPTIMAL (the steady-state layout the
 // compositor's zone pass transitions from). oldLayout UNDEFINED is always valid
-// here — the clear overwrites every pixel.
-static void ClearImageToColor(VkDevice device, VkCommandPool pool, VkQueue queue,
-                              VkImage image, const float color[4]) {
-    VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    ai.commandPool = pool;
-    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    ai.commandBufferCount = 1;
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    if (vkAllocateCommandBuffers(device, &ai, &cmd) != VK_SUCCESS) {
-        return;
-    }
+// here — the clear overwrites every pixel. Runs once at zones activation via the
+// frame ring's sanctioned blocking path (submitImmediate, INV-4.10).
+static void ClearImageToColor(dxr::VkFrameRing& ring, VkImage image, const float color[4]) {
+    ring.submitImmediate([&](VkCommandBuffer cmd) {
+        VkImageMemoryBarrier barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = image;
+        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        barrier.srcAccessMask = 0;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &barrier);
 
-    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &bi);
+        VkClearColorValue cv;
+        for (int i = 0; i < 4; i++) {
+            cv.float32[i] = color[i];
+        }
+        VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cv, 1, &range);
 
-    VkImageMemoryBarrier barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = image;
-    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    barrier.srcAccessMask = 0;
-    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         0, 0, nullptr, 0, nullptr, 1, &barrier);
-
-    VkClearColorValue cv;
-    for (int i = 0; i < 4; i++) {
-        cv.float32[i] = color[i];
-    }
-    VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdClearColorImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cv, 1, &range);
-
-    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                         0, 0, nullptr, 0, nullptr, 1, &barrier);
-
-    vkEndCommandBuffer(cmd);
-    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cmd;
-    vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(queue);
-    vkFreeCommandBuffers(device, pool, 1, &cmd);
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &barrier);
+    });
 }
 
 // Create one zone's swapchain, sized per xrGetDisplayZoneRecommendedViewSizeDXR,
@@ -3094,7 +3050,7 @@ static bool CreateZoneResources(AppXrSession& xr, VkRenderer& renderer, uint32_t
 }
 
 // Create the always-on Local2D strip and fill it once with solid amber.
-static bool CreateAndFillStrip(AppXrSession& xr, VkDevice device, VkCommandPool pool, VkQueue queue) {
+static bool CreateAndFillStrip(AppXrSession& xr, VkRenderer& renderer) {
     const uint32_t w = (uint32_t)g_stripRect.extent.width;
     const uint32_t h = (uint32_t)g_stripRect.extent.height;
     if (w == 0 || h == 0) {
@@ -3143,7 +3099,7 @@ static bool CreateAndFillStrip(AppXrSession& xr, VkDevice device, VkCommandPool 
     // what encodes; nothing is drawn into it). Alpha is never converted.
     const float amber[4] = {1.0f, 0.667f, 0.0f, 1.0f};
     const VkClearColorValue amberClear = dxr::VkDisplayReferredClearColor((VkFormat)sci.format, amber);
-    ClearImageToColor(device, pool, queue, imgs[idx].image, amberClear.float32);
+    ClearImageToColor(renderer.ring, imgs[idx].image, amberClear.float32);
 
     XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
     xrReleaseSwapchainImage(g_strip.swapchain, &ri);
@@ -3204,8 +3160,7 @@ static void HandleZoneKeys(AppXrSession& xr) {
 }
 
 // One-time zones activation: capabilities check + per-zone swapchains + strip.
-static void TryActivateZones(AppXrSession& xr, VkRenderer& renderer,
-                             VkDevice device, VkCommandPool pool, VkQueue queue) {
+static void TryActivateZones(AppXrSession& xr, VkRenderer& renderer) {
     uint32_t winW = 0, winH = 0;
     GetWindowSize(winW, winH);
     const int32_t W = (int32_t)winW;
@@ -3272,7 +3227,7 @@ static void TryActivateZones(AppXrSession& xr, VkRenderer& renderer,
             return;
         }
     }
-    if (!CreateAndFillStrip(xr, device, pool, queue)) {
+    if (!CreateAndFillStrip(xr, renderer)) {
         g_hasDisplayZonesExt = false;
         return;
     }
@@ -3298,6 +3253,11 @@ static void RenderZonesFrame(AppXrSession& xr, VkRenderer& renderer, const XrFra
     XrDisplayRigDXR rigStructs[kNumZones];
     std::vector<XrCompositionLayerProjectionView> projViews[kNumZones];
     uint32_t submitViewCounts[kNumZones] = {};
+    // INV-4.10: acquire every zone swapchain first, record all zones into ONE
+    // frame-ring command buffer, submit once, then release all.
+    std::vector<EyeRenderParams> zoneEyes[kNumZones];
+    uint32_t zoneImageIndex[kNumZones] = {};
+    bool zoneAcquired[kNumZones] = {};
 
     for (uint32_t zi = 0; zi < kNumZones; zi++) {
         DisplayZone& z = g_zonesArr[zi];
@@ -3348,7 +3308,8 @@ static void RenderZonesFrame(AppXrSession& xr, VkRenderer& renderer, const XrFra
         // far = ez + 1000*vH (identity rig here, so ez = pose z). Same recipe as
         // the base app's rig-consume path: GL-convention fov matrix remapped to
         // Vulkan's [0,1] clip via convert_projection_gl_to_zero_to_one.
-        std::vector<EyeRenderParams> eyes(n);
+        std::vector<EyeRenderParams>& eyes = zoneEyes[zi];
+        eyes.resize(n);
         for (uint32_t vi = 0; vi < n; vi++) {
             const XrView& v = zoneViews[vi];
             const float ez = RigLocalEyeZ(rigStructs[zi].pose, v.pose.position);
@@ -3384,12 +3345,38 @@ static void RenderZonesFrame(AppXrSession& xr, VkRenderer& renderer, const XrFra
         XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
         wi.timeout = XR_INFINITE_DURATION;
         xrWaitSwapchainImage(z.swapchain, &wi);
+        zoneImageIndex[zi] = imageIndex;
+        zoneAcquired[zi] = true;
+    }
 
-        RenderSceneToFramebuffer(renderer, g_zoneFbs[zi], imageIndex, eyes.data(), (int)n,
-                                 z.clearColor, z.spinPhase);
-
-        XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-        xrReleaseSwapchainImage(z.swapchain, &ri);
+    // One command buffer for every zone, ONE submit, no wait (INV-4.10). Each
+    // zone renders into its own swapchain + own depth image, so no barrier is
+    // needed between zones.
+    bool anyAcquired = false;
+    for (uint32_t zi = 0; zi < kNumZones; zi++) anyAcquired = anyAcquired || zoneAcquired[zi];
+    if (anyAcquired) {
+        VkCommandBuffer cmd = renderer.ring.beginFrame();
+        if (cmd != VK_NULL_HANDLE) {
+            for (uint32_t zi = 0; zi < kNumZones; zi++) {
+                if (!zoneAcquired[zi]) continue;
+                const DisplayZone& z = g_zonesArr[zi];
+                RenderSceneToFramebuffer(renderer, cmd, g_zoneFbs[zi], zoneImageIndex[zi],
+                                         zoneEyes[zi].data(), (int)zoneEyes[zi].size(),
+                                         z.clearColor, z.spinPhase);
+            }
+            VkResult submitResult = renderer.ring.endFrame();
+            if (submitResult != VK_SUCCESS) {
+                LOG_ERROR("[zones] frame submit failed: %d", (int)submitResult);
+            }
+        } else {
+            LOG_ERROR("[zones] frame ring beginFrame failed");
+        }
+        // Release AFTER endFrame: the runtime composes on the same queue.
+        for (uint32_t zi = 0; zi < kNumZones; zi++) {
+            if (!zoneAcquired[zi]) continue;
+            XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+            xrReleaseSwapchainImage(g_zonesArr[zi].swapchain, &ri);
+        }
     }
 
     // Layer list: [projA (zone A chained), projB (zone B chained), strip].
@@ -3741,6 +3728,7 @@ int main(int argc, char** argv) {
     VkRenderer vkRenderer = {};
     if (!InitializeVkRenderer(vkRenderer, vkDevice, physDevice, graphicsQueue, queueFamilyIndex, colorFormat)) {
         LOG_ERROR("Vulkan renderer initialization failed");
+        vkRenderer.ring.destroy();  // before vkDestroyDevice (dtor would run after)
         CleanupOpenXR(xr);
         vkDestroyDevice(vkDevice, nullptr);
         vkDestroyInstance(vkInstance, nullptr);
@@ -3816,7 +3804,7 @@ int main(int argc, char** argv) {
                 g_zonesFrameCounter++;
                 if (g_hasDisplayZonesExt && !g_zonesActive && !g_zonesAttempted &&
                     g_zonesFrameCounter >= kZonesActivationFrame) {
-                    TryActivateZones(xr, vkRenderer, vkDevice, vkRenderer.commandPool, graphicsQueue);
+                    TryActivateZones(xr, vkRenderer);
                 }
                 if (g_zonesActive && g_hasDisplayZonesExt) {
                     HandleZoneKeys(xr);
@@ -4013,6 +4001,7 @@ int main(int argc, char** argv) {
     }
     // Zone framebuffer sets hold views onto the zone swapchain images —
     // destroy them BEFORE the swapchains release those images.
+    vkRenderer.ring.waitAll();
     vkDeviceWaitIdle(vkDevice);
     for (uint32_t zi = 0; zi < kNumZones; zi++) {
         DestroyFramebuffers(vkDevice, g_zoneFbs[zi]);
