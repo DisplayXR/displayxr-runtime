@@ -176,11 +176,27 @@ struct comp_vk_native_renderer
 	 * allocate + zero fresh pages the next frame — ~80% of an sRGB app's
 	 * xrEndFrame CPU, growing as the kgsl pre-zeroed pool drained. A reset
 	 * without RELEASE_RESOURCES keeps that memory. Safe to reset at the top
-	 * of the next draw because both draw paths vkQueueWaitIdle the queue
-	 * they submitted it to before returning (and a failed submit leaves it
-	 * not pending). Only touched on the thread that owns cmd_pool.
+	 * of the next draw because both draw paths wait draw_fence (signalled by
+	 * this buffer's own submit) before returning, and a failed submit leaves
+	 * it not pending. Only touched on the thread that owns cmd_pool.
 	 */
 	VkCommandBuffer draw_cmd;
+
+	/*!
+	 * Signalled by the submit of draw_cmd, and the ONLY thing the per-frame
+	 * draw paths wait on (#1917). It used to be vkQueueWaitIdle on the main
+	 * queue — the APP's queue in-process — which waits for everything on it,
+	 * including work another thread (a fill, an app render/submit thread)
+	 * queued after ours, so a pipelining app could be held to one frame in
+	 * flight. Waiting on our own submit keeps exactly the guarantee callers
+	 * need — the atlas is complete when draw returns (the hand-off posts it
+	 * right after), and draw_cmd is idle for the next reset — and on an
+	 * in-order queue it also implies the app's earlier submits for the
+	 * source image are done, which is what the blit depended on anyway.
+	 * Created once (lazily), reset after each wait — never created or
+	 * destroyed per frame.
+	 */
+	VkFence draw_fence;
 
 	//! Number of tile columns in the atlas (default 2 for stereo).
 	uint32_t tile_columns;
@@ -945,6 +961,10 @@ comp_vk_native_renderer_destroy(struct comp_vk_native_renderer **renderer_ptr)
 		}
 		vk->vkDestroyCommandPool(vk->device, r->cmd_pool, NULL);
 	}
+	if (r->draw_fence != VK_NULL_HANDLE) {
+		vk->vkDestroyFence(vk->device, r->draw_fence, NULL);
+		r->draw_fence = VK_NULL_HANDLE;
+	}
 
 	free(r);
 	*renderer_ptr = NULL;
@@ -1408,7 +1428,7 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
  * entirely GPU-side: the consumer's `ID3D11DeviceContext4::Wait(fence, value)`
  * orders its reads behind this signal without any CPU blocking on Vulkan. In
  * particular the deposit does NOT lean on the pre-existing per-frame
- * `vkQueueWaitIdle` below (#837's to remove) — take that wait away and the
+ * wait below (#837; now a fence on this submit, #1917) — take that wait away and the
  * ordering guarantee here is unchanged.
  *
  * **VK-1 (#1178) — the same submit takes the ring's back-pressure WAIT.** The
@@ -1706,6 +1726,48 @@ renderer_begin_draw_cmd(struct comp_vk_native_renderer *r, VkCommandBuffer *out_
 		return res;
 	}
 	*out_cmd = r->draw_cmd;
+	return VK_SUCCESS;
+}
+
+/*!
+ * Submit draw_cmd on the main queue with draw_fence, and wait for THAT submit
+ * only (see draw_fence). On a failed submit nothing is pending and the fence
+ * is unsignalled, so the next frame can reset both.
+ */
+static VkResult
+renderer_submit_draw_and_wait(struct comp_vk_native_renderer *r, VkSubmitInfo *submit_info, const char *label)
+{
+	struct vk_bundle *vk = r->vk;
+	VkResult res;
+
+	if (r->draw_fence == VK_NULL_HANDLE) {
+		VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+		res = vk->vkCreateFence(vk->device, &fci, NULL, &r->draw_fence);
+		if (res != VK_SUCCESS) {
+			r->draw_fence = VK_NULL_HANDLE;
+			return res;
+		}
+	}
+
+#ifdef XRT_OS_ANDROID
+	// #1905: one retry on -3 (shared-GSL-context race; see the helper). A
+	// failed attempt consumed nothing and left the fence unsignalled.
+	res = comp_vk_native_queue_submit_retry(vk, vk->main_queue->queue, submit_info, r->draw_fence, label);
+#else
+	(void)label;
+	res = vk->vkQueueSubmit(vk->main_queue->queue, 1, submit_info, r->draw_fence);
+#endif
+	if (res != VK_SUCCESS) {
+		return res;
+	}
+
+	VkResult wres = vk->vkWaitForFences(vk->device, 1, &r->draw_fence, VK_TRUE, UINT64_MAX);
+	vk->vkResetFences(vk->device, 1, &r->draw_fence);
+	if (wres != VK_SUCCESS) {
+		// Device lost or similar. The submit DID happen, so report success
+		// (the caller must not abandon the deposit signal); just log.
+		U_LOG_E("VK compose: waiting the %s fence failed: %d", label, wres);
+	}
 	return VK_SUCCESS;
 }
 
@@ -2286,13 +2348,8 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 	deposit_chain_signal(r, &submit_info, &deposit_timeline, &deposit_sem, &deposit_value, &deposit_wait_value,
 	                     &deposit_wait_stage);
 
-#ifdef XRT_OS_ANDROID
-	// #1905: one retry on -3 (shared-GSL-context race); see the helper.
-	res = comp_vk_native_queue_submit_retry(vk, vk->main_queue->queue, &submit_info, VK_NULL_HANDLE,
-	                                        "renderer_draw_zones");
-#else
-	res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE);
-#endif
+	// #1905 retry on Android; waits THIS submit's fence, not the queue (#1917).
+	res = renderer_submit_draw_and_wait(r, &submit_info, "renderer_draw_zones");
 	if (res != VK_SUCCESS) {
 		U_LOG_E("VK zones: failed to submit draw commands: %d", res);
 		// The claimed value will never be signalled — give it back, or a
@@ -2303,8 +2360,8 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 		return XRT_ERROR_VULKAN;
 	}
 
-	// Load-bearing for the draw_cmd recycle: the next draw resets it.
-	vk->vkQueueWaitIdle(vk->main_queue->queue);
+	// renderer_submit_draw_and_wait() waited draw_fence: the atlas is
+	// complete and draw_cmd is idle for the next reset.
 
 	static bool zones_draw_logged = false;
 	if (!zones_draw_logged) {
@@ -2687,7 +2744,6 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	deposit_chain_signal(r, &submit_info, &deposit_timeline, &deposit_sem, &deposit_value, &deposit_wait_value,
 	                     &deposit_wait_stage);
 
-#ifdef XRT_OS_ANDROID
 	/*
 	 * #1905: one retry on -3. This is the submit that loses the shared-GSL
 	 * race on model viewer: the app's unlocked submit on the app queue
@@ -2696,11 +2752,10 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	 * render layers"). The failed submit consumed nothing (the deposit
 	 * timeline value is still unsignalled), so resubmitting it is safe.
 	 */
-	res =
-	    comp_vk_native_queue_submit_retry(vk, vk->main_queue->queue, &submit_info, VK_NULL_HANDLE, "renderer_draw");
-#else
-	res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE);
-#endif
+
+	// That retry lives in the helper (Android only); it waits THIS submit's
+	// fence, not the queue (#1917).
+	res = renderer_submit_draw_and_wait(r, &submit_info, "renderer_draw");
 	if (res != VK_SUCCESS) {
 		U_LOG_E("Failed to submit renderer commands: %d", res);
 		// The claimed value will never be signalled — give it back, or a
@@ -2711,8 +2766,8 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 		return XRT_ERROR_VULKAN;
 	}
 
-	// Load-bearing for the draw_cmd recycle: the next draw resets it.
-	vk->vkQueueWaitIdle(vk->main_queue->queue);
+	// renderer_submit_draw_and_wait() waited draw_fence: the atlas is
+	// complete and draw_cmd is idle for the next reset.
 
 	return XRT_SUCCESS;
 }
