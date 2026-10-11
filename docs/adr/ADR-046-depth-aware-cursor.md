@@ -1,6 +1,6 @@
 # ADR-046: Depth-aware cursor — opt-in only; the app knows the depth, the runtime places the cursor
 
-**Status:** Proposed (2026-10-06) · Phase 1 implemented · Phase 3a implemented (Metal) · Amendment 1 (lifted content, 2026-10-10) accepted · spec:
+**Status:** Proposed (2026-10-06) · Phase 1 implemented · Phase 3a implemented (Metal) · Amendment 1 (lifted content, 2026-10-10) accepted · Amendment 2 (one policy, runtime draws, app chooses the look, 2026-10-11) accepted · spec:
 [XR_DXR_cursor_depth.md](../specs/extensions/XR_DXR_cursor_depth.md) · sibling of
 [ADR-040](ADR-040-rear-depth-budget.md) (the same cue conflict, at the cursor instead of the desktop)
 
@@ -121,13 +121,14 @@ The eye compares disparities, so the margin, clamp and slew rates are expressed 
 | Parameter | Default | Why |
 |---|---|---|
 | margin in front of content | 0.03 | about 2 mm crossed on screen at 65 mm IPD: reads as in front without looking detached |
-| clamp | [−0.6, +0.6] | t ≥ 0.625: never more than about 3/8 of the way to the eye |
+| clamp | [−0.6, +0.6] — **superseded by Amendment 2: [−0.6, 0], never behind the glass** | t ≥ 0.625: never more than about 3/8 of the way to the eye |
 | rise time constant | 30 ms | never lag behind content that comes forward, or the violation is visible |
 | sink time constant | 250 ms | no flicker when the footprint crosses an edge |
 | stale gap | 0.5 s | after a pause the cursor snaps into place instead of gliding in |
 
-When nothing is under the cursor, the target is d = 0 (the display plane). Content behind the
-display plane gives d > 0, and the cursor settles onto it. A second locate in the same frame
+When nothing is under the cursor, the target is d = 0 (the display plane). ~~Content behind the
+display plane gives d > 0, and the cursor settles onto it.~~ Amendment 2: content on or behind
+the plane leaves the cursor on the plane. A second locate in the same frame
 (several zones) doesn't advance the filter.
 
 ### 4. Phases
@@ -366,3 +367,134 @@ service draws here too.
 - `depthToDisplay` (`XR_DXR_lift` v3) stays metric-only. The relief mapping is an internal
   DP-contract field that serves the cursor. Exposing it to apps is a separate decision.
 - No cost for any rect, stream or session that does not chain the request.
+
+## Amendment 2 (2026-10-11): one cursor policy everywhere, the runtime draws, the app chooses the look
+
+**Accepted** (David, 2026-10-11). It supersedes §3's clamp and every per-implementation tuning,
+and turns Phase 2 (runtime-drawn cursor) into the default way apps adopt the cursor.
+
+### Why
+
+By 2026-10-11 five implementations had diverged:
+- the runtime placement (`u_cursor_depth`, Phase 1);
+- the SDK's `DepthCursor` / `cursor: 'depth'` on `./model` and `./splat`;
+- the SDK's stereo-tile cursor on `./call` and `./camera` (web #159/#162);
+- the lifted-video cursor (Amendment 1, #1908);
+- the shell's workspace cursor.
+
+Two of them could sink the cursor **behind** the glass. Margins ranged from 0.005 to 0.03 of the
+eye baseline. Three different sprites were in use. A tester on a head-tracked panel also showed
+that a cursor with disparity but no motion parallax reads as being at the glass (#1847). Apps,
+meanwhile, had to hit-test, draw a sprite and manage the OS cursor themselves, which is why no
+demo had adopted the cursor.
+
+### Decision
+
+#### A. One policy, for every DisplayXR depth cursor
+
+Every implementation listed above follows these rules, with the same defaults. Where a pure
+module exists (`u_cursor_depth` in the runtime, `./cursor-depth` in the SDK), it is the single
+implementation that the others call.
+
+1. **Never behind the glass.** The cursor is either **on the screen plane** or **in front of
+   it**. It moves only to stay ahead of content that comes **out** of the screen. With `d` as
+   the content's disparity under the cursor footprint (eye-baseline units, < 0 in front):
+
+   `target = d < 0 ? max(d − margin, d_min) : 0`
+
+   Content on or behind the glass leaves the cursor on the glass. This replaces §3's
+   `[−0.6, +0.6]` clamp with `[−0.6, 0]`. Rationale: a cursor behind the glass sits behind the
+   page, the window chrome and the desktop, which recreates the depth conflict it exists to
+   remove.
+2. **Margin 0.03 eye baselines**, about 2 mm of crossed on-screen disparity at a 65 mm IPD.
+   This is the value the reference app (`cube_handle_metal_macos`) has shown since Phase 1.
+   Implementations expose it as a `margin` option and keep 0.03 as the default.
+3. **On the plane, it is the OS cursor.** Nothing is drawn while the filtered disparity is above
+   the **draw threshold**, −0.005 baselines (about 0.3 mm on screen) and never less than 0.5 px
+   on the panel. While nothing is drawn, the OS cursor is the cursor, untouched. The drawn
+   cursor exists only while content pops out under it, and the filter hands it back smoothly.
+4. **Filter unchanged** (§3): rise 30 ms, sink 250 ms, stale 0.5 s.
+5. **Anchor: hybrid, line of sight.**
+   - While the pointer moves, the sprite sits on the cyclopean ray through the pointer's canvas
+     point, exactly over the click point.
+   - While the pointer is still, the runtime keeps the line of sight from the last pointer move
+     (E₀ → S₀) and places the sprite on it at the current depth: the point whose distance in front
+     of the glass is (1 − t)·eyeToCanvas.
+
+   A head move leaves the sprite fixed in the world, so it parallaxes like content. A depth
+   change slides it along that line, so it stays on the click point for the viewer who placed
+   it. It is continuous at the moment the pointer stops. Screen-anchored and world-anchored modes
+   remain options. This rule is the one in #1847 and SDK 1.37.1; Amendment 1's lifted-video
+   cursor adopts it in its next revision.
+6. **Default look: the cursor the user already has.** The drawn sprite mirrors the **current OS
+   cursor shape** for that window (arrow, hand, I-beam, or whatever the app or page set). It is
+   drawn at the OS cursor's physical size (its pixel size times the panel's pixel pitch) and
+   scaled by t, so its apparent size never changes. Where the shape cannot be read, the
+   fallback is the classic arrow: 12 × 19 px, white with a dark outline (web #162's).
+
+#### B. The runtime draws; the app chooses the look (same split as the shell)
+
+The shell already works this way (`XR_DXR_spatial_workspace` v13+): the controller owns the
+sprite and the depth, and the runtime owns the drawing. Apps get the same contract in
+`XR_DXR_cursor_depth`:
+
+1. **Request.** A new struct chained on `XrCursorDepthHintDXR` asks the runtime to draw:
+   - `XrSwapchain image`: an ordinary swapchain the app created with `xrCreateSwapchain`, in its
+     own graphics API, filled with any sprite (static, animated, a different shape per state).
+     `XR_NULL_HANDLE` means the default look from A.6.
+   - `XrVector2f hotSpot`: normalised UV of the click point inside the sprite.
+   - `float sizeMeters`: physical size; 0 = the OS cursor's size.
+   - `XrBool32 visible`.
+
+   Because the app fills the swapchain in its own API, the runtime never has to create or upload
+   textures per graphics API.
+2. **Report.** A new struct chained on `XrViewState` says whether the runtime will draw the
+   cursor in the frame being located. The app hides its OS cursor exactly while that is true
+   (or lets the `displayxr-common` helper do it). The runtime still never touches the OS cursor
+   (§0). Any frame the runtime cannot place the cursor, it reports "not drawn", so the fallback
+   is always the flat OS cursor and never no cursor.
+3. **Where it is drawn.** After the app's layers and before the display processor, one sprite
+   per view at the placement pose, on top and never occluded.
+   - **In-process:** each native compositor draws it as a runtime-owned quad. Every backend
+     already composites quad layers in stereo.
+   - **Service / IPC:** through the drawer Amendment 1 factored out (`svc_draw_cursor_quads`).
+     That one path serves the shell, lifted rects and apps.
+4. **Depth sources unchanged:** the app's hint point (§1), the submitted depth layer (§6,
+   Phase 3a), or the conversion's depth map (Amendment 1). The app picks one. The policy in A is
+   applied to whichever it picks.
+5. **App-drawn placement stays supported.** The v1–v3 placement output is not removed. An app
+   that wants to draw the cursor itself still can, with the same policy.
+6. **§0 holds.** No request, no work: no sprite, no copies, no state. The draw request is per
+   frame.
+
+#### C. Web
+
+- The SDK's `DepthCursor`, `cursor: 'depth'` on `./model` and `./splat`, and the stereo-tile
+  cursor on `./call` and `./camera` all use the shared `./cursor-depth` core with the policy in
+  A and the arrow look. The SDK's crosshair is retired.
+- Later, the browser feeds the page's computed CSS `cursor` (including `url(...)` images) to the
+  runtime as the sprite (B.1). Pages then style the depth cursor with plain CSS, and the SDK
+  needs no cursor code for it.
+
+### Rollout
+
+1. **Groundwork:**
+   - the policy in A in `u_cursor_depth` (#1847, rebased onto A);
+   - the policy in A in the SDK core, with the stereo-tile cursor folded onto it;
+   - the lifted-video cursor (#1908) picks up A by calling `u_cursor_depth`.
+2. **B on Metal** with `cube_handle_metal_macos`, in both modes: mirrored OS cursor and a custom
+   sprite.
+3. **B on D3D11, D3D12, GL, Vulkan and the service**, plus a `displayxr-common` helper for the
+   app side: pointer → canvas UV on Win32, Cocoa, X11/Wayland and Android; the request; and
+   hiding the OS cursor per the report.
+4. **Adoption:**
+   - the `cube_*` reference apps;
+   - the demos: modelviewer, gaussiansplat, avatar, earthview, mediaplayer;
+   - the Unity and Unreal plug-ins;
+   - the browser's CSS-cursor feed (C);
+   - the shell (Phase 4).
+
+### Not changed
+
+- §0 (opt-in, zero cost otherwise), §1 (division of labour) and §2 (geometry from the views).
+- Amendment 1's API. Its policy constants come from A once it calls the shared module.
