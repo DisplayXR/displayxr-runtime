@@ -239,6 +239,33 @@ probe_zone_caps_d3d11(struct cli_query_result *r, const struct xrt_plugin_iface 
  * to — then lift_get_caps. ABSENCE NEVER FAILS (sim_display, every plug-in
  * without a module: modes 0 passes); only a malformed answer does.
  */
+//! Drop a trailing INCOMPLETE UTF-8 sequence, so a string cut to a fixed
+//! buffer is still valid UTF-8 (cJSON / any JSON reader rejects a half
+//! character). Plug-in text is arbitrary; never trust its byte length.
+static inline void
+dxr_utf8_trim_partial(char *s)
+{
+	size_t n = strlen(s);
+	size_t i = n;
+	size_t back = 0;
+	while (i > 0 && back < 4 && (((unsigned char)s[i - 1]) & 0xC0) == 0x80) {
+		i--;
+		back++;
+	}
+	if (i == 0) {
+		return;
+	}
+	const unsigned char lead = (unsigned char)s[i - 1];
+	size_t need = (lead & 0x80) == 0 ? 1 : (lead & 0xE0) == 0xC0 ? 2 : (lead & 0xF0) == 0xE0 ? 3 : (lead & 0xF8) == 0xF0 ? 4 : 0;
+	if (need == 0 || back + 1 < need) {
+		s[i - 1] = '\0'; // a lone or cut-off lead byte (and its tail)
+	}
+}
+
+//! Bounded wait for a fresh probe DP's module to leave ACTIVATING.
+#define CLI_LIFT_SETTLE_NS (8ull * 1000ull * 1000ull * 1000ull)
+#define CLI_LIFT_SETTLE_POLL_NS (250ll * 1000ll * 1000ll)
+
 static void
 probe_lift_caps_d3d11(struct cli_query_result *r, const struct xrt_plugin_iface *iface)
 {
@@ -284,6 +311,15 @@ probe_lift_caps_d3d11(struct cli_query_result *r, const struct xrt_plugin_iface 
 
 	struct xrt_dp_lift_caps caps;
 	bool got = xrt_display_processor_d3d11_has_lift(xdp) && xrt_display_processor_d3d11_lift_get_caps(xdp, &caps);
+	// This probe's DP is fresh, so a module that loads asynchronously starts out
+	// ACTIVATING here even when the service's copy is long READY. Give it a
+	// bounded moment to settle, or `info` reports a state no app ever sees.
+	const uint64_t settle_t0 = os_monotonic_get_ns();
+	while (got && caps.state == XRT_DP_LIFT_STATE_ACTIVATING &&
+	       os_monotonic_get_ns() - settle_t0 < CLI_LIFT_SETTLE_NS) {
+		os_nanosleep(CLI_LIFT_SETTLE_POLL_NS);
+		got = xrt_display_processor_d3d11_lift_get_caps(xdp, &caps);
+	}
 	if (!got) {
 		snprintf(r->lift_probe_note, sizeof(r->lift_probe_note),
 		         "no conversion module (modes 0) via the %s factory (OK)", which);
@@ -302,15 +338,12 @@ probe_lift_caps_d3d11(struct cli_query_result *r, const struct xrt_plugin_iface 
 		         malformed ? "MALFORMED caps: " : "", caps.modes, caps.state, caps.max_streams, caps.max_views,
 		         caps.depth_semantics == XRT_DP_LIFT_DEPTH_METRIC ? "metric" : "relative",
 		         (double)caps.typical_latency_ns / 1e6, caps.backend, which);
+		// Version + detail travel in their own fields (module_version / module_detail);
+		// the note only names the status, so it never truncates mid-sentence.
 		const char *ms = xrt_dp_lift_module_status_str(caps.module_status);
 		if (ms != NULL) {
-			char ver[sizeof(caps.module_version)];
-			char det[sizeof(caps.module_detail)];
-			snprintf(ver, sizeof(ver), "%s", caps.module_version);
-			snprintf(det, sizeof(det), "%s", caps.module_detail);
 			const size_t used = strlen(r->lift_probe_note);
-			snprintf(r->lift_probe_note + used, sizeof(r->lift_probe_note) - used, " module=%s%s%s%s%s", ms,
-			         ver[0] != '\0' ? " " : "", ver, det[0] != '\0' ? " — " : "", det);
+			snprintf(r->lift_probe_note + used, sizeof(r->lift_probe_note) - used, " module=%s", ms);
 		}
 	}
 
@@ -2630,6 +2663,8 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 				char det[sizeof(r->lift_caps.module_detail)];
 				snprintf(ver, sizeof(ver), "%s", r->lift_caps.module_version);
 				snprintf(det, sizeof(det), "%s", r->lift_caps.module_detail);
+				dxr_utf8_trim_partial(ver);
+				dxr_utf8_trim_partial(det);
 				cJSON_AddStringToObject(lc, "module_status", ms);
 				cJSON_AddStringToObject(lc, "module_version", ver);
 				cJSON_AddStringToObject(lc, "module_detail", det);
