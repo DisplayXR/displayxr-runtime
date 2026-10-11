@@ -1215,7 +1215,15 @@ typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceInputGrabDXR)(
  * each time; the runtime keeps a single source-of-truth event internally
  * and duplicates it to the caller's process at each call.
  *
- * Platforms other than Windows currently return XR_ERROR_FEATURE_UNSUPPORTED.
+ * On desktop Linux the handle is an eventfd file descriptor (an `int`,
+ * returned cast to uint64_t), duplicated into the caller's process. Caller
+ * takes ownership and must close() it when done. It becomes readable
+ * (POLLIN) whenever input is pushed onto the controller's queue; the
+ * caller resets it by read()ing 8 bytes (the value is a wake count to
+ * discard). Several pushes before the read collapse into one readable
+ * state, so drain everything on each wake, as above.
+ *
+ * Other platforms currently return XR_ERROR_FEATURE_UNSUPPORTED.
  *
  * Idle CPU cost goes from ~0.1% of one core (the polling baseline) to
  * effectively 0 when this handle is wired into the controller's wait set.
