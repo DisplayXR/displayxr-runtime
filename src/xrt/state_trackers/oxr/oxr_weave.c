@@ -975,7 +975,7 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 			// (wins) or on its XrLiftOptionsDXR.
 			(void)oxr_lift_rig_from_chain(e, o, &lr[i].rig);
 #ifdef OXR_HAVE_DXR_cursor_depth
-			// XR_DXR_cursor_depth v3 (ADR-046 Amendment 1): the runtime draws
+			// XR_DXR_cursor_depth v5 (ADR-046 Amendment 1): the runtime draws
 			// the depth cursor into this rect's lifted views.
 			if (sess->sys->inst->extensions.DXR_cursor_depth) {
 				lr[i].depth_cursor = OXR_GET_INPUT_FROM_CHAIN(e, XR_TYPE_CURSOR_DEPTH_LIFT_RECT_DXR,
@@ -996,7 +996,7 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 	uint64_t fence_value = 0;
 	struct xrt_eye_positions eyes = {0};
 	uint32_t submit_segment_count = 0; // v19: screens this submit was woven on (0 = one DP)
-	uint32_t lift_cursor_mask = 0; // XR_DXR_cursor_depth v3; the dma-buf path never draws one
+	uint32_t lift_cursor_mask = 0; // XR_DXR_cursor_depth v5; the dma-buf path never draws one
 	int release_fd = -1; // v10: per-frame release sync_file, owned by us until handed out
 	xrt_result_t xret;
 #ifdef XRT_OS_LINUX_DESKTOP

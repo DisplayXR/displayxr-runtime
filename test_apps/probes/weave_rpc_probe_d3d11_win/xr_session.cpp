@@ -130,7 +130,7 @@ InitializeOpenXR(XrSessionManager &xr)
 		enabled.push_back(XR_DXR_CURSOR_DEPTH_EXTENSION_NAME);
 	}
 	LOG_INFO("XR_DXR_lift:                 %s", g_hasLiftExt ? "AVAILABLE" : "NOT FOUND");
-	LOG_INFO("XR_DXR_cursor_depth:         %s (runtime spec v%u; v3 = lifted-rect cursor)",
+	LOG_INFO("XR_DXR_cursor_depth:         %s (runtime spec v%u; v5 = lifted-rect cursor)",
 	         g_cursorDepthSpecVersion > 0 ? "AVAILABLE" : "NOT FOUND", g_cursorDepthSpecVersion);
 
 	XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};

@@ -35,7 +35,7 @@ extern PFN_xrWeaveBindWindowDXR g_pfnWeaveBindWindow;
 extern PFN_xrWeaveSubmitDXR g_pfnWeaveSubmit;
 //! Spec v8 (browser#88). NULL on a pre-v8 runtime — the sticky-latch tests skip.
 extern PFN_xrWeaveSetScreenFlatRegionsDXR g_pfnWeaveSetScreenFlat;
-//! --lift: XR_DXR_lift (lifted weave rects) and XR_DXR_cursor_depth v3 (the
+//! --lift: XR_DXR_lift (lifted weave rects) and XR_DXR_cursor_depth v5 (the
 //! runtime-drawn depth cursor on them), enabled when the runtime advertises them.
 extern bool g_hasLiftExt;
 extern uint32_t g_cursorDepthSpecVersion; //!< 0 = not advertised

@@ -845,7 +845,7 @@ struct d3d11_client_render_resources
 	//! v6 path: RTV on weave_crop_tex, so lifted views can be written into
 	//! the crop before the weave (a lift frame never takes the zero-copy path).
 	wil::com_ptr<ID3D11RenderTargetView>   weave_crop_rtv;
-	//! XR_DXR_cursor_depth v3 (ADR-046 Amendment 1): which lift bindings of the
+	//! XR_DXR_cursor_depth v5 (ADR-046 Amendment 1): which lift bindings of the
 	//! last weave submit got the depth cursor (bit = binding index), and each
 	//! lifted stream's cursor state.
 	uint32_t                               lift_cursor_mask;
@@ -26642,12 +26642,12 @@ svc_lift_cursor_draw_impl(struct d3d11_service_system *sys,
 	u_cursor_depth_tuning_defaults(&tuning);
 	float content_d = 0.0f;
 	const bool has_content = lc->sample_has_content && u_lift_cursor_disparity_of_z(e, lc->sample_z, &content_d);
-	// Never behind the screen: rise only in front of content that comes out of
-	// it. On the plane the caller's own OS cursor is the cursor (David,
-	// 2026-10-10), so nothing is drawn there.
-	const float target = u_lift_cursor_pop_target(&tuning, has_content, content_d);
+	// ADR-046 Amendment 2 A, the one cursor policy: never behind the glass
+	// (rise only ahead of content that comes out of it), and on the plane the
+	// caller's own OS cursor is the cursor, so nothing is drawn there.
+	const float target = u_cursor_depth_target(&tuning, has_content, content_d);
 	const float d = u_cursor_depth_filter_step(&lc->filter, &tuning, target, now_ns);
-	if (d > -U_LIFT_CURSOR_DRAW_MIN_DISPARITY) {
+	if (!u_cursor_depth_should_draw(&tuning, d)) {
 		*why = SVC_LC_ON_PLANE;
 		return false;
 	}

@@ -1457,7 +1457,7 @@ void
 comp_d3d11_service_weave_set_overlay_filter_strength(struct xrt_compositor *xc, float strength);
 
 /*!
- * XR_DXR_cursor_depth v3 (ADR-046 Amendment 1): which lift rects of the last
+ * XR_DXR_cursor_depth v5 (ADR-046 Amendment 1): which lift rects of the last
  * @ref comp_d3d11_service_weave_submit got the depth cursor — bit i = the
  * submit's i-th lift binding (XrWeaveSubmitLiftRectsDXR::lifts[i]).
  */

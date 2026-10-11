@@ -7217,7 +7217,7 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	// was woven on, so the client fetches the per-screen table
 	// (weave_get_segments) only when the window actually spans screens.
 	*out_segment_count = comp_d3d11_service_weave_segment_count(ics->xc);
-	// XR_DXR_cursor_depth v3: which lift rects of this submit got the cursor.
+	// XR_DXR_cursor_depth v5: which lift rects of this submit got the cursor.
 	*out_lift_cursor_mask = comp_d3d11_service_weave_lift_cursor_mask(ics->xc);
 	return XRT_SUCCESS;
 #elif defined(COMP_MULTI_HAVE_WEAVE)
