@@ -92,6 +92,9 @@ SIM_DISPLAY_NOMINAL_Z_M=0.5           # Nominal viewing distance
 SIM_DISPLAY_PIXEL_W=3840              # Resolution width
 SIM_DISPLAY_PIXEL_H=2160              # Resolution height
 ```
+Each of these overrides the real monitor's geometry, which sim_display adopts by
+default on Windows, macOS and desktop Linux — see
+[`docs/vendors/sim_display/README.md`](../vendors/sim_display/README.md#panel-geometry).
 
 **Files (4 + shaders):**
 - `sim_display_device.c` — `xrt_device` with configurable specs
