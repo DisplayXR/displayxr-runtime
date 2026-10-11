@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import subprocess
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -40,9 +41,13 @@ from pathlib import Path
 RULES_DOC = "docs/guides/displayxr-app-rules.md"
 
 # Directories never linted: shared reference code, vendored headers, build output.
+# The Android entries matter after a local Gradle build: AGP's externalNativeBuild
+# tree (.cxx/, older AGP .externalNativeBuild/) holds FetchContent'd displayxr-common
+# sources under _deps/, incl. its tests/, which tripped false INV-3.1 errors.
 EXCLUDE_DIRS = {
     "build", ".git", "third_party", "openxr_includes", "common",
     "_package", "__pycache__", "node_modules", ".vs", "out", ".claude",
+    ".cxx", ".externalNativeBuild", ".gradle", "_deps",
 }
 SOURCE_EXTS = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".m", ".mm"}
 # JVM sources are linted for the Android rules only (§11) — the C/C++ checks
@@ -250,11 +255,51 @@ def strip_comments(text: str) -> str:
     return re.sub(r"//[^\n]*", "", text)
 
 
+_GIT_IGNORED_CACHE: dict = {}
+
+
+def git_ignored_prefixes(root: Path) -> tuple:
+    """Untracked-and-ignored paths under `root`, relative to it (directories end
+    in "/"), per the enclosing git repo's ignore rules. One `git ls-files` call
+    per root, cached. Empty when `root` is not in a git work tree or git is
+    unavailable — EXCLUDE_DIRS is then the only filter. Tracked files are never
+    reported, so a committed file inside an ignored directory is still linted."""
+    key = str(root)
+    if key not in _GIT_IGNORED_CACHE:
+        prefixes: tuple = ()
+        try:
+            out = subprocess.run(
+                ["git", "-C", key, "ls-files", "-z", "--others", "--ignored",
+                 "--exclude-standard", "--directory"],
+                capture_output=True, timeout=30, check=True).stdout
+            prefixes = tuple(e for e in out.decode("utf-8", "replace").split("\0") if e)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        _GIT_IGNORED_CACHE[key] = prefixes
+    return _GIT_IGNORED_CACHE[key]
+
+
+def is_excluded(path: Path, root: Path) -> bool:
+    """True for files the linter must skip: anything under an EXCLUDE_DIRS
+    directory, or git-ignored (build trees, generated sources)."""
+    try:
+        relp = path.relative_to(root)
+    except ValueError:
+        return False
+    if any(part in EXCLUDE_DIRS for part in relp.parts[:-1]):
+        return True
+    ignored = git_ignored_prefixes(root)
+    if not ignored:
+        return False
+    posix = relp.as_posix()
+    return any(posix == e or (e.endswith("/") and posix.startswith(e)) for e in ignored)
+
+
 def iter_source_files(root: Path):
     for p in sorted(root.rglob("*")):
         if not p.is_file() or p.suffix.lower() not in SOURCE_EXTS:
             continue
-        if any(part in EXCLUDE_DIRS for part in p.relative_to(root).parts[:-1]):
+        if is_excluded(p, root):
             continue
         yield p
 
@@ -567,7 +612,7 @@ def check_mcp_pairing(root: Path, findings: list):
     # Manifest ids.
     manifest_ids = {}
     for m in root.rglob("*.displayxr.json"):
-        if any(part in EXCLUDE_DIRS for part in m.relative_to(root).parts[:-1]):
+        if is_excluded(m, root):
             continue
         try:
             data = json.loads(m.read_text(encoding="utf-8"))
@@ -590,7 +635,7 @@ def check_mcp_pairing(root: Path, findings: list):
     for p in sorted(root.rglob("*")):
         if p.suffix.lower() not in SOURCE_EXTS or not p.is_file():
             continue
-        if any(part in EXCLUDE_DIRS for part in p.relative_to(root).parts[:-1]):
+        if is_excluded(p, root):
             continue
         try:
             text = p.read_text(encoding="utf-8", errors="replace")
@@ -635,7 +680,7 @@ def check_manual_tracking_event(root: Path, findings: list):
     for p in sorted(root.rglob("*")):
         if p.suffix.lower() not in SOURCE_EXTS or not p.is_file():
             continue
-        if any(part in EXCLUDE_DIRS for part in p.relative_to(root).parts[:-1]):
+        if is_excluded(p, root):
             continue
         try:
             text = strip_comments(p.read_text(encoding="utf-8", errors="replace"))
@@ -749,7 +794,7 @@ def check_views_change_realloc(root: Path, findings: list):
     for p in sorted(root.rglob("*")):
         if p.suffix.lower() not in SOURCE_EXTS or not p.is_file():
             continue
-        if any(part in EXCLUDE_DIRS for part in p.relative_to(root).parts[:-1]):
+        if is_excluded(p, root):
             continue
         try:
             text = strip_comments(p.read_text(encoding="utf-8", errors="replace"))
@@ -929,7 +974,7 @@ def check_vk_frame_discipline(root: Path, findings: list):
     for path in sorted(root.rglob("*")):
         if not path.is_file() or path.suffix.lower() not in VK_DISCIPLINE_EXTS:
             continue
-        if any(part in EXCLUDE_DIRS for part in path.relative_to(root).parts[:-1]):
+        if is_excluded(path, root):
             continue
         try:
             raw = path.read_text(encoding="utf-8", errors="replace")
@@ -1119,7 +1164,7 @@ def iter_android_sources(root: Path):
     for p in sorted(root.rglob("*")):
         if not p.is_file() or p.suffix.lower() not in exts:
             continue
-        if any(part in EXCLUDE_DIRS for part in p.relative_to(root).parts[:-1]):
+        if is_excluded(p, root):
             continue
         yield p
 
@@ -1279,7 +1324,7 @@ def check_android_manifest(mpath: Path, root: Path, findings: list) -> None:
 def check_android(root: Path, findings: list) -> None:
     """§11 — Android pixel-exactness. No-ops entirely for non-Android apps."""
     manifests = [m for m in sorted(root.rglob("AndroidManifest.xml"))
-                 if not any(part in EXCLUDE_DIRS for part in m.relative_to(root).parts[:-1])]
+                 if not is_excluded(m, root)]
     if not manifests:
         return  # Not an Android app — every check below is Android-only.
 
@@ -1332,7 +1377,7 @@ def check_android(root: Path, findings: list) -> None:
 
 def scan_manifests(root: Path, findings: list):
     manifests = [p for p in root.rglob("*.displayxr.json")
-                 if not any(part in EXCLUDE_DIRS for part in p.relative_to(root).parts[:-1])]
+                 if not is_excluded(p, root)]
     if not manifests:
         findings.append(Finding(WARN, "INV-9.1", str(root), 1,
                                 "No *.displayxr.json found — the app won't appear in any workspace launcher.",
