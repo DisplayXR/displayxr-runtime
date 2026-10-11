@@ -60,6 +60,39 @@ the entire "switch signers" operation.
 - **Output:** artifact **`signed`** containing `signed.zip` (same layout, signed).
 - This is what `C:\displayxr-signing\sign-hook.sh` wraps for local use.
 
+## Concurrency — identify the signing run, never take "the newest"
+
+Both workflows serialise on a single concurrency group per workflow that keeps **one
+running and one waiting** run, and every release on every component dispatches onto the
+same provider. A new dispatch therefore **cancels whichever run is still waiting**, and
+under parallel releases "the newest `workflow_dispatch` run created after I dispatched"
+is routinely **another component's** run. The provider runs expose no inputs and a bare
+`display_title` (just the workflow name), so nothing in the run listing says whose it is.
+
+**Incident, 2026-10-11:** five `/dxr-release` demo releases ran in parallel. Gauss's first
+dispatch was cancelled within 2 s by the next component's; the newest-run lookup resolved
+gauss to mediaplayer's run; the `*Setup-*.exe` download glob matched mediaplayer's
+installer, and `gh release upload --clobber` would have published it on the gauss
+release. Only an agent's manual look at the downloaded file name prevented it.
+
+The skills therefore follow three rules:
+1. **Track the run `gh workflow run` prints** (recent `gh` prints the new run's URL). Only
+   if none is printed, accept a run created since the dispatch that provably carries the
+   caller's marker: the job's first step name `Checkout <repo> @ <ref>`
+   (`build-signed-release.yml`), or the `release_tag` echoed in the completed run's log
+   (`sign-artifact`).
+2. **A `cancelled` run was displaced, not failed.** Wait until the workflow has no
+   non-`completed` run, re-dispatch **once**, and track the new run. Never fall back to
+   "newest" after a cancellation.
+3. **Assert artifact identity before uploading.** `build-signed-release.yml`: the artifact
+   holds exactly `<Name>Setup-<version>.exe` and the bare version occurs in it (NSIS
+   VERSIONINFO, UTF-16LE). `sign-artifact`: the returned file is the payload that was sent
+   plus a signature (identical past the PE header, and larger). Anything else ships the
+   unsigned CI asset with a flag; signing still never gates publishing.
+
+A provider that wants to make rule 1's fallback cheaper can add `run-name:` with the
+component and ref to its workflows; the skills do not depend on it.
+
 ## Capability gate + fallback (losing the box)
 
 Each skill probes reachability before signing and degrades gracefully:

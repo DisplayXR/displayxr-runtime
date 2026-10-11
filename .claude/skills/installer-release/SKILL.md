@@ -232,7 +232,77 @@ fi
 ```
 
 ### Step 4.5.2: Download → dispatch `sign-artifact` → re-upload
+**Track the signing run by identity, never as "the newest run".** `sign-artifact` is
+shared with every other release (the `/dxr-release` unity path, the browser's publish lane)
+and serialises on one concurrency group that keeps a single *waiting* run, so a parallel
+dispatch **cancels** ours while it waits, and "newest run since `$SINCE`" then resolves to
+someone else's (2026-10-11 incident — `/dxr-release` Phase 3.5,
+`docs/specs/runtime/release-signing.md` § Concurrency). So: track the run URL `gh workflow
+run` prints (fallback: a run whose log echoes our `$SIGN_TAG`); re-dispatch **once** after
+the workflow goes idle if ours was `cancelled`; and upload only a file named exactly
+`DisplayXRBundle-<version>.exe` that is **our payload plus a signature** (the bundle exe
+carries no version string, so the byte comparison is the identity proof).
 ```bash
+# ── Signing-run identity helpers ────────────────────────────────────────────
+# sign_dispatch <workflow> <marker> [-f k=v ...]  → sets SIGN_RUN ("" = not located)
+sign_dispatch() {
+  local wf="$1" marker="$2" since out id cand st; shift 2
+  since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  out=$(gh workflow run "$wf" -R "$SIGN_REPO" "$@" 2>&1); printf '%s\n' "$out"
+  # 1) The run gh printed. Recent gh prints the new run's URL on dispatch.
+  id=$(printf '%s\n' "$out" | sed -nE 's#.*/actions/runs/([0-9]+).*#\1#p' | head -1)
+  # 2) Fallback ONLY when nothing was printed: a run created since $since that
+  #    PROVABLY carries our marker — in its job step names (build-signed-release's
+  #    first step is "Checkout <repo> @ <ref>") or, once completed, in its log
+  #    (sign-artifact's log echoes the release_tag). NEVER the bare newest run:
+  #    under parallel releases that is another component's. A run that has not
+  #    started yet shows neither, so keep polling (<= 40 min).
+  if [ -z "$id" ]; then
+    for _ in $(seq 1 160); do
+      while read -r cand st; do
+        [ -n "$cand" ] || continue
+        if gh api "repos/$SIGN_REPO/actions/runs/$cand/jobs" --jq '.jobs[].steps[].name' 2>/dev/null | grep -qF -- "$marker" \
+           || { [ "$st" = completed ] && gh run view "$cand" -R "$SIGN_REPO" --log 2>/dev/null | grep -qF -- "$marker"; }; then
+          id="$cand"; break 2
+        fi
+      done <<RUNS
+$(gh run list -R "$SIGN_REPO" --workflow "$wf" --event workflow_dispatch --limit 20 \
+    --json databaseId,createdAt,status \
+    --jq "[.[]|select(.createdAt>=\"$since\")]|.[]|\"\(.databaseId) \(.status)\"")
+RUNS
+      sleep 15
+    done
+  fi
+  SIGN_RUN="$id"
+}
+
+# sign_track <workflow> <marker> [-f k=v ...]  → dispatch, wait, and re-dispatch ONCE if
+# the run was cancelled. Returns 0 only on conclusion=success; SIGN_RUN/SIGN_CONCL set.
+sign_track() {
+  local wf="$1" marker="$2" attempt; shift 2
+  SIGN_RUN=""; SIGN_CONCL=""
+  for attempt in 1 2; do
+    sign_dispatch "$wf" "$marker" "$@"
+    [ -n "$SIGN_RUN" ] || { SIGN_CONCL=unlocated; return 1; }
+    echo "tracking $wf run $SIGN_RUN (attempt $attempt)"
+    until [ "$(gh run view "$SIGN_RUN" -R "$SIGN_REPO" --json status --jq .status 2>/dev/null)" = completed ]; do sleep 30; done
+    SIGN_CONCL=$(gh run view "$SIGN_RUN" -R "$SIGN_REPO" --json conclusion --jq .conclusion)
+    [ "$SIGN_CONCL" = cancelled ] && [ "$attempt" = 1 ] || break
+    echo "run $SIGN_RUN was CANCELLED (another release's dispatch displaced it) — waiting for $wf to go idle, then re-dispatching once"
+    while [ "$(gh run list -R "$SIGN_REPO" --workflow "$wf" --limit 20 --json status \
+                --jq '[.[]|select(.status!="completed")]|length')" != 0 ]; do sleep 30; done
+    sleep $((RANDOM % 30))   # de-synchronise agents that idle-waited together
+  done
+  [ "$SIGN_CONCL" = success ]
+}
+
+# signed_is_our_payload <signed> <original> — <signed> is <original> plus an Authenticode
+# signature (signing rewrites only PE-header fields in the first 1 KiB and appends).
+signed_is_our_payload() {
+  python3 -I -c 'import sys
+s=open(sys.argv[1],"rb").read(); o=open(sys.argv[2],"rb").read()
+sys.exit(0 if len(s)>len(o) and s[1024:len(o)]==o[1024:] else 1)' "$1" "$2"; }
+
 if [ "$SIGNED" = yes ]; then
   D=$(mktemp -d)
   # startswith/endswith, NOT test("...\\.exe$"): that regex needs a \\ that survives only in
@@ -242,6 +312,10 @@ if [ "$SIGNED" = yes ]; then
   EXE=$(gh release view "$TAG" -R DisplayXR/displayxr-installer --json assets \
          --jq '.assets[].name | select(startswith("DisplayXRBundle-") and endswith(".exe"))')
   [ -n "$EXE" ] || { echo "No DisplayXRBundle-*.exe on $TAG — cannot sign"; exit 1; }
+  [ "$EXE" = "DisplayXRBundle-${TAG#v}.exe" ] || { echo "REFUSING: release $TAG carries '$EXE', expected exactly DisplayXRBundle-${TAG#v}.exe — not signing"; SIGNED=no; }
+fi
+
+if [ "$SIGNED" = yes ]; then
   # PROVE the download is whole before signing it. On a slow link `gh release download`
   # can stop early and still leave a file behind; signing and re-uploading that file then
   # REPLACES a good release asset with a truncated installer. (Bundle v2.5.8, 2026-10-03:
@@ -274,17 +348,10 @@ if [ "$SIGNED" = yes ]; then
   SIGN_TAG="sign-bundle-$(date +%s)-$$"
   gh release create "$SIGN_TAG" -R "$SIGN_REPO" --prerelease --title "$SIGN_TAG" \
      --notes "temp bundle-signing payload (auto-deleted)" "$D/unsigned.zip"
-  SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  gh workflow run sign-artifact -R "$SIGN_REPO" -f release_tag="$SIGN_TAG"
-
-  RID=""
-  for _ in $(seq 1 20); do
-    RID=$(gh run list -R "$SIGN_REPO" --workflow sign-artifact --event workflow_dispatch \
-            --limit 8 --json databaseId,createdAt \
-            --jq "[.[]|select(.createdAt>=\"$SINCE\")]|sort_by(.createdAt)|last|.databaseId // empty")
-    [ -n "$RID" ] && break; sleep 4
-  done
-  if [ -n "$RID" ] && gh run watch "$RID" -R "$SIGN_REPO" --interval 15 --exit-status; then
+  # Identity-tracked: printed URL, else a run whose log echoes $SIGN_TAG; a displaced
+  # (cancelled) run is re-dispatched once after the workflow goes idle.
+  if sign_track sign-artifact "$SIGN_TAG" -f release_tag="$SIGN_TAG"; then
+    RID="$SIGN_RUN"
     gh run download "$RID" -R "$SIGN_REPO" -n signed -D "$D/out"
     # portable unzip (git-bash on Windows has no `unzip`).
     if command -v unzip >/dev/null; then ( cd "$D/out" && unzip -qo signed.zip -d "$D/signed" 2>/dev/null || true )
@@ -297,6 +364,10 @@ if [ "$SIGNED" = yes ]; then
     # wrong or truncated input went through the signer — never upload it over the release.
     if [ -n "$SIGNED_EXE" ] && [ "$(stat -f%z "$SIGNED_EXE" 2>/dev/null || stat -c%s "$SIGNED_EXE")" -le "$ORIG" ]; then
       echo "ERROR: signed $EXE is not larger than the original ($ORIG bytes) — not uploading."; SIGNED_EXE=""
+    fi
+    # Identity: the returned file must be OUR payload plus a signature, not another job's file.
+    if [ -n "$SIGNED_EXE" ] && ! signed_is_our_payload "$SIGNED_EXE" "$D/in/$EXE"; then
+      echo "REFUSING: sign-artifact run $RID returned a $EXE that is not our payload + signature — not uploading."; SIGNED_EXE=""
     fi
     if [ -n "$SIGNED_EXE" ]; then
       # `--clobber` DELETES the CI asset first, then uploads. On a flaky link the delete
@@ -321,7 +392,7 @@ if [ "$SIGNED" = yes ]; then
       echo "⚠ signed .exe not returned — leaving the unsigned CI bundle."; SIGNED=no
     fi
   else
-    echo "⚠ sign-artifact run failed/absent — leaving the unsigned CI bundle."; SIGNED=no
+    echo "⚠ sign-artifact run ${SIGN_RUN:-<none>} ended '$SIGN_CONCL' — leaving the unsigned CI bundle."; SIGNED=no
   fi
   # Always clean up the temp signing release/tag on the provider.
   gh release delete "$SIGN_TAG" -R "$SIGN_REPO" --yes --cleanup-tag >/dev/null 2>&1 || true
