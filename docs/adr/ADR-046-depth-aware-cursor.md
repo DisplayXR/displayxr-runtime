@@ -663,7 +663,11 @@ sprite and the depth, and the runtime owns the drawing. Apps get the same contra
   follows the app's `[NSCursor hide]`, not the runtime draw: app-draw mode crashes too; the
   runtime draw with the OS cursor left visible (0/10), `DXR_WEAVE_REPAINT=0` (0/8) and the
   extension off (0/20) do not. The GL cube never hid the OS cursor before this adoption, so this
-  is a latent repaint-thread / AppKit race in the GL compositor surfacing, tracked separately.
+  is a latent repaint-thread / AppKit race in the GL compositor surfacing — runtime#1947. Until it
+  is fixed the GL cube's depth cursor is **opt-in** (`DISPLAYXR_CURSOR_DEPTH=1`); the Metal and
+  Vulkan cubes stay default-on.
+- **Found in passing (Metal, #1941):** on the Vulkan-app-on-Metal fallback a custom sprite is
+  handed over as the client swapchain and cast to the native Metal type — runtime#1948.
 
 ### Rollout
 

@@ -654,7 +654,7 @@ static void EnsureFBO(GLRenderer &r, uint32_t w, uint32_t h)
 // DISPLAYXR_CURSOR_DEPTH_SPRITE=custom - and the app hides the OS cursor
 // exactly while XrCursorDepthDrawStateDXR::willDraw.
 // DISPLAYXR_CURSOR_DEPTH_DRAW=app draws a crosshair from the placement
-// instead. Opt out with DISPLAYXR_CURSOR_DEPTH=0; DISPLAYXR_CURSOR_DEPTH_UV=u,v
+// instead. OPT-IN here: DISPLAYXR_CURSOR_DEPTH=1 (runtime#1947); DISPLAYXR_CURSOR_DEPTH_UV=u,v
 // scripts the cursor for headless capture.
 // ============================================================================
 
@@ -1406,14 +1406,18 @@ static bool InitializeOpenXR(AppXrSession &app)
     if (app.hasViewRigExt) {
         enabledExts.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
     }
-    // XR_DXR_cursor_depth (ADR-046): on by default; DISPLAYXR_CURSOR_DEPTH=0
-    // opts out (the runtime then does no cursor work at all).
+    // XR_DXR_cursor_depth (ADR-046): OPT-IN on this app only -
+    // DISPLAYXR_CURSOR_DEPTH=1 enables it (the runtime otherwise does no
+    // cursor work at all). Unlike the Metal and Vulkan cubes (default on), the
+    // GL cube crashes ~1 in 5 launches in Apple's GL driver while the OS cursor
+    // is hidden - a GL compositor repaint-thread vs AppKit race, runtime#1947.
+    // Flip back to default-on once that is fixed.
     if (app.hasCursorDepthExt) {
         const char *opt = getenv("DISPLAYXR_CURSOR_DEPTH");
-        if (opt != nullptr && strcmp(opt, "0") == 0) {
-            app.hasCursorDepthExt = false;
-        } else {
+        if (opt != nullptr && strcmp(opt, "1") == 0) {
             enabledExts.push_back(XR_DXR_CURSOR_DEPTH_EXTENSION_NAME);
+        } else {
+            app.hasCursorDepthExt = false;
         }
     }
     LOG_INFO("XR_DXR_cursor_depth: %s", app.hasCursorDepthExt ? "ENABLED" : "off");
