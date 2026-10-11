@@ -704,8 +704,17 @@ endif()
 # split per screen -- the segment table (compositor/util), the per-rect parts
 # the client cuts from it (aux util, header-only) and, where the IPC protocol
 # is generated, the weave_get_segments reply carrying every screen's eyes.
-target_sources(tests_weave_segments PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/comp_segments.c)
-target_include_directories(tests_weave_segments PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+# Amendment 4 addendum: which screen frames an element's views (aux util), its
+# window metrics cross-checked against the per-segment views' own
+# (oxr_segment_views.c), and the submit reply's cheap split signal.
+target_sources(
+	tests_weave_segments PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/comp_segments.c
+	${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr/oxr_segment_views.c
+	)
+target_include_directories(
+	tests_weave_segments PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor
+	${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
+	)
 target_link_libraries(tests_weave_segments PRIVATE xrt-interfaces aux_util)
 if(TARGET ipc_shared)
 	target_link_libraries(tests_weave_segments PRIVATE ipc_shared)

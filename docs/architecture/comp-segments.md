@@ -537,11 +537,26 @@ pixels into a handback texture on its own IPC thread. That submit is segmented b
   `weave_get_segments` (appended to `proto.json`) hands it to the client, which fills
   `XrWeaveOutputRectPartsDXR` and cuts the submitted rects at the seams with
   `u_weave_rect_parts` (`auxiliary/util/u_weave_rect_parts.h`, unit-tested by
-  `tests/tests_weave_segments.cpp`). Fetched only when the caller chains the struct.
+  `tests/tests_weave_segments.cpp`). Fetched only when the caller chains the struct **and**
+  `weave_submit`'s reply (its trailing `segment_count`, from
+  `comp_d3d11_service_weave_segment_count`) says the submit was woven per screen
+  (`u_weave_segments_fetch_needed`), so a window on one screen costs no second round trip.
+- **Element views (Amendment 4 addendum).** A present-owner's zone-scoped locate (the browser's
+  per-element `xrLocateViews` + `XR_DXR_view_rig`) is framed server-side in
+  `ipc_try_get_sr_view_poses`. Before the zone rebase it asks
+  `comp_d3d11_service_get_zone_weave_screen`: the locating client's own fresh weave table, else
+  that of any present-owner whose `weave_hwnd` is the same window (the browser locates from its
+  browser process and weaves from its GPU process), then `u_weave_zone_screen_segment`. When the
+  element lies wholly on a non-primary segment, the window metrics become the whole window
+  relative to that screen (`u_weave_segment_window_metrics`), and the eyes (render pair and raw
+  channel) and nominal viewer become that screen's; the eyes are predicted at the locate from the
+  segment DP (`render_mutex`, taken only on this branch). Straddling elements, elements on the
+  primary and windows on one screen take the old path unchanged (`clients_mutex` only).
 - **Drag snap.** `comp_d3d11_service_weave_snap_window_rect` first asks
   `comp_d3d11_segments_snap_dp` for the DP of the screen holding the majority of the window at the
   proposed position (a separate `comp_segments_owner`, Amendment 2's margin and hold, no failure
   latch since nothing is torn down), and falls back to the panel DP's snap.
 - **Not covered:** the v8 hardware wish is still published to the panel DP only (the primary
   screen's lens); a window across more than `XRT_MAX_SEGMENTS` screens is woven per screen but
-  reported unsegmented (one eye set).
+  reported unsegmented (one eye set); a straddling element's views stay the primary's
+  (per-part views need a view set per part, displayxr-browser-pvt#272).

@@ -250,9 +250,10 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
     def test_weave_segments_call_is_appended(self):
         # XR_DXR_weave v19 (#1884, ADR-047 Amendment 4): a present-owner's
         # per-screen segment table (with every screen's eyes) crosses as its
-        # own call, APPENDED at the end — weave_submit's reply is untouched, so
-        # a caller that does not chain XrWeaveOutputRectPartsDXR sends exactly
-        # the pre-v19 messages. The table is the per-segment views' struct.
+        # own call, APPENDED at the end, so a caller that does not chain
+        # XrWeaveOutputRectPartsDXR never sends it (weave_submit's reply only
+        # gained a trailing count, below). The table is the per-segment views'
+        # struct.
         names = [c.name for c in self.p.calls]
         self.assertEqual(names[-4], "weave_get_segments")  # ADR-052's three calls follow it
         call = self._call("weave_get_segments")
@@ -260,8 +261,6 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         self.assertEqual([(a.name, a.typename) for a in call.out_args],
                          [("metrics", "struct xrt_segment_metrics")])
         self.assertFalse(call.in_handles or call.out_handles or call.varlen)
-        sub = [a.name for a in self._call("weave_submit").out_args]
-        self.assertEqual(sub, ["have_output", "width", "height", "fence_value", "eyes"])
         text = self._generate("generate_server_c", "ipc_server_generated.c")
         self.assertIn("ipc_handle_weave_get_segments(", text)
 
@@ -292,6 +291,20 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         text = self._generate("generate_server_c", "ipc_server_generated.c")
         for n in ("workspace_enumerate_screens", "workspace_set_window_placement", "workspace_get_window_placement"):
             self.assertIn("ipc_handle_%s(" % n, text)
+
+    def test_weave_submit_split_signal_is_trailing(self):
+        # ADR-047 Amendment 4 addendum: weave_submit's reply APPENDS the
+        # segment count of the table that very submit published, so the state
+        # tracker fetches the table (weave_get_segments) only for a window
+        # woven per screen. Appended like the v12 fields: every earlier field
+        # keeps its offset (the u_git_tag gate refuses a skewed pair).
+        sub = [a.name for a in self._call("weave_submit").out_args]
+        self.assertEqual(sub, ["have_output", "width", "height", "fence_value", "eyes", "segment_count"])
+        call = self._call("weave_submit")
+        self.assertEqual(call.out_args[-1].typename, "uint32_t")
+        # weave_submit_dmabuf (desktop Linux: never segmented) is untouched.
+        sub = [a.name for a in self._call("weave_submit_dmabuf").out_args]
+        self.assertEqual(sub, ["have_output", "width", "height", "fence_value", "eyes", "origin"])
 
 
 if __name__ == "__main__":

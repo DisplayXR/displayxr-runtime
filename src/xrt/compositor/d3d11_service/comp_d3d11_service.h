@@ -1507,6 +1507,46 @@ comp_d3d11_service_weave_snap_window_rect(struct xrt_compositor *xc,
 bool
 comp_d3d11_service_weave_get_segments(struct xrt_compositor *xc, struct xrt_segment_metrics *out);
 
+/*!
+ * XR_DXR_weave v19 cheap split signal (ADR-047 Amendment 4, addendum): the
+ * segment count of the table this present-owner's last accepted submit
+ * published — what `weave_submit`'s reply carries so the client fetches the
+ * table (`weave_get_segments`) only when it is non-zero. 0 = one display
+ * processor (every window on one screen, every client that never enabled
+ * segments).
+ */
+uint32_t
+comp_d3d11_service_weave_segment_count(struct xrt_compositor *xc);
+
+/*!
+ * The screen a zone-scoped locate of client @p xc must be framed against
+ * (ADR-047 Amendment 4, addendum): when the window @p xc frames its locates
+ * against is woven per screen and the element @p zone (window px) lies wholly
+ * on a NON-primary screen of it (u_weave_zone_screen_segment, with the live
+ * client size @p live_w x @p live_h), @p out is that window's per-screen table
+ * and @p out_index the element's segment, whose eyes are predicted now from its
+ * segment DP (the table's own, as of that weave, when the DP cannot answer).
+ *
+ * The table is this client's own last weave's, else that of any present-owner
+ * weaving the same window (the DisplayXR Browser locates from its browser
+ * process and weaves from its GPU process: two sessions, one window); only a
+ * table published within the last SVC_SEG_PUB_FRESH_NS counts.
+ *
+ * Cost: clients_mutex only, unless the element is on a non-primary screen
+ * (then render_mutex too, for the fresh eyes). A window on one screen never
+ * reaches the render thread's lock.
+ *
+ * @return true when the element is to be framed against out->seg[*out_index].
+ */
+bool
+comp_d3d11_service_get_zone_weave_screen(struct xrt_system_compositor *xsysc,
+                                         struct xrt_compositor *xc,
+                                         const struct xrt_rect *zone,
+                                         uint32_t live_w,
+                                         uint32_t live_h,
+                                         struct xrt_segment_metrics *out,
+                                         uint32_t *out_index);
+
 /*
  * XR_DXR_lift (ADR-042) — 2D→3D conversion streams. SYSTEM-level (a stream is
  * owned by an IPC connection, identified by @p owner, not by a session), so a

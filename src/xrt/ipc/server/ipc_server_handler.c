@@ -17,6 +17,7 @@
 #include "util/u_trace_marker.h"
 #include "util/u_canvas.h" // XR_DXR_display_zones P5: zone-scoped locate rebase
 #include "util/u_snap_grid.h" // XR_DXR_weave v11: bulk grid snap (#1723)
+#include "util/u_weave_rect_parts.h" // ADR-047 Amendment 4 addendum: per-screen element views
 
 #include "server/ipc_server.h"
 #include "server/ipc_server_peer_creds.h"
@@ -681,9 +682,15 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 	struct xrt_quat win_orient = {0, 0, 0, 1};
 	bool win_has_orientation = false;
 	bool headless_client = (xc == NULL);
+	// ADR-047 Amendment 4, addendum: a zone-scoped locate of an element that
+	// lies wholly on a NON-primary screen of a window woven per screen is framed
+	// against that screen — its eyes, its nominal viewer, its geometry.
+	bool zone_reframed = false;
+	struct xrt_segment_metric zone_screen = {0};
 	{
 		struct xrt_window_metrics wm = {0};
 		bool have_wm = false;
+		bool wm_from_app_window = false;
 
 		// Per-client metrics: virtual window size + center offset from pose
 		if (ws_framed) {
@@ -706,6 +713,7 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		if (!have_wm && !headless_client && rig_reply != NULL && xc != NULL) {
 			have_wm = comp_d3d11_service_get_client_app_window_metrics(s->xsysc, xc, &wm) &&
 			          wm.valid && wm.window_width_m > 0.0f && wm.window_height_m > 0.0f;
+			wm_from_app_window = have_wm;
 			static bool hwnd_wm_logged = false;
 			if (!hwnd_wm_logged && have_wm) {
 				hwnd_wm_logged = true;
@@ -720,6 +728,54 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		if (!have_wm && !headless_client) {
 			have_wm = comp_d3d11_service_get_window_metrics(s->xsysc, &wm) &&
 			          wm.valid && wm.window_width_m > 0.0f && wm.window_height_m > 0.0f;
+		}
+
+		// ADR-047 Amendment 4, addendum (displayxr-browser-pvt#272): a
+		// present-owner's bound window can be woven per screen; its locates
+		// were still framed from the primary screen (the session DP's eyes, the
+		// window relative to the primary's display). An element that lies
+		// WHOLLY on another screen now gets that screen's eyes and is framed
+		// against that screen's display: swap in the whole window relative to
+		// it, and the zone rebase below places the element on it exactly as it
+		// places one on the primary. A straddling element, an element on the
+		// primary, and every window on one screen keep the framing above, byte
+		// for byte (no per-screen table exists for a window on one screen: the
+		// lookup answers false before anything else is touched). Per-part views
+		// for a straddling element need a second view set per element
+		// (displayxr-browser-pvt#272).
+		if (have_wm && wm_from_app_window && rig != NULL && rig->zone_valid != 0 && rig->zone_w_px > 0 &&
+		    rig->zone_h_px > 0) {
+			struct xrt_rect zone_rect;
+			zone_rect.offset.w = rig->zone_x_px; // xrt_offset names its fields w/h
+			zone_rect.offset.h = rig->zone_y_px;
+			zone_rect.extent.w = rig->zone_w_px;
+			zone_rect.extent.h = rig->zone_h_px;
+			struct xrt_segment_metrics wseg;
+			uint32_t k = 0;
+			struct xrt_window_metrics swm;
+			// That screen's DP must have eyes for it (a segment with no DP is
+			// flat 2D anyway): otherwise the element keeps the primary's views.
+			if (comp_d3d11_service_get_zone_weave_screen(s->xsysc, xc, &zone_rect, wm.window_pixel_width,
+			                                             wm.window_pixel_height, &wseg, &k) &&
+			    wseg.seg[k].have_eyes && wseg.seg[k].eyes.valid && wseg.seg[k].eyes.count > 0 &&
+			    u_weave_segment_window_metrics(&wseg, k, &swm)) {
+				wm = swm;
+				zone_reframed = true;
+				zone_screen = wseg.seg[k];
+				// Change-only (never per frame): which screen elements were
+				// last re-framed onto. Not logged back: a page with elements on
+				// both screens would flip it every locate.
+				static uint64_t s_zone_screen_logged = 0;
+				if (zone_screen.screen_id != s_zone_screen_logged) {
+					s_zone_screen_logged = zone_screen.screen_id;
+					IPC_WARN(
+					    s,
+					    "multi-screen: element (%d,%d %dx%d) wholly on screen 0x%016llx - views "
+					    "from that screen's eyes and geometry (ADR-047 Amendment 4 addendum)",
+					    rig->zone_x_px, rig->zone_y_px, rig->zone_w_px, rig->zone_h_px,
+					    (unsigned long long)zone_screen.screen_id);
+				}
+			}
 		}
 
 		// XR_DXR_display_zones P5 — zone-scoped locate over IPC: rebase
@@ -784,6 +840,27 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 				IPC_WARN(s, "ipc_try_get_sr_view_poses: get_display_dimensions FAILED, skipping SR poses");
 			}
 			return false;
+		}
+	}
+
+	// ADR-047 Amendment 4, addendum: the re-framed element's eyes are its
+	// screen's (that screen's display space, the frame wm now describes), both
+	// for the render pair and the raw channel.
+	if (zone_reframed) {
+		const struct xrt_eye_positions *ze = &zone_screen.eyes;
+		const uint32_t zn = ze->count < XRT_MAX_VIEWS ? ze->count : XRT_MAX_VIEWS;
+		for (uint32_t i = 0; i < eye_count; i++) {
+			const uint32_t src = i < zn ? i : zn - 1;
+			raw_eyes[i] = (struct xrt_vec3){ze->eyes[src].x, ze->eyes[src].y, ze->eyes[src].z};
+		}
+		if (rig_reply != NULL) {
+			for (uint32_t i = 0; i < zn; i++) {
+				rig_reply->raw.eyes[i] = (struct xrt_vec3){ze->eyes[i].x, ze->eyes[i].y, ze->eyes[i].z};
+			}
+			rig_reply->raw.eye_count = zn;
+			rig_reply->raw.sample_time_ns = ze->timestamp_ns;
+			rig_reply->raw.is_tracking = ze->is_tracking ? 1u : 0u;
+			rig_reply->raw.valid = 1;
 		}
 	}
 
@@ -1105,6 +1182,13 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 	if (ws_framed && ws_nominal.z > 0.0f) {
 		// ADR-052 D2: the framing screen's own nominal viewer (its display space).
 		nominal_viewer = (struct xrt_vec3){0.0f, ws_nominal.y, ws_nominal.z};
+	}
+	if (zone_reframed && zone_screen.nominal_viewer_z_m > 0.0f) {
+		// The element's own screen's nominal viewer (its display space). Never
+		// together with ws_framed: an element is re-framed only on app-window
+		// metrics, which a workspace-framed tile never resolves to.
+		nominal_viewer.y = zone_screen.nominal_viewer_y_m;
+		nominal_viewer.z = zone_screen.nominal_viewer_z_m;
 	}
 	const struct xrt_vec3 *rig_nominal = (rig_display || rig_camera) ? &nominal_viewer : NULL;
 
@@ -6957,12 +7041,16 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
                         uint32_t *out_height,
                         uint64_t *out_fence_value,
                         struct xrt_eye_positions *out_eyes,
+                        uint32_t *out_segment_count,
                         const xrt_graphics_buffer_handle_t *handles,
                         uint32_t handle_count)
 {
 	IPC_TRACE_MARKER();
 
 	*out_have_output = false;
+	// XR_DXR_weave v19 cheap split signal: 0 = woven by one display processor
+	// (every platform but the D3D11 service, every window on one screen).
+	*out_segment_count = 0;
 	xrt_result_t auth = require_present_owner(ics, "weave_submit");
 	if (auth != XRT_SUCCESS) {
 		weave_submit_release_handles(handles, handle_count);
@@ -7088,6 +7176,10 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	*out_height = h;
 	*out_fence_value = fv;
 	*out_eyes = eyes;
+	// #1884 (ADR-047 Amendment 4, addendum): how many screens this very submit
+	// was woven on, so the client fetches the per-screen table
+	// (weave_get_segments) only when the window actually spans screens.
+	*out_segment_count = comp_d3d11_service_weave_segment_count(ics->xc);
 	return XRT_SUCCESS;
 #elif defined(COMP_MULTI_HAVE_WEAVE)
 	// handles[0] is the retained IOSurfaceRef (macOS) / acquired AHardwareBuffer

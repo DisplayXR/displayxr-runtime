@@ -25,6 +25,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -120,6 +121,144 @@ u_weave_rect_parts(const struct xrt_segment_metrics *m,
 		}
 	}
 	return n;
+}
+
+/*!
+ * Must the state tracker fetch the per-screen table after a submit
+ * (`weave_get_segments`)? Only for a batch / v6 submit (@p rect_count > 0; the
+ * legacy single-rect submit is never segmented) whose weave the service reports
+ * as per screen: @p submit_segment_count is the count `weave_submit`'s reply
+ * carries (the table that very submit published). A window on one screen — and
+ * every single-screen box, which never enables segments — reports 0, so a v19
+ * caller chaining XrWeaveOutputRectPartsDXR pays no extra round trip there.
+ */
+static inline bool
+u_weave_segments_fetch_needed(uint32_t rect_count, uint32_t submit_segment_count)
+{
+	return rect_count > 0 && submit_segment_count > 0 && submit_segment_count <= XRT_MAX_SEGMENTS;
+}
+
+/*!
+ * The segment of table @p m whose screen holds ALL of @p rect (window px), or
+ * -1 when the rect lands on no segment or on more than one (it straddles a
+ * seam). The parts rule of @ref u_weave_rect_parts: a rect for which this
+ * answers k is exactly the one part of segment k.
+ */
+static inline int32_t
+u_weave_rect_single_segment(const struct xrt_segment_metrics *m, const struct xrt_rect *rect)
+{
+	if (m == NULL || rect == NULL || m->count == 0 || m->count > XRT_MAX_SEGMENTS) {
+		return -1;
+	}
+	int32_t found = -1;
+	for (uint32_t k = 0; k < m->count; k++) {
+		struct xrt_rect isect;
+		if (!u_weave_rect_intersect(rect, &m->seg[k].window_rect, &isect)) {
+			continue;
+		}
+		if (found >= 0) {
+			return -1; // a second screen: the rect straddles a seam
+		}
+		found = (int32_t)k;
+	}
+	return found;
+}
+
+/*!
+ * Which screen frames a zone-scoped locate (an inline-3D element) of a
+ * present-owner whose bound window is woven per screen (ADR-047 Amendment 4,
+ * addendum): the segment index whose screen's eyes and geometry the element's
+ * views must come from, or -1 to keep the session's own (the primary screen's)
+ * framing, which is the pre-addendum answer.
+ *
+ * Re-framed only when every one of these holds:
+ *  - @p m is a per-screen table (count 1..XRT_MAX_SEGMENTS; count 1 is a
+ *    window wholly on a non-primary screen);
+ *  - it was cut from a window of the live size @p live_w x @p live_h (a resize
+ *    in flight keeps the old framing for that locate);
+ *  - the element lies wholly on ONE segment (@ref u_weave_rect_single_segment)
+ *    — an element that straddles a seam keeps the primary's views, because
+ *    rendering it per part needs a second view set the page cannot take yet
+ *    (displayxr-browser-pvt#272);
+ *  - that segment is not the primary screen's (the session's own framing
+ *    already is that screen);
+ *  - its screen's physical and desktop sizes are known (the Kooima needs them).
+ */
+static inline int32_t
+u_weave_zone_screen_segment(const struct xrt_segment_metrics *m,
+                            const struct xrt_rect *zone,
+                            uint32_t live_w,
+                            uint32_t live_h)
+{
+	if (m == NULL || zone == NULL || m->count == 0 || m->count > XRT_MAX_SEGMENTS) {
+		return -1;
+	}
+	if (m->window_pixel_width != live_w || m->window_pixel_height != live_h) {
+		return -1;
+	}
+	const int32_t k = u_weave_rect_single_segment(m, zone);
+	if (k < 0) {
+		return -1;
+	}
+	const struct xrt_segment_metric *s = &m->seg[k];
+	if (s->is_primary || s->screen_width_m <= 0.0f || s->screen_height_m <= 0.0f || s->screen_desktop_width == 0 ||
+	    s->screen_desktop_height == 0) {
+		return -1;
+	}
+	return k;
+}
+
+/*!
+ * The WHOLE window of table @p m as window metrics relative to segment @p k's
+ * screen: that screen's display rect and physical size, the window's client
+ * area in desktop px, the window's metres at that screen's pixel pitch and its
+ * centre in that screen's display space. A zone rebase
+ * (u_canvas_apply_to_metrics) then places an element on that screen exactly as
+ * it places one on the primary from the session's own window metrics.
+ *
+ * The same arithmetic as oxr_segment_views_whole_window_metrics (cross-checked
+ * in tests/tests_weave_segments.cpp); here because the IPC server, which frames
+ * a present-owner's locates, cannot link the state tracker.
+ *
+ * @return false (and @p out zeroed) when the table or the screen lacks a size.
+ */
+static inline bool
+u_weave_segment_window_metrics(const struct xrt_segment_metrics *m, uint32_t k, struct xrt_window_metrics *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (m == NULL || k >= m->count || k >= XRT_MAX_SEGMENTS || m->window_pixel_width == 0 ||
+	    m->window_pixel_height == 0) {
+		return false;
+	}
+	const struct xrt_segment_metric *s = &m->seg[k];
+	if (s->screen_desktop_width == 0 || s->screen_desktop_height == 0 || s->screen_width_m <= 0.0f ||
+	    s->screen_height_m <= 0.0f) {
+		return false;
+	}
+	const float px = s->screen_width_m / (float)s->screen_desktop_width;
+	const float py = s->screen_height_m / (float)s->screen_desktop_height;
+	out->display_width_m = s->screen_width_m;
+	out->display_height_m = s->screen_height_m;
+	out->display_pixel_width = s->screen_desktop_width;
+	out->display_pixel_height = s->screen_desktop_height;
+	out->display_screen_left = s->screen_desktop_left;
+	out->display_screen_top = s->screen_desktop_top;
+	out->window_orientation.x = 0.0f;
+	out->window_orientation.y = 0.0f;
+	out->window_orientation.z = 0.0f;
+	out->window_orientation.w = 1.0f;
+	out->window_pixel_width = m->window_pixel_width;
+	out->window_pixel_height = m->window_pixel_height;
+	out->window_screen_left = m->window_screen_left;
+	out->window_screen_top = m->window_screen_top;
+	out->window_width_m = (float)m->window_pixel_width * px;
+	out->window_height_m = (float)m->window_pixel_height * py;
+	const float wcx = (float)(m->window_screen_left - s->screen_desktop_left) + (float)m->window_pixel_width * 0.5f;
+	const float wcy = (float)(m->window_screen_top - s->screen_desktop_top) + (float)m->window_pixel_height * 0.5f;
+	out->window_center_offset_x_m = (wcx - (float)s->screen_desktop_width * 0.5f) * px;
+	out->window_center_offset_y_m = -(wcy - (float)s->screen_desktop_height * 0.5f) * py;
+	out->valid = true;
+	return true;
 }
 
 #ifdef __cplusplus
