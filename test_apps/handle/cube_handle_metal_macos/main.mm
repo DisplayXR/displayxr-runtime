@@ -897,7 +897,10 @@ static void EnsureDepthTexture(MetalRenderer &r, uint32_t w, uint32_t h)
 // FOOTPRINT (rays from the outer eyes through a ring of points around the
 // hotspot) and hands the nearest hit to xrLocateViews. The runtime returns
 // where to draw the cursor sprite; the app draws it last, depth test off, and
-// hides the OS cursor while it does. Opt out with DISPLAYXR_CURSOR_DEPTH=0;
+// hides the OS cursor while it does. Since spec v4 (ADR-046 Amendment 2) that
+// is only while content pops out of the screen under the cursor: over the
+// floor, empty space or anything on/behind the glass, isActive is false and the
+// OS cursor is the cursor. Opt out with DISPLAYXR_CURSOR_DEPTH=0;
 // pick the anchor mode with DISPLAYXR_CURSOR_DEPTH_ANCHOR=hybrid|screen|world
 // (unset = the runtime default, HYBRID).
 // ============================================================================

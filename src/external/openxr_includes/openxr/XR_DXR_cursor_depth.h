@@ -53,8 +53,18 @@
  * head-tracked panel: the default anchor is now HYBRID (the sprite follows the
  * pointer's line of sight while the pointer moves, and is world-fixed while it
  * is still, so it motion-parallaxes like the content it rests on) and the
- * default margin is 0.005 (was 0.03). An app that wants the v1/v2 placement
- * chains the options struct with XR_CURSOR_DEPTH_ANCHOR_MODE_SCREEN_DXR.
+ * default margin was 0.005 (v4 restores 0.03). An app that wants the v1/v2
+ * placement chains the options struct with XR_CURSOR_DEPTH_ANCHOR_MODE_SCREEN_DXR.
+ *
+ * Spec v4 (ADR-046 Amendment 2 A, one cursor policy everywhere) changes
+ * behaviour, not structs:
+ *  - NEVER BEHIND THE GLASS: target = d < 0 ? max(d - margin, -0.6) : 0.
+ *    Content on or behind the display plane leaves the cursor on the plane.
+ *  - default margin 0.03 again;
+ *  - isActive is XR_TRUE only while the FILTERED disparity is at least 0.005
+ *    eye baselines in front of the plane. On the plane the OS cursor is the
+ *    cursor: draw nothing and show it. The filter keeps running while
+ *    inactive, so the drawn cursor hands back and returns smoothly.
  *
  * One call, one space. The hint is chained on XrViewLocateInfo::next and the
  * result on XrViewState::next of the SAME xrLocateViews call, and both are in
@@ -78,7 +88,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_cursor_depth 1
-#define XR_DXR_cursor_depth_SPEC_VERSION 3
+#define XR_DXR_cursor_depth_SPEC_VERSION 4
 #define XR_DXR_CURSOR_DEPTH_EXTENSION_NAME "XR_DXR_cursor_depth"
 
 // Reserved 1004999320-329 (next free decade after stereo_camera's 310-319).
@@ -227,7 +237,7 @@ typedef struct XrCursorDepthOptionsDXR {
     /*!
      * How far in front of the content the cursor floats, as a disparity in
      * eye-baseline units (> 0). <= 0 or non-finite selects the runtime
-     * default (0.005).
+     * default (0.03; spec v3 used 0.005).
      */
     float                      margin;
 } XrCursorDepthOptionsDXR;
@@ -247,8 +257,12 @@ typedef struct XrCursorDepthPlacementDXR {
     void* XR_MAY_ALIAS next;
     /*!
      * XR_FALSE when there is nothing to draw: no hint chained on this locate,
-     * fewer than two active views (2D), a cursor off the canvas, or degenerate
-     * view geometry. Every other field is then zero / identity.
+     * fewer than two active views (2D), a cursor off the canvas, degenerate
+     * view geometry, or (spec v4) a filtered disparity above the draw
+     * threshold (-0.005: the cursor is on, or within 0.005 baselines of, the
+     * display plane - the OS cursor is the cursor). pose is then identity and
+     * height 0; disparity and targetDisparity are still filled whenever the
+     * geometry was valid (diagnostics).
      */
     XrBool32 isActive;
     /*!
@@ -268,11 +282,12 @@ typedef struct XrCursorDepthPlacementDXR {
     float height;
     /*!
      * Filtered disparity, in units of the eye baseline: 0 = on the display
-     * plane, < 0 = in front of it (crossed), > 0 = behind. Diagnostic; the
-     * pose already encodes it.
+     * plane, < 0 = in front of it (crossed). Never > 0 since spec v4 (never
+     * behind the glass). Diagnostic; the pose already encodes it.
      */
     float disparity;
-    //! Unfiltered target disparity this locate (content + margin, clamped). Diagnostic.
+    //! Unfiltered target disparity this locate: content - margin, clamped to
+    //! [-0.6, 0]; 0 when the content is on or behind the plane. Diagnostic.
     float targetDisparity;
 } XrCursorDepthPlacementDXR;
 

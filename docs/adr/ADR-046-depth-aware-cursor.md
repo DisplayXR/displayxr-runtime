@@ -559,6 +559,20 @@ sprite and the depth, and the runtime owns the drawing. Apps get the same contra
   runtime as the sprite (B.1). Pages then style the depth cursor with plain CSS, and the SDK
   needs no cursor code for it.
 
+#### §A as built in the runtime (#1847, `XR_DXR_cursor_depth` spec v4)
+
+- `u_cursor_depth_target()` is A.1 verbatim; the upper clamp is 0 whatever the tuning says
+  (`max_disparity` defaults to 0 and a value > 0 is treated as 0). Margin default 0.03 (A.2),
+  still overridable through `XrCursorDepthOptionsDXR::margin`.
+- A.3 is `u_cursor_depth_should_draw()` (threshold −0.005). The state tracker reports it as
+  `XrCursorDepthPlacementDXR::isActive`, whose meaning was already "draw nothing, show the OS
+  cursor", so no struct changed. The filter and the HYBRID anchor step on every locate, drawn or
+  not, so the hand-back is smooth. `disparity` / `targetDisparity` stay filled as diagnostics.
+- The 0.5 px floor is left to the drawing backend (Part B): the placement does not know the
+  panel's pixel pitch, and −0.005 baselines (~0.33 mm at 65 mm IPD) is above 0.5 px on every
+  current panel.
+- A.5 (hybrid line-of-sight anchor) was already the v3 default and is unchanged.
+
 ### Rollout
 
 1. **Groundwork:**
