@@ -173,6 +173,21 @@ comp_gl_compositor_zones_set_frame_wish(struct xrt_compositor *xc, void *mask);
 bool
 comp_gl_compositor_get_recommended_view_size(struct xrt_compositor *xc, uint32_t *out_w, uint32_t *out_h);
 
+struct u_cursor_draw_request;
+
+/*!
+ * XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B): draw the cursor sprite into
+ * every view tile at the NEXT layer_commit only, after the app's layers
+ * (projection, quad, window-space) and before the display processor. Called by
+ * the state tracker only on a frame whose locate chained
+ * XrCursorDepthDrawInfoDXR and reported willDraw; a compositor never handed a
+ * request does no cursor work at all.
+ *
+ * @ingroup comp_gl
+ */
+void
+comp_gl_compositor_set_cursor_draw_request(struct xrt_compositor *xc, const struct u_cursor_draw_request *req);
+
 struct xrt_screen_list;
 struct xrt_segment_metrics;
 struct xrt_segment_view_routing;

@@ -16,6 +16,7 @@
 #include "d3d11/comp_d3d11_window.h"
 #endif
 
+#include "util/comp_cursor_look.h"
 #include "util/comp_layer_accum.h"
 // Multi-screen #1883: the painted-partition type the repaint snapshot carries
 // (declarations only; the segment path itself is Windows-only).
@@ -64,6 +65,7 @@
 #include "util/u_tiling.h"
 #include "util/u_canvas.h"
 #include "util/u_capture_intent.h"
+#include "util/u_cursor_depth.h"
 #include "util/u_repaint_gate.h"
 #include "util/u_fill_thread_win.h"
 #include "util/u_image_capture.h"
@@ -723,6 +725,38 @@ struct comp_gl_compositor
 	GLuint program_blit;      //!< Shader for blitting eye to atlas texture
 	GLuint program_blit_array; //!< Blit shader for LAYERED (array) swapchains (sampler2DArray)
 	GLuint program_window_space; //!< Window-space layer (positioned quad)
+
+	/*!
+	 * XR_DXR_cursor_depth v5, the runtime draws the cursor (ADR-046
+	 * Amendment 2 B).
+	 *
+	 * ZERO COST UNLESS REQUESTED: all zero for a session that never chained
+	 * XrCursorDepthDrawInfoDXR. layer_commit tests `req.requested` and does
+	 * nothing else; the program and the default-look texture are built on
+	 * the first real request only.
+	 */
+	struct
+	{
+		//! One-frame request from the state tracker, consumed by the next commit.
+		struct u_cursor_draw_request req;
+		//! This commit carries a cursor (read by gl_frame_takes_fast_path).
+		bool pending;
+		//! ...and its source is display-referred (an sRGB sprite or the
+		//! default look), so a fast-path frame may draw it undecoded.
+		bool pending_source_srgb;
+		GLuint program;
+		bool program_failed;
+		GLint loc_corners;
+		GLint loc_tex;
+		//! The default look's sprite (premultiplied, sRGB-encoded bytes).
+		GLuint default_tex;
+		uint64_t default_gen;
+		bool default_uploaded;
+		//! The shared default look (mirrored OS cursor, else the arrow).
+		struct comp_cursor_look look;
+		bool announced;
+		bool warned_array;
+	} cursor_draw;
 	//! #1581 XrCompositionLayerQuad — world-placed quad through the per-view
 	//! camera. Straight vs premultiplied alpha is blend STATE in GL, so one
 	//! program covers both; the `_array` twin only exists for arraySize>1
@@ -5899,11 +5933,269 @@ gl_frame_takes_fast_path(struct comp_gl_compositor *c)
 		}
 	}
 
+	// XR_DXR_cursor_depth v5: the runtime-drawn cursor is one more sub-rect
+	// layer blended over the frame, so it is a compose case like a quad -
+	// and a scene-linear (UNORM) sprite owes the encode.
+	if (c->cursor_draw.pending) {
+		contributing++;
+		if (!c->cursor_draw.pending_source_srgb) {
+			all_sources_srgb = false;
+		}
+	}
+
 	if (c->legacy_color) {
 		return true;
 	}
 	return u_color_compose_fast_path(c->legacy_color, contributing, base_is_projection, all_sources_srgb) &&
 	       gl_has_srgb_decode_ext();
+}
+
+/*
+ *
+ * XR_DXR_cursor_depth v5 - the runtime draws the cursor (ADR-046 Amendment 2 B)
+ *
+ * After the app's layers are composited into the atlas (projection, quad,
+ * window-space) and before the display processor, one sprite per view: a
+ * textured, alpha-blended triangle strip, depth test off, scissored to the
+ * tile, at the corners the state tracker's per-view map gives. It draws into
+ * whatever the atlas pass is painting - the private GL_SRGB8_ALPHA8 compose
+ * target with GL_FRAMEBUFFER_SRGB on (linear blend, sources decoded), or the
+ * ENCODED atlas directly on the fast path (sources read undecoded) - and
+ * binds its source through gl_bind_layer_source(), the same rule as every
+ * layer, so the atlas is never double-encoded. Built on the first request.
+ *
+ */
+
+static const char *VS_CURSOR =
+    "#version 330 core\n"
+    "// corners[k]: xy = NDC, zw = texture uv; a 4-vertex triangle strip.\n"
+    "uniform vec4 u_corners[4];\n"
+    "out vec2 v_uv;\n"
+    "void main() {\n"
+    "    vec4 c = u_corners[gl_VertexID];\n"
+    "    v_uv = c.zw;\n"
+    "    gl_Position = vec4(c.xy, 0.0, 1.0);\n"
+    "}\n";
+
+static const char *FS_CURSOR =
+    "#version 330 core\n"
+    "in vec2 v_uv;\n"
+    "out vec4 fragColor;\n"
+    "uniform sampler2D u_texture;\n"
+    "void main() {\n"
+    "    fragColor = texture(u_texture, v_uv);\n"
+    "}\n";
+
+static bool
+gl_cursor_ensure_program(struct comp_gl_compositor *c)
+{
+	if (c->cursor_draw.program != 0) {
+		return true;
+	}
+	if (c->cursor_draw.program_failed) {
+		return false;
+	}
+	c->cursor_draw.program = create_program(VS_CURSOR, FS_CURSOR);
+	if (c->cursor_draw.program == 0) {
+		c->cursor_draw.program_failed = true; // never retried per frame
+		U_LOG_E("cursor_draw: GL program build failed - cursor not drawn");
+		return false;
+	}
+	c->cursor_draw.loc_corners = glGetUniformLocation(c->cursor_draw.program, "u_corners");
+	c->cursor_draw.loc_tex = glGetUniformLocation(c->cursor_draw.program, "u_texture");
+	return true;
+}
+
+/*!
+ * The default look (Amendment 2 A.6), shared with the Metal and Vulkan
+ * compositors (comp_cursor_look). Uploaded only when its image changes, as
+ * GL_SRGB8_ALPHA8 so gl_bind_layer_source() can read it decoded (compose
+ * target) or undecoded (fast path); GL_RGBA8 holding the same encoded bytes
+ * on a stack without GL_EXT_texture_sRGB_decode, where only the latter is
+ * expressible. Rows go in top row first, so texture t = 0 is the TOP.
+ */
+static bool
+gl_cursor_update_default(struct comp_gl_compositor *c, float backing_scale)
+{
+	struct comp_cursor_look *look = &c->cursor_draw.look;
+	if (!comp_cursor_look_update(look, backing_scale)) {
+		return c->cursor_draw.default_tex != 0;
+	}
+	if (c->cursor_draw.default_uploaded && c->cursor_draw.default_gen == look->generation) {
+		return true;
+	}
+	if (c->cursor_draw.default_tex == 0) {
+		glGenTextures(1, &c->cursor_draw.default_tex);
+	}
+	GLint prev_tex = 0;
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+	GLint prev_align = 4;
+	glGetIntegerv(GL_UNPACK_ALIGNMENT, &prev_align);
+	glBindTexture(GL_TEXTURE_2D, c->cursor_draw.default_tex);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+	glTexImage2D(GL_TEXTURE_2D, 0, gl_has_srgb_decode_ext() ? GL_SRGB8_ALPHA8 : GL_RGBA8, (GLsizei)look->w,
+	             (GLsizei)look->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, look->rgba);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, prev_align);
+	glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
+	c->cursor_draw.default_gen = look->generation;
+	c->cursor_draw.default_uploaded = true;
+	return true;
+}
+
+/*!
+ * Draw the requested cursor into every tile of the bound atlas framebuffer.
+ *
+ * @return true if anything was drawn (the caller republishes the compose
+ *         target).
+ */
+static bool
+gl_cursor_draw(struct comp_gl_compositor *c, const struct u_cursor_draw_request *req)
+{
+	if (!gl_cursor_ensure_program(c)) {
+		return false;
+	}
+	// Panel pixel pitch (metres per backing pixel) and the OS point.
+	if (!c->sys_info_set || c->sys_info.display_pixel_height == 0 || !(c->sys_info.display_height_m > 0.0f)) {
+		return false;
+	}
+	const float m_per_px = c->sys_info.display_height_m / (float)c->sys_info.display_pixel_height;
+	const float backing_scale = comp_cursor_look_backing_scale();
+	const float m_per_pt = m_per_px * backing_scale;
+	// The canvas the Kooima views were built for: the window's client area.
+	uint32_t canvas_px_h = 0;
+	struct xrt_window_metrics wm;
+	if (comp_gl_compositor_get_window_metrics(&c->base.base, &wm) && wm.valid) {
+		canvas_px_h = wm.window_pixel_height;
+	}
+	if (canvas_px_h == 0) {
+		canvas_px_h = c->eff_rows * c->eff_tile_h;
+	}
+	if (canvas_px_h == 0) {
+		return false;
+	}
+	const float canvas_h_m = (float)canvas_px_h * m_per_px;
+
+	GLuint tex = 0;
+	float aspect, hot_u, hot_v, size_m;
+	bool premul;
+	bool flip_v;
+	if (req->image != NULL) {
+		struct comp_gl_swapchain *gsc = gl_swapchain(req->image);
+		if (req->image_index >= gsc->image_count || gsc->info.height == 0) {
+			return false;
+		}
+		if (gsc->target != GL_TEXTURE_2D) {
+			if (!c->cursor_draw.warned_array) {
+				c->cursor_draw.warned_array = true;
+				U_LOG_W(
+				    "cursor_draw: a layered (arraySize > 1) GL sprite swapchain is not drawn yet "
+				    "(one-time warning)");
+			}
+			return false;
+		}
+		tex = gsc->textures[req->image_index];
+		aspect = (float)gsc->info.width / (float)gsc->info.height;
+		hot_u = req->hot_u;
+		hot_v = req->hot_v;
+		size_m = req->size_m > 0.0f ? req->size_m : U_CURSOR_DRAW_DEFAULT_POINTS * m_per_pt;
+		premul = false; // spec: the app's sprite is STRAIGHT alpha
+		// A GL app's image is bottom-up (its last row is its top), as GL
+		// renders it - same rule as the Metal compositor's GL-source flip.
+		flip_v = true;
+	} else {
+		if (!gl_cursor_update_default(c, backing_scale)) {
+			return false;
+		}
+		tex = c->cursor_draw.default_tex;
+		aspect = c->cursor_draw.look.aspect;
+		hot_u = c->cursor_draw.look.hot_u;
+		hot_v = c->cursor_draw.look.hot_v;
+		size_m = req->size_m > 0.0f ? req->size_m : c->cursor_draw.look.height_pt * m_per_pt;
+		premul = true;  // the look's pixels are premultiplied
+		flip_v = false; // uploaded top row first
+	}
+	const float height = size_m / canvas_h_m; // sprite height, in units
+
+	// Mono content fills the whole content region; otherwise view i owns
+	// tile i of the effective grid (#542), placed bottom-left-origin (#1625).
+	const uint32_t cols = c->eff_cols > 0 ? c->eff_cols : 1;
+	const uint32_t rows = c->eff_rows > 0 ? c->eff_rows : 1;
+	const bool mono = c->eff_views <= 1;
+	const uint32_t tiles = mono ? 1 : cols * rows;
+	const uint32_t n = req->view_count < tiles ? req->view_count : tiles;
+	if (n == 0 || c->eff_tile_w == 0 || c->eff_tile_h == 0) {
+		return false;
+	}
+
+	GLint prev_viewport[4];
+	glGetIntegerv(GL_VIEWPORT, prev_viewport);
+	GLint prev_scissor[4];
+	glGetIntegerv(GL_SCISSOR_BOX, prev_scissor);
+
+	glUseProgram(c->cursor_draw.program);
+	glBindVertexArray(c->vao_empty);
+	glActiveTexture(GL_TEXTURE0);
+	gl_bind_layer_source(GL_TEXTURE_2D, tex, c->compose_active);
+	glUniform1i(c->cursor_draw.loc_tex, 0);
+	glEnable(GL_BLEND);
+	glBlendFuncSeparate(premul ? GL_ONE : GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+	// The scissor is mandatory: a cursor at a tile edge must not spill into
+	// the neighbour view (the DP would weave it into the wrong eye).
+	glEnable(GL_SCISSOR_TEST);
+
+	static const float uv[4][2] = {{0, 0}, {0, 1}, {1, 0}, {1, 1}};
+	for (uint32_t i = 0; i < n; i++) {
+		uint32_t bx = 0, by = 0, bw = cols * c->eff_tile_w, bh = rows * c->eff_tile_h;
+		if (!mono) {
+			u_tiling_view_origin_gl(i, cols, rows, c->eff_tile_w, c->eff_tile_h, &bx, &by);
+			bw = c->eff_tile_w;
+			bh = c->eff_tile_h;
+		}
+		glViewport((GLint)bx, (GLint)by, (GLsizei)bw, (GLsizei)bh);
+		glScissor((GLint)bx, (GLint)by, (GLsizei)bw, (GLsizei)bh);
+
+		float xy[4][2];
+		u_cursor_draw_corners(&req->view[i], height, aspect, hot_u, hot_v, xy);
+		float corners[4][4];
+		for (int k = 0; k < 4; k++) {
+			// Tile-normalised, y DOWN -> GL NDC, y UP.
+			corners[k][0] = xy[k][0] * 2.0f - 1.0f;
+			corners[k][1] = 1.0f - xy[k][1] * 2.0f;
+			corners[k][2] = uv[k][0];
+			corners[k][3] = flip_v ? 1.0f - uv[k][1] : uv[k][1];
+		}
+		glUniform4fv(c->cursor_draw.loc_corners, 4, &corners[0][0]);
+		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	}
+
+	glDisable(GL_SCISSOR_TEST);
+	glDisable(GL_BLEND);
+	glBlendFunc(GL_ONE, GL_ZERO);
+	glScissor(prev_scissor[0], prev_scissor[1], prev_scissor[2], prev_scissor[3]);
+	glViewport(prev_viewport[0], prev_viewport[1], prev_viewport[2], prev_viewport[3]);
+	glBindTexture(GL_TEXTURE_2D, 0);
+	glUseProgram(0);
+
+	if (!c->cursor_draw.announced) {
+		c->cursor_draw.announced = true;
+		U_LOG_W(
+		    "cursor_draw: GL compositor drawing the cursor (%s, %.1f mm tall, %u view(s), %s; ADR-046 "
+		    "Amendment 2 B, one-time notice)",
+		    req->image != NULL ? "app sprite" : "default look", size_m * 1000.0f, n,
+		    c->compose_active ? "linear compose target" : "encoded atlas");
+	}
+	return true;
+}
+
+void
+comp_gl_compositor_set_cursor_draw_request(struct xrt_compositor *xc, const struct u_cursor_draw_request *req)
+{
+	struct comp_gl_compositor *c = gl_comp(xc);
+	c->cursor_draw.req = *req;
 }
 
 /*!
@@ -5941,6 +6233,24 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 		} else if (c->layer_accum.layers[i].data.type == XRT_LAYER_ZONE_3D) {
 			c->zones_frame = true;
 		}
+	}
+
+	/*
+	 * XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B). ZERO COST UNLESS
+	 * REQUESTED: one field test, false for every session that never chained
+	 * XrCursorDepthDrawInfoDXR. The request covers this commit only. Zones
+	 * frames are refused by the state tracker already; belt and braces.
+	 */
+	struct u_cursor_draw_request cursor_req = {};
+	bool cursor_pending = false;
+	c->cursor_draw.pending = false;
+	if (c->cursor_draw.req.requested) {
+		cursor_req = c->cursor_draw.req;
+		c->cursor_draw.req.requested = false;
+		cursor_pending = !c->zones_frame && u_cursor_draw_should_draw(&cursor_req);
+		c->cursor_draw.pending = cursor_pending;
+		c->cursor_draw.pending_source_srgb =
+		    cursor_req.image == NULL || gl_swapchain_is_srgb(gl_swapchain(cursor_req.image));
 	}
 
 	// Save previous GL context and switch to compositor's
@@ -6141,7 +6451,10 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 			if (idx < c->xdev->rendering_mode_count)
 				mode = &c->xdev->rendering_modes[idx];
 		}
-		if (mode != NULL && c->layer_accum.layer_count == 1 && !seg_routed_frame) {
+		// XR_DXR_cursor_depth v5: a frame carrying a runtime-drawn cursor
+		// composes into the atlas - the cursor is drawn there, never into the
+		// app's own image.
+		if (mode != NULL && c->layer_accum.layer_count == 1 && !seg_routed_frame && !cursor_pending) {
 			struct comp_layer *layer = &c->layer_accum.layers[0];
 			if (layer->data.type == XRT_LAYER_PROJECTION ||
 			    layer->data.type == XRT_LAYER_PROJECTION_DEPTH) {
@@ -6763,6 +7076,20 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 		glDisable(GL_BLEND);
 	}
 
+	// XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B): the runtime-drawn
+	// cursor, LAST - over the projection, quad and window-space layers, never
+	// occluded - and before the display processor. Into the same target the
+	// pass painted, so the publish below (and the /tmp/dxr_atlas_trigger dump
+	// after it) carries it. Not on a multi-screen routed frame (a tile is a
+	// per-segment mosaic there).
+	bool cursor_routed = false;
+#ifdef XRT_OS_WINDOWS
+	cursor_routed = seg_routed_frame;
+#endif
+	if (cursor_pending && !cursor_routed && gl_cursor_draw(c, &cursor_req)) {
+		window_space_drew = true; // republish the compose target
+	}
+
 	// #1610: republish only if the window-space pass actually painted, then
 	// hand the pass back with the encode OFF — everything downstream (the
 	// Local2D flatten, the weave, the present blit) writes GL_RGBA8 targets
@@ -7169,6 +7496,12 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 	if (c->program_blit) glDeleteProgram(c->program_blit);
 	if (c->program_blit_array) glDeleteProgram(c->program_blit_array);
 	if (c->program_window_space) glDeleteProgram(c->program_window_space);
+	// XR_DXR_cursor_depth v5 draw resources (zero unless ever requested).
+	if (c->cursor_draw.program)
+		glDeleteProgram(c->cursor_draw.program);
+	if (c->cursor_draw.default_tex)
+		glDeleteTextures(1, &c->cursor_draw.default_tex);
+	comp_cursor_look_fini(&c->cursor_draw.look);
 	if (c->program_masked_composite) glDeleteProgram(c->program_masked_composite);
 	if (c->program_quad) glDeleteProgram(c->program_quad);
 	if (c->program_quad_array) glDeleteProgram(c->program_quad_array);

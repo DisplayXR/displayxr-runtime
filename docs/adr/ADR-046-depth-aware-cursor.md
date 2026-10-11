@@ -1,6 +1,6 @@
 # ADR-046: Depth-aware cursor — opt-in only; the app knows the depth, the runtime places the cursor
 
-**Status:** Proposed (2026-10-06) · Phase 1 implemented · Phase 3a implemented (Metal) · spec v3 anchor modes (2026-10-07) · Amendment 1 (lifted content, 2026-10-10) accepted · Amendment 2 (one policy, runtime draws, app chooses the look, 2026-10-11) accepted, §B built on Metal (spec v5) · spec:
+**Status:** Proposed (2026-10-06) · Phase 1 implemented · Phase 3a implemented (Metal) · spec v3 anchor modes (2026-10-07) · Amendment 1 (lifted content, 2026-10-10) accepted · Amendment 2 (one policy, runtime draws, app chooses the look, 2026-10-11) accepted, §B built on Metal, Vulkan and GL (spec v5) · spec:
 [XR_DXR_cursor_depth.md](../specs/extensions/XR_DXR_cursor_depth.md) · sibling of
 [ADR-040](ADR-040-rear-depth-budget.md) (the same cue conflict, at the cursor instead of the desktop)
 
@@ -605,9 +605,69 @@ sprite and the depth, and the runtime owns the drawing. Apps get the same contra
   metres per point (pixel pitch × backing scale). Off the main thread the last snapshot is
   kept, else the classic arrow (12 × 19, white fill, dark outline, rasterised procedurally,
   4 × 4 supersampled). `DXR_CURSOR_DEFAULT_LOOK=arrow` forces the arrow.
-- **Not yet:** D3D11, D3D12, GL, vk_native and the service (`svc_draw_cursor_quads`) report
+- **Not yet:** D3D11, D3D12 and the service (`svc_draw_cursor_quads`) report
   `willDraw = XR_FALSE`; display zones; multi-screen routed frames draw per tile without the
-  segment routing; the 0.5 px floor of A.3 is not applied (−0.005 is above it on current panels).
+  segment routing on Metal (Vulkan and GL skip them); the 0.5 px floor of A.3 is not applied
+  (−0.005 is above it on current panels).
+
+#### §B as built on Vulkan and GL (`XR_DXR_cursor_depth` spec v5, unchanged)
+
+- **One default look for every backend.** The Metal compositor's default-look code moved to
+  `compositor/util/comp_cursor_look.{h,c}` (+ `comp_cursor_look_macos.m`), a small library the
+  Metal, vk_native and GL compositors all link: it picks the look (mirrored `[NSCursor
+  currentCursor]` on the main thread, else the last snapshot, else the procedural arrow from
+  `u_cursor_draw_arrow_rgba()`), rasterises it once per change into premultiplied, sRGB-encoded
+  RGBA8, and reports aspect, hotspot and size in points plus the main screen's backing scale.
+  Each compositor only uploads the pixels when the look's `generation` moves.
+  `DXR_CURSOR_DEFAULT_LOOK=arrow` forces the arrow on all three. **OS-cursor mirroring is
+  macOS-only:** Linux (`XFixesGetCursorImage`) and Windows (`GetCursorInfo` + `GetIconInfo`)
+  draw the arrow; mirroring there is future work.
+- **State tracker.** Additive only: `oxr_session_cursor_draw_supported()` /
+  `_hand_request()` gained the `is_vk_native_compositor` and `is_gl_native_compositor` arms.
+  The placement, the per-view map and the zero-cost gate are the Metal ones.
+- **vk_native.** The request is consumed by the next commit (one field test otherwise) and
+  resolved there into tile-normalised corners per view (`u_cursor_draw_corners`). A cursor frame
+  never zero-copies and always takes the renderer's **compose render pass** (the blit fast path
+  cannot blend): the cursor is the pass's last draw, one quad per view tile through the pass's
+  own pipelines (the QUAD vertex path with an affine MVP built from three corners; straight or
+  premultiplied blend), scissored to the tile, depth off. Because the pass renders into the
+  private `_SRGB` compose target and publishes to the atlas with a raw copy, the sprite blends
+  in linear light, an `_SRGB` sprite is decoded on sample (the same single source-view choice as
+  every layer, `compose_source_view()`), and the atlas stays ENCODED — never double-encoded. The
+  default look is an `R8G8B8A8_SRGB` image (UNORM under the legacy colour hatch) uploaded
+  through a staging buffer inside the same command buffer. Nothing is created before the first
+  request; the descriptor pool carries one extra set for the cursor. **Ordering differs from
+  Metal:** vk_native stamps window-space layers in a later, weave-time pass (several call sites,
+  some on the async weave hand-off), so the cursor is drawn over projection, quad and equirect2
+  layers but **under** window-space layers. Both the projection-only and the post-compose
+  `$TMPDIR/displayxr_atlas_trigger` captures show it.
+- **GL.** Drawn after the window-space layers, before the DP, into whatever the atlas pass is
+  painting: the private `GL_SRGB8_ALPHA8` compose target with `GL_FRAMEBUFFER_SRGB` on, or the
+  ENCODED atlas directly. The source is bound through `gl_bind_layer_source()` (decode iff
+  composing), the same rule as every layer; a cursor frame counts as one more sub-rect layer in
+  `gl_frame_takes_fast_path()` (a scene-linear UNORM sprite forces the compose path when it
+  exists). A small program (corners as uniforms, `gl_VertexID` strip), per-tile viewport +
+  scissor, blend state restored. A GL sprite is sampled bottom-up (its top is its last row —
+  the Metal compositor's GL-source flip). A layered (`arraySize > 1`) GL sprite is not drawn
+  yet (one-time WARN). On Apple's GL 4.1 there is no `glCopyImageSubData`, so every macOS GL
+  frame composes in encoded space, cursor included; the linear compose-target path was not run
+  here.
+- **Measured** (macOS, sim-display Cropped SBS, cube reference apps at `cursorUV` 0.5,0.5 over
+  the cube, `DXR_CURSOR_DEFAULT_LOOK=arrow`): GL −23.6 px in the 1512 × 1646 atlas (Metal −24.0
+  on the same app geometry), vk_native −22.0 px in its 1280 × 1440 atlas; nothing drawn at
+  0.1,0.1; the arrow's fill reads (255,255,255) and its outline (5,5,8), the custom ring
+  (0,220,255) — exactly the authored bytes, so no encode is lost or doubled.
+- **Known issue (GL on macOS, not caused by the draw):** `cube_handle_gl_macos` crashes in
+  roughly 1 of 5 launches once the depth cursor is ACTIVE — in Apple's GL driver, on the #868
+  repaint thread (`gl_repaint_thread` → `glBlitFramebuffer`) or in the app's own draw. It
+  follows the app's `[NSCursor hide]`, not the runtime draw: app-draw mode crashes too; the
+  runtime draw with the OS cursor left visible (0/10), `DXR_WEAVE_REPAINT=0` (0/8) and the
+  extension off (0/20) do not. The GL cube never hid the OS cursor before this adoption, so this
+  is a latent repaint-thread / AppKit race in the GL compositor surfacing — runtime#1947. Until it
+  is fixed the GL cube's depth cursor is **opt-in** (`DISPLAYXR_CURSOR_DEPTH=1`); the Metal and
+  Vulkan cubes stay default-on.
+- **Found in passing (Metal, #1941):** on the Vulkan-app-on-Metal fallback a custom sprite is
+  handed over as the client swapchain and cast to the native Metal type — runtime#1948.
 
 ### Rollout
 

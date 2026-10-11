@@ -40,6 +40,8 @@ if(APPLE AND XRT_HAVE_METAL)
 			# itself Vulkan-gated, so this adds no new configuration.
 			aux_vk
 			xrt-external-stb
+			# XR_DXR_cursor_depth v5: the runtime-drawn cursor's default look.
+			comp_cursor_look
 			"-framework Metal"
 			"-framework Cocoa"
 			"-framework QuartzCore"

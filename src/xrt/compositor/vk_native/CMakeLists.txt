@@ -83,6 +83,8 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 			aux_os
 			aux_math
 			xrt-external-stb
+			# XR_DXR_cursor_depth v5: the runtime-drawn cursor's default look.
+			comp_cursor_look
 		)
 
 	target_include_directories(comp_vk_native PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

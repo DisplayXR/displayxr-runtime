@@ -23,6 +23,7 @@
 #include "comp_metal_segments.h" // multi-screen on macOS
 #include "comp_metal_placement.h" // runtime-owned window placement (ADR-050)
 
+#include "util/comp_cursor_look.h"
 #include "util/comp_layer_accum.h"
 // #1581 quad layers: the shared per-view camera (#1580) and the N-view
 // LEFT/RIGHT eye-visibility rule.
@@ -509,14 +510,12 @@ struct comp_metal_compositor
 		//! Built lazily: [premultiplied?][_sRGB target?].
 		id<MTLRenderPipelineState> pipe[2][2];
 		bool pipes_failed;
-		//! The default look's sprite (premultiplied, _sRGB, PixelFormatView).
+		//! The default look's sprite (premultiplied, _sRGB, PixelFormatView),
+		//! uploaded from @ref look whenever its generation moves.
 		id<MTLTexture> default_tex;
-		//! The OS cursor it mirrors (retained), nil for the arrow fallback.
-		NSCursor *default_os_cursor;
-		float default_aspect;      //!< width / height
-		float default_hot_u;       //!< hotspot, normalised (top-left, v down)
-		float default_hot_v;
-		float default_height_pt;   //!< height in OS points
+		uint64_t default_gen;
+		//! The shared default look (mirrored OS cursor, else the arrow).
+		struct comp_cursor_look look;
 		bool announced;
 		bool warned_zones;
 	} cursor_draw;
@@ -4101,111 +4100,25 @@ metal_cursor_set_default_tex(struct comp_metal_compositor *c, const uint8_t *rgb
 	return true;
 }
 
-//! The classic arrow fallback (Amendment 2 A.6): 12 x 19, tip = hotspot.
-static bool
-metal_cursor_use_arrow(struct comp_metal_compositor *c)
-{
-	if (c->cursor_draw.default_tex != nil && c->cursor_draw.default_os_cursor == nil) {
-		return true; // already the arrow
-	}
-	const uint32_t h = 76; // 4 px per arrow px: crisp up to 4x scale
-	const uint32_t w = (uint32_t)ceilf((float)h * U_CURSOR_ARROW_WIDTH_PX / U_CURSOR_ARROW_HEIGHT_PX);
-	uint8_t *rgba = calloc((size_t)w * h, 4);
-	if (rgba == NULL) {
-		return false;
-	}
-	u_cursor_draw_arrow_rgba(rgba, w, h);
-	const bool ok = metal_cursor_set_default_tex(c, rgba, w, h);
-	free(rgba);
-	if (!ok) {
-		return false;
-	}
-	[c->cursor_draw.default_os_cursor release];
-	c->cursor_draw.default_os_cursor = nil;
-	c->cursor_draw.default_aspect = (float)w / (float)h;
-	c->cursor_draw.default_hot_u = 0.0f;
-	c->cursor_draw.default_hot_v = 0.0f;
-	c->cursor_draw.default_height_pt = U_CURSOR_DRAW_DEFAULT_POINTS;
-	U_LOG_W("cursor_draw: default look = the classic arrow (12x19, tip = hotspot)");
-	return true;
-}
-
 /*!
- * The default look (Amendment 2 A.6): mirror the CURRENT OS cursor shape.
- *
- * AppKit is main-thread-only, so the shape is read only when this commit runs
- * on the main thread (an app that pumps its own events there, as the
- * cube_*_macos apps do). Off the main thread the last snapshot is kept, or the
- * classic arrow if there never was one. DXR_CURSOR_DEFAULT_LOOK=arrow forces
- * the arrow. The image is re-rasterised only when the cursor object changes.
+ * The default look (Amendment 2 A.6), shared with the Vulkan and GL
+ * compositors (comp_cursor_look): the mirrored OS cursor when the commit runs
+ * on the main thread, else the last snapshot, else the classic arrow. The
+ * texture is re-uploaded only when the look's image changes.
  */
 static bool
 metal_cursor_update_default(struct comp_metal_compositor *c, float backing_scale)
 {
-	static int force_arrow = -1;
-	if (force_arrow < 0) {
-		const char *e = getenv("DXR_CURSOR_DEFAULT_LOOK");
-		force_arrow = (e != NULL && strcmp(e, "arrow") == 0) ? 1 : 0;
+	if (!comp_cursor_look_update(&c->cursor_draw.look, backing_scale)) {
+		return c->cursor_draw.default_tex != nil;
 	}
-	if (force_arrow || ![NSThread isMainThread]) {
-		return c->cursor_draw.default_tex != nil || metal_cursor_use_arrow(c);
+	if (c->cursor_draw.default_tex == nil || c->cursor_draw.default_gen != c->cursor_draw.look.generation) {
+		if (!metal_cursor_set_default_tex(c, c->cursor_draw.look.rgba, c->cursor_draw.look.w,
+		                                  c->cursor_draw.look.h)) {
+			return c->cursor_draw.default_tex != nil;
+		}
+		c->cursor_draw.default_gen = c->cursor_draw.look.generation;
 	}
-
-	NSCursor *cur = [NSCursor currentCursor];
-	if (cur == nil || cur.image == nil) {
-		return c->cursor_draw.default_tex != nil || metal_cursor_use_arrow(c);
-	}
-	if (cur == c->cursor_draw.default_os_cursor && c->cursor_draw.default_tex != nil) {
-		return true;
-	}
-
-	NSImage *img = cur.image;
-	const NSSize sz = img.size; // points
-	const NSPoint hs = cur.hotSpot; // points, origin top-left
-	const CGFloat scale = backing_scale > 0.0f ? backing_scale : 2.0;
-	const uint32_t w = (uint32_t)ceil(sz.width * scale);
-	const uint32_t h = (uint32_t)ceil(sz.height * scale);
-	if (sz.width <= 0.0 || sz.height <= 0.0 || w == 0 || h == 0 || w > 512 || h > 512) {
-		return c->cursor_draw.default_tex != nil || metal_cursor_use_arrow(c);
-	}
-	uint8_t *rgba = calloc((size_t)w * h, 4);
-	CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-	CGContextRef ctx = (rgba != NULL && cs != NULL)
-	                       ? CGBitmapContextCreate(rgba, w, h, 8, (size_t)w * 4, cs,
-	                                               kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big)
-	                       : NULL;
-	bool ok = false;
-	if (ctx != NULL) {
-		// Bitmap-context memory holds the TOP row first, so the upload below
-		// lands top-left-origin, as Metal samples it.
-		NSGraphicsContext *gc = [NSGraphicsContext graphicsContextWithCGContext:ctx flipped:NO];
-		[NSGraphicsContext saveGraphicsState];
-		[NSGraphicsContext setCurrentContext:gc];
-		[img drawInRect:NSMakeRect(0, 0, w, h)
-		       fromRect:NSZeroRect
-		      operation:NSCompositingOperationCopy
-		       fraction:1.0];
-		[NSGraphicsContext restoreGraphicsState];
-		CGContextFlush(ctx);
-		ok = metal_cursor_set_default_tex(c, rgba, w, h);
-		CGContextRelease(ctx);
-	}
-	if (cs != NULL) {
-		CGColorSpaceRelease(cs);
-	}
-	free(rgba);
-	if (!ok) {
-		return c->cursor_draw.default_tex != nil || metal_cursor_use_arrow(c);
-	}
-	[c->cursor_draw.default_os_cursor release];
-	c->cursor_draw.default_os_cursor = [cur retain];
-	c->cursor_draw.default_aspect = (float)(sz.width / sz.height);
-	c->cursor_draw.default_hot_u = (float)(hs.x / sz.width);
-	c->cursor_draw.default_hot_v = (float)(hs.y / sz.height);
-	c->cursor_draw.default_height_pt = (float)sz.height;
-	// Not per frame: only when the app's cursor object changes.
-	U_LOG_W("cursor_draw: default look = the current OS cursor (%.0fx%.0f pt, hotspot %.1f,%.1f%s)", sz.width,
-	        sz.height, hs.x, hs.y, cur == [NSCursor arrowCursor] ? ", arrowCursor" : "");
 	return true;
 }
 
@@ -4263,10 +4176,10 @@ metal_cursor_draw(struct comp_metal_compositor *c,
 			return;
 		}
 		src = metal_layer_source_view(c->cursor_draw.default_tex, 0, compose_linear);
-		aspect = c->cursor_draw.default_aspect;
-		hot_u = c->cursor_draw.default_hot_u;
-		hot_v = c->cursor_draw.default_hot_v;
-		size_m = req->size_m > 0.0f ? req->size_m : c->cursor_draw.default_height_pt * m_per_pt;
+		aspect = c->cursor_draw.look.aspect;
+		hot_u = c->cursor_draw.look.hot_u;
+		hot_v = c->cursor_draw.look.hot_v;
+		size_m = req->size_m > 0.0f ? req->size_m : c->cursor_draw.look.height_pt * m_per_pt;
 		premul = true; // CGBitmapContext output
 	}
 	const float height = size_m / canvas_h_m; // sprite height, in units
@@ -6005,8 +5918,7 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	}
 	[c->cursor_draw.default_tex release];
 	c->cursor_draw.default_tex = nil;
-	[c->cursor_draw.default_os_cursor release];
-	c->cursor_draw.default_os_cursor = nil;
+	comp_cursor_look_fini(&c->cursor_draw.look);
 	[c->depth_texture release];
 	c->depth_texture = nil;
 	[c->projection_pipeline release];

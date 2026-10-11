@@ -70,7 +70,9 @@ FetchContent_Declare(
     # v2.27.0: window-space / HUD swapchains prefer the _SRGB sibling of
     # R8G8B8A8 (dxr::ChooseWindowSpaceSwapchainFormat; ADR-044 §7,
     # displayxr-common#72) — a UNORM HUD of encoded bytes was encoded twice.
-    GIT_TAG v2.27.0
+    # v2.29.0: dxr::CursorDepth (common/cursor_depth.h), the XR_DXR_cursor_depth
+    # app helper (ADR-046 Amendment 2) - same pin as the aggregate test_apps build.
+    GIT_TAG v2.29.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
