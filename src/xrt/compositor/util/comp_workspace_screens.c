@@ -337,6 +337,25 @@ comp_ws_split(const struct comp_ws_screen_set *set,
 }
 
 
+bool
+comp_ws_presenter_frame(const struct comp_ws_screen *primary,
+                        const struct comp_ws_screen *presenter,
+                        struct comp_ws_frame *out)
+{
+	float mx, my;
+	if (primary == NULL || presenter == NULL || out == NULL || !ws_pitch(primary, &mx, &my)) {
+		return false;
+	}
+	out->cx_px =
+	    (float)((double)primary->desktop.x + (double)primary->desktop.w * 0.5 - (double)presenter->desktop.x);
+	out->cy_px =
+	    (float)((double)primary->desktop.y + (double)primary->desktop.h * 0.5 - (double)presenter->desktop.y);
+	out->ppm_x = 1.0f / mx;
+	out->ppm_y = 1.0f / my;
+	return true;
+}
+
+
 /*
  *
  * Cursor.

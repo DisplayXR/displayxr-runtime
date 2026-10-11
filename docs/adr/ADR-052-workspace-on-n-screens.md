@@ -43,9 +43,9 @@ Three constraints frame the decision:
 
 While a workspace is active the service presents on **every claimed 3D screen**, one
 presenter per screen. A presenter is a full-screen window on its screen with its own swap
-chain on the device that presents (the output device under the #918 split — ADR-047
-Amendment 1's rule, a DP lives where its target is), its own DP created from that screen's
-registry entry through `create_dp_d3d11_for_screen`, its own present origin and its own
+chain, its own DP created from that screen's registry entry through
+`create_dp_d3d11_for_screen` on the device the presenter presents from (ADR-047
+Amendment 1's rule, a DP lives where its target is), its own present origin and its own
 eye tracker. The primary presenter is today's service window with today's panel DP,
 unchanged.
 
@@ -121,10 +121,14 @@ controller opt a 2D monitor in as a flat presenter is a later, additive request.
   flips every presenter together; a presenter whose DP declines the mode presents flat.
 - **The cursor sprite** is drawn by the presenter under the pointer, at the controller's
   pushed depth; FRAME_TICK's viewer stays the primary's.
-- **A presenter with no DP** — its plug-in cannot make one, or it was lost and is being
-  recreated — presents its composition flat (one view, no weave), the per-segment
-  refuse-rather-than-resample rule (`comp_segments_decide`). A screen whose claim
-  disappears leaves the set: its presenter is torn down and the controller is told.
+- **A presenter with no DP** — its plug-in cannot make one for that screen — still
+  presents its composition, unwoven (the primary's own no-DP fallback), and the status
+  reports it `woven: false`. A screen whose claim disappears leaves the set: its presenter
+  is torn down and the controller is told.
+- **Secondary presenters live on the render device.** They compose from the clients'
+  atlases there and their swap chains are created there, so by ADR-047 Amendment 1's rule
+  their DPs live there too; the #918 weave-on-scanout split stays the primary's (a
+  cross-adapter transport per presenter is a later optimisation, not a correctness need).
 - **`DXR_SEGMENTS=0`** (the multi-screen kill switch) or **`DXR_WORKSPACE_SCREENS=single`**
   keeps the single presenter; every screen is still listed, only the primary presents.
   `DXR_WORKSPACE_SCREENS=fallback` lets a fallback claim present (development boxes with no
@@ -146,8 +150,11 @@ controller opt a 2D monitor in as a flat presenter is a later, additive request.
   each with `primary` and `woven` — additively, so the dashboard shows which screens the
   workspace uses.
 - Rollout: the contract (D3), the screen set, the placement mapping and the status block
-  land first, with only the primary flagged `PRESENTER` — so the answer a controller reads
-  is always the truth about what is drawn — and the per-screen presenters (D1) follow on top
-  of the same set, flipping the flag on.
+  landed first with only the primary flagged `PRESENTER` — so the answer a controller reads
+  was always the truth about what is drawn — and the per-screen presenters (D1) followed on
+  top of the same set, flipping the flag on. Implementation: one compose pass per presenter
+  (`multi_compositor_compose_pass`), the primary's unchanged and a secondary's with a
+  thread-local presenter frame installed (`svc_ws_pass`), so every window, chrome and
+  cursor path is the one the primary has always run.
 - Contract: `docs/specs/extensions/XR_DXR_spatial_workspace.md` (spec_version 25). Geometry:
   `src/xrt/compositor/util/comp_workspace_screens.h`.

@@ -199,6 +199,32 @@ comp_ws_split(const struct comp_ws_screen_set *set,
               struct comp_ws_part out[COMP_SEGMENTS_MAX]);
 
 /*!
+ * How a secondary presenter's compose pass draws the primary's display space
+ * (ADR-052 D1/D2): window geometry stays in the PRIMARY's metres, and a point
+ * (x, y) of that space lands at presenter pixel
+ * (cx_px + x * ppm_x, cy_px - y * ppm_y) — the primary's centre expressed in
+ * the presenter's pixels, at the primary's pixel pitch. Through desktop pixels
+ * that is exactly @ref comp_ws_map_pose followed by the presenter's own
+ * metres -> pixels, so the compose pass needs no per-window remapping.
+ */
+struct comp_ws_frame
+{
+	float cx_px;
+	float cy_px;
+	float ppm_x;
+	float ppm_y;
+};
+
+/*!
+ * The frame of @p presenter's pass. @return false when the primary has no
+ * usable pixel pitch.
+ */
+bool
+comp_ws_presenter_frame(const struct comp_ws_screen *primary,
+                        const struct comp_ws_screen *presenter,
+                        struct comp_ws_frame *out);
+
+/*!
  * Workspace pixels — the coordinate space of every cursor position the
  * workspace reports — are desktop pixels relative to the primary screen's
  * desktop origin. With one presenter they are the service window's client

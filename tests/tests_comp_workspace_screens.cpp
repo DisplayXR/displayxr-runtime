@@ -325,6 +325,90 @@ TEST_CASE("comp_ws: window -> presenter split")
 	}
 }
 
+TEST_CASE("comp_ws: a secondary presenter's compose pass (two synthetic screens)")
+{
+	xrt_screen_list l = rig();
+	comp_ws_screen_set set{};
+	comp_ws_screens_build(&l, ALL_DP, COMP_WS_POLICY_CLAIMED, &set);
+	const comp_ws_screen *panel = &set.screens[0];
+	const comp_ws_screen *side = &set.screens[1];
+
+	comp_ws_frame f{};
+	REQUIRE(comp_ws_presenter_frame(panel, side, &f));
+	// The panel's centre (desktop 1920,1080) is 1920 px LEFT of the side panel's origin.
+	CHECK(approx(f.cx_px, -1920.0f));
+	CHECK(approx(f.cy_px, 1080.0f));
+	CHECK(approx(f.ppm_x, 6400.0f, 1e-2f)); // 1 / 156.25 um
+	CHECK(approx(f.ppm_y, 6400.0f, 1e-2f));
+
+	SECTION("the primary's own frame is the identity: centre of its panel, its pitch")
+	{
+		comp_ws_frame g{};
+		REQUIRE(comp_ws_presenter_frame(panel, panel, &g));
+		CHECK(approx(g.cx_px, 1920.0f));
+		CHECK(approx(g.cy_px, 1080.0f));
+	}
+
+	SECTION("drawing in the primary's space through the frame == mapping, then the presenter's own frame")
+	{
+		const float pts[][2] = {
+		    {0.0f, 0.0f}, {0.45f, 0.084375f}, {0.31f, -0.02f}, {0.6f, 0.15f}, {-0.1f, 0.3f}};
+		for (const auto &pt : pts) {
+			xrt_pose a{};
+			a.orientation.w = 1.0f;
+			a.position.x = pt[0];
+			a.position.y = pt[1];
+			xrt_pose b{};
+			float wb, hb;
+			REQUIRE(comp_ws_map_pose(panel, side, &a, 0.1f, 0.1f, &b, &wb, &hb));
+			const float own_x = side->desktop.w * 0.5f + b.position.x * (side->desktop.w / side->width_m);
+			const float own_y = side->desktop.h * 0.5f - b.position.y * (side->desktop.h / side->height_m);
+			CHECK(approx(f.cx_px + pt[0] * f.ppm_x, own_x, 1e-2f));
+			CHECK(approx(f.cy_px - pt[1] * f.ppm_y, own_y, 1e-2f));
+		}
+	}
+
+	SECTION("a window straddling the seam: the presenter draws exactly the split's part")
+	{
+		// Centred on the seam, 1200 x 600 px in the panel's space (as in the
+		// footprint test): footprint desktop x 3240..4440.
+		const float pitch = 0.00015625f;
+		const float wx = (3840.0f - 1920.0f) * pitch;
+		const float ww = 1200 * pitch;
+		const float left_px = f.cx_px + (wx - ww * 0.5f) * f.ppm_x;
+		const float right_px = f.cx_px + (wx + ww * 0.5f) * f.ppm_x;
+		CHECK(approx(left_px, -600.0f, 1e-2f)); // hangs 600 px off the side panel's left edge
+		CHECK(approx(right_px, 600.0f, 1e-2f));
+
+		const comp_seg_rect fp = {3240, 400, 1200, 600};
+		comp_ws_part parts[COMP_SEGMENTS_MAX];
+		REQUIRE(comp_ws_split(&set, &fp, parts) == 2);
+		CHECK(parts[1].screen_id == SIDE);
+		CHECK(parts[1].screen_rect.x == 0);
+		CHECK(approx((float)(parts[1].screen_rect.x + (int32_t)parts[1].screen_rect.w), right_px, 1e-2f));
+	}
+
+	SECTION("the side panel's viewer, mapped into the primary's space for the pass")
+	{
+		xrt_pose eye{};
+		eye.orientation.w = 1.0f;
+		eye.position = {0.0f, 0.0f, 0.6f}; // nominal, side panel's own space
+		xrt_pose in_panel{};
+		float w, h;
+		REQUIRE(comp_ws_map_pose(side, panel, &eye, 1.0f, 1.0f, &in_panel, &w, &h));
+		CHECK(approx(in_panel.position.x, 0.45f));
+		CHECK(approx(in_panel.position.y, 0.084375f));
+		CHECK(in_panel.position.z == 0.6f);
+	}
+
+	SECTION("no pitch on the primary: no frame")
+	{
+		comp_ws_screen bad = *panel;
+		bad.width_m = 0.0f;
+		CHECK_FALSE(comp_ws_presenter_frame(&bad, side, &f));
+	}
+}
+
 TEST_CASE("comp_ws: workspace pixels and the screen under the cursor")
 {
 	// The 3D panel is NOT at the desktop origin here: a 2D monitor sits left of it.
