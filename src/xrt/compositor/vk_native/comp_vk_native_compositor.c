@@ -1213,6 +1213,31 @@ struct comp_vk_native_compositor
 		uint64_t wait_ema_ns;
 		uint32_t win_async, win_sync, win_stalls;
 		/*!
+		 * #1905: stall-adaptive fallback to the blocking hand-off. On an app
+		 * that runs frames ahead (a command-buffer ring that never waits),
+		 * the serve's GPU work lands behind the app's queued frames — the
+		 * two queues share one global priority (see oxr_vulkan.c) — so every
+		 * commit's drain stalls ~a frame and async is WORSE than blocking
+		 * (model viewer, Lume phone: 22.5 -> 13.4 fps). The commit drain
+		 * scores each non-blocking frame; a window that is mostly stalls,
+		 * with stalls longer than half a panel period, switches the session
+		 * to blocking, and one non-blocking probe frame every
+		 * VK_ASYNC_PROBE_NS decides whether to come back.
+		 *
+		 * `forced` is the resolved knob (1 = forced ON: never falls back).
+		 * The window, probe and trip state are app-thread only (layer_commit
+		 * — xrEndFrame is externally synchronised); `fallback`, `trips` and
+		 * `outstanding_probe` are additionally written under
+		 * weave_hand.mutex so the trace row may read them there.
+		 */
+		int forced;
+		bool fallback;
+		bool outstanding_probe;
+		bool fallback_logged;
+		uint32_t fb_frames, fb_stalls, trips;
+		uint64_t fb_stall_ns;
+		uint64_t fb_next_probe_ns;
+		/*!
 		 * The weave thread is serving a non-blocking request right now.
 		 * Weave thread only, set and cleared under c->mutex around the
 		 * vk_dp_weave_and_present call. Routes that serve's queue work —
@@ -8099,7 +8124,7 @@ vk_midframe_active(const struct comp_vk_native_compositor *c)
  * #1910 measured. Auto-ON on that layer (dxr_async_handoff_resolve).
  */
 static bool
-dxr_async_handoff_resolve(bool layer_live, bool rt_queue, int single)
+dxr_async_handoff_resolve(bool layer_live, bool rt_queue, int single, int *out_forced)
 {
 	/*
 	 * AUTO-ON: on when the queue-lock layer is live, single weave ownership
@@ -8126,9 +8151,11 @@ dxr_async_handoff_resolve(bool layer_live, bool rt_queue, int single)
 #endif
 	const bool base = single == 1 && rt_queue;
 	const bool on = forced == 0 ? false : forced == 1 ? base : (base && layer_live);
+	*out_forced = forced;
 	U_LOG_W(
 	    "#1905: non-blocking frame hand-off %s — %s (DXR_ASYNC_HANDOFF / debug.dxr.async_handoff: \"1\" forces "
-	    "ON, \"0\" disables, anything else = auto on the queue-lock layer)",
+	    "ON with no stall fallback, \"0\" disables, anything else = auto on the queue-lock layer, falling back "
+	    "to blocking while the drain stalls)",
 	    on ? "ON" : "OFF",
 	    forced == 0   ? "disabled"
 	    : single != 1 ? "needs single weave ownership (#1196), which is off"
@@ -8177,6 +8204,101 @@ vk_async_note_wait(struct comp_vk_native_compositor *c, uint64_t d)
 	c->hand_async.wait_ema_ns = ema == 0 ? (d == 0 ? 1 : d) : (ema * 7 + d) / 8;
 }
 
+/*
+ * #1905: stall-adaptive fallback thresholds (see hand_async.fallback). A
+ * window of VK_ASYNC_FB_WINDOW non-blocking frames trips the fallback when
+ * MORE than half of them stalled (commit drain > 0.5 ms, the trace's stall
+ * definition) AND the mean of those stalls exceeds half a panel period —
+ * i.e. the app is routinely held up by a meaningful fraction of a vblank,
+ * not shaving sub-millisecond waits. Measured: model viewer 66/66 stalls at
+ * ~42 ms (trips); earthview 3/154 at 0.5 ms (never trips).
+ */
+#define VK_ASYNC_FB_WINDOW 16
+#define VK_ASYNC_FB_STALL_NS (500ULL * 1000)
+#define VK_ASYNC_PROBE_NS (5ULL * 1000 * 1000 * 1000)
+
+//! Half the panel period the compositor was sized for.
+static uint64_t
+vk_async_half_period_ns(const struct comp_vk_native_compositor *c)
+{
+	const double hz = (c->display_refresh_rate > 1.0f) ? (double)c->display_refresh_rate : 60.0;
+	return (uint64_t)(U_TIME_1S_IN_NS / hz) / 2;
+}
+
+/*!
+ * #1905: may this (otherwise eligible) frame go non-blocking under the stall
+ * fallback? Always while not fallen back; while fallen back, one probe frame
+ * per VK_ASYNC_PROBE_NS (@p out_probe set). App thread, c->mutex held.
+ */
+static bool
+vk_async_fallback_admit(struct comp_vk_native_compositor *c, bool *out_probe)
+{
+	*out_probe = false;
+	if (!c->hand_async.fallback) {
+		return true;
+	}
+	const uint64_t now_ns = os_monotonic_get_ns();
+	if (now_ns < c->hand_async.fb_next_probe_ns) {
+		return false;
+	}
+	c->hand_async.fb_next_probe_ns = now_ns + VK_ASYNC_PROBE_NS;
+	*out_probe = true;
+	return true;
+}
+
+/*!
+ * #1905: score one drained non-blocking frame (commit drain wait @p d) for
+ * the stall fallback. weave_hand.mutex held; returns the log line to emit
+ * after it is dropped (0 none, 1 trip, 2 probe failed, 3 recovered).
+ */
+static int
+vk_async_fallback_feed(struct comp_vk_native_compositor *c, uint64_t d, bool was_probe)
+{
+	if (c->hand_async.forced == 1) {
+		return 0; // forced ON: an experiment, never second-guessed
+	}
+	const uint64_t half_p = vk_async_half_period_ns(c);
+	if (was_probe) {
+		if (!c->hand_async.fallback) {
+			return 0;
+		}
+		if (d > half_p) {
+			return 2; // still stalling; next probe already scheduled at admit
+		}
+		c->hand_async.fallback = false;
+		c->hand_async.fb_frames = 0;
+		c->hand_async.fb_stalls = 0;
+		c->hand_async.fb_stall_ns = 0;
+		return 3;
+	}
+	if (c->hand_async.fallback) {
+		return 0;
+	}
+	c->hand_async.fb_frames++;
+	if (d > VK_ASYNC_FB_STALL_NS) {
+		c->hand_async.fb_stalls++;
+		c->hand_async.fb_stall_ns += d;
+	}
+	if (c->hand_async.fb_frames < VK_ASYNC_FB_WINDOW) {
+		return 0;
+	}
+	const uint32_t n = c->hand_async.fb_frames;
+	const uint32_t st = c->hand_async.fb_stalls;
+	const uint64_t mean = st != 0 ? c->hand_async.fb_stall_ns / st : 0;
+	int ret = 0;
+	if (st * 2 > n && mean > half_p) {
+		c->hand_async.fallback = true;
+		c->hand_async.trips++;
+		c->hand_async.fb_next_probe_ns = os_monotonic_get_ns() + VK_ASYNC_PROBE_NS;
+		ret = 1;
+	} else {
+		c->hand_async.fb_frames = 0;
+		c->hand_async.fb_stalls = 0;
+		c->hand_async.fb_stall_ns = 0;
+	}
+	return ret;
+}
+
 enum vk_async_drain
 {
 	VK_ASYNC_DRAIN_CLEAR,      //!< nothing outstanding, or it was served; c->mutex NOT held
@@ -8211,8 +8333,10 @@ vk_async_handoff_drain(struct comp_vk_native_compositor *c, bool from_commit)
 		os_mutex_unlock(&c->weave_hand.mutex);
 		return VK_ASYNC_DRAIN_CLEAR;
 	}
+	const bool was_probe = c->hand_async.outstanding_probe;
 	if (from_commit) {
 		c->hand_async.outstanding_seq = 0;
+		c->hand_async.outstanding_probe = false;
 	}
 	const uint64_t deadline_ns = t0 + 2ULL * 1000 * 1000 * 1000;
 	while (c->weave_hand.pending && c->weave_hand.seq == my_seq) {
@@ -8234,15 +8358,50 @@ vk_async_handoff_drain(struct comp_vk_native_compositor *c, bool from_commit)
 	if (!abandoned) {
 		c->weave_hand.consecutive_expiries = 0;
 	}
+	int fb_log = 0;
+	uint32_t fb_n = 0, fb_st = 0, fb_trips = 0;
+	uint64_t fb_mean = 0, fb_d = 0;
 	if (from_commit) {
 		const uint64_t d = os_monotonic_get_ns() - t0;
 		vk_async_note_wait(c, d);
-		if (d > 500ULL * 1000) {
+		if (d > VK_ASYNC_FB_STALL_NS) {
 			c->hand_async.win_stalls++;
+		}
+		if (!abandoned) {
+			fb_log = vk_async_fallback_feed(c, d, was_probe);
+			if (fb_log == 1) {
+				fb_n = c->hand_async.fb_frames;
+				fb_st = c->hand_async.fb_stalls;
+				fb_mean = fb_st != 0 ? c->hand_async.fb_stall_ns / fb_st : 0;
+			}
+			fb_trips = c->hand_async.trips;
+			fb_d = d;
 		}
 	}
 	const uint64_t hb_at_expiry = c->weave_hand.heartbeat;
 	os_mutex_unlock(&c->weave_hand.mutex);
+
+	if (fb_log == 1) {
+		const double half_p_ms = (double)vk_async_half_period_ns(c) / 1e6;
+		if (!c->hand_async.fallback_logged) {
+			c->hand_async.fallback_logged = true;
+			U_LOG_W(
+			    "#1905: non-blocking hand-off -> BLOCKING for this session: %u/%u frames stalled in the "
+			    "commit drain, mean stall %.2f ms > P/2 = %.2f ms (the served weave runs behind the app's "
+			    "queued frames). Re-probing one async frame every %llu s. Logged once; later trips "
+			    "are counted in the #1905 trace row (trips=).",
+			    fb_st, fb_n, (double)fb_mean / 1e6, half_p_ms,
+			    (unsigned long long)(VK_ASYNC_PROBE_NS / 1000000000ULL));
+		} else {
+			U_LOG_I("#1905: hand-off fallback trip #%u: %u/%u stalled, mean %.2f ms", fb_trips, fb_st, fb_n,
+			        (double)fb_mean / 1e6);
+		}
+		c->hand_async.fb_frames = 0;
+		c->hand_async.fb_stalls = 0;
+		c->hand_async.fb_stall_ns = 0;
+	} else if (fb_log == 3) {
+		U_LOG_I("#1905: hand-off probe drained in %.2f ms — back to non-blocking", (double)fb_d / 1e6);
+	}
 
 	if (!abandoned) {
 		return VK_ASYNC_DRAIN_CLEAR;
@@ -8722,6 +8881,11 @@ vk_repaint_thread(void *ptr)
 				const uint32_t ha_total = c->hand_async.win_async + c->hand_async.win_sync;
 				const uint32_t ha_stalls = c->hand_async.win_stalls;
 				const double ha_wait_ms = (double)c->hand_async.wait_ema_ns / 1e6;
+				const char *ha_mode = !c->hand_async.enabled      ? "blocking"
+				                      : c->hand_async.forced == 1 ? "async"
+				                      : c->hand_async.fallback    ? "fallback"
+				                                                  : "auto";
+				const uint32_t ha_trips = c->hand_async.trips;
 				c->hand_async.win_async = 0;
 				c->hand_async.win_sync = 0;
 				c->hand_async.win_stalls = 0;
@@ -8731,15 +8895,15 @@ vk_repaint_thread(void *ptr)
 				U_LOG_W(
 				    "#1905 trace site=vk midframe{on=%d legacy_fires=%u midframe_fires=%u in_frame=%u "
 				    "skip_pending=%u skip_duty=%u duty=%.0f%%/%u%% fill_ema=%.2fms parked_ema=%.2fms "
-				    "app_iv=%.1fms park=%d layer=%d} handoff{async=%d frames=%u/%u wait_ema=%.2fms "
-				    "stalls=%u}",
+				    "app_iv=%.1fms park=%d layer=%d} handoff{mode=%s async=%d frames=%u/%u "
+				    "wait_ema=%.2fms stalls=%u trips=%u}",
 				    (int)vk_midframe_active(c), c->repaint.mf.legacy_fires,
 				    c->repaint.mf.midframe_fires, c->repaint.mf.in_frame, c->repaint.mf.skip_pending,
 				    c->repaint.mf.skip_duty, duty_pct, dxr_midframe_fill_duty(),
 				    (double)c->repaint.mf.fill_ema_ns / 1e6, (double)c->repaint.mf.parked_ema_ns / 1e6,
 				    (double)c->repaint.mf.serve_iv_ema_ns / 1e6, (int)dxr_midframe_fill_park(),
-				    (int)c->repaint.mf.layer_live, (int)c->hand_async.enabled, ha_async, ha_total,
-				    ha_wait_ms, ha_stalls);
+				    (int)c->repaint.mf.layer_live, ha_mode, (int)c->hand_async.enabled, ha_async,
+				    ha_total, ha_wait_ms, ha_stalls, ha_trips);
 				c->repaint.mf.legacy_fires = 0;
 				c->repaint.mf.midframe_fires = 0;
 				c->repaint.mf.in_frame = 0;
@@ -10095,7 +10259,11 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 #ifdef VK_MIDFRAME_FILL
 				// #1905 ask 2: decided here, under c->mutex, from this frame's
 				// committed layers (see vk_async_handoff_eligible).
-				const bool async_post = vk_async_handoff_eligible(c, zero_copy);
+				// #1905: and admitted by the stall fallback (a probe frame
+				// while fallen back).
+				bool async_probe = false;
+				const bool async_post =
+				    vk_async_handoff_eligible(c, zero_copy) && vk_async_fallback_admit(c, &async_probe);
 #endif
 				os_mutex_lock(&c->weave_hand.mutex);
 				c->weave_hand.zero_copy = zero_copy;
@@ -10118,6 +10286,7 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 #ifdef VK_MIDFRAME_FILL
 				if (async_post) {
 					c->hand_async.outstanding_seq = my_seq;
+					c->hand_async.outstanding_probe = async_probe;
 					c->hand_async.win_async++;
 				} else {
 					c->hand_async.win_sync++;
@@ -12034,8 +12203,8 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		// would queue behind the app's next frame), concurrently with the
 		// app's own submits — on Adreno both share one GSL context, so the
 		// layer must serialise them, exactly as for the fill.
-		c->hand_async.enabled =
-		    dxr_async_handoff_resolve(layer_live, c->repaint_queue != VK_NULL_HANDLE, c->weave_hand.enabled);
+		c->hand_async.enabled = dxr_async_handoff_resolve(layer_live, c->repaint_queue != VK_NULL_HANDLE,
+		                                                  c->weave_hand.enabled, &c->hand_async.forced);
 #endif
 
 		if (c->repaint_queue == VK_NULL_HANDLE && c->repaint.shared_queue == 0) {

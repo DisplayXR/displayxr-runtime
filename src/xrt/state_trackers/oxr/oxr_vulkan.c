@@ -24,6 +24,10 @@
 #include "oxr_objects.h"
 #include "oxr_logger.h"
 #include "oxr_two_call.h"
+#ifdef XRT_OS_ANDROID
+
+#include <sys/system_properties.h>
+#endif
 
 /*
  * A Wayland-enabled build whose Vulkan headers were included without
@@ -821,6 +825,68 @@ vk_find_struct_in_chain(const VkBaseInStructure *base, VkStructureType type)
 	}
 	return NULL;
 }
+#ifdef XRT_OS_ANDROID
+
+/*!
+ * #1905: the relative priority (pQueuePriorities) of the runtime-owned queue
+ * on Android, where it carries the app's own weave (the non-blocking hand-off
+ * serves it there) rather than only optional repaints — so it is raised to the
+ * top of the range instead of the desktop's 0.5 below the app.
+ *
+ * GLOBAL priority cannot express the same split. It is set per
+ * VkDeviceQueueCreateInfo, and VUID-VkDeviceCreateInfo-pQueueCreateInfos-06654
+ * requires every element of pQueueCreateInfos sharing a queueFamilyIndex to
+ * carry the same global priority level; two elements may share a family only
+ * when their `flags` differ (VUID-VkDeviceCreateInfo-queueFamilyIndex-02802,
+ * i.e. protected vs not). Adreno 740 exposes one usable graphics family, so the
+ * app's queue and this one are always the same global level: whatever the app
+ * chained, or the implicit MEDIUM. (The "QUEUE_GLOBAL_PRIORITY_HIGH" device in
+ * the log is the null system compositor's own VkDevice, not the app's.)
+ * pQueuePriorities is the only per-queue lever left, and the spec leaves its
+ * effect implementation-dependent ("may be allotted more processing time").
+ *
+ * DXR_RT_QUEUE_PRIORITY / debug.dxr.rt_queue_priority: a float in [0, 1]
+ * overrides it, for A/B on device. Logged once per device creation.
+ */
+static float
+oxr_vk_runtime_queue_priority(struct oxr_logger *log, const VkDeviceQueueCreateInfo *qci)
+{
+	float prio = 1.0f;
+	const char *src = "default";
+	char sp[PROP_VALUE_MAX] = {0};
+	const char *e = getenv("DXR_RT_QUEUE_PRIORITY");
+	if (e == NULL || e[0] == '\0') {
+		e = __system_property_get("debug.dxr.rt_queue_priority", sp) > 0 ? sp : NULL;
+	}
+	if (e != NULL && e[0] != '\0') {
+		char *end = NULL;
+		const float v = strtof(e, &end);
+		if (end != e && v >= 0.0f && v <= 1.0f) {
+			prio = v;
+			src = "override";
+		}
+	}
+
+	int app_global = -1; // -1: not chained, implicit MEDIUM
+	const VkBaseInStructure *gp = vk_find_struct_in_chain(
+	    (const VkBaseInStructure *)qci, VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_EXT);
+	if (gp != NULL) {
+		app_global = (int)((const VkDeviceQueueGlobalPriorityCreateInfoEXT *)gp)->globalPriority;
+	}
+	const float app_prio = qci->pQueuePriorities != NULL ? qci->pQueuePriorities[0] : 1.0f;
+	U_LOG_W(
+	    "#1905: runtime-owned queue relative priority %.2f (%s), app queue %.2f; global priority %s for "
+	    "BOTH (one family; per-queue global priority is not expressible, VUID-06654)",
+	    prio, src, app_prio,
+	    app_global < 0       ? "MEDIUM (implicit)"
+	    : app_global >= 1024 ? "REALTIME"
+	    : app_global >= 512  ? "HIGH"
+	    : app_global >= 256  ? "MEDIUM"
+	                         : "LOW");
+	(void)log;
+	return prio;
+}
+#endif // XRT_OS_ANDROID
 
 XrResult
 oxr_vk_create_vulkan_device(struct oxr_logger *log,
@@ -1040,6 +1106,9 @@ oxr_vk_create_vulkan_device(struct oxr_logger *log,
 					// Lower priority than the app's: the repaint must never
 					// out-schedule the frame it stands in for.
 					mod_prios[want - 1] = 0.5f;
+#ifdef XRT_OS_ANDROID
+					mod_prios[want - 1] = oxr_vk_runtime_queue_priority(log, &mod_queues[i]);
+#endif
 
 					sys->vulkan_runtime_queue_family = (int32_t)fam;
 					sys->vulkan_runtime_queue_index = (int32_t)mod_queues[i].queueCount;
