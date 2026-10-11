@@ -657,6 +657,13 @@ sprite and the depth, and the runtime owns the drawing. Apps get the same contra
   on the same app geometry), vk_native −22.0 px in its 1280 × 1440 atlas; nothing drawn at
   0.1,0.1; the arrow's fill reads (255,255,255) and its outline (5,5,8), the custom ring
   (0,220,255) — exactly the authored bytes, so no encode is lost or doubled.
+- **Known issue (GL on macOS, not caused by the draw):** `cube_handle_gl_macos` crashes in
+  roughly 1 of 5 launches once the depth cursor is ACTIVE — in Apple's GL driver, on the #868
+  repaint thread (`gl_repaint_thread` → `glBlitFramebuffer`) or in the app's own draw. It
+  follows the app's `[NSCursor hide]`, not the runtime draw: app-draw mode crashes too; the
+  runtime draw with the OS cursor left visible (0/10), `DXR_WEAVE_REPAINT=0` (0/8) and the
+  extension off (0/20) do not. The GL cube never hid the OS cursor before this adoption, so this
+  is a latent repaint-thread / AppKit race in the GL compositor surfacing, tracked separately.
 
 ### Rollout
 
