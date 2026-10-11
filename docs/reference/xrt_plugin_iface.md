@@ -327,7 +327,11 @@ other screen. Same contract as `create_dp_vk`, plus:
   origin.
 - `window_handle` is NULL on desktop Linux: a segment DP is windowless, its phase comes from
   `set_present_origin` (ADR-033) — the window's origin relative to THIS screen, to which you add
-  the canvas offset.
+  the canvas offset. On **Windows** (multi-screen M6, ADR-047 Amendments 2 + 5) it is the
+  session's real HWND for the DP of the screen holding the MAJORITY of the window (it keeps your
+  drag phase-snap; phase from the window) and NULL for every other screen's DP — the same rule as
+  `create_dp_d3d11_for_screen`. The runtime may also ask this slot for a windowless DP for the
+  system-default screen while another screen holds the window.
 - Each `process_atlas` hands you `canvas = the segment` (a sub-rect of the target) and an atlas
   that holds exactly that segment's views (the runtime crops per segment — crop before the DP is
   the law). **Confine render area, viewport AND scissor to the canvas** (a windowless weaver's
