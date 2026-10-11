@@ -784,10 +784,22 @@ xdg_surface_configure(void *data, struct xdg_surface *s, uint32_t serial)
 	struct comp_window_linux_wl *w = data;
 	pthread_mutex_lock(&w->lock);
 	xdg_surface_ack_configure(s, serial);
-	// 0x0 = "you choose": the panel's logical size (the buffer is its mode, so
-	// that maps 1:1 once on the panel).
-	const int32_t lw = w->cfg_w > 0 ? w->cfg_w : w->panel_lw;
-	const int32_t lh = w->cfg_h > 0 ? w->cfg_h : w->panel_lh;
+	// Only a FULLSCREEN configure drives the destination. Before it, the
+	// surface is mapped windowed just so set_fullscreen(output) is honoured,
+	// and mutter sends interim sizes (e.g. 1661x1048 for a 3840x2160 buffer
+	// at 200 %, its maximised work area): mapping the panel-mode buffer onto
+	// one of those would present a squashed, resampled frame. The panel's
+	// logical size keeps the windowed frames 1:1 (they may overhang the work
+	// area for the moment until the fullscreen configure lands).
+	const bool use_cfg = w->fullscreen && w->cfg_w > 0 && w->cfg_h > 0;
+	const int32_t lw = use_cfg ? w->cfg_w : w->panel_lw;
+	const int32_t lh = use_cfg ? w->cfg_h : w->panel_lh;
+	if (!use_cfg && w->cfg_w > 0 && (w->cfg_w != lw || w->cfg_h != lh)) {
+		U_LOG_I(
+		    "comp_window_linux(wayland): interim %dx%d configure ignored for the viewport (not fullscreen "
+		    "yet) — keeping %dx%d logical, 1:1",
+		    w->cfg_w, w->cfg_h, lw, lh);
+	}
 	if (w->viewport != NULL && (lw != w->dst_w || lh != w->dst_h)) {
 		// Pending state; the WSI's next present commits it with the buffer.
 		wp_viewport_set_destination(w->viewport, lw, lh);
