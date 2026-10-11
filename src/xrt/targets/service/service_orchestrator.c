@@ -1093,9 +1093,7 @@ extern char **environ;
 #ifdef XRT_OS_LINUX_DESKTOP
 #include "service_hotkey_linux.h"
 #include <stdio.h>
-#ifdef SERVICE_HAVE_CONTROLLER_KEY_QUEUE
 #include "server/ipc_server_input_queue.h" // ipc_server_input_queue_push_controller_key
-#endif
 #endif
 
 
@@ -1499,11 +1497,9 @@ service_orchestrator_controller_key_mods(uint32_t hotkey_mods)
  * controller as a key (its dismiss / toggle chord — a Wayland client cannot
  * grab the chord itself).
  *
- * TODO(integration with feat/linux-workspace-compositor): the controller-key
- * queue (ipc_server_input_queue_push_controller_key, thread-safe, Windows VK
- * codes) lives on that branch. Defining SERVICE_HAVE_CONTROLLER_KEY_QUEUE
- * (service/CMakeLists.txt, Linux block) turns this on; the body is the one
- * call below.
+ * The press reaches the controller as an ordinary KEY event on its input
+ * queue (ipc_server_input_queue_push_controller_key: thread-safe, Windows VK
+ * codes), exactly as the chord would on Windows.
  */
 static void
 forward_hotkey_to_controller(void)
@@ -1515,9 +1511,7 @@ forward_hotkey_to_controller(void)
 	if (!has || hk.vk == 0) {
 		return;
 	}
-#ifdef SERVICE_HAVE_CONTROLLER_KEY_QUEUE
 	ipc_server_input_queue_push_controller_key(hk.vk, service_orchestrator_controller_key_mods(hk.mods));
-#endif
 }
 
 //! Hotkey worker thread: a press of the launch combo.

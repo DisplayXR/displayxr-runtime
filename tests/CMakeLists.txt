@@ -760,9 +760,8 @@ if(TARGET tests_service_orchestrator_linux)
 	target_link_libraries(
 		tests_service_orchestrator_linux PRIVATE target_workspace_config xrt-interfaces aux_os xrt-pthreads
 		)
-	# The chord forward to a running controller, against a stand-in of the
-	# controller-key queue header (the real one lands with the compositor work).
-	target_compile_definitions(tests_service_orchestrator_linux PRIVATE SERVICE_HAVE_CONTROLLER_KEY_QUEUE)
+	# The chord forward to a running controller, against a recording stand-in
+	# of the controller-key queue header (keeps the IPC server out of the test).
 	target_include_directories(
 		tests_service_orchestrator_linux PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/fake_controller_key
 		)
