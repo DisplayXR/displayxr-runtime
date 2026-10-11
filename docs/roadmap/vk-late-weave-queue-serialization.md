@@ -347,3 +347,72 @@ also 0 GSL warnings, 0 `Failed to render layers` and 0 CNSDK -3.
     Without the layer this case is a spec violation that happens to race
     through, so the runtime should still prefer per-queue
     `vkQueueWaitIdle`/fences over `vkDeviceWaitIdle` on a shared device.
+
+### 7.1 Non-blocking `xrEndFrame` hand-off and its fallback (#1905 ask 2, #1939, #1962)
+
+**What it is.** With the queue-lock layer live, an in-process Android frame
+whose weave reads nothing the app owns (no window-space layers, Local2D, zones
+or zero-copy) is posted to the weave thread and `xrEndFrame` returns once the
+frame is *committed* — the app's images are already blitted into the runtime
+atlas. The next `layer_commit` drains the outstanding serve before it rewrites
+anything that serve reads (the depth-1 bound). The serve runs on the
+runtime-owned queue. Knob: `DXR_ASYNC_HANDOFF` / `debug.dxr.async_handoff`
+(`1` forced on with no fallback, `0` off, else auto) — census row in
+`control-panel-performance-settings.md`.
+
+**Why it needs a fallback.** On one Adreno GSL context the two queues share a
+priority, so a run-ahead app's next frames sit in front of the serve: the
+commit drain waits about a frame. Before #1959 removed the per-frame sRGB copy,
+that made non-blocking *slower* than blocking on the model viewer (#1939: 22.5
+→ 13.4 fps), so #1939 added a stall-adaptive fallback.
+
+**Why the #1939 scorer was wrong (#1962, measured on v2.37.1).** It scored the
+drain *wait*, not harm: a window of 16 non-blocking frames with most drains
+over half a panel period tripped it. Two defects:
+- It scored the first 16 frames of a launch, when warm-up drains run 19–43 ms,
+  so it tripped on every model-viewer launch (and on earthview, where the
+  trip happens not to show).
+- It re-probed with ONE frame every 5 s against P/2 straight after a blocking
+  stretch. That probe cannot pass: no recovery in ~25 runs.
+
+With the fallback bypassed (`=1`), the model viewer drains 8–16 ms on almost
+every frame and still runs **55–59 fps on the phone** (blocking: 31) and
+**38–39 fps on the NP02J** (blocking: 22–30, GPU pinned at 680 MHz). On a
+vsync-paced app the drain replaces time the app would spend blocked anyway.
+Blocking also parks the GPU clock (348 vs 680 MHz on the phone): app CPU → app
+GPU → weave run serially, so busy-% never reaches the governor's step-up
+threshold (#1917).
+
+**The harm-scored fallback (#1962).** The sample is the app's frame interval
+(admit to admit), attributed to the mode the previous frame was posted in. P is
+one panel period.
+- **Warm-up:** nothing is scored for the first 60 frames **and** 1 s of a
+  session. The warm-up restarts after any swapchain creation, any change to
+  the effective layout, target size or 2D/3D state, any frame that cannot go
+  non-blocking, an abandoned serve, or a gap of more than 250 ms.
+- **Settle:** the first 2 samples after any mode switch are discarded.
+- **Trip** (checked per 32-sample window): the drain exceeded a **full** P on
+  more than half the frames, **and** the mean app interval is worse than 2P,
+  **and**, if an earlier fallback measured a blocking reference, worse than
+  1.1× that reference. The last condition is hysteresis: async already proved
+  it beats blocking there.
+- **Blocking:** each full 32-sample blocking window refreshes the blocking
+  reference interval.
+- **Probe:** 1 s after a trip, then every 5 s after a failed probe, run a
+  **window** of non-blocking frames (2 settle + 32 samples). It recovers if
+  its mean app interval is no worse than 1.05× the blocking reference, or if
+  the window would not trip on its own.
+
+Each trip, recovery and failed probe logs one WARN line with its numbers
+(window size, drain-over-P count, mean drain, app interval, blocking
+reference). The first four of each kind are WARN; later ones are INFO, and the
+trace row counts them all. The `#1905 trace` row shows the state:
+`handoff{mode=auto|fallback|probe|async|blocking … trips= recovered= probe_fails=}`.
+The #1939 case (13 fps, ~42 ms drains) still trips. #1962's model viewer and
+earthview do not.
+
+**What it does not do.** It does not deepen the hand-off. A depth-D ring would
+need a lock split first: the served weave holds `c->mutex` for its whole
+duration and `layer_commit` takes it right after the drain, so with D > 1 the
+wait would just move to `c->mutex`. It would also need a D-slot atlas ring and
+per-slot snapshots (#1962 comment). The data says depth 1 is not the limiter.
