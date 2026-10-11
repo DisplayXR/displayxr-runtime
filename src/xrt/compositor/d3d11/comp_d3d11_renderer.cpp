@@ -15,7 +15,7 @@
 #include "d3d11_layer_shaders.h"
 // XR_DXR_cursor_depth v5: the runtime-drawn cursor quad (shared with D3D12).
 #include "d3d_shared/comp_cursor_shaders.h"
-#include "util/u_cursor_look.h"
+#include "util/comp_cursor_look.h"
 
 #include "util/comp_layer_accum.h"
 // #1580: the ONE per-view camera every layer type is projected through.
@@ -204,7 +204,8 @@ struct comp_d3d11_renderer
 		ID3D11PixelShader *ps;
 		ID3D11PixelShader *ps_array; //!< layered sprite: samples array layer 0
 		ID3D11Buffer *cb;
-		ID3D11BlendState *blend;       //!< straight alpha
+		ID3D11BlendState *blend;        //!< straight alpha (the app's sprite)
+		ID3D11BlendState *blend_premul; //!< premultiplied (the default look)
 		ID3D11RasterizerState *raster; //!< no culling, scissor on
 		ID3D11SamplerState *sampler;   //!< linear, CLAMP (no edge bleed)
 		bool failed;                   //!< creation failed once: never retried per frame
@@ -213,7 +214,7 @@ struct comp_d3d11_renderer
 		ID3D11Texture2D *look_tex;
 		ID3D11ShaderResourceView *look_srv_raw;
 		ID3D11ShaderResourceView *look_srv_srgb;
-		uint32_t look_serial;
+		uint64_t look_generation;
 		bool announced;
 	} cursor;
 };
@@ -861,7 +862,7 @@ renderer_frame_takes_fast_path(struct comp_d3d11_renderer *r, struct comp_layer_
 	// XR_DXR_cursor_depth v5: the cursor sprite is a source this frame too. A
 	// scene-linear (non-`_SRGB`) app sprite owes the encode, which only the
 	// compose target applies. The default look is encoded bytes by
-	// construction (u_cursor_look), so it never forces a compose. The cursor
+	// construction (comp_cursor_look), so it never forces a compose. The cursor
 	// is deliberately NOT counted as a contributing layer: on a fast-path
 	// frame its edges blend in encoded space, as on Metal - a few
 	// anti-aliased pixels, not worth a full-atlas copy every frame the
@@ -1587,6 +1588,7 @@ comp_d3d11_renderer_destroy(struct comp_d3d11_renderer **renderer_ptr)
 	SAFE_RELEASE(r->cursor.look_tex);
 	SAFE_RELEASE(r->cursor.sampler);
 	SAFE_RELEASE(r->cursor.raster);
+	SAFE_RELEASE(r->cursor.blend_premul);
 	SAFE_RELEASE(r->cursor.blend);
 	SAFE_RELEASE(r->cursor.cb);
 	SAFE_RELEASE(r->cursor.ps_array);
@@ -2226,6 +2228,10 @@ cursor_release_pipeline(struct comp_d3d11_renderer *r)
 		r->cursor.raster->Release();
 		r->cursor.raster = nullptr;
 	}
+	if (r->cursor.blend_premul != nullptr) {
+		r->cursor.blend_premul->Release();
+		r->cursor.blend_premul = nullptr;
+	}
 	if (r->cursor.blend != nullptr) {
 		r->cursor.blend->Release();
 		r->cursor.blend = nullptr;
@@ -2298,9 +2304,10 @@ cursor_ensure_pipeline(struct comp_d3d11_renderer *r)
 		ok = SUCCEEDED(device->CreateBuffer(&bd, nullptr, &r->cursor.cb));
 	}
 	if (ok) {
-		// Straight alpha (every cursor source is straight - see
-		// comp_cursor_shaders.h); alpha accumulates "over", so a
-		// transparent session's atlas keeps a correct coverage.
+		// Straight alpha for the app's sprite (the spec), premultiplied
+		// for the default look (comp_cursor_look); alpha accumulates
+		// "over" either way, so a transparent session's atlas keeps a
+		// correct coverage.
 		D3D11_BLEND_DESC bd = {};
 		bd.RenderTarget[0].BlendEnable = TRUE;
 		bd.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
@@ -2311,6 +2318,10 @@ cursor_ensure_pipeline(struct comp_d3d11_renderer *r)
 		bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
 		bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
 		ok = SUCCEEDED(device->CreateBlendState(&bd, &r->cursor.blend));
+		if (ok) {
+			bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+			ok = SUCCEEDED(device->CreateBlendState(&bd, &r->cursor.blend_premul));
+		}
 	}
 	if (ok) {
 		// No culling: the sprite's winding follows the view's axes. The
@@ -2346,12 +2357,12 @@ cursor_ensure_pipeline(struct comp_d3d11_renderer *r)
 
 //! Upload the default look when its image changed (cursor shape or DPI).
 static bool
-cursor_upload_look(struct comp_d3d11_renderer *r, const struct u_cursor_look *look)
+cursor_upload_look(struct comp_d3d11_renderer *r, const struct comp_cursor_look *look)
 {
-	if (look == nullptr || look->rgba == nullptr || look->width == 0 || look->height == 0) {
+	if (look == nullptr || look->rgba == nullptr || look->w == 0 || look->h == 0) {
 		return false;
 	}
-	if (r->cursor.look_tex != nullptr && r->cursor.look_serial == look->serial) {
+	if (r->cursor.look_tex != nullptr && r->cursor.look_generation == look->generation) {
 		return true;
 	}
 	if (r->cursor.look_srv_srgb != nullptr) {
@@ -2371,8 +2382,8 @@ cursor_upload_look(struct comp_d3d11_renderer *r, const struct u_cursor_look *lo
 	// TYPELESS: the same encoded bytes are read raw on the fast path (into the
 	// encoded atlas) and decoded on the compose path (into the `_SRGB` RTV).
 	D3D11_TEXTURE2D_DESC td = {};
-	td.Width = look->width;
-	td.Height = look->height;
+	td.Width = look->w;
+	td.Height = look->h;
 	td.MipLevels = 1;
 	td.ArraySize = 1;
 	td.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
@@ -2381,7 +2392,7 @@ cursor_upload_look(struct comp_d3d11_renderer *r, const struct u_cursor_look *lo
 	td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 	D3D11_SUBRESOURCE_DATA init = {};
 	init.pSysMem = look->rgba;
-	init.SysMemPitch = look->width * 4;
+	init.SysMemPitch = look->w * 4;
 	HRESULT hr = internals.device->CreateTexture2D(&td, &init, &r->cursor.look_tex);
 	if (FAILED(hr)) {
 		r->cursor.look_tex = nullptr;
@@ -2399,7 +2410,7 @@ cursor_upload_look(struct comp_d3d11_renderer *r, const struct u_cursor_look *lo
 	if (FAILED(hr)) {
 		return false; // released on the next upload or at destroy
 	}
-	r->cursor.look_serial = look->serial;
+	r->cursor.look_generation = look->generation;
 	return true;
 }
 
@@ -2452,7 +2463,7 @@ cursor_draw(struct comp_d3d11_renderer *r,
 	ID3D11DeviceContext *ctx = internals.context;
 	ID3D11RenderTargetView *rtv = (r->compose_active && r->compose_rtv != nullptr) ? r->compose_rtv : r->atlas_rtv;
 	ctx->OMSetRenderTargets(1, &rtv, nullptr); // no DSV: depth test OFF, never occluded
-	ctx->OMSetBlendState(r->cursor.blend, nullptr, 0xFFFFFFFF);
+	ctx->OMSetBlendState(q->xsc != nullptr ? r->cursor.blend : r->cursor.blend_premul, nullptr, 0xFFFFFFFF);
 	ctx->RSSetState(r->cursor.raster);
 	ctx->IASetInputLayout(nullptr);
 	ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);

@@ -268,6 +268,11 @@ target_include_directories(comp_cursor_look PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 if(APPLE)
 	target_sources(comp_cursor_look PRIVATE util/comp_cursor_look_macos.m)
 	target_link_libraries(comp_cursor_look PRIVATE "-framework AppKit")
+elseif(WIN32)
+	# The Windows OS-cursor mirror (GetCursorInfo / DrawIconEx into a DIB),
+	# shared by the D3D11 and D3D12 compositors.
+	target_sources(comp_cursor_look PRIVATE util/comp_cursor_look_win.c)
+	target_link_libraries(comp_cursor_look PRIVATE user32 gdi32)
 endif()
 
 ###

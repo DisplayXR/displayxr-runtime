@@ -15,7 +15,7 @@
 #include "d3d_shared/comp_equirect2_shaders.h"
 // XR_DXR_cursor_depth v5: the runtime-drawn cursor quad (shared with D3D11).
 #include "d3d_shared/comp_cursor_shaders.h"
-#include "util/u_cursor_look.h"
+#include "util/comp_cursor_look.h"
 
 #include "util/comp_layer_accum.h"
 // #1580: the ONE per-view camera every layer type is projected through, plus
@@ -604,9 +604,11 @@ struct comp_d3d12_renderer
 	{
 		//! This frame's cursor (set by the compositor, cleared after the pass).
 		struct comp_d3d12_cursor_quads frame;
-		//! [sprite is layered (Texture2DArray)][target is the `_SRGB`
-		//! compose target]; straight alpha, no depth.
-		ID3D12PipelineState *pso[2][2];
+		//! [variant][target is the `_SRGB` compose target], no depth.
+		//! Variant: CURSOR_PSO_STRAIGHT / _STRAIGHT_LAYERED (the app's sprite,
+		//! straight alpha, Texture2D / Texture2DArray) or _PREMUL (the default
+		//! look, premultiplied - comp_cursor_look).
+		ID3D12PipelineState *pso[3][2];
 		bool failed; //!< creation failed once: never retried per frame
 		//! The default look's texture: TYPELESS storage, read through a UNORM
 		//! (fast path) or `_SRGB` (compose path) SRV. Rests in
@@ -615,7 +617,7 @@ struct comp_d3d12_renderer
 		//! Its upload buffer, kept until the next upload: the GPU has
 		//! retired it by then (every commit resets the allocator first).
 		ID3D12Resource *look_upload;
-		uint32_t look_serial;
+		uint64_t look_generation;
 		bool announced;
 	} cursor;
 };
@@ -2839,7 +2841,7 @@ comp_d3d12_renderer_destroy(struct comp_d3d12_renderer **renderer_ptr)
 	comp_d3d12_renderer *r = *renderer_ptr;
 
 	// XR_DXR_cursor_depth v5 (all NULL unless a cursor was ever drawn).
-	for (uint32_t l = 0; l < 2; l++) {
+	for (uint32_t l = 0; l < 3; l++) {
 		for (uint32_t rt = 0; rt < 2; rt++) {
 			if (r->cursor.pso[l][rt] != nullptr) {
 				r->cursor.pso[l][rt]->Release();
@@ -3568,7 +3570,7 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 static void
 cursor_release_pipelines(struct comp_d3d12_renderer *r)
 {
-	for (uint32_t l = 0; l < 2; l++) {
+	for (uint32_t l = 0; l < 3; l++) {
 		for (uint32_t rt = 0; rt < 2; rt++) {
 			if (r->cursor.pso[l][rt] != nullptr) {
 				r->cursor.pso[l][rt]->Release();
@@ -3578,12 +3580,20 @@ cursor_release_pipelines(struct comp_d3d12_renderer *r)
 	}
 }
 
-//! The four pipelines, built on the first cursor frame only.
+//! The cursor pipeline variants (first index of `cursor.pso`).
+enum
+{
+	CURSOR_PSO_STRAIGHT = 0,
+	CURSOR_PSO_STRAIGHT_LAYERED = 1,
+	CURSOR_PSO_PREMUL = 2,
+};
+
+//! The six pipelines, built on the first cursor frame only.
 static bool
 cursor_ensure_pipeline(struct comp_d3d12_renderer *r)
 {
-	if (r->cursor.pso[1][1] != nullptr) {
-		return true; // built last: all four exist
+	if (r->cursor.pso[CURSOR_PSO_PREMUL][1] != nullptr) {
+		return true; // built last: all six exist
 	}
 	if (r->cursor.failed) {
 		return false;
@@ -3608,8 +3618,8 @@ cursor_ensure_pipeline(struct comp_d3d12_renderer *r)
 		d.pRootSignature = r->quad_root_signature;
 		d.VS.pShaderBytecode = vs->GetBufferPointer();
 		d.VS.BytecodeLength = vs->GetBufferSize();
-		// Straight alpha (every cursor source is straight - see
-		// comp_cursor_shaders.h); alpha accumulates "over".
+		// Colour: SrcAlpha (straight sprite) or One (premultiplied default
+		// look), set per variant below; alpha accumulates "over".
 		d.BlendState.RenderTarget[0].BlendEnable = TRUE;
 		d.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
 		d.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
@@ -3628,9 +3638,12 @@ cursor_ensure_pipeline(struct comp_d3d12_renderer *r)
 		d.SampleDesc.Count = 1;
 		d.SampleMask = UINT_MAX;
 		ID3D12Device *device = get_internals(r->c)->device;
-		for (uint32_t l = 0; l < 2 && SUCCEEDED(hr); l++) {
-			d.PS.pShaderBytecode = ps[l]->GetBufferPointer();
-			d.PS.BytecodeLength = ps[l]->GetBufferSize();
+		for (uint32_t l = 0; l < 3 && SUCCEEDED(hr); l++) {
+			ID3DBlob *pl = l == CURSOR_PSO_STRAIGHT_LAYERED ? ps[1] : ps[0];
+			d.PS.pShaderBytecode = pl->GetBufferPointer();
+			d.PS.BytecodeLength = pl->GetBufferSize();
+			d.BlendState.RenderTarget[0].SrcBlend =
+			    l == CURSOR_PSO_PREMUL ? D3D12_BLEND_ONE : D3D12_BLEND_SRC_ALPHA;
 			for (uint32_t rt = 0; rt < 2 && SUCCEEDED(hr); rt++) {
 				d.RTVFormats[0] = rt == 0 ? DXGI_FORMAT_R8G8B8A8_UNORM : kComposeRtvFormat;
 				hr = device->CreateGraphicsPipelineState(
@@ -3664,12 +3677,14 @@ cursor_ensure_pipeline(struct comp_d3d12_renderer *r)
  * PIXEL_SHADER_RESOURCE.
  */
 static bool
-cursor_upload_look(struct comp_d3d12_renderer *r, ID3D12GraphicsCommandList *cmd_list, const struct u_cursor_look *look)
+cursor_upload_look(struct comp_d3d12_renderer *r,
+                   ID3D12GraphicsCommandList *cmd_list,
+                   const struct comp_cursor_look *look)
 {
-	if (look == nullptr || look->rgba == nullptr || look->width == 0 || look->height == 0) {
+	if (look == nullptr || look->rgba == nullptr || look->w == 0 || look->h == 0) {
 		return false;
 	}
-	if (r->cursor.look_tex != nullptr && r->cursor.look_serial == look->serial) {
+	if (r->cursor.look_tex != nullptr && r->cursor.look_generation == look->generation) {
 		return true;
 	}
 	// The previous texture and upload buffer were last used by an earlier
@@ -3682,7 +3697,7 @@ cursor_upload_look(struct comp_d3d12_renderer *r, ID3D12GraphicsCommandList *cmd
 		r->cursor.look_tex->Release();
 		r->cursor.look_tex = nullptr;
 	}
-	r->cursor.look_serial = 0;
+	r->cursor.look_generation = 0;
 
 	ID3D12Device *device = get_internals(r->c)->device;
 
@@ -3690,8 +3705,8 @@ cursor_upload_look(struct comp_d3d12_renderer *r, ID3D12GraphicsCommandList *cmd
 	// decoded on the compose path.
 	D3D12_RESOURCE_DESC td = {};
 	td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-	td.Width = look->width;
-	td.Height = look->height;
+	td.Width = look->w;
+	td.Height = look->h;
 	td.DepthOrArraySize = 1;
 	td.MipLevels = 1;
 	td.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
@@ -3745,9 +3760,9 @@ cursor_upload_look(struct comp_d3d12_renderer *r, ID3D12GraphicsCommandList *cmd
 		r->cursor.look_tex = nullptr;
 		return false;
 	}
-	for (uint32_t y = 0; y < look->height; y++) {
-		memcpy(mapped + fp.Offset + (size_t)y * fp.Footprint.RowPitch, look->rgba + (size_t)y * look->width * 4,
-		       (size_t)look->width * 4);
+	for (uint32_t y = 0; y < look->h; y++) {
+		memcpy(mapped + fp.Offset + (size_t)y * fp.Footprint.RowPitch, look->rgba + (size_t)y * look->w * 4,
+		       (size_t)look->w * 4);
 	}
 	r->cursor.look_upload->Unmap(0, nullptr);
 
@@ -3769,7 +3784,7 @@ cursor_upload_look(struct comp_d3d12_renderer *r, ID3D12GraphicsCommandList *cmd
 	b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 	cmd_list->ResourceBarrier(1, &b);
 
-	r->cursor.look_serial = look->serial;
+	r->cursor.look_generation = look->generation;
 	return true;
 }
 
@@ -3860,7 +3875,9 @@ cursor_draw(struct comp_d3d12_renderer *r,
 	device->CreateShaderResourceView(src, &srv_desc, srv_cpu);
 
 	cmd_list->SetGraphicsRootSignature(r->quad_root_signature);
-	cmd_list->SetPipelineState(r->cursor.pso[layered ? 1 : 0][r->compose_active ? 1 : 0]);
+	const uint32_t variant =
+	    !app_image ? CURSOR_PSO_PREMUL : (layered ? CURSOR_PSO_STRAIGHT_LAYERED : CURSOR_PSO_STRAIGHT);
+	cmd_list->SetPipelineState(r->cursor.pso[variant][r->compose_active ? 1 : 0]);
 	ID3D12DescriptorHeap *heaps[] = {r->srv_heap};
 	cmd_list->SetDescriptorHeaps(1, heaps);
 	D3D12_GPU_DESCRIPTOR_HANDLE srv_gpu = r->srv_heap->GetGPUDescriptorHandleForHeapStart();

@@ -75,7 +75,7 @@
 #include "util/u_image_capture.h"
 #include "util/u_rear_budget.h"
 #include "util/u_cursor_depth.h"
-#include "util/u_cursor_look.h"
+#include "util/comp_cursor_look.h"
 // XR_DXR_depth_budget: the API-agnostic runner (validate -> analyse -> policy
 // -> publish -> dump) shared with the other native compositors.
 #include "util/comp_rear_budget.h"
@@ -742,7 +742,7 @@ struct comp_d3d11_compositor
 		//! One-frame request from the state tracker, consumed by the next commit.
 		struct u_cursor_draw_request req;
 		//! The default look (the OS cursor mirror, else the arrow).
-		struct u_cursor_look look;
+		struct comp_cursor_look look;
 		bool warned_routed;
 	} cursor_draw;
 };
@@ -3563,14 +3563,17 @@ d3d11_cursor_resolve(struct comp_d3d11_compositor *c,
 		out->xsc = req->image;
 		out->image_index = req->image_index;
 	} else {
-		if (!u_cursor_look_update(&c->cursor_draw.look, dpi)) {
+		// Shared with every backend (comp_cursor_look): the OS cursor
+		// mirror on Windows, at this window's DPI, else the arrow.
+		if (!comp_cursor_look_update(&c->cursor_draw.look, (float)dpi / 96.0f)) {
 			return false;
 		}
-		const struct u_cursor_look *look = &c->cursor_draw.look;
-		aspect = (float)look->width / (float)look->height;
+		const struct comp_cursor_look *look = &c->cursor_draw.look;
+		aspect = look->aspect;
 		hot_u = look->hot_u;
 		hot_v = look->hot_v;
-		size_m = req->size_m > 0.0f ? req->size_m : look->height_px * m_per_px;
+		// OS points x (DPI / 96) = panel pixels, x the pixel pitch.
+		size_m = req->size_m > 0.0f ? req->size_m : look->height_pt * ((float)dpi / 96.0f) * m_per_px;
 		out->look = look;
 	}
 	const float height = size_m / canvas_h_m; // sprite height, in units (canvas heights at t)
@@ -4477,7 +4480,7 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 	mcp_capture_uninstall();
 	mcp_capture_fini(&c->mcp_capture);
 	// XR_DXR_cursor_depth v5: the default look's image (NULL unless ever drawn).
-	u_cursor_look_fini(&c->cursor_draw.look);
+	comp_cursor_look_fini(&c->cursor_draw.look);
 
 #ifdef XRT_FEATURE_DEBUG_GUI
 	// Stop debug GUI first (before destroying resources it may reference)

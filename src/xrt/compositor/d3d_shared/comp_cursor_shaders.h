@@ -57,9 +57,10 @@ VS_OUTPUT main(uint vertex_id : SV_VertexID)
 }
 )";
 
-// STRAIGHT alpha out; the blend state is SrcAlpha / InvSrcAlpha for colour and
-// One / InvSrcAlpha for alpha (every cursor source is straight: the app's
-// sprite by the spec, the default look by construction - u_cursor_look).
+// The texel as stored: the blend state carries the alpha convention -
+// SrcAlpha / InvSrcAlpha for the app's STRAIGHT sprite (the spec), One /
+// InvSrcAlpha for the PREMULTIPLIED default look (comp_cursor_look); alpha
+// is One / InvSrcAlpha either way.
 // Compiled with `DXR_LAYERED` defined for a layered (arraySize > 1) sprite
 // swapchain, whose SRV is a Texture2DArray: the spec samples array layer 0.
 static const char *cursor_quad_ps_source = R"(

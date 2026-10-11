@@ -18,9 +18,11 @@
  * points. A compositor only uploads the pixels whenever @ref
  * comp_cursor_look::generation changes and samples them.
  *
- * OS-cursor mirroring is macOS-only today ([NSCursor currentCursor], read
- * only when the commit runs on the main thread - AppKit is main-thread-only).
- * Elsewhere, and whenever the shape cannot be read, the look is the arrow.
+ * OS-cursor mirroring: macOS ([NSCursor currentCursor], read only when the
+ * commit runs on the main thread - AppKit is main-thread-only;
+ * comp_cursor_look_macos.m) and Windows (GetCursorInfo + DrawIconEx over
+ * black and white, at the panel's DPI; comp_cursor_look_win.c). Elsewhere,
+ * and whenever the shape cannot be read, the look is the arrow.
  * `DXR_CURSOR_DEFAULT_LOOK=arrow` forces the arrow everywhere.
  *
  * ZERO COST UNLESS REQUESTED (ADR-046 section 0): nothing here runs, and
@@ -56,6 +58,10 @@ struct comp_cursor_look
 	uint64_t generation;
 	//! The mirrored OS cursor (platform object, retained), NULL for the arrow.
 	void *os_cursor;
+	//! Windows: the backing scale (DPI / 96) the mirrored image was made at,
+	//! and a cursor that could not be read (not retried every frame).
+	float os_scale;
+	void *os_failed;
 };
 
 /*!
@@ -70,8 +76,8 @@ bool
 comp_cursor_look_update(struct comp_cursor_look *look, float backing_scale);
 
 /*!
- * Backing pixels per OS point of the main screen (macOS), 1 elsewhere. Read on
- * the main thread and cached; off the main thread before the first read, 2 on
+ * Backing pixels per OS point of the main screen (macOS), the system DPI / 96
+ * (Windows), 1 elsewhere. macOS: read on the main thread and cached; off the main thread before the first read, 2 on
  * macOS. The panel's metres per OS point is its pixel pitch times this.
  */
 float
@@ -84,7 +90,8 @@ comp_cursor_look_fini(struct comp_cursor_look *look);
 
 /*
  *
- * Internal - the platform half (comp_cursor_look_macos.m on Apple).
+ * Internal - the platform half (comp_cursor_look_macos.m on Apple,
+ * comp_cursor_look_win.c on Windows).
  *
  */
 

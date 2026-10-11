@@ -752,29 +752,6 @@ u_cursor_draw_arrow_rgba(uint8_t *rgba, uint32_t w, uint32_t h)
 }
 
 void
-u_cursor_draw_unpremultiply(uint8_t *px, uint32_t pixel_count)
-{
-	if (px == NULL) {
-		return;
-	}
-	for (uint32_t i = 0; i < pixel_count; i++) {
-		uint8_t *p = px + (size_t)i * 4;
-		const uint32_t a = p[3];
-		if (a == 0) {
-			p[0] = p[1] = p[2] = 0;
-			continue;
-		}
-		if (a == 255) {
-			continue;
-		}
-		for (int c = 0; c < 3; c++) {
-			const uint32_t v = ((uint32_t)p[c] * 255u + a / 2u) / a;
-			p[c] = (uint8_t)(v > 255u ? 255u : v);
-		}
-	}
-}
-
-void
 u_cursor_draw_unblend(const uint8_t *on_black, const uint8_t *on_white, uint32_t pixel_count, uint8_t *out)
 {
 	if (on_black == NULL || on_white == NULL || out == NULL) {
@@ -798,9 +775,9 @@ u_cursor_draw_unblend(const uint8_t *on_black, const uint8_t *on_white, uint32_t
 			o[0] = o[1] = o[2] = o[3] = 0;
 			continue;
 		}
+		// Over black, the render IS colour x coverage: premultiplied already.
 		for (int c = 0; c < 3; c++) {
-			const int v = ((int)b[c] * 255 + a / 2) / a;
-			o[c] = (uint8_t)(v > 255 ? 255 : v);
+			o[c] = b[c] > a ? (uint8_t)a : b[c];
 		}
 		o[3] = (uint8_t)a;
 	}

@@ -23,7 +23,7 @@ struct comp_d3d12_renderer;
 struct comp_d3d12_compositor;
 struct comp_layer_accum;
 struct xrt_swapchain;
-struct u_cursor_look;
+struct comp_cursor_look;
 
 #ifdef __cplusplus
 extern "C" {
@@ -209,7 +209,9 @@ struct comp_d3d12_cursor_quads
 	struct xrt_swapchain *xsc;
 	uint32_t image_index;
 	//! The default look (compositor-owned, outlives the frame).
-	const struct u_cursor_look *look;
+	//! Its pixels are PREMULTIPLIED (comp_cursor_look); an app sprite is
+	//! STRAIGHT (the spec). The renderer blends each accordingly.
+	const struct comp_cursor_look *look;
 };
 
 /*!

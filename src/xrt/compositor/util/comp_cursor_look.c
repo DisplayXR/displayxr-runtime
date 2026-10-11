@@ -80,16 +80,17 @@ comp_cursor_look_fini(struct comp_cursor_look *look)
 {
 	free(look->rgba);
 	look->rgba = NULL;
+	look->os_failed = NULL;
 	if (look->os_cursor != NULL) {
 		comp_cursor_look_platform_release(look->os_cursor);
 		look->os_cursor = NULL;
 	}
 }
 
-#ifndef __APPLE__
+#if !defined(__APPLE__) && !defined(_WIN32)
 /*
  * No OS-cursor mirror on this platform yet (Linux: XFixesGetCursorImage is
- * the follow-up; Windows: GetCursorInfo + GetIconInfo). The arrow it is.
+ * the follow-up). The arrow it is.
  */
 bool
 comp_cursor_look_platform_mirror(struct comp_cursor_look *look, float backing_scale)

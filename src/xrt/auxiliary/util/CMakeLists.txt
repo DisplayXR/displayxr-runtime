@@ -26,8 +26,6 @@ add_library(
 	u_bitwise.c
 	u_cursor_depth.c
 	u_cursor_depth.h
-	u_cursor_look.c
-	u_cursor_look.h
 	u_lift_cursor.c
 	u_lift_cursor.h
 	u_lift_depth.c
@@ -198,9 +196,7 @@ if(WIN32)
 	# bcrypt: BCryptGenRandom seeds the stereo camera persistentId secret (u_camera_consent_store.c)
 	# wintrust + crypt32: Authenticode signer check for user-writable consent-delegating
 	# entries; ole32 (CoTaskMemFree) + uuid (FOLDERID_*): SHGetKnownFolderPath (u_camera_consent_store.c)
-	# user32 + gdi32: the runtime-drawn cursor's default look reads the OS cursor
-	# (GetCursorInfo / DrawIconEx into a DIB section, u_cursor_look.c)
-	target_link_libraries(aux_util PRIVATE shell32 advapi32 bcrypt wintrust crypt32 ole32 uuid user32 gdi32)
+	target_link_libraries(aux_util PRIVATE shell32 advapi32 bcrypt wintrust crypt32 ole32 uuid)
 endif()
 
 # WIL is lacking official support on MINGW.

@@ -704,14 +704,16 @@ sprite and the depth, and the runtime owns the drawing. Apps get the same contra
   the panel's pixel pitch from the window metrics) — and hands them to its renderer before the
   projection pass. The renderer draws them **last in the window-space pass**: after the
   projection, quad and window-space layers, before the compose publish and (D3D12) the atlas's
-  final barrier, so before the display processor. One straight-alpha triangle strip per tile,
-  depth off (no DSV), no culling, scissored to the tile. Multi-screen routed frames draw nothing
+  final barrier, so before the display processor. One alpha-blended triangle strip per tile
+  (straight for the app's sprite, premultiplied for the default look), depth off (no DSV), no
+  culling, scissored to the tile. Multi-screen routed frames draw nothing
   (one-time WARN).
 - **Shaders.** One shared HLSL pair, `d3d_shared/comp_cursor_shaders.h` (corners in b0 — a
   D3D11 constant buffer, 16 D3D12 root constants on the existing quad root signature), compiled
   with `D3DCompile` on the first cursor frame only, like every other in-process shader here. A
-  `DXR_LAYERED` variant samples array layer 0 of a layered sprite. D3D12 builds four pipelines
-  (`[layered][_SRGB target]`), since a D3D12 PSO bakes its RTV format.
+  `DXR_LAYERED` variant samples array layer 0 of a layered sprite. D3D12 builds six pipelines
+  (`[straight | straight layered | premultiplied][_SRGB target]`), since a D3D12 PSO bakes its
+  blend and RTV format.
 - **Colour (ADR-044).** The cursor takes the frame's treatment: on a composing frame it is drawn
   into the private `_SRGB` compose target through the source's format-honest view (decoding), on
   a fast-path frame straight into the encoded atlas through the non-decoding view. A
@@ -719,19 +721,21 @@ sprite and the depth, and the runtime owns the drawing. Apps get the same contra
   not counted as a contributing layer, so a fast-path frame blends the sprite's anti-aliased
   edges in encoded space, as on Metal. The default look is uploaded once per shape into a
   TYPELESS texture with a UNORM and an `_SRGB` view, so the white arrow is white either way.
-- **Default look (A.6) — `u_cursor_look` (aux, API-agnostic).** Windows: `GetCursorInfo()` →
-  `HCURSOR`, drawn with `DrawIconEx` into a 32-bit DIB **twice, over black and over white**, and
-  recovered by `u_cursor_draw_unblend` (alpha = 1 − (white − black), colour = black ÷ alpha).
-  That reads every cursor kind the same way — 32-bit alpha, colour + AND mask, monochrome
-  AND/XOR — and turns XOR (invert) pixels into opaque white. Drawn at the size the OS draws it on
-  this panel: `GetSystemMetricsForDpi(SM_CYCURSOR, GetDpiForWindow(hwnd))`, or the image's own
-  size when larger (accessibility pointer sizes); physical size = that pixel height × the
-  panel's pixel pitch. Cached by `HCURSOR` + DPI, so it re-rasterises only on a shape change.
-  `GetCursorInfo` is global, so the compositor thread may call it. While the app has hidden its
-  cursor with `SetCursor(NULL)` — which it does as soon as a locate reports `willDraw`, i.e. on
-  most drawn frames — the shape is the **class cursor of the window under the pointer**, else
-  the last shape, else `IDC_ARROW`. Elsewhere, or with `DXR_CURSOR_DEFAULT_LOOK=arrow`: the
-  classic arrow, `u_cursor_draw_arrow_rgba` un-premultiplied, 19 px at 96 DPI.
+- **Default look (A.6) — the shared `comp_cursor_look`** (the same entry point Metal, Vulkan and
+  GL use), whose Windows half is `comp_cursor_look_win.c`: `GetCursorInfo()` → `HCURSOR`, drawn
+  with `DrawIconEx` into a 32-bit DIB **twice, over black and over white**, and recovered by
+  `u_cursor_draw_unblend` (alpha = 1 − (white − black); the render over black is the
+  premultiplied colour). That reads every cursor kind the same way — 32-bit alpha, colour + AND
+  mask, monochrome AND/XOR — and turns XOR (invert) pixels into opaque white. Drawn at the size
+  the OS draws it on this panel: `GetSystemMetricsForDpi(SM_CYCURSOR, dpi)` with the window's
+  `GetDpiForWindow` (passed as the look's backing scale, DPI / 96), or the image's own size when
+  larger (accessibility pointer sizes); its `height_pt` is that size in 96-DPI points, so the
+  physical size is `height_pt` × DPI / 96 × the panel's pixel pitch. Cached by `HCURSOR` + scale,
+  so it re-rasterises only on a shape change. `GetCursorInfo` is global, so the compositor thread
+  may call it. While the app has hidden its cursor with `SetCursor(NULL)` — which it does as soon
+  as a locate reports `willDraw`, i.e. on most drawn frames — the shape is the **class cursor of
+  the window under the pointer**, else the last shape, else `IDC_ARROW`. With
+  `DXR_CURSOR_DEFAULT_LOOK=arrow`, or if the cursor cannot be read: the shared classic arrow.
 - **App sprite.** Straight alpha, last released image, hotspot as given; `sizeMeters` ≤ 0 = 19 px
   at the window's DPI × pixel pitch (the classic arrow's size, as Metal's 19 pt). D3D12 dips the
   image RENDER_TARGET → PIXEL_SHADER_RESOURCE → RENDER_TARGET around the draw, as for

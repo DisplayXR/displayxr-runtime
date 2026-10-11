@@ -62,6 +62,8 @@ if(WIN32 AND XRT_HAVE_D3D11)
 			aux_d3d
 			comp_xbridge
 			comp_d3d11_segs
+			# XR_DXR_cursor_depth v5: the runtime-drawn cursor's default look
+			comp_cursor_look
 			xrt-external-stb
 			d3d11
 			d3d12
