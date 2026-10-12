@@ -1630,9 +1630,9 @@ lift_convert_one(d3d11_lift *l, lift_stream &st, std::unique_lock<std::mutex> &l
 			    "h=%.3f (peak %.3f, p%.0f %.3f) "
 			    "median h=%.3f confidence=%.2f cells=%u measured=%u held=%u cuts=%u applied=%llu%s",
 			    (unsigned long long)st.id, st.ac_value, st.ac.target, st.ac_last.mode_h, st.ac_last.peak_h,
-			    (double)l->ac_params.percentile, st.ac_last.pct_h,
-			    st.ac_last.median_h, st.ac_last.confidence, st.ac_last.samples, st.ac.measurements,
-			    st.ac.held, st.ac.cuts, (unsigned long long)st.ac_applied, st.ac.fast ? " (cut ramp)" : "");
+			    (double)l->ac_params.percentile, st.ac_last.pct_h, st.ac_last.median_h,
+			    st.ac_last.confidence, st.ac_last.samples, st.ac.measurements, st.ac.held, st.ac.cuts,
+			    (unsigned long long)st.ac_applied, st.ac.fast ? " (cut ramp)" : "");
 		}
 		if (vp_floats >= 3) {
 			U_LOG_I(

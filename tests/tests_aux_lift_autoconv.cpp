@@ -399,7 +399,7 @@ TEST_CASE("lift autoconv: a large far background never takes the screen plane", 
 	// frame as one flat far plateau; the old foreground-biased mode put the
 	// screen on it and pushed ~90 % of the frame out.
 	Map m(512, 288, 0.0f);
-	m.rect(0.0f, 0.0f, 1.0f, 1.0f, 20.0f);       // far plateau everywhere...
+	m.rect(0.0f, 0.0f, 1.0f, 1.0f, 20.0f);      // far plateau everywhere...
 	m.rect(0.35f, 0.40f, 0.65f, 0.95f, 140.0f); // ...a centred subject (~16 % of the frame)
 	m.rect(0.05f, 0.80f, 0.12f, 0.95f, 250.0f); // a small near detail
 	const float subject_h = (140.0f - 20.0f) / (250.0f - 20.0f);
@@ -412,7 +412,7 @@ TEST_CASE("lift autoconv: a large far background never takes the screen plane", 
 	REQUIRE(e.valid);
 	CHECK(e.peak_h == Approx(subject_h).margin(1.0f / 32.0f)); // the far end is excluded
 	CHECK(e.mode_h > 0.25f);                                   // the plane moved off the background
-	CHECK(e.mode_h <= subject_h + 1.0f / 32.0f);              // ...but not in front of the subject
+	CHECK(e.mode_h <= subject_h + 1.0f / 32.0f);               // ...but not in front of the subject
 }
 
 TEST_CASE("lift autoconv: the percentile puts about a quarter of the weight in front", "[lift_autoconv]")
