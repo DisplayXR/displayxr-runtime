@@ -324,6 +324,71 @@ dp_has_lift_factory(const struct xrt_plugin_iface *dp)
 
 /*
  *
+ * The headless host (spec §2.1 host iface). Only get_setting differs from the
+ * loader's default host: it answers `DXR_CONV_<ID>_<KEY>` from the environment,
+ * then the provider's registry `Settings\*` / manifest "settings" -- exactly the
+ * keys the service host will serve -- so a provider that gates its probe on a
+ * setting (the sim provider's ENABLE) is described here as it would be there.
+ *
+ * The callbacks carry no provider context, so the pass runs providers ONE AT A
+ * TIME and points @ref g_headless_entry at the one being negotiated / probed /
+ * described. Single-threaded by construction (CLI / tests); after the pass the
+ * pointer is NULL and every lookup answers "absent".
+ *
+ */
+
+static const struct xrt_conversion_plugin_entry *g_headless_entry = NULL;
+static struct xrt_conversion_plugin_host_iface g_headless_host;
+static bool g_headless_host_ready = false;
+
+static bool
+headless_get_setting(const char *key, char *buf, uint32_t buf_size)
+{
+	const struct xrt_conversion_plugin_entry *e = g_headless_entry;
+	if (e == NULL || key == NULL || buf == NULL || buf_size == 0) {
+		return false;
+	}
+	char env[160];
+	size_t n = (size_t)snprintf(env, sizeof(env), "DXR_CONV_%s_%s", e->id, key);
+	if (n >= sizeof(env)) {
+		return false;
+	}
+	for (char *c = env; *c != '\0'; c++) {
+		*c = *c == '-' ? '_' : (char)toupper((unsigned char)*c);
+	}
+	const char *v = getenv(env);
+	if (v != NULL && v[0] != '\0') {
+		copy_str(buf, buf_size, v);
+		return true;
+	}
+	for (uint32_t i = 0; i < e->setting_count && i < XRT_CONV_LOADER_MAX_SETTINGS; i++) {
+#ifdef XRT_OS_WINDOWS
+		if (_stricmp(e->settings[i].key, key) == 0) {
+#else
+		if (strcmp(e->settings[i].key, key) == 0) {
+#endif
+			copy_str(buf, buf_size, e->settings[i].value);
+			return true;
+		}
+	}
+	return false;
+}
+
+const struct xrt_conversion_plugin_host_iface *
+target_conv_status_headless_host(void)
+{
+	if (!g_headless_host_ready) {
+		g_headless_host = *target_conversion_plugin_default_host();
+		g_headless_host.get_setting = headless_get_setting;
+		g_headless_host.host_flags |= 2u; // bit1: headless / CI
+		g_headless_host_ready = true;
+	}
+	return &g_headless_host;
+}
+
+
+/*
+ *
  * The pass.
  *
  */
@@ -571,8 +636,9 @@ target_conv_status_build_from_entries(struct xrt_conversion_plugin_entry *entrie
 			e->status = XRT_CONV_LOAD_NOT_LOADED;
 			e->flags &= ~XRT_CONV_ENTRY_FLAG_DISABLED;
 		}
+		g_headless_entry = e; // the host's get_setting answers for this provider only
 		if (e->status == XRT_CONV_LOAD_NOT_LOADED) {
-			(void)target_conversion_plugin_negotiate_one(e, NULL);
+			(void)target_conversion_plugin_negotiate_one(e, target_conv_status_headless_host());
 		}
 
 		struct conv_provider_desc d;
@@ -623,6 +689,7 @@ target_conv_status_build_from_entries(struct xrt_conversion_plugin_entry *entrie
 		}
 		apply_provider_states(reg, (uint32_t)pi, out);
 	}
+	g_headless_entry = NULL;
 
 	// The static dp-lift row (Windows: the lift slots are a D3D11-service feature).
 #ifdef XRT_OS_WINDOWS

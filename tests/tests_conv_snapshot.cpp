@@ -579,3 +579,69 @@ TEST_CASE("conv headless: a per-user Enabled = 0 override disables without loadi
 }
 
 #endif
+
+#if defined(CONV_SNAP_SIM_STATIC)
+// The shipped sim provider, linked in (sim_conversion_static) -- its DLL needs
+// the runtime's own DLLs next to it, which only _package provides.
+extern "C" xrt_result_t
+xrtConversionPluginNegotiate(uint32_t runtime_api_version,
+                             const struct xrt_conversion_plugin_host_iface *host,
+                             struct xrt_conversion_plugin_iface **out_iface,
+                             uint32_t *out_plugin_api_version);
+
+namespace {
+//! A pre-negotiated sim entry, through the headless host (as the loader would).
+xrt_conversion_plugin_entry
+sim_entry()
+{
+	xrt_conversion_plugin_entry e;
+	std::memset(&e, 0, sizeof(e));
+	cpy(e.id, sizeof(e.id), "sim-conversion");
+	cpy(e.display_name, sizeof(e.display_name), "DisplayXR Sim Conversion");
+	e.probe_order = 250;
+	e.enabled = true;
+	REQUIRE(target_conversion_plugin_negotiate_with(&e, xrtConversionPluginNegotiate,
+	                                                target_conv_status_headless_host()));
+	return e;
+}
+} // namespace
+
+TEST_CASE("conv headless: the shipped sim provider describes cleanly (the CI selftest gate)", "[conv_snapshot][headless]")
+{
+	// What CI's `selftest --json` sees once sim-conversion is registered with
+	// Settings ENABLE = 1: a negotiated provider whose every descriptor passes
+	// validation. A failure here is a CI exit 13 waiting to happen.
+	set_env("DXR_CONV_SIM_CONVERSION_ENABLE", "1"); // the headless host's env override
+	xrt_conversion_plugin_entry e = sim_entry();
+	auto st = std::make_unique<target_conv_status>();
+	target_conv_status_build_from_entries(&e, 1, nullptr, nullptr, st.get());
+	set_env("DXR_CONV_SIM_CONVERSION_ENABLE", nullptr);
+
+	INFO("bad_note: " << st->bad_note);
+	CHECK(st->negotiated == 1);
+	CHECK(st->bad_descriptors == 0);
+	REQUIRE(st->provider_count == 1);
+	CHECK(std::string(st->providers[0].load) == "NEGOTIATED");
+	CHECK(st->providers[0].fallback);
+	CHECK(st->providers[0].cap_count > 0);
+	CHECK(st->task_count > 0);
+
+	// The registry Settings value reaches it too (CI registers ENABLE that way).
+	xrt_conversion_plugin_entry e2 = sim_entry();
+	e2.setting_count = 1;
+	cpy(e2.settings[0].key, sizeof(e2.settings[0].key), "ENABLE");
+	cpy(e2.settings[0].value, sizeof(e2.settings[0].value), "1");
+	target_conv_status_build_from_entries(&e2, 1, nullptr, nullptr, st.get());
+	CHECK(st->bad_descriptors == 0);
+	REQUIRE(st->provider_count == 1);
+	CHECK(st->providers[0].cap_count > 0);
+
+	// Without ENABLE the provider declines its probe cleanly: listed, never failed.
+	xrt_conversion_plugin_entry e3 = sim_entry();
+	target_conv_status_build_from_entries(&e3, 1, nullptr, nullptr, st.get());
+	CHECK(st->bad_descriptors == 0);
+	REQUIRE(st->provider_count == 1);
+	CHECK(std::string(st->providers[0].load) == "PROBE_DECLINED");
+	CHECK(st->providers[0].cap_count == 0);
+}
+#endif

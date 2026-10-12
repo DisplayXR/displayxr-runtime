@@ -124,6 +124,18 @@ target_conv_status_build_from_entries(struct xrt_conversion_plugin_entry *entrie
                                       struct target_conv_status *out);
 
 /*!
+ * The host iface the headless pass negotiates providers with: the loader's
+ * default host, plus a get_setting that answers `DXR_CONV_<ID>_<KEY>` from the
+ * environment, then the provider's registry `Settings` / manifest "settings".
+ * It answers only while @ref target_conv_status_build_from_entries is running
+ * that provider (single-threaded; the callbacks carry no provider context).
+ * Exposed so a caller can pre-negotiate an entry (status NEGOTIATED, iface set);
+ * the pass then probes + describes it without loading anything.
+ */
+const struct xrt_conversion_plugin_host_iface *
+target_conv_status_headless_host(void);
+
+/*!
  * Copy the rows into @p snap (`conv_providers[]`, `conv_tasks[]`). Does not
  * derive warnings: call `u_status_warnings_derive` after.
  */
