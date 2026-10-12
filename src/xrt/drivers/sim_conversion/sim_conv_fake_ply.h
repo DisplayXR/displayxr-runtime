@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  sim_display's FAKE photo → Gaussian-splat output (SIM_DISPLAY_FAKE_LIFT,
- *         XR_DXR_lift GAUSSIANS mode, ADR-042).
+ * @brief  FAKE photo → Gaussian-splat output, shared by the sim conversion
+ *         provider (SPLATS_* jobs, ADR-053) and sim_display's deprecated
+ *         SIM_DISPLAY_FAKE_LIFT module (XR_DXR_lift GAUSSIANS mode, ADR-042).
  *
  * Not a model: a tiny, VALID reference-3DGS binary PLY — two layers of splats
  * (a front layer coloured from the photo on a grid, a darker back layer behind
@@ -11,7 +12,7 @@
  * a splat viewer) can be exercised end to end without vendor hardware.
  * Platform-neutral so its format is pinned host-side (tests_lift_mailbox.cpp).
  *
- * @ingroup drv_sim_display
+ * @ingroup drv_sim_conversion
  */
 
 #pragma once
