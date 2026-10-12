@@ -64,8 +64,8 @@
  * in-process compositor offers it, so no CTS arm has ever exercised it.
  */
 static const DXGI_FORMAT d3d11_service_depth_formats[] = {
-    DXGI_FORMAT_D24_UNORM_S8_UINT,
     DXGI_FORMAT_D32_FLOAT,
+    DXGI_FORMAT_D24_UNORM_S8_UINT,
     DXGI_FORMAT_D16_UNORM,
 };
 
@@ -111,7 +111,7 @@ d3d11_service_wire_format_to_dxgi(int64_t format)
 	case VK_FORMAT_D16_UNORM: return DXGI_FORMAT_D16_UNORM;
 	case VK_FORMAT_D32_SFLOAT: return DXGI_FORMAT_D32_FLOAT;
 	case VK_FORMAT_D24_UNORM_S8_UINT: return DXGI_FORMAT_D24_UNORM_S8_UINT;
-	case VK_FORMAT_D32_SFLOAT_S8_UINT: return DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+	case VK_FORMAT_D32_SFLOAT_S8_UINT: return DXGI_FORMAT_D32_FLOAT;
 
 	// Legacy DXGI pass-through (colour only).
 	case DXGI_FORMAT_R8G8B8A8_UNORM:
@@ -151,7 +151,7 @@ d3d11_service_image_formats_for(DXGI_FORMAT format)
 	struct d3d11_service_image_formats f = {format, format, DXGI_FORMAT_UNKNOWN, false};
 	if (d3d11_service_is_depth_format(format)) {
 		f.depth = true;
-		f.texture = d3d_dxgi_format_to_typeless_dxgi(format);
+		f.texture = format;
 		f.srv = d3d_dxgi_typeless_to_typed_dxgi(f.texture);
 		f.dsv = format;
 	}
@@ -170,7 +170,8 @@ d3d11_service_bind_flags(DXGI_FORMAT format, enum xrt_swapchain_usage_bits bits)
 {
 	UINT bind = D3D11_BIND_SHADER_RESOURCE;
 	if (d3d11_service_is_depth_format(format)) {
-		return bind | D3D11_BIND_DEPTH_STENCIL;
+		return bind | D3D11_BIND_DEPTH_STENCIL |
+		       (((bits & XRT_SWAPCHAIN_USAGE_COLOR) != 0) ? D3D11_BIND_RENDER_TARGET : 0);
 	}
 	if ((bits & XRT_SWAPCHAIN_USAGE_COLOR) != 0) {
 		bind |= D3D11_BIND_RENDER_TARGET;
@@ -212,7 +213,7 @@ d3d11_service_shared_texture_desc(uint32_t width,
 	desc.CPUAccessFlags = 0;
 	// SHARED_KEYEDMUTEX: cross-process sharing with synchronisation.
 	// SHARED_NTHANDLE: real kernel handles that DuplicateHandle across processes.
-	desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+	desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
 	return desc;
 }
 
