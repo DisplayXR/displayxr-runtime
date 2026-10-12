@@ -1,0 +1,681 @@
+// Copyright 2026, The DisplayXR Project
+// SPDX-License-Identifier: BSL-1.0
+/*!
+ * @file
+ * @brief  #2003: the legacy DP-lift adapter (`dp-lift`,
+ *         conversion/conv_provider_legacy_dp.h) and the legacy golden replay,
+ *         driven through the conversion core and the v3 route with a scripted
+ *         lift-thread backend (no GPU).
+ *
+ *  - the static describe: three capabilities, INSTALLED before any module
+ *    loads (the factory is never called to describe), passing the selftest
+ *    validator (VIEWS_MONO carries EXPLICIT_VIEWPOINTS), licence UNKNOWN;
+ *  - state is a plain copy of module_status;
+ *  - properties before the first describe ⇒ ACTIVATING;
+ *  - cold boot: ACTIVATING → READY without a restart (G5), a create while
+ *    ACTIVATING accepted and served (G3);
+ *  - no module at the first activation ⇒ FAILED (retryable), READY after a
+ *    registry change without a restart; every attempt re-resolves (G5);
+ *  - splats not ready + SBS READY ⇒ READY (any, not all);
+ *  - the legacy units: the policy's RELATIVE plane and the app's strength
+ *    reach the module unchanged; an N-view stream hands the module the pair.
+ */
+
+#include "catch_amalgamated.hpp"
+
+#include "conv_fake_provider.h"
+
+#include "conversion/conv_core.h"
+#include "conversion/conv_provider_legacy_dp.h"
+#include "conversion/conv_readiness.h"
+#include "conversion/conv_registry.h"
+
+#include "server/ipc_server_conv.h"
+#include "shared/ipc_protocol.h"
+
+#include "os/os_time.h"
+
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <functional>
+#include <mutex>
+#include <thread>
+
+namespace {
+
+constexpr uint64_t MS = 1000000ull;
+
+bool
+wait_until(const std::function<bool()> &pred, uint32_t timeout_ms)
+{
+	const uint64_t end = os_monotonic_get_ns() + (uint64_t)timeout_ms * MS;
+	while (os_monotonic_get_ns() < end) {
+		if (pred()) {
+			return true;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(2));
+	}
+	return pred();
+}
+
+/*
+ * The lift thread, scripted.
+ */
+struct FakeLift
+{
+	std::mutex m;
+	bool factory = true;        //!< a lift factory resolves
+	bool module_present = true; //!< the next activation finds a module
+	int polls_until_ready = 0;  //!< the module reports ACTIVATING for this many polls
+	uint32_t module_status = 0; //!< forced module_status after activation (0 = from the script)
+	uint32_t modes = XRT_DP_LIFT_MODE_DEPTH | XRT_DP_LIFT_MODE_SBS | XRT_DP_LIFT_MODE_NVIEW;
+	uint32_t max_views = 4;
+
+	// State the snapshot reports.
+	bool attempted = false, have = false;
+	xrt_dp_lift_caps caps{};
+	uint64_t change = 0;
+
+	// Instrumentation.
+	int activations = 0, polls = 0, streams = 0, converts = 0;
+	xrt_dp_lift_params last_params{};
+	uint32_t last_vpf = 0;
+	float last_vps[3 * XRT_CONV_MAX_VIEWS] = {};
+	xrt_dp_lift_stream_info last_info{};
+
+	void
+	set_state(uint32_t st)
+	{
+		caps.state = st;
+		caps.module_status =
+		    module_status != 0
+		        ? module_status
+		        : (st == XRT_DP_LIFT_STATE_READY ? XRT_DP_LIFT_MODULE_READY : XRT_DP_LIFT_MODULE_ACTIVATING);
+		change++;
+	}
+};
+
+void
+fl_snapshot(void *ud, conv_dp_lift_snapshot *out)
+{
+	auto *f = static_cast<FakeLift *>(ud);
+	std::lock_guard<std::mutex> lk(f->m);
+	std::memset(out, 0, sizeof(*out));
+	out->factory_present = f->factory;
+	out->attempted = f->attempted;
+	out->have_module = f->have;
+	out->has_depth_slot = true;
+	out->caps = f->caps;
+	std::snprintf(out->detail, sizeof(out->detail), "%s",
+	              f->have ? "" : "display processor ships no conversion module");
+	out->change_count = f->change;
+}
+
+xrt_result_t
+fl_activate(void *ud, bool retry)
+{
+	(void)retry;
+	auto *f = static_cast<FakeLift *>(ud);
+	std::lock_guard<std::mutex> lk(f->m);
+	f->activations++;
+	f->attempted = true;
+	f->have = f->factory && f->module_present;
+	xrt_dp_lift_caps_init(&f->caps);
+	if (f->have) {
+		f->caps.modes = f->modes;
+		f->caps.max_views = f->max_views;
+		f->caps.max_streams = 4;
+		f->caps.aux_outputs = XRT_DP_LIFT_AUX_DEPTH;
+		f->caps.aux_depth_semantics = XRT_DP_LIFT_DEPTH_RELATIVE;
+		std::snprintf(f->caps.backend, sizeof(f->caps.backend), "fake-module");
+		f->set_state(f->polls_until_ready > 0 ? XRT_DP_LIFT_STATE_ACTIVATING : XRT_DP_LIFT_STATE_READY);
+	} else {
+		f->caps.state = XRT_DP_LIFT_STATE_UNAVAILABLE;
+		f->change++;
+	}
+	return XRT_SUCCESS;
+}
+
+void
+fl_poll(void *ud)
+{
+	auto *f = static_cast<FakeLift *>(ud);
+	std::lock_guard<std::mutex> lk(f->m);
+	f->polls++;
+	if (f->have && f->polls_until_ready > 0 && --f->polls_until_ready == 0) {
+		f->set_state(XRT_DP_LIFT_STATE_READY);
+	}
+}
+
+xrt_result_t
+fl_stream_create(void *ud, const xrt_dp_lift_stream_info *info, uint64_t *out_id)
+{
+	auto *f = static_cast<FakeLift *>(ud);
+	std::lock_guard<std::mutex> lk(f->m);
+	if (!f->have || (f->caps.modes & info->mode) == 0) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	f->last_info = *info;
+	*out_id = (uint64_t)++f->streams;
+	return XRT_SUCCESS;
+}
+
+void
+fl_stream_destroy(void *, uint64_t)
+{}
+
+xrt_result_t
+fl_convert(void *ud, uint64_t, conv_dp_lift_convert *io)
+{
+	auto *f = static_cast<FakeLift *>(ud);
+	std::lock_guard<std::mutex> lk(f->m);
+	f->converts++;
+	f->last_params = *io->params;
+	f->last_vpf = io->viewpoint_floats;
+	std::memset(f->last_vps, 0, sizeof(f->last_vps));
+	if (io->viewpoints != nullptr) {
+		std::memcpy(f->last_vps, io->viewpoints, sizeof(float) * io->viewpoint_floats);
+	}
+	const xrt_conv_image *primary = io->primary_is_depth ? io->depth_target : io->views_target;
+	if (primary == nullptr || primary->memory_kind != XRT_CONV_MEM_CPU || primary->cpu_ptr == nullptr) {
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+	}
+	std::memset(primary->cpu_ptr, 0x5a, (size_t)primary->byte_size);
+	io->out_w = primary->width;
+	io->out_h = primary->height;
+	io->out_format = primary->format;
+	if (io->primary_is_depth) {
+		io->depth_written = true;
+	} else {
+		io->views_written = true;
+	}
+	if (io->want_depth && io->depth_target != nullptr && io->depth_target->cpu_ptr != nullptr) {
+		std::memset(io->depth_target->cpu_ptr, 0, (size_t)io->depth_target->byte_size);
+		io->depth_written = true;
+		io->have_depth_meta = true;
+		xrt_dp_lift_depth_init(&io->depth);
+		io->depth.width = io->depth_target->width;
+		io->depth.height = io->depth_target->height;
+		io->depth.units = XRT_DP_LIFT_DEPTH_RELATIVE;
+		io->depth.encoding = XRT_DP_LIFT_DEPTH_ENCODING_INVERSE;
+		io->depth.value_scale = 1.0f;
+		io->depth.same_inference = 1;
+	}
+	return XRT_SUCCESS;
+}
+
+//! The readiness of one of dp-lift's rows (the registry copy the status snapshot reads).
+uint32_t
+row_state(conv_core *core, uint32_t cap_id)
+{
+	auto *reg = new conv_registry();
+	conv_core_copy_registry(core, reg);
+	uint32_t st = XRT_CONV_STATE_UNKNOWN;
+	const int32_t pi = conv_registry_find_provider(reg, CONV_DP_LIFT_ID);
+	const int32_t ri = pi >= 0 ? conv_registry_find_row(reg, (uint32_t)pi, cap_id) : -1;
+	if (ri >= 0) {
+		st = reg->rows[ri].rd.state;
+		CHECK(reg->rows[ri].rd.retryable == (st == XRT_CONV_STATE_FAILED));
+	}
+	delete reg;
+	return st;
+}
+
+conv_dp_lift_backend
+backend_of(FakeLift &f)
+{
+	conv_dp_lift_backend b{};
+	b.snapshot = fl_snapshot;
+	b.activate = fl_activate;
+	b.poll = fl_poll;
+	b.stream_create = fl_stream_create;
+	b.stream_destroy = fl_stream_destroy;
+	b.convert = fl_convert;
+	b.ud = &f;
+	return b;
+}
+
+/*
+ * The core + the v3 route on the CPU.
+ */
+bool
+cpu_alloc(void *, const conv_image_request *req, xrt_conv_image *out)
+{
+	const uint32_t bpp = req->format == XRT_CONV_FMT_R8_UNORM ? 1 : 4;
+	const uint64_t size = (uint64_t)req->width * req->height * bpp * (req->array_layers ? req->array_layers : 1);
+	void *p = std::calloc(1, (size_t)size);
+	if (p == nullptr) {
+		return false;
+	}
+	static std::atomic<uint64_t> key{1};
+	std::memset(out, 0, sizeof(*out));
+	out->memory_kind = XRT_CONV_MEM_CPU;
+	out->cpu_ptr = p;
+	out->byte_size = size;
+	out->width = req->width;
+	out->height = req->height;
+	out->format = req->format;
+	out->row_stride = req->width * bpp;
+	out->import_key = key++;
+	return true;
+}
+
+void
+cpu_free(void *, xrt_conv_image *img)
+{
+	std::free(img->cpu_ptr);
+	img->cpu_ptr = nullptr;
+}
+
+xrt_result_t
+g_import(void *, uint64_t, xrt_graphics_buffer_handle_t, bool, uint32_t, uint32_t, const conv_submit_slot *slot)
+{
+	return slot->image_count >= 1 && slot->images[0].cpu_ptr != nullptr ? XRT_SUCCESS : XRT_ERROR_ALLOCATION;
+}
+
+xrt_result_t
+g_import_cpu(void *, uint64_t, xrt_graphics_buffer_handle_t, bool, uint32_t w, uint32_t h, uint8_t **out)
+{
+	*out = (uint8_t *)std::calloc(1, (size_t)w * h * 4u);
+	return *out != nullptr ? XRT_SUCCESS : XRT_ERROR_ALLOCATION;
+}
+
+void
+g_release(void *, xrt_graphics_buffer_handle_t, bool)
+{}
+
+xrt_result_t
+g_publish(void *, uint64_t, const conv_result *r, ipc_server_conv_published *out)
+{
+	const xrt_conv_image &src = (r->written & XRT_CONV_OUT_VIEWS) != 0 ? r->views : r->depth;
+	out->width = src.width;
+	out->height = src.height;
+	out->format = 28;
+	out->fence_value = 1;
+	return XRT_SUCCESS;
+}
+
+bool
+g_export(void *, uint64_t, bool, xrt_graphics_buffer_handle_t *, uint32_t *, uint32_t *, uint32_t *)
+{
+	return false;
+}
+
+bool
+g_fence(void *, uint64_t, xrt_graphics_sync_handle_t *)
+{
+	return false;
+}
+
+void
+g_gone(void *, uint64_t)
+{}
+
+struct Fixture
+{
+	conv_core *core = nullptr;
+	ipc_server_conv *sc = nullptr;
+	const xrt_conversion_plugin_iface *iface = nullptr;
+	xrt_conversion_plugin_instance *inst = nullptr;
+
+	explicit Fixture(uint32_t prewarm_on, bool splats_io = false)
+	{
+		conv_core_config cfg{};
+		cfg.alloc.alloc = cpu_alloc;
+		cfg.alloc.free = cpu_free;
+		cfg.prewarm_on = prewarm_on;
+		cfg.rear_cap_m = -1.0f;
+		cfg.tick_ms = 10;
+		REQUIRE(conv_core_create(&cfg, &core) == XRT_SUCCESS);
+		REQUIRE(ipc_server_conv_create(core, &sc) == XRT_SUCCESS);
+		ipc_server_set_conv(sc);
+		ipc_server_conv_io_ops io{};
+		io.import_input = g_import;
+		io.release_input = g_release;
+		io.publish_result = g_publish;
+		io.export_output = g_export;
+		io.export_fence = g_fence;
+		io.stream_gone = g_gone;
+		io.import_input_cpu = splats_io ? g_import_cpu : nullptr;
+		ipc_server_conv_set_io(sc, &io);
+	}
+	~Fixture()
+	{
+		ipc_server_set_conv(nullptr);
+		ipc_server_conv_destroy(&sc);
+		conv_core_destroy(&core); // destroys the adapter through its host
+	}
+
+	//! Register `dp-lift` as the service does (#2003): live, or cache-only (not yet described).
+	int32_t
+	add_dp_lift(FakeLift *f)
+	{
+		conv_provider_desc d{};
+		d.id = CONV_DP_LIFT_ID;
+		d.probe_order = CONV_DP_LIFT_PROBE_ORDER;
+		d.hosting = CONV_HOSTING_IN_SERVICE;
+		d.enabled = true;
+		d.flags = CONV_PROV_LICENCE_EXEMPT | CONV_PROV_LEGACY_UNITS;
+		if (f != nullptr) {
+			conv_dp_lift_backend b = backend_of(*f);
+			REQUIRE(conv_provider_legacy_dp_create(&b, &iface, &inst));
+			d.iface = iface;
+			d.inst = inst;
+		}
+		return conv_core_add_provider(core, &d);
+	}
+
+	xrt_dp_lift_caps
+	properties()
+	{
+		xrt_dp_lift_caps caps;
+		xrt_dp_lift_caps_init(&caps);
+		if (ipc_server_conv_routes_properties(sc)) {
+			ipc_server_conv_lift_properties(sc, &caps);
+		}
+		return caps;
+	}
+
+	xrt_result_t
+	create(uint64_t client, uint32_t mode, uint64_t *id)
+	{
+		if (!ipc_server_conv_routes_create(sc, mode, 0)) {
+			return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+		}
+		return ipc_server_conv_lift_stream_create(sc, client, mode, 0, 1.0f, 0, 0, id);
+	}
+
+	xrt_result_t
+	submit(uint64_t client, uint64_t id, float convergence = -1.0f, float strength = 1.0f, uint32_t views = 0)
+	{
+		ipc_arg_lift_submit a{};
+		a.stream_id = id;
+		a.source_time = 7;
+		a.width = 32;
+		a.height = 16;
+		a.has_params = 1;
+		a.params.convergence = convergence;
+		a.params.strength = strength;
+		a.params.inpaint = 1;
+		a.params.view_count = views;
+		uint64_t fid = 0;
+		return ipc_server_conv_lift_submit(sc, client, &a, (xrt_graphics_buffer_handle_t)(intptr_t)0x10, false,
+		                                   &fid);
+	}
+
+	bool
+	acquire(uint64_t client, uint64_t id, ipc_lift_result *r)
+	{
+		bool ready = false;
+		return ipc_server_conv_lift_acquire(sc, client, id, &ready, r) == XRT_SUCCESS && ready;
+	}
+};
+
+} // namespace
+
+
+TEST_CASE("dp-lift: static describe, INSTALLED before any module loads, selftest-valid", "[conv_dp_lift]")
+{
+	FakeLift f;
+	conv_dp_lift_backend b = backend_of(f);
+	const xrt_conversion_plugin_iface *iface = nullptr;
+	xrt_conversion_plugin_instance *inst = nullptr;
+	REQUIRE(conv_provider_legacy_dp_create(&b, &iface, &inst));
+	CHECK(std::strcmp(iface->id, CONV_DP_LIFT_ID) == 0);
+
+	uint32_t count = 0;
+	REQUIRE(iface->describe_cap(inst, 0, nullptr, &count) == XRT_SUCCESS);
+	REQUIRE(count == 3u);
+	const uint32_t tasks[3] = {XRT_CONV_TASK_DEPTH_MONO, XRT_CONV_TASK_DEPTH_VIDEO, XRT_CONV_TASK_VIEWS_MONO};
+	for (uint32_t i = 0; i < 3; i++) {
+		xrt_conv_capability c{};
+		c.struct_size = (uint32_t)sizeof(c);
+		REQUIRE(iface->describe_cap(inst, i, &c, nullptr) == XRT_SUCCESS);
+		CHECK(c.cap_id == i + 1);
+		CHECK(c.task == tasks[i]);
+		CHECK(conv_cap_validate(&c) == CONV_CAP_OK); // the selftest's exit-13 rules
+		CHECK(c.licence_class == XRT_CONV_LICENCE_UNKNOWN);
+		CHECK(c.commercial_ok == 0u);
+		CHECK((c.lanes & XRT_CONV_LANE_JOB) == 0u); // no SPLATS, no job lane
+		if (c.task == XRT_CONV_TASK_VIEWS_MONO) {
+			CHECK((c.flags & XRT_CONV_CAP_EXPLICIT_VIEWPOINTS) != 0u);
+			CHECK(c.min_views == 2u);
+			CHECK(c.max_views == 8u);                      // static; refined from lift_get_caps
+			CHECK((c.outputs & XRT_CONV_OUT_DEPTH) != 0u); // provisional aux depth
+		}
+		if (c.task == XRT_CONV_TASK_DEPTH_VIDEO) {
+			CHECK((c.flags & XRT_CONV_CAP_TEMPORAL) != 0u);
+		}
+		xrt_conv_state st{};
+		st.struct_size = (uint32_t)sizeof(st);
+		REQUIRE(iface->get_state(inst, c.cap_id, &st) == XRT_SUCCESS);
+		CHECK(st.state == XRT_CONV_STATE_INSTALLED);
+	}
+	CHECK(f.activations == 0); // describing never instantiates the module
+
+	// No lift factory: ABSENT, and retryable (a plug-in swap may bring one).
+	{
+		std::lock_guard<std::mutex> lk(f.m);
+		f.factory = false;
+	}
+	xrt_conv_state st{};
+	st.struct_size = (uint32_t)sizeof(st);
+	REQUIRE(iface->get_state(inst, CONV_DP_LIFT_CAP_VIEWS_MONO, &st) == XRT_SUCCESS);
+	CHECK(st.state == XRT_CONV_STATE_ABSENT);
+	CHECK(st.retryable != 0u);
+	iface->destroy(inst);
+}
+
+TEST_CASE("dp-lift: state is a plain copy of module_status; refined describe", "[conv_dp_lift]")
+{
+	FakeLift f;
+	conv_dp_lift_backend b = backend_of(f);
+	const xrt_conversion_plugin_iface *iface = nullptr;
+	xrt_conversion_plugin_instance *inst = nullptr;
+	REQUIRE(conv_provider_legacy_dp_create(&b, &iface, &inst));
+	const uint64_t gen0 = iface->get_generation(inst);
+	REQUIRE(fl_activate(&f, false) == XRT_SUCCESS);
+	CHECK(iface->get_generation(inst) != gen0); // the refined describe is a new generation
+
+	for (uint32_t ms = XRT_DP_LIFT_MODULE_READY; ms <= XRT_DP_LIFT_MODULE_DISABLED; ms++) {
+		{
+			std::lock_guard<std::mutex> lk(f.m);
+			f.caps.module_status = ms;
+		}
+		xrt_conv_state st{};
+		st.struct_size = (uint32_t)sizeof(st);
+		REQUIRE(iface->get_state(inst, CONV_DP_LIFT_CAP_DEPTH_VIDEO, &st) == XRT_SUCCESS);
+		CHECK(st.state == ms);
+	}
+	// READY, but the module has no DEPTH mode: that capability is ABSENT.
+	{
+		std::lock_guard<std::mutex> lk(f.m);
+		f.caps.module_status = XRT_DP_LIFT_MODULE_READY;
+		f.caps.modes = XRT_DP_LIFT_MODE_SBS;
+	}
+	xrt_conv_state st{};
+	st.struct_size = (uint32_t)sizeof(st);
+	REQUIRE(iface->get_state(inst, CONV_DP_LIFT_CAP_DEPTH_MONO, &st) == XRT_SUCCESS);
+	CHECK(st.state == XRT_CONV_STATE_ABSENT);
+	REQUIRE(iface->get_state(inst, CONV_DP_LIFT_CAP_VIEWS_MONO, &st) == XRT_SUCCESS);
+	CHECK(st.state == XRT_CONV_STATE_READY);
+	// SBS only: two views, no NVIEW.
+	xrt_conv_capability c{};
+	c.struct_size = (uint32_t)sizeof(c);
+	REQUIRE(iface->describe_cap(inst, 2, &c, nullptr) == XRT_SUCCESS);
+	CHECK(c.max_views == 2u);
+	CHECK(conv_cap_validate(&c) == CONV_CAP_OK);
+	iface->destroy(inst);
+}
+
+TEST_CASE("legacy golden replay: properties before the first describe => ACTIVATING", "[conv_dp_lift]")
+{
+	FakeLift f;
+	Fixture fx(CONV_PREWARM_FIRST_CREATE);
+	// The service knows dp-lift before it could describe it (no backend yet).
+	REQUIRE(fx.add_dp_lift(nullptr) >= 0);
+	CHECK_FALSE(conv_core_discovery_settled(fx.core));
+	xrt_dp_lift_caps p = fx.properties();
+	CHECK(p.state == XRT_DP_LIFT_STATE_ACTIVATING); // never UNAVAILABLE on a cold boot
+	CHECK(p.modes == 0u);
+	// Live: described (INSTALLED), modes advertised while still ACTIVATING.
+	REQUIRE(fx.add_dp_lift(&f) >= 0);
+	p = fx.properties();
+	CHECK(p.state == XRT_DP_LIFT_STATE_ACTIVATING);
+	CHECK((p.modes & (XRT_DP_LIFT_MODE_DEPTH | XRT_DP_LIFT_MODE_SBS | XRT_DP_LIFT_MODE_NVIEW)) ==
+	      (XRT_DP_LIFT_MODE_DEPTH | XRT_DP_LIFT_MODE_SBS | XRT_DP_LIFT_MODE_NVIEW));
+	CHECK(f.activations == 0);
+}
+
+TEST_CASE("legacy golden replay: cold boot ACTIVATING -> READY without a restart (G5, G3)", "[conv_dp_lift]")
+{
+	FakeLift f;
+	f.polls_until_ready = 2; // the module warms up for ~2 s of polling
+	Fixture fx(CONV_PREWARM_FIRST_CREATE);
+	REQUIRE(fx.add_dp_lift(&f) >= 0);
+	CHECK(fx.properties().state == XRT_DP_LIFT_STATE_ACTIVATING);
+
+	// G3: a create while ACTIVATING is accepted (against the declared rows).
+	uint64_t id = 0;
+	REQUIRE(fx.create(5, XRT_DP_LIFT_MODE_SBS, &id) == XRT_SUCCESS);
+	REQUIRE(fx.submit(5, id) == XRT_SUCCESS);
+	ipc_lift_result r{};
+	CHECK_FALSE(fx.acquire(5, id, &r)); // frames wait while the module warms
+
+	REQUIRE(wait_until([&] { return fx.properties().state == XRT_DP_LIFT_STATE_READY; }, 8000));
+	REQUIRE(wait_until(
+	    [&] {
+		    fx.submit(5, id);
+		    return fx.acquire(5, id, &r);
+	    },
+	    4000));
+	CHECK(r.view_count == 2u);
+	CHECK(r.width == 64u); // 2 views x 32 (the adapter's predicted output desc)
+	std::lock_guard<std::mutex> lk(f.m);
+	CHECK(f.activations == 1);
+	CHECK(f.polls >= 2);
+	CHECK(f.last_info.mode == XRT_DP_LIFT_MODE_SBS);
+	CHECK(f.last_params.view_count == 2u);
+	CHECK(f.last_params.viewpoint_frame == XRT_DP_LIFT_VIEWPOINT_FRAME_RECT);
+	CHECK(f.last_params.inpaint == 1u);
+}
+
+TEST_CASE("legacy golden replay: no module at first, READY after a registry change, no restart (G5)", "[conv_dp_lift]")
+{
+	FakeLift f;
+	f.module_present = false; // the plug-in's factory works, but ships no module yet
+	Fixture fx(CONV_PREWARM_FIRST_CREATE);
+	REQUIRE(fx.add_dp_lift(&f) >= 0);
+	uint64_t id = 0;
+	REQUIRE(fx.create(6, XRT_DP_LIFT_MODE_SBS, &id) == XRT_SUCCESS);
+	// The warm finds no module: FAILED (terminal for selection) but retryable.
+	REQUIRE(
+	    wait_until([&] { return row_state(fx.core, CONV_DP_LIFT_CAP_VIEWS_MONO) == XRT_CONV_STATE_FAILED; }, 4000));
+	CHECK(fx.properties().state == XRT_DP_LIFT_STATE_UNAVAILABLE); // honest, while nothing can serve it
+	{
+		std::lock_guard<std::mutex> lk(f.m);
+		CHECK(f.activations == 1);
+		f.module_present = true; // the module gets installed
+	}
+	// (An install takes far longer than the adapter's one-attempt-per-wave window.)
+	std::this_thread::sleep_for(std::chrono::milliseconds(600));
+	// A registry change (a plug-in / module install) retries; the next attempt
+	// re-resolves the factory and finds the module — no service restart.
+	conv_core_provider_changed(fx.core, CONV_DP_LIFT_ID);
+	uint64_t id2 = 0;
+	REQUIRE(wait_until([&] { return fx.create(6, XRT_DP_LIFT_MODE_SBS, &id2) == XRT_SUCCESS; }, 2000));
+	REQUIRE(wait_until([&] { return fx.properties().state == XRT_DP_LIFT_STATE_READY; }, 6000));
+	std::lock_guard<std::mutex> lk(f.m);
+	CHECK(f.activations >= 2);
+}
+
+TEST_CASE("legacy golden replay: splats not ready + SBS READY -> READY", "[conv_dp_lift]")
+{
+	FakeLift f;
+	conv_fake_provider sp;
+	conv_fake_init(&sp, "fake-splats");
+	conv_fake_cap *c =
+	    conv_fake_add_cap(&sp, 7, XRT_CONV_TASK_SPLATS_MONO, XRT_CONV_LANE_JOB, XRT_CONV_OUT_SPLAT_BLOB, 0);
+	c->warm_ms = 60000; // still warming / downloading for the whole test
+	{
+		Fixture fx(CONV_PREWARM_FIRST_CREATE, /*splats_io*/ true);
+		REQUIRE(fx.add_dp_lift(&f) >= 0);
+		conv_provider_desc d{};
+		d.id = sp.id;
+		d.probe_order = 200;
+		d.enabled = true;
+		d.iface = &sp.iface;
+		d.inst = conv_fake_inst(&sp);
+		REQUIRE(conv_core_add_provider(fx.core, &d) >= 0);
+		conv_fake_set_state(&sp, 7, XRT_CONV_STATE_DOWNLOADING, 0, false);
+		(void)conv_core_warm_task(fx.core, XRT_CONV_TASK_SPLATS_MONO);
+
+		uint64_t id = 0;
+		REQUIRE(fx.create(8, XRT_DP_LIFT_MODE_SBS, &id) == XRT_SUCCESS); // warms dp-lift
+		REQUIRE(wait_until(
+		    [&] { return conv_core_task_state(fx.core, XRT_CONV_TASK_VIEWS_MONO) == XRT_CONV_STATE_READY; },
+		    4000));
+		CHECK(conv_core_task_state(fx.core, XRT_CONV_TASK_SPLATS_MONO) != XRT_CONV_STATE_READY);
+		// "Any", not "all": the splat model not being ready holds nothing back.
+		CHECK(conv_core_v3_state(fx.core, 0, true) == CONV_V3_STATE_READY);
+		const xrt_dp_lift_caps p = fx.properties();
+		CHECK(p.state == XRT_DP_LIFT_STATE_READY);
+		CHECK((p.modes & XRT_DP_LIFT_MODE_GAUSSIANS) != 0u); // the facade advertises it while it waits
+		CHECK((p.modes & XRT_DP_LIFT_MODE_SBS) != 0u);
+		CHECK(ipc_server_conv_routes_create(fx.sc, XRT_DP_LIFT_MODE_GAUSSIANS, 1));
+	}
+	conv_fake_fini(&sp);
+}
+
+TEST_CASE("dp-lift: the legacy units reach the module unchanged; N views get the pair", "[conv_dp_lift]")
+{
+	FakeLift f;
+	f.max_views = 8;
+	Fixture fx(CONV_PREWARM_FIRST_CREATE);
+	REQUIRE(fx.add_dp_lift(&f) >= 0);
+
+	// SBS, the app's plane and strength: the RELATIVE plane, not decoded units.
+	uint64_t id = 0;
+	REQUIRE(fx.create(9, XRT_DP_LIFT_MODE_SBS, &id) == XRT_SUCCESS);
+	ipc_lift_result r{};
+	REQUIRE(wait_until(
+	    [&] {
+		    fx.submit(9, id, 0.3f, 1.7f);
+		    return fx.acquire(9, id, &r);
+	    },
+	    4000));
+	{
+		std::lock_guard<std::mutex> lk(f.m);
+		CHECK(f.last_params.convergence == Catch::Approx(0.3f));
+		CHECK(f.last_params.strength == Catch::Approx(1.7f));
+		CHECK(f.last_vpf == 6u); // the (nominal) pair
+	}
+	// AUTO stays AUTO (the module's own estimate) without an observer.
+	REQUIRE(wait_until(
+	    [&] {
+		    fx.submit(9, id, -1.0f, 1.0f);
+		    std::lock_guard<std::mutex> lk(f.m);
+		    return f.last_params.convergence < 0.0f;
+	    },
+	    4000));
+
+	// NVIEW x4: the policy spreads four viewpoints; the module gets the pair.
+	uint64_t nid = 0;
+	REQUIRE(fx.create(9, XRT_DP_LIFT_MODE_NVIEW, &nid) == XRT_SUCCESS);
+	REQUIRE(wait_until(
+	    [&] {
+		    fx.submit(9, nid, -1.0f, 1.0f, 4);
+		    return fx.acquire(9, nid, &r);
+	    },
+	    4000));
+	CHECK(r.view_count == 4u);
+	std::lock_guard<std::mutex> lk(f.m);
+	CHECK(f.last_params.view_count == 4u);
+	CHECK(f.last_vpf == 6u);
+	const float dx = f.last_vps[3] - f.last_vps[0];
+	CHECK(f.last_params.baseline_m == Catch::Approx(std::fabs(dx)).margin(1e-5)); // the pair's own distance
+	CHECK(f.last_params.baseline_m > 0.0f);
+}
