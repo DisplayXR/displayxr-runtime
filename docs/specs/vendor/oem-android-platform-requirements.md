@@ -2,7 +2,7 @@
 status: Active
 owner: David Fattal
 updated: 2026-10-11
-issues: [1038, 1031, 1073, 1087, 1090, 1277, 1905, 1917, 1935]
+issues: [1038, 1031, 1073, 1087, 1090, 1277, 1680, 1905, 1917, 1935]
 adr: ADR-036
 code-paths:
   - src/xrt/auxiliary/android/android_custom_surface.cpp
@@ -80,6 +80,7 @@ Tiering:
 | **R8** | Process / service policy: non-isolated slots, FGS type, freezer, app-op persistence, **memory-pressure kill ranking**, **wake + bind must be permitted (R8.6)** | REQUIRED | **PLATFORM** | **PARTLY OPEN — MEASURED**: R8.5 (kill ranking) fails on one Android build; R8.1–R8.4 work today, don't regress |
 | **R9** | The **touch controller reports every held contact in every frame** at its default report rate (no alternate-frame drop of the first finger under a two-finger hold) | REQUIRED | **PLATFORM** (touch firmware / default config) | **OPEN — MEASURED** on the reference device 2026-09-09; 120 Hz report rate is clean, 240 Hz default is not |
 | **R10** | The **mini-window survives an activity launch from inside it** (system file picker, share sheet, permission dialog) | REQUIRED | **PLATFORM** | **OPEN — MEASURED** on the reference device 2026-09-10; no app-side arrangement avoids it |
+| **R11** | The **lens/backlight HAL reports the truth** — the set call carries the panel controller's ack, the get call reads real lens state, and a wedged controller link self-heals | REQUIRED | VENDOR (+ firmware pickup) | **OPEN — root-caused in the shipped HAL** 2026-09-22; no workaround above the HAL, a reboot is the only remedy |
 | **S1** | **SurfaceFlinger exclude-uid capture filter** (or a platform-signed capture host) | STRONGLY REC. | **PLATFORM** | **OPEN — headline ask** |
 | **S2** | **Per-PIXEL** click-through at full opacity (per-region touchability); *plus*, for apps that must keep a foreground Activity, an untrusted-touch exemption + scoping the per-Activity input sink | NICE TO HAVE | **PLATFORM** | **NARROWED** — per-FRAME click-through at full opacity is SOLVED on stock via a tight touchable overlay (#1110); only per-pixel precision and the foreground-Activity case remain |
 | **S3** | ~~Wait-semaphore hook into the vendor interlacer~~ | — | VENDOR | **NOT AN ASK — withdrawn.** The hook already existed; we were passing NULL. Documentation-only PR open |
@@ -794,6 +795,14 @@ a death to platform policy.
      battery exemptions for our packages were pruned **four separate times** in
      one session. A one-shot `adb` whitelist is not durable; only the OEM's own
      Settings entry is, and that is not scriptable.
+   - **Blocked again by every reinstall** (same phone, 2026-10-11). After a
+     runtime APK reinstall, the same `AutoLaunchManagerService` blocks the
+     runtime's broker provider until the runtime has been launched once by hand —
+     so an update, and by extension an OTA that updates the runtime, silently
+     breaks every 3D app until the user performs a step nobody tells them about.
+     **Ask:** an exemption path — an allow-list entry or a permission — for
+     display-service-class apps, so that a reinstall or OTA does not reset them
+     into the blocked state.
 
    Two measurements bound what the platform *does* still permit, and both point
    at the same component. **The activity path is allowed where the service path
@@ -1003,6 +1012,66 @@ adb logcat -d | grep -c 'setWindowingMode(freeform to full)'
 
 Expect `mode=freeform` and a count of `0` after the picker is dismissed. On the
 reference device today the mode is `fullscreen` and the count is `1`.
+
+---
+
+### R11 — The lens/backlight HAL must report the truth
+
+**Owner:** vendor (the display vendor's lens/backlight HAL) + OEM firmware pickup
+· **Status:** **OPEN — root-caused in the shipped HAL on the reference tablet
+2026-09-22** · **Traces to:** a "client bound, panel stays 2D" symptom on the
+reference tablet that looked like an R5 writer-arbitration bug and is not one
+(R5's own residual — a bound client cannot *say* 2D — is a separate gap); the
+stuck-3D history in runtime#563; runtime#1680
+
+**Mechanism.** The panel's lens is switched by a small controller on the panel
+side that the vendor HAL drives over a serial link (UART). The HAL must (a)
+return the controller's **acknowledgement** of a set-lens-state command to its
+caller, (b) answer a get-lens-state query by **asking the controller**, and (c)
+**recover** a link that stops answering — retry, re-open the port, re-toggle the
+controller's enable line — instead of giving up.
+
+On the reference tablet the controller can stop answering the HAL. When it does,
+every layer above reports "3D on" while the glass is physically 2D: the HAL, the
+vendor display services, DisplayXR, and the OEM's own 3D viewer. Content weaves,
+tracking runs and reports a face, no other client holds the panel in 2D, and a
+runtime bisect across five releases changes nothing. The only signal any layer
+emits is the HAL service's own log — a `select() timeout` (three 1 s waits)
+followed by `read() failed`, where a healthy round trip completes in ~10–35 ms.
+
+Inspection of the shipped HAL shows why nothing above it can tell: the get call
+hands its callback a **constant** without touching the link, and the set call
+returns the same success whether or not the controller acknowledged — the
+failure path only selects a log line. A service-side read-back would therefore
+always read "on"; the fix can only be in the HAL. Acceptable implementation:
+the set path carries the ack outcome (a HIDL 1.0 `void` return needs a 1.1
+revision or a status callback), the get path queries the controller, and a
+timeout triggers recovery rather than three waits and a silent give-up. The HAL
+is the display vendor's, so the vendor fixes it and the OEM ships it in an OTA.
+
+**Consequence if absent.** A unit whose lens controller wedges is flat 2D with
+every diagnostic reading 3D. Users see "3D stopped working"; integrators chase
+the runtime, the app and the tracker, none of which is at fault. Nothing can
+detect it, so nothing can fall back.
+
+**DisplayXR fallback.** **None** — there is no truthful state to read. The only
+remedy on a wedged unit is a reboot, which power-cycles the HAL and the
+controller. Until the HAL moves, detection is a logcat check for the HAL
+timeout, which our device test bundle now fails on.
+
+**Acceptance test.** Toggle 3D on and off 50 times with a DisplayXR app; then
+force the failure by holding the controller's link unanswered (disconnect, or
+hold its enable line low) and toggle again:
+
+```
+adb logcat -d | grep -E 'select\(\) timeout|read\(\) failed'
+```
+
+PASS requires all of: (1) on a healthy link, every set returns a positive ack
+and every get matches the commanded state; (2) with the link held dead, the set
+call **reports failure** to its caller and the get call does **not** return "on";
+(3) when the link is released, the HAL recovers on its own — no reboot — and the
+next set succeeds.
 
 ---
 
@@ -2117,6 +2186,7 @@ planning a firmware spin should treat those as *available to cherry-pick*, not
 | R3 | PR #698 (+ #713 for N1 observability) | **open** | Aggregate held; recomputed on disconnect |
 | R4 | PR #716 (issue #715) | **MERGED 2026-08-27** | A/B/A validated on device; present from the SDK release that carries it |
 | R5 | PR #714 (issues #702, #703) | **open** | Deprecate legacy tiers; document bind-as-preference |
+| R11 | Issue #740 | open | The HAL fix: return the controller ack from the set call, read real state in the get call, recover a dead link. Explains the "client bound, panel 2D" symptom that was first read as an R5 bug |
 | S3 | PR #720 | **open**, docs only | **No code change.** Specifies the Vulkan post-process semaphore contract that already existed — the correction that withdrew this ask |
 | S5 / S1 producer | PRs #717, #718, #719 | **open** | Capture service, multi-uid composite, protocol v2 (panel extent) |
 | S7 | Issue #704 | open | Per-display config |
