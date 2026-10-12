@@ -1175,6 +1175,12 @@ if(TARGET tests_oxr_lift_startup)
 			$<TARGET_PROPERTY:ipc_client,INTERFACE_INCLUDE_DIRECTORIES>
 		)
 	target_link_libraries(tests_oxr_lift_startup PRIVATE xrt-interfaces xrt-external-openxr aux_os)
+	if(TARGET Vulkan::Vulkan)
+		# oxr_objects.h pulls in xrt_vulkan_includes.h; st_oxr gets those headers
+		# through aux_vk, which this test deliberately does not link (macOS CI has
+		# no system vulkan/vulkan.h, Linux does).
+		target_link_libraries(tests_oxr_lift_startup PRIVATE Vulkan::Vulkan)
+	endif()
 	if(XRT_FEATURE_RENDERDOC)
 		target_link_libraries(tests_oxr_lift_startup PRIVATE xrt-external-renderdoc)
 	endif()
