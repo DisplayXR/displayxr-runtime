@@ -3209,6 +3209,20 @@ struct oxr_session
 		//! sprite had no released image: the next locate reports willDraw =
 		//! false, and xrEndFrame clears this once a frame is drawable again.
 		bool draw_failed;
+		/*!
+		 * #1952: what the compositor did with the last request handed to
+		 * it - drew, or refused for a reason only it can see (no display
+		 * info, a multi-screen routed frame, a sprite it cannot sample, a
+		 * failed default-look upload, ...). Written by the compositor during
+		 * xrt_comp_layer_commit through the request's report pointer, folded
+		 * into @ref refusal_latch right after it.
+		 */
+		struct u_cursor_draw_report report;
+		//! A request carrying @ref report was handed for this commit.
+		bool report_pending;
+		//! A compositor refusal latches willDraw = false until a commit
+		//! draws (or, report-only, would draw) again.
+		struct u_cursor_draw_latch refusal_latch;
 		bool announced;       //!< one-shot WARN on first activation
 		bool warned_undrawable; //!< one-shot WARN: placement maps to no cursor pixels
 		bool warned_backend;  //!< one-shot WARN: compositor cannot draw

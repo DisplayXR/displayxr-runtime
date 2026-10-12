@@ -11,6 +11,7 @@
 
 #include "util/u_cursor_depth.h"
 #include "util/u_logging.h"
+#include "os/os_time.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -26,6 +27,45 @@ force_arrow(void)
 		cached = (e != NULL && strcmp(e, "arrow") == 0) ? 1 : 0;
 	}
 	return cached == 1;
+}
+
+bool
+comp_cursor_draw_debug_refuse(const struct u_cursor_draw_request *req)
+{
+	// -1 = not read yet, 0 = off, 1 = always, else the period in ms.
+	static long mode = -1;
+	if (mode < 0) {
+		long m = 0;
+		const char *e = getenv("DXR_CURSOR_DRAW_REFUSE");
+		if (e != NULL && strcmp(e, "1") == 0) {
+			m = 1;
+		}
+		const char *p = getenv("DXR_CURSOR_DRAW_REFUSE_PERIOD_MS");
+		if (p != NULL) {
+			const long ms = strtol(p, NULL, 10);
+			if (ms > 1) {
+				m = ms;
+			}
+		}
+		if (m != 0) {
+			U_LOG_W(
+			    "cursor_draw: DXR_CURSOR_DRAW_REFUSE%s - compositors refuse the runtime-drawn cursor "
+			    "%s (verification hook, #1952)",
+			    m > 1 ? "_PERIOD_MS" : "", m > 1 ? "half of every period" : "always");
+		}
+		mode = m;
+	}
+	if (mode == 0) {
+		return false;
+	}
+	if (mode > 1) {
+		const uint64_t period_ns = (uint64_t)mode * 1000000ull;
+		if ((os_monotonic_get_ns() % period_ns) >= period_ns / 2) {
+			return false;
+		}
+	}
+	u_cursor_draw_report_refused(req, U_CURSOR_DRAW_REFUSAL_FORCED);
+	return true;
 }
 
 //! The classic arrow (Amendment 2 A.6): 12 x 19, tip = hotspot.

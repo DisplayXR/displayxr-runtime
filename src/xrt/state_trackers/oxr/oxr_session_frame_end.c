@@ -2128,10 +2128,38 @@ cursor_draw_submit(struct oxr_session *sess, const XrFrameEndInfo *frameEndInfo,
 		return;
 	}
 	sess->cursor_draw.draw_failed = false;
-	if (!sess->cursor_draw.will_draw) {
-		return; // the locate reported false (an earlier failure); now cleared
+	// #1952: the compositor answers through req.report during the commit
+	// (folded in by cursor_draw_fold_report). A locate that reported false
+	// - after an earlier refusal - gets a REPORT-ONLY request: every check
+	// runs, nothing is drawn (the app is showing its OS cursor), and a
+	// frame that would draw clears the latch without willDraw oscillating.
+	req.report_only = !sess->cursor_draw.will_draw;
+	u_cursor_draw_report_begin(&sess->cursor_draw.report);
+	req.report = &sess->cursor_draw.report;
+	sess->cursor_draw.report_pending = oxr_session_cursor_draw_hand_request(sess, &req);
+}
+
+/*!
+ * #1952: after the commit, fold the compositor's answer into the willDraw
+ * latch - a refusal makes the next locate report willDraw = false, a commit
+ * that drew (or would have) restores it. One WARN per distinct reason.
+ *
+ * Only ever called with a request handed this frame (the caller's single
+ * bool test), so a session that never asked pays nothing.
+ */
+static void
+cursor_draw_fold_report(struct oxr_session *sess)
+{
+	sess->cursor_draw.report_pending = false;
+	if (u_cursor_draw_latch_record(&sess->cursor_draw.refusal_latch, &sess->cursor_draw.report)) {
+		const enum u_cursor_draw_refusal reason = sess->cursor_draw.report.answered
+		                                              ? sess->cursor_draw.report.reason
+		                                              : U_CURSOR_DRAW_REFUSAL_NOT_REACHED;
+		U_LOG_W(
+		    "XR_DXR_cursor_depth: the compositor did not draw the cursor (%s) - the next locate reports "
+		    "willDraw = false until a frame draws again (one-time warning for this reason)",
+		    u_cursor_draw_refusal_name(reason));
 	}
-	(void)oxr_session_cursor_draw_hand_request(sess, &req);
 }
 #endif
 
@@ -3445,6 +3473,15 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 #endif
 
 	xret = xrt_comp_layer_commit(xc, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
+
+#ifdef OXR_HAVE_DXR_cursor_depth
+	// #1952: one bool test - true only on a frame that handed the
+	// compositor a cursor request. Folded before the error check, so a
+	// failed commit counts as the refusal it is.
+	if (sess->cursor_draw.report_pending) {
+		cursor_draw_fold_report(sess);
+	}
+#endif
 	OXR_CHECK_XRET(log, sess, xret, xrt_comp_layer_commit);
 
 #ifdef OXR_HAVE_DXR_cursor_depth

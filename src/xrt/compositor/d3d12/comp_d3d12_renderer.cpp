@@ -16,6 +16,7 @@
 // XR_DXR_cursor_depth v5: the runtime-drawn cursor quad (shared with D3D11).
 #include "d3d_shared/comp_cursor_shaders.h"
 #include "util/comp_cursor_look.h"
+#include "util/u_cursor_depth.h"
 
 #include "util/comp_layer_accum.h"
 // #1580: the ONE per-view camera every layer type is projected through, plus
@@ -3801,7 +3802,9 @@ cursor_draw(struct comp_d3d12_renderer *r,
             uint32_t vp_h)
 {
 	const struct comp_d3d12_cursor_quads *q = &r->cursor.frame;
+	// #1952: every way out that draws nothing reports why.
 	if (!cursor_ensure_pipeline(r)) {
+		u_cursor_draw_report_refused(q->req, U_CURSOR_DRAW_REFUSAL_NO_PIPELINE);
 		return false;
 	}
 
@@ -3812,6 +3815,7 @@ cursor_draw(struct comp_d3d12_renderer *r,
 	if (q->xsc != nullptr) {
 		src = static_cast<ID3D12Resource *>(comp_d3d12_swapchain_get_resource(q->xsc, q->image_index));
 		if (src == nullptr) {
+			u_cursor_draw_report_refused(q->req, U_CURSOR_DRAW_REFUSAL_SPRITE_UNUSABLE);
 			return false;
 		}
 		// A layered sprite: the spec samples array layer 0.
@@ -3822,16 +3826,31 @@ cursor_draw(struct comp_d3d12_renderer *r,
 		app_image = true;
 	} else {
 		if (!cursor_upload_look(r, cmd_list, q->look)) {
+			u_cursor_draw_report_refused(q->req, U_CURSOR_DRAW_REFUSAL_DEFAULT_LOOK);
 			return false;
 		}
 		src = r->cursor.look_tex;
 		src_format = r->compose_active ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
 	}
 
+	const uint32_t n = q->count < layout->views ? q->count : layout->views;
+	if (q->report_only) {
+		// #1952: the app shows its OS cursor this frame - report whether a
+		// tile would take the sprite, and record nothing.
+		const bool any = n > 0 && vp_w > 0 && vp_h > 0 && q->clip[2] > 0.0f && q->clip[3] > 0.0f;
+		if (any) {
+			u_cursor_draw_report_drew(q->req);
+		} else {
+			u_cursor_draw_report_refused(q->req, U_CURSOR_DRAW_REFUSAL_NO_TILES);
+		}
+		return false;
+	}
+
 	const uint32_t srv_slot = r->next_srv_slot;
 	if (srv_slot >= r->srv_heap_size) {
 		U_LOG_E("D3D12 renderer: SRV heap overflow in the cursor pass (slot %u >= %u)", srv_slot,
 		        r->srv_heap_size);
+		u_cursor_draw_report_refused(q->req, U_CURSOR_DRAW_REFUSAL_NO_PIPELINE);
 		return false;
 	}
 	r->next_srv_slot++;
@@ -3891,7 +3910,7 @@ cursor_draw(struct comp_d3d12_renderer *r,
 	cmd_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 
 	static const float uv[4][2] = {{0.0f, 0.0f}, {0.0f, 1.0f}, {1.0f, 0.0f}, {1.0f, 1.0f}};
-	const uint32_t n = q->count < layout->views ? q->count : layout->views;
+	uint32_t drawn = 0;
 	for (uint32_t i = 0; i < n && i < XRT_MAX_VIEWS; i++) {
 		// The same tile box the window-space layers use (#542 grid).
 		const uint32_t tile_x = (i % layout->cols) * layout->tile_w;
@@ -3931,6 +3950,12 @@ cursor_draw(struct comp_d3d12_renderer *r,
 		}
 		cmd_list->SetGraphicsRoot32BitConstants(1, 16, &cc, 0);
 		cmd_list->DrawInstanced(4, 1, 0, 0);
+		drawn++;
+	}
+	if (drawn > 0) {
+		u_cursor_draw_report_drew(q->req);
+	} else {
+		u_cursor_draw_report_refused(q->req, U_CURSOR_DRAW_REFUSAL_NO_TILES);
 	}
 
 	if (app_image) {

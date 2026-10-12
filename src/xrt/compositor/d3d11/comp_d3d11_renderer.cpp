@@ -16,6 +16,7 @@
 // XR_DXR_cursor_depth v5: the runtime-drawn cursor quad (shared with D3D12).
 #include "d3d_shared/comp_cursor_shaders.h"
 #include "util/comp_cursor_look.h"
+#include "util/u_cursor_depth.h"
 
 #include "util/comp_layer_accum.h"
 // #1580: the ONE per-view camera every layer type is projected through.
@@ -2425,7 +2426,9 @@ cursor_draw(struct comp_d3d11_renderer *r,
             uint32_t target_height)
 {
 	const struct comp_d3d11_cursor_quads *q = &r->cursor.frame;
+	// #1952: every way out that draws nothing reports why.
 	if (!cursor_ensure_pipeline(r)) {
+		u_cursor_draw_report_refused(q->req, U_CURSOR_DRAW_REFUSAL_NO_PIPELINE);
 		return;
 	}
 
@@ -2442,11 +2445,32 @@ cursor_draw(struct comp_d3d11_renderer *r,
 		srv = layer_source_srv(r, q->xsc, q->image_index);
 	} else {
 		if (!cursor_upload_look(r, q->look)) {
+			u_cursor_draw_report_refused(q->req, U_CURSOR_DRAW_REFUSAL_DEFAULT_LOOK);
 			return;
 		}
 		srv = r->compose_active ? r->cursor.look_srv_srgb : r->cursor.look_srv_raw;
 	}
 	if (srv == nullptr) {
+		u_cursor_draw_report_refused(q->req, q->xsc != nullptr ? U_CURSOR_DRAW_REFUSAL_SPRITE_UNUSABLE
+		                                                       : U_CURSOR_DRAW_REFUSAL_DEFAULT_LOOK);
+		return;
+	}
+
+	const uint32_t n = q->count < layout->views ? q->count : layout->views;
+	if (q->report_only) {
+		// #1952: the app shows its OS cursor this frame - report whether a
+		// tile would take the sprite, and draw nothing.
+		bool any = false;
+		for (uint32_t i = 0; i < n && i < XRT_MAX_VIEWS && !any; i++) {
+			float tx = 0.0f, ty = 0.0f, tw = 0.0f, th = 0.0f;
+			get_view_tile_box(r, i, layout, target_width, target_height, &tx, &ty, &tw, &th);
+			any = tw > 0.0f && th > 0.0f && q->clip[2] > 0.0f && q->clip[3] > 0.0f;
+		}
+		if (any) {
+			u_cursor_draw_report_drew(q->req);
+		} else {
+			u_cursor_draw_report_refused(q->req, U_CURSOR_DRAW_REFUSAL_NO_TILES);
+		}
 		return;
 	}
 
@@ -2477,7 +2501,7 @@ cursor_draw(struct comp_d3d11_renderer *r,
 	ctx->PSSetSamplers(0, 1, &r->cursor.sampler);
 
 	static const float uv[4][2] = {{0.0f, 0.0f}, {0.0f, 1.0f}, {1.0f, 0.0f}, {1.0f, 1.0f}};
-	const uint32_t n = q->count < layout->views ? q->count : layout->views;
+	uint32_t drawn = 0;
 	for (uint32_t i = 0; i < n && i < XRT_MAX_VIEWS; i++) {
 		float tx = 0.0f, ty = 0.0f, tw = 0.0f, th = 0.0f;
 		get_view_tile_box(r, i, layout, target_width, target_height, &tx, &ty, &tw, &th);
@@ -2517,6 +2541,12 @@ cursor_draw(struct comp_d3d11_renderer *r,
 		}
 		ctx->UpdateSubresource(r->cursor.cb, 0, nullptr, &cc, 0, 0);
 		ctx->Draw(4, 0);
+		drawn++;
+	}
+	if (drawn > 0) {
+		u_cursor_draw_report_drew(q->req);
+	} else {
+		u_cursor_draw_report_refused(q->req, U_CURSOR_DRAW_REFUSAL_NO_TILES);
 	}
 
 	// Hand the pipeline back the way the layer passes expect it.

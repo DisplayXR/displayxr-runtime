@@ -2566,8 +2566,10 @@ oxr_session_arm_cursor_draw(struct oxr_session *sess,
 	// or its placement mapped to no pixels in the submitted views: still arm
 	// (xrEndFrame re-checks, so a fixed app recovers), but report and draw
 	// nothing for this frame.
+	// #1952: ... or the compositor refused the last request it was handed.
 	const bool will_draw = !(sess->cursor_draw.cannot_draw && sess->cursor_draw.space == viewLocateInfo->space) &&
-	                       !sess->cursor_draw.draw_failed;
+	                       !sess->cursor_draw.draw_failed &&
+	                       u_cursor_draw_latch_allows(&sess->cursor_draw.refusal_latch);
 
 	struct oxr_swapchain *image = NULL;
 	if (draw_info->image != XR_NULL_HANDLE) {

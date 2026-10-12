@@ -35,6 +35,7 @@
 #include "util/comp_layer_accum.h"
 #include "util/comp_layer_view_camera.h"
 #include "util/u_color_encoding.h"
+#include "util/u_cursor_depth.h"
 
 #include "xrt/xrt_vulkan_includes.h"
 #include "vk/vk_helpers.h"
@@ -2151,6 +2152,7 @@ cursor_prepare(struct comp_vk_native_renderer *r,
 		// decodes into the linear blend.
 		const uint64_t v = compose_source_view(cur->xsc, cur->image_index);
 		if (img == VK_NULL_HANDLE || v == 0) {
+			u_cursor_draw_report_refused(cur->req, U_CURSOR_DRAW_REFUSAL_SPRITE_UNUSABLE);
 			return false;
 		}
 		*out_view = (VkImageView)(uintptr_t)v;
@@ -2161,6 +2163,7 @@ cursor_prepare(struct comp_vk_native_renderer *r,
 	}
 
 	if (r->cursor.default_image == VK_NULL_HANDLE) {
+		u_cursor_draw_report_refused(cur->req, U_CURSOR_DRAW_REFUSAL_DEFAULT_LOOK);
 		return false;
 	}
 	if (r->cursor.upload_pending) {
@@ -2183,6 +2186,7 @@ cursor_prepare(struct comp_vk_native_renderer *r,
 		r->cursor.default_ready = true;
 	}
 	if (!r->cursor.default_ready) {
+		u_cursor_draw_report_refused(cur->req, U_CURSOR_DRAW_REFUSAL_DEFAULT_LOOK);
 		return false;
 	}
 	*out_view = r->cursor.default_view;
@@ -2216,6 +2220,7 @@ cursor_record_draws(struct comp_vk_native_renderer *r,
 	};
 	VkDescriptorSet set = VK_NULL_HANDLE;
 	if (vk->vkAllocateDescriptorSets(vk->device, &ds_ai, &set) != VK_SUCCESS) {
+		u_cursor_draw_report_refused(cur->req, U_CURSOR_DRAW_REFUSAL_NO_PIPELINE);
 		return;
 	}
 	VkDescriptorImageInfo image_info = {
@@ -2242,6 +2247,7 @@ cursor_record_draws(struct comp_vk_native_renderer *r,
 	const bool mono = layout->views <= 1;
 	const uint32_t tiles = mono ? 1 : layout->cols * layout->rows;
 	const uint32_t n = cur->view_count < tiles ? cur->view_count : tiles;
+	uint32_t drawn = 0;
 	for (uint32_t i = 0; i < n; i++) {
 		float bx, by, bw, bh;
 		if (mono) {
@@ -2278,6 +2284,10 @@ cursor_record_draws(struct comp_vk_native_renderer *r,
 		if (sx1i <= sx0i || sy1i <= sy0i) {
 			continue;
 		}
+		drawn++;
+		if (cur->report_only) {
+			continue; // #1952: the app shows its OS cursor this frame
+		}
 		VkRect2D scissor = {
 		    .offset = {sx0i, sy0i},
 		    .extent = {(uint32_t)(sx1i - sx0i), (uint32_t)(sy1i - sy0i)},
@@ -2305,8 +2315,13 @@ cursor_record_draws(struct comp_vk_native_renderer *r,
 		                       &push);
 		vk->vkCmdDraw(cmd, 6, 1, 0, 0);
 	}
+	if (drawn > 0) {
+		u_cursor_draw_report_drew(cur->req);
+	} else {
+		u_cursor_draw_report_refused(cur->req, U_CURSOR_DRAW_REFUSAL_NO_TILES);
+	}
 
-	if (!r->cursor.announced) {
+	if (!r->cursor.announced && !cur->report_only && drawn > 0) {
 		r->cursor.announced = true;
 		U_LOG_W(
 		    "cursor_draw: Vulkan compositor drawing the cursor (%s, %u view(s); ADR-046 Amendment 2 B, "
@@ -3444,6 +3459,9 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 
 	if (want_pass && zone_pass_usable(r, layers, layout)) {
 		return draw_zones_pass(r, layers, target_width, target_height, layout, cursor.active ? &cursor : NULL);
+	}
+	if (cursor.active) {
+		u_cursor_draw_report_refused(cursor.req, U_CURSOR_DRAW_REFUSAL_NO_COMPOSE_PASS);
 	}
 	if (cursor.active && !r->cursor.warned_no_pass) {
 		r->cursor.warned_no_pass = true;

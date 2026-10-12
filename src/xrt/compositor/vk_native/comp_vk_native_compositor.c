@@ -9464,7 +9464,10 @@ vk_cursor_resolve(struct comp_vk_native_compositor *c,
 {
 	// A zones frame draws only a zone request (the state tracker sends
 	// nothing else there) and vice versa; belt and braces.
+	// #1952: every way out that draws nothing reports why (the state
+	// tracker then reports willDraw = false at the next locate).
 	if (c->zones_frame != req_in->zone_valid) {
+		u_cursor_draw_report_refused(req_in, U_CURSOR_DRAW_REFUSAL_ZONE_MISMATCH);
 		if (!c->cursor_draw.warned_zones) {
 			c->cursor_draw.warned_zones = true;
 			U_LOG_W(
@@ -9479,11 +9482,13 @@ vk_cursor_resolve(struct comp_vk_native_compositor *c,
 	const struct u_cursor_draw_request *req = &zreq;
 	float clip[4];
 	if (!u_cursor_draw_into_zone(&zreq, target_w, canvas_px_h, clip)) {
+		u_cursor_draw_report_refused(req_in, U_CURSOR_DRAW_REFUSAL_ZONE_UNPLACEABLE);
 		return false;
 	}
 	canvas_px_h = u_cursor_draw_canvas_px_h(req, canvas_px_h);
 	if (c->eff_layout.route_count > 0) {
 		// Multi-screen M3: a tile is a per-segment mosaic, not one view.
+		u_cursor_draw_report_refused(req_in, U_CURSOR_DRAW_REFUSAL_MULTI_SCREEN);
 		if (!c->cursor_draw.warned_routed) {
 			c->cursor_draw.warned_routed = true;
 			U_LOG_W("cursor_draw: multi-screen routed frame - cursor not drawn (one-time warning)");
@@ -9493,6 +9498,7 @@ vk_cursor_resolve(struct comp_vk_native_compositor *c,
 	// Panel pixel pitch (metres per backing pixel) and the OS point.
 	if (!c->sys_info_set || c->sys_info.display_pixel_height == 0 || !(c->sys_info.display_height_m > 0.0f) ||
 	    canvas_px_h == 0) {
+		u_cursor_draw_report_refused(req_in, U_CURSOR_DRAW_REFUSAL_NO_DISPLAY_INFO);
 		return false;
 	}
 	const float m_per_px = c->sys_info.display_height_m / (float)c->sys_info.display_pixel_height;
@@ -9506,6 +9512,7 @@ vk_cursor_resolve(struct comp_vk_native_compositor *c,
 		uint32_t w = 0, h = 0;
 		comp_vk_native_swapchain_get_dimensions(req->image, &w, &h);
 		if (w == 0 || h == 0) {
+			u_cursor_draw_report_refused(req_in, U_CURSOR_DRAW_REFUSAL_SPRITE_UNUSABLE);
 			return false;
 		}
 		aspect = (float)w / (float)h;
@@ -9518,11 +9525,13 @@ vk_cursor_resolve(struct comp_vk_native_compositor *c,
 	} else {
 		struct comp_cursor_look *look = &c->cursor_draw.look;
 		if (!comp_cursor_look_update(look, backing_scale)) {
+			u_cursor_draw_report_refused(req_in, U_CURSOR_DRAW_REFUSAL_DEFAULT_LOOK);
 			return false;
 		}
 		if (!c->cursor_draw.default_uploaded || c->cursor_draw.default_gen != look->generation) {
 			if (!comp_vk_native_renderer_set_cursor_default_image(c->renderer, look->rgba, look->w,
 			                                                      look->h)) {
+				u_cursor_draw_report_refused(req_in, U_CURSOR_DRAW_REFUSAL_DEFAULT_LOOK);
 				return false;
 			}
 			c->cursor_draw.default_gen = look->generation;
@@ -9541,6 +9550,10 @@ vk_cursor_resolve(struct comp_vk_native_compositor *c,
 	for (uint32_t i = 0; i < out->view_count; i++) {
 		u_cursor_draw_corners(&req->view[i], height, aspect, hot_u, hot_v, out->corners[i]);
 	}
+	// The renderer reports the rest (drew, or no pass / no sprite view /
+	// no tile) through the caller's request, which outlives the draw.
+	out->req = req_in;
+	out->report_only = req_in->report_only;
 	out->active = true;
 	return true;
 }
@@ -9846,11 +9859,16 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 	 * REQUESTED: one field test, false for every session that never chained
 	 * XrCursorDepthDrawInfoDXR. The request covers this commit only.
 	 */
+	// #1952: cursor_req lives for the whole commit - the renderer reports
+	// through it (cursor_draw.req) during the draw below.
 	struct comp_vk_native_cursor_draw cursor_draw = {0};
+	struct u_cursor_draw_request cursor_req;
 	if (c->cursor_draw.req.requested) {
-		struct u_cursor_draw_request cursor_req = c->cursor_draw.req;
+		cursor_req = c->cursor_draw.req;
 		c->cursor_draw.req.requested = false;
-		if (u_cursor_draw_should_draw(&cursor_req)) {
+		if (!u_cursor_draw_should_draw(&cursor_req)) {
+			u_cursor_draw_report_refused(&cursor_req, U_CURSOR_DRAW_REFUSAL_INVALID_REQUEST);
+		} else if (!comp_cursor_draw_debug_refuse(&cursor_req)) {
 			(void)vk_cursor_resolve(c, &cursor_req, tgt_width, tgt_height, &cursor_draw);
 		}
 	}

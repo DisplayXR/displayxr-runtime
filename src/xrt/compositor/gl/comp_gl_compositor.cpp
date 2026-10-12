@@ -6060,17 +6060,22 @@ gl_cursor_draw(struct comp_gl_compositor *c,
 {
 	// #1949: a zone request's views are zone-normalised - re-express them in
 	// the tile the way the zone's own layer is placed, and clip to the zone.
+	// #1952: every way out that draws nothing reports why (the state
+	// tracker then reports willDraw = false at the next locate).
 	struct u_cursor_draw_request zreq = *req_in;
 	const struct u_cursor_draw_request *req = &zreq;
 	float clip[4];
 	if (!u_cursor_draw_into_zone(&zreq, zones_target_w, zones_target_h, clip)) {
+		u_cursor_draw_report_refused(req_in, U_CURSOR_DRAW_REFUSAL_ZONE_UNPLACEABLE);
 		return false;
 	}
 	if (!gl_cursor_ensure_program(c)) {
+		u_cursor_draw_report_refused(req_in, U_CURSOR_DRAW_REFUSAL_NO_PIPELINE);
 		return false;
 	}
 	// Panel pixel pitch (metres per backing pixel) and the OS point.
 	if (!c->sys_info_set || c->sys_info.display_pixel_height == 0 || !(c->sys_info.display_height_m > 0.0f)) {
+		u_cursor_draw_report_refused(req_in, U_CURSOR_DRAW_REFUSAL_NO_DISPLAY_INFO);
 		return false;
 	}
 	const float m_per_px = c->sys_info.display_height_m / (float)c->sys_info.display_pixel_height;
@@ -6087,6 +6092,7 @@ gl_cursor_draw(struct comp_gl_compositor *c,
 	}
 	canvas_px_h = u_cursor_draw_canvas_px_h(req, canvas_px_h); // a zone's own height
 	if (canvas_px_h == 0) {
+		u_cursor_draw_report_refused(req_in, U_CURSOR_DRAW_REFUSAL_NO_DISPLAY_INFO);
 		return false;
 	}
 	const float canvas_h_m = (float)canvas_px_h * m_per_px;
@@ -6098,9 +6104,11 @@ gl_cursor_draw(struct comp_gl_compositor *c,
 	if (req->image != NULL) {
 		struct comp_gl_swapchain *gsc = gl_swapchain(req->image);
 		if (req->image_index >= gsc->image_count || gsc->info.height == 0) {
+			u_cursor_draw_report_refused(req_in, U_CURSOR_DRAW_REFUSAL_SPRITE_UNUSABLE);
 			return false;
 		}
 		if (gsc->target != GL_TEXTURE_2D) {
+			u_cursor_draw_report_refused(req_in, U_CURSOR_DRAW_REFUSAL_SPRITE_UNUSABLE);
 			if (!c->cursor_draw.warned_array) {
 				c->cursor_draw.warned_array = true;
 				U_LOG_W(
@@ -6120,6 +6128,7 @@ gl_cursor_draw(struct comp_gl_compositor *c,
 		flip_v = true;
 	} else {
 		if (!gl_cursor_update_default(c, backing_scale)) {
+			u_cursor_draw_report_refused(req_in, U_CURSOR_DRAW_REFUSAL_DEFAULT_LOOK);
 			return false;
 		}
 		tex = c->cursor_draw.default_tex;
@@ -6140,6 +6149,13 @@ gl_cursor_draw(struct comp_gl_compositor *c,
 	const uint32_t tiles = mono ? 1 : cols * rows;
 	const uint32_t n = req->view_count < tiles ? req->view_count : tiles;
 	if (n == 0 || c->eff_tile_w == 0 || c->eff_tile_h == 0) {
+		u_cursor_draw_report_refused(req_in, U_CURSOR_DRAW_REFUSAL_NO_TILES);
+		return false;
+	}
+	if (req->report_only) {
+		// #1952: every check passed; the app shows its OS cursor this
+		// frame, so report "would draw" and draw nothing.
+		u_cursor_draw_report_drew(req_in);
 		return false;
 	}
 
@@ -6160,6 +6176,7 @@ gl_cursor_draw(struct comp_gl_compositor *c,
 	glEnable(GL_SCISSOR_TEST);
 
 	static const float uv[4][2] = {{0, 0}, {0, 1}, {1, 0}, {1, 1}};
+	uint32_t drawn = 0;
 	for (uint32_t i = 0; i < n; i++) {
 		uint32_t bx = 0, by = 0, bw = cols * c->eff_tile_w, bh = rows * c->eff_tile_h;
 		if (!mono) {
@@ -6191,6 +6208,12 @@ gl_cursor_draw(struct comp_gl_compositor *c,
 		}
 		glUniform4fv(c->cursor_draw.loc_corners, 4, &corners[0][0]);
 		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+		drawn++;
+	}
+	if (drawn > 0) {
+		u_cursor_draw_report_drew(req_in);
+	} else {
+		u_cursor_draw_report_refused(req_in, U_CURSOR_DRAW_REFUSAL_NO_TILES);
 	}
 
 	glDisable(GL_SCISSOR_TEST);
@@ -6201,7 +6224,7 @@ gl_cursor_draw(struct comp_gl_compositor *c,
 	glBindTexture(GL_TEXTURE_2D, 0);
 	glUseProgram(0);
 
-	if (!c->cursor_draw.announced) {
+	if (!c->cursor_draw.announced && drawn > 0) {
 		c->cursor_draw.announced = true;
 		U_LOG_W(
 		    "cursor_draw: GL compositor drawing the cursor (%s, %.1f mm tall, %u view(s), %s; ADR-046 "
@@ -6268,8 +6291,16 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 		cursor_req = c->cursor_draw.req;
 		c->cursor_draw.req.requested = false;
 		// A zones frame draws only a zone request (#1949; the state tracker
-		// sends nothing else there) and vice versa; belt and braces.
-		cursor_pending = c->zones_frame == cursor_req.zone_valid && u_cursor_draw_should_draw(&cursor_req);
+		// sends nothing else there) and vice versa; belt and braces. #1952:
+		// a refusal is reported (the request's report starts out as "never
+		// reached the cursor pass", so an early-out frame refused too).
+		if (c->zones_frame != cursor_req.zone_valid) {
+			u_cursor_draw_report_refused(&cursor_req, U_CURSOR_DRAW_REFUSAL_ZONE_MISMATCH);
+		} else if (!u_cursor_draw_should_draw(&cursor_req)) {
+			u_cursor_draw_report_refused(&cursor_req, U_CURSOR_DRAW_REFUSAL_INVALID_REQUEST);
+		} else {
+			cursor_pending = !comp_cursor_draw_debug_refuse(&cursor_req);
+		}
 		c->cursor_draw.pending = cursor_pending;
 		c->cursor_draw.pending_source_srgb =
 		    cursor_req.image == NULL || gl_swapchain_is_srgb(gl_swapchain(cursor_req.image));
@@ -7108,6 +7139,9 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 #ifdef XRT_OS_WINDOWS
 	cursor_routed = seg_routed_frame;
 #endif
+	if (cursor_pending && cursor_routed) {
+		u_cursor_draw_report_refused(&cursor_req, U_CURSOR_DRAW_REFUSAL_MULTI_SCREEN);
+	}
 	if (cursor_pending && !cursor_routed && gl_cursor_draw(c, &cursor_req, zones_target_w, zones_target_h)) {
 		window_space_drew = true; // republish the compose target
 	}

@@ -760,6 +760,46 @@ sprite and the depth, and the runtime owns the drawing. Apps get the same contra
   area exactly while `willDraw` (`WM_SETCURSOR` → `SetCursor(NULL)`). Their `app` mode keeps the
   OS cursor and logs the placement; it draws no in-app crosshair.
 
+#### §B compositor refusals make `willDraw` false (runtime#1952)
+
+The state tracker checks everything it can see before it hands a request over
+(`u_cursor_draw_placement_drawable` on the located and the submitted views, #1951). A native
+compositor can still decline for reasons only it sees. Those reasons now reach `willDraw` too, so
+the app never hides its OS cursor for a frame that draws no sprite (after one frame of lag: a
+refusal is only known at the commit).
+
+- **Report.** `u_cursor_draw_request` carries a `report` pointer (owned by the session) and a
+  `report_only` flag. During the commit that consumes the request, the compositor writes
+  `u_cursor_draw_report_drew()` or `u_cursor_draw_report_refused(reason)`; the last write wins,
+  so the renderer can override the compositor. The state tracker arms the report as **NOT_REACHED**
+  before handing it, so a commit that never reaches its cursor pass (an early-out frame, a path
+  with no compose pass) counts as a refusal without any backend code.
+- **Latch.** Right after `xrt_comp_layer_commit` (one bool test, true only on a frame that handed
+  a request) the report is folded into `u_cursor_draw_latch`: a refusal makes the next locate
+  report `willDraw = XR_FALSE`; a commit that drew restores it. One WARN per distinct reason, never
+  per frame.
+- **Report-only probe.** While the latch is refused the request is still handed over, as
+  report-only: every check runs and the outcome is reported, but nothing is drawn (the app is
+  showing its OS cursor; drawing too would show two cursors). Without the probe the report would
+  oscillate: false, then a skipped request, then true, then refused again.
+- **Reasons** (`enum u_cursor_draw_refusal`) and where they come from:
+
+  | Reason | Metal | vk_native | GL | D3D11 / D3D12 |
+  |---|---|---|---|---|
+  | zone mismatch / zone unplaceable | yes | yes | yes | yes |
+  | multi-screen routed frame | (draws) | yes | yes (Windows) | yes |
+  | no display info / canvas height | yes | yes | yes | yes |
+  | sprite unusable (empty, no view, layered GL) | yes | yes (renderer: no source view) | yes | yes (renderer: no SRV / resource) |
+  | default look build / upload failed | yes | yes (+ renderer: image not ready) | yes | yes (renderer: upload) |
+  | pipeline / descriptor creation failed | yes | descriptor set (renderer) | program | yes (+ D3D12 SRV heap full) |
+  | no compose pass | (n/a) | renderer: pass unavailable | (n/a) | (n/a) |
+  | no tile area to draw into | yes | yes | yes | yes |
+  | never reached the cursor pass | default | default | default | default |
+
+- **Verification hook.** `DXR_CURSOR_DRAW_REFUSE=1` makes every compositor refuse (reason
+  FORCED); `DXR_CURSOR_DRAW_REFUSE_PERIOD_MS=N` refuses during the first half of every N ms, so a
+  single run shows `willDraw` flipping both ways (`compositor/util/comp_cursor_look.c`).
+
 ### Rollout
 
 1. **Groundwork:**
