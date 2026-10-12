@@ -250,6 +250,31 @@ else
   echo "Note: DisplayXR-SimInput.so not found — no input provider staged (qwerty keeps the hand roles)."
 fi
 
+# Conversion-provider plug-in (ADR-053): the hardware-free reference provider.
+# Same search dir; the `-conversion-provider.json` suffix routes the manifest
+# to the conversion loader (the DP and input loaders skip it). Staging it is
+# harmless: sim-conversion's probe() declines unless its ENABLE setting is 1
+# (DXR_CONV_SIM_CONVERSION_ENABLE=1), and it is FALLBACK at ProbeOrder 250.
+SIMCONV_PLUGIN="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimConversion.so" -type f | head -1)"
+if [ -n "$SIMCONV_PLUGIN" ]; then
+  cp "$SIMCONV_PLUGIN" "$PLUGIN_DIR/"
+  cat > "$PLUGIN_DIR/250-sim-conversion-conversion-provider.json" <<EOF
+{
+    "file_format_version": "1.0",
+    "plugin": {
+        "id":           "sim-conversion",
+        "display_name": "DisplayXR Sim Conversion",
+        "vendor":       "DisplayXR",
+        "version":      "dev",
+        "binary_path":  "$PLUGIN_DIR/DisplayXR-SimConversion.so",
+        "probe_order":  250
+    }
+}
+EOF
+else
+  echo "Note: DisplayXR-SimConversion.so not found — no conversion provider staged."
+fi
+
 export XRT_PLUGIN_SEARCH_PATH="$PLUGIN_DIR"
 
 echo ""

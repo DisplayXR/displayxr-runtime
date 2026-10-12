@@ -213,6 +213,31 @@ else
   echo "Note: DisplayXR-SimInput.dylib not found — no input provider in dev tree (qwerty keeps the hand roles)."
 fi
 
+# Conversion-provider plug-in (ADR-053): the hardware-free reference provider.
+# The `-conversion-provider.json` suffix routes the manifest to the conversion
+# loader. Harmless to stage: probe() declines unless its ENABLE setting is 1
+# (DXR_CONV_SIM_CONVERSION_ENABLE=1); FALLBACK at ProbeOrder 250.
+SIMCONV_PLUGIN=$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimConversion.dylib" -type f | head -1)
+if [ -n "$SIMCONV_PLUGIN" ] && [ -f "$SIMCONV_PLUGIN" ]; then
+  cp "$SIMCONV_PLUGIN" "$PKG_DIR/lib/displayxr/plugins/"
+  cat > "$PKG_DIR/lib/displayxr/plugins/250-sim-conversion-conversion-provider.json" <<EOF
+{
+    "file_format_version": "1.0",
+    "plugin": {
+        "id":           "sim-conversion",
+        "display_name": "DisplayXR Sim Conversion",
+        "vendor":       "DisplayXR",
+        "version":      "dev",
+        "binary_path":  "$PKG_DIR/lib/displayxr/plugins/DisplayXR-SimConversion.dylib",
+        "probe_order":  250
+    }
+}
+EOF
+  install_name_tool -add_rpath @loader_path/../.. "$PKG_DIR/lib/displayxr/plugins/DisplayXR-SimConversion.dylib" 2>/dev/null || true
+else
+  echo "Note: DisplayXR-SimConversion.dylib not found — no conversion provider in dev tree."
+fi
+
 # Copy test app binaries
 # Stage every built app binary (executables land directly in test_apps/build/bin).
 for _b in "$TA_BIN"/*; do
