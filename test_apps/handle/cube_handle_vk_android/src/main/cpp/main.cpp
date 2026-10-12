@@ -1053,8 +1053,41 @@ active_tile_dims(uint32_t *render_w, uint32_t *render_h, uint32_t *cols, uint32_
 	uint32_t big = g_display_px_w >= g_display_px_h ? g_display_px_w : g_display_px_h;
 	uint32_t small = g_display_px_w >= g_display_px_h ? g_display_px_h : g_display_px_w;
 	int rot = g_display_rotation.load(std::memory_order_relaxed);
-	bool portrait = (rot == 1 || rot == 3);
-	uint32_t disp_w = portrait ? small : big;
+        // Pre-surface fallback only: `rot == 1 || rot == 3` assumes a
+        // LANDSCAPE-native panel. On the NP02J the natural orientation is
+        // PORTRAIT (ROTATION_0 is portrait), so the test is inverted there —
+        // portrait got landscape-shaped 1920x1200 tiles against the runtime's
+        // portrait Kooima canvas, and the woven image came out squished.
+        // cube_zones_vk_android documents the same trap.
+        bool portrait = (rot == 1 || rot == 3);
+#ifdef CUBE_HAVE_ANDROID_SURFACE_BINDING
+        // AUTHORITATIVE: the held orientation is whichever panel edge is
+        // horizontal right now. The UI thread samples the panel extent in the
+        // CURRENT rotation (the same value published to the runtime as
+        // panelExtent); before the first sample, our own window's aspect says
+        // the same for a fullscreen app.
+        {
+          bool known = false;
+          uint64_t seq = g_win_rect_seq.load(std::memory_order_acquire);
+          if (seq != 0) {
+            WindowRectSample s = g_win_rect;
+            if (g_win_rect_seq.load(std::memory_order_acquire) == seq &&
+                s.panel_w > 0 && s.panel_h > 0) {
+              portrait = s.panel_h > s.panel_w;
+              known = true;
+            }
+          }
+          ANativeWindow *win = g_app_window.load(std::memory_order_acquire);
+          if (!known && win != nullptr) {
+            int32_t ww = ANativeWindow_getWidth(win);
+            int32_t wh = ANativeWindow_getHeight(win);
+            if (ww > 0 && wh > 0) {
+              portrait = wh > ww;
+            }
+          }
+        }
+#endif
+        uint32_t disp_w = portrait ? small : big;
 	uint32_t disp_h = portrait ? big : small;
 	if (disp_w == 0 || disp_h == 0) { // no display info yet — fall back to atlas tiles
 		disp_w = g_atlas.width / c;
