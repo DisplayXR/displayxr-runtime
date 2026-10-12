@@ -133,8 +133,13 @@ flight per provider; concurrency of jobs, converts and warm-up is opt-in per cap
 ### 4. Policy stays in the runtime; providers do pixels and units
 
 Viewpoints (ADR-048), convergence (runtime auto-convergence, in flight), the depth budget and
-the cursor's relief mapping are runtime stages. A provider must honour explicit viewpoints,
-accept a caller-set convergence exactly, and may only *suggest* one. It reports units
+the cursor's relief mapping are runtime stages. A provider must honour explicit viewpoints and
+accept a caller-set convergence exactly; the runtime hands it that plane in the provider's own
+decoded depth units, so estimator and provider cannot disagree on normalisation. A provider
+may only *suggest* a convergence or a disparity budget, and the runtime ignores the suggestion
+unless that provider has been validated against the stereo ground-truth corpus. The budget is
+derived from the content's range only for metric depth; for affine depth, whose scale is
+unknown by definition, it is a strength-scaled cap. It reports units
 honestly: depth kind (metric, metric-inverse, affine depth, affine inverse depth, affine or
 pixel disparity), measure, scale and shift, near/far, the **per-frame range before any
 normalisation**, intrinsics with their source (given, estimated or assumed), coordinate
@@ -182,6 +187,11 @@ the selected provider for the default tasks when a client signals interest in th
 (on battery: at the first stream); a reload is always reported as warming; a model bound to a
 prewarm task is never evicted on idle. State changes are pushed as events in addition to
 polling.
+
+The failure this closes was seen live: a consumer queried readiness once before the module
+was ready, cached the answer, and converted in-page at visibly lower quality for the whole
+session with no stream in the service log. The consumer contract therefore also says: never
+cache a non-ready answer beyond one poll interval.
 
 The consumer contract replaces ADR-042's "open default": **a non-ready task is a reason to
 wait, never a reason to switch paths.** There is no in-app converter; the open models are a

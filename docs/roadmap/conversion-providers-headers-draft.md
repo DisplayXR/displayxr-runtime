@@ -407,6 +407,11 @@ struct xrt_conv_capability
 #define XRT_CONV_FRAME_INPAINT (1u << 1) //!< fill disocclusions
 /*! @} */
 
+/*! @name xrt_conv_params::convergence_mode @{ */
+#define XRT_CONV_CONVERGENCE_AUTO 0u    //!< no plane given: the provider's own estimate, or its default
+#define XRT_CONV_CONVERGENCE_DECODED 1u //!< params.convergence is the zero-parallax plane in DECODED depth units
+/*! @} */
+
 /*! Rectified stereo calibration — the XR_DXR_stereo_camera shape.
  *  FROZEN: growth goes at the tail of the enclosing top-level struct or into
  *  a new slot. sizeof == 32 (asserted). */
@@ -427,8 +432,16 @@ struct xrt_conv_params
 	uint64_t source_time_ns;  //!< echoed in results
 	uint64_t frame_id;        //!< per stream, increasing
 
-	/* Look (ADR-042 semantics, unchanged). */
-	float convergence;        //!< [0,1] relative depth at glass; < 0 = provider AUTO
+	/* Look. */
+	uint32_t convergence_mode; //!< XRT_CONV_CONVERGENCE_*
+	float convergence;        //!< DECODED mode: the zero-parallax plane in the DECODED units of this
+	                          //!< stream's depth output (value = value_scale * sample + value_shift, the
+	                          //!< mirror of depth_info.convergence_value). Polarity follows the depth
+	                          //!< kind: larger = nearer for *_INVERSE / *_DISPARITY, larger = farther
+	                          //!< for METRIC_DEPTH / AFFINE. The runtime maps an app's [0,1]
+	                          //!< "relative depth at glass" onto this using the last result's range;
+	                          //!< the provider never normalises it again. A given plane also means
+	                          //!< "provider auto-convergence OFF".
 	float strength;           //!< 1 = provider budget
 	uint32_t view_count;      //!< VIEWS_*: validated against min/max_views
 	uint32_t content_hint;    //!< XRT_CONV_CONTENT_*
@@ -466,8 +479,11 @@ struct xrt_conv_depth_info
 	float range_p05, range_p95;    //!< 0,0 = not computed
 	float fx, fy, cx, cy;          //!< depth-image texels; ≤ 0 = unknown
 	uint32_t source_width, source_height;
-	float convergence_value;       //!< decoded value at zero disparity of the paired views; ≤ 0 = unknown
-	float suggested_convergence;   //!< D10 hint, params.convergence units; < 0 = none
+	float convergence_value;       //!< decoded value at zero disparity of the paired views; valid iff (suggest_flags & 4)
+	float suggested_convergence;   //!< provider hint, DECODED units (see params.convergence); valid iff (suggest_flags & 1)
+	float suggested_strength;      //!< provider hint for the disparity budget, 1 = its own; valid iff (suggest_flags & 2).
+	                               //!< Both hints are IGNORED by policy unless the provider is validated against the corpus.
+	uint32_t suggest_flags;        //!< bit0 suggested_convergence, bit1 suggested_strength, bit2 convergence_value
 	uint32_t relief_valid;         //!< ADR-046 A1: z_front_m = relief_scale/value + relief_offset
 	float relief_scale, relief_offset;
 	uint32_t temporal;             //!< from a temporal model
@@ -871,9 +887,9 @@ XRT_CONV_ABI_ASSERT(sizeof(void *) != 8 || sizeof(struct xrt_conv_image) == 128,
                     "xrt_conv_image is FROZEN (88 + 40-byte sync)");
 XRT_CONV_ABI_ASSERT(sizeof(void *) != 8 || offsetof(struct xrt_conv_image, sync) == 88,
                     "xrt_conv_image: sync at 88");
-XRT_CONV_ABI_ASSERT(sizeof(struct xrt_conv_depth_info) == 120,
-                    "xrt_conv_depth_info is FROZEN (26 x 4 + 2 x 8)");
-XRT_CONV_ABI_ASSERT(offsetof(struct xrt_conv_depth_info, source_time_ns) == 104,
+XRT_CONV_ABI_ASSERT(sizeof(struct xrt_conv_depth_info) == 128,
+                    "xrt_conv_depth_info is FROZEN (28 x 4 + 2 x 8)");
+XRT_CONV_ABI_ASSERT(offsetof(struct xrt_conv_depth_info, source_time_ns) == 112,
                     "xrt_conv_depth_info: no hidden padding before the uint64s");
 XRT_CONV_ABI_ASSERT(sizeof(struct xrt_conv_views_info) == 124,
                     "xrt_conv_views_info is FROZEN (3 x 4 + 8 x 3 x 4 + 4 x 4)");
@@ -898,7 +914,7 @@ The threading contract, the hosting-agnosticism rules and the semantics the head
 |---|---|---|
 | `xrt_conv_sync` | 0 `kind`, 4 `reserved_0`, 8 `handle`, 16 `import_key`, 24 `acquire_value`, 32 `release_value` | 40 |
 | `xrt_conv_image` | 0 `memory_kind`, 4 `reserved_0`, 8 `handle`, 16 `import_key`, 24 `cpu_ptr`, 32 `byte_size`, 40–68 eight `uint32_t` (`width` … `array_layer`), 72 `drm_modifier`, 80 `adapter_luid`, 88 `sync` (40) | 128 |
-| `xrt_conv_depth_info` | 0–100 twenty-six 4-byte fields (`kind` … `has_confidence`), 104 `source_time_ns`, 112 `provider_frame_id` | 120 |
+| `xrt_conv_depth_info` | 0–108 twenty-eight 4-byte fields (`kind` … `has_confidence`), 112 `source_time_ns`, 120 `provider_frame_id` | 128 |
 | `xrt_conv_views_info` | 0 `view_count`, 4 `layout`, 8 `reserved_0`, 12 `eye_xyz[8][3]` (96), 108 `baseline_m`, 112 `hfov_deg`, 116 `zero_parallax_disparity`, 120 `reserved_1` | 124 |
 | `xrt_conv_splat_info` | 0–56 fifteen 4-byte fields (`blob_format` … `far_m`), 60 `reserved_0`, 64 `splat_count` | 72 |
 | `xrt_conv_stereo_calibration` | 0 `eye_order`, 4–16 `fx fy cx cy`, 20 `baseline_m`, 24 `infinity_shift_px`, 28 `sbs_packed` | 32 |
@@ -1458,7 +1474,8 @@ typedef struct XrLiftViewsInfoDXR {
     XrLiftCameraModelDXR       cameraModel;
     XrLiftConvergenceSourceDXR convergenceSource;
     float                      convergenceApplied;  //!< in v3 convergence units [0,1]; < 0 = unknown
-    float                      suggestedConvergence;//!< provider hint (frame D10), same units; < 0 = none
+    float                      suggestedConvergence;//!< provider hint, same units; < 0 = none. Diagnostics: policy ignores it unless the provider is corpus-validated
+    float                      suggestedStrength;   //!< provider hint for the disparity budget, 1 = its own; < 0 = none (same rule)
     XrBool32                   reliefValid;         //!< display z of a depth d: z = reliefScale / d + reliefOffset
     float                      reliefScale;
     float                      reliefOffset;

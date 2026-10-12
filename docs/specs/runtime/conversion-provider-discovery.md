@@ -60,7 +60,7 @@ Inside the runtime — headers, loader, registry, CLI, ADR — the word is **con
 | Not in a provider | Owned by |
 |---|---|
 | Viewpoint / app-rig policy | runtime (ADR-048); the provider renders exactly `params.viewpoints_xyz` |
-| Convergence policy | runtime (rt#1978). A provider may only *suggest* (`suggested_convergence`) |
+| Convergence policy | runtime (rt#1978). A provider may only *suggest* (`suggested_convergence`, `suggested_strength`); ignored unless corpus-validated |
 | Depth budget | runtime (ADR-040 plus a new budget stage using the per-frame range) |
 | Cursor relief | runtime (ADR-046 A1); the provider reports the generic `relief_*` field |
 | OpenXR types | the state tracker. The header is self-contained: `xrt_results.h` + `<stdint.h>` / `<stddef.h>` / `<stdbool.h>` |
@@ -154,7 +154,7 @@ Each rule must hold in both hostings.
 
 - **Honesty.** Unknown means zero or the sentinel — never an invented intrinsic, baseline, focal or scale. `ASSUMED` intrinsics are legal only when labelled.
 - **Viewpoints.** Every `VIEWS_*` capability MUST set `EXPLICIT_VIEWPOINTS`; selection refuses one that does not. `viewpoints_xyz` is authoritative; the provider never reads a tracker.
-- **Convergence.** `params.convergence ≥ 0` is obeyed exactly, and also means "provider auto-convergence off"; `< 0` means AUTO. A provider's subject estimate goes in `suggested_convergence` (declared by `CAP_SUGGESTS_CONVERGENCE`); the runtime decides.
+- **Convergence.** `params.convergence_mode == DECODED` hands the provider the zero-parallax plane in the **decoded units of its own depth output** (the mirror of `depth_info.convergence_value`; polarity follows the depth kind), and also means "provider auto-convergence off"; the provider never normalises it again. `AUTO` means no plane was given. The runtime maps an app's [0,1] "relative depth at glass" onto decoded units with the last result's range, so the runtime's estimator and the provider agree on what the value means. A provider's own estimates go in `suggested_convergence` / `suggested_strength` (declared by `CAP_SUGGESTS_CONVERGENCE`); **policy ignores them unless the provider is validated against the stereo ground-truth corpus** (a vendor module's own auto-convergence measured about twice the error of the runtime rule on that corpus).
 - **Temporal state is per stream.** A provider whose library shares temporal state across streams resets it at stream boundaries, or declares `max_streams = 1` on its `TEMPORAL` caps.
 - **Stream limits** are the selected provider's `max_streams` per task; spec-3 `maxStreams` reports `VIEWS_MONO`'s.
 - **A process-wide model choice** is one capability whose variant follows `qualityHint`, not a set of capabilities that exclude each other.

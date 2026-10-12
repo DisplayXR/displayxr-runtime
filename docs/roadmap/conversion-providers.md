@@ -529,8 +529,8 @@ one model per app. Instead:
 | Policy | Stage | Code | Needs from providers |
 |---|---|---|---|
 | Viewpoints / app rig (ADR-048) | S3 | `resolve_viewpoints` (`d3d11_lift.cpp:988-1112`) + `u_lift_recenter`, moved unchanged | `EXPLICIT_VIEWPOINTS`, `max_views` (enforced at create and submit), the camera model |
-| Convergence | S7 observer feeding S3 | rt#1978's `u_lift_autoconv` (**lands first**; P1 moves its call site, not its code) reading S6 aux depth | a caller-set `convergence ≥ 0` already means "provider auto-convergence off"; `CAP_SUGGESTS_CONVERGENCE` covers the hint, which the runtime may ignore |
-| Depth budget | S3 target, S6 measure | new `conv_policy_budget()`: target disparity from display geometry, viewer distance, the ADR-040 rear budget and the content's p5/p95 | per-frame range; honest units; no silent per-frame min-max normalisation |
+| Convergence | S7 observer feeding S3 | rt#1978's `u_lift_autoconv` (**lands first**; P1 moves its call site, not its code) reading S6 aux depth. The observer consumes only aux depth with `same_inference = 1` (otherwise the plane is computed on a different frame than the one shown — the "depth late vs image" symptom); its spring filter, cut detection and refractory reset on `FRAME_RESET` and on a result `discontinuity` (provider rebind), not only the provider's state. The plane is handed to the provider in **decoded units** (`convergence_mode = DECODED`, the mirror of `convergence_value`), mapped from the app's [0,1] with the last result's range, so estimator and provider cannot disagree on normalisation | a given plane means "provider auto-convergence off"; `suggested_convergence` / `suggested_strength` are **ignored by default** — a vendor module's own auto-convergence recomputes every 20 frames, resets its EMA on histogram cuts and shares state across streams, and measured ~0.39 error against FoundationStereo ground truth on the test title where the #1978 blend rule measures 0.170; a hint is used only once that provider is validated on the corpus |
+| Depth budget | S3 target, S6 measure | new `conv_policy_budget()`. **METRIC kinds:** target disparity from the content's decoded range + display geometry + viewer distance + the ADR-040 rear budget. **AFFINE kinds:** the range cannot give an absolute budget (scale unknown by definition; on 5 trailers + 119 shots with FoundationStereo ground truth the true budget varies ~15× per shot, 0.37–5.56 % of width, while the module's output is flat at 2.2–2.5 %, and cheap image cues do not predict it), so the budget is the strength default × the ADR-040 rear cap, plus an optional validated `suggested_strength` hint | per-frame range; honest units; no silent per-frame min-max normalisation; `suggested_strength` reserved now while `xrt_conv_depth_info` is unfrozen |
 | Cursor on lifted content (ADR-046 A1) | S7 | the relief mapping (`xrt_dp_lift.h:261-272`) becomes a generic `relief` field | relief or the camera model; else the cursor stays flat |
 | Letterbox / input cap | S1 | unchanged (`u_lift_mailbox.h:283-404`) | `max_input_edge` per variant |
 | Licence gating | selection | `conv_select.c` | licence class + SPDX; a pack's `commercial` = AND over model and dependencies |
@@ -823,6 +823,10 @@ explore / orbit / SOG export.
 
 **Exit:** a service-log lift stream per lifted element; no `onnxruntime` / `models/` request in a
 `--log-file`; after a cold boot with the provider WARMING, a lifted element turns 3D by itself.
+**Named failure to test against:** the browser queried caps before the module was READY and latched
+in-page conversion for the whole session (seen live on the panel 2026-10-12; quality visibly worse, no
+stream in the service log). The consumer rule "never cache a non-READY answer beyond one poll
+interval" (§7.4) is the fix, and the cold-boot smoke test is its regression test.
 
 ### 8.2 Other consumers
 
@@ -868,9 +872,13 @@ amendment stubs. **Exit:** owner sign-off on §11.1 (a)–(e).
 readiness, ABSENT(policy), FAILED(RESOURCES)); `tests_conv_readiness`; `tests_conv_wire`;
 `tests_conversion_abi` (frozen-struct `sizeof`, `describe_cap`); `tests_lift_abi` (every v3 `sizeof` /
 `offsetof` / enum, x64 + arm64); the v3 startup sequence pinned **before** refactoring; the legacy
-golden replay incl. cold-boot ACTIVATING and "splats downloading + SBS READY → READY"; lane isolation
-(a 3 s sim job costs a VIEWS_MONO stream ≤ 10 %); view synthesis vs `live-dibr.js` on the panel
-corpus; selftest with zero / sim / malformed providers.
+golden replay incl. cold-boot ACTIVATING, "properties before the first describe ⇒ ACTIVATING" and
+"splats downloading + SBS READY → READY"; lane isolation (a 3 s sim job costs a VIEWS_MONO stream
+≤ 10 %); view synthesis vs `live-dibr.js` on the panel corpus; selftest with zero / sim / malformed
+providers. **Golden set for the convergence / budget stages and the composed-views acceptance bar:**
+FoundationStereo disparity for every frame of 19 stereo titles (5 full-width trailers + 14 half-width
+features, 704 px per eye, positive = in front) under `Documents\LiftTestAssets\stereo-train\full\fs`
+on the win box, alongside the real-media lift corpus.
 
 **Exit:** browser path unchanged on the panel (bperf + the lift panel recipe, A/B against the
 previous release); all six §10 bugs closed; `conv list` shows `dp-lift` + sim in order.
