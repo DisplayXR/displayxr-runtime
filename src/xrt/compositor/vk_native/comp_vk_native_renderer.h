@@ -370,6 +370,16 @@ struct comp_vk_native_cursor_draw
 	//! The source holds premultiplied alpha (the default look) rather than
 	//! straight (the app's sprite, per the spec).
 	bool premultiplied;
+	/*!
+	 * ADR-046 Amendment 2 B.7 crosstalk softening, resolved once per frame
+	 * (u_cursor_draw_soften_sized): blur radius in panel px and opacity.
+	 * (0, 1) = on the glass, drawn by the crisp pipeline, bit-identical.
+	 */
+	float blur_px;
+	float alpha;
+	//! The panel px that 0..1 of a tile spans (the canvas, or the window for
+	//! a zone request) - what the blur pad is converted against.
+	float tile_px_w, tile_px_h;
 	//! #1952: the state tracker's request, for the renderer to report what
 	//! it did (u_cursor_draw_report_drew / _refused). Only its report
 	//! fields are used here.
