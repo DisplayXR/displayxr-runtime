@@ -27,7 +27,11 @@ target_link_libraries(
 target_sources(displayxr-service PRIVATE
 	service_client_class.c
 	service_client_class.h
+	# ADR-053 (#2005): the service's conversion core (loader -> conv_core -> IPC).
+	service_conversion.c
+	service_conversion.h
 )
+target_link_libraries(displayxr-service PRIVATE displayxr::conversion_runtime ipc_server_conv)
 
 # Delay-load Vulkan so the service can start on systems where it is absent.
 # The D3D11 service compositor path never calls into Vulkan functions, so the
@@ -50,7 +54,7 @@ if(WIN32)
 		service_resources.rc
 	)
 	# wtsapi32: WTSRegisterSessionNotification — the stereo camera's lock-screen suspension (ADR-043 R3)
-	target_link_libraries(displayxr-service PRIVATE shell32 ws2_32 wtsapi32)
+	target_link_libraries(displayxr-service PRIVATE shell32 ws2_32 wtsapi32 advapi32)
 
 	# #1201 — embed the shared per-monitor-v2 DPI manifest. The service already
 	# called SetProcessDpiAwarenessContext at the top of WinMain (now

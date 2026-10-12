@@ -53,6 +53,7 @@ workspace_launch_provider(const char *controller_id)
 #include "target_lists.h"
 #include "target_status_snapshot.h" // ADR-051 D3: the status provider
 #include "target_display_hotplug.h" // ADR-051 D6: the display-identity follow-up sink
+#include "service_conversion.h"     // ADR-053: the conversion core
 
 // #950: run ipc_server_main under the structured-exception guard so an
 // exception escaping the main thread is recorded ([TERMINATE]) before it
@@ -425,6 +426,8 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 	ipc_server_set_client_class_verify_provider(service_client_class_verify);
 	register_status_provider();
 	register_display_followup();
+	// ADR-053 (#2005): the conversion core + the v3 lift handlers' route to it.
+	service_conversion_start();
 
 	// Same plumbing for the file-dialog capability bit so the IPC server can
 	// short-circuit `session_request_file_picker` when the active controller
@@ -462,6 +465,9 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 	struct service_main_args sma = {argc, argv, &ismi, 0};
 	u_crash_guard_run("service-main", service_main_body, &sma);
 	int ret = sma.ret;
+
+	// ADR-053: torn down last, after the IPC server (no client can reach it now).
+	service_conversion_stop();
 
 	// ADR-045: the IPC server ended its loop to complete a plug-in adoption.
 	// The successor waits for this process to exit before it starts.
@@ -580,6 +586,8 @@ main(int argc, char *argv[])
 	ipc_server_set_client_class_verify_provider(service_client_class_verify);
 	register_status_provider();
 	register_display_followup();
+	// ADR-053 (#2005): the conversion core + the v3 lift handlers' route to it.
+	service_conversion_start();
 
 	struct ipc_server_main_info ismi = {
 	    .udgci =
@@ -598,6 +606,9 @@ main(int argc, char *argv[])
 	struct service_main_args sma = {argc, argv, &ismi, 0};
 	u_crash_guard_run("service-main", service_main_body, &sma);
 	int ret = sma.ret;
+
+	// ADR-053: torn down last, after the IPC server (no client can reach it now).
+	service_conversion_stop();
 
 	u_metrics_close();
 
