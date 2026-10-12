@@ -12,6 +12,7 @@ add_library(
 			    target_lists.c target_lists.h
 			    target_input_arbiter.c target_input_arbiter.h
 			    target_input_plugin_loader.c target_input_plugin_loader.h
+			    target_conversion_plugin_loader.c target_conversion_plugin_loader.h
 			    target_plugin_loader.c target_plugin_loader.h
 			    target_screens.c target_screens.h
 			    target_display_hotplug.c target_display_hotplug.h
