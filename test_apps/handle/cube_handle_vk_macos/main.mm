@@ -32,6 +32,7 @@
 #include <openxr/XR_DXR_view_rig.h>
 #include <openxr/XR_DXR_cursor_depth.h>
 #include "cursor_depth.h" // dxr::CursorDepth — XR_DXR_cursor_depth bookkeeping (ADR-046)
+#include "stereo_photo_test.h" // XR_DXR_cursor_depth v7 test content (ADR-046 Amendment 3)
 #include <openxr/XR_DXR_spatial_workspace.h>
 #include "dxr_view_config.h" // #1486 PRIMARY_MULTIVIEW_DXR opt-in
 
@@ -1828,6 +1829,101 @@ static void CursorSpriteModel(float *out)
     mat4_multiply(out, trans, tmp);
 }
 
+// ============================================================================
+// XR_DXR_cursor_depth v7 (ADR-046 Amendment 3) test content: a synthetic
+// STEREO PHOTO (test_apps/common/stereo_photo_test.h) copied into each view's
+// tile instead of the cube. DISPLAYXR_CURSOR_DEPTH_SOURCE=measured selects it
+// (and the measured-disparity source); DISPLAYXR_STEREO_PHOTO=1 shows it alone;
+// DISPLAYXR_STEREO_PHOTO_ANIMATE=1 pans it a pixel per frame (a playing video:
+// every frame is a new measurement, nothing is answered from the cache).
+// ============================================================================
+struct VkStereoPhoto
+{
+    bool on = false;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    std::vector<VkImage> images; // the swapchain's
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    uint32_t w = 0, h = 0, pad = 32;
+    int eyes = 0;
+    bool animate = false;
+    uint32_t frame = 0;
+};
+static VkStereoPhoto g_vkPhoto;
+
+static bool EnsureVkStereoPhoto(VkDevice device, uint32_t w, uint32_t h, int eyes)
+{
+    VkStereoPhoto &sp = g_vkPhoto;
+    if (sp.buf != VK_NULL_HANDLE && sp.w == w && sp.h == h && sp.eyes == eyes) return true;
+    if (sp.buf != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(device); // a size change only (setup, not per frame)
+        vkDestroyBuffer(device, sp.buf, nullptr);
+        vkFreeMemory(device, sp.mem, nullptr);
+        sp.buf = VK_NULL_HANDLE;
+    }
+    const uint32_t tw = w + sp.pad; // a pan margin for the animated mode
+    const VkDeviceSize view_bytes = (VkDeviceSize)tw * h * 4;
+    if (!CreateBuffer(device, g_physDevice, view_bytes * eyes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, sp.buf, sp.mem)) {
+        sp.buf = VK_NULL_HANDLE;
+        return false;
+    }
+    uint8_t *mapped = nullptr;
+    vkMapMemory(device, sp.mem, 0, VK_WHOLE_SIZE, 0, (void **)&mapped);
+    const bool bgra = sp.format == VK_FORMAT_B8G8R8A8_UNORM || sp.format == VK_FORMAT_B8G8R8A8_SRGB;
+    std::vector<uint8_t> px;
+    for (int e = 0; e < eyes; e++) {
+        dxr_test::PhotoFill(e, eyes, w, tw, h, bgra, px);
+        memcpy(mapped + view_bytes * e, px.data(), px.size());
+    }
+    vkUnmapMemory(device, sp.mem);
+    sp.w = w;
+    sp.h = h;
+    sp.eyes = eyes;
+    LOG_INFO("stereo photo: %d views of %ux%u (%s; foreground +%.1f px crossed, ground %.1f px)", eyes, w, h,
+             bgra ? "BGRA" : "RGBA", dxr_test::kPhotoForegroundD * w, dxr_test::kPhotoGroundD * w);
+    return true;
+}
+
+// After the scene pass: copy each view's photo into its tile (image left in
+// COLOR_ATTACHMENT_OPTIMAL, the render pass's final layout).
+static void CopyVkStereoPhoto(VkRenderer &renderer, VkCommandBuffer cmd, uint32_t imageIndex,
+                              const EyeRenderParams *eyes, int eyeCount)
+{
+    if (eyeCount < 1 || imageIndex >= g_vkPhoto.images.size()) return;
+    if (!EnsureVkStereoPhoto(renderer.device, eyes[0].width, eyes[0].height, eyeCount)) return;
+    VkImage img = g_vkPhoto.images[imageIndex];
+    VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = img;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+                         nullptr, 0, nullptr, 1, &b);
+    const uint32_t tw = g_vkPhoto.w + g_vkPhoto.pad;
+    const uint32_t scroll = g_vkPhoto.animate ? (g_vkPhoto.frame++ % g_vkPhoto.pad) : 0u;
+    for (int e = 0; e < eyeCount; e++) {
+        VkBufferImageCopy r = {};
+        r.bufferOffset = (VkDeviceSize)tw * g_vkPhoto.h * 4 * e + (VkDeviceSize)scroll * 4;
+        r.bufferRowLength = tw;
+        r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        r.imageOffset = {(int32_t)eyes[e].viewportX, (int32_t)eyes[e].viewportY, 0};
+        r.imageExtent = {eyes[e].width < g_vkPhoto.w ? eyes[e].width : g_vkPhoto.w,
+                         eyes[e].height < g_vkPhoto.h ? eyes[e].height : g_vkPhoto.h, 1};
+        vkCmdCopyBufferToImage(cmd, g_vkPhoto.buf, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+    }
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
+                         nullptr, 0, nullptr, 1, &b);
+}
+
 static void RenderScene(VkRenderer& renderer, uint32_t imageIndex,
     const EyeRenderParams* eyes, int eyeCount)
 {
@@ -1947,6 +2043,11 @@ static void RenderScene(VkRenderer& renderer, uint32_t imageIndex,
 
     vkCmdEndRenderPass(cmd);
 
+    // XR_DXR_cursor_depth v7 test content: the stereo photo over the cube.
+    if (g_vkPhoto.on) {
+        CopyVkStereoPhoto(renderer, cmd, imageIndex, eyes, eyeCount);
+    }
+
     // ONE submit for every view, no wait. Must precede xrReleaseSwapchainImage
     // (the runtime composes on the same queue).
     VkResult r = renderer.ring.endFrame();
@@ -2025,6 +2126,11 @@ static void FillWorkspaceSwapchain(XrSwapchain sc, VkDevice device, VkQueue queu
 static void CleanupVkRenderer(VkRenderer& renderer) {
     if (renderer.device == VK_NULL_HANDLE) return;
     vkDeviceWaitIdle(renderer.device);
+    if (g_vkPhoto.buf != VK_NULL_HANDLE) { // XR_DXR_cursor_depth v7 test content
+        vkDestroyBuffer(renderer.device, g_vkPhoto.buf, nullptr);
+        vkFreeMemory(renderer.device, g_vkPhoto.mem, nullptr);
+        g_vkPhoto.buf = VK_NULL_HANDLE;
+    }
 
     {
         auto& fb = renderer.swapchainFBs;
@@ -3171,7 +3277,31 @@ static bool PollEvents(AppXrSession& xr) {
 static bool BeginFrame(AppXrSession& xr, XrFrameState& frameState) {
     frameState = {XR_TYPE_FRAME_STATE};
     XrFrameWaitInfo waitInfo = {XR_TYPE_FRAME_WAIT_INFO};
+    // DISPLAYXR_FRAME_STATS=1: frame interval, and the part of it the app
+    // spent outside xrWaitFrame (its own work + xrLocateViews + xrEndFrame),
+    // averaged and logged every 300 frames (the ADR-046 Amendment 3 cost
+    // evidence).
+    static const bool frameStats = []() {
+        const char *e = getenv("DISPLAYXR_FRAME_STATS");
+        return e != nullptr && e[0] == '1';
+    }();
+    static struct { uint32_t n = 0; double interval_ms = 0, busy_ms = 0, last_end = 0; } fs;
+    const double tWait0 = frameStats ? CFAbsoluteTimeGetCurrent() : 0.0;
     XrResult result = xrWaitFrame(xr.session, &waitInfo, &frameState);
+    if (frameStats) {
+        const double now = CFAbsoluteTimeGetCurrent();
+        if (fs.last_end > 0) {
+            fs.interval_ms += (now - fs.last_end) * 1e3;
+            fs.busy_ms += (tWait0 - fs.last_end) * 1e3;
+            if (++fs.n == 300) {
+                LOG_INFO("frame stats (300 frames): interval %.3f ms, busy outside xrWaitFrame %.3f ms",
+                         fs.interval_ms / 300.0, fs.busy_ms / 300.0);
+                fs.n = 0;
+                fs.interval_ms = fs.busy_ms = 0;
+            }
+        }
+        fs.last_end = now;
+    }
     if (XR_FAILED(result)) { xr.exitRequested = true; return false; }
 
     XrFrameBeginInfo beginInfo = {XR_TYPE_FRAME_BEGIN_INFO};
@@ -4043,10 +4173,35 @@ int main() {
     } else if (xr.cursorDepthCustomSprite) {
         cursor.setSprite(xr.cursorSpriteSwapchain, {0.5f, 0.5f}, 0.01f); // ring: hotspot = centre, 1 cm
     }
-    cursor.setRayCast([&vkRenderer](const dxr::CursorRay &r) -> std::optional<float> {
-        float t;
-        return RayHitCube(r.origin, r.dir, vkRenderer.cubeRotation, t) ? std::optional<float>(t) : std::nullopt;
-    });
+    // XR_DXR_cursor_depth v7 (ADR-046 Amendment 3): DISPLAYXR_CURSOR_DEPTH_SOURCE=
+    // measured shows the stereo photo and lets the runtime measure its
+    // disparity. dxr::CursorDepth (displayxr-common v2.29.0) predates spec v7,
+    // so the source struct is chained by hand ahead of the helper below.
+    bool cursorDepthMeasured = false;
+    if (const char *src = getenv("DISPLAYXR_CURSOR_DEPTH_SOURCE"); src != nullptr && strcmp(src, "measured") == 0) {
+        if (xr.hasCursorDepthExt && xr.cursorDepthSpecVersion >= 7) {
+            cursorDepthMeasured = true;
+        } else {
+            LOG_WARN("DISPLAYXR_CURSOR_DEPTH_SOURCE=measured needs XR_DXR_cursor_depth v7 (have v%u)",
+                     xr.cursorDepthSpecVersion);
+        }
+    }
+    {
+        const char *sp = getenv("DISPLAYXR_STEREO_PHOTO");
+        g_vkPhoto.on = cursorDepthMeasured || (sp != nullptr && sp[0] == '1');
+        g_vkPhoto.format = colorFormat;
+        const char *an = getenv("DISPLAYXR_STEREO_PHOTO_ANIMATE");
+        g_vkPhoto.animate = an != nullptr && an[0] == '1';
+    }
+    LOG_INFO("XR_DXR_cursor_depth source: %s", cursorDepthMeasured ? "MEASURED DISPARITY" : "app hit test");
+    XrCursorDepthSourceDXR measuredSource = {XR_TYPE_CURSOR_DEPTH_SOURCE_DXR};
+    measuredSource.source = XR_CURSOR_DEPTH_SOURCE_MEASURED_DISPARITY_DXR;
+    if (!cursorDepthMeasured) {
+        cursor.setRayCast([&vkRenderer](const dxr::CursorRay &r) -> std::optional<float> {
+            float t;
+            return RayHitCube(r.origin, r.dir, vkRenderer.cubeRotation, t) ? std::optional<float>(t) : std::nullopt;
+        });
+    }
     if (const char *fx = getenv("DISPLAYXR_CURSOR_DEPTH_UV")) { // scripted cursor for headless verification
         float fu, fv;
         if (sscanf(fx, "%f,%f", &fu, &fv) == 2) cursor.setPointerUV(fu, fv);
@@ -4059,6 +4214,7 @@ int main() {
         for (uint32_t i = 0; i < count; i++) {
             images[i] = swapchainImages[i].image;
         }
+        g_vkPhoto.images = images; // XR_DXR_cursor_depth v7 test content
         if (!CreateSwapchainFramebuffers(vkRenderer, images.data(), count,
             xr.swapchain.width, xr.swapchain.height, colorFormat)) {
             CleanupVkRenderer(vkRenderer);
@@ -4459,6 +4615,10 @@ int main() {
                     // late, which the runtime's filter absorbs), and the hint /
                     // draw-request / state structs on both chains. Inert when
                     // the extension is off.
+                    if (cursorDepthMeasured && cursor.enabled()) {
+                        measuredSource.next = locateInfo.next;
+                        locateInfo.next = &measuredSource;
+                    }
                     cursor.chain(locateInfo, viewState);
 
                     uint32_t viewCount = (uint32_t)xr.configViews.size();
@@ -4476,6 +4636,13 @@ int main() {
                         // App mode: we draw the crosshair from the placement.
                         const XrCursorDepthPlacementDXR &placement = cursor.placement();
                         g_cursorDraw.active = cursor.appShouldDraw();
+                        static uint64_t measuredLogFrame = 0;
+                        if (cursorDepthMeasured && cursor.pointerInCanvas() && (++measuredLogFrame % 60) == 30) {
+                            LOG_INFO("cursor_depth measured: uv=(%.3f,%.3f) target=%.4f disparity=%.4f active=%d "
+                                     "willDraw=%d",
+                                     cursor.hint().cursorUV.x, cursor.hint().cursorUV.y, placement.targetDisparity,
+                                     placement.disparity, (int)placement.isActive, (int)cursor.drawState().willDraw);
+                        }
                         g_cursorDraw.pose = placement.pose;
                         g_cursorDraw.height = placement.height;
 
