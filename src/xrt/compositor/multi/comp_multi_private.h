@@ -1446,6 +1446,19 @@ struct multi_system_compositor
 	 * @{
 	 */
 	bool shared_surface_initialized; //!< True once the shared window + resources exist.
+
+	/*!
+	 * #1006 Android overlay: the on_pause/on_resume state last pushed to
+	 * @ref shared_dp, as a @ref multi_dp_visibility (UNKNOWN until the first
+	 * push). Visible = overlay mode applied AND the controller's surface is
+	 * live; anything else releases the shared DP's lens vote (ADR-036 D7).
+	 * Render-thread only.
+	 */
+	int shared_dp_visibility;
+
+	//! #1006 / R2: the shared DP is being held back because per-session DPs
+	//! are still alive in this process (logged once per hold).
+	bool shared_dp_deferred_logged;
 	int64_t shared_init_retry_ns;    //!< After a failed target create: no retry before this (0 = none pending).
 	//! D-5 (#967): the hardware 2D/3D state last applied to shared_dp
 	//! (-1 = never), converged each frame from the lens owner's wish
@@ -1972,6 +1985,23 @@ multi_wait_fences_bounded(
  */
 bool
 multi_compositor_get_predicted_eye_positions(struct multi_compositor *mc, struct xrt_eye_positions *out_eye_pos);
+
+/*!
+ * Create a Vulkan display processor through the plug-in factory. On Android
+ * the call is marshalled onto the service main thread (the vendor DP's async
+ * init needs a pumped Looper, #510 M2) with a 2 s bound (#1007): on timeout the
+ * factory is abandoned and XRT_TIMEOUT returned. Elsewhere it runs inline.
+ * Shared by the per-session DP and the shared-surface DP.
+ *
+ * @ingroup comp_multi
+ */
+xrt_result_t
+multi_dp_factory_create(xrt_dp_factory_vk_fn_t factory,
+                        void *vk_bundle,
+                        void *vk_cmd_pool,
+                        void *window_handle,
+                        int32_t target_format,
+                        struct xrt_display_processor **out_xdp);
 
 /*!
  * Get window metrics for adaptive FOV and eye position adjustment.

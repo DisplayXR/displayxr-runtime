@@ -3892,6 +3892,133 @@ submit_and_present:
  */
 
 /*!
+ * #1006 / R2: may the shared DP exist right now? Always on macOS / desktop
+ * Linux. On Android the vendor SDK may allow only ONE core per process (risk R2
+ * of the overlay plan), so the shared DP is created only once no per-session DP
+ * is alive in THIS process — a satellite's DP is in another process and does not
+ * count. A paused per-session DP still counts: it is cached, not released, until
+ * its client goes (leia-plugin#39).
+ */
+static bool
+shared_dp_allowed(struct multi_system_compositor *msc)
+{
+#ifdef COMP_MULTI_PER_SESSION_TARGET
+	uint32_t alive = 0;
+	for (size_t k = 0; k < ARRAY_SIZE(msc->render_set); k++) {
+		struct multi_compositor *mc = msc->render_set[k];
+		if (mc != NULL && mc->session_render.display_processor != NULL) {
+			alive++;
+		}
+	}
+	if (alive > 0) {
+		if (!msc->shared_dp_deferred_logged) {
+			msc->shared_dp_deferred_logged = true;
+			U_LOG_W(
+			    "[#1006] shared display processor DEFERRED: %u per-session DP(s) still alive in this "
+			    "process (R2: one vendor core per process) - compositing unwoven until they go",
+			    alive);
+		}
+		return false;
+	}
+	msc->shared_dp_deferred_logged = false;
+#else
+	(void)msc;
+#endif
+	return true;
+}
+
+/*!
+ * Create the one shared display processor if it does not exist yet and is
+ * allowed to (@ref shared_dp_allowed). Needs the shared command pool and target
+ * (for the format). Idempotent; cheap when the DP exists.
+ */
+static void
+shared_ensure_dp(struct multi_system_compositor *msc, struct vk_bundle *vk)
+{
+	if (msc->shared_dp != NULL || msc->shared_target == NULL || msc->shared_cmd_pool == VK_NULL_HANDLE) {
+		return;
+	}
+	xrt_dp_factory_vk_fn_t factory = (xrt_dp_factory_vk_fn_t)msc->base.info.dp_factory_vk;
+	if (factory == NULL || !shared_dp_allowed(msc)) {
+		return;
+	}
+	xrt_result_t dp_ret = multi_dp_factory_create(factory,                                 //
+	                                              vk,                                      // vk_bundle
+	                                              (void *)(uintptr_t)msc->shared_cmd_pool, // cmd_pool
+	                                              NULL, // window_handle (service-owned)
+	                                              (int32_t)msc->shared_target->format, // target_format
+	                                              &msc->shared_dp);
+	if (dp_ret != XRT_SUCCESS) {
+		U_LOG_W("[#59] shared DP factory failed: %d (no weave)", dp_ret);
+		msc->shared_dp = NULL;
+	} else {
+		msc->shared_dp_visibility = MULTI_DP_VIS_UNKNOWN;
+		U_LOG_W("[#59] created shared display processor");
+	}
+}
+
+#ifdef COMP_MULTI_PER_SESSION_TARGET
+/*!
+ * #1006 Android overlay deactivate: release the shared TARGET (the swapchain on
+ * the controller's surface) and everything sized to it, so a per-session target
+ * may claim the process-global window again without
+ * VK_ERROR_NATIVE_WINDOW_IN_USE_KHR. Keeps the DP (paused by the convergence
+ * pass, never destroyed — leia-plugin#39), the command pool it borrows and the
+ * atlas. The next activate rebuilds the target lazily.
+ */
+static void
+shared_target_release(struct multi_system_compositor *msc, struct vk_bundle *vk)
+{
+	if (!msc->shared_surface_initialized && msc->shared_target == NULL) {
+		return;
+	}
+	if (vk != NULL &&
+	    multi_drain_main_queue_bounded(vk, MULTI_FENCE_DEADLINE_NS, "shared_target_release") == VK_TIMEOUT) {
+		U_LOG_E("[#1006] shared target release: GPU still busy - leaking its per-image objects");
+		vk = NULL;
+	}
+	if (vk != NULL && msc->shared_fences != NULL) {
+		for (uint32_t i = 0; i < msc->shared_buffer_count; i++) {
+			if (msc->shared_fences[i] != VK_NULL_HANDLE) {
+				vk->vkDestroyFence(vk->device, msc->shared_fences[i], NULL);
+			}
+		}
+	}
+	free(msc->shared_fences);
+	msc->shared_fences = NULL;
+	if (vk != NULL && msc->shared_cmd_buffers != NULL && msc->shared_cmd_pool != VK_NULL_HANDLE &&
+	    msc->shared_buffer_count > 0) {
+		vk->vkFreeCommandBuffers(vk->device, msc->shared_cmd_pool, msc->shared_buffer_count,
+		                         msc->shared_cmd_buffers);
+	}
+	free(msc->shared_cmd_buffers);
+	msc->shared_cmd_buffers = NULL;
+	if (vk != NULL && msc->shared_framebuffers != NULL) {
+		for (uint32_t i = 0; i < msc->shared_buffer_count; i++) {
+			if (msc->shared_framebuffers[i] != VK_NULL_HANDLE) {
+				vk->vkDestroyFramebuffer(vk->device, msc->shared_framebuffers[i], NULL);
+			}
+		}
+	}
+	free(msc->shared_framebuffers);
+	msc->shared_framebuffers = NULL;
+	if (vk != NULL && msc->shared_render_pass != VK_NULL_HANDLE) {
+		vk->vkDestroyRenderPass(vk->device, msc->shared_render_pass, NULL);
+		msc->shared_render_pass = VK_NULL_HANDLE;
+	}
+	msc->shared_buffer_count = 0;
+	msc->shared_fenced_buffer = -1;
+	msc->shared_gpu_stalled = false;
+	if (msc->shared_target != NULL && msc->target_service != NULL) {
+		comp_target_service_destroy(msc->target_service, &msc->shared_target);
+	}
+	msc->shared_surface_initialized = false;
+	msc->shared_window_visible = false;
+	U_LOG_W("[#1006] shared target released (overlay off); shared DP kept, paused");
+}
+#endif
+
+/*!
  * Lazily create the one shared full-screen target, its render rings, and the
  * one display processor. Mirrors multi_compositor_init_session_render but the
  * resources live on the multi_system_compositor (not a client).
@@ -3941,17 +4068,21 @@ shared_surface_init(struct multi_system_compositor *msc, struct vk_bundle *vk)
 
 	uint32_t image_count = ct->image_count;
 
-	// Command pool + per-image command buffers + fences (signaled).
+	// Command pool + per-image command buffers + fences (signaled). The pool is
+	// lent to the DP (vk_cmd_pool), so it lives as long as the DP: an Android
+	// overlay deactivate releases the target but keeps the pool (#1006).
 	VkResult vr;
-	VkCommandPoolCreateInfo pool_info = {
-	    .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-	    .queueFamilyIndex = vk->main_queue->family_index,
-	    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-	};
-	vr = vk->vkCreateCommandPool(vk->device, &pool_info, NULL, &msc->shared_cmd_pool);
-	if (vr != VK_SUCCESS) {
-		U_LOG_E("[#59] failed to create shared command pool: %d", vr);
-		return false;
+	if (msc->shared_cmd_pool == VK_NULL_HANDLE) {
+		VkCommandPoolCreateInfo pool_info = {
+		    .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+		    .queueFamilyIndex = vk->main_queue->family_index,
+		    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+		};
+		vr = vk->vkCreateCommandPool(vk->device, &pool_info, NULL, &msc->shared_cmd_pool);
+		if (vr != VK_SUCCESS) {
+			U_LOG_E("[#59] failed to create shared command pool: %d", vr);
+			return false;
+		}
 	}
 
 	msc->shared_cmd_buffers = U_TYPED_ARRAY_CALLOC(VkCommandBuffer, image_count);
@@ -4034,21 +4165,10 @@ shared_surface_init(struct multi_system_compositor *msc, struct vk_bundle *vk)
 		}
 	}
 
-	// The one display processor that weaves the combined atlas.
-	xrt_dp_factory_vk_fn_t factory = (xrt_dp_factory_vk_fn_t)msc->base.info.dp_factory_vk;
-	if (factory != NULL) {
-		xrt_result_t dp_ret = factory(vk,                                         // vk_bundle
-		                              (void *)(uintptr_t)msc->shared_cmd_pool,    // cmd_pool
-		                              NULL,                                        // window_handle (service-owned)
-		                              (int32_t)ct->format,                         // target_format
-		                              &msc->shared_dp);
-		if (dp_ret != XRT_SUCCESS) {
-			U_LOG_W("[#59] shared DP factory failed: %d (no weave)", dp_ret);
-			msc->shared_dp = NULL;
-		} else {
-			U_LOG_W("[#59] created shared display processor");
-		}
-	}
+	// The one display processor that weaves the combined atlas. Kept across
+	// an Android overlay deactivate/reactivate (paused, never destroyed — CNSDK
+	// release can hang, leia-plugin#39), so only create it once.
+	shared_ensure_dp(msc, vk);
 
 	msc->shared_surface_initialized = true;
 	U_LOG_W("[#59] shared surface initialized");
@@ -5360,6 +5480,9 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 	if (!shared_surface_init(msc, vk)) {
 		return;
 	}
+	// A DP held back at init (Android R2, #1006) is retried every frame, so it
+	// appears as soon as the last per-session DP in this process is gone.
+	shared_ensure_dp(msc, vk);
 	if (should_show != msc->shared_window_visible) {
 		shared_set_window_visible(msc->shared_target, should_show);
 		msc->shared_window_visible = should_show;
@@ -6662,11 +6785,85 @@ android_window_transition_locked(struct multi_system_compositor *msc)
 			}
 			os_mutex_unlock(&mc->weave.mutex);
 		}
+		// #1006: in workspace overlay mode no per-session window is on screen —
+		// the controller's surface is, composited through the ONE shared DP — so
+		// every per-session DP in this process releases its lens vote (ADR-036
+		// D7) and re-asserts when the overlay ends.
+		const bool overlay = multi_shared_surface_active(msc);
 		multi_compositor_set_window_visible_locked(
-		    mc, visible && active && !weave_idle,
-		    !visible ? "surface lost"
-		             : (!active ? "session not active"
-		                        : (weave_idle ? "weave idle (#1278)" : "surface live, session active")));
+		    mc, visible && active && !weave_idle && !overlay,
+		    overlay ? "workspace overlay active (#1006)"
+		            : (!visible
+		                   ? "surface lost"
+		                   : (!active ? "session not active"
+		                              : (weave_idle ? "weave idle (#1278)" : "surface live, session active"))));
+	}
+
+	// #1006: the shared DP's lens vote follows "overlay applied AND the
+	// controller's surface is live" — the same convergent, edge-triggered rule
+	// as the per-session DPs above. Deactivate therefore PAUSES it (never
+	// destroys it, leia-plugin#39); a reactivate resumes it.
+	if (msc->shared_dp != NULL) {
+		const bool want_visible = multi_shared_surface_active(msc) && visible;
+		const int want = want_visible ? MULTI_DP_VIS_VISIBLE : MULTI_DP_VIS_HIDDEN;
+		if (msc->shared_dp_visibility != want) {
+			msc->shared_dp_visibility = want;
+			if (want_visible) {
+				U_LOG_W(
+				    "[#1006] shared DP: overlay on + surface live - resuming, re-asserting its lens "
+				    "preference");
+				xrt_display_processor_on_resume(msc->shared_dp);
+			} else {
+				U_LOG_W("[#1006] shared DP: %s - pausing, releasing its lens preference",
+				        multi_shared_surface_active(msc) ? "controller surface lost" : "overlay off");
+				xrt_display_processor_on_pause(msc->shared_dp);
+			}
+		}
+	}
+}
+
+/*!
+ * #1006 (ADR-036 D4): apply the requested Android workspace-overlay mode
+ * (`workspace_active`, set by the IPC activate/deactivate/controller-loss arms)
+ * on the RENDER THREAD, at the top of a frame, before the layer transfer — so
+ * one frame never mixes the two shapes. Called with render_lock held and
+ * list_and_timing_lock NOT held.
+ *
+ * - ON: frames go through render_shared_surface_locked; the shared target (the
+ *   controller's own surface, published to android_globals) and the shared DP
+ *   are created lazily there. The convergence pass that follows releases every
+ *   per-session DP's lens vote in this same frame.
+ * - OFF: release the shared target (so a per-session target can claim the
+ *   process-global window again) but keep the shared DP, paused by the
+ *   convergence pass; per-session rendering resumes.
+ */
+static void
+android_overlay_transition(struct multi_system_compositor *msc)
+{
+	const bool want = msc->workspace_active; // plain bool, written under oth by the IPC arms
+	if (want == msc->shared_mode_active) {
+		return;
+	}
+
+	if (want) {
+		uint32_t live_targets = 0;
+		os_mutex_lock(&msc->list_and_timing_lock);
+		for (size_t k = 0; k < ARRAY_SIZE(msc->clients); k++) {
+			struct multi_compositor *mc = msc->clients[k];
+			if (mc != NULL && mc->session_render.initialized && mc->session_render.target != NULL) {
+				live_targets++;
+			}
+		}
+		os_mutex_unlock(&msc->list_and_timing_lock);
+		msc->shared_mode_active = true;
+		U_LOG_W(
+		    "[#1006] workspace overlay ON: every main-service client composites into the controller's "
+		    "surface through ONE display processor; per-session DPs release their lens votes%s",
+		    live_targets > 0 ? " (WARNING: a per-session target still holds the window)" : "");
+	} else {
+		msc->shared_mode_active = false;
+		shared_target_release(msc, comp_target_service_get_vk(msc->target_service));
+		U_LOG_W("[#1006] workspace overlay OFF: per-session rendering resumes");
 	}
 }
 
@@ -6795,6 +6992,12 @@ multi_main_loop(struct multi_system_compositor *msc)
 		// create/destroy, pacing calls and the wait threads no longer wait for
 		// GPU work or present. Order: render_lock -> list_and_timing_lock.
 		os_mutex_lock(&msc->render_lock);
+
+#if defined(COMP_MULTI_SHARED_SURFACE) && defined(COMP_MULTI_PER_SESSION_TARGET)
+		// #1006: the overlay mode flips here, before the transfer decides
+		// whether any client gets a per-session target this frame.
+		android_overlay_transition(msc);
+#endif
 
 		// Make sure that the clients doesn't go away while we transfer layers.
 		os_mutex_lock(&msc->list_and_timing_lock);
