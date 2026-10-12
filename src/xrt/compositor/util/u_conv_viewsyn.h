@@ -33,11 +33,10 @@
  * and the ray from eye E through output point p' reaches source position
  *   x_s = C + (E + (p' - E)(E.z - z)/E.z - C)(1 + q),  z = q C.z / (1 + q).
  *
- * The draft ABI (`xrt_conversion_plugin.h`, docs/roadmap/conversion-providers-
- * headers-draft.md) is being created on another branch. The few fields this
- * stage needs are MIRRORED below with the same names and values; reconcile
- * them with `struct xrt_conv_depth_info` / `XRT_CONV_DEPTH_*` /
- * `XRT_CONV_VIEWS_*` once that header lands (TODO(conv-p1a-hdr)).
+ * Depth units and view layouts are the provider ABI's own
+ * (`struct xrt_conv_depth_info`, `XRT_CONV_DEPTH_*`, `XRT_CONV_VIEWS_*` in
+ * `xrt/xrt_conversion_plugin.h`): the stage reads a result's depth exactly as
+ * the provider described it.
  *
  * C11, no allocation, no graphics API; host-tested by
  * tests/tests_conv_viewsyn_math.cpp.
@@ -47,6 +46,8 @@
 
 #pragma once
 
+#include "xrt/xrt_conversion_plugin.h"
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -54,46 +55,16 @@
 extern "C" {
 #endif
 
-/*! Upper bound on views; == XRT_CONV_MAX_VIEWS (draft) == XR_LIFT_MAX_VIEWS_DXR. */
-#define U_CONV_VIEWSYN_MAX_VIEWS 8u
+/*! Upper bound on views; == XRT_CONV_MAX_VIEWS == XR_LIFT_MAX_VIEWS_DXR. */
+#define U_CONV_VIEWSYN_MAX_VIEWS XRT_CONV_MAX_VIEWS
 
 /*! Nominal viewing geometry: IPD / viewing distance (63 mm at 0.6 m). Sets how
  *  much parallax a budget means for an eye at a given offset; it cancels for
  *  the nominal pair. Same constant as live-dibr.js `KAPPA`. */
 #define U_CONV_VIEWSYN_KAPPA (0.063 / 0.6)
 
-/*! @name Depth kinds — MIRROR of XRT_CONV_DEPTH_* (draft), same values.
- * @{ */
-#define U_CONV_VIEWSYN_DEPTH_UNKNOWN 0u             //!< treated as AFFINE_DISPARITY (larger = nearer)
-#define U_CONV_VIEWSYN_DEPTH_METRIC 1u              //!< metres
-#define U_CONV_VIEWSYN_DEPTH_METRIC_INVERSE 2u      //!< 1 / metres
-#define U_CONV_VIEWSYN_DEPTH_AFFINE_INVERSE 3u      //!< inverse depth up to scale + shift (larger = nearer)
-#define U_CONV_VIEWSYN_DEPTH_AFFINE_DISPARITY 4u    //!< disparity up to scale + shift (larger = nearer)
-#define U_CONV_VIEWSYN_DEPTH_AFFINE 5u              //!< depth up to scale + shift (larger = farther)
-#define U_CONV_VIEWSYN_DEPTH_STEREO_DISPARITY_PX 6u //!< px disparity of a rectified pair (larger = nearer)
-/*! @} */
-
-/*! @name Output layouts — MIRROR of XRT_CONV_VIEWS_* (draft), same values.
- * @{ */
-#define U_CONV_VIEWSYN_LAYOUT_ROW 0u   //!< N views side by side, view 0 leftmost
-#define U_CONV_VIEWSYN_LAYOUT_ARRAY 1u //!< view i in array slice i (ADR-032)
-/*! @} */
-
 /*! Rear cap value meaning "no cap" (any negative value). */
 #define U_CONV_VIEWSYN_REAR_UNLIMITED (-1.0f)
-
-/*!
- * The subset of `struct xrt_conv_depth_info` (draft, FROZEN 128 bytes) this
- * stage reads. Field names and semantics are the draft's; reconcile with the
- * real struct when `xrt_conversion_plugin.h` lands.
- */
-struct u_conv_viewsyn_depth_desc
-{
-	uint32_t kind;        //!< U_CONV_VIEWSYN_DEPTH_* (== XRT_CONV_DEPTH_*)
-	float value_scale;    //!< decoded = value_scale * sample + value_shift; 0 is read as 1
-	float value_shift;    //!< see value_scale
-	float invalid_sample; //!< raw "no data" sample value; NaN = none
-};
 
 /*!
  * Every input of one synthesis, already decided by the policy stages.
@@ -110,9 +81,9 @@ struct u_conv_viewsyn_params
 	float source_camera_m[3];                        //!< explicit source camera (look-around policy)
 
 	/* Depth units and the policy's numbers, all in DECODED units. */
-	struct u_conv_viewsyn_depth_desc depth;
-	float range_near, range_far; //!< decoded values mapped to n = 1 / n = 0 (smoothed range, policy-owned)
-	float convergence;           //!< decoded value placed on the glass (zero parallax)
+	struct xrt_conv_depth_info depth; //!< kind, value_scale / value_shift, invalid_sample are read
+	float range_near, range_far;      //!< decoded values mapped to n = 1 / n = 0 (smoothed range, policy-owned)
+	float convergence;                //!< decoded value placed on the glass (zero parallax)
 	float budget;     //!< total near–far disparity of the nominal pair, fraction of width (strength folded in)
 	float rear_cap_m; //!< ADR-040: max distance behind the glass, metres; < 0 = unlimited, 0 = nothing behind
 
@@ -165,7 +136,7 @@ u_conv_viewsyn_params_defaults(struct u_conv_viewsyn_params *p);
 
 /*! value = scale * sample + shift (scale 0 read as 1). */
 double
-u_conv_viewsyn_decode(const struct u_conv_viewsyn_depth_desc *d, double sample);
+u_conv_viewsyn_decode(const struct xrt_conv_depth_info *d, double sample);
 
 /*!
  * Decoded value -> NEARNESS (larger = nearer, linear in disparity where the
@@ -181,7 +152,7 @@ u_conv_viewsyn_nearness(uint32_t kind, double decoded);
  * An invalid sample (== invalid_sample) reads as the far end (u = 0).
  */
 double
-u_conv_viewsyn_normalise(const struct u_conv_viewsyn_depth_desc *d, double near_lo, double near_hi, double sample);
+u_conv_viewsyn_normalise(const struct xrt_conv_depth_info *d, double near_lo, double near_hi, double sample);
 
 /*! Viewpoint (metres, rect-relative) -> eye in window heights. */
 struct u_conv_viewsyn_vec3

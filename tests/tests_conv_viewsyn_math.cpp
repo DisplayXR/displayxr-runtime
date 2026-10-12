@@ -87,10 +87,10 @@ TEST_CASE("dilateMax grows the foreground by r px (square)", "[conv_viewsyn]")
 
 TEST_CASE("toDisparity: metric -> 1/z, passthrough otherwise", "[conv_viewsyn]")
 {
-	CHECK(u_conv_viewsyn_nearness(U_CONV_VIEWSYN_DEPTH_METRIC, 2.0) == 0.5);
-	CHECK(u_conv_viewsyn_nearness(U_CONV_VIEWSYN_DEPTH_METRIC, 0.5) == 2.0);
-	CHECK(u_conv_viewsyn_nearness(U_CONV_VIEWSYN_DEPTH_METRIC, 0.0) == 0.0);
-	CHECK(u_conv_viewsyn_nearness(U_CONV_VIEWSYN_DEPTH_AFFINE_DISPARITY, 1.0) == 1.0);
+	CHECK(u_conv_viewsyn_nearness(XRT_CONV_DEPTH_METRIC, 2.0) == 0.5);
+	CHECK(u_conv_viewsyn_nearness(XRT_CONV_DEPTH_METRIC, 0.5) == 2.0);
+	CHECK(u_conv_viewsyn_nearness(XRT_CONV_DEPTH_METRIC, 0.0) == 0.0);
+	CHECK(u_conv_viewsyn_nearness(XRT_CONV_DEPTH_AFFINE_DISPARITY, 1.0) == 1.0);
 }
 
 TEST_CASE("viewEye inverts kooimaProjection (eye in window heights)", "[conv_viewsyn]")
@@ -289,22 +289,30 @@ TEST_CASE("snapRadii scale with the depth width, radius capped at 12", "[conv_vi
 
 TEST_CASE("declared depth kinds decode to nearness (larger = nearer)", "[conv_viewsyn]")
 {
-	u_conv_viewsyn_depth_desc d = {U_CONV_VIEWSYN_DEPTH_METRIC, 0.0f, 0.0f, NAN};
+	xrt_conv_depth_info d{};
+	d.kind = XRT_CONV_DEPTH_METRIC;
+	d.value_scale = 0.0f;
+	d.value_shift = 0.0f;
+	d.invalid_sample = NAN;
 	NEAR(u_conv_viewsyn_decode(&d, 3.0), 3.0, 0); // scale 0 is read as 1
 	d.value_scale = 2.0f;
 	d.value_shift = 1.0f;
 	NEAR(u_conv_viewsyn_decode(&d, 3.0), 7.0, 0);
-	CHECK(u_conv_viewsyn_nearness(U_CONV_VIEWSYN_DEPTH_AFFINE, 2.0) <
-	      u_conv_viewsyn_nearness(U_CONV_VIEWSYN_DEPTH_AFFINE, 1.0));
-	CHECK(u_conv_viewsyn_nearness(U_CONV_VIEWSYN_DEPTH_METRIC, 2.0) <
-	      u_conv_viewsyn_nearness(U_CONV_VIEWSYN_DEPTH_METRIC, 1.0));
-	for (uint32_t k : {U_CONV_VIEWSYN_DEPTH_METRIC_INVERSE, U_CONV_VIEWSYN_DEPTH_AFFINE_INVERSE,
-	                   U_CONV_VIEWSYN_DEPTH_AFFINE_DISPARITY, U_CONV_VIEWSYN_DEPTH_STEREO_DISPARITY_PX,
-	                   U_CONV_VIEWSYN_DEPTH_UNKNOWN}) {
+	CHECK(u_conv_viewsyn_nearness(XRT_CONV_DEPTH_AFFINE, 2.0) <
+	      u_conv_viewsyn_nearness(XRT_CONV_DEPTH_AFFINE, 1.0));
+	CHECK(u_conv_viewsyn_nearness(XRT_CONV_DEPTH_METRIC, 2.0) <
+	      u_conv_viewsyn_nearness(XRT_CONV_DEPTH_METRIC, 1.0));
+	for (uint32_t k :
+	     {XRT_CONV_DEPTH_METRIC_INVERSE, XRT_CONV_DEPTH_AFFINE_INVERSE, XRT_CONV_DEPTH_AFFINE_DISPARITY,
+	      XRT_CONV_DEPTH_STEREO_DISPARITY_PX, XRT_CONV_DEPTH_UNKNOWN}) {
 		CHECK(u_conv_viewsyn_nearness(k, 0.7) == 0.7);
 	}
 	// Normalise: metric 1 m .. 4 m -> nearness 0.25 .. 1; 2 m sits at 1/3; invalid reads far.
-	u_conv_viewsyn_depth_desc m = {U_CONV_VIEWSYN_DEPTH_METRIC, 1.0f, 0.0f, 0.0f};
+	xrt_conv_depth_info m{};
+	m.kind = XRT_CONV_DEPTH_METRIC;
+	m.value_scale = 1.0f;
+	m.value_shift = 0.0f;
+	m.invalid_sample = 0.0f;
 	NEAR(u_conv_viewsyn_normalise(&m, 0.25, 1.0, 2.0), 1.0 / 3.0, 1e-12);
 	CHECK(u_conv_viewsyn_normalise(&m, 0.25, 1.0, 0.0) == 0.0);
 }
@@ -318,7 +326,7 @@ TEST_CASE("resolve: viewpoints in metres = the eyes viewEye reads from their Koo
 	p.view_count = 2;
 	const float vps[2][3] = {{-0.0315f, 0.10f, 0.60f}, {0.0315f, 0.10f, 0.60f}};
 	memcpy(p.viewpoints_m, vps, sizeof(vps));
-	p.depth.kind = U_CONV_VIEWSYN_DEPTH_METRIC;
+	p.depth.kind = XRT_CONV_DEPTH_METRIC;
 	p.range_near = 1.0f;  // metres: n = 1
 	p.range_far = 4.0f;   // n = 0
 	p.convergence = 2.0f; // decoded: 2 m on the glass

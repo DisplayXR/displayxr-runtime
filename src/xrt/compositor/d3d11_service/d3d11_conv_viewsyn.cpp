@@ -381,13 +381,13 @@ ensure_target(
 	D3D11_TEXTURE2D_DESC td;
 	t->texture->GetDesc(&td);
 	DXGI_FORMAT fmt = t->rtv_format != DXGI_FORMAT_UNKNOWN ? t->rtv_format : td.Format;
-	if (t->layout == U_CONV_VIEWSYN_LAYOUT_ROW) {
+	if (t->layout == XRT_CONV_VIEWS_ROW) {
 		if (td.Width < views) {
 			return false;
 		}
 		*out_vw = td.Width / views;
 		*out_vh = td.Height;
-	} else if (t->layout == U_CONV_VIEWSYN_LAYOUT_ARRAY) {
+	} else if (t->layout == XRT_CONV_VIEWS_ARRAY) {
 		if (td.ArraySize < views) {
 			return false;
 		}
@@ -396,7 +396,7 @@ ensure_target(
 	} else {
 		return false;
 	}
-	uint32_t need = t->layout == U_CONV_VIEWSYN_LAYOUT_ROW ? 1u : views;
+	uint32_t need = t->layout == XRT_CONV_VIEWS_ROW ? 1u : views;
 	if (v->tgt_tex == t->texture && v->tgt_fmt == fmt && v->tgt_layout == t->layout && v->tgt_rtv_count >= need) {
 		return true;
 	}
@@ -593,7 +593,7 @@ d3d11_conv_viewsyn_render(struct d3d11_conv_viewsyn *v,
 	c.cam[1] = (float)f.cam.y;
 	c.cam[2] = (float)f.cam.z;
 	for (uint32_t i = 0; i < f.view_count; i++) {
-		const bool row = target->layout == U_CONV_VIEWSYN_LAYOUT_ROW;
+		const bool row = target->layout == XRT_CONV_VIEWS_ROW;
 		ID3D11RenderTargetView *rtv = v->tgt_rtv[row ? 0 : i];
 		float x0 = row ? (float)(i * vw) : 0.0f;
 		c.vp_origin[0] = x0;
